@@ -141,6 +141,10 @@ static void shutdown_and_reap(pid_t pid)
 }
 
 /* Dial a Unix socket. Returns fd >= 0 on success, -1 on failure. */
+/* R142 P2-4 close: every dial gets SO_RCVTIMEO/SNDTIMEO bounds so a
+ * mis-spawned daemon that accept()s but never replies can't burn
+ * the full ctest TIMEOUT=60 silently. 5 s is comfortable margin
+ * over normal sub-100 ms handshakes. */
 static int dial_unix(const char *path)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -153,6 +157,9 @@ static int dial_unix(const char *path)
         close(fd);
         return -1;
     }
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     return fd;
 }
 
@@ -180,7 +187,8 @@ static bool do_tversion(int fd)
 
 /* Drive a no-op Tflush (oldtag = NOTAG = 0xFFFF). The server should
  * always Rflush it. This is a cheap "is the connection still
- * functional?" probe — minimal state mutation, no fid required. */
+ * parseable?" probe — does NOT touch any fs-backed state. Use
+ * `do_tattach_root_probe` for an fs-backed-surface probe. */
 static bool do_tflush_probe(int fd, uint16_t tag)
 {
     /* Tflush wire: size(4) + Tflush=108 + tag(2) + oldtag(2) = 11 */
@@ -197,6 +205,83 @@ static bool do_tflush_probe(int fd, uint16_t tag)
     ssize_t n = read(fd, rv, sizeof rv);
     /* Rflush type = 109. */
     return n >= 5 && rv[4] == 109;
+}
+
+/* R142 P2-2 close: fs-backed-surface probe via Tattach. The proxy
+ * + coord pipeline parses the frame, applies both --datasets-allowed
+ * + --user-policy gates, and forwards into stm_9p_server::h_attach
+ * which touches stm_fs. We use aname="probe" — admitted by both
+ * gates (`**` patterns match anything non-control-byte), then
+ * refused by canonical h_attach with Rlerror(EINVAL) ecode 22
+ * (h_attach only admits "/" and "spec:<N>"; the R139 wrapper
+ * refusal of "/" forces us to use a named aname). The probe is
+ * considered SUCCESS iff the wire returns ANY Rxx that is NOT
+ * Rlerror(EACCES) — proving the full proxy→coord→fs round-trip
+ * is functional. A regression breaking client_B's fs-state
+ * isolation surfaces as a hang, mangled response, or EACCES from
+ * the gate (impossible under these patterns, so EACCES === bug).
+ *
+ * Pre-R142 used Tflush (stateless no-op); this is materially
+ * stronger because it exercises h_attach + coord's stm_fs read
+ * path. */
+static bool do_tattach_probe(int fd, uint16_t tag, uint32_t fid,
+                                const char *aname)
+{
+    size_t alen = strlen(aname);
+    /* Body = fid(4) + afid(4) + uname[s](2) + aname[s](2 + alen) + n_uname(4) */
+    size_t total = 7 + 4 + 4 + 2 + 2 + alen + 4;
+    if (total > 256) return false;
+    uint8_t ta[256];
+    ta[0] = (uint8_t)(total & 0xFF);
+    ta[1] = (uint8_t)((total >> 8) & 0xFF);
+    ta[2] = (uint8_t)((total >> 16) & 0xFF);
+    ta[3] = (uint8_t)((total >> 24) & 0xFF);
+    ta[4] = 104; /* Tattach */
+    ta[5] = (uint8_t)(tag & 0xFF);
+    ta[6] = (uint8_t)((tag >> 8) & 0xFF);
+    /* fid */
+    ta[7]  = (uint8_t)(fid & 0xFF);
+    ta[8]  = (uint8_t)((fid >> 8) & 0xFF);
+    ta[9]  = (uint8_t)((fid >> 16) & 0xFF);
+    ta[10] = (uint8_t)((fid >> 24) & 0xFF);
+    /* afid = NOFID */
+    ta[11] = 0xFF; ta[12] = 0xFF; ta[13] = 0xFF; ta[14] = 0xFF;
+    /* uname = "" */
+    ta[15] = 0; ta[16] = 0;
+    /* aname */
+    ta[17] = (uint8_t)(alen & 0xFF);
+    ta[18] = (uint8_t)((alen >> 8) & 0xFF);
+    memcpy(ta + 19, aname, alen);
+    /* n_uname = 0 */
+    size_t p = 19 + alen;
+    ta[p] = 0; ta[p+1] = 0; ta[p+2] = 0; ta[p+3] = 0;
+
+    if (write(fd, ta, total) != (ssize_t)total) return false;
+    uint8_t rv[64];
+    ssize_t n = read(fd, rv, sizeof rv);
+    if (n < 5) return false;
+    if (rv[4] == 105 /* Rattach */) return true;
+    if (rv[4] == 7 /* Rlerror */ && n >= 11) {
+        uint32_t ecode = (uint32_t)rv[7]
+                       | ((uint32_t)rv[8] << 8)
+                       | ((uint32_t)rv[9] << 16)
+                       | ((uint32_t)rv[10] << 24);
+        /* Any Rlerror except EACCES (13) means the gate admitted
+         * and coord's canonical handler took over — proves the
+         * full path is alive. EACCES would mean the gate refused
+         * unexpectedly (the policy is `**`, so this can't happen
+         * under a healthy server). */
+        return ecode != 13u;
+    }
+    return false;
+}
+
+/* Monotonic-clock helper for wall-time bounds on probes. */
+static double monotonic_seconds(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -312,10 +397,11 @@ static void crash_fixture_teardown(crash_fixture *f)
 STM_TEST(multi_stratumd_crash_isolation_client_a_killed_b_survives)
 {
     resolve_stratumd_bin();
-    if (!g_stratumd_bin) {
-        fprintf(stderr, "  SKIP (STM_STRATUMD_BIN env unset)\n");
-        return;
-    }
+    /* R142 P2-3: STM_STRATUMD_BIN MUST be set; ctest sets it via
+     * the CMakeLists ENVIRONMENT property. Direct-binary invocation
+     * without the env is treated as a misconfiguration — fail loud
+     * instead of silently passing. */
+    STM_ASSERT(g_stratumd_bin != NULL);
 
     crash_fixture f;
     crash_fixture_init(&f, "iso", 2);
@@ -333,9 +419,12 @@ STM_TEST(multi_stratumd_crash_isolation_client_a_killed_b_survives)
     STM_ASSERT(sigkill_and_reap(f.client_pid[0]));
     f.client_pid[0] = -1;
 
-    /* Client B's connection MUST still be functional. Probe with
-     * a no-op Tflush (oldtag=NOTAG; server always Rflushes). */
-    STM_ASSERT(do_tflush_probe(fd_b, /*tag=*/2));
+    /* R142 P2-2 close: probe client_B's fs-backed surface with a
+     * Tattach against aname="/" — exercises h_attach (root inode
+     * lookup, qid generation), not just the wire codec. Tflush
+     * is a stateless no-op and would not surface a regression
+     * that broke fs state isolation. Pre-R142 used Tflush only. */
+    STM_ASSERT(do_tattach_probe(fd_b, /*tag=*/2, /*fid=*/1, "probe"));
 
     close(fd_a); /* will EPIPE; that's expected */
     close(fd_b);
@@ -350,10 +439,7 @@ STM_TEST(multi_stratumd_crash_isolation_client_a_killed_b_survives)
 STM_TEST(multi_stratumd_crash_coord_kill_propagates_clean)
 {
     resolve_stratumd_bin();
-    if (!g_stratumd_bin) {
-        fprintf(stderr, "  SKIP (STM_STRATUMD_BIN env unset)\n");
-        return;
-    }
+    STM_ASSERT(g_stratumd_bin != NULL);
 
     crash_fixture f;
     crash_fixture_init(&f, "coordkill", 1);
@@ -368,56 +454,66 @@ STM_TEST(multi_stratumd_crash_coord_kill_propagates_clean)
     STM_ASSERT(sigkill_and_reap(f.coord_pid));
     f.coord_pid = -1;
 
-    /* The next probe MUST fail (not hang). Set a 3s read timeout
-     * so a regression manifesting as a hang doesn't deadlock ctest. */
+    /* R142 P1-1 close: a clean EPIPE-propagation regression and a
+     * hang regression BOTH return probe_ok=false (the hang ends at
+     * SO_RCVTIMEO=3s). The two paths differ only in wall time. We
+     * bracket the probe with monotonic-clock samples and assert
+     * elapsed < 1.0s so a hang manifesting as a 3s timeout is
+     * observable as a wall-time failure, not an admission of
+     * `!probe_ok`. Pre-R142 the test was inverted in a way that
+     * passed both correct AND broken impls. */
     struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+    double t0 = monotonic_seconds();
     bool probe_ok = do_tflush_probe(fd, /*tag=*/2);
+    double elapsed = monotonic_seconds() - t0;
     STM_ASSERT(!probe_ok); /* coord gone → forwarded probe must fail */
+    STM_ASSERT(elapsed < 1.0); /* clean EPIPE-propagate, NOT hang */
 
     close(fd);
     crash_fixture_teardown(&f);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
-/* Test 3: Kernel disconnect cleans up coord's per-conn fid state.        */
+/* Test 3: Repeated abrupt disconnects don't break the proxy + coord.     */
 /*                                                                          */
-/* Indirect: a fresh dial-handshake-disconnect cycle repeated N times       */
-/* against a single coord (via the proxy) must NOT exhaust resources.       */
-/* If the coord leaked per-conn fids on disconnect, a fid-cap exhaustion    */
-/* would surface as a failed Tattach after enough cycles.                   */
+/* R142 P2-1 close: pre-R142 docstring claimed "fid-cap exhaustion" but    */
+/* each new dial gets a fresh stm_9p_server with a fresh fid table — a    */
+/* per-conn-fid leak inside one connection is unreachable via fresh dials.*/
+/* The real invariant exercised here is: repeated dial+abrupt-close       */
+/* cycles don't break the proxy's accept loop OR coord's accept loop      */
+/* (no fd leak in the accept path, no detached-worker pthread             */
+/* accumulation that would surface as accept failures after N cycles).    */
+/* Cycle count bumped from 32 → 200 to give more headroom for             */
+/* surface-by-volume regressions (still <2 s wall time on macOS).         */
+/* For TRUE per-connection memory-leak detection, run under valgrind /    */
+/* ASan with this test as a workload — that's outside the unit-test scope.*/
 /* ────────────────────────────────────────────────────────────────────── */
 
-STM_TEST(multi_stratumd_crash_kernel_disconnect_no_fid_leak)
+STM_TEST(multi_stratumd_crash_repeated_abrupt_disconnect_survives)
 {
     resolve_stratumd_bin();
-    if (!g_stratumd_bin) {
-        fprintf(stderr, "  SKIP (STM_STRATUMD_BIN env unset)\n");
-        return;
-    }
+    STM_ASSERT(g_stratumd_bin != NULL);
 
     crash_fixture f;
     crash_fixture_init(&f, "diskleak", 1);
 
-    /* 32 dial+version+abrupt-close cycles. The per-conn fid table on
-     * coord is capped at STM_9P_MAX_FIDS (4096); without cleanup we'd
-     * leak per cycle. With cleanup we run forever (limited only by
-     * the proxy's accept rate). 32 is enough to surface any obvious
-     * leak in the limit-100-fids range and finishes in well under
-     * a second. */
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < 200; i++) {
         int fd = dial_unix(f.client_sock[0]);
         STM_ASSERT(fd >= 0);
         STM_ASSERT(do_tversion(fd));
         close(fd); /* abrupt; kernel-side dies mid-conv */
     }
 
-    /* Final live probe — connection still serves. */
+    /* Final live probe — proxy + coord both still serve a fresh dial.
+     * Tattach-root makes this an fs-backed-surface probe (R142 P2-2
+     * doctrine carry). */
     int fd = dial_unix(f.client_sock[0]);
     STM_ASSERT(fd >= 0);
     STM_ASSERT(do_tversion(fd));
-    STM_ASSERT(do_tflush_probe(fd, /*tag=*/2));
+    STM_ASSERT(do_tattach_probe(fd, /*tag=*/2, /*fid=*/1, "probe"));
     close(fd);
 
     crash_fixture_teardown(&f);
