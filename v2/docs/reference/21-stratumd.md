@@ -342,7 +342,8 @@ complementary gates:
 | TLY-A2-impl-1: coord mode `--user-policy` Tattach gate | LIVE | `stratumd_check_tattach` refuse-don't-defer (`ad55173` + R139 close) |
 | TLY-A2-impl-2: client mode raw 9P proxy + `--datasets-allowed` | LIVE | `proxy_9p.{h,c}` (`9d954ce` + R140 audit) |
 | TLY-A2-impl-3: bilateral SO_PEERCRED (accept-time + `--coordinator-uid`) | LIVE | `0c16d91` + R141 audit |
-| TLY-A2-impl-4: crash recovery sweep | PENDING | kill -9 patterns; multi-client coord + client crash interleaving |
+| TLY-A2-impl-4: crash recovery sweep tests | LIVE | `test_multi_stratumd_crash.c` (3 scenarios) + R142 audit |
+| TLY-A2-impl-5: 72-hour stress | DEFERRED | GCP-gated; 4 clients concurrent for long-form sweep |
 
 Audit class: changes to wire framing, peer-cred resolution, socket
 binding, the lifecycle ordering, or signal-mask discipline MUST be

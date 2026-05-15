@@ -106,6 +106,10 @@ stm_add_test(test_stratumd_user_policy test_stratumd_user_policy.c test_fs_commo
 target_link_libraries(test_stratumd_user_policy PRIVATE stm_stratumd)
 stm_add_test(test_proxy_9p test_proxy_9p.c test_fs_common.c)
 target_link_libraries(test_proxy_9p PRIVATE stm_stratumd)
+stm_add_test(test_multi_stratumd_crash test_multi_stratumd_crash.c test_fs_common.c)
+set_tests_properties(test_multi_stratumd_crash PROPERTIES
+    ENVIRONMENT "STM_STRATUMD_BIN=$<TARGET_FILE:stratumd>"
+    TIMEOUT 60)
 stm_add_test(test_slate test_slate.c)
 target_link_libraries(test_slate PRIVATE stm_slate stm_lp9)
 stm_add_test(test_slate_socket test_slate_socket.c)
