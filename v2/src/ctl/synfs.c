@@ -189,6 +189,8 @@ typedef enum {
     KIND_POOL_METRICS_PROMETHEUS = 26, /* /pools/<uuid>/metrics/prometheus — bulk exposition */
     KIND_DATASET_SNAPSHOTS_DIR   = 27, /* /datasets/<id>/snapshots/ — read-only snap list (S5-PRE-C) */
     KIND_DATASET_SNAPSHOT_INFO   = 28, /* /datasets/<id>/snapshots/<sid> — per-snap info file */
+    KIND_DATASET_MARK_SNAPSHOT_COMPROMISED   = 29, /* /datasets/<id>/mark-snapshot-compromised — admin write (TLY-A5) */
+    KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED = 30, /* /datasets/<id>/unmark-snapshot-compromised — admin write (TLY-A5) */
     KIND_MAX
 } ctl_kind;
 
@@ -231,6 +233,8 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
     [KIND_POOL_METRICS_PROMETHEUS] = { false, false, 0444, "prometheus" }, /* world-readable bulk exposition */
     [KIND_DATASET_SNAPSHOTS_DIR]   = { true,  false, 0555, "snapshots"  }, /* S5-PRE-C: world-readable snap list dir */
     [KIND_DATASET_SNAPSHOT_INFO]   = { false, false, 0444, NULL         }, /* dynamic snap id (decimal) */
+    [KIND_DATASET_MARK_SNAPSHOT_COMPROMISED]   = { false, true, 0200, "mark-snapshot-compromised"   }, /* TLY-A5 admin write trigger */
+    [KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED] = { false, true, 0200, "unmark-snapshot-compromised" }, /* TLY-A5 admin write trigger */
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_LP9_NAME_MAX
@@ -264,6 +268,8 @@ _Static_assert(sizeof("release-snapshot") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datas
 _Static_assert(sizeof("metrics") - 1    <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../metrics literal");
 _Static_assert(sizeof("prometheus") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../metrics/prometheus literal");
 _Static_assert(sizeof("snapshots") - 1  <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../snapshots literal");
+_Static_assert(sizeof("mark-snapshot-compromised") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../mark-snapshot-compromised literal");
+_Static_assert(sizeof("unmark-snapshot-compromised") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../unmark-snapshot-compromised literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -274,7 +280,7 @@ _Static_assert(sizeof("snapshots") - 1  <= STM_LP9_NAME_MAX, "/ctl/ /datasets/..
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 29,
+_Static_assert(KIND_MAX == 31,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -1260,7 +1266,8 @@ static stm_status materialize_dataset_snapshot_info(stm_ctl *c, ctl_session *s)
         "extent-txg: %llu\n"
         "prev-snap-id: %llu\n"
         "hold-count: %u\n"
-        "flags: 0x%08x\n",
+        "flags: 0x%08x\n"
+        "compromised: %s\n",
         (unsigned long long)e.snapshot_id,
         (unsigned long long)e.dataset_id,
         (int)e.name_len, (const char *)e.name,
@@ -1268,7 +1275,10 @@ static stm_status materialize_dataset_snapshot_info(stm_ctl *c, ctl_session *s)
         (unsigned long long)e.extent_txg,
         (unsigned long long)e.prev_snap_id,
         (unsigned)e.hold_count,
-        (unsigned)e.flags);
+        (unsigned)e.flags,
+        /* TLY-A5: mask for the specific bit — unknown flags bits stay
+         * reserved + must not perturb this verdict. */
+        (e.flags & STM_SNAP_FLAG_ROLLBACK_COMPROMISED) ? "yes" : "no");
     if (n < 0) return STM_EIO;
     if ((size_t)n >= sizeof s->buf) return STM_ERANGE;
     s->len = (uint32_t)n;
@@ -1902,6 +1912,8 @@ static stm_status materialize_locked(stm_ctl_conn *cn, ctl_session *s)
     case KIND_DATASET_DELETE_SNAPSHOT:/* write-only; no body to materialize */
     case KIND_DATASET_HOLD_SNAPSHOT:  /* write-only; no body to materialize */
     case KIND_DATASET_RELEASE_SNAPSHOT:/* write-only; no body to materialize */
+    case KIND_DATASET_MARK_SNAPSHOT_COMPROMISED:  /* write-only; no body */
+    case KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED:/* write-only; no body */
     case KIND_MAX:
         break;
     }
@@ -2014,6 +2026,8 @@ static stm_status getattr_at(stm_ctl *c, uint64_t qid_path,
             || k == KIND_DATASET_DELETE_SNAPSHOT
             || k == KIND_DATASET_HOLD_SNAPSHOT
             || k == KIND_DATASET_RELEASE_SNAPSHOT
+            || k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED
+            || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED
             || k == KIND_DATASET_SNAPSHOTS_DIR) {
         if (!c->fs) return STM_ENOENT;
         uint64_t dsid = qid_dataset_id(qid_path);
@@ -2261,6 +2275,14 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
                      KIND_META[KIND_DATASET_SNAPSHOTS_DIR].static_name))
             return walk_to_qid(c,
                 qid_of(KIND_DATASET_SNAPSHOTS_DIR, 0, (uint32_t)dsid), out);
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_DATASET_MARK_SNAPSHOT_COMPROMISED].static_name))
+            return walk_to_qid(c,
+                qid_of(KIND_DATASET_MARK_SNAPSHOT_COMPROMISED, 0, (uint32_t)dsid), out);
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED].static_name))
+            return walk_to_qid(c,
+                qid_of(KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED, 0, (uint32_t)dsid), out);
         return STM_ENOENT;
     }
 
@@ -2350,6 +2372,8 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_DELETE_SNAPSHOT:
     case KIND_DATASET_HOLD_SNAPSHOT:
     case KIND_DATASET_RELEASE_SNAPSHOT:
+    case KIND_DATASET_MARK_SNAPSHOT_COMPROMISED:
+    case KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED:
     case KIND_POOL_METRICS_PROMETHEUS:
     case KIND_DATASET_SNAPSHOT_INFO:  /* leaf; no children */
     case KIND_MAX:
@@ -2573,6 +2597,13 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         rc = emit_entry(c, &em,
             qid_of(KIND_DATASET_RELEASE_SNAPSHOT, 0, (uint32_t)dsid));
         if (rc != STM_OK) return rc;
+        /* TLY-A5: rollback-compromised marker verbs. */
+        rc = emit_entry(c, &em,
+            qid_of(KIND_DATASET_MARK_SNAPSHOT_COMPROMISED, 0, (uint32_t)dsid));
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(c, &em,
+            qid_of(KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED, 0, (uint32_t)dsid));
+        if (rc != STM_OK) return rc;
         /* S5-PRE-C: emit /datasets/<id>/snapshots/ subtree dirent. */
         return emit_entry(c, &em,
             qid_of(KIND_DATASET_SNAPSHOTS_DIR, 0, (uint32_t)dsid));
@@ -2676,6 +2707,8 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_DELETE_SNAPSHOT:
     case KIND_DATASET_HOLD_SNAPSHOT:
     case KIND_DATASET_RELEASE_SNAPSHOT:
+    case KIND_DATASET_MARK_SNAPSHOT_COMPROMISED:
+    case KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED:
     case KIND_POOL_METRICS_PROMETHEUS:
     case KIND_DATASET_SNAPSHOT_INFO:  /* leaf — no readdir */
     case KIND_MAX:
@@ -2714,7 +2747,9 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
             || k == KIND_DATASET_CREATE_SNAPSHOT
             || k == KIND_DATASET_DELETE_SNAPSHOT
             || k == KIND_DATASET_HOLD_SNAPSHOT
-            || k == KIND_DATASET_RELEASE_SNAPSHOT) {
+            || k == KIND_DATASET_RELEASE_SNAPSHOT
+            || k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED
+            || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED) {
         if (accmode != STM_LP9_O_WRONLY) return STM_EACCES;
     } else {
         if (accmode != STM_LP9_O_RDONLY) return STM_EACCES;
@@ -2775,7 +2810,9 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
     if (k == KIND_DATASET_CREATE_SNAPSHOT
             || k == KIND_DATASET_DELETE_SNAPSHOT
             || k == KIND_DATASET_HOLD_SNAPSHOT
-            || k == KIND_DATASET_RELEASE_SNAPSHOT) {
+            || k == KIND_DATASET_RELEASE_SNAPSHOT
+            || k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED
+            || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED) {
         if (!c->fs) return STM_ENOENT;
         /* Dataset must still be PRESENT (R98 P2-1 carry — destroyed
          * mid-walk-then-Tlopen returns ENOENT). */
@@ -2842,7 +2879,9 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
             || k == KIND_DATASET_CREATE_SNAPSHOT
             || k == KIND_DATASET_DELETE_SNAPSHOT
             || k == KIND_DATASET_HOLD_SNAPSHOT
-            || k == KIND_DATASET_RELEASE_SNAPSHOT) {
+            || k == KIND_DATASET_RELEASE_SNAPSHOT
+            || k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED
+            || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED) {
         pthread_mutex_lock(&cn->mu);
         ctl_session *s = session_alloc_locked(cn, fid, qid_path);
         if (!s) {
@@ -3400,6 +3439,115 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             (unsigned long long)snap_id,
             rc == STM_OK ? "" : "err:",
             status_short_name(rc));
+        if (rc != STM_OK) return rc;
+        *out_written = len;
+        return STM_OK;
+    }
+
+    /* TLY-A5-impl-1b: KIND_DATASET_MARK_SNAPSHOT_COMPROMISED +
+     * KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED — seventh + eighth
+     * writable kinds. Set / clear the rollback-compromised marker on
+     * a snapshot (STM_SNAP_FLAG_ROLLBACK_COMPROMISED). Dataset-level
+     * write-only files; body shape matches the snapshot-verb family:
+     *   mark   body: "<sid>" (decimal snapshot id)
+     *   unmark body: "force <sid>" — the literal `force` token guards
+     *          the sensitive un-flag act (THYLACINE-V1-PLAN Q15).
+     *
+     * Carries the writable-kind family discipline (R104 P3-5 / R105
+     * P3-1 / R107): admin gate → zero-byte refusal → fs-attached →
+     * session-validate; every post-admin outcome logged to /events.
+     *
+     * Unlike hold/release (durable at the next sync), the marker is a
+     * security flag — this handler commits synchronously via
+     * stm_fs_commit on success so the bit is durable the moment the
+     * verb returns OK, not deferred. */
+    if (k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED
+            || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED) {
+        bool is_mark = (k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED);
+        const char *verb = is_mark ? "mark-snapshot-compromised"
+                                   : "unmark-snapshot-compromised";
+
+        if (!ctl_caller_is_admin(cn)) return STM_EACCES;
+        if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
+        pthread_mutex_lock(&cn->mu);
+        ctl_session *s = session_get_locked(cn, fid);
+        if (!s || s->qid_path != qid_path) {
+            pthread_mutex_unlock(&cn->mu);
+            return STM_EBACKEND;
+        }
+        pthread_mutex_unlock(&cn->mu);
+
+        uint64_t dsid = qid_dataset_id(qid_path);
+
+        if (len == 0) {
+            stm_ctl_log_event(c,
+                "%s uid=%u dataset=%llu snap-id=0 result=err:einval",
+                verb, (unsigned)cn->caller_uid, (unsigned long long)dsid);
+            return STM_EINVAL;
+        }
+
+        /* Trim trailing whitespace + newline. */
+        size_t end = len;
+        while (end > 0) {
+            uint8_t ch = ((const uint8_t *)buf)[end - 1];
+            if (ch != '\n' && ch != '\r' && ch != ' ' && ch != '\t')
+                break;
+            end--;
+        }
+        if (end == 0) {
+            stm_ctl_log_event(c,
+                "%s uid=%u dataset=%llu snap-id=0 result=err:einval",
+                verb, (unsigned)cn->caller_uid, (unsigned long long)dsid);
+            return STM_EINVAL;
+        }
+
+        /* For unmark, strip the mandatory leading "force" token +
+         * whitespace; the snap_id decimal follows. mark takes the
+         * whole trimmed slice as the decimal id. */
+        const char *tok = (const char *)buf;
+        size_t      tok_len = end;
+        if (!is_mark) {
+            static const char FORCE[] = "force";
+            size_t fl = sizeof FORCE - 1u;
+            const char *b = (const char *)buf;
+            if (end <= fl || memcmp(b, FORCE, fl) != 0
+                    || (b[fl] != ' ' && b[fl] != '\t')) {
+                stm_ctl_log_event(c,
+                    "%s uid=%u dataset=%llu result=err:einval (force token required)",
+                    verb, (unsigned)cn->caller_uid,
+                    (unsigned long long)dsid);
+                return STM_EINVAL;
+            }
+            size_t off = fl;
+            while (off < end && (b[off] == ' ' || b[off] == '\t')) off++;
+            tok = b + off;
+            tok_len = end - off;
+        }
+
+        uint64_t snap_id = 0;
+        if (tok_len == 0
+                || parse_snapshot_id(tok, tok_len, &snap_id) != 0) {
+            stm_ctl_log_event(c,
+                "%s uid=%u dataset=%llu snap-id=<bad-parse> result=err:einval",
+                verb, (unsigned)cn->caller_uid, (unsigned long long)dsid);
+            return STM_EINVAL;
+        }
+
+        stm_status rc = is_mark
+            ? stm_fs_mark_snapshot_compromised(c->fs, snap_id)
+            : stm_fs_unmark_snapshot_compromised(c->fs, snap_id);
+        /* Commit synchronously on success so the security marker is
+         * durable on return. Surface a commit failure as the verb's
+         * result. */
+        if (rc == STM_OK) {
+            stm_status crc = stm_fs_commit(c->fs);
+            if (crc != STM_OK) rc = crc;
+        }
+        stm_ctl_log_event(c,
+            "%s uid=%u dataset=%llu snap-id=%llu result=%s%s",
+            verb, (unsigned)cn->caller_uid,
+            (unsigned long long)dsid, (unsigned long long)snap_id,
+            rc == STM_OK ? "" : "err:", status_short_name(rc));
         if (rc != STM_OK) return rc;
         *out_written = len;
         return STM_OK;

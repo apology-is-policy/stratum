@@ -51,6 +51,8 @@ KIND_DATASET_CREATE_SNAPSHOT   /datasets/<id>/create-snapshot    0200    admin-w
 KIND_DATASET_DELETE_SNAPSHOT   /datasets/<id>/delete-snapshot    0200    admin-write
 KIND_DATASET_HOLD_SNAPSHOT     /datasets/<id>/hold-snapshot      0200    admin-write
 KIND_DATASET_RELEASE_SNAPSHOT  /datasets/<id>/release-snapshot   0200    admin-write
+KIND_DATASET_MARK_SNAPSHOT_COMPROMISED   /datasets/<id>/mark-snapshot-compromised   0200  admin-write (TLY-A5)
+KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED /datasets/<id>/unmark-snapshot-compromised 0200  admin-write (TLY-A5)
 KIND_EVENTS                    /events                           0444    file (snapshot-at-Tlopen)
 KIND_ADMIN_DIR                 /admin/                           0500    admin-dir
 KIND_ADMIN_PEER                /admin/peer                       0400    admin-file
@@ -204,6 +206,8 @@ Live writable kinds:
 | `KIND_DATASET_DELETE_SNAPSHOT` | `<snap_id>` (decimal) | stm_fs_delete_snapshot |
 | `KIND_DATASET_HOLD_SNAPSHOT` | `<snap_id>` | stm_fs_hold_snapshot |
 | `KIND_DATASET_RELEASE_SNAPSHOT` | `<snap_id>` | stm_fs_release_snapshot |
+| `KIND_DATASET_MARK_SNAPSHOT_COMPROMISED` | `<snap_id>` | stm_fs_mark_snapshot_compromised (TLY-A5; commits synchronously) |
+| `KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED` | `force <snap_id>` | stm_fs_unmark_snapshot_compromised (TLY-A5; `force` token required per Q15) |
 
 Every successful admin write logs `result=ok` to /events via
 `stm_ctl_log_event`; every failed admin write logs
