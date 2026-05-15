@@ -44,6 +44,7 @@
 #include <stratum/extent.h>
 #include <stratum/fs.h>            /* P7-CAS-16: STM_FS_RECORDSIZE_MAX */
 #include <stratum/hash.h>
+#include <stratum/corvus_client.h>
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
@@ -509,13 +510,15 @@ static void sync_dek_wipe_all(stm_sync *s)
 /* Shared iterate-and-unwrap context used by stm_sync_open to
  * rehydrate every schema entry's DEK on mount. */
 typedef struct {
-    stm_sync                  *s;
-    const stm_hybrid_keys     *wk;
-    struct stm_janus_client   *janus;
+    stm_sync                   *s;
+    const stm_hybrid_keys      *wk;
+    struct stm_janus_client    *janus;
+    const stm_corvus_mount_cfg *corvus;   /* TLY-A3-keyslot; NULL = none */
 } sync_unwrap_ctx;
 
 static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
                            stm_keyschema_state state,
+                           stm_keyschema_wrapper wrapper,
                            const void *wrapped, size_t wrapped_len,
                            void *ctx_)
 {
@@ -525,29 +528,81 @@ static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
      * unwrap to save cycles + keep the key out of RAM. */
     if (state == STM_KS_STATE_PRUNING) return 0;
 
-    uint8_t ad[STM_SYNC_WRAP_AD_LEN];
-    build_wrap_ad(u->s->pool_uuid, dataset_id, key_id, ad);
-
     uint8_t dek[32];
     size_t  dek_len = sizeof dek;
     stm_status rc;
-    if (u->wk) {
-        rc = stm_hybrid_unwrap(u->wk->sk, ad, sizeof ad,
-                                 wrapped, wrapped_len,
-                                 dek, &dek_len);
+
+    if (wrapper == STM_KS_WRAPPER_CORVUS) {
+        /* TLY-A3-keyslot: route a corvus-wrapped slot over the corvus
+         * UNWRAP socket. This is the mount-time half of
+         * key_schema.tla::MountResolvesKeyBeforeData — running here,
+         * inside stm_sync_open (before stm_fs_mount returns a usable
+         * handle), means a CURRENT corvus slot that won't unwrap
+         * aborts the mount before any data block is observable. */
+        if (!u->corvus || !u->corvus->session_token) {
+            /* Pool carries a corvus slot but the operator gave no
+             * --corvus-session-token-file. CURRENT → fail-fast abort;
+             * RETIRED → soft-skip (degraded reads of pre-rotation
+             * data only, same posture as a local unwrap failure). */
+            stm_ct_memzero(dek, sizeof dek);
+            if (state == STM_KS_STATE_CURRENT) return (int)STM_EINVAL;
+            return 0;
+        }
+        /* corvus identifies the slot by a (dataset, key_id) pair.
+         * v1.0 binding: the corvus dataset name is the decimal
+         * dataset_id; key_id is the keyschema key_id verbatim. The
+         * real corvus dataset-name binding is the open bilateral
+         * question — STRATUM-API-V1.md §5.2 specs only the UNWRAP
+         * verb; see v2/docs/thylacine-keyslot-design.md §10. */
+        char ds_name[21];
+        int dn = snprintf(ds_name, sizeof ds_name, "%llu",
+                            (unsigned long long)dataset_id);
+        if (dn < 0 || (size_t)dn >= sizeof ds_name) {
+            stm_ct_memzero(dek, sizeof dek);
+            return (int)STM_EBACKEND;
+        }
+        stm_corvus_transport_opts t = {
+            .socket_path        = u->corvus->socket_path,
+            .connect_timeout_ms = u->corvus->connect_timeout_ms,
+            .io_timeout_ms      = u->corvus->io_timeout_ms,
+            .n_retries          = u->corvus->n_retries,
+        };
+        rc = stm_corvus_unwrap(&t, u->corvus->session_token,
+                                 ds_name, (size_t)dn, key_id,
+                                 wrapped, wrapped_len, dek);
+        /* stm_corvus_unwrap fills exactly STM_CORVUS_DEK_LEN (32)
+         * bytes of `dek` on STM_OK; the dek_len discipline below is
+         * shared with the local path. */
+        if (rc == STM_OK) dek_len = STM_CORVUS_DEK_LEN;
     } else {
-        /* Reconstruct pool_uuid bytes from the AD (matches janus
-         * backend's build_ad). */
-        uint8_t pool_uuid_bytes[16];
-        memcpy(pool_uuid_bytes, ad, 16);
-        rc = stm_janus_client_unwrap(u->janus,
-                                       pool_uuid_bytes,
-                                       dataset_id, key_id,
-                                       wrapped, wrapped_len,
-                                       dek, &dek_len);
-        stm_ct_memzero(pool_uuid_bytes, sizeof pool_uuid_bytes);
+        /* LEGACY / PASSPHRASE / JANUS: the local key source. A pool
+         * is mounted with exactly one of {wk, janus}; the wrapper tag
+         * for these slots is informational at mount (the wk/janus
+         * selection is what routes them). */
+        uint8_t ad[STM_SYNC_WRAP_AD_LEN];
+        build_wrap_ad(u->s->pool_uuid, dataset_id, key_id, ad);
+        if (u->wk) {
+            rc = stm_hybrid_unwrap(u->wk->sk, ad, sizeof ad,
+                                     wrapped, wrapped_len,
+                                     dek, &dek_len);
+        } else if (u->janus) {
+            /* Reconstruct pool_uuid bytes from the AD (matches janus
+             * backend's build_ad). */
+            uint8_t pool_uuid_bytes[16];
+            memcpy(pool_uuid_bytes, ad, 16);
+            rc = stm_janus_client_unwrap(u->janus,
+                                           pool_uuid_bytes,
+                                           dataset_id, key_id,
+                                           wrapped, wrapped_len,
+                                           dek, &dek_len);
+            stm_ct_memzero(pool_uuid_bytes, sizeof pool_uuid_bytes);
+        } else {
+            /* Unreachable: stm_sync_open requires exactly one of
+             * {wk, janus}. Defensive. */
+            rc = STM_EINVAL;
+        }
+        stm_ct_memzero(ad, sizeof ad);
     }
-    stm_ct_memzero(ad, sizeof ad);
 
     if (rc != STM_OK) {
         stm_ct_memzero(dek, sizeof dek);
@@ -1502,6 +1557,7 @@ static uint64_t compute_auth_gen(const sync_scan *scans, size_t n, size_t quorum
 stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                           const stm_hybrid_keys *wk,
                           struct stm_janus_client *janus,
+                          const stm_corvus_mount_cfg *corvus,
                           stm_sync **out_sync)
 {
     if (!p || !a || !out_sync) return STM_EINVAL;
@@ -1749,8 +1805,10 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
     s2->keyschema_root_paddr = ks_root_paddr;
     memcpy(s2->keyschema_root_csum, ks_hdr.ks_root.bp_csum, 32);
 
-    /* P4-4c: unwrap every CURRENT + RETIRED entry into the DEK map. */
-    sync_unwrap_ctx ux = { .s = s2, .wk = wk, .janus = janus };
+    /* P4-4c: unwrap every CURRENT + RETIRED entry into the DEK map.
+     * TLY-A3-keyslot: corvus-wrapped slots route over `corvus`. */
+    sync_unwrap_ctx ux = { .s = s2, .wk = wk, .janus = janus,
+                            .corvus = corvus };
     stm_status all_rc = stm_keyschema_iter(s2->keyschema, sync_unwrap_cb, &ux);
     if (all_rc != STM_OK) {
         stm_sync_close(s2);
@@ -4207,10 +4265,11 @@ typedef struct {
 
 static int sweep_collect_cb(uint64_t dataset_id, uint64_t key_id,
                              stm_keyschema_state state,
+                             stm_keyschema_wrapper wrapper,
                              const void *wrapped, size_t wrapped_len,
                              void *ctx_)
 {
-    (void)wrapped; (void)wrapped_len;
+    (void)wrapper; (void)wrapped; (void)wrapped_len;
     sweep_collect *c = ctx_;
     if (dataset_id != c->dataset_id_filter) return 0;
     if (state != STM_KS_STATE_RETIRED) return 0;
@@ -4474,6 +4533,31 @@ stm_status stm_sync_set_cdc_params_for_test(stm_sync *s,
     s->cdc = tmp;
     pthread_mutex_unlock(&s->lock);
     return STM_OK;
+}
+
+/* TLY-A3-keyslot: test-only keyschema slot injection with a chosen
+ * wrapper tag. See <stratum/sync_testing.h> for why this seam exists
+ * (no production WRAP path yet). The blob is opaque — for a CORVUS
+ * slot the fake corvus maps (dataset_id, key_id) → DEK regardless of
+ * blob content. Persisted on the next stm_sync_commit. */
+stm_status stm_sync_keyschema_insert_for_test(stm_sync *s,
+                                                uint64_t dataset_id,
+                                                uint64_t key_id,
+                                                stm_keyschema_wrapper wrapper,
+                                                const void *wrapped,
+                                                size_t wrapped_len)
+{
+    if (!s || !wrapped || wrapped_len == 0) return STM_EINVAL;
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+    stm_status rc = stm_keyschema_insert_wrapped(s->keyschema,
+                                                   dataset_id, key_id,
+                                                   STM_KS_STATE_CURRENT,
+                                                   wrapper,
+                                                   wrapped, wrapped_len);
+    pthread_mutex_unlock(&s->lock);
+    return rc;
 }
 #endif /* STRATUM_BUILD_TESTING_HOOKS */
 

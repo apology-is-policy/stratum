@@ -64,6 +64,7 @@
 #include <stratum/inode.h>
 #include <stratum/locks.h>
 #include <stratum/xattr.h>
+#include <stratum/corvus_client.h>
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
@@ -706,11 +707,63 @@ stm_status stm_fs_mount(const char *path,
         return s;
     }
 
+    /* TLY-A3-keyslot: load the corvus session token (if configured)
+     * into an mlock'd buffer for the mount-time unwrap of any
+     * CORVUS-tagged keyschema slot. corvus is configured iff a token
+     * file was given; the socket path defaults inside the corvus
+     * client when NULL. */
+    uint8_t *corvus_token = NULL;
+    stm_corvus_mount_cfg corvus_cfg = {0};
+    const stm_corvus_mount_cfg *corvus_cfg_p = NULL;
+    if (opts->corvus_session_token_file) {
+        corvus_token = malloc(STM_CORVUS_TOKEN_LEN);
+        if (!corvus_token) {
+            stm_alloc_close(a);
+            stm_pool_close(pool);
+            stm_bdev_close(d);
+            stm_hybrid_keys_wipe(&wk);
+            if (janus) stm_janus_client_disconnect(janus);
+            return STM_ENOMEM;
+        }
+        (void)mlock(corvus_token, STM_CORVUS_TOKEN_LEN);
+        stm_status ts = stm_corvus_load_token(opts->corvus_session_token_file,
+                                                corvus_token);
+        if (ts != STM_OK) {
+            stm_ct_memzero(corvus_token, STM_CORVUS_TOKEN_LEN);
+            (void)munlock(corvus_token, STM_CORVUS_TOKEN_LEN);
+            free(corvus_token);
+            stm_alloc_close(a);
+            stm_pool_close(pool);
+            stm_bdev_close(d);
+            stm_hybrid_keys_wipe(&wk);
+            if (janus) stm_janus_client_disconnect(janus);
+            return ts;
+        }
+        corvus_cfg.socket_path   = opts->corvus_socket;
+        corvus_cfg.session_token = corvus_token;
+        /* Timeouts 0 → the corvus client substitutes its
+         * production-safe defaults (R144 P2-1); n_retries 3 is the
+         * full Q9 backoff schedule [100, 500, 2000] ms. */
+        corvus_cfg.n_retries = 3;
+        corvus_cfg_p = &corvus_cfg;
+    }
+
     stm_sync *sync = NULL;
     s = stm_sync_open(pool, a,
                         have_kf ? &wk : NULL,
                         have_jn ? janus : NULL,
+                        corvus_cfg_p,
                         &sync);
+    /* The session token is needed only for the mount-time unwrap;
+     * the resulting DEKs now live in the sync DEK map (zeroed at
+     * unmount via sync_dek_wipe_all). Scrub + release the token
+     * regardless of outcome — it is not retained past mount. */
+    if (corvus_token) {
+        stm_ct_memzero(corvus_token, STM_CORVUS_TOKEN_LEN);
+        (void)munlock(corvus_token, STM_CORVUS_TOKEN_LEN);
+        free(corvus_token);
+        corvus_token = NULL;
+    }
     if (s != STM_OK) {
         stm_alloc_close(a);
         stm_pool_close(pool);

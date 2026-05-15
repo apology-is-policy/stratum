@@ -378,7 +378,7 @@ STM_TEST(rotation_persists_across_mount) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     uint8_t dek_old2[32], dek_new2[32];
     STM_ASSERT_OK(stm_sync_get_dek(s2, 7, 0, dek_old2));
@@ -415,7 +415,7 @@ STM_TEST(swept_keys_dont_reappear_on_reopen) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     uint8_t dek[32];
     STM_ASSERT_EQ(stm_sync_get_dek(s2, 3, 0, dek), STM_ENOENT);
@@ -694,7 +694,7 @@ STM_TEST(rotate_dataset_key_janus) {
 
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, NULL, jc, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, NULL, jc, NULL, &s2));
 
     /* Ensure the initial add DEK is recoverable post-mount. */
     uint8_t dek_init[32];
@@ -773,7 +773,7 @@ STM_TEST(p7_10_root_dek_persists_across_mount) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_pool *pool2 = make_test_pool(d);
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     uint8_t root_dek_after[32];
     STM_ASSERT_OK(stm_sync_get_dek(s2, 1, 0, root_dek_after));

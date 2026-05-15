@@ -29,6 +29,7 @@
 #define STRATUM_V2_SYNC_TESTING_H
 
 #include <stratum/cdc.h>
+#include <stratum/keyschema.h>
 #include <stratum/types.h>
 
 #ifdef __cplusplus
@@ -54,6 +55,34 @@ typedef struct stm_sync stm_sync;
 STM_MUST_USE
 stm_status stm_sync_set_cdc_params_for_test(stm_sync *s,
                                               const stm_cdc_params *params);
+
+/*
+ * TLY-A3-keyslot: insert a keyschema slot carrying a chosen
+ * `wrapper` tag and an opaque `wrapped` blob, WITHOUT performing a
+ * real cryptographic wrap. Persisted on the next stm_sync_commit.
+ *
+ * This seam exists because the mount-time UNWRAP-routing tests need
+ * a pool that carries a STM_KS_WRAPPER_CORVUS slot, but the
+ * production WRAP path that would produce a genuine corvus-sealed
+ * blob does not exist yet — STRATUM-API-V1.md §5.2 specs only the
+ * UNWRAP verb (the open bilateral question, thylacine-keyslot-design
+ * §10). The blob is whatever bytes the caller supplies; a fake
+ * corvus keyed by (dataset_id, key_id) maps it back to a DEK.
+ *
+ * The slot is inserted as CURRENT. The DEK is NOT added to the
+ * in-RAM DEK map — the point of the test is that a subsequent
+ * stm_sync_open rehydrates it via the wrapper-routed unwrap path.
+ *
+ * Returns STM_OK; STM_EINVAL on NULL/oversize args; propagates
+ * keyschema-layer errors otherwise.
+ */
+STM_MUST_USE
+stm_status stm_sync_keyschema_insert_for_test(stm_sync *s,
+                                                uint64_t dataset_id,
+                                                uint64_t key_id,
+                                                stm_keyschema_wrapper wrapper,
+                                                const void *wrapped,
+                                                size_t wrapped_len);
 #endif /* STRATUM_BUILD_TESTING_HOOKS */
 
 #ifdef __cplusplus

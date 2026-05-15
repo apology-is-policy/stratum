@@ -206,14 +206,48 @@ void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
  * the handle via stm_alloc_close and not reuse it.
  */
 /*
+ * TLY-A3-keyslot: optional corvus key-agent config for the mount-time
+ * unwrap of keyschema slots tagged STM_KS_WRAPPER_CORVUS. Passed to
+ * stm_sync_open alongside `wk` / `janus`. NULL → no corvus configured:
+ * a CURRENT corvus-wrapped slot then aborts the mount (fail-fast,
+ * key_schema.tla::MountResolvesKeyBeforeData); RETIRED/PRUNING corvus
+ * slots soft-skip exactly like an unwrap failure.
+ *
+ * corvus is NOT mutually exclusive with `wk` / `janus`: a pool's
+ * metadata key (0,0) and any legacy/passphrase/janus dataset slots
+ * resolve via the local path, while per-dataset CORVUS slots resolve
+ * over corvus — the wrapper_identity tag routes each slot. The token
+ * is borrowed: caller keeps it valid (and SHOULD keep it mlock'd) for
+ * the duration of the stm_sync_open call; it is not referenced after.
+ */
+typedef struct {
+    /* AF_UNIX path of the corvus UNWRAP socket. NULL → the corvus
+     * client's default ("/srv/corvus/ops/unwrap") is used. */
+    const char    *socket_path;
+    /* Session token — exactly STM_CORVUS_TOKEN_LEN (33) bytes.
+     * Borrowed; sensitive. NULL → corvus is treated as not
+     * configured. */
+    const uint8_t *session_token;
+    /* Transport timeouts / retry budget. 0 timeouts → the corvus
+     * client substitutes a production-safe default (R144 P2-1). */
+    uint32_t       connect_timeout_ms;
+    uint32_t       io_timeout_ms;
+    uint32_t       n_retries;
+} stm_corvus_mount_cfg;
+
+/*
  * P4-4b: `wk` and `janus` are mutually exclusive — exactly one must
  * be non-NULL. `wk` uses the in-process unwrap path (keyfile / legacy);
  * `janus` routes the unwrap over the 9P socket to a remote daemon.
+ *
+ * TLY-A3-keyslot: `corvus` is optional (NULL = none) and additive —
+ * see stm_corvus_mount_cfg above.
  */
 STM_MUST_USE
 stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                           const stm_hybrid_keys *wk,
                           struct stm_janus_client *janus,
+                          const stm_corvus_mount_cfg *corvus,
                           stm_sync **out_sync);
 
 /*

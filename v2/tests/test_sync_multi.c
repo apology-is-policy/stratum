@@ -165,7 +165,7 @@ STM_TEST(sync_multi_3dev_roundtrip) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2));
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 3u);
     STM_ASSERT_EQ(info.auth_gen,              4u);
@@ -237,7 +237,7 @@ STM_TEST(sync_multi_mount_survives_single_device_loss) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2));
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 3u);
@@ -281,7 +281,7 @@ STM_TEST(sync_multi_mount_refuses_sub_quorum) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_ERR(stm_sync_open(pool, a2, make_wk(), NULL, &s2), STM_EQUORUM);
+    STM_ASSERT_ERR(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2), STM_EQUORUM);
     STM_ASSERT(s2 == NULL);
 
     stm_alloc_close(a2);
@@ -307,7 +307,7 @@ STM_TEST(sync_multi_mount_all_blank_returns_enoent) {
                                      (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
                                      TEST_BOOTSTRAP_BYTES, &a));
     stm_sync *s = NULL;
-    STM_ASSERT_ERR(stm_sync_open(pool, a, make_wk(), NULL, &s), STM_ENOENT);
+    STM_ASSERT_ERR(stm_sync_open(pool, a, make_wk(), NULL, NULL, &s), STM_ENOENT);
     STM_ASSERT(s == NULL);
 
     stm_alloc_close(a);
@@ -440,7 +440,7 @@ STM_TEST(sync_multi_orphan_ahead_of_quorum_ignored_on_mount) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2));
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 2u);    /* reservation gen */
@@ -498,7 +498,7 @@ STM_TEST(sync_multi_mount_tolerates_minority_content_divergence) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2));
     STM_ASSERT(s2 != NULL);
 
     stm_sync_close(s2);
@@ -566,7 +566,7 @@ STM_TEST(sync_multi_mount_detects_alloc_root_gen_tamper) {
     /* Majority (devs 1,2) has tampered alloc_root_gen=999. Mount
      * picks majority's content as canonical. Loads tree with gen=999;
      * AEAD fails (real tree encrypted at gen=1). STM_EBADTAG. */
-    stm_status ms = stm_sync_open(pool, a2, make_wk(), NULL, &s2);
+    stm_status ms = stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2);
     STM_ASSERT(ms != STM_OK);
     STM_ASSERT(s2 == NULL);
 
@@ -624,7 +624,7 @@ STM_TEST(sync_multi_mount_refuses_no_content_quorum) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_ERR(stm_sync_open(pool, a2, make_wk(), NULL, &s2), STM_EQUORUM);
+    STM_ASSERT_ERR(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2), STM_EQUORUM);
     STM_ASSERT(s2 == NULL);
 
     stm_alloc_close(a2);
@@ -743,7 +743,7 @@ STM_TEST(sync_multi_redundancy_mirror_roundtrip) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2));
 
     stm_redundancy_profile got2;
     STM_ASSERT_OK(stm_sync_redundancy_get(s2, &got2));
@@ -886,7 +886,7 @@ STM_TEST(sync_multi_redundancy_mount_rejects_nonzero_tail_on_none) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_EQ(stm_sync_open(pool, a2, make_wk(), NULL, &s2), STM_ECORRUPT);
+    STM_ASSERT_EQ(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2), STM_ECORRUPT);
     STM_ASSERT(s2 == NULL);
 
     stm_alloc_close(a2);
@@ -1194,7 +1194,7 @@ STM_TEST(sync_multi_mirror_survives_unmount_remount) {
     }
 
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool, a2s[0], make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool, a2s[0], make_wk(), NULL, NULL, &s2));
     /* attach_alloc with a mounted sync auto-loads each device's alloc
      * tree from the roots object. */
     for (size_t i = 1; i < NDEV; i++)
@@ -1297,7 +1297,7 @@ STM_TEST(sync_multi_alloc_roots_multi_commit_cycle) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2));
 
     uint64_t p2 = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a2, 9u, 0, &p2));
@@ -1370,7 +1370,7 @@ STM_TEST(sync_multi_mount_refuses_v5_ub) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_ERR(stm_sync_open(pool, a2, make_wk(), NULL, &s2),
+    STM_ASSERT_ERR(stm_sync_open(pool, a2, make_wk(), NULL, NULL, &s2),
                     STM_EBADVERSION);
     STM_ASSERT(s2 == NULL);
 
@@ -1429,7 +1429,7 @@ STM_TEST(sync_multi_mirror_per_device_nonce_differentiation) {
         STM_ASSERT_OK(stm_alloc_set_device_id(a2s[i], (uint16_t)i));
     }
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool, a2s[0], make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool, a2s[0], make_wk(), NULL, NULL, &s2));
     for (size_t i = 1; i < NDEV; i++)
         STM_ASSERT_OK(stm_sync_attach_alloc(s2, (uint16_t)i, a2s[i]));
 
@@ -1504,7 +1504,7 @@ STM_TEST(sync_multi_mirror_write_refuses_read_only) {
         STM_ASSERT_OK(stm_alloc_set_device_id(ro_as[i], (uint16_t)i));
     }
     stm_sync *ro_s = NULL;
-    STM_ASSERT_OK(stm_sync_open(ro_pool, ro_as[0], make_wk(), NULL, &ro_s));
+    STM_ASSERT_OK(stm_sync_open(ro_pool, ro_as[0], make_wk(), NULL, NULL, &ro_s));
     for (size_t i = 1; i < NDEV; i++)
         STM_ASSERT_OK(stm_sync_attach_alloc(ro_s, (uint16_t)i, ro_as[i]));
 
@@ -1680,7 +1680,7 @@ STM_TEST(sync_multi_add_device_mid_session_survives_remount) {
         STM_ASSERT_OK(stm_alloc_set_device_id(a2s[i], (uint16_t)i));
     }
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool2, a2s[0], make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2s[0], make_wk(), NULL, NULL, &s2));
     STM_ASSERT_OK(stm_sync_attach_alloc(s2, 1, a2s[1]));
     STM_ASSERT_OK(stm_sync_attach_alloc(s2, 2, a2s[2]));
 

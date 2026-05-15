@@ -795,7 +795,7 @@ stm_status stm_keyschema_iter(const stm_keyschema *ks,
 {
     if (!ks || !cb) return STM_EINVAL;
     for (const ks_entry *e = ks->head; e; e = e->next) {
-        int r = cb(e->dataset_id, e->key_id, e->state,
+        int r = cb(e->dataset_id, e->key_id, e->state, e->wrapper,
                     e->wrapped, e->wrapped_len, ctx);
         if (r != 0) return (stm_status)r;
     }

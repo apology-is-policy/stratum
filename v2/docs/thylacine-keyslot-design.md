@@ -211,18 +211,32 @@ already models the keyslot set; this is a small extension):
 
 Each sub-chunk its own commit + audit-trigger discipline:
 
-1. **3a — format + flag**: `wrapper_identity` byte in the keyschema
-   entry encoding; `STM_UB_VERSION` bump; feature flag (tier per
-   Q-KS1); migration pass that adds a `CORVUS` slot to an existing
-   dataset's current DEK.
-2. **3b — mount wiring + CLI**: route a `CORVUS` slot through
-   `stm_corvus_unwrap` at mount/attach time, fail-fast; `--corvus-socket`
-   + `--corvus-session-token-file`; DEK mlock'd cache +
-   `explicit_bzero` on unmount + A4 eviction; the §6 `send_init`
-   `get_dek` touchpoint.
+1. **3a — format + flag** ✓ (`2d68c08`): `wrapper_identity` byte in
+   the keyschema entry encoding; `STM_UB_VERSION` 26 → 27.
+2. **3b — mount wiring + CLI** ✓: `sync_unwrap_cb` routes a `CORVUS`
+   slot through `stm_corvus_unwrap` at `stm_sync_open` time,
+   fail-fast (`MountResolvesKeyBeforeData`); `stm_corvus_mount_cfg`
+   threaded through `stm_sync_open`; `--corvus-socket` +
+   `--corvus-session-token-file` on stratumd; token loaded into an
+   mlock'd buffer for the mount and `stm_ct_memzero`'d after; the
+   unwrapped DEK lands in the sync DEK map (zeroed at unmount /
+   A4 eviction by the existing `sync_dek_wipe_all`). The §6
+   `send_init` `get_dek` touchpoint needed NO code — the corvus DEK
+   is in `sync->deks` after mount, so `stm_sync_get_dek` serves it
+   transparently (verified). Tests: `test_corvus_mount.c` (4 e2e
+   cases: resolve / no-corvus / corvus-reject / unreachable) against
+   a fake corvus; CORVUS slots injected via the test-only
+   `stm_sync_keyschema_insert_for_test` seam (no production WRAP
+   path exists — §10).
 3. **audit**: fresh round scoping the format change, the
-   `MountResolvesKeyBeforeData` impl, the migration path, and the
-   DEK mount-time lifecycle.
+   `MountResolvesKeyBeforeData` impl, the DEK mount-time lifecycle,
+   and the test-only keyschema-insert seam.
+
+   The pre-3b plan listed a "migration pass that adds a `CORVUS`
+   slot to an existing dataset's current DEK" under 3a; that is the
+   WRAP path and is blocked on the §10 bilateral question — it is
+   NOT part of 3a/3b. impl-3b ships only the mount-time UNWRAP
+   routing; producing a CORVUS-sealed blob is future work.
 
 (The earlier 3-sub-chunk plan had a separate snapshot/send-recv
 chunk; that is gone — §4/§5.)

@@ -124,6 +124,14 @@ static void usage(const char *argv0)
         "  --corvus-notify-timeout <seconds>\n"
             "                           Tolerant-mode reconnect window "
             "(default: 30)\n"
+        "  --corvus-socket <path>   Path to corvus UNWRAP socket for "
+            "per-dataset CORVUS-wrapped keyschema slots (TLY-A3-keyslot; "
+            "default: /srv/corvus/ops/unwrap). Distinct from "
+            "--corvus-notify-socket.\n"
+        "  --corvus-session-token-file <path>\n"
+            "                           Path to the 33-byte corvus session "
+            "token. When set, CORVUS-tagged keyschema slots are unwrapped "
+            "over corvus at mount (TLY-A3-keyslot).\n"
         "  --role {coord,client}    Stratumd role (default: coord). client mode\n"
             "                           runs as a per-user proxy to a coordinator\n"
             "                           stratumd; requires --coordinator-socket and\n"
@@ -373,6 +381,17 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         }
         if (!strcmp(a, "--corvus-notify-socket") && i + 1 < argc) {
             opts.corvus_notify_socket = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--corvus-socket") && i + 1 < argc) {
+            /* TLY-A3-keyslot: corvus UNWRAP socket (distinct from
+             * --corvus-notify-socket above, which is the
+             * SESSION_CLOSED notify consumer's socket). */
+            opts.corvus_unwrap_socket = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--corvus-session-token-file") && i + 1 < argc) {
+            opts.corvus_session_token_file = argv[++i];
             continue;
         }
         if (!strcmp(a, "--corvus-notify-mode") && i + 1 < argc) {

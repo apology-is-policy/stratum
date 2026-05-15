@@ -291,9 +291,15 @@ stm_status stm_keyschema_prune(stm_keyschema *ks,
 /*
  * Callback signature for `stm_keyschema_iter`. Returns 0 to continue,
  * non-zero to stop; iter propagates the non-zero value to its caller.
+ *
+ * `wrapper` is the slot's wrapper_identity (TLY-A3-keyslot) — the
+ * mount-time unwrap path routes a CORVUS slot to stm_corvus_unwrap by
+ * inspecting it. Callbacks that don't care (e.g. the retired-key
+ * sweeper) just ignore the parameter.
  */
 typedef int (*stm_keyschema_iter_cb)(uint64_t dataset_id, uint64_t key_id,
                                        stm_keyschema_state state,
+                                       stm_keyschema_wrapper wrapper,
                                        const void *wrapped, size_t wrapped_len,
                                        void *ctx);
 

@@ -1194,6 +1194,10 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
         /* TLY-A1: forward pool_serial if --bind-pool-serial was set. */
         .expected_pool_serial   = opts->bind_pool_serial
                                     ? opts->pool_serial : NULL,
+        /* TLY-A3-keyslot: forward corvus unwrap config. corvus is
+         * consulted only when corvus_session_token_file is set. */
+        .corvus_socket             = opts->corvus_unwrap_socket,
+        .corvus_session_token_file = opts->corvus_session_token_file,
     };
 
     stm_fs *fs = NULL;

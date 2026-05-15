@@ -183,6 +183,27 @@ typedef struct {
      * emitted in the unbound-success path. /ctl/events surface
      * (forward-noted, TLY-A1b chunk) will fold that telemetry. */
     const uint8_t *expected_pool_serial;
+
+    /* TLY-A3-keyslot: corvus key-agent config for per-dataset keyschema
+     * slots tagged STM_KS_WRAPPER_CORVUS. corvus is OPTIONAL and
+     * ADDITIVE — the pool's metadata key and any legacy/passphrase/
+     * janus slots still resolve via keyfile_path / janus_socket; only
+     * CORVUS-tagged slots route over corvus (the wrapper_identity tag
+     * routes each slot at mount).
+     *
+     * corvus is "configured" iff `corvus_session_token_file` is set.
+     * stm_fs_mount loads the 33-byte session token from that path into
+     * an mlock'd buffer, uses it for the duration of the mount-time
+     * unwrap, then explicit_bzero's + frees it (the token is not
+     * needed past mount — the unwrapped DEKs live in the sync DEK map
+     * and are zeroed at unmount). If a pool carries a CURRENT
+     * CORVUS-tagged slot and no token file is given, the mount fails
+     * fast (key_schema.tla::MountResolvesKeyBeforeData).
+     *
+     * `corvus_socket` is the corvus UNWRAP socket; NULL → the corvus
+     * client default ("/srv/corvus/ops/unwrap"). */
+    const char *corvus_socket;
+    const char *corvus_session_token_file;
 } stm_fs_mount_opts;
 
 /*

@@ -100,6 +100,26 @@ byte-identical (`KS_VAL_HDR_LEN` stays 8); the `STM_UB_VERSION` bump
 gates the *semantic* break (a pre-TLY-A3 binary would misroute a
 `CORVUS` slot). See `v2/docs/thylacine-keyslot-design.md`.
 
+### Mount-time unwrap routing (TLY-A3-keyslot-impl-3b)
+
+`stm_keyschema_iter`'s callback signature carries the per-entry
+`wrapper` (`stm_keyschema_iter_cb` gained a `stm_keyschema_wrapper`
+parameter). `stm_sync_open`'s `sync_unwrap_cb` uses it: a `CORVUS`
+entry routes through `stm_corvus_unwrap` (the corvus key agent),
+every other tag routes through the local keyfile/janus path. The
+unwrap runs inside `stm_sync_open`, before `stm_fs_mount` returns a
+usable handle — so a CURRENT corvus slot that won't unwrap aborts
+the mount with no data served (`key_schema.tla::MountResolvesKey-
+BeforeData`); RETIRED/PRUNING corvus slots soft-skip on failure,
+exactly like a local-unwrap failure. corvus config reaches
+`stm_sync_open` via the optional `stm_corvus_mount_cfg` parameter
+(NULL = no corvus). `stm_fs_mount` builds it from
+`stm_fs_mount_opts.corvus_socket` + `.corvus_session_token_file`
+(the 33-byte session token is loaded into an mlock'd buffer for the
+duration of the mount and then `stm_ct_memzero`'d). The corvus
+dataset-name binding is v1.0 provisional — see
+`v2/docs/thylacine-keyslot-design.md` §10.
+
 ### Rotation + sweep
 
 ```c

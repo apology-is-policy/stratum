@@ -575,7 +575,7 @@ STM_TEST(pool_sync_open_refuses_wrong_pool_uuid) {
                                                      STM_DEV_STATE_ONLINE);
 
     stm_sync *s = NULL;
-    STM_ASSERT_ERR(stm_sync_open(wrong_pool, a, &wk, NULL, &s),
+    STM_ASSERT_ERR(stm_sync_open(wrong_pool, a, &wk, NULL, NULL, &s),
                      STM_ECORRUPT);
     STM_ASSERT(s == NULL);
 
@@ -854,7 +854,7 @@ STM_TEST(pool_sync_open_refuses_wrong_device_uuid) {
                                                      STM_DEV_STATE_ONLINE);
 
     stm_sync *s = NULL;
-    STM_ASSERT_ERR(stm_sync_open(wrong_pool, a, &wk, NULL, &s),
+    STM_ASSERT_ERR(stm_sync_open(wrong_pool, a, &wk, NULL, NULL, &s),
                      STM_ECORRUPT);
     STM_ASSERT(s == NULL);
 

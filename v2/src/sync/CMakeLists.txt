@@ -7,7 +7,8 @@ target_include_directories(stm_sync PUBLIC
 target_link_libraries(stm_sync
     PRIVATE stm_warnings stm_sanitize stm_coverage Threads::Threads
     PUBLIC  stm_sb stm_alloc stm_alloc_roots stm_block stm_hash stm_crypto
-            stm_cdc stm_keyschema stm_keyfile stm_janus stm_pool)
+            stm_cdc stm_keyschema stm_keyfile stm_janus stm_corvus_client
+            stm_pool)
 
 # P7-CAS-4b: gate stm_sync_set_cdc_params_for_test (the FastCDC params
 # override used by chunked-migrate tests) behind STRATUM_BUILD_TESTING_HOOKS,

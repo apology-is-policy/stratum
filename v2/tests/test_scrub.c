@@ -1216,7 +1216,7 @@ STM_TEST(scrub_durable_resumes_after_reopen) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bd2, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     /* Create scrub on the reopened sync. Should restore mid-run state. */
     stm_scrub *sc2 = NULL;
@@ -1316,7 +1316,7 @@ STM_TEST(scrub_durable_resumes_beta_run_after_reopen) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bd2, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     stm_scrub *sc2 = NULL;
     STM_ASSERT_OK(stm_scrub_create(s2, &sc2));

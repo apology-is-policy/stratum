@@ -346,7 +346,7 @@ complementary gates:
 | TLY-A2-impl-5: 72-hour stress | DEFERRED | GCP-gated; 4 clients concurrent for long-form sweep |
 | TLY-A3-impl-1: corvus UNWRAP codec + token loader | LIVE | `v2/src/corvus_client/` — pure codec (`1eb7480`) |
 | TLY-A3-impl-2: corvus UNWRAP transport + retry | LIVE | `stm_corvus_unwrap_once` + `stm_corvus_unwrap` (Q9 backoff); raw AF_UNIX (`58a7253`) |
-| TLY-A3-impl-3: mount-time UNWRAP data-flow + CLI | PENDING | needs per-dataset `{key_id, wrapped_dek}` storage decision first — see THYLACINE-V1-PLAN.md §5 |
+| TLY-A3-keyslot-impl-3b: mount-time UNWRAP wiring + CLI | LIVE | `--corvus-socket` + `--corvus-session-token-file` → `stm_fs_mount_opts` → `stm_sync_open`'s `stm_corvus_mount_cfg`; `sync_unwrap_cb` routes `STM_KS_WRAPPER_CORVUS` slots |
 
 The corvus UNWRAP client (`v2/src/corvus_client/`) is a standalone
 library, NOT part of stratumd's transport, but is listed here because

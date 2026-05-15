@@ -159,7 +159,7 @@ STM_TEST(sync_fresh_create_has_no_uberblock) {
     /* Fresh pool has no durable UB → sync_open returns STM_ENOENT
      * BEFORE any roster validation; the pool constructed here is
      * harmless — it's closed below. */
-    STM_ASSERT_ERR(stm_sync_open(pool2, a2, make_wk(), NULL, &s2), STM_ENOENT);
+    STM_ASSERT_ERR(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2), STM_ENOENT);
     stm_pool_close(pool2);
     stm_alloc_close(a2);
 
@@ -227,7 +227,7 @@ STM_TEST(sync_mount_gen_bump) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
@@ -265,7 +265,7 @@ STM_TEST(sync_alloc_state_survives_mount) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     stm_alloc_stats ast;
     STM_ASSERT_OK(stm_alloc_stats_get(a2, &ast));
@@ -333,7 +333,7 @@ STM_TEST(sync_inode_persistence_roundtrip) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2_handle));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2_handle, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2_handle, make_wk(), NULL, NULL, &s2));
 
     stm_inode_index *iidx2 = stm_sync_inode_index(s2);
     STM_ASSERT_TRUE(iidx2 != NULL);
@@ -366,7 +366,7 @@ STM_TEST(sync_inode_persistence_roundtrip) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a3_handle));
     stm_sync *s3 = NULL;
     stm_pool *pool3 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool3, a3_handle, make_wk(), NULL, &s3));
+    STM_ASSERT_OK(stm_sync_open(pool3, a3_handle, make_wk(), NULL, NULL, &s3));
 
     stm_inode_index *iidx3 = stm_sync_inode_index(s3);
     STM_ASSERT_OK(stm_inode_lookup(iidx3, 1, a3, &v));
@@ -438,7 +438,7 @@ STM_TEST(sync_dirent_persistence_roundtrip) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     stm_dirent_index *didx2 = stm_sync_dirent_index(s2);
     STM_ASSERT_TRUE(didx2 != NULL);
@@ -484,7 +484,7 @@ STM_TEST(sync_dirent_persistence_roundtrip) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a3));
     stm_sync *s3 = NULL;
     stm_pool *pool3 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool3, a3, make_wk(), NULL, &s3));
+    STM_ASSERT_OK(stm_sync_open(pool3, a3, make_wk(), NULL, NULL, &s3));
 
     stm_dirent_index *didx3 = stm_sync_dirent_index(s3);
     STM_ASSERT_OK(stm_dirent_lookup(didx3, 1, 2,
@@ -566,7 +566,7 @@ STM_TEST(sync_xattr_persistence_roundtrip) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     stm_xattr_index *xidx2 = stm_sync_xattr_index(s2);
     STM_ASSERT_TRUE(xidx2 != NULL);
@@ -613,7 +613,7 @@ STM_TEST(sync_xattr_persistence_roundtrip) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a3));
     stm_sync *s3 = NULL;
     stm_pool *pool3 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool3, a3, make_wk(), NULL, &s3));
+    STM_ASSERT_OK(stm_sync_open(pool3, a3, make_wk(), NULL, NULL, &s3));
 
     stm_xattr_index *xidx3 = stm_sync_xattr_index(s3);
     STM_ASSERT_OK(stm_xattr_get(xidx3, 1, 100,
@@ -698,7 +698,7 @@ STM_TEST(sync_xattr_root_csum_tamper_detected) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    stm_status rs = stm_sync_open(pool2, a2, make_wk(), NULL, &s2);
+    stm_status rs = stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2);
     STM_ASSERT_EQ((int)rs, (int)STM_ECORRUPT);
     /* Pool ref must be cleaned up; sync handle was never returned so
      * nothing to teardown except the alloc + bdev. */
@@ -809,7 +809,7 @@ STM_TEST(sync_commit_empty_pool_produces_ub_alloc_root) {
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d2);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     stm_alloc_stats ast;
     STM_ASSERT_OK(stm_alloc_stats_get(a2, &ast));
@@ -841,7 +841,7 @@ STM_TEST(sync_reserve_across_mount_avoids_overlap) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     uint64_t paddr2 = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a2, 32u, 0, &paddr2));
@@ -942,7 +942,7 @@ STM_TEST(sync_remount_verifies_merkle_root) {
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d2);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     teardown(a2, s2, pool2);
     stm_bdev_close(d2);
@@ -1023,7 +1023,7 @@ STM_TEST(sync_tamper_substitutes_well_formed_node) {
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d2);
-    stm_status ms = stm_sync_open(pool2, a2, make_wk(), NULL, &s2);
+    stm_status ms = stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2);
     STM_ASSERT_ERR(ms, STM_ECORRUPT);
     STM_ASSERT(s2 == NULL);
 
@@ -1077,7 +1077,7 @@ STM_TEST(sync_tamper_tree_node_surfaces_on_mount) {
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d2);
-    stm_status ms = stm_sync_open(pool2, a2, make_wk(), NULL, &s2);
+    stm_status ms = stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2);
     STM_ASSERT_ERR(ms, STM_ECORRUPT);
     STM_ASSERT(s2 == NULL);
 
@@ -1154,7 +1154,7 @@ STM_TEST(sync_no_plaintext_key_on_disk) {
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d2);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     STM_ASSERT_OK(stm_sync_commit(s2));
     teardown(a2, s2, pool2);
@@ -1195,7 +1195,7 @@ STM_TEST(sync_wrong_keyfile_rejected) {
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d2);
-    stm_status ms = stm_sync_open(pool2, a2, &other, NULL, &s2);
+    stm_status ms = stm_sync_open(pool2, a2, &other, NULL, NULL, &s2);
     STM_ASSERT(ms != STM_OK);
     STM_ASSERT(s2 == NULL);
 
@@ -1228,7 +1228,7 @@ STM_TEST(sync_mount_claim_advances_durable_gen) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 1u);
@@ -1246,7 +1246,7 @@ STM_TEST(sync_mount_claim_advances_durable_gen) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a3));
     stm_sync *s3 = NULL;
     stm_pool *pool3 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool3, a3, make_wk(), NULL, &s3));
+    STM_ASSERT_OK(stm_sync_open(pool3, a3, make_wk(), NULL, NULL, &s3));
     STM_ASSERT_OK(stm_sync_info_get(s3, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 2u);
     STM_ASSERT_EQ(info.auth_gen,              3u);
@@ -1414,7 +1414,7 @@ STM_TEST(sync_dataset_state_survives_mount) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     di = stm_sync_dataset_index(s2);
     si = stm_sync_snapshot_index(s2);
@@ -1596,7 +1596,7 @@ STM_TEST(sync_clone_state_survives_mount) {
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
     stm_pool *pool2 = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
 
     di = stm_sync_dataset_index(s2);
     si = stm_sync_snapshot_index(s2);

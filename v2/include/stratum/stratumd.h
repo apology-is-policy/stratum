@@ -244,6 +244,20 @@ typedef struct stm_stratumd_opts {
     bool        corvus_notify_strict;
     uint32_t    corvus_notify_timeout_ms;
 
+    /* TLY-A3-keyslot: corvus key-agent config for the mount-time
+     * unwrap of per-dataset keyschema slots tagged
+     * STM_KS_WRAPPER_CORVUS. Forwarded into stm_fs_mount_opts.
+     * `corvus_session_token_file` is the path to the 33-byte session
+     * token; when set, corvus is consulted for CORVUS-tagged slots.
+     * `corvus_unwrap_socket` is the corvus UNWRAP socket path; NULL →
+     * the corvus client default ("/srv/corvus/ops/unwrap"). Both NULL
+     * = no corvus unwrap path (back-compat for non-Thylacine
+     * deployments). This is independent of `corvus_user` above —
+     * that drives the SESSION_CLOSED notify consumer, a separate
+     * subsystem. */
+    const char *corvus_unwrap_socket;
+    const char *corvus_session_token_file;
+
     /* Auth fallback policy (R95 P2-2). When peer-credential
      * resolution fails (platform without SO_PEERCRED / getpeereid),
      * the default behavior is to REFUSE the connection — the daemon
