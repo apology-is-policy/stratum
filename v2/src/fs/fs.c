@@ -39,12 +39,24 @@
  *     (wrlock) and dispatch under PARALLEL-2's compound-op atomicity
  *     contract. Two such ops serialize on fs->global EX exactly as the
  *     pre-PARALLEL-3 big-fs-lock did. (PARALLEL-2 baseline preserved.)
- *   - PARALLEL-3 impl-1+ ops (the per-inode SH surface — chmod / chown /
- *     utimens at impl-1; more in impl-2..5): take fs->global SH (rdlock)
- *     PLUS the per-inode mutex for each target inode via
- *     stm_inode_pin/_unpin. Two such ops on disjoint inodes proceed
- *     concurrently; on the same inode they serialize on the per-inode
- *     mutex.
+ *   - PARALLEL-3 impl-1..5 mutators (the per-inode SH surface — chmod /
+ *     chown / utimens / unlink / rename / reflink / truncate / write /
+ *     ...): take fs->global SH (rdlock) PLUS the per-inode mutex for
+ *     each target inode via stm_inode_pin/_unpin. Two such ops on
+ *     disjoint inodes proceed concurrently; on the same inode they
+ *     serialize on the per-inode mutex.
+ *   - PARALLEL-3 impl-6 pure-read ops (stm_fs_read / stat / lookup /
+ *     readlink / readdir / get_seals / getxattr / listxattr / fadvise /
+ *     name_to_handle / open_by_handle / the dataset-read + aggregate +
+ *     lock-table-read getters): take fs->global SH (rdlock) and NO
+ *     per-inode pin. A pure read issues internally-atomic subsystem
+ *     calls (inode/dirent/xattr indices each guard records[] with their
+ *     own mutex); it never mutates fs/inode/dirent/xattr/sync/alloc
+ *     state, so concurrent SH readers + SH mutators are safe. The pin
+ *     is for compound lookup-then-mutate atomicity only — a reader has
+ *     no compound mutation to make atomic, and pinning would also kill
+ *     read-read concurrency on the same inode (the pin is a mutex).
+ *     See docs/p9.5-parallel-3-design.md §12.
  *
  * stm_sync_commit nests stm_alloc_commit under sync->lock. Every reader-
  * path inside stm_fs (stats_get) acquires the same order. Do not add a
@@ -1425,7 +1437,7 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * observe on STM_EINVAL get a defined value (0). */
     if (out_read) *out_read = 0;
     if (!fs) return STM_EINVAL;
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     /* Same dispatch shape as fs_write. */
@@ -1501,7 +1513,7 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
 
     *out_child_ino = 0;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -2421,7 +2433,7 @@ stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!fs || !out_value) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -3090,7 +3102,7 @@ stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (target_max == 0u) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -3398,7 +3410,7 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!fs || !out_seals) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -3436,7 +3448,7 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -3533,7 +3545,7 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
     uint64_t want_gen = stm_load_le64(handle->h_si_gen);
     if (ds == 0u || ino == 0u) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     /* R83 P2-1: cross-pool isolation. Compare the handle's pool_uuid
@@ -4208,7 +4220,7 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
      * UINT64_MAX. */
     if (*cursor == UINT64_MAX) return STM_OK;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -4473,7 +4485,7 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (name_len == 0u || name_len > STM_FS_XATTR_NAME_MAX) return STM_EINVAL;
     if (!fs_xattr_name_in_posix_namespace(name, name_len)) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_status ps = fs_xattr_require_inode(fs, dataset_id, ino);
@@ -4504,7 +4516,7 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (buf_max > 0u && !name_buf) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_status ps = fs_xattr_require_inode(fs, dataset_id, ino);
@@ -5737,7 +5749,7 @@ stm_status stm_fs_effective_dataset_property(stm_fs *fs, uint64_t dataset_id,
     if (out_value) *out_value = 0;
     if (!fs || !out_value) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
@@ -5768,7 +5780,7 @@ stm_status stm_fs_dataset_lookup(stm_fs *fs, uint64_t dataset_id,
     if (out) memset(out, 0, sizeof *out);
     if (!fs || !out) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
@@ -5787,7 +5799,7 @@ stm_status stm_fs_dataset_count(stm_fs *fs, size_t *out_count)
     if (out_count) *out_count = 0;
     if (!fs || !out_count) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
@@ -5805,7 +5817,7 @@ stm_status stm_fs_dataset_iter(stm_fs *fs, stm_dataset_iter_cb cb, void *ctx)
 {
     if (!fs || !cb) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
@@ -5847,7 +5859,7 @@ stm_status stm_fs_alloc_stats_get(const stm_fs *fs, uint16_t device_id,
     if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
 
     stm_fs *mfs = (stm_fs *)fs;
-    pthread_rwlock_wrlock(&mfs->global);
+    pthread_rwlock_rdlock(&mfs->global);
     /* Allow reading stats on a wedged fs — matches stm_fs_stats_get
      * (fs.c:4737) for the same reason: diagnostics. */
 
@@ -5875,7 +5887,7 @@ stm_status stm_fs_alloc_attached(const stm_fs *fs, uint16_t device_id,
     if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
 
     stm_fs *mfs = (stm_fs *)fs;
-    pthread_rwlock_wrlock(&mfs->global);
+    pthread_rwlock_rdlock(&mfs->global);
     stm_alloc *a = stm_sync_alloc(fs->sync, device_id);
     *out = (a != NULL);
     pthread_rwlock_unlock(&mfs->global);
@@ -6624,7 +6636,7 @@ stm_status stm_fs_lock_test(stm_fs *fs,
     if (out_conflicting_owner) *out_conflicting_owner = 0;
     if (!fs || !out_would_grant) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
     stm_status s = stm_lock_test(fs->locks, dataset_id, ino,
                                        owner_id, type, off, len,
@@ -6656,7 +6668,7 @@ stm_status stm_fs_lock_count(stm_fs *fs, size_t *out_count)
     if (out_count) *out_count = 0;
     if (!fs || !out_count) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
     stm_status s = stm_lock_count(fs->locks, out_count);
     pthread_rwlock_unlock(&fs->global);
@@ -6709,7 +6721,7 @@ stm_status stm_fs_fadvise(stm_fs *fs,
      * inode-index entry but are valid fadvise targets (the inner
      * promote/migrate primitives accept them). The delegate's
      * own ino-not-found path is also swallowed. */
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
     pthread_rwlock_unlock(&fs->global);
 
@@ -6758,7 +6770,7 @@ stm_status stm_fs_stats_get(const stm_fs *fs, stm_fs_stats *out)
     memset(out, 0, sizeof *out);
 
     stm_fs *mfs = (stm_fs *)fs;
-    pthread_rwlock_wrlock(&mfs->global);
+    pthread_rwlock_rdlock(&mfs->global);
     /* Allow reading stats on a wedged fs — useful for diagnostics. */
 
     /* R7e-P2-1: sync first, then alloc — matches the nesting used by
@@ -6809,7 +6821,7 @@ stm_status stm_fs_verify(const stm_fs *fs)
      * shift under us, but ignores read_only + wedged (both make
      * sense for scrubbing). */
     stm_fs *mfs = (stm_fs *)fs;
-    pthread_rwlock_wrlock(&mfs->global);
+    pthread_rwlock_rdlock(&mfs->global);
     stm_status s = stm_alloc_verify(fs->alloc);
     pthread_rwlock_unlock(&mfs->global);
     return s;

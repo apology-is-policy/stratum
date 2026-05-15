@@ -324,15 +324,25 @@ duration of a per-inode compound op:
     ported pre-impl-5). UNSHARE_RANGE branch in stm_fs_fallocate
     unpins + drops SH BEFORE chaining into stm_fs_promote_to_hot to
     avoid ERRORCHECK EDEADLK on the recursive pin.
-  - impl-6 (forward): drop residual EX takes — RO ops
-    (stm_fs_read/stat/lookup/readlink/readdir/get_seals/getxattr/
-    listxattr/fadvise) MAY convert to SH-only (no pins needed —
-    READ contract); xattr mutators (setxattr/removexattr/add_seals)
-    MAY port to SH+pin; snapshot ops + create_dataset stay EX
-    (dataset-wide); commit + reserve + free + lock-table ops stay
-    EX (sync-level / fs-wide); migrate/promote policy steps already
-    compose over per-ino so the iteration drops fs->lock between
-    candidates as today.
+  - impl-6: 21 pure-read ops ported EX→SH (no pins — a pure read
+    does internally-atomic subsystem calls; the pin is for compound
+    lookup-then-mutate atomicity only). RO file ops
+    (read/stat/lookup/readlink/readdir/get_seals/getxattr/listxattr/
+    fadvise/name_to_handle/open_by_handle) + dataset-read ops
+    (effective_dataset_property/dataset_lookup/count/iter) + aggregate
+    getters (stats_get/alloc_stats_get/alloc_attached/verify) +
+    lock-table readers (lock_test/lock_count). Three safety bases:
+    (a) inode/dirent/xattr reads — atomic snapshot via each index's
+    own internal records[] mutex; (b) dataset-table + lock-table
+    reads — safe because every mutator of those tables is STILL EX
+    (SH excludes EX) — a future port of a dataset/lock-table mutator
+    to SH MUST first add that table an internal mutex OR revert
+    these reads to EX; (c) sync/alloc aggregate reads — sync/alloc
+    internal locks. No per-inode pin → no new lock-order edge.
+    Design doc §12. xattr mutators (setxattr/removexattr/add_seals)
+    + remaining single-inode work deferred to impl-7. snapshot ops
+    + create_dataset stay EX (dataset-wide); commit + reserve + free
+    + lock-table mutators stay EX (sync-level / fs-wide).
 
 Spec composition realizes the `inode_lock_holder[i] = w` action of
 `compound_ops_per_inode.tla`.
@@ -451,7 +461,8 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 | 4-inode ops ported (rename overwrite/EXCHANGE) | LIVE | impl-3: stm_fs_rename — TOCTOU re-verify covers both src+dst dirents; R128/R130 wiring preserved on dst cascade-free |
 | 2-inode cross-dataset ops ported | LIVE | impl-4: stm_fs_reflink + stm_fs_copy_file_range; SH+pin_two happy path with EX fallback for legacy direct-extent inodes |
 | Single-inode mutators ported | LIVE | impl-5: stm_fs_truncate/fallocate (iidx-required), stm_fs_write/migrate_to_cold/promote_to_hot (iidx-with-legacy-EX-fallback); single-exit goto pattern; R128 P2-1 pre-flush under pin |
-| Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-6 ports remaining (RO ops + xattr mutators OR keep selectively-EX) |
+| Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-3+ helper `stm_inode_pin_many` sorts ascending |
+| Pure-read ops on SH (no pin) | LIVE | impl-6: 21 read-only stm_fs_* ops ported EX→SH; safety via subsystem-internal mutexes + EX-still-held mutators |
 
 Audit class: any change to allocator paths (alloc / alloc_anon /
 materialize / free), gen arithmetic, or persistence validators MUST

@@ -62,6 +62,7 @@
 #include "tharness.h"
 
 #include <stratum/fs.h>
+#include <stratum/inode.h>      /* struct stm_inode_value (stm_fs_stat) */
 #include <stratum/snapshot.h>
 #include <stratum/sync.h>
 
@@ -1205,6 +1206,302 @@ STM_TEST(per_inode_write_truncate_fallocate_disjoint_inodes) {
     STM_ASSERT_EQ(0, atomic_load(&cb.err));
     STM_ASSERT_EQ(50u, atomic_load(&ca.completed));
     STM_ASSERT_EQ(50u, atomic_load(&cb.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── PARALLEL-3 impl-6: pure-read op vs ported SH-mutator ────────────── */
+
+/* impl-6 ports the pure-read stm_fs_* ops from fs->global EX to SH. The
+ * new behavior to pin: a pure read (stm_fs_stat / stm_fs_get_seals)
+ * holding SH can now run CONCURRENTLY with a ported SH-mutator
+ * (stm_fs_chmod) — under EX they were mutually exclusive. Correctness
+ * basis: stm_inode_index guards records[] with its own internal mutex,
+ * so each read accessor returns an atomic snapshot even racing a
+ * same-inode writer (design doc §12.2 basis 1). The reader therefore
+ * never sees a torn mode word and never deadlocks. */
+
+typedef struct {
+    stm_fs *fs;
+    uint64_t dataset_id;
+    uint64_t ino;
+    unsigned iterations;
+    atomic_int err;
+    atomic_uint completed;
+    atomic_bool done;
+} impl6_reader_ctx;
+
+static void *stat_reader_thread(void *arg)
+{
+    impl6_reader_ctx *r = (impl6_reader_ctx *)arg;
+    for (unsigned i = 0; i < r->iterations; i++) {
+        struct stm_inode_value iv = {0};
+        stm_status rc = stm_fs_stat(r->fs, r->dataset_id, r->ino, &iv);
+        if (rc != STM_OK) {
+            atomic_store(&r->err, (int)rc);
+            break;
+        }
+        /* The inode is a regular file for the test's whole lifetime;
+         * a torn snapshot would corrupt the S_IFMT bits. (S_IFREG =
+         * 0100000, S_IFMT = 0170000 — raw octal to match this file's
+         * style, no <sys/stat.h> dependency.) */
+        uint32_t mode = stm_load_le32(iv.si_mode);
+        if ((mode & 0170000u) != 0100000u) {
+            atomic_store(&r->err, -9999);  /* sentinel: torn mode word */
+            break;
+        }
+        /* get_seals — second pure-read op, also SH post-impl-6. */
+        uint32_t seals = 0;
+        rc = stm_fs_get_seals(r->fs, r->dataset_id, r->ino, &seals);
+        if (rc != STM_OK) {
+            atomic_store(&r->err, (int)rc);
+            break;
+        }
+        atomic_fetch_add(&r->completed, 1u);
+    }
+    atomic_store(&r->done, true);
+    return NULL;
+}
+
+/* Reader on SAME inode as the chmod writer. Both hold fs->global SH;
+ * the reader takes no per-inode pin (design doc §12.1). No deadlock,
+ * no error, no torn mode word. */
+STM_TEST(impl6_stat_reader_vs_chmod_writer_same_inode) {
+    make_tmp("impl6_reader_same");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "impl6_same_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"f", 1,
+                                        0100644, 0, 0, &ino));
+
+    setattr_ctx wc = { 0 };
+    wc.fs = fs; wc.dataset_id = ds_id; wc.ino = ino;
+    wc.base_mode = 0100600u; wc.iterations = PER_INODE_ITERATIONS;
+    impl6_reader_ctx rc = { 0 };
+    rc.fs = fs; rc.dataset_id = ds_id; rc.ino = ino;
+    rc.iterations = PER_INODE_ITERATIONS;
+
+    pthread_t wt, rt;
+    STM_ASSERT_EQ(0, pthread_create(&wt, NULL, setattr_thread, &wc));
+    STM_ASSERT_EQ(0, pthread_create(&rt, NULL, stat_reader_thread, &rc));
+
+    /* wait_two_threads keys on the setattr_ctx done-flag layout; the
+     * reader_ctx's done flag sits at the same trailing position, so a
+     * direct poll is clearer here. */
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    bool ok = true;
+    for (;;) {
+        if (atomic_load(&wc.done) && atomic_load(&rc.done)) break;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) { ok = false; break; }
+        struct timespec ns = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ns, NULL);
+    }
+    (void)pthread_join(wt, NULL);
+    (void)pthread_join(rt, NULL);
+    STM_ASSERT_TRUE(ok);
+
+    STM_ASSERT_EQ(0, atomic_load(&wc.err));
+    STM_ASSERT_EQ(0, atomic_load(&rc.err));
+    STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&wc.completed));
+    STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&rc.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Reader on a DIFFERENT inode than the chmod writer. Post-impl-6 both
+ * hold SH and never the per-inode pin in common — fully concurrent.
+ * Pre-impl-6 (read on EX) this would have been serialized; the test
+ * still passes either way, but a deadlock here would expose a broken
+ * SH/EX configuration. */
+STM_TEST(impl6_stat_reader_vs_chmod_writer_disjoint_inodes) {
+    make_tmp("impl6_reader_disjoint");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "impl6_disjoint_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    uint64_t ino_a = 0, ino_b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"a", 1,
+                                        0100644, 0, 0, &ino_a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"b", 1,
+                                        0100644, 0, 0, &ino_b));
+    STM_ASSERT_TRUE(ino_a != ino_b);
+
+    setattr_ctx wc = { 0 };
+    wc.fs = fs; wc.dataset_id = ds_id; wc.ino = ino_b;
+    wc.base_mode = 0100600u; wc.iterations = PER_INODE_ITERATIONS;
+    impl6_reader_ctx rc = { 0 };
+    rc.fs = fs; rc.dataset_id = ds_id; rc.ino = ino_a;
+    rc.iterations = PER_INODE_ITERATIONS;
+
+    pthread_t wt, rt;
+    STM_ASSERT_EQ(0, pthread_create(&wt, NULL, setattr_thread, &wc));
+    STM_ASSERT_EQ(0, pthread_create(&rt, NULL, stat_reader_thread, &rc));
+
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    bool ok = true;
+    for (;;) {
+        if (atomic_load(&wc.done) && atomic_load(&rc.done)) break;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) { ok = false; break; }
+        struct timespec ns = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ns, NULL);
+    }
+    (void)pthread_join(wt, NULL);
+    (void)pthread_join(rt, NULL);
+    STM_ASSERT_TRUE(ok);
+
+    STM_ASSERT_EQ(0, atomic_load(&wc.err));
+    STM_ASSERT_EQ(0, atomic_load(&rc.err));
+    STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&wc.completed));
+    STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&rc.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R147 P2-1: stm_fs_read vs stm_fs_write on the SAME regular-file
+ * inode through the buffered (dirty_buffer) EXTENT path. Pre-impl-6
+ * stm_fs_read held EX so it never ran concurrently with the impl-5
+ * SH-mutator stm_fs_write; impl-6 makes that pair reachable. Both
+ * touch the same dirty_buffer entry; safety rests on dirty_buffer's
+ * own buf->mu serializing has_ino / insert / overlay / drain_ino.
+ * The reader may see a torn-across-the-call byte view (POSIX-OK for
+ * read vs concurrent write) but must never see a garbage byte, an
+ * error, or STM_ECORRUPT. The file is pre-written to a fixed length
+ * so every read returns the full extent; the writer only ever fills
+ * with 0xAA or 0xBB, so a non-{0xAA,0xBB} byte would expose a torn
+ * read into uninitialized memory. */
+
+#define IMPL6_RW_LEN   4096u
+
+static void *buffered_write_thread(void *arg)
+{
+    impl6_reader_ctx *w = (impl6_reader_ctx *)arg;
+    uint8_t buf[IMPL6_RW_LEN];
+    for (unsigned i = 0; i < w->iterations; i++) {
+        memset(buf, (i & 1u) ? 0xBB : 0xAA, sizeof buf);
+        stm_status rc = stm_fs_write(w->fs, w->dataset_id, w->ino,
+                                        0, buf, sizeof buf);
+        if (rc != STM_OK) {
+            atomic_store(&w->err, (int)rc);
+            break;
+        }
+        atomic_fetch_add(&w->completed, 1u);
+    }
+    atomic_store(&w->done, true);
+    return NULL;
+}
+
+static void *buffered_read_thread(void *arg)
+{
+    impl6_reader_ctx *r = (impl6_reader_ctx *)arg;
+    uint8_t buf[IMPL6_RW_LEN];
+    for (unsigned i = 0; i < r->iterations; i++) {
+        memset(buf, 0, sizeof buf);
+        size_t got = 0;
+        stm_status rc = stm_fs_read(r->fs, r->dataset_id, r->ino,
+                                       0, buf, sizeof buf, &got);
+        if (rc != STM_OK) {
+            atomic_store(&r->err, (int)rc);
+            break;
+        }
+        /* File is pre-written to IMPL6_RW_LEN; every read must return
+         * the whole extent. */
+        if (got != sizeof buf) {
+            atomic_store(&r->err, -9002);
+            break;
+        }
+        for (size_t b = 0; b < got; b++) {
+            if (buf[b] != 0xAAu && buf[b] != 0xBBu) {
+                atomic_store(&r->err, -9003);  /* garbage byte */
+                goto done;
+            }
+        }
+        atomic_fetch_add(&r->completed, 1u);
+    }
+done:
+    atomic_store(&r->done, true);
+    return NULL;
+}
+
+STM_TEST(impl6_read_write_same_inode_buffered) {
+    make_tmp("impl6_read_write_buffered");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "impl6_rw_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"f", 1,
+                                        0100644, 0, 0, &ino));
+
+    /* Pre-write the file to IMPL6_RW_LEN so every concurrent read
+     * returns the full extent (no size-transition window). */
+    uint8_t seed[IMPL6_RW_LEN];
+    memset(seed, 0xAAu, sizeof seed);
+    STM_ASSERT_OK(stm_fs_write(fs, ds_id, ino, 0, seed, sizeof seed));
+
+    impl6_reader_ctx wc = { 0 }, rc = { 0 };
+    wc.fs = fs; wc.dataset_id = ds_id; wc.ino = ino;
+    wc.iterations = PER_INODE_ITERATIONS;
+    rc.fs = fs; rc.dataset_id = ds_id; rc.ino = ino;
+    rc.iterations = PER_INODE_ITERATIONS;
+
+    pthread_t wt, rt;
+    STM_ASSERT_EQ(0, pthread_create(&wt, NULL, buffered_write_thread, &wc));
+    STM_ASSERT_EQ(0, pthread_create(&rt, NULL, buffered_read_thread, &rc));
+
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    bool ok = true;
+    for (;;) {
+        if (atomic_load(&wc.done) && atomic_load(&rc.done)) break;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) { ok = false; break; }
+        struct timespec ns = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ns, NULL);
+    }
+    (void)pthread_join(wt, NULL);
+    (void)pthread_join(rt, NULL);
+    STM_ASSERT_TRUE(ok);
+
+    STM_ASSERT_EQ(0, atomic_load(&wc.err));
+    STM_ASSERT_EQ(0, atomic_load(&rc.err));
+    STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&wc.completed));
+    STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&rc.completed));
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
