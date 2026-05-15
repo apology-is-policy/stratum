@@ -97,6 +97,10 @@ typedef enum {
     STM_ECORVUSBADFORMAT = -214,  /* corvus UNWRAP returned BadFormat (TLY-A3) */
     STM_ECORVUSINTERNAL = -215,   /* corvus UNWRAP returned InternalError (TLY-A3) */
     STM_ECORVUSRATELIMITED = -216, /* corvus UNWRAP returned RateLimited (TLY-A3) */
+    STM_ECOMPROMISED    = -217,   /* rollback refused: target snapshot is marked
+                                     rollback-compromised (TLY-A5; non-forced
+                                     rollback of a STM_SNAP_FLAG_ROLLBACK_COMPROMISED
+                                     snap) */
 
     /* P8-POSIX-2b: dirent / directory-shape errors. POSIX-aligned values
      * (matches Linux errno.h) so callers can interpret without translation. */

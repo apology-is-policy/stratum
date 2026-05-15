@@ -6177,6 +6177,47 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs,
     return s;
 }
 
+stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t snapshot_id,
+                                      bool force)
+{
+    if (!fs) return STM_EINVAL;
+    if (snapshot_id == 0) return STM_EINVAL;
+
+    pthread_rwlock_wrlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!sidx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ECORRUPT;
+    }
+
+    /* Resolve the target — STM_ENOENT for unknown/deleted snaps. */
+    stm_snapshot_entry entry;
+    stm_status s = stm_snapshot_lookup(sidx, snapshot_id, &entry);
+    if (s != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return s;
+    }
+
+    /* Consultation gate (snapshot.tla::RollbackBlockedIffCompromised):
+     * a rollback to a corvus-flagged snapshot proceeds ONLY via the
+     * operator's explicit `force`. The lookup + this check run under
+     * fs->global EX, so a racing unmark either fully precedes (gate
+     * sees clear) or fully follows (gate sees set) — never torn. */
+    if ((entry.flags & STM_SNAP_FLAG_ROLLBACK_COMPROMISED) && !force) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ECOMPROMISED;
+    }
+
+    /* The rollback mechanism — per-dataset metadata-tree swap + birth-
+     * txg reclamation — lands in Phase 9.7 (v2 has no per-dataset
+     * trees yet). v1.0 stub: every gate above is real; only this
+     * mutation is deferred. */
+    pthread_rwlock_unlock(&fs->global);
+    return STM_ENOTSUPPORTED;
+}
+
 stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
                                               uint64_t value)
 {

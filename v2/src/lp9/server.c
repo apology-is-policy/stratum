@@ -114,6 +114,7 @@ static uint32_t status_to_ecode(stm_status s)
     case STM_ERANGE:            return STM_LP9_ECODE_ERANGE;
     case STM_EOVERFLOW:         return STM_LP9_ECODE_EOVERFLOW;
     case STM_ENOTSUPPORTED:     return STM_LP9_ECODE_ENOSYS;
+    case STM_ECOMPROMISED:      return STM_LP9_ECODE_EACCES; /* refusal */
     default:                    return STM_LP9_ECODE_EIO;
     }
 }

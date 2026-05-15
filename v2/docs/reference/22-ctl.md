@@ -222,8 +222,9 @@ Live writable kinds:
 | `KIND_DATASET_DELETE_SNAPSHOT` | `<snap_id>` (decimal) | stm_fs_delete_snapshot |
 | `KIND_DATASET_HOLD_SNAPSHOT` | `<snap_id>` | stm_fs_hold_snapshot |
 | `KIND_DATASET_RELEASE_SNAPSHOT` | `<snap_id>` | stm_fs_release_snapshot |
-| `KIND_DATASET_MARK_SNAPSHOT_COMPROMISED` | `<snap_id>` | stm_fs_mark_snapshot_compromised (TLY-A5; commits synchronously) |
+| `KIND_DATASET_MARK_SNAPSHOT_COMPROMISED` | `<snap_id>` | stm_fs_mark_snapshot_compromised (TLY-A5; commits synchronously; admits the corvus principal — see above) |
 | `KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED` | `force <snap_id>` | stm_fs_unmark_snapshot_compromised (TLY-A5; `force` token required per Q15) |
+| `KIND_DATASET_ROLLBACK_SNAPSHOT` | `<snap_id>` or `force <snap_id>` | stm_fs_rollback_snapshot (TLY-A5-impl-2; strict-admin). The consultation gate refuses a `STM_SNAP_FLAG_ROLLBACK_COMPROMISED` snap with `STM_ECOMPROMISED` unless `force` is given (`snapshot.tla::RollbackBlockedIffCompromised`). The rollback *mechanism* is a Phase 9.7 stub → `STM_ENOTSUPPORTED` on a non-compromised / forced path. |
 
 Every successful admin write logs `result=ok` to /events via
 `stm_ctl_log_event`; every failed admin write logs

@@ -1679,16 +1679,40 @@ fn handle_snap_list_key(
             });
             return Ok(Action::Refresh);
         }
-        // R or Enter → rollback (forward-noted to SWISS-6 v1.1c).
+        // R or Enter → roll back to the cursor's snapshot. TLY-A5-impl-2:
+        // a destructive op behind a default-No Confirm. The /ctl/
+        // rollback-snapshot verb's data mutation is a Phase 9.7 stub —
+        // the dispatch surfaces STM_ENOTSUPPORTED as an error dialog —
+        // but the consultation gate (a compromised snap → refused) and
+        // the full UI path are live now.
         KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
-            *local_dialog = Some(info_dialog(
-                "Rollback is not yet implemented in v1.0.\n\
+            if snap_count == 0 || *cursor >= snap_count {
+                return Ok(Action::Ignore);
+            }
+            let snap = &snaps[*cursor];
+            let snap_id = snap.snapshot_id;
+            let name = snap.name.clone();
+            let prompt = format!(
+                "Roll back to snapshot {name} (#{snap_id})?\n\
                  \n\
-                 Rolling back to a snapshot is destructive (it discards\n\
-                 all data + snapshots newer than the target). Stratum\n\
-                 v1.1c will add the verb with a double-confirm gate\n\
-                 after the underlying C-side API + spec extension land.",
-            ));
+                 This DISCARDS all data and every snapshot newer than\n\
+                 the target. It cannot be undone."
+            );
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::Confirm {
+                    options: vec!["No".to_string(), "Yes".to_string()],
+                    selected: 0, // default No — destructive default-safe
+                    on_pick: ConfirmAction::RollbackSnapshot {
+                        dataset_id: dsid,
+                        snap_id,
+                        name,
+                    },
+                },
+                prompt,
+                value: String::new(),
+                is_password: false,
+                is_error: false,
+            });
             return Ok(Action::Refresh);
         }
         _ => {}
@@ -1967,6 +1991,47 @@ fn submit_confirm(
             ));
             *local_dialog = Some(info_dialog(&format!(
                 "Sending scrub {verb} request…"
+            )));
+            Ok(Action::Refresh)
+        }
+        ConfirmAction::RollbackSnapshot { dataset_id, snap_id, name } => {
+            // TLY-A5-impl-2: F9 → R/Enter → confirm. On Yes, write the
+            // bare snap_id to /ctl/datasets/<id>/rollback-snapshot
+            // (admin write). v1.0: the C-side mechanism is a Phase 9.7
+            // stub returning STM_ENOTSUPPORTED, so the job completes
+            // as an error dialog; a compromised snap is refused by the
+            // consultation gate with STM_ECOMPROMISED. The UI path is
+            // final — Phase 9.7 makes the same write succeed.
+            if label != "Yes" {
+                return Ok(Action::Refresh);
+            }
+            let sp = match spawn {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Rollback failed: spawn helper unavailable.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let ctl_sock = match sp.current_ctl_sock() {
+                Some(p) => p,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Rollback failed: stratum /ctl/ socket missing.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let p9_path = format!("/datasets/{dataset_id}/rollback-snapshot");
+            *ctl_job = Some(spawn_ctl_job(
+                ctl_sock,
+                p9_path,
+                format!("{snap_id}").into_bytes(),
+                format!("Rolled back to snapshot {name} (#{snap_id})."),
+            ));
+            *local_dialog = Some(info_dialog(&format!(
+                "Rolling back to snapshot \"{name}\" (#{snap_id})…"
             )));
             Ok(Action::Refresh)
         }

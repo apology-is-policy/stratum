@@ -5732,4 +5732,115 @@ STM_TEST(ctl_a5_admin_marks_and_unmarks)
     destroy_scrub_trigger_fixture(f);
 }
 
+/* ── TLY-A5-impl-2 — rollback-snapshot verb + consultation gate ──── */
+
+/* Admin rollback of a non-compromised snap reaches the Phase-9.7
+ * stub — STM_ENOTSUPPORTED. The verb surface + body parse are real;
+ * only the data mutation is deferred. */
+STM_TEST(ctl_a5_rollback_uncompromised_reaches_stub)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_rb1", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "rb_clean");
+    char body[32];
+    int n = snprintf(body, sizeof body, "%llu",
+                      (unsigned long long)snap_id);
+
+    open_hold_release(&f, "rollback-snapshot", 1, 2, 11);
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);   /* stub → STM_ENOTSUPPORTED */
+
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    char want[192];
+    snprintf(want, sizeof want,
+        "rollback-snapshot uid=0 dataset=1 snap-id=%llu force=0 "
+        "result=err:enotsupported", (unsigned long long)snap_id);
+    STM_ASSERT(strstr(ebody, want) != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* A rollback of a COMPROMISED snap WITHOUT `force` is refused by the
+ * consultation gate (snapshot.tla::RollbackBlockedIffCompromised) —
+ * STM_ECOMPROMISED, before the (stubbed) mechanism. */
+STM_TEST(ctl_a5_rollback_compromised_refused)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_rb2", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "rb_marked");
+    STM_ASSERT_OK(stm_fs_mark_snapshot_compromised(f.fs, snap_id));
+
+    char body[32];
+    int n = snprintf(body, sizeof body, "%llu",
+                      (unsigned long long)snap_id);
+    open_hold_release(&f, "rollback-snapshot", 1, 2, 11);
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
+
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    char want[192];
+    snprintf(want, sizeof want,
+        "rollback-snapshot uid=0 dataset=1 snap-id=%llu force=0 "
+        "result=err:ecompromised", (unsigned long long)snap_id);
+    STM_ASSERT(strstr(ebody, want) != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* `force <sid>` is the operator's explicit override — it bypasses the
+ * consultation gate and reaches the stub (STM_ENOTSUPPORTED), proving
+ * the force token is parsed + wired through. */
+STM_TEST(ctl_a5_rollback_compromised_force_bypasses_gate)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_rb3", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "rb_forced");
+    STM_ASSERT_OK(stm_fs_mark_snapshot_compromised(f.fs, snap_id));
+
+    char body[40];
+    int n = snprintf(body, sizeof body, "force %llu",
+                      (unsigned long long)snap_id);
+    open_hold_release(&f, "rollback-snapshot", 1, 2, 11);
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);   /* stub, NOT the gate */
+
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    char want[192];
+    snprintf(want, sizeof want,
+        "rollback-snapshot uid=0 dataset=1 snap-id=%llu force=1 "
+        "result=err:enotsupported", (unsigned long long)snap_id);
+    STM_ASSERT(strstr(ebody, want) != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* rollback-snapshot is strict-admin: a non-admin caller is refused at
+ * Tlopen — AND so is the corvus principal. corvus may RAISE the F13
+ * alarm (mark-snapshot-compromised) but must never reach the rollback
+ * verb, with or without force. */
+STM_TEST(ctl_a5_rollback_nonadmin_and_corvus_refused)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_rb4", 1000);
+    /* Plain non-admin uid 1000. */
+    STM_ASSERT_EQ(a5_open_dataset_verb(&f, "rollback-snapshot", 2, 11),
+                  STM_LP9_RLERROR);
+    /* Even designated the corvus principal, uid 1000 is still refused
+     * — rollback stays strict-admin (unlike mark-snapshot-compromised,
+     * which admits the corvus principal). */
+    STM_ASSERT_OK(stm_ctl_set_corvus_admin_uid(f.c, 1000));
+    STM_ASSERT_EQ(a5_open_dataset_verb(&f, "rollback-snapshot", 4, 12),
+                  STM_LP9_RLERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
 STM_TEST_MAIN("ctl")

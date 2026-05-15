@@ -254,6 +254,18 @@ pub enum ConfirmAction {
         pool_uuid: String,
         verb: String,
     },
+    /// TLY-A5-impl-2: F9 snapshot dialog → R/Enter: roll the dataset
+    /// back to a snapshot via /ctl/datasets/<id>/rollback-snapshot
+    /// (admin write). v1.0 writes the bare "<snap_id>" body — the
+    /// rollback mechanism is a Phase 9.7 stub, so the job surfaces
+    /// STM_ENOTSUPPORTED as an error dialog; the consultation gate
+    /// refuses a compromised snap with STM_ECOMPROMISED. When 9.7
+    /// lands, this same path succeeds unchanged.
+    RollbackSnapshot {
+        dataset_id: u64,
+        snap_id: u64,
+        name: String,
+    },
 }
 
 /// SWISS-4c: state for the mkfs wizard. v1.0 collects only Name +

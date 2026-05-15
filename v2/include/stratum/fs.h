@@ -1700,6 +1700,35 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs,
                                                 uint64_t snapshot_id);
 
 /*
+ * TLY-A5-impl-2: roll the dataset back to a snapshot.
+ *
+ * v1.0 status: the rollback MECHANISM (per-dataset metadata-tree swap +
+ * birth-txg block reclamation) is NOT implemented — v2 carries only the
+ * snapshot INDEX, not per-dataset trees (see ROADMAP-V2 Phase 9.7). The
+ * data-mutation step therefore returns STM_ENOTSUPPORTED. Phase 9.7
+ * replaces only that final step; the surface + the gate below stay.
+ *
+ * The CONSULTATION GATE is real and load-bearing in v1.0 — it composes
+ * against `v2/specs/snapshot.tla::RollbackBlockedIffCompromised`:
+ *
+ *   If the target snapshot carries STM_SNAP_FLAG_ROLLBACK_COMPROMISED
+ *   (corvus flagged its wrap chain as possibly compromised — the F13
+ *   hazard, CORVUS-DESIGN §4.5) AND `force` is false, the call refuses
+ *   with STM_ECOMPROMISED *before* reaching the (stubbed) mechanism.
+ *   `force == true` is the operator's explicit override and proceeds
+ *   to the mechanism.
+ *
+ * Refusals: STM_EINVAL (NULL fs / snapshot_id == 0), STM_ECORRUPT
+ * (snapshot index unavailable), STM_ENOENT (snapshot unknown / wrong
+ * dataset), STM_ECOMPROMISED (marked + not forced), STM_EWEDGED,
+ * STM_EROFS. On a non-compromised (or force) path: STM_ENOTSUPPORTED
+ * (the v1.0 stub).
+ */
+STM_MUST_USE
+stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t snapshot_id,
+                                      bool force);
+
+/*
  * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty
  * extent tree with a reflink-share of src's extent tree. Same
  * semantics as `ioctl(fd_dst, FICLONE, fd_src)` for a freshly-created

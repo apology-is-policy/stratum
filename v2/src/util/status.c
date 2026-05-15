@@ -36,6 +36,7 @@ const char *stm_strerror(stm_status s)
     case STM_ECORVUSBADFORMAT: return "corvus UNWRAP: wire format violation";
     case STM_ECORVUSINTERNAL: return "corvus UNWRAP: corvus internal error";
     case STM_ECORVUSRATELIMITED: return "corvus UNWRAP: rate limited";
+    case STM_ECOMPROMISED:   return "snapshot marked rollback-compromised";
     case STM_ENOTDIR:        return "not a directory";
     case STM_EISDIR:         return "is a directory";
     case STM_ENOTEMPTY:      return "directory not empty";
