@@ -95,6 +95,46 @@ STM_TEST(fs_mount_without_format_fails) {
     unlink(g_tmp_path);
 }
 
+STM_TEST(fs_mount_corvus_token_mode_gate) {
+    /* R145 P2-1: the corvus session token is a bearer credential —
+     * stm_fs_mount refuses a token file carrying group/other access
+     * bits, and accepts a 0600/0400 one. */
+    make_tmp("cvtok");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    char tok_path[512];
+    snprintf(tok_path, sizeof tok_path, "%s.cvtok", g_tmp_path);
+    unlink(tok_path);
+    FILE *tf = fopen(tok_path, "wb");
+    STM_ASSERT(tf != NULL);
+    uint8_t tok[33];
+    memset(tok, 'x', sizeof tok);
+    tok[0] = 's';
+    STM_ASSERT_EQ(fwrite(tok, 1, sizeof tok, tf), sizeof tok);
+    fclose(tf);
+
+    /* World/group-readable token → refused with STM_EACCES. */
+    STM_ASSERT_EQ(chmod(tok_path, 0644), 0);
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    mopts.corvus_session_token_file = tok_path;
+    stm_fs *fs = NULL;
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_EACCES);
+    STM_ASSERT(fs == NULL);
+
+    /* 0600 token → passes the mode gate. The pool has no CORVUS-tagged
+     * keyschema slots, so the token is loaded but never consulted and
+     * the mount succeeds; the point is only that it is NOT refused
+     * with STM_EACCES. */
+    STM_ASSERT_EQ(chmod(tok_path, 0600), 0);
+    stm_status rc = stm_fs_mount(g_tmp_path, &mopts, &fs);
+    STM_ASSERT(rc != STM_EACCES);
+    if (rc == STM_OK) STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    unlink(tok_path);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(fs_reserve_free_commit_via_fs) {
     make_tmp("ops");
 

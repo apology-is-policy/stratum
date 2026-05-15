@@ -76,6 +76,7 @@
 
 #include <sys/stat.h>            /* S_IFMT / S_IFREG / S_IFDIR */
 #include <time.h>                /* clock_gettime / CLOCK_REALTIME */
+#include <unistd.h>              /* geteuid (TLY-A3-keyslot token-mode gate) */
 
 #include <pthread.h>
 #include <stdio.h>
@@ -716,6 +717,32 @@ stm_status stm_fs_mount(const char *path,
     stm_corvus_mount_cfg corvus_cfg = {0};
     const stm_corvus_mount_cfg *corvus_cfg_p = NULL;
     if (opts->corvus_session_token_file) {
+        /* R145 P2-1: the corvus session token is a bearer credential —
+         * anyone who can read the file can unwrap every per-dataset
+         * DEK over corvus. Refuse a token file that is not a regular
+         * file owned by the caller with no group/other access bits
+         * (0400/0600 posture). `stm_corvus_load_token` explicitly
+         * defers this check to its caller; mirrors the `.key`
+         * second-factor + SO_PEERCRED fail-closed doctrine. */
+        struct stat tok_st;
+        if (stat(opts->corvus_session_token_file, &tok_st) != 0) {
+            stm_alloc_close(a);
+            stm_pool_close(pool);
+            stm_bdev_close(d);
+            stm_hybrid_keys_wipe(&wk);
+            if (janus) stm_janus_client_disconnect(janus);
+            return STM_ENOENT;
+        }
+        if (!S_ISREG(tok_st.st_mode) ||
+            tok_st.st_uid != geteuid() ||
+            (tok_st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+            stm_alloc_close(a);
+            stm_pool_close(pool);
+            stm_bdev_close(d);
+            stm_hybrid_keys_wipe(&wk);
+            if (janus) stm_janus_client_disconnect(janus);
+            return STM_EACCES;
+        }
         corvus_token = malloc(STM_CORVUS_TOKEN_LEN);
         if (!corvus_token) {
             stm_alloc_close(a);
