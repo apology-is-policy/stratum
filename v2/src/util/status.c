@@ -30,6 +30,12 @@ const char *stm_strerror(stm_status s)
     case STM_EQUORUM:        return "quorum not reached";
     case STM_ESERIAL:        return "pool serial mismatch";
     case STM_ECORVUSGONE:    return "corvus notify socket unavailable";
+    case STM_ECORVUSAUTH:    return "corvus UNWRAP: bad session token";
+    case STM_ECORVUSPERM:    return "corvus UNWRAP: permission denied";
+    case STM_ECORVUSNOTFOUND: return "corvus UNWRAP: dataset not registered";
+    case STM_ECORVUSBADFORMAT: return "corvus UNWRAP: wire format violation";
+    case STM_ECORVUSINTERNAL: return "corvus UNWRAP: corvus internal error";
+    case STM_ECORVUSRATELIMITED: return "corvus UNWRAP: rate limited";
     case STM_ENOTDIR:        return "not a directory";
     case STM_EISDIR:         return "is a directory";
     case STM_ENOTEMPTY:      return "directory not empty";

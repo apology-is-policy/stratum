@@ -91,6 +91,12 @@ typedef enum {
     STM_EQUORUM         = -208,   /* multi-device commit/mount lacked quorum confirmations */
     STM_ESERIAL         = -209,   /* pool_serial mismatch vs --bind-pool-serial expected value (TLY-A1) */
     STM_ECORVUSGONE     = -210,   /* corvus notify socket EOF + tolerant-mode timeout expired (TLY-A4) */
+    STM_ECORVUSAUTH     = -211,   /* corvus UNWRAP returned BadAuth (TLY-A3) */
+    STM_ECORVUSPERM     = -212,   /* corvus UNWRAP returned PermissionDenied (TLY-A3) */
+    STM_ECORVUSNOTFOUND = -213,   /* corvus UNWRAP returned NotFound (TLY-A3) */
+    STM_ECORVUSBADFORMAT = -214,  /* corvus UNWRAP returned BadFormat (TLY-A3) */
+    STM_ECORVUSINTERNAL = -215,   /* corvus UNWRAP returned InternalError (TLY-A3) */
+    STM_ECORVUSRATELIMITED = -216, /* corvus UNWRAP returned RateLimited (TLY-A3) */
 
     /* P8-POSIX-2b: dirent / directory-shape errors. POSIX-aligned values
      * (matches Linux errno.h) so callers can interpret without translation. */
