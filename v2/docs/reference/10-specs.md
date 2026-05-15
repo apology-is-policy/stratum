@@ -27,7 +27,7 @@ chapter as specs get wider cross-reference tables).
 | `merge.tla` | 2 | Three-CAS MERGE (under PurgeSplitOnL). | 65536 states at depth 18 | — |
 | `allocator.tla` | 3 | Refcount + deferred-free. | bounded | — |
 | `merkle.tla` | 4 | Per-node Merkle chain. | bounded | — |
-| `key_schema.tla` | 4 | Per-dataset key state machine. | bounded | — |
+| `key_schema.tla` | 7 | Per-dataset key state machine + TLY-A3-keyslot mount machine. | bounded | `key_schema_mount_serve_before_resolve_buggy.cfg` |
 | `quorum.tla` | 5 | Multi-device commit + mount-claim. | 36839 states at depth 35 | `quorum_buggy.cfg` |
 | `metadata_nonce.tla` | 5 | Per-device paddr-stamping for nonces. | 51939 states | `metadata_nonce_buggy.cfg` |
 | `device_lifecycle.tla` | 5 | Roster state machine (add/remove/fail/rejoin). | large cfg: 10.6M states at depth 21 | `device_lifecycle_buggy.cfg` |
@@ -178,19 +178,37 @@ Spec-to-code: `src/btree_store/crypt.c` + `src/btree_store/serialize.c`
 compute the per-node csum; `src/sync/sync.c::build_uberblock` fills
 `ub_merkle_root`.
 
-### `key_schema.tla` — per-dataset key lifecycle
+### `key_schema.tla` — per-dataset key lifecycle + mount machine
 
+Schema state machine (P4-4):
 - `TypeOK`.
+- `ExactlyOneCurrent` — exactly one CURRENT entry per dataset at
+  every reachable state.
+- `PruneSafety` — a PRUNING key has refs=0; no extent points at a
+  pruned key.
 - `MonotonicKeyIds` — key_ids never recycle, even across
   RETIRED → PRUNING → delete.
-- `UniqueCurrentPerDataset` — at most one CURRENT entry per
-  dataset.
-- `DEKReferenceSafe` — RETIRED entries' DEKs stay in RAM while
-  any extent might reference them.
-- `ADBoundWrappedBlob` — a retired wrapped blob cannot be
-  swapped into CURRENT (AD contains `pool_uuid || dataset_id || key_id`).
+- `RotationAtomic` — rotation never leaves a dataset with zero
+  CURRENTs.
 
-Spec-to-code: `src/keyschema/keyschema.c` + `src/crypto/hybrid_wrap.c`.
+TLY-A3-keyslot extension (`v2/docs/thylacine-keyslot-design.md` §8):
+- `WrapperConsistent` — a slot has a `wrapper_identity`
+  (PASSPHRASE / JANUS / CORVUS) iff it is live. The non-perturbation
+  result: adding the field + the mount state machine leaves the
+  five schema invariants above intact.
+- `MountResolvesKeyBeforeData` — load-bearing. A dataset's data is
+  observable only when its mount is MOUNTED, reachable only via a
+  successful CURRENT-keyslot resolve (UNWRAP for a CORVUS slot). A
+  CORVUS slot corvus cannot unwrap aborts the mount with no data
+  served — fail-fast, never a half-mount (STRATUM-API-V1.md §5.3).
+
+Buggy config: `key_schema_mount_serve_before_resolve_buggy.cfg`
+(`BuggyServeBeforeResolve = TRUE`) — a mount serves data while still
+RESOLVING; trips `MountResolvesKeyBeforeData`.
+
+Spec-to-code: `src/keyschema/keyschema.c` + `src/crypto/hybrid_wrap.c`;
+the mount machine composes against the TLY-A3-keyslot-impl mount path
+(`stm_corvus_unwrap` routed by `wrapper_identity`).
 
 ### `quorum.tla` — multi-device commit + mount
 
