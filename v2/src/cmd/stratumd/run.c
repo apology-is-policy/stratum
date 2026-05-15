@@ -33,6 +33,8 @@
 #include "../cli_passphrase.h"
 #include "dataset_pattern.h"
 
+#include "proxy_9p.h"
+
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
@@ -123,9 +125,19 @@ static void usage(const char *argv0)
             "                           Tolerant-mode reconnect window "
             "(default: 30)\n"
         "  --role {coord,client}    Stratumd role (default: coord). client mode\n"
-            "                           is reserved for TLY-A2-impl-2; v2.0 accepts\n"
-            "                           the flag for forward-compat but refuses\n"
-            "                           --role client.\n"
+            "                           runs as a per-user proxy to a coordinator\n"
+            "                           stratumd; requires --coordinator-socket and\n"
+            "                           does not mount a filesystem.\n"
+        "  --coordinator-socket <path>\n"
+            "                           Path to the coordinator stratumd's FS Unix\n"
+            "                           socket (TLY-A2-impl-2; client mode only).\n"
+        "  --datasets-allowed <pattern>\n"
+            "                           Glob pattern admitting Tattach `aname`\n"
+            "                           values (TLY-A2-impl-2; client mode only,\n"
+            "                           repeatable, max 8). Pattern syntax:\n"
+            "                           `*` matches one component, `**` matches\n"
+            "                           zero-or-more components. Aname must be\n"
+            "                           ≤ 256 bytes; control bytes refused.\n"
         "  --user-policy uid=N:pat1,pat2,...\n"
             "                           Coordinator-side per-uid Tattach pattern\n"
             "                           policy (TLY-A2-impl-1, repeatable). When\n"
@@ -198,6 +210,13 @@ int stm_cmd_stratumd_main(int argc, char **argv)
     stm_ds_policy_table user_policy_table;
     memset(&user_policy_table, 0, sizeof user_policy_table);
 
+    /* TLY-A2-impl-2: client-mode `--datasets-allowed` pattern list.
+     * Populated by repeated `--datasets-allowed <pat>` flags (each
+     * one pattern). The strings are borrowed from argv (which lives
+     * for the whole process); no heap allocation. */
+    const char *datasets_allowed[STM_PROXY_9P_PATTERN_MAX];
+    size_t n_datasets_allowed = 0;
+
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
@@ -231,19 +250,59 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         if (!strcmp(a, "--role") && i + 1 < argc) {
             const char *r = argv[++i];
             if (!strcmp(r, "coord")) {
-                /* Default. No-op. */
+                opts.client_mode = false;
             } else if (!strcmp(r, "client")) {
-                fprintf(stderr,
-                    "stratumd: --role client is reserved for "
-                    "TLY-A2-impl-2; not yet implemented\n");
-                stm_ds_policy_table_close(&user_policy_table);
-                return 1;
+                /* TLY-A2-impl-2: pure proxy mode. Validation of the
+                 * required companion flags (--coordinator-socket,
+                 * --datasets-allowed) happens in stm_stratumd_run
+                 * with explicit refusal stderr lines. */
+                opts.client_mode = true;
             } else {
                 fprintf(stderr, "stratumd: invalid --role: %s "
                                 "(expected 'coord' or 'client')\n", r);
                 stm_ds_policy_table_close(&user_policy_table);
                 return 1;
             }
+            continue;
+        }
+        if (!strcmp(a, "--coordinator-socket") && i + 1 < argc) {
+            opts.coordinator_socket_path = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--datasets-allowed") && i + 1 < argc) {
+            if (n_datasets_allowed >= STM_PROXY_9P_PATTERN_MAX) {
+                fprintf(stderr,
+                    "stratumd: too many --datasets-allowed flags "
+                    "(max %u)\n",
+                    (unsigned)STM_PROXY_9P_PATTERN_MAX);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            const char *pat = argv[++i];
+            /* Defense-in-depth: pre-validate length + control bytes
+             * here so the operator gets immediate feedback rather
+             * than a runtime-on-first-Tattach refusal. The proxy
+             * also re-checks at admit time via the matcher. */
+            size_t plen = strnlen(pat, STM_DS_PATTERN_NAME_MAX + 1u);
+            if (plen == 0u || plen > STM_DS_PATTERN_NAME_MAX) {
+                fprintf(stderr,
+                    "stratumd: --datasets-allowed: invalid pattern "
+                    "length (got %zu, max %u)\n",
+                    plen, (unsigned)STM_DS_PATTERN_NAME_MAX);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            for (size_t k = 0; k < plen; k++) {
+                unsigned char c = (unsigned char)pat[k];
+                if (c == 0u || c < 0x20u || c == 0x7Fu) {
+                    fprintf(stderr,
+                        "stratumd: --datasets-allowed: pattern "
+                        "contains control byte (offset %zu)\n", k);
+                    stm_ds_policy_table_close(&user_policy_table);
+                    return 1;
+                }
+            }
+            datasets_allowed[n_datasets_allowed++] = pat;
             continue;
         }
         if (!strcmp(a, "--user-policy") && i + 1 < argc) {
@@ -379,8 +438,20 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         return 1;
     }
 
-    if (!opts.fs_path) {
+    /* TLY-A2-impl-2: client mode has its own argument-shape contract
+     * (no fs_path required; coordinator_socket_path required).
+     * stm_stratumd_run validates the full client-mode constraint set
+     * with explicit stderr lines; here we just refuse the obvious
+     * coord-mode-only foot-gun before invoking it. */
+    if (!opts.client_mode && !opts.fs_path) {
         usage(argv[0]);
+        stm_ds_policy_table_close(&user_policy_table);
+        return 1;
+    }
+    if (opts.client_mode && opts.fs_path) {
+        fprintf(stderr,
+            "stratumd: --role client does not take a positional "
+            "fs-path argument (got: %s)\n", opts.fs_path);
         stm_ds_policy_table_close(&user_policy_table);
         return 1;
     }
@@ -389,6 +460,12 @@ int stm_cmd_stratumd_main(int argc, char **argv)
      * the daemon. NULL/empty = back-compat single-process mode. */
     if (user_policy_table.n_entries > 0u) {
         opts.user_policy = &user_policy_table;
+    }
+
+    /* TLY-A2-impl-2: thread `--datasets-allowed` pattern list. */
+    if (n_datasets_allowed > 0u) {
+        opts.datasets_allowed   = datasets_allowed;
+        opts.n_datasets_allowed = n_datasets_allowed;
     }
 
     install_signal_handlers();
@@ -428,15 +505,27 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         opts.keyfile_passphrase_len = passlen;
     }
 
-    fprintf(stderr,
-            "stratumd: serving %s on %s (backlog=%d, msize=%u, ds=%llu, ro=%d)\n",
-            opts.fs_path, opts.socket_path,
-            opts.backlog, opts.msize_max, (unsigned long long)opts.root_dataset,
-            (int)opts.read_only);
-    if (opts.ctl_socket_path) {
+    if (opts.client_mode) {
         fprintf(stderr,
-                "stratumd: /ctl/ on %s\n",
-                opts.ctl_socket_path);
+                "stratumd: --role client: proxy on %s → %s "
+                "(backlog=%d, msize=%u, allowed=%zu pattern(s))\n",
+                opts.socket_path,
+                opts.coordinator_socket_path
+                    ? opts.coordinator_socket_path : "(MISSING)",
+                opts.backlog, opts.msize_max, n_datasets_allowed);
+    } else {
+        fprintf(stderr,
+                "stratumd: serving %s on %s (backlog=%d, msize=%u, "
+                "ds=%llu, ro=%d)\n",
+                opts.fs_path, opts.socket_path,
+                opts.backlog, opts.msize_max,
+                (unsigned long long)opts.root_dataset,
+                (int)opts.read_only);
+        if (opts.ctl_socket_path) {
+            fprintf(stderr,
+                    "stratumd: /ctl/ on %s\n",
+                    opts.ctl_socket_path);
+        }
     }
 
     stm_status rc = stm_stratumd_run(&opts);

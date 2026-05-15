@@ -185,6 +185,32 @@ typedef struct stm_stratumd_opts {
      * `v2/specs/multi_stratumd.tla::TattachPatternEnforced`. */
     const struct stm_ds_policy_table *user_policy;
 
+    /* TLY-A2 (impl-2): client mode — raw 9P-frame proxy to a
+     * coordinator stratumd. When `client_mode == true`:
+     *   - `fs_path` / `keyfile_path` / `janus_socket` / `ctl_socket_path`
+     *     MUST all be NULL — client mode does NOT mount a filesystem
+     *     and does NOT expose /ctl/. `stm_stratumd_run` refuses with
+     *     STM_EINVAL otherwise.
+     *   - `coordinator_socket_path` is required — the upstream
+     *     coordinator's FS socket; dialed once per accepted upstream
+     *     connection (per-conn fid namespace contract per
+     *     `v2/docs/thylacine-multi-stratumd-design.md §3`).
+     *   - `datasets_allowed` / `n_datasets_allowed` are a borrowed
+     *     array of NUL-terminated pattern strings (operator-supplied,
+     *     glob `*`/`**` semantics per `dataset_pattern.h`). NULL/0 =
+     *     no Tattach gate (test posture only — production deployments
+     *     MUST populate the list).
+     *   - `user_policy` MUST be NULL — the per-uid policy table is a
+     *     coord-side construct.
+     *
+     * Composes against
+     * `v2/specs/multi_stratumd.tla::{ClientAdmitsDataset,
+     * CrossClientIsolation}`. */
+    bool        client_mode;
+    const char *coordinator_socket_path;
+    const char *const *datasets_allowed;
+    size_t      n_datasets_allowed;
+
     /* TLY-A4: corvus SESSION_CLOSED notify consumer. When `corvus_user`
      * is non-NULL, stratumd spawns a consumer thread that subscribes
      * to `corvus_notify_socket` (default "/srv/corvus/notify") and

@@ -15,6 +15,7 @@
 
 #include "corvus_notify.h"
 #include "dataset_pattern.h"
+#include "proxy_9p.h"
 
 #include <stratum/9p.h>
 #include <stratum/ctl.h>
@@ -614,6 +615,138 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* Proxy accept loop (TLY-A2-impl-2 — client mode).                       */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* SWISS-4g pattern carried verbatim: detached pthread per accepted
+ * upstream connection. The proxy worker dials the coordinator fresh
+ * (per-conn fid namespace contract) and forwards 9P frames until
+ * either side disconnects. */
+typedef struct {
+    int          upstream_fd;
+    const char  *coord_socket_path;
+    const char *const *datasets_allowed;
+    size_t       n_datasets_allowed;
+    uid_t        peer_uid;
+    gid_t        peer_gid;
+    uint32_t     msize_max;
+    uint32_t     idle_timeout_ms;
+} stratumd_proxy_worker_ctx;
+
+static void *stratumd_proxy_worker(void *arg)
+{
+    /* R113 P1-1 carry: block fatal signals on the worker so the
+     * accept thread / main thread receives them and drives shutdown. */
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGHUP);
+    sigaddset(&block, SIGQUIT);
+    (void)pthread_sigmask(SIG_BLOCK, &block, NULL);
+
+    stratumd_proxy_worker_ctx *ctx = arg;
+    (void)stm_proxy_9p_serve_client(ctx->upstream_fd,
+                                       ctx->coord_socket_path,
+                                       ctx->datasets_allowed,
+                                       ctx->n_datasets_allowed,
+                                       ctx->peer_uid, ctx->peer_gid,
+                                       ctx->msize_max,
+                                       ctx->idle_timeout_ms);
+    free(ctx);
+    return NULL;
+}
+
+/* Internal proxy accept loop. Mirrors stm_stratumd_accept_loop's
+ * SWISS-4g poll-then-accept discipline and R95 P2-2 peer-cred
+ * fail-closed policy. Pure local linkage — proxy is not part of the
+ * public stratumd surface (callers go through stm_stratumd_run with
+ * client_mode=true). */
+static stm_status stratumd_accept_proxy_loop(int listen_fd,
+                                                const char *coord_socket_path,
+                                                const char *const *datasets_allowed,
+                                                size_t n_datasets_allowed,
+                                                uint32_t msize_max,
+                                                uint32_t idle_timeout_ms,
+                                                bool allow_unauthenticated_peer,
+                                                atomic_bool *stop_flag)
+{
+    if (listen_fd < 0 || !coord_socket_path) return STM_EINVAL;
+
+    if (idle_timeout_ms == 0u)
+        idle_timeout_ms = STM_STRATUMD_DEFAULT_IDLE_MS;
+
+    while (1) {
+        if (stop_flag && atomic_load_explicit(stop_flag,
+                                                  memory_order_acquire))
+            break;
+
+        struct pollfd pfd = { listen_fd, POLLIN, 0 };
+        int prc = poll(&pfd, 1, /*timeout_ms=*/200);
+        if (prc < 0) {
+            if (errno == EINTR) continue;
+            return STM_EBACKEND;
+        }
+        if (prc == 0) continue;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (!(pfd.revents & POLLIN)) continue;
+
+        int client_fd = accept(listen_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (stop_flag && atomic_load_explicit(stop_flag,
+                                                      memory_order_acquire))
+                break;
+            return STM_EBACKEND;
+        }
+
+        uid_t peer_uid = (uid_t)-1;
+        gid_t peer_gid = (gid_t)-1;
+        int   pc_rc    = peer_creds(client_fd, &peer_uid, &peer_gid);
+        if (pc_rc != 0) {
+            if (!allow_unauthenticated_peer) {
+                fprintf(stderr,
+                    "stratumd: refusing proxy upstream connection: "
+                    "peer credentials unavailable (errno=%d); "
+                    "set allow_unauthenticated_peer to opt in\n",
+                    -pc_rc);
+                close(client_fd);
+                continue;
+            }
+            peer_uid = (uid_t)getuid();
+            peer_gid = (gid_t)getgid();
+        }
+
+        stratumd_proxy_worker_ctx *ctx = malloc(sizeof *ctx);
+        if (!ctx) {
+            close(client_fd);
+            continue;
+        }
+        ctx->upstream_fd        = client_fd;
+        ctx->coord_socket_path  = coord_socket_path;
+        ctx->datasets_allowed   = datasets_allowed;
+        ctx->n_datasets_allowed = n_datasets_allowed;
+        ctx->peer_uid           = peer_uid;
+        ctx->peer_gid           = peer_gid;
+        ctx->msize_max          = msize_max;
+        ctx->idle_timeout_ms    = idle_timeout_ms;
+
+        pthread_t tid;
+        int wprc = pthread_create(&tid, NULL, stratumd_proxy_worker, ctx);
+        if (wprc != 0) {
+            fprintf(stderr,
+                "stratumd: proxy pthread_create failed (rc=%d)\n", wprc);
+            close(client_fd);
+            free(ctx);
+            continue;
+        }
+        (void)pthread_detach(tid);
+    }
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* /ctl/ transport (P9-CTL-2c).                                           */
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -888,10 +1021,129 @@ static void *ctl_worker_main(void *arg)
     return NULL;
 }
 
+/* TLY-A2-impl-2: client-mode path. Pure proxy — no fs mount, no /ctl/,
+ * no corvus consumer (Thylacine deployments typically run corvus_user
+ * on the coord, not the per-user stratumd, though we accept it here
+ * for symmetry once a use case lands). Mirrors stm_stratumd_run's
+ * shutdown discipline: stop_flag observed → accept loop exits →
+ * in-flight detached proxy workers exit naturally on EOF/error
+ * (process-exit reclaims their stacks).
+ *
+ * Refusals on misconfig: client mode incompatible with fs_path /
+ * keyfile_path / janus_socket / ctl_socket_path / user_policy. Each
+ * surfaced as STM_EINVAL with a stderr line so operators see the
+ * specific incompatibility. */
+static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
+{
+    if (!opts->coordinator_socket_path) {
+        fprintf(stderr,
+            "stratumd: --role client requires --coordinator-socket\n");
+        return STM_EINVAL;
+    }
+    if (!opts->socket_path) {
+        fprintf(stderr,
+            "stratumd: --role client requires --listen\n");
+        return STM_EINVAL;
+    }
+    /* Refuse coord-mode-only options. The user typed something
+     * mutually inconsistent; better to fail loudly than to silently
+     * ignore. */
+    if (opts->fs_path) {
+        fprintf(stderr,
+            "stratumd: --role client does not accept fs-path "
+            "(client mode mounts no filesystem)\n");
+        return STM_EINVAL;
+    }
+    if (opts->keyfile_path || opts->janus_socket) {
+        fprintf(stderr,
+            "stratumd: --role client does not accept --keyfile / "
+            "--janus-socket (client mode mounts no filesystem)\n");
+        return STM_EINVAL;
+    }
+    if (opts->ctl_socket_path) {
+        fprintf(stderr,
+            "stratumd: --role client does not accept --ctl-listen "
+            "(/ctl/ is coord-only per design §6)\n");
+        return STM_EINVAL;
+    }
+    if (opts->user_policy) {
+        fprintf(stderr,
+            "stratumd: --role client does not accept --user-policy "
+            "(per-uid policy is coord-only)\n");
+        return STM_EINVAL;
+    }
+    if (opts->bind_pool_serial) {
+        fprintf(stderr,
+            "stratumd: --role client does not accept "
+            "--bind-pool-serial (no fs mounted)\n");
+        return STM_EINVAL;
+    }
+
+    int backlog = opts->backlog > 0 ? opts->backlog
+                                     : STM_STRATUMD_DEFAULT_BACKLOG;
+    mode_t mode = opts->socket_mode != 0
+                    ? opts->socket_mode
+                    : STM_STRATUMD_DEFAULT_SOCKET_MODE;
+
+    int listen_fd = stm_stratumd_listen_unix(opts->socket_path,
+                                                backlog, mode);
+    if (listen_fd < 0) {
+        fprintf(stderr,
+            "stratumd: listen on %s failed: %s\n",
+            opts->socket_path, strerror(-listen_fd));
+        return STM_EBACKEND;
+    }
+
+    uint32_t msize_max = opts->msize_max > 0u ? opts->msize_max
+                                              : STM_9P_MSIZE_DEFAULT;
+
+    /* Defense-in-depth: cap n_datasets_allowed at the matcher's
+     * per-policy limit (parser-side already bounds, but a direct-
+     * FFI caller might supply a raw array). */
+    if (opts->n_datasets_allowed > STM_PROXY_9P_PATTERN_MAX) {
+        fprintf(stderr,
+            "stratumd: --role client: too many --datasets-allowed "
+            "patterns (got %zu, max %u)\n",
+            opts->n_datasets_allowed,
+            (unsigned)STM_PROXY_9P_PATTERN_MAX);
+        close(listen_fd);
+        (void)unlink(opts->socket_path);
+        return STM_EINVAL;
+    }
+    if (opts->n_datasets_allowed > 0u && !opts->datasets_allowed) {
+        fprintf(stderr,
+            "stratumd: --role client: n_datasets_allowed > 0 but "
+            "datasets_allowed is NULL\n");
+        close(listen_fd);
+        (void)unlink(opts->socket_path);
+        return STM_EINVAL;
+    }
+
+    stm_status rc = stratumd_accept_proxy_loop(listen_fd,
+                                                  opts->coordinator_socket_path,
+                                                  opts->datasets_allowed,
+                                                  opts->n_datasets_allowed,
+                                                  msize_max,
+                                                  opts->idle_timeout_ms,
+                                                  opts->allow_unauthenticated_peer,
+                                                  opts->stop_flag);
+
+    close(listen_fd);
+    (void)unlink(opts->socket_path);
+    return rc;
+}
+
 stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
 {
-    if (!opts || !opts->fs_path || !opts->socket_path)
+    if (!opts || !opts->socket_path)
         return STM_EINVAL;
+
+    /* TLY-A2-impl-2: client-mode dispatch BEFORE the mount-related
+     * argument checks. Client mode validates its own argument shape
+     * separately (no fs_path required). */
+    if (opts->client_mode) return stratumd_run_client(opts);
+
+    if (!opts->fs_path) return STM_EINVAL;
 
     stm_fs_mount_opts mopts = {
         .read_only             = opts->read_only,
