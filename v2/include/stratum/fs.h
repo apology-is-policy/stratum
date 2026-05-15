@@ -1682,22 +1682,42 @@ stm_status stm_fs_release_snapshot(stm_fs *fs, uint64_t snapshot_id);
  * rollback to it is refused-by-default (see stm_fs_rollback_snapshot,
  * TLY-A5-impl-2).
  *
+ * `dataset_id` is the dataset the caller BELIEVES owns the snapshot
+ * — typically the `<id>` component of the /ctl/ path. The snapshot
+ * index is pool-global; this call resolves `snapshot_id` and refuses
+ * with STM_ENOENT if the snapshot's actual `dataset_id` differs (so a
+ * `/ctl/datasets/1/...` verb cannot reach into dataset 7's snapshots
+ * — R146 P2-2).
+ *
  * Mutates only the in-RAM snapshot index (sets its dirty flag) — like
  * stm_fs_hold_snapshot, the bit becomes durable at the next
  * stm_fs_commit; the caller (e.g. the /ctl/ admin verb) is
  * responsible for committing. Idempotent — marking an already-marked
  * snap is STM_OK and leaves the index clean.
  *
- * Refusals: STM_EINVAL (NULL fs / snapshot_id == 0), STM_ECORRUPT
- * (snapshot index unavailable), STM_ENOENT (snapshot unknown /
- * deleted), STM_EWEDGED, STM_EROFS.
+ * `out_changed` (optional, may be NULL): set to true iff this call
+ * actually flipped the bit — i.e. a non-idempotent change that the
+ * caller must commit. The /ctl/ handler uses it to (a) skip a
+ * needless commit on an idempotent no-op, and (b) revert the in-RAM
+ * toggle if its commit fails (R146 P2-1 — without the revert, a
+ * failed `unmark` whose bit-clear stays in RAM would be silently
+ * persisted by a later unrelated commit, un-gating a rollback the
+ * operator was told failed).
+ *
+ * Refusals: STM_EINVAL (NULL fs / dataset_id == 0 / snapshot_id == 0),
+ * STM_ECORRUPT (snapshot index unavailable), STM_ENOENT (snapshot
+ * unknown / deleted / belongs to a different dataset), STM_EWEDGED,
+ * STM_EROFS.
  */
 STM_MUST_USE
-stm_status stm_fs_mark_snapshot_compromised(stm_fs *fs, uint64_t snapshot_id);
+stm_status stm_fs_mark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
+                                              uint64_t snapshot_id,
+                                              bool *out_changed);
 
 STM_MUST_USE
-stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs,
-                                                uint64_t snapshot_id);
+stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
+                                                uint64_t snapshot_id,
+                                                bool *out_changed);
 
 /*
  * TLY-A5-impl-2: roll the dataset back to a snapshot.
@@ -1718,15 +1738,20 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs,
  *   `force == true` is the operator's explicit override and proceeds
  *   to the mechanism.
  *
- * Refusals: STM_EINVAL (NULL fs / snapshot_id == 0), STM_ECORRUPT
- * (snapshot index unavailable), STM_ENOENT (snapshot unknown / wrong
- * dataset), STM_ECOMPROMISED (marked + not forced), STM_EWEDGED,
- * STM_EROFS. On a non-compromised (or force) path: STM_ENOTSUPPORTED
- * (the v1.0 stub).
+ * `dataset_id` is the dataset the caller believes owns the snapshot
+ * (the /ctl/ path's `<id>`); a snapshot whose actual `dataset_id`
+ * differs is refused with STM_ENOENT — the rollback cannot cross the
+ * dataset boundary the verb was addressed to (R146 P2-2).
+ *
+ * Refusals: STM_EINVAL (NULL fs / dataset_id == 0 / snapshot_id == 0),
+ * STM_ECORRUPT (snapshot index unavailable), STM_ENOENT (snapshot
+ * unknown / belongs to a different dataset), STM_ECOMPROMISED (marked
+ * + not forced), STM_EWEDGED, STM_EROFS. On a non-compromised (or
+ * force) path: STM_ENOTSUPPORTED (the v1.0 stub).
  */
 STM_MUST_USE
-stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t snapshot_id,
-                                      bool force);
+stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
+                                      uint64_t snapshot_id, bool force);
 
 /*
  * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty

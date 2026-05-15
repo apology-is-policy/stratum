@@ -3590,15 +3590,28 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             return STM_EINVAL;
         }
 
+        bool changed = false;
         stm_status rc = is_mark
-            ? stm_fs_mark_snapshot_compromised(c->fs, snap_id)
-            : stm_fs_unmark_snapshot_compromised(c->fs, snap_id);
-        /* Commit synchronously on success so the security marker is
-         * durable on return. Surface a commit failure as the verb's
-         * result. */
-        if (rc == STM_OK) {
+            ? stm_fs_mark_snapshot_compromised(c->fs, dsid, snap_id, &changed)
+            : stm_fs_unmark_snapshot_compromised(c->fs, dsid, snap_id, &changed);
+        /* Commit synchronously so the security marker is durable on
+         * return. R146 P2-1: only commit when the bit actually
+         * changed — an idempotent no-op has nothing to persist and
+         * its desired state is already durable. On commit failure,
+         * REVERT the in-RAM toggle so RAM matches the un-persisted
+         * on-disk state; without this a later unrelated commit would
+         * silently persist a change the operator was told failed
+         * (for unmark, that un-gates a rollback — fails unsafe). */
+        if (rc == STM_OK && changed) {
             stm_status crc = stm_fs_commit(c->fs);
-            if (crc != STM_OK) rc = crc;
+            if (crc != STM_OK) {
+                (void)(is_mark
+                    ? stm_fs_unmark_snapshot_compromised(c->fs, dsid,
+                                                           snap_id, NULL)
+                    : stm_fs_mark_snapshot_compromised(c->fs, dsid,
+                                                         snap_id, NULL));
+                rc = crc;
+            }
         }
         stm_ctl_log_event(c,
             "%s uid=%u dataset=%llu snap-id=%llu result=%s%s",
@@ -3691,7 +3704,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             return STM_EINVAL;
         }
 
-        stm_status rc = stm_fs_rollback_snapshot(c->fs, snap_id, force);
+        stm_status rc = stm_fs_rollback_snapshot(c->fs, dsid, snap_id, force);
         stm_ctl_log_event(c,
             "%s uid=%u dataset=%llu snap-id=%llu force=%d result=%s%s",
             verb, (unsigned)cn->caller_uid, (unsigned long long)dsid,

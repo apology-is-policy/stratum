@@ -5770,7 +5770,7 @@ STM_TEST(ctl_a5_rollback_compromised_refused)
 {
     scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_rb2", 0);
     uint64_t snap_id = setup_snapshot(f.fs, 1, "rb_marked");
-    STM_ASSERT_OK(stm_fs_mark_snapshot_compromised(f.fs, snap_id));
+    STM_ASSERT_OK(stm_fs_mark_snapshot_compromised(f.fs, 1, snap_id, NULL));
 
     char body[32];
     int n = snprintf(body, sizeof body, "%llu",
@@ -5800,7 +5800,7 @@ STM_TEST(ctl_a5_rollback_compromised_force_bypasses_gate)
 {
     scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_rb3", 0);
     uint64_t snap_id = setup_snapshot(f.fs, 1, "rb_forced");
-    STM_ASSERT_OK(stm_fs_mark_snapshot_compromised(f.fs, snap_id));
+    STM_ASSERT_OK(stm_fs_mark_snapshot_compromised(f.fs, 1, snap_id, NULL));
 
     char body[40];
     int n = snprintf(body, sizeof body, "force %llu",
@@ -5839,6 +5839,68 @@ STM_TEST(ctl_a5_rollback_nonadmin_and_corvus_refused)
     STM_ASSERT_OK(stm_ctl_set_corvus_admin_uid(f.c, 1000));
     STM_ASSERT_EQ(a5_open_dataset_verb(&f, "rollback-snapshot", 4, 12),
                   STM_LP9_RLERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* ── R146 P2-2 — snapshot id is dataset-bound ────────────────────── */
+
+/* A mark / rollback addressed to the WRONG dataset is refused with
+ * STM_ENOENT even though the snapshot id exists pool-globally — the
+ * /ctl/datasets/<id>/ verb cannot reach a snapshot owned by another
+ * dataset. */
+STM_TEST(ctl_a5_r146_snapshot_is_dataset_bound)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_dsbind", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "ds1_snap");
+
+    /* Correct dataset (1) — resolves. mark is idempotent OK. */
+    STM_ASSERT_OK(stm_fs_mark_snapshot_compromised(f.fs, 1, snap_id, NULL));
+    STM_ASSERT_OK(stm_fs_unmark_snapshot_compromised(f.fs, 1, snap_id, NULL));
+
+    /* Wrong dataset id — the snapshot is dataset 1's, not 999's. */
+    STM_ASSERT_EQ(stm_fs_mark_snapshot_compromised(f.fs, 999, snap_id, NULL),
+                  STM_ENOENT);
+    STM_ASSERT_EQ(stm_fs_unmark_snapshot_compromised(f.fs, 999, snap_id, NULL),
+                  STM_ENOENT);
+    STM_ASSERT_EQ(stm_fs_rollback_snapshot(f.fs, 999, snap_id, false),
+                  STM_ENOENT);
+    STM_ASSERT_EQ(stm_fs_rollback_snapshot(f.fs, 999, snap_id, true),
+                  STM_ENOENT);
+
+    /* dataset_id == 0 is an arg-shape error, pre-empts everything. */
+    STM_ASSERT_EQ(stm_fs_mark_snapshot_compromised(f.fs, 0, snap_id, NULL),
+                  STM_EINVAL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* R146 P2-1: `out_changed` reports a REAL bit flip vs an idempotent
+ * no-op — the signal the /ctl/ handler uses to skip a needless commit
+ * and to know whether a commit-failure revert is required. */
+STM_TEST(ctl_a5_r146_mark_reports_changed)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_chg", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "chg_snap");
+    bool changed = false;
+
+    /* First mark of a clean snap → real change. */
+    STM_ASSERT_OK(stm_fs_mark_snapshot_compromised(f.fs, 1, snap_id, &changed));
+    STM_ASSERT_TRUE(changed);
+
+    /* Second mark → idempotent no-op, no change. */
+    changed = true;
+    STM_ASSERT_OK(stm_fs_mark_snapshot_compromised(f.fs, 1, snap_id, &changed));
+    STM_ASSERT_TRUE(!changed);
+
+    /* First unmark of a marked snap → real change. */
+    STM_ASSERT_OK(stm_fs_unmark_snapshot_compromised(f.fs, 1, snap_id, &changed));
+    STM_ASSERT_TRUE(changed);
+
+    /* Second unmark → idempotent no-op. */
+    changed = true;
+    STM_ASSERT_OK(stm_fs_unmark_snapshot_compromised(f.fs, 1, snap_id, &changed));
+    STM_ASSERT_TRUE(!changed);
 
     destroy_scrub_trigger_fixture(f);
 }

@@ -6137,11 +6137,20 @@ stm_status stm_fs_release_snapshot(stm_fs *fs, uint64_t snapshot_id)
     return s;
 }
 
-stm_status stm_fs_mark_snapshot_compromised(stm_fs *fs,
-                                              uint64_t snapshot_id)
+/* TLY-A5 / R146 P2-1+P2-2: shared body for mark (set=true) /
+ * unmark (set=false). Resolves snapshot_id, binds it to dataset_id
+ * (cross-dataset → STM_ENOENT), toggles the marker, and reports
+ * whether the bit actually changed so the caller can skip a needless
+ * commit and revert cleanly on commit failure. */
+static stm_status fs_set_snapshot_compromised(stm_fs *fs,
+                                                uint64_t dataset_id,
+                                                uint64_t snapshot_id,
+                                                bool set,
+                                                bool *out_changed)
 {
+    if (out_changed) *out_changed = false;
     if (!fs) return STM_EINVAL;
-    if (snapshot_id == 0) return STM_EINVAL;
+    if (dataset_id == 0 || snapshot_id == 0) return STM_EINVAL;
 
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
@@ -6152,36 +6161,51 @@ stm_status stm_fs_mark_snapshot_compromised(stm_fs *fs,
         return STM_ECORRUPT;
     }
 
-    stm_status s = stm_snapshot_mark_compromised(sidx, snapshot_id);
-    pthread_rwlock_unlock(&fs->global);
-    return s;
-}
-
-stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs,
-                                                uint64_t snapshot_id)
-{
-    if (!fs) return STM_EINVAL;
-    if (snapshot_id == 0) return STM_EINVAL;
-
-    pthread_rwlock_wrlock(&fs->global);
-    FS_GUARD_WRITE(fs);
-
-    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
-    if (!sidx) {
+    /* Resolve + dataset-bind the target. The snapshot index is
+     * pool-global; refuse a snapshot that lives in a different
+     * dataset than the one the caller addressed (R146 P2-2). */
+    stm_snapshot_entry entry;
+    stm_status s = stm_snapshot_lookup(sidx, snapshot_id, &entry);
+    if (s != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
-        return STM_ECORRUPT;
+        return s;
+    }
+    if (entry.dataset_id != dataset_id) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ENOENT;
     }
 
-    stm_status s = stm_snapshot_unmark_compromised(sidx, snapshot_id);
+    bool was_set =
+        (entry.flags & STM_SNAP_FLAG_ROLLBACK_COMPROMISED) != 0;
+    s = set ? stm_snapshot_mark_compromised(sidx, snapshot_id)
+            : stm_snapshot_unmark_compromised(sidx, snapshot_id);
+    if (s == STM_OK && out_changed)
+        *out_changed = (was_set != set);
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
 
-stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t snapshot_id,
-                                      bool force)
+stm_status stm_fs_mark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
+                                              uint64_t snapshot_id,
+                                              bool *out_changed)
+{
+    return fs_set_snapshot_compromised(fs, dataset_id, snapshot_id,
+                                          true, out_changed);
+}
+
+stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
+                                                uint64_t snapshot_id,
+                                                bool *out_changed)
+{
+    return fs_set_snapshot_compromised(fs, dataset_id, snapshot_id,
+                                          false, out_changed);
+}
+
+stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
+                                      uint64_t snapshot_id, bool force)
 {
     if (!fs) return STM_EINVAL;
-    if (snapshot_id == 0) return STM_EINVAL;
+    if (dataset_id == 0 || snapshot_id == 0) return STM_EINVAL;
 
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
@@ -6198,6 +6222,12 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t snapshot_id,
     if (s != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return s;
+    }
+    /* Dataset-bind: the rollback cannot cross the dataset boundary
+     * the /ctl/ verb was addressed to (R146 P2-2). */
+    if (entry.dataset_id != dataset_id) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ENOENT;
     }
 
     /* Consultation gate (snapshot.tla::RollbackBlockedIffCompromised):

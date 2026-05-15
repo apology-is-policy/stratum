@@ -149,10 +149,17 @@ materializer gains a `compromised: yes|no` line.
 `force` — clearing a compromise flag is itself a sensitive act, so it
 is not a bare no-arg verb. Audit-logged.
 
-**`mark` reason validation** (R99 P2-1 line-injection doctrine): the
-reason text is bound to a max length and control bytes (`< 0x20`,
-`0x7F`) are refused — it flows into the line-oriented `/ctl/events`
-log. UTF-8 multi-byte (`≥ 0x80`) passes.
+**`mark` reason text — DEFERRED** (R146 P3-1 reconciliation). An
+earlier draft of this section accepted a `<sid> <reason>` body and
+specified R99 P2-1 line-injection validation for the reason. The
+v1.0 impl ships `<sid>`-only: `mark-snapshot-compromised` records
+who (uid) + when (`/ctl/events` timestamp) + what (verb + snap-id),
+which satisfies the audit-trail goal; the free-text *why* is not
+captured. A future v1.x chunk may add the reason field — at which
+point the R99 line-injection rule (max length + control-byte
+refusal, since it flows into the line-oriented `/ctl/events` log)
+applies. §3's "the *why* is in `/ctl/events`" goal is amended to
+"the *who/when/what*"; the *why* is forward-noted.
 
 ## 7. Corvus principal — `--corvus-admin-uid` (TLY-A5-impl-1)
 
