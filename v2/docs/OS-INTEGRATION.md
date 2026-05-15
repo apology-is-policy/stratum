@@ -324,6 +324,46 @@ This is one of the most underrated wins of running on Stratum: **transactional O
 - **Snapshot creates flush the dirty buffer first.** A snapshot during a hot write loop will block briefly. Schedule snapshots when the system is quiescent OR accept ~hundreds of ms of write stall.
 - **Snapshot names are line-oriented; sanitize user input.** Names with control bytes are refused server-side (R99 P2-1 doctrine), but your UI should refuse them client-side too.
 
+### v1.0 status — rollback is gated, not yet executed (TLY-A5)
+
+**The `rollback-snapshot` *mechanism* is a v1.1 / Phase 9.7 stub.** v2
+ships only the snapshot *index* (accounting records), not the
+per-dataset metadata trees that a real rollback swaps. In v1.0,
+`echo <snap-id> > /ctl/datasets/<id>/rollback-snapshot` parses, gates,
+audit-logs — and then returns `STM_ENOTSUPPORTED`. The "shape" above
+is the v1.1 target; an installer that needs working rollback today
+should fall back to boot-from-previous-snapshot at the bootloader
+level. The `/ctl/` verb surface, the error codes, and the safety gate
+below are final — Phase 9.7 only fills in the data-mutation step, so
+code written against the verb today keeps working unchanged.
+
+### Snapshot rollback-compromise marker (TLY-A5)
+
+A snapshot taken while a dataset's wrap keys were live can become a
+liability if those keys are later found compromised — rolling back to
+it resurrects a vulnerable key chain (the "F13 hazard",
+CORVUS-DESIGN §4.5). Stratum carries a per-snapshot
+**rollback-compromised marker** (bit 0 of the snapshot's `flags`; no
+on-disk format change) and three `/ctl/` verbs:
+
+| Verb | Path | Body | Who |
+|---|---|---|---|
+| mark | `/ctl/datasets/<id>/mark-snapshot-compromised` | `<sid>` | admin **or** the corvus principal |
+| unmark | `/ctl/datasets/<id>/unmark-snapshot-compromised` | `force <sid>` | admin only |
+| rollback | `/ctl/datasets/<id>/rollback-snapshot` | `<sid>` or `force <sid>` | admin only |
+
+- **Consultation gate.** A `rollback-snapshot` of a marked snapshot is
+  refused with `STM_ECOMPROMISED` (-217) unless the body carries the
+  `force` token. This is load-bearing in v1.0 — it fires *before* the
+  stubbed mechanism, so the safety check is genuinely exercised.
+- **Corvus principal.** corvus (the key agent) can *raise* the alarm
+  autonomously: pass `stratumd --corvus-admin-uid <uid>` and that uid
+  is admitted by `mark-snapshot-compromised` alongside the operator
+  admin. corvus may **not** clear the marker (`unmark`) nor force a
+  rollback — clearing the alarm is an operator decision.
+- **Marker is durable on return.** `mark` / `unmark` commit
+  synchronously; the bit is on disk the moment the verb returns OK.
+
 ---
 
 ## 9. Storage tiers

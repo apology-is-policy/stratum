@@ -45,6 +45,8 @@ stm_status stm_snapshot_delete   (idx, snapshot_id,
                                   **out_freed_cold_hashes, *out_freed_cold_count);
 stm_status stm_snapshot_hold     (idx, snapshot_id);
 stm_status stm_snapshot_release  (idx, snapshot_id);
+stm_status stm_snapshot_mark_compromised   (idx, snapshot_id);   /* TLY-A5 */
+stm_status stm_snapshot_unmark_compromised (idx, snapshot_id);   /* TLY-A5 */
 ```
 
 All run under an internal `PTHREAD_MUTEX_ERRORCHECK` mutex. Same
@@ -89,6 +91,36 @@ A clean-no-overwrites delete returns `*out_freed_paddrs = NULL`,
 `Hold` / `Release` increment / decrement `hold_count`. Holds
 persist across mount (matches ZFS semantics). Release of a
 zero-count slot is `STM_EINVAL`.
+
+### Rollback-compromise marker (TLY-A5)
+
+`stm_snapshot_mark_compromised` / `_unmark_compromised` set / clear
+bit 0 of the entry's existing `flags` field
+(`STM_SNAP_FLAG_ROLLBACK_COMPROMISED`) — **no on-disk format
+change**. A marked snapshot is one taken while the dataset's wrap
+keys were live and those keys are now suspect; rolling back to it
+would resurrect a compromised key chain (the "F13 hazard",
+CORVUS-DESIGN §4.5). Both calls are idempotent — marking an
+already-marked snap is `STM_OK` and leaves the index clean (dirty
+flag set only on a real change). The bit becomes durable at the
+next commit; the `/ctl/` admin verbs that drive these
+(`mark-snapshot-compromised` / `unmark-snapshot-compromised`)
+commit synchronously so it is durable on verb return.
+
+The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
+(fs.h) — thin `fs->global` EX wrappers — and
+`stm_fs_rollback_snapshot(fs, snapshot_id, force)`:
+
+- **Consultation gate** (`snapshot.tla::RollbackBlockedIffCompromised`):
+  if the target carries `STM_SNAP_FLAG_ROLLBACK_COMPROMISED` AND
+  `force` is false, the call refuses with `STM_ECOMPROMISED` (-217)
+  *before* the mechanism. The lookup + the flag check run under one
+  `fs->global` EX hold, so a racing unmark is never torn.
+- **Mechanism** — the per-dataset metadata-tree swap is **Phase 9.7**
+  (v2 has no per-dataset trees). A non-compromised / forced rollback
+  therefore reaches a stub returning `STM_ENOTSUPPORTED`. The gate,
+  the error code, and the `/ctl/` surface are final; Phase 9.7 fills
+  in only the stub body.
 
 ### Dead-list (P6-deadlist + P7-CAS-4c cold-tier)
 
@@ -377,7 +409,13 @@ tree uses `STM_BPTR_KIND_DATASET = 9` (added in P6-clone).
       revision; in-line cap STM_SNAP_DEAD_LIST_MAX = 256.
 - [ ] Production callers of `overwrite_block` (extent COW path) —
       lands with P7's paddr→bptr resolver.
-- [ ] Snapshot rollback (ARCH §8.10) — separate API.
+- [x] Rollback-compromise marker (TLY-A5) — `STM_SNAP_FLAG_ROLLBACK_COMPROMISED`
+      + `stm_snapshot_{mark,unmark}_compromised` + the fs-level
+      consultation gate in `stm_fs_rollback_snapshot`.
+- [~] Snapshot rollback (ARCH §8.10) — the `/ctl/` verb surface, the
+      consultation gate, and `STM_ECOMPROMISED` ship at TLY-A5-impl-2;
+      the rollback *mechanism* (per-dataset metadata-tree swap) is a
+      **Phase 9.7** stub returning `STM_ENOTSUPPORTED`.
 - [ ] Snapshot send/recv via birth-txg incremental diffs — Phase 7.
 
 ## Known caveats
