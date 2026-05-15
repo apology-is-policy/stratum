@@ -185,6 +185,22 @@ The gate fires:
 3. At **`vops_write`** as defense-in-depth re-check for writable
    admin kinds — every admin-write rechecks the gate.
 
+### Corvus principal (TLY-A5-impl-1c)
+
+`mark-snapshot-compromised` has a SECOND, narrower principal beyond
+the operator admin. `stm_ctl::corvus_admin_uid` (set once at startup
+via `stm_ctl_set_corvus_admin_uid`, fed by stratumd's
+`--corvus-admin-uid`) names a uid that `ctl_caller_may_mark_compromised`
+admits ALONGSIDE the admin — for the mark verb ONLY. Rationale: corvus
+(the key agent) detects a compromised wrap chain and must autonomously
+RAISE the F13 rollback-compromise marker; clearing it
+(`unmark-snapshot-compromised`) and every other admin surface stay
+strict-admin-only. The gate is consulted at both `vops_lopen` and the
+`vops_write` defense-in-depth re-check, for `KIND_DATASET_MARK_SNAPSHOT_COMPROMISED`
+only. Default (`corvus_admin_uid == (uid_t)-1`) = no corvus principal;
+the mark verb collapses back to strict-admin (back-compat). Fails
+closed: an unset `caller_uid` never matches.
+
 ### Writable kinds discipline
 
 All writable kinds inherit:

@@ -1274,6 +1274,16 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
          * non-root operator. */
         (void)stm_ctl_set_admin_uid(ctl, (uid_t)geteuid());
 
+        /* TLY-A5-impl-1c: optional corvus principal. When the
+         * operator passed --corvus-admin-uid, that uid is admitted
+         * by the mark-snapshot-compromised verb alongside admin —
+         * corvus can autonomously raise the F13 alarm. Set BEFORE
+         * the accept-loop pthread spawn (R97 P2-2 timing barrier:
+         * the pthread_create happens-before edge publishes this
+         * write to every worker). */
+        if (opts->corvus_admin_uid_set)
+            (void)stm_ctl_set_corvus_admin_uid(ctl, opts->corvus_admin_uid);
+
         /* S5-PRE-A: attach pool + scrub so /ctl/pools/<uuid>/ becomes
          * non-empty (devices/, scrub, metrics). The pool pointer is
          * borrowed from the fs (same lifetime); the scrub is owned by

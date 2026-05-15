@@ -112,7 +112,12 @@ static void usage(const char *argv0)
             "(default: %d)\n"
         "  --bind-pool-serial <hex> 32-hex-char (16-byte) pool_serial "
             "that the on-disk superblock must match. Refuses to mount on "
-            "mismatch (STRATUM-API-V1.md §3.3 — TLY-A1).\n"
+            "mismatch (STRATUM-API-V1.md §3.3 — TLY-A1).\n",
+        argv0, STM_STRATUMD_DEFAULT_BACKLOG);
+    /* Split into a second fprintf: the concatenated literal exceeds
+     * the C99 4095-byte minimum for a single string literal
+     * (-Woverlength-strings). No format args in this half. */
+    fprintf(stderr,
         "  --corvus-user <name>     Subscribe to corvus SESSION_CLOSED notify "
             "for this user (TLY-A4). When matching frame arrives, stratumd "
             "shuts down cleanly. STRATUM-API-V1.md §6.\n"
@@ -132,6 +137,10 @@ static void usage(const char *argv0)
             "                           Path to the 33-byte corvus session "
             "token. When set, CORVUS-tagged keyschema slots are unwrapped "
             "over corvus at mount (TLY-A3-keyslot).\n"
+        "  --corvus-admin-uid <N>   uid that the /ctl/ "
+            "mark-snapshot-compromised verb admits alongside the operator "
+            "admin (TLY-A5). corvus may RAISE the rollback-compromise "
+            "alarm; only the operator may clear it. Requires --ctl-listen.\n"
         "  --role {coord,client}    Stratumd role (default: coord). client mode\n"
             "                           runs as a per-user proxy to a coordinator\n"
             "                           stratumd; requires --coordinator-socket and\n"
@@ -166,8 +175,7 @@ static void usage(const char *argv0)
             "                           each bounded at 256 bytes; longer anames\n"
             "                           (spec:/abs forms) are refused under\n"
             "                           policy enforcement (R139 P2-1).\n"
-        "  -h, --help               This message\n",
-        argv0, STM_STRATUMD_DEFAULT_BACKLOG);
+        "  -h, --help               This message\n");
 }
 
 /* TLY-A1 (R137 P2-1 close): un-static'd and namespaced so tests can
@@ -394,6 +402,37 @@ int stm_cmd_stratumd_main(int argc, char **argv)
             opts.corvus_session_token_file = argv[++i];
             continue;
         }
+        if (!strcmp(a, "--corvus-admin-uid") && i + 1 < argc) {
+            /* TLY-A5-impl-1c: the corvus-principal uid admitted by
+             * the mark-snapshot-compromised /ctl/ verb (alongside
+             * admin). Strict parse — refuse empty / no-digit-prefix
+             * inputs (R141 P2-1 doctrine carry: strtoull("")
+             * returns 0 with end == arg, which would silently
+             * enable the gate expecting uid 0). The '-'/'+' prefixes
+             * are caught by the digit-range test below. */
+            const char *arg = argv[++i];
+            if (*arg < '0' || *arg > '9') {
+                fprintf(stderr,
+                    "stratumd: invalid --corvus-admin-uid: %s "
+                    "(expected non-empty unsigned integer)\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            char *end = NULL;
+            unsigned long long v = strtoull(arg, &end, 10);
+            /* (uid_t)-1 is the "no corvus principal" sentinel — a
+             * valid uid must be strictly below it. */
+            if (!end || *end != '\0' || end == arg
+                || v > (unsigned long long)((uid_t)-2)) {
+                fprintf(stderr,
+                    "stratumd: invalid --corvus-admin-uid: %s\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            opts.corvus_admin_uid     = (uid_t)v;
+            opts.corvus_admin_uid_set = true;
+            continue;
+        }
         if (!strcmp(a, "--corvus-notify-mode") && i + 1 < argc) {
             const char *m = argv[++i];
             if (!strcmp(m, "strict")) {
@@ -531,6 +570,18 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         fprintf(stderr,
             "stratumd: --coordinator-uid requires --role client "
             "(coord mode does not dial; the flag has no effect)\n");
+        stm_ds_policy_table_close(&user_policy_table);
+        return 1;
+    }
+    /* TLY-A5-impl-1c: --corvus-admin-uid only affects the /ctl/
+     * mark-snapshot-compromised verb; without --ctl-listen the
+     * /ctl/ surface is never created and the flag is a silent
+     * no-op. Refuse loudly (R141 P2-2 doctrine carry). */
+    if (opts.corvus_admin_uid_set && !opts.ctl_socket_path) {
+        fprintf(stderr,
+            "stratumd: --corvus-admin-uid requires --ctl-listen "
+            "(the corvus principal only gates the /ctl/ "
+            "mark-snapshot-compromised verb)\n");
         stm_ds_policy_table_close(&user_policy_table);
         return 1;
     }

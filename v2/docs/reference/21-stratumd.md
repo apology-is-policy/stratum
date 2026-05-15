@@ -347,6 +347,7 @@ complementary gates:
 | TLY-A3-impl-1: corvus UNWRAP codec + token loader | LIVE | `v2/src/corvus_client/` — pure codec (`1eb7480`) |
 | TLY-A3-impl-2: corvus UNWRAP transport + retry | LIVE | `stm_corvus_unwrap_once` + `stm_corvus_unwrap` (Q9 backoff); raw AF_UNIX (`58a7253`) |
 | TLY-A3-keyslot-impl-3b: mount-time UNWRAP wiring + CLI | LIVE | `--corvus-socket` + `--corvus-session-token-file` → `stm_fs_mount_opts` → `stm_sync_open`'s `stm_corvus_mount_cfg`; `sync_unwrap_cb` routes `STM_KS_WRAPPER_CORVUS` slots |
+| TLY-A5-impl-1c: corvus-principal gate `--corvus-admin-uid` | LIVE | CLI → `stm_stratumd_opts.corvus_admin_uid` → `stm_ctl_set_corvus_admin_uid`; the `/ctl/` `mark-snapshot-compromised` verb admits that uid alongside admin (`unmark` stays strict-admin). Requires `--ctl-listen` |
 
 The corvus UNWRAP client (`v2/src/corvus_client/`) is a standalone
 library, NOT part of stratumd's transport, but is listed here because

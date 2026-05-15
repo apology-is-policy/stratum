@@ -463,6 +463,12 @@ struct stm_ctl {
      * invocation; immutable on read paths. Per-conn caller_uid
      * lives on stm_ctl_conn (P9.5-PARALLEL-1). */
     uid_t            admin_uid;      /* (uid_t)-1 = no daemon-euid admin */
+    /* TLY-A5-impl-1c: corvus-principal uid. A second, narrower
+     * principal admitted ONLY by mark-snapshot-compromised (NOT
+     * unmark, NOT any other admin kind). Set once at startup via
+     * stm_ctl_set_corvus_admin_uid; immutable on read paths.
+     * (uid_t)-1 = no corvus principal — mark stays strict-admin. */
+    uid_t            corvus_admin_uid;
     /* P9.5-PARALLEL-1 test-compat: stm_ctl_set_caller stashes here
      * so the test harness's make_ctl_server() helper can pull the
      * configured uid when creating its stm_ctl_conn. NOT used by
@@ -520,6 +526,23 @@ static bool ctl_caller_is_admin(const stm_ctl_conn *cn)
     if (cn->caller_uid == 0) return true;
     if (cn->ctl->admin_uid != (uid_t)-1
             && cn->caller_uid == cn->ctl->admin_uid)
+        return true;
+    return false;
+}
+
+/* TLY-A5-impl-1c: gate for KIND_DATASET_MARK_SNAPSHOT_COMPROMISED.
+ * Admits the operator admin (root or admin_uid) OR the configured
+ * corvus principal. corvus can autonomously RAISE the F13
+ * rollback-compromise alarm; clearing it (unmark) stays strict-admin
+ * via ctl_caller_is_admin. Fails closed: an unset caller_uid
+ * ((uid_t)-1) never matches, and an unconfigured corvus_admin_uid
+ * ((uid_t)-1) collapses this back to the admin-only gate. */
+static bool ctl_caller_may_mark_compromised(const stm_ctl_conn *cn)
+{
+    if (ctl_caller_is_admin(cn)) return true;
+    if (cn->caller_uid == (uid_t)-1) return false;
+    if (cn->ctl->corvus_admin_uid != (uid_t)-1
+            && cn->caller_uid == cn->ctl->corvus_admin_uid)
         return true;
     return false;
 }
@@ -2762,8 +2785,15 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
      * distinguish "EACCES because not admin" from "ENOENT because
      * the path doesn't exist" — same defensive posture as POSIX
      * mode 0500 directories. */
-    if (meta->admin_required && !ctl_caller_is_admin(cn))
-        return STM_EACCES;
+    if (meta->admin_required) {
+        /* TLY-A5-impl-1c: the mark-snapshot-compromised verb admits
+         * the corvus principal alongside admin; every other admin
+         * kind (incl. unmark) stays strict-admin-only. */
+        bool gate_ok = (k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED)
+                           ? ctl_caller_may_mark_compromised(cn)
+                           : ctl_caller_is_admin(cn);
+        if (!gate_ok) return STM_EACCES;
+    }
 
     /* Directories: open is advisory; readdir handles iteration. */
     if (meta->is_dir) {
@@ -3467,7 +3497,14 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         const char *verb = is_mark ? "mark-snapshot-compromised"
                                    : "unmark-snapshot-compromised";
 
-        if (!ctl_caller_is_admin(cn)) return STM_EACCES;
+        /* TLY-A5-impl-1c: defense-in-depth re-check. mark admits the
+         * corvus principal; unmark stays strict-admin (only the
+         * operator may clear the F13 alarm). A client that forged the
+         * qid to skip the vops_lopen gate still fails here. */
+        bool write_gate_ok = is_mark
+            ? ctl_caller_may_mark_compromised(cn)
+            : ctl_caller_is_admin(cn);
+        if (!write_gate_ok) return STM_EACCES;
         if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
         pthread_mutex_lock(&cn->mu);
         ctl_session *s = session_get_locked(cn, fid);
@@ -3618,6 +3655,9 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out)
      * ctl_caller_is_admin returns false for any non-root caller —
      * admin-only kinds refuse access. */
     c->admin_uid  = (uid_t)-1;
+    /* TLY-A5-impl-1c: no corvus principal until stratumd configures
+     * one via --corvus-admin-uid → stm_ctl_set_corvus_admin_uid. */
+    c->corvus_admin_uid = (uid_t)-1;
     c->pending_caller_uid = (uid_t)-1;
     c->pending_caller_gid = (gid_t)-1;
     /* P9.5-PARALLEL-1: event_gen starts at 1 so a stm_ctl_conn that
@@ -3752,6 +3792,13 @@ stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid)
 {
     if (!c) return STM_EINVAL;
     c->admin_uid = admin_uid;
+    return STM_OK;
+}
+
+stm_status stm_ctl_set_corvus_admin_uid(stm_ctl *c, uid_t corvus_admin_uid)
+{
+    if (!c) return STM_EINVAL;
+    c->corvus_admin_uid = corvus_admin_uid;
     return STM_OK;
 }
 

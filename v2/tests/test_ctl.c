@@ -5603,4 +5603,133 @@ STM_TEST(ctl_e1_metrics_prometheus_wedged_emits_wedged_gauge)
     destroy_metrics_fixture(f);
 }
 
+/* ── TLY-A5-impl-1c — corvus-principal gate ─────────────────────── */
+
+/* Walk /datasets/1/<verb>, then Topen O_WRONLY. Returns the Rxx tag
+ * byte of the Topen reply: STM_LP9_RLOPEN on success, STM_LP9_RLERROR
+ * on a gate refusal. The Twalk is asserted to succeed — leaf kinds in
+ * /datasets/<id>/ are never walk-gated; the admin/principal gate
+ * fires at Tlopen. */
+static uint8_t a5_open_dataset_verb(scrub_trigger_fixture *f,
+                                       const char *verb,
+                                       uint16_t tag, uint32_t fid)
+{
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[3];
+    path[0] = "datasets";
+    path[1] = "1";
+    path[2] = verb;
+    uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    return resp[4];
+}
+
+/* The corvus principal (caller uid == corvus_admin_uid, NOT an admin)
+ * MAY open + write mark-snapshot-compromised, but MUST NOT clear the
+ * marker (unmark) nor reach any other admin verb (create-snapshot).
+ * corvus raises the F13 alarm autonomously; only the operator clears
+ * it. */
+STM_TEST(ctl_a5_corvus_principal_marks_not_unmarks)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_cm", 1000);
+    /* admin_uid stays unset (only uid 0 is admin); designate uid 1000
+     * — the connection's caller — as the corvus principal. */
+    STM_ASSERT_OK(stm_ctl_set_corvus_admin_uid(f.c, 1000));
+
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "f13_target");
+    char body[32];
+    int n = snprintf(body, sizeof body, "%llu",
+                      (unsigned long long)snap_id);
+
+    /* mark-snapshot-compromised: principal admitted. */
+    STM_ASSERT_EQ(a5_open_dataset_verb(&f, "mark-snapshot-compromised", 2, 11),
+                  STM_LP9_RLOPEN);
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
+
+    /* /events records the principal's uid + a result=ok. */
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    char want[160];
+    snprintf(want, sizeof want,
+        "mark-snapshot-compromised uid=1000 dataset=1 snap-id=%llu result=ok",
+        (unsigned long long)snap_id);
+    STM_ASSERT(strstr(ebody, want) != NULL);
+
+    /* unmark-snapshot-compromised: principal REFUSED — clearing the
+     * F13 alarm is an operator-only act. */
+    STM_ASSERT_EQ(a5_open_dataset_verb(&f, "unmark-snapshot-compromised", 6, 13),
+                  STM_LP9_RLERROR);
+
+    /* The principal is scoped to the mark verb ONLY — no other admin
+     * surface (create-snapshot here) opens for it. */
+    STM_ASSERT_EQ(a5_open_dataset_verb(&f, "create-snapshot", 8, 14),
+                  STM_LP9_RLERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* A non-admin caller that is NOT the configured corvus principal —
+ * either because corvus_admin_uid is a different uid, or because no
+ * corvus principal is configured at all — is refused at the mark
+ * verb (back-compat: mark stays strict-admin when no principal). */
+STM_TEST(ctl_a5_nonprincipal_cannot_mark)
+{
+    /* corvus principal configured, but as a DIFFERENT uid (2000) than
+     * the connecting caller (1000). */
+    scrub_trigger_fixture f1 = make_scrub_trigger_fixture("ctl_a5_np1", 1000);
+    STM_ASSERT_OK(stm_ctl_set_corvus_admin_uid(f1.c, 2000));
+    STM_ASSERT_EQ(a5_open_dataset_verb(&f1, "mark-snapshot-compromised", 2, 11),
+                  STM_LP9_RLERROR);
+    destroy_scrub_trigger_fixture(f1);
+
+    /* No corvus principal configured at all — the default. The mark
+     * verb collapses back to strict-admin and refuses uid 1000. */
+    scrub_trigger_fixture f2 = make_scrub_trigger_fixture("ctl_a5_np2", 1000);
+    STM_ASSERT_EQ(a5_open_dataset_verb(&f2, "mark-snapshot-compromised", 2, 11),
+                  STM_LP9_RLERROR);
+    destroy_scrub_trigger_fixture(f2);
+}
+
+/* The operator admin is unaffected by the corvus-principal gate — it
+ * may both mark AND unmark (clear) the compromise marker. */
+STM_TEST(ctl_a5_admin_marks_and_unmarks)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_adm", 0);
+    /* corvus_admin_uid left unset; the caller is uid 0 (root admin). */
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "adm_target");
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    char body[32];
+    int n = snprintf(body, sizeof body, "%llu",
+                      (unsigned long long)snap_id);
+
+    /* mark. */
+    STM_ASSERT_EQ(a5_open_dataset_verb(&f, "mark-snapshot-compromised", 2, 11),
+                  STM_LP9_RLOPEN);
+    uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
+
+    /* unmark — admin clears the marker with the mandatory force token. */
+    char ubody[40];
+    int un = snprintf(ubody, sizeof ubody, "force %llu",
+                        (unsigned long long)snap_id);
+    STM_ASSERT_EQ(a5_open_dataset_verb(&f, "unmark-snapshot-compromised", 6, 12),
+                  STM_LP9_RLOPEN);
+    sz = build_twrite(req, 8, 12, 0, ubody, (uint32_t)un);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
 STM_TEST_MAIN("ctl")

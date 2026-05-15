@@ -317,6 +317,34 @@ STM_MUST_USE
 stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid);
 
 /*
+ * TLY-A5-impl-1c: set the "corvus principal" uid policy. This uid is
+ * a SECOND principal — narrower than admin — that is admitted ONLY
+ * by the `/ctl/datasets/<id>/mark-snapshot-compromised` write verb,
+ * alongside the operator admin uid. Rationale (CORVUS-DESIGN §4.5 /
+ * STRATUM-API-V1.md §7): corvus, the key agent, can detect that a
+ * snapshot's wrap chain is compromised and must autonomously RAISE
+ * the rollback-compromise marker (the F13 hazard). It must NOT be
+ * able to CLEAR the marker (`unmark-snapshot-compromised`), nor
+ * touch any other admin surface — clearing the alarm is an operator
+ * decision.
+ *
+ * The gate for the mark verb thus becomes:
+ *   ctl_caller_is_admin(cn)            (operator — root or admin_uid)
+ *   OR caller_uid == corvus_admin_uid  (the corvus principal)
+ *
+ * Stratumd calls this once at startup from `--corvus-admin-uid`.
+ * The default `corvus_admin_uid` (set at stm_ctl_create) is
+ * `(uid_t)-1` meaning "no corvus principal configured" — the mark
+ * verb then stays strict-admin-only (back-compat for non-Thylacine
+ * deployments). Immutable on read paths, same timing posture as
+ * `stm_ctl_set_admin_uid` (call BEFORE the first server handle).
+ *
+ * Returns STM_EINVAL if `c` is NULL.
+ */
+STM_MUST_USE
+stm_status stm_ctl_set_corvus_admin_uid(stm_ctl *c, uid_t corvus_admin_uid);
+
+/*
  * DEPRECATED (P9.5-PARALLEL-1): sessions[] now live on
  * `stm_ctl_conn`, NOT on shared `stm_ctl`. Per-conn sessions die
  * with the conn via `stm_ctl_conn_destroy`; the "drop_all between

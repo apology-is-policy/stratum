@@ -258,6 +258,23 @@ typedef struct stm_stratumd_opts {
     const char *corvus_unwrap_socket;
     const char *corvus_session_token_file;
 
+    /* TLY-A5-impl-1c: corvus-principal gate for the snapshot
+     * compromise marker. When `corvus_admin_uid_set` is true, the
+     * `/ctl/datasets/<id>/mark-snapshot-compromised` write verb
+     * admits `corvus_admin_uid` ALONGSIDE the operator admin uid —
+     * corvus can autonomously raise the F13 alarm (a snapshot's
+     * wrap chain is compromised). Every OTHER admin kind, INCLUDING
+     * `unmark-snapshot-compromised`, stays strict-admin-only: corvus
+     * may *raise* the alarm but only the operator may *clear* it.
+     *
+     * Forwarded into `stm_ctl` via `stm_ctl_set_corvus_admin_uid`
+     * at startup (immutable thereafter, same posture as admin_uid).
+     * Default (`corvus_admin_uid_set == false`) = no corvus
+     * principal — the mark verb stays strict-admin-only (back-compat
+     * for non-Thylacine deployments). */
+    bool        corvus_admin_uid_set;
+    uid_t       corvus_admin_uid;
+
     /* Auth fallback policy (R95 P2-2). When peer-credential
      * resolution fails (platform without SO_PEERCRED / getpeereid),
      * the default behavior is to REFUSE the connection — the daemon
