@@ -1023,4 +1023,88 @@ STM_TEST(corvus_unwrap_dial_failure_propagates_as_ebackend)
     STM_ASSERT_EQ((int)rc, (int)STM_EBACKEND);
 }
 
+/* R144 P3-1: a hostile/buggy corvus sends status=OK with a payload_len
+ * larger than the 32-byte DEK. The transport must reject at the
+ * header-read step (before reading the payload into the fixed `resp`
+ * stack buffer) with STM_EPROTOCOL. */
+STM_TEST(corvus_unwrap_once_oversize_payload_len_is_eprotocol)
+{
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "oversize_plen") == 0);
+    /* Header only: status=OK, payload_len = 1000 (0x03E8 LE). The
+     * transport sees payload_len > 32 and refuses without reading a
+     * payload, so the fake need not send one. */
+    uint8_t hdr[3] = { STM_CORVUS_STATUS_OK, 0xE8, 0x03 };
+    size_t hdr_len = sizeof hdr;
+    uint8_t *hdr_p = hdr;
+    fc.responses     = &hdr_p;
+    fc.response_lens = &hdr_len;
+    fc.n_responses   = 1;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = fc.sock_path,
+        .connect_timeout_ms = 1000,
+        .io_timeout_ms      = 1000,
+        .n_retries          = 0,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    token[0] = 's';
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    stm_corvus_status status = STM_CORVUS_STATUS_OK;
+    stm_status rc = stm_corvus_unwrap_once(&t, token, "a", 1, 0, NULL, 0,
+                                                &status, dek);
+    STM_ASSERT_EQ((int)rc, (int)STM_EPROTOCOL);
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+}
+
+/* R144 P3-2: a zero connect_timeout_ms / io_timeout_ms must NOT mean
+ * "block forever" — the transport substitutes a 5 s default. This
+ * test confirms a zero-initialized-timeout opts struct still drives a
+ * successful unwrap (the default substitution doesn't break the happy
+ * path) and does not hang. */
+STM_TEST(corvus_unwrap_once_zero_timeout_uses_default)
+{
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "zero_timeout") == 0);
+    uint8_t dek_payload[STM_CORVUS_DEK_LEN];
+    memset(dek_payload, 0x9A, sizeof dek_payload);
+    size_t resp_len;
+    uint8_t *resp = build_resp(STM_CORVUS_STATUS_OK, dek_payload,
+                                   STM_CORVUS_DEK_LEN, &resp_len);
+    STM_ASSERT(resp != NULL);
+    fc.responses     = &resp;
+    fc.response_lens = &resp_len;
+    fc.n_responses   = 1;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    /* connect_timeout_ms + io_timeout_ms left at 0 — exercises the
+     * R144 P2-1 default substitution. */
+    stm_corvus_transport_opts t = {
+        .socket_path = fc.sock_path,
+        .n_retries   = 0,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    token[0] = 's';
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    stm_corvus_status status = STM_CORVUS_STATUS_INTERNAL_ERROR;
+    stm_status rc = stm_corvus_unwrap_once(&t, token, "a", 1, 0, NULL, 0,
+                                                &status, dek);
+    STM_ASSERT_EQ((int)rc, (int)STM_OK);
+    STM_ASSERT_EQ((int)status, (int)STM_CORVUS_STATUS_OK);
+    for (unsigned i = 0; i < STM_CORVUS_DEK_LEN; i++) {
+        STM_ASSERT_EQ((int)dek[i], 0x9A);
+    }
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+    free(resp);
+}
+
 STM_TEST_MAIN("corvus_client")

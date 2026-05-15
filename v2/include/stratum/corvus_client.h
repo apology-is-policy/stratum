@@ -245,12 +245,15 @@ typedef struct {
      * "/srv/corvus/ops/unwrap". NULL/empty → STM_EINVAL. */
     const char *socket_path;
 
-    /* Bounded connect timeout in milliseconds. 0 disables timeout
-     * (test-only posture — production callers SHOULD set ≥ 1000). */
+    /* Bounded connect timeout in milliseconds. 0 → a production-safe
+     * 5000 ms default is substituted (R144 P2-1 — 0 NEVER means
+     * "block forever"; a zero-initialized opts struct must not be
+     * able to hang the caller against a wedged corvus). */
     uint32_t    connect_timeout_ms;
 
     /* Bounded steady-state read/write timeout (SO_RCVTIMEO /
-     * SO_SNDTIMEO). 0 disables timeout (test-only). */
+     * SO_SNDTIMEO). 0 → same 5000 ms default substitution as
+     * connect_timeout_ms (R144 P2-1). */
     uint32_t    io_timeout_ms;
 
     /* Number of retries on a retry-eligible class. The spec-fixed
@@ -294,6 +297,8 @@ typedef struct {
  *                    out of range).
  *   STM_ENOSPC     — out_dek buffer too small (unreachable when
  *                    caller passes the canonical [STM_CORVUS_DEK_LEN]).
+ *   STM_ENOMEM     — request-frame allocation failed. Fatal (the
+ *                    retry wrapper does NOT retry it).
  */
 STM_MUST_USE
 stm_status stm_corvus_unwrap_once(const stm_corvus_transport_opts *t_opts,
@@ -320,7 +325,8 @@ stm_status stm_corvus_unwrap_once(const stm_corvus_transport_opts *t_opts,
  *     { BAD_AUTH, PERM_DENIED, NOT_FOUND, BAD_FORMAT } — mapped to
  *     STM_ECORVUSAUTH / STM_ECORVUSPERM / STM_ECORVUSNOTFOUND /
  *     STM_ECORVUSBADFORMAT via stm_corvus_status_to_stm.
- *   - stm_corvus_unwrap_once returns STM_EPROTOCOL or STM_EINVAL.
+ *   - stm_corvus_unwrap_once returns STM_EPROTOCOL, STM_EINVAL,
+ *     STM_ENOMEM, or STM_ENOSPC — all returned verbatim, no retry.
  *
  * On retries-exhausted (n_retries attempts all returned a
  * retry-eligible failure), this function returns the LAST observed

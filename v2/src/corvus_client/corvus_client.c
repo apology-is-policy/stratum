@@ -270,6 +270,20 @@ stm_status stm_corvus_load_token(const char *path,
 /* Transport — TLY-A3-impl-2.                                              */
 /* ────────────────────────────────────────────────────────────────────── */
 
+/* R144 P2-1: production-safe default substituted for a 0 (un-set)
+ * connect/io timeout in `stm_corvus_unwrap_once`. 0 in the opts struct
+ * means "use this default", NOT "block forever" — a zero-initialized
+ * opts struct must not be able to hang the mount path. */
+#define STM_CORVUS_DEFAULT_TIMEOUT_MS  5000u
+
+/* MSG_NOSIGNAL (R144 P2-2): Linux suppresses SIGPIPE per-send via this
+ * flag. macOS/BSD lack it (they use the SO_NOSIGPIPE socket option,
+ * set in dial_corvus). Define to 0 where absent so the send() call is
+ * portable. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 /* Dial corvus's UNWRAP socket with a bounded connect timeout. Mirrors
  * proxy_9p.c::dial_coord's R140 P2-3 posture: O_NONBLOCK + poll(POLLOUT)
  * + SO_ERROR check, then restore blocking for steady-state I/O. */
@@ -281,6 +295,17 @@ static int dial_corvus(const char *path, uint32_t timeout_ms)
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -errno;
+
+    /* R144 P2-2: macOS/BSD suppress SIGPIPE via this socket option
+     * (Linux uses MSG_NOSIGNAL per-send instead). Best-effort — a
+     * write() to a corvus that closed its end then yields EPIPE
+     * rather than killing the embedding daemon. */
+#ifdef SO_NOSIGPIPE
+    {
+        int on = 1;
+        (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+    }
+#endif
 
     if (timeout_ms > 0u) {
         int fl = fcntl(fd, F_GETFL);
@@ -327,9 +352,17 @@ static int dial_corvus(const char *path, uint32_t timeout_ms)
         }
     }
 
+    /* R144 P3-4: restore blocking mode for the steady-state serve
+     * loop. A failed restore would leave the socket non-blocking,
+     * making read_exact/write_all busy-poll against EAGAIN until
+     * SO_RCVTIMEO — burns CPU. Treat the failure as fatal-close. */
     if (timeout_ms > 0u) {
         int fl = fcntl(fd, F_GETFL);
-        if (fl >= 0) (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+        if (fl < 0 || fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) < 0) {
+            int e = errno;
+            close(fd);
+            return -e;
+        }
     }
 
     int flags = fcntl(fd, F_GETFD);
@@ -352,12 +385,16 @@ static void set_io_timeout(int fd, uint32_t timeout_ms)
 }
 
 /* Write exactly `len` bytes. EINTR loops; EAGAIN/EWOULDBLOCK (steady-
- * state timeout firing) AND EPIPE/ECONNRESET classify as STM_EBACKEND. */
+ * state timeout firing) AND EPIPE/ECONNRESET classify as STM_EBACKEND.
+ * R144 P2-2: send(..., MSG_NOSIGNAL) so a write to a corvus that closed
+ * its end yields EPIPE rather than SIGPIPE-killing the embedding
+ * daemon. (macOS lacks MSG_NOSIGNAL — there SO_NOSIGPIPE set in
+ * dial_corvus covers it, and MSG_NOSIGNAL is #define'd to 0.) */
 static stm_status write_all(int fd, const uint8_t *buf, size_t len)
 {
     size_t done = 0;
     while (done < len) {
-        ssize_t n = write(fd, buf + done, len - done);
+        ssize_t n = send(fd, buf + done, len - done, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue;
             return STM_EBACKEND;
@@ -403,82 +440,85 @@ stm_status stm_corvus_unwrap_once(const stm_corvus_transport_opts *t_opts,
         (stm_corvus_status)(STM_CORVUS_STATUS_INTERNAL_ERROR + 1);
     *out_status = SENTINEL;
 
-    /* Build the request frame on stack — worst case ~66 KiB (max
-     * wrapped_len + 255 dataset). Use a heap alloc to avoid stack
-     * pressure. */
+    /* Build the request frame in a heap buffer (worst case ~66 KiB:
+     * max wrapped_len + 255 dataset — too large for the stack). */
     size_t req_cap = stm_corvus_encode_unwrap_size(dataset_len, wrapped_len);
     if (req_cap == 0) return STM_EINVAL;
     uint8_t *req = malloc(req_cap);
     if (!req) return STM_ENOMEM;
 
+    /* R144 P1-1: every exit after this point routes through `out:`,
+     * which scrubs `req` (the encoded frame holds the 33-byte session
+     * token) BEFORE free() — no token bytes left in freed heap. The
+     * pre-fix code only scrubbed after write_all, so the encode-fail
+     * and dial-fail early returns leaked the token frame. */
+    int fd = -1;
     size_t req_len = 0;
     stm_status s = stm_corvus_encode_unwrap(token, dataset, dataset_len,
                                                  key_id, wrapped, wrapped_len,
                                                  req, req_cap, &req_len);
-    if (s != STM_OK) {
-        free(req);
-        return s;
-    }
+    if (s != STM_OK) goto out;
 
-    int fd = dial_corvus(t_opts->socket_path, t_opts->connect_timeout_ms);
-    if (fd < 0) {
-        free(req);
-        return STM_EBACKEND;
+    /* R144 P2-1: a zero timeout is the natural mistake of a caller
+     * that zero-inits the opts struct. Substitute a production-safe
+     * default so a wedged corvus cannot hang the mount path — 0 now
+     * means "use the default", never "block forever". */
+    {
+        uint32_t ct = t_opts->connect_timeout_ms
+                          ? t_opts->connect_timeout_ms
+                          : STM_CORVUS_DEFAULT_TIMEOUT_MS;
+        uint32_t iot = t_opts->io_timeout_ms
+                          ? t_opts->io_timeout_ms
+                          : STM_CORVUS_DEFAULT_TIMEOUT_MS;
+        fd = dial_corvus(t_opts->socket_path, ct);
+        if (fd < 0) { s = STM_EBACKEND; goto out; }
+        set_io_timeout(fd, iot);
     }
-    set_io_timeout(fd, t_opts->io_timeout_ms);
 
     s = write_all(fd, req, req_len);
-    /* Token bytes lived in `req` (the encoded frame). The frame is
-     * about to be sent across a local socket; after write completes,
-     * zero our copy so the bytes don't linger in the daemon's heap
-     * after free(). R138 P1-1 doctrine carry — never leave token
-     * bytes in freed memory. */
-    {
-        /* explicit_bzero shim — types.h may not expose one. */
-        volatile uint8_t *p = req;
-        for (size_t i = 0; i < req_len; i++) p[i] = 0;
-    }
-    free(req);
-    if (s != STM_OK) {
-        close(fd);
-        return s;
-    }
+    if (s != STM_OK) goto out;
 
     /* Read the 3-byte response header. */
-    uint8_t hdr[3];
-    s = read_exact(fd, hdr, 3);
-    if (s != STM_OK) {
-        close(fd);
-        return s;
-    }
-    uint16_t payload_len = (uint16_t)((uint16_t)hdr[1] |
-                                          ((uint16_t)hdr[2] << 8));
+    {
+        uint8_t hdr[3];
+        s = read_exact(fd, hdr, 3);
+        if (s != STM_OK) goto out;
+        uint16_t payload_len = (uint16_t)((uint16_t)hdr[1] |
+                                              ((uint16_t)hdr[2] << 8));
 
-    /* Payload buffer: max is 32 (DEK). Larger payload_len means the
-     * peer is malformed — we still allocate so the decoder can apply
-     * the same status-payload discipline. Bound at the worst-case
-     * a corvus could ever return; reject obvious garbage upfront. */
-    if (payload_len > STM_CORVUS_DEK_LEN) {
-        close(fd);
-        return STM_EPROTOCOL;
-    }
-
-    uint8_t resp[3 + STM_CORVUS_DEK_LEN];
-    resp[0] = hdr[0];
-    resp[1] = hdr[1];
-    resp[2] = hdr[2];
-    if (payload_len > 0u) {
-        s = read_exact(fd, resp + 3, payload_len);
-        if (s != STM_OK) {
-            close(fd);
-            return s;
+        /* Payload max is 32 (the DEK). A larger payload_len is a
+         * malformed/hostile peer — reject upfront, before the read
+         * could overrun the fixed `resp` buffer. */
+        if (payload_len > STM_CORVUS_DEK_LEN) {
+            s = STM_EPROTOCOL;
+            goto out;
         }
-    }
-    close(fd);
 
-    return stm_corvus_decode_response(resp, 3u + (size_t)payload_len,
-                                          out_status, out_dek,
-                                          STM_CORVUS_DEK_LEN);
+        uint8_t resp[3 + STM_CORVUS_DEK_LEN];
+        resp[0] = hdr[0];
+        resp[1] = hdr[1];
+        resp[2] = hdr[2];
+        if (payload_len > 0u) {
+            s = read_exact(fd, resp + 3, payload_len);
+            if (s != STM_OK) goto out;
+        }
+
+        s = stm_corvus_decode_response(resp, 3u + (size_t)payload_len,
+                                            out_status, out_dek,
+                                            STM_CORVUS_DEK_LEN);
+    }
+
+out:
+    /* Scrub the request frame (token bytes) on EVERY exit — R138
+     * P1-1 + R144 P1-1 doctrine. Whole-buffer scrub (req_cap, not
+     * req_len) so a partial/failed encode leaves nothing either. */
+    {
+        volatile uint8_t *p = req;
+        for (size_t i = 0; i < req_cap; i++) p[i] = 0;
+    }
+    free(req);
+    if (fd >= 0) close(fd);
+    return s;
 }
 
 /* Backoff schedule per Q9 (STRATUM-API-V1.md §5.5): 100, 500, 2000 ms.
