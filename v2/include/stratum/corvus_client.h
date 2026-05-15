@@ -209,6 +209,148 @@ stm_status stm_corvus_decode_response(const uint8_t *buf, size_t len,
 stm_status stm_corvus_status_to_stm(stm_corvus_status s);
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* Transport + retry (TLY-A3-impl-2).                                      */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/*
+ * Transport-layer policy knobs (TLY-A3-impl-2; STRATUM-API-V1.md §5.3 +
+ * §5.5 Q9).
+ *
+ * v1.0 transport posture: synchronous AF_UNIX SOCK_STREAM dial +
+ * write(request) + read(3-byte header) + read(payload). The corvus
+ * spec text at §5.3 says "9P over the corvus Spoor"; the practical
+ * v1.0 reading (matching the TLY-A4 notify socket's raw-bytes shape)
+ * is raw Unix-socket. If real-corvus integration testing reveals a
+ * 9P wrapper, this transport layer is the single refactor surface
+ * (the codec module above is pure and unaffected).
+ *
+ * Retry policy is fixed at v1.0 per Q9: 3 retries with backoff
+ * 100ms / 500ms / 2000ms. Retry-eligible classes (see
+ * `stm_corvus_unwrap` doc):
+ *   - Transport: STM_EBACKEND (connect failure, read short/timeout,
+ *     write EPIPE).
+ *   - Corvus wire: RATE_LIMITED, INTERNAL_ERROR.
+ * Fatal classes (no retry; first observation is final):
+ *   - Corvus wire: BAD_AUTH, PERM_DENIED, NOT_FOUND, BAD_FORMAT.
+ *   - Wire-format violation in the response: STM_EPROTOCOL.
+ *   - Argument validation: STM_EINVAL.
+ *
+ * Connect-timeout discipline (R140 P2-3 doctrine carry): the dial
+ * uses O_NONBLOCK + poll(POLLOUT, connect_timeout_ms) so a wedged
+ * corvus can't hang the caller. Steady-state I/O is bounded via
+ * SO_RCVTIMEO / SO_SNDTIMEO at io_timeout_ms.
+ */
+typedef struct {
+    /* AF_UNIX path of the corvus UNWRAP socket. v1.0 default is
+     * "/srv/corvus/ops/unwrap". NULL/empty → STM_EINVAL. */
+    const char *socket_path;
+
+    /* Bounded connect timeout in milliseconds. 0 disables timeout
+     * (test-only posture — production callers SHOULD set ≥ 1000). */
+    uint32_t    connect_timeout_ms;
+
+    /* Bounded steady-state read/write timeout (SO_RCVTIMEO /
+     * SO_SNDTIMEO). 0 disables timeout (test-only). */
+    uint32_t    io_timeout_ms;
+
+    /* Number of retries on a retry-eligible class. The spec-fixed
+     * schedule [100, 500, 2000] ms is hardcoded; `n_retries` may be
+     * 0 (single attempt — no retry) up to 3 (full schedule). Values
+     * > 3 are clamped to 3. */
+    uint32_t    n_retries;
+} stm_corvus_transport_opts;
+
+/*
+ * Single-attempt transport. Dials the corvus socket, sends the
+ * encoded UNWRAP request, reads the response, decodes it.
+ *
+ * Inputs:
+ *   t_opts       — transport configuration (socket path + timeouts).
+ *                  n_retries is IGNORED here (single attempt).
+ *   token        — exactly STM_CORVUS_TOKEN_LEN (33) bytes.
+ *                  Sensitive: caller's responsibility to mlock +
+ *                  explicit_bzero around the call site.
+ *   dataset / dataset_len — caller-validated UTF-8 dataset path.
+ *   key_id       — corvus's key registry index.
+ *   wrapped / wrapped_len — opaque AEAD-wrapped DEK blob.
+ *   out_status   — populated with the parsed corvus wire status on
+ *                  STM_OK return (caller must inspect; STM_OK on
+ *                  this function means the FRAME was well-formed,
+ *                  NOT that the UNWRAP succeeded).
+ *   out_dek      — populated with the 32-byte unwrapped DEK iff
+ *                  *out_status == STM_CORVUS_STATUS_OK on STM_OK
+ *                  return. Caller MUST `explicit_bzero` on dispose.
+ *                  Caller's responsibility to mlock the buffer.
+ *
+ * Returns:
+ *   STM_OK         — frame round-tripped; inspect *out_status.
+ *   STM_EBACKEND   — transport failure (connect, write, read,
+ *                    timeout). Retry-eligible per opts->n_retries
+ *                    when called through stm_corvus_unwrap.
+ *   STM_EPROTOCOL  — corvus's response was malformed (truncated,
+ *                    oversize, unknown status code, status/payload
+ *                    discipline violation). Fatal.
+ *   STM_EINVAL     — argument validation failed (NULL ptrs, sizes
+ *                    out of range).
+ *   STM_ENOSPC     — out_dek buffer too small (unreachable when
+ *                    caller passes the canonical [STM_CORVUS_DEK_LEN]).
+ */
+STM_MUST_USE
+stm_status stm_corvus_unwrap_once(const stm_corvus_transport_opts *t_opts,
+                                       const uint8_t token[STM_CORVUS_TOKEN_LEN],
+                                       const char *dataset,
+                                       size_t dataset_len,
+                                       uint64_t key_id,
+                                       const uint8_t *wrapped,
+                                       size_t wrapped_len,
+                                       stm_corvus_status *out_status,
+                                       uint8_t out_dek[STM_CORVUS_DEK_LEN]);
+
+/*
+ * Composite transport with retry policy. Wraps stm_corvus_unwrap_once
+ * with the spec-fixed retry schedule [100, 500, 2000] ms.
+ *
+ * Retry-eligible outcomes (try again after backoff):
+ *   - stm_corvus_unwrap_once returns STM_EBACKEND (transport).
+ *   - stm_corvus_unwrap_once returns STM_OK with status in
+ *     { RATE_LIMITED, INTERNAL_ERROR }.
+ *
+ * Fatal outcomes (return immediately, no retry):
+ *   - stm_corvus_unwrap_once returns STM_OK with status in
+ *     { BAD_AUTH, PERM_DENIED, NOT_FOUND, BAD_FORMAT } — mapped to
+ *     STM_ECORVUSAUTH / STM_ECORVUSPERM / STM_ECORVUSNOTFOUND /
+ *     STM_ECORVUSBADFORMAT via stm_corvus_status_to_stm.
+ *   - stm_corvus_unwrap_once returns STM_EPROTOCOL or STM_EINVAL.
+ *
+ * On retries-exhausted (n_retries attempts all returned a
+ * retry-eligible failure), this function returns the LAST observed
+ * failure mapped to a typed stm_status:
+ *   - Transport-class: STM_EBACKEND.
+ *   - RATE_LIMITED: STM_ECORVUSRATELIMITED.
+ *   - INTERNAL_ERROR: STM_ECORVUSINTERNAL.
+ *
+ * Success: returns STM_OK; out_dek is populated with the 32-byte
+ * DEK. Caller MUST `explicit_bzero` + free out_dek when finished.
+ *
+ * NOTE: this function calls usleep() for the backoff intervals.
+ * Callers that need to cooperate with a stop flag (e.g., a daemon
+ * mid-startup that wants to bail on SIGTERM) SHOULD set a small
+ * io_timeout_ms + check the stop flag between calls to
+ * stm_corvus_unwrap_once. v1.0 does not thread a stop flag through
+ * the retry wrapper; the spec's worst-case latency is ~2.6s which
+ * is acceptable for v1.0 mount-time blocking.
+ */
+STM_MUST_USE
+stm_status stm_corvus_unwrap(const stm_corvus_transport_opts *t_opts,
+                                  const uint8_t token[STM_CORVUS_TOKEN_LEN],
+                                  const char *dataset,
+                                  size_t dataset_len,
+                                  uint64_t key_id,
+                                  const uint8_t *wrapped,
+                                  size_t wrapped_len,
+                                  uint8_t out_dek[STM_CORVUS_DEK_LEN]);
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Session token loader.                                                   */
 /* ────────────────────────────────────────────────────────────────────── */
 

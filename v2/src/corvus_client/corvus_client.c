@@ -14,13 +14,18 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
+#include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -259,4 +264,324 @@ stm_status stm_corvus_load_token(const char *path,
     if (n_extra > 0) return STM_ERANGE;
 
     return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Transport — TLY-A3-impl-2.                                              */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Dial corvus's UNWRAP socket with a bounded connect timeout. Mirrors
+ * proxy_9p.c::dial_coord's R140 P2-3 posture: O_NONBLOCK + poll(POLLOUT)
+ * + SO_ERROR check, then restore blocking for steady-state I/O. */
+static int dial_corvus(const char *path, uint32_t timeout_ms)
+{
+    if (!path || !*path) return -EINVAL;
+    if (strlen(path) >= sizeof((struct sockaddr_un *)0)->sun_path)
+        return -ENAMETOOLONG;
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -errno;
+
+    if (timeout_ms > 0u) {
+        int fl = fcntl(fd, F_GETFL);
+        if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {
+            int e = errno;
+            close(fd);
+            return -e;
+        }
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
+
+    int rc = connect(fd, (struct sockaddr *)&addr, sizeof addr);
+    if (rc < 0 && errno != EINPROGRESS) {
+        int e = errno;
+        close(fd);
+        return -e;
+    }
+    if (rc < 0 /* EINPROGRESS */ && timeout_ms > 0u) {
+        struct pollfd pfd = { fd, POLLOUT, 0 };
+        int prc = poll(&pfd, 1, (int)timeout_ms);
+        if (prc < 0) {
+            int e = errno;
+            close(fd);
+            return -e;
+        }
+        if (prc == 0) {
+            close(fd);
+            return -ETIMEDOUT;
+        }
+        int sockerr = 0;
+        socklen_t solen = sizeof sockerr;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockerr, &solen) < 0) {
+            int e = errno;
+            close(fd);
+            return -e;
+        }
+        if (sockerr != 0) {
+            close(fd);
+            return -sockerr;
+        }
+    }
+
+    if (timeout_ms > 0u) {
+        int fl = fcntl(fd, F_GETFL);
+        if (fl >= 0) (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+
+    int flags = fcntl(fd, F_GETFD);
+    if (flags >= 0) (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+
+    return fd;
+}
+
+/* Apply SO_RCVTIMEO + SO_SNDTIMEO to bound steady-state read/write
+ * after the connect handshake. Best-effort: ENOPROTOOPT or similar
+ * is non-fatal (some kernels / socket types may not support it). */
+static void set_io_timeout(int fd, uint32_t timeout_ms)
+{
+    if (timeout_ms == 0u) return;
+    struct timeval tv;
+    tv.tv_sec  = (time_t)(timeout_ms / 1000u);
+    tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+
+/* Write exactly `len` bytes. EINTR loops; EAGAIN/EWOULDBLOCK (steady-
+ * state timeout firing) AND EPIPE/ECONNRESET classify as STM_EBACKEND. */
+static stm_status write_all(int fd, const uint8_t *buf, size_t len)
+{
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = write(fd, buf + done, len - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return STM_EBACKEND;
+        }
+        if (n == 0) return STM_EBACKEND;
+        done += (size_t)n;
+    }
+    return STM_OK;
+}
+
+/* Read exactly `len` bytes. EOF before `len` and timeout both classify
+ * as STM_EBACKEND (retry-eligible). */
+static stm_status read_exact(int fd, uint8_t *buf, size_t len)
+{
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = read(fd, buf + done, len - done);
+        if (n == 0) return STM_EBACKEND; /* EOF mid-frame */
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return STM_EBACKEND;
+        }
+        done += (size_t)n;
+    }
+    return STM_OK;
+}
+
+stm_status stm_corvus_unwrap_once(const stm_corvus_transport_opts *t_opts,
+                                       const uint8_t token[STM_CORVUS_TOKEN_LEN],
+                                       const char *dataset,
+                                       size_t dataset_len,
+                                       uint64_t key_id,
+                                       const uint8_t *wrapped,
+                                       size_t wrapped_len,
+                                       stm_corvus_status *out_status,
+                                       uint8_t out_dek[STM_CORVUS_DEK_LEN])
+{
+    if (!t_opts || !t_opts->socket_path || !*t_opts->socket_path
+        || !token || !out_status || !out_dek) return STM_EINVAL;
+
+    /* Sentinel for failure paths. */
+    const stm_corvus_status SENTINEL =
+        (stm_corvus_status)(STM_CORVUS_STATUS_INTERNAL_ERROR + 1);
+    *out_status = SENTINEL;
+
+    /* Build the request frame on stack — worst case ~66 KiB (max
+     * wrapped_len + 255 dataset). Use a heap alloc to avoid stack
+     * pressure. */
+    size_t req_cap = stm_corvus_encode_unwrap_size(dataset_len, wrapped_len);
+    if (req_cap == 0) return STM_EINVAL;
+    uint8_t *req = malloc(req_cap);
+    if (!req) return STM_ENOMEM;
+
+    size_t req_len = 0;
+    stm_status s = stm_corvus_encode_unwrap(token, dataset, dataset_len,
+                                                 key_id, wrapped, wrapped_len,
+                                                 req, req_cap, &req_len);
+    if (s != STM_OK) {
+        free(req);
+        return s;
+    }
+
+    int fd = dial_corvus(t_opts->socket_path, t_opts->connect_timeout_ms);
+    if (fd < 0) {
+        free(req);
+        return STM_EBACKEND;
+    }
+    set_io_timeout(fd, t_opts->io_timeout_ms);
+
+    s = write_all(fd, req, req_len);
+    /* Token bytes lived in `req` (the encoded frame). The frame is
+     * about to be sent across a local socket; after write completes,
+     * zero our copy so the bytes don't linger in the daemon's heap
+     * after free(). R138 P1-1 doctrine carry — never leave token
+     * bytes in freed memory. */
+    {
+        /* explicit_bzero shim — types.h may not expose one. */
+        volatile uint8_t *p = req;
+        for (size_t i = 0; i < req_len; i++) p[i] = 0;
+    }
+    free(req);
+    if (s != STM_OK) {
+        close(fd);
+        return s;
+    }
+
+    /* Read the 3-byte response header. */
+    uint8_t hdr[3];
+    s = read_exact(fd, hdr, 3);
+    if (s != STM_OK) {
+        close(fd);
+        return s;
+    }
+    uint16_t payload_len = (uint16_t)((uint16_t)hdr[1] |
+                                          ((uint16_t)hdr[2] << 8));
+
+    /* Payload buffer: max is 32 (DEK). Larger payload_len means the
+     * peer is malformed — we still allocate so the decoder can apply
+     * the same status-payload discipline. Bound at the worst-case
+     * a corvus could ever return; reject obvious garbage upfront. */
+    if (payload_len > STM_CORVUS_DEK_LEN) {
+        close(fd);
+        return STM_EPROTOCOL;
+    }
+
+    uint8_t resp[3 + STM_CORVUS_DEK_LEN];
+    resp[0] = hdr[0];
+    resp[1] = hdr[1];
+    resp[2] = hdr[2];
+    if (payload_len > 0u) {
+        s = read_exact(fd, resp + 3, payload_len);
+        if (s != STM_OK) {
+            close(fd);
+            return s;
+        }
+    }
+    close(fd);
+
+    return stm_corvus_decode_response(resp, 3u + (size_t)payload_len,
+                                          out_status, out_dek,
+                                          STM_CORVUS_DEK_LEN);
+}
+
+/* Backoff schedule per Q9 (STRATUM-API-V1.md §5.5): 100, 500, 2000 ms.
+ * Applied between successive attempts. Length matches the v1.0 cap on
+ * n_retries (3). */
+static const uint32_t BACKOFF_MS[3] = { 100u, 500u, 2000u };
+
+static bool is_retry_eligible_transport(stm_status s)
+{
+    return s == STM_EBACKEND;
+}
+
+static bool is_retry_eligible_status(stm_corvus_status s)
+{
+    return s == STM_CORVUS_STATUS_RATE_LIMITED
+        || s == STM_CORVUS_STATUS_INTERNAL_ERROR;
+}
+
+/* Sleep `ms` milliseconds via nanosleep, EINTR-safe. */
+static void sleep_ms(uint32_t ms)
+{
+    if (ms == 0u) return;
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)((ms % 1000u) * 1000000u);
+    while (nanosleep(&ts, &ts) != 0) {
+        if (errno != EINTR) break;
+    }
+}
+
+stm_status stm_corvus_unwrap(const stm_corvus_transport_opts *t_opts,
+                                  const uint8_t token[STM_CORVUS_TOKEN_LEN],
+                                  const char *dataset,
+                                  size_t dataset_len,
+                                  uint64_t key_id,
+                                  const uint8_t *wrapped,
+                                  size_t wrapped_len,
+                                  uint8_t out_dek[STM_CORVUS_DEK_LEN])
+{
+    if (!t_opts || !token || !out_dek) return STM_EINVAL;
+
+    /* Clamp n_retries to the schedule length. */
+    uint32_t max_retries = t_opts->n_retries;
+    if (max_retries > 3u) max_retries = 3u;
+    uint32_t max_attempts = max_retries + 1u; /* attempts = retries + 1 */
+
+    stm_corvus_status last_status = STM_CORVUS_STATUS_OK;
+    stm_status        last_transport_rc = STM_OK;
+    bool              last_was_transport = false;
+
+    for (uint32_t attempt = 0; attempt < max_attempts; attempt++) {
+        if (attempt > 0u) {
+            /* Backoff before retry — schedule indexed by retry-#
+             * (so the FIRST retry waits 100ms, the second 500ms,
+             * the third 2000ms). */
+            uint32_t idx = attempt - 1u;
+            if (idx >= 3u) idx = 2u;
+            sleep_ms(BACKOFF_MS[idx]);
+        }
+
+        stm_corvus_status status = STM_CORVUS_STATUS_OK;
+        stm_status rc = stm_corvus_unwrap_once(t_opts, token, dataset,
+                                                   dataset_len, key_id,
+                                                   wrapped, wrapped_len,
+                                                   &status, out_dek);
+
+        if (rc == STM_OK) {
+            if (status == STM_CORVUS_STATUS_OK) return STM_OK;
+            if (is_retry_eligible_status(status)) {
+                last_status        = status;
+                last_was_transport = false;
+                continue;
+            }
+            /* Fatal corvus status — map and return immediately. */
+            /* Defensive zeroing of out_dek: stm_corvus_unwrap_once
+             * shouldn't have populated it on non-OK status, but
+             * make sure no stale bytes from a prior attempt
+             * linger. */
+            for (size_t i = 0; i < STM_CORVUS_DEK_LEN; i++) {
+                ((volatile uint8_t *)out_dek)[i] = 0;
+            }
+            return stm_corvus_status_to_stm(status);
+        }
+
+        /* Non-OK transport-side rc. */
+        if (is_retry_eligible_transport(rc)) {
+            last_transport_rc  = rc;
+            last_was_transport = true;
+            continue;
+        }
+        /* Fatal transport-side rc (STM_EPROTOCOL, STM_EINVAL, ...).
+         * Same defensive zeroing. */
+        for (size_t i = 0; i < STM_CORVUS_DEK_LEN; i++) {
+            ((volatile uint8_t *)out_dek)[i] = 0;
+        }
+        return rc;
+    }
+
+    /* Retries exhausted. Surface the LAST observed failure as a typed
+     * stm_status. Defensive zero of out_dek to be safe. */
+    for (size_t i = 0; i < STM_CORVUS_DEK_LEN; i++) {
+        ((volatile uint8_t *)out_dek)[i] = 0;
+    }
+    if (last_was_transport) return last_transport_rc;
+    return stm_corvus_status_to_stm(last_status);
 }
