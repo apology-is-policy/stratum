@@ -155,6 +155,41 @@ STM_TEST(proxy_9p_parse_tattach_refuses_non_tattach_type)
                                                      &off, &alen));
 }
 
+STM_TEST(proxy_9p_parse_tattach_refuses_non_nul_control_bytes)
+{
+    /* R140 P2-5 regression: aname containing a non-NUL control
+     * byte must be refused at the wrapper. Pre-R140 the wrapper
+     * refused only NUL; control bytes flowed to the matcher,
+     * which doesn't refuse name-side bytes. */
+    uint8_t aname[14] = {
+        'u', 's', 'e', 'r', 's', '/', 'm', 'i', 'c', 'h', 0x01, 'a', 'e', 'l'
+    };
+    uint8_t frame[64];
+    size_t n = build_tattach(frame, sizeof frame, aname, sizeof aname);
+    STM_ASSERT(n > 0);
+
+    size_t off = 0; uint16_t alen = 0;
+    STM_ASSERT(!stm_proxy_9p_parse_tattach_aname(frame, (uint32_t)n,
+                                                     &off, &alen));
+
+    /* 0x7F (DEL) — same class. */
+    uint8_t aname2[13] = {
+        'u', 's', 'e', 'r', 's', '/', 'd', 'e', 'l', 0x7F, 'e', 't', 'e'
+    };
+    n = build_tattach(frame, sizeof frame, aname2, sizeof aname2);
+    STM_ASSERT(n > 0);
+    STM_ASSERT(!stm_proxy_9p_parse_tattach_aname(frame, (uint32_t)n,
+                                                     &off, &alen));
+
+    /* High-bit byte (UTF-8 multi-byte continuation) — passes
+     * through (no refusal). */
+    uint8_t aname3[4] = { 'u', 'i', 0xC3, 0xA9 }; /* "ué" */
+    n = build_tattach(frame, sizeof frame, aname3, 4);
+    STM_ASSERT(n > 0);
+    STM_ASSERT(stm_proxy_9p_parse_tattach_aname(frame, (uint32_t)n,
+                                                    &off, &alen));
+}
+
 STM_TEST(proxy_9p_parse_tattach_refuses_null_args)
 {
     size_t off = 0; uint16_t alen = 0;

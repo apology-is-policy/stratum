@@ -138,6 +138,10 @@ static void usage(const char *argv0)
             "                           `*` matches one component, `**` matches\n"
             "                           zero-or-more components. Aname must be\n"
             "                           ≤ 256 bytes; control bytes refused.\n"
+        "  --allow-empty-datasets-allowed\n"
+            "                           Opt in to running --role client with no\n"
+            "                           --datasets-allowed (open relay; tests +\n"
+            "                           non-Thylacine deployments only).\n"
         "  --user-policy uid=N:pat1,pat2,...\n"
             "                           Coordinator-side per-uid Tattach pattern\n"
             "                           policy (TLY-A2-impl-1, repeatable). When\n"
@@ -217,6 +221,14 @@ int stm_cmd_stratumd_main(int argc, char **argv)
     const char *datasets_allowed[STM_PROXY_9P_PATTERN_MAX];
     size_t n_datasets_allowed = 0;
 
+    /* R140 P2-4 close: `--role client` with NO `--datasets-allowed`
+     * flags is a silent open-relay (every Tattach forwarded
+     * un-gated to coord). Refuse-by-default in client mode unless
+     * the operator opts in explicitly via this flag. The opt-in
+     * exists for tests + non-Thylacine deployments where the
+     * proxy is intentionally a transparent forwarder. */
+    bool allow_empty_datasets = false;
+
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
@@ -267,6 +279,10 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         }
         if (!strcmp(a, "--coordinator-socket") && i + 1 < argc) {
             opts.coordinator_socket_path = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--allow-empty-datasets-allowed")) {
+            allow_empty_datasets = true;
             continue;
         }
         if (!strcmp(a, "--datasets-allowed") && i + 1 < argc) {
@@ -452,6 +468,21 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         fprintf(stderr,
             "stratumd: --role client does not take a positional "
             "fs-path argument (got: %s)\n", opts.fs_path);
+        stm_ds_policy_table_close(&user_policy_table);
+        return 1;
+    }
+    /* R140 P2-4 close: refuse client mode with empty allowlist
+     * unless explicitly opted in. The opt-in keeps the test +
+     * non-Thylacine paths working. */
+    if (opts.client_mode && n_datasets_allowed == 0u
+                          && !allow_empty_datasets) {
+        fprintf(stderr,
+            "stratumd: --role client with NO --datasets-allowed "
+            "forwards every Tattach to the coordinator without "
+            "policy enforcement — refusing.\n"
+            "  Pass one or more --datasets-allowed <pattern>, OR "
+            "pass --allow-empty-datasets-allowed to opt in to the "
+            "non-Thylacine open-relay posture.\n");
         stm_ds_policy_table_close(&user_policy_table);
         return 1;
     }

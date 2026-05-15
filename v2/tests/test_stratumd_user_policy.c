@@ -353,6 +353,34 @@ STM_TEST(stratumd_user_policy_admits_matching_aname)
     udp_fixture_teardown(&f);
 }
 
+STM_TEST(stratumd_user_policy_refuses_non_nul_control_byte_aname)
+{
+    /* R140 P2-5: the wrapper now refuses bytes < 0x20 || == 0x7F
+     * in aname (extended from R139's NUL-only refusal). With a
+     * catch-all `**` policy, a pre-R140 wrapper would forward to
+     * the matcher, which would admit (matcher only refuses NUL
+     * via strnlen). Post-R140: wrapper refuses with EACCES. */
+    udp_fixture f;
+    udp_fixture_init(&f, "ctlbyte", "uid=0:**");
+    int fd = dial_and_version(STM_9P_MSIZE_DEFAULT);
+    STM_ASSERT(fd >= 0);
+
+    uint8_t aname[14] = {
+        'u', 's', 'e', 'r', 's', '/', 'm', 'i', 'c', 'h', 0x01, 'a', 'e', 'l'
+    };
+    uint8_t frame[64];
+    size_t n = build_tattach(frame, sizeof frame, aname, sizeof aname);
+    STM_ASSERT(n > 0);
+
+    uint8_t type; uint32_t ecode;
+    STM_ASSERT_EQ(send_tattach_raw(fd, frame, n, &type, &ecode), 0);
+    STM_ASSERT_EQ(type, STM_9P_RLERROR);
+    STM_ASSERT_EQ((long long)ecode, 13LL); /* EACCES */
+
+    close(fd);
+    udp_fixture_teardown(&f);
+}
+
 STM_TEST(stratumd_user_policy_refuses_mismatched_aname)
 {
     udp_fixture f;

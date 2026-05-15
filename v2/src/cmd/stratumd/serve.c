@@ -191,9 +191,19 @@ static bool stratumd_check_tattach(const uint8_t *req, uint32_t req_len,
      * (wrapper-strict + canonical-permissive) confusion class is
      * the same shape as P0-1; this refusal makes the policy
      * decision operate on the SAME bytes the canonical handler
-     * would see. */
+     * would see.
+     *
+     * R140 P2-5 close: extended to refuse ALL control bytes
+     * (< 0x20 + == 0x7F + == 0). The matcher delegates name-side
+     * validation to the caller (dataset_pattern.h docstring); the
+     * wrapper IS that caller for wire-derived input. Without this,
+     * admitted dataset names containing control bytes flow into
+     * /ctl/events line-oriented logs as a line-injection vector
+     * (R99 P2-1 doctrine carry). UTF-8 multi-byte (≥ 0x80) passes
+     * through unchanged. */
     for (uint16_t i = 0; i < alen; i++) {
-        if (aname_bytes[i] == 0u) goto refuse;
+        uint8_t b = aname_bytes[i];
+        if (b == 0u || b < 0x20u || b == 0x7Fu) goto refuse;
     }
 
     /* Copy aname into a NUL-terminated stack buffer for the matcher

@@ -98,7 +98,11 @@ extern "C" {
  *   proxy's per-conn buffers. Both upstream and downstream framing
  *   bounds use this.
  * `idle_timeout_ms` — applied to BOTH upstream and downstream fds
- *   via SO_RCVTIMEO/SO_SNDTIMEO (R95 P2-1 carry).
+ *   via SO_RCVTIMEO/SO_SNDTIMEO (R95 P2-1 carry). ALSO bounds the
+ *   initial coord-side connect() via nonblock+poll (R140 P2-3
+ *   close — pre-R140 dial was blocking with no timeout, hanging
+ *   the worker if coord's accept loop was wedged). `0` = no bound
+ *   (test posture).
  *
  * Returns STM_OK on clean disconnect (EOF on either side), non-OK
  * on framing / io / dial error. Always closes both fds before

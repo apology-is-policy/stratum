@@ -252,9 +252,42 @@ glue, not a state machine. The spec composition is by reference:
   `v2/specs/namespace.tla` + `v2/specs/locks.tla` per connection.
 - The /ctl/ server it hosts composes against
   `v2/specs/ctl_conn.tla` per connection.
+- The client-mode proxy (TLY-A2-impl-2) composes against
+  `v2/specs/multi_stratumd.tla::{ClientAdmitsDataset,
+  CrossClientIsolation}`. The proxy is a transparent forwarder;
+  the spec abstracts it as a per-client admit predicate.
+- The corvus notify consumer (TLY-A4) composes against
+  `v2/specs/eviction.tla` (4 invariants on data-sealed-on-exit
+  + stop-before-unmount + in-flight-drain + consumer-escalates).
 - Workers run concurrently within and across sockets; the spec
   invariants hold by the per-conn state-isolation discipline +
   the worker_count refcount lifecycle.
+
+## Client mode (TLY-A2-impl-2)
+
+When `opts->client_mode == true`, `stm_stratumd_run` dispatches to
+the internal `stratumd_run_client` helper. The per-user stratumd
+mounts no fs, exposes no /ctl/, and refuses-loud on any of:
+`fs_path`, `keyfile_path`, `janus_socket`, `ctl_socket_path`,
+`user_policy`, `bind_pool_serial` (each gets its own stderr line
+naming the specific incompatibility).
+
+Required fields:
+- `coordinator_socket_path` — coord's FS socket; dialed afresh per
+  accepted upstream conn (per-conn fid namespace contract).
+- `socket_path` — the per-user stratumd's listen socket.
+
+Optional fields:
+- `datasets_allowed` / `n_datasets_allowed` — borrowed array of
+  pattern strings (`*` one-level + `**` recursive glob; see
+  `dataset_pattern.h`). NULL/0 = no Tattach gate (test posture);
+  production MUST populate.
+
+The proxy worker (`stm_proxy_9p_serve_client` in `proxy_9p.c`)
+intercepts Tattach for `aname` validation and forwards every
+other frame byte-for-byte (identity fid map). Tattach refusal
+emits Rlerror(EACCES) directly to upstream without ever touching
+coord — refuse-don't-defer doctrine (R139 carry).
 
 ## Tests
 
@@ -286,6 +319,11 @@ glue, not a state machine. The spec composition is by reference:
 | Signal-mask discipline on workers (R113 P1-1) | LIVE | SIGINT/TERM/HUP/QUIT blocked |
 | Pluggable auth backends (factotum / SASL / token) | DEFERRED | ARCH §10.10.3 forward-noted |
 | Lifecycle ordering (servers → ctl_destroy → scrub_close → fs_unmount) | LIVE | R26 P3-4 + ctl.h contract |
+| TLY-A1: `--bind-pool-serial` + `STM_ESERIAL` | LIVE | Thylacine pool binding (`f89e5a9` + R137 close) |
+| TLY-A4: corvus SESSION_CLOSED consumer + `STM_ECORVUSGONE` | LIVE | `corvus_notify.{h,c}` + `eviction.tla` (`f37c518` + R138 close) |
+| TLY-A2-impl-1: coord mode `--user-policy` Tattach gate | LIVE | `stratumd_check_tattach` refuse-don't-defer (`ad55173` + R139 close) |
+| TLY-A2-impl-2: client mode raw 9P proxy + `--datasets-allowed` | LIVE | `proxy_9p.{h,c}` (`9d954ce` + R140 audit) |
+| TLY-A2-impl-3: bilateral SO_PEERCRED downstream-side | PENDING | Per-user stratumd's uid validated against coord's `--user-policy` |
 
 Audit class: changes to wire framing, peer-cred resolution, socket
 binding, the lifecycle ordering, or signal-mask discipline MUST be

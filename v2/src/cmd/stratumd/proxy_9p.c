@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -122,10 +123,21 @@ bool stm_proxy_9p_parse_tattach_aname(const uint8_t *req, uint32_t req_len,
 
     /* R139 P2-3 + R139 P0-2 carry: oversize + embedded NUL refused
      * BEFORE matcher dispatch (this parser is the right gate per
-     * the wrapper-canonical-seam doctrine). */
+     * the wrapper-canonical-seam doctrine).
+     *
+     * R140 P2-5 close: extended to refuse ALL control bytes
+     * (< 0x20 + == 0x7F + == 0). The matcher delegates name-side
+     * validation to the caller (dataset_pattern.h docstring); the
+     * wrapper IS that caller for wire-derived input. Without this,
+     * admitted dataset names containing control bytes flow into
+     * /ctl/events line-oriented logs as a line-injection vector
+     * (R99 P2-1 doctrine carry — the proxy is a new surface
+     * R99 didn't cover). UTF-8 multi-byte (≥ 0x80) passes
+     * through unchanged. */
     if (alen > STM_DS_PATTERN_NAME_MAX) return false;
     for (uint16_t i = 0; i < alen; i++) {
-        if (p[i] == 0u) return false;
+        uint8_t b = p[i];
+        if (b == 0u || b < 0x20u || b == 0x7Fu) return false;
     }
 
     *out_aname_off = (size_t)(p - req);
@@ -137,7 +149,16 @@ bool stm_proxy_9p_parse_tattach_aname(const uint8_t *req, uint32_t req_len,
 /* Coordinator dial.                                                      */
 /* ────────────────────────────────────────────────────────────────────── */
 
-static int dial_coord(const char *path)
+/* Dial the coordinator socket with a bounded connect timeout.
+ *
+ * R140 P2-3 close: pre-R140 used blocking `connect()` with no
+ * timeout — a wedged coord (long mutex hold under FS-side bug)
+ * hung the proxy worker indefinitely. The post-connect
+ * SO_RCVTIMEO/SNDTIMEO only bound steady-state reads/writes,
+ * NOT the initial dial. Fix: nonblock + poll bounded by
+ * `timeout_ms` (caller passes idle_timeout_ms; 0 = no bound,
+ * preserving the test posture). */
+static int dial_coord(const char *path, uint32_t timeout_ms)
 {
     if (!path || !*path) return -EINVAL;
     if (strlen(path) >= sizeof((struct sockaddr_un *)0)->sun_path)
@@ -146,15 +167,58 @@ static int dial_coord(const char *path)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -errno;
 
+    /* Set O_NONBLOCK on the socket. connect() will return
+     * -EINPROGRESS; we poll(POLLOUT) bounded by timeout_ms,
+     * then check SO_ERROR. */
+    if (timeout_ms > 0u) {
+        int fl = fcntl(fd, F_GETFL);
+        if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {
+            int e = errno;
+            close(fd);
+            return -e;
+        }
+    }
+
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof addr);
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+    int rc = connect(fd, (struct sockaddr *)&addr, sizeof addr);
+    if (rc < 0 && errno != EINPROGRESS) {
         int e = errno;
         close(fd);
         return -e;
+    }
+    if (rc < 0 /* EINPROGRESS */ && timeout_ms > 0u) {
+        struct pollfd pfd = { fd, POLLOUT, 0 };
+        int prc = poll(&pfd, 1, (int)timeout_ms);
+        if (prc < 0) {
+            int e = errno;
+            close(fd);
+            return -e;
+        }
+        if (prc == 0) {
+            close(fd);
+            return -ETIMEDOUT;
+        }
+        int sockerr = 0;
+        socklen_t solen = sizeof sockerr;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockerr, &solen) < 0) {
+            int e = errno;
+            close(fd);
+            return -e;
+        }
+        if (sockerr != 0) {
+            close(fd);
+            return -sockerr;
+        }
+    }
+
+    /* Restore blocking mode for the steady-state serve loop. */
+    if (timeout_ms > 0u) {
+        int fl = fcntl(fd, F_GETFL);
+        if (fl >= 0) (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
     }
 
     int flags = fcntl(fd, F_GETFD);
@@ -222,7 +286,7 @@ stm_status stm_proxy_9p_serve_client(int upstream_fd,
         (void)setsockopt(upstream_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     }
 
-    int coord_fd = dial_coord(coord_socket_path);
+    int coord_fd = dial_coord(coord_socket_path, idle_timeout_ms);
     if (coord_fd < 0) {
         fprintf(stderr,
             "stratumd: proxy: coord dial failed (path=%s errno=%d)\n",
