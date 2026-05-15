@@ -293,13 +293,25 @@ int stm_cmd_stratumd_main(int argc, char **argv)
             continue;
         }
         if (!strcmp(a, "--coordinator-uid") && i + 1 < argc) {
+            const char *arg = argv[++i];
+            /* R141 P2-1: refuse empty / no-digit-consumed inputs.
+             * strtoull("") returns 0 with end == arg; the bound
+             * check below would pass and silently enable the
+             * check expecting uid 0. */
+            if (*arg == '\0' || *arg == '-' || *arg == '+'
+                || (*arg < '0' || *arg > '9')) {
+                fprintf(stderr,
+                    "stratumd: invalid --coordinator-uid: %s "
+                    "(expected non-empty unsigned integer)\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
             char *end = NULL;
-            unsigned long long v = strtoull(argv[++i], &end, 10);
-            if (!end || *end != '\0'
+            unsigned long long v = strtoull(arg, &end, 10);
+            if (!end || *end != '\0' || end == arg
                 || v > (unsigned long long)((uid_t)-2)) {
                 fprintf(stderr,
-                    "stratumd: invalid --coordinator-uid: %s\n",
-                    argv[i]);
+                    "stratumd: invalid --coordinator-uid: %s\n", arg);
                 stm_ds_policy_table_close(&user_policy_table);
                 return 1;
             }
@@ -490,6 +502,16 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         fprintf(stderr,
             "stratumd: --role client does not take a positional "
             "fs-path argument (got: %s)\n", opts.fs_path);
+        stm_ds_policy_table_close(&user_policy_table);
+        return 1;
+    }
+    /* R141 P2-2: --coordinator-uid is a client-mode flag; refuse
+     * loudly if set without --role client (silent no-op
+     * otherwise). */
+    if (!opts.client_mode && opts.coordinator_uid_check_enabled) {
+        fprintf(stderr,
+            "stratumd: --coordinator-uid requires --role client "
+            "(coord mode does not dial; the flag has no effect)\n");
         stm_ds_policy_table_close(&user_policy_table);
         return 1;
     }

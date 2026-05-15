@@ -15,6 +15,7 @@
 
 #include "corvus_notify.h"
 #include "dataset_pattern.h"
+#include "peer_creds.h"
 #include "proxy_9p.h"
 
 #include <stratum/9p.h>
@@ -329,31 +330,10 @@ int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode)
 /* Peer credential resolution.                                            */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* Read the connecting peer's uid/gid via the platform's native
- * credentials API. Returns 0 on success, -errno on failure (caller
- * should fall back to the daemon's own uid/gid in that case). */
-static int peer_creds(int fd, uid_t *out_uid, gid_t *out_gid)
-{
-#if defined(__linux__)
-    struct ucred uc;
-    socklen_t    len = sizeof uc;
-    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &uc, &len) < 0)
-        return -errno;
-    *out_uid = uc.uid;
-    *out_gid = uc.gid;
-    return 0;
-#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) \
-   || defined(__NetBSD__) || defined(__DragonFly__)
-    if (getpeereid(fd, out_uid, out_gid) < 0)
-        return -errno;
-    return 0;
-#else
-    (void)fd;
-    *out_uid = (uid_t)-1;
-    *out_gid = (gid_t)-1;
-    return -ENOSYS;
-#endif
-}
+/* Peer-cred resolution moved to peer_creds.{h,c} at R141 P2-4
+ * close. Three call sites previously had identical local copies
+ * (FS accept, /ctl/ accept, proxy downstream). */
+#define peer_creds stm_peer_creds
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* serve_client.                                                          */
@@ -575,12 +555,28 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
         gid_t peer_gid = (gid_t)-1;
         int   pc_rc    = peer_creds(client_fd, &peer_uid, &peer_gid);
         if (pc_rc != 0) {
-            if (!allow_unauthenticated_peer) {
+            /* R141 P1-1: when user_policy is set, the unauth
+             * fallback is INCOHERENT with bilateral auth — the
+             * fallback uid is the daemon's own uid (getuid()),
+             * which in a Thylacine deployment IS the uid most
+             * likely to have a --user-policy entry. Admitting an
+             * unauth peer with the daemon-uid's pattern set is
+             * exactly the confused-deputy class the bilateral
+             * auth layer is meant to close. Fail-closed
+             * unconditionally when user_policy is non-empty,
+             * regardless of allow_unauthenticated_peer. */
+            bool policy_active = user_policy
+                && ((const stm_ds_policy_table *)user_policy)
+                       ->n_entries > 0u;
+            if (!allow_unauthenticated_peer || policy_active) {
                 fprintf(stderr,
                     "stratumd: refusing connection: "
-                    "peer credentials unavailable (errno=%d); "
-                    "set allow_unauthenticated_peer to opt in\n",
-                    -pc_rc);
+                    "peer credentials unavailable (errno=%d)%s\n",
+                    -pc_rc,
+                    policy_active
+                        ? " (--user-policy set; allow_unauthenticated_peer "
+                          "ignored — incoherent with bilateral auth)"
+                        : "; set allow_unauthenticated_peer to opt in");
                 close(client_fd);
                 continue;
             }

@@ -11,6 +11,7 @@
 #include "proxy_9p.h"
 
 #include "dataset_pattern.h"
+#include "peer_creds.h"
 
 #include <stratum/9p.h>
 #include <stratum/types.h>
@@ -29,9 +30,6 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#if defined(__linux__)
-#  include <sys/socket.h>     /* SO_PEERCRED */
-#endif
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* read/write helpers — duplicated from serve.c to keep the lib trim.     */
@@ -84,31 +82,9 @@ static uint32_t decode_le32(const uint8_t *p)
          | ((uint32_t)p[3] << 24);
 }
 
-/* Resolve peer credentials on a connected Unix-domain socket.
- * Duplicated from serve.c (R140 P3-1 carry — extract on third
- * user). 0 on success, -errno on failure. */
-static int peer_creds(int fd, uid_t *out_uid, gid_t *out_gid)
-{
-#if defined(__linux__)
-    struct ucred uc;
-    socklen_t    len = sizeof uc;
-    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &uc, &len) < 0)
-        return -errno;
-    *out_uid = uc.uid;
-    *out_gid = uc.gid;
-    return 0;
-#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) \
-   || defined(__NetBSD__) || defined(__DragonFly__)
-    if (getpeereid(fd, out_uid, out_gid) < 0)
-        return -errno;
-    return 0;
-#else
-    (void)fd;
-    *out_uid = (uid_t)-1;
-    *out_gid = (gid_t)-1;
-    return -ENOSYS;
-#endif
-}
+/* peer-cred resolution lives in peer_creds.{h,c} (R141 P2-4
+ * close — three call sites previously had identical local
+ * copies). */
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Tattach aname parser (mirrors serve.c::stratumd_check_tattach).        */
@@ -340,13 +316,26 @@ stm_status stm_proxy_9p_serve_client(int upstream_fd,
     if (coord_uid_check_enabled) {
         uid_t got_uid = (uid_t)-1;
         gid_t got_gid = (gid_t)-1;
-        int rc = peer_creds(coord_fd, &got_uid, &got_gid);
+        int rc = stm_peer_creds(coord_fd, &got_uid, &got_gid);
         if (rc != 0) {
             fprintf(stderr,
                 "stratumd: proxy: refusing coord conn — peer "
                 "credentials unavailable (errno=%d; "
                 "--coordinator-uid set but cannot verify)\n",
                 -rc);
+            close(coord_fd);
+            close(upstream_fd);
+            return STM_EBACKEND;
+        }
+        /* R141 P3-1 defense-in-depth: refuse if peer_creds
+         * returned 0 (success) but the resolved uid is the (uid_t)-1
+         * sentinel. Cannot happen on Linux/BSD success paths, but
+         * pinned here so a future platform-shim bug can't slip
+         * through. */
+        if (got_uid == (uid_t)-1) {
+            fprintf(stderr,
+                "stratumd: proxy: refusing coord conn — resolved "
+                "peer uid is sentinel (uid_t)-1\n");
             close(coord_fd);
             close(upstream_fd);
             return STM_EBACKEND;

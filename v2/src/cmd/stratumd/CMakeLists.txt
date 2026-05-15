@@ -11,6 +11,7 @@ add_library(stm_stratumd STATIC
     serve.c
     corvus_notify.c
     dataset_pattern.c
+    peer_creds.c
     proxy_9p.c)
 
 target_include_directories(stm_stratumd PUBLIC

@@ -131,8 +131,11 @@ FS-socket. The coordinator sees the per-user stratumd's uid (which is the
 end-user's uid, since the per-user stratumd doesn't drop privileges to its
 own dedicated user — it IS the user's process). The coordinator enforces:
 
-- The dialing client's uid MUST match a configured per-user-uid allow-list,
-  OR be 0 (root, for `stratumd-system`).
+- The dialing client's uid MUST match a configured per-user-uid allow-list.
+  For `stratumd-system`, the operator adds an explicit `uid=0:...` entry —
+  uid 0 has NO hardcoded bypass (R141 P2-3 close: the original "OR be 0"
+  wording was a hint about which entry to add; the impl enforces strict
+  table-membership, which is the safer posture).
 - The Tattach `aname` from the dialing client MUST be matchable to the
   configured `<uid> → <pattern set>` table on the coordinator.
 

@@ -289,6 +289,24 @@ other frame byte-for-byte (identity fid map). Tattach refusal
 emits Rlerror(EACCES) directly to upstream without ever touching
 coord — refuse-don't-defer doctrine (R139 carry).
 
+## Bilateral authentication (TLY-A2-impl-3)
+
+Layer-2 of the Thylacine auth posture per design §4. Two
+complementary gates:
+
+- **Coord-side accept-time refusal**: when `user_policy` is
+  non-empty AND the SO_PEERCRED-derived peer uid has no entry
+  in the policy table, `stm_stratumd_accept_loop` closes the
+  conn BEFORE spawning a worker. uid 0 has NO special bypass;
+  the operator MUST add a `uid=0:...` entry for
+  `stratumd-system`. NULL/empty policy → no gate (back-compat).
+- **Client-side downstream coord-uid check**: opt-in via
+  `--coordinator-uid <N>` (`opts.coordinator_uid_check_enabled`
+  + `opts.coordinator_uid`). After `dial_coord` succeeds the
+  proxy verifies the dialed coord's peer uid via SO_PEERCRED /
+  getpeereid; mismatch → close + STM_EBACKEND. Defense against
+  socket-bind impersonation. Default-disabled for back-compat.
+
 ## Tests
 
 - `tests/test_stratumd_ctl.c` — exercises the daemon end-to-end:
@@ -323,7 +341,8 @@ coord — refuse-don't-defer doctrine (R139 carry).
 | TLY-A4: corvus SESSION_CLOSED consumer + `STM_ECORVUSGONE` | LIVE | `corvus_notify.{h,c}` + `eviction.tla` (`f37c518` + R138 close) |
 | TLY-A2-impl-1: coord mode `--user-policy` Tattach gate | LIVE | `stratumd_check_tattach` refuse-don't-defer (`ad55173` + R139 close) |
 | TLY-A2-impl-2: client mode raw 9P proxy + `--datasets-allowed` | LIVE | `proxy_9p.{h,c}` (`9d954ce` + R140 audit) |
-| TLY-A2-impl-3: bilateral SO_PEERCRED downstream-side | PENDING | Per-user stratumd's uid validated against coord's `--user-policy` |
+| TLY-A2-impl-3: bilateral SO_PEERCRED (accept-time + `--coordinator-uid`) | LIVE | `0c16d91` + R141 audit |
+| TLY-A2-impl-4: crash recovery sweep | PENDING | kill -9 patterns; multi-client coord + client crash interleaving |
 
 Audit class: changes to wire framing, peer-cred resolution, socket
 binding, the lifecycle ordering, or signal-mask discipline MUST be
