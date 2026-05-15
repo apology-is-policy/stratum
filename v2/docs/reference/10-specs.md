@@ -35,7 +35,7 @@ chapter as specs get wider cross-reference tables).
 | `scrub.tla` | 5 | Scrub state machine + β cb-classification + γ durable cursor. | small (each of α + β + γ configs; γ adds durable shadow + Persist/Crash/Mount) | `scrub_buggy.cfg` |
 | `bptr.tla` | 6 | Production scrub β cb protocol — replica-walk + csum-gate + rewrite-bad + verify-writeback + log. | 29 states, depth 8 (NReplicas=3) | `bptr_accept_corrupt_buggy.cfg`, `bptr_no_verify_writeback_buggy.cfg` |
 | `dataset.tla` | 6 | Pool-wide dataset hierarchy — forest structure + atomic create/destroy/rename/move + sibling-name uniqueness + id monotonicity + birth-txg. | 43 states, depth 7 (MaxDatasets=3, 2 names) | `dataset_cycles_buggy.cfg`, `dataset_dup_name_buggy.cfg`, `dataset_destroy_non_leaf_buggy.cfg` |
-| `snapshot.tla` | 6 | Snapshot lifecycle — O(1) atomic create + birth-txg ordering + chain integrity + holds prevent delete. P7-8 added separate `sync_gen` counter + `snap_extent_txg` capture so send/recv's incremental gen filter aligns with extent.gen. Block-level dead-list deferred. | 3975 states, depth 12 (MaxSnaps=3, MaxTxg=5) | `snapshot_delete_held_buggy.cfg`, `snapshot_chain_disorder_buggy.cfg`, `snapshot_extent_txg_unbounded_buggy.cfg` (P7-8) |
+| `snapshot.tla` | 6 / TLY-A5 | Snapshot lifecycle — O(1) atomic create + birth-txg ordering + chain integrity + holds prevent delete. P7-8 added separate `sync_gen` counter + `snap_extent_txg` capture so send/recv's incremental gen filter aligns with extent.gen. TLY-A5 added the rollback compromise marker — `snap_compromised` flag + Mark/Unmark/Rollback actions + `RollbackBlockedIffCompromised` (rollback admission gate only; mechanism deferred to Phase 9.7). Block-level dead-list deferred. | 3975 states, depth 12 (MaxSnaps=3, MaxTxg=5) — pre-TLY-A5 | `snapshot_delete_held_buggy.cfg`, `snapshot_chain_disorder_buggy.cfg`, `snapshot_extent_txg_unbounded_buggy.cfg` (P7-8), `snapshot_rollback_skip_consult_buggy.cfg` (TLY-A5) |
 | `property.tla` | 6 | Per-dataset property inheritance — local override / inheritable walk / non-inheritable + immutable-at-create. | 1040 states, depth 11 (MaxDatasets=2, 3 props, 2 values) | `property_inherit_non_inh_buggy.cfg`, `property_mutate_immutable_buggy.cfg` |
 | `clone.tla` | 6 | Clone (writable snapshot) lifecycle — clone-from-snap + snap-with-clones-undeletable + promote-breaks-dependency. | 161 states, depth 11 (MaxDatasets=3, MaxSnaps=2) | `clone_delete_snap_with_clones_buggy.cfg` |
 | `dead_list.tla` | 6 + P7-CAS-4c | Block-level reachability + per-snapshot dead-list incremental maintenance during COW + ZFS-style SnapDelete (free-unique + merge-surviving-into-pred). P7-CAS-4c extends with parallel cold-tier model: `WriteCold(c, h)` + `OverwriteCold(c)` actions + `snap_cold_dead`, `cold_dereffed`, `used_cold_extents` variables; SnapDelete drains snap_cold_dead → cold_dereffed; new invariants `ColdExtentsTrackedSomewhere`, `LiveColdDisjointFromDead`, `LiveColdDisjointFromDereffed`, `DereffedColdDisjointFromDead`, `ColdSingleOwnership`. | 4.11M states, depth 21 (MaxBlocks=4, MaxSnaps=3, MaxColdExtents=3, MaxHashIds=2) — was 5656 / 15 pre-P7-CAS-4c | `dead_list_overwrite_forgets_buggy.cfg`, `dead_list_delete_forgets_free_buggy.cfg`, `dead_list_merge_includes_freed_buggy.cfg`, `dead_list_overwrite_cold_forgets_buggy.cfg`, `dead_list_delete_cold_forgets_deref_buggy.cfg` |
@@ -697,6 +697,26 @@ Buggy configs:
   P7-8): Create chooses arbitrary `snap_extent_txg` ∈ 0..MaxTxg.
   Reachable at state 2: snap_extent_txg = 1, sync_gen = 0.
   `ExtentTxgBoundedBySync` violated immediately.
+- `snapshot_rollback_skip_consult_buggy.cfg` (`BuggyRollbackSkipsConsult=TRUE`,
+  TLY-A5): `Rollback` skips the marker-consultation gate. Reachable:
+  Create → `MarkCompromised(1)` → `Rollback(1)` with `force=FALSE`
+  sets `did_unsafe_rollback=TRUE`. `RollbackBlockedIffCompromised`
+  violated.
+
+### TLY-A5 extension — rollback compromise marking
+
+`snapshot.tla` gained a per-snapshot `snap_compromised` flag,
+`MarkCompromised` / `UnmarkCompromised` actions, and a `Rollback`
+action modeling the **admission gate only** (the rollback mechanism
+— tree-swap, block reclamation — belongs to the post-Thylacine Phase
+9.7 spec). New invariant `RollbackBlockedIffCompromised`
+(`~did_unsafe_rollback`) — a rollback to a compromised snapshot never
+proceeds without the `force` flag; the same invariant holding across
+every `UnmarkCompromised`/`Rollback` interleaving is the
+unmark-races-rollback proof. The marker is inert w.r.t. every pre-A5
+invariant (non-perturbation — `Mark`/`Unmark`/`Rollback` UNCHANGED
+every variable those invariants constrain). See
+`v2/docs/thylacine-a5-design.md` §10.
 
 Spec-to-code (forward reference): the C implementation of the
 snapshot index tree is **not yet in this commit**. Lands in a
@@ -707,7 +727,8 @@ follow-on chunk under `src/snapshot/` (or alongside
 Out of scope for `snapshot.tla`:
 - Block-level reachability + dead-list correctness (ARCH §8.5.5);
   separate spec needed for the block model.
-- Snapshot rollback (ARCH §8.10).
+- Snapshot rollback MECHANISM (ARCH §8.10) — Phase 9.7 spec. TLY-A5
+  models only the rollback admission gate.
 - Multi-dataset snapshot indexing; spec covers a single dataset's
   chain.
 - Send/recv use of birth-txg for incremental diffs (ARCH §8.7.4);

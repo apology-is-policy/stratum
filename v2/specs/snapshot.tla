@@ -56,7 +56,9 @@
 (*     delete — are a separate spec / chunk. The block model needed is   *)
 (*     substantial enough to warrant its own module.                       *)
 (*                                                                           *)
-(*   - Snapshot rollback (ARCH §8.10). Future spec.                       *)
+(*   - Snapshot rollback MECHANISM (ARCH §8.10 — tree-swap, birth-txg     *)
+(*     block reclamation). Belongs to the post-Thylacine Phase 9.7        *)
+(*     spec. TLY-A5 adds only the rollback ADMISSION GATE — see below.    *)
 (*                                                                           *)
 (*   - Multi-dataset snapshot indexing. The spec models a single          *)
 (*     dataset's snapshot chain; cross-dataset interactions (clones)     *)
@@ -95,6 +97,23 @@
 (*     extent_txg) or `ChainExtentTxgOrdered` (capturing a value lower    *)
 (*     than the prior snap's). Models the impl bug we're closing in       *)
 (*     P7-8: filtering by a counter that doesn't bound extent.gen.        *)
+(*                                                                           *)
+(*   - BuggyRollbackSkipsConsult — Rollback proceeds on a compromised      *)
+(*     snapshot WITHOUT the `force` flag, i.e. the marker-consultation    *)
+(*     gate is skipped. Should violate `RollbackBlockedIffCompromised`.   *)
+(*                                                                           *)
+(* TLY-A5 extension — rollback compromise marking:                          *)
+(*                                                                           *)
+(*   A snapshot can be MARKED rollback-compromised (corvus detected the    *)
+(*   keys it was taken under may be compromised — CORVUS-DESIGN §4.5 F13). *)
+(*   A non-forced rollback to a marked snapshot must be REFUSED. This spec *)
+(*   models the ADMISSION GATE only (the A5 deliverable): MarkCompromised, *)
+(*   UnmarkCompromised, and a Rollback action whose guard is the           *)
+(*   consultation. The rollback MECHANISM (live_tree_root := snapshot      *)
+(*   root, block reclamation) is deliberately NOT modeled — that is the    *)
+(*   Phase 9.7 spec. `did_unsafe_rollback` is the history variable that    *)
+(*   witnesses a gate bypass; `RollbackBlockedIffCompromised` asserts it   *)
+(*   never becomes TRUE.                                                    *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets
@@ -105,7 +124,8 @@ CONSTANTS
     TreeRoots,
     BuggyDeleteWithHold,
     BuggyChainOutOfOrder,
-    BuggyExtentTxgUnbounded
+    BuggyExtentTxgUnbounded,
+    BuggyRollbackSkipsConsult
 
 ASSUME MaxSnaps \in (Nat \ {0})
 ASSUME MaxTxg \in (Nat \ {0})
@@ -113,6 +133,7 @@ ASSUME TreeRoots # {}
 ASSUME BuggyDeleteWithHold \in BOOLEAN
 ASSUME BuggyChainOutOfOrder \in BOOLEAN
 ASSUME BuggyExtentTxgUnbounded \in BOOLEAN
+ASSUME BuggyRollbackSkipsConsult \in BOOLEAN
 
 SnapIds == 1..MaxSnaps
 NoSnap  == 0
@@ -125,14 +146,18 @@ VARIABLES
     snap_extent_txg,    \* SnapIds → 0 .. MaxTxg. Sync_gen captured at Create.
     snap_prev,          \* SnapIds → 0 .. MaxSnaps (0 = no previous).
     snap_held,          \* SnapIds → BOOLEAN.
+    snap_compromised,   \* SnapIds → BOOLEAN. TLY-A5 rollback-compromised flag.
     next_snap_id,       \* 1 .. MaxSnaps + 1.
     current_txg,        \* 0 .. MaxTxg. Snap-index counter; bumps on Create only.
     sync_gen,           \* 0 .. MaxTxg. Models sync.current_gen; bumps on Write.
-    most_recent_snap    \* 0 .. MaxSnaps (0 = no snaps yet).
+    most_recent_snap,   \* 0 .. MaxSnaps (0 = no snaps yet).
+    did_unsafe_rollback \* BOOLEAN. TLY-A5 history var: a non-forced rollback
+                        \* to a compromised snap got past the gate (a bug).
 
 vars == <<live_tree_root, snap_state, snap_tree_root, snap_created_txg,
-          snap_extent_txg, snap_prev, snap_held, next_snap_id,
-          current_txg, sync_gen, most_recent_snap>>
+          snap_extent_txg, snap_prev, snap_held, snap_compromised,
+          next_snap_id, current_txg, sync_gen, most_recent_snap,
+          did_unsafe_rollback>>
 
 (***************************************************************************)
 (* Pick an arbitrary deterministic initial root from the TreeRoots set.    *)
@@ -148,10 +173,12 @@ Init ==
     /\ snap_extent_txg   = [s \in SnapIds |-> 0]
     /\ snap_prev         = [s \in SnapIds |-> NoSnap]
     /\ snap_held         = [s \in SnapIds |-> FALSE]
+    /\ snap_compromised  = [s \in SnapIds |-> FALSE]
     /\ next_snap_id      = 1
     /\ current_txg       = 0
     /\ sync_gen          = 0
     /\ most_recent_snap  = NoSnap
+    /\ did_unsafe_rollback = FALSE
 
 (***************************************************************************)
 (* Helper: is snapshot s currently PRESENT?                                 *)
@@ -180,8 +207,9 @@ Write ==
         /\ live_tree_root' = new_root
     /\ sync_gen' = sync_gen + 1
     /\ UNCHANGED <<snap_state, snap_tree_root, snap_created_txg,
-                   snap_extent_txg, snap_prev, snap_held, next_snap_id,
-                   current_txg, most_recent_snap>>
+                   snap_extent_txg, snap_prev, snap_held, snap_compromised,
+                   next_snap_id, current_txg, most_recent_snap,
+                   did_unsafe_rollback>>
 
 (***************************************************************************)
 (* Action: SnapshotCreate — atomically capture live's tree_root.            *)
@@ -213,10 +241,11 @@ SnapshotCreate ==
         /\ snap_extent_txg' = [snap_extent_txg EXCEPT ![next_snap_id] = etxg]
     /\ snap_prev'       = [snap_prev EXCEPT ![next_snap_id] = most_recent_snap]
     /\ snap_held'       = [snap_held EXCEPT ![next_snap_id] = FALSE]
+    /\ snap_compromised' = [snap_compromised EXCEPT ![next_snap_id] = FALSE]
     /\ next_snap_id'    = next_snap_id + 1
     /\ current_txg'     = current_txg + 1
     /\ most_recent_snap' = next_snap_id
-    /\ UNCHANGED <<live_tree_root, sync_gen>>
+    /\ UNCHANGED <<live_tree_root, sync_gen, did_unsafe_rollback>>
 
 (***************************************************************************)
 (* Action: SnapshotDelete(s) — mark s ABSENT.                               *)
@@ -242,8 +271,9 @@ SnapshotDelete(s) ==
        \/ ~snap_held[s]
     /\ snap_state' = [snap_state EXCEPT ![s] = "ABSENT"]
     /\ UNCHANGED <<live_tree_root, snap_tree_root, snap_created_txg,
-                   snap_extent_txg, snap_prev, snap_held, next_snap_id,
-                   current_txg, sync_gen, most_recent_snap>>
+                   snap_extent_txg, snap_prev, snap_held, snap_compromised,
+                   next_snap_id, current_txg, sync_gen, most_recent_snap,
+                   did_unsafe_rollback>>
 
 (***************************************************************************)
 (* Action: SnapshotHold(s) / SnapshotRelease(s) — toggle hold flag.         *)
@@ -255,7 +285,8 @@ SnapshotHold(s) ==
     /\ snap_held' = [snap_held EXCEPT ![s] = TRUE]
     /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
                    snap_created_txg, snap_extent_txg, snap_prev,
-                   next_snap_id, current_txg, sync_gen, most_recent_snap>>
+                   snap_compromised, next_snap_id, current_txg, sync_gen,
+                   most_recent_snap, did_unsafe_rollback>>
 
 SnapshotRelease(s) ==
     /\ s \in SnapIds
@@ -264,7 +295,74 @@ SnapshotRelease(s) ==
     /\ snap_held' = [snap_held EXCEPT ![s] = FALSE]
     /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
                    snap_created_txg, snap_extent_txg, snap_prev,
-                   next_snap_id, current_txg, sync_gen, most_recent_snap>>
+                   snap_compromised, next_snap_id, current_txg, sync_gen,
+                   most_recent_snap, did_unsafe_rollback>>
+
+(***************************************************************************)
+(* TLY-A5 — Action: MarkCompromised(s) / UnmarkCompromised(s).               *)
+(*                                                                           *)
+(* MarkCompromised sets the rollback-compromised flag on a PRESENT snap     *)
+(* (in the impl: corvus, or the operator, writes the mark-compromised      *)
+(* /ctl/ kind). UnmarkCompromised clears it (operator only, `force` body). *)
+(* Both touch ONLY snap_compromised — no other state — so every existing   *)
+(* invariant is trivially preserved (the spec's non-perturbation proof).   *)
+(* Marking an already-marked snap (or unmarking an unmarked one) is a      *)
+(* permitted no-op-shaped step; the spec models it as a real step so TLC   *)
+(* explores the idempotent case.                                           *)
+(***************************************************************************)
+MarkCompromised(s) ==
+    /\ s \in SnapIds
+    /\ Present(s)
+    /\ snap_compromised' = [snap_compromised EXCEPT ![s] = TRUE]
+    /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
+                   snap_created_txg, snap_extent_txg, snap_prev, snap_held,
+                   next_snap_id, current_txg, sync_gen, most_recent_snap,
+                   did_unsafe_rollback>>
+
+UnmarkCompromised(s) ==
+    /\ s \in SnapIds
+    /\ Present(s)
+    /\ snap_compromised' = [snap_compromised EXCEPT ![s] = FALSE]
+    /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
+                   snap_created_txg, snap_extent_txg, snap_prev, snap_held,
+                   next_snap_id, current_txg, sync_gen, most_recent_snap,
+                   did_unsafe_rollback>>
+
+(***************************************************************************)
+(* TLY-A5 — Action: Rollback(s) — the rollback ADMISSION GATE.               *)
+(*                                                                           *)
+(* This models ONLY the marker-consultation gate, not the rollback         *)
+(* mechanism (tree-swap / block reclamation — Phase 9.7). The caller       *)
+(* supplies a `force` flag (the impl: body `<sid>` vs `force <sid>`).      *)
+(*                                                                           *)
+(* Fixed policy: a rollback to a compromised snap proceeds ONLY if force.  *)
+(* The action records, in the history variable did_unsafe_rollback,        *)
+(* whether a rollback ever proceeded on a compromised snap WITHOUT force — *)
+(* which the fixed gate makes impossible.                                  *)
+(*                                                                           *)
+(* Buggy variant BuggyRollbackSkipsConsult drops the consultation: a       *)
+(* non-forced rollback of a compromised snap proceeds, setting             *)
+(* did_unsafe_rollback := TRUE and tripping RollbackBlockedIffCompromised. *)
+(*                                                                           *)
+(* The interleaving of UnmarkCompromised(s) and Rollback(s) is explored    *)
+(* by TLC for free: each is one atomic step, so a racing Rollback sees     *)
+(* either the marked (blocked) or the unmarked (allowed) snap, never a     *)
+(* torn in-between — the gate stays sound across the race.                  *)
+(***************************************************************************)
+Rollback(s) ==
+    /\ s \in SnapIds
+    /\ Present(s)
+    /\ \E force \in BOOLEAN:
+        \* Fixed gate: compromised ⇒ force required. Buggy: gate skipped. *)
+        /\ \/ BuggyRollbackSkipsConsult
+           \/ ~snap_compromised[s]
+           \/ force
+        /\ did_unsafe_rollback' =
+               (did_unsafe_rollback \/ (snap_compromised[s] /\ ~force))
+    /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
+                   snap_created_txg, snap_extent_txg, snap_prev, snap_held,
+                   snap_compromised, next_snap_id, current_txg, sync_gen,
+                   most_recent_snap>>
 
 (***************************************************************************)
 (* Top-level Next.                                                           *)
@@ -275,6 +373,9 @@ Next ==
     \/ \E s \in SnapIds: SnapshotDelete(s)
     \/ \E s \in SnapIds: SnapshotHold(s)
     \/ \E s \in SnapIds: SnapshotRelease(s)
+    \/ \E s \in SnapIds: MarkCompromised(s)
+    \/ \E s \in SnapIds: UnmarkCompromised(s)
+    \/ \E s \in SnapIds: Rollback(s)
 
 Spec == Init /\ [][Next]_vars
 
@@ -290,10 +391,12 @@ TypeOK ==
     /\ snap_extent_txg \in [SnapIds -> 0..MaxTxg]
     /\ snap_prev \in [SnapIds -> 0..MaxSnaps]
     /\ snap_held \in [SnapIds -> BOOLEAN]
+    /\ snap_compromised \in [SnapIds -> BOOLEAN]
     /\ next_snap_id \in 1..(MaxSnaps + 1)
     /\ current_txg \in 0..MaxTxg
     /\ sync_gen \in 0..MaxTxg
     /\ most_recent_snap \in 0..MaxSnaps
+    /\ did_unsafe_rollback \in BOOLEAN
 
 (* Every snapshot's created_txg is at most the current commit gen. The     *)
 (* spec's chain ordering also implies this transitively, but the direct   *)
@@ -394,6 +497,7 @@ SnapIdMonotonic ==
              /\ snap_extent_txg[s] = 0
              /\ snap_prev[s] = NoSnap
              /\ snap_held[s] = FALSE
+             /\ snap_compromised[s] = FALSE
 
 (* P7-8: extent-txg captured at Create is bounded by current sync_gen.    *)
 (* Captured monotonically; sync_gen never decreases. Refutes a buggy      *)
@@ -421,5 +525,27 @@ ChainExtentTxgWellOrderedFromN(s, fuel) ==
 ChainExtentTxgOrdered ==
     \A s \in SnapIds:
         Present(s) => ChainExtentTxgWellOrderedFromN(s, MaxSnaps + 1)
+
+(* TLY-A5: the rollback marker-consultation gate. A rollback to a         *)
+(* compromised snapshot must NEVER proceed without the `force` flag — the *)
+(* Rollback action records any such bypass in did_unsafe_rollback. Under  *)
+(* the fixed config (BuggyRollbackSkipsConsult = FALSE) the gate makes a  *)
+(* compromised+unforced rollback unreachable, so this stays FALSE; the    *)
+(* buggy config drops the gate and trips the invariant.                    *)
+(*                                                                           *)
+(* This is also the `unmark`-races-`rollback` proof: TLC explores every    *)
+(* interleaving of UnmarkCompromised(s) and Rollback(s); the invariant     *)
+(* holding across all of them shows no race admits an unsafe rollback.     *)
+RollbackBlockedIffCompromised ==
+    ~did_unsafe_rollback
+
+(* TLY-A5 non-perturbation: the compromise marker is inert w.r.t. every   *)
+(* pre-A5 invariant. There is no separate invariant for this — it is the  *)
+(* fact that BirthTxgMonotonic / HoldPreventsDelete / ChainTxgOrdered /   *)
+(* ChainAcyclic / MostRecentValid / SnapIdMonotonic / ExtentTxgBoundedBySync *)
+(* / ChainExtentTxgOrdered all still hold with snap_compromised + the new *)
+(* actions in the model. TLC checking the full invariant list IS the     *)
+(* non-perturbation proof (MarkCompromised / UnmarkCompromised / Rollback *)
+(* UNCHANGED every variable those invariants constrain).                  *)
 
 ================================================================================
