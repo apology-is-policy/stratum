@@ -1264,6 +1264,7 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                                             STM_SYNC_POOL_DATASET_ID,
                                             STM_SYNC_POOL_KEY_ID,
                                             STM_KS_STATE_CURRENT,
+                                            STM_KS_WRAPPER_LEGACY,
                                             wrapped, wrapped_len);
         stm_ct_memzero(wrapped, sizeof wrapped);
         if (ws != STM_OK) { stm_sync_close(s); return ws; }
@@ -1760,7 +1761,8 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
     uint64_t pool_cur_kid = UINT64_MAX;
     kos = stm_keyschema_lookup_current(s2->keyschema,
                                          STM_SYNC_POOL_DATASET_ID,
-                                         &pool_cur_kid, NULL, 0, NULL);
+                                         &pool_cur_kid, /*out_wrapper=*/NULL,
+                                         NULL, 0, NULL);
     if (kos != STM_OK) { stm_sync_close(s2); return kos; }
     if (pool_cur_kid != STM_SYNC_POOL_KEY_ID) {
         stm_sync_close(s2);
@@ -4096,6 +4098,7 @@ stm_status stm_sync_add_dataset_key(stm_sync *s,
 
     rc = stm_keyschema_insert_wrapped(s->keyschema, dataset_id, /*key_id=*/0,
                                         STM_KS_STATE_CURRENT,
+                                        STM_KS_WRAPPER_LEGACY,
                                         wrapped, wrapped_len);
     stm_ct_memzero(wrapped, sizeof wrapped);
     if (rc != STM_OK) {
@@ -4169,6 +4172,7 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
 
     uint64_t old_id = 0;
     rc = stm_keyschema_rotate(s->keyschema, dataset_id, next_id,
+                                 STM_KS_WRAPPER_LEGACY,
                                  wrapped, wrapped_len, &old_id);
     stm_ct_memzero(wrapped, sizeof wrapped);
     if (rc != STM_OK) {
@@ -4568,6 +4572,7 @@ static stm_status sync_resolve_current_dek_locked(const stm_sync *s,
     uint64_t kid = 0;
     stm_status rc = stm_keyschema_lookup_current((const stm_keyschema *)s->keyschema,
                                                     dataset_id, &kid,
+                                                    /*out_wrapper=*/NULL,
                                                     /*out_wrapped=*/NULL,
                                                     /*out_cap=*/0,
                                                     /*out_len=*/NULL);
@@ -7006,7 +7011,7 @@ stm_status stm_sync_recv_cold_extent(
     {
         stm_status ks = stm_keyschema_lookup_current(
                 (const stm_keyschema *)s->keyschema,
-                target_dataset_id, &key_id,
+                target_dataset_id, &key_id, /*out_wrapper=*/NULL,
                 /*out_wrapped=*/NULL, /*out_cap=*/0, /*out_len=*/NULL);
         if (ks != STM_OK) {
             (void)stm_cas_deref(s->cas_idx, out_hash);
@@ -7153,7 +7158,7 @@ stm_status stm_sync_recv_cold_extent_ref(stm_sync *s,
     {
         stm_status ks = stm_keyschema_lookup_current(
                 (const stm_keyschema *)s->keyschema,
-                target_dataset_id, &key_id,
+                target_dataset_id, &key_id, /*out_wrapper=*/NULL,
                 /*out_wrapped=*/NULL, /*out_cap=*/0, /*out_len=*/NULL);
         if (ks != STM_OK) {
             (void)stm_cas_deref(s->cas_idx, claimed_hash);

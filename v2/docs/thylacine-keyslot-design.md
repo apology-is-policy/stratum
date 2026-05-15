@@ -229,11 +229,20 @@ chunk; that is gone — §4/§5.)
 
 ## 10. Open question
 
-- **Q-KS1** (decided at impl-3a against the real entry encoding):
-  compat tier. Lean — if the `wrapper_identity` byte can be added
-  such that an old reader sees existing slots as `PASSPHRASE`-kind
-  and simply does not understand `CORVUS`-kind slots → **ro-compat**
-  is justifiable. If an old reader would miswrap or misroute a slot
-  → **incompat**. Do not pre-commit; decide on the encoding.
+- **Q-KS1 — RESOLVED at impl-3a.** The compat-tier framing
+  (ro-compat vs incompat feature flag) does not apply: the v2 tree
+  does **not** use the `ub_flags_*` feature-flag fields — they are
+  vestigial. Every on-disk format change is a full `STM_UB_VERSION`
+  bump with an exact-match gate (`version != STM_UB_VERSION →
+  STM_EBADVERSION`; super.h's ~20-entry version history is all "full
+  version bump, no feature flag"). So impl-3a bumps **STM_UB_VERSION
+  26 → 27**. The `wrapper_identity` byte is carved from the
+  keyschema entry value's reserved bytes (offset 2; the layout stays
+  8 + wrapped_len), so the change is byte-back-compatible — but the
+  semantic break (a pre-TLY-A3 binary has no wrapper_identity concept
+  and would misroute a CORVUS slot) is what the version bump gates.
+  The exact-match check is strictly stronger than an incompat flag:
+  a v26 binary refuses a v27 pool outright. `STM_KS_WRAPPER_LEGACY =
+  0` is the back-compat default a pre-TLY-A3 zero byte decodes to.
 
 Q-KS2 and Q-KS3 are answered above (§4).

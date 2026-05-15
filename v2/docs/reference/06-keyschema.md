@@ -67,16 +67,38 @@ identical `ub_key_schema[512]` bytes, satisfying quorum.tla's
 
 ```c
 stm_status stm_keyschema_insert_wrapped(ks, dataset_id, key_id, state,
-                                          wrapped, wrapped_len);
+                                          wrapper, wrapped, wrapped_len);
 
 stm_status stm_keyschema_lookup         (ks, dataset_id, key_id,
-                                          &state, out_buf, out_cap, &len);
+                                          &state, &wrapper,
+                                          out_buf, out_cap, &len);
 
 stm_status stm_keyschema_lookup_current (ks, dataset_id,
-                                          &key_id, out_buf, out_cap, &len);
+                                          &key_id, &wrapper,
+                                          out_buf, out_cap, &len);
 
 size_t     stm_keyschema_count          (const stm_keyschema *ks);
 ```
+
+### `wrapper_identity` (TLY-A3-keyslot, STM_UB_VERSION 26 → 27)
+
+Every entry carries a `stm_keyschema_wrapper` tag — `LEGACY` (0),
+`PASSPHRASE` (1), `JANUS` (2), `CORVUS` (3) — recording how the
+wrapped-DEK blob is sealed, so the mount path can route a `CORVUS`
+slot through `stm_corvus_unwrap` and a local slot through the
+keyfile/janus path. `insert_wrapped` and `rotate` take it as a
+parameter; `lookup` / `lookup_current` return it via a NULL-able
+`*out_wrapper`.
+
+On disk the tag is byte [2] of the entry value (`state(1) ||
+flags(1) || wrapper_identity(1) || reserved(5) || wrapped`). It is
+carved from what was a 6-byte reserved block written zero, so a
+pre-TLY-A3 entry decodes as `LEGACY` — the back-compat default,
+which the mount path treats exactly like `PASSPHRASE`. `decode_val`
+refuses any byte outside {0,1,2,3} as `STM_ECORRUPT`. The layout is
+byte-identical (`KS_VAL_HDR_LEN` stays 8); the `STM_UB_VERSION` bump
+gates the *semantic* break (a pre-TLY-A3 binary would misroute a
+`CORVUS` slot). See `v2/docs/thylacine-keyslot-design.md`.
 
 ### Rotation + sweep
 

@@ -70,6 +70,25 @@ typedef enum {
     STM_KS_STATE_PRUNING  = 3,
 } stm_keyschema_state;
 
+/* TLY-A3-keyslot: how a slot's wrapped-DEK blob is sealed — the
+ * `wrapper_identity` byte carved from the entry-value reserved space
+ * (STM_UB_VERSION 26 -> 27). The mount path routes a slot to the
+ * right unwrapper by this tag (see v2/docs/thylacine-keyslot-design.md
+ * §3). On-disk encoding is a little-endian 1 byte at value offset 2.
+ *
+ * LEGACY (0) is the back-compat default: a pre-TLY-A3 slot wrote
+ * zero into that reserved byte, so a slot read back as LEGACY is one
+ * created before the wrapper_identity field existed — the mount path
+ * treats it exactly like PASSPHRASE (the keyfile / derived-key path).
+ * Decoders MUST accept LEGACY for back-compat; only CORVUS routes
+ * through stm_corvus_unwrap. */
+typedef enum {
+    STM_KS_WRAPPER_LEGACY     = 0,  /* unset — pre-TLY-A3 slot */
+    STM_KS_WRAPPER_PASSPHRASE = 1,  /* keyfile / Argon2id derived */
+    STM_KS_WRAPPER_JANUS      = 2,  /* janus key agent */
+    STM_KS_WRAPPER_CORVUS     = 3,  /* corvus key agent (TLY-A3) */
+} stm_keyschema_wrapper;
+
 /* Maximum wrapped-blob size we support per entry. Sized for the
  * PQ-hybrid wrap of a 32-byte dek: 32 + STM_HYBRID_WRAP_OVERHEAD
  * (1160) = 1192 bytes. Round up to give a little future headroom. */
@@ -142,18 +161,24 @@ stm_status stm_keyschema_get_root(const stm_keyschema *ks,
 
 /*
  * Insert (or replace) an entry keyed by (dataset_id, key_id).
- * `wrapped_len` must be <= STM_KEYSCHEMA_WRAPPED_MAX.
+ * `wrapped_len` must be <= STM_KEYSCHEMA_WRAPPED_MAX. `wrapper`
+ * tags how the blob is sealed (TLY-A3-keyslot); pass
+ * STM_KS_WRAPPER_LEGACY for the pre-TLY-A3 keyfile / derived-key
+ * path, STM_KS_WRAPPER_CORVUS for a corvus-wrapped DEK.
  */
 STM_MUST_USE
 stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
                                           uint64_t dataset_id,
                                           uint64_t key_id,
                                           stm_keyschema_state state,
+                                          stm_keyschema_wrapper wrapper,
                                           const void *wrapped, size_t wrapped_len);
 
 /*
  * Read the entry for (dataset_id, key_id). `out_wrapped` may be
- * NULL if the caller only wants `out_state` / `out_len`.
+ * NULL if the caller only wants `out_state` / `out_len` /
+ * `out_wrapper`. `out_wrapper` may be NULL if the caller does not
+ * care which agent sealed the blob.
  *
  * Returns STM_ENOENT if no entry exists, STM_ERANGE if out_cap is
  * smaller than the stored blob.
@@ -162,12 +187,17 @@ STM_MUST_USE
 stm_status stm_keyschema_lookup(const stm_keyschema *ks,
                                   uint64_t dataset_id, uint64_t key_id,
                                   stm_keyschema_state *out_state,
+                                  stm_keyschema_wrapper *out_wrapper,
                                   void *out_wrapped, size_t out_cap,
                                   size_t *out_len);
 
 /*
  * Find the CURRENT entry for `dataset_id`, regardless of key_id.
  * There must be exactly one; STM_ECORRUPT otherwise.
+ *
+ * `out_wrapper` may be NULL; when non-NULL it receives the CURRENT
+ * slot's wrapper_identity — the TLY-A3-keyslot mount path uses this
+ * to route the blob to stm_corvus_unwrap vs the local path.
  *
  * Returns STM_ENOENT if no current entry exists (no such dataset,
  * or all its keys are retired).
@@ -176,6 +206,7 @@ STM_MUST_USE
 stm_status stm_keyschema_lookup_current(const stm_keyschema *ks,
                                           uint64_t dataset_id,
                                           uint64_t *out_key_id,
+                                          stm_keyschema_wrapper *out_wrapper,
                                           void *out_wrapped, size_t out_cap,
                                           size_t *out_len);
 
@@ -224,6 +255,7 @@ STM_MUST_USE
 stm_status stm_keyschema_rotate(stm_keyschema *ks,
                                   uint64_t dataset_id,
                                   uint64_t new_key_id,
+                                  stm_keyschema_wrapper wrapper,
                                   const void *wrapped, size_t wrapped_len,
                                   uint64_t *out_old_key_id);
 

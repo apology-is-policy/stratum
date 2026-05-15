@@ -31,12 +31,13 @@
 /* Entry in RAM. Owns its wrapped blob. */
 typedef struct ks_entry ks_entry;
 struct ks_entry {
-    uint64_t            dataset_id;
-    uint64_t            key_id;
-    stm_keyschema_state state;
-    uint8_t             *wrapped;
-    size_t              wrapped_len;
-    ks_entry            *next;      /* sorted by (dataset_id, key_id) */
+    uint64_t              dataset_id;
+    uint64_t              key_id;
+    stm_keyschema_state   state;
+    stm_keyschema_wrapper wrapper;    /* TLY-A3-keyslot — how blob is sealed */
+    uint8_t               *wrapped;
+    size_t                wrapped_len;
+    ks_entry              *next;      /* sorted by (dataset_id, key_id) */
 };
 
 struct stm_keyschema {
@@ -105,22 +106,32 @@ static void decode_key(const uint8_t in[16],
     *out_key_id     = kid;
 }
 
-/* Value: state(1) || flags(1) || reserved(6) || wrapped(variable).
- * Total bytes = 8 + wrapped_len. */
+/* Value: state(1) || flags(1) || wrapper_identity(1) || reserved(5)
+ * || wrapped(variable). Total bytes = 8 + wrapped_len.
+ *
+ * TLY-A3-keyslot (STM_UB_VERSION 26 -> 27): byte [2] — previously
+ * part of the 6-byte reserved block, always written zero — now
+ * carries the `wrapper_identity` tag. A pre-TLY-A3 pool has [2]==0,
+ * which decodes as STM_KS_WRAPPER_LEGACY (back-compat); the version
+ * bump makes a pre-TLY-A3 binary refuse a v27 pool outright so it
+ * never misroutes a CORVUS slot it cannot interpret. */
 #define KS_VAL_HDR_LEN  8u
 
 static void encode_val(stm_keyschema_state state,
+                         stm_keyschema_wrapper wrapper,
                          const void *wrapped, size_t wrapped_len,
                          uint8_t *out)
 {
     out[0] = (uint8_t)state;
     out[1] = 0;                               /* flags — none yet   */
-    memset(out + 2, 0, 6);                    /* reserved           */
+    out[2] = (uint8_t)wrapper;                /* wrapper_identity   */
+    memset(out + 3, 0, 5);                    /* reserved           */
     if (wrapped_len > 0) memcpy(out + KS_VAL_HDR_LEN, wrapped, wrapped_len);
 }
 
 static stm_status decode_val(const uint8_t *in, size_t in_len,
                                 stm_keyschema_state *out_state,
+                                stm_keyschema_wrapper *out_wrapper,
                                 const uint8_t **out_wrapped, size_t *out_wrapped_len)
 {
     if (in_len < KS_VAL_HDR_LEN) return STM_ECORRUPT;
@@ -128,8 +139,19 @@ static stm_status decode_val(const uint8_t *in, size_t in_len,
     if (st != STM_KS_STATE_CURRENT &&
         st != STM_KS_STATE_RETIRED &&
         st != STM_KS_STATE_PRUNING) return STM_ECORRUPT;
-    /* flags byte + reserved: no constraints yet, accept any value. */
+    /* wrapper_identity (byte [2]): must be a known kind. 0 == LEGACY
+     * is the pre-TLY-A3 default (the reserved byte was zero). Any
+     * value outside {LEGACY, PASSPHRASE, JANUS, CORVUS} on a node
+     * that already passed the Merkle/self-csum check is a format
+     * violation, not tamper — refuse as STM_ECORRUPT. */
+    uint8_t wr = in[2];
+    if (wr != STM_KS_WRAPPER_LEGACY &&
+        wr != STM_KS_WRAPPER_PASSPHRASE &&
+        wr != STM_KS_WRAPPER_JANUS &&
+        wr != STM_KS_WRAPPER_CORVUS) return STM_ECORRUPT;
+    /* flags byte + remaining reserved: no constraints yet. */
     *out_state       = (stm_keyschema_state)st;
+    *out_wrapper     = (stm_keyschema_wrapper)wr;
     *out_wrapped     = in + KS_VAL_HDR_LEN;
     *out_wrapped_len = in_len - KS_VAL_HDR_LEN;
     return STM_OK;
@@ -275,9 +297,11 @@ static int load_cb(const void *key, size_t key_len,
     decode_key(key, &dataset_id, &key_id);
 
     stm_keyschema_state state = STM_KS_STATE_INVALID;
+    stm_keyschema_wrapper wrapper = STM_KS_WRAPPER_LEGACY;
     const uint8_t *wrapped = NULL;
     size_t wrapped_len = 0;
-    stm_status vs = decode_val(value, value_len, &state, &wrapped, &wrapped_len);
+    stm_status vs = decode_val(value, value_len, &state, &wrapper,
+                                 &wrapped, &wrapped_len);
     if (vs != STM_OK) { lc->err = vs; return 1; }
     if (wrapped_len > STM_KEYSCHEMA_WRAPPED_MAX) {
         lc->err = STM_ECORRUPT; return 1;
@@ -288,6 +312,7 @@ static int load_cb(const void *key, size_t key_len,
     e->dataset_id  = dataset_id;
     e->key_id      = key_id;
     e->state       = state;
+    e->wrapper     = wrapper;
     e->wrapped_len = wrapped_len;
     if (wrapped_len > 0) {
         e->wrapped = malloc(wrapped_len);
@@ -395,7 +420,8 @@ stm_status stm_keyschema_commit(stm_keyschema *ks, uint64_t committed_gen,
         for (ks_entry *e = ks->head; e; e = e->next, i++) {
             encode_key(e->dataset_id, e->key_id, keybufs[i]);
             size_t vlen = KS_VAL_HDR_LEN + e->wrapped_len;
-            encode_val(e->state, e->wrapped, e->wrapped_len, valbuf + voff);
+            encode_val(e->state, e->wrapper, e->wrapped, e->wrapped_len,
+                         valbuf + voff);
             entries[i].key       = keybufs[i];
             entries[i].key_len   = 16;
             entries[i].value     = valbuf + voff;
@@ -492,11 +518,16 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
                                           uint64_t dataset_id,
                                           uint64_t key_id,
                                           stm_keyschema_state state,
+                                          stm_keyschema_wrapper wrapper,
                                           const void *wrapped, size_t wrapped_len)
 {
     if (!ks) return STM_EINVAL;
     if (wrapped_len > 0 && !wrapped) return STM_EINVAL;
     if (wrapped_len > STM_KEYSCHEMA_WRAPPED_MAX) return STM_ERANGE;
+    if (wrapper != STM_KS_WRAPPER_LEGACY &&
+        wrapper != STM_KS_WRAPPER_PASSPHRASE &&
+        wrapper != STM_KS_WRAPPER_JANUS &&
+        wrapper != STM_KS_WRAPPER_CORVUS) return STM_EINVAL;
     /* R12 P2-4: the public insert path is narrowed to CURRENT only.
      * RETIRED / PRUNING transitions go through stm_keyschema_rotate /
      * _mark_pruning (both of which enforce the legal state machine
@@ -526,6 +557,7 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
         existing->wrapped     = new_wrapped;
         existing->wrapped_len = wrapped_len;
         existing->state       = state;
+        existing->wrapper     = wrapper;
         ks->dirty = true;
         return STM_OK;
     }
@@ -536,6 +568,7 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
     e->dataset_id  = dataset_id;
     e->key_id      = key_id;
     e->state       = state;
+    e->wrapper     = wrapper;
     e->wrapped_len = wrapped_len;
     if (wrapped_len > 0) {
         e->wrapped = malloc(wrapped_len);
@@ -552,6 +585,7 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
 stm_status stm_keyschema_lookup(const stm_keyschema *ks,
                                   uint64_t dataset_id, uint64_t key_id,
                                   stm_keyschema_state *out_state,
+                                  stm_keyschema_wrapper *out_wrapper,
                                   void *out_wrapped, size_t out_cap,
                                   size_t *out_len)
 {
@@ -560,8 +594,9 @@ stm_status stm_keyschema_lookup(const stm_keyschema *ks,
         int c = entry_cmp(e->dataset_id, e->key_id, dataset_id, key_id);
         if (c > 0) break;
         if (c < 0) continue;
-        if (out_state) *out_state = e->state;
-        if (out_len)   *out_len   = e->wrapped_len;
+        if (out_state)   *out_state   = e->state;
+        if (out_wrapper) *out_wrapper = e->wrapper;
+        if (out_len)     *out_len     = e->wrapped_len;
         if (out_wrapped) {
             if (out_cap < e->wrapped_len) return STM_ERANGE;
             memcpy(out_wrapped, e->wrapped, e->wrapped_len);
@@ -574,6 +609,7 @@ stm_status stm_keyschema_lookup(const stm_keyschema *ks,
 stm_status stm_keyschema_lookup_current(const stm_keyschema *ks,
                                           uint64_t dataset_id,
                                           uint64_t *out_key_id,
+                                          stm_keyschema_wrapper *out_wrapper,
                                           void *out_wrapped, size_t out_cap,
                                           size_t *out_len)
 {
@@ -589,6 +625,7 @@ stm_status stm_keyschema_lookup_current(const stm_keyschema *ks,
     }
     if (!found) return STM_ENOENT;
     if (out_key_id) *out_key_id = found->key_id;
+    if (out_wrapper) *out_wrapper = found->wrapper;
     if (out_len)    *out_len    = found->wrapped_len;
     if (out_wrapped) {
         if (out_cap < found->wrapped_len) return STM_ERANGE;
@@ -640,12 +677,17 @@ stm_status stm_keyschema_next_key_id(const stm_keyschema *ks,
 stm_status stm_keyschema_rotate(stm_keyschema *ks,
                                   uint64_t dataset_id,
                                   uint64_t new_key_id,
+                                  stm_keyschema_wrapper wrapper,
                                   const void *wrapped, size_t wrapped_len,
                                   uint64_t *out_old_key_id)
 {
     if (!ks || !out_old_key_id) return STM_EINVAL;
     if (wrapped_len == 0 || !wrapped) return STM_EINVAL;
     if (wrapped_len > STM_KEYSCHEMA_WRAPPED_MAX) return STM_ERANGE;
+    if (wrapper != STM_KS_WRAPPER_LEGACY &&
+        wrapper != STM_KS_WRAPPER_PASSPHRASE &&
+        wrapper != STM_KS_WRAPPER_JANUS &&
+        wrapper != STM_KS_WRAPPER_CORVUS) return STM_EINVAL;
 
     /* Strict monotonicity: caller must pass the expected next id. A
      * mismatch indicates a lost-update race or buggy caller; either
@@ -673,6 +715,7 @@ stm_status stm_keyschema_rotate(stm_keyschema *ks,
     new_entry->dataset_id  = dataset_id;
     new_entry->key_id      = new_key_id;
     new_entry->state       = STM_KS_STATE_CURRENT;
+    new_entry->wrapper     = wrapper;
     new_entry->wrapped_len = wrapped_len;
     new_entry->wrapped     = malloc(wrapped_len);
     if (!new_entry->wrapped) {

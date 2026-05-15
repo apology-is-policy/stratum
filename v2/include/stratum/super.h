@@ -400,8 +400,29 @@ extern "C" {
  * guards on name_len + value_len mirror decoder-side guards (R71
  * P1-1 + R77 P1-1 lesson — the OOB-read shape extends from inline
  * data to xattr value records). v25 pools refused at v26 mount via
- * uniform STM_EBADVERSION. */
-#define STM_UB_VERSION        26u
+ * uniform STM_EBADVERSION.
+ *
+ * v26 → v27 bump (TLY-A3-keyslot): NO uberblock field change — the
+ * bump versions the keyschema sub-tree entry-value SEMANTICS. Byte
+ * [2] of each keyschema entry value (state(1) || flags(1) ||
+ * wrapper_identity(1) || reserved(5) || wrapped) was previously part
+ * of a 6-byte reserved block written zero; it now carries the
+ * `wrapper_identity` tag (STM_KS_WRAPPER_{LEGACY,PASSPHRASE,JANUS,
+ * CORVUS} — see keyschema.h). The on-disk layout is byte-identical
+ * (reserved → meaningful; KS_VAL_HDR_LEN stays 8), so the change is
+ * forward/backward COMPATIBLE at the byte level. The bump exists
+ * for the SEMANTIC break: a pre-TLY-A3 binary has no wrapper_identity
+ * concept and would misroute a CORVUS-wrapped keyslot through its
+ * keyfile/janus unwrap path. The exact-match SB version check
+ * (`version != STM_UB_VERSION` → STM_EBADVERSION) makes a v26 binary
+ * refuse a v27 pool outright — strictly stronger than an incompat
+ * feature flag, and the only refusal mechanism the v2 tree uses
+ * (the ub_flags_* fields remain vestigial; every prior bump was a
+ * full version bump, "no feature flag"). v26 pools refused at v27
+ * mount via uniform STM_EBADVERSION. Precedent for a version bump
+ * driven by a sub-tree value-format change rather than a UB field:
+ * the v17 → v18 value-layer bump. */
+#define STM_UB_VERSION        27u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

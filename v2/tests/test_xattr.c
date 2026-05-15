@@ -21,7 +21,7 @@
  *     tombstones surviving the persistence path.
  *   - Probe-only / range-truncation getxattr shapes (POSIX getxattr(2)).
  *   - Drop-for-ino.
- *   - On-disk layout sanity: STM_UB_VERSION compile-time at 26.
+ *   - On-disk layout sanity: STM_UB_VERSION compile-time at 27.
  */
 #include "tharness.h"
 
@@ -608,9 +608,11 @@ STM_TEST(xattr_persist_value_with_max_size_roundtrip) {
 /* Compile-time invariants.                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(xattr_ub_version_is_v26) {
-    /* P8-POSIX-6 introduces the xattr tree, bumping STM_UB_VERSION to 26. */
-    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)26u);
+STM_TEST(xattr_ub_version_is_v27) {
+    /* TLY-A3-keyslot bumps STM_UB_VERSION 26 → 27 for the keyschema
+     * entry `wrapper_identity` byte. The xattr layer is unchanged
+     * since v26 but rides the latest version constant. */
+    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)27u);
 }
 
 /* ------------------------------------------------------------------ */
