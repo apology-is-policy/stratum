@@ -109,6 +109,8 @@ target_link_libraries(test_proxy_9p PRIVATE stm_stratumd)
 stm_add_test(test_corvus_client test_corvus_client.c)
 target_link_libraries(test_corvus_client PRIVATE stm_corvus_client)
 stm_add_test(test_corvus_mount test_corvus_mount.c)
+stm_add_test(test_corvus_provision test_corvus_provision.c test_fs_common.c)
+target_link_libraries(test_corvus_provision PRIVATE stm_stratumd)
 stm_add_test(test_multi_stratumd_crash test_multi_stratumd_crash.c test_fs_common.c)
 set_tests_properties(test_multi_stratumd_crash PROPERTIES
     ENVIRONMENT "STM_STRATUMD_BIN=$<TARGET_FILE:stratumd>"

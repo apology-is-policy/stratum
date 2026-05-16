@@ -132,8 +132,10 @@ The envelope itself is produced by the corvus WRAP verb —
 the provisioning-time counterpart of `stm_corvus_unwrap`. The
 sync-layer flow that calls it, generates the DEK, and writes the
 resulting `CORVUS` slot is `stm_sync_add_dataset_key_corvus`
-(chunk 5a — see [07-sb-sync.md](07-sb-sync.md)); the operator-facing
-stratumd CLI that drives it lands in chunk 5b.
+(see [07-sb-sync.md](07-sb-sync.md)); `stm_fs_create_dataset_corvus`
+is the fs-layer wrapper, and the one-shot
+`stratumd --provision-corvus-dataset` CLI is the operator surface
+(see [21-stratumd.md](21-stratumd.md)).
 See `v2/docs/thylacine-keyslot-wrap-design.md`.
 
 ### Mount-time unwrap routing (TLY-A3-keyslot-impl-3b)

@@ -289,6 +289,23 @@ typedef struct stm_stratumd_opts {
      * blocks. NULL is allowed: the loop runs until accept() returns
      * an unrecoverable error. */
     atomic_bool *stop_flag;
+
+    /* TLY-A3-keyslot-wrap (chunk 5b): one-shot corvus-dataset
+     * provisioning mode. When `provision_corvus` is true,
+     * stm_stratumd_run does NOT serve — it mounts opts->fs_path,
+     * creates a corvus-encrypted dataset (stm_fs_create_dataset_corvus
+     * + stm_fs_init_dataset_root), unmounts (the unmount's final
+     * commit makes the new dataset + its CORVUS keyslot durable), and
+     * returns. Requires `provision_dataset_name`,
+     * `provision_corvus_path`, and `corvus_session_token_file` (the
+     * WRAP needs a token); `corvus_unwrap_socket` is optional (NULL →
+     * the corvus client default). `read_only` and `ctl_socket_path`
+     * are refused in this mode. Default (provision_corvus == false) =
+     * the normal serving daemon. */
+    bool        provision_corvus;
+    const char *provision_dataset_name;   /* Stratum dataset name */
+    const char *provision_corvus_path;    /* corvus AEAD-AD identity path */
+    uint64_t    provision_parent;         /* parent dataset id (0 → root 1) */
 } stm_stratumd_opts;
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -308,6 +325,13 @@ typedef struct stm_stratumd_opts {
  *
  * Blocks for the lifetime of the daemon. Tests MAY call this in a
  * worker pthread and signal stop_flag from the controlling thread.
+ *
+ * Two non-serving modes branch off before the listen step:
+ *   - `client_mode` — a per-user 9P proxy to a coordinator stratumd.
+ *   - `provision_corvus` (TLY-A3-keyslot-wrap) — a one-shot:
+ *     mount → create a corvus-encrypted dataset → unmount → return.
+ *     Binds no socket; does not block. Returns STM_OK once the new
+ *     dataset + its CORVUS keyslot are durable.
  */
 STM_MUST_USE
 stm_status stm_stratumd_run(const stm_stratumd_opts *opts);

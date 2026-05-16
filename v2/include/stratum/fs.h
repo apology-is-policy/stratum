@@ -44,6 +44,7 @@
 #include <stratum/dataset.h>     /* stm_property (P7-CAS-13) */
 #include <stratum/alloc.h>       /* stm_alloc_stats (P9-CTL-1d-debug) */
 #include <stratum/dirent.h>      /* STM_DIRENT_NAME_MAX, STM_DT_* (P8-POSIX-4) */
+#include <stratum/sync.h>        /* stm_corvus_mount_cfg (TLY-A3-keyslot-wrap) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -1362,6 +1363,54 @@ STM_MUST_USE
 stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
                                     const char *name,
                                     uint64_t *out_id);
+
+/*
+ * TLY-A3-keyslot-wrap: create a corvus-encrypted dataset — the
+ * provisioning-time counterpart of stm_fs_create_dataset.
+ *
+ * Composes stm_dataset_create_child + stm_sync_add_dataset_key_corvus
+ * under fs->global so the FS observer never sees a half-created
+ * dataset; on key-provisioning failure the dataset_create_child is
+ * rolled back via stm_dataset_destroy (same posture as
+ * stm_fs_create_dataset).
+ *
+ * Unlike stm_fs_create_dataset, this does NOT use the mount-time
+ * keyfile / janus wrap source: the new dataset's DEK is sealed by the
+ * corvus key agent (a CORVUS-tagged keyschema slot), not wrapped under
+ * the pool's local hybrid pair. The corvus config — socket + the
+ * 33-byte session token — is supplied per call via `corvus`. The
+ * token is BORROWED: it must stay valid (and SHOULD be mlock'd) for
+ * the duration of this call; it is not referenced after. Both
+ * `corvus` and `corvus->session_token` MUST be non-NULL — a WRAP
+ * needs a token.
+ *
+ * `corvus_dataset_path` is corvus's stable AEAD-AD-bound identity for
+ * the dataset (STRATUM-API-V1.md §5.10) — REQUIRED, length
+ * 1..STM_KEYSCHEMA_CORVUS_PATH_MAX (255). It is recorded verbatim in
+ * the keyschema slot so a later mount sends corvus the same binding.
+ * It is distinct from `name` (the dataset's name in the Stratum
+ * namespace); the two are independent strings.
+ *
+ * Like stm_fs_create_dataset this creates ONLY the dataset entry +
+ * its key — the dataset's root inode is NOT initialized. A caller
+ * that wants an immediately-attachable dataset must follow with
+ * stm_fs_init_dataset_root.
+ *
+ * Returns STM_OK with `*out_id` set. STM_EINVAL (NULL fs / name /
+ * corvus_dataset_path / corvus / out_id), STM_EWEDGED, STM_EROFS at
+ * the entry; errors propagate from stm_dataset_create_child (bad
+ * parent, name collision, ...) and stm_sync_add_dataset_key_corvus
+ * (bad path / missing token / STM_ECORVUS* / STM_EBACKEND on a WRAP
+ * failure). On any post-create_child failure the dataset entry is
+ * rolled back; the index is never left with an orphan dataset.
+ */
+STM_MUST_USE
+stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
+                                           const char *name,
+                                           const char *corvus_dataset_path,
+                                           size_t corvus_dataset_path_len,
+                                           const stm_corvus_mount_cfg *corvus,
+                                           uint64_t *out_id);
 
 /*
  * P9-9P-1a: initialize a freshly-created dataset's root inode.

@@ -295,8 +295,10 @@ an opaque envelope bound to `corvus_path`, stores the envelope as a
 `STM_KS_WRAPPER_CORVUS` keyschema slot with the path recorded, and
 installs the live DEK. A later mount resolves the slot over the
 corvus UNWRAP verb (`sync_unwrap_cb`). Strictly "new dataset" — same
-`STM_EEXIST` posture as `_add_dataset_key`. The operator-facing
-stratumd CLI that drives it lands in chunk 5b.
+`STM_EEXIST` posture as `_add_dataset_key`.
+`stm_fs_create_dataset_corvus` is the fs-layer wrapper; the one-shot
+`stratumd --provision-corvus-dataset` CLI is the operator surface
+(see [21-stratumd.md](21-stratumd.md)).
 
 ### Scrub + device-lifecycle composition
 

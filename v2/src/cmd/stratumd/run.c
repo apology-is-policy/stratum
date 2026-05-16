@@ -174,7 +174,23 @@ static void usage(const char *argv0)
             "                           refuses every aname. Pattern + aname are\n"
             "                           each bounded at 256 bytes; longer anames\n"
             "                           (spec:/abs forms) are refused under\n"
-            "                           policy enforcement (R139 P2-1).\n"
+            "                           policy enforcement (R139 P2-1).\n");
+    /* Third fprintf — TLY-A3-keyslot-wrap provisioning flags. Kept in
+     * its own literal so the concatenated string stays under the C99
+     * 4095-byte minimum (-Woverlength-strings). */
+    fprintf(stderr,
+        "  --provision-corvus-dataset <name>\n"
+        "                           One-shot: mount <fs-path>, create a\n"
+        "                           corvus-encrypted dataset named <name>,\n"
+        "                           then exit (no serving). Requires\n"
+        "                           --corvus-dataset-path +\n"
+        "                           --corvus-session-token-file "
+            "(TLY-A3-keyslot-wrap).\n"
+        "  --corvus-dataset-path <path>\n"
+        "                           corvus's AEAD-AD identity for the\n"
+        "                           provisioned dataset (e.g. users/<name>).\n"
+        "  --provision-parent <id>  Parent dataset id for the provisioned\n"
+        "                           dataset (default: 1, the root dataset).\n"
         "  -h, --help               This message\n");
 }
 
@@ -402,6 +418,34 @@ int stm_cmd_stratumd_main(int argc, char **argv)
             opts.corvus_session_token_file = argv[++i];
             continue;
         }
+        if (!strcmp(a, "--provision-corvus-dataset") && i + 1 < argc) {
+            /* TLY-A3-keyslot-wrap (5b): enters the one-shot
+             * provisioning mode; the value is the new dataset's
+             * Stratum-namespace name. */
+            opts.provision_corvus       = true;
+            opts.provision_dataset_name = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--corvus-dataset-path") && i + 1 < argc) {
+            opts.provision_corvus_path = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--provision-parent") && i + 1 < argc) {
+            char *end = NULL;
+            unsigned long long v = strtoull(argv[++i], &end, 10);
+            if (!end || *end != '\0' || v == 0ull
+                || v > (unsigned long long)STM_SYNC_DATASET_ID_MAX) {
+                fprintf(stderr,
+                    "stratumd: invalid --provision-parent: %s "
+                    "(must be in [1, %llu])\n",
+                    argv[i],
+                    (unsigned long long)STM_SYNC_DATASET_ID_MAX);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            opts.provision_parent = (uint64_t)v;
+            continue;
+        }
         if (!strcmp(a, "--corvus-admin-uid") && i + 1 < argc) {
             /* TLY-A5-impl-1c: the corvus-principal uid admitted by
              * the mark-snapshot-compromised /ctl/ verb (alongside
@@ -585,6 +629,22 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         stm_ds_policy_table_close(&user_policy_table);
         return 1;
     }
+    /* TLY-A3-keyslot-wrap (5b): the one-shot provisioning mode mounts
+     * a filesystem; --role client does not. Mutually exclusive —
+     * refuse loudly rather than silently picking one (the dispatch in
+     * stm_stratumd_run would otherwise take the client branch and
+     * ignore provisioning). The remaining provision-mode arg-shape
+     * checks (required --corvus-dataset-path / token-file, refused
+     * --read-only / --ctl-listen) are enforced in stratumd_run_provision
+     * with explicit stderr lines — same posture as stratumd_run_client. */
+    if (opts.client_mode && opts.provision_corvus) {
+        fprintf(stderr,
+            "stratumd: --provision-corvus-dataset is incompatible with "
+            "--role client (provisioning mounts a filesystem; client "
+            "mode does not)\n");
+        stm_ds_policy_table_close(&user_policy_table);
+        return 1;
+    }
     /* R140 P2-4 close: refuse client mode with empty allowlist
      * unless explicitly opted in. The opt-in keeps the test +
      * non-Thylacine paths working. */
@@ -658,6 +718,15 @@ int stm_cmd_stratumd_main(int argc, char **argv)
                 opts.coordinator_socket_path
                     ? opts.coordinator_socket_path : "(MISSING)",
                 opts.backlog, opts.msize_max, n_datasets_allowed);
+    } else if (opts.provision_corvus) {
+        fprintf(stderr,
+                "stratumd: provisioning corvus dataset '%s' in %s "
+                "(corvus-path '%s')\n",
+                opts.provision_dataset_name
+                    ? opts.provision_dataset_name : "(MISSING)",
+                opts.fs_path,
+                opts.provision_corvus_path
+                    ? opts.provision_corvus_path : "(MISSING)");
     } else {
         fprintf(stderr,
                 "stratumd: serving %s on %s (backlog=%d, msize=%u, "

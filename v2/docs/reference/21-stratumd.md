@@ -307,6 +307,36 @@ complementary gates:
   getpeereid; mismatch → close + STM_EBACKEND. Defense against
   socket-bind impersonation. Default-disabled for back-compat.
 
+## Corvus provisioning mode (TLY-A3-keyslot-wrap)
+
+When `opts->provision_corvus == true`, `stm_stratumd_run` dispatches
+to the internal `stratumd_run_provision` helper — a one-shot:
+mount → create a corvus-encrypted dataset → unmount → return. It
+binds no socket and does not block. The unmount's final
+`stm_sync_commit` is what makes the new dataset + its CURRENT
+`STM_KS_WRAPPER_CORVUS` keyslot durable.
+
+CLI: `--provision-corvus-dataset <name>` (the trigger + the new
+dataset's Stratum-namespace name), `--corvus-dataset-path <path>`
+(corvus's AEAD-AD identity, e.g. `users/<name>`), optional
+`--provision-parent <id>` (default 1, the root dataset). Requires
+the pool wrap source (`--keyfile` / `--janus-socket` /
+`--passphrase-stdin`) to mount, plus `--corvus-session-token-file`
+(the WRAP needs a token) and optionally `--corvus-socket`.
+
+`stratumd_run_provision` refuses-loud on misconfig (each its own
+stderr line): missing `--corvus-dataset-path` / token-file;
+`--read-only` (provisioning writes); `--ctl-listen` (one-shot
+serves nothing). The corvus dataset path is operator-supplied — its
+length is bounded (`STM_CORVUS_DATASET_MAX`) and control bytes are
+refused (R99 line-injection doctrine). Flow:
+`stm_fs_create_dataset_corvus` (compose dataset-table create +
+`stm_sync_add_dataset_key_corvus` WRAP, rollback on failure) →
+`stm_fs_init_dataset_root` (so the dataset is immediately
+attachable) → `stm_fs_unmount` (the durable commit). The 33-byte
+session token is loaded into an mlock'd buffer for the WRAP and
+`stm_ct_memzero`'d + freed before unmount.
+
 ## Tests
 
 - `tests/test_stratumd_ctl.c` — exercises the daemon end-to-end:
@@ -348,6 +378,7 @@ complementary gates:
 | TLY-A3-impl-2: corvus UNWRAP transport + retry | LIVE | `stm_corvus_unwrap_once` + `stm_corvus_unwrap` (Q9 backoff); raw AF_UNIX (`58a7253`) |
 | TLY-A3-keyslot-impl-3b: mount-time UNWRAP wiring + CLI | LIVE | `--corvus-socket` + `--corvus-session-token-file` → `stm_fs_mount_opts` → `stm_sync_open`'s `stm_corvus_mount_cfg`; `sync_unwrap_cb` routes `STM_KS_WRAPPER_CORVUS` slots |
 | TLY-A5-impl-1c: corvus-principal gate `--corvus-admin-uid` | LIVE | CLI → `stm_stratumd_opts.corvus_admin_uid` → `stm_ctl_set_corvus_admin_uid`; the `/ctl/` `mark-snapshot-compromised` verb admits that uid alongside admin (`unmark` stays strict-admin). Requires `--ctl-listen` |
+| TLY-A3-keyslot-wrap: one-shot `--provision-corvus-dataset` mode | LIVE | `stratumd_run_provision` → `stm_fs_create_dataset_corvus` (corvus WRAP) + `stm_fs_init_dataset_root`; non-serving; `test_corvus_provision.c` |
 
 The corvus UNWRAP client (`v2/src/corvus_client/`) is a standalone
 library, NOT part of stratumd's transport, but is listed here because

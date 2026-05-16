@@ -5685,6 +5685,72 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
     return STM_OK;
 }
 
+/*
+ * TLY-A3-keyslot-wrap: the corvus-encrypted-dataset creation path —
+ * the provisioning counterpart of stm_fs_create_dataset (see fs.h for
+ * the contract). Simpler than the sibling: no mount-time wrap source
+ * to load (the per-dataset DEK is sealed by corvus, supplied via the
+ * `corvus` cfg per call), so there is no keyfile / janus lifecycle to
+ * wind up + tear down. stm_sync_add_dataset_key_corvus performs the
+ * WRAP (a corvus network round-trip) under sync's lock; fs->global is
+ * held EX across it — the same posture stm_fs_create_dataset already
+ * has for the janus-wrap network round-trip, and dataset creation is
+ * a rare operation.
+ */
+stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
+                                           const char *name,
+                                           const char *corvus_dataset_path,
+                                           size_t corvus_dataset_path_len,
+                                           const stm_corvus_mount_cfg *corvus,
+                                           uint64_t *out_id)
+{
+    if (!fs || !name || !corvus_dataset_path || !corvus || !out_id)
+        return STM_EINVAL;
+    /* Path-length + token-presence validation is delegated to
+     * stm_sync_add_dataset_key_corvus, which refuses STM_EINVAL on a
+     * zero-length / oversize path or a NULL session_token. */
+
+    pthread_rwlock_wrlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        /* sync_open always populates the dataset index; a NULL here
+         * means sync-internal corruption — surface it rather than
+         * dereferencing. */
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ECORRUPT;
+    }
+
+    uint64_t new_id = 0;
+    stm_status s = stm_dataset_create_child(didx, parent_id, name, &new_id);
+    if (s != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return s;
+    }
+
+    uint64_t new_kid = 0;
+    s = stm_sync_add_dataset_key_corvus(fs->sync, new_id,
+                                           corvus_dataset_path,
+                                           corvus_dataset_path_len,
+                                           corvus, &new_kid);
+    if (s != STM_OK) {
+        /* Roll back the freshly-created leaf. Infallible for a
+         * non-root, no-children, PRESENT id minted under fs->global
+         * (the dataset module's three documented destroy failure
+         * modes — root-id, not-PRESENT, has-children — are all
+         * unreachable here); same argument as stm_fs_create_dataset's
+         * R45 P3-2 rollback. */
+        (void)stm_dataset_destroy(didx, new_id);
+        pthread_rwlock_unlock(&fs->global);
+        return s;
+    }
+
+    *out_id = new_id;
+    pthread_rwlock_unlock(&fs->global);
+    return STM_OK;
+}
+
 /* ========================================================================= */
 /* Dataset property wrappers (P7-CAS-13).                                     */
 /*                                                                            */

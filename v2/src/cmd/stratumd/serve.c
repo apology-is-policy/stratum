@@ -19,6 +19,8 @@
 #include "proxy_9p.h"
 
 #include <stratum/9p.h>
+#include <stratum/corvus_client.h>
+#include <stratum/crypto.h>
 #include <stratum/ctl.h>
 #include <stratum/fs.h>
 #include <stratum/lp9.h>
@@ -1173,6 +1175,186 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
     return rc;
 }
 
+/* TLY-A3-keyslot-wrap (chunk 5b): the one-shot corvus-dataset
+ * provisioning mode. Unlike stm_stratumd_run's serving path this binds
+ * no socket and does not block — it mounts opts->fs_path, creates a
+ * corvus-encrypted dataset (stm_fs_create_dataset_corvus +
+ * stm_fs_init_dataset_root), and unmounts. stm_fs_unmount's final
+ * stm_sync_commit is what makes the new dataset + its CORVUS keyslot
+ * durable; its return value IS that commit's status.
+ *
+ * Refusals on misconfig (each its own stderr line — same posture as
+ * stratumd_run_client): --corvus-dataset-path required + bounded +
+ * control-byte-free; --corvus-session-token-file required (a WRAP
+ * needs a token); --read-only refused (provisioning writes);
+ * --ctl-listen refused (one-shot, nothing to serve). */
+static stm_status stratumd_run_provision(const stm_stratumd_opts *opts)
+{
+    if (!opts->provision_dataset_name || !*opts->provision_dataset_name) {
+        fprintf(stderr,
+            "stratumd: --provision-corvus-dataset requires a "
+            "non-empty dataset name\n");
+        return STM_EINVAL;
+    }
+    if (!opts->provision_corvus_path || !*opts->provision_corvus_path) {
+        fprintf(stderr,
+            "stratumd: --provision-corvus-dataset requires "
+            "--corvus-dataset-path <path>\n");
+        return STM_EINVAL;
+    }
+    if (!opts->corvus_session_token_file) {
+        fprintf(stderr,
+            "stratumd: --provision-corvus-dataset requires "
+            "--corvus-session-token-file (the WRAP needs a session "
+            "token)\n");
+        return STM_EINVAL;
+    }
+    if (opts->read_only) {
+        fprintf(stderr,
+            "stratumd: --provision-corvus-dataset is incompatible "
+            "with --read-only (provisioning writes a new dataset)\n");
+        return STM_EINVAL;
+    }
+    if (opts->ctl_socket_path) {
+        fprintf(stderr,
+            "stratumd: --provision-corvus-dataset does not accept "
+            "--ctl-listen (one-shot mode serves nothing)\n");
+        return STM_EINVAL;
+    }
+
+    /* The corvus dataset path is operator-supplied; bound its length
+     * and refuse control bytes (R99 P2-1 line-injection doctrine —
+     * the path flows into the keyschema slot, the corvus wire, and
+     * potentially /ctl/events). UTF-8 multi-byte (>= 0x80) passes. */
+    size_t path_len = strlen(opts->provision_corvus_path);
+    if (path_len == 0u || path_len > STM_CORVUS_DATASET_MAX) {
+        fprintf(stderr,
+            "stratumd: --corvus-dataset-path length %zu out of range "
+            "(must be 1..%u)\n",
+            path_len, (unsigned)STM_CORVUS_DATASET_MAX);
+        return STM_EINVAL;
+    }
+    for (size_t k = 0; k < path_len; k++) {
+        unsigned char c = (unsigned char)opts->provision_corvus_path[k];
+        if (c < 0x20u || c == 0x7Fu) {
+            fprintf(stderr,
+                "stratumd: --corvus-dataset-path contains a control "
+                "byte at offset %zu (refused)\n", k);
+            return STM_EINVAL;
+        }
+    }
+
+    /* Mount the pool. corvus_socket + token are forwarded so any
+     * pre-existing CORVUS slots resolve at mount; a freshly-formatted
+     * pool has only LEGACY slots and the forward is harmless. */
+    stm_fs_mount_opts mopts = {
+        .read_only              = false,
+        .keyfile_path           = opts->keyfile_path,
+        .janus_socket           = opts->janus_socket,
+        .keyfile_passphrase     = opts->keyfile_passphrase,
+        .keyfile_passphrase_len = opts->keyfile_passphrase_len,
+        .expected_pool_serial   = opts->bind_pool_serial
+                                    ? opts->pool_serial : NULL,
+        .corvus_socket             = opts->corvus_unwrap_socket,
+        .corvus_session_token_file = opts->corvus_session_token_file,
+    };
+    stm_fs *fs = NULL;
+    stm_status rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
+    if (rc != STM_OK) {
+        fprintf(stderr,
+            "stratumd: provisioning: mount of %s failed (rc=%d)\n",
+            opts->fs_path, (int)rc);
+        return rc;
+    }
+
+    /* Load the 33-byte corvus session token for the WRAP. stm_fs_mount
+     * already consumed + scrubbed its own copy (for mount-time
+     * UNWRAP); the WRAP needs its own. mlock'd heap buffer (per
+     * stm_corvus_load_token's contract); scrubbed + freed before
+     * return. */
+    uint8_t *token = malloc(STM_CORVUS_TOKEN_LEN);
+    if (!token) {
+        (void)stm_fs_unmount(fs);
+        return STM_ENOMEM;
+    }
+    rc = stm_corvus_load_token(opts->corvus_session_token_file, token);
+    if (rc != STM_OK) {
+        fprintf(stderr,
+            "stratumd: provisioning: failed to load corvus session "
+            "token from %s (rc=%d)\n",
+            opts->corvus_session_token_file, (int)rc);
+        stm_ct_memzero(token, STM_CORVUS_TOKEN_LEN);
+        free(token);
+        (void)stm_fs_unmount(fs);
+        return rc;
+    }
+
+    stm_corvus_mount_cfg cc = {
+        .socket_path   = opts->corvus_unwrap_socket,
+        .session_token = token,
+        /* timeouts 0 → the corvus client substitutes a production-safe
+         * default (R144 P2-1); n_retries 0 → single attempt. */
+    };
+
+    uint64_t parent = opts->provision_parent != 0u
+                          ? opts->provision_parent : 1u;
+    uint64_t new_id = 0;
+    rc = stm_fs_create_dataset_corvus(fs, parent,
+                                         opts->provision_dataset_name,
+                                         opts->provision_corvus_path,
+                                         path_len, &cc, &new_id);
+    if (rc == STM_OK) {
+        /* Initialize the new dataset's root inode so the provisioned
+         * dataset is immediately attachable. mode 0755, owned by the
+         * daemon's effective uid/gid (the operator running the
+         * provision). v1.0 limitation: if this fails after the
+         * dataset was created, stm_fs_unmount's final commit still
+         * persists the keyed-but-rootless dataset — a retry with the
+         * same name then refuses STM_EEXIST (no silent corruption).
+         * init_dataset_root failure on a fresh dataset is ENOMEM /
+         * ECORRUPT only — catastrophic + rare. */
+        uint64_t root_ino = 0;
+        rc = stm_fs_init_dataset_root(fs, new_id, 0755u,
+                                         (uint32_t)geteuid(),
+                                         (uint32_t)getegid(),
+                                         &root_ino);
+        if (rc != STM_OK) {
+            fprintf(stderr,
+                "stratumd: provisioning: dataset %llu created but "
+                "root-inode init failed (rc=%d)\n",
+                (unsigned long long)new_id, (int)rc);
+        }
+    } else {
+        fprintf(stderr,
+            "stratumd: provisioning: create corvus dataset '%s' "
+            "failed (rc=%d)\n",
+            opts->provision_dataset_name, (int)rc);
+    }
+
+    /* The token is no longer needed — scrub + free before unmount. */
+    stm_ct_memzero(token, STM_CORVUS_TOKEN_LEN);
+    free(token);
+
+    /* Unmount. For a mutable handle this performs the final
+     * stm_sync_commit that makes the new dataset + CORVUS keyslot
+     * durable; its return value IS that commit's status. */
+    stm_status urc = stm_fs_unmount(fs);
+
+    if (rc != STM_OK) return rc;       /* provisioning op failed */
+    if (urc != STM_OK) {
+        fprintf(stderr,
+            "stratumd: provisioning: final commit failed (rc=%d)\n",
+            (int)urc);
+        return urc;
+    }
+    fprintf(stderr,
+        "stratumd: provisioned corvus dataset '%s' (id=%llu, "
+        "corvus-path '%s')\n",
+        opts->provision_dataset_name, (unsigned long long)new_id,
+        opts->provision_corvus_path);
+    return STM_OK;
+}
+
 stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
 {
     if (!opts || !opts->socket_path)
@@ -1184,6 +1366,12 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
     if (opts->client_mode) return stratumd_run_client(opts);
 
     if (!opts->fs_path) return STM_EINVAL;
+
+    /* TLY-A3-keyslot-wrap (5b): one-shot corvus-dataset provisioning —
+     * mounts, creates the dataset, unmounts; binds no socket and does
+     * not block. Branches before the serving mount-opts build below
+     * (stratumd_run_provision builds its own). */
+    if (opts->provision_corvus) return stratumd_run_provision(opts);
 
     stm_fs_mount_opts mopts = {
         .read_only             = opts->read_only,
