@@ -275,16 +275,28 @@ protocol details.
 ### Per-dataset keys
 
 ```c
-stm_status stm_sync_add_dataset_key    (s, dataset_id, wk_or_janus, &new_key_id);
-stm_status stm_sync_rotate_dataset_key (s, dataset_id, wk_or_janus, &new_key_id, &old_key_id);
-stm_status stm_sync_keyschema_sweep    (s, dataset_id, &pruned_count);
-stm_status stm_sync_get_dek            (s, dataset_id, key_id, dek_out[32]);
-size_t     stm_sync_dek_count          (const stm_sync *s);
+stm_status stm_sync_add_dataset_key       (s, dataset_id, wk_or_janus, &new_key_id);
+stm_status stm_sync_add_dataset_key_corvus(s, dataset_id, corvus_path, path_len,
+                                           corvus_cfg, &new_key_id);
+stm_status stm_sync_rotate_dataset_key    (s, dataset_id, wk_or_janus, &new_key_id, &old_key_id);
+stm_status stm_sync_keyschema_sweep       (s, dataset_id, &pruned_count);
+stm_status stm_sync_get_dek               (s, dataset_id, key_id, dek_out[32]);
+size_t     stm_sync_dek_count             (const stm_sync *s);
 ```
 
 `wk_or_janus` is a union — exactly one must be non-NULL. `wk` is
 the in-process keyfile path; `janus` routes through the remote
 unwrap daemon (see [janus](#janus-interaction) below).
+
+`stm_sync_add_dataset_key_corvus` (TLY-A3-keyslot-wrap chunk 5a) is
+the corvus provisioning variant of `_add_dataset_key`: it generates a
+fresh DEK, seals it via the corvus WRAP verb (`stm_corvus_wrap`) into
+an opaque envelope bound to `corvus_path`, stores the envelope as a
+`STM_KS_WRAPPER_CORVUS` keyschema slot with the path recorded, and
+installs the live DEK. A later mount resolves the slot over the
+corvus UNWRAP verb (`sync_unwrap_cb`). Strictly "new dataset" — same
+`STM_EEXIST` posture as `_add_dataset_key`. The operator-facing
+stratumd CLI that drives it lands in chunk 5b.
 
 ### Scrub + device-lifecycle composition
 
@@ -350,7 +362,7 @@ atomically so add / attach / commit / detach composes in one step.
 - [x] Content-quorum agreement check (R14).
 - [x] Mount-claim + MountGenBump.
 - [x] Attach-alloc + reserve-mirror + mirror_write + mirror_read.
-- [x] Per-dataset key add / rotate / sweep / get_dek.
+- [x] Per-dataset key add / corvus-provision / rotate / sweep / get_dek.
 - [x] Device-lifecycle composition (evac / remove / replace / fail / rejoin).
 - [x] Wedge + read-only guards.
 - [x] Per-pool rwlock composition (P5-4b-ii-β).

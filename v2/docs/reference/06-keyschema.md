@@ -129,9 +129,11 @@ the recorded path back; `sync_unwrap_cb` uses it so the UNWRAP sends
 corvus the WRAP-recorded binding (`key_schema.tla::UnwrapUsesWrapBinding`).
 The envelope itself is produced by the corvus WRAP verb —
 `stm_corvus_wrap` in `corvus_client` (TLY-A3-keyslot-wrap chunk 4),
-the provisioning-time counterpart of `stm_corvus_unwrap`; the
-keyschema-side provisioning flow that calls it and writes the
-resulting `CORVUS` slot lands in a following chunk.
+the provisioning-time counterpart of `stm_corvus_unwrap`. The
+sync-layer flow that calls it, generates the DEK, and writes the
+resulting `CORVUS` slot is `stm_sync_add_dataset_key_corvus`
+(chunk 5a — see [07-sb-sync.md](07-sb-sync.md)); the operator-facing
+stratumd CLI that drives it lands in chunk 5b.
 See `v2/docs/thylacine-keyslot-wrap-design.md`.
 
 ### Mount-time unwrap routing (TLY-A3-keyslot-impl-3b)

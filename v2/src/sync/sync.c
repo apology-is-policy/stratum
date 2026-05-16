@@ -4191,6 +4191,125 @@ stm_status stm_sync_add_dataset_key(stm_sync *s,
     return STM_OK;
 }
 
+/* TLY-A3-keyslot-wrap: the corvus WRAP provisioning path. The
+ * production counterpart of stm_sync_add_dataset_key for a
+ * corvus-encrypted dataset — see sync.h for the contract. Mirrors the
+ * sibling's structure (validate -> lock -> wedged/RO -> next_key_id ->
+ * pre-grow the DEK map -> generate+seal -> insert slot -> install DEK)
+ * with the keyfile/janus wrap swapped for stm_corvus_wrap. */
+stm_status stm_sync_add_dataset_key_corvus(stm_sync *s,
+                                             uint64_t dataset_id,
+                                             const char *corvus_dataset_path,
+                                             size_t corvus_dataset_path_len,
+                                             const stm_corvus_mount_cfg *corvus,
+                                             uint64_t *out_new_key_id)
+{
+    /* TLY-A3-keyslot-wrap cross-header invariants this function leans
+     * on: the corvus envelope is stored verbatim as the keyschema
+     * slot's `wrapped` blob, and the corvus dataset path travels both
+     * the corvus wire and the keyschema slot. The two cap pairs must
+     * agree; pin them at compile time (corvus_client.h forward-noted
+     * the first assert's home here). */
+    _Static_assert(STM_CORVUS_ENVELOPE_MAX == STM_KEYSCHEMA_WRAPPED_MAX,
+                   "corvus envelope cap must equal keyschema wrapped cap");
+    _Static_assert(STM_CORVUS_DATASET_MAX == STM_KEYSCHEMA_CORVUS_PATH_MAX,
+                   "corvus wire dataset-path cap must equal keyschema path cap");
+
+    if (!s || !corvus_dataset_path || !corvus || !out_new_key_id)
+        return STM_EINVAL;
+    /* A WRAP needs a session token and a real dataset-path binding —
+     * unlike UNWRAP/legacy add, a zero-length path is meaningless. */
+    if (!corvus->session_token) return STM_EINVAL;
+    if (corvus_dataset_path_len == 0
+        || corvus_dataset_path_len > STM_KEYSCHEMA_CORVUS_PATH_MAX)
+        return STM_EINVAL;
+    /* ds=0 is reserved for the pool metadata key (installed by
+     * stm_sync_create). Symmetric with stm_sync_add_dataset_key. */
+    if (dataset_id == STM_SYNC_POOL_DATASET_ID) return STM_EINVAL;
+    /* R12 P2-3: cap dataset_id at janus's qid-path field (28 bits) —
+     * symmetric with stm_sync_add_dataset_key. */
+    if (dataset_id > STM_SYNC_DATASET_ID_MAX) return STM_ERANGE;
+
+    pthread_mutex_lock(&s->lock);
+    /* R42 P2-2: wedged/RO refuse — symmetric with add / rotate. */
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+
+    /* Strictly "new dataset" — refuse if any entry already exists. */
+    uint64_t next_id = 0;
+    stm_status rc = stm_keyschema_next_key_id(s->keyschema, dataset_id, &next_id);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
+    if (next_id != 0) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EEXIST;
+    }
+
+    /* R12 P1-2: pre-reserve the DEK map slot BEFORE any schema
+     * mutation so the post-insert sync_dek_insert is infallible. */
+    rc = sync_dek_grow(s, s->dek_count + 1);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
+
+    /* Generate a fresh 32-byte DEK. corvus seals it into an opaque
+     * envelope; the plaintext is installed into the in-RAM map below
+     * and scrubbed on every exit after this point. */
+    uint8_t dek[32];
+    stm_random_bytes(dek, 32);
+
+    /* WRAP the DEK over corvus. The envelope corvus returns is the
+     * blob the keyschema slot stores; corvus binds it (AEAD-AD) to
+     * `corvus_dataset_path`, so the mount-time UNWRAP must send the
+     * same path back (recorded in the slot below). stm_corvus_wrap
+     * blocks on the transport + retry schedule — acceptable here, the
+     * janus add path likewise does a blocking network wrap under the
+     * lock. */
+    uint8_t envelope[STM_CORVUS_ENVELOPE_MAX];
+    size_t  envelope_len = 0;
+    stm_corvus_transport_opts t = {
+        .socket_path        = corvus->socket_path,
+        .connect_timeout_ms = corvus->connect_timeout_ms,
+        .io_timeout_ms      = corvus->io_timeout_ms,
+        .n_retries          = corvus->n_retries,
+    };
+    rc = stm_corvus_wrap(&t, corvus->session_token,
+                            corvus_dataset_path, corvus_dataset_path_len,
+                            /*key_id=*/0, dek,
+                            envelope, sizeof envelope, &envelope_len);
+    if (rc != STM_OK) {
+        stm_ct_memzero(dek, sizeof dek);
+        pthread_mutex_unlock(&s->lock);
+        return rc;
+    }
+
+    rc = stm_keyschema_insert_wrapped(s->keyschema, dataset_id, /*key_id=*/0,
+                                        STM_KS_STATE_CURRENT,
+                                        STM_KS_WRAPPER_CORVUS,
+                                        envelope, envelope_len,
+                                        corvus_dataset_path,
+                                        corvus_dataset_path_len);
+    /* The envelope is a sealed blob (not plaintext-secret), but scrub
+     * the stack buffer anyway for parity with stm_sync_add_dataset_key. */
+    stm_ct_memzero(envelope, sizeof envelope);
+    if (rc != STM_OK) {
+        stm_ct_memzero(dek, sizeof dek);
+        pthread_mutex_unlock(&s->lock);
+        return rc;
+    }
+
+    /* Post-grow invariant: sync_dek_insert cannot fail from OOM now. */
+    rc = sync_dek_insert(s, dataset_id, /*key_id=*/0, dek);
+    stm_ct_memzero(dek, sizeof dek);
+    if (rc != STM_OK) {
+        /* Only STM_EEXIST is reachable — a same-lock self-race, i.e. a
+         * logic bug. Surface as STM_ECORRUPT (matches the sibling). */
+        pthread_mutex_unlock(&s->lock);
+        return STM_ECORRUPT;
+    }
+
+    *out_new_key_id = 0;
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
 stm_status stm_sync_rotate_dataset_key(stm_sync *s,
                                          uint64_t dataset_id,
                                          const stm_hybrid_keys *wk,

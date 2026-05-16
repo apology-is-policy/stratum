@@ -819,6 +819,51 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
                                          uint64_t *out_old_key_id);
 
 /*
+ * TLY-A3-keyslot-wrap: add a new dataset's key via the corvus WRAP
+ * verb — the provisioning-time counterpart of stm_sync_add_dataset_key
+ * for a corvus-encrypted dataset.
+ *
+ * Like stm_sync_add_dataset_key this is strictly "new dataset": it
+ * refuses (STM_EEXIST) if `dataset_id` already has any keyschema
+ * entry. Use stm_sync_rotate_dataset_key for an existing dataset.
+ *
+ * Flow: generate a fresh 32-byte DEK (CSPRNG) -> stm_corvus_wrap seals
+ * it into an opaque envelope bound (AEAD-AD) to `corvus_dataset_path`
+ * -> the envelope is stored as the dataset's CURRENT keyschema slot
+ * tagged STM_KS_WRAPPER_CORVUS with the path recorded -> the plaintext
+ * DEK is installed into the in-RAM DEK map so the dataset is
+ * immediately usable. The schema change becomes durable on the next
+ * stm_sync_commit.
+ *
+ * `corvus_dataset_path` is corvus's stable AEAD-AD-bound identity for
+ * the dataset (STRATUM-API-V1.md §5.10) — REQUIRED, non-NULL, length
+ * 1..STM_KEYSCHEMA_CORVUS_PATH_MAX (255). It is recorded verbatim in
+ * the slot so a later mount sends corvus the same binding
+ * (key_schema.tla::UnwrapUsesWrapBinding).
+ *
+ * `corvus` carries the corvus socket path + session token + transport
+ * budget (same struct the mount path uses). The token is BORROWED —
+ * kept valid only for the duration of the call. Both `corvus` and
+ * `corvus->session_token` MUST be non-NULL (a WRAP needs a token).
+ *
+ * `dataset_id == 0` (pool metadata key) is refused (STM_EINVAL).
+ *
+ * On success `*out_new_key_id` is set to 0 (a dataset's first key).
+ * Returns STM_EINVAL on NULL / out-of-range path / missing token,
+ * STM_ERANGE if `dataset_id` exceeds the janus qid cap, STM_EEXIST if
+ * a slot already exists, STM_EWEDGED / STM_EROFS on a non-writable
+ * handle, STM_ECORVUS* / STM_EBACKEND / STM_EPROTOCOL if the corvus
+ * WRAP fails, or a keyschema-layer error.
+ */
+STM_MUST_USE
+stm_status stm_sync_add_dataset_key_corvus(stm_sync *s,
+                                             uint64_t dataset_id,
+                                             const char *corvus_dataset_path,
+                                             size_t corvus_dataset_path_len,
+                                             const stm_corvus_mount_cfg *corvus,
+                                             uint64_t *out_new_key_id);
+
+/*
  * Sweep every RETIRED key for `dataset_id`, transitioning each
  * through PRUNING and deleting it. In-RAM DEKs for the pruned entries
  * are wiped. Phase 4 has no extent layer referencing these keys, so
