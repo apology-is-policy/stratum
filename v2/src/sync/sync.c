@@ -548,18 +548,26 @@ static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
             if (state == STM_KS_STATE_CURRENT) return (int)STM_EINVAL;
             return 0;
         }
-        /* corvus identifies the slot by a (dataset, key_id) pair.
-         * v1.0 binding: the corvus dataset name is the decimal
-         * dataset_id; key_id is the keyschema key_id verbatim. The
-         * real corvus dataset-name binding is the open bilateral
-         * question — STRATUM-API-V1.md §5.2 specs only the UNWRAP
-         * verb; see v2/docs/thylacine-keyslot-design.md §10. */
-        char ds_name[21];
-        int dn = snprintf(ds_name, sizeof ds_name, "%llu",
-                            (unsigned long long)dataset_id);
-        if (dn < 0 || (size_t)dn >= sizeof ds_name) {
+        /* TLY-A3-keyslot-wrap: corvus's stable identity for the
+         * dataset is the UTF-8 path string recorded in the CORVUS
+         * keyslot at WRAP/provisioning time (STRATUM-API-V1.md
+         * §5.10). The mount-time UNWRAP MUST send that same binding —
+         * corvus's envelope AEAD-AD is bound to it, so a mismatch
+         * (e.g. the pre-keyslot-wrap provisional decimal dataset_id)
+         * makes corvus reject the envelope and the pool unmountable
+         * (key_schema.tla::UnwrapUsesWrapBinding). Read it back from
+         * the slot rather than reconstructing an identifier. */
+        char   ds_path[STM_KEYSCHEMA_CORVUS_PATH_MAX];
+        size_t ds_path_len = 0;
+        stm_status ps = stm_keyschema_get_corvus_path(
+                            u->s->keyschema, dataset_id, key_id,
+                            ds_path, sizeof ds_path, &ds_path_len);
+        if (ps != STM_OK || ds_path_len == 0) {
+            /* A CORVUS slot with no recorded path cannot be UNWRAP'd
+             * (corvus needs the binding). decode_val already refuses
+             * such a slot at load; this is defense-in-depth. */
             stm_ct_memzero(dek, sizeof dek);
-            return (int)STM_EBACKEND;
+            return (int)(ps != STM_OK ? ps : STM_ECORRUPT);
         }
         stm_corvus_transport_opts t = {
             .socket_path        = u->corvus->socket_path,
@@ -568,7 +576,7 @@ static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
             .n_retries          = u->corvus->n_retries,
         };
         rc = stm_corvus_unwrap(&t, u->corvus->session_token,
-                                 ds_name, (size_t)dn, key_id,
+                                 ds_path, ds_path_len, key_id,
                                  wrapped, wrapped_len, dek);
         /* stm_corvus_unwrap fills exactly STM_CORVUS_DEK_LEN (32)
          * bytes of `dek` on STM_OK; the dek_len discipline below is
@@ -1320,7 +1328,8 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                                             STM_SYNC_POOL_KEY_ID,
                                             STM_KS_STATE_CURRENT,
                                             STM_KS_WRAPPER_LEGACY,
-                                            wrapped, wrapped_len);
+                                            wrapped, wrapped_len,
+                                            /*corvus_dataset_path=*/NULL, 0);
         stm_ct_memzero(wrapped, sizeof wrapped);
         if (ws != STM_OK) { stm_sync_close(s); return ws; }
 
@@ -4157,7 +4166,8 @@ stm_status stm_sync_add_dataset_key(stm_sync *s,
     rc = stm_keyschema_insert_wrapped(s->keyschema, dataset_id, /*key_id=*/0,
                                         STM_KS_STATE_CURRENT,
                                         STM_KS_WRAPPER_LEGACY,
-                                        wrapped, wrapped_len);
+                                        wrapped, wrapped_len,
+                                        /*corvus_dataset_path=*/NULL, 0);
     stm_ct_memzero(wrapped, sizeof wrapped);
     if (rc != STM_OK) {
         stm_ct_memzero(dek, sizeof dek);
@@ -4231,7 +4241,8 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
     uint64_t old_id = 0;
     rc = stm_keyschema_rotate(s->keyschema, dataset_id, next_id,
                                  STM_KS_WRAPPER_LEGACY,
-                                 wrapped, wrapped_len, &old_id);
+                                 wrapped, wrapped_len,
+                                 /*corvus_dataset_path=*/NULL, 0, &old_id);
     stm_ct_memzero(wrapped, sizeof wrapped);
     if (rc != STM_OK) {
         stm_ct_memzero(dek, sizeof dek);
@@ -4545,17 +4556,24 @@ stm_status stm_sync_keyschema_insert_for_test(stm_sync *s,
                                                 uint64_t key_id,
                                                 stm_keyschema_wrapper wrapper,
                                                 const void *wrapped,
-                                                size_t wrapped_len)
+                                                size_t wrapped_len,
+                                                const char *corvus_dataset_path,
+                                                size_t corvus_dataset_path_len)
 {
     if (!s || !wrapped || wrapped_len == 0) return STM_EINVAL;
     pthread_mutex_lock(&s->lock);
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+    /* TLY-A3-keyslot-wrap: the corvus path is validated by
+     * stm_keyschema_insert_wrapped against the wrapper (CORVUS
+     * requires it; every other wrapper refuses it). */
     stm_status rc = stm_keyschema_insert_wrapped(s->keyschema,
                                                    dataset_id, key_id,
                                                    STM_KS_STATE_CURRENT,
                                                    wrapper,
-                                                   wrapped, wrapped_len);
+                                                   wrapped, wrapped_len,
+                                                   corvus_dataset_path,
+                                                   corvus_dataset_path_len);
     pthread_mutex_unlock(&s->lock);
     return rc;
 }

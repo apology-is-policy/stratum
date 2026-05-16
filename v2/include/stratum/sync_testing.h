@@ -75,6 +75,13 @@ stm_status stm_sync_set_cdc_params_for_test(stm_sync *s,
  *
  * Returns STM_OK; STM_EINVAL on NULL/oversize args; propagates
  * keyschema-layer errors otherwise.
+ *
+ * TLY-A3-keyslot-wrap: `corvus_dataset_path` follows the keyschema
+ * rule — REQUIRED (non-NULL, 1..STM_KEYSCHEMA_CORVUS_PATH_MAX) for a
+ * STM_KS_WRAPPER_CORVUS slot, absent (NULL, 0) for every other
+ * wrapper. STM_EINVAL on violation. The mount-time UNWRAP reads the
+ * stored path back from the slot, so a CORVUS test slot must supply
+ * the path the fake corvus expects.
  */
 STM_MUST_USE
 stm_status stm_sync_keyschema_insert_for_test(stm_sync *s,
@@ -82,7 +89,9 @@ stm_status stm_sync_keyschema_insert_for_test(stm_sync *s,
                                                 uint64_t key_id,
                                                 stm_keyschema_wrapper wrapper,
                                                 const void *wrapped,
-                                                size_t wrapped_len);
+                                                size_t wrapped_len,
+                                                const char *corvus_dataset_path,
+                                                size_t corvus_dataset_path_len);
 #endif /* STRATUM_BUILD_TESTING_HOOKS */
 
 #ifdef __cplusplus

@@ -37,6 +37,11 @@ struct ks_entry {
     stm_keyschema_wrapper wrapper;    /* TLY-A3-keyslot — how blob is sealed */
     uint8_t               *wrapped;
     size_t                wrapped_len;
+    /* TLY-A3-keyslot-wrap: corvus dataset-path binding. Non-empty
+     * iff wrapper == STM_KS_WRAPPER_CORVUS. Fixed array (no malloc);
+     * calloc zeroes it so a fresh non-CORVUS entry has len 0. */
+    uint8_t               corvus_dataset_path[STM_KEYSCHEMA_CORVUS_PATH_MAX];
+    size_t                corvus_dataset_path_len;
     ks_entry              *next;      /* sorted by (dataset_id, key_id) */
 };
 
@@ -106,32 +111,46 @@ static void decode_key(const uint8_t in[16],
     *out_key_id     = kid;
 }
 
-/* Value: state(1) || flags(1) || wrapper_identity(1) || reserved(5)
- * || wrapped(variable). Total bytes = 8 + wrapped_len.
+/* Value: state(1) || flags(1) || wrapper_identity(1) ||
+ * corvus_path_len(1) || reserved(4) || corvus_dataset_path(variable)
+ * || wrapped(variable). Total bytes = 8 + corvus_path_len + wrapped_len.
  *
  * TLY-A3-keyslot (STM_UB_VERSION 26 -> 27): byte [2] — previously
- * part of the 6-byte reserved block, always written zero — now
- * carries the `wrapper_identity` tag. A pre-TLY-A3 pool has [2]==0,
- * which decodes as STM_KS_WRAPPER_LEGACY (back-compat); the version
- * bump makes a pre-TLY-A3 binary refuse a v27 pool outright so it
- * never misroutes a CORVUS slot it cannot interpret. */
+ * part of the 6-byte reserved block, always written zero — carries
+ * the `wrapper_identity` tag.
+ *
+ * TLY-A3-keyslot-wrap (STM_UB_VERSION 27 -> 28): byte [3] — also
+ * previously reserved-zero — carries `corvus_dataset_path_len`, and
+ * the path bytes are stored immediately after the 8-byte header,
+ * BEFORE the wrapped blob. A CORVUS slot MUST carry a non-empty path
+ * (corvus's AEAD-AD-bound identity, STRATUM-API-V1.md §5.10); every
+ * other wrapper MUST carry a zero-length path. The version bump
+ * gates the layout change: a v27 binary has no corvus_path_len
+ * concept and would mis-slice the value, so it refuses a v28 pool. */
 #define KS_VAL_HDR_LEN  8u
 
 static void encode_val(stm_keyschema_state state,
                          stm_keyschema_wrapper wrapper,
+                         const uint8_t *corvus_path, size_t corvus_path_len,
                          const void *wrapped, size_t wrapped_len,
                          uint8_t *out)
 {
     out[0] = (uint8_t)state;
-    out[1] = 0;                               /* flags — none yet   */
-    out[2] = (uint8_t)wrapper;                /* wrapper_identity   */
-    memset(out + 3, 0, 5);                    /* reserved           */
-    if (wrapped_len > 0) memcpy(out + KS_VAL_HDR_LEN, wrapped, wrapped_len);
+    out[1] = 0;                               /* flags — none yet      */
+    out[2] = (uint8_t)wrapper;                /* wrapper_identity      */
+    out[3] = (uint8_t)corvus_path_len;        /* TLY-A3-keyslot-wrap   */
+    memset(out + 4, 0, 4);                    /* reserved              */
+    if (corvus_path_len > 0)
+        memcpy(out + KS_VAL_HDR_LEN, corvus_path, corvus_path_len);
+    if (wrapped_len > 0)
+        memcpy(out + KS_VAL_HDR_LEN + corvus_path_len, wrapped, wrapped_len);
 }
 
 static stm_status decode_val(const uint8_t *in, size_t in_len,
                                 stm_keyschema_state *out_state,
                                 stm_keyschema_wrapper *out_wrapper,
+                                const uint8_t **out_corvus_path,
+                                size_t *out_corvus_path_len,
                                 const uint8_t **out_wrapped, size_t *out_wrapped_len)
 {
     if (in_len < KS_VAL_HDR_LEN) return STM_ECORRUPT;
@@ -149,11 +168,28 @@ static stm_status decode_val(const uint8_t *in, size_t in_len,
         wr != STM_KS_WRAPPER_PASSPHRASE &&
         wr != STM_KS_WRAPPER_JANUS &&
         wr != STM_KS_WRAPPER_CORVUS) return STM_ECORRUPT;
+    /* TLY-A3-keyslot-wrap: corvus_dataset_path_len (byte [3], 0..255
+     * by type). The path must fit inside the value before the
+     * wrapped blob. */
+    size_t pl = in[3];
+    if ((size_t)KS_VAL_HDR_LEN + pl > in_len) return STM_ECORRUPT;
+    /* CORVUS <=> path-present consistency. A CORVUS slot without a
+     * recorded path could not be UNWRAP'd (corvus needs the binding);
+     * a non-CORVUS slot carrying one is a format violation. Either
+     * way, on a node that passed the Merkle/self-csum check, refuse
+     * as STM_ECORRUPT. */
+    if (wr == STM_KS_WRAPPER_CORVUS) {
+        if (pl == 0) return STM_ECORRUPT;
+    } else {
+        if (pl != 0) return STM_ECORRUPT;
+    }
     /* flags byte + remaining reserved: no constraints yet. */
-    *out_state       = (stm_keyschema_state)st;
-    *out_wrapper     = (stm_keyschema_wrapper)wr;
-    *out_wrapped     = in + KS_VAL_HDR_LEN;
-    *out_wrapped_len = in_len - KS_VAL_HDR_LEN;
+    *out_state           = (stm_keyschema_state)st;
+    *out_wrapper         = (stm_keyschema_wrapper)wr;
+    *out_corvus_path     = (pl > 0) ? (in + KS_VAL_HDR_LEN) : NULL;
+    *out_corvus_path_len = pl;
+    *out_wrapped         = in + KS_VAL_HDR_LEN + pl;
+    *out_wrapped_len     = in_len - KS_VAL_HDR_LEN - pl;
     return STM_OK;
 }
 
@@ -298,9 +334,12 @@ static int load_cb(const void *key, size_t key_len,
 
     stm_keyschema_state state = STM_KS_STATE_INVALID;
     stm_keyschema_wrapper wrapper = STM_KS_WRAPPER_LEGACY;
+    const uint8_t *corvus_path = NULL;
+    size_t corvus_path_len = 0;
     const uint8_t *wrapped = NULL;
     size_t wrapped_len = 0;
     stm_status vs = decode_val(value, value_len, &state, &wrapper,
+                                 &corvus_path, &corvus_path_len,
                                  &wrapped, &wrapped_len);
     if (vs != STM_OK) { lc->err = vs; return 1; }
     if (wrapped_len > STM_KEYSCHEMA_WRAPPED_MAX) {
@@ -313,6 +352,12 @@ static int load_cb(const void *key, size_t key_len,
     e->key_id      = key_id;
     e->state       = state;
     e->wrapper     = wrapper;
+    /* TLY-A3-keyslot-wrap: corvus_path_len is decode_val-bounded to
+     * 0..STM_KEYSCHEMA_CORVUS_PATH_MAX (a single value byte), so it
+     * always fits the fixed entry array. */
+    if (corvus_path_len > 0)
+        memcpy(e->corvus_dataset_path, corvus_path, corvus_path_len);
+    e->corvus_dataset_path_len = corvus_path_len;
     e->wrapped_len = wrapped_len;
     if (wrapped_len > 0) {
         e->wrapped = malloc(wrapped_len);
@@ -408,7 +453,8 @@ stm_status stm_keyschema_commit(stm_keyschema *ks, uint64_t committed_gen,
             return STM_ENOMEM;
         }
         for (ks_entry *e = ks->head; e; e = e->next) {
-            valtotal += KS_VAL_HDR_LEN + e->wrapped_len;
+            valtotal += KS_VAL_HDR_LEN + e->corvus_dataset_path_len
+                          + e->wrapped_len;
         }
         valbuf = malloc(valtotal);
         if (!valbuf) {
@@ -419,9 +465,11 @@ stm_status stm_keyschema_commit(stm_keyschema *ks, uint64_t committed_gen,
         size_t i = 0;
         for (ks_entry *e = ks->head; e; e = e->next, i++) {
             encode_key(e->dataset_id, e->key_id, keybufs[i]);
-            size_t vlen = KS_VAL_HDR_LEN + e->wrapped_len;
-            encode_val(e->state, e->wrapper, e->wrapped, e->wrapped_len,
-                         valbuf + voff);
+            size_t vlen = KS_VAL_HDR_LEN + e->corvus_dataset_path_len
+                            + e->wrapped_len;
+            encode_val(e->state, e->wrapper,
+                         e->corvus_dataset_path, e->corvus_dataset_path_len,
+                         e->wrapped, e->wrapped_len, valbuf + voff);
             entries[i].key       = keybufs[i];
             entries[i].key_len   = 16;
             entries[i].value     = valbuf + voff;
@@ -514,12 +562,34 @@ stm_status stm_keyschema_get_root(const stm_keyschema *ks,
 /* Entry manipulation.                                                        */
 /* ========================================================================= */
 
+/* TLY-A3-keyslot-wrap: validate the corvus dataset-path against the
+ * wrapper. STM_KS_WRAPPER_CORVUS REQUIRES a path (non-NULL,
+ * 1..STM_KEYSCHEMA_CORVUS_PATH_MAX); every other wrapper REQUIRES
+ * none (NULL, length 0). Shared by insert_wrapped + rotate. */
+static stm_status validate_corvus_path(stm_keyschema_wrapper wrapper,
+                                          const char *corvus_dataset_path,
+                                          size_t corvus_dataset_path_len)
+{
+    if (wrapper == STM_KS_WRAPPER_CORVUS) {
+        if (!corvus_dataset_path ||
+            corvus_dataset_path_len == 0 ||
+            corvus_dataset_path_len > STM_KEYSCHEMA_CORVUS_PATH_MAX)
+            return STM_EINVAL;
+    } else {
+        if (corvus_dataset_path != NULL || corvus_dataset_path_len != 0)
+            return STM_EINVAL;
+    }
+    return STM_OK;
+}
+
 stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
                                           uint64_t dataset_id,
                                           uint64_t key_id,
                                           stm_keyschema_state state,
                                           stm_keyschema_wrapper wrapper,
-                                          const void *wrapped, size_t wrapped_len)
+                                          const void *wrapped, size_t wrapped_len,
+                                          const char *corvus_dataset_path,
+                                          size_t corvus_dataset_path_len)
 {
     if (!ks) return STM_EINVAL;
     if (wrapped_len > 0 && !wrapped) return STM_EINVAL;
@@ -528,6 +598,9 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
         wrapper != STM_KS_WRAPPER_PASSPHRASE &&
         wrapper != STM_KS_WRAPPER_JANUS &&
         wrapper != STM_KS_WRAPPER_CORVUS) return STM_EINVAL;
+    stm_status pv = validate_corvus_path(wrapper, corvus_dataset_path,
+                                            corvus_dataset_path_len);
+    if (pv != STM_OK) return pv;
     /* R12 P2-4: the public insert path is narrowed to CURRENT only.
      * RETIRED / PRUNING transitions go through stm_keyschema_rotate /
      * _mark_pruning (both of which enforce the legal state machine
@@ -558,6 +631,13 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
         existing->wrapped_len = wrapped_len;
         existing->state       = state;
         existing->wrapper     = wrapper;
+        /* TLY-A3-keyslot-wrap: replace the corvus path binding too.
+         * validate_corvus_path bounded the length to the fixed
+         * array; len 0 for a non-CORVUS replace. */
+        if (corvus_dataset_path_len > 0)
+            memcpy(existing->corvus_dataset_path, corvus_dataset_path,
+                     corvus_dataset_path_len);
+        existing->corvus_dataset_path_len = corvus_dataset_path_len;
         ks->dirty = true;
         return STM_OK;
     }
@@ -570,6 +650,10 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
     e->state       = state;
     e->wrapper     = wrapper;
     e->wrapped_len = wrapped_len;
+    if (corvus_dataset_path_len > 0)
+        memcpy(e->corvus_dataset_path, corvus_dataset_path,
+                 corvus_dataset_path_len);
+    e->corvus_dataset_path_len = corvus_dataset_path_len;
     if (wrapped_len > 0) {
         e->wrapped = malloc(wrapped_len);
         if (!e->wrapped) { free(e); return STM_ENOMEM; }
@@ -600,6 +684,29 @@ stm_status stm_keyschema_lookup(const stm_keyschema *ks,
         if (out_wrapped) {
             if (out_cap < e->wrapped_len) return STM_ERANGE;
             memcpy(out_wrapped, e->wrapped, e->wrapped_len);
+        }
+        return STM_OK;
+    }
+    return STM_ENOENT;
+}
+
+stm_status stm_keyschema_get_corvus_path(const stm_keyschema *ks,
+                                           uint64_t dataset_id,
+                                           uint64_t key_id,
+                                           char *out_path, size_t out_cap,
+                                           size_t *out_len)
+{
+    if (!ks || !out_len) return STM_EINVAL;
+    for (const ks_entry *e = ks->head; e; e = e->next) {
+        int c = entry_cmp(e->dataset_id, e->key_id, dataset_id, key_id);
+        if (c > 0) break;
+        if (c < 0) continue;
+        *out_len = e->corvus_dataset_path_len;
+        if (out_path) {
+            if (out_cap < e->corvus_dataset_path_len) return STM_ERANGE;
+            if (e->corvus_dataset_path_len > 0)
+                memcpy(out_path, e->corvus_dataset_path,
+                         e->corvus_dataset_path_len);
         }
         return STM_OK;
     }
@@ -679,6 +786,8 @@ stm_status stm_keyschema_rotate(stm_keyschema *ks,
                                   uint64_t new_key_id,
                                   stm_keyschema_wrapper wrapper,
                                   const void *wrapped, size_t wrapped_len,
+                                  const char *corvus_dataset_path,
+                                  size_t corvus_dataset_path_len,
                                   uint64_t *out_old_key_id)
 {
     if (!ks || !out_old_key_id) return STM_EINVAL;
@@ -688,6 +797,9 @@ stm_status stm_keyschema_rotate(stm_keyschema *ks,
         wrapper != STM_KS_WRAPPER_PASSPHRASE &&
         wrapper != STM_KS_WRAPPER_JANUS &&
         wrapper != STM_KS_WRAPPER_CORVUS) return STM_EINVAL;
+    stm_status pv = validate_corvus_path(wrapper, corvus_dataset_path,
+                                            corvus_dataset_path_len);
+    if (pv != STM_OK) return pv;
 
     /* Strict monotonicity: caller must pass the expected next id. A
      * mismatch indicates a lost-update race or buggy caller; either
@@ -716,6 +828,10 @@ stm_status stm_keyschema_rotate(stm_keyschema *ks,
     new_entry->key_id      = new_key_id;
     new_entry->state       = STM_KS_STATE_CURRENT;
     new_entry->wrapper     = wrapper;
+    if (corvus_dataset_path_len > 0)
+        memcpy(new_entry->corvus_dataset_path, corvus_dataset_path,
+                 corvus_dataset_path_len);
+    new_entry->corvus_dataset_path_len = corvus_dataset_path_len;
     new_entry->wrapped_len = wrapped_len;
     new_entry->wrapped     = malloc(wrapped_len);
     if (!new_entry->wrapped) {

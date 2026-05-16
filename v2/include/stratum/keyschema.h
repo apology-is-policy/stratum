@@ -94,6 +94,13 @@ typedef enum {
  * (1160) = 1192 bytes. Round up to give a little future headroom. */
 #define STM_KEYSCHEMA_WRAPPED_MAX   1280u
 
+/* TLY-A3-keyslot-wrap: max corvus dataset-path bytes a CORVUS slot
+ * records. The path is corvus's stable AEAD-AD-bound identity for the
+ * dataset (STRATUM-API-V1.md §5.10) — the mount-time UNWRAP sends it
+ * back. Matches STM_CORVUS_DATASET_MAX. A CORVUS slot MUST carry a
+ * non-empty path; a non-CORVUS slot MUST carry a zero-length path. */
+#define STM_KEYSCHEMA_CORVUS_PATH_MAX  255u
+
 /* ========================================================================= */
 /* Lifecycle.                                                                 */
 /* ========================================================================= */
@@ -165,6 +172,13 @@ stm_status stm_keyschema_get_root(const stm_keyschema *ks,
  * tags how the blob is sealed (TLY-A3-keyslot); pass
  * STM_KS_WRAPPER_LEGACY for the pre-TLY-A3 keyfile / derived-key
  * path, STM_KS_WRAPPER_CORVUS for a corvus-wrapped DEK.
+ *
+ * TLY-A3-keyslot-wrap: `corvus_dataset_path` records corvus's stable
+ * AEAD-AD-bound identity for the dataset (the path the mount-time
+ * UNWRAP must send back — STRATUM-API-V1.md §5.10). It is REQUIRED
+ * for STM_KS_WRAPPER_CORVUS (non-NULL, length 1..STM_KEYSCHEMA_CORVUS_PATH_MAX)
+ * and MUST be absent for every other wrapper (NULL, length 0) —
+ * STM_EINVAL on violation.
  */
 STM_MUST_USE
 stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
@@ -172,7 +186,25 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
                                           uint64_t key_id,
                                           stm_keyschema_state state,
                                           stm_keyschema_wrapper wrapper,
-                                          const void *wrapped, size_t wrapped_len);
+                                          const void *wrapped, size_t wrapped_len,
+                                          const char *corvus_dataset_path,
+                                          size_t corvus_dataset_path_len);
+
+/*
+ * TLY-A3-keyslot-wrap: read the corvus dataset-path recorded in the
+ * slot at (dataset_id, key_id). On STM_OK `out_path` holds the path
+ * bytes (NOT NUL-terminated) and `*out_len` its length — 0 for a
+ * non-CORVUS slot. STM_ENOENT if no entry exists; STM_ERANGE if
+ * `out_cap` < the stored length. The mount-time UNWRAP path uses
+ * this to send corvus the slot's recorded binding rather than a
+ * reconstructed identifier.
+ */
+STM_MUST_USE
+stm_status stm_keyschema_get_corvus_path(const stm_keyschema *ks,
+                                           uint64_t dataset_id,
+                                           uint64_t key_id,
+                                           char *out_path, size_t out_cap,
+                                           size_t *out_len);
 
 /*
  * Read the entry for (dataset_id, key_id). `out_wrapped` may be
@@ -250,6 +282,10 @@ stm_status stm_keyschema_next_key_id(const stm_keyschema *ks,
  *
  * On failure the in-RAM schema is untouched (operation is
  * all-or-nothing with respect to the list mutations).
+ *
+ * TLY-A3-keyslot-wrap: `corvus_dataset_path` follows the same rule as
+ * `stm_keyschema_insert_wrapped` — REQUIRED for STM_KS_WRAPPER_CORVUS,
+ * absent (NULL / length 0) for every other wrapper.
  */
 STM_MUST_USE
 stm_status stm_keyschema_rotate(stm_keyschema *ks,
@@ -257,6 +293,8 @@ stm_status stm_keyschema_rotate(stm_keyschema *ks,
                                   uint64_t new_key_id,
                                   stm_keyschema_wrapper wrapper,
                                   const void *wrapped, size_t wrapped_len,
+                                  const char *corvus_dataset_path,
+                                  size_t corvus_dataset_path_len,
                                   uint64_t *out_old_key_id);
 
 /*

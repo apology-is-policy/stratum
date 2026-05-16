@@ -219,14 +219,18 @@ static void build_pool_with_corvus_slot(void)
 
     /* Inject a CURRENT CORVUS-tagged keyschema slot. The blob is an
      * opaque marker — the fake corvus ignores it and returns a canned
-     * DEK. (No production WRAP path exists yet — see header comment.) */
+     * DEK. TLY-A3-keyslot-wrap: a CORVUS slot MUST record a corvus
+     * dataset-path (the binding the mount-time UNWRAP sends back); the
+     * fake corvus echoes a DEK regardless of the path it receives. */
     static const uint8_t blob[16] = {
         0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
         0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44,
     };
+    static const char ds_path[] = "users/corvus-test";
     STM_ASSERT_OK(stm_sync_keyschema_insert_for_test(
                       s, CORVUS_DATASET_ID, CORVUS_KEY_ID,
-                      STM_KS_WRAPPER_CORVUS, blob, sizeof blob));
+                      STM_KS_WRAPPER_CORVUS, blob, sizeof blob,
+                      ds_path, sizeof ds_path - 1));
     STM_ASSERT_OK(stm_sync_commit(s));
 
     stm_sync_close(s);

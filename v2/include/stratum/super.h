@@ -421,8 +421,25 @@ extern "C" {
  * full version bump, "no feature flag"). v26 pools refused at v27
  * mount via uniform STM_EBADVERSION. Precedent for a version bump
  * driven by a sub-tree value-format change rather than a UB field:
- * the v17 → v18 value-layer bump. */
-#define STM_UB_VERSION        27u
+ * the v17 → v18 value-layer bump.
+ *
+ * v27 → v28 bump (TLY-A3-keyslot-wrap): NO uberblock field change —
+ * the bump versions the keyschema entry-value LAYOUT. Byte [3] of
+ * each keyschema entry value (state(1) || flags(1) ||
+ * wrapper_identity(1) || corvus_path_len(1) || reserved(4) ||
+ * corvus_dataset_path || wrapped) was previously part of the reserved
+ * block written zero; it now carries `corvus_dataset_path_len`, and a
+ * variable-length corvus dataset-path is stored immediately after the
+ * 8-byte header, BEFORE the wrapped blob. A CORVUS slot records the
+ * UTF-8 dataset path the mount-time UNWRAP must send corvus
+ * (STRATUM-API-V1.md §5.10); every other wrapper records a zero-length
+ * path. Unlike the v26→v27 bump this is a genuine LAYOUT change (the
+ * wrapped blob shifts by corvus_path_len bytes), so a v27 binary would
+ * mis-slice a v28 value — the exact-match SB version check
+ * (`version != STM_UB_VERSION` → STM_EBADVERSION) makes a v27 binary
+ * refuse a v28 pool outright. v27 pools refused at v28 mount via
+ * uniform STM_EBADVERSION. */
+#define STM_UB_VERSION        28u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

@@ -448,12 +448,12 @@ STM_TEST(dirent_set_crypt_ctx_refuses_rebind) {
     stm_dirent_index_close(idx);
 }
 
-STM_TEST(dirent_ub_version_is_v27) {
-    /* TLY-A3-keyslot bumped STM_UB_VERSION 26 → 27 for the keyschema
-     * entry `wrapper_identity` byte (v2/include/stratum/super.h). The
-     * dirent layer is unchanged since v25 but rides the latest
-     * version constant. */
-    STM_ASSERT_EQ(STM_UB_VERSION, 27u);
+STM_TEST(dirent_ub_version_is_v28) {
+    /* TLY-A3-keyslot-wrap bumped STM_UB_VERSION 27 → 28 for the
+     * keyschema entry corvus_dataset_path layout change
+     * (v2/include/stratum/super.h). The dirent layer is unchanged
+     * since v25 but rides the latest version constant. */
+    STM_ASSERT_EQ(STM_UB_VERSION, 28u);
 }
 
 /* R73 P2-1: stm_dirent_drop_for_dir bulk-removes every record keyed

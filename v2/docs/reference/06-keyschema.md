@@ -67,7 +67,9 @@ identical `ub_key_schema[512]` bytes, satisfying quorum.tla's
 
 ```c
 stm_status stm_keyschema_insert_wrapped(ks, dataset_id, key_id, state,
-                                          wrapper, wrapped, wrapped_len);
+                                          wrapper, wrapped, wrapped_len,
+                                          corvus_dataset_path,
+                                          corvus_dataset_path_len);
 
 stm_status stm_keyschema_lookup         (ks, dataset_id, key_id,
                                           &state, &wrapper,
@@ -76,6 +78,10 @@ stm_status stm_keyschema_lookup         (ks, dataset_id, key_id,
 stm_status stm_keyschema_lookup_current (ks, dataset_id,
                                           &key_id, &wrapper,
                                           out_buf, out_cap, &len);
+
+/* TLY-A3-keyslot-wrap: read a CORVUS slot's recorded corvus path. */
+stm_status stm_keyschema_get_corvus_path(ks, dataset_id, key_id,
+                                          out_path, out_cap, &len);
 
 size_t     stm_keyschema_count          (const stm_keyschema *ks);
 ```
@@ -90,15 +96,38 @@ keyfile/janus path. `insert_wrapped` and `rotate` take it as a
 parameter; `lookup` / `lookup_current` return it via a NULL-able
 `*out_wrapper`.
 
-On disk the tag is byte [2] of the entry value (`state(1) ||
-flags(1) || wrapper_identity(1) || reserved(5) || wrapped`). It is
-carved from what was a 6-byte reserved block written zero, so a
-pre-TLY-A3 entry decodes as `LEGACY` — the back-compat default,
-which the mount path treats exactly like `PASSPHRASE`. `decode_val`
-refuses any byte outside {0,1,2,3} as `STM_ECORRUPT`. The layout is
-byte-identical (`KS_VAL_HDR_LEN` stays 8); the `STM_UB_VERSION` bump
-gates the *semantic* break (a pre-TLY-A3 binary would misroute a
-`CORVUS` slot). See `v2/docs/thylacine-keyslot-design.md`.
+On disk the tag is byte [2] of the entry value. It is carved from
+what was a 6-byte reserved block written zero, so a pre-TLY-A3 entry
+decodes as `LEGACY` — the back-compat default, which the mount path
+treats exactly like `PASSPHRASE`. `decode_val` refuses any byte
+outside {0,1,2,3} as `STM_ECORRUPT`. At STM_UB_VERSION 26 → 27 the
+layout was byte-identical (`KS_VAL_HDR_LEN` stayed 8); the bump gated
+the *semantic* break (a pre-TLY-A3 binary would misroute a `CORVUS`
+slot). See `v2/docs/thylacine-keyslot-design.md`.
+
+### corvus dataset-path binding (TLY-A3-keyslot-wrap, STM_UB_VERSION 27 → 28)
+
+A `CORVUS` slot records the **corvus dataset-path** — the UTF-8
+string corvus binds into the DEK envelope's AEAD-AD and the value the
+mount-time UNWRAP must send back (`STRATUM-API-V1.md` §5.10). Byte [3]
+of the entry value (also previously reserved-zero) is
+`corvus_dataset_path_len`, and the path bytes (1..255) are stored
+immediately after the 8-byte header, BEFORE the wrapped blob:
+
+```
+state(1) || flags(1) || wrapper_identity(1) || corvus_path_len(1)
+  || reserved(4) || corvus_dataset_path(0..255) || wrapped(variable)
+```
+
+A `CORVUS` slot MUST carry a non-empty path; every other wrapper MUST
+carry a zero-length one — `insert_wrapped` / `rotate` enforce this
+(`STM_EINVAL`), `decode_val` re-checks it (`STM_ECORRUPT`). Unlike the
+26 → 27 bump this is a genuine *layout* change (the wrapped blob
+shifts by `corvus_path_len` bytes), so the 27 → 28 bump gates a v27
+binary mis-slicing a v28 value. `stm_keyschema_get_corvus_path` reads
+the recorded path back; `sync_unwrap_cb` uses it so the UNWRAP sends
+corvus the WRAP-recorded binding (`key_schema.tla::UnwrapUsesWrapBinding`).
+See `v2/docs/thylacine-keyslot-wrap-design.md`.
 
 ### Mount-time unwrap routing (TLY-A3-keyslot-impl-3b)
 
@@ -186,7 +215,7 @@ is deferred (ARCH §7.7.3).
 Single-leaf Bε-tree node (btnode format, 128 KiB max payload):
 
 - **Key** (16 bytes): `le64 dataset_id || le64 key_id`.
-- **Value** (3 + ≤1280 bytes): `le8 state || le8 pad || le16 wrapped_len || wrapped[]`.
+- **Value** (8 + path + ≤1280 bytes): `le8 state || le8 flags || le8 wrapper_identity || le8 corvus_path_len || reserved[4] || corvus_dataset_path[0..255] || wrapped[]` — `KS_VAL_HDR_LEN` is the 8-byte fixed header; the length is implicit in the btnode value-length (no `wrapped_len` field).
 
 Up to ~107 entries per leaf at `STM_KEYSCHEMA_WRAPPED_MAX = 1280`;
 multi-level tree extension lands when entry count exceeds this.
