@@ -260,3 +260,13 @@ chunk; that is gone — §4/§5.)
   0` is the back-compat default a pre-TLY-A3 zero byte decodes to.
 
 Q-KS2 and Q-KS3 are answered above (§4).
+
+- **WRAP path — RESOLVED 2026-05-16.** The §9 forward-note "producing
+  a CORVUS-sealed blob is future work, blocked on the bilateral
+  question" is closed: `STRATUM-API-V1.md` §5.2 + §5.10 now spec the
+  corvus WRAP verb (verb_id=10) and answer the dataset-binding
+  question (the stable identity is the UTF-8 dataset path string, not
+  a decimal id). The production WRAP path — provisioning-time DEK
+  sealing, the keyschema dataset-path binding fix, and the
+  `STM_UB_VERSION` 27 → 28 bump that carries it — is designed in
+  `thylacine-keyslot-wrap-design.md` (chunk series TLY-A3-keyslot-wrap).
