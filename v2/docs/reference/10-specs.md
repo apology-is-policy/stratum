@@ -27,7 +27,7 @@ chapter as specs get wider cross-reference tables).
 | `merge.tla` | 2 | Three-CAS MERGE (under PurgeSplitOnL). | 65536 states at depth 18 | — |
 | `allocator.tla` | 3 | Refcount + deferred-free. | bounded | — |
 | `merkle.tla` | 4 | Per-node Merkle chain. | bounded | — |
-| `key_schema.tla` | 7 | Per-dataset key state machine + TLY-A3-keyslot mount machine. | bounded | `key_schema_mount_serve_before_resolve_buggy.cfg` |
+| `key_schema.tla` | 7 / TLY-A3 | Per-dataset key state machine + TLY-A3-keyslot mount machine (`wrapper_identity` + mount FSM + `MountResolvesKeyBeforeData`) + TLY-A3-keyslot-wrap UNWRAP-binding: `unwrap_path` tracking + `UnwrapUsesWrapBinding` — a mount that resolves a CORVUS slot sends corvus the same dataset-path binding the slot's WRAP recorded; a mismatch makes corvus reject the envelope → unmountable pool. | bounded | `key_schema_mount_serve_before_resolve_buggy.cfg`, `key_schema_unwrap_wrong_path_buggy.cfg` |
 | `quorum.tla` | 5 | Multi-device commit + mount-claim. | 36839 states at depth 35 | `quorum_buggy.cfg` |
 | `metadata_nonce.tla` | 5 | Per-device paddr-stamping for nonces. | 51939 states | `metadata_nonce_buggy.cfg` |
 | `device_lifecycle.tla` | 5 | Roster state machine (add/remove/fail/rejoin). | large cfg: 10.6M states at depth 21 | `device_lifecycle_buggy.cfg` |
@@ -55,8 +55,12 @@ All 35 fixed configs green (one per module + `scrub_beta` +
 P8-POSIX-2's `dirent.cfg`; +1 with P8-POSIX-5's `inode_inline.cfg`;
 +1 with P8-POSIX-6's `xattr.cfg`; +1 with P8-POSIX-7d's `locks.cfg`;
 +1 with P9-9P-0's `fid.cfg`; +1 with P9-9P-2c's `namespace_multi_bind.cfg`).
-All 64 buggy configs reproduce their designed invariant
-violations (was 40 → +3 P8-POSIX-2 write-side chain-integrity
+All 86 buggy configs reproduce their designed invariant
+violations (the itemized progression below is the P8/P9-era
+trace; later P9-CTL / P9-SLATE / SWISS / P9.5-PARALLEL / TLY
+chunks added the remainder — most recently TLY-A3-keyslot-wrap's
+`key_schema_unwrap_wrong_path_buggy` firing UnwrapUsesWrapBinding)
+(was 40 → +3 P8-POSIX-2 write-side chain-integrity
 → +1 P8-POSIX-3 inode_unlink_leaves_zero_nlink → +3 P8-POSIX-4
 readdir cursor-stability buggy variants → +2 P8-POSIX-5 inline-
 data buggy variants → +3 P8-POSIX-6 xattr chain-integrity buggy

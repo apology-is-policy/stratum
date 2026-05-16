@@ -155,25 +155,41 @@ runtime keyslot management is wanted.
 - **No new `STM_E*` codes.** WRAP reuses the `STM_ECORVUS*` family from
   UNWRAP (`status_to_stm` already maps the full status enum).
 
-## 8. Spec scope (key_schema.tla extension)
+## 8. Spec scope (key_schema.tla extension) — AS BUILT
 
-Extend `key_schema.tla` (do NOT fork) with a `Wrap` action and one new
-invariant — small, in the spirit of the impl-3b `MountResolvesKeyBeforeData`
-extension:
+Extended `key_schema.tla` (no fork) — small, in the spirit of the
+impl-3b `MountResolvesKeyBeforeData` extension. **Refinement vs the
+earlier draft of this section:** there is no separate `Wrap` action.
+The existing `Init` / `Rotate` already create CORVUS slots, and that
+*is* the provisioning/WRAP step in the model — there is no
+"slot exists but not yet wrapped" intermediate in the real impl
+(`stm_keyschema_insert_wrapped` creates the slot and records the path
+in one step). corvus's C-7 ownership gate at WRAP time guarantees an
+*existing* CORVUS slot was sealed under the dataset's true owned path,
+so the slot's recorded binding deterministically IS that path — the
+spec models it as the derived `CurrentSlotPath(ds)` rather than a
+stored variable.
 
-- **`Wrap` action** — models provisioning: creates a CORVUS slot bound
-  to a `(dataset_path, key_id)` pair, state CURRENT.
-- **New invariant `UnwrapUsesWrapBinding`** — for any mount that
-  resolves a CORVUS slot, the `(dataset_path, key_id)` Stratum sends to
-  UNWRAP equals the `(dataset_path, key_id)` recorded by the `Wrap`
-  that created the slot. This is load-bearing: if mount sent a
-  different path, corvus's envelope-AD check fails → an unmountable
-  pool. (Models the §5 binding fix at the spec level.)
-- **Non-perturbation check** — adding `corvus_dataset_path` to the slot
-  value does not perturb `ExactlyOneCurrent` / `RotationAtomic` /
-  `MonotonicKeyIds` / `MountResolvesKeyBeforeData` / `TypeOK`.
-- **Buggy config** — one: a mount that sends a path differing from the
-  Wrap binding → trips `UnwrapUsesWrapBinding`.
+As built:
+
+- **`unwrap_path` variable** — `[Datasets -> Datasets ∪ {WRONG_PATH,
+  NONE}]`: the corvus dataset-path the mount sent to UNWRAP for ds's
+  current resolution. `MountResolveOk` sets it from the slot
+  (`CurrentSlotPath(ds)`); `Unmount` clears it; a local
+  PASSPHRASE/JANUS resolve leaves it NONE.
+- **New invariant `UnwrapUsesWrapBinding`** — `unwrap_path[ds] ≠ NONE
+  ⇒ unwrap_path[ds] = ds`: a mount that resolved a CORVUS slot used
+  the dataset's true path (the WRAP-recorded binding), never a wrong
+  identifier. Load-bearing: a wrong path makes corvus's envelope-AD
+  check fail → an unmountable pool. Models the §5 binding fix.
+- **Buggy action + config** — `MountResolveOkWrongPath` (gated by the
+  new `BuggyUnwrapWrongPath` constant) resolves a CORVUS slot to
+  MOUNTED with `unwrap_path = WRONG_PATH`; `key_schema_unwrap_wrong_path_buggy.cfg`
+  trips `UnwrapUsesWrapBinding`.
+- **Non-perturbation** — `unwrap_path` is threaded UNCHANGED through
+  every schema action and does not perturb `ExactlyOneCurrent` /
+  `RotationAtomic` / `MonotonicKeyIds` / `WrapperConsistent` /
+  `MountResolvesKeyBeforeData` / `TypeOK`.
 
 ## 9. Impl chunking (each its own commit + audit discipline)
 
