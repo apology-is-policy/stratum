@@ -192,6 +192,145 @@ stm_status stm_corvus_status_to_stm(stm_corvus_status s)
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* WRAP encode (TLY-A3-keyslot-wrap).                                      */
+/* ────────────────────────────────────────────────────────────────────── */
+
+size_t stm_corvus_encode_wrap_size(size_t dataset_len)
+{
+    /* A WRAP must bind to a real dataset path — zero-length is
+     * invalid (unlike UNWRAP, which permits an empty dataset). */
+    if (dataset_len == 0u) return 0;
+    if (dataset_len > STM_CORVUS_DATASET_MAX) return 0;
+    /* 4 (header: verb + ver + payload_len) + 33 (token) + 1 (ds_len)
+     * + dataset_len + 8 (key_id) + 2 (dek_len) + 32 (dek). The DEK is
+     * fixed-size, so — unlike UNWRAP — there is no variable blob. */
+    return 4u + STM_CORVUS_TOKEN_LEN + 1u + dataset_len
+         + 8u + 2u + STM_CORVUS_DEK_LEN;
+}
+
+stm_status stm_corvus_encode_wrap(const uint8_t token[STM_CORVUS_TOKEN_LEN],
+                                     const char *dataset,
+                                     size_t dataset_len,
+                                     uint64_t key_id,
+                                     const uint8_t dek[STM_CORVUS_DEK_LEN],
+                                     uint8_t *out_buf,
+                                     size_t out_cap,
+                                     size_t *out_len)
+{
+    if (!token || !dataset || !dek || !out_buf || !out_len) return STM_EINVAL;
+    /* A WRAP must bind to a real dataset path — zero-length refused
+     * (unlike UNWRAP, which permits an empty dataset). */
+    if (dataset_len == 0u) return STM_EINVAL;
+    if (dataset_len > STM_CORVUS_DATASET_MAX) return STM_EINVAL;
+
+    size_t total = stm_corvus_encode_wrap_size(dataset_len);
+    if (total == 0) return STM_EINVAL; /* defense-in-depth */
+    if (out_cap < total) return STM_ENOSPC;
+
+    /* payload_len counts the bytes AFTER the 4-byte header. WRAP's
+     * payload is bounded well under UINT16_MAX (max 4+33+1+255+8+2+32
+     * - 4 = 331), but the check pins the invariant for parity with
+     * the UNWRAP encoder. */
+    size_t payload_len = total - 4u;
+    if (payload_len > UINT16_MAX) return STM_EINVAL;
+
+    uint8_t *p = out_buf;
+    *p++ = STM_CORVUS_VERB_WRAP;
+    *p++ = STM_CORVUS_PROTO_V1;
+    store_le16(p, (uint16_t)payload_len);
+    p += 2;
+    memcpy(p, token, STM_CORVUS_TOKEN_LEN);
+    p += STM_CORVUS_TOKEN_LEN;
+    *p++ = (uint8_t)dataset_len;
+    /* dataset_len > 0 guaranteed above — unconditional copy. */
+    memcpy(p, dataset, dataset_len);
+    p += dataset_len;
+    store_le64(p, key_id);
+    p += 8;
+    /* dek_len is always exactly STM_CORVUS_DEK_LEN (32) on the wire. */
+    store_le16(p, (uint16_t)STM_CORVUS_DEK_LEN);
+    p += 2;
+    memcpy(p, dek, STM_CORVUS_DEK_LEN);
+    p += STM_CORVUS_DEK_LEN;
+
+    *out_len = (size_t)(p - out_buf);
+    /* Defense-in-depth: the computed length matches the predicted
+     * total. If not, we wrote off-by-one bytes that would surface as
+     * a corvus BadFormat on the wire. */
+    if (*out_len != total) return STM_EBACKEND;
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* WRAP decode.                                                            */
+/* ────────────────────────────────────────────────────────────────────── */
+
+stm_status stm_corvus_decode_wrap_response(const uint8_t *buf, size_t len,
+                                              stm_corvus_status *out_status,
+                                              uint8_t *out_envelope,
+                                              size_t out_envelope_cap,
+                                              size_t *out_envelope_len)
+{
+    if (!buf || !out_status) return STM_EINVAL;
+    /* If the caller wants the envelope bytes it MUST also pass a
+     * length-out param — otherwise it cannot know how many bytes
+     * landed in out_envelope. */
+    if (out_envelope && !out_envelope_len) return STM_EINVAL;
+
+    /* Sentinel out-of-enum value for the failure path. */
+    const stm_corvus_status SENTINEL =
+        (stm_corvus_status)(STM_CORVUS_STATUS_INTERNAL_ERROR + 1);
+    *out_status = SENTINEL;
+    if (out_envelope_len) *out_envelope_len = 0;
+
+    if (len < 3u) return STM_EPROTOCOL;
+
+    uint8_t  status_byte = buf[0];
+    uint16_t payload_len = load_le16(buf + 1);
+
+    /* Strict-equality on framing (R111 P3 F-10 carry): the buffer's
+     * trailing length MUST equal payload_len. Truncated AND
+     * oversize-trailing-bytes both refused. */
+    if ((size_t)payload_len != len - 3u) return STM_EPROTOCOL;
+
+    /* Validate status byte is a known value. */
+    switch (status_byte) {
+    case STM_CORVUS_STATUS_OK:
+    case STM_CORVUS_STATUS_BAD_AUTH:
+    case STM_CORVUS_STATUS_PERM_DENIED:
+    case STM_CORVUS_STATUS_NOT_FOUND:
+    case STM_CORVUS_STATUS_RATE_LIMITED:
+    case STM_CORVUS_STATUS_BAD_FORMAT:
+    case STM_CORVUS_STATUS_INTERNAL_ERROR:
+        break;
+    default:
+        return STM_EPROTOCOL;
+    }
+
+    if (status_byte == STM_CORVUS_STATUS_OK) {
+        /* Envelope discipline: status=OK → payload is a NON-EMPTY
+         * envelope no larger than STM_CORVUS_ENVELOPE_MAX. The
+         * envelope is opaque to Stratum (corvus carries its own
+         * envelope_version byte) — NO strict == 1217 check (design
+         * §7). A zero-length envelope on status=OK is a frame from a
+         * non-conforming peer; refuse. */
+        if (payload_len == 0u) return STM_EPROTOCOL;
+        if ((size_t)payload_len > STM_CORVUS_ENVELOPE_MAX) return STM_EPROTOCOL;
+        if (out_envelope) {
+            if (out_envelope_cap < (size_t)payload_len) return STM_ENOSPC;
+            memcpy(out_envelope, buf + 3, payload_len);
+        }
+        if (out_envelope_len) *out_envelope_len = (size_t)payload_len;
+    } else {
+        /* All non-OK statuses → payload must be exactly 0 bytes. */
+        if (payload_len != 0u) return STM_EPROTOCOL;
+    }
+
+    *out_status = (stm_corvus_status)status_byte;
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Session token loader.                                                   */
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -622,6 +761,201 @@ stm_status stm_corvus_unwrap(const stm_corvus_transport_opts *t_opts,
     for (size_t i = 0; i < STM_CORVUS_DEK_LEN; i++) {
         ((volatile uint8_t *)out_dek)[i] = 0;
     }
+    if (last_was_transport) return last_transport_rc;
+    return stm_corvus_status_to_stm(last_status);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* WRAP transport — TLY-A3-keyslot-wrap.                                   */
+/*                                                                         */
+/* Reuses the UNWRAP transport plumbing verbatim — dial_corvus,            */
+/* set_io_timeout, write_all, read_exact, BACKOFF_MS, the retry-eligible   */
+/* predicates, sleep_ms. The only verb-specific differences are the codec  */
+/* (encode_wrap / decode_wrap_response) and the variable-length opaque     */
+/* envelope in the response.                                               */
+/* ────────────────────────────────────────────────────────────────────── */
+
+stm_status stm_corvus_wrap_once(const stm_corvus_transport_opts *t_opts,
+                                   const uint8_t token[STM_CORVUS_TOKEN_LEN],
+                                   const char *dataset,
+                                   size_t dataset_len,
+                                   uint64_t key_id,
+                                   const uint8_t dek[STM_CORVUS_DEK_LEN],
+                                   stm_corvus_status *out_status,
+                                   uint8_t *out_envelope,
+                                   size_t out_envelope_cap,
+                                   size_t *out_envelope_len)
+{
+    if (!t_opts || !t_opts->socket_path || !*t_opts->socket_path
+        || !token || !dataset || dataset_len == 0u || !dek
+        || !out_status || !out_envelope || !out_envelope_len)
+        return STM_EINVAL;
+
+    /* Sentinel for failure paths. */
+    const stm_corvus_status SENTINEL =
+        (stm_corvus_status)(STM_CORVUS_STATUS_INTERNAL_ERROR + 1);
+    *out_status = SENTINEL;
+    *out_envelope_len = 0;
+
+    /* Build the WRAP request frame in a heap buffer. Worst case is
+     * ~335 bytes — small, but heap-allocated for symmetry with the
+     * UNWRAP path so the scrub-before-free discipline is uniform.
+     * The frame holds the 33-byte session token AND the 32-byte
+     * PLAINTEXT DEK. */
+    size_t req_cap = stm_corvus_encode_wrap_size(dataset_len);
+    if (req_cap == 0) return STM_EINVAL;
+    uint8_t *req = malloc(req_cap);
+    if (!req) return STM_ENOMEM;
+
+    /* Every exit after this point routes through `out:`, which
+     * scrubs `req` (token + plaintext DEK) BEFORE free() — no secret
+     * bytes left in freed heap. */
+    int fd = -1;
+    size_t req_len = 0;
+    stm_status s = stm_corvus_encode_wrap(token, dataset, dataset_len,
+                                              key_id, dek,
+                                              req, req_cap, &req_len);
+    if (s != STM_OK) goto out;
+
+    /* R144 P2-1: a zero timeout means "use the production-safe
+     * default", never "block forever" — a zero-initialized opts
+     * struct must not be able to hang the provisioning path. */
+    {
+        uint32_t ct = t_opts->connect_timeout_ms
+                          ? t_opts->connect_timeout_ms
+                          : STM_CORVUS_DEFAULT_TIMEOUT_MS;
+        uint32_t iot = t_opts->io_timeout_ms
+                          ? t_opts->io_timeout_ms
+                          : STM_CORVUS_DEFAULT_TIMEOUT_MS;
+        fd = dial_corvus(t_opts->socket_path, ct);
+        if (fd < 0) { s = STM_EBACKEND; goto out; }
+        set_io_timeout(fd, iot);
+    }
+
+    s = write_all(fd, req, req_len);
+    if (s != STM_OK) goto out;
+
+    /* Read the 3-byte response header. */
+    {
+        uint8_t hdr[3];
+        s = read_exact(fd, hdr, 3);
+        if (s != STM_OK) goto out;
+        uint16_t payload_len = (uint16_t)((uint16_t)hdr[1] |
+                                              ((uint16_t)hdr[2] << 8));
+
+        /* Pre-reject an oversize envelope at the header step, before
+         * reading the payload into the fixed `resp` buffer — a
+         * hostile/buggy corvus cannot make us read a 64 KiB payload.
+         * STM_CORVUS_ENVELOPE_MAX is the same cap the decoder
+         * enforces (R144 P3-1 doctrine carry). */
+        if ((size_t)payload_len > STM_CORVUS_ENVELOPE_MAX) {
+            s = STM_EPROTOCOL;
+            goto out;
+        }
+
+        /* 3 + 1280 = 1283 bytes on the stack — bounded + small. */
+        uint8_t resp[3u + STM_CORVUS_ENVELOPE_MAX];
+        resp[0] = hdr[0];
+        resp[1] = hdr[1];
+        resp[2] = hdr[2];
+        if (payload_len > 0u) {
+            s = read_exact(fd, resp + 3, payload_len);
+            if (s != STM_OK) goto out;
+        }
+
+        s = stm_corvus_decode_wrap_response(resp, 3u + (size_t)payload_len,
+                                                out_status, out_envelope,
+                                                out_envelope_cap,
+                                                out_envelope_len);
+    }
+
+out:
+    /* R138 P1-1 + design §7 — the WRAP request frame holds the
+     * 33-byte session token AND the 32-byte PLAINTEXT DEK. Scrub the
+     * whole buffer (req_cap, not req_len) on EVERY exit so neither
+     * the token nor the DEK is left in freed heap. The plaintext DEK
+     * is a confidentiality exposure UNWRAP never had (its request
+     * carries an opaque wrapped blob). Non-elidable `volatile` write
+     * — same idiom as stm_corvus_unwrap_once's scrub. The response
+     * envelope is a sealed blob — not secret, no scrub. */
+    {
+        volatile uint8_t *p = req;
+        for (size_t i = 0; i < req_cap; i++) p[i] = 0;
+    }
+    free(req);
+    if (fd >= 0) close(fd);
+    return s;
+}
+
+stm_status stm_corvus_wrap(const stm_corvus_transport_opts *t_opts,
+                              const uint8_t token[STM_CORVUS_TOKEN_LEN],
+                              const char *dataset,
+                              size_t dataset_len,
+                              uint64_t key_id,
+                              const uint8_t dek[STM_CORVUS_DEK_LEN],
+                              uint8_t *out_envelope,
+                              size_t out_envelope_cap,
+                              size_t *out_envelope_len)
+{
+    if (!t_opts || !token || !dataset || dataset_len == 0u || !dek
+        || !out_envelope || !out_envelope_len) return STM_EINVAL;
+
+    /* Clamp n_retries to the schedule length. */
+    uint32_t max_retries = t_opts->n_retries;
+    if (max_retries > 3u) max_retries = 3u;
+    uint32_t max_attempts = max_retries + 1u; /* attempts = retries + 1 */
+
+    stm_corvus_status last_status = STM_CORVUS_STATUS_OK;
+    stm_status        last_transport_rc = STM_OK;
+    bool              last_was_transport = false;
+
+    for (uint32_t attempt = 0; attempt < max_attempts; attempt++) {
+        if (attempt > 0u) {
+            /* Backoff before retry — schedule indexed by retry-#
+             * (FIRST retry waits 100ms, second 500ms, third 2000ms).
+             * Reuses the UNWRAP schedule per design §7 (STRATUM-API-V1
+             * §5.10 is silent on a WRAP-specific policy). */
+            uint32_t idx = attempt - 1u;
+            if (idx >= 3u) idx = 2u;
+            sleep_ms(BACKOFF_MS[idx]);
+        }
+
+        stm_corvus_status status = STM_CORVUS_STATUS_OK;
+        stm_status rc = stm_corvus_wrap_once(t_opts, token, dataset,
+                                                 dataset_len, key_id, dek,
+                                                 &status, out_envelope,
+                                                 out_envelope_cap,
+                                                 out_envelope_len);
+
+        if (rc == STM_OK) {
+            if (status == STM_CORVUS_STATUS_OK) return STM_OK;
+            if (is_retry_eligible_status(status)) {
+                last_status        = status;
+                last_was_transport = false;
+                continue;
+            }
+            /* Fatal corvus status — map and return immediately. The
+             * WRAP response envelope is NOT secret (it is a sealed
+             * blob), so — unlike stm_corvus_unwrap's out_dek — there
+             * is nothing to defensively zero; stm_corvus_wrap_once
+             * already left *out_envelope_len = 0 on the non-OK
+             * status path. */
+            return stm_corvus_status_to_stm(status);
+        }
+
+        /* Non-OK transport-side rc. */
+        if (is_retry_eligible_transport(rc)) {
+            last_transport_rc  = rc;
+            last_was_transport = true;
+            continue;
+        }
+        /* Fatal transport-side rc (STM_EPROTOCOL, STM_EINVAL, ...). */
+        return rc;
+    }
+
+    /* Retries exhausted. Surface the LAST observed failure as a typed
+     * stm_status. *out_envelope_len was left 0 by the last failed
+     * stm_corvus_wrap_once. */
     if (last_was_transport) return last_transport_rc;
     return stm_corvus_status_to_stm(last_status);
 }

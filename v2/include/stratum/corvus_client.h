@@ -7,29 +7,33 @@
  * (distinct from janus's `JPAS`) per `CORVUS-DESIGN.md §6.4` +
  * `STRATUM-API-V1.md §5`.
  *
- * v1.0 surface (this header):
+ * Surface (this header):
  *
- *   1. **UNWRAP codec** — encode a request frame containing a
- *      session token + dataset name + key_id + wrapped-DEK blob;
- *      decode a response frame containing a status byte + an
- *      optional 32-byte DEK payload.
+ *   1. **UNWRAP codec** — encode a request frame (session token +
+ *      dataset path + key_id + wrapped-DEK blob); decode a response
+ *      frame (status byte + optional 32-byte DEK payload).
  *
- *   2. **Session token loader** — read 33 bytes from a path,
+ *   2. **WRAP codec** (TLY-A3-keyslot-wrap) — encode a request frame
+ *      (session token + dataset path + key_id + 32-byte PLAINTEXT
+ *      DEK to seal); decode a response frame (status byte + optional
+ *      opaque DEK-envelope payload, ~1217 bytes). Provisioning-time
+ *      counterpart to UNWRAP: WRAP *produces* the corvus-sealed
+ *      envelope that a CORVUS keyslot stores and UNWRAP later
+ *      *consumes*.
+ *
+ *   3. **Transport + retry** — synchronous AF_UNIX dial + bounded
+ *      send/recv + the spec-fixed retry schedule, for both verbs.
+ *
+ *   4. **Session token loader** — read 33 bytes from a path,
  *      `mlock`(2) the buffer, `MADV_DONTDUMP` (Linux) to keep it
  *      out of core dumps. Caller `explicit_bzero`s + frees on
  *      shutdown.
  *
- * v1.0 explicitly does NOT include:
+ * Out of scope: DEK caching — the live DEK is lifted into
+ * `stm_sync` / per-dataset state by the mount + provisioning paths,
+ * not this module.
  *
- *   - Transport: caller dials the corvus socket + sends the
- *     encoded request via its own write(2). Keeps this module
- *     pure-codec.
- *   - Retry policy: TLY-A3-impl-2's responsibility (mount-time
- *     integration).
- *   - DEK caching: TLY-A3-impl-2 lifts the cached DEK into
- *     `stm_sync` / per-dataset state.
- *
- * Wire format (request, after Q11 protocol_version byte added):
+ * UNWRAP wire format (request — 4-byte versioned header):
  *
  *   [0]       verb_id          u8 = STM_CORVUS_VERB_UNWRAP (4)
  *   [1]       protocol_version u8 = STM_CORVUS_PROTO_V1 (1)
@@ -41,11 +45,31 @@
  *   [46+dl..48+dl) wrapped_len u16 LE
  *   [48+dl..)  wrapped         wrapped_len opaque bytes
  *
- * Wire format (response):
+ * UNWRAP wire format (response — 3-byte header, unversioned):
  *
  *   [0]       status           u8  (STM_CORVUS_STATUS_OK = 0, ...)
  *   [1..3)    payload_len      u16 LE
  *   [3..)     payload          on status=0: exactly 32 bytes (DEK)
+ *                              else: 0 bytes
+ *
+ * WRAP wire format (request — same 4-byte versioned header):
+ *
+ *   [0]       verb_id          u8 = STM_CORVUS_VERB_WRAP (10)
+ *   [1]       protocol_version u8 = STM_CORVUS_PROTO_V1 (1)
+ *   [2..4)    payload_len      u16 LE (count of bytes [4..end))
+ *   [4..37)   token            33 bytes (session token, verbatim)
+ *   [37]      dataset_len      u8 (1..255 — a WRAP must bind a path)
+ *   [38..38+dl) dataset        dataset_len utf-8 bytes
+ *   [38+dl..46+dl) key_id      u64 LE
+ *   [46+dl..48+dl) dek_len     u16 LE (always == 32)
+ *   [48+dl..80+dl) dek         32 bytes — PLAINTEXT DEK to seal
+ *
+ * WRAP wire format (response — 3-byte header, unversioned):
+ *
+ *   [0]       status           u8  (same enum as UNWRAP)
+ *   [1..3)    payload_len      u16 LE
+ *   [3..)     payload          on status=0: the opaque DEK envelope
+ *                              (~1217 bytes, ≤ STM_CORVUS_ENVELOPE_MAX);
  *                              else: 0 bytes
  *
  * Trust boundaries (audit-trigger surface — R144):
@@ -64,8 +88,17 @@
  *     concatenated with garbage). `mlock` best-effort; caller is
  *     responsible for explicit_bzero on shutdown.
  *
- *   - DEK output buffer: exactly 32 bytes when status=0. Caller-
- *     owned; caller `explicit_bzero`s when done.
+ *   - DEK output buffer (UNWRAP): exactly 32 bytes when status=0.
+ *     Caller-owned; caller `explicit_bzero`s when done.
+ *
+ *   - WRAP request confidentiality (R138 doctrine extension): the
+ *     WRAP request frame carries the PLAINTEXT DEK on the wire — an
+ *     exposure UNWRAP never had (UNWRAP's request carries an opaque
+ *     wrapped blob). The transport securely scrubs the encoded
+ *     request buffer (token + DEK) before free (a non-elidable
+ *     `volatile`-write loop — see corvus_client.c). The WRAP
+ *     *response* envelope is a sealed blob — not secret, no scrub
+ *     needed.
  *
  *   - No logging of token or DEK bytes. Status-string mappings in
  *     `util/status.c` mention "bad session token" generically.
@@ -88,6 +121,7 @@ extern "C" {
 /* ────────────────────────────────────────────────────────────────────── */
 
 #define STM_CORVUS_VERB_UNWRAP           ((uint8_t)4)
+#define STM_CORVUS_VERB_WRAP             ((uint8_t)10)
 #define STM_CORVUS_PROTO_V1              ((uint8_t)1)
 
 #define STM_CORVUS_TOKEN_LEN             33u
@@ -102,6 +136,25 @@ extern "C" {
 
 /* Response frame: 3 + 32 = 35 bytes (OK path); 3 bytes on error. */
 #define STM_CORVUS_RESPONSE_MAX  (3u + STM_CORVUS_DEK_LEN)
+
+/* Maximum WRAP-response DEK-envelope size Stratum will accept. corvus's
+ * ML-KEM-768 + X25519 envelope is ~1217 bytes today; this cap leaves
+ * headroom for envelope-format evolution. It is deliberately equal to
+ * keyschema's STM_KEYSCHEMA_WRAPPED_MAX — the envelope is stored
+ * verbatim as a CORVUS keyslot's `wrapped` blob, so the two caps MUST
+ * agree (the provisioning path static-asserts it). A future envelope
+ * exceeding this is a coordinated cap bump in both headers. */
+#define STM_CORVUS_ENVELOPE_MAX          1280u
+
+/* Worst-case WRAP request frame: 4 (header) + 33 (token) + 1 (ds_len)
+ * + 255 (dataset) + 8 (key_id) + 2 (dek_len) + 32 (dek) = 335. The DEK
+ * is fixed-size, so a WRAP request is far smaller than an UNWRAP one. */
+#define STM_CORVUS_WRAP_REQUEST_MAX  \
+    (4u + STM_CORVUS_TOKEN_LEN + 1u + STM_CORVUS_DATASET_MAX \
+     + 8u + 2u + STM_CORVUS_DEK_LEN)
+
+/* Worst-case WRAP response frame: 3 (header) + envelope. */
+#define STM_CORVUS_WRAP_RESPONSE_MAX  (3u + STM_CORVUS_ENVELOPE_MAX)
 
 /* corvus wire status byte values (verbatim from STRATUM-API-V1.md §5.2). */
 typedef enum {
@@ -207,6 +260,105 @@ stm_status stm_corvus_decode_response(const uint8_t *buf, size_t len,
  * maps to STM_OK; unknown values map to STM_EPROTOCOL.
  */
 stm_status stm_corvus_status_to_stm(stm_corvus_status s);
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* WRAP codec (TLY-A3-keyslot-wrap).                                       */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/*
+ * Encode a WRAP request into `out_buf`.
+ *
+ * WRAP is the provisioning-time counterpart of UNWRAP: it asks corvus
+ * to SEAL a freshly-generated plaintext DEK into an opaque envelope
+ * bound (AEAD-AD) to the dataset path. The request therefore carries
+ * the **plaintext DEK** — see the confidentiality note below.
+ *
+ * Inputs:
+ *   token        — exactly STM_CORVUS_TOKEN_LEN bytes (33).
+ *   dataset      — UTF-8 corvus dataset path ("users/<name>"), length
+ *                  `dataset_len`. Caller-validated; this codec does
+ *                  NOT inspect the bytes beyond bound-checking length.
+ *   dataset_len  — 1..STM_CORVUS_DATASET_MAX (255). Unlike UNWRAP, a
+ *                  zero-length dataset is REFUSED — a WRAP must bind
+ *                  to a real dataset path.
+ *   key_id       — opaque u64 (corvus's key registry index).
+ *   dek          — exactly STM_CORVUS_DEK_LEN (32) bytes of plaintext
+ *                  DEK to seal. Sensitive: caller's responsibility to
+ *                  mlock + explicit_bzero around the call site.
+ *   out_buf      — caller buffer of at least STM_CORVUS_WRAP_REQUEST_MAX
+ *                  bytes (or `stm_corvus_encode_wrap_size`).
+ *   out_cap      — capacity of `out_buf`.
+ *   out_len      — populated with the actual encoded length on success.
+ *
+ * Returns STM_OK on success, STM_EINVAL on NULL / zero-length dataset
+ * / oversize dataset, STM_ENOSPC if `out_cap` is too small.
+ *
+ * Confidentiality: `out_buf` holds the plaintext DEK after a
+ * successful encode. The caller MUST securely zero it (e.g.
+ * `stm_ct_memzero`) once the frame has been sent — the transport
+ * functions below do this. The encoder does NOT zero `out_buf` on
+ * error.
+ */
+STM_MUST_USE
+stm_status stm_corvus_encode_wrap(const uint8_t token[STM_CORVUS_TOKEN_LEN],
+                                     const char *dataset,
+                                     size_t dataset_len,
+                                     uint64_t key_id,
+                                     const uint8_t dek[STM_CORVUS_DEK_LEN],
+                                     uint8_t *out_buf,
+                                     size_t out_cap,
+                                     size_t *out_len);
+
+/*
+ * Compute the byte size a WRAP request would encode to. Returns the
+ * size on success, 0 on a zero-length or oversize dataset_len.
+ */
+size_t stm_corvus_encode_wrap_size(size_t dataset_len);
+
+/*
+ * Decode a corvus WRAP response frame.
+ *
+ * Inputs:
+ *   buf, len          — the on-wire response bytes. Caller frames.
+ *   out_status        — populated with the parsed status byte
+ *                       (stm_corvus_status enum).
+ *   out_envelope      — when status == OK, populated with the opaque
+ *                       DEK envelope. NULL → envelope dropped (caller
+ *                       doesn't want the bytes). NEVER populated on
+ *                       non-OK status.
+ *   out_envelope_cap  — capacity of `out_envelope`; must be ≥ the
+ *                       envelope length when out_envelope is non-NULL.
+ *   out_envelope_len  — populated with the envelope length on
+ *                       status == OK. MUST be non-NULL when
+ *                       out_envelope is non-NULL (otherwise the caller
+ *                       cannot know how many bytes landed). Set to 0
+ *                       on every non-OK / error path.
+ *
+ * The envelope is OPAQUE to Stratum — corvus carries its own
+ * `envelope_version` byte and the envelope may evolve. The decoder
+ * accepts any non-empty payload up to STM_CORVUS_ENVELOPE_MAX; it does
+ * NOT hard-check the current ~1217-byte size.
+ *
+ * Returns:
+ *   STM_OK         — frame well-formed; inspect *out_status. STM_OK
+ *                    here does NOT mean the WRAP succeeded.
+ *   STM_EPROTOCOL  — malformed frame (truncated, oversize, unknown
+ *                    status code, status/payload discipline violation,
+ *                    empty envelope on status=OK).
+ *   STM_EINVAL     — NULL buf/out_status, or out_envelope non-NULL
+ *                    with out_envelope_len NULL.
+ *   STM_ENOSPC     — out_envelope_cap < the envelope length.
+ *
+ * On non-OK return, *out_status is set to a sentinel
+ * (STM_CORVUS_STATUS_INTERNAL_ERROR + 1); out_envelope is NOT
+ * modified.
+ */
+STM_MUST_USE
+stm_status stm_corvus_decode_wrap_response(const uint8_t *buf, size_t len,
+                                              stm_corvus_status *out_status,
+                                              uint8_t *out_envelope,
+                                              size_t out_envelope_cap,
+                                              size_t *out_envelope_len);
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Transport + retry (TLY-A3-impl-2).                                      */
@@ -355,6 +507,70 @@ stm_status stm_corvus_unwrap(const stm_corvus_transport_opts *t_opts,
                                   const uint8_t *wrapped,
                                   size_t wrapped_len,
                                   uint8_t out_dek[STM_CORVUS_DEK_LEN]);
+
+/*
+ * Single-attempt WRAP transport. Dials the corvus socket, sends the
+ * encoded WRAP request, reads the response, decodes it.
+ *
+ * Same shape + return-code contract as `stm_corvus_unwrap_once`, with
+ * two differences:
+ *   - the request carries a PLAINTEXT DEK (`dek`) instead of an
+ *     opaque wrapped blob;
+ *   - the response carries an opaque, variable-length DEK envelope
+ *     instead of a fixed 32-byte DEK. `out_envelope` /
+ *     `out_envelope_cap` / `out_envelope_len` receive it; all three
+ *     are required (non-NULL) here.
+ *
+ * Confidentiality: the encoded request frame holds the session token
+ * AND the plaintext DEK. This function securely scrubs that buffer
+ * (a non-elidable `volatile`-write loop) after the send completes,
+ * before freeing it (R138 doctrine extension). The DEK is never
+ * logged.
+ *
+ * Returns STM_OK / STM_EBACKEND / STM_EPROTOCOL / STM_EINVAL /
+ * STM_ENOSPC / STM_ENOMEM exactly as `stm_corvus_unwrap_once`. On
+ * STM_OK the caller MUST inspect *out_status (STM_OK means the FRAME
+ * was well-formed, not that the WRAP succeeded).
+ */
+STM_MUST_USE
+stm_status stm_corvus_wrap_once(const stm_corvus_transport_opts *t_opts,
+                                   const uint8_t token[STM_CORVUS_TOKEN_LEN],
+                                   const char *dataset,
+                                   size_t dataset_len,
+                                   uint64_t key_id,
+                                   const uint8_t dek[STM_CORVUS_DEK_LEN],
+                                   stm_corvus_status *out_status,
+                                   uint8_t *out_envelope,
+                                   size_t out_envelope_cap,
+                                   size_t *out_envelope_len);
+
+/*
+ * Composite WRAP transport with retry. Wraps `stm_corvus_wrap_once`
+ * with the same spec-fixed retry schedule + retry-eligible vs fatal
+ * split as `stm_corvus_unwrap` (STRATUM-API-V1.md §5.10 is silent on
+ * a WRAP-specific policy; UNWRAP's §5.5 Q9 schedule is adopted
+ * symmetrically — 3 retries, 100/500/2000 ms; transport / RATE_LIMITED
+ * / INTERNAL_ERROR retry-eligible, BAD_AUTH / PERM_DENIED / NOT_FOUND
+ * / BAD_FORMAT / EPROTOCOL fatal).
+ *
+ * On success: returns STM_OK; out_envelope holds the opaque DEK
+ * envelope, *out_envelope_len its length. The envelope is NOT secret
+ * (it is a sealed blob) — no explicit_bzero needed on it.
+ *
+ * On retries-exhausted / fatal status: returns the typed
+ * STM_ECORVUS* / STM_EBACKEND / STM_EPROTOCOL exactly as
+ * `stm_corvus_unwrap`; *out_envelope_len is 0.
+ */
+STM_MUST_USE
+stm_status stm_corvus_wrap(const stm_corvus_transport_opts *t_opts,
+                              const uint8_t token[STM_CORVUS_TOKEN_LEN],
+                              const char *dataset,
+                              size_t dataset_len,
+                              uint64_t key_id,
+                              const uint8_t dek[STM_CORVUS_DEK_LEN],
+                              uint8_t *out_envelope,
+                              size_t out_envelope_cap,
+                              size_t *out_envelope_len);
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Session token loader.                                                   */

@@ -127,6 +127,11 @@ shifts by `corvus_path_len` bytes), so the 27 → 28 bump gates a v27
 binary mis-slicing a v28 value. `stm_keyschema_get_corvus_path` reads
 the recorded path back; `sync_unwrap_cb` uses it so the UNWRAP sends
 corvus the WRAP-recorded binding (`key_schema.tla::UnwrapUsesWrapBinding`).
+The envelope itself is produced by the corvus WRAP verb —
+`stm_corvus_wrap` in `corvus_client` (TLY-A3-keyslot-wrap chunk 4),
+the provisioning-time counterpart of `stm_corvus_unwrap`; the
+keyschema-side provisioning flow that calls it and writes the
+resulting `CORVUS` slot lands in a following chunk.
 See `v2/docs/thylacine-keyslot-wrap-design.md`.
 
 ### Mount-time unwrap routing (TLY-A3-keyslot-impl-3b)

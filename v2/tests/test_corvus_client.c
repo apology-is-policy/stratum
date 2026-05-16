@@ -1107,4 +1107,863 @@ STM_TEST(corvus_unwrap_once_zero_timeout_uses_default)
     free(resp);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* WRAP encode tests (TLY-A3-keyslot-wrap).                                */
+/* ────────────────────────────────────────────────────────────────────── */
+
+STM_TEST(corvus_encode_wrap_size_happy_path)
+{
+    /* 4 header + 33 token + 1 ds_len + 13 ds + 8 key_id + 2 dek_len
+     * + 32 dek = 93. */
+    size_t s = stm_corvus_encode_wrap_size(13);
+    STM_ASSERT_EQ((long long)s, (long long)(4 + 33 + 1 + 13 + 8 + 2 + 32));
+
+    /* Max dataset_len = 255. */
+    s = stm_corvus_encode_wrap_size(255);
+    STM_ASSERT_EQ((long long)s, (long long)(4 + 33 + 1 + 255 + 8 + 2 + 32));
+}
+
+STM_TEST(corvus_encode_wrap_size_refuses_zero_and_oversize)
+{
+    /* WRAP must bind a real path — zero-length dataset is invalid. */
+    STM_ASSERT_EQ(stm_corvus_encode_wrap_size(0), 0u);
+    STM_ASSERT_EQ(stm_corvus_encode_wrap_size(256), 0u);
+    STM_ASSERT_EQ(stm_corvus_encode_wrap_size(SIZE_MAX), 0u);
+}
+
+STM_TEST(corvus_encode_wrap_happy_path)
+{
+    uint8_t token[STM_CORVUS_TOKEN_LEN];
+    memset(token, 0xC1, sizeof token);
+    token[0] = 's';
+
+    const char *ds = "users/michael";
+    size_t ds_len = strlen(ds); /* 13 */
+    uint64_t key_id = 0x1122334455667788ull;
+    uint8_t dek[STM_CORVUS_DEK_LEN];
+    for (int i = 0; i < (int)STM_CORVUS_DEK_LEN; i++) {
+        dek[i] = (uint8_t)(0x40 + i);
+    }
+
+    uint8_t buf[STM_CORVUS_WRAP_REQUEST_MAX];
+    size_t enc_len = 0;
+    STM_ASSERT_OK(stm_corvus_encode_wrap(token, ds, ds_len, key_id, dek,
+                                              buf, sizeof buf, &enc_len));
+    /* Total = 4 + 33 + 1 + 13 + 8 + 2 + 32 = 93. */
+    STM_ASSERT_EQ((long long)enc_len, 93LL);
+
+    /* Header. */
+    STM_ASSERT_EQ((int)buf[0], 10); /* verb_id = STM_CORVUS_VERB_WRAP */
+    STM_ASSERT_EQ((int)buf[1], 1);  /* protocol_version */
+    /* payload_len = 93 - 4 = 89 (LE). */
+    STM_ASSERT_EQ((int)buf[2], 89);
+    STM_ASSERT_EQ((int)buf[3], 0);
+
+    /* Token. */
+    STM_ASSERT_EQ(memcmp(buf + 4, token, STM_CORVUS_TOKEN_LEN), 0);
+
+    /* dataset_len = 13. */
+    STM_ASSERT_EQ((int)buf[37], 13);
+    /* dataset. */
+    STM_ASSERT_EQ(memcmp(buf + 38, "users/michael", 13), 0);
+
+    /* key_id LE at offset 51. */
+    for (int i = 0; i < 8; i++) {
+        STM_ASSERT_EQ((int)buf[51 + i], (int)((key_id >> (8 * i)) & 0xFFu));
+    }
+
+    /* dek_len LE at offset 59 — always 32. */
+    STM_ASSERT_EQ((int)buf[59], 32);
+    STM_ASSERT_EQ((int)buf[60], 0);
+
+    /* dek at offset 61. */
+    STM_ASSERT_EQ(memcmp(buf + 61, dek, STM_CORVUS_DEK_LEN), 0);
+}
+
+STM_TEST(corvus_encode_wrap_refuses_zero_dataset)
+{
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = {0};
+    uint8_t dek[STM_CORVUS_DEK_LEN] = {0};
+    uint8_t buf[STM_CORVUS_WRAP_REQUEST_MAX];
+    size_t enc_len = 0;
+    /* dataset_len = 0 — WRAP must bind a real path. Refused even with
+     * a non-NULL dataset pointer (unlike UNWRAP, which permits it). */
+    STM_ASSERT_EQ(stm_corvus_encode_wrap(token, "", 0, 0, dek,
+                                              buf, sizeof buf, &enc_len),
+                    STM_EINVAL);
+}
+
+STM_TEST(corvus_encode_wrap_refuses_oversize_dataset)
+{
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = {0};
+    uint8_t dek[STM_CORVUS_DEK_LEN] = {0};
+    uint8_t buf[STM_CORVUS_WRAP_REQUEST_MAX];
+    size_t enc_len = 0;
+    char big[300];
+    memset(big, 'x', sizeof big);
+    STM_ASSERT_EQ(stm_corvus_encode_wrap(token, big, 256, 0, dek,
+                                              buf, sizeof buf, &enc_len),
+                    STM_EINVAL);
+}
+
+STM_TEST(corvus_encode_wrap_refuses_undersize_out)
+{
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = {0};
+    uint8_t dek[STM_CORVUS_DEK_LEN] = {0};
+    uint8_t buf[20];
+    size_t enc_len = 0;
+    STM_ASSERT_EQ(stm_corvus_encode_wrap(token, "users/x", 7, 0, dek,
+                                              buf, sizeof buf, &enc_len),
+                    STM_ENOSPC);
+}
+
+STM_TEST(corvus_encode_wrap_refuses_null_args)
+{
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = {0};
+    uint8_t dek[STM_CORVUS_DEK_LEN] = {0};
+    uint8_t buf[STM_CORVUS_WRAP_REQUEST_MAX];
+    size_t enc_len = 0;
+    STM_ASSERT_EQ(stm_corvus_encode_wrap(NULL, "users/x", 7, 0, dek,
+                                              buf, sizeof buf, &enc_len),
+                    STM_EINVAL);
+    STM_ASSERT_EQ(stm_corvus_encode_wrap(token, NULL, 7, 0, dek,
+                                              buf, sizeof buf, &enc_len),
+                    STM_EINVAL);
+    STM_ASSERT_EQ(stm_corvus_encode_wrap(token, "users/x", 7, 0, NULL,
+                                              buf, sizeof buf, &enc_len),
+                    STM_EINVAL);
+    STM_ASSERT_EQ(stm_corvus_encode_wrap(token, "users/x", 7, 0, dek,
+                                              NULL, sizeof buf, &enc_len),
+                    STM_EINVAL);
+    STM_ASSERT_EQ(stm_corvus_encode_wrap(token, "users/x", 7, 0, dek,
+                                              buf, sizeof buf, NULL),
+                    STM_EINVAL);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* WRAP decode tests.                                                      */
+/* ────────────────────────────────────────────────────────────────────── */
+
+STM_TEST(corvus_decode_wrap_response_ok_with_envelope)
+{
+    /* status OK + a 100-byte opaque envelope. */
+    const size_t ENV = 100;
+    uint8_t buf[3 + 100];
+    buf[0] = 0; /* STATUS_OK */
+    buf[1] = (uint8_t)(ENV & 0xFF);
+    buf[2] = (uint8_t)((ENV >> 8) & 0xFF);
+    for (size_t i = 0; i < ENV; i++) buf[3 + i] = (uint8_t)(0x90 + (i & 0x3F));
+
+    stm_corvus_status st = (stm_corvus_status)99;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    STM_ASSERT_OK(stm_corvus_decode_wrap_response(buf, sizeof buf, &st,
+                                                       env, sizeof env,
+                                                       &env_len));
+    STM_ASSERT_EQ((int)st, STM_CORVUS_STATUS_OK);
+    STM_ASSERT_EQ((long long)env_len, (long long)ENV);
+    for (size_t i = 0; i < ENV; i++) {
+        STM_ASSERT_EQ((int)env[i], (int)(uint8_t)(0x90 + (i & 0x3F)));
+    }
+}
+
+STM_TEST(corvus_decode_wrap_response_accepts_1217_envelope)
+{
+    /* The canonical ML-KEM-768 + X25519 envelope size — accepted with
+     * no strict size check (design §7: the envelope is opaque). */
+    const size_t ENV = 1217;
+    uint8_t *buf = malloc(3 + ENV);
+    STM_ASSERT(buf != NULL);
+    buf[0] = 0;
+    buf[1] = (uint8_t)(ENV & 0xFF);
+    buf[2] = (uint8_t)((ENV >> 8) & 0xFF);
+    for (size_t i = 0; i < ENV; i++) buf[3 + i] = (uint8_t)(i & 0xFF);
+
+    stm_corvus_status st = (stm_corvus_status)99;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    STM_ASSERT_OK(stm_corvus_decode_wrap_response(buf, 3 + ENV, &st,
+                                                       env, sizeof env,
+                                                       &env_len));
+    STM_ASSERT_EQ((int)st, STM_CORVUS_STATUS_OK);
+    STM_ASSERT_EQ((long long)env_len, (long long)ENV);
+    free(buf);
+}
+
+STM_TEST(corvus_decode_wrap_response_error_statuses)
+{
+    uint8_t codes[] = { 1, 2, 3, 4, 5, 6 };
+    stm_corvus_status expected[] = {
+        STM_CORVUS_STATUS_BAD_AUTH,
+        STM_CORVUS_STATUS_PERM_DENIED,
+        STM_CORVUS_STATUS_NOT_FOUND,
+        STM_CORVUS_STATUS_RATE_LIMITED,
+        STM_CORVUS_STATUS_BAD_FORMAT,
+        STM_CORVUS_STATUS_INTERNAL_ERROR,
+    };
+    for (size_t i = 0; i < sizeof codes; i++) {
+        uint8_t buf[3] = { codes[i], 0, 0 };
+        stm_corvus_status st = (stm_corvus_status)99;
+        size_t env_len = 123; /* must be reset to 0 */
+        STM_ASSERT_OK(stm_corvus_decode_wrap_response(buf, sizeof buf, &st,
+                                                           NULL, 0, &env_len));
+        STM_ASSERT_EQ((int)st, (int)expected[i]);
+        STM_ASSERT_EQ((long long)env_len, 0LL);
+    }
+}
+
+STM_TEST(corvus_decode_wrap_response_refuses_truncated)
+{
+    uint8_t buf[2] = { 0, 0 };
+    stm_corvus_status st;
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(buf, sizeof buf, &st,
+                                                       NULL, 0, NULL),
+                    STM_EPROTOCOL);
+
+    /* payload_len says 100 but only the 3-byte header is present. */
+    uint8_t buf2[3] = { 0, 100, 0 };
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(buf2, sizeof buf2, &st,
+                                                       NULL, 0, NULL),
+                    STM_EPROTOCOL);
+}
+
+STM_TEST(corvus_decode_wrap_response_refuses_trailing_bytes)
+{
+    /* payload_len = 50, but buffer carries 60 trailing bytes. */
+    uint8_t buf[3 + 60] = {0};
+    buf[0] = 0; buf[1] = 50; buf[2] = 0;
+    stm_corvus_status st;
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(buf, sizeof buf, &st,
+                                                       NULL, 0, NULL),
+                    STM_EPROTOCOL);
+}
+
+STM_TEST(corvus_decode_wrap_response_refuses_unknown_status)
+{
+    uint8_t buf[3] = { 7, 0, 0 }; /* 7 is outside the enum. */
+    stm_corvus_status st;
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(buf, sizeof buf, &st,
+                                                       NULL, 0, NULL),
+                    STM_EPROTOCOL);
+}
+
+STM_TEST(corvus_decode_wrap_response_refuses_empty_envelope)
+{
+    /* status=OK but payload_len = 0 — a WRAP-OK MUST carry a
+     * non-empty envelope. */
+    uint8_t buf[3] = { 0, 0, 0 };
+    stm_corvus_status st;
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(buf, sizeof buf, &st,
+                                                       NULL, 0, NULL),
+                    STM_EPROTOCOL);
+}
+
+STM_TEST(corvus_decode_wrap_response_refuses_oversize_envelope)
+{
+    /* status=OK + payload_len = STM_CORVUS_ENVELOPE_MAX + 1 (1281). */
+    const size_t ENV = STM_CORVUS_ENVELOPE_MAX + 1u;
+    uint8_t *buf = malloc(3 + ENV);
+    STM_ASSERT(buf != NULL);
+    buf[0] = 0;
+    buf[1] = (uint8_t)(ENV & 0xFF);
+    buf[2] = (uint8_t)((ENV >> 8) & 0xFF);
+    memset(buf + 3, 0xEE, ENV);
+    stm_corvus_status st;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(buf, 3 + ENV, &st,
+                                                       env, sizeof env,
+                                                       &env_len),
+                    STM_EPROTOCOL);
+    free(buf);
+}
+
+STM_TEST(corvus_decode_wrap_response_refuses_status_payload_mismatch)
+{
+    /* status=BAD_AUTH but payload_len != 0 — non-conforming peer. */
+    uint8_t buf[3 + 16] = {0};
+    buf[0] = 1; buf[1] = 16; buf[2] = 0;
+    stm_corvus_status st;
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(buf, sizeof buf, &st,
+                                                       NULL, 0, NULL),
+                    STM_EPROTOCOL);
+}
+
+STM_TEST(corvus_decode_wrap_response_refuses_undersize_envelope_out)
+{
+    /* envelope = 100 bytes but out_envelope_cap = 50. */
+    uint8_t buf[3 + 100] = {0};
+    buf[0] = 0; buf[1] = 100; buf[2] = 0;
+    stm_corvus_status st;
+    uint8_t env[50];
+    size_t env_len = 0;
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(buf, sizeof buf, &st,
+                                                       env, sizeof env,
+                                                       &env_len),
+                    STM_ENOSPC);
+}
+
+STM_TEST(corvus_decode_wrap_response_refuses_envelope_without_len)
+{
+    /* out_envelope non-NULL but out_envelope_len NULL — the caller
+     * cannot learn how many bytes landed. Refused. */
+    uint8_t buf[3 + 64] = {0};
+    buf[0] = 0; buf[1] = 64; buf[2] = 0;
+    stm_corvus_status st;
+    uint8_t env[64];
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(buf, sizeof buf, &st,
+                                                       env, sizeof env, NULL),
+                    STM_EINVAL);
+}
+
+STM_TEST(corvus_decode_wrap_response_null_envelope_drops_bytes)
+{
+    /* OK status + envelope, but caller passes NULL out_envelope — the
+     * envelope is dropped; status + length still reported. */
+    uint8_t buf[3 + 80] = {0};
+    buf[0] = 0; buf[1] = 80; buf[2] = 0;
+    for (int i = 0; i < 80; i++) buf[3 + i] = (uint8_t)i;
+    stm_corvus_status st = (stm_corvus_status)99;
+    size_t env_len = 0;
+    STM_ASSERT_OK(stm_corvus_decode_wrap_response(buf, sizeof buf, &st,
+                                                       NULL, 0, &env_len));
+    STM_ASSERT_EQ((int)st, STM_CORVUS_STATUS_OK);
+    STM_ASSERT_EQ((long long)env_len, 80LL);
+}
+
+STM_TEST(corvus_decode_wrap_response_refuses_null_args)
+{
+    uint8_t buf[3] = { 0, 0, 0 };
+    stm_corvus_status st;
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(NULL, 3, &st, NULL, 0, NULL),
+                    STM_EINVAL);
+    STM_ASSERT_EQ(stm_corvus_decode_wrap_response(buf, 3, NULL, NULL, 0, NULL),
+                    STM_EINVAL);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* WRAP transport tests.                                                   */
+/* The fake_corvus_unwrap harness above is verb-agnostic (it captures the  */
+/* request bytes + replays scripted responses), so it serves WRAP          */
+/* unchanged — only the verb byte + codec differ.                          */
+/* ────────────────────────────────────────────────────────────────────── */
+
+STM_TEST(corvus_wrap_once_happy_path)
+{
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "wrap_once_happy") == 0);
+
+    /* Scripted response: OK + a 200-byte envelope. */
+    uint8_t env_payload[200];
+    for (int i = 0; i < 200; i++) env_payload[i] = (uint8_t)(0xA0 + (i & 0x1F));
+    size_t resp_len;
+    uint8_t *resp = build_resp(STM_CORVUS_STATUS_OK, env_payload,
+                                   sizeof env_payload, &resp_len);
+    STM_ASSERT(resp != NULL);
+    fc.responses     = &resp;
+    fc.response_lens = &resp_len;
+    fc.n_responses   = 1;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = fc.sock_path,
+        .connect_timeout_ms = 1000,
+        .io_timeout_ms      = 1000,
+        .n_retries          = 0,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN];
+    memset(token, 0xAB, sizeof token);
+    token[0] = 's';
+    uint8_t dek[STM_CORVUS_DEK_LEN];
+    for (int i = 0; i < (int)STM_CORVUS_DEK_LEN; i++) {
+        dek[i] = (uint8_t)(0x50 + i);
+    }
+
+    stm_corvus_status status = STM_CORVUS_STATUS_INTERNAL_ERROR;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap_once(&t, token, "users/michael", 13,
+                                              42, dek, &status,
+                                              env, sizeof env, &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_OK);
+    STM_ASSERT_EQ((int)status, (int)STM_CORVUS_STATUS_OK);
+    STM_ASSERT_EQ((long long)env_len, 200LL);
+    for (int i = 0; i < 200; i++) {
+        STM_ASSERT_EQ((int)env[i], (int)(uint8_t)(0xA0 + (i & 0x1F)));
+    }
+
+    /* Verify the request the fake received. */
+    STM_ASSERT(fc.last_request_len > 0);
+    STM_ASSERT_EQ((int)fc.last_request[0], STM_CORVUS_VERB_WRAP);   /* 10 */
+    STM_ASSERT_EQ((int)fc.last_request[1], STM_CORVUS_PROTO_V1);    /* 1 */
+    /* token at [4..37). */
+    for (unsigned i = 0; i < STM_CORVUS_TOKEN_LEN; i++) {
+        STM_ASSERT_EQ((int)fc.last_request[4 + i], (int)token[i]);
+    }
+    /* dataset_len at [37], dataset "users/michael" at [38..51). */
+    STM_ASSERT_EQ((int)fc.last_request[37], 13);
+    STM_ASSERT_EQ(memcmp(fc.last_request + 38, "users/michael", 13), 0);
+    /* dek_len at [59..61) == 32; the PLAINTEXT dek at [61..93). */
+    STM_ASSERT_EQ((int)fc.last_request[59], 32);
+    STM_ASSERT_EQ((int)fc.last_request[60], 0);
+    for (int i = 0; i < (int)STM_CORVUS_DEK_LEN; i++) {
+        STM_ASSERT_EQ((int)fc.last_request[61 + i], (int)dek[i]);
+    }
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+    free(resp);
+}
+
+STM_TEST(corvus_wrap_once_refuses_null_args)
+{
+    stm_corvus_transport_opts t = { .socket_path = "/tmp/x",
+                                       .connect_timeout_ms = 100,
+                                       .io_timeout_ms = 100 };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    stm_corvus_status status = STM_CORVUS_STATUS_OK;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+
+    STM_ASSERT_EQ((int)stm_corvus_wrap_once(NULL, token, "users/x", 7, 0, dek,
+                                                 &status, env, sizeof env,
+                                                 &env_len), (int)STM_EINVAL);
+    STM_ASSERT_EQ((int)stm_corvus_wrap_once(&t, NULL, "users/x", 7, 0, dek,
+                                                 &status, env, sizeof env,
+                                                 &env_len), (int)STM_EINVAL);
+    /* dataset_len = 0 — a WRAP must bind a real path. */
+    STM_ASSERT_EQ((int)stm_corvus_wrap_once(&t, token, "users/x", 0, 0, dek,
+                                                 &status, env, sizeof env,
+                                                 &env_len), (int)STM_EINVAL);
+    /* NULL dataset. */
+    STM_ASSERT_EQ((int)stm_corvus_wrap_once(&t, token, NULL, 7, 0, dek,
+                                                 &status, env, sizeof env,
+                                                 &env_len), (int)STM_EINVAL);
+    /* NULL dek. */
+    STM_ASSERT_EQ((int)stm_corvus_wrap_once(&t, token, "users/x", 7, 0, NULL,
+                                                 &status, env, sizeof env,
+                                                 &env_len), (int)STM_EINVAL);
+    /* NULL out_status. */
+    STM_ASSERT_EQ((int)stm_corvus_wrap_once(&t, token, "users/x", 7, 0, dek,
+                                                 NULL, env, sizeof env,
+                                                 &env_len), (int)STM_EINVAL);
+    /* NULL out_envelope. */
+    STM_ASSERT_EQ((int)stm_corvus_wrap_once(&t, token, "users/x", 7, 0, dek,
+                                                 &status, NULL, sizeof env,
+                                                 &env_len), (int)STM_EINVAL);
+    /* NULL out_envelope_len. */
+    STM_ASSERT_EQ((int)stm_corvus_wrap_once(&t, token, "users/x", 7, 0, dek,
+                                                 &status, env, sizeof env,
+                                                 NULL), (int)STM_EINVAL);
+    /* Empty socket_path. */
+    stm_corvus_transport_opts t_empty = { .socket_path = "",
+                                             .connect_timeout_ms = 100,
+                                             .io_timeout_ms = 100 };
+    STM_ASSERT_EQ((int)stm_corvus_wrap_once(&t_empty, token, "users/x", 7, 0,
+                                                 dek, &status, env, sizeof env,
+                                                 &env_len), (int)STM_EINVAL);
+}
+
+STM_TEST(corvus_wrap_once_dial_refused_is_ebackend)
+{
+    stm_corvus_transport_opts t = {
+        .socket_path        = "/tmp/stm_corvus_wrap_no_such.sock",
+        .connect_timeout_ms = 100,
+        .io_timeout_ms      = 100,
+        .n_retries          = 0,
+    };
+    (void)unlink(t.socket_path);
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    stm_corvus_status status = STM_CORVUS_STATUS_OK;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap_once(&t, token, "users/x", 7, 0, dek,
+                                              &status, env, sizeof env,
+                                              &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_EBACKEND);
+}
+
+STM_TEST(corvus_wrap_once_eof_mid_response_is_ebackend)
+{
+    /* Fake corvus accepts but sends 0 bytes before closing. */
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "wrap_eof") == 0);
+    fc.n_responses = 1;
+    size_t empty_len = 0;
+    uint8_t *empty_resp = NULL;
+    fc.responses = &empty_resp;
+    fc.response_lens = &empty_len;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = fc.sock_path,
+        .connect_timeout_ms = 1000,
+        .io_timeout_ms      = 1000,
+        .n_retries          = 0,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    stm_corvus_status status = STM_CORVUS_STATUS_OK;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap_once(&t, token, "users/x", 7, 0, dek,
+                                              &status, env, sizeof env,
+                                              &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_EBACKEND);
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+}
+
+STM_TEST(corvus_wrap_once_oversize_envelope_is_eprotocol)
+{
+    /* A hostile/buggy corvus sends status=OK with payload_len = 2000
+     * (> STM_CORVUS_ENVELOPE_MAX). The transport must reject at the
+     * header-read step, before reading the payload into the fixed
+     * `resp` stack buffer. 2000 = 0x07D0 LE. */
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "wrap_oversize") == 0);
+    uint8_t hdr[3] = { STM_CORVUS_STATUS_OK, 0xD0, 0x07 };
+    size_t hdr_len = sizeof hdr;
+    uint8_t *hdr_p = hdr;
+    fc.responses     = &hdr_p;
+    fc.response_lens = &hdr_len;
+    fc.n_responses   = 1;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = fc.sock_path,
+        .connect_timeout_ms = 1000,
+        .io_timeout_ms      = 1000,
+        .n_retries          = 0,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    stm_corvus_status status = STM_CORVUS_STATUS_OK;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap_once(&t, token, "users/x", 7, 0, dek,
+                                              &status, env, sizeof env,
+                                              &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_EPROTOCOL);
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+}
+
+STM_TEST(corvus_wrap_once_empty_envelope_is_eprotocol)
+{
+    /* status=OK + payload_len=0 — a WRAP-OK must carry an envelope. */
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "wrap_empty_env") == 0);
+    size_t resp_len;
+    uint8_t *resp = build_resp(STM_CORVUS_STATUS_OK, NULL, 0, &resp_len);
+    STM_ASSERT(resp != NULL);
+    fc.responses     = &resp;
+    fc.response_lens = &resp_len;
+    fc.n_responses   = 1;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = fc.sock_path,
+        .connect_timeout_ms = 1000,
+        .io_timeout_ms      = 1000,
+        .n_retries          = 0,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    stm_corvus_status status = STM_CORVUS_STATUS_OK;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap_once(&t, token, "users/x", 7, 0, dek,
+                                              &status, env, sizeof env,
+                                              &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_EPROTOCOL);
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+    free(resp);
+}
+
+STM_TEST(corvus_wrap_once_bad_auth_returns_ok_with_status)
+{
+    /* corvus returns BadAuth — wrap_once still returns STM_OK (frame
+     * parsed); caller inspects out_status. */
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "wrap_bad_auth") == 0);
+    size_t resp_len;
+    uint8_t *resp = build_resp(STM_CORVUS_STATUS_BAD_AUTH, NULL, 0, &resp_len);
+    STM_ASSERT(resp != NULL);
+    fc.responses     = &resp;
+    fc.response_lens = &resp_len;
+    fc.n_responses   = 1;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = fc.sock_path,
+        .connect_timeout_ms = 1000,
+        .io_timeout_ms      = 1000,
+        .n_retries          = 0,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    stm_corvus_status status = STM_CORVUS_STATUS_OK;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap_once(&t, token, "users/x", 7, 0, dek,
+                                              &status, env, sizeof env,
+                                              &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_OK);
+    STM_ASSERT_EQ((int)status, (int)STM_CORVUS_STATUS_BAD_AUTH);
+    STM_ASSERT_EQ((long long)env_len, 0LL);
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+    free(resp);
+}
+
+STM_TEST(corvus_wrap_once_zero_timeout_uses_default)
+{
+    /* connect/io timeouts left at 0 — exercises the R144 P2-1 default
+     * substitution; the happy path must still drive a successful WRAP
+     * and not hang. */
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "wrap_zero_to") == 0);
+    uint8_t env_payload[64];
+    memset(env_payload, 0x5C, sizeof env_payload);
+    size_t resp_len;
+    uint8_t *resp = build_resp(STM_CORVUS_STATUS_OK, env_payload,
+                                   sizeof env_payload, &resp_len);
+    STM_ASSERT(resp != NULL);
+    fc.responses     = &resp;
+    fc.response_lens = &resp_len;
+    fc.n_responses   = 1;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path = fc.sock_path,
+        .n_retries   = 0,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    stm_corvus_status status = STM_CORVUS_STATUS_INTERNAL_ERROR;
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap_once(&t, token, "users/x", 7, 0, dek,
+                                              &status, env, sizeof env,
+                                              &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_OK);
+    STM_ASSERT_EQ((int)status, (int)STM_CORVUS_STATUS_OK);
+    STM_ASSERT_EQ((long long)env_len, 64LL);
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+    free(resp);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* WRAP retry tests (stm_corvus_wrap).                                     */
+/* ────────────────────────────────────────────────────────────────────── */
+
+STM_TEST(corvus_wrap_retries_on_internal_then_succeeds)
+{
+    /* Attempt 1: InternalError (retry-eligible). Attempt 2: OK. */
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "wrap_retry_int") == 0);
+
+    uint8_t env_payload[128];
+    memset(env_payload, 0x3D, sizeof env_payload);
+    size_t r1_len, r2_len;
+    uint8_t *r1 = build_resp(STM_CORVUS_STATUS_INTERNAL_ERROR, NULL, 0, &r1_len);
+    uint8_t *r2 = build_resp(STM_CORVUS_STATUS_OK, env_payload,
+                                sizeof env_payload, &r2_len);
+    STM_ASSERT(r1 && r2);
+    uint8_t *resps[2] = { r1, r2 };
+    size_t   r_lens[2] = { r1_len, r2_len };
+    fc.responses     = resps;
+    fc.response_lens = r_lens;
+    fc.n_responses   = 2;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = fc.sock_path,
+        .connect_timeout_ms = 1000,
+        .io_timeout_ms      = 1000,
+        .n_retries          = 1,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap(&t, token, "users/x", 7, 0, dek,
+                                         env, sizeof env, &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_OK);
+    STM_ASSERT_EQ((long long)env_len, 128LL);
+    for (int i = 0; i < 128; i++) STM_ASSERT_EQ((int)env[i], 0x3D);
+    STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 2);
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+    free(r1);
+    free(r2);
+}
+
+STM_TEST(corvus_wrap_no_retry_on_perm_denied)
+{
+    /* PERM_DENIED is fatal — maps to STM_ECORVUSPERM, no retry. */
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "wrap_no_retry_perm") == 0);
+    size_t r1_len, r2_len;
+    uint8_t *r1 = build_resp(STM_CORVUS_STATUS_PERM_DENIED, NULL, 0, &r1_len);
+    uint8_t env_payload[32];
+    memset(env_payload, 0x11, sizeof env_payload);
+    uint8_t *r2 = build_resp(STM_CORVUS_STATUS_OK, env_payload,
+                                sizeof env_payload, &r2_len);
+    STM_ASSERT(r1 && r2);
+    uint8_t *resps[2] = { r1, r2 };
+    size_t   r_lens[2] = { r1_len, r2_len };
+    fc.responses     = resps;
+    fc.response_lens = r_lens;
+    fc.n_responses   = 2;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = fc.sock_path,
+        .connect_timeout_ms = 1000,
+        .io_timeout_ms      = 1000,
+        .n_retries          = 3,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap(&t, token, "users/x", 7, 0, dek,
+                                         env, sizeof env, &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_ECORVUSPERM);
+    /* Only ONE accept should have happened. */
+    STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 1);
+    STM_ASSERT_EQ((long long)env_len, 0LL);
+
+    /* Harness is sitting in accept() (n_responses=2); shutdown wakes
+     * it so the join is clean. */
+    fake_corvus_unwrap_stop(&fc);
+    pthread_join(tid, NULL);
+    free(r1);
+    free(r2);
+}
+
+STM_TEST(corvus_wrap_exhausts_retries_then_returns_last)
+{
+    /* Three responses, all InternalError; n_retries=2 → 3 attempts;
+     * the wrapper exhausts and returns STM_ECORVUSINTERNAL. */
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "wrap_exhaust") == 0);
+    size_t lens[3];
+    uint8_t *resps[3] = {
+        build_resp(STM_CORVUS_STATUS_INTERNAL_ERROR, NULL, 0, &lens[0]),
+        build_resp(STM_CORVUS_STATUS_INTERNAL_ERROR, NULL, 0, &lens[1]),
+        build_resp(STM_CORVUS_STATUS_INTERNAL_ERROR, NULL, 0, &lens[2]),
+    };
+    STM_ASSERT(resps[0] && resps[1] && resps[2]);
+    fc.responses     = resps;
+    fc.response_lens = lens;
+    fc.n_responses   = 3;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = fc.sock_path,
+        .connect_timeout_ms = 1000,
+        .io_timeout_ms      = 1000,
+        .n_retries          = 2, /* 3 attempts total */
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap(&t, token, "users/x", 7, 0, dek,
+                                         env, sizeof env, &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_ECORVUSINTERNAL);
+    STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 3);
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+    for (int i = 0; i < 3; i++) free(resps[i]);
+}
+
+STM_TEST(corvus_wrap_zero_retries_single_attempt)
+{
+    /* n_retries=0 → single attempt; InternalError surfaces
+     * immediately as STM_ECORVUSINTERNAL. */
+    fake_corvus_unwrap fc;
+    STM_ASSERT(fake_corvus_unwrap_start(&fc, "wrap_zero_retry") == 0);
+    size_t r_len;
+    uint8_t *r = build_resp(STM_CORVUS_STATUS_INTERNAL_ERROR, NULL, 0, &r_len);
+    STM_ASSERT(r != NULL);
+    fc.responses     = &r;
+    fc.response_lens = &r_len;
+    fc.n_responses   = 1;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_unwrap_thread, &fc);
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = fc.sock_path,
+        .connect_timeout_ms = 1000,
+        .io_timeout_ms      = 1000,
+        .n_retries          = 0,
+    };
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap(&t, token, "users/x", 7, 0, dek,
+                                         env, sizeof env, &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_ECORVUSINTERNAL);
+    STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 1);
+
+    pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
+    free(r);
+}
+
+STM_TEST(corvus_wrap_dial_failure_propagates_as_ebackend)
+{
+    /* No fake corvus running → dial fails on every attempt → after
+     * retries-exhausted, surface STM_EBACKEND. */
+    stm_corvus_transport_opts t = {
+        .socket_path        = "/tmp/stm_corvus_wrap_no_listener.sock",
+        .connect_timeout_ms = 50,
+        .io_timeout_ms      = 50,
+        .n_retries          = 1,
+    };
+    (void)unlink(t.socket_path);
+    uint8_t token[STM_CORVUS_TOKEN_LEN] = { 0 };
+    uint8_t dek[STM_CORVUS_DEK_LEN] = { 0 };
+    uint8_t env[STM_CORVUS_ENVELOPE_MAX];
+    size_t env_len = 0;
+    stm_status rc = stm_corvus_wrap(&t, token, "users/x", 7, 0, dek,
+                                         env, sizeof env, &env_len);
+    STM_ASSERT_EQ((int)rc, (int)STM_EBACKEND);
+}
+
 STM_TEST_MAIN("corvus_client")
