@@ -5706,9 +5706,10 @@ stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
 {
     if (!fs || !name || !corvus_dataset_path || !corvus || !out_id)
         return STM_EINVAL;
-    /* Path-length + token-presence validation is delegated to
-     * stm_sync_add_dataset_key_corvus, which refuses STM_EINVAL on a
-     * zero-length / oversize path or a NULL session_token. */
+    /* Path validation (length, control bytes, embedded NUL) and
+     * token-presence validation are delegated to
+     * stm_sync_add_dataset_key_corvus -> validate_corvus_path, which
+     * refuse STM_EINVAL on any violation. */
 
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);

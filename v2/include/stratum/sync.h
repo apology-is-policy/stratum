@@ -221,8 +221,11 @@ void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
  * the duration of the stm_sync_open call; it is not referenced after.
  */
 typedef struct {
-    /* AF_UNIX path of the corvus UNWRAP socket. NULL → the corvus
-     * client's default ("/srv/corvus/ops/unwrap") is used. */
+    /* AF_UNIX path of the corvus socket. REQUIRED: a NULL or empty
+     * path is refused with STM_EINVAL by the corvus transport — there
+     * is no default-path substitution (only the timeouts below carry
+     * a 0 → default rule). The v1.0 corvus convention is
+     * "/srv/corvus/ops/unwrap"; the operator passes it explicitly. */
     const char    *socket_path;
     /* Session token — exactly STM_CORVUS_TOKEN_LEN (33) bytes.
      * Borrowed; sensitive. NULL → corvus is treated as not
@@ -837,9 +840,10 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
  *
  * `corvus_dataset_path` is corvus's stable AEAD-AD-bound identity for
  * the dataset (STRATUM-API-V1.md §5.10) — REQUIRED, non-NULL, length
- * 1..STM_KEYSCHEMA_CORVUS_PATH_MAX (255). It is recorded verbatim in
- * the slot so a later mount sends corvus the same binding
- * (key_schema.tla::UnwrapUsesWrapBinding).
+ * 1..STM_KEYSCHEMA_CORVUS_PATH_MAX (255), and content-validated:
+ * control bytes (< 0x20, == 0x7F) and embedded NUL are refused
+ * (R148 P2-2). It is recorded verbatim in the slot so a later mount
+ * sends corvus the same binding (key_schema.tla::UnwrapUsesWrapBinding).
  *
  * `corvus` carries the corvus socket path + session token + transport
  * budget (same struct the mount path uses). The token is BORROWED —

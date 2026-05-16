@@ -120,8 +120,11 @@ state(1) || flags(1) || wrapper_identity(1) || corvus_path_len(1)
 ```
 
 A `CORVUS` slot MUST carry a non-empty path; every other wrapper MUST
-carry a zero-length one — `insert_wrapped` / `rotate` enforce this
-(`STM_EINVAL`), `decode_val` re-checks it (`STM_ECORRUPT`). Unlike the
+carry a zero-length one — `insert_wrapped` / `rotate` enforce this via
+`validate_corvus_path` (`STM_EINVAL`), which also refuses control bytes
++ embedded NUL in the path (R148 P2-2, R99 line-injection doctrine);
+`decode_val` re-checks the CORVUS⟺path rule (`STM_ECORRUPT`) and bounds
+`corvus_path_len` against `STM_KEYSCHEMA_CORVUS_PATH_MAX` (R148 P2-1). Unlike the
 26 → 27 bump this is a genuine *layout* change (the wrapped blob
 shifts by `corvus_path_len` bytes), so the 27 → 28 bump gates a v27
 binary mis-slicing a v28 value. `stm_keyschema_get_corvus_path` reads

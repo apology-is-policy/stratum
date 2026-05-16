@@ -604,4 +604,42 @@ STM_TEST(corvus_provision_refuses_duplicate) {
     unlink(g_tmp_path);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* R148 P2-2: validate_corvus_path refuses control bytes in the corvus    */
+/* dataset path — at the keyschema layer no producer can bypass.          */
+/* ────────────────────────────────────────────────────────────────────── */
+
+STM_TEST(corvus_keyslot_refuses_control_byte_path) {
+    make_tmp("ctlbyte");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL;
+    stm_sync  *s = NULL;
+    STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_pool *pool = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+
+    static const uint8_t blob[16] = {
+        0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
+        0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44,
+    };
+    /* A CORVUS keyslot path carrying a control byte (0x01) must be
+     * refused at validate_corvus_path — reached here via the test
+     * seam -> stm_keyschema_insert_wrapped, the layer no producer can
+     * bypass (R99 line-injection doctrine). The split literal stops
+     * \x01 from greedily eating the "bad" hex digits. */
+    static const char bad_path[] = "users/\x01" "bad";
+    STM_ASSERT_ERR(stm_sync_keyschema_insert_for_test(
+                       s, CORVUS_DATASET_ID, CORVUS_KEY_ID,
+                       STM_KS_WRAPPER_CORVUS, blob, sizeof blob,
+                       bad_path, sizeof bad_path - 1),
+                     STM_EINVAL);
+
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("corvus_mount")

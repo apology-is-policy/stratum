@@ -129,6 +129,13 @@ static void decode_key(const uint8_t in[16],
  * concept and would mis-slice the value, so it refuses a v28 pool. */
 #define KS_VAL_HDR_LEN  8u
 
+/* R148 P2-1: the corvus dataset-path length is persisted as a single
+ * value byte — `encode_val` writes `out[3] = (uint8_t)corvus_path_len`,
+ * `decode_val` reads `in[3]`. A cap above 255 would silently truncate
+ * the stored length; pin the relationship at compile time. */
+_Static_assert(STM_KEYSCHEMA_CORVUS_PATH_MAX <= 255u,
+               "corvus_path_len is encoded as a single u8 value byte");
+
 static void encode_val(stm_keyschema_state state,
                          stm_keyschema_wrapper wrapper,
                          const uint8_t *corvus_path, size_t corvus_path_len,
@@ -172,6 +179,12 @@ static stm_status decode_val(const uint8_t *in, size_t in_len,
      * by type). The path must fit inside the value before the
      * wrapped blob. */
     size_t pl = in[3];
+    /* R148 P2-1: bound the on-disk path-len byte against the named cap,
+     * not merely the implicit uint8_t range — `load_cb` memcpy's it
+     * into a fixed STM_KEYSCHEMA_CORVUS_PATH_MAX[] entry array, so the
+     * cap is load-bearing. Parity with load_cb's
+     * `wrapped_len > STM_KEYSCHEMA_WRAPPED_MAX` re-check. */
+    if (pl > STM_KEYSCHEMA_CORVUS_PATH_MAX) return STM_ECORRUPT;
     if ((size_t)KS_VAL_HDR_LEN + pl > in_len) return STM_ECORRUPT;
     /* CORVUS <=> path-present consistency. A CORVUS slot without a
      * recorded path could not be UNWRAP'd (corvus needs the binding);
@@ -352,9 +365,9 @@ static int load_cb(const void *key, size_t key_len,
     e->key_id      = key_id;
     e->state       = state;
     e->wrapper     = wrapper;
-    /* TLY-A3-keyslot-wrap: corvus_path_len is decode_val-bounded to
-     * 0..STM_KEYSCHEMA_CORVUS_PATH_MAX (a single value byte), so it
-     * always fits the fixed entry array. */
+    /* TLY-A3-keyslot-wrap: decode_val rejects corvus_path_len >
+     * STM_KEYSCHEMA_CORVUS_PATH_MAX (R148 P2-1), so it always fits
+     * this fixed-size entry array. */
     if (corvus_path_len > 0)
         memcpy(e->corvus_dataset_path, corvus_path, corvus_path_len);
     e->corvus_dataset_path_len = corvus_path_len;
@@ -489,6 +502,10 @@ stm_status stm_keyschema_commit(stm_keyschema *ks, uint64_t committed_gen,
                                             scratch, STM_BTNODE_SIZE);
     free(entries);
     free(keybufs);
+    /* R148 P3-1: wipe valbuf (encoded value bytes) before returning it
+     * to the heap — parity with the scratch wipe below (R10 P3-1).
+     * NULL when n == 0. */
+    if (valbuf) stm_ct_memzero(valbuf, valtotal);
     free(valbuf);
     if (s != STM_OK) { free(scratch); return s; }
 
@@ -575,6 +592,18 @@ static stm_status validate_corvus_path(stm_keyschema_wrapper wrapper,
             corvus_dataset_path_len == 0 ||
             corvus_dataset_path_len > STM_KEYSCHEMA_CORVUS_PATH_MAX)
             return STM_EINVAL;
+        /* R148 P2-2: refuse control bytes + embedded NUL in the corvus
+         * dataset path at the layer no producer can bypass. The path
+         * travels the corvus wire and lands in line-oriented
+         * /ctl/events logs (R99 P2-1 line-injection doctrine). The
+         * stratumd CLI also pre-checks for a clean operator-facing
+         * error, but a future /ctl/ keyslot verb or any direct SDK
+         * caller inherits the refusal here. UTF-8 multi-byte (>= 0x80)
+         * passes unchanged. */
+        for (size_t i = 0; i < corvus_dataset_path_len; i++) {
+            unsigned char c = (unsigned char)corvus_dataset_path[i];
+            if (c < 0x20u || c == 0x7Fu) return STM_EINVAL;
+        }
     } else {
         if (corvus_dataset_path != NULL || corvus_dataset_path_len != 0)
             return STM_EINVAL;

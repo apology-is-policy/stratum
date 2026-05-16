@@ -177,8 +177,12 @@ stm_status stm_keyschema_get_root(const stm_keyschema *ks,
  * AEAD-AD-bound identity for the dataset (the path the mount-time
  * UNWRAP must send back — STRATUM-API-V1.md §5.10). It is REQUIRED
  * for STM_KS_WRAPPER_CORVUS (non-NULL, length 1..STM_KEYSCHEMA_CORVUS_PATH_MAX)
- * and MUST be absent for every other wrapper (NULL, length 0) —
- * STM_EINVAL on violation.
+ * and MUST be absent for every other wrapper (NULL, length 0). A
+ * CORVUS path is also content-validated — control bytes (< 0x20,
+ * == 0x7F) and embedded NUL are refused (R148 P2-2; R99 line-injection
+ * doctrine — the path travels the corvus wire + /ctl/events logs).
+ * UTF-8 multi-byte (>= 0x80) is permitted. STM_EINVAL on any
+ * violation.
  */
 STM_MUST_USE
 stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,

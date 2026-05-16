@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -1209,6 +1210,15 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts)
             "token)\n");
         return STM_EINVAL;
     }
+    if (!opts->corvus_unwrap_socket || !*opts->corvus_unwrap_socket) {
+        /* R148 P3-2: the WRAP has no default socket path — refuse
+         * loudly here rather than letting the operator hit a bare
+         * STM_EINVAL from deep inside stm_corvus_wrap. */
+        fprintf(stderr,
+            "stratumd: --provision-corvus-dataset requires "
+            "--corvus-socket (the WRAP has no default socket path)\n");
+        return STM_EINVAL;
+    }
     if (opts->read_only) {
         fprintf(stderr,
             "stratumd: --provision-corvus-dataset is incompatible "
@@ -1284,6 +1294,7 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts)
             "token from %s (rc=%d)\n",
             opts->corvus_session_token_file, (int)rc);
         stm_ct_memzero(token, STM_CORVUS_TOKEN_LEN);
+        (void)munlock(token, STM_CORVUS_TOKEN_LEN);
         free(token);
         (void)stm_fs_unmount(fs);
         return rc;
@@ -1331,8 +1342,10 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts)
             opts->provision_dataset_name, (int)rc);
     }
 
-    /* The token is no longer needed — scrub + free before unmount. */
+    /* The token is no longer needed — scrub, munlock, free before
+     * unmount (R148 P3-3: undo stm_corvus_load_token's mlock). */
     stm_ct_memzero(token, STM_CORVUS_TOKEN_LEN);
+    (void)munlock(token, STM_CORVUS_TOKEN_LEN);
     free(token);
 
     /* Unmount. For a mutable handle this performs the final

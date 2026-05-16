@@ -207,6 +207,15 @@ because it also fixes the existing UNWRAP provisional binding and is
 independently valuable; wrap-client + wrap-provision then build the
 production seal path on top.
 
+**Status (all chunks shipped):** 1 design + 2 spec → `82e231b`;
+3 wrap-pathbind → `8d6fe6c`; 4 wrap-client → `e27db75`; chunk 5 split
+into 5a sync-provision (`c0fc8ff`) + 5b fs-wrapper + stratumd one-shot
+`--provision-corvus-dataset` CLI (`bfc3a4d`); 6 audit → **R148**
+(0 P0/P1, 2 P2 fixed inline + 4 P3, close commit follows; findings in
+`v2/.audit_r148_findings.md`). The corvus WRAP-path bilateral gap is
+closed on the Stratum side; corvus's 3→4-byte decoder change + the
+real-corvus WRAP-socket question remain Thylacine-side (§10).
+
 ## 10. Cross-repo dependency (Thylacine-side, NOT Stratum work)
 
 For reference only — handled by the Thylacine-side agent:
