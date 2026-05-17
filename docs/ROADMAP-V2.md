@@ -54,14 +54,23 @@ Phase 9 ─ Client interfaces                    (~2 months)
 
 Phase 9.5 ─ Concurrent 9P API                  (~1 month)
           stratumd concurrent-accept + compound-op race
-          class + fs->lock granularity. Exposes the
-          lock-free Bε-tree (Phase 2) through to clients.
+          class + per-inode fs->lock granularity.
           Gating chunk for kernel-9P-mount as a production
           backing store for a POSIX OS.
 
-Phase 9.7 ─ Snapshot completion                (~2-3 months)
-          Per-dataset metadata trees + O(1) rollback + clones.
-          Scheduled post-Thylacine-integration. See amendment below.
+Phase 9.6 ─ Metadata tree engine               (~2-3 months)
+          Incremental copy-on-write multi-level B+tree.
+          Replaces the whole-tree-rebuild MVP. See amendment.
+
+Phase 9.7 ─ Snapshot completion                (~2 months)
+          Per-dataset trees + O(1) rollback + clones,
+          built on the 9.6 engine. See amendment.
+
+Phase 9.8 ─ Write-optimised lock-free metadata (~2 months)
+          Bε message buffer + Bw-tree lock-free layer:
+          the unfinished pioneering layers (mission item
+          4), finished and plugged into the live path.
+          See amendment.
 
 Phase 10 ─ Hardening                           (~2 months)
           Fuzzers, audits, benchmarks, docs
@@ -76,6 +85,8 @@ Post-v2.0 (v2.1, v2.2+)                        (ongoing)
 Total Phase 1 → Phase 11: **~30 months** from design-freeze to v2.0. Aggressive but bounded. Some phases can overlap (notes per-phase). Phase 8 (POSIX surface) was inserted post-Phase-7 in 2026-04-30 once the gap was surfaced — the prior 10-phase plan implicitly assumed POSIX semantics existed but had no chunk for them; APIs (now Phase 9) are necessarily downstream. Phase 9.5 (Concurrent 9P API) was inserted post-SLATE in 2026-05-11 once the kernel-9P-mount target became near-term — Phase 9 shipped the protocol; 9.5 makes it scale across clients by lifting `fs->lock` granularity to expose the Phase-2 lock-free Bε-tree end-to-end.
 
 **Amendment 2026-05-15 — Phase 9.7 (Snapshot completion) inserted.** During Thylacine integration (TLY-A5, the snapshot-rollback compromise marker) it was surfaced that **Phase 6's "snapshots" shipped only the snapshot *index*** — a pool-wide btree of accounting entries (`stm_snapshot_entry`: `dataset_id`, `extent_txg`, `prev_snap_id`, hold-count, flags) sufficient for create / delete / hold / birth-txg dead-list accounting. It did **not** ship the per-dataset metadata trees that `ARCHITECTURE.md` §8.5/§8.6/§12.6 assume: v2 metadata lives in *pool-global* trees keyed by `(dataset_id, …)` (`ub_inode_root`, `ub_dirent_root`, `ub_xattr_root`, `ub_extent_root`), and the dataset descriptor has no `di_tree_root`. Consequence: a v2 snapshot records a generation number but roots no recoverable tree (`tree_root_paddr == 0`), so **snapshot rollback, snapshot-as-readable-tree (`.snaps/` browsing), and clone-as-shared-root all cannot be built** on the current substrate. Phase 9.7 is the foundational re-architecture to per-dataset metadata trees that closes this — a COW filesystem without working rollback is not a COW filesystem. It is scheduled *after* Thylacine v1.0 integration (so Thylacine is unblocked) and *before* Phase 10 hardening (so v2.0 ships with real snapshots). TLY-A5 itself ships marker-first with a stubbed `stm_fs_rollback_snapshot` (`STM_ENOTSUPPORTED`); Phase 9.7 replaces only the stub body — the `/ctl/` rollback verb surface, admin gate, and marker-consultation gate are already in place. See `v2/docs/THYLACINE-V1-PLAN.md` §6.
+
+**Amendment 2026-05-17 — Phase 9.7 split into 9.6 + 9.7 + 9.8.** Designing Phase 9.7 surfaced that its prerequisite runs deeper than per-dataset trees: v2 has **no incremental copy-on-write for metadata at all**. The persistence layer (`v2/src/btree_store/`) is a documented Phase-3 *"chunk 5c MVP"* — every `sync_commit` rebuilds the entire metadata tree from a flat in-RAM array, and the on-disk tree is hard-capped at two levels (`STM_ENOTSUPPORTED` past ~700K inodes). That is a v2.0 release blocker independent of snapshots, so the substrate becomes its own phase. Revised arc: **Phase 9.6 — Metadata Tree Engine** builds the real incremental-COW, multi-level B+tree — a plain copy-on-write B+tree, the btrfs / ZFS-objset structural model (`v2/docs/phase-9.6-metadata-tree-engine-design.md`); **Phase 9.7 — Snapshot Completion** layers per-dataset trees + rollback + clones on it; **Phase 9.8 — Write-Optimised Lock-Free Metadata** finishes and plugs into the live path the two unfinished *pioneering* layers — the Bε write-optimisation message buffer (coded in `stm_btree` but never persisted) and the Bw-tree lock-free layer (`stm_btree_lf` is a single-node experiment, task #172 deferred; production uses an `stm_btree_mt` rwlock). Mission item 4 lands at 9.8, deliberately, against a working COW engine. The combined 9.6 + 9.7 + 9.8 scope supersedes the 2026-05-15 *"~2-3 months"* Phase 9.7 estimate.
 
 ## 3. Principles that apply throughout
 

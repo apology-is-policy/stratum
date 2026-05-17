@@ -1763,6 +1763,65 @@ MaxAttaches=1..2); good cfg under 10K reachable states; buggy
 configs fire within tens. TLC verify tooling-gated (folds into
 #958/#966/#973 forward-noted list).
 
+### `btree.tla` — incremental copy-on-write B+tree engine (Phase 9.6 entry)
+
+Spec-first scaffold for the Phase 9.6 metadata tree engine
+(`v2/docs/phase-9.6-metadata-tree-engine-design.md`). Models the
+incremental copy-on-write commit of the on-disk B+tree: a mutation COWs
+only the dirty root-to-leaf path, unchanged subtrees are shared, the
+new root is published atomically at the final phase, the replaced
+nodes are handed back to the allocator, and a crash before the final
+phase reverts to the last durable root.
+
+Abstraction: the tree is modelled at depth 2 (one internal root, two
+leaf children) — the COW commit mechanism is level-uniform, so depth 2
+with a shared sibling leaf exercises COW-path completeness, subtree
+sharing, the crash revert, and the free-only-unreachable rule.
+`(paddr, gen)` AEAD-nonce uniqueness is NOT modelled here — it composes
+from `allocator.tla` (fresh paddrs / deferred-free) + `sync.tla`
+(monotonic commit gen).
+
+State variables: `disk`, `durableRoot`, `durableRootCsum`, `commit`
+(in-flight commit record), `freed`, `nextPaddr`, `begins`.
+
+Actions: `BeginCommit` (plan a COW commit modifying one leaf) /
+`WriteNode` (write one planned node) / `FinalCommit` (publish the new
+root + free the replaced nodes) / `Crash` (revert to the last durable
+root) / `Terminating`.
+
+Headline invariants:
+
+- `DurableTreeWellFormed` — the tree reachable from the durable root is
+  structurally complete (every reachable node on disk, root internal,
+  children leaves). Held across every state including post-`Crash`, it
+  also asserts crash-revert correctness.
+- `CommittedTreeMerkleConsistent` — every durable node's csum equals
+  the Merkle recomputation over what is on disk, and the published
+  root csum matches the root node.
+- `FreedNodesNotReachable` — a paddr handed back to the allocator is
+  not reachable from the durable root. (Phase 9.7 generalises this to
+  "any live snapshot root".)
+
+Buggy variants — one per invariant:
+
+- `btree_partial_cow_buggy.cfg` — the COW root records the
+  pre-modification child csum (paddr updated, csum not). Trips
+  `CommittedTreeMerkleConsistent`.
+- `btree_early_publish_buggy.cfg` — `FinalCommit` publishes the new
+  root before every planned node is written. Trips
+  `DurableTreeWellFormed`.
+- `btree_over_free_buggy.cfg` — a commit frees the shared sibling leaf,
+  which the new root still reaches. Trips `FreedNodesNotReachable`.
+
+State-space: `btree.cfg` — 144 distinct states, depth 13 (MaxBegins=3,
+MaxContent=2). Base config green; each buggy config trips its target
+invariant. TLC-verified 2026-05-17.
+
+The spec is the foundation Phase 9.7's snapshot/rollback spec extends
+(snapshot-aware retention generalises `FreedNodesNotReachable`); Phase
+9.8's message-buffer-flush + Bw-tree lock-free invariants extend it
+again.
+
 ## Running TLC
 
 ```bash
