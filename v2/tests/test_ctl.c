@@ -2698,8 +2698,8 @@ STM_TEST(ctl_d3_debug_alloc_admin_reads_stats)
      * (depends on format geometry) so we just assert the labels. */
     STM_ASSERT(strstr(body, "device-id: 0\n") != NULL);
     STM_ASSERT(strstr(body, "bootstrap-size-blocks: ") != NULL);
-    STM_ASSERT(strstr(body, "bootstrap-total-units: ") != NULL);
-    STM_ASSERT(strstr(body, "bootstrap-allocated-units: ") != NULL);
+    STM_ASSERT(strstr(body, "bootstrap-total-nodes: ") != NULL);
+    STM_ASSERT(strstr(body, "bootstrap-allocated-nodes: ") != NULL);
     STM_ASSERT(strstr(body, "bootstrap-bitmap-gen: ") != NULL);
     STM_ASSERT(strstr(body, "data-first-block: ") != NULL);
     STM_ASSERT(strstr(body, "data-last-block: ") != NULL);

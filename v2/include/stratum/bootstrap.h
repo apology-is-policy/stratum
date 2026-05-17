@@ -22,15 +22,23 @@
  *
  * Bootstrap pool layout (within the pool itself):
  *
- *    [hdr A | hdr B | bm A | bm B | pad | data unit 0 | data unit 1 | ...]
- *    block  0       1       2      3     4-31  32-63        64-95
+ *    [hdr A | hdr B | bitmap A (14 blk) | bitmap B (14 blk) | pad | data...]
+ *    block  0       1   2 .. 15           16 .. 29           30-31  32 ..
  *
- * Header slots A/B ping-pong for torn-write safety. Bitmap slots A/B
- * likewise. The bitmap tracks data units at 128-KiB (32-block) granularity;
- * each bit = 1 if its data unit is allocated (or deferred-free / PENDING),
- * 0 if free. The padding blocks 4..31 exist so the data area begins at a
- * 32-block-aligned offset within the bootstrap pool. MVP supports a
- * single 4 KiB bitmap block = 32768 units = up to 4 GiB bootstrap pool.
+ * Header slots A/B (one block each) ping-pong for torn-write safety;
+ * bitmap slots A/B (STM_BOOTSTRAP_BITMAP_BLOCKS = 14 blocks each) likewise.
+ * The bitmap tracks data NODES at 16-KiB (4-block) granularity — each bit
+ * = 1 if its node is allocated (or deferred-free / PENDING), 0 if free.
+ * The data area starts at block 32 (STM_BOOTSTRAP_DATA_START_BLOCK);
+ * blocks 30..31 are reserved. One bitmap slot's 14 x 4 KiB = 458752 bits
+ * cap the pool at 458752 nodes x 16 KiB ~= 7 GiB; larger devices return
+ * STM_ENOTSUPPORTED on create until a dynamically sized bitmap lands.
+ *
+ * A NODE (STM_BOOTSTRAP_NODE_BLOCKS = 4 blocks, 16 KiB) is the bitmap
+ * quantum and the minimum reservation — the COW B+tree node size from
+ * Phase 9.6 §3.4. The 128-KiB btnode reservation used by btree_store /
+ * keyschema / repair_log is STM_BOOTSTRAP_UNIT_BLOCKS = 8 nodes — still a
+ * valid reservation multiple, no longer the bitmap granularity.
  *
  * Deferred-free semantics mirror `v2/specs/allocator.tla` exactly:
  *
@@ -68,32 +76,51 @@ typedef struct stm_bdev stm_bdev;   /* forward from block.h */
  * Label 0 + Label 1 (2 × 256 KiB at the head) plus a 512 KiB margin. */
 #define STM_BOOTSTRAP_OFFSET          (UINT64_C(1) * 1024u * 1024u)
 
-/* Allocation granularity of the bootstrap pool, in 4 KiB blocks.
- * 32 × 4 KiB = 128 KiB — the allocator-tree-node size from ARCH §6.3. */
-#define STM_BOOTSTRAP_UNIT_BLOCKS     32u
+/* Bitmap-bit granularity: a metadata-tree NODE, in 4 KiB blocks.
+ * 4 × 4 KiB = 16 KiB — the COW B+tree node size (Phase 9.6 §3.4). This is
+ * the minimum reservation quantum: every stm_bootstrap_reserve / _free
+ * `nblocks` argument must be a nonzero multiple of STM_BOOTSTRAP_NODE_BLOCKS. */
+#define STM_BOOTSTRAP_NODE_BLOCKS     4u
+
+/* The 128-KiB btnode reservation size = 8 nodes. The whole-tree-rebuild
+ * btree_store and the single-node stores (keyschema, repair_log, …) reserve
+ * one STM_BOOTSTRAP_UNIT_BLOCKS run per 128-KiB btnode. It is no longer the
+ * bitmap granularity — that is STM_BOOTSTRAP_NODE_BLOCKS — but remains a
+ * valid (8-node) reservation multiple. */
+#define STM_BOOTSTRAP_UNIT_BLOCKS     (8u * STM_BOOTSTRAP_NODE_BLOCKS)
 
 /* Default bootstrap pool size: max(64 MiB, device_size / 1024). ARCH §6.5.1. */
 #define STM_BOOTSTRAP_MIN_SIZE_BYTES  (UINT64_C(64) * 1024u * 1024u)
 #define STM_BOOTSTRAP_SIZE_DIVISOR    1024u
 
-/* Maximum bootstrap size supported by chunk 4a's single-bitmap-block MVP.
- * 32768 bits × 128 KiB/bit = 4 GiB (+ 128 KiB for the reserved blocks).
- * Devices needing more will return STM_ENOTSUPPORTED on create until
- * multi-block bitmaps land. */
-#define STM_BOOTSTRAP_MAX_UNITS       32768u
-
-/* Header / bitmap slot layout inside the bootstrap pool, in block indices. */
+/* Header slots (one 4 KiB block each) inside the bootstrap pool. */
 #define STM_BOOTSTRAP_HDR_SLOT_A          0u
 #define STM_BOOTSTRAP_HDR_SLOT_B          1u
+
+/* Blocks per bitmap slot. 14 × 4 KiB = 56 KiB = 458752 bits. The two
+ * bitmap slots (A at block 2, B at block 16) plus the two header slots
+ * fill blocks 0..29; blocks 30..31 are reserved before the data area. */
+#define STM_BOOTSTRAP_BITMAP_BLOCKS       14u
 #define STM_BOOTSTRAP_BITMAP_SLOT_A       2u
-#define STM_BOOTSTRAP_BITMAP_SLOT_B       3u
+#define STM_BOOTSTRAP_BITMAP_SLOT_B       (STM_BOOTSTRAP_BITMAP_SLOT_A + \
+                                           STM_BOOTSTRAP_BITMAP_BLOCKS)
+
+/* Maximum node count: one bitmap slot's bits (14 blocks × 4096 bytes ×
+ * 8 bits). 458752 nodes × 16 KiB ≈ 7 GiB max bootstrap pool. Devices
+ * needing more return STM_ENOTSUPPORTED on create until a dynamically
+ * sized (multi-region) bitmap lands. */
+#define STM_BOOTSTRAP_MAX_NODES       (STM_BOOTSTRAP_BITMAP_BLOCKS * 4096u * 8u)
 
 /* First block (within the bootstrap pool) of the data area. Equal to
- * STM_BOOTSTRAP_UNIT_BLOCKS so unit 0 starts at a natural alignment. */
+ * STM_BOOTSTRAP_UNIT_BLOCKS — a multiple of STM_BOOTSTRAP_NODE_BLOCKS, so
+ * node 0 starts at a natural alignment and 128-KiB consumers stay aligned. */
 #define STM_BOOTSTRAP_DATA_START_BLOCK    STM_BOOTSTRAP_UNIT_BLOCKS
 
-/* On-disk format version of the bootstrap-pool header. */
-#define STM_BOOTSTRAP_HDR_VERSION         1u
+/* On-disk format version of the bootstrap-pool header. v2: 16-KiB-node
+ * bitmap granularity + a 14-block bitmap region (was v1: 128-KiB units,
+ * single-block bitmap). v2 is a clean break — a v1 header is rejected at
+ * the version check (v2 is pre-release; dev pools re-format). */
+#define STM_BOOTSTRAP_HDR_VERSION         2u
 
 /* Size (bytes) of the opaque user-data region stashed in each bootstrap
  * header slot. Layers above the bootstrap pool (e.g. the allocator)
@@ -112,13 +139,13 @@ typedef struct stm_bootstrap stm_bootstrap;
 typedef struct {
     /* Bootstrap pool geometry. */
     uint64_t bootstrap_size_blocks;   /* total blocks in the bootstrap region   */
-    uint64_t data_unit_blocks;        /* = STM_BOOTSTRAP_UNIT_BLOCKS            */
-    uint64_t total_units;             /* data-unit count                        */
+    uint64_t data_node_blocks;        /* = STM_BOOTSTRAP_NODE_BLOCKS            */
+    uint64_t total_nodes;             /* data-node count                        */
 
     /* Accounting (per the in-RAM bitmap + PENDING list). */
-    uint64_t allocated_units;         /* bitmap bits set, PENDING included      */
-    uint64_t pending_units;           /* pending-free entries                   */
-    uint64_t free_units;              /* total - allocated                      */
+    uint64_t allocated_nodes;         /* bitmap bits set, PENDING included      */
+    uint64_t pending_nodes;           /* pending-free nodes                     */
+    uint64_t free_nodes;              /* total - allocated                      */
 
     /* Header / bitmap state. */
     uint64_t header_slot_live;        /* 0 or 1                                 */
@@ -144,7 +171,7 @@ typedef struct {
  *
  * Returns STM_EINVAL on argument errors, STM_ENOSPC when the bootstrap
  * pool doesn't fit the device, STM_ENOTSUPPORTED when the pool's data
- * unit count exceeds STM_BOOTSTRAP_MAX_UNITS.
+ * node count exceeds STM_BOOTSTRAP_MAX_NODES.
  */
 STM_MUST_USE
 stm_status stm_bootstrap_create(stm_bdev *d,
@@ -178,11 +205,11 @@ void stm_bootstrap_close(stm_bootstrap *a);
 
 /*
  * Reserve a run of `nblocks` consecutive blocks from the bootstrap pool.
- * `nblocks` must be a nonzero multiple of STM_BOOTSTRAP_UNIT_BLOCKS; the
- * allocator serves in unit-sized chunks.
+ * `nblocks` must be a nonzero multiple of STM_BOOTSTRAP_NODE_BLOCKS; the
+ * allocator serves in node-sized (16 KiB) chunks.
  *
  * `hint_paddr` is an optional allocation hint: if it points into the
- * bootstrap pool's data area and the unit there is free, allocation
+ * bootstrap pool's data area and the node there is free, allocation
  * starts there; otherwise the hint is ignored and a roving cursor picks
  * up where it left off. 0 means "no hint". The hint is advisory only;
  * a successful reserve may return a different paddr.
@@ -190,6 +217,8 @@ void stm_bootstrap_close(stm_bootstrap *a);
  * On success, `*out_paddr` gets the absolute paddr of the first block
  * of the reserved run (device 0 for single-device MVP; the device
  * field will be filled in once stm_bootstrap is parameterized per-device).
+ * Returned paddrs are node-aligned (a multiple of STM_BOOTSTRAP_NODE_BLOCKS
+ * from the data start) — not necessarily 128-KiB unit-aligned.
  *
  * Returns STM_ENOSPC if no run of the requested size is free.
  */
@@ -200,7 +229,7 @@ stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
 
 /*
  * Mark `paddr .. paddr+nblocks` as PENDING. `nblocks` must be a multiple
- * of STM_BOOTSTRAP_UNIT_BLOCKS; `paddr` must be unit-aligned and within
+ * of STM_BOOTSTRAP_NODE_BLOCKS; `paddr` must be node-aligned and within
  * the bootstrap pool's data area; the bits must currently be set (i.e.
  * the range was returned by a prior reserve and not yet freed).
  *
@@ -245,7 +274,7 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen);
 STM_MUST_USE
 stm_status stm_bootstrap_stats_get(const stm_bootstrap *a, stm_bootstrap_stats *out);
 
-/* Report whether a given paddr's data unit is currently allocated (bitmap
+/* Report whether a given paddr's data node is currently allocated (bitmap
  * bit set, includes PENDING). For tests and diagnostics. */
 STM_MUST_USE
 stm_status stm_bootstrap_is_allocated(const stm_bootstrap *a, uint64_t paddr,

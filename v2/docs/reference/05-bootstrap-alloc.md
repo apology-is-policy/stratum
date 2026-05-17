@@ -19,8 +19,9 @@ Device layout (ARCH §5.3.1, §6.5):
 - **Label regions** (4 × 256 KiB): uberblock commit ring, slot 63
   reserved for pool-config mirror (future).
 - **Bootstrap pool** (default `max(64 MiB, device_size / 1024)`):
-  bitmap-managed, tracks 128 KiB data units. Hosts allocator-tree
-  nodes, alloc-roots tree nodes, keyschema-tree nodes.
+  bitmap-managed, tracks 16 KiB data nodes (9.6-impl-1a; was
+  128 KiB units). Hosts allocator-tree nodes, alloc-roots tree
+  nodes, keyschema-tree nodes — each a 128-KiB (8-node) reservation.
 - **Data area** (rest of device): tree-managed, tracks individual
   4 KiB blocks with length + refcount. Hosts extents + btree leaves
   that a filesystem actually cares about.
@@ -112,8 +113,8 @@ stm_status stm_alloc_first_allocated_from(const stm_alloc *a,
 
 `stm_alloc_stats` fields:
 
-- `bootstrap_size_blocks`, `bootstrap_total_units`,
-  `bootstrap_allocated_units`, `bootstrap_bitmap_gen`.
+- `bootstrap_size_blocks`, `bootstrap_total_nodes`,
+  `bootstrap_allocated_nodes`, `bootstrap_bitmap_gen`.
 - `data_first_block`, `data_last_block`, `data_total_blocks`.
 - `data_allocated_blocks`, `data_pending_blocks`, `data_free_blocks`.
 - `n_allocated_ranges`, `n_pending_ranges`.
@@ -126,27 +127,39 @@ by admin-invoked scrubs (future β) and regression tests.
 
 ### Bootstrap pool — `include/stratum/bootstrap.h` + `src/bootstrap/*.c`
 
-Bitmap-managed allocator for 128-KiB units (32 × 4 KiB blocks). One
-bit per unit.
+Bitmap-managed allocator. The bitmap quantum is a 16-KiB **node**
+(`STM_BOOTSTRAP_NODE_BLOCKS` = 4 × 4 KiB) — the COW B+tree node size
+(Phase 9.6 §3.4). One bit per node. `stm_bootstrap_reserve` / `_free`
+take an `nblocks` that must be a nonzero multiple of
+`STM_BOOTSTRAP_NODE_BLOCKS`; the 128-KiB-btnode consumers
+(`btree_store`, keyschema, repair_log) reserve
+`STM_BOOTSTRAP_UNIT_BLOCKS` = 8-node runs. Returned paddrs are
+node-aligned.
 
 On-disk layout, within the bootstrap region:
 
 ```
-block 0:    header slot A   (primary)
-block 1:    header slot B   (ping-pong)
-block 2:    bitmap slot A
-block 3:    bitmap slot B
-blocks 4..31: padding (unit 0 starts at 128-KiB-aligned offset)
-blocks 32..63:  data unit 0
-blocks 64..95:  data unit 1
+block 0:       header slot A   (primary)
+block 1:       header slot B   (ping-pong)
+blocks 2..15:  bitmap slot A   (14 × 4 KiB region)
+blocks 16..29: bitmap slot B   (14 × 4 KiB region, ping-pong)
+blocks 30..31: padding         (reserved)
+blocks 32..35: data node 0     (16 KiB)
+blocks 36..39: data node 1
 ...
 ```
 
-- **Header** (block): format magic, version, pool_uuid, geometry,
-  256-byte user_data slot (layers above — e.g. alloc — stash their
-  own state there for atomic commit), bitmap_gen counter, csum.
-- **Bitmap** (block): 4 KiB = 32768 bits = up to 4 GiB bootstrap
-  (MVP single-block cap; multi-block bitmap extension is future).
+- **Header** (1 block): format magic, version (`STM_BOOTSTRAP_HDR_VERSION`
+  = **2** as of 9.6-impl-1a), pool_uuid, geometry (`h_data_node_blocks`
+  = 4, `h_bitmap_block_count` = 14, bit-count, sizes), 256-byte
+  user_data slot (layers above — e.g. alloc — stash their own state
+  there for atomic commit), bitmap_gen counter, csum.
+- **Bitmap** (`STM_BOOTSTRAP_BITMAP_BLOCKS` = 14 blocks): 14 × 4 KiB
+  = 458752 bits = `STM_BOOTSTRAP_MAX_NODES` nodes × 16 KiB ≈ 7 GiB
+  bootstrap cap. A single BLAKE3 csum covers the whole region; a torn
+  write anywhere in it mismatches and the reader falls back to the
+  other slot. Devices needing a larger bootstrap return
+  `STM_ENOTSUPPORTED` at create until a dynamically sized bitmap lands.
 - **Slot A/B ping-pong**: every commit writes to the OTHER slot
   from the one the current state lives in, then fsyncs, then the
   header points at the new slot. Torn-write safe: either slot can
@@ -250,7 +263,7 @@ carries a dirty flag; a clean-state commit returns the cached
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_bootstrap` | 18 | Bootstrap-pool format, open-roundtrip, reserve/free/commit, bitmap ping-pong, torn-write recovery (crash between COW and header update), capacity boundaries, user_data slot roundtrip. |
+| `test_bootstrap` | 22 | Bootstrap-pool format (v2), open-roundtrip, node- and 8-node-unit reserve/free/commit, bitmap ping-pong, torn-write recovery (incl. a flip in the last block of the 14-block region), capacity boundaries, the widened bitmap region carrying a >32768-node pool (high-index bit round-trip), and `STM_ENOTSUPPORTED` past `STM_BOOTSTRAP_MAX_NODES`. |
 | `test_alloc` | 32 | Tree insertion order, gap-scan reserve, free-then-pending, commit-sweeps-pending, refcount transitions, double-free rejected, full-tree scan, stats, accel is_allocated consistency, device_id stamping, set_device_id-refused-after-reserve, first_allocated + first_allocated_from basic cases, corrupt-tree-entry → STM_ECORRUPT, **first_allocated_from boundary cases** (R20 P3-2 close: NULL args; `min_start_block ≥ 2^48` → STM_EINVAL; empty tree; inclusive lower bound at exact start_block; cursor past end-of-range → next entry; cursor mid-range → next entry by start_block; PENDING-skip; cursor below first entry returns leftmost). |
 | `test_alloc_roots` | 10 | Roots-object set/get/count/iter/commit/load roundtrip; idempotent commit; tamper detection (wrong csum / wrong key / wrong gen). |
 | `test_sync_multi` (indirectly) | — | Exercises `stm_alloc_set_device_id`, multi-alloc attach, roots-object load, mirror reservation across devices. |
@@ -259,7 +272,8 @@ carries a dirty flag; a clean-state commit returns the cached
 
 - [x] Bootstrap pool create / open / format / reserve / free /
       commit / COW bitmap / torn-write-safe headers.
-- [x] Single-block bitmap MVP (4 GiB bootstrap cap).
+- [x] 16-KiB node granularity + 14-block bitmap region
+      (9.6-impl-1a; on-disk header format v2, ≈ 7 GiB pool cap).
 - [x] Data-area tree reserve / free / ref / commit / stats /
       lookup / is_allocated / scan.
 - [x] On-disk tree serialization via `btree_store` (AEAD + Merkle).
@@ -267,10 +281,11 @@ carries a dirty flag; a clean-state commit returns the cached
 - [x] Alloc-roots object (P5-3b + P5-3c per-tree-gen).
 - [x] Cursor scans for evacuation + scrub
       (`first_allocated`, `first_allocated_from`).
-- [ ] **Multi-block bitmap**: return `STM_ENOTSUPPORTED` today when
-      bootstrap size exceeds 4 GiB (32768 units). Needed for >4 TiB
-      devices or >64 MiB tree-node footprint. Known-bounded
-      extension; no spec change.
+- [ ] **Dynamically sized bitmap**: return `STM_ENOTSUPPORTED`
+      today when the bootstrap pool exceeds `STM_BOOTSTRAP_MAX_NODES`
+      (458752 nodes ≈ 7 GiB). Needed for >7 TiB devices at the
+      default sizing, or a larger metadata-tree-node footprint.
+      Known-bounded extension; no spec change.
 - [ ] **Slot reclamation** for evacuated device roster slots.
       Today's REMOVED slots stay tombstoned (burned-UUID tracking).
       Future work when add/remove cycle count becomes interesting.

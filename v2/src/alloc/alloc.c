@@ -1360,8 +1360,8 @@ stm_status stm_alloc_stats_get(const stm_alloc *a, stm_alloc_stats *out)
     }
 
     out->bootstrap_size_blocks      = bstats.bootstrap_size_blocks;
-    out->bootstrap_total_units      = bstats.total_units;
-    out->bootstrap_allocated_units  = bstats.allocated_units;
+    out->bootstrap_total_nodes      = bstats.total_nodes;
+    out->bootstrap_allocated_nodes  = bstats.allocated_nodes;
     out->bootstrap_bitmap_gen       = bstats.bitmap_gen;
 
     out->data_first_block       = a->data_first_block;

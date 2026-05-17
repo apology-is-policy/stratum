@@ -5,22 +5,26 @@
  *   see ARCHITECTURE §6.5 (Bootstrap pool: no recursion)
  *   see v2/specs/allocator.tla (refcount + deferred-free spec)
  *
+ *   Revised 9.6-impl-1a (2026-05-17): the bitmap quantum dropped from a
+ *   128-KiB unit to a 16-KiB NODE (STM_BOOTSTRAP_NODE_BLOCKS), and the
+ *   bitmap region grew from one 4 KiB block to STM_BOOTSTRAP_BITMAP_BLOCKS.
+ *   On-disk header format → v2 (clean break; v2 is pre-release).
+ *
  * On-disk layout inside the bootstrap pool:
  *
- *   block 0    hdr slot A            (4 KiB)
- *   block 1    hdr slot B            (4 KiB)     ping-pong torn-write safety
- *   block 2    bitmap slot A         (4 KiB)
- *   block 3    bitmap slot B         (4 KiB)     ping-pong torn-write safety
- *   block 4..31            padding   (28 × 4 KiB) — reserved so data starts
- *                                                  at a STM_BOOTSTRAP_UNIT_BLOCKS
- *                                                  boundary
- *   block 32..             data area; allocated in 32-block units (128 KiB each)
+ *   block 0       hdr slot A         (4 KiB)
+ *   block 1       hdr slot B         (4 KiB)      ping-pong torn-write safety
+ *   block 2..15   bitmap slot A      (14 × 4 KiB)
+ *   block 16..29  bitmap slot B      (14 × 4 KiB) ping-pong torn-write safety
+ *   block 30..31  padding            (2 × 4 KiB)  reserved
+ *   block 32..    data area; allocated in 4-block nodes (16 KiB each)
  *
- * The header records which bitmap block is "live" (slot A or B) along with
- * a BLAKE3-256 csum of the bitmap block's payload. Commits COW:
+ * The header records which bitmap slot is "live" (slot A or B) by its
+ * first-block index, along with a BLAKE3-256 csum of the bitmap region's
+ * full payload (STM_BOOTSTRAP_BITMAP_BLOCKS blocks). Commits COW:
  *
- *   1. Build the new bitmap in RAM, write it to the non-live bitmap slot,
- *      fsync.
+ *   1. Build the new bitmap region in RAM, write it to the non-live
+ *      bitmap slot, fsync.
  *   2. Build the new header (bitmap_gen+1, pointing at the new bitmap
  *      slot, with its csum), write to the non-live header slot, fsync.
  *
@@ -38,6 +42,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The on-disk bitmap region: STM_BOOTSTRAP_BITMAP_BLOCKS contiguous 4 KiB
+ * blocks. 14 × 4096 = 57344 bytes = 458752 bits = STM_BOOTSTRAP_MAX_NODES. */
+#define BITMAP_REGION_BYTES  ((size_t)STM_BOOTSTRAP_BITMAP_BLOCKS * STM_UB_SIZE)
+
+_Static_assert(BITMAP_REGION_BYTES * 8u == STM_BOOTSTRAP_MAX_NODES,
+               "bitmap region must hold exactly STM_BOOTSTRAP_MAX_NODES bits");
+_Static_assert(STM_BOOTSTRAP_BITMAP_SLOT_B + STM_BOOTSTRAP_BITMAP_BLOCKS
+               <= STM_BOOTSTRAP_DATA_START_BLOCK,
+               "the two bitmap slots must fit before the data area");
+_Static_assert(STM_BOOTSTRAP_DATA_START_BLOCK % STM_BOOTSTRAP_NODE_BLOCKS == 0,
+               "the data area must start at a node-aligned block");
+_Static_assert(STM_BOOTSTRAP_UNIT_BLOCKS % STM_BOOTSTRAP_NODE_BLOCKS == 0,
+               "the 128-KiB unit must be a whole number of nodes");
+
 /* ========================================================================= */
 /* On-disk header.                                                            */
 /* ========================================================================= */
@@ -52,14 +70,15 @@ typedef struct {
     le64    h_pool_uuid[2];          /*   16 : 16 */
     le64    h_device_uuid[2];        /*   32 : 16 */
     le64    h_bitmap_gen;            /*   48 :  8 */
-    le64    h_bitmap_block;          /*   56 :  8 — block index in bootstrap */
-    le64    h_bitmap_bit_count;      /*   64 :  8 */
+    le64    h_bitmap_block;          /*   56 :  8 — first block of live bitmap slot */
+    le64    h_bitmap_bit_count;      /*   64 :  8 — node count                      */
     le64    h_bootstrap_size_blocks; /*   72 :  8 */
-    le64    h_data_unit_blocks;      /*   80 :  8 */
+    le64    h_data_node_blocks;      /*   80 :  8 — 4 KiB blocks per node            */
     le64    h_data_start_block;      /*   88 :  8 */
-    uint8_t h_bitmap_csum[32];       /*   96 : 32 */
-    uint8_t h_user_data[STM_BOOTSTRAP_USER_DATA_SIZE]; /*  128 : 256 */
-    uint8_t h_reserved[3680];        /*  384 : 3680 */
+    le64    h_bitmap_block_count;    /*   96 :  8 — 4 KiB blocks per bitmap slot     */
+    uint8_t h_bitmap_csum[32];       /*  104 : 32 */
+    uint8_t h_user_data[STM_BOOTSTRAP_USER_DATA_SIZE]; /*  136 : 256 */
+    uint8_t h_reserved[3672];        /*  392 : 3672 */
     uint8_t h_csum[32];              /* 4064 : 32 */
 } stm_bootstrap_hdr;
 
@@ -73,7 +92,7 @@ _Static_assert(sizeof(stm_bootstrap_hdr) == 4096,
 typedef struct pending_entry pending_entry;
 struct pending_entry {
     uint64_t       paddr;       /* absolute device paddr of first block */
-    uint32_t       nblocks;     /* multiple of STM_BOOTSTRAP_UNIT_BLOCKS */
+    uint32_t       nblocks;     /* multiple of STM_BOOTSTRAP_NODE_BLOCKS */
     uint64_t       free_gen;    /* free_gen stamp */
     pending_entry *next;
 };
@@ -81,8 +100,8 @@ struct pending_entry {
 struct stm_bootstrap {
     stm_bdev  *d;
     uint64_t   bootstrap_size_blocks;
-    uint64_t   total_units;
-    uint64_t   data_start_block;    /* in-pool block index of unit 0 */
+    uint64_t   total_nodes;
+    uint64_t   data_start_block;    /* in-pool block index of node 0 */
     uint64_t   pool_uuid[2];
     uint64_t   device_uuid[2];
 
@@ -91,17 +110,17 @@ struct stm_bootstrap {
     uint32_t   bitmap_slot_live;    /* 0 or 1                            */
     uint64_t   bitmap_gen;
 
-    /* In-RAM bitmap: bit i = 1 iff unit i is allocated (or PENDING). */
+    /* In-RAM bitmap: bit i = 1 iff node i is allocated (or PENDING). */
     uint8_t   *bitmap;
-    size_t     bitmap_bytes;        /* = ceil(total_units / 8)           */
+    size_t     bitmap_bytes;        /* = ceil(total_nodes / 8)           */
 
     /* Deferred-free list. Head is the most-recently-freed entry. */
     pending_entry *pending_head;
     uint64_t       pending_count;   /* #entries                          */
-    uint64_t       pending_units;   /* total units across all entries    */
+    uint64_t       pending_nodes;   /* total nodes across all entries    */
 
-    /* Roving allocation cursor (in units). */
-    uint64_t   rove_next_unit;
+    /* Roving allocation cursor (in nodes). */
+    uint64_t   rove_next_node;
 
     /* Chunk 5d: opaque user-data region stored in the header. Persisted
      * atomically with the bootstrap commit. */
@@ -131,30 +150,38 @@ static inline uint64_t hdr_slot_offset(uint32_t slot)
                                            : STM_BOOTSTRAP_HDR_SLOT_B);
 }
 
-/* Byte offset of bitmap slot A/B (pool block 2 or 3). */
-static inline uint64_t bitmap_slot_offset(uint32_t slot)
-{
-    return device_byte_offset((slot == 0) ? STM_BOOTSTRAP_BITMAP_SLOT_A
-                                           : STM_BOOTSTRAP_BITMAP_SLOT_B);
-}
-
-/* In-pool block index of bitmap slot A/B. */
+/* In-pool first-block index of bitmap slot A/B. */
 static inline uint64_t bitmap_slot_block(uint32_t slot)
 {
-    return (slot == 0) ? STM_BOOTSTRAP_BITMAP_SLOT_A : STM_BOOTSTRAP_BITMAP_SLOT_B;
+    return (slot == 0) ? STM_BOOTSTRAP_BITMAP_SLOT_A
+                       : STM_BOOTSTRAP_BITMAP_SLOT_B;
 }
 
-/* Unit index → absolute device paddr of the first block. */
-static inline uint64_t unit_to_paddr(const stm_bootstrap *a, uint64_t unit_idx)
+/* Byte offset of bitmap slot A/B's first block. */
+static inline uint64_t bitmap_slot_offset(uint32_t slot)
+{
+    return device_byte_offset(bitmap_slot_block(slot));
+}
+
+/* Map a bitmap-slot first-block index back to slot 0/1. The caller must
+ * have validated `block` is one of the two slot block indices (which
+ * load_bitmap_for_hdr does before the chosen header is used). */
+static inline uint32_t block_to_bitmap_slot(uint64_t block)
+{
+    return (block == STM_BOOTSTRAP_BITMAP_SLOT_A) ? 0u : 1u;
+}
+
+/* Node index → absolute device paddr of the first block. */
+static inline uint64_t node_to_paddr(const stm_bootstrap *a, uint64_t node_idx)
 {
     uint64_t pool_block = a->data_start_block +
-                          unit_idx * (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
+                          node_idx * (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
     return stm_paddr_make(0, bootstrap_start_block() + pool_block);
 }
 
-/* paddr → unit index. Returns true on valid, unit-aligned, in-range paddr. */
-static bool paddr_to_unit(const stm_bootstrap *a, uint64_t paddr,
-                          uint64_t *out_unit_idx)
+/* paddr → node index. Returns true on a valid, node-aligned, in-range paddr. */
+static bool paddr_to_node(const stm_bootstrap *a, uint64_t paddr,
+                          uint64_t *out_node_idx)
 {
     if (stm_paddr_device(paddr) != 0) return false;
     uint64_t block = stm_paddr_offset(paddr);
@@ -163,13 +190,13 @@ static bool paddr_to_unit(const stm_bootstrap *a, uint64_t paddr,
 
     uint64_t pool_block = block - bootstrap_first;
     if ((pool_block - a->data_start_block) %
-            (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS != 0) return false;
+            (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS != 0) return false;
 
-    uint64_t unit = (pool_block - a->data_start_block) /
-                    (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
-    if (unit >= a->total_units) return false;
+    uint64_t node = (pool_block - a->data_start_block) /
+                    (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
+    if (node >= a->total_nodes) return false;
 
-    *out_unit_idx = unit;
+    *out_node_idx = node;
     return true;
 }
 
@@ -187,13 +214,30 @@ static inline void bit_clear(uint8_t *bm, uint64_t idx)
     bm[idx >> 3] &= (uint8_t)~(1u << (idx & 7u));
 }
 
-/* BLAKE3 of a bitmap block (4 KiB). */
-static void compute_bitmap_csum(const uint8_t *bitmap_block,
-                                 uint8_t out[32])
+/* BLAKE3 of the full bitmap region (STM_BOOTSTRAP_BITMAP_BLOCKS × 4 KiB). */
+static void compute_bitmap_csum(const uint8_t *bitmap_region, uint8_t out[32])
 {
     stm_blake3_hash h;
-    stm_blake3(bitmap_block, STM_UB_SIZE, &h);
+    stm_blake3(bitmap_region, BITMAP_REGION_BYTES, &h);
     memcpy(out, h.bytes, 32);
+}
+
+/*
+ * Build the on-disk bitmap region from the in-RAM bitmap (zero-padded to
+ * BITMAP_REGION_BYTES), csum it, and write it to bitmap slot `slot`. Does
+ * NOT fsync — the caller fsyncs at the point its COW discipline requires.
+ * `region` is a caller-owned BITMAP_REGION_BYTES scratch buffer (heap, to
+ * keep 56 KiB off the stack).
+ */
+static stm_status write_bitmap_region(stm_bdev *d, uint32_t slot,
+                                       const uint8_t *bitmap, size_t bitmap_bytes,
+                                       uint8_t *region, uint8_t out_csum[32])
+{
+    memset(region, 0, BITMAP_REGION_BYTES);
+    memcpy(region, bitmap, bitmap_bytes);   /* bitmap_bytes ≤ BITMAP_REGION_BYTES */
+    compute_bitmap_csum(region, out_csum);
+    return stm_bdev_write(d, bitmap_slot_offset(slot), region,
+                          BITMAP_REGION_BYTES);
 }
 
 /* ========================================================================= */
@@ -282,20 +326,21 @@ static stm_status compute_bootstrap_size(stm_bdev *d,
     if (size % STM_UB_SIZE != 0) return STM_EINVAL;
 
     /* The ARCH-mandated minimum only applies to the default path.
-     * Explicit sizes down to one data unit plus reserved blocks are
+     * Explicit sizes down to one data node plus reserved blocks are
      * permitted (useful for tests that don't want to allocate 64 MiB
      * files). */
     if (!size_explicit && size < STM_BOOTSTRAP_MIN_SIZE_BYTES)
         return STM_EINVAL;
     if (size > max_bootstrap) return STM_ENOSPC;
 
-    /* Unit count check (chunk 4a MVP: single-block bitmap). */
+    /* Node count check (single-region bitmap MVP: STM_BOOTSTRAP_MAX_NODES
+     * is one 14-block bitmap slot's worth of bits, ≈ 7 GiB of pool). */
     uint64_t size_blocks = size / STM_UB_SIZE;
     if (size_blocks <= STM_BOOTSTRAP_DATA_START_BLOCK) return STM_ENOSPC;
     uint64_t data_blocks = size_blocks - STM_BOOTSTRAP_DATA_START_BLOCK;
-    uint64_t num_units = data_blocks / (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
-    if (num_units == 0) return STM_ENOSPC;
-    if (num_units > STM_BOOTSTRAP_MAX_UNITS) return STM_ENOTSUPPORTED;
+    uint64_t num_nodes = data_blocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
+    if (num_nodes == 0) return STM_ENOSPC;
+    if (num_nodes > STM_BOOTSTRAP_MAX_NODES) return STM_ENOTSUPPORTED;
 
     *out_size_bytes = size;
     return STM_OK;
@@ -315,16 +360,16 @@ static stm_bootstrap *alloc_new(stm_bdev *d, uint64_t size_bytes,
     a->d = d;
     a->bootstrap_size_blocks = size_bytes / STM_UB_SIZE;
     a->data_start_block = STM_BOOTSTRAP_DATA_START_BLOCK;
-    a->total_units =
+    a->total_nodes =
         (a->bootstrap_size_blocks - a->data_start_block) /
-        (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
+        (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
 
     memcpy(a->pool_uuid,   pool_uuid,   sizeof a->pool_uuid);
     memcpy(a->device_uuid, device_uuid, sizeof a->device_uuid);
 
-    /* Bitmap sized to exactly hold total_units bits, rounded up to a
-     * byte. Zero-initialized = all units free. */
-    a->bitmap_bytes = (size_t)((a->total_units + 7u) / 8u);
+    /* Bitmap sized to exactly hold total_nodes bits, rounded up to a
+     * byte. Zero-initialized = all nodes free. */
+    a->bitmap_bytes = (size_t)((a->total_nodes + 7u) / 8u);
     a->bitmap = calloc(1, a->bitmap_bytes);
     if (!a->bitmap) {
         free(a);
@@ -349,7 +394,15 @@ stm_status stm_bootstrap_create(stm_bdev *d,
     stm_bootstrap *a = alloc_new(d, size_bytes, pool_uuid, device_uuid);
     if (!a) return STM_ENOMEM;
 
-    /* Fresh pool: bitmap is all zeros (all units free), gen starts at 0.
+    /* The bitmap region is 56 KiB — heap, not stack. */
+    uint8_t *region = malloc(BITMAP_REGION_BYTES);
+    if (!region) {
+        free(a->bitmap);
+        free(a);
+        return STM_ENOMEM;
+    }
+
+    /* Fresh pool: bitmap is all zeros (all nodes free), gen starts at 0.
      * The initial live slots are slot-0 (hdr A, bitmap A). Slot-1 is
      * explicitly overwritten with zeros below so any stale state from a
      * prior pool formatted on this device (which could otherwise
@@ -358,27 +411,22 @@ stm_status stm_bootstrap_create(stm_bdev *d,
     a->hdr_slot_live    = 0;
     a->bitmap_slot_live = 0;
 
-    /* Write the bitmap block first (step 1 of our COW discipline). */
-    uint8_t bitmap_block[STM_UB_SIZE] = { 0 };
-    memcpy(bitmap_block, a->bitmap, a->bitmap_bytes);
-
+    /* Step 1 of the COW discipline: write the live bitmap slot. */
     uint8_t bitmap_csum[32];
-    compute_bitmap_csum(bitmap_block, bitmap_csum);
-
-    s = stm_bdev_write(d, bitmap_slot_offset(a->bitmap_slot_live),
-                       bitmap_block, sizeof bitmap_block);
+    s = write_bitmap_region(d, a->bitmap_slot_live, a->bitmap, a->bitmap_bytes,
+                            region, bitmap_csum);
     if (s != STM_OK) goto fail;
 
-    /* Invalidate slot 1's bitmap with zeros (R7a P1-1). Any magic-matching
-     * bytes there from a prior pool must not outlive this reformat. */
-    uint8_t zero_block[STM_UB_SIZE] = { 0 };
-    s = stm_bdev_write(d, bitmap_slot_offset(1u), zero_block, sizeof zero_block);
+    /* Invalidate slot 1's bitmap region with zeros (R7a P1-1). Any
+     * stale bytes there from a prior pool must not outlive this reformat. */
+    memset(region, 0, BITMAP_REGION_BYTES);
+    s = stm_bdev_write(d, bitmap_slot_offset(1u), region, BITMAP_REGION_BYTES);
     if (s != STM_OK) goto fail;
 
     s = stm_bdev_fsync(d);
     if (s != STM_OK) goto fail;
 
-    /* Now the header (step 2). */
+    /* Step 2 — the header. */
     stm_bootstrap_hdr hdr = { 0 };
     hdr.h_magic                 = stm_store_le64(STM_BOOTSTRAP_HDR_MAGIC);
     hdr.h_version               = stm_store_le32(STM_BOOTSTRAP_HDR_VERSION);
@@ -389,10 +437,11 @@ stm_status stm_bootstrap_create(stm_bdev *d,
     hdr.h_device_uuid[1]        = stm_store_le64(device_uuid[1]);
     hdr.h_bitmap_gen            = stm_store_le64(a->bitmap_gen);
     hdr.h_bitmap_block          = stm_store_le64(bitmap_slot_block(a->bitmap_slot_live));
-    hdr.h_bitmap_bit_count      = stm_store_le64(a->total_units);
+    hdr.h_bitmap_bit_count      = stm_store_le64(a->total_nodes);
     hdr.h_bootstrap_size_blocks = stm_store_le64(a->bootstrap_size_blocks);
-    hdr.h_data_unit_blocks      = stm_store_le64(STM_BOOTSTRAP_UNIT_BLOCKS);
+    hdr.h_data_node_blocks      = stm_store_le64(STM_BOOTSTRAP_NODE_BLOCKS);
     hdr.h_data_start_block      = stm_store_le64(a->data_start_block);
+    hdr.h_bitmap_block_count    = stm_store_le64(STM_BOOTSTRAP_BITMAP_BLOCKS);
     memcpy(hdr.h_bitmap_csum, bitmap_csum, 32);
     /* User data starts zero in a fresh pool; caller can set via
      * stm_bootstrap_set_user_data and it'll persist on next commit. */
@@ -406,37 +455,41 @@ stm_status stm_bootstrap_create(stm_bdev *d,
     if (s != STM_OK) goto fail;
 
     /* Invalidate header slot 1 (R7a P1-1). */
+    uint8_t zero_block[STM_UB_SIZE] = { 0 };
     s = stm_bdev_write(d, hdr_slot_offset(1u), zero_block, sizeof zero_block);
     if (s != STM_OK) goto fail;
 
     s = stm_bdev_fsync(d);
     if (s != STM_OK) goto fail;
 
+    free(region);
     *out_alloc = a;
     return STM_OK;
 
 fail:
+    free(region);
     free(a->bitmap);
     free(a);
     return s;
 }
 
-/* Try to read + csum-verify the bitmap designated by `hdr`. On success
- * fills `out_bitmap` and returns STM_OK. On failure returns an error
- * suitable for the caller to fall back to a different header. */
+/* Try to read + csum-verify the bitmap region designated by `hdr`. On
+ * success fills `out_region` (BITMAP_REGION_BYTES) and returns STM_OK. On
+ * failure returns an error suitable for the caller to fall back to a
+ * different header. */
 static stm_status load_bitmap_for_hdr(stm_bdev *d, const stm_bootstrap_hdr *hdr,
-                                       uint8_t out_bitmap[STM_UB_SIZE])
+                                       uint8_t *out_region)
 {
     uint64_t idx = stm_load_le64(hdr->h_bitmap_block);
     if (idx != STM_BOOTSTRAP_BITMAP_SLOT_A && idx != STM_BOOTSTRAP_BITMAP_SLOT_B)
         return STM_ECORRUPT;
 
     stm_status s = stm_bdev_read(d, device_byte_offset(idx),
-                                  out_bitmap, STM_UB_SIZE);
+                                  out_region, BITMAP_REGION_BYTES);
     if (s != STM_OK) return s;
 
     uint8_t expected[32];
-    compute_bitmap_csum(out_bitmap, expected);
+    compute_bitmap_csum(out_region, expected);
     uint8_t diff = 0;
     for (size_t i = 0; i < 32; i++) {
         diff |= (uint8_t)(expected[i] ^ hdr->h_bitmap_csum[i]);
@@ -500,43 +553,63 @@ stm_status stm_bootstrap_open(stm_bdev *d, stm_bootstrap **out_alloc)
         cand_hdr[0] = &hdr_b; cand_slot[0] = 1; ncand = 1;
     }
 
-    uint8_t         bitmap_block[STM_UB_SIZE];
-    stm_bootstrap_hdr  *chosen_hdr  = NULL;
+    /* The bitmap region is 56 KiB — heap, not stack (open may run on
+     * threads with modest stacks). One scratch buffer threads from the
+     * candidate loop through the final memcpy into the in-RAM bitmap. */
+    uint8_t *bitmap_region = malloc(BITMAP_REGION_BYTES);
+    if (!bitmap_region) return STM_ENOMEM;
+
+    stm_bootstrap     *a  = NULL;
+    stm_status         rc = STM_OK;
+
+    stm_bootstrap_hdr *chosen_hdr  = NULL;
     uint32_t        chosen_slot = 0;
     for (int i = 0; i < ncand; i++) {
-        stm_status cs = load_bitmap_for_hdr(d, cand_hdr[i], bitmap_block);
+        stm_status cs = load_bitmap_for_hdr(d, cand_hdr[i], bitmap_region);
         if (cs == STM_OK) {
             chosen_hdr  = cand_hdr[i];
             chosen_slot = cand_slot[i];
             break;
         }
     }
-    if (!chosen_hdr) return STM_ECORRUPT;
+    if (!chosen_hdr) { rc = STM_ECORRUPT; goto done; }
 
     /* Validate bounds on decoded sizes before using them (R7a P2-2):
      * an attacker-controlled header with a valid csum must not drive
      * arithmetic overflow or geometry drift. */
     uint64_t size_blocks = stm_load_le64(chosen_hdr->h_bootstrap_size_blocks);
-    uint64_t unit_blocks = stm_load_le64(chosen_hdr->h_data_unit_blocks);
+    uint64_t node_blocks = stm_load_le64(chosen_hdr->h_data_node_blocks);
     uint64_t data_start  = stm_load_le64(chosen_hdr->h_data_start_block);
     uint64_t bit_count   = stm_load_le64(chosen_hdr->h_bitmap_bit_count);
+    uint64_t bm_blocks   = stm_load_le64(chosen_hdr->h_bitmap_block_count);
 
-    if (unit_blocks != STM_BOOTSTRAP_UNIT_BLOCKS) return STM_EBADVERSION;
-    if (data_start  != STM_BOOTSTRAP_DATA_START_BLOCK) return STM_EBADVERSION;
-    if (bit_count  == 0 || bit_count > STM_BOOTSTRAP_MAX_UNITS) return STM_ECORRUPT;
+    if (node_blocks != STM_BOOTSTRAP_NODE_BLOCKS) { rc = STM_EBADVERSION; goto done; }
+    if (bm_blocks   != STM_BOOTSTRAP_BITMAP_BLOCKS) { rc = STM_EBADVERSION; goto done; }
+    if (data_start  != STM_BOOTSTRAP_DATA_START_BLOCK) { rc = STM_EBADVERSION; goto done; }
+    if (bit_count == 0 || bit_count > STM_BOOTSTRAP_MAX_NODES) {
+        rc = STM_ECORRUPT; goto done;
+    }
 
     /* Overflow: size_blocks * STM_UB_SIZE must fit in uint64_t. */
-    if (size_blocks > UINT64_MAX / (uint64_t)STM_UB_SIZE) return STM_ECORRUPT;
-    /* Overflow: data_start + bit_count * unit_blocks. */
-    if (bit_count > (UINT64_MAX - data_start) / unit_blocks) return STM_ECORRUPT;
-    if (data_start + bit_count * unit_blocks > size_blocks) return STM_ECORRUPT;
+    if (size_blocks > UINT64_MAX / (uint64_t)STM_UB_SIZE) {
+        rc = STM_ECORRUPT; goto done;
+    }
+    /* Overflow: data_start + bit_count * node_blocks. */
+    if (bit_count > (UINT64_MAX - data_start) / node_blocks) {
+        rc = STM_ECORRUPT; goto done;
+    }
+    if (data_start + bit_count * node_blocks > size_blocks) {
+        rc = STM_ECORRUPT; goto done;
+    }
 
     /* The pool must physically fit on the device. */
     const stm_bdev_caps *caps = stm_bdev_caps_of(d);
-    if (!caps) return STM_EINVAL;
+    if (!caps) { rc = STM_EINVAL; goto done; }
     uint64_t size_bytes = size_blocks * (uint64_t)STM_UB_SIZE;
-    if (STM_BOOTSTRAP_OFFSET > caps->size_bytes) return STM_ECORRUPT;
-    if (size_bytes > caps->size_bytes - STM_BOOTSTRAP_OFFSET) return STM_ECORRUPT;
+    if (STM_BOOTSTRAP_OFFSET > caps->size_bytes) { rc = STM_ECORRUPT; goto done; }
+    if (size_bytes > caps->size_bytes - STM_BOOTSTRAP_OFFSET) {
+        rc = STM_ECORRUPT; goto done;
+    }
 
     uint64_t pool_uuid[2]   = {
         stm_load_le64(chosen_hdr->h_pool_uuid[0]),
@@ -547,24 +620,27 @@ stm_status stm_bootstrap_open(stm_bdev *d, stm_bootstrap **out_alloc)
         stm_load_le64(chosen_hdr->h_device_uuid[1]),
     };
 
-    stm_bootstrap *a = alloc_new(d, size_bytes, pool_uuid, device_uuid);
-    if (!a) return STM_ENOMEM;
+    a = alloc_new(d, size_bytes, pool_uuid, device_uuid);
+    if (!a) { rc = STM_ENOMEM; goto done; }
 
     a->bitmap_gen       = stm_load_le64(chosen_hdr->h_bitmap_gen);
     a->hdr_slot_live    = chosen_slot;
-    a->bitmap_slot_live = (uint32_t)(stm_load_le64(chosen_hdr->h_bitmap_block) -
-                                     STM_BOOTSTRAP_BITMAP_SLOT_A);
+    a->bitmap_slot_live =
+        block_to_bitmap_slot(stm_load_le64(chosen_hdr->h_bitmap_block));
 
-    /* Header's bit_count and our computed total_units must agree. */
-    if (bit_count != a->total_units) {
-        free(a->bitmap);
-        free(a);
-        return STM_ECORRUPT;
-    }
-    memcpy(a->bitmap, bitmap_block, a->bitmap_bytes);
+    /* Header's bit_count and our computed total_nodes must agree. */
+    if (bit_count != a->total_nodes) { rc = STM_ECORRUPT; goto done; }
+
+    memcpy(a->bitmap, bitmap_region, a->bitmap_bytes);
     memcpy(a->user_data, chosen_hdr->h_user_data,
            STM_BOOTSTRAP_USER_DATA_SIZE);
 
+done:
+    free(bitmap_region);
+    if (rc != STM_OK) {
+        if (a) { free(a->bitmap); free(a); }
+        return rc;
+    }
     *out_alloc = a;
     return STM_OK;
 }
@@ -586,36 +662,36 @@ void stm_bootstrap_close(stm_bootstrap *a)
 /* Reserve / free / commit.                                                   */
 /* ========================================================================= */
 
-/* Scan for a run of `nunits` consecutive free units starting at `start`.
- * Returns true + *out_first_unit on success; false on no-fit. */
-static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nunits,
-                           uint64_t *out_first_unit)
+/* Scan for a run of `nnodes` consecutive free nodes starting at `start`.
+ * Returns true + *out_first_node on success; false on no-fit. */
+static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nnodes,
+                           uint64_t *out_first_node)
 {
-    if (nunits == 0 || nunits > a->total_units) return false;
+    if (nnodes == 0 || nnodes > a->total_nodes) return false;
 
     uint64_t scanned = 0;
-    uint64_t cursor  = start % a->total_units;
+    uint64_t cursor  = start % a->total_nodes;
 
-    while (scanned < a->total_units) {
+    while (scanned < a->total_nodes) {
         if (bit_is_set(a->bitmap, cursor)) {
-            cursor = (cursor + 1) % a->total_units;
+            cursor = (cursor + 1) % a->total_nodes;
             scanned++;
             continue;
         }
 
-        /* Candidate run starts at `cursor`. Confirm nunits free. */
-        uint64_t end = cursor + nunits;
-        if (end > a->total_units) {
+        /* Candidate run starts at `cursor`. Confirm nnodes free. */
+        uint64_t end = cursor + nnodes;
+        if (end > a->total_nodes) {
             /* Wrap-around not allowed for a contiguous run. Skip past
              * the end and retry from 0. */
-            uint64_t skip = a->total_units - cursor;
+            uint64_t skip = a->total_nodes - cursor;
             scanned += skip;
             cursor = 0;
             continue;
         }
 
         bool     ok    = true;
-        uint64_t advance = nunits;   /* units scanned forward this iter */
+        uint64_t advance = nnodes;   /* nodes scanned forward this iter */
         for (uint64_t i = cursor; i < end; i++) {
             if (bit_is_set(a->bitmap, i)) {
                 ok = false;
@@ -625,7 +701,7 @@ static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nunit
             }
         }
         if (ok) {
-            *out_first_unit = cursor;
+            *out_first_node = cursor;
             return true;
         }
         scanned += advance;
@@ -639,32 +715,32 @@ stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
 {
     if (!a || !out_paddr) return STM_EINVAL;
     if (nblocks == 0) return STM_EINVAL;
-    if (nblocks % STM_BOOTSTRAP_UNIT_BLOCKS != 0) return STM_EINVAL;
+    if (nblocks % STM_BOOTSTRAP_NODE_BLOCKS != 0) return STM_EINVAL;
 
-    uint64_t nunits = nblocks / (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
+    uint64_t nnodes = nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
 
-    /* Determine start unit from hint + rove. */
-    uint64_t start = a->rove_next_unit;
+    /* Determine start node from hint + rove. */
+    uint64_t start = a->rove_next_node;
     if (hint_paddr != 0) {
-        uint64_t hint_unit = 0;
-        if (paddr_to_unit(a, hint_paddr, &hint_unit) &&
-            !bit_is_set(a->bitmap, hint_unit)) {
-            start = hint_unit;
+        uint64_t hint_node = 0;
+        if (paddr_to_node(a, hint_paddr, &hint_node) &&
+            !bit_is_set(a->bitmap, hint_node)) {
+            start = hint_node;
         }
     }
 
-    uint64_t first_unit = 0;
-    if (!find_free_run(a, start, nunits, &first_unit)) {
+    uint64_t first_node = 0;
+    if (!find_free_run(a, start, nnodes, &first_node)) {
         return STM_ENOSPC;
     }
 
     /* Set bits. */
-    for (uint64_t i = 0; i < nunits; i++) {
-        bit_set(a->bitmap, first_unit + i);
+    for (uint64_t i = 0; i < nnodes; i++) {
+        bit_set(a->bitmap, first_node + i);
     }
 
-    a->rove_next_unit = (first_unit + nunits) % a->total_units;
-    *out_paddr = unit_to_paddr(a, first_unit);
+    a->rove_next_node = (first_node + nnodes) % a->total_nodes;
+    *out_paddr = node_to_paddr(a, first_node);
     return STM_OK;
 }
 
@@ -673,22 +749,22 @@ stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks
 {
     if (!a) return STM_EINVAL;
     if (nblocks == 0) return STM_EINVAL;
-    if (nblocks % STM_BOOTSTRAP_UNIT_BLOCKS != 0) return STM_EINVAL;
+    if (nblocks % STM_BOOTSTRAP_NODE_BLOCKS != 0) return STM_EINVAL;
 
-    uint64_t nunits = nblocks / (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
-    uint64_t first_unit = 0;
-    if (!paddr_to_unit(a, paddr, &first_unit)) return STM_EINVAL;
-    if (first_unit + nunits > a->total_units) return STM_EINVAL;
+    uint64_t nnodes = nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
+    uint64_t first_node = 0;
+    if (!paddr_to_node(a, paddr, &first_node)) return STM_EINVAL;
+    if (first_node + nnodes > a->total_nodes) return STM_EINVAL;
 
-    /* Verify every unit is currently allocated (bit set).
+    /* Verify every node is currently allocated (bit set).
      *
      * The PENDING scan below is O(N) per free and thus O(N^2) for a
-     * burst of N frees between commits (R7a P2-3). The chunk 4a
-     * single-block bitmap cap of 32768 units keeps this bounded; a
+     * burst of N frees between commits (R7a P2-3). The single-region
+     * bitmap cap of STM_BOOTSTRAP_MAX_NODES nodes keeps this bounded; a
      * future upgrade to a sorted-interval structure could make it
      * O(log N) if the pattern becomes hot. */
-    for (uint64_t i = 0; i < nunits; i++) {
-        if (!bit_is_set(a->bitmap, first_unit + i)) return STM_EINVAL;
+    for (uint64_t i = 0; i < nnodes; i++) {
+        if (!bit_is_set(a->bitmap, first_node + i)) return STM_EINVAL;
     }
 
     /* R7c P1-1/P2-2: idempotent retry — if the exact same (paddr,
@@ -702,16 +778,16 @@ stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks
      * range) remains a caller bug → STM_EINVAL. */
     for (pending_entry *e = a->pending_head; e; e = e->next) {
         uint64_t e_first = 0;
-        bool ok = paddr_to_unit(a, e->paddr, &e_first);
+        bool ok = paddr_to_node(a, e->paddr, &e_first);
         if (!ok) return STM_ECORRUPT;
-        uint64_t e_nunits = e->nblocks / (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
+        uint64_t e_nnodes = e->nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
 
         if (e->paddr == paddr && e->nblocks == nblocks) {
             /* Exact match: retry semantics. */
             if (free_gen > e->free_gen) e->free_gen = free_gen;
             return STM_OK;
         }
-        if (first_unit < e_first + e_nunits && e_first < first_unit + nunits) {
+        if (first_node < e_first + e_nnodes && e_first < first_node + nnodes) {
             return STM_EINVAL;
         }
     }
@@ -724,7 +800,7 @@ stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks
     ent->next     = a->pending_head;
     a->pending_head = ent;
     a->pending_count++;
-    a->pending_units += nunits;
+    a->pending_nodes += nnodes;
     return STM_OK;
 }
 
@@ -734,7 +810,7 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
 
     /*
      * Three-phase commit (R7a P1-2 fix):
-     *   Phase 1 — scan: compute the new bitmap in a scratch buffer and
+     *   Phase 1 — scan: compute the new bitmap in a scratch region and
      *     count which PENDING entries *would* sweep. Do NOT touch the
      *     pending list or the in-RAM bitmap yet.
      *   Phase 2 — I/O: write new bitmap → fsync → write new header →
@@ -748,40 +824,45 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
      * the old slot is still live and mount recovers the pre-commit state.
      */
 
-    /* Phase 1 — scan + compute new bitmap. */
-    uint8_t new_bitmap_block[STM_UB_SIZE];
-    memset(new_bitmap_block, 0, sizeof new_bitmap_block);
-    memcpy(new_bitmap_block, a->bitmap, a->bitmap_bytes);
+    /* The bitmap region is 56 KiB — heap, not stack. */
+    uint8_t *new_region = malloc(BITMAP_REGION_BYTES);
+    if (!new_region) return STM_ENOMEM;
+
+    stm_status s = STM_OK;
+
+    /* Phase 1 — scan + compute new bitmap region. */
+    memset(new_region, 0, BITMAP_REGION_BYTES);
+    memcpy(new_region, a->bitmap, a->bitmap_bytes);
 
     uint64_t swept_count = 0;
-    uint64_t swept_units = 0;
+    uint64_t swept_nodes = 0;
     for (const pending_entry *e = a->pending_head; e; e = e->next) {
         if (e->free_gen >= committed_gen) continue;
 
-        uint64_t first_unit = 0;
-        bool ok = paddr_to_unit(a, e->paddr, &first_unit);
+        uint64_t first_node = 0;
+        bool ok = paddr_to_node(a, e->paddr, &first_node);
         /* Invariant: every PENDING entry's paddr was validated on free().
          * A failure here means a pending_head link was corrupted — fatal. */
-        if (!ok) return STM_ECORRUPT;
+        if (!ok) { s = STM_ECORRUPT; goto out; }
 
-        uint64_t nunits = e->nblocks / (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
-        for (uint64_t i = 0; i < nunits; i++) {
-            bit_clear(new_bitmap_block, first_unit + i);
+        uint64_t nnodes = e->nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
+        for (uint64_t i = 0; i < nnodes; i++) {
+            bit_clear(new_region, first_node + i);
         }
-        swept_units += nunits;
+        swept_nodes += nnodes;
         swept_count++;
     }
 
     uint8_t bitmap_csum[32];
-    compute_bitmap_csum(new_bitmap_block, bitmap_csum);
+    compute_bitmap_csum(new_region, bitmap_csum);
 
     /* Phase 2 — I/O. */
     uint32_t new_bitmap_slot = 1u - a->bitmap_slot_live;
-    stm_status s = stm_bdev_write(a->d, bitmap_slot_offset(new_bitmap_slot),
-                                   new_bitmap_block, sizeof new_bitmap_block);
-    if (s != STM_OK) return s;
+    s = stm_bdev_write(a->d, bitmap_slot_offset(new_bitmap_slot),
+                       new_region, BITMAP_REGION_BYTES);
+    if (s != STM_OK) goto out;
     s = stm_bdev_fsync(a->d);
-    if (s != STM_OK) return s;
+    if (s != STM_OK) goto out;
 
     stm_bootstrap_hdr hdr = { 0 };
     hdr.h_magic                 = stm_store_le64(STM_BOOTSTRAP_HDR_MAGIC);
@@ -793,10 +874,11 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
     hdr.h_device_uuid[1]        = stm_store_le64(a->device_uuid[1]);
     hdr.h_bitmap_gen            = stm_store_le64(a->bitmap_gen + 1);
     hdr.h_bitmap_block          = stm_store_le64(bitmap_slot_block(new_bitmap_slot));
-    hdr.h_bitmap_bit_count      = stm_store_le64(a->total_units);
+    hdr.h_bitmap_bit_count      = stm_store_le64(a->total_nodes);
     hdr.h_bootstrap_size_blocks = stm_store_le64(a->bootstrap_size_blocks);
-    hdr.h_data_unit_blocks      = stm_store_le64(STM_BOOTSTRAP_UNIT_BLOCKS);
+    hdr.h_data_node_blocks      = stm_store_le64(STM_BOOTSTRAP_NODE_BLOCKS);
     hdr.h_data_start_block      = stm_store_le64(a->data_start_block);
+    hdr.h_bitmap_block_count    = stm_store_le64(STM_BOOTSTRAP_BITMAP_BLOCKS);
     memcpy(hdr.h_bitmap_csum, bitmap_csum, 32);
     memcpy(hdr.h_user_data, a->user_data, STM_BOOTSTRAP_USER_DATA_SIZE);
 
@@ -806,9 +888,9 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
     uint32_t new_hdr_slot = 1u - a->hdr_slot_live;
     s = stm_bdev_write(a->d, hdr_slot_offset(new_hdr_slot),
                        hdr_buf, sizeof hdr_buf);
-    if (s != STM_OK) return s;
+    if (s != STM_OK) goto out;
     s = stm_bdev_fsync(a->d);
-    if (s != STM_OK) return s;
+    if (s != STM_OK) goto out;
 
     /* Phase 3 — finalize. I/O succeeded; promote in-RAM state. */
     pending_entry **link = &a->pending_head;
@@ -824,13 +906,17 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
         e = next;
     }
 
-    memcpy(a->bitmap, new_bitmap_block, a->bitmap_bytes);
+    memcpy(a->bitmap, new_region, a->bitmap_bytes);
     a->bitmap_slot_live = new_bitmap_slot;
     a->hdr_slot_live    = new_hdr_slot;
     a->bitmap_gen      += 1;
     a->pending_count   -= swept_count;
-    a->pending_units   -= swept_units;
-    return STM_OK;
+    a->pending_nodes   -= swept_nodes;
+    s = STM_OK;
+
+out:
+    free(new_region);
+    return s;
 }
 
 /* ========================================================================= */
@@ -842,16 +928,16 @@ stm_status stm_bootstrap_stats_get(const stm_bootstrap *a, stm_bootstrap_stats *
     if (!a || !out) return STM_EINVAL;
 
     uint64_t allocated = 0;
-    for (uint64_t i = 0; i < a->total_units; i++) {
+    for (uint64_t i = 0; i < a->total_nodes; i++) {
         if (bit_is_set(a->bitmap, i)) allocated++;
     }
 
     out->bootstrap_size_blocks = a->bootstrap_size_blocks;
-    out->data_unit_blocks      = STM_BOOTSTRAP_UNIT_BLOCKS;
-    out->total_units           = a->total_units;
-    out->allocated_units       = allocated;
-    out->pending_units         = a->pending_units;
-    out->free_units            = a->total_units - allocated;
+    out->data_node_blocks      = STM_BOOTSTRAP_NODE_BLOCKS;
+    out->total_nodes           = a->total_nodes;
+    out->allocated_nodes       = allocated;
+    out->pending_nodes         = a->pending_nodes;
+    out->free_nodes            = a->total_nodes - allocated;
     out->header_slot_live      = a->hdr_slot_live;
     out->bitmap_slot_live      = a->bitmap_slot_live;
     out->bitmap_gen            = a->bitmap_gen;
@@ -862,9 +948,9 @@ stm_status stm_bootstrap_is_allocated(const stm_bootstrap *a, uint64_t paddr,
                                    bool *out_allocated)
 {
     if (!a || !out_allocated) return STM_EINVAL;
-    uint64_t unit = 0;
-    if (!paddr_to_unit(a, paddr, &unit)) return STM_EINVAL;
-    *out_allocated = bit_is_set(a->bitmap, unit);
+    uint64_t node = 0;
+    if (!paddr_to_node(a, paddr, &node)) return STM_EINVAL;
+    *out_allocated = bit_is_set(a->bitmap, node);
     return STM_OK;
 }
 

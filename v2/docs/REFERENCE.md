@@ -1100,7 +1100,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   that resolves stm_sync_alloc + calls stm_alloc_stats_get
   under fs->lock with stm_fs_stats_get's wedged-OK posture.
   Per-device body surfaces 13 fields (bootstrap_size_blocks,
-  bootstrap_total_units, bootstrap_allocated_units,
+  bootstrap_total_nodes, bootstrap_allocated_nodes,
   bootstrap_bitmap_gen, data_first_block, data_last_block,
   data_total_blocks, data_allocated_blocks, data_pending_blocks,
   data_free_blocks, n_allocated_ranges, n_pending_ranges +

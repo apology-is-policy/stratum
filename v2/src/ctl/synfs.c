@@ -1504,8 +1504,8 @@ static stm_status materialize_debug_alloc(stm_ctl *c, ctl_session *s)
     int n = snprintf((char *)s->buf, sizeof s->buf,
         "device-id: %u\n"
         "bootstrap-size-blocks: %llu\n"
-        "bootstrap-total-units: %llu\n"
-        "bootstrap-allocated-units: %llu\n"
+        "bootstrap-total-nodes: %llu\n"
+        "bootstrap-allocated-nodes: %llu\n"
         "bootstrap-bitmap-gen: %llu\n"
         "data-first-block: %llu\n"
         "data-last-block: %llu\n"
@@ -1517,8 +1517,8 @@ static stm_status materialize_debug_alloc(stm_ctl *c, ctl_session *s)
         "n-pending-ranges: %llu\n",
         (unsigned)did,
         (unsigned long long)stats.bootstrap_size_blocks,
-        (unsigned long long)stats.bootstrap_total_units,
-        (unsigned long long)stats.bootstrap_allocated_units,
+        (unsigned long long)stats.bootstrap_total_nodes,
+        (unsigned long long)stats.bootstrap_allocated_nodes,
         (unsigned long long)stats.bootstrap_bitmap_gen,
         (unsigned long long)stats.data_first_block,
         (unsigned long long)stats.data_last_block,

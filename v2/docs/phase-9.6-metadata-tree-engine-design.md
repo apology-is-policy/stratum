@@ -330,7 +330,8 @@ message-buffer-flush and lock-free invariants extend it again.
 |---|---|---|
 | **9.6-design** | This document. | — |
 | **9.6-spec** | `btree.tla` + buggy configs + TLC verify. | — |
-| **9.6-impl-1** | COW node store: paddr-addressed nodes, the in-memory node cache, dirty-tracking, **multi-level** (kill the 2-level cap), node-size reduction (§3.4). Engine usable standalone. | R-series |
+| **9.6-impl-1a** | Bootstrap allocator: bitmap quantum dropped 128 KiB unit → 16 KiB node (§3.4); bitmap region widened to `STM_BOOTSTRAP_BITMAP_BLOCKS` = 14 blocks (~7 GiB pool cap, no regression vs. the old 4 GiB); on-disk header format v2. | R149 |
+| **9.6-impl-1b** | COW node store: paddr-addressed nodes, the in-memory node cache, dirty-tracking, **multi-level** (kill the 2-level cap). Engine usable standalone. | R-series |
 | **9.6-impl-2** | Incremental commit: COW dirty root-to-leaf paths only; deferred-free of replaced nodes; three-phase-sync integration; crash-revert. | R-series |
 | **9.6-impl-3** | Large-value spill (§3.8). | R-series |
 | **9.6-impl-4** | Cut the four metadata modules over to the engine; retire whole-rebuild + flat `records[]`. | R-series |

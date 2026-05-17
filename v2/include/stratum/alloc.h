@@ -61,8 +61,8 @@ typedef struct stm_alloc stm_alloc;
 typedef struct {
     /* Bootstrap pool totals (ARCH §6.5). */
     uint64_t bootstrap_size_blocks;
-    uint64_t bootstrap_total_units;
-    uint64_t bootstrap_allocated_units;
+    uint64_t bootstrap_total_nodes;
+    uint64_t bootstrap_allocated_nodes;
     uint64_t bootstrap_bitmap_gen;
 
     /* Data-area geometry. */
