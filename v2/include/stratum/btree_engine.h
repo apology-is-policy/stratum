@@ -19,14 +19,13 @@
  * root_csum) — the same shape the uberblock and snapshot entries
  * already store.
  *
- * Chunk scope (9.6-impl-2): the structural engine plus incremental
- * commit — node cache, dirty-tracking, multi-level descent / insert /
- * lookup / split, a commit that COWs only the dirty root-to-leaf
- * paths, deferred-free of the superseded paddrs, and a flush /
- * finalize / abort split so the commit composes with the three-phase
- * sync and reverts cleanly on a crash before the final phase.
- * Large-value spill (for values that exceed a node) is 9.6-impl-3;
- * until then a single entry larger than STM_BTREE_ENGINE_MAX_ENTRY_BYTES
+ * Chunk scope (9.6-impl-3): the structural engine, incremental commit,
+ * and large-value spill — node cache, dirty-tracking, multi-level
+ * descent / insert / lookup / split, a commit that COWs only the dirty
+ * root-to-leaf paths with deferred-free and a flush / finalize / abort
+ * split, and out-of-line storage of values too large to sit inline in
+ * a node (a chain of spill blocks; the leaf entry holds a small
+ * indirection record). Only a value over STM_BTREE_ENGINE_MAX_VALUE_BYTES
  * is refused with STM_ERANGE.
  *
  * Concurrency: NOT thread-safe at impl-1b. One engine handle is used
@@ -60,17 +59,26 @@ extern "C" {
 #define STM_BTREE_ENGINE_NODE_SIZE      (16u * 1024u)
 
 /*
- * Largest single (key + value) entry the impl-1b engine accepts —
- * key_len + value_len + the 8-byte entry header. Bounded at a third
- * of a node's payload so a 2-way node split is always sufficient and
- * always produces two well-formed nodes (see the reference doc §Split).
- * Phase 9.6-impl-3 (large-value spill) lifts this: a value above the
- * bound is written to its own block and the leaf holds a small
- * indirection record instead.
+ * Largest single leaf entry the engine stores INLINE — key_len +
+ * value_len + the 8-byte btnode entry header + a 1-byte spill tag.
+ * Bounded at a third of a node's payload so a 2-way node split is
+ * always sufficient and always produces two well-formed nodes (see the
+ * reference doc §Split). A value that would push the entry past this
+ * bound is spilled out-of-line (9.6-impl-3); a spilled entry's leaf
+ * footprint is just the small indirection record, so it always fits.
  */
 #define STM_BTREE_ENGINE_MAX_ENTRY_BYTES   \
     ((STM_BTREE_ENGINE_NODE_SIZE - STM_BTNODE_HDR_SIZE -               \
       STM_BTNODE_CSUM_SIZE) / 3u)
+
+/*
+ * Largest value the engine accepts (9.6-impl-3). A value over the
+ * inline bound is stored out-of-line in a chain of spill blocks; a
+ * value over THIS cap is refused with STM_ERANGE — a metadata value
+ * larger than 1 MiB is pathological (bulk data belongs in extents, not
+ * the metadata tree). The cap also bounds the spill-chain walk length.
+ */
+#define STM_BTREE_ENGINE_MAX_VALUE_BYTES   (1024u * 1024u)
 
 /* ========================================================================= */
 /* Opaque handle + stats.                                                     */
@@ -144,9 +152,11 @@ void stm_btree_engine_destroy(stm_btree_engine *eng);
  *
  * `key_len` may be 0 (the minimum key). `value_len` may be 0.
  *
- * Returns STM_ERANGE if STM_BTNODE_ENTRY_HDR_SIZE + key_len +
- * value_len exceeds STM_BTREE_ENGINE_MAX_ENTRY_BYTES (impl-3 spill
- * lifts this), STM_EINVAL on NULL key/value with nonzero length,
+ * A value larger than the inline bound is stored out-of-line in a
+ * spill chain (9.6-impl-3) — it is NOT refused. STM_ERANGE is returned
+ * only when `value_len` exceeds STM_BTREE_ENGINE_MAX_VALUE_BYTES, or
+ * when `key_len` is so large the entry could not fit even as a spilled
+ * indirection. STM_EINVAL on NULL key/value with nonzero length,
  * STM_EBUSY while a commit is flushed but not yet finalized/aborted,
  * STM_ENOMEM / STM_ECORRUPT / device errors otherwise. An insert that
  * fails never loses an already-present key (see the reference doc

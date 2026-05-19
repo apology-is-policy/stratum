@@ -55,8 +55,7 @@ typedef struct {
  * flushed-but-unfinalized commit. */
 static void pending_reset(eng_pending *p);
 static void pending_free_paddrs(stm_btree_engine *eng,
-                                 const uint64_t *paddrs, uint32_t n,
-                                 uint64_t free_gen);
+                                 const paddr_vec *v, uint64_t free_gen);
 
 /* ========================================================================= */
 /* Lifecycle.                                                                  */
@@ -129,8 +128,7 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
      * tracking arrays themselves are freed by pending_reset; when no
      * commit is pending those arrays are already NULL. */
     if (eng->pending.active) {
-        pending_free_paddrs(eng, eng->pending.fresh,
-                            eng->pending.n_fresh, eng->pending.gen);
+        pending_free_paddrs(eng, &eng->pending.fresh, eng->pending.gen);
         pending_reset(&eng->pending);
     }
     eng_node_free_recursive(eng->root);    /* frees every in-memory node */
@@ -278,10 +276,14 @@ stm_status stm_btree_engine_insert(stm_btree_engine *eng,
     if (key_len   && !key)          return STM_EINVAL;
     if (value_len && !value)        return STM_EINVAL;
 
-    /* Entry-size bound — impl-3 large-value spill lifts this. The
-     * arg-shape checks above pre-empt STM_EBUSY (R135 doctrine). */
-    size_t entry = (size_t)STM_BTNODE_ENTRY_HDR_SIZE + key_len + value_len;
-    if (entry > ENG_MAX_ITEM_BYTES) return STM_ERANGE;
+    /* Value- and key-size bounds (9.6-impl-3). A large value spills
+     * out-of-line — only a value over the cap, or a key so large the
+     * entry could not fit even as a spilled indirection, is refused.
+     * The arg-shape checks above pre-empt STM_EBUSY (R135 doctrine). */
+    if (value_len > STM_BTREE_ENGINE_MAX_VALUE_BYTES) return STM_ERANGE;
+    size_t spilled_entry = (size_t)STM_BTNODE_ENTRY_HDR_SIZE + key_len +
+                           ENG_VAL_TAG_SIZE + ENG_SPILL_INDIRECT_SIZE;
+    if (spilled_entry > ENG_MAX_ITEM_BYTES) return STM_ERANGE;  /* key too big */
 
     /* No mutation inside a flushed-but-unfinalized commit window. */
     if (eng->pending.active)        return STM_EBUSY;
@@ -363,17 +365,54 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
 /* Commit — incremental COW, three-phase (flush / finalize / abort).            */
 /* ========================================================================= */
 
-/* Free both paddr-tracking arrays and zero the pending record. */
+/* ---- paddr_vec — the growable commit superseded / fresh sets. -------------- */
+
+/* Free the backing store and zero the vector. */
+void paddr_vec_free(paddr_vec *v)
+{
+    free(v->v);
+    v->v = NULL;
+    v->n = 0;
+    v->cap = 0;
+}
+
+/* Ensure room for `additional` more entries beyond the current count.
+ * Callers that must record a paddr AFTER an irreversible device write
+ * reserve first, so the subsequent push cannot fail and leak it. */
+STM_MUST_USE
+stm_status paddr_vec_reserve(paddr_vec *v, uint32_t additional)
+{
+    if ((uint32_t)(v->cap - v->n) >= additional) return STM_OK;
+    uint64_t want = (uint64_t)v->n + additional;
+    if (want > UINT32_MAX) return STM_ENOMEM;
+    uint32_t nc = v->cap ? v->cap : 8u;
+    while (nc < want) {
+        if (nc > UINT32_MAX / 2u) { nc = (uint32_t)want; break; }
+        nc *= 2u;
+    }
+    uint64_t *nv = realloc(v->v, (size_t)nc * sizeof *nv);
+    if (!nv) return STM_ENOMEM;
+    v->v   = nv;
+    v->cap = nc;
+    return STM_OK;
+}
+
+/* Append `p`. Grows on demand — fallible. */
+STM_MUST_USE
+stm_status paddr_vec_push(paddr_vec *v, uint64_t p)
+{
+    stm_status s = paddr_vec_reserve(v, 1u);
+    if (s != STM_OK) return s;
+    v->v[v->n++] = p;
+    return STM_OK;
+}
+
+/* Free both paddr vectors and zero the pending record. */
 static void pending_reset(eng_pending *p)
 {
-    free(p->superseded);
-    free(p->fresh);
-    p->superseded   = NULL;
-    p->fresh        = NULL;
-    p->n_superseded = 0;
-    p->n_fresh      = 0;
-    p->cap          = 0;
-    p->active       = false;
+    paddr_vec_free(&p->superseded);
+    paddr_vec_free(&p->fresh);
+    *p = (eng_pending){ 0 };
 }
 
 /*
@@ -384,12 +423,11 @@ static void pending_reset(eng_pending *p)
  * is already decided.
  */
 static void pending_free_paddrs(stm_btree_engine *eng,
-                                 const uint64_t *paddrs, uint32_t n,
-                                 uint64_t free_gen)
+                                 const paddr_vec *v, uint64_t free_gen)
 {
     if (!eng->vt->free) return;
-    for (uint32_t i = 0; i < n; i++)
-        (void)eng->vt->free(eng->vt_ctx, paddrs[i], free_gen);
+    for (uint32_t i = 0; i < v->n; i++)
+        (void)eng->vt->free(eng->vt_ctx, v->v[i], free_gen);
 }
 
 /*
@@ -427,8 +465,8 @@ static void invalidate_memtree(stm_btree_engine *eng)
  * Count the dirty nodes reachable from `node` through dirty ancestors —
  * exactly the set commit_node will rewrite. A clean node short-circuits
  * (node_insert dirties every ancestor of a mutation, so a clean node
- * implies a wholly-clean subtree). The count pre-sizes commit_flush's
- * superseded / fresh arrays so the flush walk's appends are infallible.
+ * implies a wholly-clean subtree). The count is commit_flush's
+ * initial-capacity hint for the superseded / fresh paddr vectors.
  */
 static stm_status count_dirty(const eng_node *node, uint32_t depth,
                                uint32_t *n)
@@ -449,20 +487,92 @@ static stm_status count_dirty(const eng_node *node, uint32_t depth,
 }
 
 /*
+ * Sync a dirty leaf's spilled values to disk BEFORE the leaf node is
+ * written (phase-9.6-impl-3-spill-design.md §6). A spill chain is
+ * rewritten only when its value changed:
+ *
+ *  - value still spills, chain dirty  -> free the old chain (superseded)
+ *    and write a fresh one (fresh);
+ *  - value still spills, chain clean  -> reuse the existing chain;
+ *  - value now fits inline            -> free the old chain (superseded),
+ *    drop the eng_spill;
+ *  - value newly spills               -> allocate eng_spill, write a chain.
+ *
+ * The superseded slots are reserved up front so the record cannot fail
+ * after a chain is logically gone. On any failure the partial state is
+ * left for commit_flush's failed-flush handler: every fresh block paddr
+ * is already in pending.fresh; every in-memory eng_spill is freed by
+ * invalidate_memtree.
+ */
+static stm_status leaf_sync_spill(stm_btree_engine *eng, eng_node *leaf,
+                                   uint64_t gen)
+{
+    for (uint32_t i = 0; i < leaf->n_entries; i++) {
+        eng_entry *e = &leaf->entries[i];
+        size_t inline_entry = (size_t)STM_BTNODE_ENTRY_HDR_SIZE +
+                              e->key_len + ENG_VAL_TAG_SIZE + e->val_len;
+        bool spilled = inline_entry > ENG_MAX_ITEM_BYTES;
+
+        if (!spilled) {
+            if (!e->spill) continue;            /* inline -> inline */
+            /* The value shrank below the inline bound — free the stale
+             * on-disk chain, drop the spill record. */
+            stm_status s = paddr_vec_reserve(&eng->pending.superseded,
+                                             e->spill->n_blocks);
+            if (s != STM_OK) return s;
+            for (uint32_t j = 0; j < e->spill->n_blocks; j++)
+                (void)paddr_vec_push(&eng->pending.superseded,
+                                     e->spill->blocks[j]);
+            free(e->spill->blocks);
+            free(e->spill);
+            e->spill = NULL;
+            continue;
+        }
+
+        /* Spilled. Ensure the spill record exists (a value that newly
+         * crossed the inline bound has none yet). */
+        if (!e->spill) {
+            e->spill = calloc(1, sizeof *e->spill);
+            if (!e->spill) return STM_ENOMEM;
+            e->spill->dirty = true;
+        }
+        if (!e->spill->dirty) continue;         /* clean — reuse the chain */
+
+        /* Free the stale chain (superseded), then write a fresh one. */
+        stm_status s = paddr_vec_reserve(&eng->pending.superseded,
+                                         e->spill->n_blocks);
+        if (s != STM_OK) return s;
+        for (uint32_t j = 0; j < e->spill->n_blocks; j++)
+            (void)paddr_vec_push(&eng->pending.superseded,
+                                 e->spill->blocks[j]);
+        free(e->spill->blocks);
+        e->spill->blocks   = NULL;
+        e->spill->n_blocks = 0;
+
+        s = eng_spill_chain_write(eng, e->val, e->val_len, gen,
+                                  e->spill, &eng->pending.fresh);
+        if (s != STM_OK) return s;     /* reserved fresh blocks already logged */
+    }
+    return STM_OK;
+}
+
+/*
  * Commit `node` and its dirty descendants bottom-up. A clean node (and
  * therefore its wholly-clean subtree — node_insert dirties every
  * ancestor of a mutation) short-circuits with its existing durable
  * paddr / csum, so only dirty root-to-leaf paths are rewritten.
  *
- * Each rewritten node's PRIOR paddr (its superseded on-disk location)
- * and its FRESH paddr are recorded into eng->pending: finalize frees
- * the superseded set, abort frees the fresh set. A node freshly created
- * in RAM (a split product, a grown root) has prior paddr 0 — nothing to
- * supersede, so superseded <= fresh. A clean (shared) subtree is never
- * recorded, so a freed paddr is never reachable from the new durable
- * root (btree.tla::FreedNodesNotReachable). The pending arrays were
- * pre-sized by count_dirty, so the appends are infallible.
+ * For a dirty leaf, leaf_sync_spill first writes / frees the entries'
+ * spill chains. Each rewritten node's PRIOR paddr is recorded into
+ * pending.superseded and its FRESH paddr into pending.fresh — finalize
+ * frees the superseded set, abort frees the fresh set. A RAM-fresh node
+ * (a split product, a grown root) has prior paddr 0 — nothing to
+ * supersede. A clean (shared) subtree is never recorded, so a freed
+ * paddr is never reachable from the new durable root
+ * (btree.tla::FreedNodesNotReachable).
  *
+ * The fresh / superseded slots are reserved BEFORE the device write so
+ * the post-write record cannot fail and leak the just-written node.
  * The depth cap is defence in depth: the in-memory tree is built by
  * node_insert (depth-capped) and load_child (which rejects DAGs /
  * cycles), so it is always a strict tree of depth <= ENG_MAX_DEPTH.
@@ -494,22 +604,31 @@ static stm_status commit_node(stm_btree_engine *eng, eng_node *node,
             ch->is_leaf = ch->mem->is_leaf;
             memcpy(ch->csum, cc, STM_BTNODE_CSUM_SIZE);
         }
+    } else {
+        /* Write / free the leaf's spilled-value chains first, so
+         * eng_node_write encodes each spilled entry's indirection from
+         * the now-current eng_spill. */
+        stm_status s = leaf_sync_spill(eng, node, gen);
+        if (s != STM_OK) return s;
     }
 
-    /* Capacity-check the pending arrays BEFORE the write, so a (never-
-     * reached) count_dirty / commit_node traversal divergence cannot
-     * produce an unrecorded — thus unreclaimable — disk write. */
-    eng_pending *p = &eng->pending;
-    if (p->n_fresh >= p->cap) return STM_ECORRUPT;
-    uint64_t old_paddr = node->paddr;      /* 0 for a RAM-fresh node */
-    if (old_paddr != 0 && p->n_superseded >= p->cap) return STM_ECORRUPT;
+    /* Reserve the pending slots BEFORE the irreversible device write —
+     * one fresh paddr always, one superseded iff this node had a prior
+     * on-disk location — so the post-write pushes cannot fail. */
+    uint64_t old_paddr = node->paddr;          /* 0 for a RAM-fresh node */
+    stm_status s = paddr_vec_reserve(&eng->pending.fresh, 1u);
+    if (s != STM_OK) return s;
+    if (old_paddr != 0) {
+        s = paddr_vec_reserve(&eng->pending.superseded, 1u);
+        if (s != STM_OK) return s;
+    }
 
-    stm_status s = eng_node_write(eng, node, gen);   /* assigns a fresh paddr */
+    s = eng_node_write(eng, node, gen);        /* assigns a fresh paddr */
     if (s != STM_OK) return s;
 
-    p->fresh[p->n_fresh++] = node->paddr;
+    (void)paddr_vec_push(&eng->pending.fresh, node->paddr);   /* reserved */
     if (old_paddr != 0)
-        p->superseded[p->n_superseded++] = old_paddr;
+        (void)paddr_vec_push(&eng->pending.superseded, old_paddr); /* reserved */
 
     *out_paddr = node->paddr;
     memcpy(out_csum, node->csum, STM_BTNODE_CSUM_SIZE);
@@ -539,10 +658,10 @@ stm_status stm_btree_engine_commit_flush(stm_btree_engine *eng, uint64_t gen,
     stm_status s = load_root(eng, &root);
     if (s != STM_OK) return s;             /* no pending window opened */
 
-    /* Pre-size the paddr-tracking arrays from the dirty-node count so
-     * the commit_node walk's appends are infallible (ENOMEM surfaces
-     * only here). p is zeroed — calloc at create/open, pending_reset
-     * after every commit, and after every failed flush. */
+    /* count_dirty gives the initial-capacity hint for the paddr vectors
+     * (spill chains grow them further during the walk). p is zeroed —
+     * calloc at create/open, pending_reset after every commit and after
+     * every failed flush. */
     uint32_t n_dirty = 0;
     s = count_dirty(root, 0, &n_dirty);
     if (s != STM_OK) {
@@ -557,21 +676,13 @@ stm_status stm_btree_engine_commit_flush(stm_btree_engine *eng, uint64_t gen,
     }
 
     eng_pending *p = &eng->pending;
-    if (n_dirty > 0) {
-        p->superseded = malloc((size_t)n_dirty * sizeof *p->superseded);
-        p->fresh      = malloc((size_t)n_dirty * sizeof *p->fresh);
-        if (!p->superseded || !p->fresh) {
-            free(p->superseded);
-            free(p->fresh);
-            p->superseded = NULL;
-            p->fresh      = NULL;
-            return STM_ENOMEM;             /* no pending window opened */
-        }
+    s = paddr_vec_reserve(&p->superseded, n_dirty);
+    if (s == STM_OK) s = paddr_vec_reserve(&p->fresh, n_dirty);
+    if (s != STM_OK) {
+        pending_reset(p);                  /* no pending window opened */
+        return s;
     }
-    p->cap          = n_dirty;
-    p->gen          = gen;
-    p->n_superseded = 0;
-    p->n_fresh      = 0;
+    p->gen = gen;
 
     uint64_t rp = 0;
     uint8_t  rc[STM_BTNODE_CSUM_SIZE];
@@ -580,7 +691,7 @@ stm_status stm_btree_engine_commit_flush(stm_btree_engine *eng, uint64_t gen,
         /* Failed flush — the in-process Crash. Reclaim whatever nodes
          * were written (unrooted), drop the now-inconsistent in-memory
          * tree, leave the durable root naming the previous tree. */
-        pending_free_paddrs(eng, p->fresh, p->n_fresh, gen);
+        pending_free_paddrs(eng, &p->fresh, gen);
         pending_reset(p);
         invalidate_memtree(eng);
         return s;
@@ -623,7 +734,7 @@ stm_status stm_btree_engine_commit_finalize(stm_btree_engine *eng)
      * bootstrap.h). A clean/shared subtree is never in `superseded`, so
      * this never frees a node the new root still points at
      * (btree.tla::FreedNodesNotReachable). */
-    pending_free_paddrs(eng, p->superseded, p->n_superseded, p->gen);
+    pending_free_paddrs(eng, &p->superseded, p->gen);
     /* The superseded paddrs are now freed — drop the node cache so it
      * carries no entry keyed by a freed paddr. The in-memory tree is
      * kept (reached via eng->root + child.mem); the cache only indexes
@@ -644,7 +755,7 @@ stm_status stm_btree_engine_commit_abort(stm_btree_engine *eng)
      * triple is untouched. Drop the in-memory tree — it is now clean at
      * paddrs we just freed — so the next descent reloads the previous
      * durable root. */
-    pending_free_paddrs(eng, p->fresh, p->n_fresh, p->gen);
+    pending_free_paddrs(eng, &p->fresh, p->gen);
     pending_reset(p);
     invalidate_memtree(eng);
     return STM_OK;

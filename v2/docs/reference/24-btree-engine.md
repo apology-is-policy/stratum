@@ -15,13 +15,15 @@ node — 16 KiB — AEGIS-256 encrypted with a per-node BLAKE3 Merkle csum,
 the same crypto envelope `btree_store` nodes carry. A tree's durable
 identity is the triple `(root_paddr, root_gen, root_csum)`.
 
-This file documents **9.6-impl-2** — the structural engine plus
-incremental copy-on-write commit: deferred-free of superseded paddrs,
-the `commit_flush` / `commit_finalize` / `commit_abort` three-phase
-split, and crash-revert. Large-value spill is 9.6-impl-3; the cutover of
-the four metadata modules onto the engine — wiring the real
-`stm_bootstrap`-backed vtable into the three-phase sync — is 9.6-impl-4.
-See `docs/phase-9.6-metadata-tree-engine-design.md`.
+This file documents **9.6-impl-3** — the structural engine, incremental
+copy-on-write commit (deferred-free of superseded paddrs, the
+`commit_flush` / `commit_finalize` / `commit_abort` three-phase split,
+crash-revert), and large-value spill (out-of-line storage for values
+too large to sit inline in a node). The cutover of the four metadata
+modules onto the engine — wiring the real `stm_bootstrap`-backed vtable
+into the three-phase sync — is 9.6-impl-4. See
+`docs/phase-9.6-metadata-tree-engine-design.md` and
+`docs/phase-9.6-impl-3-spill-design.md`.
 
 ## Where it sits
 
@@ -52,8 +54,10 @@ the engine's three-phase commit joins the live sync path.
 - `STM_BTREE_ENGINE_NODE_SIZE` = 16 KiB — one bootstrap node
   (`STM_BOOTSTRAP_NODE_BLOCKS` × 4 KiB; pinned by a `_Static_assert`).
 - `STM_BTREE_ENGINE_MAX_ENTRY_BYTES` = node payload / 3 — the largest
-  `hdr + key + value` entry impl-1b accepts (see §Split). impl-3
-  large-value spill lifts this.
+  `hdr + key + value` entry stored INLINE (see §Split). A value past it
+  spills out-of-line (§Large-value spill).
+- `STM_BTREE_ENGINE_MAX_VALUE_BYTES` = 1 MiB — the largest value the
+  engine accepts at all; a value over it is refused with `STM_ERANGE`.
 
 ### Lifecycle
 
@@ -94,7 +98,9 @@ stm_status stm_btree_engine_scan  (stm_btree_engine *eng,
 
 `insert` upserts on a duplicate key. `lookup` copies the value into a
 freshly malloc'd buffer the caller frees (NULL for a zero-length
-value). `scan` enumerates every entry in ascending key order.
+value). `scan` enumerates every entry in ascending key order. Spill is
+transparent: `lookup` / `scan` always see the full value — the engine
+materialises a spilled value at load (§Large-value spill).
 
 ### Commit + inspection
 
@@ -224,9 +230,10 @@ The 2-way split is **always sufficient and always well-formed** because
   lands in `[1, m-2]` and neither half is a degenerate single-child
   node.
 
-The bound is the honest impl-1b boundary: a value too large to share a
-node is what 9.6-impl-3 large-value spill routes to its own block. An
-entry over the bound is refused with `STM_ERANGE`.
+A value too large to fit inline within the `cap/3` bound is stored
+out-of-line — a spilled entry's leaf footprint is just the small fixed
+indirection record, well under `cap/3` — so the 2-way split argument
+holds for spilled entries too (§Large-value spill).
 
 ### Commit — incremental, three-phase
 
@@ -325,6 +332,55 @@ allocator-bitmap commit is part of the same final phase that publishes
 the root, so an aborted (never-finalized) gen never advances
 `committed_gen`.
 
+### Large-value spill
+
+A value too large to sit inline — `8 (btnode entry hdr) + key_len + 1
+(spill tag) + value_len > STM_BTREE_ENGINE_MAX_ENTRY_BYTES` — is stored
+**out-of-line** in a chain of spill blocks; the leaf entry holds a
+fixed 72-byte indirection record in its place. Design of record:
+`docs/phase-9.6-impl-3-spill-design.md`.
+
+**On disk.** Every engine leaf value is `[tag : 1][payload]` — the tag
+(`ENG_VAL_INLINE` / `ENG_VAL_SPILLED`) keeps the spill discriminator
+inside the engine's *opaque* value bytes, so the shared `btnode` codec
+is **not** touched and no format version is bumped at impl-3 (the
+version gate moves to 9.6-impl-4, when the engine becomes the pool's
+metadata format). A spilled payload is `real_value_len (le64) ‖ head
+bptr (64)`. A spill block is one 16-KiB engine-node region — AEGIS-256
+encrypted and Merkle-csummed exactly as a tree node, but an
+engine-owned plaintext format (magic ‖ chunk_len ‖ flags ‖ next bptr ‖
+value chunk), **not** a `btnode`. A value larger than one block's chunk
+capacity is a forward-linked chain; the leaf indirection points at
+block 0, each block's `next` bptr at its successor. `verify` walks the
+chain Merkle/AEAD-checking every block, so the integrity chain extends
+leaf → spill chain unbroken (`CommittedTreeMerkleConsistent`).
+
+**In memory.** `eng_entry.val` always holds the full materialised value
+(`eng_node_read` walks the chain at load) — spill is purely an on-disk
+representation, so `lookup` / `scan` are unchanged. A spilled entry
+carries an `eng_spill` recording its on-disk chain (`blocks[]`,
+`head_gen`, `head_csum`, a `dirty` flag).
+
+**Per-value COW.** A spill chain is rewritten **only when its value
+changes** — a leaf rewritten because a *sibling* entry changed keeps an
+unchanged spilled value's chain *shared* with the superseded leaf
+version (its blocks are never recorded as superseded, so never freed —
+`FreedNodesNotReachable` for chains; pinned by
+`engine_spill_per_value_cow`). `commit_node`'s `leaf_sync_spill` step,
+for a dirty leaf: writes a fresh chain for each `dirty` spilled value
+(the old chain → superseded set), reuses a clean spilled value's chain,
+frees the chain of a value that shrank below the inline bound. Fresh /
+superseded chain blocks join the same `commit` superseded / fresh sets
+as tree nodes, so deferred-free, abort-revert, and crash-revert all
+cover spill blocks identically. Because a leaf's spill blocks make the
+per-commit paddr count variable, those sets are growable `paddr_vec`s
+(`count_dirty` is now the initial-capacity hint, not an exact
+pre-size).
+
+**Cap.** A value over `STM_BTREE_ENGINE_MAX_VALUE_BYTES` (1 MiB), or a
+key so large the entry could not fit even as a spilled indirection, is
+refused with `STM_ERANGE` — the only `STM_ERANGE` cases at impl-3.
+
 ### Failure atomicity
 
 An `insert` never loses an already-present key, even on `STM_ENOMEM`:
@@ -349,7 +405,7 @@ btnode encoder rather than writing a malformed node.
 
 | Spec | Pins |
 |---|---|
-| `btree.tla` | The incremental COW-commit mechanism. `commit_flush` / `commit_finalize` / `commit_abort` realise `WriteNode` / `FinalCommit` / `Crash`; the three invariants map directly — `DurableTreeWellFormed` (finalize publishes a complete flushed tree; a flush failure or abort leaves the prior durable root, never a torn one), `CommittedTreeMerkleConsistent` (`eng_node_write`'s ciphertext-BLAKE3 Merkle link, propagated bottom-up by `commit_node`), `FreedNodesNotReachable` (finalize frees only the superseded set — a clean/shared subtree is never recorded, never freed). TLC-verified green; the three buggy configs (partial-COW, early-publish, over-free) each trip exactly one invariant. |
+| `btree.tla` | The incremental COW-commit mechanism. `commit_flush` / `commit_finalize` / `commit_abort` realise `WriteNode` / `FinalCommit` / `Crash`; the three invariants map directly — `DurableTreeWellFormed` (finalize publishes a complete flushed tree; a flush failure or abort leaves the prior durable root, never a torn one), `CommittedTreeMerkleConsistent` (`eng_node_write`'s ciphertext-BLAKE3 Merkle link, propagated bottom-up by `commit_node`), `FreedNodesNotReachable` (finalize frees only the superseded set — a clean/shared subtree is never recorded, never freed). TLC-verified green; the three buggy configs (partial-COW, early-publish, over-free) each trip exactly one invariant. 9.6-impl-3 large-value spill needs **no** `btree.tla` extension — a spill block is another COWed paddr written by the existing flush, freed by finalize/abort, and Merkle-linked by its parent; the spec's COW-commit mechanism already covers it (`phase-9.6-impl-3-spill-design.md` §7). |
 | `allocator.tla` / `sync.tla` | `(paddr, gen)` AEAD-nonce uniqueness composes from the allocator (fresh paddrs) and sync (monotone gen); `btree.tla` and the engine model the tree-shape mechanism on that composition. `btree.tla` comment §Composition. |
 
 The multi-level B+tree split / descent is a structural-algorithm
@@ -359,7 +415,7 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 24 cases against an in-RAM
+`tests/test_btree_engine.c` — 30 cases against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
 can both assert which paddrs were superseded and still open a prior
@@ -373,9 +429,10 @@ crash-revert path):
 | Multi-level | 150 large-key entries force `height >= 3` (the 2-level cap is gone); deep tree commits, reopens, verifies, spot-checks |
 | Commit | re-commit of a clean tree is a no-op (same root, no new nodes); the published gen stays the root's real write gen and the triple reopens; a non-monotonic commit gen → `STM_EINVAL`; incremental commit COWs the root to a new paddr and shares unchanged subtrees — the prior root stays intact and readable |
 | Three-phase commit | deferred-free — a second commit hands back exactly the superseded paddrs (the rewritten leaf + the old root), stamped with the commit gen, and never the shared subtrees (`FreedNodesNotReachable`); a three-commit chain confirms no paddr is freed twice; `commit_flush` + `commit_finalize` publishes the flushed root, and the pending-commit window rejects every other op with `STM_EBUSY`; `commit_abort` reverts to the last durable root and reclaims the flushed nodes — on both a committed tree and a never-committed one; a mid-flush device write error reverts identically (durable root intact, partial nodes reclaimed, engine usable); `destroy` of an un-finalized flush implicitly aborts; phased-API NULL + no-pending argument validation |
+| Large-value spill | a small-inline + single-block + multi-block (~200 KiB) value commits / reopens / verifies / round-trips; a value upserted inline→spilled→spilled→inline round-trips each way; **per-value COW** — changing a sibling entry does NOT rewrite an unchanged spilled value's chain (exactly the leaf node superseded), changing the value itself rewrites + supersedes the chain; `commit_abort` of a flush with a fresh multi-block chain reclaims every spill block; a tampered spill block is caught by `verify` + `lookup` (`STM_ECORRUPT`); 40 spilled values commit / reopen / verify / look up |
 | Integrity | a flipped ciphertext byte is caught by the Merkle chain (`STM_ECORRUPT`); opening with a wrong root csum is rejected |
 | Hostile trees | a forged on-disk DAG (two child slots → one paddr) and a forged child-kind mismatch are both rejected with `STM_ECORRUPT`, and `destroy` does not double-free (R150 P1 regressions) |
-| Validation | oversize entry → `STM_ERANGE`, at-the-bound entry accepted; NULL-argument matrix |
+| Validation | a value past the inline bound spills (no longer refused); a value over `STM_BTREE_ENGINE_MAX_VALUE_BYTES` and a key too large to fit even a spilled entry → `STM_ERANGE`; NULL-argument matrix |
 
 ## Status
 
@@ -395,13 +452,18 @@ crash-revert path):
       only) + 4 P3, all fixed (cache-reset on finalize, failed-flush +
       3-commit regression tests, `count_dirty`-failure invalidate,
       `commit` out-param ordering).
-- [ ] **Large-value spill (9.6-impl-3)**: values above
-      `STM_BTREE_ENGINE_MAX_ENTRY_BYTES` to their own blocks; lifts the
-      entry-size bound.
+- [x] **Large-value spill (9.6-impl-3)**: a value past the inline bound
+      is stored out-of-line in a chain of spill blocks; per-value COW so
+      an unchanged spilled value's chain is shared, not rewritten, when
+      a sibling changes; the `btnode` codec is untouched (the spill tag
+      lives in the engine's opaque value bytes — no format-version
+      bump). R152 adversarial audit launched; close DEFERRED to the
+      next session (report: `v2/.audit_r152_findings.md`).
 - [ ] **Module cutover (9.6-impl-4)**: inode / dirent / xattr /
       extent-index onto the engine; retire `btree_store`'s whole-tree
       rebuild + each module's flat `records[]`; wire the real
-      `stm_bootstrap`-backed vtable into the three-phase sync.
+      `stm_bootstrap`-backed vtable into the three-phase sync; bump
+      `STM_UB_VERSION` (the engine becomes the pool's metadata format).
 
 ## Known caveats
 

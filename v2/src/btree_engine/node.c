@@ -132,6 +132,10 @@ void eng_node_free(eng_node *n)
     for (uint32_t i = 0; i < n->n_entries; i++) {
         free(n->entries[i].key);
         free(n->entries[i].val);
+        if (n->entries[i].spill) {       /* spilled-value chain bookkeeping */
+            free(n->entries[i].spill->blocks);
+            free(n->entries[i].spill);
+        }
     }
     free(n->entries);
     for (uint32_t i = 0; i < n->n_pivots; i++)
@@ -208,13 +212,32 @@ uint32_t eng_pivot_child_for(const eng_node *n,
 /* Encoded-payload sizing (matches the btnode codec).                         */
 /* ========================================================================= */
 
+bool eng_value_spills(size_t key_len, size_t val_len)
+{
+    return (size_t)STM_BTNODE_ENTRY_HDR_SIZE + key_len +
+           ENG_VAL_TAG_SIZE + val_len > ENG_MAX_ITEM_BYTES;
+}
+
+/* On-disk encoded size of one leaf entry: the 8-byte btnode entry
+ * header + key + the [tag][payload] value field. The payload is the
+ * value inline, or — when the value spills — the fixed indirection
+ * record. Every accepted entry is <= ENG_MAX_ITEM_BYTES (the insert
+ * path refuses a key too large to fit even a spilled entry), so the
+ * 2-way split correctness argument holds for spilled entries too. */
+static size_t leaf_entry_ondisk_bytes(const eng_entry *e)
+{
+    size_t hdr_key = (size_t)STM_BTNODE_ENTRY_HDR_SIZE + e->key_len +
+                     ENG_VAL_TAG_SIZE;
+    return eng_value_spills(e->key_len, e->val_len)
+           ? hdr_key + ENG_SPILL_INDIRECT_SIZE
+           : hdr_key + e->val_len;
+}
+
 size_t eng_leaf_payload_bytes(const eng_node *n)
 {
     size_t s = 0;
-    for (uint32_t i = 0; i < n->n_entries; i++) {
-        s += (size_t)STM_BTNODE_ENTRY_HDR_SIZE +
-             n->entries[i].key_len + n->entries[i].val_len;
-    }
+    for (uint32_t i = 0; i < n->n_entries; i++)
+        s += leaf_entry_ondisk_bytes(&n->entries[i]);
     return s;
 }
 
@@ -245,6 +268,12 @@ stm_status eng_leaf_put(eng_node *n,
         free(n->entries[i].val);
         n->entries[i].val     = vc;
         n->entries[i].val_len = (uint32_t)val_len;
+        /* The value changed — if it has an on-disk spill chain that
+         * chain is now stale (commit rewrites it, supersedes the old
+         * one). A value that newly crosses the inline bound gets its
+         * eng_spill allocated by leaf_sync_spill at commit. */
+        if (n->entries[i].spill)
+            n->entries[i].spill->dirty = true;
         return STM_OK;
     }
 
@@ -264,6 +293,9 @@ stm_status eng_leaf_put(eng_node *n,
     n->entries[i].key_len = (uint32_t)key_len;
     n->entries[i].val     = vc;
     n->entries[i].val_len = (uint32_t)val_len;
+    n->entries[i].spill   = NULL;        /* on-disk form decided at commit;
+                                          * MUST clear — memmove aliased the
+                                          * shifted slot's spill into [i] */
     n->n_entries++;
     return STM_OK;
 }
@@ -285,6 +317,8 @@ stm_status eng_leaf_append(eng_node *n,
     n->entries[n->n_entries].key_len = (uint32_t)key_len;
     n->entries[n->n_entries].val     = vc;
     n->entries[n->n_entries].val_len = (uint32_t)val_len;
+    n->entries[n->n_entries].spill   = NULL;   /* leaf-load attaches it for
+                                                * a spilled entry */
     n->n_entries++;
     return STM_OK;
 }
@@ -364,8 +398,7 @@ stm_status eng_split_leaf(eng_node *n, eng_node **out_right,
                                                   : (right_bytes - left_bytes);
             if (d < best_diff) { best_diff = d; m = i; }
         }
-        left_bytes += (size_t)STM_BTNODE_ENTRY_HDR_SIZE +
-                      n->entries[i].key_len + n->entries[i].val_len;
+        left_bytes += leaf_entry_ondisk_bytes(&n->entries[i]);
     }
     /* n overflowed => n_entries >= 2 => m lands in [1, n_entries-1]. */
     if (m == 0 || m >= n->n_entries) return STM_EBACKEND;  /* invariant guard */

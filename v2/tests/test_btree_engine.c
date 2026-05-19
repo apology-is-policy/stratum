@@ -750,28 +750,39 @@ STM_TEST(engine_wrong_csum_open_rejected) {
     memstore_destroy(&ms);
 }
 
-STM_TEST(engine_oversize_entry_erange) {
+STM_TEST(engine_value_size_bounds) {
     memstore ms; memstore_init(&ms);
     stm_btree_crypt_ctx cx = test_cx();
     stm_btree_engine *eng = NULL;
     STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
 
-    /* An entry one byte past the impl-1b bound is refused (impl-3
-     * large-value spill lifts this). */
-    size_t too_big = STM_BTREE_ENGINE_MAX_ENTRY_BYTES;  /* hdr+key+val == bound+1 fails */
-    uint8_t *big = malloc(too_big);
+    /* A value past the inline bound is no longer refused — it spills
+     * out-of-line (9.6-impl-3). */
+    size_t over_inline = STM_BTREE_ENGINE_MAX_ENTRY_BYTES;
+    uint8_t *big = malloc(over_inline);
     STM_ASSERT(big != NULL);
     if (!big) { stm_btree_engine_destroy(eng); memstore_destroy(&ms); return; }
-    memset(big, 0x5A, too_big);
-    STM_ASSERT_ERR(stm_btree_engine_insert(eng, "k", 1, big, too_big),
+    memset(big, 0x5A, over_inline);
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, big, over_inline));
+
+    /* A value over the hard cap IS refused (the bound check fires
+     * before any read of `value`, so a short buffer is safe here). */
+    STM_ASSERT_ERR(stm_btree_engine_insert(eng, "big", 3, big,
+                                  (size_t)STM_BTREE_ENGINE_MAX_VALUE_BYTES + 1u),
                    STM_ERANGE);
-
-    /* An entry exactly at the bound is accepted. */
-    size_t ok_val = STM_BTREE_ENGINE_MAX_ENTRY_BYTES -
-                    STM_BTNODE_ENTRY_HDR_SIZE - 1u;     /* 1-byte key */
-    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, big, ok_val));
-
     free(big);
+
+    /* A key so large the entry could not fit even as a spilled
+     * indirection is refused. */
+    size_t huge_key = STM_BTREE_ENGINE_MAX_ENTRY_BYTES;
+    uint8_t *kbuf = malloc(huge_key);
+    STM_ASSERT(kbuf != NULL);
+    if (!kbuf) { stm_btree_engine_destroy(eng); memstore_destroy(&ms); return; }
+    memset(kbuf, 0x33, huge_key);
+    STM_ASSERT_ERR(stm_btree_engine_insert(eng, kbuf, huge_key, "v", 1),
+                   STM_ERANGE);
+    free(kbuf);
+
     stm_btree_engine_destroy(eng);
     memstore_destroy(&ms);
 }
@@ -1350,6 +1361,337 @@ STM_TEST(engine_commit_deferred_free_three) {
     STM_ASSERT(got && glen == 2 && memcmp(got, "v2", 2) == 0);
     free(got);
 
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+/* ========================================================================= */
+/* Tests — 9.6-impl-3 large-value spill.                                        */
+/* ========================================================================= */
+
+STM_TEST(engine_spill_roundtrip) {
+    /* Three values — small inline, single-block spill, multi-block
+     * spill — commit, reopen, verify, every value materialises. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { ONE_BLK = 10u * 1024u, MULTI = 200u * 1024u };
+    uint8_t *vone = malloc(ONE_BLK);
+    uint8_t *vmul = malloc(MULTI);
+    STM_ASSERT(vone && vmul);
+    if (!vone || !vmul) {
+        free(vone); free(vmul);
+        stm_btree_engine_destroy(eng); memstore_destroy(&ms); return;
+    }
+    for (size_t i = 0; i < ONE_BLK; i++) vone[i] = (uint8_t)(i * 7u + 1u);
+    for (size_t i = 0; i < MULTI;  i++) vmul[i] = (uint8_t)(i * 31u + 5u);
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "small", 5, "tiny", 4));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "one",   3, vone, ONE_BLK));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "multi", 5, vmul, MULTI));
+
+    /* In-RAM lookup before any commit — the value is always materialised. */
+    bool found = false;
+    void *got = NULL;
+    size_t glen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "multi", 5, &found, &got, &glen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ(glen, (size_t)MULTI);
+    STM_ASSERT(got && memcmp(got, vmul, MULTI) == 0);
+    free(got);
+
+    uint64_t rp = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));   /* walks the spill chains */
+    stm_btree_engine_destroy(eng);
+
+    /* Reopen — spilled values materialise from disk. */
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         rp, 1, rc, &eng));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "one", 3, &found, &got, &glen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ(glen, (size_t)ONE_BLK);
+    STM_ASSERT(got && memcmp(got, vone, ONE_BLK) == 0);
+    free(got);
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "multi", 5, &found, &got, &glen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ(glen, (size_t)MULTI);
+    STM_ASSERT(got && memcmp(got, vmul, MULTI) == 0);
+    free(got);
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "small", 5, &found, &got, &glen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ(glen, (size_t)4);
+    free(got);
+
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_EQ(st.n_keys, UINT64_C(3));
+
+    free(vone); free(vmul);
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_spill_upsert) {
+    /* A value crossing the inline bound in either direction round-trips:
+     * inline -> spilled (grow), spilled -> spilled (replace), spilled ->
+     * inline (shrink). */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { BIG1 = 40u * 1024u, BIG2 = 90u * 1024u };
+    uint8_t *b1 = malloc(BIG1), *b2 = malloc(BIG2);
+    STM_ASSERT(b1 && b2);
+    if (!b1 || !b2) {
+        free(b1); free(b2);
+        stm_btree_engine_destroy(eng); memstore_destroy(&ms); return;
+    }
+    memset(b1, 0xC1, BIG1);
+    memset(b2, 0xD2, BIG2);
+
+    bool found = false;
+    void *got = NULL;
+    size_t glen = 0;
+    uint64_t r = 0;
+    uint8_t  rc[32];
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, "small", 5));
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+
+    /* inline -> spilled. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, b1, BIG1));
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &r, rc));
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "k", 1, &found, &got, &glen));
+    STM_ASSERT_TRUE(found && glen == BIG1 && got && memcmp(got, b1, BIG1) == 0);
+    free(got);
+
+    /* spilled -> spilled (different size). */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, b2, BIG2));
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 3, &r, rc));
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "k", 1, &found, &got, &glen));
+    STM_ASSERT_TRUE(found && glen == BIG2 && got && memcmp(got, b2, BIG2) == 0);
+    free(got);
+
+    /* spilled -> inline. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, "back-small", 10));
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 4, &r, rc));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    stm_btree_engine_destroy(eng);
+
+    /* Reopen at the final root — the value is inline again. */
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         r, 4, rc, &eng));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "k", 1, &found, &got, &glen));
+    STM_ASSERT_TRUE(found && glen == 10 && got &&
+                    memcmp(got, "back-small", 10) == 0);
+    free(got);
+
+    free(b1); free(b2);
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_spill_per_value_cow) {
+    /* A spill chain is rewritten only when ITS value changes — not when
+     * the leaf is rewritten because a sibling entry changed. The
+     * headline "spic and span COW" property for spilled values. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { BIG = 12u * 1024u };          /* single-block spill */
+    uint8_t *big = malloc(BIG), *big2 = malloc(BIG);
+    STM_ASSERT(big && big2);
+    if (!big || !big2) {
+        free(big); free(big2);
+        stm_btree_engine_destroy(eng); memstore_destroy(&ms); return;
+    }
+    memset(big, 0xAA, BIG);
+    memset(big2, 0xBB, BIG);
+
+    /* A small inline entry "a" + a spilled entry "b" in the same leaf. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "a", 1, "v0", 2));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "b", 1, big, BIG));
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+    STM_ASSERT_EQ(memstore_freed_count(&ms), (size_t)0);   /* first commit */
+
+    /* Change ONLY the sibling "a". The leaf is COWed — but "b"'s spill
+     * chain is SHARED, not superseded: exactly one paddr freed (the old
+     * leaf node), proving per-value COW. */
+    size_t before = memstore_freed_count(&ms);
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "a", 1, "v1", 2));
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &r, rc));
+    STM_ASSERT_EQ(memstore_freed_count(&ms), before + 1u);  /* leaf only */
+
+    /* Now change "b" itself: the leaf AND b's one-block spill chain are
+     * rewritten — old leaf + old chain block both superseded. */
+    before = memstore_freed_count(&ms);
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "b", 1, big2, BIG));
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 3, &r, rc));
+    STM_ASSERT_EQ(memstore_freed_count(&ms), before + 2u);  /* leaf + 1 block */
+
+    bool found = false;
+    void *got = NULL;
+    size_t glen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "b", 1, &found, &got, &glen));
+    STM_ASSERT_TRUE(found && glen == BIG && got && memcmp(got, big2, BIG) == 0);
+    free(got);
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+
+    free(big); free(big2);
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_spill_abort_frees_chain) {
+    /* A flush that writes a fresh multi-block spill chain, then aborts,
+     * reclaims every spill-block paddr — they were never durably rooted
+     * (FreedNodesNotReachable / btree.tla::Crash for spill blocks). */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { BIG = 100u * 1024u };          /* ~7 spill blocks */
+    uint8_t *big = malloc(BIG);
+    STM_ASSERT(big != NULL);
+    if (!big) { stm_btree_engine_destroy(eng); memstore_destroy(&ms); return; }
+    memset(big, 0x9E, BIG);
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "x", 1, "seed", 4));
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+
+    /* Insert a spilling value, flush at gen 2, then abort. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "big", 3, big, BIG));
+    uint64_t fp = 0, fg = 0;
+    uint8_t  fc[32];
+    size_t freed_before = memstore_freed_count(&ms);
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 2, &fp, &fg, fc));
+    /* The flush wrote the nodes + the spill chain but freed nothing. */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), freed_before);
+    STM_ASSERT_OK(stm_btree_engine_commit_abort(eng));
+    /* The abort reclaimed the flush — the ~7 chain blocks + the COWed
+     * node(s). */
+    STM_ASSERT_TRUE(memstore_freed_count(&ms) >= freed_before + 7u);
+
+    /* The durable root is unchanged; "big" never landed. */
+    uint64_t gp = 0, gg = 0;
+    uint8_t  gc[32];
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+    STM_ASSERT_EQ(gp, r);
+    bool found = true;
+    void *got = NULL;
+    size_t glen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "big", 3, &found, &got, &glen));
+    STM_ASSERT_TRUE(!found);
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+
+    free(big);
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_spill_tamper_detected) {
+    /* A flipped byte in a spill block's ciphertext is caught — the
+     * Merkle chain extends leaf -> spill chain. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { BIG = 30u * 1024u };           /* 2 spill blocks */
+    uint8_t *big = malloc(BIG);
+    STM_ASSERT(big != NULL);
+    if (!big) { stm_btree_engine_destroy(eng); memstore_destroy(&ms); return; }
+    memset(big, 0x44, BIG);
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "spilled", 7, big, BIG));
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+    free(big);
+
+    /* The root leaf is paddr `r`; the spill blocks are other slots —
+     * flip a byte in a non-root slot's ciphertext. */
+    uint64_t victim = (r == 1u) ? 2u : 1u;
+    uint8_t *vbuf = memstore_buf(&ms, victim);
+    STM_ASSERT(vbuf != NULL);
+    if (vbuf) vbuf[200] ^= 0x20;
+
+    stm_btree_engine_destroy(eng);
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         r, 1, rc, &eng));
+    /* verify walks the spill chain and catches the tampered block. */
+    STM_ASSERT_ERR(stm_btree_engine_verify(eng), STM_ECORRUPT);
+    /* A lookup that materialises the value also fails. */
+    bool found = false;
+    void *got = NULL;
+    size_t glen = 0;
+    STM_ASSERT_ERR(stm_btree_engine_lookup(eng, "spilled", 7,
+                                            &found, &got, &glen),
+                   STM_ECORRUPT);
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_spill_many) {
+    /* Many spilled values: commit, reopen, verify, every value
+     * round-trips. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { N = 40, VLEN = 8u * 1024u };   /* each value spills */
+    uint8_t *v = malloc(VLEN);
+    STM_ASSERT(v != NULL);
+    if (!v) { stm_btree_engine_destroy(eng); memstore_destroy(&ms); return; }
+
+    for (uint32_t i = 0; i < N; i++) {
+        uint8_t key[4];
+        be32_key(i, key);
+        memset(v, (int)(i & 0xFFu), VLEN);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, v, VLEN));
+    }
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    stm_btree_engine_destroy(eng);
+
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         r, 1, rc, &eng));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_EQ(st.n_keys, (uint64_t)N);
+
+    for (uint32_t i = 0; i < N; i++) {
+        uint8_t key[4];
+        be32_key(i, key);
+        bool found = false;
+        void *got = NULL;
+        size_t glen = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup(eng, key, 4,
+                                               &found, &got, &glen));
+        STM_ASSERT_TRUE(found);
+        STM_ASSERT_EQ(glen, (size_t)VLEN);
+        STM_ASSERT(got && ((uint8_t *)got)[0] == (uint8_t)i);
+        free(got);
+    }
+
+    free(v);
     stm_btree_engine_destroy(eng);
     memstore_destroy(&ms);
 }

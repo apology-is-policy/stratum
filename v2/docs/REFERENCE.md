@@ -38,39 +38,40 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: Phase 9.6-impl-2 — incremental copy-on-write commit for the
-  Metadata Tree Engine (`btree_engine`). The engine
-  (`v2/src/btree_engine/`, public header
-  `include/stratum/btree_engine.h`, reference
+- **Tip**: Phase 9.6-impl-3 — large-value spill for the Metadata Tree
+  Engine (`btree_engine`). The engine (`v2/src/btree_engine/`, public
+  header `include/stratum/btree_engine.h`, reference
   [24-btree-engine.md](reference/24-btree-engine.md)) is a
   paddr-addressed copy-on-write multi-level B+tree that replaces the
-  `btree_store` whole-tree-rebuild MVP — an in-memory node cache,
-  dirty-tracking, multi-level descent / insert / byte-balanced split
-  (the `btree_store` 2-level cap is gone), and a dirty-only COW commit.
-  - **impl-2** adds incremental commit: a commit COWs only the dirty
-    root-to-leaf paths and deferred-frees the superseded paddrs; the
-    `commit_flush` / `commit_finalize` / `commit_abort` three-phase
-    split composes with the three-phase sync and reverts cleanly on a
-    crash before the final phase. Composes against `btree.tla`
-    (`WriteNode` / `FinalCommit` / `Crash`; TLC-green, 3 buggy configs)
-    — the chunk where the spec's `DurableTreeWellFormed` /
-    `CommittedTreeMerkleConsistent` / `FreedNodesNotReachable`
-    invariants become load-bearing in code.
-  - **impl-1b** (the prior chunk) built the structural engine and
-    folded in the `btnode` codec + `btree_store/crypt.c` node-size
-    parameterization — the formerly 128-KiB-fixed codec is now keyed on
-    a per-call `node_size` (legacy callers pass `STM_BTNODE_SIZE`,
-    byte-identical; the engine encodes 16-KiB nodes).
-  - **Scope boundary**: large-value spill is 9.6-impl-3; the four-module
-    cutover — wiring the real `stm_bootstrap`-backed vtable into the
-    three-phase sync — is 9.6-impl-4.
-  - **ctest 63/63 GREEN** — `test_btree_engine` 22 cases (16 structural
-    + 6 impl-2: deferred-free, three-phase flush / finalize / abort,
-    crash-revert).
+  `btree_store` whole-tree-rebuild MVP.
+  - **impl-3** stores a value too large to sit inline in a 16-KiB node
+    out-of-line, in a forward-linked chain of AEAD-encrypted +
+    Merkle-csummed spill blocks; the leaf entry holds a small
+    indirection record. **Per-value COW** — an unchanged spilled
+    value's chain is *shared*, not rewritten, when a sibling entry
+    changes. The spill discriminator is a 1-byte tag inside the
+    engine's opaque value bytes, so the shared `btnode` codec is
+    untouched and no format version is bumped (deferred to impl-4).
+    Needs no `btree.tla` extension — a spill block is another COWed
+    paddr the existing flush / finalize / abort already cover (design
+    `phase-9.6-impl-3-spill-design.md`).
+  - **impl-2** (prior) added incremental commit — the `commit_flush` /
+    `commit_finalize` / `commit_abort` three-phase split, deferred-free
+    of superseded paddrs, crash-revert; composes against `btree.tla`.
+  - **impl-1a / 1b** (prior) — the bootstrap allocator 16-KiB node
+    granularity, then the structural engine + the node-size-
+    parameterized `btnode` codec.
+  - **Scope boundary**: the four-module cutover — wiring the real
+    `stm_bootstrap`-backed vtable into the three-phase sync, retiring
+    `btree_store`'s whole-tree rebuild, and the `STM_UB_VERSION` bump —
+    is 9.6-impl-4.
+  - **ctest 63/63 GREEN** — `test_btree_engine` 30 cases (24 + 6
+    impl-3 spill: roundtrip, upsert, per-value COW, abort-frees-chain,
+    tamper-detect, many).
   - **History gap**: the chunks between PARALLEL-3 impl-4 and here —
     PARALLEL-3 impl-5 / impl-6 + R134–R136, the Thylacine A1–A5
     series + R137–R148, and Phase 9.6 (design + `btree.tla` spec +
-    impl-1a bootstrap-allocator 16-KiB nodes + R149, impl-1b + R150) —
+    impl-1a + R149, impl-1b + R150, impl-2 + R151, impl-3 + R152) —
     are recorded in the per-section reference docs, `git log`, and the
     memory index rather than expanded in this Snapshot list.
 

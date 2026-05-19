@@ -95,6 +95,233 @@ static void decode_child_bptr(const uint8_t in[STM_BTNODE_CHILD_BPTR_SIZE],
 }
 
 /* ========================================================================= */
+/* Spill blocks — out-of-line storage for large leaf values (9.6-impl-3).      */
+/* see v2/docs/phase-9.6-impl-3-spill-design.md §4.                            */
+/* ========================================================================= */
+
+/* Lay out, AEAD-encrypt, and write one spill block at the already-
+ * reserved paddr `p`; `out_csum` gets the block's ciphertext BLAKE3
+ * (the Merkle link the parent / previous block records). Does NOT free
+ * `p` on failure — the chain writer logs every reserved paddr into
+ * pending.fresh before calling this, so the failed-flush handler is the
+ * sole owner of that reclaim (no double-free). */
+static stm_status eng_spill_block_emit(stm_btree_engine *eng,
+                                        uint64_t p, uint64_t gen,
+                                        const uint8_t *chunk, uint32_t chunk_len,
+                                        bool have_next, uint64_t next_paddr,
+                                        uint64_t next_gen,
+                                        const uint8_t next_csum[STM_BTNODE_CSUM_SIZE],
+                                        uint8_t out_csum[STM_BTNODE_CSUM_SIZE])
+{
+    uint8_t *b = calloc(1, STM_BTREE_ENGINE_NODE_SIZE);
+    if (!b) return STM_ENOMEM;
+
+    le64 m  = stm_store_le64(ENG_SPILL_MAGIC);
+    le32 cl = stm_store_le32(chunk_len);
+    le32 fl = stm_store_le32(have_next ? ENG_SPILL_FLAG_HAS_NEXT : 0u);
+    memcpy(b + 0,  m.v,  8);
+    memcpy(b + 8,  cl.v, 4);
+    memcpy(b + 12, fl.v, 4);
+    if (have_next)
+        encode_child_bptr(next_paddr, ENG_SPILL_BPTR_KIND, next_gen,
+                          next_csum, b + 16);
+    if (chunk_len) memcpy(b + ENG_SPILL_HDR_SIZE, chunk, chunk_len);
+
+    stm_status s = stm_btree_node_encrypt(&eng->cx, p, gen, b,
+                                          STM_BTREE_ENGINE_NODE_SIZE);
+    if (s != STM_OK) { free(b); return s; }
+    compute_ct_csum(b, out_csum);
+    s = eng->vt->write(eng->vt_ctx, p, b, STM_BTREE_ENGINE_NODE_SIZE);
+    free(b);
+    return s;
+}
+
+stm_status eng_spill_chain_write(stm_btree_engine *eng,
+                                  const uint8_t *val, uint32_t val_len,
+                                  uint64_t gen, eng_spill *sp,
+                                  paddr_vec *fresh)
+{
+    uint32_t n = (uint32_t)(((uint64_t)val_len + ENG_SPILL_CHUNK_CAP - 1u) /
+                            ENG_SPILL_CHUNK_CAP);
+    if (n == 0u || n > ENG_SPILL_MAX_BLOCKS) return STM_ERANGE;
+
+    uint64_t *blocks = malloc((size_t)n * sizeof *blocks);
+    if (!blocks) return STM_ENOMEM;
+
+    /* Reserve fresh-vec room for all n paddrs up front, so each
+     * per-block push — after the paddr is reserved, before the block is
+     * written — is infallible and a mid-chain failure still leaves
+     * every reserved paddr logged for the failed-flush handler. */
+    stm_status s = paddr_vec_reserve(fresh, n);
+    if (s != STM_OK) { free(blocks); return s; }
+
+    bool     have_next  = false;
+    uint64_t next_paddr = 0, next_gen = 0;
+    uint8_t  next_csum[STM_BTNODE_CSUM_SIZE];
+    uint8_t  head_csum[STM_BTNODE_CSUM_SIZE];
+    memset(next_csum, 0, sizeof next_csum);
+    memset(head_csum, 0, sizeof head_csum);
+
+    /* Tail-to-head: a block's `next` bptr is its already-written
+     * successor's, so every `next` carries a real csum. */
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t i = n - 1u - k;
+        uint64_t p = 0;
+        s = eng->vt->reserve(eng->vt_ctx, &p);
+        if (s != STM_OK) { free(blocks); return s; }
+        (void)paddr_vec_push(fresh, p);             /* reserved above */
+        blocks[i] = p;
+
+        uint64_t off       = (uint64_t)i * ENG_SPILL_CHUNK_CAP;
+        uint64_t remaining = (uint64_t)val_len - off;
+        uint32_t chunk_len = (uint32_t)(remaining < ENG_SPILL_CHUNK_CAP
+                                        ? remaining : ENG_SPILL_CHUNK_CAP);
+        uint8_t  csum_i[STM_BTNODE_CSUM_SIZE];
+        s = eng_spill_block_emit(eng, p, gen, val + off, chunk_len,
+                                 have_next, next_paddr, next_gen, next_csum,
+                                 csum_i);
+        if (s != STM_OK) { free(blocks); return s; }  /* p already in fresh */
+
+        next_paddr = p;
+        next_gen   = gen;
+        memcpy(next_csum, csum_i, STM_BTNODE_CSUM_SIZE);
+        have_next  = true;
+        if (i == 0u) memcpy(head_csum, csum_i, STM_BTNODE_CSUM_SIZE);
+    }
+
+    sp->blocks   = blocks;
+    sp->n_blocks = n;
+    sp->head_gen = gen;
+    memcpy(sp->head_csum, head_csum, STM_BTNODE_CSUM_SIZE);
+    sp->dirty    = false;
+    return STM_OK;
+}
+
+/* Read + Merkle/AEAD-check one spill block at (paddr, gen) into the
+ * caller's NODE_SIZE scratch buffer, parse the header. */
+static stm_status eng_spill_block_read(stm_btree_engine *eng,
+                                        uint64_t paddr, uint64_t gen,
+                                        const uint8_t expect[STM_BTNODE_CSUM_SIZE],
+                                        uint8_t *scratch,
+                                        uint32_t *out_chunk_len,
+                                        bool *out_has_next,
+                                        uint64_t *out_next_paddr,
+                                        uint64_t *out_next_gen,
+                                        uint8_t out_next_csum[STM_BTNODE_CSUM_SIZE])
+{
+    stm_status s = eng->vt->read(eng->vt_ctx, paddr, scratch,
+                                 STM_BTREE_ENGINE_NODE_SIZE);
+    if (s != STM_OK) return s;
+    s = check_merkle_link(scratch, expect);
+    if (s != STM_OK) return s;
+    s = stm_btree_node_decrypt(&eng->cx, paddr, gen, scratch,
+                               STM_BTREE_ENGINE_NODE_SIZE);
+    if (s != STM_OK) return s;
+
+    le64 m;  memcpy(m.v,  scratch + 0,  8);
+    le32 cl; memcpy(cl.v, scratch + 8,  4);
+    le32 fl; memcpy(fl.v, scratch + 12, 4);
+    if (stm_load_le64(m) != ENG_SPILL_MAGIC)        return STM_ECORRUPT;
+    uint32_t chunk_len = stm_load_le32(cl);
+    uint32_t flags     = stm_load_le32(fl);
+    if (chunk_len > ENG_SPILL_CHUNK_CAP)            return STM_ECORRUPT;
+    if (flags & ~(uint32_t)ENG_SPILL_FLAG_HAS_NEXT) return STM_ECORRUPT;
+
+    *out_chunk_len = chunk_len;
+    *out_has_next  = (flags & ENG_SPILL_FLAG_HAS_NEXT) != 0u;
+    if (*out_has_next) {
+        uint8_t kind = 0;
+        decode_child_bptr(scratch + 16, out_next_paddr, &kind,
+                          out_next_csum, out_next_gen);
+    } else {
+        *out_next_paddr = 0;
+        *out_next_gen   = 0;
+        memset(out_next_csum, 0, STM_BTNODE_CSUM_SIZE);
+    }
+    return STM_OK;
+}
+
+/* Walk the chain rooted at (head_paddr, head_gen, head_csum) for
+ * exactly `total_len` value bytes, Merkle/AEAD-checking each block. If
+ * `out_val` is non-NULL the value is materialised into a fresh buffer
+ * and the block paddrs into *out_blocks; if NULL the walk only
+ * verifies. The expected block count is derived from `total_len`, so a
+ * chain longer or shorter than that is rejected as corrupt. */
+static stm_status spill_chain_walk(stm_btree_engine *eng,
+                                    uint64_t head_paddr, uint64_t head_gen,
+                                    const uint8_t head_csum[STM_BTNODE_CSUM_SIZE],
+                                    uint64_t total_len,
+                                    uint8_t **out_val, uint64_t **out_blocks,
+                                    uint32_t *out_n_blocks)
+{
+    if (total_len == 0u || total_len > STM_BTREE_ENGINE_MAX_VALUE_BYTES)
+        return STM_ECORRUPT;
+    uint32_t n = (uint32_t)((total_len + ENG_SPILL_CHUNK_CAP - 1u) /
+                            ENG_SPILL_CHUNK_CAP);
+
+    uint8_t  *scratch = malloc(STM_BTREE_ENGINE_NODE_SIZE);
+    uint8_t  *val     = out_val ? malloc((size_t)total_len) : NULL;
+    uint64_t *blocks  = out_val ? malloc((size_t)n * sizeof *blocks) : NULL;
+    if (!scratch || (out_val && (!val || !blocks))) {
+        free(scratch); free(val); free(blocks);
+        return STM_ENOMEM;
+    }
+
+    uint64_t paddr = head_paddr, gen = head_gen;
+    uint8_t  csum[STM_BTNODE_CSUM_SIZE];
+    memcpy(csum, head_csum, STM_BTNODE_CSUM_SIZE);
+    uint64_t off = 0;
+    stm_status s = STM_OK;
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t cl = 0;
+        bool     hn = false;
+        uint64_t np = 0, ng = 0;
+        uint8_t  nc[STM_BTNODE_CSUM_SIZE];
+        s = eng_spill_block_read(eng, paddr, gen, csum, scratch,
+                                 &cl, &hn, &np, &ng, nc);
+        if (s != STM_OK) break;
+        if ((uint64_t)cl > total_len - off) { s = STM_ECORRUPT; break; }
+        bool last = (i == n - 1u);
+        if (last == hn) { s = STM_ECORRUPT; break; }   /* chain-shape */
+        if (val)    memcpy(val + off, scratch + ENG_SPILL_HDR_SIZE, cl);
+        if (blocks) blocks[i] = paddr;
+        off  += cl;
+        paddr = np;
+        gen   = ng;
+        memcpy(csum, nc, STM_BTNODE_CSUM_SIZE);
+    }
+    if (s == STM_OK && off != total_len) s = STM_ECORRUPT;
+
+    free(scratch);
+    if (s != STM_OK) { free(val); free(blocks); return s; }
+    if (out_val)      *out_val      = val;
+    if (out_blocks)   *out_blocks   = blocks;
+    if (out_n_blocks) *out_n_blocks = n;
+    return STM_OK;
+}
+
+stm_status eng_spill_chain_read(stm_btree_engine *eng,
+                                 uint64_t head_paddr, uint64_t head_gen,
+                                 const uint8_t head_csum[STM_BTNODE_CSUM_SIZE],
+                                 uint64_t total_len,
+                                 uint8_t **out_val, uint64_t **out_blocks,
+                                 uint32_t *out_n_blocks)
+{
+    return spill_chain_walk(eng, head_paddr, head_gen, head_csum, total_len,
+                            out_val, out_blocks, out_n_blocks);
+}
+
+stm_status eng_spill_chain_verify(stm_btree_engine *eng,
+                                   uint64_t head_paddr, uint64_t head_gen,
+                                   const uint8_t head_csum[STM_BTNODE_CSUM_SIZE],
+                                   uint64_t total_len)
+{
+    return spill_chain_walk(eng, head_paddr, head_gen, head_csum, total_len,
+                            NULL, NULL, NULL);
+}
+
+/* ========================================================================= */
 /* Write.                                                                      */
 /* ========================================================================= */
 
@@ -105,20 +332,51 @@ stm_status eng_node_write(stm_btree_engine *eng, eng_node *n, uint64_t gen)
     stm_status s;
 
     if (n->is_leaf) {
+        /* Each on-disk leaf value is [tag : 1][payload]: an inline
+         * value verbatim, or — when the entry carries an eng_spill
+         * (leaf_sync_spill ran first) — the 72-byte indirection record.
+         * Build the tagged blobs in one scratch buffer; point the codec
+         * at it (the codec stores keys/values as opaque bytes). */
         stm_btnode_entry *ents = NULL;
+        uint8_t          *vbuf = NULL;
         if (n->n_entries) {
             ents = malloc((size_t)n->n_entries * sizeof *ents);
             if (!ents) { free(buf); return STM_ENOMEM; }
+            size_t vtot = 0;
+            for (uint32_t i = 0; i < n->n_entries; i++)
+                vtot += ENG_VAL_TAG_SIZE +
+                        (n->entries[i].spill ? ENG_SPILL_INDIRECT_SIZE
+                                             : n->entries[i].val_len);
+            vbuf = malloc(vtot ? vtot : 1u);
+            if (!vbuf) { free(ents); free(buf); return STM_ENOMEM; }
+            uint8_t *vp = vbuf;
             for (uint32_t i = 0; i < n->n_entries; i++) {
-                ents[i].key       = n->entries[i].key;
-                ents[i].key_len   = n->entries[i].key_len;
-                ents[i].value     = n->entries[i].val;
-                ents[i].value_len = n->entries[i].val_len;
+                eng_entry *e = &n->entries[i];
+                ents[i].key     = e->key;
+                ents[i].key_len = e->key_len;
+                ents[i].value   = vp;
+                if (e->spill) {
+                    *vp++ = ENG_VAL_SPILLED;
+                    le64 rl = stm_store_le64(e->val_len);
+                    memcpy(vp, rl.v, 8);
+                    vp += 8;
+                    encode_child_bptr(e->spill->blocks[0], ENG_SPILL_BPTR_KIND,
+                                      e->spill->head_gen, e->spill->head_csum,
+                                      vp);
+                    vp += STM_BTNODE_CHILD_BPTR_SIZE;
+                    ents[i].value_len = ENG_VAL_TAG_SIZE + ENG_SPILL_INDIRECT_SIZE;
+                } else {
+                    *vp++ = ENG_VAL_INLINE;
+                    if (e->val_len) memcpy(vp, e->val, e->val_len);
+                    vp += e->val_len;
+                    ents[i].value_len = ENG_VAL_TAG_SIZE + e->val_len;
+                }
             }
         }
         s = stm_btnode_leaf_encode(ents, n->n_entries, gen, eng->tree_id,
                                    buf, STM_BTREE_ENGINE_NODE_SIZE);
         free(ents);
+        free(vbuf);
         if (s != STM_OK) { free(buf); return s; }
     } else {
         uint32_t np = n->n_pivots;
@@ -190,16 +448,59 @@ stm_status eng_node_write(stm_btree_engine *eng, eng_node *n, uint64_t gen)
 /* ========================================================================= */
 
 typedef struct {
-    eng_node  *node;
-    stm_status err;
+    stm_btree_engine *eng;
+    eng_node         *node;
+    stm_status        err;
 } leaf_load_ctx;
 
 static int leaf_load_cb(const void *key, size_t key_len,
                          const void *val, size_t val_len, void *ctx_)
 {
     leaf_load_ctx *c = ctx_;
-    stm_status s = eng_leaf_append(c->node, key, key_len, val, val_len);
+    const uint8_t *v = val;
+    if (val_len < ENG_VAL_TAG_SIZE) { c->err = STM_ECORRUPT; return 1; }
+
+    if (v[0] == ENG_VAL_INLINE) {
+        stm_status s = eng_leaf_append(c->node, key, key_len,
+                                       v + 1, val_len - 1u);
+        if (s != STM_OK) { c->err = s; return 1; }
+        return 0;
+    }
+    if (v[0] != ENG_VAL_SPILLED ||
+        val_len != ENG_VAL_TAG_SIZE + ENG_SPILL_INDIRECT_SIZE) {
+        c->err = STM_ECORRUPT;
+        return 1;
+    }
+
+    /* Spilled: [tag][real_len : le64][head bptr : 64]. Materialise the
+     * value from its spill chain, attach an eng_spill recording it. */
+    le64 rl;
+    memcpy(rl.v, v + 1, 8);
+    uint64_t real_len = stm_load_le64(rl);
+    uint64_t hp = 0, hg = 0;
+    uint8_t  kind = 0;
+    uint8_t  hc[STM_BTNODE_CSUM_SIZE];
+    decode_child_bptr(v + 1 + 8, &hp, &kind, hc, &hg);
+
+    uint8_t  *mval = NULL;
+    uint64_t *blks = NULL;
+    uint32_t  nblk = 0;
+    stm_status s = eng_spill_chain_read(c->eng, hp, hg, hc, real_len,
+                                        &mval, &blks, &nblk);
     if (s != STM_OK) { c->err = s; return 1; }
+
+    eng_spill *sp = calloc(1, sizeof *sp);
+    if (!sp) { free(mval); free(blks); c->err = STM_ENOMEM; return 1; }
+    sp->dirty    = false;
+    sp->blocks   = blks;
+    sp->n_blocks = nblk;
+    sp->head_gen = hg;
+    memcpy(sp->head_csum, hc, STM_BTNODE_CSUM_SIZE);
+
+    s = eng_leaf_append(c->node, key, key_len, mval, (size_t)real_len);
+    free(mval);
+    if (s != STM_OK) { free(blks); free(sp); c->err = s; return 1; }
+    c->node->entries[c->node->n_entries - 1u].spill = sp;
     return 0;
 }
 
@@ -269,7 +570,7 @@ stm_status eng_node_read(stm_btree_engine *eng,
     if (info.kind == STM_BTNODE_KIND_LEAF) {
         n = eng_node_new_leaf();
         if (!n) { free(buf); return STM_ENOMEM; }
-        leaf_load_ctx lc = { .node = n, .err = STM_OK };
+        leaf_load_ctx lc = { .eng = eng, .node = n, .err = STM_OK };
         s = stm_btnode_leaf_decode(buf, STM_BTREE_ENGINE_NODE_SIZE, NULL,
                                    leaf_load_cb, &lc);
         if (s == STM_OK) s = lc.err;
@@ -335,11 +636,39 @@ static int sortchk_step(sortchk *sc, const void *key, size_t key_len)
     return 0;
 }
 
+/* Leaf verify context: the key sort-check + the engine handle, so a
+ * spilled value's chain can be walked. */
+typedef struct {
+    sortchk           sc;
+    stm_btree_engine *eng;
+    stm_status        err;
+} verify_leaf_ctx;
+
 static int verify_leaf_cb(const void *key, size_t key_len,
                            const void *val, size_t val_len, void *ctx_)
 {
-    (void)val; (void)val_len;
-    return sortchk_step((sortchk *)ctx_, key, key_len);
+    verify_leaf_ctx *c = ctx_;
+    if (sortchk_step(&c->sc, key, key_len) != 0) return 1;   /* sc.err set */
+
+    const uint8_t *v = val;
+    if (val_len < ENG_VAL_TAG_SIZE) { c->err = STM_ECORRUPT; return 1; }
+    if (v[0] == ENG_VAL_SPILLED) {
+        if (val_len != ENG_VAL_TAG_SIZE + ENG_SPILL_INDIRECT_SIZE) {
+            c->err = STM_ECORRUPT; return 1;
+        }
+        le64 rl;
+        memcpy(rl.v, v + 1, 8);
+        uint64_t real_len = stm_load_le64(rl);
+        uint64_t hp = 0, hg = 0;
+        uint8_t  kind = 0;
+        uint8_t  hc[STM_BTNODE_CSUM_SIZE];
+        decode_child_bptr(v + 1 + 8, &hp, &kind, hc, &hg);
+        stm_status s = eng_spill_chain_verify(c->eng, hp, hg, hc, real_len);
+        if (s != STM_OK) { c->err = s; return 1; }
+    } else if (v[0] != ENG_VAL_INLINE) {
+        c->err = STM_ECORRUPT; return 1;
+    }
+    return 0;
 }
 
 typedef struct {
@@ -402,12 +731,14 @@ stm_status eng_verify_subtree(stm_btree_engine *eng,
 
     if (info.kind == STM_BTNODE_KIND_LEAF) {
         /* Decode validates entry boundaries; verify_leaf_cb additionally
-         * rejects out-of-order entries. */
-        sortchk sc = { 0 };
+         * rejects out-of-order entries and walks each spilled value's
+         * chain (Merkle + AEAD at every spill block). */
+        verify_leaf_ctx vlc = { .eng = eng };
         s = stm_btnode_leaf_decode(buf, STM_BTREE_ENGINE_NODE_SIZE, NULL,
-                                   verify_leaf_cb, &sc);
-        if (s == STM_OK) s = sc.err;
-        free(sc.prev);
+                                   verify_leaf_cb, &vlc);
+        if (s == STM_OK) s = vlc.sc.err;
+        if (s == STM_OK) s = vlc.err;
+        free(vlc.sc.prev);
         free(buf);
         return s;
     }

@@ -263,10 +263,17 @@ csum at every size; the engine's per-child birth-gen lives in the
 `btnode` child bptr's already-reserved `bp_reserved2`), so
 `STM_BTNODE_VERSION` is **not** bumped at impl-1b — a bump would
 needlessly fail every existing 128-KiB node's version check. The
-spill-record kind (§3.8) IS a real format change and carries the
-`STM_BTNODE_VERSION` / `STM_UB_VERSION` bump when 9.6-impl-3 lands.
-**Migration**: v2 is pre-release (Phase 9.6 is before Phase 10/11) —
-a clean version break, no converter; dev pools re-format.
+9.6-impl-3 large-value spill (§3.8) likewise keeps the `btnode` format
+**unchanged** — the spill discriminator is a 1-byte tag inside the
+engine's opaque leaf values and a spill block is an engine-owned
+region, not a `btnode` (see `phase-9.6-impl-3-spill-design.md` §2) — so
+impl-3 bumps neither version. The on-disk pool-format gate
+(`STM_UB_VERSION`) moves to **9.6-impl-4**, the cutover that makes the
+engine the pool's metadata format: that is the chunk where a mounted
+pool genuinely contains engine nodes (some with spilled values) and the
+uberblock must gate them. **Migration**: v2 is pre-release (Phase 9.6
+is before Phase 10/11) — a clean version break at impl-4, no converter;
+dev pools re-format.
 
 ---
 

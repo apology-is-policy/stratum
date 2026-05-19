@@ -29,15 +29,96 @@
  * tree whose nodes form a cycle. */
 #define ENG_MAX_DEPTH   32u
 
+/* ========================================================================= */
+/* Large-value spill (9.6-impl-3).                                             */
+/* ========================================================================= */
+
+/*
+ * A leaf value too large to sit inline — counting the 1-byte on-disk
+ * value tag, 8 + key_len + 1 + value_len > ENG_MAX_ITEM_BYTES — is
+ * stored out-of-line in a chain of spill blocks; the leaf entry holds a
+ * fixed indirection record in place of the value. See
+ * v2/docs/phase-9.6-impl-3-spill-design.md.
+ *
+ * Every engine leaf value is stored on disk as [tag : 1][payload]:
+ *   ENG_VAL_INLINE  — payload is the value bytes verbatim.
+ *   ENG_VAL_SPILLED — payload is the 72-byte indirection record:
+ *                     real_value_len (le64) || head bptr (64 bytes).
+ * The tag keeps the spill discriminator inside the engine's opaque
+ * value bytes — the shared btnode codec is untouched.
+ */
+#define ENG_VAL_TAG_SIZE          1u
+#define ENG_VAL_INLINE            0u
+#define ENG_VAL_SPILLED           1u
+
+/* The indirection record: 8-byte real length + a 64-byte bptr to spill
+ * block 0. */
+#define ENG_SPILL_INDIRECT_SIZE   (8u + STM_BTNODE_CHILD_BPTR_SIZE)   /* 72 */
+
+/*
+ * A spill block is one 16-KiB engine-node region, AEGIS-256 encrypted
+ * (ciphertext [0, NODE_SIZE-32), tag in the trailing 32) and Merkle-
+ * csummed exactly as a tree node — but its plaintext is an engine-owned
+ * format, NOT a btnode:
+ *   [0,8)    magic      ENG_SPILL_MAGIC (le64)
+ *   [8,12)   chunk_len  le32 — value bytes carried by this block
+ *   [12,16)  flags      le32 — bit 0 = HAS_NEXT
+ *   [16,80)  next bptr  64 bytes — to the next block (valid iff HAS_NEXT)
+ *   [80, NODE_SIZE-32) value chunk — up to ENG_SPILL_CHUNK_CAP bytes
+ */
+#define ENG_SPILL_MAGIC           UINT64_C(0x314C4C4950535453) /* "STSPILL1" */
+#define ENG_SPILL_HDR_SIZE        (8u + 4u + 4u + STM_BTNODE_CHILD_BPTR_SIZE)
+#define ENG_SPILL_CT_LEN          (STM_BTREE_ENGINE_NODE_SIZE - STM_BTNODE_CSUM_SIZE)
+#define ENG_SPILL_CHUNK_CAP       (ENG_SPILL_CT_LEN - ENG_SPILL_HDR_SIZE)
+#define ENG_SPILL_FLAG_HAS_NEXT   0x1u
+
+/* The `kind` byte stamped into a spill chain's next / head bptr.
+ * Distinct from STM_BPTR_KIND_LEAF / INTERNAL; not load-bearing (the
+ * spill block's magic + the Merkle csum are the integrity gates) —
+ * carried only so the bptr is self-describing. */
+#define ENG_SPILL_BPTR_KIND       3u
+
+/* Most spill blocks a value at the value-size cap could occupy — a
+ * chain longer than this, decoded from disk, is corrupt. */
+#define ENG_SPILL_MAX_BLOCKS   \
+    ((STM_BTREE_ENGINE_MAX_VALUE_BYTES + ENG_SPILL_CHUNK_CAP - 1u) /   \
+     ENG_SPILL_CHUNK_CAP)
+
 typedef struct eng_node eng_node;
 
-/* A leaf entry. `key` / `val` are owned (malloc'd); a zero-length
- * key or value is stored as a NULL pointer. */
+/*
+ * Out-of-line state for a spilled leaf value. NULL on an eng_entry
+ * whose value fits inline. `eng_entry.val` ALWAYS holds the full
+ * materialized value (inline or spilled) — spill is purely an on-disk
+ * representation, and this struct just tracks the on-disk chain.
+ *
+ *   dirty   — the on-disk chain is stale vs `val` (the value was set /
+ *             replaced since the last write of this leaf). commit frees
+ *             the old chain and writes a fresh one. A never-yet-written
+ *             chain is dirty with blocks == NULL.
+ *   blocks  — paddrs of the on-disk chain, head (blocks[0]) .. tail;
+ *             cached so a superseded chain frees with no I/O.
+ *   head_gen / head_csum — block 0's gen + ciphertext csum: the bptr
+ *             the leaf indirection record stores.
+ */
 typedef struct {
-    uint8_t  *key;
-    uint32_t  key_len;
-    uint8_t  *val;
-    uint32_t  val_len;
+    bool      dirty;
+    uint64_t *blocks;
+    uint32_t  n_blocks;
+    uint64_t  head_gen;
+    uint8_t   head_csum[STM_BTNODE_CSUM_SIZE];
+} eng_spill;
+
+/* A leaf entry. `key` / `val` are owned (malloc'd); a zero-length
+ * key or value is stored as a NULL pointer. `val` is the full
+ * materialized value even when spilled; `spill` is non-NULL iff the
+ * value has (or had) an on-disk spill chain. */
+typedef struct {
+    uint8_t   *key;
+    uint32_t   key_len;
+    uint8_t   *val;
+    uint32_t   val_len;
+    eng_spill *spill;
 } eng_entry;
 
 /* An internal node's pivot. `key` owned; zero-length stored NULL. */
@@ -151,6 +232,29 @@ stm_status eng_cache_put(eng_cache *c, uint64_t paddr, eng_node *node);
 /* ========================================================================= */
 
 /*
+ * A growable paddr list — the commit superseded / fresh sets. impl-2
+ * pre-sized these from a dirty-node count; 9.6-impl-3 spill makes the
+ * per-commit paddr count variable (a leaf can write a multi-block spill
+ * chain), so they are doubling vectors. `count_dirty` survives as the
+ * initial-capacity hint. A push can STM_ENOMEM — that surfaces as a
+ * flush failure through the existing failed-flush revert path.
+ */
+typedef struct {
+    uint64_t *v;
+    uint32_t  n;
+    uint32_t  cap;
+} paddr_vec;
+
+/* paddr_vec helpers — defined in engine.c, shared with btnode_io.c's
+ * spill-chain writer. `reserve` ensures room for `additional` more
+ * entries (call it before an irreversible device write so the push
+ * that records the result cannot fail); `push` appends, growing on
+ * demand. */
+STM_MUST_USE stm_status paddr_vec_reserve(paddr_vec *v, uint32_t additional);
+STM_MUST_USE stm_status paddr_vec_push(paddr_vec *v, uint64_t p);
+void                    paddr_vec_free(paddr_vec *v);
+
+/*
  * A commit that has been FLUSHED (every dirty node written to a fresh
  * paddr) but not yet FINALIZED publishes nothing durable — the engine's
  * durable root triple still names the prior tree. `eng_pending` records
@@ -164,13 +268,9 @@ stm_status eng_cache_put(eng_cache *c, uint64_t paddr, eng_node *node);
  *     in-memory tree so the next access reloads the prior durable
  *     root; the spec's Crash.
  *
- * `superseded` / `fresh` are pre-sized from a dirty-node count pass
- * (commit_flush) so the flush walk's appends are infallible — ENOMEM
- * can only surface at the one upfront allocation. Both arrays hold at
- * most `cap` (= dirty-node count) entries: one `fresh` paddr per
- * rewritten node, one `superseded` paddr per rewritten node that had a
- * prior on-disk paddr (a RAM-fresh node — a split product, a grown
- * root — has none, so superseded <= fresh = cap).
+ * `superseded` collects the prior paddrs of every rewritten node AND
+ * every superseded spill-chain block; `fresh` collects every paddr the
+ * flush wrote — nodes and fresh spill-chain blocks alike.
  *
  * Models the in-flight `commit` record of v2/specs/btree.tla.
  */
@@ -180,11 +280,8 @@ typedef struct {
     uint64_t  new_root_paddr;  /* prospective durable root — published by  */
     uint64_t  new_root_gen;    /*   finalize, discarded by abort           */
     uint8_t   new_root_csum[STM_BTNODE_CSUM_SIZE];
-    uint64_t *superseded;      /* prior paddrs of rewritten nodes          */
-    uint32_t  n_superseded;
-    uint64_t *fresh;           /* paddrs the flush wrote this commit       */
-    uint32_t  n_fresh;
-    uint32_t  cap;             /* capacity of superseded[] AND fresh[]     */
+    paddr_vec superseded;      /* prior paddrs of rewritten nodes + chains */
+    paddr_vec fresh;           /* paddrs the flush wrote this commit       */
 } eng_pending;
 
 /* ========================================================================= */
@@ -234,9 +331,17 @@ uint32_t   eng_leaf_lower_bound(const eng_node *n,
 uint32_t   eng_pivot_child_for(const eng_node *n,
                                 const void *key, size_t key_len);
 
-/* Encoded-payload byte size of a node (matches the codec). */
+/* Encoded-payload byte size of a node (matches the codec). For a leaf
+ * this counts each value's ON-DISK footprint — inline, or the small
+ * spill indirection record when the value spills. */
 size_t     eng_leaf_payload_bytes(const eng_node *n);
 size_t     eng_internal_payload_bytes(const eng_node *n);
+
+/* Does a leaf value of (key_len, val_len) spill out-of-line? True iff
+ * the inline entry — 8-byte btnode hdr + key + 1-byte tag + value —
+ * exceeds ENG_MAX_ITEM_BYTES. The single source of the spill decision,
+ * shared by node.c sizing and engine.c's leaf_sync_spill. */
+bool       eng_value_spills(size_t key_len, size_t val_len);
 
 /* Insert / upsert a pre-size-validated entry into a leaf. Fully
  * transactional: on STM_ENOMEM the leaf is unchanged. */
@@ -301,11 +406,60 @@ stm_status eng_node_read(stm_btree_engine *eng,
                           eng_node **out_node);
 
 /* Verify the on-disk subtree rooted at (paddr, gen, expected_csum):
- * Merkle + AEAD at every node, recursing through internal nodes. */
+ * Merkle + AEAD at every node, recursing through internal nodes and
+ * through every spilled leaf value's spill chain. */
 STM_MUST_USE
 stm_status eng_verify_subtree(stm_btree_engine *eng,
                                uint64_t paddr, uint64_t gen,
                                const uint8_t expected_csum[STM_BTNODE_CSUM_SIZE],
                                uint32_t depth);
+
+/* ========================================================================= */
+/* btnode_io.c — spill-block chain I/O (9.6-impl-3).                           */
+/* ========================================================================= */
+
+/*
+ * Write `val` (val_len bytes) as a fresh forward-linked chain of spill
+ * blocks at gen `gen`. On success fills `sp` — blocks[] (newly
+ * malloc'd, head..tail), n_blocks, head_gen, head_csum — and clears
+ * sp->dirty. Every reserved block paddr is pushed into `fresh` BEFORE
+ * its block is written, so a mid-chain failure still leaves every
+ * reserved paddr reclaimable by the caller's failed-flush handler.
+ * `sp->blocks` must be NULL on entry (the caller frees / supersedes any
+ * prior chain first). Returns STM_ENOMEM / STM_ERANGE / device errors.
+ */
+STM_MUST_USE
+stm_status eng_spill_chain_write(stm_btree_engine *eng,
+                                  const uint8_t *val, uint32_t val_len,
+                                  uint64_t gen, eng_spill *sp,
+                                  paddr_vec *fresh);
+
+/*
+ * Read the spill chain rooted at (head_paddr, head_gen, head_csum),
+ * Merkle + AEAD checking every block, into a freshly malloc'd *out_val
+ * of exactly `total_len` bytes. *out_blocks (freshly malloc'd) gets the
+ * chain's block paddrs head..tail, *out_n_blocks the count. `total_len`
+ * must be in (0, STM_BTREE_ENGINE_MAX_VALUE_BYTES]. Returns STM_ECORRUPT
+ * on a magic / Merkle / length / chain-shape violation, STM_EBADTAG on
+ * AEAD failure, STM_ENOMEM / device errors.
+ */
+STM_MUST_USE
+stm_status eng_spill_chain_read(stm_btree_engine *eng,
+                                 uint64_t head_paddr, uint64_t head_gen,
+                                 const uint8_t head_csum[STM_BTNODE_CSUM_SIZE],
+                                 uint64_t total_len,
+                                 uint8_t **out_val, uint64_t **out_blocks,
+                                 uint32_t *out_n_blocks);
+
+/*
+ * Verify the spill chain rooted at (head_paddr, head_gen, head_csum):
+ * Merkle + AEAD at every block, magic + chain shape, total chunk bytes
+ * == total_len. Reads nothing back. Returns STM_ECORRUPT / STM_EBADTAG.
+ */
+STM_MUST_USE
+stm_status eng_spill_chain_verify(stm_btree_engine *eng,
+                                   uint64_t head_paddr, uint64_t head_gen,
+                                   const uint8_t head_csum[STM_BTNODE_CSUM_SIZE],
+                                   uint64_t total_len);
 
 #endif /* STM_V2_BTREE_ENGINE_INTERNAL_H */
