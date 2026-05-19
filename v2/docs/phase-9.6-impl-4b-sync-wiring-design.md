@@ -146,36 +146,59 @@ would make AllocReused O(1) — a later optimisation, out of 4b scope;
 
 ### 3.5 Engine lifecycle vs. the module lifecycle
 
-`stm_btree_engine_create` / `_open` both need `vt` + `cx`, which are
-set by `set_storage` (bdev/boot) + `set_crypt_ctx` (key/uuids) —
-called *after* `stm_inode_index_create`. So the engine cannot exist at
-`create` time. Resolution — an internal `in_ensure_engine(idx)`:
+`stm_btree_engine_create` / `_open` both need `vt` + `vt_ctx` + `cx`.
+`vt` is the static `STM_ENGINE_STORE_VT`; `vt_ctx` (`{boot, bdev}`)
+comes from `set_storage`; `cx` (`metadata_key` + uuids) comes from
+`set_crypt_ctx` — both called *after* `stm_inode_index_create`. So the
+engine cannot exist at `create` time.
+
+**Resolution — eager creation at the SECOND binder** (4b-ii; this
+note's §9-Q1 is resolved here, not as originally leaned). `set_storage`
+and `set_crypt_ctx` each populate their stable `stm_inode_index` member
+(`store_ctx` / `crypt_ctx`); whichever runs second — finding the other
+context already bound and `idx->eng == NULL` — calls
+`stm_btree_engine_create`. A create failure leaves that binder's latch
+*un-set* so the caller may retry. After both binders have latched,
+`idx->eng` is guaranteed non-NULL.
 
 - **Fresh-format path** (`stm_sync_create`): `index_create` →
-  `set_storage` → `set_crypt_ctx`; the first op that needs the engine
-  (`alloc` or `commit`) calls `in_ensure_engine`, which —
-  `idx->eng == NULL` and both contexts set — `stm_btree_engine_create`s
-  an empty-leaf-root engine. This matches the engine's own
-  lazy-`create` philosophy and today's behaviour (a fresh inode index
-  is empty until the first commit serialises it).
+  `set_storage` → `set_crypt_ctx` (this one stands up the empty-leaf-
+  root engine). The first commit flushes that empty leaf — matching
+  today's behaviour (a fresh inode index is empty until first commit).
 - **Mount path** (`stm_sync_open`): `index_create` → `set_storage` →
-  `set_crypt_ctx` → `load_at`. `stm_inode_index_load_at` calls
-  `stm_btree_engine_open(vt, ctx, cx, tree_id, root_paddr, root_gen,
-  root_csum, &idx->eng)` (lazy — no I/O) then `engine_scan` to rebuild
-  `dsstate[]`. Subsequent ops find `idx->eng` already set.
+  `set_crypt_ctx` (stands up a fresh engine) → `load_at`.
+  `stm_inode_index_load_at` `stm_btree_engine_destroy`s that fresh
+  engine, `stm_btree_engine_open`s the on-disk one (lazy — no I/O),
+  then `engine_scan` rebuilds `dsstate[]` AND validates every record.
 
 `stm_inode_index_close` → `stm_btree_engine_destroy(idx->eng)` (NULL-
 safe; an un-finalized flush implicitly aborts — header contract).
 
+**Why eager, not lazy-on-first-op.** Lazy (an `in_ensure_engine` in
+every op) would set `idx->eng` *inside* `stm_inode_lookup` /
+`stm_inode_count_for_ds` — mutating `idx` — forcing `const` off those
+two read accessors' signatures, a (minor but real) public-API change
+the cutover doc's "signature and contract preserved" goal did not
+intend. Eager-at-second-bind keeps `idx->eng` set before any op runs,
+so a read just *reads* the (const) `idx->eng` pointer and calls the
+engine through it — every public signature is preserved verbatim. It
+also moves the one fallible step (engine create) to a setup call (the
+natural place for a setup failure) and removes STM_ENOMEM from the
+read ops' error sets. Eager handle-creation does zero device I/O — the
+engine stays lazy about *I/O* until the first commit — so it honours
+the engine's lazy philosophy.
+
 ### 3.6 `stm_inode_index_commit` (4b-ii form — monolithic preserved)
 
 ```
-in_ensure_engine(idx)                       // lazy-create on fresh path
 stm_btree_engine_commit(eng, committed_gen, &paddr, csum)  // single-shot
 stm_btree_engine_get_root(eng, &paddr, &gen, csum)         // authoritative triple
-stm_bootstrap_commit(idx->boot, committed_gen)             // durable bitmap
+stm_bootstrap_commit(idx->store_ctx.boot, committed_gen)   // durable bitmap
 → out_root_paddr = paddr; out_root_csum = csum
 ```
+
+(`idx->eng` is already non-NULL — eager creation at the second binder,
+§3.5 — so the flow opens straight at `stm_btree_engine_commit`.)
 
 - The engine's single-shot `commit` is incremental-COW (only dirty
   root-to-leaf paths rewritten) — the design §1.1 fix for the
@@ -433,11 +456,14 @@ window.
 
 ## 9. Open questions
 
-- **Q1 — `in_ensure_engine` timing.** Lazy-create on first engine-
-  needing op (§3.5) vs. an explicit init call from `stm_sync_create`.
-  Lazy is chosen (matches the engine's own lazy philosophy, no new
-  public API); 4b-ii confirms no op reaches the engine before
-  `set_storage`+`set_crypt_ctx` (sync.c orders them at create/open).
+- **Q1 — engine-handle creation timing.** *Resolved at 4b-ii: eager
+  creation at the second `set_storage` / `set_crypt_ctx` binder*
+  (§3.5). The design originally leaned lazy-on-first-op; the impl
+  found lazy forces a `const` drop on `stm_inode_lookup` /
+  `stm_inode_count_for_ds`, so eager-at-second-bind was chosen instead
+  — it preserves every public signature verbatim and keeps `idx->eng`
+  non-NULL for every op. No new public API either way. See §3.5's
+  "Why eager" rationale.
 - **Q2 — does a failed `stm_sync_commit` always wedge the fs?** §5.5
   asserts it must; R154 verifies against every fs.c `stm_sync_commit`
   caller. If a non-wedging path exists it is a 4b-iii fix.

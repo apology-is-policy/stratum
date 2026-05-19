@@ -1,23 +1,27 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * Tests for the inode allocator + value store (P8-POSIX-1).
+ * Tests for the inode allocator + value store (P8-POSIX-1 +
+ * P8-POSIX-1b + 9.6-impl-4b-ii).
  *
  * Spec: v2/specs/inode.tla.
  *
- * Coverage (MVP — alloc-fresh-only):
+ * 9.6-impl-4b-ii note: the inode module is now btree_engine-backed —
+ * the engine IS the store. Every op (alloc / free / lookup / set /
+ * link / unlink / materialize / count / pin) needs an engine, and the
+ * engine needs a bound bdev + bootstrap. `inode_test_idx` is the
+ * fixture: it builds the storage + a fully-bound index. The
+ * arg-validation tests (which refuse before the engine is reached) and
+ * the explicit-storage persistence tests keep a bare
+ * stm_inode_index_create().
+ *
+ * Coverage:
  *   - Lifecycle: create / close / null-tolerance.
  *   - alloc: returns ino=1 first; monotonic; per-dataset isolation;
- *     gen=0 always (P8-POSIX-1 contract).
- *   - free: flips state; subsequent lookup returns ENOENT; record
- *     state preserved for future P8-POSIX-1b reuse path.
- *   - lookup: returns the canonical value; ENOENT on missing/freed.
- *   - set: roundtrips a caller-provided value; refuses identity
- *     mismatches (ino, dataset_id, gen) — protects the (ino, gen)
- *     tuple uniqueness invariant from caller error.
- *   - count_for_ds: reflects ALLOCATED records only.
- *   - next_ino: high-water-mark accessor for persistence
- *     checkpointing.
- *   - arg validation matrix.
+ *     AllocReused with gen bump.
+ *   - free: flips FREED; subsequent lookup returns ENOENT.
+ *   - lookup / set / count_for_ds / next_ino.
+ *   - persistence roundtrip across a commit + remount.
+ *   - per-inode locks (pin / unpin / pin_two / pin_many).
  */
 
 #include "tharness.h"
@@ -32,6 +36,76 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
+/* ------------------------------------------------------------------ */
+/* Storage fixture.                                                    */
+/*                                                                      */
+/* 9.6-impl-4b-ii: the inode module is btree_engine-backed, so every    */
+/* op needs a bound bdev + bootstrap. inode_test_idx builds them + a    */
+/* fully-bound index; inode_test_idx_close tears it all down. The       */
+/* harness runs tests sequentially in one process, so a single static  */
+/* fixture slot (g_fx_*) is safe — the same posture the persistence    */
+/* tests' static inp_tmp_path already relies on.                       */
+/* ------------------------------------------------------------------ */
+
+#define INP_DEVICE_BYTES     (UINT64_C(8)  * 1024u * 1024u)
+#define INP_BOOTSTRAP_BYTES  (UINT64_C(2)  * 1024u * 1024u)
+
+static const uint64_t INP_POOL_UUID[2]   = { 0xAA00, 0xBB00 };
+static const uint64_t INP_DEVICE_UUID[2] = { 0xCC00, 0xDD00 };
+static const uint8_t  INP_KEY[32]        = { 0x42, 0x43, 0x44 };
+
+static char inp_tmp_path[256];
+
+static void inp_make_tmp(const char *tag) {
+    snprintf(inp_tmp_path, sizeof inp_tmp_path,
+             "/tmp/stm_v2_inode_persist_%s_%d.bin", tag, (int)getpid());
+    unlink(inp_tmp_path);
+}
+
+static void inp_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(inp_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bdev_resize(*out_d, INP_DEVICE_BYTES));
+    STM_ASSERT_OK(stm_crypto_init());
+    STM_ASSERT_OK(stm_bootstrap_create(*out_d, INP_POOL_UUID, INP_DEVICE_UUID,
+                                         INP_BOOTSTRAP_BYTES, out_b));
+}
+
+static void inp_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(inp_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
+}
+
+/* Single static fixture slot — see the comment block above. */
+static stm_bdev      *g_fx_bdev;
+static stm_bootstrap *g_fx_boot;
+
+/* Build a fresh storage-backed, fully-bound inode index. The engine is
+ * stood up by the second binder (set_crypt_ctx here), so the returned
+ * index is ready for any op. */
+static stm_inode_index *inode_test_idx(void) {
+    inp_make_tmp("fx");
+    inp_open_fresh(&g_fx_bdev, &g_fx_boot);
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx, g_fx_bdev, g_fx_boot));
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
+                                                INP_POOL_UUID,
+                                                INP_DEVICE_UUID));
+    return idx;
+}
+
+static void inode_test_idx_close(stm_inode_index *idx) {
+    stm_inode_index_close(idx);     /* before bootstrap — the engine
+                                     * deferred-frees through it */
+    stm_bootstrap_close(g_fx_boot);
+    stm_bdev_close(g_fx_bdev);
+    g_fx_boot = NULL;
+    g_fx_bdev = NULL;
+    unlink(inp_tmp_path);
+}
 
 /* ------------------------------------------------------------------ */
 /* Lifecycle.                                                          */
@@ -52,20 +126,18 @@ STM_TEST(inode_close_handles_null) {
 /* ------------------------------------------------------------------ */
 
 STM_TEST(inode_alloc_returns_ino_one_first) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, /*ds=*/1, /*mode=*/0100644,
                                        /*uid=*/0, /*gid=*/0, &ino));
     STM_ASSERT_EQ(ino, (uint64_t)1);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_alloc_monotonic) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     for (uint64_t i = 1; i <= 8; i++) {
         uint64_t ino = 0;
@@ -73,12 +145,11 @@ STM_TEST(inode_alloc_monotonic) {
         STM_ASSERT_EQ(ino, i);
     }
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_alloc_per_dataset_isolated) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     /* Allocate 3 in dataset 1, 2 in dataset 2. Each dataset's
      * next_ino is independent. */
@@ -96,12 +167,11 @@ STM_TEST(inode_alloc_per_dataset_isolated) {
     STM_ASSERT_EQ(x, (uint64_t)1);
     STM_ASSERT_EQ(y, (uint64_t)2);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_alloc_initial_value_correct) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 7, 0100755, 1000, 1001, &ino));
@@ -118,10 +188,12 @@ STM_TEST(inode_alloc_initial_value_correct) {
     STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_INLINE);
     STM_ASSERT_EQ(v.si_data_len, (uint8_t)0);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_alloc_arg_validation) {
+    /* Arg-invalid calls refuse before the engine is reached, so a
+     * bare index (no storage bound) is sufficient. */
     stm_inode_index *idx = stm_inode_index_create();
     STM_ASSERT_TRUE(idx != NULL);
 
@@ -139,8 +211,7 @@ STM_TEST(inode_alloc_arg_validation) {
 /* ------------------------------------------------------------------ */
 
 STM_TEST(inode_free_then_lookup_returns_enoent) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -150,28 +221,26 @@ STM_TEST(inode_free_then_lookup_returns_enoent) {
     struct stm_inode_value v = {0};
     STM_ASSERT_ERR(stm_inode_lookup(idx, 1, ino, &v), STM_ENOENT);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_free_unknown_returns_enoent) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     STM_ASSERT_ERR(stm_inode_free(idx, 1, 12345), STM_ENOENT);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_double_free_refused) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
     STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
     STM_ASSERT_ERR(stm_inode_free(idx, 1, ino), STM_ENOENT);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_alloc_prefers_reuse_with_gen_bump) {
@@ -180,8 +249,7 @@ STM_TEST(inode_alloc_prefers_reuse_with_gen_bump) {
      * reuse cycle. After all FREED slots are exhausted, alloc
      * falls back to fresh at next_ino. Models inode.tla's
      * AllocReused → AllocFresh fallback. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t a = 0, b = 0, c = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &a));
@@ -211,15 +279,14 @@ STM_TEST(inode_alloc_prefers_reuse_with_gen_bump) {
     STM_ASSERT_OK(stm_inode_lookup(idx, 1, e, &v));
     STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)0);  /* fresh → gen=0 */
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* P8-POSIX-1b: free + reuse + free + reuse → gen monotonically
  * increases at the same ino. inode.tla's GenMonotonicAcrossAllocations
  * pinned at the impl level. */
 STM_TEST(inode_reuse_gen_monotonic_across_cycles) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -237,15 +304,14 @@ STM_TEST(inode_reuse_gen_monotonic_across_cycles) {
         STM_ASSERT_EQ(stm_load_le64(v.si_gen), cycle);  /* gen monotonic */
     }
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* P8-POSIX-1b: stm_inode_set rejects an in_value with the FREED
  * flag set in si_flags. The flag is the allocator's internal
  * lifecycle marker; callers reach FREED via stm_inode_free. */
 STM_TEST(inode_set_rejects_freed_flag) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -261,7 +327,7 @@ STM_TEST(inode_set_rejects_freed_flag) {
     v.si_flags = stm_store_le32(STM_INO_FLAG_FREED | STM_INO_FLAG_IMMUTABLE);
     STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &v), STM_EINVAL);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -269,8 +335,7 @@ STM_TEST(inode_set_rejects_freed_flag) {
 /* ------------------------------------------------------------------ */
 
 STM_TEST(inode_set_then_lookup_roundtrip) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -293,15 +358,14 @@ STM_TEST(inode_set_then_lookup_roundtrip) {
     STM_ASSERT_EQ(stm_load_le64(out.si_size), (uint64_t)4096);
     STM_ASSERT_EQ(stm_load_le32(out.si_flags), (uint32_t)STM_INO_FLAG_IMMUTABLE);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_set_refuses_identity_mismatch) {
     /* Set with a value claiming a different ino / dataset_id /
      * gen MUST be refused with STM_EINVAL — protects the
      * (ino, gen) tuple uniqueness invariant from caller error. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -328,12 +392,11 @@ STM_TEST(inode_set_refuses_identity_mismatch) {
         STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &bad), STM_EINVAL);
     }
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_set_on_freed_returns_enoent) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -345,7 +408,7 @@ STM_TEST(inode_set_on_freed_returns_enoent) {
 
     STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &v), STM_ENOENT);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -353,8 +416,7 @@ STM_TEST(inode_set_on_freed_returns_enoent) {
 /* ------------------------------------------------------------------ */
 
 STM_TEST(inode_count_for_ds_excludes_freed) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     size_t n = 999;
     STM_ASSERT_OK(stm_inode_count_for_ds(idx, 1, &n));
@@ -376,10 +438,11 @@ STM_TEST(inode_count_for_ds_excludes_freed) {
     STM_ASSERT_OK(stm_inode_count_for_ds(idx, 2, &n));
     STM_ASSERT_EQ(n, (size_t)0);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_next_ino_initial_zero) {
+    /* next_ino reads dsstate only — no engine needed. */
     stm_inode_index *idx = stm_inode_index_create();
     STM_ASSERT_TRUE(idx != NULL);
 
@@ -391,8 +454,7 @@ STM_TEST(inode_next_ino_initial_zero) {
 }
 
 STM_TEST(inode_next_ino_advances_with_alloc) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0, next = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -403,7 +465,7 @@ STM_TEST(inode_next_ino_advances_with_alloc) {
     STM_ASSERT_OK(stm_inode_next_ino(idx, 1, &next));
     STM_ASSERT_EQ(next, (uint64_t)3);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -424,16 +486,11 @@ STM_TEST(inode_lookup_arg_validation) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Struct sanity — the 256-byte invariant from ARCH §11.3.            */
-/* ------------------------------------------------------------------ */
-
-/* ------------------------------------------------------------------ */
 /* R69 P3-7: arg validation tests for the remaining mutators.          */
 /* ------------------------------------------------------------------ */
 
 STM_TEST(inode_set_arg_validation) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -445,7 +502,7 @@ STM_TEST(inode_set_arg_validation) {
     STM_ASSERT_ERR(stm_inode_set(idx,  0, ino, &v),  STM_EINVAL);
     STM_ASSERT_ERR(stm_inode_set(idx,  1, 0,   &v),  STM_EINVAL);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_free_arg_validation) {
@@ -485,8 +542,7 @@ STM_TEST(inode_next_ino_arg_validation) {
 
 /* R69 P3-3: stm_inode_set rejects unknown si_data_kind. */
 STM_TEST(inode_set_refuses_unknown_data_kind) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -512,7 +568,7 @@ STM_TEST(inode_set_refuses_unknown_data_kind) {
     STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &after));
     STM_ASSERT_EQ(after.si_data_kind, (uint8_t)STM_DATA_INLINE);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* R71 P1-1: stm_inode_set rejects writing nlink=0 on an ALLOCATED
@@ -520,8 +576,7 @@ STM_TEST(inode_set_refuses_unknown_data_kind) {
  * READ side). Without this guard a buggy or hostile caller could
  * commit a corrupt record that wedges the pool on next mount. */
 STM_TEST(inode_r71_p1_1_set_rejects_nlink_zero) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -538,7 +593,7 @@ STM_TEST(inode_r71_p1_1_set_rejects_nlink_zero) {
     STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &after));
     STM_ASSERT_EQ(stm_load_le32(after.si_nlink), (uint32_t)1);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* R82 P2-2: stm_inode_set rejects writes that clear seal bits.
@@ -550,8 +605,7 @@ STM_TEST(inode_r71_p1_1_set_rejects_nlink_zero) {
  * as R71 P1-1's writer/decoder symmetry — a write that clears any
  * seal bit is rejected here regardless of caller. */
 STM_TEST(inode_r82_p2_2_set_rejects_clearing_seal_bits) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -593,15 +647,14 @@ STM_TEST(inode_r82_p2_2_set_rejects_clearing_seal_bits) {
     cv.si_flags = stm_store_le32(0);
     STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &cv), STM_EINVAL);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* R69 P3-2: stm_inode_set zeroes si_reserved on every successful Set
  * — protects against caller-controlled bytes leaking into a future
  * format extension that reads from this region. */
 STM_TEST(inode_set_zeroes_reserved_bytes) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -620,15 +673,14 @@ STM_TEST(inode_set_zeroes_reserved_bytes) {
         STM_ASSERT_EQ(out.si_reserved[i], (uint8_t)0);
     }
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* R69 P3-8: pin the alloc-initial state across all zero-init fields,
  * not just the ones the prior test hit. Catches a future "helpful"
  * non-zero initializer regression. */
 STM_TEST(inode_alloc_zero_inits_all_passive_fields) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -663,7 +715,7 @@ STM_TEST(inode_alloc_zero_inits_all_passive_fields) {
         STM_ASSERT_EQ(v.si_reserved[i], (uint8_t)0);
     }
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_struct_size_is_256_bytes) {
@@ -675,38 +727,8 @@ STM_TEST(inode_struct_size_is_256_bytes) {
 }
 
 /* ------------------------------------------------------------------ */
-/* P8-POSIX-1b: persistence roundtrip helpers + tests.                 */
+/* P8-POSIX-1b: persistence roundtrip tests.                           */
 /* ------------------------------------------------------------------ */
-
-#define INP_DEVICE_BYTES     (UINT64_C(8)  * 1024u * 1024u)
-#define INP_BOOTSTRAP_BYTES  (UINT64_C(2)  * 1024u * 1024u)
-
-static const uint64_t INP_POOL_UUID[2]   = { 0xAA00, 0xBB00 };
-static const uint64_t INP_DEVICE_UUID[2] = { 0xCC00, 0xDD00 };
-static const uint8_t  INP_KEY[32]        = { 0x42, 0x43, 0x44 };
-
-static char inp_tmp_path[256];
-
-static void inp_make_tmp(const char *tag) {
-    snprintf(inp_tmp_path, sizeof inp_tmp_path,
-             "/tmp/stm_v2_inode_persist_%s_%d.bin", tag, (int)getpid());
-    unlink(inp_tmp_path);
-}
-
-static void inp_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
-    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
-    STM_ASSERT_OK(stm_bdev_open(inp_tmp_path, &bo, out_d));
-    STM_ASSERT_OK(stm_bdev_resize(*out_d, INP_DEVICE_BYTES));
-    STM_ASSERT_OK(stm_crypto_init());
-    STM_ASSERT_OK(stm_bootstrap_create(*out_d, INP_POOL_UUID, INP_DEVICE_UUID,
-                                         INP_BOOTSTRAP_BYTES, out_b));
-}
-
-static void inp_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
-    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
-    STM_ASSERT_OK(stm_bdev_open(inp_tmp_path, &bo, out_d));
-    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
-}
 
 STM_TEST(inode_persist_commit_load_roundtrip) {
     inp_make_tmp("rt");
@@ -736,6 +758,11 @@ STM_TEST(inode_persist_commit_load_roundtrip) {
     STM_ASSERT_OK(stm_inode_index_commit(idx, /*committed_gen=*/1u, &paddr, cs));
     STM_ASSERT(paddr != 0);
 
+    /* The btree_engine commit keeps the root at its actual write gen;
+     * fetch the authoritative gen for the reopen. */
+    uint64_t root_gen = 0;
+    STM_ASSERT_OK(stm_inode_index_get_gen(idx, &root_gen));
+
     stm_inode_index_close(idx);
     stm_bootstrap_close(b);
     stm_bdev_close(d);
@@ -748,7 +775,7 @@ STM_TEST(inode_persist_commit_load_roundtrip) {
     STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx2, INP_KEY,
                                                     INP_POOL_UUID,
                                                     INP_DEVICE_UUID));
-    STM_ASSERT_OK(stm_inode_index_load_at(idx2, paddr, 1u, cs));
+    STM_ASSERT_OK(stm_inode_index_load_at(idx2, paddr, root_gen, cs));
 
     /* ALLOCATED counts per dataset survive: 2 in ds=1 (a1, a3 — a2 freed),
      * 2 in ds=2 (b1, b2). */
@@ -823,6 +850,8 @@ STM_TEST(inode_persist_gen_monotonic_across_mount) {
 
     uint64_t paddr = 0; uint8_t cs[32];
     STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &paddr, cs));
+    uint64_t root_gen = 0;
+    STM_ASSERT_OK(stm_inode_index_get_gen(idx, &root_gen));
 
     stm_inode_index_close(idx);
     stm_bootstrap_close(b);
@@ -834,7 +863,7 @@ STM_TEST(inode_persist_gen_monotonic_across_mount) {
     STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx2, INP_KEY,
                                                     INP_POOL_UUID,
                                                     INP_DEVICE_UUID));
-    STM_ASSERT_OK(stm_inode_index_load_at(idx2, paddr, 1u, cs));
+    STM_ASSERT_OK(stm_inode_index_load_at(idx2, paddr, root_gen, cs));
 
     /* Reuse the persisted FREED slot — gen bumps from 2 to 3. */
     STM_ASSERT_OK(stm_inode_alloc(idx2, 1, 0100644, 0, 0, &reused));
@@ -856,7 +885,10 @@ STM_TEST(inode_persist_commit_requires_storage_and_crypt) {
     stm_inode_index_close(idx);
 }
 
-/* P8-POSIX-1b: idempotent commit when clean. */
+/* 9.6-impl-4b-ii: a clean tree's commit at a HIGHER gen is a no-op
+ * that returns the unchanged root. (The btree_engine refuses a
+ * non-monotonic commit gen, so the prior P8-POSIX-1b same-gen
+ * idempotency is gone — the engine's clean-commit is the no-op now.) */
 STM_TEST(inode_persist_idempotent_commit_when_clean) {
     inp_make_tmp("idem");
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;
@@ -873,8 +905,9 @@ STM_TEST(inode_persist_idempotent_commit_when_clean) {
 
     uint64_t p1 = 0, p2 = 0; uint8_t c1[32], c2[32];
     STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p1, c1));
-    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p2, c2));
-    /* Second commit is idempotent — same root paddr, same csum. */
+    /* Nothing changed since the gen-1 commit; the gen-2 commit is a
+     * clean no-op returning the same root paddr + csum. */
+    STM_ASSERT_OK(stm_inode_index_commit(idx, 2u, &p2, c2));
     STM_ASSERT_EQ(p1, p2);
     STM_ASSERT_MEM_EQ(c1, c2, 32);
 
@@ -912,10 +945,10 @@ STM_TEST(inode_p3_6_set_crypt_ctx_refuses_rebind) {
 }
 
 /* R70 P3-4: a no-op stm_inode_set (writing the same value back) does
- * NOT re-dirty the index — the next commit returns the same root
- * paddr/csum as before the no-op. Catches a regression where Set
- * unconditionally flips dirty=true and forces a re-serialize on
- * every clean-mount + identity-write workload. */
+ * NOT re-dirty the tree — a clean commit at a higher gen returns the
+ * same root paddr/csum as the prior commit. Catches a regression
+ * where Set unconditionally re-COWs a root-to-leaf path on every
+ * clean-mount + identity-write workload. */
 STM_TEST(inode_p3_4_set_no_op_doesnt_redirty) {
     inp_make_tmp("p3_4");
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;
@@ -937,9 +970,10 @@ STM_TEST(inode_p3_4_set_no_op_doesnt_redirty) {
     STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
     STM_ASSERT_OK(stm_inode_set(idx, 1, ino, &v));
 
-    /* Idempotent commit — same root because dirty stayed false. */
+    /* The no-op Set left the tree clean — the gen-2 commit returns
+     * the same root. */
     uint64_t p2 = 0; uint8_t c2[32];
-    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p2, c2));
+    STM_ASSERT_OK(stm_inode_index_commit(idx, 2u, &p2, c2));
     STM_ASSERT_EQ(p1, p2);
     STM_ASSERT_MEM_EQ(c1, c2, 32);
 
@@ -951,7 +985,7 @@ STM_TEST(inode_p3_4_set_no_op_doesnt_redirty) {
 
 /* P8-POSIX-3: stm_inode_link / stm_inode_unlink with cascade-free. */
 STM_TEST(inode_p3_link_increments_nlink) {
-    stm_inode_index *idx = stm_inode_index_create();
+    stm_inode_index *idx = inode_test_idx();
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
 
@@ -967,11 +1001,11 @@ STM_TEST(inode_p3_link_increments_nlink) {
     STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
     STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)3);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_p3_unlink_cascade_freed_only_at_zero) {
-    stm_inode_index *idx = stm_inode_index_create();
+    stm_inode_index *idx = inode_test_idx();
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
     STM_ASSERT_OK(stm_inode_link(idx, 1, ino));    /* nlink=2 */
@@ -991,22 +1025,22 @@ STM_TEST(inode_p3_unlink_cascade_freed_only_at_zero) {
     struct stm_inode_value v = {0};
     STM_ASSERT_ERR(stm_inode_lookup(idx, 1, ino, &v), STM_ENOENT);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_p3_link_refuses_freed) {
-    stm_inode_index *idx = stm_inode_index_create();
+    stm_inode_index *idx = inode_test_idx();
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
     STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
 
     STM_ASSERT_ERR(stm_inode_link(idx, 1, ino), STM_ENOENT);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_p3_link_unlink_arg_validation) {
-    stm_inode_index *idx = stm_inode_index_create();
+    stm_inode_index *idx = inode_test_idx();
     bool freed = false;
     STM_ASSERT_ERR(stm_inode_link(NULL, 1, 1), STM_EINVAL);
     STM_ASSERT_ERR(stm_inode_link(idx, 0, 1), STM_EINVAL);
@@ -1018,7 +1052,7 @@ STM_TEST(inode_p3_link_unlink_arg_validation) {
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
     STM_ASSERT_OK(stm_inode_unlink(idx, 1, ino, NULL));
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* ========================================================================= */
@@ -1026,8 +1060,7 @@ STM_TEST(inode_p3_link_unlink_arg_validation) {
 /* ========================================================================= */
 
 STM_TEST(inode_alloc_anon_starts_orphan_nlink_zero) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino));
@@ -1040,12 +1073,11 @@ STM_TEST(inode_alloc_anon_starts_orphan_nlink_zero) {
     /* gen starts at 0 for fresh AllocAnon. */
     STM_ASSERT_EQ(stm_load_le64(v.si_gen), 0u);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_materialize_clears_orphan_bumps_nlink) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino));
@@ -1064,12 +1096,11 @@ STM_TEST(inode_materialize_clears_orphan_bumps_nlink) {
     STM_ASSERT_EQ(stm_load_le32(v1.si_flags) & STM_INO_FLAG_ORPHAN, 0u);
     STM_ASSERT_EQ(stm_load_le64(v1.si_gen), pre_gen);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_materialize_refuses_non_orphan) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     /* Linked inode (not orphan) → materialize refused. */
     uint64_t ino = 0;
@@ -1090,15 +1121,14 @@ STM_TEST(inode_materialize_refuses_non_orphan) {
     STM_ASSERT_ERR(stm_inode_materialize(idx, 0, ino2), STM_EINVAL);
     STM_ASSERT_ERR(stm_inode_materialize(idx, 1, 0), STM_EINVAL);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_link_refuses_orphan) {
     /* Direct stm_inode_link on an orphan must refuse —
      * the materialize path is the only legal way to bump
      * nlink 0→1 on an orphan. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino));
@@ -1110,14 +1140,13 @@ STM_TEST(inode_link_refuses_orphan) {
     STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 0u);
     STM_ASSERT_TRUE((stm_load_le32(v.si_flags) & STM_INO_FLAG_ORPHAN) != 0);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_unlink_refuses_orphan) {
     /* Direct stm_inode_unlink on an orphan must refuse —
      * caller must use stm_inode_free (via stm_fs_unlink_anon). */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino));
@@ -1126,15 +1155,14 @@ STM_TEST(inode_unlink_refuses_orphan) {
     STM_ASSERT_ERR(stm_inode_unlink(idx, 1, ino, &freed), STM_EINVAL);
     STM_ASSERT_EQ(freed, false);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_set_refuses_orphan_bit_change) {
     /* stm_inode_set must refuse a candidate that toggles the ORPHAN
      * flag — orphan-state transitions go through alloc_anon /
      * materialize, not through Set. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -1159,15 +1187,14 @@ STM_TEST(inode_set_refuses_orphan_bit_change) {
      * non-orphan check fires. STM_EINVAL either way. */
     STM_ASSERT_ERR(stm_inode_set(idx, 1, ino2, &v2), STM_EINVAL);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_set_orphan_with_nlink_nonzero_rejected) {
     /* stm_inode_set must enforce ORPHAN ⇒ nlink=0 (writer-side
      * mirror of decoder's R70 P3-3). A candidate with ORPHAN flag
      * + nlink > 0 violates the dual invariant. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino));
@@ -1177,14 +1204,13 @@ STM_TEST(inode_set_orphan_with_nlink_nonzero_rejected) {
     v.si_nlink = stm_store_le32(5u);
     STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &v), STM_EINVAL);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_alloc_anon_after_free_bumps_gen) {
     /* AllocAnon on a previously-FREED slot bumps gen — same
      * TupleUniqueAllTime invariant as regular AllocReused. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino1 = 0;
     STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino1));
@@ -1201,7 +1227,7 @@ STM_TEST(inode_alloc_anon_after_free_bumps_gen) {
     STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 0u);
     STM_ASSERT_TRUE((stm_load_le32(v.si_flags) & STM_INO_FLAG_ORPHAN) != 0);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_alloc_anon_arg_validation) {
@@ -1230,8 +1256,7 @@ STM_TEST(inode_alloc_anon_arg_validation) {
 /* ------------------------------------------------------------------ */
 
 STM_TEST(inode_pin_roundtrip) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -1241,23 +1266,21 @@ STM_TEST(inode_pin_roundtrip) {
     STM_ASSERT_TRUE(h != NULL);
     stm_inode_unpin(idx, h);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_pin_missing_returns_enoent) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     stm_inode_handle *h = NULL;
     STM_ASSERT_ERR(stm_inode_pin(idx, 1, 42, &h), STM_ENOENT);
     STM_ASSERT_TRUE(h == NULL);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_pin_freed_returns_enoent) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -1266,10 +1289,11 @@ STM_TEST(inode_pin_freed_returns_enoent) {
     stm_inode_handle *h = NULL;
     STM_ASSERT_ERR(stm_inode_pin(idx, 1, ino, &h), STM_ENOENT);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_pin_arg_validation) {
+    /* Arg-invalid pins refuse before the engine is reached. */
     stm_inode_index *idx = stm_inode_index_create();
     STM_ASSERT_TRUE(idx != NULL);
 
@@ -1296,8 +1320,7 @@ STM_TEST(inode_pin_disjoint_inodes_independent) {
      * smoke test for the spec's WriterAtomicPerInode invariant: at most
      * one writer per inode; different inodes are different writers'
      * domains.) */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino1 = 0, ino2 = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino1));
@@ -1316,15 +1339,14 @@ STM_TEST(inode_pin_disjoint_inodes_independent) {
     stm_inode_unpin(idx, h1);
     stm_inode_unpin(idx, h2);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_pin_per_dataset_isolated) {
     /* The lock key is (dataset_id, ino). Different datasets with the
      * same ino are distinct lock slots; pinning both in the same thread
      * proves they don't collide on the bucket. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino_ds1 = 0, ino_ds2 = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino_ds1));
@@ -1337,7 +1359,7 @@ STM_TEST(inode_pin_per_dataset_isolated) {
     stm_inode_unpin(idx, h1);
     stm_inode_unpin(idx, h2);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_pin_slot_reused_after_unpin) {
@@ -1345,8 +1367,7 @@ STM_TEST(inode_pin_slot_reused_after_unpin) {
      * pin on the same (ds, ino) gets a FRESH slot. We can't observe
      * the slot pointer directly, but we can verify the lifecycle
      * produces no leaks (close runs the drain). */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -1357,12 +1378,14 @@ STM_TEST(inode_pin_slot_reused_after_unpin) {
         stm_inode_unpin(idx, h);
     }
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 /* ── pin_many unit tests (R134 P2-2 close) ─────────────────────────── */
 
 STM_TEST(inode_pin_many_arg_validation) {
+    /* Every case here refuses (STM_EINVAL) before any real pin, so a
+     * bare index is sufficient. */
     stm_inode_index *idx = stm_inode_index_create();
     STM_ASSERT_TRUE(idx != NULL);
 
@@ -1408,8 +1431,7 @@ STM_TEST(inode_pin_many_arg_validation) {
 }
 
 STM_TEST(inode_pin_many_duplicate_refused) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino_a = 0, ino_b = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino_a));
@@ -1435,13 +1457,12 @@ STM_TEST(inode_pin_many_duplicate_refused) {
     STM_ASSERT_TRUE(outs2[1] == NULL);
     STM_ASSERT_TRUE(outs2[2] == NULL);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_pin_many_roundtrip_n1) {
     /* N=1 — pin_many degenerates to a single pin. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
@@ -1452,14 +1473,13 @@ STM_TEST(inode_pin_many_roundtrip_n1) {
     STM_ASSERT_TRUE(outs[0] != NULL);
     stm_inode_unpin(idx, outs[0]);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_pin_many_roundtrip_n4_reverse_caller_order) {
     /* N=4 — pass in REVERSE-ino caller order; verify handles are mapped
      * back to caller slots (not sort slots). */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t inos[4] = { 0 };
     for (int i = 0; i < 4; i++) {
@@ -1488,13 +1508,12 @@ STM_TEST(inode_pin_many_roundtrip_n4_reverse_caller_order) {
         stm_inode_unpin(idx, outs[i]);
     }
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_pin_many_roundtrip_n16) {
     /* N=16 — full capacity; sort + pin all + unpin all without leak. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t inos[STM_INODE_PIN_MANY_MAX] = { 0 };
     for (size_t i = 0; i < STM_INODE_PIN_MANY_MAX; i++) {
@@ -1517,7 +1536,7 @@ STM_TEST(inode_pin_many_roundtrip_n16) {
         stm_inode_unpin(idx, outs[i]);
     }
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_pin_many_rollback_on_missing) {
@@ -1526,8 +1545,7 @@ STM_TEST(inode_pin_many_rollback_on_missing) {
      * by re-pinning the surviving inos individually — which would fail
      * (or hang on the ERRORCHECK mutex's double-lock) if pin_many had
      * left them locked from this thread. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t inos[3] = { 0 };
     for (int i = 0; i < 3; i++) {
@@ -1562,15 +1580,14 @@ STM_TEST(inode_pin_many_rollback_on_missing) {
     stm_inode_unpin(idx, h1);
     stm_inode_unpin(idx, h0);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST(inode_pin_many_cross_dataset) {
     /* pin_many supports cross-dataset pins (dataset_id varies across
      * requests). Verify the sort key is (ds, ino) lex order: ds=1, ino=5
      * sorts BEFORE ds=2, ino=1. */
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
+    stm_inode_index *idx = inode_test_idx();
 
     uint64_t ino_ds1 = 0, ino_ds2 = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino_ds1));
@@ -1589,7 +1606,7 @@ STM_TEST(inode_pin_many_cross_dataset) {
     stm_inode_unpin(idx, outs[0]);
     stm_inode_unpin(idx, outs[1]);
 
-    stm_inode_index_close(idx);
+    inode_test_idx_close(idx);
 }
 
 STM_TEST_MAIN("test_inode")

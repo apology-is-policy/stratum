@@ -636,26 +636,30 @@ stm_status stm_inode_next_ino(const stm_inode_index *idx,
                                  uint64_t *out_next);
 
 /* ========================================================================= */
-/* Persistence (P8-POSIX-1b, v24).                                           */
+/* Persistence (P8-POSIX-1b; btree_engine-backed since 9.6-impl-4b-ii).       */
 /*                                                                            */
-/* The inode index is persisted as a btree_store-encoded, AEAD-encrypted     */
-/* Bε-tree under `ub_inode_root` on device 0. Same envelope as the dataset / */
-/* extent / cas trees: AEAD nonce `paddr || gen || pool_uuid`, AD            */
-/* `pool_uuid || device_uuid_0`, idempotent commit via internal dirty flag,  */
-/* atomic shadow-swap on load_at.                                            */
+/* The inode index is persisted as a btree_engine (Phase 9.6 incremental-COW */
+/* B+tree) rooted under `ub_inode_root` on device 0. Each 16-KiB tree node is */
+/* AEAD-encrypted (nonce `paddr || gen || pool_uuid`, AD                      */
+/* `pool_uuid || device_uuid_0`) with a per-node BLAKE3 Merkle csum. The      */
+/* btree_engine IS the inode store — the module keeps no separate in-RAM      */
+/* records array. A commit rewrites only the dirty root-to-leaf paths; a     */
+/* clean tree's commit is a cheap no-op.                                      */
 /*                                                                            */
-/* Key (16 bytes, lexicographically sorted):                                 */
+/* Key (16 bytes):                                                            */
 /*                                                                            */
 /*   off  size  field                                                        */
 /*    0    8    le64 dataset_id                                              */
 /*    8    8    le64 ino                                                     */
 /*                                                                            */
 /* Value: 256-byte struct stm_inode_value as defined above. The FREED        */
-/* state is encoded inline via STM_INO_FLAG_FREED in si_flags.               */
+/* state is encoded inline via STM_INO_FLAG_FREED in si_flags; a FREED       */
+/* record is upserted, never engine-deleted, so AllocReused can re-issue     */
+/* the ino with a bumped gen.                                                 */
 /*                                                                            */
-/* `next_ino` per-dataset high-water mark is reconstructed at load_at        */
-/* time from the deserialized records (max(ino over records-for-ds) + 1),   */
-/* so it does not need a separate persistence slot.                          */
+/* `next_ino` per-dataset high-water mark stays in RAM, reconstructed at     */
+/* load_at time from a one-time engine_scan (max(ino over records-for-ds) +  */
+/* 1), so it does not need a separate persistence slot.                       */
 /* ========================================================================= */
 
 struct stm_bdev;       typedef struct stm_bdev stm_bdev;
@@ -683,13 +687,23 @@ stm_status stm_inode_index_set_crypt_ctx(stm_inode_index *idx,
                                             const uint64_t device_uuid_0[2]);
 
 /*
- * Commit the in-RAM index to disk under `committed_gen`. Returns the
- * new tree's root paddr + 32-byte BLAKE3 csum via out-params, which
- * the caller stamps into `ub_inode_root`. Idempotent when clean.
+ * Commit the index to disk under `committed_gen` via the btree_engine's
+ * single-shot incremental-COW commit, then make the bootstrap bitmap
+ * durable. Returns the new tree's root paddr + 32-byte BLAKE3 csum via
+ * out-params, which the caller stamps into `ub_inode_root`.
  *
- * Refusals: STM_EINVAL (NULL idx / out_paddr / out_csum, or storage
- * / crypt context unset), and any error bubbled from
- * stm_btree_store_serialize.
+ * `committed_gen` MUST strictly increase across commits (it is
+ * stm_sync_commit's target_gen — the engine refuses a non-monotonic
+ * gen). A clean tree's commit is a cheap no-op that returns the prior
+ * root at its prior gen; pair it with stm_inode_index_get_gen to read
+ * the authoritative AEAD gen for the uberblock.
+ *
+ * Refusals: STM_EINVAL (NULL idx / out_paddr / out_csum, or storage /
+ * crypt context unbound), and any error bubbled from the btree_engine
+ * commit or the bootstrap allocator. A failed commit self-reverts (the
+ * engine drops the uncommitted in-memory tree, the durable root still
+ * names the previous tree) — a failed stm_sync_commit is therefore
+ * crash-equivalent and the caller must wedge the fs.
  */
 STM_MUST_USE
 stm_status stm_inode_index_commit(stm_inode_index *idx,
@@ -698,10 +712,12 @@ stm_status stm_inode_index_commit(stm_inode_index *idx,
                                      uint8_t out_root_csum[32]);
 
 /*
- * Atomic shadow-swap load_at. Reads the tree under (root_paddr,
- * root_gen), validates against expected_csum, deserializes records,
- * and atomically swaps in the new state. After return, all prior
- * in-RAM records are replaced (no preservation across load_at).
+ * Mount-path load_at. Opens the btree_engine rooted at (root_paddr,
+ * root_gen, expected_csum), scans it once to validate every record and
+ * rebuild the per-dataset next_ino high-water marks, then atomically
+ * adopts the opened tree. A corrupt record fails the mount here with
+ * STM_ECORRUPT. After return, all prior in-RAM state is replaced (no
+ * preservation across load_at); on failure `idx` is left unchanged.
  */
 STM_MUST_USE
 stm_status stm_inode_index_load_at(stm_inode_index *idx,

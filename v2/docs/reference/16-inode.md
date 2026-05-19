@@ -1,4 +1,4 @@
-# 16 — Inode index (P8-POSIX-1 + P8-POSIX-1b, v24)
+# 16 — Inode index (P8-POSIX-1 + P8-POSIX-1b + 9.6-impl-4b-ii)
 
 ## Purpose
 
@@ -34,18 +34,19 @@ The inode module is the bridge between:
   reference an extent tree rooted at `si_data.extent_tree.{paddr, gen}`).
 - **fs.c** (per-fs create/link/unlink/stat/chmod/chown/utimens wrappers).
 
-In-RAM storage: flat record array (`stm_inode_record`) under a single
-mutex. **Note**: the records array can be reallocated on grow, so per-
-record stable pointers don't exist today. The P9.5-PARALLEL-3 design
-(`v2/docs/p9.5-parallel-3-design.md`) forward-notes adding per-record
-mutexes via heap-allocated pointers for the per-inode locking refactor.
+Storage (9.6-impl-4b-ii): the `btree_engine` COW B+tree (Phase 9.6) IS
+the inode store — the module keeps no separate in-RAM record array.
+Each 16-KiB engine node is AEAD-encrypted with a per-node BLAKE3 Merkle
+csum, rooted under `ub_inode_root` on device 0, keyed by `(le64
+dataset_id, le64 ino)`. STM_UB_VERSION 23 → 24 added the inode tree to
+the uberblock layout; the engine-format change carries no further
+version bump until 9.6-impl-4d (the on-disk format is in-flight on the
+`phase-9.6` branch — see `phase-9.6-impl-4b-sync-wiring-design.md` §7).
+Only the per-dataset `next_ino` high-water mark stays in RAM
+(`stm_inode_dsstate`), mount-reconstructed from a one-time engine scan.
 
-On-disk: btree_store-encoded, AEAD-encrypted Bε-tree under
-`ub_inode_root`, keyed by `(le64 dataset_id, le64 ino)`. STM_UB_VERSION
-23 → 24 added the inode tree to the uberblock layout.
-
-Header: `v2/include/stratum/inode.h` (566 lines).
-Impl: `v2/src/inode/inode.c` (1342 lines).
+Header: `v2/include/stratum/inode.h` (753 lines).
+Impl: `v2/src/inode/inode.c` (1505 lines).
 Spec: `v2/specs/inode.tla`.
 
 ## On-disk inode value
@@ -107,8 +108,8 @@ stm_inode_index *stm_inode_index_create (void);
 void             stm_inode_index_close  (stm_inode_index *idx);
 ```
 
-`_create` returns an empty index. `_close` frees the records + dsstate
-arrays. Safe on NULL.
+`_create` returns an empty index (no engine yet — see Persistence).
+`_close` destroys the engine + frees the dsstate array. Safe on NULL.
 
 ### Allocation
 
@@ -199,14 +200,28 @@ stm_status stm_inode_index_get_root       (idx, *paddr, csum);
 stm_status stm_inode_index_get_gen        (idx, *gen);
 ```
 
-Same shape + semantics as the dirent / xattr / extent / cas
-persistence APIs. AEAD nonce `paddr || gen || pool_uuid`. AD
-`pool_uuid || device_uuid_0`. Idempotent commit via internal dirty
-flag. Atomic shadow-swap on `_load_at`.
+The `btree_engine` handle is stood up by whichever of `_set_storage`
+/ `_set_crypt_ctx` runs SECOND (the engine needs both the storage
+vtable ctx and the AEAD crypt ctx). `_commit` drives the engine's
+single-shot incremental-COW commit then `stm_bootstrap_commit`;
+`committed_gen` MUST strictly increase (the engine refuses a
+non-monotonic gen). A clean tree's commit is a cheap no-op that
+returns the prior root at its prior gen — pair with `_get_gen` for
+the authoritative AEAD gen. `_load_at` destroys the fresh engine and
+opens the on-disk one. Per-node AEAD nonce `paddr || gen ||
+pool_uuid`, AD `pool_uuid || device_uuid_0`.
 
-**`next_ino` reconstruction**: at `_load_at` time, `next_ino` per
-dataset is reconstructed from the deserialized records (`max(ino over
-records-for-ds) + 1`); no separate persistence slot.
+**`next_ino` reconstruction**: `_load_at` scans the opened tree once,
+validating every record (a corrupt tree fails the mount with
+STM_ECORRUPT) and raising `next_ino` per dataset to `max(ino) + 1`;
+no separate persistence slot.
+
+**Crash-safety** (9.6-impl-4b-ii): `_commit` keeps the
+`stm_bootstrap_commit` call inside the inode commit — the exact
+monolithic shape the retired `btree_store` path used, so `sync.c` is
+unchanged and crash-safety is identical. 9.6-impl-4b-iii splits the
+commit into flush / finalize / abort and relocates the
+`stm_bootstrap_commit` into `stm_sync_commit`.
 
 **Merkle root binding** (R70 P0-1): `inode_csum` is an input to the
 pool's `compute_merkle_root`. Tamper-evident across the inode tree.
@@ -215,19 +230,29 @@ pool's `compute_merkle_root`. Tamper-evident across the inode tree.
 
 ### Storage layout
 
-`struct stm_inode_record` is a flat array of 296 bytes per entry
-(`{dataset_id, ino, state, stm_inode_value}`). Linear scan by
-`(ds, ino)` lookup. Heap-grown vector; capacity doubles on overflow.
+The `btree_engine` (`stm_btree_engine *eng`) is the store. Every
+public op maps onto it — `lookup` → `engine_lookup`; `set` →
+`engine_insert` (upsert); `alloc` / `free` / `link` / `unlink` /
+`materialize` → `engine_lookup`, mutate the 256-byte value, then
+`engine_insert`; `count_for_ds` → `engine_scan_range` over
+`[ds‖0 .. ds‖UINT64_MAX]`. A FREED record is an upsert of a
+FREED-flagged value, never an engine delete — the record must persist
+so AllocReused can re-issue the ino with a bumped gen. AllocReused's
+FREED-ino scan is an `engine_scan_range` early-stop callback.
 
-Per-dataset `next_ino` lives in a sibling array `stm_inode_dsstate`
-keyed by dataset_id.
+Per-dataset `next_ino` lives in a small in-RAM array
+(`stm_inode_dsstate`) keyed by dataset_id; it is not file-count-
+scaling and is mount-reconstructed from a one-time engine scan.
 
 ### Concurrency
 
-Single mutex (`PTHREAD_MUTEX_ERRORCHECK`) guards records + dsstate +
-persistence fields. The module takes its own lock only — no cross-
-layer dependencies. Caller (sync.c) MUST not hold any other inode-
-comparable lock when invoking these APIs.
+Single mutex (`PTHREAD_MUTEX_ERRORCHECK`, `idx->lock`) guards dsstate
++ the persistence fields AND every `btree_engine` call — the engine is
+single-threaded (one handle, one thread at a time), and `idx->lock` IS
+that serialization: no engine API is touched without it held. The
+module takes its own lock only — no cross-layer dependencies. Caller
+(sync.c) MUST not hold any other inode-comparable lock when invoking
+these APIs.
 
 ### Per-inode locks (P9.5-PARALLEL-3 impl-1, impl-2)
 
@@ -333,7 +358,9 @@ duration of a per-inode compound op:
     getters (stats_get/alloc_stats_get/alloc_attached/verify) +
     lock-table readers (lock_test/lock_count). Three safety bases:
     (a) inode/dirent/xattr reads — atomic snapshot via each index's
-    own internal records[] mutex; (b) dataset-table + lock-table
+    own internal mutex (the inode index's mutex serializes its
+    btree_engine access; dirent / xattr remain records[]-based until
+    9.6-impl-4c); (b) dataset-table + lock-table
     reads — safe because every mutator of those tables is STILL EX
     (SH excludes EX) — a future port of a dataset/lock-table mutator
     to SH MUST first add that table an internal mutex OR revert
@@ -391,11 +418,16 @@ tuples, each NEVER re-issued.
 ### Anti-tamper at persistence
 
 - `si_reserved` zeroed on every Set (R69 P3-2).
-- `_load_at` validator (`in_validate_shadow`) rejects records with
-  `si_ino == 0`, `si_dataset_id == 0`, unknown `si_data_kind`,
-  AllocReused-without-gen-bump (gen would aliased a prior tuple),
-  malformed `si_flags` (reserved bits set), etc. Idempotent commit
-  produces byte-identical UB bytes for `quorum.tla::ContentQuorumAtGen`.
+- `in_validate_value` runs on every value read back from the engine
+  (`in_engine_get`) AND on every record the `_load_at` mount scan
+  walks. It rejects identity mismatch (`si_ino` / `si_dataset_id` not
+  matching the key), unknown `si_data_kind`, `si_data_len` over the
+  100-byte inline / symlink slot (R77 P1-1 OOB-read defense), and the
+  FREED / ORPHAN / nlink consistency invariants (R70 P3-3 / R85). A
+  corrupt record fails the mount with STM_ECORRUPT.
+- Every engine node is AEAD-tag + BLAKE3-Merkle verified by the
+  engine's own read path; `in_validate_value` is the SEMANTIC layer on
+  top.
 
 ## Spec cross-reference
 
@@ -432,12 +464,16 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 
 ## Tests
 
-- `tests/test_inode.c` — direct unit coverage. Every action + the
-  canonical (Alloc → Free → AllocReused → check gen bumped) scenarios
-  + orphan lifecycle (alloc_anon → materialize → unlink → cascade-free)
-  + hard-link nlink arithmetic + cascade-free at nlink=0 + reserved-ino
-  refusals + persistence (load_at + commit roundtrip; FREED records +
-  ORPHAN records preserved across mount).
+- `tests/test_inode.c` — direct unit coverage (64 cases). Every action
+  + the canonical (Alloc → Free → AllocReused → check gen bumped)
+  scenarios + orphan lifecycle (alloc_anon → materialize → unlink →
+  cascade-free) + hard-link nlink arithmetic + cascade-free at nlink=0
+  + reserved-ino refusals + persistence (load_at + commit roundtrip;
+  FREED records + ORPHAN records preserved across mount) + per-inode
+  pin / unpin / pin_two / pin_many. 9.6-impl-4b-ii: every engine-
+  touching test runs against the `inode_test_idx` fixture (a real
+  bdev + bootstrap behind a fully-bound index); arg-validation tests
+  that refuse before reaching the engine keep a bare index.
 - `tests/test_fs.c` — composes with fs.c wrappers (`stm_fs_create_file`,
   `_mkdir`, `_unlink`, `_rmdir`, `_link`, `_stat`, `_chmod`, `_chown`,
   `_utimens`, `_add_seals`, etc.).
@@ -452,7 +488,7 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 | File seals (F_SEAL_*) | LIVE | P8-POSIX-7a-seals; bits 8..12 |
 | Inline data (≤100 bytes) | LIVE | P8-POSIX-5 |
 | Symlink target (≤100 bytes) | LIVE | P8-POSIX-8 |
-| Persistence (load_at + commit) | LIVE | v24 format break |
+| Persistence (load_at + commit) | LIVE | btree_engine-backed (9.6-impl-4b-ii) |
 | Merkle root binding | LIVE | `inode_csum` is the 1st input to `compute_merkle_root` |
 | Per-inode mutex (pin/unpin) | LIVE | P9.5-PARALLEL-3 impl-1; 256-bucket hash table; chmod/chown/utimens ported |
 | stm_inode_pin_two (sorted 2-inode pin) | LIVE | P9.5-PARALLEL-3 impl-2; ascending-order helper |
@@ -463,6 +499,7 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 | Single-inode mutators ported | LIVE | impl-5: stm_fs_truncate/fallocate (iidx-required), stm_fs_write/migrate_to_cold/promote_to_hot (iidx-with-legacy-EX-fallback); single-exit goto pattern; R128 P2-1 pre-flush under pin |
 | Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-3+ helper `stm_inode_pin_many` sorts ascending |
 | Pure-read ops on SH (no pin) | LIVE | impl-6: 21 read-only stm_fs_* ops ported EX→SH; safety via subsystem-internal mutexes + EX-still-held mutators |
+| btree_engine-backed inode store | LIVE | 9.6-impl-4b-ii: the engine IS the store; `records[]` retired; monolithic commit (4b-iii splits it into flush/finalize/abort) |
 
 Audit class: any change to allocator paths (alloc / alloc_anon /
 materialize / free), gen arithmetic, or persistence validators MUST
