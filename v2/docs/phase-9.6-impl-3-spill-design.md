@@ -103,9 +103,13 @@ A value larger than one chunk is a **forward-linked chain**: block i's
 points at block 0. The chain is written **tail-to-head** (the tail has
 no next; each earlier block's `next_bptr` is filled from the
 already-written successor's bptr) so every `next_bptr` carries a real
-csum. Read walks head→tail, Merkle-checking each hop. The walk is capped
-at `ENG_SPILL_MAX_BLOCKS` (`ceil(MAX_VALUE_BYTES / CHUNK_CAP)` ≈ 65) —
-a longer chain is `STM_ECORRUPT`.
+csum. Read walks head→tail, Merkle-checking each hop. The read derives
+the expected block count from the indirection record's `real_value_len`
+(itself rejected as `STM_ECORRUPT` if it exceeds
+`STM_BTREE_ENGINE_MAX_VALUE_BYTES` = 1 MiB); a chain whose actual block
+count or chunk-byte total diverges from that derivation — too long, too
+short, or cyclic — is `STM_ECORRUPT`. `ENG_SPILL_MAX_BLOCKS`
+(`ceil(MAX_VALUE_BYTES / CHUNK_CAP)` = 65) bounds the *write* path.
 
 The Merkle chain extends naturally: a leaf node's csum commits to its
 bytes, which include the indirection record, which includes

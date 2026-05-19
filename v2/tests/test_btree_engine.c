@@ -134,6 +134,17 @@ static bool memstore_was_freed(const memstore *ms, uint64_t paddr,
     return false;
 }
 
+/* True iff no paddr was handed to vt->free more than once across the
+ * whole run — the direct no-double-free guard for the COW free sets. */
+static bool memstore_no_double_free(const memstore *ms)
+{
+    for (size_t i = 0; i < ms->n_freed; i++)
+        for (size_t j = i + 1u; j < ms->n_freed; j++)
+            if (ms->freed[i].paddr == ms->freed[j].paddr)
+                return false;
+    return true;
+}
+
 static stm_status memstore_write(void *ctx, uint64_t paddr,
                                   const void *buf, size_t len)
 {
@@ -1582,9 +1593,13 @@ STM_TEST(engine_spill_abort_frees_chain) {
     /* The flush wrote the nodes + the spill chain but freed nothing. */
     STM_ASSERT_EQ(memstore_freed_count(&ms), freed_before);
     STM_ASSERT_OK(stm_btree_engine_commit_abort(eng));
-    /* The abort reclaimed the flush — the ~7 chain blocks + the COWed
-     * node(s). */
-    STM_ASSERT_TRUE(memstore_freed_count(&ms) >= freed_before + 7u);
+    /* The abort reclaimed the whole `fresh` set, exactly: 7 spill-chain
+     * blocks (ceil(100 KiB / ENG_SPILL_CHUNK_CAP)) + the 1 COWed root
+     * leaf. An exact count — a loose `>=` would not catch an over-free
+     * (a still-reachable superseded block freed, or a paddr freed
+     * twice). */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), freed_before + 8u);
+    STM_ASSERT_TRUE(memstore_no_double_free(&ms));
 
     /* The durable root is unchanged; "big" never landed. */
     uint64_t gp = 0, gg = 0;
@@ -1597,6 +1612,84 @@ STM_TEST(engine_spill_abort_frees_chain) {
     STM_ASSERT_OK(stm_btree_engine_lookup(eng, "big", 3, &found, &got, &glen));
     STM_ASSERT_TRUE(!found);
     STM_ASSERT_OK(stm_btree_engine_verify(eng));
+
+    free(big);
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_spill_write_fails_midchain) {
+    /* A device write error INSIDE eng_spill_chain_write's tail-to-head
+     * loop — a distinct path from engine_commit_failed_flush_reverts,
+     * which fails an early tree-node write. The chain writer reserves a
+     * paddr and logs it in pending.fresh BEFORE writing each block, so
+     * a mid-chain failure leaves every started block logged; the
+     * failed-flush handler must reclaim them all, leave the durable
+     * root naming the prior tree, and leave the engine usable
+     * (R152 P3-2). */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { BIG = 100u * 1024u };          /* ceil(100 KiB / 16272) = 7 blocks */
+    uint8_t *big = malloc(BIG);
+    STM_ASSERT(big != NULL);
+    if (!big) { stm_btree_engine_destroy(eng); memstore_destroy(&ms); return; }
+    memset(big, 0x5C, BIG);
+
+    /* A durable gen-1 root holding only a tiny inline entry. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "x", 1, "seed", 4));
+    uint64_t rp1 = 0;
+    uint8_t  rc1[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp1, rc1));
+
+    /* Insert a 7-block-spilling value, then arm the fault so the 4th
+     * device write fails. The chain (7 blocks) is written before the
+     * leaf node, so write 4 is spill-chain block 4 of 7 — squarely
+     * mid-chain. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "big", 3, big, BIG));
+    uint64_t paddr_before = ms.next_paddr;
+    size_t   freed_before = memstore_freed_count(&ms);
+    ms.fail_after = 3;                        /* 3 writes land, the 4th fails */
+    uint64_t rp2 = 0;
+    uint8_t  rc2[32];
+    STM_ASSERT_ERR(stm_btree_engine_commit(eng, 2, &rp2, rc2), STM_EBACKEND);
+
+    /* The failed-flush handler frees pending.fresh. When block 4's write
+     * failed, blocks 1..4 had each been reserved + logged; the leaf's
+     * own paddr was never reached (leaf_sync_spill runs before the
+     * leaf's reserve). So exactly 4 paddrs are reclaimed. */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), freed_before + 4u);
+    /* No leak: every paddr the failed commit reserved was reclaimed. */
+    for (uint64_t p = paddr_before + 1u; p <= ms.next_paddr; p++)
+        STM_ASSERT_TRUE(memstore_was_freed(&ms, p, NULL));
+    /* No double-free anywhere in the run. */
+    STM_ASSERT_TRUE(memstore_no_double_free(&ms));
+
+    /* The durable root is untouched — still the gen-1 tree — and "big"
+     * never landed. */
+    uint64_t gp = 0, gg = 0;
+    uint8_t  gc[32];
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+    STM_ASSERT_EQ(gp, rp1);
+    STM_ASSERT_EQ(gg, UINT64_C(1));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    bool found = true;
+    void *got = NULL;
+    size_t glen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "big", 3, &found, &got, &glen));
+    STM_ASSERT_TRUE(!found);
+
+    /* The engine stays usable — the one-shot fault disarmed itself; the
+     * retried commit succeeds and the spilled value round-trips. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "big", 3, big, BIG));
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &rp2, rc2));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    found = false; got = NULL; glen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "big", 3, &found, &got, &glen));
+    STM_ASSERT_TRUE(found && glen == BIG && got && memcmp(got, big, BIG) == 0);
+    free(got);
 
     free(big);
     stm_btree_engine_destroy(eng);

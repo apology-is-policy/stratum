@@ -415,7 +415,7 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 30 cases against an in-RAM
+`tests/test_btree_engine.c` — 31 cases against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
 can both assert which paddrs were superseded and still open a prior
@@ -429,7 +429,7 @@ crash-revert path):
 | Multi-level | 150 large-key entries force `height >= 3` (the 2-level cap is gone); deep tree commits, reopens, verifies, spot-checks |
 | Commit | re-commit of a clean tree is a no-op (same root, no new nodes); the published gen stays the root's real write gen and the triple reopens; a non-monotonic commit gen → `STM_EINVAL`; incremental commit COWs the root to a new paddr and shares unchanged subtrees — the prior root stays intact and readable |
 | Three-phase commit | deferred-free — a second commit hands back exactly the superseded paddrs (the rewritten leaf + the old root), stamped with the commit gen, and never the shared subtrees (`FreedNodesNotReachable`); a three-commit chain confirms no paddr is freed twice; `commit_flush` + `commit_finalize` publishes the flushed root, and the pending-commit window rejects every other op with `STM_EBUSY`; `commit_abort` reverts to the last durable root and reclaims the flushed nodes — on both a committed tree and a never-committed one; a mid-flush device write error reverts identically (durable root intact, partial nodes reclaimed, engine usable); `destroy` of an un-finalized flush implicitly aborts; phased-API NULL + no-pending argument validation |
-| Large-value spill | a small-inline + single-block + multi-block (~200 KiB) value commits / reopens / verifies / round-trips; a value upserted inline→spilled→spilled→inline round-trips each way; **per-value COW** — changing a sibling entry does NOT rewrite an unchanged spilled value's chain (exactly the leaf node superseded), changing the value itself rewrites + supersedes the chain; `commit_abort` of a flush with a fresh multi-block chain reclaims every spill block; a tampered spill block is caught by `verify` + `lookup` (`STM_ECORRUPT`); 40 spilled values commit / reopen / verify / look up |
+| Large-value spill | a small-inline + single-block + multi-block (~200 KiB) value commits / reopens / verifies / round-trips; a value upserted inline→spilled→spilled→inline round-trips each way; **per-value COW** — changing a sibling entry does NOT rewrite an unchanged spilled value's chain (exactly the leaf node superseded), changing the value itself rewrites + supersedes the chain; `commit_abort` of a flush with a fresh multi-block chain reclaims every spill block; a mid-chain device write failure reverts cleanly — durable root intact, every started spill block reclaimed exactly once, no double-free; a tampered spill block is caught by `verify` + `lookup` (`STM_ECORRUPT`); 40 spilled values commit / reopen / verify / look up |
 | Integrity | a flipped ciphertext byte is caught by the Merkle chain (`STM_ECORRUPT`); opening with a wrong root csum is rejected |
 | Hostile trees | a forged on-disk DAG (two child slots → one paddr) and a forged child-kind mismatch are both rejected with `STM_ECORRUPT`, and `destroy` does not double-free (R150 P1 regressions) |
 | Validation | a value past the inline bound spills (no longer refused); a value over `STM_BTREE_ENGINE_MAX_VALUE_BYTES` and a key too large to fit even a spilled entry → `STM_ERANGE`; NULL-argument matrix |
@@ -457,8 +457,10 @@ crash-revert path):
       an unchanged spilled value's chain is shared, not rewritten, when
       a sibling changes; the `btnode` codec is untouched (the spill tag
       lives in the engine's opaque value bytes — no format-version
-      bump). R152 adversarial audit launched; close DEFERRED to the
-      next session (report: `v2/.audit_r152_findings.md`).
+      bump). R152 adversarial audit closed — 0 P0/P1, 0 P2, 3 P3, all
+      addressed (tightened the abort free-count assertion to exact, added
+      a mid-chain spill-write-failure regression test, reworded the
+      design doc's read-path bound).
 - [ ] **Module cutover (9.6-impl-4)**: inode / dirent / xattr /
       extent-index onto the engine; retire `btree_store`'s whole-tree
       rebuild + each module's flat `records[]`; wire the real
