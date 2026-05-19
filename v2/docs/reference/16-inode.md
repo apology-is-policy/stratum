@@ -196,32 +196,50 @@ stm_status stm_inode_index_set_storage    (idx, bdev_0, boot_0);
 stm_status stm_inode_index_set_crypt_ctx  (idx, key, pool_uuid, dev_uuid_0);
 stm_status stm_inode_index_load_at        (idx, root_paddr, root_gen, csum);
 stm_status stm_inode_index_commit         (idx, committed_gen, *paddr, *csum);
+stm_status stm_inode_index_commit_flush   (idx, committed_gen, *paddr, *gen, *csum);
+stm_status stm_inode_index_commit_finalize(idx);
+stm_status stm_inode_index_commit_abort   (idx);
 stm_status stm_inode_index_get_root       (idx, *paddr, csum);
 stm_status stm_inode_index_get_gen        (idx, *gen);
 ```
 
 The `btree_engine` handle is stood up by whichever of `_set_storage`
 / `_set_crypt_ctx` runs SECOND (the engine needs both the storage
-vtable ctx and the AEAD crypt ctx). `_commit` drives the engine's
-single-shot incremental-COW commit then `stm_bootstrap_commit`;
-`committed_gen` MUST strictly increase (the engine refuses a
-non-monotonic gen). A clean tree's commit is a cheap no-op that
-returns the prior root at its prior gen — pair with `_get_gen` for
-the authoritative AEAD gen. `_load_at` destroys the fresh engine and
-opens the on-disk one. Per-node AEAD nonce `paddr || gen ||
-pool_uuid`, AD `pool_uuid || device_uuid_0`.
+vtable ctx and the AEAD crypt ctx). `committed_gen` MUST strictly
+increase across commits (the engine refuses a non-monotonic gen). A
+clean tree's commit is a cheap no-op that returns the prior root at
+its prior gen — pair with `_get_gen` for the authoritative AEAD gen.
+`_load_at` destroys the fresh engine and opens the on-disk one.
+Per-node AEAD nonce `paddr || gen || pool_uuid`, AD `pool_uuid ||
+device_uuid_0`.
+
+The commit has two forms. `_commit` is the **single-shot** monolith —
+engine flush + finalize + a trailing `stm_bootstrap_commit` — kept for
+non-sync callers + the persistence unit tests. `_commit_flush` /
+`_commit_finalize` / `_commit_abort` are the **three-phase** form
+`stm_sync_commit` drives (9.6-impl-4b-iii). `_commit_flush` writes the
+dirty nodes to fresh paddrs at `committed_gen` and returns the
+PROSPECTIVE `(paddr, gen, csum)`; the durable-root mirror is adopted
+only by `_commit_finalize`. Between flush and finalize the engine
+holds a pending-commit window — every other op returns STM_EBUSY.
+`_commit_abort` discards the flush (crash-equivalent: drops the
+in-memory tree, reverts to the previous durable root). The trio does
+NOT call `stm_bootstrap_commit` — the sync layer runs that one
+explicit barrier.
 
 **`next_ino` reconstruction**: `_load_at` scans the opened tree once,
 validating every record (a corrupt tree fails the mount with
 STM_ECORRUPT) and raising `next_ino` per dataset to `max(ino) + 1`;
 no separate persistence slot.
 
-**Crash-safety** (9.6-impl-4b-ii): `_commit` keeps the
-`stm_bootstrap_commit` call inside the inode commit — the exact
-monolithic shape the retired `btree_store` path used, so `sync.c` is
-unchanged and crash-safety is identical. 9.6-impl-4b-iii splits the
-commit into flush / finalize / abort and relocates the
-`stm_bootstrap_commit` into `stm_sync_commit`.
+**Crash-safety** (9.6-impl-4b-iii): `stm_sync_commit` runs
+`_commit_flush` in Phase 2, the explicit `stm_bootstrap_commit`
+durable-bitmap barrier strictly before the final uberblock write, and
+`_commit_finalize` after it; every error path between the flush and
+the finalize runs `_commit_abort` first. The bitmap-before-UB order is
+crash-safe (4b design §5.2 case A) — a crash in any window leaks at
+most a dirty root-to-leaf path of 16-KiB nodes: bounded, non-
+corrupting, scrub-reclaimable.
 
 **Merkle root binding** (R70 P0-1): `inode_csum` is an input to the
 pool's `compute_merkle_root`. Tamper-evident across the inode tree.
@@ -464,12 +482,14 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 
 ## Tests
 
-- `tests/test_inode.c` — direct unit coverage (64 cases). Every action
+- `tests/test_inode.c` — direct unit coverage (69 cases). Every action
   + the canonical (Alloc → Free → AllocReused → check gen bumped)
   scenarios + orphan lifecycle (alloc_anon → materialize → unlink →
   cascade-free) + hard-link nlink arithmetic + cascade-free at nlink=0
   + reserved-ino refusals + persistence (load_at + commit roundtrip;
-  FREED records + ORPHAN records preserved across mount) + per-inode
+  FREED records + ORPHAN records preserved across mount) + three-phase
+  commit (9.6-impl-4b-iii: flush→finalize roundtrip, flush→abort
+  reverts, pending-window STM_EBUSY, arg validation) + per-inode
   pin / unpin / pin_two / pin_many. 9.6-impl-4b-ii: every engine-
   touching test runs against the `inode_test_idx` fixture (a real
   bdev + bootstrap behind a fully-bound index); arg-validation tests
@@ -499,7 +519,8 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 | Single-inode mutators ported | LIVE | impl-5: stm_fs_truncate/fallocate (iidx-required), stm_fs_write/migrate_to_cold/promote_to_hot (iidx-with-legacy-EX-fallback); single-exit goto pattern; R128 P2-1 pre-flush under pin |
 | Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-3+ helper `stm_inode_pin_many` sorts ascending |
 | Pure-read ops on SH (no pin) | LIVE | impl-6: 21 read-only stm_fs_* ops ported EX→SH; safety via subsystem-internal mutexes + EX-still-held mutators |
-| btree_engine-backed inode store | LIVE | 9.6-impl-4b-ii: the engine IS the store; `records[]` retired; monolithic commit (4b-iii splits it into flush/finalize/abort) |
+| btree_engine-backed inode store | LIVE | 9.6-impl-4b-ii: the engine IS the store; `records[]` retired |
+| Three-phase commit (flush / finalize / abort) | LIVE | 9.6-impl-4b-iii: `stm_sync_commit` drives it; explicit `stm_bootstrap_commit` barrier relocated into sync |
 
 Audit class: any change to allocator paths (alloc / alloc_anon /
 materialize / free), gen arithmetic, or persistence validators MUST

@@ -504,8 +504,11 @@ void stm_inode_index_close(stm_inode_index *idx) {
     pthread_mutex_destroy(idx_lock(idx));
     /* NULL-safe; an un-finalized flush is implicitly aborted (the
      * flushed-but-unrooted paddrs are handed back to the allocator).
-     * stm_inode_index_commit uses the single-shot commit so no pending
-     * window is ever left open in practice. */
+     * The monolithic stm_inode_index_commit uses the single-shot engine
+     * commit (no pending window); the three-phase _commit_flush /
+     * _finalize / _abort trio pairs every flush with a finalize-or-abort
+     * in stm_sync_commit. The implicit abort here is defense-in-depth
+     * for a destroy that races a buggy mid-flush caller. */
     stm_btree_engine_destroy(idx->eng);
     free(idx->dsstate);
     free(idx);
@@ -1071,6 +1074,113 @@ stm_status stm_inode_index_commit(stm_inode_index *idx,
     memcpy(out_root_csum, rc, 32);
     must_unlock(idx_lock(idx));
     return STM_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Three-phase commit — flush / finalize / abort (9.6-impl-4b-iii).     */
+/*                                                                      */
+/* The form stm_sync_commit drives. Each is a thin wrapper over the     */
+/* btree_engine's commit_flush / _finalize / _abort, under idx->lock.   */
+/* NONE of them calls stm_bootstrap_commit — the sync layer runs that   */
+/* single explicit durable-bitmap barrier after every index flush,      */
+/* strictly before the uberblock write (4b design note §5.2).           */
+/* ------------------------------------------------------------------ */
+
+stm_status stm_inode_index_commit_flush(stm_inode_index *idx,
+                                           uint64_t committed_gen,
+                                           uint64_t *out_root_paddr,
+                                           uint64_t *out_root_gen,
+                                           uint8_t out_root_csum[32]) {
+    if (!idx || !out_root_paddr || !out_root_gen || !out_root_csum)
+        return STM_EINVAL;
+    must_lock(idx_lock(idx));
+
+    if (!idx->storage_set || !idx->crypt_set || !idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
+
+    /* Flush the dirty root-to-leaf paths to fresh paddrs at committed_gen
+     * and return the PROSPECTIVE root triple. The durable root mirror
+     * (idx->root_*) is untouched until _commit_finalize — a reader
+     * between flush and finalize still sees the previous tree's root.
+     * committed_gen is stm_sync_commit's target_gen, strictly increasing
+     * across commits, so the engine's monotonic-gen guard never fires. */
+    uint64_t cp = 0, cg = 0;
+    uint8_t  cc[32];
+    stm_status cs = stm_btree_engine_commit_flush(idx->eng, committed_gen,
+                                                  &cp, &cg, cc);
+    if (cs != STM_OK) {
+        /* A failed flush self-reverts: NO pending window opened, the
+         * in-memory tree dropped, the durable root still names the
+         * previous tree. The caller MUST NOT _commit_abort (nothing is
+         * pending). 9.6-impl-4b design §5.5: a failed stm_sync_commit is
+         * crash-equivalent — the caller wedges the fs. */
+        must_unlock(idx_lock(idx));
+        return cs;
+    }
+
+    *out_root_paddr = cp;
+    *out_root_gen   = cg;
+    memcpy(out_root_csum, cc, 32);
+    must_unlock(idx_lock(idx));
+    return STM_OK;
+}
+
+stm_status stm_inode_index_commit_finalize(stm_inode_index *idx) {
+    if (!idx) return STM_EINVAL;
+    must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
+
+    /* Adopt the flushed root + deferred-free the superseded paddrs.
+     * After a successful commit_flush this is infallible (btree_engine.h
+     * contract); the STM_EINVAL exit is a no-pending-flush sequencing
+     * bug. */
+    stm_status fs = stm_btree_engine_commit_finalize(idx->eng);
+    if (fs != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return fs;
+    }
+
+    /* Mirror the now-durable triple into idx->root_* so the get_root /
+     * get_gen accessors return the new root. With the pending window
+     * closed the engine's get_root succeeds — its STM_EINVAL (never
+     * committed) / STM_EBUSY (un-finalized flush) exits are unreachable
+     * here; the check is defense-in-depth. */
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    stm_status gs = stm_btree_engine_get_root(idx->eng, &rp, &rg, rc);
+    if (gs != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return gs;
+    }
+    idx->root_paddr = rp;
+    idx->root_gen   = rg;
+    memcpy(idx->root_csum, rc, 32);
+
+    must_unlock(idx_lock(idx));
+    return STM_OK;
+}
+
+stm_status stm_inode_index_commit_abort(stm_inode_index *idx) {
+    if (!idx) return STM_EINVAL;
+    must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
+
+    /* Discard the flushed root: deferred-free the freshly-written
+     * paddrs + drop the in-memory tree (next access reloads the
+     * previous durable root). idx->root_* is deliberately NOT touched —
+     * the durable root still names the previous tree, exactly as
+     * commit_abort leaves the engine. */
+    stm_status as = stm_btree_engine_commit_abort(idx->eng);
+    must_unlock(idx_lock(idx));
+    return as;
 }
 
 /* ------------------------------------------------------------------ */

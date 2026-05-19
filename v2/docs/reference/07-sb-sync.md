@@ -181,18 +181,26 @@ Phase 1: Reservation
      with gen bumped — pre-flush roots; rollback target.)
 
 Phase 2: Flush
-    stm_keyschema_commit(ks, target_gen)     // persist key-schema if dirty
+    stm_keyschema_commit(ks, target_gen)      // persist key-schema if dirty
     For each attached alloc in allocs[]:
-        stm_alloc_commit(alloc, target_gen)   // persist per-device tree
-    stm_alloc_roots_commit(roots, target_gen) // persist pool-level roots object
-    // Bootstrap pools' bitmap states become durable here via
-    // stm_alloc_commit's internal bootstrap_commit.
+        stm_alloc_commit(alloc, target_gen)    // persist per-device tree
+    stm_alloc_roots_commit(roots, target_gen)  // persist pool-level roots object
+    stm_{dataset,snapshot,extent,repair_log,cas}_index_commit(target_gen)
+    stm_inode_index_commit_flush(target_gen)   // 9.6-impl-4b-iii: btree_engine
+                                               // FLUSH -> PROSPECTIVE root triple
+    stm_{dirent,xattr}_index_commit(target_gen)  // btree_store (cut over at 4c)
+    compute_merkle_root(... every index csum, incl. inode prospective ...)
+    stm_bootstrap_commit(boot, target_gen)     // 9.6-impl-4b-iii: explicit
+                                               // durable-bitmap barrier --
+                                               // strictly BEFORE the UB write
 
 Phase 3: Final
     Build final UB: post-flush roots + post-flush Merkle.
     Same per-device fan-out as Phase 1.
     Wait for quorum confirmations.
     If sub-quorum: abort; in-RAM state unchanged (rollback UB at auth+1 is durable).
+    stm_inode_index_commit_finalize()          // 9.6-impl-4b-iii: adopt the
+                                               // flushed inode root, post-UB
 
 Phase 4: Publish
     auth_gen := auth + 2
@@ -200,6 +208,32 @@ Phase 4: Publish
 ```
 
 Each commit advances `auth_gen` by 2. Mount-claim advances by 1.
+
+### Inode index — three-phase commit (9.6-impl-4b-iii)
+
+The inode module is `btree_engine`-backed (incremental-COW B+tree); its
+commit is split across `stm_sync_commit`'s phases. In Phase 2
+`stm_inode_index_commit_flush` writes the dirty nodes to fresh paddrs
+and yields the PROSPECTIVE root triple — which feeds
+`compute_merkle_root` + the final uberblock exactly as a finished root
+would. In Phase 3, after the final UB is durable,
+`stm_inode_index_commit_finalize` adopts that root + deferred-frees the
+superseded nodes. Every error path between the flush and the finalize
+runs `stm_inode_index_commit_abort` first — discarding the flush and
+reverting the in-memory tree (the in-process realisation of a crash
+between flush and final; a failed `stm_sync_commit` wedges the fs).
+
+The explicit `stm_bootstrap_commit` at the end of Phase 2 is the
+durable-bitmap barrier. The engine's flush set node bits in the
+bootstrap bitmap in RAM; that bitmap MUST be made durable strictly
+BEFORE the final UB write. Bitmap-then-UB is crash-safe — a crash with
+the bitmap durable but the UB stale only leaks the freshly-flushed
+nodes (bounded, non-corrupting); the reverse order would let a later
+`reserve` re-hand a still-rooted paddr and corrupt the tree
+(9.6-impl-4b design §5.2 case A). At 4b-iii the remaining `btree_store`
+indices still call `stm_bootstrap_commit` internally, so the explicit
+call is redundant-but-cheap; 4c/4d retire those internal calls and the
+explicit barrier becomes the sole one.
 
 ### Mount flow
 

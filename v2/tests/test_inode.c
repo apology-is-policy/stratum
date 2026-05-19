@@ -983,6 +983,165 @@ STM_TEST(inode_p3_4_set_no_op_doesnt_redirty) {
     unlink(inp_tmp_path);
 }
 
+/* ------------------------------------------------------------------ */
+/* 9.6-impl-4b-iii: three-phase commit — flush / finalize / abort.      */
+/*                                                                      */
+/* The form stm_sync_commit drives. The monolithic stm_inode_index_     */
+/* commit above stays for the persistence tests + non-sync callers.     */
+/* ------------------------------------------------------------------ */
+
+/* A flush then finalize is a durable commit: get_root / get_gen mirror
+ * the flushed triple, and the records survive a remount + load_at. */
+STM_TEST(inode_commit_flush_finalize_roundtrip) {
+    inp_make_tmp("flfin");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    inp_open_fresh(&d, &b);
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
+                                                   INP_POOL_UUID,
+                                                   INP_DEVICE_UUID));
+    uint64_t a1 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 7, 7, &a1));
+
+    /* FLUSH writes the dirty nodes + returns the prospective triple;
+     * the durable-root mirror (get_root / get_gen) is NOT updated yet. */
+    uint64_t fp = 0, fg = 0; uint8_t fc[32];
+    STM_ASSERT_OK(stm_inode_index_commit_flush(idx, 1u, &fp, &fg, fc));
+    STM_ASSERT(fp != 0);
+
+    /* FINALIZE adopts it; get_root / get_gen now mirror the flushed
+     * triple exactly. */
+    STM_ASSERT_OK(stm_inode_index_commit_finalize(idx));
+    uint64_t rp = 0, rg = 0; uint8_t rc[32];
+    STM_ASSERT_OK(stm_inode_index_get_root(idx, &rp, rc));
+    STM_ASSERT_OK(stm_inode_index_get_gen(idx, &rg));
+    STM_ASSERT_EQ(rp, fp);
+    STM_ASSERT_EQ(rg, fg);
+    STM_ASSERT_MEM_EQ(rc, fc, 32);
+
+    /* The sync layer makes the bitmap durable between the flush and the
+     * UB write; run that barrier explicitly so the reopen is faithful. */
+    STM_ASSERT_OK(stm_bootstrap_commit(b, 1u));
+
+    stm_inode_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    inp_reopen(&d, &b);
+    stm_inode_index *idx2 = stm_inode_index_create();
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx2, INP_KEY,
+                                                    INP_POOL_UUID,
+                                                    INP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_inode_index_load_at(idx2, fp, fg, fc));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx2, 1, a1, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_uid), (uint32_t)7);
+
+    stm_inode_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(inp_tmp_path);
+}
+
+/* A flush then abort is a clean revert: the aborted records vanish, the
+ * durable root is unchanged, the tree stays committable (crash-equivalent
+ * — 9.6-impl-4b design §5.5). */
+STM_TEST(inode_commit_flush_abort_reverts) {
+    inp_make_tmp("flab");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    inp_open_fresh(&d, &b);
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
+                                                   INP_POOL_UUID,
+                                                   INP_DEVICE_UUID));
+    /* Durable baseline: one inode committed at gen 1. */
+    uint64_t a1 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &a1));
+    uint64_t p0 = 0; uint8_t c0[32];
+    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p0, c0));
+
+    /* Allocate a second inode, FLUSH it at gen 2, then ABORT. */
+    uint64_t a2 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &a2));
+    uint64_t fp = 0, fg = 0; uint8_t fc[32];
+    STM_ASSERT_OK(stm_inode_index_commit_flush(idx, 2u, &fp, &fg, fc));
+    STM_ASSERT_OK(stm_inode_index_commit_abort(idx));
+
+    /* Abort dropped the in-memory tree → it reloaded the gen-1 durable
+     * root: a1 survives, a2's mutation is gone. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, a1, &v));
+    STM_ASSERT_ERR(stm_inode_lookup(idx, 1, a2, &v), STM_ENOENT);
+
+    /* get_root still names the pre-flush durable root. */
+    uint64_t rp = 0; uint8_t rc[32];
+    STM_ASSERT_OK(stm_inode_index_get_root(idx, &rp, rc));
+    STM_ASSERT_EQ(rp, p0);
+    STM_ASSERT_MEM_EQ(rc, c0, 32);
+
+    /* The tree is committable post-abort: a clean commit at gen 3
+     * no-ops back to the gen-1 root. */
+    uint64_t p3 = 0; uint8_t c3[32];
+    STM_ASSERT_OK(stm_inode_index_commit(idx, 3u, &p3, c3));
+    STM_ASSERT_EQ(p3, p0);
+    STM_ASSERT_MEM_EQ(c3, c0, 32);
+
+    stm_inode_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(inp_tmp_path);
+}
+
+/* Between a flush and its finalize the engine holds a pending-commit
+ * window — engine-backed inode ops are refused with STM_EBUSY. */
+STM_TEST(inode_commit_flush_pending_window_blocks_ops) {
+    stm_inode_index *idx = inode_test_idx();
+    uint64_t a1 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &a1));
+
+    uint64_t fp = 0, fg = 0; uint8_t fc[32];
+    STM_ASSERT_OK(stm_inode_index_commit_flush(idx, 1u, &fp, &fg, fc));
+
+    /* Pending window: a lookup is refused until finalize/abort closes it. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_ERR(stm_inode_lookup(idx, 1, a1, &v), STM_EBUSY);
+
+    /* FINALIZE closes the window; ops resume. */
+    STM_ASSERT_OK(stm_inode_index_commit_finalize(idx));
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, a1, &v));
+
+    inode_test_idx_close(idx);
+}
+
+/* commit_flush refuses NULL args + an index with storage / crypt unbound
+ * (parity with the monolithic stm_inode_index_commit). */
+STM_TEST(inode_commit_flush_arg_validation) {
+    uint64_t fp = 0, fg = 0; uint8_t fc[32];
+    STM_ASSERT_ERR(stm_inode_index_commit_flush(NULL, 1u, &fp, &fg, fc),
+                   STM_EINVAL);
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_ERR(stm_inode_index_commit_flush(idx, 1u, NULL, &fg, fc),
+                   STM_EINVAL);
+    /* storage + crypt unbound → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_inode_index_commit_flush(idx, 1u, &fp, &fg, fc),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_index_commit_finalize(NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_index_commit_abort(NULL), STM_EINVAL);
+    stm_inode_index_close(idx);
+}
+
+/* finalize / abort with no flush pending is a caller-sequencing bug —
+ * refused with STM_EINVAL, the tree untouched. */
+STM_TEST(inode_commit_finalize_abort_without_flush_refused) {
+    stm_inode_index *idx = inode_test_idx();
+    STM_ASSERT_ERR(stm_inode_index_commit_finalize(idx), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_index_commit_abort(idx), STM_EINVAL);
+    inode_test_idx_close(idx);
+}
+
 /* P8-POSIX-3: stm_inode_link / stm_inode_unlink with cascade-free. */
 STM_TEST(inode_p3_link_increments_nlink) {
     stm_inode_index *idx = inode_test_idx();
