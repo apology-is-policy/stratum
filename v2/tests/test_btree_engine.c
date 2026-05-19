@@ -2278,4 +2278,56 @@ STM_TEST(engine_scan_range_args) {
     memstore_destroy(&ms);
 }
 
+STM_TEST(engine_delete_height1_empty_root) {
+    /* Delete the only key of a height-1 (single-leaf-root) tree — the
+     * durable root itself becomes an empty leaf. Distinct from
+     * engine_delete_to_empty, which keeps an internal root over empty
+     * leaves: this exercises eng_node_write / verify / open /
+     * load_root / re-insert of an empty-LEAF root. impl-4d's extent
+     * cutover hits exactly this shape — a single-extent file truncated
+     * to zero. R153 P3-2. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "only", 4, "v", 1));
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_EQ(st.height, 1u);                  /* the root is a leaf */
+
+    bool found = false;
+    STM_ASSERT_OK(stm_btree_engine_delete(eng, "only", 4, &found));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &r, rc));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));    /* empty-leaf root */
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_EQ(st.n_keys, UINT64_C(0));
+    STM_ASSERT_EQ(st.height, 1u);
+
+    /* Reopen at the empty-leaf root; it must verify + accept an insert. */
+    stm_btree_engine_destroy(eng);
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         r, 2, rc, &eng));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    bool lf = true;
+    void *gv = NULL;
+    size_t gl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "only", 4, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(!lf);
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "fresh", 5, "w", 1));
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 3, &r, rc));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "fresh", 5, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(lf && gl == 1 && gv && memcmp(gv, "w", 1) == 0);
+    free(gv);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
 STM_TEST_MAIN("btree_engine")

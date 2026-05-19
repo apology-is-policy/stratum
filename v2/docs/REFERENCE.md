@@ -65,10 +65,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     `stm_bootstrap`-backed vtable into the three-phase sync, retiring
     `btree_store`'s whole-tree rebuild, and the `STM_UB_VERSION` bump —
     is 9.6-impl-4.
-  - **ctest 63/63 GREEN** — `test_btree_engine` 41 cases (31 +
-    10 impl-4a: 5 delete — basic, spilled-supersede, then-abort,
-    to-empty, cow-incremental; 5 range-scan — basic, prefix-isolation,
-    multilevel, edges, args).
+  - **ctest 63/63 GREEN** — `test_btree_engine` 42 cases (31 + 11
+    impl-4a: 6 delete + 5 range-scan).
   - **History gap**: the chunks between PARALLEL-3 impl-4 and here —
     PARALLEL-3 impl-5 / impl-6 + R134–R136, the Thylacine A1–A5
     series + R137–R148, and Phase 9.6 (design + `btree.tla` spec +
