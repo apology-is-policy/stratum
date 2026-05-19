@@ -1789,4 +1789,493 @@ STM_TEST(engine_spill_many) {
     memstore_destroy(&ms);
 }
 
+/* ========================================================================= */
+/* Tests — 9.6-impl-4a delete + range-scan.                                    */
+/* ========================================================================= */
+
+STM_TEST(engine_delete_basic) {
+    /* Delete removes a key; siblings survive; an absent-key delete is
+     * a benign no-op; the delete is durable across reopen. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "a", 1, "va", 2));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "b", 1, "vb", 2));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "c", 1, "vc", 2));
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+
+    bool found = false;
+    STM_ASSERT_OK(stm_btree_engine_delete(eng, "b", 1, &found));
+    STM_ASSERT_TRUE(found);
+
+    bool lf = false;
+    void *gv = NULL;
+    size_t gl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "b", 1, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(!lf);                                  /* gone */
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "a", 1, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(lf && gl == 2 && gv && memcmp(gv, "va", 2) == 0);
+    free(gv);
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "c", 1, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(lf && gl == 2 && gv && memcmp(gv, "vc", 2) == 0);
+    free(gv);
+
+    /* Re-delete "b" — a miss, benign no-op; absent key with NULL
+     * out_found also OK. */
+    found = true;
+    STM_ASSERT_OK(stm_btree_engine_delete(eng, "b", 1, &found));
+    STM_ASSERT_TRUE(!found);
+    STM_ASSERT_OK(stm_btree_engine_delete(eng, "zzz", 3, NULL));
+
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &r, rc));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    stm_btree_engine_destroy(eng);
+
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         r, 2, rc, &eng));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "b", 1, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(!lf);
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "a", 1, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(lf);
+    free(gv);
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_EQ(st.n_keys, UINT64_C(2));
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_delete_spilled_supersedes_chain) {
+    /* Deleting a spilled-value key supersedes its out-of-line chain:
+     * the next commit frees exactly the chain blocks + the COWed leaf,
+     * once each — no leak, no double-free. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { BIG = 30u * 1024u };           /* ceil(30 KiB / 16272) = 2 blocks */
+    uint8_t *big = malloc(BIG);
+    STM_ASSERT(big != NULL);
+    if (!big) { stm_btree_engine_destroy(eng); memstore_destroy(&ms); return; }
+    memset(big, 0x71, BIG);
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "keep", 4, "small", 5));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "big", 3, big, BIG));
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+    STM_ASSERT_EQ(memstore_freed_count(&ms), (size_t)0);   /* first commit */
+
+    size_t before = memstore_freed_count(&ms);
+    bool found = false;
+    STM_ASSERT_OK(stm_btree_engine_delete(eng, "big", 3, &found));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &r, rc));
+    /* 2 spill-chain blocks + the 1 COWed root leaf — exact. */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), before + 3u);
+    STM_ASSERT_TRUE(memstore_no_double_free(&ms));
+
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    bool lf = false;
+    void *gv = NULL;
+    size_t gl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "big", 3, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(!lf);
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "keep", 4, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(lf && gl == 5);
+    free(gv);
+
+    free(big);
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_delete_then_abort) {
+    /* delete + commit_flush + commit_abort reverts the delete: the
+     * entry comes back intact and its spill chain is NOT freed (the
+     * unchanged durable root still references it). */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { BIG = 30u * 1024u };           /* 2 spill blocks */
+    uint8_t *big = malloc(BIG);
+    STM_ASSERT(big != NULL);
+    if (!big) { stm_btree_engine_destroy(eng); memstore_destroy(&ms); return; }
+    memset(big, 0x4D, BIG);
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "big", 3, big, BIG));
+    uint64_t r1 = 0;
+    uint8_t  rc1[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r1, rc1));
+
+    bool found = false;
+    STM_ASSERT_OK(stm_btree_engine_delete(eng, "big", 3, &found));
+    STM_ASSERT_TRUE(found);
+
+    size_t before = memstore_freed_count(&ms);
+    uint64_t fp = 0, fg = 0;
+    uint8_t  fc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 2, &fp, &fg, fc));
+    STM_ASSERT_OK(stm_btree_engine_commit_abort(eng));
+    /* Abort frees only the flush's fresh node (the COWed leaf); the
+     * superseded spill chain is NOT freed — gen-1 still owns it. */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), before + 1u);
+    STM_ASSERT_TRUE(memstore_no_double_free(&ms));
+
+    uint64_t gp = 0, gg = 0;
+    uint8_t  gc[32];
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+    STM_ASSERT_EQ(gp, r1);
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    bool lf = false;
+    void *gv = NULL;
+    size_t gl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "big", 3, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(lf && gl == BIG && gv && memcmp(gv, big, BIG) == 0);
+    free(gv);
+
+    free(big);
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_delete_to_empty) {
+    /* Delete every key of a multi-leaf tree — empty non-root leaves
+     * are well-formed; commit / reopen / verify all hold. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { N = 600 };
+    for (uint32_t i = 0; i < N; i++) {
+        uint8_t key[4];
+        be32_key(i, key);
+        uint8_t val[40];
+        memset(val, (int)(i & 0xFFu), sizeof val);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, val, sizeof val));
+    }
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_TRUE(st.height >= 2u);              /* genuinely multi-leaf */
+
+    for (uint32_t i = 0; i < N; i++) {
+        uint8_t key[4];
+        be32_key(i, key);
+        bool found = false;
+        STM_ASSERT_OK(stm_btree_engine_delete(eng, key, 4, &found));
+        STM_ASSERT_TRUE(found);
+    }
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &r, rc));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));    /* empty leaves OK */
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_EQ(st.n_keys, UINT64_C(0));
+
+    /* Reopen at the all-deleted root — still well-formed + empty. */
+    stm_btree_engine_destroy(eng);
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         r, 2, rc, &eng));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_EQ(st.n_keys, UINT64_C(0));
+    uint8_t k0[4];
+    be32_key(0, k0);
+    bool lf = true;
+    void *gv = NULL;
+    size_t gl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, k0, 4, &lf, &gv, &gl));
+    STM_ASSERT_TRUE(!lf);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_delete_cow_incremental) {
+    /* Deleting one key from a multi-level tree COWs only its
+     * root-to-leaf path — exactly `height` nodes superseded, the
+     * sibling subtrees shared (FreedNodesNotReachable for delete). */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { N = 500 };
+    for (uint32_t i = 0; i < N; i++) {
+        uint8_t key[4];
+        be32_key(i, key);
+        uint8_t val[40];
+        memset(val, (int)(i & 0xFFu), sizeof val);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, val, sizeof val));
+    }
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_TRUE(st.height >= 2u);
+
+    size_t before = memstore_freed_count(&ms);
+    uint8_t k[4];
+    be32_key(N / 2u, k);
+    bool found = false;
+    STM_ASSERT_OK(stm_btree_engine_delete(eng, k, 4, &found));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &r, rc));
+    /* Exactly `height` nodes superseded — the COWed path, nothing
+     * else. A wrongly-freed sibling subtree would push the count up. */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), before + (size_t)st.height);
+    STM_ASSERT_TRUE(memstore_no_double_free(&ms));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+
+    /* Every other key survives. */
+    for (uint32_t i = 0; i < N; i++) {
+        if (i == N / 2u) continue;
+        uint8_t key[4];
+        be32_key(i, key);
+        bool lf = false;
+        void *gv = NULL;
+        size_t gl = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup(eng, key, 4, &lf, &gv, &gl));
+        STM_ASSERT_TRUE(lf);
+        free(gv);
+    }
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+/* Range-scan collector: records each visited 4-byte key, in order. */
+typedef struct {
+    uint8_t got[300][4];
+    size_t  n;
+    size_t  stop_after;     /* 0 = never; else cb returns nonzero at n == this */
+} range_ctx;
+
+static int range_cb(const void *k, size_t kl,
+                     const void *v, size_t vl, void *ctx)
+{
+    (void)v; (void)vl;
+    range_ctx *rcx = ctx;
+    if (kl == 4u && rcx->n < 300u) memcpy(rcx->got[rcx->n], k, 4u);
+    rcx->n++;
+    if (rcx->stop_after != 0u && rcx->n >= rcx->stop_after) return 1;
+    return 0;
+}
+
+STM_TEST(engine_scan_range_basic) {
+    /* scan_range over [lo, hi] yields exactly the in-range keys, in
+     * ascending order, both bounds inclusive. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    for (uint32_t i = 0; i < 100u; i++) {
+        uint8_t key[4];
+        be32_key(i, key);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, "v", 1));
+    }
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+
+    uint8_t lo[4], hi[4];
+    be32_key(10, lo);
+    be32_key(20, hi);
+    range_ctx rcx;
+    memset(&rcx, 0, sizeof rcx);
+    STM_ASSERT_OK(stm_btree_engine_scan_range(eng, lo, 4, hi, 4,
+                                               range_cb, &rcx));
+    STM_ASSERT_EQ(rcx.n, (size_t)11);              /* 10..20 inclusive */
+    for (uint32_t j = 0; j <= 10u; j++) {
+        uint8_t exp[4];
+        be32_key(10u + j, exp);
+        STM_ASSERT(memcmp(rcx.got[j], exp, 4) == 0);
+    }
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_scan_range_prefix_isolation) {
+    /* The readdir use case: keys under two 4-byte prefixes; a prefix
+     * scan [prefix, prefix+1] yields ONLY that prefix's keys. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    /* 8-byte keys: [prefix:4][sub:4]. Prefix 100 and prefix 200. */
+    for (uint32_t pfx = 100u; pfx <= 200u; pfx += 100u) {
+        for (uint32_t sub = 0; sub < 10u; sub++) {
+            uint8_t key[8];
+            be32_key(pfx, key);
+            be32_key(sub, key + 4);
+            STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 8, "v", 1));
+        }
+    }
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+
+    /* Scan prefix 100: lo = the 4-byte prefix (<= every [100][*] key),
+     * hi = the 4-byte next prefix (> every [100][*], < every [200][*]). */
+    uint8_t lo[4], hi[4];
+    be32_key(100, lo);
+    be32_key(101, hi);
+    range_ctx rcx;
+    memset(&rcx, 0, sizeof rcx);
+    STM_ASSERT_OK(stm_btree_engine_scan_range(eng, lo, 4, hi, 4,
+                                               range_cb, &rcx));
+    /* n == 10 (not 20) is the isolation proof — scan_range visited no
+     * prefix-200 key. The lookups confirm the 10 are the right keys. */
+    STM_ASSERT_EQ(rcx.n, (size_t)10);
+    for (uint32_t sub = 0; sub < 10u; sub++) {
+        uint8_t key[8];
+        be32_key(100, key);
+        be32_key(sub, key + 4);
+        bool lf = false;
+        void *gv = NULL;
+        size_t gl = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup(eng, key, 8, &lf, &gv, &gl));
+        STM_ASSERT_TRUE(lf);
+        free(gv);
+    }
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_scan_range_multilevel) {
+    /* A sub-range scan of a multi-level tree visits the right subset —
+     * exercises scan_range_node's child pruning. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    enum { N = 500 };
+    for (uint32_t i = 0; i < N; i++) {
+        uint8_t key[4];
+        be32_key(i, key);
+        uint8_t val[40];
+        memset(val, (int)(i & 0xFFu), sizeof val);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, val, sizeof val));
+    }
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_TRUE(st.height >= 2u);
+
+    uint8_t lo[4], hi[4];
+    be32_key(100, lo);
+    be32_key(250, hi);
+    range_ctx rcx;
+    memset(&rcx, 0, sizeof rcx);
+    STM_ASSERT_OK(stm_btree_engine_scan_range(eng, lo, 4, hi, 4,
+                                               range_cb, &rcx));
+    STM_ASSERT_EQ(rcx.n, (size_t)151);             /* 100..250 inclusive */
+    for (uint32_t j = 0; j <= 150u; j++) {
+        uint8_t exp[4];
+        be32_key(100u + j, exp);
+        STM_ASSERT(memcmp(rcx.got[j], exp, 4) == 0);
+    }
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_scan_range_edges) {
+    /* Empty range (lo > hi), no-match range, and early-stop via the
+     * callback all behave. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    for (uint32_t i = 0; i < 100u; i++) {
+        uint8_t key[4];
+        be32_key(i, key);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, "v", 1));
+    }
+    uint64_t r = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &r, rc));
+
+    uint8_t a[4], b[4];
+
+    /* lo sorts after hi — empty. */
+    be32_key(50, a);
+    be32_key(40, b);
+    range_ctx rcx;
+    memset(&rcx, 0, sizeof rcx);
+    STM_ASSERT_OK(stm_btree_engine_scan_range(eng, a, 4, b, 4,
+                                               range_cb, &rcx));
+    STM_ASSERT_EQ(rcx.n, (size_t)0);
+
+    /* In-order range with no keys in it — empty. */
+    be32_key(200, a);
+    be32_key(300, b);
+    memset(&rcx, 0, sizeof rcx);
+    STM_ASSERT_OK(stm_btree_engine_scan_range(eng, a, 4, b, 4,
+                                               range_cb, &rcx));
+    STM_ASSERT_EQ(rcx.n, (size_t)0);
+
+    /* Early stop — the callback halts the walk after 5 entries. */
+    be32_key(10, a);
+    be32_key(90, b);
+    memset(&rcx, 0, sizeof rcx);
+    rcx.stop_after = 5u;
+    STM_ASSERT_OK(stm_btree_engine_scan_range(eng, a, 4, b, 4,
+                                               range_cb, &rcx));
+    STM_ASSERT_EQ(rcx.n, (size_t)5);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_scan_range_args) {
+    /* NULL-argument matrix for delete + scan_range. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    bool found = false;
+    STM_ASSERT_ERR(stm_btree_engine_delete(NULL, "k", 1, &found), STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_delete(eng, NULL, 1, &found), STM_EINVAL);
+    /* A NULL key with key_len 0 is the (valid) empty key. */
+    STM_ASSERT_OK(stm_btree_engine_delete(eng, NULL, 0, &found));
+    STM_ASSERT_TRUE(!found);
+
+    range_ctx rcx;
+    memset(&rcx, 0, sizeof rcx);
+    STM_ASSERT_ERR(stm_btree_engine_scan_range(NULL, "a", 1, "z", 1,
+                                                range_cb, &rcx), STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_scan_range(eng, "a", 1, "z", 1,
+                                                NULL, &rcx), STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_scan_range(eng, NULL, 1, "z", 1,
+                                                range_cb, &rcx), STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_scan_range(eng, "a", 1, NULL, 1,
+                                                range_cb, &rcx), STM_EINVAL);
+    /* Empty-key bounds (NULL key, len 0) are valid args, not EINVAL. */
+    STM_ASSERT_OK(stm_btree_engine_scan_range(eng, NULL, 0, NULL, 0,
+                                               range_cb, &rcx));
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
 STM_TEST_MAIN("btree_engine")

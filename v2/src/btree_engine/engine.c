@@ -133,6 +133,7 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
     }
     eng_node_free_recursive(eng->root);    /* frees every in-memory node */
     eng_cache_destroy(&eng->cache);        /* frees the index, not nodes */
+    paddr_vec_free(&eng->orphaned_spill_blocks);
     free(eng);
 }
 
@@ -362,6 +363,69 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
 }
 
 /* ========================================================================= */
+/* Delete (9.6-impl-4a).                                                        */
+/* ========================================================================= */
+
+/*
+ * Recursively delete `key` under `node`. On a hit the leaf entry is
+ * removed and every node on the root-to-leaf path is marked dirty (so
+ * commit COWs the path, sharing the unchanged subtrees); *removed is
+ * set TRUE. On a miss nothing is mutated and *removed is FALSE.
+ *
+ * Delete-without-merge: no node is merged or structurally removed, so
+ * — unlike node_insert — there is no split / splice to bubble up, and
+ * a failed delete (STM_ENOMEM from eng_leaf_remove's orphan-sink
+ * reserve) mutates nothing at all.
+ */
+static stm_status node_delete(stm_btree_engine *eng, eng_node *node,
+                               const void *key, size_t key_len,
+                               uint32_t depth, bool *removed)
+{
+    if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+
+    if (node->is_leaf) {
+        bool found = false;
+        uint32_t i = eng_leaf_lower_bound(node, key, key_len, &found);
+        if (!found) { *removed = false; return STM_OK; }
+        stm_status s = eng_leaf_remove(node, i, &eng->orphaned_spill_blocks);
+        if (s != STM_OK) return s;          /* leaf intact on failure */
+        node->dirty = true;
+        *removed = true;
+        return STM_OK;
+    }
+
+    uint32_t idx = eng_pivot_child_for(node, key, key_len);
+    eng_node *child = NULL;
+    stm_status s = load_child(eng, node, idx, &child);
+    if (s != STM_OK) return s;
+    s = node_delete(eng, child, key, key_len, depth + 1u, removed);
+    if (s != STM_OK) return s;
+    if (*removed) node->dirty = true;       /* this ancestor is COWed too */
+    return STM_OK;
+}
+
+stm_status stm_btree_engine_delete(stm_btree_engine *eng,
+                                    const void *key, size_t key_len,
+                                    bool *out_found)
+{
+    if (!eng)            return STM_EINVAL;
+    if (key_len && !key) return STM_EINVAL;
+    if (out_found) *out_found = false;
+    /* The arg-shape checks above pre-empt STM_EBUSY (R135 doctrine). */
+    if (eng->pending.active) return STM_EBUSY;
+
+    eng_node *root = NULL;
+    stm_status s = load_root(eng, &root);
+    if (s != STM_OK) return s;
+
+    bool removed = false;
+    s = node_delete(eng, root, key, key_len, 0, &removed);
+    if (s != STM_OK) return s;
+    if (out_found) *out_found = removed;
+    return STM_OK;
+}
+
+/* ========================================================================= */
 /* Commit — incremental COW, three-phase (flush / finalize / abort).            */
 /* ========================================================================= */
 
@@ -459,6 +523,11 @@ static void invalidate_memtree(stm_btree_engine *eng)
     eng_node_free_recursive(eng->root);
     eng->root = NULL;
     cache_reset(eng);
+    /* A delete's orphaned spill-chain paddrs are in-memory mutation
+     * bookkeeping — they go with the dropped tree. The durable tree
+     * still references those chains, so they must NOT be freed; just
+     * clear the list (keep its backing store for reuse). */
+    eng->orphaned_spill_blocks.n = 0u;
 }
 
 /*
@@ -684,6 +753,20 @@ stm_status stm_btree_engine_commit_flush(stm_btree_engine *eng, uint64_t gen,
     }
     p->gen = gen;
 
+    /* Spill chains orphaned by stm_btree_engine_delete since the last
+     * commit join the superseded set — finalize deferred-frees them.
+     * Drained here, as the in-memory deletes are about to be made
+     * durable; a failed flush below drops the in-memory tree (the
+     * deletes revert) and this now-empty list stays consistent. */
+    s = paddr_vec_reserve(&p->superseded, eng->orphaned_spill_blocks.n);
+    if (s != STM_OK) {
+        pending_reset(p);
+        return s;
+    }
+    for (uint32_t i = 0; i < eng->orphaned_spill_blocks.n; i++)
+        (void)paddr_vec_push(&p->superseded, eng->orphaned_spill_blocks.v[i]);
+    eng->orphaned_spill_blocks.n = 0u;
+
     uint64_t rp = 0;
     uint8_t  rc[STM_BTNODE_CSUM_SIZE];
     s = commit_node(eng, root, gen, 0, &rp, rc);
@@ -850,6 +933,68 @@ stm_status stm_btree_engine_scan(stm_btree_engine *eng,
     if (s != STM_OK) return s;
     bool stopped = false;
     return scan_node(eng, root, cb, ctx, 0, &stopped);
+}
+
+/* Enumerate the entries of `node`'s subtree whose keys fall in the
+ * inclusive range [lo, hi] (9.6-impl-4a). A leaf binary-searches to
+ * the first key >= lo and walks until a key > hi; an internal node
+ * recurses only into children whose key-ranges can overlap [lo, hi]
+ * — child(lo) .. child(hi) inclusive (children below child(lo) hold
+ * keys < lo, children above child(hi) hold keys > hi). When lo sorts
+ * strictly after hi, child(lo) > child(hi) and the range is empty. */
+static stm_status scan_range_node(stm_btree_engine *eng, eng_node *node,
+                                   const void *lo, size_t lo_len,
+                                   const void *hi, size_t hi_len,
+                                   stm_btree_engine_iter_cb cb, void *ctx,
+                                   uint32_t depth, bool *stopped)
+{
+    if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+
+    if (node->is_leaf) {
+        bool dummy = false;
+        for (uint32_t i = eng_leaf_lower_bound(node, lo, lo_len, &dummy);
+             i < node->n_entries; i++) {
+            const eng_entry *e = &node->entries[i];
+            if (eng_key_cmp(e->key, e->key_len, hi, hi_len) > 0)
+                break;                      /* sorted leaf — past hi, done */
+            if (cb(e->key, e->key_len, e->val, e->val_len, ctx) != 0) {
+                *stopped = true;
+                return STM_OK;
+            }
+        }
+        return STM_OK;
+    }
+
+    uint32_t c_lo = eng_pivot_child_for(node, lo, lo_len);
+    uint32_t c_hi = eng_pivot_child_for(node, hi, hi_len);
+    for (uint32_t i = c_lo; i <= c_hi; i++) {
+        eng_node *child = NULL;
+        stm_status s = load_child(eng, node, i, &child);
+        if (s != STM_OK) return s;
+        s = scan_range_node(eng, child, lo, lo_len, hi, hi_len,
+                            cb, ctx, depth + 1u, stopped);
+        if (s != STM_OK) return s;
+        if (*stopped) return STM_OK;
+    }
+    return STM_OK;
+}
+
+stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
+                                        const void *lo_key, size_t lo_key_len,
+                                        const void *hi_key, size_t hi_key_len,
+                                        stm_btree_engine_iter_cb cb, void *ctx)
+{
+    if (!eng || !cb)            return STM_EINVAL;
+    if (lo_key_len && !lo_key)  return STM_EINVAL;
+    if (hi_key_len && !hi_key)  return STM_EINVAL;
+    if (eng->pending.active)    return STM_EBUSY;
+
+    eng_node *root = NULL;
+    stm_status s = load_root(eng, &root);
+    if (s != STM_OK) return s;
+    bool stopped = false;
+    return scan_range_node(eng, root, lo_key, lo_key_len, hi_key, hi_key_len,
+                           cb, ctx, 0, &stopped);
 }
 
 static int count_cb(const void *k, size_t kl, const void *v, size_t vl,

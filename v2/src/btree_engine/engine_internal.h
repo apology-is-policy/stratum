@@ -305,6 +305,13 @@ struct stm_btree_engine {
 
     eng_cache   cache;
     eng_pending pending;                    /* the flush -> finalize window */
+
+    /* Spill chains orphaned by stm_btree_engine_delete since the last
+     * commit — on-disk block paddrs awaiting supersede. commit_flush
+     * drains this into pending.superseded (so finalize deferred-frees
+     * them); invalidate_memtree clears it (a delete is reverted with
+     * the dropped in-memory tree); destroy frees the backing store. */
+    paddr_vec   orphaned_spill_blocks;
 };
 
 /* ========================================================================= */
@@ -355,6 +362,15 @@ STM_MUST_USE
 stm_status eng_leaf_append(eng_node *n,
                             const void *key, size_t key_len,
                             const void *val, size_t val_len);
+
+/* Remove leaf entry `idx` (9.6-impl-4a). When the entry's value was
+ * stored out-of-line, the paddrs of its on-disk spill chain are
+ * appended to `orphan_sink` so the next commit supersedes them. The
+ * append is the only fallible step and it reserves before it mutates,
+ * so on STM_ENOMEM the leaf is left unchanged. The leaf is NOT merged
+ * or rebalanced — it may be left empty. */
+STM_MUST_USE
+stm_status eng_leaf_remove(eng_node *n, uint32_t idx, paddr_vec *orphan_sink);
 
 /* Set pivot `idx` of an internal node (in-order node load only;
  * pivots array pre-sized by eng_node_new_internal_sized). */

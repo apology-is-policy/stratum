@@ -184,6 +184,31 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
                                     bool *out_found,
                                     void **out_value, size_t *out_value_len);
 
+/*
+ * Delete `key`. On a hit the entry is removed and — if `out_found` is
+ * non-NULL — *out_found is set TRUE; on a miss the tree is unchanged
+ * and *out_found is FALSE. A delete of an absent key is a benign
+ * no-op, not an error. `out_found` may be NULL when the caller does
+ * not need the signal.
+ *
+ * Delete is copy-on-write exactly as insert: the target leaf and every
+ * ancestor on the root-to-leaf path are rewritten to fresh paddrs at
+ * the next commit, unchanged subtrees shared. It does NOT merge or
+ * rebalance — a leaf may be left under-full or empty (correct, just
+ * not space-optimal; node merge is a Phase 9.8 concern). When the
+ * deleted value was stored out-of-line, its spill chain is reclaimed
+ * (deferred-free) by the commit that follows the delete.
+ *
+ * `key_len` may be 0. Returns STM_EINVAL on a NULL `eng` or a NULL
+ * `key` with nonzero `key_len`, STM_EBUSY during an un-finalized
+ * commit flush, STM_ENOMEM / STM_ECORRUPT / device errors otherwise.
+ * A delete that fails never loses or corrupts an already-present key.
+ */
+STM_MUST_USE
+stm_status stm_btree_engine_delete(stm_btree_engine *eng,
+                                    const void *key, size_t key_len,
+                                    bool *out_found);
+
 /* Per-entry callback for stm_btree_engine_scan. Pointers are valid
  * only for the duration of the call. Return 0 to continue, nonzero to
  * stop (the scan then returns STM_OK). */
@@ -196,6 +221,31 @@ typedef int (*stm_btree_engine_iter_cb)(const void *key, size_t key_len,
 STM_MUST_USE
 stm_status stm_btree_engine_scan(stm_btree_engine *eng,
                                   stm_btree_engine_iter_cb cb, void *ctx);
+
+/*
+ * Enumerate every (key, value) pair whose key is in the INCLUSIVE
+ * range [lo_key, hi_key], in ascending key order — the bounded-prefix
+ * counterpart of stm_btree_engine_scan. It descends to the first key
+ * >= lo_key and walks only the leaves overlapping the range, so the
+ * cost is O(matched entries + tree height), NOT O(tree). A caller
+ * iterating one key-prefix passes lo_key / hi_key as that prefix's
+ * natural low / high bounds.
+ *
+ * lo_key_len / hi_key_len may be 0 (the empty key — the minimum). If
+ * lo_key sorts strictly after hi_key the range is empty and the scan
+ * is a no-op. `cb` is invoked per in-range entry; a nonzero return
+ * stops the scan early (which then returns STM_OK), as for
+ * stm_btree_engine_scan.
+ *
+ * Returns STM_EINVAL on NULL `eng` / `cb` or a NULL key with nonzero
+ * length, STM_EBUSY during an un-finalized commit flush,
+ * STM_ENOMEM / STM_ECORRUPT / device errors otherwise.
+ */
+STM_MUST_USE
+stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
+                                        const void *lo_key, size_t lo_key_len,
+                                        const void *hi_key, size_t hi_key_len,
+                                        stm_btree_engine_iter_cb cb, void *ctx);
 
 /* ========================================================================= */
 /* Commit + inspection.                                                       */

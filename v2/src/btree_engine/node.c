@@ -324,6 +324,47 @@ stm_status eng_leaf_append(eng_node *n,
 }
 
 /* ========================================================================= */
+/* Leaf delete (9.6-impl-4a).                                                  */
+/* ========================================================================= */
+
+stm_status eng_leaf_remove(eng_node *n, uint32_t idx, paddr_vec *orphan_sink)
+{
+    eng_entry *e  = &n->entries[idx];
+    eng_spill *sp = e->spill;
+    bool has_chain = sp && sp->n_blocks > 0u;
+
+    /* Fallible work first — on STM_ENOMEM the leaf is left untouched.
+     * A spilled entry's on-disk chain outlives the entry that named
+     * it: route its block paddrs to the orphan sink so commit can
+     * supersede them (leaf_sync_spill walks only LIVE entries and
+     * could not otherwise see a removed entry's chain). */
+    if (has_chain) {
+        stm_status s = paddr_vec_reserve(orphan_sink, sp->n_blocks);
+        if (s != STM_OK) return s;
+    }
+
+    /* Infallible from here. */
+    if (has_chain) {
+        for (uint32_t j = 0; j < sp->n_blocks; j++)
+            (void)paddr_vec_push(orphan_sink, sp->blocks[j]);   /* reserved */
+    }
+    free(e->key);
+    free(e->val);
+    if (sp) { free(sp->blocks); free(sp); }
+
+    /* Shift the tail down. The vacated last slot is left stale (a
+     * struct-copy of the new last entry) but n_entries excludes it,
+     * so it is never freed; a later append / insert overwrites it.
+     * Unlike eng_leaf_put's insert (memmove UP, then a NEW entry
+     * written at the aliased slot), this memmove DOWN writes no new
+     * entry, so no spill-pointer clearing is needed. */
+    memmove(&n->entries[idx], &n->entries[idx + 1u],
+            (size_t)(n->n_entries - idx - 1u) * sizeof(eng_entry));
+    n->n_entries--;
+    return STM_OK;
+}
+
+/* ========================================================================= */
 /* Internal splice.                                                            */
 /* ========================================================================= */
 

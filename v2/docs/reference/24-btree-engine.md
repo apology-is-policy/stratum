@@ -15,15 +15,17 @@ node — 16 KiB — AEGIS-256 encrypted with a per-node BLAKE3 Merkle csum,
 the same crypto envelope `btree_store` nodes carry. A tree's durable
 identity is the triple `(root_paddr, root_gen, root_csum)`.
 
-This file documents **9.6-impl-3** — the structural engine, incremental
-copy-on-write commit (deferred-free of superseded paddrs, the
-`commit_flush` / `commit_finalize` / `commit_abort` three-phase split,
-crash-revert), and large-value spill (out-of-line storage for values
-too large to sit inline in a node). The cutover of the four metadata
-modules onto the engine — wiring the real `stm_bootstrap`-backed vtable
-into the three-phase sync — is 9.6-impl-4. See
-`docs/phase-9.6-metadata-tree-engine-design.md` and
-`docs/phase-9.6-impl-3-spill-design.md`.
+This file documents **9.6-impl-3 + impl-4a** — the structural engine,
+incremental copy-on-write commit (deferred-free of superseded paddrs,
+the `commit_flush` / `commit_finalize` / `commit_abort` three-phase
+split, crash-revert), large-value spill (out-of-line storage for
+values too large to sit inline in a node), and the impl-4a
+engine-completion ops `delete` + `scan_range`. The cutover of the four
+metadata modules onto the engine — wiring the real `stm_bootstrap`-
+backed vtable into the three-phase sync — is 9.6-impl-4b..d. See
+`docs/phase-9.6-metadata-tree-engine-design.md`,
+`docs/phase-9.6-impl-3-spill-design.md`, and
+`docs/phase-9.6-impl-4-cutover-design.md`.
 
 ## Where it sits
 
@@ -88,19 +90,29 @@ keeps them alive for the engine's lifetime.
 stm_status stm_btree_engine_insert(stm_btree_engine *eng,
                                     const void *key, size_t key_len,
                                     const void *value, size_t value_len);
+stm_status stm_btree_engine_delete(stm_btree_engine *eng,
+                                    const void *key, size_t key_len,
+                                    bool *out_found);
 stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
                                     const void *key, size_t key_len,
                                     bool *out_found,
                                     void **out_value, size_t *out_value_len);
 stm_status stm_btree_engine_scan  (stm_btree_engine *eng,
                                     stm_btree_engine_iter_cb cb, void *ctx);
+stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
+                                    const void *lo_key, size_t lo_key_len,
+                                    const void *hi_key, size_t hi_key_len,
+                                    stm_btree_engine_iter_cb cb, void *ctx);
 ```
 
-`insert` upserts on a duplicate key. `lookup` copies the value into a
+`insert` upserts on a duplicate key. `delete` removes a key — a miss
+is a benign no-op, not an error. `lookup` copies the value into a
 freshly malloc'd buffer the caller frees (NULL for a zero-length
-value). `scan` enumerates every entry in ascending key order. Spill is
-transparent: `lookup` / `scan` always see the full value — the engine
-materialises a spilled value at load (§Large-value spill).
+value). `scan` enumerates every entry in ascending key order;
+`scan_range` enumerates only the entries in an inclusive `[lo, hi]`
+key range — the bounded-prefix form, cost O(matched + height) not
+O(tree). Spill is transparent: every query path sees the full value —
+the engine materialises a spilled value at load (§Large-value spill).
 
 ### Commit + inspection
 
@@ -381,6 +393,39 @@ pre-size).
 key so large the entry could not fit even as a spilled indirection, is
 refused with `STM_ERANGE` — the only `STM_ERANGE` cases at impl-3.
 
+### Delete + range scan (9.6-impl-4a)
+
+`stm_btree_engine_delete` removes a key. It is copy-on-write exactly
+as insert — `node_delete` descends to the leaf, `eng_leaf_remove`
+drops the entry, and every node on the root-to-leaf path is marked
+dirty so commit COWs the path and shares the unchanged subtrees. A
+miss is a benign no-op (nothing dirtied). It is **delete-without-
+merge**: no node is merged or structurally removed, so a leaf may be
+left under-full or empty — a well-formed leaf either way (an empty
+leaf encodes, verifies, and routes a lookup to a clean miss; node
+merge / rebalance is a Phase 9.8 concern). The tree's node-set is
+structurally invariant under delete.
+
+A spilled value's on-disk spill chain outlives the entry that named
+it, and `leaf_sync_spill` walks only live entries — so it cannot see
+a deleted entry's chain. `eng_leaf_remove` instead routes the chain's
+block paddrs to `stm_btree_engine.orphaned_spill_blocks`, an
+engine-level pending-supersede list. `commit_flush` drains that list
+into `pending.superseded` (finalize then deferred-frees the blocks);
+`invalidate_memtree` clears it — a `commit_abort` / failed flush
+reverts the delete with the dropped in-memory tree, and the durable
+tree still references those chains, so they must NOT be freed;
+`destroy` frees the list's backing store.
+
+`stm_btree_engine_scan_range` enumerates the entries in an inclusive
+`[lo, hi]` key range. A leaf binary-searches to the first key `>= lo`
+and walks until a key `> hi`; an internal node recurses only into the
+children whose key-ranges overlap `[lo, hi]` — `child(lo) ..
+child(hi)` inclusive — so the cost is O(matched entries + height),
+not O(tree). It is a pure read (no commit, no `btree.tla`
+implication). The 9.6-impl-4 cutover modules use it for per-prefix
+iteration — `readdir`, `listxattr`, extent iterate-for-inode.
+
 ### Failure atomicity
 
 An `insert` never loses an already-present key, even on `STM_ENOMEM`:
@@ -405,7 +450,7 @@ btnode encoder rather than writing a malformed node.
 
 | Spec | Pins |
 |---|---|
-| `btree.tla` | The incremental COW-commit mechanism. `commit_flush` / `commit_finalize` / `commit_abort` realise `WriteNode` / `FinalCommit` / `Crash`; the three invariants map directly — `DurableTreeWellFormed` (finalize publishes a complete flushed tree; a flush failure or abort leaves the prior durable root, never a torn one), `CommittedTreeMerkleConsistent` (`eng_node_write`'s ciphertext-BLAKE3 Merkle link, propagated bottom-up by `commit_node`), `FreedNodesNotReachable` (finalize frees only the superseded set — a clean/shared subtree is never recorded, never freed). TLC-verified green; the three buggy configs (partial-COW, early-publish, over-free) each trip exactly one invariant. 9.6-impl-3 large-value spill needs **no** `btree.tla` extension — a spill block is another COWed paddr written by the existing flush, freed by finalize/abort, and Merkle-linked by its parent; the spec's COW-commit mechanism already covers it (`phase-9.6-impl-3-spill-design.md` §7). |
+| `btree.tla` | The incremental COW-commit mechanism. `commit_flush` / `commit_finalize` / `commit_abort` realise `WriteNode` / `FinalCommit` / `Crash`; the three invariants map directly — `DurableTreeWellFormed` (finalize publishes a complete flushed tree; a flush failure or abort leaves the prior durable root, never a torn one), `CommittedTreeMerkleConsistent` (`eng_node_write`'s ciphertext-BLAKE3 Merkle link, propagated bottom-up by `commit_node`), `FreedNodesNotReachable` (finalize frees only the superseded set — a clean/shared subtree is never recorded, never freed). TLC-verified green; the three buggy configs (partial-COW, early-publish, over-free) each trip exactly one invariant. 9.6-impl-3 large-value spill needs **no** `btree.tla` extension — a spill block is another COWed paddr written by the existing flush, freed by finalize/abort, and Merkle-linked by its parent; the spec's COW-commit mechanism already covers it (`phase-9.6-impl-3-spill-design.md` §7). 9.6-impl-4a `delete` likewise needs **no** extension — a delete is a leaf-content mutation that COWs the root-to-leaf path exactly as an insert (the `BeginCommit` abstraction), delete-without-merge changes no tree structure, and the spec models no leaf occupancy so an empty leaf is already a well-formed leaf; `scan_range` is a pure read with no spec implication (`phase-9.6-impl-4-cutover-design.md` §9). |
 | `allocator.tla` / `sync.tla` | `(paddr, gen)` AEAD-nonce uniqueness composes from the allocator (fresh paddrs) and sync (monotone gen); `btree.tla` and the engine model the tree-shape mechanism on that composition. `btree.tla` comment §Composition. |
 
 The multi-level B+tree split / descent is a structural-algorithm
@@ -415,7 +460,7 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 31 cases against an in-RAM
+`tests/test_btree_engine.c` — 41 cases against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
 can both assert which paddrs were superseded and still open a prior
@@ -430,6 +475,8 @@ crash-revert path):
 | Commit | re-commit of a clean tree is a no-op (same root, no new nodes); the published gen stays the root's real write gen and the triple reopens; a non-monotonic commit gen → `STM_EINVAL`; incremental commit COWs the root to a new paddr and shares unchanged subtrees — the prior root stays intact and readable |
 | Three-phase commit | deferred-free — a second commit hands back exactly the superseded paddrs (the rewritten leaf + the old root), stamped with the commit gen, and never the shared subtrees (`FreedNodesNotReachable`); a three-commit chain confirms no paddr is freed twice; `commit_flush` + `commit_finalize` publishes the flushed root, and the pending-commit window rejects every other op with `STM_EBUSY`; `commit_abort` reverts to the last durable root and reclaims the flushed nodes — on both a committed tree and a never-committed one; a mid-flush device write error reverts identically (durable root intact, partial nodes reclaimed, engine usable); `destroy` of an un-finalized flush implicitly aborts; phased-API NULL + no-pending argument validation |
 | Large-value spill | a small-inline + single-block + multi-block (~200 KiB) value commits / reopens / verifies / round-trips; a value upserted inline→spilled→spilled→inline round-trips each way; **per-value COW** — changing a sibling entry does NOT rewrite an unchanged spilled value's chain (exactly the leaf node superseded), changing the value itself rewrites + supersedes the chain; `commit_abort` of a flush with a fresh multi-block chain reclaims every spill block; a mid-chain device write failure reverts cleanly — durable root intact, every started spill block reclaimed exactly once, no double-free; a tampered spill block is caught by `verify` + `lookup` (`STM_ECORRUPT`); 40 spilled values commit / reopen / verify / look up |
+| Delete (impl-4a) | delete removes a key, siblings survive, a miss is a benign no-op, the delete reopens durable; deleting a spilled-value key supersedes its chain — the next commit frees exactly the chain blocks + the COWed leaf, once each; `commit_abort` after a delete-flush reverts it (the entry returns, the chain is NOT freed); deleting every key of a multi-leaf tree leaves well-formed empty leaves that commit / reopen / verify; deleting one key COWs exactly `height` nodes — the path, never a shared sibling |
+| Range scan (impl-4a) | `scan_range` over `[lo, hi]` yields exactly the in-range keys ascending, bounds inclusive; a two-prefix tree scanned by prefix yields only that prefix's keys; a multi-level sub-range exercises the child pruning; an empty range (`lo > hi`), a no-match range, and an early-stopping callback all behave; NULL-argument matrix |
 | Integrity | a flipped ciphertext byte is caught by the Merkle chain (`STM_ECORRUPT`); opening with a wrong root csum is rejected |
 | Hostile trees | a forged on-disk DAG (two child slots → one paddr) and a forged child-kind mismatch are both rejected with `STM_ECORRUPT`, and `destroy` does not double-free (R150 P1 regressions) |
 | Validation | a value past the inline bound spills (no longer refused); a value over `STM_BTREE_ENGINE_MAX_VALUE_BYTES` and a key too large to fit even a spilled entry → `STM_ERANGE`; NULL-argument matrix |
@@ -461,11 +508,18 @@ crash-revert path):
       addressed (tightened the abort free-count assertion to exact, added
       a mid-chain spill-write-failure regression test, reworded the
       design doc's read-path bound).
-- [ ] **Module cutover (9.6-impl-4)**: inode / dirent / xattr /
+- [x] **Engine completion (9.6-impl-4a)**: `stm_btree_engine_delete`
+      (delete-without-merge; a deleted spilled value's chain is routed
+      to `orphaned_spill_blocks` and superseded at the next commit) +
+      `stm_btree_engine_scan_range` (bounded-prefix iteration). No
+      `btree.tla` extension — delete is a leaf-content COW the spec's
+      `BeginCommit` already abstracts; `scan_range` is a pure read.
+- [ ] **Module cutover (9.6-impl-4b..d)**: inode / dirent / xattr /
       extent-index onto the engine; retire `btree_store`'s whole-tree
       rebuild + each module's flat `records[]`; wire the real
       `stm_bootstrap`-backed vtable into the three-phase sync; bump
       `STM_UB_VERSION` (the engine becomes the pool's metadata format).
+      See `docs/phase-9.6-impl-4-cutover-design.md`.
 
 ## Known caveats
 
