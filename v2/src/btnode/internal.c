@@ -10,7 +10,8 @@
  *   children (N+1 fixed size):   64 opaque bytes each
  *
  * The same 128-byte header + trailing BLAKE3 csum as the leaf encoding
- * (see leaf.c). Only the payload format differs.
+ * (see leaf.c). Only the payload format differs. The node size is a
+ * per-call parameter (`buf_size`) since 9.6-impl-1b.
  *
  * Chunk 5b does not yet serialize message buffers (the ε part of the
  * Bε-tree). Callers must flush pending messages before serializing.
@@ -50,7 +51,7 @@ stm_status stm_btnode_internal_encode(const stm_btnode_pivot *pivots,
                                         void *buf, size_t buf_size)
 {
     if (!buf) return STM_EINVAL;
-    if (buf_size < STM_BTNODE_SIZE) return STM_ERANGE;
+    if (buf_size < STM_BTNODE_MIN_SIZE) return STM_ERANGE;
     if (n_pivots > 0 && !pivots) return STM_EINVAL;
     if (!children) return STM_EINVAL;
 
@@ -62,10 +63,10 @@ stm_status stm_btnode_internal_encode(const stm_btnode_pivot *pivots,
     if (children_len != expected_children) return STM_EINVAL;
 
     size_t payload_bytes = stm_btnode_internal_encoded_bytes(pivots, n_pivots);
-    if (payload_bytes > STM_BTNODE_PAYLOAD_MAX) return STM_ERANGE;
+    if (payload_bytes > STM_BTNODE_PAYLOAD_CAP(buf_size)) return STM_ERANGE;
 
     uint8_t *out = (uint8_t *)buf;
-    memset(out, 0, STM_BTNODE_SIZE);
+    memset(out, 0, buf_size);
 
     btnode_hdr_write(out, STM_BTNODE_KIND_INTERNAL,
                      n_pivots, /*buffer_used=*/0,
@@ -92,8 +93,8 @@ stm_status stm_btnode_internal_encode(const stm_btnode_pivot *pivots,
 
     /* Trailing csum. */
     uint8_t csum[STM_BTNODE_CSUM_SIZE];
-    btnode_compute_csum(out, csum);
-    memcpy(out + BTNODE_CSUM_OFFSET, csum, STM_BTNODE_CSUM_SIZE);
+    btnode_compute_csum(out, buf_size, csum);
+    memcpy(out + BTNODE_CSUM_OFFSET(buf_size), csum, STM_BTNODE_CSUM_SIZE);
 
     return STM_OK;
 }
@@ -105,7 +106,7 @@ stm_status stm_btnode_internal_decode(const void *buf, size_t buf_size,
                                         void *ctx)
 {
     if (!buf) return STM_EINVAL;
-    if (buf_size < STM_BTNODE_SIZE) return STM_ERANGE;
+    if (buf_size < STM_BTNODE_MIN_SIZE) return STM_ERANGE;
 
     const uint8_t *in = (const uint8_t *)buf;
 
@@ -116,13 +117,14 @@ stm_status stm_btnode_internal_decode(const void *buf, size_t buf_size,
     /* R7c P2-3: wrong on-disk kind → STM_ECORRUPT, not STM_EINVAL. */
     if (info.kind != STM_BTNODE_KIND_INTERNAL) return STM_ECORRUPT;
 
-    s = btnode_verify_csum(in);
+    s = btnode_verify_csum(in, buf_size);
     if (s != STM_OK) return s;
 
     if (out_info) *out_info = info;
 
     /* Walk payload. N pivots (variable), then (N+1) × 64 children. */
-    if (info.payload_used > STM_BTNODE_PAYLOAD_MAX) return STM_ECORRUPT;
+    if (info.payload_used > STM_BTNODE_PAYLOAD_CAP(buf_size))
+        return STM_ECORRUPT;
 
     const uint8_t *p   = in + STM_BTNODE_HDR_SIZE;
     const uint8_t *end = p + info.payload_used;

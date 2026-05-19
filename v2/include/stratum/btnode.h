@@ -12,16 +12,20 @@
  * the serialization primitive that both the allocator-tree (chunk 4)
  * and the main fs tree (future) share.
  *
- * Node size is fixed at 128 KiB — one STM_BOOTSTRAP_UNIT (32 blocks
- * × 4 KiB) per ARCH §6.3.1. A fixed size keeps the bootstrap-pool
- * bitmap math trivial: each allocated unit is exactly one node.
+ * Node size is a per-call parameter (`buf_size`), not a fixed constant
+ * (9.6-impl-1b). The legacy metadata path (allocator tree, keyschema,
+ * repair_log) uses STM_BTNODE_SIZE = 128 KiB; the Phase 9.6 COW B+tree
+ * engine uses a smaller node (~16 KiB) to cut copy-on-write
+ * amplification. The format below is identical at every size — only the
+ * total length and the trailing-csum offset scale with `buf_size`, which
+ * must be at least STM_BTNODE_MIN_SIZE (header + csum, no payload).
  *
- * Layout (131072 bytes total):
+ * Layout (buf_size bytes total):
  *
- *   offset 0       header (128 bytes)  — see struct stm_btnode_hdr
- *   offset 128     payload (up to 130912 bytes)
- *   offset 131040  csum (32 bytes) — BLAKE3-256 over bytes [0, 131040)
- *                                    with the csum field zeroed
+ *   offset 0                header (128 bytes) — see struct stm_btnode_hdr
+ *   offset 128              payload (up to buf_size - 160 bytes)
+ *   offset buf_size - 32    csum (32 bytes) — BLAKE3-256 over
+ *                           bytes [0, buf_size - 32)
  *
  * Keys and values are opaque byte strings; comparison is lexicographic.
  * This matches stm_btree's external contract.
@@ -61,8 +65,11 @@ extern "C" {
 /* Constants.                                                                 */
 /* ========================================================================= */
 
-/* Fixed node size: 128 KiB. Matches STM_BOOTSTRAP_UNIT_BLOCKS × 4 KiB
- * so each allocator-tree node maps 1:1 to a bootstrap-pool unit. */
+/* The legacy metadata node size: 128 KiB = one STM_BOOTSTRAP_UNIT_BLOCKS
+ * run (8 × 16-KiB bootstrap nodes). The codec is node-size-parameterized
+ * (9.6-impl-1b); keyschema / repair_log / btree_store encode at this
+ * size, the COW B+tree engine at a smaller one. NOT a fixed format
+ * constant — pass the chosen size as `buf_size` to every codec call. */
 #define STM_BTNODE_SIZE          (128u * 1024u)
 
 /* Header size (bytes). */
@@ -71,11 +78,19 @@ extern "C" {
 /* Checksum size (bytes). BLAKE3-256 output. */
 #define STM_BTNODE_CSUM_SIZE     32u
 
-/* Maximum payload bytes available between the header and the trailing
- * csum. Any encoding that produces more than this will error with
- * STM_ERANGE. */
-#define STM_BTNODE_PAYLOAD_MAX   \
-    (STM_BTNODE_SIZE - STM_BTNODE_HDR_SIZE - STM_BTNODE_CSUM_SIZE)
+/* Minimum node size: a header plus a trailing csum, zero payload.
+ * Every codec function rejects buf_size < this with STM_ERANGE. */
+#define STM_BTNODE_MIN_SIZE   \
+    (STM_BTNODE_HDR_SIZE + STM_BTNODE_CSUM_SIZE)
+
+/* Payload bytes available in a node of size `node_size` — the region
+ * between the header and the trailing csum. An encoding that produces
+ * more than this errors with STM_ERANGE. */
+#define STM_BTNODE_PAYLOAD_CAP(node_size)   \
+    ((node_size) - STM_BTNODE_HDR_SIZE - STM_BTNODE_CSUM_SIZE)
+
+/* Payload cap for the legacy 128-KiB node (STM_BTNODE_SIZE). */
+#define STM_BTNODE_PAYLOAD_MAX   STM_BTNODE_PAYLOAD_CAP(STM_BTNODE_SIZE)
 
 /* 8-byte magic at the head of every node. ASCII "STBTNODE" read as
  * little-endian uint64: byte 0 = 'S', byte 7 = 'E'. Chosen distinct
@@ -161,19 +176,17 @@ stm_status stm_btnode_verify(const void *buf, size_t buf_size);
 /* ========================================================================= */
 
 /*
- * Encode a leaf node into `buf` (must be at least STM_BTNODE_SIZE
- * bytes). The entries must be sorted ascending by key (lex); the
- * encoder asserts this in debug builds via a softer check that's
- * documented below but not enforced at runtime in release — caller
- * responsibility.
+ * Encode a leaf node into `buf`, a buffer of exactly `buf_size` bytes
+ * (the node size; ≥ STM_BTNODE_MIN_SIZE). The entries must be sorted
+ * ascending by key (lex) — caller responsibility, not enforced.
  *
  * `gen` is the creation generation (commit-txg); written verbatim into
  * the header for MVCC snapshot routing. The Merkle hash field is
  * zeroed (chunk 7 will populate it post-encode).
  *
- * Returns STM_ERANGE if the encoded entries exceed
- * STM_BTNODE_PAYLOAD_MAX bytes (caller must split the leaf before
- * retrying).
+ * Returns STM_ERANGE if the encoded entries exceed the node's payload
+ * cap, STM_BTNODE_PAYLOAD_CAP(buf_size) (caller must split the leaf
+ * before retrying), or if buf_size < STM_BTNODE_MIN_SIZE.
  */
 STM_MUST_USE
 stm_status stm_btnode_leaf_encode(

@@ -4,12 +4,12 @@
  *
  *   see v2/include/stratum/btnode.h for the format spec.
  *
- * The node layout is a fixed 128 KiB block with three regions:
+ * The node is a `buf_size`-byte block (the node size; 9.6-impl-1b made
+ * it a per-call parameter) with three regions:
  *
- *   [0, 128)          header       (stm_btnode_hdr)
- *   [128, 131040)     payload      (leaf entries)
- *   [131040, 131072)  csum         (BLAKE3-256 over [0, 131040) with
- *                                   the csum region zeroed)
+ *   [0, 128)                 header       (stm_btnode_hdr)
+ *   [128, buf_size - 32)      payload      (leaf entries)
+ *   [buf_size - 32, buf_size) csum         (BLAKE3-256 over [0, buf_size-32))
  *
  * Each leaf entry is packed as:
  *
@@ -47,13 +47,13 @@ stm_status stm_btnode_peek(const void *buf, size_t buf_size,
 stm_status stm_btnode_verify(const void *buf, size_t buf_size)
 {
     if (!buf) return STM_EINVAL;
-    if (buf_size < STM_BTNODE_SIZE) return STM_ERANGE;
+    if (buf_size < STM_BTNODE_MIN_SIZE) return STM_ERANGE;
 
     stm_btnode_info info;
     stm_status s = btnode_hdr_read((const uint8_t *)buf, buf_size, &info);
     if (s != STM_OK) return s;
 
-    return btnode_verify_csum((const uint8_t *)buf);
+    return btnode_verify_csum((const uint8_t *)buf, buf_size);
 }
 
 /* ========================================================================= */
@@ -78,18 +78,18 @@ stm_status stm_btnode_leaf_encode(const stm_btnode_entry *entries,
                                    void *buf, size_t buf_size)
 {
     if (!buf) return STM_EINVAL;
-    if (buf_size < STM_BTNODE_SIZE) return STM_ERANGE;
+    if (buf_size < STM_BTNODE_MIN_SIZE) return STM_ERANGE;
     if (n_entries > 0 && !entries) return STM_EINVAL;
 
     /* Size check first — bail before touching buf if we can't fit. */
     size_t payload_bytes = stm_btnode_leaf_encoded_bytes(entries, n_entries);
-    if (payload_bytes > STM_BTNODE_PAYLOAD_MAX) return STM_ERANGE;
+    if (payload_bytes > STM_BTNODE_PAYLOAD_CAP(buf_size)) return STM_ERANGE;
 
     uint8_t *out = (uint8_t *)buf;
 
     /* Zero the entire node so padding + csum region + reserved bytes
      * start clean. */
-    memset(out, 0, STM_BTNODE_SIZE);
+    memset(out, 0, buf_size);
 
     /* Header. payload_used = total bytes from offset 128 onward that
      * carry valid entry data. */
@@ -116,8 +116,8 @@ stm_status stm_btnode_leaf_encode(const stm_btnode_entry *entries,
 
     /* Trailing csum. */
     uint8_t csum[STM_BTNODE_CSUM_SIZE];
-    btnode_compute_csum(out, csum);
-    memcpy(out + BTNODE_CSUM_OFFSET, csum, STM_BTNODE_CSUM_SIZE);
+    btnode_compute_csum(out, buf_size, csum);
+    memcpy(out + BTNODE_CSUM_OFFSET(buf_size), csum, STM_BTNODE_CSUM_SIZE);
 
     return STM_OK;
 }
@@ -127,7 +127,7 @@ stm_status stm_btnode_leaf_decode(const void *buf, size_t buf_size,
                                    stm_btnode_entry_cb cb, void *ctx)
 {
     if (!buf || !cb) return STM_EINVAL;
-    if (buf_size < STM_BTNODE_SIZE) return STM_ERANGE;
+    if (buf_size < STM_BTNODE_MIN_SIZE) return STM_ERANGE;
 
     const uint8_t *in = (const uint8_t *)buf;
 
@@ -140,16 +140,17 @@ stm_status stm_btnode_leaf_decode(const void *buf, size_t buf_size,
     if (info.kind != STM_BTNODE_KIND_LEAF) return STM_ECORRUPT;
 
     /* Verify csum before trusting any payload bytes. */
-    s = btnode_verify_csum(in);
+    s = btnode_verify_csum(in, buf_size);
     if (s != STM_OK) return s;
 
     if (out_info) *out_info = info;
 
     /* Walk payload. Boundaries:
-     *   payload_used must fit in [0, STM_BTNODE_PAYLOAD_MAX].
+     *   payload_used must fit in [0, STM_BTNODE_PAYLOAD_CAP(buf_size)].
      *   Each entry must fit entirely within payload_used.
      *   n_entries must match the walk count. */
-    if (info.payload_used > STM_BTNODE_PAYLOAD_MAX) return STM_ECORRUPT;
+    if (info.payload_used > STM_BTNODE_PAYLOAD_CAP(buf_size))
+        return STM_ECORRUPT;
 
     const uint8_t *p   = in + STM_BTNODE_HDR_SIZE;
     const uint8_t *end = p + info.payload_used;

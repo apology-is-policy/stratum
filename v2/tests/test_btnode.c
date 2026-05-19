@@ -10,7 +10,8 @@
  *   - Single-bit tamper in payload / header / csum is detected as
  *     STM_ECORRUPT by verify.
  *   - Bad magic / version / kind rejected with the right error code.
- *   - Truncated buffer (< 128 KiB) rejected.
+ *   - Sub-minimum buffer (< STM_BTNODE_MIN_SIZE) rejected.
+ *   - Small (non-128-KiB) node sizes encode + decode round-trip.
  *   - Callback early-stop returns STM_OK with a stopped enumeration.
  *   - stm_btnode_peek returns header info without needing csum.
  *   - stm_btnode_leaf_encoded_bytes sums correctly.
@@ -280,17 +281,62 @@ STM_TEST(btnode_peek_bad_kind) {
 }
 
 STM_TEST(btnode_truncated_buffer_erange) {
+    /* 9.6-impl-1b: buf_size IS the node size. Only a buf_size below
+     * STM_BTNODE_MIN_SIZE (a header + csum, zero payload) is rejected
+     * with STM_ERANGE — a small-but-valid node size is accepted (see
+     * btnode_small_node_roundtrip). */
     uint8_t *buf = malloc(STM_BTNODE_SIZE);
     STM_ASSERT(buf != NULL);
     if (!buf) return;
     STM_ASSERT_OK(stm_btnode_leaf_encode(NULL, 0, 0, 0, buf, STM_BTNODE_SIZE));
 
     stm_btnode_info info;
-    STM_ASSERT_ERR(stm_btnode_peek(buf, STM_BTNODE_SIZE - 1, &info),
+    STM_ASSERT_ERR(stm_btnode_peek(buf, STM_BTNODE_MIN_SIZE - 1, &info),
                    STM_ERANGE);
-    STM_ASSERT_ERR(stm_btnode_verify(buf, 4096), STM_ERANGE);
-    STM_ASSERT_ERR(stm_btnode_leaf_encode(NULL, 0, 0, 0, buf, 1024),
+    STM_ASSERT_ERR(stm_btnode_verify(buf, STM_BTNODE_MIN_SIZE - 1),
                    STM_ERANGE);
+    STM_ASSERT_ERR(stm_btnode_leaf_encode(NULL, 0, 0, 0, buf,
+                                          STM_BTNODE_MIN_SIZE - 1),
+                   STM_ERANGE);
+
+    free(buf);
+}
+
+STM_TEST(btnode_small_node_roundtrip) {
+    /* 9.6-impl-1b: the COW B+tree engine uses ~16 KiB nodes. Encode +
+     * verify + decode a leaf at a non-128-KiB node size; the trailing
+     * csum lands at buf_size - 32 and the round-trip preserves entries. */
+    const size_t node_size = 16u * 1024u;
+    uint8_t *buf = malloc(node_size);
+    STM_ASSERT(buf != NULL);
+    if (!buf) return;
+
+    const char *k0 = "alpha", *v0 = "one";
+    const char *k1 = "beta",  *v1 = "two";
+    stm_btnode_entry ents[2] = {
+        { .key = k0, .key_len = 5, .value = v0, .value_len = 3 },
+        { .key = k1, .key_len = 4, .value = v1, .value_len = 3 },
+    };
+
+    STM_ASSERT_OK(stm_btnode_leaf_encode(ents, 2, /*gen=*/5, /*tree_id=*/0,
+                                          buf, node_size));
+    STM_ASSERT_OK(stm_btnode_verify(buf, node_size));
+
+    stm_btnode_info info;
+    collect_ctx ctx = { .expected = ents, .n_expected = 2,
+                        .n_seen = 0, .ok = true };
+    STM_ASSERT_OK(stm_btnode_leaf_decode(buf, node_size, &info,
+                                           collect_cb, &ctx));
+    STM_ASSERT_EQ(info.kind,      STM_BTNODE_KIND_LEAF);
+    STM_ASSERT_EQ(info.n_entries, 2u);
+    STM_ASSERT_EQ(info.gen,       5u);
+    STM_ASSERT_EQ(ctx.n_seen,     2u);
+    STM_ASSERT_TRUE(ctx.ok);
+
+    /* Verifying the same bytes at a DIFFERENT node size reads the csum
+     * from the wrong offset — caught as STM_ECORRUPT. The probe size
+     * (8 KiB) stays within the 16 KiB buffer, so no out-of-bounds read. */
+    STM_ASSERT_ERR(stm_btnode_verify(buf, 8u * 1024u), STM_ECORRUPT);
 
     free(buf);
 }

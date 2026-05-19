@@ -272,7 +272,7 @@ static stm_status emit_leaf(const coll_entry *entries, size_t lo, size_t hi,
     s = vt->reserve(ctx, out_paddr);
     if (s != STM_OK) return s;
 
-    s = stm_btree_node_encrypt(cx, *out_paddr, gen, scratch);
+    s = stm_btree_node_encrypt(cx, *out_paddr, gen, scratch, STM_BTNODE_SIZE);
     if (s != STM_OK) return s;
 
     compute_bp_csum(scratch, out_csum);
@@ -302,7 +302,7 @@ static stm_status emit_internal(const stm_btnode_pivot *pivots, uint32_t np,
     s = vt->reserve(ctx, out_paddr);
     if (s != STM_OK) return s;
 
-    s = stm_btree_node_encrypt(cx, *out_paddr, gen, scratch);
+    s = stm_btree_node_encrypt(cx, *out_paddr, gen, scratch, STM_BTNODE_SIZE);
     if (s != STM_OK) return s;
 
     compute_bp_csum(scratch, out_csum);
@@ -633,7 +633,7 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
 
     /* P4-3b: decrypt in place. A tag-verify failure aborts with
      * STM_EBADTAG — surfaced to the caller as a read failure. */
-    s = stm_btree_node_decrypt(cx, root_paddr, gen, buf);
+    s = stm_btree_node_decrypt(cx, root_paddr, gen, buf, STM_BTNODE_SIZE);
     if (s != STM_OK) { free(buf); return s; }
     restore_plaintext_self_csum(buf);
 
@@ -698,7 +698,8 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
         s = check_merkle_link(leafbuf, &cc.child_csums[i * 32]);
         if (s != STM_OK) break;
         /* AEAD decrypt each leaf under the child's paddr + shared gen. */
-        s = stm_btree_node_decrypt(cx, cc.child_paddrs[i], gen, leafbuf);
+        s = stm_btree_node_decrypt(cx, cc.child_paddrs[i], gen, leafbuf,
+                                   STM_BTNODE_SIZE);
         if (s != STM_OK) break;
         restore_plaintext_self_csum(leafbuf);
         s = deserialize_leaf(t, leafbuf, &ic);
@@ -731,7 +732,7 @@ static stm_status verify_one(uint64_t paddr, uint64_t gen,
     if (s != STM_OK) return s;
     s = check_merkle_link(buf, expected);
     if (s != STM_OK) return s;
-    s = stm_btree_node_decrypt(cx, paddr, gen, buf);
+    s = stm_btree_node_decrypt(cx, paddr, gen, buf, STM_BTNODE_SIZE);
     if (s != STM_OK) return s;
     restore_plaintext_self_csum(buf);
     return stm_btnode_peek(buf, STM_BTNODE_SIZE, out_info);
@@ -842,7 +843,7 @@ stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t root_gen,
      * without enumerating children; those bytes on disk remain
      * allocated and will leak (bounded by the tampered subtree)
      * rather than being freed silently under corrupt data. */
-    s = stm_btree_node_decrypt(cx, root_paddr, root_gen, buf);
+    s = stm_btree_node_decrypt(cx, root_paddr, root_gen, buf, STM_BTNODE_SIZE);
     if (s != STM_OK) { free(buf); return s; }
     restore_plaintext_self_csum(buf);
 

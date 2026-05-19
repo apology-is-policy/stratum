@@ -74,7 +74,9 @@ typedef struct {
 /*
  * Encrypt a freshly-encoded btnode image in place.
  *
- *   buf           — STM_BTNODE_SIZE bytes. Before call: plaintext
+ *   node_size     — the btnode image size: STM_BTNODE_SIZE for the
+ *                   legacy metadata path, ~16 KiB for the COW engine.
+ *   buf           — node_size bytes. Before call: plaintext
  *                   btnode image produced by stm_btnode_*_encode
  *                   (including the plaintext self-csum in the trailing
  *                   32 bytes). After call on success: ciphertext in
@@ -92,12 +94,13 @@ typedef struct {
 STM_MUST_USE
 stm_status stm_btree_node_encrypt(const stm_btree_crypt_ctx *cx,
                                     uint64_t paddr, uint64_t gen,
-                                    uint8_t *buf);
+                                    uint8_t *buf, size_t node_size);
 
 /*
  * Decrypt an on-disk btnode image in place.
  *
- *   buf           — STM_BTNODE_SIZE bytes. Before call: ciphertext in
+ *   node_size     — the btnode image size (see stm_btree_node_encrypt).
+ *   buf           — node_size bytes. Before call: ciphertext in
  *                   [0 .. STM_BTNODE_SIZE - 32) and AEAD tag in the
  *                   trailing 32 bytes. After call on success: recovered
  *                   plaintext (identical to what the encoder wrote,
@@ -109,7 +112,7 @@ stm_status stm_btree_node_encrypt(const stm_btree_crypt_ctx *cx,
 STM_MUST_USE
 stm_status stm_btree_node_decrypt(const stm_btree_crypt_ctx *cx,
                                     uint64_t paddr, uint64_t gen,
-                                    uint8_t *buf);
+                                    uint8_t *buf, size_t node_size);
 
 /* ========================================================================= */
 /* I/O vtable.                                                                */
@@ -117,8 +120,11 @@ stm_status stm_btree_node_decrypt(const stm_btree_crypt_ctx *cx,
 
 /*
  * Abstraction over node-sized storage. Callers (chunk 5d) implement
- * these against stm_bootstrap + stm_bdev. All node buffers are exactly
- * STM_BTNODE_SIZE (128 KiB).
+ * these against stm_bootstrap + stm_bdev. The node-buffer size is the
+ * caller's `len` argument to read / write — STM_BTNODE_SIZE (128 KiB)
+ * for the legacy whole-tree-rebuild path, STM_BTREE_ENGINE_NODE_SIZE
+ * (16 KiB) for the Phase 9.6 COW B+tree engine. `reserve` must back a
+ * region large enough for whichever size its caller uses.
  *
  *   reserve  — allocate a fresh node-sized region (paddr returned
  *              via out_paddr).

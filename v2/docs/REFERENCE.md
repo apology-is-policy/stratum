@@ -38,47 +38,34 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9.5-PARALLEL-3 impl-4 (this commit). Ports `stm_fs_reflink`
-  and `stm_fs_copy_file_range` from EX (wrlock) to **try SH (rdlock)
-  + per-inode pin on (src_ino, dst_ino) via `stm_inode_pin_two`; fall
-  back to EX on STM_ENOENT for legacy direct-extent inodes that have
-  no inode-index record** (load-bearing: `stm_fs_write` falls through
-  to `stm_sync_write_extent` on missing-index — see fs.c:1227 — so
-  legacy-mode tests like `fs_reflink_basic_share` would regress
-  without the fallback). The cross-dataset shape is the headline
-  (signatures admit `src_dataset_id != dst_dataset_id`); pin_two
-  already supports it via the `(dataset_id, ino)` lex sort key, but
-  the sync layer still rejects cross-dataset with STM_EXDEV
-  (sync.c:5749, deferred to a future chunk pending matching
-  encryption keys). Same-(ds, ino) refused upfront with STM_EINVAL
-  (preserves `test_9p.c::p9_r94_p3_2_reflink_src_eq_dst_returns_einval`).
-  - **R128 P2-1 pre-flush preserved**: src + dst flushes under the
-    pins (was: under wrlock).
-  - **R84 P2-1 TOCTOU preserved on cfr**: size-validation lookup
-    under the pin so no concurrent writer extends src.
-  - **`fs_reflink_locked` unchanged**: seal enforcement + non-EXTENT-
-    source refusal + post-success stamping still runs serially under
-    the caller's lock context (now SH+pins instead of EX).
-  - **Regression tests**: `per_inode_reflink_disjoint_files_shared_parent`
-    (empty-extent reflink share path under SH+pin) +
-    `per_inode_cfr_disjoint_files_shared_parent` (cfr SH+pin happy path
-    including R84 P2-1 size-validation TOCTOU step + out_copied
-    contract; added at R135 close per P2-2) +
-    `fs_reflink_einval_preempts_erofs_on_rofs` in test_fs.c (pins the
-    arg-shape-validation-pre-empts-EROFS priority posture per R135 P2-1).
-  - **R135 audit close** (this commit): 0 P0, 0 P1, 3 P2 — all
-    test/doc-drift. P2-1 (priority shift on wedged/RO + invalid-arg)
-    documented + pinned via the new test. P2-2 (cfr SH+pin path had no
-    concurrent coverage) closed by the new cfr test. P2-3 (docstring
-    said "copy_file_range" but original test used reflink) closed
-    inline.
-  - **ctest 54/54 GREEN** (test_compound_ops_concurrent now 8 cases;
-    test_fs now 160 cases). Rust unit 97/97. e2e_crud 33/33.
-    concurrent_ctl 2/2.
-  - **Next**: impl-5 retires the residual EX-takers (read-only ops
-    + single-inode mutators not yet ported: truncate/fallocate/write/
-    migrate_to_cold/promote_to_hot/create_snapshot/...). impl-6 lands
-    the perf regression test. R136 audit candidate after impl-5.
+- **Tip**: Phase 9.6-impl-1b — the Metadata Tree Engine
+  (`btree_engine`), a new module. A paddr-addressed copy-on-write
+  multi-level B+tree (`v2/src/btree_engine/`, public header
+  `include/stratum/btree_engine.h`, reference
+  [24-btree-engine.md](reference/24-btree-engine.md)) that replaces the
+  `btree_store` whole-tree-rebuild MVP: an in-memory node cache,
+  dirty-tracking, multi-level descent / insert / byte-balanced split
+  (the `btree_store` 2-level cap is gone), and a dirty-only COW commit.
+  - Folds in the `btnode` codec + `btree_store/crypt.c` node-size
+    parameterization — the formerly 128-KiB-fixed codec is now keyed on
+    a per-call `node_size`; legacy callers pass `STM_BTNODE_SIZE`
+    (behaviour byte-identical), the engine encodes 16-KiB nodes.
+  - **Scope boundary**: the incremental-commit machinery — deferred-free
+    of superseded paddrs, three-phase-sync integration, crash-revert —
+    is 9.6-impl-2; large-value spill is 9.6-impl-3; the four-module
+    cutover is 9.6-impl-4. Composes against `btree.tla` (committed at
+    9.6-spec); impl-1b realises the structural substrate the spec's
+    COW-commit invariants build on.
+  - **ctest 63/63 GREEN** — new `test_btree_engine` (14 cases). Every
+    codec/crypt-consuming suite (`test_btnode`, `test_btree_store`,
+    `test_alloc`, `test_sync`, `test_keyschema_rotate`, …) green under
+    the parameterized codec.
+  - **History gap**: the chunks between PARALLEL-3 impl-4 and here —
+    PARALLEL-3 impl-5 / impl-6 + R134–R136, the Thylacine A1–A5
+    series + R137–R148, and Phase 9.6 (design + `btree.tla` spec +
+    impl-1a bootstrap-allocator 16-KiB nodes + R149) — are recorded in
+    the per-section reference docs, `git log`, and the memory index
+    rather than expanded in this Snapshot list.
 
 - **Pre-tip-1**: R134 audit close (`2a117e9`). 0 P0, 0 P1, 3 P2 — all
   test/doc-drift; no impl correctness issue. Closed by adding
@@ -2455,6 +2442,7 @@ reference below covers the as-built layers in bottom-up order.
 | [21-stratumd.md](reference/21-stratumd.md) | Unix-socket daemon transport (P9-9P-4 + P9-CTL-2c + P9.5-PARALLEL-1) | medium |
 | [22-ctl.md](reference/22-ctl.md) | /ctl/ synthetic FS (P9-CTL-1..1e + P9.5-PARALLEL-1) | large |
 | [23-9p_client.md](reference/23-9p_client.md) | libstratum-9p — synchronous 9P2000.L client (P9-LIB-1..1d) | medium |
+| [24-btree-engine.md](reference/24-btree-engine.md) | Metadata Tree Engine — COW B+tree (Phase 9.6-impl-1b) | large |
 
 This is a live document — every phase-chunk commit that touches a
 subsystem updates the corresponding section in the same PR.

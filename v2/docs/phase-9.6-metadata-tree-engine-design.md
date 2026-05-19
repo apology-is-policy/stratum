@@ -256,11 +256,17 @@ the in-memory `btree.c` algorithms (split / merge / lookup logic).
 two-level cap; each module's flat `records[]` array + `*_build_btree_locked`
 transient-rebuild.
 
-**Format**: the `btnode` format largely survives; a node-size change
-(§3.4) and a spill-record kind (§3.8) imply an `STM_BTNODE_VERSION`
-and/or `STM_UB_VERSION` bump. **Migration**: v2 is pre-release (Phase
-9.6 is before Phase 10/11) — a clean version break, no converter; dev
-pools re-format.
+**Format**: the `btnode` format largely survives. The 9.6-impl-1b
+node-size change (§3.4) turned out **format-compatible** — a node is
+self-describing at its own `buf_size` (header + payload + trailing
+csum at every size; the engine's per-child birth-gen lives in the
+`btnode` child bptr's already-reserved `bp_reserved2`), so
+`STM_BTNODE_VERSION` is **not** bumped at impl-1b — a bump would
+needlessly fail every existing 128-KiB node's version check. The
+spill-record kind (§3.8) IS a real format change and carries the
+`STM_BTNODE_VERSION` / `STM_UB_VERSION` bump when 9.6-impl-3 lands.
+**Migration**: v2 is pre-release (Phase 9.6 is before Phase 10/11) —
+a clean version break, no converter; dev pools re-format.
 
 ---
 

@@ -18,17 +18,22 @@
  *     P4-3b). Tag bytes = STM_AEAD_TAG_LEN_AEGIS256 = 32, exactly the
  *     STM_BTNODE_CSUM_SIZE slot.
  *
+ * 9.6-impl-1b: the node image size is a per-call parameter (`node_size`)
+ * — STM_BTNODE_SIZE for the legacy metadata path, ~16 KiB for the COW
+ * B+tree engine. The ciphertext region is node_size - STM_BTNODE_CSUM_SIZE
+ * and the AEAD tag occupies the trailing STM_BTNODE_CSUM_SIZE bytes, at
+ * any node size. The nonce / AD construction is node-size-independent.
+ *
  * In-place semantics (outward): the public API mutates the caller's
  * buffer in place so the serialize / deserialize paths don't have
- * to keep two 128 KiB scratch buffers per node. Internally we go
- * through a heap-allocated intermediate because libsodium's
- * AEGIS-256 does NOT guarantee safety under aliased input/output —
- * the state-update step in the AEGIS round reads the plaintext
- * AFTER the ciphertext write, which clobbers subsequent reads on
- * aliased buffers. Empirically confirmed: with aliased pt/ct, the
- * decrypted plaintext came back as zeros. The intermediate is
- * wiped via `stm_ct_memzero` before free so plaintext key material
- * does not linger in the freed block.
+ * to keep two scratch buffers per node. Internally we go through a
+ * heap-allocated intermediate because libsodium's AEGIS-256 does NOT
+ * guarantee safety under aliased input/output — the state-update step
+ * in the AEGIS round reads the plaintext AFTER the ciphertext write,
+ * which clobbers subsequent reads on aliased buffers. Empirically
+ * confirmed: with aliased pt/ct, the decrypted plaintext came back as
+ * zeros. The intermediate is wiped via `stm_ct_memzero` before free so
+ * plaintext key material does not linger in the freed block.
  */
 
 #include <stratum/btnode.h>
@@ -38,8 +43,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-
-#define CIPHERTEXT_LEN  (STM_BTNODE_SIZE - STM_BTNODE_CSUM_SIZE)
 
 _Static_assert(STM_AEAD_TAG_LEN_AEGIS256 == STM_BTNODE_CSUM_SIZE,
                "AEGIS-256 tag must fit exactly the btnode's trailing csum slot");
@@ -93,46 +96,49 @@ static void build_ad(const uint64_t pool_uuid[2],
 
 stm_status stm_btree_node_encrypt(const stm_btree_crypt_ctx *cx,
                                     uint64_t paddr, uint64_t gen,
-                                    uint8_t *buf)
+                                    uint8_t *buf, size_t node_size)
 {
     if (!cx || !cx->metadata_key || !buf) return STM_EINVAL;
+    if (node_size < STM_BTNODE_MIN_SIZE) return STM_EINVAL;
+
+    /* Ciphertext region = node minus the trailing tag slot. */
+    size_t ciphertext_len = node_size - STM_BTNODE_CSUM_SIZE;
 
     uint8_t nonce[STM_AEAD_NONCE_LEN];
     uint8_t ad[AD_LEN];
     build_nonce(paddr, gen, cx->pool_uuid, nonce);
     build_ad(cx->pool_uuid, cx->device_uuid, ad);
 
-    /* Heap scratch for the plaintext input (see module comment). The
-     * commit hot path allocates one 128 KiB block per node; the
-     * allocator commit already does this (serialize's outer scratch),
-     * so the O(nodes) extra allocation is in the noise. If this
-     * shows up in profiles later, pass a caller-owned scratch
-     * through the serialize path to amortize. */
-    uint8_t *pt = malloc(CIPHERTEXT_LEN);
+    /* Heap scratch for the plaintext input (see module comment). */
+    uint8_t *pt = malloc(ciphertext_len);
     if (!pt) return STM_ENOMEM;
-    memcpy(pt, buf, CIPHERTEXT_LEN);
+    memcpy(pt, buf, ciphertext_len);
 
     size_t out_len = 0;
     stm_status s = stm_aead_encrypt(STM_AEAD_AEGIS256,
                                       cx->metadata_key, nonce,
                                       ad, AD_LEN,
-                                      pt, CIPHERTEXT_LEN,
+                                      pt, ciphertext_len,
                                       buf, &out_len);
     /* pt held plaintext key material (btnode headers + keys +
      * values). Wipe before free so freed-memory scans can't recover
      * tree contents. */
-    stm_ct_memzero(pt, CIPHERTEXT_LEN);
+    stm_ct_memzero(pt, ciphertext_len);
     free(pt);
     if (s != STM_OK) return s;
-    if (out_len != STM_BTNODE_SIZE) return STM_EBACKEND;
+    /* AEAD output = ciphertext + tag = node_size bytes. */
+    if (out_len != node_size) return STM_EBACKEND;
     return STM_OK;
 }
 
 stm_status stm_btree_node_decrypt(const stm_btree_crypt_ctx *cx,
                                     uint64_t paddr, uint64_t gen,
-                                    uint8_t *buf)
+                                    uint8_t *buf, size_t node_size)
 {
     if (!cx || !cx->metadata_key || !buf) return STM_EINVAL;
+    if (node_size < STM_BTNODE_MIN_SIZE) return STM_EINVAL;
+
+    size_t ciphertext_len = node_size - STM_BTNODE_CSUM_SIZE;
 
     uint8_t nonce[STM_AEAD_NONCE_LEN];
     uint8_t ad[AD_LEN];
@@ -143,18 +149,18 @@ stm_status stm_btree_node_decrypt(const stm_btree_crypt_ctx *cx,
      * aegis256_decrypt verifies the tag before committing any
      * plaintext, so a tag-fail leaves buf in undefined state (the
      * caller must discard it). */
-    uint8_t *ct = malloc(STM_BTNODE_SIZE);
+    uint8_t *ct = malloc(node_size);
     if (!ct) return STM_ENOMEM;
-    memcpy(ct, buf, STM_BTNODE_SIZE);
+    memcpy(ct, buf, node_size);
 
     size_t pt_len = 0;
     stm_status s = stm_aead_decrypt(STM_AEAD_AEGIS256,
                                       cx->metadata_key, nonce,
                                       ad, AD_LEN,
-                                      ct, STM_BTNODE_SIZE,
+                                      ct, node_size,
                                       buf, &pt_len);
     free(ct);
     if (s != STM_OK) return s;
-    if (pt_len != CIPHERTEXT_LEN) return STM_EBACKEND;
+    if (pt_len != ciphertext_len) return STM_EBACKEND;
     return STM_OK;
 }
