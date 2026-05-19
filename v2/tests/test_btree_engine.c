@@ -1,21 +1,24 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * Metadata Tree Engine tests (Phase 9.6-impl-1b).
+ * Metadata Tree Engine tests (Phase 9.6-impl-2).
  *
- * Exercises the standalone COW B+tree engine through an in-RAM node
- * store (the engine is allocator-agnostic — it talks to storage only
- * through the stm_btree_store_vtable; wiring the real stm_bootstrap
- * allocator is 9.6-impl-2):
+ * Exercises the COW B+tree engine through an in-RAM node store (the
+ * engine is allocator-agnostic — it talks to storage only through the
+ * stm_btree_store_vtable; the in-RAM store also models deferred-free,
+ * recording vt->free without deleting the slot):
  *
  *   - create / insert / lookup / upsert round-trips
  *   - many-entry inserts in ascending, descending, and shuffled order
  *   - multi-level splits force a height >= 3 tree (the 2-level cap is
- *     gone) — the headline impl-1b deliverable
+ *     gone)
  *   - commit writes the tree out; open + scan + verify reads it back
- *   - incremental commit: a second commit rewrites the root and shares
- *     the unchanged subtrees; the prior root stays readable
+ *   - incremental commit: a second commit rewrites only the dirty
+ *     root-to-leaf path, shares the unchanged subtrees, and hands the
+ *     superseded paddrs back to the allocator (deferred-free)
+ *   - three-phase commit: flush / finalize / abort, the pending-commit
+ *     STM_EBUSY window, and crash-revert to the last durable root
  *   - ciphertext tamper is caught by the Merkle chain
- *   - argument validation + the impl-1b oversize-entry bound
+ *   - argument validation + the oversize-entry bound
  */
 #include "tharness.h"
 #include <stratum/btree_engine.h>
@@ -33,19 +36,33 @@
 /* In-RAM node store — the test's stm_btree_store_vtable backing.              */
 /* ========================================================================= */
 
+/* One recorded deferred-free: vt->free(paddr, free_gen). */
+typedef struct { uint64_t paddr; uint64_t free_gen; } memfree;
+
 typedef struct {
     uint8_t **slots;          /* one STM_BTREE_ENGINE_NODE_SIZE buffer each */
     size_t    n;
     size_t    cap;
     uint64_t  next_paddr;     /* monotonic; paddr P -> slot index P-1       */
+
+    /* impl-2 deferred-free tracking: memstore_free records (paddr,
+     * free_gen) here but does NOT delete the slot — deferred-free keeps
+     * the bytes readable (a prior root must stay openable) until a real
+     * allocator sweep, which is stm_bootstrap's job, not the engine's. */
+    memfree  *freed;
+    size_t    n_freed;
+    size_t    freed_cap;
+
+    /* One-shot write-fault injection: -1 = disarmed; >= 0 = the next
+     * `fail_after` writes succeed and the one after that fails once
+     * (then re-disarms). Exercises the failed-flush crash-revert path. */
+    int64_t   fail_after;
 } memstore;
 
 static void memstore_init(memstore *ms)
 {
-    ms->slots = NULL;
-    ms->n = 0;
-    ms->cap = 0;
-    ms->next_paddr = 0;
+    *ms = (memstore){ 0 };
+    ms->fail_after = -1;                   /* fault injection disarmed */
 }
 
 static void memstore_destroy(memstore *ms)
@@ -53,8 +70,8 @@ static void memstore_destroy(memstore *ms)
     for (size_t i = 0; i < ms->n; i++)
         free(ms->slots[i]);
     free(ms->slots);
-    ms->slots = NULL;
-    ms->n = ms->cap = 0;
+    free(ms->freed);
+    *ms = (memstore){ 0 };
 }
 
 /* Direct buffer access — for the tamper test. */
@@ -83,10 +100,38 @@ static stm_status memstore_reserve(void *ctx, uint64_t *out_paddr)
 
 static stm_status memstore_free(void *ctx, uint64_t paddr, uint64_t free_gen)
 {
-    /* impl-1b never frees through the vtable; the engine leaks
-     * superseded paddrs (impl-2 wires deferred-free). No-op. */
-    (void)ctx; (void)paddr; (void)free_gen;
+    /* Deferred-free: record (paddr, free_gen) but leave the slot buffer
+     * in place — the bytes stay readable until a real allocator sweep.
+     * That models stm_bootstrap_free, and lets a test both assert which
+     * paddrs were superseded AND still open a prior root. */
+    memstore *ms = ctx;
+    if (paddr == 0 || paddr > ms->n) return STM_EINVAL;
+    if (ms->n_freed == ms->freed_cap) {
+        size_t nc = ms->freed_cap ? ms->freed_cap * 2 : 16;
+        memfree *p = realloc(ms->freed, nc * sizeof *p);
+        if (!p) return STM_ENOMEM;
+        ms->freed = p;
+        ms->freed_cap = nc;
+    }
+    ms->freed[ms->n_freed++] = (memfree){ .paddr = paddr, .free_gen = free_gen };
     return STM_OK;
+}
+
+/* Number of vt->free calls recorded so far. */
+static size_t memstore_freed_count(const memstore *ms) { return ms->n_freed; }
+
+/* Was `paddr` handed to vt->free? On a hit, *out_free_gen (if non-NULL)
+ * gets the free_gen of the first matching record. */
+static bool memstore_was_freed(const memstore *ms, uint64_t paddr,
+                                uint64_t *out_free_gen)
+{
+    for (size_t i = 0; i < ms->n_freed; i++) {
+        if (ms->freed[i].paddr == paddr) {
+            if (out_free_gen) *out_free_gen = ms->freed[i].free_gen;
+            return true;
+        }
+    }
+    return false;
 }
 
 static stm_status memstore_write(void *ctx, uint64_t paddr,
@@ -95,6 +140,13 @@ static stm_status memstore_write(void *ctx, uint64_t paddr,
     memstore *ms = ctx;
     if (paddr == 0 || paddr > ms->n) return STM_EINVAL;
     if (len > STM_BTREE_ENGINE_NODE_SIZE) return STM_EINVAL;
+    /* One-shot fault injection: when armed, count down `fail_after`
+     * successful writes, then fail the next one once (and disarm). */
+    if (ms->fail_after == 0) {
+        ms->fail_after = -1;               /* one-shot — disarm */
+        return STM_EBACKEND;
+    }
+    if (ms->fail_after > 0) ms->fail_after--;
     memcpy(ms->slots[paddr - 1], buf, len);
     return STM_OK;
 }
@@ -827,6 +879,478 @@ STM_TEST(engine_corrupt_kind_mismatch_rejected) {
     scan_ctx_free(&sc);
     stm_btree_engine_destroy(eng);
 
+    memstore_destroy(&ms);
+}
+
+/* ========================================================================= */
+/* Tests — 9.6-impl-2 incremental commit: deferred-free, three-phase, abort.    */
+/* ========================================================================= */
+
+STM_TEST(engine_commit_deferred_free) {
+    /* Incremental COW: a second commit rewrites only the dirty
+     * root-to-leaf path and hands the SUPERSEDED paddrs back to the
+     * allocator (deferred-free). The shared/clean subtrees are neither
+     * rewritten nor freed — btree.tla::FreedNodesNotReachable. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    /* 10 entries x 4000-byte values overflow one leaf into a height-2
+     * tree: an internal root over multiple leaves. */
+    enum { N = 10, VLEN = 4000 };
+    uint8_t val[VLEN];
+    for (uint32_t i = 0; i < N; i++) {
+        uint8_t key[4];
+        be32_key(i, key);
+        memset(val, (int)(i & 0xFFu), sizeof val);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, val, sizeof val));
+    }
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_EQ(st.n_keys, (uint64_t)N);
+    STM_ASSERT_TRUE(st.height == 2u);         /* internal root + leaves */
+
+    /* First commit: every node is RAM-fresh (paddr 0) — nothing is
+     * superseded, so nothing is freed. */
+    uint64_t rp1 = 0;
+    uint8_t  rc1[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp1, rc1));
+    STM_ASSERT_EQ(memstore_freed_count(&ms), (size_t)0);
+
+    /* Upsert one existing key with a same-size value: rewrites exactly
+     * the leaf holding it (no split) plus the root — 2 COWed nodes. */
+    uint8_t key3[4];
+    be32_key(3, key3);
+    uint8_t newval[VLEN];
+    memset(newval, 0x77, sizeof newval);
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, key3, 4, newval, sizeof newval));
+
+    uint64_t rp2 = 0;
+    uint8_t  rc2[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &rp2, rc2));
+
+    /* The root was copied on write. */
+    STM_ASSERT(rp2 != rp1);
+    /* Exactly two paddrs superseded — the rewritten leaf + the old
+     * root. The other leaves were shared, NOT freed. */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), (size_t)2);
+    /* The old root is among them, freed at the commit's gen. */
+    uint64_t fg = 0;
+    STM_ASSERT_TRUE(memstore_was_freed(&ms, rp1, &fg));
+    STM_ASSERT_EQ(fg, UINT64_C(2));
+    /* The new root is live — never freed. */
+    STM_ASSERT_TRUE(!memstore_was_freed(&ms, rp2, NULL));
+    stm_btree_engine_destroy(eng);
+
+    /* Deferred-free keeps the bytes: the PRIOR root still opens, still
+     * verifies, and still holds key 3's OLD value. */
+    stm_btree_engine *e1 = NULL;
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         rp1, 1, rc1, &e1));
+    STM_ASSERT_OK(stm_btree_engine_verify(e1));
+    bool found = false;
+    void *got = NULL;
+    size_t glen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(e1, key3, 4, &found, &got, &glen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ(glen, (size_t)VLEN);
+    STM_ASSERT(got && ((uint8_t *)got)[0] == (uint8_t)3);    /* old value */
+    free(got);
+    stm_btree_engine_destroy(e1);
+
+    /* The new root holds key 3's NEW value. */
+    stm_btree_engine *e2 = NULL;
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         rp2, 2, rc2, &e2));
+    STM_ASSERT_OK(stm_btree_engine_verify(e2));
+    found = false; got = NULL; glen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(e2, key3, 4, &found, &got, &glen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT(got && ((uint8_t *)got)[0] == 0x77);          /* new value */
+    free(got);
+    stm_btree_engine_destroy(e2);
+
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_commit_phased_flush_finalize) {
+    /* The three-phase commit: flush returns the prospective root and
+     * opens a pending-commit window in which every op except finalize/
+     * abort is STM_EBUSY; finalize publishes the flushed root. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "alpha", 5, "one", 3));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "beta",  4, "two", 3));
+
+    /* Flush phase — writes the dirty nodes, returns the PROSPECTIVE
+     * root, opens the pending-commit window. */
+    uint64_t fp = 0, fgg = 0;
+    uint8_t  fc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 7, &fp, &fgg, fc));
+    STM_ASSERT_EQ(fgg, UINT64_C(7));
+
+    /* The window: every op except finalize/abort is STM_EBUSY. */
+    uint64_t gp = 0, gg = 0;
+    uint8_t  gc[32];
+    STM_ASSERT_ERR(stm_btree_engine_get_root(eng, &gp, &gg, gc), STM_EBUSY);
+    STM_ASSERT_ERR(stm_btree_engine_verify(eng), STM_EBUSY);
+    STM_ASSERT_ERR(stm_btree_engine_insert(eng, "c", 1, "v", 1), STM_EBUSY);
+    bool found = false;
+    void *val = NULL;
+    size_t vlen = 0;
+    STM_ASSERT_ERR(stm_btree_engine_lookup(eng, "alpha", 5,
+                                            &found, &val, &vlen), STM_EBUSY);
+    scan_ctx sc = { .sorted = true };
+    STM_ASSERT_ERR(stm_btree_engine_scan(eng, scan_check_cb, &sc), STM_EBUSY);
+    scan_ctx_free(&sc);
+    stm_btree_engine_stats st;
+    STM_ASSERT_ERR(stm_btree_engine_stats_get(eng, &st), STM_EBUSY);
+    uint64_t xp = 0, xg = 0;
+    uint8_t  xc[32];
+    STM_ASSERT_ERR(stm_btree_engine_commit(eng, 8, &xp, xc), STM_EBUSY);
+    STM_ASSERT_ERR(stm_btree_engine_commit_flush(eng, 8, &xp, &xg, xc),
+                   STM_EBUSY);
+
+    /* Final phase — publishes the flushed root. */
+    STM_ASSERT_OK(stm_btree_engine_commit_finalize(eng));
+    /* finalize/abort with no commit pending now → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_btree_engine_commit_finalize(eng), STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_commit_abort(eng), STM_EINVAL);
+
+    /* The published root is exactly what flush returned. */
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+    STM_ASSERT_EQ(gp, fp);
+    STM_ASSERT_EQ(gg, fgg);
+    STM_ASSERT(memcmp(gc, fc, 32) == 0);
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "alpha", 5,
+                                           &found, &val, &vlen));
+    STM_ASSERT_TRUE(found);
+    free(val);
+
+    /* A no-op flush of the now-all-clean tree still opens a window that
+     * finalize closes; the root keeps its prior write gen. */
+    uint64_t np = 0, ng = 0;
+    uint8_t  nc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 9, &np, &ng, nc));
+    STM_ASSERT_EQ(np, fp);                    /* root unchanged */
+    STM_ASSERT_EQ(ng, UINT64_C(7));           /* root keeps its write gen */
+    STM_ASSERT_OK(stm_btree_engine_commit_finalize(eng));
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_commit_abort_reverts) {
+    /* btree.tla::Crash — a flush followed by abort reverts to the last
+     * durable root, reclaims the flushed-but-unrooted nodes, and leaves
+     * the engine usable. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "a", 1, "1", 1));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "b", 1, "2", 1));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "c", 1, "3", 1));
+    uint64_t rp1 = 0;
+    uint8_t  rc1[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp1, rc1));
+
+    /* Insert one more key, flush at gen 2 — but then abort. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "d", 1, "4", 1));
+    uint64_t fp = 0, fg = 0;
+    uint8_t  fc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 2, &fp, &fg, fc));
+    STM_ASSERT(fp != rp1);                    /* a fresh prospective root */
+
+    size_t freed_before = memstore_freed_count(&ms);
+    STM_ASSERT_OK(stm_btree_engine_commit_abort(eng));
+
+    /* The durable root is UNCHANGED — reverted to commit 1. */
+    uint64_t gp = 0, gg = 0;
+    uint8_t  gc[32];
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+    STM_ASSERT_EQ(gp, rp1);
+    STM_ASSERT_EQ(gg, UINT64_C(1));
+    STM_ASSERT(memcmp(gc, rc1, 32) == 0);
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+
+    /* The aborted commit's freshly-written nodes were reclaimed. */
+    STM_ASSERT_TRUE(memstore_freed_count(&ms) > freed_before);
+
+    /* "d" is gone (the in-memory tree was dropped, the durable root
+     * reloaded); the committed keys survive. */
+    bool found = true;
+    void *val = NULL;
+    size_t vlen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "d", 1, &found, &val, &vlen));
+    STM_ASSERT_TRUE(!found);
+    found = false;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "a", 1, &found, &val, &vlen));
+    STM_ASSERT_TRUE(found);
+    free(val);
+
+    /* The engine is still usable — and gen 2 is free to reuse (the
+     * aborted flush never advanced the durable gen). */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "d", 1, "4", 1));
+    uint64_t rp2 = 0;
+    uint8_t  rc2[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &rp2, rc2));
+    found = false;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "d", 1, &found, &val, &vlen));
+    STM_ASSERT_TRUE(found);
+    free(val);
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_commit_abort_uncommitted) {
+    /* Aborting the first-ever commit's flush: the tree has no durable
+     * root to fall back to, so it reverts to empty + uncommitted, and
+     * the engine stays usable (load_root lazily re-creates the leaf). */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "x", 1, "1", 1));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "y", 1, "2", 1));
+
+    uint64_t fp = 0, fg = 0;
+    uint8_t  fc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 1, &fp, &fg, fc));
+    STM_ASSERT_OK(stm_btree_engine_commit_abort(eng));
+
+    /* Still no durable root — the abort reverted the first commit. */
+    uint64_t gp = 0, gg = 0;
+    uint8_t  gc[32];
+    STM_ASSERT_ERR(stm_btree_engine_get_root(eng, &gp, &gg, gc), STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_verify(eng), STM_EINVAL);
+
+    /* The tree is empty again. */
+    bool found = true;
+    void *val = NULL;
+    size_t vlen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "x", 1, &found, &val, &vlen));
+    STM_ASSERT_TRUE(!found);
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_EQ(st.n_keys, UINT64_C(0));
+
+    /* The flushed nodes were reclaimed. */
+    STM_ASSERT_TRUE(memstore_freed_count(&ms) > 0);
+
+    /* The engine is usable — gen 1 is free to reuse (no durable root
+     * was ever advanced). */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "z", 1, "9", 1));
+    uint64_t rp = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+    found = false;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "z", 1, &found, &val, &vlen));
+    STM_ASSERT_TRUE(found);
+    free(val);
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_commit_destroy_aborts_pending) {
+    /* destroy() with a flushed-but-unfinalized commit implicitly aborts
+     * it — the flushed-but-unrooted paddrs are reclaimed, not leaked. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, "v", 1));
+    uint64_t fp = 0, fg = 0;
+    uint8_t  fc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 1, &fp, &fg, fc));
+
+    /* Nothing freed yet — flush only writes; finalize/abort free. */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), (size_t)0);
+
+    stm_btree_engine_destroy(eng);             /* implicit abort */
+
+    /* The flushed node was handed back — not leaked. */
+    STM_ASSERT_TRUE(memstore_freed_count(&ms) > 0);
+
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_phased_invalid_args) {
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+
+    uint64_t p = 0, g = 0;
+    uint8_t  c[32];
+
+    /* NULL-argument matrix for the phased API. */
+    STM_ASSERT_ERR(stm_btree_engine_commit_flush(NULL, 1, &p, &g, c),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_commit_finalize(NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_commit_abort(NULL), STM_EINVAL);
+
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    STM_ASSERT_ERR(stm_btree_engine_commit_flush(eng, 1, NULL, &g, c),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_commit_flush(eng, 1, &p, NULL, c),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_commit_flush(eng, 1, &p, &g, NULL),
+                   STM_EINVAL);
+
+    /* finalize / abort with no commit pending. */
+    STM_ASSERT_ERR(stm_btree_engine_commit_finalize(eng), STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_commit_abort(eng), STM_EINVAL);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_commit_failed_flush_reverts) {
+    /* A device write error mid-flush is the in-process crash: the
+     * commit fails, the durable root is untouched, the nodes written
+     * before the failure are reclaimed, and the engine stays usable
+     * (R151 P3-2 — the failed-flush crash-revert path). */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    /* A height >= 2 tree so the upsert's COW path is >= 2 nodes — at
+     * least one node is written before the failing one. */
+    enum { N = 10, VLEN = 4000 };
+    uint8_t val[VLEN];
+    for (uint32_t i = 0; i < N; i++) {
+        uint8_t key[4];
+        be32_key(i, key);
+        memset(val, (int)(i & 0xFFu), sizeof val);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, val, sizeof val));
+    }
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_TRUE(st.height >= 2u);
+    uint64_t rp1 = 0;
+    uint8_t  rc1[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp1, rc1));
+
+    /* Re-dirty one leaf (upsert, same-size value — no split), then make
+     * the SECOND write of the next commit fail: one node lands, the
+     * next does not — a genuine partial flush. */
+    uint8_t key3[4];
+    be32_key(3, key3);
+    uint8_t newval[VLEN];
+    memset(newval, 0x77, sizeof newval);
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, key3, 4, newval, sizeof newval));
+
+    size_t freed_before = memstore_freed_count(&ms);
+    ms.fail_after = 1;                        /* 1 write lands, the 2nd fails */
+    uint64_t rp2 = 0;
+    uint8_t  rc2[32];
+    STM_ASSERT_ERR(stm_btree_engine_commit(eng, 2, &rp2, rc2), STM_EBACKEND);
+
+    /* The failed commit reclaims two distinct paddrs: the node written
+     * before the failure (handed back by the failed-flush handler) and
+     * the failing node's reserved-but-never-written paddr (eng_node_write
+     * hands its own reserve back on a write error). No leak, no
+     * double-free — disjoint paddrs. */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), freed_before + 2u);
+
+    /* The durable root is untouched — still commit 1 — and intact. */
+    uint64_t gp = 0, gg = 0;
+    uint8_t  gc[32];
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+    STM_ASSERT_EQ(gp, rp1);
+    STM_ASSERT_EQ(gg, UINT64_C(1));
+    STM_ASSERT(memcmp(gc, rc1, 32) == 0);
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+
+    /* The in-memory tree was dropped, so the failed upsert is gone —
+     * key 3 reverts to its committed value. */
+    bool found = false;
+    void *got = NULL;
+    size_t glen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, key3, 4, &found, &got, &glen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT(got && ((uint8_t *)got)[0] == (uint8_t)3);
+    free(got);
+
+    /* The engine is usable — retry the commit (the fault disarmed
+     * itself), it succeeds. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, key3, 4, newval, sizeof newval));
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &rp2, rc2));
+    STM_ASSERT(rp2 != rp1);
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    found = false; got = NULL; glen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, key3, 4, &found, &got, &glen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT(got && ((uint8_t *)got)[0] == 0x77);
+    free(got);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_commit_deferred_free_three) {
+    /* Three commits down one chain: each commit supersedes exactly the
+     * paddr the PREVIOUS commit wrote — never an older one — so no
+     * paddr is freed twice across the chain (R151 P3-2 — the
+     * no-double-free-across-commits property). */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, "v0", 2));
+    uint64_t rp1 = 0;
+    uint8_t  rc1[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp1, rc1));
+    STM_ASSERT_EQ(memstore_freed_count(&ms), (size_t)0);   /* nothing superseded */
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, "v1", 2));
+    uint64_t rp2 = 0;
+    uint8_t  rc2[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &rp2, rc2));
+    /* commit 2 supersedes commit 1's root (a one-node tree). */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), (size_t)1);
+    STM_ASSERT_TRUE(memstore_was_freed(&ms, rp1, NULL));
+
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, "v2", 2));
+    uint64_t rp3 = 0;
+    uint8_t  rc3[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 3, &rp3, rc3));
+    /* commit 3 supersedes commit 2's root — NOT commit 1's (already
+     * freed). Exactly one new free; the count of 2 (not 3) proves rp1
+     * was not freed a second time. */
+    STM_ASSERT_EQ(memstore_freed_count(&ms), (size_t)2);
+    STM_ASSERT_TRUE(memstore_was_freed(&ms, rp2, NULL));
+
+    /* The three roots are distinct; rp3 (the live one) is never freed. */
+    STM_ASSERT(rp1 != rp2 && rp2 != rp3 && rp1 != rp3);
+    STM_ASSERT_TRUE(!memstore_was_freed(&ms, rp3, NULL));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+
+    bool found = false;
+    void *got = NULL;
+    size_t glen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "k", 1, &found, &got, &glen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT(got && glen == 2 && memcmp(got, "v2", 2) == 0);
+    free(got);
+
+    stm_btree_engine_destroy(eng);
     memstore_destroy(&ms);
 }
 

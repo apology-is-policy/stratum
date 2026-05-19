@@ -38,34 +38,41 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: Phase 9.6-impl-1b — the Metadata Tree Engine
-  (`btree_engine`), a new module. A paddr-addressed copy-on-write
-  multi-level B+tree (`v2/src/btree_engine/`, public header
+- **Tip**: Phase 9.6-impl-2 — incremental copy-on-write commit for the
+  Metadata Tree Engine (`btree_engine`). The engine
+  (`v2/src/btree_engine/`, public header
   `include/stratum/btree_engine.h`, reference
-  [24-btree-engine.md](reference/24-btree-engine.md)) that replaces the
-  `btree_store` whole-tree-rebuild MVP: an in-memory node cache,
+  [24-btree-engine.md](reference/24-btree-engine.md)) is a
+  paddr-addressed copy-on-write multi-level B+tree that replaces the
+  `btree_store` whole-tree-rebuild MVP — an in-memory node cache,
   dirty-tracking, multi-level descent / insert / byte-balanced split
   (the `btree_store` 2-level cap is gone), and a dirty-only COW commit.
-  - Folds in the `btnode` codec + `btree_store/crypt.c` node-size
+  - **impl-2** adds incremental commit: a commit COWs only the dirty
+    root-to-leaf paths and deferred-frees the superseded paddrs; the
+    `commit_flush` / `commit_finalize` / `commit_abort` three-phase
+    split composes with the three-phase sync and reverts cleanly on a
+    crash before the final phase. Composes against `btree.tla`
+    (`WriteNode` / `FinalCommit` / `Crash`; TLC-green, 3 buggy configs)
+    — the chunk where the spec's `DurableTreeWellFormed` /
+    `CommittedTreeMerkleConsistent` / `FreedNodesNotReachable`
+    invariants become load-bearing in code.
+  - **impl-1b** (the prior chunk) built the structural engine and
+    folded in the `btnode` codec + `btree_store/crypt.c` node-size
     parameterization — the formerly 128-KiB-fixed codec is now keyed on
-    a per-call `node_size`; legacy callers pass `STM_BTNODE_SIZE`
-    (behaviour byte-identical), the engine encodes 16-KiB nodes.
-  - **Scope boundary**: the incremental-commit machinery — deferred-free
-    of superseded paddrs, three-phase-sync integration, crash-revert —
-    is 9.6-impl-2; large-value spill is 9.6-impl-3; the four-module
-    cutover is 9.6-impl-4. Composes against `btree.tla` (committed at
-    9.6-spec); impl-1b realises the structural substrate the spec's
-    COW-commit invariants build on.
-  - **ctest 63/63 GREEN** — new `test_btree_engine` (14 cases). Every
-    codec/crypt-consuming suite (`test_btnode`, `test_btree_store`,
-    `test_alloc`, `test_sync`, `test_keyschema_rotate`, …) green under
-    the parameterized codec.
+    a per-call `node_size` (legacy callers pass `STM_BTNODE_SIZE`,
+    byte-identical; the engine encodes 16-KiB nodes).
+  - **Scope boundary**: large-value spill is 9.6-impl-3; the four-module
+    cutover — wiring the real `stm_bootstrap`-backed vtable into the
+    three-phase sync — is 9.6-impl-4.
+  - **ctest 63/63 GREEN** — `test_btree_engine` 22 cases (16 structural
+    + 6 impl-2: deferred-free, three-phase flush / finalize / abort,
+    crash-revert).
   - **History gap**: the chunks between PARALLEL-3 impl-4 and here —
     PARALLEL-3 impl-5 / impl-6 + R134–R136, the Thylacine A1–A5
     series + R137–R148, and Phase 9.6 (design + `btree.tla` spec +
-    impl-1a bootstrap-allocator 16-KiB nodes + R149) — are recorded in
-    the per-section reference docs, `git log`, and the memory index
-    rather than expanded in this Snapshot list.
+    impl-1a bootstrap-allocator 16-KiB nodes + R149, impl-1b + R150) —
+    are recorded in the per-section reference docs, `git log`, and the
+    memory index rather than expanded in this Snapshot list.
 
 - **Pre-tip-1**: R134 audit close (`2a117e9`). 0 P0, 0 P1, 3 P2 — all
   test/doc-drift; no impl correctness issue. Closed by adding

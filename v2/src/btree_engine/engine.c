@@ -16,6 +16,15 @@
  * Every node on a mutated root-to-leaf path is marked dirty; commit
  * walks bottom-up, writing each dirty node to a fresh paddr and
  * skipping clean subtrees entirely.
+ *
+ * Commit is incremental and three-phase (9.6-impl-2): a flush writes
+ * the dirty nodes and records every node's superseded + fresh paddr;
+ * a finalize publishes the new root and deferred-frees the superseded
+ * paddrs; an abort discards the flush, deferred-frees the fresh
+ * paddrs, and reverts to the previous durable root — the crash-revert
+ * path. The model is v2/specs/btree.tla (WriteNode / FinalCommit /
+ * Crash + DurableTreeWellFormed / CommittedTreeMerkleConsistent /
+ * FreedNodesNotReachable).
  */
 
 #include "engine_internal.h"
@@ -40,6 +49,14 @@ typedef struct {
     uint8_t  *sep_key;      /* owned — ownership passes to the splice */
     uint32_t  sep_len;
 } split_result;
+
+/* Pending-commit bookkeeping — defined in the Commit section below;
+ * forward-declared so stm_btree_engine_destroy can implicitly abort a
+ * flushed-but-unfinalized commit. */
+static void pending_reset(eng_pending *p);
+static void pending_free_paddrs(stm_btree_engine *eng,
+                                 const uint64_t *paddrs, uint32_t n,
+                                 uint64_t free_gen);
 
 /* ========================================================================= */
 /* Lifecycle.                                                                  */
@@ -106,6 +123,16 @@ stm_status stm_btree_engine_open(const stm_btree_store_vtable *vt,
 void stm_btree_engine_destroy(stm_btree_engine *eng)
 {
     if (!eng) return;
+    /* A commit flushed but never finalized/aborted: hand the
+     * flushed-but-unrooted paddrs back to the allocator (deferred-free)
+     * so they do not leak on disk — an implicit abort. The pending
+     * tracking arrays themselves are freed by pending_reset; when no
+     * commit is pending those arrays are already NULL. */
+    if (eng->pending.active) {
+        pending_free_paddrs(eng, eng->pending.fresh,
+                            eng->pending.n_fresh, eng->pending.gen);
+        pending_reset(&eng->pending);
+    }
     eng_node_free_recursive(eng->root);    /* frees every in-memory node */
     eng_cache_destroy(&eng->cache);        /* frees the index, not nodes */
     free(eng);
@@ -120,6 +147,19 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
 static stm_status load_root(stm_btree_engine *eng, eng_node **out)
 {
     if (eng->root) { *out = eng->root; return STM_OK; }
+
+    /* No in-memory root and no durable root: a never-committed tree
+     * whose in-memory root a failed flush / commit_abort dropped (see
+     * invalidate_memtree). Re-create the empty-leaf root that
+     * stm_btree_engine_create starts from — the tree is empty again,
+     * which is the correct post-crash state of an uncommitted tree. */
+    if (!eng->has_durable_root) {
+        eng_node *e = eng_node_new_leaf();
+        if (!e) return STM_ENOMEM;
+        eng->root = e;
+        *out = e;
+        return STM_OK;
+    }
 
     eng_node *r = NULL;
     stm_status s = eng_node_read(eng, eng->root_paddr, eng->root_gen,
@@ -238,9 +278,13 @@ stm_status stm_btree_engine_insert(stm_btree_engine *eng,
     if (key_len   && !key)          return STM_EINVAL;
     if (value_len && !value)        return STM_EINVAL;
 
-    /* Entry-size bound — impl-3 large-value spill lifts this. */
+    /* Entry-size bound — impl-3 large-value spill lifts this. The
+     * arg-shape checks above pre-empt STM_EBUSY (R135 doctrine). */
     size_t entry = (size_t)STM_BTNODE_ENTRY_HDR_SIZE + key_len + value_len;
     if (entry > ENG_MAX_ITEM_BYTES) return STM_ERANGE;
+
+    /* No mutation inside a flushed-but-unfinalized commit window. */
+    if (eng->pending.active)        return STM_EBUSY;
 
     eng_node *root = NULL;
     stm_status s = load_root(eng, &root);
@@ -286,6 +330,7 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
     *out_found     = false;
     *out_value     = NULL;
     *out_value_len = 0;
+    if (eng->pending.active) return STM_EBUSY;
 
     eng_node *node = NULL;
     stm_status s = load_root(eng, &node);
@@ -315,24 +360,118 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
 }
 
 /* ========================================================================= */
-/* Commit.                                                                     */
+/* Commit — incremental COW, three-phase (flush / finalize / abort).            */
 /* ========================================================================= */
+
+/* Free both paddr-tracking arrays and zero the pending record. */
+static void pending_reset(eng_pending *p)
+{
+    free(p->superseded);
+    free(p->fresh);
+    p->superseded   = NULL;
+    p->fresh        = NULL;
+    p->n_superseded = 0;
+    p->n_fresh      = 0;
+    p->cap          = 0;
+    p->active       = false;
+}
+
+/*
+ * Hand a set of paddrs back to the allocator (deferred-free, stamped
+ * `free_gen`). Best-effort: a vt->free failure is a (rare) reclaim
+ * miss, never a correctness fault, and must not fail a finalize/abort
+ * whose primary effect — publish the new root, or revert to the old —
+ * is already decided.
+ */
+static void pending_free_paddrs(stm_btree_engine *eng,
+                                 const uint64_t *paddrs, uint32_t n,
+                                 uint64_t free_gen)
+{
+    if (!eng->vt->free) return;
+    for (uint32_t i = 0; i < n; i++)
+        (void)eng->vt->free(eng->vt_ctx, paddrs[i], free_gen);
+}
+
+/*
+ * Drop every node-cache entry. The cache is non-owning — it never frees
+ * a node — so this releases only the index structs; node lifetime is
+ * the in-memory tree. Called wherever the set of live paddrs shifts out
+ * from under the cache: commit_finalize (the superseded paddrs are now
+ * freed) and invalidate_memtree. Without the finalize reset the cache
+ * would keep entries keyed by freed paddrs, and once the allocator
+ * recycles a freed paddr (impl-4) a stale hit would mis-fire
+ * load_child's duplicate-paddr gate (R151 P3-1).
+ */
+static void cache_reset(stm_btree_engine *eng)
+{
+    eng_cache_destroy(&eng->cache);
+    eng_cache_init(&eng->cache);
+}
+
+/*
+ * Drop the in-memory tree and the node cache. The durable root triple
+ * is left untouched, so the next descent reloads it from disk — or, for
+ * a never-committed tree, load_root lazily re-creates an empty leaf.
+ * Called on commit_abort and on a failed flush: both are the
+ * in-process realisation of btree.tla's Crash — the in-flight nodes
+ * are reclaimed and the last durable root is what survives.
+ */
+static void invalidate_memtree(stm_btree_engine *eng)
+{
+    eng_node_free_recursive(eng->root);
+    eng->root = NULL;
+    cache_reset(eng);
+}
+
+/*
+ * Count the dirty nodes reachable from `node` through dirty ancestors —
+ * exactly the set commit_node will rewrite. A clean node short-circuits
+ * (node_insert dirties every ancestor of a mutation, so a clean node
+ * implies a wholly-clean subtree). The count pre-sizes commit_flush's
+ * superseded / fresh arrays so the flush walk's appends are infallible.
+ */
+static stm_status count_dirty(const eng_node *node, uint32_t depth,
+                               uint32_t *n)
+{
+    if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+    if (!node->dirty)          return STM_OK;
+    if (*n == UINT32_MAX)      return STM_ECORRUPT;   /* defensive */
+    (*n)++;
+    if (!node->is_leaf) {
+        uint32_t nc = node->n_pivots + 1u;
+        for (uint32_t i = 0; i < nc; i++) {
+            if (!node->children[i].mem) continue;
+            stm_status s = count_dirty(node->children[i].mem, depth + 1u, n);
+            if (s != STM_OK) return s;
+        }
+    }
+    return STM_OK;
+}
 
 /*
  * Commit `node` and its dirty descendants bottom-up. A clean node (and
  * therefore its wholly-clean subtree — node_insert dirties every
  * ancestor of a mutation) short-circuits with its existing durable
  * paddr / csum, so only dirty root-to-leaf paths are rewritten.
+ *
+ * Each rewritten node's PRIOR paddr (its superseded on-disk location)
+ * and its FRESH paddr are recorded into eng->pending: finalize frees
+ * the superseded set, abort frees the fresh set. A node freshly created
+ * in RAM (a split product, a grown root) has prior paddr 0 — nothing to
+ * supersede, so superseded <= fresh. A clean (shared) subtree is never
+ * recorded, so a freed paddr is never reachable from the new durable
+ * root (btree.tla::FreedNodesNotReachable). The pending arrays were
+ * pre-sized by count_dirty, so the appends are infallible.
+ *
+ * The depth cap is defence in depth: the in-memory tree is built by
+ * node_insert (depth-capped) and load_child (which rejects DAGs /
+ * cycles), so it is always a strict tree of depth <= ENG_MAX_DEPTH.
  */
 static stm_status commit_node(stm_btree_engine *eng, eng_node *node,
                                uint64_t gen, uint32_t depth,
                                uint64_t *out_paddr,
                                uint8_t out_csum[STM_BTNODE_CSUM_SIZE])
 {
-    /* The in-memory tree is built by node_insert (depth-capped) and by
-     * load_child (which rejects DAGs / cycles), so it is always a
-     * strict tree of depth <= ENG_MAX_DEPTH. The cap is defence in
-     * depth against a future mutation path that violates that. */
     if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
 
     if (!node->dirty) {
@@ -357,10 +496,157 @@ static stm_status commit_node(stm_btree_engine *eng, eng_node *node,
         }
     }
 
-    stm_status s = eng_node_write(eng, node, gen);
+    /* Capacity-check the pending arrays BEFORE the write, so a (never-
+     * reached) count_dirty / commit_node traversal divergence cannot
+     * produce an unrecorded — thus unreclaimable — disk write. */
+    eng_pending *p = &eng->pending;
+    if (p->n_fresh >= p->cap) return STM_ECORRUPT;
+    uint64_t old_paddr = node->paddr;      /* 0 for a RAM-fresh node */
+    if (old_paddr != 0 && p->n_superseded >= p->cap) return STM_ECORRUPT;
+
+    stm_status s = eng_node_write(eng, node, gen);   /* assigns a fresh paddr */
     if (s != STM_OK) return s;
+
+    p->fresh[p->n_fresh++] = node->paddr;
+    if (old_paddr != 0)
+        p->superseded[p->n_superseded++] = old_paddr;
+
     *out_paddr = node->paddr;
     memcpy(out_csum, node->csum, STM_BTNODE_CSUM_SIZE);
+    return STM_OK;
+}
+
+stm_status stm_btree_engine_commit_flush(stm_btree_engine *eng, uint64_t gen,
+                                          uint64_t *out_root_paddr,
+                                          uint64_t *out_root_gen,
+                                          uint8_t out_root_csum[32])
+{
+    if (!eng || !out_root_paddr || !out_root_gen || !out_root_csum)
+        return STM_EINVAL;
+    if (eng->pending.active) return STM_EBUSY;
+    /* The commit gen must strictly increase across FINALIZED commits —
+     * node birth-gens (n_gen) are an ordering Phase 9.7's snapshot
+     * retention keys on (design §3.9). It is NOT the source of
+     * AEAD-nonce uniqueness: that rests on the allocator's
+     * free_gen < committed_gen deferred-free discipline (a freed paddr
+     * stays PENDING — un-reclaimable — until an allocator commit past
+     * its free_gen; see commit_finalize / commit_abort and
+     * reference/24 §Commit). An aborted commit does not consume its
+     * gen, so the same gen may be reused by the retried commit. */
+    if (eng->has_durable_root && gen <= eng->root_gen) return STM_EINVAL;
+
+    eng_node *root = NULL;
+    stm_status s = load_root(eng, &root);
+    if (s != STM_OK) return s;             /* no pending window opened */
+
+    /* Pre-size the paddr-tracking arrays from the dirty-node count so
+     * the commit_node walk's appends are infallible (ENOMEM surfaces
+     * only here). p is zeroed — calloc at create/open, pending_reset
+     * after every commit, and after every failed flush. */
+    uint32_t n_dirty = 0;
+    s = count_dirty(root, 0, &n_dirty);
+    if (s != STM_OK) {
+        /* A count_dirty failure means a malformed in-memory tree (the
+         * depth cap — a cycle). Drop it, consistent with the
+         * commit_node corrupt-tree exit below; the next descent reloads
+         * the durable root. Unreachable in practice — node_insert and
+         * load_child keep the in-memory tree a strict depth-capped
+         * tree — so no pending window was opened either. */
+        invalidate_memtree(eng);
+        return s;
+    }
+
+    eng_pending *p = &eng->pending;
+    if (n_dirty > 0) {
+        p->superseded = malloc((size_t)n_dirty * sizeof *p->superseded);
+        p->fresh      = malloc((size_t)n_dirty * sizeof *p->fresh);
+        if (!p->superseded || !p->fresh) {
+            free(p->superseded);
+            free(p->fresh);
+            p->superseded = NULL;
+            p->fresh      = NULL;
+            return STM_ENOMEM;             /* no pending window opened */
+        }
+    }
+    p->cap          = n_dirty;
+    p->gen          = gen;
+    p->n_superseded = 0;
+    p->n_fresh      = 0;
+
+    uint64_t rp = 0;
+    uint8_t  rc[STM_BTNODE_CSUM_SIZE];
+    s = commit_node(eng, root, gen, 0, &rp, rc);
+    if (s != STM_OK) {
+        /* Failed flush — the in-process Crash. Reclaim whatever nodes
+         * were written (unrooted), drop the now-inconsistent in-memory
+         * tree, leave the durable root naming the previous tree. */
+        pending_free_paddrs(eng, p->fresh, p->n_fresh, gen);
+        pending_reset(p);
+        invalidate_memtree(eng);
+        return s;
+    }
+
+    /* Flush succeeded — record the PROSPECTIVE root. The durable triple
+     * (eng->root_*) stays the previous tree until commit_finalize.
+     * new_root_gen is the gen the ROOT NODE was actually written at
+     * (root->gen): a no-op commit of an all-clean tree keeps the root's
+     * prior gen, so the triple stays openable at that gen. */
+    p->new_root_paddr = rp;
+    p->new_root_gen   = root->gen;
+    memcpy(p->new_root_csum, rc, STM_BTNODE_CSUM_SIZE);
+    p->active = true;
+
+    *out_root_paddr = rp;
+    *out_root_gen   = root->gen;
+    memcpy(out_root_csum, rc, STM_BTNODE_CSUM_SIZE);
+    return STM_OK;
+}
+
+stm_status stm_btree_engine_commit_finalize(stm_btree_engine *eng)
+{
+    if (!eng) return STM_EINVAL;
+    eng_pending *p = &eng->pending;
+    if (!p->active) return STM_EINVAL;
+
+    /* Publish: the flushed root becomes the durable root (btree.tla's
+     * FinalCommit). The in-memory tree already matches it — every node
+     * is clean at its new paddr — so it is kept, not invalidated. */
+    eng->root_paddr       = p->new_root_paddr;
+    eng->root_gen         = p->new_root_gen;
+    memcpy(eng->root_csum, p->new_root_csum, STM_BTNODE_CSUM_SIZE);
+    eng->has_durable_root = true;
+
+    /* Deferred-free the superseded paddrs — the previous tree's
+     * rewritten nodes, now unreachable from the new durable root. The
+     * free_gen stamp is the commit's write gen; the allocator reclaims
+     * them on a later commit (free_gen < committed_gen — allocator.tla,
+     * bootstrap.h). A clean/shared subtree is never in `superseded`, so
+     * this never frees a node the new root still points at
+     * (btree.tla::FreedNodesNotReachable). */
+    pending_free_paddrs(eng, p->superseded, p->n_superseded, p->gen);
+    /* The superseded paddrs are now freed — drop the node cache so it
+     * carries no entry keyed by a freed paddr. The in-memory tree is
+     * kept (reached via eng->root + child.mem); the cache only indexes
+     * purely-on-disk children and lazily refills (R151 P3-1). */
+    cache_reset(eng);
+    pending_reset(p);
+    return STM_OK;
+}
+
+stm_status stm_btree_engine_commit_abort(stm_btree_engine *eng)
+{
+    if (!eng) return STM_EINVAL;
+    eng_pending *p = &eng->pending;
+    if (!p->active) return STM_EINVAL;
+
+    /* Discard the flush (btree.tla's Crash): the freshly-written nodes
+     * were never durably rooted, so reclaim them; the durable root
+     * triple is untouched. Drop the in-memory tree — it is now clean at
+     * paddrs we just freed — so the next descent reloads the previous
+     * durable root. */
+    pending_free_paddrs(eng, p->fresh, p->n_fresh, p->gen);
+    pending_reset(p);
+    invalidate_memtree(eng);
     return STM_OK;
 }
 
@@ -369,33 +655,21 @@ stm_status stm_btree_engine_commit(stm_btree_engine *eng, uint64_t gen,
                                     uint8_t out_root_csum[32])
 {
     if (!eng || !out_root_paddr || !out_root_csum) return STM_EINVAL;
-    /* The commit gen must strictly increase. Node birth-gens (n_gen)
-     * are an ordering Phase 9.7's snapshot retention keys on (design
-     * §3.9); a non-monotonic gen does not break AEAD-nonce uniqueness
-     * (every node still gets a fresh paddr) but would corrupt it. */
-    if (eng->has_durable_root && gen <= eng->root_gen) return STM_EINVAL;
+    if (eng->pending.active) return STM_EBUSY;
 
-    eng_node *root = NULL;
-    stm_status s = load_root(eng, &root);
-    if (s != STM_OK) return s;
-
-    uint64_t rp = 0;
+    uint64_t rp = 0, rg = 0;
     uint8_t  rc[STM_BTNODE_CSUM_SIZE];
-    s = commit_node(eng, root, gen, 0, &rp, rc);
-    if (s != STM_OK) return s;             /* durable root left unchanged */
+    stm_status s = stm_btree_engine_commit_flush(eng, gen, &rp, &rg, rc);
+    if (s != STM_OK) return s;             /* a failed flush reverts itself */
 
-    /* root_gen is the gen the ROOT NODE was actually written at —
-     * `root->gen`, not the passed `gen`. For a no-op commit of an
-     * all-clean tree the root keeps its prior gen, so the published
-     * (root_paddr, root_gen, root_csum) triple stays openable. */
-    eng->root_paddr = rp;
-    eng->root_gen   = root->gen;
-    memcpy(eng->root_csum, rc, STM_BTNODE_CSUM_SIZE);
-    eng->has_durable_root = true;
-
+    /* The flush produced the new root triple — return it now, before
+     * the finalize, so the caller has a usable triple regardless of
+     * finalize's outcome. commit_finalize is infallible after a
+     * successful flush (its only failure exit is the no-pending guard,
+     * which cannot fire here), so its return value is the commit's. */
     *out_root_paddr = rp;
     memcpy(out_root_csum, rc, STM_BTNODE_CSUM_SIZE);
-    return STM_OK;
+    return stm_btree_engine_commit_finalize(eng);
 }
 
 stm_status stm_btree_engine_get_root(const stm_btree_engine *eng,
@@ -405,6 +679,7 @@ stm_status stm_btree_engine_get_root(const stm_btree_engine *eng,
 {
     if (!eng || !out_root_paddr || !out_root_gen || !out_root_csum)
         return STM_EINVAL;
+    if (eng->pending.active)    return STM_EBUSY;
     if (!eng->has_durable_root) return STM_EINVAL;
     *out_root_paddr = eng->root_paddr;
     *out_root_gen   = eng->root_gen;
@@ -415,6 +690,7 @@ stm_status stm_btree_engine_get_root(const stm_btree_engine *eng,
 stm_status stm_btree_engine_verify(stm_btree_engine *eng)
 {
     if (!eng) return STM_EINVAL;
+    if (eng->pending.active)    return STM_EBUSY;
     if (!eng->has_durable_root) return STM_EINVAL;
     return eng_verify_subtree(eng, eng->root_paddr, eng->root_gen,
                               eng->root_csum, 0);
@@ -457,6 +733,7 @@ stm_status stm_btree_engine_scan(stm_btree_engine *eng,
                                   stm_btree_engine_iter_cb cb, void *ctx)
 {
     if (!eng || !cb) return STM_EINVAL;
+    if (eng->pending.active) return STM_EBUSY;
     eng_node *root = NULL;
     stm_status s = load_root(eng, &root);
     if (s != STM_OK) return s;
@@ -476,6 +753,7 @@ stm_status stm_btree_engine_stats_get(stm_btree_engine *eng,
                                        stm_btree_engine_stats *out)
 {
     if (!eng || !out) return STM_EINVAL;
+    if (eng->pending.active) return STM_EBUSY;
 
     eng_node *root = NULL;
     stm_status s = load_root(eng, &root);

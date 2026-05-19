@@ -15,11 +15,13 @@ node — 16 KiB — AEGIS-256 encrypted with a per-node BLAKE3 Merkle csum,
 the same crypto envelope `btree_store` nodes carry. A tree's durable
 identity is the triple `(root_paddr, root_gen, root_csum)`.
 
-This file documents **9.6-impl-1b** — the standalone structural engine.
-The incremental-commit machinery (deferred-free of superseded paddrs,
-three-phase-sync integration, crash-revert) is 9.6-impl-2; large-value
-spill is 9.6-impl-3; the cutover of the four metadata modules onto the
-engine is 9.6-impl-4. See `docs/phase-9.6-metadata-tree-engine-design.md`.
+This file documents **9.6-impl-2** — the structural engine plus
+incremental copy-on-write commit: deferred-free of superseded paddrs,
+the `commit_flush` / `commit_finalize` / `commit_abort` three-phase
+split, and crash-revert. Large-value spill is 9.6-impl-3; the cutover of
+the four metadata modules onto the engine — wiring the real
+`stm_bootstrap`-backed vtable into the three-phase sync — is 9.6-impl-4.
+See `docs/phase-9.6-metadata-tree-engine-design.md`.
 
 ## Where it sits
 
@@ -37,9 +39,9 @@ engine is 9.6-impl-4. See `docs/phase-9.6-metadata-tree-engine-design.md`.
 
 The engine talks to storage **only** through `stm_btree_store_vtable`
 (`reserve` / `free` / `write` / `read` over node-sized regions). It is
-therefore allocator-agnostic: impl-1b is exercised against an in-RAM
-store; impl-2 wires the real `stm_bootstrap`-backed vtable when the
-engine joins the three-phase sync path.
+therefore allocator-agnostic and is exercised against an in-RAM store;
+the real `stm_bootstrap`-backed vtable is wired in at 9.6-impl-4, when
+the engine's three-phase commit joins the live sync path.
 
 ## Public API
 
@@ -97,24 +99,33 @@ value). `scan` enumerates every entry in ascending key order.
 ### Commit + inspection
 
 ```c
-stm_status stm_btree_engine_commit  (stm_btree_engine *eng, uint64_t gen,
-                                      uint64_t *out_root_paddr,
-                                      uint8_t out_root_csum[32]);
-stm_status stm_btree_engine_get_root(const stm_btree_engine *eng,
-                                      uint64_t *out_root_paddr,
-                                      uint64_t *out_root_gen,
-                                      uint8_t out_root_csum[32]);
-stm_status stm_btree_engine_verify  (stm_btree_engine *eng);
-stm_status stm_btree_engine_stats_get(stm_btree_engine *eng,
-                                       stm_btree_engine_stats *out);
+stm_status stm_btree_engine_commit         (stm_btree_engine *eng, uint64_t gen,
+                                             uint64_t *out_root_paddr,
+                                             uint8_t out_root_csum[32]);
+stm_status stm_btree_engine_commit_flush   (stm_btree_engine *eng, uint64_t gen,
+                                             uint64_t *out_root_paddr,
+                                             uint64_t *out_root_gen,
+                                             uint8_t out_root_csum[32]);
+stm_status stm_btree_engine_commit_finalize(stm_btree_engine *eng);
+stm_status stm_btree_engine_commit_abort   (stm_btree_engine *eng);
+stm_status stm_btree_engine_get_root       (const stm_btree_engine *eng,
+                                             uint64_t *out_root_paddr,
+                                             uint64_t *out_root_gen,
+                                             uint8_t out_root_csum[32]);
+stm_status stm_btree_engine_verify         (stm_btree_engine *eng);
+stm_status stm_btree_engine_stats_get      (stm_btree_engine *eng,
+                                             stm_btree_engine_stats *out);
 ```
 
-`verify` walks the last committed on-disk tree, checking the Merkle
-chain and AEAD tag at every node **and** that every node's entries /
-pivots are strictly ascending — a crypto-valid but unsorted node would
-silently mis-route the binary-search descents, so verify catches
-structural corruption, not just bit-rot / substitution. `stats_get`
-returns key count + tree height.
+`commit` is the single-shot form (flush + finalize); the phased
+`commit_flush` / `commit_finalize` / `commit_abort` compose with the
+three-phase sync — see §Commit. `verify` walks the last committed
+on-disk tree, checking the Merkle chain and AEAD tag at every node
+**and** that every node's entries / pivots are strictly ascending — a
+crypto-valid but unsorted node would silently mis-route the
+binary-search descents, so verify catches structural corruption, not
+just bit-rot / substitution. `stats_get` returns key count + tree
+height.
 
 ## Implementation
 
@@ -217,35 +228,102 @@ The bound is the honest impl-1b boundary: a value too large to share a
 node is what 9.6-impl-3 large-value spill routes to its own block. An
 entry over the bound is refused with `STM_ERANGE`.
 
-### Commit
+### Commit — incremental, three-phase
 
-`commit_node` walks bottom-up. A clean node short-circuits with its
-existing durable `paddr` / `csum` — and because `node_insert` dirties
-every ancestor of a mutation, a clean node implies a wholly-clean
-subtree, so **only dirty root-to-leaf paths are rewritten** (the design
-§3.1 fix for O(all-metadata) commit cost). Each dirty node is written
-to a **fresh** paddr by `eng_node_write` (encode → `vt->reserve` →
+Commit COWs **only the dirty root-to-leaf paths**. `commit_node` walks
+bottom-up: a clean node short-circuits with its existing durable
+`paddr` / `csum` — and because `node_insert` dirties every ancestor of
+a mutation, a clean node implies a wholly-clean subtree, so an
+unchanged subtree is neither rewritten nor rehashed (the design §3.1
+fix for O(all-metadata) commit cost). Each dirty node is written to a
+**fresh** paddr by `eng_node_write` (encode → `vt->reserve` →
 `stm_btree_node_encrypt` under `(paddr, gen)` → BLAKE3 over the
 ciphertext → `vt->write`); the parent records the child's new
-paddr/gen/csum. The new root triple is published into the engine state
-and returned. A re-commit of an all-clean tree writes nothing and
-returns the unchanged triple.
+paddr/gen/csum.
+
+Commit is **three-phase** so it composes with the three-phase sync:
+
+| Phase | Function | btree.tla |
+|---|---|---|
+| flush | `stm_btree_engine_commit_flush` | `BeginCommit` + `WriteNode` |
+| final | `stm_btree_engine_commit_finalize` | `FinalCommit` |
+| abort | `stm_btree_engine_commit_abort` | `Crash` |
+
+- **`commit_flush(gen)`** runs a `count_dirty` pass to pre-size two
+  paddr arrays, then `commit_node` writes every dirty node and records,
+  per rewritten node, its **superseded** paddr (the prior on-disk
+  location — 0, hence nothing recorded, for a RAM-fresh split product
+  or grown root) and its **fresh** paddr. The prospective new root
+  triple is returned, but the engine's durable root is **unchanged** —
+  the flush opens a *pending-commit window*.
+- **`commit_finalize`** adopts the flushed root as the durable root and
+  hands the **superseded** paddrs back to the allocator (`vt->free`,
+  deferred-free stamped with the commit gen). A clean/shared subtree is
+  never in the superseded set, so a freed paddr is never reachable from
+  the new durable root (`btree.tla::FreedNodesNotReachable`).
+- **`commit_abort`** discards the flush: the **fresh** paddrs — written
+  but never durably rooted — are handed back, and the in-memory tree is
+  dropped so the next descent reloads the previous durable root. This
+  is the in-process realisation of a crash between flush and final
+  (`btree.tla::Crash`); the durable root is exactly what survives.
+
+`commit` is the single-shot convenience: `commit_flush` then
+`commit_finalize`. A re-commit of an all-clean tree is a no-op — it
+writes nothing, frees nothing, and returns the unchanged triple.
+
+During the pending-commit window every operation except
+`commit_finalize` / `commit_abort` / `destroy` returns `STM_EBUSY`.
+`destroy` of an engine with an un-finalized flush implicitly aborts —
+the flushed-but-unrooted paddrs are reclaimed, never leaked on disk.
 
 The commit `gen` MUST strictly increase across commits — a non-monotonic
 `gen` is refused with `STM_EINVAL` (node birth-gens, `n_gen`, are the
 ordering Phase 9.7's snapshot retention keys on; design §3.9). The
-authoritative `root_gen` the engine publishes is the gen the **root
-node** was actually written at: for a no-op commit of an all-clean
-tree the root keeps its prior gen, so `(root_paddr, root_gen,
-root_csum)` from `stm_btree_engine_get_root` stays openable — callers
-read the gen from `get_root`, not from the `gen` they passed to a
-no-op commit.
+authoritative `root_gen` is the gen the **root node** was actually
+written at: a no-op commit of an all-clean tree keeps the root's prior
+gen, so `(root_paddr, root_gen, root_csum)` from `get_root` (or
+`commit_flush`'s out-param) stays openable — callers do not read the
+gen back from the `gen` they passed to a no-op commit.
 
-**impl-1b boundary**: the superseded paddrs of rewritten nodes are
-**not** freed — that deferred-free, plus three-phase-sync integration
-and crash-revert, is 9.6-impl-2. A commit that fails partway leaves the
-durable root pointing at the previous tree (the partially-written new
-nodes are simply unreferenced); no torn tree is ever published.
+**Failure / crash handling.** A flush that fails partway (a device
+write error) reverts cleanly: the partially-written nodes are handed
+back, the in-memory tree is dropped, and the durable root still names
+the previous tree — no torn tree is ever published. A true power-loss
+crash mid-flush leaves the engine un-running; the next mount opens at
+the previous durable root, and the flushed-but-unrooted paddrs are
+reclaimed by the sync transaction's allocator-bitmap atomicity (the
+9.6-impl-4 integration contract — the engine's `vt->reserve`s are made
+durable only by the same final-phase commit that publishes the root).
+
+**Deferred-free + AEAD-nonce uniqueness.** A superseded / aborted paddr
+is `vt->free`d with `free_gen` = the commit's write gen, and the
+allocator hands it back to a future `reserve` only once a later
+`stm_bootstrap_commit` runs with `committed_gen > free_gen`
+(`free_gen < committed_gen` — `allocator.tla`, `bootstrap.h`). That
+deferred-free discipline — *not* a strictly-increasing commit gen — is
+what guarantees no `(paddr, gen)` AEAD-nonce reuse:
+
+- A **superseded** paddr (a `commit_finalize`) was written at an
+  *older* gen and is freed at the new, higher commit gen; whenever it is
+  reclaimed and rewritten the rewrite gen is strictly higher than the
+  original — the commit gen does strictly increase across *finalized*
+  commits.
+- An **aborted** paddr (a `commit_abort`) is the subtle case. An abort
+  does *not* consume its gen `G`: the durable root is unchanged and the
+  retried commit MAY reuse `G` (the test `engine_commit_abort_reverts`
+  does exactly this). Nonce safety here rests *solely* on the
+  deferred-free — the aborted paddr `P`, freed at `free_gen = G`, stays
+  allocator-PENDING until a `stm_bootstrap_commit(committed_gen > G)`,
+  so while any gen-≤-`G` state can still be written `P` is never
+  re-handed-out, and `(P, G)` is written exactly once.
+
+**impl-4 integration contract.** After a `commit_abort` the same gen
+`G` MAY be reused for the retried commit. The allocator MUST NOT be
+`stm_bootstrap_commit`-ed with `committed_gen > G` between the abort and
+a gen-≤-`G` rewrite — the three-phase sync guarantees this because the
+allocator-bitmap commit is part of the same final phase that publishes
+the root, so an aborted (never-finalized) gen never advances
+`committed_gen`.
 
 ### Failure atomicity
 
@@ -271,7 +349,7 @@ btnode encoder rather than writing a malformed node.
 
 | Spec | Pins |
 |---|---|
-| `btree.tla` | The incremental COW-commit mechanism — `DurableTreeWellFormed`, `CommittedTreeMerkleConsistent`, `FreedNodesNotReachable`. impl-1b realises the *structural* substrate the spec composes over: `eng_node_write`'s ciphertext-BLAKE3 Merkle link is `CommittedTreeMerkleConsistent`; `commit`'s dirty-only bottom-up rewrite is the well-formed-durable-tree mechanism; `FreedNodesNotReachable` holds trivially (impl-1b frees nothing). The COW-commit *invariants* — deferred-free, early-publish, crash-revert — are exercised by 9.6-impl-2. |
+| `btree.tla` | The incremental COW-commit mechanism. `commit_flush` / `commit_finalize` / `commit_abort` realise `WriteNode` / `FinalCommit` / `Crash`; the three invariants map directly — `DurableTreeWellFormed` (finalize publishes a complete flushed tree; a flush failure or abort leaves the prior durable root, never a torn one), `CommittedTreeMerkleConsistent` (`eng_node_write`'s ciphertext-BLAKE3 Merkle link, propagated bottom-up by `commit_node`), `FreedNodesNotReachable` (finalize frees only the superseded set — a clean/shared subtree is never recorded, never freed). TLC-verified green; the three buggy configs (partial-COW, early-publish, over-free) each trip exactly one invariant. |
 | `allocator.tla` / `sync.tla` | `(paddr, gen)` AEAD-nonce uniqueness composes from the allocator (fresh paddrs) and sync (monotone gen); `btree.tla` and the engine model the tree-shape mechanism on that composition. `btree.tla` comment §Composition. |
 
 The multi-level B+tree split / descent is a structural-algorithm
@@ -281,8 +359,12 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 16 cases against an in-RAM
-`stm_btree_store_vtable`:
+`tests/test_btree_engine.c` — 24 cases against an in-RAM
+`stm_btree_store_vtable` that also models deferred-free (`free` records
+the call's `(paddr, free_gen)` but keeps the slot readable, so a test
+can both assert which paddrs were superseded and still open a prior
+root) and one-shot write-fault injection (to exercise the failed-flush
+crash-revert path):
 
 | Area | Cases |
 |---|---|
@@ -290,6 +372,7 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 | Many entries | 3000 keys inserted ascending / descending / shuffled — scan is strictly sorted, every key looks up, commit + reopen + verify round-trips. `engine_many_descending` also pins the byte-balanced-split performance fix |
 | Multi-level | 150 large-key entries force `height >= 3` (the 2-level cap is gone); deep tree commits, reopens, verifies, spot-checks |
 | Commit | re-commit of a clean tree is a no-op (same root, no new nodes); the published gen stays the root's real write gen and the triple reopens; a non-monotonic commit gen → `STM_EINVAL`; incremental commit COWs the root to a new paddr and shares unchanged subtrees — the prior root stays intact and readable |
+| Three-phase commit | deferred-free — a second commit hands back exactly the superseded paddrs (the rewritten leaf + the old root), stamped with the commit gen, and never the shared subtrees (`FreedNodesNotReachable`); a three-commit chain confirms no paddr is freed twice; `commit_flush` + `commit_finalize` publishes the flushed root, and the pending-commit window rejects every other op with `STM_EBUSY`; `commit_abort` reverts to the last durable root and reclaims the flushed nodes — on both a committed tree and a never-committed one; a mid-flush device write error reverts identically (durable root intact, partial nodes reclaimed, engine usable); `destroy` of an un-finalized flush implicitly aborts; phased-API NULL + no-pending argument validation |
 | Integrity | a flipped ciphertext byte is caught by the Merkle chain (`STM_ECORRUPT`); opening with a wrong root csum is rejected |
 | Hostile trees | a forged on-disk DAG (two child slots → one paddr) and a forged child-kind mismatch are both rejected with `STM_ECORRUPT`, and `destroy` does not double-free (R150 P1 regressions) |
 | Validation | oversize entry → `STM_ERANGE`, at-the-bound entry accepted; NULL-argument matrix |
@@ -300,22 +383,25 @@ it is pinned by tests, not a `btree.tla`-class invariant.
       multi-level descent / insert / lookup / byte-balanced split.
 - [x] Per-node AEGIS-256 + BLAKE3 Merkle (16 KiB nodes, parameterized
       `btnode` codec + `crypt.c`).
-- [x] `commit` — dirty-only bottom-up COW write; `open` / `verify` /
-      `scan` / `stats`.
+- [x] `open` / `verify` / `scan` / `stats`.
+- [x] **Incremental commit (9.6-impl-2)**: dirty-only bottom-up COW
+      write; deferred-free of the superseded paddrs; the three-phase
+      `commit_flush` / `commit_finalize` / `commit_abort` split with a
+      pending-commit `STM_EBUSY` window; crash-revert to the last
+      durable root.
 - [x] R150 audit close — 2 P1 (`load_child` DAG double-free +
-      child-kind-mismatch UAF, both on the hostile-on-disk-tree path)
-      and 3 P2 (failed-write paddr return, `verify` structural sort
-      check, monotonic commit-gen) fixed; the two P1s pinned by the
-      "Hostile trees" regression tests.
-- [ ] **Incremental commit (9.6-impl-2)**: deferred-free of superseded
-      paddrs, three-phase-sync integration, crash-revert. Today a
-      commit leaks the old paddrs of rewritten nodes.
+      child-kind-mismatch UAF) + 3 P2. R151 audit close (impl-2) —
+      0 P0 / 0 P1; 1 P2 (the abort-path nonce-safety rationale, doc
+      only) + 4 P3, all fixed (cache-reset on finalize, failed-flush +
+      3-commit regression tests, `count_dirty`-failure invalidate,
+      `commit` out-param ordering).
 - [ ] **Large-value spill (9.6-impl-3)**: values above
       `STM_BTREE_ENGINE_MAX_ENTRY_BYTES` to their own blocks; lifts the
       entry-size bound.
 - [ ] **Module cutover (9.6-impl-4)**: inode / dirent / xattr /
       extent-index onto the engine; retire `btree_store`'s whole-tree
-      rebuild + each module's flat `records[]`.
+      rebuild + each module's flat `records[]`; wire the real
+      `stm_bootstrap`-backed vtable into the three-phase sync.
 
 ## Known caveats
 
@@ -324,9 +410,10 @@ it is pinned by tests, not a `btree.tla`-class invariant.
   engine joins the concurrent path; the cache + dirty-tracking
   interfaces are shaped so that — and Phase 9.8's Bw-tree lock-free
   layer — drop in without re-architecting the engine.
-- **Commit leaks superseded paddrs** (impl-1b — see §Commit). Bounded:
-  a commit rewrites only O(dirty) nodes. impl-2's deferred-free closes
-  it.
+- **A commit_abort / failed flush drops the whole in-memory tree**, so
+  the next access re-reads it from the durable root. Correct (it is the
+  crash-equivalent state) but not free — acceptable for an error /
+  crash-revert path.
 - **The node cache is fixed-size** (1024 buckets, chained). Adequate
   for a metadata tree's node count; a resize / eviction policy is a
   later concern (and is where Phase 9.8's ARC-style cache lands).

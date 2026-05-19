@@ -147,6 +147,47 @@ eng_node  *eng_cache_get(const eng_cache *c, uint64_t paddr);
 stm_status eng_cache_put(eng_cache *c, uint64_t paddr, eng_node *node);
 
 /* ========================================================================= */
+/* Pending commit — the flush -> finalize / abort window (engine.c).           */
+/* ========================================================================= */
+
+/*
+ * A commit that has been FLUSHED (every dirty node written to a fresh
+ * paddr) but not yet FINALIZED publishes nothing durable — the engine's
+ * durable root triple still names the prior tree. `eng_pending` records
+ * what the flush did so the matching close-out can run:
+ *
+ *   stm_btree_engine_commit_finalize — adopt new_root_* as the durable
+ *     root and hand the `superseded` paddrs back to the allocator
+ *     (deferred-free, stamped `gen`); the spec's FinalCommit.
+ *   stm_btree_engine_commit_abort — discard the flush: hand the `fresh`
+ *     paddrs back (written but never durably rooted) and drop the
+ *     in-memory tree so the next access reloads the prior durable
+ *     root; the spec's Crash.
+ *
+ * `superseded` / `fresh` are pre-sized from a dirty-node count pass
+ * (commit_flush) so the flush walk's appends are infallible — ENOMEM
+ * can only surface at the one upfront allocation. Both arrays hold at
+ * most `cap` (= dirty-node count) entries: one `fresh` paddr per
+ * rewritten node, one `superseded` paddr per rewritten node that had a
+ * prior on-disk paddr (a RAM-fresh node — a split product, a grown
+ * root — has none, so superseded <= fresh = cap).
+ *
+ * Models the in-flight `commit` record of v2/specs/btree.tla.
+ */
+typedef struct {
+    bool      active;          /* a flushed-but-unfinalized commit exists  */
+    uint64_t  gen;             /* the write gen of the flushed commit      */
+    uint64_t  new_root_paddr;  /* prospective durable root — published by  */
+    uint64_t  new_root_gen;    /*   finalize, discarded by abort           */
+    uint8_t   new_root_csum[STM_BTNODE_CSUM_SIZE];
+    uint64_t *superseded;      /* prior paddrs of rewritten nodes          */
+    uint32_t  n_superseded;
+    uint64_t *fresh;           /* paddrs the flush wrote this commit       */
+    uint32_t  n_fresh;
+    uint32_t  cap;             /* capacity of superseded[] AND fresh[]     */
+} eng_pending;
+
+/* ========================================================================= */
 /* The engine handle.                                                         */
 /* ========================================================================= */
 
@@ -157,14 +198,16 @@ struct stm_btree_engine {
     uint64_t                      tree_id;
 
     /* The live tree. root is the in-memory root, or NULL when the tree
-     * was opened and not yet descended (root still purely on-disk). */
+     * was opened and not yet descended (root still purely on-disk), or
+     * after a commit_abort / failed flush dropped the in-memory tree. */
     eng_node *root;
     uint64_t  root_paddr;
     uint64_t  root_gen;
     uint8_t   root_csum[STM_BTNODE_CSUM_SIZE];
     bool      has_durable_root;             /* false for a fresh tree */
 
-    eng_cache cache;
+    eng_cache   cache;
+    eng_pending pending;                    /* the flush -> finalize window */
 };
 
 /* ========================================================================= */
