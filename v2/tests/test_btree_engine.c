@@ -23,10 +23,15 @@
 #include "tharness.h"
 #include <stratum/btree_engine.h>
 #include <stratum/hash.h>          /* stm_blake3 — for the corrupt-tree forges */
+#include <stratum/engine_store.h>  /* 4b-i: the production bootstrap-backed vtable */
+#include <stratum/block.h>
+#include <stratum/bootstrap.h>
+#include <stratum/crypto.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* stm_bptr_kind values (super.h) — used to forge child bptrs by hand. */
 #define BPTR_KIND_INTERNAL  1
@@ -2328,6 +2333,111 @@ STM_TEST(engine_delete_height1_empty_root) {
 
     stm_btree_engine_destroy(eng);
     memstore_destroy(&ms);
+}
+
+/* ========================================================================= */
+/* Production store vtable (9.6-impl-4b-i) — STM_ENGINE_STORE_VT over a real   */
+/* stm_bdev + stm_bootstrap, the binding the inode cutover relies on.          */
+/* ========================================================================= */
+
+STM_TEST(engine_store_vt_bootstrap_roundtrip) {
+    /* The production stm_btree_store_vtable (engine_store.c) backed by a
+     * real block device + bootstrap allocator, reserving at 16-KiB node
+     * granularity. Exercises create / insert / commit / durable-bitmap
+     * commit / verify, a bdev+bootstrap close+reopen, engine open at the
+     * durable root, full lookup, and an incremental commit — all through
+     * the bootstrap-backed vtable rather than the in-RAM memstore. */
+    char path[256];
+    snprintf(path, sizeof path, "/tmp/stm_v2_engine_store_%d.bin", (int)getpid());
+    unlink(path);
+
+    STM_ASSERT_OK(stm_crypto_init());
+
+    stm_bdev *d = NULL;
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(path, &bo, &d));
+    STM_ASSERT_OK(stm_bdev_resize(d, UINT64_C(8) * 1024u * 1024u));
+
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_bootstrap *b = NULL;
+    STM_ASSERT_OK(stm_bootstrap_create(d, cx.pool_uuid, cx.device_uuid,
+                                         UINT64_C(2) * 1024u * 1024u, &b));
+
+    stm_engine_store_ctx ctx = { .boot = b, .bdev = d };
+
+    /* create → 1500 keys (forces a 2-level tree) → commit at gen 1. */
+    enum { N = 1500u };
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&STM_ENGINE_STORE_VT, &ctx, &cx,
+                                           /*tree_id=*/7, &eng));
+    for (uint32_t i = 0; i < N; i++) {
+        uint8_t k[4]; be32_key(i, k);
+        uint8_t v[4]; be32_key(i * 3u + 1u, v);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, k, 4, v, 4));
+    }
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, /*gen=*/1, &rp, rc));
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &rp, &rg, rc));
+
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_EQ(st.n_keys, (uint64_t)N);
+    STM_ASSERT_TRUE(st.height >= 2u);          /* multi-level via the real vtable */
+
+    /* The vt->reserve bitmap bits are in-RAM until a bootstrap commit —
+     * the 4b durable-bitmap barrier (design note §5). */
+    STM_ASSERT_OK(stm_bootstrap_commit(b, /*committed_gen=*/1));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    stm_btree_engine_destroy(eng);
+
+    /* Close + reopen the bdev + bootstrap — the durable path. */
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(path, &bo, &d));
+    STM_ASSERT_OK(stm_bootstrap_open(d, &b));
+    ctx.boot = b;
+    ctx.bdev = d;
+
+    STM_ASSERT_OK(stm_btree_engine_open(&STM_ENGINE_STORE_VT, &ctx, &cx,
+                                         /*tree_id=*/7, rp, rg, rc, &eng));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    for (uint32_t i = 0; i < N; i++) {
+        uint8_t k[4]; be32_key(i, k);
+        bool   found = false;
+        void  *gv = NULL;
+        size_t gl = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup(eng, k, 4, &found, &gv, &gl));
+        uint8_t want[4]; be32_key(i * 3u + 1u, want);
+        STM_ASSERT_TRUE(found && gl == 4 && gv && memcmp(gv, want, 4) == 0);
+        free(gv);
+    }
+
+    /* An incremental commit through the production vtable: one value
+     * rewritten, committed at a higher gen, deferred-free + durable
+     * bitmap. The unchanged sibling subtree is shared, not rewritten. */
+    {
+        uint8_t k[4]; be32_key(7u, k);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, k, 4, "ZZZZ", 4));
+    }
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, /*gen=*/3, &rp, rc));
+    STM_ASSERT_OK(stm_bootstrap_commit(b, /*committed_gen=*/3));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    {
+        uint8_t k[4]; be32_key(7u, k);
+        bool   found = false;
+        void  *gv = NULL;
+        size_t gl = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup(eng, k, 4, &found, &gv, &gl));
+        STM_ASSERT_TRUE(found && gl == 4 && gv && memcmp(gv, "ZZZZ", 4) == 0);
+        free(gv);
+    }
+
+    stm_btree_engine_destroy(eng);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(path);
 }
 
 STM_TEST_MAIN("btree_engine")

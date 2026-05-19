@@ -43,9 +43,11 @@ backed vtable into the three-phase sync — is 9.6-impl-4b..d. See
 
 The engine talks to storage **only** through `stm_btree_store_vtable`
 (`reserve` / `free` / `write` / `read` over node-sized regions). It is
-therefore allocator-agnostic and is exercised against an in-RAM store;
-the real `stm_bootstrap`-backed vtable is wired in at 9.6-impl-4, when
-the engine's three-phase commit joins the live sync path.
+therefore allocator-agnostic and is exercised against an in-RAM store.
+The production binding — `STM_ENGINE_STORE_VT`, the one vtable backed
+by `stm_bootstrap` + `stm_bdev` — lands at 9.6-impl-4b-i (see
+§"Production storage vtable"); the engine's three-phase commit joins
+the live sync path at 9.6-impl-4b-iii.
 
 ## Public API
 
@@ -147,7 +149,7 @@ height.
 
 ## Implementation
 
-`v2/src/btree_engine/` — four files:
+`v2/src/btree_engine/` — five files:
 
 | File | Holds |
 |---|---|
@@ -155,6 +157,7 @@ height.
 | `node_cache.c` | the paddr-keyed node cache |
 | `btnode_io.c` | per-node device I/O: encode → reserve → encrypt → Merkle-csum → write, and read → Merkle-check → decrypt → decode |
 | `engine.c` | the public API: lifecycle, descent, insert/split, lookup, commit, scan, verify, stats |
+| `engine_store.c` | `STM_ENGINE_STORE_VT` — the production `stm_btree_store_vtable` over `stm_bootstrap` + `stm_bdev` (its own `stm_engine_store` library, so the engine proper stays allocator-agnostic; 9.6-impl-4b-i) |
 
 ### In-memory model — the tree is the store
 
@@ -446,6 +449,32 @@ self-healing (re-split on the next insert that splices into it). A
 `commit` of an over-cap node fails cleanly with `STM_ERANGE` from the
 btnode encoder rather than writing a malformed node.
 
+### Production storage vtable (9.6-impl-4b)
+
+`engine_store.c` is the one production `stm_btree_store_vtable` —
+`STM_ENGINE_STORE_VT` — binding the engine to the real `stm_bootstrap`
+allocator + `stm_bdev`. The vtable's `vt_ctx` is a
+`stm_engine_store_ctx` (a borrowed `{ bootstrap, bdev }` pair).
+
+- `reserve` → `stm_bootstrap_reserve` at **`STM_BOOTSTRAP_NODE_BLOCKS`**
+  (16 KiB — one engine node), **not** the 128-KiB
+  `STM_BOOTSTRAP_UNIT_BLOCKS` the legacy whole-tree-rebuild
+  `btree_store` consumers reserve.
+- `free` → `stm_bootstrap_free` — the deferred-free PENDING stamp; the
+  paddr is not reclaimable until a `stm_bootstrap_commit` past its
+  `free_gen`.
+- `write` / `read` → `stm_bdev_write` / `_read` at the node's byte
+  offset on device 0 (a non-zero device field → `STM_EINVAL`; MVP).
+
+It lives in its own `stm_engine_store` library so `stm_btree_engine`
+itself stays allocator-agnostic — the engine and `test_btree_engine`
+exercise the in-RAM vtable; only the 9.6-impl-4 cutover modules link
+`stm_engine_store`. A `reserve` only sets a bitmap bit in RAM and a
+`free` only PENDING-stamps it; **neither is durable until a
+`stm_bootstrap_commit`** — which the sync layer issues, strictly
+before the uberblock write
+(`phase-9.6-impl-4b-sync-wiring-design.md` §5).
+
 ## Spec cross-reference
 
 | Spec | Pins |
@@ -460,12 +489,13 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 42 cases against an in-RAM
+`tests/test_btree_engine.c` — 43 cases. 42 run against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
 can both assert which paddrs were superseded and still open a prior
 root) and one-shot write-fault injection (to exercise the failed-flush
-crash-revert path):
+crash-revert path); one (9.6-impl-4b-i) runs against the production
+`STM_ENGINE_STORE_VT` over a real `stm_bdev` + `stm_bootstrap`:
 
 | Area | Cases |
 |---|---|
@@ -480,6 +510,7 @@ crash-revert path):
 | Integrity | a flipped ciphertext byte is caught by the Merkle chain (`STM_ECORRUPT`); opening with a wrong root csum is rejected |
 | Hostile trees | a forged on-disk DAG (two child slots → one paddr) and a forged child-kind mismatch are both rejected with `STM_ECORRUPT`, and `destroy` does not double-free (R150 P1 regressions) |
 | Validation | a value past the inline bound spills (no longer refused); a value over `STM_BTREE_ENGINE_MAX_VALUE_BYTES` and a key too large to fit even a spilled entry → `STM_ERANGE`; NULL-argument matrix |
+| Production vtable (impl-4b-i) | `STM_ENGINE_STORE_VT` over a real `stm_bdev` + `stm_bootstrap`: a 1500-key 2-level tree commits at 16-KiB node granularity, the bitmap is made durable, the bdev + bootstrap close and reopen, the engine reopens at the durable root, verifies, every key looks up, and an incremental commit round-trips |
 
 ## Status
 

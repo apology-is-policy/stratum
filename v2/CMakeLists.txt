@@ -225,6 +225,7 @@ target_link_libraries(stratum INTERFACE
     stm_btnode
     stm_btree_store
     stm_btree_engine
+    stm_engine_store
     stm_alloc
     stm_alloc_roots
     stm_sdarray

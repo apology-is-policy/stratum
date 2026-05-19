@@ -23,7 +23,7 @@ independently" — 4b is staged into three commits:
 
 | Sub | Deliverable | State after |
 |---|---|---|
-| **4b-i** | The shared engine store vtable — a new TU `src/btree_engine/engine_store.{c,h}`. Standalone; a direct unit test in `test_btree_engine.c`. No sync/inode change. | Engine still standalone; the production vtable proven. |
+| **4b-i** | The shared engine store vtable — `src/btree_engine/engine_store.c` + public header `include/stratum/engine_store.h`, in their own `stm_engine_store` library. Standalone; a direct unit test in `test_btree_engine.c`. No sync/inode change. | Engine still standalone; the production vtable proven. |
 | **4b-ii** | The inode cutover — `records[]` retired, the engine is the store. `stm_inode_index_commit` keeps its **monolithic signature**, internally driving the single-shot `stm_btree_engine_commit` + a trailing `stm_bootstrap_commit`. `sync.c` **unchanged**. | inode is engine-backed; commit is incremental-COW; crash-safety **identical to today's `btree_store`**. |
 | **4b-iii** | Split inode's commit into `commit_flush` / `commit_finalize` / `commit_abort`; rewire `stm_sync_commit` to the three-phase form; relocate `stm_bootstrap_commit` out of the inode module into sync. | The §6 target shape. |
 
@@ -49,8 +49,10 @@ cutover modules each carry their own vtable today (`IN_STORE_VT` etc.,
 (`STM_BOOTSTRAP_UNIT_BLOCKS`). An engine node is **16 KiB**
 (`STM_BTREE_ENGINE_NODE_SIZE` = `STM_BOOTSTRAP_NODE_BLOCKS` × 4 KiB).
 
-4b-i writes **one shared engine store vtable** — `src/btree_engine/
-engine_store.{c,h}`:
+4b-i writes **one shared engine store vtable** —
+`src/btree_engine/engine_store.c` + the public header
+`include/stratum/engine_store.h`, in their own `stm_engine_store`
+library (so `stm_btree_engine` itself stays allocator-agnostic):
 
 ```c
 typedef struct { stm_bootstrap *boot; stm_bdev *bdev; } stm_engine_store_ctx;
