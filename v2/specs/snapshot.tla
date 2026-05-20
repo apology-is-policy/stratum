@@ -102,6 +102,14 @@
 (*     snapshot WITHOUT the `force` flag, i.e. the marker-consultation    *)
 (*     gate is skipped. Should violate `RollbackBlockedIffCompromised`.   *)
 (*                                                                           *)
+(*   - BuggyRollbackSkipsGenBump (9.7-spec) — Rollback proceeds without     *)
+(*     advancing sync_gen. Should violate `RollbackBumpsGen` — the         *)
+(*     R9-1 doctrine carry from v1's `stm_snap_rollback`: a rollback       *)
+(*     that doesn't bump `fs->gen` before the allocator swap would allow   *)
+(*     a (paddr, write_gen) AEAD-nonce collision between a pre-rollback    *)
+(*     orphan and a post-rollback write. The bump preserves                *)
+(*     `disk ss_gen > fs->gen` across rollback.                            *)
+(*                                                                           *)
 (* TLY-A5 extension — rollback compromise marking:                          *)
 (*                                                                           *)
 (*   A snapshot can be MARKED rollback-compromised (corvus detected the    *)
@@ -125,7 +133,8 @@ CONSTANTS
     BuggyDeleteWithHold,
     BuggyChainOutOfOrder,
     BuggyExtentTxgUnbounded,
-    BuggyRollbackSkipsConsult
+    BuggyRollbackSkipsConsult,
+    BuggyRollbackSkipsGenBump
 
 ASSUME MaxSnaps \in (Nat \ {0})
 ASSUME MaxTxg \in (Nat \ {0})
@@ -134,6 +143,7 @@ ASSUME BuggyDeleteWithHold \in BOOLEAN
 ASSUME BuggyChainOutOfOrder \in BOOLEAN
 ASSUME BuggyExtentTxgUnbounded \in BOOLEAN
 ASSUME BuggyRollbackSkipsConsult \in BOOLEAN
+ASSUME BuggyRollbackSkipsGenBump \in BOOLEAN
 
 SnapIds == 1..MaxSnaps
 NoSnap  == 0
@@ -150,14 +160,17 @@ VARIABLES
     next_snap_id,       \* 1 .. MaxSnaps + 1.
     current_txg,        \* 0 .. MaxTxg. Snap-index counter; bumps on Create only.
     sync_gen,           \* 0 .. MaxTxg. Models sync.current_gen; bumps on Write.
-    most_recent_snap,   \* 0 .. MaxSnaps (0 = no snaps yet).
-    did_unsafe_rollback \* BOOLEAN. TLY-A5 history var: a non-forced rollback
-                        \* to a compromised snap got past the gate (a bug).
+    most_recent_snap,    \* 0 .. MaxSnaps (0 = no snaps yet).
+    did_unsafe_rollback, \* BOOLEAN. TLY-A5 history var: a non-forced rollback
+                         \* to a compromised snap got past the gate (a bug).
+    did_unbumped_rollback \* BOOLEAN. 9.7-spec history var: a Rollback fired
+                         \* but did NOT bump sync_gen (the R9-1 doctrine
+                         \* violation). Refuted by RollbackBumpsGen.
 
 vars == <<live_tree_root, snap_state, snap_tree_root, snap_created_txg,
           snap_extent_txg, snap_prev, snap_held, snap_compromised,
           next_snap_id, current_txg, sync_gen, most_recent_snap,
-          did_unsafe_rollback>>
+          did_unsafe_rollback, did_unbumped_rollback>>
 
 (***************************************************************************)
 (* Pick an arbitrary deterministic initial root from the TreeRoots set.    *)
@@ -179,6 +192,7 @@ Init ==
     /\ sync_gen          = 0
     /\ most_recent_snap  = NoSnap
     /\ did_unsafe_rollback = FALSE
+    /\ did_unbumped_rollback = FALSE
 
 (***************************************************************************)
 (* Helper: is snapshot s currently PRESENT?                                 *)
@@ -209,7 +223,7 @@ Write ==
     /\ UNCHANGED <<snap_state, snap_tree_root, snap_created_txg,
                    snap_extent_txg, snap_prev, snap_held, snap_compromised,
                    next_snap_id, current_txg, most_recent_snap,
-                   did_unsafe_rollback>>
+                   did_unsafe_rollback, did_unbumped_rollback>>
 
 (***************************************************************************)
 (* Action: SnapshotCreate — atomically capture live's tree_root.            *)
@@ -245,7 +259,7 @@ SnapshotCreate ==
     /\ next_snap_id'    = next_snap_id + 1
     /\ current_txg'     = current_txg + 1
     /\ most_recent_snap' = next_snap_id
-    /\ UNCHANGED <<live_tree_root, sync_gen, did_unsafe_rollback>>
+    /\ UNCHANGED <<live_tree_root, sync_gen, did_unsafe_rollback, did_unbumped_rollback>>
 
 (***************************************************************************)
 (* Action: SnapshotDelete(s) — mark s ABSENT.                               *)
@@ -273,7 +287,7 @@ SnapshotDelete(s) ==
     /\ UNCHANGED <<live_tree_root, snap_tree_root, snap_created_txg,
                    snap_extent_txg, snap_prev, snap_held, snap_compromised,
                    next_snap_id, current_txg, sync_gen, most_recent_snap,
-                   did_unsafe_rollback>>
+                   did_unsafe_rollback, did_unbumped_rollback>>
 
 (***************************************************************************)
 (* Action: SnapshotHold(s) / SnapshotRelease(s) — toggle hold flag.         *)
@@ -286,7 +300,7 @@ SnapshotHold(s) ==
     /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
                    snap_created_txg, snap_extent_txg, snap_prev,
                    snap_compromised, next_snap_id, current_txg, sync_gen,
-                   most_recent_snap, did_unsafe_rollback>>
+                   most_recent_snap, did_unsafe_rollback, did_unbumped_rollback>>
 
 SnapshotRelease(s) ==
     /\ s \in SnapIds
@@ -296,7 +310,7 @@ SnapshotRelease(s) ==
     /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
                    snap_created_txg, snap_extent_txg, snap_prev,
                    snap_compromised, next_snap_id, current_txg, sync_gen,
-                   most_recent_snap, did_unsafe_rollback>>
+                   most_recent_snap, did_unsafe_rollback, did_unbumped_rollback>>
 
 (***************************************************************************)
 (* TLY-A5 — Action: MarkCompromised(s) / UnmarkCompromised(s).               *)
@@ -317,7 +331,7 @@ MarkCompromised(s) ==
     /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
                    snap_created_txg, snap_extent_txg, snap_prev, snap_held,
                    next_snap_id, current_txg, sync_gen, most_recent_snap,
-                   did_unsafe_rollback>>
+                   did_unsafe_rollback, did_unbumped_rollback>>
 
 UnmarkCompromised(s) ==
     /\ s \in SnapIds
@@ -326,23 +340,30 @@ UnmarkCompromised(s) ==
     /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
                    snap_created_txg, snap_extent_txg, snap_prev, snap_held,
                    next_snap_id, current_txg, sync_gen, most_recent_snap,
-                   did_unsafe_rollback>>
+                   did_unsafe_rollback, did_unbumped_rollback>>
 
 (***************************************************************************)
-(* TLY-A5 — Action: Rollback(s) — the rollback ADMISSION GATE.               *)
+(* TLY-A5 + 9.7-spec — Action: Rollback(s).                                 *)
 (*                                                                           *)
-(* This models ONLY the marker-consultation gate, not the rollback         *)
-(* mechanism (tree-swap / block reclamation — Phase 9.7). The caller       *)
-(* supplies a `force` flag (the impl: body `<sid>` vs `force <sid>`).      *)
+(* TLY-A5 shipped the marker-consultation ADMISSION GATE only — the          *)
+(* mechanism (tree-swap / block reclamation) was deferred. 9.7-spec adds    *)
+(* the MECHANISM:                                                           *)
 (*                                                                           *)
-(* Fixed policy: a rollback to a compromised snap proceeds ONLY if force.  *)
-(* The action records, in the history variable did_unsafe_rollback,        *)
-(* whether a rollback ever proceeded on a compromised snap WITHOUT force — *)
-(* which the fixed gate makes impossible.                                  *)
+(*   - live_tree_root' = snap_tree_root[s] — the swap.                      *)
+(*   - sync_gen' = sync_gen + 1 — the R9-1 doctrine gen bump. v1's          *)
+(*     stm_snap_rollback advances fs->gen BEFORE the allocator swap so a    *)
+(*     post-rollback write to a recycled paddr uses a fresh                 *)
+(*     (paddr, write_gen) AEAD nonce. Without the bump, a paddr that was    *)
+(*     live pre-rollback AND becomes live again post-rollback would be      *)
+(*     written under the same gen, reusing the nonce.                       *)
 (*                                                                           *)
-(* Buggy variant BuggyRollbackSkipsConsult drops the consultation: a       *)
-(* non-forced rollback of a compromised snap proceeds, setting             *)
-(* did_unsafe_rollback := TRUE and tripping RollbackBlockedIffCompromised. *)
+(* Two buggy variants:                                                       *)
+(*   - BuggyRollbackSkipsConsult — admission gate skipped; setting          *)
+(*     did_unsafe_rollback := TRUE → RollbackBlockedIffCompromised fires.   *)
+(*   - BuggyRollbackSkipsGenBump (9.7-spec) — mechanism skips the gen       *)
+(*     bump; setting did_unbumped_rollback := TRUE → RollbackBumpsGen       *)
+(*     fires. Models the impl bug where a rollback handler forgets to       *)
+(*     advance fs->gen before the allocator swap.                           *)
 (*                                                                           *)
 (* The interleaving of UnmarkCompromised(s) and Rollback(s) is explored    *)
 (* by TLC for free: each is one atomic step, so a racing Rollback sees     *)
@@ -353,16 +374,24 @@ Rollback(s) ==
     /\ s \in SnapIds
     /\ Present(s)
     /\ \E force \in BOOLEAN:
-        \* Fixed gate: compromised ⇒ force required. Buggy: gate skipped. *)
+        \* TLY-A5 admission gate: compromised ⇒ force required.            *)
         /\ \/ BuggyRollbackSkipsConsult
            \/ ~snap_compromised[s]
            \/ force
         /\ did_unsafe_rollback' =
                (did_unsafe_rollback \/ (snap_compromised[s] /\ ~force))
-    /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
-                   snap_created_txg, snap_extent_txg, snap_prev, snap_held,
-                   snap_compromised, next_snap_id, current_txg, sync_gen,
-                   most_recent_snap>>
+    \* 9.7-spec mechanism: swap live_tree_root + bump sync_gen.              *)
+    /\ live_tree_root' = snap_tree_root[s]
+    /\ \/ /\ ~BuggyRollbackSkipsGenBump
+          /\ sync_gen < MaxTxg
+          /\ sync_gen' = sync_gen + 1
+          /\ did_unbumped_rollback' = did_unbumped_rollback
+       \/ /\ BuggyRollbackSkipsGenBump
+          /\ sync_gen' = sync_gen
+          /\ did_unbumped_rollback' = TRUE
+    /\ UNCHANGED <<snap_state, snap_tree_root, snap_created_txg,
+                   snap_extent_txg, snap_prev, snap_held, snap_compromised,
+                   next_snap_id, current_txg, most_recent_snap>>
 
 (***************************************************************************)
 (* Top-level Next.                                                           *)
@@ -397,6 +426,7 @@ TypeOK ==
     /\ sync_gen \in 0..MaxTxg
     /\ most_recent_snap \in 0..MaxSnaps
     /\ did_unsafe_rollback \in BOOLEAN
+    /\ did_unbumped_rollback \in BOOLEAN
 
 (* Every snapshot's created_txg is at most the current commit gen. The     *)
 (* spec's chain ordering also implies this transitively, but the direct   *)
@@ -538,6 +568,16 @@ ChainExtentTxgOrdered ==
 (* holding across all of them shows no race admits an unsafe rollback.     *)
 RollbackBlockedIffCompromised ==
     ~did_unsafe_rollback
+
+(* 9.7-spec: every Rollback transition MUST advance sync_gen by 1 (the     *)
+(* R9-1 doctrine — v1's stm_snap_rollback advances fs->gen before the      *)
+(* allocator swap, so a recycled paddr at the same gen never collides with *)
+(* the post-rollback write at that gen). did_unbumped_rollback is the      *)
+(* history variable: set TRUE whenever a Rollback transition leaves        *)
+(* sync_gen unchanged. The fixed config keeps it FALSE; the buggy variant  *)
+(* BuggyRollbackSkipsGenBump flips it the first time Rollback fires.       *)
+RollbackBumpsGen ==
+    ~did_unbumped_rollback
 
 (* TLY-A5 non-perturbation: the compromise marker is inert w.r.t. every   *)
 (* pre-A5 invariant. There is no separate invariant for this — it is the  *)
