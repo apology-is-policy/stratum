@@ -178,6 +178,7 @@ add_subdirectory(src/bootstrap)
 add_subdirectory(src/btnode)
 add_subdirectory(src/btree_store)
 add_subdirectory(src/btree_engine)
+add_subdirectory(src/metakey)
 add_subdirectory(src/alloc)
 add_subdirectory(src/alloc_roots)
 add_subdirectory(src/keyfile)
@@ -226,6 +227,7 @@ target_link_libraries(stratum INTERFACE
     stm_btree_store
     stm_btree_engine
     stm_engine_store
+    stm_metakey
     stm_alloc
     stm_alloc_roots
     stm_sdarray
