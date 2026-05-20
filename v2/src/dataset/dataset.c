@@ -863,11 +863,11 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  * The dataset index is persisted as a single btree_store-encoded tree
  * under ub_main_root. Keyspace:
  *   - le64 0   → pool-property defaults  (value: 8 * STM_PROP_COUNT bytes;
- *                v22 = 40, v20 = 32, v19 = 24).
+ *                v22+ = 40, v20 = 32, v19 = 24).
  *   - le64 ≥1  → packed dataset entry
  *                  (value: DS_VAL_FIXED + name_len bytes;
- *                   v22 = 80 + name_len, v20 = 72 + name_len,
- *                   v19 = 64 + name_len).
+ *                   v30 = 128 + name_len, v22 = 80 + name_len,
+ *                   v20 = 72 + name_len, v19 = 64 + name_len).
  *
  * Implementation mirrors src/alloc_roots/alloc_roots.c — same vtable shape,
  * same dirty-flag idempotency, same Merkle + AEAD chain via btree_store.
@@ -884,13 +884,36 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  *        local_value grows from 32 to 40 bytes; origin_snap_id moves
  *        from offset 64 to offset 72; DS_VAL_FIXED grows from 72 to 80.
  *        v21 pools refused at v22 mount via uniform STM_EBADVERSION.
+ *   v30: per-dataset metadata-tree root triple appended after
+ *        origin_snap_id (9.7-impl-1b — Phase 9.7 D1). Three new fields:
+ *        di_tree_root (le64) at offset 80, di_root_gen (le64) at offset
+ *        88, di_root_csum[32] at offset 96. DS_VAL_FIXED grows from
+ *        80 to 128. v29 pools refused at v30 mount via uniform
+ *        STM_EBADVERSION. The triple's all-zero state is the
+ *        "empty dataset" sentinel — fresh datasets persist zeros
+ *        until their first sync_commit produces a real engine root.
+ *        Per-dataset routing through the recorded triple is wired in
+ *        at 9.7-impl-1c; at 1b the fields are encoded/decoded but
+ *        the engine still routes through the pool-global 4-engine
+ *        cascade.
  * ========================================================================= */
 
 #define DS_KEY_LEN              8u
-/* v22: 32 bytes fixed prefix + 40 bytes local_value (5 × le64) + 8 bytes
- * origin_snap_id = 80 fixed bytes. */
-#define DS_VAL_FIXED            80u
+/* v30: 80-byte v22 prefix + 8-byte di_tree_root + 8-byte di_root_gen
+ * + 32-byte di_root_csum = 128 fixed bytes. */
+#define DS_VAL_FIXED            128u
 #define DS_VAL_MAX              (DS_VAL_FIXED + STM_DATASET_NAME_MAX)
+/* The v22 prefix length, before the v30 triple. Used as a literal
+ * offset by the encoder/decoder for the three new fields. */
+#define DS_VAL_V22_PREFIX_LEN   80u
+#define DS_VAL_TREE_ROOT_OFF    (DS_VAL_V22_PREFIX_LEN + 0u)
+#define DS_VAL_ROOT_GEN_OFF     (DS_VAL_V22_PREFIX_LEN + 8u)
+#define DS_VAL_ROOT_CSUM_OFF    (DS_VAL_V22_PREFIX_LEN + 16u)
+#define DS_VAL_ROOT_CSUM_LEN    32u
+_Static_assert(DS_VAL_V22_PREFIX_LEN + 8u + 8u + DS_VAL_ROOT_CSUM_LEN
+                   == DS_VAL_FIXED,
+               "DS_VAL_FIXED must equal the sum of the v22 prefix + "
+               "the v30 triple sizes.");
 #define DS_POOL_DEFAULTS_KEY    UINT64_C(0)
 #define DS_POOL_DEFAULTS_VAL_LEN  (8u * STM_PROP_COUNT)
 
@@ -959,6 +982,15 @@ static size_t ds_encode_dataset_value(const dataset_slot *s,
     /* v22: origin_snap_id at offset 32 + 8*STM_PROP_COUNT
      * (= 72 at STM_PROP_COUNT=5). Was at offset 56 pre-v20, 64 at v20. */
     memcpy(out + 32u + 8u * STM_PROP_COUNT, origin.v, 8);
+    /* v30 (9.7-impl-1b): per-dataset metadata-tree root triple at
+     * offset 80 (DS_VAL_V22_PREFIX_LEN). Fresh datasets persist the
+     * all-zero triple (the "empty dataset" sentinel). */
+    le64 tree_root = stm_store_le64(s->e.di_tree_root);
+    le64 root_gen  = stm_store_le64(s->e.di_root_gen);
+    memcpy(out + DS_VAL_TREE_ROOT_OFF, tree_root.v, 8);
+    memcpy(out + DS_VAL_ROOT_GEN_OFF,  root_gen.v,  8);
+    memcpy(out + DS_VAL_ROOT_CSUM_OFF, s->e.di_root_csum,
+              DS_VAL_ROOT_CSUM_LEN);
     if (s->e.name_len > 0) {
         memcpy(out + DS_VAL_FIXED, s->e.name, s->e.name_len);
     }
@@ -1012,6 +1044,17 @@ static stm_status ds_decode_dataset_value(uint64_t id, const uint8_t *in,
      * STM_PROP_COUNT=5). Mirror of the encode offset. */
     memcpy(origin.v, in + 32u + 8u * STM_PROP_COUNT, 8);
     out_slot->e.origin_snap_id = stm_load_le64(origin);
+    /* v30 (9.7-impl-1b): per-dataset metadata-tree root triple. The
+     * length check `in_len != DS_VAL_FIXED + name_len` above already
+     * gates us; a v29-shaped record (DS_VAL_FIXED=80) decoded as v30
+     * fails the length check before reaching here. */
+    le64 tree_root, root_gen;
+    memcpy(tree_root.v, in + DS_VAL_TREE_ROOT_OFF, 8);
+    memcpy(root_gen.v,  in + DS_VAL_ROOT_GEN_OFF,  8);
+    out_slot->e.di_tree_root = stm_load_le64(tree_root);
+    out_slot->e.di_root_gen  = stm_load_le64(root_gen);
+    memcpy(out_slot->e.di_root_csum, in + DS_VAL_ROOT_CSUM_OFF,
+              DS_VAL_ROOT_CSUM_LEN);
     if (name_len > 0) {
         memcpy(out_slot->e.name, in + DS_VAL_FIXED, name_len);
     }

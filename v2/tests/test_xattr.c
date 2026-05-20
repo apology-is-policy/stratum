@@ -21,7 +21,7 @@
  *     tombstones surviving the persistence path.
  *   - Probe-only / range-truncation getxattr shapes (POSIX getxattr(2)).
  *   - Drop-for-ino.
- *   - On-disk layout sanity: STM_UB_VERSION compile-time at 29.
+ *   - On-disk layout sanity: STM_UB_VERSION compile-time at 30.
  */
 #include "tharness.h"
 
@@ -726,11 +726,11 @@ STM_TEST(xattr_set_crypt_ctx_refuses_rebind) {
 /* Compile-time invariants.                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(xattr_ub_version_is_v29) {
-    /* 9.6-impl-4d bumps STM_UB_VERSION 28 → 29 for the extent index
-     * cutover to btree_engine. The xattr layer's on-disk format is
+STM_TEST(xattr_ub_version_is_v30) {
+    /* 9.7-impl-1b bumps STM_UB_VERSION 29 → 30 for the per-dataset
+     * metadata-tree substrate. The xattr layer's on-disk format is
      * unchanged since v26 but rides the latest version constant. */
-    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)29u);
+    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)30u);
 }
 
 /* ------------------------------------------------------------------ */

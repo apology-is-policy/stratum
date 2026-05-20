@@ -16,7 +16,7 @@
  *   - Persistence: alloc / commit / close / open / load_at / lookup
  *     roundtrip across mount boundaries with both live records and
  *     tombstones surviving the persistence path.
- *   - On-disk layout sanity: STM_UB_VERSION compile-time at 29.
+ *   - On-disk layout sanity: STM_UB_VERSION compile-time at 30.
  */
 #include "tharness.h"
 
@@ -509,12 +509,12 @@ STM_TEST(dirent_set_crypt_ctx_refuses_rebind) {
     stm_dirent_index_close(idx);
 }
 
-STM_TEST(dirent_ub_version_is_v29) {
-    /* 9.6-impl-4d bumped STM_UB_VERSION 28 → 29 for the extent index
-     * cutover to btree_engine (v2/include/stratum/super.h). The dirent
+STM_TEST(dirent_ub_version_is_v30) {
+    /* 9.7-impl-1b bumped STM_UB_VERSION 29 → 30 for the per-dataset
+     * metadata-tree substrate (v2/include/stratum/super.h). The dirent
      * layer's on-disk format is unchanged since v25 but rides the
      * latest version constant. */
-    STM_ASSERT_EQ(STM_UB_VERSION, 29u);
+    STM_ASSERT_EQ(STM_UB_VERSION, 30u);
 }
 
 /* R73 P2-1: stm_dirent_drop_for_dir bulk-removes every record keyed

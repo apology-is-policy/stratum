@@ -196,10 +196,13 @@ off  size  field
  30    2   name_len         (le16; 0..STM_DATASET_NAME_MAX)
  32   40   local_value[STM_PROP_COUNT] (5 × le64, in property-id order)
  72    8   origin_snap_id   (le64; STM_DATASET_NO_ORIGIN for non-clones)
- 80    L   name             (UTF-8, no NUL)
+ 80    8   di_tree_root     (le64; paddr of per-dataset btree_engine root; v30)
+ 88    8   di_root_gen      (le64; AEAD gen + birth-gen of the root; v30)
+ 96   32   di_root_csum[32] (BLAKE3-256 of the root node ciphertext; v30)
+128    L   name             (UTF-8, no NUL)
 ```
 
-Total: `80 + name_len` bytes. `DS_VAL_FIXED == 80`.
+Total: `128 + name_len` bytes (v30). `DS_VAL_FIXED == 128`.
 
 Layout history:
 - pre-v10: 56 + name_len (no `origin_snap_id`).
@@ -211,10 +214,24 @@ Layout history:
 - v21 → v22 (P7-CAS-12 STM_PROP_PROMOTE_DECAY_WINDOW):
   local_value grew from 32 to 40 bytes; `origin_snap_id` moved
   from offset 64 to offset 72; total 80 + name_len.
+- v29 → v30 (Phase 9.7-impl-1b, per-dataset metadata-tree
+  substrate): appended `di_tree_root` (le64) + `di_root_gen`
+  (le64) + `di_root_csum[32]` after `origin_snap_id`. Total
+  grows from 80 to 128 + name_len. The triple is the dataset's
+  per-dataset `btree_engine` root identity — paddr +
+  AEAD-gen-with-birth-gen + Merkle csum. Fresh datasets persist
+  the all-zero triple (the "empty dataset" sentinel — the
+  engine's `open` accepts it as a degenerate empty tree).
+  9.7-impl-1c wires the per-dataset routing; at 1b the fields
+  are encoded / decoded but the engine still routes through
+  the pool-global 4-engine cascade.
 
 The encoder/decoder express `origin_snap_id`'s offset as
 `32 + 8 * STM_PROP_COUNT` so future STM_PROP_COUNT bumps slide it
-without code duplication.
+without code duplication. The v30 triple is at literal offset 80
+via the `DS_VAL_V22_PREFIX_LEN` constant; future bumps that grow
+the v22 prefix (e.g., STM_PROP_COUNT > 5) MUST slide the triple's
+offsets in lockstep AND bump STM_UB_VERSION.
 
 ### Crypt + Merkle
 

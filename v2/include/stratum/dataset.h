@@ -141,12 +141,23 @@ typedef enum {
 stm_property_kind stm_property_kind_of(stm_property p);
 
 /*
- * Per-dataset entry. Mirrors ARCH §8.3.2 stm_dataset_index_entry but
- * omits di_tree_root + di_key_slot + di_local_props which are added
- * in follow-on chunks (extents + key schema + property system).
+ * Per-dataset entry. Mirrors ARCH §8.3.2 stm_dataset_index_entry.
  *
  * `name` is null-terminated; `name_len` is the byte count excluding
  * the NUL.
+ *
+ * 9.7-impl-1b (v30) extension: the `di_tree_root` / `di_root_gen` /
+ * `di_root_csum` triple is the dataset's per-dataset metadata tree's
+ * durable identity, surfaced for the per-dataset `btree_engine`
+ * instance that 9.7-impl-1c wires in. At 1b the triple is encoded /
+ * decoded but the engine still routes through the pool-global
+ * 4-engine cascade; the per-dataset routing arrives at 1c. The
+ * all-zero triple is the "empty dataset" sentinel — the engine's
+ * `open` accepts it as a degenerate empty tree (the first sync
+ * commits an actual paddr).
+ *
+ * See `v2/docs/phase-9.7-design.md` §3.1 for the dataset-entry
+ * shape rationale.
  */
 typedef struct {
     uint64_t id;                  /* unique, monotonically assigned */
@@ -163,6 +174,24 @@ typedef struct {
      * holds because Snapshot.Delete refuses while any clone
      * references the snap. */
     uint64_t origin_snap_id;
+    /* 9.7-impl-1b (v30): per-dataset metadata-tree root triple.
+     *   - di_tree_root: paddr of the dataset's btree_engine root.
+     *   - di_root_gen:  AEAD gen at which the root node was
+     *                   encrypted (also the per-node birth-gen
+     *                   from 24-btree-engine.md §3.9). Carries
+     *                   into the engine's AEAD additional-data so
+     *                   tampering forces decrypt failure.
+     *   - di_root_csum: BLAKE3-256 of the root node ciphertext —
+     *                   the Merkle link from the dataset entry
+     *                   into the engine's tree.
+     *
+     * The all-zero triple is the "empty dataset" sentinel; a fresh
+     * dataset persists this until its first sync commits real
+     * bytes. Snapshot create (9.7-impl-3) reads this triple to
+     * capture the dataset's current durable identity. */
+    uint64_t di_tree_root;
+    uint64_t di_root_gen;
+    uint8_t  di_root_csum[32];
 } stm_dataset_entry;
 
 struct stm_dataset_index;
@@ -453,7 +482,7 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  *                               at v19; 8 × N in general).
  *
  * On-disk per-dataset value (variable length, name_len bytes for the name).
- * v22 layout (current):
+ * v30 layout (current):
  *
  *   off  size  field
  *    0    8   parent_id (le64)
@@ -462,11 +491,14 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  *   24    4   flags (le32)
  *   28    2   local_set_bitmap (le16) — bits 0..STM_PROP_COUNT-1 = local_set[]
  *   30    2   name_len (le16) — 0..STM_DATASET_NAME_MAX
- *   32   40   local_value[STM_PROP_COUNT] (5 × le64 at v22, in property-id order)
- *   72    8   origin_snap_id (le64) — STM_DATASET_NO_ORIGIN (0) for non-clones (v10)
- *   80    L   name (UTF-8, no NUL)   L = name_len
+ *   32   40   local_value[STM_PROP_COUNT] (5 × le64 at v30, in property-id order)
+ *   72    8   origin_snap_id (le64) — STM_DATASET_NO_ORIGIN (0) for non-clones
+ *   80    8   di_tree_root (le64) — paddr of per-dataset btree_engine root (v30, 9.7-impl-1b)
+ *   88    8   di_root_gen  (le64) — AEAD gen + per-node birth-gen of the root
+ *   96   32   di_root_csum[32]    — BLAKE3-256 of the root node ciphertext
+ *  128    L   name (UTF-8, no NUL)   L = name_len
  *
- * Total: 80 + name_len bytes (v22).
+ * Total: 128 + name_len bytes (v30).
  *
  * Format-break history:
  *   v9  → v10: added origin_snap_id at offset 56 (P6-clone). Total
@@ -478,6 +510,12 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  *              STM_PROP_PROMOTE_DECAY_WINDOW). local_value grows from
  *              32 to 40 bytes; origin_snap_id moves from offset 64 to
  *              offset 72; total 80 + name_len.
+ *   v29 → v30: per-dataset metadata-tree root triple appended after
+ *              origin_snap_id (9.7-impl-1b). di_tree_root + di_root_gen
+ *              + di_root_csum[32] (48 bytes total). Total grows from
+ *              80 to 128 + name_len. Fresh datasets persist the
+ *              all-zero triple (the "empty dataset" sentinel). v29
+ *              pools refused at v30 mount via uniform STM_EBADVERSION.
  *
  * The on-disk encoder/decoder express origin_snap_id's offset as
  * `32 + 8 * STM_PROP_COUNT` so future STM_PROP_COUNT bumps slide it
