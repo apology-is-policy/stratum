@@ -465,7 +465,7 @@ static stm_status fs_flush_all_locked(stm_fs *fs);
 static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs, uint64_t ds,
                                                   uint64_t ino,
                                                   const struct stm_inode_value *cv);
-static void fs_post_inode_free_reclaim_locked(stm_fs *fs);
+static bool fs_post_inode_free_reclaim_locked(stm_fs *fs);
 
 static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
                        stm_alloc *a, stm_sync *sync, bool ro,
@@ -964,7 +964,19 @@ stm_status stm_fs_commit(stm_fs *fs)
         return fr;
     }
     stm_status s = stm_sync_commit(fs->sync);
+    /* R154 P2-1: a failed stm_sync_commit is crash-equivalent — the
+     * inode engine's three-phase abort dropped the in-memory tree
+     * (9.6-impl-4b design §5.5). Wedge so a retry (fsync IS retryable;
+     * the 9P Tfsync / Tsync handlers + /ctl/'s seal-bit commit re-issue
+     * it) is refused with STM_EWEDGED instead of silently committing
+     * the reverted-to-previous-durable inode tree. Deferred past the
+     * unlock — stm_fs_mark_wedged itself takes fs->global (fs.c:31).
+     * The fs_flush_all_locked failure above is deliberately NOT wedged:
+     * it leaves the dirty buffer intact for retry — only the inode-
+     * engine abort makes a failure unrecoverable. */
+    bool should_wedge = (s != STM_OK);
     pthread_rwlock_unlock(&fs->global);
+    if (should_wedge) stm_fs_mark_wedged(fs);
     return s;
 }
 
@@ -2023,12 +2035,16 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
      * only files, directories, symlinks ALL skip the ~200ms commit
      * pair) AND (b) fs_free == STM_OK so a failed free doesn't
      * commit half-baked state. */
+    bool needs_wedge = false;
     if (cleanup_did_truncate && fs_free == STM_OK) {
-        fs_post_inode_free_reclaim_locked(fs);
+        needs_wedge = fs_post_inode_free_reclaim_locked(fs);
     }
 
     stm_inode_unpin(iidx, h);
     pthread_rwlock_unlock(&fs->global);
+    /* R154 P1-1: a failed reclaim commit is crash-equivalent — wedge
+     * AFTER the unlock (stm_fs_mark_wedged takes fs->global; fs.c:31). */
+    if (needs_wedge) stm_fs_mark_wedged(fs);
     return fs_free;
 }
 
@@ -2091,17 +2107,33 @@ static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs,
 
 /* R128 P1-1 + P1-2: post-free reclaim helper. Double-commit to step
  * the allocator's free_gen past committed_gen (R50 P2-1 strict-less-
- * than predicate). Caller MUST hold fs->lock. Same posture as the
+ * than predicate). Caller MUST hold fs->global. Same posture as the
  * inline double-commit at the original unlink path's reclaim trigger
  * (SWISS-4q P2). Extracted so rename + unlink_anon can reuse it.
  *
  * Cost: two stm_sync_commit calls (~10-50 ms each on local NVMe).
  * Acceptable; the alternative is permanent PENDING leak per cycle.
+ *
+ * R154 P1-1: returns `true` if the fs MUST be wedged. 9.6-impl-4b-ii
+ * made the inode engine's commit-abort drop the in-memory tree, so a
+ * failed stm_sync_commit is crash-equivalent (4b design §5.5) — it
+ * can no longer be retried in-process. The pre-4b code issued the
+ * second commit UNCONDITIONALLY; if the first failed (aborting the
+ * inode flush — the engine reverts to its previous durable root),
+ * that retry would re-commit a tree in which the just-FREED inode is
+ * ALLOCATED again while its extents are already reclaimed — corruption
+ * / an unmountable pool. So: on the first commit's failure, STOP — do
+ * NOT issue the retry — and signal the caller to wedge. A failed
+ * second commit also wedges (any failed stm_sync_commit is crash-
+ * equivalent per §5.5). The caller fires stm_fs_mark_wedged AFTER its
+ * own pthread_rwlock_unlock — the fs.c:31 deferred-wedge doctrine,
+ * since stm_fs_mark_wedged itself takes fs->global.
  */
-static void fs_post_inode_free_reclaim_locked(stm_fs *fs)
+static bool fs_post_inode_free_reclaim_locked(stm_fs *fs)
 {
-    (void)stm_sync_commit(fs->sync);
-    (void)stm_sync_commit(fs->sync);
+    if (stm_sync_commit(fs->sync) != STM_OK) return true;
+    if (stm_sync_commit(fs->sync) != STM_OK) return true;
+    return false;
 }
 
 /* Common path for unlink / rmdir. `expect_dir` selects the type
@@ -2387,13 +2419,17 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
      * commit pair per unlink even though they had no extents to
      * reclaim. Triggered by ctest's parallel-4 timeouts when test_fs's
      * 159 tests each ran a few unlinks. */
+    bool needs_wedge = false;
     if (freed && cleanup_did_truncate) {
-        fs_post_inode_free_reclaim_locked(fs);
+        needs_wedge = fs_post_inode_free_reclaim_locked(fs);
     }
 
     stm_inode_unpin(iidx, h_parent);
     stm_inode_unpin(iidx, h_child);
     pthread_rwlock_unlock(&fs->global);
+    /* R154 P1-1: a failed reclaim commit is crash-equivalent — wedge
+     * AFTER the unlock (stm_fs_mark_wedged takes fs->global; fs.c:31). */
+    if (needs_wedge) stm_fs_mark_wedged(fs);
     return STM_OK;
 }
 
@@ -4164,11 +4200,15 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
      * a directory or symlink target (no extents) skips the ~200 ms
      * commit pair. */
     if (dst_freed_unused && dst_cleanup_did_truncate) {
-        fs_post_inode_free_reclaim_locked(fs);
+        /* R154 P1-1: capture wedge-intent; a failed reclaim commit is
+         * crash-equivalent. Reuses rename's should_wedge — fired AFTER
+         * the unlock per the R133 P1-2 deferred-wedge doctrine. */
+        if (fs_post_inode_free_reclaim_locked(fs)) should_wedge = true;
     }
 
     FS_RENAME_UNPIN_ALL();
     pthread_rwlock_unlock(&fs->global);
+    if (should_wedge) stm_fs_mark_wedged(fs);
     return STM_OK;
     #undef FS_RENAME_UNPIN_ALL
 }

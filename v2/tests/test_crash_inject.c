@@ -280,4 +280,60 @@ STM_TEST(crash_inject_free_commit_sweep_recovers_clean) {
     STM_ASSERT(injected_points > 0u);
 }
 
+/* R154 P2-1 regression: a failed stm_sync_commit MUST wedge the fs.
+ *
+ * 9.6-impl-4b-iii made the inode engine's three-phase abort drop the
+ * in-memory tree (crash-equivalent semantics; 4b design §5.5). After a
+ * failed stm_sync_commit the engine has reverted to its previous
+ * durable root — an in-process retry would silently commit that
+ * reverted state, dropping every uncommitted inode mutation (P2-1
+ * silent metadata loss) or, on the unlink reclaim path, durably
+ * resurrecting a just-FREED inode while its extents are already
+ * reclaimed (P1-1 corruption / unmountable pool). The fix: any
+ * stm_sync_commit != STM_OK wedges the fs so a retry is refused.
+ *
+ * This test arms a bdev-level write injection during stm_fs_commit
+ * and asserts (a) the commit fails, (b) the injection fired, (c) the
+ * fs is now wedged (stm_fs_stats reflects it), and (d) a retry is
+ * refused with STM_EWEDGED. Both the P1-1 and P2-1 fixes share this
+ * "wedge on failed sync" shape; this test gates the regression for
+ * the P2-1 site (stm_fs_commit) directly and for P1-1's helper by
+ * the same fix-shape. */
+STM_TEST(r154_failed_commit_wedges_fs) {
+    make_tmp(0xFEED54u);
+
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(warm_up(&fs));
+
+    /* Dirty the allocator (the reserve is in-RAM only); the next bdev
+     * writes are inside stm_fs_commit. The fix wedges on ANY
+     * stm_sync_commit failure, so wherever the injected write lands
+     * inside the commit is fine. */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_fs_reserve(fs, 4u, 0, &p));
+
+    stm_bdev *bdev = stm_fs_bdev_for_test(fs);
+    STM_ASSERT(bdev != NULL);
+    stm_bdev_inject_fail_after(bdev, 1);
+
+    stm_status cs = stm_fs_commit(fs);
+    STM_ASSERT(cs != STM_OK);
+    STM_ASSERT(stm_bdev_inject_fired_count(bdev) > 0u);
+
+    /* (R154 P2-1 fix) The fs is wedged. */
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT(st.wedged);
+
+    /* (R154 P2-1 fix) The retry-after-failed-sync attack class is
+     * closed — a second stm_fs_commit is refused with STM_EWEDGED
+     * rather than silently committing the reverted-to-previous-
+     * durable state. */
+    STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+
+    (void)stm_fs_unmount(fs);
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("crash_inject")
