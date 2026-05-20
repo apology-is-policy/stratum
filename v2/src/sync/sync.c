@@ -1430,17 +1430,15 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                                                    s->dataset_idx);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
-        /* P8-POSIX-2 (v25): dirent index. Same wiring shape as
-         * inode_idx. AEAD-encrypted Bε-tree under ub_dirent_root on
-         * device 0. Keys (le64 dataset_id || le64 dir_ino || le64
-         * hash_probe). Values: variable-length 32 + name_len byte
-         * dirent records. Empty at format time. */
+        /* 9.7-impl-1c-iii: dirent index. Same wiring shape as inode_idx
+         * at 1c-ii — the module borrows the dataset index and resolves
+         * each dataset's per-dataset btree_engine on demand. The
+         * pool-global dirent tree under ub_dirent_root is RETIRED;
+         * stamped zero at v30. */
         s->dirent_idx = stm_dirent_index_create();
         if (!s->dirent_idx) { stm_sync_close(s); return STM_ENOMEM; }
-        rc = stm_dirent_index_set_storage(s->dirent_idx, d, boot);
-        if (rc != STM_OK) { stm_sync_close(s); return rc; }
-        rc = stm_dirent_index_set_crypt_ctx(s->dirent_idx, s->metadata_key,
-                                                s->pool_uuid, s->device_uuid);
+        rc = stm_dirent_index_attach_dataset_index(s->dirent_idx,
+                                                    s->dataset_idx);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
         /* P8-POSIX-6 (v26): xattr index. Same wiring shape as
@@ -2154,30 +2152,20 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         s2->inode_root_gen   = 0;
         memset(s2->inode_root_csum, 0, 32);
 
-        /* P8-POSIX-2 (v25): dirent index. Same wiring as inode_idx. */
+        /* 9.7-impl-1c-iii: dirent index. Same wiring as inode_idx at
+         * 1c-ii — borrowed dataset index; per-dataset engines hold
+         * the records. The pool-global ub_dirent_root is RETIRED;
+         * any non-zero on-disk value at v30 is treated as stale
+         * (post-migration writes stamp zero). The dirent_root mirror
+         * fields are kept zero on this path. */
         s2->dirent_idx = stm_dirent_index_create();
         if (!s2->dirent_idx) { stm_sync_close(s2); return STM_ENOMEM; }
-        stm_status dni = stm_dirent_index_set_storage(s2->dirent_idx, meta_bdev, boot2);
+        stm_status dni = stm_dirent_index_attach_dataset_index(s2->dirent_idx,
+                                                                s2->dataset_idx);
         if (dni != STM_OK) { stm_sync_close(s2); return dni; }
-        dni = stm_dirent_index_set_crypt_ctx(s2->dirent_idx, s2->metadata_key,
-                                                s2->pool_uuid, s2->device_uuid);
-        if (dni != STM_OK) { stm_sync_close(s2); return dni; }
-
-        uint64_t dpaddr = stm_load_le64(ub.ub_dirent_root.bp_paddr);
-        uint64_t dgen   = stm_load_le64(ub.ub_dirent_root_gen);
-        if (dpaddr != 0) {
-            if (ub.ub_dirent_root.bp_kind != STM_BPTR_KIND_DIRENT_TREE) {
-                stm_sync_close(s2);
-                return STM_ECORRUPT;
-            }
-            stm_status ls = stm_dirent_index_load_at(s2->dirent_idx,
-                                                        dpaddr, dgen,
-                                                        ub.ub_dirent_root.bp_csum);
-            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
-        }
-        s2->dirent_root_paddr = dpaddr;
-        s2->dirent_root_gen   = dgen;
-        memcpy(s2->dirent_root_csum, ub.ub_dirent_root.bp_csum, 32);
+        s2->dirent_root_paddr = 0;
+        s2->dirent_root_gen   = 0;
+        memset(s2->dirent_root_csum, 0, 32);
 
         /* P8-POSIX-6 (v26): xattr index. Same wiring as dirent_idx. */
         s2->xattr_idx = stm_xattr_index_create();
@@ -2751,29 +2739,16 @@ stm_status stm_sync_commit(stm_sync *s)
     uint8_t  inode_csum[32] = {0};
     uint64_t inode_gen = 0;
 
-    /* P8-POSIX-2 (v25) / 9.6-impl-4c: FLUSH the dirent index. The
-     * dirent module is btree_engine-backed (incremental-COW B+tree);
-     * commit_flush writes the dirty root-to-leaf paths to fresh
-     * paddrs at target_gen and returns the PROSPECTIVE (paddr, gen,
-     * csum) — durable only after commit_finalize in Phase 3. Same
-     * shape as the extent flush above. From here every error `return`
-     * MUST abort BOTH extent AND dirent (the dirent flush opened its
-     * OWN pending window now). */
+    /* 9.7-impl-1c-iii: dirent tree's per-pool engine is RETIRED. Per-
+     * dataset dirent records flush as part of the M-engine cascade
+     * (commit_engines_flush) that ran BEFORE dataset_index_commit
+     * above. The dirent_csum slot in the pool Merkle root is zero
+     * bytes at v30 (transitively covered by main_csum). UB
+     * ub_dirent_root/_csum/_gen are stamped zero. Full UB field
+     * retirement to reserved-on-the-wire lands at 1c-vi. */
     uint64_t dirent_paddr = 0;
     uint8_t  dirent_csum[32] = {0};
     uint64_t dirent_gen = 0;
-    stm_status dcs = stm_dirent_index_commit_flush(s->dirent_idx, target_gen,
-                                                    &dirent_paddr, &dirent_gen,
-                                                    dirent_csum);
-    if (dcs != STM_OK) {
-        /* dirent flush self-reverts; extent has a pending window +
-         * the ds_idx M-cascade has pending engines that must be
-         * aborted. */
-        (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return dcs;
-    }
 
     /* P8-POSIX-6 (v26) / 9.6-impl-4c: FLUSH the xattr index. Same
      * shape as dirent. */
@@ -2784,11 +2759,10 @@ stm_status stm_sync_commit(stm_sync *s)
                                                    &xattr_paddr, &xattr_gen,
                                                    xattr_csum);
     if (xcs != STM_OK) {
-        /* xattr flush self-reverts; extent + dirent have pending
-         * windows + the ds_idx M-cascade has pending engines that
-         * must be aborted. */
+        /* xattr flush self-reverts; extent has a pending window +
+         * the ds_idx M-cascade has pending engines that must be
+         * aborted. */
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return xcs;
@@ -2798,7 +2772,6 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
@@ -2815,13 +2788,17 @@ stm_status stm_sync_commit(stm_sync *s)
      * index tree's (P7-CAS v18). R8-P1-1: refuse to commit on BLAKE3
      * OOM.
      *
-     * 9.7-impl-1c-ii: `inode_csum` is now ZERO bytes — the per-pool
+     * 9.7-impl-1c-ii: `inode_csum` is ZERO bytes — the per-pool
      * inode engine is retired; per-dataset inode records are
      * transitively covered by `main_csum` (the dataset_index tree's
      * root csum, which serializes each slot's per-dataset triple).
-     * The slot stays in the compute_merkle_root signature for now;
-     * full retirement of inode_csum + ub_inode_root/_csum/_gen lands
-     * at 1c-vi. inode_csum is zero by initialiser. */
+     * 9.7-impl-1c-iii: `dirent_csum` is ZERO bytes for the same
+     * reason — per-pool dirent engine retired; per-dataset dirent
+     * records flow through the same dataset_index triples. Both
+     * slots stay in compute_merkle_root's signature for now; full
+     * retirement of inode_csum / dirent_csum + corresponding UB
+     * fields lands at 1c-vi when all four pool-global engines are
+     * retired together. */
     uint8_t new_merkle_root[32];
     stm_status ms = compute_merkle_root(main_csum,   /* main */
                                           roots_csum,
@@ -2831,13 +2808,12 @@ stm_status stm_sync_commit(stm_sync *s)
                                           extent_csum,
                                           repair_log_csum,
                                           inode_csum,    /* zero @ 1c-ii */
-                                          dirent_csum,   /* P8-POSIX-2 */
+                                          dirent_csum,   /* zero @ 1c-iii */
                                           xattr_csum,    /* P8-POSIX-6 */
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
@@ -2876,7 +2852,6 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_bootstrap *boot = stm_alloc_bootstrap(s->alloc);
     if (!boot) {
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
@@ -2885,7 +2860,6 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status bcs = stm_bootstrap_commit(boot, target_gen);
     if (bcs != STM_OK) {
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
@@ -2923,7 +2897,6 @@ stm_status stm_sync_commit(stm_sync *s)
                                                 fin_label, fin_slot);
     if (fw != STM_OK) {
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
@@ -2950,17 +2923,20 @@ stm_status stm_sync_commit(stm_sync *s)
      *
      * 9.7-impl-1c-ii: the per-pool inode finalize is RETIRED; the
      * per-dataset inode records' finalize lives in the M-cascade
-     * commit_engines_finalize below (every PRESENT dataset's engine). */
+     * commit_engines_finalize below (every PRESENT dataset's engine).
+     * 9.7-impl-1c-iii: the per-pool dirent finalize is RETIRED for
+     * the same reason; per-dataset dirent records finalize in the
+     * same M-cascade pass. */
     stm_status efs = stm_extent_index_commit_finalize(s->extent_idx);
     if (efs != STM_OK) {
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return efs;
     }
-    stm_status dfs = stm_dirent_index_commit_finalize(s->dirent_idx);
-    if (dfs != STM_OK) {
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return dfs;
-    }
+    /* 9.7-impl-1c-iii: per-pool dirent finalize is RETIRED; the
+     * per-dataset dirent records' finalize lives in the M-cascade
+     * commit_engines_finalize below (every PRESENT dataset's engine,
+     * paired with the inode finalize that 1c-ii folded into the same
+     * cascade). */
     stm_status xfs = stm_xattr_index_commit_finalize(s->xattr_idx);
     if (xfs != STM_OK) {
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);

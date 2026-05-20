@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * test_dirent.c — P8-POSIX-2.
+ * test_dirent.c — P8-POSIX-2 + 9.7-impl-1c-iii.
  *
  * Exercises the dirent index per `v2/specs/dirent.tla`:
  *
- *   - Lifecycle (create / close).
+ *   - Lifecycle (create / close / attach).
  *   - Alloc / lookup / unlink / count_for_dir basic paths.
  *   - Chain integrity: tombstone-after-unlink preserves reachability of
  *     a colliding name at a higher probe index (the canonical
@@ -13,16 +13,26 @@
  *   - Argument validation matrix: every documented refusal in dirent.h
  *     is exercised and asserted symmetric with the on-disk decoder
  *     (R71 P1-1 lesson — writer-side guards mirror decoder-side guards).
- *   - Persistence: alloc / commit / close / open / load_at / lookup
- *     roundtrip across mount boundaries with both live records and
- *     tombstones surviving the persistence path.
+ *   - D1 invariant from dirent's side: per-dataset engines distinct;
+ *     same-key lookups across datasets see independent values.
  *   - On-disk layout sanity: STM_UB_VERSION compile-time at 30.
+ *
+ * 9.7-impl-1c-iii: the dirent module no longer owns its own engine —
+ * records live in each dataset's per-dataset btree_engine, resolved
+ * via an attached `stm_dataset_index`. The fixture builds bdev +
+ * boot + ds_idx + creates a roster of test datasets, then attaches
+ * the dirent index. Tests that exercise dataset_ids 1..16 just work
+ * (the fixture pre-creates them). Persistence-specific tests from
+ * P8-POSIX-2 + 9.6-impl-4c are dropped — that persistence layer is
+ * now in the dataset_index + per-dataset engines.
  */
 #include "tharness.h"
 
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
+#include <stratum/btree_engine.h>
 #include <stratum/crypto.h>
+#include <stratum/dataset.h>
 #include <stratum/dirent.h>
 #include <stratum/dirent_testing.h>
 #include <stratum/super.h>
@@ -37,26 +47,20 @@
 
 #define DI_DEVICE_BYTES        (UINT64_C(64) * 1024u * 1024u)
 #define DI_BOOTSTRAP_BYTES     (UINT64_C(8)  * 1024u * 1024u)
+#define DI_DS_ROSTER_MAX       16u
 
 static const uint64_t DI_POOL_UUID[2]   = { 0xAA01, 0xBB01 };
 static const uint64_t DI_DEVICE_UUID[2] = { 0xCC01, 0xDD01 };
 static const uint8_t  DI_KEY[32]        = { 0x55, 0x66, 0x77 };
 
 /* ------------------------------------------------------------------ */
-/* Storage fixture for in-memory-op tests.                              */
+/* Storage fixture.                                                    */
 /*                                                                      */
-/* 9.6-impl-4c: the dirent module is btree_engine-backed, so every op   */
-/* (alloc / lookup / unlink / count / readdir / swap / whiteout / drop) */
-/* needs a bound bdev + bootstrap. `di_test_idx` builds them + a fully- */
-/* bound index; `di_test_idx_close` tears it all down. Mirrors the      */
-/* inode test fixture (test_inode.c::inode_test_idx). The harness runs  */
-/* tests sequentially in one process, so a single static fixture slot   */
-/* (g_fx_*) is safe.                                                    */
-/*                                                                      */
-/* Tests that intentionally exercise the unbound surface (rebind        */
-/* latches, persist commit_requires_storage_and_crypt, the persist      */
-/* roundtrip tests that manage their own bdev) keep the bare            */
-/* stm_dirent_index_create() form.                                     */
+/* 9.7-impl-1c-iii: the fixture stands up bdev + boot + ds_idx +       */
+/* creates a roster of test datasets (id 2..16 — id 1 is the auto-     */
+/* created root), then attaches the dirent index. Tests can use any    */
+/* dataset_id in [1..16] directly. The harness runs tests sequentially */
+/* in one process, so static fixture slots (g_fx_*) are safe.          */
 /* ------------------------------------------------------------------ */
 
 static char di_tmp_path[256];
@@ -76,38 +80,56 @@ static void di_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
                                          DI_BOOTSTRAP_BYTES, out_b));
 }
 
-static void di_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
-    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
-    STM_ASSERT_OK(stm_bdev_open(di_tmp_path, &bo, out_d));
-    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
-}
-
 /* Single static fixture slot — sequential tests share it. */
-static stm_bdev      *di_g_fx_bdev;
-static stm_bootstrap *di_g_fx_boot;
+static stm_bdev          *di_g_fx_bdev;
+static stm_bootstrap     *di_g_fx_boot;
+static stm_dataset_index *di_g_fx_ds_idx;
 
-/* Build a fresh storage-backed, fully-bound dirent index. The engine
- * is stood up by the second binder (set_crypt_ctx here), so the
- * returned index is ready for any op. */
+/* Build a fresh storage-backed, fully-bound dirent index. The dataset
+ * index owns the per-dataset engines + the bdev/boot/crypt context;
+ * the dirent index borrows the dataset index via attach. A roster of
+ * datasets (ids 2..DI_DS_ROSTER_MAX) is pre-created so every test's
+ * chosen dataset_id is PRESENT. */
 static stm_dirent_index *di_test_idx(void) {
     di_make_tmp("fx");
     di_open_fresh(&di_g_fx_bdev, &di_g_fx_boot);
+
+    STM_ASSERT_OK(stm_dataset_index_create(/*current_txg=*/0, &di_g_fx_ds_idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(di_g_fx_ds_idx,
+                                                  di_g_fx_bdev, di_g_fx_boot));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(di_g_fx_ds_idx, DI_KEY,
+                                                    DI_POOL_UUID,
+                                                    DI_DEVICE_UUID));
+
+    /* Pre-create datasets id 2..DI_DS_ROSTER_MAX as siblings of root.
+     * Each stm_dataset_create_child returns a monotonic id; we discard
+     * the returned id and rely on the monotonic assignment (root=1,
+     * first child=2, second child=3, ...). */
+    char name_buf[8];
+    for (uint64_t i = 2u; i <= DI_DS_ROSTER_MAX; i++) {
+        uint64_t out_id = 0;
+        snprintf(name_buf, sizeof name_buf, "ds%llu", (unsigned long long)i);
+        STM_ASSERT_OK(stm_dataset_create_child(di_g_fx_ds_idx,
+                                                 STM_DATASET_ROOT_ID,
+                                                 name_buf, &out_id));
+        STM_ASSERT_EQ(out_id, i);
+    }
+
     stm_dirent_index *idx = stm_dirent_index_create();
     STM_ASSERT_TRUE(idx != NULL);
-    STM_ASSERT_OK(stm_dirent_index_set_storage(idx, di_g_fx_bdev, di_g_fx_boot));
-    STM_ASSERT_OK(stm_dirent_index_set_crypt_ctx(idx, DI_KEY,
-                                                  DI_POOL_UUID,
-                                                  DI_DEVICE_UUID));
+    STM_ASSERT_OK(stm_dirent_index_attach_dataset_index(idx, di_g_fx_ds_idx));
     return idx;
 }
 
 static void di_test_idx_close(stm_dirent_index *idx) {
-    stm_dirent_index_close(idx);    /* before bootstrap — the engine
-                                     * deferred-frees through it */
+    stm_dirent_index_close(idx);    /* before ds_idx — the dirent index
+                                     * borrows the dataset index */
+    stm_dataset_index_close(di_g_fx_ds_idx);
     stm_bootstrap_close(di_g_fx_boot);
     stm_bdev_close(di_g_fx_bdev);
-    di_g_fx_boot = NULL;
-    di_g_fx_bdev = NULL;
+    di_g_fx_ds_idx = NULL;
+    di_g_fx_boot   = NULL;
+    di_g_fx_bdev   = NULL;
     unlink(di_tmp_path);
 }
 
@@ -366,148 +388,12 @@ STM_TEST(dirent_arg_validation) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Persistence — alloc / commit / close / open / load_at / lookup.     */
+/* Persistence — handled now by the dataset_index + per-dataset       */
+/* engines (9.7-impl-1c-iii). The legacy persistence-roundtrip tests   */
+/* were dropped at the cutover; the M-engine cascade roundtrip is      */
+/* covered at the sync layer (test_sync) and end-to-end through        */
+/* test_fs.                                                            */
 /* ------------------------------------------------------------------ */
-
-STM_TEST(dirent_persist_commit_load_roundtrip) {
-    di_make_tmp("rt");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    di_open_fresh(&d, &b);
-
-    /* Bare create — this test manages its own bdev/bootstrap. */
-    stm_dirent_index *idx = stm_dirent_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
-    STM_ASSERT_OK(stm_dirent_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_dirent_index_set_crypt_ctx(idx, DI_KEY,
-                                                    DI_POOL_UUID,
-                                                    DI_DEVICE_UUID));
-
-    /* Three live records; one becomes a tombstone. */
-    const uint8_t fa[] = "alpha";
-    const uint8_t fb[] = "beta";
-    const uint8_t fc[] = "gamma";
-    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, fa, (uint8_t)(sizeof fa - 1u),
-                                       101, 0, STM_DT_REG));
-    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, fb, (uint8_t)(sizeof fb - 1u),
-                                       102, 0, STM_DT_DIR));
-    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, fc, (uint8_t)(sizeof fc - 1u),
-                                       103, 0, STM_DT_LNK));
-    STM_ASSERT_OK(stm_dirent_unlink(idx, 1, 2, fb, (uint8_t)(sizeof fb - 1u)));
-
-    uint64_t paddr = 0; uint8_t cs[32];
-    STM_ASSERT_OK(stm_dirent_index_commit(idx, /*committed_gen=*/1u, &paddr, cs));
-    STM_ASSERT(paddr != 0);
-
-    stm_dirent_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-
-    /* Reopen and load. */
-    di_reopen(&d, &b);
-    /* Bare create: the persist roundtrip test manages its own bdev +
-     * bootstrap; do NOT bind via di_test_idx (would conflict). */
-    stm_dirent_index *idx2 = stm_dirent_index_create();
-    STM_ASSERT_OK(stm_dirent_index_set_storage(idx2, d, b));
-    STM_ASSERT_OK(stm_dirent_index_set_crypt_ctx(idx2, DI_KEY,
-                                                     DI_POOL_UUID,
-                                                     DI_DEVICE_UUID));
-    STM_ASSERT_OK(stm_dirent_index_load_at(idx2, paddr, 1u, cs));
-
-    /* alpha + gamma still reachable; beta returns ENOENT (tombstoned). */
-    uint64_t ci = 0;
-    uint8_t  ct = 0;
-    STM_ASSERT_OK(stm_dirent_lookup(idx2, 1, 2, fa, (uint8_t)(sizeof fa - 1u),
-                                        &ci, NULL, &ct));
-    STM_ASSERT_EQ(ci, (uint64_t)101);
-    STM_ASSERT_EQ(ct, (uint8_t)STM_DT_REG);
-    STM_ASSERT_OK(stm_dirent_lookup(idx2, 1, 2, fc, (uint8_t)(sizeof fc - 1u),
-                                        &ci, NULL, &ct));
-    STM_ASSERT_EQ(ci, (uint64_t)103);
-    STM_ASSERT_EQ(ct, (uint8_t)STM_DT_LNK);
-    STM_ASSERT_ERR(stm_dirent_lookup(idx2, 1, 2, fb, (uint8_t)(sizeof fb - 1u),
-                                         &ci, NULL, NULL),
-                   STM_ENOENT);
-    /* count: 2 live (alpha + gamma). */
-    size_t n = 0;
-    STM_ASSERT_OK(stm_dirent_count_for_dir(idx2, 1, 2, &n));
-    STM_ASSERT_EQ(n, (size_t)2);
-
-    stm_dirent_index_close(idx2);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(di_tmp_path);
-}
-
-STM_TEST(dirent_persist_commit_requires_storage_and_crypt) {
-    /* Bare create — the test asserts commit() refuses without bound
-     * storage/crypt; the fixture would have already bound them. */
-    stm_dirent_index *idx = stm_dirent_index_create();
-    uint64_t paddr = 0; uint8_t cs[32];
-    STM_ASSERT_ERR(stm_dirent_index_commit(idx, 1u, &paddr, cs), STM_EINVAL);
-    stm_dirent_index_close(idx);
-}
-
-STM_TEST(dirent_persist_idempotent_commit_when_clean) {
-    di_make_tmp("idem");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    di_open_fresh(&d, &b);
-
-    /* Bare create — this test manages its own bdev/bootstrap. */
-    stm_dirent_index *idx = stm_dirent_index_create();
-    STM_ASSERT_OK(stm_dirent_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_dirent_index_set_crypt_ctx(idx, DI_KEY,
-                                                    DI_POOL_UUID,
-                                                    DI_DEVICE_UUID));
-
-    const uint8_t name[] = "x";
-    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, name, 1, 100, 0, STM_DT_REG));
-
-    uint64_t p1 = 0, p2 = 0; uint8_t c1[32], c2[32];
-    STM_ASSERT_OK(stm_dirent_index_commit(idx, 1u, &p1, c1));
-    /* Nothing changed since the gen-1 commit; the gen-2 commit is a
-     * clean no-op returning the same root paddr + csum. (9.6-impl-4c:
-     * the engine refuses non-monotonic gen, so the test bumps gen by
-     * one between the two commits. Mirrors inode's
-     * inode_persist_idempotent_commit_when_clean.) */
-    STM_ASSERT_OK(stm_dirent_index_commit(idx, 2u, &p2, c2));
-    STM_ASSERT_EQ(p1, p2);
-    STM_ASSERT_MEM_EQ(c1, c2, 32);
-
-    stm_dirent_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(di_tmp_path);
-}
-
-/* R70 P3-6 + R71 P2-1 carry-forward: bound-once latches refuse re-bind. */
-STM_TEST(dirent_set_storage_refuses_rebind) {
-    di_make_tmp("rebind_st");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    di_open_fresh(&d, &b);
-    /* Bare create — the test asserts the FIRST set_storage succeeds
-     * and the SECOND refuses; the fixture pre-binds, so a re-bind
-     * test must start from unbound. */
-    stm_dirent_index *idx = stm_dirent_index_create();
-    STM_ASSERT_OK(stm_dirent_index_set_storage(idx, d, b));
-    STM_ASSERT_ERR(stm_dirent_index_set_storage(idx, d, b), STM_EINVAL);
-    stm_dirent_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(di_tmp_path);
-}
-
-STM_TEST(dirent_set_crypt_ctx_refuses_rebind) {
-    /* Bare create — same rationale as set_storage_refuses_rebind. */
-    stm_dirent_index *idx = stm_dirent_index_create();
-    STM_ASSERT_OK(stm_dirent_index_set_crypt_ctx(idx, DI_KEY,
-                                                    DI_POOL_UUID,
-                                                    DI_DEVICE_UUID));
-    STM_ASSERT_ERR(stm_dirent_index_set_crypt_ctx(idx, DI_KEY,
-                                                     DI_POOL_UUID,
-                                                     DI_DEVICE_UUID),
-                   STM_EINVAL);
-    stm_dirent_index_close(idx);
-}
 
 STM_TEST(dirent_ub_version_is_v30) {
     /* 9.7-impl-1b bumped STM_UB_VERSION 29 → 30 for the per-dataset
@@ -1493,6 +1379,107 @@ STM_TEST(dirent_whiteout_same_name_create_overwrites_under_collision) {
     STM_ASSERT_EQ(batch[0].hash_probe, foo_hash);  /* same slot */
 
     di_test_idx_close(idx);
+}
+
+/* ------------------------------------------------------------------ */
+/* 9.7-impl-1c-iii — D1 invariant + attach behavior.                  */
+/* ------------------------------------------------------------------ */
+
+/* D1 invariant from the dirent side: distinct datasets get distinct
+ * engine handles. The dirent index resolves the engine via
+ * stm_dataset_index_get_engine; this test confirms the underlying
+ * engines returned for two different datasets are different handles,
+ * and a chain in one dataset is invisible from the other. */
+STM_TEST(dirent_routes_via_dataset_engine) {
+    stm_dirent_index *idx = di_test_idx();
+
+    /* Alloc the SAME name in dataset 1 and dataset 2 — they must NOT
+     * collide because the engines have independent keyspaces. The
+     * child_inos differ so a lookup verifies the cross-dataset
+     * boundary holds. */
+    const uint8_t name[] = "shared";
+    STM_ASSERT_OK(stm_dirent_alloc(idx, /*ds=*/1, /*dir=*/2,
+                                       name, (uint8_t)(sizeof name - 1u),
+                                       /*child_ino=*/111, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, /*ds=*/2, /*dir=*/2,
+                                       name, (uint8_t)(sizeof name - 1u),
+                                       /*child_ino=*/222, 0, STM_DT_DIR));
+
+    stm_btree_engine *eng_a = NULL;
+    stm_btree_engine *eng_b = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(di_g_fx_ds_idx, 1, &eng_a));
+    STM_ASSERT_OK(stm_dataset_index_get_engine(di_g_fx_ds_idx, 2, &eng_b));
+    STM_ASSERT_TRUE(eng_a != NULL);
+    STM_ASSERT_TRUE(eng_b != NULL);
+    STM_ASSERT_TRUE(eng_a != eng_b);
+
+    /* Same name, same dir_ino, distinct datasets → distinct values. */
+    uint64_t ci = 0;
+    uint8_t  ct = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 2,
+                                        name, (uint8_t)(sizeof name - 1u),
+                                        &ci, NULL, &ct));
+    STM_ASSERT_EQ(ci, (uint64_t)111);
+    STM_ASSERT_EQ(ct, (uint8_t)STM_DT_REG);
+
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 2, 2,
+                                        name, (uint8_t)(sizeof name - 1u),
+                                        &ci, NULL, &ct));
+    STM_ASSERT_EQ(ci, (uint64_t)222);
+    STM_ASSERT_EQ(ct, (uint8_t)STM_DT_DIR);
+
+    di_test_idx_close(idx);
+}
+
+/* Attaching twice is refused — the borrow is one-time. */
+STM_TEST(dirent_attach_dataset_index_refuses_rebind) {
+    di_make_tmp("attach");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    di_open_fresh(&d, &b);
+
+    stm_dataset_index *ds = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &ds));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(ds, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(ds, DI_KEY,
+                                                    DI_POOL_UUID,
+                                                    DI_DEVICE_UUID));
+
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+    STM_ASSERT_OK(stm_dirent_index_attach_dataset_index(idx, ds));
+    STM_ASSERT_ERR(stm_dirent_index_attach_dataset_index(idx, ds), STM_EINVAL);
+
+    stm_dirent_index_close(idx);
+    stm_dataset_index_close(ds);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(di_tmp_path);
+}
+
+/* Attach with NULL args refused. */
+STM_TEST(dirent_attach_dataset_index_null_args) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_ERR(stm_dirent_index_attach_dataset_index(NULL, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_dirent_index_attach_dataset_index(idx,  NULL),
+                   STM_EINVAL);
+    /* idx-NULL + ds-non-NULL also refuses; build a throwaway ds to
+     * exercise it without needing storage. */
+    stm_dataset_index *ds = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &ds));
+    STM_ASSERT_ERR(stm_dirent_index_attach_dataset_index(NULL, ds),
+                   STM_EINVAL);
+    stm_dataset_index_close(ds);
+    stm_dirent_index_close(idx);
+}
+
+/* Op on a dirent index with no attach refused. */
+STM_TEST(dirent_op_without_attach_refused) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    const uint8_t name[] = "x";
+    STM_ASSERT_ERR(stm_dirent_alloc(idx, 1, 2, name, 1, 100, 0, STM_DT_REG),
+                   STM_EINVAL);
+    stm_dirent_index_close(idx);
 }
 
 STM_TEST_MAIN("test_dirent")

@@ -6,6 +6,7 @@ target_include_directories(stm_dirent PUBLIC
 target_link_libraries(stm_dirent
     PRIVATE stm_warnings stm_sanitize stm_coverage
     PUBLIC  stm_block stm_bootstrap stm_btree stm_btree_store
+            stm_btree_engine stm_engine_store stm_metakey stm_dataset
             stm_sb Threads::Threads)
 
 # P8-POSIX-9b R88 P2-1: gate stm_dirent_install_at_probe_for_test (the

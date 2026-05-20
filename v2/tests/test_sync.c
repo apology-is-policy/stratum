@@ -413,6 +413,17 @@ STM_TEST(sync_dirent_persistence_roundtrip) {
     stm_dirent_index *didx = stm_sync_dirent_index(s);
     STM_ASSERT_TRUE(didx != NULL);
 
+    /* 9.7-impl-1c-iii: dirent_alloc routes through the per-dataset
+     * btree_engine resolved via the attached ds_idx — each dataset
+     * MUST be PRESENT before any dirent op against it. ds=1 is the
+     * root (auto-created); ds=2 is created here. */
+    stm_dataset_index *dsidx = stm_sync_dataset_index(s);
+    STM_ASSERT_TRUE(dsidx != NULL);
+    uint64_t ds2 = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(dsidx, STM_DATASET_ROOT_ID,
+                                              "ds2", &ds2));
+    STM_ASSERT_EQ(ds2, (uint64_t)2);
+
     const uint8_t na[] = "alpha";
     const uint8_t nb[] = "beta";
     const uint8_t nc[] = "gamma";

@@ -38,46 +38,51 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: Phase 9.7-impl-1c — per-dataset `btree_engine` substrate
-  on the dataset index. `stm_dataset_index_get_engine` /
-  `_close_engine` stand up the lifecycle: each `dataset_slot` gains
-  a lazily-opened `stm_btree_engine *` rooted at the slot entry's
-  triple (`di_tree_root`, `di_root_gen`, `di_root_csum`). All-zero
-  triple → engine created fresh; non-zero → opened. The engine is
-  cached on the slot for subsequent `get_engine` calls; closed at
-  `stm_dataset_destroy`, `stm_dataset_index_close`, and the
-  `load_at` shadow-swap. The engine borrows the same bdev/boot +
-  metadata_key/uuids the dataset table itself uses, mirrored into
-  fresh `engine_store_ctx` + `engine_crypt_ctx` fields on the index
-  at `set_storage` / `set_crypt_ctx` time. `tree_id = dataset_id`
-  weaves the dataset id into AEAD additional-data so cross-dataset
-  substitution attacks fail decrypt.
-  - **STM_UB_VERSION stays at 30** — 1c is a code-path substrate
-    change, no on-disk format change. The 1b dataset-entry triple
-    (already on disk at v30) is the durable identity the new
-    engines bind to.
-  - **1c-i posture**: the four metadata modules (inode / dirent /
-    xattr / extent_index) STILL route through the pool-global
-    4-engine cascade. The per-dataset engines stand up + survive
-    the lifecycle (create / destroy / index close / load_at swap)
-    but are not yet consumed. 1c-ii..1c-v migrate each module to
-    consume the per-dataset engine via `stm_metakey_compose`;
-    1c-vi retires the four pool-global engines + reserved-zeroes
-    `ub_{inode,dirent,xattr,extent}_root`.
-  - **9 new test cases** in `tests/test_dataset.c`:
-    NULL/dataset_id=0 EINVAL, storage+crypt-unbound EINVAL,
-    missing-dataset ENOENT, lazy create + cached-handle on second
-    get, insert/lookup roundtrip on the opened engine, distinct
-    engines per dataset (D1 invariant), close + re-open,
-    close-idempotent-on-never-opened, destroy closes engine →
-    subsequent get ENOENT, index close releases all open engines
-    without leaking.
-  - **ctest 64/64 GREEN** at the 1c tip (test_dataset grew 62 → 71
-    cases; everything else unchanged).
-  - **What's next**: 9.7-impl-1c-ii — first module migration (inode
-    cuts over to the per-dataset engine + metakey keys). R157
-    audit gates the full 9.7-impl-1 close after all five module
-    cutover chunks (1c-ii..1c-vi) land.
+- **Tip**: Phase 9.7-impl-1c-iii — second module cutover lands.
+  The dirent module now routes through per-dataset `btree_engine`s
+  via an attached `stm_dataset_index *` and `stm_metakey_compose`
+  keys. The 17-byte key shape is `STM_METAKEY_KIND_DIRENT || le64
+  dir_ino || le64 hash_probe` — dataset_id prefix retired, woven
+  into the engine's AEAD additional-data via `tree_id = dataset_id`.
+  The dirent persistence API (set_storage / set_crypt_ctx / load_at
+  / commit-trio / get_root / get_gen) is retired; the module now
+  exposes a single `stm_dirent_index_attach_dataset_index(idx,
+  ds_idx)`. The M-engine three-phase cascade (1c-ii) extends to
+  cover dirent records — both inode AND dirent flush/finalize/abort
+  flow through `stm_dataset_index_commit_engines_*` so the
+  ds_idx commit's `main_csum` transitively covers every per-dataset
+  engine root. `compute_merkle_root`'s `dirent_csum` slot is zeroed
+  alongside `inode_csum`; UB `ub_dirent_root` / `ub_dirent_root_gen`
+  / `ub_dirent_csum` are stamped zero at v30 and ignored on mount.
+  Full UB field retirement at 1c-vi.
+  - **STM_UB_VERSION stays at 30** — 1c-iii is a code-path
+    cutover, no on-disk format change. The 1b dataset-entry triple
+    (already at v30) is the durable identity the dirent records
+    bind to.
+  - **dirent.tla invariants UNCHANGED**: chain integrity
+    (Reachable, NoColliderShadowing, SwapDoesNotMove,
+    WhiteoutPreservesName) hold verbatim — only the storage under
+    the chain walker swapped from the pool-global engine to a
+    per-dataset engine.
+  - **ctest 64/64 GREEN** at this tip; test_dirent's persistence
+    roundtrip tests (5 cases) retired; D1-invariant +
+    attach-behavior tests (4 new cases) added. test_sync's
+    `sync_dirent_persistence_roundtrip` updated to pre-create
+    ds=2 via `stm_dataset_create_child` (same fix as
+    `sync_inode_persistence_roundtrip` at 1c-ii).
+  - **What's next**: 9.7-impl-1c-iv — xattr cutover, mirrors 1c-iii
+    pattern; then 1c-v (extent_index) and 1c-vi (retire pool-global
+    engines + reserved-zero UB fields). R157 audit gates the full
+    9.7-impl-1 close.
+
+- **Pre-tip-0**: Phase 9.7-impl-1c-ii — first module cutover
+  (inode). Same shape as 1c-iii above but applied to the inode
+  index: 9-byte metakey key
+  (`stm_metakey_compose(STM_METAKEY_KIND_INODE, &ino_le, 8)`),
+  `stm_inode_index_attach_dataset_index` replaces the retired
+  persistence API, M-engine cascade introduced at this commit.
+  `inode_csum` zeroed in `compute_merkle_root`; UB inode fields
+  stamped zero.
 
 - **Pre-tip-1**: Phase 9.7-impl-1b — `stm_dataset_entry` gains the
   3-field triple (`di_tree_root` + `di_root_gen` +

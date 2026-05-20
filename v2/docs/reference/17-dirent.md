@@ -1,18 +1,50 @@
-# 17 — Dirent index (P8-POSIX-2, v25)
+# 17 — Dirent index (P8-POSIX-2 + 9.6-impl-4c + 9.7-impl-1c-iii)
 
 ## Purpose
 
-Per-pool directory-entry index. Each entry is the canonical mapping
+Per-dataset directory-entry index. Each entry is the canonical mapping
 from `(dataset_id, dir_ino, hash_probe)` → dirent record, where
 `hash_probe = fnv1a64(name) + probe_offset` resolves hash collisions
 via open-addressing per ARCHITECTURE §11.4.2. The on-disk record
 carries `child_ino`, `child_gen`, `child_type` (POSIX DT_* shape), plus
 flags for TOMBSTONE / WHITEOUT.
 
+## 9.7-impl-1c-iii cutover
+
+As of 9.7-impl-1c-iii the dirent module no longer owns its own
+`btree_engine`. Records live in each dataset's per-dataset
+`btree_engine` (the substrate from 9.7-impl-1c-i), resolved at every
+op via an attached `stm_dataset_index *`. Keys are 17 bytes
+(`stm_metakey_compose(STM_METAKEY_KIND_DIRENT, body, 16)` where body =
+`le64 dir_ino || le64 hash_probe`) instead of the previous 24-byte
+`(le64 dataset_id, le64 dir_ino, le64 hash_probe)`; the dataset id is
+now woven into the engine's AEAD additional-data via `tree_id =
+dataset_id`, so cross-dataset substitution attacks fail decrypt.
+
+The retired persistence API (`set_storage`, `set_crypt_ctx`,
+`load_at`, `commit`/`commit_flush`/`commit_finalize`/`commit_abort`,
+`get_root`, `get_gen`) has been replaced by a single one-time bind:
+`stm_dirent_index_attach_dataset_index(idx, ds_idx)` at mount time.
+The dirent flush/finalize/abort calls in `stm_sync_commit` are
+retired — per-dataset dirent records flow through the same M-engine
+three-phase cascade as the inode records (1c-ii); the cascade is
+driven once per commit by `stm_dataset_index_commit_engines_{flush,
+finalize,abort}` immediately BEFORE the dataset_index commit, so the
+ds_idx commit's `main_csum` transitively covers every per-dataset
+engine root. The `ub_dirent_root` / `ub_dirent_root_gen` /
+`ub_dirent_csum` fields are stamped ZERO at v30 and ignored on mount.
+The `dirent_csum` slot in `compute_merkle_root` is also zero bytes —
+the chain-integrity invariants from `dirent.tla` are UNCHANGED; only
+the storage under them swapped from the pool-global engine to a
+per-dataset engine. Full UB field retirement to reserved-on-the-wire
+lands at 1c-vi when all four pool-global engines (inode, dirent,
+xattr, extent) are retired together.
+
 The dirent module is the bridge between:
 
 - **Sync** (constructs the index at `sync_create` / `sync_open`;
-  hydrates from `ub_dirent_root`; persists every commit).
+  attaches the dataset index at mount; per-dataset engines hold the
+  records).
 - **Inode allocator** (every `child_ino` references an `inode.tla` slot;
   `child_gen` mirrors `si_gen` so 9P fid staleness can re-check freshness).
 - **fs.c** (per-fs lookup / create_file / mkdir / unlink / rmdir / rename /
@@ -21,19 +53,10 @@ The dirent module is the bridge between:
   record under a freed directory so AllocReused can't inherit prior
   tombstone trail).
 
-In-RAM storage: NONE — the btree_engine COW B+tree IS the store
-(9.6-impl-4c cutover; the pre-cutover heap-allocated record array
-is retired). Every chain walk goes through `stm_btree_engine_lookup`
-on the exact `(ds, dir_ino, hash_probe)` key; readdir / count /
-drop_for_dir use `stm_btree_engine_scan_range` over the (ds,
-dir_ino) prefix.
-On-disk: btree_engine-backed, AEAD-encrypted COW B+tree under
-`ub_dirent_root`, keyed by `(le64 dataset_id, le64 dir_ino, le64
-hash_probe)`. Format break STM_UB_VERSION 24 → 25; the engine
-swap-in at 9.6-impl-4c is a write-side cutover (the key + value
-shapes on the wire are unchanged, only the tree structure under them
-swapped from btree_store's whole-tree-rebuild MVP to btree_engine's
-incremental COW B+tree).
+In-RAM storage: NONE — each dataset's per-dataset `btree_engine` IS
+the store. The dirent module is now a lightweight chain walker over
+the resolved engine; it keeps only a borrowed `ds_idx` pointer + the
+serialization mutex.
 
 Header: `v2/include/stratum/dirent.h`.
 Impl: `v2/src/dirent/dirent.c`.
@@ -124,54 +147,47 @@ children + 1 for `.`) and to gate `rmdir` on empty directories.
 Models `dirent.tla::ReaddirReset(d) ; ReaddirStep(d)* ;
 ReaddirEnd(d)`, collapsed to a single C call boundary.
 
-### Persistence
+### Persistence (9.7-impl-1c-iii)
 
 ```c
-stm_status stm_dirent_index_set_storage      (idx, bdev_0, boot_0);
-stm_status stm_dirent_index_set_crypt_ctx    (idx, key, pool_uuid, dev_uuid_0);
-stm_status stm_dirent_index_load_at          (idx, root_paddr, root_gen, csum);
-stm_status stm_dirent_index_commit           (idx, committed_gen, *paddr, *csum);
-stm_status stm_dirent_index_commit_flush     (idx, committed_gen,
-                                                *paddr, *gen, csum);
-stm_status stm_dirent_index_commit_finalize  (idx);
-stm_status stm_dirent_index_commit_abort     (idx);
-stm_status stm_dirent_index_get_root         (idx, *paddr, csum);
-stm_status stm_dirent_index_get_gen          (idx, *gen);
+stm_status stm_dirent_index_attach_dataset_index (idx, ds_idx);
 ```
 
-Same shape + semantics as the inode persistence API (9.6-impl-4c
-matches inode's 9.6-impl-4b-ii cutover). AEAD nonce `paddr || gen ||
-pool_uuid`. AD `pool_uuid || device_uuid_0`. `dirent_csum` binds
-into the pool's Merkle root chain.
+The previous persistence API (`set_storage`, `set_crypt_ctx`,
+`load_at`, `commit`/`commit_flush`/`commit_finalize`/`commit_abort`,
+`get_root`, `get_gen`) has been retired. The dirent module now
+borrows the dataset index via `attach_dataset_index` (one-time, at
+mount); every public op resolves the per-dataset
+`btree_engine` via `stm_dataset_index_get_engine(ds_idx, dataset_id,
+&eng)` under the dirent module's lock. Per-dataset engine commits
+flow through `stm_dataset_index_commit_engines_{flush,finalize,
+abort}` (driven by `stm_sync_commit`, see
+`reference/12-dataset.md` §M-cascade); the dirent module has no
+per-pool durable root any more. AEAD nonce / AAD / pool-Merkle-root
+binding for the per-dataset engine is owned by the engine layer; the
+dirent_csum slot in `compute_merkle_root` is stamped zero at v30.
 
-**Three-phase commit** (9.6-impl-4c): `stm_sync_commit` drives the
-`_commit_flush` / `_commit_finalize` / `_commit_abort` trio so the
-dirent flush slots into sync's Phase 2 and the root is adopted only
-after the uberblock write. Flush returns the PROSPECTIVE root
-triple via out-params; the durable root mirror is updated only at
-`_commit_finalize` (called after `write_ub_to_all_devices`
-succeeds). On any failure between flush and finalize, the sync
-layer calls `_commit_abort` — which discards the pending flush,
-deferred-frees the freshly-written paddrs, drops the in-memory tree,
-and reverts to the previous durable root (the in-process realisation
-of a crash between flush and UB write). A failed `stm_sync_commit` is
-crash-equivalent — the fs.c caller MUST wedge the fs (R154 doctrine
-carry). The monolithic `_commit` form remains for non-sync callers
-(unit tests, future scrub-style introspection); it is
-flush-then-finalize plus a trailing `stm_bootstrap_commit` barrier.
+A failed `stm_sync_commit` is crash-equivalent; the fs.c caller MUST
+wedge the fs (R154 Q2 doctrine carry — unchanged at 1c-iii since the
+M-cascade preserves the same all-or-nothing posture across every
+per-dataset engine).
 
 ## Implementation
 
 ### On-disk layout
 
-Key (24 bytes):
+Key (17 bytes at 9.7-impl-1c-iii):
 
 ```
   off  size  field
-   0     8   le64 dataset_id   (non-zero)
-   8     8   le64 dir_ino      (non-zero)
-  16     8   le64 hash_probe   (fnv1a64(name) + probe_offset)
+   0     1   u8   STM_METAKEY_KIND_DIRENT (=0x02)
+   1     8   le64 dir_ino      (non-zero)
+   9     8   le64 hash_probe   (fnv1a64(name) + probe_offset)
 ```
+
+The dataset_id prefix retired at the 1c-iii cutover; it now lives in
+the engine's AEAD AAD via `tree_id = dataset_id`. Pre-1c-iii key
+shape was 24-byte `(le64 ds, le64 dir, le64 hp)`.
 
 Value (variable-length, 32 + name_len):
 
@@ -289,9 +305,9 @@ LookupStopsOnTombstone). Each trips its targeted invariant.
 | readdir cursor stability | LIVE | P8-POSIX-4 (single-call boundary; monotonic-cursor) |
 | Whiteout (RENAME_WHITEOUT) | LIVE | P8-POSIX-9b WHITEOUT |
 | Drop-for-dir cascade GC | LIVE | Called by `stm_fs_rmdir` (R73 P2-1) |
-| Persistence (load_at + commit) | LIVE | v25 wire-format; 9.6-impl-4c engine cutover |
-| Three-phase commit (flush / finalize / abort) | LIVE | 9.6-impl-4c — sync drives the trio so the dirent root is adopted only after the uberblock write |
-| Merkle root binding | LIVE | `dirent_csum` is an input to `compute_merkle_root` |
+| Persistence | LIVE | 9.7-impl-1c-iii — borrowed `ds_idx`; per-dataset engines hold records; pool-global dirent root retired (zero at v30) |
+| Three-phase commit (flush / finalize / abort) | LIVE | Per-dataset; driven by the M-engine cascade in `stm_dataset_index_commit_engines_*` |
+| Merkle root binding | LIVE | `dirent_csum` slot in `compute_merkle_root` is zero at v30; per-dataset roots transitively covered by `main_csum` |
 | Case-insensitivity | DEFERRED | Hash function abstraction lets per-dataset property substitute `fnv1a64(NFKD(lower(name)))`; full impl deferred |
 
 Audit class: any change to chain walks, tombstone/whiteout semantics,
