@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * test_xattr.c — P8-POSIX-6.
+ * test_xattr.c — P8-POSIX-6 + 9.7-impl-1c-iv.
  *
  * Exercises the xattr index per `v2/specs/xattr.tla`:
  *
- *   - Lifecycle (create / close).
+ *   - Lifecycle (create / close / attach).
  *   - Set / get / remove / list basic paths.
  *   - POSIX setxattr flag semantics (CREATE / REPLACE / default-replace-
  *     or-create).
@@ -16,18 +16,28 @@
  *     is exercised and asserted symmetric with the on-disk decoder
  *     (R71 P1-1 + R77 P1-1 lesson — writer-side guards mirror
  *     decoder-side guards for both name_len AND value_len).
- *   - Persistence: set / commit / close / open / load_at / get
- *     roundtrip across mount boundaries with both live records and
- *     tombstones surviving the persistence path.
  *   - Probe-only / range-truncation getxattr shapes (POSIX getxattr(2)).
  *   - Drop-for-ino.
+ *   - D1 invariant from xattr's side: per-dataset engines distinct;
+ *     same-key lookups across datasets see independent values.
  *   - On-disk layout sanity: STM_UB_VERSION compile-time at 30.
+ *
+ * 9.7-impl-1c-iv: the xattr module no longer owns its own engine —
+ * records live in each dataset's per-dataset btree_engine, resolved
+ * via an attached `stm_dataset_index`. The fixture builds bdev +
+ * boot + ds_idx + creates a roster of test datasets, then attaches
+ * the xattr index. Tests that exercise dataset_ids 1..16 just work
+ * (the fixture pre-creates them). Persistence-specific tests from
+ * P8-POSIX-6 + 9.6-impl-4c are dropped — that persistence layer is
+ * now in the dataset_index + per-dataset engines.
  */
 #include "tharness.h"
 
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
+#include <stratum/btree_engine.h>
 #include <stratum/crypto.h>
+#include <stratum/dataset.h>
 #include <stratum/xattr.h>
 #include <stratum/super.h>
 #include <stratum/types.h>
@@ -41,24 +51,20 @@
 
 #define XA_DEVICE_BYTES        (UINT64_C(64) * 1024u * 1024u)
 #define XA_BOOTSTRAP_BYTES     (UINT64_C(8)  * 1024u * 1024u)
+#define XA_DS_ROSTER_MAX       16u
 
 static const uint64_t XA_POOL_UUID[2]   = { 0xA001, 0xB001 };
 static const uint64_t XA_DEVICE_UUID[2] = { 0xC001, 0xD001 };
 static const uint8_t  XA_KEY[32]        = { 0x88, 0x99, 0xAA };
 
 /* ------------------------------------------------------------------ */
-/* Storage fixture for in-memory-op tests.                              */
+/* Storage fixture.                                                    */
 /*                                                                      */
-/* 9.6-impl-4c: the xattr module is btree_engine-backed, so every op    */
-/* (set / get / remove / list / drop_for_ino) needs a bound bdev +     */
-/* bootstrap. `xa_test_idx` builds them + a fully-bound index;         */
-/* `xa_test_idx_close` tears it all down. Mirrors the inode + dirent  */
-/* test fixtures.                                                      */
-/*                                                                      */
-/* Tests that intentionally exercise the unbound surface (rebind        */
-/* latches, persist commit_requires_storage_and_crypt, the persist     */
-/* roundtrip tests that manage their own bdev) keep the bare           */
-/* stm_xattr_index_create() form.                                      */
+/* 9.7-impl-1c-iv: the fixture stands up bdev + boot + ds_idx +        */
+/* creates a roster of test datasets (id 2..16 — id 1 is the auto-     */
+/* created root), then attaches the xattr index. Tests can use any     */
+/* dataset_id in [1..16] directly. The harness runs tests sequentially */
+/* in one process, so static fixture slots (g_fx_*) are safe.          */
 /* ------------------------------------------------------------------ */
 
 static char xa_tmp_path[256];
@@ -78,34 +84,56 @@ static void xa_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
                                          XA_BOOTSTRAP_BYTES, out_b));
 }
 
-static void xa_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
-    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
-    STM_ASSERT_OK(stm_bdev_open(xa_tmp_path, &bo, out_d));
-    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
-}
-
 /* Single static fixture slot — sequential tests share it. */
-static stm_bdev      *xa_g_fx_bdev;
-static stm_bootstrap *xa_g_fx_boot;
+static stm_bdev          *xa_g_fx_bdev;
+static stm_bootstrap     *xa_g_fx_boot;
+static stm_dataset_index *xa_g_fx_ds_idx;
 
+/* Build a fresh storage-backed, fully-bound xattr index. The dataset
+ * index owns the per-dataset engines + the bdev/boot/crypt context;
+ * the xattr index borrows the dataset index via attach. A roster of
+ * datasets (ids 2..XA_DS_ROSTER_MAX) is pre-created so every test's
+ * chosen dataset_id is PRESENT. */
 static stm_xattr_index *xa_test_idx(void) {
     xa_make_tmp("fx");
     xa_open_fresh(&xa_g_fx_bdev, &xa_g_fx_boot);
+
+    STM_ASSERT_OK(stm_dataset_index_create(/*current_txg=*/0, &xa_g_fx_ds_idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(xa_g_fx_ds_idx,
+                                                  xa_g_fx_bdev, xa_g_fx_boot));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(xa_g_fx_ds_idx, XA_KEY,
+                                                    XA_POOL_UUID,
+                                                    XA_DEVICE_UUID));
+
+    /* Pre-create datasets id 2..XA_DS_ROSTER_MAX as siblings of root.
+     * Each stm_dataset_create_child returns a monotonic id; we discard
+     * the returned id and rely on the monotonic assignment (root=1,
+     * first child=2, second child=3, ...). */
+    char name_buf[8];
+    for (uint64_t i = 2u; i <= XA_DS_ROSTER_MAX; i++) {
+        uint64_t out_id = 0;
+        snprintf(name_buf, sizeof name_buf, "ds%llu", (unsigned long long)i);
+        STM_ASSERT_OK(stm_dataset_create_child(xa_g_fx_ds_idx,
+                                                 STM_DATASET_ROOT_ID,
+                                                 name_buf, &out_id));
+        STM_ASSERT_EQ(out_id, i);
+    }
+
     stm_xattr_index *idx = stm_xattr_index_create();
     STM_ASSERT_TRUE(idx != NULL);
-    STM_ASSERT_OK(stm_xattr_index_set_storage(idx, xa_g_fx_bdev, xa_g_fx_boot));
-    STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
-                                                 XA_POOL_UUID,
-                                                 XA_DEVICE_UUID));
+    STM_ASSERT_OK(stm_xattr_index_attach_dataset_index(idx, xa_g_fx_ds_idx));
     return idx;
 }
 
 static void xa_test_idx_close(stm_xattr_index *idx) {
-    stm_xattr_index_close(idx);
+    stm_xattr_index_close(idx);     /* before ds_idx — the xattr index
+                                     * borrows the dataset index */
+    stm_dataset_index_close(xa_g_fx_ds_idx);
     stm_bootstrap_close(xa_g_fx_boot);
     stm_bdev_close(xa_g_fx_bdev);
-    xa_g_fx_boot = NULL;
-    xa_g_fx_bdev = NULL;
+    xa_g_fx_ds_idx = NULL;
+    xa_g_fx_boot   = NULL;
+    xa_g_fx_bdev   = NULL;
     unlink(xa_tmp_path);
 }
 
@@ -116,7 +144,7 @@ static void xa_test_idx_close(stm_xattr_index *idx) {
 STM_TEST(xattr_lifecycle_create_close) {
     stm_xattr_index *idx = xa_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
     /* Closing NULL is safe. */
     stm_xattr_index_close(NULL);
 }
@@ -532,193 +560,107 @@ STM_TEST(xattr_get_arg_validation) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Persistence — commit / load_at roundtrip.                           */
+/* 9.7-impl-1c-iv: per-dataset engine routing + attach lifecycle.       */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(xattr_persist_commit_load_roundtrip) {
-    xa_make_tmp("rt");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    xa_open_fresh(&d, &b);
+/* D1 invariant from xattr's side: two distinct datasets MUST get
+ * distinct engines, so the same (ino, name) lookup across datasets
+ * returns INDEPENDENT values. Pre-cutover the dataset_id was a key
+ * prefix so this was obviously held by the engine layout; post-cutover
+ * the dataset_id rides in the engine's AEAD AD (tree_id) and the
+ * engines are per-slot — the same property must still hold. */
+STM_TEST(xattr_routes_via_dataset_engine) {
+    stm_xattr_index *idx = xa_test_idx();
 
-    /* Bare create — this test manages its own bdev/bootstrap. */
+    const uint8_t name[] = "user.k";
+    STM_ASSERT_OK(stm_xattr_set(idx, /*ds=*/1, /*ino=*/100,
+                                   name, (uint8_t)(sizeof name - 1u),
+                                   (const uint8_t *)"alpha", 5, 0, NULL));
+    STM_ASSERT_OK(stm_xattr_set(idx, /*ds=*/2, /*ino=*/100,
+                                   name, (uint8_t)(sizeof name - 1u),
+                                   (const uint8_t *)"beta", 4, 0, NULL));
+    STM_ASSERT_OK(stm_xattr_set(idx, /*ds=*/3, /*ino=*/100,
+                                   name, (uint8_t)(sizeof name - 1u),
+                                   (const uint8_t *)"gamma", 5, 0, NULL));
+
+    uint8_t  buf[16] = { 0 };
+    uint32_t sz = 0;
+    STM_ASSERT_OK(stm_xattr_get(idx, 1, 100, name, (uint8_t)(sizeof name - 1u),
+                                   buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)5);
+    STM_ASSERT_TRUE(memcmp(buf, "alpha", 5) == 0);
+    STM_ASSERT_OK(stm_xattr_get(idx, 2, 100, name, (uint8_t)(sizeof name - 1u),
+                                   buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)4);
+    STM_ASSERT_TRUE(memcmp(buf, "beta", 4) == 0);
+    STM_ASSERT_OK(stm_xattr_get(idx, 3, 100, name, (uint8_t)(sizeof name - 1u),
+                                   buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)5);
+    STM_ASSERT_TRUE(memcmp(buf, "gamma", 5) == 0);
+
+    /* Removing from ds=2 leaves ds=1 + ds=3 intact. */
+    STM_ASSERT_OK(stm_xattr_remove(idx, 2, 100, name, (uint8_t)(sizeof name - 1u)));
+    STM_ASSERT_OK(stm_xattr_get(idx, 1, 100, name, (uint8_t)(sizeof name - 1u),
+                                   buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)5);
+    STM_ASSERT_TRUE(memcmp(buf, "alpha", 5) == 0);
+    STM_ASSERT_ERR(stm_xattr_get(idx, 2, 100, name, (uint8_t)(sizeof name - 1u),
+                                    buf, sizeof buf, &sz),
+                   STM_ENODATA);
+    STM_ASSERT_OK(stm_xattr_get(idx, 3, 100, name, (uint8_t)(sizeof name - 1u),
+                                   buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)5);
+    STM_ASSERT_TRUE(memcmp(buf, "gamma", 5) == 0);
+
+    xa_test_idx_close(idx);
+}
+
+/* The attach is one-time — a second call refuses. */
+STM_TEST(xattr_attach_dataset_index_refuses_rebind) {
+    stm_xattr_index *idx = xa_test_idx();
+    /* Fixture already attached xa_g_fx_ds_idx; a second attach fails. */
+    STM_ASSERT_ERR(stm_xattr_index_attach_dataset_index(idx, xa_g_fx_ds_idx),
+                   STM_EINVAL);
+    xa_test_idx_close(idx);
+}
+
+STM_TEST(xattr_attach_dataset_index_null_args) {
+    stm_xattr_index *idx = stm_xattr_index_create();
+    STM_ASSERT_ERR(stm_xattr_index_attach_dataset_index(NULL, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_xattr_index_attach_dataset_index(idx, NULL), STM_EINVAL);
+    /* Don't pass non-NULL ds_idx here; we'd have to wire up a real one
+     * and the fixture-style refuse_rebind test above already covers
+     * the successful attach + rebind refusal. */
+    stm_xattr_index_close(idx);
+}
+
+/* Public ops MUST refuse with STM_EINVAL when no ds_idx is attached.
+ * Mirrors dirent_op_without_attach_refused. */
+STM_TEST(xattr_op_without_attach_refused) {
     stm_xattr_index *idx = stm_xattr_index_create();
     STM_ASSERT_TRUE(idx != NULL);
-    STM_ASSERT_OK(stm_xattr_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
-                                                    XA_POOL_UUID,
-                                                    XA_DEVICE_UUID));
 
-    /* Three live records; one becomes a tombstone. */
-    STM_ASSERT_OK(stm_xattr_set(idx, 1, 100, (const uint8_t *)"user.alpha", 10,
-                                   (const uint8_t *)"AAAA", 4, 0, NULL));
-    STM_ASSERT_OK(stm_xattr_set(idx, 1, 100, (const uint8_t *)"user.beta", 9,
-                                   (const uint8_t *)"BBBBBBBB", 8, 0, NULL));
-    STM_ASSERT_OK(stm_xattr_set(idx, 1, 100, (const uint8_t *)"user.gamma", 10,
-                                   (const uint8_t *)"CCCCCCCCCCCC", 12, 0, NULL));
-    STM_ASSERT_OK(stm_xattr_remove(idx, 1, 100, (const uint8_t *)"user.beta", 9));
-
-    uint64_t paddr = 0; uint8_t cs[32];
-    STM_ASSERT_OK(stm_xattr_index_commit(idx, /*committed_gen=*/1u, &paddr, cs));
-    STM_ASSERT(paddr != 0);
-
-    stm_xattr_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-
-    /* Reopen and load. */
-    xa_reopen(&d, &b);
-    stm_xattr_index *idx2 = stm_xattr_index_create();
-    STM_ASSERT_OK(stm_xattr_index_set_storage(idx2, d, b));
-    STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx2, XA_KEY,
-                                                     XA_POOL_UUID,
-                                                     XA_DEVICE_UUID));
-    STM_ASSERT_OK(stm_xattr_index_load_at(idx2, paddr, 1u, cs));
-
-    /* alpha + gamma still reachable; beta returns ENODATA (tombstoned). */
-    uint8_t  buf[64] = { 0 };
-    uint32_t sz = 0;
-    STM_ASSERT_OK(stm_xattr_get(idx2, 1, 100, (const uint8_t *)"user.alpha", 10,
-                                    buf, sizeof buf, &sz));
-    STM_ASSERT_EQ(sz, (uint32_t)4);
-    STM_ASSERT_TRUE(memcmp(buf, "AAAA", 4) == 0);
-    STM_ASSERT_OK(stm_xattr_get(idx2, 1, 100, (const uint8_t *)"user.gamma", 10,
-                                    buf, sizeof buf, &sz));
-    STM_ASSERT_EQ(sz, (uint32_t)12);
-    STM_ASSERT_TRUE(memcmp(buf, "CCCCCCCCCCCC", 12) == 0);
-    STM_ASSERT_ERR(stm_xattr_get(idx2, 1, 100, (const uint8_t *)"user.beta", 9,
-                                     buf, sizeof buf, &sz),
-                   STM_ENODATA);
-
-    /* List reports 2 live (alpha + gamma). */
-    size_t n = 0;
-    STM_ASSERT_OK(stm_xattr_list(idx2, 1, 100, NULL, 0, &n));
-    STM_ASSERT_EQ(n, (size_t)2);
-
-    stm_xattr_index_close(idx2);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(xa_tmp_path);
-}
-
-STM_TEST(xattr_persist_value_with_max_size_roundtrip) {
-    /* 64 KiB value boundary roundtrips through encode/decode. */
-    xa_make_tmp("max");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    xa_open_fresh(&d, &b);
-
-    /* Bare create — this test manages its own bdev/bootstrap. */
-    stm_xattr_index *idx = stm_xattr_index_create();
-    STM_ASSERT_OK(stm_xattr_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
-                                                    XA_POOL_UUID,
-                                                    XA_DEVICE_UUID));
-
-    static uint8_t big[STM_XATTR_VALUE_MAX];
-    for (size_t i = 0; i < STM_XATTR_VALUE_MAX; i++) big[i] = (uint8_t)((i * 37u) & 0xFFu);
-    const uint8_t name[] = "user.bigblob";
-    STM_ASSERT_OK(stm_xattr_set(idx, 1, 100, name, (uint8_t)(sizeof name - 1u),
-                                   big, STM_XATTR_VALUE_MAX, 0, NULL));
-
-    uint64_t paddr = 0; uint8_t cs[32];
-    STM_ASSERT_OK(stm_xattr_index_commit(idx, 1u, &paddr, cs));
-    stm_xattr_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-
-    xa_reopen(&d, &b);
-    stm_xattr_index *idx2 = stm_xattr_index_create();
-    STM_ASSERT_OK(stm_xattr_index_set_storage(idx2, d, b));
-    STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx2, XA_KEY,
-                                                     XA_POOL_UUID,
-                                                     XA_DEVICE_UUID));
-    STM_ASSERT_OK(stm_xattr_index_load_at(idx2, paddr, 1u, cs));
-
-    static uint8_t got[STM_XATTR_VALUE_MAX];
-    uint32_t sz = 0;
-    STM_ASSERT_OK(stm_xattr_get(idx2, 1, 100, name, (uint8_t)(sizeof name - 1u),
-                                    got, sizeof got, &sz));
-    STM_ASSERT_EQ(sz, (uint32_t)STM_XATTR_VALUE_MAX);
-    STM_ASSERT_TRUE(memcmp(got, big, STM_XATTR_VALUE_MAX) == 0);
-
-    stm_xattr_index_close(idx2);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(xa_tmp_path);
-}
-
-/* R155 P3-1 close: xattr persistence-surface tests that were missing
- * before 9.6-impl-4c. Each mirrors the same-shape dirent test. */
-
-STM_TEST(xattr_persist_commit_requires_storage_and_crypt) {
-    /* Bare create — the test asserts commit() refuses without bound
-     * storage/crypt; the fixture would have already bound them. */
-    stm_xattr_index *idx = stm_xattr_index_create();
-    uint64_t paddr = 0; uint8_t cs[32];
-    STM_ASSERT_ERR(stm_xattr_index_commit(idx, 1u, &paddr, cs), STM_EINVAL);
-    stm_xattr_index_close(idx);
-}
-
-STM_TEST(xattr_persist_idempotent_commit_when_clean) {
-    xa_make_tmp("idem");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    xa_open_fresh(&d, &b);
-
-    /* Bare create — this test manages its own bdev/bootstrap. */
-    stm_xattr_index *idx = stm_xattr_index_create();
-    STM_ASSERT_OK(stm_xattr_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
-                                                  XA_POOL_UUID,
-                                                  XA_DEVICE_UUID));
-
-    /* One Set, one commit, then a no-op commit at the next gen. */
-    const uint8_t name[] = "user.x";
-    STM_ASSERT_OK(stm_xattr_set(idx, 1, 100, name, (uint8_t)(sizeof name - 1u),
-                                   (const uint8_t *)"v", 1, 0, NULL));
-
-    uint64_t p1 = 0, p2 = 0; uint8_t c1[32], c2[32];
-    STM_ASSERT_OK(stm_xattr_index_commit(idx, 1u, &p1, c1));
-    /* Nothing changed since the gen-1 commit; the gen-2 commit is a
-     * clean no-op returning the same root paddr + csum. (9.6-impl-4c:
-     * the engine refuses non-monotonic gen, so the test bumps gen by
-     * one between the two commits. Mirrors inode's
-     * inode_persist_idempotent_commit_when_clean.) */
-    STM_ASSERT_OK(stm_xattr_index_commit(idx, 2u, &p2, c2));
-    STM_ASSERT_EQ(p1, p2);
-    STM_ASSERT_MEM_EQ(c1, c2, 32);
-
-    stm_xattr_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(xa_tmp_path);
-}
-
-/* R70 P3-6 + R71 P2-1 carry-forward: bound-once latches refuse re-bind. */
-STM_TEST(xattr_set_storage_refuses_rebind) {
-    xa_make_tmp("rebind_st");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    xa_open_fresh(&d, &b);
-    /* Bare create — same rationale as set_storage_refuses_rebind in
-     * test_dirent: fixture pre-binds, so a re-bind test must start
-     * from unbound. */
-    stm_xattr_index *idx = stm_xattr_index_create();
-    STM_ASSERT_OK(stm_xattr_index_set_storage(idx, d, b));
-    STM_ASSERT_ERR(stm_xattr_index_set_storage(idx, d, b), STM_EINVAL);
-    stm_xattr_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(xa_tmp_path);
-}
-
-STM_TEST(xattr_set_crypt_ctx_refuses_rebind) {
-    /* Bare create — same rationale as set_storage_refuses_rebind. */
-    stm_xattr_index *idx = stm_xattr_index_create();
-    STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
-                                                  XA_POOL_UUID,
-                                                  XA_DEVICE_UUID));
-    STM_ASSERT_ERR(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
-                                                   XA_POOL_UUID,
-                                                   XA_DEVICE_UUID),
+    /* set without attach: STM_EINVAL. */
+    STM_ASSERT_ERR(stm_xattr_set(idx, 1, 1, (const uint8_t *)"u.x", 3,
+                                    (const uint8_t *)"v", 1, 0, NULL),
                    STM_EINVAL);
+    /* get without attach: STM_EINVAL. */
+    uint8_t  buf[8] = { 0 };
+    uint32_t sz = 0;
+    STM_ASSERT_ERR(stm_xattr_get(idx, 1, 1, (const uint8_t *)"u.x", 3,
+                                    buf, sizeof buf, &sz),
+                   STM_EINVAL);
+    /* remove without attach: STM_EINVAL. */
+    STM_ASSERT_ERR(stm_xattr_remove(idx, 1, 1, (const uint8_t *)"u.x", 3),
+                   STM_EINVAL);
+    /* list without attach: STM_EINVAL. */
+    size_t total = 0;
+    STM_ASSERT_ERR(stm_xattr_list(idx, 1, 1, NULL, 0, &total),
+                   STM_EINVAL);
+    /* drop_for_ino without attach: STM_EINVAL. */
+    STM_ASSERT_ERR(stm_xattr_drop_for_ino(idx, 1, 1, NULL),
+                   STM_EINVAL);
+
     stm_xattr_index_close(idx);
 }
 
@@ -728,8 +670,9 @@ STM_TEST(xattr_set_crypt_ctx_refuses_rebind) {
 
 STM_TEST(xattr_ub_version_is_v30) {
     /* 9.7-impl-1b bumps STM_UB_VERSION 29 → 30 for the per-dataset
-     * metadata-tree substrate. The xattr layer's on-disk format is
-     * unchanged since v26 but rides the latest version constant. */
+     * metadata-tree substrate. The xattr layer's on-disk value format
+     * is unchanged since v26 but the key shape moved to a per-dataset
+     * engine (1c-iv); the version constant rides the latest UB. */
     STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)30u);
 }
 
@@ -740,32 +683,28 @@ STM_TEST(xattr_ub_version_is_v30) {
 /* R80 P0-1: install_bytes OOM must NOT leave a zero-keyed zombie in
  * records[] that wedges the pool on next mount.
  *
- * The original bug: stm_xattr_set's append_record path bumped
- * n_records++ before install_bytes; on install_bytes STM_ENOMEM the
- * zero-keyed record survived in records[] and was serialized at the
- * next sync_commit with key 24 zero bytes. On reopen, xa_load_iter
+ * Pre-cutover the bug shape was: stm_xattr_set's append_record path
+ * bumped n_records++ before install_bytes; on install_bytes STM_ENOMEM
+ * the zero-keyed record survived in records[] and was serialized at
+ * the next sync_commit with key 24 zero bytes. On reopen, xa_load_iter
  * rejected ds==0 with STM_ECORRUPT → unmountable pool.
  *
- * Test shape: we can't easily fault-inject malloc here without an
- * LD_PRELOAD or test harness hook, but we CAN exercise the rollback
- * path in pure logic by exhausting an allocator boundary that lies
- * within install_bytes. The smallest practical exercise is to verify
- * the rollback property structurally: after a successful install, an
- * immediate failed install (e.g., via oversized value_len caught at
- * arg validation BEFORE append_record runs) must not leave a stale
- * record. The R80 P0-1 fix's invariant is that records[] only ever
- * contains legitimate (ds!=0, ino!=0) entries; we verify this by
- * forcing a sequence where the success and failure paths are
- * interleaved and assert a clean records[]-via-list count.
+ * Post-cutover (9.6-impl-4c + 9.7-impl-1c-iv), the in-RAM records[]
+ * array is gone — every set goes straight through engine_insert which
+ * is failure-atomic by the engine's contract. The zombie shape is
+ * structurally impossible. This test still exercises the rollback
+ * BRANCH via interleaved set / remove / set sequences and verifies the
+ * list always agrees with the legitimate live record set; a structural
+ * regression introducing a zombie would show up here as a phantom
+ * count.
  *
  * Coverage gap acknowledged: a true malloc-failure repro requires a
- * test seam for install_bytes' malloc; deferred until P8-POSIX-11
- * lands a fault-injection harness. The structural test below
- * exercises the rollback BRANCH but not the OOM TRIGGER. */
+ * test seam for the engine's encode-allocate path; deferred until a
+ * fault-injection harness lands. */
 STM_TEST(xattr_r80_p0_1_install_failure_no_zombie_record) {
     stm_xattr_index *idx = xa_test_idx();
 
-    /* First, succeed with two real records so n_records > 0. */
+    /* First, succeed with two real records so the engine isn't empty. */
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.a", 6,
                                    (const uint8_t *)"v1", 2, 0, NULL));
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.b", 6,
@@ -776,14 +715,8 @@ STM_TEST(xattr_r80_p0_1_install_failure_no_zombie_record) {
     STM_ASSERT_OK(stm_xattr_list(idx, 1, 1, NULL, 0, &total));
     STM_ASSERT_EQ(total, (size_t)2);
 
-    /* Now attempt a SET that fails at install_bytes' malloc-equivalent
-     * path. We can't trigger that directly, but we can verify the
-     * rollback is unconditional via the on-success-no-zombie property
-     * (the only path that creates records is set; rollback would be
-     * exercised on install_bytes failure, which the audit's repro
-     * required malloc fault-injection). The structural property we
-     * pin: list+count after various set/remove sequences always
-     * matches the live record count. */
+    /* Interleaved set/remove/set sequence — verify list always agrees
+     * with the legitimate live record set. */
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.c", 6,
                                    (const uint8_t *)"v3", 2, 0, NULL));
     STM_ASSERT_OK(stm_xattr_remove(idx, 1, 1, (const uint8_t *)"user.b", 6));
@@ -794,13 +727,6 @@ STM_TEST(xattr_r80_p0_1_install_failure_no_zombie_record) {
     STM_ASSERT_OK(stm_xattr_list(idx, 1, 1, NULL, 0, &total));
     STM_ASSERT_EQ(total, (size_t)3);
 
-    /* Sanity: the in-RAM records[] slots are accounted for. We can't
-     * inspect n_records directly (private), but list returns 3 live
-     * + 1 tombstone (b) — the tombstone is invisible to list, but
-     * the underlying records[] holds 4 slots. Per the fix, no zombie
-     * with ds==0 exists; if it did, the first commit-and-reopen would
-     * fail STM_ECORRUPT (covered by xattr_persist_commit_load_roundtrip
-     * which is structurally similar). */
     xa_test_idx_close(idx);
 }
 

@@ -38,53 +38,66 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: Phase 9.7-impl-1c-iii — second module cutover lands.
-  The dirent module now routes through per-dataset `btree_engine`s
+- **Tip**: Phase 9.7-impl-1c-iv — third module cutover lands.
+  The xattr module now routes through per-dataset `btree_engine`s
   via an attached `stm_dataset_index *` and `stm_metakey_compose`
-  keys. The 17-byte key shape is `STM_METAKEY_KIND_DIRENT || le64
-  dir_ino || le64 hash_probe` — dataset_id prefix retired, woven
+  keys. The 17-byte key shape is `STM_METAKEY_KIND_XATTR || le64
+  ino || le64 hash_probe` — dataset_id prefix retired, woven
   into the engine's AEAD additional-data via `tree_id = dataset_id`.
-  The dirent persistence API (set_storage / set_crypt_ctx / load_at
+  The xattr persistence API (set_storage / set_crypt_ctx / load_at
   / commit-trio / get_root / get_gen) is retired; the module now
-  exposes a single `stm_dirent_index_attach_dataset_index(idx,
-  ds_idx)`. The M-engine three-phase cascade (1c-ii) extends to
-  cover dirent records — both inode AND dirent flush/finalize/abort
+  exposes a single `stm_xattr_index_attach_dataset_index(idx,
+  ds_idx)`. The M-engine three-phase cascade (1c-ii) now carries
+  inode + dirent + xattr records — all three flush/finalize/abort
   flow through `stm_dataset_index_commit_engines_*` so the
   ds_idx commit's `main_csum` transitively covers every per-dataset
-  engine root. `compute_merkle_root`'s `dirent_csum` slot is zeroed
-  alongside `inode_csum`; UB `ub_dirent_root` / `ub_dirent_root_gen`
-  / `ub_dirent_csum` are stamped zero at v30 and ignored on mount.
-  Full UB field retirement at 1c-vi.
-  - **STM_UB_VERSION stays at 30** — 1c-iii is a code-path
+  engine root. `compute_merkle_root`'s `xattr_csum` slot is zeroed
+  alongside `inode_csum` + `dirent_csum`; UB `ub_xattr_root` /
+  `ub_xattr_root_gen` / `ub_xattr_root_csum` are stamped zero at
+  v30 and ignored on mount. Full UB field retirement at 1c-vi.
+  - **STM_UB_VERSION stays at 30** — 1c-iv is a code-path
     cutover, no on-disk format change. The 1b dataset-entry triple
-    (already at v30) is the durable identity the dirent records
+    (already at v30) is the durable identity the xattr records
     bind to.
-  - **dirent.tla invariants UNCHANGED**: chain integrity
-    (Reachable, NoColliderShadowing, SwapDoesNotMove,
-    WhiteoutPreservesName) hold verbatim — only the storage under
-    the chain walker swapped from the pool-global engine to a
-    per-dataset engine.
-  - **ctest 64/64 GREEN** at this tip; test_dirent's persistence
-    roundtrip tests (5 cases) retired; D1-invariant +
+  - **xattr.tla invariants UNCHANGED**: chain integrity
+    (Reachable, NoColliderShadowing, plus the R71 P1-1 + R77 P1-1
+    symmetric writer/decoder bounds on BOTH `name_len` AND
+    `value_len`) hold verbatim — only the storage under the chain
+    walker swapped from the pool-global engine to a per-dataset
+    engine.
+  - **ctest 64/64 GREEN** at this tip; test_xattr's persistence
+    roundtrip tests (6 cases) retired; D1-invariant +
     attach-behavior tests (4 new cases) added. test_sync's
-    `sync_dirent_persistence_roundtrip` updated to pre-create
+    `sync_xattr_persistence_roundtrip` updated to pre-create
     ds=2 via `stm_dataset_create_child` (same fix as
-    `sync_inode_persistence_roundtrip` at 1c-ii).
-  - **What's next**: 9.7-impl-1c-iv — xattr cutover, mirrors 1c-iii
-    pattern; then 1c-v (extent_index) and 1c-vi (retire pool-global
+    `sync_inode_persistence_roundtrip` at 1c-ii and
+    `sync_dirent_persistence_roundtrip` at 1c-iii).
+  - **What's next**: 9.7-impl-1c-v — extent_index cutover, mirrors
+    1c-ii..1c-iv pattern with key form `STM_METAKEY_KIND_EXTENT ||
+    le64 ino || le64 file_offset`; then 1c-vi (retire pool-global
     engines + reserved-zero UB fields). R157 audit gates the full
     9.7-impl-1 close.
 
-- **Pre-tip-0**: Phase 9.7-impl-1c-ii — first module cutover
-  (inode). Same shape as 1c-iii above but applied to the inode
-  index: 9-byte metakey key
-  (`stm_metakey_compose(STM_METAKEY_KIND_INODE, &ino_le, 8)`),
+- **Pre-tip-0**: Phase 9.7-impl-1c-iii — second module cutover
+  (dirent). Same shape as 1c-iv above but applied to the dirent
+  index: 17-byte metakey key
+  (`STM_METAKEY_KIND_DIRENT || le64 dir_ino || le64 hash_probe`),
+  `stm_dirent_index_attach_dataset_index` replaces the retired
+  persistence API. The M-engine cascade (already installed at
+  1c-ii) extends to cover dirent records — the dirent
+  flush/finalize/abort calls in `stm_sync_commit` retired.
+  `dirent_csum` zeroed in `compute_merkle_root`; UB dirent fields
+  stamped zero.
+
+- **Pre-tip-1**: Phase 9.7-impl-1c-ii — first module cutover
+  (inode). Same shape applied to the inode index: 9-byte metakey
+  key (`stm_metakey_compose(STM_METAKEY_KIND_INODE, &ino_le, 8)`),
   `stm_inode_index_attach_dataset_index` replaces the retired
   persistence API, M-engine cascade introduced at this commit.
   `inode_csum` zeroed in `compute_merkle_root`; UB inode fields
   stamped zero.
 
-- **Pre-tip-1**: Phase 9.7-impl-1b — `stm_dataset_entry` gains the
+- **Pre-tip-2**: Phase 9.7-impl-1b — `stm_dataset_entry` gains the
   3-field triple (`di_tree_root` + `di_root_gen` +
   `di_root_csum[32]`); DS_VAL_FIXED grows 80 → 128 bytes;
   STM_UB_VERSION bumped 29 → 30. The triple is the durable identity
@@ -92,13 +105,13 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   this commit). Three `*_ub_version_is_v29` tests renamed `_is_v30`.
   Encoder/decoder extended; persistence roundtrip verified.
 
-- **Pre-tip-2**: Phase 9.7-impl-1a — `v2/src/metakey/` lib lands.
+- **Pre-tip-3**: Phase 9.7-impl-1a — `v2/src/metakey/` lib lands.
   Small chokepoint for the 1-byte type-tag prefix that
   discriminates per-record-kind subspaces inside a single
   per-dataset `btree_engine`. No callers yet (1c-ii..1c-v wire
   them in). 16 new test cases + reference doc.
 
-- **Pre-tip-3**: Phase 9.6-impl-4d — the final cutover that lands
+- **Pre-tip-4**: Phase 9.6-impl-4d — the final cutover that lands
   the Metadata Tree Engine (`btree_engine`) as the persistence
   substrate for every load-bearing metadata index. The extent index
   ([14-extent.md](reference/14-extent.md)) is now `btree_engine`-
@@ -134,18 +147,18 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 63/63 GREEN** at the 4d tip.
   - **What's next**: Phase 9.7 (snapshots, **D1**) → 9.8 (Bε + Bw).
 
-- **Pre-tip-4**: 9.6-impl-4c — cut dirent + xattr to `btree_engine`
+- **Pre-tip-5**: 9.6-impl-4c — cut dirent + xattr to `btree_engine`
   + three-phase sync wiring for three engines (`0def2a0`) + R155
   close (`3233611`; 4 missing xattr persistence tests added).
   Verdict: 0 P0/P1/P2 + 4 P3 (only P3-1 actionable).
 
-- **Pre-tip-5**: 9.6-impl-4b — production vtable + sync wiring +
+- **Pre-tip-6**: 9.6-impl-4b — production vtable + sync wiring +
   inode cutover. Chain: design (`24475bd`), 4b-i engine store vtable
   TU (`6f45271`), 4b-ii inode cutover (`051b76c`), 4b-iii three-phase
   sync wiring + bootstrap_commit relocation (`9cf0c75`), R154 close
   (`0165f4c`; Q2 wedge-on-failed-sync at fs.c).
 
-- **Pre-tip-6**: 9.6-impl-4a — engine completion (delete +
+- **Pre-tip-7**: 9.6-impl-4a — engine completion (delete +
   scan_range) (`18946c5`) + R153 close (`fd3f188`). The cutover
   required two engine APIs the impl-1..3 chain hadn't shipped:
   `stm_btree_engine_delete` (extent's truncate/punch/migrate uses

@@ -2,7 +2,7 @@
 /*
  * Stratum v2 — extended attribute (xattr) layer (P8-POSIX-6).
  *
- * Implements the on-disk xattr record + the per-pool xattr index per
+ * Implements the on-disk xattr record + the per-dataset xattr index per
  * ARCHITECTURE §11.5. The index is the canonical mapping from
  * `(dataset_id, ino, hash_probe)` → xattr record, where
  * `hash_probe = fnv1a64(name) + probe_offset` resolves hash collisions
@@ -19,13 +19,23 @@
  * occupant), and `BuggyLookupStopsOnTombstone` (read-side analog of
  * UnlinkUsesEmpty).
  *
- * MVP scope (P8-POSIX-6):
- *   - Per-pool xattr tree backed by btree_store (mirrors stm_dirent_index
- *     persistence shape). Format break STM_UB_VERSION 25 → 26 adds a
- *     new `ub_xattr_root` tree-root field and binds its csum into the
- *     pool's Merkle root chain (R70 P0-1 lesson — the 10th input).
+ * Storage evolution:
+ *   - P8-POSIX-6 → 9.6-impl-4c: per-pool xattr tree backed by
+ *     btree_engine, keyed by 24-byte `(le64 dataset_id || le64 ino
+ *     || le64 hash_probe)`. STM_UB_VERSION 26..29.
+ *   - 9.7-impl-1c-iv: per-dataset btree_engine. Each dataset's xattr
+ *     records live in that dataset's engine (the substrate from
+ *     9.7-impl-1c-i), resolved via an attached
+ *     `stm_dataset_index *`. Keys shrink to 17 bytes — the 1-byte
+ *     STM_METAKEY_KIND_XATTR tag replaces the 8-byte dataset_id
+ *     prefix; the dataset id is woven into the engine's AEAD
+ *     additional-data via `tree_id = dataset_id`. Cross-dataset
+ *     substitution attacks fail decrypt rather than relying on the
+ *     key prefix.
+ *
+ * MVP scope (P8-POSIX-6) carries forward:
  *   - Open-addressing chain integrity per xattr.tla. Tombstones are
- *     kept in the btree on Remove (encoded via STM_XATTR_FLAG_TOMBSTONE
+ *     kept in the engine on Remove (encoded via STM_XATTR_FLAG_TOMBSTONE
  *     in the value's flags byte) so a colliding name at a higher probe
  *     index stays reachable. Lookup walks past tombstones.
  *   - Probe cap STM_XATTR_PROBE_MAX = 64 (same value as dirent's; ARCH
@@ -61,6 +71,11 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Forward-decl (9.7-impl-1c-iv): the xattr module borrows a dataset
+ * index via stm_xattr_index_attach_dataset_index. */
+struct stm_dataset_index;
+typedef struct stm_dataset_index stm_dataset_index;
 
 /* ========================================================================= */
 /* On-disk constants. ARCH §11.5.                                            */
@@ -107,12 +122,20 @@ extern "C" {
  *
  * Total = 16 + name_len + value_len bytes (live), 16 bytes (tombstone).
  *
- * On-disk key layout (fixed 24 bytes):
+ * On-disk key layout (9.7-impl-1c-iv — fixed 17 bytes):
  *
  *   off  size  field                       contract
- *    0     8   le64 dataset_id             non-zero
- *    8     8   le64 ino                    non-zero
- *   16     8   le64 hash_probe             fnv1a64(name) + probe_offset
+ *    0     1   u8   STM_METAKEY_KIND_XATTR  metakey tag (=0x03)
+ *    1     8   le64 ino                    non-zero
+ *    9     8   le64 hash_probe             fnv1a64(name) + probe_offset
+ *
+ * The dataset_id prefix is retired; cross-dataset substitution
+ * defense lives in the engine layer via `tree_id = dataset_id` in
+ * AEAD AD. R71 P1-1 doctrine: writer-side and decoder-side bounds
+ * checks SYMMETRIC at the tag byte (stm_metakey_compose /
+ * stm_metakey_parse pin the tag chokepoint) AND at the body
+ * (the per-module decoder enforces the 16-byte body length +
+ * ino-non-zero invariant on every read-back).
  */
 
 /* ========================================================================= */
@@ -126,9 +149,32 @@ typedef struct stm_xattr_index stm_xattr_index;
  * Mirrors `stm_dirent_index_create`. */
 stm_xattr_index *stm_xattr_index_create(void);
 
-/* Free the index (in-RAM records, persistence handles, every record's
- * heap-allocated value buffer). Safe on NULL. */
+/* Free the index (in-RAM records, borrowed ds_idx pointer is NOT
+ * freed — its lifecycle is owned by the caller, typically stm_sync).
+ * Safe on NULL. */
 void stm_xattr_index_close(stm_xattr_index *idx);
+
+/*
+ * 9.7-impl-1c-iv: attach the dataset index. The xattr module borrows
+ * the `ds_idx` pointer; the caller MUST keep it alive for the xattr
+ * index's lifetime. The attach is one-time — re-binding returns
+ * STM_EINVAL.
+ *
+ * Lifetime: idx and ds_idx are typically both owned by stm_sync; they
+ * are created together at open and destroyed together at close. The
+ * borrow is safe by construction in the production path.
+ *
+ * Every public xattr op resolves the dataset's per-dataset engine via
+ * the attached ds_idx, lazily opening the engine on first use per
+ * `stm_dataset_index_get_engine`.
+ *
+ * Refusals:
+ *   - NULL idx OR NULL ds_idx (STM_EINVAL).
+ *   - Re-attach (STM_EINVAL — the attach is one-time).
+ */
+STM_MUST_USE
+stm_status stm_xattr_index_attach_dataset_index(stm_xattr_index *idx,
+                                                stm_dataset_index *ds_idx);
 
 /* ========================================================================= */
 /* In-memory operations. Models xattr.tla's actions.                          */
@@ -306,134 +352,31 @@ stm_status stm_xattr_drop_for_ino(stm_xattr_index *idx,
                                      size_t *out_dropped);
 
 /* ========================================================================= */
-/* Persistence (P8-POSIX-6, v26).                                            */
+/* Persistence (9.7-impl-1c-iv: per-dataset metadata-tree engines).           */
 /*                                                                            */
-/* The xattr index is persisted as a btree_store-encoded, AEAD-encrypted    */
-/* Bε-tree under `ub_xattr_root` on device 0. Same envelope as the inode    */
-/* / dirent / extent / cas trees: AEAD nonce `paddr || gen || pool_uuid`,   */
-/* AD `pool_uuid || device_uuid_0`, idempotent commit via internal dirty    */
-/* flag, atomic shadow-swap on load_at.                                      */
+/* As of 9.7-impl-1c-iv the xattr module owns NO storage of its own. Each    */
+/* dataset's xattr records live in that dataset's per-dataset btree_engine   */
+/* (the substrate from 9.7-impl-1c-i), keyed by `stm_metakey_compose`:       */
+/*                                                                            */
+/*   key (17 bytes): le8 STM_METAKEY_KIND_XATTR || le64 ino                  */
+/*                   || le64 hash_probe                                       */
+/*   value (16 + name_len + value_len bytes): tombstone/live encoded per the */
+/*   layout doc at the top of this header.                                   */
+/*                                                                            */
+/* The dataset id is folded into the engine's AEAD additional-data via the   */
+/* engine's tree_id; cross-dataset substitution attacks fail decrypt.        */
+/* That is why the key no longer carries the dataset_id prefix it had at    */
+/* P8-POSIX-6 / 9.6-impl-4c.                                                  */
+/*                                                                            */
+/* The pool-global `ub_xattr_root` / `ub_xattr_root_gen` /                     */
+/* `ub_xattr_root_csum` fields are stamped ZERO at 1c-iv; the xattr_csum     */
+/* slot in the pool Merkle root is also zero bytes. The per-dataset engine  */
+/* roots are transitively covered by `main_csum` (the dataset_index tree's  */
+/* root csum, which serializes each slot's (di_tree_root, di_root_gen,      */
+/* di_root_csum) triple). Full UB field retirement to reserved-on-the-wire  */
+/* happens at 1c-vi when all four pool-global engines (inode, dirent, xattr,*/
+/* extent) are retired together.                                             */
 /* ========================================================================= */
-
-struct stm_bdev;       typedef struct stm_bdev stm_bdev;
-struct stm_bootstrap;  typedef struct stm_bootstrap stm_bootstrap;
-
-STM_MUST_USE
-stm_status stm_xattr_index_set_storage(stm_xattr_index *idx,
-                                          stm_bdev *bdev_0,
-                                          stm_bootstrap *boot_0);
-
-STM_MUST_USE
-stm_status stm_xattr_index_set_crypt_ctx(stm_xattr_index *idx,
-                                            const uint8_t *metadata_key,
-                                            const uint64_t pool_uuid[2],
-                                            const uint64_t device_uuid_0[2]);
-
-/*
- * Single-shot commit — the btree_engine's flush + finalize in one
- * call, then make the bootstrap bitmap durable. Returns the new
- * tree's root paddr + 32-byte BLAKE3 csum via out-params, which the
- * caller stamps into `ub_xattr_root`.
- *
- * `committed_gen` MUST strictly increase across commits. A clean
- * tree's commit is a cheap no-op that returns the prior root at its
- * prior gen; pair with stm_xattr_index_get_gen for the AEAD gen.
- *
- * 9.6-impl-4c: stm_sync_commit no longer drives this monolithic form
- * — it uses the three-phase stm_xattr_index_commit_flush / _finalize
- * / _abort below so the xattr flush slots into sync's Phase 2 and the
- * root is adopted only after the uberblock write. This single-shot
- * form remains for non-sync callers and the persistence unit tests.
- *
- * Refusals: STM_EINVAL (NULL args / storage / crypt context unbound),
- * and any error bubbled from the btree_engine commit or the bootstrap
- * allocator. A failed commit self-reverts — a failed stm_sync_commit
- * is crash-equivalent and the caller MUST wedge the fs.
- */
-STM_MUST_USE
-stm_status stm_xattr_index_commit(stm_xattr_index *idx,
-                                     uint64_t committed_gen,
-                                     uint64_t *out_root_paddr,
-                                     uint8_t out_root_csum[32]);
-
-/*
- * Three-phase commit — FLUSH. The form stm_sync_commit drives. Writes
- * every dirty root-to-leaf path to fresh paddrs at `committed_gen` and
- * returns the PROSPECTIVE new root triple via (*out_root_paddr,
- * *out_root_gen, *out_root_csum) — NOT yet durable: the index's
- * durable root still names the previous tree until
- * stm_xattr_index_commit_finalize. The prospective csum is what the
- * caller folds into the pool Merkle root + stamps into ub_xattr_root.
- *
- * Does NOT make the bootstrap bitmap durable — the sync layer runs
- * the single explicit stm_bootstrap_commit barrier after every index
- * flush, strictly before the uberblock write (9.6-impl-4b design §5).
- *
- * On SUCCESS the engine holds a pending-commit window: pair the flush
- * with exactly one stm_xattr_index_commit_finalize (after the UB
- * write) or stm_xattr_index_commit_abort (on any failure before the
- * UB write). A FAILED flush self-reverts and opens NO window — do
- * not abort it.
- *
- * `committed_gen` MUST strictly increase across commits. Refusals:
- * STM_EINVAL (NULL args, storage / crypt unbound, non-monotonic gen),
- * STM_EBUSY (a prior flush is still un-finalized), and engine errors.
- */
-STM_MUST_USE
-stm_status stm_xattr_index_commit_flush(stm_xattr_index *idx,
-                                            uint64_t committed_gen,
-                                            uint64_t *out_root_paddr,
-                                            uint64_t *out_root_gen,
-                                            uint8_t out_root_csum[32]);
-
-/*
- * Three-phase commit — FINALIZE. Adopts the root flushed by the
- * preceding stm_xattr_index_commit_flush as the index's durable root
- * (mirroring the triple into the get_root / get_gen accessors) and
- * hands the superseded paddrs back to the allocator (deferred-free).
- * Call it only after the uberblock naming the flushed root is durable.
- *
- * After a successful flush this is INFALLIBLE — the lone failure exit
- * is STM_EINVAL when no flush is pending (a caller-sequencing bug).
- */
-STM_MUST_USE
-stm_status stm_xattr_index_commit_finalize(stm_xattr_index *idx);
-
-/*
- * Three-phase commit — ABORT. Discards the root flushed by the
- * preceding stm_xattr_index_commit_flush: the freshly-written paddrs
- * were never durably rooted, so they are handed back to the allocator
- * (deferred-free), and the in-memory tree is dropped so the next access
- * reloads the previous durable root. The durable root triple is
- * unchanged — the in-process realisation of a crash between the flush
- * and the uberblock write. The sync layer calls this on every error
- * path between a successful flush and the finalize.
- *
- * Returns STM_EINVAL if no flush is pending; otherwise STM_OK.
- */
-STM_MUST_USE
-stm_status stm_xattr_index_commit_abort(stm_xattr_index *idx);
-
-STM_MUST_USE
-stm_status stm_xattr_index_load_at(stm_xattr_index *idx,
-                                      uint64_t root_paddr,
-                                      uint64_t root_gen,
-                                      const uint8_t expected_csum[32]);
-
-/* R80 P3-1: stm_xattr_index_get_root has no in-tree caller as of
- * the P8-POSIX-6 substantive landing (sync.c only consumes _commit /
- * _get_gen / _load_at). Exported for symmetry with the dirent /
- * inode index APIs and for future debug tooling / forensics paths
- * that snapshot the live root paddr+csum without driving a commit.
- * Safe to remove if no consumer materializes by Phase 8 exit. */
-STM_MUST_USE
-stm_status stm_xattr_index_get_root(const stm_xattr_index *idx,
-                                       uint64_t *out_root_paddr,
-                                       uint8_t out_root_csum[32]);
-
-STM_MUST_USE
-stm_status stm_xattr_index_get_gen(const stm_xattr_index *idx,
-                                      uint64_t *out_root_gen);
 
 #ifdef __cplusplus
 }

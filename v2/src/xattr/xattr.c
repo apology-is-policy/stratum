@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: ISC */
 /*
  * Stratum v2 — xattr index implementation
- * (P8-POSIX-6 + 9.6-impl-4c).
+ * (P8-POSIX-6 + 9.6-impl-4c + 9.7-impl-1c-iv).
  *
  * Spec: v2/specs/xattr.tla. Models open-addressing chain integrity
  * for extended attributes keyed by `(dataset_id, ino, hash_probe)`
@@ -19,57 +19,67 @@
  *   - POSIX setxattr flags (CREATE / REPLACE) layered atop the
  *     spec's basic Set action.
  *
- * 9.6-impl-4c — the xattr cutover. The module no longer keeps an
- * in-RAM `records[]` array serialized whole on every commit: the
- * btree_engine COW B+tree (Phase 9.6) IS the xattr store. Every
- * public op maps onto the engine —
+ * 9.6-impl-4c — the xattr module was cut to btree_engine; the
+ * in-RAM `records[]` array was retired in favour of an
+ * incremental-COW B+tree as the canonical store.
  *
+ * 9.7-impl-1c-iv — the xattr cutover. The module no longer owns
+ * its own btree_engine. Each dataset's xattr records live in that
+ * dataset's per-dataset engine (the substrate from 9.7-impl-1c-i),
+ * resolved via an attached borrowed `stm_dataset_index *`. Every
+ * public op resolves the dataset's engine on entry, atomically with
+ * the xattr index's own lock, and routes its lookup / scan / insert
+ * / delete through that engine.
+ *
+ * Keys (17 bytes): `stm_metakey_compose(STM_METAKEY_KIND_XATTR,
+ *                  body, 16)` where body = `le64 ino || le64
+ *                  hash_probe`.
+ *
+ * The previous 24-byte `(le64 dataset_id || le64 ino || le64
+ * hash_probe)` form is retired — the dataset id is now woven into
+ * the engine's AEAD additional-data via `tree_id = dataset_id`, so
+ * a cross-dataset substitution attack fails decrypt rather than
+ * relying on the key prefix.
+ *
+ * Values (16 + name_len + value_len bytes, tombstones 16 bytes):
+ * unchanged from 4c — see xattr.h for the full byte-level layout.
+ *
+ * Engine ops:
  *   set            -> chain-walk via engine_lookup per probe, install
  *                     via engine_insert (upsert overwrites a
  *                     tombstone OR a same-name live record per POSIX
  *                     setxattr default semantics)
  *   get            -> chain-walk via engine_lookup per probe
  *   remove         -> chain-walk + engine_insert (tombstone-flavored)
- *   list           -> engine_scan_range over the (ds, ino) prefix,
+ *   list           -> engine_scan_range over the (ino, *) prefix,
  *                     count + copy out live records (no sort —
  *                     POSIX listxattr doesn't promise order)
  *   drop_for_ino   -> engine_scan_range collects keys, then
  *                     engine_delete each
  *
  * xattr.tla's chain-integrity invariants are UNCHANGED; only the
- * storage under it swapped from btree_store's whole-tree-rebuild MVP
- * to btree_engine's incremental COW B+tree. Tombstones remain
- * reachable as engine_inserted records (no engine_delete for a
- * Remove — the slot must persist so a colliding name at a higher
- * probe stays reachable per xattr.tla's tombstone-leaves-on-Remove
- * invariant). engine_delete is only used by drop_for_ino's bulk
- * cleanup.
+ * storage under it swapped from the pool-global engine to a per-
+ * dataset engine. Tombstones remain reachable as engine_inserted
+ * records (no engine_delete is issued for a Remove — the slot must
+ * persist so a colliding name at a higher probe stays reachable
+ * per xattr.tla's tombstone-leaves-on-Remove invariant).
+ * engine_delete is only used by drop_for_ino's bulk cleanup.
  *
- * On-disk encoding (unchanged from P8-POSIX-6):
- *   - Key (24 bytes): le64 dataset_id || le64 ino || le64 hash_probe.
- *   - Value (16 + name_len + value_len bytes, tombstones 16 bytes):
- *     see xattr.h for the full byte-level layout.
- *
- * Engine lifecycle. stm_btree_engine_create needs the storage vtable
- * context (bdev + bootstrap) AND the AEAD crypt context — set by
- * stm_xattr_index_set_storage / _set_crypt_ctx, which the sole caller
- * (sync.c) issues after stm_xattr_index_create. The engine is created
- * by whichever of the two binders runs SECOND (the first one with
- * both contexts now populated); the mount path's load_at then
- * destroys that fresh engine and opens the on-disk one.
- *
- * Concurrency: a single mutex (idx->lock) guards the persistence
- * fields AND every engine call — the btree_engine is single-threaded
- * (one handle, one thread at a time), and idx->lock IS that
- * serialization.
+ * Concurrency: a single mutex (idx->lock) guards the ds_idx pointer
+ * AND every engine call — the btree_engine is single-threaded (one
+ * handle, one thread at a time), and idx->lock IS that
+ * serialization. The engine handle is BORROWED from the dataset
+ * index per call; lifetime is safe because the fs.c layer holds
+ * fs->global SH/EX across every xattr op, and `stm_dataset_destroy`
+ * takes fs->global EX (so a slot's engine cannot be closed mid-op).
  *
  * Audit-trigger surface: this module is on CLAUDE.md's trigger list.
  */
 #include <stratum/xattr.h>
-#include <stratum/types.h>
-#include <stratum/bootstrap.h>
+#include <stratum/dataset.h>
 #include <stratum/btree_engine.h>
-#include <stratum/engine_store.h>
+#include <stratum/metakey.h>
+#include <stratum/types.h>
 
 #include <pthread.h>
 #include <stdint.h>
@@ -93,7 +103,11 @@ static inline void must_unlock(pthread_mutex_t *m) {
 /* On-disk layout constants.                                            */
 /* ------------------------------------------------------------------ */
 
-#define XA_KEY_LEN              24u
+/* Key: 1-byte STM_METAKEY_KIND_XATTR tag + 8-byte le64 ino + 8-byte
+ * le64 hash_probe = 17 bytes total. */
+#define XA_KEY_BODY_LEN         16u
+#define XA_KEY_LEN              (1u + XA_KEY_BODY_LEN)        /* 17 */
+
 #define XA_VAL_FIXED            16u
 
 /* Max possible on-disk value length (live record): fixed header +
@@ -112,12 +126,16 @@ static inline void must_unlock(pthread_mutex_t *m) {
  * bytes; this is the structured shape every chain helper + public op
  * operates on. Decoded from engine_lookup and re-encoded for
  * engine_insert. The dataset_id / ino / hash_probe fields are STAMPED
- * from the KEY (NOT from the value bytes) so a buggy writer can't
- * tamper cross-key references.
+ * from the (caller, key) triple (NOT from the value bytes) so a buggy
+ * writer can't tamper cross-key references.
  *
  * `value` is heap-allocated when value_len > 0; the caller MUST free
  * it after every use. This struct is per-call stack-allocated; there
- * is no in-RAM cache of records. */
+ * is no in-RAM cache of records.
+ *
+ * The dataset_id is conceptual (it comes from the engine handle's
+ * tree_id, not the on-disk key body) but we record it on the
+ * decoded record for caller-side symmetry with the pre-cutover shape. */
 typedef struct {
     uint64_t dataset_id;
     uint64_t ino;
@@ -132,29 +150,11 @@ typedef struct {
 struct stm_xattr_index {
     pthread_mutex_t      lock;
 
-    /* ----- Persistence (9.6-impl-4c: btree_engine-backed). ----- */
-    bool                  storage_set;   /* R70 P3-6: latched on first
-                                           * successful set_storage. */
-    bool                  crypt_set;     /* R70 P3-6: latched on first
-                                           * successful set_crypt_ctx. */
-    stm_engine_store_ctx  store_ctx;     /* { boot, bdev } — the engine's
-                                           * vt_ctx. Populated by set_storage;
-                                           * a stable member so the engine's
-                                           * borrowed vt_ctx pointer stays
-                                           * valid for idx's lifetime. */
-    stm_btree_crypt_ctx   crypt_ctx;     /* metadata_key + uuids — the
-                                           * engine's cx. Populated by
-                                           * set_crypt_ctx; a stable member. */
-    stm_btree_engine     *eng;           /* the xattr store. Created once
-                                           * BOTH contexts are bound (see
-                                           * xa_engine_create_locked /
-                                           * the two binders), or by load_at
-                                           * on the mount path. */
-    /* Last durably-committed root triple — mirrored for the sync layer's
-     * uberblock stamping (stm_xattr_index_get_root / _get_gen). */
-    uint64_t            root_paddr;
-    uint64_t            root_gen;
-    uint8_t             root_csum[32];
+    /* 9.7-impl-1c-iv: borrowed dataset index. Set once by
+     * stm_xattr_index_attach_dataset_index; alive for the xattr
+     * index's lifetime. NULL pre-attach — every op refuses with
+     * STM_EINVAL. */
+    stm_dataset_index   *ds_idx;
 };
 
 static inline pthread_mutex_t *idx_lock(const stm_xattr_index *idx) {
@@ -197,27 +197,47 @@ static uint64_t fnv1a64(const uint8_t *data, size_t len) {
 
 /* ------------------------------------------------------------------ */
 /* On-disk key/value encoding.                                         */
+/*                                                                      */
+/* Key: 17 bytes — STM_METAKEY_KIND_XATTR tag || le64 ino ||           */
+/*                  le64 hash_probe.                                    */
+/* Value: 16 + name_len + value_len bytes (tombstone: 16 bytes).        */
+/* See xattr.h.                                                         */
+/*                                                                      */
+/* The dataset id is woven into the engine's AEAD additional-data via   */
+/* tree_id = dataset_id at engine create / open time (the substrate     */
+/* from 9.7-impl-1c-i). Cross-dataset substitution defense lives in the */
+/* engine layer, not the key prefix.                                    */
+/*                                                                      */
+/* R71 P1-1 doctrine: stm_metakey_compose tags + stm_metakey_parse      */
+/* decoder-side tag check are symmetric. The body length (16 bytes)     */
+/* is re-validated on every decode in xa_decode_key.                    */
 /* ------------------------------------------------------------------ */
 
-static void xa_encode_key(uint64_t dataset_id, uint64_t ino,
-                              uint64_t hash_probe, uint8_t out[XA_KEY_LEN]) {
-    le64 ds = stm_store_le64(dataset_id);
+static stm_status xa_encode_key(uint64_t ino, uint64_t hash_probe,
+                                uint8_t out[XA_KEY_LEN]) {
+    uint8_t body[XA_KEY_BODY_LEN];
     le64 in = stm_store_le64(ino);
     le64 hp = stm_store_le64(hash_probe);
-    memcpy(out + 0,  ds.v, 8);
-    memcpy(out + 8,  in.v, 8);
-    memcpy(out + 16, hp.v, 8);
+    memcpy(body + 0, in.v, 8);
+    memcpy(body + 8, hp.v, 8);
+    size_t out_len = 0;
+    return stm_metakey_compose(STM_METAKEY_KIND_XATTR,
+                                body, XA_KEY_BODY_LEN,
+                                out, XA_KEY_LEN, &out_len);
 }
 
 static stm_status xa_decode_key(const void *in, size_t in_len,
-                                    uint64_t *out_ds, uint64_t *out_ino,
-                                    uint64_t *out_probe) {
-    if (in_len != XA_KEY_LEN) return STM_ECORRUPT;
-    le64 ds_le, in_le, hp_le;
-    memcpy(ds_le.v, (const uint8_t *)in + 0,  8);
-    memcpy(in_le.v, (const uint8_t *)in + 8,  8);
-    memcpy(hp_le.v, (const uint8_t *)in + 16, 8);
-    *out_ds    = stm_load_le64(ds_le);
+                                    uint64_t *out_ino, uint64_t *out_probe) {
+    stm_metakey_kind kind;
+    const uint8_t *body = NULL;
+    size_t body_len = 0;
+    stm_status rc = stm_metakey_parse(in, in_len, &kind, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    if (kind != STM_METAKEY_KIND_XATTR) return STM_ECORRUPT;
+    if (body_len != XA_KEY_BODY_LEN) return STM_ECORRUPT;
+    le64 in_le, hp_le;
+    memcpy(in_le.v, body + 0, 8);
+    memcpy(hp_le.v, body + 8, 8);
     *out_ino   = stm_load_le64(in_le);
     *out_probe = stm_load_le64(hp_le);
     return STM_OK;
@@ -269,7 +289,7 @@ static void xa_encode_value(const stm_xattr_record *r,
  * heap-allocates a fresh `out->value` buffer if value_len > 0
  * (caller takes ownership; freed via record_clear_value or free()).
  * The dataset_id / ino / hash_probe fields are NOT set here — caller
- * stamps from the on-disk key. */
+ * stamps from the (caller, on-disk key) triple. */
 static stm_status xa_decode_value(const void *in, size_t in_len,
                                        stm_xattr_record *out) {
     if (in_len < XA_VAL_FIXED) return STM_ECORRUPT;
@@ -298,7 +318,7 @@ static stm_status xa_decode_value(const void *in, size_t in_len,
     /* R80 P3-6: zero-init key fields explicitly so the contract is
      * "xa_decode_value fully initializes out except for caller-
      * supplied (dataset_id, ino, hash_probe) which the caller fills
-     * post-call from the on-disk key". */
+     * post-call from the (caller, on-disk key) triple". */
     out->dataset_id = 0u;
     out->ino        = 0u;
     out->hash_probe = 0u;
@@ -343,12 +363,29 @@ static stm_status xa_decode_value(const void *in, size_t in_len,
 /* Engine glue.                                                         */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Resolve the dataset's per-dataset engine handle. Caller holds
+ * idx->lock.
+ *
+ * Returns STM_OK with *out_eng set on success. Common failures:
+ *   - STM_EINVAL: ds_idx unbound (attach not called).
+ *   - STM_ENOENT: dataset not PRESENT (destroyed or never created).
+ *   - Engine create / open errors propagated verbatim.
+ */
+static stm_status xa_get_engine_locked(stm_xattr_index *idx,
+                                       uint64_t dataset_id,
+                                       stm_btree_engine **out_eng) {
+    *out_eng = NULL;
+    if (idx->ds_idx == NULL) return STM_EINVAL;
+    return stm_dataset_index_get_engine(idx->ds_idx, dataset_id, out_eng);
+}
+
 /* engine_lookup + decode + validate at exact (ds, ino, probe). Caller
  * holds idx->lock. On STM_OK with *out_found = true, *out holds the
  * validated decoded record (live or tombstone); if value_len > 0 the
  * caller MUST free out->value (or call record_clear_value). The
- * dataset_id / ino / hash_probe fields are STAMPED from the key
- * triple. On STM_OK with *out_found = false, *out is left in a
+ * dataset_id / ino / hash_probe fields are STAMPED from the (caller,
+ * key) triple. On STM_OK with *out_found = false, *out is left in a
  * cleared state (no heap to free). */
 static stm_status xa_engine_get(stm_xattr_index *idx,
                                 uint64_t ds, uint64_t ino, uint64_t probe,
@@ -356,13 +393,18 @@ static stm_status xa_engine_get(stm_xattr_index *idx,
     *out_found = false;
     memset(out, 0, sizeof *out);
 
+    stm_btree_engine *eng = NULL;
+    stm_status es = xa_get_engine_locked(idx, ds, &eng);
+    if (es != STM_OK) return es;
+
     uint8_t key[XA_KEY_LEN];
-    xa_encode_key(ds, ino, probe, key);
+    stm_status ks = xa_encode_key(ino, probe, key);
+    if (ks != STM_OK) return ks;
 
     bool found = false;
     void *vbuf = NULL;
     size_t vlen = 0;
-    stm_status ls = stm_btree_engine_lookup(idx->eng, key, XA_KEY_LEN,
+    stm_status ls = stm_btree_engine_lookup(eng, key, XA_KEY_LEN,
                                             &found, &vbuf, &vlen);
     if (ls != STM_OK) return ls;
     if (!found) return STM_OK;                  /* *out_found stays false */
@@ -393,14 +435,19 @@ static stm_status xa_engine_get(stm_xattr_index *idx,
  * (worst-case 16 + 255 + 65536 ≈ 64 KiB — too big for the stack). */
 static stm_status xa_engine_put(stm_xattr_index *idx,
                                 const stm_xattr_record *r) {
+    stm_btree_engine *eng = NULL;
+    stm_status es = xa_get_engine_locked(idx, r->dataset_id, &eng);
+    if (es != STM_OK) return es;
+
     uint8_t key[XA_KEY_LEN];
-    xa_encode_key(r->dataset_id, r->ino, r->hash_probe, key);
+    stm_status ks = xa_encode_key(r->ino, r->hash_probe, key);
+    if (ks != STM_OK) return ks;
 
     uint8_t *val = malloc(XA_VAL_MAX);
     if (!val) return STM_ENOMEM;
     size_t vlen = 0;
     xa_encode_value(r, val, &vlen);
-    stm_status is = stm_btree_engine_insert(idx->eng, key, XA_KEY_LEN,
+    stm_status is = stm_btree_engine_insert(eng, key, XA_KEY_LEN,
                                             val, vlen);
     free(val);
     return is;
@@ -411,18 +458,14 @@ static stm_status xa_engine_put(stm_xattr_index *idx,
  * it engine_inserts a tombstone (chain integrity per xattr.tla). */
 static stm_status xa_engine_del(stm_xattr_index *idx,
                                 uint64_t ds, uint64_t ino, uint64_t probe) {
-    uint8_t key[XA_KEY_LEN];
-    xa_encode_key(ds, ino, probe, key);
-    return stm_btree_engine_delete(idx->eng, key, XA_KEY_LEN, NULL);
-}
+    stm_btree_engine *eng = NULL;
+    stm_status es = xa_get_engine_locked(idx, ds, &eng);
+    if (es != STM_OK) return es;
 
-/* Stand up the btree_engine from the (now both populated) store + crypt
- * contexts. Caller holds idx->lock, has verified BOTH contexts are
- * bound and idx->eng is NULL. */
-static stm_status xa_engine_create_locked(stm_xattr_index *idx) {
-    return stm_btree_engine_create(&STM_ENGINE_STORE_VT, &idx->store_ctx,
-                                   &idx->crypt_ctx, /*tree_id=*/0u,
-                                   &idx->eng);
+    uint8_t key[XA_KEY_LEN];
+    stm_status ks = xa_encode_key(ino, probe, key);
+    if (ks != STM_OK) return ks;
+    return stm_btree_engine_delete(eng, key, XA_KEY_LEN, NULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -455,11 +498,25 @@ stm_xattr_index *stm_xattr_index_create(void) {
 void stm_xattr_index_close(stm_xattr_index *idx) {
     if (!idx) return;
     pthread_mutex_destroy(&idx->lock);
-    /* NULL-safe; an un-finalized flush is implicitly aborted (the
-     * flushed-but-unrooted paddrs are handed back to the allocator).
-     * Same defense-in-depth posture as inode.c::stm_inode_index_close. */
-    stm_btree_engine_destroy(idx->eng);
+    /* 9.7-impl-1c-iv: the engine isn't ours to close — the per-dataset
+     * engines live on the borrowed ds_idx and are closed by
+     * stm_dataset_index_close at its lifecycle end. We just drop the
+     * borrowed pointer. */
     free(idx);
+}
+
+stm_status stm_xattr_index_attach_dataset_index(stm_xattr_index *idx,
+                                                stm_dataset_index *ds_idx) {
+    if (!idx || !ds_idx) return STM_EINVAL;
+    must_lock(idx_lock(idx));
+    if (idx->ds_idx != NULL) {
+        /* Re-attach refused — borrow lifetime is fixed at attach. */
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
+    idx->ds_idx = ds_idx;
+    must_unlock(idx_lock(idx));
+    return STM_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -500,7 +557,7 @@ stm_status stm_xattr_set(stm_xattr_index *idx,
     if (av != STM_OK) return av;
 
     must_lock(idx_lock(idx));
-    if (!idx->eng) {
+    if (idx->ds_idx == NULL) {
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
@@ -634,13 +691,13 @@ stm_status stm_xattr_get(const stm_xattr_index *idx,
 
     pthread_mutex_t *lk = idx_lock(idx);
     must_lock(lk);
-    if (!idx->eng) {
-        must_unlock(lk);
-        return STM_EINVAL;
-    }
 
     /* Cast away const for the engine_lookup call. */
     stm_xattr_index *m = (stm_xattr_index *)idx;
+    if (m->ds_idx == NULL) {
+        must_unlock(lk);
+        return STM_EINVAL;
+    }
 
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
 
@@ -652,6 +709,9 @@ stm_status stm_xattr_get(const stm_xattr_index *idx,
                                       &r, &found);
         if (gs != STM_OK) {
             must_unlock(lk);
+            /* Dataset not present → no record. POSIX getxattr maps
+             * to ENODATA. */
+            if (gs == STM_ENOENT) return STM_ENODATA;
             return gs;
         }
         if (!found) {
@@ -705,7 +765,7 @@ stm_status stm_xattr_remove(stm_xattr_index *idx,
     if (name_len == 0u || name_len > STM_XATTR_NAME_MAX) return STM_EINVAL;
 
     must_lock(idx_lock(idx));
-    if (!idx->eng) {
+    if (idx->ds_idx == NULL) {
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
@@ -720,6 +780,9 @@ stm_status stm_xattr_remove(stm_xattr_index *idx,
                                       &r, &found);
         if (gs != STM_OK) {
             must_unlock(idx_lock(idx));
+            /* Dataset not present → nothing to remove. POSIX
+             * removexattr maps to ENODATA. */
+            if (gs == STM_ENOENT) return STM_ENODATA;
             return gs;
         }
         if (!found) {
@@ -753,11 +816,11 @@ stm_status stm_xattr_remove(stm_xattr_index *idx,
     return STM_ENODATA;
 }
 
-/* listxattr: scan_range over [ds||ino||0 .. ds||ino||UINT64_MAX] and
- * emit live records into out_entries. POSIX listxattr doesn't promise
- * any order, so we emit in scan_range's bytewise-key order. *out_total
- * is the count of live records under (ds, ino), regardless of how
- * many were copied.
+/* listxattr: scan_range over [tag||ino||0 .. tag||ino||UINT64_MAX]
+ * within the dataset's engine and emit live records into out_entries.
+ * POSIX listxattr doesn't promise any order, so we emit in scan_range's
+ * bytewise-key order. *out_total is the count of live records under
+ * (ds, ino), regardless of how many were copied.
  *
  * Two-pass not strictly required (we know cap from caller), but we
  * still need to count live records first to refuse with STM_ERANGE
@@ -767,8 +830,6 @@ stm_status stm_xattr_remove(stm_xattr_index *idx,
  * max_entries IF we don't need precise counts. We don't early-stop
  * because the POSIX semantics expose the count via *out_total. */
 typedef struct {
-    uint64_t          ds;
-    uint64_t          ino;
     stm_xattr_entry  *out;
     size_t            out_cap;            /* caller's max_entries */
     size_t            out_n;              /* number copied so far */
@@ -779,9 +840,10 @@ typedef struct {
 static int xa_list_cb(const void *k, size_t klen,
                       const void *v, size_t vlen, void *ctx_) {
     xa_list_ctx *c = ctx_;
-    uint64_t ds = 0, ino = 0, probe = 0;
-    stm_status ks = xa_decode_key(k, klen, &ds, &ino, &probe);
+    uint64_t ino = 0, probe = 0;
+    stm_status ks = xa_decode_key(k, klen, &ino, &probe);
     if (ks != STM_OK) { c->err = ks; return 1; }
+    (void)ino;                          /* range bracket pins ino */
 
     stm_xattr_record r;
     memset(&r, 0, sizeof r);
@@ -822,22 +884,34 @@ stm_status stm_xattr_list(const stm_xattr_index *idx,
 
     pthread_mutex_t *lk = idx_lock(idx);
     must_lock(lk);
-    if (!idx->eng) {
+
+    /* Cast away const for the engine_scan_range call. */
+    stm_xattr_index *m = (stm_xattr_index *)idx;
+    if (m->ds_idx == NULL) {
         must_unlock(lk);
         return STM_EINVAL;
     }
 
-    /* Cast away const for the engine_scan_range call. */
-    stm_xattr_index *m = (stm_xattr_index *)idx;
+    stm_btree_engine *eng = NULL;
+    stm_status es = xa_get_engine_locked(m, dataset_id, &eng);
+    if (es != STM_OK) {
+        must_unlock(lk);
+        /* Dataset not present → empty listing. */
+        if (es == STM_ENOENT) return STM_OK;
+        return es;
+    }
 
     uint8_t lo[XA_KEY_LEN], hi[XA_KEY_LEN];
-    xa_encode_key(dataset_id, ino, 0u,         lo);
-    xa_encode_key(dataset_id, ino, UINT64_MAX, hi);
+    stm_status k1 = xa_encode_key(ino, 0u,         lo);
+    stm_status k2 = xa_encode_key(ino, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK) {
+        must_unlock(lk);
+        return k1 != STM_OK ? k1 : k2;
+    }
 
-    xa_list_ctx c = { .ds = dataset_id, .ino = ino,
-                       .out = out_entries, .out_cap = max_entries,
+    xa_list_ctx c = { .out = out_entries, .out_cap = max_entries,
                        .out_n = 0, .n_total = 0, .err = STM_OK };
-    stm_status ss = stm_btree_engine_scan_range(m->eng, lo, XA_KEY_LEN,
+    stm_status ss = stm_btree_engine_scan_range(eng, lo, XA_KEY_LEN,
                                                 hi, XA_KEY_LEN,
                                                 xa_list_cb, &c);
     if (ss != STM_OK || c.err != STM_OK) {
@@ -877,9 +951,10 @@ static int xa_drop_cb(const void *k, size_t klen,
     (void)v;                                /* drop reads keys only */
     (void)vlen;
     xa_drop_ctx *c = ctx_;
-    uint64_t ds = 0, ino = 0, probe = 0;
-    stm_status ks = xa_decode_key(k, klen, &ds, &ino, &probe);
+    uint64_t ino = 0, probe = 0;
+    stm_status ks = xa_decode_key(k, klen, &ino, &probe);
     if (ks != STM_OK) { c->err = ks; return 1; }
+    (void)ino;                          /* range bracket pins ino */
 
     if (c->n == c->cap) {
         if (c->cap > (SIZE_MAX / sizeof *c->probes) / 2u) {
@@ -903,17 +978,33 @@ stm_status stm_xattr_drop_for_ino(stm_xattr_index *idx,
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
     must_lock(idx_lock(idx));
-    if (!idx->eng) {
+    if (idx->ds_idx == NULL) {
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
 
+    stm_btree_engine *eng = NULL;
+    stm_status es = xa_get_engine_locked(idx, dataset_id, &eng);
+    if (es != STM_OK) {
+        must_unlock(idx_lock(idx));
+        /* Dataset not present → nothing to drop. */
+        if (es == STM_ENOENT) {
+            if (out_dropped) *out_dropped = 0;
+            return STM_OK;
+        }
+        return es;
+    }
+
     uint8_t lo[XA_KEY_LEN], hi[XA_KEY_LEN];
-    xa_encode_key(dataset_id, ino, 0u,         lo);
-    xa_encode_key(dataset_id, ino, UINT64_MAX, hi);
+    stm_status k1 = xa_encode_key(ino, 0u,         lo);
+    stm_status k2 = xa_encode_key(ino, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return k1 != STM_OK ? k1 : k2;
+    }
 
     xa_drop_ctx c = { .probes = NULL, .n = 0, .cap = 0, .err = STM_OK };
-    stm_status ss = stm_btree_engine_scan_range(idx->eng, lo, XA_KEY_LEN,
+    stm_status ss = stm_btree_engine_scan_range(eng, lo, XA_KEY_LEN,
                                                 hi, XA_KEY_LEN,
                                                 xa_drop_cb, &c);
     if (ss != STM_OK || c.err != STM_OK) {
@@ -922,7 +1013,12 @@ stm_status stm_xattr_drop_for_ino(stm_xattr_index *idx,
         return ss != STM_OK ? ss : c.err;
     }
 
-    /* Phase 2: engine_delete each collected probe. */
+    /* Phase 2: engine_delete each collected probe. On the first
+     * failure we stop + return the error code; previously-deleted
+     * probes stay deleted (engine_delete is failure-atomic; partial
+     * progress is durable from the engine's view, retried at the
+     * next sync). The caller wedges the fs on any sync error
+     * (R154 doctrine), preserving consistency. */
     for (size_t i = 0; i < c.n; i++) {
         stm_status ds = xa_engine_del(idx, dataset_id, ino, c.probes[i]);
         if (ds != STM_OK) {
@@ -935,259 +1031,6 @@ stm_status stm_xattr_drop_for_ino(stm_xattr_index *idx,
     size_t dropped = c.n;
     free(c.probes);
     if (out_dropped) *out_dropped = dropped;
-
-    must_unlock(idx_lock(idx));
-    return STM_OK;
-}
-
-/* ------------------------------------------------------------------ */
-/* Public API — persistence (9.6-impl-4c).                              */
-/* ------------------------------------------------------------------ */
-
-stm_status stm_xattr_index_set_storage(stm_xattr_index *idx,
-                                          stm_bdev *bdev_0,
-                                          stm_bootstrap *boot_0) {
-    if (!idx || !bdev_0 || !boot_0) return STM_EINVAL;
-    must_lock(idx_lock(idx));
-    if (idx->storage_set) {
-        must_unlock(idx_lock(idx));
-        return STM_EINVAL;
-    }
-    idx->store_ctx.bdev = bdev_0;
-    idx->store_ctx.boot = boot_0;
-    /* Second binder: stand the engine up. */
-    if (idx->crypt_set && !idx->eng) {
-        stm_status es = xa_engine_create_locked(idx);
-        if (es != STM_OK) {
-            must_unlock(idx_lock(idx));
-            return es;
-        }
-    }
-    idx->storage_set = true;
-    must_unlock(idx_lock(idx));
-    return STM_OK;
-}
-
-stm_status stm_xattr_index_set_crypt_ctx(stm_xattr_index *idx,
-                                            const uint8_t *metadata_key,
-                                            const uint64_t pool_uuid[2],
-                                            const uint64_t device_uuid_0[2]) {
-    if (!idx || !metadata_key || !pool_uuid || !device_uuid_0) return STM_EINVAL;
-    must_lock(idx_lock(idx));
-    if (idx->crypt_set) {
-        must_unlock(idx_lock(idx));
-        return STM_EINVAL;
-    }
-    idx->crypt_ctx.metadata_key   = metadata_key;
-    idx->crypt_ctx.pool_uuid[0]   = pool_uuid[0];
-    idx->crypt_ctx.pool_uuid[1]   = pool_uuid[1];
-    idx->crypt_ctx.device_uuid[0] = device_uuid_0[0];
-    idx->crypt_ctx.device_uuid[1] = device_uuid_0[1];
-    /* Second binder: stand the engine up. */
-    if (idx->storage_set && !idx->eng) {
-        stm_status es = xa_engine_create_locked(idx);
-        if (es != STM_OK) {
-            must_unlock(idx_lock(idx));
-            return es;
-        }
-    }
-    idx->crypt_set = true;
-    must_unlock(idx_lock(idx));
-    return STM_OK;
-}
-
-stm_status stm_xattr_index_get_root(const stm_xattr_index *idx,
-                                       uint64_t *out_root_paddr,
-                                       uint8_t out_root_csum[32]) {
-    if (!idx || !out_root_paddr) return STM_EINVAL;
-    pthread_mutex_t *lock = idx_lock(idx);
-    must_lock(lock);
-    *out_root_paddr = idx->root_paddr;
-    if (out_root_csum) memcpy(out_root_csum, idx->root_csum, 32);
-    must_unlock(lock);
-    return STM_OK;
-}
-
-stm_status stm_xattr_index_get_gen(const stm_xattr_index *idx,
-                                      uint64_t *out_root_gen) {
-    if (!idx || !out_root_gen) return STM_EINVAL;
-    pthread_mutex_t *lock = idx_lock(idx);
-    must_lock(lock);
-    *out_root_gen = idx->root_gen;
-    must_unlock(lock);
-    return STM_OK;
-}
-
-stm_status stm_xattr_index_commit(stm_xattr_index *idx,
-                                     uint64_t committed_gen,
-                                     uint64_t *out_root_paddr,
-                                     uint8_t out_root_csum[32]) {
-    if (!idx || !out_root_paddr || !out_root_csum) return STM_EINVAL;
-    must_lock(idx_lock(idx));
-
-    if (!idx->storage_set || !idx->crypt_set || !idx->eng) {
-        must_unlock(idx_lock(idx));
-        return STM_EINVAL;
-    }
-
-    /* Single-shot incremental-COW commit: flush + finalize, no
-     * pending window left open. 9.6-impl-4c: stm_sync_commit drives
-     * the three-phase form below; this monolithic form remains for
-     * non-sync callers and the persistence unit tests. */
-    uint64_t cp = 0;
-    uint8_t  cc[32];
-    stm_status cs = stm_btree_engine_commit(idx->eng, committed_gen, &cp, cc);
-    if (cs != STM_OK) {
-        /* Failed commit self-reverts; the caller wedges the fs
-         * (R154 doctrine carry). */
-        must_unlock(idx_lock(idx));
-        return cs;
-    }
-
-    uint64_t rp = 0, rg = 0;
-    uint8_t  rc[32];
-    stm_status gs = stm_btree_engine_get_root(idx->eng, &rp, &rg, rc);
-    if (gs != STM_OK) {
-        must_unlock(idx_lock(idx));
-        return gs;
-    }
-
-    stm_status bs = stm_bootstrap_commit(idx->store_ctx.boot, committed_gen);
-    if (bs != STM_OK) {
-        must_unlock(idx_lock(idx));
-        return bs;
-    }
-
-    idx->root_paddr = rp;
-    idx->root_gen   = rg;
-    memcpy(idx->root_csum, rc, 32);
-
-    *out_root_paddr = rp;
-    memcpy(out_root_csum, rc, 32);
-    must_unlock(idx_lock(idx));
-    return STM_OK;
-}
-
-/* ------------------------------------------------------------------ */
-/* Three-phase commit — flush / finalize / abort (9.6-impl-4c).         */
-/* ------------------------------------------------------------------ */
-
-stm_status stm_xattr_index_commit_flush(stm_xattr_index *idx,
-                                            uint64_t committed_gen,
-                                            uint64_t *out_root_paddr,
-                                            uint64_t *out_root_gen,
-                                            uint8_t out_root_csum[32]) {
-    if (!idx || !out_root_paddr || !out_root_gen || !out_root_csum)
-        return STM_EINVAL;
-    must_lock(idx_lock(idx));
-
-    if (!idx->storage_set || !idx->crypt_set || !idx->eng) {
-        must_unlock(idx_lock(idx));
-        return STM_EINVAL;
-    }
-
-    uint64_t cp = 0, cg = 0;
-    uint8_t  cc[32];
-    stm_status cs = stm_btree_engine_commit_flush(idx->eng, committed_gen,
-                                                  &cp, &cg, cc);
-    if (cs != STM_OK) {
-        /* Failed flush self-reverts; NO pending window. Caller must
-         * NOT _commit_abort. Caller wedges the fs (R154 doctrine
-         * carry). */
-        must_unlock(idx_lock(idx));
-        return cs;
-    }
-
-    *out_root_paddr = cp;
-    *out_root_gen   = cg;
-    memcpy(out_root_csum, cc, 32);
-    must_unlock(idx_lock(idx));
-    return STM_OK;
-}
-
-stm_status stm_xattr_index_commit_finalize(stm_xattr_index *idx) {
-    if (!idx) return STM_EINVAL;
-    must_lock(idx_lock(idx));
-    if (!idx->eng) {
-        must_unlock(idx_lock(idx));
-        return STM_EINVAL;
-    }
-
-    stm_status fs = stm_btree_engine_commit_finalize(idx->eng);
-    if (fs != STM_OK) {
-        must_unlock(idx_lock(idx));
-        return fs;
-    }
-
-    uint64_t rp = 0, rg = 0;
-    uint8_t  rc[32];
-    stm_status gs = stm_btree_engine_get_root(idx->eng, &rp, &rg, rc);
-    if (gs != STM_OK) {
-        must_unlock(idx_lock(idx));
-        return gs;
-    }
-    idx->root_paddr = rp;
-    idx->root_gen   = rg;
-    memcpy(idx->root_csum, rc, 32);
-
-    must_unlock(idx_lock(idx));
-    return STM_OK;
-}
-
-stm_status stm_xattr_index_commit_abort(stm_xattr_index *idx) {
-    if (!idx) return STM_EINVAL;
-    must_lock(idx_lock(idx));
-    if (!idx->eng) {
-        must_unlock(idx_lock(idx));
-        return STM_EINVAL;
-    }
-
-    stm_status as = stm_btree_engine_commit_abort(idx->eng);
-    must_unlock(idx_lock(idx));
-    return as;
-}
-
-/* ------------------------------------------------------------------ */
-/* load_at — open the on-disk engine.                                  */
-/*                                                                      */
-/* Like dirent's load_at, xattr has no in-RAM state to reconstruct —    */
-/* the chain walkers go straight to the engine. Lazy validation: a     */
-/* corrupt record surfaces at first access via xa_decode_value         */
-/* (returning STM_ECORRUPT to the caller). The AEAD tag + Merkle chain */
-/* on the enclosing engine node still defend against offline tamper at */
-/* every node read.                                                     */
-/* ------------------------------------------------------------------ */
-
-stm_status stm_xattr_index_load_at(stm_xattr_index *idx,
-                                      uint64_t root_paddr,
-                                      uint64_t root_gen,
-                                      const uint8_t expected_csum[32]) {
-    if (!idx || !expected_csum) return STM_EINVAL;
-    if (root_paddr == 0u) return STM_EINVAL;
-    must_lock(idx_lock(idx));
-    if (!idx->storage_set || !idx->crypt_set) {
-        must_unlock(idx_lock(idx));
-        return STM_EINVAL;
-    }
-
-    stm_btree_engine *opened = NULL;
-    stm_status os = stm_btree_engine_open(&STM_ENGINE_STORE_VT,
-                                          &idx->store_ctx, &idx->crypt_ctx,
-                                          /*tree_id=*/0u,
-                                          root_paddr, root_gen, expected_csum,
-                                          &opened);
-    if (os != STM_OK) {
-        must_unlock(idx_lock(idx));
-        return os;
-    }
-
-    /* Atomic install: drop the prior engine, adopt the opened tree. */
-    stm_btree_engine_destroy(idx->eng);
-    idx->eng = opened;
-
-    idx->root_paddr = root_paddr;
-    idx->root_gen   = root_gen;
-    memcpy(idx->root_csum, expected_csum, 32);
 
     must_unlock(idx_lock(idx));
     return STM_OK;
