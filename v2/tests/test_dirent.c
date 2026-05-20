@@ -16,7 +16,7 @@
  *   - Persistence: alloc / commit / close / open / load_at / lookup
  *     roundtrip across mount boundaries with both live records and
  *     tombstones surviving the persistence path.
- *   - On-disk layout sanity: STM_UB_VERSION compile-time at 25.
+ *   - On-disk layout sanity: STM_UB_VERSION compile-time at 29.
  */
 #include "tharness.h"
 

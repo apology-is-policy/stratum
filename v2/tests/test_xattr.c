@@ -21,7 +21,7 @@
  *     tombstones surviving the persistence path.
  *   - Probe-only / range-truncation getxattr shapes (POSIX getxattr(2)).
  *   - Drop-for-ino.
- *   - On-disk layout sanity: STM_UB_VERSION compile-time at 28.
+ *   - On-disk layout sanity: STM_UB_VERSION compile-time at 29.
  */
 #include "tharness.h"
 

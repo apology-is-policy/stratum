@@ -90,11 +90,13 @@ _Static_assert(STM_EXTENT_HASH_LEN == STM_CAS_HASH_LEN,
 
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
-#include <stratum/btnode.h>
-#include <stratum/btree.h>
 #include <stratum/btree_engine.h>
 #include <stratum/engine_store.h>
 #include <stratum/super.h>
+/* btree_engine.h transitively pulls in btree_store.h (for the shared
+ * stm_btree_crypt_ctx + the btree-store vtable type) + btnode.h. The
+ * R156 P3-6 close removed explicit stratum/btnode.h + stratum/btree.h
+ * includes since no symbol from either is referenced post-4d cutover. */
 
 #include <pthread.h>
 #include <stdint.h>
@@ -458,8 +460,14 @@ static int ex_global_check_cb(const void *k, size_t klen,
         }
     }
 
-    /* Cohabit probe (SharedReplicasAreCohabit). */
-    if (gc->cohabit_active && gc->cohabit_ok) {
+    /* Cohabit probe (SharedReplicasAreCohabit). The skipped record is
+     * about to be freed (its paddrs are queued for return-to-allocator),
+     * so it can't cohabit with the candidate even if their paddrs share —
+     * the share would not survive the commit. R156 P3-2 close. Today's
+     * only cohabit caller (stm_extent_reflink) sets no skip_keys, so this
+     * branch was unreachable; defense-in-depth for future callers that
+     * activate both probes. */
+    if (gc->cohabit_active && gc->cohabit_ok && !skipped) {
         bool any_share = false;
         for (uint8_t i = 0; i < r.n_replicas && !any_share; i++) {
             for (size_t k_ = 0; k_ < gc->n_cand; k_++) {
@@ -901,10 +909,21 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
     free(drop_offs_idx);
     ex_collect_free(&c);
 
+    /* R156 P2-1 close: on the engine_delete-mid-loop failure path the
+     * out-args contract is "NULL on failure" (header + 14-extent.md). The
+     * failure mode is unreachable in production (engine_del cannot return
+     * STM_EBUSY under the FS lock discipline — sync's commit_flush holds
+     * s->lock), but the latent leak — sync.c:5211 skips `free(dropped)`
+     * on a non-OK return — is closed by zero-ing the out-args here. */
+    if (last_ds != STM_OK) {
+        free(out_buf);
+        must_unlock(&idx->lock);
+        return last_ds;
+    }
     *out_dropped_paddrs = out_buf;
     *out_n_dropped      = out_idx;
     must_unlock(&idx->lock);
-    return last_ds;
+    return STM_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -983,9 +1002,17 @@ static stm_status drop_by_predicate_locked(stm_extent_index *idx,
     }
     ex_collect_free(&c);
 
+    /* R156 P2-1 close: out-args contract "NULL on failure" carries from
+     * the header docstring across stm_extent_{truncate,truncate_into,
+     * delete_file,punch_range} (every caller of this helper); see the
+     * matching close in stm_extent_overwrite above. */
+    if (last_ds != STM_OK) {
+        free(paddrs);
+        return last_ds;
+    }
     *out_paddrs = paddrs;
     *out_n      = pidx;
-    return last_ds;
+    return STM_OK;
 }
 
 /* Predicate-drop variant for stm_extent_truncate_into — uses caller-
@@ -2479,10 +2506,30 @@ static stm_status ex_encode_value(const stm_extent_record *r,
      * bytes are deterministic-zero. */
     memset(out, 0, EX_VAL_LEN);
 
+    /* R156 P3-1 close: encoder-side mirrors of decoder-side guards
+     * (R71 P1-1 + R77 P1-1 doctrine — writer-side guards mirror decoder-
+     * side guards). All three are already enforced by every public
+     * stm_extent_* arg-validation site, so the strict-mirror discipline
+     * is satisfied compositionally; the encoder is defense-in-depth
+     * against a future internal caller that bypasses the public API. */
+    /* (a) origin_dataset_id + origin_ino > 0 (mirrors decode line ~2632). */
+    if (r->origin_dataset_id == 0 || r->origin_ino == 0) return STM_ECORRUPT;
+    /* (b) origin_off + r->len no-overflow (mirrors decode line ~2633;
+     * extent.tla::OriginConsistentInBounds). */
+    if (r->origin_off > UINT64_MAX - r->len) return STM_ECORRUPT;
+
     /* P7-CAS / v18: byte 0 = kind discriminator. */
     if (r->kind == STM_EXTENT_KIND_HOT) {
         if (r->n_replicas < 1 || r->n_replicas > STM_EXTENT_MAX_REPLICAS) {
             return STM_ECORRUPT;
+        }
+        /* (c) Within-set distinctness (mirrors decode line ~2580 — every
+         * decoded HOT record's replica set is checked pairwise; the
+         * encoder previously relied on caller-side replica_set_is_valid). */
+        for (uint8_t i = 0; i < r->n_replicas; i++) {
+            for (uint8_t j = (uint8_t)(i + 1); j < r->n_replicas; j++) {
+                if (r->paddrs[i] == r->paddrs[j]) return STM_ECORRUPT;
+            }
         }
         out[0] = (uint8_t)STM_EXTENT_KIND_HOT;
         out[1] = r->n_replicas;

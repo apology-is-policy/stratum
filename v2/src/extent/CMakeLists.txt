@@ -7,6 +7,10 @@ target_include_directories(stm_extent PUBLIC
 
 target_link_libraries(stm_extent
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  stm_crypto stm_block stm_bootstrap stm_btree stm_btree_store
+    PUBLIC  stm_crypto stm_block stm_bootstrap
             stm_btree_engine stm_engine_store
             Threads::Threads)
+# R156 P3-6 close: stm_btree + stm_btree_store retired from explicit
+# PUBLIC deps — they're pulled in transitively via stm_btree_engine's
+# own PUBLIC deps (for the shared stm_btree_crypt_ctx + btnode constants),
+# and no direct symbol from either is used by extent post-4d.
