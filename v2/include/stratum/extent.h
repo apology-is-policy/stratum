@@ -1120,6 +1120,52 @@ stm_status stm_extent_index_commit(stm_extent_index *idx,
                                       uint64_t *out_root_paddr,
                                       uint8_t out_root_csum[32]);
 
+/*
+ * Three-phase commit (9.6-impl-4d). The form stm_sync_commit drives.
+ *
+ *   _commit_flush(idx, committed_gen, &paddr, &gen, csum) — open a
+ *     pending-commit window: flush every dirty path to fresh paddrs
+ *     at committed_gen and return the prospective (paddr, gen, csum)
+ *     triple. The durable root (idx->root_*) is NOT touched yet — a
+ *     concurrent reader still sees the previous tree's root via
+ *     stm_extent_index_get_root. The bootstrap bitmap is NOT
+ *     committed here; the sync layer batches a single
+ *     stm_bootstrap_commit across all engine flushes.
+ *
+ *     On STM_OK: pending window open; caller MUST follow with
+ *     _commit_finalize (commit-path) OR _commit_abort (failure-path).
+ *
+ *     On failure: NO pending window opened (the engine self-reverts:
+ *     drops the in-memory tree, deferred-frees the freshly-written
+ *     paddrs). The caller MUST NOT call _commit_abort — there's
+ *     nothing to abort. 9.6-impl-4b design §5.5: a failed
+ *     stm_sync_commit is crash-equivalent — the caller wedges the fs.
+ *
+ *   _commit_finalize(idx) — adopt the flushed root as durable. After
+ *     this returns the pending window is closed and idx->root_* names
+ *     the new tree. INFALLIBLE after a successful _commit_flush
+ *     (btree_engine.h contract); the STM_EINVAL exit is a
+ *     no-pending-flush sequencing bug.
+ *
+ *   _commit_abort(idx) — discard the flush. The freshly-written
+ *     paddrs are deferred-freed and the engine reverts to the
+ *     durable-root state. idx->root_* is unchanged. Caller's
+ *     responsibility to ensure no _commit_finalize call is made
+ *     after this returns.
+ */
+STM_MUST_USE
+stm_status stm_extent_index_commit_flush(stm_extent_index *idx,
+                                            uint64_t committed_gen,
+                                            uint64_t *out_root_paddr,
+                                            uint64_t *out_root_gen,
+                                            uint8_t out_root_csum[32]);
+
+STM_MUST_USE
+stm_status stm_extent_index_commit_finalize(stm_extent_index *idx);
+
+STM_MUST_USE
+stm_status stm_extent_index_commit_abort(stm_extent_index *idx);
+
 /* Durable root paddr + csum as last persisted by _commit / _load_at.
  * Both zero before any commit. */
 STM_MUST_USE

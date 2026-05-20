@@ -2655,24 +2655,6 @@ stm_status stm_sync_commit(stm_sync *s)
         return scs;
     }
 
-    /* P7-3 (v12): commit the extent index. Same shape as dataset /
-     * snapshot — idempotent when clean, returns (paddr, csum) for
-     * the new tree root. */
-    uint64_t extent_paddr = 0;
-    uint8_t  extent_csum[32] = {0};
-    uint64_t extent_gen = 0;
-    stm_status ecs = stm_extent_index_commit(s->extent_idx, target_gen,
-                                                  &extent_paddr, extent_csum);
-    if (ecs != STM_OK) {
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return ecs;
-    }
-    ecs = stm_extent_index_get_gen(s->extent_idx, &extent_gen);
-    if (ecs != STM_OK) {
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return ecs;
-    }
-
     /* P7-15 (v16): commit the repair-log index. Plaintext +
      * Merkle-covered (no AEAD); idempotent when no emit since last
      * commit (R14b P2-1 pattern). Returns (paddr, csum, next_seq)
@@ -2709,6 +2691,33 @@ stm_status stm_sync_commit(stm_sync *s)
         return ccs;
     }
 
+    /* P7-3 (v12) / 9.6-impl-4d: FLUSH the extent index. The extent
+     * module is now btree_engine-backed (incremental-COW B+tree); its
+     * commit is three-phase. commit_flush writes the dirty root-to-leaf
+     * paths to fresh paddrs at target_gen and returns the PROSPECTIVE
+     * (paddr, gen, csum) — durable only after commit_finalize in
+     * Phase 3 (the engine's durable root still names the previous tree
+     * until then). The prospective triple feeds compute_merkle_root +
+     * build_uberblock exactly as the old single-shot out-params did.
+     *
+     * Extent is the FIRST of the four engine-backed flushes (extent →
+     * inode → dirent → xattr). From here until the finalize the engine
+     * holds a pending-commit window: EVERY error `return` between this
+     * flush and the finalize MUST stm_extent_index_commit_abort first.
+     * A failed commit_flush itself opens NO window (it self-reverts),
+     * so the abort is paired only with a SUCCESSFUL flush — the flush's
+     * own failure return below needs no abort. */
+    uint64_t extent_paddr = 0;
+    uint8_t  extent_csum[32] = {0};
+    uint64_t extent_gen = 0;
+    stm_status ecs = stm_extent_index_commit_flush(s->extent_idx, target_gen,
+                                                     &extent_paddr, &extent_gen,
+                                                     extent_csum);
+    if (ecs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return ecs;
+    }
+
     /* P8-POSIX-1b (v24) / 9.6-impl-4b-iii: FLUSH the inode index. The
      * inode module is btree_engine-backed (incremental-COW B+tree); its
      * commit is three-phase. commit_flush writes the dirty root-to-leaf
@@ -2735,6 +2744,8 @@ stm_status stm_sync_commit(stm_sync *s)
                                                     &inode_paddr, &inode_gen,
                                                     inode_csum);
     if (ics != STM_OK) {
+        /* inode flush self-reverts; only extent has a pending window. */
+        (void)stm_extent_index_commit_abort(s->extent_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return ics;
     }
@@ -2754,7 +2765,9 @@ stm_status stm_sync_commit(stm_sync *s)
                                                     &dirent_paddr, &dirent_gen,
                                                     dirent_csum);
     if (dcs != STM_OK) {
-        /* dirent flush self-reverts; only inode has a pending window. */
+        /* dirent flush self-reverts; extent + inode have pending
+         * windows that must be aborted. */
+        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_inode_index_commit_abort(s->inode_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return dcs;
@@ -2769,8 +2782,9 @@ stm_status stm_sync_commit(stm_sync *s)
                                                    &xattr_paddr, &xattr_gen,
                                                    xattr_csum);
     if (xcs != STM_OK) {
-        /* xattr flush self-reverts; inode + dirent have pending
-         * windows that must be aborted. */
+        /* xattr flush self-reverts; extent + inode + dirent have
+         * pending windows that must be aborted. */
+        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
@@ -2780,6 +2794,7 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_alloc_stats astats;
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
+        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
@@ -2811,6 +2826,7 @@ stm_status stm_sync_commit(stm_sync *s)
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
+        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
@@ -2833,21 +2849,23 @@ stm_status stm_sync_commit(stm_sync *s)
      * `boot` is device 0's shared bootstrap — the same handle every
      * metadata index borrows.
      *
-     * At 4c the inode / dirent / xattr trees are all engine-backed
-     * and rely on this single barrier. The btree_store-backed trees
-     * (extent / dataset / snapshot / cas) ALSO call
-     * stm_bootstrap_commit internally at this same target_gen, so
-     * this explicit call is redundant-but-cheap for them (it advances
-     * bitmap_gen + fsyncs an unchanged bitmap — idempotent at the
-     * same gen). 4d cuts extent over to the engine and retires the
-     * extent module's internal call; this becomes the sole
-     * durable-bitmap barrier for the remaining engine-backed trees.
+     * At 4d the extent / inode / dirent / xattr trees are ALL
+     * engine-backed and rely on this single barrier (extent's monolithic
+     * _commit's internal stm_bootstrap_commit call is retired from this
+     * code path; the test-only stm_extent_index_commit still calls it
+     * for unit-test isolation). The remaining btree_store-backed trees
+     * (dataset / snapshot / cas / repair_log) ALSO call
+     * stm_bootstrap_commit internally at this same target_gen, so this
+     * explicit call is redundant-but-cheap for them (it advances
+     * bitmap_gen + fsyncs an unchanged bitmap — idempotent at the same
+     * gen).
      *
-     * On failure all three pending flushes are aborted
+     * On failure all four pending flushes are aborted
      * (crash-equivalent) and the commit returns — the fs wedges +
      * remounts off the previous (still-consistent) uberblock. */
     stm_bootstrap *boot = stm_alloc_bootstrap(s->alloc);
     if (!boot) {
+        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
@@ -2856,6 +2874,7 @@ stm_status stm_sync_commit(stm_sync *s)
     }
     stm_status bcs = stm_bootstrap_commit(boot, target_gen);
     if (bcs != STM_OK) {
+        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
@@ -2893,6 +2912,7 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status fw = write_ub_to_all_devices(s, &fin_prototype,
                                                 fin_label, fin_slot);
     if (fw != STM_OK) {
+        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
@@ -2925,6 +2945,11 @@ stm_status stm_sync_commit(stm_sync *s)
      * pointing at the previous tree (the engine's get_root has no
      * way to know about the new UB). A subsequent remount opens each
      * engine at its UB-recorded root → consistency restored. */
+    stm_status efs = stm_extent_index_commit_finalize(s->extent_idx);
+    if (efs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return efs;
+    }
     stm_status ifs = stm_inode_index_commit_finalize(s->inode_idx);
     if (ifs != STM_OK) {
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);

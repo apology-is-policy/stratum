@@ -33,43 +33,64 @@ helpers (`stm_extent_encrypt` / `stm_extent_decrypt`) and the index
 API. Both relate to extents but are independent — encrypt/decrypt
 serve the data-plane payload; the index serves metadata.
 
-### Persistence (P7-3, v12)
+### Persistence (9.6-impl-4d — btree_engine-backed, v29)
 
 ```c
 stm_status stm_extent_index_set_storage    (idx, bdev_0, boot_0);
 stm_status stm_extent_index_set_crypt_ctx  (idx, key, pool_uuid, dev_uuid_0);
 stm_status stm_extent_index_load_at        (idx, root_paddr, root_gen, csum);
 stm_status stm_extent_index_commit         (idx, target_gen, *out_paddr, *out_csum);
+/* Three-phase commit (the form stm_sync_commit drives): */
+stm_status stm_extent_index_commit_flush   (idx, target_gen,
+                                              *out_paddr, *out_gen, out_csum);
+stm_status stm_extent_index_commit_finalize(idx);
+stm_status stm_extent_index_commit_abort   (idx);
 stm_status stm_extent_index_get_root       (idx, *out_paddr, out_csum);
 stm_status stm_extent_index_get_gen        (idx, *out_root_gen);
 stm_status stm_extent_index_verify         (idx);
 ```
 
-Same shape + semantics as the snapshot module's persistence API.
-`load_at` runs the structural validator (`ex_validate_shadow`):
-rejects extents with overlapping ranges within the same `(ds, ino)`,
-extents whose replica sets share a paddr WITHOUT also matching whole-
-set + (gen, key_id, origin_*) tuple — i.e., extent.tla::
-SharedReplicasAreCohabit (P7-16; replaces the prior strict
-LiveReplicasDisjoint). Legitimate reflink-siblings are accepted;
-partial overlap or whole-share-with-mismatched-origin is refused.
-Extents with zero ds / ino / paddr / len, zero origin fields, and
-any decode-format violation are also refused.
+At 9.6-impl-4d the extent index is `btree_engine`-backed
+(incremental-COW B+tree), the same persistence substrate the inode /
+dirent / xattr indices use as of 9.6-impl-4b/c. The on-disk key + value
+layout for individual extent records is UNCHANGED — 24-byte key
+(le64 dataset_id ‖ le64 ino ‖ le64 offset), 108-byte value (v21
+HOT/COLD discriminator + replicas + gen + origin tuple + read_count).
+What changes is the on-disk envelope around them: the prior
+`btree_store` whole-tree-rebuild MVP becomes the engine's
+incremental-COW B+tree (16 KiB nodes, AEAD-encrypted via the
+shared crypt ctx, per-node BLAKE3 Merkle csum).
 
-Idempotent commit: when `dirty == false` AND a prior commit's root
-exists, `_commit` returns the cached `(paddr, csum)` without on-
-disk activity. Mandatory for `quorum.tla::ContentQuorumAtGen` —
-sync_commit may invoke this multiple times at the same target_gen
-under retry, and every call must produce byte-identical UB bytes.
+**Three-phase commit** mirrors the inode / dirent / xattr cutover.
+`_commit_flush` writes the dirty root-to-leaf paths to fresh paddrs
+at `target_gen` and returns the PROSPECTIVE root triple — the durable
+root mirror (`idx->root_*`) is untouched until `_commit_finalize`. The
+sync layer drives the trio: Phase 2 flush, then `compute_merkle_root`
+on the prospective csum, then `stm_bootstrap_commit` (the single
+durable-bitmap barrier covering all four engine-backed indices), then
+the final UB write, then `_commit_finalize` (post-UB, infallible per
+the engine contract — adopts the flushed root + deferred-frees the
+superseded paddrs). Every error path between flush and finalize runs
+`_commit_abort` for every engine whose flush has already succeeded —
+discarding the flush(es) and reverting the in-memory tree(s) to
+crash-equivalent state. A failed `stm_sync_commit` is crash-equivalent;
+fs.c wedges the fs (R154 doctrine carry).
 
-Atomic shadow swap: `_load_at` builds a shadow record array,
-validates it structurally, then atomically replaces the live
-records. Failure paths (corruption, AEAD mismatch, validator
-rejection) free the shadow and leave the live index untouched.
+**Monolithic `_commit`** is kept for the non-sync test path
+(`stm_extent_index_commit` runs the engine's single-shot
+`stm_btree_engine_commit` + an internal `stm_bootstrap_commit` for
+unit-test isolation); the sync layer uses the three-phase trio.
 
-`_load_at` post-condition: `current_txg` is bumped to
+**`_load_at`**: opens the engine (lazy — no device I/O until first
+descend), then `stm_btree_engine_scan` walks every record into a
+mount scratch ctx. Validates each record's decode + runs the mount-
+time structural validator `ex_mount_validate` (cross-record
+NoOverlapWithinIno + SharedReplicasAreCohabit — partial paddr-share
+between two records is refused; whole-set match with matching
+(gen, key_id, origin_*) tuple is accepted as legitimate reflink-
+siblings). Post-condition: `current_txg` raised to
 `max(loaded write_gen)` per `extent.tla::BirthTxgBound`, so post-
-mount Write/Overwrite cannot stamp an extent with gen below any
+mount Write/Overwrite cannot stamp an extent at a gen below any
 persisted gen.
 
 ### Lifecycle

@@ -726,12 +726,11 @@ STM_TEST(xattr_set_crypt_ctx_refuses_rebind) {
 /* Compile-time invariants.                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(xattr_ub_version_is_v28) {
-    /* TLY-A3-keyslot-wrap bumps STM_UB_VERSION 27 → 28 for the
-     * keyschema entry corvus_dataset_path layout change. The xattr
-     * layer is unchanged since v26 but rides the latest version
-     * constant. */
-    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)28u);
+STM_TEST(xattr_ub_version_is_v29) {
+    /* 9.6-impl-4d bumps STM_UB_VERSION 28 → 29 for the extent index
+     * cutover to btree_engine. The xattr layer's on-disk format is
+     * unchanged since v26 but rides the latest version constant. */
+    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)29u);
 }
 
 /* ------------------------------------------------------------------ */

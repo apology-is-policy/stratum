@@ -38,43 +38,86 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: Phase 9.6-impl-3 — large-value spill for the Metadata Tree
-  Engine (`btree_engine`). The engine (`v2/src/btree_engine/`, public
-  header `include/stratum/btree_engine.h`, reference
-  [24-btree-engine.md](reference/24-btree-engine.md)) is a
-  paddr-addressed copy-on-write multi-level B+tree that replaces the
-  `btree_store` whole-tree-rebuild MVP.
-  - **impl-3** stores a value too large to sit inline in a 16-KiB node
-    out-of-line, in a forward-linked chain of AEAD-encrypted +
-    Merkle-csummed spill blocks; the leaf entry holds a small
-    indirection record. **Per-value COW** — an unchanged spilled
-    value's chain is *shared*, not rewritten, when a sibling entry
-    changes. The spill discriminator is a 1-byte tag inside the
-    engine's opaque value bytes, so the shared `btnode` codec is
-    untouched and no format version is bumped (deferred to impl-4).
-    Needs no `btree.tla` extension — a spill block is another COWed
-    paddr the existing flush / finalize / abort already cover (design
-    `phase-9.6-impl-3-spill-design.md`).
-  - **impl-2** (prior) added incremental commit — the `commit_flush` /
-    `commit_finalize` / `commit_abort` three-phase split, deferred-free
-    of superseded paddrs, crash-revert; composes against `btree.tla`.
-  - **impl-1a / 1b** (prior) — the bootstrap allocator 16-KiB node
-    granularity, then the structural engine + the node-size-
-    parameterized `btnode` codec.
-  - **Scope boundary**: the four-module cutover — wiring the real
-    `stm_bootstrap`-backed vtable into the three-phase sync, retiring
-    `btree_store`'s whole-tree rebuild, and the `STM_UB_VERSION` bump —
-    is 9.6-impl-4.
-  - **ctest 63/63 GREEN** — `test_btree_engine` 42 cases (31 + 11
-    impl-4a: 6 delete + 5 range-scan).
-  - **History gap**: the chunks between PARALLEL-3 impl-4 and here —
-    PARALLEL-3 impl-5 / impl-6 + R134–R136, the Thylacine A1–A5
-    series + R137–R148, and Phase 9.6 (design + `btree.tla` spec +
-    impl-1a + R149, impl-1b + R150, impl-2 + R151, impl-3 + R152) —
-    are recorded in the per-section reference docs, `git log`, and the
-    memory index rather than expanded in this Snapshot list.
+- **Tip**: Phase 9.6-impl-4d — the final cutover that lands the
+  Metadata Tree Engine (`btree_engine`) as the persistence substrate
+  for every load-bearing metadata index. The extent index
+  ([14-extent.md](reference/14-extent.md)) is now `btree_engine`-
+  backed, the same shape the inode / dirent / xattr indices use as of
+  9.6-impl-4b/c.
+  - **STM_UB_VERSION 28 → 29** (`include/stratum/super.h`) — the on-
+    disk format settles at v29. A v28 binary would mis-read a v29
+    extent tree (and vice-versa) because the root envelope differs;
+    the exact-match SB version check makes the cross-version mismatch
+    refuse-loud. Individual extent records' key + value bytes are
+    UNCHANGED (24-byte key, 108-byte v21 value).
+  - **Three-phase sync wiring extends from three engines to four**:
+    `stm_sync_commit` now drives `_commit_flush` / `_commit_finalize` /
+    `_commit_abort` for extent in addition to inode / dirent / xattr.
+    The abort cascade extends in lockstep (extent flushes first; the
+    cascade matrix is in [07-sb-sync.md](reference/07-sb-sync.md)).
+    The explicit `stm_bootstrap_commit` barrier at sync.c is now the
+    SOLE durable-bitmap barrier for the four engine-backed indices
+    (extent's monolithic `_commit` retains its internal call for test
+    isolation; the sync path uses the trio).
+  - **Cross-pool paddr-uniqueness + cohabit checks** stay GLOBAL —
+    `any_paddr_in_use_global_locked` and `cohabit_check_global_locked`
+    engine-scan the entire tree at every write/reflink. The pre-4d
+    in-RAM linear scan becomes an engine-scan; a known perf
+    degradation for high-frequency writes on large pools, addressed
+    later by a paddr→extent in-RAM index (forward-noted in
+    `extent_index.c`).
+  - **Phase 9.6 COMPLETE** — impl-1a / 1b / 2 / 3 / 4a / 4b / 4c / 4d
+    all shipped. The four engine-backed indices (extent + inode +
+    dirent + xattr) all flow through `btree_engine`'s incremental-COW
+    + deferred-free + three-phase commit. R149–R155 closed; R156
+    pending on the 4d close commit.
+  - **ctest 63/63 GREEN** at the 4d tip.
+  - **What's next**: Phase 9.7 (snapshots, **D1**) → 9.8 (Bε + Bw).
 
-- **Pre-tip-1**: R134 audit close (`2a117e9`). 0 P0, 0 P1, 3 P2 — all
+- **Pre-tip-1**: 9.6-impl-4c — cut dirent + xattr to `btree_engine`
+  + three-phase sync wiring for three engines (`0def2a0`) + R155
+  close (`3233611`; 4 missing xattr persistence tests added).
+  Verdict: 0 P0/P1/P2 + 4 P3 (only P3-1 actionable).
+
+- **Pre-tip-2**: 9.6-impl-4b — production vtable + sync wiring +
+  inode cutover. Chain: design (`24475bd`), 4b-i engine store vtable
+  TU (`6f45271`), 4b-ii inode cutover (`051b76c`), 4b-iii three-phase
+  sync wiring + bootstrap_commit relocation (`9cf0c75`), R154 close
+  (`0165f4c`; Q2 wedge-on-failed-sync at fs.c).
+
+- **Pre-tip-3**: 9.6-impl-4a — engine completion (delete +
+  scan_range) (`18946c5`) + R153 close (`fd3f188`). The cutover
+  required two engine APIs the impl-1..3 chain hadn't shipped:
+  `stm_btree_engine_delete` (extent's truncate/punch/migrate uses
+  structural removal, not tombstones) and `stm_btree_engine_scan_range`
+  (the (ds, ino) / (dir_ino) / (ino) prefix iterations). Design
+  rationale in `phase-9.6-impl-4-cutover-design.md` §3.
+
+- **Pre-tip-4**: Phase 9.6-impl-3 — large-value spill for the Metadata
+  Tree Engine (`btree_engine`). Stores a value too large to sit inline
+  in a 16-KiB node out-of-line, in a forward-linked chain of AEAD-
+  encrypted + Merkle-csummed spill blocks; the leaf entry holds a
+  small indirection record. **Per-value COW** — an unchanged spilled
+  value's chain is *shared*, not rewritten, when a sibling entry
+  changes. The spill discriminator is a 1-byte tag inside the engine's
+  opaque value bytes, so the shared `btnode` codec is untouched.
+  R152 closed (`0b3ebd1`; 3 P3 fixes).
+
+- **Pre-tip-5**: Phase 9.6-impl-2 — incremental commit (the
+  `commit_flush` / `commit_finalize` / `commit_abort` three-phase
+  split, deferred-free of superseded paddrs, crash-revert); composes
+  against `btree.tla`. R151 closed.
+
+- **Pre-tip-6**: Phase 9.6-impl-1a / 1b — the bootstrap allocator
+  16-KiB node granularity, then the structural engine + the node-
+  size-parameterized `btnode` codec. R149 + R150 closed.
+
+- **History gap**: PARALLEL-3 impl-5 / impl-6 + R134–R136, the
+  Thylacine A1–A5 series + R137–R148 are recorded in the per-section
+  reference docs, `git log`, and the memory index rather than
+  expanded in this Snapshot list.
+
+- **Pre-tip-7**: R134 audit close (`2a117e9`). 0 P0, 0 P1, 3 P2 — all
   test/doc-drift; no impl correctness issue. Closed by adding
   shared-parents rename test (provokes NoCircularWait deadlock if
   pin_many's sort is removed; verified by neutering the sort and
@@ -82,7 +125,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   tests + accurate CLAUDE.md / REFERENCE.md framing on the disjoint
   test's actual coverage.
 
-- **Pre-tip-2**: P9.5-PARALLEL-3 impl-3 (`7970bcf`). Ports `stm_fs_rename`
+- **Pre-tip-8**: P9.5-PARALLEL-3 impl-3 (`7970bcf`). Ports `stm_fs_rename`
   to `fs->global` SH + per-inode pin on up to 4 inodes (src_parent +
   dst_parent + src_ino + [dst_ino if overwrite/EXCHANGE]) via a new
   `stm_inode_pin_many` helper. This is the first commit where
@@ -146,7 +189,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **Next**: impl-4 (cross-dataset ops — copy_file_range, reflink).
     impl-5 drops residual EX takes. impl-6 perf regression test.
 
-- **Pre-tip-3**: R133 audit close (`fdbfff3`). Three findings from the
+- **Pre-tip-9**: R133 audit close (`fdbfff3`). Three findings from the
   R133 prosecutor (scoping impl-1 + impl-2) addressed:
   - **P1-1 — rwlock writer-preference attr**: `fs->global` now
     initialized with `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`
@@ -177,7 +220,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 54/54 GREEN**. Rust unit 97/97. e2e_crud 33/33.
     concurrent_ctl 2/2.
 
-- **Pre-tip-4**: P9.5-PARALLEL-3 impl-2 (`499a988`). Ports the
+- **Pre-tip-10**: P9.5-PARALLEL-3 impl-2 (`499a988`). Ports the
   2-inode surface to `fs->global` SH + per-inode pin: unlink /
   rmdir / create_file / mkdir / symlink / linkat_anon /
   unlink_anon / create_anon / link / link_by_ino. Adds
@@ -223,14 +266,14 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     the residual EX takes (every remaining unported `stm_fs_*` that
     still falls back to wrlock). impl-6 lands a perf regression test.
 
-- **Pre-tip-5**: P9.5-PARALLEL-3 impl-1 foundation commit (`39071cf`).
+- **Pre-tip-11**: P9.5-PARALLEL-3 impl-1 foundation commit (`39071cf`).
   Converts `fs->lock` from `pthread_mutex_t` to `pthread_rwlock_t
   fs->global`, introduces the `stm_inode_pin/_unpin` per-inode mutex
   API (256-bucket refcounted hash-table of stable mutex slots), and
   ports the three single-inode setattr-shape ops (chmod / chown /
   utimens) onto the SH + per-inode-pin path. R133 audit pending.
 
-- **Pre-tip-6**: P9.5-POLISH-1 xattr pair client primitives
+- **Pre-tip-12**: P9.5-POLISH-1 xattr pair client primitives
   (`e208cb9`). `libstratum-9p` adds `stm_9p_xattrwalk` +
   `stm_9p_xattrcreate` — the LAST deferred surface from POLISH-1
   #927. Closes the entire v9fs-critical-path client API set. Linux
@@ -272,7 +315,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     The remaining libstratum-9p deferred items (Tflush, async
     API, 9P2000 non-.L dialect) are NOT v9fs-mount-critical.
 
-- **Pre-tip-7**: P9.5-POLISH-1 batch — Tstatfs + Stratum extensions
+- **Pre-tip-13**: P9.5-POLISH-1 batch — Tstatfs + Stratum extensions
   client primitives (`e357a12`). Adds 4 kernel-v9fs-critical-path
   ops + Tsync (whole-pool barrier). `libstratum-9p` covers
   Tstatfs (df / vfs_statfs), Tsync (pool-wide commit without a fid),
@@ -312,7 +355,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 54/54 GREEN** (test_9p_client now runs 58 cases, up
     from 51). Rust suites unchanged.
 
-- **Pre-tip-8**: P9.5-POLISH-1 Tlock + Tgetlock client primitives
+- **Pre-tip-14**: P9.5-POLISH-1 Tlock + Tgetlock client primitives
   (`d4e5d67`). `libstratum-9p` gained advisory byte-range locking.
   Composes against `locks.tla::AcquireLock`/`ReleaseLock`/`GetLock`
   through the server.
@@ -339,7 +382,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 54/54 GREEN** (test_9p_client now runs 51 cases, up
     from 43). Rust suites unchanged.
 
-- **Pre-tip-9**: R128 P3-1/P3-8 + R129 P3-3/P3-4 doc-drift forward-note
+- **Pre-tip-15**: R128 P3-1/P3-8 + R129 P3-3/P3-4 doc-drift forward-note
   closures (`4267b3d`). Comment-only: corrected
   `stm_dirty_buffer_destroy` stale auto-wedge claim, rewrote
   `stm_dirty_buffer_drain_ino` doc-comment to match pop-on-success
@@ -347,13 +390,13 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   install_production_cb cleanup-order comment + fs->pool/sync
   immutability comment.
 
-- **Pre-tip-10**: R131 P3-4 + P3-5 saturation guards (`4cf257c`).
+- **Pre-tip-16**: R131 P3-4 + P3-5 saturation guards (`4cf257c`).
   `stm_ctl_conn_create` refuses with STM_EOVERFLOW when
   `worker_count == UINT32_MAX`; `/admin/clear-events` write refuses
   with STM_EOVERFLOW when `event_gen == UINT64_MAX`. R29 P3-1
   doctrine carry (refuse rather than wrap).
 
-- **Pre-tip-11**: Reference-doc backfill — Phase 9 modules
+- **Pre-tip-17**: Reference-doc backfill — Phase 9 modules
   (`ad0d087`+`d317bfb`+`3065c21`; DOC-ONLY). Closes the second
   half of the Phase 9 deferment forward-noted in CLAUDE.md (R96
   P3-8): per-subsystem `reference/NN-*.md` catalog for the Phase
@@ -364,7 +407,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     template: Purpose, Public API, Implementation, Spec
     cross-reference, SPEC-TO-CODE mapping, Tests, Status table.
 
-- **Pre-tip-12**: Reference-doc backfill — Phase 8 modules (`cac568c`;
+- **Pre-tip-18**: Reference-doc backfill — Phase 8 modules (`cac568c`;
   DOC-ONLY). Per-subsystem `reference/NN-*.md` catalog for the
   Phase 8 POSIX-surface modules: `16-inode.md`
   (`inode.tla::TupleUniqueAllTime`), `17-dirent.md`
@@ -374,7 +417,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   (`locks.tla::NoConflictingLocks`). REFERENCE.md Contents index
   also gained the previously-missing `15-cas.md` row.
 
-- **Pre-tip-13**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
+- **Pre-tip-19**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
   `fs->lock` granularity refinement (SPEC ONLY, no impl yet). Lays
   down the formal model + design doc the multi-commit impl phase
   (future sessions) will reference.
@@ -397,7 +440,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification (#973 tooling-gated); impl-1..6
     multi-commit deferred.
 
-- **Pre-tip-14**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
+- **Pre-tip-20**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
   spec + regression test. The chunk verifies and
   documents the contract that emerges under post-PARALLEL-1
   concurrent /ctl/: **per-subsystem linearizable + cross-subsystem
@@ -443,7 +486,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification of compound_ops.tla (tooling-gated
     like #958; expected verdicts documented in each cfg header).
 
-- **Pre-tip-15**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
+- **Pre-tip-21**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
   accept + R131 audit close + #961 dedicated concurrent regression
   tests. `v2/include/stratum/ctl.h` declares the new
   per-connection wrapper API (`stm_ctl_conn_create` / `_destroy` /
@@ -484,7 +527,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   row + stratumd row updated. Outstanding sub-task: #958 (TLC
   verify ctl_conn.tla, tooling-gated).
 
-- **Pre-tip-16**: P9-CTL-2b /ctl/ codec migration to lp9.
+- **Pre-tip-22**: P9-CTL-2b /ctl/ codec migration to lp9.
   `v2/src/ctl/synfs.c` + `v2/include/stratum/ctl.h` + `v2/tests/test_ctl.c`
   all re-keyed from `stm_p9_server` (9P2000 vops) to `stm_lp9_server`
   (.L vops). The `KIND_META[]` table, `qid_path` encoding, materializer
@@ -509,7 +552,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   migration; the lp9 trigger row notes /ctl/ as the first consumer.
   46/46 ctest green; 140/140 test_ctl pass.
 
-- **Pre-tip-1**: P9-CTL-2a stm_lp9_server. New library `v2/src/lp9/`
+- **Pre-tip-7**: P9-CTL-2a stm_lp9_server. New library `v2/src/lp9/`
   — generic vops-based 9P2000.L server, sibling to `stm_p9_server`
   (9P2000 vops) but on the .L wire. v1.0 wire-handles Tversion/
   Tattach/Twalk/Tlopen/Tread/Twrite/Tclunk/Tflush/Tgetattr/Treaddir;
@@ -518,7 +561,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   (the FS-bound .L server). 5 unit tests in `test_lp9.c`. CLAUDE.md
   trigger row added.
 
-- **Pre-tip-2**: stratum-mkfs CLI. New artifact: `stratum-mkfs`
+- **Pre-tip-8**: stratum-mkfs CLI. New artifact: `stratum-mkfs`
   binary at `v2/src/cmd/stratum-mkfs/`. Wraps `stm_fs_format` +
   initial dataset-root setup so users can `stratum-mkfs vol.stm` and
   immediately point stratumd at the resulting image. Defaults: 64 MiB
@@ -532,7 +575,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   end roundtrip verified manually: `mkfs → stratumd serve → stratum-fs
   ls/mkdir/write/read` all succeed.
 
-- **Pre-tip-1**: P9-TUI-2a stratum-tui v2 wholesale lift. 45
+- **Pre-tip-7**: P9-TUI-2a stratum-tui v2 wholesale lift. 45
   ctest suites green (TUI is Rust crate; not in ctest). New artifact:
   `stratum-tui` binary at `v2/tui/`. ratatui chrome (FAR
   Commander-style dual-pane file manager + inline editor) lifted
@@ -560,7 +603,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   stratumd; -2b replaces dialog action handlers with /ctl/ reads
   and writes for the full admin surface.
 
-- **Pre-tip-1**: P9-CLI-1 FS-only stratum-fs CLI. 45 ctest
+- **Pre-tip-7**: P9-CLI-1 FS-only stratum-fs CLI. 45 ctest
   suites green (was 44; +test_stratum_fs). test_stratum_fs 0 → 15
   integration tests. New artifact: `stratum-fs` binary at
   `v2/src/cmd/stratum-fs/`. Plan-9-shaped subcommand dispatcher
@@ -584,7 +627,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   invalidates the fd at the syscall level so accept() returns
   EBADF and the worker loop exits cleanly.
 
-- **Pre-tip-1**: P9-LIB-1d-link Tlink end-to-end. 44 ctest
+- **Pre-tip-7**: P9-LIB-1d-link Tlink end-to-end. 44 ctest
   suites green. test_9p_client 39 → 43 (+4 link tests). test_9p
   79 → 83 (+4 server-side h_link tests). test_fs_phase8 +3
   link_by_ino tests.
@@ -617,7 +660,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   Surface is now POSIX-complete for everything except xattr ops and
   advisory locking.
 
-- **Pre-tip-1**: P9-LIB-1d 5-op write-side completion. 44
+- **Pre-tip-7**: P9-LIB-1d 5-op write-side completion. 44
   ctest suites green. test_9p_client 27 → 39 (+12 P9-LIB-1d tests).
   **P9-LIB-1d** (audit-light, R111 doctrine carry) closes the
   CLI-shape write-side primitive set with five ops: stm_9p_setattr
@@ -654,7 +697,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   now covers the full set the CLI needs for `mkdir/touch/rm/rmdir
   /chmod/chown/touch -d/mv/ln -s/readlink/cat/echo X > /file/sync`.
 
-- **Pre-tip-1**: P9-LIB-1c mutation triad. 44 ctest suites
+- **Pre-tip-7**: P9-LIB-1c mutation triad. 44 ctest suites
   green. test_9p_client 19 → 27 (+8 mutation tests).
   **P9-LIB-1c** (audit-light, R111 doctrine carry) extends the lib
   with the file-mutation primitive set: stm_9p_lcreate (create
@@ -671,7 +714,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   + AT_REMOVEDIR semantics (without-flag-on-dir refused, with-
   flag-empty-dir succeeds, with-flag-non-empty → EBUSY).
 
-- **Pre-tip-1**: P9-LIB-1b Twrite primitive. 44 ctest suites
+- **Pre-tip-7**: P9-LIB-1b Twrite primitive. 44 ctest suites
   green. test_9p_client 15 → 19 (+4 Twrite tests). **P9-LIB-1b**
   (audit-light, R111 doctrine carry) extends the lib's read-side
   surface with stm_9p_write — the Twrite counterpart to Tread. Wire
@@ -690,7 +733,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   chunk that will add Tlcreate / Tmkdir / Tunlinkat / Trenameat /
   Tsetattr / Tfsync etc.
 
-- **Pre-tip-1**: P9-LIB-1 cleanup. 44 ctest suites
+- **Pre-tip-7**: P9-LIB-1 cleanup. 44 ctest suites
   green. test_9p_client 13 → 15 (+1 F-6 regression + 1 F-11
   poison-flag regression). **P9-LIB-1 cleanup** (audit-light, R111
   doctrine carry) closes 4 of 5 P3 forward-notes from R111
@@ -716,7 +759,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   belong to P9-LIB-2 async API which has io_uring transport with
   timer fds).
 
-- **Pre-tip-1**: P9-LIB-1 R111 audit close. 44 ctest suites
+- **Pre-tip-7**: P9-LIB-1 R111 audit close. 44 ctest suites
   green default. test_9p_client 13/13 (was 12; +1 R111 P0 F-1
   regression test). **R111 close** RED → YELLOW MERGE: 1 P0 + 0 P1 +
   3 P2 + 7 P3, all P0/P2 addressed inline + 4 P3 polish addressed +
@@ -780,7 +823,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   the v2 9P client surface that P9-CLI-1, P9-FUSE-1, and
   P9-BIND-1/2/3 will all wrap. R111 audit pending.
 
-- **Pre-tip-1**: P9-CTL-1e R110 audit close. 43 ctest suites
+- **Pre-tip-7**: P9-CTL-1e R110 audit close. 43 ctest suites
   green default. test_ctl 140/140 (was 138 at substantive; +2 R110
   regression tests). **R110 close** YELLOW — 0 P0 + 0 P1 + 1 P2 + 7
   P3, all addressed inline. **P2-1 (load-bearing wedged-fs
@@ -836,11 +879,11 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   simplest path. Per-dataset op counters + latency histograms
   deferred until instrumentation hot-path work.
 
-- **Pre-tip-1**: P9-CTL-1e substantive (was tip pre-R110). 138/138
+- **Pre-tip-7**: P9-CTL-1e substantive (was tip pre-R110). 138/138
   test_ctl. R110 audit caught 1 P2 + 7 P3 forward-notes, all
   addressed in the close commit above.
 
-- **Pre-tip-1**: P8.5 cleanup-2 — family-wide RO tests + result=err:rc
+- **Pre-tip-7**: P8.5 cleanup-2 — family-wide RO tests + result=err:rc
   enrichment. 43 ctest suites green default. test_ctl
   124/124 (was 120 at R108 close; +4 R109 cleanup tests). **R109
   audit-light close** (isomorphic to R107 — direct doctrine carry,
@@ -864,7 +907,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   result=err:enoent). 2 R109 P3-2 RO-mount regression tests for
   hold + release.
 
-- **Pre-tip-2**: P9-CTL-1d-actions-snapshot-hold R108 close —
+- **Pre-tip-8**: P9-CTL-1d-actions-snapshot-hold R108 close —
   YELLOW MERGE, 0 P0 + 0 P1 + 1 P2 + 5 P3. 43 ctest
   suites green default. test_ctl 120/120 (was 112 at R107 close;
   +7 -1d-actions-snapshot-hold + 1 R108 P2-1 regression test).
@@ -898,7 +941,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   kind family is now feature-complete for v2.0's snapshot
   lifecycle: create + delete + hold + release.
 
-- **Pre-tip-1**: P8.5 audit-log doctrine backport. 43 ctest
+- **Pre-tip-7**: P8.5 audit-log doctrine backport. 43 ctest
   suites green default. test_ctl 112/112 (was 110 at R106 close;
   +2 R107 backport tests). **R107 backport (R105 P3-1
   doctrine carry)** extends the post-admin-gate-refusals-DO-log
@@ -913,7 +956,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   lines. R107 audit-light close (no separate prosecutor —
   isomorphic to R105 P3-1 which passed audit).
 
-- **Pre-tip-1**: P9-CTL-1d-actions-snapshot-delete R106 close —
+- **Pre-tip-7**: P9-CTL-1d-actions-snapshot-delete R106 close —
   GREEN, 0 P0 + 0 P1 + 0 P2 + 4 P3 (verdict MERGE), all
   addressed inline. 43 ctest suites green default. test_ctl 110/110
   (was 99 at R105 close; +9 -1d-actions-snapshot-delete + 2 R106).
@@ -929,7 +972,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   snapshot_wedged_ewedged (FS_GUARD_WRITE → STM_EWEDGED, mirror of
   R105 P3-4's create-snapshot test).
 
-- **Pre-tip-1**: P9-CTL-1d-actions-snapshot-delete substantive.
+- **Pre-tip-7**: P9-CTL-1d-actions-snapshot-delete substantive.
   test_ctl 108/108 (was 99 at R105 close; +9 -1d-actions-snapshot-
   delete). **P9-CTL-1d-
   actions-snapshot-delete** adds /datasets/<id>/delete-snapshot
@@ -950,7 +993,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   members (clear-events, scrub-trigger, create-snapshot, delete-
   snapshot). R106 audit pending.
 
-- **Pre-tip-1**: P9-CTL-1d-actions-snapshot-create R105 close —
+- **Pre-tip-7**: P9-CTL-1d-actions-snapshot-create R105 close —
   GREEN, 0 P0 + 0 P1 + 0 P2 + 4 P3 (verdict MERGE),
   all addressed inline. 43 ctest suites green default. test_ctl
   99/99 (was 88 at R104 close; +8 -1d-actions-snapshot-create
@@ -980,7 +1023,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   clear-events, scrub-trigger, create-snapshot, and the existing
   events-log self-trigger.
 
-- **Pre-tip-1**: P9-CTL-1d-actions-snapshot-create substantive.
+- **Pre-tip-7**: P9-CTL-1d-actions-snapshot-create substantive.
   test_ctl 96/96 (was 88 at R104 close; +8 -1d-actions-snapshot-
   create). **P9-CTL-1d-
   actions-snapshot-create** adds /datasets/<id>/create-snapshot
@@ -1001,7 +1044,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   attack vector (R99 P2-1 carry to snapshot names) is now closed
   at the source.
 
-- **Pre-tip-1**: P9-CTL-1d-scrub-trigger R104 close — YELLOW,
+- **Pre-tip-7**: P9-CTL-1d-scrub-trigger R104 close — YELLOW,
   0 P0 + 0 P1 + 1 P2 + 6 P3 (verdict MERGE). 43 ctest
   suites green default. test_ctl 88/88 (close adds inline assertions
   to existing tests rather than new tests). R104 close: P2-1
@@ -1017,7 +1060,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   writable-kind family pattern is now established and well-
   documented.
 
-- **Pre-tip-1**: P9-CTL-1d-scrub-trigger substantive. 43
+- **Pre-tip-7**: P9-CTL-1d-scrub-trigger substantive. 43
   ctest suites green default. test_ctl 88/88 (was 80 at R103 close;
   +8 -1d-scrub-trigger). **P9-CTL-1d-scrub-trigger** adds /pools/
   <uuid>/scrub-trigger (admin-only mode 0200 write trigger). Body
@@ -1034,7 +1077,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   this is the second writable kind, the family pattern is now
   established. R104 audit pending.
 
-- **Pre-tip-1**: P9-CTL-1d-scrub-read R103 close — GREEN,
+- **Pre-tip-7**: P9-CTL-1d-scrub-read R103 close — GREEN,
   0 P0 + 0 P1 + 0 P2 + 4 P3 forward-notes, all addressed inline or
   forward-noted. 43 ctest suites green default. test_ctl 80/80 (was
   71 at R102 close; +6 -1d-scrub-read + 3 R103). R103 P3-1 close:
@@ -1051,7 +1094,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   (state=\"completed\" 9 chars + 5-digit cursor + 6× UINT64_MAX 20-
   digit + per-line labels)."
 
-- **Pre-tip-1**: P9-CTL-1d-scrub-read substantive. test_ctl 77/77. **P9-CTL-1d-scrub-read** adds /pools/<uuid>/scrub
+- **Pre-tip-7**: P9-CTL-1d-scrub-read substantive. test_ctl 77/77. **P9-CTL-1d-scrub-read** adds /pools/<uuid>/scrub
   (read-only state + counters, world-readable mode 0444). New public
   API stm_ctl_attach_scrub(c, scrub) with R97 P2-1 NULL-rejection +
   idempotent same-pointer + STM_EEXIST on different. KIND_MAX = 20
@@ -1068,7 +1111,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   chunk; would compose against the admin gate from -1d-uid +
   audit log from -1d-events.
 
-- **Pre-tip-1**: P9-CTL-1d-debug-alloc R102 close — GREEN,
+- **Pre-tip-7**: P9-CTL-1d-debug-alloc R102 close — GREEN,
   0 P0 + 0 P1 + 0 P2 + 5 P3 forward-notes, all addressed inline. 43
   ctest suites green default. test_ctl 71/71 (was 60 at R101 close;
   +9 -1d-debug-alloc + 2 R102). New public API
@@ -1113,7 +1156,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   -1d-debug-integrity (integrity-verify gated on Phase 8.5
   stm_fs_verify_merkle_chain), -1d-actions, -1d-tracing.
 
-- **Pre-tip-1**: P9-CTL-1d-events R101 close. 43 ctest suites
+- **Pre-tip-7**: P9-CTL-1d-events R101 close. 43 ctest suites
   green default. test_ctl 60/60. **P9-CTL-1d-events** added
   /events world-readable append-only log + /admin/clear-events
   admin-only write trigger. New public APIs: stm_ctl_log_event
@@ -1125,7 +1168,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   (frankenstein view defense); P2-2 zero-byte Twrite to
   action triggers MUST refuse with STM_EINVAL.
 
-- **Pre-tip-2**: P9-CTL-1c R99 close. 43 ctest suites
+- **Pre-tip-8**: P9-CTL-1c R99 close. 43 ctest suites
   green default. test_ctl 38/38 (was 13 at -1a R96 close;
   +10 -1b + 2 R97 + 5 -1b' + 6 -1c + 2 R99). **P9-CTL-1c +
   P9-CTL-1b'** added /pools/<uuid>/devices/<id>/status (b'),

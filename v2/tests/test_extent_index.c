@@ -54,13 +54,79 @@ static void free_dropped(uint64_t **paddrs, size_t *n) {
                             /*key_id=*/0, (drp), (n_drp))
 
 /* ------------------------------------------------------------------ */
+/* Storage fixture for in-memory-op tests.                              */
+/*                                                                      */
+/* 9.6-impl-4d: extent module is btree_engine-backed, so every op       */
+/* (write / overwrite / truncate / iter / lookup / migrate / ...) needs */
+/* a bound bdev + bootstrap. `ex_test_idx(current_txg)` builds them +   */
+/* a fully-bound index; `ex_test_idx_close` tears it all down. Mirrors  */
+/* dirent + xattr (di_test_idx / xa_test_idx). The harness runs tests   */
+/* sequentially in one process, so a single static fixture slot is safe.*/
+/*                                                                      */
+/* Tests that intentionally exercise the unbound surface (the           */
+/* persist_* tests that manage their own bdev) keep bare                */
+/* stm_extent_index_create() calls.                                     */
+/* ------------------------------------------------------------------ */
+
+#define EX_FX_DEVICE_BYTES        (UINT64_C(64) * 1024u * 1024u)
+#define EX_FX_BOOTSTRAP_BYTES     (UINT64_C(8)  * 1024u * 1024u)
+
+static const uint64_t EX_FX_POOL_UUID[2]   = { 0xEE01, 0xEE02 };
+static const uint64_t EX_FX_DEVICE_UUID[2] = { 0xEF01, 0xEF02 };
+static const uint8_t  EX_FX_KEY[32]        = { 0x88, 0x99, 0xAA };
+
+static char ex_fx_tmp_path[256];
+static stm_bdev      *ex_g_fx_bdev;
+static stm_bootstrap *ex_g_fx_boot;
+
+static void ex_fx_make_tmp(const char *tag) {
+    snprintf(ex_fx_tmp_path, sizeof ex_fx_tmp_path,
+             "/tmp/stm_v2_extent_fx_%s_%d.bin", tag, (int)getpid());
+    unlink(ex_fx_tmp_path);
+}
+
+static void ex_fx_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(ex_fx_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bdev_resize(*out_d, EX_FX_DEVICE_BYTES));
+    STM_ASSERT_OK(stm_crypto_init());
+    STM_ASSERT_OK(stm_bootstrap_create(*out_d, EX_FX_POOL_UUID, EX_FX_DEVICE_UUID,
+                                         EX_FX_BOOTSTRAP_BYTES, out_b));
+}
+
+/* Build a fresh storage-backed, fully-bound extent index at the
+ * caller's `current_txg`. The engine is stood up by the second binder
+ * (set_crypt_ctx here), so the returned index is ready for any op. */
+static stm_extent_index *ex_test_idx(uint64_t current_txg) {
+    ex_fx_make_tmp("default");
+    ex_fx_open_fresh(&ex_g_fx_bdev, &ex_g_fx_boot);
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(current_txg, &idx));
+    STM_ASSERT_TRUE(idx != NULL);
+    STM_ASSERT_OK(stm_extent_index_set_storage(idx, ex_g_fx_bdev, ex_g_fx_boot));
+    STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx, EX_FX_KEY,
+                                                  EX_FX_POOL_UUID,
+                                                  EX_FX_DEVICE_UUID));
+    return idx;
+}
+
+static void ex_test_idx_close(stm_extent_index *idx) {
+    stm_extent_index_close(idx);    /* before bootstrap — the engine
+                                     * deferred-frees through it */
+    stm_bootstrap_close(ex_g_fx_boot);
+    stm_bdev_close(ex_g_fx_bdev);
+    ex_g_fx_boot = NULL;
+    ex_g_fx_bdev = NULL;
+    unlink(ex_fx_tmp_path);
+}
+
+/* ------------------------------------------------------------------ */
 /* Lifecycle.                                                          */
 /* ------------------------------------------------------------------ */
 
 STM_TEST(ex_index_create_initial_state) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
-    STM_ASSERT_TRUE(idx != NULL);
+    idx = ex_test_idx(0);
 
     size_t n = 999;
     STM_ASSERT_OK(stm_extent_count(idx, &n));
@@ -70,7 +136,7 @@ STM_TEST(ex_index_create_initial_state) {
     STM_ASSERT_OK(stm_extent_index_current_txg(idx, &txg));
     STM_ASSERT_EQ(txg, (uint64_t)0);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_index_create_rejects_null) {
@@ -83,7 +149,7 @@ STM_TEST(ex_index_close_handles_null) {
 
 STM_TEST(ex_index_advance_txg) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(10, &idx));
+    idx = ex_test_idx(10);
     STM_ASSERT_OK(stm_extent_index_advance_txg(idx, 15));
     uint64_t t = 0;
     STM_ASSERT_OK(stm_extent_index_current_txg(idx, &t));
@@ -97,7 +163,7 @@ STM_TEST(ex_index_advance_txg) {
     /* R34 P3-2: NULL-idx parity. */
     STM_ASSERT_ERR(stm_extent_index_advance_txg(NULL, 0), STM_EINVAL);
     STM_ASSERT_ERR(stm_extent_index_current_txg(NULL, &t), STM_EINVAL);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 /* R34 P2-1: out-arg zeroing must happen even on idx==NULL early return.
@@ -136,7 +202,7 @@ STM_TEST(ex_mutators_zero_out_args_on_null_idx) {
 
 STM_TEST(ex_write_basic) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(100, &idx));
+    idx = ex_test_idx(100);
 
     STM_ASSERT_OK(EX_WRITE1(idx,
                                      /*ds=*/1, /*ino=*/1,
@@ -156,32 +222,32 @@ STM_TEST(ex_write_basic) {
     STM_ASSERT_EQ(e.paddrs[0],      (uint64_t)0xAA);
     STM_ASSERT_EQ(e.gen,        (uint64_t)100);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_write_rejects_zero_len) {
     /* extent.tla::LengthPositive */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_ERR(EX_WRITE1(idx, 1, 1, 0, 0, 0xAA, 0), STM_EINVAL);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_write_rejects_zero_args) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_ERR(EX_WRITE1(idx, 0, 1, 0, 4096, 0xAA, 0), STM_EINVAL);
     STM_ASSERT_ERR(EX_WRITE1(idx, 1, 0, 0, 4096, 0xAA, 0), STM_EINVAL);
     /* paddr=0 reserved sentinel. */
     STM_ASSERT_ERR(EX_WRITE1(idx, 1, 1, 0, 4096, 0,    0), STM_EINVAL);
     /* NULL idx. */
     STM_ASSERT_ERR(EX_WRITE1(NULL, 1, 1, 0, 4096, 0xAA, 0), STM_EINVAL);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_write_rejects_overflow) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     /* off + len overflows uint64. */
     STM_ASSERT_ERR(EX_WRITE1(idx, 1, 1, UINT64_MAX, 1, 0xAA, 0),
                        STM_EOVERFLOW);
@@ -189,24 +255,24 @@ STM_TEST(ex_write_rejects_overflow) {
                        STM_EOVERFLOW);
     /* Boundary: off + len == UINT64_MAX is allowed (not strictly overflow). */
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, UINT64_MAX - 1, 1, 0xAA, 0));
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_write_rejects_future_gen) {
     /* extent.tla::BirthTxgBound */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(5, &idx));
+    idx = ex_test_idx(5);
     STM_ASSERT_ERR(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, /*gen=*/6),
                        STM_EINVAL);
     /* Equal-to-current OK. */
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, /*gen=*/5));
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_write_refuses_overlap) {
     /* extent.tla::NoOverlapWithinIno */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0,    4096, 0xAA, 0));
 
@@ -227,20 +293,20 @@ STM_TEST(ex_write_refuses_overlap) {
     /* Different ino — allowed. */
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 2, 0, 4096, 0x101, 0));
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_write_refuses_paddr_reuse) {
     /* extent.tla::PaddrFreshness (live-paddr) */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0,    4096, 0xAA, 0));
     /* Same paddr in different (ds, ino, off) — refused. */
     STM_ASSERT_ERR(EX_WRITE1(idx, 2, 2, 0,    4096, 0xAA, 0), STM_EEXIST);
     STM_ASSERT_ERR(EX_WRITE1(idx, 1, 1, 4096, 4096, 0xAA, 0), STM_EEXIST);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -250,7 +316,7 @@ STM_TEST(ex_write_refuses_paddr_reuse) {
 STM_TEST(ex_overwrite_into_hole) {
     /* No overlapping extents → no drops; new extent inserted. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t *dropped = NULL;
     size_t    n = 0;
@@ -264,12 +330,12 @@ STM_TEST(ex_overwrite_into_hole) {
     STM_ASSERT_EQ(cnt, (size_t)1);
 
     free_dropped(&dropped, &n);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_overwrite_drops_one) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
 
     uint64_t *dropped = NULL;
@@ -292,12 +358,12 @@ STM_TEST(ex_overwrite_drops_one) {
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096, 4096, 0xAA, 0));
 
     free_dropped(&dropped, &n);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_overwrite_drops_multiple) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     /* Three contiguous 4 KiB extents. */
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0,        4096, 0xAA, 0));
@@ -327,12 +393,12 @@ STM_TEST(ex_overwrite_drops_multiple) {
     STM_ASSERT_EQ(cnt, (size_t)1);
 
     free_dropped(&dropped, &n);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_overwrite_does_not_touch_other_inos) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 2, 0, 4096, 0xBB, 0));
@@ -353,13 +419,13 @@ STM_TEST(ex_overwrite_does_not_touch_other_inos) {
     STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xCC);
 
     free_dropped(&dropped, &n);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_overwrite_rejects_paddr_cycle) {
     /* new_paddr equals an extent we'd drop — caller bug. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
 
     uint64_t *dropped = NULL;
@@ -376,13 +442,13 @@ STM_TEST(ex_overwrite_rejects_paddr_cycle) {
     STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 0, &e));
     STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xAA);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_overwrite_rejects_paddr_collision_with_other_ino) {
     /* new_paddr matches a LIVE extent in a different (ds, ino). */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
     STM_ASSERT_OK(EX_WRITE1(idx, 2, 2, 0, 4096, 0xBB, 0));
 
@@ -399,12 +465,12 @@ STM_TEST(ex_overwrite_rejects_paddr_collision_with_other_ino) {
     STM_ASSERT_OK(stm_extent_lookup_at(idx, 2, 2, 0, &e));
     STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xBB);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_overwrite_rejects_basic_args) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t *dropped = NULL;
     size_t    n = 0;
@@ -420,7 +486,7 @@ STM_TEST(ex_overwrite_rejects_basic_args) {
                                            &dropped, &n),
                        STM_EINVAL);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -429,7 +495,7 @@ STM_TEST(ex_overwrite_rejects_basic_args) {
 
 STM_TEST(ex_truncate_drops_past_size) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     /* Three 4 KiB extents at offs 0 / 4 KiB / 8 KiB. */
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0,        4096, 0xAA, 0));
@@ -456,12 +522,12 @@ STM_TEST(ex_truncate_drops_past_size) {
     STM_ASSERT_EQ(cnt, (size_t)1);
 
     free_dropped(&dropped, &n);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_truncate_to_zero_drops_all) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0,    4096, 0xAA, 0));
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096, 4096, 0xBB, 0));
@@ -476,12 +542,12 @@ STM_TEST(ex_truncate_to_zero_drops_all) {
     STM_ASSERT_EQ(cnt, (size_t)0);
 
     free_dropped(&dropped, &n);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_truncate_no_drops_when_above_max) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
 
     uint64_t *dropped = NULL;
@@ -492,12 +558,12 @@ STM_TEST(ex_truncate_no_drops_when_above_max) {
     STM_ASSERT_TRUE(dropped == NULL);
 
     free_dropped(&dropped, &n);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_truncate_does_not_touch_other_inos) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096, 4096, 0xAA, 0));
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 2, 4096, 4096, 0xBB, 0));
@@ -518,7 +584,7 @@ STM_TEST(ex_truncate_does_not_touch_other_inos) {
     STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xCC);
 
     free_dropped(&dropped, &n);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -527,7 +593,7 @@ STM_TEST(ex_truncate_does_not_touch_other_inos) {
 
 STM_TEST(ex_delete_file_drops_all) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0,    4096, 0xAA, 0));
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096, 4096, 0xBB, 0));
@@ -546,13 +612,13 @@ STM_TEST(ex_delete_file_drops_all) {
     STM_ASSERT_EQ(cnt, (size_t)1);
 
     free_dropped(&dropped, &n);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_delete_file_idempotent) {
     /* Calling delete on a (ds, ino) with no extents is a no-op. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t *dropped = NULL;
     size_t    n = 0;
@@ -561,7 +627,7 @@ STM_TEST(ex_delete_file_idempotent) {
     STM_ASSERT_TRUE(dropped == NULL);
 
     free_dropped(&dropped, &n);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -570,7 +636,7 @@ STM_TEST(ex_delete_file_idempotent) {
 
 STM_TEST(ex_lookup_at_hole) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096, 4096, 0xAA, 0));
 
     stm_extent_record e;
@@ -585,20 +651,20 @@ STM_TEST(ex_lookup_at_hole) {
     STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 8191, &e));
     STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xAA);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_lookup_at_unknown_ino) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     stm_extent_record e;
     STM_ASSERT_ERR(stm_extent_lookup_at(idx, 1, 999, 0, &e), STM_ENOENT);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_lookup_by_paddr_finds_extent) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0,    4096, 0xAA, 0));
     STM_ASSERT_OK(EX_WRITE1(idx, 2, 5, 4096, 8192, 0xBB, 0));
 
@@ -615,12 +681,12 @@ STM_TEST(ex_lookup_by_paddr_finds_extent) {
     STM_ASSERT_EQ(e.off,        4096u);
     STM_ASSERT_EQ(e.len,        8192u);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_lookup_by_paddr_unknown_returns_enoent) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
 
     stm_extent_record e;
@@ -631,17 +697,17 @@ STM_TEST(ex_lookup_by_paddr_unknown_returns_enoent) {
      * in the index — only the base. */
     STM_ASSERT_ERR(stm_extent_lookup_by_paddr(idx, 0xAA + 1, &e), STM_ENOENT);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_lookup_by_paddr_rejects_bad_args) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     stm_extent_record e;
     STM_ASSERT_ERR(stm_extent_lookup_by_paddr(NULL, 0xAA, &e), STM_EINVAL);
     STM_ASSERT_ERR(stm_extent_lookup_by_paddr(idx,  0,    &e), STM_EINVAL);
     STM_ASSERT_ERR(stm_extent_lookup_by_paddr(idx,  0xAA, NULL), STM_EINVAL);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_lookup_by_paddr_after_overwrite) {
@@ -649,7 +715,7 @@ STM_TEST(ex_lookup_by_paddr_after_overwrite) {
      * old paddr returns ENOENT (live-paddr semantics) and the new
      * paddr returns the new extent. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
 
     uint64_t *dropped = NULL;
@@ -665,7 +731,7 @@ STM_TEST(ex_lookup_by_paddr_after_overwrite) {
     STM_ASSERT_OK (stm_extent_lookup_by_paddr(idx, 0xBB, &e));
     STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xBB);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 typedef struct {
@@ -682,7 +748,7 @@ static bool ex_iter_collect_cb(const stm_extent_record *e, void *ctx_) {
 
 STM_TEST(ex_iter_returns_off_ascending) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     /* Insert in non-ascending order. */
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096 * 4, 4096, 0xCC, 0));
@@ -697,7 +763,7 @@ STM_TEST(ex_iter_returns_off_ascending) {
     STM_ASSERT_EQ(c.offs[1], (uint64_t)(4096 * 2));
     STM_ASSERT_EQ(c.offs[2], (uint64_t)(4096 * 4));
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 static bool ex_iter_terminate_after_one_cb(const stm_extent_record *e,
@@ -710,7 +776,7 @@ static bool ex_iter_terminate_after_one_cb(const stm_extent_record *e,
 
 STM_TEST(ex_iter_early_terminate) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0,        4096, 0xAA, 0));
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096,     4096, 0xBB, 0));
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096 * 2, 4096, 0xCC, 0));
@@ -719,12 +785,12 @@ STM_TEST(ex_iter_early_terminate) {
     STM_ASSERT_OK(stm_extent_iter(idx, 1, 1, ex_iter_terminate_after_one_cb,
                                      &seen));
     STM_ASSERT_EQ(seen, 1);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_iter_filters_by_ino) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 2, 0, 4096, 0xBB, 0));
     STM_ASSERT_OK(EX_WRITE1(idx, 2, 1, 0, 4096, 0xCC, 0));
@@ -737,7 +803,7 @@ STM_TEST(ex_iter_filters_by_ino) {
     STM_ASSERT_OK(stm_extent_iter(idx, 1, 2, ex_iter_collect_cb, &c2));
     STM_ASSERT_EQ(c2.n_seen, (size_t)1);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -769,14 +835,14 @@ STM_TEST(ex_iter_cb_runs_under_lock) {
      * we just confirm the cb is invoked at least once and returning
      * false from cb terminates iteration correctly. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
 
     ex_reentry_ctx c = { .idx = idx, .aborted_inner = true };
     STM_ASSERT_OK(stm_extent_iter(idx, 1, 1, ex_iter_reenters_cb, &c));
     STM_ASSERT_FALSE(c.aborted_inner);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -810,7 +876,7 @@ static void *ex_stress_worker(void *arg) {
 STM_TEST(ex_concurrent_writes_serialized) {
     enum { N_THREADS = 4, N_OPS = 256 };
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     pthread_t       th[N_THREADS];
     ex_stress_ctx   ctx[N_THREADS];
@@ -834,7 +900,7 @@ STM_TEST(ex_concurrent_writes_serialized) {
     STM_ASSERT_OK(stm_extent_count(idx, &n));
     STM_ASSERT_EQ(n, (size_t)(N_THREADS * N_OPS));
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -879,6 +945,9 @@ static void exp_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
 }
 
 STM_TEST(extent_persist_set_storage_required_for_commit) {
+    /* This test intentionally exercises the unbound-storage surface
+     * (no set_storage), so it does NOT use the ex_test_idx fixture
+     * (which auto-binds both storage + crypt). */
     stm_extent_index *idx = NULL;
     STM_ASSERT_OK(stm_extent_index_create(0, &idx));
     STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx, EXP_KEY,
@@ -972,10 +1041,17 @@ STM_TEST(extent_persist_idempotent_commit) {
 
     STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
 
+    /* 9.6-impl-4d: the engine refuses non-monotonic committed_gen, so
+     * the second commit's gen must be > the first's. The idempotency
+     * we verify is "clean tree → no-op": the second commit's root
+     * triple (p2, c2) MUST equal the first's (p1, c1) because no
+     * writes happened between them. Matches the inode + dirent test
+     * pattern (inode_persist_idempotent_commit_when_clean,
+     * dirent_persist_idempotent_commit_when_clean). */
     uint64_t p1 = 0, p2 = 0;
     uint8_t  c1[32], c2[32];
     STM_ASSERT_OK(stm_extent_index_commit(idx, 1u, &p1, c1));
-    STM_ASSERT_OK(stm_extent_index_commit(idx, 1u, &p2, c2));
+    STM_ASSERT_OK(stm_extent_index_commit(idx, 2u, &p2, c2));
     STM_ASSERT_EQ(p1, p2);
     STM_ASSERT_MEM_EQ(c1, c2, 32);
 
@@ -1032,7 +1108,14 @@ STM_TEST(extent_persist_load_rejects_tampered_csum) {
 }
 
 STM_TEST(extent_persist_24bit_length_cap) {
-    /* MVP cap: lengths must fit in 24 bits (≤ 16 MiB - 1). */
+    /* MVP cap: lengths must fit in 24 bits (≤ 16 MiB - 1).
+     *
+     * 9.6-impl-4d: pre-4d the cap fired at commit time (the btree was
+     * rebuilt + ex_encode_value rejected). Post-4d every write encodes
+     * the value immediately via ex_engine_put, so the cap fires at
+     * the WRITE site instead. The end-to-end "oversize len is
+     * refused" invariant is identical; the failure point moves one
+     * call earlier. */
     exp_make_tmp("cap");
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;
     exp_open_fresh(&d, &b);
@@ -1044,11 +1127,13 @@ STM_TEST(extent_persist_24bit_length_cap) {
                                                     EXP_POOL_UUID,
                                                     EXP_DEVICE_UUID));
 
-    /* 16 MiB extent — exceeds 24-bit cap; commit refuses with ERANGE. */
-    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 1u << 24, 0xAA, 0));
+    /* 16 MiB extent — exceeds 24-bit cap; the write itself refuses
+     * with ERANGE post-4d (the value encode is at the write site). */
+    STM_ASSERT_ERR(EX_WRITE1(idx, 1, 1, 0, 1u << 24, 0xAA, 0), STM_ERANGE);
 
+    /* A subsequent commit of the still-empty tree succeeds. */
     uint64_t paddr = 0; uint8_t cs[32];
-    STM_ASSERT_ERR(stm_extent_index_commit(idx, 1u, &paddr, cs), STM_ERANGE);
+    STM_ASSERT_OK(stm_extent_index_commit(idx, 1u, &paddr, cs));
 
     stm_extent_index_close(idx);
     stm_bootstrap_close(b);
@@ -1106,7 +1191,7 @@ STM_TEST(ex_write_multi_replica_basic) {
     /* Write a 2-replica extent; verify both paddrs in record + lookup
      * resolves on either replica. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t replicas[2] = { 0xAA, 0xBB };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, replicas, 2, 0, /*key_id=*/0));
@@ -1125,32 +1210,32 @@ STM_TEST(ex_write_multi_replica_basic) {
     /* Non-replica paddr → ENOENT. */
     STM_ASSERT_ERR(stm_extent_lookup_by_paddr(idx, 0xCC, &e), STM_ENOENT);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_write_rejects_within_set_collision) {
     /* extent.tla::within-set distinctness: replica set must have all
      * distinct paddrs. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     uint64_t bad[2] = { 0xAA, 0xAA };
     STM_ASSERT_ERR(stm_extent_write(idx, 1, 1, 0, 4096, bad, 2, 0, /*key_id=*/0),
                        STM_EINVAL);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_write_rejects_zero_paddr_in_set) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     uint64_t bad[2] = { 0xAA, 0 };  /* paddrs[1] is the sentinel */
     STM_ASSERT_ERR(stm_extent_write(idx, 1, 1, 0, 4096, bad, 2, 0, /*key_id=*/0),
                        STM_EINVAL);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_write_rejects_zero_or_oversized_replica_count) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     uint64_t r[STM_EXTENT_MAX_REPLICAS + 1u];
     for (size_t i = 0; i < sizeof r / sizeof r[0]; i++)
         r[i] = 0xAA + (uint64_t)i;
@@ -1162,14 +1247,14 @@ STM_TEST(ex_write_rejects_zero_or_oversized_replica_count) {
                                       STM_EXTENT_MAX_REPLICAS + 1u, 0,
                                       /*key_id=*/0),
                        STM_EINVAL);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_write_rejects_replica_collision_across_extents) {
     /* extent.tla::LiveReplicasDisjoint: a new replica paddr must not
      * appear in any live extent's replica set. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t e1[2] = { 0xAA, 0xBB };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, e1, 2, 0, /*key_id=*/0));
@@ -1181,13 +1266,13 @@ STM_TEST(ex_write_rejects_replica_collision_across_extents) {
     uint64_t e3[2] = { 0xCC, 0xDD };
     STM_ASSERT_OK(stm_extent_write(idx, 2, 2, 0, 4096, e3, 2, 0, /*key_id=*/0));
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_overwrite_drops_full_replica_set) {
     /* Overwrite drops every paddr of every overlapping extent. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t old[3] = { 0xAA, 0xBB, 0xCC };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, old, 3, 0, /*key_id=*/0));
@@ -1218,14 +1303,14 @@ STM_TEST(ex_overwrite_drops_full_replica_set) {
     STM_ASSERT_OK(stm_extent_lookup_by_paddr(idx, 0xDD, &e));
     STM_ASSERT_OK(stm_extent_lookup_by_paddr(idx, 0xEE, &e));
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_overwrite_rejects_cycle_via_any_replica) {
     /* Cycle check: new replica set may NOT match any paddr in the
      * to-be-dropped extents' replica sets. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t old[2] = { 0xAA, 0xBB };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, old, 2, 0, /*key_id=*/0));
@@ -1241,14 +1326,14 @@ STM_TEST(ex_overwrite_rejects_cycle_via_any_replica) {
     STM_ASSERT_TRUE(dropped == NULL);
     STM_ASSERT_EQ(n_dropped, (size_t)0);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_truncate_returns_full_replica_set_for_each_dropped) {
     /* Truncate drops the full replica set of every past-truncation
      * extent. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t r1[2] = { 0xAA, 0xBB };
     uint64_t r2[2] = { 0xCC, 0xDD };
@@ -1269,7 +1354,7 @@ STM_TEST(ex_truncate_returns_full_replica_set_for_each_dropped) {
     STM_ASSERT(saw_cc && saw_dd);
     free(dropped);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_persist_multi_replica_roundtrip) {
@@ -1359,7 +1444,7 @@ STM_TEST(ex_truncate_peek_counts_past_extents) {
      * report 2 past extents (off=4096 + off=8192) with their replica
      * counts summed. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t r1[1] = { 0xAA };
     uint64_t r2[2] = { 0xBB, 0xCC };
@@ -1390,13 +1475,13 @@ STM_TEST(ex_truncate_peek_counts_past_extents) {
     STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
     STM_ASSERT_EQ(cnt, (size_t)3);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_truncate_into_uses_pre_allocated_buffers) {
     /* Same setup; pre-allocate exact-cap buffers and call _into. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t r1[1] = { 0xAA };
     uint64_t r2[2] = { 0xBB, 0xCC };
@@ -1438,7 +1523,7 @@ STM_TEST(ex_truncate_into_uses_pre_allocated_buffers) {
     STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
     STM_ASSERT_EQ(cnt, (size_t)1);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_truncate_into_refuses_undersized_buffer_and_keeps_state) {
@@ -1446,7 +1531,7 @@ STM_TEST(ex_truncate_into_refuses_undersized_buffer_and_keeps_state) {
      * require, _into returns STM_ERANGE and leaves the index
      * unchanged. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t r1[2] = { 0xAA, 0xBB };
     uint64_t r2[2] = { 0xCC, 0xDD };
@@ -1484,13 +1569,13 @@ STM_TEST(ex_truncate_into_refuses_undersized_buffer_and_keeps_state) {
     STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
     STM_ASSERT_EQ(cnt, (size_t)2);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_truncate_into_zero_drops_accepts_null_buffers) {
     /* When peek says 0 + 0, caller may pass NULL/0 buffers. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t r1[1] = { 0xAA };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r1, 1, 0, 0));
@@ -1506,7 +1591,7 @@ STM_TEST(ex_truncate_into_zero_drops_accepts_null_buffers) {
     STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
     STM_ASSERT_EQ(cnt, (size_t)1);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1518,7 +1603,7 @@ STM_TEST(ex_reflink_basic_share) {
      * same paddr, same gen, same key_id, AND the same origin (inherited
      * from src). extent.tla::Reflink + SharedReplicasAreCohabit. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t r[1] = { 0xAA };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r, 1, 0, 0));
@@ -1547,13 +1632,13 @@ STM_TEST(ex_reflink_basic_share) {
     STM_ASSERT_EQ(src.origin_ino,        (uint64_t)1);
     STM_ASSERT_EQ(src.origin_off,        (uint64_t)0);
 
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_reflink_rejects_dst_overlap) {
     /* dst already has an extent at the target offset — STM_EEXIST. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t rA[1] = { 0xAA };
     uint64_t rB[1] = { 0xBB };
@@ -1563,7 +1648,7 @@ STM_TEST(ex_reflink_rejects_dst_overlap) {
                                          rA, 1, 0, 0,
                                          1, 1, 0, 0),
                       STM_EEXIST);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_reflink_rejects_partial_overlap_with_other) {
@@ -1571,7 +1656,7 @@ STM_TEST(ex_reflink_rejects_partial_overlap_with_other) {
      * shares ONE paddr with an existing extent but isn't a whole-set
      * match. SharedReplicasAreCohabit fires. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t r2[2] = { 0xAA, 0xBB };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r2, 2, 0, 0));
@@ -1581,7 +1666,7 @@ STM_TEST(ex_reflink_rejects_partial_overlap_with_other) {
                                          r1, 1, 0, 0,
                                          1, 1, 0, 0),
                       STM_EEXIST);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_reflink_rejects_whole_share_different_origin) {
@@ -1589,7 +1674,7 @@ STM_TEST(ex_reflink_rejects_whole_share_different_origin) {
      * fires. This catches the "buggy reflink rotates origin" pattern
      * (extent.tla::BuggyReflinkRotatesOrigin). */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t r[1] = { 0xAA };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r, 1, 0, 0));
@@ -1603,12 +1688,12 @@ STM_TEST(ex_reflink_rejects_whole_share_different_origin) {
                                          /*origin_off=*/0,
                                          /*link_gen=*/0),
                       STM_EEXIST);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_reflink_rejects_invalid_args) {
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
     uint64_t r[1] = { 0xAA };
     STM_ASSERT_ERR(stm_extent_reflink(NULL, 1, 1, 0, 4096, r, 1, 0, 0,
                                          1, 1, 0, 0), STM_EINVAL);
@@ -1627,14 +1712,14 @@ STM_TEST(ex_reflink_rejects_invalid_args) {
     /* NULL paddrs */
     STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 1, 0, 4096, NULL, 1, 0, 0,
                                          1, 1, 0, 0), STM_EINVAL);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_reflink_multiple_siblings_ok) {
     /* Two reflink-siblings at different (ds, ino), both sharing src's
      * paddrs and origin. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    idx = ex_test_idx(0);
 
     uint64_t r[1] = { 0xAA };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r, 1, 0, 0));
@@ -1645,7 +1730,7 @@ STM_TEST(ex_reflink_multiple_siblings_ok) {
     size_t n = 0;
     STM_ASSERT_OK(stm_extent_count(idx, &n));
     STM_ASSERT_EQ(n, (size_t)3);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST(ex_overwrite_resets_origin_to_self) {
@@ -1653,7 +1738,7 @@ STM_TEST(ex_overwrite_resets_origin_to_self) {
      * subsequent reflink-like share would re-derive origin from the
      * NEW extent's (live = origin) tuple. */
     stm_extent_index *idx = NULL;
-    STM_ASSERT_OK(stm_extent_index_create(5, &idx));
+    idx = ex_test_idx(5);
 
     uint64_t r1[1] = { 0xAA };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r1, 1, 0, 0));
@@ -1682,7 +1767,7 @@ STM_TEST(ex_overwrite_resets_origin_to_self) {
     STM_ASSERT_EQ(live2.origin_dataset_id, (uint64_t)1);
     STM_ASSERT_EQ(live2.origin_ino,        (uint64_t)1);
     STM_ASSERT_EQ(live2.origin_off,        (uint64_t)0);
-    stm_extent_index_close(idx);
+    ex_test_idx_close(idx);
 }
 
 STM_TEST_MAIN("test_extent_index")

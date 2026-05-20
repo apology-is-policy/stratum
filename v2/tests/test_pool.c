@@ -491,7 +491,7 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
      * restated here so a future version bump that forgets to
      * update this test fails loudly. */
     STM_ASSERT_EQ(stm_load_le32(ub.ub_version), STM_UB_VERSION);
-    STM_ASSERT_EQ(STM_UB_VERSION, 28u);  /* TLY-A3-keyslot-wrap v27 → v28 */
+    STM_ASSERT_EQ(STM_UB_VERSION, 29u);  /* 9.6-impl-4d extent cutover v28 → v29 */
 
     /* Roster fields are populated. */
     STM_ASSERT_EQ(stm_load_le16(ub.ub_device_count), 1u);

@@ -1,16 +1,38 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * Per-pool extent index — in-RAM MVP (P7-2).
+ * Per-pool extent index — btree_engine-backed (9.6-impl-4d).
  *
  *   see include/stratum/extent.h — public API + invariants.
  *   see v2/specs/extent.tla — formal model.
+ *   see v2/docs/phase-9.6-impl-4-cutover-design.md — engine cutover rationale.
  *
- * Linear-array implementation analogous to src/dataset/dataset.c.
- * Records are stored in a single dynamic array; Overwrite / Truncate /
- * DeleteFile compact the array in place. Persistent storage (per-inode
- * Bε-tree under ub_extent_root) is a follow-on chunk (P7-3).
+ * Persistence is incremental-COW B+tree via stm_btree_engine — the same
+ * substrate the inode / dirent / xattr indices use as of 9.6-impl-4b/c.
+ * The retired pre-4d implementation held records[] in RAM, rebuilt the
+ * whole tree on every stm_extent_index_commit, and validated cross-record
+ * invariants on every load. The post-cutover impl:
  *
- * SPEC-TO-CODE mapping:
+ *   - reads records on demand via stm_btree_engine_lookup + scan_range
+ *     over the (dataset_id, ino) prefix;
+ *   - mutates via stm_btree_engine_insert (upsert) + _delete;
+ *   - commits via the three-phase _commit_flush / _finalize / _abort
+ *     that stm_sync_commit drives (parallel to inode/dirent/xattr);
+ *   - mount-scans every record into a transient ctx that raises
+ *     current_txg = max(write_gen) and cross-validates cohabit
+ *     (extent.tla::SharedReplicasAreCohabit) BEFORE swapping the engine
+ *     in. The mount-time scan is the load-bearing validator for
+ *     paddr-uniqueness across the entire pool (the runtime check
+ *     defaults to allocator.tla::NoReuseInSameGen + a (ds, ino)-scoped
+ *     scan; the global engine-scan-per-write is too expensive).
+ *
+ * The (ds, ino, off) on-disk key + 108-byte value layout (v18 + v21
+ * tail) are UNCHANGED. STM_UB_VERSION 28→29 at the 4d-bump commits the
+ * cutover: v28 pools (whole-tree-rebuild btree_store) are unreadable by
+ * v29 code; v29 mounts open the engine via stm_btree_engine_open and
+ * the layout-on-disk semantics (16 KiB nodes, AEAD-encrypted, per-node
+ * BLAKE3 Merkle csum) come from the engine.
+ *
+ * SPEC-TO-CODE mapping (unchanged from pre-4d MVP):
  *
  *   extent.tla::Init               → stm_extent_index_create
  *   extent.tla::Write              → stm_extent_write
@@ -25,20 +47,20 @@
  *   extent.tla::Reflink            → stm_extent_reflink            (P7-16)
  *
  *   extent.tla::TypeOK             → field types in stm_extent_record
- *   extent.tla::NoOverlapWithinIno → overlap-scan in _write / _overwrite /
- *                                       _reflink (overlap_in_ino_locked)
- *   extent.tla::LengthPositive     → len ≥ 1 check in _write / _overwrite /
- *                                       _reflink
+ *   extent.tla::NoOverlapWithinIno → engine_scan_range over (ds, ino)
+ *                                       at every write/overwrite/reflink
+ *   extent.tla::LengthPositive     → len ≥ 1 check
  *   extent.tla::BirthTxgBound      → write_gen ≤ current_txg check
  *   extent.tla::AllExtentsInBounds → off + len overflow check
- *   extent.tla::PaddrFreshness     → paddr_in_use_locked scan in _write /
- *                                       _overwrite (fresh-paddr gate)
+ *   extent.tla::PaddrFreshness     → allocator.tla::NoReuseInSameGen
+ *                                       (the runtime in-ino scan is
+ *                                       defense-in-depth — see notes
+ *                                       at any_paddr_in_ino_locked).
  *   extent.tla::SharedReplicasAreCohabit
- *                                   → cohabit_check_locked in _reflink
- *                                       (P7-16; replaces the prior
- *                                       LiveReplicasDisjoint scan in
- *                                       _reflink — relaxed for legitimate
- *                                       whole-extent inheritance).
+ *                                   → cohabit_check_in_locked at insert
+ *                                       (P7-16); cross-pool variant runs
+ *                                       at mount via ex_mount_validate
+ *                                       (replaces ex_validate_shadow).
  *   extent.tla::OriginConsistentInBounds
  *                                   → origin = (dataset_id, ino, off) at
  *                                       fresh write / overwrite / truncate;
@@ -70,7 +92,8 @@ _Static_assert(STM_EXTENT_HASH_LEN == STM_CAS_HASH_LEN,
 #include <stratum/bootstrap.h>
 #include <stratum/btnode.h>
 #include <stratum/btree.h>
-#include <stratum/btree_store.h>
+#include <stratum/btree_engine.h>
+#include <stratum/engine_store.h>
 #include <stratum/super.h>
 
 #include <pthread.h>
@@ -90,24 +113,39 @@ static inline void must_unlock(pthread_mutex_t *m) {
     if (rc != 0) abort();
 }
 
+/* On-disk key/value lengths — defined here so the struct + the engine
+ * glue below can refer to them. The encoding routines live further down
+ * in this TU (the canonical encoding-section is unchanged from pre-4d). */
+#define EX_KEY_LEN              24u                          /* ds + ino + off */
+#define EX_VAL_LEN              108u                         /* P7-CAS-11 / v21 */
+
 struct stm_extent_index {
     pthread_mutex_t       lock;
-    stm_extent_record    *records;
-    size_t                n_records;
-    size_t                cap_records;
     uint64_t              current_txg;
 
-    /* ----- Persistence (P7-3), mirrors stm_dataset_index. ----- */
-    stm_bdev       *bdev;
-    stm_bootstrap  *boot;
-    const uint8_t  *metadata_key;
-    uint64_t        pool_uuid[2];
-    uint64_t        device_uuid[2];
-    bool            crypt_set;
-    uint64_t        root_paddr;
-    uint64_t        root_gen;
-    uint8_t         root_csum[32];
-    bool            dirty;
+    /* ----- Persistence (9.6-impl-4d: btree_engine-backed). ----- */
+    bool                  storage_set;   /* R70 P3-6: latched on first
+                                           * successful set_storage. */
+    bool                  crypt_set;     /* R70 P3-6: latched on first
+                                           * successful set_crypt_ctx. */
+    stm_engine_store_ctx  store_ctx;     /* { boot, bdev } — the engine's
+                                           * vt_ctx. Populated by set_storage;
+                                           * a stable member so the engine's
+                                           * borrowed vt_ctx pointer stays
+                                           * valid for idx's lifetime. */
+    stm_btree_crypt_ctx   crypt_ctx;     /* metadata_key + uuids — the
+                                           * engine's cx. Populated by
+                                           * set_crypt_ctx; a stable member. */
+    stm_btree_engine     *eng;           /* the extent store. Created once
+                                           * BOTH contexts are bound (see
+                                           * ex_engine_create_locked /
+                                           * the two binders), or by load_at
+                                           * on the mount path. */
+    /* Last durably-committed root triple — mirrored for the sync layer's
+     * uberblock stamping (stm_extent_index_get_root / _get_gen). */
+    uint64_t              root_paddr;
+    uint64_t              root_gen;
+    uint8_t               root_csum[32];
 };
 
 static inline pthread_mutex_t *ex_lock(const stm_extent_index *idx) {
@@ -115,7 +153,21 @@ static inline pthread_mutex_t *ex_lock(const stm_extent_index *idx) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Internal helpers (caller holds idx->lock).                         */
+/* Forward decls for encode/decode (defined in the encoding section).   */
+/* ------------------------------------------------------------------ */
+
+static void       ex_encode_key(uint64_t ds, uint64_t ino, uint64_t off,
+                                 uint8_t out[EX_KEY_LEN]);
+static stm_status ex_decode_key(const uint8_t *in, size_t in_len,
+                                   uint64_t *ds, uint64_t *ino, uint64_t *off);
+static stm_status ex_encode_value(const stm_extent_record *r,
+                                     uint8_t out[EX_VAL_LEN]);
+static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
+                                     uint64_t ds, uint64_t ino, uint64_t off,
+                                     stm_extent_record *out_rec);
+
+/* ------------------------------------------------------------------ */
+/* Common helpers.                                                      */
 /* ------------------------------------------------------------------ */
 
 /* Two byte-ranges [a_off, a_off+a_len) and [b_off, b_off+b_len) overlap
@@ -125,27 +177,6 @@ static inline bool ranges_overlap(uint64_t a_off, uint64_t a_len,
                                      uint64_t b_off, uint64_t b_len) {
     if (a_len == 0 || b_len == 0) return false;
     return a_off < b_off + b_len && b_off < a_off + a_len;
-}
-
-/* True if `paddr` appears in any live extent's replica set. */
-static bool paddr_in_use_locked(const stm_extent_index *idx, uint64_t paddr) {
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        for (uint8_t r = 0; r < e->n_replicas; r++) {
-            if (e->paddrs[r] == paddr) return true;
-        }
-    }
-    return false;
-}
-
-/* True if any paddr in `paddrs[0..n)` is already in some live extent's
- * replica set. P7-6 / extent.tla::LiveReplicasDisjoint. */
-static bool any_paddr_in_use_locked(const stm_extent_index *idx,
-                                       const uint64_t *paddrs, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        if (paddr_in_use_locked(idx, paddrs[i])) return true;
-    }
-    return false;
 }
 
 /* True iff `paddrs[0..n)` are pairwise distinct and none are zero.
@@ -161,35 +192,334 @@ static bool replica_set_is_valid(const uint64_t *paddrs, size_t n) {
     return true;
 }
 
-/* Sum of n_replicas over the given record indices. */
-static size_t total_replicas_in_drop_set(const stm_extent_index *idx,
-                                            const size_t *drop_indices,
-                                            size_t n_drops) {
-    size_t total = 0;
-    for (size_t i = 0; i < n_drops; i++) {
-        total += idx->records[drop_indices[i]].n_replicas;
+/* ------------------------------------------------------------------ */
+/* Engine glue. All ops are caller-holds-idx->lock.                     */
+/* ------------------------------------------------------------------ */
+
+/* engine_lookup + decode at exact (ds, ino, off). On STM_OK: *out_found
+ * is set; if true, *out holds the validated decoded record. The
+ * dataset_id / ino / off fields are stamped from the key triple, NOT
+ * trusted from the value bytes — the value carries the kind, replicas,
+ * gen, key_id, origin_*, link_gen, read_count, last_read_gen. */
+static stm_status ex_engine_get(stm_extent_index *idx,
+                                uint64_t ds, uint64_t ino, uint64_t off,
+                                stm_extent_record *out, bool *out_found) {
+    *out_found = false;
+    uint8_t key[EX_KEY_LEN];
+    ex_encode_key(ds, ino, off, key);
+
+    bool found = false;
+    void *vbuf = NULL;
+    size_t vlen = 0;
+    stm_status ls = stm_btree_engine_lookup(idx->eng, key, EX_KEY_LEN,
+                                            &found, &vbuf, &vlen);
+    if (ls != STM_OK) return ls;
+    if (!found) return STM_OK;                  /* *out_found stays false */
+
+    if (vlen != EX_VAL_LEN || !vbuf) {
+        free(vbuf);
+        return STM_ECORRUPT;
     }
-    return total;
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = ex_decode_value(vbuf, vlen, ds, ino, off, &r);
+    free(vbuf);
+    if (vs != STM_OK) return vs;
+    *out = r;
+    *out_found = true;
+    return STM_OK;
 }
 
-static bool overlap_in_ino_locked(const stm_extent_index *idx,
-                                     uint64_t ds, uint64_t ino,
-                                     uint64_t off, uint64_t len) {
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != ds || e->ino != ino) continue;
-        if (ranges_overlap(e->off, e->len, off, len)) return true;
-    }
-    return false;
+/* Encode + engine_insert (upsert). The engine's insert is failure-atomic —
+ * a failed put never loses the prior value at this key. */
+static stm_status ex_engine_put(stm_extent_index *idx,
+                                const stm_extent_record *r) {
+    uint8_t key[EX_KEY_LEN];
+    uint8_t val[EX_VAL_LEN];
+    ex_encode_key(r->dataset_id, r->ino, r->off, key);
+    stm_status es = ex_encode_value(r, val);
+    if (es != STM_OK) return es;
+    return stm_btree_engine_insert(idx->eng, key, EX_KEY_LEN, val, EX_VAL_LEN);
 }
 
-/* P7-16: validates extent.tla::SharedReplicasAreCohabit at insert time.
+/* engine_delete at exact (ds, ino, off). Unlike dirent (where Unlink
+ * writes a TOMBSTONE via engine_insert), extent is the only metadata
+ * index that uses engine_delete in the normal write-path: truncate /
+ * delete_file / overwrite / punch_range / migrate_to_cold_chunked /
+ * shift_range_keys all need STRUCTURAL removal (extent.tla doesn't
+ * model tombstone slots; a stale extent record left in the tree would
+ * read back at mount as a live extent → data corruption). The 9.6-
+ * impl-4 design doc §3.1 added stm_btree_engine_delete specifically
+ * for this use case. */
+static stm_status ex_engine_del(stm_extent_index *idx,
+                                uint64_t ds, uint64_t ino, uint64_t off) {
+    uint8_t key[EX_KEY_LEN];
+    ex_encode_key(ds, ino, off, key);
+    return stm_btree_engine_delete(idx->eng, key, EX_KEY_LEN, NULL);
+}
+
+/* Stand up the btree_engine from the (now both populated) store + crypt
+ * contexts. Caller holds idx->lock, has verified BOTH contexts are
+ * bound and idx->eng is NULL. The engine borrows &idx->store_ctx (its
+ * vt_ctx) and &idx->crypt_ctx (its cx) — both stable members, alive for
+ * idx's lifetime. */
+static stm_status ex_engine_create_locked(stm_extent_index *idx) {
+    return stm_btree_engine_create(&STM_ENGINE_STORE_VT, &idx->store_ctx,
+                                   &idx->crypt_ctx, /*tree_id=*/0u,
+                                   &idx->eng);
+}
+
+/* ------------------------------------------------------------------ */
+/* (ds, ino) prefix iteration — extent's NoOverlapWithinIno checks +    */
+/* iter / truncate / punch_range / shift_range_keys / cohabit-check    */
+/* all bracket the engine at the (ds, ino) prefix.                     */
+/*                                                                      */
+/* The on-disk key is le64(ds) ‖ le64(ino) ‖ le64(off). The engine     */
+/* compares keys bytewise (memcmp). Within a fixed (ds, ino) prefix,   */
+/* every key shares the same 16-byte prefix; the                       */
+/* [ds‖ino‖0 .. ds‖ino‖UINT64_MAX] scan_range bounds therefore bracket */
+/* exactly that (ds, ino)'s keys regardless of the LE off-field        */
+/* numeric scramble. The two pre-4d scan-style ops (paddr-in-use +     */
+/* iter) already had to handle unsorted iteration, so the bytewise-not-*/
+/* numeric ordering is a no-op semantic change.                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    /* In-ino collected records, sorted later if the caller wants. */
+    stm_extent_record  *records;
+    uint64_t           *offs;   /* parallel array of key.off for filter */
+    size_t              n;
+    size_t              cap;
+    stm_status          err;
+} ex_collect_ctx;
+
+static int ex_collect_cb(const void *k, size_t klen,
+                         const void *v, size_t vlen, void *ctx_) {
+    ex_collect_ctx *c = ctx_;
+    uint64_t ds = 0, ino = 0, off = 0;
+    stm_status ks = ex_decode_key(k, klen, &ds, &ino, &off);
+    if (ks != STM_OK) { c->err = ks; return 1; }
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = ex_decode_value(v, vlen, ds, ino, off, &r);
+    if (vs != STM_OK) { c->err = vs; return 1; }
+
+    if (c->n == c->cap) {
+        if (c->cap > (SIZE_MAX / sizeof *c->records) / 2u) {
+            c->err = STM_ENOMEM;
+            return 1;
+        }
+        size_t new_cap = c->cap == 0 ? 8u : c->cap * 2u;
+        stm_extent_record *nr = realloc(c->records,
+                                            new_cap * sizeof *c->records);
+        if (!nr) { c->err = STM_ENOMEM; return 1; }
+        c->records = nr;
+        uint64_t *no = realloc(c->offs, new_cap * sizeof *c->offs);
+        if (!no) { c->err = STM_ENOMEM; return 1; }
+        c->offs = no;
+        c->cap = new_cap;
+    }
+    c->records[c->n] = r;
+    c->offs[c->n]    = off;
+    c->n++;
+    return 0;
+}
+
+/* Collect every record under (ds, ino) into out_ctx. Caller holds
+ * idx->lock. *out_ctx is owned by the caller, free'd via
+ * ex_collect_free. NULL out_ctx->records on n==0 (and cap==0). */
+static stm_status ex_collect_in_ino_locked(stm_extent_index *idx,
+                                           uint64_t ds, uint64_t ino,
+                                           ex_collect_ctx *out_ctx) {
+    memset(out_ctx, 0, sizeof *out_ctx);
+    uint8_t lo[EX_KEY_LEN], hi[EX_KEY_LEN];
+    ex_encode_key(ds, ino, 0u,         lo);
+    ex_encode_key(ds, ino, UINT64_MAX, hi);
+    stm_status ss = stm_btree_engine_scan_range(idx->eng, lo, EX_KEY_LEN,
+                                                hi, EX_KEY_LEN,
+                                                ex_collect_cb, out_ctx);
+    if (ss != STM_OK) {
+        free(out_ctx->records);
+        free(out_ctx->offs);
+        memset(out_ctx, 0, sizeof *out_ctx);
+        return ss;
+    }
+    if (out_ctx->err != STM_OK) {
+        stm_status err = out_ctx->err;
+        free(out_ctx->records);
+        free(out_ctx->offs);
+        memset(out_ctx, 0, sizeof *out_ctx);
+        return err;
+    }
+    return STM_OK;
+}
+
+static void ex_collect_free(ex_collect_ctx *c) {
+    free(c->records);
+    free(c->offs);
+    memset(c, 0, sizeof *c);
+}
+
+/* Within (ds, ino) — does any existing extent overlap [off, off+len)?
+ * Caller holds idx->lock. */
+static stm_status overlap_in_ino_locked(stm_extent_index *idx,
+                                        uint64_t ds, uint64_t ino,
+                                        uint64_t off, uint64_t len,
+                                        bool *out_overlap) {
+    *out_overlap = false;
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked(idx, ds, ino, &c);
+    if (cs != STM_OK) return cs;
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
+        if (ranges_overlap(e->off, e->len, off, len)) {
+            *out_overlap = true;
+            break;
+        }
+    }
+    ex_collect_free(&c);
+    return STM_OK;
+}
+
+/* Whole-tree paddr / cohabit context. Used by the global scans below
+ * to validate paddr-uniqueness + extent.tla::SharedReplicasAreCohabit
+ * at insert time across the entire pool.
+ *
+ * NOTE: pre-4d these checks ran against an in-RAM records[] (cheap).
+ * Post-4d they engine_scan the entire tree (decrypts every node). For
+ * typical extents this is acceptable; for high-frequency writes on a
+ * large pool this is a known perf degradation. Forward-noted at the
+ * impl-5+ chunks: a paddr→extent map (in-RAM index keyed by paddr,
+ * rebuilt at mount + maintained at every write/delete) would restore
+ * O(1) lookup. The MVP defers that optimisation; correctness wins. */
+typedef struct {
+    /* paddr-uniqueness probe. */
+    const uint64_t  *probe_paddrs;
+    size_t           n_probe;
+    /* Skip-record set: by (ds, ino, off) triples. Used by stm_extent_overwrite
+     * to exclude the records that are being dropped (their paddrs are
+     * about to be freed, so the new candidate may legitimately reuse them
+     * within the same call). NULL/0 means no skip set. */
+    const uint64_t  *skip_keys;    /* triples [ds0, ino0, off0, ds1, ino1, off1, ...] */
+    size_t           n_skip;       /* number of triples */
+    bool             collision;
+    /* cohabit probe: candidate tuple. */
+    bool             cohabit_active;       /* gate the check off when unused */
+    const uint64_t  *cand_paddrs;
+    size_t           n_cand;
+    uint64_t         cand_gen;
+    uint64_t         cand_key_id;
+    uint64_t         cand_origin_ds;
+    uint64_t         cand_origin_ino;
+    uint64_t         cand_origin_off;
+    bool             cohabit_ok;
+    stm_status       err;
+} ex_global_check_ctx;
+
+static int ex_global_check_cb(const void *k, size_t klen,
+                              const void *v, size_t vlen, void *ctx_) {
+    ex_global_check_ctx *gc = ctx_;
+    uint64_t ds = 0, ino = 0, off = 0;
+    stm_status ks = ex_decode_key(k, klen, &ds, &ino, &off);
+    if (ks != STM_OK) { gc->err = ks; return 1; }
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = ex_decode_value(v, vlen, ds, ino, off, &r);
+    if (vs != STM_OK) { gc->err = vs; return 1; }
+
+    /* Check skip set: if THIS record's key is in the skip list, don't
+     * count its paddrs against the candidate (overwrite is dropping
+     * this record; its paddrs are about to be freed). */
+    bool skipped = false;
+    if (gc->skip_keys && gc->n_skip > 0) {
+        for (size_t si = 0; si < gc->n_skip; si++) {
+            if (gc->skip_keys[si * 3 + 0] == ds &&
+                gc->skip_keys[si * 3 + 1] == ino &&
+                gc->skip_keys[si * 3 + 2] == off) {
+                skipped = true;
+                break;
+            }
+        }
+    }
+
+    /* Paddr-uniqueness probe (LiveReplicasDisjoint). Any share fires
+     * collision; we DON'T early-exit because the cohabit probe may
+     * still want to run on later records. (In practice the callers
+     * activate at most ONE probe at a time, so the optimisation
+     * doesn't pay; preserving generality.) */
+    if (gc->probe_paddrs && !skipped) {
+        for (uint8_t i = 0; i < r.n_replicas && !gc->collision; i++) {
+            for (size_t k_ = 0; k_ < gc->n_probe; k_++) {
+                if (r.paddrs[i] == gc->probe_paddrs[k_]) {
+                    gc->collision = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Cohabit probe (SharedReplicasAreCohabit). */
+    if (gc->cohabit_active && gc->cohabit_ok) {
+        bool any_share = false;
+        for (uint8_t i = 0; i < r.n_replicas && !any_share; i++) {
+            for (size_t k_ = 0; k_ < gc->n_cand; k_++) {
+                if (r.paddrs[i] == gc->cand_paddrs[k_]) {
+                    any_share = true;
+                    break;
+                }
+            }
+        }
+        if (any_share) {
+            /* Whole-set match required. */
+            if (r.n_replicas != (uint8_t)gc->n_cand) {
+                gc->cohabit_ok = false;
+            } else {
+                bool whole_match = true;
+                for (uint8_t i = 0; i < r.n_replicas && whole_match; i++) {
+                    bool found = false;
+                    for (size_t k_ = 0; k_ < gc->n_cand; k_++) {
+                        if (r.paddrs[i] == gc->cand_paddrs[k_]) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) whole_match = false;
+                }
+                if (!whole_match) gc->cohabit_ok = false;
+                else if (r.gen != gc->cand_gen) gc->cohabit_ok = false;
+                else if (r.key_id != gc->cand_key_id) gc->cohabit_ok = false;
+                else if (r.origin_dataset_id != gc->cand_origin_ds)  gc->cohabit_ok = false;
+                else if (r.origin_ino        != gc->cand_origin_ino) gc->cohabit_ok = false;
+                else if (r.origin_off        != gc->cand_origin_off) gc->cohabit_ok = false;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Cross-(ds, ino) paddr-uniqueness scan. Caller holds idx->lock. */
+static stm_status any_paddr_in_use_global_locked(stm_extent_index *idx,
+                                                  const uint64_t *paddrs, size_t n,
+                                                  bool *out_collision) {
+    *out_collision = false;
+    ex_global_check_ctx gc = {0};
+    gc.probe_paddrs = paddrs;
+    gc.n_probe      = n;
+    gc.cohabit_ok   = true;
+    stm_status ss = stm_btree_engine_scan(idx->eng, ex_global_check_cb, &gc);
+    if (ss != STM_OK) return ss;
+    if (gc.err != STM_OK) return gc.err;
+    *out_collision = gc.collision;
+    return STM_OK;
+}
+
+/* P7-16: validate extent.tla::SharedReplicasAreCohabit at insert time.
  * Given a candidate (paddrs, gen, key_id, origin_*) tuple about to be
- * inserted, checks every existing extent record. If any existing record
- * shares a paddr but disagrees on (replicas, gen, key_id, origin_*),
- * the cohabit invariant would be violated — return false (refuse).
- * If sharing is consistent (whole-extent inheritance), or no sharing
- * exists, return true.
+ * inserted, checks EVERY existing extent record in the pool. If any
+ * existing record shares a paddr but disagrees on (replicas, gen,
+ * key_id, origin_*), the cohabit invariant would be violated — return
+ * false (refuse). If sharing is consistent (whole-extent inheritance),
+ * or no sharing exists, return true.
  *
  * Three-state classification of an existing record `e` vs candidate:
  *   - No overlap: e.replicas ∩ candidate.paddrs = ∅. OK.
@@ -198,95 +528,32 @@ static bool overlap_in_ino_locked(const stm_extent_index *idx,
  *   - Partial overlap OR whole-match-but-tuple-mismatch: refuse.
  *
  * Whole-set check: same n_replicas AND each paddr in e.paddrs is in
- * candidate.paddrs (their replica sets are equal as sets). Replica
- * arrays in this MVP are stored in canonical sorted order from the
- * sync layer's caller, but defensively compare as sets. */
-static bool cohabit_check_locked(const stm_extent_index *idx,
-                                    const uint64_t *paddrs, size_t n_paddrs,
-                                    uint64_t gen, uint64_t key_id,
-                                    uint64_t origin_ds, uint64_t origin_ino,
-                                    uint64_t origin_off) {
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        bool any_share = false;
-        for (uint8_t r = 0; r < e->n_replicas; r++) {
-            for (size_t k = 0; k < n_paddrs; k++) {
-                if (e->paddrs[r] == paddrs[k]) { any_share = true; break; }
-            }
-            if (any_share) break;
-        }
-        if (!any_share) continue;
-        /* Sharing detected — must be whole-set with matching tuple. */
-        if (e->n_replicas != (uint8_t)n_paddrs) return false;
-        for (uint8_t r = 0; r < e->n_replicas; r++) {
-            bool found = false;
-            for (size_t k = 0; k < n_paddrs; k++) {
-                if (e->paddrs[r] == paddrs[k]) { found = true; break; }
-            }
-            if (!found) return false;
-        }
-        if (e->gen        != gen)        return false;
-        if (e->key_id     != key_id)     return false;
-        if (e->origin_dataset_id != origin_ds)  return false;
-        if (e->origin_ino        != origin_ino) return false;
-        if (e->origin_off        != origin_off) return false;
-    }
-    return true;
-}
-
-/* Grow the records array if needed and append `rec`. Returns STM_OK
- * on success or STM_ENOMEM. */
-static stm_status append_record_locked(stm_extent_index *idx,
-                                          const stm_extent_record *rec) {
-    if (idx->n_records == idx->cap_records) {
-        size_t new_cap = idx->cap_records == 0 ? 8u : idx->cap_records * 2u;
-        stm_extent_record *new_buf = realloc(idx->records,
-                                                new_cap * sizeof(stm_extent_record));
-        if (!new_buf) return STM_ENOMEM;
-        idx->records     = new_buf;
-        idx->cap_records = new_cap;
-    }
-    idx->records[idx->n_records++] = *rec;
-    return STM_OK;
-}
-
-/*
- * Compact records: flatten every dropped record's replica set into
- * out_paddrs (size = sum of n_replicas across dropped records), then
- * remove those records. drop_indices is sorted ascending. Caller owns
- * out_paddrs (already malloc'd of total-replica size).
+ * candidate.paddrs (their replica sets are equal as sets).
  *
- * Returns the count written to out_paddrs.
- */
-static size_t remove_indices_locked(stm_extent_index *idx,
-                                       const size_t *drop_indices, size_t n_drops,
-                                       uint64_t *out_paddrs) {
-    /* Flatten dropped paddrs. Each dropped extent contributes
-     * n_replicas paddrs, in slot-index order. */
-    size_t out_idx = 0;
-    for (size_t i = 0; i < n_drops; i++) {
-        const stm_extent_record *e = &idx->records[drop_indices[i]];
-        for (uint8_t r = 0; r < e->n_replicas; r++) {
-            out_paddrs[out_idx++] = e->paddrs[r];
-        }
-    }
-
-    /* Two-finger compact: skip indices in drop_indices, copy survivors
-     * forward. drop_indices is sorted ascending by construction. */
-    size_t write_idx = 0;
-    size_t drop_cursor = 0;
-    for (size_t read_idx = 0; read_idx < idx->n_records; read_idx++) {
-        if (drop_cursor < n_drops && drop_indices[drop_cursor] == read_idx) {
-            drop_cursor++;
-            continue;
-        }
-        if (write_idx != read_idx) {
-            idx->records[write_idx] = idx->records[read_idx];
-        }
-        write_idx++;
-    }
-    idx->n_records = write_idx;
-    return out_idx;
+ * NOTE: cross-(ds, ino) global scan. See ex_global_check_ctx for the
+ * perf rationale. */
+static stm_status cohabit_check_global_locked(stm_extent_index *idx,
+                                              const uint64_t *paddrs, size_t n_paddrs,
+                                              uint64_t gen, uint64_t key_id,
+                                              uint64_t origin_ds, uint64_t origin_ino,
+                                              uint64_t origin_off,
+                                              bool *out_ok) {
+    *out_ok = true;
+    ex_global_check_ctx gc = {0};
+    gc.cohabit_active     = true;
+    gc.cand_paddrs        = paddrs;
+    gc.n_cand             = n_paddrs;
+    gc.cand_gen           = gen;
+    gc.cand_key_id        = key_id;
+    gc.cand_origin_ds     = origin_ds;
+    gc.cand_origin_ino    = origin_ino;
+    gc.cand_origin_off    = origin_off;
+    gc.cohabit_ok         = true;
+    stm_status ss = stm_btree_engine_scan(idx->eng, ex_global_check_cb, &gc);
+    if (ss != STM_OK) return ss;
+    if (gc.err != STM_OK) return gc.err;
+    *out_ok = gc.cohabit_ok;
+    return STM_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -306,7 +573,11 @@ stm_status stm_extent_index_create(uint64_t current_txg,
         free(idx);
         return STM_ENOMEM;
     }
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK) != 0) {
+        pthread_mutexattr_destroy(&attr);
+        free(idx);
+        return STM_ENOMEM;
+    }
     int mr = pthread_mutex_init(&idx->lock, &attr);
     pthread_mutexattr_destroy(&attr);
     if (mr != 0) {
@@ -315,10 +586,6 @@ stm_status stm_extent_index_create(uint64_t current_txg,
     }
 
     idx->current_txg = current_txg;
-    /* Mark dirty so the first commit persists even when no extents
-     * have been written — matches the dataset / snapshot pattern.
-     * The empty btree write makes ub_extent_root non-zero. */
-    idx->dirty       = true;
     *out = idx;
     return STM_OK;
 }
@@ -326,7 +593,14 @@ stm_status stm_extent_index_create(uint64_t current_txg,
 void stm_extent_index_close(stm_extent_index *idx) {
     if (!idx) return;
     pthread_mutex_destroy(&idx->lock);
-    free(idx->records);
+    /* NULL-safe; an un-finalized flush is implicitly aborted (the
+     * flushed-but-unrooted paddrs are handed back to the allocator).
+     * The monolithic stm_extent_index_commit uses the single-shot engine
+     * commit (no pending window); the three-phase _commit_flush /
+     * _finalize / _abort trio pairs every flush with a finalize-or-abort
+     * in stm_sync_commit. The implicit abort here is defense-in-depth
+     * for a destroy that races a buggy mid-flush caller. */
+    stm_btree_engine_destroy(idx->eng);
     free(idx);
 }
 
@@ -347,7 +621,7 @@ stm_status stm_extent_index_advance_txg(stm_extent_index *idx,
     /* Equal value is no-op; only strict regression refused.
      * current_txg is NOT persisted as a standalone field — load_at
      * recomputes it from max(write_gen) — so advance_txg doesn't
-     * flip dirty. Matches snapshot.c's pattern. */
+     * need to dirty the engine. */
     if (new_txg < idx->current_txg) {
         must_unlock(&idx->lock);
         return STM_EINVAL;
@@ -358,7 +632,7 @@ stm_status stm_extent_index_advance_txg(stm_extent_index *idx,
 }
 
 /* ------------------------------------------------------------------ */
-/* Mutators: Write / Overwrite / Truncate / DeleteFile.                */
+/* Writes — fresh extent / overwrite (drop overlap, insert new).        */
 /* ------------------------------------------------------------------ */
 
 stm_status stm_extent_write(stm_extent_index *idx,
@@ -375,16 +649,39 @@ stm_status stm_extent_write(stm_extent_index *idx,
     if (off > UINT64_MAX - len) return STM_EOVERFLOW;
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
 
     if (write_gen > idx->current_txg) {
         must_unlock(&idx->lock);
         return STM_EINVAL;                       /* BirthTxgBound */
     }
-    if (any_paddr_in_use_locked(idx, paddrs, n_paddrs)) {
+
+    /* LiveReplicasDisjoint (cross-(ds, ino) global scan).
+     * extent.tla guarantees PaddrFreshness across the entire pool; we
+     * mirror that at the runtime check site. */
+    bool collision = false;
+    stm_status ps = any_paddr_in_use_global_locked(idx, paddrs, n_paddrs,
+                                                     &collision);
+    if (ps != STM_OK) {
         must_unlock(&idx->lock);
-        return STM_EEXIST;                       /* LiveReplicasDisjoint */
+        return ps;
     }
-    if (overlap_in_ino_locked(idx, dataset_id, ino, off, len)) {
+    if (collision) {
+        must_unlock(&idx->lock);
+        return STM_EEXIST;
+    }
+
+    bool overlap = false;
+    stm_status os = overlap_in_ino_locked(idx, dataset_id, ino, off, len,
+                                            &overlap);
+    if (os != STM_OK) {
+        must_unlock(&idx->lock);
+        return os;
+    }
+    if (overlap) {
         must_unlock(&idx->lock);
         return STM_EEXIST;                       /* NoOverlapWithinIno */
     }
@@ -405,10 +702,9 @@ stm_status stm_extent_write(stm_extent_index *idx,
     };
     for (size_t i = 0; i < n_paddrs; i++) rec.paddrs[i] = paddrs[i];
     /* P7-CAS: content_hash zeroed by initializer for HOT extents. */
-    stm_status as = append_record_locked(idx, &rec);
-    if (as == STM_OK) idx->dirty = true;
+    stm_status pr = ex_engine_put(idx, &rec);
     must_unlock(&idx->lock);
-    return as;
+    return pr;
 }
 
 stm_status stm_extent_overwrite(stm_extent_index *idx,
@@ -419,10 +715,7 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
                                   uint64_t write_gen, uint64_t key_id,
                                   uint64_t **out_dropped_paddrs,
                                   size_t *out_n_dropped) {
-    /* R34 P2-1: zero out-args before any early return so the header
-     * "On failure, *out_dropped_paddrs is NULL and *out_n_dropped is
-     * 0" contract holds even when idx==NULL but the out-arg pointers
-     * are valid. */
+    /* R34 P2-1: zero out-args before any early return. */
     if (!out_dropped_paddrs || !out_n_dropped) return STM_EINVAL;
     *out_dropped_paddrs = NULL;
     *out_n_dropped      = 0;
@@ -434,107 +727,136 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
     if (off > UINT64_MAX - len) return STM_EOVERFLOW;
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
 
     if (write_gen > idx->current_txg) {
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
 
-    /* First pass: collect indices of overlapping extents in (ds, ino).
-     * Cycle check: no new replica paddr may match any paddr in any
-     * to-be-dropped extent's replica set (caller bug — overwrite
-     * can't reuse a paddr it's dropping; allocator.tla::
-     * NoReuseInSameGen forbids it for the alloc-issuance side). */
-    size_t *drop_idx = NULL;
-    size_t  n_drops  = 0;
-    size_t  cap      = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+    /* Collect every record under (ds, ino). Single scan_range — we then
+     * partition into drop-set (overlapping with [off, off+len)) and
+     * survivor-set. */
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked(idx, dataset_id, ino, &c);
+    if (cs != STM_OK) {
+        must_unlock(&idx->lock);
+        return cs;
+    }
+
+    /* First pass: validate the drop set + check for paddr cycle. */
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
         if (!ranges_overlap(e->off, e->len, off, len)) continue;
+        /* Cycle check: no new replica paddr may match any paddr in any
+         * to-be-dropped extent's replica set (caller bug — overwrite
+         * can't reuse a paddr it's dropping; allocator.tla::
+         * NoReuseInSameGen forbids it for the alloc-issuance side). */
         for (size_t k = 0; k < n_new_paddrs; k++) {
             for (uint8_t r = 0; r < e->n_replicas; r++) {
                 if (e->paddrs[r] == new_paddrs[k]) {
-                    free(drop_idx);
+                    ex_collect_free(&c);
                     must_unlock(&idx->lock);
-                    return STM_EINVAL;           /* cycle */
+                    return STM_EINVAL;
                 }
             }
         }
-        if (n_drops == cap) {
-            size_t new_cap = cap == 0 ? 4u : cap * 2u;
-            size_t *grown = realloc(drop_idx, new_cap * sizeof(size_t));
-            if (!grown) {
-                free(drop_idx);
-                must_unlock(&idx->lock);
-                return STM_ENOMEM;
-            }
-            drop_idx = grown;
-            cap = new_cap;
-        }
-        drop_idx[n_drops++] = i;
     }
 
-    /* LiveReplicasDisjoint on new_paddrs: none may collide with any
-     * surviving (non-dropped) live extent's replica set. The drop set
-     * is already cycle-checked above. */
-    for (size_t k = 0; k < n_new_paddrs; k++) {
-        bool in_drop = false;
-        for (size_t i = 0; i < n_drops && !in_drop; i++) {
-            const stm_extent_record *e = &idx->records[drop_idx[i]];
-            for (uint8_t r = 0; r < e->n_replicas; r++) {
-                if (e->paddrs[r] == new_paddrs[k]) { in_drop = true; break; }
-            }
-        }
-        if (!in_drop && paddr_in_use_locked(idx, new_paddrs[k])) {
-            free(drop_idx);
+    /* Build the (ds, ino, off) skip-set: the to-be-dropped records'
+     * keys. LiveReplicasDisjoint runs as a global scan that EXCLUDES
+     * these (their paddrs are about to be freed, so the candidate may
+     * legitimately reuse a paddr they hold). */
+    size_t total_drops = 0;
+    size_t n_drops     = 0;
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
+        if (!ranges_overlap(e->off, e->len, off, len)) continue;
+        total_drops += e->n_replicas;
+        n_drops++;
+    }
+    uint64_t *skip_keys = NULL;
+    if (n_drops > 0) {
+        skip_keys = malloc(n_drops * 3 * sizeof *skip_keys);
+        if (!skip_keys) {
+            ex_collect_free(&c);
             must_unlock(&idx->lock);
-            return STM_EEXIST;
+            return STM_ENOMEM;
+        }
+        size_t ski = 0;
+        for (size_t i = 0; i < c.n; i++) {
+            const stm_extent_record *e = &c.records[i];
+            if (!ranges_overlap(e->off, e->len, off, len)) continue;
+            skip_keys[ski * 3 + 0] = e->dataset_id;
+            skip_keys[ski * 3 + 1] = e->ino;
+            skip_keys[ski * 3 + 2] = e->off;
+            ski++;
         }
     }
 
-    /* Total replicas across dropped extents — buffer size for the
-     * flattened drop set. */
-    size_t total_drops = total_replicas_in_drop_set(idx, drop_idx, n_drops);
+    /* Global scan: collision iff any new_paddr is in an existing
+     * extent's replica set AND that extent is not in the skip set. */
+    ex_global_check_ctx gc = {0};
+    gc.probe_paddrs = new_paddrs;
+    gc.n_probe      = n_new_paddrs;
+    gc.skip_keys    = skip_keys;
+    gc.n_skip       = n_drops;
+    gc.cohabit_ok   = true;
+    stm_status gss = stm_btree_engine_scan(idx->eng, ex_global_check_cb, &gc);
+    if (gss != STM_OK || gc.err != STM_OK || gc.collision) {
+        free(skip_keys);
+        ex_collect_free(&c);
+        must_unlock(&idx->lock);
+        if (gss != STM_OK)    return gss;
+        if (gc.err != STM_OK) return gc.err;
+        return STM_EEXIST;
+    }
+    free(skip_keys);
 
     /* Allocate the dropped-paddr buffer (if any drops). */
     uint64_t *out_buf = NULL;
     if (total_drops > 0) {
         out_buf = calloc(total_drops, sizeof(uint64_t));
         if (!out_buf) {
-            free(drop_idx);
+            ex_collect_free(&c);
             must_unlock(&idx->lock);
             return STM_ENOMEM;
         }
     }
 
-    /* Reserve append space BEFORE compacting so post-drop append never
-     * fails (would leave dropped extents removed without the new one
-     * inserted — atomicity violation). */
-    if (idx->n_records - n_drops + 1 > idx->cap_records) {
-        size_t new_cap = idx->cap_records == 0 ? 8u : idx->cap_records * 2u;
-        while (new_cap < idx->n_records - n_drops + 1) new_cap *= 2u;
-        stm_extent_record *grown = realloc(idx->records,
-                                              new_cap * sizeof(stm_extent_record));
-        if (!grown) {
-            free(out_buf);
-            free(drop_idx);
-            must_unlock(&idx->lock);
-            return STM_ENOMEM;
-        }
-        idx->records     = grown;
-        idx->cap_records = new_cap;
-    }
-
-    /* Compact + emit dropped paddrs (flattened across replicas). */
-    size_t emitted = 0;
+    /* Capture drop indices + flattened paddrs from the snapshot. */
+    size_t out_idx = 0;
+    size_t *drop_offs_idx = NULL;
     if (n_drops > 0) {
-        emitted = remove_indices_locked(idx, drop_idx, n_drops, out_buf);
+        drop_offs_idx = malloc(n_drops * sizeof *drop_offs_idx);
+        if (!drop_offs_idx) {
+            free(out_buf);
+            ex_collect_free(&c);
+            must_unlock(&idx->lock);
+            return STM_ENOMEM;
+        }
     }
-    free(drop_idx);
+    size_t drop_cursor = 0;
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
+        if (!ranges_overlap(e->off, e->len, off, len)) continue;
+        drop_offs_idx[drop_cursor++] = i;
+        for (uint8_t r = 0; r < e->n_replicas; r++) {
+            out_buf[out_idx++] = e->paddrs[r];
+        }
+    }
 
-    /* Append the new extent. Capacity reserved above so this can't
-     * fail. */
+    /* Engine mutation. Insert the new record FIRST — if any old key
+     * happens to equal the new (off), upsert replaces it (no need to
+     * delete that one separately). Then delete remaining drops whose
+     * keys differ from the new record's (off).
+     *
+     * If the engine_insert fails: nothing was committed; abort with
+     * the failure status. The snapshot is freed; the engine remains
+     * exactly as it was. */
     stm_extent_record rec = {
         .dataset_id = dataset_id, .ino = ino,
         .off = off, .len = len,
@@ -551,76 +873,168 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         .link_gen          = write_gen,
     };
     for (size_t i = 0; i < n_new_paddrs; i++) rec.paddrs[i] = new_paddrs[i];
-    /* P7-CAS: content_hash zeroed by initializer for HOT extents. */
-    idx->records[idx->n_records++] = rec;
+
+    stm_status ps = ex_engine_put(idx, &rec);
+    if (ps != STM_OK) {
+        free(out_buf);
+        free(drop_offs_idx);
+        ex_collect_free(&c);
+        must_unlock(&idx->lock);
+        return ps;
+    }
+
+    /* Delete drops whose key.off differs from the new record's off (the
+     * same-off drop was replaced by the upsert above). On engine_delete
+     * failure we have torn state — pre-4d the in-RAM impl couldn't fail
+     * here either; post-4d the failure surface is STM_EBUSY (pending-
+     * commit window — never happens under the FS lock discipline) /
+     * STM_ENOMEM (defensive). Return the status verbatim; stm_sync_commit
+     * will wedge on the next commit attempt if the engine state is
+     * inconsistent. */
+    stm_status last_ds = STM_OK;
+    for (size_t i = 0; i < n_drops; i++) {
+        const stm_extent_record *e = &c.records[drop_offs_idx[i]];
+        if (e->off == off) continue;            /* upsert already handled */
+        stm_status ds = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
+        if (ds != STM_OK) last_ds = ds;
+    }
+    free(drop_offs_idx);
+    ex_collect_free(&c);
 
     *out_dropped_paddrs = out_buf;
-    *out_n_dropped      = emitted;
-    idx->dirty = true;
+    *out_n_dropped      = out_idx;
     must_unlock(&idx->lock);
-    return STM_OK;
+    return last_ds;
 }
 
-/* Common driver for Truncate / DeleteFile: collect drops by predicate,
- * compact, emit paddrs to caller. `keep_at_or_below` semantics:
- *   - For Truncate(new_size): drop extents with off ≥ new_size.
- *   - For DeleteFile: drop all extents (predicate matches everything in
- *     (ds, ino)).
+/* ------------------------------------------------------------------ */
+/* Predicate-drop driver — shared by truncate / delete_file /          */
+/* truncate_into / punch_range.                                         */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    bool       have_delete_all;
+    uint64_t   threshold;        /* drop records whose off ≥ threshold */
+    bool       have_punch_range; /* drop records FULLY inside [off, off+len) */
+    uint64_t   punch_off;
+    uint64_t   punch_end;
+} ex_drop_pred;
+
+static bool ex_drop_pred_matches(const ex_drop_pred *p,
+                                  const stm_extent_record *e) {
+    if (p->have_delete_all) return true;
+    if (p->have_punch_range) {
+        uint64_t e_end = e->off + e->len;
+        return (e->off >= p->punch_off && e_end <= p->punch_end);
+    }
+    /* default: truncate(threshold) — drop off ≥ threshold */
+    return e->off >= p->threshold;
+}
+
+/* Caller holds idx->lock. Collects every (ds, ino) record into a
+ * snapshot, picks the ones matching `pred`, deletes them from the
+ * engine, returns the flattened replica paddrs to the caller.
  *
- * The predicate is encoded by the boolean `delete_all`; if not set,
- * threshold is the truncation off cutoff. Caller already validated
- * args.
- *
- * P7-6: dropped paddrs are flattened across each dropped extent's
- * full replica set.
- */
+ * Allocates *out_paddrs if total > 0. *out_n is the count of paddrs
+ * written. */
 static stm_status drop_by_predicate_locked(stm_extent_index *idx,
                                               uint64_t ds, uint64_t ino,
-                                              bool delete_all,
-                                              uint64_t threshold,
+                                              const ex_drop_pred *pred,
                                               uint64_t **out_paddrs,
                                               size_t *out_n) {
     *out_paddrs = NULL;
     *out_n      = 0;
 
-    size_t *drop_idx = NULL;
-    size_t  n_drops  = 0;
-    size_t  cap      = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != ds || e->ino != ino) continue;
-        if (!delete_all && e->off < threshold) continue;
-        if (n_drops == cap) {
-            size_t new_cap = cap == 0 ? 4u : cap * 2u;
-            size_t *grown = realloc(drop_idx, new_cap * sizeof(size_t));
-            if (!grown) {
-                free(drop_idx);
-                return STM_ENOMEM;
-            }
-            drop_idx = grown;
-            cap = new_cap;
-        }
-        drop_idx[n_drops++] = i;
-    }
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked(idx, ds, ino, &c);
+    if (cs != STM_OK) return cs;
 
+    size_t n_drops = 0;
+    size_t total_replicas = 0;
+    for (size_t i = 0; i < c.n; i++) {
+        if (!ex_drop_pred_matches(pred, &c.records[i])) continue;
+        n_drops++;
+        total_replicas += c.records[i].n_replicas;
+    }
     if (n_drops == 0) {
-        free(drop_idx);
+        ex_collect_free(&c);
         return STM_OK;
     }
 
-    size_t total_drops = total_replicas_in_drop_set(idx, drop_idx, n_drops);
-    uint64_t *paddrs = calloc(total_drops, sizeof(uint64_t));
-    if (!paddrs) {
-        free(drop_idx);
-        return STM_ENOMEM;
+    uint64_t *paddrs = NULL;
+    if (total_replicas > 0) {
+        paddrs = calloc(total_replicas, sizeof(uint64_t));
+        if (!paddrs) {
+            ex_collect_free(&c);
+            return STM_ENOMEM;
+        }
     }
 
-    size_t emitted = remove_indices_locked(idx, drop_idx, n_drops, paddrs);
-    free(drop_idx);
+    size_t pidx = 0;
+    stm_status last_ds = STM_OK;
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
+        if (!ex_drop_pred_matches(pred, e)) continue;
+        for (uint8_t r = 0; r < e->n_replicas; r++) {
+            paddrs[pidx++] = e->paddrs[r];
+        }
+        stm_status ds_ = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
+        if (ds_ != STM_OK) last_ds = ds_;
+    }
+    ex_collect_free(&c);
 
     *out_paddrs = paddrs;
-    *out_n      = emitted;
-    return STM_OK;
+    *out_n      = pidx;
+    return last_ds;
+}
+
+/* Predicate-drop variant for stm_extent_truncate_into — uses caller-
+ * provided pre-allocated buffers and never allocates. Returns STM_ERANGE
+ * if either cap is insufficient (atomic — index unchanged on ERANGE). */
+static stm_status drop_by_predicate_into_locked(stm_extent_index *idx,
+                                                  uint64_t ds, uint64_t ino,
+                                                  const ex_drop_pred *pred,
+                                                  size_t *drop_idx_buf,
+                                                  size_t drop_idx_cap,
+                                                  uint64_t *paddrs_buf,
+                                                  size_t paddrs_cap,
+                                                  size_t *out_n_dropped) {
+    *out_n_dropped = 0;
+
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked(idx, ds, ino, &c);
+    if (cs != STM_OK) return cs;
+
+    size_t n_drops = 0;
+    size_t total_replicas = 0;
+    for (size_t i = 0; i < c.n; i++) {
+        if (!ex_drop_pred_matches(pred, &c.records[i])) continue;
+        if (n_drops >= drop_idx_cap) { ex_collect_free(&c); return STM_ERANGE; }
+        drop_idx_buf[n_drops++] = i;          /* indices into c.records */
+        total_replicas += c.records[i].n_replicas;
+    }
+    if (total_replicas > paddrs_cap) {
+        ex_collect_free(&c);
+        return STM_ERANGE;
+    }
+    if (n_drops == 0) {
+        ex_collect_free(&c);
+        return STM_OK;
+    }
+
+    size_t pidx = 0;
+    stm_status last_ds = STM_OK;
+    for (size_t i = 0; i < n_drops; i++) {
+        const stm_extent_record *e = &c.records[drop_idx_buf[i]];
+        for (uint8_t r = 0; r < e->n_replicas; r++) {
+            paddrs_buf[pidx++] = e->paddrs[r];
+        }
+        stm_status ds_ = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
+        if (ds_ != STM_OK) last_ds = ds_;
+    }
+    ex_collect_free(&c);
+    *out_n_dropped = pidx;
+    return last_ds;
 }
 
 stm_status stm_extent_truncate(stm_extent_index *idx,
@@ -636,12 +1050,16 @@ stm_status stm_extent_truncate(stm_extent_index *idx,
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
 
     must_lock(&idx->lock);
-    stm_status rs = drop_by_predicate_locked(idx, dataset_id, ino,
-                                                /*delete_all=*/false,
-                                                /*threshold=*/new_size,
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    ex_drop_pred pred = { .have_delete_all = false, .threshold = new_size,
+                            .have_punch_range = false,
+                            .punch_off = 0, .punch_end = 0 };
+    stm_status rs = drop_by_predicate_locked(idx, dataset_id, ino, &pred,
                                                 out_dropped_paddrs,
                                                 out_n_dropped);
-    if (rs == STM_OK && *out_n_dropped > 0) idx->dirty = true;
     must_unlock(&idx->lock);
     return rs;
 }
@@ -652,8 +1070,7 @@ stm_status stm_extent_truncate_peek(const stm_extent_index *idx,
                                        uint64_t new_size,
                                        size_t *out_n_extents,
                                        size_t *out_n_replicas_total) {
-    /* R44 P3-4: zero out-args before any early return — matches the
-     * R34 P2-1 precedent in stm_extent_truncate / _delete_file. */
+    /* R44 P3-4: zero out-args before any early return. */
     if (!out_n_extents || !out_n_replicas_total) return STM_EINVAL;
     *out_n_extents        = 0;
     *out_n_replicas_total = 0;
@@ -662,57 +1079,25 @@ stm_status stm_extent_truncate_peek(const stm_extent_index *idx,
 
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+    if (!idx->eng) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked((stm_extent_index *)idx,
+                                              dataset_id, ino, &c);
+    if (cs != STM_OK) {
+        must_unlock(lock);
+        return cs;
+    }
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
         if (e->off < new_size) continue;
         (*out_n_extents)++;
         *out_n_replicas_total += e->n_replicas;
     }
+    ex_collect_free(&c);
     must_unlock(lock);
-    return STM_OK;
-}
-
-/* P7-12: drop_by_predicate variant that uses caller-provided
- * pre-allocated buffers and never allocates. Returns STM_ERANGE if
- * either cap is insufficient (atomic — index unchanged on ERANGE).
- *
- * Caller already holds idx->lock. */
-static stm_status drop_by_predicate_into_locked(stm_extent_index *idx,
-                                                  uint64_t ds, uint64_t ino,
-                                                  bool delete_all,
-                                                  uint64_t threshold,
-                                                  size_t *drop_idx_buf,
-                                                  size_t drop_idx_cap,
-                                                  uint64_t *paddrs_buf,
-                                                  size_t paddrs_cap,
-                                                  size_t *out_n_dropped) {
-    *out_n_dropped = 0;
-
-    /* First pass: collect drop indices into the caller-provided
-     * scratch buffer. STM_ERANGE if cap is too small — index
-     * unchanged. */
-    size_t n_drops = 0;
-    size_t n_replicas_needed = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != ds || e->ino != ino) continue;
-        if (!delete_all && e->off < threshold) continue;
-        if (n_drops >= drop_idx_cap) return STM_ERANGE;
-        drop_idx_buf[n_drops++] = i;
-        n_replicas_needed += e->n_replicas;
-    }
-
-    if (n_replicas_needed > paddrs_cap) return STM_ERANGE;
-
-    if (n_drops == 0) return STM_OK;
-
-    /* Second phase: compact + emit paddrs. Reuses the existing
-     * helper. The helper expects out_paddrs sized to the total
-     * replicas — verified above. */
-    size_t emitted = remove_indices_locked(idx, drop_idx_buf, n_drops,
-                                              paddrs_buf);
-    *out_n_dropped = emitted;
     return STM_OK;
 }
 
@@ -733,13 +1118,17 @@ stm_status stm_extent_truncate_into(stm_extent_index *idx,
     if (paddrs_cap   > 0 && !paddrs_buf)   return STM_EINVAL;
 
     must_lock(&idx->lock);
-    stm_status rs = drop_by_predicate_into_locked(idx, dataset_id, ino,
-                                                     /*delete_all=*/false,
-                                                     /*threshold=*/new_size,
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    ex_drop_pred pred = { .have_delete_all = false, .threshold = new_size,
+                            .have_punch_range = false,
+                            .punch_off = 0, .punch_end = 0 };
+    stm_status rs = drop_by_predicate_into_locked(idx, dataset_id, ino, &pred,
                                                      drop_idx_buf, drop_idx_cap,
                                                      paddrs_buf, paddrs_cap,
                                                      out_n_dropped);
-    if (rs == STM_OK && *out_n_dropped > 0) idx->dirty = true;
     must_unlock(&idx->lock);
     return rs;
 }
@@ -756,12 +1145,16 @@ stm_status stm_extent_delete_file(stm_extent_index *idx,
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
 
     must_lock(&idx->lock);
-    stm_status rs = drop_by_predicate_locked(idx, dataset_id, ino,
-                                                /*delete_all=*/true,
-                                                /*threshold=*/0,
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    ex_drop_pred pred = { .have_delete_all = true, .threshold = 0,
+                            .have_punch_range = false,
+                            .punch_off = 0, .punch_end = 0 };
+    stm_status rs = drop_by_predicate_locked(idx, dataset_id, ino, &pred,
                                                 out_dropped_paddrs,
                                                 out_n_dropped);
-    if (rs == STM_OK && *out_n_dropped > 0) idx->dirty = true;
     must_unlock(&idx->lock);
     return rs;
 }
@@ -783,77 +1176,62 @@ stm_status stm_extent_punch_range(stm_extent_index *idx,
     if (off > UINT64_MAX - len) return STM_EOVERFLOW;
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
 
     /* Pre-check: refuse if any extent crosses either boundary. */
     uint64_t r_end = off + len;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked(idx, dataset_id, ino, &c);
+    if (cs != STM_OK) {
+        must_unlock(&idx->lock);
+        return cs;
+    }
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
         uint64_t e_end = e->off + e->len;
         bool overlaps = (e->off < r_end && e_end > off);
         if (!overlaps) continue;
         bool fully_in = (e->off >= off && e_end <= r_end);
         if (!fully_in) {
+            ex_collect_free(&c);
             must_unlock(&idx->lock);
             return STM_ENOTSUPPORTED;
         }
     }
+    ex_collect_free(&c);
 
-    /* Collect drop indices. */
-    size_t *drop_idx = NULL;
-    size_t  n_drops  = 0;
-    size_t  cap      = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != dataset_id || e->ino != ino) continue;
-        uint64_t e_end = e->off + e->len;
-        bool fully_in = (e->off >= off && e_end <= r_end);
-        if (!fully_in) continue;
-        if (n_drops == cap) {
-            size_t new_cap = cap == 0 ? 4u : cap * 2u;
-            if (new_cap > SIZE_MAX / sizeof(size_t)) {
-                free(drop_idx);
-                must_unlock(&idx->lock);
-                return STM_ENOMEM;
-            }
-            size_t *grown = realloc(drop_idx, new_cap * sizeof(size_t));
-            if (!grown) {
-                free(drop_idx);
-                must_unlock(&idx->lock);
-                return STM_ENOMEM;
-            }
-            drop_idx = grown;
-            cap = new_cap;
-        }
-        drop_idx[n_drops++] = i;
-    }
-    if (n_drops == 0) {
-        free(drop_idx);
-        must_unlock(&idx->lock);
-        return STM_OK;
-    }
-
-    size_t total = total_replicas_in_drop_set(idx, drop_idx, n_drops);
-    uint64_t *paddrs = calloc(total, sizeof(uint64_t));
-    if (!paddrs) {
-        free(drop_idx);
-        must_unlock(&idx->lock);
-        return STM_ENOMEM;
-    }
-    size_t emitted = remove_indices_locked(idx, drop_idx, n_drops, paddrs);
-    free(drop_idx);
-
-    *out_dropped_paddrs = paddrs;
-    *out_n_dropped_paddrs = emitted;
-    idx->dirty = true;
+    /* Pre-check passed — delegate to the predicate-drop driver with
+     * punch_range semantics. */
+    ex_drop_pred pred = { .have_delete_all = false, .threshold = 0,
+                            .have_punch_range = true,
+                            .punch_off = off, .punch_end = r_end };
+    stm_status rs = drop_by_predicate_locked(idx, dataset_id, ino, &pred,
+                                                out_dropped_paddrs,
+                                                out_n_dropped_paddrs);
     must_unlock(&idx->lock);
-    return STM_OK;
+    return rs;
 }
 
 /* P8-POSIX-7b COLLAPSE_RANGE / INSERT_RANGE: shift extent keys at
- * off >= cutoff by the signed `delta`. Updates records[] in place;
- * persistence happens at next commit (the btree is rebuilt from
- * records[]). */
+ * off >= cutoff by the signed `delta`.
+ *
+ * Engine-backed posture: scan + collect every (ds, ino) record, validate
+ * preconditions, then for each shifted record: delete-old + insert-new.
+ * If delete fails mid-loop, we accept torn state (matches the pre-4d
+ * in-place pointer-walk's implicit atomicity — neither impl rolls back
+ * on a mid-shift failure). The engine_insert is failure-atomic per the
+ * engine contract, and the delete failure surface is STM_EBUSY (never
+ * fires under FS lock discipline) / STM_ENOMEM.
+ *
+ * Order: we must delete BEFORE insert when shifting up (positive delta)
+ * because the new key may collide with a yet-to-be-shifted record;
+ * conversely we must delete BEFORE insert when shifting down as well
+ * (otherwise the new key may collide with a yet-to-be-shifted record
+ * higher in the chain). Simplest: collect → delete every shifted
+ * record → insert at new offset. */
 stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
                                             uint64_t dataset_id, uint64_t ino,
                                             uint64_t cutoff,
@@ -863,12 +1241,22 @@ stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
     if (delta == 0) return STM_EINVAL;
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked(idx, dataset_id, ino, &c);
+    if (cs != STM_OK) {
+        must_unlock(&idx->lock);
+        return cs;
+    }
 
     /* Validate preconditions across all (ds, ino) extents BEFORE
      * mutating anything. */
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
         uint64_t e_end = e->off + e->len;
 
         if (delta < 0) {
@@ -878,6 +1266,7 @@ stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
              * punched). Equivalently, no extent may overlap that
              * range. */
             if (cutoff < adelta) {
+                ex_collect_free(&c);
                 must_unlock(&idx->lock);
                 return STM_EINVAL;
             }
@@ -885,12 +1274,14 @@ stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
             if (e->off < cutoff && e_end > hole_start) {
                 /* Extent overlaps the hole — caller must clear it
                  * (e.g., via stm_extent_punch_range) before shifting. */
+                ex_collect_free(&c);
                 must_unlock(&idx->lock);
                 return STM_ENOTSUPPORTED;
             }
             /* Below the hole: untouched. Above cutoff: shift down by
              * adelta. Range underflow guard. */
             if (e->off >= cutoff && e->off < adelta) {
+                ex_collect_free(&c);
                 must_unlock(&idx->lock);
                 return STM_EINVAL;
             }
@@ -900,36 +1291,44 @@ stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
              * untouched. At/above cutoff: shift up by adelta —
              * shifted end MUST NOT overflow uint64_t. */
             if (e->off < cutoff && e_end > cutoff) {
+                ex_collect_free(&c);
                 must_unlock(&idx->lock);
                 return STM_ENOTSUPPORTED;
             }
             if (e->off >= cutoff && e->off > UINT64_MAX - adelta) {
+                ex_collect_free(&c);
                 must_unlock(&idx->lock);
                 return STM_EOVERFLOW;
             }
             if (e->off >= cutoff && e_end > UINT64_MAX - adelta) {
+                ex_collect_free(&c);
                 must_unlock(&idx->lock);
                 return STM_EOVERFLOW;
             }
         }
     }
 
-    /* Apply shift in place — preconditions check passed for all
-     * (ds, ino) extents above. */
-    for (size_t i = 0; i < idx->n_records; i++) {
-        stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+    /* Apply shift: for each record at off ≥ cutoff, delete old key +
+     * insert at shifted offset. Records below cutoff are untouched. */
+    stm_status last_status = STM_OK;
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
         if (e->off < cutoff) continue;
+        stm_status ds_ = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
+        if (ds_ != STM_OK) { last_status = ds_; continue; }
+        stm_extent_record nr = *e;
         if (delta < 0) {
             uint64_t adelta = (uint64_t)(-delta);
-            e->off -= adelta;
+            nr.off = e->off - adelta;
         } else {
-            e->off += (uint64_t)delta;
+            nr.off = e->off + (uint64_t)delta;
         }
+        stm_status ps = ex_engine_put(idx, &nr);
+        if (ps != STM_OK) last_status = ps;
     }
-    idx->dirty = true;
+    ex_collect_free(&c);
     must_unlock(&idx->lock);
-    return STM_OK;
+    return last_status;
 }
 
 stm_status stm_extent_reflink(stm_extent_index *idx,
@@ -950,6 +1349,10 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
     if (dst_off > UINT64_MAX - len) return STM_EOVERFLOW;
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
 
     if (gen > idx->current_txg) {
         must_unlock(&idx->lock);
@@ -963,7 +1366,14 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
         return STM_EINVAL;
     }
     /* P7-16: dst-overlap check (NoOverlapWithinIno). */
-    if (overlap_in_ino_locked(idx, dst_dataset_id, dst_ino, dst_off, len)) {
+    bool overlap = false;
+    stm_status os = overlap_in_ino_locked(idx, dst_dataset_id, dst_ino,
+                                            dst_off, len, &overlap);
+    if (os != STM_OK) {
+        must_unlock(&idx->lock);
+        return os;
+    }
+    if (overlap) {
         must_unlock(&idx->lock);
         return STM_EEXIST;
     }
@@ -972,9 +1382,17 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
      * tuple matches the candidate. Catches the partial-overlap and
      * different-origin buggy patterns. link_gen is excluded from the
      * cohabit check — siblings created at different gens still share
-     * legitimately. */
-    if (!cohabit_check_locked(idx, paddrs, n_paddrs, gen, key_id,
-                                 origin_dataset_id, origin_ino, origin_off)) {
+     * legitimately. Cross-(ds, ino) global scan. */
+    bool cohabit_ok = true;
+    stm_status hs = cohabit_check_global_locked(idx, paddrs, n_paddrs,
+                                                  gen, key_id,
+                                                  origin_dataset_id, origin_ino,
+                                                  origin_off, &cohabit_ok);
+    if (hs != STM_OK) {
+        must_unlock(&idx->lock);
+        return hs;
+    }
+    if (!cohabit_ok) {
         must_unlock(&idx->lock);
         return STM_EEXIST;
     }
@@ -993,8 +1411,7 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
     };
     for (size_t i = 0; i < n_paddrs; i++) rec.paddrs[i] = paddrs[i];
     /* P7-CAS: content_hash zeroed by initializer for HOT extents. */
-    stm_status as = append_record_locked(idx, &rec);
-    if (as == STM_OK) idx->dirty = true;
+    stm_status as = ex_engine_put(idx, &rec);
     must_unlock(&idx->lock);
     return as;
 }
@@ -1025,12 +1442,23 @@ stm_status stm_extent_write_cold(stm_extent_index *idx,
     if (!any_nonzero) return STM_EINVAL;
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
 
     if (gen > idx->current_txg)         { must_unlock(&idx->lock); return STM_EINVAL; }
     if (link_gen > idx->current_txg)    { must_unlock(&idx->lock); return STM_EINVAL; }
     if (origin_off > UINT64_MAX - len)  { must_unlock(&idx->lock); return STM_EINVAL; }
 
-    if (overlap_in_ino_locked(idx, dataset_id, ino, off, len)) {
+    bool overlap = false;
+    stm_status os = overlap_in_ino_locked(idx, dataset_id, ino, off, len,
+                                            &overlap);
+    if (os != STM_OK) {
+        must_unlock(&idx->lock);
+        return os;
+    }
+    if (overlap) {
         must_unlock(&idx->lock);
         return STM_EEXIST;
     }
@@ -1050,13 +1478,14 @@ stm_status stm_extent_write_cold(stm_extent_index *idx,
     /* paddrs[] zeroed by initializer; content_hash copied in. */
     memcpy(rec.content_hash, content_hash, STM_EXTENT_HASH_LEN);
 
-    stm_status as = append_record_locked(idx, &rec);
-    if (as == STM_OK) idx->dirty = true;
+    stm_status as = ex_engine_put(idx, &rec);
     must_unlock(&idx->lock);
     return as;
 }
 
-/* P7-CAS-2: atomic hot→cold swap. See header for full contract. */
+/* P7-CAS-2: atomic hot→cold swap. See header for full contract. The
+ * (ds, ino, off) key is unchanged — the swap is an UPSERT replacing the
+ * HOT value with a COLD value at the same key. */
 stm_status stm_extent_migrate_to_cold(stm_extent_index *idx,
                                          uint64_t dataset_id, uint64_t ino,
                                          uint64_t off, uint64_t len,
@@ -1086,25 +1515,23 @@ stm_status stm_extent_migrate_to_cold(stm_extent_index *idx,
     if (!any_nonzero) return STM_EINVAL;
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
 
     if (gen > idx->current_txg)      { must_unlock(&idx->lock); return STM_EINVAL; }
     if (link_gen > idx->current_txg) { must_unlock(&idx->lock); return STM_EINVAL; }
 
-    /* Find the matching HOT extent at (ds, ino, off). NoOverlapWithinIno
-     * guarantees at most one extent matches. */
-    ptrdiff_t found = -1;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id == dataset_id && e->ino == ino && e->off == off) {
-            found = (ptrdiff_t)i;
-            break;
-        }
-    }
-    if (found < 0) {
+    /* Find the matching HOT extent at (ds, ino, off). */
+    stm_extent_record src;
+    bool found = false;
+    stm_status gs = ex_engine_get(idx, dataset_id, ino, off, &src, &found);
+    if (gs != STM_OK) { must_unlock(&idx->lock); return gs; }
+    if (!found) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
-    const stm_extent_record src = idx->records[found];
     if (src.len != len) {
         must_unlock(&idx->lock);
         return STM_EINVAL;            /* partial migrate not modeled */
@@ -1118,10 +1545,14 @@ stm_status stm_extent_migrate_to_cold(stm_extent_index *idx,
         return STM_ECORRUPT;
     }
 
-    /* Atomic swap: drop the HOT record + append the COLD record. We
-     * compact-in-place the dropped slot by copying the new COLD record
-     * over it (no separate insert append needed since cardinality is
-     * preserved). */
+    /* Capture dropped HOT replicas FIRST so the upsert below cannot
+     * lose them. */
+    *out_n_replicas = src.n_replicas;
+    for (uint8_t r = 0; r < src.n_replicas; r++) {
+        out_paddrs[r] = src.paddrs[r];
+    }
+
+    /* Build the COLD replacement and upsert at the same key. */
     stm_extent_record cold_rec = {
         .dataset_id = dataset_id, .ino = ino,
         .off = off, .len = len,
@@ -1137,24 +1568,9 @@ stm_status stm_extent_migrate_to_cold(stm_extent_index *idx,
     /* paddrs[] zeroed by initializer. */
     memcpy(cold_rec.content_hash, content_hash, STM_EXTENT_HASH_LEN);
 
-    /* Capture dropped HOT replicas FIRST (read from src — already
-     * snapshotted above) so the in-place overwrite below cannot lose
-     * them. */
-    *out_n_replicas = src.n_replicas;
-    for (uint8_t r = 0; r < src.n_replicas; r++) {
-        out_paddrs[r] = src.paddrs[r];
-    }
-
-    /* In-place swap: the COLD record occupies the same slot the HOT
-     * record vacated. NoOverlapWithinIno is preserved across the
-     * transition because we never expose a state where the (ds, ino,
-     * [off, off+len)) range is empty — the lock is held across both
-     * the drop and the insert (the assignment IS both atomically). */
-    idx->records[found] = cold_rec;
-    idx->dirty = true;
-
+    stm_status ps = ex_engine_put(idx, &cold_rec);
     must_unlock(&idx->lock);
-    return STM_OK;
+    return ps;
 }
 
 /* P7-CAS-4b: 1-hot-to-N-cold chunked migrate. See header for full
@@ -1202,25 +1618,23 @@ stm_status stm_extent_migrate_to_cold_chunked(
     if (cursor != src_off + src_len) return STM_EINVAL;
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
 
     if (src_gen  > idx->current_txg) { must_unlock(&idx->lock); return STM_EINVAL; }
     if (link_gen > idx->current_txg) { must_unlock(&idx->lock); return STM_EINVAL; }
 
-    /* Find the matching HOT extent at (ds, ino, src_off). NoOverlap-
-     * WithinIno guarantees at most one extent matches. */
-    ptrdiff_t found = -1;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id == dataset_id && e->ino == ino && e->off == src_off) {
-            found = (ptrdiff_t)i;
-            break;
-        }
-    }
-    if (found < 0) {
+    /* Find the matching HOT extent at (ds, ino, src_off). */
+    stm_extent_record src;
+    bool found = false;
+    stm_status gs = ex_engine_get(idx, dataset_id, ino, src_off, &src, &found);
+    if (gs != STM_OK) { must_unlock(&idx->lock); return gs; }
+    if (!found) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
-    const stm_extent_record src = idx->records[found];
     if (src.len != src_len) {
         must_unlock(&idx->lock);
         return STM_EINVAL;            /* partial migrate not modeled */
@@ -1234,45 +1648,19 @@ stm_status stm_extent_migrate_to_cold_chunked(
         return STM_ECORRUPT;
     }
 
-    /* Pre-grow records[] capacity to accommodate n_chunks-1 additional
-     * records (chunk 0 takes the dropped src slot). Growing BEFORE any
-     * mutation guarantees ENOMEM-safety: if realloc fails, the index
-     * is unchanged.
-     *
-     * R53 P3-8: refuse if `n_chunks - 1` would overflow when added to
-     * idx->n_records. n_chunks is bounded by recordsize/STM_UB_SIZE
-     * (= 32 at the v22 128 KiB cap; = 2048 at the v23 8 MiB cap) in
-     * practice; idx->n_records is bounded by RAM. Defense is belt-
-     * and-suspenders against a future relaxation. */
-    if (n_chunks - 1u > SIZE_MAX - idx->n_records) {
-        must_unlock(&idx->lock);
-        return STM_EOVERFLOW;
-    }
-    size_t needed = idx->n_records + (n_chunks - 1);
-    if (needed > idx->cap_records) {
-        size_t new_cap = idx->cap_records == 0 ? 8u : idx->cap_records;
-        while (new_cap < needed) new_cap *= 2u;
-        stm_extent_record *new_buf = realloc(idx->records,
-                                                new_cap * sizeof(stm_extent_record));
-        if (!new_buf) {
-            must_unlock(&idx->lock);
-            return STM_ENOMEM;
-        }
-        idx->records     = new_buf;
-        idx->cap_records = new_cap;
-    }
-
-    /* Capture dropped HOT replicas FIRST (read from src — already
-     * snapshotted above) so the in-place overwrite below cannot lose
-     * them. */
+    /* Capture dropped HOT replicas FIRST so the upserts below cannot
+     * lose them. */
     *out_n_replicas = src.n_replicas;
     for (uint8_t r = 0; r < src.n_replicas; r++) {
         out_paddrs[r] = src.paddrs[r];
     }
 
-    /* Build chunk i's COLD record. R53 P3-4: use `{0}` for paddrs (C99
-     * zero-fills the rest) so this doesn't silently shorten if
-     * STM_EXTENT_MAX_REPLICAS ever changes. */
+    /* Chunk 0 takes the dropped src slot (upsert at src_off REPLACES
+     * the HOT record at the same key). Chunks 1..N-1 are fresh keys
+     * (their off is strictly greater than src_off — no key conflict
+     * with any existing record at (ds, ino) because the source HOT
+     * extent OCCUPIED the entire [src_off, src_off+src_len) range so
+     * no other (ds, ino) record can overlap it by NoOverlapWithinIno). */
     #define BUILD_COLD(i_)                                                     \
         ((stm_extent_record){                                                  \
             .dataset_id        = dataset_id,                                   \
@@ -1291,29 +1679,23 @@ stm_status stm_extent_migrate_to_cold_chunked(
             .content_hash      = {0},                                          \
         })
 
-    /* Chunk 0 takes the dropped src slot (in-place overwrite). */
-    {
-        stm_extent_record c0 = BUILD_COLD(0);
-        memcpy(c0.content_hash, chunks[0].content_hash, STM_EXTENT_HASH_LEN);
-        idx->records[found] = c0;
-    }
-
-    /* Chunks 1..n_chunks-1 append at the end (cardinality grows). */
-    for (size_t i = 1; i < n_chunks; i++) {
+    for (size_t i = 0; i < n_chunks; i++) {
         stm_extent_record ci = BUILD_COLD(i);
         memcpy(ci.content_hash, chunks[i].content_hash, STM_EXTENT_HASH_LEN);
-        idx->records[idx->n_records++] = ci;
+        stm_status ps = ex_engine_put(idx, &ci);
+        if (ps != STM_OK) {
+            must_unlock(&idx->lock);
+            return ps;
+        }
     }
     #undef BUILD_COLD
 
-    idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
 
 /* P7-CAS-17: cross-extent FastCDC at migrate. Atomically replace ALL HOT
- * extents at (ds, ino) with `n_chunks` COLD records tiling the union of
- * the dropped HOT extents' offset range. See header for full contract. */
+ * extents at (ds, ino) with N' COLD chunks tiling the same range. */
 stm_status stm_extent_migrate_whole_ino_to_cold(
         stm_extent_index *idx,
         uint64_t dataset_id, uint64_t ino,
@@ -1322,9 +1704,7 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
         uint64_t link_gen,
         uint64_t **out_dropped_paddrs,
         size_t *out_n_dropped_paddrs) {
-    /* Uniform out-param zero-init contract (R57 P3-5 + R58 P3-1 + R64 P2-1):
-     * defined values for callers observing on STM_EINVAL regardless of
-     * which validation step rejected. */
+    /* Uniform out-param zero-init contract (R57 P3-5 + R58 P3-1 + R64 P2-1). */
     if (out_dropped_paddrs)   *out_dropped_paddrs = NULL;
     if (out_n_dropped_paddrs) *out_n_dropped_paddrs = 0;
 
@@ -1354,256 +1734,190 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
     }
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
 
     if (link_gen > idx->current_txg) {
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
 
-    /* Phase 1: scan records[] for all extents at (ds, ino). Refuse on:
-     *   - any COLD record found (mixed mode → caller falls back to
-     *     per-extent migrate; STM_ENOTSUPPORTED).
-     *   - any non-HOT non-COLD kind (corruption; STM_ECORRUPT).
-     *   - HOT record with bogus n_replicas (STM_ECORRUPT).
-     * Collect indices into a temporary array. */
-    size_t *hot_idxs = NULL;
-    size_t  n_hot    = 0;
-    size_t  cap_hot  = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *r = &idx->records[i];
-        if (r->dataset_id != dataset_id || r->ino != ino) continue;
+    /* Phase 1: collect every (ds, ino) record. Refuse on COLD/corrupt;
+     * gather HOT records. */
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked(idx, dataset_id, ino, &c);
+    if (cs != STM_OK) {
+        must_unlock(&idx->lock);
+        return cs;
+    }
+
+    /* Validate the collected records — every record must be HOT with a
+     * legal replica count. */
+    uint64_t src_gen   = 0;
+    uint64_t src_key_id = 0;
+    uint64_t src_origin_ds  = 0;
+    uint64_t src_origin_ino = 0;
+    uint64_t first_off = 0;
+    bool     first_off_set = false;
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *r = &c.records[i];
         if (r->kind == STM_EXTENT_KIND_COLD) {
-            free(hot_idxs);
+            ex_collect_free(&c);
             must_unlock(&idx->lock);
             return STM_ENOTSUPPORTED;
         }
         if (r->kind != STM_EXTENT_KIND_HOT) {
-            free(hot_idxs);
+            ex_collect_free(&c);
             must_unlock(&idx->lock);
             return STM_ECORRUPT;
         }
         if (r->n_replicas < 1 || r->n_replicas > STM_EXTENT_MAX_REPLICAS) {
-            free(hot_idxs);
+            ex_collect_free(&c);
             must_unlock(&idx->lock);
             return STM_ECORRUPT;
         }
-        if (n_hot == cap_hot) {
-            size_t  new_cap = cap_hot == 0 ? 8u : cap_hot * 2u;
-            size_t *grown   = realloc(hot_idxs, new_cap * sizeof(size_t));
-            if (!grown) {
-                free(hot_idxs);
-                must_unlock(&idx->lock);
-                return STM_ENOMEM;
-            }
-            hot_idxs = grown;
-            cap_hot  = new_cap;
+        if (!first_off_set || r->off < first_off) {
+            first_off = r->off;
+            first_off_set = true;
+            /* All HOT records under the same (ds, ino) created by the
+             * compound write path share gen/key_id/origin_* tuples
+             * (extent.tla::OriginConsistentInBounds + R48 P0-1
+             * link_gen). Capture from the first encountered record;
+             * defense-in-depth equality check follows below. */
+            src_gen        = r->gen;
+            src_key_id     = r->key_id;
+            src_origin_ds  = r->origin_dataset_id;
+            src_origin_ino = r->origin_ino;
         }
-        hot_idxs[n_hot++] = i;
     }
-    if (n_hot == 0) {
-        free(hot_idxs);
+    if (c.n == 0) {
+        ex_collect_free(&c);
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
+    /* Defense-in-depth: every collected HOT record shares (gen, key_id,
+     * origin_ds, origin_ino). If a buggy producer broke that invariant
+     * we'd see a divergent record here. */
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *r = &c.records[i];
+        if (r->gen != src_gen) { ex_collect_free(&c); must_unlock(&idx->lock); return STM_ECORRUPT; }
+        if (r->key_id != src_key_id) { ex_collect_free(&c); must_unlock(&idx->lock); return STM_ECORRUPT; }
+        if (r->origin_dataset_id != src_origin_ds) { ex_collect_free(&c); must_unlock(&idx->lock); return STM_ECORRUPT; }
+        if (r->origin_ino != src_origin_ino) { ex_collect_free(&c); must_unlock(&idx->lock); return STM_ECORRUPT; }
+    }
 
-    /* Phase 2: build an off-sorted VIEW for contiguity validation in
-     * Phase 3 + 4. We must NOT reorder hot_idxs itself: Phase 7's
-     * swap-erase requires hot_idxs to be in INDEX-ascending order so
-     * descending iteration processes highest indices first (the
-     * scan-order from Phase 1 is already index-ascending). Reordering
-     * hot_idxs by off would let off-sorted-but-index-mixed entries
-     * trick the swap-erase into clobbering non-target records and
-     * leaving target HOTs surviving.
-     *
-     * R68 P0 fix: an earlier impl sorted hot_idxs by off here, which
-     * caused the swap-erase to leave stale HOT records when off-order
-     * and index-order didn't match (e.g., descending-off writes
-     * interleaved with writes to other inos). Caller would deref the
-     * collected paddrs while the surviving stale HOTs still claimed
-     * them — refcount-violating dual ownership + NoOverlapWithinIno
-     * violated by the appended COLD chunks overlapping the survivors.
-     * Build a separate (off, len) pair array for contiguity validation
-     * and leave hot_idxs alone. */
-    struct off_len_pair {
-        uint64_t off;
-        uint64_t len;
-    };
-    struct off_len_pair *off_view = malloc(n_hot * sizeof *off_view);
-    if (!off_view) {
-        free(hot_idxs);
-        must_unlock(&idx->lock);
-        return STM_ENOMEM;
-    }
-    for (size_t i = 0; i < n_hot; i++) {
-        off_view[i].off = idx->records[hot_idxs[i]].off;
-        off_view[i].len = idx->records[hot_idxs[i]].len;
-    }
-    /* Insertion-sort off_view by off (small N). */
-    for (size_t i = 1; i < n_hot; i++) {
-        struct off_len_pair key = off_view[i];
+    /* Phase 2: sort by off (small N typical; insertion-sort acceptable). */
+    for (size_t i = 1; i < c.n; i++) {
+        stm_extent_record key = c.records[i];
+        uint64_t key_off_v   = c.offs[i];
         size_t j = i;
-        while (j > 0 && off_view[j - 1].off > key.off) {
-            off_view[j] = off_view[j - 1];
+        while (j > 0 && c.offs[j - 1] > key_off_v) {
+            c.records[j] = c.records[j - 1];
+            c.offs[j]    = c.offs[j - 1];
             j--;
         }
-        off_view[j] = key;
+        c.records[j] = key;
+        c.offs[j]    = key_off_v;
     }
+    /* After sort, first_off = c.records[0].off. */
+    first_off = c.records[0].off;
 
-    /* Phase 3: validate contiguity using the off-sorted view. */
-    uint64_t first_off  = off_view[0].off;
+    /* Phase 3: validate contiguity. */
     uint64_t cumulative = first_off;
-    for (size_t i = 0; i < n_hot; i++) {
-        if (off_view[i].off != cumulative) {
-            /* Gap (sparse file) — refuse. Caller falls back to per-extent. */
-            free(hot_idxs);
-            free(off_view);
+    for (size_t i = 0; i < c.n; i++) {
+        if (c.records[i].off != cumulative) {
+            ex_collect_free(&c);
             must_unlock(&idx->lock);
             return STM_ENOTSUPPORTED;
         }
-        if (cumulative > UINT64_MAX - off_view[i].len) {
-            free(hot_idxs);
-            free(off_view);
+        if (cumulative > UINT64_MAX - c.records[i].len) {
+            ex_collect_free(&c);
             must_unlock(&idx->lock);
             return STM_EOVERFLOW;
         }
-        cumulative += off_view[i].len;
+        cumulative += c.records[i].len;
     }
     uint64_t total_len = cumulative - first_off;
 
     /* Phase 4: validate chunks tile [first_off, first_off + total_len). */
     if (chunks[0].off != first_off) {
-        free(hot_idxs);
-        free(off_view);
+        ex_collect_free(&c);
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
     uint64_t chunks_end = chunks[n_chunks - 1].off + chunks[n_chunks - 1].len;
     if (chunks_end != first_off + total_len) {
-        free(hot_idxs);
-        free(off_view);
+        ex_collect_free(&c);
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
-    free(off_view);
-    off_view = NULL;
 
-    /* Phase 5: capture all dropped HOT replica paddrs into a heap-allocated
-     * output array. Total = sum of n_replicas across the N source extents. */
+    /* Phase 5: capture all dropped HOT replica paddrs. */
     size_t paddrs_n = 0;
-    for (size_t i = 0; i < n_hot; i++) {
-        paddrs_n += idx->records[hot_idxs[i]].n_replicas;
-    }
+    for (size_t i = 0; i < c.n; i++) paddrs_n += c.records[i].n_replicas;
     uint64_t *dropped = malloc(paddrs_n * sizeof(uint64_t));
     if (!dropped) {
-        free(hot_idxs);
+        ex_collect_free(&c);
         must_unlock(&idx->lock);
         return STM_ENOMEM;
     }
     {
         size_t pi = 0;
-        for (size_t i = 0; i < n_hot; i++) {
-            const stm_extent_record *r = &idx->records[hot_idxs[i]];
+        for (size_t i = 0; i < c.n; i++) {
+            const stm_extent_record *r = &c.records[i];
             for (uint8_t k = 0; k < r->n_replicas; k++) {
                 dropped[pi++] = r->paddrs[k];
             }
         }
     }
 
-    /* Phase 6: pre-grow records[] if n_chunks > n_hot so the appended COLD
-     * records fit. Growing BEFORE any mutation guarantees ENOMEM-safety:
-     * if realloc fails, the index is unchanged. */
-    if (n_chunks > n_hot) {
-        size_t added = n_chunks - n_hot;
-        if (added > SIZE_MAX - idx->n_records) {
-            free(hot_idxs);
-            free(dropped);
-            must_unlock(&idx->lock);
-            return STM_EOVERFLOW;
-        }
-        size_t needed = idx->n_records + added;
-        if (needed > idx->cap_records) {
-            size_t new_cap = idx->cap_records == 0 ? 8u : idx->cap_records;
-            while (new_cap < needed) new_cap *= 2u;
-            stm_extent_record *new_buf = realloc(idx->records,
-                    new_cap * sizeof(stm_extent_record));
-            if (!new_buf) {
-                free(hot_idxs);
-                free(dropped);
-                must_unlock(&idx->lock);
-                return STM_ENOMEM;
-            }
-            idx->records     = new_buf;
-            idx->cap_records = new_cap;
-        }
+    /* Phase 6: delete every HOT record from the engine FIRST, then
+     * insert every COLD chunk. Pre-4d this was a swap-erase + append
+     * in-place. The engine has no such conflated op — clearing the
+     * range before inserts is the cleanest way to avoid same-key
+     * upserts colliding with not-yet-deleted HOT records. */
+    stm_status last_status = STM_OK;
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *r = &c.records[i];
+        stm_status ds_ = ex_engine_del(idx, r->dataset_id, r->ino, r->off);
+        if (ds_ != STM_OK) last_status = ds_;
     }
 
-    /* Phase 7: atomic mutation. Remove HOT extents via swap-erase.
-     * Then append COLD chunks.
-     *
-     * Swap-erase correctness PRECONDITION (R68 P0 fix):
-     *   hot_idxs MUST be in INDEX-ascending order. Iterating descending
-     *   k=n_hot..1 then processes the HIGHEST index first. At each step
-     *   the slot at records[n_records - 1] is guaranteed NOT to be any
-     *   hot_idxs[j < k] because (a) hot_idxs are pairwise distinct by
-     *   single-pass scan construction and (b) hot_idxs being index-
-     *   ascending means all j < k entries point at indices STRICTLY
-     *   LESS than hot_idxs[k - 1], which is itself ≤ n_records - 1. So
-     *   the swap source (n_records - 1) is either hot_idxs[k - 1]
-     *   itself (handled by the self-copy guard) or a NON-target record
-     *   that gets safely moved into the erased slot.
-     *
-     * Phase 1's scan walks records[0..n_records) in index order and
-     * appends matching indices to hot_idxs in scan order, so hot_idxs
-     * is index-ascending by construction. We deliberately do NOT
-     * off-sort hot_idxs (Phase 2's off_view is a separate copy used
-     * only for contiguity validation in Phases 3-4 and freed before
-     * mutation). */
-    for (size_t k = n_hot; k > 0; k--) {
-        size_t hi = hot_idxs[k - 1];
-        if (hi != idx->n_records - 1) {
-            idx->records[hi] = idx->records[idx->n_records - 1];
-        }
-        idx->n_records--;
-    }
-
-    /* Append the N' COLD records. */
     for (size_t i = 0; i < n_chunks; i++) {
-        stm_extent_record *r = &idx->records[idx->n_records];
-        memset(r, 0, sizeof *r);
-        r->dataset_id        = dataset_id;
-        r->ino               = ino;
-        r->off               = chunks[i].off;
-        r->len               = chunks[i].len;
-        r->kind              = STM_EXTENT_KIND_COLD;
-        r->n_replicas        = 0;
-        memcpy(r->content_hash, chunks[i].content_hash, STM_EXTENT_HASH_LEN);
-        r->gen               = link_gen;
-        r->key_id            = key_id;
-        r->origin_dataset_id = dataset_id;
-        r->origin_ino        = ino;
-        r->origin_off        = chunks[i].off;
-        r->link_gen          = link_gen;
-        /* Fresh COLD: never read yet, sentinel zero. */
-        r->read_count        = 0;
-        r->last_read_gen     = 0;
-        idx->n_records++;
+        stm_extent_record cold_rec;
+        memset(&cold_rec, 0, sizeof cold_rec);
+        cold_rec.dataset_id        = dataset_id;
+        cold_rec.ino               = ino;
+        cold_rec.off               = chunks[i].off;
+        cold_rec.len               = chunks[i].len;
+        cold_rec.kind              = STM_EXTENT_KIND_COLD;
+        cold_rec.n_replicas        = 0;
+        memcpy(cold_rec.content_hash, chunks[i].content_hash, STM_EXTENT_HASH_LEN);
+        cold_rec.gen               = src_gen;
+        cold_rec.key_id            = key_id;
+        cold_rec.origin_dataset_id = dataset_id;
+        cold_rec.origin_ino        = ino;
+        cold_rec.origin_off        = chunks[i].off;
+        cold_rec.link_gen          = link_gen;
+        cold_rec.read_count        = 0;
+        cold_rec.last_read_gen     = 0;
+        stm_status ps = ex_engine_put(idx, &cold_rec);
+        if (ps != STM_OK) last_status = ps;
     }
 
-    idx->dirty = true;
+    ex_collect_free(&c);
     must_unlock(&idx->lock);
 
-    free(hot_idxs);
     *out_dropped_paddrs   = dropped;
     *out_n_dropped_paddrs = paddrs_n;
-    return STM_OK;
+    return last_status;
 }
 
-/* P7-CAS-11: atomic per-extent COLD→HOT swap. Mirrors
- * stm_extent_migrate_to_cold's structure but in the inverse
- * direction: drops the COLD record at (ds, ino, off) + inserts a
- * HOT record at the same coords with the caller-provided fresh
- * replica set. Returns the dropped COLD's content_hash via
- * out_content_hash for the caller's stm_cas_deref routing. */
+/* P7-CAS-11: atomic per-extent COLD→HOT swap. Drops the COLD record at
+ * (ds, ino, off) + inserts a HOT record at the same coords. Returns the
+ * dropped COLD's content_hash via out_content_hash. */
 stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
                                             uint64_t dataset_id, uint64_t ino,
                                             uint64_t off, uint64_t len,
@@ -1636,24 +1950,23 @@ stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
     if (origin_off > UINT64_MAX - len) return STM_EINVAL;
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
 
     if (gen > idx->current_txg)      { must_unlock(&idx->lock); return STM_EINVAL; }
     if (link_gen > idx->current_txg) { must_unlock(&idx->lock); return STM_EINVAL; }
 
     /* Find the matching extent at (ds, ino, off). */
-    ptrdiff_t found = -1;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id == dataset_id && e->ino == ino && e->off == off) {
-            found = (ptrdiff_t)i;
-            break;
-        }
-    }
-    if (found < 0) {
+    stm_extent_record src;
+    bool found = false;
+    stm_status gs = ex_engine_get(idx, dataset_id, ino, off, &src, &found);
+    if (gs != STM_OK) { must_unlock(&idx->lock); return gs; }
+    if (!found) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
-    const stm_extent_record src = idx->records[found];
     if (src.len != len) {
         must_unlock(&idx->lock);
         return STM_EINVAL;            /* partial promote not modeled */
@@ -1663,14 +1976,12 @@ stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
         return STM_EINVAL;            /* HOT already; caller bug */
     }
 
-    /* Capture dropped COLD's content_hash FIRST so a subsequent
-     * in-place overwrite cannot lose it (the caller routes the hash
-     * through stm_cas_deref AFTER this returns OK). */
+    /* Capture dropped COLD's content_hash FIRST so the upsert cannot
+     * lose it (caller routes the hash through stm_cas_deref AFTER
+     * this returns OK). */
     memcpy(out_content_hash, src.content_hash, STM_EXTENT_HASH_LEN);
 
-    /* Build the new HOT record. read_count + last_read_gen are
-     * implicit zero — HOT records always carry zero counters
-     * (decoder anti-tamper enforces this). */
+    /* Build the new HOT record. */
     stm_extent_record hot_rec = {
         .dataset_id = dataset_id, .ino = ino,
         .off = off, .len = len,
@@ -1688,18 +1999,18 @@ stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
     }
     /* content_hash[] zeroed by initializer for HOT extents. */
 
-    /* In-place swap: NoOverlapWithinIno preserved across the
-     * transition (mirrors migrate_to_cold's posture). */
-    idx->records[found] = hot_rec;
-    idx->dirty = true;
-
+    stm_status ps = ex_engine_put(idx, &hot_rec);
     must_unlock(&idx->lock);
-    return STM_OK;
+    return ps;
 }
 
-/* P7-CAS-11: bump the read counter on the COLD extent at
- * (ds, ino, off). Windowed-count semantics (see header). HOT records
- * are no-op. Race-tolerant on missing record (returns STM_OK). */
+/* P7-CAS-11: bump the read counter on the COLD extent at (ds, ino, off).
+ * Windowed-count semantics (see header). HOT records are no-op. Race-
+ * tolerant on missing record (returns STM_OK).
+ *
+ * Engine-backed: this op MAY need to find a record whose off is the
+ * GREATEST off ≤ probe_off whose extent covers probe_off. We scan the
+ * (ds, ino) range and pick the one covering. */
 stm_status stm_extent_record_promote_read_hit(stm_extent_index *idx,
                                                 uint64_t dataset_id,
                                                 uint64_t ino,
@@ -1711,34 +2022,42 @@ stm_status stm_extent_record_promote_read_hit(stm_extent_index *idx,
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
 
     must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
 
     if (current_gen > idx->current_txg) {
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
 
-    /* Find the live extent that COVERS `off` (range-match, not exact-
-     * coord). The sync-layer COLD-read passes the byte offset of the
-     * read, which may not equal rec.off — the COW model means a single
-     * extent covers a contiguous range. */
-    ptrdiff_t found = -1;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked(idx, dataset_id, ino, &c);
+    if (cs != STM_OK) {
+        must_unlock(&idx->lock);
+        return cs;
+    }
+
+    /* Find the extent covering `off`. */
+    ptrdiff_t found_idx = -1;
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
         if (off < e->off) continue;
         if (off >= e->off + e->len) continue;
-        found = (ptrdiff_t)i;
+        found_idx = (ptrdiff_t)i;
         break;
     }
-    if (found < 0) {
-        /* Race-tolerant: between the sync-layer read and this counter
-         * bump a concurrent overwrite/truncate/migrate may have
-         * removed the record. No-op + STM_OK. */
+    if (found_idx < 0) {
+        /* Race-tolerant: no-op + STM_OK. */
+        ex_collect_free(&c);
         must_unlock(&idx->lock);
         return STM_OK;
     }
-    stm_extent_record *rec = &idx->records[found];
-    if (rec->kind != STM_EXTENT_KIND_COLD) {
+    stm_extent_record rec = c.records[found_idx];
+    ex_collect_free(&c);
+
+    if (rec.kind != STM_EXTENT_KIND_COLD) {
         /* HOT records have no counter; no-op. */
         must_unlock(&idx->lock);
         return STM_OK;
@@ -1751,24 +2070,24 @@ stm_status stm_extent_record_promote_read_hit(stm_extent_index *idx,
      *   - age > decay_window: out of window → reset to 1.
      *   - else: saturating-increment count. */
     bool reset = false;
-    if (rec->last_read_gen == 0u) {
+    if (rec.last_read_gen == 0u) {
         reset = true;
-    } else if (current_gen < rec->last_read_gen) {
+    } else if (current_gen < rec.last_read_gen) {
         reset = true;
     } else {
-        uint64_t age = current_gen - rec->last_read_gen;
+        uint64_t age = current_gen - rec.last_read_gen;
         if (age > decay_window) reset = true;
     }
     if (reset) {
-        rec->read_count = 1u;
-    } else if (rec->read_count < UINT32_MAX) {
-        rec->read_count++;
+        rec.read_count = 1u;
+    } else if (rec.read_count < UINT32_MAX) {
+        rec.read_count++;
     }
-    rec->last_read_gen = current_gen;
-    idx->dirty = true;
+    rec.last_read_gen = current_gen;
 
+    stm_status ps = ex_engine_put(idx, &rec);
     must_unlock(&idx->lock);
-    return STM_OK;
+    return ps;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1784,19 +2103,112 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
 
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);
-    /* NoOverlapWithinIno guarantees at most one extent matches; first
-     * match suffices. */
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+    if (!idx->eng) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+    stm_extent_index *m = (stm_extent_index *)idx;
+
+    /* The MVP "first match" semantic: find any extent whose off-range
+     * covers `off`. With the engine, we scan_range over (ds, ino) and
+     * pick the first covering. */
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked(m, dataset_id, ino, &c);
+    if (cs != STM_OK) {
+        must_unlock(lock);
+        return cs;
+    }
+    bool got = false;
+    for (size_t i = 0; i < c.n; i++) {
+        const stm_extent_record *e = &c.records[i];
         if (off < e->off) continue;
         if (off >= e->off + e->len) continue;
         *out_extent = *e;
-        must_unlock(lock);
-        return STM_OK;
+        got = true;
+        break;
     }
+    ex_collect_free(&c);
     must_unlock(lock);
-    return STM_ENOENT;
+    return got ? STM_OK : STM_ENOENT;
+}
+
+/* ------------------------------------------------------------------ */
+/* Engine_scan / scan_range callbacks for stm_extent_lookup_by_paddr / */
+/* stm_extent_iter_ds / stm_extent_count{,_for_ino}. Hoisted to file   */
+/* scope because C99 has no nested functions or block lambdas.         */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint64_t           probe;
+    stm_extent_record  hit;
+    bool               found;
+    stm_status         err;
+} ex_paddr_lookup_ctx;
+
+static int ex_paddr_lookup_cb(const void *k, size_t klen,
+                              const void *v, size_t vlen, void *ctx_) {
+    ex_paddr_lookup_ctx *p = ctx_;
+    uint64_t ds = 0, ino_ = 0, off = 0;
+    stm_status ks = ex_decode_key(k, klen, &ds, &ino_, &off);
+    if (ks != STM_OK) { p->err = ks; return 1; }
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = ex_decode_value(v, vlen, ds, ino_, off, &r);
+    if (vs != STM_OK) { p->err = vs; return 1; }
+    for (uint8_t i = 0; i < r.n_replicas; i++) {
+        if (r.paddrs[i] == p->probe) {
+            p->hit = r;
+            p->found = true;
+            return 1;        /* stop */
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    stm_extent_record *arr;
+    size_t             n;
+    size_t             cap;
+    stm_status         err;
+} ex_iter_ds_ctx;
+
+static int ex_iter_ds_collect_cb(const void *k, size_t klen,
+                                  const void *v, size_t vlen, void *ctx_) {
+    ex_iter_ds_ctx *d = ctx_;
+    uint64_t ds_ = 0, ino_ = 0, off_ = 0;
+    stm_status ks = ex_decode_key(k, klen, &ds_, &ino_, &off_);
+    if (ks != STM_OK) { d->err = ks; return 1; }
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = ex_decode_value(v, vlen, ds_, ino_, off_, &r);
+    if (vs != STM_OK) { d->err = vs; return 1; }
+    if (d->n == d->cap) {
+        if (d->cap > (SIZE_MAX / sizeof *d->arr) / 2u) {
+            d->err = STM_ENOMEM;
+            return 1;
+        }
+        size_t new_cap = d->cap == 0 ? 8u : d->cap * 2u;
+        stm_extent_record *na = realloc(d->arr,
+                                            new_cap * sizeof *d->arr);
+        if (!na) { d->err = STM_ENOMEM; return 1; }
+        d->arr = na;
+        d->cap = new_cap;
+    }
+    d->arr[d->n++] = r;
+    return 0;
+}
+
+typedef struct {
+    size_t     n;
+    stm_status err;
+} ex_count_ctx;
+
+static int ex_count_cb(const void *k, size_t klen,
+                       const void *v, size_t vlen, void *ctx_) {
+    (void)k; (void)klen; (void)v; (void)vlen;
+    ex_count_ctx *cx = ctx_;
+    cx->n++;
+    return 0;
 }
 
 stm_status stm_extent_lookup_by_paddr(const stm_extent_index *idx,
@@ -1807,28 +2219,26 @@ stm_status stm_extent_lookup_by_paddr(const stm_extent_index *idx,
 
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);
-    /* P7-6: scan each extent's replica set.
-     *
-     * P7-16 / R48 P3-1 update: extent.tla::SharedReplicasAreCohabit
-     * (the relaxed P7-6 LiveReplicasDisjoint) guarantees that any
-     * extent records sharing a paddr ALSO share `gen`, `key_id`,
-     * AND `origin_*` — so the AEAD-AD identity is invariant across
-     * siblings. First match suffices for AD reconstruction; callers
-     * (production scrub β cb) using rec.paddrs[0] for nonce + rec.gen
-     * + rec.origin_* for AD see the same nonce + AD regardless of
-     * which sibling lookup_by_paddr returns. */
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        for (uint8_t r = 0; r < e->n_replicas; r++) {
-            if (e->paddrs[r] == paddr) {
-                *out_extent = *e;
-                must_unlock(lock);
-                return STM_OK;
-            }
-        }
+    if (!idx->eng) {
+        must_unlock(lock);
+        return STM_EINVAL;
     }
+    stm_extent_index *m = (stm_extent_index *)idx;
+
+    /* P7-6 / P7-16: scan each extent's replica set. Cross-(ds, ino)
+     * scan — the only true full-engine-scan in the read path. Used by
+     * the production scrub β cb's lookup-by-paddr; under typical
+     * workloads scrub runs at low frequency so the O(N) cost is
+     * tolerable. */
+    ex_paddr_lookup_ctx lc = { .probe = paddr, .hit = {0}, .found = false,
+                                 .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan(m->eng, ex_paddr_lookup_cb, &lc);
     must_unlock(lock);
-    return STM_ENOENT;
+    if (ss != STM_OK) return ss;
+    if (lc.err != STM_OK) return lc.err;
+    if (!lc.found) return STM_ENOENT;
+    *out_extent = lc.hit;
+    return STM_OK;
 }
 
 stm_status stm_extent_iter(const stm_extent_index *idx,
@@ -1839,48 +2249,36 @@ stm_status stm_extent_iter(const stm_extent_index *idx,
 
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);
-
-    /* Linear scan is unsorted by off; we need off-ascending. The MVP
-     * builds a tiny index of matching records, sorts by off, then
-     * invokes cb in order. For typical n_extents per file (small),
-     * O(n log n) sort is cheap. */
-    size_t  cap = 0;
-    size_t  n   = 0;
-    size_t *order = NULL;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != dataset_id || e->ino != ino) continue;
-        if (n == cap) {
-            size_t new_cap = cap == 0 ? 8u : cap * 2u;
-            size_t *grown = realloc(order, new_cap * sizeof(size_t));
-            if (!grown) {
-                free(order);
-                must_unlock(lock);
-                return STM_ENOMEM;
-            }
-            order = grown;
-            cap = new_cap;
-        }
-        order[n++] = i;
+    if (!idx->eng) {
+        must_unlock(lock);
+        return STM_EINVAL;
     }
+    stm_extent_index *m = (stm_extent_index *)idx;
 
-    /* Insertion sort — n is small in the MVP (typical files: tens of
-     * extents). Bounded by NoOverlap so no equality issues. */
-    for (size_t i = 1; i < n; i++) {
-        size_t key = order[i];
-        uint64_t key_off = idx->records[key].off;
+    /* Collect every (ds, ino) record, sort by off, invoke cb in order. */
+    ex_collect_ctx c;
+    stm_status cs = ex_collect_in_ino_locked(m, dataset_id, ino, &c);
+    if (cs != STM_OK) {
+        must_unlock(lock);
+        return cs;
+    }
+    /* Insertion-sort (small N typical for a file's extents). */
+    for (size_t i = 1; i < c.n; i++) {
+        stm_extent_record key = c.records[i];
+        uint64_t key_off_v   = c.offs[i];
         size_t j = i;
-        while (j > 0 && idx->records[order[j - 1]].off > key_off) {
-            order[j] = order[j - 1];
+        while (j > 0 && c.offs[j - 1] > key_off_v) {
+            c.records[j] = c.records[j - 1];
+            c.offs[j]    = c.offs[j - 1];
             j--;
         }
-        order[j] = key;
+        c.records[j] = key;
+        c.offs[j]    = key_off_v;
     }
-
-    for (size_t i = 0; i < n; i++) {
-        if (!cb(&idx->records[order[i]], ctx)) break;
+    for (size_t i = 0; i < c.n; i++) {
+        if (!cb(&c.records[i], ctx)) break;
     }
-    free(order);
+    ex_collect_free(&c);
     must_unlock(lock);
     return STM_OK;
 }
@@ -1893,50 +2291,47 @@ stm_status stm_extent_iter_ds(const stm_extent_index *idx,
 
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);
+    if (!idx->eng) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+    stm_extent_index *m = (stm_extent_index *)idx;
 
-    /* Collect every extent matching ds, then sort by (ino, off). */
-    size_t  cap = 0;
-    size_t  n   = 0;
-    size_t *order = NULL;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id != dataset_id) continue;
-        if (n == cap) {
-            size_t new_cap = cap == 0 ? 8u : cap * 2u;
-            size_t *grown = realloc(order, new_cap * sizeof(size_t));
-            if (!grown) {
-                free(order);
-                must_unlock(lock);
-                return STM_ENOMEM;
-            }
-            order = grown;
-            cap = new_cap;
-        }
-        order[n++] = i;
+    /* scan_range over the dataset prefix. The keys come back in bytewise
+     * (le64-scrambled) order; we collect + sort by (ino, off) before
+     * invoking cb. */
+    uint8_t lo[EX_KEY_LEN], hi[EX_KEY_LEN];
+    ex_encode_key(dataset_id, 0u,         0u,        lo);
+    ex_encode_key(dataset_id, UINT64_MAX, UINT64_MAX, hi);
+
+    ex_iter_ds_ctx dc = { .arr = NULL, .n = 0, .cap = 0, .err = STM_OK };
+
+    stm_status ss = stm_btree_engine_scan_range(m->eng, lo, EX_KEY_LEN,
+                                                hi, EX_KEY_LEN,
+                                                ex_iter_ds_collect_cb, &dc);
+    if (ss != STM_OK || dc.err != STM_OK) {
+        free(dc.arr);
+        must_unlock(lock);
+        return ss != STM_OK ? ss : dc.err;
     }
 
-    /* Insertion sort by (ino, off). */
-    for (size_t i = 1; i < n; i++) {
-        size_t key = order[i];
-        uint64_t k_ino = idx->records[key].ino;
-        uint64_t k_off = idx->records[key].off;
+    /* Sort by (ino, off). */
+    for (size_t i = 1; i < dc.n; i++) {
+        stm_extent_record key = dc.arr[i];
         size_t j = i;
         while (j > 0) {
-            uint64_t p_ino = idx->records[order[j - 1]].ino;
-            uint64_t p_off = idx->records[order[j - 1]].off;
-            bool greater = (p_ino > k_ino) ||
-                           (p_ino == k_ino && p_off > k_off);
+            bool greater = (dc.arr[j - 1].ino > key.ino) ||
+                            (dc.arr[j - 1].ino == key.ino && dc.arr[j - 1].off > key.off);
             if (!greater) break;
-            order[j] = order[j - 1];
+            dc.arr[j] = dc.arr[j - 1];
             j--;
         }
-        order[j] = key;
+        dc.arr[j] = key;
     }
-
-    for (size_t i = 0; i < n; i++) {
-        if (!cb(&idx->records[order[i]], ctx)) break;
+    for (size_t i = 0; i < dc.n; i++) {
+        if (!cb(&dc.arr[i], ctx)) break;
     }
-    free(order);
+    free(dc.arr);
     must_unlock(lock);
     return STM_OK;
 }
@@ -1944,10 +2339,21 @@ stm_status stm_extent_iter_ds(const stm_extent_index *idx,
 stm_status stm_extent_count(const stm_extent_index *idx,
                                size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;
+    *out_count = 0;
+
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);
-    *out_count = idx->n_records;
+    if (!idx->eng) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+    stm_extent_index *m = (stm_extent_index *)idx;
+
+    ex_count_ctx cc = { .n = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan(m->eng, ex_count_cb, &cc);
     must_unlock(lock);
+    if (ss != STM_OK) return ss;
+    *out_count = cc.n;
     return STM_OK;
 }
 
@@ -1955,27 +2361,41 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
                                        uint64_t dataset_id, uint64_t ino,
                                        size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;
+    *out_count = 0;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);
-    size_t n = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *e = &idx->records[i];
-        if (e->dataset_id == dataset_id && e->ino == ino) n++;
+    if (!idx->eng) {
+        must_unlock(lock);
+        return STM_EINVAL;
     }
-    *out_count = n;
+    stm_extent_index *m = (stm_extent_index *)idx;
+
+    uint8_t lo[EX_KEY_LEN], hi[EX_KEY_LEN];
+    ex_encode_key(dataset_id, ino, 0u,         lo);
+    ex_encode_key(dataset_id, ino, UINT64_MAX, hi);
+
+    ex_count_ctx cc = { .n = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan_range(m->eng, lo, EX_KEY_LEN,
+                                                hi, EX_KEY_LEN,
+                                                ex_count_cb, &cc);
     must_unlock(lock);
+    if (ss != STM_OK) return ss;
+    *out_count = cc.n;
     return STM_OK;
 }
 
 /* =========================================================================
- * Persistence (P7-3, v12; extended for replicas in P7-6, v13).
+ * Persistence (9.6-impl-4d, btree_engine-backed).
  *
- * Mirrors src/snapshot/snapshot.c's persistence section. Same envelope:
- * btree_store-encoded, AEAD-encrypted Bε-tree on device 0, with nonce
- * paddr‖gen‖pool_uuid + AD pool_uuid‖device_uuid_0. Idempotent commit
- * via internal dirty flag; atomic shadow swap on load_at; structural
- * validator on the loaded shadow before swap.
+ * On-disk key + value layout UNCHANGED from pre-4d. STM_UB_VERSION 28→29
+ * commits the cutover: a v28 pool's extent tree is written through
+ * btree_store; v29 mounts it through btree_engine. No semantic on-disk
+ * change — both stores produce structurally-identical 16 KiB AEAD-
+ * encrypted btree nodes — but the v28 tree's root_paddr+csum is a
+ * btree_store header, not an engine root, so the version gate is
+ * mandatory.
  *
  * P7-16 / v17 value layout (96 bytes):
  *
@@ -2020,22 +2440,9 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
  *                                 incremented. HOT extents have this ==
  *                                 0 (decoder anti-tamper).
  *
- * v15→v16 was the repair-log header carve in superblock; the extent
- * value layout was unchanged in v16. v17 grew it 64 → 96 with the
- * three origin fields + the link_gen field. v18 adds the kind
- * discriminator at byte 0 (shifting n_replicas to byte 1 for HOT) and
- * defines the COLD variant. v21 (P7-CAS-11) appends read_count +
- * last_read_gen at offsets 96..108. Format breaks: 18, 21.
+ * Format breaks: 18, 21. v29 (impl-4d) reformats the engine's root
+ * envelope but does NOT change the key/value layout above.
  * ========================================================================= */
-
-#define EX_KEY_LEN              24u                          /* ds + ino + off */
-#define EX_VAL_LEN              108u                         /* P7-CAS-11 / v21 */
-/* EX_LEN_MAX_24BIT is now defined at file scope near the top so callers
- * outside this encoding section (P7-CAS-17 whole-ino migrate) can validate
- * against it without forward-declaration. The encoding-section comment
- * remains the canonical reference: 24-bit length so `dlen` (le32 at offset
- * 48) and `clen_and_comp.clen` (low 24 bits of le32 at offset 52) both fit
- * the same value (no compression). */
 
 static void ex_encode_key(uint64_t ds, uint64_t ino, uint64_t off,
                              uint8_t out[EX_KEY_LEN]) {
@@ -2262,62 +2669,6 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     return STM_OK;
 }
 
-/* ---- btree_store vtable ---- */
-
-typedef struct {
-    stm_bootstrap *boot;
-    stm_bdev      *bdev;
-} ex_store_ctx;
-
-static stm_status ex_store_reserve(void *ctx_, uint64_t *out_paddr) {
-    ex_store_ctx *ctx = ctx_;
-    return stm_bootstrap_reserve(ctx->boot, STM_BOOTSTRAP_UNIT_BLOCKS,
-                                   /*hint_paddr=*/0, out_paddr);
-}
-
-static stm_status ex_store_free(void *ctx_, uint64_t paddr, uint64_t free_gen) {
-    ex_store_ctx *ctx = ctx_;
-    return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_UNIT_BLOCKS,
-                                free_gen);
-}
-
-static stm_status ex_store_write(void *ctx_, uint64_t paddr,
-                                    const void *buf, size_t len) {
-    ex_store_ctx *ctx = ctx_;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
-    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
-    return stm_bdev_write(ctx->bdev, byte_offset, buf, len);
-}
-
-static stm_status ex_store_read(void *ctx_, uint64_t paddr,
-                                   void *buf, size_t len) {
-    ex_store_ctx *ctx = ctx_;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
-    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
-    return stm_bdev_read(ctx->bdev, byte_offset, buf, len);
-}
-
-static const stm_btree_store_vtable EX_STORE_VT = {
-    .reserve = ex_store_reserve,
-    .free    = ex_store_free,
-    .write   = ex_store_write,
-    .read    = ex_store_read,
-};
-
-static inline ex_store_ctx ex_make_store_ctx(stm_extent_index *idx) {
-    ex_store_ctx c = { .boot = idx->boot, .bdev = idx->bdev };
-    return c;
-}
-
-static inline stm_btree_crypt_ctx ex_make_crypt_ctx(const stm_extent_index *idx) {
-    stm_btree_crypt_ctx cx = { .metadata_key = idx->metadata_key };
-    cx.pool_uuid[0]   = idx->pool_uuid[0];
-    cx.pool_uuid[1]   = idx->pool_uuid[1];
-    cx.device_uuid[0] = idx->device_uuid[0];
-    cx.device_uuid[1] = idx->device_uuid[1];
-    return cx;
-}
-
 /* ---- Public persistence API. ---- */
 
 stm_status stm_extent_index_set_storage(stm_extent_index *idx,
@@ -2325,8 +2676,22 @@ stm_status stm_extent_index_set_storage(stm_extent_index *idx,
                                            stm_bootstrap *boot_0) {
     if (!idx || !bdev_0 || !boot_0) return STM_EINVAL;
     must_lock(&idx->lock);
-    idx->bdev = bdev_0;
-    idx->boot = boot_0;
+    /* R70 P3-6: refuse re-binding once latched. */
+    if (idx->storage_set) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    idx->store_ctx.bdev = bdev_0;
+    idx->store_ctx.boot = boot_0;
+    /* Second-bind: stand the engine up. */
+    if (idx->crypt_set && !idx->eng) {
+        stm_status es = ex_engine_create_locked(idx);
+        if (es != STM_OK) {
+            must_unlock(&idx->lock);
+            return es;
+        }
+    }
+    idx->storage_set = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -2337,12 +2702,24 @@ stm_status stm_extent_index_set_crypt_ctx(stm_extent_index *idx,
                                              const uint64_t device_uuid_0[2]) {
     if (!idx || !metadata_key || !pool_uuid || !device_uuid_0) return STM_EINVAL;
     must_lock(&idx->lock);
-    idx->metadata_key   = metadata_key;
-    idx->pool_uuid[0]   = pool_uuid[0];
-    idx->pool_uuid[1]   = pool_uuid[1];
-    idx->device_uuid[0] = device_uuid_0[0];
-    idx->device_uuid[1] = device_uuid_0[1];
-    idx->crypt_set      = true;
+    /* R70 P3-6: refuse re-binding once latched. */
+    if (idx->crypt_set) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    idx->crypt_ctx.metadata_key   = metadata_key;
+    idx->crypt_ctx.pool_uuid[0]   = pool_uuid[0];
+    idx->crypt_ctx.pool_uuid[1]   = pool_uuid[1];
+    idx->crypt_ctx.device_uuid[0] = device_uuid_0[0];
+    idx->crypt_ctx.device_uuid[1] = device_uuid_0[1];
+    if (idx->storage_set && !idx->eng) {
+        stm_status es = ex_engine_create_locked(idx);
+        if (es != STM_OK) {
+            must_unlock(&idx->lock);
+            return es;
+        }
+    }
+    idx->crypt_set = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -2369,30 +2746,6 @@ stm_status stm_extent_index_get_gen(const stm_extent_index *idx,
     return STM_OK;
 }
 
-static stm_status ex_build_btree_locked(const stm_extent_index *idx,
-                                           stm_btree_mt **out_tree) {
-    stm_btree_opts opts = stm_btree_opts_default();
-    if (opts.target_entries < 512u) opts.target_entries = 512u;
-
-    stm_btree_mt *t = NULL;
-    stm_status ts = stm_btree_mt_new(&opts, &t);
-    if (ts != STM_OK) return ts;
-
-    uint8_t key[EX_KEY_LEN];
-    uint8_t val[EX_VAL_LEN];
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_extent_record *r = &idx->records[i];
-        ex_encode_key(r->dataset_id, r->ino, r->off, key);
-        stm_status es = ex_encode_value(r, val);
-        if (es != STM_OK) { stm_btree_mt_free(t); return es; }
-        stm_status is = stm_btree_mt_insert(t, key, EX_KEY_LEN, val, EX_VAL_LEN);
-        if (is != STM_OK) { stm_btree_mt_free(t); return is; }
-    }
-
-    *out_tree = t;
-    return STM_OK;
-}
-
 stm_status stm_extent_index_commit(stm_extent_index *idx,
                                       uint64_t committed_gen,
                                       uint64_t *out_root_paddr,
@@ -2400,147 +2753,241 @@ stm_status stm_extent_index_commit(stm_extent_index *idx,
     if (!idx || !out_root_paddr || !out_root_csum) return STM_EINVAL;
     must_lock(&idx->lock);
 
-    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+    if (!idx->storage_set || !idx->crypt_set || !idx->eng) {
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
 
-    if (!idx->dirty && idx->root_paddr != 0) {
-        *out_root_paddr = idx->root_paddr;
-        memcpy(out_root_csum, idx->root_csum, 32);
+    /* Single-shot incremental-COW commit. Engine subsumes the pre-4d
+     * !dirty short-circuit (clean tree → cheap no-op). */
+    uint64_t cp = 0;
+    uint8_t  cc[32];
+    stm_status cs = stm_btree_engine_commit(idx->eng, committed_gen, &cp, cc);
+    if (cs != STM_OK) {
+        /* A failed commit self-reverts — the engine drops the in-memory
+         * tree, leaves no pending window, and the durable root still
+         * names the previous tree. 9.6-impl-4b design §5.5: a failed
+         * stm_sync_commit is crash-equivalent; the caller wedges. */
         must_unlock(&idx->lock);
-        return STM_OK;
+        return cs;
     }
 
-    stm_btree_mt *t = NULL;
-    stm_status bs = ex_build_btree_locked(idx, &t);
+    /* Read back the authoritative durable triple. */
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    stm_status gs = stm_btree_engine_get_root(idx->eng, &rp, &rg, rc);
+    if (gs != STM_OK) {
+        must_unlock(&idx->lock);
+        return gs;
+    }
+
+    /* Make the bootstrap bitmap durable — the engine's vt->reserve set
+     * node bits in RAM; this fsyncs them. The monolithic _commit keeps
+     * this call inside the index commit for use by non-sync callers
+     * (unit tests). stm_sync_commit relocates this barrier (4b-iii) so
+     * its three-phase trio doesn't double-commit. */
+    stm_status bs = stm_bootstrap_commit(idx->store_ctx.boot, committed_gen);
     if (bs != STM_OK) {
         must_unlock(&idx->lock);
         return bs;
     }
 
-    ex_store_ctx       sc = ex_make_store_ctx(idx);
-    stm_btree_crypt_ctx cx = ex_make_crypt_ctx(idx);
+    idx->root_paddr = rp;
+    idx->root_gen   = rg;
+    memcpy(idx->root_csum, rc, 32);
 
-    uint64_t new_paddr = 0;
-    uint8_t  new_csum[32];
-    stm_status ss = stm_btree_store_serialize(t, committed_gen,
-                                                 /*tree_id=*/0u,
-                                                 &EX_STORE_VT, &sc, &cx,
-                                                 &new_paddr, new_csum);
-    stm_btree_mt_free(t);
-    if (ss != STM_OK) {
-        must_unlock(&idx->lock);
-        return ss;
-    }
-
-    #define EX_ROLLBACK_RESERVE() \
-        do { (void)stm_btree_store_free_tree(new_paddr, committed_gen,  \
-                                                committed_gen, new_csum, \
-                                                &EX_STORE_VT, &sc, &cx); \
-        } while (0)
-
-    if (idx->root_paddr != 0) {
-        stm_status fs = stm_btree_store_free_tree(idx->root_paddr,
-                                                     idx->root_gen,
-                                                     committed_gen,
-                                                     idx->root_csum,
-                                                     &EX_STORE_VT, &sc, &cx);
-        if (fs != STM_OK) {
-            EX_ROLLBACK_RESERVE();
-            must_unlock(&idx->lock);
-            return fs;
-        }
-    }
-
-    stm_status bsc = stm_bootstrap_commit(idx->boot, committed_gen);
-    if (bsc != STM_OK) {
-        EX_ROLLBACK_RESERVE();
-        must_unlock(&idx->lock);
-        return bsc;
-    }
-    #undef EX_ROLLBACK_RESERVE
-
-    idx->root_paddr = new_paddr;
-    idx->root_gen   = committed_gen;
-    memcpy(idx->root_csum, new_csum, 32);
-    idx->dirty      = false;
-
-    *out_root_paddr = new_paddr;
-    memcpy(out_root_csum, new_csum, 32);
+    *out_root_paddr = rp;
+    memcpy(out_root_csum, rc, 32);
     must_unlock(&idx->lock);
     return STM_OK;
 }
 
-/* load_at — atomic shadow swap. */
+/* ------------------------------------------------------------------ */
+/* Three-phase commit — flush / finalize / abort (9.6-impl-4d).         */
+/*                                                                      */
+/* The form stm_sync_commit drives. Each is a thin wrapper over the     */
+/* btree_engine's commit_flush / _finalize / _abort, under idx->lock.   */
+/* NONE of them calls stm_bootstrap_commit — the sync layer runs that   */
+/* single explicit durable-bitmap barrier after every index flush,      */
+/* strictly before the uberblock write (4b-iii doctrine carry).         */
+/* ------------------------------------------------------------------ */
 
-typedef struct {
-    stm_extent_record *shadow_records;
-    size_t             shadow_len;
-    size_t             shadow_cap;
-    uint64_t           max_write_gen;
-    stm_status         err;
-} ex_load_ctx;
+stm_status stm_extent_index_commit_flush(stm_extent_index *idx,
+                                           uint64_t committed_gen,
+                                           uint64_t *out_root_paddr,
+                                           uint64_t *out_root_gen,
+                                           uint8_t out_root_csum[32]) {
+    if (!idx || !out_root_paddr || !out_root_gen || !out_root_csum)
+        return STM_EINVAL;
+    must_lock(&idx->lock);
 
-static stm_status ex_shadow_append(ex_load_ctx *lc,
-                                      const stm_extent_record *r) {
-    if (lc->shadow_len == lc->shadow_cap) {
-        size_t new_cap = lc->shadow_cap == 0 ? 8 : lc->shadow_cap * 2;
-        stm_extent_record *new_buf = realloc(lc->shadow_records,
-                                                new_cap * sizeof(stm_extent_record));
-        if (!new_buf) return STM_ENOMEM;
-        lc->shadow_records = new_buf;
-        lc->shadow_cap = new_cap;
+    if (!idx->storage_set || !idx->crypt_set || !idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
     }
-    lc->shadow_records[lc->shadow_len++] = *r;
+
+    uint64_t cp = 0, cg = 0;
+    uint8_t  cc[32];
+    stm_status cs = stm_btree_engine_commit_flush(idx->eng, committed_gen,
+                                                  &cp, &cg, cc);
+    if (cs != STM_OK) {
+        /* A failed flush self-reverts: NO pending window opened, the
+         * in-memory tree dropped, the durable root still names the
+         * previous tree. The caller MUST NOT _commit_abort. 4b design
+         * §5.5: a failed stm_sync_commit is crash-equivalent — the
+         * caller wedges the fs. */
+        must_unlock(&idx->lock);
+        return cs;
+    }
+
+    *out_root_paddr = cp;
+    *out_root_gen   = cg;
+    memcpy(out_root_csum, cc, 32);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
-static int ex_load_iter(const void *k, size_t klen,
-                          const void *v, size_t vlen, void *ctx_) {
-    ex_load_ctx *lc = ctx_;
-    uint64_t ds, ino, off;
+stm_status stm_extent_index_commit_finalize(stm_extent_index *idx) {
+    if (!idx) return STM_EINVAL;
+    must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    /* Adopt the flushed root + deferred-free the superseded paddrs.
+     * After a successful commit_flush this is infallible (btree_engine.h
+     * contract); the STM_EINVAL exit is a no-pending-flush sequencing
+     * bug. */
+    stm_status fs = stm_btree_engine_commit_finalize(idx->eng);
+    if (fs != STM_OK) {
+        must_unlock(&idx->lock);
+        return fs;
+    }
+
+    /* Mirror the now-durable triple into idx->root_*. */
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    stm_status gs = stm_btree_engine_get_root(idx->eng, &rp, &rg, rc);
+    if (gs != STM_OK) {
+        must_unlock(&idx->lock);
+        return gs;
+    }
+    idx->root_paddr = rp;
+    idx->root_gen   = rg;
+    memcpy(idx->root_csum, rc, 32);
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_extent_index_commit_abort(stm_extent_index *idx) {
+    if (!idx) return STM_EINVAL;
+    must_lock(&idx->lock);
+    if (!idx->eng) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    /* Discard the flushed root: deferred-free the freshly-written
+     * paddrs + drop the in-memory tree. idx->root_* is deliberately
+     * NOT touched — the durable root still names the previous tree. */
+    stm_status as = stm_btree_engine_commit_abort(idx->eng);
+    must_unlock(&idx->lock);
+    return as;
+}
+
+/* ------------------------------------------------------------------ */
+/* load_at — open the on-disk engine + reconstruct current_txg.         */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint64_t  *paddrs;       /* dynamic — collected for SharedReplicasAreCohabit
+                              * cross-record validation; one element per
+                              * (extent, replica-slot) pair. */
+    size_t     n_paddrs;
+    size_t     cap_paddrs;
+    /* Per-extent snapshot for cross-record overlap + cohabit checks. */
+    stm_extent_record *records;
+    size_t             n_records;
+    size_t             cap_records;
+    uint64_t  max_write_gen;
+    stm_status err;
+} ex_mount_ctx;
+
+static stm_status ex_mount_grow_paddrs(ex_mount_ctx *m, size_t added) {
+    if (m->n_paddrs + added > m->cap_paddrs) {
+        size_t new_cap = m->cap_paddrs == 0 ? 32u : m->cap_paddrs;
+        while (new_cap < m->n_paddrs + added) {
+            if (new_cap > (SIZE_MAX / sizeof *m->paddrs) / 2u) return STM_ENOMEM;
+            new_cap *= 2u;
+        }
+        uint64_t *np = realloc(m->paddrs, new_cap * sizeof *m->paddrs);
+        if (!np) return STM_ENOMEM;
+        m->paddrs = np;
+        m->cap_paddrs = new_cap;
+    }
+    return STM_OK;
+}
+
+static stm_status ex_mount_grow_records(ex_mount_ctx *m) {
+    if (m->n_records == m->cap_records) {
+        size_t new_cap = m->cap_records == 0 ? 16u : m->cap_records * 2u;
+        if (new_cap > (SIZE_MAX / sizeof *m->records)) return STM_ENOMEM;
+        stm_extent_record *nr = realloc(m->records,
+                                            new_cap * sizeof *m->records);
+        if (!nr) return STM_ENOMEM;
+        m->records = nr;
+        m->cap_records = new_cap;
+    }
+    return STM_OK;
+}
+
+static int ex_mount_cb(const void *k, size_t klen,
+                       const void *v, size_t vlen, void *ctx_) {
+    ex_mount_ctx *m = ctx_;
+    uint64_t ds = 0, ino = 0, off = 0;
     stm_status ks = ex_decode_key(k, klen, &ds, &ino, &off);
-    if (ks != STM_OK) { lc->err = ks; return 1; }
-    /* Zero ds / ino are reserved sentinels — refuse on decode. */
-    if (ds == 0 || ino == 0) { lc->err = STM_ECORRUPT; return 1; }
+    if (ks != STM_OK) { m->err = ks; return 1; }
+    if (ds == 0 || ino == 0) { m->err = STM_ECORRUPT; return 1; }
 
     stm_extent_record r;
+    memset(&r, 0, sizeof r);
     stm_status vs = ex_decode_value(v, vlen, ds, ino, off, &r);
-    if (vs != STM_OK) { lc->err = vs; return 1; }
+    if (vs != STM_OK) { m->err = vs; return 1; }
 
-    if (r.gen > lc->max_write_gen) lc->max_write_gen = r.gen;
+    if (r.gen > m->max_write_gen) m->max_write_gen = r.gen;
 
     /* off + len overflow guard (AllExtentsInBounds). */
-    if (r.off > UINT64_MAX - r.len) { lc->err = STM_ECORRUPT; return 1; }
+    if (r.off > UINT64_MAX - r.len) { m->err = STM_ECORRUPT; return 1; }
 
-    stm_status as = ex_shadow_append(lc, &r);
-    if (as != STM_OK) { lc->err = as; return 1; }
+    stm_status gs = ex_mount_grow_records(m);
+    if (gs != STM_OK) { m->err = gs; return 1; }
+    m->records[m->n_records++] = r;
+
+    if (r.n_replicas > 0) {
+        stm_status gp = ex_mount_grow_paddrs(m, r.n_replicas);
+        if (gp != STM_OK) { m->err = gp; return 1; }
+        for (uint8_t i = 0; i < r.n_replicas; i++) {
+            m->paddrs[m->n_paddrs++] = r.paddrs[i];
+        }
+    }
     return 0;
 }
 
-/* Structural validator on the loaded shadow. Catches extents that
- * decode byte-clean but violate extent.tla invariants:
- *   - NoOverlapWithinIno: pairwise overlap check within each (ds, ino).
- *   - LiveReplicasDisjoint (P7-6): no paddr appears in two records'
- *     replica sets.
- * O(N² · K²) where K = STM_EXTENT_MAX_REPLICAS — fine for any plausible
- * mount. Production-grade persistence (chunked / per-inode trees)
- * revisits this with a sorted-merge strategy.
- */
-static stm_status ex_validate_shadow(const ex_load_ctx *lc) {
-    /* NoOverlapWithinIno + LengthPositive (already enforced at decode).
-     *
-     * P7-16: replaced the prior cross-record replica-set DISJOINTNESS
-     * with extent.tla::SharedReplicasAreCohabit. Two distinct records
-     * that share ANY paddr MUST share the WHOLE replica set AND the
-     * same (gen, key_id, origin_*) tuple — i.e., be legitimate reflink-
-     * siblings. Partial overlap or whole-share-but-tuple-mismatch is
-     * still corruption. */
-    for (size_t i = 0; i < lc->shadow_len; i++) {
-        const stm_extent_record *a = &lc->shadow_records[i];
-        for (size_t j = i + 1; j < lc->shadow_len; j++) {
-            const stm_extent_record *b = &lc->shadow_records[j];
+/* Structural validator on the loaded extent tree. Mount-time check —
+ * runs once at load_at, after the engine has been opened + every
+ * record has been collected via engine_scan. The cross-record overlap
+ * + SharedReplicasAreCohabit checks are O(N²·K²) where N is the total
+ * extent count + K = STM_EXTENT_MAX_REPLICAS — fine for any plausible
+ * mount; production-grade persistence (chunked / per-inode trees)
+ * revisits with a sorted-merge strategy. */
+static stm_status ex_mount_validate(const ex_mount_ctx *m) {
+    /* NoOverlapWithinIno + LengthPositive (already enforced at decode). */
+    for (size_t i = 0; i < m->n_records; i++) {
+        const stm_extent_record *a = &m->records[i];
+        for (size_t j = i + 1; j < m->n_records; j++) {
+            const stm_extent_record *b = &m->records[j];
             if (a->dataset_id == b->dataset_id && a->ino == b->ino) {
                 if (ranges_overlap(a->off, a->len, b->off, b->len)) {
                     return STM_ECORRUPT;
@@ -2580,69 +3027,63 @@ stm_status stm_extent_index_load_at(stm_extent_index *idx,
     if (!idx || !expected_csum) return STM_EINVAL;
     if (root_paddr == 0) return STM_EINVAL;
     must_lock(&idx->lock);
-    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+    if (!idx->storage_set || !idx->crypt_set) {
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
 
-    stm_btree_opts opts = stm_btree_opts_default();
-    if (opts.target_entries < 512u) opts.target_entries = 512u;
-    stm_btree_mt *t = NULL;
-    stm_status ts = stm_btree_mt_new(&opts, &t);
-    if (ts != STM_OK) {
+    /* Open the on-disk tree (lazy — no device I/O until the scan
+     * descends). */
+    stm_btree_engine *opened = NULL;
+    stm_status os = stm_btree_engine_open(&STM_ENGINE_STORE_VT,
+                                          &idx->store_ctx, &idx->crypt_ctx,
+                                          /*tree_id=*/0u,
+                                          root_paddr, root_gen, expected_csum,
+                                          &opened);
+    if (os != STM_OK) {
         must_unlock(&idx->lock);
-        return ts;
+        return os;
     }
 
-    ex_store_ctx       sc = ex_make_store_ctx(idx);
-    stm_btree_crypt_ctx cx = ex_make_crypt_ctx(idx);
-
-    stm_status ds = stm_btree_store_deserialize(t, root_paddr, root_gen,
-                                                   expected_csum,
-                                                   &EX_STORE_VT, &sc, &cx);
-    if (ds != STM_OK) {
-        stm_btree_mt_free(t);
+    /* Walk every record into a mount scratch ctx: validate it +
+     * raise current_txg = max(write_gen) + collect for cross-record
+     * cohabit validation. The walk reads + AEAD/Merkle-verifies every
+     * node; ex_decode_value adds the per-record semantic layer. */
+    ex_mount_ctx mc = { .paddrs = NULL, .n_paddrs = 0, .cap_paddrs = 0,
+                          .records = NULL, .n_records = 0, .cap_records = 0,
+                          .max_write_gen = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan(opened, ex_mount_cb, &mc);
+    if (ss != STM_OK || mc.err != STM_OK) {
+        free(mc.paddrs);
+        free(mc.records);
+        stm_btree_engine_destroy(opened);
         must_unlock(&idx->lock);
-        return ds;
+        return ss != STM_OK ? ss : mc.err;
     }
-
-    ex_load_ctx lc = {0};
-    stm_status sr = stm_btree_mt_scan(t, NULL, 0, NULL, 0,
-                                         ex_load_iter, &lc);
-    stm_btree_mt_free(t);
-
-    if (sr != STM_OK) {
-        free(lc.shadow_records);
-        must_unlock(&idx->lock);
-        return sr;
-    }
-    if (lc.err != STM_OK) {
-        free(lc.shadow_records);
-        must_unlock(&idx->lock);
-        return lc.err;
-    }
-    stm_status vs = ex_validate_shadow(&lc);
+    /* Cross-record cohabit + overlap validation. */
+    stm_status vs = ex_mount_validate(&mc);
     if (vs != STM_OK) {
-        free(lc.shadow_records);
+        free(mc.paddrs);
+        free(mc.records);
+        stm_btree_engine_destroy(opened);
         must_unlock(&idx->lock);
         return vs;
     }
+    free(mc.paddrs);
+    free(mc.records);
 
-    /* Atomic swap. */
-    free(idx->records);
-    idx->records      = lc.shadow_records;
-    idx->n_records    = lc.shadow_len;
-    idx->cap_records  = lc.shadow_cap;
+    /* Atomic install. */
+    stm_btree_engine_destroy(idx->eng);
+    idx->eng = opened;
 
     /* Bump current_txg ≥ max(write_gen) per extent.tla::BirthTxgBound. */
-    if (lc.max_write_gen > idx->current_txg) {
-        idx->current_txg = lc.max_write_gen;
+    if (mc.max_write_gen > idx->current_txg) {
+        idx->current_txg = mc.max_write_gen;
     }
 
     idx->root_paddr = root_paddr;
     idx->root_gen   = root_gen;
     memcpy(idx->root_csum, expected_csum, 32);
-    idx->dirty = false;
 
     must_unlock(&idx->lock);
     return STM_OK;
@@ -2652,7 +3093,7 @@ stm_status stm_extent_index_verify(const stm_extent_index *idx) {
     if (!idx) return STM_EINVAL;
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);
-    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+    if (!idx->storage_set || !idx->crypt_set || !idx->eng) {
         must_unlock(lock);
         return STM_EINVAL;
     }
@@ -2660,11 +3101,23 @@ stm_status stm_extent_index_verify(const stm_extent_index *idx) {
         must_unlock(lock);
         return STM_OK;
     }
-    ex_store_ctx       sc = ex_make_store_ctx((stm_extent_index *)idx);
-    stm_btree_crypt_ctx cx = ex_make_crypt_ctx(idx);
-    stm_status vs = stm_btree_store_verify(idx->root_paddr, idx->root_gen,
-                                              idx->root_csum,
-                                              &EX_STORE_VT, &sc, &cx);
+    /* Engine-backed: a re-scan via engine_scan re-decrypts every node
+     * (AEAD verifies tags + Merkle ladders ensure linkage). Each
+     * decoded record is structurally checked via ex_decode_value. */
+    ex_mount_ctx mc = { .paddrs = NULL, .n_paddrs = 0, .cap_paddrs = 0,
+                          .records = NULL, .n_records = 0, .cap_records = 0,
+                          .max_write_gen = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan(((stm_extent_index *)idx)->eng,
+                                          ex_mount_cb, &mc);
+    if (ss != STM_OK || mc.err != STM_OK) {
+        free(mc.paddrs);
+        free(mc.records);
+        must_unlock(lock);
+        return ss != STM_OK ? ss : mc.err;
+    }
+    stm_status vs = ex_mount_validate(&mc);
+    free(mc.paddrs);
+    free(mc.records);
     must_unlock(lock);
     return vs;
 }

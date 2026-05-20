@@ -185,12 +185,14 @@ Phase 2: Flush
     For each attached alloc in allocs[]:
         stm_alloc_commit(alloc, target_gen)    // persist per-device tree
     stm_alloc_roots_commit(roots, target_gen)  // persist pool-level roots object
-    stm_{dataset,snapshot,extent,repair_log,cas}_index_commit(target_gen)
+    stm_{dataset,snapshot,repair_log,cas}_index_commit(target_gen)
+    stm_extent_index_commit_flush(target_gen)  // 9.6-impl-4d: btree_engine FLUSH
+                                               //   -> PROSPECTIVE root triple
     stm_inode_index_commit_flush(target_gen)   // 9.6-impl-4b-iii: btree_engine
-                                               // FLUSH -> PROSPECTIVE root triple
+                                               //   FLUSH -> PROSPECTIVE triple
     stm_dirent_index_commit_flush(target_gen)  // 9.6-impl-4c: btree_engine FLUSH
     stm_xattr_index_commit_flush(target_gen)   // 9.6-impl-4c: btree_engine FLUSH
-    compute_merkle_root(... every index csum, incl. inode/dirent/xattr
+    compute_merkle_root(... every index csum, incl. extent/inode/dirent/xattr
                             prospective triples ...)
     stm_bootstrap_commit(boot, target_gen)     // 9.6-impl-4b-iii: explicit
                                                // durable-bitmap barrier --
@@ -201,6 +203,8 @@ Phase 3: Final
     Same per-device fan-out as Phase 1.
     Wait for quorum confirmations.
     If sub-quorum: abort; in-RAM state unchanged (rollback UB at auth+1 is durable).
+    stm_extent_index_commit_finalize()         // 9.6-impl-4d: adopt the
+                                               // flushed extent root, post-UB
     stm_inode_index_commit_finalize()          // 9.6-impl-4b-iii: adopt the
                                                // flushed inode root, post-UB
     stm_dirent_index_commit_finalize()         // 9.6-impl-4c: adopt the
@@ -215,21 +219,31 @@ Phase 4: Publish
 
 Each commit advances `auth_gen` by 2. Mount-claim advances by 1.
 
-### Inode / dirent / xattr indices — three-phase commit (9.6-impl-4b-iii + 4c)
+### Extent / inode / dirent / xattr indices — three-phase commit (9.6-impl-4b-iii + 4c + 4d)
 
-The inode, dirent, and xattr modules are `btree_engine`-backed
-(incremental-COW B+tree); each commit is split across `stm_sync_commit`'s
-phases. In Phase 2 each `_commit_flush` writes the dirty nodes to fresh
-paddrs and yields the PROSPECTIVE root triple — which feeds
-`compute_merkle_root` + the final uberblock exactly as a finished root
-would. In Phase 3, after the final UB is durable, each `_commit_finalize`
-adopts that root + deferred-frees the superseded nodes. Every error path
-between flush and finalize runs `_commit_abort` for every engine whose
-flush has already succeeded (inode-only if dirent's flush fails; inode +
-dirent if xattr's flush fails; all three if any later step fails) —
-discarding the flush(es) and reverting the in-memory tree(s). A failed
-`stm_sync_commit` is crash-equivalent — fs.c MUST wedge the fs (R154
-doctrine carry).
+The extent, inode, dirent, and xattr modules are all `btree_engine`-
+backed (incremental-COW B+tree); each commit is split across
+`stm_sync_commit`'s phases. In Phase 2 each `_commit_flush` writes the
+dirty nodes to fresh paddrs and yields the PROSPECTIVE root triple —
+which feeds `compute_merkle_root` + the final uberblock exactly as a
+finished root would. In Phase 3, after the final UB is durable, each
+`_commit_finalize` adopts that root + deferred-frees the superseded
+nodes. Every error path between flush and finalize runs `_commit_abort`
+for every engine whose flush has already succeeded — discarding the
+flush(es) and reverting the in-memory tree(s). The abort cascade
+(extent flushes first, then inode, then dirent, then xattr):
+
+| failure point                          | abort set                                |
+|----------------------------------------|------------------------------------------|
+| extent flush                           | (none — self-reverts)                    |
+| inode flush                            | extent                                   |
+| dirent flush                           | extent + inode                           |
+| xattr flush                            | extent + inode + dirent                  |
+| anything between xattr flush + UB write | extent + inode + dirent + xattr (all 4) |
+| post-UB write (any finalize failure)   | (none — commit point passed; fs wedges) |
+
+A failed `stm_sync_commit` is crash-equivalent — fs.c MUST wedge the fs
+(R154 doctrine carry).
 
 The explicit `stm_bootstrap_commit` at the end of Phase 2 is the
 durable-bitmap barrier. Every engine's flush set node bits in the
@@ -238,14 +252,13 @@ BEFORE the final UB write. Bitmap-then-UB is crash-safe — a crash with
 the bitmap durable but the UB stale only leaks the freshly-flushed
 nodes (bounded, non-corrupting); the reverse order would let a later
 `reserve` re-hand a still-rooted paddr and corrupt the tree
-(9.6-impl-4b design §5.2 case A). At 4c the remaining `btree_store`
-indices (dataset / snapshot / extent / repair_log / cas) still call
-`stm_bootstrap_commit` internally, so the explicit call is
-redundant-but-cheap; 4d retires extent's internal call and the
-explicit barrier becomes the dominant one (the surviving
-btree_store-backed indices still call it for their own legacy
-serialize-and-free path; harmless since the call is idempotent at the
-same gen).
+(9.6-impl-4b design §5.2 case A). At 4d the extent module's monolithic
+`_commit` internal `stm_bootstrap_commit` is retired from this code
+path (the test-only `stm_extent_index_commit` still calls it for
+unit-test isolation); the remaining `btree_store`-backed indices
+(dataset / snapshot / repair_log / cas) still call `stm_bootstrap_commit`
+internally, so the explicit call is redundant-but-cheap for them —
+harmless since the call is idempotent at the same gen.
 
 ### Mount flow
 

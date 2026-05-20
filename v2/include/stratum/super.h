@@ -438,8 +438,24 @@ extern "C" {
  * mis-slice a v28 value — the exact-match SB version check
  * (`version != STM_UB_VERSION` → STM_EBADVERSION) makes a v27 binary
  * refuse a v28 pool outright. v27 pools refused at v28 mount via
- * uniform STM_EBADVERSION. */
-#define STM_UB_VERSION        28u
+ * uniform STM_EBADVERSION.
+ *
+ * v28→v29 (9.6-impl-4d): cut the extent index over to the
+ * incremental-COW btree_engine substrate (the same persistence layer
+ * the inode / dirent / xattr indices use as of 9.6-impl-4b/c).
+ * On-disk key + value layout for individual extent records is
+ * UNCHANGED (24-byte key, 108-byte value v21); the persistence layer
+ * around them changes from btree_store (whole-tree-rebuild MVP) to
+ * btree_engine (incremental-COW B+tree with deferred-free + three-
+ * phase commit). The root_paddr / root_csum stamping in the uberblock
+ * is structurally identical; what changes is the on-disk envelope at
+ * that paddr (btree_store header vs engine root header) — so a v28
+ * binary would mis-read a v29 extent tree (and vice-versa). The
+ * exact-match SB version check makes the cross-version mismatch
+ * refuse-loud. v28 pools refused at v29 mount via STM_EBADVERSION;
+ * the new format is the SOLE supported persistence shape for the
+ * extent index post-4d. */
+#define STM_UB_VERSION        29u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
