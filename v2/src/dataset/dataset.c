@@ -21,7 +21,9 @@
 #include <stratum/bootstrap.h>
 #include <stratum/btnode.h>
 #include <stratum/btree.h>
+#include <stratum/btree_engine.h>     /* 9.7-impl-1c per-dataset engine */
 #include <stratum/btree_store.h>
+#include <stratum/engine_store.h>     /* 9.7-impl-1c STM_ENGINE_STORE_VT */
 #include <stratum/super.h>
 
 #include <pthread.h>
@@ -79,6 +81,25 @@ typedef struct {
     bool              present;
     bool              local_set[STM_PROP_COUNT];
     uint64_t          local_value[STM_PROP_COUNT];
+    /*
+     * 9.7-impl-1c (per-dataset metadata-tree engine substrate).
+     *
+     * Lazily opened on the first stm_dataset_index_get_engine call; NULL
+     * means the engine has not been touched yet, the engine was closed
+     * by stm_dataset_index_close_engine, or load_at swapped this slot
+     * in from the durable store before any access.
+     *
+     * Ownership: the index owns the engine handle. Closing happens at
+     * stm_dataset_destroy (the slot transitions away from PRESENT), at
+     * stm_dataset_index_close (every present slot's engine), and at
+     * load_at (before the wholesale shadow-swap; see ds_swap_in_shadow_locked).
+     *
+     * 1c-i posture: the four metadata modules (inode / dirent / xattr /
+     * extent_index) still route through the 4 pool-global engines; this
+     * field is unused by them. Subsequent 1c-ii..1c-v chunks migrate
+     * each module to consume the per-dataset engine via stm_metakey_*.
+     */
+    stm_btree_engine *engine;
 } dataset_slot;
 
 struct stm_dataset_index {
@@ -128,6 +149,24 @@ struct stm_dataset_index {
      * (a stale window value yields a stale heuristic decision, not a
      * soundness violation per R62 + R63 audits). */
     _Atomic uint64_t prop_mutation_gen;
+
+    /*
+     * 9.7-impl-1c per-dataset metadata-tree engine substrate (storage
+     * + crypt mirrors).
+     *
+     * All per-dataset engines (one per PRESENT dataset) borrow these two
+     * contexts. The vt_ctx mirror is populated from set_storage (the same
+     * bdev + boot the dataset table itself uses); the crypt mirror is
+     * populated from set_crypt_ctx (the same metadata_key + uuids). Both
+     * structs are stable members so the engines' borrowed pointers stay
+     * valid for the index's lifetime.
+     *
+     * Forward-note (TLY-A6): per-dataset DEKs threaded through TLY-A3's
+     * CORVUS keyslot will eventually replace the shared engine_crypt_ctx;
+     * the substrate ABI takes the crypt ctx by the index for v1.0.
+     */
+    stm_engine_store_ctx engine_store_ctx;     /* { boot, bdev } — engine vt_ctx */
+    stm_btree_crypt_ctx  engine_crypt_ctx;      /* metadata_key + uuids — engine cx */
 };
 
 /*
@@ -152,6 +191,16 @@ static inline pthread_mutex_t *dataset_lock(const stm_dataset_index *idx) {
  * Note: an "allocated" slot may be PRESENT or ABSENT; lookup callers
  * should additionally check slot->present for PRESENT semantics.
  */
+
+/* 9.7-impl-1c: forward decls — definitions sit alongside the public
+ * stm_dataset_index_get_engine / _close_engine API below set_crypt_ctx.
+ * Forward-declared here so the early users (close / destroy / load_at
+ * shadow swap) see them.
+ */
+static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
+                                                dataset_slot *slot);
+static void dataset_engine_close_locked(dataset_slot *slot);
+
 static size_t find_slot_locked(const stm_dataset_index *idx, uint64_t id) {
     for (size_t i = 0; i < idx->slots_len; i++) {
         if (idx->slots[i].e.id == id) return i;
@@ -310,6 +359,14 @@ stm_status stm_dataset_index_create(uint64_t current_txg,
 
 void stm_dataset_index_close(stm_dataset_index *idx) {
     if (!idx) return;
+    /* 9.7-impl-1c: close any open per-dataset engines before freeing
+     * slots[]. Iterates every slot (including ABSENT ones) for
+     * defense-in-depth — a destroyed slot should already have its
+     * engine NULL'd via stm_dataset_destroy, but a bug there would
+     * leak the engine here. */
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        dataset_engine_close_locked(&idx->slots[i]);
+    }
     pthread_mutex_destroy(&idx->lock);
     free(idx->slots);
     free(idx);
@@ -420,6 +477,12 @@ stm_status stm_dataset_destroy(stm_dataset_index *idx, uint64_t id) {
         must_unlock(&idx->lock);
         return STM_EBUSY;
     }
+    /* 9.7-impl-1c: drop the per-dataset engine before flipping present.
+     * A future get_engine on a non-PRESENT slot returns STM_ENOENT,
+     * so the engine is unreachable post-flip; closing here keeps the
+     * lifecycle tight and avoids carrying a dangling engine handle
+     * across the destroy. */
+    dataset_engine_close_locked(&idx->slots[s]);
     idx->slots[s].present = false;
     idx->dirty = true;
     must_unlock(&idx->lock);
@@ -1146,6 +1209,10 @@ stm_status stm_dataset_index_set_storage(stm_dataset_index *idx,
     must_lock(&idx->lock);
     idx->bdev = bdev_0;
     idx->boot = boot_0;
+    /* 9.7-impl-1c: mirror into the per-dataset engine vt_ctx so engines
+     * borrow the same { boot, bdev } pair the dataset table itself uses. */
+    idx->engine_store_ctx.boot = boot_0;
+    idx->engine_store_ctx.bdev = bdev_0;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -1162,6 +1229,152 @@ stm_status stm_dataset_index_set_crypt_ctx(stm_dataset_index *idx,
     idx->device_uuid[0] = device_uuid_0[0];
     idx->device_uuid[1] = device_uuid_0[1];
     idx->crypt_set      = true;
+    /* 9.7-impl-1c: mirror into the per-dataset engine crypt ctx. The
+     * metadata_key pointer is BORROWED from the caller; the uuids are
+     * copied (the source arrays are caller's stack/local at typical
+     * callers — sync_open). The engine reads these for AEAD AD and the
+     * key-derivation hash; v1.0 every per-dataset engine shares this
+     * single pool metadata_key. TLY-A6 will split this per-dataset. */
+    idx->engine_crypt_ctx.metadata_key    = metadata_key;
+    idx->engine_crypt_ctx.pool_uuid[0]    = pool_uuid[0];
+    idx->engine_crypt_ctx.pool_uuid[1]    = pool_uuid[1];
+    idx->engine_crypt_ctx.device_uuid[0]  = device_uuid_0[0];
+    idx->engine_crypt_ctx.device_uuid[1]  = device_uuid_0[1];
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+/* ========================================================================= */
+/* 9.7-impl-1c per-dataset engine helpers (caller holds idx->lock).            */
+/* ========================================================================= */
+
+/*
+ * Open (or create) the per-dataset btree_engine for `slot`. Caller holds
+ * idx->lock and verified slot->present. The engine is cached on
+ * slot->engine; subsequent calls are O(1) no-ops.
+ *
+ * The slot's (di_tree_root, di_root_gen, di_root_csum) triple is the
+ * open address: an all-zero triple is the "empty dataset" sentinel and
+ * the engine is created fresh; a non-zero triple opens the existing
+ * tree (lazy — no device I/O until first descent per
+ * btree_engine.h `stm_btree_engine_open`).
+ *
+ * tree_id = slot->e.id is passed to the engine so the AEAD additional-
+ * data weaves the dataset's id in; a cross-dataset substitution attack
+ * (a malicious actor swapping ondisk nodes between datasets) fails the
+ * decrypt.
+ *
+ * Returns STM_OK on success (engine already open is also STM_OK),
+ * STM_EINVAL if storage / crypt ctx not bound, propagates errors from
+ * stm_btree_engine_create / stm_btree_engine_open.
+ */
+static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
+                                                dataset_slot *slot) {
+    if (slot->engine != NULL) return STM_OK;
+
+    /* Both contexts must be bound — sync_open populates them BEFORE
+     * any get_engine call (engine_store_ctx.boot/bdev mirror idx->boot
+     * / idx->bdev; engine_crypt_ctx.metadata_key mirrors
+     * idx->metadata_key). Defense in depth: refuse if either bind
+     * is missing. */
+    if (idx->engine_store_ctx.boot == NULL ||
+        idx->engine_store_ctx.bdev == NULL ||
+        idx->engine_crypt_ctx.metadata_key == NULL) {
+        return STM_EINVAL;
+    }
+
+    stm_btree_engine *eng = NULL;
+    stm_status rc;
+    if (slot->e.di_tree_root == 0 && slot->e.di_root_gen == 0) {
+        /* All-zero triple ⇒ "empty dataset" sentinel: create fresh.
+         * The fresh engine starts with an in-memory empty-leaf root;
+         * the dataset's first sync_commit stamps a real triple. */
+        rc = stm_btree_engine_create(&STM_ENGINE_STORE_VT,
+                                       &idx->engine_store_ctx,
+                                       &idx->engine_crypt_ctx,
+                                       /*tree_id=*/slot->e.id,
+                                       &eng);
+    } else {
+        /* Non-zero triple ⇒ existing tree: open at its durable root.
+         * The first lookup / insert / scan descends to the device. */
+        rc = stm_btree_engine_open(&STM_ENGINE_STORE_VT,
+                                     &idx->engine_store_ctx,
+                                     &idx->engine_crypt_ctx,
+                                     /*tree_id=*/slot->e.id,
+                                     slot->e.di_tree_root,
+                                     slot->e.di_root_gen,
+                                     slot->e.di_root_csum,
+                                     &eng);
+    }
+    if (rc != STM_OK) return rc;
+    slot->engine = eng;
+    return STM_OK;
+}
+
+/*
+ * Close (destroy) the per-dataset engine on `slot` if one is open.
+ * Caller holds idx->lock. Safe to call when slot->engine is NULL —
+ * a no-op. The durable triple in slot->e.di_* is unchanged; a
+ * subsequent dataset_engine_open_locked re-opens at the same address.
+ *
+ * Used at:
+ *   - stm_dataset_destroy (the slot transitions away from PRESENT).
+ *   - stm_dataset_index_close (every PRESENT slot's engine).
+ *   - load_at's atomic shadow-swap (defensive — load_at typically
+ *     runs on a fresh idx with no open engines, but a future code
+ *     path that retains the idx across mounts would have to drop
+ *     stale engines here).
+ *   - stm_dataset_index_close_engine (the manual close API).
+ *
+ * stm_btree_engine_destroy is NULL-safe per its docstring; an engine
+ * with a flushed-but-unrooted commit pending implicitly aborts on
+ * destroy (the flushed paddrs are deferred-freed; sync's commit
+ * cascade is the only caller that holds an un-finalized flush, and
+ * sync wedges the fs if it can't finalize).
+ */
+static void dataset_engine_close_locked(dataset_slot *slot) {
+    if (slot->engine == NULL) return;
+    stm_btree_engine_destroy(slot->engine);
+    slot->engine = NULL;
+}
+
+/* ---- Public per-dataset engine API. ---- */
+
+stm_status stm_dataset_index_get_engine(stm_dataset_index *idx,
+                                           uint64_t dataset_id,
+                                           stm_btree_engine **out_engine) {
+    if (!idx || !out_engine) return STM_EINVAL;
+    *out_engine = NULL;
+    if (dataset_id == 0) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, dataset_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    stm_status rc = dataset_engine_open_locked(idx, &idx->slots[s]);
+    if (rc != STM_OK) {
+        must_unlock(&idx->lock);
+        return rc;
+    }
+    *out_engine = idx->slots[s].engine;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_index_close_engine(stm_dataset_index *idx,
+                                             uint64_t dataset_id) {
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, dataset_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    dataset_engine_close_locked(&idx->slots[s]);
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -1574,7 +1787,17 @@ stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
         return vs;
     }
 
-    /* Atomic swap: replace in-RAM slots[] with the validated shadow. */
+    /* Atomic swap: replace in-RAM slots[] with the validated shadow.
+     * 9.7-impl-1c: defense-in-depth — close any engines on existing
+     * slots before the wholesale swap. In practice the R65 P3-1
+     * comment notes load_at runs on fresh idx (no engines yet), but
+     * a future caller that retains the idx across mounts would leak
+     * engines without this. The shadow_slots are freshly-decoded so
+     * their engine fields are NULL (ds_decode_dataset_value memsets
+     * the slot first). */
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        dataset_engine_close_locked(&idx->slots[i]);
+    }
     free(idx->slots);
     idx->slots     = lc.shadow_slots;
     idx->slots_len = lc.shadow_len;

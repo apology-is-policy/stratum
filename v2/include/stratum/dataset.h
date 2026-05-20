@@ -59,8 +59,9 @@
 extern "C" {
 #endif
 
-struct stm_bdev;       typedef struct stm_bdev       stm_bdev;
-struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
+struct stm_bdev;          typedef struct stm_bdev          stm_bdev;
+struct stm_bootstrap;     typedef struct stm_bootstrap     stm_bootstrap;
+struct stm_btree_engine;  typedef struct stm_btree_engine  stm_btree_engine;
 
 /* Dataset id 1 is the root dataset, created at index init time.
  * Parent id 0 is the sentinel "no parent" (only root has it). */
@@ -659,6 +660,81 @@ stm_status stm_dataset_index_get_next_id(const stm_dataset_index *idx,
  */
 uint64_t stm_dataset_index_property_mutation_gen(
         const stm_dataset_index *idx);
+
+/* ========================================================================= */
+/* 9.7-impl-1c: per-dataset metadata-tree engine substrate.                    */
+/*                                                                             */
+/* Each PRESENT dataset owns one stm_btree_engine instance, lazily opened on  */
+/* first stm_dataset_index_get_engine call. The engine is rooted at the slot */
+/* entry's triple (di_tree_root, di_root_gen, di_root_csum); an all-zero      */
+/* triple is the "empty dataset" sentinel and the engine starts fresh.        */
+/*                                                                             */
+/* The engine borrows the dataset index's storage (bdev + boot) and crypt    */
+/* context (metadata_key + uuids), bound via set_storage / set_crypt_ctx.    */
+/* tree_id is set to dataset_id so the engine's AEAD additional-data weaves */
+/* the dataset's id in — a cross-dataset substitution attack fails decrypt.  */
+/*                                                                             */
+/* At 1c the substrate stands up; the four metadata modules (inode, dirent,  */
+/* xattr, extent_index) still route through the four pool-global engines    */
+/* (the 4-engine cascade). Subsequent chunks (1c-ii..1c-v) migrate each      */
+/* module to consume the per-dataset engine via stm_metakey_compose;         */
+/* 1c-vi retires the pool-global engines + reserved-zeroes the four         */
+/* ub_{inode,dirent,xattr,extent}_root fields.                                */
+/*                                                                             */
+/* TLY-A6 (forward-noted) will eventually thread per-dataset DEKs in here   */
+/* via TLY-A3's CORVUS keyslot. The substrate ABI takes the crypt ctx by    */
+/* the index; for v1.0 every per-dataset engine shares the pool's metadata  */
+/* key.                                                                       */
+/* ========================================================================= */
+
+/*
+ * Lazily open the per-dataset btree_engine for `dataset_id`. On first call
+ * the engine is created (all-zero triple) or opened (non-zero triple) from
+ * the slot entry's (di_tree_root, di_root_gen, di_root_csum); subsequent
+ * calls return the cached handle. The returned engine is owned by the index
+ * — DO NOT destroy it; it is closed at stm_dataset_index_close OR when the
+ * dataset is destroyed.
+ *
+ * Mandatory pre-requisites: stm_dataset_index_set_storage AND
+ * stm_dataset_index_set_crypt_ctx must have been called first (the engine
+ * borrows their bdev / boot / metadata_key / uuids). Storage / crypt-ctx
+ * unbound returns STM_EINVAL.
+ *
+ * Refusals:
+ *   - NULL idx OR NULL out_engine (STM_EINVAL).
+ *   - dataset_id == 0 (STM_EINVAL — root sentinel).
+ *   - Dataset not PRESENT (STM_ENOENT — destroyed or never created).
+ *   - storage / crypt ctx not bound (STM_EINVAL).
+ *   - Engine create / open failure: device / decrypt / corrupt errors
+ *     propagate verbatim.
+ *
+ * Concurrency: takes idx's lock; safe for concurrent callers.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_get_engine(stm_dataset_index *idx,
+                                           uint64_t dataset_id,
+                                           stm_btree_engine **out_engine);
+
+/*
+ * Close the per-dataset engine for `dataset_id`, if open. The slot's
+ * triple is unchanged (the engine's last durable root is already stamped
+ * there from the most recent successful commit). After return the next
+ * stm_dataset_index_get_engine for this dataset re-opens at the triple.
+ *
+ * Used by the 1c-ii..1c-v module-cutover paths (post-commit teardown of
+ * a dropped-from-cache engine) AND by stm_fs_rollback_snapshot which
+ * needs to drop the in-RAM tree so the swapped triple's open governs.
+ *
+ * Refusals:
+ *   - NULL idx (STM_EINVAL).
+ *   - dataset_id == 0 (STM_EINVAL).
+ *   - Dataset not PRESENT (STM_ENOENT).
+ *
+ * STM_OK whether the engine was open or not (no-op when closed).
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_close_engine(stm_dataset_index *idx,
+                                             uint64_t dataset_id);
 
 #ifdef __cplusplus
 }

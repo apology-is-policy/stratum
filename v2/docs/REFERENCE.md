@@ -38,25 +38,62 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: Phase 9.7-impl-1a — `v2/src/metakey/` lib lands. New
-  small chokepoint for the 1-byte type-tag prefix that
-  discriminates per-record-kind subspaces inside a single
-  per-dataset `btree_engine`. No callers yet; consumers wire in at
-  9.7-impl-1c when each of the four metadata modules (inode +
-  dirent + xattr + extent) cuts over to the new key shape and the
-  pool-global engines are retired.
-  - **STM_UB_VERSION stays at 29** — 1a is foundation only, no
-    on-disk format change. 1b lands the dataset entry extension
-    (`di_tree_root` + `di_root_gen` + `di_root_csum[32]`) AND the
-    UB v30 bump together.
-  - **16 new test cases** in `tests/test_metakey.c` covering
-    roundtrip across every kind, every refusal class, and the
-    tag-byte-dominates-lex-order property.
-  - **ctest 64/64 GREEN** at the 1a tip (63 carried + 1 new).
-  - **What's next**: 9.7-impl-1b — dataset entry 3-field extension
-    + UB v30 bump. R157 audit gates the full 9.7-impl-1 close.
+- **Tip**: Phase 9.7-impl-1c — per-dataset `btree_engine` substrate
+  on the dataset index. `stm_dataset_index_get_engine` /
+  `_close_engine` stand up the lifecycle: each `dataset_slot` gains
+  a lazily-opened `stm_btree_engine *` rooted at the slot entry's
+  triple (`di_tree_root`, `di_root_gen`, `di_root_csum`). All-zero
+  triple → engine created fresh; non-zero → opened. The engine is
+  cached on the slot for subsequent `get_engine` calls; closed at
+  `stm_dataset_destroy`, `stm_dataset_index_close`, and the
+  `load_at` shadow-swap. The engine borrows the same bdev/boot +
+  metadata_key/uuids the dataset table itself uses, mirrored into
+  fresh `engine_store_ctx` + `engine_crypt_ctx` fields on the index
+  at `set_storage` / `set_crypt_ctx` time. `tree_id = dataset_id`
+  weaves the dataset id into AEAD additional-data so cross-dataset
+  substitution attacks fail decrypt.
+  - **STM_UB_VERSION stays at 30** — 1c is a code-path substrate
+    change, no on-disk format change. The 1b dataset-entry triple
+    (already on disk at v30) is the durable identity the new
+    engines bind to.
+  - **1c-i posture**: the four metadata modules (inode / dirent /
+    xattr / extent_index) STILL route through the pool-global
+    4-engine cascade. The per-dataset engines stand up + survive
+    the lifecycle (create / destroy / index close / load_at swap)
+    but are not yet consumed. 1c-ii..1c-v migrate each module to
+    consume the per-dataset engine via `stm_metakey_compose`;
+    1c-vi retires the four pool-global engines + reserved-zeroes
+    `ub_{inode,dirent,xattr,extent}_root`.
+  - **9 new test cases** in `tests/test_dataset.c`:
+    NULL/dataset_id=0 EINVAL, storage+crypt-unbound EINVAL,
+    missing-dataset ENOENT, lazy create + cached-handle on second
+    get, insert/lookup roundtrip on the opened engine, distinct
+    engines per dataset (D1 invariant), close + re-open,
+    close-idempotent-on-never-opened, destroy closes engine →
+    subsequent get ENOENT, index close releases all open engines
+    without leaking.
+  - **ctest 64/64 GREEN** at the 1c tip (test_dataset grew 62 → 71
+    cases; everything else unchanged).
+  - **What's next**: 9.7-impl-1c-ii — first module migration (inode
+    cuts over to the per-dataset engine + metakey keys). R157
+    audit gates the full 9.7-impl-1 close after all five module
+    cutover chunks (1c-ii..1c-vi) land.
 
-- **Pre-tip-1**: Phase 9.6-impl-4d — the final cutover that lands
+- **Pre-tip-1**: Phase 9.7-impl-1b — `stm_dataset_entry` gains the
+  3-field triple (`di_tree_root` + `di_root_gen` +
+  `di_root_csum[32]`); DS_VAL_FIXED grows 80 → 128 bytes;
+  STM_UB_VERSION bumped 29 → 30. The triple is the durable identity
+  of each dataset's per-dataset `btree_engine` (consumed by 1c at
+  this commit). Three `*_ub_version_is_v29` tests renamed `_is_v30`.
+  Encoder/decoder extended; persistence roundtrip verified.
+
+- **Pre-tip-2**: Phase 9.7-impl-1a — `v2/src/metakey/` lib lands.
+  Small chokepoint for the 1-byte type-tag prefix that
+  discriminates per-record-kind subspaces inside a single
+  per-dataset `btree_engine`. No callers yet (1c-ii..1c-v wire
+  them in). 16 new test cases + reference doc.
+
+- **Pre-tip-3**: Phase 9.6-impl-4d — the final cutover that lands
   the Metadata Tree Engine (`btree_engine`) as the persistence
   substrate for every load-bearing metadata index. The extent index
   ([14-extent.md](reference/14-extent.md)) is now `btree_engine`-
@@ -92,18 +129,18 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 63/63 GREEN** at the 4d tip.
   - **What's next**: Phase 9.7 (snapshots, **D1**) → 9.8 (Bε + Bw).
 
-- **Pre-tip-2**: 9.6-impl-4c — cut dirent + xattr to `btree_engine`
+- **Pre-tip-4**: 9.6-impl-4c — cut dirent + xattr to `btree_engine`
   + three-phase sync wiring for three engines (`0def2a0`) + R155
   close (`3233611`; 4 missing xattr persistence tests added).
   Verdict: 0 P0/P1/P2 + 4 P3 (only P3-1 actionable).
 
-- **Pre-tip-3**: 9.6-impl-4b — production vtable + sync wiring +
+- **Pre-tip-5**: 9.6-impl-4b — production vtable + sync wiring +
   inode cutover. Chain: design (`24475bd`), 4b-i engine store vtable
   TU (`6f45271`), 4b-ii inode cutover (`051b76c`), 4b-iii three-phase
   sync wiring + bootstrap_commit relocation (`9cf0c75`), R154 close
   (`0165f4c`; Q2 wedge-on-failed-sync at fs.c).
 
-- **Pre-tip-4**: 9.6-impl-4a — engine completion (delete +
+- **Pre-tip-6**: 9.6-impl-4a — engine completion (delete +
   scan_range) (`18946c5`) + R153 close (`fd3f188`). The cutover
   required two engine APIs the impl-1..3 chain hadn't shipped:
   `stm_btree_engine_delete` (extent's truncate/punch/migrate uses
@@ -111,7 +148,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   (the (ds, ino) / (dir_ino) / (ino) prefix iterations). Design
   rationale in `phase-9.6-impl-4-cutover-design.md` §3.
 
-- **Pre-tip-5**: Phase 9.6-impl-3 — large-value spill for the Metadata
+- **Pre-tip-7**: Phase 9.6-impl-3 — large-value spill for the Metadata
   Tree Engine (`btree_engine`). Stores a value too large to sit inline
   in a 16-KiB node out-of-line, in a forward-linked chain of AEAD-
   encrypted + Merkle-csummed spill blocks; the leaf entry holds a
@@ -121,12 +158,12 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   opaque value bytes, so the shared `btnode` codec is untouched.
   R152 closed (`0b3ebd1`; 3 P3 fixes).
 
-- **Pre-tip-6**: Phase 9.6-impl-2 — incremental commit (the
+- **Pre-tip-8**: Phase 9.6-impl-2 — incremental commit (the
   `commit_flush` / `commit_finalize` / `commit_abort` three-phase
   split, deferred-free of superseded paddrs, crash-revert); composes
   against `btree.tla`. R151 closed.
 
-- **Pre-tip-7**: Phase 9.6-impl-1a / 1b — the bootstrap allocator
+- **Pre-tip-9**: Phase 9.6-impl-1a / 1b — the bootstrap allocator
   16-KiB node granularity, then the structural engine + the node-
   size-parameterized `btnode` codec. R149 + R150 closed.
 
@@ -135,7 +172,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   reference docs, `git log`, and the memory index rather than
   expanded in this Snapshot list.
 
-- **Pre-tip-8**: R134 audit close (`2a117e9`). 0 P0, 0 P1, 3 P2 — all
+- **Pre-tip-10**: R134 audit close (`2a117e9`). 0 P0, 0 P1, 3 P2 — all
   test/doc-drift; no impl correctness issue. Closed by adding
   shared-parents rename test (provokes NoCircularWait deadlock if
   pin_many's sort is removed; verified by neutering the sort and
@@ -143,7 +180,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   tests + accurate CLAUDE.md / REFERENCE.md framing on the disjoint
   test's actual coverage.
 
-- **Pre-tip-9**: P9.5-PARALLEL-3 impl-3 (`7970bcf`). Ports `stm_fs_rename`
+- **Pre-tip-11**: P9.5-PARALLEL-3 impl-3 (`7970bcf`). Ports `stm_fs_rename`
   to `fs->global` SH + per-inode pin on up to 4 inodes (src_parent +
   dst_parent + src_ino + [dst_ino if overwrite/EXCHANGE]) via a new
   `stm_inode_pin_many` helper. This is the first commit where
@@ -207,7 +244,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **Next**: impl-4 (cross-dataset ops — copy_file_range, reflink).
     impl-5 drops residual EX takes. impl-6 perf regression test.
 
-- **Pre-tip-10**: R133 audit close (`fdbfff3`). Three findings from the
+- **Pre-tip-12**: R133 audit close (`fdbfff3`). Three findings from the
   R133 prosecutor (scoping impl-1 + impl-2) addressed:
   - **P1-1 — rwlock writer-preference attr**: `fs->global` now
     initialized with `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`
@@ -238,7 +275,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 54/54 GREEN**. Rust unit 97/97. e2e_crud 33/33.
     concurrent_ctl 2/2.
 
-- **Pre-tip-11**: P9.5-PARALLEL-3 impl-2 (`499a988`). Ports the
+- **Pre-tip-13**: P9.5-PARALLEL-3 impl-2 (`499a988`). Ports the
   2-inode surface to `fs->global` SH + per-inode pin: unlink /
   rmdir / create_file / mkdir / symlink / linkat_anon /
   unlink_anon / create_anon / link / link_by_ino. Adds
@@ -284,14 +321,14 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     the residual EX takes (every remaining unported `stm_fs_*` that
     still falls back to wrlock). impl-6 lands a perf regression test.
 
-- **Pre-tip-12**: P9.5-PARALLEL-3 impl-1 foundation commit (`39071cf`).
+- **Pre-tip-14**: P9.5-PARALLEL-3 impl-1 foundation commit (`39071cf`).
   Converts `fs->lock` from `pthread_mutex_t` to `pthread_rwlock_t
   fs->global`, introduces the `stm_inode_pin/_unpin` per-inode mutex
   API (256-bucket refcounted hash-table of stable mutex slots), and
   ports the three single-inode setattr-shape ops (chmod / chown /
   utimens) onto the SH + per-inode-pin path. R133 audit pending.
 
-- **Pre-tip-13**: P9.5-POLISH-1 xattr pair client primitives
+- **Pre-tip-15**: P9.5-POLISH-1 xattr pair client primitives
   (`e208cb9`). `libstratum-9p` adds `stm_9p_xattrwalk` +
   `stm_9p_xattrcreate` — the LAST deferred surface from POLISH-1
   #927. Closes the entire v9fs-critical-path client API set. Linux
@@ -333,7 +370,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     The remaining libstratum-9p deferred items (Tflush, async
     API, 9P2000 non-.L dialect) are NOT v9fs-mount-critical.
 
-- **Pre-tip-14**: P9.5-POLISH-1 batch — Tstatfs + Stratum extensions
+- **Pre-tip-16**: P9.5-POLISH-1 batch — Tstatfs + Stratum extensions
   client primitives (`e357a12`). Adds 4 kernel-v9fs-critical-path
   ops + Tsync (whole-pool barrier). `libstratum-9p` covers
   Tstatfs (df / vfs_statfs), Tsync (pool-wide commit without a fid),
@@ -373,7 +410,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 54/54 GREEN** (test_9p_client now runs 58 cases, up
     from 51). Rust suites unchanged.
 
-- **Pre-tip-15**: P9.5-POLISH-1 Tlock + Tgetlock client primitives
+- **Pre-tip-17**: P9.5-POLISH-1 Tlock + Tgetlock client primitives
   (`d4e5d67`). `libstratum-9p` gained advisory byte-range locking.
   Composes against `locks.tla::AcquireLock`/`ReleaseLock`/`GetLock`
   through the server.
@@ -400,7 +437,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 54/54 GREEN** (test_9p_client now runs 51 cases, up
     from 43). Rust suites unchanged.
 
-- **Pre-tip-16**: R128 P3-1/P3-8 + R129 P3-3/P3-4 doc-drift forward-note
+- **Pre-tip-18**: R128 P3-1/P3-8 + R129 P3-3/P3-4 doc-drift forward-note
   closures (`4267b3d`). Comment-only: corrected
   `stm_dirty_buffer_destroy` stale auto-wedge claim, rewrote
   `stm_dirty_buffer_drain_ino` doc-comment to match pop-on-success
@@ -408,13 +445,13 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   install_production_cb cleanup-order comment + fs->pool/sync
   immutability comment.
 
-- **Pre-tip-17**: R131 P3-4 + P3-5 saturation guards (`4cf257c`).
+- **Pre-tip-19**: R131 P3-4 + P3-5 saturation guards (`4cf257c`).
   `stm_ctl_conn_create` refuses with STM_EOVERFLOW when
   `worker_count == UINT32_MAX`; `/admin/clear-events` write refuses
   with STM_EOVERFLOW when `event_gen == UINT64_MAX`. R29 P3-1
   doctrine carry (refuse rather than wrap).
 
-- **Pre-tip-18**: Reference-doc backfill — Phase 9 modules
+- **Pre-tip-20**: Reference-doc backfill — Phase 9 modules
   (`ad0d087`+`d317bfb`+`3065c21`; DOC-ONLY). Closes the second
   half of the Phase 9 deferment forward-noted in CLAUDE.md (R96
   P3-8): per-subsystem `reference/NN-*.md` catalog for the Phase
@@ -425,7 +462,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     template: Purpose, Public API, Implementation, Spec
     cross-reference, SPEC-TO-CODE mapping, Tests, Status table.
 
-- **Pre-tip-19**: Reference-doc backfill — Phase 8 modules (`cac568c`;
+- **Pre-tip-21**: Reference-doc backfill — Phase 8 modules (`cac568c`;
   DOC-ONLY). Per-subsystem `reference/NN-*.md` catalog for the
   Phase 8 POSIX-surface modules: `16-inode.md`
   (`inode.tla::TupleUniqueAllTime`), `17-dirent.md`
@@ -435,7 +472,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   (`locks.tla::NoConflictingLocks`). REFERENCE.md Contents index
   also gained the previously-missing `15-cas.md` row.
 
-- **Pre-tip-20**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
+- **Pre-tip-22**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
   `fs->lock` granularity refinement (SPEC ONLY, no impl yet). Lays
   down the formal model + design doc the multi-commit impl phase
   (future sessions) will reference.
@@ -458,7 +495,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification (#973 tooling-gated); impl-1..6
     multi-commit deferred.
 
-- **Pre-tip-21**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
+- **Pre-tip-23**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
   spec + regression test. The chunk verifies and
   documents the contract that emerges under post-PARALLEL-1
   concurrent /ctl/: **per-subsystem linearizable + cross-subsystem
@@ -504,7 +541,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification of compound_ops.tla (tooling-gated
     like #958; expected verdicts documented in each cfg header).
 
-- **Pre-tip-22**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
+- **Pre-tip-24**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
   accept + R131 audit close + #961 dedicated concurrent regression
   tests. `v2/include/stratum/ctl.h` declares the new
   per-connection wrapper API (`stm_ctl_conn_create` / `_destroy` /
@@ -545,7 +582,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   row + stratumd row updated. Outstanding sub-task: #958 (TLC
   verify ctl_conn.tla, tooling-gated).
 
-- **Pre-tip-23**: P9-CTL-2b /ctl/ codec migration to lp9.
+- **Pre-tip-25**: P9-CTL-2b /ctl/ codec migration to lp9.
   `v2/src/ctl/synfs.c` + `v2/include/stratum/ctl.h` + `v2/tests/test_ctl.c`
   all re-keyed from `stm_p9_server` (9P2000 vops) to `stm_lp9_server`
   (.L vops). The `KIND_META[]` table, `qid_path` encoding, materializer

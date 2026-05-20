@@ -163,6 +163,62 @@ load leaves the index unchanged.
 `set_next_id` is used at mount to seed from `ub_next_dataset_id`;
 refuses regression below `max_present + 1` (R31 P2-4).
 
+### Per-dataset metadata-tree engine substrate (9.7-impl-1c)
+
+```c
+stm_status stm_dataset_index_get_engine   (stm_dataset_index *idx,
+                                              uint64_t dataset_id,
+                                              stm_btree_engine **out_engine);
+stm_status stm_dataset_index_close_engine (stm_dataset_index *idx,
+                                              uint64_t dataset_id);
+```
+
+`get_engine` lazily opens the per-dataset `btree_engine` rooted at
+the slot entry's triple (`di_tree_root`, `di_root_gen`,
+`di_root_csum`); on first call the engine is created (all-zero
+triple) or opened (non-zero triple). Subsequent calls return the
+cached handle. The engine borrows the dataset index's storage +
+crypt context (`set_storage` + `set_crypt_ctx` populate engine
+context mirrors at the same time they populate the dataset table's
+own context). The engine's `tree_id` is set to the dataset id so
+the AEAD additional-data weaves the dataset's id in — a
+cross-dataset substitution attack fails decrypt.
+
+`close_engine` drops the cached handle without touching the durable
+triple; a subsequent `get_engine` re-opens at the same address.
+Used by the rollback mechanism (9.7-impl-4) which swaps the
+dataset's triple and needs the in-RAM tree dropped so the swapped
+root governs the next access.
+
+**1c-i posture**: the four metadata modules (inode / dirent / xattr
+/ extent_index) STILL route through the pool-global 4-engine
+cascade. The per-dataset engines stand up + survive the lifecycle
+(create / destroy / index close / load_at swap) but are not yet
+consumed by any module. Subsequent chunks (1c-ii..1c-v) migrate
+each module to consume the per-dataset engine via
+`stm_metakey_compose`; 1c-vi retires the four pool-global engines +
+reserved-zeroes `ub_{inode,dirent,xattr,extent}_root`.
+
+**Lifecycle**:
+- Fresh slot (after `_create_child`): `engine == NULL`, triple
+  all-zero. First `get_engine` creates a fresh empty-leaf engine;
+  the dataset's first sync commit stamps a real triple.
+- Destroy: `stm_dataset_destroy` calls `dataset_engine_close_locked`
+  on the doomed slot BEFORE flipping `present = false`, so a future
+  get_engine on the destroyed id surfaces `STM_ENOENT`.
+- Index close: every slot's engine is destroyed before slots[] is
+  freed (defense-in-depth — destroyed slots already had their
+  engine closed at destroy time).
+- `load_at`: existing slots' engines are closed before the
+  wholesale shadow-swap. In practice `load_at` runs on a fresh idx
+  with no engines yet (R65 P3-1), but the discipline carries.
+
+**Crypt forward-note (TLY-A6)**: per-dataset DEKs threaded through
+TLY-A3's CORVUS keyslot will eventually replace the shared engine
+crypt context; the substrate ABI takes the crypt ctx by the index
+for v1.0. Every per-dataset engine shares the pool's metadata key
+today.
+
 ## On-disk encoding (v22)
 
 ### Key
@@ -277,7 +333,7 @@ runtime).
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_dataset` | 62 | Lifecycle (create/destroy/rename/move w/ all error paths); concurrent Create stress (8 threads × 100 ops); IdMonotonic / BirthTxgMonotonic / SiblingNameUnique / ForestStructure / RootInvariant; property API (5 props × 3 kinds × inherit-walk); STM_PROP_PROMOTE_DECAY_WINDOW chain inheritance + explicit-zero-as-legal-value (P7-CAS-12); property-mutation gen counter advance on each mutation type + no-advance on idempotent / failed mutation + NULL-defensive read (P7-CAS-14); clone create + arg validation + sibling-collision; promote semantics; clones_count_for_snap; persist roundtrip including pool defaults, ABSENT slots, properties (all 5 slots in v22 layout), clones, and post-mount counters; idempotent commit; tamper detection (csum/key/gen); next_id + current_txg seeding from on-disk + UB. |
+| `test_dataset` | 71 | Lifecycle (create/destroy/rename/move w/ all error paths); concurrent Create stress (8 threads × 100 ops); IdMonotonic / BirthTxgMonotonic / SiblingNameUnique / ForestStructure / RootInvariant; property API (5 props × 3 kinds × inherit-walk); STM_PROP_PROMOTE_DECAY_WINDOW chain inheritance + explicit-zero-as-legal-value (P7-CAS-12); property-mutation gen counter advance on each mutation type + no-advance on idempotent / failed mutation + NULL-defensive read (P7-CAS-14); clone create + arg validation + sibling-collision; promote semantics; clones_count_for_snap; persist roundtrip including pool defaults, ABSENT slots, properties (all 5 slots in v22 layout), clones, and post-mount counters; idempotent commit; tamper detection (csum/key/gen); next_id + current_txg seeding from on-disk + UB. 9.7-impl-1c per-dataset engine substrate (9 tests): EINVAL on NULL / dataset_id=0; storage+crypt-unbound EINVAL; ENOENT on missing dataset; lazy create + cached-handle on second get; insert/lookup roundtrip on the opened engine; engine instances distinct per dataset (D1 invariant); close + re-open; close idempotent on never-opened slot; destroy closes engine → subsequent get ENOENT; index close releases all open engines without leaking. |
 | `test_sync` | 24 | Mount/unmount roundtrip via sync handle; snap delete refused with clone (cb wires through); destroy-all-clones unblocks delete; clone state survives mount with cb rehydration. |
 
 ## Status
@@ -290,6 +346,10 @@ runtime).
 - [x] R31 atomic shadow-swap on load + structural validator.
 - [x] Idempotent commit.
 - [x] STM_BPTR_KIND_DATASET (=9) on `ub_main_root`.
+- [x] 9.7-impl-1c per-dataset engine substrate: `stm_dataset_index_get_engine`
+      / `_close_engine` + slot lifecycle wiring. Module-level cutover
+      (consume the engine from inode / dirent / xattr / extent_index)
+      lands in 1c-ii..1c-v.
 - [ ] Multi-level btree when datasets exceed single-leaf cap
       (~460 entries — single-leaf is MVP). Extension via existing
       btree_store machinery.

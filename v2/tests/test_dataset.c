@@ -22,6 +22,7 @@
 #include "tharness.h"
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
+#include <stratum/btree_engine.h>     /* 9.7-impl-1c engine substrate tests */
 #include <stratum/crypto.h>
 #include <stratum/dataset.h>
 
@@ -2010,6 +2011,265 @@ STM_TEST(clone_persist_roundtrip) {
     STM_ASSERT_EQ(n200, (size_t)0);   /* c3 was promoted before commit */
 
     stm_dataset_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+/* ====================================================================== */
+/* 9.7-impl-1c per-dataset engine substrate.                                */
+/*                                                                          */
+/* These tests exercise the new stm_dataset_index_get_engine /              */
+/* _close_engine API alongside the slot's lifecycle. At 1c-i the four      */
+/* metadata modules (inode / dirent / xattr / extent_index) STILL route   */
+/* through the pool-global engines; the substrate is dead-code-but-       */
+/* exercised here so the lifecycle (open / close / destroy / close_index) */
+/* lands audit-clean before subsequent chunks migrate the modules.        */
+/* ====================================================================== */
+
+STM_TEST(dataset_engine_get_returns_einval_on_null) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_ERR(stm_dataset_index_get_engine(NULL, 1, &eng), STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_index_get_engine(idx, 1, NULL),  STM_EINVAL);
+    /* dataset_id = 0 is reserved sentinel. */
+    STM_ASSERT_ERR(stm_dataset_index_get_engine(idx, 0, &eng),  STM_EINVAL);
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(dataset_engine_get_refuses_without_storage_or_crypt) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    stm_btree_engine *eng = NULL;
+    /* Storage + crypt both unbound on a fresh idx. */
+    STM_ASSERT_ERR(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID, &eng),
+                    STM_EINVAL);
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(dataset_engine_get_returns_enoent_on_missing_dataset) {
+    dsp_make_tmp("eng_enoent");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+    stm_btree_engine *eng = NULL;
+    /* A dataset id that has never been allocated → STM_ENOENT. */
+    STM_ASSERT_ERR(stm_dataset_index_get_engine(idx, 9999, &eng), STM_ENOENT);
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_engine_lazy_open_roundtrip) {
+    dsp_make_tmp("eng_lazy");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    /* The root dataset (id=1) was seeded at create time with an all-zero
+     * triple → first get_engine creates a fresh engine. */
+    stm_btree_engine *eng_root = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID,
+                                                 &eng_root));
+    STM_ASSERT(eng_root != NULL);
+
+    /* Second call returns the SAME cached handle (no re-open). */
+    stm_btree_engine *eng_root_2 = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID,
+                                                 &eng_root_2));
+    STM_ASSERT_EQ(eng_root_2, eng_root);
+
+    /* Insert a record + read it back to verify the engine is operational.
+     * 16-byte key (8B "tag||body" placeholder; the metakey lib is not yet
+     * wired into the module call sites — that's 1c-ii..1c-v). */
+    uint8_t key[16] = { 0x01, 0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0x42 };
+    uint8_t val[32]; for (size_t i = 0; i < sizeof val; i++) val[i] = (uint8_t)i;
+    STM_ASSERT_OK(stm_btree_engine_insert(eng_root, key, sizeof key,
+                                            val, sizeof val));
+    bool found = false; void *vbuf = NULL; size_t vlen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng_root, key, sizeof key,
+                                            &found, &vbuf, &vlen));
+    STM_ASSERT(found);
+    STM_ASSERT_EQ(vlen, sizeof val);
+    STM_ASSERT(memcmp(vbuf, val, vlen) == 0);
+    free(vbuf);
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_engine_distinct_per_dataset) {
+    dsp_make_tmp("eng_distinct");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    uint64_t child_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "alpha", &child_id));
+    stm_btree_engine *eng_root  = NULL;
+    stm_btree_engine *eng_child = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID,
+                                                 &eng_root));
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, child_id,
+                                                 &eng_child));
+    STM_ASSERT(eng_root != NULL && eng_child != NULL);
+    /* Distinct engines per dataset — D1: ONE engine per dataset. */
+    STM_ASSERT(eng_root != eng_child);
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_engine_close_drops_handle_next_get_reopens) {
+    dsp_make_tmp("eng_close_reopen");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    stm_btree_engine *eng_a = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID,
+                                                 &eng_a));
+    STM_ASSERT(eng_a != NULL);
+
+    /* Close the cached handle. */
+    STM_ASSERT_OK(stm_dataset_index_close_engine(idx, STM_DATASET_ROOT_ID));
+
+    /* Next get re-opens; the triple is still all-zero (no commit happened
+     * via the engine, so the slot's di_* fields stayed at 0), so a fresh
+     * engine is created. The new handle is a distinct pointer from eng_a. */
+    stm_btree_engine *eng_b = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID,
+                                                 &eng_b));
+    STM_ASSERT(eng_b != NULL);
+    /* Pointer values can technically be identical if malloc reuses the slot
+     * — that's not a defect, just an implementation detail. We assert
+     * the get succeeded; opaque pointer equality is not part of the
+     * contract. */
+    (void)eng_a;
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_engine_close_idempotent_when_unopened) {
+    dsp_make_tmp("eng_close_idem");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    /* Engine never opened; close is a no-op STM_OK. */
+    STM_ASSERT_OK(stm_dataset_index_close_engine(idx, STM_DATASET_ROOT_ID));
+
+    /* dataset_id = 0 is still EINVAL even on close. */
+    STM_ASSERT_ERR(stm_dataset_index_close_engine(idx, 0), STM_EINVAL);
+    /* Missing dataset → ENOENT. */
+    STM_ASSERT_ERR(stm_dataset_index_close_engine(idx, 4242), STM_ENOENT);
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_engine_destroyed_dataset_returns_enoent) {
+    dsp_make_tmp("eng_destroy_enoent");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    uint64_t cid = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "doomed", &cid));
+    /* Open the engine, then destroy the dataset; the engine should be
+     * closed by stm_dataset_destroy's lifecycle hook, and a subsequent
+     * get_engine on this id returns STM_ENOENT (slot ABSENT). */
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, cid, &eng));
+    STM_ASSERT(eng != NULL);
+
+    STM_ASSERT_OK(stm_dataset_destroy(idx, cid));
+    STM_ASSERT_ERR(stm_dataset_index_get_engine(idx, cid, &eng), STM_ENOENT);
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_engine_index_close_releases_all_open_engines) {
+    dsp_make_tmp("eng_close_all");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    /* Three present datasets, all engines opened. */
+    uint64_t a = 0, b1 = 0, c = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "a", &a));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "b", &b1));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "c", &c));
+    stm_btree_engine *e_root = NULL, *e_a = NULL, *e_b = NULL, *e_c = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID, &e_root));
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, a,  &e_a));
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, b1, &e_b));
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, c,  &e_c));
+    STM_ASSERT(e_root && e_a && e_b && e_c);
+
+    /* Close the index: it MUST free all four engines without leaking
+     * (ASan would catch the leak; here we just assert the close runs). */
+    stm_dataset_index_close(idx);
+
     stm_bootstrap_close(b);
     stm_bdev_close(d);
     unlink(dsp_tmp_path);
