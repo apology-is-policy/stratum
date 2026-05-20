@@ -1,32 +1,69 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * Stratum v2 — dirent index implementation (P8-POSIX-2).
+ * Stratum v2 — dirent index implementation
+ * (P8-POSIX-2 + 9.6-impl-4c).
  *
  * Spec: v2/specs/dirent.tla. Models open-addressing chain integrity
  * for directory entries keyed by `(dataset_id, dir_ino, hash_probe)`
  * where `hash_probe = fnv1a64(name) + probe_offset`. Per ARCH §11.4.
  *
- * On-disk encoding:
+ * 9.6-impl-4c — the dirent cutover. The module no longer keeps an
+ * in-RAM `records[]` array serialized whole on every commit: the
+ * btree_engine COW B+tree (Phase 9.6) IS the dirent store. Every
+ * public op maps onto the engine —
+ *
+ *   alloc          -> chain-walk via engine_lookup per probe,
+ *                     engine_insert at the chosen probe (upsert
+ *                     overwrites a tombstone or same-name whiteout)
+ *   lookup         -> chain-walk via engine_lookup per probe
+ *   unlink         -> chain-walk + engine_insert (tombstone-flavored)
+ *   whiteout       -> chain-walk + engine_insert (whiteout-flavored)
+ *   swap_two       -> two chain-walks + two engine_inserts (atomic
+ *                     under idx->lock — single critical section)
+ *   count_for_dir  -> engine_scan_range over the (ds, dir) prefix,
+ *                     count live records (not tombstones/whiteouts)
+ *   readdir        -> engine_scan_range over the (ds, dir, cursor)
+ *                     range, collect into a buffer, sort by hash_probe,
+ *                     emit prefix
+ *   drop_for_dir   -> engine_scan_range to collect keys, then
+ *                     engine_delete each
+ *
+ * dirent.tla's chain-integrity invariants are UNCHANGED; only the
+ * storage under it swapped from btree_store's whole-tree-rebuild MVP
+ * to btree_engine's incremental COW B+tree. Tombstones + whiteouts
+ * remain reachable as engine_inserted records (no engine_delete is
+ * issued for an Unlink — the slot must persist so a colliding name
+ * at a higher probe stays reachable per dirent.tla::BuggyUnlinkUsesEmpty).
+ * engine_delete is only used by drop_for_dir's bulk cleanup.
+ *
+ * On-disk encoding (unchanged from P8-POSIX-2):
  *   - Key (24 bytes): le64 dataset_id || le64 dir_ino || le64 hash_probe.
  *   - Value (32 + name_len bytes, tombstones 32 bytes): see dirent.h
  *     for the full byte-level layout.
  *
- * Concurrency: a single mutex guards records[] + persistence fields.
- * Lock posture: this layer takes its own lock only — no cross-layer
- * lock dependencies. The caller (sync.c) MUST not hold any other
- * dirent-comparable lock when invoking these APIs; sync.c does not.
+ * Engine lifecycle. stm_btree_engine_create needs the storage vtable
+ * context (bdev + bootstrap) AND the AEAD crypt context — set by
+ * stm_dirent_index_set_storage / _set_crypt_ctx, which the sole caller
+ * (sync.c) issues after stm_dirent_index_create. So the engine cannot
+ * exist at create time. It is created by whichever of the two binders
+ * runs SECOND (the first one with both contexts now populated); the
+ * mount path's load_at then destroys that fresh engine and opens the
+ * on-disk one.
  *
- * Audit-trigger surface: this module joins CLAUDE.md's trigger list
- * with this commit (P8-POSIX-2 substantive).
+ * Concurrency: a single mutex (idx->lock) guards the persistence
+ * fields AND every engine call — the btree_engine is single-threaded
+ * (one handle, one thread at a time), and idx->lock IS that
+ * serialization. No btree_engine API is ever touched without
+ * idx->lock held.
+ *
+ * Audit-trigger surface: this module is on CLAUDE.md's trigger list.
  */
 #include <stratum/dirent.h>
 #include <stratum/dirent_testing.h>
 #include <stratum/types.h>
-#include <stratum/block.h>
 #include <stratum/bootstrap.h>
-#include <stratum/btree.h>
-#include <stratum/btree_store.h>
-#include <stratum/super.h>
+#include <stratum/btree_engine.h>
+#include <stratum/engine_store.h>
 
 #include <pthread.h>
 #include <stdint.h>
@@ -62,6 +99,13 @@ static inline void must_unlock(pthread_mutex_t *m) {
 /* Internal record + index types.                                      */
 /* ------------------------------------------------------------------ */
 
+/* In-memory decoded record. The engine stores key + value as opaque
+ * bytes; this is the structured shape every chain helper + public op
+ * operates on. Decoded from engine_lookup and re-encoded for
+ * engine_insert. Per-call stack allocation — no heap, no persistence;
+ * the dataset_id / dir_ino / hash_probe fields are STAMPED from the
+ * key (NOT from the value bytes) so a buggy writer can't tamper
+ * cross-key references. */
 typedef struct {
     uint64_t dataset_id;
     uint64_t dir_ino;
@@ -70,28 +114,36 @@ typedef struct {
     uint64_t child_gen;
     uint8_t  child_type;
     uint8_t  name_len;
-    uint8_t  flags;          /* STM_DIRENT_FLAG_TOMBSTONE on tombstone */
+    uint8_t  flags;          /* STM_DIRENT_FLAG_TOMBSTONE / _WHITEOUT */
     uint8_t  name[STM_DIRENT_NAME_MAX];
 } stm_dirent_record;
 
 struct stm_dirent_index {
     pthread_mutex_t      lock;
-    stm_dirent_record   *records;
-    size_t               n_records;
-    size_t               cap_records;
 
-    /* Persistence (mirrors stm_inode_index, with R70 P3-6 latches). */
-    stm_bdev       *bdev;
-    stm_bootstrap  *boot;
-    const uint8_t  *metadata_key;
-    uint64_t        pool_uuid[2];
-    uint64_t        device_uuid[2];
-    bool            crypt_set;       /* latched on first set_crypt_ctx */
-    bool            storage_set;     /* latched on first set_storage */
-    uint64_t        root_paddr;
-    uint64_t        root_gen;
-    uint8_t         root_csum[32];
-    bool            dirty;
+    /* ----- Persistence (9.6-impl-4c: btree_engine-backed). ----- */
+    bool                  storage_set;   /* R70 P3-6: latched on first
+                                           * successful set_storage. */
+    bool                  crypt_set;     /* R70 P3-6: latched on first
+                                           * successful set_crypt_ctx. */
+    stm_engine_store_ctx  store_ctx;     /* { boot, bdev } — the engine's
+                                           * vt_ctx. Populated by set_storage;
+                                           * a stable member so the engine's
+                                           * borrowed vt_ctx pointer stays
+                                           * valid for idx's lifetime. */
+    stm_btree_crypt_ctx   crypt_ctx;     /* metadata_key + uuids — the
+                                           * engine's cx. Populated by
+                                           * set_crypt_ctx; a stable member. */
+    stm_btree_engine     *eng;           /* the dirent store. Created once
+                                           * BOTH contexts are bound (see
+                                           * di_engine_create_locked /
+                                           * the two binders), or by load_at
+                                           * on the mount path. */
+    /* Last durably-committed root triple — mirrored for the sync layer's
+     * uberblock stamping (stm_dirent_index_get_root / _get_gen). */
+    uint64_t            root_paddr;
+    uint64_t            root_gen;
+    uint8_t             root_csum[32];
 };
 
 static inline pthread_mutex_t *idx_lock(const stm_dirent_index *idx) {
@@ -133,58 +185,6 @@ static uint64_t fnv1a64(const uint8_t *data, size_t len) {
         h *= 0x100000001B3ull;                  /* FNV prime */
     }
     return h;
-}
-
-/* ------------------------------------------------------------------ */
-/* Internal helpers (caller holds idx->lock).                          */
-/* ------------------------------------------------------------------ */
-
-/* Linear scan for a record at exact key (ds, dir_ino, probe). NULL on
- * miss. Used by the chain walkers as the per-step "is there a record
- * at probe k?" check — semantic equivalent to "slot[k] EMPTY iff
- * find returns NULL". */
-static stm_dirent_record *find_record_at_probe(stm_dirent_index *idx,
-                                                    uint64_t dataset_id,
-                                                    uint64_t dir_ino,
-                                                    uint64_t hash_probe) {
-    for (size_t i = 0; i < idx->n_records; i++) {
-        stm_dirent_record *r = &idx->records[i];
-        if (r->dataset_id == dataset_id &&
-            r->dir_ino    == dir_ino &&
-            r->hash_probe == hash_probe) return r;
-    }
-    return NULL;
-}
-
-static const stm_dirent_record *find_record_at_probe_c(
-        const stm_dirent_index *idx,
-        uint64_t dataset_id, uint64_t dir_ino, uint64_t hash_probe) {
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_dirent_record *r = &idx->records[i];
-        if (r->dataset_id == dataset_id &&
-            r->dir_ino    == dir_ino &&
-            r->hash_probe == hash_probe) return r;
-    }
-    return NULL;
-}
-
-/* Append a fresh record. Returns NULL only on STM_ENOMEM.
- * R71b P3-1: cap-doubling guard tightened to bound the
- * `* sizeof` multiplication. */
-static stm_dirent_record *append_record(stm_dirent_index *idx) {
-    if (idx->n_records == idx->cap_records) {
-        if (idx->cap_records > (SIZE_MAX / sizeof *idx->records) / 2u)
-            return NULL;
-        size_t new_cap = idx->cap_records ? idx->cap_records * 2u : 8u;
-        stm_dirent_record *new_arr =
-                realloc(idx->records, new_cap * sizeof *new_arr);
-        if (!new_arr) return NULL;
-        idx->records     = new_arr;
-        idx->cap_records = new_cap;
-    }
-    stm_dirent_record *r = &idx->records[idx->n_records++];
-    memset(r, 0, sizeof *r);
-    return r;
 }
 
 /* ------------------------------------------------------------------ */
@@ -321,61 +321,75 @@ static stm_status di_decode_value(const void *in, size_t in_len,
 }
 
 /* ------------------------------------------------------------------ */
-/* btree_store vtable — same shape as inode_index's.                   */
+/* Engine glue.                                                         */
 /* ------------------------------------------------------------------ */
 
-typedef struct {
-    stm_bootstrap *boot;
-    stm_bdev      *bdev;
-} di_store_ctx;
+/* engine_lookup + decode + validate at exact (ds, dir, probe). Caller
+ * holds idx->lock. On STM_OK: *out_found is set; if true, *out holds
+ * the validated decoded record (live, tombstone, or whiteout). The
+ * dataset_id / dir_ino / hash_probe fields are STAMPED from the key
+ * triple, NOT trusted from the value bytes — the value carries only
+ * (child_ino, child_gen, child_type, name_len, flags, name). */
+static stm_status di_engine_get(stm_dirent_index *idx,
+                                uint64_t ds, uint64_t dir, uint64_t probe,
+                                stm_dirent_record *out, bool *out_found) {
+    *out_found = false;
+    uint8_t key[DI_KEY_LEN];
+    di_encode_key(ds, dir, probe, key);
 
-static stm_status di_store_reserve(void *ctx_, uint64_t *out_paddr) {
-    di_store_ctx *ctx = ctx_;
-    return stm_bootstrap_reserve(ctx->boot, STM_BOOTSTRAP_UNIT_BLOCKS,
-                                   /*hint_paddr=*/0, out_paddr);
+    bool found = false;
+    void *vbuf = NULL;
+    size_t vlen = 0;
+    stm_status ls = stm_btree_engine_lookup(idx->eng, key, DI_KEY_LEN,
+                                            &found, &vbuf, &vlen);
+    if (ls != STM_OK) return ls;
+    if (!found) return STM_OK;                  /* *out_found stays false */
+
+    memset(out, 0, sizeof *out);
+    stm_status vs = di_decode_value(vbuf, vlen, out);
+    free(vbuf);
+    if (vs != STM_OK) return vs;
+    out->dataset_id = ds;
+    out->dir_ino    = dir;
+    out->hash_probe = probe;
+    *out_found      = true;
+    return STM_OK;
 }
 
-static stm_status di_store_free(void *ctx_, uint64_t paddr, uint64_t free_gen) {
-    di_store_ctx *ctx = ctx_;
-    return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_UNIT_BLOCKS,
-                                free_gen);
+/* Encode + engine_insert (upsert). Caller holds idx->lock. The engine's
+ * insert is failure-atomic — a failed put never loses the prior value
+ * at this key. The record's dataset_id / dir_ino / hash_probe fields
+ * are encoded into the KEY; the engine_insert key is constructed from
+ * those fields. */
+static stm_status di_engine_put(stm_dirent_index *idx,
+                                const stm_dirent_record *r) {
+    uint8_t key[DI_KEY_LEN];
+    uint8_t val[DI_VAL_MAX];
+    size_t  vlen = 0;
+    di_encode_key(r->dataset_id, r->dir_ino, r->hash_probe, key);
+    di_encode_value(r, val, &vlen);
+    return stm_btree_engine_insert(idx->eng, key, DI_KEY_LEN, val, vlen);
 }
 
-static stm_status di_store_write(void *ctx_, uint64_t paddr,
-                                     const void *buf, size_t len) {
-    di_store_ctx *ctx = ctx_;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
-    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
-    return stm_bdev_write(ctx->bdev, byte_offset, buf, len);
+/* engine_delete at exact (ds, dir, probe). Caller holds idx->lock.
+ * Used ONLY by drop_for_dir's bulk cleanup; Unlink does NOT delete —
+ * it engine_inserts a tombstone (chain integrity per dirent.tla). */
+static stm_status di_engine_del(stm_dirent_index *idx,
+                                uint64_t ds, uint64_t dir, uint64_t probe) {
+    uint8_t key[DI_KEY_LEN];
+    di_encode_key(ds, dir, probe, key);
+    return stm_btree_engine_delete(idx->eng, key, DI_KEY_LEN, NULL);
 }
 
-static stm_status di_store_read(void *ctx_, uint64_t paddr,
-                                    void *buf, size_t len) {
-    di_store_ctx *ctx = ctx_;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
-    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
-    return stm_bdev_read(ctx->bdev, byte_offset, buf, len);
-}
-
-static const stm_btree_store_vtable DI_STORE_VT = {
-    .reserve = di_store_reserve,
-    .free    = di_store_free,
-    .write   = di_store_write,
-    .read    = di_store_read,
-};
-
-static inline di_store_ctx di_make_store_ctx(stm_dirent_index *idx) {
-    di_store_ctx c = { .boot = idx->boot, .bdev = idx->bdev };
-    return c;
-}
-
-static inline stm_btree_crypt_ctx di_make_crypt_ctx(const stm_dirent_index *idx) {
-    stm_btree_crypt_ctx cx = { .metadata_key = idx->metadata_key };
-    cx.pool_uuid[0]   = idx->pool_uuid[0];
-    cx.pool_uuid[1]   = idx->pool_uuid[1];
-    cx.device_uuid[0] = idx->device_uuid[0];
-    cx.device_uuid[1] = idx->device_uuid[1];
-    return cx;
+/* Stand up the btree_engine from the (now both populated) store + crypt
+ * contexts. Caller holds idx->lock, has verified BOTH contexts are
+ * bound and idx->eng is NULL. The engine borrows &idx->store_ctx (its
+ * vt_ctx) and &idx->crypt_ctx (its cx) — both stable members, alive for
+ * idx's lifetime. */
+static stm_status di_engine_create_locked(stm_dirent_index *idx) {
+    return stm_btree_engine_create(&STM_ENGINE_STORE_VT, &idx->store_ctx,
+                                   &idx->crypt_ctx, /*tree_id=*/0u,
+                                   &idx->eng);
 }
 
 /* ------------------------------------------------------------------ */
@@ -408,7 +422,14 @@ stm_dirent_index *stm_dirent_index_create(void) {
 void stm_dirent_index_close(stm_dirent_index *idx) {
     if (!idx) return;
     pthread_mutex_destroy(&idx->lock);
-    free(idx->records);
+    /* NULL-safe; an un-finalized flush is implicitly aborted (the
+     * flushed-but-unrooted paddrs are handed back to the allocator).
+     * The monolithic stm_dirent_index_commit uses the single-shot engine
+     * commit (no pending window); the three-phase _commit_flush /
+     * _finalize / _abort trio pairs every flush with a finalize-or-abort
+     * in stm_sync_commit. The implicit abort here is defense-in-depth
+     * for a destroy that races a buggy mid-flush caller. */
+    stm_btree_engine_destroy(idx->eng);
     free(idx);
 }
 
@@ -451,6 +472,10 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
     if (av != STM_OK) return av;
 
     must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
 
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
 
@@ -468,54 +493,52 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
      * RENAME_WHITEOUT's contract that whiteouts persist across
      * other dir ops (R88 P2-1). Walking past a non-matching
      * whiteout treats it as a chain-occupying slot (like a
-     * different-named live record) — chain integrity preserved.
-     * Whiteout-overwrite semantics are tested in test_dirent.c's
-     * dirent_whiteout_then_create_overwrites_slot;
-     * whiteout-preservation under hash collision is tested by
-     * dirent_whiteout_preserved_under_hash_collision. */
+     * different-named live record) — chain integrity preserved. */
     bool     have_install_slot = false;
     uint64_t install_probe     = 0;
-    stm_dirent_record *install_existing = NULL;  /* tombstone or same-name whiteout to overwrite */
 
     for (uint32_t k = 0; k < STM_DIRENT_PROBE_MAX; k++) {
         uint64_t probe = hash_base + (uint64_t)k;
-        stm_dirent_record *r =
-                find_record_at_probe(idx, dataset_id, dir_ino, probe);
-        if (!r) {
+        stm_dirent_record r;
+        bool found = false;
+        stm_status gs = di_engine_get(idx, dataset_id, dir_ino, probe,
+                                      &r, &found);
+        if (gs != STM_OK) {
+            must_unlock(idx_lock(idx));
+            return gs;
+        }
+        if (!found) {
             /* EMPTY — chain ends here. Install at first install slot
              * (this EMPTY if none earlier was found). */
             if (!have_install_slot) {
                 install_probe     = probe;
-                install_existing  = NULL;
                 have_install_slot = true;
             }
             break;
         }
-        if (record_is_tombstone(r)) {
+        if (record_is_tombstone(&r)) {
             if (!have_install_slot) {
                 install_probe     = probe;
-                install_existing  = r;
                 have_install_slot = true;
             }
             continue;
         }
-        if (record_is_whiteout(r)) {
+        if (record_is_whiteout(&r)) {
             /* SAME-NAME whiteout: install candidate (overlayfs
              * "promote name" — overwrites the whiteout with a
              * fresh live record at the same name). DIFFERENT-NAME
              * whiteout: MUST be preserved to honor RENAME_WHITEOUT's
              * persistence contract — walk past it as an occupying
              * slot. (R88 P2-1) */
-            if (record_name_eq(r, name, name_len)) {
+            if (record_name_eq(&r, name, name_len)) {
                 if (!have_install_slot) {
                     install_probe     = probe;
-                    install_existing  = r;
                     have_install_slot = true;
                 }
             }
             continue;
         }
-        if (record_name_eq(r, name, name_len)) {
+        if (record_name_eq(&r, name, name_len)) {
             must_unlock(idx_lock(idx));
             return STM_EEXIST;
         }
@@ -527,31 +550,26 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
         return STM_ENOSPC;
     }
 
-    /* Install at install_probe. */
-    stm_dirent_record *target;
-    if (install_existing) {
-        target = install_existing;
-    } else {
-        target = append_record(idx);
-        if (!target) {
-            must_unlock(idx_lock(idx));
-            return STM_ENOMEM;
-        }
-    }
-    target->dataset_id = dataset_id;
-    target->dir_ino    = dir_ino;
-    target->hash_probe = install_probe;
-    target->child_ino  = child_ino;
-    target->child_gen  = child_gen;
-    target->child_type = child_type;
-    target->name_len   = name_len;
-    target->flags      = 0u;
-    memset(target->name, 0, sizeof target->name);
-    memcpy(target->name, name, name_len);
-    idx->dirty = true;
+    /* engine_insert (upsert) the fresh live record at install_probe.
+     * If the slot was previously a tombstone or same-name whiteout,
+     * the upsert overwrites it; if EMPTY, this is a fresh insert.
+     * Failure-atomic — engine_insert never loses an already-present
+     * value on failure. */
+    stm_dirent_record r;
+    memset(&r, 0, sizeof r);
+    r.dataset_id = dataset_id;
+    r.dir_ino    = dir_ino;
+    r.hash_probe = install_probe;
+    r.child_ino  = child_ino;
+    r.child_gen  = child_gen;
+    r.child_type = child_type;
+    r.name_len   = name_len;
+    r.flags      = 0u;
+    memcpy(r.name, name, name_len);
 
+    stm_status ps = di_engine_put(idx, &r);
     must_unlock(idx_lock(idx));
-    return STM_OK;
+    return ps;
 }
 
 stm_status stm_dirent_lookup(const stm_dirent_index *idx,
@@ -568,41 +586,59 @@ stm_status stm_dirent_lookup(const stm_dirent_index *idx,
     if (out_child_gen)  *out_child_gen  = 0;
     if (out_child_type) *out_child_type = 0;
 
-    must_lock(idx_lock(idx));
+    pthread_mutex_t *lk = idx_lock(idx);
+    must_lock(lk);
+    if (!idx->eng) {
+        must_unlock(lk);
+        return STM_EINVAL;
+    }
 
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
 
+    /* Cast away const so we can call engine_lookup via di_engine_get
+     * (which needs a mutable idx to call the engine). The const on
+     * the public API signals semantic read-only-ness; the engine
+     * itself does internal state updates (node cache), so a mutable
+     * pointer is required at the call site. */
+    stm_dirent_index *m = (stm_dirent_index *)idx;
+
     for (uint32_t k = 0; k < STM_DIRENT_PROBE_MAX; k++) {
         uint64_t probe = hash_base + (uint64_t)k;
-        const stm_dirent_record *r =
-                find_record_at_probe_c(idx, dataset_id, dir_ino, probe);
-        if (!r) {
+        stm_dirent_record r;
+        bool found = false;
+        stm_status gs = di_engine_get(m, dataset_id, dir_ino, probe,
+                                      &r, &found);
+        if (gs != STM_OK) {
+            must_unlock(lk);
+            return gs;
+        }
+        if (!found) {
             /* EMPTY — chain ends. */
-            must_unlock(idx_lock(idx));
+            must_unlock(lk);
             return STM_ENOENT;
         }
-        if (record_is_tombstone(r)) continue;
-        if (record_is_whiteout(r)) {
+        if (record_is_tombstone(&r)) continue;
+        if (record_is_whiteout(&r)) {
             /* P8-POSIX-9b: a matching whiteout HIDES the name from
              * lookup view (overlayfs interprets via readdir).
              * Non-matching whiteout slots preserve chain integrity
              * for colliding names — continue probing past them. */
-            if (record_name_eq(r, name, name_len)) {
-                must_unlock(idx_lock(idx));
+            if (record_name_eq(&r, name, name_len)) {
+                must_unlock(lk);
                 return STM_ENOENT;
             }
             continue;
         }
-        if (record_name_eq(r, name, name_len)) {
-            *out_child_ino = r->child_ino;
-            if (out_child_gen)  *out_child_gen  = r->child_gen;
-            if (out_child_type) *out_child_type = r->child_type;
-            must_unlock(idx_lock(idx));
+        if (record_name_eq(&r, name, name_len)) {
+            *out_child_ino = r.child_ino;
+            if (out_child_gen)  *out_child_gen  = r.child_gen;
+            if (out_child_type) *out_child_type = r.child_type;
+            must_unlock(lk);
             return STM_OK;
         }
     }
 
-    must_unlock(idx_lock(idx));
+    must_unlock(lk);
     return STM_ENOENT;
 }
 
@@ -614,40 +650,54 @@ stm_status stm_dirent_unlink(stm_dirent_index *idx,
     if (name_len == 0u || name_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
 
     must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
 
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
 
     for (uint32_t k = 0; k < STM_DIRENT_PROBE_MAX; k++) {
         uint64_t probe = hash_base + (uint64_t)k;
-        stm_dirent_record *r =
-                find_record_at_probe(idx, dataset_id, dir_ino, probe);
-        if (!r) {
+        stm_dirent_record r;
+        bool found = false;
+        stm_status gs = di_engine_get(idx, dataset_id, dir_ino, probe,
+                                      &r, &found);
+        if (gs != STM_OK) {
+            must_unlock(idx_lock(idx));
+            return gs;
+        }
+        if (!found) {
             must_unlock(idx_lock(idx));
             return STM_ENOENT;
         }
-        if (record_is_tombstone(r)) continue;
-        if (record_is_whiteout(r)) {
+        if (record_is_tombstone(&r)) continue;
+        if (record_is_whiteout(&r)) {
             /* P8-POSIX-9b: a matching whiteout name has no live
              * record to unlink — return ENOENT. Non-matching
              * whiteouts preserve chain integrity (continue probing). */
-            if (record_name_eq(r, name, name_len)) {
+            if (record_name_eq(&r, name, name_len)) {
                 must_unlock(idx_lock(idx));
                 return STM_ENOENT;
             }
             continue;
         }
-        if (record_name_eq(r, name, name_len)) {
-            /* Replace with TOMBSTONE — preserves chain integrity for
-             * colliding names at higher probe indices. */
-            r->child_ino  = 0;
-            r->child_gen  = 0;
-            r->child_type = 0;
-            r->name_len   = 0;
-            r->flags      = STM_DIRENT_FLAG_TOMBSTONE;
-            memset(r->name, 0, sizeof r->name);
-            idx->dirty = true;
+        if (record_name_eq(&r, name, name_len)) {
+            /* Replace with TOMBSTONE via engine_insert — preserves
+             * chain integrity for colliding names at higher probe
+             * indices (dirent.tla::BuggyUnlinkUsesEmpty). The slot
+             * is NOT engine_deleted; the tombstone IS the marker. */
+            stm_dirent_record tomb;
+            memset(&tomb, 0, sizeof tomb);
+            tomb.dataset_id = dataset_id;
+            tomb.dir_ino    = dir_ino;
+            tomb.hash_probe = probe;
+            tomb.flags      = STM_DIRENT_FLAG_TOMBSTONE;
+            /* child_ino / child_gen / child_type / name_len / name all
+             * zero — matches the decoder's tombstone invariants. */
+            stm_status ps = di_engine_put(idx, &tomb);
             must_unlock(idx_lock(idx));
-            return STM_OK;
+            return ps;
         }
     }
 
@@ -656,31 +706,39 @@ stm_status stm_dirent_unlink(stm_dirent_index *idx,
 }
 
 /* P8-POSIX-9b: helper that walks the chain to locate the live
- * record at (dataset_id, dir_ino, name). Returns NULL if not
- * found OR if the chain runs into EMPTY before the name appears.
- * Whiteouts are NOT live records — a matching whiteout returns
- * NULL (caller sees this as ENOENT). Non-matching whiteouts
- * preserve chain integrity (continue probing). Caller MUST
+ * record at (dataset_id, dir_ino, name). Returns STM_OK with
+ * `*out_found = true` AND the decoded record on hit; STM_OK with
+ * `*out_found = false` if not found OR the chain runs into EMPTY
+ * before the name appears OR a matching whiteout hides the name.
+ * Non-matching whiteouts preserve chain integrity (continue
+ * probing). Engine I/O errors propagate verbatim. Caller MUST
  * hold the index mutex. */
-static stm_dirent_record *
-find_live_record(stm_dirent_index *idx, uint64_t dataset_id,
-                      uint64_t dir_ino,
-                      const uint8_t *name, uint8_t name_len)
-{
+static stm_status find_live_record(stm_dirent_index *idx,
+                                   uint64_t dataset_id, uint64_t dir_ino,
+                                   const uint8_t *name, uint8_t name_len,
+                                   stm_dirent_record *out, bool *out_found) {
+    *out_found = false;
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
     for (uint32_t k = 0; k < STM_DIRENT_PROBE_MAX; k++) {
         uint64_t probe = hash_base + (uint64_t)k;
-        stm_dirent_record *r =
-                find_record_at_probe(idx, dataset_id, dir_ino, probe);
-        if (!r) return NULL;   /* EMPTY — chain ends */
-        if (record_is_tombstone(r)) continue;
-        if (record_is_whiteout(r)) {
-            if (record_name_eq(r, name, name_len)) return NULL;
+        stm_dirent_record r;
+        bool found = false;
+        stm_status gs = di_engine_get(idx, dataset_id, dir_ino, probe,
+                                      &r, &found);
+        if (gs != STM_OK) return gs;
+        if (!found) return STM_OK;          /* EMPTY — chain ends */
+        if (record_is_tombstone(&r)) continue;
+        if (record_is_whiteout(&r)) {
+            if (record_name_eq(&r, name, name_len)) return STM_OK;
             continue;
         }
-        if (record_name_eq(r, name, name_len)) return r;
+        if (record_name_eq(&r, name, name_len)) {
+            *out = r;
+            *out_found = true;
+            return STM_OK;
+        }
     }
-    return NULL;
+    return STM_OK;
 }
 
 stm_status stm_dirent_swap_two(stm_dirent_index *idx,
@@ -707,41 +765,65 @@ stm_status stm_dirent_swap_two(stm_dirent_index *idx,
      * carry an explicit iter_active flag; the index mutex held
      * across the entire swap window substitutes for the spec's
      * stable-iteration guard (readdir at the C layer also takes
-     * this same mutex). Don't introduce a separate iter_active
-     * flag without simultaneously redesigning readdir to release
-     * the mutex between cursor steps; today both serialize through
-     * the same lock and the spec precondition is satisfied de facto. */
+     * this same mutex). */
     must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
 
-    stm_dirent_record *r1 =
-            find_live_record(idx, dataset_id, dir1_ino, name1, name1_len);
-    if (!r1) {
+    stm_dirent_record r1, r2;
+    bool found1 = false, found2 = false;
+    stm_status fs1 = find_live_record(idx, dataset_id, dir1_ino,
+                                      name1, name1_len, &r1, &found1);
+    if (fs1 != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return fs1;
+    }
+    if (!found1) {
         must_unlock(idx_lock(idx));
         return STM_ENOENT;
     }
-    stm_dirent_record *r2 =
-            find_live_record(idx, dataset_id, dir2_ino, name2, name2_len);
-    if (!r2) {
+    stm_status fs2 = find_live_record(idx, dataset_id, dir2_ino,
+                                      name2, name2_len, &r2, &found2);
+    if (fs2 != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return fs2;
+    }
+    if (!found2) {
         must_unlock(idx_lock(idx));
         return STM_ENOENT;
     }
 
-    /* Swap (child_ino, child_gen, child_type). Slot positions +
-     * names + flags + name_len UNCHANGED — chain integrity by
-     * construction. */
-    uint64_t c_ino  = r1->child_ino;
-    uint64_t c_gen  = r1->child_gen;
-    uint8_t  c_type = r1->child_type;
-    r1->child_ino  = r2->child_ino;
-    r1->child_gen  = r2->child_gen;
-    r1->child_type = r2->child_type;
-    r2->child_ino  = c_ino;
-    r2->child_gen  = c_gen;
-    r2->child_type = c_type;
-    idx->dirty = true;
+    /* Swap (child_ino, child_gen, child_type) in the decoded records.
+     * Slot positions (hash_probe + key) + names + flags + name_len
+     * UNCHANGED — chain integrity by construction. Two engine_inserts
+     * land in this critical section so no observer can see a
+     * half-swapped state. The engine_insert is failure-atomic: a
+     * mid-swap failure on the second put leaves the first put's
+     * upsert in place (a partial swap). We accept this trade-off:
+     * the partial swap is a self-consistent dirent state (one valid
+     * live record replaces another), and the caller wedges the fs
+     * on any sync error (R154 doctrine), which forces the next mount
+     * to reload from the previous uberblock's pre-swap state. */
+    uint64_t c_ino  = r1.child_ino;
+    uint64_t c_gen  = r1.child_gen;
+    uint8_t  c_type = r1.child_type;
+    r1.child_ino  = r2.child_ino;
+    r1.child_gen  = r2.child_gen;
+    r1.child_type = r2.child_type;
+    r2.child_ino  = c_ino;
+    r2.child_gen  = c_gen;
+    r2.child_type = c_type;
 
+    stm_status p1 = di_engine_put(idx, &r1);
+    if (p1 != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return p1;
+    }
+    stm_status p2 = di_engine_put(idx, &r2);
     must_unlock(idx_lock(idx));
-    return STM_OK;
+    return p2;
 }
 
 /* P8-POSIX-9b: convert a live record at (ds, dir_ino, name) to a
@@ -754,31 +836,64 @@ stm_status stm_dirent_whiteout(stm_dirent_index *idx,
     if (name_len == 0u || name_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
 
     must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
 
-    stm_dirent_record *r =
-            find_live_record(idx, dataset_id, dir_ino, name, name_len);
-    if (!r) {
+    stm_dirent_record r;
+    bool found = false;
+    stm_status fs = find_live_record(idx, dataset_id, dir_ino,
+                                     name, name_len, &r, &found);
+    if (fs != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return fs;
+    }
+    if (!found) {
         must_unlock(idx_lock(idx));
         return STM_ENOENT;
     }
 
     /* Convert the live record to a WHITEOUT slot in place. Slot
-     * position (hash_probe + array index) UNCHANGED — chain
-     * integrity preserved by construction. The name field is
-     * PRESERVED (so readdir can emit the marker). child_ino /
-     * child_gen are CLEARED. child_type is reassigned to
-     * STM_DT_WHITEOUT (Linux DT_WHT). The flags byte holds ONLY
-     * the WHITEOUT bit (mutually exclusive with TOMBSTONE per
-     * the decoder). */
-    r->child_ino  = 0;
-    r->child_gen  = 0;
-    r->child_type = STM_DT_WHITEOUT;
-    r->flags      = STM_DIRENT_FLAG_WHITEOUT;
+     * position (hash_probe + key) UNCHANGED — chain integrity
+     * preserved by construction. The name field is PRESERVED (so
+     * readdir can emit the marker). child_ino / child_gen are
+     * CLEARED. child_type is reassigned to STM_DT_WHITEOUT (Linux
+     * DT_WHT). The flags byte holds ONLY the WHITEOUT bit (mutually
+     * exclusive with TOMBSTONE per the decoder). */
+    r.child_ino  = 0;
+    r.child_gen  = 0;
+    r.child_type = STM_DT_WHITEOUT;
+    r.flags      = STM_DIRENT_FLAG_WHITEOUT;
     /* name + name_len UNCHANGED. */
-    idx->dirty = true;
 
+    stm_status ps = di_engine_put(idx, &r);
     must_unlock(idx_lock(idx));
-    return STM_OK;
+    return ps;
+}
+
+/* count_for_dir: scan_range over [ds||dir||0 .. ds||dir||UINT64_MAX]
+ * and count live records (not tombstones, not whiteouts). Range
+ * membership is correct under bytewise key order regardless of the
+ * little-endian hash_probe encoding's numeric scramble (the all-zero
+ * / all-FF probe suffixes are the bytewise extremes within the
+ * fixed-prefix scan) — same argument as inode's count_for_ds. */
+typedef struct {
+    size_t     count;
+    stm_status err;
+} di_count_ctx;
+
+static int di_count_cb(const void *k, size_t klen,
+                       const void *v, size_t vlen, void *ctx_) {
+    (void)k;                                /* range bracket pins (ds, dir) */
+    (void)klen;
+    di_count_ctx *c = ctx_;
+    stm_dirent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = di_decode_value(v, vlen, &r);
+    if (vs != STM_OK) { c->err = vs; return 1; }
+    if (record_is_live(&r)) c->count++;
+    return 0;
 }
 
 stm_status stm_dirent_count_for_dir(const stm_dirent_index *idx,
@@ -788,48 +903,93 @@ stm_status stm_dirent_count_for_dir(const stm_dirent_index *idx,
     if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
 
     *out_count = 0;
-    must_lock(idx_lock(idx));
-
-    /* P8-POSIX-9b: only LIVE records count toward the directory's
-     * link count. Tombstones (invisible) and whiteouts (visible-
-     * to-readdir markers but no addressable child_ino) do not
-     * contribute to nlink/empty-check semantics. A directory with
-     * only whiteouts is empty for rmdir purposes (POSIX:
-     * whiteouts shouldn't block rmdir per overlayfs semantics). */
-    size_t count = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_dirent_record *r = &idx->records[i];
-        if (r->dataset_id == dataset_id &&
-            r->dir_ino    == dir_ino &&
-            record_is_live(r)) count++;
+    pthread_mutex_t *lk = idx_lock(idx);
+    must_lock(lk);
+    if (!idx->eng) {
+        must_unlock(lk);
+        return STM_EINVAL;
     }
-    *out_count = count;
 
-    must_unlock(idx_lock(idx));
+    /* Cast away const for the same reason as stm_dirent_lookup. */
+    stm_dirent_index *m = (stm_dirent_index *)idx;
+
+    uint8_t lo[DI_KEY_LEN], hi[DI_KEY_LEN];
+    di_encode_key(dataset_id, dir_ino, 0u,         lo);
+    di_encode_key(dataset_id, dir_ino, UINT64_MAX, hi);
+    di_count_ctx c = { .count = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan_range(m->eng, lo, DI_KEY_LEN,
+                                                hi, DI_KEY_LEN,
+                                                di_count_cb, &c);
+    must_unlock(lk);
+    if (ss != STM_OK) return ss;
+    if (c.err != STM_OK) return c.err;
+    *out_count = c.count;
     return STM_OK;
 }
 
-/* P8-POSIX-4 readdir: emits live records under (ds, dir_ino) in
- * hash_probe-ascending order, starting at *cursor. Models dirent.tla's
- * ReaddirReset/Step/End cycle.
+/* P8-POSIX-4 readdir: emits live + whiteout records under (ds, dir_ino)
+ * in hash_probe-ascending order, starting at *cursor.
  *
- * Implementation: filter records[] for matches (ds, dir_ino, hp >=
- * cursor, !tombstone), copy match indices + probes into a temp buffer,
- * qsort by hash_probe, emit up to max_entries. Memory cost: one
- * malloc'd `(uint64_t hp, size_t idx)` pair per match. For a directory
- * with N total records, this is O(N) memory + O(N log N) time per
- * call. Future optimization (when xfstests stresses 1M-entry dirs):
- * top-K heap select with O(max_entries) memory + O(N log K) time.
- */
+ * Implementation: scan_range over the (ds, dir) prefix to collect all
+ * matches into a heap buffer, sort by hash_probe (NOT bytewise — the
+ * LE encoding scrambles numeric order), then apply cursor filter and
+ * emit prefix. Memory cost: one heap entry per record under (ds, dir).
+ * For a directory with N total records (live + tomb + whiteout) this
+ * is O(N) memory + O(N log N) time per call.
+ *
+ * Forward-note (4d format break): switching hash_probe to big-endian
+ * in the on-disk key would make scan_range yield numeric ascending
+ * order natively, letting readdir drop the qsort + serve a window
+ * (cursor..cursor+max_entries) directly. Out of scope for 4c; same
+ * algorithmic cost as the pre-4c records[] linear pass + qsort. */
 typedef struct {
-    uint64_t hash_probe;
-    size_t   record_idx;
+    uint64_t          hash_probe;
+    stm_dirent_record r;
 } di_readdir_match;
+
+typedef struct {
+    di_readdir_match *arr;
+    size_t            n;
+    size_t            cap;
+    stm_status        err;
+} di_readdir_ctx;
 
 static int di_readdir_match_cmp(const void *a, const void *b) {
     const di_readdir_match *pa = a, *pb = b;
     if (pa->hash_probe < pb->hash_probe) return -1;
     if (pa->hash_probe > pb->hash_probe) return  1;
+    return 0;
+}
+
+static int di_readdir_cb(const void *k, size_t klen,
+                         const void *v, size_t vlen, void *ctx_) {
+    di_readdir_ctx *c = ctx_;
+    uint64_t ds = 0, dir = 0, probe = 0;
+    stm_status ks = di_decode_key(k, klen, &ds, &dir, &probe);
+    if (ks != STM_OK) { c->err = ks; return 1; }
+    stm_dirent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = di_decode_value(v, vlen, &r);
+    if (vs != STM_OK) { c->err = vs; return 1; }
+    if (record_is_tombstone(&r)) return 0;     /* never emit tombstones */
+    r.dataset_id = ds;
+    r.dir_ino    = dir;
+    r.hash_probe = probe;
+
+    if (c->n == c->cap) {
+        if (c->cap > (SIZE_MAX / sizeof *c->arr) / 2u) {
+            c->err = STM_ENOMEM;
+            return 1;
+        }
+        size_t new_cap = c->cap == 0 ? 16u : c->cap * 2u;
+        di_readdir_match *na = realloc(c->arr, new_cap * sizeof *na);
+        if (!na) { c->err = STM_ENOMEM; return 1; }
+        c->arr = na;
+        c->cap = new_cap;
+    }
+    c->arr[c->n].hash_probe = probe;
+    c->arr[c->n].r          = r;
+    c->n++;
     return 0;
 }
 
@@ -842,8 +1002,7 @@ stm_status stm_dirent_readdir(const stm_dirent_index *idx,
 {
     /* R75 P3-1: zero-init out-param BEFORE arg validation so callers
      * observing on STM_EINVAL see defined values regardless of which
-     * validation step rejected. Mirrors the R57 P3-5 / R58 P3-1
-     * uniform out-param contract used elsewhere in the codebase. */
+     * validation step rejected. */
     if (out_returned) *out_returned = 0;
 
     if (!idx || !cursor || !out_entries || !out_returned) return STM_EINVAL;
@@ -851,75 +1010,58 @@ stm_status stm_dirent_readdir(const stm_dirent_index *idx,
     if (max_entries == 0u) return STM_EINVAL;
 
     /* R75 P2-1: cursor saturation sentinel. Once the prior call's
-     * cursor advance hit UINT64_MAX (either from `last_probe + 1`
-     * saturation or because the highest live probe was UINT64_MAX
-     * itself), iteration is done — short-circuit before the filter
-     * loop. Without this guard, a record at probe=UINT64_MAX would
-     * get re-emitted forever because the strict-less-than filter
-     * `r->hash_probe < UINT64_MAX` is false at probe=UINT64_MAX. */
+     * cursor advance hit UINT64_MAX, iteration is done — short-
+     * circuit. */
     if (*cursor == UINT64_MAX) return STM_OK;
 
-    /* Cast away const for lock acquisition; idx is logically read-only
-     * across this call but we need write access to its mutex. Mirrors
-     * the const-cast in find_record_at_probe_c's lock pattern. */
     pthread_mutex_t *lk = idx_lock(idx);
     must_lock(lk);
-
-    /* Pass 1: count matches.
-     *
-     * "Match" = same dataset_id + dir_ino + (live record OR whiteout)
-     * + probe ≥ cursor. Tombstones are NEVER emitted (they're internal
-     * chain-integrity markers). Whiteouts ARE emitted (P8-POSIX-9b —
-     * Linux DT_WHT semantics; overlayfs userspace interprets the
-     * marker). We allocate enough space for all matches even if many
-     * exceed max_entries — the post-sort prefix gives the smallest
-     * max_entries by probe, which is what readdir needs. */
-    size_t n_match = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_dirent_record *r = &idx->records[i];
-        if (r->dataset_id != dataset_id) continue;
-        if (r->dir_ino    != dir_ino)    continue;
-        if (record_is_tombstone(r))      continue;
-        if (r->hash_probe < *cursor)     continue;
-        n_match++;
+    if (!idx->eng) {
+        must_unlock(lk);
+        return STM_EINVAL;
     }
-    if (n_match == 0) {
-        /* No matches: leave *cursor unchanged, *out_returned = 0. */
+
+    /* Cast away const for the same reason as stm_dirent_lookup. */
+    stm_dirent_index *m = (stm_dirent_index *)idx;
+
+    /* Collect every non-tombstone match under (ds, dir) into a heap
+     * buffer via scan_range. The range bracket pins the prefix; we
+     * filter the cursor in the post-sort emit step. */
+    uint8_t lo[DI_KEY_LEN], hi[DI_KEY_LEN];
+    di_encode_key(dataset_id, dir_ino, 0u,         lo);
+    di_encode_key(dataset_id, dir_ino, UINT64_MAX, hi);
+
+    di_readdir_ctx c = { .arr = NULL, .n = 0, .cap = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan_range(m->eng, lo, DI_KEY_LEN,
+                                                hi, DI_KEY_LEN,
+                                                di_readdir_cb, &c);
+    if (ss != STM_OK || c.err != STM_OK) {
+        free(c.arr);
+        must_unlock(lk);
+        return ss != STM_OK ? ss : c.err;
+    }
+    if (c.n == 0) {
+        free(c.arr);
         must_unlock(lk);
         return STM_OK;
     }
 
-    /* Bounded multiplication: SIZE_MAX / sizeof guarantees no overflow. */
-    if (n_match > SIZE_MAX / sizeof(di_readdir_match)) {
-        must_unlock(lk);
-        return STM_ENOMEM;
-    }
-    di_readdir_match *matches = malloc(n_match * sizeof *matches);
-    if (!matches) {
-        must_unlock(lk);
-        return STM_ENOMEM;
-    }
+    qsort(c.arr, c.n, sizeof *c.arr, di_readdir_match_cmp);
 
-    /* Pass 2: collect matches. */
-    size_t j = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_dirent_record *r = &idx->records[i];
-        if (r->dataset_id != dataset_id) continue;
-        if (r->dir_ino    != dir_ino)    continue;
-        if (record_is_tombstone(r))      continue;
-        if (r->hash_probe < *cursor)     continue;
-        matches[j].hash_probe = r->hash_probe;
-        matches[j].record_idx = i;
-        j++;
+    /* Apply cursor filter: skip records with hash_probe < cursor. */
+    size_t start = 0;
+    while (start < c.n && c.arr[start].hash_probe < *cursor) start++;
+    if (start == c.n) {
+        free(c.arr);
+        must_unlock(lk);
+        return STM_OK;
     }
-    /* j must equal n_match — both passes use identical filter. */
-
-    qsort(matches, n_match, sizeof *matches, di_readdir_match_cmp);
 
     /* Emit prefix. */
-    size_t emit = (max_entries < n_match) ? max_entries : n_match;
+    size_t avail = c.n - start;
+    size_t emit  = (max_entries < avail) ? max_entries : avail;
     for (size_t k = 0; k < emit; k++) {
-        const stm_dirent_record *r = &idx->records[matches[k].record_idx];
+        const stm_dirent_record *r = &c.arr[start + k].r;
         out_entries[k].child_ino  = r->child_ino;
         out_entries[k].child_gen  = r->child_gen;
         out_entries[k].hash_probe = r->hash_probe;
@@ -931,23 +1073,54 @@ stm_status stm_dirent_readdir(const stm_dirent_index *idx,
     }
 
     /* Advance cursor to (last_returned_probe + 1), saturating at
-     * UINT64_MAX so caller-side arithmetic doesn't wrap. The next
-     * call resumes at this cursor; matches with probe < cursor are
-     * filtered out, ensuring strict monotone advance per
-     * dirent.tla::ReaddirCursorMonotonicEmits. */
-    uint64_t last_probe = matches[emit - 1].hash_probe;
+     * UINT64_MAX. */
+    uint64_t last_probe = c.arr[start + emit - 1].hash_probe;
     *cursor = (last_probe == UINT64_MAX) ? UINT64_MAX : (last_probe + 1u);
     *out_returned = emit;
 
-    free(matches);
+    free(c.arr);
     must_unlock(lk);
     return STM_OK;
 }
 
-/* P8-POSIX-2b R73 P2-1: bulk-drop every record keyed at (ds, dir_ino,
- * *). Walks records[] once, compacts in place. After this returns the
- * dirent btree on the next sync_commit will not encode any record at
- * that (ds, dir_ino) prefix — including tombstones from prior unlinks. */
+/* P8-POSIX-2b R73 P2-1: bulk-drop every record (live + tombstone +
+ * whiteout) keyed at (ds, dir_ino, *). Two-phase: scan_range
+ * collects every probe under the prefix into a heap buffer, then a
+ * second pass engine_deletes each key. The two-phase pattern avoids
+ * mutating the engine during scan_range traversal — which is the
+ * safe-by-contract pattern (engine_delete during a callback is
+ * undefined). */
+typedef struct {
+    uint64_t  *probes;
+    size_t     n;
+    size_t     cap;
+    stm_status err;
+} di_drop_ctx;
+
+static int di_drop_cb(const void *k, size_t klen,
+                      const void *v, size_t vlen, void *ctx_) {
+    (void)v;                                /* drop reads keys only */
+    (void)vlen;
+    di_drop_ctx *c = ctx_;
+    uint64_t ds = 0, dir = 0, probe = 0;
+    stm_status ks = di_decode_key(k, klen, &ds, &dir, &probe);
+    if (ks != STM_OK) { c->err = ks; return 1; }
+
+    if (c->n == c->cap) {
+        if (c->cap > (SIZE_MAX / sizeof *c->probes) / 2u) {
+            c->err = STM_ENOMEM;
+            return 1;
+        }
+        size_t new_cap = c->cap == 0 ? 16u : c->cap * 2u;
+        uint64_t *na = realloc(c->probes, new_cap * sizeof *na);
+        if (!na) { c->err = STM_ENOMEM; return 1; }
+        c->probes = na;
+        c->cap    = new_cap;
+    }
+    c->probes[c->n++] = probe;
+    return 0;
+}
+
 stm_status stm_dirent_drop_for_dir(stm_dirent_index *idx,
                                        uint64_t dataset_id, uint64_t dir_ino,
                                        size_t *out_dropped) {
@@ -955,22 +1128,42 @@ stm_status stm_dirent_drop_for_dir(stm_dirent_index *idx,
     if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
 
     must_lock(idx_lock(idx));
-
-    size_t kept = 0;
-    size_t dropped = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        stm_dirent_record *r = &idx->records[i];
-        if (r->dataset_id == dataset_id && r->dir_ino == dir_ino) {
-            dropped++;
-            continue;
-        }
-        if (kept != i) {
-            idx->records[kept] = *r;
-        }
-        kept++;
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
     }
-    idx->n_records = kept;
-    if (dropped > 0u) idx->dirty = true;
+
+    uint8_t lo[DI_KEY_LEN], hi[DI_KEY_LEN];
+    di_encode_key(dataset_id, dir_ino, 0u,         lo);
+    di_encode_key(dataset_id, dir_ino, UINT64_MAX, hi);
+
+    di_drop_ctx c = { .probes = NULL, .n = 0, .cap = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan_range(idx->eng, lo, DI_KEY_LEN,
+                                                hi, DI_KEY_LEN,
+                                                di_drop_cb, &c);
+    if (ss != STM_OK || c.err != STM_OK) {
+        free(c.probes);
+        must_unlock(idx_lock(idx));
+        return ss != STM_OK ? ss : c.err;
+    }
+
+    /* Phase 2: engine_delete each collected probe. On the first
+     * failure we stop + return the error code; previously-deleted
+     * probes stay deleted (engine_delete is failure-atomic; partial
+     * progress is durable from the engine's view, retried at the
+     * next sync). The caller wedges the fs on any sync error
+     * (R154 doctrine), preserving consistency. */
+    for (size_t i = 0; i < c.n; i++) {
+        stm_status ds = di_engine_del(idx, dataset_id, dir_ino, c.probes[i]);
+        if (ds != STM_OK) {
+            free(c.probes);
+            must_unlock(idx_lock(idx));
+            return ds;
+        }
+    }
+
+    size_t dropped = c.n;
+    free(c.probes);
     if (out_dropped) *out_dropped = dropped;
 
     must_unlock(idx_lock(idx));
@@ -978,7 +1171,7 @@ stm_status stm_dirent_drop_for_dir(stm_dirent_index *idx,
 }
 
 /* ------------------------------------------------------------------ */
-/* Public API — persistence (mirrors stm_inode_index).                  */
+/* Public API — persistence (9.6-impl-4c).                              */
 /* ------------------------------------------------------------------ */
 
 stm_status stm_dirent_index_set_storage(stm_dirent_index *idx,
@@ -986,12 +1179,24 @@ stm_status stm_dirent_index_set_storage(stm_dirent_index *idx,
                                             stm_bootstrap *boot_0) {
     if (!idx || !bdev_0 || !boot_0) return STM_EINVAL;
     must_lock(idx_lock(idx));
+    /* R70 P3-6: refuse re-binding once latched. */
     if (idx->storage_set) {
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
-    idx->bdev = bdev_0;
-    idx->boot = boot_0;
+    idx->store_ctx.bdev = bdev_0;
+    idx->store_ctx.boot = boot_0;
+    /* If crypt is already bound this is the SECOND bind — both the
+     * engine's vt_ctx (&store_ctx) and cx (&crypt_ctx) are now
+     * populated, so stand the engine up. A create failure leaves
+     * storage_set false so the caller may retry. */
+    if (idx->crypt_set && !idx->eng) {
+        stm_status es = di_engine_create_locked(idx);
+        if (es != STM_OK) {
+            must_unlock(idx_lock(idx));
+            return es;
+        }
+    }
     idx->storage_set = true;
     must_unlock(idx_lock(idx));
     return STM_OK;
@@ -1003,16 +1208,25 @@ stm_status stm_dirent_index_set_crypt_ctx(stm_dirent_index *idx,
                                               const uint64_t device_uuid_0[2]) {
     if (!idx || !metadata_key || !pool_uuid || !device_uuid_0) return STM_EINVAL;
     must_lock(idx_lock(idx));
+    /* R70 P3-6: refuse re-binding once latched. */
     if (idx->crypt_set) {
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
-    idx->metadata_key   = metadata_key;
-    idx->pool_uuid[0]   = pool_uuid[0];
-    idx->pool_uuid[1]   = pool_uuid[1];
-    idx->device_uuid[0] = device_uuid_0[0];
-    idx->device_uuid[1] = device_uuid_0[1];
-    idx->crypt_set      = true;
+    idx->crypt_ctx.metadata_key   = metadata_key;
+    idx->crypt_ctx.pool_uuid[0]   = pool_uuid[0];
+    idx->crypt_ctx.pool_uuid[1]   = pool_uuid[1];
+    idx->crypt_ctx.device_uuid[0] = device_uuid_0[0];
+    idx->crypt_ctx.device_uuid[1] = device_uuid_0[1];
+    /* Second-bind: stand the engine up (see set_storage). */
+    if (idx->storage_set && !idx->eng) {
+        stm_status es = di_engine_create_locked(idx);
+        if (es != STM_OK) {
+            must_unlock(idx_lock(idx));
+            return es;
+        }
+    }
+    idx->crypt_set = true;
     must_unlock(idx_lock(idx));
     return STM_OK;
 }
@@ -1039,31 +1253,6 @@ stm_status stm_dirent_index_get_gen(const stm_dirent_index *idx,
     return STM_OK;
 }
 
-/* Build a btree from records[] for serialization. */
-static stm_status di_build_btree_locked(const stm_dirent_index *idx,
-                                              stm_btree_mt **out_tree) {
-    stm_btree_opts opts = stm_btree_opts_default();
-    if (opts.target_entries < 512u) opts.target_entries = 512u;
-
-    stm_btree_mt *t = NULL;
-    stm_status ts = stm_btree_mt_new(&opts, &t);
-    if (ts != STM_OK) return ts;
-
-    uint8_t key[DI_KEY_LEN];
-    uint8_t val[DI_VAL_MAX];
-    size_t  vlen;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_dirent_record *r = &idx->records[i];
-        di_encode_key(r->dataset_id, r->dir_ino, r->hash_probe, key);
-        di_encode_value(r, val, &vlen);
-        stm_status is = stm_btree_mt_insert(t, key, DI_KEY_LEN, val, vlen);
-        if (is != STM_OK) { stm_btree_mt_free(t); return is; }
-    }
-
-    *out_tree = t;
-    return STM_OK;
-}
-
 stm_status stm_dirent_index_commit(stm_dirent_index *idx,
                                        uint64_t committed_gen,
                                        uint64_t *out_root_paddr,
@@ -1071,124 +1260,188 @@ stm_status stm_dirent_index_commit(stm_dirent_index *idx,
     if (!idx || !out_root_paddr || !out_root_csum) return STM_EINVAL;
     must_lock(idx_lock(idx));
 
-    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+    if (!idx->storage_set || !idx->crypt_set || !idx->eng) {
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
 
-    /* Clean + already-committed: idempotent return of the existing root. */
-    if (!idx->dirty && idx->root_paddr != 0) {
-        *out_root_paddr = idx->root_paddr;
-        memcpy(out_root_csum, idx->root_csum, 32);
+    /* Single-shot incremental-COW commit: flush the dirty root-to-leaf
+     * paths + finalize, no pending window left open. A clean tree's
+     * commit is a cheap no-op (the engine subsumes the old explicit
+     * !dirty short-circuit). committed_gen is stm_sync_commit's
+     * target_gen — strictly increasing across commits, so the engine's
+     * monotonic-gen guard never fires.
+     *
+     * 9.6-impl-4c: stm_sync_commit no longer drives this monolithic
+     * form — it uses the three-phase _commit_flush / _finalize /
+     * _abort below so the dirent flush slots into sync's Phase 2 and
+     * the root is adopted only after the uberblock write. This
+     * single-shot form remains for non-sync callers and the
+     * persistence unit tests; it IS flush-then-finalize plus the
+     * trailing stm_bootstrap_commit barrier the trio leaves to the
+     * sync layer. */
+    uint64_t cp = 0;
+    uint8_t  cc[32];
+    stm_status cs = stm_btree_engine_commit(idx->eng, committed_gen, &cp, cc);
+    if (cs != STM_OK) {
+        /* A failed commit self-reverts — the engine drops the in-memory
+         * tree, leaves no pending window, and the durable root still
+         * names the previous tree. 9.6-impl-4b design §5.5 + R154: a
+         * failed stm_sync_commit is crash-equivalent; the caller
+         * wedges the fs. */
         must_unlock(idx_lock(idx));
-        return STM_OK;
+        return cs;
     }
 
-    stm_btree_mt *t = NULL;
-    stm_status bs = di_build_btree_locked(idx, &t);
+    /* Read back the authoritative durable triple. A no-op clean commit
+     * keeps the root's PRIOR write gen — that, not committed_gen, is the
+     * gen the uberblock must record + the gen a future mount opens at. */
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    stm_status gs = stm_btree_engine_get_root(idx->eng, &rp, &rg, rc);
+    if (gs != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return gs;
+    }
+
+    /* Make the bootstrap bitmap durable. 9.6-impl-4c retains this
+     * inside the monolithic commit so the unit-test surface keeps
+     * its current shape; the three-phase trio leaves it to the
+     * sync layer (single explicit barrier). */
+    stm_status bs = stm_bootstrap_commit(idx->store_ctx.boot, committed_gen);
     if (bs != STM_OK) {
         must_unlock(idx_lock(idx));
         return bs;
     }
 
-    di_store_ctx        sc = di_make_store_ctx(idx);
-    stm_btree_crypt_ctx cx = di_make_crypt_ctx(idx);
+    idx->root_paddr = rp;
+    idx->root_gen   = rg;
+    memcpy(idx->root_csum, rc, 32);
 
-    uint64_t new_paddr = 0;
-    uint8_t  new_csum[32];
-    stm_status ss = stm_btree_store_serialize(t, committed_gen,
-                                                 /*tree_id=*/0u,
-                                                 &DI_STORE_VT, &sc, &cx,
-                                                 &new_paddr, new_csum);
-    stm_btree_mt_free(t);
-    if (ss != STM_OK) {
-        must_unlock(idx_lock(idx));
-        return ss;
-    }
-
-    #define DI_ROLLBACK_RESERVE() \
-        do { (void)stm_btree_store_free_tree(new_paddr, committed_gen,  \
-                                                committed_gen, new_csum, \
-                                                &DI_STORE_VT, &sc, &cx); \
-        } while (0)
-
-    if (idx->root_paddr != 0) {
-        stm_status fs = stm_btree_store_free_tree(idx->root_paddr,
-                                                     idx->root_gen,
-                                                     committed_gen,
-                                                     idx->root_csum,
-                                                     &DI_STORE_VT, &sc, &cx);
-        if (fs != STM_OK) {
-            DI_ROLLBACK_RESERVE();
-            must_unlock(idx_lock(idx));
-            return fs;
-        }
-    }
-
-    stm_status bsc = stm_bootstrap_commit(idx->boot, committed_gen);
-    if (bsc != STM_OK) {
-        DI_ROLLBACK_RESERVE();
-        must_unlock(idx_lock(idx));
-        return bsc;
-    }
-    #undef DI_ROLLBACK_RESERVE
-
-    idx->root_paddr = new_paddr;
-    idx->root_gen   = committed_gen;
-    memcpy(idx->root_csum, new_csum, 32);
-    idx->dirty      = false;
-
-    *out_root_paddr = new_paddr;
-    memcpy(out_root_csum, new_csum, 32);
+    *out_root_paddr = rp;
+    memcpy(out_root_csum, rc, 32);
     must_unlock(idx_lock(idx));
     return STM_OK;
 }
 
-/* load_at — atomic shadow swap. */
+/* ------------------------------------------------------------------ */
+/* Three-phase commit — flush / finalize / abort (9.6-impl-4c).         */
+/*                                                                      */
+/* The form stm_sync_commit drives. Each is a thin wrapper over the     */
+/* btree_engine's commit_flush / _finalize / _abort, under idx->lock.   */
+/* NONE of them calls stm_bootstrap_commit — the sync layer runs that   */
+/* single explicit durable-bitmap barrier after every index flush,      */
+/* strictly before the uberblock write (4b design note §5.2).           */
+/* ------------------------------------------------------------------ */
 
-typedef struct {
-    stm_dirent_record *shadow;
-    size_t             shadow_len;
-    size_t             shadow_cap;
-    stm_status         err;
-} di_load_ctx;
+stm_status stm_dirent_index_commit_flush(stm_dirent_index *idx,
+                                             uint64_t committed_gen,
+                                             uint64_t *out_root_paddr,
+                                             uint64_t *out_root_gen,
+                                             uint8_t out_root_csum[32]) {
+    if (!idx || !out_root_paddr || !out_root_gen || !out_root_csum)
+        return STM_EINVAL;
+    must_lock(idx_lock(idx));
 
-static stm_status di_shadow_append(di_load_ctx *lc,
-                                       const stm_dirent_record *r) {
-    if (lc->shadow_len == lc->shadow_cap) {
-        if (lc->shadow_cap > (SIZE_MAX / sizeof *lc->shadow) / 2u) return STM_ENOMEM;
-        size_t new_cap = lc->shadow_cap == 0 ? 8u : lc->shadow_cap * 2u;
-        stm_dirent_record *new_buf = realloc(lc->shadow,
-                                                 new_cap * sizeof *new_buf);
-        if (!new_buf) return STM_ENOMEM;
-        lc->shadow     = new_buf;
-        lc->shadow_cap = new_cap;
+    if (!idx->storage_set || !idx->crypt_set || !idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
     }
-    lc->shadow[lc->shadow_len++] = *r;
+
+    /* Flush the dirty root-to-leaf paths to fresh paddrs at committed_gen
+     * and return the PROSPECTIVE root triple. The durable root mirror
+     * (idx->root_*) is untouched until _commit_finalize — a reader
+     * between flush and finalize still sees the previous tree's root.
+     * committed_gen is stm_sync_commit's target_gen, strictly increasing
+     * across commits, so the engine's monotonic-gen guard never fires. */
+    uint64_t cp = 0, cg = 0;
+    uint8_t  cc[32];
+    stm_status cs = stm_btree_engine_commit_flush(idx->eng, committed_gen,
+                                                  &cp, &cg, cc);
+    if (cs != STM_OK) {
+        /* A failed flush self-reverts: NO pending window opened, the
+         * in-memory tree dropped, the durable root still names the
+         * previous tree. The caller MUST NOT _commit_abort (nothing is
+         * pending). 9.6-impl-4b design §5.5 + R154: a failed
+         * stm_sync_commit is crash-equivalent — the caller wedges the
+         * fs. */
+        must_unlock(idx_lock(idx));
+        return cs;
+    }
+
+    *out_root_paddr = cp;
+    *out_root_gen   = cg;
+    memcpy(out_root_csum, cc, 32);
+    must_unlock(idx_lock(idx));
     return STM_OK;
 }
 
-static int di_load_iter(const void *k, size_t klen,
-                            const void *v, size_t vlen, void *ctx_) {
-    di_load_ctx *lc = ctx_;
-    uint64_t ds = 0, dir = 0, probe = 0;
-    stm_status ks = di_decode_key(k, klen, &ds, &dir, &probe);
-    if (ks != STM_OK) { lc->err = ks; return 1; }
-    if (ds == 0u || dir == 0u) { lc->err = STM_ECORRUPT; return 1; }
+stm_status stm_dirent_index_commit_finalize(stm_dirent_index *idx) {
+    if (!idx) return STM_EINVAL;
+    must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
 
-    stm_dirent_record r;
-    memset(&r, 0, sizeof r);
-    stm_status vs = di_decode_value(v, vlen, &r);
-    if (vs != STM_OK) { lc->err = vs; return 1; }
+    /* Adopt the flushed root + deferred-free the superseded paddrs.
+     * After a successful commit_flush this is infallible (btree_engine.h
+     * contract); the STM_EINVAL exit is a no-pending-flush sequencing
+     * bug. */
+    stm_status fs = stm_btree_engine_commit_finalize(idx->eng);
+    if (fs != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return fs;
+    }
 
-    r.dataset_id = ds;
-    r.dir_ino    = dir;
-    r.hash_probe = probe;
+    /* Mirror the now-durable triple into idx->root_* so the get_root /
+     * get_gen accessors return the new root. */
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    stm_status gs = stm_btree_engine_get_root(idx->eng, &rp, &rg, rc);
+    if (gs != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return gs;
+    }
+    idx->root_paddr = rp;
+    idx->root_gen   = rg;
+    memcpy(idx->root_csum, rc, 32);
 
-    stm_status as = di_shadow_append(lc, &r);
-    if (as != STM_OK) { lc->err = as; return 1; }
-    return 0;
+    must_unlock(idx_lock(idx));
+    return STM_OK;
 }
+
+stm_status stm_dirent_index_commit_abort(stm_dirent_index *idx) {
+    if (!idx) return STM_EINVAL;
+    must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
+
+    /* Discard the flushed root: deferred-free the freshly-written
+     * paddrs + drop the in-memory tree (next access reloads the
+     * previous durable root). idx->root_* is deliberately NOT
+     * touched — the durable root still names the previous tree,
+     * exactly as commit_abort leaves the engine. */
+    stm_status as = stm_btree_engine_commit_abort(idx->eng);
+    must_unlock(idx_lock(idx));
+    return as;
+}
+
+/* ------------------------------------------------------------------ */
+/* load_at — open the on-disk engine.                                  */
+/*                                                                      */
+/* Unlike the inode mount-scan (which rebuilds per-dataset next_ino    */
+/* high-water marks), dirent has no in-RAM state to reconstruct — the   */
+/* chain walkers go straight to the engine. So load_at is just         */
+/* engine_open + atomic adoption. Validation of individual records is  */
+/* lazy: a corrupt record surfaces at first access via di_decode_value */
+/* (returning STM_ECORRUPT to the caller). The AEAD tag + Merkle chain */
+/* on the enclosing engine node still defend against offline tamper at */
+/* every node read — that protection is preserved verbatim from the    */
+/* engine layer.                                                        */
+/* ------------------------------------------------------------------ */
 
 stm_status stm_dirent_index_load_at(stm_dirent_index *idx,
                                         uint64_t root_paddr,
@@ -1197,56 +1450,33 @@ stm_status stm_dirent_index_load_at(stm_dirent_index *idx,
     if (!idx || !expected_csum) return STM_EINVAL;
     if (root_paddr == 0u) return STM_EINVAL;
     must_lock(idx_lock(idx));
-    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+    if (!idx->storage_set || !idx->crypt_set) {
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
 
-    stm_btree_opts opts = stm_btree_opts_default();
-    if (opts.target_entries < 512u) opts.target_entries = 512u;
-    stm_btree_mt *t = NULL;
-    stm_status ts = stm_btree_mt_new(&opts, &t);
-    if (ts != STM_OK) {
+    /* Open the on-disk tree (lazy — no device I/O until the first
+     * lookup descends). */
+    stm_btree_engine *opened = NULL;
+    stm_status os = stm_btree_engine_open(&STM_ENGINE_STORE_VT,
+                                          &idx->store_ctx, &idx->crypt_ctx,
+                                          /*tree_id=*/0u,
+                                          root_paddr, root_gen, expected_csum,
+                                          &opened);
+    if (os != STM_OK) {
         must_unlock(idx_lock(idx));
-        return ts;
+        return os;
     }
 
-    di_store_ctx        sc = di_make_store_ctx(idx);
-    stm_btree_crypt_ctx cx = di_make_crypt_ctx(idx);
+    /* Atomic install: drop the prior engine (the fresh one stood up by
+     * the second binder, or a previously-loaded one), adopt the
+     * opened tree. */
+    stm_btree_engine_destroy(idx->eng);
+    idx->eng = opened;
 
-    stm_status ds = stm_btree_store_deserialize(t, root_paddr, root_gen,
-                                                   expected_csum,
-                                                   &DI_STORE_VT, &sc, &cx);
-    if (ds != STM_OK) {
-        stm_btree_mt_free(t);
-        must_unlock(idx_lock(idx));
-        return ds;
-    }
-
-    di_load_ctx lc = { .err = STM_OK };
-    stm_status sr = stm_btree_mt_scan(t, NULL, 0, NULL, 0,
-                                         di_load_iter, &lc);
-    stm_btree_mt_free(t);
-    if (sr != STM_OK) {
-        free(lc.shadow);
-        must_unlock(idx_lock(idx));
-        return sr;
-    }
-    if (lc.err != STM_OK) {
-        free(lc.shadow);
-        must_unlock(idx_lock(idx));
-        return lc.err;
-    }
-
-    /* Atomic shadow swap. */
-    free(idx->records);
-    idx->records     = lc.shadow;
-    idx->n_records   = lc.shadow_len;
-    idx->cap_records = lc.shadow_cap;
-    idx->root_paddr  = root_paddr;
-    idx->root_gen    = root_gen;
+    idx->root_paddr = root_paddr;
+    idx->root_gen   = root_gen;
     memcpy(idx->root_csum, expected_csum, 32);
-    idx->dirty       = false;
 
     must_unlock(idx_lock(idx));
     return STM_OK;
@@ -1274,30 +1504,31 @@ stm_status stm_dirent_install_at_probe_for_test(
     if (name_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
 
     must_lock(idx_lock(idx));
-
-    stm_dirent_record *target =
-            find_record_at_probe(idx, dataset_id, dir_ino, hash_probe);
-    if (!target) {
-        target = append_record(idx);
-        if (!target) {
-            must_unlock(idx_lock(idx));
-            return STM_ENOMEM;
-        }
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
     }
-    target->dataset_id = dataset_id;
-    target->dir_ino    = dir_ino;
-    target->hash_probe = hash_probe;
-    target->child_ino  = child_ino;
-    target->child_gen  = child_gen;
-    target->child_type = child_type;
-    target->name_len   = name_len;
-    target->flags      = flags;
-    memset(target->name, 0, sizeof target->name);
-    if (name && name_len > 0u) memcpy(target->name, name, name_len);
-    idx->dirty = true;
 
+    /* Construct the in-memory record + engine_insert (upsert). Tests
+     * use this to set up specific chain layouts (whiteouts with
+     * controlled hash_probes, etc); we bypass alloc's chain-walk +
+     * accept whatever (probably-malformed) flags + payload the test
+     * specifies, but the engine's KEY-side encoding still applies. */
+    stm_dirent_record r;
+    memset(&r, 0, sizeof r);
+    r.dataset_id = dataset_id;
+    r.dir_ino    = dir_ino;
+    r.hash_probe = hash_probe;
+    r.child_ino  = child_ino;
+    r.child_gen  = child_gen;
+    r.child_type = child_type;
+    r.name_len   = name_len;
+    r.flags      = flags;
+    if (name && name_len > 0u) memcpy(r.name, name, name_len);
+
+    stm_status ps = di_engine_put(idx, &r);
     must_unlock(idx_lock(idx));
-    return STM_OK;
+    return ps;
 }
 
 uint64_t stm_dirent_fnv1a64_for_test(const uint8_t *name, size_t len) {

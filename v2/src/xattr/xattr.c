@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * Stratum v2 — xattr index implementation (P8-POSIX-6).
+ * Stratum v2 — xattr index implementation
+ * (P8-POSIX-6 + 9.6-impl-4c).
  *
  * Spec: v2/specs/xattr.tla. Models open-addressing chain integrity
  * for extended attributes keyed by `(dataset_id, ino, hash_probe)`
@@ -11,33 +12,64 @@
  * guards (R71 P1-1 + R77 P1-1 lessons). Differences:
  *   - Keyed at `ino` instead of `dir_ino` (a dir is just a special
  *     inode at the namespace layer; the key field is the same shape).
- *   - Variable-length VALUE field heap-allocated per record (up to
- *     STM_XATTR_VALUE_MAX = 64 KiB) rather than fixed-size embedded
- *     bytes — keeps the records[] array compact for inodes with many
- *     small xattrs.
+ *   - Variable-length VALUE field (up to STM_XATTR_VALUE_MAX = 64 KiB)
+ *     — engine_insert / engine_lookup serialise the full value bytes
+ *     per record; 9.6-impl-3's spill mechanism handles values past
+ *     the inline-leaf cap automatically.
  *   - POSIX setxattr flags (CREATE / REPLACE) layered atop the
  *     spec's basic Set action.
  *
- * On-disk encoding:
+ * 9.6-impl-4c — the xattr cutover. The module no longer keeps an
+ * in-RAM `records[]` array serialized whole on every commit: the
+ * btree_engine COW B+tree (Phase 9.6) IS the xattr store. Every
+ * public op maps onto the engine —
+ *
+ *   set            -> chain-walk via engine_lookup per probe, install
+ *                     via engine_insert (upsert overwrites a
+ *                     tombstone OR a same-name live record per POSIX
+ *                     setxattr default semantics)
+ *   get            -> chain-walk via engine_lookup per probe
+ *   remove         -> chain-walk + engine_insert (tombstone-flavored)
+ *   list           -> engine_scan_range over the (ds, ino) prefix,
+ *                     count + copy out live records (no sort —
+ *                     POSIX listxattr doesn't promise order)
+ *   drop_for_ino   -> engine_scan_range collects keys, then
+ *                     engine_delete each
+ *
+ * xattr.tla's chain-integrity invariants are UNCHANGED; only the
+ * storage under it swapped from btree_store's whole-tree-rebuild MVP
+ * to btree_engine's incremental COW B+tree. Tombstones remain
+ * reachable as engine_inserted records (no engine_delete for a
+ * Remove — the slot must persist so a colliding name at a higher
+ * probe stays reachable per xattr.tla's tombstone-leaves-on-Remove
+ * invariant). engine_delete is only used by drop_for_ino's bulk
+ * cleanup.
+ *
+ * On-disk encoding (unchanged from P8-POSIX-6):
  *   - Key (24 bytes): le64 dataset_id || le64 ino || le64 hash_probe.
  *   - Value (16 + name_len + value_len bytes, tombstones 16 bytes):
  *     see xattr.h for the full byte-level layout.
  *
- * Concurrency: a single mutex guards records[] + persistence fields.
- * Lock posture: this layer takes its own lock only — no cross-layer
- * lock dependencies. The caller (sync.c) MUST not hold any other
- * xattr-comparable lock when invoking these APIs; sync.c does not.
+ * Engine lifecycle. stm_btree_engine_create needs the storage vtable
+ * context (bdev + bootstrap) AND the AEAD crypt context — set by
+ * stm_xattr_index_set_storage / _set_crypt_ctx, which the sole caller
+ * (sync.c) issues after stm_xattr_index_create. The engine is created
+ * by whichever of the two binders runs SECOND (the first one with
+ * both contexts now populated); the mount path's load_at then
+ * destroys that fresh engine and opens the on-disk one.
  *
- * Audit-trigger surface: this module joins CLAUDE.md's trigger list
- * with this commit (P8-POSIX-6 substantive).
+ * Concurrency: a single mutex (idx->lock) guards the persistence
+ * fields AND every engine call — the btree_engine is single-threaded
+ * (one handle, one thread at a time), and idx->lock IS that
+ * serialization.
+ *
+ * Audit-trigger surface: this module is on CLAUDE.md's trigger list.
  */
 #include <stratum/xattr.h>
 #include <stratum/types.h>
-#include <stratum/block.h>
 #include <stratum/bootstrap.h>
-#include <stratum/btree.h>
-#include <stratum/btree_store.h>
-#include <stratum/super.h>
+#include <stratum/btree_engine.h>
+#include <stratum/engine_store.h>
 
 #include <pthread.h>
 #include <stdint.h>
@@ -45,7 +77,7 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/* Lock helpers — abort on misuse (dirent.c convention).               */
+/* Lock helpers — abort on misuse (dirent.c / inode.c convention).     */
 /* ------------------------------------------------------------------ */
 
 static inline void must_lock(pthread_mutex_t *m) {
@@ -76,6 +108,16 @@ static inline void must_unlock(pthread_mutex_t *m) {
 /* Internal record + index types.                                      */
 /* ------------------------------------------------------------------ */
 
+/* In-memory decoded record. The engine stores key + value as opaque
+ * bytes; this is the structured shape every chain helper + public op
+ * operates on. Decoded from engine_lookup and re-encoded for
+ * engine_insert. The dataset_id / ino / hash_probe fields are STAMPED
+ * from the KEY (NOT from the value bytes) so a buggy writer can't
+ * tamper cross-key references.
+ *
+ * `value` is heap-allocated when value_len > 0; the caller MUST free
+ * it after every use. This struct is per-call stack-allocated; there
+ * is no in-RAM cache of records. */
 typedef struct {
     uint64_t dataset_id;
     uint64_t ino;
@@ -84,32 +126,35 @@ typedef struct {
     uint8_t  flags;          /* STM_XATTR_FLAG_TOMBSTONE on tombstone */
     uint8_t  name[STM_XATTR_NAME_MAX];
     uint32_t value_len;
-    /* Heap-allocated value buffer (NULL iff value_len == 0). The
-     * pointer is valid across records[] realloc (it points off-heap;
-     * realloc relocates the array of structs but not the bytes
-     * referenced by struct fields). Freed on Remove, replace, drop
-     * for ino, load_at shadow-swap, and close. */
     uint8_t *value;
 } stm_xattr_record;
 
 struct stm_xattr_index {
     pthread_mutex_t      lock;
-    stm_xattr_record    *records;
-    size_t               n_records;
-    size_t               cap_records;
 
-    /* Persistence (mirrors stm_dirent_index, with R70 P3-6 latches). */
-    stm_bdev       *bdev;
-    stm_bootstrap  *boot;
-    const uint8_t  *metadata_key;
-    uint64_t        pool_uuid[2];
-    uint64_t        device_uuid[2];
-    bool            crypt_set;       /* latched on first set_crypt_ctx */
-    bool            storage_set;     /* latched on first set_storage */
-    uint64_t        root_paddr;
-    uint64_t        root_gen;
-    uint8_t         root_csum[32];
-    bool            dirty;
+    /* ----- Persistence (9.6-impl-4c: btree_engine-backed). ----- */
+    bool                  storage_set;   /* R70 P3-6: latched on first
+                                           * successful set_storage. */
+    bool                  crypt_set;     /* R70 P3-6: latched on first
+                                           * successful set_crypt_ctx. */
+    stm_engine_store_ctx  store_ctx;     /* { boot, bdev } — the engine's
+                                           * vt_ctx. Populated by set_storage;
+                                           * a stable member so the engine's
+                                           * borrowed vt_ctx pointer stays
+                                           * valid for idx's lifetime. */
+    stm_btree_crypt_ctx   crypt_ctx;     /* metadata_key + uuids — the
+                                           * engine's cx. Populated by
+                                           * set_crypt_ctx; a stable member. */
+    stm_btree_engine     *eng;           /* the xattr store. Created once
+                                           * BOTH contexts are bound (see
+                                           * xa_engine_create_locked /
+                                           * the two binders), or by load_at
+                                           * on the mount path. */
+    /* Last durably-committed root triple — mirrored for the sync layer's
+     * uberblock stamping (stm_xattr_index_get_root / _get_gen). */
+    uint64_t            root_paddr;
+    uint64_t            root_gen;
+    uint8_t             root_csum[32];
 };
 
 static inline pthread_mutex_t *idx_lock(const stm_xattr_index *idx) {
@@ -126,13 +171,11 @@ static inline bool record_name_eq(const stm_xattr_record *r,
            memcmp(r->name, name, name_len) == 0;
 }
 
-/* Free a record's value buffer + clear its header to a tombstone-shaped
- * zero state (caller may then set TOMBSTONE flag if applicable, or
- * leave the slot for compaction). */
+/* Free a record's value buffer + clear value_len. */
 static void record_clear_value(stm_xattr_record *r) {
     if (r->value) {
-        /* Note: not stm_ct_memzero — xattr values are user-controlled
-         * but not key material. dirent's record_clear is similar. */
+        /* Not stm_ct_memzero — xattr values are user-controlled but not
+         * key material. */
         free(r->value);
         r->value = NULL;
     }
@@ -141,8 +184,6 @@ static void record_clear_value(stm_xattr_record *r) {
 
 /* ------------------------------------------------------------------ */
 /* FNV-1a 64-bit hash (ARCH §11.5 — used to compute hash_probe).       */
-/* Identical to dirent.c's fnv1a64; same offset basis + prime so the   */
-/* hash function is the standard one. */
 /* ------------------------------------------------------------------ */
 
 static uint64_t fnv1a64(const uint8_t *data, size_t len) {
@@ -152,58 +193,6 @@ static uint64_t fnv1a64(const uint8_t *data, size_t len) {
         h *= 0x100000001B3ull;                  /* FNV prime */
     }
     return h;
-}
-
-/* ------------------------------------------------------------------ */
-/* Internal helpers (caller holds idx->lock).                          */
-/* ------------------------------------------------------------------ */
-
-/* Linear scan for a record at exact key (ds, ino, probe). NULL on
- * miss. Used by the chain walkers as the per-step "is there a record
- * at probe k?" check — semantic equivalent to "slot[k] EMPTY iff
- * find returns NULL". */
-static stm_xattr_record *find_record_at_probe(stm_xattr_index *idx,
-                                                    uint64_t dataset_id,
-                                                    uint64_t ino,
-                                                    uint64_t hash_probe) {
-    for (size_t i = 0; i < idx->n_records; i++) {
-        stm_xattr_record *r = &idx->records[i];
-        if (r->dataset_id == dataset_id &&
-            r->ino        == ino &&
-            r->hash_probe == hash_probe) return r;
-    }
-    return NULL;
-}
-
-static const stm_xattr_record *find_record_at_probe_c(
-        const stm_xattr_index *idx,
-        uint64_t dataset_id, uint64_t ino, uint64_t hash_probe) {
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_xattr_record *r = &idx->records[i];
-        if (r->dataset_id == dataset_id &&
-            r->ino        == ino &&
-            r->hash_probe == hash_probe) return r;
-    }
-    return NULL;
-}
-
-/* Append a fresh record. Returns NULL only on STM_ENOMEM.
- * R71b P3-1: cap-doubling guard tightened to bound the
- * `* sizeof` multiplication. */
-static stm_xattr_record *append_record(stm_xattr_index *idx) {
-    if (idx->n_records == idx->cap_records) {
-        if (idx->cap_records > (SIZE_MAX / sizeof *idx->records) / 2u)
-            return NULL;
-        size_t new_cap = idx->cap_records ? idx->cap_records * 2u : 8u;
-        stm_xattr_record *new_arr =
-                realloc(idx->records, new_cap * sizeof *new_arr);
-        if (!new_arr) return NULL;
-        idx->records     = new_arr;
-        idx->cap_records = new_cap;
-    }
-    stm_xattr_record *r = &idx->records[idx->n_records++];
-    memset(r, 0, sizeof *r);
-    return r;
 }
 
 /* ------------------------------------------------------------------ */
@@ -235,8 +224,7 @@ static stm_status xa_decode_key(const void *in, size_t in_len,
 }
 
 /* Encode a record into out[]; out must be ≥ XA_VAL_FIXED + r->name_len
- * + r->value_len bytes. Caller writes the result via btree_mt_insert
- * with the returned length. */
+ * + r->value_len bytes (the caller passes XA_VAL_MAX-sized buffers). */
 static void xa_encode_value(const stm_xattr_record *r,
                                 uint8_t *out, size_t *out_len) {
     le32 vl = stm_store_le32(r->value_len);
@@ -248,9 +236,7 @@ static void xa_encode_value(const stm_xattr_record *r,
         memcpy(out + XA_VAL_FIXED, r->name, r->name_len);
     }
     /* R80 P3-4: encode invariant — value_len > 0 ⇒ value != NULL.
-     * install_bytes / xa_decode_value pair value_len with non-NULL
-     * value; tombstones have value_len == 0 + value == NULL. The
-     * `else` branch zero-fills any value_len bytes if the upstream
+     * The `else` branch zero-fills any value_len bytes if the upstream
      * invariant is violated (defense-in-depth) so we never disclose
      * heap content via an unset value pointer. */
     if (r->value_len > 0u) {
@@ -281,8 +267,9 @@ static void xa_encode_value(const stm_xattr_record *r,
  *
  * On success, copies the name into `out->name[0..name_len)` and
  * heap-allocates a fresh `out->value` buffer if value_len > 0
- * (caller takes ownership; freed via record_clear_value on
- * subsequent Remove/replace/drop_for_ino/close). */
+ * (caller takes ownership; freed via record_clear_value or free()).
+ * The dataset_id / ino / hash_probe fields are NOT set here — caller
+ * stamps from the on-disk key. */
 static stm_status xa_decode_value(const void *in, size_t in_len,
                                        stm_xattr_record *out) {
     if (in_len < XA_VAL_FIXED) return STM_ECORRUPT;
@@ -311,10 +298,7 @@ static stm_status xa_decode_value(const void *in, size_t in_len,
     /* R80 P3-6: zero-init key fields explicitly so the contract is
      * "xa_decode_value fully initializes out except for caller-
      * supplied (dataset_id, ino, hash_probe) which the caller fills
-     * post-call from the on-disk key". The xa_load_iter caller's
-     * memset(&r, 0, sizeof r) at the top makes this redundant in
-     * practice, but documenting it here protects future reuse of
-     * this function in a context without that upstream init. */
+     * post-call from the on-disk key". */
     out->dataset_id = 0u;
     out->ino        = 0u;
     out->hash_probe = 0u;
@@ -356,61 +340,89 @@ static stm_status xa_decode_value(const void *in, size_t in_len,
 }
 
 /* ------------------------------------------------------------------ */
-/* btree_store vtable — same shape as dirent_index's.                   */
+/* Engine glue.                                                         */
 /* ------------------------------------------------------------------ */
 
-typedef struct {
-    stm_bootstrap *boot;
-    stm_bdev      *bdev;
-} xa_store_ctx;
+/* engine_lookup + decode + validate at exact (ds, ino, probe). Caller
+ * holds idx->lock. On STM_OK with *out_found = true, *out holds the
+ * validated decoded record (live or tombstone); if value_len > 0 the
+ * caller MUST free out->value (or call record_clear_value). The
+ * dataset_id / ino / hash_probe fields are STAMPED from the key
+ * triple. On STM_OK with *out_found = false, *out is left in a
+ * cleared state (no heap to free). */
+static stm_status xa_engine_get(stm_xattr_index *idx,
+                                uint64_t ds, uint64_t ino, uint64_t probe,
+                                stm_xattr_record *out, bool *out_found) {
+    *out_found = false;
+    memset(out, 0, sizeof *out);
 
-static stm_status xa_store_reserve(void *ctx_, uint64_t *out_paddr) {
-    xa_store_ctx *ctx = ctx_;
-    return stm_bootstrap_reserve(ctx->boot, STM_BOOTSTRAP_UNIT_BLOCKS,
-                                   /*hint_paddr=*/0, out_paddr);
+    uint8_t key[XA_KEY_LEN];
+    xa_encode_key(ds, ino, probe, key);
+
+    bool found = false;
+    void *vbuf = NULL;
+    size_t vlen = 0;
+    stm_status ls = stm_btree_engine_lookup(idx->eng, key, XA_KEY_LEN,
+                                            &found, &vbuf, &vlen);
+    if (ls != STM_OK) return ls;
+    if (!found) return STM_OK;                  /* *out_found stays false */
+
+    stm_status vs = xa_decode_value(vbuf, vlen, out);
+    free(vbuf);
+    if (vs != STM_OK) {
+        /* xa_decode_value may have heap-allocated out->value before
+         * hitting an error code path; in practice it returns the
+         * heap allocation only on STM_OK. Defense-in-depth: free if
+         * non-NULL. */
+        if (out->value) {
+            free(out->value);
+            out->value = NULL;
+        }
+        return vs;
+    }
+    out->dataset_id = ds;
+    out->ino        = ino;
+    out->hash_probe = probe;
+    *out_found      = true;
+    return STM_OK;
 }
 
-static stm_status xa_store_free(void *ctx_, uint64_t paddr, uint64_t free_gen) {
-    xa_store_ctx *ctx = ctx_;
-    return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_UNIT_BLOCKS,
-                                free_gen);
+/* Encode + engine_insert (upsert). Caller holds idx->lock. The engine's
+ * insert is failure-atomic — a failed put never loses the prior value
+ * at this key. The encoded value buffer is allocated on the heap
+ * (worst-case 16 + 255 + 65536 ≈ 64 KiB — too big for the stack). */
+static stm_status xa_engine_put(stm_xattr_index *idx,
+                                const stm_xattr_record *r) {
+    uint8_t key[XA_KEY_LEN];
+    xa_encode_key(r->dataset_id, r->ino, r->hash_probe, key);
+
+    uint8_t *val = malloc(XA_VAL_MAX);
+    if (!val) return STM_ENOMEM;
+    size_t vlen = 0;
+    xa_encode_value(r, val, &vlen);
+    stm_status is = stm_btree_engine_insert(idx->eng, key, XA_KEY_LEN,
+                                            val, vlen);
+    free(val);
+    return is;
 }
 
-static stm_status xa_store_write(void *ctx_, uint64_t paddr,
-                                     const void *buf, size_t len) {
-    xa_store_ctx *ctx = ctx_;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
-    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
-    return stm_bdev_write(ctx->bdev, byte_offset, buf, len);
+/* engine_delete at exact (ds, ino, probe). Caller holds idx->lock.
+ * Used ONLY by drop_for_ino's bulk cleanup; Remove does NOT delete —
+ * it engine_inserts a tombstone (chain integrity per xattr.tla). */
+static stm_status xa_engine_del(stm_xattr_index *idx,
+                                uint64_t ds, uint64_t ino, uint64_t probe) {
+    uint8_t key[XA_KEY_LEN];
+    xa_encode_key(ds, ino, probe, key);
+    return stm_btree_engine_delete(idx->eng, key, XA_KEY_LEN, NULL);
 }
 
-static stm_status xa_store_read(void *ctx_, uint64_t paddr,
-                                    void *buf, size_t len) {
-    xa_store_ctx *ctx = ctx_;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
-    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
-    return stm_bdev_read(ctx->bdev, byte_offset, buf, len);
-}
-
-static const stm_btree_store_vtable XA_STORE_VT = {
-    .reserve = xa_store_reserve,
-    .free    = xa_store_free,
-    .write   = xa_store_write,
-    .read    = xa_store_read,
-};
-
-static inline xa_store_ctx xa_make_store_ctx(stm_xattr_index *idx) {
-    xa_store_ctx c = { .boot = idx->boot, .bdev = idx->bdev };
-    return c;
-}
-
-static inline stm_btree_crypt_ctx xa_make_crypt_ctx(const stm_xattr_index *idx) {
-    stm_btree_crypt_ctx cx = { .metadata_key = idx->metadata_key };
-    cx.pool_uuid[0]   = idx->pool_uuid[0];
-    cx.pool_uuid[1]   = idx->pool_uuid[1];
-    cx.device_uuid[0] = idx->device_uuid[0];
-    cx.device_uuid[1] = idx->device_uuid[1];
-    return cx;
+/* Stand up the btree_engine from the (now both populated) store + crypt
+ * contexts. Caller holds idx->lock, has verified BOTH contexts are
+ * bound and idx->eng is NULL. */
+static stm_status xa_engine_create_locked(stm_xattr_index *idx) {
+    return stm_btree_engine_create(&STM_ENGINE_STORE_VT, &idx->store_ctx,
+                                   &idx->crypt_ctx, /*tree_id=*/0u,
+                                   &idx->eng);
 }
 
 /* ------------------------------------------------------------------ */
@@ -443,12 +455,10 @@ stm_xattr_index *stm_xattr_index_create(void) {
 void stm_xattr_index_close(stm_xattr_index *idx) {
     if (!idx) return;
     pthread_mutex_destroy(&idx->lock);
-    /* Free every record's heap-allocated value before freeing the
-     * records[] array itself. */
-    for (size_t i = 0; i < idx->n_records; i++) {
-        record_clear_value(&idx->records[i]);
-    }
-    free(idx->records);
+    /* NULL-safe; an un-finalized flush is implicitly aborted (the
+     * flushed-but-unrooted paddrs are handed back to the allocator).
+     * Same defense-in-depth posture as inode.c::stm_inode_index_close. */
+    stm_btree_engine_destroy(idx->eng);
     free(idx);
 }
 
@@ -477,40 +487,6 @@ static stm_status set_validate_args(uint64_t dataset_id, uint64_t ino,
     return STM_OK;
 }
 
-/* Helper: install bytes into target's (name, value) slot. Frees any
- * existing value (POSIX setxattr replace-or-create). Allocates new
- * buffer for value if value_len > 0. Returns STM_ENOMEM if the new
- * value buffer can't be allocated. On STM_ENOMEM, target's prior
- * state is preserved (we malloc a fresh buffer BEFORE freeing the
- * old one). */
-static stm_status install_bytes(stm_xattr_record *target,
-                                      uint64_t dataset_id, uint64_t ino,
-                                      uint64_t hash_probe,
-                                      const uint8_t *name, uint8_t name_len,
-                                      const uint8_t *value, uint32_t value_len) {
-    uint8_t *new_value = NULL;
-    if (value_len > 0u) {
-        new_value = malloc(value_len);
-        if (!new_value) return STM_ENOMEM;
-        memcpy(new_value, value, value_len);
-    }
-    /* Now safe to free old. */
-    if (target->value) {
-        free(target->value);
-        target->value = NULL;
-    }
-    target->dataset_id = dataset_id;
-    target->ino        = ino;
-    target->hash_probe = hash_probe;
-    target->name_len   = name_len;
-    target->flags      = 0u;
-    memset(target->name, 0, sizeof target->name);
-    memcpy(target->name, name, name_len);
-    target->value_len  = value_len;
-    target->value      = new_value;
-    return STM_OK;
-}
-
 stm_status stm_xattr_set(stm_xattr_index *idx,
                             uint64_t dataset_id, uint64_t ino,
                             const uint8_t *name, uint8_t name_len,
@@ -524,6 +500,10 @@ stm_status stm_xattr_set(stm_xattr_index *idx,
     if (av != STM_OK) return av;
 
     must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
 
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
 
@@ -533,56 +513,77 @@ stm_status stm_xattr_set(stm_xattr_index *idx,
      * in-place at that slot (POSIX setxattr default semantics). */
     bool     have_install_slot = false;
     uint64_t install_probe     = 0;
-    stm_xattr_record *install_tomb = NULL;  /* non-NULL iff install_probe is a TOMBSTONE */
-    stm_xattr_record *existing    = NULL;
-    uint64_t existing_probe       = 0;
+    bool     existing_found    = false;
+    uint64_t existing_probe    = 0;
 
     for (uint32_t k = 0; k < STM_XATTR_PROBE_MAX; k++) {
         uint64_t probe = hash_base + (uint64_t)k;
-        stm_xattr_record *r =
-                find_record_at_probe(idx, dataset_id, ino, probe);
-        if (!r) {
+        stm_xattr_record r;
+        bool found = false;
+        stm_status gs = xa_engine_get(idx, dataset_id, ino, probe,
+                                      &r, &found);
+        if (gs != STM_OK) {
+            must_unlock(idx_lock(idx));
+            return gs;
+        }
+        if (!found) {
             /* EMPTY — chain ends here. Install at first install slot
              * (this EMPTY if none earlier was found). */
             if (!have_install_slot) {
                 install_probe     = probe;
-                install_tomb      = NULL;
                 have_install_slot = true;
             }
             break;
         }
-        if (record_is_tombstone(r)) {
+        if (record_is_tombstone(&r)) {
             if (!have_install_slot) {
                 install_probe     = probe;
-                install_tomb      = r;
                 have_install_slot = true;
             }
+            /* tombstone has no heap value to free */
             continue;
         }
-        if (record_name_eq(r, name, name_len)) {
-            existing       = r;
+        if (record_name_eq(&r, name, name_len)) {
+            /* Found a live match at this probe. Free the heap value
+             * we just allocated in xa_engine_get and remember the
+             * probe to replace at. */
+            record_clear_value(&r);
+            existing_found = true;
             existing_probe = probe;
             break;
         }
-        /* Different live name → continue probing. */
+        /* Different live name → continue probing. Free the heap value
+         * before the next iteration. */
+        record_clear_value(&r);
     }
 
     /* Apply POSIX setxattr flag semantics. */
-    if (existing) {
+    if (existing_found) {
         if (flags & STM_XATTR_FLAG_CREATE) {
             must_unlock(idx_lock(idx));
             return STM_EEXIST;
         }
-        /* REPLACE or default: rewrite the existing record. */
-        stm_status is = install_bytes(existing, dataset_id, ino,
-                                            existing_probe,
-                                            name, name_len,
-                                            value, value_len);
-        if (is != STM_OK) {
+        /* REPLACE or default: rewrite the existing record. Construct
+         * the new value via engine_insert (upsert) at the same probe. */
+        stm_xattr_record nr;
+        memset(&nr, 0, sizeof nr);
+        nr.dataset_id = dataset_id;
+        nr.ino        = ino;
+        nr.hash_probe = existing_probe;
+        nr.name_len   = name_len;
+        nr.flags      = 0u;
+        memcpy(nr.name, name, name_len);
+        nr.value_len  = value_len;
+        nr.value      = (uint8_t *)value;   /* borrowed for encode only */
+
+        stm_status ps = xa_engine_put(idx, &nr);
+        /* xa_engine_put doesn't free nr.value (it's borrowed); we
+         * also do nothing because the caller owns the original
+         * buffer. */
+        if (ps != STM_OK) {
             must_unlock(idx_lock(idx));
-            return is;
+            return ps;
         }
-        idx->dirty = true;
         if (out_replaced) *out_replaced = true;
         must_unlock(idx_lock(idx));
         return STM_OK;
@@ -598,43 +599,22 @@ stm_status stm_xattr_set(stm_xattr_index *idx,
         return STM_ENOSPC;
     }
 
-    /* Install at install_probe. */
-    stm_xattr_record *target;
-    bool target_freshly_appended = false;
-    if (install_tomb) {
-        target = install_tomb;
-    } else {
-        target = append_record(idx);
-        if (!target) {
-            must_unlock(idx_lock(idx));
-            return STM_ENOMEM;
-        }
-        target_freshly_appended = true;
-    }
-    stm_status is = install_bytes(target, dataset_id, ino, install_probe,
-                                        name, name_len, value, value_len);
-    if (is != STM_OK) {
-        /* R80 P0-1 fix: roll back the freshly-appended slot on
-         * install_bytes failure. Without this, the zero-keyed zombie
-         * record (memset by append_record) survives in records[] and
-         * gets serialized by xa_build_btree_locked at the next commit
-         * with key 24 zero bytes. On the subsequent mount,
-         * xa_load_iter rejects ds==0 keys with STM_ECORRUPT and the
-         * pool wedges. The rollback restores the pre-call invariant
-         * (records[] holds only legitimate (ds!=0, ino!=0) entries).
-         * If install_tomb was used, the tombstone is preserved
-         * unchanged (install_bytes' malloc-before-free ordering
-         * guarantees target's prior state is intact on STM_ENOMEM). */
-        if (target_freshly_appended) {
-            idx->n_records--;
-        }
-        must_unlock(idx_lock(idx));
-        return is;
-    }
-    idx->dirty = true;
+    /* Install at install_probe via engine_insert (upsert overwrites
+     * a tombstone if present, fresh insert at EMPTY). */
+    stm_xattr_record nr;
+    memset(&nr, 0, sizeof nr);
+    nr.dataset_id = dataset_id;
+    nr.ino        = ino;
+    nr.hash_probe = install_probe;
+    nr.name_len   = name_len;
+    nr.flags      = 0u;
+    memcpy(nr.name, name, name_len);
+    nr.value_len  = value_len;
+    nr.value      = (uint8_t *)value;   /* borrowed for encode only */
 
+    stm_status ps = xa_engine_put(idx, &nr);
     must_unlock(idx_lock(idx));
-    return STM_OK;
+    return ps;
 }
 
 stm_status stm_xattr_get(const stm_xattr_index *idx,
@@ -652,49 +632,68 @@ stm_status stm_xattr_get(const stm_xattr_index *idx,
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (name_len == 0u || name_len > STM_XATTR_NAME_MAX) return STM_EINVAL;
 
-    must_lock(idx_lock(idx));
+    pthread_mutex_t *lk = idx_lock(idx);
+    must_lock(lk);
+    if (!idx->eng) {
+        must_unlock(lk);
+        return STM_EINVAL;
+    }
+
+    /* Cast away const for the engine_lookup call. */
+    stm_xattr_index *m = (stm_xattr_index *)idx;
 
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
 
     for (uint32_t k = 0; k < STM_XATTR_PROBE_MAX; k++) {
         uint64_t probe = hash_base + (uint64_t)k;
-        const stm_xattr_record *r =
-                find_record_at_probe_c(idx, dataset_id, ino, probe);
-        if (!r) {
+        stm_xattr_record r;
+        bool found = false;
+        stm_status gs = xa_engine_get(m, dataset_id, ino, probe,
+                                      &r, &found);
+        if (gs != STM_OK) {
+            must_unlock(lk);
+            return gs;
+        }
+        if (!found) {
             /* EMPTY — chain ends. */
-            must_unlock(idx_lock(idx));
+            must_unlock(lk);
             return STM_ENODATA;
         }
-        if (record_is_tombstone(r)) continue;
-        if (record_name_eq(r, name, name_len)) {
-            /* R77 P1-1 defense-in-depth: re-cap value_len before any
-             * memcpy. The decoder + writer both bound value_len ≤
-             * STM_XATTR_VALUE_MAX, so a record exceeding the cap is
-             * unreachable through legitimate paths — but the explicit
-             * cap here closes any future-bypass surface. */
-            if (r->value_len > STM_XATTR_VALUE_MAX) {
-                must_unlock(idx_lock(idx));
+        if (record_is_tombstone(&r)) {
+            /* No heap value on a tombstone — no-op free. */
+            continue;
+        }
+        if (record_name_eq(&r, name, name_len)) {
+            /* R77 P1-1 defense-in-depth: re-cap value_len. */
+            if (r.value_len > STM_XATTR_VALUE_MAX) {
+                record_clear_value(&r);
+                must_unlock(lk);
                 return STM_ECORRUPT;
             }
-            *out_size = r->value_len;
+            *out_size = r.value_len;
             if (value_max == 0u) {
                 /* Probe-only call; no copy. */
-                must_unlock(idx_lock(idx));
+                record_clear_value(&r);
+                must_unlock(lk);
                 return STM_OK;
             }
-            if (value_max < r->value_len) {
-                must_unlock(idx_lock(idx));
+            if (value_max < r.value_len) {
+                record_clear_value(&r);
+                must_unlock(lk);
                 return STM_ERANGE;
             }
-            if (r->value_len > 0u && r->value) {
-                memcpy(value_buf, r->value, r->value_len);
+            if (r.value_len > 0u && r.value) {
+                memcpy(value_buf, r.value, r.value_len);
             }
-            must_unlock(idx_lock(idx));
+            record_clear_value(&r);
+            must_unlock(lk);
             return STM_OK;
         }
+        /* Different live name → free the heap value, continue. */
+        record_clear_value(&r);
     }
 
-    must_unlock(idx_lock(idx));
+    must_unlock(lk);
     return STM_ENODATA;
 }
 
@@ -706,35 +705,108 @@ stm_status stm_xattr_remove(stm_xattr_index *idx,
     if (name_len == 0u || name_len > STM_XATTR_NAME_MAX) return STM_EINVAL;
 
     must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
 
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
 
     for (uint32_t k = 0; k < STM_XATTR_PROBE_MAX; k++) {
         uint64_t probe = hash_base + (uint64_t)k;
-        stm_xattr_record *r =
-                find_record_at_probe(idx, dataset_id, ino, probe);
-        if (!r) {
+        stm_xattr_record r;
+        bool found = false;
+        stm_status gs = xa_engine_get(idx, dataset_id, ino, probe,
+                                      &r, &found);
+        if (gs != STM_OK) {
+            must_unlock(idx_lock(idx));
+            return gs;
+        }
+        if (!found) {
             must_unlock(idx_lock(idx));
             return STM_ENODATA;
         }
-        if (record_is_tombstone(r)) continue;
-        if (record_name_eq(r, name, name_len)) {
-            /* Replace with TOMBSTONE — preserves chain integrity for
-             * colliding names at higher probe indices. Free the
-             * value bytes; clear the name buffer; keep ds/ino/probe
-             * for the chain walk, set tombstone flag. */
-            record_clear_value(r);
-            r->name_len = 0;
-            r->flags    = STM_XATTR_FLAG_TOMBSTONE;
-            memset(r->name, 0, sizeof r->name);
-            idx->dirty = true;
+        if (record_is_tombstone(&r)) continue;     /* no heap to free */
+        if (record_name_eq(&r, name, name_len)) {
+            /* Free the live record's heap value before constructing
+             * the tombstone (tombstones have no value). */
+            record_clear_value(&r);
+            /* Replace with TOMBSTONE via engine_insert — preserves
+             * chain integrity for colliding names at higher probe
+             * indices. */
+            stm_xattr_record tomb;
+            memset(&tomb, 0, sizeof tomb);
+            tomb.dataset_id = dataset_id;
+            tomb.ino        = ino;
+            tomb.hash_probe = probe;
+            tomb.flags      = STM_XATTR_FLAG_TOMBSTONE;
+            /* name_len / name / value_len / value all zero. */
+            stm_status ps = xa_engine_put(idx, &tomb);
             must_unlock(idx_lock(idx));
-            return STM_OK;
+            return ps;
         }
+        /* Different live name → continue, free heap value. */
+        record_clear_value(&r);
     }
 
     must_unlock(idx_lock(idx));
     return STM_ENODATA;
+}
+
+/* listxattr: scan_range over [ds||ino||0 .. ds||ino||UINT64_MAX] and
+ * emit live records into out_entries. POSIX listxattr doesn't promise
+ * any order, so we emit in scan_range's bytewise-key order. *out_total
+ * is the count of live records under (ds, ino), regardless of how
+ * many were copied.
+ *
+ * Two-pass not strictly required (we know cap from caller), but we
+ * still need to count live records first to refuse with STM_ERANGE
+ * when max_entries < n_total. We collect into a heap buffer of
+ * caller_max entries during the scan, also incrementing n_total for
+ * every live match — early-stop the scan once n_total exceeds
+ * max_entries IF we don't need precise counts. We don't early-stop
+ * because the POSIX semantics expose the count via *out_total. */
+typedef struct {
+    uint64_t          ds;
+    uint64_t          ino;
+    stm_xattr_entry  *out;
+    size_t            out_cap;            /* caller's max_entries */
+    size_t            out_n;              /* number copied so far */
+    size_t            n_total;            /* total live records seen */
+    stm_status        err;
+} xa_list_ctx;
+
+static int xa_list_cb(const void *k, size_t klen,
+                      const void *v, size_t vlen, void *ctx_) {
+    xa_list_ctx *c = ctx_;
+    uint64_t ds = 0, ino = 0, probe = 0;
+    stm_status ks = xa_decode_key(k, klen, &ds, &ino, &probe);
+    if (ks != STM_OK) { c->err = ks; return 1; }
+
+    stm_xattr_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = xa_decode_value(v, vlen, &r);
+    if (vs != STM_OK) { c->err = vs; return 1; }
+    if (record_is_tombstone(&r)) {
+        /* Tombstones aren't live records; don't count. No heap. */
+        return 0;
+    }
+    /* Live record — count + maybe copy. Free the heap value we just
+     * allocated in xa_decode_value; we only need name + value_len for
+     * the listxattr entry shape. */
+    c->n_total++;
+    if (c->out && c->out_n < c->out_cap) {
+        c->out[c->out_n].hash_probe = probe;
+        c->out[c->out_n].name_len   = r.name_len;
+        memset(c->out[c->out_n].name, 0, sizeof c->out[c->out_n].name);
+        if (r.name_len > 0u) {
+            memcpy(c->out[c->out_n].name, r.name, r.name_len);
+        }
+        c->out[c->out_n].value_len = r.value_len;
+        c->out_n++;
+    }
+    record_clear_value(&r);
+    return 0;
 }
 
 stm_status stm_xattr_list(const stm_xattr_index *idx,
@@ -748,51 +820,80 @@ stm_status stm_xattr_list(const stm_xattr_index *idx,
     if (max_entries > 0u && !out_entries) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
-    must_lock(idx_lock(idx));
-
-    /* Pass 1: count live matches. */
-    size_t n_total = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_xattr_record *r = &idx->records[i];
-        if (r->dataset_id != dataset_id) continue;
-        if (r->ino        != ino)        continue;
-        if (record_is_tombstone(r))      continue;
-        n_total++;
+    pthread_mutex_t *lk = idx_lock(idx);
+    must_lock(lk);
+    if (!idx->eng) {
+        must_unlock(lk);
+        return STM_EINVAL;
     }
-    *out_total = n_total;
 
+    /* Cast away const for the engine_scan_range call. */
+    stm_xattr_index *m = (stm_xattr_index *)idx;
+
+    uint8_t lo[XA_KEY_LEN], hi[XA_KEY_LEN];
+    xa_encode_key(dataset_id, ino, 0u,         lo);
+    xa_encode_key(dataset_id, ino, UINT64_MAX, hi);
+
+    xa_list_ctx c = { .ds = dataset_id, .ino = ino,
+                       .out = out_entries, .out_cap = max_entries,
+                       .out_n = 0, .n_total = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan_range(m->eng, lo, XA_KEY_LEN,
+                                                hi, XA_KEY_LEN,
+                                                xa_list_cb, &c);
+    if (ss != STM_OK || c.err != STM_OK) {
+        must_unlock(lk);
+        return ss != STM_OK ? ss : c.err;
+    }
+    *out_total = c.n_total;
     if (max_entries == 0u) {
-        must_unlock(idx_lock(idx));
+        /* Probe-only: report the count, copied 0. */
+        must_unlock(lk);
         return STM_OK;
     }
-
-    if (max_entries < n_total) {
-        must_unlock(idx_lock(idx));
+    if (max_entries < c.n_total) {
+        /* Caller's buffer is too small for the full listing. POSIX
+         * listxattr returns ERANGE; out_total has the required size. */
+        must_unlock(lk);
         return STM_ERANGE;
     }
-
-    /* Pass 2: copy out. Order is records[]'s natural order — we don't
-     * sort by hash_probe here because POSIX listxattr doesn't promise
-     * any order, and tests can compute a stable order by pairing
-     * names. */
-    size_t j = 0;
-    for (size_t i = 0; i < idx->n_records && j < n_total; i++) {
-        const stm_xattr_record *r = &idx->records[i];
-        if (r->dataset_id != dataset_id) continue;
-        if (r->ino        != ino)        continue;
-        if (record_is_tombstone(r))      continue;
-        out_entries[j].hash_probe = r->hash_probe;
-        out_entries[j].name_len   = r->name_len;
-        memset(out_entries[j].name, 0, sizeof out_entries[j].name);
-        if (r->name_len > 0u) {
-            memcpy(out_entries[j].name, r->name, r->name_len);
-        }
-        out_entries[j].value_len = r->value_len;
-        j++;
-    }
-
-    must_unlock(idx_lock(idx));
+    must_unlock(lk);
     return STM_OK;
+}
+
+/* drop_for_ino: bulk-drop every record (live + tombstone) keyed at
+ * (ds, ino, *). Two-phase: scan_range collects every probe under the
+ * prefix into a heap buffer, then a second pass engine_deletes each
+ * key. The two-phase pattern avoids mutating the engine during
+ * scan_range traversal — safe-by-contract. */
+typedef struct {
+    uint64_t  *probes;
+    size_t     n;
+    size_t     cap;
+    stm_status err;
+} xa_drop_ctx;
+
+static int xa_drop_cb(const void *k, size_t klen,
+                      const void *v, size_t vlen, void *ctx_) {
+    (void)v;                                /* drop reads keys only */
+    (void)vlen;
+    xa_drop_ctx *c = ctx_;
+    uint64_t ds = 0, ino = 0, probe = 0;
+    stm_status ks = xa_decode_key(k, klen, &ds, &ino, &probe);
+    if (ks != STM_OK) { c->err = ks; return 1; }
+
+    if (c->n == c->cap) {
+        if (c->cap > (SIZE_MAX / sizeof *c->probes) / 2u) {
+            c->err = STM_ENOMEM;
+            return 1;
+        }
+        size_t new_cap = c->cap == 0 ? 16u : c->cap * 2u;
+        uint64_t *na = realloc(c->probes, new_cap * sizeof *na);
+        if (!na) { c->err = STM_ENOMEM; return 1; }
+        c->probes = na;
+        c->cap    = new_cap;
+    }
+    c->probes[c->n++] = probe;
+    return 0;
 }
 
 stm_status stm_xattr_drop_for_ino(stm_xattr_index *idx,
@@ -802,34 +903,37 @@ stm_status stm_xattr_drop_for_ino(stm_xattr_index *idx,
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
     must_lock(idx_lock(idx));
-
-    size_t kept = 0;
-    size_t dropped = 0;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        stm_xattr_record *r = &idx->records[i];
-        if (r->dataset_id == dataset_id && r->ino == ino) {
-            /* Free heap value before dropping. */
-            record_clear_value(r);
-            dropped++;
-            continue;
-        }
-        if (kept != i) {
-            idx->records[kept] = *r;
-            /* The struct copy transferred the (uint8_t *)value
-             * pointer from the source. The source slot is being
-             * abandoned (i > kept means src at i is one being
-             * compacted out, dst at kept is one being preserved).
-             * We must NOT double-free or leak. The source pointer
-             * is now solely owned by records[kept]; clear records[i]
-             * to avoid confusion at the next iteration if i happens
-             * to be re-read. */
-            r->value = NULL;
-            r->value_len = 0;
-        }
-        kept++;
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
     }
-    idx->n_records = kept;
-    if (dropped > 0u) idx->dirty = true;
+
+    uint8_t lo[XA_KEY_LEN], hi[XA_KEY_LEN];
+    xa_encode_key(dataset_id, ino, 0u,         lo);
+    xa_encode_key(dataset_id, ino, UINT64_MAX, hi);
+
+    xa_drop_ctx c = { .probes = NULL, .n = 0, .cap = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan_range(idx->eng, lo, XA_KEY_LEN,
+                                                hi, XA_KEY_LEN,
+                                                xa_drop_cb, &c);
+    if (ss != STM_OK || c.err != STM_OK) {
+        free(c.probes);
+        must_unlock(idx_lock(idx));
+        return ss != STM_OK ? ss : c.err;
+    }
+
+    /* Phase 2: engine_delete each collected probe. */
+    for (size_t i = 0; i < c.n; i++) {
+        stm_status ds = xa_engine_del(idx, dataset_id, ino, c.probes[i]);
+        if (ds != STM_OK) {
+            free(c.probes);
+            must_unlock(idx_lock(idx));
+            return ds;
+        }
+    }
+
+    size_t dropped = c.n;
+    free(c.probes);
     if (out_dropped) *out_dropped = dropped;
 
     must_unlock(idx_lock(idx));
@@ -837,7 +941,7 @@ stm_status stm_xattr_drop_for_ino(stm_xattr_index *idx,
 }
 
 /* ------------------------------------------------------------------ */
-/* Public API — persistence (mirrors stm_dirent_index).                 */
+/* Public API — persistence (9.6-impl-4c).                              */
 /* ------------------------------------------------------------------ */
 
 stm_status stm_xattr_index_set_storage(stm_xattr_index *idx,
@@ -849,8 +953,16 @@ stm_status stm_xattr_index_set_storage(stm_xattr_index *idx,
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
-    idx->bdev = bdev_0;
-    idx->boot = boot_0;
+    idx->store_ctx.bdev = bdev_0;
+    idx->store_ctx.boot = boot_0;
+    /* Second binder: stand the engine up. */
+    if (idx->crypt_set && !idx->eng) {
+        stm_status es = xa_engine_create_locked(idx);
+        if (es != STM_OK) {
+            must_unlock(idx_lock(idx));
+            return es;
+        }
+    }
     idx->storage_set = true;
     must_unlock(idx_lock(idx));
     return STM_OK;
@@ -866,12 +978,20 @@ stm_status stm_xattr_index_set_crypt_ctx(stm_xattr_index *idx,
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
-    idx->metadata_key   = metadata_key;
-    idx->pool_uuid[0]   = pool_uuid[0];
-    idx->pool_uuid[1]   = pool_uuid[1];
-    idx->device_uuid[0] = device_uuid_0[0];
-    idx->device_uuid[1] = device_uuid_0[1];
-    idx->crypt_set      = true;
+    idx->crypt_ctx.metadata_key   = metadata_key;
+    idx->crypt_ctx.pool_uuid[0]   = pool_uuid[0];
+    idx->crypt_ctx.pool_uuid[1]   = pool_uuid[1];
+    idx->crypt_ctx.device_uuid[0] = device_uuid_0[0];
+    idx->crypt_ctx.device_uuid[1] = device_uuid_0[1];
+    /* Second binder: stand the engine up. */
+    if (idx->storage_set && !idx->eng) {
+        stm_status es = xa_engine_create_locked(idx);
+        if (es != STM_OK) {
+            must_unlock(idx_lock(idx));
+            return es;
+        }
+    }
+    idx->crypt_set = true;
     must_unlock(idx_lock(idx));
     return STM_OK;
 }
@@ -898,39 +1018,6 @@ stm_status stm_xattr_index_get_gen(const stm_xattr_index *idx,
     return STM_OK;
 }
 
-/* Build a btree from records[] for serialization. */
-static stm_status xa_build_btree_locked(const stm_xattr_index *idx,
-                                              stm_btree_mt **out_tree) {
-    stm_btree_opts opts = stm_btree_opts_default();
-    if (opts.target_entries < 512u) opts.target_entries = 512u;
-
-    stm_btree_mt *t = NULL;
-    stm_status ts = stm_btree_mt_new(&opts, &t);
-    if (ts != STM_OK) return ts;
-
-    uint8_t key[XA_KEY_LEN];
-    /* Variable-length value: allocate the worst-case buffer once and
-     * reuse. XA_VAL_MAX (16 + 255 + 65536 = 65807 bytes) on the heap
-     * to avoid stack pressure. */
-    uint8_t *val = malloc(XA_VAL_MAX);
-    if (!val) {
-        stm_btree_mt_free(t);
-        return STM_ENOMEM;
-    }
-    size_t  vlen;
-    for (size_t i = 0; i < idx->n_records; i++) {
-        const stm_xattr_record *r = &idx->records[i];
-        xa_encode_key(r->dataset_id, r->ino, r->hash_probe, key);
-        xa_encode_value(r, val, &vlen);
-        stm_status is = stm_btree_mt_insert(t, key, XA_KEY_LEN, val, vlen);
-        if (is != STM_OK) { free(val); stm_btree_mt_free(t); return is; }
-    }
-
-    free(val);
-    *out_tree = t;
-    return STM_OK;
-}
-
 stm_status stm_xattr_index_commit(stm_xattr_index *idx,
                                      uint64_t committed_gen,
                                      uint64_t *out_root_paddr,
@@ -938,136 +1025,138 @@ stm_status stm_xattr_index_commit(stm_xattr_index *idx,
     if (!idx || !out_root_paddr || !out_root_csum) return STM_EINVAL;
     must_lock(idx_lock(idx));
 
-    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+    if (!idx->storage_set || !idx->crypt_set || !idx->eng) {
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
 
-    /* Clean + already-committed: idempotent return of the existing root. */
-    if (!idx->dirty && idx->root_paddr != 0) {
-        *out_root_paddr = idx->root_paddr;
-        memcpy(out_root_csum, idx->root_csum, 32);
+    /* Single-shot incremental-COW commit: flush + finalize, no
+     * pending window left open. 9.6-impl-4c: stm_sync_commit drives
+     * the three-phase form below; this monolithic form remains for
+     * non-sync callers and the persistence unit tests. */
+    uint64_t cp = 0;
+    uint8_t  cc[32];
+    stm_status cs = stm_btree_engine_commit(idx->eng, committed_gen, &cp, cc);
+    if (cs != STM_OK) {
+        /* Failed commit self-reverts; the caller wedges the fs
+         * (R154 doctrine carry). */
         must_unlock(idx_lock(idx));
-        return STM_OK;
+        return cs;
     }
 
-    stm_btree_mt *t = NULL;
-    stm_status bs = xa_build_btree_locked(idx, &t);
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    stm_status gs = stm_btree_engine_get_root(idx->eng, &rp, &rg, rc);
+    if (gs != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return gs;
+    }
+
+    stm_status bs = stm_bootstrap_commit(idx->store_ctx.boot, committed_gen);
     if (bs != STM_OK) {
         must_unlock(idx_lock(idx));
         return bs;
     }
 
-    xa_store_ctx        sc = xa_make_store_ctx(idx);
-    stm_btree_crypt_ctx cx = xa_make_crypt_ctx(idx);
+    idx->root_paddr = rp;
+    idx->root_gen   = rg;
+    memcpy(idx->root_csum, rc, 32);
 
-    uint64_t new_paddr = 0;
-    uint8_t  new_csum[32];
-    stm_status ss = stm_btree_store_serialize(t, committed_gen,
-                                                 /*tree_id=*/0u,
-                                                 &XA_STORE_VT, &sc, &cx,
-                                                 &new_paddr, new_csum);
-    stm_btree_mt_free(t);
-    if (ss != STM_OK) {
-        must_unlock(idx_lock(idx));
-        return ss;
-    }
-
-    #define XA_ROLLBACK_RESERVE() \
-        do { (void)stm_btree_store_free_tree(new_paddr, committed_gen,  \
-                                                committed_gen, new_csum, \
-                                                &XA_STORE_VT, &sc, &cx); \
-        } while (0)
-
-    if (idx->root_paddr != 0) {
-        stm_status fs = stm_btree_store_free_tree(idx->root_paddr,
-                                                     idx->root_gen,
-                                                     committed_gen,
-                                                     idx->root_csum,
-                                                     &XA_STORE_VT, &sc, &cx);
-        if (fs != STM_OK) {
-            XA_ROLLBACK_RESERVE();
-            must_unlock(idx_lock(idx));
-            return fs;
-        }
-    }
-
-    stm_status bsc = stm_bootstrap_commit(idx->boot, committed_gen);
-    if (bsc != STM_OK) {
-        XA_ROLLBACK_RESERVE();
-        must_unlock(idx_lock(idx));
-        return bsc;
-    }
-    #undef XA_ROLLBACK_RESERVE
-
-    idx->root_paddr = new_paddr;
-    idx->root_gen   = committed_gen;
-    memcpy(idx->root_csum, new_csum, 32);
-    idx->dirty      = false;
-
-    *out_root_paddr = new_paddr;
-    memcpy(out_root_csum, new_csum, 32);
+    *out_root_paddr = rp;
+    memcpy(out_root_csum, rc, 32);
     must_unlock(idx_lock(idx));
     return STM_OK;
 }
 
-/* load_at — atomic shadow swap. */
+/* ------------------------------------------------------------------ */
+/* Three-phase commit — flush / finalize / abort (9.6-impl-4c).         */
+/* ------------------------------------------------------------------ */
 
-typedef struct {
-    stm_xattr_record  *shadow;
-    size_t             shadow_len;
-    size_t             shadow_cap;
-    stm_status         err;
-} xa_load_ctx;
+stm_status stm_xattr_index_commit_flush(stm_xattr_index *idx,
+                                            uint64_t committed_gen,
+                                            uint64_t *out_root_paddr,
+                                            uint64_t *out_root_gen,
+                                            uint8_t out_root_csum[32]) {
+    if (!idx || !out_root_paddr || !out_root_gen || !out_root_csum)
+        return STM_EINVAL;
+    must_lock(idx_lock(idx));
 
-static stm_status xa_shadow_append(xa_load_ctx *lc,
-                                       const stm_xattr_record *r) {
-    if (lc->shadow_len == lc->shadow_cap) {
-        if (lc->shadow_cap > (SIZE_MAX / sizeof *lc->shadow) / 2u) return STM_ENOMEM;
-        size_t new_cap = lc->shadow_cap == 0 ? 8u : lc->shadow_cap * 2u;
-        stm_xattr_record *new_buf = realloc(lc->shadow,
-                                                 new_cap * sizeof *new_buf);
-        if (!new_buf) return STM_ENOMEM;
-        lc->shadow     = new_buf;
-        lc->shadow_cap = new_cap;
+    if (!idx->storage_set || !idx->crypt_set || !idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
     }
-    lc->shadow[lc->shadow_len++] = *r;
-    /* Caller's `r` continues to own the value pointer until we assume
-     * ownership here. The struct-copy transferred the pointer; caller
-     * MUST NOT free it. We document this contract in xa_load_iter. */
+
+    uint64_t cp = 0, cg = 0;
+    uint8_t  cc[32];
+    stm_status cs = stm_btree_engine_commit_flush(idx->eng, committed_gen,
+                                                  &cp, &cg, cc);
+    if (cs != STM_OK) {
+        /* Failed flush self-reverts; NO pending window. Caller must
+         * NOT _commit_abort. Caller wedges the fs (R154 doctrine
+         * carry). */
+        must_unlock(idx_lock(idx));
+        return cs;
+    }
+
+    *out_root_paddr = cp;
+    *out_root_gen   = cg;
+    memcpy(out_root_csum, cc, 32);
+    must_unlock(idx_lock(idx));
     return STM_OK;
 }
 
-static int xa_load_iter(const void *k, size_t klen,
-                            const void *v, size_t vlen, void *ctx_) {
-    xa_load_ctx *lc = ctx_;
-    uint64_t ds = 0, ino = 0, probe = 0;
-    stm_status ks = xa_decode_key(k, klen, &ds, &ino, &probe);
-    if (ks != STM_OK) { lc->err = ks; return 1; }
-    if (ds == 0u || ino == 0u) { lc->err = STM_ECORRUPT; return 1; }
-
-    stm_xattr_record r;
-    memset(&r, 0, sizeof r);
-    /* xa_decode_value heap-allocates r.value if value_len > 0. The
-     * shadow_append below transfers ownership to the shadow buffer.
-     * On error before append we must free r.value. */
-    stm_status vs = xa_decode_value(v, vlen, &r);
-    if (vs != STM_OK) { lc->err = vs; return 1; }
-
-    r.dataset_id = ds;
-    r.ino        = ino;
-    r.hash_probe = probe;
-
-    stm_status as = xa_shadow_append(lc, &r);
-    if (as != STM_OK) {
-        /* Append failed; free our heap value before returning so it
-         * doesn't leak. */
-        if (r.value) free(r.value);
-        lc->err = as;
-        return 1;
+stm_status stm_xattr_index_commit_finalize(stm_xattr_index *idx) {
+    if (!idx) return STM_EINVAL;
+    must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
     }
-    return 0;
+
+    stm_status fs = stm_btree_engine_commit_finalize(idx->eng);
+    if (fs != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return fs;
+    }
+
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    stm_status gs = stm_btree_engine_get_root(idx->eng, &rp, &rg, rc);
+    if (gs != STM_OK) {
+        must_unlock(idx_lock(idx));
+        return gs;
+    }
+    idx->root_paddr = rp;
+    idx->root_gen   = rg;
+    memcpy(idx->root_csum, rc, 32);
+
+    must_unlock(idx_lock(idx));
+    return STM_OK;
 }
+
+stm_status stm_xattr_index_commit_abort(stm_xattr_index *idx) {
+    if (!idx) return STM_EINVAL;
+    must_lock(idx_lock(idx));
+    if (!idx->eng) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
+
+    stm_status as = stm_btree_engine_commit_abort(idx->eng);
+    must_unlock(idx_lock(idx));
+    return as;
+}
+
+/* ------------------------------------------------------------------ */
+/* load_at — open the on-disk engine.                                  */
+/*                                                                      */
+/* Like dirent's load_at, xattr has no in-RAM state to reconstruct —    */
+/* the chain walkers go straight to the engine. Lazy validation: a     */
+/* corrupt record surfaces at first access via xa_decode_value         */
+/* (returning STM_ECORRUPT to the caller). The AEAD tag + Merkle chain */
+/* on the enclosing engine node still defend against offline tamper at */
+/* every node read.                                                     */
+/* ------------------------------------------------------------------ */
 
 stm_status stm_xattr_index_load_at(stm_xattr_index *idx,
                                       uint64_t root_paddr,
@@ -1076,68 +1165,29 @@ stm_status stm_xattr_index_load_at(stm_xattr_index *idx,
     if (!idx || !expected_csum) return STM_EINVAL;
     if (root_paddr == 0u) return STM_EINVAL;
     must_lock(idx_lock(idx));
-    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+    if (!idx->storage_set || !idx->crypt_set) {
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
 
-    stm_btree_opts opts = stm_btree_opts_default();
-    if (opts.target_entries < 512u) opts.target_entries = 512u;
-    stm_btree_mt *t = NULL;
-    stm_status ts = stm_btree_mt_new(&opts, &t);
-    if (ts != STM_OK) {
+    stm_btree_engine *opened = NULL;
+    stm_status os = stm_btree_engine_open(&STM_ENGINE_STORE_VT,
+                                          &idx->store_ctx, &idx->crypt_ctx,
+                                          /*tree_id=*/0u,
+                                          root_paddr, root_gen, expected_csum,
+                                          &opened);
+    if (os != STM_OK) {
         must_unlock(idx_lock(idx));
-        return ts;
+        return os;
     }
 
-    xa_store_ctx        sc = xa_make_store_ctx(idx);
-    stm_btree_crypt_ctx cx = xa_make_crypt_ctx(idx);
+    /* Atomic install: drop the prior engine, adopt the opened tree. */
+    stm_btree_engine_destroy(idx->eng);
+    idx->eng = opened;
 
-    stm_status ds = stm_btree_store_deserialize(t, root_paddr, root_gen,
-                                                   expected_csum,
-                                                   &XA_STORE_VT, &sc, &cx);
-    if (ds != STM_OK) {
-        stm_btree_mt_free(t);
-        must_unlock(idx_lock(idx));
-        return ds;
-    }
-
-    xa_load_ctx lc = { .err = STM_OK };
-    stm_status sr = stm_btree_mt_scan(t, NULL, 0, NULL, 0,
-                                         xa_load_iter, &lc);
-    stm_btree_mt_free(t);
-    if (sr != STM_OK) {
-        /* Free any heap values inside the partially-built shadow
-         * before discarding it. */
-        for (size_t i = 0; i < lc.shadow_len; i++) {
-            if (lc.shadow[i].value) free(lc.shadow[i].value);
-        }
-        free(lc.shadow);
-        must_unlock(idx_lock(idx));
-        return sr;
-    }
-    if (lc.err != STM_OK) {
-        for (size_t i = 0; i < lc.shadow_len; i++) {
-            if (lc.shadow[i].value) free(lc.shadow[i].value);
-        }
-        free(lc.shadow);
-        must_unlock(idx_lock(idx));
-        return lc.err;
-    }
-
-    /* Atomic shadow swap. Free old records' heap values + the records[]
-     * array, then swap in shadow. */
-    for (size_t i = 0; i < idx->n_records; i++) {
-        record_clear_value(&idx->records[i]);
-    }
-    free(idx->records);
-    idx->records     = lc.shadow;
-    idx->n_records   = lc.shadow_len;
-    idx->cap_records = lc.shadow_cap;
-    idx->root_paddr  = root_paddr;
-    idx->root_gen    = root_gen;
+    idx->root_paddr = root_paddr;
+    idx->root_gen   = root_gen;
     memcpy(idx->root_csum, expected_csum, 32);
-    idx->dirty       = false;
 
     must_unlock(idx_lock(idx));
     return STM_OK;

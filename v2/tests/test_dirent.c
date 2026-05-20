@@ -43,11 +43,80 @@ static const uint64_t DI_DEVICE_UUID[2] = { 0xCC01, 0xDD01 };
 static const uint8_t  DI_KEY[32]        = { 0x55, 0x66, 0x77 };
 
 /* ------------------------------------------------------------------ */
+/* Storage fixture for in-memory-op tests.                              */
+/*                                                                      */
+/* 9.6-impl-4c: the dirent module is btree_engine-backed, so every op   */
+/* (alloc / lookup / unlink / count / readdir / swap / whiteout / drop) */
+/* needs a bound bdev + bootstrap. `di_test_idx` builds them + a fully- */
+/* bound index; `di_test_idx_close` tears it all down. Mirrors the      */
+/* inode test fixture (test_inode.c::inode_test_idx). The harness runs  */
+/* tests sequentially in one process, so a single static fixture slot   */
+/* (g_fx_*) is safe.                                                    */
+/*                                                                      */
+/* Tests that intentionally exercise the unbound surface (rebind        */
+/* latches, persist commit_requires_storage_and_crypt, the persist      */
+/* roundtrip tests that manage their own bdev) keep the bare            */
+/* stm_dirent_index_create() form.                                     */
+/* ------------------------------------------------------------------ */
+
+static char di_tmp_path[256];
+
+static void di_make_tmp(const char *tag) {
+    snprintf(di_tmp_path, sizeof di_tmp_path,
+             "/tmp/stm_v2_dirent_persist_%s_%d.bin", tag, (int)getpid());
+    unlink(di_tmp_path);
+}
+
+static void di_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(di_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bdev_resize(*out_d, DI_DEVICE_BYTES));
+    STM_ASSERT_OK(stm_crypto_init());
+    STM_ASSERT_OK(stm_bootstrap_create(*out_d, DI_POOL_UUID, DI_DEVICE_UUID,
+                                         DI_BOOTSTRAP_BYTES, out_b));
+}
+
+static void di_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(di_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
+}
+
+/* Single static fixture slot — sequential tests share it. */
+static stm_bdev      *di_g_fx_bdev;
+static stm_bootstrap *di_g_fx_boot;
+
+/* Build a fresh storage-backed, fully-bound dirent index. The engine
+ * is stood up by the second binder (set_crypt_ctx here), so the
+ * returned index is ready for any op. */
+static stm_dirent_index *di_test_idx(void) {
+    di_make_tmp("fx");
+    di_open_fresh(&di_g_fx_bdev, &di_g_fx_boot);
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+    STM_ASSERT_OK(stm_dirent_index_set_storage(idx, di_g_fx_bdev, di_g_fx_boot));
+    STM_ASSERT_OK(stm_dirent_index_set_crypt_ctx(idx, DI_KEY,
+                                                  DI_POOL_UUID,
+                                                  DI_DEVICE_UUID));
+    return idx;
+}
+
+static void di_test_idx_close(stm_dirent_index *idx) {
+    stm_dirent_index_close(idx);    /* before bootstrap — the engine
+                                     * deferred-frees through it */
+    stm_bootstrap_close(di_g_fx_boot);
+    stm_bdev_close(di_g_fx_bdev);
+    di_g_fx_boot = NULL;
+    di_g_fx_bdev = NULL;
+    unlink(di_tmp_path);
+}
+
+/* ------------------------------------------------------------------ */
 /* In-memory ops — chain integrity + arg validation.                    */
 /* ------------------------------------------------------------------ */
 
 STM_TEST(dirent_lifecycle_create_close) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
     stm_dirent_index_close(idx);
     /* Closing NULL is safe. */
@@ -55,7 +124,7 @@ STM_TEST(dirent_lifecycle_create_close) {
 }
 
 STM_TEST(dirent_alloc_lookup_basic) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
 
     const uint8_t name[] = "foo";
     STM_ASSERT_OK(stm_dirent_alloc(idx, /*ds=*/1, /*dir=*/2,
@@ -78,20 +147,20 @@ STM_TEST(dirent_alloc_lookup_basic) {
                    STM_ENOENT);
     STM_ASSERT_EQ(child_ino, (uint64_t)0);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_alloc_refuses_duplicate) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     const uint8_t name[] = "x";
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, name, 1, 100, 0, STM_DT_REG));
     STM_ASSERT_ERR(stm_dirent_alloc(idx, 1, 2, name, 1, 200, 0, STM_DT_REG),
                    STM_EEXIST);
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_unlink_basic) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     const uint8_t name[] = "to-unlink";
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, name, (uint8_t)(sizeof name - 1u),
                                        100, 0, STM_DT_REG));
@@ -104,11 +173,11 @@ STM_TEST(dirent_unlink_basic) {
     /* Unlink of an absent name returns ENOENT. */
     STM_ASSERT_ERR(stm_dirent_unlink(idx, 1, 2, name, (uint8_t)(sizeof name - 1u)),
                    STM_ENOENT);
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_per_dir_isolation) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     const uint8_t name[] = "shared-name";
     /* Same name in different (ds, dir) pairs is not a conflict. */
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, name, (uint8_t)(sizeof name - 1u),
@@ -128,11 +197,11 @@ STM_TEST(dirent_per_dir_isolation) {
     STM_ASSERT_OK(stm_dirent_lookup(idx, 2, 2, name, (uint8_t)(sizeof name - 1u),
                                        &child_ino, NULL, NULL));
     STM_ASSERT_EQ(child_ino, (uint64_t)300);
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_count_for_dir) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     const uint8_t a[] = "a";
     const uint8_t b[] = "b";
     const uint8_t c[] = "c";
@@ -153,7 +222,7 @@ STM_TEST(dirent_count_for_dir) {
     STM_ASSERT_OK(stm_dirent_count_for_dir(idx, 1, 3, &n));
     STM_ASSERT_EQ(n, (size_t)0);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 /* dirent.tla::BuggyUnlinkUsesEmpty — the canonical chain-integrity
@@ -171,7 +240,7 @@ STM_TEST(dirent_count_for_dir) {
  * the live half still resolves. The test passes regardless of
  * collision pattern because TOMBSTONE preservation is symmetric. */
 STM_TEST(dirent_unlink_preserves_chain_integrity) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
 
     /* Alloc 32 distinct names with a shared prefix (fnv1a will
      * spread their hashes; but the test doesn't need a forced
@@ -215,13 +284,13 @@ STM_TEST(dirent_unlink_preserves_chain_integrity) {
                        STM_ENOENT);
     }
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 /* Re-create a previously-unlinked name. The TOMBSTONE slot must be
  * reusable for the new alloc — chain stays compact. */
 STM_TEST(dirent_realloc_after_unlink) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     const uint8_t name[] = "rotated";
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, name, (uint8_t)(sizeof name - 1u),
                                        100, 0, STM_DT_REG));
@@ -234,13 +303,13 @@ STM_TEST(dirent_realloc_after_unlink) {
                                         &child_ino, NULL, &child_type));
     STM_ASSERT_EQ(child_ino, (uint64_t)200);
     STM_ASSERT_EQ(child_type, (uint8_t)STM_DT_DIR);
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 /* R71 P1-1 lesson — symmetric writer-side guards. Each documented
  * refusal in dirent.h is exercised explicitly. */
 STM_TEST(dirent_arg_validation) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     const uint8_t name[] = "x";
 
     /* alloc */
@@ -293,41 +362,19 @@ STM_TEST(dirent_arg_validation) {
     STM_ASSERT_ERR(stm_dirent_count_for_dir(idx, 0, 2, &n),   STM_EINVAL);
     STM_ASSERT_ERR(stm_dirent_count_for_dir(idx, 1, 0, &n),   STM_EINVAL);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
 /* Persistence — alloc / commit / close / open / load_at / lookup.     */
 /* ------------------------------------------------------------------ */
 
-static char di_tmp_path[256];
-
-static void di_make_tmp(const char *tag) {
-    snprintf(di_tmp_path, sizeof di_tmp_path,
-             "/tmp/stm_v2_dirent_persist_%s_%d.bin", tag, (int)getpid());
-    unlink(di_tmp_path);
-}
-
-static void di_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
-    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
-    STM_ASSERT_OK(stm_bdev_open(di_tmp_path, &bo, out_d));
-    STM_ASSERT_OK(stm_bdev_resize(*out_d, DI_DEVICE_BYTES));
-    STM_ASSERT_OK(stm_crypto_init());
-    STM_ASSERT_OK(stm_bootstrap_create(*out_d, DI_POOL_UUID, DI_DEVICE_UUID,
-                                         DI_BOOTSTRAP_BYTES, out_b));
-}
-
-static void di_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
-    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
-    STM_ASSERT_OK(stm_bdev_open(di_tmp_path, &bo, out_d));
-    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
-}
-
 STM_TEST(dirent_persist_commit_load_roundtrip) {
     di_make_tmp("rt");
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;
     di_open_fresh(&d, &b);
 
+    /* Bare create — this test manages its own bdev/bootstrap. */
     stm_dirent_index *idx = stm_dirent_index_create();
     STM_ASSERT_TRUE(idx != NULL);
     STM_ASSERT_OK(stm_dirent_index_set_storage(idx, d, b));
@@ -357,6 +404,8 @@ STM_TEST(dirent_persist_commit_load_roundtrip) {
 
     /* Reopen and load. */
     di_reopen(&d, &b);
+    /* Bare create: the persist roundtrip test manages its own bdev +
+     * bootstrap; do NOT bind via di_test_idx (would conflict). */
     stm_dirent_index *idx2 = stm_dirent_index_create();
     STM_ASSERT_OK(stm_dirent_index_set_storage(idx2, d, b));
     STM_ASSERT_OK(stm_dirent_index_set_crypt_ctx(idx2, DI_KEY,
@@ -390,6 +439,8 @@ STM_TEST(dirent_persist_commit_load_roundtrip) {
 }
 
 STM_TEST(dirent_persist_commit_requires_storage_and_crypt) {
+    /* Bare create — the test asserts commit() refuses without bound
+     * storage/crypt; the fixture would have already bound them. */
     stm_dirent_index *idx = stm_dirent_index_create();
     uint64_t paddr = 0; uint8_t cs[32];
     STM_ASSERT_ERR(stm_dirent_index_commit(idx, 1u, &paddr, cs), STM_EINVAL);
@@ -401,6 +452,7 @@ STM_TEST(dirent_persist_idempotent_commit_when_clean) {
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;
     di_open_fresh(&d, &b);
 
+    /* Bare create — this test manages its own bdev/bootstrap. */
     stm_dirent_index *idx = stm_dirent_index_create();
     STM_ASSERT_OK(stm_dirent_index_set_storage(idx, d, b));
     STM_ASSERT_OK(stm_dirent_index_set_crypt_ctx(idx, DI_KEY,
@@ -412,7 +464,12 @@ STM_TEST(dirent_persist_idempotent_commit_when_clean) {
 
     uint64_t p1 = 0, p2 = 0; uint8_t c1[32], c2[32];
     STM_ASSERT_OK(stm_dirent_index_commit(idx, 1u, &p1, c1));
-    STM_ASSERT_OK(stm_dirent_index_commit(idx, 1u, &p2, c2));
+    /* Nothing changed since the gen-1 commit; the gen-2 commit is a
+     * clean no-op returning the same root paddr + csum. (9.6-impl-4c:
+     * the engine refuses non-monotonic gen, so the test bumps gen by
+     * one between the two commits. Mirrors inode's
+     * inode_persist_idempotent_commit_when_clean.) */
+    STM_ASSERT_OK(stm_dirent_index_commit(idx, 2u, &p2, c2));
     STM_ASSERT_EQ(p1, p2);
     STM_ASSERT_MEM_EQ(c1, c2, 32);
 
@@ -427,6 +484,9 @@ STM_TEST(dirent_set_storage_refuses_rebind) {
     di_make_tmp("rebind_st");
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;
     di_open_fresh(&d, &b);
+    /* Bare create — the test asserts the FIRST set_storage succeeds
+     * and the SECOND refuses; the fixture pre-binds, so a re-bind
+     * test must start from unbound. */
     stm_dirent_index *idx = stm_dirent_index_create();
     STM_ASSERT_OK(stm_dirent_index_set_storage(idx, d, b));
     STM_ASSERT_ERR(stm_dirent_index_set_storage(idx, d, b), STM_EINVAL);
@@ -437,6 +497,7 @@ STM_TEST(dirent_set_storage_refuses_rebind) {
 }
 
 STM_TEST(dirent_set_crypt_ctx_refuses_rebind) {
+    /* Bare create — same rationale as set_storage_refuses_rebind. */
     stm_dirent_index *idx = stm_dirent_index_create();
     STM_ASSERT_OK(stm_dirent_index_set_crypt_ctx(idx, DI_KEY,
                                                     DI_POOL_UUID,
@@ -459,7 +520,7 @@ STM_TEST(dirent_ub_version_is_v28) {
 /* R73 P2-1: stm_dirent_drop_for_dir bulk-removes every record keyed
  * under (ds, dir_ino, *), including tombstones from prior unlinks. */
 STM_TEST(dirent_r73_p2_1_drop_for_dir_clears_records_and_tombstones) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
 
     /* Three live + one tombstone in dir=2, plus one live in dir=3
      * (must survive — drop_for_dir is scoped). */
@@ -503,18 +564,18 @@ STM_TEST(dirent_r73_p2_1_drop_for_dir_clears_records_and_tombstones) {
                                         &ci, NULL, NULL));
     STM_ASSERT_EQ(ci, (uint64_t)300);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_r73_p2_1_drop_for_dir_arg_validation) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     size_t n = 0;
     STM_ASSERT_ERR(stm_dirent_drop_for_dir(NULL, 1, 2, &n), STM_EINVAL);
     STM_ASSERT_ERR(stm_dirent_drop_for_dir(idx, 0, 2, &n),  STM_EINVAL);
     STM_ASSERT_ERR(stm_dirent_drop_for_dir(idx, 1, 0, &n),  STM_EINVAL);
     /* out_dropped optional — STM_OK with NULL. */
     STM_ASSERT_OK(stm_dirent_drop_for_dir(idx, 1, 2, NULL));
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -522,7 +583,7 @@ STM_TEST(dirent_r73_p2_1_drop_for_dir_arg_validation) {
 /* ------------------------------------------------------------------ */
 
 STM_TEST(dirent_readdir_empty_dir) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     /* Empty directory: readdir returns 0 entries, cursor unchanged. */
     uint64_t cursor = 0;
     stm_dirent_entry batch[16];
@@ -530,11 +591,11 @@ STM_TEST(dirent_readdir_empty_dir) {
     STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
     STM_ASSERT_EQ(n, (size_t)0);
     STM_ASSERT_EQ(cursor, (uint64_t)0);
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_readdir_single_entry) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"foo", 3,
                                        100, 7, STM_DT_REG));
 
@@ -556,11 +617,11 @@ STM_TEST(dirent_readdir_single_entry) {
     STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
     STM_ASSERT_EQ(n, (size_t)0);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_readdir_multiple_entries_hash_order) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     /* Insert 5 entries; readdir returns them in hash_probe-ascending
      * order regardless of insertion order. */
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"alpha", 5,
@@ -599,7 +660,7 @@ STM_TEST(dirent_readdir_multiple_entries_hash_order) {
     STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
     STM_ASSERT_EQ(n, (size_t)0);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_readdir_skips_tombstones) {
@@ -608,7 +669,7 @@ STM_TEST(dirent_readdir_skips_tombstones) {
      * and "n_b" hash differently here (not the spec's collision pair),
      * but the principle is the same — unlink one, readdir returns the
      * other but never the tombstone. */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"keep1", 5,
                                        100, 0, STM_DT_REG));
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"drop", 4,
@@ -636,14 +697,14 @@ STM_TEST(dirent_readdir_skips_tombstones) {
     }
     STM_ASSERT_TRUE(saw_100 && saw_102);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_readdir_pagination_max_entries_one) {
     /* Models dirent.tla::ReaddirNoDuplicateProbeInLog — strict cursor
      * advance prevents same-probe re-emit. With max_entries=1, a full
      * iteration emits each record exactly once. */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"e1", 2,
                                        1, 0, STM_DT_REG));
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"e2", 2,
@@ -674,11 +735,11 @@ STM_TEST(dirent_readdir_pagination_max_entries_one) {
     }
     STM_ASSERT_TRUE(s1 && s2 && s3);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_readdir_per_dir_isolation) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     /* Same name in three different (ds, dir) pairs. readdir on each
      * sees only its own. */
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"name", 4,
@@ -710,7 +771,7 @@ STM_TEST(dirent_readdir_per_dir_isolation) {
     STM_ASSERT_EQ(n, (size_t)1);
     STM_ASSERT_EQ(batch[0].child_ino, (uint64_t)300);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_readdir_resume_after_create_past_cursor) {
@@ -725,7 +786,7 @@ STM_TEST(dirent_readdir_resume_after_create_past_cursor) {
      * is consistent (no probe-duplicates, no original entry returned
      * twice).
      */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"alpha", 5,
                                        1, 0, STM_DT_REG));
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"beta", 4,
@@ -770,11 +831,11 @@ STM_TEST(dirent_readdir_resume_after_create_past_cursor) {
     /* Cursor monotonically advanced. */
     STM_ASSERT_TRUE(cursor >= cursor_after_first);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_readdir_arg_validation) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     uint64_t cursor = 0;
     stm_dirent_entry batch[4];
     size_t n = 0;
@@ -801,7 +862,7 @@ STM_TEST(dirent_readdir_arg_validation) {
     STM_ASSERT_ERR(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 0, &n),
                    STM_EINVAL);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 /* R75 P2-1: cursor saturation sentinel. When the caller passes
@@ -811,7 +872,7 @@ STM_TEST(dirent_readdir_arg_validation) {
  * would re-emit forever because the strict-less-than filter
  * `r->hash_probe < UINT64_MAX` is false at probe=UINT64_MAX. */
 STM_TEST(dirent_readdir_r75_p2_1_cursor_saturation_terminates) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     /* Even with a live record present, cursor=UINT64_MAX returns 0. */
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"foo", 3,
                                        100, 0, STM_DT_REG));
@@ -827,7 +888,7 @@ STM_TEST(dirent_readdir_r75_p2_1_cursor_saturation_terminates) {
     STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 999, &cursor, batch, 16, &n));
     STM_ASSERT_EQ(n, (size_t)0);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 /* R75 P3-1: out-param zero-init contract. *out_returned must be
@@ -835,7 +896,7 @@ STM_TEST(dirent_readdir_r75_p2_1_cursor_saturation_terminates) {
  * STM_EINVAL see a defined value (0) regardless of which validation
  * step rejected. */
 STM_TEST(dirent_readdir_r75_p3_1_out_param_zero_init_on_einval) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     uint64_t cursor = 0;
     stm_dirent_entry batch[4];
 
@@ -857,13 +918,13 @@ STM_TEST(dirent_readdir_r75_p3_1_out_param_zero_init_on_einval) {
                    STM_EINVAL);
     STM_ASSERT_EQ(n, (size_t)0);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_readdir_after_drop_for_dir) {
     /* drop_for_dir wipes records[]; subsequent readdir on the dir
      * returns 0 entries. */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"a", 1, 1, 0, STM_DT_REG));
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"b", 1, 2, 0, STM_DT_REG));
     STM_ASSERT_OK(stm_dirent_unlink(idx, 1, 2, (const uint8_t *)"a", 1));
@@ -881,7 +942,7 @@ STM_TEST(dirent_readdir_after_drop_for_dir) {
     STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
     STM_ASSERT_EQ(n, (size_t)0);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 /* ========================================================================= */
@@ -889,7 +950,7 @@ STM_TEST(dirent_readdir_after_drop_for_dir) {
 /* ========================================================================= */
 
 STM_TEST(dirent_swap_two_same_dir) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     /* Two distinct dirents in the same directory. */
@@ -918,11 +979,11 @@ STM_TEST(dirent_swap_two_same_dir) {
     STM_ASSERT_EQ(gen, 1u);
     STM_ASSERT_EQ(typ, (uint8_t)STM_DT_REG);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_swap_two_cross_dir) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
@@ -946,12 +1007,12 @@ STM_TEST(dirent_swap_two_cross_dir) {
     STM_ASSERT_EQ(ino, 10u);
     STM_ASSERT_EQ(gen, 1u);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_swap_two_is_self_inverse) {
     /* Swap is its own inverse: swap(a,b) twice restores identity. */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
@@ -980,11 +1041,11 @@ STM_TEST(dirent_swap_two_is_self_inverse) {
     STM_ASSERT_EQ(gen, 2u);
     STM_ASSERT_EQ(typ, (uint8_t)STM_DT_DIR);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_swap_two_self_swap_refused) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
@@ -997,11 +1058,11 @@ STM_TEST(dirent_swap_two_self_swap_refused) {
                                              100, (const uint8_t *)"a", 1),
                    STM_EINVAL);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_swap_two_missing_either_returns_enoent) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
@@ -1019,11 +1080,11 @@ STM_TEST(dirent_swap_two_missing_either_returns_enoent) {
                                              100, (const uint8_t *)"missing", 7),
                    STM_ENOENT);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_swap_two_arg_validation) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
                                         (const uint8_t *)"a", 1,
@@ -1060,7 +1121,7 @@ STM_TEST(dirent_swap_two_arg_validation) {
                                              100, (const uint8_t *)"b", 1),
                    STM_EINVAL);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 /* ========================================================================= */
@@ -1070,7 +1131,7 @@ STM_TEST(dirent_swap_two_arg_validation) {
 STM_TEST(dirent_whiteout_basic_lookup_returns_enoent) {
     /* Create a name, whiteout it, lookup returns ENOENT (the
      * whiteout hides the name from lookup view). */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
@@ -1092,14 +1153,14 @@ STM_TEST(dirent_whiteout_basic_lookup_returns_enoent) {
                    STM_ENOENT);
     STM_ASSERT_EQ(ino, (uint64_t)0);  /* zero-init contract */
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_whiteout_emitted_in_readdir) {
     /* Whiteout slots ARE emitted in readdir output (with
      * child_ino=0 + child_type=STM_DT_WHITEOUT). The name is
      * preserved so overlayfs userspace can interpret it. */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     /* Live entry "a" + a soon-to-be-whiteout "b" + live "c". */
@@ -1137,7 +1198,7 @@ STM_TEST(dirent_whiteout_emitted_in_readdir) {
     }
     STM_ASSERT_TRUE(saw_a && saw_b_whiteout && saw_c);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_whiteout_then_create_overwrites_slot) {
@@ -1145,7 +1206,7 @@ STM_TEST(dirent_whiteout_then_create_overwrites_slot) {
      * the new record overwrites the whiteout slot (chain
      * integrity preserved). Subsequent lookup returns the NEW
      * ino (not the whiteout). */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
@@ -1165,7 +1226,7 @@ STM_TEST(dirent_whiteout_then_create_overwrites_slot) {
     STM_ASSERT_EQ(gen, (uint64_t)1);
     STM_ASSERT_EQ((int)type, (int)STM_DT_DIR);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_whiteout_preserves_chain_integrity_for_collision) {
@@ -1173,7 +1234,7 @@ STM_TEST(dirent_whiteout_preserves_chain_integrity_for_collision) {
      * remain reachable through whiteouts in the chain. Same shape
      * as the tombstone chain-integrity test but with a whiteout
      * instead of a tombstone in the middle of the chain. */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     /* Alloc 4 names; the second gets whiteouted; the third + fourth
@@ -1209,13 +1270,13 @@ STM_TEST(dirent_whiteout_preserves_chain_integrity_for_collision) {
                                           &ino, NULL, NULL));
     STM_ASSERT_EQ(ino, (uint64_t)103);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_whiteout_unlink_returns_enoent) {
     /* unlink on a whiteout-named slot returns ENOENT (no live
      * record to remove). */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
@@ -1224,13 +1285,13 @@ STM_TEST(dirent_whiteout_unlink_returns_enoent) {
     STM_ASSERT_ERR(stm_dirent_unlink(idx, 1, 100, (const uint8_t *)"a", 1),
                    STM_ENOENT);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_whiteout_count_excludes_whiteouts) {
     /* count_for_dir counts only LIVE records — whiteouts and
      * tombstones don't contribute. */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
@@ -1254,13 +1315,13 @@ STM_TEST(dirent_whiteout_count_excludes_whiteouts) {
     STM_ASSERT_OK(stm_dirent_count_for_dir(idx, 1, 100, &n));
     STM_ASSERT_EQ(n, (size_t)1);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_whiteout_on_missing_returns_enoent) {
     /* whiteout on a name that doesn't exist (or is already a
      * whiteout / tombstone) returns ENOENT. */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     /* No record at "z" — whiteout returns ENOENT. */
@@ -1280,11 +1341,11 @@ STM_TEST(dirent_whiteout_on_missing_returns_enoent) {
     STM_ASSERT_ERR(stm_dirent_unlink(idx, 1, 100, (const uint8_t *)"a", 1),
                    STM_ENOENT);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_whiteout_arg_validation) {
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     /* NULL idx. */
@@ -1303,7 +1364,7 @@ STM_TEST(dirent_whiteout_arg_validation) {
     STM_ASSERT_ERR(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"a", 0),
                    STM_EINVAL);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_whiteout_preserved_under_hash_collision) {
@@ -1326,7 +1387,7 @@ STM_TEST(dirent_whiteout_preserved_under_hash_collision) {
      *
      * Verification via readdir output: post-alloc, both "baz"
      * (live REG) and "foo" (WHITEOUT) MUST be present. */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     uint64_t baz_hash =
@@ -1387,7 +1448,7 @@ STM_TEST(dirent_whiteout_preserved_under_hash_collision) {
     }
     STM_ASSERT_TRUE(found_baz_record);
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST(dirent_whiteout_same_name_create_overwrites_under_collision) {
@@ -1400,7 +1461,7 @@ STM_TEST(dirent_whiteout_same_name_create_overwrites_under_collision) {
      * Test: install whiteout for "foo" at foo's starting probe;
      * alloc("foo") MUST overwrite the slot, not install at a new
      * probe. */
-    stm_dirent_index *idx = stm_dirent_index_create();
+    stm_dirent_index *idx = di_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
 
     uint64_t foo_hash =
@@ -1431,7 +1492,7 @@ STM_TEST(dirent_whiteout_same_name_create_overwrites_under_collision) {
     STM_ASSERT_EQ((int)batch[0].child_type, (int)STM_DT_REG);
     STM_ASSERT_EQ(batch[0].hash_probe, foo_hash);  /* same slot */
 
-    stm_dirent_index_close(idx);
+    di_test_idx_close(idx);
 }
 
 STM_TEST_MAIN("test_dirent")

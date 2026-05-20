@@ -2739,40 +2739,40 @@ stm_status stm_sync_commit(stm_sync *s)
         return ics;
     }
 
-    /* P8-POSIX-2 (v25): commit the dirent index. Same shape as
-     * inode_idx. */
+    /* P8-POSIX-2 (v25) / 9.6-impl-4c: FLUSH the dirent index. The
+     * dirent module is btree_engine-backed (incremental-COW B+tree);
+     * commit_flush writes the dirty root-to-leaf paths to fresh
+     * paddrs at target_gen and returns the PROSPECTIVE (paddr, gen,
+     * csum) — durable only after commit_finalize in Phase 3. Same
+     * shape as the inode flush above. From here every error `return`
+     * MUST abort BOTH inode AND dirent (the dirent flush opened its
+     * OWN pending window now). */
     uint64_t dirent_paddr = 0;
     uint8_t  dirent_csum[32] = {0};
     uint64_t dirent_gen = 0;
-    stm_status dcs = stm_dirent_index_commit(s->dirent_idx, target_gen,
-                                                &dirent_paddr, dirent_csum);
+    stm_status dcs = stm_dirent_index_commit_flush(s->dirent_idx, target_gen,
+                                                    &dirent_paddr, &dirent_gen,
+                                                    dirent_csum);
     if (dcs != STM_OK) {
-        (void)stm_inode_index_commit_abort(s->inode_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return dcs;
-    }
-    dcs = stm_dirent_index_get_gen(s->dirent_idx, &dirent_gen);
-    if (dcs != STM_OK) {
+        /* dirent flush self-reverts; only inode has a pending window. */
         (void)stm_inode_index_commit_abort(s->inode_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return dcs;
     }
 
-    /* P8-POSIX-6 (v26): commit the xattr index. Same shape as
-     * dirent_idx. */
+    /* P8-POSIX-6 (v26) / 9.6-impl-4c: FLUSH the xattr index. Same
+     * shape as dirent. */
     uint64_t xattr_paddr = 0;
     uint8_t  xattr_csum[32] = {0};
     uint64_t xattr_gen = 0;
-    stm_status xcs = stm_xattr_index_commit(s->xattr_idx, target_gen,
-                                              &xattr_paddr, xattr_csum);
+    stm_status xcs = stm_xattr_index_commit_flush(s->xattr_idx, target_gen,
+                                                   &xattr_paddr, &xattr_gen,
+                                                   xattr_csum);
     if (xcs != STM_OK) {
+        /* xattr flush self-reverts; inode + dirent have pending
+         * windows that must be aborted. */
         (void)stm_inode_index_commit_abort(s->inode_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return xcs;
-    }
-    xcs = stm_xattr_index_get_gen(s->xattr_idx, &xattr_gen);
-    if (xcs != STM_OK) {
-        (void)stm_inode_index_commit_abort(s->inode_idx);
+        (void)stm_dirent_index_commit_abort(s->dirent_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return xcs;
     }
@@ -2781,6 +2781,8 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
         (void)stm_inode_index_commit_abort(s->inode_idx);
+        (void)stm_dirent_index_commit_abort(s->dirent_idx);
+        (void)stm_xattr_index_commit_abort(s->xattr_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return sr;
     }
@@ -2810,43 +2812,53 @@ stm_status stm_sync_commit(stm_sync *s)
                                           new_merkle_root);
     if (ms != STM_OK) {
         (void)stm_inode_index_commit_abort(s->inode_idx);
+        (void)stm_dirent_index_commit_abort(s->dirent_idx);
+        (void)stm_xattr_index_commit_abort(s->xattr_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return ms;
     }
 
-    /* 9.6-impl-4b-iii: the explicit durable-bitmap barrier. The inode
-     * engine's commit_flush above did vt->reserve (set node bits in the
-     * bootstrap bitmap IN RAM) + vt->write (node bytes straight to the
-     * device); stm_bootstrap_commit is what makes those bitmap bits
-     * DURABLE — it COWs the bitmap to its other slot + fsyncs. It MUST
-     * run strictly BEFORE the final uberblock write (9.6-impl-4b design
-     * §5.2 case A): a crash with the bitmap durable but the UB stale
-     * leaks the freshly-flushed nodes (bounded, non-corrupting); the
-     * reverse order — UB durable, bitmap stale — would let a later
-     * reserve re-hand a still-rooted paddr and corrupt the tree.
+    /* 9.6-impl-4b-iii: the explicit durable-bitmap barrier. Every
+     * engine-backed index's commit_flush above did vt->reserve (set
+     * node bits in the bootstrap bitmap IN RAM) + vt->write (node
+     * bytes straight to the device); stm_bootstrap_commit is what
+     * makes those bitmap bits DURABLE — it COWs the bitmap to its
+     * other slot + fsyncs. It MUST run strictly BEFORE the final
+     * uberblock write (9.6-impl-4b design §5.2 case A): a crash with
+     * the bitmap durable but the UB stale leaks the freshly-flushed
+     * nodes (bounded, non-corrupting); the reverse order — UB
+     * durable, bitmap stale — would let a later reserve re-hand a
+     * still-rooted paddr and corrupt the tree.
      *
      * `boot` is device 0's shared bootstrap — the same handle every
-     * metadata index borrows (see the dataset/snapshot comment above).
-     * At 4b-iii the btree_store trees (dirent / xattr / extent /
-     * dataset / snapshot / cas) ALSO call stm_bootstrap_commit
-     * internally at this same target_gen, so this explicit call is
-     * redundant-but-cheap (it advances bitmap_gen + fsyncs an unchanged
-     * bitmap — idempotent at the same gen). It is the call that STAYS:
-     * 4c/4d cut those trees over to the engine and retire their
-     * internal calls; this becomes the sole durable-bitmap barrier.
+     * metadata index borrows.
      *
-     * On failure the inode flush is aborted (crash-equivalent) and the
-     * commit returns — the fs wedges + remounts off the previous
-     * (still-consistent) uberblock. */
+     * At 4c the inode / dirent / xattr trees are all engine-backed
+     * and rely on this single barrier. The btree_store-backed trees
+     * (extent / dataset / snapshot / cas) ALSO call
+     * stm_bootstrap_commit internally at this same target_gen, so
+     * this explicit call is redundant-but-cheap for them (it advances
+     * bitmap_gen + fsyncs an unchanged bitmap — idempotent at the
+     * same gen). 4d cuts extent over to the engine and retires the
+     * extent module's internal call; this becomes the sole
+     * durable-bitmap barrier for the remaining engine-backed trees.
+     *
+     * On failure all three pending flushes are aborted
+     * (crash-equivalent) and the commit returns — the fs wedges +
+     * remounts off the previous (still-consistent) uberblock. */
     stm_bootstrap *boot = stm_alloc_bootstrap(s->alloc);
     if (!boot) {
         (void)stm_inode_index_commit_abort(s->inode_idx);
+        (void)stm_dirent_index_commit_abort(s->dirent_idx);
+        (void)stm_xattr_index_commit_abort(s->xattr_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
     stm_status bcs = stm_bootstrap_commit(boot, target_gen);
     if (bcs != STM_OK) {
         (void)stm_inode_index_commit_abort(s->inode_idx);
+        (void)stm_dirent_index_commit_abort(s->dirent_idx);
+        (void)stm_xattr_index_commit_abort(s->xattr_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return bcs;
     }
@@ -2882,30 +2894,51 @@ stm_status stm_sync_commit(stm_sync *s)
                                                 fin_label, fin_slot);
     if (fw != STM_OK) {
         (void)stm_inode_index_commit_abort(s->inode_idx);
+        (void)stm_dirent_index_commit_abort(s->dirent_idx);
+        (void)stm_xattr_index_commit_abort(s->xattr_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return fw;
     }
 
-    /* 9.6-impl-4b-iii: the final uberblock landed — THIS is the commit
-     * point. Adopt the inode engine's flushed root as its durable root
-     * and deferred-free the superseded paddrs (commit_finalize). After a
-     * successful commit_flush, finalize is INFALLIBLE per the engine
-     * header contract — the lone failure exit is STM_EINVAL for
-     * no-pending-flush, unreachable here; the check is defense-in-depth.
+    /* 9.6-impl-4b-iii / 9.6-impl-4c: the final uberblock landed —
+     * THIS is the commit point. Adopt each engine's flushed root as
+     * its durable root and deferred-free the superseded paddrs
+     * (commit_finalize). After a successful commit_flush, finalize is
+     * INFALLIBLE per the engine header contract — the lone failure
+     * exit is STM_EINVAL for no-pending-flush, unreachable here; the
+     * check is defense-in-depth.
      *
      * This is POST-commit-point, so there is NO abort on failure: the
      * new uberblock is already durable; an abort would revert the
      * in-engine root to the OLD tree and desync it from the just-
-     * written UB. The error return wedges the fs (R154 Q2 verifies the
-     * fs.c caller wedges on any stm_sync_commit error) — the wedge
-     * forces a remount that reloads the NEW uberblock and reopens the
-     * engine fresh at the NEW root, consistent. A crash in this same
-     * window behaves identically (4b design §5.4 case c): new tree
-     * intact, superseded nodes merely leaked. */
+     * written UB. The error return wedges the fs (R154 Q2 verifies
+     * the fs.c caller wedges on any stm_sync_commit error) — the
+     * wedge forces a remount that reloads the NEW uberblock and
+     * reopens the engines fresh at the NEW roots, consistent. A crash
+     * in this same window behaves identically (4b design §5.4 case
+     * c): new trees intact, superseded nodes merely leaked.
+     *
+     * If one finalize succeeds and another fails (a caller-sequencing
+     * bug — the only failure path), the indices end up partially
+     * advanced. The just-written UB names the new roots of all three;
+     * the failed finalize leaves its engine's durable root still
+     * pointing at the previous tree (the engine's get_root has no
+     * way to know about the new UB). A subsequent remount opens each
+     * engine at its UB-recorded root → consistency restored. */
     stm_status ifs = stm_inode_index_commit_finalize(s->inode_idx);
     if (ifs != STM_OK) {
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return ifs;
+    }
+    stm_status dfs = stm_dirent_index_commit_finalize(s->dirent_idx);
+    if (dfs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return dfs;
+    }
+    stm_status xfs = stm_xattr_index_commit_finalize(s->xattr_idx);
+    if (xfs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return xfs;
     }
 
     /* Publish: advance in-RAM state. auth_gen = target, current_gen =

@@ -19,13 +19,25 @@ The xattr module is the bridge between:
   record under a freed inode so AllocReused can't inherit prior
   tenant's xattrs — composes with `inode.tla::AllocReused`).
 
-In-RAM storage: heap-allocated record array; each record owns a
-heap-allocated `value` buffer (variable-length).
-On-disk: btree_store-encoded, AEAD-encrypted Bε-tree under
-`ub_xattr_root`, keyed by `(le64 dataset_id, le64 ino, le64 hash_probe)`.
+In-RAM storage: NONE — the btree_engine COW B+tree IS the store
+(9.6-impl-4c cutover; the pre-cutover heap-allocated record array +
+per-record value buffer are retired). Each chain walk issues
+`stm_btree_engine_lookup` per probe; list / drop_for_ino use
+`stm_btree_engine_scan_range` over the (ds, ino) prefix. Decoded
+values are heap-allocated per-call (returned by the engine) and freed
+at the end of the op.
+On-disk: btree_engine-backed, AEAD-encrypted COW B+tree under
+`ub_xattr_root`, keyed by `(le64 dataset_id, le64 ino, le64
+hash_probe)`. The 9.6-impl-4c engine swap-in is a write-side cutover
+(key + value wire shapes unchanged; only the tree under them swapped
+from btree_store's whole-tree-rebuild MVP to btree_engine's
+incremental COW B+tree). Large values (over the inline-leaf cap) are
+handled by 9.6-impl-3's spill mechanism transparently — the same
+on-disk value-byte sequence per record, just with the bytes that
+don't fit inline stored in a spill chain.
 
-Header: `v2/include/stratum/xattr.h` (363 lines).
-Impl: `v2/src/xattr/xattr.c` (1144 lines).
+Header: `v2/include/stratum/xattr.h`.
+Impl: `v2/src/xattr/xattr.c`.
 Spec: `v2/specs/xattr.tla`.
 
 ## Public API
@@ -88,19 +100,36 @@ rarely called on inodes with > 64 attrs in practice.
 ### Persistence
 
 ```c
-stm_status stm_xattr_index_set_storage    (idx, bdev_0, boot_0);
-stm_status stm_xattr_index_set_crypt_ctx  (idx, key, pool_uuid, dev_uuid_0);
-stm_status stm_xattr_index_load_at        (idx, root_paddr, root_gen, csum);
-stm_status stm_xattr_index_commit         (idx, committed_gen, *paddr, *csum);
-stm_status stm_xattr_index_get_root       (idx, *paddr, csum);
-stm_status stm_xattr_index_get_gen        (idx, *gen);
+stm_status stm_xattr_index_set_storage      (idx, bdev_0, boot_0);
+stm_status stm_xattr_index_set_crypt_ctx    (idx, key, pool_uuid, dev_uuid_0);
+stm_status stm_xattr_index_load_at          (idx, root_paddr, root_gen, csum);
+stm_status stm_xattr_index_commit           (idx, committed_gen, *paddr, *csum);
+stm_status stm_xattr_index_commit_flush     (idx, committed_gen,
+                                                *paddr, *gen, csum);
+stm_status stm_xattr_index_commit_finalize  (idx);
+stm_status stm_xattr_index_commit_abort     (idx);
+stm_status stm_xattr_index_get_root         (idx, *paddr, csum);
+stm_status stm_xattr_index_get_gen          (idx, *gen);
 ```
 
-Same shape + semantics as the dirent / inode / extent / cas persistence
-APIs. AEAD nonce: `paddr || gen || pool_uuid`. AD: `pool_uuid ||
-device_uuid_0`. Idempotent commit via internal dirty flag. Atomic
-shadow-swap on `_load_at`. `xattr_csum` is the 10th input to the pool's
+Same shape + semantics as the inode + dirent persistence APIs after
+9.6-impl-4c. AEAD nonce: `paddr || gen || pool_uuid`. AD: `pool_uuid
+|| device_uuid_0`. `xattr_csum` is the 10th input to the pool's
 Merkle root (R70 P0-1 lesson + R80 P0-1 close).
+
+**Three-phase commit** (9.6-impl-4c): `stm_sync_commit` drives the
+`_commit_flush` / `_commit_finalize` / `_commit_abort` trio so the
+xattr flush slots into sync's Phase 2 and the root is adopted only
+after the uberblock write. Flush returns the PROSPECTIVE root triple
+via out-params; the durable root mirror is updated only at
+`_commit_finalize` (called after `write_ub_to_all_devices`
+succeeds). On any failure between flush and finalize, the sync
+layer calls `_commit_abort` — which discards the pending flush,
+deferred-frees the freshly-written paddrs, drops the in-memory tree,
+and reverts to the previous durable root. A failed `stm_sync_commit`
+is crash-equivalent — the fs.c caller MUST wedge the fs (R154
+doctrine carry). The monolithic `_commit` form remains for non-sync
+callers (unit tests).
 
 ## Implementation
 
@@ -155,10 +184,12 @@ the pool on next mount or trigger an OOB read on lookup.
 
 ### Concurrency
 
-Single mutex (`PTHREAD_MUTEX_ERRORCHECK`) guards records + persistence
-fields. Linear-scan find by key. No cross-layer dependencies — the
-xattr module takes its own lock only; sync.c MUST not hold any other
-inode-comparable lock when invoking these APIs.
+Single mutex (`PTHREAD_MUTEX_ERRORCHECK`) guards the persistence
+fields AND every engine call — the `btree_engine` is single-threaded
+(one handle, one thread at a time), and `idx->lock` IS that
+serialization. No `btree_engine` API is ever touched without
+`idx->lock` held. No cross-layer dependencies — the xattr module
+takes its own lock only.
 
 ### POSIX namespace gating
 
@@ -215,7 +246,8 @@ LookupStopsOnTombstone) — each trips its targeted invariant within
 | Set / Remove / Get / List | LIVE | POSIX shape with CREATE / REPLACE flags |
 | Tombstone preservation | LIVE | Per `xattr.tla::Remove` |
 | Cascade-free on inode unlink | LIVE | `stm_xattr_drop_for_ino` |
-| Persistence (load_at + commit) | LIVE | v26 format break (R80 audit close) |
+| Persistence (load_at + commit) | LIVE | v26 wire-format; 9.6-impl-4c engine cutover |
+| Three-phase commit (flush / finalize / abort) | LIVE | 9.6-impl-4c — sync drives the trio so the xattr root is adopted only after the uberblock write |
 | Merkle root binding | LIVE | `xattr_csum` is the 10th input to `compute_merkle_root` |
 | listxattr cursor stability | NOT MODELED | Single-call full enumeration; STM_ERANGE on overflow |
 | POSIX ACL surface | DEFERRED | `system.posix_acl_*` namespace not validated against POSIX ACL grammar at xattr layer |

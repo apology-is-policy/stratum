@@ -21,14 +21,22 @@ The dirent module is the bridge between:
   record under a freed directory so AllocReused can't inherit prior
   tombstone trail).
 
-In-RAM storage: heap-allocated record array; each record owns the
-variable-length name buffer.
-On-disk: btree_store-encoded, AEAD-encrypted Bε-tree under
+In-RAM storage: NONE — the btree_engine COW B+tree IS the store
+(9.6-impl-4c cutover; the pre-cutover heap-allocated record array
+is retired). Every chain walk goes through `stm_btree_engine_lookup`
+on the exact `(ds, dir_ino, hash_probe)` key; readdir / count /
+drop_for_dir use `stm_btree_engine_scan_range` over the (ds,
+dir_ino) prefix.
+On-disk: btree_engine-backed, AEAD-encrypted COW B+tree under
 `ub_dirent_root`, keyed by `(le64 dataset_id, le64 dir_ino, le64
-hash_probe)`. Format break STM_UB_VERSION 24 → 25.
+hash_probe)`. Format break STM_UB_VERSION 24 → 25; the engine
+swap-in at 9.6-impl-4c is a write-side cutover (the key + value
+shapes on the wire are unchanged, only the tree structure under them
+swapped from btree_store's whole-tree-rebuild MVP to btree_engine's
+incremental COW B+tree).
 
-Header: `v2/include/stratum/dirent.h` (484 lines).
-Impl: `v2/src/dirent/dirent.c` (1306 lines).
+Header: `v2/include/stratum/dirent.h`.
+Impl: `v2/src/dirent/dirent.c`.
 Spec: `v2/specs/dirent.tla`.
 
 ## Public API
@@ -119,18 +127,38 @@ ReaddirEnd(d)`, collapsed to a single C call boundary.
 ### Persistence
 
 ```c
-stm_status stm_dirent_index_set_storage    (idx, bdev_0, boot_0);
-stm_status stm_dirent_index_set_crypt_ctx  (idx, key, pool_uuid, dev_uuid_0);
-stm_status stm_dirent_index_load_at        (idx, root_paddr, root_gen, csum);
-stm_status stm_dirent_index_commit         (idx, committed_gen, *paddr, *csum);
-stm_status stm_dirent_index_get_root       (idx, *paddr, csum);
-stm_status stm_dirent_index_get_gen        (idx, *gen);
+stm_status stm_dirent_index_set_storage      (idx, bdev_0, boot_0);
+stm_status stm_dirent_index_set_crypt_ctx    (idx, key, pool_uuid, dev_uuid_0);
+stm_status stm_dirent_index_load_at          (idx, root_paddr, root_gen, csum);
+stm_status stm_dirent_index_commit           (idx, committed_gen, *paddr, *csum);
+stm_status stm_dirent_index_commit_flush     (idx, committed_gen,
+                                                *paddr, *gen, csum);
+stm_status stm_dirent_index_commit_finalize  (idx);
+stm_status stm_dirent_index_commit_abort     (idx);
+stm_status stm_dirent_index_get_root         (idx, *paddr, csum);
+stm_status stm_dirent_index_get_gen          (idx, *gen);
 ```
 
-Same shape + semantics as the inode / extent / cas persistence APIs.
-AEAD nonce `paddr || gen || pool_uuid`. AD `pool_uuid || device_uuid_0`.
-Idempotent commit. Atomic shadow-swap on `_load_at`. `dirent_csum`
-binds into the pool's Merkle root chain.
+Same shape + semantics as the inode persistence API (9.6-impl-4c
+matches inode's 9.6-impl-4b-ii cutover). AEAD nonce `paddr || gen ||
+pool_uuid`. AD `pool_uuid || device_uuid_0`. `dirent_csum` binds
+into the pool's Merkle root chain.
+
+**Three-phase commit** (9.6-impl-4c): `stm_sync_commit` drives the
+`_commit_flush` / `_commit_finalize` / `_commit_abort` trio so the
+dirent flush slots into sync's Phase 2 and the root is adopted only
+after the uberblock write. Flush returns the PROSPECTIVE root
+triple via out-params; the durable root mirror is updated only at
+`_commit_finalize` (called after `write_ub_to_all_devices`
+succeeds). On any failure between flush and finalize, the sync
+layer calls `_commit_abort` — which discards the pending flush,
+deferred-frees the freshly-written paddrs, drops the in-memory tree,
+and reverts to the previous durable root (the in-process realisation
+of a crash between flush and UB write). A failed `stm_sync_commit` is
+crash-equivalent — the fs.c caller MUST wedge the fs (R154 doctrine
+carry). The monolithic `_commit` form remains for non-sync callers
+(unit tests, future scrub-style introspection); it is
+flush-then-finalize plus a trailing `stm_bootstrap_commit` barrier.
 
 ## Implementation
 
@@ -205,9 +233,12 @@ the pool on next mount.
 
 ### Concurrency
 
-Single mutex (`PTHREAD_MUTEX_ERRORCHECK`) guards records +
-persistence fields. Linear-scan find by key. No cross-layer
-dependencies — the dirent module takes its own lock only.
+Single mutex (`PTHREAD_MUTEX_ERRORCHECK`) guards the persistence
+fields AND every engine call — the `btree_engine` is single-threaded
+(one handle, one thread at a time), and `idx->lock` IS that
+serialization. No `btree_engine` API is ever touched without
+`idx->lock` held. No cross-layer dependencies — the dirent module
+takes its own lock only.
 
 ## Spec cross-reference
 
@@ -258,7 +289,8 @@ LookupStopsOnTombstone). Each trips its targeted invariant.
 | readdir cursor stability | LIVE | P8-POSIX-4 (single-call boundary; monotonic-cursor) |
 | Whiteout (RENAME_WHITEOUT) | LIVE | P8-POSIX-9b WHITEOUT |
 | Drop-for-dir cascade GC | LIVE | Called by `stm_fs_rmdir` (R73 P2-1) |
-| Persistence (load_at + commit) | LIVE | v25 format break |
+| Persistence (load_at + commit) | LIVE | v25 wire-format; 9.6-impl-4c engine cutover |
+| Three-phase commit (flush / finalize / abort) | LIVE | 9.6-impl-4c — sync drives the trio so the dirent root is adopted only after the uberblock write |
 | Merkle root binding | LIVE | `dirent_csum` is an input to `compute_merkle_root` |
 | Case-insensitivity | DEFERRED | Hash function abstraction lets per-dataset property substitute `fnv1a64(NFKD(lower(name)))`; full impl deferred |
 

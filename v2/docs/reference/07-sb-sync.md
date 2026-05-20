@@ -188,8 +188,10 @@ Phase 2: Flush
     stm_{dataset,snapshot,extent,repair_log,cas}_index_commit(target_gen)
     stm_inode_index_commit_flush(target_gen)   // 9.6-impl-4b-iii: btree_engine
                                                // FLUSH -> PROSPECTIVE root triple
-    stm_{dirent,xattr}_index_commit(target_gen)  // btree_store (cut over at 4c)
-    compute_merkle_root(... every index csum, incl. inode prospective ...)
+    stm_dirent_index_commit_flush(target_gen)  // 9.6-impl-4c: btree_engine FLUSH
+    stm_xattr_index_commit_flush(target_gen)   // 9.6-impl-4c: btree_engine FLUSH
+    compute_merkle_root(... every index csum, incl. inode/dirent/xattr
+                            prospective triples ...)
     stm_bootstrap_commit(boot, target_gen)     // 9.6-impl-4b-iii: explicit
                                                // durable-bitmap barrier --
                                                // strictly BEFORE the UB write
@@ -201,6 +203,10 @@ Phase 3: Final
     If sub-quorum: abort; in-RAM state unchanged (rollback UB at auth+1 is durable).
     stm_inode_index_commit_finalize()          // 9.6-impl-4b-iii: adopt the
                                                // flushed inode root, post-UB
+    stm_dirent_index_commit_finalize()         // 9.6-impl-4c: adopt the
+                                               // flushed dirent root, post-UB
+    stm_xattr_index_commit_finalize()          // 9.6-impl-4c: adopt the
+                                               // flushed xattr root, post-UB
 
 Phase 4: Publish
     auth_gen := auth + 2
@@ -209,31 +215,37 @@ Phase 4: Publish
 
 Each commit advances `auth_gen` by 2. Mount-claim advances by 1.
 
-### Inode index — three-phase commit (9.6-impl-4b-iii)
+### Inode / dirent / xattr indices — three-phase commit (9.6-impl-4b-iii + 4c)
 
-The inode module is `btree_engine`-backed (incremental-COW B+tree); its
-commit is split across `stm_sync_commit`'s phases. In Phase 2
-`stm_inode_index_commit_flush` writes the dirty nodes to fresh paddrs
-and yields the PROSPECTIVE root triple — which feeds
+The inode, dirent, and xattr modules are `btree_engine`-backed
+(incremental-COW B+tree); each commit is split across `stm_sync_commit`'s
+phases. In Phase 2 each `_commit_flush` writes the dirty nodes to fresh
+paddrs and yields the PROSPECTIVE root triple — which feeds
 `compute_merkle_root` + the final uberblock exactly as a finished root
-would. In Phase 3, after the final UB is durable,
-`stm_inode_index_commit_finalize` adopts that root + deferred-frees the
-superseded nodes. Every error path between the flush and the finalize
-runs `stm_inode_index_commit_abort` first — discarding the flush and
-reverting the in-memory tree (the in-process realisation of a crash
-between flush and final; a failed `stm_sync_commit` wedges the fs).
+would. In Phase 3, after the final UB is durable, each `_commit_finalize`
+adopts that root + deferred-frees the superseded nodes. Every error path
+between flush and finalize runs `_commit_abort` for every engine whose
+flush has already succeeded (inode-only if dirent's flush fails; inode +
+dirent if xattr's flush fails; all three if any later step fails) —
+discarding the flush(es) and reverting the in-memory tree(s). A failed
+`stm_sync_commit` is crash-equivalent — fs.c MUST wedge the fs (R154
+doctrine carry).
 
 The explicit `stm_bootstrap_commit` at the end of Phase 2 is the
-durable-bitmap barrier. The engine's flush set node bits in the
+durable-bitmap barrier. Every engine's flush set node bits in the
 bootstrap bitmap in RAM; that bitmap MUST be made durable strictly
 BEFORE the final UB write. Bitmap-then-UB is crash-safe — a crash with
 the bitmap durable but the UB stale only leaks the freshly-flushed
 nodes (bounded, non-corrupting); the reverse order would let a later
 `reserve` re-hand a still-rooted paddr and corrupt the tree
-(9.6-impl-4b design §5.2 case A). At 4b-iii the remaining `btree_store`
-indices still call `stm_bootstrap_commit` internally, so the explicit
-call is redundant-but-cheap; 4c/4d retire those internal calls and the
-explicit barrier becomes the sole one.
+(9.6-impl-4b design §5.2 case A). At 4c the remaining `btree_store`
+indices (dataset / snapshot / extent / repair_log / cas) still call
+`stm_bootstrap_commit` internally, so the explicit call is
+redundant-but-cheap; 4d retires extent's internal call and the
+explicit barrier becomes the dominant one (the surviving
+btree_store-backed indices still call it for their own legacy
+serialize-and-free path; harmless since the call is idempotent at the
+same gen).
 
 ### Mount flow
 

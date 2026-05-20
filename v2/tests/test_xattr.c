@@ -47,11 +47,74 @@ static const uint64_t XA_DEVICE_UUID[2] = { 0xC001, 0xD001 };
 static const uint8_t  XA_KEY[32]        = { 0x88, 0x99, 0xAA };
 
 /* ------------------------------------------------------------------ */
+/* Storage fixture for in-memory-op tests.                              */
+/*                                                                      */
+/* 9.6-impl-4c: the xattr module is btree_engine-backed, so every op    */
+/* (set / get / remove / list / drop_for_ino) needs a bound bdev +     */
+/* bootstrap. `xa_test_idx` builds them + a fully-bound index;         */
+/* `xa_test_idx_close` tears it all down. Mirrors the inode + dirent  */
+/* test fixtures.                                                      */
+/*                                                                      */
+/* Tests that intentionally exercise the unbound surface (rebind        */
+/* latches, persist commit_requires_storage_and_crypt, the persist     */
+/* roundtrip tests that manage their own bdev) keep the bare           */
+/* stm_xattr_index_create() form.                                      */
+/* ------------------------------------------------------------------ */
+
+static char xa_tmp_path[256];
+
+static void xa_make_tmp(const char *tag) {
+    snprintf(xa_tmp_path, sizeof xa_tmp_path,
+             "/tmp/stm_v2_xattr_persist_%s_%d.bin", tag, (int)getpid());
+    unlink(xa_tmp_path);
+}
+
+static void xa_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(xa_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bdev_resize(*out_d, XA_DEVICE_BYTES));
+    STM_ASSERT_OK(stm_crypto_init());
+    STM_ASSERT_OK(stm_bootstrap_create(*out_d, XA_POOL_UUID, XA_DEVICE_UUID,
+                                         XA_BOOTSTRAP_BYTES, out_b));
+}
+
+static void xa_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(xa_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
+}
+
+/* Single static fixture slot — sequential tests share it. */
+static stm_bdev      *xa_g_fx_bdev;
+static stm_bootstrap *xa_g_fx_boot;
+
+static stm_xattr_index *xa_test_idx(void) {
+    xa_make_tmp("fx");
+    xa_open_fresh(&xa_g_fx_bdev, &xa_g_fx_boot);
+    stm_xattr_index *idx = stm_xattr_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+    STM_ASSERT_OK(stm_xattr_index_set_storage(idx, xa_g_fx_bdev, xa_g_fx_boot));
+    STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
+                                                 XA_POOL_UUID,
+                                                 XA_DEVICE_UUID));
+    return idx;
+}
+
+static void xa_test_idx_close(stm_xattr_index *idx) {
+    stm_xattr_index_close(idx);
+    stm_bootstrap_close(xa_g_fx_boot);
+    stm_bdev_close(xa_g_fx_bdev);
+    xa_g_fx_boot = NULL;
+    xa_g_fx_bdev = NULL;
+    unlink(xa_tmp_path);
+}
+
+/* ------------------------------------------------------------------ */
 /* In-memory ops — chain integrity + arg validation.                    */
 /* ------------------------------------------------------------------ */
 
 STM_TEST(xattr_lifecycle_create_close) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     STM_ASSERT_TRUE(idx != NULL);
     stm_xattr_index_close(idx);
     /* Closing NULL is safe. */
@@ -59,7 +122,7 @@ STM_TEST(xattr_lifecycle_create_close) {
 }
 
 STM_TEST(xattr_set_get_basic) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
 
     const uint8_t name[] = "user.foo";
     const uint8_t value[] = "hello world";
@@ -86,12 +149,12 @@ STM_TEST(xattr_set_get_basic) {
                    STM_ENODATA);
     STM_ASSERT_EQ(out_size, (uint32_t)0);
 
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_get_probe_with_value_max_zero) {
     /* POSIX getxattr probe shape: pass value_max=0, get full size. */
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
 
     const uint8_t name[]  = "user.size";
     const uint8_t value[] = "0123456789ABCDEF";
@@ -102,11 +165,11 @@ STM_TEST(xattr_get_probe_with_value_max_zero) {
     STM_ASSERT_OK(stm_xattr_get(idx, 1, 1, name, (uint8_t)(sizeof name - 1u),
                                    /*buf=*/NULL, /*max=*/0, &sz));
     STM_ASSERT_EQ(sz, (uint32_t)(sizeof value - 1u));
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_get_buf_too_small_returns_erange) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
 
     const uint8_t name[]  = "user.long";
     const uint8_t value[] = "this-is-twelve-bytes!";
@@ -120,11 +183,11 @@ STM_TEST(xattr_get_buf_too_small_returns_erange) {
                    STM_ERANGE);
     /* sz still tells caller the full size. */
     STM_ASSERT_EQ(sz, (uint32_t)(sizeof value - 1u));
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_set_default_replaces) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
 
     const uint8_t name[] = "user.k";
     bool replaced = false;
@@ -142,11 +205,11 @@ STM_TEST(xattr_set_default_replaces) {
                                    buf, sizeof buf, &sz));
     STM_ASSERT_EQ(sz, (uint32_t)9);
     STM_ASSERT_TRUE(memcmp(buf, "v2-bigger", 9) == 0);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_set_create_flag_refuses_existing) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     const uint8_t name[] = "user.k";
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, name, (uint8_t)(sizeof name - 1u),
                                    (const uint8_t *)"v", 1, 0, NULL));
@@ -155,11 +218,11 @@ STM_TEST(xattr_set_create_flag_refuses_existing) {
                                     (const uint8_t *)"new", 3,
                                     STM_XATTR_FLAG_CREATE, NULL),
                    STM_EEXIST);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_set_replace_flag_refuses_missing) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     const uint8_t name[] = "user.k";
     /* REPLACE on a missing name → STM_ENODATA. */
     STM_ASSERT_ERR(stm_xattr_set(idx, 1, 1, name, (uint8_t)(sizeof name - 1u),
@@ -172,22 +235,22 @@ STM_TEST(xattr_set_replace_flag_refuses_missing) {
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, name, (uint8_t)(sizeof name - 1u),
                                    (const uint8_t *)"v2", 2,
                                    STM_XATTR_FLAG_REPLACE, NULL));
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_set_create_and_replace_together_is_einval) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     const uint8_t name[] = "user.k";
     STM_ASSERT_ERR(stm_xattr_set(idx, 1, 1, name, (uint8_t)(sizeof name - 1u),
                                     (const uint8_t *)"v", 1,
                                     STM_XATTR_FLAG_CREATE | STM_XATTR_FLAG_REPLACE,
                                     NULL),
                    STM_EINVAL);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_remove_basic) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     const uint8_t name[] = "user.gone";
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, name, (uint8_t)(sizeof name - 1u),
                                    (const uint8_t *)"x", 1, 0, NULL));
@@ -200,12 +263,12 @@ STM_TEST(xattr_remove_basic) {
     /* Remove of an absent name returns STM_ENODATA. */
     STM_ASSERT_ERR(stm_xattr_remove(idx, 1, 1, name, (uint8_t)(sizeof name - 1u)),
                    STM_ENODATA);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_per_ino_isolation) {
     /* Same name on different (ds, ino) pairs is independent. */
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     const uint8_t name[] = "user.shared";
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, name, (uint8_t)(sizeof name - 1u),
                                    (const uint8_t *)"a", 1, 0, NULL));
@@ -226,7 +289,7 @@ STM_TEST(xattr_per_ino_isolation) {
     STM_ASSERT_OK(stm_xattr_get(idx, 2, 1, name, (uint8_t)(sizeof name - 1u),
                                    buf, sizeof buf, &sz));
     STM_ASSERT_EQ(buf[0], (uint8_t)'c');
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 /* xattr.tla::BuggyLookupStopsOnTombstone — Remove must leave a tombstone
@@ -241,7 +304,7 @@ STM_TEST(xattr_per_ino_isolation) {
  * an inserted name then re-set the same name — it MUST end up at the
  * tombstoned slot (the chain-integrity contract for re-allocation). */
 STM_TEST(xattr_remove_then_set_same_name_lands_on_tombstone) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     const uint8_t name[] = "user.tomb";
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, name, (uint8_t)(sizeof name - 1u),
                                    (const uint8_t *)"v1", 2, 0, NULL));
@@ -255,11 +318,11 @@ STM_TEST(xattr_remove_then_set_same_name_lands_on_tombstone) {
                                    buf, sizeof buf, &sz));
     STM_ASSERT_EQ(sz, (uint32_t)13);
     STM_ASSERT_TRUE(memcmp(buf, "v2-after-tomb", 13) == 0);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_set_arg_validation) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
 
     /* NULL idx. */
     STM_ASSERT_ERR(stm_xattr_set(NULL, 1, 1, (const uint8_t *)"u.x", 3,
@@ -300,12 +363,12 @@ STM_TEST(xattr_set_arg_validation) {
                                     0, NULL),
                    STM_ERANGE);
 
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_max_size_value_accepted) {
     /* Boundary: value_len == STM_XATTR_VALUE_MAX is accepted. */
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     static uint8_t big[STM_XATTR_VALUE_MAX] = { 0 };
     for (size_t i = 0; i < STM_XATTR_VALUE_MAX; i++) big[i] = (uint8_t)(i & 0xFFu);
 
@@ -326,12 +389,12 @@ STM_TEST(xattr_max_size_value_accepted) {
     STM_ASSERT_EQ(sz, (uint32_t)STM_XATTR_VALUE_MAX);
     STM_ASSERT_TRUE(memcmp(out, big, STM_XATTR_VALUE_MAX) == 0);
 
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_max_name_accepted) {
     /* Boundary: name_len == STM_XATTR_NAME_MAX is accepted. */
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     uint8_t name[STM_XATTR_NAME_MAX];
     memcpy(name, "user.", 5);
     for (size_t i = 5; i < STM_XATTR_NAME_MAX; i++) name[i] = 'A';
@@ -342,11 +405,11 @@ STM_TEST(xattr_max_name_accepted) {
     STM_ASSERT_OK(stm_xattr_get(idx, 1, 1, name, STM_XATTR_NAME_MAX,
                                    NULL, 0, &sz));
     STM_ASSERT_EQ(sz, (uint32_t)1);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_list_basic) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.a", 6,
                                    (const uint8_t *)"v1", 2, 0, NULL));
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.b", 6,
@@ -374,11 +437,11 @@ STM_TEST(xattr_list_basic) {
     }
     STM_ASSERT_TRUE(saw_a && saw_b && saw_acl);
 
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_list_skips_tombstones) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.a", 6,
                                    (const uint8_t *)"v", 1, 0, NULL));
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.b", 6,
@@ -395,11 +458,11 @@ STM_TEST(xattr_list_skips_tombstones) {
     STM_ASSERT_EQ(got, (size_t)1);
     STM_ASSERT_EQ(batch[0].name_len, (uint8_t)6);
     STM_ASSERT_TRUE(memcmp(batch[0].name, "user.b", 6) == 0);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_list_buf_too_small_returns_erange) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.a", 6,
                                    (const uint8_t *)"v", 1, 0, NULL));
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.b", 6,
@@ -410,11 +473,11 @@ STM_TEST(xattr_list_buf_too_small_returns_erange) {
     STM_ASSERT_ERR(stm_xattr_list(idx, 1, 1, one, 1, &total),
                    STM_ERANGE);
     STM_ASSERT_EQ(total, (size_t)2);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_drop_for_ino) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     /* Three xattrs on one ino, two on another. */
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.a", 6,
                                    (const uint8_t *)"x", 1, 0, NULL));
@@ -440,11 +503,11 @@ STM_TEST(xattr_drop_for_ino) {
     /* ino=2 untouched. */
     STM_ASSERT_OK(stm_xattr_list(idx, 1, 2, NULL, 0, &total));
     STM_ASSERT_EQ(total, (size_t)2);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 STM_TEST(xattr_get_arg_validation) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
     uint8_t  buf[16] = { 0 };
     uint32_t sz = 0xFFFFu;
 
@@ -465,41 +528,19 @@ STM_TEST(xattr_get_arg_validation) {
                                     NULL, sizeof buf, &sz),
                    STM_EINVAL);
     STM_ASSERT_EQ(sz, (uint32_t)0);
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
 /* Persistence — commit / load_at roundtrip.                           */
 /* ------------------------------------------------------------------ */
 
-static char xa_tmp_path[256];
-
-static void xa_make_tmp(const char *tag) {
-    snprintf(xa_tmp_path, sizeof xa_tmp_path,
-             "/tmp/stm_v2_xattr_persist_%s_%d.bin", tag, (int)getpid());
-    unlink(xa_tmp_path);
-}
-
-static void xa_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
-    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
-    STM_ASSERT_OK(stm_bdev_open(xa_tmp_path, &bo, out_d));
-    STM_ASSERT_OK(stm_bdev_resize(*out_d, XA_DEVICE_BYTES));
-    STM_ASSERT_OK(stm_crypto_init());
-    STM_ASSERT_OK(stm_bootstrap_create(*out_d, XA_POOL_UUID, XA_DEVICE_UUID,
-                                         XA_BOOTSTRAP_BYTES, out_b));
-}
-
-static void xa_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
-    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
-    STM_ASSERT_OK(stm_bdev_open(xa_tmp_path, &bo, out_d));
-    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
-}
-
 STM_TEST(xattr_persist_commit_load_roundtrip) {
     xa_make_tmp("rt");
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;
     xa_open_fresh(&d, &b);
 
+    /* Bare create — this test manages its own bdev/bootstrap. */
     stm_xattr_index *idx = stm_xattr_index_create();
     STM_ASSERT_TRUE(idx != NULL);
     STM_ASSERT_OK(stm_xattr_index_set_storage(idx, d, b));
@@ -565,6 +606,7 @@ STM_TEST(xattr_persist_value_with_max_size_roundtrip) {
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;
     xa_open_fresh(&d, &b);
 
+    /* Bare create — this test manages its own bdev/bootstrap. */
     stm_xattr_index *idx = stm_xattr_index_create();
     STM_ASSERT_OK(stm_xattr_index_set_storage(idx, d, b));
     STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
@@ -646,7 +688,7 @@ STM_TEST(xattr_ub_version_is_v28) {
  * lands a fault-injection harness. The structural test below
  * exercises the rollback BRANCH but not the OOM TRIGGER. */
 STM_TEST(xattr_r80_p0_1_install_failure_no_zombie_record) {
-    stm_xattr_index *idx = stm_xattr_index_create();
+    stm_xattr_index *idx = xa_test_idx();
 
     /* First, succeed with two real records so n_records > 0. */
     STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.a", 6,
@@ -684,7 +726,7 @@ STM_TEST(xattr_r80_p0_1_install_failure_no_zombie_record) {
      * with ds==0 exists; if it did, the first commit-and-reopen would
      * fail STM_ECORRUPT (covered by xattr_persist_commit_load_roundtrip
      * which is structurally similar). */
-    stm_xattr_index_close(idx);
+    xa_test_idx_close(idx);
 }
 
 /* R80 P2-3 forward-noted: STM_ENOSPC chain-exhaustion at probe cap.

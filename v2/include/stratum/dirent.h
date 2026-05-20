@@ -456,11 +456,93 @@ stm_status stm_dirent_index_set_crypt_ctx(stm_dirent_index *idx,
                                               const uint64_t pool_uuid[2],
                                               const uint64_t device_uuid_0[2]);
 
+/*
+ * Single-shot commit — the btree_engine's flush + finalize in one call,
+ * then make the bootstrap bitmap durable. Returns the new tree's root
+ * paddr + 32-byte BLAKE3 csum via out-params, which the caller stamps
+ * into `ub_dirent_root`.
+ *
+ * `committed_gen` MUST strictly increase across commits. A clean tree's
+ * commit is a cheap no-op that returns the prior root at its prior gen;
+ * pair it with stm_dirent_index_get_gen to read the authoritative AEAD
+ * gen.
+ *
+ * 9.6-impl-4c: stm_sync_commit no longer drives this monolithic form —
+ * it uses the three-phase stm_dirent_index_commit_flush / _finalize /
+ * _abort below so the dirent flush slots into sync's Phase 2 and the
+ * root is adopted only after the uberblock write. This single-shot
+ * form remains for non-sync callers and the persistence unit tests; it
+ * IS flush-then-finalize plus the trailing stm_bootstrap_commit barrier
+ * the trio leaves to the sync layer.
+ *
+ * Refusals: STM_EINVAL (NULL args / storage / crypt context unbound),
+ * and any error bubbled from the btree_engine commit or the bootstrap
+ * allocator. A failed commit self-reverts — a failed stm_sync_commit
+ * is crash-equivalent and the caller MUST wedge the fs.
+ */
 STM_MUST_USE
 stm_status stm_dirent_index_commit(stm_dirent_index *idx,
                                        uint64_t committed_gen,
                                        uint64_t *out_root_paddr,
                                        uint8_t out_root_csum[32]);
+
+/*
+ * Three-phase commit — FLUSH. The form stm_sync_commit drives. Writes
+ * every dirty root-to-leaf path to fresh paddrs at `committed_gen` and
+ * returns the PROSPECTIVE new root triple via (*out_root_paddr,
+ * *out_root_gen, *out_root_csum) — NOT yet durable: the index's
+ * durable root still names the previous tree until
+ * stm_dirent_index_commit_finalize. The prospective csum is what the
+ * caller folds into the pool Merkle root + stamps into ub_dirent_root.
+ *
+ * Does NOT make the bootstrap bitmap durable — the sync layer runs the
+ * single explicit stm_bootstrap_commit barrier after every index
+ * flush, strictly before the uberblock write (9.6-impl-4b design §5).
+ *
+ * On SUCCESS the engine holds a pending-commit window: pair the flush
+ * with exactly one stm_dirent_index_commit_finalize (after the UB
+ * write) or stm_dirent_index_commit_abort (on any failure before the
+ * UB write). A FAILED flush self-reverts and opens NO window — do not
+ * abort it.
+ *
+ * `committed_gen` MUST strictly increase across commits. Refusals:
+ * STM_EINVAL (NULL args, storage / crypt unbound, non-monotonic gen),
+ * STM_EBUSY (a prior flush is still un-finalized), and engine errors.
+ */
+STM_MUST_USE
+stm_status stm_dirent_index_commit_flush(stm_dirent_index *idx,
+                                             uint64_t committed_gen,
+                                             uint64_t *out_root_paddr,
+                                             uint64_t *out_root_gen,
+                                             uint8_t out_root_csum[32]);
+
+/*
+ * Three-phase commit — FINALIZE. Adopts the root flushed by the
+ * preceding stm_dirent_index_commit_flush as the index's durable root
+ * (mirroring the triple into the get_root / get_gen accessors) and
+ * hands the superseded paddrs back to the allocator (deferred-free).
+ * Call it only after the uberblock naming the flushed root is durable.
+ *
+ * After a successful flush this is INFALLIBLE — the lone failure exit
+ * is STM_EINVAL when no flush is pending (a caller-sequencing bug).
+ */
+STM_MUST_USE
+stm_status stm_dirent_index_commit_finalize(stm_dirent_index *idx);
+
+/*
+ * Three-phase commit — ABORT. Discards the root flushed by the
+ * preceding stm_dirent_index_commit_flush: the freshly-written paddrs
+ * were never durably rooted, so they are handed back to the allocator
+ * (deferred-free), and the in-memory tree is dropped so the next access
+ * reloads the previous durable root. The durable root triple is
+ * unchanged — the in-process realisation of a crash between the flush
+ * and the uberblock write. The sync layer calls this on every error
+ * path between a successful flush and the finalize.
+ *
+ * Returns STM_EINVAL if no flush is pending; otherwise STM_OK.
+ */
+STM_MUST_USE
+stm_status stm_dirent_index_commit_abort(stm_dirent_index *idx);
 
 STM_MUST_USE
 stm_status stm_dirent_index_load_at(stm_dirent_index *idx,
