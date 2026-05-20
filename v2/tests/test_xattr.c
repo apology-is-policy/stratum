@@ -646,6 +646,82 @@ STM_TEST(xattr_persist_value_with_max_size_roundtrip) {
     unlink(xa_tmp_path);
 }
 
+/* R155 P3-1 close: xattr persistence-surface tests that were missing
+ * before 9.6-impl-4c. Each mirrors the same-shape dirent test. */
+
+STM_TEST(xattr_persist_commit_requires_storage_and_crypt) {
+    /* Bare create — the test asserts commit() refuses without bound
+     * storage/crypt; the fixture would have already bound them. */
+    stm_xattr_index *idx = stm_xattr_index_create();
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_ERR(stm_xattr_index_commit(idx, 1u, &paddr, cs), STM_EINVAL);
+    stm_xattr_index_close(idx);
+}
+
+STM_TEST(xattr_persist_idempotent_commit_when_clean) {
+    xa_make_tmp("idem");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    xa_open_fresh(&d, &b);
+
+    /* Bare create — this test manages its own bdev/bootstrap. */
+    stm_xattr_index *idx = stm_xattr_index_create();
+    STM_ASSERT_OK(stm_xattr_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
+                                                  XA_POOL_UUID,
+                                                  XA_DEVICE_UUID));
+
+    /* One Set, one commit, then a no-op commit at the next gen. */
+    const uint8_t name[] = "user.x";
+    STM_ASSERT_OK(stm_xattr_set(idx, 1, 100, name, (uint8_t)(sizeof name - 1u),
+                                   (const uint8_t *)"v", 1, 0, NULL));
+
+    uint64_t p1 = 0, p2 = 0; uint8_t c1[32], c2[32];
+    STM_ASSERT_OK(stm_xattr_index_commit(idx, 1u, &p1, c1));
+    /* Nothing changed since the gen-1 commit; the gen-2 commit is a
+     * clean no-op returning the same root paddr + csum. (9.6-impl-4c:
+     * the engine refuses non-monotonic gen, so the test bumps gen by
+     * one between the two commits. Mirrors inode's
+     * inode_persist_idempotent_commit_when_clean.) */
+    STM_ASSERT_OK(stm_xattr_index_commit(idx, 2u, &p2, c2));
+    STM_ASSERT_EQ(p1, p2);
+    STM_ASSERT_MEM_EQ(c1, c2, 32);
+
+    stm_xattr_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(xa_tmp_path);
+}
+
+/* R70 P3-6 + R71 P2-1 carry-forward: bound-once latches refuse re-bind. */
+STM_TEST(xattr_set_storage_refuses_rebind) {
+    xa_make_tmp("rebind_st");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    xa_open_fresh(&d, &b);
+    /* Bare create — same rationale as set_storage_refuses_rebind in
+     * test_dirent: fixture pre-binds, so a re-bind test must start
+     * from unbound. */
+    stm_xattr_index *idx = stm_xattr_index_create();
+    STM_ASSERT_OK(stm_xattr_index_set_storage(idx, d, b));
+    STM_ASSERT_ERR(stm_xattr_index_set_storage(idx, d, b), STM_EINVAL);
+    stm_xattr_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(xa_tmp_path);
+}
+
+STM_TEST(xattr_set_crypt_ctx_refuses_rebind) {
+    /* Bare create — same rationale as set_storage_refuses_rebind. */
+    stm_xattr_index *idx = stm_xattr_index_create();
+    STM_ASSERT_OK(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
+                                                  XA_POOL_UUID,
+                                                  XA_DEVICE_UUID));
+    STM_ASSERT_ERR(stm_xattr_index_set_crypt_ctx(idx, XA_KEY,
+                                                   XA_POOL_UUID,
+                                                   XA_DEVICE_UUID),
+                   STM_EINVAL);
+    stm_xattr_index_close(idx);
+}
+
 /* ------------------------------------------------------------------ */
 /* Compile-time invariants.                                            */
 /* ------------------------------------------------------------------ */
