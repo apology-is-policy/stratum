@@ -312,6 +312,17 @@ STM_TEST(sync_inode_persistence_roundtrip) {
     stm_inode_index *iidx = stm_sync_inode_index(s);
     STM_ASSERT_TRUE(iidx != NULL);
 
+    /* 9.7-impl-1c-ii: inode_alloc routes through the per-dataset
+     * btree_engine resolved via the attached ds_idx — each dataset
+     * MUST be PRESENT before any inode op against it. ds=1 is the
+     * root (auto-created); ds=2 is created here. */
+    stm_dataset_index *dsidx = stm_sync_dataset_index(s);
+    STM_ASSERT_TRUE(dsidx != NULL);
+    uint64_t ds2 = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(dsidx, STM_DATASET_ROOT_ID,
+                                              "ds2", &ds2));
+    STM_ASSERT_EQ(ds2, (uint64_t)2);
+
     uint64_t a1 = 0, a2 = 0, b1 = 0;
     STM_ASSERT_OK(stm_inode_alloc(iidx, /*ds=*/1, 0100644, 1000, 1000, &a1));
     STM_ASSERT_OK(stm_inode_alloc(iidx, 1, 0100755, 1001, 1001, &a2));

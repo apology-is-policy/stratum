@@ -1,4 +1,4 @@
-# 16 — Inode index (P8-POSIX-1 + P8-POSIX-1b + 9.6-impl-4b-ii)
+# 16 — Inode index (P8-POSIX-1 + P8-POSIX-1b + 9.6-impl-4b-ii + 9.7-impl-1c-ii)
 
 ## Purpose
 
@@ -7,6 +7,38 @@ Per-pool inode allocator + index. The canonical mapping from
 the allocator state machine (`stm_inode_alloc` / `stm_inode_free`) that
 maintains the **`(ino, si_gen)` tuple-uniqueness-across-time** invariant
 pinned by `inode.tla`.
+
+## 9.7-impl-1c-ii cutover
+
+As of 9.7-impl-1c-ii the inode module no longer owns its own
+`btree_engine`. Records live in each dataset's per-dataset
+`btree_engine` (the substrate from 9.7-impl-1c-i), resolved at every op
+via an attached `stm_dataset_index *`. Keys are 9 bytes
+(`stm_metakey_compose(STM_METAKEY_KIND_INODE, &ino_le, 8)`) instead of
+the previous 16-byte `(le64 dataset_id, le64 ino)`; the dataset id is
+now woven into the engine's AEAD additional-data via `tree_id =
+dataset_id`, so cross-dataset substitution attacks fail decrypt.
+
+The retired persistence API (`set_storage`, `set_crypt_ctx`, `load_at`,
+`commit`/`commit_flush`/`commit_finalize`/`commit_abort`, `get_root`,
+`get_gen`) has been replaced by a single one-time bind:
+`stm_inode_index_attach_dataset_index(idx, ds_idx)` at mount time. The
+M-engine three-phase commit cascade now lives in
+`stm_dataset_index_commit_engines_{flush,finalize,abort}` (see
+`reference/12-dataset.md` §M-cascade) and is driven by
+`stm_sync_commit` immediately BEFORE the dataset_index commit, so the
+ds_idx commit sees the per-dataset triples post-flush. The
+`ub_inode_root` / `ub_inode_root_gen` / `ub_inode_csum` fields are
+stamped ZERO at v30 and ignored on mount — the per-dataset engine roots
+are transitively covered by `main_csum`. Full UB field retirement to
+reserved-on-the-wire happens at 1c-vi when all four pool-global engines
+are retired together.
+
+The allocator state machine — alloc / free / link / unlink /
+materialize, the `(ino, si_gen)` tuple-uniqueness invariant — is
+UNCHANGED; only the storage under it swapped. Per-dataset `next_ino`
+high-water marks are reconstructed lazily on first alloc-shaped op per
+dataset via a one-time engine_scan over that dataset's INODE subspace.
 
 The inode module is the foundational Phase 8 layer:
 

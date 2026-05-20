@@ -51,6 +51,11 @@
 extern "C" {
 #endif
 
+/* Forward-decl (9.7-impl-1c-ii): the inode module borrows a dataset
+ * index via stm_inode_index_attach_dataset_index. */
+struct stm_dataset_index;
+typedef struct stm_dataset_index stm_dataset_index;
+
 /* ========================================================================= */
 /* On-disk inode value. ARCH §11.3.                                          */
 /* ========================================================================= */
@@ -636,180 +641,57 @@ stm_status stm_inode_next_ino(const stm_inode_index *idx,
                                  uint64_t *out_next);
 
 /* ========================================================================= */
-/* Persistence (P8-POSIX-1b; btree_engine-backed since 9.6-impl-4b-ii).       */
+/* Persistence (9.7-impl-1c-ii: per-dataset metadata-tree engines).            */
 /*                                                                            */
-/* The inode index is persisted as a btree_engine (Phase 9.6 incremental-COW */
-/* B+tree) rooted under `ub_inode_root` on device 0. Each 16-KiB tree node is */
-/* AEAD-encrypted (nonce `paddr || gen || pool_uuid`, AD                      */
-/* `pool_uuid || device_uuid_0`) with a per-node BLAKE3 Merkle csum. The      */
-/* btree_engine IS the inode store — the module keeps no separate in-RAM      */
-/* records array. A commit rewrites only the dirty root-to-leaf paths; a     */
-/* clean tree's commit is a cheap no-op.                                      */
+/* As of 9.7-impl-1c-ii the inode module owns NO storage of its own. Each    */
+/* dataset's inode records live in that dataset's per-dataset btree_engine   */
+/* (the substrate from 9.7-impl-1c-i), keyed by `stm_metakey_compose`:       */
 /*                                                                            */
-/* Key (16 bytes):                                                            */
+/*   key (9 bytes): le8 STM_METAKEY_KIND_INODE || le64 ino                  */
+/*   value (256 bytes): the full struct stm_inode_value (FREED state         */
+/*   inline via STM_INO_FLAG_FREED in si_flags; FREED records are upserted,  */
+/*   never engine-deleted, so AllocReused can re-issue the ino with a        */
+/*   bumped gen).                                                             */
 /*                                                                            */
-/*   off  size  field                                                        */
-/*    0    8    le64 dataset_id                                              */
-/*    8    8    le64 ino                                                     */
+/* The dataset id is folded into the engine's AEAD additional-data via the   */
+/* engine's tree_id; cross-dataset substitution attacks fail decrypt.        */
+/* That is why the key no longer carries the dataset_id prefix it had at    */
+/* P8-POSIX-1b / 9.6-impl-4b-ii.                                              */
 /*                                                                            */
-/* Value: 256-byte struct stm_inode_value as defined above. The FREED        */
-/* state is encoded inline via STM_INO_FLAG_FREED in si_flags; a FREED       */
-/* record is upserted, never engine-deleted, so AllocReused can re-issue     */
-/* the ino with a bumped gen.                                                 */
+/* The pool-global `ub_inode_root` / `ub_inode_root_gen` / `ub_inode_csum`   */
+/* fields are stamped ZERO at 1c-ii; the inode_csum slot in the pool        */
+/* Merkle root is also zero. The per-dataset engine roots are transitively  */
+/* covered by `main_csum` (the dataset_index tree's root csum, which        */
+/* serializes each slot's (di_tree_root, di_root_gen, di_root_csum)         */
+/* triple). Full UB field retirement to reserved-on-the-wire happens at    */
+/* 1c-vi when all four pool-global engines (inode, dirent, xattr, extent)  */
+/* are retired together.                                                    */
 /*                                                                            */
-/* `next_ino` per-dataset high-water mark stays in RAM, reconstructed at     */
-/* load_at time from a one-time engine_scan (max(ino over records-for-ds) +  */
-/* 1), so it does not need a separate persistence slot.                       */
+/* `next_ino` per-dataset high-water mark stays in RAM, lazily seeded on   */
+/* first alloc-shaped op per dataset via an engine_scan over that dataset's */
+/* INODE subspace.                                                           */
 /* ========================================================================= */
 
-struct stm_bdev;       typedef struct stm_bdev stm_bdev;
-struct stm_bootstrap;  typedef struct stm_bootstrap stm_bootstrap;
-
 /*
- * Bind the inode index to its on-disk storage (device 0 + bootstrap
- * allocator). MUST be called before commit() / load_at(). Mirrors
- * `stm_extent_index_set_storage`.
+ * 9.7-impl-1c-ii: attach the dataset index. The inode module borrows the
+ * `ds_idx` pointer; the caller MUST keep it alive for the inode index's
+ * lifetime. The attach is one-time — re-binding returns STM_EINVAL.
+ *
+ * Lifetime: idx and ds_idx are typically both owned by stm_sync; they
+ * are created together at open and destroyed together at close. The
+ * borrow is safe by construction in the production path.
+ *
+ * Every public inode op resolves the dataset's per-dataset engine via
+ * the attached ds_idx, lazily opening the engine on first use per
+ * `stm_dataset_index_get_engine`.
+ *
+ * Refusals:
+ *   - NULL idx OR NULL ds_idx (STM_EINVAL).
+ *   - Re-attach (STM_EINVAL — the attach is one-time).
  */
 STM_MUST_USE
-stm_status stm_inode_index_set_storage(stm_inode_index *idx,
-                                          stm_bdev *bdev_0,
-                                          stm_bootstrap *boot_0);
-
-/*
- * Bind the AEAD context (metadata key + pool/device UUIDs). MUST be
- * called before commit() / load_at(). The pointer to `metadata_key`
- * is stored — caller MUST keep the buffer alive.
- */
-STM_MUST_USE
-stm_status stm_inode_index_set_crypt_ctx(stm_inode_index *idx,
-                                            const uint8_t *metadata_key,
-                                            const uint64_t pool_uuid[2],
-                                            const uint64_t device_uuid_0[2]);
-
-/*
- * Single-shot commit — the btree_engine's flush + finalize in one call,
- * then make the bootstrap bitmap durable. Returns the new tree's root
- * paddr + 32-byte BLAKE3 csum via out-params, which the caller stamps
- * into `ub_inode_root`.
- *
- * `committed_gen` MUST strictly increase across commits (the engine
- * refuses a non-monotonic gen). A clean tree's commit is a cheap no-op
- * that returns the prior root at its prior gen; pair it with
- * stm_inode_index_get_gen to read the authoritative AEAD gen.
- *
- * 9.6-impl-4b-iii: stm_sync_commit no longer drives this monolithic
- * form — it uses the three-phase stm_inode_index_commit_flush /
- * _finalize / _abort below so the inode flush slots into sync's
- * Phase 2 and the root is adopted only after the uberblock write.
- * This single-shot form remains for non-sync callers and the
- * persistence unit tests; it IS flush-then-finalize plus the trailing
- * stm_bootstrap_commit barrier the trio leaves to the sync layer.
- *
- * Refusals: STM_EINVAL (NULL idx / out_paddr / out_csum, or storage /
- * crypt context unbound), and any error bubbled from the btree_engine
- * commit or the bootstrap allocator. A failed commit self-reverts (the
- * engine drops the uncommitted in-memory tree, the durable root still
- * names the previous tree) — a failed stm_sync_commit is therefore
- * crash-equivalent and the caller must wedge the fs.
- */
-STM_MUST_USE
-stm_status stm_inode_index_commit(stm_inode_index *idx,
-                                     uint64_t committed_gen,
-                                     uint64_t *out_root_paddr,
-                                     uint8_t out_root_csum[32]);
-
-/*
- * Three-phase commit — FLUSH. The form stm_sync_commit drives (the
- * monolithic stm_inode_index_commit above is for non-sync callers).
- * Writes every dirty root-to-leaf path to fresh paddrs at
- * `committed_gen` and returns the PROSPECTIVE new root triple via
- * (*out_root_paddr, *out_root_gen, *out_root_csum) — NOT yet durable:
- * the index's durable root still names the previous tree until
- * stm_inode_index_commit_finalize. The prospective csum is what the
- * caller folds into the pool Merkle root + stamps into ub_inode_root.
- *
- * Does NOT make the bootstrap bitmap durable — the sync layer runs the
- * single explicit stm_bootstrap_commit barrier after every index
- * flush, strictly before the uberblock write (9.6-impl-4b design §5).
- *
- * On SUCCESS the engine holds a pending-commit window: pair the flush
- * with exactly one stm_inode_index_commit_finalize (after the UB write)
- * or stm_inode_index_commit_abort (on any failure before the UB write).
- * A FAILED flush self-reverts and opens NO window — do not abort it.
- *
- * `committed_gen` MUST strictly increase across commits. Refusals:
- * STM_EINVAL (NULL args, storage / crypt unbound, non-monotonic gen),
- * STM_EBUSY (a prior flush is still un-finalized), and engine errors.
- */
-STM_MUST_USE
-stm_status stm_inode_index_commit_flush(stm_inode_index *idx,
-                                           uint64_t committed_gen,
-                                           uint64_t *out_root_paddr,
-                                           uint64_t *out_root_gen,
-                                           uint8_t out_root_csum[32]);
-
-/*
- * Three-phase commit — FINALIZE. Adopts the root flushed by the
- * preceding stm_inode_index_commit_flush as the index's durable root
- * (mirroring the triple into the get_root / get_gen accessors) and
- * hands the superseded paddrs back to the allocator (deferred-free).
- * Call it only after the uberblock naming the flushed root is durable.
- *
- * After a successful flush this is INFALLIBLE — the lone failure exit
- * is STM_EINVAL when no flush is pending (a caller-sequencing bug).
- */
-STM_MUST_USE
-stm_status stm_inode_index_commit_finalize(stm_inode_index *idx);
-
-/*
- * Three-phase commit — ABORT. Discards the root flushed by the
- * preceding stm_inode_index_commit_flush: the freshly-written paddrs
- * were never durably rooted, so they are handed back to the allocator
- * (deferred-free), and the in-memory tree is dropped so the next access
- * reloads the previous durable root. The durable root triple is
- * unchanged — the in-process realisation of a crash between the flush
- * and the uberblock write. The sync layer calls this on every error
- * path between a successful flush and the finalize.
- *
- * Returns STM_EINVAL if no flush is pending; otherwise STM_OK.
- */
-STM_MUST_USE
-stm_status stm_inode_index_commit_abort(stm_inode_index *idx);
-
-/*
- * Mount-path load_at. Opens the btree_engine rooted at (root_paddr,
- * root_gen, expected_csum), scans it once to validate every record and
- * rebuild the per-dataset next_ino high-water marks, then atomically
- * adopts the opened tree. A corrupt record fails the mount here with
- * STM_ECORRUPT. After return, all prior in-RAM state is replaced (no
- * preservation across load_at); on failure `idx` is left unchanged.
- */
-STM_MUST_USE
-stm_status stm_inode_index_load_at(stm_inode_index *idx,
-                                      uint64_t root_paddr, uint64_t root_gen,
-                                      const uint8_t expected_csum[32]);
-
-/* Read the current root paddr / csum — for the sync layer's
- * dirty-tracking + uberblock stamping. `out_root_paddr` is required;
- * `out_root_csum` is optional (pass NULL if the csum is not needed).
- * For the AEAD gen, use the sibling `stm_inode_index_get_gen` below.
- * (R71 P2-2: docstring referenced "/ gen" but the function does not
- * return it; gen lives in the dedicated accessor.)
- *
- * Forward use: P8-POSIX-2's dirent layer + future POSIX-surface
- * chunks call this to mirror the inode tree's root state during
- * the per-fs commit cadence. R70 P2-2 + P3-8: presently no in-tree
- * caller — the accessor is published with the persistence API as
- * part of P8-POSIX-1b so the sync.c → inode.c contract stays
- * symmetric with the equivalent extent / cas / repair_log
- * accessors that all carry their own root-mirror getter. */
-STM_MUST_USE
-stm_status stm_inode_index_get_root(const stm_inode_index *idx,
-                                       uint64_t *out_root_paddr,
-                                       uint8_t out_root_csum[32]);
-STM_MUST_USE
-stm_status stm_inode_index_get_gen(const stm_inode_index *idx,
-                                      uint64_t *out_root_gen);
+stm_status stm_inode_index_attach_dataset_index(stm_inode_index *idx,
+                                                stm_dataset_index *ds_idx);
 
 #ifdef __cplusplus
 }

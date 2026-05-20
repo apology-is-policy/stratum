@@ -1417,18 +1417,17 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                                             s->pool_uuid, s->device_uuid);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
-        /* P8-POSIX-1b (v24): inode index. Same wiring shape as
-         * cas_idx / extent_idx. AEAD-encrypted Bε-tree under
-         * ub_inode_root on device 0. Keys (le64 dataset_id || le64
-         * ino). Values: 256-byte stm_inode_value records. Empty at
-         * format time; first sync_commit serializes the empty btree
-         * so subsequent mounts find a valid bptr. */
+        /* 9.7-impl-1c-ii: inode index. The module no longer owns its
+         * own engine — records live in each dataset's per-dataset
+         * btree_engine (substrate from 9.7-impl-1c-i). We just create
+         * the in-RAM allocator-state-machine layer and attach the
+         * dataset index for engine resolution. The pool-global
+         * ub_inode_root field is stamped zero at v30 (full retirement
+         * lands at 1c-vi). */
         s->inode_idx = stm_inode_index_create();
         if (!s->inode_idx) { stm_sync_close(s); return STM_ENOMEM; }
-        rc = stm_inode_index_set_storage(s->inode_idx, d, boot);
-        if (rc != STM_OK) { stm_sync_close(s); return rc; }
-        rc = stm_inode_index_set_crypt_ctx(s->inode_idx, s->metadata_key,
-                                              s->pool_uuid, s->device_uuid);
+        rc = stm_inode_index_attach_dataset_index(s->inode_idx,
+                                                   s->dataset_idx);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
         /* P8-POSIX-2 (v25): dirent index. Same wiring shape as
@@ -2139,32 +2138,21 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         s2->cas_index_root_gen   = cgen;
         memcpy(s2->cas_index_root_csum, ub.ub_cas_index_root.bp_csum, 32);
 
-        /* P8-POSIX-1b (v24): inode index. Same wiring shape as
-         * cas_idx. Empty (paddr=0) on fresh format / pre-first-commit
-         * pools — load_at is skipped. */
+        /* 9.7-impl-1c-ii: inode index. The module no longer owns its
+         * own engine — records live in each dataset's per-dataset
+         * btree_engine. We just create the in-RAM layer + attach the
+         * dataset index. The pool-global ub_inode_root field is
+         * stamped zero at v30; ignored on mount. The s2->inode_root_*
+         * mirrors stay (zeroed) for now — full retirement lands at
+         * 1c-vi. */
         s2->inode_idx = stm_inode_index_create();
         if (!s2->inode_idx) { stm_sync_close(s2); return STM_ENOMEM; }
-        stm_status ini = stm_inode_index_set_storage(s2->inode_idx, meta_bdev, boot2);
+        stm_status ini = stm_inode_index_attach_dataset_index(s2->inode_idx,
+                                                                s2->dataset_idx);
         if (ini != STM_OK) { stm_sync_close(s2); return ini; }
-        ini = stm_inode_index_set_crypt_ctx(s2->inode_idx, s2->metadata_key,
-                                              s2->pool_uuid, s2->device_uuid);
-        if (ini != STM_OK) { stm_sync_close(s2); return ini; }
-
-        uint64_t ipaddr = stm_load_le64(ub.ub_inode_root.bp_paddr);
-        uint64_t igen   = stm_load_le64(ub.ub_inode_root_gen);
-        if (ipaddr != 0) {
-            if (ub.ub_inode_root.bp_kind != STM_BPTR_KIND_INODE_TREE) {
-                stm_sync_close(s2);
-                return STM_ECORRUPT;
-            }
-            stm_status ls = stm_inode_index_load_at(s2->inode_idx,
-                                                       ipaddr, igen,
-                                                       ub.ub_inode_root.bp_csum);
-            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
-        }
-        s2->inode_root_paddr = ipaddr;
-        s2->inode_root_gen   = igen;
-        memcpy(s2->inode_root_csum, ub.ub_inode_root.bp_csum, 32);
+        s2->inode_root_paddr = 0;
+        s2->inode_root_gen   = 0;
+        memset(s2->inode_root_csum, 0, 32);
 
         /* P8-POSIX-2 (v25): dirent index. Same wiring as inode_idx. */
         s2->dirent_idx = stm_dirent_index_create();
@@ -2605,6 +2593,26 @@ stm_status stm_sync_commit(stm_sync *s)
         return rc;
     }
 
+    /* 9.7-impl-1c-ii: M-engine cascade flush. For each PRESENT dataset
+     * whose per-dataset btree_engine is OPEN, flush its dirty root-to-
+     * leaf paths at target_gen and stamp the prospective triple into
+     * that dataset's slot. This MUST run BEFORE stm_dataset_index_commit
+     * below so the dataset-index's own serialization picks up the new
+     * triples — its main_csum then transitively covers every per-dataset
+     * engine root.
+     *
+     * A failed commit_engines_flush self-rolls-back (every previously-
+     * flushed engine aborted + every slot's triple restored); no
+     * commit_engines_abort needed on this exit. Subsequent error paths
+     * (between this flush and the UB write) MUST call
+     * stm_dataset_index_commit_engines_abort. */
+    stm_status ecs2 = stm_dataset_index_commit_engines_flush(s->dataset_idx,
+                                                              target_gen);
+    if (ecs2 != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return ecs2;
+    }
+
     /* P6-persist: commit the dataset + snapshot indices. Each is
      * idempotent on clean (R7c/R14b parallel) — clean handles return
      * cached (paddr, csum) bytes which keep the UB content
@@ -2613,7 +2621,11 @@ stm_status stm_sync_commit(stm_sync *s)
      * sequential (alloc_roots → dataset → snap) — each consumer's
      * own stm_bootstrap_commit at the same target_gen is cheap (it
      * advances bitmap_gen + fsyncs the bitmap, idempotent on subsequent
-     * calls at the same gen). */
+     * calls at the same gen).
+     *
+     * 9.7-impl-1c-ii: dataset_index_commit now sees the updated
+     * per-dataset triples (di_tree_root/_gen/_csum) stamped by the
+     * commit_engines_flush above. */
     uint64_t main_paddr = 0;
     uint8_t  main_csum[32] = {0};
     uint64_t main_gen = 0;
@@ -2621,16 +2633,19 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status mcs = stm_dataset_index_commit(s->dataset_idx, target_gen,
                                                   &main_paddr, main_csum);
     if (mcs != STM_OK) {
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return mcs;
     }
     mcs = stm_dataset_index_get_gen(s->dataset_idx, &main_gen);
     if (mcs != STM_OK) {
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return mcs;
     }
     mcs = stm_dataset_index_get_next_id(s->dataset_idx, &main_next_id);
     if (mcs != STM_OK) {
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return mcs;
     }
@@ -2641,16 +2656,19 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status scs = stm_snapshot_index_commit(s->snap_idx, target_gen,
                                                    &snap_paddr, snap_csum);
     if (scs != STM_OK) {
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return scs;
     }
     scs = stm_snapshot_index_get_gen(s->snap_idx, &snap_gen);
     if (scs != STM_OK) {
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return scs;
     }
     scs = stm_snapshot_index_get_next_id(s->snap_idx, &snap_next_id);
     if (scs != STM_OK) {
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return scs;
     }
@@ -2667,6 +2685,7 @@ stm_status stm_sync_commit(stm_sync *s)
                                                     repair_log_csum,
                                                     &repair_log_seq);
     if (rls != STM_OK) {
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return rls;
     }
@@ -2682,11 +2701,13 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status ccs = stm_cas_index_commit(s->cas_idx, target_gen,
                                             &cas_paddr, cas_csum);
     if (ccs != STM_OK) {
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return ccs;
     }
     ccs = stm_cas_index_get_gen(s->cas_idx, &cas_gen);
     if (ccs != STM_OK) {
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return ccs;
     }
@@ -2714,49 +2735,29 @@ stm_status stm_sync_commit(stm_sync *s)
                                                      &extent_paddr, &extent_gen,
                                                      extent_csum);
     if (ecs != STM_OK) {
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return ecs;
     }
 
-    /* P8-POSIX-1b (v24) / 9.6-impl-4b-iii: FLUSH the inode index. The
-     * inode module is btree_engine-backed (incremental-COW B+tree); its
-     * commit is three-phase. commit_flush writes the dirty root-to-leaf
-     * paths to fresh paddrs at target_gen and returns the PROSPECTIVE
-     * (paddr, gen, csum) — durable only after commit_finalize in Phase 3
-     * (the engine's durable root still names the previous tree until
-     * then). The prospective triple feeds compute_merkle_root +
-     * build_uberblock exactly as the old single-shot out-params did.
-     *
-     * From here until the finalize the engine holds a pending-commit
-     * window: EVERY error `return` between this flush and the finalize
-     * MUST stm_inode_index_commit_abort first (9.6-impl-4b design §5.3).
-     * The abort discards the flush, deferred-frees the freshly-written
-     * paddrs, drops the in-memory tree, and reverts to the previous
-     * durable root — the in-process realisation of a crash between the
-     * flush and the final uberblock write. A failed commit_flush itself
-     * opens NO window (it self-reverts), so the abort is paired only
-     * with a SUCCESSFUL flush — the flush's own failure return below
-     * needs no abort. */
+    /* 9.7-impl-1c-ii: inode tree's per-pool engine is RETIRED. Per-
+     * dataset inode records flush as part of the M-engine cascade
+     * (commit_engines_flush) that ran BEFORE dataset_index_commit
+     * above. The inode_csum slot in the pool Merkle root is zero
+     * bytes at v30 (transitively covered by main_csum). UB
+     * ub_inode_root/_csum/_gen are stamped zero. Full UB field
+     * retirement to reserved-on-the-wire lands at 1c-vi. */
     uint64_t inode_paddr = 0;
     uint8_t  inode_csum[32] = {0};
     uint64_t inode_gen = 0;
-    stm_status ics = stm_inode_index_commit_flush(s->inode_idx, target_gen,
-                                                    &inode_paddr, &inode_gen,
-                                                    inode_csum);
-    if (ics != STM_OK) {
-        /* inode flush self-reverts; only extent has a pending window. */
-        (void)stm_extent_index_commit_abort(s->extent_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return ics;
-    }
 
     /* P8-POSIX-2 (v25) / 9.6-impl-4c: FLUSH the dirent index. The
      * dirent module is btree_engine-backed (incremental-COW B+tree);
      * commit_flush writes the dirty root-to-leaf paths to fresh
      * paddrs at target_gen and returns the PROSPECTIVE (paddr, gen,
      * csum) — durable only after commit_finalize in Phase 3. Same
-     * shape as the inode flush above. From here every error `return`
-     * MUST abort BOTH inode AND dirent (the dirent flush opened its
+     * shape as the extent flush above. From here every error `return`
+     * MUST abort BOTH extent AND dirent (the dirent flush opened its
      * OWN pending window now). */
     uint64_t dirent_paddr = 0;
     uint8_t  dirent_csum[32] = {0};
@@ -2765,10 +2766,11 @@ stm_status stm_sync_commit(stm_sync *s)
                                                     &dirent_paddr, &dirent_gen,
                                                     dirent_csum);
     if (dcs != STM_OK) {
-        /* dirent flush self-reverts; extent + inode have pending
-         * windows that must be aborted. */
+        /* dirent flush self-reverts; extent has a pending window +
+         * the ds_idx M-cascade has pending engines that must be
+         * aborted. */
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_inode_index_commit_abort(s->inode_idx);
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return dcs;
     }
@@ -2782,11 +2784,12 @@ stm_status stm_sync_commit(stm_sync *s)
                                                    &xattr_paddr, &xattr_gen,
                                                    xattr_csum);
     if (xcs != STM_OK) {
-        /* xattr flush self-reverts; extent + inode + dirent have
-         * pending windows that must be aborted. */
+        /* xattr flush self-reverts; extent + dirent have pending
+         * windows + the ds_idx M-cascade has pending engines that
+         * must be aborted. */
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return xcs;
     }
@@ -2795,9 +2798,9 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return sr;
     }
@@ -2809,9 +2812,16 @@ stm_status stm_sync_commit(stm_sync *s)
      * index tree's root csum; `snap_root` is the snapshot index
      * tree's; `extent_root` is the extent index tree's; `repair_log`
      * is the audit-trail tree's (P7-15 v16); `cas` is the CAS-tier
-     * index tree's (P7-CAS v18); `inode` is the per-pool inode tree's
-     * (P8-POSIX-1b v24). Each feeds in directly. R8-P1-1: refuse to
-     * commit on BLAKE3 OOM. */
+     * index tree's (P7-CAS v18). R8-P1-1: refuse to commit on BLAKE3
+     * OOM.
+     *
+     * 9.7-impl-1c-ii: `inode_csum` is now ZERO bytes — the per-pool
+     * inode engine is retired; per-dataset inode records are
+     * transitively covered by `main_csum` (the dataset_index tree's
+     * root csum, which serializes each slot's per-dataset triple).
+     * The slot stays in the compute_merkle_root signature for now;
+     * full retirement of inode_csum + ub_inode_root/_csum/_gen lands
+     * at 1c-vi. inode_csum is zero by initialiser. */
     uint8_t new_merkle_root[32];
     stm_status ms = compute_merkle_root(main_csum,   /* main */
                                           roots_csum,
@@ -2820,16 +2830,16 @@ stm_status stm_sync_commit(stm_sync *s)
                                           ks_root_csum,
                                           extent_csum,
                                           repair_log_csum,
-                                          inode_csum,    /* P8-POSIX-1b */
+                                          inode_csum,    /* zero @ 1c-ii */
                                           dirent_csum,   /* P8-POSIX-2 */
                                           xattr_csum,    /* P8-POSIX-6 */
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return ms;
     }
@@ -2866,18 +2876,18 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_bootstrap *boot = stm_alloc_bootstrap(s->alloc);
     if (!boot) {
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
     stm_status bcs = stm_bootstrap_commit(boot, target_gen);
     if (bcs != STM_OK) {
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return bcs;
     }
@@ -2913,20 +2923,20 @@ stm_status stm_sync_commit(stm_sync *s)
                                                 fin_label, fin_slot);
     if (fw != STM_OK) {
         (void)stm_extent_index_commit_abort(s->extent_idx);
-        (void)stm_inode_index_commit_abort(s->inode_idx);
         (void)stm_dirent_index_commit_abort(s->dirent_idx);
         (void)stm_xattr_index_commit_abort(s->xattr_idx);
+        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return fw;
     }
 
-    /* 9.6-impl-4b-iii / 9.6-impl-4c: the final uberblock landed —
-     * THIS is the commit point. Adopt each engine's flushed root as
-     * its durable root and deferred-free the superseded paddrs
-     * (commit_finalize). After a successful commit_flush, finalize is
-     * INFALLIBLE per the engine header contract — the lone failure
-     * exit is STM_EINVAL for no-pending-flush, unreachable here; the
-     * check is defense-in-depth.
+    /* 9.6-impl-4b-iii / 9.6-impl-4c / 9.7-impl-1c-ii: the final
+     * uberblock landed — THIS is the commit point. Adopt each engine's
+     * flushed root as its durable root and deferred-free the
+     * superseded paddrs (commit_finalize). After a successful
+     * commit_flush, finalize is INFALLIBLE per the engine header
+     * contract — the lone failure exit is STM_EINVAL for
+     * no-pending-flush, unreachable here; the check is defense-in-depth.
      *
      * This is POST-commit-point, so there is NO abort on failure: the
      * new uberblock is already durable; an abort would revert the
@@ -2938,22 +2948,13 @@ stm_status stm_sync_commit(stm_sync *s)
      * in this same window behaves identically (4b design §5.4 case
      * c): new trees intact, superseded nodes merely leaked.
      *
-     * If one finalize succeeds and another fails (a caller-sequencing
-     * bug — the only failure path), the indices end up partially
-     * advanced. The just-written UB names the new roots of all three;
-     * the failed finalize leaves its engine's durable root still
-     * pointing at the previous tree (the engine's get_root has no
-     * way to know about the new UB). A subsequent remount opens each
-     * engine at its UB-recorded root → consistency restored. */
+     * 9.7-impl-1c-ii: the per-pool inode finalize is RETIRED; the
+     * per-dataset inode records' finalize lives in the M-cascade
+     * commit_engines_finalize below (every PRESENT dataset's engine). */
     stm_status efs = stm_extent_index_commit_finalize(s->extent_idx);
     if (efs != STM_OK) {
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return efs;
-    }
-    stm_status ifs = stm_inode_index_commit_finalize(s->inode_idx);
-    if (ifs != STM_OK) {
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return ifs;
     }
     stm_status dfs = stm_dirent_index_commit_finalize(s->dirent_idx);
     if (dfs != STM_OK) {
@@ -2964,6 +2965,16 @@ stm_status stm_sync_commit(stm_sync *s)
     if (xfs != STM_OK) {
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return xfs;
+    }
+    /* 9.7-impl-1c-ii: finalize every previously-flushed per-dataset
+     * engine. After the M-cascade flush ran cleanly (above) the
+     * pending engines now adopt their freshly-stamped triples as
+     * durable. Same POST-UB posture as the other finalizes — failure
+     * wedges the fs. */
+    stm_status mfs = stm_dataset_index_commit_engines_finalize(s->dataset_idx);
+    if (mfs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return mfs;
     }
 
     /* Publish: advance in-RAM state. auth_gen = target, current_gen =

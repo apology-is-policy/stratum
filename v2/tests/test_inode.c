@@ -1,27 +1,27 @@
 /* SPDX-License-Identifier: ISC */
 /*
  * Tests for the inode allocator + value store (P8-POSIX-1 +
- * P8-POSIX-1b + 9.6-impl-4b-ii).
+ * P8-POSIX-1b + 9.6-impl-4b-ii + 9.7-impl-1c-ii).
  *
  * Spec: v2/specs/inode.tla.
  *
- * 9.6-impl-4b-ii note: the inode module is now btree_engine-backed —
- * the engine IS the store. Every op (alloc / free / lookup / set /
- * link / unlink / materialize / count / pin) needs an engine, and the
- * engine needs a bound bdev + bootstrap. `inode_test_idx` is the
- * fixture: it builds the storage + a fully-bound index. The
- * arg-validation tests (which refuse before the engine is reached) and
- * the explicit-storage persistence tests keep a bare
- * stm_inode_index_create().
+ * 9.7-impl-1c-ii: the inode module no longer owns its own engine —
+ * records live in each dataset's per-dataset btree_engine, resolved
+ * via an attached `stm_dataset_index`. The fixture builds bdev +
+ * boot + ds_idx + creates a roster of test datasets, then attaches
+ * the inode index. Tests that exercise dataset_ids 1..16 just work
+ * (the fixture pre-creates them). Persistence-specific tests from
+ * P8-POSIX-1b + 9.6-impl-4b-ii are dropped — that persistence layer
+ * is now in the dataset_index + per-dataset engines.
  *
  * Coverage:
- *   - Lifecycle: create / close / null-tolerance.
+ *   - Lifecycle: create / close / null-tolerance / attach.
  *   - alloc: returns ino=1 first; monotonic; per-dataset isolation;
  *     AllocReused with gen bump.
  *   - free: flips FREED; subsequent lookup returns ENOENT.
  *   - lookup / set / count_for_ds / next_ino.
- *   - persistence roundtrip across a commit + remount.
  *   - per-inode locks (pin / unpin / pin_two / pin_many).
+ *   - per-dataset engine routing (D1 invariant from inode side).
  */
 
 #include "tharness.h"
@@ -29,6 +29,7 @@
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
 #include <stratum/crypto.h>
+#include <stratum/dataset.h>
 #include <stratum/inode.h>
 #include <stratum/types.h>
 
@@ -40,16 +41,19 @@
 /* ------------------------------------------------------------------ */
 /* Storage fixture.                                                    */
 /*                                                                      */
-/* 9.6-impl-4b-ii: the inode module is btree_engine-backed, so every    */
-/* op needs a bound bdev + bootstrap. inode_test_idx builds them + a    */
-/* fully-bound index; inode_test_idx_close tears it all down. The       */
-/* harness runs tests sequentially in one process, so a single static  */
-/* fixture slot (g_fx_*) is safe — the same posture the persistence    */
-/* tests' static inp_tmp_path already relies on.                       */
+/* 9.7-impl-1c-ii: the fixture now stands up bdev + boot + ds_idx +    */
+/* creates a roster of test datasets (id 2..16 — id 1 is the auto-     */
+/* created root), then attaches the inode index. Tests can use any     */
+/* dataset_id in [1..16] directly. Tests that intentionally use a      */
+/* non-present dataset id (e.g., 9999) expect STM_ENOENT. The harness  */
+/* runs tests sequentially in one process, so static fixture slots     */
+/* (g_fx_*) are safe — the same posture the prior persistence tests'   */
+/* static inp_tmp_path already relied on.                              */
 /* ------------------------------------------------------------------ */
 
 #define INP_DEVICE_BYTES     (UINT64_C(8)  * 1024u * 1024u)
 #define INP_BOOTSTRAP_BYTES  (UINT64_C(2)  * 1024u * 1024u)
+#define INP_DS_ROSTER_MAX    16u
 
 static const uint64_t INP_POOL_UUID[2]   = { 0xAA00, 0xBB00 };
 static const uint64_t INP_DEVICE_UUID[2] = { 0xCC00, 0xDD00 };
@@ -72,38 +76,56 @@ static void inp_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
                                          INP_BOOTSTRAP_BYTES, out_b));
 }
 
-static void inp_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
-    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
-    STM_ASSERT_OK(stm_bdev_open(inp_tmp_path, &bo, out_d));
-    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
-}
-
 /* Single static fixture slot — see the comment block above. */
-static stm_bdev      *g_fx_bdev;
-static stm_bootstrap *g_fx_boot;
+static stm_bdev          *g_fx_bdev;
+static stm_bootstrap     *g_fx_boot;
+static stm_dataset_index *g_fx_ds_idx;
 
-/* Build a fresh storage-backed, fully-bound inode index. The engine is
- * stood up by the second binder (set_crypt_ctx here), so the returned
- * index is ready for any op. */
+/* Build a fresh storage-backed, fully-bound inode index. The dataset
+ * index owns the per-dataset engines + the bdev/boot/crypt context;
+ * the inode index borrows the dataset index via attach. A roster of
+ * datasets (ids 2..STM_INP_DS_ROSTER_MAX) is pre-created so every
+ * test's chosen dataset_id is PRESENT. */
 static stm_inode_index *inode_test_idx(void) {
     inp_make_tmp("fx");
     inp_open_fresh(&g_fx_bdev, &g_fx_boot);
+
+    STM_ASSERT_OK(stm_dataset_index_create(/*current_txg=*/0, &g_fx_ds_idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(g_fx_ds_idx,
+                                                  g_fx_bdev, g_fx_boot));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(g_fx_ds_idx, INP_KEY,
+                                                    INP_POOL_UUID,
+                                                    INP_DEVICE_UUID));
+
+    /* Pre-create datasets id 2..INP_DS_ROSTER_MAX as siblings of root.
+     * Each stm_dataset_create_child returns a monotonic id; we discard
+     * the returned id and rely on the monotonic assignment (root=1,
+     * first child=2, second child=3, ...). */
+    char name_buf[8];
+    for (uint64_t i = 2u; i <= INP_DS_ROSTER_MAX; i++) {
+        uint64_t out_id = 0;
+        snprintf(name_buf, sizeof name_buf, "ds%llu", (unsigned long long)i);
+        STM_ASSERT_OK(stm_dataset_create_child(g_fx_ds_idx,
+                                                 STM_DATASET_ROOT_ID,
+                                                 name_buf, &out_id));
+        STM_ASSERT_EQ(out_id, i);
+    }
+
     stm_inode_index *idx = stm_inode_index_create();
     STM_ASSERT_TRUE(idx != NULL);
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx, g_fx_bdev, g_fx_boot));
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
-                                                INP_POOL_UUID,
-                                                INP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_inode_index_attach_dataset_index(idx, g_fx_ds_idx));
     return idx;
 }
 
 static void inode_test_idx_close(stm_inode_index *idx) {
-    stm_inode_index_close(idx);     /* before bootstrap — the engine
-                                     * deferred-frees through it */
+    stm_inode_index_close(idx);     /* before ds_idx — the inode index
+                                     * borrows the dataset index */
+    stm_dataset_index_close(g_fx_ds_idx);
     stm_bootstrap_close(g_fx_boot);
     stm_bdev_close(g_fx_bdev);
-    g_fx_boot = NULL;
-    g_fx_bdev = NULL;
+    g_fx_ds_idx = NULL;
+    g_fx_boot   = NULL;
+    g_fx_bdev   = NULL;
     unlink(inp_tmp_path);
 }
 
@@ -724,422 +746,6 @@ STM_TEST(inode_struct_size_is_256_bytes) {
      * assertion is ever weakened. */
     STM_ASSERT_EQ(sizeof(struct stm_inode_value), (size_t)256);
     STM_ASSERT_EQ(sizeof(struct stm_inode_value), (size_t)STM_INODE_SIZE_BYTES);
-}
-
-/* ------------------------------------------------------------------ */
-/* P8-POSIX-1b: persistence roundtrip tests.                           */
-/* ------------------------------------------------------------------ */
-
-STM_TEST(inode_persist_commit_load_roundtrip) {
-    inp_make_tmp("rt");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    inp_open_fresh(&d, &b);
-
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx != NULL);
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
-                                                   INP_POOL_UUID,
-                                                   INP_DEVICE_UUID));
-
-    /* Allocate three inodes across two datasets, free the middle one
-     * in dataset 1. The roundtrip should preserve ALLOCATED records,
-     * the FREED record (carrying its gen for future reuse), and the
-     * per-dataset next_ino high-water marks. */
-    uint64_t a1 = 0, a2 = 0, a3 = 0, b1 = 0, b2 = 0;
-    STM_ASSERT_OK(stm_inode_alloc(idx, /*ds=*/1, 0100644, 1000, 1000, &a1));
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 1000, 1000, &a2));
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 1000, 1000, &a3));
-    STM_ASSERT_OK(stm_inode_alloc(idx, /*ds=*/2, 0100644, 2000, 2000, &b1));
-    STM_ASSERT_OK(stm_inode_alloc(idx, 2, 0100644, 2000, 2000, &b2));
-    STM_ASSERT_OK(stm_inode_free(idx, 1, a2));
-
-    uint64_t paddr = 0; uint8_t cs[32];
-    STM_ASSERT_OK(stm_inode_index_commit(idx, /*committed_gen=*/1u, &paddr, cs));
-    STM_ASSERT(paddr != 0);
-
-    /* The btree_engine commit keeps the root at its actual write gen;
-     * fetch the authoritative gen for the reopen. */
-    uint64_t root_gen = 0;
-    STM_ASSERT_OK(stm_inode_index_get_gen(idx, &root_gen));
-
-    stm_inode_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-
-    /* Remount + load. */
-    inp_reopen(&d, &b);
-    stm_inode_index *idx2 = stm_inode_index_create();
-    STM_ASSERT_TRUE(idx2 != NULL);
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx2, d, b));
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx2, INP_KEY,
-                                                    INP_POOL_UUID,
-                                                    INP_DEVICE_UUID));
-    STM_ASSERT_OK(stm_inode_index_load_at(idx2, paddr, root_gen, cs));
-
-    /* ALLOCATED counts per dataset survive: 2 in ds=1 (a1, a3 — a2 freed),
-     * 2 in ds=2 (b1, b2). */
-    size_t n = 0;
-    STM_ASSERT_OK(stm_inode_count_for_ds(idx2, 1, &n));
-    STM_ASSERT_EQ(n, (size_t)2);
-    STM_ASSERT_OK(stm_inode_count_for_ds(idx2, 2, &n));
-    STM_ASSERT_EQ(n, (size_t)2);
-
-    /* Lookups: a1 + a3 still ALLOCATED (gen=0). a2 returns ENOENT. */
-    struct stm_inode_value v = {0};
-    STM_ASSERT_OK(stm_inode_lookup(idx2, 1, a1, &v));
-    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)0);
-    STM_ASSERT_EQ(stm_load_le32(v.si_uid), (uint32_t)1000);
-
-    STM_ASSERT_OK(stm_inode_lookup(idx2, 1, a3, &v));
-    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)0);
-
-    STM_ASSERT_ERR(stm_inode_lookup(idx2, 1, a2, &v), STM_ENOENT);
-
-    /* next_ino reconstructed: ds=1 highest seen is a3=3, so next=4. */
-    uint64_t next = 0;
-    STM_ASSERT_OK(stm_inode_next_ino(idx2, 1, &next));
-    STM_ASSERT_EQ(next, (uint64_t)4);
-    STM_ASSERT_OK(stm_inode_next_ino(idx2, 2, &next));
-    STM_ASSERT_EQ(next, (uint64_t)3);
-
-    /* The FREED record (a2) is reused on next alloc with bumped gen. */
-    uint64_t reused = 0;
-    STM_ASSERT_OK(stm_inode_alloc(idx2, 1, 0100644, 1000, 1000, &reused));
-    STM_ASSERT_EQ(reused, a2);
-    STM_ASSERT_OK(stm_inode_lookup(idx2, 1, reused, &v));
-    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)1);
-
-    stm_inode_index_close(idx2);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(inp_tmp_path);
-}
-
-/* P8-POSIX-1b: gen survives across mount cycles. AllocReused after
- * remount continues to bump gen monotonically — the (ino, gen)
- * tuple-uniqueness invariant from inode.tla extends across the
- * persistence boundary. */
-STM_TEST(inode_persist_gen_monotonic_across_mount) {
-    inp_make_tmp("genmon");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    inp_open_fresh(&d, &b);
-
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
-                                                   INP_POOL_UUID,
-                                                   INP_DEVICE_UUID));
-
-    uint64_t ino = 0;
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
-    /* Two free+alloc cycles before persist: gen 0 → 1 → 2. */
-    STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
-    uint64_t reused = 0;
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &reused));
-    STM_ASSERT_EQ(reused, ino);
-    STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &reused));
-
-    struct stm_inode_value v = {0};
-    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
-    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)2);
-
-    /* Free + commit + remount. */
-    STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
-
-    uint64_t paddr = 0; uint8_t cs[32];
-    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &paddr, cs));
-    uint64_t root_gen = 0;
-    STM_ASSERT_OK(stm_inode_index_get_gen(idx, &root_gen));
-
-    stm_inode_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-
-    inp_reopen(&d, &b);
-    stm_inode_index *idx2 = stm_inode_index_create();
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx2, d, b));
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx2, INP_KEY,
-                                                    INP_POOL_UUID,
-                                                    INP_DEVICE_UUID));
-    STM_ASSERT_OK(stm_inode_index_load_at(idx2, paddr, root_gen, cs));
-
-    /* Reuse the persisted FREED slot — gen bumps from 2 to 3. */
-    STM_ASSERT_OK(stm_inode_alloc(idx2, 1, 0100644, 0, 0, &reused));
-    STM_ASSERT_EQ(reused, ino);
-    STM_ASSERT_OK(stm_inode_lookup(idx2, 1, ino, &v));
-    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)3);
-
-    stm_inode_index_close(idx2);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(inp_tmp_path);
-}
-
-/* P8-POSIX-1b: commit-without-storage is refused. */
-STM_TEST(inode_persist_commit_requires_storage_and_crypt) {
-    stm_inode_index *idx = stm_inode_index_create();
-    uint64_t paddr = 0; uint8_t cs[32];
-    STM_ASSERT_ERR(stm_inode_index_commit(idx, 1u, &paddr, cs), STM_EINVAL);
-    stm_inode_index_close(idx);
-}
-
-/* 9.6-impl-4b-ii: a clean tree's commit at a HIGHER gen is a no-op
- * that returns the unchanged root. (The btree_engine refuses a
- * non-monotonic commit gen, so the prior P8-POSIX-1b same-gen
- * idempotency is gone — the engine's clean-commit is the no-op now.) */
-STM_TEST(inode_persist_idempotent_commit_when_clean) {
-    inp_make_tmp("idem");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    inp_open_fresh(&d, &b);
-
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
-                                                   INP_POOL_UUID,
-                                                   INP_DEVICE_UUID));
-
-    uint64_t ino = 0;
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
-
-    uint64_t p1 = 0, p2 = 0; uint8_t c1[32], c2[32];
-    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p1, c1));
-    /* Nothing changed since the gen-1 commit; the gen-2 commit is a
-     * clean no-op returning the same root paddr + csum. */
-    STM_ASSERT_OK(stm_inode_index_commit(idx, 2u, &p2, c2));
-    STM_ASSERT_EQ(p1, p2);
-    STM_ASSERT_MEM_EQ(c1, c2, 32);
-
-    stm_inode_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(inp_tmp_path);
-}
-
-/* R70 P3-6: stm_inode_index_set_storage refuses re-binding. */
-STM_TEST(inode_p3_6_set_storage_refuses_rebind) {
-    inp_make_tmp("p3_6_st");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    inp_open_fresh(&d, &b);
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
-    STM_ASSERT_ERR(stm_inode_index_set_storage(idx, d, b), STM_EINVAL);
-    stm_inode_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(inp_tmp_path);
-}
-
-/* R70 P3-6: stm_inode_index_set_crypt_ctx refuses re-binding. */
-STM_TEST(inode_p3_6_set_crypt_ctx_refuses_rebind) {
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
-                                                   INP_POOL_UUID,
-                                                   INP_DEVICE_UUID));
-    STM_ASSERT_ERR(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
-                                                    INP_POOL_UUID,
-                                                    INP_DEVICE_UUID),
-                   STM_EINVAL);
-    stm_inode_index_close(idx);
-}
-
-/* R70 P3-4: a no-op stm_inode_set (writing the same value back) does
- * NOT re-dirty the tree — a clean commit at a higher gen returns the
- * same root paddr/csum as the prior commit. Catches a regression
- * where Set unconditionally re-COWs a root-to-leaf path on every
- * clean-mount + identity-write workload. */
-STM_TEST(inode_p3_4_set_no_op_doesnt_redirty) {
-    inp_make_tmp("p3_4");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    inp_open_fresh(&d, &b);
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
-                                                   INP_POOL_UUID,
-                                                   INP_DEVICE_UUID));
-
-    uint64_t ino = 0;
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
-
-    uint64_t p1 = 0; uint8_t c1[32];
-    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p1, c1));
-
-    /* Read the freshly-committed value, write it back unchanged. */
-    struct stm_inode_value v = {0};
-    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
-    STM_ASSERT_OK(stm_inode_set(idx, 1, ino, &v));
-
-    /* The no-op Set left the tree clean — the gen-2 commit returns
-     * the same root. */
-    uint64_t p2 = 0; uint8_t c2[32];
-    STM_ASSERT_OK(stm_inode_index_commit(idx, 2u, &p2, c2));
-    STM_ASSERT_EQ(p1, p2);
-    STM_ASSERT_MEM_EQ(c1, c2, 32);
-
-    stm_inode_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(inp_tmp_path);
-}
-
-/* ------------------------------------------------------------------ */
-/* 9.6-impl-4b-iii: three-phase commit — flush / finalize / abort.      */
-/*                                                                      */
-/* The form stm_sync_commit drives. The monolithic stm_inode_index_     */
-/* commit above stays for the persistence tests + non-sync callers.     */
-/* ------------------------------------------------------------------ */
-
-/* A flush then finalize is a durable commit: get_root / get_gen mirror
- * the flushed triple, and the records survive a remount + load_at. */
-STM_TEST(inode_commit_flush_finalize_roundtrip) {
-    inp_make_tmp("flfin");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    inp_open_fresh(&d, &b);
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
-                                                   INP_POOL_UUID,
-                                                   INP_DEVICE_UUID));
-    uint64_t a1 = 0;
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 7, 7, &a1));
-
-    /* FLUSH writes the dirty nodes + returns the prospective triple;
-     * the durable-root mirror (get_root / get_gen) is NOT updated yet. */
-    uint64_t fp = 0, fg = 0; uint8_t fc[32];
-    STM_ASSERT_OK(stm_inode_index_commit_flush(idx, 1u, &fp, &fg, fc));
-    STM_ASSERT(fp != 0);
-
-    /* FINALIZE adopts it; get_root / get_gen now mirror the flushed
-     * triple exactly. */
-    STM_ASSERT_OK(stm_inode_index_commit_finalize(idx));
-    uint64_t rp = 0, rg = 0; uint8_t rc[32];
-    STM_ASSERT_OK(stm_inode_index_get_root(idx, &rp, rc));
-    STM_ASSERT_OK(stm_inode_index_get_gen(idx, &rg));
-    STM_ASSERT_EQ(rp, fp);
-    STM_ASSERT_EQ(rg, fg);
-    STM_ASSERT_MEM_EQ(rc, fc, 32);
-
-    /* The sync layer makes the bitmap durable between the flush and the
-     * UB write; run that barrier explicitly so the reopen is faithful. */
-    STM_ASSERT_OK(stm_bootstrap_commit(b, 1u));
-
-    stm_inode_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-
-    inp_reopen(&d, &b);
-    stm_inode_index *idx2 = stm_inode_index_create();
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx2, d, b));
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx2, INP_KEY,
-                                                    INP_POOL_UUID,
-                                                    INP_DEVICE_UUID));
-    STM_ASSERT_OK(stm_inode_index_load_at(idx2, fp, fg, fc));
-    struct stm_inode_value v = {0};
-    STM_ASSERT_OK(stm_inode_lookup(idx2, 1, a1, &v));
-    STM_ASSERT_EQ(stm_load_le32(v.si_uid), (uint32_t)7);
-
-    stm_inode_index_close(idx2);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(inp_tmp_path);
-}
-
-/* A flush then abort is a clean revert: the aborted records vanish, the
- * durable root is unchanged, the tree stays committable (crash-equivalent
- * — 9.6-impl-4b design §5.5). */
-STM_TEST(inode_commit_flush_abort_reverts) {
-    inp_make_tmp("flab");
-    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
-    inp_open_fresh(&d, &b);
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
-    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
-                                                   INP_POOL_UUID,
-                                                   INP_DEVICE_UUID));
-    /* Durable baseline: one inode committed at gen 1. */
-    uint64_t a1 = 0;
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &a1));
-    uint64_t p0 = 0; uint8_t c0[32];
-    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p0, c0));
-
-    /* Allocate a second inode, FLUSH it at gen 2, then ABORT. */
-    uint64_t a2 = 0;
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &a2));
-    uint64_t fp = 0, fg = 0; uint8_t fc[32];
-    STM_ASSERT_OK(stm_inode_index_commit_flush(idx, 2u, &fp, &fg, fc));
-    STM_ASSERT_OK(stm_inode_index_commit_abort(idx));
-
-    /* Abort dropped the in-memory tree → it reloaded the gen-1 durable
-     * root: a1 survives, a2's mutation is gone. */
-    struct stm_inode_value v = {0};
-    STM_ASSERT_OK(stm_inode_lookup(idx, 1, a1, &v));
-    STM_ASSERT_ERR(stm_inode_lookup(idx, 1, a2, &v), STM_ENOENT);
-
-    /* get_root still names the pre-flush durable root. */
-    uint64_t rp = 0; uint8_t rc[32];
-    STM_ASSERT_OK(stm_inode_index_get_root(idx, &rp, rc));
-    STM_ASSERT_EQ(rp, p0);
-    STM_ASSERT_MEM_EQ(rc, c0, 32);
-
-    /* The tree is committable post-abort: a clean commit at gen 3
-     * no-ops back to the gen-1 root. */
-    uint64_t p3 = 0; uint8_t c3[32];
-    STM_ASSERT_OK(stm_inode_index_commit(idx, 3u, &p3, c3));
-    STM_ASSERT_EQ(p3, p0);
-    STM_ASSERT_MEM_EQ(c3, c0, 32);
-
-    stm_inode_index_close(idx);
-    stm_bootstrap_close(b);
-    stm_bdev_close(d);
-    unlink(inp_tmp_path);
-}
-
-/* Between a flush and its finalize the engine holds a pending-commit
- * window — engine-backed inode ops are refused with STM_EBUSY. */
-STM_TEST(inode_commit_flush_pending_window_blocks_ops) {
-    stm_inode_index *idx = inode_test_idx();
-    uint64_t a1 = 0;
-    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &a1));
-
-    uint64_t fp = 0, fg = 0; uint8_t fc[32];
-    STM_ASSERT_OK(stm_inode_index_commit_flush(idx, 1u, &fp, &fg, fc));
-
-    /* Pending window: a lookup is refused until finalize/abort closes it. */
-    struct stm_inode_value v = {0};
-    STM_ASSERT_ERR(stm_inode_lookup(idx, 1, a1, &v), STM_EBUSY);
-
-    /* FINALIZE closes the window; ops resume. */
-    STM_ASSERT_OK(stm_inode_index_commit_finalize(idx));
-    STM_ASSERT_OK(stm_inode_lookup(idx, 1, a1, &v));
-
-    inode_test_idx_close(idx);
-}
-
-/* commit_flush refuses NULL args + an index with storage / crypt unbound
- * (parity with the monolithic stm_inode_index_commit). */
-STM_TEST(inode_commit_flush_arg_validation) {
-    uint64_t fp = 0, fg = 0; uint8_t fc[32];
-    STM_ASSERT_ERR(stm_inode_index_commit_flush(NULL, 1u, &fp, &fg, fc),
-                   STM_EINVAL);
-    stm_inode_index *idx = stm_inode_index_create();
-    STM_ASSERT_ERR(stm_inode_index_commit_flush(idx, 1u, NULL, &fg, fc),
-                   STM_EINVAL);
-    /* storage + crypt unbound → STM_EINVAL. */
-    STM_ASSERT_ERR(stm_inode_index_commit_flush(idx, 1u, &fp, &fg, fc),
-                   STM_EINVAL);
-    STM_ASSERT_ERR(stm_inode_index_commit_finalize(NULL), STM_EINVAL);
-    STM_ASSERT_ERR(stm_inode_index_commit_abort(NULL), STM_EINVAL);
-    stm_inode_index_close(idx);
-}
-
-/* finalize / abort with no flush pending is a caller-sequencing bug —
- * refused with STM_EINVAL, the tree untouched. */
-STM_TEST(inode_commit_finalize_abort_without_flush_refused) {
-    stm_inode_index *idx = inode_test_idx();
-    STM_ASSERT_ERR(stm_inode_index_commit_finalize(idx), STM_EINVAL);
-    STM_ASSERT_ERR(stm_inode_index_commit_abort(idx), STM_EINVAL);
-    inode_test_idx_close(idx);
 }
 
 /* P8-POSIX-3: stm_inode_link / stm_inode_unlink with cascade-free. */
@@ -1766,6 +1372,102 @@ STM_TEST(inode_pin_many_cross_dataset) {
     stm_inode_unpin(idx, outs[1]);
 
     inode_test_idx_close(idx);
+}
+
+/* ------------------------------------------------------------------ */
+/* 9.7-impl-1c-ii: per-dataset engine routing.                          */
+/* ------------------------------------------------------------------ */
+
+/* The D1 invariant from the inode side: allocations on dataset A and
+ * dataset B land in DISTINCT btree_engine handles. Verifies the
+ * cutover wired keys via the per-dataset engine and not via a
+ * pool-global engine that would otherwise alias.
+ *
+ * The test inserts records via stm_inode_alloc (which routes through
+ * the attached ds_idx) for dataset 1 and dataset 2, then verifies the
+ * engine returned by stm_dataset_index_get_engine for each dataset is
+ * a different handle. Cross-dataset lookups via the inode index AT
+ * the SAME ino value succeed independently — each dataset has its own
+ * keyspace under the engine. */
+STM_TEST(inode_routes_via_dataset_engine) {
+    stm_inode_index *idx = inode_test_idx();
+
+    /* Allocate one inode in dataset 1 and one in dataset 2; both
+     * receive ino=1 because next_ino is per-dataset. */
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 100, 100, &a));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 2, 0100644, 200, 200, &b));
+    STM_ASSERT_EQ(a, (uint64_t)1);
+    STM_ASSERT_EQ(b, (uint64_t)1);
+
+    /* Distinct engines per dataset. */
+    stm_btree_engine *eng_a = NULL;
+    stm_btree_engine *eng_b = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(g_fx_ds_idx, 1, &eng_a));
+    STM_ASSERT_OK(stm_dataset_index_get_engine(g_fx_ds_idx, 2, &eng_b));
+    STM_ASSERT_TRUE(eng_a != NULL);
+    STM_ASSERT_TRUE(eng_b != NULL);
+    STM_ASSERT_TRUE(eng_a != eng_b);
+
+    /* Lookups at the same ino across datasets see DIFFERENT values
+     * (uid 100 vs 200) — confirming no key collision across engines. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, a, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_uid), (uint32_t)100);
+    STM_ASSERT_OK(stm_inode_lookup(idx, 2, b, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_uid), (uint32_t)200);
+
+    inode_test_idx_close(idx);
+}
+
+/* Attaching twice is refused — the borrow is one-time. */
+STM_TEST(inode_attach_dataset_index_refuses_rebind) {
+    inp_make_tmp("attach");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    inp_open_fresh(&d, &b);
+
+    stm_dataset_index *ds = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &ds));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(ds, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(ds, INP_KEY,
+                                                    INP_POOL_UUID,
+                                                    INP_DEVICE_UUID));
+
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+    STM_ASSERT_OK(stm_inode_index_attach_dataset_index(idx, ds));
+    STM_ASSERT_ERR(stm_inode_index_attach_dataset_index(idx, ds), STM_EINVAL);
+
+    stm_inode_index_close(idx);
+    stm_dataset_index_close(ds);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(inp_tmp_path);
+}
+
+/* Attach with NULL args refused. */
+STM_TEST(inode_attach_dataset_index_null_args) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_ERR(stm_inode_index_attach_dataset_index(NULL, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_index_attach_dataset_index(idx,  NULL),
+                   STM_EINVAL);
+    /* idx-NULL + ds-non-NULL also refuses; build a throwaway ds to
+     * exercise it without needing storage. */
+    stm_dataset_index *ds = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &ds));
+    STM_ASSERT_ERR(stm_inode_index_attach_dataset_index(NULL, ds),
+                   STM_EINVAL);
+    stm_dataset_index_close(ds);
+    stm_inode_index_close(idx);
+}
+
+/* Op on an inode index with no attach refused. */
+STM_TEST(inode_op_without_attach_refused) {
+    stm_inode_index *idx = stm_inode_index_create();
+    uint64_t ino = 0;
+    STM_ASSERT_ERR(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino), STM_EINVAL);
+    stm_inode_index_close(idx);
 }
 
 STM_TEST_MAIN("test_inode")

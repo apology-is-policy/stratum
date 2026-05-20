@@ -736,6 +736,104 @@ STM_MUST_USE
 stm_status stm_dataset_index_close_engine(stm_dataset_index *idx,
                                              uint64_t dataset_id);
 
+/* ========================================================================= */
+/* 9.7-impl-1c-ii: per-dataset engine M-cascade commit driving APIs.          */
+/*                                                                             */
+/* The sync.c commit cascade now walks every PRESENT dataset with an OPEN     */
+/* engine, three-phase-commits each, and (on a per-engine flush success)      */
+/* updates the slot's (di_tree_root, di_root_gen, di_root_csum) triple to    */
+/* the new prospective values. The dataset_index's own commit (which          */
+/* serializes its slots[] as a btree_store tree) THEN runs and sees the      */
+/* updated triples; main_csum transitively covers every per-dataset engine   */
+/* root. Closed engines cannot be dirty and are skipped.                      */
+/*                                                                             */
+/* The contract carries btree_engine's three-phase shape verbatim:           */
+/*   - flush: each engine writes its dirty root-to-leaf paths to fresh       */
+/*     paddrs at `target_gen`; each slot's pre-flush triple is saved so      */
+/*     abort can restore. On any per-engine flush failure, every previously- */
+/*     flushed engine's abort runs AND its slot's triple is restored.        */
+/*   - finalize: every previously-flushed engine adopts its new triple +     */
+/*     deferred-frees its superseded paddrs. INFALLIBLE per the engine      */
+/*     contract.                                                              */
+/*   - abort: every previously-flushed engine's pending window is discarded  */
+/*     + its slot's triple is restored to the saved pre-flush value.         */
+/*                                                                             */
+/* Ordering in sync.c:                                                       */
+/*   commit_engines_flush                                                    */
+/*   → dataset_index_commit (sees updated triples)                           */
+/*   → … other indices …                                                     */
+/*   → write_uberblock                                                       */
+/*   → commit_engines_finalize                                               */
+/* ========================================================================= */
+
+/*
+ * Three-phase commit driving: FLUSH every PRESENT dataset's open engine.
+ *
+ * For every PRESENT slot whose engine is OPEN (non-NULL handle), calls
+ * the engine's commit_flush at `target_gen` and stamps the prospective
+ * (paddr, gen, csum) into that slot's (di_tree_root, di_root_gen,
+ * di_root_csum) — but the slot also saves the pre-flush triple so abort
+ * can restore it. The index is marked dirty if any triple changed, so
+ * the subsequent stm_dataset_index_commit re-serializes the slots.
+ *
+ * Each successful flush opens a pending-commit window on its engine.
+ * The caller MUST pair this call with EXACTLY ONE of
+ * stm_dataset_index_commit_engines_finalize OR
+ * stm_dataset_index_commit_engines_abort.
+ *
+ * On per-engine flush failure mid-walk: every previously-flushed engine
+ * is aborted + every saved triple is restored. The function returns the
+ * failure status; NO pending window remains. STM_EBUSY indicates a
+ * prior flush is still un-finalized (caller-sequencing bug).
+ *
+ * `target_gen` MUST strictly increase across calls (the engine's
+ * monotonic-gen guard).
+ *
+ * Refusals:
+ *   - NULL idx (STM_EINVAL).
+ *   - storage / crypt ctx unbound (STM_EINVAL).
+ *   - STM_EBUSY if a prior commit_engines_flush has not been
+ *     finalized / aborted yet.
+ *   - Engine errors propagated verbatim.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_commit_engines_flush(stm_dataset_index *idx,
+                                                     uint64_t target_gen);
+
+/*
+ * FINALIZE every previously-flushed engine. After a successful
+ * stm_dataset_index_commit_engines_flush, this is INFALLIBLE per the
+ * engine contract — the per-engine finalize is the lone failure
+ * surface (defense-in-depth) and is unreachable by construction.
+ *
+ * Carries the saved pre-flush triples FORWARD (overwrites them with
+ * the current slot values now they're durable). After return, every
+ * engine holds its new durable root and the saved-triple bookkeeping
+ * is reset so the next flush can capture fresh pre-flush state.
+ *
+ * No-pending is the NORMAL case when no dataset had an open engine
+ * at the paired flush — returns STM_OK as a no-op. The sync layer
+ * pairs every commit_engines_flush with EXACTLY ONE finalize OR abort
+ * regardless of whether any work was done.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_commit_engines_finalize(stm_dataset_index *idx);
+
+/*
+ * ABORT every previously-flushed engine. Each pending engine commits
+ * an abort (deferred-frees the freshly-written paddrs + drops the
+ * in-memory tree) AND its slot's triple is restored to the saved
+ * pre-flush value. The index is marked dirty if any restoration
+ * occurred so the next commit re-serializes the restored triples.
+ *
+ * Returns STM_OK regardless of whether any flushes were pending —
+ * no-pending is the NORMAL case when no dataset had an open engine
+ * at the paired flush. The engine's own abort is infallible after a
+ * successful flush — downstream errors are unreachable.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_commit_engines_abort(stm_dataset_index *idx);
+
 #ifdef __cplusplus
 }
 #endif

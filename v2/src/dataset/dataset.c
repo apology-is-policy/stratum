@@ -100,6 +100,25 @@ typedef struct {
      * each module to consume the per-dataset engine via stm_metakey_*.
      */
     stm_btree_engine *engine;
+
+    /*
+     * 9.7-impl-1c-ii: M-cascade three-phase commit bookkeeping.
+     *
+     * pending_flush is TRUE between a successful per-engine commit_flush
+     * inside stm_dataset_index_commit_engines_flush and the corresponding
+     * commit_engines_finalize / commit_engines_abort. The saved triple
+     * remembers the slot's (di_tree_root, di_root_gen, di_root_csum) as
+     * they were BEFORE the flush overwrote them with the prospective
+     * values, so abort can restore.
+     *
+     * Both fields are guarded by idx->lock. They never refer to a value
+     * that lives beyond the slot's lifetime (the engine handle itself is
+     * borrowed; the triple bytes are owned by this struct).
+     */
+    bool      pending_flush;
+    uint64_t  saved_tree_root;
+    uint64_t  saved_root_gen;
+    uint8_t   saved_root_csum[32];
 } dataset_slot;
 
 struct stm_dataset_index {
@@ -1376,6 +1395,164 @@ stm_status stm_dataset_index_close_engine(stm_dataset_index *idx,
     }
     dataset_engine_close_locked(&idx->slots[s]);
     must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+/* ---- 9.7-impl-1c-ii: M-cascade three-phase commit driving. ---- */
+
+/* Walk every slot and return true iff ANY slot has pending_flush set.
+ * Caller holds idx->lock. */
+static bool any_pending_flush_locked(const stm_dataset_index *idx) {
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        if (idx->slots[i].pending_flush) return true;
+    }
+    return false;
+}
+
+stm_status stm_dataset_index_commit_engines_flush(stm_dataset_index *idx,
+                                                     uint64_t target_gen) {
+    if (!idx) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    /* A prior un-finalized / un-aborted flush is a caller-sequencing
+     * bug — refuse rather than open a second pending window. */
+    if (any_pending_flush_locked(idx)) {
+        must_unlock(&idx->lock);
+        return STM_EBUSY;
+    }
+
+    /* Walk PRESENT slots whose engine is OPEN. Closed engines cannot
+     * be dirty (the engine handle would have to exist to accumulate
+     * dirt) so skipping them is sound.
+     *
+     * On per-engine flush failure mid-walk, abort every previously-
+     * flushed engine + restore each slot's saved pre-flush triple. */
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        dataset_slot *slot = &idx->slots[i];
+        if (!slot->present) continue;
+        if (slot->engine == NULL) continue;
+
+        /* Save the pre-flush triple BEFORE issuing the engine flush
+         * so abort can restore it. The slot's current (di_tree_root,
+         * di_root_gen, di_root_csum) is the previous durable triple. */
+        slot->saved_tree_root = slot->e.di_tree_root;
+        slot->saved_root_gen  = slot->e.di_root_gen;
+        memcpy(slot->saved_root_csum, slot->e.di_root_csum, 32);
+
+        uint64_t new_paddr = 0;
+        uint64_t new_gen   = 0;
+        uint8_t  new_csum[32];
+        stm_status fs = stm_btree_engine_commit_flush(slot->engine,
+                                                       target_gen,
+                                                       &new_paddr, &new_gen,
+                                                       new_csum);
+        if (fs != STM_OK) {
+            /* A failed commit_flush self-reverts: no pending window
+             * opened on THIS engine. Roll back every previously-
+             * flushed engine + restore each saved triple. The saved
+             * triple on THIS slot wasn't touched (we just wrote it
+             * but never overwrote slot->e.*), so just leave it. */
+            for (size_t j = 0; j < i; j++) {
+                dataset_slot *prior = &idx->slots[j];
+                if (!prior->pending_flush) continue;
+                (void)stm_btree_engine_commit_abort(prior->engine);
+                /* Restore the saved triple. */
+                prior->e.di_tree_root = prior->saved_tree_root;
+                prior->e.di_root_gen  = prior->saved_root_gen;
+                memcpy(prior->e.di_root_csum, prior->saved_root_csum, 32);
+                prior->pending_flush  = false;
+            }
+            /* If any restore happened, the in-RAM slots[] diverged
+             * from the durable index — re-mark dirty so the next
+             * stm_dataset_index_commit re-serializes. */
+            idx->dirty = true;
+            must_unlock(&idx->lock);
+            return fs;
+        }
+
+        /* Stamp the prospective triple into the slot. The slot is now
+         * pending — abort can restore via saved_*. */
+        slot->e.di_tree_root = new_paddr;
+        slot->e.di_root_gen  = new_gen;
+        memcpy(slot->e.di_root_csum, new_csum, 32);
+        slot->pending_flush  = true;
+        /* Any change to a slot's triple means the index's serialized
+         * form has changed — mark dirty so stm_dataset_index_commit
+         * re-serializes (the idempotent-when-clean fast path would
+         * otherwise return the prior root). */
+        idx->dirty = true;
+    }
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_index_commit_engines_finalize(stm_dataset_index *idx) {
+    if (!idx) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    /* Walk pending engines + finalize each. Per the btree_engine
+     * contract a finalize after a successful flush is INFALLIBLE — the
+     * lone failure exit is STM_EINVAL (no pending flush). We surface
+     * any such failure but it's unreachable by construction. The
+     * triples currently in slot->e.* are now durable; saved_* is
+     * cleared as bookkeeping. No-pending is the NORMAL case when no
+     * dataset had an open engine at the paired flush — return STM_OK. */
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        dataset_slot *slot = &idx->slots[i];
+        if (!slot->pending_flush) continue;
+        stm_status fs = stm_btree_engine_commit_finalize(slot->engine);
+        if (fs != STM_OK) {
+            /* Unreachable per contract — defense-in-depth surface. The
+             * caller wedges (R154 Q2 doctrine); the slot's pending_flush
+             * stays set so the in-memory state advertises the
+             * inconsistency for the wedge'd remount. */
+            must_unlock(&idx->lock);
+            return fs;
+        }
+        slot->saved_tree_root = 0;
+        slot->saved_root_gen  = 0;
+        memset(slot->saved_root_csum, 0, 32);
+        slot->pending_flush   = false;
+    }
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_index_commit_engines_abort(stm_dataset_index *idx) {
+    if (!idx) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    bool restored_any = false;
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        dataset_slot *slot = &idx->slots[i];
+        if (!slot->pending_flush) continue;
+        /* Discard the pending root + restore the saved triple. abort
+         * is infallible after a successful flush per the engine
+         * contract; downstream errors are unreachable. */
+        (void)stm_btree_engine_commit_abort(slot->engine);
+        slot->e.di_tree_root = slot->saved_tree_root;
+        slot->e.di_root_gen  = slot->saved_root_gen;
+        memcpy(slot->e.di_root_csum, slot->saved_root_csum, 32);
+        slot->saved_tree_root = 0;
+        slot->saved_root_gen  = 0;
+        memset(slot->saved_root_csum, 0, 32);
+        slot->pending_flush   = false;
+        restored_any = true;
+    }
+    /* If any restore happened, the in-RAM slots[] diverged from the
+     * durable index — re-mark dirty so the next dataset_index_commit
+     * re-serializes the restored triples. */
+    if (restored_any) idx->dirty = true;
+
+    must_unlock(&idx->lock);
+    /* No-pending is the NORMAL case when no dataset had an open engine
+     * at the paired flush — return STM_OK rather than EINVAL. */
     return STM_OK;
 }
 
