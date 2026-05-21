@@ -46,7 +46,9 @@ static stm_status snap_delete_simple(stm_snapshot_index *idx, uint64_t id) {
     uint8_t  *cold_hashes = NULL;
     size_t    cold_n      = 0;
     stm_status rs = stm_snapshot_delete(idx, id, &freed, &n,
-                                          &cold_hashes, &cold_n);
+                                          &cold_hashes, &cold_n,
+                                          /*out_boot_paddrs=*/NULL,
+                                          /*out_boot_count=*/NULL);
     free(freed);
     free(cold_hashes);
     return rs;
@@ -1648,36 +1650,25 @@ STM_TEST(sync_clone_state_survives_mount) {
     unlink(g_tmp_path);
 }
 
-STM_TEST(sync_impl2_substrate_snap_idx_wired_at_mount) {
-    /* 9.7-impl-2 substrate: stm_dataset_index_set_snap_idx is invoked
-     * at mount time, before any per-dataset engine opens. The
-     * substrate has no behavioural effect yet (engine_store_free is
-     * still bootstrap_free) — this test pins that the substrate
-     * doesn't regress the pre-impl-2 paths (multi-commit + snap
-     * create/delete still work) and that snap_create proceeds
-     * normally with the snap_idx attached to dataset_idx.
+STM_TEST(sync_impl2_routing_engine_nodes_route_to_bootstrap_dead_list) {
+    /* 9.7-impl-2-routing: engine_store_free routes superseded engine
+     * NODE paddrs through stm_snapshot_index_overwrite_bootstrap_block
+     * (option (b) — separate per-allocator-class dead-list). Verified
+     * by churning inode allocs across a snap-create boundary and
+     * asserting the snap's bootstrap_dead_list grows.
      *
-     * The actual snap-aware vt->free routing for engine NODE paddrs
-     * needs an allocator-class-aware dead-list mechanism (impl-2-
-     * routing, deferred); engine NODE paddrs are bootstrap-managed,
-     * but the existing dead-list reclaim in stm_fs_delete_snapshot
-     * routes through stm_alloc_free — bootstrap-vs-stm_alloc mismatch.
-     */
-    make_tmp("impl2_substrate");
+     * dead_list.tla::OverwriteBlock spec mapping: same semantics with
+     * allocator class as a side parameter. */
+    make_tmp("impl2_routing");
     stm_bdev *d = open_fresh_device();
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
     make_fresh_pool(d, &a, &s, &pool);
 
     stm_inode_index *iidx = stm_sync_inode_index(s);
     stm_snapshot_index *si = stm_sync_snapshot_index(s);
-    STM_ASSERT_TRUE(iidx != NULL);
-    STM_ASSERT_TRUE(si != NULL);
 
-    /* Multi-commit churn with snap in the middle exercises both the
-     * snap-attached and snap-detached paths through engine_store_free.
-     * Pre-snap commit, snap create, post-snap commits — all must
-     * succeed under the substrate (which is dead code; bootstrap_free
-     * runs unconditionally). */
+    /* Pre-snap: populate the inode engine so it has a non-trivial
+     * root + leaves. */
     for (int i = 0; i < 3; i++) {
         uint64_t ino = 0;
         STM_ASSERT_OK(stm_inode_alloc(iidx, STM_DATASET_ROOT_ID,
@@ -1686,19 +1677,34 @@ STM_TEST(sync_impl2_substrate_snap_idx_wired_at_mount) {
     }
     STM_ASSERT_OK(stm_sync_commit(s));
 
+    /* Snap captures the post-commit engine state. */
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(si, STM_DATASET_ROOT_ID,
-                                        "substrate_snap", 0xa1,
+                                        "routing_snap", 0xa1,
                                         stm_sync_current_gen(s), &snap_id));
     STM_ASSERT_OK(stm_sync_commit(s));
 
+    /* Pre-COW: bootstrap-tier dead-list is empty. */
+    size_t bdl0 = 0;
+    STM_ASSERT_OK(stm_snapshot_bootstrap_dead_list_count(si, snap_id, &bdl0));
+    STM_ASSERT_EQ(bdl0, (size_t)0);
+
+    /* Mutate the engine: more inode allocs force the engine to COW its
+     * leaf (and possibly the root). The superseded NODE paddrs are
+     * bootstrap-allocated (16 KiB units); engine_store_free routes them
+     * through stm_snapshot_index_overwrite_bootstrap_block. */
     for (int i = 0; i < 3; i++) {
         uint64_t ino = 0;
         STM_ASSERT_OK(stm_inode_alloc(iidx, STM_DATASET_ROOT_ID,
                                          0100644, (uint32_t)(2000 + i),
                                          (uint32_t)(2000 + i), &ino));
-        STM_ASSERT_OK(stm_sync_commit(s));
     }
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Post-COW: snap's bootstrap_dead_list has at least one entry. */
+    size_t bdl1 = 0;
+    STM_ASSERT_OK(stm_snapshot_bootstrap_dead_list_count(si, snap_id, &bdl1));
+    STM_ASSERT_TRUE(bdl1 > bdl0);
 
     teardown(a, s, pool);
     stm_bdev_close(d);

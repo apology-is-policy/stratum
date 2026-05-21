@@ -668,12 +668,12 @@ STM_TEST(xattr_op_without_attach_refused) {
 /* Compile-time invariants.                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(xattr_ub_version_is_v30) {
-    /* 9.7-impl-1b bumps STM_UB_VERSION 29 → 30 for the per-dataset
-     * metadata-tree substrate. The xattr layer's on-disk value format
-     * is unchanged since v26 but the key shape moved to a per-dataset
-     * engine (1c-iv); the version constant rides the latest UB. */
-    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)30u);
+STM_TEST(xattr_ub_version_is_v31) {
+    /* 9.7-impl-2-routing bumps STM_UB_VERSION 30 → 31 for the new
+     * snap-record bootstrap-tier dead-list tail. The xattr layer's
+     * on-disk value format is unchanged since v26 but rides the
+     * latest version constant. */
+    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)31u);
 }
 
 /* ------------------------------------------------------------------ */

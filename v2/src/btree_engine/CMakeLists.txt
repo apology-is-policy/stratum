@@ -24,4 +24,4 @@ target_include_directories(stm_engine_store PUBLIC
 
 target_link_libraries(stm_engine_store
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  stm_btree_store stm_bootstrap stm_block)
+    PUBLIC  stm_btree_store stm_bootstrap stm_block stm_snapshot)

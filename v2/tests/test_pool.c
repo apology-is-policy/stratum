@@ -491,7 +491,7 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
      * restated here so a future version bump that forgets to
      * update this test fails loudly. */
     STM_ASSERT_EQ(stm_load_le32(ub.ub_version), STM_UB_VERSION);
-    STM_ASSERT_EQ(STM_UB_VERSION, 30u);  /* 9.7-impl-1b per-dataset substrate v29 → v30 */
+    STM_ASSERT_EQ(STM_UB_VERSION, 31u);  /* 9.7-impl-2-routing snap-tier dead-list v30 → v31 */
 
     /* Roster fields are populated. */
     STM_ASSERT_EQ(stm_load_le16(ub.ub_device_count), 1u);

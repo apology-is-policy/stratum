@@ -3307,7 +3307,9 @@ STM_TEST(fs_snap_delete_releases_cold_dead) {
     uint8_t  *freed_hashes = NULL; size_t n_hashes = 0;
     STM_ASSERT_OK(stm_snapshot_delete(snap_idx, snap_id,
                                           &freed_paddrs, &n_paddrs,
-                                          &freed_hashes, &n_hashes));
+                                          &freed_hashes, &n_hashes,
+                                          /*out_boot_paddrs=*/NULL,
+                                          /*out_boot_count=*/NULL));
     STM_ASSERT_EQ(n_hashes, (size_t)1);
     STM_ASSERT_TRUE(freed_hashes != NULL);
     /* Caller-side: deref each hash. */
@@ -3504,7 +3506,9 @@ STM_TEST(fs_snap_intra_cow_shared_hash_no_leak) {
     uint8_t  *freed_hashes = NULL; size_t n_hashes = 0;
     STM_ASSERT_OK(stm_snapshot_delete(snap_idx, snap_id,
                                           &freed_paddrs, &n_paddrs,
-                                          &freed_hashes, &n_hashes));
+                                          &freed_hashes, &n_hashes,
+                                          /*out_boot_paddrs=*/NULL,
+                                          /*out_boot_count=*/NULL));
     STM_ASSERT_EQ(n_hashes, (size_t)cnt.cold_count);
     for (size_t i = 0; i < n_hashes; i++) {
         STM_ASSERT_OK(stm_cas_deref(cas, freed_hashes + i * STM_SNAP_HASH_LEN));

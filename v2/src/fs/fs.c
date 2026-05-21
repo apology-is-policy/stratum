@@ -6146,19 +6146,26 @@ stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
     size_t freed_n = 0;
     uint8_t *cold_hashes = NULL;
     size_t cold_n = 0;
+    /* 9.7-impl-2-routing: also consume the engine NODE (bootstrap-tier)
+     * dead-list. Those paddrs are unknown to stm_alloc; they're routed
+     * through stm_bootstrap_free per device below. */
+    uint64_t *freed_boot = NULL;
+    size_t freed_boot_n  = 0;
     stm_status del = stm_snapshot_delete(sidx, snapshot_id,
                                             &freed, &freed_n,
-                                            &cold_hashes, &cold_n);
+                                            &cold_hashes, &cold_n,
+                                            &freed_boot, &freed_boot_n);
     if (del != STM_OK) {
-        /* Snapshot.h contract: on non-OK return, both pairs are
-         * zero/NULL. Defensive free anyway. */
+        /* Snapshot.h contract: on non-OK return, ALL pairs are zero/NULL.
+         * Defensive free anyway. */
         free(freed);
         free(cold_hashes);
+        free(freed_boot);
         pthread_rwlock_unlock(&fs->global);
         return del;
     }
 
-    if (out_freed_count) *out_freed_count = freed_n;
+    if (out_freed_count) *out_freed_count = freed_n + freed_boot_n;
 
     /* First-failure status — propagated after the cleanup loop runs
      * to completion (best-effort reclaim). */
@@ -6200,8 +6207,32 @@ stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
         }
     }
 
+    /* 9.7-impl-2-routing: route bootstrap-tier paddrs through the
+     * per-device bootstrap allocator (reached via
+     * `stm_alloc_bootstrap(stm_sync_alloc(fs->sync, did))`). These
+     * are engine NODE paddrs (16-KiB bootstrap reservations); each is
+     * returned to the bootstrap deferred-free pool at `free_gen`. */
+    for (size_t i = 0; i < freed_boot_n; i++) {
+        uint16_t did = stm_paddr_device(freed_boot[i]);
+        stm_alloc *a = stm_sync_alloc(fs->sync, did);
+        if (!a) {
+            if (first_err == STM_OK) first_err = STM_ENOENT;
+            continue;
+        }
+        stm_bootstrap *boot = stm_alloc_bootstrap(a);
+        if (!boot) {
+            if (first_err == STM_OK) first_err = STM_ENOENT;
+            continue;
+        }
+        stm_status fr = stm_bootstrap_free(boot, freed_boot[i],
+                                              STM_BOOTSTRAP_NODE_BLOCKS,
+                                              free_gen);
+        if (fr != STM_OK && first_err == STM_OK) first_err = fr;
+    }
+
     free(freed);
     free(cold_hashes);
+    free(freed_boot);
     pthread_rwlock_unlock(&fs->global);
     return first_err;
 }

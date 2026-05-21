@@ -15,9 +15,12 @@
  * except for the reservation size: STM_BOOTSTRAP_NODE_BLOCKS (16 KiB, one
  * engine node) instead of STM_BOOTSTRAP_UNIT_BLOCKS (128 KiB legacy unit).
  */
+#include <stdbool.h>
+
 #include <stratum/engine_store.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
+#include <stratum/snapshot.h>       /* stm_snapshot_index_overwrite_bootstrap_block */
 #include <stratum/super.h>          /* STM_UB_SIZE, stm_paddr_device/offset */
 #include <stratum/types.h>
 
@@ -33,33 +36,53 @@ static stm_status engine_store_reserve(void *ctx_, uint64_t *out_paddr)
 }
 
 /*
- * free: deferred-free — stamps a PENDING entry with free_gen. The bitmap
- * bit stays SET until a stm_bootstrap_commit(committed_gen > free_gen)
- * sweeps it (the allocator.tla / bootstrap.h deferred-free discipline;
- * what keeps an aborted / superseded paddr off any reserve until it can
- * no longer alias a still-live (paddr, gen) AEAD nonce).
+ * free: snapshot-aware deferred-free (9.7-impl-2-routing).
  *
- * 9.7-impl-2 forward-note: `ctx->snap_idx` + `ctx->dataset_id` are
- * populated by the dataset_slot's engine open (so the substrate is in
- * place) but NOT consulted here yet. The naïve snap-routing — append
- * each superseded paddr to the dataset's most-recent PRESENT snap's
- * dead-list — is allocator-mismatched: this path reserves through
- * `stm_bootstrap` (16-KiB nodes), while the snapshot's dead-list
- * reclaim path in `stm_fs_delete_snapshot` routes paddrs through
- * `stm_alloc_free` (the user-data allocator). Bootstrap-allocated
- * paddrs are unknown to `stm_alloc`, so cross-routing them produces
- * STM_ENOENT at snap-delete time. A correct snap-aware reclaim for
- * engine NODE paddrs needs either (a) a parallel bootstrap-aware
- * dead-list on the snap index, OR (b) a unified allocator-class tag
- * on each dead-list entry so the reclaim path can dispatch. That's
- * impl-2-routing (or impl-2.x). For now: bootstrap_free unconditionally
- * preserves the pre-9.7 contract; the substrate (per-slot ctx with
- * snap_idx + dataset_id) is harmless dead state.
+ * Routes superseded engine NODE paddrs (16-KiB bootstrap reservations)
+ * through the dataset's most-recent PRESENT snapshot's bootstrap-tier
+ * dead-list — option (b) from the impl-2 design: a separate per-snap
+ * list keyed by allocator class so reclaim at snap-delete dispatches
+ * correctly (stm_bootstrap_free for engine NODE paddrs, NOT the
+ * stm_alloc_free path the paddr-tier dead-list uses).
+ *
+ * Routing dispatch:
+ *   - ctx->snap_idx == NULL OR ctx->dataset_id == 0 ⇒ skip the snap
+ *     path (degenerate / pre-wire); fall through to bootstrap_free.
+ *   - stm_snapshot_index_overwrite_bootstrap_block returns
+ *     out_should_free == true ⇒ no PRESENT snap holds this paddr;
+ *     fall through to bootstrap_free.
+ *   - out_should_free == false ⇒ snap captured; the paddr is now
+ *     owned by the snap's bootstrap_dead_list. Return STM_OK without
+ *     touching the bootstrap allocator.
+ *   - Any other status from overwrite_bootstrap_block (STM_ENOMEM /
+ *     STM_ENOSPC / STM_EINVAL / STM_ECORRUPT) is a best-effort
+ *     fall-through per engine.c::pending_free_paddrs' "vt->free is
+ *     best-effort, must not fail commit_finalize" contract. The
+ *     side-effect of the rare STM_ENOSPC class is that the snap's
+ *     view of the superseded subtree fails STM_ECORRUPT at read
+ *     time (the (paddr, gen) AEAD nonce mismatch prevents reading
+ *     the new bytes). impl-2.x adds pre-flush dead-list reservation
+ *     to refuse the COW at the higher-level write boundary.
+ *
+ * Spec mapping: dead_list.tla::OverwriteBlock with allocator class
+ * threaded through (the class is a side parameter; the spec's invariants
+ * compose verbatim).
  */
 static stm_status engine_store_free(void *ctx_, uint64_t paddr,
                                        uint64_t free_gen)
 {
     stm_engine_store_ctx *ctx = ctx_;
+    if (ctx->snap_idx != NULL && ctx->dataset_id != 0) {
+        bool should_free = true;
+        stm_status sr = stm_snapshot_index_overwrite_bootstrap_block(
+            ctx->snap_idx, ctx->dataset_id, paddr, &should_free);
+        if (sr == STM_OK && !should_free) {
+            /* Snap captured the paddr; allocator MUST NOT see it. */
+            return STM_OK;
+        }
+        /* sr != STM_OK OR should_free == true: fall through to the
+         * bootstrap allocator. */
+    }
     return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_NODE_BLOCKS,
                                 free_gen);
 }

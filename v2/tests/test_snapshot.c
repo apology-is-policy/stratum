@@ -38,7 +38,9 @@ static stm_status snap_delete_simple(stm_snapshot_index *idx, uint64_t id) {
     uint8_t  *cold_hashes = NULL;
     size_t    cold_n      = 0;
     stm_status rs = stm_snapshot_delete(idx, id, &freed, &n,
-                                          &cold_hashes, &cold_n);
+                                          &cold_hashes, &cold_n,
+                                          /*out_boot_paddrs=*/NULL,
+                                          /*out_boot_count=*/NULL);
     free(freed);
     free(cold_hashes);
     return rs;
@@ -1119,7 +1121,9 @@ STM_TEST(snap_delete_returns_dead_list) {
     uint8_t  *cold_hashes = NULL;
     size_t    cold_n      = 0;
     STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n,
-                                          &cold_hashes, &cold_n));
+                                          &cold_hashes, &cold_n,
+                                          /*out_boot_paddrs=*/NULL,
+                                          /*out_boot_count=*/NULL));
     STM_ASSERT_EQ(n, (size_t)3);
     STM_ASSERT_TRUE(freed != NULL);
     STM_ASSERT_EQ(freed[0], (uint64_t)0xA001);
@@ -1149,7 +1153,9 @@ STM_TEST(snap_delete_clean_returns_null_zero) {
     uint8_t  *cold_hashes = (uint8_t *)0xDEADBEEF;
     size_t    cold_n      = 99;
     STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n,
-                                          &cold_hashes, &cold_n));
+                                          &cold_hashes, &cold_n,
+                                          /*out_boot_paddrs=*/NULL,
+                                          /*out_boot_count=*/NULL));
     STM_ASSERT_TRUE(freed == NULL);
     STM_ASSERT_EQ(n, (size_t)0);
     STM_ASSERT_TRUE(cold_hashes == NULL);
@@ -1174,7 +1180,10 @@ STM_TEST(snap_delete_refused_held_keeps_dead_list) {
     uint8_t  *cold_hashes = NULL;
     size_t    cold_n      = 99;
     STM_ASSERT_ERR(stm_snapshot_delete(idx, s, &freed, &n,
-                                           &cold_hashes, &cold_n), STM_EBUSY);
+                                           &cold_hashes, &cold_n,
+                                           /*out_boot_paddrs=*/NULL,
+                                           /*out_boot_count=*/NULL),
+                       STM_EBUSY);
     STM_ASSERT_TRUE(freed == NULL);
     STM_ASSERT_EQ(n, (size_t)0);
     STM_ASSERT_TRUE(cold_hashes == NULL);
@@ -1188,7 +1197,9 @@ STM_TEST(snap_delete_refused_held_keeps_dead_list) {
     /* After release, delete succeeds and yields the paddr. */
     STM_ASSERT_OK(stm_snapshot_release(idx, s));
     STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n,
-                                          &cold_hashes, &cold_n));
+                                          &cold_hashes, &cold_n,
+                                          /*out_boot_paddrs=*/NULL,
+                                          /*out_boot_count=*/NULL));
     STM_ASSERT_EQ(n, (size_t)1);
     STM_ASSERT_EQ(freed[0], (uint64_t)0xB001);
     STM_ASSERT_EQ(cold_n, (size_t)0);
@@ -1259,7 +1270,9 @@ STM_TEST(snapshot_persist_dead_list_roundtrip) {
     uint64_t *freed = NULL; size_t n = 0;
     uint8_t  *cold_hashes = NULL; size_t cold_n = 0;
     STM_ASSERT_OK(stm_snapshot_delete(idx2, s1, &freed, &n,
-                                           &cold_hashes, &cold_n));
+                                           &cold_hashes, &cold_n,
+                                          /*out_boot_paddrs=*/NULL,
+                                          /*out_boot_count=*/NULL));
     STM_ASSERT_EQ(n, (size_t)3);
     STM_ASSERT_EQ(cold_n, (size_t)0);
     STM_ASSERT_TRUE(cold_hashes == NULL);

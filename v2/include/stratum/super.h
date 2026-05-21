@@ -486,11 +486,27 @@ extern "C" {
  * across the cutover without an additional UB version bump.
  * Layout-compat contract: the fields stay at their carved offsets,
  * so a pre-1c-vi v30 pool with real csums mounts cleanly under a
- * 1c-vi binary (the reader ignores the bytes either way). A future
- * v31 may carve the bytes for a different purpose.
+ * 1c-vi binary (the reader ignores the bytes either way).
  *
- * See `v2/docs/phase-9.7-design.md` §3.1 / §3.3 for the staging. */
-#define STM_UB_VERSION        30u
+ * v30→v31 (9.7-impl-2-routing — Phase 9.7 snap-aware engine NODE
+ * retention): the snapshot record gains a bootstrap-dead-list tail
+ * appended after the cold-dead-list tail (4-byte count + 8 bytes
+ * per engine NODE paddr). The new tail tracks engine NODE paddrs
+ * (allocated via `stm_bootstrap_reserve`) that were superseded
+ * during this snap's lifetime; reclaim at snap-delete routes them
+ * through `stm_bootstrap_free` per device, NOT `stm_alloc_free` —
+ * a different allocator class than the paddr-tier dead-list. NO
+ * uberblock field changes at this bump; the format break is in the
+ * snap-record encoding only. v30 binaries would mis-read v31 snap
+ * records (the trailing-tail offset shifted), so the exact-match
+ * SB version check (`version != STM_UB_VERSION` → STM_EBADVERSION)
+ * makes a v30 binary refuse a v31 pool outright. v30 pools refused
+ * at v31 mount via STM_EBADVERSION. The new tail's all-zero state
+ * (no engine NODE overwrites) is the steady-state encoding; the
+ * tail is always present.
+ *
+ * See `v2/docs/phase-9.7-design.md` §3.1 / §3.3 + §4 for the staging. */
+#define STM_UB_VERSION        31u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

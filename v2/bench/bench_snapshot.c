@@ -170,7 +170,9 @@ static void bench_snap_delete_vs_dead_list(size_t dead_size)
         size_t   cold_n      = 0;
         double t0 = now_sec();
         stm_status rs = stm_snapshot_delete(idx, id, &freed, &n,
-                                              &cold_hashes, &cold_n);
+                                              &cold_hashes, &cold_n,
+                                              /*out_boot_paddrs=*/NULL,
+                                              /*out_boot_count=*/NULL);
         double t1 = now_sec();
         if (rs == STM_OK) {
             total_sec += (t1 - t0);

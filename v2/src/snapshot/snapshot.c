@@ -63,6 +63,18 @@ typedef struct {
     uint8_t           *cold_dead_list;
     size_t             cold_dead_count;
     size_t             cold_dead_capacity;
+
+    /* 9.7-impl-2-routing: per-snapshot bootstrap-allocator dead-list.
+     * Mirrors the paddr-tier dead-list above but for engine NODE
+     * paddrs allocated via stm_bootstrap_reserve. Reclaim at
+     * snap_delete routes through stm_bootstrap_free (NOT
+     * stm_alloc_free); fs.c::stm_fs_delete_snapshot dispatches.
+     * boot_dead_count <= boot_dead_capacity <=
+     *   STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX. NULL/0 for slots with no
+     * engine NODE overwrites. */
+    uint64_t          *boot_dead_list;
+    size_t             boot_dead_count;
+    size_t             boot_dead_capacity;
 } snapshot_slot;
 
 struct stm_snapshot_index {
@@ -212,11 +224,12 @@ stm_status stm_snapshot_index_create(uint64_t current_txg,
 void stm_snapshot_index_close(stm_snapshot_index *idx) {
     if (!idx) return;
     pthread_mutex_destroy(&idx->lock);
-    /* P6-deadlist + P7-CAS-4c: free per-slot dead-list arrays (HOT
-     * paddrs + COLD content hashes). */
+    /* P6-deadlist + P7-CAS-4c + 9.7-impl-2-routing: free per-slot
+     * dead-list arrays (paddr-tier + cold-tier + bootstrap-tier). */
     for (size_t i = 0; i < idx->slots_len; i++) {
         free(idx->slots[i].dead_list);
         free(idx->slots[i].cold_dead_list);
+        free(idx->slots[i].boot_dead_list);
     }
     free(idx->slots);
     free(idx);
@@ -412,13 +425,26 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
                                  uint64_t **out_freed_paddrs,
                                  size_t *out_freed_count,
                                  uint8_t **out_freed_cold_hashes,
-                                 size_t *out_freed_cold_count) {
+                                 size_t *out_freed_cold_count,
+                                 uint64_t **out_freed_boot_paddrs,
+                                 size_t *out_freed_boot_count) {
     if (!idx || !out_freed_paddrs || !out_freed_count
         || !out_freed_cold_hashes || !out_freed_cold_count) return STM_EINVAL;
+    /* 9.7-impl-2-routing: bootstrap-tier output is atomic in (paddrs,
+     * count) — both NULL ⇒ caller doesn't want this list (back-compat
+     * surface for tests + bench); both non-NULL ⇒ caller consumes it.
+     * Mismatched NULL refused (drops the dead-list silently otherwise). */
+    if ((out_freed_boot_paddrs == NULL) != (out_freed_boot_count == NULL)) {
+        return STM_EINVAL;
+    }
     *out_freed_paddrs       = NULL;
     *out_freed_count        = 0;
     *out_freed_cold_hashes  = NULL;
     *out_freed_cold_count   = 0;
+    if (out_freed_boot_paddrs) {
+        *out_freed_boot_paddrs = NULL;
+        *out_freed_boot_count  = 0;
+    }
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, snapshot_id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
@@ -439,15 +465,22 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
         must_unlock(&idx->lock);
         return STM_EBUSY;
     }
-    /* P6-deadlist + P7-CAS-4c: transfer BOTH dead-lists to caller. In
-     * dead_list.tla's single-ownership model, all entries are unique-and-
-     * freed; the predecessor-merge step is empty so we just hand off
-     * the full lists for caller-side reclaim (paddrs via stm_alloc_free,
-     * cold-hashes via stm_cas_deref). After the transfer, the slot's
-     * lists are NULL/0 — safe to mark ABSENT.
+    /* P6-deadlist + P7-CAS-4c + 9.7-impl-2-routing: transfer ALL THREE
+     * dead-lists to caller. In dead_list.tla's single-ownership model,
+     * all entries are unique-and-freed; the predecessor-merge step is
+     * empty so we just hand off the full lists for caller-side reclaim
+     * (stm_alloc_free for the paddr-tier, stm_cas_deref for cold, and
+     * stm_bootstrap_free for the engine NODE bootstrap-tier).
+     *
+     * If the caller passes NULL out_freed_boot_paddrs (back-compat
+     * surface for tests that don't wire engine NODE retention), the
+     * bootstrap-tier list is FREED here. This is a leak in principle
+     * — those engine NODE paddrs become orphaned in the bootstrap
+     * allocator — but only for callers that explicitly opted out.
+     * Production callers (fs.c) always pass non-NULL.
      *
      * Note: we do this AFTER all the refusal checks above (hold, clone-
-     * cb), so a refused delete leaves both dead-lists intact. */
+     * cb), so a refused delete leaves all dead-lists intact. */
     snapshot_slot *slot = &idx->slots[s];
     *out_freed_paddrs   = slot->dead_list;
     *out_freed_count    = slot->dead_count;
@@ -460,6 +493,18 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
     slot->cold_dead_list     = NULL;
     slot->cold_dead_count    = 0;
     slot->cold_dead_capacity = 0;
+
+    if (out_freed_boot_paddrs) {
+        *out_freed_boot_paddrs = slot->boot_dead_list;
+        *out_freed_boot_count  = slot->boot_dead_count;
+    } else {
+        /* Back-compat: caller didn't ask for the bootstrap list. Free
+         * here; the paddrs leak from tracking until next scrub. */
+        free(slot->boot_dead_list);
+    }
+    slot->boot_dead_list     = NULL;
+    slot->boot_dead_count    = 0;
+    slot->boot_dead_capacity = 0;
 
     slot->present = false;
     idx->dirty    = true;
@@ -551,6 +596,99 @@ stm_status stm_snapshot_dead_list_count(const stm_snapshot_index *idx,
         return STM_ENOENT;
     }
     *out_count = idx->slots[s].dead_count;
+    must_unlock(lock);
+    return STM_OK;
+}
+
+/* 9.7-impl-2-routing: mirror of stm_snapshot_index_overwrite_block for
+ * the bootstrap allocator class. Same semantics + same defense-in-depth
+ * single-ownership scan + same caps, but the entry lands in
+ * boot_dead_list[] instead of dead_list[]. */
+stm_status stm_snapshot_index_overwrite_bootstrap_block(
+    stm_snapshot_index *idx,
+    uint64_t dataset_id,
+    uint64_t paddr,
+    bool *out_should_free) {
+    if (!idx || !out_should_free) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    if (paddr == 0) return STM_EINVAL;
+    *out_should_free = false;
+
+    must_lock(&idx->lock);
+
+    uint64_t mr = most_recent_locked(idx, dataset_id);
+    if (mr == STM_SNAP_NO_PREV) {
+        /* No PRESENT snap → caller frees directly via stm_bootstrap_free. */
+        *out_should_free = true;
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+
+    size_t s = find_slot_locked(idx, mr);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ECORRUPT;
+    }
+
+    snapshot_slot *slot = &idx->slots[s];
+
+    /* R33 P2 single-ownership defense (mirror): a bootstrap paddr in
+     * one PRESENT snap's boot_dead_list cannot appear in another's.
+     * Scoped to the boot-tier; alloc-tier collisions are intentionally
+     * permitted (different allocators may produce the same bit pattern;
+     * the allocator class is the resolver). */
+    for (size_t k = 0; k < idx->slots_len; k++) {
+        const snapshot_slot *sk = &idx->slots[k];
+        if (!sk->present) continue;
+        for (size_t j = 0; j < sk->boot_dead_count; j++) {
+            if (sk->boot_dead_list[j] == paddr) {
+                must_unlock(&idx->lock);
+                return STM_EINVAL;
+            }
+        }
+    }
+
+    if (slot->boot_dead_count >= STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX) {
+        must_unlock(&idx->lock);
+        return STM_ENOSPC;
+    }
+
+    if (slot->boot_dead_count == slot->boot_dead_capacity) {
+        size_t new_cap = slot->boot_dead_capacity == 0
+                            ? 8u
+                            : slot->boot_dead_capacity * 2u;
+        if (new_cap > STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX) {
+            new_cap = STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX;
+        }
+        uint64_t *new_buf = realloc(slot->boot_dead_list,
+                                       new_cap * sizeof(uint64_t));
+        if (!new_buf) {
+            must_unlock(&idx->lock);
+            return STM_ENOMEM;
+        }
+        slot->boot_dead_list     = new_buf;
+        slot->boot_dead_capacity = new_cap;
+    }
+
+    slot->boot_dead_list[slot->boot_dead_count++] = paddr;
+    idx->dirty = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_bootstrap_dead_list_count(
+    const stm_snapshot_index *idx,
+    uint64_t snapshot_id,
+    size_t *out_count) {
+    if (!idx || !out_count) return STM_EINVAL;
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+    size_t s = find_slot_locked(idx, snapshot_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(lock);
+        return STM_ENOENT;
+    }
+    *out_count = idx->slots[s].boot_dead_count;
     must_unlock(lock);
     return STM_OK;
 }
@@ -888,11 +1026,17 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
 /* P7-CAS-4c v19: cold-dead tail = 4 bytes count + 32 bytes per hash. */
 #define SP_COLD_TAIL_FIXED      4u                            /* le32 cold_dead_count */
 #define SP_COLD_HASH_BYTES      32u
+/* 9.7-impl-2-routing v30→v31: bootstrap-dead tail = 4 bytes count +
+ * 8 bytes per engine NODE paddr. */
+#define SP_BOOT_TAIL_FIXED      4u                            /* le32 boot_dead_count */
+#define SP_BOOT_PADDR_BYTES     8u                            /* le64 paddr */
 #define SP_VAL_MAX              (SP_VAL_FIXED + STM_SNAP_NAME_MAX \
                                   + SP_DEAD_TAIL_FIXED \
                                   + STM_SNAP_DEAD_LIST_MAX * SP_DEAD_PADDR_BYTES \
                                   + SP_COLD_TAIL_FIXED \
-                                  + STM_SNAP_COLD_DEAD_LIST_MAX * SP_COLD_HASH_BYTES)
+                                  + STM_SNAP_COLD_DEAD_LIST_MAX * SP_COLD_HASH_BYTES \
+                                  + SP_BOOT_TAIL_FIXED \
+                                  + STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX * SP_BOOT_PADDR_BYTES)
 
 static void sp_encode_key(uint64_t id, uint8_t out[SP_KEY_LEN]) {
     le64 k = stm_store_le64(id);
@@ -911,7 +1055,9 @@ static size_t sp_encode_value(const snapshot_slot *s,
                 + SP_DEAD_TAIL_FIXED
                 + (size_t)s->dead_count * SP_DEAD_PADDR_BYTES
                 + SP_COLD_TAIL_FIXED
-                + (size_t)s->cold_dead_count * SP_COLD_HASH_BYTES;
+                + (size_t)s->cold_dead_count * SP_COLD_HASH_BYTES
+                + SP_BOOT_TAIL_FIXED
+                + (size_t)s->boot_dead_count * SP_BOOT_PADDR_BYTES;
     if (out_cap < need) return 0;
 
     le64 ds   = stm_store_le64(s->e.dataset_id);
@@ -958,6 +1104,20 @@ static size_t sp_encode_value(const snapshot_slot *s,
         memcpy(out + tail_off, s->cold_dead_list,
                 s->cold_dead_count * SP_COLD_HASH_BYTES);
     }
+    tail_off += (size_t)s->cold_dead_count * SP_COLD_HASH_BYTES;
+
+    /* 9.7-impl-2-routing v30→v31 tail: boot_dead_count then
+     * boot_dead_paddrs[]. Each paddr is an engine NODE allocated via
+     * stm_bootstrap_reserve; snap-delete routes through
+     * stm_bootstrap_free per device, NOT stm_alloc_free. */
+    le32 bdc = stm_store_le32((uint32_t)s->boot_dead_count);
+    memcpy(out + tail_off, bdc.v, 4);
+    tail_off += SP_BOOT_TAIL_FIXED;
+    for (size_t i = 0; i < s->boot_dead_count; i++) {
+        le64 p = stm_store_le64(s->boot_dead_list[i]);
+        memcpy(out + tail_off, p.v, 8);
+        tail_off += SP_BOOT_PADDR_BYTES;
+    }
     return need;
 }
 
@@ -995,8 +1155,17 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
     memcpy(cdc.v, in + paddr_tail_end, 4);
     uint32_t cold_dead_count = stm_load_le32(cdc);
     if (cold_dead_count > STM_SNAP_COLD_DEAD_LIST_MAX) return STM_ECORRUPT;
-    size_t expected = paddr_tail_end + SP_COLD_TAIL_FIXED
-                    + (size_t)cold_dead_count * SP_COLD_HASH_BYTES;
+    size_t cold_tail_end = paddr_tail_end + SP_COLD_TAIL_FIXED
+                         + (size_t)cold_dead_count * SP_COLD_HASH_BYTES;
+
+    /* 9.7-impl-2-routing v30→v31: boot_dead_count + boot_dead_paddrs[]. */
+    if (in_len < cold_tail_end + SP_BOOT_TAIL_FIXED) return STM_ECORRUPT;
+    le32 bdc;
+    memcpy(bdc.v, in + cold_tail_end, 4);
+    uint32_t boot_dead_count = stm_load_le32(bdc);
+    if (boot_dead_count > STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX) return STM_ECORRUPT;
+    size_t expected = cold_tail_end + SP_BOOT_TAIL_FIXED
+                    + (size_t)boot_dead_count * SP_BOOT_PADDR_BYTES;
     if (in_len != expected) return STM_ECORRUPT;
 
     memset(out_slot, 0, sizeof *out_slot);
@@ -1064,6 +1233,48 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
                 if (h[k] != 0) { any_nonzero = true; break; }
             }
             if (!any_nonzero) {
+                free(out_slot->cold_dead_list);
+                out_slot->cold_dead_list     = NULL;
+                out_slot->cold_dead_count    = 0;
+                out_slot->cold_dead_capacity = 0;
+                free(out_slot->dead_list);
+                out_slot->dead_list     = NULL;
+                out_slot->dead_count    = 0;
+                out_slot->dead_capacity = 0;
+                return STM_ECORRUPT;
+            }
+        }
+    }
+
+    /* 9.7-impl-2-routing v30→v31: load bootstrap-dead-list. Each entry
+     * is an engine NODE paddr (16-KiB granularity bootstrap reservation);
+     * reject paddr=0 for the same reason as the paddr-tier. */
+    if (boot_dead_count > 0) {
+        out_slot->boot_dead_list = calloc((size_t)boot_dead_count,
+                                             sizeof(uint64_t));
+        if (!out_slot->boot_dead_list) {
+            free(out_slot->cold_dead_list);
+            out_slot->cold_dead_list     = NULL;
+            out_slot->cold_dead_count    = 0;
+            out_slot->cold_dead_capacity = 0;
+            free(out_slot->dead_list);
+            out_slot->dead_list     = NULL;
+            out_slot->dead_count    = 0;
+            out_slot->dead_capacity = 0;
+            return STM_ENOMEM;
+        }
+        out_slot->boot_dead_capacity = boot_dead_count;
+        out_slot->boot_dead_count    = boot_dead_count;
+        size_t boff = cold_tail_end + SP_BOOT_TAIL_FIXED;
+        for (size_t i = 0; i < boot_dead_count; i++) {
+            le64 p;
+            memcpy(p.v, in + boff + i * SP_BOOT_PADDR_BYTES, 8);
+            out_slot->boot_dead_list[i] = stm_load_le64(p);
+            if (out_slot->boot_dead_list[i] == 0) {
+                free(out_slot->boot_dead_list);
+                out_slot->boot_dead_list     = NULL;
+                out_slot->boot_dead_count    = 0;
+                out_slot->boot_dead_capacity = 0;
                 free(out_slot->cold_dead_list);
                 out_slot->cold_dead_list     = NULL;
                 out_slot->cold_dead_count    = 0;
@@ -1549,12 +1760,13 @@ stm_status stm_snapshot_index_load_at(stm_snapshot_index *idx,
         return vs;
     }
 
-    /* Atomic swap. P6-deadlist + P7-CAS-4c: free OLD slots' dead-list
-     * arrays (HOT paddrs + COLD content hashes) before dropping the
-     * OLD slots[] backing store. */
+    /* Atomic swap. P6-deadlist + P7-CAS-4c + 9.7-impl-2-routing: free
+     * OLD slots' dead-list arrays (paddr-tier + cold-tier + bootstrap-
+     * tier) before dropping the OLD slots[] backing store. */
     for (size_t i = 0; i < idx->slots_len; i++) {
         free(idx->slots[i].dead_list);
         free(idx->slots[i].cold_dead_list);
+        free(idx->slots[i].boot_dead_list);
     }
     free(idx->slots);
     idx->slots     = lc.shadow_slots;

@@ -93,6 +93,22 @@ struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
 #define STM_SNAP_DEAD_LIST_MAX   256u
 
 /*
+ * 9.7-impl-2-routing: per-snapshot bootstrap-dead-list cap. The
+ * paddr-tier dead-list (above) tracks paddrs allocated via
+ * `stm_alloc_reserve` (per-device, with replication). Engine
+ * NODE paddrs (used by per-dataset btree_engines for metadata) are
+ * allocated via `stm_bootstrap_reserve` instead — a different
+ * allocator with its own bitmap. The snap-aware reclaim path must
+ * route bootstrap paddrs through `stm_bootstrap_free`, NOT
+ * `stm_alloc_free` (which doesn't track them).
+ *
+ * This second list stores superseded engine NODE paddrs separately
+ * so the reclaim path in `stm_fs_delete_snapshot` can dispatch per
+ * allocator class. The cap mirrors STM_SNAP_DEAD_LIST_MAX.
+ */
+#define STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX   256u
+
+/*
  * P7-CAS-4c: per-snapshot cold-dead-list cap. Mirrors STM_SNAP_DEAD_LIST_MAX
  * for the COLD tier — when a live cold extent is dropped via COW, the
  * caller routes the dropped extent's content_hash[32] through
@@ -253,13 +269,40 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
  * the cold-hashes buffer after iterating, identical to the
  * out_freed_paddrs ownership convention.
  */
+/*
+ * 9.7-impl-2-routing: snap-delete also returns the bootstrap-tier
+ * dead-list (engine NODE paddrs allocated via `stm_bootstrap_reserve`).
+ * The caller MUST iterate `*out_freed_boot_paddrs` and call
+ * `stm_bootstrap_free` per device against `stm_alloc_bootstrap`,
+ * NOT `stm_alloc_free` — these paddrs are unknown to the user-data
+ * allocator. The buffer ownership transfers to the caller; caller
+ * MUST `free(*out_freed_boot_paddrs)` after iterating.
+ *
+ *   - *out_freed_boot_paddrs / *out_freed_boot_count = NULL/0 when
+ *     the snap had no engine NODE overwrites. Caller skips the free
+ *     loop AND the free()-of-buffer step.
+ *   - On non-OK return both pairs are zero/NULL.
+ *
+ * Pre-9.7-impl-2-routing callers (tests + benches that don't deal
+ * with engine NODE retention) MAY pass NULL for both
+ * `out_freed_boot_paddrs` AND `out_freed_boot_count` to disable
+ * bootstrap-list output. If either is non-NULL, both MUST be (the
+ * pair is atomic). Refused otherwise with STM_EINVAL.
+ *
+ * The bootstrap-tier dead-list complements the paddr-tier dead-list
+ * (stm_alloc class) and the cold-tier dead-list (CAS class). The
+ * three lists are mutually exclusive in which-allocator-owns-the-
+ * block sense; reclaim dispatches accordingly.
+ */
 STM_MUST_USE
 stm_status stm_snapshot_delete(stm_snapshot_index *idx,
                                  uint64_t snapshot_id,
                                  uint64_t **out_freed_paddrs,
                                  size_t *out_freed_count,
                                  uint8_t **out_freed_cold_hashes,
-                                 size_t *out_freed_cold_count);
+                                 size_t *out_freed_cold_count,
+                                 uint64_t **out_freed_boot_paddrs,
+                                 size_t *out_freed_boot_count);
 
 /*
  * P6-deadlist: append `paddr` to the dead-list of the dataset's
@@ -296,6 +339,37 @@ stm_status stm_snapshot_index_overwrite_block(stm_snapshot_index *idx,
                                                  bool *out_should_free);
 
 /*
+ * 9.7-impl-2-routing: mirror of `stm_snapshot_index_overwrite_block`
+ * for the bootstrap allocator class (engine NODE paddrs allocated via
+ * `stm_bootstrap_reserve`). Same single-ownership defense-in-depth +
+ * cap-refusal semantics — refused if paddr already tracked by any
+ * PRESENT snap's bootstrap_dead_list (STM_EINVAL); refused at
+ * STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX (STM_ENOSPC).
+ *
+ * The bootstrap and paddr (stm_alloc) dead-lists are mutually
+ * exclusive in single-ownership scope — the same `paddr` value in
+ * BOTH lists is permitted (they're tracking blocks from different
+ * allocators that happen to share the bit pattern). Single-ownership
+ * is enforced WITHIN each list, NOT across.
+ *
+ * Spec mapping (dead_list.tla::OverwriteBlock) — same semantics with
+ * the allocator class as a side parameter.
+ *
+ * Refused with:
+ *   - STM_EINVAL on NULL idx / NULL out / dataset_id == 0 / paddr == 0.
+ *   - STM_EINVAL if paddr is already tracked by some PRESENT snap's
+ *     bootstrap_dead_list.
+ *   - STM_ENOMEM on realloc failure (prior list preserved).
+ *   - STM_ENOSPC at STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX cap.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_index_overwrite_bootstrap_block(
+    stm_snapshot_index *idx,
+    uint64_t dataset_id,
+    uint64_t paddr,
+    bool *out_should_free);
+
+/*
  * P6-deadlist observability: count of paddrs in `snapshot_id`'s
  * in-RAM dead-list. STM_ENOENT if not PRESENT. *out_count is 0 for
  * a present snap with no overwrites.
@@ -304,6 +378,18 @@ STM_MUST_USE
 stm_status stm_snapshot_dead_list_count(const stm_snapshot_index *idx,
                                            uint64_t snapshot_id,
                                            size_t *out_count);
+
+/*
+ * 9.7-impl-2-routing: count of paddrs in `snapshot_id`'s in-RAM
+ * bootstrap_dead_list (the parallel list for engine NODE paddrs).
+ * STM_ENOENT if not PRESENT. *out_count is 0 for a present snap with
+ * no engine NODE overwrites.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_bootstrap_dead_list_count(
+    const stm_snapshot_index *idx,
+    uint64_t snapshot_id,
+    size_t *out_count);
 
 /*
  * P7-CAS-4c: route a dropped COLD-extent record through the snap-aware
@@ -532,8 +618,16 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
  *   52         L    name (UTF-8, no NUL)  L = name_len
  *   52+L       4    dead_count (le32) — 0..STM_SNAP_DEAD_LIST_MAX
  *   56+L     8*N    dead_paddrs (le64[N]) where N = dead_count
+ *   --P7-CAS-4c v19 cold-dead tail:
+ *   ...        4    cold_dead_count (le32) — 0..STM_SNAP_COLD_DEAD_LIST_MAX
+ *   ...     32*N    cold_dead_hashes (32-byte content_hashes)
+ *   --9.7-impl-2-routing v30→v31 bootstrap-dead tail:
+ *   ...        4    boot_dead_count (le32) — 0..STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX
+ *   ...      8*N    boot_dead_paddrs (le64[N]) — engine NODE paddrs
  *
- * Total: 56 + name_len + 8*dead_count bytes (was 48 pre-v14).
+ * Total per record at v31: 56 + name_len + 8*dead_count
+ *                          + 4 + 32*cold_dead_count
+ *                          + 4 + 8*boot_dead_count bytes.
  * Crypt + I/O follow the alloc_roots pattern. v13 → v14 is a hard
  * format break enforced by STM_UB_VERSION mismatch at uberblock
  * validation (uberblock.c returns STM_EBADVERSION); the snapshot

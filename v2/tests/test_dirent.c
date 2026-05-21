@@ -395,12 +395,12 @@ STM_TEST(dirent_arg_validation) {
 /* test_fs.                                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(dirent_ub_version_is_v30) {
-    /* 9.7-impl-1b bumped STM_UB_VERSION 29 → 30 for the per-dataset
-     * metadata-tree substrate (v2/include/stratum/super.h). The dirent
-     * layer's on-disk format is unchanged since v25 but rides the
-     * latest version constant. */
-    STM_ASSERT_EQ(STM_UB_VERSION, 30u);
+STM_TEST(dirent_ub_version_is_v31) {
+    /* 9.7-impl-2-routing bumped STM_UB_VERSION 30 → 31 for the new
+     * snap-record bootstrap-tier dead-list tail. The dirent layer's
+     * on-disk format is unchanged since v25 but rides the latest
+     * version constant. */
+    STM_ASSERT_EQ(STM_UB_VERSION, 31u);
 }
 
 /* R73 P2-1: stm_dirent_drop_for_dir bulk-removes every record keyed
