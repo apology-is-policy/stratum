@@ -1210,12 +1210,16 @@ STM_TEST(fs_keyschema_sweep_succeeds_after_overwrite_drops_ref) {
 }
 
 STM_TEST(fs_io_unprovisioned_dataset_id_refused) {
-    /* fs_write on a dataset_id that has no DEK installed must return
-     * STM_ENOENT, NOT silently encrypt under a fallback key. P7-13
-     * adds stm_fs_create_dataset which bundles dataset_index +
-     * keyschema provisioning; this test still pins the explicit-
-     * failure contract for ids that pre-date the create call (or
-     * were imported by other means). */
+    /* fs_write on a dataset_id that isn't provisioned must return
+     * STM_ENOENT, NOT silently encrypt under a fallback key.
+     *
+     * 9.7-impl-1c-v: provisioning under per-dataset metadata-tree
+     * engines requires BOTH dataset_index presence AND a DEK in the
+     * keyschema; `stm_fs_create_dataset` bundles them. The pre-1c-v
+     * "import-only" shortcut (add_dataset_key without create_dataset)
+     * is retired — write to an id that has a key but isn't PRESENT
+     * in dataset_idx still fails STM_ENOENT, and the test pins the
+     * full-provisioning happy path via stm_fs_create_dataset. */
     make_tmp("dek_unprov");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -1224,18 +1228,16 @@ STM_TEST(fs_io_unprovisioned_dataset_id_refused) {
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
     uint8_t buf[4096] = {0};
-    /* ds=42 has no DEK — refuse. */
+    /* ds=42 has no DEK + isn't present in dataset_idx — refuse. */
     STM_ASSERT_ERR(stm_fs_write(fs, 42, 1, 0, buf, sizeof buf), STM_ENOENT);
 
-    /* Provision ds=42 → write succeeds. */
-    stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_hybrid_keys wk;
-    STM_ASSERT_OK(stm_keyfile_load(g_key_path, &wk));
-    uint64_t kid = 0;
-    STM_ASSERT_OK(stm_sync_add_dataset_key(sync, 42, &wk, NULL, &kid));
-    STM_ASSERT_OK(stm_fs_write(fs, 42, 1, 0, buf, sizeof buf));
+    /* Full provisioning via stm_fs_create_dataset: bundles
+     * dataset_index + keyschema. The new id is monotonically
+     * assigned (root claimed id=1; first child = 2). */
+    uint64_t new_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "ds42", &new_id));
+    STM_ASSERT_OK(stm_fs_write(fs, new_id, 1, 0, buf, sizeof buf));
 
-    stm_hybrid_keys_wipe(&wk);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);

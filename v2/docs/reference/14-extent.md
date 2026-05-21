@@ -33,31 +33,90 @@ helpers (`stm_extent_encrypt` / `stm_extent_decrypt`) and the index
 API. Both relate to extents but are independent — encrypt/decrypt
 serve the data-plane payload; the index serves metadata.
 
-### Persistence (9.6-impl-4d — btree_engine-backed, v29)
+### Persistence (9.7-impl-1c-v — per-dataset metadata-tree engines, v30)
 
 ```c
-stm_status stm_extent_index_set_storage    (idx, bdev_0, boot_0);
-stm_status stm_extent_index_set_crypt_ctx  (idx, key, pool_uuid, dev_uuid_0);
-stm_status stm_extent_index_load_at        (idx, root_paddr, root_gen, csum);
-stm_status stm_extent_index_commit         (idx, target_gen, *out_paddr, *out_csum);
-/* Three-phase commit (the form stm_sync_commit drives): */
-stm_status stm_extent_index_commit_flush   (idx, target_gen,
-                                              *out_paddr, *out_gen, out_csum);
-stm_status stm_extent_index_commit_finalize(idx);
-stm_status stm_extent_index_commit_abort   (idx);
-stm_status stm_extent_index_get_root       (idx, *out_paddr, out_csum);
-stm_status stm_extent_index_get_gen        (idx, *out_root_gen);
-stm_status stm_extent_index_verify         (idx);
+stm_status stm_extent_index_attach_dataset_index(idx, ds_idx);
+stm_status stm_extent_index_mount_validate     (idx);
+stm_status stm_extent_index_verify             (idx);
 ```
 
-At 9.6-impl-4d the extent index is `btree_engine`-backed
+At 9.7-impl-1c-v the extent module owns NO storage of its own. Each
+dataset's extent records live in that dataset's per-dataset
+`btree_engine` (the substrate from 9.7-impl-1c-i), resolved via the
+attached `stm_dataset_index *`.
+
+**Key layout** (17 bytes — UB v30):
+
+```
+off  size  field                       contract
+ 0     1   u8   STM_METAKEY_KIND_EXTENT  metakey tag (=0x04)
+ 1     8   le64 ino                     non-zero
+ 9     8   le64 file_offset             byte offset within file
+```
+
+The 24-byte `(le64 dataset_id || le64 ino || le64 offset)` form is
+retired. The dataset id is now woven into the engine's AEAD
+additional-data via the engine's `tree_id = dataset_id`; a
+cross-dataset substitution attack fails decrypt rather than relying
+on the key prefix.
+
+**Value layout** (108 bytes — P7-CAS-11 / v21) UNCHANGED. Same
+HOT/COLD discriminator + replicas + gen + origin tuple + read_count
+tail.
+
+**Retired persistence API** (pre-1c-v):
+`stm_extent_index_set_storage` / `_set_crypt_ctx` / `_load_at` /
+`_commit` / `_commit_flush` / `_commit_finalize` / `_commit_abort` /
+`_get_root` / `_get_gen` — none of these exist post-1c-v. The
+remaining commit machinery lives in the dataset_index's M-engine
+cascade: `stm_dataset_index_commit_engines_{flush,finalize,abort}`
+drives every PRESENT dataset's per-dataset engine in lockstep with
+the dataset_index commit.
+
+**Mount discipline**: `stm_extent_index_create(current_txg)` →
+`stm_extent_index_attach_dataset_index(idx, ds_idx)` ONCE (re-attach
+refused) → `stm_extent_index_mount_validate(idx)` (the cross-pool
+sweep that replaces what `stm_extent_index_load_at` used to do as a
+single tree scan: it walks every PRESENT dataset's engine over its
+EXTENT subspace via `ex_global_walk_locked`, raises current_txg =
+max(write_gen) and validates NoOverlapWithinIno +
+SharedReplicasAreCohabit + per-record invariants).
+
+**UB field retirement**: `ub_extent_root` / `ub_extent_root_gen` /
+`ub_extent_root_csum` stamped ZERO at v30. The `extent_csum` slot in
+`compute_merkle_root` is also zero bytes. Per-dataset engine roots
+are transitively covered by `main_csum` (the dataset_index tree's
+root csum, which serializes each slot's
+`(di_tree_root, di_root_gen, di_root_csum)` triple). Full UB field
+retirement to reserved-on-the-wire happens at 1c-vi when all four
+pool-global engines (inode, dirent, xattr, extent) are retired
+together.
+
+**Cross-pool walk discipline** (load-bearing new pattern):
+`ex_global_walk_locked` is the single chokepoint for paddr-uniqueness
+/ cohabit-check / lookup_by_paddr / count / mount_validate. Two-phase
+implementation: phase 1 collects PRESENT dataset_ids via
+`stm_dataset_iter` (the iter holds dataset_idx's internal mutex
+during its callback — we CANNOT call
+`stm_dataset_index_get_engine` from inside or we re-enter the same
+mutex and EDEADLK abort). Phase 2 iterates the collected id buffer +
+resolves + scans each engine over the EXTENT subspace
+`[tag||0||0 .. tag||MAX||MAX]`. Bounded by N_datasets ×
+extents-per-dataset; acceptable at small-N. A paddr→extent in-RAM
+index is the forward-noted perf optimization, deferred until data
+motivates.
+
+**Pre-1c-v context** (kept for historical reference; pre-1c-v
+context if reading an older audit):
+
+At 9.6-impl-4d the extent index was `btree_engine`-backed
 (incremental-COW B+tree), the same persistence substrate the inode /
-dirent / xattr indices use as of 9.6-impl-4b/c. The on-disk key + value
-layout for individual extent records is UNCHANGED — 24-byte key
-(le64 dataset_id ‖ le64 ino ‖ le64 offset), 108-byte value (v21
-HOT/COLD discriminator + replicas + gen + origin tuple + read_count).
-What changes is the on-disk envelope around them: the prior
-`btree_store` whole-tree-rebuild MVP becomes the engine's
+dirent / xattr indices used as of 9.6-impl-4b/c. The on-disk key was
+24 bytes (`le64 dataset_id || le64 ino || le64 offset`); the value
+shape (108 bytes / v21) is UNCHANGED at 1c-v. What changed at
+9.6-impl-4d is the on-disk envelope around them: the prior
+`btree_store` whole-tree-rebuild MVP became the engine's
 incremental-COW B+tree (16 KiB nodes, AEAD-encrypted via the
 shared crypt ctx, per-node BLAKE3 Merkle csum).
 

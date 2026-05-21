@@ -1389,13 +1389,16 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                                                  s->pool_uuid, s->device_uuid);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
-        /* P7-3: extent index, same wiring shape. */
+        /* 9.7-impl-1c-v: extent index. The module no longer owns its
+         * own btree_engine — records live in each dataset's per-dataset
+         * engine (the substrate from 9.7-impl-1c-i), resolved via the
+         * attached dataset index. The pool-global tree under
+         * ub_extent_root is RETIRED; stamped zero at v30 (full
+         * retirement lands at 1c-vi). */
         rc = stm_extent_index_create(/*current_txg=*/0, &s->extent_idx);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
-        rc = stm_extent_index_set_storage(s->extent_idx, d, boot);
-        if (rc != STM_OK) { stm_sync_close(s); return rc; }
-        rc = stm_extent_index_set_crypt_ctx(s->extent_idx, s->metadata_key,
-                                                s->pool_uuid, s->device_uuid);
+        rc = stm_extent_index_attach_dataset_index(s->extent_idx,
+                                                    s->dataset_idx);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
         /* P7-15: repair-log index. Plaintext + Merkle-covered (no
@@ -2036,31 +2039,38 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         si = stm_snapshot_index_get_next_id(s2->snap_idx, &s2->next_snap_id);
         if (si != STM_OK) { stm_sync_close(s2); return si; }
 
-        /* P7-3: extent index. */
+        /* 9.7-impl-1c-v: extent index. Same shape as inode / dirent /
+         * xattr at 1c-ii / 1c-iii / 1c-iv — the module borrows the
+         * dataset index and routes every op to a per-dataset engine.
+         * The pool-global tree under ub_extent_root is RETIRED — at
+         * v30 the UB fields are stamped zero and the on-disk tree
+         * isn't read at mount. */
         stm_status ei = stm_extent_index_create(/*current_txg=*/0,
                                                     &s2->extent_idx);
         if (ei != STM_OK) { stm_sync_close(s2); return ei; }
-        ei = stm_extent_index_set_storage(s2->extent_idx, meta_bdev, boot2);
-        if (ei != STM_OK) { stm_sync_close(s2); return ei; }
-        ei = stm_extent_index_set_crypt_ctx(s2->extent_idx, s2->metadata_key,
-                                                s2->pool_uuid, s2->device_uuid);
+        ei = stm_extent_index_attach_dataset_index(s2->extent_idx,
+                                                    s2->dataset_idx);
         if (ei != STM_OK) { stm_sync_close(s2); return ei; }
 
-        uint64_t epaddr = stm_load_le64(ub.ub_extent_root.bp_paddr);
-        uint64_t egen   = stm_load_le64(ub.ub_extent_root_gen);
-        if (epaddr != 0) {
-            if (ub.ub_extent_root.bp_kind != STM_BPTR_KIND_EXTENT_TREE) {
-                stm_sync_close(s2);
-                return STM_ECORRUPT;
-            }
-            stm_status ls = stm_extent_index_load_at(s2->extent_idx,
-                                                         epaddr, egen,
-                                                         ub.ub_extent_root.bp_csum);
-            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
-        }
-        s2->extent_root_paddr = epaddr;
-        s2->extent_root_gen   = egen;
-        memcpy(s2->extent_root_csum, ub.ub_extent_root.bp_csum, 32);
+        /* 9.7-impl-1c-v: max(write_gen) is now reconstructed by
+         * walking every PRESENT dataset's engine via the dedicated
+         * mount validator. This MUST run AFTER s2->dataset_idx has
+         * opened every slot's engine (which happens lazily on first
+         * stm_dataset_index_get_engine OR via dataset_index_load_at
+         * for stored entries). For freshly-formatted pools and pools
+         * with no extents the walk is a no-op; for hydrated pools the
+         * walk raises s2->extent_idx->current_txg to the persisted
+         * max so post-mount writes pass BirthTxgBound. */
+        stm_status mv = stm_extent_index_mount_validate(s2->extent_idx);
+        if (mv != STM_OK) { stm_sync_close(s2); return mv; }
+
+        /* The pool-global ub_extent_root fields are stamped ZERO at
+         * v30; the per-dataset engine roots are transitively covered
+         * by main_csum (the dataset_index tree's root csum). The
+         * mirrors below stay zero for the lifetime of the mount. */
+        s2->extent_root_paddr = 0;
+        s2->extent_root_gen   = 0;
+        memset(s2->extent_root_csum, 0, 32);
 
         /* P7-15: repair-log index. Plaintext + Merkle-covered, so
          * load_at takes (root_paddr, expected_csum) plus the
@@ -2689,63 +2699,30 @@ stm_status stm_sync_commit(stm_sync *s)
         return ccs;
     }
 
-    /* P7-3 (v12) / 9.6-impl-4d: FLUSH the extent index. The extent
-     * module is now btree_engine-backed (incremental-COW B+tree); its
-     * commit is three-phase. commit_flush writes the dirty root-to-leaf
-     * paths to fresh paddrs at target_gen and returns the PROSPECTIVE
-     * (paddr, gen, csum) — durable only after commit_finalize in
-     * Phase 3 (the engine's durable root still names the previous tree
-     * until then). The prospective triple feeds compute_merkle_root +
-     * build_uberblock exactly as the old single-shot out-params did.
-     *
-     * Extent is the FIRST of the four engine-backed flushes (extent →
-     * inode → dirent → xattr). From here until the finalize the engine
-     * holds a pending-commit window: EVERY error `return` between this
-     * flush and the finalize MUST stm_extent_index_commit_abort first.
-     * A failed commit_flush itself opens NO window (it self-reverts),
-     * so the abort is paired only with a SUCCESSFUL flush — the flush's
-     * own failure return below needs no abort. */
+    /* 9.7-impl-1c-ii / 1c-iii / 1c-iv / 1c-v: the four pool-global
+     * metadata-tree engines (inode, dirent, xattr, extent) are RETIRED.
+     * Per-dataset records flow through the SAME M-engine cascade —
+     * stm_dataset_index_commit_engines_flush ran BEFORE the
+     * dataset_index_commit call above; that single flush covered
+     * inode + dirent + xattr + extent records side-by-side in each
+     * PRESENT dataset's engine (distinguished by metakey tag byte).
+     * The pool Merkle root inputs (inode_csum / dirent_csum /
+     * xattr_csum / extent_csum) are ZERO bytes — every per-dataset
+     * engine's root is transitively covered by `main_csum` (the
+     * dataset_index tree's root csum, which serializes each slot's
+     * (di_tree_root, di_root_gen, di_root_csum) triple). UB
+     * ub_{inode,dirent,xattr,extent}_root/_csum/_gen are stamped
+     * zero. Full UB field retirement to reserved-on-the-wire lands
+     * at 1c-vi. */
     uint64_t extent_paddr = 0;
     uint8_t  extent_csum[32] = {0};
     uint64_t extent_gen = 0;
-    stm_status ecs = stm_extent_index_commit_flush(s->extent_idx, target_gen,
-                                                     &extent_paddr, &extent_gen,
-                                                     extent_csum);
-    if (ecs != STM_OK) {
-        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return ecs;
-    }
-
-    /* 9.7-impl-1c-ii: inode tree's per-pool engine is RETIRED. Per-
-     * dataset inode records flush as part of the M-engine cascade
-     * (commit_engines_flush) that ran BEFORE dataset_index_commit
-     * above. The inode_csum slot in the pool Merkle root is zero
-     * bytes at v30 (transitively covered by main_csum). UB
-     * ub_inode_root/_csum/_gen are stamped zero. Full UB field
-     * retirement to reserved-on-the-wire lands at 1c-vi. */
     uint64_t inode_paddr = 0;
     uint8_t  inode_csum[32] = {0};
     uint64_t inode_gen = 0;
-
-    /* 9.7-impl-1c-iii: dirent tree's per-pool engine is RETIRED. Per-
-     * dataset dirent records flush as part of the M-engine cascade
-     * (commit_engines_flush) that ran BEFORE dataset_index_commit
-     * above. The dirent_csum slot in the pool Merkle root is zero
-     * bytes at v30 (transitively covered by main_csum). UB
-     * ub_dirent_root/_csum/_gen are stamped zero. Full UB field
-     * retirement to reserved-on-the-wire lands at 1c-vi. */
     uint64_t dirent_paddr = 0;
     uint8_t  dirent_csum[32] = {0};
     uint64_t dirent_gen = 0;
-
-    /* 9.7-impl-1c-iv: xattr tree's per-pool engine is RETIRED. Per-
-     * dataset xattr records flush as part of the M-engine cascade
-     * (commit_engines_flush) that ran BEFORE dataset_index_commit
-     * above. The xattr_csum slot in the pool Merkle root is zero
-     * bytes at v30 (transitively covered by main_csum). UB
-     * ub_xattr_root/_csum/_gen are stamped zero. Full UB field
-     * retirement to reserved-on-the-wire lands at 1c-vi. */
     uint64_t xattr_paddr = 0;
     uint8_t  xattr_csum[32] = {0};
     uint64_t xattr_gen = 0;
@@ -2753,7 +2730,6 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_alloc_stats astats;
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
-        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return sr;
@@ -2797,51 +2773,45 @@ stm_status stm_sync_commit(stm_sync *s)
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
-        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return ms;
     }
 
     /* 9.6-impl-4b-iii: the explicit durable-bitmap barrier. Every
-     * engine-backed index's commit_flush above did vt->reserve (set
-     * node bits in the bootstrap bitmap IN RAM) + vt->write (node
-     * bytes straight to the device); stm_bootstrap_commit is what
-     * makes those bitmap bits DURABLE — it COWs the bitmap to its
-     * other slot + fsyncs. It MUST run strictly BEFORE the final
-     * uberblock write (9.6-impl-4b design §5.2 case A): a crash with
-     * the bitmap durable but the UB stale leaks the freshly-flushed
-     * nodes (bounded, non-corrupting); the reverse order — UB
-     * durable, bitmap stale — would let a later reserve re-hand a
-     * still-rooted paddr and corrupt the tree.
+     * engine's commit_flush above did vt->reserve (set node bits in
+     * the bootstrap bitmap IN RAM) + vt->write (node bytes straight
+     * to the device); stm_bootstrap_commit is what makes those
+     * bitmap bits DURABLE — it COWs the bitmap to its other slot +
+     * fsyncs. It MUST run strictly BEFORE the final uberblock write
+     * (9.6-impl-4b design §5.2 case A): a crash with the bitmap
+     * durable but the UB stale leaks the freshly-flushed nodes
+     * (bounded, non-corrupting); the reverse order — UB durable,
+     * bitmap stale — would let a later reserve re-hand a still-
+     * rooted paddr and corrupt the tree.
      *
      * `boot` is device 0's shared bootstrap — the same handle every
      * metadata index borrows.
      *
-     * At 4d the extent / inode / dirent / xattr trees are ALL
-     * engine-backed and rely on this single barrier (extent's monolithic
-     * _commit's internal stm_bootstrap_commit call is retired from this
-     * code path; the test-only stm_extent_index_commit still calls it
-     * for unit-test isolation). The remaining btree_store-backed trees
-     * (dataset / snapshot / cas / repair_log) ALSO call
-     * stm_bootstrap_commit internally at this same target_gen, so this
-     * explicit call is redundant-but-cheap for them (it advances
-     * bitmap_gen + fsyncs an unchanged bitmap — idempotent at the same
-     * gen).
+     * 9.7-impl-1c-v: the four pool-global engines (inode, dirent,
+     * xattr, extent) are RETIRED. The M-engine cascade's
+     * commit_engines_flush above is the SOLE source of dirty bitmap
+     * bits at v30; the remaining btree_store-backed trees (dataset /
+     * snapshot / cas / repair_log) ALSO call stm_bootstrap_commit
+     * internally at this same target_gen, so this explicit call is
+     * redundant-but-cheap for them (idempotent at the same gen).
      *
-     * On failure all four pending flushes are aborted
-     * (crash-equivalent) and the commit returns — the fs wedges +
-     * remounts off the previous (still-consistent) uberblock. */
+     * On failure the M-cascade is aborted (crash-equivalent) and the
+     * commit returns — the fs wedges + remounts off the previous
+     * (still-consistent) uberblock. */
     stm_bootstrap *boot = stm_alloc_bootstrap(s->alloc);
     if (!boot) {
-        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
     stm_status bcs = stm_bootstrap_commit(boot, target_gen);
     if (bcs != STM_OK) {
-        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return bcs;
@@ -2877,19 +2847,17 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status fw = write_ub_to_all_devices(s, &fin_prototype,
                                                 fin_label, fin_slot);
     if (fw != STM_OK) {
-        (void)stm_extent_index_commit_abort(s->extent_idx);
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return fw;
     }
 
-    /* 9.6-impl-4b-iii / 9.6-impl-4c / 9.7-impl-1c-ii: the final
-     * uberblock landed — THIS is the commit point. Adopt each engine's
-     * flushed root as its durable root and deferred-free the
-     * superseded paddrs (commit_finalize). After a successful
-     * commit_flush, finalize is INFALLIBLE per the engine header
-     * contract — the lone failure exit is STM_EINVAL for
-     * no-pending-flush, unreachable here; the check is defense-in-depth.
+    /* 9.7-impl-1c-v: the final uberblock landed — THIS is the commit
+     * point. The four pool-global engines (inode, dirent, xattr,
+     * extent) are RETIRED; finalize every previously-flushed per-
+     * dataset engine (inode + dirent + xattr + extent records all
+     * flow through the M-cascade) so each adopts its freshly-stamped
+     * triple as durable.
      *
      * This is POST-commit-point, so there is NO abort on failure: the
      * new uberblock is already durable; an abort would revert the
@@ -2897,30 +2865,9 @@ stm_status stm_sync_commit(stm_sync *s)
      * written UB. The error return wedges the fs (R154 Q2 verifies
      * the fs.c caller wedges on any stm_sync_commit error) — the
      * wedge forces a remount that reloads the NEW uberblock and
-     * reopens the engines fresh at the NEW roots, consistent. A crash
-     * in this same window behaves identically (4b design §5.4 case
-     * c): new trees intact, superseded nodes merely leaked.
-     *
-     * 9.7-impl-1c-ii: the per-pool inode finalize is RETIRED; the
-     * per-dataset inode records' finalize lives in the M-cascade
-     * commit_engines_finalize below (every PRESENT dataset's engine).
-     * 9.7-impl-1c-iii: the per-pool dirent finalize is RETIRED for
-     * the same reason; per-dataset dirent records finalize in the
-     * same M-cascade pass.
-     * 9.7-impl-1c-iv: the per-pool xattr finalize is RETIRED for
-     * the same reason; per-dataset xattr records finalize in the
-     * same M-cascade pass. */
-    stm_status efs = stm_extent_index_commit_finalize(s->extent_idx);
-    if (efs != STM_OK) {
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return efs;
-    }
-    /* 9.7-impl-1c-ii / 1c-iii / 1c-iv: finalize every previously-
-     * flushed per-dataset engine (inode + dirent + xattr records all
-     * flow through here as of 1c-iv). After the M-cascade flush ran
-     * cleanly (above) the pending engines now adopt their
-     * freshly-stamped triples as durable. Same POST-UB posture as
-     * the extent finalize — failure wedges the fs. */
+     * reopens the engines fresh at the NEW roots. A crash in this
+     * same window behaves identically (4b design §5.4 case c): new
+     * trees intact, superseded nodes merely leaked. */
     stm_status mfs = stm_dataset_index_commit_engines_finalize(s->dataset_idx);
     if (mfs != STM_OK) {
         pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);

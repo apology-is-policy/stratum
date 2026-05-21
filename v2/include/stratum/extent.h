@@ -36,6 +36,11 @@ extern "C" {
 struct stm_bdev;       typedef struct stm_bdev       stm_bdev;
 struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
 
+/* Forward-decl (9.7-impl-1c-v): the extent module borrows a dataset
+ * index via stm_extent_index_attach_dataset_index. */
+struct stm_dataset_index;
+typedef struct stm_dataset_index stm_dataset_index;
+
 /* ARCH §7.6.1 AD magic / version. */
 #define STM_AD_MAGIC_EXTENT     UINT32_C(0x44545845)   /* 'EXTD' */
 #define STM_AD_VERSION_EXTENT   1u
@@ -1016,170 +1021,89 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
                                        size_t *out_count);
 
 /* ========================================================================= */
-/* Persistence (P7-3, v12).                                                   */
+/* Persistence (9.7-impl-1c-v: per-dataset metadata-tree engines).            */
+/*                                                                            */
+/* As of 9.7-impl-1c-v the extent module owns NO storage of its own. Each    */
+/* dataset's extent records live in that dataset's per-dataset btree_engine  */
+/* (the substrate from 9.7-impl-1c-i), keyed by `stm_metakey_compose`:       */
+/*                                                                            */
+/*   key (17 bytes): le8 STM_METAKEY_KIND_EXTENT || le64 ino                 */
+/*                   || le64 file_offset                                      */
+/*   value (108 bytes): kind-discriminated (HOT / COLD) layout per P7-CAS    */
+/*   /v18 + v21 tail — unchanged from 9.6-impl-4d.                            */
+/*                                                                            */
+/* The dataset id is folded into the engine's AEAD additional-data via the   */
+/* engine's tree_id; cross-dataset substitution attacks fail decrypt.        */
+/* That is why the key no longer carries the dataset_id prefix it had at    */
+/* P7-3 / 9.6-impl-4d.                                                        */
+/*                                                                            */
+/* The pool-global `ub_extent_root` / `ub_extent_root_gen` /                  */
+/* `ub_extent_root_csum` fields are stamped ZERO at 1c-v; the extent_csum    */
+/* slot in the pool Merkle root is also zero bytes. The per-dataset engine  */
+/* roots are transitively covered by `main_csum` (the dataset_index tree's  */
+/* root csum, which serializes each slot's (di_tree_root, di_root_gen,      */
+/* di_root_csum) triple). Full UB field retirement to reserved-on-the-wire  */
+/* happens at 1c-vi when all four pool-global engines (inode, dirent, xattr,*/
+/* extent) are retired together.                                             */
+/*                                                                            */
+/* Cross-pool perf forward-note (9.6-impl-4d carry, sharpened at 1c-v):     */
+/* `stm_extent_lookup_by_paddr`, `stm_extent_count`, and the mount-time     */
+/* validate sweep all iterate EVERY PRESENT dataset's engine, scanning its  */
+/* EXTENT subspace. Bounded by N_datasets × extents-per-dataset; acceptable */
+/* at small-N and infrequent (scrub β / count). An in-RAM paddr→extent      */
+/* index would lift the scrub cost; deferred until perf data justifies it.  */
+/* The frequent-write paddr-uniqueness check (`stm_extent_write` /           */
+/* `_overwrite` / `_reflink`) ALSO needs the cross-pool scan; this is the    */
+/* known degradation from the in-RAM records[] era and is the load-bearing  */
+/* correctness gate for extent.tla::PaddrFreshness (LiveReplicasDisjoint).  */
 /* ========================================================================= */
 
 /*
- * The extent index is persisted as a btree_store-encoded, AEAD-encrypted
- * Bε-tree under `ub_extent_root`. Same envelope as the dataset / snapshot
- * trees — AEAD nonce `paddr || gen || pool_uuid`, AD `pool_uuid ||
- * device_uuid_0`, idempotent commit via internal dirty flag, atomic
- * shadow-swap on load_at.
+ * 9.7-impl-1c-v: attach the dataset index. The extent module borrows
+ * the `ds_idx` pointer; the caller MUST keep it alive for the extent
+ * index's lifetime. The attach is one-time — re-binding returns
+ * STM_EINVAL.
  *
- * Key (24 bytes, lexicographically sorted):
+ * Lifetime: idx and ds_idx are typically both owned by stm_sync; they
+ * are created together at open and destroyed together at close. The
+ * borrow is safe by construction in the production path.
  *
- *   off  size  field
- *    0    8    dataset_id (le64)
- *    8    8    ino        (le64)
- *   16    8    offset     (le64) — byte offset within the file
+ * Every public extent op resolves the dataset's per-dataset engine via
+ * the attached ds_idx, lazily opening the engine on first use per
+ * `stm_dataset_index_get_engine`.
  *
- * Value (32 bytes, ARCH §11.6.1 stm_extent_v2 layout):
- *
- *   off  size  field
- *    0    8    paddr            (le64)
- *    8    8    write_gen        (le64)
- *   16    4    dlen             (le32) — logical byte length
- *   20    4    clen_and_comp    (le32) — low 24: stored length; high 8: comp algo
- *   24    8    xxh              (le64) — 0 in this MVP (AEAD tag is integrity)
- *
- * Total: 32 bytes per ARCH §11.6.1.
- *
- * MVP caps:
- *   - `len` must fit in 24 bits (≤ 0xFFFFFF; ~16 MiB-1) so both `dlen`
- *     and `clen` (low 24 bits of clen_and_comp) can hold it without
- *     compression. Production recordsizes (default 128 KiB) are far
- *     under this. Refuse with STM_ERANGE on commit if any extent's
- *     length exceeds the cap.
- *   - Compression algorithm field is always 0 (no compression in this
- *     MVP).
- *   - `xxh` is always 0 (AEAD tag is the integrity check; the
- *     unencrypted-extent path with non-zero xxh is a future extension).
- *
- * The unified key shape (ds || ino || off) places all extents in a
- * single Bε-tree under `ub_extent_root`. ARCH §11.6.2 specifies a
- * per-file Bε-tree keyed by `(ino, type, offset)`; the unified MVP
- * here is structurally compatible (no semantic divergence) and the
- * migration to per-file or per-dataset trees is incremental.
+ * Refusals:
+ *   - NULL idx OR NULL ds_idx (STM_EINVAL).
+ *   - Re-attach (STM_EINVAL — the attach is one-time).
  */
-
 STM_MUST_USE
-stm_status stm_extent_index_set_storage(stm_extent_index *idx,
-                                           stm_bdev *bdev_0,
-                                           stm_bootstrap *boot_0);
-
-STM_MUST_USE
-stm_status stm_extent_index_set_crypt_ctx(stm_extent_index *idx,
-                                             const uint8_t *metadata_key,
-                                             const uint64_t pool_uuid[2],
-                                             const uint64_t device_uuid_0[2]);
+stm_status stm_extent_index_attach_dataset_index(stm_extent_index *idx,
+                                                stm_dataset_index *ds_idx);
 
 /*
- * Hydrate the index from on-disk state. Wipes existing in-RAM extent
- * records and replaces with the on-disk contents. Sets dirty=false on
- * success.
+ * 9.7-impl-1c-v: mount-time validator. After every PRESENT dataset's
+ * engine has been opened and the per-dataset slot triples loaded, the
+ * sync layer calls this to perform the cross-pool sweep that
+ * `stm_extent_index_load_at` used to do as a single tree scan:
  *
- * `root_paddr` MUST be non-zero (the caller checks for "no commit yet"
- * by inspecting the UB before invoking). `root_gen` is the AEAD gen
- * at which the tree was last serialized (= ub_extent_root_gen).
- * `expected_csum` is the Merkle link from ub_extent_root.bp_csum.
+ *   - max(write_gen) across every extent record → bumps current_txg
+ *     so post-mount writes pass BirthTxgBound;
+ *   - NoOverlapWithinIno across every (ds, ino);
+ *   - SharedReplicasAreCohabit across every replica-set share;
+ *   - Length / origin / off+len-overflow per-record invariants from
+ *     ex_decode_value.
  *
- * On success, current_txg is bumped to max(loaded write_gen) per
- * extent.tla::BirthTxgBound — post-mount Write/Overwrite must not stamp
- * extents with gen less than the highest persisted gen.
- *
- * Returns STM_OK on full hydration; STM_ECORRUPT on Merkle mismatch
- * or malformed entries (zero ds/ino, zero len, key/value length
- * mismatch, NoOverlapWithinIno violation, paddr collision among
- * loaded records); STM_EBADTAG on AEAD failure; STM_EINVAL on
- * missing storage / crypt ctx.
+ * Returns STM_OK on a clean sweep; STM_ECORRUPT on any invariant
+ * violation; STM_EINVAL pre-attach.
  */
 STM_MUST_USE
-stm_status stm_extent_index_load_at(stm_extent_index *idx,
-                                       uint64_t root_paddr, uint64_t root_gen,
-                                       const uint8_t expected_csum[32]);
+stm_status stm_extent_index_mount_validate(stm_extent_index *idx);
 
 /*
- * Serialize current state, AEAD-encrypt, write a fresh root, free the
- * previous root's nodes (if any), return new (paddr, csum).
- *
- * Idempotent when clean (dirty=false + prior commit exists): returns
- * cached values without on-disk activity. Mandatory for
- * quorum.tla::ContentQuorumAtGen under retry — sync_commit may invoke
- * us multiple times at the same target_gen and every call must produce
- * byte-identical UB bytes across devices.
- *
- * `committed_gen` is the AEAD gen for the new root AND the free_gen for
- * reclaiming the previous root.
- *
- * Returns STM_ERANGE if any live extent's length exceeds the MVP
- * 24-bit cap (see preamble).
+ * Re-verify on a live index. Same shape as mount_validate but used as
+ * an explicit integrity check (e.g., test harnesses). Returns
+ * STM_OK on a clean sweep; STM_ECORRUPT on violation.
  */
-STM_MUST_USE
-stm_status stm_extent_index_commit(stm_extent_index *idx,
-                                      uint64_t committed_gen,
-                                      uint64_t *out_root_paddr,
-                                      uint8_t out_root_csum[32]);
-
-/*
- * Three-phase commit (9.6-impl-4d). The form stm_sync_commit drives.
- *
- *   _commit_flush(idx, committed_gen, &paddr, &gen, csum) — open a
- *     pending-commit window: flush every dirty path to fresh paddrs
- *     at committed_gen and return the prospective (paddr, gen, csum)
- *     triple. The durable root (idx->root_*) is NOT touched yet — a
- *     concurrent reader still sees the previous tree's root via
- *     stm_extent_index_get_root. The bootstrap bitmap is NOT
- *     committed here; the sync layer batches a single
- *     stm_bootstrap_commit across all engine flushes.
- *
- *     On STM_OK: pending window open; caller MUST follow with
- *     _commit_finalize (commit-path) OR _commit_abort (failure-path).
- *
- *     On failure: NO pending window opened (the engine self-reverts:
- *     drops the in-memory tree, deferred-frees the freshly-written
- *     paddrs). The caller MUST NOT call _commit_abort — there's
- *     nothing to abort. 9.6-impl-4b design §5.5: a failed
- *     stm_sync_commit is crash-equivalent — the caller wedges the fs.
- *
- *   _commit_finalize(idx) — adopt the flushed root as durable. After
- *     this returns the pending window is closed and idx->root_* names
- *     the new tree. INFALLIBLE after a successful _commit_flush
- *     (btree_engine.h contract); the STM_EINVAL exit is a
- *     no-pending-flush sequencing bug.
- *
- *   _commit_abort(idx) — discard the flush. The freshly-written
- *     paddrs are deferred-freed and the engine reverts to the
- *     durable-root state. idx->root_* is unchanged. Caller's
- *     responsibility to ensure no _commit_finalize call is made
- *     after this returns.
- */
-STM_MUST_USE
-stm_status stm_extent_index_commit_flush(stm_extent_index *idx,
-                                            uint64_t committed_gen,
-                                            uint64_t *out_root_paddr,
-                                            uint64_t *out_root_gen,
-                                            uint8_t out_root_csum[32]);
-
-STM_MUST_USE
-stm_status stm_extent_index_commit_finalize(stm_extent_index *idx);
-
-STM_MUST_USE
-stm_status stm_extent_index_commit_abort(stm_extent_index *idx);
-
-/* Durable root paddr + csum as last persisted by _commit / _load_at.
- * Both zero before any commit. */
-STM_MUST_USE
-stm_status stm_extent_index_get_root(const stm_extent_index *idx,
-                                        uint64_t *out_root_paddr,
-                                        uint8_t out_root_csum[32]);
-
-/* Gen at which the durable root was AEAD-encrypted. May differ from
- * the current commit's gen when _commit idempotent-shortcircuits.
- * 0 before any commit. Stamped into ub_extent_root_gen. */
-STM_MUST_USE
-stm_status stm_extent_index_get_gen(const stm_extent_index *idx,
-                                       uint64_t *out_root_gen);
-
 STM_MUST_USE
 stm_status stm_extent_index_verify(const stm_extent_index *idx);
 

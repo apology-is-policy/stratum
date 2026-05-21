@@ -8,9 +8,11 @@ target_include_directories(stm_extent PUBLIC
 target_link_libraries(stm_extent
     PRIVATE stm_warnings stm_sanitize stm_coverage
     PUBLIC  stm_crypto stm_block stm_bootstrap
-            stm_btree_engine stm_engine_store
+            stm_btree_engine stm_metakey stm_dataset
             Threads::Threads)
-# R156 P3-6 close: stm_btree + stm_btree_store retired from explicit
-# PUBLIC deps — they're pulled in transitively via stm_btree_engine's
-# own PUBLIC deps (for the shared stm_btree_crypt_ctx + btnode constants),
-# and no direct symbol from either is used by extent post-4d.
+# 9.7-impl-1c-v: stm_engine_store no longer needed (engine create / open
+# is now driven from stm_dataset_index's per-slot engine cache). Added
+# stm_metakey (key encoding via stm_metakey_compose / parse) + stm_dataset
+# (per-dataset engine resolution via stm_dataset_index_get_engine). The
+# pool-global engine + its storage-binder APIs are RETIRED — see
+# extent_index.c header comment.
