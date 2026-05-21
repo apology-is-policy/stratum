@@ -259,12 +259,15 @@ struct stm_sync {
     stm_dataset_index  *dataset_idx;
     stm_snapshot_index *snap_idx;
 
-    /* P7-3 (v12): extent-index. Same wiring as dataset_idx / snap_idx —
-     * created at sync_open / sync_create, hydrated from ub_extent_root
-     * + ub_extent_root_gen if non-zero, committed every sync_commit.
-     * The extent index is the data-plane analog of the namespace
+    /* P7-3 (v12): extent-index. The data-plane analog of the namespace
      * indices: it tracks the (ds, ino, off) → (paddr, gen, len)
-     * mapping for every regular file. */
+     * mapping for every regular file.
+     *
+     * 9.7-impl-1c-v / vi: the pool-global engine that backed the
+     * extent index is RETIRED. The module borrows the dataset_index
+     * (see `stm_extent_index_attach_dataset_index`) and routes every
+     * op to the target dataset's per-dataset btree_engine. The
+     * `ub_extent_root` UB field is stamped reserved-zero at v30. */
     stm_extent_index   *extent_idx;
 
     /* P7-15 (v16): repair-log sub-tree (ARCH §7.15.4 /
@@ -283,28 +286,33 @@ struct stm_sync {
      * lifecycle wiring + persistence layer is the foundation. */
     stm_cas_index      *cas_idx;
 
-    /* P8-POSIX-1b (v24): per-pool inode index. Same wiring shape as
-     * extent_idx / cas_idx — AEAD-encrypted Bε-tree under
-     * ub_inode_root on device 0. Keys (le64 dataset_id || le64 ino).
-     * Values: 256-byte stm_inode_value records (ARCH §11.3). Empty
-     * at format time; first sync_commit serializes the empty btree
-     * so subsequent mounts find a valid bptr. */
+    /* P8-POSIX-1b (v24) — 9.7-impl-1c-ii / vi: inode index. The pool-
+     * global engine that backed this module is RETIRED. The module
+     * borrows the dataset_index (see
+     * `stm_inode_index_attach_dataset_index`) and routes every op to
+     * the target dataset's per-dataset btree_engine. Keys live in the
+     * INODE subspace tagged by metakey. Values: 256-byte
+     * stm_inode_value records (ARCH §11.3). ub_inode_root is stamped
+     * reserved-zero at v30. */
     stm_inode_index    *inode_idx;
 
-    /* P8-POSIX-2 (v25): per-pool dirent index. Same wiring shape as
-     * inode_idx — AEAD-encrypted Bε-tree under ub_dirent_root on
-     * device 0. Keys (le64 dataset_id || le64 dir_ino || le64
-     * hash_probe). Values: variable-length 32 + name_len byte dirent
-     * records (ARCH §11.4, spec dirent.tla). Open-addressing chain
-     * integrity per dirent.tla. */
+    /* P8-POSIX-2 (v25) — 9.7-impl-1c-iii / vi: dirent index. Same
+     * shape as inode_idx after the per-dataset cutover — borrows the
+     * dataset_index and routes ops to per-dataset engines. Keys live
+     * in the DIRENT subspace tagged by metakey. Values: variable-
+     * length 32 + name_len byte dirent records (ARCH §11.4, spec
+     * dirent.tla). Open-addressing chain integrity per dirent.tla.
+     * ub_dirent_root is stamped reserved-zero at v30. */
     stm_dirent_index   *dirent_idx;
 
-    /* P8-POSIX-6 (v26): per-pool xattr index. Same wiring shape as
-     * dirent_idx — AEAD-encrypted Bε-tree under ub_xattr_root on
-     * device 0. Keys (le64 dataset_id || le64 ino || le64
-     * hash_probe). Values: variable-length 16 + name_len + value_len
-     * byte xattr records (ARCH §11.5, spec xattr.tla). Open-addressing
-     * chain integrity per xattr.tla. */
+    /* P8-POSIX-6 (v26) — 9.7-impl-1c-iv / vi: xattr index. Same
+     * shape as inode_idx / dirent_idx after the per-dataset cutover —
+     * borrows the dataset_index and routes ops to per-dataset
+     * engines. Keys live in the XATTR subspace tagged by metakey.
+     * Values: variable-length 16 + name_len + value_len byte xattr
+     * records (ARCH §11.5, spec xattr.tla). Open-addressing chain
+     * integrity per xattr.tla. ub_xattr_root is stamped reserved-zero
+     * at v30. */
     stm_xattr_index    *xattr_idx;
 
     /* P7-CAS-4b: FastCDC chunker for the cold-tier migration path. The
@@ -357,16 +365,24 @@ struct stm_sync {
     /* Durable mirror of ub_main_root / ub_snap_root state, last-
      * committed. Updated on successful sync_commit; consumed by
      * claim/reservation-phase build_uberblock to keep the prior
-     * roots intact across the gen bump. Zero before first commit. */
+     * roots intact across the gen bump. Zero before first commit.
+     *
+     * 9.7-impl-1c-vi: the four pool-global metadata-tree mirrors
+     * (extent_root_* / inode_root_* / dirent_root_* / xattr_root_*)
+     * are RETIRED. Per-dataset records flow through the M-engine
+     * cascade; each PRESENT dataset's per-dataset engine root lives
+     * in its dataset_slot triple (di_tree_root / di_root_gen /
+     * di_root_csum) and is transitively covered by main_csum (the
+     * dataset_index tree's root csum). The corresponding UB fields
+     * (ub_{extent,inode,dirent,xattr}_root / _root_gen / _root_csum)
+     * are stamped reserved-zero on every v30 write (via the initial
+     * memset in build_uberblock); reads at v30 ignore them. */
     uint64_t           main_root_paddr;
     uint64_t           main_root_gen;
     uint8_t            main_root_csum[32];
     uint64_t           snap_root_paddr;
     uint64_t           snap_root_gen;
     uint8_t            snap_root_csum[32];
-    uint64_t           extent_root_paddr;
-    uint64_t           extent_root_gen;
-    uint8_t            extent_root_csum[32];
     uint64_t           repair_log_root_paddr;
     uint64_t           repair_log_root_gen;
     uint8_t            repair_log_root_csum[32];
@@ -374,18 +390,6 @@ struct stm_sync {
     uint64_t           cas_index_root_paddr;
     uint64_t           cas_index_root_gen;
     uint8_t            cas_index_root_csum[32];
-    /* P8-POSIX-1b (v24): inode tree root mirrors the cas/extent shape. */
-    uint64_t           inode_root_paddr;
-    uint64_t           inode_root_gen;
-    uint8_t            inode_root_csum[32];
-    /* P8-POSIX-2 (v25): dirent tree root mirrors the inode shape. */
-    uint64_t           dirent_root_paddr;
-    uint64_t           dirent_root_gen;
-    uint8_t            dirent_root_csum[32];
-    /* P8-POSIX-6 (v26): xattr tree root mirrors the dirent shape. */
-    uint64_t           xattr_root_paddr;
-    uint64_t           xattr_root_gen;
-    uint8_t            xattr_root_csum[32];
 
     /* Mirror of ub_next_dataset_id / ub_next_snap_id. Sourced from the
      * indices' get_next_id at commit; restored at mount via
@@ -872,6 +876,13 @@ static stm_status sync_redundancy_decode(uint8_t on_disk_kind,
     }
 }
 
+/* 9.7-impl-1c-vi: the four pool-global metadata-tree roots (extent /
+ * inode / dirent / xattr) are RETIRED. Per-dataset records flow through
+ * the M-engine cascade and live in each PRESENT dataset's slot triple,
+ * transitively covered by main_csum. The corresponding UB fields are
+ * stamped reserved-zero on every v30 write (handled by the initial
+ * memset below — no explicit per-field writes needed at v30). The
+ * function signature dropped the 12 retired params at 1c-vi. */
 static void build_uberblock(stm_uberblock *out,
                               const stm_sync *s,
                               uint16_t target_device_id,
@@ -889,9 +900,6 @@ static void build_uberblock(stm_uberblock *out,
                               const uint8_t snap_root_csum[32],
                               uint64_t snap_root_gen,
                               uint64_t next_snap_id,
-                              uint64_t extent_root_paddr,
-                              const uint8_t extent_root_csum[32],
-                              uint64_t extent_root_gen,
                               uint64_t repair_log_root_paddr,
                               const uint8_t repair_log_root_csum[32],
                               uint64_t repair_log_root_gen,
@@ -899,15 +907,6 @@ static void build_uberblock(stm_uberblock *out,
                               uint64_t cas_index_root_paddr,
                               const uint8_t cas_index_root_csum[32],
                               uint64_t cas_index_root_gen,
-                              uint64_t inode_root_paddr,
-                              const uint8_t inode_root_csum[32],
-                              uint64_t inode_root_gen,
-                              uint64_t dirent_root_paddr,
-                              const uint8_t dirent_root_csum[32],
-                              uint64_t dirent_root_gen,
-                              uint64_t xattr_root_paddr,
-                              const uint8_t xattr_root_csum[32],
-                              uint64_t xattr_root_gen,
                               const uint8_t merkle_root[32],
                               const stm_alloc_stats *astats)
 {
@@ -969,14 +968,11 @@ static void build_uberblock(stm_uberblock *out,
     }
     out->ub_snap_root_gen = stm_store_le64(snap_root_gen);
 
-    /* P7-3 (v12): extent-index tree root + AEAD gen. Same shape as
-     * main_root / snap_root. */
-    if (extent_root_paddr != 0) {
-        out->ub_extent_root.bp_paddr = stm_store_le64(extent_root_paddr);
-        out->ub_extent_root.bp_kind  = STM_BPTR_KIND_EXTENT_TREE;
-        memcpy(out->ub_extent_root.bp_csum, extent_root_csum, 32);
-    }
-    out->ub_extent_root_gen = stm_store_le64(extent_root_gen);
+    /* 9.7-impl-1c-vi: ub_extent_root / ub_extent_root_gen RETIRED.
+     * On a v30 write the bytes are reserved-zero (covered by the
+     * initial `memset(out, 0, sizeof *out)` above). Reads at v30
+     * ignore the fields — per-dataset extent records flow through
+     * the M-engine cascade rooted in main_csum. */
 
     /* P7-15 (v16): repair-log tree root + gen + next_seq counter.
      * Plaintext + Merkle-covered (no AEAD); the gen field tracks
@@ -1003,39 +999,17 @@ static void build_uberblock(stm_uberblock *out,
     }
     out->ub_cas_index_root_gen = stm_store_le64(cas_index_root_gen);
 
-    /* P8-POSIX-1b (v24): inode tree root + AEAD gen. Same shape as
-     * extent_root / cas_index_root. The tree root field
-     * `ub_inode_root` lives at offset 3288 (head of the prior
-     * `ub_reserved`); `ub_inode_root_gen` is the AEAD gen.
-     *
-     * P8-POSIX-2 (v25): dirent tree root + AEAD gen, same shape as
-     * inode_root. `ub_dirent_root` lives at offset 3360 (head of the
-     * prior `ub_reserved` after v24 carve); `ub_dirent_root_gen` at
-     * 3424. Stamped below in lockstep with the inode triple. */
-    if (inode_root_paddr != 0) {
-        out->ub_inode_root.bp_paddr = stm_store_le64(inode_root_paddr);
-        out->ub_inode_root.bp_kind  = STM_BPTR_KIND_INODE_TREE;
-        memcpy(out->ub_inode_root.bp_csum, inode_root_csum, 32);
-    }
-    out->ub_inode_root_gen = stm_store_le64(inode_root_gen);
-
-    if (dirent_root_paddr != 0) {
-        out->ub_dirent_root.bp_paddr = stm_store_le64(dirent_root_paddr);
-        out->ub_dirent_root.bp_kind  = STM_BPTR_KIND_DIRENT_TREE;
-        memcpy(out->ub_dirent_root.bp_csum, dirent_root_csum, 32);
-    }
-    out->ub_dirent_root_gen = stm_store_le64(dirent_root_gen);
-
-    /* P8-POSIX-6 (v26): xattr tree root + AEAD gen. Same shape as
-     * dirent_root. `ub_xattr_root` lives at offset 3432 (head of
-     * the prior `ub_reserved` after v25 carve); `ub_xattr_root_gen`
-     * at 3496. */
-    if (xattr_root_paddr != 0) {
-        out->ub_xattr_root.bp_paddr = stm_store_le64(xattr_root_paddr);
-        out->ub_xattr_root.bp_kind  = STM_BPTR_KIND_XATTR_TREE;
-        memcpy(out->ub_xattr_root.bp_csum, xattr_root_csum, 32);
-    }
-    out->ub_xattr_root_gen = stm_store_le64(xattr_root_gen);
+    /* 9.7-impl-1c-vi: ub_inode_root + ub_dirent_root + ub_xattr_root
+     * (and the corresponding _gen fields) RETIRED on the same shape
+     * as ub_extent_root above. The bytes are reserved-zero on every
+     * v30 write (covered by the initial memset); reads at v30 ignore
+     * the fields. Per-dataset inode + dirent + xattr records flow
+     * through the M-engine cascade rooted in main_csum. Fields stay
+     * at their carved offsets (3288 / 3360 / 3432) for layout
+     * compatibility with pre-1c-vi v30 disk images that may carry
+     * stale non-zero values — the v30 reader sees zero from a
+     * 1c-vi-written UB and never consults the field even if the
+     * on-disk bytes are stale from a pre-1c-vi mount. */
 
     /* Pool-wide id counters (ARCH §5.4). Stamped from the indices'
      * get_next_id; restored at mount via the indices' set_next_id. */
@@ -2064,13 +2038,9 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         stm_status mv = stm_extent_index_mount_validate(s2->extent_idx);
         if (mv != STM_OK) { stm_sync_close(s2); return mv; }
 
-        /* The pool-global ub_extent_root fields are stamped ZERO at
-         * v30; the per-dataset engine roots are transitively covered
-         * by main_csum (the dataset_index tree's root csum). The
-         * mirrors below stay zero for the lifetime of the mount. */
-        s2->extent_root_paddr = 0;
-        s2->extent_root_gen   = 0;
-        memset(s2->extent_root_csum, 0, 32);
+        /* 9.7-impl-1c-vi: the pool-global ub_extent_root mirror is
+         * RETIRED; per-dataset records are transitively covered by
+         * main_csum. */
 
         /* P7-15: repair-log index. Plaintext + Merkle-covered, so
          * load_at takes (root_paddr, expected_csum) plus the
@@ -2144,52 +2114,30 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         s2->cas_index_root_gen   = cgen;
         memcpy(s2->cas_index_root_csum, ub.ub_cas_index_root.bp_csum, 32);
 
-        /* 9.7-impl-1c-ii: inode index. The module no longer owns its
-         * own engine — records live in each dataset's per-dataset
-         * btree_engine. We just create the in-RAM layer + attach the
-         * dataset index. The pool-global ub_inode_root field is
-         * stamped zero at v30; ignored on mount. The s2->inode_root_*
-         * mirrors stay (zeroed) for now — full retirement lands at
-         * 1c-vi. */
+        /* 9.7-impl-1c-ii / iii / iv (vi closes): the inode, dirent,
+         * and xattr indices have no pool-global engine. Each module
+         * borrows the dataset index and routes every op to the
+         * target dataset's per-dataset btree_engine. The
+         * corresponding UB fields (ub_inode_root / ub_dirent_root /
+         * ub_xattr_root) are stamped reserved-zero at v30; on-disk
+         * bytes are ignored at mount. */
         s2->inode_idx = stm_inode_index_create();
         if (!s2->inode_idx) { stm_sync_close(s2); return STM_ENOMEM; }
         stm_status ini = stm_inode_index_attach_dataset_index(s2->inode_idx,
                                                                 s2->dataset_idx);
         if (ini != STM_OK) { stm_sync_close(s2); return ini; }
-        s2->inode_root_paddr = 0;
-        s2->inode_root_gen   = 0;
-        memset(s2->inode_root_csum, 0, 32);
 
-        /* 9.7-impl-1c-iii: dirent index. Same wiring as inode_idx at
-         * 1c-ii — borrowed dataset index; per-dataset engines hold
-         * the records. The pool-global ub_dirent_root is RETIRED;
-         * any non-zero on-disk value at v30 is treated as stale
-         * (post-migration writes stamp zero). The dirent_root mirror
-         * fields are kept zero on this path. */
         s2->dirent_idx = stm_dirent_index_create();
         if (!s2->dirent_idx) { stm_sync_close(s2); return STM_ENOMEM; }
         stm_status dni = stm_dirent_index_attach_dataset_index(s2->dirent_idx,
                                                                 s2->dataset_idx);
         if (dni != STM_OK) { stm_sync_close(s2); return dni; }
-        s2->dirent_root_paddr = 0;
-        s2->dirent_root_gen   = 0;
-        memset(s2->dirent_root_csum, 0, 32);
 
-        /* 9.7-impl-1c-iv: xattr index. Same wiring as inode_idx +
-         * dirent_idx at 1c-ii / 1c-iii — borrowed dataset index;
-         * per-dataset engines hold the records. The pool-global
-         * ub_xattr_root is RETIRED; any non-zero on-disk value at
-         * v30 is treated as stale (post-migration writes stamp
-         * zero). The xattr_root mirror fields are kept zero on this
-         * path. */
         s2->xattr_idx = stm_xattr_index_create();
         if (!s2->xattr_idx) { stm_sync_close(s2); return STM_ENOMEM; }
         stm_status xni = stm_xattr_index_attach_dataset_index(s2->xattr_idx,
                                                                 s2->dataset_idx);
         if (xni != STM_OK) { stm_sync_close(s2); return xni; }
-        s2->xattr_root_paddr = 0;
-        s2->xattr_root_gen   = 0;
-        memset(s2->xattr_root_csum, 0, 32);
 
         /* P6-clone: register the clone-dependency check now that both
          * indices are populated. Snap delete refuses while any present
@@ -2238,9 +2186,6 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                          /*snap_csum=*/         s2->snap_root_csum,
                          /*snap_gen=*/          s2->snap_root_gen,
                          /*next_snap_id=*/      s2->next_snap_id,
-                         /*extent_root=*/       s2->extent_root_paddr,
-                         /*extent_csum=*/       s2->extent_root_csum,
-                         /*extent_gen=*/        s2->extent_root_gen,
                          /*repair_log_root=*/   s2->repair_log_root_paddr,
                          /*repair_log_csum=*/   s2->repair_log_root_csum,
                          /*repair_log_gen=*/    s2->repair_log_root_gen,
@@ -2248,15 +2193,6 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                          /*cas_index_root=*/    s2->cas_index_root_paddr,
                          /*cas_index_csum=*/    s2->cas_index_root_csum,
                          /*cas_index_gen=*/     s2->cas_index_root_gen,
-                         /*inode_root=*/        s2->inode_root_paddr,
-                         /*inode_csum=*/        s2->inode_root_csum,
-                         /*inode_gen=*/         s2->inode_root_gen,
-                         /*dirent_root=*/       s2->dirent_root_paddr,
-                         /*dirent_csum=*/       s2->dirent_root_csum,
-                         /*dirent_gen=*/        s2->dirent_root_gen,
-                         /*xattr_root=*/        s2->xattr_root_paddr,
-                         /*xattr_csum=*/        s2->xattr_root_csum,
-                         /*xattr_gen=*/         s2->xattr_root_gen,
                          /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
         uint32_t lbl  = ring_label_for_gen(auth_gen + 1);
@@ -2429,9 +2365,6 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*snap_csum=*/         s->snap_root_csum,
                          /*snap_gen=*/          s->snap_root_gen,
                          /*next_snap_id=*/      s->next_snap_id,
-                         /*extent_root=*/       s->extent_root_paddr,
-                         /*extent_csum=*/       s->extent_root_csum,
-                         /*extent_gen=*/        s->extent_root_gen,
                          /*repair_log_root=*/   s->repair_log_root_paddr,
                          /*repair_log_csum=*/   s->repair_log_root_csum,
                          /*repair_log_gen=*/    s->repair_log_root_gen,
@@ -2439,15 +2372,6 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*cas_index_root=*/    s->cas_index_root_paddr,
                          /*cas_index_csum=*/    s->cas_index_root_csum,
                          /*cas_index_gen=*/     s->cas_index_root_gen,
-                         /*inode_root=*/        s->inode_root_paddr,
-                         /*inode_csum=*/        s->inode_root_csum,
-                         /*inode_gen=*/         s->inode_root_gen,
-                         /*dirent_root=*/       s->dirent_root_paddr,
-                         /*dirent_csum=*/       s->dirent_root_csum,
-                         /*dirent_gen=*/        s->dirent_root_gen,
-                         /*xattr_root=*/        s->xattr_root_paddr,
-                         /*xattr_csum=*/        s->xattr_root_csum,
-                         /*xattr_gen=*/         s->xattr_root_gen,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
         uint32_t res_label = ring_label_for_gen(reservation_gen);
@@ -2699,33 +2623,25 @@ stm_status stm_sync_commit(stm_sync *s)
         return ccs;
     }
 
-    /* 9.7-impl-1c-ii / 1c-iii / 1c-iv / 1c-v: the four pool-global
-     * metadata-tree engines (inode, dirent, xattr, extent) are RETIRED.
-     * Per-dataset records flow through the SAME M-engine cascade —
-     * stm_dataset_index_commit_engines_flush ran BEFORE the
+    /* 9.7-impl-1c-ii / 1c-iii / 1c-iv / 1c-v / 1c-vi: the four pool-
+     * global metadata-tree engines (inode, dirent, xattr, extent) are
+     * RETIRED. Per-dataset records flow through the SAME M-engine
+     * cascade — stm_dataset_index_commit_engines_flush ran BEFORE the
      * dataset_index_commit call above; that single flush covered
      * inode + dirent + xattr + extent records side-by-side in each
      * PRESENT dataset's engine (distinguished by metakey tag byte).
-     * The pool Merkle root inputs (inode_csum / dirent_csum /
-     * xattr_csum / extent_csum) are ZERO bytes — every per-dataset
-     * engine's root is transitively covered by `main_csum` (the
-     * dataset_index tree's root csum, which serializes each slot's
-     * (di_tree_root, di_root_gen, di_root_csum) triple). UB
-     * ub_{inode,dirent,xattr,extent}_root/_csum/_gen are stamped
-     * zero. Full UB field retirement to reserved-on-the-wire lands
-     * at 1c-vi. */
-    uint64_t extent_paddr = 0;
-    uint8_t  extent_csum[32] = {0};
-    uint64_t extent_gen = 0;
-    uint64_t inode_paddr = 0;
-    uint8_t  inode_csum[32] = {0};
-    uint64_t inode_gen = 0;
-    uint64_t dirent_paddr = 0;
-    uint8_t  dirent_csum[32] = {0};
-    uint64_t dirent_gen = 0;
-    uint64_t xattr_paddr = 0;
-    uint8_t  xattr_csum[32] = {0};
-    uint64_t xattr_gen = 0;
+     * The pool Merkle root inputs (extent_csum / inode_csum /
+     * dirent_csum / xattr_csum) are local zero-byte buffers — every
+     * per-dataset engine's root is transitively covered by
+     * `main_csum` (the dataset_index tree's root csum, which
+     * serializes each slot's (di_tree_root, di_root_gen,
+     * di_root_csum) triple). UB ub_{extent,inode,dirent,xattr}_root /
+     * _gen / _csum are stamped reserved-zero on every v30 write via
+     * build_uberblock's initial memset. compute_merkle_root retains
+     * its four legacy csum slots at v30 (the salt stays cryptographic-
+     * identical across the cutover; dropping the slots would invalidate
+     * cached merkle_roots without an additional UB version bump). */
+    static const uint8_t zero_csum[32] = {0};
 
     stm_alloc_stats astats;
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
@@ -2745,31 +2661,26 @@ stm_status stm_sync_commit(stm_sync *s)
      * index tree's (P7-CAS v18). R8-P1-1: refuse to commit on BLAKE3
      * OOM.
      *
-     * 9.7-impl-1c-ii: `inode_csum` is ZERO bytes — the per-pool
-     * inode engine is retired; per-dataset inode records are
-     * transitively covered by `main_csum` (the dataset_index tree's
-     * root csum, which serializes each slot's per-dataset triple).
-     * 9.7-impl-1c-iii: `dirent_csum` is ZERO bytes for the same
-     * reason — per-pool dirent engine retired; per-dataset dirent
-     * records flow through the same dataset_index triples.
-     * 9.7-impl-1c-iv: `xattr_csum` is ZERO bytes for the same
-     * reason — per-pool xattr engine retired; per-dataset xattr
-     * records flow through the same dataset_index triples. All
-     * three slots stay in compute_merkle_root's signature for now;
-     * full retirement of inode_csum / dirent_csum / xattr_csum +
-     * corresponding UB fields lands at 1c-vi when all four
-     * pool-global engines are retired together. */
+     * 9.7-impl-1c-ii / iii / iv / v / vi: extent_csum / inode_csum /
+     * dirent_csum / xattr_csum are passed as zero bytes — the four
+     * pool-global engines are retired; per-dataset records flow
+     * through the M-cascade and are transitively covered by
+     * `main_csum`. The four legacy slots stay in compute_merkle_root's
+     * signature at v30 so the salt input layout (and thus cached
+     * merkle_roots from existing v30 pools) stays stable across the
+     * cutover; dropping the slots would require a UB version bump
+     * to invalidate the prior chain. */
     uint8_t new_merkle_root[32];
     stm_status ms = compute_merkle_root(main_csum,   /* main */
                                           roots_csum,
                                           snap_csum,
                                           cas_csum,  /* P7-CAS */
                                           ks_root_csum,
-                                          extent_csum,
+                                          zero_csum, /* extent — retired @ 1c-v */
                                           repair_log_csum,
-                                          inode_csum,    /* zero @ 1c-ii */
-                                          dirent_csum,   /* zero @ 1c-iii */
-                                          xattr_csum,    /* zero @ 1c-iv */
+                                          zero_csum, /* inode  — retired @ 1c-ii */
+                                          zero_csum, /* dirent — retired @ 1c-iii */
+                                          zero_csum, /* xattr  — retired @ 1c-iv */
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
@@ -2825,21 +2736,11 @@ stm_status stm_sync_commit(stm_sync *s)
                      ks_root_paddr, ks_root_csum,
                      main_paddr, main_csum, main_gen, main_next_id,
                      snap_paddr, snap_csum, snap_gen, snap_next_id,
-                     extent_paddr, extent_csum, extent_gen,
                      repair_log_paddr, repair_log_csum,
                      /*repair_log_gen=*/ target_gen, repair_log_seq,
                      /*cas_index_root=*/ cas_paddr,
                      /*cas_index_csum=*/ cas_csum,
                      /*cas_index_gen=*/  cas_gen,
-                     /*inode_root=*/     inode_paddr,
-                     /*inode_csum=*/     inode_csum,
-                     /*inode_gen=*/      inode_gen,
-                     /*dirent_root=*/    dirent_paddr,
-                     /*dirent_csum=*/    dirent_csum,
-                     /*dirent_gen=*/     dirent_gen,
-                     /*xattr_root=*/     xattr_paddr,
-                     /*xattr_csum=*/     xattr_csum,
-                     /*xattr_gen=*/      xattr_gen,
                      new_merkle_root, &astats);
 
     uint32_t fin_label = ring_label_for_gen(target_gen);
@@ -2890,30 +2791,23 @@ stm_status stm_sync_commit(stm_sync *s)
     s->main_root_gen         = main_gen;
     s->snap_root_paddr       = snap_paddr;
     s->snap_root_gen         = snap_gen;
-    s->extent_root_paddr     = extent_paddr;
-    s->extent_root_gen       = extent_gen;
     s->repair_log_root_paddr = repair_log_paddr;
     s->repair_log_root_gen   = target_gen;
     s->repair_log_next_seq   = repair_log_seq;
     s->cas_index_root_paddr  = cas_paddr;
     s->cas_index_root_gen    = cas_gen;
-    s->inode_root_paddr      = inode_paddr;
-    s->inode_root_gen        = inode_gen;
-    s->dirent_root_paddr     = dirent_paddr;
-    s->dirent_root_gen       = dirent_gen;
-    s->xattr_root_paddr      = xattr_paddr;
-    s->xattr_root_gen        = xattr_gen;
+    /* 9.7-impl-1c-vi: the four pool-global metadata-tree mirrors
+     * (extent / inode / dirent / xattr) are RETIRED — no publish
+     * assignments here at v30. Per-dataset roots live in each
+     * dataset_slot's triple; the slot's authoritative csum is
+     * folded into main_csum via dataset_index_commit. */
     s->next_dataset_id       = main_next_id;
     s->next_snap_id          = snap_next_id;
     memcpy(s->alloc_root_csum,     roots_csum,      32);
     memcpy(s->keyschema_root_csum, ks_root_csum,   32);
     memcpy(s->main_root_csum,      main_csum,      32);
     memcpy(s->snap_root_csum,      snap_csum,      32);
-    memcpy(s->extent_root_csum,    extent_csum,    32);
     memcpy(s->cas_index_root_csum, cas_csum,        32);
-    memcpy(s->inode_root_csum,     inode_csum,      32);
-    memcpy(s->dirent_root_csum,    dirent_csum,     32);
-    memcpy(s->xattr_root_csum,     xattr_csum,      32);
     memcpy(s->repair_log_root_csum, repair_log_csum, 32);
     memcpy(s->merkle_root,         new_merkle_root, 32);
 
