@@ -119,6 +119,28 @@ typedef struct {
     uint64_t  saved_tree_root;
     uint64_t  saved_root_gen;
     uint8_t   saved_root_csum[32];
+
+    /*
+     * 9.7-impl-2: per-slot engine_store_ctx.
+     *
+     * The btree_engine's storage vtable carries this ctx as its vt_ctx
+     * pointer (`&slot->engine_ctx`). vt->free uses `dataset_id` to
+     * route a superseded paddr to the correct dataset's most-recent
+     * snapshot's dead-list (dead_list.tla::OverwriteBlock).
+     *
+     * Populated at `dataset_engine_open_locked` time — boot + bdev
+     * mirror idx->engine_store_ctx (which stays as the pre-9.7-impl-2
+     * template); snap_idx mirrors idx->snap_idx (set via
+     * stm_dataset_index_set_snap_idx at mount); dataset_id mirrors
+     * slot->e.id.
+     *
+     * Lifetime: tied to the slot. Engine destruction at
+     * `dataset_engine_close_locked` happens-before the slot's
+     * deallocation. The engine's vt_ctx pointer (`&slot->engine_ctx`)
+     * stays valid through the engine's lifetime per the engine_store.h
+     * borrowed-pointer contract.
+     */
+    stm_engine_store_ctx engine_ctx;
 } dataset_slot;
 
 struct stm_dataset_index {
@@ -171,21 +193,45 @@ struct stm_dataset_index {
 
     /*
      * 9.7-impl-1c per-dataset metadata-tree engine substrate (storage
-     * + crypt mirrors).
+     * + crypt templates).
      *
-     * All per-dataset engines (one per PRESENT dataset) borrow these two
-     * contexts. The vt_ctx mirror is populated from set_storage (the same
-     * bdev + boot the dataset table itself uses); the crypt mirror is
-     * populated from set_crypt_ctx (the same metadata_key + uuids). Both
-     * structs are stable members so the engines' borrowed pointers stay
-     * valid for the index's lifetime.
+     * idx-level TEMPLATE state. At engine open time each slot's
+     * `engine_ctx` is initialised from `engine_store_ctx.{boot, bdev}`
+     * (plus the slot's `e.id` for dataset_id and idx->snap_idx for
+     * snap-routing — see 9.7-impl-2). The crypt ctx is shared across
+     * all engines (one ctx per dataset_index lifetime).
+     *
+     * Pre-9.7-impl-2: every engine carried `&idx->engine_store_ctx`
+     * as its vt_ctx pointer. 9.7-impl-2 split that off into per-slot
+     * `slot->engine_ctx` so vt->free can route per-dataset to the
+     * snap dead-list. The idx-level `engine_store_ctx` stays as the
+     * template (NOT used by any engine post-9.7-impl-2; it just
+     * caches boot + bdev for the per-slot copies at open time).
      *
      * Forward-note (TLY-A6): per-dataset DEKs threaded through TLY-A3's
      * CORVUS keyslot will eventually replace the shared engine_crypt_ctx;
      * the substrate ABI takes the crypt ctx by the index for v1.0.
      */
-    stm_engine_store_ctx engine_store_ctx;     /* { boot, bdev } — engine vt_ctx */
+    stm_engine_store_ctx engine_store_ctx;     /* template { boot, bdev } */
     stm_btree_crypt_ctx  engine_crypt_ctx;      /* metadata_key + uuids — engine cx */
+
+    /*
+     * 9.7-impl-2: borrowed pool-wide snapshot index.
+     *
+     * Attached at mount time via `stm_dataset_index_set_snap_idx`
+     * (called by sync_open after the snapshot index is constructed).
+     * Copied into each slot's `engine_ctx.snap_idx` at engine open
+     * time so vt->free can route superseded paddrs to the dataset's
+     * most-recent snapshot's dead-list.
+     *
+     * NULL means snap-routing is disabled — every superseded paddr
+     * goes straight to bootstrap_free (pre-9.7-impl-2 behaviour;
+     * back-compat for tests + early-mount transient).
+     *
+     * Lifetime: the snap_idx is owned by stm_sync and MUST outlive
+     * the dataset_index. The dataset_index never frees this pointer.
+     */
+    stm_snapshot_index  *snap_idx;
 };
 
 /*
@@ -1292,6 +1338,20 @@ stm_status stm_dataset_index_set_crypt_ctx(stm_dataset_index *idx,
     return STM_OK;
 }
 
+stm_status stm_dataset_index_set_snap_idx(stm_dataset_index *idx,
+                                            stm_snapshot_index *snap_idx) {
+    if (!idx) return STM_EINVAL;
+    must_lock(&idx->lock);
+    /* 9.7-impl-2: borrowed snapshot index for snap-aware vt->free
+     * routing. The change takes effect for engines opened AFTER this
+     * setter; already-open engines' per-slot ctx still holds the
+     * prior snap_idx. Production discipline (sync_open) calls this
+     * BEFORE any get_engine, so the staleness window is empty. */
+    idx->snap_idx = snap_idx;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
 /* ========================================================================= */
 /* 9.7-impl-1c per-dataset engine helpers (caller holds idx->lock).            */
 /* ========================================================================= */
@@ -1331,6 +1391,21 @@ static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
         return STM_EINVAL;
     }
 
+    /*
+     * 9.7-impl-2: initialise the slot's per-engine ctx from the idx
+     * template + slot identity + idx's borrowed snap_idx. The engine
+     * carries &slot->engine_ctx as its vt_ctx pointer; vt->free reads
+     * snap_idx + dataset_id to route superseded paddrs through the
+     * dead-list (dead_list.tla::OverwriteBlock). snap_idx may be NULL
+     * — back-compat fall-through to bootstrap_free. dataset_id mirrors
+     * the engine's tree_id so the AEAD bind matches the dead-list
+     * routing key.
+     */
+    slot->engine_ctx.boot       = idx->engine_store_ctx.boot;
+    slot->engine_ctx.bdev       = idx->engine_store_ctx.bdev;
+    slot->engine_ctx.snap_idx   = idx->snap_idx;
+    slot->engine_ctx.dataset_id = slot->e.id;
+
     stm_btree_engine *eng = NULL;
     stm_status rc;
     if (slot->e.di_tree_root == 0 && slot->e.di_root_gen == 0) {
@@ -1338,7 +1413,7 @@ static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
          * The fresh engine starts with an in-memory empty-leaf root;
          * the dataset's first sync_commit stamps a real triple. */
         rc = stm_btree_engine_create(&STM_ENGINE_STORE_VT,
-                                       &idx->engine_store_ctx,
+                                       &slot->engine_ctx,
                                        &idx->engine_crypt_ctx,
                                        /*tree_id=*/slot->e.id,
                                        &eng);
@@ -1346,7 +1421,7 @@ static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
         /* Non-zero triple ⇒ existing tree: open at its durable root.
          * The first lookup / insert / scan descends to the device. */
         rc = stm_btree_engine_open(&STM_ENGINE_STORE_VT,
-                                     &idx->engine_store_ctx,
+                                     &slot->engine_ctx,
                                      &idx->engine_crypt_ctx,
                                      /*tree_id=*/slot->e.id,
                                      slot->e.di_tree_root,

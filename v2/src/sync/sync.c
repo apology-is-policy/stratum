@@ -1363,6 +1363,16 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                                                  s->pool_uuid, s->device_uuid);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
+        /* 9.7-impl-2: wire the snapshot index into the dataset index for
+         * snap-aware vt->free routing. Every per-dataset engine opened
+         * via stm_dataset_index_get_engine AFTER this point carries
+         * &slot->engine_ctx with snap_idx populated; vt->free routes
+         * superseded paddrs through stm_snapshot_index_overwrite_block
+         * (dead_list.tla::OverwriteBlock). MUST happen BEFORE any
+         * get_engine call. */
+        rc = stm_dataset_index_set_snap_idx(s->dataset_idx, s->snap_idx);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+
         /* 9.7-impl-1c-v: extent index. The module no longer owns its
          * own btree_engine — records live in each dataset's per-dataset
          * engine (the substrate from 9.7-impl-1c-i), resolved via the
@@ -1986,6 +1996,15 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         if (si != STM_OK) { stm_sync_close(s2); return si; }
         si = stm_snapshot_index_set_crypt_ctx(s2->snap_idx, s2->metadata_key,
                                                  s2->pool_uuid, s2->device_uuid);
+        if (si != STM_OK) { stm_sync_close(s2); return si; }
+
+        /* 9.7-impl-2: wire snap_idx into dataset_idx for snap-aware
+         * vt->free routing (mirrors the format-time path above; see
+         * dead_list.tla::OverwriteBlock). MUST happen BEFORE the first
+         * get_engine call — engines are opened lazily on first
+         * per-dataset metadata op, all of which fire AFTER sync_open
+         * returns. */
+        si = stm_dataset_index_set_snap_idx(s2->dataset_idx, s2->snap_idx);
         if (si != STM_OK) { stm_sync_close(s2); return si; }
 
         uint64_t spaddr = stm_load_le64(ub.ub_snap_root.bp_paddr);

@@ -38,6 +38,23 @@ static stm_status engine_store_reserve(void *ctx_, uint64_t *out_paddr)
  * sweeps it (the allocator.tla / bootstrap.h deferred-free discipline;
  * what keeps an aborted / superseded paddr off any reserve until it can
  * no longer alias a still-live (paddr, gen) AEAD nonce).
+ *
+ * 9.7-impl-2 forward-note: `ctx->snap_idx` + `ctx->dataset_id` are
+ * populated by the dataset_slot's engine open (so the substrate is in
+ * place) but NOT consulted here yet. The naïve snap-routing — append
+ * each superseded paddr to the dataset's most-recent PRESENT snap's
+ * dead-list — is allocator-mismatched: this path reserves through
+ * `stm_bootstrap` (16-KiB nodes), while the snapshot's dead-list
+ * reclaim path in `stm_fs_delete_snapshot` routes paddrs through
+ * `stm_alloc_free` (the user-data allocator). Bootstrap-allocated
+ * paddrs are unknown to `stm_alloc`, so cross-routing them produces
+ * STM_ENOENT at snap-delete time. A correct snap-aware reclaim for
+ * engine NODE paddrs needs either (a) a parallel bootstrap-aware
+ * dead-list on the snap index, OR (b) a unified allocator-class tag
+ * on each dead-list entry so the reclaim path can dispatch. That's
+ * impl-2-routing (or impl-2.x). For now: bootstrap_free unconditionally
+ * preserves the pre-9.7 contract; the substrate (per-slot ctx with
+ * snap_idx + dataset_id) is harmless dead state.
  */
 static stm_status engine_store_free(void *ctx_, uint64_t paddr,
                                        uint64_t free_gen)

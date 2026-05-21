@@ -59,9 +59,10 @@
 extern "C" {
 #endif
 
-struct stm_bdev;          typedef struct stm_bdev          stm_bdev;
-struct stm_bootstrap;     typedef struct stm_bootstrap     stm_bootstrap;
-struct stm_btree_engine;  typedef struct stm_btree_engine  stm_btree_engine;
+struct stm_bdev;             typedef struct stm_bdev             stm_bdev;
+struct stm_bootstrap;        typedef struct stm_bootstrap        stm_bootstrap;
+struct stm_btree_engine;     typedef struct stm_btree_engine     stm_btree_engine;
+struct stm_snapshot_index;   typedef struct stm_snapshot_index   stm_snapshot_index;
 
 /* Dataset id 1 is the root dataset, created at index init time.
  * Parent id 0 is the sentinel "no parent" (only root has it). */
@@ -553,6 +554,36 @@ stm_status stm_dataset_index_set_crypt_ctx(stm_dataset_index *idx,
                                               const uint8_t *metadata_key,
                                               const uint64_t pool_uuid[2],
                                               const uint64_t device_uuid_0[2]);
+
+/*
+ * 9.7-impl-2: attach a pool-wide snapshot index for snap-aware COW
+ * free routing (dead_list.tla::OverwriteBlock).
+ *
+ * When attached, every per-dataset btree_engine's `vt->free` checks
+ * the dataset's most-recent PRESENT snapshot via
+ * `stm_snapshot_index_overwrite_block` and either appends the
+ * superseded paddr to the snap's dead-list (snap captures the block)
+ * or falls through to `stm_bootstrap_free` (no PRESENT snap holds
+ * the dataset). Without an attached snap_idx, every superseded paddr
+ * goes straight to `stm_bootstrap_free` — pre-9.7-impl-2 behaviour,
+ * also the back-compat fall-through for tests + tooling without a
+ * snapshot index.
+ *
+ * `snap_idx` is BORROWED — the dataset_index does NOT take ownership.
+ * The caller (typically `stm_sync_open`) MUST keep `snap_idx` alive
+ * for the dataset_index's lifetime; passing a dangling pointer is a
+ * use-after-free hazard. NULL detaches.
+ *
+ * The attachment takes effect at the NEXT `dataset_engine_open_locked`
+ * — engines already open carry the prior snap_idx in their per-slot
+ * ctx. In practice this means the attachment MUST happen at mount
+ * BEFORE any get_engine call (sync_open's lifecycle).
+ *
+ * STM_EINVAL on NULL idx.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_set_snap_idx(stm_dataset_index *idx,
+                                            stm_snapshot_index *snap_idx);
 
 /*
  * Hydrate the index from on-disk state.  Wipes every existing slot

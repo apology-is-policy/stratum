@@ -33,23 +33,46 @@
 #ifndef STRATUM_V2_ENGINE_STORE_H
 #define STRATUM_V2_ENGINE_STORE_H
 
+#include <stdint.h>
+
 #include <stratum/btree_store.h>   /* stm_btree_store_vtable */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-struct stm_bdev;       typedef struct stm_bdev stm_bdev;
-struct stm_bootstrap;  typedef struct stm_bootstrap stm_bootstrap;
+struct stm_bdev;             typedef struct stm_bdev stm_bdev;
+struct stm_bootstrap;        typedef struct stm_bootstrap stm_bootstrap;
+struct stm_snapshot_index;   typedef struct stm_snapshot_index stm_snapshot_index;
 
 /*
  * vt_ctx for STM_ENGINE_STORE_VT — the storage handles one engine-backed
- * tree binds to. Both pointers are BORROWED (owned by the module that
- * holds the engine — inode / dirent / xattr / extent).
+ * tree binds to. All pointers are BORROWED (owned by the module that
+ * holds the engine — typically a dataset_slot, in turn owned by
+ * stm_dataset_index).
+ *
+ * 9.7-impl-2: ctx is now PER-ENGINE (not per-index) so vt->free can
+ * route each superseded paddr to the correct dataset's most-recent
+ * snapshot's dead-list via `stm_snapshot_index_overwrite_block`.
+ * Per-slot ownership in dataset.c ensures `dataset_id` matches the
+ * engine's tree_id, and `snap_idx` is the borrowed pool-wide snapshot
+ * index attached at mount via `stm_dataset_index_set_snap_idx`.
+ *
+ *   - boot / bdev: stable through engine lifetime.
+ *   - snap_idx:   may be NULL pre-attach OR if the deployment has no
+ *                 snapshot index (degenerate). When NULL, the free
+ *                 path falls through to direct bootstrap_free (back-
+ *                 compat with mounts that haven't reached the wiring
+ *                 yet, AND the no-snapshot-in-chain steady state).
+ *   - dataset_id: 0 means "no snap-routing for this engine" — same
+ *                 fall-through as snap_idx NULL. Production engines
+ *                 always set a non-zero dataset_id at create/open.
  */
 typedef struct {
-    stm_bootstrap *boot;   /* node reserve / free; the durable-bitmap commit */
-    stm_bdev      *bdev;   /* node read / write                              */
+    stm_bootstrap       *boot;       /* node reserve / free                         */
+    stm_bdev            *bdev;       /* node read / write                           */
+    stm_snapshot_index  *snap_idx;   /* most-recent snap dead-list routing (may be NULL) */
+    uint64_t             dataset_id; /* mirrors engine tree_id; 0 disables routing  */
 } stm_engine_store_ctx;
 
 /*
