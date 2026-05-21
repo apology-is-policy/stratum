@@ -460,20 +460,36 @@ extern "C" {
  * `stm_dataset_entry` gains a 48-byte per-dataset metadata-tree root
  * triple (`di_tree_root` + `di_root_gen` + `di_root_csum[32]`)
  * appended after `origin_snap_id`. The dataset entry's encoded
- * length grows from 80 + name_len bytes to 128 + name_len. NO
- * uberblock field changes at this bump — the four pool-global
- * metadata-tree roots (`ub_inode_root` / `ub_dirent_root` /
- * `ub_xattr_root` / `ub_extent_root`) stay live and authoritative
- * at v30; 9.7-impl-1c is the chunk that retires them in favour of
- * the per-dataset triple recorded on each dataset entry. v29
- * binaries would mis-read a v30 dataset record (the trailing-name
- * offset shifted), so the exact-match SB version check
- * (`version != STM_UB_VERSION` → STM_EBADVERSION) makes a v29
- * binary refuse a v30 pool outright. v29 pools refused at v30
- * mount via STM_EBADVERSION. The triple's all-zero state is the
- * "empty dataset" sentinel; fresh datasets persist zeros until
- * 9.7-impl-1c's per-dataset engine produces a real root. See
- * `v2/docs/phase-9.7-design.md` §3.1 / §3.3 for the staging. */
+ * length grows from 80 + name_len bytes to 128 + name_len. At the
+ * v29→v30 wire-format bump (1b) NO uberblock field changes; the
+ * four pool-global metadata-tree roots (`ub_inode_root` /
+ * `ub_dirent_root` / `ub_xattr_root` / `ub_extent_root`) initially
+ * stay live and authoritative. 9.7-impl-1c (the metadata-tree
+ * cutover chain 1c-ii..1c-v) retires them in favour of the
+ * per-dataset triple recorded on each dataset entry. v29 binaries
+ * would mis-read a v30 dataset record (the trailing-name offset
+ * shifted), so the exact-match SB version check (`version !=
+ * STM_UB_VERSION` → STM_EBADVERSION) makes a v29 binary refuse a
+ * v30 pool outright. v29 pools refused at v30 mount via
+ * STM_EBADVERSION. The triple's all-zero state is the "empty
+ * dataset" sentinel; fresh datasets persist zeros until 9.7-impl-1c
+ * fills them with the per-dataset engine's first real root.
+ *
+ * 9.7-impl-1c-vi (still under v30 — same on-disk format era): the
+ * four UB metadata-tree root fields (`ub_inode_root` / `ub_dirent_root`
+ * / `ub_xattr_root` / `ub_extent_root`) and their `_gen` fields are
+ * now RESERVED-ZERO on every v30 write — `build_uberblock`'s initial
+ * `memset(out, 0, sizeof *out)` zeroes them and no subsequent write
+ * path stamps them. Readers IGNORE the fields. `compute_merkle_root`
+ * keeps the four legacy csum slots at v30 (zero-byte input from a
+ * shared `zero_csum` local) so the salt input layout stays stable
+ * across the cutover without an additional UB version bump.
+ * Layout-compat contract: the fields stay at their carved offsets,
+ * so a pre-1c-vi v30 pool with real csums mounts cleanly under a
+ * 1c-vi binary (the reader ignores the bytes either way). A future
+ * v31 may carve the bytes for a different purpose.
+ *
+ * See `v2/docs/phase-9.7-design.md` §3.1 / §3.3 for the staging. */
 #define STM_UB_VERSION        30u
 
 /* Fixed sizes. */

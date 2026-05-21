@@ -500,7 +500,18 @@ stm_status stm_dataset_destroy(stm_dataset_index *idx, uint64_t id) {
      * A future get_engine on a non-PRESENT slot returns STM_ENOENT,
      * so the engine is unreachable post-flip; closing here keeps the
      * lifecycle tight and avoids carrying a dangling engine handle
-     * across the destroy. */
+     * across the destroy.
+     *
+     * R157 P3-3 forward-note: dataset_engine_close_locked destroys the
+     * engine without flushing — uncommitted records in the engine are
+     * silently dropped, and any data paddrs referenced by those records
+     * leak in the allocator. Today's only callers are the rollback paths
+     * in stm_fs_create_dataset / stm_fs_create_dataset_corvus, where the
+     * dataset has just been created and never had an engine opened — so
+     * the destroy is safe. A future public stm_fs_destroy_dataset API
+     * MUST reconcile this: either refuse when the engine has uncommitted
+     * state, OR force-flush first, OR walk the engine's records to free
+     * the referenced data paddrs before destroying. */
     dataset_engine_close_locked(&idx->slots[s]);
     idx->slots[s].present = false;
     idx->dirty = true;
@@ -1137,6 +1148,24 @@ static stm_status ds_decode_dataset_value(uint64_t id, const uint8_t *in,
     out_slot->e.di_root_gen  = stm_load_le64(root_gen);
     memcpy(out_slot->e.di_root_csum, in + DS_VAL_ROOT_CSUM_OFF,
               DS_VAL_ROOT_CSUM_LEN);
+    /* R157 P2-2 — sentinel discipline (R71 P1-1 symmetry).
+     * The "empty dataset" sentinel requires ALL THREE fields zero
+     * (di_tree_root, di_root_gen, di_root_csum). A partial-zero
+     * state is decoder-side inconsistency — the writer side
+     * (append_slot_locked calloc-zero + commit_engines_flush
+     * stamping all three together) never produces it, and the
+     * AEAD chain over the dataset_index serialisation protects
+     * against tamper. Refusing here closes the integrity chain
+     * conceptually and pins the invariant for future format
+     * extensions that might add encoder-side paths that could
+     * accidentally produce partial state. */
+    bool root_zero = (out_slot->e.di_tree_root == 0 &&
+                      out_slot->e.di_root_gen  == 0);
+    bool csum_zero = true;
+    for (size_t i = 0; i < DS_VAL_ROOT_CSUM_LEN; i++) {
+        if (out_slot->e.di_root_csum[i] != 0) { csum_zero = false; break; }
+    }
+    if (root_zero != csum_zero) return STM_ECORRUPT;
     if (name_len > 0) {
         memcpy(out_slot->e.name, in + DS_VAL_FIXED, name_len);
     }
@@ -1456,6 +1485,7 @@ stm_status stm_dataset_index_commit_engines_flush(stm_dataset_index *idx,
              * flushed engine + restore each saved triple. The saved
              * triple on THIS slot wasn't touched (we just wrote it
              * but never overwrote slot->e.*), so just leave it. */
+            bool restored_any = false;
             for (size_t j = 0; j < i; j++) {
                 dataset_slot *prior = &idx->slots[j];
                 if (!prior->pending_flush) continue;
@@ -1465,26 +1495,44 @@ stm_status stm_dataset_index_commit_engines_flush(stm_dataset_index *idx,
                 prior->e.di_root_gen  = prior->saved_root_gen;
                 memcpy(prior->e.di_root_csum, prior->saved_root_csum, 32);
                 prior->pending_flush  = false;
+                restored_any = true;
             }
-            /* If any restore happened, the in-RAM slots[] diverged
-             * from the durable index — re-mark dirty so the next
-             * stm_dataset_index_commit re-serializes. */
-            idx->dirty = true;
+            /* R157 P3-5 — only mark dirty if a restore actually happened.
+             * The i == 0 case (failure at the very first walked slot)
+             * touches no prior state, so the in-RAM slots[] is unchanged
+             * from the pre-flush state. */
+            if (restored_any) idx->dirty = true;
+            /* R157 P3-4 — zero saved_* on the failing slot for symmetry
+             * with abort + finalize cleanup so a future defense-in-depth
+             * audit doesn't confuse leftover saved_* with un-finalized
+             * pending state. */
+            slot->saved_tree_root = 0;
+            slot->saved_root_gen  = 0;
+            memset(slot->saved_root_csum, 0, 32);
             must_unlock(&idx->lock);
             return fs;
         }
 
+        /* R157 P2-1 — only mark dirty if the triple actually changed.
+         * A clean-tree engine_flush returns the prior (paddr, gen, csum)
+         * triple verbatim (engine.c keeps root->gen on a no-op commit).
+         * Stamping byte-identical values does not invalidate the dataset
+         * index's serialised form; marking dirty unconditionally would
+         * force fresh-paddr allocation every sync_commit cycle once any
+         * per-dataset engine is open, breaking the byte-identical-UB-
+         * across-cycles invariant quorum.tla::ContentQuorumAtGen relies
+         * on and amplifying I/O cost. */
+        bool triple_changed =
+            (new_paddr != slot->saved_tree_root) ||
+            (new_gen   != slot->saved_root_gen)  ||
+            (memcmp(new_csum, slot->saved_root_csum, 32) != 0);
         /* Stamp the prospective triple into the slot. The slot is now
          * pending — abort can restore via saved_*. */
         slot->e.di_tree_root = new_paddr;
         slot->e.di_root_gen  = new_gen;
         memcpy(slot->e.di_root_csum, new_csum, 32);
         slot->pending_flush  = true;
-        /* Any change to a slot's triple means the index's serialized
-         * form has changed — mark dirty so stm_dataset_index_commit
-         * re-serializes (the idempotent-when-clean fast path would
-         * otherwise return the prior root). */
-        idx->dirty = true;
+        if (triple_changed) idx->dirty = true;
     }
 
     must_unlock(&idx->lock);

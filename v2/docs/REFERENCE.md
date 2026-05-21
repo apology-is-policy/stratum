@@ -38,43 +38,71 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: Phase 9.7-impl-1c-vi — the pool-global-engine retirement
-  closes. The four `stm_sync` mirror fields (`extent_root_paddr/gen/
-  csum`, `inode_root_*`, `dirent_root_*`, `xattr_root_*`) are deleted;
-  `build_uberblock` dropped its 12 corresponding parameters + the 4
-  conditional `if (X_paddr != 0)` UB-field write blocks + the 4
-  `out->ub_*_root_gen = stm_store_le64(...)` stamps. The UB fields
-  `ub_extent_root` / `ub_inode_root` / `ub_dirent_root` /
-  `ub_xattr_root` (plus their `_gen` / `_csum` siblings) are now
-  reserved-zero on every v30 write — the bytes are zero via
-  `build_uberblock`'s initial `memset(out, 0, sizeof *out)`, uniform
-  for every write. Mount paths ignore the four UB fields entirely;
-  on-disk values from pre-1c-vi v30 writes (where the bytes were
-  conditionally zero too) are read but not consulted.
-  - **STM_UB_VERSION stays at 30** — 1c-vi is a code-path cutover,
-    no on-disk format change. Cross-mount compatibility within v30
-    is preserved by the new readers ignoring the fields entirely.
-  - **`compute_merkle_root` signature unchanged at v30** — the four
-    legacy csum slots (`extent_csum`, `inode_csum`, `dirent_csum`,
-    `xattr_csum`) are retained as zero-byte inputs (sourced from a
-    shared `zero_csum` local in `stm_sync_commit`). The salt input
-    layout stays stable across the 1c-* cutover; dropping the slots
-    would require an additional UB version bump to invalidate the
-    prior chain.
-  - **Q2 wedge discipline preserved** — every `stm_sync_commit` error
-    return (including `commit_engines_finalize` failures) wedges the
-    fs in the caller (R154 doctrine; ~10 call sites in fs.c).
-  - **ctest 64/64 GREEN** standalone post-edit; the known
-    `test_compound_ops_concurrent` flake ([[flake-per-inode-cfr-concurrent]])
-    fires under ctest -j4 contention exactly as at the 1c-v tip
-    (verified by stash + retest). 1c-vi does not amplify the flake;
-    the cross-pool dataset_iter contention was already in place from
-    1c-v.
-  - **What's next**: R157 audit gates the full 9.7-impl-1 close.
-    Then 9.7-impl-2..6 (snapshot-aware COW free → real snap-create →
-    rollback mechanism → readable .snaps/ → clones).
+- **Tip**: R157 audit close — 9.7-impl-1 (the full 1a + 1b + 1c-i..vi
+  series) is now signed off. Verdict: **0 P0, 0 P1, 2 P2, 7 P3**. Both
+  P2s and four of the seven P3s applied inline; three P3s acknowledged
+  as forward-notes (P3-1 M-cascade trio tests, P3-2 close-engine pending
+  state, P3-6 misleading finalize comment).
+  - **P2-1 — conditional `idx->dirty` in `commit_engines_flush`**: the
+    success path now compares the new triple against `saved_*` (= the
+    prior durable triple). A clean-tree engine flush returns prior
+    `(paddr, gen, csum)` verbatim; stamping byte-identical values no
+    longer marks the dataset_index dirty. Closes the perf regression
+    where every `stm_sync_commit` cycle after the first metadata op
+    forced fresh-paddr allocation for the dataset-index tree root, AND
+    closes the latent retry-safety regression against the
+    `quorum.tla::ContentQuorumAtGen` byte-identical-UB invariant the
+    dataset.h docstring already pinned.
+  - **P2-2 — empty-sentinel decoder gap**: `ds_decode_dataset_value`
+    now refuses partial-zero state (R71 P1-1 symmetry doctrine carry).
+    The "empty dataset" sentinel requires ALL THREE fields zero
+    (di_tree_root, di_root_gen, di_root_csum); writer never produces
+    partial state, but the decoder now refuses the latent class with
+    STM_ECORRUPT. Closes the integrity-chain conceptual hole.
+  - **P3-3 — forward-note** at `stm_dataset_destroy`: a future
+    public `stm_fs_destroy_dataset` API MUST reconcile the silent
+    drop of uncommitted engine state (refuse / force-flush / walk-
+    and-free-paddrs). Today's only callers are the rollback paths
+    in `stm_fs_create_dataset` where the engine has never been
+    opened — destroy is safe.
+  - **P3-4 — zero saved_* on failure-exit slot** in
+    `commit_engines_flush`: the failing slot's `saved_*` were written
+    just before the flush call; on failure they're now zeroed for
+    symmetry with abort + finalize cleanup so future defense-in-depth
+    audits don't confuse leftover saved_* with un-finalized pending
+    state.
+  - **P3-5 — conditional rollback dirty**: the failure-rollback branch
+    now tracks `restored_any` and only marks `idx->dirty = true` if a
+    prior slot was actually restored. The i == 0 case touches no prior
+    state — no dirty bump needed.
+  - **P3-7 — super.h v30 doc-comment update**: the v29→v30 doc block
+    now has a 1c-vi sub-paragraph documenting the four UB fields'
+    reserved-zero status + layout-compat contract.
+  - **ctest 64/64 GREEN standalone** at this tip; `test_dataset`
+    (71 tests) and `test_sync` (28 tests) verified post-fix. The
+    pre-existing `test_compound_ops_concurrent` flake
+    ([[flake-per-inode-cfr-concurrent]]) is unchanged — verified by
+    stash + retest at the pre-R157 tip.
+  - **What's next**: 9.7-impl-2 (snapshot-aware COW free) → R158.
 
-- **Pre-tip-0**: Phase 9.7-impl-1c-v — fourth module cutover (extent).
+- **Pre-tip-0**: Phase 9.7-impl-1c-vi (`3afa915`) — the pool-global-engine
+  retirement closes. The four `stm_sync` mirror fields
+  (`extent_root_paddr/gen/csum`, `inode_root_*`, `dirent_root_*`,
+  `xattr_root_*`) are deleted; `build_uberblock` dropped its 12
+  corresponding parameters + the 4 conditional `if (X_paddr != 0)`
+  UB-field write blocks + the 4 `out->ub_*_root_gen = stm_store_le64(...)`
+  stamps. The UB fields `ub_extent_root` / `ub_inode_root` /
+  `ub_dirent_root` / `ub_xattr_root` (plus their `_gen` / `_csum`
+  siblings) are now reserved-zero on every v30 write — the bytes are
+  zero via `build_uberblock`'s initial `memset(out, 0, sizeof *out)`,
+  uniform for every write. Mount paths ignore the four UB fields
+  entirely; on-disk values from pre-1c-vi v30 writes (where the bytes
+  were conditionally zero too) are read but not consulted.
+  STM_UB_VERSION stays at 30. `compute_merkle_root` signature
+  unchanged — four legacy csum slots fed from a shared `zero_csum`
+  local. Q2 wedge preserved; ctest 64/64 GREEN standalone.
+
+- **Pre-tip-1**: Phase 9.7-impl-1c-v — fourth module cutover (extent).
   Extent module routes through per-dataset `btree_engine`s via
   attached `stm_dataset_index` + `stm_metakey_compose` keys. 17-byte
   key shape `STM_METAKEY_KIND_EXTENT || le64 ino || le64 file_offset`;
@@ -90,7 +118,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `stm_dataset_index_get_engine` from inside `stm_dataset_iter`'s
   callback.
 
-- **Pre-tip-1**: Phase 9.7-impl-1c-iv — third module cutover lands.
+- **Pre-tip-2**: Phase 9.7-impl-1c-iv — third module cutover lands.
   The xattr module now routes through per-dataset `btree_engine`s
   via an attached `stm_dataset_index *`. 17-byte metakey key
   (`STM_METAKEY_KIND_XATTR || le64 ino || le64 hash_probe`),
@@ -99,7 +127,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `xattr_csum` zeroed in `compute_merkle_root`; UB xattr fields
   stamped zero.
 
-- **Pre-tip-2**: Phase 9.7-impl-1c-iii — second module cutover
+- **Pre-tip-3**: Phase 9.7-impl-1c-iii — second module cutover
   (dirent). Same shape as 1c-iv above but applied to the dirent
   index: 17-byte metakey key
   (`STM_METAKEY_KIND_DIRENT || le64 dir_ino || le64 hash_probe`),
@@ -110,7 +138,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `dirent_csum` zeroed in `compute_merkle_root`; UB dirent fields
   stamped zero.
 
-- **Pre-tip-3**: Phase 9.7-impl-1c-ii — first module cutover
+- **Pre-tip-4**: Phase 9.7-impl-1c-ii — first module cutover
   (inode). Same shape applied to the inode index: 9-byte metakey
   key (`stm_metakey_compose(STM_METAKEY_KIND_INODE, &ino_le, 8)`),
   `stm_inode_index_attach_dataset_index` replaces the retired
@@ -118,7 +146,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `inode_csum` zeroed in `compute_merkle_root`; UB inode fields
   stamped zero.
 
-- **Pre-tip-4**: Phase 9.7-impl-1b — `stm_dataset_entry` gains the
+- **Pre-tip-5**: Phase 9.7-impl-1b — `stm_dataset_entry` gains the
   3-field triple (`di_tree_root` + `di_root_gen` +
   `di_root_csum[32]`); DS_VAL_FIXED grows 80 → 128 bytes;
   STM_UB_VERSION bumped 29 → 30. The triple is the durable identity
@@ -126,7 +154,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   this commit). Three `*_ub_version_is_v29` tests renamed `_is_v30`.
   Encoder/decoder extended; persistence roundtrip verified.
 
-- **Pre-tip-5**: Phase 9.7-impl-1a — `v2/src/metakey/` lib lands.
+- **Pre-tip-6**: Phase 9.7-impl-1a — `v2/src/metakey/` lib lands.
   Small chokepoint for the 1-byte type-tag prefix that
   discriminates per-record-kind subspaces inside a single
   per-dataset `btree_engine`. No callers yet (1c-ii..1c-v wire
