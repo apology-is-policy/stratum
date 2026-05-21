@@ -53,7 +53,8 @@ struct stm_snapshot_index;   typedef struct stm_snapshot_index stm_snapshot_inde
  *
  * 9.7-impl-2: ctx is now PER-ENGINE (not per-index) so vt->free can
  * route each superseded paddr to the correct dataset's most-recent
- * snapshot's dead-list via `stm_snapshot_index_overwrite_block`.
+ * snapshot's bootstrap-tier dead-list via
+ * `stm_snapshot_index_overwrite_bootstrap_block` (9.7-impl-2-routing).
  * Per-slot ownership in dataset.c ensures `dataset_id` matches the
  * engine's tree_id, and `snap_idx` is the borrowed pool-wide snapshot
  * index attached at mount via `stm_dataset_index_set_snap_idx`.

@@ -1666,6 +1666,10 @@ STM_TEST(sync_impl2_routing_engine_nodes_route_to_bootstrap_dead_list) {
 
     stm_inode_index *iidx = stm_sync_inode_index(s);
     stm_snapshot_index *si = stm_sync_snapshot_index(s);
+    /* R158 P3-8 defensive asserts — surface a missing index handle as a
+     * clean test failure instead of a libc-segfault deeper down. */
+    STM_ASSERT_TRUE(iidx != NULL);
+    STM_ASSERT_TRUE(si != NULL);
 
     /* Pre-snap: populate the inode engine so it has a non-trivial
      * root + leaves. */

@@ -1103,6 +1103,208 @@ STM_TEST(snap_overwrite_caps_at_max) {
     stm_snapshot_index_close(idx);
 }
 
+/* ------------------------------------------------------------------ */
+/* R158 P2-2: targeted unit tests for the new bootstrap-tier APIs     */
+/* (stm_snapshot_index_overwrite_bootstrap_block +                     */
+/*  stm_snapshot_bootstrap_dead_list_count + stm_snapshot_delete's     */
+/*  new bootstrap pair output + mismatched-NULL atomicity).            */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(snap_overwrite_boot_no_snap_signals_caller_to_free) {
+    /* No PRESENT snap in chain → should_free=true; caller frees via
+     * stm_bootstrap_free directly. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    bool should_free = false;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, /*ds*/1, 0xCAFE, &should_free));
+    STM_ASSERT_TRUE(should_free);
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_overwrite_boot_appends_to_most_recent) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s1 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/1, "snap1", 0, 0, &s1));
+
+    bool should_free = true;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, 1, 0x1000, &should_free));
+    STM_ASSERT_FALSE(should_free);
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, 1, 0x2000, &should_free));
+    STM_ASSERT_FALSE(should_free);
+
+    size_t bc = 0;
+    STM_ASSERT_OK(stm_snapshot_bootstrap_dead_list_count(idx, s1, &bc));
+    STM_ASSERT_EQ(bc, (size_t)2);
+
+    /* Cross-dataset isolation: dataset 2's overwrite is unaffected by
+     * dataset 1's snap. */
+    bool sf2 = false;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, /*ds*/2, 0x3000, &sf2));
+    STM_ASSERT_TRUE(sf2);
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_overwrite_boot_arg_validation) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    bool sf = false;
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_bootstrap_block(NULL, 1, 0x1, &sf),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_bootstrap_block(idx, 1, 0x1, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_bootstrap_block(idx, 0, 0x1, &sf),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_bootstrap_block(idx, 1, 0,   &sf),
+                   STM_EINVAL);
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_overwrite_boot_refuses_duplicate_paddr) {
+    /* R33 P2 doctrine carry: single-ownership scoped to boot-tier list. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s1 = 0, s2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "first", 0, 0, &s1));
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, 1, 0xABCD, &sf));
+    /* Same paddr again → EINVAL within the most-recent snap. */
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, 1, 0xABCD, &sf), STM_EINVAL);
+    /* Cross-snap defense: create another snap; same paddr still refused. */
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "second", 0, 0, &s2));
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, 1, 0xABCD, &sf), STM_EINVAL);
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_overwrite_boot_paddr_collisions_across_tiers_permitted) {
+    /* Cross-list (paddr-tier vs boot-tier) collisions are NOT defended
+     * against — different allocators may legitimately produce the same
+     * bit pattern. Single-ownership is scoped per list. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s1 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "shared", 0, 0, &s1));
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xBEEF, &sf));
+    STM_ASSERT_FALSE(sf);
+    /* Same paddr value in boot-tier list IS permitted. */
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, 1, 0xBEEF, &sf));
+    STM_ASSERT_FALSE(sf);
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_overwrite_boot_caps_at_max) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "fill", 0, 0, &s));
+    bool sf;
+    for (uint32_t i = 0; i < STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX; i++) {
+        uint64_t paddr = (uint64_t)0x1000 + i;
+        STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
+            idx, 1, paddr, &sf));
+        STM_ASSERT_FALSE(sf);
+    }
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, 1, 0xDEAD, &sf), STM_ENOSPC);
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_boot_dead_list_count_arg_validation) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    size_t c = 99;
+    STM_ASSERT_ERR(stm_snapshot_bootstrap_dead_list_count(NULL, 1, &c),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_bootstrap_dead_list_count(idx, 1, NULL),
+                   STM_EINVAL);
+    /* Unknown snap → ENOENT. */
+    STM_ASSERT_ERR(stm_snapshot_bootstrap_dead_list_count(idx, 999, &c),
+                   STM_ENOENT);
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_delete_mismatched_null_boot_pair_refused) {
+    /* The bootstrap output pair is atomic: both NULL OR both non-NULL.
+     * Mismatched NULL → STM_EINVAL refused at function entry, leaving
+     * the existing pair outputs zero/NULL per the documented contract. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "victim", 0, 0, &s));
+
+    uint64_t *freed = (uint64_t *)0xDEADBEEF;
+    size_t n = 99;
+    uint8_t *cold = (uint8_t *)0xCAFEBABE;
+    size_t cn = 99;
+    uint64_t *bp = NULL;
+    /* bp NULL but bc non-NULL → EINVAL. */
+    size_t bn = 99;
+    STM_ASSERT_ERR(stm_snapshot_delete(idx, s, &freed, &n, &cold, &cn,
+                                          NULL, &bn),
+                   STM_EINVAL);
+    STM_ASSERT_TRUE(freed == NULL);
+    STM_ASSERT_EQ(n, (size_t)0);
+    STM_ASSERT_TRUE(cold == NULL);
+    STM_ASSERT_EQ(cn, (size_t)0);
+
+    /* The other half: bp non-NULL but count NULL → also EINVAL. */
+    freed = (uint64_t *)0xDEADBEEF;
+    n = 99; cold = (uint8_t *)0xCAFEBABE; cn = 99;
+    STM_ASSERT_ERR(stm_snapshot_delete(idx, s, &freed, &n, &cold, &cn,
+                                          &bp, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_TRUE(freed == NULL);
+    STM_ASSERT_EQ(n, (size_t)0);
+    STM_ASSERT_TRUE(cold == NULL);
+    STM_ASSERT_EQ(cn, (size_t)0);
+
+    /* Snap is STILL present — refusal was atomic. */
+    size_t bc = 0;
+    STM_ASSERT_OK(stm_snapshot_bootstrap_dead_list_count(idx, s, &bc));
+    STM_ASSERT_EQ(bc, (size_t)0);
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_delete_transfers_boot_dead_list) {
+    /* Happy path: non-NULL boot pair receives transferred ownership. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "src", 0, 0, &s));
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, 1, 0xB001, &sf));
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
+        idx, 1, 0xB002, &sf));
+
+    uint64_t *freed = NULL; size_t fn = 0;
+    uint8_t  *cold  = NULL; size_t cn = 0;
+    uint64_t *boot  = NULL; size_t bn = 0;
+    STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &fn, &cold, &cn,
+                                         &boot, &bn));
+    STM_ASSERT_EQ(fn, (size_t)0);
+    STM_ASSERT_TRUE(freed == NULL);
+    STM_ASSERT_EQ(cn, (size_t)0);
+    STM_ASSERT_TRUE(cold == NULL);
+    STM_ASSERT_EQ(bn, (size_t)2);
+    STM_ASSERT_TRUE(boot != NULL);
+    STM_ASSERT_EQ(boot[0], (uint64_t)0xB001);
+    STM_ASSERT_EQ(boot[1], (uint64_t)0xB002);
+    free(boot);
+
+    stm_snapshot_index_close(idx);
+}
+
 STM_TEST(snap_delete_returns_dead_list) {
     /* dead_list.tla::SnapDelete: all paddrs in s.dead are returned to
      * the caller; s.dead is cleared; slot is ABSENT. */

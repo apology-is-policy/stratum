@@ -561,10 +561,13 @@ stm_status stm_dataset_index_set_crypt_ctx(stm_dataset_index *idx,
  *
  * When attached, every per-dataset btree_engine's `vt->free` checks
  * the dataset's most-recent PRESENT snapshot via
- * `stm_snapshot_index_overwrite_block` and either appends the
- * superseded paddr to the snap's dead-list (snap captures the block)
- * or falls through to `stm_bootstrap_free` (no PRESENT snap holds
- * the dataset). Without an attached snap_idx, every superseded paddr
+ * `stm_snapshot_index_overwrite_bootstrap_block` (the bootstrap-tier
+ * variant of the paddr-tier API — engine NODE paddrs are bootstrap-
+ * allocated, not stm_alloc-allocated) and either appends the
+ * superseded paddr to the snap's bootstrap dead-list (snap captures
+ * the block) or falls through to `stm_bootstrap_free` (no PRESENT
+ * snap holds the dataset). Without an attached snap_idx, every
+ * superseded paddr
  * goes straight to `stm_bootstrap_free` — pre-9.7-impl-2 behaviour,
  * also the back-compat fall-through for tests + tooling without a
  * snapshot index.

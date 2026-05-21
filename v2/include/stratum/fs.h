@@ -1636,12 +1636,18 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
  *
  * Drives the full delete cycle including dead-list reclamation:
  *   1. stm_snapshot_delete returns freed_paddrs + cold_hashes
- *      (ownership transferred per snapshot.c trigger entry clause 4).
+ *      + freed_boot_paddrs (ownership transferred per snapshot.c
+ *      trigger entry clause 4; bootstrap-tier added at 9.7-impl-2-
+ *      routing).
  *   2. Each freed paddr routed to its per-device allocator via
  *      stm_paddr_device → stm_sync_alloc → stm_alloc_free.
  *   3. Each cold hash dereffed via stm_cas_deref (the auto-GC sweep
  *      at stm_sync_commit reclaims refcount=0 paddrs).
- *   4. Buffers freed before return.
+ *   4. Each engine NODE paddr routed to its per-device bootstrap
+ *      allocator via stm_paddr_device → stm_sync_alloc →
+ *      stm_alloc_bootstrap → stm_bootstrap_free (bootstrap-tier
+ *      reclaim, 9.7-impl-2-routing).
+ *   5. Buffers freed before return.
  *
  * Holds fs->lock + FS_GUARD_WRITE for the duration so no concurrent
  * sync_commit can race against the dead-list reclaim — addresses

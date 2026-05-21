@@ -4499,9 +4499,21 @@ stm_status stm_sync_get_dek(const stm_sync *s,
  * refuses the delete with STM_EBUSY.
  *
  * Lock-order: caller holds snap_idx->lock; we acquire dataset_idx->lock
- * via stm_dataset_clones_count_for_snap. snap → dataset is the
- * established direction (sync_commit also takes them in this order
- * via the index handles). */
+ * via stm_dataset_clones_count_for_snap. This cb takes the snap →
+ * dataset direction.
+ *
+ * R158 P3-1 update: post-9.7-impl-2-routing, stm_sync_commit's
+ * commit_engines_finalize takes the REVERSE direction
+ * (dataset_idx → snap_idx via engine_store_free →
+ * stm_snapshot_index_overwrite_bootstrap_block). The two paths are
+ * inverse but cannot deadlock: both stm_sync_commit (via stm_fs_commit
+ * and other public fs.c surfaces) AND stm_snapshot_delete (via
+ * stm_fs_delete_snapshot) execute under fs->global EX, so they
+ * serialize at the fs layer before either nested lock acquisition
+ * runs. Future code that takes snap_idx->lock OR dataset_idx->lock
+ * without holding fs->global EX MUST address the inversion explicitly
+ * (e.g., adopt a canonical direction OR document a new serialization
+ * gate). The natural-lock-order doctrine is no longer the whole story. */
 static bool sync_clone_check_cb(uint64_t snapshot_id, void *ctx)
 {
     stm_dataset_index *di = (stm_dataset_index *)ctx;

@@ -80,8 +80,29 @@ static stm_status engine_store_free(void *ctx_, uint64_t paddr,
             /* Snap captured the paddr; allocator MUST NOT see it. */
             return STM_OK;
         }
-        /* sr != STM_OK OR should_free == true: fall through to the
-         * bootstrap allocator. */
+        /* R158 P2-1: STM_EINVAL from the single-ownership defense scan
+         * (snapshot.c:640-649) means the paddr is ALREADY tracked by
+         * some other PRESENT snap's boot_dead_list. Falling through to
+         * stm_bootstrap_free in this case would create a double-free
+         * hazard: the bitmap bit gets stamped PENDING at free_gen, the
+         * other snap eventually fires stm_bootstrap_free for the same
+         * paddr at delete-time, and the sweep reclaims a paddr that
+         * could be live elsewhere. The scan is defense-in-depth against
+         * caller bugs (the bootstrap allocator's "can't reissue a still-
+         * set bit" invariant should prevent the same paddr from reaching
+         * us twice); but if it ever fires, the safe posture is "do
+         * nothing" — the paddr is already retained by the snap that
+         * owns it. Return STM_OK without touching the allocator.
+         *
+         * The remaining fall-through (STM_ENOMEM / STM_ENOSPC /
+         * STM_ECORRUPT, OR should_free == true) keeps the best-effort
+         * posture: bootstrap_free is the resource-exhaustion-safe
+         * release path. */
+        if (sr == STM_EINVAL) {
+            return STM_OK;
+        }
+        /* sr is STM_OK + should_free=true OR a resource-exhaustion code:
+         * fall through to the bootstrap allocator. */
     }
     return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_NODE_BLOCKS,
                                 free_gen);

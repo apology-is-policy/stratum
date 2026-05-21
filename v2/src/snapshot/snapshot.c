@@ -430,6 +430,14 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
                                  size_t *out_freed_boot_count) {
     if (!idx || !out_freed_paddrs || !out_freed_count
         || !out_freed_cold_hashes || !out_freed_cold_count) return STM_EINVAL;
+    /* R158 P3-5: zero the existing pair outputs BEFORE the mismatched-
+     * NULL check. The header docstring promises "on non-OK return both
+     * pairs are zero/NULL" — that contract MUST hold for the
+     * mismatched-NULL EINVAL exit too. */
+    *out_freed_paddrs       = NULL;
+    *out_freed_count        = 0;
+    *out_freed_cold_hashes  = NULL;
+    *out_freed_cold_count   = 0;
     /* 9.7-impl-2-routing: bootstrap-tier output is atomic in (paddrs,
      * count) — both NULL ⇒ caller doesn't want this list (back-compat
      * surface for tests + bench); both non-NULL ⇒ caller consumes it.
@@ -437,10 +445,6 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
     if ((out_freed_boot_paddrs == NULL) != (out_freed_boot_count == NULL)) {
         return STM_EINVAL;
     }
-    *out_freed_paddrs       = NULL;
-    *out_freed_count        = 0;
-    *out_freed_cold_hashes  = NULL;
-    *out_freed_cold_count   = 0;
     if (out_freed_boot_paddrs) {
         *out_freed_boot_paddrs = NULL;
         *out_freed_boot_count  = 0;
@@ -498,8 +502,12 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
         *out_freed_boot_paddrs = slot->boot_dead_list;
         *out_freed_boot_count  = slot->boot_dead_count;
     } else {
-        /* Back-compat: caller didn't ask for the bootstrap list. Free
-         * here; the paddrs leak from tracking until next scrub. */
+        /* R158 P3-3: back-compat path for callers that don't wire engine
+         * NODE retention (tests + bench). The paddrs PERMANENTLY leak in
+         * the bootstrap allocator — scrub does not detect "bit set in
+         * bootstrap bitmap but unreferenced" at v2.0. Production callers
+         * (fs.c::stm_fs_delete_snapshot) always pass non-NULL to receive
+         * + reclaim them via stm_alloc_bootstrap + stm_bootstrap_free. */
         free(slot->boot_dead_list);
     }
     slot->boot_dead_list     = NULL;
@@ -1270,7 +1278,14 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
             le64 p;
             memcpy(p.v, in + boff + i * SP_BOOT_PADDR_BYTES, 8);
             out_slot->boot_dead_list[i] = stm_load_le64(p);
-            if (out_slot->boot_dead_list[i] == 0) {
+            /* R158 P3-6 defense-in-depth: boot-tier paddrs are
+             * bootstrap-allocated and live on device 0 only at v2.0
+             * (engine_store.c refuses non-zero device IDs at write/read
+             * time). A tampered on-disk record with a non-zero device
+             * byte would otherwise pass decode and fail downstream at
+             * fs.c::stm_fs_delete_snapshot's per-device dispatch. */
+            if (out_slot->boot_dead_list[i] == 0
+                || stm_paddr_device(out_slot->boot_dead_list[i]) != 0) {
                 free(out_slot->boot_dead_list);
                 out_slot->boot_dead_list     = NULL;
                 out_slot->boot_dead_count    = 0;
@@ -1685,6 +1700,30 @@ static stm_status sp_validate_shadow(const sp_load_ctx *lc) {
                 size_t jp_start = (j == i) ? (ip + 1) : 0;
                 for (size_t jp = jp_start; jp < sj->dead_count; jp++) {
                     if (sj->dead_list[jp] == p) return STM_ECORRUPT;
+                }
+            }
+        }
+    }
+
+    /* R158 P2-3: same single-ownership scan for the bootstrap-tier
+     * (boot_dead_list[]). The runtime defense at
+     * stm_snapshot_index_overwrite_bootstrap_block catches caller bugs
+     * at insert time; this validator catches the same invariant at
+     * mount time (defense-in-depth against tampered or buggy on-disk
+     * state). Bounded by STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX × n_snaps.
+     * Cold-tier deliberately skips this — cold hashes are a multiset
+     * (R54 P1-1); boot-tier paddrs are unique by allocator construction. */
+    for (size_t i = 0; i < lc->shadow_len; i++) {
+        const snapshot_slot *si = &lc->shadow_slots[i];
+        if (!si->present) continue;
+        for (size_t ip = 0; ip < si->boot_dead_count; ip++) {
+            uint64_t p = si->boot_dead_list[ip];
+            for (size_t j = i; j < lc->shadow_len; j++) {
+                const snapshot_slot *sj = &lc->shadow_slots[j];
+                if (!sj->present) continue;
+                size_t jp_start = (j == i) ? (ip + 1) : 0;
+                for (size_t jp = jp_start; jp < sj->boot_dead_count; jp++) {
+                    if (sj->boot_dead_list[jp] == p) return STM_ECORRUPT;
                 }
             }
         }
