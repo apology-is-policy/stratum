@@ -46,6 +46,8 @@ Only after `ARCHITECTURE.md` is signed off does implementation resume — likely
 
 ## Spec-first policy (applies to every new feature, not just Phase 0)
 
+**Status (2026-05-21): SUSPENDED until further notice.** Per user decision, the spec-first discipline below is paused. New chunks ship without prior TLA+ modeling AND without extending an existing spec to cover the new mechanism. Existing specs remain on disk as references; do not delete them, do not treat their invariants as authoritative for new mechanisms that postdate this note. When the user lifts the suspension, the policy below applies verbatim.
+
 **If a feature touches a load-bearing invariant — concurrency, commit ordering, nonce uniqueness, quorum, redundancy, crypto key derivation, cache coherence, torn-write recovery — the TLA+ (or similar) model comes BEFORE the implementation.** Write the spec, let TLC chew on it, and let the invariant violations (if any) surface at the spec level where they cost minutes, not at runtime where they cost commits.
 
 Concrete pattern that's repeatedly paid off on this project:
