@@ -6597,7 +6597,17 @@ static void fs_rollback_reclaim_diverged_extents(
 
     /* old \ snap via a sorted merge — sorting old_set too dedups it
      * (a paddr two reflink-siblings in the old tree share, or a corrupt
-     * tree presenting one paddr twice, would otherwise double-free). */
+     * tree presenting one paddr twice, would otherwise double-free).
+     * R162 P3-1: the dedup trades a refcount-exact free for double-free
+     * safety. stm_alloc_free is refcount-aware (one call = one decrement);
+     * a paddr N reflink-siblings WITHIN the old tree share carries
+     * allocator refcount N, and the single dedup'd free leaves it at
+     * N-1 — an under-free. That is a phantom-refcount LEAK, never a
+     * corruption (the block stays allocated, so never reissued, so the
+     * AEAD nonce stays unique), and it is covered by this function's
+     * BEST-EFFORT posture. A refcount-exact reclaim would need the same
+     * counted-multiset machinery the cold-extent tier needs — forward-
+     * noted to 9.7-impl-4c-ii alongside the CAS-refcount work. */
     qsort(snap_set.v, snap_set.n, sizeof *snap_set.v, fs_rb_paddr_cmp);
     qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_paddr_cmp);
 
@@ -6831,6 +6841,12 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                 de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
                 entry.tree_root_paddr, entry.root_gen, entry.root_csum);
 
+        /* The data-extent reclaim re-opens a throwaway engine at the
+         * SAME de_old triple the node reclaim above just walked + freed
+         * nodes from. Safe: stm_bootstrap_free is a DEFERRED free — the
+         * bitmap bit stays set and the on-disk node bytes stay intact
+         * until a commit sweep, so the Merkle/AEAD descent here still
+         * verifies on the unchanged bytes. */
         stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
         if (eidx) {
             fs_rollback_reclaim_diverged_extents(fs, eidx, dataset_id,

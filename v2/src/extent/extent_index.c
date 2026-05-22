@@ -2686,15 +2686,17 @@ typedef struct {
     stm_extent_paddr_cb user_cb;
     void               *user_ctx;
     uint64_t            ds;            /* the tree's dataset id        */
-    int                 user_signal;   /* set if user cb returned != 0 */
     stm_status          err;
 } ex_collect_data_ctx;
 
 /* stm_btree_engine_iter_cb — decode one extent value, emit its HOT
- * replica paddrs. A decode failure aborts via gc->err; a user-cb stop
- * propagates via gc->user_signal. COLD records are decoded + validated
- * (so a corrupt COLD value still aborts the scan) but contribute no
- * paddr — the CAS tier is reclaimed separately (9.7-impl-4c-ii). */
+ * replica paddrs. A decode failure aborts the scan via gc->err. A
+ * nonzero user-cb return halts the scan with no error (the user cb
+ * surfaces its own state through user_ctx — there is no per-dataset
+ * loop above this to break, unlike ex_global_scan_adapter). COLD
+ * records are decoded + validated (so a corrupt COLD value still
+ * aborts the scan) but contribute no paddr — the CAS tier is reclaimed
+ * separately (9.7-impl-4c-ii). */
 static int ex_collect_data_adapter(const void *k, size_t klen,
                                       const void *v, size_t vlen,
                                       void *ctx_) {
@@ -2708,8 +2710,8 @@ static int ex_collect_data_adapter(const void *k, size_t klen,
     if (vs != STM_OK) { gc->err = vs; return 1; }
     if (r.kind == STM_EXTENT_KIND_HOT) {
         for (uint8_t i = 0; i < r.n_replicas; i++) {
-            int rc = gc->user_cb(r.paddrs[i], gc->user_ctx);
-            if (rc != 0) { gc->user_signal = rc; return 1; }
+            if (gc->user_cb(r.paddrs[i], gc->user_ctx) != 0)
+                return 1;          /* user cb halted the scan */
         }
     }
     return 0;
@@ -2740,8 +2742,7 @@ stm_status stm_extent_index_collect_engine_data_paddrs_at(
     }
 
     ex_collect_data_ctx gc = { .user_cb = cb, .user_ctx = cb_ctx,
-                                 .ds = dataset_id, .user_signal = 0,
-                                 .err = STM_OK };
+                                 .ds = dataset_id, .err = STM_OK };
     /* Delegate the throwaway-engine open + bounded scan to the dataset
      * index. Lock order: extent idx->lock (held) -> dataset idx->lock
      * (taken inside) — the same order ex_global_walk_locked uses. */
