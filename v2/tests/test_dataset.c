@@ -2383,4 +2383,81 @@ STM_TEST(dataset_collect_engine_paddrs_empty_triple) {
     unlink(dsp_tmp_path);
 }
 
+/* 9.7-impl-4c: stm_dataset_index_scan_engine_range_at scans a bounded
+ * key-range of a tree via a throwaway read-only engine — the rollback
+ * data-extent reclamation primitive. (The real-tree scan is covered
+ * end-to-end by test_extent_index.c's collect-data-paddrs tests and by
+ * test_fs.c's rollback-reclaim test; here: arg validation + the empty-
+ * dataset sentinel path.) */
+static int scan_range_count_cb(const void *k, size_t klen,
+                                  const void *v, size_t vlen, void *ctx)
+{
+    (void)k; (void)klen; (void)v; (void)vlen;
+    ((collect_paddr_ctx *)ctx)->n++;
+    return 0;
+}
+
+STM_TEST(dataset_scan_engine_range_arg_validation) {
+    collect_paddr_ctx cc = {0};
+    uint8_t csum[32] = {0};
+    uint8_t lo[4] = {0}, hi[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+
+    /* NULL idx / NULL cb / dataset_id 0 — refused before the lock. */
+    STM_ASSERT_ERR(stm_dataset_index_scan_engine_range_at(
+                       NULL, 1, 0xCAFEu, 5u, csum,
+                       lo, 4, hi, 4, scan_range_count_cb, &cc),
+                   STM_EINVAL);
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_ERR(stm_dataset_index_scan_engine_range_at(
+                       idx, 1, 0xCAFEu, 5u, csum,
+                       lo, 4, hi, 4, NULL, &cc), STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_index_scan_engine_range_at(
+                       idx, 0, 0xCAFEu, 5u, csum,
+                       lo, 4, hi, 4, scan_range_count_cb, &cc),
+                   STM_EINVAL);
+    /* NULL key with nonzero length — refused triple-independently. */
+    STM_ASSERT_ERR(stm_dataset_index_scan_engine_range_at(
+                       idx, 1, 0xCAFEu, 5u, csum,
+                       NULL, 4, hi, 4, scan_range_count_cb, &cc),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_index_scan_engine_range_at(
+                       idx, 1, 0xCAFEu, 5u, csum,
+                       lo, 4, NULL, 4, scan_range_count_cb, &cc),
+                   STM_EINVAL);
+    /* Storage / crypt unbound — refused with STM_EINVAL. */
+    STM_ASSERT_ERR(stm_dataset_index_scan_engine_range_at(
+                       idx, 1, 0xCAFEu, 5u, csum,
+                       lo, 4, hi, 4, scan_range_count_cb, &cc),
+                   STM_EINVAL);
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(dataset_scan_engine_range_empty_triple) {
+    dsp_make_tmp("scan_empty");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    /* The all-zero "empty dataset" triple — STM_OK, cb never invoked. */
+    collect_paddr_ctx cc = {0};
+    uint8_t zero[32] = {0};
+    uint8_t lo[4] = {0}, hi[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    STM_ASSERT_OK(stm_dataset_index_scan_engine_range_at(
+                      idx, STM_DATASET_ROOT_ID, 0, 0, zero,
+                      lo, 4, hi, 4, scan_range_count_cb, &cc));
+    STM_ASSERT_EQ(cc.n, (size_t)0);
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
 STM_TEST_MAIN("dataset")

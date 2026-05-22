@@ -1107,6 +1107,53 @@ stm_status stm_extent_index_mount_validate(stm_extent_index *idx);
 STM_MUST_USE
 stm_status stm_extent_index_verify(const stm_extent_index *idx);
 
+/* Per-data-paddr callback for stm_extent_index_collect_engine_data_
+ * paddrs_at. `paddr` is one HOT-extent replica block. Return 0 to
+ * continue, nonzero to stop (the collect then returns STM_OK). */
+typedef int (*stm_extent_paddr_cb)(uint64_t paddr, void *ctx);
+
+/*
+ * 9.7-impl-4c (rollback data-extent reclamation): enumerate every
+ * DATA-tier (stm_alloc-class) replica paddr referenced by the frozen
+ * tree at an arbitrary `(root_paddr, root_gen, root_csum)` triple,
+ * invoking `cb` once per HOT-extent replica paddr.
+ *
+ * Walks the EXTENT subspace of a THROWAWAY read-only engine opened at
+ * the triple (delegating the throwaway-engine open + bounded scan to
+ * stm_dataset_index_scan_engine_range_at on the attached dataset
+ * index), decodes each 108-byte extent value, and for every HOT
+ * extent calls `cb(paddrs[i])` for i in [0, n_replicas). COLD extents
+ * are decoded + validated but contribute NO paddr — their backing
+ * storage is the content-addressed (CAS) tier, reclaimed separately
+ * (9.7-impl-4c-ii). A node is Merkle + AEAD verified as the scan
+ * descends; a corrupt node / value aborts with the decode error.
+ *
+ * The rollback mechanism calls this on the pre-rollback live root AND
+ * the snapshot root, then set-differences the two paddr sets to find
+ * the post-snapshot DATA divergence to stm_alloc_free. A paddr a HOT
+ * extent reflink-shares appears once per referencing extent — the
+ * caller's set-difference + dedup handles cohabitation (a paddr the
+ * snapshot tree still references survives).
+ *
+ * An all-zero triple is the "empty dataset" sentinel (STM_OK, `cb`
+ * never invoked). Returns STM_EINVAL on NULL idx / NULL cb /
+ * dataset_id == 0 / the extent index's dataset index unattached,
+ * STM_ECORRUPT / STM_EBADTAG on a Merkle / AEAD / value-decode
+ * failure, STM_ENOMEM / device errors otherwise. A nonzero `cb`
+ * return stops the walk early and is NOT itself an error (STM_OK).
+ *
+ * Concurrency: takes the extent index's internal lock for the call.
+ */
+STM_MUST_USE
+stm_status stm_extent_index_collect_engine_data_paddrs_at(
+                                       stm_extent_index *idx,
+                                       uint64_t dataset_id,
+                                       uint64_t root_paddr,
+                                       uint64_t root_gen,
+                                       const uint8_t root_csum[32],
+                                       stm_extent_paddr_cb cb,
+                                       void *cb_ctx);
+
 #ifdef __cplusplus
 }
 #endif

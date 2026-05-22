@@ -6531,6 +6531,97 @@ done:
     free(snap_set.v);
 }
 
+/*
+ * 9.7-impl-4c: reclaim the pre-rollback live tree's DATA-extent
+ * divergence — every HOT-extent replica block (stm_alloc class)
+ * referenced by the OLD live tree's EXTENT keyspace but NOT by the
+ * snapshot's. Those data blocks were allocated for writes that landed
+ * AFTER the snapshot was taken; once the dataset entry is swapped to
+ * the snapshot root nothing references them.
+ *
+ * SPEC: dead_list.tla::Rollback — the data-tier projection of the
+ *       live-divergence term `live_blocks \ snap_view_blocks[s]`. The
+ *       sibling fs_rollback_reclaim_diverged_nodes (9.7-impl-4b) covers
+ *       the metadata-NODE (bootstrap) tier. Still leaked, forward-noted:
+ *       the cold-extent (CAS) tier — 9.7-impl-4c-ii — and the
+ *       snapshot's cleared dead-list garbage — 9.7-impl-4c-iii.
+ *
+ * SAFETY (load-bearing): a paddr is freed ONLY when it is in old_set
+ * AND NOT in snap_set AND BOTH walks completed in full — identical to
+ * fs_rollback_reclaim_diverged_nodes. A paddr a HOT extent reflink-
+ * SHARES across the snapshot boundary is referenced by a snapshot-tree
+ * extent, so it lands in snap_set and is excluded — the set-difference
+ * handles cohabitation. Sorting old_set dedups it, so a paddr two
+ * reflink-siblings in the OLD tree share is freed at most once (a
+ * double stm_alloc_free would corrupt the allocator). If either walk
+ * fails or is truncated NOTHING is freed.
+ *
+ * Correct ONLY because the caller already refused the rollback when a
+ * newer snapshot of the dataset exists — see the matching note on
+ * fs_rollback_reclaim_diverged_nodes.
+ *
+ * BEST-EFFORT: any walk / collect / per-paddr free failure leaves the
+ * unreclaimed remainder LEAKED — a space cost, never a corruption (a
+ * leaked block stays ALLOCATED, so the allocator never reissues it and
+ * the AEAD (paddr, write_gen) nonce stays unique).
+ *
+ * Freed paddrs are data-area (stm_alloc class) — each is routed to its
+ * device's allocator deferred-free pool at the sync's current gen
+ * (exactly stm_fs_delete_snapshot's paddr-tier free loop). The caller's
+ * stm_sync_commit persists the frees; the strict
+ * `free_gen < committed_gen` predicate (R50 P2-1) keeps the block out
+ * of reuse until a later commit, so no (paddr, write_gen) is reissued.
+ *
+ * Caller holds fs->global EX.
+ */
+static void fs_rollback_reclaim_diverged_extents(
+        stm_fs *fs, stm_extent_index *eidx, uint64_t dataset_id,
+        uint64_t old_paddr, uint64_t old_gen, const uint8_t old_csum[32],
+        uint64_t snap_paddr, uint64_t snap_gen, const uint8_t snap_csum[32])
+{
+    fs_rb_paddr_set old_set  = {0};
+    fs_rb_paddr_set snap_set = {0};
+
+    /* Snapshot tree first: an incomplete snap_set must abort the whole
+     * reclaim — a missing snap paddr would mis-classify a shared data
+     * block as diverged and free live storage. */
+    stm_status w = stm_extent_index_collect_engine_data_paddrs_at(
+            eidx, dataset_id, snap_paddr, snap_gen, snap_csum,
+            fs_rb_paddr_collect_cb, &snap_set);
+    if (w != STM_OK || snap_set.oom) goto done;
+
+    w = stm_extent_index_collect_engine_data_paddrs_at(
+            eidx, dataset_id, old_paddr, old_gen, old_csum,
+            fs_rb_paddr_collect_cb, &old_set);
+    if (w != STM_OK || old_set.oom) goto done;
+
+    /* old \ snap via a sorted merge — sorting old_set too dedups it
+     * (a paddr two reflink-siblings in the old tree share, or a corrupt
+     * tree presenting one paddr twice, would otherwise double-free). */
+    qsort(snap_set.v, snap_set.n, sizeof *snap_set.v, fs_rb_paddr_cmp);
+    qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_paddr_cmp);
+
+    uint64_t free_gen = stm_sync_current_gen(fs->sync);
+    size_t   j = 0;
+    for (size_t i = 0; i < old_set.n; i++) {
+        uint64_t p = old_set.v[i];
+        if (i > 0 && p == old_set.v[i - 1]) continue;       /* dedup */
+        while (j < snap_set.n && snap_set.v[j] < p) j++;
+        if (j < snap_set.n && snap_set.v[j] == p) continue; /* shared — KEEP */
+
+        /* p is diverged: data-area, per-device routed. A free failure
+         * (device gone) leaks p — best-effort, continue. */
+        uint16_t did = stm_paddr_device(p);
+        stm_alloc *a = stm_sync_alloc(fs->sync, did);
+        if (!a) continue;
+        (void)stm_alloc_free(a, p, free_gen);
+    }
+
+done:
+    free(old_set.v);
+    free(snap_set.v);
+}
+
 stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                                       uint64_t snapshot_id, bool force)
 {
@@ -6591,17 +6682,17 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * refusal — the drain pops buffered writes into the engine in-memory
      * tree, which the swap then destroys.
      *
-     * Scope — impl-4 shipped the SWAP only. 9.7-impl-4b adds metadata-
-     * node reclamation: fs_rollback_reclaim_diverged_nodes walks the
-     * pre-rollback live tree and the snapshot tree, set-differences the
-     * node + spill paddr sets, and bootstrap-frees the divergence (the
-     * boot-tier projection of dead_list.tla::Rollback's live-divergence
-     * term). Still leaked, forward-noted to 9.7-impl-4c: the data-extent
-     * (stm_alloc) + cold-extent (CAS) tiers and the snapshot's own
-     * cleared dead-list garbage. A leak is a space cost, never a
-     * corruption — a leaked block stays ALLOCATED, so the allocator
-     * never reissues it, so the AEAD-nonce (paddr, write_gen) pair is
-     * never reused.
+     * Scope — impl-4 shipped the SWAP only. 9.7-impl-4b + 4c reclaim
+     * the post-snapshot live-divergence: 4b the metadata-NODE / spill
+     * tier (fs_rollback_reclaim_diverged_nodes, bootstrap class), 4c
+     * the DATA-extent replica tier (fs_rollback_reclaim_diverged_
+     * extents, stm_alloc class) — together the boot- + data-tier
+     * projection of dead_list.tla::Rollback's live-divergence term.
+     * Still leaked, forward-noted: the cold-extent (CAS) tier
+     * (9.7-impl-4c-ii) and the snapshot's own cleared dead-list garbage
+     * (9.7-impl-4c-iii). A leak is a space cost, never a corruption —
+     * a leaked block stays ALLOCATED, so the allocator never reissues
+     * it, so the AEAD-nonce (paddr, write_gen) pair is never reused.
      *
      * v1.0 limitation — a newer snapshot of this dataset blocks the
      * rollback (STM_ENOTSUPPORTED). ZFS semantics destroy every snapshot
@@ -6709,7 +6800,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * (a corruption). Clearing resets the snapshot to a just-created
      * dead-list state, exactly correct now that no divergence sits
      * between it and live. Discarded entries unreachable from the
-     * snapshot's tree (intermediate COW garbage) leak — 9.7-impl-4c
+     * snapshot's tree (intermediate COW garbage) leak — 9.7-impl-4c-iii
      * reclaims them. */
     s = stm_snapshot_clear_dead_lists(sidx, snapshot_id);
     if (s != STM_OK) {
@@ -6722,18 +6813,30 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         return s;
     }
 
-    /* 9.7-impl-4b: reclaim the post-snapshot metadata-node divergence —
-     * the engine NODE / spill blocks reachable from the pre-rollback
-     * live tree but not from the snapshot's frozen tree. Best-effort
-     * (a failure leaks, never corrupts — see the helper); it runs
-     * before the commit so the bootstrap deferred-frees ride the SAME
-     * stm_sync_commit as the swap (all-or-nothing on a commit failure).
-     * The data-extent + cold-extent tiers + the snapshot's cleared
-     * dead-list garbage are forward-noted to 9.7-impl-4c. */
+    /* Reclaim the post-snapshot divergence — blocks reachable from the
+     * pre-rollback live tree but not from the snapshot's frozen tree.
+     * Two tiers run here:
+     *   - 9.7-impl-4b: the metadata-NODE / spill blocks (bootstrap
+     *     class) via fs_rollback_reclaim_diverged_nodes;
+     *   - 9.7-impl-4c: the DATA-extent replica blocks (stm_alloc class)
+     *     via fs_rollback_reclaim_diverged_extents.
+     * Both are best-effort (a failure leaks, never corrupts — see the
+     * helpers); both run before the commit so their deferred-frees ride
+     * the SAME stm_sync_commit as the swap (all-or-nothing on a commit
+     * failure). Still leaked, forward-noted: the cold-extent (CAS) tier
+     * — 9.7-impl-4c-ii — and the snapshot's own cleared dead-list
+     * garbage — 9.7-impl-4c-iii. */
     if (have_old_root) {
         fs_rollback_reclaim_diverged_nodes(fs, didx, dataset_id,
                 de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
                 entry.tree_root_paddr, entry.root_gen, entry.root_csum);
+
+        stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
+        if (eidx) {
+            fs_rollback_reclaim_diverged_extents(fs, eidx, dataset_id,
+                de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
+                entry.tree_root_paddr, entry.root_gen, entry.root_csum);
+        }
     }
 
     /* Commit the swap. stm_sync_commit drives the three-phase cascade;

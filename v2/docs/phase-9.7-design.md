@@ -447,8 +447,21 @@ impl-4b ships the first tier of the block reclamation §6.5 deferred — the eng
 
 Still deferred:
 
-- **9.7-impl-4c** — the data-extent (`stm_alloc`) + cold-extent (`CAS`) tiers of the live divergence, AND the snapshot's own cleared dead-list garbage (`snap_dead[s] \ s_view` — §7.2 `to_free`'s second term), which `stm_snapshot_clear_dead_lists` currently discards.
+- **9.7-impl-4c** — the data-extent (`stm_alloc`) tier of the live divergence.
+- **9.7-impl-4c-ii** — the cold-extent (`CAS`) tier of the live divergence (the CAS refcount is per-extent-record, so the reclaim is a counted multiset difference, not a set difference — its own chunk).
+- **9.7-impl-4c-iii** — the snapshot's own cleared dead-list garbage (`snap_dead[s] \ s_view` — §7.2 `to_free`'s second term), which `stm_snapshot_clear_dead_lists` currently discards.
 - **9.7-impl-4d** — lift the newer-snapshot refusal: delete every snapshot newer than the target and free `newer_dead \ s_view` (the third `to_free` term). This realises `dead_list.tla::Rollback` in full.
+
+### 6.7 — As-built note (9.7-impl-4c: data-extent reclamation)
+
+impl-4c ships the data-extent tier of the §6.6 deferred list — the `stm_alloc`-class **HOT-extent replica blocks**. After the swap + dead-list clear + the impl-4b metadata-node reclaim, the rollback runs `fs_rollback_reclaim_diverged_extents` (fs.c):
+
+- A new dataset-index primitive `stm_dataset_index_scan_engine_range_at` is the third throwaway-engine wrapper (sibling of `verify_engine_at` / `collect_engine_paddrs_at`) — it runs `stm_btree_engine_scan_range` over an inclusive `[lo_key, hi_key]` range. The extent module's `stm_extent_index_collect_engine_data_paddrs_at` calls it with the EXTENT-subspace bounds, decodes each 108-byte value, and emits every HOT extent's replica paddrs (COLD extents decode + validate but contribute no paddr — the CAS tier is impl-4c-ii).
+- The rollback collects the data paddrs of the pre-rollback live tree (`old_set`) and of the snapshot tree (`snap_set`), then `stm_alloc_free`s `old_set \ snap_set` — the data-tier projection of `dead_list.tla::Rollback`'s `live_blocks \ snap_view_blocks[s]`.
+- **Reflink**: a HOT extent's replica paddr is emitted once per referencing extent. A paddr two reflink-siblings of the OLD tree share is deduped by sorting `old_set` (a double `stm_alloc_free` would corrupt the allocator); a paddr a snapshot-tree extent reflink-shares lands in `snap_set` and the set-difference excludes it. The set-difference handles cohabitation exactly.
+- **Safety + best-effort + the newer-snapshot precondition**: identical to §6.6's `fs_rollback_reclaim_diverged_nodes` — a block is freed only if in `old_set`, NOT in `snap_set`, AND both walks completed in full; either walk failing ⇒ nothing freed.
+- **Uncommitted-divergence leak window** (shared with impl-4b, not a regression): the reclaim walks the dataset entry's last-COMMITTED `de_old` triple. Post-snapshot writes still in the dirty buffer at rollback time are flushed by the rollback's own R128 P2-3 drain into the engine's in-RAM tree and then discarded by the swap — those just-allocated paddrs are in neither `de_old` nor `snap`, so they leak. A leak, never a corruption; a candidate for a future "discard the dirty buffer instead of draining it" optimization.
+- No `STM_UB_VERSION` bump — reclamation frees blocks through the existing `stm_alloc` deferred-free; no on-disk format change.
 
 ## 7 — Spec extensions (9.7-spec)
 

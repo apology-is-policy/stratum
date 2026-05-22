@@ -885,6 +885,54 @@ stm_status stm_dataset_index_collect_engine_paddrs_at(
                                        stm_btree_engine_paddr_cb cb,
                                        void *cb_ctx);
 
+/*
+ * 9.7-impl-4c (rollback data-extent reclamation): enumerate every
+ * (key, value) pair whose key is in the INCLUSIVE range [lo_key, hi_key]
+ * of the btree_engine tree at an arbitrary `(root_paddr, root_gen,
+ * root_csum)` triple, invoking `cb` per in-range entry in ascending key
+ * order.
+ *
+ * Opens a THROWAWAY read-only engine at the triple (index storage +
+ * crypt context, `tree_id = dataset_id` for the AEAD), runs
+ * `stm_btree_engine_scan_range`, and destroys it — no dataset slot is
+ * touched, no in-RAM engine is cached. Each node is Merkle + AEAD
+ * verified as the scan descends; a corrupt node aborts with the verify
+ * error. Sibling of stm_dataset_index_collect_engine_paddrs_at — same
+ * throwaway-engine shape, a bounded key-range scan in place of the
+ * paddr walk.
+ *
+ * The extent module's `stm_extent_index_collect_engine_data_paddrs_at`
+ * calls this with the EXTENT-subspace key bounds to enumerate one
+ * frozen tree's extent records (the rollback divergence walk); a
+ * caller iterating any other metakey subspace passes that subspace's
+ * natural low / high bounds.
+ *
+ * An all-zero triple (`root_paddr == 0 && root_gen == 0`) is the "empty
+ * dataset" sentinel — there is no on-disk tree, so STM_OK is returned
+ * with `cb` never invoked. `dataset_id` need NOT name a PRESENT dataset
+ * — only the storage/crypt binding and the triple matter.
+ *
+ * Returns STM_OK on a complete scan, STM_ECORRUPT / STM_EBADTAG on a
+ * Merkle / AEAD failure, STM_EINVAL on NULL idx / NULL cb /
+ * dataset_id == 0 / a NULL key with nonzero length / storage or crypt
+ * ctx unbound, STM_ENOMEM / device errors otherwise. A nonzero `cb`
+ * return stops the scan early and is NOT itself an error (STM_OK) — a
+ * cb that needs to surface a failure of its own carries it in `cb_ctx`.
+ *
+ * Concurrency: takes idx's lock for the open->scan->destroy sequence.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_scan_engine_range_at(
+                                       stm_dataset_index *idx,
+                                       uint64_t dataset_id,
+                                       uint64_t root_paddr,
+                                       uint64_t root_gen,
+                                       const uint8_t root_csum[32],
+                                       const void *lo_key, size_t lo_key_len,
+                                       const void *hi_key, size_t hi_key_len,
+                                       stm_btree_engine_iter_cb cb,
+                                       void *cb_ctx);
+
 /* ========================================================================= */
 /* 9.7-impl-1c-ii: per-dataset engine M-cascade commit driving APIs.          */
 /*                                                                             */

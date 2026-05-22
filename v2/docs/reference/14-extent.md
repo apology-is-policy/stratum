@@ -152,6 +152,35 @@ siblings). Post-condition: `current_txg` raised to
 mount Write/Overwrite cannot stamp an extent at a gen below any
 persisted gen.
 
+### Rollback reclamation (9.7-impl-4c)
+
+```c
+stm_status stm_extent_index_collect_engine_data_paddrs_at(
+        idx, dataset_id, root_paddr, root_gen, root_csum[32],
+        stm_extent_paddr_cb cb, void *cb_ctx);
+```
+
+`collect_engine_data_paddrs_at` enumerates every DATA-tier
+(stm_alloc-class) replica paddr a frozen tree references — the
+rollback data-extent reclamation primitive. It walks the EXTENT
+subspace of a THROWAWAY read-only engine opened at the triple
+(delegating the open + bounded scan to
+`stm_dataset_index_scan_engine_range_at` →
+`stm_btree_engine_scan_range`), decodes each 108-byte value, and for
+every HOT extent invokes `cb` once per replica paddr in
+`paddrs[0..n_replicas)`. COLD extents are decoded + validated (a
+corrupt COLD value still aborts the walk) but contribute no paddr —
+their CAS-tier storage is reclaimed separately (9.7-impl-4c-ii).
+
+`stm_fs_rollback_snapshot`'s `fs_rollback_reclaim_diverged_extents`
+calls it on the pre-rollback live root AND the snapshot root, then
+set-differences the two paddr sets and `stm_alloc_free`s `old \ snap`
+— the data-tier projection of `dead_list.tla::Rollback`'s
+live-divergence term. A paddr a HOT extent reflink-shares across the
+snapshot boundary is referenced by a snapshot-tree extent, so it
+lands in the snapshot set and the difference excludes it. An all-zero
+triple enumerates nothing (`STM_OK`, `cb` never invoked).
+
 ### Lifecycle
 
 ```c
@@ -479,7 +508,7 @@ layout changes.
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_extent_index` | 38 | Lifecycle (create / close / advance_txg with all error paths including R34 P3-2 NULL-idx parity). Write — basic insert + lookup roundtrip; refuses zero-len, zero-args, off+len overflow, future write_gen, overlap with existing in-ino, paddr already-in-use. Overwrite — into hole returns no drops; drops one extent; drops multiple overlapping; doesn't touch other (ds, ino); refuses paddr-cycle (new_paddr equals a dropped extent); refuses paddr-collision with live extent in different (ds, ino); refuses bad args. Truncate — drops past-size extents; truncate-to-zero drops all; no drops when new_size > max extent end; doesn't touch other (ds, ino). DeleteFile — drops all in (ds, ino); idempotent on empty (ds, ino). Lookup — hole boundaries (off < extent.off, off ≥ extent.off+extent.len, off=last byte); unknown (ds, ino) returns ENOENT. Iter — returns off-ascending despite insertion order; early terminate on cb=false; filters by (ds, ino). ERRORCHECK reentry — cb-runs-under-lock smoke test. Concurrent stress — 4 workers × 256 ops each on disjoint (ds, ino) all serialize cleanly. **R34 P2-1 regression** — out-arg zeroing on `idx==NULL` early return for overwrite / truncate / delete_file. **P7-3 persistence** (6 tests) — set_storage required for commit; commit + load_at roundtrip across multiple datasets / inos / paddrs / write_gens with current_txg bumped to max(write_gen); idempotent commit at same target_gen returns same paddr+csum bytes; tampered csum on load_at refused + atomic state preserve; 24-bit length cap refused at commit; empty-tree first-commit roundtrip. |
+| `test_extent_index` | 57 | Lifecycle (create / close / advance_txg with all error paths including R34 P3-2 NULL-idx parity). Write — basic insert + lookup roundtrip; refuses zero-len, zero-args, off+len overflow, future write_gen, overlap with existing in-ino, paddr already-in-use. Overwrite — into hole returns no drops; drops one extent; drops multiple overlapping; doesn't touch other (ds, ino); refuses paddr-cycle (new_paddr equals a dropped extent); refuses paddr-collision with live extent in different (ds, ino); refuses bad args. Truncate — drops past-size extents; truncate-to-zero drops all; no drops when new_size > max extent end; doesn't touch other (ds, ino). DeleteFile — drops all in (ds, ino); idempotent on empty (ds, ino). Lookup — hole boundaries (off < extent.off, off ≥ extent.off+extent.len, off=last byte); unknown (ds, ino) returns ENOENT. Iter — returns off-ascending despite insertion order; early terminate on cb=false; filters by (ds, ino). Multi-replica write / overwrite / truncate / reflink (P7-6 / P7-16). ERRORCHECK reentry — cb-runs-under-lock smoke test. Concurrent stress — 4 workers × 256 ops each on disjoint (ds, ino) all serialize cleanly. **R34 P2-1 regression** — out-arg zeroing on `idx==NULL` early return for overwrite / truncate / delete_file. **9.7-impl-4c `collect_engine_data_paddrs_at`** (2 tests) — arg validation (NULL idx / NULL cb / dataset_id=0 / dataset-index-unattached EINVAL); all-zero "empty dataset" triple → STM_OK with cb never invoked (the real-tree walk on committed trees is covered end-to-end by `test_fs`'s rollback-reclaim integration test). |
 | `test_fs` | 17 | Lifecycle / format / mount / unmount / RO / wedged / reserve+free / stats / null-args (9 pre-existing). **P7-4 (8 new)**: write/read 4 KiB roundtrip; read-hole returns zeros; write args validation (zero ds/ino/len, unaligned off/len, `len > STM_FS_RECORDSIZE_MAX`); COW without snapshot routes drop to alloc.free; COW with snapshot routes drop to snap dead-list (asserts `stm_snapshot_dead_list_count` 0 → 1); cross-mount durability (write + commit + unmount + remount + read); RO mount blocks writes; multi-extent per ino. |
 
 `test_extent` (Phase 4) covers the AEAD-wrap helpers; that suite is

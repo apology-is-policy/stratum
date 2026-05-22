@@ -38,10 +38,30 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: 9.7-impl-4b — rollback metadata-node reclamation — shipped +
-  R161 audit closed. R161 verdict: **0 P0, 0 P1, 0 P2, 3 P3**; all 3
-  P3s (cosmetic — an overflow guard, a doc + a comment) closed in the
-  close commit.
+- **Tip**: 9.7-impl-4c — rollback data-extent reclamation — shipped;
+  R162 audit pending.
+  - **9.7-impl-4c**: `stm_fs_rollback_snapshot` now also reclaims the
+    post-snapshot DATA-extent divergence (the `stm_alloc`-class
+    HOT-extent replica blocks) — the data-tier sibling of impl-4b's
+    metadata-node reclaim. After the swap + dead-list clear + the
+    impl-4b node reclaim, `fs_rollback_reclaim_diverged_extents` walks
+    the EXTENT keyspace of the pre-rollback live tree AND the snapshot
+    tree (`stm_extent_index_collect_engine_data_paddrs_at` →
+    `stm_dataset_index_scan_engine_range_at` →
+    `stm_btree_engine_scan_range` — two new APIs; `scan_engine_range_at`
+    is the third throwaway-engine wrapper, `collect_engine_data_paddrs_at`
+    decodes each 108-byte extent value to its HOT replica paddrs),
+    set-differences the two data-paddr sets, and `stm_alloc_free`s
+    `old \ snap` (the data-tier projection of `dead_list.tla::Rollback`'s
+    live-divergence term). A reflink-shared paddr that the snapshot tree
+    references lands in `snap_set` and is excluded; sorting `old_set`
+    dedups a paddr two reflink-siblings of the OLD tree share. Same
+    best-effort + walk-must-complete + `free_gen`-before-commit posture
+    as impl-4b. **No STM_UB_VERSION bump.** Forward-noted: 9.7-impl-4c-ii
+    (the cold-extent CAS tier — the CAS refcount is per-record so it is
+    a counted multiset difference, its own chunk), 9.7-impl-4c-iii (the
+    cleared dead-list garbage), 9.7-impl-4d (lift the newer-snapshot
+    refusal).
   - **9.7-impl-4b** (`ac83d4f` + R161 close): `stm_fs_rollback_snapshot`
     now reclaims the post-snapshot metadata-node divergence instead of
     leaking it. After the swap + dead-list clear,
@@ -104,15 +124,22 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **9.7-impl-2** (`4b73f23` + `2176db0`, R158): snapshot-aware COW
     free — superseded engine NODE paddrs route into a per-snap
     bootstrap-tier dead-list. STM_UB_VERSION 30→31.
-  - **ctest 63/64 standalone** — the lone failure is the documented
-    `test_compound_ops_concurrent` rename/cfr/reflink/write-truncate
-    flake ([[flake-per-inode-cfr-concurrent]]), confirmed pre-existing
-    (the failing case wandered cfr↔rename across runs; impl-4b touches
-    neither path). `test_btree_engine` 47, `test_snapshot` 58,
-    `test_dataset` 75, `test_fs` 181, `test_ctl` 149.
-  - **What's next**: 9.7-impl-4c (rollback data-extent + cold-extent
-    reclamation + the cleared dead-list garbage) → 9.7-impl-4d (lift
-    the newer-snapshot refusal) → 9.7-impl-5 (readable `.snaps/`).
+  - **ctest 63/64 standalone** at the impl-4c tip — the lone failure is
+    the documented `test_compound_ops_concurrent`
+    rename/cfr/reflink/write-truncate flake
+    ([[flake-per-inode-cfr-concurrent]]), confirmed pre-existing by the
+    stash-retest method: with impl-4c stashed, the test still failed
+    4/4 runs at the clean `10cd722` tip; with impl-4c present it both
+    passed and failed across runs (a SEGFAULT under `-j4`, a rename-case
+    error standalone — the non-deterministic wander IS the flake
+    signature). impl-4c touches no per-inode op — its new code runs
+    only on the rollback path, which the test never exercises.
+    `test_btree_engine` 47, `test_snapshot` 58, `test_dataset` 77,
+    `test_extent_index` 57, `test_fs` 182, `test_ctl` 149.
+  - **What's next**: 9.7-impl-4c-ii (rollback cold-extent CAS-tier
+    reclamation) → 9.7-impl-4c-iii (cleared dead-list garbage) →
+    9.7-impl-4d (lift the newer-snapshot refusal) → 9.7-impl-5
+    (readable `.snaps/`).
 
 - **Pre-tip-0**: Phase 9.7-impl-1c-vi (`3afa915`) — the pool-global-engine
   retirement closes. The four `stm_sync` mirror fields

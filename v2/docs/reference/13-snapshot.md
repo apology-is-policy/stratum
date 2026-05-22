@@ -172,10 +172,21 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
   and are never freed; if either walk fails the reclaim frees nothing
   (best-effort — an unreclaimed block leaks, a space cost, never a
   corruption: it stays allocated so the allocator never reissues it
-  and the AEAD `(paddr, write_gen)` nonce stays unique). Still leaked,
-  forward-noted to **9.7-impl-4c**: the data-extent (stm_alloc) +
-  cold-extent (CAS) tiers and the snapshot's own cleared dead-list
-  garbage.
+  and the AEAD `(paddr, write_gen)` nonce stays unique).
+- **Data-extent reclamation (9.7-impl-4c)** — the data-tier sibling of
+  the above, run in the same pre-commit window:
+  `fs_rollback_reclaim_diverged_extents` walks the EXTENT keyspace of
+  both trees (`stm_extent_index_collect_engine_data_paddrs_at` →
+  `stm_dataset_index_scan_engine_range_at` → `stm_btree_engine_scan_range`,
+  decoding each value to its HOT replica paddrs), set-differences the
+  data-paddr sets, and `stm_alloc_free`s `old \ snap` — the data-tier
+  projection of the same live-divergence term. A paddr a HOT extent
+  reflink-shares across the snapshot boundary lands in the snapshot
+  set and is excluded; sorting `old` dedups a paddr two reflink-
+  siblings of the OLD tree share. Same best-effort + walk-must-complete
+  posture as the node reclaim. Still leaked, forward-noted: the
+  cold-extent (CAS) tier — **9.7-impl-4c-ii** — and the snapshot's own
+  cleared dead-list garbage — **9.7-impl-4c-iii**.
 - **v1.0 limitation** — a rollback is refused (`STM_ENOTSUPPORTED`)
   when a newer snapshot of the dataset exists. ZFS semantics destroy
   every newer snapshot; doing that correctly needs the `\ newer_dead`
@@ -232,8 +243,8 @@ snapshot stays PRESENT. The cleared entries are **discarded**, not
 transferred to the caller — a dead-list mixes paddrs the snapshot's
 tree references (live after a rollback — MUST NOT be freed) with
 intermediate COW garbage, and the snapshot module cannot tell them
-apart, so it frees neither (the garbage leaks; 9.7-impl-4c reclaims
-it).
+apart, so it frees neither (the garbage leaks; 9.7-impl-4c-iii
+reclaims it).
 The rollback mechanism calls this on the rolled-back-to snapshot:
 post-rollback the live tree is the snapshot's tree, so its
 dead-listed paddrs are live again and must not stay dead-listed (a

@@ -750,6 +750,119 @@ STM_TEST(fs_rollback_reclaims_diverged_nodes) {
     unlink(g_tmp_path);
 }
 
+/* 9.7-impl-4c: a rollback reclaims the post-snapshot DATA-extent
+ * divergence — HOT-extent replica blocks (stm_alloc class) reachable
+ * from the pre-rollback live tree but not from the snapshot's frozen
+ * tree. The load-bearing property is that a data block S's frozen tree
+ * still references is NEVER freed. This test diverges the data layer,
+ * rolls back, asserts data_allocated_blocks drops back to the post-
+ * snapshot value (the divergence was reclaimed, not leaked as impl-4b
+ * left it), then runs a heavy post-rollback DATA workload that forces
+ * the allocator to reissue the freed paddrs: a wrongly-freed S-data
+ * block would be overwritten by a reissue and the snapshot-era read
+ * would then fail or mismatch — caught by the inode-1 re-read. */
+STM_TEST(fs_rollback_reclaims_diverged_data_extents) {
+    make_tmp("rb_reclaim_data");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                     0, 0, &dir));
+
+    uint8_t a[4096], b[4096], fdata[4096], out[4096];
+    memset(a, 0xA1, sizeof a);
+    memset(b, 0xB2, sizeof b);
+    memset(fdata, 0xCD, sizeof fdata);
+
+    /* Pre-snapshot: data A on inode 1. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "S", 1, &snap_id));
+
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    uint64_t alloc_after_snap = st.data_allocated_blocks;
+
+    /* Diverge: overwrite inode 1 with B + 8 files f00..f07 each carrying
+     * a 4-KiB data extent. Commit so the divergence is a COMMITTED tree
+     * the rollback's de_old triple walk enumerates. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, b, sizeof b));
+    for (int i = 0; i < 8; i++) {
+        char nm[4] = { 'f', (char)('0' + i / 10), (char)('0' + i % 10), 0 };
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm, 3,
+                                            0644u, 0, 0, &ino));
+        STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, fdata, sizeof fdata));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    uint64_t alloc_after_diverge = st.data_allocated_blocks;
+    /* The diverge allocated real data blocks (B + the 8 file extents). */
+    STM_ASSERT(alloc_after_diverge > alloc_after_snap);
+
+    /* Roll back to S — the swap reverts the tree, the reclaim frees the
+     * diverged DATA extents. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap_id, /*force=*/false));
+
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    uint64_t alloc_after_rollback = st.data_allocated_blocks;
+    /* 9.7-impl-4c: the diverged data blocks were reclaimed. Without the
+     * reclaim, alloc_after_rollback would still equal alloc_after_diverge
+     * (the data leak impl-4b left). Back to EXACTLY the post-snapshot
+     * value — the rolled-back live tree references precisely S's data. */
+    STM_ASSERT(alloc_after_rollback < alloc_after_diverge);
+    STM_ASSERT_EQ(alloc_after_rollback, alloc_after_snap);
+
+    /* Snapshot view restored, divergence gone, fs verifies clean. */
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+    uint64_t found = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"f00", 3, &found),
+                       STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    /* Heavy post-rollback DATA workload: 16 fresh files each carrying a
+     * 4-KiB extent, a commit each. This draws down the data free list,
+     * so the paddrs freed by the reclaim get REISSUED. A wrongly-freed
+     * block S's frozen tree still references would now be overwritten —
+     * caught by the inode-1 re-read + re-verify below. */
+    for (int i = 0; i < 16; i++) {
+        char nm[4] = { 'h', (char)('0' + i / 10), (char)('0' + i % 10), 0 };
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm, 3,
+                                            0644u, 0, 0, &ino));
+        STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, fdata, sizeof fdata));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+
+    /* The snapshot-era data is STILL intact — no block S references was
+     * reclaimed + reissued out from under it. */
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    /* Durable across a remount. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 STM_TEST(fs_io_read_hole_returns_zeros) {
     make_tmp("io_hole");
     stm_fs_format_opts fopts = default_format_opts();
