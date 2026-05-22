@@ -2782,6 +2782,11 @@ static int ex_collect_cold_adapter(const void *k, size_t klen,
     if (ks != STM_OK) { gc->err = ks; return 1; }
     stm_extent_record r;
     memset(&r, 0, sizeof r);
+    /* gc->ds feeds ex_decode_value only to populate r.dataset_id, which
+     * the COLD path below never reads — it is threaded purely for the
+     * decoder's signature parity. The cross-dataset-substitution defense
+     * is the engine layer's tree_id=dataset_id AEAD-AD binding, not this
+     * argument (R163 P3-1). */
     stm_status vs = ex_decode_value(v, vlen, gc->ds, ino, off, &r);
     if (vs != STM_OK) { gc->err = vs; return 1; }
     if (r.kind == STM_EXTENT_KIND_COLD) {

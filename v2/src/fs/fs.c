@@ -6505,8 +6505,12 @@ static void fs_rollback_reclaim_diverged_nodes(
     /* old \ snap via a sorted merge — sorting old_set too dedups it
      * (defence against a corrupt tree presenting one paddr twice,
      * which would otherwise double-free). */
-    qsort(snap_set.v, snap_set.n, sizeof *snap_set.v, fs_rb_paddr_cmp);
-    qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_paddr_cmp);
+    /* Skip the sort for an empty / single-element set — already sorted,
+     * and it keeps a NULL base out of qsort (strict-C-clean; R163 P3-2). */
+    if (snap_set.n > 1)
+        qsort(snap_set.v, snap_set.n, sizeof *snap_set.v, fs_rb_paddr_cmp);
+    if (old_set.n > 1)
+        qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_paddr_cmp);
 
     uint64_t free_gen = stm_sync_current_gen(fs->sync);
     size_t   j = 0;
@@ -6610,8 +6614,12 @@ static void fs_rollback_reclaim_diverged_extents(
      * BEST-EFFORT posture. A refcount-exact reclaim would need the same
      * counted-multiset machinery the cold-extent tier needs — forward-
      * noted to 9.7-impl-4c-ii alongside the CAS-refcount work. */
-    qsort(snap_set.v, snap_set.n, sizeof *snap_set.v, fs_rb_paddr_cmp);
-    qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_paddr_cmp);
+    /* Skip the sort for an empty / single-element set — already sorted,
+     * and it keeps a NULL base out of qsort (strict-C-clean; R163 P3-2). */
+    if (snap_set.n > 1)
+        qsort(snap_set.v, snap_set.n, sizeof *snap_set.v, fs_rb_paddr_cmp);
+    if (old_set.n > 1)
+        qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_paddr_cmp);
 
     uint64_t free_gen = stm_sync_current_gen(fs->sync);
     size_t   j = 0;
@@ -6757,8 +6765,12 @@ static void fs_rollback_reclaim_diverged_cold(
     stm_cas_index *cidx = stm_sync_cas_index(fs->sync);
     if (!cidx) goto done;   /* no CAS index attached — nothing to deref */
 
-    qsort(snap_set.v, snap_set.n, sizeof *snap_set.v, fs_rb_cold_cmp);
-    qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_cold_cmp);
+    /* Skip the sort for an empty / single-element set — already sorted,
+     * and it keeps a NULL base out of qsort (strict-C-clean; R163 P3-2). */
+    if (snap_set.n > 1)
+        qsort(snap_set.v, snap_set.n, sizeof *snap_set.v, fs_rb_cold_cmp);
+    if (old_set.n > 1)
+        qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_cold_cmp);
 
     size_t j = 0;
     for (size_t i = 0; i < old_set.n; i++) {

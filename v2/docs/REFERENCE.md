@@ -39,8 +39,14 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 ## Snapshot
 
 - **Tip**: 9.7-impl-4c-ii — rollback cold-extent (CAS-tier)
-  reclamation — shipped; R163 audit pending.
-  - **9.7-impl-4c-ii**: `stm_fs_rollback_snapshot` now also reclaims
+  reclamation — shipped + R163 audit closed. R163 verdict: **0 P0,
+  0 P1, 0 P2, 2 P3**; the audit prosecuted the central no-over-deref
+  claim (the per-key structural merge) exhaustively and it holds. Both
+  P3s (a `gc->ds`-threading clarity comment; a strict-C `qsort(NULL,0)`
+  corner now gated on `n > 1` across all three rollback-reclaim
+  helpers) closed inline in the close commit.
+  - **9.7-impl-4c-ii** (`db5e8f5` + R163 close): `stm_fs_rollback_snapshot`
+    now also reclaims
     the post-snapshot COLD-extent divergence — the CAS-tier sibling of
     impl-4b's metadata-node + impl-4c's data-extent reclaims. With it
     the rollback reclaims the WHOLE live-divergence term of
