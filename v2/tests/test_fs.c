@@ -651,6 +651,105 @@ STM_TEST(fs_rollback_then_delete_snapshot_no_live_block_freed) {
     unlink(g_tmp_path);
 }
 
+/* 9.7-impl-4b: a rollback reclaims the post-snapshot metadata-node
+ * divergence (engine NODE / spill blocks reachable from the pre-
+ * rollback live tree but not from the snapshot's). The load-bearing
+ * property is that the COW-SHARED nodes — which ARE the snapshot's tree
+ * after the swap — are NEVER freed. This test diverges the tree, rolls
+ * back, then runs a heavy post-rollback workload that cycles the sync
+ * gen and forces the bootstrap allocator to reissue freed paddrs: a
+ * wrongly-freed shared node would be overwritten by a reissue and the
+ * snapshot-era data / Merkle chain would then break — caught by the
+ * re-verify. */
+STM_TEST(fs_rollback_reclaims_diverged_nodes) {
+    make_tmp("rb_reclaim");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                     0, 0, &dir));
+
+    uint8_t a[4096], b[4096], out[4096];
+    memset(a, 0xA1, sizeof a);
+    memset(b, 0xB2, sizeof b);
+
+    /* Pre-snapshot state: data A on inode 1 + 16 files f00..f15 to bulk
+     * the per-dataset metadata tree past a single node. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    for (int i = 0; i < 16; i++) {
+        char nm[4] = { 'f', (char)('0' + i / 10), (char)('0' + i % 10), 0 };
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm, 3,
+                                            0644u, 0, 0, &ino));
+    }
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "S", 1, &snap_id));
+
+    /* Diverge: overwrite inode 1 with B + 16 more files g00..g15. The
+     * COW writes fresh metadata nodes — the divergence the reclaim
+     * frees. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, b, sizeof b));
+    for (int i = 0; i < 16; i++) {
+        char nm[4] = { 'g', (char)('0' + i / 10), (char)('0' + i % 10), 0 };
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm, 3,
+                                            0644u, 0, 0, &ino));
+    }
+
+    /* Roll back to S — the swap reverts the tree, the reclaim frees the
+     * diverged nodes. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap_id, /*force=*/false));
+
+    /* Snapshot view restored, divergence gone, fs verifies clean. */
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"f00", 3, &found));
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"g00", 3, &found),
+                       STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    /* Heavy post-rollback workload: 16 fresh files, a commit each. This
+     * cycles the sync gen and draws down the bootstrap free list, so the
+     * paddrs freed by the reclaim get reissued. A wrongly-freed SHARED
+     * node would now be overwritten — caught by the re-verify below. */
+    for (int i = 0; i < 16; i++) {
+        char nm[4] = { 'h', (char)('0' + i / 10), (char)('0' + i % 10), 0 };
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm, 3,
+                                            0644u, 0, 0, &ino));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+
+    /* The snapshot-era state is STILL intact + the Merkle chain clean —
+     * no COW-shared node was reclaimed. */
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"f15", 3, &found));
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    /* Durable across a remount. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"f08", 3, &found));
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 STM_TEST(fs_io_read_hole_returns_zeros) {
     make_tmp("io_hole");
     stm_fs_format_opts fopts = default_format_opts();

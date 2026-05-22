@@ -435,6 +435,21 @@ The §6.2 sketch above predates impl-1..3; the shipped mechanism deviates as fol
 - **`stm_snapshot_rollback_reclaim` does not exist — block reclamation is deferred to 9.7-impl-4b.** impl-4 ships the swap only. The post-snapshot diverged engine nodes + data extents LEAK (stay allocated, untracked). This is a space cost, never a corruption: a leaked block stays allocated so the allocator never reissues it and the AEAD nonce stays unique. The target snapshot's own dead-lists ARE cleared (`stm_snapshot_clear_dead_lists`, a new API) — mandatory, since post-rollback the live tree IS the snapshot's tree and a dead-listed-but-now-live paddr would let a later `stm_snapshot_delete` free live storage.
 - **v1.0 refuses rollback past a newer snapshot** (`STM_ENOTSUPPORTED`). The §7.2 `dead_list.tla::Rollback` action (delete newer snaps + free `newer_dead \ s_view`) needs the diverged-block walk that impl-4b introduces; until then the operator deletes newer snapshots explicitly (the existing `stm_fs_delete_snapshot` reclaims them correctly) and then rolls back. impl-4b lifts this limitation and realises `dead_list.tla::Rollback` in full.
 
+### 6.6 — As-built note (9.7-impl-4b: metadata-node reclamation)
+
+impl-4b ships the first tier of the block reclamation §6.5 deferred — the engine **metadata nodes**. After the swap + dead-list clear, the rollback runs `fs_rollback_reclaim_diverged_nodes` (fs.c):
+
+- A new btree_engine primitive `stm_btree_engine_walk_paddrs` enumerates every on-disk block reachable from a tree's durable root — every NODE and every large-value spill-chain block — under the same Merkle + AEAD descent gate `stm_btree_engine_verify` applies. `stm_dataset_index_collect_engine_paddrs_at` wraps it in the throwaway-engine pattern of `verify_engine_at`.
+- The rollback collects the node + spill paddrs of the pre-rollback live tree (`old_set`) and of the snapshot tree (`snap_set`), then bootstrap-frees `old_set \ snap_set` — the post-snapshot metadata-node divergence. This is the boot-tier projection of `dead_list.tla::Rollback`'s live-divergence term `live_blocks \ snap_view_blocks[s]`.
+- **Safety**: incremental COW SHARES every unchanged subtree between the two roots; the shared nodes (`old ∩ snap`) ARE the snapshot's tree after the swap, so the `\ snap_set` filter is load-bearing — a block is freed only if it is in `old_set`, NOT in `snap_set`, AND both walks completed in full. Either walk failing ⇒ nothing freed (best-effort: an unreclaimed block leaks — a space cost, never a corruption).
+- Correct only because impl-4 already refuses the rollback when a newer snapshot exists: with `s` the most-recent snapshot, every `old \ snap` block was allocated after `s` (COW only writes fresh paddrs), so no older snapshot references it.
+- No `STM_UB_VERSION` bump — reclamation frees blocks through the existing bootstrap deferred-free; no on-disk format change.
+
+Still deferred:
+
+- **9.7-impl-4c** — the data-extent (`stm_alloc`) + cold-extent (`CAS`) tiers of the live divergence, AND the snapshot's own cleared dead-list garbage (`snap_dead[s] \ s_view` — §7.2 `to_free`'s second term), which `stm_snapshot_clear_dead_lists` currently discards.
+- **9.7-impl-4d** — lift the newer-snapshot refusal: delete every snapshot newer than the target and free `newer_dead \ s_view` (the third `to_free` term). This realises `dead_list.tla::Rollback` in full.
+
 ## 7 — Spec extensions (9.7-spec)
 
 ### 7.1 — snapshot.tla rollback mechanism

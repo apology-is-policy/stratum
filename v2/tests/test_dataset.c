@@ -2320,4 +2320,67 @@ STM_TEST(dataset_set_engine_root_arg_validation) {
     stm_dataset_index_close(idx);
 }
 
+/* 9.7-impl-4b: stm_dataset_index_collect_engine_paddrs_at enumerates a
+ * tree's node + spill paddrs via a throwaway read-only engine — the
+ * rollback reclamation primitive. (The real-tree walk is covered
+ * exhaustively by test_btree_engine.c's walk_paddrs tests and end-to-
+ * end by test_fs.c's rollback-reclaim test; here: arg validation + the
+ * empty-dataset sentinel path.) */
+typedef struct { size_t n; } collect_paddr_ctx;
+
+static int collect_paddr_cb(uint64_t paddr, void *ctx)
+{
+    (void)paddr;
+    ((collect_paddr_ctx *)ctx)->n++;
+    return 0;
+}
+
+STM_TEST(dataset_collect_engine_paddrs_arg_validation) {
+    collect_paddr_ctx cc = {0};
+    uint8_t csum[32] = {0};
+
+    /* NULL idx / NULL cb / dataset_id 0 — refused before the lock. */
+    STM_ASSERT_ERR(stm_dataset_index_collect_engine_paddrs_at(
+                       NULL, 1, 0xCAFEu, 5u, csum, collect_paddr_cb, &cc),
+                   STM_EINVAL);
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_ERR(stm_dataset_index_collect_engine_paddrs_at(
+                       idx, 1, 0xCAFEu, 5u, csum, NULL, &cc), STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_index_collect_engine_paddrs_at(
+                       idx, 0, 0xCAFEu, 5u, csum, collect_paddr_cb, &cc),
+                   STM_EINVAL);
+    /* Storage / crypt unbound — refused with STM_EINVAL. */
+    STM_ASSERT_ERR(stm_dataset_index_collect_engine_paddrs_at(
+                       idx, 1, 0xCAFEu, 5u, csum, collect_paddr_cb, &cc),
+                   STM_EINVAL);
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(dataset_collect_engine_paddrs_empty_triple) {
+    dsp_make_tmp("collect_empty");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    /* The all-zero "empty dataset" triple — STM_OK, cb never invoked. */
+    collect_paddr_ctx cc = {0};
+    uint8_t zero[32] = {0};
+    STM_ASSERT_OK(stm_dataset_index_collect_engine_paddrs_at(
+                      idx, STM_DATASET_ROOT_ID, 0, 0, zero,
+                      collect_paddr_cb, &cc));
+    STM_ASSERT_EQ(cc.n, (size_t)0);
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
 STM_TEST_MAIN("dataset")

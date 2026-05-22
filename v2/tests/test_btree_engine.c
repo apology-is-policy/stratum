@@ -2440,4 +2440,208 @@ STM_TEST(engine_store_vt_bootstrap_roundtrip) {
     unlink(path);
 }
 
+/* ========================================================================= */
+/* Tests — paddr enumeration (9.7-impl-4b: rollback block reclamation).         */
+/* ========================================================================= */
+
+/* Collector for stm_btree_engine_walk_paddrs. 512 slots covers every
+ * tree the tests below build (a height-3 150-key tree is ~50 nodes; a
+ * 200-KiB spilled value is ~14 blocks). */
+typedef struct { uint64_t v[512]; size_t n; bool overflow; } walk_paddr_buf;
+
+static int walk_paddr_cb(uint64_t paddr, void *ctx)
+{
+    walk_paddr_buf *b = ctx;
+    if (b->n >= 512) { b->overflow = true; return 1; }   /* stop the walk */
+    b->v[b->n++] = paddr;
+    return 0;
+}
+
+static bool walk_buf_has(const walk_paddr_buf *b, uint64_t p)
+{
+    for (size_t i = 0; i < b->n; i++) if (b->v[i] == p) return true;
+    return false;
+}
+
+static bool walk_buf_all_distinct(const walk_paddr_buf *b)
+{
+    for (size_t i = 0; i < b->n; i++)
+        for (size_t j = i + 1u; j < b->n; j++)
+            if (b->v[i] == b->v[j]) return false;
+    return true;
+}
+
+/* A single-leaf tree (empty, or one tiny inline entry) walks to exactly
+ * one paddr — its leaf root. */
+STM_TEST(engine_walk_paddrs_basic) {
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    /* Empty committed tree: one leaf node (the empty root). */
+    uint64_t rp = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+    walk_paddr_buf wb = {0};
+    STM_ASSERT_OK(stm_btree_engine_walk_paddrs(eng, walk_paddr_cb, &wb));
+    STM_ASSERT_TRUE(!wb.overflow);
+    STM_ASSERT_EQ(wb.n, (size_t)1);
+    STM_ASSERT_EQ(wb.v[0], rp);
+
+    /* One tiny inline insert: still a single leaf root. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, "v", 1));
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &rp, rc));
+    walk_paddr_buf wb2 = {0};
+    STM_ASSERT_OK(stm_btree_engine_walk_paddrs(eng, walk_paddr_cb, &wb2));
+    STM_ASSERT_EQ(wb2.n, (size_t)1);
+    STM_ASSERT_EQ(wb2.v[0], rp);
+
+    /* Determinism: a second walk yields the same single paddr. */
+    walk_paddr_buf wb3 = {0};
+    STM_ASSERT_OK(stm_btree_engine_walk_paddrs(eng, walk_paddr_cb, &wb3));
+    STM_ASSERT_EQ(wb3.n, (size_t)1);
+    STM_ASSERT_EQ(wb3.v[0], rp);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+/* A multi-level tree walks to >= 3 distinct paddrs, all of them store
+ * slots, with the root among them. An incremental commit COWs one
+ * root-to-leaf path: the two roots SHARE every unchanged subtree (the
+ * exact set-up the rollback reclamation set-differences). */
+STM_TEST(engine_walk_paddrs_multilevel) {
+    enum { N = 150, KLEN = 4000 };
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    uint8_t *key = malloc(KLEN);
+    STM_ASSERT(key != NULL);
+    if (!key) { stm_btree_engine_destroy(eng); memstore_destroy(&ms); return; }
+    memset(key, 0xAB, KLEN);
+    for (uint32_t i = 0; i < N; i++) {
+        be32_key(i, key + KLEN - 4);
+        uint8_t val[8];
+        for (int b = 0; b < 8; b++) val[b] = (uint8_t)(i + (uint32_t)b);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, KLEN, val, 8));
+    }
+    stm_btree_engine_stats st;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_TRUE(st.height >= 3);
+
+    uint64_t rp1 = 0;
+    uint8_t  rc1[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 7, &rp1, rc1));
+
+    walk_paddr_buf w1 = {0};
+    STM_ASSERT_OK(stm_btree_engine_walk_paddrs(eng, walk_paddr_cb, &w1));
+    STM_ASSERT_TRUE(!w1.overflow);
+    STM_ASSERT_TRUE(w1.n >= 3);                  /* root + internal + leaves */
+    STM_ASSERT_TRUE(walk_buf_all_distinct(&w1));
+    STM_ASSERT_TRUE(walk_buf_has(&w1, rp1));     /* the root is emitted */
+    for (size_t i = 0; i < w1.n; i++)            /* every paddr was reserved */
+        STM_ASSERT_TRUE(w1.v[i] >= 1 && w1.v[i] <= ms.n);
+
+    /* Incremental commit COWs one root-to-leaf path; the new root shares
+     * every unchanged subtree with the old. old\new is the superseded
+     * path, the intersection is the shared subtrees — the rollback diff. */
+    be32_key(7u, key + KLEN - 4);
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, key, KLEN, "ZZZZ", 4));
+    uint64_t rp2 = 0;
+    uint8_t  rc2[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 9, &rp2, rc2));
+
+    walk_paddr_buf w2 = {0};
+    STM_ASSERT_OK(stm_btree_engine_walk_paddrs(eng, walk_paddr_cb, &w2));
+    STM_ASSERT_TRUE(!w2.overflow);
+
+    size_t shared = 0, only1 = 0;
+    for (size_t i = 0; i < w1.n; i++) {
+        if (walk_buf_has(&w2, w1.v[i])) shared++;
+        else                            only1++;
+    }
+    STM_ASSERT_TRUE(shared > 0);   /* unchanged subtrees are shared (COW) */
+    STM_ASSERT_TRUE(only1 > 0);    /* the superseded root-to-leaf path */
+
+    free(key);
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+/* The walk emits spill-chain blocks, not just tree nodes: a leaf with a
+ * large out-of-line value walks to strictly more paddrs than the same
+ * leaf with a tiny inline value. */
+STM_TEST(engine_walk_paddrs_spill) {
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+
+    /* Tree A: one tiny inline value — a single leaf node, no spill. */
+    stm_btree_engine *ea = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &ea));
+    STM_ASSERT_OK(stm_btree_engine_insert(ea, "k", 1, "v", 1));
+    uint64_t rpa = 0;
+    uint8_t  rca[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(ea, 1, &rpa, rca));
+    walk_paddr_buf wa = {0};
+    STM_ASSERT_OK(stm_btree_engine_walk_paddrs(ea, walk_paddr_cb, &wa));
+    STM_ASSERT_EQ(wa.n, (size_t)1);              /* leaf only */
+    stm_btree_engine_destroy(ea);
+
+    /* Tree B: one large value that spills out-of-line. The walk must
+     * emit the leaf node AND every spill-chain block. */
+    enum { BIG = 200u * 1024u };
+    uint8_t *big = malloc(BIG);
+    STM_ASSERT(big != NULL);
+    if (!big) { memstore_destroy(&ms); return; }
+    for (size_t i = 0; i < BIG; i++) big[i] = (uint8_t)(i * 31u + 7u);
+    stm_btree_engine *eb = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eb));
+    STM_ASSERT_OK(stm_btree_engine_insert(eb, "k", 1, big, BIG));
+    uint64_t rpb = 0;
+    uint8_t  rcb[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eb, 1, &rpb, rcb));
+    walk_paddr_buf wbb = {0};
+    STM_ASSERT_OK(stm_btree_engine_walk_paddrs(eb, walk_paddr_cb, &wbb));
+    STM_ASSERT_TRUE(!wbb.overflow);
+    STM_ASSERT_TRUE(wbb.n > 1);                  /* leaf + >= 1 spill block */
+    STM_ASSERT_TRUE(walk_buf_has(&wbb, rpb));    /* the leaf root */
+    STM_ASSERT_TRUE(walk_buf_all_distinct(&wbb));
+    stm_btree_engine_destroy(eb);
+
+    free(big);
+    memstore_destroy(&ms);
+}
+
+/* Argument + state validation: NULL eng / cb, no durable root, the
+ * un-finalized-flush EBUSY window. */
+STM_TEST(engine_walk_paddrs_args) {
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    walk_paddr_buf wb = {0};
+    STM_ASSERT_ERR(stm_btree_engine_walk_paddrs(NULL, walk_paddr_cb, &wb),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_walk_paddrs(eng, NULL, &wb), STM_EINVAL);
+    /* A fresh, never-committed tree has no durable root (mirrors verify). */
+    STM_ASSERT_ERR(stm_btree_engine_walk_paddrs(eng, walk_paddr_cb, &wb),
+                   STM_EINVAL);
+
+    /* During an un-finalized commit flush: STM_EBUSY. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, "v", 1));
+    uint64_t fp = 0, fg = 0;
+    uint8_t  fc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 1, &fp, &fg, fc));
+    STM_ASSERT_ERR(stm_btree_engine_walk_paddrs(eng, walk_paddr_cb, &wb),
+                   STM_EBUSY);
+    STM_ASSERT_OK(stm_btree_engine_commit_finalize(eng));
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
 STM_TEST_MAIN("btree_engine")

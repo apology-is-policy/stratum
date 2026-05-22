@@ -160,20 +160,30 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
   snapshot paddrs never collide on `(paddr, write_gen)`. v2's rollback
   does **not** roll back the allocator, so there is no allocator swap
   to "bump before" (the v1 R9-1 doctrine is subsumed by the commit).
+- **Metadata-node reclamation (9.7-impl-4b)** — after the swap +
+  dead-list clear, the rollback reclaims the post-snapshot
+  metadata-node divergence: `fs_rollback_reclaim_diverged_nodes` walks
+  the pre-rollback live tree and the snapshot tree
+  (`stm_dataset_index_collect_engine_paddrs_at` →
+  `stm_btree_engine_walk_paddrs`), set-differences the node + spill
+  paddr sets, and bootstrap-frees `old \ snap` — the boot-tier
+  projection of `dead_list.tla::Rollback`'s live-divergence term. The
+  COW-shared nodes (`old ∩ snap`) ARE the snapshot's tree post-swap
+  and are never freed; if either walk fails the reclaim frees nothing
+  (best-effort — an unreclaimed block leaks, a space cost, never a
+  corruption: it stays allocated so the allocator never reissues it
+  and the AEAD `(paddr, write_gen)` nonce stays unique). Still leaked,
+  forward-noted to **9.7-impl-4c**: the data-extent (stm_alloc) +
+  cold-extent (CAS) tiers and the snapshot's own cleared dead-list
+  garbage.
 - **v1.0 limitation** — a rollback is refused (`STM_ENOTSUPPORTED`)
   when a newer snapshot of the dataset exists. ZFS semantics destroy
-  every newer snapshot; doing that correctly needs the diverged-block
-  walk that **impl-4b** introduces (a newer snapshot's dead-list can
-  hold paddrs the target's frozen tree also references). Until
-  impl-4b, delete newer snapshots explicitly (`stm_fs_delete_snapshot`
-  reclaims them correctly) then roll back.
-- **Block reclamation is impl-4b** — the post-snapshot diverged engine
-  nodes + data extents are NOT freed by impl-4. They leak (stay
-  allocated, untracked) — a space cost on rollback, never a corruption
-  (a leaked block stays allocated so the allocator never reissues it;
-  the AEAD nonce stays unique). impl-4b walks the old-live vs snapshot
-  trees, set-differences, and frees the divergence per
-  `dead_list.tla::Rollback`.
+  every newer snapshot; doing that correctly needs the `\ newer_dead`
+  filter of `dead_list.tla::Rollback` (a newer snapshot's dead-list
+  can hold paddrs the target's frozen tree also references) — forward-
+  noted to **9.7-impl-4d**. Until then, delete newer snapshots
+  explicitly (`stm_fs_delete_snapshot` reclaims them correctly) then
+  roll back.
 
 ### Dead-list (P6-deadlist + P7-CAS-4c cold-tier)
 
@@ -222,7 +232,8 @@ snapshot stays PRESENT. The cleared entries are **discarded**, not
 transferred to the caller — a dead-list mixes paddrs the snapshot's
 tree references (live after a rollback — MUST NOT be freed) with
 intermediate COW garbage, and the snapshot module cannot tell them
-apart, so it frees neither (the garbage leaks; impl-4b reclaims it).
+apart, so it frees neither (the garbage leaks; 9.7-impl-4c reclaims
+it).
 The rollback mechanism calls this on the rolled-back-to snapshot:
 post-rollback the live tree is the snapshot's tree, so its
 dead-listed paddrs are live again and must not stay dead-listed (a

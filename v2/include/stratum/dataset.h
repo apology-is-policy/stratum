@@ -54,6 +54,7 @@
 #define STRATUM_V2_DATASET_H
 
 #include <stratum/types.h>
+#include <stratum/btree_engine.h>   /* stm_btree_engine + stm_btree_engine_paddr_cb */
 
 #ifdef __cplusplus
 extern "C" {
@@ -61,7 +62,6 @@ extern "C" {
 
 struct stm_bdev;             typedef struct stm_bdev             stm_bdev;
 struct stm_bootstrap;        typedef struct stm_bootstrap        stm_bootstrap;
-struct stm_btree_engine;     typedef struct stm_btree_engine     stm_btree_engine;
 struct stm_snapshot_index;   typedef struct stm_snapshot_index   stm_snapshot_index;
 
 /* Dataset id 1 is the root dataset, created at index init time.
@@ -843,6 +843,47 @@ stm_status stm_dataset_index_verify_engine_at(stm_dataset_index *idx,
                                                  uint64_t root_paddr,
                                                  uint64_t root_gen,
                                                  const uint8_t root_csum[32]);
+
+/*
+ * 9.7-impl-4b (rollback block reclamation): enumerate every on-disk
+ * block — tree NODE + large-value spill-chain block — reachable from
+ * the btree_engine tree at an arbitrary `(root_paddr, root_gen,
+ * root_csum)` triple, invoking `cb` once per paddr.
+ *
+ * Opens a THROWAWAY read-only engine at the triple (index storage +
+ * crypt context, `tree_id = dataset_id` for the AEAD), runs
+ * `stm_btree_engine_walk_paddrs`, and destroys it — no dataset slot is
+ * touched, no in-RAM engine is cached. Each node is Merkle + AEAD
+ * verified as the walk descends; a corrupt node aborts with the verify
+ * error and `cb` is not called for the unreachable remainder.
+ *
+ * The rollback mechanism (stm_fs_rollback_snapshot) calls this on the
+ * pre-rollback live root AND the snapshot root, then set-differences
+ * the two paddr sets to find the post-snapshot divergence to free.
+ *
+ * An all-zero triple (`root_paddr == 0 && root_gen == 0`) is the "empty
+ * dataset" sentinel — there is no on-disk tree, so STM_OK is returned
+ * with `cb` never invoked. `dataset_id` need NOT name a PRESENT dataset
+ * — only the storage/crypt binding and the triple matter.
+ *
+ * Returns STM_OK on a complete walk, STM_ECORRUPT / STM_EBADTAG on a
+ * Merkle / AEAD failure, STM_EINVAL on NULL idx / NULL cb /
+ * dataset_id == 0 / storage or crypt ctx unbound, STM_ENOMEM / device
+ * errors otherwise. A nonzero `cb` return stops the walk early and is
+ * NOT itself an error (STM_OK) — a cb that needs to surface a failure
+ * of its own carries it in `cb_ctx`.
+ *
+ * Concurrency: takes idx's lock for the open->walk->destroy sequence.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_collect_engine_paddrs_at(
+                                       stm_dataset_index *idx,
+                                       uint64_t dataset_id,
+                                       uint64_t root_paddr,
+                                       uint64_t root_gen,
+                                       const uint8_t root_csum[32],
+                                       stm_btree_engine_paddr_cb cb,
+                                       void *cb_ctx);
 
 /* ========================================================================= */
 /* 9.7-impl-1c-ii: per-dataset engine M-cascade commit driving APIs.          */

@@ -891,6 +891,76 @@ stm_status stm_btree_engine_verify(stm_btree_engine *eng)
 }
 
 /* ========================================================================= */
+/* Paddr enumeration (9.7-impl-4b — rollback block reclamation).               */
+/* ========================================================================= */
+
+/*
+ * Recursive node + spill-block paddr enumerator. Built on eng_node_read,
+ * which does the read + Merkle + AEAD + decode and — for a leaf —
+ * materialises every spilled value's chain into entry->spill->blocks; so
+ * the walk inherits every integrity gate eng_node_read enforces. Mirrors
+ * eng_verify_subtree's descent shape but emits each on-disk block paddr
+ * via `cb` rather than only verifying it. A nonzero `cb` return aborts
+ * the walk via `*stopped` (the established scan_node pattern).
+ */
+static stm_status engine_walk_paddrs_subtree(
+        stm_btree_engine *eng, uint64_t paddr, uint64_t gen,
+        const uint8_t csum[STM_BTNODE_CSUM_SIZE], uint32_t depth,
+        stm_btree_engine_paddr_cb cb, void *ctx, bool *stopped)
+{
+    if (*stopped) return STM_OK;
+    if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+
+    eng_node *n = NULL;
+    stm_status s = eng_node_read(eng, paddr, gen, csum, &n);
+    if (s != STM_OK) return s;
+
+    /* Emit this node's own paddr. */
+    if (cb(paddr, ctx) != 0) { *stopped = true; eng_node_free(n); return STM_OK; }
+
+    if (n->is_leaf) {
+        /* Each spilled value's chain blocks were materialised into
+         * entry->spill->blocks by eng_node_read's leaf_load_cb. */
+        for (uint32_t i = 0; i < n->n_entries; i++) {
+            eng_spill *sp = n->entries[i].spill;
+            if (!sp) continue;
+            for (uint32_t j = 0; j < sp->n_blocks; j++) {
+                if (cb(sp->blocks[j], ctx) != 0) {
+                    *stopped = true; eng_node_free(n); return STM_OK;
+                }
+            }
+        }
+        eng_node_free(n);
+        return STM_OK;
+    }
+
+    /* Internal: recurse through every child (children are not loaded
+     * into n->children[i].mem by eng_node_read — the walk re-reads each
+     * from its bptr, so eng_node_free of one node frees no subtree). */
+    uint32_t nc = n->n_pivots + 1u;
+    for (uint32_t i = 0; s == STM_OK && i < nc && !*stopped; i++) {
+        s = engine_walk_paddrs_subtree(eng, n->children[i].paddr,
+                                          n->children[i].gen,
+                                          n->children[i].csum,
+                                          depth + 1u, cb, ctx, stopped);
+    }
+    eng_node_free(n);
+    return s;
+}
+
+stm_status stm_btree_engine_walk_paddrs(stm_btree_engine *eng,
+                                          stm_btree_engine_paddr_cb cb,
+                                          void *ctx)
+{
+    if (!eng || !cb)            return STM_EINVAL;
+    if (eng->pending.active)    return STM_EBUSY;
+    if (!eng->has_durable_root) return STM_EINVAL;
+    bool stopped = false;
+    return engine_walk_paddrs_subtree(eng, eng->root_paddr, eng->root_gen,
+                                         eng->root_csum, 0, cb, ctx, &stopped);
+}
+
+/* ========================================================================= */
 /* Scan + stats.                                                                */
 /* ========================================================================= */
 

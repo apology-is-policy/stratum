@@ -372,6 +372,36 @@ stm_status stm_btree_engine_get_root(const stm_btree_engine *eng,
 STM_MUST_USE
 stm_status stm_btree_engine_verify(stm_btree_engine *eng);
 
+/* Per-paddr callback for stm_btree_engine_walk_paddrs. `paddr` is one
+ * on-disk block reachable from the engine's durable root — a tree NODE
+ * or a large-value spill-chain block. Return 0 to continue the walk,
+ * nonzero to stop it early (the walk then returns STM_OK); a callback
+ * that needs to surface an error of its own carries it in `ctx`. */
+typedef int (*stm_btree_engine_paddr_cb)(uint64_t paddr, void *ctx);
+
+/*
+ * Walk the last durably-committed on-disk tree, invoking `cb` exactly
+ * once for every on-disk block reachable from the durable root — every
+ * tree NODE and every large-value spill-chain block. Each node is
+ * Merkle-chain + AEAD-verified as the walk descends (the same integrity
+ * gate stm_btree_engine_verify applies); a corrupt node aborts the walk
+ * with STM_ECORRUPT / STM_EBADTAG and `cb` is not invoked for the
+ * unreachable remainder.
+ *
+ * The intended use is rollback block reclamation (9.7-impl-4b): collect
+ * the node + spill paddrs of the pre-rollback live tree and of the
+ * snapshot tree, then set-difference to find the divergence to free.
+ *
+ * Returns STM_EINVAL on NULL args or no durable root (a freshly
+ * *created*, never-flushed tree — an engine *opened* at a triple always
+ * has one), STM_EBUSY during an un-finalized commit flush, STM_ECORRUPT
+ * / STM_EBADTAG / STM_ENOMEM / device errors otherwise.
+ */
+STM_MUST_USE
+stm_status stm_btree_engine_walk_paddrs(stm_btree_engine *eng,
+                                         stm_btree_engine_paddr_cb cb,
+                                         void *ctx);
+
 /* Compute tree stats (key count + height) by an in-order walk.
  * STM_EBUSY during an un-finalized commit flush. */
 STM_MUST_USE

@@ -1618,6 +1618,55 @@ stm_status stm_dataset_index_verify_engine_at(stm_dataset_index *idx,
     return rc;
 }
 
+/* 9.7-impl-4b (rollback block reclamation): enumerate the node + spill
+ * paddrs of the on-disk tree at an arbitrary triple via a throwaway
+ * read-only engine. Sibling of verify_engine_at — same throwaway-engine
+ * shape, walk_paddrs in place of verify. See the header docstring. */
+stm_status stm_dataset_index_collect_engine_paddrs_at(
+        stm_dataset_index *idx, uint64_t dataset_id,
+        uint64_t root_paddr, uint64_t root_gen, const uint8_t root_csum[32],
+        stm_btree_engine_paddr_cb cb, void *cb_ctx) {
+    if (!idx || !cb) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    /* Storage + crypt must be bound — same precondition as
+     * dataset_engine_open_locked / verify_engine_at. */
+    if (idx->engine_store_ctx.boot == NULL ||
+        idx->engine_store_ctx.bdev == NULL ||
+        idx->engine_crypt_ctx.metadata_key == NULL) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    /* An all-zero triple is the "empty dataset" sentinel — there is no
+     * on-disk tree, so there is nothing to enumerate. */
+    if (dataset_triple_is_empty(root_paddr, root_gen)) {
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+
+    /* Throwaway read-only engine — stack-local store-ctx copy, snap_idx
+     * NULL (the walk never frees a node, so vt->free is never reached).
+     * The local outlives the open->walk->destroy sequence below. */
+    stm_engine_store_ctx vctx = idx->engine_store_ctx;
+    vctx.dataset_id = dataset_id;
+    vctx.snap_idx   = NULL;
+
+    stm_btree_engine *eng = NULL;
+    stm_status rc = stm_btree_engine_open(&STM_ENGINE_STORE_VT, &vctx,
+                                             &idx->engine_crypt_ctx,
+                                             /*tree_id=*/dataset_id,
+                                             root_paddr, root_gen, root_csum,
+                                             &eng);
+    if (rc == STM_OK) {
+        rc = stm_btree_engine_walk_paddrs(eng, cb, cb_ctx);
+        stm_btree_engine_destroy(eng);
+    }
+
+    must_unlock(&idx->lock);
+    return rc;
+}
+
 /* ---- 9.7-impl-1c-ii: M-cascade three-phase commit driving. ---- */
 
 /* Walk every slot and return true iff ANY slot has pending_flush set.

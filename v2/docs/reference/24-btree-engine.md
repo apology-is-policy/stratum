@@ -133,6 +133,9 @@ stm_status stm_btree_engine_get_root       (const stm_btree_engine *eng,
                                              uint64_t *out_root_gen,
                                              uint8_t out_root_csum[32]);
 stm_status stm_btree_engine_verify         (stm_btree_engine *eng);
+stm_status stm_btree_engine_walk_paddrs    (stm_btree_engine *eng,
+                                             stm_btree_engine_paddr_cb cb,
+                                             void *ctx);
 stm_status stm_btree_engine_stats_get      (stm_btree_engine *eng,
                                              stm_btree_engine_stats *out);
 ```
@@ -146,6 +149,17 @@ crypto-valid but unsorted node would silently mis-route the
 binary-search descents, so verify catches structural corruption, not
 just bit-rot / substitution. `stats_get` returns key count + tree
 height.
+
+`walk_paddrs` (9.7-impl-4b) enumerates every on-disk block reachable
+from the durable root — every tree NODE and every large-value
+spill-chain block — invoking `cb` once per paddr, descending under the
+same Merkle + AEAD gate `verify` applies (a corrupt node aborts the
+walk; `cb` is not invoked for the unreachable remainder). It is the
+substrate of rollback block reclamation: the rollback collects the
+node + spill paddrs of the pre-rollback live tree and of the snapshot
+tree, then set-differences them to find the post-snapshot divergence
+to free. EBUSY during an un-finalized commit flush; EINVAL on NULL
+args or no durable root.
 
 ## Implementation
 
@@ -489,7 +503,7 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 43 cases. 42 run against an in-RAM
+`tests/test_btree_engine.c` — 47 cases. 46 run against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
 can both assert which paddrs were superseded and still open a prior
