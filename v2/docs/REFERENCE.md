@@ -38,41 +38,45 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: R159 audit close — 9.7-impl-3 (snapshot-create captures
-  the real per-dataset tree-root triple) signed off. Verdict:
-  **0 P0, 0 P1, 1 P2, 3 P3**.
-  - **9.7-impl-3** (`7e67ded`): `stm_snapshot_entry` +
-    `stm_snapshot_create` / `_for_test` gained `root_gen` +
-    `root_csum[32]`. `stm_fs_create_snapshot` runs `stm_sync_commit`
-    then captures the dataset entry's real `(di_tree_root,
-    di_root_gen, di_root_csum)` triple — replacing the
-    `tree_root_paddr=0` stub. Snap-record fixed prefix grew 52→92
-    (`root_gen` @ 52, `root_csum` @ 60); **STM_UB_VERSION 31→32**.
-    The snapshot module stores the triple OPAQUELY (faithful
-    transport) — validation is deferred to `stm_btree_engine_open`
-    at the consuming chunks (impl-4 / impl-5). `root_csum` NULL ⇒
-    all-zero; an all-zero triple is the valid empty-dataset snapshot.
-  - **R159 P2** — failed-precondition snapshot-create forced a
-    pool-wide commit: the dataset-presence gate now runs BEFORE
-    `stm_sync_commit`, so an invalid `dataset_id` fails with no
-    durable side effect. Fixed inline.
-  - **R159 P3-2 / P3-3** fixed inline (`phase-9.7-design.md` §5
-    stale mount-refusal rule + version; this REFERENCE.md drift).
-    **R159 P3-1** forward-noted: `sp_decode_value` deliberately omits
-    the dataset decoder's partial-zero check — the snapshot module's
-    faithful-transport posture is internally symmetric (no writer
-    check, no decoder check); the consumer validates.
+- **Tip**: 9.7-impl-4 — the snapshot rollback mechanism — shipped.
+  R160 audit follows this commit.
+  - **9.7-impl-4**: `stm_fs_rollback_snapshot` filled in (the TLY-A5
+    `STM_ENOTSUPPORTED` stub is retired). Mechanism is swap-then-
+    validate: refuse if a newer snapshot exists (v1.0 limitation) →
+    drain dirty buffers → swap the dataset entry's `(di_tree_root,
+    di_root_gen, di_root_csum)` triple to the snapshot's captured
+    triple → validate by re-opening the engine + `stm_btree_engine_
+    verify` (bad triple ⇒ restore + STM_ECORRUPT, fs not wedged) →
+    `stm_snapshot_clear_dead_lists` on the target → `stm_sync_commit`
+    (R154 Q2 wedge on failure). The commit's gen advance is the
+    AEAD-nonce bump; v2's rollback does NOT roll back the allocator,
+    so there is no allocator swap to "bump before" (the v1 R9-1
+    doctrine is subsumed). Two new APIs: `stm_dataset_index_set_
+    engine_root` (force a slot triple) + `stm_snapshot_clear_dead_
+    lists` (empty a snapshot's 3 dead-lists in place). **Block
+    reclamation of the post-snapshot divergence is forward-noted to
+    9.7-impl-4b** — diverged engine nodes + data extents LEAK (stay
+    allocated, untracked; a space cost, never a corruption — a leaked
+    block is never reissued so the AEAD nonce stays unique). impl-4b
+    also lifts the newer-snapshot refusal. Two stub-pinned TLY-A5
+    `test_ctl` tests updated to the real success behavior. **No
+    STM_UB_VERSION bump** — no on-disk format change.
+  - **9.7-impl-3** (`7e67ded` + `2604ede`, R159): `stm_snapshot_
+    entry` gained `root_gen` + `root_csum[32]`; `stm_fs_create_
+    snapshot` captures the dataset's real committed triple (the
+    `tree_root_paddr=0` stub is gone). **STM_UB_VERSION 31→32**.
+    Faithful-transport posture: the snapshot stores the triple
+    OPAQUELY; validation deferred to `stm_btree_engine_open` — first
+    realised by impl-4's rollback verify.
   - **9.7-impl-2** (`4b73f23` + `2176db0`, R158): snapshot-aware COW
     free — superseded engine NODE paddrs route into a per-snap
-    bootstrap-tier dead-list (allocator-class-aware). STM_UB_VERSION
-    30→31.
+    bootstrap-tier dead-list. STM_UB_VERSION 30→31.
   - **ctest 63/64 standalone** — the lone failure is the documented
-    `test_compound_ops_concurrent` rename/cfr flake
-    ([[flake-per-inode-cfr-concurrent]]); the impl-3-exercising
-    `compound_ops_concurrent_writer_reader_no_deadlock_no_tear`
-    passes. `test_snapshot` 56 tests, `test_fs` 41+.
-  - **What's next**: 9.7-impl-4 (rollback mechanism — replaces the
-    TLY-A5 stub) → R160.
+    `test_compound_ops_concurrent` rename/cfr/reflink/write-truncate
+    flake ([[flake-per-inode-cfr-concurrent]]), confirmed pre-existing
+    by stash + retest at the clean tip. `test_snapshot` 58,
+    `test_dataset` 73, `test_fs` 180, `test_ctl` 149.
+  - **What's next**: R160 audit → 9.7-impl-5 (readable `.snaps/`).
 
 - **Pre-tip-0**: Phase 9.7-impl-1c-vi (`3afa915`) — the pool-global-engine
   retirement closes. The four `stm_sync` mirror fields

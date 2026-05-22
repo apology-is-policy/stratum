@@ -1775,23 +1775,35 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
                                                 bool *out_changed);
 
 /*
- * TLY-A5-impl-2: roll the dataset back to a snapshot.
+ * TLY-A5-impl-2 / 9.7-impl-4: roll the dataset back to a snapshot.
  *
- * v1.0 status: the rollback MECHANISM (per-dataset metadata-tree swap +
- * birth-txg block reclamation) is NOT implemented — v2 carries only the
- * snapshot INDEX, not per-dataset trees (see ROADMAP-V2 Phase 9.7). The
- * data-mutation step therefore returns STM_ENOTSUPPORTED. Phase 9.7
- * replaces only that final step; the surface + the gate below stay.
+ * Mechanism (9.7-impl-4, swap-then-validate): drain every dirty buffer
+ * → swap the dataset entry's per-dataset btree_engine root triple
+ * (di_tree_root, di_root_gen, di_root_csum) to the snapshot's captured
+ * triple → validate it (re-open the engine + stm_btree_engine_verify;
+ * a bad triple restores the pre-swap triple and refuses STM_ECORRUPT
+ * with the fs NOT wedged) → clear the target snapshot's dead-lists →
+ * stm_sync_commit. The commit's gen advance keeps the AEAD nonce fresh
+ * for post-rollback writes. After return the dataset reads the
+ * snapshot's frozen view; the post-snapshot writes are discarded.
  *
- * The CONSULTATION GATE is real and load-bearing in v1.0 — it composes
- * against `v2/specs/snapshot.tla::RollbackBlockedIffCompromised`:
+ * v1.0 LIMITATION — a rollback is refused with STM_ENOTSUPPORTED when
+ * a newer snapshot of the dataset exists. ZFS semantics destroy every
+ * newer snapshot; doing that correctly needs the diverged-block walk
+ * that 9.7-impl-4b introduces. Until impl-4b, delete newer snapshots
+ * explicitly (stm_fs_delete_snapshot reclaims them correctly) and then
+ * roll back to what is now the most-recent snapshot. impl-4b also adds
+ * reclamation of the post-snapshot diverged blocks (which impl-4 leaks
+ * — a space cost, never a corruption).
+ *
+ * The CONSULTATION GATE is load-bearing — it composes against
+ * `v2/specs/snapshot.tla::RollbackBlockedIffCompromised`:
  *
  *   If the target snapshot carries STM_SNAP_FLAG_ROLLBACK_COMPROMISED
  *   (corvus flagged its wrap chain as possibly compromised — the F13
  *   hazard, CORVUS-DESIGN §4.5) AND `force` is false, the call refuses
- *   with STM_ECOMPROMISED *before* reaching the (stubbed) mechanism.
- *   `force == true` is the operator's explicit override and proceeds
- *   to the mechanism.
+ *   with STM_ECOMPROMISED *before* the mechanism. `force == true` is
+ *   the operator's explicit override and proceeds to the mechanism.
  *
  * `dataset_id` is the dataset the caller believes owns the snapshot
  * (the /ctl/ path's `<id>`); a snapshot whose actual `dataset_id`
@@ -1799,10 +1811,12 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
  * dataset boundary the verb was addressed to (R146 P2-2).
  *
  * Refusals: STM_EINVAL (NULL fs / dataset_id == 0 / snapshot_id == 0),
- * STM_ECORRUPT (snapshot index unavailable), STM_ENOENT (snapshot
- * unknown / belongs to a different dataset), STM_ECOMPROMISED (marked
- * + not forced), STM_EWEDGED, STM_EROFS. On a non-compromised (or
- * force) path: STM_ENOTSUPPORTED (the v1.0 stub).
+ * STM_ECORRUPT (snapshot index unavailable, or the snapshot's captured
+ * triple fails to verify), STM_ENOENT (snapshot unknown / belongs to a
+ * different dataset), STM_ECOMPROMISED (marked + not forced),
+ * STM_ENOTSUPPORTED (a newer snapshot of the dataset exists — the v1.0
+ * limitation), STM_EWEDGED, STM_EROFS. A post-swap commit failure is
+ * crash-equivalent and wedges the fs (R154 Q2).
  */
 STM_MUST_USE
 stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,

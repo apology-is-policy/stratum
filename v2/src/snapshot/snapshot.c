@@ -534,6 +534,49 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
     return STM_OK;
 }
 
+/* 9.7-impl-4 (rollback): free + zero all three of a PRESENT snapshot's
+ * dead-lists in place. The snapshot stays PRESENT. The contents are
+ * DISCARDED — see the header docstring for why a rollback caller must
+ * not reclaim them (the dead-list mixes now-live paddrs with garbage). */
+stm_status stm_snapshot_clear_dead_lists(stm_snapshot_index *idx,
+                                            uint64_t snapshot_id) {
+    if (!idx) return STM_EINVAL;
+    if (snapshot_id == 0) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, snapshot_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    snapshot_slot *slot = &idx->slots[s];
+
+    /* R157 P2-1: a snapshot with no dead-list entries is a no-op — do
+     * not dirty the index (would force a needless re-serialize). */
+    bool had_any = (slot->dead_count > 0) ||
+                   (slot->cold_dead_count > 0) ||
+                   (slot->boot_dead_count > 0);
+
+    free(slot->dead_list);
+    slot->dead_list     = NULL;
+    slot->dead_count    = 0;
+    slot->dead_capacity = 0;
+
+    free(slot->cold_dead_list);
+    slot->cold_dead_list     = NULL;
+    slot->cold_dead_count    = 0;
+    slot->cold_dead_capacity = 0;
+
+    free(slot->boot_dead_list);
+    slot->boot_dead_list     = NULL;
+    slot->boot_dead_count    = 0;
+    slot->boot_dead_capacity = 0;
+
+    if (had_any) idx->dirty = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
 stm_status stm_snapshot_index_overwrite_block(stm_snapshot_index *idx,
                                                  uint64_t dataset_id,
                                                  uint64_t paddr,

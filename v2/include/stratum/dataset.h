@@ -770,6 +770,47 @@ STM_MUST_USE
 stm_status stm_dataset_index_close_engine(stm_dataset_index *idx,
                                              uint64_t dataset_id);
 
+/*
+ * 9.7-impl-4 (rollback): explicitly set a PRESENT dataset's slot triple
+ * (di_tree_root, di_root_gen, di_root_csum) to an arbitrary root.
+ *
+ * This is the rollback primitive. Normally a slot's triple is updated
+ * only as a side effect of the M-cascade (`commit_engines_flush` stamps
+ * each open engine's freshly-flushed root). Rollback needs to FORCE the
+ * triple to a snapshot's captured root with no engine flush behind it.
+ *
+ * The call (a) drops the slot's in-RAM engine if one is open — so the
+ * next `stm_dataset_index_get_engine` re-opens at the new triple, AND so
+ * the M-cascade (which only flushes slots whose engine is OPEN) cannot
+ * re-stamp the slot back to the engine's stale root; and (b) marks the
+ * index dirty (only when the triple actually changed — R157 P2-1) so the
+ * next `stm_dataset_index_commit` re-serialises the slot durably.
+ *
+ * `root_csum` may be NULL — treated as a 32-byte all-zero csum. An
+ * all-zero triple (paddr 0, gen 0, csum 0) is the "empty dataset"
+ * sentinel; the next get_engine then creates a fresh empty engine.
+ *
+ * The caller is responsible for VALIDATING the triple (e.g. opening the
+ * engine at it + `stm_btree_engine_verify`) — this setter stamps the
+ * triple verbatim without interpreting it.
+ *
+ * Refusals:
+ *   - NULL idx (STM_EINVAL).
+ *   - dataset_id == 0 (STM_EINVAL).
+ *   - Dataset not PRESENT (STM_ENOENT).
+ *   - An un-finalised commit flush is pending on the slot (STM_EBUSY) —
+ *     a caller-sequencing bug; a legitimate caller holds the fs-wide
+ *     write lock with no commit in flight.
+ *
+ * Concurrency: takes idx's lock.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_set_engine_root(stm_dataset_index *idx,
+                                                uint64_t dataset_id,
+                                                uint64_t root_paddr,
+                                                uint64_t root_gen,
+                                                const uint8_t root_csum[32]);
+
 /* ========================================================================= */
 /* 9.7-impl-1c-ii: per-dataset engine M-cascade commit driving APIs.          */
 /*                                                                             */

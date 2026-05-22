@@ -5734,10 +5734,11 @@ STM_TEST(ctl_a5_admin_marks_and_unmarks)
 
 /* ── TLY-A5-impl-2 — rollback-snapshot verb + consultation gate ──── */
 
-/* Admin rollback of a non-compromised snap reaches the Phase-9.7
- * stub — STM_ENOTSUPPORTED. The verb surface + body parse are real;
- * only the data mutation is deferred. */
-STM_TEST(ctl_a5_rollback_uncompromised_reaches_stub)
+/* Admin rollback of a non-compromised snapshot — the 9.7-impl-4 real
+ * mechanism. The fixture has exactly one snapshot of the dataset (the
+ * target IS the most-recent), so the rollback succeeds: Rwrite +
+ * result=ok in the audit log. */
+STM_TEST(ctl_a5_rollback_uncompromised_succeeds)
 {
     scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_rb1", 0);
     uint64_t snap_id = setup_snapshot(f.fs, 1, "rb_clean");
@@ -5750,14 +5751,14 @@ STM_TEST(ctl_a5_rollback_uncompromised_reaches_stub)
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
     STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);   /* stub → STM_ENOTSUPPORTED */
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);   /* 9.7-impl-4 mechanism */
 
     char ebody[8192];
     read_events_log(&f, 5, 12, ebody, sizeof ebody);
     char want[192];
     snprintf(want, sizeof want,
         "rollback-snapshot uid=0 dataset=1 snap-id=%llu force=0 "
-        "result=err:enotsupported", (unsigned long long)snap_id);
+        "result=ok", (unsigned long long)snap_id);
     STM_ASSERT(strstr(ebody, want) != NULL);
 
     destroy_scrub_trigger_fixture(f);
@@ -5794,8 +5795,12 @@ STM_TEST(ctl_a5_rollback_compromised_refused)
 }
 
 /* `force <sid>` is the operator's explicit override — it bypasses the
- * consultation gate and reaches the stub (STM_ENOTSUPPORTED), proving
- * the force token is parsed + wired through. */
+ * consultation gate (snapshot.tla::RollbackBlockedIffCompromised) and
+ * reaches the real 9.7-impl-4 mechanism. The fixture has exactly one
+ * snapshot of the dataset, so the target IS the most-recent and the
+ * rollback succeeds — proving the force token is parsed, the gate is
+ * bypassed, AND the mechanism runs to completion (it is NOT refused
+ * with STM_ECOMPROMISED). */
 STM_TEST(ctl_a5_rollback_compromised_force_bypasses_gate)
 {
     scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_a5_rb3", 0);
@@ -5810,14 +5815,16 @@ STM_TEST(ctl_a5_rollback_compromised_force_bypasses_gate)
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
     STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);   /* stub, NOT the gate */
+    /* 9.7-impl-4: force bypasses the gate AND the mechanism succeeds —
+     * the verb returns Rwrite, not Rlerror(ECOMPROMISED) from the gate. */
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
 
     char ebody[8192];
     read_events_log(&f, 5, 12, ebody, sizeof ebody);
     char want[192];
     snprintf(want, sizeof want,
         "rollback-snapshot uid=0 dataset=1 snap-id=%llu force=1 "
-        "result=err:enotsupported", (unsigned long long)snap_id);
+        "result=ok", (unsigned long long)snap_id);
     STM_ASSERT(strstr(ebody, want) != NULL);
 
     destroy_scrub_trigger_fixture(f);

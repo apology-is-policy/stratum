@@ -137,11 +137,39 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
   `force` is false, the call refuses with `STM_ECOMPROMISED` (-217)
   *before* the mechanism. The lookup + the flag check run under one
   `fs->global` EX hold, so a racing unmark is never torn.
-- **Mechanism** — the per-dataset metadata-tree swap is **Phase 9.7**
-  (v2 has no per-dataset trees). A non-compromised / forced rollback
-  therefore reaches a stub returning `STM_ENOTSUPPORTED`. The gate,
-  the error code, and the `/ctl/` surface are final; Phase 9.7 fills
-  in only the stub body.
+- **Mechanism (9.7-impl-4)** — swap-then-validate. After the gate:
+  (1) refuse `STM_ENOTSUPPORTED` if a newer snapshot of the dataset
+  exists (the v1.0 limitation — see below); (2) drain every dirty
+  buffer (`fs_flush_all_locked`); (3) swap the dataset entry's
+  `(di_tree_root, di_root_gen, di_root_csum)` triple to the
+  snapshot's captured triple via `stm_dataset_index_set_engine_root`
+  (which drops the live in-RAM engine); (4) **validate** the swapped
+  triple by re-opening the engine at it + `stm_btree_engine_verify`
+  — a bad triple restores the pre-swap triple and refuses
+  `STM_ECORRUPT` (clean no-op, fs not wedged); an all-zero "empty
+  dataset" triple skips the verify; (5) `stm_snapshot_clear_dead_lists`
+  on the target — post-rollback the live tree IS the snapshot's tree,
+  so its dead-listed paddrs are live again and must not stay
+  dead-listed; (6) `stm_sync_commit` (R154 Q2 — wedge on failure).
+  The commit's gen advance is the AEAD-nonce bump: every
+  post-rollback write lands at a strictly-higher gen, so reused
+  snapshot paddrs never collide on `(paddr, write_gen)`. v2's rollback
+  does **not** roll back the allocator, so there is no allocator swap
+  to "bump before" (the v1 R9-1 doctrine is subsumed by the commit).
+- **v1.0 limitation** — a rollback is refused (`STM_ENOTSUPPORTED`)
+  when a newer snapshot of the dataset exists. ZFS semantics destroy
+  every newer snapshot; doing that correctly needs the diverged-block
+  walk that **impl-4b** introduces (a newer snapshot's dead-list can
+  hold paddrs the target's frozen tree also references). Until
+  impl-4b, delete newer snapshots explicitly (`stm_fs_delete_snapshot`
+  reclaims them correctly) then roll back.
+- **Block reclamation is impl-4b** — the post-snapshot diverged engine
+  nodes + data extents are NOT freed by impl-4. They leak (stay
+  allocated, untracked) — a space cost on rollback, never a corruption
+  (a leaked block stays allocated so the allocator never reissues it;
+  the AEAD nonce stays unique). impl-4b walks the old-live vs snapshot
+  trees, set-differences, and frees the divergence per
+  `dead_list.tla::Rollback`.
 
 ### Dead-list (P6-deadlist + P7-CAS-4c cold-tier)
 
@@ -160,6 +188,9 @@ stm_status stm_snapshot_cold_dead_list_count        (idx, snapshot_id, *out_coun
 /* Cold-tier capacity pre-check (P7-CAS-4 R54 P3-2). */
 stm_status stm_snapshot_index_cold_dead_list_reserve(idx, dataset_id,
                                                      n_to_append, *out_can_accept);
+
+/* Clear all three dead-lists in place — the rollback primitive (9.7-impl-4). */
+stm_status stm_snapshot_clear_dead_lists            (idx, snapshot_id);
 ```
 
 `overwrite_block` realizes `dead_list.tla::OverwriteBlock`. If the
@@ -180,6 +211,20 @@ Refusal codes:
 
 `dead_list_count` is read-only observability; returns the number
 of paddrs tracked in `snapshot_id`'s dead-list.
+
+`clear_dead_lists` (9.7-impl-4) frees + zeroes all three dead-lists
+(paddr / cold / bootstrap) of a PRESENT snapshot in place; the
+snapshot stays PRESENT. The cleared entries are **discarded**, not
+transferred to the caller — a dead-list mixes paddrs the snapshot's
+tree references (live after a rollback — MUST NOT be freed) with
+intermediate COW garbage, and the snapshot module cannot tell them
+apart, so it frees neither (the garbage leaks; impl-4b reclaims it).
+The rollback mechanism calls this on the rolled-back-to snapshot:
+post-rollback the live tree is the snapshot's tree, so its
+dead-listed paddrs are live again and must not stay dead-listed (a
+later `stm_snapshot_delete` would otherwise free live storage). The
+index is marked dirty only when an entry was actually cleared
+(`STM_OK` no-op on an already-clear snapshot).
 
 In `dead_list.tla`'s bounded single-ownership model `surviving =
 S.dead ∩ successor.dead = ∅`, so `unique = S.dead`; SnapDelete
@@ -414,9 +459,11 @@ tree uses `STM_BPTR_KIND_DATASET = 9` (added in P6-clone).
 - **Dead-list memory ownership**: per-slot `dead_list` is a
   malloc'd `uint64_t[]`. Owned by the slot until either
   `stm_snapshot_delete` (transfers to the caller),
-  `stm_snapshot_index_close` (frees), or `stm_snapshot_index_load_at`
-  (frees old slots' lists pre-swap). `sp_validate_shadow` adds a
-  paddr-disjoint check enforcing single-ownership.
+  `stm_snapshot_clear_dead_lists` (frees in place; slot stays
+  PRESENT — the rollback path), `stm_snapshot_index_close` (frees),
+  or `stm_snapshot_index_load_at` (frees old slots' lists pre-swap).
+  `sp_validate_shadow` adds a paddr-disjoint check enforcing
+  single-ownership.
 - **Dead-list at append time**: `overwrite_block` rejects a paddr
   already tracked anywhere in the index (R33 P2). The alloc layer's
   live-tracking is the structural prevention; this is a
@@ -426,7 +473,7 @@ tree uses `STM_BPTR_KIND_DATASET = 9` (added in P6-clone).
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_snapshot` | 56 | Lifecycle (create / delete / hold / release w/ all error paths); concurrent stress on per-dataset + same-dataset chains; SnapIdMonotonic / BirthTxgMonotonic / HoldPreventsDelete / TreeRootImmutable / ChainTxgOrdered / ChainAcyclic; persist roundtrip including persisted holds + ABSENT slots; idempotent commit; tamper detection (csum/key); next_id + current_txg seeding from on-disk + UB; **dead-list lifecycle** (overwrite no-snap → caller frees; overwrite with-snap → appended to most-recent; cross-dataset isolation; cap at STM_SNAP_DEAD_LIST_MAX → ENOSPC; duplicate paddr → EINVAL (R33 P2); arg validation; delete returns the dead-list and clears the slot; refused delete keeps the dead-list intact; persist roundtrip with non-empty dead-list; idempotent commit byte-identicality with dead-list); **bootstrap-tier dead-list** (9.7-impl-2 — overwrite/count/cap/dup/cross-tier APIs); **9.7-impl-3 tree-root triple** (`snap_create_captures_root_triple` — verbatim capture + NULL-csum⇒zero; `snapshot_persist_tree_root_triple_roundtrip` — triple survives v32 encode/decode). |
+| `test_snapshot` | 58 | Lifecycle (create / delete / hold / release w/ all error paths); concurrent stress on per-dataset + same-dataset chains; SnapIdMonotonic / BirthTxgMonotonic / HoldPreventsDelete / TreeRootImmutable / ChainTxgOrdered / ChainAcyclic; persist roundtrip including persisted holds + ABSENT slots; idempotent commit; tamper detection (csum/key); next_id + current_txg seeding from on-disk + UB; **dead-list lifecycle** (overwrite no-snap → caller frees; overwrite with-snap → appended to most-recent; cross-dataset isolation; cap at STM_SNAP_DEAD_LIST_MAX → ENOSPC; duplicate paddr → EINVAL (R33 P2); arg validation; delete returns the dead-list and clears the slot; refused delete keeps the dead-list intact; persist roundtrip with non-empty dead-list; idempotent commit byte-identicality with dead-list); **bootstrap-tier dead-list** (9.7-impl-2 — overwrite/count/cap/dup/cross-tier APIs); **9.7-impl-3 tree-root triple** (`snap_create_captures_root_triple` — verbatim capture + NULL-csum⇒zero; `snapshot_persist_tree_root_triple_roundtrip` — triple survives v32 encode/decode); **9.7-impl-4 clear-dead-lists** (`snap_clear_dead_lists_empties_all_three` — paddr/cold/boot lists emptied, snap stays PRESENT, idempotent; `snap_clear_dead_lists_arg_validation`). |
 | `test_sync` | included | Snap-delete cb integration covered through dataset persistence + clone tests (sync_snap_delete_refused_with_clone, sync_clone_state_survives_mount). |
 
 ## Status
@@ -449,10 +496,13 @@ tree uses `STM_BPTR_KIND_DATASET = 9` (added in P6-clone).
 - [x] Rollback-compromise marker (TLY-A5) — `STM_SNAP_FLAG_ROLLBACK_COMPROMISED`
       + `stm_snapshot_{mark,unmark}_compromised` + the fs-level
       consultation gate in `stm_fs_rollback_snapshot`.
-- [~] Snapshot rollback (ARCH §8.10) — the `/ctl/` verb surface, the
-      consultation gate, and `STM_ECOMPROMISED` ship at TLY-A5-impl-2;
-      the rollback *mechanism* (per-dataset metadata-tree swap) is a
-      **Phase 9.7** stub returning `STM_ENOTSUPPORTED`.
+- [x] Snapshot rollback (ARCH §8.10) — the `/ctl/` verb surface, the
+      consultation gate, and `STM_ECOMPROMISED` shipped at
+      TLY-A5-impl-2; the **swap mechanism** (per-dataset engine-root
+      swap + validate + dead-list clear + commit) shipped at
+      9.7-impl-4. Block reclamation of the post-snapshot divergence,
+      and rollback past newer snapshots, are **9.7-impl-4b** (until
+      then a newer snapshot refuses with `STM_ENOTSUPPORTED`).
 - [ ] Snapshot send/recv via birth-txg incremental diffs — Phase 7.
 
 ## Known caveats

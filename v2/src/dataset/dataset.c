@@ -1502,6 +1502,61 @@ stm_status stm_dataset_index_close_engine(stm_dataset_index *idx,
     return STM_OK;
 }
 
+/* 9.7-impl-4 (rollback): force a PRESENT dataset's slot triple to an
+ * arbitrary root. See the header docstring for the rollback rationale. */
+stm_status stm_dataset_index_set_engine_root(stm_dataset_index *idx,
+                                                uint64_t dataset_id,
+                                                uint64_t root_paddr,
+                                                uint64_t root_gen,
+                                                const uint8_t root_csum[32]) {
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, dataset_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    dataset_slot *slot = &idx->slots[s];
+
+    /* An un-finalised commit flush in progress is a caller-sequencing
+     * bug — refuse rather than tear an engine down mid-three-phase. A
+     * legitimate caller (stm_fs_rollback_snapshot) holds the fs-wide
+     * write lock with no commit in flight, so pending_flush is never
+     * set here. */
+    if (slot->pending_flush) {
+        must_unlock(&idx->lock);
+        return STM_EBUSY;
+    }
+
+    /* Drop the in-RAM engine: the next get_engine re-opens at the new
+     * triple, and the M-cascade — which walks only slots with an OPEN
+     * engine — then skips this slot, so the triple stamped below
+     * survives untouched to the dataset_index_commit. */
+    dataset_engine_close_locked(slot);
+
+    /* R157 P2-1: only mark dirty when the triple actually changes, so a
+     * no-op set does not burn a fresh-paddr dataset_index commit. */
+    bool changed = (slot->e.di_tree_root != root_paddr) ||
+                   (slot->e.di_root_gen  != root_gen);
+    slot->e.di_tree_root = root_paddr;
+    slot->e.di_root_gen  = root_gen;
+    if (root_csum != NULL) {
+        if (memcmp(slot->e.di_root_csum, root_csum, 32) != 0) changed = true;
+        memcpy(slot->e.di_root_csum, root_csum, 32);
+    } else {
+        for (int i = 0; i < 32; i++) {
+            if (slot->e.di_root_csum[i] != 0) { changed = true; break; }
+        }
+        memset(slot->e.di_root_csum, 0, 32);
+    }
+    if (changed) idx->dirty = true;
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
 /* ---- 9.7-impl-1c-ii: M-cascade three-phase commit driving. ---- */
 
 /* Walk every slot and return true iff ANY slot has pending_flush set.

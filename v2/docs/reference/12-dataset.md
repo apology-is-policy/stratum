@@ -171,6 +171,11 @@ stm_status stm_dataset_index_get_engine   (stm_dataset_index *idx,
                                               stm_btree_engine **out_engine);
 stm_status stm_dataset_index_close_engine (stm_dataset_index *idx,
                                               uint64_t dataset_id);
+stm_status stm_dataset_index_set_engine_root (stm_dataset_index *idx,
+                                              uint64_t dataset_id,
+                                              uint64_t root_paddr,
+                                              uint64_t root_gen,
+                                              const uint8_t root_csum[32]);
 ```
 
 `get_engine` lazily opens the per-dataset `btree_engine` rooted at
@@ -189,6 +194,21 @@ triple; a subsequent `get_engine` re-opens at the same address.
 Used by the rollback mechanism (9.7-impl-4) which swaps the
 dataset's triple and needs the in-RAM tree dropped so the swapped
 root governs the next access.
+
+`set_engine_root` (9.7-impl-4) is the rollback primitive: it forces
+a PRESENT dataset's slot triple to an arbitrary `(root_paddr,
+root_gen, root_csum)`. Normally a slot triple is updated only as a
+side effect of the M-cascade (`commit_engines_flush` stamps each
+open engine's flushed root); rollback needs to FORCE it to a
+snapshot's captured root with no engine flush behind it. The call
+drops the slot's in-RAM engine (so the next `get_engine` re-opens
+at the new triple AND the M-cascade — which flushes only OPEN
+engines — skips the slot, leaving the stamped triple untouched
+through to the `dataset_index_commit`), and marks the index dirty
+(R157 P2-1 — only when the triple actually changed). A NULL
+`root_csum` ⇒ all-zero. The caller validates the triple
+(`stm_btree_engine_verify`); `set_engine_root` stamps it verbatim.
+Refuses `STM_EBUSY` on a pending un-finalised commit flush.
 
 **1c-i posture**: the four metadata modules (inode / dirent / xattr
 / extent_index) STILL route through the pool-global 4-engine
@@ -333,7 +353,7 @@ runtime).
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_dataset` | 71 | Lifecycle (create/destroy/rename/move w/ all error paths); concurrent Create stress (8 threads × 100 ops); IdMonotonic / BirthTxgMonotonic / SiblingNameUnique / ForestStructure / RootInvariant; property API (5 props × 3 kinds × inherit-walk); STM_PROP_PROMOTE_DECAY_WINDOW chain inheritance + explicit-zero-as-legal-value (P7-CAS-12); property-mutation gen counter advance on each mutation type + no-advance on idempotent / failed mutation + NULL-defensive read (P7-CAS-14); clone create + arg validation + sibling-collision; promote semantics; clones_count_for_snap; persist roundtrip including pool defaults, ABSENT slots, properties (all 5 slots in v22 layout), clones, and post-mount counters; idempotent commit; tamper detection (csum/key/gen); next_id + current_txg seeding from on-disk + UB. 9.7-impl-1c per-dataset engine substrate (9 tests): EINVAL on NULL / dataset_id=0; storage+crypt-unbound EINVAL; ENOENT on missing dataset; lazy create + cached-handle on second get; insert/lookup roundtrip on the opened engine; engine instances distinct per dataset (D1 invariant); close + re-open; close idempotent on never-opened slot; destroy closes engine → subsequent get ENOENT; index close releases all open engines without leaking. |
+| `test_dataset` | 73 | Lifecycle (create/destroy/rename/move w/ all error paths); concurrent Create stress (8 threads × 100 ops); IdMonotonic / BirthTxgMonotonic / SiblingNameUnique / ForestStructure / RootInvariant; property API (5 props × 3 kinds × inherit-walk); STM_PROP_PROMOTE_DECAY_WINDOW chain inheritance + explicit-zero-as-legal-value (P7-CAS-12); property-mutation gen counter advance on each mutation type + no-advance on idempotent / failed mutation + NULL-defensive read (P7-CAS-14); clone create + arg validation + sibling-collision; promote semantics; clones_count_for_snap; persist roundtrip including pool defaults, ABSENT slots, properties (all 5 slots in v22 layout), clones, and post-mount counters; idempotent commit; tamper detection (csum/key/gen); next_id + current_txg seeding from on-disk + UB. 9.7-impl-1c per-dataset engine substrate (9 tests): EINVAL on NULL / dataset_id=0; storage+crypt-unbound EINVAL; ENOENT on missing dataset; lazy create + cached-handle on second get; insert/lookup roundtrip on the opened engine; engine instances distinct per dataset (D1 invariant); close + re-open; close idempotent on never-opened slot; destroy closes engine → subsequent get ENOENT; index close releases all open engines without leaking. 9.7-impl-4 `set_engine_root` (2 tests): triple round-trips through lookup + NULL-csum⇒zero; arg validation (NULL idx / dataset_id=0 / unknown dataset). |
 | `test_sync` | 24 | Mount/unmount roundtrip via sync handle; snap delete refused with clone (cb wires through); destroy-all-clones unblocks delete; clone state survives mount with cb rehydration. |
 
 ## Status
@@ -350,6 +370,8 @@ runtime).
       / `_close_engine` + slot lifecycle wiring. Module-level cutover
       (consume the engine from inode / dirent / xattr / extent_index)
       lands in 1c-ii..1c-v.
+- [x] 9.7-impl-4 `stm_dataset_index_set_engine_root` — the rollback
+      primitive (force a slot triple; drop the in-RAM engine).
 - [ ] Multi-level btree when datasets exceed single-leaf cap
       (~460 entries — single-leaf is MVP). Extension via existing
       btree_store machinery.

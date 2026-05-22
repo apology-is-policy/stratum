@@ -2275,4 +2275,49 @@ STM_TEST(dataset_engine_index_close_releases_all_open_engines) {
     unlink(dsp_tmp_path);
 }
 
+/* 9.7-impl-4: stm_dataset_index_set_engine_root forces a PRESENT
+ * dataset's slot triple to an arbitrary root — the rollback primitive.
+ * The stamped triple must round-trip through stm_dataset_lookup. */
+STM_TEST(dataset_set_engine_root_stamps_triple) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    uint64_t ds = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "rb", &ds));
+
+    uint8_t csum[32];
+    memset(csum, 0x33, sizeof csum);
+    STM_ASSERT_OK(stm_dataset_index_set_engine_root(idx, ds,
+                                                       0xCAFEu, 7u, csum));
+
+    stm_dataset_entry e;
+    STM_ASSERT_OK(stm_dataset_lookup(idx, ds, &e));
+    STM_ASSERT_EQ(e.di_tree_root, (uint64_t)0xCAFEu);
+    STM_ASSERT_EQ(e.di_root_gen,  (uint64_t)7u);
+    STM_ASSERT_EQ(memcmp(e.di_root_csum, csum, 32), 0);
+
+    /* NULL csum ⇒ all-zero csum (the "empty dataset" sentinel form). */
+    STM_ASSERT_OK(stm_dataset_index_set_engine_root(idx, ds, 0, 0, NULL));
+    STM_ASSERT_OK(stm_dataset_lookup(idx, ds, &e));
+    STM_ASSERT_EQ(e.di_tree_root, (uint64_t)0);
+    STM_ASSERT_EQ(e.di_root_gen,  (uint64_t)0);
+    uint8_t zero[32] = {0};
+    STM_ASSERT_EQ(memcmp(e.di_root_csum, zero, 32), 0);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(dataset_set_engine_root_arg_validation) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    uint8_t csum[32] = {0};
+    STM_ASSERT_ERR(stm_dataset_index_set_engine_root(NULL, 1, 0, 0, csum),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_index_set_engine_root(idx, 0, 0, 0, csum),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_index_set_engine_root(idx, 9999u, 0, 0, csum),
+                       STM_ENOENT);
+    stm_dataset_index_close(idx);
+}
+
 STM_TEST_MAIN("dataset")

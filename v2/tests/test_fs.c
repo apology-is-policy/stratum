@@ -463,6 +463,98 @@ STM_TEST(fs_create_snapshot_captures_real_root_triple) {
     unlink(g_tmp_path);
 }
 
+/* 9.7-impl-4: stm_fs_rollback_snapshot swaps the dataset's per-dataset
+ * engine root to a snapshot's captured triple. After rollback the
+ * dataset reads the snapshot's frozen view; the post-snapshot writes
+ * are discarded. The rolled-back state survives a remount. */
+STM_TEST(fs_rollback_restores_snapshot_view) {
+    make_tmp("rb_view");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Data A — the state the snapshot freezes. Data B — the post-
+     * snapshot divergence the rollback discards. */
+    uint8_t a[4096], b[4096], out[4096];
+    memset(a, 0xA1, sizeof a);
+    memset(b, 0xB2, sizeof b);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "before-b", 8, &snap_id));
+    STM_ASSERT(snap_id != 0);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, b, sizeof b));
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)sizeof out);
+    STM_ASSERT_MEM_EQ(b, out, sizeof b);   /* live tree holds B */
+
+    /* Roll back to the snapshot. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap_id, /*force=*/false));
+
+    /* The dataset now reads A — the snapshot's frozen view. */
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)sizeof out);
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+
+    /* The snapshot itself is still PRESENT after rollback. */
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(stm_fs_sync(fs));
+    stm_snapshot_entry snap;
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, snap_id, &snap));
+
+    /* The rolled-back state is durable — survives a remount. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)sizeof out);
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* 9.7-impl-4 v1.0 limitation: a rollback is refused (STM_ENOTSUPPORTED)
+ * when a newer snapshot of the dataset exists — the operator deletes
+ * newer snapshots first. A rollback to the most-recent snapshot
+ * proceeds. */
+STM_TEST(fs_rollback_refuses_when_newer_snapshot_exists) {
+    make_tmp("rb_newer");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t data[4096];
+    memset(data, 0x5C, sizeof data);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, data, sizeof data));
+    uint64_t s1 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s1", 2, &s1));
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, data, sizeof data));
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
+    STM_ASSERT(s2 > s1);
+
+    /* Rollback to s1 is refused — s2 is newer. The refusal is checked
+     * before any I/O, so it leaves no durable side effect. */
+    STM_ASSERT_ERR(stm_fs_rollback_snapshot(fs, 1, s1, false),
+                       STM_ENOTSUPPORTED);
+
+    /* Rollback to the most-recent snapshot (s2) proceeds. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, s2, false));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 STM_TEST(fs_io_read_hole_returns_zeros) {
     make_tmp("io_hole");
     stm_fs_format_opts fopts = default_format_opts();

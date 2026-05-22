@@ -1703,4 +1703,60 @@ STM_TEST(snap_create_for_test_bypasses_chain_ordering_check) {
     stm_snapshot_index_close(idx);
 }
 
+/* 9.7-impl-4: stm_snapshot_clear_dead_lists empties the paddr-tier,
+ * cold-tier, AND bootstrap-tier dead-lists of a PRESENT snapshot in
+ * place; the snapshot stays PRESENT. The rollback mechanism relies on
+ * this to reset the rolled-back-to snapshot's dead-lists. */
+STM_TEST(snap_clear_dead_lists_empties_all_three) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "rb", 0, 0, NULL, 0, &s));
+
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xA001, &sf));
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xA002, &sf));
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(idx, 1,
+                                                                  0xB001, &sf));
+    uint8_t hash[32];
+    memset(hash, 0x5A, sizeof hash);
+    bool should_deref;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_cold_block(idx, 1, hash,
+                                                             &should_deref));
+
+    size_t pc = 0, cc = 0, bc = 0;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s, &pc));
+    STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(idx, s, &cc));
+    STM_ASSERT_OK(stm_snapshot_bootstrap_dead_list_count(idx, s, &bc));
+    STM_ASSERT_EQ(pc, (size_t)2);
+    STM_ASSERT_EQ(cc, (size_t)1);
+    STM_ASSERT_EQ(bc, (size_t)1);
+
+    /* Clear: all three counts drop to 0; the snapshot stays PRESENT. */
+    STM_ASSERT_OK(stm_snapshot_clear_dead_lists(idx, s));
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s, &pc));
+    STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(idx, s, &cc));
+    STM_ASSERT_OK(stm_snapshot_bootstrap_dead_list_count(idx, s, &bc));
+    STM_ASSERT_EQ(pc, (size_t)0);
+    STM_ASSERT_EQ(cc, (size_t)0);
+    STM_ASSERT_EQ(bc, (size_t)0);
+
+    stm_snapshot_entry e;
+    STM_ASSERT_OK(stm_snapshot_lookup(idx, s, &e));   /* still PRESENT */
+
+    /* Idempotent: clearing an already-clear snapshot is a STM_OK no-op. */
+    STM_ASSERT_OK(stm_snapshot_clear_dead_lists(idx, s));
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_clear_dead_lists_arg_validation) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    STM_ASSERT_ERR(stm_snapshot_clear_dead_lists(NULL, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_clear_dead_lists(idx, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_clear_dead_lists(idx, 9999), STM_ENOENT);
+    stm_snapshot_index_close(idx);
+}
+
 STM_TEST_MAIN("snapshot")

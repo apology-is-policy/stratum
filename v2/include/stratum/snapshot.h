@@ -418,6 +418,40 @@ stm_status stm_snapshot_bootstrap_dead_list_count(
     size_t *out_count);
 
 /*
+ * 9.7-impl-4 (rollback): empty ALL THREE of a PRESENT snapshot's
+ * dead-lists — the paddr-tier (stm_alloc class), the cold-tier (CAS
+ * class), and the bootstrap-tier (engine NODE paddrs) — in place. The
+ * snapshot itself stays PRESENT; only its dead-lists are cleared.
+ *
+ * Why rollback needs this (load-bearing — the corruption it prevents):
+ * after a rollback to snapshot S, the live dataset tree IS S's frozen
+ * tree. Every paddr on S's dead-lists that S's tree references is now
+ * LIVE again. Leaving those paddrs dead-listed would let a later
+ * `stm_snapshot_delete(S)` free live storage — a corruption. Clearing
+ * resets S to a just-created dead-list state, which is exactly correct
+ * once no divergence sits between S and live.
+ *
+ * The cleared entries are DISCARDED, not transferred to the caller —
+ * unlike `stm_snapshot_delete`, this API frees the dead-list arrays
+ * themselves and does NOT hand the paddrs back. The reason: a dead-list
+ * holds a mix of paddrs S's tree references (now live — MUST NOT be
+ * freed) and intermediate COW garbage (genuinely reclaimable). The
+ * snapshot module cannot tell them apart, so it frees neither — the
+ * garbage leaks (it stays allocated, so the allocator never reissues it
+ * and the AEAD nonce stays unique; a leak here is a space cost, never a
+ * corruption). 9.7-impl-4b's diverged-block walk reclaims the garbage.
+ *
+ * Refuses STM_EINVAL on NULL idx / snapshot_id == 0, STM_ENOENT if the
+ * snapshot is unknown / ABSENT. STM_OK whether or not the snapshot had
+ * any dead-list entries (the empty case is a no-op); `idx` is marked
+ * dirty only when an entry was actually cleared (R157 P2-1 doctrine —
+ * no needless re-serialize).
+ */
+STM_MUST_USE
+stm_status stm_snapshot_clear_dead_lists(stm_snapshot_index *idx,
+                                            uint64_t snapshot_id);
+
+/*
  * P7-CAS-4c: route a dropped COLD-extent record through the snap-aware
  * deref path. Mirror of `stm_snapshot_index_overwrite_block` for the
  * cold tier — when a COW operation (overwrite / truncate / delete-file)

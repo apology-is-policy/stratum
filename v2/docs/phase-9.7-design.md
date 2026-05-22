@@ -425,6 +425,16 @@ v1's STRATUM.md §7 / §22 invariant `disk ss_gen > fs->gen` post-mount carries 
 
 The pre-rollback paddrs are NOT freed for reuse at the **bumped** gen until the rollback's commit succeeds — the bump locks them at the old gen for refcount purposes. R9-1's exact discipline.
 
+### 6.5 — As-built note (9.7-impl-4)
+
+The §6.2 sketch above predates impl-1..3; the shipped mechanism deviates as follows (the *shape* — swap-then-clean, gen-bump-before-reuse, R154 Q2 wedge — is unchanged):
+
+- **`stm_sync_bump_gen_for_rollback` does not exist.** v2's rollback swaps a metadata pointer (the dataset's engine-root triple); it does **not** roll back the allocator. The diverged blocks are not freed (they leak — see below), so the allocator never reissues a pre-rollback paddr at a stale gen. There is therefore no allocator swap to "bump before". The gen advance that keeps the AEAD nonce fresh is `stm_sync_commit`'s own (auth_gen += 2). R9-1's *intent* (no `(paddr, write_gen)` reuse) holds; its v1 *mechanism* (a standalone disk-gen bump) is subsumed by the commit.
+- **The triple swap goes through `stm_dataset_index_set_engine_root`** (a new API), not direct `de.engine` mutation. It also drops the in-RAM engine so the M-cascade does not re-stamp the stale root.
+- **Validation is swap-then-verify**, not a pre-swap detached open: set the slot triple → `stm_dataset_index_get_engine` (opens at the new triple) → `stm_btree_engine_verify`; a bad triple restores the pre-swap triple and refuses `STM_ECORRUPT` (fs not wedged). An all-zero "empty dataset" triple skips the verify.
+- **`stm_snapshot_rollback_reclaim` does not exist — block reclamation is deferred to 9.7-impl-4b.** impl-4 ships the swap only. The post-snapshot diverged engine nodes + data extents LEAK (stay allocated, untracked). This is a space cost, never a corruption: a leaked block stays allocated so the allocator never reissues it and the AEAD nonce stays unique. The target snapshot's own dead-lists ARE cleared (`stm_snapshot_clear_dead_lists`, a new API) — mandatory, since post-rollback the live tree IS the snapshot's tree and a dead-listed-but-now-live paddr would let a later `stm_snapshot_delete` free live storage.
+- **v1.0 refuses rollback past a newer snapshot** (`STM_ENOTSUPPORTED`). The §7.2 `dead_list.tla::Rollback` action (delete newer snaps + free `newer_dead \ s_view`) needs the diverged-block walk that impl-4b introduces; until then the operator deletes newer snapshots explicitly (the existing `stm_fs_delete_snapshot` reclaims them correctly) and then rolls back. impl-4b lifts this limitation and realises `dead_list.tla::Rollback` in full.
+
 ## 7 — Spec extensions (9.7-spec)
 
 ### 7.1 — snapshot.tla rollback mechanism
