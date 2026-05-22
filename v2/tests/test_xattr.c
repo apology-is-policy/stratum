@@ -20,7 +20,7 @@
  *   - Drop-for-ino.
  *   - D1 invariant from xattr's side: per-dataset engines distinct;
  *     same-key lookups across datasets see independent values.
- *   - On-disk layout sanity: STM_UB_VERSION compile-time at 30.
+ *   - On-disk layout sanity: STM_UB_VERSION compile-time at 32.
  *
  * 9.7-impl-1c-iv: the xattr module no longer owns its own engine —
  * records live in each dataset's per-dataset btree_engine, resolved
@@ -668,12 +668,12 @@ STM_TEST(xattr_op_without_attach_refused) {
 /* Compile-time invariants.                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(xattr_ub_version_is_v31) {
-    /* 9.7-impl-2-routing bumps STM_UB_VERSION 30 → 31 for the new
-     * snap-record bootstrap-tier dead-list tail. The xattr layer's
+STM_TEST(xattr_ub_version_is_v32) {
+    /* 9.7-impl-3 bumps STM_UB_VERSION 31 → 32 for the snap-record
+     * tree-root triple (root_gen + root_csum). The xattr layer's
      * on-disk value format is unchanged since v26 but rides the
      * latest version constant. */
-    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)31u);
+    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)32u);
 }
 
 /* ------------------------------------------------------------------ */

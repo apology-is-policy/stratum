@@ -505,8 +505,26 @@ extern "C" {
  * (no engine NODE overwrites) is the steady-state encoding; the
  * tail is always present.
  *
- * See `v2/docs/phase-9.7-design.md` §3.1 / §3.3 + §4 for the staging. */
-#define STM_UB_VERSION        31u
+ * v31→v32 (9.7-impl-3 — Phase 9.7 snapshot captures the real
+ * per-dataset tree root): the snapshot record's fixed prefix grows
+ * 52 → 92 bytes — `root_gen` (le64 @ 52) + `root_csum[32]` (@ 60)
+ * appended at the END of the fixed prefix, so the v31 offsets 0..52
+ * stay byte-identical and only the trailing name + dead-list tail
+ * offsets shift. Together with the existing `tree_root_paddr` (@ 8)
+ * the three form the snapshot's captured btree_engine root triple —
+ * a verbatim copy of the dataset entry's (di_tree_root, di_root_gen,
+ * di_root_csum) at Create time. NO uberblock field changes at this
+ * bump; the format break is in the snap-record encoding only. v31
+ * binaries would mis-read v32 snap records (the trailing offsets
+ * shifted), so the exact-match SB version check (`version !=
+ * STM_UB_VERSION` → STM_EBADVERSION) makes a v31 binary refuse a
+ * v32 pool outright. v31 pools refused at v32 mount via
+ * STM_EBADVERSION. An all-zero triple is the "empty dataset"
+ * snapshot (mirrors the dataset entry's empty sentinel).
+ *
+ * See `v2/docs/phase-9.7-design.md` §3.1 / §3.3 + §4 + §5 for the
+ * staging. */
+#define STM_UB_VERSION        32u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

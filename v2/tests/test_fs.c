@@ -411,6 +411,58 @@ STM_TEST(fs_io_write_read_roundtrip) {
     unlink(g_tmp_path);
 }
 
+/* 9.7-impl-3: stm_fs_create_snapshot captures the dataset's real
+ * committed per-dataset btree_engine root triple — not the
+ * pre-impl-3 tree_root_paddr=0 stub. The snapshot's captured
+ * (tree_root_paddr, root_gen, root_csum) must be a verbatim copy of
+ * the dataset entry's (di_tree_root, di_root_gen, di_root_csum). */
+STM_TEST(fs_create_snapshot_captures_real_root_triple) {
+    make_tmp("snap_triple");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Write data so dataset 1's engine is non-empty — its
+     * di_tree_root becomes a real paddr at the next commit. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, /*ds=*/1, /*ino=*/1, /*off=*/0,
+                                  plain, sizeof plain));
+
+    /* Create a snapshot — internally flushes + commits, then
+     * captures the dataset's freshly-committed root triple. */
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, /*ds=*/1, "rooted", 6, &snap_id));
+    STM_ASSERT(snap_id != 0);
+
+    stm_sync *sync = stm_fs_sync(fs);
+    STM_ASSERT(sync != NULL);
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(sync);
+    stm_dataset_index  *didx = stm_sync_dataset_index(sync);
+    STM_ASSERT(sidx != NULL && didx != NULL);
+
+    stm_snapshot_entry snap;
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, snap_id, &snap));
+    stm_dataset_entry de;
+    STM_ASSERT_OK(stm_dataset_lookup(didx, /*ds=*/1, &de));
+
+    /* Verbatim-copy invariant: the snapshot's triple == the
+     * dataset entry's committed triple. */
+    STM_ASSERT_EQ(snap.tree_root_paddr, de.di_tree_root);
+    STM_ASSERT_EQ(snap.root_gen,        de.di_root_gen);
+    STM_ASSERT_EQ(memcmp(snap.root_csum, de.di_root_csum, 32), 0);
+
+    /* impl-3 deliverable: a REAL engine root was captured — the
+     * dataset was written so its committed root is a non-zero
+     * paddr, not the old tree_root_paddr=0 stub. */
+    STM_ASSERT(snap.tree_root_paddr != 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 STM_TEST(fs_io_read_hole_returns_zeros) {
     make_tmp("io_hole");
     stm_fs_format_opts fopts = default_format_opts();
@@ -528,6 +580,7 @@ STM_TEST(fs_io_cow_with_snapshot_routes_to_dead_list) {
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap, /*ds=*/1, "snap_a",
                                           /*tree_root_paddr=*/0xCAFE,
+                                          0, NULL,
                                           stm_sync_current_gen(sync),
                                           &snap_id));
     /* Pre-overwrite: dead_list is empty. */
@@ -1025,6 +1078,7 @@ STM_TEST(fs_truncate_with_snapshot_routes_old_paddrs_to_dead_list) {
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap, /*ds=*/1, "snap_pre_truncate",
                                           /*tree_root_paddr=*/0xCAFE,
+                                          0, NULL,
                                           stm_sync_current_gen(s),
                                           &snap_id));
 
@@ -1564,10 +1618,12 @@ STM_TEST(fs_snap_chain_inversion_on_disk_refused_at_mount) {
     uint64_t s1 = 0, s2 = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, /*ds=*/1, "ok",
                                           /*tree_root=*/0xAABBu,
+                                          0, NULL,
                                           /*extent_txg=*/100, &s1));
     STM_ASSERT_OK(stm_snapshot_create_for_test(snap_idx, /*ds=*/1,
                                                    "inverted",
                                                    /*tree_root=*/0xCCDDu,
+                                                   0, NULL,
                                                    /*extent_txg=*/50, &s2));
     STM_ASSERT(s2 > s1);
 
@@ -1905,6 +1961,7 @@ STM_TEST(fs_reflink_snap_dual_overwrite_no_wedge) {
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap, /*ds=*/1, "S",
                                           /*tree_root_paddr=*/0xCAFE,
+                                          0, NULL,
                                           stm_sync_current_gen(sync),
                                           &snap_id));
 
@@ -3238,6 +3295,7 @@ STM_TEST(fs_snap_holds_cold_extent_after_overwrite) {
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, /*ds=*/1, "p4c_a",
                                           /*tree_root=*/0xC4FE,
+                                          0, NULL,
                                           stm_sync_current_gen(sync),
                                           &snap_id));
     /* Snap's cold-dead-list is empty before any overwrite. */
@@ -3297,6 +3355,7 @@ STM_TEST(fs_snap_delete_releases_cold_dead) {
 
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4c_b", 0xD00D,
+                                          0, NULL,
                                           stm_sync_current_gen(sync),
                                           &snap_id));
     /* Drop the cold extent. Snap captures hash. */
@@ -3393,6 +3452,7 @@ STM_TEST(fs_snap_cold_dead_list_persists_across_mount) {
     stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4c_c", 0x9999,
+                                          0, NULL,
                                           stm_sync_current_gen(sync),
                                           &snap_id));
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
@@ -3479,6 +3539,7 @@ STM_TEST(fs_snap_intra_cow_shared_hash_no_leak) {
     /* Snap captures the cold extents. */
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4c_idd", 0xBEEF,
+                                          0, NULL,
                                           stm_sync_current_gen(sync),
                                           &snap_id));
 
@@ -3649,6 +3710,7 @@ STM_TEST(fs_p7cas4_cold_dead_list_reserve_with_snap) {
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, /*ds=*/1, "p4_resv",
                                           /*tree_root=*/0xCAFE,
+                                          0, NULL,
                                           stm_sync_current_gen(sync),
                                           &snap_id));
 
@@ -3752,6 +3814,7 @@ STM_TEST(fs_p7cas4_overwrite_with_full_snap_returns_enospc) {
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4_full",
                                           /*tree_root=*/0xC4FE,
+                                          0, NULL,
                                           stm_sync_current_gen(sync),
                                           &snap_id));
 
@@ -3826,6 +3889,7 @@ STM_TEST(fs_p7cas4_truncate_crossing_cold_with_full_snap_returns_enospc) {
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4_trunc",
                                           /*tree_root=*/0xC0FE,
+                                          0, NULL,
                                           stm_sync_current_gen(sync),
                                           &snap_id));
 
@@ -4025,6 +4089,7 @@ STM_TEST(fs_p7cas4_r55_truncate_crossing_cold_with_near_full_snap) {
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4r55",
                                           /*tree_root=*/0xC0DE,
+                                          0, NULL,
                                           stm_sync_current_gen(sync),
                                           &snap_id));
 

@@ -6068,25 +6068,48 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
-    /* R105 P3-2: validate dataset_id is a PRESENT dataset before
-     * creating a snapshot for it. The underlying snapshot.c uses
-     * dataset_id as an opaque bucket-key without lookup; without
-     * this gate, non-/ctl/ callers (CLI, FUSE, direct embedders)
-     * could create orphan snapshot records keyed at never-registered
-     * or destroyed dataset_ids — internally consistent but
-     * occupying snapshot index slots and bumping current_txg
-     * unnecessarily.
+    /* 9.7-impl-3: commit the per-dataset engine cascade so the
+     * dataset's (di_tree_root, di_root_gen, di_root_csum) triple is
+     * DURABLE and reflects the just-flushed writes. A snapshot must
+     * capture a *recoverable* root — the pre-commit di_tree_root is
+     * stale (the previous commit's root, or all-zero for a never-
+     * committed dataset). The three-phase sync_commit makes each
+     * dataset engine's root durable and re-stamps every dataset
+     * entry's triple; the post-commit stm_dataset_lookup below then
+     * reads the fresh values.
      *
-     * The /ctl/ vops_walk + vops_open paths already perform the
-     * lookup, so this gate is unreachable through /ctl/ today; it's
-     * defense-in-depth at the public-API trust boundary. */
+     * R154 Q2: a failed stm_sync_commit is crash-equivalent (the
+     * engines' three-phase abort dropped the in-memory trees), so we
+     * wedge the fs — mirroring stm_fs_commit. The wedge is deferred
+     * past the unlock since stm_fs_mark_wedged itself takes
+     * fs->global. */
+    {
+        stm_status cr = stm_sync_commit(fs->sync);
+        if (cr != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            stm_fs_mark_wedged(fs);
+            return cr;
+        }
+    }
+
+    /* R105 P3-2 gate + 9.7-impl-3 capture: look up the dataset entry
+     * AFTER the commit so its triple reflects the committed engine
+     * root. The lookup doubles as the PRESENT-dataset validation
+     * gate — the underlying snapshot.c uses dataset_id as an opaque
+     * bucket-key without lookup, so without this gate a non-/ctl/
+     * caller (CLI, FUSE, direct embedder) could create an orphan
+     * snapshot record keyed at a never-registered dataset_id.
+     * STM_ENOENT propagates for a missing dataset. The /ctl/
+     * vops_walk + vops_open paths already perform the lookup, so the
+     * gate is unreachable through /ctl/ today; it is defense-in-depth
+     * at the public-API trust boundary. */
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
     if (!didx) {
         pthread_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
-    stm_dataset_entry tmp;
-    stm_status drc = stm_dataset_lookup(didx, dataset_id, &tmp);
+    stm_dataset_entry de;
+    stm_status drc = stm_dataset_lookup(didx, dataset_id, &de);
     if (drc != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return drc;     /* propagates STM_ENOENT for missing dataset */
@@ -6099,14 +6122,16 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
     }
 
     uint64_t cur_gen = stm_sync_current_gen(fs->sync);
-    /* tree_root_paddr=0: dataset.h's stm_dataset_entry doesn't yet
-     * carry a per-dataset tree-root paddr (P6/P7 follow-on). v2.0's
-     * snapshot index records the value as opaque metadata; existing
-     * tests (test_send_recv.c:222) pass 0 too. When the per-dataset
-     * tree-root surface lands, this wrapper bumps to pass it
-     * through. */
+    /* 9.7-impl-3: capture the dataset's real committed engine-root
+     * triple. An all-zero triple (a never-written dataset) is a
+     * valid "empty dataset" snapshot — the snapshot module stores
+     * the triple opaquely; stm_btree_engine_open validates it at
+     * the consuming chunks (9.7-impl-4 rollback / 9.7-impl-5
+     * readable .snaps). */
     stm_status s = stm_snapshot_create(sidx, dataset_id, nbuf,
-                                          /*tree_root_paddr=*/0,
+                                          de.di_tree_root,
+                                          de.di_root_gen,
+                                          de.di_root_csum,
                                           cur_gen, out_id);
     pthread_rwlock_unlock(&fs->global);
     return s;

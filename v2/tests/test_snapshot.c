@@ -84,7 +84,7 @@ STM_TEST(snap_create_basic) {
 
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(idx, 42 /* dataset */, "daily-1",
-                                         0xCAFEBABE, 0, &snap_id));
+                                         0xCAFEBABE, 0, NULL, 0, &snap_id));
     STM_ASSERT_EQ(snap_id, (uint64_t)1);
 
     stm_snapshot_entry e;
@@ -106,15 +106,15 @@ STM_TEST(snap_create_arg_validation) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t out = 0;
-    STM_ASSERT_ERR(stm_snapshot_create(NULL, 1, "x", 0, 0, &out), STM_EINVAL);
-    STM_ASSERT_ERR(stm_snapshot_create(idx, 0, "x", 0, 0, &out), STM_EINVAL);
-    STM_ASSERT_ERR(stm_snapshot_create(idx, 1, NULL, 0, 0, &out), STM_EINVAL);
-    STM_ASSERT_ERR(stm_snapshot_create(idx, 1, "x", 0, 0, NULL), STM_EINVAL);
-    STM_ASSERT_ERR(stm_snapshot_create(idx, 1, "", 0, 0, &out), STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create(NULL, 1, "x", 0, 0, NULL, 0, &out), STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create(idx, 0, "x", 0, 0, NULL, 0, &out), STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create(idx, 1, NULL, 0, 0, NULL, 0, &out), STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create(idx, 1, "x", 0, 0, NULL, 0, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create(idx, 1, "", 0, 0, NULL, 0, &out), STM_EINVAL);
     char too_long[STM_SNAP_NAME_MAX + 2];
     memset(too_long, 'a', sizeof too_long);
     too_long[sizeof too_long - 1] = '\0';
-    STM_ASSERT_ERR(stm_snapshot_create(idx, 1, too_long, 0, 0, &out), STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create(idx, 1, too_long, 0, 0, NULL, 0, &out), STM_EINVAL);
     stm_snapshot_index_close(idx);
 }
 
@@ -122,9 +122,9 @@ STM_TEST(snap_create_chain_links_prev) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s1 = 0, s2 = 0, s3 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0xa1, 0, &s1));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0xa2, 0, &s2));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "c", 0xa3, 0, &s3));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0xa1, 0, NULL, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0xa2, 0, NULL, 0, &s2));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "c", 0xa3, 0, NULL, 0, &s3));
 
     /* Each new snap's prev = previous. */
     stm_snapshot_entry e;
@@ -137,7 +137,7 @@ STM_TEST(snap_create_chain_links_prev) {
 
     /* Different dataset gets independent chain. */
     uint64_t t1 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 7, "alpha", 0xb1, 0, &t1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 7, "alpha", 0xb1, 0, NULL, 0, &t1));
     STM_ASSERT_OK(stm_snapshot_lookup(idx, t1, &e));
     STM_ASSERT_EQ(e.prev_snap_id, STM_SNAP_NO_PREV);
     stm_snapshot_index_close(idx);
@@ -147,10 +147,10 @@ STM_TEST(snap_create_rejects_duplicate_name_in_dataset) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s1 = 0, s2 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "daily", 0, 0, &s1));
-    STM_ASSERT_ERR(stm_snapshot_create(idx, 1, "daily", 0, 0, &s2), STM_EEXIST);
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "daily", 0, 0, NULL, 0, &s1));
+    STM_ASSERT_ERR(stm_snapshot_create(idx, 1, "daily", 0, 0, NULL, 0, &s2), STM_EEXIST);
     /* Same name in DIFFERENT dataset is fine. */
-    STM_ASSERT_OK(stm_snapshot_create(idx, 2, "daily", 0, 0, &s2));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 2, "daily", 0, 0, NULL, 0, &s2));
     STM_ASSERT_NE(s1, s2);
     stm_snapshot_index_close(idx);
 }
@@ -161,9 +161,9 @@ STM_TEST(snap_chain_txg_strictly_increases) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s1 = 0, s2 = 0, s3 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s1));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, 0, &s2));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "c", 0, 0, &s3));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, 0, NULL, 0, &s2));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "c", 0, 0, NULL, 0, &s3));
     stm_snapshot_entry e1, e2, e3;
     STM_ASSERT_OK(stm_snapshot_lookup(idx, s1, &e1));
     STM_ASSERT_OK(stm_snapshot_lookup(idx, s2, &e2));
@@ -181,7 +181,7 @@ STM_TEST(snap_delete_basic) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &s));
     STM_ASSERT_OK(snap_delete_simple(idx, s));
 
     stm_snapshot_entry e;
@@ -197,7 +197,7 @@ STM_TEST(snap_delete_refused_while_held) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &s));
     STM_ASSERT_OK(stm_snapshot_hold(idx, s));
     STM_ASSERT_ERR(snap_delete_simple(idx, s), STM_EBUSY);
 
@@ -211,7 +211,7 @@ STM_TEST(snap_multiple_holds_each_must_release) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &s));
     STM_ASSERT_OK(stm_snapshot_hold(idx, s));
     STM_ASSERT_OK(stm_snapshot_hold(idx, s));
     STM_ASSERT_OK(stm_snapshot_hold(idx, s));
@@ -232,7 +232,7 @@ STM_TEST(snap_release_without_hold_rejected) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &s));
     STM_ASSERT_ERR(stm_snapshot_release(idx, s), STM_EINVAL);
     /* And on unknown id. */
     STM_ASSERT_ERR(stm_snapshot_release(idx, 9999u), STM_ENOENT);
@@ -245,7 +245,7 @@ STM_TEST(snap_hold_on_unknown_id_rejected) {
     STM_ASSERT_ERR(stm_snapshot_hold(idx, 9999u), STM_ENOENT);
     /* And on already-deleted id. */
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &s));
     STM_ASSERT_OK(snap_delete_simple(idx, s));
     STM_ASSERT_ERR(stm_snapshot_hold(idx, s), STM_ENOENT);
     stm_snapshot_index_close(idx);
@@ -259,7 +259,7 @@ STM_TEST(snap_mark_compromised_roundtrip) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &s));
 
     stm_snapshot_entry e;
     /* Fresh snap: not compromised. */
@@ -294,7 +294,7 @@ STM_TEST(snap_mark_compromised_unknown_id_rejected) {
     STM_ASSERT_ERR(stm_snapshot_unmark_compromised(idx, 9999u), STM_ENOENT);
     /* And on an already-deleted snap. */
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &s));
     STM_ASSERT_OK(snap_delete_simple(idx, s));
     STM_ASSERT_ERR(stm_snapshot_mark_compromised(idx, s), STM_ENOENT);
     STM_ASSERT_ERR(stm_snapshot_unmark_compromised(idx, s), STM_ENOENT);
@@ -309,7 +309,7 @@ STM_TEST(snap_tree_root_is_immutable) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0xDEADBEEF, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0xDEADBEEF, 0, NULL, 0, &s));
 
     stm_snapshot_entry e1, e2;
     STM_ASSERT_OK(stm_snapshot_lookup(idx, s, &e1));
@@ -327,7 +327,7 @@ STM_TEST(snap_tree_root_is_immutable) {
     /* Even after creating other snaps in same dataset, this snap's
      * tree_root is unaffected. */
     uint64_t s2 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0xBADCAB1E, 0, &s2));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0xBADCAB1E, 0, NULL, 0, &s2));
     STM_ASSERT_OK(stm_snapshot_lookup(idx, s, &e2));
     STM_ASSERT_EQ(e2.tree_root_paddr, e1.tree_root_paddr);
 
@@ -342,12 +342,12 @@ STM_TEST(snap_id_never_recycled) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t a = 0, b = 0, c = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &a));
     STM_ASSERT_OK(snap_delete_simple(idx, a));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, 0, &b));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, 0, NULL, 0, &b));
     STM_ASSERT_TRUE(b > a);
     STM_ASSERT_OK(snap_delete_simple(idx, b));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &c));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &c));
     /* Re-using name "a" in same dataset is fine after the original was
      * deleted; new id is still monotonic. */
     STM_ASSERT_TRUE(c > b);
@@ -362,9 +362,9 @@ STM_TEST(snap_dataset_count_basic) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t a = 0, b = 0, c = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &a));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, 0, &b));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 7, "x", 0, 0, &c));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, 0, NULL, 0, &b));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 7, "x", 0, 0, NULL, 0, &c));
 
     size_t n = 0;
     STM_ASSERT_OK(stm_snapshot_count(idx, &n));
@@ -389,10 +389,10 @@ STM_TEST(snap_most_recent_basic) {
     STM_ASSERT_EQ(latest, STM_SNAP_NO_PREV);
 
     uint64_t a = 0, b = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &a));
     STM_ASSERT_OK(stm_snapshot_most_recent(idx, 1, &latest));
     STM_ASSERT_EQ(latest, a);
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, 0, &b));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, 0, NULL, 0, &b));
     STM_ASSERT_OK(stm_snapshot_most_recent(idx, 1, &latest));
     STM_ASSERT_EQ(latest, b);
     /* After deleting most-recent, latest falls back to previous. */
@@ -413,9 +413,9 @@ STM_TEST(snap_iter_visits_all_present) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t a = 0, b = 0, c = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &a));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, 0, &b));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 7, "c", 0, 0, &c));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, 0, NULL, 0, &b));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 7, "c", 0, 0, NULL, 0, &c));
     STM_ASSERT_OK(snap_delete_simple(idx, b));   /* ABSENT → not visited */
 
     size_t count = 0;
@@ -439,7 +439,7 @@ STM_TEST(snap_advance_txg_refuses_regression) {
 
     /* Created snap stamps the new txg+1. */
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, NULL, 0, &s));
     stm_snapshot_entry e;
     STM_ASSERT_OK(stm_snapshot_lookup(idx, s, &e));
     STM_ASSERT_EQ(e.created_txg, (uint64_t)201);
@@ -459,7 +459,7 @@ STM_TEST(snap_grows_past_initial_capacity) {
     for (int i = 0; i < N; i++) {
         char name[16];
         snprintf(name, sizeof name, "s_%d", i);
-        STM_ASSERT_OK(stm_snapshot_create(idx, 1, name, (uint64_t)i, 0, &ids[i]));
+        STM_ASSERT_OK(stm_snapshot_create(idx, 1, name, (uint64_t)i, 0, NULL, 0, &ids[i]));
     }
     size_t n = 0;
     STM_ASSERT_OK(stm_snapshot_count(idx, &n));
@@ -495,7 +495,7 @@ static void *snap_concurrent_creator(void *arg) {
          * don't interfere — we want to test pure id-allocation
          * + slot-array race, not name-uniqueness. */
         stm_status s = stm_snapshot_create(c->idx, (uint64_t)(c->tid + 1),
-                                              name, (uint64_t)i, 0, &c->ids[i]);
+                                              name, (uint64_t)i, 0, NULL, 0, &c->ids[i]);
         if (s != STM_OK) c->fail_count++;
     }
     return NULL;
@@ -557,7 +557,7 @@ static void *snap_same_dataset_creator(void *arg) {
          * per-dataset chain (most_recent + name uniqueness within the
          * dataset). */
         stm_status s = stm_snapshot_create(c->idx, 1, name,
-                                              (uint64_t)i, 0, &c->ids[i]);
+                                              (uint64_t)i, 0, NULL, 0, &c->ids[i]);
         if (s != STM_OK) c->fail_count++;
     }
     return NULL;
@@ -698,11 +698,11 @@ STM_TEST(snapshot_persist_commit_load_roundtrip) {
      * unconstrained. */
     uint64_t a = 0, b1 = 0, c = 0;
     STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 1, "snap_alpha", 0xfeed01,
-                                          /*extent_txg=*/0x1111111111111111ull, &a));
+                                          0, NULL, /*extent_txg=*/0x1111111111111111ull, &a));
     STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 1, "snap_beta",  0xfeed02,
-                                          /*extent_txg=*/0x2222222222222222ull, &b1));
+                                          0, NULL, /*extent_txg=*/0x2222222222222222ull, &b1));
     STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 2, "snap_gamma", 0xfeed03,
-                                          /*extent_txg=*/0x3333333333333333ull, &c));
+                                          0, NULL, /*extent_txg=*/0x3333333333333333ull, &c));
 
     /* Hold snap_alpha twice (should persist). */
     STM_ASSERT_OK(stm_snapshot_hold(idx, a));
@@ -760,6 +760,95 @@ STM_TEST(snapshot_persist_commit_load_roundtrip) {
     unlink(spp_tmp_path);
 }
 
+/* 9.7-impl-3: stm_snapshot_create captures the per-dataset engine
+ * root triple (tree_root_paddr, root_gen, root_csum) verbatim. The
+ * snapshot module stores it opaquely — no semantic validation; a
+ * NULL root_csum is treated as a 32-byte all-zero csum. */
+STM_TEST(snap_create_captures_root_triple) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+
+    uint8_t csum[32];
+    for (size_t i = 0; i < 32; i++) csum[i] = (uint8_t)(0xA0u + i);
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/1, "withroot",
+                                         /*paddr*/0xC0FFEEull,
+                                         /*root_gen*/777ull, csum,
+                                         /*extent_txg*/0, &s));
+    stm_snapshot_entry e;
+    STM_ASSERT_OK(stm_snapshot_lookup(idx, s, &e));
+    STM_ASSERT_EQ(e.tree_root_paddr, (uint64_t)0xC0FFEEull);
+    STM_ASSERT_EQ(e.root_gen,        (uint64_t)777ull);
+    STM_ASSERT_EQ(memcmp(e.root_csum, csum, 32), 0);
+
+    /* root_csum NULL ⇒ all-zero csum stored. */
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/1, "nullcsum",
+                                         0, 0, NULL, 0, &s2));
+    STM_ASSERT_OK(stm_snapshot_lookup(idx, s2, &e));
+    STM_ASSERT_EQ(e.tree_root_paddr, (uint64_t)0);
+    STM_ASSERT_EQ(e.root_gen,        (uint64_t)0);
+    uint8_t zero[32];
+    memset(zero, 0, sizeof zero);
+    STM_ASSERT_EQ(memcmp(e.root_csum, zero, 32), 0);
+
+    stm_snapshot_index_close(idx);
+}
+
+/* 9.7-impl-3: the captured root triple survives the v32 on-disk
+ * encode/decode (SP_VAL_FIXED grew 52→92 for root_gen @ 52 +
+ * root_csum @ 60). Regression-catches an off-by-N in the new
+ * fixed-prefix layout. */
+STM_TEST(snapshot_persist_tree_root_triple_roundtrip) {
+    spp_make_tmp("triple");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    spp_open_fresh(&d, &b);
+
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(/*current_txg=*/50, &idx));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx, SPP_KEY,
+                                                      SPP_POOL_UUID,
+                                                      SPP_DEVICE_UUID));
+
+    uint8_t csum[32];
+    for (size_t i = 0; i < 32; i++) csum[i] = (uint8_t)(i * 7u + 3u);
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/1, "rooted",
+                                         /*paddr*/0xABCDEF0123ull,
+                                         /*root_gen*/0x9090909090909090ull,
+                                         csum, /*extent_txg*/0x55ull, &s));
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr, cs));
+    STM_ASSERT(paddr != 0);
+
+    stm_snapshot_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    spp_reopen(&d, &b);
+    stm_snapshot_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx2, SPP_KEY,
+                                                       SPP_POOL_UUID,
+                                                       SPP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_snapshot_index_load_at(idx2, paddr, 1u, cs));
+
+    stm_snapshot_entry e;
+    STM_ASSERT_OK(stm_snapshot_lookup(idx2, s, &e));
+    STM_ASSERT_EQ(e.tree_root_paddr, (uint64_t)0xABCDEF0123ull);
+    STM_ASSERT_EQ(e.root_gen,        (uint64_t)0x9090909090909090ull);
+    STM_ASSERT_EQ(memcmp(e.root_csum, csum, 32), 0);
+    STM_ASSERT_EQ(e.extent_txg,      (uint64_t)0x55ull);
+
+    stm_snapshot_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(spp_tmp_path);
+}
+
 STM_TEST(snapshot_persist_commit_idempotent_on_clean) {
     spp_make_tmp("idem");
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;
@@ -772,7 +861,7 @@ STM_TEST(snapshot_persist_commit_idempotent_on_clean) {
                                                       SPP_POOL_UUID,
                                                       SPP_DEVICE_UUID));
     uint64_t a = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "snap1", 0x1000, 0, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "snap1", 0x1000, 0, NULL, 0, &a));
 
     uint64_t paddr1 = 0; uint8_t cs1[32];
     STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr1, cs1));
@@ -806,7 +895,7 @@ STM_TEST(snapshot_persist_load_at_wrong_csum_rejected) {
                                                       SPP_POOL_UUID,
                                                       SPP_DEVICE_UUID));
     uint64_t a = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0x100, 0, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0x100, 0, NULL, 0, &a));
     uint64_t paddr = 0; uint8_t cs[32];
     STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr, cs));
 
@@ -843,7 +932,7 @@ STM_TEST(snapshot_persist_load_at_wrong_key_rejected) {
                                                       SPP_POOL_UUID,
                                                       SPP_DEVICE_UUID));
     uint64_t a = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0x100, 0, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0x100, 0, NULL, 0, &a));
     uint64_t paddr = 0; uint8_t cs[32];
     STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr, cs));
 
@@ -885,7 +974,7 @@ STM_TEST(snapshot_persist_current_txg_seeded_from_max_created) {
                                                       SPP_POOL_UUID,
                                                       SPP_DEVICE_UUID));
     uint64_t a = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "snap1", 0x100, 0, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "snap1", 0x100, 0, NULL, 0, &a));
     stm_snapshot_entry e;
     STM_ASSERT_OK(stm_snapshot_lookup(idx, a, &e));
     STM_ASSERT_EQ(e.created_txg, (uint64_t)51);
@@ -911,7 +1000,7 @@ STM_TEST(snapshot_persist_current_txg_seeded_from_max_created) {
     STM_ASSERT(txg_after >= 51u);
 
     uint64_t b1 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx2, 1, "snap2", 0x200, 0, &b1));
+    STM_ASSERT_OK(stm_snapshot_create(idx2, 1, "snap2", 0x200, 0, NULL, 0, &b1));
     STM_ASSERT_OK(stm_snapshot_lookup(idx2, b1, &e));
     STM_ASSERT(e.created_txg > 51u);
 
@@ -933,9 +1022,9 @@ STM_TEST(snapshot_persist_next_id_seeded_after_load) {
                                                       SPP_POOL_UUID,
                                                       SPP_DEVICE_UUID));
     uint64_t a, c, e;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "x", 1, 0, &a));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "y", 2, 0, &c));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "z", 3, 0, &e));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "x", 1, 0, NULL, 0, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "y", 2, 0, NULL, 0, &c));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "z", 3, 0, NULL, 0, &e));
     STM_ASSERT_EQ(a, (uint64_t)1);
     STM_ASSERT_EQ(e, (uint64_t)3);
 
@@ -961,7 +1050,7 @@ STM_TEST(snapshot_persist_next_id_seeded_after_load) {
 
     /* New Create gets id=4. */
     uint64_t newer = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx2, 1, "newer", 4, 0, &newer));
+    STM_ASSERT_OK(stm_snapshot_create(idx2, 1, "newer", 4, 0, NULL, 0, &newer));
     STM_ASSERT_EQ(newer, (uint64_t)4);
 
     STM_ASSERT_ERR(stm_snapshot_index_set_next_id(idx2, 2u), STM_EINVAL);
@@ -998,7 +1087,7 @@ STM_TEST(snap_overwrite_appends_to_most_recent) {
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
 
     uint64_t s1 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/1, "snap1", 0, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/1, "snap1", 0, 0, NULL, 0, &s1));
 
     bool should_free = true;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0x1000,
@@ -1027,8 +1116,8 @@ STM_TEST(snap_overwrite_appends_to_latest_snap) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s1 = 0, s2 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "first",  0, 0, &s1));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "second", 0, 0, &s2));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "first",  0, 0, NULL, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "second", 0, 0, NULL, 0, &s2));
 
     bool sf;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xAAAA, &sf));
@@ -1064,7 +1153,7 @@ STM_TEST(snap_overwrite_refuses_duplicate_paddr) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s1 = 0, s2 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "first",  0, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "first",  0, 0, NULL, 0, &s1));
 
     bool sf;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xABCD, &sf));
@@ -1074,7 +1163,7 @@ STM_TEST(snap_overwrite_refuses_duplicate_paddr) {
 
     /* Create a second snap; same paddr in OTHER snap also refused
      * (cross-snap defense). */
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "second", 0, 0, &s2));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "second", 0, 0, NULL, 0, &s2));
     STM_ASSERT_ERR(stm_snapshot_index_overwrite_block(idx, 1, 0xABCD, &sf),
                    STM_EINVAL);
 
@@ -1088,7 +1177,7 @@ STM_TEST(snap_overwrite_caps_at_max) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "fill", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "fill", 0, 0, NULL, 0, &s));
 
     bool sf;
     for (uint32_t i = 0; i < STM_SNAP_DEAD_LIST_MAX; i++) {
@@ -1126,7 +1215,7 @@ STM_TEST(snap_overwrite_boot_appends_to_most_recent) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s1 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/1, "snap1", 0, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/1, "snap1", 0, 0, NULL, 0, &s1));
 
     bool should_free = true;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
@@ -1170,7 +1259,7 @@ STM_TEST(snap_overwrite_boot_refuses_duplicate_paddr) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s1 = 0, s2 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "first", 0, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "first", 0, 0, NULL, 0, &s1));
     bool sf;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
         idx, 1, 0xABCD, &sf));
@@ -1178,7 +1267,7 @@ STM_TEST(snap_overwrite_boot_refuses_duplicate_paddr) {
     STM_ASSERT_ERR(stm_snapshot_index_overwrite_bootstrap_block(
         idx, 1, 0xABCD, &sf), STM_EINVAL);
     /* Cross-snap defense: create another snap; same paddr still refused. */
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "second", 0, 0, &s2));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "second", 0, 0, NULL, 0, &s2));
     STM_ASSERT_ERR(stm_snapshot_index_overwrite_bootstrap_block(
         idx, 1, 0xABCD, &sf), STM_EINVAL);
     stm_snapshot_index_close(idx);
@@ -1191,7 +1280,7 @@ STM_TEST(snap_overwrite_boot_paddr_collisions_across_tiers_permitted) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s1 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "shared", 0, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "shared", 0, 0, NULL, 0, &s1));
     bool sf;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xBEEF, &sf));
     STM_ASSERT_FALSE(sf);
@@ -1206,7 +1295,7 @@ STM_TEST(snap_overwrite_boot_caps_at_max) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "fill", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "fill", 0, 0, NULL, 0, &s));
     bool sf;
     for (uint32_t i = 0; i < STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX; i++) {
         uint64_t paddr = (uint64_t)0x1000 + i;
@@ -1240,7 +1329,7 @@ STM_TEST(snap_delete_mismatched_null_boot_pair_refused) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "victim", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "victim", 0, 0, NULL, 0, &s));
 
     uint64_t *freed = (uint64_t *)0xDEADBEEF;
     size_t n = 99;
@@ -1280,7 +1369,7 @@ STM_TEST(snap_delete_transfers_boot_dead_list) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "src", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "src", 0, 0, NULL, 0, &s));
     bool sf;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_bootstrap_block(
         idx, 1, 0xB001, &sf));
@@ -1311,7 +1400,7 @@ STM_TEST(snap_delete_returns_dead_list) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "doomed", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "doomed", 0, 0, NULL, 0, &s));
 
     bool sf;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xA001, &sf));
@@ -1348,7 +1437,7 @@ STM_TEST(snap_delete_clean_returns_null_zero) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "clean", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "clean", 0, 0, NULL, 0, &s));
 
     uint64_t *freed = (uint64_t *)0xDEADBEEF;  /* will be cleared */
     size_t    n     = 99;
@@ -1371,7 +1460,7 @@ STM_TEST(snap_delete_refused_held_keeps_dead_list) {
     stm_snapshot_index *idx = NULL;
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "held", 0, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "held", 0, 0, NULL, 0, &s));
     bool sf;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xB001, &sf));
 
@@ -1437,8 +1526,8 @@ STM_TEST(snapshot_persist_dead_list_roundtrip) {
                                                       SPP_POOL_UUID,
                                                       SPP_DEVICE_UUID));
     uint64_t s1 = 0, s2 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "with-dead", 0xA, 0, &s1));
-    STM_ASSERT_OK(stm_snapshot_create(idx, 2, "no-dead",   0xB, 0, &s2));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "with-dead", 0xA, 0, NULL, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 2, "no-dead",   0xB, 0, NULL, 0, &s2));
 
     bool sf;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0x1000, &sf));
@@ -1504,7 +1593,7 @@ STM_TEST(snapshot_persist_dead_list_idempotent_commit) {
                                                       SPP_POOL_UUID,
                                                       SPP_DEVICE_UUID));
     uint64_t s = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "x", 1, 0, &s));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "x", 1, 0, NULL, 0, &s));
     bool sf;
     STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xC1, &sf));
     STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xC2, &sf));
@@ -1536,10 +1625,12 @@ STM_TEST(snap_create_in_process_chain_ordering_refused) {
     uint64_t s1 = 0, s2 = 0;
     STM_ASSERT_OK(stm_snapshot_create(idx, /*ds=*/1, "s1",
                                           /*tree_root=*/0xAABBu,
+                                          0, NULL,
                                           /*extent_txg=*/10, &s1));
     /* Chain inversion within same dataset: refused. */
     STM_ASSERT_ERR(stm_snapshot_create(idx, /*ds=*/1, "s2",
                                           /*tree_root=*/0xCCDDu,
+                                          0, NULL,
                                           /*extent_txg=*/5, &s2),
                        STM_EINVAL);
     STM_ASSERT_EQ(s2, 0u);
@@ -1547,6 +1638,7 @@ STM_TEST(snap_create_in_process_chain_ordering_refused) {
     /* Different dataset bypasses the check (chain is per-dataset). */
     STM_ASSERT_OK(stm_snapshot_create(idx, /*ds=*/2, "s2_other_ds",
                                           /*tree_root=*/0xCCDDu,
+                                          0, NULL,
                                           /*extent_txg=*/5, &s2));
     STM_ASSERT(s2 > s1);
 
@@ -1556,6 +1648,7 @@ STM_TEST(snap_create_in_process_chain_ordering_refused) {
     uint64_t s3 = 0;
     STM_ASSERT_OK(stm_snapshot_create(idx, /*ds=*/1, "s3",
                                           /*tree_root=*/0xEEFFu,
+                                          0, NULL,
                                           /*extent_txg=*/10, &s3));
 
     stm_snapshot_index_close(idx);
@@ -1570,9 +1663,9 @@ STM_TEST(snap_create_for_test_bypasses_chain_ordering_check) {
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
 
     uint64_t s1 = 0, s2 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s1", 0xAABBu, 10, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s1", 0xAABBu, 0, NULL, 10, &s1));
     STM_ASSERT_OK(stm_snapshot_create_for_test(idx, 1, "s2",
-                                                   0xCCDDu, 5, &s2));
+                                                   0xCCDDu, 0, NULL, 5, &s2));
     STM_ASSERT(s2 > s1);
 
     stm_snapshot_entry e2;
@@ -1587,24 +1680,24 @@ STM_TEST(snap_create_for_test_bypasses_chain_ordering_check) {
      * pins that contract so a future drift doesn't silently
      * weaken the test seam. */
     uint64_t junk = 0;
-    STM_ASSERT_ERR(stm_snapshot_create_for_test(NULL, 1, "x", 0, 0, &junk),
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(NULL, 1, "x", 0, 0, NULL, 0, &junk),
                        STM_EINVAL);
-    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, NULL, 0, 0, &junk),
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, NULL, 0, 0, NULL, 0, &junk),
                        STM_EINVAL);
-    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, "x", 0, 0, NULL),
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, "x", 0, 0, NULL, 0, NULL),
                        STM_EINVAL);
-    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 0, "x", 0, 0, &junk),
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 0, "x", 0, 0, NULL, 0, &junk),
                        STM_EINVAL);
-    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, "", 0, 0, &junk),
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, "", 0, 0, NULL, 0, &junk),
                        STM_EINVAL);
     /* Oversize name: STM_SNAP_NAME_MAX + 1 'a's. */
     char too_long[STM_SNAP_NAME_MAX + 2];
     memset(too_long, 'a', sizeof too_long - 1);
     too_long[sizeof too_long - 1] = '\0';
-    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, too_long, 0, 0, &junk),
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, too_long, 0, 0, NULL, 0, &junk),
                        STM_EINVAL);
     STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, "s1",
-                                                   0xAABBu, 99, &junk),
+                                                   0xAABBu, 0, NULL, 99, &junk),
                        STM_EEXIST);
 
     stm_snapshot_index_close(idx);

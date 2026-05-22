@@ -69,6 +69,8 @@ stm_status stm_snapshot_create_for_test(stm_snapshot_index *idx,
                                           uint64_t dataset_id,
                                           const char *name,
                                           uint64_t tree_root_paddr,
+                                          uint64_t root_gen,
+                                          const uint8_t root_csum[32],
                                           uint64_t extent_txg,
                                           uint64_t *out_id);
 #endif /* STRATUM_BUILD_TESTING_HOOKS */

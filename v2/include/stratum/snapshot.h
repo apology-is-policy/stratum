@@ -138,6 +138,19 @@ struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
  * monotonic counter. `extent_txg` IS the value send/recv's
  * incremental gen filter uses to bound `extent.gen` (see
  * snapshot.tla::ExtentTxgBoundedBySync). Format-break v13 → v14.
+ *
+ * 9.7-impl-3 added `root_gen` + `root_csum`: the snapshot captures
+ * the dataset's per-dataset btree_engine root as the full triple
+ * (tree_root_paddr, root_gen, root_csum) — a verbatim copy of the
+ * dataset entry's (di_tree_root, di_root_gen, di_root_csum) at the
+ * moment of Create. The triple is what stm_btree_engine_open
+ * rehydrates the snapshot's frozen tree from (9.7-impl-4 rollback /
+ * 9.7-impl-5 readable .snaps). The snapshot module treats the
+ * triple as OPAQUE metadata — it is faithfully stored + round-
+ * tripped, never interpreted; the real validation (csum match)
+ * happens at stm_btree_engine_open in the consuming chunks. An
+ * all-zero triple is the "empty dataset" snapshot (mirrors the
+ * dataset entry's empty sentinel). Format-break v31 → v32.
  */
 typedef struct {
     uint64_t snapshot_id;             /* unique pool-wide; monotonic */
@@ -145,6 +158,8 @@ typedef struct {
     uint32_t name_len;                /* bytes; ≤ STM_SNAP_NAME_MAX */
     uint8_t  name[STM_SNAP_NAME_MAX + 1u];  /* UTF-8 + NUL */
     uint64_t tree_root_paddr;         /* dataset tree_root captured at Create */
+    uint64_t root_gen;                /* engine root birth-gen captured (9.7-impl-3) */
+    uint8_t  root_csum[32];           /* BLAKE3-256 of root node ciphertext (9.7-impl-3) */
     uint64_t created_txg;             /* snap-index counter at Create */
     uint64_t extent_txg;              /* sync.current_gen at Create (P7-8) */
     uint64_t prev_snap_id;            /* STM_SNAP_NO_PREV for first */
@@ -187,10 +202,19 @@ stm_status stm_snapshot_index_current_txg(const stm_snapshot_index *idx,
 
 /*
  * Create a new snapshot of `dataset_id`. Captures the live
- * `tree_root_paddr` atomically. Bumps current_txg (per spec
- * semantics — every Create is also a commit boundary). Sets
- * prev_snap_id to the dataset's most-recent existing snapshot
- * (NO_PREV if this is the first).
+ * tree-root triple (`tree_root_paddr`, `root_gen`, `root_csum`)
+ * atomically. Bumps current_txg (per spec semantics — every Create
+ * is also a commit boundary). Sets prev_snap_id to the dataset's
+ * most-recent existing snapshot (NO_PREV if this is the first).
+ *
+ * 9.7-impl-3: the triple is the dataset's per-dataset btree_engine
+ * root, copied verbatim from the dataset entry's (di_tree_root,
+ * di_root_gen, di_root_csum). It is stored opaquely — the snapshot
+ * module never interprets it; stm_btree_engine_open (9.7-impl-4 /
+ * 9.7-impl-5) is where the triple is validated against the root
+ * node ciphertext. `root_csum` may be NULL — treated as a 32-byte
+ * all-zero csum (the convenient form for the "empty dataset"
+ * snapshot and for callers with no engine root to capture).
  *
  * `extent_txg` (P7-8): the sync.current_gen value at the moment of
  * Create. Captured into the entry as `extent_txg`. Used by send/
@@ -215,6 +239,8 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
                                  uint64_t dataset_id,
                                  const char *name,
                                  uint64_t tree_root_paddr,
+                                 uint64_t root_gen,
+                                 const uint8_t root_csum[32],
                                  uint64_t extent_txg,
                                  uint64_t *out_id);
 
@@ -615,9 +641,11 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
  *   44         4    flags (le32)
  *   48         2    name_len (le16) — 1..STM_SNAP_NAME_MAX
  *   50         2    pad (zero)
- *   52         L    name (UTF-8, no NUL)  L = name_len
- *   52+L       4    dead_count (le32) — 0..STM_SNAP_DEAD_LIST_MAX
- *   56+L     8*N    dead_paddrs (le64[N]) where N = dead_count
+ *   52         8    root_gen (le64) — engine root birth-gen (9.7-impl-3 v32)
+ *   60        32    root_csum[32] — BLAKE3-256 of root node ciphertext (v32)
+ *   92         L    name (UTF-8, no NUL)  L = name_len
+ *   92+L       4    dead_count (le32) — 0..STM_SNAP_DEAD_LIST_MAX
+ *   96+L     8*N    dead_paddrs (le64[N]) where N = dead_count
  *   --P7-CAS-4c v19 cold-dead tail:
  *   ...        4    cold_dead_count (le32) — 0..STM_SNAP_COLD_DEAD_LIST_MAX
  *   ...     32*N    cold_dead_hashes (32-byte content_hashes)
@@ -625,17 +653,23 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
  *   ...        4    boot_dead_count (le32) — 0..STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX
  *   ...      8*N    boot_dead_paddrs (le64[N]) — engine NODE paddrs
  *
- * Total per record at v31: 56 + name_len + 8*dead_count
+ * The (tree_root_paddr@8, root_gen@52, root_csum@60) triple is the
+ * snapshot's captured per-dataset btree_engine root (9.7-impl-3 v32).
+ * root_gen + root_csum sit at the end of the fixed prefix so the
+ * v31 offsets 0..52 stay byte-identical — only the prefix grew.
+ *
+ * Total per record at v32: 96 + name_len + 8*dead_count
  *                          + 4 + 32*cold_dead_count
  *                          + 4 + 8*boot_dead_count bytes.
- * Crypt + I/O follow the alloc_roots pattern. v13 → v14 is a hard
- * format break enforced by STM_UB_VERSION mismatch at uberblock
- * validation (uberblock.c returns STM_EBADVERSION); the snapshot
- * decoder is never reached on a v13 pool. The 52-byte fixed-prefix
- * length check in sp_decode_value is defense-in-depth at the
- * snapshot layer — pure-snapshot-record forgery is not in the threat
- * model since records are AEAD-validated under metadata_key, but
- * the length check rejects gross encoding drift cheaply.
+ * Crypt + I/O follow the alloc_roots pattern. Each STM_UB_VERSION
+ * bump that touches this layout is a hard format break enforced by
+ * the uberblock version check (uberblock.c returns STM_EBADVERSION
+ * on mismatch); the snapshot decoder is never reached on a pool of
+ * a different version. The 92-byte fixed-prefix length check in
+ * sp_decode_value is defense-in-depth at the snapshot layer —
+ * pure-snapshot-record forgery is not in the threat model since
+ * records are AEAD-validated under metadata_key, but the length
+ * check rejects gross encoding drift cheaply.
  */
 
 STM_MUST_USE

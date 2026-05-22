@@ -296,6 +296,8 @@ static stm_status snapshot_create_inner(stm_snapshot_index *idx,
                                            uint64_t dataset_id,
                                            const char *name,
                                            uint64_t tree_root_paddr,
+                                           uint64_t root_gen,
+                                           const uint8_t root_csum[32],
                                            uint64_t extent_txg,
                                            bool skip_chain_check,
                                            uint64_t *out_id) {
@@ -374,6 +376,12 @@ static stm_status snapshot_create_inner(stm_snapshot_index *idx,
     memcpy(s->e.name, name, name_len);
     s->e.name[name_len]  = '\0';
     s->e.tree_root_paddr = tree_root_paddr;
+    /* 9.7-impl-3: capture the per-dataset engine root triple verbatim.
+     * root_csum NULL ⇒ all-zero (append_slot_locked memset the slot,
+     * so the csum is already zero in that case). The triple is opaque
+     * to the snapshot module — not validated here. */
+    s->e.root_gen        = root_gen;
+    if (root_csum != NULL) memcpy(s->e.root_csum, root_csum, 32);
     s->e.created_txg     = idx->current_txg;
     s->e.extent_txg      = extent_txg;
     s->e.prev_snap_id    = prev_snap;
@@ -392,10 +400,13 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
                                  uint64_t dataset_id,
                                  const char *name,
                                  uint64_t tree_root_paddr,
+                                 uint64_t root_gen,
+                                 const uint8_t root_csum[32],
                                  uint64_t extent_txg,
                                  uint64_t *out_id) {
     return snapshot_create_inner(idx, dataset_id, name,
-                                    tree_root_paddr, extent_txg,
+                                    tree_root_paddr, root_gen, root_csum,
+                                    extent_txg,
                                     /*skip_chain_check=*/false, out_id);
 }
 
@@ -412,10 +423,13 @@ stm_status stm_snapshot_create_for_test(stm_snapshot_index *idx,
                                           uint64_t dataset_id,
                                           const char *name,
                                           uint64_t tree_root_paddr,
+                                          uint64_t root_gen,
+                                          const uint8_t root_csum[32],
                                           uint64_t extent_txg,
                                           uint64_t *out_id) {
     return snapshot_create_inner(idx, dataset_id, name,
-                                    tree_root_paddr, extent_txg,
+                                    tree_root_paddr, root_gen, root_csum,
+                                    extent_txg,
                                     /*skip_chain_check=*/true, out_id);
 }
 #endif /* STRATUM_BUILD_TESTING_HOOKS */
@@ -1027,8 +1041,12 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
 #define SP_KEY_LEN              8u
 /* P7-8 v14: SP_VAL_FIXED grew 44 → 52 to accommodate the new 8-byte
  * extent_txg field inserted between created_txg (off 16) and
- * prev_snap_id (off 32). Refuses v13 mounts via length check at decode. */
-#define SP_VAL_FIXED            52u                          /* before name[] */
+ * prev_snap_id (off 32).
+ * 9.7-impl-3 v32: SP_VAL_FIXED grew 52 → 92 — root_gen (8 bytes @ 52)
+ * + root_csum[32] (@ 60) appended at the END of the fixed prefix so
+ * the v31 offsets 0..52 stay byte-identical. Each format era refuses
+ * the prior via the SB version check before the decoder is reached. */
+#define SP_VAL_FIXED            92u                          /* before name[] */
 #define SP_DEAD_TAIL_FIXED      4u                            /* le32 dead_count */
 #define SP_DEAD_PADDR_BYTES     8u                            /* le64 paddr */
 /* P7-CAS-4c v19: cold-dead tail = 4 bytes count + 32 bytes per hash. */
@@ -1087,6 +1105,11 @@ static size_t sp_encode_value(const snapshot_slot *s,
     memcpy(out + 48, nl.v,   2);
     /* out[50..52) is pad; zero. */
     out[50] = 0; out[51] = 0;
+    /* 9.7-impl-3 v32: root_gen (@52) + root_csum[32] (@60) — the
+     * captured per-dataset engine root triple, opaque metadata. */
+    le64 rg = stm_store_le64(s->e.root_gen);
+    memcpy(out + 52, rg.v, 8);
+    memcpy(out + 60, s->e.root_csum, 32);
     if (s->e.name_len > 0) {
         memcpy(out + SP_VAL_FIXED, s->e.name, s->e.name_len);
     }
@@ -1133,7 +1156,7 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
                                      size_t in_len, snapshot_slot *out_slot) {
     if (in_len < SP_VAL_FIXED) return STM_ECORRUPT;
 
-    le64 ds, trp, ctxg, etxg, prev;
+    le64 ds, trp, ctxg, etxg, prev, rg;
     le32 hc, fl;
     le16 nl;
     memcpy(ds.v,   in + 0,  8);
@@ -1144,6 +1167,9 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
     memcpy(hc.v,   in + 40, 4);
     memcpy(fl.v,   in + 44, 4);
     memcpy(nl.v,   in + 48, 2);
+    /* 9.7-impl-3 v32: root_gen (@52) + root_csum[32] (@60). The
+     * in_len < SP_VAL_FIXED (now 92) guard above bounds both reads. */
+    memcpy(rg.v,   in + 52, 8);
 
     uint16_t name_len = stm_load_le16(nl);
     if (name_len > STM_SNAP_NAME_MAX) return STM_ECORRUPT;
@@ -1181,6 +1207,8 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
     out_slot->e.snapshot_id        = id;
     out_slot->e.dataset_id         = stm_load_le64(ds);
     out_slot->e.tree_root_paddr    = stm_load_le64(trp);
+    out_slot->e.root_gen           = stm_load_le64(rg);
+    memcpy(out_slot->e.root_csum, in + 60, 32);
     out_slot->e.created_txg        = stm_load_le64(ctxg);
     out_slot->e.extent_txg         = stm_load_le64(etxg);
     out_slot->e.prev_snap_id       = stm_load_le64(prev);

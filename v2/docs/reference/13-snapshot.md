@@ -39,10 +39,13 @@ written so `ub_snap_root` becomes non-zero).
 ### Mutation
 
 ```c
-stm_status stm_snapshot_create   (idx, dataset_id, name, tree_root_paddr, extent_txg, *out_id);
+stm_status stm_snapshot_create   (idx, dataset_id, name,
+                                  tree_root_paddr, root_gen, root_csum,
+                                  extent_txg, *out_id);
 stm_status stm_snapshot_delete   (idx, snapshot_id,
                                   **out_freed_paddrs, *out_freed_count,
-                                  **out_freed_cold_hashes, *out_freed_cold_count);
+                                  **out_freed_cold_hashes, *out_freed_cold_count,
+                                  **out_freed_boot_paddrs, *out_freed_boot_count);
 stm_status stm_snapshot_hold     (idx, snapshot_id);
 stm_status stm_snapshot_release  (idx, snapshot_id);
 stm_status stm_snapshot_mark_compromised   (idx, snapshot_id);   /* TLY-A5 */
@@ -56,6 +59,19 @@ All run under an internal `PTHREAD_MUTEX_ERRORCHECK` mutex. Same
 `created_txg` equals (post-bump) `current_txg`. `prev_snap_id` is
 auto-stamped to the most-recent PRESENT snapshot of the same
 `dataset_id` (or `STM_SNAP_NO_PREV = 0` if first).
+
+`Create` also captures the dataset's per-dataset `btree_engine`
+root as the `(tree_root_paddr, root_gen, root_csum)` triple
+(9.7-impl-3). The fs-level wrapper `stm_fs_create_snapshot` reads
+the triple from the dataset entry's `(di_tree_root, di_root_gen,
+di_root_csum)` *after* a `stm_sync_commit`, so the captured root
+is durable and reflects every write up to the snapshot point
+(a failed commit wedges the fs — R154 Q2). The snapshot module
+stores the triple opaquely — it is never interpreted here;
+`stm_btree_engine_open` validates it at the consuming chunks
+(9.7-impl-4 rollback / 9.7-impl-5 readable `.snaps`). `root_csum`
+may be passed NULL (⇒ all-zero); an all-zero triple is the "empty
+dataset" snapshot.
 
 `extent_txg` (P7-8) is a caller-supplied value that the impl
 captures verbatim into the entry. Production callers (sync-aware)
@@ -83,10 +99,15 @@ caller:
   32-byte strides calling `stm_cas_deref(cas, hash)` per entry
   to release the CAS refcount. Composes the cold-tier mirror of
   the paddr-tier free path.
+- `*out_freed_boot_paddrs` + `*out_freed_boot_count` (9.7-impl-2)
+  — the bootstrap-tier dead-list of superseded engine NODE
+  paddrs. Caller owns the malloc'd array (`free()` it) and MUST
+  reclaim every paddr through `stm_bootstrap_free` — **not**
+  `stm_alloc_free` (a distinct allocator class). The pair may be
+  passed NULL/NULL by pre-9.7 callers to disable the output.
 
-A clean-no-overwrites delete returns `*out_freed_paddrs = NULL`,
-`*out_freed_count = 0`, `*out_freed_cold_hashes = NULL`,
-`*out_freed_cold_count = 0`.
+A clean-no-overwrites delete returns all three buffer pointers
+NULL with their counts 0.
 
 `Hold` / `Release` increment / decrement `hold_count`. Holds
 persist across mount (matches ZFS semantics). Release of a
@@ -305,34 +326,50 @@ sentinel for "first in chain", never used as a key).
 ### Value (variable length)
 
 ```
-off            size      field
-  0              8       dataset_id        (le64; ≠ 0)
-  8              8       tree_root_paddr   (le64; STM_SNAP_NO_TREE_ROOT for stub)
- 16              8       created_txg       (le64; ≤ idx->current_txg)
- 24              8       extent_txg        (le64; ≤ sync.current_gen at Create — P7-8)
- 32              8       prev_snap_id      (le64; STM_SNAP_NO_PREV for chain head)
- 40              4       hold_count        (le32; persists across mount)
- 44              4       flags             (le32)
- 48              2       name_len          (le16; 1..STM_SNAP_NAME_MAX)
- 50              2       pad               (zero)
- 52              L       name              (UTF-8, no NUL)
- 52+L            4       dead_count        (le32; 0..STM_SNAP_DEAD_LIST_MAX)
- 56+L          8*N       dead_paddrs       (le64[N])  N = dead_count
- 56+L+8*N        4       cold_dead_count   (le32; 0..STM_SNAP_COLD_DEAD_LIST_MAX) — P7-CAS-4c v19
- 60+L+8*N    32*M       cold_dead_hashes   (uint8_t[M][32])  M = cold_dead_count
+off                 size   field
+  0                    8   dataset_id        (le64; ≠ 0)
+  8                    8   tree_root_paddr   (le64; engine root paddr — 0 = empty dataset)
+ 16                    8   created_txg       (le64; ≤ idx->current_txg)
+ 24                    8   extent_txg        (le64; ≤ sync.current_gen at Create — P7-8)
+ 32                    8   prev_snap_id      (le64; STM_SNAP_NO_PREV for chain head)
+ 40                    4   hold_count        (le32; persists across mount)
+ 44                    4   flags             (le32)
+ 48                    2   name_len          (le16; 1..STM_SNAP_NAME_MAX)
+ 50                    2   pad               (zero)
+ 52                    8   root_gen          (le64; engine root birth-gen — 9.7-impl-3 v32)
+ 60                   32   root_csum         (uint8_t[32]; BLAKE3 of root node ct — v32)
+ 92                    L   name              (UTF-8, no NUL)
+ 92+L                  4   dead_count        (le32; 0..STM_SNAP_DEAD_LIST_MAX)
+ 96+L                8*N   dead_paddrs       (le64[N])  N = dead_count
+ 96+L+8N               4   cold_dead_count   (le32; 0..STM_SNAP_COLD_DEAD_LIST_MAX) — P7-CAS-4c v19
+100+L+8N            32*M   cold_dead_hashes   (uint8_t[M][32])  M = cold_dead_count
+100+L+8N+32M           4   boot_dead_count   (le32; 0..STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX) — 9.7-impl-2 v31
+104+L+8N+32M         8*K   boot_dead_paddrs  (le64[K])  K = boot_dead_count — engine NODE paddrs
 ```
 
-Total: `56 + name_len + 8*N + 4 + 32*M` bytes (was `56 + name_len
-+ 8*N` pre-v19). `SP_VAL_FIXED == 52`; `SP_DEAD_TAIL_FIXED == 4`;
-`SP_COLD_TAIL_FIXED == 4`; `SP_COLD_HASH_BYTES == 32`. The
-v13→v14 bump was a HARD format break (added extent_txg + dead-
-list tail). The v18→v19 bump (P7-CAS-4c) appends the cold-dead-
-list tail past the existing layout — a v18 pool whose ub_version
-is flipped to v19 has snap values lacking the new 4-byte
-cold_dead_count field; the v19 decoder's length check `in_len <
-paddr_tail_end + SP_COLD_TAIL_FIXED` returns STM_ECORRUPT.
-Refused at mount via uniform STM_EBADVERSION (uberblock.c
-version gate) before the snap decoder runs.
+Total: `96 + name_len + 8*N + 4 + 32*M + 4 + 8*K` bytes.
+`SP_VAL_FIXED == 92`; `SP_DEAD_TAIL_FIXED == 4`;
+`SP_COLD_TAIL_FIXED == 4`; `SP_COLD_HASH_BYTES == 32`;
+`SP_BOOT_TAIL_FIXED == 4`; `SP_BOOT_PADDR_BYTES == 8`.
+
+The `(tree_root_paddr@8, root_gen@52, root_csum@60)` triple is the
+snapshot's captured per-dataset `btree_engine` root — a verbatim
+copy of the dataset entry's `(di_tree_root, di_root_gen,
+di_root_csum)` at Create time (9.7-impl-3). The snapshot module
+treats the triple as opaque metadata: it is faithfully stored and
+round-tripped, never interpreted. The real validation (root-node
+csum match) happens at `stm_btree_engine_open` in the consuming
+chunks (9.7-impl-4 rollback / 9.7-impl-5 readable `.snaps`). An
+all-zero triple is the "empty dataset" snapshot.
+
+Each STM_UB_VERSION bump that touches this layout is a HARD format
+break: v13→v14 added extent_txg + dead-list tail; v18→v19
+(P7-CAS-4c) appended the cold-dead tail; v30→v31 (9.7-impl-2)
+appended the bootstrap-dead tail; v31→v32 (9.7-impl-3) grew the
+fixed prefix 52→92 for root_gen + root_csum. A pool of the wrong
+version is refused at mount via uniform STM_EBADVERSION (uberblock.c
+version gate) before the snap decoder runs; the decoder's own
+length checks are defense-in-depth against gross encoding drift.
 
 ### Crypt + Merkle
 
@@ -389,7 +426,7 @@ tree uses `STM_BPTR_KIND_DATASET = 9` (added in P6-clone).
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_snapshot` | 41 | Lifecycle (create / delete / hold / release w/ all error paths); concurrent stress on per-dataset + same-dataset chains; SnapIdMonotonic / BirthTxgMonotonic / HoldPreventsDelete / TreeRootImmutable / ChainTxgOrdered / ChainAcyclic; persist roundtrip including persisted holds + ABSENT slots; idempotent commit; tamper detection (csum/key); next_id + current_txg seeding from on-disk + UB; **dead-list lifecycle** (overwrite no-snap → caller frees; overwrite with-snap → appended to most-recent; cross-dataset isolation; cap at STM_SNAP_DEAD_LIST_MAX → ENOSPC; duplicate paddr → EINVAL (R33 P2); arg validation; delete returns the dead-list and clears the slot; refused delete keeps the dead-list intact; persist roundtrip with non-empty dead-list; idempotent commit byte-identicality with dead-list). |
+| `test_snapshot` | 56 | Lifecycle (create / delete / hold / release w/ all error paths); concurrent stress on per-dataset + same-dataset chains; SnapIdMonotonic / BirthTxgMonotonic / HoldPreventsDelete / TreeRootImmutable / ChainTxgOrdered / ChainAcyclic; persist roundtrip including persisted holds + ABSENT slots; idempotent commit; tamper detection (csum/key); next_id + current_txg seeding from on-disk + UB; **dead-list lifecycle** (overwrite no-snap → caller frees; overwrite with-snap → appended to most-recent; cross-dataset isolation; cap at STM_SNAP_DEAD_LIST_MAX → ENOSPC; duplicate paddr → EINVAL (R33 P2); arg validation; delete returns the dead-list and clears the slot; refused delete keeps the dead-list intact; persist roundtrip with non-empty dead-list; idempotent commit byte-identicality with dead-list); **bootstrap-tier dead-list** (9.7-impl-2 — overwrite/count/cap/dup/cross-tier APIs); **9.7-impl-3 tree-root triple** (`snap_create_captures_root_triple` — verbatim capture + NULL-csum⇒zero; `snapshot_persist_tree_root_triple_roundtrip` — triple survives v32 encode/decode). |
 | `test_sync` | included | Snap-delete cb integration covered through dataset persistence + clone tests (sync_snap_delete_refused_with_clone, sync_clone_state_survives_mount). |
 
 ## Status

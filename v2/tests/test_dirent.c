@@ -15,7 +15,7 @@
  *     (R71 P1-1 lesson — writer-side guards mirror decoder-side guards).
  *   - D1 invariant from dirent's side: per-dataset engines distinct;
  *     same-key lookups across datasets see independent values.
- *   - On-disk layout sanity: STM_UB_VERSION compile-time at 30.
+ *   - On-disk layout sanity: STM_UB_VERSION compile-time at 32.
  *
  * 9.7-impl-1c-iii: the dirent module no longer owns its own engine —
  * records live in each dataset's per-dataset btree_engine, resolved
@@ -395,12 +395,12 @@ STM_TEST(dirent_arg_validation) {
 /* test_fs.                                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(dirent_ub_version_is_v31) {
-    /* 9.7-impl-2-routing bumped STM_UB_VERSION 30 → 31 for the new
-     * snap-record bootstrap-tier dead-list tail. The dirent layer's
+STM_TEST(dirent_ub_version_is_v32) {
+    /* 9.7-impl-3 bumped STM_UB_VERSION 31 → 32 for the snap-record
+     * tree-root triple (root_gen + root_csum). The dirent layer's
      * on-disk format is unchanged since v25 but rides the latest
      * version constant. */
-    STM_ASSERT_EQ(STM_UB_VERSION, 31u);
+    STM_ASSERT_EQ(STM_UB_VERSION, 32u);
 }
 
 /* R73 P2-1: stm_dirent_drop_for_dir bulk-removes every record keyed

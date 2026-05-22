@@ -220,6 +220,7 @@ STM_TEST(incremental_send_filters_by_extent_txg) {
     uint64_t snap_a = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_src, /*ds*/1, "snap_a",
                                           /*tree_root_paddr=*/0,
+                                          0, NULL,
                                           stm_sync_current_gen(s_src),
                                           &snap_a));
 
@@ -237,6 +238,7 @@ STM_TEST(incremental_send_filters_by_extent_txg) {
     uint64_t snap_b = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_src, /*ds*/1, "snap_b",
                                           /*tree_root_paddr=*/0,
+                                          0, NULL,
                                           stm_sync_current_gen(s_src),
                                           &snap_b));
 
@@ -293,6 +295,7 @@ STM_TEST(incremental_send_rejects_swapped_from_to) {
 
     uint64_t snap_a = 0;
     STM_ASSERT_OK(stm_snapshot_create(sidx, /*ds*/1, "a", 0,
+                                          0, NULL,
                                           stm_sync_current_gen(s), &snap_a));
     STM_ASSERT_OK(stm_sync_commit(s));
 
@@ -301,6 +304,7 @@ STM_TEST(incremental_send_rejects_swapped_from_to) {
 
     uint64_t snap_b = 0;
     STM_ASSERT_OK(stm_snapshot_create(sidx, /*ds*/1, "b", 0,
+                                          0, NULL,
                                           stm_sync_current_gen(s), &snap_b));
 
     /* from=snap_b (newer) → to=snap_a (older): inverted. */
@@ -326,8 +330,10 @@ STM_TEST(incremental_send_equal_extent_txg_chain_accepted_send_rejected) {
     uint64_t gen_at_create = stm_sync_current_gen(s);
     uint64_t snap_a = 0, snap_b = 0;
     STM_ASSERT_OK(stm_snapshot_create(sidx, /*ds*/1, "a", 0,
+                                          0, NULL,
                                           gen_at_create, &snap_a));
     STM_ASSERT_OK(stm_snapshot_create(sidx, /*ds*/1, "b", 0,
+                                          0, NULL,
                                           gen_at_create, &snap_b));
 
     /* Roundtrip: commit + unmount + remount; chain validator accepts
@@ -564,6 +570,7 @@ STM_TEST(incremental_send_includes_reflink_in_window) {
     uint64_t from_S = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_src, /*ds*/1, "from",
                                           /*tree_root_paddr=*/0,
+                                          0, NULL,
                                           stm_sync_current_gen(s_src),
                                           &from_S));
     STM_ASSERT_OK(stm_sync_commit(s_src));
@@ -579,6 +586,7 @@ STM_TEST(incremental_send_includes_reflink_in_window) {
     uint64_t to_S = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_src, /*ds*/1, "to",
                                           /*tree_root_paddr=*/0,
+                                          0, NULL,
                                           stm_sync_current_gen(s_src),
                                           &to_S));
     STM_ASSERT_OK(stm_sync_commit(s_src));
@@ -1687,6 +1695,7 @@ STM_TEST(p7val3_full_then_chained_incremental_roundtrip) {
 
     uint64_t snap_1 = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_src, 1, "v3_snap_1", 0,
+                                          0, NULL,
                                           stm_sync_current_gen(s_src), &snap_1));
     STM_ASSERT_OK(stm_sync_commit(s_src));
 
@@ -1697,6 +1706,7 @@ STM_TEST(p7val3_full_then_chained_incremental_roundtrip) {
 
     uint64_t snap_2 = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_src, 1, "v3_snap_2", 0,
+                                          0, NULL,
                                           stm_sync_current_gen(s_src), &snap_2));
     STM_ASSERT_OK(stm_sync_commit(s_src));
 
@@ -1707,6 +1717,7 @@ STM_TEST(p7val3_full_then_chained_incremental_roundtrip) {
 
     uint64_t snap_3 = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_src, 1, "v3_snap_3", 0,
+                                          0, NULL,
                                           stm_sync_current_gen(s_src), &snap_3));
     STM_ASSERT_OK(stm_sync_commit(s_src));
 
@@ -1747,6 +1758,7 @@ STM_TEST(p7val3_full_then_chained_incremental_roundtrip) {
 
     uint64_t snap_4 = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_src, 1, "v3_snap_4", 0,
+                                          0, NULL,
                                           stm_sync_current_gen(s_src), &snap_4));
     STM_ASSERT_OK(stm_sync_commit(s_src));
 
@@ -1784,6 +1796,7 @@ STM_TEST(p7val3_full_then_chained_incremental_roundtrip) {
     stm_snapshot_index *snap_tgt = stm_sync_snapshot_index(s_tgt);
     uint64_t snap_tgt_4 = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_tgt, 1, "v3_snap_4_replica", 0,
+                                          0, NULL,
                                           stm_sync_current_gen(s_tgt),
                                           &snap_tgt_4));
     STM_ASSERT_OK(stm_sync_commit(s_tgt));
@@ -1796,6 +1809,7 @@ STM_TEST(p7val3_full_then_chained_incremental_roundtrip) {
 
     uint64_t snap_5 = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap_src, 1, "v3_snap_5", 0,
+                                          0, NULL,
                                           stm_sync_current_gen(s_src), &snap_5));
     STM_ASSERT_OK(stm_sync_commit(s_src));
     {
