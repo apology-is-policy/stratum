@@ -38,9 +38,28 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: 9.7-impl-4 — the snapshot rollback mechanism — shipped +
-  R160 audit closed. R160 verdict: **0 P0, 1 P1, 2 P2, 4 P3**; the P1
-  + both P2s fixed in the close commit.
+- **Tip**: 9.7-impl-4b — rollback metadata-node reclamation — shipped +
+  R161 audit closed. R161 verdict: **0 P0, 0 P1, 0 P2, 3 P3**; all 3
+  P3s (cosmetic — an overflow guard, a doc + a comment) closed in the
+  close commit.
+  - **9.7-impl-4b** (`ac83d4f` + R161 close): `stm_fs_rollback_snapshot`
+    now reclaims the post-snapshot metadata-node divergence instead of
+    leaking it. After the swap + dead-list clear,
+    `fs_rollback_reclaim_diverged_nodes` walks the pre-rollback live
+    tree AND the snapshot tree (`stm_dataset_index_collect_engine_paddrs_at`
+    → `stm_btree_engine_walk_paddrs` — two new APIs; a node + spill-block
+    paddr enumerator descending under the same Merkle/AEAD gate as
+    `stm_btree_engine_verify`), set-differences the two paddr sets, and
+    `stm_bootstrap_free`s `old \ snap` (the boot-tier projection of
+    `dead_list.tla::Rollback`'s live-divergence term). The COW-shared
+    nodes (`old ∩ snap`, which ARE the snapshot's tree post-swap) are
+    never freed; either walk failing ⇒ nothing freed (best-effort — an
+    unreclaimed block leaks, a space cost, never a corruption). **No
+    STM_UB_VERSION bump.** Forward-noted: 9.7-impl-4c (data-extent +
+    cold-extent tiers + the cleared dead-list garbage), 9.7-impl-4d
+    (lift the newer-snapshot refusal). R161 traced both catastrophic
+    claims — never-free-a-shared-node + AEAD-nonce uniqueness —
+    exhaustively; both hold.
   - **9.7-impl-4** (`585b5ee` + R160 close): `stm_fs_rollback_snapshot`
     filled in (the TLY-A5 `STM_ENOTSUPPORTED` stub is retired).
     Mechanism is **validate-then-swap**: refuse if a newer snapshot
@@ -88,9 +107,11 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 63/64 standalone** — the lone failure is the documented
     `test_compound_ops_concurrent` rename/cfr/reflink/write-truncate
     flake ([[flake-per-inode-cfr-concurrent]]), confirmed pre-existing
-    by stash + retest at the clean tip. `test_snapshot` 58,
-    `test_dataset` 73, `test_fs` 180, `test_ctl` 149.
-  - **What's next**: 9.7-impl-4b (rollback block reclamation + lift
+    (the failing case wandered cfr↔rename across runs; impl-4b touches
+    neither path). `test_btree_engine` 47, `test_snapshot` 58,
+    `test_dataset` 75, `test_fs` 181, `test_ctl` 149.
+  - **What's next**: 9.7-impl-4c (rollback data-extent + cold-extent
+    reclamation + the cleared dead-list garbage) → 9.7-impl-4d (lift
     the newer-snapshot refusal) → 9.7-impl-5 (readable `.snaps/`).
 
 - **Pre-tip-0**: Phase 9.7-impl-1c-vi (`3afa915`) — the pool-global-engine

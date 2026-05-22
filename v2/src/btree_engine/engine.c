@@ -936,7 +936,11 @@ static stm_status engine_walk_paddrs_subtree(
 
     /* Internal: recurse through every child (children are not loaded
      * into n->children[i].mem by eng_node_read — the walk re-reads each
-     * from its bptr, so eng_node_free of one node frees no subtree). */
+     * from its bptr, so eng_node_free of one node frees no subtree).
+     * R161 P3-2: eng_node_read's child_load_cb already rejected any
+     * child bptr whose kind byte is not LEAF/INTERNAL (STM_ECORRUPT at
+     * decode), so this walk inherits eng_verify_subtree's explicit
+     * child-kind gate transitively — a bad-kind parent never decodes. */
     uint32_t nc = n->n_pivots + 1u;
     for (uint32_t i = 0; s == STM_OK && i < nc && !*stopped; i++) {
         s = engine_walk_paddrs_subtree(eng, n->children[i].paddr,

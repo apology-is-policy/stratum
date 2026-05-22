@@ -396,6 +396,11 @@ typedef int (*stm_btree_engine_paddr_cb)(uint64_t paddr, void *ctx);
  * *created*, never-flushed tree — an engine *opened* at a triple always
  * has one), STM_EBUSY during an un-finalized commit flush, STM_ECORRUPT
  * / STM_EBADTAG / STM_ENOMEM / device errors otherwise.
+ *
+ * A `cb` that aborts the walk for an error of its OWN (rather than a
+ * deliberate early stop) MUST record that error in `ctx`: the walk
+ * returns STM_OK on any cb-initiated stop, so a caller cannot otherwise
+ * distinguish a complete walk from a cb-truncated one.
  */
 STM_MUST_USE
 stm_status stm_btree_engine_walk_paddrs(stm_btree_engine *eng,

@@ -6417,6 +6417,11 @@ static int fs_rb_paddr_collect_cb(uint64_t paddr, void *ctx)
     fs_rb_paddr_set *set = ctx;
     if (set->n == set->cap) {
         size_t ncap = set->cap ? set->cap * 2u : 128u;
+        /* R161 P3-1: overflow guard — route an oversize grow through the
+         * same `oom` "set incomplete, free nothing" signal. Cosmetic
+         * defense-in-depth; unreachable in practice (the engine-node
+         * count is bounded far below SIZE_MAX / 8 by the device size). */
+        if (ncap > SIZE_MAX / sizeof *set->v) { set->oom = true; return 1; }
         uint64_t *g = realloc(set->v, ncap * sizeof *g);
         if (!g) { set->oom = true; return 1; }   /* stop the walk */
         set->v   = g;
