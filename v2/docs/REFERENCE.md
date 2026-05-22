@@ -38,8 +38,10 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: 9.7-impl-4c — rollback data-extent reclamation — shipped;
-  R162 audit pending.
+- **Tip**: 9.7-impl-4c — rollback data-extent reclamation — shipped +
+  R162 audit closed. R162 verdict: **0 P0, 0 P1, 0 P2, 3 P3**; all 3
+  P3s (cosmetic — a dedup-vs-refcount doc note, an inert struct field,
+  a stale doc count) closed in the close commit `ce83681`.
   - **9.7-impl-4c**: `stm_fs_rollback_snapshot` now also reclaims the
     post-snapshot DATA-extent divergence (the `stm_alloc`-class
     HOT-extent replica blocks) — the data-tier sibling of impl-4b's
