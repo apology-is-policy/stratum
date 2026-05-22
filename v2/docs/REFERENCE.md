@@ -38,52 +38,41 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: R157 audit close — 9.7-impl-1 (the full 1a + 1b + 1c-i..vi
-  series) is now signed off. Verdict: **0 P0, 0 P1, 2 P2, 7 P3**. Both
-  P2s and four of the seven P3s applied inline; three P3s acknowledged
-  as forward-notes (P3-1 M-cascade trio tests, P3-2 close-engine pending
-  state, P3-6 misleading finalize comment).
-  - **P2-1 — conditional `idx->dirty` in `commit_engines_flush`**: the
-    success path now compares the new triple against `saved_*` (= the
-    prior durable triple). A clean-tree engine flush returns prior
-    `(paddr, gen, csum)` verbatim; stamping byte-identical values no
-    longer marks the dataset_index dirty. Closes the perf regression
-    where every `stm_sync_commit` cycle after the first metadata op
-    forced fresh-paddr allocation for the dataset-index tree root, AND
-    closes the latent retry-safety regression against the
-    `quorum.tla::ContentQuorumAtGen` byte-identical-UB invariant the
-    dataset.h docstring already pinned.
-  - **P2-2 — empty-sentinel decoder gap**: `ds_decode_dataset_value`
-    now refuses partial-zero state (R71 P1-1 symmetry doctrine carry).
-    The "empty dataset" sentinel requires ALL THREE fields zero
-    (di_tree_root, di_root_gen, di_root_csum); writer never produces
-    partial state, but the decoder now refuses the latent class with
-    STM_ECORRUPT. Closes the integrity-chain conceptual hole.
-  - **P3-3 — forward-note** at `stm_dataset_destroy`: a future
-    public `stm_fs_destroy_dataset` API MUST reconcile the silent
-    drop of uncommitted engine state (refuse / force-flush / walk-
-    and-free-paddrs). Today's only callers are the rollback paths
-    in `stm_fs_create_dataset` where the engine has never been
-    opened — destroy is safe.
-  - **P3-4 — zero saved_* on failure-exit slot** in
-    `commit_engines_flush`: the failing slot's `saved_*` were written
-    just before the flush call; on failure they're now zeroed for
-    symmetry with abort + finalize cleanup so future defense-in-depth
-    audits don't confuse leftover saved_* with un-finalized pending
-    state.
-  - **P3-5 — conditional rollback dirty**: the failure-rollback branch
-    now tracks `restored_any` and only marks `idx->dirty = true` if a
-    prior slot was actually restored. The i == 0 case touches no prior
-    state — no dirty bump needed.
-  - **P3-7 — super.h v30 doc-comment update**: the v29→v30 doc block
-    now has a 1c-vi sub-paragraph documenting the four UB fields'
-    reserved-zero status + layout-compat contract.
-  - **ctest 64/64 GREEN standalone** at this tip; `test_dataset`
-    (71 tests) and `test_sync` (28 tests) verified post-fix. The
-    pre-existing `test_compound_ops_concurrent` flake
-    ([[flake-per-inode-cfr-concurrent]]) is unchanged — verified by
-    stash + retest at the pre-R157 tip.
-  - **What's next**: 9.7-impl-2 (snapshot-aware COW free) → R158.
+- **Tip**: R159 audit close — 9.7-impl-3 (snapshot-create captures
+  the real per-dataset tree-root triple) signed off. Verdict:
+  **0 P0, 0 P1, 1 P2, 3 P3**.
+  - **9.7-impl-3** (`7e67ded`): `stm_snapshot_entry` +
+    `stm_snapshot_create` / `_for_test` gained `root_gen` +
+    `root_csum[32]`. `stm_fs_create_snapshot` runs `stm_sync_commit`
+    then captures the dataset entry's real `(di_tree_root,
+    di_root_gen, di_root_csum)` triple — replacing the
+    `tree_root_paddr=0` stub. Snap-record fixed prefix grew 52→92
+    (`root_gen` @ 52, `root_csum` @ 60); **STM_UB_VERSION 31→32**.
+    The snapshot module stores the triple OPAQUELY (faithful
+    transport) — validation is deferred to `stm_btree_engine_open`
+    at the consuming chunks (impl-4 / impl-5). `root_csum` NULL ⇒
+    all-zero; an all-zero triple is the valid empty-dataset snapshot.
+  - **R159 P2** — failed-precondition snapshot-create forced a
+    pool-wide commit: the dataset-presence gate now runs BEFORE
+    `stm_sync_commit`, so an invalid `dataset_id` fails with no
+    durable side effect. Fixed inline.
+  - **R159 P3-2 / P3-3** fixed inline (`phase-9.7-design.md` §5
+    stale mount-refusal rule + version; this REFERENCE.md drift).
+    **R159 P3-1** forward-noted: `sp_decode_value` deliberately omits
+    the dataset decoder's partial-zero check — the snapshot module's
+    faithful-transport posture is internally symmetric (no writer
+    check, no decoder check); the consumer validates.
+  - **9.7-impl-2** (`4b73f23` + `2176db0`, R158): snapshot-aware COW
+    free — superseded engine NODE paddrs route into a per-snap
+    bootstrap-tier dead-list (allocator-class-aware). STM_UB_VERSION
+    30→31.
+  - **ctest 63/64 standalone** — the lone failure is the documented
+    `test_compound_ops_concurrent` rename/cfr flake
+    ([[flake-per-inode-cfr-concurrent]]); the impl-3-exercising
+    `compound_ops_concurrent_writer_reader_no_deadlock_no_tear`
+    passes. `test_snapshot` 56 tests, `test_fs` 41+.
+  - **What's next**: 9.7-impl-4 (rollback mechanism — replaces the
+    TLY-A5 stub) → R160.
 
 - **Pre-tip-0**: Phase 9.7-impl-1c-vi (`3afa915`) — the pool-global-engine
   retirement closes. The four `stm_sync` mirror fields

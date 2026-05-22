@@ -302,9 +302,31 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
 }
 ```
 
-`stm_snapshot_create`'s signature gains `root_gen` + `root_csum`; the on-disk snap-entry format gains the two fields. **STM_UB_VERSION 30**.
+`stm_snapshot_create`'s signature gains `root_gen` + `root_csum`; the on-disk snap-entry format gains the two fields.
 
-`STM_SNAP_NO_TREE_ROOT` (sentinel reserved at snapshot.h:79, currently unused) gains a meaning: a snap entry with `tree_root_paddr == STM_SNAP_NO_TREE_ROOT` is a legacy / never-captured entry, which a 9.7 pool refuses on mount with `STM_ECORRUPT` (no v29 pool should reach a v30 mount because the UB-version bump is enforced).
+> **As-built note (9.7-impl-3, R159 P3-2).** Two corrections to this
+> section as originally drafted:
+>
+> 1. **Version.** `STM_UB_VERSION` landed at **32** for impl-3, not
+>    30. The actual sequence is 29→30 (impl-1c) → 31 (impl-2-routing)
+>    → 32 (impl-3). The snap-record fixed prefix grew 52→92 bytes —
+>    `root_gen` at offset 52, `root_csum[32]` at offset 60, appended
+>    so the v31 offsets 0..52 stay byte-identical.
+> 2. **No `STM_SNAP_NO_TREE_ROOT` mount-refusal rule.** The original
+>    draft proposed refusing, on mount with `STM_ECORRUPT`, any snap
+>    entry whose `tree_root_paddr == STM_SNAP_NO_TREE_ROOT`. That
+>    rule was **retired**: `STM_SNAP_NO_TREE_ROOT == 0`, and an
+>    *empty dataset*'s `di_tree_root` is also 0, so the rule would
+>    reject every legitimate snapshot of an empty dataset. impl-3
+>    instead treats the captured triple as **opaque** — the snapshot
+>    module stores it faithfully and never interprets it; the real
+>    validation (root-node csum match) happens at
+>    `stm_btree_engine_open` in the consuming chunks (impl-4
+>    rollback / impl-5 readable `.snaps`). An all-zero
+>    `(tree_root_paddr, root_gen, root_csum)` triple is the valid
+>    "empty dataset" snapshot, mirroring the dataset entry's
+>    empty-sentinel (R157 P2-2). A future impl-4/-5 mount path MUST
+>    NOT reintroduce the refusal rule.
 
 ## 6 — Rollback mechanism (impl-4)
 

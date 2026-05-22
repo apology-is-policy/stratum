@@ -6068,6 +6068,35 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
+    /* R105 P3-2 gate (R159 P2: BEFORE the commit): validate that
+     * dataset_id names a PRESENT dataset. The underlying snapshot.c
+     * uses dataset_id as an opaque bucket-key without lookup, so
+     * without this gate a non-/ctl/ caller (CLI, FUSE, direct
+     * embedder) could create an orphan snapshot record keyed at a
+     * never-registered dataset_id. The /ctl/ vops_walk + vops_open
+     * paths already pre-validate; this is defense-in-depth at the
+     * public-API trust boundary.
+     *
+     * R159 P2: the gate runs BEFORE the stm_sync_commit below so an
+     * invalid dataset_id fails with NO durable side effect (parity
+     * with pre-9.7-impl-3). Committing first would force a pool-wide
+     * three-phase commit + uberblock write + fsync before returning
+     * STM_ENOENT — a wear/IOPS-amplification hazard on the public
+     * API and a surprising "failed op bumped fs->gen". */
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ECORRUPT;
+    }
+    {
+        stm_dataset_entry de_gate;
+        stm_status pgrc = stm_dataset_lookup(didx, dataset_id, &de_gate);
+        if (pgrc != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return pgrc;     /* STM_ENOENT for a missing dataset */
+        }
+    }
+
     /* 9.7-impl-3: commit the per-dataset engine cascade so the
      * dataset's (di_tree_root, di_root_gen, di_root_csum) triple is
      * DURABLE and reflects the just-flushed writes. A snapshot must
@@ -6092,22 +6121,12 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
-    /* R105 P3-2 gate + 9.7-impl-3 capture: look up the dataset entry
-     * AFTER the commit so its triple reflects the committed engine
-     * root. The lookup doubles as the PRESENT-dataset validation
-     * gate — the underlying snapshot.c uses dataset_id as an opaque
-     * bucket-key without lookup, so without this gate a non-/ctl/
-     * caller (CLI, FUSE, direct embedder) could create an orphan
-     * snapshot record keyed at a never-registered dataset_id.
-     * STM_ENOENT propagates for a missing dataset. The /ctl/
-     * vops_walk + vops_open paths already perform the lookup, so the
-     * gate is unreachable through /ctl/ today; it is defense-in-depth
-     * at the public-API trust boundary. */
-    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
-    if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_ECORRUPT;
-    }
+    /* 9.7-impl-3 capture: re-look-up the dataset entry AFTER the
+     * commit so its triple reflects the committed engine root. The
+     * dataset table cannot change between the gate above and here —
+     * fs->global wrlock is held continuously and dataset-table
+     * mutators are EX-takers — so this re-lookup is purely to pick
+     * up the post-commit triple. */
     stm_dataset_entry de;
     stm_status drc = stm_dataset_lookup(didx, dataset_id, &de);
     if (drc != STM_OK) {
