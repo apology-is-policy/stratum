@@ -2754,3 +2754,84 @@ stm_status stm_extent_index_collect_engine_data_paddrs_at(
     if (rc != STM_OK) return rc;
     return gc.err;   /* a per-value decode failure inside the adapter */
 }
+
+/* ------------------------------------------------------------------ */
+/* 9.7-impl-4c-ii: rollback COLD-extent (CAS tier) reclamation —       */
+/* enumerate every COLD extent record of a frozen tree.                */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    stm_extent_cold_record_cb user_cb;
+    void                     *user_ctx;
+    uint64_t                  ds;          /* the tree's dataset id     */
+    stm_status                err;
+} ex_collect_cold_ctx;
+
+/* stm_btree_engine_iter_cb — decode one extent value, emit it if COLD.
+ * A decode failure aborts the scan via gc->err. A nonzero user-cb
+ * return halts the scan with no error. HOT records are decoded +
+ * validated (so a corrupt HOT value still aborts the scan) but emit
+ * nothing — the HOT (stm_alloc) tier is reclaimed by the sibling
+ * ex_collect_data_adapter. */
+static int ex_collect_cold_adapter(const void *k, size_t klen,
+                                      const void *v, size_t vlen,
+                                      void *ctx_) {
+    ex_collect_cold_ctx *gc = ctx_;
+    uint64_t ino = 0, off = 0;
+    stm_status ks = ex_decode_key(k, klen, &ino, &off);
+    if (ks != STM_OK) { gc->err = ks; return 1; }
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = ex_decode_value(v, vlen, gc->ds, ino, off, &r);
+    if (vs != STM_OK) { gc->err = vs; return 1; }
+    if (r.kind == STM_EXTENT_KIND_COLD) {
+        stm_extent_cold_ref cr;
+        memset(&cr, 0, sizeof cr);
+        cr.ino      = ino;
+        cr.off      = off;
+        memcpy(cr.content_hash, r.content_hash, STM_EXTENT_HASH_LEN);
+        cr.gen      = r.gen;
+        cr.link_gen = r.link_gen;
+        if (gc->user_cb(&cr, gc->user_ctx) != 0)
+            return 1;          /* user cb halted the scan */
+    }
+    return 0;
+}
+
+stm_status stm_extent_index_collect_engine_cold_records_at(
+        stm_extent_index *idx, uint64_t dataset_id,
+        uint64_t root_paddr, uint64_t root_gen, const uint8_t root_csum[32],
+        stm_extent_cold_record_cb cb, void *cb_ctx) {
+    if (!idx || !cb) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    if (idx->ds_idx == NULL) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+
+    /* EXTENT subspace bounds: [tag||0||0 .. tag||MAX||MAX] — the same
+     * inclusive prefix range ex_global_walk_locked scans. */
+    uint8_t lo[EX_KEY_LEN], hi[EX_KEY_LEN];
+    stm_status k1 = ex_encode_key(0u,         0u,         lo);
+    stm_status k2 = ex_encode_key(UINT64_MAX, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK) {
+        must_unlock(lock);
+        return k1 != STM_OK ? k1 : k2;
+    }
+
+    ex_collect_cold_ctx gc = { .user_cb = cb, .user_ctx = cb_ctx,
+                                 .ds = dataset_id, .err = STM_OK };
+    /* Delegate the throwaway-engine open + bounded scan to the dataset
+     * index. Lock order: extent idx->lock (held) -> dataset idx->lock
+     * (taken inside) — the same order ex_global_walk_locked uses. */
+    stm_status rc = stm_dataset_index_scan_engine_range_at(
+            idx->ds_idx, dataset_id, root_paddr, root_gen, root_csum,
+            lo, EX_KEY_LEN, hi, EX_KEY_LEN,
+            ex_collect_cold_adapter, &gc);
+    must_unlock(lock);
+    if (rc != STM_OK) return rc;
+    return gc.err;   /* a per-value decode failure inside the adapter */
+}

@@ -181,6 +181,41 @@ snapshot boundary is referenced by a snapshot-tree extent, so it
 lands in the snapshot set and the difference excludes it. An all-zero
 triple enumerates nothing (`STM_OK`, `cb` never invoked).
 
+### Cold-extent rollback reclamation (9.7-impl-4c-ii)
+
+```c
+typedef struct {
+    uint64_t ino, off;
+    uint8_t  content_hash[32];
+    uint64_t gen, link_gen;
+} stm_extent_cold_ref;
+
+stm_status stm_extent_index_collect_engine_cold_records_at(
+        idx, dataset_id, root_paddr, root_gen, root_csum[32],
+        stm_extent_cold_record_cb cb, void *cb_ctx);
+```
+
+`collect_engine_cold_records_at` is the COLD-tier sibling of
+`collect_engine_data_paddrs_at`: the same throwaway-engine
+EXTENT-subspace walk, but it emits one `stm_extent_cold_ref` per COLD
+record (HOT extents are decoded + validated but contribute nothing).
+Each record carries its logical key `(ino, off)`, its CAS
+`content_hash`, and the `(gen, link_gen)` identity pair.
+
+`stm_fs_rollback_snapshot`'s `fs_rollback_reclaim_diverged_cold` calls
+it on the pre-rollback live root AND the snapshot root, then merges
+the two record sets by `(ino, off)` and `stm_cas_deref`s each old-tree
+COLD record that is NOT the same logical record as a snapshot-tree
+record at the same key. A **per-key structural merge, not a per-hash
+count subtraction**: content-defined dedup lets distinct records share
+a hash, so subtracting per-hash counts would cancel a diverged record
+against an unrelated snapshot record and leak the refcount. `link_gen`
+— the gen at which a record entered the live extent index — is the
+load-bearing identity discriminator (snapshot creation forces a
+commit, so a snapshot's records all carry `link_gen ≤` the snapshot
+gen while a post-snapshot diverged record carries a strictly higher
+one). An all-zero triple enumerates nothing (`STM_OK`).
+
 ### Lifecycle
 
 ```c
@@ -508,8 +543,8 @@ layout changes.
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_extent_index` | 57 | Lifecycle (create / close / advance_txg with all error paths including R34 P3-2 NULL-idx parity). Write — basic insert + lookup roundtrip; refuses zero-len, zero-args, off+len overflow, future write_gen, overlap with existing in-ino, paddr already-in-use. Overwrite — into hole returns no drops; drops one extent; drops multiple overlapping; doesn't touch other (ds, ino); refuses paddr-cycle (new_paddr equals a dropped extent); refuses paddr-collision with live extent in different (ds, ino); refuses bad args. Truncate — drops past-size extents; truncate-to-zero drops all; no drops when new_size > max extent end; doesn't touch other (ds, ino). DeleteFile — drops all in (ds, ino); idempotent on empty (ds, ino). Lookup — hole boundaries (off < extent.off, off ≥ extent.off+extent.len, off=last byte); unknown (ds, ino) returns ENOENT. Iter — returns off-ascending despite insertion order; early terminate on cb=false; filters by (ds, ino). Multi-replica write / overwrite / truncate / reflink (P7-6 / P7-16). ERRORCHECK reentry — cb-runs-under-lock smoke test. Concurrent stress — 4 workers × 256 ops each on disjoint (ds, ino) all serialize cleanly. **R34 P2-1 regression** — out-arg zeroing on `idx==NULL` early return for overwrite / truncate / delete_file. **9.7-impl-4c `collect_engine_data_paddrs_at`** (2 tests) — arg validation (NULL idx / NULL cb / dataset_id=0 / dataset-index-unattached EINVAL); all-zero "empty dataset" triple → STM_OK with cb never invoked (the real-tree walk on committed trees is covered end-to-end by `test_fs`'s rollback-reclaim integration test). |
-| `test_fs` | 182 | The fs-integration suite (cross-referenced here for the data-path coverage it exercises via the extent index). Extent-relevant: write/read 4 KiB roundtrip; read-hole returns zeros; write-args validation; COW-drop routing (to alloc-free without a snapshot, to the snap dead-list with one); cross-mount durability; multi-extent per ino; **9.7-impl-4c** `fs_rollback_reclaims_diverged_data_extents` (rollback reclaims the post-snapshot data-extent divergence — `data_allocated_blocks` returns to the post-snapshot value; a heavy post-rollback data workload reissues the freed paddrs without disturbing the snapshot-era data). Per-test detail lives in the fs / snapshot reference sections. |
+| `test_extent_index` | 59 | Lifecycle (create / close / advance_txg with all error paths including R34 P3-2 NULL-idx parity). Write — basic insert + lookup roundtrip; refuses zero-len, zero-args, off+len overflow, future write_gen, overlap with existing in-ino, paddr already-in-use. Overwrite — into hole returns no drops; drops one extent; drops multiple overlapping; doesn't touch other (ds, ino); refuses paddr-cycle (new_paddr equals a dropped extent); refuses paddr-collision with live extent in different (ds, ino); refuses bad args. Truncate — drops past-size extents; truncate-to-zero drops all; no drops when new_size > max extent end; doesn't touch other (ds, ino). DeleteFile — drops all in (ds, ino); idempotent on empty (ds, ino). Lookup — hole boundaries (off < extent.off, off ≥ extent.off+extent.len, off=last byte); unknown (ds, ino) returns ENOENT. Iter — returns off-ascending despite insertion order; early terminate on cb=false; filters by (ds, ino). Multi-replica write / overwrite / truncate / reflink (P7-6 / P7-16). ERRORCHECK reentry — cb-runs-under-lock smoke test. Concurrent stress — 4 workers × 256 ops each on disjoint (ds, ino) all serialize cleanly. **R34 P2-1 regression** — out-arg zeroing on `idx==NULL` early return for overwrite / truncate / delete_file. **9.7-impl-4c `collect_engine_data_paddrs_at`** (2 tests) — arg validation (NULL idx / NULL cb / dataset_id=0 / dataset-index-unattached EINVAL); all-zero "empty dataset" triple → STM_OK with cb never invoked (the real-tree walk on committed trees is covered end-to-end by `test_fs`'s rollback-reclaim integration test). **9.7-impl-4c-ii `collect_engine_cold_records_at`** (2 tests) — same arg-validation + empty-triple shape for the COLD-record collector. |
+| `test_fs` | 183 | The fs-integration suite (cross-referenced here for the data-path coverage it exercises via the extent index). Extent-relevant: write/read 4 KiB roundtrip; read-hole returns zeros; write-args validation; COW-drop routing (to alloc-free without a snapshot, to the snap dead-list with one); cross-mount durability; multi-extent per ino; **9.7-impl-4c** `fs_rollback_reclaims_diverged_data_extents` (rollback reclaims the post-snapshot data-extent divergence — `data_allocated_blocks` returns to the post-snapshot value; a heavy post-rollback data workload reissues the freed paddrs without disturbing the snapshot-era data); **9.7-impl-4c-ii** `fs_rollback_reclaims_diverged_cold_extents` (rollback derefs the post-snapshot COLD-extent divergence — CAS entry count returns to the post-snapshot value, and a dedup-shared diverged extent's hash is dereffed EXACTLY once, leaving the snapshot's refcount intact). Per-test detail lives in the fs / snapshot reference sections. |
 
 `test_extent` (Phase 4) covers the AEAD-wrap helpers; that suite is
 unrelated to the index API and stays separate.

@@ -1154,6 +1154,73 @@ stm_status stm_extent_index_collect_engine_data_paddrs_at(
                                        stm_extent_paddr_cb cb,
                                        void *cb_ctx);
 
+/* One COLD extent record surfaced by
+ * stm_extent_index_collect_engine_cold_records_at. `ino` / `off` are
+ * the extent's logical key; `content_hash` is the CAS key the rollback
+ * derefs; `gen` / `link_gen` are the record-identity discriminator the
+ * rollback merge uses to tell a SHARED cold record from a diverged one
+ * (see the function doc). */
+typedef struct {
+    uint64_t ino;
+    uint64_t off;
+    uint8_t  content_hash[STM_EXTENT_HASH_LEN];
+    uint64_t gen;
+    uint64_t link_gen;
+} stm_extent_cold_ref;
+
+/* Per-COLD-record callback for
+ * stm_extent_index_collect_engine_cold_records_at. Return 0 to
+ * continue, nonzero to stop (the collect then returns STM_OK). The
+ * `rec` pointer is valid only for the callback's duration. */
+typedef int (*stm_extent_cold_record_cb)(const stm_extent_cold_ref *rec,
+                                           void *ctx);
+
+/*
+ * 9.7-impl-4c-ii (rollback cold-extent reclamation): enumerate every
+ * COLD extent record of the frozen tree at an arbitrary
+ * `(root_paddr, root_gen, root_csum)` triple, invoking `cb` once per
+ * COLD record.
+ *
+ * Sibling of stm_extent_index_collect_engine_data_paddrs_at: the same
+ * throwaway-engine EXTENT-subspace walk, but emits the COLD records
+ * (HOT extents are decoded + validated but contribute nothing — their
+ * storage is the stm_alloc tier reclaimed by the _data_paddrs_at
+ * sibling). Each emitted record carries its logical key (ino, off),
+ * its CAS content_hash, and the (gen, link_gen) identity pair.
+ *
+ * The rollback mechanism calls this on the pre-rollback live root AND
+ * the snapshot root. A COLD record's CAS hash holds one refcount taken
+ * at the record's creation; the rollback merges the two record sets by
+ * (ino, off) and stm_cas_derefs each old-tree COLD record that is NOT
+ * the same logical record as a snapshot-tree COLD record at the same
+ * key. A per-hash count subtraction would be WRONG — content-defined
+ * dedup lets distinct records share a hash, so a diverged record and an
+ * unrelated snapshot record sharing a hash would cancel and leak the
+ * refcount. `link_gen` (the gen at which a record entered the live
+ * extent index — snapshot creation forces a commit, so a snapshot's
+ * records all carry link_gen <= the snapshot gen while a post-snapshot
+ * diverged record carries a strictly higher one) is the load-bearing
+ * record-identity discriminator.
+ *
+ * An all-zero triple is the "empty dataset" sentinel (STM_OK, `cb`
+ * never invoked). Returns STM_EINVAL on NULL idx / NULL cb /
+ * dataset_id == 0 / the extent index's dataset index unattached,
+ * STM_ECORRUPT / STM_EBADTAG on a Merkle / AEAD / value-decode
+ * failure, STM_ENOMEM / device errors otherwise. A nonzero `cb`
+ * return stops the walk early and is NOT itself an error (STM_OK).
+ *
+ * Concurrency: takes the extent index's internal lock for the call.
+ */
+STM_MUST_USE
+stm_status stm_extent_index_collect_engine_cold_records_at(
+                                       stm_extent_index *idx,
+                                       uint64_t dataset_id,
+                                       uint64_t root_paddr,
+                                       uint64_t root_gen,
+                                       const uint8_t root_csum[32],
+                                       stm_extent_cold_record_cb cb,
+                                       void *cb_ctx);
+
 #ifdef __cplusplus
 }
 #endif

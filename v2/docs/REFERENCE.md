@@ -38,32 +38,51 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: 9.7-impl-4c — rollback data-extent reclamation — shipped +
-  R162 audit closed. R162 verdict: **0 P0, 0 P1, 0 P2, 3 P3**; all 3
-  P3s (cosmetic — a dedup-vs-refcount doc note, an inert struct field,
-  a stale doc count) closed in the close commit `ce83681`.
-  - **9.7-impl-4c**: `stm_fs_rollback_snapshot` now also reclaims the
+- **Tip**: 9.7-impl-4c-ii — rollback cold-extent (CAS-tier)
+  reclamation — shipped; R163 audit pending.
+  - **9.7-impl-4c-ii**: `stm_fs_rollback_snapshot` now also reclaims
+    the post-snapshot COLD-extent divergence — the CAS-tier sibling of
+    impl-4b's metadata-node + impl-4c's data-extent reclaims. With it
+    the rollback reclaims the WHOLE live-divergence term of
+    `dead_list.tla::Rollback`. After the swap + dead-list clear + the
+    impl-4b/4c reclaims, `fs_rollback_reclaim_diverged_cold` walks the
+    EXTENT keyspace of the pre-rollback live tree AND the snapshot tree
+    (`stm_extent_index_collect_engine_cold_records_at` — one new API,
+    the COLD-tier sibling of `collect_engine_data_paddrs_at`; it emits
+    one `stm_extent_cold_ref {ino, off, content_hash, gen, link_gen}`
+    per COLD record), merges the two record sets by `(ino, off)`, and
+    `stm_cas_deref`s each old-tree COLD record that is NOT the same
+    logical record as a snapshot-tree record at the same key. **A
+    per-key structural merge, NOT a per-hash count subtraction**:
+    content-defined dedup lets distinct cold records share a hash, so
+    subtracting per-hash occurrence counts would cancel a diverged
+    record against an unrelated snapshot record and leak the refcount.
+    `link_gen` (the gen at which a record entered the live extent
+    index) is the load-bearing record-identity discriminator —
+    snapshot creation forces a commit, so a snapshot's records all
+    carry `link_gen ≤` the snapshot gen while a post-snapshot diverged
+    record carries a strictly higher one; the reclaim therefore NEVER
+    over-derefs (which would prematurely CAS-GC live cold storage). The
+    derefs feed the rollback commit's CAS auto-GC sweep. Same
+    best-effort + walk-must-complete posture as impl-4b/4c. **No
+    STM_UB_VERSION bump.** Forward-noted: 9.7-impl-4c-iii (the cleared
+    dead-list garbage), 9.7-impl-4d (lift the newer-snapshot refusal).
+  - **9.7-impl-4c** (`39d71e8` + R162 close `ce83681`, verdict 0 P0 /
+    0 P1 / 0 P2 / 3 P3): `stm_fs_rollback_snapshot` reclaims the
     post-snapshot DATA-extent divergence (the `stm_alloc`-class
     HOT-extent replica blocks) — the data-tier sibling of impl-4b's
-    metadata-node reclaim. After the swap + dead-list clear + the
-    impl-4b node reclaim, `fs_rollback_reclaim_diverged_extents` walks
-    the EXTENT keyspace of the pre-rollback live tree AND the snapshot
-    tree (`stm_extent_index_collect_engine_data_paddrs_at` →
+    metadata-node reclaim. `fs_rollback_reclaim_diverged_extents` walks
+    the EXTENT keyspace of both trees
+    (`stm_extent_index_collect_engine_data_paddrs_at` →
     `stm_dataset_index_scan_engine_range_at` →
     `stm_btree_engine_scan_range` — two new APIs; `scan_engine_range_at`
-    is the third throwaway-engine wrapper, `collect_engine_data_paddrs_at`
-    decodes each 108-byte extent value to its HOT replica paddrs),
-    set-differences the two data-paddr sets, and `stm_alloc_free`s
-    `old \ snap` (the data-tier projection of `dead_list.tla::Rollback`'s
-    live-divergence term). A reflink-shared paddr that the snapshot tree
-    references lands in `snap_set` and is excluded; sorting `old_set`
-    dedups a paddr two reflink-siblings of the OLD tree share. Same
-    best-effort + walk-must-complete + `free_gen`-before-commit posture
-    as impl-4b. **No STM_UB_VERSION bump.** Forward-noted: 9.7-impl-4c-ii
-    (the cold-extent CAS tier — the CAS refcount is per-record so it is
-    a counted multiset difference, its own chunk), 9.7-impl-4c-iii (the
-    cleared dead-list garbage), 9.7-impl-4d (lift the newer-snapshot
-    refusal).
+    is the third throwaway-engine wrapper), set-differences the two
+    data-paddr sets, and `stm_alloc_free`s `old \ snap`. A
+    reflink-shared paddr the snapshot tree references lands in
+    `snap_set` and is excluded; sorting `old_set` dedups a paddr two
+    reflink-siblings of the OLD tree share. Same best-effort +
+    walk-must-complete + `free_gen`-before-commit posture as impl-4b.
+    **No STM_UB_VERSION bump.**
   - **9.7-impl-4b** (`ac83d4f` + R161 close): `stm_fs_rollback_snapshot`
     now reclaims the post-snapshot metadata-node divergence instead of
     leaking it. After the swap + dead-list clear,
@@ -126,20 +145,20 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **9.7-impl-2** (`4b73f23` + `2176db0`, R158): snapshot-aware COW
     free — superseded engine NODE paddrs route into a per-snap
     bootstrap-tier dead-list. STM_UB_VERSION 30→31.
-  - **ctest 63/64 standalone** at the impl-4c tip — the lone failure is
-    the documented `test_compound_ops_concurrent`
+  - **ctest 63/64 standalone** at the impl-4c-ii tip — the lone failure
+    is the documented `test_compound_ops_concurrent`
     rename/cfr/reflink/write-truncate flake
     ([[flake-per-inode-cfr-concurrent]]), confirmed pre-existing by the
-    stash-retest method: with impl-4c stashed, the test still failed
-    4/4 runs at the clean `10cd722` tip; with impl-4c present it both
-    passed and failed across runs (a SEGFAULT under `-j4`, a rename-case
-    error standalone — the non-deterministic wander IS the flake
-    signature). impl-4c touches no per-inode op — its new code runs
-    only on the rollback path, which the test never exercises.
-    `test_btree_engine` 47, `test_snapshot` 58, `test_dataset` 77,
-    `test_extent_index` 57, `test_fs` 182, `test_ctl` 149.
-  - **What's next**: 9.7-impl-4c-ii (rollback cold-extent CAS-tier
-    reclamation) → 9.7-impl-4c-iii (cleared dead-list garbage) →
+    stash-retest method: with impl-4c-ii stashed, the test still failed
+    3/3 runs at the clean `17e0a41` tip (the failing case + signal
+    wandered run-to-run — 2× a sub-test FAIL, 1× a SEGFAULT — the
+    non-deterministic wander IS the flake signature). impl-4c-ii adds
+    only a new static function (`fs_rollback_reclaim_diverged_cold`)
+    plus an extent collector API, both reachable ONLY from the rollback
+    path, which the test never exercises. `test_btree_engine` 47,
+    `test_snapshot` 58, `test_dataset` 77, `test_extent_index` 59,
+    `test_fs` 183, `test_ctl` 149.
+  - **What's next**: 9.7-impl-4c-iii (cleared dead-list garbage) →
     9.7-impl-4d (lift the newer-snapshot refusal) → 9.7-impl-5
     (readable `.snaps/`).
 

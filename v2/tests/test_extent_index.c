@@ -1493,4 +1493,56 @@ STM_TEST(ex_collect_engine_data_paddrs_empty_triple) {
     ex_test_idx_close(idx);
 }
 
+/* ------------------------------------------------------------------ */
+/* 9.7-impl-4c-ii: stm_extent_index_collect_engine_cold_records_at      */
+/* enumerates a frozen tree's COLD extent records via a throwaway      */
+/* read-only engine — the rollback cold-extent reclamation primitive.  */
+/* (The real-tree walk on committed trees is covered end-to-end by     */
+/* test_fs.c's fs_rollback_reclaims_diverged_cold_extents; here: arg   */
+/* validation + the empty-dataset sentinel path.)                      */
+/* ------------------------------------------------------------------ */
+
+typedef struct { size_t n; } ex_collect_cold_count;
+
+static int ex_collect_cold_count_cb(const stm_extent_cold_ref *rec, void *ctx) {
+    (void)rec;
+    ((ex_collect_cold_count *)ctx)->n++;
+    return 0;
+}
+
+STM_TEST(ex_collect_engine_cold_records_arg_validation) {
+    ex_collect_cold_count cc = {0};
+    uint8_t csum[32] = {0};
+
+    /* NULL idx / NULL cb / dataset_id 0 — refused before the lock. */
+    STM_ASSERT_ERR(stm_extent_index_collect_engine_cold_records_at(
+                       NULL, 2, 0xCAFEu, 5u, csum,
+                       ex_collect_cold_count_cb, &cc), STM_EINVAL);
+    stm_extent_index *bare = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &bare));
+    STM_ASSERT_ERR(stm_extent_index_collect_engine_cold_records_at(
+                       bare, 2, 0xCAFEu, 5u, csum, NULL, &cc), STM_EINVAL);
+    STM_ASSERT_ERR(stm_extent_index_collect_engine_cold_records_at(
+                       bare, 0, 0xCAFEu, 5u, csum,
+                       ex_collect_cold_count_cb, &cc), STM_EINVAL);
+    /* Dataset index unattached — refused with STM_EINVAL. */
+    STM_ASSERT_ERR(stm_extent_index_collect_engine_cold_records_at(
+                       bare, 2, 0xCAFEu, 5u, csum,
+                       ex_collect_cold_count_cb, &cc), STM_EINVAL);
+    stm_extent_index_close(bare);
+}
+
+STM_TEST(ex_collect_engine_cold_records_empty_triple) {
+    stm_extent_index *idx = ex_test_idx(0);
+
+    /* The all-zero "empty dataset" triple — STM_OK, cb never invoked. */
+    ex_collect_cold_count cc = {0};
+    uint8_t zero[32] = {0};
+    STM_ASSERT_OK(stm_extent_index_collect_engine_cold_records_at(
+                      idx, 2, 0, 0, zero, ex_collect_cold_count_cb, &cc));
+    STM_ASSERT_EQ(cc.n, (size_t)0);
+
+    ex_test_idx_close(idx);
+}
+
 STM_TEST_MAIN("test_extent_index")

@@ -184,9 +184,24 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
   reflink-shares across the snapshot boundary lands in the snapshot
   set and is excluded; sorting `old` dedups a paddr two reflink-
   siblings of the OLD tree share. Same best-effort + walk-must-complete
-  posture as the node reclaim. Still leaked, forward-noted: the
-  cold-extent (CAS) tier — **9.7-impl-4c-ii** — and the snapshot's own
-  cleared dead-list garbage — **9.7-impl-4c-iii**.
+  posture as the node reclaim.
+- **Cold-extent reclamation (9.7-impl-4c-ii)** — the CAS-tier sibling,
+  run in the same pre-commit window: `fs_rollback_reclaim_diverged_cold`
+  walks the EXTENT keyspace of both trees
+  (`stm_extent_index_collect_engine_cold_records_at`), merges the COLD
+  record sets by `(ino, off)`, and `stm_cas_deref`s each old-tree COLD
+  record that is NOT the same logical record as a snapshot-tree record
+  at the same key. A **per-key structural merge, not a per-hash count
+  subtraction** — content-defined dedup lets distinct records share a
+  hash, so a count subtraction would cancel a diverged record against
+  an unrelated snapshot record and leak its refcount. `link_gen` (the
+  gen at which a record entered the live extent index) is the
+  load-bearing record-identity discriminator. The derefs feed the
+  rollback commit's CAS auto-GC sweep. Same best-effort +
+  walk-must-complete posture; this reclaim NEVER over-derefs (a shared
+  record always matches its snapshot counterpart, so it is never
+  mis-classified as diverged). Still leaked, forward-noted: the
+  snapshot's own cleared dead-list garbage — **9.7-impl-4c-iii**.
 - **v1.0 limitation** — a rollback is refused (`STM_ENOTSUPPORTED`)
   when a newer snapshot of the dataset exists. ZFS semantics destroy
   every newer snapshot; doing that correctly needs the `\ newer_dead`

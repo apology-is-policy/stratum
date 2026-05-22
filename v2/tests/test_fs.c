@@ -2565,6 +2565,137 @@ static bool mtc_capture_first_cb(const stm_cas_record *r, void *ctx) {
     return false;       /* terminate after first */
 }
 
+/* 9.7-impl-4c-ii: rollback COLD-extent (CAS-tier) reclamation. A
+ * snapshot captures two dedup-sharing cold extents; the divergence
+ * adds a THIRD cold extent of the SAME content plus six distinct-
+ * content cold extents, and truncates one of the snapshot's two
+ * dedup-sharing files out of the live tree. The rollback must:
+ *   - deref every distinct-content diverged cold extent's hash to 0 so
+ *     the auto-GC sweep drops the CAS entry (CAS entry count 7 -> 1);
+ *   - deref the same-content diverged extent's CAS hash EXACTLY once,
+ *     leaving the shared entry's refcount at 2 (the snapshot's two
+ *     files) — NOT 0 (over-deref -> live cold storage GC'd) and NOT 3
+ *     (under-deref -> the hash-count-difference bug this chunk fixes).
+ * CAS entry count + refcount are the direct CAS-tier measures here;
+ * block-level data_allocated_blocks accounting (confounded by the
+ * migrate-to-cold HOT-transient pipeline) is the impl-4c HOT test's
+ * concern, not this one's.
+ * The inode-2 truncate is what makes the bug observable: with it,
+ * count_old(C1) == count_snap(C1) == 2, so a naive per-hash count
+ * subtraction would deref 0 and leak the third extent's refcount. */
+STM_TEST(fs_rollback_reclaims_diverged_cold_extents) {
+    make_tmp("rb_reclaim_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_cas_index *cas = stm_sync_cas_index(stm_fs_sync_for_test(fs));
+    STM_ASSERT(cas != NULL);
+
+    /* C1 — the deduped content. Pre-snapshot inodes 1 + 2 both carry a
+     * cold extent of C1 -> one CAS entry, refcount 2. */
+    uint8_t c1[8192];
+    for (size_t i = 0; i < sizeof c1; i++) c1[i] = (uint8_t)((i * 11) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, c1, sizeof c1));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, c1, sizeof c1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 2));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "S", 1, &snap_id));
+
+    size_t cas_n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n));
+    STM_ASSERT_EQ(cas_n, (size_t)1);          /* C1, dedup-shared by 1+2 */
+
+    /* Diverge. (a) inode 3 — a THIRD cold extent of C1 (dedup -> CAS
+     * refcount 3). (b) inodes 10..15 — six distinct-content cold
+     * extents (six fresh CAS entries). (c) truncate inode 2 to 0 —
+     * drops its cold extent from the live tree (the snapshot still
+     * pins it). Commit so the divergence is a COMMITTED de_old tree
+     * the rollback's reclaim walk enumerates. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 3, 0, c1, sizeof c1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 3));
+    uint8_t distinct[4096];
+    for (uint64_t k = 0; k < 6; k++) {
+        memset(distinct, (int)(0x30u + k), sizeof distinct);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, 10 + k, 0, distinct, sizeof distinct));
+        STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 10 + k));
+    }
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 2, 0));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n));
+    STM_ASSERT_EQ(cas_n, (size_t)7);          /* C1 + six distinct */
+
+    /* Roll back to S — the swap reverts the tree, the COLD reclaim
+     * derefs the diverged cold extents' CAS hashes. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap_id, /*force=*/false));
+
+    /* The six distinct-content diverged entries dereffed to 0 ->
+     * auto-GC'd by the rollback's commit. Only C1 survives — proving
+     * the distinct-hash diverged cold extents were each reclaimed. */
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n));
+    STM_ASSERT_EQ(cas_n, (size_t)1);
+
+    /* THE differential assertion: C1's CAS entry refcount is back to
+     * EXACTLY 2 (inodes 1 + 2, the snapshot's two files). The diverge
+     * bumped it to 3; the rollback dereffed the inode-3 diverged
+     * extent exactly once. A per-hash count-subtraction reclaim would
+     * have dereffed 0 (count_old == count_snap == 2 after the inode-2
+     * truncate) and left refcount stuck at 3. */
+    mtc_capture_t cap = { .got = false };
+    STM_ASSERT_OK(stm_cas_iter(cas, mtc_capture_first_cb, &cap));
+    STM_ASSERT_TRUE(cap.got);
+    STM_ASSERT_EQ(cap.rec.refcount, 2u);
+
+    /* Snapshot view restored: inodes 1 + 2 both read back C1. */
+    uint8_t out[8192];
+    size_t got = 0;
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof c1);
+    STM_ASSERT_MEM_EQ(c1, out, sizeof c1);
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof c1);
+    STM_ASSERT_MEM_EQ(c1, out, sizeof c1);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    /* Heavy post-rollback cold workload: four fresh distinct cold
+     * extents, drawing the CAS chunk paddrs the reclaim freed back
+     * into use. A wrongly-freed chunk S's frozen tree still references
+     * would now be overwritten — caught by the inode-1/2 re-read. */
+    for (uint64_t k = 0; k < 4; k++) {
+        memset(distinct, (int)(0x80u + k), sizeof distinct);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, 30 + k, 0, distinct, sizeof distinct));
+        STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 30 + k));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(c1, out, sizeof c1);
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(c1, out, sizeof c1);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    /* Durable across a remount. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(c1, out, sizeof c1);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_migrate_to_cold_basic_roundtrip) {
     /* Write to (1, 1), migrate to cold, read back: same plaintext. The
      * extent index shows the record is now COLD; the CAS index has one

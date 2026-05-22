@@ -6446,9 +6446,10 @@ static int fs_rb_paddr_cmp(const void *a, const void *b)
  *
  * SPEC: dead_list.tla::Rollback — the boot-tier projection of the
  *       live-divergence term `live_blocks \ snap_view_blocks[s]`. The
- *       data-extent (stm_alloc) + cold-extent (CAS) tiers and the
- *       snapshot's own cleared dead-list garbage are NOT freed here —
- *       forward-noted to 9.7-impl-4c.
+ *       data-extent (stm_alloc) + cold-extent (CAS) tiers are reclaimed
+ *       by the sibling fs_rollback_reclaim_diverged_extents (4c) +
+ *       fs_rollback_reclaim_diverged_cold (4c-ii); the snapshot's own
+ *       cleared dead-list garbage stays forward-noted to 9.7-impl-4c-iii.
  *
  * SAFETY (load-bearing): a block is freed ONLY when it is in old_set
  * AND NOT in snap_set AND BOTH walks completed in full. Incremental COW
@@ -6541,9 +6542,10 @@ done:
  *
  * SPEC: dead_list.tla::Rollback — the data-tier projection of the
  *       live-divergence term `live_blocks \ snap_view_blocks[s]`. The
- *       sibling fs_rollback_reclaim_diverged_nodes (9.7-impl-4b) covers
- *       the metadata-NODE (bootstrap) tier. Still leaked, forward-noted:
- *       the cold-extent (CAS) tier — 9.7-impl-4c-ii — and the
+ *       siblings fs_rollback_reclaim_diverged_nodes (9.7-impl-4b)
+ *       cover the metadata-NODE (bootstrap) tier and
+ *       fs_rollback_reclaim_diverged_cold (9.7-impl-4c-ii) the
+ *       COLD-extent (CAS) tier. Still leaked, forward-noted: the
  *       snapshot's cleared dead-list garbage — 9.7-impl-4c-iii.
  *
  * SAFETY (load-bearing): a paddr is freed ONLY when it is in old_set
@@ -6632,6 +6634,175 @@ done:
     free(snap_set.v);
 }
 
+/* A growable COLD-extent-record set — the collector sink for one
+ * engine tree's EXTENT-keyspace walk. `oom` records a push that hit
+ * ENOMEM: the set is then INCOMPLETE and MUST NOT inform a deref
+ * decision — an incomplete snap-side set would mis-classify a shared
+ * cold record as diverged and OVER-deref its CAS hash. */
+typedef struct {
+    stm_extent_cold_ref *v;
+    size_t               n;
+    size_t               cap;
+    bool                 oom;
+} fs_rb_cold_set;
+
+/* stm_extent_cold_record_cb — append `rec`, doubling on demand. A
+ * nonzero return aborts the walk (ENOMEM only). */
+static int fs_rb_cold_collect_cb(const stm_extent_cold_ref *rec, void *ctx)
+{
+    fs_rb_cold_set *set = ctx;
+    if (set->n == set->cap) {
+        size_t ncap = set->cap ? set->cap * 2u : 64u;
+        if (ncap > SIZE_MAX / sizeof *set->v) { set->oom = true; return 1; }
+        stm_extent_cold_ref *g = realloc(set->v, ncap * sizeof *g);
+        if (!g) { set->oom = true; return 1; }   /* stop the walk */
+        set->v   = g;
+        set->cap = ncap;
+    }
+    set->v[set->n++] = *rec;
+    return 0;
+}
+
+/* qsort comparator — order cold refs by (ino, off) ascending. */
+static int fs_rb_cold_cmp(const void *a, const void *b)
+{
+    const stm_extent_cold_ref *x = a, *y = b;
+    if (x->ino != y->ino) return (x->ino > y->ino) - (x->ino < y->ino);
+    return (x->off > y->off) - (x->off < y->off);
+}
+
+/*
+ * 9.7-impl-4c-ii: reclaim the pre-rollback live tree's COLD-extent
+ * divergence — the CAS refcount every COLD extent record reachable
+ * from the OLD live tree's EXTENT keyspace but NOT from the snapshot's
+ * holds. Those cold records were created for migrations / cold writes
+ * that landed AFTER the snapshot was taken; once the dataset entry is
+ * swapped to the snapshot root nothing references them, so the one
+ * stm_cas_ref each took at creation must be released.
+ *
+ * SPEC: dead_list.tla::Rollback — the cold-tier projection of the
+ *       live-divergence term `live_blocks \ snap_view_blocks[s]`. The
+ *       siblings fs_rollback_reclaim_diverged_nodes (9.7-impl-4b,
+ *       bootstrap NODE tier) and fs_rollback_reclaim_diverged_extents
+ *       (9.7-impl-4c, stm_alloc HOT-replica tier) cover the two
+ *       physical-block tiers. With this tier the rollback reclaims the
+ *       whole live-divergence; the snapshot's own cleared dead-list
+ *       garbage stays forward-noted to 9.7-impl-4c-iii.
+ *
+ * WHY A PER-KEY STRUCTURAL MERGE, NOT A HASH-COUNT DIFFERENCE.
+ * Content-defined dedup lets DISTINCT cold records share a content
+ * hash. A reclaim that merely subtracted per-hash occurrence counts
+ * ("deref H, max(0, count_old(H) - count_snap(H)) times") is WRONG: a
+ * post-snapshot diverged record and an unrelated snapshot record that
+ * happen to share hash H cancel each other in the subtraction, leaving
+ * the diverged record's refcount un-released — a CAS-refcount leak
+ * that compounds across every rollback. The correct unit is the
+ * RECORD: walk both trees' EXTENT keyspaces and, for each key, decide
+ * shared-vs-diverged structurally.
+ *
+ * SAFETY (load-bearing): a cold record's hash is dereffed ONLY when
+ * the record is in old_set, is NOT the same logical record as a
+ * snapshot-tree record at the same (ino, off), AND BOTH walks
+ * completed in full. Two COLD records at the same key are the SAME
+ * logical record iff their (content_hash, gen, link_gen) identity is
+ * byte-identical. link_gen — the gen at which a record entered the
+ * live extent index — is the load-bearing separator: snapshot creation
+ * forces a commit, so every cold record in the snapshot carries
+ * link_gen <= the snapshot's gen, while any post-snapshot (diverged)
+ * record entered the index at a strictly higher gen. A shared record
+ * therefore ALWAYS matches its snapshot counterpart and is never
+ * mis-classified as diverged — this reclaim NEVER over-derefs (which
+ * would prematurely GC live cold storage). The only residual failure
+ * mode is an under-deref (a leak), consistent with the best-effort
+ * posture. If either walk fails or is truncated NOTHING is dereffed.
+ *
+ * Correct ONLY because the caller already refused the rollback when a
+ * newer snapshot of the dataset exists — see the matching note on
+ * fs_rollback_reclaim_diverged_nodes.
+ *
+ * BEST-EFFORT: any walk / collect / per-record deref failure leaves
+ * the unreleased remainder as a CAS-refcount leak — a space cost (the
+ * cold chunk's storage is never GC'd), never a corruption. The
+ * rollback itself still succeeds.
+ *
+ * The deref drops the CAS entry's refcount; the caller's
+ * stm_sync_commit runs the auto-GC sweep that reclaims any entry whose
+ * refcount reaches 0 (and routes its chunk paddrs through the
+ * allocator) — exactly stm_fs_delete_snapshot's cold-hash path.
+ *
+ * Caller holds fs->global EX.
+ */
+static void fs_rollback_reclaim_diverged_cold(
+        stm_fs *fs, stm_extent_index *eidx, uint64_t dataset_id,
+        uint64_t old_paddr, uint64_t old_gen, const uint8_t old_csum[32],
+        uint64_t snap_paddr, uint64_t snap_gen, const uint8_t snap_csum[32])
+{
+    fs_rb_cold_set old_set  = {0};
+    fs_rb_cold_set snap_set = {0};
+
+    /* Snapshot tree first: an incomplete snap_set could mis-classify a
+     * shared cold record as diverged and OVER-deref its CAS hash — a
+     * premature GC that frees live cold storage. Abort on any
+     * incompleteness. */
+    stm_status w = stm_extent_index_collect_engine_cold_records_at(
+            eidx, dataset_id, snap_paddr, snap_gen, snap_csum,
+            fs_rb_cold_collect_cb, &snap_set);
+    if (w != STM_OK || snap_set.oom) goto done;
+
+    w = stm_extent_index_collect_engine_cold_records_at(
+            eidx, dataset_id, old_paddr, old_gen, old_csum,
+            fs_rb_cold_collect_cb, &old_set);
+    if (w != STM_OK || old_set.oom) goto done;
+
+    stm_cas_index *cidx = stm_sync_cas_index(fs->sync);
+    if (!cidx) goto done;   /* no CAS index attached — nothing to deref */
+
+    qsort(snap_set.v, snap_set.n, sizeof *snap_set.v, fs_rb_cold_cmp);
+    qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_cold_cmp);
+
+    size_t j = 0;
+    for (size_t i = 0; i < old_set.n; i++) {
+        const stm_extent_cold_ref *o = &old_set.v[i];
+
+        /* Defensive dedup: the extent index holds at most one record
+         * per (ino, off), so adjacent-equal keys can only appear in a
+         * corrupt tree. Skipping the duplicate errs toward an
+         * under-deref (a leak) — never a double-deref (a corruption). */
+        if (i > 0 && o->ino == old_set.v[i - 1].ino
+                  && o->off == old_set.v[i - 1].off) continue;
+
+        /* Advance the snapshot cursor to o's key. */
+        while (j < snap_set.n &&
+               (snap_set.v[j].ino < o->ino ||
+                (snap_set.v[j].ino == o->ino &&
+                 snap_set.v[j].off < o->off))) j++;
+
+        bool shared = false;
+        if (j < snap_set.n &&
+            snap_set.v[j].ino == o->ino && snap_set.v[j].off == o->off) {
+            const stm_extent_cold_ref *sref = &snap_set.v[j];
+            /* SAME logical record iff its identity is byte-identical.
+             * link_gen is the load-bearing separator (see the function
+             * comment); gen + content_hash are compared too so the
+             * decision needs no reasoning beyond "identical record". */
+            shared = (sref->link_gen == o->link_gen &&
+                      sref->gen      == o->gen      &&
+                      memcmp(sref->content_hash, o->content_hash,
+                             STM_EXTENT_HASH_LEN) == 0);
+        }
+        if (shared) continue;   /* o survives the rollback — keep */
+
+        /* o is a post-snapshot (diverged) cold record: release the one
+         * CAS refcount it took at creation. A deref failure leaks the
+         * refcount — best-effort, continue. */
+        (void)stm_cas_deref(cidx, o->content_hash);
+    }
+
+done:
+    free(old_set.v);
+    free(snap_set.v);
+}
+
 stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                                       uint64_t snapshot_id, bool force)
 {
@@ -6692,17 +6863,19 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * refusal — the drain pops buffered writes into the engine in-memory
      * tree, which the swap then destroys.
      *
-     * Scope — impl-4 shipped the SWAP only. 9.7-impl-4b + 4c reclaim
-     * the post-snapshot live-divergence: 4b the metadata-NODE / spill
-     * tier (fs_rollback_reclaim_diverged_nodes, bootstrap class), 4c
-     * the DATA-extent replica tier (fs_rollback_reclaim_diverged_
-     * extents, stm_alloc class) — together the boot- + data-tier
-     * projection of dead_list.tla::Rollback's live-divergence term.
-     * Still leaked, forward-noted: the cold-extent (CAS) tier
-     * (9.7-impl-4c-ii) and the snapshot's own cleared dead-list garbage
-     * (9.7-impl-4c-iii). A leak is a space cost, never a corruption —
-     * a leaked block stays ALLOCATED, so the allocator never reissues
-     * it, so the AEAD-nonce (paddr, write_gen) pair is never reused.
+     * Scope — impl-4 shipped the SWAP only. 9.7-impl-4b + 4c + 4c-ii
+     * reclaim the whole post-snapshot live-divergence: 4b the
+     * metadata-NODE / spill tier (fs_rollback_reclaim_diverged_nodes,
+     * bootstrap class), 4c the DATA-extent replica tier
+     * (fs_rollback_reclaim_diverged_extents, stm_alloc class), 4c-ii
+     * the COLD-extent tier (fs_rollback_reclaim_diverged_cold, CAS
+     * refcount) — together the full live-divergence term of
+     * dead_list.tla::Rollback. Still leaked, forward-noted: the
+     * snapshot's own cleared dead-list garbage (9.7-impl-4c-iii). A
+     * leak is a space cost, never a corruption — a leaked block stays
+     * ALLOCATED (or its CAS entry refcount stays > 0), so the
+     * allocator never reissues it, so the AEAD-nonce (paddr,
+     * write_gen) pair is never reused.
      *
      * v1.0 limitation — a newer snapshot of this dataset blocks the
      * rollback (STM_ENOTSUPPORTED). ZFS semantics destroy every snapshot
@@ -6825,16 +6998,18 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
 
     /* Reclaim the post-snapshot divergence — blocks reachable from the
      * pre-rollback live tree but not from the snapshot's frozen tree.
-     * Two tiers run here:
+     * Three tiers run here:
      *   - 9.7-impl-4b: the metadata-NODE / spill blocks (bootstrap
      *     class) via fs_rollback_reclaim_diverged_nodes;
      *   - 9.7-impl-4c: the DATA-extent replica blocks (stm_alloc class)
-     *     via fs_rollback_reclaim_diverged_extents.
-     * Both are best-effort (a failure leaks, never corrupts — see the
-     * helpers); both run before the commit so their deferred-frees ride
-     * the SAME stm_sync_commit as the swap (all-or-nothing on a commit
-     * failure). Still leaked, forward-noted: the cold-extent (CAS) tier
-     * — 9.7-impl-4c-ii — and the snapshot's own cleared dead-list
+     *     via fs_rollback_reclaim_diverged_extents;
+     *   - 9.7-impl-4c-ii: the COLD-extent CAS refcounts via
+     *     fs_rollback_reclaim_diverged_cold.
+     * All three are best-effort (a failure leaks, never corrupts — see
+     * the helpers). The node + data frees are deferred and ride the
+     * SAME stm_sync_commit as the swap; the cold derefs feed that
+     * commit's CAS auto-GC sweep — all-or-nothing on a commit failure.
+     * Still leaked, forward-noted: the snapshot's own cleared dead-list
      * garbage — 9.7-impl-4c-iii. */
     if (have_old_root) {
         fs_rollback_reclaim_diverged_nodes(fs, didx, dataset_id,
@@ -6850,6 +7025,16 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
         if (eidx) {
             fs_rollback_reclaim_diverged_extents(fs, eidx, dataset_id,
+                de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
+                entry.tree_root_paddr, entry.root_gen, entry.root_csum);
+
+            /* 9.7-impl-4c-ii: the COLD-extent (CAS) tier — release the
+             * CAS refcount of every cold record reachable from the old
+             * live tree but not the snapshot's. Same throwaway-engine
+             * EXTENT-keyspace re-walk as the data reclaim above (the
+             * deferred-free safety note there covers this third walk);
+             * deref touches only the CAS index, never the allocator. */
+            fs_rollback_reclaim_diverged_cold(fs, eidx, dataset_id,
                 de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
                 entry.tree_root_paddr, entry.root_gen, entry.root_csum);
         }
