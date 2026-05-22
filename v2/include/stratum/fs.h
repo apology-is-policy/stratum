@@ -1777,15 +1777,18 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
 /*
  * TLY-A5-impl-2 / 9.7-impl-4: roll the dataset back to a snapshot.
  *
- * Mechanism (9.7-impl-4, swap-then-validate): drain every dirty buffer
- * → swap the dataset entry's per-dataset btree_engine root triple
- * (di_tree_root, di_root_gen, di_root_csum) to the snapshot's captured
- * triple → validate it (re-open the engine + stm_btree_engine_verify;
- * a bad triple restores the pre-swap triple and refuses STM_ECORRUPT
- * with the fs NOT wedged) → clear the target snapshot's dead-lists →
- * stm_sync_commit. The commit's gen advance keeps the AEAD nonce fresh
- * for post-rollback writes. After return the dataset reads the
- * snapshot's frozen view; the post-snapshot writes are discarded.
+ * Mechanism (9.7-impl-4, validate-then-swap): VALIDATE the snapshot's
+ * captured per-dataset btree_engine root triple (di_tree_root,
+ * di_root_gen, di_root_csum) — a throwaway engine opened at the triple
+ * + stm_btree_engine_verify; a bad triple refuses STM_ECORRUPT with the
+ * fs NOT wedged, a true no-op — then drain every dirty buffer → swap the
+ * dataset entry's triple to the snapshot's → clear the target
+ * snapshot's dead-lists → stm_sync_commit. The validation runs BEFORE
+ * the destructive drain (R160 P1-1) so a corrupt / unverifiable
+ * snapshot leaves the caller's un-committed writes intact. The commit's
+ * gen advance keeps the AEAD nonce fresh for post-rollback writes. After
+ * return the dataset reads the snapshot's frozen view; the
+ * post-snapshot writes are discarded.
  *
  * v1.0 LIMITATION — a rollback is refused with STM_ENOTSUPPORTED when
  * a newer snapshot of the dataset exists. ZFS semantics destroy every

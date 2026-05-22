@@ -1356,6 +1356,16 @@ stm_status stm_dataset_index_set_snap_idx(stm_dataset_index *idx,
 /* 9.7-impl-1c per-dataset engine helpers (caller holds idx->lock).            */
 /* ========================================================================= */
 
+/* R160 P3-3: the single "all-zero ⇒ empty dataset" predicate. An
+ * all-zero (di_tree_root, di_root_gen) pair is the "empty dataset"
+ * sentinel: the engine starts fresh rather than opening an on-disk
+ * tree. Shared by dataset_engine_open_locked + verify_engine_at so the
+ * create-vs-open routing cannot drift between them. */
+static inline bool dataset_triple_is_empty(uint64_t root_paddr,
+                                              uint64_t root_gen) {
+    return root_paddr == 0 && root_gen == 0;
+}
+
 /*
  * Open (or create) the per-dataset btree_engine for `slot`. Caller holds
  * idx->lock and verified slot->present. The engine is cached on
@@ -1408,7 +1418,7 @@ static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
 
     stm_btree_engine *eng = NULL;
     stm_status rc;
-    if (slot->e.di_tree_root == 0 && slot->e.di_root_gen == 0) {
+    if (dataset_triple_is_empty(slot->e.di_tree_root, slot->e.di_root_gen)) {
         /* All-zero triple ⇒ "empty dataset" sentinel: create fresh.
          * The fresh engine starts with an in-memory empty-leaf root;
          * the dataset's first sync_commit stamps a real triple. */
@@ -1555,6 +1565,57 @@ stm_status stm_dataset_index_set_engine_root(stm_dataset_index *idx,
 
     must_unlock(&idx->lock);
     return STM_OK;
+}
+
+/* 9.7-impl-4 (rollback, R160 P1-1): verify the on-disk tree at an
+ * arbitrary triple via a throwaway read-only engine — no dataset slot
+ * touched. See the header docstring for the rollback rationale. */
+stm_status stm_dataset_index_verify_engine_at(stm_dataset_index *idx,
+                                                 uint64_t dataset_id,
+                                                 uint64_t root_paddr,
+                                                 uint64_t root_gen,
+                                                 const uint8_t root_csum[32]) {
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    /* Storage + crypt must be bound — same precondition as
+     * dataset_engine_open_locked. */
+    if (idx->engine_store_ctx.boot == NULL ||
+        idx->engine_store_ctx.bdev == NULL ||
+        idx->engine_crypt_ctx.metadata_key == NULL) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    /* An all-zero triple is the "empty dataset" sentinel — there is no
+     * on-disk tree, so it verifies trivially. */
+    if (dataset_triple_is_empty(root_paddr, root_gen)) {
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+
+    /* Throwaway read-only engine. The vt_ctx is a stack-local copy of
+     * the index's store-ctx template (boot + bdev), with dataset_id set
+     * for the AEAD tree_id and snap_idx NULL — verify never frees a
+     * node, so vt->free is never reached. The local outlives the
+     * open→verify→destroy sequence below. */
+    stm_engine_store_ctx vctx = idx->engine_store_ctx;
+    vctx.dataset_id = dataset_id;
+    vctx.snap_idx   = NULL;
+
+    stm_btree_engine *eng = NULL;
+    stm_status rc = stm_btree_engine_open(&STM_ENGINE_STORE_VT, &vctx,
+                                             &idx->engine_crypt_ctx,
+                                             /*tree_id=*/dataset_id,
+                                             root_paddr, root_gen, root_csum,
+                                             &eng);
+    if (rc == STM_OK) {
+        rc = stm_btree_engine_verify(eng);
+        stm_btree_engine_destroy(eng);
+    }
+
+    must_unlock(&idx->lock);
+    return rc;
 }
 
 /* ---- 9.7-impl-1c-ii: M-cascade three-phase commit driving. ---- */

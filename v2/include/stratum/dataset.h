@@ -811,6 +811,39 @@ stm_status stm_dataset_index_set_engine_root(stm_dataset_index *idx,
                                                 uint64_t root_gen,
                                                 const uint8_t root_csum[32]);
 
+/*
+ * 9.7-impl-4 (rollback): verify that the on-disk btree_engine tree at an
+ * arbitrary `(root_paddr, root_gen, root_csum)` triple is intact —
+ * Merkle-chain + AEAD-walked, exactly as `stm_btree_engine_verify` does.
+ *
+ * Opens a THROWAWAY read-only engine at the triple (from the index's
+ * bound storage + crypt context, with `tree_id = dataset_id` so the
+ * AEAD additional-data matches), walks it, and destroys it — no dataset
+ * slot is touched, no in-RAM engine is created or cached. The rollback
+ * mechanism calls this BEFORE its destructive dirty-buffer drain, so a
+ * corrupt / unverifiable snapshot triple is a true no-op refusal
+ * (R160 P1-1).
+ *
+ * An all-zero triple (`root_paddr == 0 && root_gen == 0`) is the "empty
+ * dataset" sentinel — there is no on-disk tree, so it verifies trivially
+ * (STM_OK). `dataset_id` need NOT name a PRESENT dataset — only the
+ * storage/crypt binding and the triple matter; `dataset_id` is used
+ * solely as the AEAD `tree_id`.
+ *
+ * Returns STM_OK if the tree verifies, STM_ECORRUPT on a Merkle
+ * mismatch, STM_EBADTAG on an AEAD failure, STM_EINVAL on NULL idx /
+ * dataset_id == 0 / storage or crypt ctx unbound, STM_ENOMEM / device
+ * errors otherwise.
+ *
+ * Concurrency: takes idx's lock for the open→verify→destroy sequence.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_verify_engine_at(stm_dataset_index *idx,
+                                                 uint64_t dataset_id,
+                                                 uint64_t root_paddr,
+                                                 uint64_t root_gen,
+                                                 const uint8_t root_csum[32]);
+
 /* ========================================================================= */
 /* 9.7-impl-1c-ii: per-dataset engine M-cascade commit driving APIs.          */
 /*                                                                             */

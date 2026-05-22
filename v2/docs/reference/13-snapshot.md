@@ -137,20 +137,24 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
   `force` is false, the call refuses with `STM_ECOMPROMISED` (-217)
   *before* the mechanism. The lookup + the flag check run under one
   `fs->global` EX hold, so a racing unmark is never torn.
-- **Mechanism (9.7-impl-4)** — swap-then-validate. After the gate:
+- **Mechanism (9.7-impl-4)** — validate-then-swap. After the gate:
   (1) refuse `STM_ENOTSUPPORTED` if a newer snapshot of the dataset
-  exists (the v1.0 limitation — see below); (2) drain every dirty
-  buffer (`fs_flush_all_locked`); (3) swap the dataset entry's
-  `(di_tree_root, di_root_gen, di_root_csum)` triple to the
-  snapshot's captured triple via `stm_dataset_index_set_engine_root`
-  (which drops the live in-RAM engine); (4) **validate** the swapped
-  triple by re-opening the engine at it + `stm_btree_engine_verify`
-  — a bad triple restores the pre-swap triple and refuses
-  `STM_ECORRUPT` (clean no-op, fs not wedged); an all-zero "empty
-  dataset" triple skips the verify; (5) `stm_snapshot_clear_dead_lists`
-  on the target — post-rollback the live tree IS the snapshot's tree,
-  so its dead-listed paddrs are live again and must not stay
-  dead-listed; (6) `stm_sync_commit` (R154 Q2 — wedge on failure).
+  exists (the v1.0 limitation — see below); (2) **validate** the
+  snapshot's captured `(di_tree_root, di_root_gen, di_root_csum)`
+  triple via `stm_dataset_index_verify_engine_at` — a throwaway engine
+  opened at the triple + `stm_btree_engine_verify`; a bad triple
+  refuses `STM_ECORRUPT` (a true no-op, fs not wedged), an all-zero
+  "empty dataset" triple verifies trivially; (3) drain every dirty
+  buffer (`fs_flush_all_locked`) — the FIRST destructive step, so
+  every refusal above is a true no-op (R160 P1-1: validating *after*
+  the drain would silently destroy the caller's un-committed writes);
+  (4) swap the dataset entry's triple to the snapshot's captured
+  triple via `stm_dataset_index_set_engine_root` (which drops the live
+  in-RAM engine, so the M-cascade skips the closed slot and the
+  stamped triple persists); (5) `stm_snapshot_clear_dead_lists` on the
+  target — post-rollback the live tree IS the snapshot's tree, so its
+  dead-listed paddrs are live again and must not stay dead-listed;
+  (6) `stm_sync_commit` (R154 Q2 — wedge on failure).
   The commit's gen advance is the AEAD-nonce bump: every
   post-rollback write lands at a strictly-higher gen, so reused
   snapshot paddrs never collide on `(paddr, write_gen)`. v2's rollback

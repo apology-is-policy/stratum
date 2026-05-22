@@ -555,6 +555,102 @@ STM_TEST(fs_rollback_refuses_when_newer_snapshot_exists) {
     unlink(g_tmp_path);
 }
 
+/* 9.7-impl-4 (R160 P2-2): a rollback reverts dirent + inode-table
+ * divergence, not just extents — set_engine_root swaps the whole
+ * per-dataset engine root, so all four metadata kinds revert
+ * atomically. Create file A, snapshot, create file B, roll back: B's
+ * dirent + inode are gone, A's survive. */
+STM_TEST(fs_rollback_reverts_dirent_and_inode) {
+    make_tmp("rb_dirent");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* A directory inode in dataset 1 to hang dirents off. */
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                     0, 0, &dir));
+
+    /* File A — frozen by the snapshot. */
+    uint64_t ino_a = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"A", 1,
+                                        0644u, 0, 0, &ino_a));
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "pre-B", 5, &snap_id));
+
+    /* File B — the post-snapshot divergence. */
+    uint64_t ino_b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"B", 1,
+                                        0644u, 0, 0, &ino_b));
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"B", 1, &found));
+
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap_id, /*force=*/false));
+
+    /* B's dirent is gone; A's dirent survives — dirent + inode records
+     * reverted together with the engine-root swap. */
+    found = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"B", 1, &found),
+                       STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"A", 1, &found));
+    STM_ASSERT_EQ(found, ino_a);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* 9.7-impl-4 (R160 P2-2): the dead-list-corruption scenario the chunk
+ * exists to prevent, end-to-end. After a rollback to S the live tree IS
+ * S's tree; if S's dead-lists were not cleared, deleting S would free
+ * blocks the live tree still references. stm_snapshot_clear_dead_lists
+ * (called by the rollback) prevents that — so a post-rollback delete-S
+ * frees nothing live and the data stays readable + verifies clean. */
+STM_TEST(fs_rollback_then_delete_snapshot_no_live_block_freed) {
+    make_tmp("rb_del_snap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096], b[4096], out[4096];
+    memset(a, 0xA1, sizeof a);
+    memset(b, 0xB2, sizeof b);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "S", 1, &snap_id));
+
+    /* Overwrite with B — the COW (during the rollback's own drain)
+     * routes the superseded blocks, which S's frozen tree references,
+     * onto S's dead-lists. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, b, sizeof b));
+
+    /* Roll back to S — the rollback clears S's dead-lists. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap_id, /*force=*/false));
+
+    /* Delete S. With S's dead-lists cleared by the rollback, this frees
+     * NO block (out_freed_count == 0). Without the clear it would free
+     * blocks the rolled-back live tree references — a corruption. */
+    size_t freed = 99;
+    STM_ASSERT_OK(stm_fs_delete_snapshot(fs, snap_id, &freed));
+    STM_ASSERT_EQ(freed, (size_t)0);
+
+    /* The dataset still reads as A and the fs verifies clean. */
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)sizeof out);
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 STM_TEST(fs_io_read_hole_returns_zeros) {
     make_tmp("io_hole");
     stm_fs_format_opts fopts = default_format_opts();

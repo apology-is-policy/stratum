@@ -176,6 +176,11 @@ stm_status stm_dataset_index_set_engine_root (stm_dataset_index *idx,
                                               uint64_t root_paddr,
                                               uint64_t root_gen,
                                               const uint8_t root_csum[32]);
+stm_status stm_dataset_index_verify_engine_at(stm_dataset_index *idx,
+                                              uint64_t dataset_id,
+                                              uint64_t root_paddr,
+                                              uint64_t root_gen,
+                                              const uint8_t root_csum[32]);
 ```
 
 `get_engine` lazily opens the per-dataset `btree_engine` rooted at
@@ -209,6 +214,15 @@ through to the `dataset_index_commit`), and marks the index dirty
 `root_csum` ⇒ all-zero. The caller validates the triple
 (`stm_btree_engine_verify`); `set_engine_root` stamps it verbatim.
 Refuses `STM_EBUSY` on a pending un-finalised commit flush.
+
+`verify_engine_at` (9.7-impl-4, R160 P1-1) Merkle/AEAD-verifies the
+on-disk tree at an arbitrary triple by opening a THROWAWAY read-only
+engine (`tree_id = dataset_id` for the AEAD bind), walking it with
+`stm_btree_engine_verify`, and destroying it — no dataset slot is
+touched. An all-zero triple verifies trivially (`STM_OK` — no on-disk
+tree). The rollback mechanism calls this BEFORE its destructive
+dirty-buffer drain so an unverifiable snapshot triple is a true no-op
+refusal; `dataset_id` need not name a PRESENT dataset.
 
 **1c-i posture**: the four metadata modules (inode / dirent / xattr
 / extent_index) STILL route through the pool-global 4-engine

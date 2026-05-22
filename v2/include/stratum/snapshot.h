@@ -433,13 +433,24 @@ stm_status stm_snapshot_bootstrap_dead_list_count(
  *
  * The cleared entries are DISCARDED, not transferred to the caller —
  * unlike `stm_snapshot_delete`, this API frees the dead-list arrays
- * themselves and does NOT hand the paddrs back. The reason: a dead-list
- * holds a mix of paddrs S's tree references (now live — MUST NOT be
- * freed) and intermediate COW garbage (genuinely reclaimable). The
- * snapshot module cannot tell them apart, so it frees neither — the
- * garbage leaks (it stays allocated, so the allocator never reissues it
- * and the AEAD nonce stays unique; a leak here is a space cost, never a
- * corruption). 9.7-impl-4b's diverged-block walk reclaims the garbage.
+ * themselves and does NOT hand the entries back. The reason: a dead-list
+ * holds a mix of entries S's tree references (now live — the obligation
+ * MUST NOT be discharged) and intermediate COW garbage (genuinely
+ * reclaimable). The snapshot module cannot tell them apart, so it
+ * discharges neither — the garbage leaks. The leak's *shape* differs per
+ * tier, but in all three it is a space cost, never a corruption:
+ *   - paddr-tier + bootstrap-tier: the garbage paddr stays ALLOCATED
+ *     (the deferred `stm_alloc_free` / `stm_bootstrap_free` never runs),
+ *     so the allocator never reissues it and the AEAD `(paddr, gen)`
+ *     nonce stays unique — a leaked allocator block.
+ *   - cold-tier (CAS class): the garbage hash's `stm_cas_deref` never
+ *     runs, so the CAS chunk's refcount never reaches 0 and the chunk is
+ *     never auto-GC'd — a leaked CAS refcount, NOT an allocator paddr.
+ *     (`stm_snapshot_delete`, by contrast, hands cold hashes back for
+ *     the caller to `stm_cas_deref`.) For the now-live cold extents this
+ *     same not-dereffing is *correct* — the refcount must stay up.
+ * 9.7-impl-4b's diverged-block walk reclaims the genuine garbage across
+ * all three tiers.
  *
  * Refuses STM_EINVAL on NULL idx / snapshot_id == 0, STM_ENOENT if the
  * snapshot is unknown / ABSENT. STM_OK whether or not the snapshot had

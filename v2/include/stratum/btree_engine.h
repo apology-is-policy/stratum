@@ -364,8 +364,10 @@ stm_status stm_btree_engine_get_root(const stm_btree_engine *eng,
 /*
  * Walk the last durably-committed on-disk tree, verifying the Merkle
  * chain and AEAD tag at every node. Returns STM_ECORRUPT on a Merkle
- * mismatch, STM_EBADTAG on an AEAD failure, STM_EINVAL if the tree has
- * never been committed, STM_EBUSY during an un-finalized commit flush.
+ * mismatch, STM_EBADTAG on an AEAD failure, STM_EINVAL if the engine has
+ * no durable root (a freshly *created*, never-flushed tree — an engine
+ * *opened* at a triple always has one, even before any commit by this
+ * handle), STM_EBUSY during an un-finalized commit flush.
  */
 STM_MUST_USE
 stm_status stm_btree_engine_verify(stm_btree_engine *eng);

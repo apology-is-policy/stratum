@@ -69,7 +69,6 @@
 #include <stratum/alloc.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
-#include <stratum/btree_engine.h>   /* 9.7-impl-4: rollback triple validation */
 #include <stratum/dataset.h>
 #include <stratum/dirent.h>
 #include <stratum/dirty_buffer.h>
@@ -6436,7 +6435,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     }
 
     /* ====================================================================
-     * 9.7-impl-4: rollback mechanism — swap-then-validate.
+     * 9.7-impl-4: rollback mechanism — validate-then-swap.
      *
      * SPEC: snapshot.tla::Rollback (live_tree_root' = snap_tree_root[s])
      *       + dead_list.tla::Rollback.
@@ -6445,6 +6444,16 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * snapshot's captured triple (impl-3 made that triple REAL); after
      * the commit the dataset reads the snapshot's frozen view and the
      * post-snapshot live tree is discarded.
+     *
+     * Step order is LOAD-BEARING (R160 P1-1): every refusal — the
+     * newer-snapshot gate and the snapshot-triple VALIDATION — runs
+     * BEFORE the destructive dirty-buffer drain. A refused rollback is
+     * therefore a true no-op: no buffered write is touched. Only after
+     * validation passes does drain → swap → commit run; a failure past
+     * the drain is crash-equivalent and wedges (R154 Q2). Validating
+     * after the drain would be silent data loss disguised as a clean
+     * refusal — the drain pops buffered writes into the engine in-memory
+     * tree, which the swap then destroys.
      *
      * Scope — impl-4 ships the SWAP. Block reclamation is impl-4b: the
      * post-snapshot diverged engine nodes + data extents are NOT freed
@@ -6467,8 +6476,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
 
     /* v1.0 limitation: refuse if a newer snapshot exists. stm_snapshot_
      * most_recent returns the highest-id PRESENT snapshot of the dataset;
-     * if it is not our target, a newer one is in the way. Checked BEFORE
-     * the drain so a refused rollback does no I/O. */
+     * if it is not our target, a newer one is in the way. */
     uint64_t most_recent = STM_SNAP_NO_PREV;
     s = stm_snapshot_most_recent(sidx, dataset_id, &most_recent);
     if (s != STM_OK) {
@@ -6480,12 +6488,40 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         return STM_ENOTSUPPORTED;   /* delete newer snapshots first */
     }
 
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ECORRUPT;
+    }
+
+    /* VALIDATE the snapshot's captured triple — BEFORE any destructive
+     * step (R160 P1-1). impl-3 stores the triple OPAQUELY (faithful-
+     * transport posture); this is the first chunk that interprets it.
+     * stm_dataset_index_verify_engine_at opens a throwaway engine at the
+     * triple, Merkle/AEAD-walks it, and destroys it — no dataset slot is
+     * touched. An all-zero "empty dataset" triple verifies trivially. A
+     * mismatch means the snapshot's frozen tree is unrecoverable: refuse
+     * with the verify error, fs NOT wedged — a true no-op (the drain +
+     * swap below have not run, so no caller data is at risk). This is the
+     * impl realisation of dead_list.tla::Rollback's precondition
+     * `snap_view_blocks[s] \cap freed = {}` (a snapshot whose tree
+     * references reclaimed storage cannot be rolled back to). */
+    s = stm_dataset_index_verify_engine_at(didx, dataset_id,
+                                              entry.tree_root_paddr,
+                                              entry.root_gen,
+                                              entry.root_csum);
+    if (s != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return s;
+    }
+
     /* R128 P2-3 carry: drain every dirty buffer before touching the
      * metadata tree. The post-snapshot buffered writes are exactly what
      * the rollback discards; draining empties the buffer so no stale
      * write can later flush into the rolled-back tree. (Over-flushes —
      * every dataset, every inode — mirroring create_snapshot; rollback
-     * is rare, the cost is acceptable.) */
+     * is rare, the cost is acceptable.) This is the FIRST destructive
+     * step — every refusal above it was a true no-op. */
     {
         stm_status fr = fs_flush_all_locked(fs);
         if (fr != STM_OK) {
@@ -6494,64 +6530,25 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
-    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
-    if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_ECORRUPT;
-    }
-
-    /* Capture the dataset's current triple so a failed validation can
-     * restore it cleanly — a corrupt snapshot triple makes the rollback
-     * a no-op, not a filesystem fault, so the fs is NOT wedged. */
-    stm_dataset_entry de_before;
-    s = stm_dataset_lookup(didx, dataset_id, &de_before);
-    if (s != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return s;
-    }
-
-    /* Swap the dataset entry's triple to the snapshot's captured triple.
-     * set_engine_root drops the live in-RAM engine so (a) the next
-     * get_engine re-opens at the swapped triple and (b) the M-cascade —
-     * which flushes only slots whose engine is OPEN — does not re-stamp
-     * the slot back to the stale root. */
+    /* Swap the dataset entry's triple to the snapshot's (already
+     * validated) captured triple. set_engine_root drops the live in-RAM
+     * engine so (a) the next get_engine re-opens at the swapped triple
+     * and (b) the M-cascade — which flushes only slots whose engine is
+     * OPEN — skips this slot, so the stamped triple survives untouched
+     * to the dataset_index_commit. The engine stays CLOSED until the
+     * next post-rollback access opens it lazily at the swapped root. */
     s = stm_dataset_index_set_engine_root(didx, dataset_id,
                                              entry.tree_root_paddr,
                                              entry.root_gen,
                                              entry.root_csum);
     if (s != STM_OK) {
+        /* set_engine_root fails here only with STM_ENOENT (the dataset
+         * is not PRESENT) — and it refuses as a clean no-op (it bails
+         * before mutating the slot). The drain above is non-durable
+         * (buffered writes sit in engine in-memory trees, recoverable by
+         * the next commit), so this is not crash-equivalent — no wedge. */
         pthread_rwlock_unlock(&fs->global);
         return s;
-    }
-
-    /* VALIDATE the snapshot's captured triple. impl-3 stores the triple
-     * OPAQUELY (faithful-transport posture); this is the first chunk
-     * that interprets it. An all-zero triple is the "empty dataset"
-     * snapshot — nothing on disk to verify; the next get_engine creates
-     * a fresh empty engine. A non-zero triple is opened + Merkle/AEAD-
-     * walked by stm_btree_engine_verify; a mismatch means the snapshot's
-     * frozen tree is unrecoverable — restore the pre-swap triple and
-     * refuse (clean no-op, fs not wedged). The verify is the impl
-     * realisation of dead_list.tla::Rollback's precondition
-     * `snap_view_blocks[s] \cap freed = {}` (a snapshot whose tree
-     * references reclaimed storage cannot be rolled back to). */
-    bool empty_snap = (entry.tree_root_paddr == 0 && entry.root_gen == 0);
-    if (!empty_snap) {
-        stm_btree_engine *eng = NULL;
-        stm_status vr = stm_dataset_index_get_engine(didx, dataset_id, &eng);
-        if (vr == STM_OK) vr = stm_btree_engine_verify(eng);
-        if (vr != STM_OK) {
-            /* Restore the pre-swap triple (set_engine_root closes the
-             * engine opened at the bad root). The lingering idx->dirty
-             * is harmless — it forces one extra dataset_index re-encode
-             * on the next unrelated commit; the triples are all correct. */
-            (void)stm_dataset_index_set_engine_root(didx, dataset_id,
-                                                       de_before.di_tree_root,
-                                                       de_before.di_root_gen,
-                                                       de_before.di_root_csum);
-            pthread_rwlock_unlock(&fs->global);
-            return vr;
-        }
     }
 
     /* Clear the target snapshot's dead-lists. Post-rollback the live
@@ -6565,25 +6562,27 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * reclaims them. */
     s = stm_snapshot_clear_dead_lists(sidx, snapshot_id);
     if (s != STM_OK) {
-        /* Unreachable: snapshot_id is validated + PRESENT. Defensive —
-         * the in-RAM triple is swapped but not durable, crash-equivalent
-         * inconsistent state → wedge (R154 Q2). */
+        /* Unreachable: snapshot_id is validated + PRESENT under the held
+         * fs->global EX. Defensive — the in-RAM triple is swapped but
+         * not durable, crash-equivalent inconsistent state → wedge
+         * (R154 Q2). */
         pthread_rwlock_unlock(&fs->global);
         stm_fs_mark_wedged(fs);
         return s;
     }
 
-    /* Commit the swap. stm_sync_commit drives the three-phase cascade:
-     * the re-opened clean engine flushes as a no-op; the dataset_index —
-     * marked dirty by set_engine_root — re-serialises the slot with the
-     * swapped triple. The commit advances the sync gen, so every post-
-     * rollback write lands at a strictly-higher gen than any pre-rollback
-     * write — the AEAD-nonce (paddr, write_gen) pair stays fresh even
-     * though the snapshot's older paddrs are live again. (The v1 R9-1
-     * "bump fs->gen before the allocator swap" doctrine: v2's rollback
-     * does NOT roll back the allocator — diverged blocks leak rather than
-     * free — so there is no allocator swap to bump before; the commit's
-     * gen advance subsumes it.)
+    /* Commit the swap. stm_sync_commit drives the three-phase cascade;
+     * the dataset_index — marked dirty by set_engine_root — re-serialises
+     * the slot with the swapped triple (the rolled-back dataset's engine
+     * is closed, so the M-cascade skips it and cannot un-stamp it). The
+     * commit advances the sync gen, so every post-rollback write lands at
+     * a strictly-higher gen than any pre-rollback write — the AEAD-nonce
+     * (paddr, write_gen) pair stays fresh even though the snapshot's
+     * older paddrs are live again. (The v1 R9-1 "bump fs->gen before the
+     * allocator swap" doctrine: v2's rollback does NOT roll back the
+     * allocator — diverged blocks leak rather than free — so there is no
+     * allocator swap to bump before; the commit's gen advance subsumes
+     * it.)
      *
      * R154 Q2: a failed commit is crash-equivalent (the engines' three-
      * phase abort dropped the in-memory trees) — wedge the fs. The wedge

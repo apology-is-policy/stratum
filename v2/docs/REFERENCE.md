@@ -38,29 +38,43 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: 9.7-impl-4 — the snapshot rollback mechanism — shipped.
-  R160 audit follows this commit.
-  - **9.7-impl-4**: `stm_fs_rollback_snapshot` filled in (the TLY-A5
-    `STM_ENOTSUPPORTED` stub is retired). Mechanism is swap-then-
-    validate: refuse if a newer snapshot exists (v1.0 limitation) →
-    drain dirty buffers → swap the dataset entry's `(di_tree_root,
-    di_root_gen, di_root_csum)` triple to the snapshot's captured
-    triple → validate by re-opening the engine + `stm_btree_engine_
-    verify` (bad triple ⇒ restore + STM_ECORRUPT, fs not wedged) →
-    `stm_snapshot_clear_dead_lists` on the target → `stm_sync_commit`
-    (R154 Q2 wedge on failure). The commit's gen advance is the
-    AEAD-nonce bump; v2's rollback does NOT roll back the allocator,
-    so there is no allocator swap to "bump before" (the v1 R9-1
-    doctrine is subsumed). Two new APIs: `stm_dataset_index_set_
-    engine_root` (force a slot triple) + `stm_snapshot_clear_dead_
-    lists` (empty a snapshot's 3 dead-lists in place). **Block
-    reclamation of the post-snapshot divergence is forward-noted to
-    9.7-impl-4b** — diverged engine nodes + data extents LEAK (stay
-    allocated, untracked; a space cost, never a corruption — a leaked
-    block is never reissued so the AEAD nonce stays unique). impl-4b
-    also lifts the newer-snapshot refusal. Two stub-pinned TLY-A5
-    `test_ctl` tests updated to the real success behavior. **No
-    STM_UB_VERSION bump** — no on-disk format change.
+- **Tip**: 9.7-impl-4 — the snapshot rollback mechanism — shipped +
+  R160 audit closed. R160 verdict: **0 P0, 1 P1, 2 P2, 4 P3**; the P1
+  + both P2s fixed in the close commit.
+  - **9.7-impl-4** (`585b5ee` + R160 close): `stm_fs_rollback_snapshot`
+    filled in (the TLY-A5 `STM_ENOTSUPPORTED` stub is retired).
+    Mechanism is **validate-then-swap**: refuse if a newer snapshot
+    exists (v1.0 limitation) → **validate** the snapshot's captured
+    `(di_tree_root, di_root_gen, di_root_csum)` triple via
+    `stm_dataset_index_verify_engine_at` (a throwaway engine opened at
+    the triple + `stm_btree_engine_verify`; bad triple ⇒ STM_ECORRUPT,
+    fs not wedged — a true no-op) → drain dirty buffers → swap the
+    dataset entry's triple to the snapshot's via
+    `stm_dataset_index_set_engine_root` → `stm_snapshot_clear_dead_
+    lists` on the target → `stm_sync_commit` (R154 Q2 wedge on
+    failure). The commit's gen advance is the AEAD-nonce bump; v2's
+    rollback does NOT roll back the allocator, so there is no allocator
+    swap to "bump before" (the v1 R9-1 doctrine is subsumed). Three new
+    APIs: `stm_dataset_index_set_engine_root` (force a slot triple),
+    `stm_dataset_index_verify_engine_at` (throwaway-engine triple
+    verify), `stm_snapshot_clear_dead_lists` (empty a snapshot's 3
+    dead-lists in place). **Block reclamation of the post-snapshot
+    divergence is forward-noted to 9.7-impl-4b** — diverged engine
+    nodes + data extents LEAK (stay allocated, untracked; a space cost,
+    never a corruption — a leaked block is never reissued so the AEAD
+    nonce stays unique). impl-4b also lifts the newer-snapshot refusal.
+    **No STM_UB_VERSION bump** — no on-disk format change.
+  - **R160 P1-1**: the verify originally ran AFTER the destructive
+    dirty-buffer drain — a verify-fail then silently lost the caller's
+    un-committed writes while reporting a "clean no-op". Fixed by
+    `stm_dataset_index_verify_engine_at` + reordering validation BEFORE
+    the drain. **R160 P2-1**: `clear_dead_lists` docstring corrected
+    re the cold (CAS-refcount) tier. **R160 P2-2**: 2 e2e tests added
+    (`fs_rollback_reverts_dirent_and_inode`,
+    `fs_rollback_then_delete_snapshot_no_live_block_freed`). P3s: dead
+    branch acknowledged; `dataset_triple_is_empty` helper extracted;
+    `stm_btree_engine_verify` docstring tightened. Two stub-pinned
+    TLY-A5 `test_ctl` tests updated to the real success behavior.
   - **9.7-impl-3** (`7e67ded` + `2604ede`, R159): `stm_snapshot_
     entry` gained `root_gen` + `root_csum[32]`; `stm_fs_create_
     snapshot` captures the dataset's real committed triple (the
@@ -76,7 +90,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     flake ([[flake-per-inode-cfr-concurrent]]), confirmed pre-existing
     by stash + retest at the clean tip. `test_snapshot` 58,
     `test_dataset` 73, `test_fs` 180, `test_ctl` 149.
-  - **What's next**: R160 audit → 9.7-impl-5 (readable `.snaps/`).
+  - **What's next**: 9.7-impl-4b (rollback block reclamation + lift
+    the newer-snapshot refusal) → 9.7-impl-5 (readable `.snaps/`).
 
 - **Pre-tip-0**: Phase 9.7-impl-1c-vi (`3afa915`) — the pool-global-engine
   retirement closes. The four `stm_sync` mirror fields
