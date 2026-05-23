@@ -1413,6 +1413,73 @@ stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
                                            uint64_t *out_id);
 
 /*
+ * 9.7-impl-6e: create a clone — a new dataset that originates from a
+ * PRESENT snapshot. Composes `stm_dataset_create_clone` (mints the
+ * clone's id, stamps `origin_snap_id`) + `stm_snapshot_hold` (keeps
+ * the origin alive for the clone's lifetime; the registered clone-
+ * check cb at delete time refuses delete while any clone references
+ * the snap) + `stm_dataset_index_set_engine_root` (copies the
+ * snapshot's captured (tree_root_paddr, root_gen, root_csum) triple
+ * into the new dataset's (di_tree_root, di_root_gen, di_root_csum) so
+ * the clone's tree is the snap's tree — the share-root mechanism per
+ * phase-9.7-design.md §9.1.2) + `stm_sync_add_dataset_key` (a fresh
+ * per-dataset DEK; the clone's new writes stamp the clone's key_id on
+ * each extent, reads of shared extents use the origin's stamped
+ * key_id via the pool-global keyschema). Held under `fs->global` EX
+ * across every step so an observer never sees a half-built clone.
+ *
+ * Spec composition (no spec change at impl-6e): realises
+ * `clone.tla::CloneCreate` against existing actions.
+ *
+ * Wrap-key source: same posture as `stm_fs_create_dataset` — binds to
+ * the mount-time keyfile / janus source (R45 P2-1 carry).
+ *
+ * Rollback discipline (mirrors `stm_fs_create_dataset`'s post-
+ * create-child + add-key sequence): if any post-`create_clone` step
+ * fails the clone is destroyed via `stm_dataset_destroy`; if hold
+ * succeeded but a subsequent step fails the hold is released. Both
+ * rollback steps are infallible by construction (freshly-created
+ * non-root leaf + the hold we just took).
+ *
+ * v1.0 forward-noted limitations (phase-9.7-design.md §9.1.4):
+ * `stm_fs_create_snapshot` on a clone refuses STM_ENOTSUPPORTED;
+ * `stm_fs_promote_clone` refuses STM_ENOTSUPPORTED; rollback to a
+ * snap with PRESENT clones refuses STM_EBUSY in the cascade pre-
+ * validate. Other writable surfaces on the clone (write / mkdir / ...)
+ * work transparently; the per-extent `key_id` makes the per-extent
+ * cross-DEK dispatch self-describing.
+ *
+ * Returns STM_OK with `*out_id` set. STM_EINVAL on NULL args / zero
+ * origin_snap_id / bad name / zero parent_id. STM_ENOENT if origin
+ * snap is not PRESENT OR parent dataset is not PRESENT.
+ * STM_EEXIST on sibling-name collision. Errors propagate from
+ * `stm_snapshot_hold`, `stm_dataset_create_clone`,
+ * `stm_dataset_index_set_engine_root`, and `stm_sync_add_dataset_key`.
+ */
+STM_MUST_USE
+stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
+                                  const char *name,
+                                  uint64_t origin_snap_id,
+                                  uint64_t *out_clone_id);
+
+/*
+ * 9.7-impl-6e: promote a clone — clears the clone's origin
+ * dependency so the previously-referenced snapshot becomes deletable.
+ *
+ * v1.0 stub: refuses STM_ENOTSUPPORTED unconditionally. The full
+ * mechanism (ARCH §8.6.2 snap-chain reshuffling, where the previously-
+ * referenced snap becomes a "descendant of the clone") needs per-block-
+ * birth deadlist tracking to keep the shared paddrs sound across the
+ * chain reversal — deferred to v1.x. The API is forward-defined so
+ * callers can adopt it once the v1.x mechanism lands.
+ *
+ * STM_EINVAL on NULL fs / zero clone_dataset_id.
+ * STM_ENOTSUPPORTED on every other input at v1.0.
+ */
+STM_MUST_USE
+stm_status stm_fs_promote_clone(stm_fs *fs, uint64_t clone_dataset_id);
+
+/*
  * P9-9P-1a: initialize a freshly-created dataset's root inode.
  *
  * Allocates a directory inode at `dataset_id`'s ino space. The

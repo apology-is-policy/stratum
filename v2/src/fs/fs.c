@@ -1218,6 +1218,15 @@ stm_status stm_fs_mount(const char *path,
         return STM_ENOMEM;
     }
 
+    /* 9.7-impl-6e: clone_check_cb wiring is ALREADY done by
+     * stm_sync_open + stm_sync_create (sync.c::sync_clone_check_cb).
+     * No fs.c install needed — the snapshot index in fs->sync already
+     * has the cb bound to fs->sync's dataset_idx by the time we
+     * return here. The design's "fs.c installs a callback at mount"
+     * note (§9.1.5) was historical drift; sync.c got there first at
+     * P6-clone time. clone.tla::SnapWithClonesUndeletable enforcement
+     * is therefore live at mount with no impl-6e wiring required. */
+
     /* SWISS-4m1: cache the UNWRAPPED hybrid keypair for later
      * stm_fs_create_dataset reloads. Eliminates the SWISS-4m cached-
      * passphrase posture — plaintext bytes no longer survive past the
@@ -6475,6 +6484,167 @@ stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
 }
 
 /* ========================================================================= */
+/* Clones (9.7-impl-6e).                                                      */
+/* ========================================================================= */
+
+stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
+                                  const char *name,
+                                  uint64_t origin_snap_id,
+                                  uint64_t *out_clone_id)
+{
+    if (!fs || !name || !out_clone_id) return STM_EINVAL;
+    if (parent_id == 0) return STM_EINVAL;
+    if (origin_snap_id == STM_DATASET_NO_ORIGIN) return STM_EINVAL;
+    *out_clone_id = 0;
+
+    /* Wrap-key source — same R45 P2-1 binding as stm_fs_create_dataset. */
+    int have_kf = fs->keyfile_path != NULL;
+    int have_jn = fs->janus_socket != NULL;
+    if (have_kf == have_jn) return STM_ECORRUPT;
+
+    stm_hybrid_keys   wk    = {0};
+    stm_janus_client *janus = NULL;
+    if (have_kf) {
+        if (fs->cached_keys) {
+            memcpy(wk.pk, fs->cached_keys->pk, sizeof wk.pk);
+            memcpy(wk.sk, fs->cached_keys->sk, sizeof wk.sk);
+        } else {
+            stm_status ks = stm_keyfile_load(fs->keyfile_path, &wk);
+            if (ks != STM_OK) return ks;
+        }
+    } else {
+        stm_status js = stm_janus_client_connect(fs->janus_socket, &janus);
+        if (js != STM_OK) return js;
+    }
+
+    pthread_rwlock_wrlock(&fs->global);
+    if (fs->wedged) {
+        pthread_rwlock_unlock(&fs->global);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return STM_EWEDGED;
+    }
+    if (fs->read_only) {
+        pthread_rwlock_unlock(&fs->global);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return STM_EROFS;
+    }
+
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!didx || !sidx) {
+        pthread_rwlock_unlock(&fs->global);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return STM_ECORRUPT;
+    }
+
+    /* Resolve the origin snap — must be PRESENT (else STM_ENOENT). The
+     * lookup captures the snap's (tree_root_paddr, root_gen, root_csum)
+     * triple, which we will stamp into the clone's slot below. */
+    stm_snapshot_entry origin;
+    stm_status s = stm_snapshot_lookup(sidx, origin_snap_id, &origin);
+    if (s != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+
+    /* Mint the clone dataset entry. stm_dataset_create_clone refuses
+     * STM_EINVAL on origin == about-to-be-allocated id (self-reference),
+     * STM_ENOENT on parent-not-PRESENT, STM_EEXIST on sibling-name
+     * collision, STM_EOVERFLOW on counter saturation, STM_ENOMEM on
+     * alloc failure. On success: present=true, origin_snap_id stamped,
+     * di_tree_root triple all-zero (the next step swaps it). */
+    uint64_t new_id = 0;
+    s = stm_dataset_create_clone(didx, parent_id, name, origin_snap_id,
+                                    &new_id);
+    if (s != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+
+    /* Hold the origin snap so it stays PRESENT for the clone's lifetime.
+     * The clone_check_cb installed at mount ALSO gates delete on
+     * "any PRESENT clone references this snap", but the explicit hold
+     * is defense-in-depth + a clean rollback signal (if hold succeeds
+     * then we know we own a release we can pair with on rollback). */
+    s = stm_snapshot_hold(sidx, origin_snap_id);
+    if (s != STM_OK) {
+        /* Origin snap deleted between lookup + hold under our EX lock
+         * is impossible (snapshot mutators take EX); a hold failure is
+         * therefore STM_ECORRUPT or an unexpected internal error. Roll
+         * back the freshly-created clone. */
+        (void)stm_dataset_destroy(didx, new_id);
+        pthread_rwlock_unlock(&fs->global);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+
+    /* Stamp the origin snap's captured triple into the clone's slot
+     * (the share-root mechanism per phase-9.7-design.md §9.1.2). The
+     * clone's next engine open will then create no fresh tree but open
+     * AT the origin's captured root — the engine's COW machinery will
+     * COW every diverged node on first mutation. set_engine_root
+     * refuses STM_EBUSY if a commit-flush is pending on the slot; that
+     * cannot happen on a freshly-created PRESENT slot (no engine has
+     * opened it yet). */
+    s = stm_dataset_index_set_engine_root(didx, new_id,
+                                             origin.tree_root_paddr,
+                                             origin.root_gen,
+                                             origin.root_csum);
+    if (s != STM_OK) {
+        (void)stm_snapshot_release(sidx, origin_snap_id);
+        (void)stm_dataset_destroy(didx, new_id);
+        pthread_rwlock_unlock(&fs->global);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+
+    /* Provision the clone's per-dataset DEK (§9.1.3). The clone's new
+     * writes will stamp the clone's key_id; reads of shared extents
+     * use the origin's stamped key_id via the pool-global keyschema. */
+    uint64_t new_kid = 0;
+    s = stm_sync_add_dataset_key(fs->sync, new_id,
+                                    have_kf ? &wk : NULL,
+                                    have_jn ? janus : NULL,
+                                    &new_kid);
+    if (s != STM_OK) {
+        (void)stm_snapshot_release(sidx, origin_snap_id);
+        (void)stm_dataset_destroy(didx, new_id);
+        pthread_rwlock_unlock(&fs->global);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+
+    *out_clone_id = new_id;
+    pthread_rwlock_unlock(&fs->global);
+    stm_hybrid_keys_wipe(&wk);
+    if (janus) stm_janus_client_disconnect(janus);
+    return STM_OK;
+}
+
+stm_status stm_fs_promote_clone(stm_fs *fs, uint64_t clone_dataset_id)
+{
+    if (!fs) return STM_EINVAL;
+    if (clone_dataset_id == 0) return STM_EINVAL;
+    /* v1.0 stub — phase-9.7-design.md §9.1.4. Promote requires the
+     * ARCH §8.6.2 snap-chain reshuffling (the snap that was the origin
+     * becomes a "descendant of the clone") + per-block-birth deadlist
+     * tracking to keep shared paddrs sound across the chain reversal.
+     * Deferred to v1.x; this stub surfaces the surface so callers can
+     * adopt the API once the v1.x mechanism lands. */
+    return STM_ENOTSUPPORTED;
+}
+
+/* ========================================================================= */
 /* Dataset property wrappers (P7-CAS-13).                                     */
 /*                                                                            */
 /* Thin pass-through wrappers around the dataset.c property API. Take         */
@@ -6776,6 +6946,20 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
         if (pgrc != STM_OK) {
             pthread_rwlock_unlock(&fs->global);
             return pgrc;     /* STM_ENOENT for a missing dataset */
+        }
+        /* 9.7-impl-6e: snap-of-clone refusal — phase-9.7-design.md
+         * §9.1.4. Taking a snapshot of a clone needs per-block-birth
+         * deadlist tracking (the clone's tree shares blocks with the
+         * origin snap; a naive snap of the clone would either
+         * double-count those blocks in dead-lists or fail to reclaim
+         * post-snap divergence correctly). Deferred to v1.x; v1.0
+         * refuses STM_ENOTSUPPORTED. The gate runs BEFORE
+         * stm_sync_commit so a refused snap-of-clone has NO durable
+         * side effect (R160 P1-1 doctrine — same posture as the
+         * presence gate above). */
+        if (de_gate.origin_snap_id != STM_DATASET_NO_ORIGIN) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_ENOTSUPPORTED;
         }
     }
 
@@ -8287,11 +8471,22 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     /* 9.7-impl-4d: collect every newer-than-target PRESENT snap. Then
      * pre-validate (R160 P1-1) that NONE is held — a held snap is a
      * refusable precondition; refuse with STM_EBUSY BEFORE the
-     * destructive dirty-buffer drain. Future v1.x may extend this gate
-     * (e.g., refuse if any newer snap has a clone — clones don't exist
-     * at v2.0, so the gate is empty for now; stm_snapshot_delete will
-     * STM_EBUSY at cascade time if one appears, which is best-effort
-     * post-drain but space-only). */
+     * destructive dirty-buffer drain.
+     *
+     * 9.7-impl-6e — phase-9.7-design.md §9.1.6: the gate ALSO refuses
+     * when ANY newer snap has a PRESENT clone referencing it. Without
+     * this, the cascade's stm_snapshot_delete on a cloned newer snap
+     * would either fire the clone-check cb (STM_EBUSY post-drain — a
+     * best-effort, space-only failure that leaves the rollback half-
+     * done) OR (if the cb were skipped) leave a clone dangling with no
+     * extant origin snap, breaking clone.tla::CloneOriginPresent. The
+     * pre-validate is the load-bearing refusal: a refused rollback is
+     * a true no-op (no destructive step taken). */
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ECORRUPT;
+    }
     uint64_t *newer_ids = NULL;
     size_t    n_newer   = 0;
     s = stm_snapshot_collect_newer(sidx, dataset_id, snapshot_id,
@@ -8317,13 +8512,26 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
             pthread_rwlock_unlock(&fs->global);
             return STM_EBUSY;
         }
-    }
-
-    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
-    if (!didx) {
-        free(newer_ids);
-        pthread_rwlock_unlock(&fs->global);
-        return STM_ECORRUPT;
+        /* 9.7-impl-6e clone-refusal: refuse if any PRESENT clone
+         * references this newer snap. Fail-closed on count-lookup
+         * error (STM_ECORRUPT propagates, NOT silent ALLOW — the
+         * cascade itself would later observe the clone via the
+         * clone_check_cb post-drain, where the refusal becomes
+         * space-only). */
+        size_t n_clones = 0;
+        stm_status cs = stm_dataset_clones_count_for_snap(didx,
+                                                             newer_ids[i],
+                                                             &n_clones);
+        if (cs != STM_OK) {
+            free(newer_ids);
+            pthread_rwlock_unlock(&fs->global);
+            return cs;
+        }
+        if (n_clones > 0) {
+            free(newer_ids);
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EBUSY;
+        }
     }
 
     /* 9.7-impl-4b: capture the pre-rollback live root triple BEFORE the

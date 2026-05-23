@@ -87,6 +87,36 @@ NOT call back into `stm_dataset_*` (deadlock — ERRORCHECK aborts).
 enforce `clone.tla::SnapWithClonesUndeletable` at snap-delete time.
 A snapshot with one or more present clones is undeletable.
 
+### fs-level clone wrappers (9.7-impl-6e)
+
+```c
+stm_status stm_fs_create_clone (fs, parent_id, name, origin_snap_id, *out_clone_id);
+stm_status stm_fs_promote_clone(fs, clone_dataset_id);  /* v1.0: STM_ENOTSUPPORTED */
+```
+
+`stm_fs_create_clone` composes `stm_dataset_create_clone` +
+`stm_snapshot_hold(origin)` + `stm_dataset_index_set_engine_root`
+(stamps the origin snap's captured triple into the clone's slot —
+the share-root mechanism per `phase-9.7-design.md §9.1.2`) +
+`stm_sync_add_dataset_key` (clone's fresh per-dataset DEK). Held
+under `fs->global` EX across every step; on any post-create failure
+rollback chains stm_snapshot_release + stm_dataset_destroy (both
+infallible by construction on a freshly-created leaf + a hold-we-
+own).
+
+`stm_fs_promote_clone` is a v1.0 stub returning STM_ENOTSUPPORTED;
+the full mechanism (ARCH §8.6.2 snap-chain reshuffling) needs per-
+block-birth deadlist tracking deferred to v1.x.
+
+`stm_fs_create_snapshot` refuses STM_ENOTSUPPORTED when the target
+dataset has `origin_snap_id != STM_DATASET_NO_ORIGIN` (snap-of-
+clone forward-noted to v1.x).
+
+`stm_fs_rollback_snapshot`'s newer-snapshot cascade pre-validate
+ALSO refuses STM_EBUSY when any newer snap has
+`stm_dataset_clones_count_for_snap > 0` — closes the §6.10 P2-1
+forward-note's latent corruption window.
+
 ### Property API
 
 ```c
