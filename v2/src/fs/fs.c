@@ -228,6 +228,400 @@ struct stm_fs {
 } while (0)
 
 /* ========================================================================= */
+/* 9.7-impl-5: synthetic inode encoding for .snaps/ mount surface.            */
+/*                                                                            */
+/* The .snaps/ namespace is a stateless namespace projection of frozen        */
+/* snapshot trees onto the live mount. Synthetic inodes occupy the high      */
+/* half of the 64-bit ino space (bit 63 = 1); live inodes always have bit    */
+/* 63 = 0 because the allocator grows from 1 monotonically and would need    */
+/* ~2^63 inodes per dataset before colliding with the synthetic range.       */
+/*                                                                            */
+/* Encoding (within bit 63 = 1):                                              */
+/*   - The sentinel value `1ULL << 63` (i.e., snap_id=0 + frozen_ino=0) is   */
+/*     SNAPS_PARENT — the synthetic ".snaps" dir at every dataset root.      */
+/*     The dataset_id arg to the fs API call discriminates per-dataset.     */
+/*   - All other synth values: bits 62..32 = snap_id (31 bits, range        */
+/*     [1, 2^31)); bits 31..0 = frozen_ino (32 bits, range [1, 2^32)).      */
+/*     This is a SNAP_VIEW inode in snap_id's frozen tree.                   */
+/*                                                                            */
+/* Saturation: snap_id ≥ 2^31 OR frozen_ino ≥ 2^32 cannot be projected;     */
+/* synthesis returns STM_EOVERFLOW. At practical scales (millions of snaps   */
+/* + billions of inodes per dataset) these caps are unreachable; the gates  */
+/* exist so a hypothetical pathological pool surfaces an error rather than  */
+/* silently corrupting the encoding.                                         */
+/*                                                                            */
+/* Resolution: the fs.c layer recognizes synth inos at the top of each      */
+/* public op, routes reads through throwaway-engine helpers against the     */
+/* snapshot's captured (root_paddr, root_gen, root_csum) triple, and        */
+/* refuses writes with STM_EROFS. v1.0 scope: lookup / stat / readdir /     */
+/* readlink / INLINE read. EXTENT (regular-file) reads are deferred to     */
+/* impl-5b. See docs/phase-9.7-design.md §8.                                 */
+/* ========================================================================= */
+
+#define FS_SYNTH_TAG          (1ULL << 63)
+#define FS_SYNTH_INO_BITS     32u
+#define FS_SYNTH_SNAP_BITS    31u
+#define FS_SYNTH_INO_MASK     ((1ULL << FS_SYNTH_INO_BITS) - 1u)
+#define FS_SYNTH_SNAP_MASK    ((1ULL << FS_SYNTH_SNAP_BITS) - 1u)
+#define FS_SYNTH_SNAP_SHIFT   FS_SYNTH_INO_BITS
+
+/* The SNAPS_PARENT sentinel — synth tag + snap_id=0 + frozen_ino=0.
+ * Lookup at (dataset_root_ino, ".snaps") returns this; readdir on it
+ * enumerates the dataset's PRESENT snaps. */
+#define FS_SNAPS_PARENT_INO   FS_SYNTH_TAG
+
+/* The literal ".snaps" name we recognize at every dataset root. The
+ * length is 6; longer / shorter names with the same prefix fall through
+ * to regular dirent lookup as ordinary file names. */
+static const uint8_t FS_SNAPS_NAME[6] = { '.', 's', 'n', 'a', 'p', 's' };
+#define FS_SNAPS_NAME_LEN     6u
+
+static inline bool fs_ino_is_synth(uint64_t ino) {
+    return (ino & FS_SYNTH_TAG) != 0u;
+}
+
+static inline bool fs_ino_is_snaps_parent(uint64_t ino) {
+    return ino == FS_SNAPS_PARENT_INO;
+}
+
+static inline uint64_t fs_synth_snap_id(uint64_t ino) {
+    return (ino >> FS_SYNTH_SNAP_SHIFT) & FS_SYNTH_SNAP_MASK;
+}
+
+static inline uint64_t fs_synth_frozen_ino(uint64_t ino) {
+    return ino & FS_SYNTH_INO_MASK;
+}
+
+/* Encode a (snap_id, frozen_ino) pair as a synthetic inode. Refuses
+ * STM_EOVERFLOW on saturation; refuses STM_EINVAL on the zero-snap
+ * AND zero-ino case (which would collide with FS_SNAPS_PARENT_INO).
+ * The bits-31..0 result fits in `*out_ino`. */
+static inline stm_status fs_synth_encode(uint64_t snap_id, uint64_t frozen_ino,
+                                            uint64_t *out_ino) {
+    if (!out_ino) return STM_EINVAL;
+    *out_ino = 0;
+    if (snap_id == 0u || frozen_ino == 0u) return STM_EINVAL;
+    if (snap_id > FS_SYNTH_SNAP_MASK) return STM_EOVERFLOW;
+    if (frozen_ino > FS_SYNTH_INO_MASK) return STM_EOVERFLOW;
+    *out_ino = FS_SYNTH_TAG | (snap_id << FS_SYNTH_SNAP_SHIFT) | frozen_ino;
+    return STM_OK;
+}
+
+/* Predicate matching ".snaps" exactly. A lookup with this name at
+ * (live) ino=1 of any dataset returns FS_SNAPS_PARENT_INO; at any
+ * other parent ino, it falls through to regular dirent lookup (in
+ * which case it would normally STM_ENOENT — ".snaps" isn't a stored
+ * dirent). */
+static inline bool fs_name_eq_snaps(const uint8_t *name, uint8_t name_len) {
+    return name_len == FS_SNAPS_NAME_LEN
+        && memcmp(name, FS_SNAPS_NAME, FS_SNAPS_NAME_LEN) == 0;
+}
+
+/* Synthesize a stat value for the SNAPS_PARENT directory: a synthetic
+ * dir with mode 0555 (r-xr-xr-x), root-owned, size 0. Timestamps are
+ * stamped from CLOCK_REALTIME so callers don't see all-zero times. */
+static void fs_synth_stat_snaps_parent(struct stm_inode_value *out_iv) {
+    memset(out_iv, 0, sizeof *out_iv);
+    out_iv->si_ino        = stm_store_le64(FS_SNAPS_PARENT_INO);
+    out_iv->si_dataset_id = stm_store_le64(0u);
+    out_iv->si_gen        = stm_store_le64(0u);
+    out_iv->si_mode       = stm_store_le32((uint32_t)S_IFDIR | 0555u);
+    out_iv->si_uid        = stm_store_le32(0u);
+    out_iv->si_gid        = stm_store_le32(0u);
+    out_iv->si_nlink      = stm_store_le32(2u);     /* "." + ".." */
+    /* Timestamps left zero (epoch) — synthetic dir has no meaningful
+     * mtime/btime; callers presenting the dir via stat(2) get
+     * 1970-01-01 which is the conventional "synthetic" marker. A
+     * future v1.x could stamp these from CLOCK_REALTIME for a more
+     * natural display; deferred since the value is non-load-bearing. */
+    out_iv->si_size       = stm_store_le64(0u);
+    out_iv->si_allocated  = stm_store_le64(0u);
+    out_iv->si_data_kind  = STM_DATA_EXTENT;        /* nominal — synth dir */
+    out_iv->si_data_len   = 0u;
+}
+
+/* Lookup a snapshot by id AND verify it belongs to `dataset_id`.
+ * Mirrors `stm_snapshot_lookup` plus the dataset-membership check.
+ * Returns STM_ENOENT on missing OR on dataset mismatch (defense-in-
+ * depth — a caller passing the wrong dataset_id with a valid snap_id
+ * shouldn't expose the snap's data). */
+static stm_status fs_synth_snap_lookup(stm_fs *fs,
+                                          uint64_t dataset_id,
+                                          uint64_t snap_id,
+                                          stm_snapshot_entry *out_entry) {
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!sidx) return STM_EINVAL;
+    stm_status s = stm_snapshot_lookup(sidx, snap_id, out_entry);
+    if (s != STM_OK) return s;
+    if (out_entry->dataset_id != dataset_id) return STM_ENOENT;
+    return STM_OK;
+}
+
+/* Stat a SNAP_VIEW inode: look up the frozen-tree inode value at
+ * (snap.tree_root_*, frozen_ino) via the throwaway-engine path.
+ * Returns the 256-byte inode value verbatim (frozen mode bits / size /
+ * times) — the read-only contract is enforced at write entry, not by
+ * masking the displayed mode bits. */
+static stm_status fs_snap_view_stat(stm_fs *fs,
+                                       uint64_t dataset_id,
+                                       uint64_t synth_ino,
+                                       struct stm_inode_value *out_iv) {
+    if (!fs_ino_is_synth(synth_ino)) return STM_EINVAL;
+    if (fs_ino_is_snaps_parent(synth_ino)) {
+        fs_synth_stat_snaps_parent(out_iv);
+        return STM_OK;
+    }
+    uint64_t snap_id    = fs_synth_snap_id(synth_ino);
+    uint64_t frozen_ino = fs_synth_frozen_ino(synth_ino);
+    if (snap_id == 0u || frozen_ino == 0u) return STM_EINVAL;
+
+    stm_snapshot_entry e;
+    stm_status ss = fs_synth_snap_lookup(fs, dataset_id, snap_id, &e);
+    if (ss != STM_OK) return ss;
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) return STM_EINVAL;
+    return stm_inode_lookup_at_root(iidx, dataset_id,
+                                       e.tree_root_paddr, e.root_gen,
+                                       e.root_csum,
+                                       frozen_ino, out_iv);
+}
+
+/* Lookup `name` under SNAPS_PARENT for `dataset_id`: walks the snap
+ * index, finds the PRESENT snap whose `name` matches, returns its
+ * synthetic root inode. Mirrors the regular `stm_fs_lookup` shape
+ * (out_child_ino on success; STM_ENOENT on miss). */
+typedef struct {
+    uint64_t        dataset_id;
+    const uint8_t  *name;
+    uint8_t         name_len;
+    uint64_t        out_snap_id;
+    bool            found;
+} fs_snap_by_name_ctx;
+
+static bool fs_snap_by_name_cb(const stm_snapshot_entry *e, void *ctx_) {
+    fs_snap_by_name_ctx *c = ctx_;
+    if (e->dataset_id != c->dataset_id) return true;     /* keep iterating */
+    if (e->name_len != (uint32_t)c->name_len) return true;
+    if (memcmp(e->name, c->name, c->name_len) != 0) return true;
+    c->out_snap_id = e->snapshot_id;
+    c->found = true;
+    return false;                                          /* stop iteration */
+}
+
+static stm_status fs_snaps_parent_lookup_by_name(stm_fs *fs,
+                                                    uint64_t dataset_id,
+                                                    const uint8_t *name,
+                                                    uint8_t name_len,
+                                                    uint64_t *out_synth_ino) {
+    *out_synth_ino = 0;
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!sidx) return STM_EINVAL;
+
+    fs_snap_by_name_ctx c = {
+        .dataset_id  = dataset_id,
+        .name        = name,
+        .name_len    = name_len,
+        .out_snap_id = 0,
+        .found       = false,
+    };
+    stm_status s = stm_snapshot_iter(sidx, fs_snap_by_name_cb, &c);
+    if (s != STM_OK) return s;
+    if (!c.found) return STM_ENOENT;
+
+    /* Snap root ino = frozen_ino = 1 (the dataset root) inside the
+     * captured tree. */
+    return fs_synth_encode(c.out_snap_id, 1u, out_synth_ino);
+}
+
+/* Lookup `name` inside a SNAP_VIEW directory (synth_parent_ino with
+ * snap_id>0 + frozen_ino>0). Routes the dirent walk to the frozen
+ * tree via stm_dirent_lookup_at_root. The result is encoded back as
+ * SNAP_VIEW(snap_id, child_frozen_ino). */
+static stm_status fs_snap_view_lookup(stm_fs *fs,
+                                         uint64_t dataset_id,
+                                         uint64_t synth_parent_ino,
+                                         const uint8_t *name,
+                                         uint8_t name_len,
+                                         uint64_t *out_synth_child_ino) {
+    *out_synth_child_ino = 0;
+    uint64_t snap_id    = fs_synth_snap_id(synth_parent_ino);
+    uint64_t parent_frozen = fs_synth_frozen_ino(synth_parent_ino);
+    if (snap_id == 0u || parent_frozen == 0u) return STM_EINVAL;
+
+    stm_snapshot_entry e;
+    stm_status ss = fs_synth_snap_lookup(fs, dataset_id, snap_id, &e);
+    if (ss != STM_OK) return ss;
+
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!didx) return STM_EINVAL;
+
+    uint64_t child_frozen = 0;
+    stm_status ls = stm_dirent_lookup_at_root(didx, dataset_id,
+                                                 e.tree_root_paddr, e.root_gen,
+                                                 e.root_csum,
+                                                 parent_frozen,
+                                                 name, name_len,
+                                                 &child_frozen, NULL, NULL);
+    if (ls != STM_OK) return ls;
+
+    return fs_synth_encode(snap_id, child_frozen, out_synth_child_ino);
+}
+
+/* Readdir of the SNAPS_PARENT dir: list PRESENT snaps of `dataset_id`.
+ * Cursor is the next snap_id to emit (ascending). Each entry's child_ino
+ * is SNAP_VIEW(snap_id, 1); name is the snap's name; type is DT_DIR. */
+typedef struct {
+    uint64_t                 dataset_id;
+    uint64_t                 cursor;       /* min snap_id to emit */
+    stm_fs_dirent_entry     *out;
+    size_t                   out_max;
+    size_t                   out_n;
+    uint64_t                 last_emit_id; /* for next cursor */
+    stm_status               err;
+} fs_snaps_readdir_ctx;
+
+static bool fs_snaps_readdir_cb(const stm_snapshot_entry *e, void *ctx_) {
+    fs_snaps_readdir_ctx *c = ctx_;
+    if (e->dataset_id != c->dataset_id) return true;        /* keep iterating */
+    if (e->snapshot_id < c->cursor) return true;
+    if (c->out_n >= c->out_max) return false;               /* batch full */
+
+    /* R71 P1-1 defense-in-depth: refuse anomalous frozen records. The
+     * snap name decoder already enforces these (see snapshot.c
+     * stm_snap_name_chars_valid), but a buggy refactor could let
+     * a record slip through with bytes outside [0x20, 0x7E]. */
+    if (e->name_len == 0u || e->name_len > STM_DIRENT_NAME_MAX) {
+        c->err = STM_ECORRUPT;
+        return false;
+    }
+
+    uint64_t synth = 0;
+    stm_status es = fs_synth_encode(e->snapshot_id, /*frozen_ino=*/1u, &synth);
+    if (es != STM_OK) {
+        /* Saturation — snap_id >= 2^31. Skip this entry; the readdir
+         * surfaces successful entries + the cursor saturates on the
+         * highest emitted id. A future v1.x could expose an explicit
+         * "snap unavailable in .snaps namespace" error to callers. */
+        return true;
+    }
+
+    stm_fs_dirent_entry *o = &c->out[c->out_n];
+    memset(o, 0, sizeof *o);
+    o->child_ino  = synth;
+    o->child_gen  = 0u;          /* synth */
+    o->child_type = STM_DT_DIR;
+    o->name_len   = (uint8_t)e->name_len;
+    memcpy(o->name, e->name, e->name_len);
+    c->out_n++;
+    c->last_emit_id = e->snapshot_id;
+    return true;
+}
+
+static stm_status fs_snaps_parent_readdir(stm_fs *fs,
+                                             uint64_t dataset_id,
+                                             uint64_t *cursor,
+                                             stm_fs_dirent_entry *out_entries,
+                                             size_t max_entries,
+                                             size_t *out_returned) {
+    *out_returned = 0;
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!sidx) return STM_EINVAL;
+
+    fs_snaps_readdir_ctx c = {
+        .dataset_id   = dataset_id,
+        .cursor       = *cursor,
+        .out          = out_entries,
+        .out_max      = max_entries,
+        .out_n        = 0,
+        .last_emit_id = 0,
+        .err          = STM_OK,
+    };
+    stm_status s = stm_snapshot_iter(sidx, fs_snaps_readdir_cb, &c);
+    if (s != STM_OK) return s;
+    if (c.err != STM_OK) return c.err;
+
+    *out_returned = c.out_n;
+    if (c.out_n > 0u) {
+        /* Advance cursor past the last emitted id; saturate at UINT64_MAX
+         * so callers can detect end-of-iteration via the same sentinel
+         * the live readdir uses. */
+        *cursor = (c.last_emit_id == UINT64_MAX)
+                     ? UINT64_MAX
+                     : (c.last_emit_id + 1u);
+    }
+    /* On empty batch we leave *cursor unchanged; the live readdir does
+     * the same (returns STM_OK with out_returned=0 to signal done). */
+    return STM_OK;
+}
+
+/* Readdir of a SNAP_VIEW dir: route the dirent_readdir to the frozen
+ * tree, translate each child_ino → SNAP_VIEW(snap_id, child_frozen_ino).
+ * The cursor + max_entries semantics carry verbatim from
+ * stm_dirent_readdir_at_root. */
+static stm_status fs_snap_view_readdir(stm_fs *fs,
+                                          uint64_t dataset_id,
+                                          uint64_t synth_dir_ino,
+                                          uint64_t *cursor,
+                                          stm_fs_dirent_entry *out_entries,
+                                          size_t max_entries,
+                                          size_t *out_returned) {
+    *out_returned = 0;
+    uint64_t snap_id     = fs_synth_snap_id(synth_dir_ino);
+    uint64_t dir_frozen  = fs_synth_frozen_ino(synth_dir_ino);
+    if (snap_id == 0u || dir_frozen == 0u) return STM_EINVAL;
+
+    stm_snapshot_entry e;
+    stm_status ss = fs_synth_snap_lookup(fs, dataset_id, snap_id, &e);
+    if (ss != STM_OK) return ss;
+
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!didx) return STM_EINVAL;
+
+    /* Borrow the caller's batch buffer for the underlying readdir,
+     * then translate child_ino in place + copy into the fs_layer
+     * dirent shape. */
+    if (max_entries > SIZE_MAX / sizeof(stm_dirent_entry)) return STM_ENOMEM;
+    stm_dirent_entry *batch = malloc(max_entries * sizeof *batch);
+    if (!batch) return STM_ENOMEM;
+
+    size_t got = 0;
+    stm_status rs = stm_dirent_readdir_at_root(didx, dataset_id,
+                                                  e.tree_root_paddr, e.root_gen,
+                                                  e.root_csum,
+                                                  dir_frozen, cursor,
+                                                  batch, max_entries, &got);
+    if (rs != STM_OK) {
+        free(batch);
+        return rs;
+    }
+
+    for (size_t k = 0; k < got; k++) {
+        if (batch[k].name_len > STM_DIRENT_NAME_MAX) {
+            free(batch);
+            return STM_ECORRUPT;
+        }
+        uint64_t synth_child = 0;
+        stm_status es = fs_synth_encode(snap_id, batch[k].child_ino,
+                                            &synth_child);
+        if (es != STM_OK) {
+            /* Saturation — frozen_ino >= 2^32. Skip this entry. */
+            continue;
+        }
+        stm_fs_dirent_entry *o = &out_entries[*out_returned];
+        memset(o, 0, sizeof *o);
+        o->child_ino  = synth_child;
+        o->child_gen  = 0u;       /* not exposed for snap-view */
+        o->child_type = batch[k].child_type;
+        o->name_len   = batch[k].name_len;
+        memcpy(o->name, batch[k].name, batch[k].name_len);
+        (*out_returned)++;
+    }
+    free(batch);
+    return STM_OK;
+}
+
+/* ========================================================================= */
 /* P8-POSIX-7a: clock source + ctime/mtime/btime stamping discipline.        */
 /*                                                                            */
 /* Closes the P8-wide R78 P3-3 forward-noted gap. Pre-7a, every inode         */
@@ -1394,6 +1788,9 @@ stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 {
     if (!fs) return STM_EINVAL;
 
+    /* 9.7-impl-5: write to a snap-view inode is structurally forbidden. */
+    if (fs_ino_is_synth(ino)) return STM_EROFS;
+
     /* P9.5-PARALLEL-3 impl-5: SH (rdlock) + per-inode pin happy path
      * for regular files in the inode index. Falls back to EX (wrlock —
      * pre-impl-5 posture) on STM_ENOENT from pin OR on non-regular
@@ -1451,6 +1848,59 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!fs) return STM_EINVAL;
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
+
+    /* 9.7-impl-5: synth-ino read. v1.0 scope: INLINE-only. Inline
+     * data lives in the inode value; one frozen-tree inode lookup
+     * yields the bytes — no extent walk, no AEAD decrypt of separate
+     * data blocks. EXTENT regular files (size > 100 bytes) currently
+     * return STM_ENOTSUPPORTED with a forward-note to impl-5b. Dirs
+     * surface STM_EISDIR; other non-REG kinds STM_EINVAL (same shape
+     * as the live `stm_fs_read` for non-REG targets). */
+    if (fs_ino_is_synth(ino)) {
+        if (fs_ino_is_snaps_parent(ino)) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EISDIR;
+        }
+        struct stm_inode_value iv = {0};
+        stm_status vs = fs_snap_view_stat(fs, dataset_id, ino, &iv);
+        if (vs != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return vs;
+        }
+        uint32_t smode = stm_load_le32(iv.si_mode);
+        if ((smode & (uint32_t)S_IFMT) == (uint32_t)S_IFDIR) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EISDIR;
+        }
+        if ((smode & (uint32_t)S_IFMT) != (uint32_t)S_IFREG) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+        if (iv.si_data_kind == STM_DATA_INLINE) {
+            uint64_t cur_size = stm_load_le64(iv.si_size);
+            if (iv.si_data_len > STM_INODE_INLINE_MAX) {
+                pthread_rwlock_unlock(&fs->global);
+                return STM_ECORRUPT;
+            }
+            if (off >= cur_size) {
+                pthread_rwlock_unlock(&fs->global);
+                return STM_OK;             /* EOF — *out_read stays 0 */
+            }
+            size_t avail = (size_t)(cur_size - off);
+            size_t copy_n = (len < avail) ? len : avail;
+            if (copy_n > 0u && buf) {
+                memcpy(buf, iv.si_data.inline_data + off, copy_n);
+            }
+            if (out_read) *out_read = copy_n;
+            pthread_rwlock_unlock(&fs->global);
+            return STM_OK;
+        }
+        /* EXTENT (regular files > 100 bytes) — forward-noted to
+         * 9.7-impl-5b. Surface STM_ENOTSUPPORTED so callers see the
+         * gap clearly. */
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ENOTSUPPORTED;
+    }
 
     /* Same dispatch shape as fs_write. */
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -1527,6 +1977,36 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
 
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
+
+    /* 9.7-impl-5: synthetic .snaps namespace.
+     *
+     * 1. Lookup of ".snaps" at the LIVE dataset-root inode (=1) returns
+     *    the synthetic SNAPS_PARENT sentinel. The dirent ".snaps" is
+     *    NEVER stored on-disk; this branch is the only path that
+     *    surfaces it.
+     * 2. Lookup under SNAPS_PARENT resolves a snap name to the
+     *    SNAP_VIEW root inode (snap_id, frozen_ino=1).
+     * 3. Lookup under a SNAP_VIEW inode routes through the snapshot's
+     *    frozen tree via stm_dirent_lookup_at_root. */
+    if (parent_ino == 1u && fs_name_eq_snaps(name, name_len)) {
+        *out_child_ino = FS_SNAPS_PARENT_INO;
+        pthread_rwlock_unlock(&fs->global);
+        return STM_OK;
+    }
+    if (fs_ino_is_snaps_parent(parent_ino)) {
+        stm_status s = fs_snaps_parent_lookup_by_name(fs, dataset_id,
+                                                          name, name_len,
+                                                          out_child_ino);
+        pthread_rwlock_unlock(&fs->global);
+        return s;
+    }
+    if (fs_ino_is_synth(parent_ino)) {
+        stm_status s = fs_snap_view_lookup(fs, dataset_id, parent_ino,
+                                              name, name_len,
+                                              out_child_ino);
+        pthread_rwlock_unlock(&fs->global);
+        return s;
+    }
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
@@ -1690,6 +2170,7 @@ stm_status stm_fs_create_file(stm_fs *fs, uint64_t dataset_id,
 {
     if (!fs || !out_child_ino) return STM_EINVAL;
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
     /* Caller's S_IFMT bits must be 0 or S_IFREG; any other type is a
@@ -1861,6 +2342,8 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
 {
     if (!fs || !name) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u || parent_ino == 0u) return STM_EINVAL;
+    /* 9.7-impl-5: refuse if either target is a snap-view inode. */
+    if (fs_ino_is_synth(ino) || fs_ino_is_synth(parent_ino)) return STM_EROFS;
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
 
@@ -1977,6 +2460,7 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
 
     /* PARALLEL-3 impl-2: single-inode op (just the orphan). SH + pin. */
     pthread_rwlock_rdlock(&fs->global);
@@ -2056,6 +2540,7 @@ stm_status stm_fs_mkdir(stm_fs *fs, uint64_t dataset_id,
 {
     if (!fs || !out_child_ino) return STM_EINVAL;
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
     uint32_t mtype = mode & (uint32_t)S_IFMT;
@@ -2439,6 +2924,7 @@ stm_status stm_fs_unlink(stm_fs *fs, uint64_t dataset_id,
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
     return fs_unlink_inode_and_dirent(fs, dataset_id, parent_ino,
@@ -2451,6 +2937,7 @@ stm_status stm_fs_rmdir(stm_fs *fs, uint64_t dataset_id,
                            const uint8_t *name, uint8_t name_len)
 {
     if (!fs) return STM_EINVAL;
+    if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
@@ -2471,6 +2958,13 @@ stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
+
+    /* 9.7-impl-5: synth ino → frozen-tree stat or SNAPS_PARENT synth dir. */
+    if (fs_ino_is_synth(ino)) {
+        stm_status s = fs_snap_view_stat(fs, dataset_id, ino, out_value);
+        pthread_rwlock_unlock(&fs->global);
+        return s;
+    }
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
@@ -2512,6 +3006,9 @@ stm_status stm_fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    /* 9.7-impl-5: snap-view inodes are read-only. */
+    if (fs_ino_is_synth(ino)) return STM_EROFS;
 
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
@@ -2565,6 +3062,7 @@ stm_status stm_fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
 
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
@@ -2613,6 +3111,7 @@ stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                               uint64_t mtime_sec, uint32_t mtime_nsec,
                               uint64_t ctime_sec, uint32_t ctime_nsec)
 {
+    if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     /* R81 P3-6: ctime_nsec arg is now ignored (P8-POSIX-7a auto-stamps
@@ -2675,6 +3174,9 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || src_parent_ino == 0u || dst_parent_ino == 0u)
         return STM_EINVAL;
+    /* 9.7-impl-5: any synth ino in src/dst → EROFS. */
+    if (fs_ino_is_synth(src_parent_ino) || fs_ino_is_synth(dst_parent_ino))
+        return STM_EROFS;
     stm_status nv1 = fs_validate_dirent_name(src_name, src_name_len);
     if (nv1 != STM_OK) return nv1;
     stm_status nv2 = fs_validate_dirent_name(dst_name, dst_name_len);
@@ -2878,6 +3380,9 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || src_ino == 0u || dst_parent_ino == 0u)
         return STM_EINVAL;
+    /* 9.7-impl-5: any synth ino → EROFS. */
+    if (fs_ino_is_synth(src_ino) || fs_ino_is_synth(dst_parent_ino))
+        return STM_EROFS;
     stm_status nv = fs_validate_dirent_name(dst_name, dst_name_len);
     if (nv != STM_OK) return nv;
 
@@ -3014,6 +3519,7 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
 
     if (!fs || !out_child_ino) return STM_EINVAL;
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
 
@@ -3147,12 +3653,27 @@ stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         return STM_EINVAL;
     }
 
+    /* 9.7-impl-5: synth-ino routes through the frozen tree. SNAPS_PARENT
+     * is a dir — POSIX EINVAL on readlink of a non-symlink. SNAP_VIEW
+     * inodes go through fs_snap_view_stat which delivers the same
+     * inode_value shape, including symlink_target bytes. */
     struct stm_inode_value iv = {0};
+    if (fs_ino_is_synth(ino)) {
+        stm_status vs = fs_snap_view_stat(fs, dataset_id, ino, &iv);
+        if (vs != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return vs;
+        }
+        goto check_link;
+    }
+    {
     stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
     if (ls != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return ls;       /* STM_ENOENT */
     }
+    }
+check_link:;
 
     uint32_t mode = stm_load_le32(iv.si_mode);
     if ((mode & (uint32_t)S_IFMT) != (uint32_t)S_IFLNK) {
@@ -3193,6 +3714,7 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
 
     /* P9.5-PARALLEL-3 impl-5: SH (rdlock) + per-inode pin. truncate is
      * a single-inode mutator — the (load + size-check + flush + extent
@@ -3383,6 +3905,7 @@ stm_status stm_fs_add_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     /* Reject any out-of-mask bit so future format extensions can rely
      * on every set bit being a known seal. */
     if ((seals & ~(uint32_t)STM_FS_SEAL_MASK) != 0u) return STM_EINVAL;
@@ -3668,6 +4191,9 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
     if (dataset_id == 0u || src_parent_ino == 0u || dst_parent_ino == 0u) {
         return STM_EINVAL;
     }
+    /* 9.7-impl-5: any synth parent → EROFS. */
+    if (fs_ino_is_synth(src_parent_ino) || fs_ino_is_synth(dst_parent_ino))
+        return STM_EROFS;
     if ((flags & ~(uint32_t)(STM_FS_RENAME_NOREPLACE |
                               STM_FS_RENAME_EXCHANGE  |
                               STM_FS_RENAME_WHITEOUT)) != 0u) return STM_EINVAL;
@@ -4263,6 +4789,69 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
+    /* 9.7-impl-5: synthetic .snaps namespace readdir.
+     *
+     * SNAPS_PARENT readdir enumerates the dataset's PRESENT snapshots
+     * (one dirent per snap, named after `e.name`). SNAP_VIEW readdir
+     * routes to the frozen tree via stm_dirent_readdir_at_root and
+     * translates each child_ino → SNAP_VIEW(snap_id, frozen_child_ino).
+     *
+     * Both branches synthesize "." and ".." in the same shape as the
+     * live readdir — POSIX expects every directory listing to include
+     * them. */
+    if (fs_ino_is_synth(dir_ino)) {
+        bool no_dots = (flags & STM_FS_READDIR_FLAG_NO_DOTS) != 0u;
+        uint64_t local_cursor = *cursor;
+        size_t emitted = 0;
+
+        /* Phase 0: emit "." (this inode). */
+        if (local_cursor == 0u) {
+            if (!no_dots && emitted < max_entries) {
+                fs_readdir_synth_dot(&out_entries[emitted], dir_ino, 1);
+                emitted++;
+            }
+            local_cursor = 1u;
+        }
+        /* Phase 1: emit "..". For SNAPS_PARENT, parent is the dataset
+         * root (live ino=1). For SNAP_VIEW, parent is whatever the
+         * caller passed — we trust it. */
+        if (local_cursor == 1u && emitted < max_entries) {
+            if (!no_dots) {
+                fs_readdir_synth_dot(&out_entries[emitted], parent_ino, 2);
+                emitted++;
+            }
+            local_cursor = 2u;
+        }
+
+        size_t batch_returned = 0;
+        if (emitted < max_entries) {
+            uint64_t inner_cursor = local_cursor - 2u;
+            size_t max_inner = max_entries - emitted;
+            stm_status s;
+            if (fs_ino_is_snaps_parent(dir_ino)) {
+                s = fs_snaps_parent_readdir(fs, dataset_id, &inner_cursor,
+                                                out_entries + emitted,
+                                                max_inner, &batch_returned);
+            } else {
+                s = fs_snap_view_readdir(fs, dataset_id, dir_ino,
+                                            &inner_cursor,
+                                            out_entries + emitted,
+                                            max_inner, &batch_returned);
+            }
+            if (s != STM_OK) {
+                pthread_rwlock_unlock(&fs->global);
+                return s;
+            }
+            emitted += batch_returned;
+            local_cursor = (inner_cursor > UINT64_MAX - 2u)
+                              ? UINT64_MAX : (inner_cursor + 2u);
+        }
+        *cursor = local_cursor;
+        *out_returned = emitted;
+        pthread_rwlock_unlock(&fs->global);
+        return STM_OK;
+    }
+
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) {
@@ -4454,6 +5043,7 @@ stm_status stm_fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
     if (!fs) return STM_EINVAL;
     if (!name) return STM_EINVAL;
+    if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     if (value_len > 0u && !value) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (name_len == 0u || name_len > STM_FS_XATTR_NAME_MAX) return STM_EINVAL;
@@ -4673,6 +5263,7 @@ stm_status stm_fs_removexattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!fs) return STM_EINVAL;
     if (!name) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     if (name_len == 0u || name_len > STM_FS_XATTR_NAME_MAX) return STM_EINVAL;
     if (!fs_xattr_name_in_posix_namespace(name, name_len)) return STM_EINVAL;
 
@@ -4875,6 +5466,9 @@ stm_status stm_fs_reflink(stm_fs *fs,
     if (!fs) return STM_EINVAL;
     if (src_dataset_id == 0u || src_ino == 0u) return STM_EINVAL;
     if (dst_dataset_id == 0u || dst_ino == 0u) return STM_EINVAL;
+    /* 9.7-impl-5: any synth ino → EROFS (dst write OR src read deferred). */
+    if (fs_ino_is_synth(src_ino) || fs_ino_is_synth(dst_ino))
+        return STM_EROFS;
     /* Same-(ds, ino) refused upfront with STM_EINVAL. Required to
      * preserve test_9p.c::p9_r94_p3_2_reflink_src_eq_dst_returns_einval
      * semantics + matches stm_sync_reflink's own guard. */
@@ -4962,6 +5556,9 @@ stm_status stm_fs_copy_file_range(stm_fs *fs,
     if (!fs) return STM_EINVAL;
     if (src_dataset_id == 0u || src_ino == 0u) return STM_EINVAL;
     if (dst_dataset_id == 0u || dst_ino == 0u) return STM_EINVAL;
+    /* 9.7-impl-5: any synth ino → EROFS. */
+    if (fs_ino_is_synth(src_ino) || fs_ino_is_synth(dst_ino))
+        return STM_EROFS;
 
     /* MVP: whole-file copy only. Caller must pass (0, 0, src_size).
      * len == 0 is a legal POSIX no-op (out_copied = 0; STM_OK). */
@@ -5063,6 +5660,7 @@ stm_status stm_fs_migrate_to_cold(stm_fs *fs,
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
 
     /* P9.5-PARALLEL-3 impl-5: SH (rdlock) + per-inode pin. Migrate is
      * a single-inode mutator (extent-layer flip + per-extent rewrite).
@@ -5384,6 +5982,7 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
     if (!fs)                  return STM_EINVAL;
     if (dataset_id == 0u)     return STM_EINVAL;
     if (ino == 0u)            return STM_EINVAL;
+    if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
 
     /* P9.5-PARALLEL-3 impl-5: SH (rdlock) + per-inode pin. Symmetric
      * with stm_fs_migrate_to_cold (clause 18 of CLAUDE.md inode-alloc
@@ -7936,6 +8535,7 @@ stm_status stm_fs_fallocate(stm_fs *fs,
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     if (len == 0u) return STM_EINVAL;
     if (off > UINT64_MAX - len) return STM_EINVAL;
     if ((flags & ~(uint32_t)STM_FS_FALLOC_MASK) != 0u) return STM_EINVAL;

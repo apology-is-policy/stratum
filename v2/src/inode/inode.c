@@ -872,6 +872,60 @@ stm_status stm_inode_lookup(const stm_inode_index *idx,
     return STM_OK;
 }
 
+/* 9.7-impl-5: frozen-tree inode lookup via throwaway engine. Mirrors
+ * stm_inode_lookup but resolves keys through
+ * stm_dataset_index_lookup_engine_at against an arbitrary
+ * (root_paddr, root_gen, root_csum) triple — used by the .snaps
+ * surface to read inodes from a snapshot's captured root without
+ * touching the live engine. */
+stm_status stm_inode_lookup_at_root(const stm_inode_index *idx,
+                                       uint64_t dataset_id,
+                                       uint64_t root_paddr,
+                                       uint64_t root_gen,
+                                       const uint8_t root_csum[32],
+                                       uint64_t ino,
+                                       struct stm_inode_value *out_value) {
+    if (!idx || !out_value) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+
+    /* The idx->ds_idx pointer is read without taking idx's lock: it's
+     * set once at attach_dataset_index time and never rewritten. The
+     * downstream stm_dataset_index_lookup_engine_at takes ds_idx's own
+     * lock for the throwaway open/lookup/destroy sequence. */
+    stm_inode_index *midx = (stm_inode_index *)idx;
+    if (midx->ds_idx == NULL) return STM_EINVAL;
+
+    uint8_t key[IN_KEY_LEN];
+    stm_status ks = in_encode_key(ino, key);
+    if (ks != STM_OK) return ks;
+
+    uint8_t vbuf[IN_VAL_LEN];
+    size_t vlen = 0;
+    stm_status ls = stm_dataset_index_lookup_engine_at(
+                          midx->ds_idx, dataset_id,
+                          root_paddr, root_gen, root_csum,
+                          key, IN_KEY_LEN,
+                          vbuf, sizeof vbuf, &vlen);
+    if (ls != STM_OK) return ls;     /* STM_ENOENT / STM_ECORRUPT / etc. */
+    if (vlen != IN_VAL_LEN) return STM_ECORRUPT;
+
+    struct stm_inode_value v;
+    memcpy(&v, vbuf, IN_VAL_LEN);
+
+    /* Full structural validation against the (dataset_id, ino) key —
+     * same R69/R70/R71/R77/R85 carry the live engine_get applies. */
+    stm_status vs = in_validate_value(&v, dataset_id, ino);
+    if (vs != STM_OK) return vs;
+
+    /* The FREED filter matches the live stm_inode_lookup: a FREED slot
+     * surfaces STM_ENOENT to callers (the snap captured an alloc-then-
+     * free; the snap-view sees it as gone). */
+    if (stm_load_le32(v.si_flags) & STM_INO_FLAG_FREED) return STM_ENOENT;
+
+    *out_value = v;
+    return STM_OK;
+}
+
 stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
                             uint64_t ino,
                             const struct stm_inode_value *in_value) {

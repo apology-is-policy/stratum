@@ -508,6 +508,70 @@ stm_status stm_dirent_drop_for_dir(stm_dirent_index *idx,
 /* extent) are retired together.                                             */
 /* ========================================================================= */
 
+/* ========================================================================= */
+/* 9.7-impl-5: readable .snaps support — frozen-tree dirent lookup + readdir. */
+/* ========================================================================= */
+
+/*
+ * Look up `name` under `dir_ino` in the FROZEN tree rooted at
+ * `(root_paddr, root_gen, root_csum)`. Opens a THROWAWAY read-only
+ * engine via the attached `ds_idx`, walks the open-addressing hash
+ * chain via repeated `stm_dataset_index_lookup_engine_at` probes
+ * (mirrors the live `stm_dirent_lookup` semantics: TOMBSTONE skips,
+ * matching WHITEOUT hides as STM_ENOENT, EMPTY ends the chain),
+ * and returns the child inode info.
+ *
+ * `dataset_id` is the snapshot's dataset (AEAD `tree_id`). The triple
+ * is the snapshot's captured tree-root. Used by the .snaps surface
+ * to resolve path components inside a snap.
+ *
+ * Refusals: same shape as `stm_dirent_lookup` — NULL idx / name /
+ * out_child_ino, name_len == 0 OR > STM_DIRENT_NAME_MAX,
+ * dataset_id == 0 OR dir_ino == 0 → STM_EINVAL. STM_ENOENT if no
+ * matching record OR a matching whiteout. STM_ECORRUPT on Merkle /
+ * decoder. STM_EBADTAG on AEAD.
+ */
+STM_MUST_USE
+stm_status stm_dirent_lookup_at_root(const stm_dirent_index *idx,
+                                        uint64_t dataset_id,
+                                        uint64_t root_paddr,
+                                        uint64_t root_gen,
+                                        const uint8_t root_csum[32],
+                                        uint64_t dir_ino,
+                                        const uint8_t *name, uint8_t name_len,
+                                        uint64_t *out_child_ino,
+                                        uint64_t *out_child_gen,
+                                        uint8_t *out_child_type);
+
+/*
+ * Iterate live records under `dir_ino` in the FROZEN tree rooted at
+ * `(root_paddr, root_gen, root_csum)`. Same cursor semantics as
+ * `stm_dirent_readdir` (caller starts at *cursor = 0; subsequent
+ * calls pass the returned cursor back; *out_returned == 0 indicates
+ * iteration done). Opens a THROWAWAY engine via the attached
+ * `ds_idx`, runs `stm_btree_engine_scan_range` over the dir's
+ * keyspace, sorts by hash_probe, applies the cursor filter, emits.
+ *
+ * The frozen tree is read-only — there are no concurrent mutators —
+ * so the stability-under-Create/Unlink contract from the live
+ * readdir trivially holds (no Creates or Unlinks happen against a
+ * snapshot). Tombstones are skipped; whiteouts are skipped (snap-view
+ * doesn't surface overlayfs whiteout semantics at v1.0).
+ *
+ * Refusals: same shape as `stm_dirent_readdir`.
+ */
+STM_MUST_USE
+stm_status stm_dirent_readdir_at_root(const stm_dirent_index *idx,
+                                         uint64_t dataset_id,
+                                         uint64_t root_paddr,
+                                         uint64_t root_gen,
+                                         const uint8_t root_csum[32],
+                                         uint64_t dir_ino,
+                                         uint64_t *cursor,
+                                         stm_dirent_entry *out_entries,
+                                         size_t max_entries,
+                                         size_t *out_returned);
+
 #ifdef __cplusplus
 }
 #endif

@@ -8691,4 +8691,573 @@ STM_TEST(snapshot_collect_newer_returns_ascending_present) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* 9.7-impl-5: readable .snaps mount surface — namespace + lookup + readdir + */
+/* stat + readlink + INLINE-file read + write-path EROFS. EXTENT-file read    */
+/* deferred to impl-5b (returns STM_ENOTSUPPORTED).                            */
+/* ========================================================================= */
+
+/* Synth-ino encoding constants — keep in sync with fs.c FS_SYNTH_* macros.
+ * Used only inside test_fs.c; not exported from fs.h. */
+#define TFS_SYNTH_TAG          (1ULL << 63)
+#define TFS_SNAPS_PARENT_INO   TFS_SYNTH_TAG
+
+static inline uint64_t tfs_synth_encode(uint64_t snap_id, uint64_t frozen_ino) {
+    return TFS_SYNTH_TAG | (snap_id << 32) | (frozen_ino & 0xFFFFFFFFu);
+}
+
+/* `.snaps` lookup at the dataset root returns the SNAPS_PARENT sentinel.
+ * Lookup of `.snaps` at any other parent stays a regular dirent lookup
+ * (which returns STM_ENOENT since `.snaps` is not stored). */
+STM_TEST(snaps_lookup_at_root_returns_sentinel) {
+    make_tmp("snaps_lookup_root");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+    STM_ASSERT_EQ(r, 1u);
+
+    uint64_t out = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, /*parent=*/1, (const uint8_t *)".snaps",
+                                    6, &out));
+    STM_ASSERT_EQ(out, TFS_SNAPS_PARENT_INO);
+
+    /* Lookup of ".snaps" at a non-root parent stays ENOENT (regular
+     * dirent path; ".snaps" is not stored). */
+    uint64_t sub = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, 1, (const uint8_t *)"d", 1,
+                                    0755u, 0, 0, &sub));
+    out = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, sub, (const uint8_t *)".snaps", 6,
+                                       &out),
+                       STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* SNAPS_PARENT readdir lists the dataset's PRESENT snapshots — one entry
+ * per snap, named after `e.name`, child_ino encoded as SNAP_VIEW root,
+ * child_type = STM_DT_DIR. Other datasets' snaps are filtered out. */
+STM_TEST(snaps_readdir_lists_dataset_snaps) {
+    make_tmp("snaps_readdir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    /* Two snapshots in dataset 1. */
+    uint64_t s1 = 0, s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "alpha", 5, &s1));
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "beta",  4, &s2));
+
+    /* A snapshot in dataset 2 (created underneath) — should NOT appear
+     * when we readdir SNAPS_PARENT for dataset 1. */
+    uint64_t ds2 = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "ds2", &ds2));
+    uint64_t ds2_root = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds2, 0755u, 0, 0, &ds2_root));
+    uint64_t s_other = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, ds2, "in_ds2", 6, &s_other));
+
+    /* Drive readdir from cursor 0 with the NO_DOTS flag (we want only
+     * stored entries — simpler to verify). max=8 covers the chain. */
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry out[8];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    /*parent_ino=*/1,
+                                    STM_FS_READDIR_FLAG_NO_DOTS, &cursor,
+                                    out, 8, &got));
+    STM_ASSERT_EQ(got, (size_t)2);
+
+    /* Both names present; child_ino is a SNAP_VIEW root (synth); type DIR. */
+    bool seen_alpha = false, seen_beta = false;
+    for (size_t k = 0; k < got; k++) {
+        STM_ASSERT_EQ(out[k].child_type, (uint8_t)STM_DT_DIR);
+        STM_ASSERT((out[k].child_ino & TFS_SYNTH_TAG) != 0u);
+        if (out[k].name_len == 5
+                && memcmp(out[k].name, "alpha", 5) == 0) seen_alpha = true;
+        if (out[k].name_len == 4
+                && memcmp(out[k].name, "beta",  4) == 0) seen_beta  = true;
+    }
+    STM_ASSERT_TRUE(seen_alpha);
+    STM_ASSERT_TRUE(seen_beta);
+
+    /* The ds2 snap doesn't surface in dataset 1's listing. */
+    for (size_t k = 0; k < got; k++) {
+        bool is_other = (out[k].name_len == 6
+                            && memcmp(out[k].name, "in_ds2", 6) == 0);
+        STM_ASSERT_FALSE(is_other);
+    }
+
+    /* Next call returns 0 — iteration done. */
+    got = 99;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, TFS_SNAPS_PARENT_INO, 1,
+                                    STM_FS_READDIR_FLAG_NO_DOTS, &cursor,
+                                    out, 8, &got));
+    STM_ASSERT_EQ(got, (size_t)0);
+
+    /* Reference the consumer-only symbols so they aren't flagged
+     * unused on builds that skip the other 4d tests. */
+    (void)s1; (void)s2; (void)s_other;
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* Lookup of a snap name under SNAPS_PARENT resolves to the synthetic
+ * SNAP_VIEW root inode. Missing-name → STM_ENOENT. */
+STM_TEST(snaps_lookup_by_name_resolves_snap_root) {
+    make_tmp("snaps_lookup_by_name");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "gamma", 5, &snap_id));
+
+    /* Resolve "gamma" → expected synth(snap_id, 1). */
+    uint64_t out = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"gamma", 5, &out));
+    STM_ASSERT_EQ(out, tfs_synth_encode(snap_id, 1u));
+
+    /* Missing snap name → ENOENT. */
+    out = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                       (const uint8_t *)"missing", 7, &out),
+                       STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* SNAP_VIEW lookup descends through the frozen tree. Mutations to the
+ * LIVE tree after snap creation are invisible from the snap-view. */
+STM_TEST(snap_view_lookup_sees_frozen_tree) {
+    make_tmp("snap_view_lookup");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    /* Pre-snap state: file "preexisting" under the root. */
+    uint64_t ino_pre = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1,
+                                        (const uint8_t *)"preexisting", 11,
+                                        0644u, 0, 0, &ino_pre));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "snap1", 5, &snap_id));
+
+    /* Post-snap mutations to the LIVE tree. */
+    uint64_t ino_post = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1,
+                                        (const uint8_t *)"post_snap", 9,
+                                        0644u, 0, 0, &ino_post));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, 1, (const uint8_t *)"preexisting",
+                                       11));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Resolve the snap-view root via .snaps/snap1. */
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"snap1", 5, &snap_root));
+    STM_ASSERT_EQ(snap_root, tfs_synth_encode(snap_id, 1u));
+
+    /* The frozen tree still has "preexisting". */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"preexisting", 11,
+                                    &found));
+    STM_ASSERT((found & TFS_SYNTH_TAG) != 0u);
+    /* And does NOT have "post_snap". */
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, snap_root,
+                                       (const uint8_t *)"post_snap", 9,
+                                       &found),
+                       STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* SNAP_VIEW stat returns the frozen inode value. The synthesized
+ * SNAPS_PARENT directory has mode S_IFDIR + 0555 + nlink 2 (".+..").
+ * Read on the SNAPS_PARENT dir → STM_EISDIR. Read on a SNAP_VIEW dir
+ * → STM_EISDIR. */
+STM_TEST(snap_view_stat_returns_frozen_inode) {
+    make_tmp("snap_view_stat");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    /* SNAPS_PARENT stat (any dataset_id arg works; we use 1). */
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, TFS_SNAPS_PARENT_INO, &iv));
+    STM_ASSERT_EQ(stm_load_le32(iv.si_mode) & 0170000u, 0040000u);  /* S_IFDIR */
+    STM_ASSERT_EQ(stm_load_le32(iv.si_mode) & 0777u,    0555u);
+    STM_ASSERT_EQ(stm_load_le32(iv.si_nlink), 2u);
+
+    /* Read on a synthetic dir → EISDIR. */
+    uint8_t buf[16];
+    size_t got = 0;
+    STM_ASSERT_ERR(stm_fs_read(fs, 1, TFS_SNAPS_PARENT_INO, 0, buf, sizeof buf,
+                                     &got),
+                       STM_EISDIR);
+
+    /* Stat of a SNAP_VIEW root returns the frozen dataset-root's
+     * inode value (a directory). */
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "snapA", 5, &snap_id));
+    uint64_t snap_root = tfs_synth_encode(snap_id, 1u);
+    memset(&iv, 0, sizeof iv);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, snap_root, &iv));
+    STM_ASSERT_EQ(stm_load_le32(iv.si_mode) & 0170000u, 0040000u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* SNAP_VIEW readdir emits the frozen tree's entries with each child_ino
+ * translated to SNAP_VIEW(snap_id, frozen_child). */
+STM_TEST(snap_view_readdir_emits_frozen_entries) {
+    make_tmp("snap_view_readdir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t ino_a = 0, ino_b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"a", 1,
+                                        0644u, 0, 0, &ino_a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"b", 1,
+                                        0644u, 0, 0, &ino_b));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sv", 2, &snap_id));
+
+    /* Unlink "a" in the live tree — must NOT affect the snap-view. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, 1, (const uint8_t *)"a", 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_root = tfs_synth_encode(snap_id, 1u);
+    stm_fs_dirent_entry out[8];
+    size_t got = 0;
+    uint64_t cursor = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, snap_root, TFS_SNAPS_PARENT_INO,
+                                    STM_FS_READDIR_FLAG_NO_DOTS, &cursor,
+                                    out, 8, &got));
+    STM_ASSERT_EQ(got, (size_t)2);
+    bool seen_a = false, seen_b = false;
+    for (size_t k = 0; k < got; k++) {
+        STM_ASSERT((out[k].child_ino & TFS_SYNTH_TAG) != 0u);
+        if (out[k].name_len == 1 && out[k].name[0] == 'a') seen_a = true;
+        if (out[k].name_len == 1 && out[k].name[0] == 'b') seen_b = true;
+    }
+    STM_ASSERT_TRUE(seen_a);
+    STM_ASSERT_TRUE(seen_b);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* Inline-file read through a snap-view returns the frozen bytes. The
+ * file's inline_data lives inside the inode value, so one frozen-tree
+ * inode lookup yields the bytes — no extent walk needed (the EXTENT
+ * path is deferred to impl-5b and returns STM_ENOTSUPPORTED). */
+STM_TEST(snap_view_inline_read_returns_frozen_bytes) {
+    make_tmp("snap_view_inline");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &ino));
+    /* Write 50 bytes — stays inline (≤ STM_INODE_INLINE_MAX = 100). */
+    uint8_t pat[50];
+    for (size_t k = 0; k < sizeof pat; k++) pat[k] = (uint8_t)(0x10 + k);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, pat, sizeof pat));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sv-inl", 6, &snap_id));
+
+    /* Mutate the live file post-snap (overwrite + truncate). */
+    uint8_t junk[50];
+    memset(junk, 0xFF, sizeof junk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, junk, sizeof junk));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, ino, 10u));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Resolve snap-view path .snaps/sv-inl/f. */
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"sv-inl", 6, &snap_root));
+    uint64_t snap_f = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"f", 1, &snap_f));
+
+    /* Stat the snap-view file: size is the FROZEN size (50), not 10. */
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, snap_f, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), 50u);
+
+    /* Read the bytes — get back `pat`, not `junk`. */
+    uint8_t rbuf[64] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, snap_f, 0, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, (size_t)50);
+    STM_ASSERT(memcmp(rbuf, pat, 50) == 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* EXTENT-file read on a snap-view returns STM_ENOTSUPPORTED at v1.0
+ * (forward-noted to impl-5b). Stat still works — caller sees the
+ * correct size. */
+STM_TEST(snap_view_extent_read_returns_not_supported) {
+    make_tmp("snap_view_extent");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"big", 3,
+                                        0644u, 0, 0, &ino));
+    /* 4 KiB — guaranteed EXTENT-mode (≫ STM_INODE_INLINE_MAX). */
+    uint8_t pat[4096];
+    memset(pat, 0xAB, sizeof pat);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, pat, sizeof pat));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sv-ext", 6, &snap_id));
+
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"sv-ext", 6, &snap_root));
+    uint64_t snap_big = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"big", 3, &snap_big));
+
+    /* Stat works — size is frozen 4096. */
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, snap_big, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), 4096u);
+    STM_ASSERT_EQ(iv.si_data_kind, STM_DATA_EXTENT);
+
+    /* Read deferred. */
+    uint8_t rbuf[16];
+    size_t got = 0;
+    STM_ASSERT_ERR(stm_fs_read(fs, 1, snap_big, 0, rbuf, sizeof rbuf, &got),
+                       STM_ENOTSUPPORTED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* readlink on a frozen symlink returns the frozen target bytes. */
+STM_TEST(snap_view_readlink_returns_frozen_target) {
+    make_tmp("snap_view_readlink");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    /* Symlink: name "lnk" → target "/etc/hostname". */
+    uint64_t link_ino = 0;
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, 1, (const uint8_t *)"lnk", 3,
+                                       (const uint8_t *)"/etc/hostname",
+                                       13, 0, 0, &link_ino));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sv-lnk", 6, &snap_id));
+
+    /* Resolve via .snaps/sv-lnk/lnk. */
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"sv-lnk", 6, &snap_root));
+    uint64_t snap_lnk = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"lnk", 3, &snap_lnk));
+
+    uint8_t tbuf[64] = {0};
+    size_t tlen = 0;
+    STM_ASSERT_OK(stm_fs_readlink(fs, 1, snap_lnk, tbuf, sizeof tbuf, &tlen));
+    STM_ASSERT_EQ(tlen, (size_t)13);
+    STM_ASSERT(memcmp(tbuf, "/etc/hostname", 13) == 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* Write paths through a snap-view inode refuse STM_EROFS — every common
+ * mutator returns it without touching state. */
+STM_TEST(snap_view_writes_return_erofs) {
+    make_tmp("snap_view_erofs");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"vic", 3,
+                                        0644u, 0, 0, &ino));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sv-rw", 5, &snap_id));
+
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"sv-rw", 5, &snap_root));
+    uint64_t snap_vic = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"vic", 3, &snap_vic));
+
+    /* Direct mutators on a SNAP_VIEW file ino. */
+    uint8_t pat[8] = {0};
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, snap_vic, 0, pat, 1), STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, snap_vic, 0), STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_chmod(fs, 1, snap_vic, 0600u), STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_chown(fs, 1, snap_vic, 9, 9), STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_utimens(fs, 1, snap_vic, 0, 0, 0, 0, 0, 0),
+                       STM_EROFS);
+
+    /* Mutators on the snap-view directory ino (creates / removes
+     * children in the frozen tree). */
+    uint64_t dummy_out = 0;
+    STM_ASSERT_ERR(stm_fs_create_file(fs, 1, snap_root,
+                                            (const uint8_t *)"new", 3,
+                                            0644u, 0, 0, &dummy_out),
+                       STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_mkdir(fs, 1, snap_root, (const uint8_t *)"d", 1,
+                                       0755u, 0, 0, &dummy_out),
+                       STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_unlink(fs, 1, snap_root, (const uint8_t *)"vic",
+                                       3),
+                       STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, snap_root,
+                                       (const uint8_t *)"vic", 3,
+                                       snap_root,
+                                       (const uint8_t *)"renamed", 7, 0),
+                       STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* .snaps does NOT appear in the regular readdir of the dataset root —
+ * v1.0 keeps the namespace hidden (direct-name access only). */
+STM_TEST(snaps_invisible_in_dataset_root_readdir) {
+    make_tmp("snaps_hidden");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    /* One real dirent + a snapshot. */
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"real", 4,
+                                        0644u, 0, 0, &ino));
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "snap", 4, &snap_id));
+
+    /* readdir of root with NO_DOTS — must show "real" but NOT ".snaps". */
+    stm_fs_dirent_entry out[8];
+    size_t got = 0;
+    uint64_t cursor = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, 1, 1,
+                                    STM_FS_READDIR_FLAG_NO_DOTS, &cursor,
+                                    out, 8, &got));
+    STM_ASSERT_EQ(got, (size_t)1);
+    STM_ASSERT_EQ(out[0].name_len, 4u);
+    STM_ASSERT(memcmp(out[0].name, "real", 4) == 0);
+    /* .snaps still reachable by direct lookup. */
+    uint64_t direct = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, 1, (const uint8_t *)".snaps", 6,
+                                    &direct));
+    STM_ASSERT_EQ(direct, TFS_SNAPS_PARENT_INO);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* Cross-dataset isolation: a SNAP_VIEW ino encoding a snap from dataset
+ * A passed with dataset_id=B must surface as STM_ENOENT — defense-in-
+ * depth gate so a buggy caller can't dump foreign-dataset state. */
+STM_TEST(snap_view_refuses_cross_dataset_snap_id) {
+    make_tmp("snap_view_xds");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    /* Dataset 2 with a snapshot inside. */
+    uint64_t ds2 = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "ds2", &ds2));
+    uint64_t ds2_root = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds2, 0755u, 0, 0, &ds2_root));
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, ds2, "xs", 2, &s2));
+
+    /* Probe with dataset_id=1 against s2's encoded SNAP_VIEW root —
+     * the dataset-membership check inside fs_synth_snap_lookup maps
+     * to STM_ENOENT. */
+    uint64_t synth = tfs_synth_encode(s2, 1u);
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_ERR(stm_fs_stat(fs, /*ds=*/1, synth, &iv), STM_ENOENT);
+
+    /* Same probe with the correct dataset_id resolves. */
+    STM_ASSERT_OK(stm_fs_stat(fs, /*ds=*/ds2, synth, &iv));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("fs")

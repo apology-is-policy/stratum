@@ -637,9 +637,21 @@ tree uses `STM_BPTR_KIND_DATASET = 9` (added in P6-clone).
       consultation gate, and `STM_ECOMPROMISED` shipped at
       TLY-A5-impl-2; the **swap mechanism** (per-dataset engine-root
       swap + validate + dead-list clear + commit) shipped at
-      9.7-impl-4. Block reclamation of the post-snapshot divergence,
-      and rollback past newer snapshots, are **9.7-impl-4b** (until
-      then a newer snapshot refuses with `STM_ENOTSUPPORTED`).
+      9.7-impl-4. Block reclamation of the post-snapshot divergence
+      shipped at 9.7-impl-4b/4c/4c-ii/4c-iii (all three tiers).
+      Rollback past newer snapshots shipped at 9.7-impl-4d (the
+      newer-snapshot cascade). With 4d, the rollback realises
+      `dead_list.tla::Rollback`'s `to_free` IN FULL.
+- [x] Readable `.snaps/<name>/` mount surface (ARCH §8.5.4) — 9.7-impl-5.
+      `.snaps` is a synthetic dir at every dataset's root (LOOKUP
+      reachable; INVISIBLE in readdir of root at v1.0). Synthetic
+      ino encoding (bit 63 = tag; bits 62..32 = snap_id; bits 31..0 =
+      frozen_ino) routes reads through a throwaway-engine pattern
+      against the snapshot's captured triple. Every write op
+      refuses STM_EROFS via a synth-ino gate at the public entry.
+      Scope: namespace + lookup + stat + readdir + readlink + INLINE
+      file read. EXTENT (regular-file > 100B) read returns
+      STM_ENOTSUPPORTED forward-noted to **9.7-impl-5b**.
 - [ ] Snapshot send/recv via birth-txg incremental diffs — Phase 7.
 
 ## Known caveats

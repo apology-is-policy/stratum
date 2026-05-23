@@ -38,18 +38,39 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: 9.7-impl-4d — rollback newer-snapshot CASCADE — shipped
-  (`6b282f6` + R165 close `0a5f048`, verdict 0 P0 / 0 P1 / 1 P2 + 4 P3
-  — all fixed inline: P2-1 cascade-failure forward-compat docstring,
-  P3-1 counted-subtraction proof refined to case-(1)/(2)/(b) partition,
-  P3-2 cross-snap dedup test, P3-3 overflow-guard reorder, P3-4
-  dirty-buffer pin-down). Lifts the impl-4
-  `STM_ENOTSUPPORTED` refusal that fired when newer snapshots of the
-  dataset existed; the cascade destroys them (ZFS rollback semantics)
-  and reclaims `newer_dead \ s_view` — the third `to_free` term of
-  `dead_list.tla::Rollback`. With 4d the rollback realises the spec's
-  `to_free` in full: `(live ∖ s_view) ∪ (snap_dead[s] ∖ s_view) ∪
-  (newer_dead ∖ s_view)`. New API `stm_snapshot_collect_newer(idx,
+- **Tip**: 9.7-impl-5 — readable `.snaps/<name>/` mount surface — in
+  flight. Synthetic `.snaps` dir at every dataset's root inode;
+  direct-name lookup-reachable, INVISIBLE in dataset-root readdir at
+  v1.0 (matches ZFS `.zfs/snapshot/`). Encoding: bit 63 = synth tag;
+  bits 62..32 = snap_id; bits 31..0 = frozen_ino. Reads route through
+  throwaway-engine primitives against the snapshot's captured
+  `(tree_root_paddr, root_gen, root_csum)` triple — three new APIs:
+  `stm_dataset_index_lookup_engine_at` (generic single-key lookup),
+  `stm_inode_lookup_at_root`, `stm_dirent_lookup_at_root` /
+  `_readdir_at_root`. Every write op refuses STM_EROFS via a
+  synth-ino gate at the public entry (write / truncate / chmod /
+  chown / utimens / setxattr / removexattr / add_seals / create_file /
+  mkdir / unlink / rmdir / symlink / linkat_anon / unlink_anon / link /
+  link_by_ino / rename / reflink / copy_file_range / migrate_to_cold /
+  promote_to_hot / fallocate). Read scope: lookup / stat / readdir /
+  readlink / INLINE-file read all work; EXTENT-mode regular-file read
+  returns STM_ENOTSUPPORTED (forward-noted to **9.7-impl-5b** — adds
+  throwaway-engine extent lookup + AEAD decrypt against the frozen
+  extent record). Cross-dataset defense-in-depth: SNAP_VIEW ino
+  encodes snap_id but NOT dataset_id; `fs_synth_snap_lookup` verifies
+  `snap.dataset_id == api_dataset_id` and returns STM_ENOENT on
+  mismatch. No STM_UB_VERSION bump (no on-disk format change).
+  - **9.7-impl-4d** (`6b282f6` + R165 close `0a5f048`, verdict 0 P0 /
+  0 P1 / 1 P2 + 4 P3 — all fixed inline: P2-1 cascade-failure
+  forward-compat docstring, P3-1 counted-subtraction proof refined to
+  case-(1)/(2)/(b) partition, P3-2 cross-snap dedup test, P3-3
+  overflow-guard reorder, P3-4 dirty-buffer pin-down). Lifts the
+  impl-4 `STM_ENOTSUPPORTED` refusal that fired when newer snapshots
+  of the dataset existed; the cascade destroys them (ZFS rollback
+  semantics) and reclaims `newer_dead \ s_view` — the third `to_free`
+  term of `dead_list.tla::Rollback`. With 4d the rollback realises
+  the spec's `to_free` in full: `(live ∖ s_view) ∪ (snap_dead[s] ∖
+  s_view) ∪ (newer_dead ∖ s_view)`. New API `stm_snapshot_collect_newer(idx,
   ds_id, target_sid, **out_ids, *out_count)` enumerates ascending
   PRESENT snap_ids strictly greater than the target. New helper
   `fs_rollback_reclaim_newer_snap_cascade` (fs.c): walks s.view's

@@ -630,6 +630,71 @@ The `STM_FS_GUARD_WRITE` macro carries: every write op through a snapshot inode 
 
 Out of scope for impl-5: snapshot-bound 9p attach (a `Tattach` whose `aname` is `dataset@snap`). That's impl-5b or 9.7-readable-fids — needs the fid layer to know how to route to a snapshot view. For impl-5 a snapshot is reachable only through the live mount's `.snaps/` traversal.
 
+### 8.1 — As-built note (9.7-impl-5)
+
+Differences from the §8 sketch — encoding-based rather than inode-kind-based. The two `STM_INODE_KIND_*` enum values the §8 sketch introduces are NOT a stored on-disk discriminator (POSIX `si_mode` already discriminates type per `S_IFMT`); they're synthesized at recognition time via a high-bit-tagged ino encoding.
+
+**Synthetic ino encoding (fs.c-internal, no header exposure)**:
+
+```
+bit 63 = 1 ⇒ synthetic ino. Live inos always have bit 63 = 0
+            (allocator monotonic from 1; ~2^63 inodes per dataset to
+            collide).
+within bit 63 = 1:
+  sentinel  ino = 1ULL<<63  exactly         → SNAPS_PARENT
+                                              (the .snaps dir for ANY dataset
+                                              — the dataset_id arg discriminates)
+  otherwise  bits 62..32 = snap_id (31 bits)
+             bits 31..0  = frozen_ino (32 bits)
+             snap_id ≥ 1 ∧ frozen_ino ≥ 1 ⇒ SNAP_VIEW inode in snap's frozen tree
+
+saturation: snap_id ≥ 2^31 OR frozen_ino ≥ 2^32 → fs_synth_encode refuses
+            STM_EOVERFLOW (forward-noted; allocator pace makes this
+            unreachable at v1.0 scales).
+```
+
+**Path resolution**:
+
+1. `stm_fs_lookup(fs, ds, parent_ino=1, ".snaps", 6, out)` → out=SNAPS_PARENT_INO.
+2. `stm_fs_lookup(fs, ds, SNAPS_PARENT_INO, "<snap_name>", n, out)` → walks `stm_snapshot_iter` for snaps where `dataset_id == ds && name == <snap_name>`; on match, encodes SNAP_VIEW(snap_id, 1).
+3. `stm_fs_lookup(fs, ds, SNAP_VIEW(s, fz_p), name, n, out)` → `stm_dirent_lookup_at_root(didx, ds, snap.triple, fz_p, name, ...)`. Returns SNAP_VIEW(s, child_fz).
+4. `.snaps` is invisible in dataset-root readdir at v1.0 (direct-name access only — hidden); a regular `ls` of the dataset root does NOT show it. Mirrors ZFS's `.zfs/snapshot/` convention.
+
+**Throwaway-engine APIs** (the surface 4b/4c/4c-ii rollback already established, extended for read-paths):
+
+- `stm_dataset_index_lookup_engine_at(idx, ds, triple, key, key_len, buf, buf_cap, *out_len)` — single-key lookup through a throwaway engine. The third throwaway-engine primitive alongside `_verify_engine_at` (full-tree verify) and `_scan_engine_range_at` (range scan).
+- `stm_inode_lookup_at_root(iidx, ds, triple, ino, *out_iv)` — inode-tree lookup in a frozen root. Same R69/R70/R71/R77/R85 decoder gates as the live `stm_inode_lookup`.
+- `stm_dirent_lookup_at_root(didx, ds, triple, dir_ino, name, n, *child_ino, *child_gen, *child_type)` — frozen-tree dirent lookup; in-memory chain reconstruction over a single scan_range_at (O(1) engine open per call, not O(PROBE_MAX)).
+- `stm_dirent_readdir_at_root(didx, ds, triple, dir_ino, *cursor, out, max, *returned)` — frozen-tree readdir via scan_range_at + qsort + cursor filter; same `(R75 P2-1)` UINT64_MAX saturation as the live `stm_dirent_readdir`.
+
+**fs.c routing** is uniform: every public op that takes an `(dataset_id, ino)` checks `fs_ino_is_synth(ino)` (and parent_ino for verbs that take both) at the top:
+
+- Read ops (`stm_fs_lookup` / `_stat` / `_readdir` / `_readlink` / `_read`) route to the snap-view dispatcher helpers.
+- All write ops refuse `STM_EROFS` — write / truncate / chmod / chown / utimens / setxattr / removexattr / add_seals / create_file / mkdir / unlink / rmdir / symlink / linkat_anon / unlink_anon / link / link_by_ino / rename / reflink / copy_file_range / migrate_to_cold / promote_to_hot / fallocate.
+
+**Read scope at v1.0**:
+
+- `stm_fs_lookup` on synth ino → walks frozen dirent chain via `stm_dirent_lookup_at_root`.
+- `stm_fs_stat` on synth ino → looks up frozen inode via `stm_inode_lookup_at_root`; the SNAPS_PARENT sentinel synthesizes a dir stat (mode `S_IFDIR | 0555`, nlink 2, size 0, epoch timestamps).
+- `stm_fs_readdir` on SNAPS_PARENT → iterates `stm_snapshot_iter`, filtering on dataset_id; emits one DT_DIR dirent per PRESENT snap.
+- `stm_fs_readdir` on SNAP_VIEW dir → `stm_dirent_readdir_at_root` + per-entry child_ino translation to SNAP_VIEW(snap_id, frozen_child).
+- `stm_fs_readlink` on SNAP_VIEW symlink → frozen-tree inode lookup + symlink_target copy.
+- `stm_fs_read` on SNAP_VIEW INLINE-mode file → reads inline_data directly from the frozen inode value.
+- `stm_fs_read` on SNAP_VIEW EXTENT-mode file → STM_ENOTSUPPORTED (forward-noted to **9.7-impl-5b**; needs throwaway-engine extent-record lookup + AEAD decrypt against the frozen extent record).
+- `stm_fs_read` on SNAP_VIEW dir → STM_EISDIR (matches POSIX).
+- Other op kinds (xattr read, file handles, locks) — not surfaced for v1.0; future v1.x.
+
+**Cross-dataset defense-in-depth**: a SNAP_VIEW ino encodes snap_id but NOT dataset_id (dataset_id comes from the API arg). `fs_synth_snap_lookup` verifies `snap.dataset_id == api_dataset_id` and returns STM_ENOENT on mismatch — a buggy caller passing the wrong dataset_id with a SNAP_VIEW ino from another dataset cannot extract foreign-dataset state.
+
+**Held-snap semantics**: v1.0 does NOT bump `hold_count` on fid open into `.snaps/<name>/...`. Each op opens a fresh throwaway engine, performs its work, destroys; the snap blocks stay reachable while the snap is PRESENT regardless of fid-holding. Forward-noted: a long-lived snap-bound 9p Tattach (impl-5b territory) may want per-fid hold-bumping; for the v1.0 short-op surface the cost outweighs the value.
+
+**Lifetime + concurrency**: every snap-view op holds `fs->global` SH (rdlock) for the duration of its throwaway-engine open / use / destroy sequence. The `stm_snapshot_index` lock protects snap entries; `stm_dataset_index`'s own lock guards the throwaway-engine open (the existing throwaway pattern handles this). The throwaway engine itself is single-threaded (one handle, one thread); the per-op pattern keeps that invariant.
+
+**Out of scope (forward-noted)**:
+
+- **9.7-impl-5b** — EXTENT-mode file content reads. Adds throwaway-engine extent lookup + AEAD decrypt against the frozen extent record. The decrypt logic is shared with `stm_sync_read_extent_locked`; the only new code is the throwaway record-lookup + a sync-layer `_at_snap` variant.
+- **v1.x** — snap-bound 9p Tattach (`aname = dataset@snap`), per-fid hold-bumping, xattr reads, name_to_handle / open_by_handle on snap-view, advisory locks on snap-view inodes.
+
 ## 9 — Clones (impl-6)
 
 ARCH §8.6 / clone.tla: a clone is a fresh dataset whose `origin_snap_id != 0` and whose `di_tree_root` initialises to the **origin snapshot's captured root**:

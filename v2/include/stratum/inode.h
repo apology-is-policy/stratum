@@ -693,6 +693,44 @@ STM_MUST_USE
 stm_status stm_inode_index_attach_dataset_index(stm_inode_index *idx,
                                                 stm_dataset_index *ds_idx);
 
+/* ========================================================================= */
+/* 9.7-impl-5: readable .snaps support — frozen-tree inode lookup.            */
+/* ========================================================================= */
+
+/*
+ * Look up the inode at `ino` in the FROZEN tree rooted at
+ * `(root_paddr, root_gen, root_csum)`. Opens a THROWAWAY read-only engine
+ * via the attached `ds_idx`, performs one `stm_btree_engine_lookup` on the
+ * KIND_INODE metakey, decodes + validates the 256-byte inode value, and
+ * destroys the engine. No live engine is touched; no slot is materialized.
+ *
+ * Used by `stm_fs_stat` and friends on synthetic snapshot-view inodes
+ * (the `.snaps/<name>/...` mount surface — design §8). The triple is the
+ * snapshot's captured tree-root from `stm_snapshot_entry`. `dataset_id`
+ * is the snapshot's dataset (used as the AEAD `tree_id`).
+ *
+ * The decoder runs the SAME full structural validation as the live
+ * `stm_inode_lookup` (R69/R70/R71/R77/R85 carry) — a corrupt frozen
+ * record is surfaced as STM_ECORRUPT.
+ *
+ * An all-zero triple (the "empty dataset" sentinel) returns STM_ENOENT
+ * (no inodes in an empty tree).
+ *
+ * Refusals:
+ *   - NULL idx / out_value / dataset_id == 0 / ino == 0 / no ds_idx
+ *     attached → STM_EINVAL.
+ *   - STM_ENOENT if no inode record at `ino` in the frozen tree.
+ *   - STM_ECORRUPT on Merkle / decoder failure; STM_EBADTAG on AEAD.
+ */
+STM_MUST_USE
+stm_status stm_inode_lookup_at_root(const stm_inode_index *idx,
+                                       uint64_t dataset_id,
+                                       uint64_t root_paddr,
+                                       uint64_t root_gen,
+                                       const uint8_t root_csum[32],
+                                       uint64_t ino,
+                                       struct stm_inode_value *out_value);
+
 #ifdef __cplusplus
 }
 #endif

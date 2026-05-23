@@ -1309,3 +1309,232 @@ uint64_t stm_dirent_fnv1a64_for_test(const uint8_t *name, size_t len) {
     return fnv1a64(name, len);
 }
 #endif /* STRATUM_BUILD_TESTING_HOOKS */
+
+/* ========================================================================= */
+/* 9.7-impl-5: readable .snaps support — frozen-tree lookup + readdir.        */
+/*                                                                            */
+/* Both helpers below resolve key/value records through a SINGLE throwaway   */
+/* read-only engine opened at the snapshot's captured tree root, walking     */
+/* the engine's keyspace via stm_dataset_index_scan_engine_range_at. The     */
+/* live `stm_dirent_lookup` per-probe loop is replaced by an in-memory       */
+/* chain scan over the result set — same chain-end-at-EMPTY semantics, but   */
+/* O(1) engine opens per call instead of O(PROBE_MAX).                       */
+/* ========================================================================= */
+
+typedef struct {
+    uint64_t        hash_base;
+    uint64_t        next_probe;            /* expected next probe in chain */
+    uint32_t        probes_walked;         /* bounded by STM_DIRENT_PROBE_MAX */
+    const uint8_t  *name;
+    uint8_t         name_len;
+    bool            chain_ended;           /* gap or PROBE_MAX hit */
+    bool            found;
+    bool            hidden_by_whiteout;
+    uint64_t        child_ino;
+    uint64_t        child_gen;
+    uint8_t         child_type;
+    stm_status      err;
+} di_lookup_at_ctx;
+
+static int di_lookup_at_cb(const void *k, size_t klen,
+                              const void *v, size_t vlen, void *ctx_) {
+    di_lookup_at_ctx *c = ctx_;
+    if (c->found || c->hidden_by_whiteout || c->chain_ended) return 1;
+
+    uint64_t kdir = 0, kprobe = 0;
+    stm_status ks = di_decode_key(k, klen, &kdir, &kprobe);
+    if (ks != STM_OK) { c->err = ks; return 1; }
+
+    /* The scan range bracket is exact-dir prefix, so kdir matches by
+     * construction; defense-in-depth assert. */
+    (void)kdir;
+
+    /* Records before our chain start (impossible per the bracket) or out
+     * of order are silently skipped. */
+    if (kprobe < c->next_probe) return 0;
+    if (kprobe > c->next_probe) {
+        /* Gap = EMPTY slot = chain end (live `stm_dirent_lookup` stops
+         * at the first non-present probe). */
+        c->chain_ended = true;
+        return 1;
+    }
+
+    /* kprobe == c->next_probe — walk one chain step. */
+    stm_dirent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = di_decode_value(v, vlen, &r);
+    if (vs != STM_OK) { c->err = vs; return 1; }
+
+    c->next_probe++;
+    c->probes_walked++;
+
+    if (record_is_tombstone(&r)) {
+        /* Tombstone keeps the chain alive but doesn't match anything. */
+    } else if (record_is_whiteout(&r)) {
+        if (record_name_eq(&r, c->name, c->name_len)) {
+            c->hidden_by_whiteout = true;
+            return 1;
+        }
+        /* Non-matching whiteout preserves chain integrity for collisions. */
+    } else if (record_name_eq(&r, c->name, c->name_len)) {
+        c->found = true;
+        c->child_ino  = r.child_ino;
+        c->child_gen  = r.child_gen;
+        c->child_type = r.child_type;
+        return 1;
+    }
+
+    /* PROBE_MAX cap — same as live `stm_dirent_lookup`. */
+    if (c->probes_walked >= STM_DIRENT_PROBE_MAX) {
+        c->chain_ended = true;
+        return 1;
+    }
+    return 0;
+}
+
+stm_status stm_dirent_lookup_at_root(const stm_dirent_index *idx,
+                                        uint64_t dataset_id,
+                                        uint64_t root_paddr,
+                                        uint64_t root_gen,
+                                        const uint8_t root_csum[32],
+                                        uint64_t dir_ino,
+                                        const uint8_t *name, uint8_t name_len,
+                                        uint64_t *out_child_ino,
+                                        uint64_t *out_child_gen,
+                                        uint8_t *out_child_type) {
+    if (!idx || !name || !out_child_ino) return STM_EINVAL;
+    if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
+    if (name_len == 0u || name_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
+
+    *out_child_ino = 0;
+    if (out_child_gen)  *out_child_gen  = 0;
+    if (out_child_type) *out_child_type = 0;
+
+    stm_dirent_index *m = (stm_dirent_index *)idx;
+    if (m->ds_idx == NULL) return STM_EINVAL;
+
+    uint64_t hash_base = fnv1a64(name, (size_t)name_len);
+
+    /* Range [encode(dir, hash_base), encode(dir, UINT64_MAX)] — the cb
+     * caps the walk at STM_DIRENT_PROBE_MAX records OR the first gap.
+     * The cb's early-stop return terminates scan_range cheaply. */
+    uint8_t lo[DI_KEY_LEN], hi[DI_KEY_LEN];
+    stm_status k1 = di_encode_key(dir_ino, hash_base,   lo);
+    stm_status k2 = di_encode_key(dir_ino, UINT64_MAX,  hi);
+    if (k1 != STM_OK || k2 != STM_OK) return k1 != STM_OK ? k1 : k2;
+
+    di_lookup_at_ctx c = {0};
+    c.hash_base  = hash_base;
+    c.next_probe = hash_base;
+    c.name       = name;
+    c.name_len   = name_len;
+    c.err        = STM_OK;
+
+    stm_status ss = stm_dataset_index_scan_engine_range_at(
+                          m->ds_idx, dataset_id,
+                          root_paddr, root_gen, root_csum,
+                          lo, DI_KEY_LEN, hi, DI_KEY_LEN,
+                          di_lookup_at_cb, &c);
+    if (ss != STM_OK) return ss;
+    if (c.err != STM_OK) return c.err;
+    if (c.hidden_by_whiteout || !c.found) return STM_ENOENT;
+
+    *out_child_ino = c.child_ino;
+    if (out_child_gen)  *out_child_gen  = c.child_gen;
+    if (out_child_type) *out_child_type = c.child_type;
+    return STM_OK;
+}
+
+/* di_readdir_cb (top of this file) is reused for the at_root variant —
+ * same shape (collect every live record under dir into a heap buffer).
+ * The cursor-filter + qsort + emit logic mirrors stm_dirent_readdir. */
+
+stm_status stm_dirent_readdir_at_root(const stm_dirent_index *idx,
+                                         uint64_t dataset_id,
+                                         uint64_t root_paddr,
+                                         uint64_t root_gen,
+                                         const uint8_t root_csum[32],
+                                         uint64_t dir_ino,
+                                         uint64_t *cursor,
+                                         stm_dirent_entry *out_entries,
+                                         size_t max_entries,
+                                         size_t *out_returned) {
+    if (out_returned) *out_returned = 0;
+
+    if (!idx || !cursor || !out_entries || !out_returned) return STM_EINVAL;
+    if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
+    if (max_entries == 0u) return STM_EINVAL;
+
+    /* R75 P2-1 cursor saturation sentinel — same as live readdir. */
+    if (*cursor == UINT64_MAX) return STM_OK;
+
+    stm_dirent_index *m = (stm_dirent_index *)idx;
+    if (m->ds_idx == NULL) return STM_EINVAL;
+
+    /* Range bracket: every record under (dir_ino, *). */
+    uint8_t lo[DI_KEY_LEN], hi[DI_KEY_LEN];
+    stm_status k1 = di_encode_key(dir_ino, 0u,         lo);
+    stm_status k2 = di_encode_key(dir_ino, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK) return k1 != STM_OK ? k1 : k2;
+
+    di_readdir_ctx c = { .arr = NULL, .n = 0, .cap = 0, .err = STM_OK };
+    stm_status ss = stm_dataset_index_scan_engine_range_at(
+                          m->ds_idx, dataset_id,
+                          root_paddr, root_gen, root_csum,
+                          lo, DI_KEY_LEN, hi, DI_KEY_LEN,
+                          di_readdir_cb, &c);
+    if (ss != STM_OK || c.err != STM_OK) {
+        free(c.arr);
+        return ss != STM_OK ? ss : c.err;
+    }
+    if (c.n == 0) {
+        free(c.arr);
+        return STM_OK;
+    }
+
+    qsort(c.arr, c.n, sizeof *c.arr, di_readdir_match_cmp);
+
+    /* v1.0: snap-view does NOT surface overlayfs whiteout semantics —
+     * a whiteout record represents a deletion that happened post-snap,
+     * but in the frozen tree they're just hidden records. Filter them
+     * out (the live readdir likewise filters tombstones; whiteouts are
+     * a separate case the live readdir surfaces explicitly because
+     * overlayfs callers consume them; the snap-view caller is plain
+     * `ls -la`, which doesn't want whiteouts). */
+    size_t live_n = 0;
+    for (size_t i = 0; i < c.n; i++) {
+        if (record_is_whiteout(&c.arr[i].r)) continue;
+        if (i != live_n) c.arr[live_n] = c.arr[i];
+        live_n++;
+    }
+    c.n = live_n;
+
+    /* Cursor filter. */
+    size_t start = 0;
+    while (start < c.n && c.arr[start].hash_probe < *cursor) start++;
+    if (start == c.n) {
+        free(c.arr);
+        return STM_OK;
+    }
+
+    size_t avail = c.n - start;
+    size_t emit  = (max_entries < avail) ? max_entries : avail;
+    for (size_t k = 0; k < emit; k++) {
+        const stm_dirent_record *r = &c.arr[start + k].r;
+        out_entries[k].child_ino  = r->child_ino;
+        out_entries[k].child_gen  = r->child_gen;
+        out_entries[k].hash_probe = r->hash_probe;
+        out_entries[k].child_type = r->child_type;
+        out_entries[k].name_len   = r->name_len;
+        memset(out_entries[k].name, 0, sizeof out_entries[k].name);
+        if (r->name_len > 0u)
+            memcpy(out_entries[k].name, r->name, r->name_len);
+    }
+
+    uint64_t last_probe = c.arr[start + emit - 1].hash_probe;
+    *cursor = (last_probe == UINT64_MAX) ? UINT64_MAX : (last_probe + 1u);
+    *out_returned = emit;
+
+    free(c.arr);
+    return STM_OK;
+}

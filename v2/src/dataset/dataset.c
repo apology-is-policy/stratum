@@ -1726,6 +1726,87 @@ stm_status stm_dataset_index_scan_engine_range_at(
     return rc;
 }
 
+stm_status stm_dataset_index_lookup_engine_at(
+        stm_dataset_index *idx, uint64_t dataset_id,
+        uint64_t root_paddr, uint64_t root_gen, const uint8_t root_csum[32],
+        const void *key, size_t key_len,
+        void *out_value_buf, size_t value_buf_cap,
+        size_t *out_value_len) {
+    /* Uniform out-param contract (R57 P3-5 / R58 P3-1): zero-init
+     * BEFORE arg validation so callers observing on STM_EINVAL see a
+     * defined value. */
+    if (out_value_len) *out_value_len = 0;
+
+    if (!idx || !out_value_buf || !out_value_len) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    if (key == NULL && key_len != 0) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    /* Storage + crypt must be bound — same precondition as
+     * verify_engine_at / collect_engine_paddrs_at / scan_engine_range_at. */
+    if (idx->engine_store_ctx.boot == NULL ||
+        idx->engine_store_ctx.bdev == NULL ||
+        idx->engine_crypt_ctx.metadata_key == NULL) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    /* All-zero triple = "empty dataset" sentinel; the empty tree has
+     * no records. */
+    if (dataset_triple_is_empty(root_paddr, root_gen)) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+
+    /* Throwaway read-only engine — stack-local store-ctx copy,
+     * snap_idx NULL (the lookup never frees a node). The local
+     * outlives the open->lookup->destroy sequence below. */
+    stm_engine_store_ctx vctx = idx->engine_store_ctx;
+    vctx.dataset_id = dataset_id;
+    vctx.snap_idx   = NULL;
+
+    stm_btree_engine *eng = NULL;
+    stm_status rc = stm_btree_engine_open(&STM_ENGINE_STORE_VT, &vctx,
+                                             &idx->engine_crypt_ctx,
+                                             /*tree_id=*/dataset_id,
+                                             root_paddr, root_gen, root_csum,
+                                             &eng);
+    if (rc != STM_OK) {
+        must_unlock(&idx->lock);
+        return rc;
+    }
+
+    bool found = false;
+    void *vbuf = NULL;
+    size_t vlen = 0;
+    rc = stm_btree_engine_lookup(eng, key, key_len, &found, &vbuf, &vlen);
+    stm_btree_engine_destroy(eng);
+    must_unlock(&idx->lock);
+
+    if (rc != STM_OK) {
+        /* engine_lookup may have allocated vbuf on a path that still
+         * returned non-OK; free defensively. */
+        free(vbuf);
+        return rc;
+    }
+    if (!found) {
+        free(vbuf);
+        return STM_ENOENT;
+    }
+    if (vlen > value_buf_cap) {
+        /* Caller's buffer too small — surface the actual length so the
+         * caller can resize + retry. The contract says out_value_buf
+         * may be partially written; we leave it untouched to keep the
+         * impl simple. */
+        *out_value_len = vlen;
+        free(vbuf);
+        return STM_ENOSPC;
+    }
+    if (vlen > 0u) memcpy(out_value_buf, vbuf, vlen);
+    *out_value_len = vlen;
+    free(vbuf);
+    return STM_OK;
+}
+
 /* ---- 9.7-impl-1c-ii: M-cascade three-phase commit driving. ---- */
 
 /* Walk every slot and return true iff ANY slot has pending_flush set.

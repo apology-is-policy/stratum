@@ -933,6 +933,57 @@ stm_status stm_dataset_index_scan_engine_range_at(
                                        stm_btree_engine_iter_cb cb,
                                        void *cb_ctx);
 
+/*
+ * 9.7-impl-5 (readable .snaps): single-key lookup against a THROWAWAY
+ * read-only engine opened at an arbitrary `(root_paddr, root_gen,
+ * root_csum)` triple. The third throwaway-engine primitive alongside
+ * `stm_dataset_index_verify_engine_at` (full-tree verify) and
+ * `stm_dataset_index_scan_engine_range_at` (key-range scan).
+ *
+ * Opens a THROWAWAY engine (idx's storage + crypt context, `tree_id =
+ * dataset_id` for the AEAD), runs `stm_btree_engine_lookup`, copies the
+ * resulting value into `out_value_buf` if found (refusing STM_ENOSPC if
+ * `value_buf_cap` < actual_len), and destroys the engine — no dataset
+ * slot is touched, no in-RAM engine is cached. Used by the .snaps
+ * surface to fetch one record (inode value, dirent value) from a snap's
+ * frozen tree without keeping per-snap engine state.
+ *
+ * Output contract:
+ *   - STM_OK + key found: `*out_value_len` = bytes copied
+ *     (≤ value_buf_cap); out_value_buf[0..*out_value_len) holds the
+ *     value bytes verbatim.
+ *   - STM_ENOENT: key not present in the frozen tree; `*out_value_len`
+ *     = 0; out_value_buf untouched.
+ *   - STM_ENOSPC: value_buf_cap too small for the actual value;
+ *     `*out_value_len` = actual on-disk value length so the caller can
+ *     resize + retry. out_value_buf may be partially written — treat
+ *     as undefined.
+ *
+ * An all-zero triple (`root_paddr == 0 && root_gen == 0`) is the
+ * "empty dataset" sentinel — STM_ENOENT is returned (the empty tree
+ * contains no records). `dataset_id` need NOT name a PRESENT dataset;
+ * only the storage/crypt binding and the triple matter (the dataset_id
+ * is used solely as the AEAD `tree_id`).
+ *
+ * Refusals: NULL idx / out_value_buf / out_value_len / key (with
+ * key_len > 0) / dataset_id == 0 / storage or crypt ctx unbound →
+ * STM_EINVAL. Engine open/lookup errors propagated verbatim
+ * (STM_ECORRUPT on Merkle / STM_EBADTAG on AEAD).
+ *
+ * Concurrency: takes idx's lock for the open→lookup→destroy sequence.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_lookup_engine_at(
+                                       stm_dataset_index *idx,
+                                       uint64_t dataset_id,
+                                       uint64_t root_paddr,
+                                       uint64_t root_gen,
+                                       const uint8_t root_csum[32],
+                                       const void *key, size_t key_len,
+                                       void *out_value_buf,
+                                       size_t value_buf_cap,
+                                       size_t *out_value_len);
+
 /* ========================================================================= */
 /* 9.7-impl-1c-ii: per-dataset engine M-cascade commit driving APIs.          */
 /*                                                                             */
