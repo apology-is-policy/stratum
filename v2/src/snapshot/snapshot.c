@@ -926,6 +926,198 @@ stm_status stm_snapshot_index_overwrite_cold_block(stm_snapshot_index *idx,
     return STM_OK;
 }
 
+/* ========================================================================= */
+/* 9.7-impl-6b: clone routing variants — append to a SPECIFIC snap_id's        */
+/* dead-list (paddr / boot / cold tiers). Used by the clone path's            */
+/* engine_store_free + sync.c overwrite dispatch when the engine's            */
+/* origin_snap_id is set (see phase-9.7-design.md §9.1).                      */
+/*                                                                            */
+/* These are siblings of the existing _overwrite_*_block family but route to  */
+/* a caller-supplied snap_id directly, skipping the                           */
+/* `most_recent_locked(dataset_id)` step that's wrong for clones (a clone's   */
+/* drop of a paddr in origin snap S's view must land in S's dead-list, NOT    */
+/* in the most-recent snap of the clone's own dataset). The single-ownership  */
+/* scan + caps + realloc-doubling growth logic is identical to the parent     */
+/* APIs — only the slot lookup changes.                                       */
+/* ========================================================================= */
+
+stm_status stm_snapshot_index_add_to_snap_dead_list(stm_snapshot_index *idx,
+                                                       uint64_t snap_id,
+                                                       uint64_t paddr) {
+    if (!idx) return STM_EINVAL;
+    if (snap_id == 0) return STM_EINVAL;
+    if (paddr == 0) return STM_EINVAL;  /* paddr=0 reserved sentinel */
+
+    must_lock(&idx->lock);
+
+    size_t s = find_slot_locked(idx, snap_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+
+    snapshot_slot *slot = &idx->slots[s];
+
+    /* R33 P2 single-ownership defense (paddr tier) — identical scan to
+     * _overwrite_block: a paddr in ONE PRESENT snap's dead_list cannot
+     * appear in another's. The clone path doesn't introduce a new tier
+     * — it routes to the same dead_list[] storage — so the scan covers
+     * both producer paths uniformly. */
+    for (size_t k = 0; k < idx->slots_len; k++) {
+        const snapshot_slot *sk = &idx->slots[k];
+        if (!sk->present) continue;
+        for (size_t j = 0; j < sk->dead_count; j++) {
+            if (sk->dead_list[j] == paddr) {
+                must_unlock(&idx->lock);
+                return STM_EINVAL;
+            }
+        }
+    }
+
+    if (slot->dead_count >= STM_SNAP_DEAD_LIST_MAX) {
+        must_unlock(&idx->lock);
+        return STM_ENOSPC;
+    }
+
+    if (slot->dead_count == slot->dead_capacity) {
+        size_t new_cap = slot->dead_capacity == 0 ? 8u : slot->dead_capacity * 2u;
+        if (new_cap > STM_SNAP_DEAD_LIST_MAX) new_cap = STM_SNAP_DEAD_LIST_MAX;
+        uint64_t *new_buf = realloc(slot->dead_list,
+                                       new_cap * sizeof(uint64_t));
+        if (!new_buf) {
+            must_unlock(&idx->lock);
+            return STM_ENOMEM;
+        }
+        slot->dead_list     = new_buf;
+        slot->dead_capacity = new_cap;
+    }
+
+    slot->dead_list[slot->dead_count++] = paddr;
+    idx->dirty = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_index_add_to_snap_bootstrap_dead_list(
+    stm_snapshot_index *idx,
+    uint64_t snap_id,
+    uint64_t paddr) {
+    if (!idx) return STM_EINVAL;
+    if (snap_id == 0) return STM_EINVAL;
+    if (paddr == 0) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+
+    size_t s = find_slot_locked(idx, snap_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+
+    snapshot_slot *slot = &idx->slots[s];
+
+    /* R33 P2 single-ownership defense (boot tier) — scoped to the boot
+     * tier; alloc-tier paddr-bit-pattern collisions are intentionally
+     * permitted. Mirrors _overwrite_bootstrap_block. */
+    for (size_t k = 0; k < idx->slots_len; k++) {
+        const snapshot_slot *sk = &idx->slots[k];
+        if (!sk->present) continue;
+        for (size_t j = 0; j < sk->boot_dead_count; j++) {
+            if (sk->boot_dead_list[j] == paddr) {
+                must_unlock(&idx->lock);
+                return STM_EINVAL;
+            }
+        }
+    }
+
+    if (slot->boot_dead_count >= STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX) {
+        must_unlock(&idx->lock);
+        return STM_ENOSPC;
+    }
+
+    if (slot->boot_dead_count == slot->boot_dead_capacity) {
+        size_t new_cap = slot->boot_dead_capacity == 0
+                            ? 8u
+                            : slot->boot_dead_capacity * 2u;
+        if (new_cap > STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX) {
+            new_cap = STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX;
+        }
+        uint64_t *new_buf = realloc(slot->boot_dead_list,
+                                       new_cap * sizeof(uint64_t));
+        if (!new_buf) {
+            must_unlock(&idx->lock);
+            return STM_ENOMEM;
+        }
+        slot->boot_dead_list     = new_buf;
+        slot->boot_dead_capacity = new_cap;
+    }
+
+    slot->boot_dead_list[slot->boot_dead_count++] = paddr;
+    idx->dirty = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_index_add_to_snap_cold_dead_list(
+    stm_snapshot_index *idx,
+    uint64_t snap_id,
+    const uint8_t content_hash[STM_SNAP_HASH_LEN]) {
+    if (!idx) return STM_EINVAL;
+    if (snap_id == 0) return STM_EINVAL;
+    if (!content_hash) return STM_EINVAL;
+    /* Reject all-zero hash (CAS sentinel). */
+    bool any_nonzero = false;
+    for (size_t k = 0; k < STM_SNAP_HASH_LEN; k++) {
+        if (content_hash[k] != 0) { any_nonzero = true; break; }
+    }
+    if (!any_nonzero) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+
+    size_t s = find_slot_locked(idx, snap_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+
+    snapshot_slot *slot = &idx->slots[s];
+
+    /* R54 P1-1: NO within-snap dedup-defense scan for cold hashes.
+     * The cold_dead_list is a MULTISET — distinct cold records may
+     * legitimately share a hash via content-defined dedup. See
+     * _overwrite_cold_block's R54 P1-1 doctrine note for the full
+     * rationale (the clone path inherits it verbatim — same multiset
+     * semantics, same per-entry deref obligation). */
+
+    if (slot->cold_dead_count >= STM_SNAP_COLD_DEAD_LIST_MAX) {
+        must_unlock(&idx->lock);
+        return STM_ENOSPC;
+    }
+
+    if (slot->cold_dead_count == slot->cold_dead_capacity) {
+        size_t new_cap = slot->cold_dead_capacity == 0
+                            ? 8u : slot->cold_dead_capacity * 2u;
+        if (new_cap > STM_SNAP_COLD_DEAD_LIST_MAX) {
+            new_cap = STM_SNAP_COLD_DEAD_LIST_MAX;
+        }
+        uint8_t *new_buf = realloc(slot->cold_dead_list,
+                                      new_cap * STM_SNAP_HASH_LEN);
+        if (!new_buf) {
+            must_unlock(&idx->lock);
+            return STM_ENOMEM;
+        }
+        slot->cold_dead_list     = new_buf;
+        slot->cold_dead_capacity = new_cap;
+    }
+
+    memcpy(slot->cold_dead_list + slot->cold_dead_count * STM_SNAP_HASH_LEN,
+            content_hash, STM_SNAP_HASH_LEN);
+    slot->cold_dead_count++;
+    idx->dirty = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
 stm_status stm_snapshot_cold_dead_list_count(const stm_snapshot_index *idx,
                                                  uint64_t snapshot_id,
                                                  size_t *out_count) {

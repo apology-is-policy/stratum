@@ -665,6 +665,94 @@ stm_status stm_snapshot_cold_dead_list_get(stm_snapshot_index *idx,
                                               uint8_t **out_hashes,
                                               size_t *out_count);
 
+/* ========================================================================= */
+/* 9.7-impl-6b: clone routing variants of the _overwrite_*_block family.       */
+/* ========================================================================= */
+
+/*
+ * 9.7-impl-6b: append `paddr` to the SPECIFIC snapshot `snap_id`'s
+ * paddr-tier (stm_alloc class) dead-list.
+ *
+ * Sibling of `stm_snapshot_index_overwrite_block`, but routes to a
+ * caller-supplied snap_id instead of looking up
+ * `most_recent_locked(dataset_id)`. The clone path uses this: when a
+ * clone's engine drops a paddr in origin snap S's view, the drop MUST
+ * land in S's dead-list specifically (NOT the most-recent snap of the
+ * clone OR the origin) so a future `stm_snapshot_delete(S)` (deferred
+ * until the clone is gone) reclaims the paddr correctly. See
+ * `phase-9.7-design.md` §9.1 for the snap-routing-gap analysis the
+ * clone mechanism closes.
+ *
+ * Single-ownership defense-in-depth (R33 P2): same as
+ * `_overwrite_block` — refuses STM_EINVAL if `paddr` already appears
+ * in any PRESENT snap's paddr-tier dead-list.
+ *
+ * Refused with:
+ *   - STM_EINVAL on NULL idx / snap_id == 0 / paddr == 0.
+ *   - STM_EINVAL if paddr is already tracked by some PRESENT snap's
+ *     paddr-tier dead_list (single-ownership defense, R33 P2).
+ *   - STM_ENOENT if snap_id is not PRESENT.
+ *   - STM_ENOMEM on realloc failure (prior dead_list preserved).
+ *   - STM_ENOSPC at STM_SNAP_DEAD_LIST_MAX cap.
+ *
+ * On STM_OK the paddr is owned by `snap_id`'s dead-list until either
+ * `stm_snapshot_delete(snap_id)` reclaims it or
+ * `stm_snapshot_clear_dead_lists(snap_id)` (post-rollback) discards it.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_index_add_to_snap_dead_list(stm_snapshot_index *idx,
+                                                       uint64_t snap_id,
+                                                       uint64_t paddr);
+
+/*
+ * 9.7-impl-6b: append `paddr` to the SPECIFIC snapshot `snap_id`'s
+ * bootstrap-tier (engine NODE / stm_bootstrap class) dead-list.
+ *
+ * Sibling of `stm_snapshot_index_overwrite_bootstrap_block` for the
+ * clone path. Same posture as `_add_to_snap_dead_list` above but for
+ * the boot tier — single-ownership scan in `boot_dead_list`, append
+ * to `slot->boot_dead_list`, cap at STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX.
+ *
+ * Refused with:
+ *   - STM_EINVAL on NULL idx / snap_id == 0 / paddr == 0.
+ *   - STM_EINVAL if paddr is already tracked by some PRESENT snap's
+ *     bootstrap-tier dead_list (single-ownership defense, R33 P2).
+ *   - STM_ENOENT if snap_id is not PRESENT.
+ *   - STM_ENOMEM on realloc failure (prior dead_list preserved).
+ *   - STM_ENOSPC at STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX cap.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_index_add_to_snap_bootstrap_dead_list(
+    stm_snapshot_index *idx,
+    uint64_t snap_id,
+    uint64_t paddr);
+
+/*
+ * 9.7-impl-6b: append `content_hash` to the SPECIFIC snapshot
+ * `snap_id`'s cold-tier (CAS class) dead-list.
+ *
+ * Sibling of `stm_snapshot_index_overwrite_cold_block` for the clone
+ * path. Same multiset semantics — a single hash MAY appear multiple
+ * times (one entry per deferred deref obligation; see
+ * `_overwrite_cold_block`'s R54 P1-1 note for the rationale).
+ *
+ * NO single-ownership scan (the cold tier doesn't have one — distinct
+ * cold records legitimately share a content_hash via content-defined
+ * dedup).
+ *
+ * Refused with:
+ *   - STM_EINVAL on NULL idx / snap_id == 0 / NULL hash.
+ *   - STM_EINVAL if hash is all-zero (CAS sentinel, never live).
+ *   - STM_ENOENT if snap_id is not PRESENT.
+ *   - STM_ENOMEM on realloc failure (prior dead_list preserved).
+ *   - STM_ENOSPC at STM_SNAP_COLD_DEAD_LIST_MAX cap.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_index_add_to_snap_cold_dead_list(
+    stm_snapshot_index *idx,
+    uint64_t snap_id,
+    const uint8_t content_hash[STM_SNAP_HASH_LEN]);
+
 /*
  * Increment snapshot's hold count. STM_ENOENT if not PRESENT.
  *

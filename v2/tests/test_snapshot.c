@@ -1759,4 +1759,230 @@ STM_TEST(snap_clear_dead_lists_arg_validation) {
     stm_snapshot_index_close(idx);
 }
 
+/* ========================================================================= */
+/* 9.7-impl-6b: clone routing variants — _add_to_snap_*_dead_list APIs.        */
+/* ========================================================================= */
+
+/* Roundtrip: add a paddr to a SPECIFIC snap_id's paddr dead-list, verify
+ * the count went up on that snap and stayed 0 on a sibling snap. The
+ * clone path uses this to route drops to the origin snap_id directly
+ * regardless of which snap is most-recent. */
+STM_TEST(snap_add_to_snap_dead_list_roundtrip) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s1 = 0, s2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s1", 0xAA, 0, NULL, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create_for_test(idx, 1, "s2", 0xBB, 0, NULL, 1,
+                                                   &s2));
+    /* s2 is most-recent. Route a drop to s1 explicitly — the clone path. */
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_dead_list(idx, s1, 0xA001));
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_dead_list(idx, s1, 0xA002));
+
+    size_t c1 = 0, c2 = 0;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s1, &c1));
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s2, &c2));
+    STM_ASSERT_EQ(c1, (size_t)2);
+    STM_ASSERT_EQ(c2, (size_t)0);
+
+    stm_snapshot_index_close(idx);
+}
+
+/* The single-ownership defense scans EVERY PRESENT snap's dead_list,
+ * regardless of which path produced the entry. So a paddr already in
+ * snap_A via _overwrite_block cannot be added to snap_B via the new
+ * _add_to_snap_dead_list API (a caller bug would land here). */
+STM_TEST(snap_add_to_snap_dead_list_refuses_duplicate_across_path) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t sA = 0, sB = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "sA", 0, 0, NULL, 0, &sA));
+    /* sA is most-recent of dataset 1; _overwrite_block routes there. */
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xDEAD, &sf));
+    /* Different dataset — sB is most-recent of dataset 2 (a separate snap
+     * chain). */
+    STM_ASSERT_OK(stm_snapshot_create_for_test(idx, 2, "sB", 0, 0, NULL, 0,
+                                                   &sB));
+    /* The new path refuses STM_EINVAL — paddr 0xDEAD is already in sA's
+     * dead-list; single-ownership prevents it from landing in sB's. */
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_dead_list(idx, sB, 0xDEAD),
+                       STM_EINVAL);
+    stm_snapshot_index_close(idx);
+}
+
+/* Arg validation parallels _overwrite_block's posture: NULL idx,
+ * snap_id == 0, paddr == 0 all return STM_EINVAL; missing snap_id
+ * returns STM_ENOENT (distinct from the parent API which returns
+ * out_should_free=true for the NO_PREV case — the clone path has no
+ * such fall-through). */
+STM_TEST(snap_add_to_snap_dead_list_arg_validation) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0, 0, NULL, 0, &s));
+
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_dead_list(NULL, s, 0x1000),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_dead_list(idx, 0, 0x1000),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_dead_list(idx, s, 0),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_dead_list(idx, 9999, 0x1000),
+                       STM_ENOENT);
+    /* On STM_OK the paddr is appended; same call twice trips the
+     * within-tier single-ownership scan (the second call sees the
+     * paddr already present). */
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_dead_list(idx, s, 0x1000));
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_dead_list(idx, s, 0x1000),
+                       STM_EINVAL);
+
+    stm_snapshot_index_close(idx);
+}
+
+/* Bootstrap-tier variant — same posture as the paddr-tier above. */
+STM_TEST(snap_add_to_snap_bootstrap_dead_list_roundtrip) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0, 0, NULL, 0, &s));
+
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_bootstrap_dead_list(idx, s,
+                                                                        0xB001));
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_bootstrap_dead_list(idx, s,
+                                                                        0xB002));
+    size_t bc = 0;
+    STM_ASSERT_OK(stm_snapshot_bootstrap_dead_list_count(idx, s, &bc));
+    STM_ASSERT_EQ(bc, (size_t)2);
+
+    /* Cross-tier: the same bit-pattern paddr in BOTH paddr-tier and
+     * boot-tier is intentionally permitted (different allocators, same
+     * pattern). The single-ownership scan is per-tier. */
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_dead_list(idx, s, 0xB001));
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_add_to_snap_bootstrap_dead_list_arg_validation) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0, 0, NULL, 0, &s));
+
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_bootstrap_dead_list(NULL, s, 0x1000),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_bootstrap_dead_list(idx, 0, 0x1000),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_bootstrap_dead_list(idx, s, 0),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_bootstrap_dead_list(idx, 9999, 0x1000),
+                       STM_ENOENT);
+
+    /* Within-tier single-ownership scan: same paddr twice refused. */
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_bootstrap_dead_list(idx, s, 0xB001));
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_bootstrap_dead_list(idx, s, 0xB001),
+                       STM_EINVAL);
+
+    stm_snapshot_index_close(idx);
+}
+
+/* Cold-tier variant: multiset semantics (same hash may legitimately
+ * repeat — content-defined dedup). NO single-ownership scan. */
+STM_TEST(snap_add_to_snap_cold_dead_list_multiset) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0, 0, NULL, 0, &s));
+
+    uint8_t hashA[32], hashB[32];
+    memset(hashA, 0xAA, sizeof hashA);
+    memset(hashB, 0xBB, sizeof hashB);
+
+    /* Add hashA twice + hashB once — count should be 3. */
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_cold_dead_list(idx, s, hashA));
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_cold_dead_list(idx, s, hashA));
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_cold_dead_list(idx, s, hashB));
+
+    size_t cc = 0;
+    STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(idx, s, &cc));
+    STM_ASSERT_EQ(cc, (size_t)3);
+
+    /* Read-back exposes the multiset shape: hashA appears twice. */
+    uint8_t *out = NULL;
+    size_t out_n = 0;
+    STM_ASSERT_OK(stm_snapshot_cold_dead_list_get(idx, s, &out, &out_n));
+    STM_ASSERT_EQ(out_n, (size_t)3);
+    int n_a = 0;
+    for (size_t i = 0; i < out_n; i++) {
+        if (memcmp(out + i * 32, hashA, 32) == 0) n_a++;
+    }
+    STM_ASSERT_EQ(n_a, 2);
+    free(out);
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_add_to_snap_cold_dead_list_arg_validation) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0, 0, NULL, 0, &s));
+
+    uint8_t hash[32];
+    memset(hash, 0x42, sizeof hash);
+    uint8_t zero_hash[32] = {0};
+
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_cold_dead_list(NULL, s, hash),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_cold_dead_list(idx, 0, hash),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_cold_dead_list(idx, s, NULL),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_cold_dead_list(idx, s, zero_hash),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_add_to_snap_cold_dead_list(idx, 9999, hash),
+                       STM_ENOENT);
+
+    stm_snapshot_index_close(idx);
+}
+
+/* The clone-routing scenario: a clone of origin snap S drops a paddr
+ * that S's view referenced. The drop MUST land in S's dead-list, NOT
+ * in the most-recent snap of any dataset. Verify the new API achieves
+ * this exact targeting even when newer snaps of the origin's dataset
+ * exist. */
+STM_TEST(snap_add_to_snap_dead_list_targets_specific_snap_not_most_recent) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+
+    /* Dataset 1: 3 snaps in chain (s1 is oldest, s3 is most-recent). */
+    uint64_t s1 = 0, s2 = 0, s3 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s1", 0, 0, NULL, 0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create_for_test(idx, 1, "s2", 0, 0, NULL, 1,
+                                                   &s2));
+    STM_ASSERT_OK(stm_snapshot_create_for_test(idx, 1, "s3", 0, 0, NULL, 2,
+                                                   &s3));
+
+    /* The "clone path" routes the drop to s1 (the specific origin snap)
+     * even though s3 is the most-recent of dataset 1. */
+    STM_ASSERT_OK(stm_snapshot_index_add_to_snap_dead_list(idx, s1, 0xC0FFEE));
+
+    size_t c1 = 0, c3 = 0;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s1, &c1));
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s3, &c3));
+    STM_ASSERT_EQ(c1, (size_t)1);
+    STM_ASSERT_EQ(c3, (size_t)0);
+
+    /* Contrast with _overwrite_block, which routes via most-recent and
+     * lands the drop in s3. */
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xBADBEEF, &sf));
+    STM_ASSERT_EQ(sf, false);
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s1, &c1));
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s3, &c3));
+    STM_ASSERT_EQ(c1, (size_t)1);  /* unchanged */
+    STM_ASSERT_EQ(c3, (size_t)1);  /* the most-recent caught the drop */
+
+    stm_snapshot_index_close(idx);
+}
+
 STM_TEST_MAIN("snapshot")
