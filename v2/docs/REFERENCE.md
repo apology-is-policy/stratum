@@ -39,8 +39,16 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 ## Snapshot
 
 - **Tip**: 9.7-impl-4c-iii — rollback cleared-dead-list-garbage
-  reclamation — shipped (R164 audit forthcoming at commit time).
-  Closes the §6.6 forward-list completely: `fs_rollback_reclaim_cleared_dead_list_garbage`
+  reclamation — shipped + R164 audit **CLOSED GREEN** (0 P0 / 0 P1 /
+  0 P2 / 0 P3). R164 prosecuted all 11 load-bearing claims — central
+  no-over-deref via the snap_unique → dead_S correspondence proof,
+  the reorder of `clear_dead_lists` past the reclaim block, walk-
+  must-complete invariants, free_gen discipline, memory safety,
+  concurrency, wedge-on-commit-failure, and the new regression
+  test's differential — through 6+ adversarial scenarios per claim
+  (chained overwrites, dedup-shared hashes across (ino, off) pairs,
+  post-unlink inode-number reuse, reflink). No findings at any
+  severity. Closes the §6.6 forward-list completely: `fs_rollback_reclaim_cleared_dead_list_garbage`
   reads S's three dead-lists (boot / data / cold) via the new
   non-destructive getters `stm_snapshot_{dead_list, bootstrap_dead_list,
   cold_dead_list}_get`, then reclaims `snap_dead[s] \ s_view` — the
