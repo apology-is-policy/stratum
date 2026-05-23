@@ -763,6 +763,99 @@ The shared-root mechanism is "for free" — the engine's COW machinery handles i
 
 **Promote** (ARCH §8.6.2 / clone.tla::Promote): clears `origin_snap_id` to `NO_ORIGIN`. The clone becomes a free-standing dataset; the snap becomes deletable (assuming no other clones). Block lifetimes don't change at promote — the shared blocks are still shared with the snap until snap-delete. Promote is a metadata-only operation.
 
+### 9.1 — Implementation refinement (2026-05-23)
+
+The §9 sketch above said the share-root mechanism is "for free — the engine's COW machinery handles it without any clone-specific logic." That undersells the work: a careful look at the engine's COW free-routing surfaces a load-bearing wrinkle that needs an explicit fix. This section captures the as-designed mechanism + the v1.0 sub-chunking plan.
+
+#### 9.1.1 — The snap-routing gap
+
+The 9.7-impl-2-routing scheme routes a superseded paddr through `stm_snapshot_index_overwrite_block(snap_idx, dataset_id, paddr, &should_free)` (and the `_bootstrap_block` / `_cold_block` variants). The function looks up `most_recent_locked(dataset_id)` and stamps the paddr into THAT snap's dead-list. The scheme works for non-clone datasets because (a) every dropped paddr was previously referenced by the dataset's live tree, and (b) the most-recent PRESENT snap of the SAME dataset is the snap whose `view` last covered the paddr.
+
+Both assumptions break for clones:
+
+1. **Cross-dataset reference**. A clone's `di_tree_root` is initialised from the origin snap S's captured root. The clone's live tree references blocks that were originally allocated by the ORIGIN dataset's writes. When the clone COWs a shared subtree, the dropped paddr is in **S.view**, NOT in the clone's snap chain. Routing through `most_recent_locked(clone_dataset_id)` yields `STM_SNAP_NO_PREV` (the clone has no snaps of its own at v1.0); the engine falls through to `stm_bootstrap_free` and the paddr returns to the allocator while S still references it. Subsequent reuse at a new gen breaks S's read (AEAD `(paddr, write_gen)` nonce mismatch → STM_ECORRUPT).
+
+2. **New snaps of the origin's dataset don't capture the clone**. Even with the routing fix above, sending clone drops to "the most-recent snap of the origin's dataset_id" is wrong: if the user takes a NEW snap S' of the origin AFTER the clone exists, the clone's tree is NOT in S'.view (S' captures the origin's live tree, which is a separate divergence). Routing clone drops to S' would let S' carry shared paddrs S references; deleting S' later would free paddrs S still needs.
+
+#### 9.1.2 — The v1.0 mechanism
+
+The clone's engine MUST route drops to the **specific** origin snap S (the snap the clone was created from), regardless of what the most-recent snap of any dataset is. This is straightforward but needs three pieces of plumbing:
+
+1. **`stm_engine_store_ctx` extension** — add `uint64_t origin_snap_id` (0 = "not a clone"; non-zero = "route drops to this snap"). Populated at `dataset_engine_open_locked` time from the slot's `e.origin_snap_id`. Borrowed reference; snap_idx already holds the lifetime.
+
+2. **New snapshot APIs** — three sibling functions to the existing `_overwrite_block` / `_overwrite_bootstrap_block` / `_overwrite_cold_block`, but taking a SPECIFIC `snap_id` instead of looking up most-recent:
+
+   ```c
+   stm_status stm_snapshot_index_add_to_snap_dead_list(stm_snapshot_index *idx,
+                                                          uint64_t snap_id,
+                                                          uint64_t paddr,
+                                                          bool *out_should_free);
+   stm_status stm_snapshot_index_add_to_snap_bootstrap_dead_list(stm_snapshot_index *idx,
+                                                                   uint64_t snap_id,
+                                                                   uint64_t paddr,
+                                                                   bool *out_should_free);
+   stm_status stm_snapshot_index_add_to_snap_cold_dead_list(stm_snapshot_index *idx,
+                                                              uint64_t snap_id,
+                                                              const uint8_t content_hash[STM_CAS_HASH_LEN],
+                                                              uint64_t gen, uint64_t link_gen,
+                                                              uint64_t ino, uint64_t off,
+                                                              bool *out_should_free);
+   ```
+
+   Same R33 P2 single-ownership defense-in-depth scan + same caps as the existing _overwrite_block family. STM_ENOENT if the snap isn't PRESENT (cannot happen for the clone path — origin snap is held). `out_should_free=true` is the back-compat return path; for the clone path, `false` is the expected outcome (the snap captures the paddr).
+
+3. **engine_store_free dispatch** — when `ctx->origin_snap_id != 0`, route through the new `_add_to_snap_bootstrap_dead_list` API with the explicit snap_id. The existing `most_recent_locked(dataset_id)` path stays for non-clone datasets.
+
+   The same dispatch shape applies to the data-tier (`sync.c::stm_snapshot_index_overwrite_block` call sites at sync.c:4821 + cold:5168 + cold:6046). When the engine's slot has `origin_snap_id != 0`, those call sites route to `_add_to_snap_dead_list` and `_add_to_snap_cold_dead_list` against the origin snap_id.
+
+#### 9.1.3 — DEK provisioning
+
+The clone gets its OWN per-dataset DEK (same shape as `stm_fs_create_dataset` calls `stm_sync_add_dataset_key`). The clone's NEW data writes stamp the clone's `key_id` on each extent record. The clone's READS of shared extents look up the extent's stamped `key_id` (origin's) via the pool-global keyschema and decrypt under the origin's DEK. Cross-DEK reads/writes work transparently because the per-extent `key_id` field makes the dispatch self-describing.
+
+The clone's metadata reads/writes use the pool-global metadata_key (same as every other dataset's metadata). No metadata-key concerns.
+
+#### 9.1.4 — v1.0 scope decisions
+
+ARCH §8.6.2 describes a "full promote" that reshuffles the snap chain — the snap that was the origin becomes a "descendant of the clone" — non-trivial spec extension. The MVP `clone.tla::Promote` action just clears the origin dependency (clone "forgets" the origin snap). With the MVP semantics, post-promote the origin snap would be deletable AND the clone's tree would lose its anchor — the shared blocks would be freed and the clone's tree would break. The MVP semantics are unsafe as-is.
+
+To keep v1.0 sound without the full promote machinery, we limit the surface:
+
+| Operation | v1.0 | Forward-note |
+|---|---|---|
+| `stm_fs_create_clone` (the create + share-root + hold) | **YES** | — |
+| `stm_fs_destroy_dataset` of a clone (releases the snap-hold on destroy) | **YES** (via existing destroy, extended) | — |
+| `stm_fs_create_snapshot` on a clone | **REFUSED** STM_ENOTSUPPORTED | v1.x with per-block-birth deadlist tracking |
+| `stm_fs_promote_clone` | **REFUSED** STM_ENOTSUPPORTED | v1.x with full snap-chain reshuffling |
+| `stm_fs_create_snapshot` on the clone's PARENT dataset (origin) while a clone exists | **ALLOWED** (separate snap chain) | — |
+| `stm_fs_rollback_snapshot` to origin snap S while clone is held on S | **REFUSED** STM_EBUSY (already the case — rollback refuses on `hold_count > 0`) | v1.x: rollback-with-clone-destroy semantics |
+
+These limitations are equivalent to ZFS's "you can clone, but to take a snap of the clone or to promote it, do it as a separate workflow" — operationally familiar, and the v1.0 mechanism is sound.
+
+The snap-of-clone refusal lives in `stm_fs_create_snapshot`'s gate: look up the dataset entry, refuse with STM_ENOTSUPPORTED if `origin_snap_id != STM_DATASET_NO_ORIGIN`. The promote refusal is the (currently nonexistent) `stm_fs_promote_clone` returning STM_ENOTSUPPORTED at v1.0; the API is forward-defined so callers can adopt it once the v1.x mechanism lands.
+
+#### 9.1.5 — Snap-delete gate via clone_check_cb
+
+`stm_snapshot_index_set_clone_check_cb` already exists (snapshot.h); the callback is invoked at `stm_snapshot_delete` time and returns `true` to refuse the delete. At mount, fs.c installs a callback that calls `stm_dataset_clones_count_for_snap(didx, snap_id, &count)` and returns `count > 0`. This realises `clone.tla::SnapWithClonesUndeletable`.
+
+The cb installation point is `stm_fs_mount`, after the dataset_index + snap_idx are constructed. The cb context is the dataset_index. Lifetime: ds_idx and snap_idx are both owned by sync, both die at unmount; the cb's context survives the snap_idx's lifetime.
+
+#### 9.1.6 — R165 P2-1 forward-compat carry
+
+The §6.10 P2-1 forward-note (latent corruption window in rollback's cascade) explicitly flagged impl-6 as a trigger: when clones exist, `stm_snapshot_delete`'s gate set widens to include "no clones reference this snap" (clone_check_cb). The cascade's pre-validate already enumerates `hold_count > 0` refusals; it now ALSO needs to enumerate the clone-check refusal — OR the rollback refuses upfront if ANY newer snap has clones. The latter is simpler and matches the existing newer-snap-with-hold refusal posture. **impl-6 close commit MUST extend the cascade pre-validate to refuse on `stm_dataset_clones_count_for_snap > 0`.**
+
+#### 9.1.7 — Sub-chunking plan
+
+| Chunk | Output |
+|---|---|
+| 9.7-impl-6a (this) | design refinement — captures snap-routing gap + v1.0 mechanism + scope decisions |
+| 9.7-impl-6b | snapshot.h/.c — 3 new `_add_to_snap_*_dead_list` APIs + unit tests |
+| 9.7-impl-6c | engine_store_ctx + dataset.c — `origin_snap_id` field + wire at engine open + dispatch in engine_store_free |
+| 9.7-impl-6d | sync.c — extend data-tier + cold-tier overwrite_block call sites to dispatch on origin_snap_id |
+| 9.7-impl-6e | fs.c — `stm_fs_create_clone` + clone_check_cb wiring at mount + snap-of-clone refusal + rollback cascade extension |
+| 9.7-impl-6f | tests (clone create / destroy / share-root reads / COW divergence / snap-of-clone refusal / rollback cascade) + ctest + R168 |
+
+Each chunk is a single commit with its own ctest pass; 6a–6f together realise `clone.tla::{CloneCreate, CloneDestroy, SnapWithClonesUndeletable}` + the engine routing fix. `clone.tla::Promote` remains v1.x.
+
 ## 10 — Out of scope (deferred to later)
 
 ### 10.1 — Send/recv across snapshots
@@ -788,6 +881,8 @@ The writeback dirty buffer (SWISS-4q-flush) is per-inode + per-dataset. A snapsh
 | 9.7-impl-3 | snap-create captures real root | R159 |
 | 9.7-impl-4 | rollback mechanism (real) | R160 |
 | 9.7-impl-5 | readable .snaps | R161 |
+| 9.7-impl-6a | clone design refinement | (none — design only) |
+| 9.7-impl-6b..f | clones impl (snapshot APIs, engine routing, fs API, tests) | R168 |
 | 9.7-impl-6 | clones | R162 |
 
 Each impl chunk follows the standing discipline: pre-flush, ctest green at the close, R-audit verdict before the next chunk starts. Reference doc (`v2/docs/reference/13-snapshot.md`) updated in the same commit per the Phase 9 reference-doc upkeep policy.
