@@ -2891,7 +2891,14 @@ stm_status stm_extent_index_lookup_at_root(stm_extent_index *idx,
                                               const uint8_t root_csum[32],
                                               uint64_t ino, uint64_t off,
                                               stm_extent_record *out_extent) {
-    if (!idx || !out_extent) return STM_EINVAL;
+    /* R167 P2-1: refuse NULL root_csum at the entry — the empty-triple
+     * branch inside `stm_dataset_index_scan_engine_range_at` doesn't
+     * touch root_csum, so a (paddr=0, gen=0, csum=NULL) call would
+     * silently treat root_csum as "empty dataset"; tighter arg
+     * validation here surfaces the bug as STM_EINVAL instead. The
+     * paddr/gen=0 sentinel is still accepted (it's the documented
+     * "empty dataset" triple); the NULL-csum gate is separate. */
+    if (!idx || !out_extent || !root_csum) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
 
     pthread_mutex_t *lock = ex_lock(idx);
@@ -2942,5 +2949,85 @@ stm_status stm_extent_index_lookup_at_root(stm_extent_index *idx,
     if (gc.err != STM_OK) return gc.err;
     if (!gc.found) return STM_ENOENT;
     *out_extent = gc.hit;
+    return STM_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* R167 P1-1: count snap-captured HOT EXTENT records by key_id —      */
+/* keyschema sweep gate against pruning a DEK referenced by a frozen   */
+/* tree's extent records.                                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint64_t   want_key_id;
+    size_t     count;
+    uint64_t   ds;          /* the tree's dataset id        */
+    stm_status err;         /* set on decode failure        */
+} ex_key_id_refs_ctx;
+
+static int ex_key_id_refs_adapter(const void *k, size_t klen,
+                                    const void *v, size_t vlen,
+                                    void *ctx_) {
+    ex_key_id_refs_ctx *gc = ctx_;
+    uint64_t ino = 0, off = 0;
+    stm_status ks = ex_decode_key(k, klen, &ino, &off);
+    if (ks != STM_OK) { gc->err = ks; return 1; }
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = ex_decode_value(v, vlen, gc->ds, ino, off, &r);
+    if (vs != STM_OK) { gc->err = vs; return 1; }
+    /* Only HOT extents reference per-dataset DEKs; COLD records use the
+     * pool-global metadata_key, which sweep doesn't touch. */
+    if (r.kind == STM_EXTENT_KIND_HOT && r.key_id == gc->want_key_id) {
+        gc->count++;
+    }
+    return 0;
+}
+
+stm_status stm_extent_index_count_key_id_refs_at(stm_extent_index *idx,
+                                                   uint64_t dataset_id,
+                                                   uint64_t root_paddr,
+                                                   uint64_t root_gen,
+                                                   const uint8_t root_csum[32],
+                                                   uint64_t want_key_id,
+                                                   size_t *out_count) {
+    if (!idx || !root_csum || !out_count) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    *out_count = 0;
+
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    if (idx->ds_idx == NULL) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+
+    /* Whole-EXTENT-subspace bound — same shape as
+     * `_collect_engine_data_paddrs_at`. */
+    uint8_t lo[EX_KEY_LEN], hi[EX_KEY_LEN];
+    stm_status k1 = ex_encode_key(0u,         0u,         lo);
+    stm_status k2 = ex_encode_key(UINT64_MAX, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK) {
+        must_unlock(lock);
+        return k1 != STM_OK ? k1 : k2;
+    }
+
+    ex_key_id_refs_ctx gc = {
+        .want_key_id = want_key_id,
+        .count       = 0,
+        .ds          = dataset_id,
+        .err         = STM_OK,
+    };
+    /* An all-zero triple lands in the "empty dataset" path inside the
+     * dataset-index helper; the scan returns STM_OK with no callback
+     * invocations → gc.count stays 0. */
+    stm_status rc = stm_dataset_index_scan_engine_range_at(
+            idx->ds_idx, dataset_id, root_paddr, root_gen, root_csum,
+            lo, EX_KEY_LEN, hi, EX_KEY_LEN,
+            ex_key_id_refs_adapter, &gc);
+    must_unlock(lock);
+    if (rc != STM_OK) return rc;
+    if (gc.err != STM_OK) return gc.err;
+    *out_count = gc.count;
     return STM_OK;
 }

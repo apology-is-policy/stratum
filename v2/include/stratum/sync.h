@@ -1206,20 +1206,24 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  * (the gap between two extents in the frozen tree) ALSO return zeros
  * for that slice.
  *
- * `count_for_promotion` is FORCED to false: snap views are frozen
- * and must not dirty the live dataset's promotion-heuristic state.
+ * The COLD promote-read-hit bump that the live read path uses is
+ * intentionally OMITTED: snap views are frozen, and the heuristic
+ * counts dirty the LIVE extent_idx — meaningless for a frozen
+ * snapshot view (R167 P3-3 doctrine carry).
  *
  * MVP constraints (carry from `stm_sync_read_extent`):
- *   - len > 0.
  *   - off must be 4 KiB aligned (caller's loop chunks at iounit).
  *
- * An all-zero triple is the "empty dataset" sentinel — returns
- * STM_OK with `*out_read = len` and the buffer zero-filled.
+ * `len == 0` is permitted and returns STM_OK with `*out_read = 0`.
+ *
+ * An all-zero (paddr, gen) triple is the "empty dataset" sentinel —
+ * returns STM_OK with `*out_read = len` and the buffer zero-filled.
  *
  * Returns STM_EINVAL on NULL s / NULL buf / NULL out_read /
- * dataset_id == 0 / ino == 0 / unaligned off, STM_EWEDGED when the
- * sync is wedged, STM_ECORRUPT / STM_EBADTAG on a value-decode /
- * AEAD / Merkle failure, device errors otherwise.
+ * NULL root_csum / dataset_id == 0 / ino == 0 / unaligned off,
+ * STM_EWEDGED when the sync is wedged, STM_ECORRUPT / STM_EBADTAG
+ * on a value-decode / AEAD / Merkle failure, device errors
+ * otherwise.
  *
  * Thread safety: serialized by sync's internal mutex (same as the
  * live read variant).

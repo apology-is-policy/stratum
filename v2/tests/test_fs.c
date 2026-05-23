@@ -9157,6 +9157,180 @@ STM_TEST(snap_view_extent_read_multi_block) {
     unlink(g_tmp_path);
 }
 
+/* 9.7-impl-5b + R167 P3-1: multi-EXTENT read — force two SEPARATE
+ * extents by writing at non-contiguous offsets with a commit between
+ * writes (the dirty buffer would otherwise aggregate adjacent writes
+ * into one extent). Snapshot captures both extents + the hole between
+ * them. The snap-view's `_lookup_at_root` MUST resolve each covering
+ * extent across the inode's extent set; a hole read in the gap MUST
+ * return zeros without surfacing either extent's bytes. */
+STM_TEST(snap_view_extent_read_multi_extent_with_hole) {
+    make_tmp("snap_view_extent_multi2");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"m", 1,
+                                        0644u, 0, 0, &ino));
+    /* First extent: 4 KiB of 0xA1 at off=0. Commit forces it to drain
+     * as its own extent. */
+    uint8_t pa[4096];
+    memset(pa, 0xA1, sizeof pa);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, pa, sizeof pa));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Second extent: 4 KiB of 0xB2 at off=8192 (4 KiB hole at off=4096).
+     * Commit forces it to drain as a distinct extent. */
+    uint8_t pb[4096];
+    memset(pb, 0xB2, sizeof pb);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 8192u, pb, sizeof pb));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "mh", 2, &snap_id));
+
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"mh", 2, &snap_root));
+    uint64_t snap_m = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"m", 1, &snap_m));
+
+    uint8_t rbuf[4096];
+    size_t got = 0;
+    memset(rbuf, 0, sizeof rbuf);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, snap_m, 0, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, sizeof rbuf);
+    for (size_t i = 0; i < sizeof rbuf; i++) STM_ASSERT_EQ(rbuf[i], 0xA1u);
+
+    /* Hole at off=4096 — sync_read_extent_at_snap's STM_ENOENT branch
+     * zero-fills. fs.c size-clamps by frozen si_size (= 12288 here, the
+     * end of the second extent), so the read at 4096 returns 4096
+     * zero bytes. */
+    memset(rbuf, 0xCC, sizeof rbuf);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, snap_m, 4096u, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, sizeof rbuf);
+    for (size_t i = 0; i < sizeof rbuf; i++) STM_ASSERT_EQ(rbuf[i], 0u);
+
+    memset(rbuf, 0, sizeof rbuf);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, snap_m, 8192u, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, sizeof rbuf);
+    for (size_t i = 0; i < sizeof rbuf; i++) STM_ASSERT_EQ(rbuf[i], 0xB2u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* R167 P1-1: keyschema sweep MUST refuse to prune a RETIRED key while
+ * a PRESENT snapshot's captured extent references that key_id. Without
+ * the fix, a `rotate → snap → overwrite → commit → sweep → snap-view
+ * read` sequence would prune the DEK + the snap-view EXTENT read would
+ * return STM_ECORRUPT for on-disk bytes that are actually intact.
+ *
+ * Sequence:
+ *   1. Write 4 KiB at (1, ino, 0) under k=0; commit.
+ *   2. Snapshot S — captures the extent with key_id=0.
+ *   3. Rotate dataset key → CURRENT=k=1, RETIRED=k=0.
+ *   4. Overwrite (1, ino, 0) — drops live ref to k=0, stamps new
+ *      extent with k=1. Live tree no longer references k=0. Commit.
+ *   5. Sweep — MUST return pruned == 0 (snap-captured ref blocks the
+ *      prune).
+ *   6. Snap-view read still succeeds + returns the frozen bytes.
+ *   7. AFTER deleting the snap, the sweep CAN prune k=0 (no more
+ *      refs in either live tree or snap-captured tree). */
+STM_TEST(snap_view_extent_sweep_blocked_by_snap_key_ref) {
+    make_tmp("snap_view_sweep");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &ino));
+    uint8_t orig[4096];
+    memset(orig, 0x99, sizeof orig);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, orig, sizeof orig));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "snap", 4, &snap_id));
+
+    /* Rotate the dataset's DEK. The pre-snap extent at off=0 still
+     * references key_id=0 (now RETIRED); k=1 is CURRENT. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_hybrid_keys wk;
+    STM_ASSERT_OK(stm_keyfile_load(g_key_path, &wk));
+    uint64_t new_id = 0, old_id = 0;
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(sync, 1, &wk, NULL,
+                                                 &new_id, &old_id));
+    STM_ASSERT_EQ(new_id, 1u);
+    STM_ASSERT_EQ(old_id, 0u);
+
+    /* Overwrite the same offset — live ref to k=0 drops; new extent
+     * gets k=1. */
+    uint8_t new_pt[4096];
+    memset(new_pt, 0x77, sizeof new_pt);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, new_pt, sizeof new_pt));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Sweep — without the R167 P1-1 fix, this would prune k=0 because
+     * the live tree no longer references it. With the fix, the snap's
+     * captured extent still references k=0 + the sweep refuses. */
+    size_t pruned = 99;
+    STM_ASSERT_OK(stm_sync_keyschema_sweep(sync, 1, &pruned));
+    STM_ASSERT_EQ(pruned, 0u);
+
+    /* Confirm k=0's DEK is still in RAM. */
+    uint8_t dek[32];
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 1, 0, dek));
+
+    /* Snap-view read still works + returns the frozen 0x99 bytes. */
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"snap", 4, &snap_root));
+    uint64_t snap_f = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"f", 1, &snap_f));
+    uint8_t rbuf[4096];
+    memset(rbuf, 0, sizeof rbuf);
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, snap_f, 0, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, sizeof rbuf);
+    for (size_t i = 0; i < sizeof rbuf; i++) STM_ASSERT_EQ(rbuf[i], 0x99u);
+
+    /* And live read returns the new 0x77 bytes (k=1). */
+    memset(rbuf, 0, sizeof rbuf);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, ino, 0, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, sizeof rbuf);
+    for (size_t i = 0; i < sizeof rbuf; i++) STM_ASSERT_EQ(rbuf[i], 0x77u);
+
+    /* AFTER deleting the snap, the sweep CAN prune k=0 (no more refs
+     * in either live tree or snap-captured tree). This confirms the
+     * R167 P1-1 fix gates ONLY on PRESENT snaps + the pin lifts when
+     * the snap is gone. */
+    size_t freed_count = 0;
+    STM_ASSERT_OK(stm_fs_delete_snapshot(fs, snap_id, &freed_count));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    pruned = 99;
+    STM_ASSERT_OK(stm_sync_keyschema_sweep(sync, 1, &pruned));
+    STM_ASSERT_EQ(pruned, 1u);
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, 1, 0, dek), STM_ENOENT);
+
+    stm_hybrid_keys_wipe(&wk);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 /* 9.7-impl-5b: COLD-mode read from a snap — migrate the file to COLD
  * BEFORE the snapshot so the snap captures the COLD record, then read
  * via the snap-view. The COLD decrypt path (CAS lookup +

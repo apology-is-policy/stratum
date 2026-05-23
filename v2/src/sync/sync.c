@@ -4387,22 +4387,113 @@ static bool extent_ref_count_cb(const stm_extent_record *e, void *ctx_)
     return true;  /* continue */
 }
 
-/* Walk extent_idx for `dataset_id` and count live extents stamped
- * with `key_id`. Caller MUST hold s->lock. */
+/* R167 P1-1: collector for snap entries matching a dataset. The
+ * callback runs UNDER the snapshot index's mutex; we just COPY each
+ * matching entry into a heap buffer and return — the caller walks
+ * the buffer after iter completes (snap_idx released), avoiding any
+ * nested-lock dance with extent_idx / dataset_idx. */
+typedef struct {
+    uint64_t            dataset_id;
+    stm_snapshot_entry *entries;
+    size_t              count;
+    size_t              cap;
+    stm_status          err;
+} sync_snap_collect_ctx;
+
+static bool sync_snap_collect_cb(const stm_snapshot_entry *e, void *ctx_) {
+    sync_snap_collect_ctx *c = ctx_;
+    if (e->dataset_id != c->dataset_id) return true;     /* skip; continue */
+    if (c->count == c->cap) {
+        if (c->cap > (SIZE_MAX / sizeof *c->entries) / 2u) {
+            c->err = STM_ENOMEM;
+            return false;
+        }
+        size_t ncap = c->cap == 0 ? 4u : c->cap * 2u;
+        stm_snapshot_entry *ne = realloc(c->entries, ncap * sizeof *ne);
+        if (!ne) { c->err = STM_ENOMEM; return false; }
+        c->entries = ne;
+        c->cap     = ncap;
+    }
+    c->entries[c->count++] = *e;
+    return true;
+}
+
+/* Count live extents stamped with `key_id` in `dataset_id`'s LIVE
+ * extent index AND in every PRESENT snapshot's frozen extent tree.
+ * Caller MUST hold s->lock.
+ *
+ * R167 P1-1: pre-fix this function walked the LIVE extent index
+ * only, so a snap-captured extent referencing a RETIRED key_id was
+ * invisible to `stm_sync_keyschema_sweep`. A subsequent snap-view
+ * EXTENT read (9.7-impl-5b) would then return STM_ECORRUPT for
+ * on-disk bytes that are actually intact (the DEK got pruned). The
+ * fix walks every PRESENT snap of the dataset via a throwaway-engine
+ * scan over its captured EXTENT subspace, counting HOT records with
+ * the matching key_id (COLD records reference `metadata_key` not
+ * per-dataset DEKs and cannot block the sweep).
+ *
+ * Returns SIZE_MAX on ANY error path — the sweep treats SIZE_MAX as
+ * "assume non-zero refs" and refuses the prune. Safer than skipping
+ * the check. */
 static size_t sync_extent_refs_for_key_locked(stm_sync *s,
                                                  uint64_t dataset_id,
                                                  uint64_t key_id)
 {
     if (!s->extent_idx) return 0;
+
+    /* Live tree first. */
     extent_ref_count_ctx c = { .want_key_id = key_id, .count = 0 };
-    /* iter_ds returns STM_OK on completion or ENOMEM on a temporary
-     * sort-buffer alloc fail. On ENOMEM we fall back to "assume
-     * non-zero refs" (refuse the prune) — safer than skipping the
-     * check. */
     stm_status rc = stm_extent_iter_ds(s->extent_idx, dataset_id,
                                           extent_ref_count_cb, &c);
     if (rc != STM_OK) return SIZE_MAX;
-    return c.count;
+    size_t total = c.count;
+
+    /* R167 P1-1: snap-captured trees. Walk every PRESENT snapshot of
+     * the dataset via a snap-iter that COPIES matching entries (the
+     * iter cb holds snap_idx's mutex; we cannot call into extent_idx
+     * from inside it without inviting lock-order trouble). Then walk
+     * the copy outside the iter, opening a throwaway engine per snap. */
+    if (!s->snap_idx) return total;       /* no snap index attached */
+
+    sync_snap_collect_ctx sc = {
+        .dataset_id = dataset_id,
+        .entries    = NULL,
+        .count      = 0,
+        .cap        = 0,
+        .err        = STM_OK,
+    };
+    stm_status irc = stm_snapshot_iter(s->snap_idx,
+                                         sync_snap_collect_cb, &sc);
+    if (irc != STM_OK || sc.err != STM_OK) {
+        free(sc.entries);
+        return SIZE_MAX;
+    }
+    for (size_t i = 0; i < sc.count; i++) {
+        size_t nrefs = 0;
+        stm_status crc = stm_extent_index_count_key_id_refs_at(
+                s->extent_idx, dataset_id,
+                sc.entries[i].tree_root_paddr,
+                sc.entries[i].root_gen,
+                sc.entries[i].root_csum,
+                key_id, &nrefs);
+        if (crc != STM_OK) {
+            free(sc.entries);
+            return SIZE_MAX;
+        }
+        /* SIZE_MAX safety: per-snap nrefs is bounded by the snap's
+         * extent count; total can grow unbounded as snaps × extents.
+         * The sweep treats SIZE_MAX as "refuse"; saturate at MAX-1
+         * to keep "real-count" semantics for the not-yet-saturated
+         * case without ever signalling the sentinel from a real
+         * count. */
+        if (nrefs > SIZE_MAX - 1u - total) {
+            free(sc.entries);
+            return SIZE_MAX;
+        }
+        total += nrefs;
+    }
+    free(sc.entries);
+    return total;
 }
 
 stm_status stm_sync_keyschema_sweep(stm_sync *s,
@@ -5601,7 +5692,12 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
                                            uint64_t ino, uint64_t off,
                                            void *buf, size_t len,
                                            size_t *out_read) {
-    if (!s || !buf || !out_read) return STM_EINVAL;
+    /* R167 P2-1: refuse NULL root_csum at the entry — tighter than the
+     * defaulting-empty-triple behaviour buried inside
+     * stm_dataset_index_scan_engine_range_at. The all-zero
+     * (paddr=0, gen=0) sentinel is still valid (empty dataset); the
+     * NULL csum is a distinct arg-validation failure. */
+    if (!s || !buf || !out_read || !root_csum) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (len == 0) { *out_read = 0; return STM_OK; }
     if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;

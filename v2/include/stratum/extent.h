@@ -1238,11 +1238,12 @@ stm_status stm_extent_index_collect_engine_cold_records_at(
  * confused-deputy attack the cross-dataset gate refuses one layer up
  * at `fs_synth_snap_lookup`.
  *
- * An all-zero triple is the "empty dataset" sentinel — returns
- * STM_ENOENT (no records). Returns STM_EINVAL on NULL idx /
- * NULL out_extent / dataset_id == 0 / ino == 0 / extent index's
- * dataset index unattached, STM_ECORRUPT / STM_EBADTAG on a Merkle /
- * AEAD / value-decode failure, STM_ENOMEM / device errors otherwise.
+ * An all-zero (paddr, gen) triple is the "empty dataset" sentinel —
+ * returns STM_ENOENT (no records). Returns STM_EINVAL on NULL idx /
+ * NULL out_extent / NULL root_csum / dataset_id == 0 / ino == 0 /
+ * extent index's dataset index unattached, STM_ECORRUPT / STM_EBADTAG
+ * on a Merkle / AEAD / value-decode failure, STM_ENOMEM / device
+ * errors otherwise.
  *
  * Concurrency: takes the extent index's internal lock for the call.
  */
@@ -1254,6 +1255,44 @@ stm_status stm_extent_index_lookup_at_root(stm_extent_index *idx,
                                               const uint8_t root_csum[32],
                                               uint64_t ino, uint64_t off,
                                               stm_extent_record *out_extent);
+
+/*
+ * R167 P1-1: count HOT EXTENT records whose `key_id` matches `want_key_id`
+ * inside a frozen tree at `(root_paddr, root_gen, root_csum)`. The
+ * `stm_sync_keyschema_sweep` consults this on every PRESENT snapshot of
+ * the dataset before pruning a RETIRED `key_id` — without it, the sweep
+ * would prune a DEK still referenced by a snap-captured extent, and a
+ * subsequent snap-view EXTENT read (impl-5b) would return STM_ECORRUPT
+ * for on-disk data that is actually intact.
+ *
+ * Counts HOT records only — COLD records reference the pool-global
+ * `metadata_key`, not per-dataset DEKs, so they cannot block the
+ * per-dataset sweep. Same throwaway-engine substrate as
+ * `_collect_engine_data_paddrs_at` (EXTENT-subspace scan + per-value
+ * decode).
+ *
+ * `out_count` receives the count on STM_OK; SIZE_MAX is reserved as
+ * the "scan failed (assume non-zero refs)" sentinel by callers that
+ * must fail-safe on transient errors. SIZE_MAX is NEVER produced by
+ * this function — the function returns STM_OK + `*out_count`, or a
+ * non-OK status with `*out_count` unmodified.
+ *
+ * An all-zero triple is the "empty dataset" sentinel — returns STM_OK
+ * with `*out_count = 0`. Returns STM_EINVAL on NULL idx / NULL
+ * root_csum / NULL out_count / dataset_id == 0 / extent index's
+ * dataset index unattached, STM_ECORRUPT / STM_EBADTAG on a Merkle /
+ * AEAD / value-decode failure, STM_ENOMEM / device errors otherwise.
+ *
+ * Concurrency: takes the extent index's internal lock for the call.
+ */
+STM_MUST_USE
+stm_status stm_extent_index_count_key_id_refs_at(stm_extent_index *idx,
+                                                   uint64_t dataset_id,
+                                                   uint64_t root_paddr,
+                                                   uint64_t root_gen,
+                                                   const uint8_t root_csum[32],
+                                                   uint64_t want_key_id,
+                                                   size_t *out_count);
 
 #ifdef __cplusplus
 }
