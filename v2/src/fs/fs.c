@@ -7136,12 +7136,26 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
  *   we can only filter at the hash level. The snap_unique(H) count
  *   ("records in s.view whose (ino, off) has different identity in
  *   OLD-live") is identical to 4c-iii's because the OLD-live tree is
- *   the same; the divergence shape is unchanged by the cascade. The
- *   SAFETY argument is identical to 4c-iii's: every snap_unique record's
- *   drop fired the snap-aware deref routing while SOME newer snap was
- *   most-recent → at least one matching dead-list entry exists across
- *   the union of newer snaps' dead-lists (snap_unique(H) ≤ agg_cold(H)
- *   per hash). The clamp-at-0 is defense-in-depth.
+ *   the same; the divergence shape is unchanged by the cascade.
+ *
+ * SAFETY of the cold-tier counted subtraction (R165 P3-1 — refined):
+ * snap_unique[H] is the multiset of hashes whose drop fired the
+ * snap-aware deref routing. Each such drop went EITHER to the target's
+ * cold_dead (case-(1) — the drop happened while the target was
+ * most-recent, BEFORE any newer snap existed) OR to some newer snap's
+ * cold_dead (case-(2)). agg_cold[H] sums case-(2)(H) plus case-(b)(H)
+ * (pure post-newer-snap garbage). Therefore
+ *   agg_cold[H] − snap_unique[H] = case-(b)[H] − case-(1)[H].
+ * The clamp-at-0 gives `deref = max(0, case-(b) − case-(1))`. This
+ * NEVER over-derefs (the absolute correctness invariant we need), but
+ * under-derefs by `min(case-(1)[H], case-(b)[H])` — a CAS-refcount
+ * leak when case-(1) drops + case-(b) garbage share a hash via
+ * content-defined dedup. The leak is a space cost (the CAS entry stays
+ * past when it should be GC'd), never a corruption, and is consistent
+ * with the best-effort posture. case-(1) drops are themselves the
+ * target's own dead-list garbage that 4c-iii already reclaimed
+ * (target.cold_dead is cleared by clear_dead_lists), so the leak only
+ * persists until the next CAS-refcount scrub.
  *
  * SAFETY (load-bearing): identical posture as the 4b/4c/4c-ii/4c-iii
  * tiers — best-effort, walk-must-complete, NEVER over-deref / over-free.
@@ -7151,6 +7165,33 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
  * remaining snaps in the cascade still process. Leaked paddrs / cold
  * refcounts are a space cost, never a corruption — a leaked paddr stays
  * ALLOCATED so the AEAD-nonce (paddr, write_gen) pair stays unique.
+ *
+ * R165 P2-1 — CASCADE-FAILURE LATENT CORRUPTION WINDOW (forward-compat):
+ * 4b/4c/4c-ii already ran by the time this helper executes. They freed
+ * `OLD ∖ s_target.view` paddrs — which INCLUDES paddrs that a newer
+ * snap `s_a` references in its frozen tree (a paddr allocated post-s_
+ * target but pre-s_a is in s_a.view AND in OLD-live ∖ s_target.view,
+ * so 4b/4c freed it). The cascade's `stm_snapshot_delete` of s_a must
+ * succeed for s_a's frozen tree to disappear; if it fails best-effort,
+ * s_a stays PRESENT and its tree references freed paddrs. The rollback
+ * commit advances gen → after the next commit those paddrs become
+ * REUSABLE → any later read of s_a's frozen tree decrypts with a stale
+ * `(paddr, write_gen)` pair → AEAD verify fails → STM_ECORRUPT on
+ * any access to s_a. No nonce REUSE (each (paddr, write_gen) is
+ * still unique), but s_a is silently CORRUPTED. **Currently unreachable
+ * in production at v2.0** — the only `stm_snapshot_delete` failure
+ * modes are STM_EBUSY-on-hold (we pre-validate under fs->global EX, so
+ * the hold can't appear between validate and delete) and
+ * STM_EBUSY-on-clone (clones don't exist yet). Both gates are tight
+ * enough that the failure path is unreachable for v2.0 callers.
+ * **Forward-compat hazard** — when 9.7-impl-6 (clones) lands OR a new
+ * `stm_snapshot_delete` failure mode is introduced, this window opens.
+ * Proper fix at that point: either (a) extend the pre-validate to
+ * enumerate every refusable precondition, OR (b) reorder so the
+ * cascade-delete happens BEFORE 4b/4c/4c-ii (the spec-faithful order —
+ * spec marks newer ABSENT first, then computes to_free against the
+ * post-state). (b) is the architectural fix; (a) is the minimum gate.
+ * Forward-noted to the impl-6 (clones) chunk.
  *
  * AGGREGATION (cold tier only): newer snaps' cold dead-lists are
  * accumulated into a single agg_cold buffer (one realloc-growth pass),
@@ -7361,16 +7402,38 @@ static void fs_rollback_reclaim_newer_snap_cascade(
         }
 
         /* Cold tier: append into the aggregation buffer for the
-         * post-loop counted subtraction. */
+         * post-loop counted subtraction. R165 P3-3: reorder the
+         * overflow guards so the size_t addition `n_agg_cold + cold_n`
+         * is checked BEFORE the multiplication (a wrapped addition's
+         * product satisfies the multiplication-overflow self-check, so
+         * the prior order missed adversarial input — defense-in-depth
+         * only; the per-snap dead-list is bounded by
+         * STM_SNAP_COLD_DEAD_LIST_MAX = 256 so SIZE_MAX is unreachable
+         * in production). */
         if (cold_ok && cold_n > 0) {
-            size_t need = (n_agg_cold + cold_n) * STM_EXTENT_HASH_LEN;
-            if (need / STM_EXTENT_HASH_LEN < n_agg_cold + cold_n) {
-                /* overflow guard — defense-in-depth */
+            if (n_agg_cold > SIZE_MAX - cold_n) {
+                /* addition would overflow */
+                cold_ok = false;
+            } else if ((n_agg_cold + cold_n) > SIZE_MAX / STM_EXTENT_HASH_LEN) {
+                /* multiplication would overflow */
                 cold_ok = false;
             } else if (n_agg_cold + cold_n > cap_agg_cold) {
-                size_t ncap = cap_agg_cold ? cap_agg_cold * 2u : 128u;
+                size_t ncap;
+                if (cap_agg_cold == 0) {
+                    ncap = 128u;
+                } else if (cap_agg_cold > SIZE_MAX / 2u) {
+                    /* R165 P3-3: doubling pre-check, NOT post-check —
+                     * a wrapped product re-enters the loop with a
+                     * smaller capacity than the true target. */
+                    ncap = n_agg_cold + cold_n;
+                } else {
+                    ncap = cap_agg_cold * 2u;
+                }
                 while (ncap < n_agg_cold + cold_n) {
-                    if (ncap > SIZE_MAX / 2u) { ncap = n_agg_cold + cold_n; break; }
+                    if (ncap > SIZE_MAX / 2u) {
+                        ncap = n_agg_cold + cold_n;
+                        break;
+                    }
                     ncap *= 2u;
                 }
                 if (ncap > SIZE_MAX / STM_EXTENT_HASH_LEN) {

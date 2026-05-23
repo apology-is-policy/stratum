@@ -252,11 +252,18 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
     deferred to post-loop).
   - Post-loop cold-tier reclaim: counted subtraction `agg_cold(H) −
     snap_unique(H)` clamped at 0; identical merge-walk to 4c-iii.
-    Safe because every `snap_unique` record's drop fired the
-    snap-aware deref routing while SOME newer snap was most-recent at
-    COW time, so at least one matching entry lives across the union
-    of newer snaps' cold dead-lists → `snap_unique(H) ≤ agg_cold(H)`
-    per hash always; clamp is defense-in-depth.
+    Safety (R165 P3-1 refined): snap_unique[H] partitions into
+    case-(1)(H) (drop went to TARGET's cold_dead while target was
+    most-recent BEFORE any newer snap existed) + case-(2)(H) (drop
+    went to some newer snap's cold_dead). agg_cold[H] sums
+    case-(2)(H) + case-(b)(H) (pure post-newer-snap garbage). So
+    `agg_cold[H] − snap_unique[H] = case-(b)[H] − case-(1)[H]`,
+    clamped at 0 → `deref = max(0, case-(b) − case-(1))`. NEVER
+    over-derefs; under-derefs by `min(case-(1), case-(b))` when they
+    share a hash via dedup (CAS-refcount leak — space cost, not
+    corruption; case-(1) drops were already discharged by 4c-iii's
+    `clear_dead_lists`, so the leak persists only until the next
+    CAS-refcount scrub).
   - Best-effort per snap: a `stm_snapshot_delete` failure on one
     snap leaves the others reclaimed; the rollback itself still
     succeeds. Walks that fail wholesale skip their tier; leaked

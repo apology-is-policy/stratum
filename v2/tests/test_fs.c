@@ -8242,6 +8242,13 @@ STM_TEST(fs_rollback_refuses_when_newer_snapshot_held) {
     /* Hold s2 — any future stm_snapshot_delete refuses STM_EBUSY. */
     STM_ASSERT_OK(stm_fs_hold_snapshot(fs, s2));
 
+    /* R165 P3-4: a write with DIFFERENT content (vs the prior data
+     * pattern) so the dirty buffer holds it at refusal time. Stays
+     * unflushed until the next snapshot create / commit. */
+    uint8_t fresh[4096];
+    memset(fresh, 0x99, sizeof fresh);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, fresh, sizeof fresh));
+
     /* Rollback to s1: refused STM_EBUSY because the cascade can't
      * destroy s2 (held). The refusal fires BEFORE the drain, so the
      * post-snapshot live write at (1, 1, 0) is preserved. */
@@ -8254,6 +8261,16 @@ STM_TEST(fs_rollback_refuses_when_newer_snapshot_held) {
     STM_ASSERT_OK(stm_snapshot_lookup(sidx, s1, &e));
     STM_ASSERT_OK(stm_snapshot_lookup(sidx, s2, &e));
     STM_ASSERT_EQ(e.hold_count, 1u);
+
+    /* R165 P3-4: prove the dirty buffer survived the refusal — the
+     * just-written `fresh` content is readable. Without the pre-drain
+     * refusal posture the buffer would have been drained + then
+     * discarded by the swap, returning a stale value. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof fresh);
+    STM_ASSERT_MEM_EQ(fresh, out, sizeof fresh);
 
     /* Release the hold + rollback succeeds (cascade destroys s2). */
     STM_ASSERT_OK(stm_fs_release_snapshot(fs, s2));
@@ -8503,6 +8520,84 @@ STM_TEST(fs_rollback_4d_cold_dedup_correct) {
     size_t got = 0;
     STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
     STM_ASSERT_MEM_EQ(c1, out, sizeof c1);
+
+    STM_ASSERT_OK(stm_fs_verify(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R165 P3-2: cold-tier multi-snap cross-dedup. Two different newer
+ * snaps each drop a distinct (ino, off) record at the SAME hash via
+ * content-defined dedup. snap_unique = 0 (target doesn't reference
+ * either record). Aggregation sums per-snap drops at the same hash;
+ * post-loop subtraction `agg_cold(H) − snap_unique(H) = 2 − 0 = 2`
+ * derefs. Per-snap subtraction would deref 1 per snap = 2 anyway in
+ * THIS case, but the aggregation is load-bearing for OTHER cases
+ * (when snap_unique > 0 the per-snap-subtraction would over-deref
+ * by applying snap_unique credit independently to each snap). */
+STM_TEST(fs_rollback_4d_cold_cross_snap_dedup) {
+    make_tmp("rb_4d_cross_dedup");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_cas_index *cas = stm_sync_cas_index(stm_fs_sync_for_test(fs));
+    STM_ASSERT(cas != NULL);
+
+    /* Target snap s: empty view (no cold records of interest). */
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &s));
+
+    /* Write+migrate ino 30 with content H. Refcount(H) = 1. */
+    uint8_t cH[4096];
+    memset(cH, 0x44, sizeof cH);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 30, 0, cH, sizeof cH));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 30));
+
+    /* Newer snap s_a: captures (30, 0)=H. Refcount unchanged at 1. */
+    uint64_t s_a = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sa", 2, &s_a));
+
+    /* Write+migrate ino 31 with SAME content → dedups to H.
+     * Refcount(H) = 2. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 31, 0, cH, sizeof cH));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 31));
+
+    /* Truncate ino 30: drops (30, 0)=H. Snap-aware deref defers to
+     * MOST-RECENT = s_a. s_a.cold_dead += H. Refcount(H) still 2. */
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 30, 0));
+
+    /* Newer snap s_b: captures (31, 0)=H. Refcount(H) still 2. */
+    uint64_t s_b = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sb", 2, &s_b));
+
+    /* Truncate ino 31: drops (31, 0)=H. Snap-aware deref defers to
+     * MOST-RECENT = s_b. s_b.cold_dead += H. Refcount(H) still 2. */
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 31, 0));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Pre-rollback: CAS has H at refcount 2; the H deref is split
+     * across s_a.cold_dead + s_b.cold_dead (one entry each). */
+    size_t cas_n_pre = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n_pre));
+    STM_ASSERT_EQ(cas_n_pre, (size_t)1);
+
+    /* Roll back to s. Cascade destroys s_a + s_b. agg_cold = [H, H]
+     * (one from each). snap_unique = 0 (s's view has no records).
+     * deref_count = max(0, 2 − 0) = 2. Refcount(H) drops to 0 →
+     * auto-GC. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, s, false));
+
+    /* Post: CAS empty. The 2 derefs are the load-bearing
+     * cross-snap aggregation in action — without it the cascade
+     * would only deref the per-snap subtractions (which happen to
+     * coincide here, but illustrates the aggregation works). */
+    size_t cas_n_post = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n_post));
+    STM_ASSERT_EQ(cas_n_post, (size_t)0);
 
     STM_ASSERT_OK(stm_fs_verify(fs));
     STM_ASSERT_OK(stm_fs_unmount(fs));
