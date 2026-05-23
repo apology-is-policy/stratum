@@ -9260,4 +9260,92 @@ STM_TEST(snap_view_refuses_cross_dataset_snap_id) {
     unlink(g_tmp_path);
 }
 
+/* R166 P2-4: lookup of ".snaps" at parent_ino=1 in an UNINIT'D
+ * dataset refuses STM_ENOENT — the synth-namespace surface is gated
+ * on the parent dir actually existing as a live inode. */
+STM_TEST(snaps_lookup_refuses_when_dataset_root_missing) {
+    make_tmp("snaps_no_root");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Create a CHILD dataset but do NOT call stm_fs_init_dataset_root
+     * on it. Then probe .snaps at the child's ino=1 — must surface
+     * ENOENT (no phantom surface). */
+    uint64_t ds = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "child", &ds));
+
+    uint64_t out = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, ds, /*parent=*/1,
+                                       (const uint8_t *)".snaps", 6, &out),
+                       STM_ENOENT);
+
+    /* Init the root + retry — succeeds. */
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0755u, 0, 0, &r));
+    out = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, ds, 1, (const uint8_t *)".snaps", 6,
+                                    &out));
+    STM_ASSERT_EQ(out, TFS_SNAPS_PARENT_INO);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* R166 P2-1 + P2-2: synth-ino read-side ops other than the four
+ * routed paths refuse STM_ENOTSUPPORTED (xattr / seals) or STM_EROFS
+ * (lock / unlock). Confirms the clarity gates fire BEFORE any
+ * library-level fall-through. */
+STM_TEST(snap_view_read_side_ops_refuse_explicitly) {
+    make_tmp("snap_view_refuse_explicit");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &ino));
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sv-r", 4, &snap_id));
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"sv-r", 4, &snap_root));
+    uint64_t snap_f = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"f", 1, &snap_f));
+
+    /* xattr: getxattr / listxattr on snap-view → STM_ENOTSUPPORTED. */
+    uint8_t buf[64] = {0};
+    uint32_t got = 0;
+    STM_ASSERT_ERR(stm_fs_getxattr(fs, 1, snap_f,
+                                         (const uint8_t *)"user.x", 6,
+                                         buf, sizeof buf, &got),
+                       STM_ENOTSUPPORTED);
+    size_t tot = 0;
+    STM_ASSERT_ERR(stm_fs_listxattr(fs, 1, snap_f, buf, sizeof buf, &tot),
+                       STM_ENOTSUPPORTED);
+    /* seals on snap-view → STM_ENOTSUPPORTED. */
+    uint32_t seals = 0;
+    STM_ASSERT_ERR(stm_fs_get_seals(fs, 1, snap_f, &seals),
+                       STM_ENOTSUPPORTED);
+    /* lock / unlock / lock_test on snap-view → STM_EROFS. */
+    STM_ASSERT_ERR(stm_fs_lock(fs, 1, snap_f, 1, 0u/*STM_LOCK_SHARED*/, 0, 0),
+                       STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_unlock(fs, 1, snap_f, 1, 0, 0), STM_EROFS);
+    bool would = false;
+    uint64_t owner = 0;
+    STM_ASSERT_ERR(stm_fs_lock_test(fs, 1, snap_f, 1, 0u/*STM_LOCK_SHARED*/, 0, 0,
+                                          &would, &owner),
+                       STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("fs")

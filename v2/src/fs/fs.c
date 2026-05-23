@@ -1983,12 +1983,27 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
      * 1. Lookup of ".snaps" at the LIVE dataset-root inode (=1) returns
      *    the synthetic SNAPS_PARENT sentinel. The dirent ".snaps" is
      *    NEVER stored on-disk; this branch is the only path that
-     *    surfaces it.
+     *    surfaces it. R166 P2-4: verify the parent ino=1 actually
+     *    exists as a directory in `dataset_id` before returning the
+     *    sentinel — matches the existing "parent must be a dir"
+     *    contract; refuses a "phantom .snaps" surface on uninit'd
+     *    datasets.
      * 2. Lookup under SNAPS_PARENT resolves a snap name to the
      *    SNAP_VIEW root inode (snap_id, frozen_ino=1).
      * 3. Lookup under a SNAP_VIEW inode routes through the snapshot's
      *    frozen tree via stm_dirent_lookup_at_root. */
     if (parent_ino == 1u && fs_name_eq_snaps(name, name_len)) {
+        stm_inode_index *iidx_chk = stm_sync_inode_index(fs->sync);
+        if (!iidx_chk) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+        struct stm_inode_value pv = {0};
+        stm_status pcs = fs_load_parent_dir(iidx_chk, dataset_id, 1u, &pv);
+        if (pcs != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return pcs;     /* STM_ENOENT for uninit'd dataset / freed root */
+        }
         *out_child_ino = FS_SNAPS_PARENT_INO;
         pthread_rwlock_unlock(&fs->global);
         return STM_OK;
@@ -3968,6 +3983,9 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (out_seals) *out_seals = 0;
     if (!fs || !out_seals) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    /* 9.7-impl-5 R166 P2-1: seal reads on snap-view not surfaced at
+     * v1.0 — explicit STM_ENOTSUPPORTED. */
+    if (fs_ino_is_synth(ino)) return STM_ENOTSUPPORTED;
 
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
@@ -4003,6 +4021,11 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
     if (out_handle) memset(out_handle, 0, sizeof *out_handle);
     if (!fs || !name || !out_handle) return STM_EINVAL;
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    /* 9.7-impl-5 R166 P2-3: refuse synth parent up-front for clarity.
+     * The downstream `fs_load_parent_dir` against the live iidx
+     * returns STM_ENOENT for synth inos anyway; this gate documents
+     * the intent ("file handles are for live-tree inodes only"). */
+    if (fs_ino_is_synth(parent_ino)) return STM_ENOTSUPPORTED;
 
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
@@ -4103,6 +4126,11 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
     uint64_t ino = stm_load_le64(handle->h_ino);
     uint64_t want_gen = stm_load_le64(handle->h_si_gen);
     if (ds == 0u || ino == 0u) return STM_EINVAL;
+    /* 9.7-impl-5 R166 P2-3: refuse synth-encoded handle. A forged
+     * handle with bit 63 set would otherwise miss the live iidx +
+     * surface STM_ENOENT; STM_ESTALE matches POSIX semantics for
+     * "handle describes nothing under this mount". */
+    if (fs_ino_is_synth(ino)) return STM_ESTALE;
 
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
@@ -5112,6 +5140,10 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!name || !out_size) return STM_EINVAL;
     if (value_max > 0u && !value_buf) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    /* 9.7-impl-5 R166 P2-1: xattr reads on snap-view not surfaced
+     * at v1.0 — explicit STM_ENOTSUPPORTED instead of a confusing
+     * STM_ENOENT fall-through through the live xattr index. */
+    if (fs_ino_is_synth(ino)) return STM_ENOTSUPPORTED;
     if (name_len == 0u || name_len > STM_FS_XATTR_NAME_MAX) return STM_EINVAL;
     if (!fs_xattr_name_in_posix_namespace(name, name_len)) return STM_EINVAL;
 
@@ -5145,6 +5177,9 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!out_total_len) return STM_EINVAL;
     if (buf_max > 0u && !name_buf) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    /* 9.7-impl-5 R166 P2-1: xattr reads on snap-view not surfaced
+     * at v1.0 — explicit STM_ENOTSUPPORTED. */
+    if (fs_ino_is_synth(ino)) return STM_ENOTSUPPORTED;
 
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
@@ -8809,6 +8844,9 @@ stm_status stm_fs_lock(stm_fs *fs,
                               uint64_t off, uint64_t len)
 {
     if (!fs) return STM_EINVAL;
+    /* 9.7-impl-5 R166 P2-2: advisory locks on snap-view inodes have
+     * no semantic meaning — the snap is frozen. Refuse STM_EROFS. */
+    if (fs_ino_is_synth(ino)) return STM_EROFS;
 
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_READ(fs);
@@ -8824,6 +8862,8 @@ stm_status stm_fs_unlock(stm_fs *fs,
                                 uint64_t off, uint64_t len)
 {
     if (!fs) return STM_EINVAL;
+    /* 9.7-impl-5 R166 P2-2: symmetric to lock — synth ino refusal. */
+    if (fs_ino_is_synth(ino)) return STM_EROFS;
 
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_READ(fs);
@@ -8844,6 +8884,11 @@ stm_status stm_fs_lock_test(stm_fs *fs,
     if (out_would_grant) *out_would_grant = false;
     if (out_conflicting_owner) *out_conflicting_owner = 0;
     if (!fs || !out_would_grant) return STM_EINVAL;
+    /* 9.7-impl-5 R166 P2-2: synth ino lock-test is meaningless. The
+     * RO probe semantically is "would acquire succeed?" — and acquire
+     * itself refuses STM_EROFS — so probe surfaces STM_EROFS too for
+     * symmetry. */
+    if (fs_ino_is_synth(ino)) return STM_EROFS;
 
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
