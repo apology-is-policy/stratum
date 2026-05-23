@@ -4604,7 +4604,27 @@ stm_status stm_sync_get_dek(const stm_sync *s,
  * runs. Future code that takes snap_idx->lock OR dataset_idx->lock
  * without holding fs->global EX MUST address the inversion explicitly
  * (e.g., adopt a canonical direction OR document a new serialization
- * gate). The natural-lock-order doctrine is no longer the whole story. */
+ * gate). The natural-lock-order doctrine is no longer the whole story.
+ *
+ * R168 P3-5 update: post-9.7-impl-6d there is a THIRD acquisition
+ * pattern. `sync_dataset_origin_snap_id_locked` (the data + cold
+ * tier clone dispatch helper) is called under `s->lock` and briefly
+ * takes + releases `dataset_idx->lock` (via stm_dataset_lookup);
+ * the caller then calls `stm_snapshot_index_add_to_snap_*_dead_list`
+ * which briefly takes + releases `snap_idx->lock`. The dataset
+ * lock is released BEFORE the snap lock is acquired — the two
+ * locks never overlap — so no NEW nested edge is introduced. The
+ * pattern enumeration post-impl-6d is:
+ *   (1) snap → dataset (NESTED) — sync_clone_check_cb
+ *   (2) dataset → snap (NESTED) — commit_engines_finalize →
+ *                                  engine_store_free
+ *   (3) dataset (briefly) → snap (briefly) — non-nested; 6d data
+ *                                            + cold tier clone
+ *                                            dispatch
+ * All three rely on `fs->global` EX serialization at the FS layer.
+ * Future code that takes either lock without holding `fs->global`
+ * EX MUST classify into one of these three patterns OR document a
+ * new one. */
 static bool sync_clone_check_cb(uint64_t snapshot_id, void *ctx)
 {
     stm_dataset_index *di = (stm_dataset_index *)ctx;

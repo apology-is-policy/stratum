@@ -452,5 +452,171 @@ STM_TEST(fs_clone_promote_clone_refused_v1) {
 }
 
 /* ========================================================================= */
+/* R168-close regression tests (P1-1 + P2-1 + P2-2 + P2-4).                  */
+/* ========================================================================= */
+
+/* R168 P1-1 / P2-4: remount round-trip for a clone whose dataset_id
+ * coincides numerically with its origin_snap_id. The 6f close commit
+ * removed the namespace-confused self-reference check at the create
+ * site (`stm_dataset_create_clone`) but missed the identical flawed
+ * check at the load-time validator (`ds_validate_shadow` at
+ * dataset.c:2293). Pre-fix this test fails STM_ECORRUPT on the
+ * remount; post-fix the remount succeeds + the clone entry survives
+ * with its triple intact. */
+STM_TEST(fs_clone_remount_with_id_equals_origin_snap_id) {
+    make_tmp("clone_remount");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Construct the id-collision scenario: two snapshots of root +
+     * a clone of s2 yields clone_id == origin_snap_id == 2 (root=1
+     * used the dataset slot 1, so next_dataset_id starts at 2;
+     * snap_idx counter advances 1→2 across two snaps). */
+    uint8_t buf[4096];
+    memset(buf, 0x99, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf));
+    uint64_t s1 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s1", 2, &s1));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf));
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
+    STM_ASSERT_EQ(s2, (uint64_t)2);
+
+    uint64_t clone_id = 0;
+    STM_ASSERT_OK(stm_fs_create_clone(fs, 1, "rmt", s2, &clone_id));
+    STM_ASSERT_EQ(clone_id, (uint64_t)2);
+    STM_ASSERT_EQ(clone_id, s2);  /* the bug-triggering coincidence */
+
+    /* Capture the clone's triple BEFORE unmount for round-trip
+     * verification. */
+    stm_dataset_index *didx = stm_sync_dataset_index(stm_fs_sync(fs));
+    stm_dataset_entry de_before;
+    STM_ASSERT_OK(stm_dataset_lookup(didx, clone_id, &de_before));
+
+    /* Unmount → the dirty dataset_idx persists the clone slot. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+
+    /* Remount — pre-fix this returns STM_ECORRUPT from
+     * `ds_validate_shadow`. Post-fix it succeeds. */
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Clone entry survives with the same triple. */
+    didx = stm_sync_dataset_index(stm_fs_sync(fs));
+    stm_dataset_entry de_after;
+    STM_ASSERT_OK(stm_dataset_lookup(didx, clone_id, &de_after));
+    STM_ASSERT_EQ(de_after.origin_snap_id, de_before.origin_snap_id);
+    STM_ASSERT_EQ(de_after.di_tree_root,   de_before.di_tree_root);
+    STM_ASSERT_EQ(de_after.di_root_gen,    de_before.di_root_gen);
+    STM_ASSERT_EQ(memcmp(de_after.di_root_csum, de_before.di_root_csum, 32), 0);
+    STM_ASSERT_EQ(de_after.parent_id, (uint64_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* R168 P2-1: the impl-6e clone-count gate at `stm_fs_rollback_snapshot`'s
+ * newer-snap pre-validate is masked by the pre-existing `hold_count > 0`
+ * check (impl-6e takes a snap hold at clone-create, so a clone-of-newer-
+ * snap rollback hits the hold gate first). Test 7 verifies the COMPOSITE
+ * STM_EBUSY refusal but cannot distinguish which gate fired. This variant
+ * drops the hold first so the clone-count gate is the LOAD-BEARING
+ * refusal. A future regression that broke ONLY the clone-count gate
+ * would silently pass test 7; this variant catches it. */
+STM_TEST(fs_clone_rollback_clone_count_gate_alone) {
+    make_tmp("rb_gate_alone");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t buf[4096];
+    memset(buf, 0x11, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf));
+    uint64_t s1 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s1", 2, &s1));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf));
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
+
+    uint64_t clone_id = 0;
+    STM_ASSERT_OK(stm_fs_create_clone(fs, 1, "rbg", s2, &clone_id));
+
+    /* Drop the snap-hold impl-6e took at create_clone time. After this:
+     *   s2.hold_count = 0          (hold gate would NOT fire)
+     *   clones_count_for_snap(s2) = 1  (clone-count gate WILL fire)
+     * The rollback's newer-snap loop now demonstrates the new gate in
+     * isolation. */
+    STM_ASSERT_OK(stm_fs_release_snapshot(fs, s2));
+
+    /* Pre-validate: hold_count check passes (0); clone-count check
+     * fires (1 clone). STM_EBUSY refusal — true no-op. */
+    STM_ASSERT_ERR(stm_fs_rollback_snapshot(fs, 1, s1, /*force=*/false),
+                       STM_EBUSY);
+
+    /* Verify no destructive step taken: both snaps + clone still
+     * present. */
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(stm_fs_sync(fs));
+    stm_snapshot_entry e;
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, s1, &e));
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, s2, &e));
+    stm_dataset_index *didx = stm_sync_dataset_index(stm_fs_sync(fs));
+    stm_dataset_entry de;
+    STM_ASSERT_OK(stm_dataset_lookup(didx, clone_id, &de));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* R168 P2-2: the sync.c-installed clone_check_cb at `stm_snapshot_delete`
+ * is masked by the pre-existing `hold_count > 0` check (test 6's first
+ * delete attempt has hold_count=1 from create_clone's hold). Test 6
+ * verifies the COMPOSITE STM_EBUSY refusal but cannot distinguish which
+ * gate fired. This variant drops the hold first so the cb is the
+ * LOAD-BEARING refusal. A future regression that broke ONLY the cb
+ * registration / body would silently pass test 6; this variant catches
+ * it. */
+STM_TEST(fs_clone_origin_snap_undeletable_clone_check_cb_alone) {
+    make_tmp("undel_cb_alone");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t buf[4096];
+    memset(buf, 0x22, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf));
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "cb", 2, &snap_id));
+
+    uint64_t clone_id = 0;
+    STM_ASSERT_OK(stm_fs_create_clone(fs, 1, "cb_c", snap_id, &clone_id));
+
+    /* Drop the snap-hold impl-6e took at create_clone time. After
+     * this: snap.hold_count = 0; clone is still PRESENT and still
+     * references the snap. The clone_check_cb is the SOLE remaining
+     * gate. */
+    STM_ASSERT_OK(stm_fs_release_snapshot(fs, snap_id));
+
+    /* Delete refused via clone_check_cb only. */
+    size_t freed = 0;
+    STM_ASSERT_ERR(stm_fs_delete_snapshot(fs, snap_id, &freed),
+                       STM_EBUSY);
+
+    /* Snap still present after the refused delete. */
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(stm_fs_sync(fs));
+    stm_snapshot_entry e;
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, snap_id, &e));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* ========================================================================= */
 
 STM_TEST_MAIN("test_fs_clone")

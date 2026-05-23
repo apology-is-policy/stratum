@@ -2284,13 +2284,26 @@ static stm_status ds_validate_shadow(const ds_load_ctx *lc) {
         /* Non-root: parent_id must be set and must NOT equal own id. */
         if (si->e.parent_id == STM_DATASET_NO_PARENT) return STM_ECORRUPT;
         if (si->e.parent_id == si->e.id) return STM_ECORRUPT;
-        /* P6-clone: a clone's origin_snap_id cannot equal its own id
-         * (datasets and snapshots use disjoint id-spaces in the spec
-         * but the impl shares the type — so origin == own_id is a
-         * malformed reference). The cross-module "snap exists"
-         * invariant (CloneOriginPresent) is enforced at delete time
-         * via the snapshot module's clone-check cb, not here. */
-        if (si->e.origin_snap_id == si->e.id) return STM_ECORRUPT;
+        /* 9.7-impl-6f R168 P1-1: the P6-clone "origin_snap_id ==
+         * own_id" check is RETIRED here, paralleling the same removal
+         * the 6f close commit applied at the create site
+         * (`stm_dataset_create_clone`). Reasoning is identical:
+         * snap_ids (snap_idx->next_id counter, starts at 1) and
+         * dataset_ids (this index's counter, starts at 2) live in
+         * SEPARATE counters; a numerical coincidence is NOT a
+         * structural malformed-reference. A common production
+         * scenario hits this: a pool with more snapshots than non-
+         * root datasets has snap_id catch up to the dataset counter,
+         * so a freshly-created clone routinely has
+         * `clone_id == origin_snap_id` numerically. Pre-fix the load-
+         * time validator refused such pools at mount with
+         * STM_ECORRUPT — making the pool unmountable with no public
+         * recovery surface. The cross-module CloneOriginPresent
+         * invariant is still enforced at delete time via the
+         * snapshot module's clone-check cb (sync.c::sync_clone_check_cb,
+         * registered at sync_open + sync_create); the check here
+         * never carried correctness weight, only a flawed sanity
+         * gate. */
         /* Parent must reference an existing shadow slot. */
         bool parent_found = false;
         for (size_t j = 0; j < lc->shadow_len; j++) {
