@@ -39,7 +39,11 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 ## Snapshot
 
 - **Tip**: 9.7-impl-4d — rollback newer-snapshot CASCADE — shipped
-  (R165 audit forthcoming at commit time). Lifts the impl-4
+  (`6b282f6` + R165 close `0a5f048`, verdict 0 P0 / 0 P1 / 1 P2 + 4 P3
+  — all fixed inline: P2-1 cascade-failure forward-compat docstring,
+  P3-1 counted-subtraction proof refined to case-(1)/(2)/(b) partition,
+  P3-2 cross-snap dedup test, P3-3 overflow-guard reorder, P3-4
+  dirty-buffer pin-down). Lifts the impl-4
   `STM_ENOTSUPPORTED` refusal that fired when newer snapshots of the
   dataset existed; the cascade destroys them (ZFS rollback semantics)
   and reclaims `newer_dead \ s_view` — the third `to_free` term of
