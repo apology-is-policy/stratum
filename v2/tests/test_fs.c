@@ -2696,6 +2696,145 @@ STM_TEST(fs_rollback_reclaims_diverged_cold_extents) {
     unlink(g_key_path);
 }
 
+/* 9.7-impl-4c-iii — pin the differential between 4c-ii's live-divergence
+ * reclaim and 4c-iii's dead-list garbage reclaim. The 4c-ii test above
+ * puts only case-(a) (snap_view-resurrecting) entries on the dead-list;
+ * 4c-iii fires on those zero times (snap_unique cancels dead_S) so the
+ * 4c-ii test runs through 4c-iii as a no-op.
+ *
+ * THIS test puts case-(b) garbage on the dead-list — cold records that
+ * impl-2's COW routing dumped onto S's cold dead-list because S was
+ * most-recent at drop time, but which were NEVER in S's view. Their
+ * deferred-deref obligations would leak forever without 4c-iii. The
+ * test mixes case-(a) and case-(b) in one rollback:
+ *   - case-(a): truncate of an inode that IS in snap_view.
+ *   - case-(b): write+migrate of fresh post-snap inodes, then truncate.
+ *
+ * Expected:
+ *   - CAS count drops by exactly the case-(b) count (the case-(b)
+ *     hashes deref to 0 → auto-GC reclaims their chunks).
+ *   - The case-(a) chunk stays alive AND its file reads back the snap
+ *     plaintext post-rollback (proves no over-deref on the case-(a)
+ *     entry; if 4c-iii naively dereffed all of dead_S, the case-(a)
+ *     chunk would auto-GC and the read would surface STM_ECORRUPT). */
+STM_TEST(fs_rollback_reclaims_cleared_dead_list_cold_garbage) {
+    make_tmp("rb_reclaim_cdl_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_cas_index *cas = stm_sync_cas_index(stm_fs_sync_for_test(fs));
+    STM_ASSERT(cas != NULL);
+
+    /* Pre-snap: write+migrate inode 1 cold. refcount(H1) = 1; this
+     * record will be in snap_view (case-(a) anchor). */
+    uint8_t c1[4096];
+    for (size_t i = 0; i < sizeof c1; i++) c1[i] = (uint8_t)((i * 13) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, c1, sizeof c1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "S", 1, &snap_id));
+
+    size_t cas_n0 = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n0));
+    STM_ASSERT_EQ(cas_n0, (size_t)1);
+
+    /* Post-snap:
+     *   - case-(a) — truncate inode 1: R1 was in snap_view → drop
+     *     routes to dead_S(H1) (deref deferred). refcount(H1) stays at
+     *     1 (live → 0, dead → 1, total 1). 4c-iii: dead(H1)=1 -
+     *     snap_unique(H1)=1 = 0 derefs.
+     *   - case-(b) — write+migrate inodes 20+21 (TWO fresh cold
+     *     records H20, H21 never in snap_view) then truncate each →
+     *     dead_S(H20) += 1, dead_S(H21) += 1. refcount(H20)=1,
+     *     refcount(H21)=1 each via the dead-list. 4c-iii: dead-snap_
+     *     unique = 1-0 = 1 deref each. refcount drops to 0 → auto-GC. */
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 0));
+
+    uint8_t c20[4096], c21[4096];
+    memset(c20, 0xAA, sizeof c20);
+    memset(c21, 0xBB, sizeof c21);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 20, 0, c20, sizeof c20));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 20));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 21, 0, c21, sizeof c21));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 21));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 20, 0));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 21, 0));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Pre-rollback: H1 (refcount 1 via dead_S), H20 + H21 (refcount 1
+     * each via dead_S). Total 3 CAS entries. */
+    size_t cas_n1 = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n1));
+    STM_ASSERT_EQ(cas_n1, (size_t)3);
+
+    /* Roll back. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap_id, /*force=*/false));
+
+    /* THE 4c-iii DIFFERENTIAL: CAS count drops from 3 to 1.
+     *   - H20 + H21: case-(b) garbage. 4c-iii derefs each once →
+     *     refcount=0 → auto-GC at the rollback commit. CAS count -= 2.
+     *   - H1: case-(a). 4c-iii derefs 0 times (snap_unique(H1)=1
+     *     cancels dead_S(H1)=1). Post-swap R1 is live again →
+     *     refcount(H1) = 1 (live in snap's tree).
+     *
+     * Without 4c-iii: CAS count would stay at 3 — H20 and H21 would
+     * leak as dangling refcount=1 entries that no live path references
+     * but `stm_cas_deref` was never called on. */
+    size_t cas_n2 = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n2));
+    STM_ASSERT_EQ(cas_n2, (size_t)1);
+
+    /* The surviving entry is H1 with refcount=1 (R1 live in
+     * post-rollback tree). */
+    mtc_capture_t cap = { .got = false };
+    STM_ASSERT_OK(stm_cas_iter(cas, mtc_capture_first_cb, &cap));
+    STM_ASSERT_TRUE(cap.got);
+    STM_ASSERT_EQ(cap.rec.refcount, 1u);
+
+    /* The case-(a) chunk is readable — proves 4c-iii did NOT over-deref
+     * the dead_S(H1) entry. Without the snap_unique adjustment, H1
+     * would have refcount=0 + auto-GC'd and the read would fail. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof c1);
+    STM_ASSERT_MEM_EQ(c1, out, sizeof c1);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    /* Reissue the reclaimed CAS chunk paddrs through fresh cold writes —
+     * if the case-(a) chunk had been wrongly reclaimed, those writes
+     * would overwrite the storage R1 still references. Re-read of R1
+     * is then the canary for any over-deref. */
+    for (uint64_t k = 0; k < 3; k++) {
+        uint8_t fresh[4096];
+        memset(fresh, (int)(0x90u + k), sizeof fresh);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, 30 + k, 0, fresh, sizeof fresh));
+        STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 30 + k));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(c1, out, sizeof c1);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    /* Durable across a remount. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(c1, out, sizeof c1);
+    STM_ASSERT_OK(stm_fs_verify(fs));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_migrate_to_cold_basic_roundtrip) {
     /* Write to (1, 1), migrate to cold, read back: same plaintext. The
      * extent index shows the record is now COLD; the CAS index has one

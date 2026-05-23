@@ -6815,6 +6815,292 @@ done:
     free(snap_set.v);
 }
 
+/* qsort comparator — raw 32-byte hash bytes (memcmp order). */
+static int fs_rb_hash_cmp_raw(const void *a, const void *b)
+{
+    return memcmp(a, b, STM_EXTENT_HASH_LEN);
+}
+
+/*
+ * 9.7-impl-4c-iii: reclaim the snapshot's own cleared dead-list garbage —
+ * the second `to_free` term of `dead_list.tla::Rollback`:
+ *   `snap_dead[s] \ s_view`.
+ *
+ * impl-4's `stm_snapshot_clear_dead_lists` empties S's three dead-lists
+ * (boot / data / cold) by DISCARD — the rollback can't tell now-live
+ * (resurrected) entries from intermediate-COW garbage, so it discharges
+ * neither, and the garbage leaks until this reclaim runs. 4c-iii reads
+ * each dead-list BEFORE clear_dead_lists fires and reclaims the
+ * survivors.
+ *
+ * WHY THE DEAD-LIST HOLDS NON-S_VIEW GARBAGE.
+ * impl-2's snap-aware COW free routes every freed paddr/record through
+ * `stm_snapshot_index_overwrite_{block,bootstrap_block,cold_block}`,
+ * which always sends to the MOST-RECENT PRESENT snap regardless of
+ * whether THAT snap actually references the freed block. With S = the
+ * most-recent at rollback time (under impl-4's newer-snapshot refusal),
+ * S's dead-list collects EVERY post-S COW free, including both:
+ *   (a) blocks/records IN S's view (RESURRECT on rollback — must NOT
+ *       be freed/dereffed), and
+ *   (b) blocks/records created post-S and freed post-S (intermediate
+ *       COW garbage — SHOULD be freed/dereffed).
+ *
+ * Boot + Data tiers — simple set-difference on paddrs (paddrs are
+ * unique IDs; no dedup at this level). For each paddr P on dead_S:
+ *   - P ∈ snap_paddr_set  ⇒ case-(a), KEEP (P resurrects in live).
+ *   - P ∉ snap_paddr_set  ⇒ case-(b), FREE.
+ *
+ * Cold tier — per-key structural merge to compute snap_unique[hash]
+ * (the multiset of hashes whose snap-tree record at (ino, off) is NOT
+ * the same logical record as the old tree's record at the same key —
+ * these are the case-(a) entries on the cold dead-list). Then for each
+ * unique hash H run the COUNTED subtraction:
+ *
+ *     deref_count(H) = dead_S_cold(H) − snap_unique(H)       [≥ 0]
+ *
+ * Why a counted subtraction is SAFE for the cold dead-list (distinct
+ * from 4c-ii's live-divergence case): every snap_unique record has a
+ * corresponding dead-list entry — its drop fired the snap-aware deref
+ * routing while S was most-recent — so `snap_unique(H) ≤ dead_S(H)`
+ * always holds per hash. The 4c-ii live-divergence case had no such
+ * pairing — an old-tree diverged record and an unrelated snap-tree
+ * record could coincide on hash H via content-defined dedup, breaking
+ * the counted subtraction; 4c-ii had to use a per-key structural
+ * merge for the deref decision itself. HERE the per-key merge is
+ * used only to count snap_unique; the deref decision uses the count.
+ *
+ * SAFETY (load-bearing): a paddr is freed / hash dereffed ONLY when
+ *   - boot/data: the dead-list paddr is NOT in the snapshot's
+ *     corresponding paddr set AND the snap walk completed in full;
+ *   - cold: per-hash deref count is dead_S_cold(H) − snap_unique(H)
+ *     AND BOTH the snap-cold + old-cold walks completed in full.
+ * If any walk fails / collects ENOMEM, THAT TIER aborts (no freeing
+ * / no derefing for the tier) — best-effort, per-tier. The other
+ * tiers proceed.
+ *
+ * BEST-EFFORT: any walk / per-paddr-free / per-hash-deref failure
+ * leaves the unreclaimed remainder as a LEAK — paddrs stay allocated
+ * (so the allocator never reissues them, AEAD nonce stays unique);
+ * cold-hash refcounts stay up (so CAS never auto-GCs the live chunk).
+ * A space cost, never a corruption. The rollback itself still
+ * succeeds.
+ *
+ * Freed paddrs ride the SAME stm_sync_commit as the swap; strict
+ * `free_gen < committed_gen` (R50 P2-1) keeps the block out of reuse
+ * one tick. Dereffed cold hashes feed the commit's CAS auto-GC sweep.
+ *
+ * Caller holds fs->global EX.
+ */
+static void fs_rollback_reclaim_cleared_dead_list_garbage(
+        stm_fs *fs,
+        stm_snapshot_index *sidx,
+        stm_dataset_index *didx,
+        stm_extent_index *eidx,
+        uint64_t dataset_id,
+        uint64_t snapshot_id,
+        uint64_t old_paddr, uint64_t old_gen, const uint8_t old_csum[32],
+        uint64_t snap_paddr, uint64_t snap_gen, const uint8_t snap_csum[32])
+{
+    uint64_t free_gen = stm_sync_current_gen(fs->sync);
+
+    /* ---------- Boot tier (engine NODE paddrs / stm_bootstrap) -------- */
+    uint64_t *dead_boot = NULL;
+    size_t    n_dead_boot = 0;
+    (void)stm_snapshot_bootstrap_dead_list_get(sidx, snapshot_id,
+                                                 &dead_boot, &n_dead_boot);
+    if (n_dead_boot > 0) {
+        fs_rb_paddr_set snap_nodes = {0};
+        stm_status w = stm_dataset_index_collect_engine_paddrs_at(
+                didx, dataset_id, snap_paddr, snap_gen, snap_csum,
+                fs_rb_paddr_collect_cb, &snap_nodes);
+        bool ok = (w == STM_OK && !snap_nodes.oom);
+        if (ok && snap_nodes.n > 1) {
+            qsort(snap_nodes.v, snap_nodes.n,
+                  sizeof *snap_nodes.v, fs_rb_paddr_cmp);
+        }
+        if (ok) {
+            for (size_t i = 0; i < n_dead_boot; i++) {
+                uint64_t p = dead_boot[i];
+                if (bsearch(&p, snap_nodes.v, snap_nodes.n,
+                            sizeof p, fs_rb_paddr_cmp) != NULL)
+                    continue;   /* case-(a): resurrects */
+                uint16_t did = stm_paddr_device(p);
+                stm_alloc *a = stm_sync_alloc(fs->sync, did);
+                if (!a) continue;
+                stm_bootstrap *boot = stm_alloc_bootstrap(a);
+                if (!boot) continue;
+                (void)stm_bootstrap_free(boot, p,
+                        STM_BOOTSTRAP_NODE_BLOCKS, free_gen);
+            }
+        }
+        free(snap_nodes.v);
+    }
+    free(dead_boot);
+
+    /* ---------- Data tier (HOT-extent replicas / stm_alloc) ----------- */
+    uint64_t *dead_data = NULL;
+    size_t    n_dead_data = 0;
+    (void)stm_snapshot_dead_list_get(sidx, snapshot_id,
+                                       &dead_data, &n_dead_data);
+    if (n_dead_data > 0 && eidx) {
+        fs_rb_paddr_set snap_data = {0};
+        stm_status w = stm_extent_index_collect_engine_data_paddrs_at(
+                eidx, dataset_id, snap_paddr, snap_gen, snap_csum,
+                fs_rb_paddr_collect_cb, &snap_data);
+        bool ok = (w == STM_OK && !snap_data.oom);
+        if (ok && snap_data.n > 1) {
+            qsort(snap_data.v, snap_data.n,
+                  sizeof *snap_data.v, fs_rb_paddr_cmp);
+        }
+        if (ok) {
+            for (size_t i = 0; i < n_dead_data; i++) {
+                uint64_t p = dead_data[i];
+                if (bsearch(&p, snap_data.v, snap_data.n,
+                            sizeof p, fs_rb_paddr_cmp) != NULL)
+                    continue;   /* case-(a): resurrects */
+                uint16_t did = stm_paddr_device(p);
+                stm_alloc *a = stm_sync_alloc(fs->sync, did);
+                if (!a) continue;
+                (void)stm_alloc_free(a, p, free_gen);
+            }
+        }
+        free(snap_data.v);
+    }
+    free(dead_data);
+
+    /* ---------- Cold tier (CAS hashes — per-key snap_unique merge) ---- */
+    uint8_t *dead_cold = NULL;
+    size_t   n_dead_cold = 0;
+    (void)stm_snapshot_cold_dead_list_get(sidx, snapshot_id,
+                                            &dead_cold, &n_dead_cold);
+    if (n_dead_cold > 0 && eidx) {
+        fs_rb_cold_set snap_cold = {0};
+        fs_rb_cold_set old_cold  = {0};
+        stm_status w1 = stm_extent_index_collect_engine_cold_records_at(
+                eidx, dataset_id, snap_paddr, snap_gen, snap_csum,
+                fs_rb_cold_collect_cb, &snap_cold);
+        stm_status w2 = stm_extent_index_collect_engine_cold_records_at(
+                eidx, dataset_id, old_paddr,  old_gen,  old_csum,
+                fs_rb_cold_collect_cb, &old_cold);
+        bool ok = (w1 == STM_OK && !snap_cold.oom
+                   && w2 == STM_OK && !old_cold.oom);
+        stm_cas_index *cidx = stm_sync_cas_index(fs->sync);
+        if (ok && cidx) {
+            if (snap_cold.n > 1)
+                qsort(snap_cold.v, snap_cold.n,
+                      sizeof *snap_cold.v, fs_rb_cold_cmp);
+            if (old_cold.n > 1)
+                qsort(old_cold.v, old_cold.n,
+                      sizeof *old_cold.v, fs_rb_cold_cmp);
+
+            /* Compute snap_unique[]: walk SNAP cold records in (ino,off)
+             * order; for each, see whether OLD has the SAME LOGICAL
+             * record at the same key. Same-logical = byte-identical
+             * (content_hash, gen, link_gen) — the 4c-ii record-identity
+             * discriminator. If not the same logical record, the snap
+             * record's hash is "unique to snap"; collect into a flat
+             * multiset buffer. */
+            uint8_t *snap_unique = NULL;
+            size_t   n_snap_unique = 0;
+            if (snap_cold.n > 0) {
+                snap_unique = malloc(snap_cold.n * STM_EXTENT_HASH_LEN);
+            }
+            if (snap_cold.n == 0 || snap_unique != NULL) {
+                size_t oi = 0;
+                for (size_t si = 0; si < snap_cold.n; si++) {
+                    const stm_extent_cold_ref *sr = &snap_cold.v[si];
+                    /* Advance oi past old records with key < sr's. */
+                    while (oi < old_cold.n) {
+                        const stm_extent_cold_ref *ro = &old_cold.v[oi];
+                        if (ro->ino < sr->ino
+                            || (ro->ino == sr->ino && ro->off < sr->off)) {
+                            oi++;
+                        } else {
+                            break;
+                        }
+                    }
+                    bool same_logical = false;
+                    if (oi < old_cold.n) {
+                        const stm_extent_cold_ref *ro = &old_cold.v[oi];
+                        if (ro->ino == sr->ino && ro->off == sr->off
+                            && ro->link_gen == sr->link_gen
+                            && ro->gen      == sr->gen
+                            && memcmp(ro->content_hash, sr->content_hash,
+                                       STM_EXTENT_HASH_LEN) == 0) {
+                            same_logical = true;
+                        }
+                    }
+                    if (!same_logical) {
+                        memcpy(&snap_unique[n_snap_unique * STM_EXTENT_HASH_LEN],
+                                sr->content_hash, STM_EXTENT_HASH_LEN);
+                        n_snap_unique++;
+                    }
+                }
+
+                /* Sort both flat hash arrays for the merge-walk by hash. */
+                if (n_snap_unique > 1) {
+                    qsort(snap_unique, n_snap_unique,
+                          STM_EXTENT_HASH_LEN, fs_rb_hash_cmp_raw);
+                }
+                if (n_dead_cold > 1) {
+                    qsort(dead_cold, n_dead_cold,
+                          STM_EXTENT_HASH_LEN, fs_rb_hash_cmp_raw);
+                }
+
+                /* Per-hash merge: for each run-of-equal hashes H in the
+                 * dead-list, count the matching run in snap_unique[],
+                 * and deref `dead_count − unique_count` (clamped at 0).
+                 *
+                 * Defense-in-depth clamp at 0: by the snap_unique →
+                 * dead_S correspondence proof, unique_count ≤ dead_count
+                 * always. A deviation would mean a snap-tree record has
+                 * no matching dead-list entry — i.e. an upstream COW
+                 * path missed the snap-aware routing. Clamping to 0
+                 * preserves the safety (NEVER over-deref) at the cost
+                 * of an under-deref (a CAS-refcount leak), consistent
+                 * with the best-effort posture. */
+                size_t ui = 0, dj = 0;
+                while (dj < n_dead_cold) {
+                    const uint8_t *H = &dead_cold[dj * STM_EXTENT_HASH_LEN];
+                    size_t dj_end = dj + 1;
+                    while (dj_end < n_dead_cold
+                           && memcmp(&dead_cold[dj_end * STM_EXTENT_HASH_LEN],
+                                      H, STM_EXTENT_HASH_LEN) == 0) {
+                        dj_end++;
+                    }
+                    size_t dead_count = dj_end - dj;
+
+                    while (ui < n_snap_unique
+                           && memcmp(&snap_unique[ui * STM_EXTENT_HASH_LEN],
+                                      H, STM_EXTENT_HASH_LEN) < 0) {
+                        ui++;
+                    }
+                    size_t ui_end = ui;
+                    while (ui_end < n_snap_unique
+                           && memcmp(&snap_unique[ui_end * STM_EXTENT_HASH_LEN],
+                                      H, STM_EXTENT_HASH_LEN) == 0) {
+                        ui_end++;
+                    }
+                    size_t unique_count = ui_end - ui;
+
+                    size_t deref_count = (unique_count <= dead_count)
+                                          ? (dead_count - unique_count) : 0;
+                    for (size_t k = 0; k < deref_count; k++) {
+                        (void)stm_cas_deref(cidx, H);
+                    }
+
+                    dj = dj_end;
+                    ui = ui_end;
+                }
+            }
+            free(snap_unique);
+        }
+        free(snap_cold.v);
+        free(old_cold.v);
+    }
+    free(dead_cold);
+}
+
 stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                                       uint64_t snapshot_id, bool force)
 {
@@ -6988,41 +7274,33 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         return s;
     }
 
-    /* Clear the target snapshot's dead-lists. Post-rollback the live
-     * tree IS the snapshot's tree, so every dead-listed paddr the
-     * snapshot's frozen tree references is LIVE again — leaving it dead-
-     * listed would let a later stm_fs_delete_snapshot free live storage
-     * (a corruption). Clearing resets the snapshot to a just-created
-     * dead-list state, exactly correct now that no divergence sits
-     * between it and live. Discarded entries unreachable from the
-     * snapshot's tree (intermediate COW garbage) leak — 9.7-impl-4c-iii
-     * reclaims them. */
-    s = stm_snapshot_clear_dead_lists(sidx, snapshot_id);
-    if (s != STM_OK) {
-        /* Unreachable: snapshot_id is validated + PRESENT under the held
-         * fs->global EX. Defensive — the in-RAM triple is swapped but
-         * not durable, crash-equivalent inconsistent state → wedge
-         * (R154 Q2). */
-        pthread_rwlock_unlock(&fs->global);
-        stm_fs_mark_wedged(fs);
-        return s;
-    }
-
     /* Reclaim the post-snapshot divergence — blocks reachable from the
      * pre-rollback live tree but not from the snapshot's frozen tree.
-     * Three tiers run here:
+     * FOUR tiers run here:
      *   - 9.7-impl-4b: the metadata-NODE / spill blocks (bootstrap
      *     class) via fs_rollback_reclaim_diverged_nodes;
      *   - 9.7-impl-4c: the DATA-extent replica blocks (stm_alloc class)
      *     via fs_rollback_reclaim_diverged_extents;
      *   - 9.7-impl-4c-ii: the COLD-extent CAS refcounts via
-     *     fs_rollback_reclaim_diverged_cold.
-     * All three are best-effort (a failure leaks, never corrupts — see
+     *     fs_rollback_reclaim_diverged_cold;
+     *   - 9.7-impl-4c-iii: the snapshot's own dead-list garbage
+     *     (`snap_dead[s] \ s_view`) via
+     *     fs_rollback_reclaim_cleared_dead_list_garbage — reads each
+     *     of S's three dead-lists BEFORE clear_dead_lists discards them
+     *     and frees survivors (case-(b) intermediate-COW garbage that
+     *     impl-2's COW routing dropped onto S's dead-list under "most-
+     *     recent snap" but which S's tree never references). The
+     *     case-(a) resurrection entries (whose paddrs/hashes are live
+     *     again post-swap) are KEPT, then discarded by the
+     *     clear_dead_lists call below.
+     * All four are best-effort (a failure leaks, never corrupts — see
      * the helpers). The node + data frees are deferred and ride the
      * SAME stm_sync_commit as the swap; the cold derefs feed that
      * commit's CAS auto-GC sweep — all-or-nothing on a commit failure.
-     * Still leaked, forward-noted: the snapshot's own cleared dead-list
-     * garbage — 9.7-impl-4c-iii. */
+     * With 4c-iii in place, the rollback fully realises
+     * dead_list.tla::Rollback's `to_free` minus the `newer_dead \ s_view`
+     * term — which the impl-4d newer-snapshot cascade picks up after the
+     * newer-snapshot refusal lifts. */
     if (have_old_root) {
         fs_rollback_reclaim_diverged_nodes(fs, didx, dataset_id,
                 de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
@@ -7050,6 +7328,50 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                 de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
                 entry.tree_root_paddr, entry.root_gen, entry.root_csum);
         }
+
+        /* 9.7-impl-4c-iii: the snapshot's own dead-list garbage. Runs
+         * AFTER 4b/4c/4c-ii so the live-divergence walks have already
+         * completed; reads each of S's three dead-lists from sidx
+         * BEFORE clear_dead_lists below discards them; filters each by
+         * `\ s_view` (boot/data — set-difference on paddrs; cold —
+         * per-key snap_unique merge + counted subtraction); frees
+         * the survivors per resource class. The helper consults eidx
+         * for the data + cold tiers; passing NULL is the documented
+         * skip-those-tiers path (boot tier still runs through didx). */
+        fs_rollback_reclaim_cleared_dead_list_garbage(
+                fs, sidx, didx, stm_sync_extent_index(fs->sync),
+                dataset_id, snapshot_id,
+                de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
+                entry.tree_root_paddr, entry.root_gen, entry.root_csum);
+    }
+
+    /* Clear the target snapshot's dead-lists. MOVED here from
+     * pre-reclaim (impl-4 original position) at 9.7-impl-4c-iii: the
+     * 4c-iii reclaim above already discharged the case-(b) garbage
+     * entries (freed / dereffed them); the remaining case-(a)
+     * resurrection entries DO NOT need their deferred-free fired
+     * because their paddrs/hashes are live in the post-swap tree.
+     * Clearing now drops both classes from the in-RAM index in one
+     * shot — exactly matching the just-created dead-list state, which
+     * is correct since no divergence sits between S and live anymore.
+     *
+     * Why this order is safe vs the impl-4 (clear-first) order:
+     * 4b/4c/4c-ii/4c-iii are PURE READERS of sidx (and 4c-iii reads
+     * dead_list contents only — it doesn't mutate the snapshot index),
+     * so moving clear from pre-reclaim to post-reclaim doesn't change
+     * the reclaim's observed state. The R160 correctness invariant —
+     * "post-rollback S's dead-list must not retain live-paddr
+     * entries" — is preserved: clear_dead_lists drops everything in
+     * one shot just as before, only later. */
+    s = stm_snapshot_clear_dead_lists(sidx, snapshot_id);
+    if (s != STM_OK) {
+        /* Unreachable: snapshot_id is validated + PRESENT under the held
+         * fs->global EX. Defensive — the in-RAM triple is swapped but
+         * not durable, crash-equivalent inconsistent state → wedge
+         * (R154 Q2). */
+        pthread_rwlock_unlock(&fs->global);
+        stm_fs_mark_wedged(fs);
+        return s;
     }
 
     /* Commit the swap. stm_sync_commit drives the three-phase cascade;

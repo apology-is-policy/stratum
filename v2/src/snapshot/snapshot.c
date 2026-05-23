@@ -665,6 +665,43 @@ stm_status stm_snapshot_dead_list_count(const stm_snapshot_index *idx,
     return STM_OK;
 }
 
+/* 9.7-impl-4c-iii: non-destructive read of a PRESENT snapshot's paddr
+ * dead-list — returns a malloc'd copy of the contents. Caller frees.
+ * Same lock + lookup posture as _count; the empty dead-list returns
+ * STM_OK with *out_paddrs = NULL + *out_count = 0. */
+stm_status stm_snapshot_dead_list_get(stm_snapshot_index *idx,
+                                         uint64_t snapshot_id,
+                                         uint64_t **out_paddrs,
+                                         size_t *out_count) {
+    if (!idx || !out_paddrs || !out_count) return STM_EINVAL;
+    if (snapshot_id == 0) return STM_EINVAL;
+    *out_paddrs = NULL;
+    *out_count  = 0;
+
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, snapshot_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    const snapshot_slot *slot = &idx->slots[s];
+    size_t n = slot->dead_count;
+    if (n == 0) {
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+    uint64_t *buf = malloc(n * sizeof *buf);
+    if (!buf) {
+        must_unlock(&idx->lock);
+        return STM_ENOMEM;
+    }
+    memcpy(buf, slot->dead_list, n * sizeof *buf);
+    *out_paddrs = buf;
+    *out_count  = n;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
 /* 9.7-impl-2-routing: mirror of stm_snapshot_index_overwrite_block for
  * the bootstrap allocator class. Same semantics + same defense-in-depth
  * single-ownership scan + same caps, but the entry lands in
@@ -755,6 +792,42 @@ stm_status stm_snapshot_bootstrap_dead_list_count(
     }
     *out_count = idx->slots[s].boot_dead_count;
     must_unlock(lock);
+    return STM_OK;
+}
+
+/* 9.7-impl-4c-iii: non-destructive read of a PRESENT snapshot's
+ * bootstrap (engine NODE) dead-list. Mirror of dead_list_get for the
+ * boot tier. */
+stm_status stm_snapshot_bootstrap_dead_list_get(stm_snapshot_index *idx,
+                                                   uint64_t snapshot_id,
+                                                   uint64_t **out_paddrs,
+                                                   size_t *out_count) {
+    if (!idx || !out_paddrs || !out_count) return STM_EINVAL;
+    if (snapshot_id == 0) return STM_EINVAL;
+    *out_paddrs = NULL;
+    *out_count  = 0;
+
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, snapshot_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    const snapshot_slot *slot = &idx->slots[s];
+    size_t n = slot->boot_dead_count;
+    if (n == 0) {
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+    uint64_t *buf = malloc(n * sizeof *buf);
+    if (!buf) {
+        must_unlock(&idx->lock);
+        return STM_ENOMEM;
+    }
+    memcpy(buf, slot->boot_dead_list, n * sizeof *buf);
+    *out_paddrs = buf;
+    *out_count  = n;
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
@@ -868,6 +941,44 @@ stm_status stm_snapshot_cold_dead_list_count(const stm_snapshot_index *idx,
     }
     *out_count = idx->slots[s].cold_dead_count;
     must_unlock(lock);
+    return STM_OK;
+}
+
+/* 9.7-impl-4c-iii: non-destructive read of a PRESENT snapshot's
+ * cold-tier (CAS-class) dead-list. Hashes are packed in a buffer of
+ * `*out_count * STM_SNAP_HASH_LEN` bytes — same layout as
+ * `stm_snapshot_delete`'s `out_freed_cold_hashes` (the destructive
+ * sibling). The list is a MULTISET; a hash may legitimately repeat. */
+stm_status stm_snapshot_cold_dead_list_get(stm_snapshot_index *idx,
+                                              uint64_t snapshot_id,
+                                              uint8_t **out_hashes,
+                                              size_t *out_count) {
+    if (!idx || !out_hashes || !out_count) return STM_EINVAL;
+    if (snapshot_id == 0) return STM_EINVAL;
+    *out_hashes = NULL;
+    *out_count  = 0;
+
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, snapshot_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    const snapshot_slot *slot = &idx->slots[s];
+    size_t n = slot->cold_dead_count;
+    if (n == 0) {
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+    uint8_t *buf = malloc(n * STM_SNAP_HASH_LEN);
+    if (!buf) {
+        must_unlock(&idx->lock);
+        return STM_ENOMEM;
+    }
+    memcpy(buf, slot->cold_dead_list, n * STM_SNAP_HASH_LEN);
+    *out_hashes = buf;
+    *out_count  = n;
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 

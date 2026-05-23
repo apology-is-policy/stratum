@@ -200,8 +200,36 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
   rollback commit's CAS auto-GC sweep. Same best-effort +
   walk-must-complete posture; this reclaim NEVER over-derefs (a shared
   record always matches its snapshot counterpart, so it is never
-  mis-classified as diverged). Still leaked, forward-noted: the
-  snapshot's own cleared dead-list garbage — **9.7-impl-4c-iii**.
+  mis-classified as diverged).
+- **Cleared dead-list garbage reclamation (9.7-impl-4c-iii)** — the
+  final reclaim tier, run AFTER 4b/4c/4c-ii and BEFORE `clear_dead_lists`:
+  `fs_rollback_reclaim_cleared_dead_list_garbage` reads S's three
+  dead-lists (boot / data / cold) via the new non-destructive getters
+  (`stm_snapshot_{bootstrap,_,cold}_dead_list_get`) and reclaims the
+  entries S's frozen tree DOES NOT reference (`snap_dead[s] \ s_view` —
+  the second `to_free` term of `dead_list.tla::Rollback`).
+  - Boot + data tiers: set-difference on paddrs against the snapshot
+    tree's node / data-paddr walks. Survivors → `stm_bootstrap_free` /
+    `stm_alloc_free` at the sync's current gen.
+  - Cold tier: per-key structural merge of OLD vs SNAP COLD records
+    (same walks 4c-ii uses) to compute `snap_unique[hash]` (multiset of
+    hashes whose snap-tree record at `(ino, off)` is NOT shared with the
+    old tree). For each unique hash `H` on the cold dead-list, deref
+    count = `dead_S(H) − snap_unique(H)` (clamped at 0). The counted
+    subtraction is safe HERE — distinct from 4c-ii's live-divergence
+    case — because every `snap_unique` record has a corresponding
+    dead-list entry (its drop fired the snap-aware deref routing while
+    S was most-recent), so `snap_unique(H) ≤ dead_S(H)` always holds
+    per hash. NEVER over-derefs; under-derefs (clamp at 0) become a
+    leak, consistent with the best-effort posture.
+  - The case-(b) garbage on the dead-list — paddrs / records impl-2's
+    COW routing dumped onto S's dead-list under "most-recent snap" but
+    which S's tree NEVER referenced — is dispositioned here; the
+    case-(a) resurrection entries are KEPT (their paddrs / hashes are
+    live in the post-swap tree) and discarded by `clear_dead_lists`
+    below without deref. With this tier the rollback realises the
+    `to_free` minus the `newer_dead \ s_view` term in full; only the
+    newer-snapshot cascade — 9.7-impl-4d — remains.
 - **v1.0 limitation** — a rollback is refused (`STM_ENOTSUPPORTED`)
   when a newer snapshot of the dataset exists. ZFS semantics destroy
   every newer snapshot; doing that correctly needs the `\ newer_dead`
@@ -228,6 +256,19 @@ stm_status stm_snapshot_cold_dead_list_count        (idx, snapshot_id, *out_coun
 /* Cold-tier capacity pre-check (P7-CAS-4 R54 P3-2). */
 stm_status stm_snapshot_index_cold_dead_list_reserve(idx, dataset_id,
                                                      n_to_append, *out_can_accept);
+
+/* Bootstrap-tier (9.7-impl-2-routing). */
+stm_status stm_snapshot_index_overwrite_bootstrap_block(idx, dataset_id, paddr,
+                                                       *out_should_free);
+stm_status stm_snapshot_bootstrap_dead_list_count   (idx, snapshot_id, *out_count);
+
+/* Non-destructive content readers (9.7-impl-4c-iii). */
+stm_status stm_snapshot_dead_list_get               (idx, snapshot_id,
+                                                     **out_paddrs, *out_count);
+stm_status stm_snapshot_bootstrap_dead_list_get     (idx, snapshot_id,
+                                                     **out_paddrs, *out_count);
+stm_status stm_snapshot_cold_dead_list_get          (idx, snapshot_id,
+                                                     **out_hashes, *out_count);
 
 /* Clear all three dead-lists in place — the rollback primitive (9.7-impl-4). */
 stm_status stm_snapshot_clear_dead_lists            (idx, snapshot_id);
@@ -257,9 +298,13 @@ of paddrs tracked in `snapshot_id`'s dead-list.
 snapshot stays PRESENT. The cleared entries are **discarded**, not
 transferred to the caller — a dead-list mixes paddrs the snapshot's
 tree references (live after a rollback — MUST NOT be freed) with
-intermediate COW garbage, and the snapshot module cannot tell them
-apart, so it frees neither (the garbage leaks; 9.7-impl-4c-iii
-reclaims it).
+intermediate COW garbage. The garbage was discharged by
+9.7-impl-4c-iii's `fs_rollback_reclaim_cleared_dead_list_garbage`,
+which read each dead-list via the `_get` getters BEFORE this clear
+fires and freed / dereffed only the entries the snapshot's tree does
+not reference (case-(b) garbage). What's left at this point is the
+case-(a) resurrection entries — paddrs / hashes that are live again
+post-swap — so this clear drops them WITHOUT a deref / free.
 The rollback mechanism calls this on the rolled-back-to snapshot:
 post-rollback the live tree is the snapshot's tree, so its
 dead-listed paddrs are live again and must not stay dead-listed (a

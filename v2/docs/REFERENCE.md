@@ -38,14 +38,28 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: 9.7-impl-4c-ii — rollback cold-extent (CAS-tier)
-  reclamation — shipped + R163 audit closed. R163 verdict: **0 P0,
-  0 P1, 0 P2, 2 P3**; the audit prosecuted the central no-over-deref
-  claim (the per-key structural merge) exhaustively and it holds. Both
-  P3s (a `gc->ds`-threading clarity comment; a strict-C `qsort(NULL,0)`
-  corner now gated on `n > 1` across all three rollback-reclaim
-  helpers) closed inline in the close commit.
-  - **9.7-impl-4c-ii** (`db5e8f5` + R163 close): `stm_fs_rollback_snapshot`
+- **Tip**: 9.7-impl-4c-iii — rollback cleared-dead-list-garbage
+  reclamation — shipped (R164 audit forthcoming at commit time).
+  Closes the §6.6 forward-list completely: `fs_rollback_reclaim_cleared_dead_list_garbage`
+  reads S's three dead-lists (boot / data / cold) via the new
+  non-destructive getters `stm_snapshot_{dead_list, bootstrap_dead_list,
+  cold_dead_list}_get`, then reclaims `snap_dead[s] \ s_view` — the
+  case-(b) intermediate-COW garbage that impl-2's "send to most-recent
+  snap" routing dumped onto S's dead-list even though S's tree never
+  referenced it. Boot + data tiers are set-difference on paddrs against
+  the snapshot's frozen-tree walks (4b's `_paddrs_at` + 4c's
+  `_data_paddrs_at`); the cold tier is a per-key structural merge of
+  OLD vs SNAP COLD records to count `snap_unique[hash]`, then per-hash
+  `deref_count = dead_S(H) − snap_unique(H)` (clamped at 0; counted
+  subtraction is safe here because every `snap_unique` record has a
+  corresponding dead-list entry, unlike 4c-ii's live-divergence case).
+  The flow REORDERS: clear_dead_lists moves from pre-reclaim to
+  post-reclaim (4b/4c/4c-ii are pure readers of `sidx`, so the move is
+  observation-preserving). With this tier, the rollback realises
+  `dead_list.tla::Rollback`'s `to_free` minus the `newer_dead \ s_view`
+  term — only the **9.7-impl-4d** newer-snapshot cascade remains. No
+  STM_UB_VERSION bump.
+  - **9.7-impl-4c-ii** (`db5e8f5` + R163 close `d34a791`): `stm_fs_rollback_snapshot`
     now also reclaims
     the post-snapshot COLD-extent divergence — the CAS-tier sibling of
     impl-4b's metadata-node + impl-4c's data-extent reclaims. With it
@@ -151,22 +165,22 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **9.7-impl-2** (`4b73f23` + `2176db0`, R158): snapshot-aware COW
     free — superseded engine NODE paddrs route into a per-snap
     bootstrap-tier dead-list. STM_UB_VERSION 30→31.
-  - **ctest 63/64 standalone** at the impl-4c-ii tip — the lone failure
-    is the documented `test_compound_ops_concurrent`
+  - **ctest 63/64 standalone** at the impl-4c-iii tip — the lone
+    failure is the documented `test_compound_ops_concurrent`
     rename/cfr/reflink/write-truncate flake
-    ([[flake-per-inode-cfr-concurrent]]), confirmed pre-existing by the
-    stash-retest method: with impl-4c-ii stashed, the test still failed
-    3/3 runs at the clean `17e0a41` tip (the failing case + signal
-    wandered run-to-run — 2× a sub-test FAIL, 1× a SEGFAULT — the
-    non-deterministic wander IS the flake signature). impl-4c-ii adds
-    only a new static function (`fs_rollback_reclaim_diverged_cold`)
-    plus an extent collector API, both reachable ONLY from the rollback
-    path, which the test never exercises. `test_btree_engine` 47,
-    `test_snapshot` 58, `test_dataset` 77, `test_extent_index` 59,
-    `test_fs` 183, `test_ctl` 149.
-  - **What's next**: 9.7-impl-4c-iii (cleared dead-list garbage) →
-    9.7-impl-4d (lift the newer-snapshot refusal) → 9.7-impl-5
-    (readable `.snaps/`).
+    ([[flake-per-inode-cfr-concurrent]]), confirmed pre-existing by
+    R163's stash-retest at `17e0a41` (`d34a791`'s parent). impl-4c-iii
+    adds only a new static function
+    (`fs_rollback_reclaim_cleared_dead_list_garbage`), three
+    non-destructive snapshot-dead-list getters, plus a reorder of
+    `clear_dead_lists` past the reclaim block — all reachable ONLY
+    from the rollback path, which the flaky test never exercises.
+    `test_btree_engine` 47, `test_snapshot` 58, `test_dataset` 77,
+    `test_extent_index` 59, `test_fs` 184, `test_ctl` 149.
+  - **What's next**: 9.7-impl-4d (lift the newer-snapshot refusal —
+    `newer_dead \ s_view`, the third `to_free` term, realising
+    `dead_list.tla::Rollback` in full) → 9.7-impl-5 (readable
+    `.snaps/`) → 9.7-impl-6 (clones).
 
 - **Pre-tip-0**: Phase 9.7-impl-1c-vi (`3afa915`) — the pool-global-engine
   retirement closes. The four `stm_sync` mirror fields

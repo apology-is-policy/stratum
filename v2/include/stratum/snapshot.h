@@ -406,6 +406,39 @@ stm_status stm_snapshot_dead_list_count(const stm_snapshot_index *idx,
                                            size_t *out_count);
 
 /*
+ * 9.7-impl-4c-iii: non-destructive READ of `snapshot_id`'s in-RAM
+ * paddr dead-list (data tier — stm_alloc-class). Returns a malloc'd
+ * copy of the contents; caller MUST `free(*out_paddrs)`.
+ *
+ * The snapshot stays PRESENT and its dead-list is UNCHANGED — for an
+ * atomic read-and-clear, callers run this BEFORE
+ * `stm_snapshot_clear_dead_lists` under a lock that excludes other
+ * mutators (rollback is the only consumer at v2.0; it holds fs->global
+ * EX over the whole sequence).
+ *
+ * Used by `fs_rollback_reclaim_cleared_dead_list_garbage` to read S's
+ * paddr dead-list BEFORE `clear_dead_lists` discards it, then filter
+ * `\ snap_paddr_set` (paddrs the snapshot's frozen tree references
+ * resurrect on rollback — must NOT be freed) and free the survivors
+ * (pure post-snapshot COW garbage) via `stm_alloc_free`.
+ *
+ * Errors:
+ *   - STM_EINVAL  - idx == NULL, snapshot_id == 0, or out params NULL.
+ *   - STM_ENOENT  - snapshot_id not PRESENT in the index.
+ *   - STM_ENOMEM  - allocation failed (no partial output: *out_paddrs
+ *                   = NULL, *out_count = 0).
+ *
+ * On non-OK return, both *out_paddrs and *out_count are zero-init'd.
+ * On OK with an empty dead-list, *out_paddrs is NULL and *out_count
+ * is 0 (free(NULL) is well-defined).
+ */
+STM_MUST_USE
+stm_status stm_snapshot_dead_list_get(stm_snapshot_index *idx,
+                                         uint64_t snapshot_id,
+                                         uint64_t **out_paddrs,
+                                         size_t *out_count);
+
+/*
  * 9.7-impl-2-routing: count of paddrs in `snapshot_id`'s in-RAM
  * bootstrap_dead_list (the parallel list for engine NODE paddrs).
  * STM_ENOENT if not PRESENT. *out_count is 0 for a present snap with
@@ -415,6 +448,24 @@ STM_MUST_USE
 stm_status stm_snapshot_bootstrap_dead_list_count(
     const stm_snapshot_index *idx,
     uint64_t snapshot_id,
+    size_t *out_count);
+
+/*
+ * 9.7-impl-4c-iii: non-destructive READ of `snapshot_id`'s in-RAM
+ * bootstrap_dead_list (boot tier — engine NODE paddrs / stm_bootstrap
+ * class). Returns a malloc'd copy of the contents; caller MUST
+ * `free(*out_paddrs)`. Mirror of `stm_snapshot_dead_list_get` for the
+ * boot tier — same lock-and-read pattern, same error set.
+ *
+ * Used by `fs_rollback_reclaim_cleared_dead_list_garbage`'s boot-tier
+ * branch: read S's boot dead-list, filter `\ snap_node_paddrs`, free
+ * survivors via `stm_bootstrap_free`.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_bootstrap_dead_list_get(
+    stm_snapshot_index *idx,
+    uint64_t snapshot_id,
+    uint64_t **out_paddrs,
     size_t *out_count);
 
 /*
@@ -577,6 +628,42 @@ STM_MUST_USE
 stm_status stm_snapshot_cold_dead_list_count(const stm_snapshot_index *idx,
                                                  uint64_t snapshot_id,
                                                  size_t *out_count);
+
+/*
+ * 9.7-impl-4c-iii: non-destructive READ of `snapshot_id`'s in-RAM
+ * cold_dead_list (cold tier — CAS-class deref obligations). Returns
+ * a malloc'd copy: `*out_hashes` points to a buffer of `*out_count`
+ * × `STM_SNAP_HASH_LEN` bytes (a packed array of 32-byte content
+ * hashes — the same shape `stm_snapshot_delete` hands out via its
+ * `out_freed_cold_hashes` parameter). Caller MUST `free(*out_hashes)`.
+ *
+ * The dead-list is a MULTISET — a single 32-byte hash MAY appear
+ * multiple times, one entry per deferred-deref obligation. Mirror of
+ * `stm_snapshot_dead_list_get` for the cold tier.
+ *
+ * Used by `fs_rollback_reclaim_cleared_dead_list_garbage`'s cold-tier
+ * branch: read S's cold dead-list, compute `snap_unique[hash]` (per-
+ * key merge of OLD vs SNAP COLD-record sets), and for each hash H
+ * issue `dead_S(H) − snap_unique(H)` derefs (clamped at 0 — defense-
+ * in-depth) via `stm_cas_deref`. The per-hash counted subtraction is
+ * safe HERE — distinct from the 4c-ii live-divergence case — because
+ * every snap_unique record has a corresponding dead-list entry (its
+ * deferred deref), so `snap_unique(H) ≤ dead_S(H)` per hash.
+ *
+ * Errors:
+ *   - STM_EINVAL  - idx == NULL, snapshot_id == 0, or out params NULL.
+ *   - STM_ENOENT  - snapshot_id not PRESENT in the index.
+ *   - STM_ENOMEM  - allocation failed (no partial output).
+ *
+ * On non-OK return, both *out_hashes and *out_count are zero-init'd.
+ * On OK with an empty dead-list, *out_hashes is NULL and *out_count
+ * is 0.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_cold_dead_list_get(stm_snapshot_index *idx,
+                                              uint64_t snapshot_id,
+                                              uint8_t **out_hashes,
+                                              size_t *out_count);
 
 /*
  * Increment snapshot's hold count. STM_ENOENT if not PRESENT.
