@@ -1410,11 +1410,19 @@ static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
      * — back-compat fall-through to bootstrap_free. dataset_id mirrors
      * the engine's tree_id so the AEAD bind matches the dead-list
      * routing key.
+     *
+     * 9.7-impl-6c: also propagate the slot's `e.origin_snap_id` so
+     * vt->free can route clone drops through the per-snap append API
+     * (phase-9.7-design.md §9.1.2). For non-clone slots the field is
+     * STM_DATASET_NO_ORIGIN (== 0); the engine_store_free dispatch
+     * branches on zero / non-zero. Each engine inherits its slot's
+     * clone-link automatically — no fs-side wiring required.
      */
-    slot->engine_ctx.boot       = idx->engine_store_ctx.boot;
-    slot->engine_ctx.bdev       = idx->engine_store_ctx.bdev;
-    slot->engine_ctx.snap_idx   = idx->snap_idx;
-    slot->engine_ctx.dataset_id = slot->e.id;
+    slot->engine_ctx.boot           = idx->engine_store_ctx.boot;
+    slot->engine_ctx.bdev           = idx->engine_store_ctx.bdev;
+    slot->engine_ctx.snap_idx       = idx->snap_idx;
+    slot->engine_ctx.dataset_id     = slot->e.id;
+    slot->engine_ctx.origin_snap_id = slot->e.origin_snap_id;
 
     stm_btree_engine *eng = NULL;
     stm_status rc;

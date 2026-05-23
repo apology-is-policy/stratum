@@ -59,21 +59,42 @@ struct stm_snapshot_index;   typedef struct stm_snapshot_index stm_snapshot_inde
  * engine's tree_id, and `snap_idx` is the borrowed pool-wide snapshot
  * index attached at mount via `stm_dataset_index_set_snap_idx`.
  *
- *   - boot / bdev: stable through engine lifetime.
- *   - snap_idx:   may be NULL pre-attach OR if the deployment has no
- *                 snapshot index (degenerate). When NULL, the free
- *                 path falls through to direct bootstrap_free (back-
- *                 compat with mounts that haven't reached the wiring
- *                 yet, AND the no-snapshot-in-chain steady state).
- *   - dataset_id: 0 means "no snap-routing for this engine" — same
- *                 fall-through as snap_idx NULL. Production engines
- *                 always set a non-zero dataset_id at create/open.
+ * 9.7-impl-6c: `origin_snap_id` extends the routing fork for clones
+ * (phase-9.7-design.md §9.1.2). A clone's `di_tree_root` initialises to
+ * an origin snap S's captured root, so its first COW drops paddrs that
+ * are in S.view, NOT in the clone's own snap chain (the clone has no
+ * snaps at v1.0). Routing through `most_recent_locked(clone_dataset_id)`
+ * yields NO_PREV and the paddr would return to the allocator while S
+ * still references it → AEAD `(paddr, write_gen)` nonce mismatch →
+ * STM_ECORRUPT on subsequent S reads. When `origin_snap_id != 0` the
+ * `free` path dispatches through `stm_snapshot_index_add_to_snap_bootstrap_dead_list`
+ * against that SPECIFIC snap_id instead, regardless of any most-recent
+ * snap of any dataset. Non-clone engines leave the field 0 (sentinel
+ * `STM_DATASET_NO_ORIGIN`); their free dispatch follows the original
+ * dataset-id / most-recent path.
+ *
+ *   - boot / bdev:      stable through engine lifetime.
+ *   - snap_idx:         may be NULL pre-attach OR if the deployment has
+ *                       no snapshot index (degenerate). When NULL, the
+ *                       free path falls through to direct bootstrap_free
+ *                       (back-compat with mounts that haven't reached
+ *                       the wiring yet, AND the no-snapshot-in-chain
+ *                       steady state).
+ *   - dataset_id:       0 means "no snap-routing for this engine" — same
+ *                       fall-through as snap_idx NULL. Production engines
+ *                       always set a non-zero dataset_id at create/open.
+ *   - origin_snap_id:   0 ⇒ not a clone (default). Non-zero ⇒ the slot's
+ *                       dataset is a clone; route drops to this SPECIFIC
+ *                       snap_id. Borrowed lifetime: the snap is held by
+ *                       the clone (`stm_snapshot_hold` at clone-create)
+ *                       so it stays PRESENT for the engine's lifetime.
  */
 typedef struct {
-    stm_bootstrap       *boot;       /* node reserve / free                         */
-    stm_bdev            *bdev;       /* node read / write                           */
-    stm_snapshot_index  *snap_idx;   /* most-recent snap dead-list routing (may be NULL) */
-    uint64_t             dataset_id; /* mirrors engine tree_id; 0 disables routing  */
+    stm_bootstrap       *boot;           /* node reserve / free                              */
+    stm_bdev            *bdev;           /* node read / write                                */
+    stm_snapshot_index  *snap_idx;       /* most-recent snap dead-list routing (may be NULL) */
+    uint64_t             dataset_id;     /* mirrors engine tree_id; 0 disables routing       */
+    uint64_t             origin_snap_id; /* clone origin snap; 0 = not a clone (9.7-impl-6c) */
 } stm_engine_store_ctx;
 
 /*
