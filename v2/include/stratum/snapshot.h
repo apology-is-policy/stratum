@@ -753,6 +753,39 @@ STM_MUST_USE
 stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
                                stm_snapshot_iter_cb cb, void *ctx);
 
+/*
+ * 9.7-impl-4d (newer-snapshot cascade): collect snapshot_ids of every
+ * PRESENT snapshot of `dataset_id` whose id is STRICTLY GREATER than
+ * `target_snapshot_id`. The returned ids are sorted ASCENDING (so
+ * iterating from index 0 visits the oldest-newer snap first).
+ *
+ * On success: *out_snap_ids is a malloc'd buffer (or NULL when count
+ * is 0); *out_count is the buffer length; caller MUST free
+ * *out_snap_ids when done. Empty result (no newer snaps) returns
+ * STM_OK with *out_snap_ids == NULL and *out_count == 0.
+ *
+ * Refused with:
+ *   - STM_EINVAL: NULL idx / out / dataset_id == 0 / target_snapshot_id == 0.
+ *   - STM_ENOMEM: malloc failure (caller buffers unchanged).
+ *
+ * Used by the rollback flow to enumerate snapshots that must be
+ * deleted (ZFS-style rollback semantics — newer snaps are destroyed
+ * by the rollback). The target snapshot itself is excluded; only
+ * STRICTLY-newer (greater snapshot_id) PRESENT snaps are returned.
+ * dead_list.tla::Rollback's `newer_snaps == { s2 ∈ SnapIds : s2 > s ∧
+ * SnapPresent(s2) }` definition matches verbatim.
+ *
+ * The snapshot_id ascending order is convenient for the rollback's
+ * dead-list aggregation (the ordering doesn't matter for correctness;
+ * all newer snaps must be deleted before the commit either way).
+ */
+STM_MUST_USE
+stm_status stm_snapshot_collect_newer(const stm_snapshot_index *idx,
+                                         uint64_t dataset_id,
+                                         uint64_t target_snapshot_id,
+                                         uint64_t **out_snap_ids,
+                                         size_t *out_count);
+
 /* ========================================================================= */
 /* Persistence (P6-persist).                                                  */
 /* ========================================================================= */

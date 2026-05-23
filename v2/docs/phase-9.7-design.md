@@ -500,6 +500,38 @@ No `STM_UB_VERSION` bump — the reclaim only calls existing `stm_bootstrap_free
 - **Safety + best-effort + the newer-snapshot precondition**: identical to §6.6 / §6.7 — a hash is dereffed only if its record is in `old_set`, not the same logical record as a `snap_set` record at the same key, AND both walks completed in full; either walk failing ⇒ nothing dereffed.
 - No `STM_UB_VERSION` bump — the reclaim only `stm_cas_deref`s; no on-disk format change.
 
+### 6.10 — As-built note (9.7-impl-4d: newer-snapshot cascade)
+
+impl-4d closes the §6.6 / §6.9 forward-noted hole: the newer-snapshot refusal lifts. `stm_fs_rollback_snapshot` no longer returns `STM_ENOTSUPPORTED` when newer snapshots of the dataset exist; the cascade destroys them (ZFS rollback semantics) and reclaims `newer_dead \ s_view` — the third `to_free` term of `dead_list.tla::Rollback`. With 4d in place the rollback realises `to_free = (live ∖ s_view) ∪ (snap_dead[s] ∖ s_view) ∪ (newer_dead ∖ s_view)` in full.
+
+**New API**: `stm_snapshot_collect_newer(idx, dataset_id, target_sid, **out_ids, *out_count)` — returns the ascending list of PRESENT snap_ids strictly greater than the target. The lock is held for both the count + fill passes (defense-in-depth `STM_ECORRUPT` if the two passes disagree, which can't happen under the held mutex but the assertion documents the contract).
+
+**Pre-validate (R160 P1-1 doctrine)**: every newer snap is `stm_snapshot_lookup`'d under the held `fs->global` EX BEFORE the destructive drain. If any has `hold_count > 0`, the rollback refuses `STM_EBUSY` as a true no-op (no destructive step taken). Future v1.x may extend the gate (clones once they land); the underlying `stm_snapshot_delete` already refuses STM_EBUSY on holds + clones, so an unanticipated refusal at cascade time degrades to "this newer snap stays + the others get reclaimed" — best-effort.
+
+**New helper**: `fs_rollback_reclaim_newer_snap_cascade` (fs.c). Runs AFTER 4b/4c/4c-ii/4c-iii on the target + `clear_dead_lists` on the target, BEFORE the rollback's commit. Flow:
+
+1. **Walk s.view ONCE**: bootstrap-paddr set + data-paddr set + cold-record set (via the same APIs 4b/4c/4c-ii use). Walk OLD-live's cold record set ONCE. Compute `snap_unique` (same algorithm as 4c-iii — records in s.view whose `(ino, off)` has a different identity in OLD-live).
+2. **Per newer snap** (in ascending snap_id — the order `stm_snapshot_collect_newer` emits; ordering is cosmetic since boot/data filters are set-difference + cold reclaim aggregates):
+   - `stm_snapshot_delete` → owned dead-list buffers (boot, data, cold).
+   - Boot tier: for each paddr in `freed_boot`, skip if in `snap_nodes` (case-(a)); else `stm_bootstrap_free` at `free_gen = stm_sync_current_gen`.
+   - Data tier: for each paddr in `freed_paddrs`, skip if in `snap_data`; else `stm_alloc_free`.
+   - Cold tier: append `cold_hashes` into the aggregation buffer (`agg_cold`), realloc-doubling.
+3. **Post-loop cold-tier reclaim**: sort `agg_cold`; run the same merge-walk 4c-iii uses against `snap_unique` — for each hash run `H`, deref count = `agg_cold(H) − snap_unique(H)` clamped at 0; `stm_cas_deref` per derefed-occurrence. The derefs feed the rollback commit's CAS auto-GC sweep.
+
+**LOAD-BEARING — counted subtraction safety (cold tier)**: every `snap_unique` record's drop event fired the snap-aware deref routing while SOME newer snap was most-recent at COW time, so at least one matching entry lives in the union of newer snaps' cold dead-lists (i.e., in `agg_cold`). Therefore `snap_unique(H) ≤ agg_cold(H)` per hash always holds; the clamp-at-0 is defense-in-depth against an upstream COW-routing bug that left a snap_unique record without its corresponding dead-list entry. UNDER-derefs (a leak) are consistent with best-effort posture; OVER-derefs (which would prematurely CAS-GC live cold storage) NEVER happen.
+
+**DISJOINT-SET property (boot / data tiers)**: `(OLD-live ∖ s.view) ∩ (newer_snap.dead_list) = ∅` — a paddr in OLD-live is still-allocated-not-yet-dropped, so it cannot appear in any newer snap's dead-list (dead-list only collects DROPPED paddrs). The live-divergence 4b/4c reclaims and the 4d boot/data cascade reclaims therefore operate on DISJOINT paddr sets, no double-free risk.
+
+**Best-effort per snap**: a `stm_snapshot_delete` failure on one newer snap leaves the other snaps' reclaims intact (the failed snap stays PRESENT, its dead-lists intact — a future delete or recovery sweep can still reclaim it). A wholesale walk failure for any of the s.view sets skips that tier's reclaim entirely (no partial filtering — that would risk freeing case-(a) survivors). Leaked paddrs / cold refcounts are a space cost, never a corruption.
+
+**AEAD-nonce posture preserved**: every freed paddr rides the SAME `stm_sync_commit` as the rollback's swap. The `free_gen < committed_gen` predicate (R50 P2-1) gates reuse, so the allocator never reissues a freed paddr at the same gen. The v1 R9-1 "bump fs->gen before the allocator swap" doctrine remains subsumed by the commit's gen advance (v2's rollback doesn't roll back the allocator).
+
+**Cosmetic ordering**: per-snap iteration in ascending snap_id. The order is cosmetic — boot/data tiers reclaim independently per-snap, cold-tier reclaim aggregates ALL snaps before the single subtraction. Per-snap subtraction against snap_unique would over-deref under cross-snap dedup (snap_unique credit applied independently per snap), which is why aggregation is load-bearing.
+
+No `STM_UB_VERSION` bump — the cascade calls only existing `stm_snapshot_delete` / `stm_alloc_free` / `stm_bootstrap_free` / `stm_cas_deref`; no on-disk format change.
+
+With this clause, `dead_list.tla::Rollback` is realised IN FULL. R161 / R162 / R163 / R164 "best-effort + walk-must-complete + clamp-at-0 + per-key structural merge" doctrines all carry verbatim. The R165 audit will scope the cascade against the spec + the load-bearing invariants this section enumerates.
+
 ## 7 — Spec extensions (9.7-spec)
 
 ### 7.1 — snapshot.tla rollback mechanism

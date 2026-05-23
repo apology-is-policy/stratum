@@ -1170,6 +1170,62 @@ stm_status stm_snapshot_most_recent(const stm_snapshot_index *idx,
     return STM_OK;
 }
 
+/* 9.7-impl-4d: enumerate PRESENT snapshots of `dataset_id` whose id is
+ * STRICTLY GREATER than `target_snapshot_id`. Two-pass under the lock:
+ * count, malloc, fill. Slots are appended in id-ascending order so the
+ * linear walk emits id-ascending too — no sort needed. */
+stm_status stm_snapshot_collect_newer(const stm_snapshot_index *idx,
+                                         uint64_t dataset_id,
+                                         uint64_t target_snapshot_id,
+                                         uint64_t **out_snap_ids,
+                                         size_t *out_count) {
+    if (!idx || !out_snap_ids || !out_count) return STM_EINVAL;
+    if (dataset_id == 0 || target_snapshot_id == 0) return STM_EINVAL;
+    *out_snap_ids = NULL;
+    *out_count    = 0;
+
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+
+    size_t n = 0;
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        const snapshot_slot *s = &idx->slots[i];
+        if (!s->present) continue;
+        if (s->e.dataset_id != dataset_id) continue;
+        if (s->e.snapshot_id > target_snapshot_id) n++;
+    }
+    if (n == 0) {
+        must_unlock(lock);
+        return STM_OK;
+    }
+
+    uint64_t *buf = malloc(n * sizeof *buf);
+    if (!buf) {
+        must_unlock(lock);
+        return STM_ENOMEM;
+    }
+    size_t j = 0;
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        const snapshot_slot *s = &idx->slots[i];
+        if (!s->present) continue;
+        if (s->e.dataset_id != dataset_id) continue;
+        if (s->e.snapshot_id > target_snapshot_id) {
+            buf[j++] = s->e.snapshot_id;
+        }
+    }
+    /* Defense-in-depth: j MUST equal n — the locked snapshot of the
+     * slot table is consistent between the two passes. */
+    if (j != n) {
+        free(buf);
+        must_unlock(lock);
+        return STM_ECORRUPT;
+    }
+    *out_snap_ids = buf;
+    *out_count    = n;
+    must_unlock(lock);
+    return STM_OK;
+}
+
 stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
                                stm_snapshot_iter_cb cb, void *ctx) {
     if (!idx || !cb) return STM_EINVAL;

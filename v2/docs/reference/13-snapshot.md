@@ -230,14 +230,50 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
     below without deref. With this tier the rollback realises the
     `to_free` minus the `newer_dead \ s_view` term in full; only the
     newer-snapshot cascade — 9.7-impl-4d — remains.
-- **v1.0 limitation** — a rollback is refused (`STM_ENOTSUPPORTED`)
-  when a newer snapshot of the dataset exists. ZFS semantics destroy
-  every newer snapshot; doing that correctly needs the `\ newer_dead`
-  filter of `dead_list.tla::Rollback` (a newer snapshot's dead-list
-  can hold paddrs the target's frozen tree also references) — forward-
-  noted to **9.7-impl-4d**. Until then, delete newer snapshots
-  explicitly (`stm_fs_delete_snapshot` reclaims them correctly) then
-  roll back.
+- **Newer-snapshot CASCADE reclamation (9.7-impl-4d)** — lifts the
+  impl-4 `STM_ENOTSUPPORTED` refusal: a rollback past newer snapshots
+  of the dataset is now supported and destroys those snapshots (ZFS
+  rollback semantics). New API `stm_snapshot_collect_newer(idx,
+  dataset_id, target_sid, **out_ids, *out_count)` returns the ascending
+  list of PRESENT snap_ids strictly greater than the target. New
+  helper `fs_rollback_reclaim_newer_snap_cascade` (fs.c):
+  - Pre-validate (R160 P1-1 doctrine): every newer snap is
+    `stm_snapshot_lookup`'d BEFORE the destructive drain; if any
+    `hold_count > 0`, the rollback refuses `STM_EBUSY` as a true
+    no-op.
+  - Walks s.view's bootstrap paddrs + data paddrs + cold records +
+    OLD-live's cold records ONCE (same APIs the 4b/4c/4c-ii reclaims
+    use); computes `snap_unique` (records in s.view whose `(ino, off)`
+    has a different identity in OLD-live; identical algorithm to
+    4c-iii).
+  - Per newer snap: `stm_snapshot_delete` → for each of the three
+    dead-list buffers, filter by `\ s_view` (boot/data: set-difference
+    on paddrs; cold: accumulated into a single aggregation buffer
+    deferred to post-loop).
+  - Post-loop cold-tier reclaim: counted subtraction `agg_cold(H) −
+    snap_unique(H)` clamped at 0; identical merge-walk to 4c-iii.
+    Safe because every `snap_unique` record's drop fired the
+    snap-aware deref routing while SOME newer snap was most-recent at
+    COW time, so at least one matching entry lives across the union
+    of newer snaps' cold dead-lists → `snap_unique(H) ≤ agg_cold(H)`
+    per hash always; clamp is defense-in-depth.
+  - Best-effort per snap: a `stm_snapshot_delete` failure on one
+    snap leaves the others reclaimed; the rollback itself still
+    succeeds. Walks that fail wholesale skip their tier; leaked
+    paddrs / cold refcounts are a space cost, never a corruption.
+  - DISJOINT-SET property: `(OLD-live ∖ s.view) ∩ (newer_snap.dead_list)
+    = ∅` — a paddr in OLD-live is still-allocated-not-yet-dropped, so
+    cannot appear in any newer snap's dead-list. The live-divergence
+    4b/4c reclaims and the 4d boot/data cascade therefore operate on
+    DISJOINT paddr sets, no double-free risk.
+  - With this tier, `dead_list.tla::Rollback`'s
+    `to_free = (live ∖ s_view) ∪ (snap_dead[s] ∖ s_view) ∪ (newer_dead ∖ s_view)`
+    is realised IN FULL. The v1.0 limitation forward-note retires.
+  - Flow within the rollback: drain → swap → 4b → 4c → 4c-ii → 4c-iii
+    on target → clear_dead_lists on target → **4d cascade** → commit.
+    Every freed paddr / dereffed cold record rides the SAME commit,
+    deferred via R50 P2-1's strict `free_gen < committed_gen` predicate
+    so AEAD-nonce (paddr, write_gen) uniqueness holds.
 
 ### Dead-list (P6-deadlist + P7-CAS-4c cold-tier)
 
@@ -394,6 +430,14 @@ stm_status stm_snapshot_count             (idx, *out_count);
 stm_status stm_snapshot_dataset_count     (idx, dataset_id, *out_count);
 stm_status stm_snapshot_most_recent       (idx, dataset_id, *out_id);
 stm_status stm_snapshot_iter              (idx, cb, ctx);
+
+/* 9.7-impl-4d: enumerate PRESENT snap_ids of `dataset_id` strictly
+ * greater than `target_snapshot_id`. Returned ids are sorted
+ * ASCENDING; caller frees `*out_snap_ids`. Empty result returns
+ * STM_OK with NULL/0. */
+stm_status stm_snapshot_collect_newer     (idx, dataset_id,
+                                           target_snapshot_id,
+                                           **out_snap_ids, *out_count);
 ```
 
 ### Persistence (P6-persist)

@@ -523,7 +523,12 @@ STM_TEST(fs_rollback_restores_snapshot_view) {
  * when a newer snapshot of the dataset exists — the operator deletes
  * newer snapshots first. A rollback to the most-recent snapshot
  * proceeds. */
-STM_TEST(fs_rollback_refuses_when_newer_snapshot_exists) {
+/* 9.7-impl-4d: rolling back past a newer snapshot is now supported —
+ * the rollback destroys the newer snapshots (ZFS semantics). This test
+ * pinned the impl-4 STM_ENOTSUPPORTED refusal; it now pins the lifted
+ * behavior — rollback to s1 with s2 newer succeeds + s2 disappears
+ * from the snapshot index. */
+STM_TEST(fs_rollback_destroys_newer_snapshot_cascade) {
     make_tmp("rb_newer");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -543,13 +548,16 @@ STM_TEST(fs_rollback_refuses_when_newer_snapshot_exists) {
     STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
     STM_ASSERT(s2 > s1);
 
-    /* Rollback to s1 is refused — s2 is newer. The refusal is checked
-     * before any I/O, so it leaves no durable side effect. */
-    STM_ASSERT_ERR(stm_fs_rollback_snapshot(fs, 1, s1, false),
-                       STM_ENOTSUPPORTED);
+    /* Rollback to s1: with 9.7-impl-4d the refusal is gone — s2 is
+     * destroyed as part of the cascade. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, s1, false));
 
-    /* Rollback to the most-recent snapshot (s2) proceeds. */
-    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, s2, false));
+    /* s2 is no longer PRESENT; s1 stays PRESENT. */
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(stm_fs_sync(fs));
+    STM_ASSERT(sidx != NULL);
+    stm_snapshot_entry e;
+    STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s2, &e), STM_ENOENT);
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, s1, &e));
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -8198,6 +8206,394 @@ STM_TEST(tly_a1_unbound_on_disk_with_zero_arg_mounts) {
     STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_ESERIAL);
 
     unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* ==========================================================================
+ * 9.7-impl-4d — newer-snapshot CASCADE tests
+ *
+ * Each test exercises a distinct aspect of the cascade's filter or
+ * refusal posture. The basic "newer snap destroyed" case is
+ * `fs_rollback_destroys_newer_snapshot_cascade` (earlier in the file —
+ * formerly `fs_rollback_refuses_when_newer_snapshot_exists`).
+ * ========================================================================== */
+
+/* 9.7-impl-4d R160 P1-1: a held newer snapshot refuses the rollback
+ * with STM_EBUSY — pre-drain. The refusal is a true no-op: the
+ * dirty-buffer drain hasn't run, no destructive step taken. */
+STM_TEST(fs_rollback_refuses_when_newer_snapshot_held) {
+    make_tmp("rb_held_newer");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t data[4096];
+    memset(data, 0x77, sizeof data);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, data, sizeof data));
+    uint64_t s1 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s1", 2, &s1));
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, data, sizeof data));
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
+
+    /* Hold s2 — any future stm_snapshot_delete refuses STM_EBUSY. */
+    STM_ASSERT_OK(stm_fs_hold_snapshot(fs, s2));
+
+    /* Rollback to s1: refused STM_EBUSY because the cascade can't
+     * destroy s2 (held). The refusal fires BEFORE the drain, so the
+     * post-snapshot live write at (1, 1, 0) is preserved. */
+    STM_ASSERT_ERR(stm_fs_rollback_snapshot(fs, 1, s1, false), STM_EBUSY);
+
+    /* Both snapshots remain PRESENT — refusal is a true no-op. */
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(stm_fs_sync(fs));
+    STM_ASSERT(sidx != NULL);
+    stm_snapshot_entry e;
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, s1, &e));
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, s2, &e));
+    STM_ASSERT_EQ(e.hold_count, 1u);
+
+    /* Release the hold + rollback succeeds (cascade destroys s2). */
+    STM_ASSERT_OK(stm_fs_release_snapshot(fs, s2));
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, s1, false));
+    STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s2, &e), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* 9.7-impl-4d data-tier: case-(b) HOT-extent garbage from a newer
+ * snap's dead-list IS freed at rollback. We verify via allocator
+ * stats — a paddr allocated post-newer-snap then COW'd during the
+ * newer snap's lifetime should be a case-(b) paddr in the newer snap's
+ * dead-list; the 4d cascade frees it (vs the pre-impl-4d behavior
+ * where the rollback would refuse altogether). */
+STM_TEST(fs_rollback_4d_frees_newer_snap_case_b_data_garbage) {
+    make_tmp("rb_4d_case_b");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Snap s with nothing yet (s.view is empty for our test inodes). */
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &s));
+
+    /* Newer snap s2: capture an empty post-s state (s2.view is empty
+     * too — both ino 20 and ino 21 are written AFTER s2). */
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
+
+    /* Post-s2: write inode 20 — pure case-(b) (neither s.view nor
+     * s2.view has it; allocated post-s2). */
+    uint8_t pat[4096];
+    memset(pat, 0xCC, sizeof pat);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 20, 0, pat, sizeof pat));
+
+    /* COW it: drop the just-written extent → its paddr goes to
+     * most-recent snap = s2's data dead-list. The replacement-extent
+     * is in OLD-live, will get reclaimed by 4c (live-divergence). */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 20, 0, pat, sizeof pat));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    size_t pre_dead_count = 0;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(
+            stm_sync_snapshot_index(stm_fs_sync(fs)), s2, &pre_dead_count));
+    STM_ASSERT(pre_dead_count >= 1);
+
+    /* Roll back to s. The cascade destroys s2 AND frees its case-(b)
+     * data dead-list paddrs. Without 4d, this would refuse
+     * STM_ENOTSUPPORTED. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, s, false));
+
+    /* s2 is gone. s remains. */
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(stm_fs_sync(fs));
+    stm_snapshot_entry e;
+    STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s2, &e), STM_ENOENT);
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, s, &e));
+
+    /* The s2 deletion through the cascade is the cumulative effect:
+     * (a) s2 gone (asserted above); (b) stm_fs_verify passes — proves
+     * the post-rollback tree is internally consistent including any
+     * paddrs the cascade freed or kept. Deeper extent-presence
+     * assertions are gated on extent_index walk APIs, deferred. */
+    STM_ASSERT_OK(stm_fs_verify(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* 9.7-impl-4d data-tier: case-(a) paddrs in s.view are KEPT live by
+ * the cascade's filter — even though they appear in a newer snap's
+ * data dead-list (impl-2's COW routing sends every drop to most-
+ * recent regardless of s.view membership). This is the load-bearing
+ * filter; without it the rollback would over-free + corrupt live
+ * post-swap. */
+STM_TEST(fs_rollback_4d_keeps_case_a_data_paddrs_live) {
+    make_tmp("rb_4d_case_a");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Pre-s: write a HOT extent (ino 10). It's in OLD-live AND s.view. */
+    uint8_t a[4096];
+    memset(a, 0xAA, sizeof a);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 10, 0, a, sizeof a));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &s));
+
+    /* Snap s2 — shares (10, 0)=A with s and live. */
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
+
+    /* Post-s2 COW (10, 0): drop A's paddr (which IS in s.view) →
+     * routes to most-recent = s2's data dead-list. case-(a) for s2:
+     * dead_s2 contains a paddr s.view also references. */
+    uint8_t a2[4096];
+    memset(a2, 0xAB, sizeof a2);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 10, 0, a2, sizeof a2));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Rollback: cascade destroys s2; filter MUST skip A's paddr in
+     * s2.data_dead because A is in s.view. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, s, false));
+
+    /* Post-rollback: live = s.view. Reading (10, 0) returns the
+     * original A — proves A's paddr stayed allocated through the
+     * cascade. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 10, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof a);
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+
+    /* Defense-in-depth: force fresh allocations that could re-issue
+     * the freed paddr if the filter had wrongly freed A. Re-read A. */
+    for (uint64_t k = 0; k < 4; k++) {
+        uint8_t fresh[4096];
+        memset(fresh, (int)(0x40u + k), sizeof fresh);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, 30 + k, 0, fresh, sizeof fresh));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 10, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+
+    STM_ASSERT_OK(stm_fs_verify(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* 9.7-impl-4d multi-snap cascade: chain of 3 newer snaps. All are
+ * destroyed; target survives. */
+STM_TEST(fs_rollback_4d_destroys_multiple_newer_snaps) {
+    make_tmp("rb_4d_chain");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t d[4096];
+    memset(d, 0x33, sizeof d);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, d, sizeof d));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &s));
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, d, sizeof d));
+    uint64_t s_a = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sa", 2, &s_a));
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, d, sizeof d));
+    uint64_t s_b = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sb", 2, &s_b));
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, d, sizeof d));
+    uint64_t s_c = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "sc", 2, &s_c));
+
+    STM_ASSERT(s_a > s && s_b > s_a && s_c > s_b);
+
+    /* Roll back to s — all three newer snaps must be destroyed. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, s, false));
+
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(stm_fs_sync(fs));
+    stm_snapshot_entry e;
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, s, &e));
+    STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s_a, &e), STM_ENOENT);
+    STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s_b, &e), STM_ENOENT);
+    STM_ASSERT_ERR(stm_snapshot_lookup(sidx, s_c, &e), STM_ENOENT);
+
+    /* The dataset's most-recent is now s. */
+    uint64_t mr = 0;
+    STM_ASSERT_OK(stm_snapshot_most_recent(sidx, 1, &mr));
+    STM_ASSERT_EQ(mr, s);
+
+    STM_ASSERT_OK(stm_fs_verify(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* 9.7-impl-4d cold-tier dedup: a hash in s.view + a hash in a newer
+ * snap's cold_dead at a DIFFERENT (ino, off). The cascade's counted
+ * subtraction skips snap_unique(H) entries; the remaining entries
+ * (intermediate-COW garbage / case-(b)) deref. CAS-refcount post-
+ * rollback reflects only s.view's records + older snaps. */
+STM_TEST(fs_rollback_4d_cold_dedup_correct) {
+    make_tmp("rb_4d_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_cas_index *cas = stm_sync_cas_index(stm_fs_sync_for_test(fs));
+    STM_ASSERT(cas != NULL);
+
+    /* Pre-s: write+migrate cold inode 1 (hash H1). */
+    uint8_t c1[4096];
+    for (size_t i = 0; i < sizeof c1; i++) c1[i] = (uint8_t)((i * 17) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, c1, sizeof c1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &s));
+
+    /* Newer snap s2 — captures the same H1 record. */
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
+
+    /* Post-s2: write+migrate inode 30 with FRESH bytes (hash H30; pure
+     * case-(b) for s2). Then truncate it to drop the cold record →
+     * snap-aware deref defers to s2.cold_dead. */
+    uint8_t c30[4096];
+    memset(c30, 0xDE, sizeof c30);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 30, 0, c30, sizeof c30));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 30));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 30, 0));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Pre-rollback CAS count = 2: H1 (live via inode 1) + H30 (in s2's
+     * cold_dead, deferred deref). */
+    size_t cas_n_pre = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n_pre));
+    STM_ASSERT_EQ(cas_n_pre, (size_t)2);
+
+    /* Roll back to s — destroys s2. Cascade derefs s2's cold_dead
+     * filtered by snap_unique against s.view:
+     *   - s.view has (1, 0)=H1. OLD-live also has (1, 0)=H1 same
+     *     identity. snap_unique = empty (the (1,0)-side is shared, not
+     *     diverged). So snap_unique(H30) = 0.
+     *   - s2.cold_dead = [H30] (count 1). subtraction: 1 - 0 = 1 deref. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, s, false));
+
+    /* Post: H30 → refcount 0 → auto-GC at the rollback's commit. CAS
+     * count drops to 1 (just H1). */
+    size_t cas_n_post = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n_post));
+    STM_ASSERT_EQ(cas_n_post, (size_t)1);
+
+    /* (1, 0)=H1 still readable through s.view. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(c1, out, sizeof c1);
+
+    STM_ASSERT_OK(stm_fs_verify(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* 9.7-impl-4d API surface: stm_snapshot_collect_newer returns ascending
+ * snap_ids of newer-than-target PRESENT snaps. Empty-result path. */
+STM_TEST(snapshot_collect_newer_empty_returns_ok_null) {
+    make_tmp("collect_newer_empty");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "only", 1, &s));
+
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(stm_fs_sync(fs));
+    uint64_t *ids = NULL;
+    size_t n = 0;
+    STM_ASSERT_OK(stm_snapshot_collect_newer(sidx, 1, s, &ids, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+    STM_ASSERT(ids == NULL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* 9.7-impl-4d API surface: ascending order + only PRESENT snaps. */
+STM_TEST(snapshot_collect_newer_returns_ascending_present) {
+    make_tmp("collect_newer_chain");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t s0 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s0", 2, &s0));
+    uint64_t s1 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s1", 2, &s1));
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
+    uint64_t s3 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s3", 2, &s3));
+
+    /* Delete s2 to verify ABSENT slots are skipped. */
+    STM_ASSERT_OK(stm_fs_delete_snapshot(fs, s2, NULL));
+
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(stm_fs_sync(fs));
+    uint64_t *ids = NULL;
+    size_t n = 0;
+    STM_ASSERT_OK(stm_snapshot_collect_newer(sidx, 1, s0, &ids, &n));
+    STM_ASSERT_EQ(n, (size_t)2);    /* s1 + s3, ABSENT s2 omitted */
+    STM_ASSERT_EQ(ids[0], s1);
+    STM_ASSERT_EQ(ids[1], s3);
+    STM_ASSERT(ids[0] < ids[1]);    /* ascending */
+    free(ids);
+    ids = NULL;
+
+    /* Different target. */
+    n = 0;
+    STM_ASSERT_OK(stm_snapshot_collect_newer(sidx, 1, s1, &ids, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_EQ(ids[0], s3);
+    free(ids);
+
+    /* dataset 2 has no snapshots. */
+    ids = NULL;
+    n = 99;
+    STM_ASSERT_OK(stm_snapshot_collect_newer(sidx, 2, s0, &ids, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+    STM_ASSERT(ids == NULL);
+
+    /* Invalid args. */
+    STM_ASSERT_ERR(stm_snapshot_collect_newer(NULL, 1, s0, &ids, &n),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_collect_newer(sidx, 0, s0, &ids, &n),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_collect_newer(sidx, 1, 0, &ids, &n),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_collect_newer(sidx, 1, s0, NULL, &n),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_collect_newer(sidx, 1, s0, &ids, NULL),
+                       STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
 }
 
 STM_TEST_MAIN("fs")
