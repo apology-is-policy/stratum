@@ -4774,6 +4774,39 @@ stm_status stm_sync_keyschema_insert_for_test(stm_sync *s,
  *     Per-dataset DEKs are deferred to a future chunk.
  */
 
+/* 9.7-impl-6d: resolve the dataset's `origin_snap_id` for clone-path
+ * dispatch in the snap-aware drop routing (data + cold tiers).
+ *
+ * Returns 0 (== `STM_DATASET_NO_ORIGIN`, "not a clone") on every
+ * non-OK status from `stm_dataset_lookup`. The caller's branch on
+ * zero falls through to the legacy `most_recent_locked(dataset_id)`
+ * path — the conservative behavior. A genuine "dataset destroyed
+ * mid-op" race shouldn't be reachable in practice (sync holds
+ * `s->lock` for the entire drop loop, and `stm_fs_destroy_dataset`
+ * serializes under `fs->global` EX), but treating any lookup
+ * failure as "not a clone" keeps the dispatch defined.
+ *
+ * A non-zero return is the explicit `snap_id` the engine's free
+ * was given via `stm_engine_store_ctx::origin_snap_id` at engine
+ * open time (impl-6c). The two paths read the SAME dataset entry
+ * field, so the boot tier (engine_store_free) and the data/cold
+ * tiers (this function's callers) stay in lockstep.
+ *
+ * Lock order: caller holds `s->lock`; this function acquires
+ * `dataset_idx->lock` internally via `stm_dataset_lookup`. The
+ * `s->lock → dataset_idx->lock` ordering is established by every
+ * other sync.c caller that reaches dataset_idx (the engine cascade,
+ * the property accessors, etc.). No new ordering edge introduced. */
+static uint64_t sync_dataset_origin_snap_id_locked(const stm_sync *s,
+                                                       uint64_t dataset_id) {
+    if (s->dataset_idx == NULL) return 0;
+    stm_dataset_entry entry;
+    if (stm_dataset_lookup(s->dataset_idx, dataset_id, &entry) != STM_OK) {
+        return 0;
+    }
+    return entry.origin_snap_id;
+}
+
 static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t paddr) {
     /* Composes extent.tla::Overwrite-drop with dead_list.tla::OverwriteBlock
      * AND P7-16 reflink refcount semantics:
@@ -4816,7 +4849,28 @@ static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t padd
          * live elsewhere. */
         return stm_alloc_free(s->allocs[dev_id], paddr, s->current_gen);
     }
-    /* refcount == 1: last live reference. Original routing applies. */
+    /* refcount == 1: last live reference. Original routing applies.
+     *
+     * 9.7-impl-6d: clone-path dispatch. If the dataset is a clone
+     * (origin_snap_id != 0), drops route to the SPECIFIC origin snap
+     * via the per-snap append API (6b). Non-clone datasets continue
+     * through the legacy most-recent-of-dataset path. Spec mapping:
+     * dead_list.tla::OverwriteBlock with allocator class threaded
+     * through; the clone branch realises §9.1.2 per-snap routing for
+     * clone.tla::CloneCreate's share-root semantics on the data
+     * tier. Mirrors engine_store_free's boot-tier dispatch (impl-6c). */
+    uint64_t origin_snap_id = sync_dataset_origin_snap_id_locked(s, ds);
+    if (origin_snap_id != 0) {
+        /* Clone path — route to the specific origin snap. STM_OK ⇒
+         * snap captured the paddr; allocator MUST NOT see it. No
+         * should_free signal — the explicit snap_id IS the capture.
+         * Any other status surfaces as the drop's rc (caller treats
+         * it best-effort the same way it would a legacy-path error). */
+        stm_status os = stm_snapshot_index_add_to_snap_dead_list(
+            s->snap_idx, origin_snap_id, paddr);
+        return os;
+    }
+    /* Non-clone path — original routing. */
     bool should_free = false;
     stm_status os = stm_snapshot_index_overwrite_block(s->snap_idx, ds, paddr,
                                                           &should_free);
@@ -5161,17 +5215,31 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
      * true; }` fallback is removed. The capacity pre-check above
      * already guarantees overwrite_cold_block will not return
      * STM_ENOSPC mid-bookend. */
+    /* 9.7-impl-6d: clone-path dispatch on cold-tier hashes. Clone
+     * datasets route each dropped content_hash to the SPECIFIC origin
+     * snap's cold_dead_list via the per-snap append API (6b); non-
+     * clone datasets stay on the legacy most-recent-of-dataset path.
+     * The origin snap's cold_dead_list holds the deref obligation
+     * across the snap's lifetime — no direct cas_deref on the clone
+     * path. */
     if (s->cas_idx && cox.n_hashes > 0) {
+        uint64_t origin_snap_id = sync_dataset_origin_snap_id_locked(s, dataset_id);
         for (size_t i = 0; i < cox.n_hashes; i++) {
             const uint8_t *h = cox.hashes + i * STM_CAS_HASH_LEN;
-            bool should_deref = false;
-            stm_status srs = stm_snapshot_index_overwrite_cold_block(
-                    s->snap_idx, dataset_id, h, &should_deref);
-            if (srs == STM_OK && should_deref) {
-                stm_status crs = stm_cas_deref(s->cas_idx, h);
-                if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
-            } else if (srs != STM_OK && drop_err == STM_OK) {
-                drop_err = srs;
+            if (origin_snap_id != 0) {
+                stm_status srs = stm_snapshot_index_add_to_snap_cold_dead_list(
+                        s->snap_idx, origin_snap_id, h);
+                if (srs != STM_OK && drop_err == STM_OK) drop_err = srs;
+            } else {
+                bool should_deref = false;
+                stm_status srs = stm_snapshot_index_overwrite_cold_block(
+                        s->snap_idx, dataset_id, h, &should_deref);
+                if (srs == STM_OK && should_deref) {
+                    stm_status crs = stm_cas_deref(s->cas_idx, h);
+                    if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
+                } else if (srs != STM_OK && drop_err == STM_OK) {
+                    drop_err = srs;
+                }
             }
         }
     }
@@ -6039,17 +6107,29 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
      * locked's bookend — see that function for the contract.
      * P7-CAS-4 R54 P3-1: dead else-fallback removed; s->snap_idx is
      * unconditionally created. */
+    /* 9.7-impl-6d: same clone-path dispatch as the write-extent
+     * bookend — clone datasets route through the per-snap cold-tier
+     * append API to the SPECIFIC origin snap; non-clone datasets stay
+     * on the legacy most-recent-of-dataset path. See write-extent
+     * site for the full rationale. */
     if (s->cas_idx && tcox.n_hashes > 0) {
+        uint64_t origin_snap_id = sync_dataset_origin_snap_id_locked(s, dataset_id);
         for (size_t i = 0; i < tcox.n_hashes; i++) {
             const uint8_t *h = tcox.hashes + i * STM_CAS_HASH_LEN;
-            bool should_deref = false;
-            stm_status srs = stm_snapshot_index_overwrite_cold_block(
-                    s->snap_idx, dataset_id, h, &should_deref);
-            if (srs == STM_OK && should_deref) {
-                stm_status crs = stm_cas_deref(s->cas_idx, h);
-                if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
-            } else if (srs != STM_OK && drop_err == STM_OK) {
-                drop_err = srs;
+            if (origin_snap_id != 0) {
+                stm_status srs = stm_snapshot_index_add_to_snap_cold_dead_list(
+                        s->snap_idx, origin_snap_id, h);
+                if (srs != STM_OK && drop_err == STM_OK) drop_err = srs;
+            } else {
+                bool should_deref = false;
+                stm_status srs = stm_snapshot_index_overwrite_cold_block(
+                        s->snap_idx, dataset_id, h, &should_deref);
+                if (srs == STM_OK && should_deref) {
+                    stm_status crs = stm_cas_deref(s->cas_idx, h);
+                    if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
+                } else if (srs != STM_OK && drop_err == STM_OK) {
+                    drop_err = srs;
+                }
             }
         }
     }
