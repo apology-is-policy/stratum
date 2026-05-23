@@ -650,8 +650,14 @@ tree uses `STM_BPTR_KIND_DATASET = 9` (added in P6-clone).
       against the snapshot's captured triple. Every write op
       refuses STM_EROFS via a synth-ino gate at the public entry.
       Scope: namespace + lookup + stat + readdir + readlink + INLINE
-      file read. EXTENT (regular-file > 100B) read returns
-      STM_ENOTSUPPORTED forward-noted to **9.7-impl-5b**.
+      file read. EXTENT (regular-file > 100B) read shipped at
+      **9.7-impl-5b** via `stm_extent_index_lookup_at_root` (sibling
+      of the impl-5 throwaway-engine primitives) + a shared
+      `sync_decrypt_extent_record_locked` helper (the AEAD-decrypt
+      body factored out of `stm_sync_read_extent_locked`) + a
+      public `stm_sync_read_extent_at_snap`. HOT + COLD decrypt
+      paths both work; size-clamp at fs.c masks block-padding past
+      EOF.
 - [ ] Snapshot send/recv via birth-txg incremental diffs — Phase 7.
 
 ## Known caveats

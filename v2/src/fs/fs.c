@@ -1849,23 +1849,51 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
-    /* 9.7-impl-5: synth-ino read. v1.0 scope: INLINE-only. Inline
-     * data lives in the inode value; one frozen-tree inode lookup
-     * yields the bytes — no extent walk, no AEAD decrypt of separate
-     * data blocks. EXTENT regular files (size > 100 bytes) currently
-     * return STM_ENOTSUPPORTED with a forward-note to impl-5b. Dirs
-     * surface STM_EISDIR; other non-REG kinds STM_EINVAL (same shape
-     * as the live `stm_fs_read` for non-REG targets). */
+    /* 9.7-impl-5 (INLINE) + 9.7-impl-5b (EXTENT): synth-ino read.
+     *
+     * INLINE data lives in the inode value; one frozen-tree inode
+     * lookup yields the bytes. EXTENT-mode regular files (size > 100
+     * bytes since impl-5b) route through stm_sync_read_extent_at_snap
+     * with the snapshot's captured triple. Dirs surface STM_EISDIR;
+     * other non-REG kinds STM_EINVAL (same shape as the live
+     * `stm_fs_read` for non-REG targets).
+     *
+     * The cross-dataset gate is enforced at fs_synth_snap_lookup —
+     * an attacker constructing a SNAP_VIEW ino for the wrong
+     * dataset_id gets STM_ENOENT before any cipher input flows. */
     if (fs_ino_is_synth(ino)) {
         if (fs_ino_is_snaps_parent(ino)) {
             pthread_rwlock_unlock(&fs->global);
             return STM_EISDIR;
         }
-        struct stm_inode_value iv = {0};
-        stm_status vs = fs_snap_view_stat(fs, dataset_id, ino, &iv);
-        if (vs != STM_OK) {
+        /* Resolve the snap entry triple AND the frozen inode value
+         * in one branch — both EXTENT and INLINE paths need the
+         * inode's mode + size; EXTENT also needs the triple. */
+        uint64_t snap_id    = fs_synth_snap_id(ino);
+        uint64_t frozen_ino = fs_synth_frozen_ino(ino);
+        if (snap_id == 0u || frozen_ino == 0u) {
             pthread_rwlock_unlock(&fs->global);
-            return vs;
+            return STM_EINVAL;
+        }
+        stm_snapshot_entry e;
+        stm_status ss = fs_synth_snap_lookup(fs, dataset_id, snap_id, &e);
+        if (ss != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ss;
+        }
+        stm_inode_index *snap_iidx = stm_sync_inode_index(fs->sync);
+        if (!snap_iidx) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+        struct stm_inode_value iv = {0};
+        stm_status is = stm_inode_lookup_at_root(snap_iidx, dataset_id,
+                                                    e.tree_root_paddr,
+                                                    e.root_gen, e.root_csum,
+                                                    frozen_ino, &iv);
+        if (is != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return is;
         }
         uint32_t smode = stm_load_le32(iv.si_mode);
         if ((smode & (uint32_t)S_IFMT) == (uint32_t)S_IFDIR) {
@@ -1876,15 +1904,15 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             pthread_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
+        uint64_t cur_size = stm_load_le64(iv.si_size);
+        if (off >= cur_size) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_OK;                 /* EOF — *out_read stays 0 */
+        }
         if (iv.si_data_kind == STM_DATA_INLINE) {
-            uint64_t cur_size = stm_load_le64(iv.si_size);
             if (iv.si_data_len > STM_INODE_INLINE_MAX) {
                 pthread_rwlock_unlock(&fs->global);
                 return STM_ECORRUPT;
-            }
-            if (off >= cur_size) {
-                pthread_rwlock_unlock(&fs->global);
-                return STM_OK;             /* EOF — *out_read stays 0 */
             }
             size_t avail = (size_t)(cur_size - off);
             size_t copy_n = (len < avail) ? len : avail;
@@ -1895,11 +1923,31 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             pthread_rwlock_unlock(&fs->global);
             return STM_OK;
         }
-        /* EXTENT (regular files > 100 bytes) — forward-noted to
-         * 9.7-impl-5b. Surface STM_ENOTSUPPORTED so callers see the
-         * gap clearly. */
+        if (iv.si_data_kind == STM_DATA_EXTENT) {
+            /* 9.7-impl-5b: throwaway-engine extent lookup against the
+             * snapshot's captured triple + shared AEAD decrypt path.
+             * sync's contract demands UB-aligned off; the caller's
+             * loop (9P client iounit) provides this. Clamp the
+             * returned slice by the frozen inode's si_size so reads
+             * don't surface block-padding bytes past EOF (R76 P2-1
+             * carry — same posture as fs_read_regular_locked). */
+            size_t got = 0;
+            stm_status rs = stm_sync_read_extent_at_snap(
+                    fs->sync, dataset_id,
+                    e.tree_root_paddr, e.root_gen, e.root_csum,
+                    frozen_ino, off, buf, len, &got);
+            if (rs == STM_OK) {
+                uint64_t logical_avail = cur_size - off;
+                if ((uint64_t)got > logical_avail) {
+                    got = (size_t)logical_avail;
+                }
+                if (out_read) *out_read = got;
+            }
+            pthread_rwlock_unlock(&fs->global);
+            return rs;
+        }
         pthread_rwlock_unlock(&fs->global);
-        return STM_ENOTSUPPORTED;
+        return STM_EINVAL;
     }
 
     /* Same dispatch shape as fs_write. */

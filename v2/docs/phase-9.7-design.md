@@ -680,7 +680,7 @@ saturation: snap_id ≥ 2^31 OR frozen_ino ≥ 2^32 → fs_synth_encode refuses
 - `stm_fs_readdir` on SNAP_VIEW dir → `stm_dirent_readdir_at_root` + per-entry child_ino translation to SNAP_VIEW(snap_id, frozen_child).
 - `stm_fs_readlink` on SNAP_VIEW symlink → frozen-tree inode lookup + symlink_target copy.
 - `stm_fs_read` on SNAP_VIEW INLINE-mode file → reads inline_data directly from the frozen inode value.
-- `stm_fs_read` on SNAP_VIEW EXTENT-mode file → STM_ENOTSUPPORTED (forward-noted to **9.7-impl-5b**; needs throwaway-engine extent-record lookup + AEAD decrypt against the frozen extent record).
+- `stm_fs_read` on SNAP_VIEW EXTENT-mode file → throwaway-engine extent record lookup + AEAD-decrypt (HOT + COLD paths) — see §8.2 for the as-built. (Pre-9.7-impl-5b returned STM_ENOTSUPPORTED.)
 - `stm_fs_read` on SNAP_VIEW dir → STM_EISDIR (matches POSIX).
 - Other op kinds (xattr read, file handles, locks) — not surfaced for v1.0; future v1.x.
 
@@ -692,8 +692,33 @@ saturation: snap_id ≥ 2^31 OR frozen_ino ≥ 2^32 → fs_synth_encode refuses
 
 **Out of scope (forward-noted)**:
 
-- **9.7-impl-5b** — EXTENT-mode file content reads. Adds throwaway-engine extent lookup + AEAD decrypt against the frozen extent record. The decrypt logic is shared with `stm_sync_read_extent_locked`; the only new code is the throwaway record-lookup + a sync-layer `_at_snap` variant.
 - **v1.x** — snap-bound 9p Tattach (`aname = dataset@snap`), per-fid hold-bumping, xattr reads, name_to_handle / open_by_handle on snap-view, advisory locks on snap-view inodes.
+
+### 8.2 — As-built note (9.7-impl-5b)
+
+**Status (2026-05-23):** EXTENT-mode file content reads on `.snaps/<name>/` are live. The impl-5 STM_ENOTSUPPORTED stub is retired.
+
+**Three new pieces of plumbing**:
+
+1. **`stm_extent_index_lookup_at_root` (extent.h / extent_index.c)** — throwaway-engine single-key extent lookup. Bounds the scan to the per-ino EXTENT subspace (whole-ino range; the LE-encoded `off` does NOT lex-sort as integer order across byte boundaries, so per-ino is the smallest correct bound) and applies the offset-covers-probe check in the adapter. `extent.tla::NoOverlapWithinIno` guarantees the first match is the only match, so the adapter terminates at the first hit. Decoder gates inherit verbatim from the live `stm_extent_lookup_at`: every record is decoded under the engine's Merkle + AEAD-AD gates.
+
+2. **`sync_decrypt_extent_record_locked` (sync.c, static)** — the slice-arithmetic + AEAD-decrypt body extracted from `stm_sync_read_extent_locked`. Takes a decoded `stm_extent_record` + `off` + `buf` + `len` and dispatches through the existing HOT path (per-dataset DEK lookup keyed by `rec.dataset_id` + `rec.key_id`; AEAD-AD reconstructed from `origin_*` per P7-16) or COLD path (CAS lookup + `metadata_key` decrypt under `stm_ad_cas`). Used by both the live `stm_sync_read_extent_locked` AND the new snap-view variant — single AEAD-decrypt implementation across the live + snap-view surfaces. The COLD promote-read-hit bump stays in the live caller (it targets the LIVE `extent_idx` heuristic at the LIVE key; meaningless for a frozen-view read).
+
+3. **`stm_sync_read_extent_at_snap` (sync.h)** — public sync API that takes the snapshot's captured `(root_paddr, root_gen, root_csum)` triple + frozen `ino` + UB-aligned `off`, calls `stm_extent_index_lookup_at_root`, dispatches through `sync_decrypt_extent_record_locked`. STM_ENOENT → hole zero-fill (mirrors the live path); STM_OK → decrypted slice. Holds `s->lock` for the call; refuses on wedged with STM_EWEDGED.
+
+**fs.c wiring** (the `if (fs_ino_is_synth(ino))` branch in `stm_fs_read`): resolves the snap entry (the cross-dataset gate at `fs_synth_snap_lookup` still applies), looks up the frozen inode value via `stm_inode_lookup_at_root`, validates mode/kind/size, then routes EXTENT-mode files through `stm_sync_read_extent_at_snap` with a post-read `cur_size` clamp (R76 P2-1 carry — block-padding bytes past EOF are masked to match the INLINE branch's POSIX-EOF semantics).
+
+**Lifetime + concurrency**: still under `fs->global` SH for the full read. The snap entry → throwaway engine open → record decrypt → engine close is a single sequence with no fs->global drops. No new locks; same posture as impl-5.
+
+**Cross-dataset defense-in-depth** carries verbatim: the SNAP_VIEW ino encodes snap_id but NOT dataset_id; `fs_synth_snap_lookup` refuses on mismatch BEFORE any cipher input flows. The engine's `tree_id = dataset_id` AEAD-AD binding is a second defense at the cipher layer — a wrong-dataset triple is structurally refused at engine open with STM_EBADTAG.
+
+**Performance posture**: inherits the live read path's "decrypt the whole extent into a temp buffer + memcpy the slice" cost profile. A 500 KB extent serving an 8 KB read decrypts 60× more bytes than asked; the same per-extent decrypt cache forward-noted at SWISS-4q would lift this for both live + snap-view reads.
+
+**No STM_UB_VERSION bump** (no on-disk format change).
+
+**Tests (test_fs)**: `snap_view_extent_read_hot_block` (replaces the impl-5 STM_ENOTSUPPORTED test), `snap_view_extent_read_multi_block`, `snap_view_extent_read_cold_block`, `snap_view_extent_read_unaffected_by_post_snap_writes`. Together they prove the throwaway-engine lookup resolves the right extent at multi-block offsets; the COLD path produces the expected plaintext under the snap's frozen content_hash; and post-snap writes to the live dataset don't change the snap-view's read result.
+
+**Out of scope (forward-noted)** — same surfaces as impl-5: snap-bound 9p Tattach, per-fid hold-bumping, xattr reads, name_to_handle / open_by_handle on snap-view, advisory locks. Add when v1.x callers need them.
 
 ## 9 — Clones (impl-6)
 

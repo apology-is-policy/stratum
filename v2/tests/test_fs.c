@@ -9040,10 +9040,12 @@ STM_TEST(snap_view_inline_read_returns_frozen_bytes) {
     unlink(g_tmp_path);
 }
 
-/* EXTENT-file read on a snap-view returns STM_ENOTSUPPORTED at v1.0
- * (forward-noted to impl-5b). Stat still works — caller sees the
- * correct size. */
-STM_TEST(snap_view_extent_read_returns_not_supported) {
+/* 9.7-impl-5b: EXTENT-mode file read on a snap-view returns the
+ * frozen ciphertext, decrypted under the SAME AEAD-AD as the live
+ * read path. Single-block (4 KiB) HOT case — caller asks for the
+ * full block at offset 0; the impl-5b throwaway-engine lookup +
+ * shared decrypt helper return the frozen bytes. */
+STM_TEST(snap_view_extent_read_hot_block) {
     make_tmp("snap_view_extent");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -9072,17 +9074,189 @@ STM_TEST(snap_view_extent_read_returns_not_supported) {
     STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
                                     (const uint8_t *)"big", 3, &snap_big));
 
-    /* Stat works — size is frozen 4096. */
+    /* Stat: frozen size 4096, EXTENT kind. */
     struct stm_inode_value iv = {0};
     STM_ASSERT_OK(stm_fs_stat(fs, 1, snap_big, &iv));
     STM_ASSERT_EQ(stm_load_le64(iv.si_size), 4096u);
     STM_ASSERT_EQ(iv.si_data_kind, STM_DATA_EXTENT);
 
-    /* Read deferred. */
-    uint8_t rbuf[16];
+    /* impl-5b read: full block at offset 0 — every byte must equal 0xAB. */
+    uint8_t rbuf[4096];
+    memset(rbuf, 0, sizeof rbuf);
     size_t got = 0;
-    STM_ASSERT_ERR(stm_fs_read(fs, 1, snap_big, 0, rbuf, sizeof rbuf, &got),
-                       STM_ENOTSUPPORTED);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, snap_big, 0, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, sizeof rbuf);
+    for (size_t i = 0; i < sizeof rbuf; i++) {
+        STM_ASSERT_EQ(rbuf[i], 0xABu);
+    }
+
+    /* Read past EOF returns STM_OK with got = 0 (size clamp). */
+    got = 0xdeadbeef;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, snap_big, 4096u, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* 9.7-impl-5b: multi-block EXTENT read — write 16 KiB, snapshot, read
+ * each block at successive 4 KiB offsets. Verifies the throwaway-engine
+ * lookup_at_root correctly resolves the covering extent for any block
+ * in a multi-block file, and the size clamp at fs.c surfaces the right
+ * bytes per offset. */
+STM_TEST(snap_view_extent_read_multi_block) {
+    make_tmp("snap_view_extent_multi");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"q", 1,
+                                        0644u, 0, 0, &ino));
+    /* 16 KiB plaintext — 4 blocks at the 4 KiB UB size. Each block's
+     * leading 4 bytes encode its block index so we can verify the read
+     * returned the right bytes. */
+    enum { TOTAL = 16384, BLK = 4096 };
+    uint8_t pt[TOTAL];
+    for (size_t i = 0; i < TOTAL; i++) pt[i] = (uint8_t)((i * 7u + 3u) & 0xFFu);
+    for (uint32_t b = 0; b < TOTAL / BLK; b++) {
+        memcpy(pt + b * BLK, &b, sizeof b);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, pt, TOTAL));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "mb", 2, &snap_id));
+
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"mb", 2, &snap_root));
+    uint64_t snap_q = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"q", 1, &snap_q));
+
+    uint8_t rbuf[BLK];
+    for (uint32_t b = 0; b < TOTAL / BLK; b++) {
+        memset(rbuf, 0xCD, sizeof rbuf);
+        size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, snap_q, (uint64_t)b * BLK,
+                                       rbuf, sizeof rbuf, &got));
+        STM_ASSERT_EQ(got, sizeof rbuf);
+        uint32_t got_idx = 0;
+        memcpy(&got_idx, rbuf, sizeof got_idx);
+        STM_ASSERT_EQ(got_idx, b);
+        STM_ASSERT(memcmp(rbuf + sizeof b, pt + b * BLK + sizeof b,
+                              BLK - sizeof b) == 0);
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* 9.7-impl-5b: COLD-mode read from a snap — migrate the file to COLD
+ * BEFORE the snapshot so the snap captures the COLD record, then read
+ * via the snap-view. The COLD decrypt path (CAS lookup +
+ * metadata_key AEAD under stm_ad_cas) MUST yield the original
+ * plaintext exactly. */
+STM_TEST(snap_view_extent_read_cold_block) {
+    make_tmp("snap_view_extent_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"c", 1,
+                                        0644u, 0, 0, &ino));
+    uint8_t pat[4096];
+    memset(pat, 0x5A, sizeof pat);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, pat, sizeof pat));
+    /* Migrate the file's extent to the COLD/CAS tier; the snap below
+     * captures the COLD record. */
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, ino));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "cd", 2, &snap_id));
+
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"cd", 2, &snap_root));
+    uint64_t snap_c = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"c", 1, &snap_c));
+
+    uint8_t rbuf[4096];
+    memset(rbuf, 0, sizeof rbuf);
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, snap_c, 0, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, sizeof rbuf);
+    for (size_t i = 0; i < sizeof rbuf; i++) STM_ASSERT_EQ(rbuf[i], 0x5Au);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* 9.7-impl-5b: post-snap writes to the LIVE dataset must NOT change
+ * the snap-view's read result. Composes against snapshot.tla's
+ * TreeRootImmutable + extent.tla's NoOverlapWithinIno + the COW
+ * invariant that overwrites allocate fresh paddrs. */
+STM_TEST(snap_view_extent_read_unaffected_by_post_snap_writes) {
+    make_tmp("snap_view_extent_post_write");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, 1, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &ino));
+    uint8_t pre[4096];
+    memset(pre, 0x11, sizeof pre);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, pre, sizeof pre));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "pre", 3, &snap_id));
+
+    /* Mutate the LIVE file post-snap. */
+    uint8_t post[4096];
+    memset(post, 0x22, sizeof post);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, post, sizeof post));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Snap-view still reads 0x11 — the captured triple points at the
+     * pre-overwrite extent's tree, which the COW path preserved. */
+    uint64_t snap_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"pre", 3, &snap_root));
+    uint64_t snap_f = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, snap_root,
+                                    (const uint8_t *)"f", 1, &snap_f));
+
+    uint8_t rbuf[4096];
+    memset(rbuf, 0, sizeof rbuf);
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, snap_f, 0, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, sizeof rbuf);
+    for (size_t i = 0; i < sizeof rbuf; i++) STM_ASSERT_EQ(rbuf[i], 0x11u);
+
+    /* Belt-and-braces: live reads 0x22. */
+    memset(rbuf, 0, sizeof rbuf);
+    got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, ino, 0, rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, sizeof rbuf);
+    for (size_t i = 0; i < sizeof rbuf; i++) STM_ASSERT_EQ(rbuf[i], 0x22u);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);

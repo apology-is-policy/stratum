@@ -2840,3 +2840,107 @@ stm_status stm_extent_index_collect_engine_cold_records_at(
     if (rc != STM_OK) return rc;
     return gc.err;   /* a per-value decode failure inside the adapter */
 }
+
+/* ------------------------------------------------------------------ */
+/* 9.7-impl-5b: snap-view EXTENT-mode file content reads — single-key  */
+/* offset-covering lookup against a throwaway engine at the snapshot's */
+/* captured (tree_root_paddr, root_gen, root_csum) triple.             */
+/*                                                                      */
+/* Same shape as the live stm_extent_lookup_at (the offset-covering    */
+/* sweep over an ino's per-key range), but the underlying engine is    */
+/* opened ad-hoc against a frozen root rather than the dataset's live  */
+/* root. The decode discipline (ex_decode_value's full R71/R77 gates)  */
+/* carries verbatim — every record is decoded under the engine's       */
+/* Merkle + AEAD-AD gates first.                                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint64_t           probe_off;      /* the off we want to cover     */
+    stm_extent_record  hit;            /* populated on first match     */
+    bool               found;
+    uint64_t           ds;
+    stm_status         err;            /* set on decode failure        */
+} ex_lookup_at_ctx;
+
+static int ex_lookup_at_adapter(const void *k, size_t klen,
+                                  const void *v, size_t vlen,
+                                  void *ctx_) {
+    ex_lookup_at_ctx *gc = ctx_;
+    uint64_t ino = 0, off = 0;
+    stm_status ks = ex_decode_key(k, klen, &ino, &off);
+    if (ks != STM_OK) { gc->err = ks; return 1; }
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = ex_decode_value(v, vlen, gc->ds, ino, off, &r);
+    if (vs != STM_OK) { gc->err = vs; return 1; }
+    /* Range bound below ensures off ≤ probe_off; len check completes
+     * the [r.off, r.off + r.len) containment. The first match wins —
+     * extent.tla::NoOverlapWithinIno guarantees at most one. */
+    if (gc->probe_off >= r.off && gc->probe_off < r.off + r.len) {
+        gc->hit = r;
+        gc->found = true;
+        return 1;       /* stop — no other extent can cover probe_off */
+    }
+    return 0;
+}
+
+stm_status stm_extent_index_lookup_at_root(stm_extent_index *idx,
+                                              uint64_t dataset_id,
+                                              uint64_t root_paddr,
+                                              uint64_t root_gen,
+                                              const uint8_t root_csum[32],
+                                              uint64_t ino, uint64_t off,
+                                              stm_extent_record *out_extent) {
+    if (!idx || !out_extent) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    if (idx->ds_idx == NULL) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+
+    /* Bound the scan to the per-ino EXTENT subspace. The key encoding
+     * is `kind_tag || ino_le || off_le` — lex compare of the off_le
+     * tail does NOT match integer order across byte boundaries (e.g.,
+     * off=256 encodes to bytes [00 01 ...] which lex-sorts BEFORE
+     * off=5's [05 00 ...] despite the integer order), so we cannot
+     * bound the hi end at `ex_encode_key(ino, off)`. We scan the FULL
+     * per-ino range and apply the offset-covers-probe check in the
+     * adapter — same shape as `ex_collect_in_ino_locked`. The
+     * NoOverlapWithinIno invariant (extent.tla) guarantees at most one
+     * record covers any given off, so the first match terminates. */
+    uint8_t lo[EX_KEY_LEN], hi[EX_KEY_LEN];
+    stm_status k1 = ex_encode_key(ino, 0u,         lo);
+    stm_status k2 = ex_encode_key(ino, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK) {
+        must_unlock(lock);
+        return k1 != STM_OK ? k1 : k2;
+    }
+
+    ex_lookup_at_ctx gc = {
+        .probe_off = off,
+        .hit       = {0},
+        .found     = false,
+        .ds        = dataset_id,
+        .err       = STM_OK,
+    };
+    /* Delegate the throwaway-engine open + bounded scan to the dataset
+     * index. Lock order: extent idx->lock (held) -> dataset idx->lock
+     * (taken inside) — matches the _collect_*_at siblings.
+     *
+     * An all-zero triple lands in the "empty dataset" path inside the
+     * dataset-index helper: the scan returns STM_OK with no callback
+     * invocations → gc.found stays false → STM_ENOENT below. */
+    stm_status rc = stm_dataset_index_scan_engine_range_at(
+            idx->ds_idx, dataset_id, root_paddr, root_gen, root_csum,
+            lo, EX_KEY_LEN, hi, EX_KEY_LEN,
+            ex_lookup_at_adapter, &gc);
+    must_unlock(lock);
+    if (rc != STM_OK) return rc;
+    if (gc.err != STM_OK) return gc.err;
+    if (!gc.found) return STM_ENOENT;
+    *out_extent = gc.hit;
+    return STM_OK;
+}

@@ -1221,6 +1221,40 @@ stm_status stm_extent_index_collect_engine_cold_records_at(
                                        stm_extent_cold_record_cb cb,
                                        void *cb_ctx);
 
+/*
+ * 9.7-impl-5b (snap-view EXTENT-mode file content reads): look up the
+ * single extent record covering (frozen_ino, off) inside the frozen
+ * tree at an arbitrary `(root_paddr, root_gen, root_csum)` triple.
+ *
+ * Mechanism: open a throwaway read-only btree_engine at the triple via
+ * stm_dataset_index_scan_engine_range_at, scan the EXTENT subspace
+ * bounded to `ino`, decode each value, and return the first record
+ * whose [rec.off, rec.off + rec.len) contains `off`. STM_ENOENT when
+ * no extent at the ino covers `off` (POSIX hole — the caller's read
+ * branch surfaces zeros).
+ *
+ * `dataset_id` is the EXTENT-key's per-dataset subspace selector AND
+ * the AEAD-AD's tree-id binding — passing the wrong dataset_id is the
+ * confused-deputy attack the cross-dataset gate refuses one layer up
+ * at `fs_synth_snap_lookup`.
+ *
+ * An all-zero triple is the "empty dataset" sentinel — returns
+ * STM_ENOENT (no records). Returns STM_EINVAL on NULL idx /
+ * NULL out_extent / dataset_id == 0 / ino == 0 / extent index's
+ * dataset index unattached, STM_ECORRUPT / STM_EBADTAG on a Merkle /
+ * AEAD / value-decode failure, STM_ENOMEM / device errors otherwise.
+ *
+ * Concurrency: takes the extent index's internal lock for the call.
+ */
+STM_MUST_USE
+stm_status stm_extent_index_lookup_at_root(stm_extent_index *idx,
+                                              uint64_t dataset_id,
+                                              uint64_t root_paddr,
+                                              uint64_t root_gen,
+                                              const uint8_t root_csum[32],
+                                              uint64_t ino, uint64_t off,
+                                              stm_extent_record *out_extent);
+
 #ifdef __cplusplus
 }
 #endif

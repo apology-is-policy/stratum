@@ -1184,6 +1184,56 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                    size_t *out_read);
 
 /*
+ * 9.7-impl-5b: snap-view EXTENT-mode file content read.
+ *
+ * Looks up the EXTENT record covering `(ino, off)` inside the FROZEN
+ * tree at `(root_paddr, root_gen, root_csum)`, AEAD-decrypts the
+ * extent under the SAME HOT-path / COLD-path code path the live
+ * `stm_sync_read_extent` uses, and copies the requested slice to
+ * `buf`. The lookup-vs-decrypt split shares the decrypt body with
+ * the live read (a single AEAD path; no second AEAD implementation
+ * to keep in sync with the write side).
+ *
+ * The throwaway-engine open + Merkle/AEAD-AD validation are the
+ * cross-dataset / tampering / wrong-gen defenses; passing the wrong
+ * `dataset_id` (the AEAD-AD's tree-id binding) is structurally
+ * refused at the engine open layer with STM_EBADTAG.
+ *
+ * Holes (no extent at this `(ino, off)` in the frozen tree) return
+ * STM_OK with `*out_read = len` and the buffer zero-filled — same
+ * shape as the live `stm_sync_read_extent_locked`'s STM_ENOENT
+ * branch. Reads past a record's end inside the same logical inode
+ * (the gap between two extents in the frozen tree) ALSO return zeros
+ * for that slice.
+ *
+ * `count_for_promotion` is FORCED to false: snap views are frozen
+ * and must not dirty the live dataset's promotion-heuristic state.
+ *
+ * MVP constraints (carry from `stm_sync_read_extent`):
+ *   - len > 0.
+ *   - off must be 4 KiB aligned (caller's loop chunks at iounit).
+ *
+ * An all-zero triple is the "empty dataset" sentinel — returns
+ * STM_OK with `*out_read = len` and the buffer zero-filled.
+ *
+ * Returns STM_EINVAL on NULL s / NULL buf / NULL out_read /
+ * dataset_id == 0 / ino == 0 / unaligned off, STM_EWEDGED when the
+ * sync is wedged, STM_ECORRUPT / STM_EBADTAG on a value-decode /
+ * AEAD / Merkle failure, device errors otherwise.
+ *
+ * Thread safety: serialized by sync's internal mutex (same as the
+ * live read variant).
+ */
+STM_MUST_USE
+stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
+                                           uint64_t root_paddr,
+                                           uint64_t root_gen,
+                                           const uint8_t root_csum[32],
+                                           uint64_t ino, uint64_t off,
+                                           void *buf, size_t len,
+                                           size_t *out_read);
+
+/*
  * P7-9: POSIX-shape truncate. Shrinks (dataset_id, ino) to `new_size`
  * bytes.
  *

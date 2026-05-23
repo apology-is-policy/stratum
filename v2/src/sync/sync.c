@@ -5213,6 +5213,14 @@ static uint64_t sync_resolve_promote_decay_window_cached(stm_sync *s,
     return (v != 0u) ? v : STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS;
 }
 
+/* 9.7-impl-5b forward declaration. Definition below
+ * stm_sync_read_extent_locked. */
+static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
+                                                       const stm_extent_record *rec_in,
+                                                       uint64_t off,
+                                                       void *buf, size_t len,
+                                                       size_t *out_read);
+
 static stm_status stm_sync_read_extent_locked(stm_sync *s,
                                                  uint64_t dataset_id, uint64_t ino,
                                                  uint64_t off, void *buf,
@@ -5255,8 +5263,71 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
      * read is 60× wasted work. SWISS-4q's writeback-aggregation
      * layer + a per-extent decrypt cache would address this; for
      * now the simplest-correct path is what users observe vs. the
-     * EINVAL bug they hit at every backend op above iounit size. */
-    if (off < rec.off) return STM_EINVAL;     /* lookup_at invariant violation */
+     * EINVAL bug they hit at every backend op above iounit size.
+     *
+     * 9.7-impl-5b factoring: the slice arithmetic + AEAD decrypt
+     * paths below moved to sync_decrypt_extent_record_locked so the
+     * snap-view read variant can reuse them verbatim. The
+     * count_for_promotion bump stays HERE because it queries the
+     * LIVE extent_idx for the LIVE (ds, ino, off) — meaningless on
+     * a frozen snap-view read. */
+    stm_status ds = sync_decrypt_extent_record_locked(s, &rec, off,
+                                                        buf, len, out_read);
+    if (ds != STM_OK) return ds;
+
+    /* P7-CAS-11: bump the per-COLD-extent read-frequency counter
+     * after every successful decrypt. Best-effort + race-tolerant:
+     * a concurrent overwrite/migrate that removed the record
+     * between lookup and bump returns STM_OK no-op (no record at
+     * (ds, ino, off) anymore). The bump's failure modes are
+     * cosmetic — the policy step downgrades to "less accurate"
+     * decisions, not to corruption. R62 P2-1: gated by
+     * `count_for_promotion` so internal callers (truncate's
+     * prefix re-encrypt) don't dirty heuristic state for a
+     * record they're about to drop.
+     *
+     * P7-CAS-12: the decay window is the dataset's effective
+     * STM_PROP_PROMOTE_DECAY_WINDOW (in txgs) — value 0 falls back
+     * to the compile-time default 1024.
+     *
+     * P7-CAS-14: the lookup goes through the per-sync property
+     * cache (`sync_resolve_promote_decay_window_cached`) — this
+     * avoids the dataset_idx parent-chain walk on every COLD
+     * read for hot-COLD-read workloads. The cache is invalidated
+     * en masse when the dataset_idx's `prop_mutation_gen`
+     * advances (set_property / clear_property / set_pool_default
+     * / move bump it). A failed lookup falls back to the default
+     * per the heuristic-best-effort posture. */
+    if (count_for_promotion && rec.kind == STM_EXTENT_KIND_COLD
+            && *out_read > 0) {
+        uint64_t decay_window =
+                sync_resolve_promote_decay_window_cached(s, dataset_id);
+        (void)stm_extent_record_promote_read_hit(
+                s->extent_idx, dataset_id, ino, off,
+                s->current_gen, decay_window);
+    }
+
+    return STM_OK;
+}
+
+/* 9.7-impl-5b refactor — decrypt a single extent record's
+ * [off, off+len) slice. `rec` may originate from the live tree OR a
+ * frozen snap tree; the decrypt path doesn't care — every cipher
+ * input lives in `rec`, `s->cas_idx`, `s->pool`, `s->metadata_key`,
+ * and `s->deks`. Caller holds s->lock.
+ *
+ * Forward-references stm_sync_read_extent_locked's slice math
+ * verbatim (the function block below was extracted from there). The
+ * COLD promote-read-hit bump stays in the live caller — it queries
+ * `s->extent_idx` for the LIVE `(dataset_id, ino, off)`, which is
+ * meaningless for snap-view reads. */
+static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
+                                                       const stm_extent_record *rec_in,
+                                                       uint64_t off,
+                                                       void *buf, size_t len,
+                                                       size_t *out_read) {
+    stm_extent_record rec = *rec_in;
+    if (off < rec.off) return STM_EINVAL;     /* lookup invariant violation */
     uint64_t slice_off = off - rec.off;
     if (slice_off >= rec.len) {
         /* Past end of this extent — POSIX-EOF for this segment. */
@@ -5360,37 +5431,6 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
         stm_ct_memzero(cpbuf, rec.len);
         free(cpbuf);
 
-        /* P7-CAS-11: bump the per-COLD-extent read-frequency counter
-         * after every successful decrypt. Best-effort + race-tolerant:
-         * a concurrent overwrite/migrate that removed the record
-         * between lookup and bump returns STM_OK no-op (no record at
-         * (ds, ino, off) anymore). The bump's failure modes are
-         * cosmetic — the policy step downgrades to "less accurate"
-         * decisions, not to corruption. R62 P2-1: gated by
-         * `count_for_promotion` so internal callers (truncate's
-         * prefix re-encrypt) don't dirty heuristic state for a
-         * record they're about to drop.
-         *
-         * P7-CAS-12: the decay window is the dataset's effective
-         * STM_PROP_PROMOTE_DECAY_WINDOW (in txgs) — value 0 falls back
-         * to the compile-time default 1024.
-         *
-         * P7-CAS-14: the lookup goes through the per-sync property
-         * cache (`sync_resolve_promote_decay_window_cached`) — this
-         * avoids the dataset_idx parent-chain walk on every COLD
-         * read for hot-COLD-read workloads. The cache is invalidated
-         * en masse when the dataset_idx's `prop_mutation_gen`
-         * advances (set_property / clear_property / set_pool_default
-         * / move bump it). A failed lookup falls back to the default
-         * per the heuristic-best-effort posture. */
-        if (count_for_promotion) {
-            uint64_t decay_window =
-                    sync_resolve_promote_decay_window_cached(s, dataset_id);
-            (void)stm_extent_record_promote_read_hit(
-                    s->extent_idx, dataset_id, ino, off,
-                    s->current_gen, decay_window);
-        }
-
         *out_read = slice_len;
         return STM_OK;
     }
@@ -5404,8 +5444,15 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
      * means the keyschema entry was pruned while a live extent still
      * referenced it; this is a corruption signal because
      * stm_sync_keyschema_sweep refuses to prune keys with extent
-     * refs. Surface as STM_ECORRUPT to the caller. */
-    sync_dek_slot *rd_slot = sync_dek_find(s, dataset_id, rec.key_id);
+     * refs. Surface as STM_ECORRUPT to the caller.
+     *
+     * 9.7-impl-5b: `rec.dataset_id` (stamped by ex_decode_value from
+     * the caller-provided dataset arg at lookup time) is the live
+     * dataset's id for both live + snap-view reads — every snap is a
+     * captured view of ITS dataset, so the dataset's CURRENT DEK
+     * map is the right key store regardless of which root the
+     * record came from. */
+    sync_dek_slot *rd_slot = sync_dek_find(s, rec.dataset_id, rec.key_id);
     if (!rd_slot) return STM_ECORRUPT;
     uint8_t dek[32];
     memcpy(dek, rd_slot->dek, 32);
@@ -5510,6 +5557,65 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     stm_status rc = stm_sync_read_extent_locked(s, dataset_id, ino,
                                                    off, buf, len, out_read,
                                                    /*count_for_promotion=*/true);
+    pthread_mutex_unlock(&s->lock);
+    return rc;
+}
+
+/* 9.7-impl-5b: snap-view EXTENT-mode file content read — the
+ * throwaway-engine sibling of stm_sync_read_extent_locked. Looks up
+ * the covering extent in a frozen tree at `(root_paddr, root_gen,
+ * root_csum)` and dispatches through the SHARED decrypt helper. The
+ * COLD promote-read-hit bump is intentionally omitted (snap reads
+ * must not dirty the LIVE dataset's promotion heuristics — the
+ * counter targets the live extent_idx record at the live key,
+ * meaningless for a frozen view). */
+static stm_status stm_sync_read_extent_at_snap_locked(stm_sync *s,
+                                                        uint64_t dataset_id,
+                                                        uint64_t root_paddr,
+                                                        uint64_t root_gen,
+                                                        const uint8_t root_csum[32],
+                                                        uint64_t ino,
+                                                        uint64_t off,
+                                                        void *buf, size_t len,
+                                                        size_t *out_read) {
+    stm_extent_record rec;
+    stm_status ls = stm_extent_index_lookup_at_root(s->extent_idx, dataset_id,
+                                                       root_paddr, root_gen,
+                                                       root_csum,
+                                                       ino, off, &rec);
+    if (ls == STM_ENOENT) {
+        /* Hole in the frozen tree — zero-fill the slice. Mirrors the
+         * live read path's hole-as-zeros contract. */
+        memset(buf, 0, len);
+        *out_read = len;
+        return STM_OK;
+    }
+    if (ls != STM_OK) return ls;
+    return sync_decrypt_extent_record_locked(s, &rec, off, buf, len, out_read);
+}
+
+stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
+                                           uint64_t root_paddr,
+                                           uint64_t root_gen,
+                                           const uint8_t root_csum[32],
+                                           uint64_t ino, uint64_t off,
+                                           void *buf, size_t len,
+                                           size_t *out_read) {
+    if (!s || !buf || !out_read) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if (len == 0) { *out_read = 0; return STM_OK; }
+    if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
+
+    *out_read = 0;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+
+    stm_status rc = stm_sync_read_extent_at_snap_locked(s, dataset_id,
+                                                          root_paddr, root_gen,
+                                                          root_csum,
+                                                          ino, off, buf, len,
+                                                          out_read);
     pthread_mutex_unlock(&s->lock);
     return rc;
 }
