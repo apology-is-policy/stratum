@@ -38,8 +38,77 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: 9.7-impl-5 — readable `.snaps/<name>/` mount surface — in
-  flight. Synthetic `.snaps` dir at every dataset's root inode;
+- **Tip**: 9.7-impl-6f — clone integration tests + two bug fixes
+  uncovered at test time, closes the 9.7-impl-6 umbrella. Eight new
+  tests in `tests/test_fs_clone.c` exercise the v1.0 clone surface
+  end-to-end: triple round-trip (`fs_clone_create_basic`), share-root
+  reads (`fs_clone_share_root_reads`), COW divergence
+  (`fs_clone_cow_divergence`), arg-validation matrix
+  (`fs_clone_create_arg_validation`), snap-of-clone refusal
+  (`fs_clone_snap_of_clone_refused`), origin-snap-undeletable-while-
+  clone-exists (`fs_clone_origin_snap_undeletable_with_clone`),
+  rollback cascade clone gate
+  (`fs_clone_rollback_refused_with_clone_on_newer_snap`), and the v1.0
+  promote stub (`fs_clone_promote_clone_refused_v1`). Two bugs the
+  share-root reads + the rollback-cascade tests uncovered, fixed
+  inline: **(a)** `stm_dataset_create_clone`'s R32 P2-2 "self-reference"
+  check refused when `origin_snap_id == idx->next_id` numerically —
+  namespace-confused (snap_ids and dataset_ids live in SEPARATE
+  counters; a numerical coincidence is not a structural self-reference).
+  Removed; `clone.tla::CloneCreate` has no analogous guard. **(b)**
+  `sync_dek_find` in the read + scrub paths used `rec.dataset_id`
+  (= live caller's id = clone_id for a clone read of a shared extent),
+  not `rec.origin_dataset_id` (= the writer's id). Bytes were
+  encrypted under the writer's DEK; using the live caller's DEK map
+  missed the right key + surfaced STM_EBADTAG on clone reads of
+  unwritten extents. Switched both sites (sync.c:5614 read + 8613
+  scrub) to use `rec.origin_dataset_id` — non-clone reads are
+  identical (origin == live), clone-shared reads now resolve the
+  origin's DEK transparently. The AEAD-AD reconstruction at line 5652
+  already used `rec.origin_*` for the same reason; this aligns the
+  DEK lookup with that doctrine. No STM_UB_VERSION bump; no spec
+  change. ctest excl. flake **64/64 GREEN** in ~134s.
+  - **9.7-impl-6e** (`b071cea`): public clone surface lands.
+    `stm_fs_create_clone(fs, parent_id, name, origin_snap_id,
+    *out_clone_id)` composes `stm_dataset_create_clone` +
+    `stm_snapshot_hold(origin)` + `stm_dataset_index_set_engine_root`
+    (the share-root mechanism per §9.1.2) +
+    `stm_sync_add_dataset_key`. Held under `fs->global` EX with full
+    rollback chain (release + destroy) on any post-create failure.
+    Snap-of-clone refused STM_ENOTSUPPORTED at `stm_fs_create_snapshot`
+    BEFORE `stm_sync_commit` (R160 P1-1). Rollback cascade pre-validate
+    refuses STM_EBUSY when any newer snap of the target dataset has
+    clones (closes R165 P2-1 forward-note). `stm_fs_promote_clone`
+    stub returns STM_ENOTSUPPORTED at v1.0; v1.x lifts. Discovery
+    mid-impl: `clone_check_cb` wiring was already done by
+    `sync.c::stm_sync_open` + `stm_sync_create` with correct
+    fail-CLOSED semantics; the design's "fs.c installs at mount"
+    note was historical drift, retired.
+  - **9.7-impl-6a..6d** (`07a34e3` → `8d6fe6c` → `700010b` → `532b3a5`):
+    plumbing for the public surface. 6a refined the design (snap-
+    routing gap + sub-chunking); 6b added three `_add_to_snap_*_dead_list`
+    APIs; 6c added `origin_snap_id` to `engine_store_ctx` + dispatch
+    in `engine_store_free` (boot tier); 6d added the same dispatch in
+    `sync_drop_paddr_locked` (data tier) + cold bookends in
+    `stm_sync_write_extent` / `stm_sync_truncate` (cold tier). Together
+    these route post-clone-write COW drops to the origin snap's
+    per-tier dead-list (preserves AEAD `(paddr, write_gen)` uniqueness
+    across a future origin read of the still-shared extent).
+  - **9.7-impl-5b** (`a4716a4` + R167 close): snap-view EXTENT-mode
+    file content reads — closes the impl-5 forward-note. Three new
+    APIs: `stm_extent_index_lookup_at_root` (throwaway-engine single-
+    key EXTENT lookup), `sync_decrypt_extent_record_locked` (factored
+    AEAD-decrypt body shared with the live read path),
+    `stm_sync_read_extent_at_snap` (public — lookup + decrypt against
+    a frozen triple). fs.c wires the synth-ino EXTENT branch in
+    `stm_fs_read`. R167 P1-1 close: `stm_sync_keyschema_sweep` walks
+    snap-captured extent refs via the new
+    `stm_extent_index_count_key_id_refs_at` API (was newly-reachable
+    soundness gap on rotate→snap→overwrite→sweep→snap-view-read).
+    P2-1 + P3-3 close: NULL root_csum refused with STM_EINVAL at
+    entry of every throwaway-engine API. No STM_UB_VERSION bump.
+  - **9.7-impl-5** — readable `.snaps/<name>/` mount surface.
+    Synthetic `.snaps` dir at every dataset's root inode;
   direct-name lookup-reachable, INVISIBLE in dataset-root readdir at
   v1.0 (matches ZFS `.zfs/snapshot/`). Encoding: bit 63 = synth tag;
   bits 62..32 = snap_id; bits 31..0 = frozen_ino. Reads route through

@@ -904,14 +904,21 @@ stm_status stm_dataset_create_clone(stm_dataset_index *idx,
         return STM_EOVERFLOW;
     }
 
-    /* R32 P2-2: check self-reference BEFORE counter advances. The
-     * about-to-be-allocated id is `idx->next_id`; rejecting here
-     * leaves all in-RAM counters untouched, so we don't need a
-     * rollback path on this branch. */
-    if (origin_snap_id == idx->next_id) {
-        must_unlock(&idx->lock);
-        return STM_EINVAL;
-    }
+    /* 9.7-impl-6f: the R32 P2-2 "self-reference" check that compared
+     * origin_snap_id against idx->next_id is RETIRED. The check was
+     * namespace-confused: snap_ids (stm_snapshot_index counter starting
+     * at 1) and dataset_ids (this index's counter starting at 2) live
+     * in SEPARATE counters, so a numerical coincidence does not
+     * represent a structural self-reference. Real self-reference is
+     * impossible by construction here: the clone's dataset_id is not
+     * known until AFTER this function returns, so origin_snap_id (which
+     * names a snap) can never structurally name the about-to-be-created
+     * clone. The check was false-positive in any production scenario
+     * where the snap counter caught up to or passed the dataset counter
+     * — observed at 6f when `stm_fs_create_snapshot` was called twice on
+     * the root dataset before any child dataset, advancing snap_id past
+     * dataset_id and refusing legitimate clones. dataset.tla::CloneCreate
+     * has no analogous guard. */
 
     if (!is_present_locked(idx, parent_id)) {
         must_unlock(&idx->lock);

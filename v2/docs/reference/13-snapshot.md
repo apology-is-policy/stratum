@@ -498,6 +498,28 @@ queries `stm_dataset_clones_count_for_snap` to enforce
 explicitly un-registered in `stm_sync_close` BEFORE the dataset
 index is freed (R32 P2-1 defensive hygiene).
 
+The fs-layer wrappers that drive the cb live in `12-dataset.md`'s
+"fs-level clone wrappers (9.7-impl-6e)" section:
+`stm_fs_create_clone` takes the snap-hold + stamps the snap's
+captured triple into the clone; `stm_fs_delete_snapshot` is the
+sync.c-cb's gate (refuses STM_EBUSY when clones exist);
+`stm_fs_rollback_snapshot`'s cascade pre-validate (§9.1.6) also
+refuses STM_EBUSY when a newer snap of the target dataset has any
+clone. Snap-of-clone is refused STM_ENOTSUPPORTED at the
+`stm_fs_create_snapshot` entry BEFORE any destructive step
+(R160 P1-1). Integration tests for the full surface live in
+`tests/test_fs_clone.c` (9.7-impl-6f) — eight cases covering
+create / share-root reads / COW divergence / arg validation /
+all three refusals / promote stub.
+
+The sync.c-internal `sync_clone_check_cb` is fail-CLOSED on
+count-lookup error (refuses delete by returning true). A
+historical design note in the 9.7-impl-6 series suggested fs.c
+might install this cb at mount, but as of 9.7-impl-6e the
+sync.c wiring is authoritative; fs.c does NOT install a sibling
+cb (would race + override sync.c's fail-CLOSED with a less-safe
+posture).
+
 ## On-disk encoding (v14+)
 
 ### Key

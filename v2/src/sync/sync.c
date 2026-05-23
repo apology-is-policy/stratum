@@ -5605,13 +5605,21 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
      * stm_sync_keyschema_sweep refuses to prune keys with extent
      * refs. Surface as STM_ECORRUPT to the caller.
      *
-     * 9.7-impl-5b: `rec.dataset_id` (stamped by ex_decode_value from
-     * the caller-provided dataset arg at lookup time) is the live
-     * dataset's id for both live + snap-view reads — every snap is a
-     * captured view of ITS dataset, so the dataset's CURRENT DEK
-     * map is the right key store regardless of which root the
-     * record came from. */
-    sync_dek_slot *rd_slot = sync_dek_find(s, rec.dataset_id, rec.key_id);
+     * 9.7-impl-6f: use rec.origin_dataset_id (= the dataset that
+     * WROTE the extent) instead of rec.dataset_id (= the live caller
+     * — clone_id for a clone read of a shared extent, otherwise the
+     * writer's id). For non-clone reads + snap-view reads the two
+     * are identical (the live caller IS the writer), so this change
+     * preserves the pre-6f behavior for those cases. For CLONE reads
+     * of shared (non-COW'd) extents the two differ: the bytes were
+     * encrypted under the ORIGIN's DEK, so the clone's CURRENT DEK
+     * map would miss the right key and the decrypt fails with
+     * STM_EBADTAG. Using origin_dataset_id makes the per-extent
+     * cross-DEK dispatch self-describing per impl-6e's docstring
+     * claim, and matches the AEAD-AD reconstruction at line 5652
+     * which already uses `rec.origin_*` for the same reason. */
+    sync_dek_slot *rd_slot = sync_dek_find(s, rec.origin_dataset_id,
+                                              rec.key_id);
     if (!rd_slot) return STM_ECORRUPT;
     uint8_t dek[32];
     memcpy(dek, rd_slot->dek, 32);
@@ -8607,10 +8615,17 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
      * extent ref) is impossible by construction: sweep refuses
      * prune with refs, and the unwrap_cb's R42 P1-1 hard-fail on
      * tampered CURRENTs makes mount itself fail. */
+    /* 9.7-impl-6f: scrub verifies against the ORIGIN's DEK (parallel
+     * to the read-path fix at line 5614). The AEAD-AD reconstruction
+     * below at line 8647 already uses rec.origin_dataset_id; the DEK
+     * lookup must match. For non-clone-shared extents origin == live
+     * (no behavior change); for clone-shared extents this is the
+     * difference between scrub OK and a false STM_EBADTAG. */
     uint8_t dek[32];
     {
         pthread_mutex_lock(&s->lock);
-        sync_dek_slot *sl = sync_dek_find(s, rec.dataset_id, rec.key_id);
+        sync_dek_slot *sl = sync_dek_find(s, rec.origin_dataset_id,
+                                              rec.key_id);
         if (!sl) {
             pthread_mutex_unlock(&s->lock);
             return STM_SCRUB_VERIFY_OK;   /* R42 P2-1 race tolerance */
