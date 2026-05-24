@@ -378,13 +378,26 @@ struct stm_btree_engine {
     /* 9.8-LF-1 / 9.8-LF-2: lock-free concurrency substrate.
      *
      * `commit_mu` serialises engine-internal commits (one in-flight
-     * three-phase commit per engine). LF-2 reserves it for the
-     * future concurrent-commit regime; the LF-2 atomic-publish at
-     * commit_finalize relies on atomic-store-release alone and does
-     * not yet take this mutex (the production caller still serialises
-     * commits via its own lock — single-writer regime). When
+     * three-phase commit per engine). LF-2 takes it in the slow-warm
+     * path of `stm_btree_engine_lookup_concurrent` to serialise
+     * multiple concurrent readers' first-descent load_root calls
+     * against each other (double-checked locking). LF-2 commits
+     * themselves still rely on atomic-store-release alone (the
+     * production caller's fs->global EX serialises commits). When
      * LF-BE-prepend's consolidator becomes commit-concurrent with
      * writes, finalize/abort/flush will all acquire this mutex.
+     *
+     * Lock order (R170 P3-2): `commit_mu` sits ABOVE the engine's
+     * store-vtable I/O (`vt->reserve` / `vt->write` / `vt->read` /
+     * `vt->free`) — the slow-warm path holds commit_mu across the
+     * load_root disk-read it triggers. Any future code that takes
+     * commit_mu AND a store-vtable lock MUST preserve this order
+     * (commit_mu outer, vtable inner) — reversal risks deadlock if
+     * a future caller takes the vtable lock then upcalls into a
+     * function that would acquire commit_mu. The bootstrap allocator
+     * is the production vtable (`STM_ENGINE_STORE_VT`); its internal
+     * locks are inside the vtable layer + therefore inside commit_mu
+     * by construction.
      *
      * `next_delta_seq` is the engine-wide monotonic source for
      * `eng_delta::seq` — gives every prepended message a total order

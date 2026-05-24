@@ -193,12 +193,30 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
 /* Resolve the root node, reading it from disk on the first descent of
  * an opened tree.
  *
+ * Threading (9.8-LF-2 R170 P2-4): load_root mutates `eng->root`
+ * non-atomically; callers must ensure no concurrent execution of
+ * load_root against the same engine. Two caller classes today:
+ *   - Serial-path callers (lookup / insert / delete / scan /
+ *     commit_flush) — rely on the fs.c-level `fs->global` EX lock OR
+ *     a test discipline of single-threaded use. They do NOT take
+ *     commit_mu.
+ *   - The slow-warm path inside `stm_btree_engine_lookup_concurrent`
+ *     — holds `eng->commit_mu` across the load_root call, so multiple
+ *     concurrent readers don't trip each other.
+ * At LF-2 the serial and concurrent paths are mutually excluded by
+ * `fs->global`'s EX-vs-SH; they don't actually race. LF-BE-prepend's
+ * concurrent-commit regime will require the serial commit path to
+ * also acquire commit_mu before calling load_root (any new caller
+ * MUST follow the established discipline).
+ *
  * 9.8-LF-2: every code path that sets eng->root to a non-NULL node
  * MUST atomic-store-release that pointer into eng->mvcc_root — this
  * is the single source of root materialisations, so publishing here
  * keeps the (eng->root, eng->mvcc_root) invariant: mvcc_root mirrors
  * eng->root, except briefly inside invalidate_memtree where mvcc_root
- * is cleared FIRST. */
+ * is cleared FIRST. The sole OTHER write site to eng->root + mvcc_root
+ * is the root-grow path in `stm_btree_engine_insert` (which publishes
+ * both fields directly; R170 P2-3). */
 static stm_status load_root(stm_btree_engine *eng, eng_node **out)
 {
     if (eng->root) { *out = eng->root; return STM_OK; }
@@ -371,6 +389,16 @@ stm_status stm_btree_engine_insert(stm_btree_engine *eng,
         spare->children[1] = (eng_child){ .mem = rs.right,
                                           .is_leaf = rs.right->is_leaf };
         eng->root = spare;
+        /* 9.8-LF-2 (R170 P2-3): every eng->root reassignment publishes
+         * mvcc_root release-store. The invariant from engine_internal.h
+         * (mvcc_root mirrors eng->root except briefly inside
+         * invalidate_memtree) holds across root-grow too. At LF-2
+         * production callers hold fs->global EX so concurrent readers
+         * can't be racing here, but the publish keeps the invariant
+         * intact for LF-3+ and for the test surface that bypasses
+         * fs->global. The PRIOR root pointer is now `spare->children[0].mem`
+         * — still alive in the tree, no EBR retire needed. */
+        atomic_store_explicit(&eng->mvcc_root, spare, memory_order_release);
     } else {
         eng_node_free(spare);
     }
@@ -1062,12 +1090,19 @@ stm_status stm_btree_engine_commit_finalize(stm_btree_engine *eng)
      * At LF-2 commit_node mutates eng->root nodes in place (paddr/gen/
      * csum/dirty fields updated; entries/pivots/children-mem fields are
      * NOT touched on resident nodes), so the in-memory root POINTER
-     * value is unchanged across the commit. The publish here is
-     * semantically a release-fence — a concurrent reader's subsequent
-     * acquire-load synchronises-with this store, guaranteeing it
-     * observes every byte the commit_node mutated. At LF-2 there is
-     * no superseded in-memory eng_node pointer (in-place mutation), so
-     * NOTHING goes to stm_ebr_retire here.
+     * value is unchanged across a commit IF no root-grow happened
+     * between commits. A root-grow during an insert (between this
+     * commit and the previous one) reassigns eng->root to a fresh
+     * internal node — `stm_btree_engine_insert` already publishes that
+     * pointer change to mvcc_root at the root-grow site (R170 P2-3),
+     * so this finalize republish is typically idempotent (same
+     * pointer as the prior publish). The publish here is the
+     * release-fence — a concurrent reader's subsequent acquire-load
+     * synchronises-with this store, guaranteeing it observes every
+     * byte commit_node mutated. At LF-2 there is no superseded
+     * in-memory eng_node pointer to retire (the root-grow's prior
+     * root stays alive as the new root's child[0].mem; in-place
+     * commit mutation produces no superseded pointer either).
      *
      * LF-BE-prepend's consolidator will COW the dirty root-to-leaf
      * path producing a FRESH root pointer; at that point the

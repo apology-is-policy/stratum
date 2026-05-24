@@ -262,10 +262,14 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
  * descent. The chain-aware shape becomes load-bearing at 9.8-BE-prepend.
  *
  * Returns STM_EINVAL on NULL `eng` / `ebr` / out params or a NULL
- * `key` with nonzero key_len, STM_EBUSY in the unwarmed window after
- * an invalidate_memtree (failed flush / commit_abort) until the next
- * serial-path op re-materialises the root, STM_ENOMEM / STM_ECORRUPT /
- * device errors otherwise.
+ * `key` with nonzero key_len, STM_ENOMEM / STM_ECORRUPT / device
+ * errors otherwise. STM_EBUSY is not reachable at LF-2 — an
+ * invalidated engine (failed flush / commit_abort) is auto-rewarmed
+ * by the slow-warm path's load_root call inside lookup_concurrent;
+ * a failure of THAT load_root surfaces as STM_ENOMEM (for the
+ * never-committed empty-leaf re-creation branch) OR STM_ECORRUPT /
+ * STM_EBADTAG / device errors (for the disk-read branch when a
+ * durable root exists). (R170 P3-4 carry.)
  *
  * Spec composition:
  *   bepsilon.tla::PerKeyNewestWins — chain walk is LIFO; first

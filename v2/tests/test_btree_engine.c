@@ -3099,16 +3099,19 @@ STM_TEST(engine_lf2_commit_finalize_republishes) {
     stm_ebr_thread_free(me);
 }
 
-/* A failed flush invalidates the in-memory tree (mvcc_root cleared
- * + eng->root NULL'd + cache reset). lookup_concurrent then returns
- * STM_EBUSY (mvcc_root acquire-load is NULL); a subsequent serial-path
- * op re-materialises eng->root + republishes mvcc_root via load_root,
- * after which lookup_concurrent succeeds again.
+/* R170 P2-2 carry: this test (and the body comment at the post-warm
+ * lookup_concurrent below) exercise the post-invalidate slow-warm
+ * path of `lookup_concurrent` for the NEVER-COMMITTED case — a failed
+ * first flush sets `has_durable_root` false + clears `mvcc_root`,
+ * and the next concurrent lookup's slow warm re-creates the empty
+ * leaf via load_root's `!has_durable_root` branch. STM_EBUSY is
+ * unreachable at LF-2 (the slow warm always synchronously materialises
+ * a root OR surfaces an underlying STM_ENOMEM / STM_ECORRUPT). The
+ * sibling test below exercises the disk-read branch of the slow warm.
  *
  * LF-2 LIMITATION (documented in invalidate_memtree): the test is
  * single-threaded — concurrent readers + concurrent invalidate is
- * UAF at LF-2. The recovery sequence (failed-flush → STM_EBUSY →
- * serial re-warm → success) is the test's actual contract. */
+ * UAF at LF-2. */
 STM_TEST(engine_lf2_invalidate_clears_then_serial_rewarms) {
     STM_ASSERT_OK(stm_ebr_init());
     stm_ebr_thread *me = stm_ebr_register();
@@ -3164,23 +3167,104 @@ STM_TEST(engine_lf2_invalidate_clears_then_serial_rewarms) {
     stm_ebr_thread_free(me);
 }
 
-/* The headline LF-2 deliverable: concurrent readers run safely against
- * a concurrent writer doing repeated commits.
+/* R170 P2-2 sibling: invalidate-AFTER-durable-commit exercises the
+ * disk-read branch of load_root under the slow-warm path. The flow:
  *
- * The pre-warmed tree has K entries; T_READER threads loop on
- * lookup_concurrent over a fixed subset of keys; the writer thread
- * loops on (gen++, commit_flush, commit_finalize) — a no-op commit
- * since the tree is clean between writer iterations, but each iteration
- * still exercises the full three-phase + mvcc_root republish path.
+ *   - create + commit a 2-entry tree (durable root persisted).
+ *   - second insert → fail second flush → invalidate_memtree clears
+ *     mvcc_root + drops eng->root, but leaves has_durable_root true
+ *     + the durable-root triple naming the committed tree.
+ *   - lookup_concurrent → slow-warm enters load_root → eng->root is
+ *     NULL + has_durable_root true → DISK-READ branch (the previously-
+ *     uncovered code path engine.c:220-227). load_root reads the
+ *     durable root, publishes mvcc_root, returns.
+ *   - the lookup returns the COMMITTED tree's bytes — the un-flushed
+ *     second insert is correctly lost (revert-to-prior-durable, the
+ *     btree.tla::Crash semantic). */
+STM_TEST(engine_lf2_invalidate_with_durable_root_rewarms_from_disk) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    /* First commit lands the durable root. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "alpha", 5, "one", 3));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "beta",  4, "two", 3));
+    uint64_t rp = 0; uint8_t rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+
+    /* Insert a third key + force the next flush to fail at the FIRST
+     * device write — invalidate_memtree clears mvcc_root + drops
+     * eng->root, but the durable-root triple still names the
+     * first-commit tree. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "gamma", 5, "three", 5));
+    ms.fail_after = 0;
+    uint64_t fp = 0, fg = 0; uint8_t fc[32];
+    stm_status flush_rc = stm_btree_engine_commit_flush(eng, 2, &fp, &fg, fc);
+    STM_ASSERT_TRUE(flush_rc != STM_OK);   /* invalidated */
+
+    /* lookup_concurrent triggers the slow warm → load_root's disk-read
+     * branch (has_durable_root == true). The committed two keys are
+     * visible; the un-flushed third is correctly absent (revert-to-
+     * prior-durable). */
+    bool found = false; void *val = NULL; size_t vl = 0;
+    stm_ebr_enter(me);
+    STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me, "alpha", 5,
+                                                      &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT(val && vl == 3 && memcmp(val, "one", 3) == 0);
+    free(val); val = NULL; vl = 0; found = false;
+
+    STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me, "beta", 4,
+                                                      &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT(val && vl == 3 && memcmp(val, "two", 3) == 0);
+    free(val); val = NULL; vl = 0; found = false;
+
+    /* The un-flushed third key reverted with the failed flush. */
+    STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me, "gamma", 5,
+                                                      &found, &val, &vl));
+    STM_ASSERT_FALSE(found);
+    STM_ASSERT(val == NULL && vl == 0);
+    stm_ebr_exit(me);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
+/* The headline LF-2 deliverable: concurrent readers run safely against
+ * a concurrent writer that DOES exercise the in-place commit-node
+ * mutation arm.
+ *
+ * R170 P2-1 carry: the prior version of this test had the writer
+ * loop on (gen++, commit_flush, commit_finalize) over a CLEAN tree —
+ * count_dirty returned 0, commit_node short-circuited, eng_node_write
+ * was never called. That demonstrated only the trivial same-pointer
+ * republish, not the load-bearing claim ("commit_node mutates
+ * paddr/gen/csum/dirty on resident nodes that readers concurrently
+ * traverse"). Fixed by inserting one fresh key per writer iteration
+ * before each commit, so commit_node walks a dirty leaf (and the
+ * dirty root) on every iteration — readers concurrently descend the
+ * SAME nodes whose paddr/gen/csum the writer is mid-mutating.
+ *
+ * Pre-warmed tree has 300 fixed keys ("lf2-key-NNNNN") that readers
+ * loop over; the writer inserts disjoint "lf2-w-NNNNN" keys. Reader
+ * lookups for the pre-warmed keys must always succeed even as the
+ * writer's inserts COW the root-to-leaf path of unrelated leaves.
  *
  * Spec composition realised:
  *   - concurrency_mvcc.tla::RootAlwaysReachable: the publish at every
- *     finalize is the same pointer at LF-2; readers never see a
- *     dangling root.
- *   - concurrency_mvcc.tla::ReaderObservesCoherentTree: at LF-2 the
- *     trivial case (no retired nodes — in-place mutation has no
- *     superseded pointers); the spec invariant exists in the API
- *     plumbing, will be load-bearing at LF-BE-prepend.
+ *     finalize names a coherent tree. Verified by every reader
+ *     lookup returning STM_OK + found=true.
+ *   - concurrency_mvcc.tla::ReaderObservesCoherentTree: trivially
+ *     at LF-2 (no retire — in-place mutation has no superseded
+ *     pointers); the spec invariant exists in the API plumbing, will
+ *     be load-bearing at LF-BE-prepend.
  *   - "concurrent reads survive concurrent commits without ECORRUPT"
  *     (the LF-2 design-doc deliverable). */
 typedef struct {
@@ -3240,9 +3324,24 @@ static void *lf2_writer_thread(void *arg)
     while (atomic_load_explicit(c->go, memory_order_acquire) == 0u)
         ;
     for (uint32_t i = 0; i < c->iters; i++) {
+        /* R170 P2-1: insert one fresh key per iteration so commit_node
+         * actually walks dirty nodes + calls eng_node_write — readers
+         * concurrently descend nodes whose paddr/gen/csum the writer
+         * is mid-mutating, which is the load-bearing claim of LF-2
+         * (commit_node fields are reader-irrelevant for resident
+         * descents). */
+        char kbuf[32], vbuf[32];
+        int kl = snprintf(kbuf, sizeof kbuf, "lf2-w-%05u", i);
+        int vl = snprintf(vbuf, sizeof vbuf, "w-%05u", i);
+        stm_status s = stm_btree_engine_insert(c->eng, kbuf, (size_t)kl,
+                                                vbuf, (size_t)vl);
+        if (s != STM_OK) {
+            atomic_compare_exchange_strong(c->first_err, &(int){0}, (int)s);
+            return NULL;
+        }
         uint64_t gen = c->start_gen + 1u + (uint64_t)i;
         uint64_t fp = 0, fg = 0; uint8_t fc[32];
-        stm_status s = stm_btree_engine_commit_flush(c->eng, gen, &fp, &fg, fc);
+        s = stm_btree_engine_commit_flush(c->eng, gen, &fp, &fg, fc);
         if (s != STM_OK) {
             atomic_compare_exchange_strong(c->first_err, &(int){0}, (int)s);
             return NULL;

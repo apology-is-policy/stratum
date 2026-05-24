@@ -725,8 +725,8 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 56 cases (47 9.6 + 4 9.8-LF-1 +
-5 9.8-LF-2). 55 run against an in-RAM
+`tests/test_btree_engine.c` — 57 cases (47 9.6 + 4 9.8-LF-1 +
+6 9.8-LF-2). 56 run against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
 can both assert which paddrs were superseded and still open a prior
@@ -749,7 +749,7 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
 | Validation | a value past the inline bound spills (no longer refused); a value over `STM_BTREE_ENGINE_MAX_VALUE_BYTES` and a key too large to fit even a spilled entry → `STM_ERANGE`; NULL-argument matrix |
 | Production vtable (impl-4b-i) | `STM_ENGINE_STORE_VT` over a real `stm_bdev` + `stm_bootstrap`: a 1500-key 2-level tree commits at 16-KiB node granularity, the bitmap is made durable, the bdev + bootstrap close and reopen, the engine reopens at the durable root, verifies, every key looks up, and an incremental commit round-trips |
 | Concurrent reader substrate (9.8-LF-1) | single-level + multilevel concurrent-lookup smoke; NULL-arg matrix + reader-during-flush succeeds (LF-2 contract); 4-thread × 2000-iter pre-warmed multi-reader against a static committed tree exercises the EBR-pinned descent + LIFO chain walk (currently always empty) |
-| mvcc_root publish (9.8-LF-2) | `engine_create` publishes empty leaf for immediate concurrent reads; lazy `engine_open` + first `lookup_concurrent` triggers the slow-warm path under `commit_mu`; `commit_finalize`'s republish synchronises post-commit reader acquire-loads with `commit_node`'s in-place mutations; `invalidate_memtree` clears mvcc_root → `lookup_concurrent` returns STM_EBUSY → serial re-warm recovers; 4-thread × 2000-iter readers concurrent with 100-iter writer doing gen-bump commits on a 300-key pre-warmed tree — no STM_ECORRUPT, no STM_EBUSY, every-lookup-finds-its-key |
+| mvcc_root publish (9.8-LF-2) | `engine_create` publishes empty leaf for immediate concurrent reads; lazy `engine_open` + first `lookup_concurrent` triggers the slow-warm path under `commit_mu`; `commit_finalize`'s republish synchronises post-commit reader acquire-loads with `commit_node`'s in-place mutations; failed-flush-on-never-committed → slow-warm re-creates empty leaf (load_root's `!has_durable_root` branch); failed-flush-AFTER-durable-commit → slow-warm re-reads durable root from disk (load_root's `has_durable_root == true` branch — R170 P2-2 sibling) + the un-flushed insert correctly reverts; 4-thread × 2000-iter readers concurrent with 100-iter writer inserting one fresh key per iteration + commit_flush + commit_finalize on a 300-key pre-warmed tree — readers concurrently descend nodes whose `paddr/gen/csum` the writer is mid-mutating (R170 P2-1 fix: the original test wrote no-op clean commits so commit_node short-circuited; now every iteration walks a dirty leaf + dirty root) — no STM_ECORRUPT, every-lookup-finds-its-key |
 
 ## Status
 
