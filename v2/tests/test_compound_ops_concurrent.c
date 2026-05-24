@@ -1508,4 +1508,586 @@ STM_TEST(impl6_read_write_same_inode_buffered) {
     unlink(g_key_path);
 }
 
+/* ── 9.8-LF-3d: wait-free reader path integration tests ──────────────── */
+/*
+ * Exercises the LF-3b/c-ported reader surfaces against parallel writers
+ * that still take fs->global SH + per-inode pins (impl-5/6). All four
+ * tests assert: no deadlock; no STM_ECORRUPT from the reader; no torn
+ * decode; writer completes its iteration count cleanly.
+ *
+ * Composes against v2/specs/concurrency_mvcc.tla:
+ *   - ReaderObservesCoherentTree: any mvcc_root the reader picks up
+ *     yields a consistent decode of every node it traverses.
+ *   - RootAlwaysReachable: writer's commit-time atomic publish never
+ *     leaves a window where root is NULL.
+ *
+ * **Test scope and the LF-2 "no concurrent writer" caveat**: the engine
+ * layer's LF-2 contract is that mvcc_root is atomic-published on commit
+ * + reader walks one coherent root; but BETWEEN commits the writer's
+ * serial mutation path (stm_inode_set, stm_xattr_set, stm_dirent_insert)
+ * mutates `eng->root`'s tree in place — and mvcc_root mirrors eng->root,
+ * so the reader walking mvcc_root sees writer's in-place mutations.
+ * Same-engine same-instant reader/writer can therefore observe torn
+ * state (STM_ECORRUPT / STM_EBADTAG / phantom records). That race is
+ * EXPLICITLY a BE-prepend (#1218) concern — LF-3 ports the reader
+ * library shape; BE-prepend ports the writer to CAS-prepend so the
+ * reader is fully insulated.
+ *
+ * LF-3d therefore tests reader/writer pairs that do NOT mutate the
+ * same engine concurrently — the wait-free read path is exercised
+ * meaningfully (real EBR, atomic mvcc_root acquire, engine-resolve,
+ * btree descent) without depending on the BE-prepend race-tolerance.
+ *
+ * Tests below:
+ *   1. lf3d_listxattr_stable_vs_chmod_disjoint_inode — listxattr on
+ *      inode A vs chmod on inode B. Disjoint keys; reader's xattr scan
+ *      hits a stable engine.
+ *   2. lf3d_readdir_vs_chmod_child_same_parent — readdir (dirent
+ *      engine read) vs chmod on a child inode (inode engine write).
+ *      Different engines for the writer (inode) vs reader's main path
+ *      (dirent); reader's parent-inode existence check is on a stable
+ *      inode that the writer never touches.
+ *   3. lf3d_read_inline_vs_chmod_same_inode — INLINE-mode read vs
+ *      chmod on the SAME inode. The wait-free path returns STM_ECORRUPT
+ *      under race; stm_fs_read falls back to SH+serial-inode-lookup
+ *      and succeeds. Tests the fallback path (R171 should consider
+ *      back-porting the same fallback to listxattr / stat).
+ *   4. lf3d_getxattr_vs_setxattr_disjoint_inodes — getxattr on a
+ *      stable inode vs setxattr churn on a DIFFERENT inode.
+ *
+ * Per impl-6 doctrine the reader takes NO per-inode pin (it pins via
+ * EBR for memory reclamation only); writer takes SH + per-inode pin
+ * (impl-5). Reader threads MUST run on real OS threads because EBR's
+ * pthread_key destructor + atomic-acquire posture is per-thread.
+ */
+
+#define LF3D_ITERATIONS         200u
+#define LF3D_INLINE_LEN         64u   /* < STM_INODE_INLINE_MAX (100) */
+
+/* ── shared ctx + helper ─────────────────────────────────────────────── */
+
+typedef struct {
+    stm_fs *fs;
+    uint64_t dataset_id;
+    uint64_t ino;
+    unsigned iterations;
+    atomic_int err;
+    atomic_uint completed;
+    atomic_bool done;
+} lf3d_ctx;
+
+static bool lf3d_wait_two(const lf3d_ctx *a, const lf3d_ctx *b,
+                              pthread_t at, pthread_t bt)
+{
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        if (atomic_load(&a->done) && atomic_load(&b->done)) break;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        struct timespec ns = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ns, NULL);
+    }
+    (void)pthread_join(at, NULL);
+    (void)pthread_join(bt, NULL);
+    return true;
+}
+
+/* ── listxattr (xattr engine) vs chmod (inode engine) disjoint inode ── */
+
+/* Disjoint-key reader/writer: reader does listxattr on inode A (with
+ * one seeded xattr — stable for test duration). Writer does chmod on
+ * a DIFFERENT inode B. Both touch the inode-index engine but at
+ * different keys; the writer's per-leaf in-place value-byte mutation
+ * for B does not perturb A's value bytes (the per-inode si_csum field
+ * on A's encoded value stays consistent because A is never written).
+ * The xattr engine is fully stable.
+ *
+ * Same-inode same-engine reader/writer is a DOCUMENTED LF-2 limitation
+ * (mvcc_root mirrors eng->root within a commit cycle; writer's
+ * in-place inode_set mutates the leaf the reader is walking, surfaces
+ * as STM_ECORRUPT from in_validate_value's per-value csum check). The
+ * documented flake `[[flake-per-inode-cfr-concurrent]]` covers the
+ * same race in the impl6 / per_inode tests. BE-prepend (#1218) closes
+ * the gap by porting the writer to CAS-prepend. LF-3d intentionally
+ * tests the disjoint case to validate the wait-free reader's plumbing
+ * without depending on BE-prepend.
+ */
+
+/* Reader: listxattr on a stable inode whose xattr index has exactly
+ * one entry ("user.stable" = 13 bytes including trailing NUL). */
+static void *lf3d_listxattr_reader_thread(void *arg)
+{
+    lf3d_ctx *r = (lf3d_ctx *)arg;
+    uint8_t buf[64];
+    static const size_t EXPECTED_TOTAL = 12u;  /* strlen("user.stable") + 1 */
+    for (unsigned i = 0; i < r->iterations; i++) {
+        size_t total = 0;
+        stm_status rc = stm_fs_listxattr(r->fs, r->dataset_id, r->ino,
+                                            NULL, 0, &total);
+        if (rc != STM_OK) {
+            atomic_store(&r->err, (int)rc);
+            break;
+        }
+        if (total != EXPECTED_TOTAL) {
+            atomic_store(&r->err, -9100);
+            break;
+        }
+        memset(buf, 0, sizeof buf);
+        rc = stm_fs_listxattr(r->fs, r->dataset_id, r->ino,
+                                 buf, sizeof buf, &total);
+        if (rc != STM_OK) {
+            atomic_store(&r->err, (int)rc);
+            break;
+        }
+        if (total != EXPECTED_TOTAL) {
+            atomic_store(&r->err, -9101);
+            break;
+        }
+        if (memcmp(buf, "user.stable\0", 12) != 0) {
+            atomic_store(&r->err, -9102);
+            break;
+        }
+        atomic_fetch_add(&r->completed, 1u);
+    }
+    atomic_store(&r->done, true);
+    return NULL;
+}
+
+/* Writer: chmod loop on the same inode. */
+static void *lf3d_chmod_writer_thread(void *arg)
+{
+    lf3d_ctx *w = (lf3d_ctx *)arg;
+    for (unsigned i = 0; i < w->iterations; i++) {
+        uint32_t mode = 0100600u | (i & 0177u);
+        stm_status rc = stm_fs_chmod(w->fs, w->dataset_id, w->ino, mode);
+        if (rc != STM_OK) {
+            atomic_store(&w->err, (int)rc);
+            break;
+        }
+        atomic_fetch_add(&w->completed, 1u);
+    }
+    atomic_store(&w->done, true);
+    return NULL;
+}
+
+STM_TEST(lf3d_listxattr_stable_vs_chmod_disjoint_inode) {
+    make_tmp("lf3d_listxattr_stable_vs_chmod_disjoint");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "lf3d_lsxattr_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    uint64_t reader_ino = 0, writer_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"a", 1,
+                                        0100644, 0, 0, &reader_ino));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"b", 1,
+                                        0100644, 0, 0, &writer_ino));
+    STM_ASSERT_TRUE(reader_ino != writer_ino);
+
+    /* Seed exactly one xattr on the READER's inode — stable for the
+     * test duration. The writer's inode never receives any xattr. */
+    {
+        const uint8_t name[] = "user.stable";
+        uint8_t name_len = (uint8_t)(sizeof name - 1u);
+        uint8_t value[4];
+        memset(value, 0x33u, sizeof value);
+        STM_ASSERT_OK(stm_fs_setxattr(fs, ds_id, reader_ino, name, name_len,
+                                          value, sizeof value, 0u, NULL));
+    }
+
+    lf3d_ctx wc = { 0 }, rc = { 0 };
+    wc.fs = fs; wc.dataset_id = ds_id; wc.ino = writer_ino;
+    wc.iterations = LF3D_ITERATIONS;
+    rc.fs = fs; rc.dataset_id = ds_id; rc.ino = reader_ino;
+    rc.iterations = LF3D_ITERATIONS;
+
+    pthread_t wt, rt;
+    STM_ASSERT_EQ(0, pthread_create(&wt, NULL, lf3d_chmod_writer_thread, &wc));
+    STM_ASSERT_EQ(0, pthread_create(&rt, NULL, lf3d_listxattr_reader_thread, &rc));
+
+    STM_ASSERT(lf3d_wait_two(&wc, &rc, wt, rt));
+
+    STM_ASSERT_EQ(0, atomic_load(&wc.err));
+    STM_ASSERT_EQ(0, atomic_load(&rc.err));
+    STM_ASSERT_EQ(LF3D_ITERATIONS, atomic_load(&wc.completed));
+    STM_ASSERT_EQ(LF3D_ITERATIONS, atomic_load(&rc.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── readdir (dirent engine) vs chmod child (inode engine) ───────────── */
+
+/* Cross-engine pair: writer chmods one of the stable child inodes →
+ * mutates inode engine (in-place mode-bits). Reader does readdir on
+ * the PARENT → scans dirent engine for the parent's chain. The dirent
+ * engine is STABLE for the test duration (no mkdir/rmdir/unlink/rename).
+ *
+ * Reader still goes through the full LF-3 wait-free readdir path:
+ *   - FS_GUARD_READ_LOCKLESS on fs->global
+ *   - EBR pin
+ *   - parent inode-existence check via stm_inode_lookup_concurrent
+ *     (this DOES hit the same inode index as the writer, but on a
+ *     DIFFERENT inode — the parent. Writer touches the CHILD inode's
+ *     mode bits; reader looks up the PARENT inode's value. Same engine,
+ *     different keys, no in-place collision on the parent's storage)
+ *   - dirent scan via stm_dirent_readdir_concurrent (different engine,
+ *     stable contents).
+ */
+
+typedef struct {
+    stm_fs *fs;
+    uint64_t dataset_id;
+    uint64_t parent_ino;
+    uint64_t child_ino;
+    unsigned iterations;
+    atomic_int err;
+    atomic_uint completed;
+    atomic_bool done;
+} lf3d_readdir_ctx;
+
+/* Writer: chmod loop on the child inode only. */
+static void *lf3d_chmod_child_thread(void *arg)
+{
+    lf3d_readdir_ctx *w = (lf3d_readdir_ctx *)arg;
+    for (unsigned i = 0; i < w->iterations; i++) {
+        uint32_t mode = 0100600u | (i & 0177u);
+        stm_status rc = stm_fs_chmod(w->fs, w->dataset_id, w->child_ino, mode);
+        if (rc != STM_OK) {
+            atomic_store(&w->err, (int)rc);
+            break;
+        }
+        atomic_fetch_add(&w->completed, 1u);
+    }
+    atomic_store(&w->done, true);
+    return NULL;
+}
+
+/* Reader: readdir on parent. Three stable children always visible. */
+static void *lf3d_readdir_reader_thread(void *arg)
+{
+    lf3d_readdir_ctx *r = (lf3d_readdir_ctx *)arg;
+    for (unsigned i = 0; i < r->iterations; i++) {
+        stm_fs_dirent_entry entries[32];
+        memset(entries, 0, sizeof entries);
+        size_t n_out = 0;
+        uint64_t cursor = 0;
+        stm_status rc = stm_fs_readdir(r->fs, r->dataset_id, r->parent_ino,
+                                          /*parent_ino=*/r->parent_ino,
+                                          STM_FS_READDIR_FLAG_NO_DOTS,
+                                          &cursor, entries, 32, &n_out);
+        if (rc != STM_OK) {
+            atomic_store(&r->err, (int)rc);
+            break;
+        }
+        /* Exactly 3 stable children — dirent engine is not mutated. */
+        if (n_out != 3u) {
+            atomic_store(&r->err, -9201);
+            break;
+        }
+        for (size_t k = 0; k < n_out; k++) {
+            if (entries[k].child_ino == 0u) {
+                atomic_store(&r->err, -9202);
+                goto done;
+            }
+            if (entries[k].name_len != 1u) {
+                atomic_store(&r->err, -9203);
+                goto done;
+            }
+        }
+        atomic_fetch_add(&r->completed, 1u);
+    }
+done:
+    atomic_store(&r->done, true);
+    return NULL;
+}
+
+static bool lf3d_wait_readdir(const lf3d_readdir_ctx *a,
+                                 const lf3d_readdir_ctx *b,
+                                 pthread_t at, pthread_t bt)
+{
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        if (atomic_load(&a->done) && atomic_load(&b->done)) break;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        struct timespec ns = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ns, NULL);
+    }
+    (void)pthread_join(at, NULL);
+    (void)pthread_join(bt, NULL);
+    return true;
+}
+
+STM_TEST(lf3d_readdir_vs_chmod_child_same_parent) {
+    make_tmp("lf3d_readdir_vs_chmod_child");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "lf3d_readdir_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+
+    /* Three stable children. */
+    uint64_t a = 0, b = 0, c = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"a", 1,
+                                        0100644, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"b", 1,
+                                        0100644, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"c", 1,
+                                        0100644, 0, 0, &c));
+
+    lf3d_readdir_ctx wc = { 0 }, rc = { 0 };
+    wc.fs = fs; wc.dataset_id = ds_id;
+    wc.parent_ino = 1; wc.child_ino = a;
+    wc.iterations = LF3D_ITERATIONS;
+    rc.fs = fs; rc.dataset_id = ds_id;
+    rc.parent_ino = 1; rc.child_ino = 0;        /* reader doesn't touch a child */
+    rc.iterations = LF3D_ITERATIONS;
+
+    pthread_t wt, rt;
+    STM_ASSERT_EQ(0, pthread_create(&wt, NULL, lf3d_chmod_child_thread, &wc));
+    STM_ASSERT_EQ(0, pthread_create(&rt, NULL, lf3d_readdir_reader_thread, &rc));
+
+    STM_ASSERT(lf3d_wait_readdir(&wc, &rc, wt, rt));
+
+    STM_ASSERT_EQ(0, atomic_load(&wc.err));
+    STM_ASSERT_EQ(0, atomic_load(&rc.err));
+    STM_ASSERT_EQ(LF3D_ITERATIONS, atomic_load(&wc.completed));
+    STM_ASSERT_EQ(LF3D_ITERATIONS, atomic_load(&rc.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── INLINE-mode read vs chmod same inode ────────────────────────────── */
+
+/* Reader: read the file's inline-data via stm_fs_read (under the
+ * LF-3 wait-free INLINE branch). The file was seeded with a fixed
+ * byte pattern; reader must always see that exact pattern + got==len.
+ * A torn inode_value decode would manifest as garbage bytes, wrong
+ * size, or STM_ECORRUPT. */
+static void *lf3d_inline_read_thread(void *arg)
+{
+    lf3d_ctx *r = (lf3d_ctx *)arg;
+    uint8_t buf[LF3D_INLINE_LEN];
+    for (unsigned i = 0; i < r->iterations; i++) {
+        memset(buf, 0, sizeof buf);
+        size_t got = 0;
+        stm_status rc = stm_fs_read(r->fs, r->dataset_id, r->ino,
+                                       0, buf, sizeof buf, &got);
+        if (rc != STM_OK) {
+            atomic_store(&r->err, (int)rc);
+            break;
+        }
+        if (got != LF3D_INLINE_LEN) {
+            atomic_store(&r->err, -9200);
+            break;
+        }
+        for (size_t k = 0; k < got; k++) {
+            if (buf[k] != 0x42u) {
+                atomic_store(&r->err, -9201);
+                goto done;
+            }
+        }
+        atomic_fetch_add(&r->completed, 1u);
+    }
+done:
+    atomic_store(&r->done, true);
+    return NULL;
+}
+
+STM_TEST(lf3d_read_inline_vs_chmod_same_inode) {
+    make_tmp("lf3d_read_inline_vs_chmod");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "lf3d_inline_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"f", 1,
+                                        0100644, 0, 0, &ino));
+
+    /* Seed inline data — 64 B < STM_INODE_INLINE_MAX (100), so the
+     * write stays in the inode value (INLINE branch). */
+    uint8_t seed[LF3D_INLINE_LEN];
+    memset(seed, 0x42u, sizeof seed);
+    STM_ASSERT_OK(stm_fs_write(fs, ds_id, ino, 0, seed, sizeof seed));
+
+    lf3d_ctx wc = { 0 }, rc = { 0 };
+    wc.fs = fs; wc.dataset_id = ds_id; wc.ino = ino;
+    wc.iterations = LF3D_ITERATIONS;
+    rc.fs = fs; rc.dataset_id = ds_id; rc.ino = ino;
+    rc.iterations = LF3D_ITERATIONS;
+
+    pthread_t wt, rt;
+    STM_ASSERT_EQ(0, pthread_create(&wt, NULL, lf3d_chmod_writer_thread, &wc));
+    STM_ASSERT_EQ(0, pthread_create(&rt, NULL, lf3d_inline_read_thread, &rc));
+
+    STM_ASSERT(lf3d_wait_two(&wc, &rc, wt, rt));
+
+    STM_ASSERT_EQ(0, atomic_load(&wc.err));
+    STM_ASSERT_EQ(0, atomic_load(&rc.err));
+    STM_ASSERT_EQ(LF3D_ITERATIONS, atomic_load(&wc.completed));
+    STM_ASSERT_EQ(LF3D_ITERATIONS, atomic_load(&rc.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── getxattr-vs-setxattr disjoint inodes ────────────────────────────── */
+
+/* Writer: setxattr churn on its assigned inode. The disjoint test
+ * passes the WRITER's inode here — the reader hits a DIFFERENT inode.
+ * Setxattr DOES mutate the xattr engine (insert + tree rebalance under
+ * stress), so this test exercises tolerance for cross-inode xattr
+ * engine churn. The reader's wait-free path on a different inode +
+ * different xattr name walks DIFFERENT engine subtree paths under
+ * the engine's invariant that distinct keys never collide on the
+ * same leaf — provided the tree height is stable enough that the
+ * writer's churn doesn't perturb the reader's descent path. With
+ * small N (one xattr per inode, ≤ LF3D_ITERATIONS pairs) the tree
+ * stays compact + the writer's mutations are localized to its key
+ * range; the reader's descent path is disjoint. */
+static void *lf3d_setxattr_thread(void *arg)
+{
+    lf3d_ctx *w = (lf3d_ctx *)arg;
+    const uint8_t name[] = "user.churn";
+    uint8_t name_len = (uint8_t)(sizeof name - 1u);
+    uint8_t value[16];
+    for (unsigned i = 0; i < w->iterations; i++) {
+        memset(value, (uint8_t)('a' + (i & 0x1Fu)), sizeof value);
+        stm_status rc = stm_fs_setxattr(w->fs, w->dataset_id, w->ino,
+                                           name, name_len,
+                                           value, sizeof value, 0u, NULL);
+        if (rc != STM_OK) {
+            atomic_store(&w->err, (int)rc);
+            break;
+        }
+        rc = stm_fs_removexattr(w->fs, w->dataset_id, w->ino, name, name_len);
+        if (rc != STM_OK) {
+            atomic_store(&w->err, (int)rc);
+            break;
+        }
+        atomic_fetch_add(&w->completed, 1u);
+    }
+    atomic_store(&w->done, true);
+    return NULL;
+}
+
+/* Reader: getxattr on a STABLE inode whose value never changes; reader
+ * must see exactly the seeded value every iteration. The writer churns
+ * a DIFFERENT inode — no inode-level contention; this is the per-inode
+ * pin disjoint-set proof at the wait-free reader layer. */
+static void *lf3d_getxattr_reader_thread(void *arg)
+{
+    lf3d_ctx *r = (lf3d_ctx *)arg;
+    const uint8_t name[] = "user.stable";
+    uint8_t name_len = (uint8_t)(sizeof name - 1u);
+    for (unsigned i = 0; i < r->iterations; i++) {
+        uint8_t buf[32];
+        memset(buf, 0, sizeof buf);
+        uint32_t got = 0;
+        stm_status rc = stm_fs_getxattr(r->fs, r->dataset_id, r->ino,
+                                           name, name_len,
+                                           buf, sizeof buf, &got);
+        if (rc != STM_OK) {
+            atomic_store(&r->err, (int)rc);
+            break;
+        }
+        if (got != 8u) {
+            atomic_store(&r->err, -9300);
+            break;
+        }
+        for (uint32_t k = 0; k < got; k++) {
+            if (buf[k] != 0x77u) {
+                atomic_store(&r->err, -9301);
+                goto done;
+            }
+        }
+        atomic_fetch_add(&r->completed, 1u);
+    }
+done:
+    atomic_store(&r->done, true);
+    return NULL;
+}
+
+STM_TEST(lf3d_getxattr_vs_setxattr_disjoint_inodes) {
+    make_tmp("lf3d_getxattr_disjoint");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "lf3d_disjoint_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    uint64_t stable_ino = 0, churn_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"s", 1,
+                                        0100644, 0, 0, &stable_ino));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"c", 1,
+                                        0100644, 0, 0, &churn_ino));
+    STM_ASSERT_TRUE(stable_ino != churn_ino);
+
+    /* Seed the stable inode's xattr exactly once before launching
+     * threads. */
+    {
+        const uint8_t name[] = "user.stable";
+        uint8_t name_len = (uint8_t)(sizeof name - 1u);
+        uint8_t value[8];
+        memset(value, 0x77u, sizeof value);
+        STM_ASSERT_OK(stm_fs_setxattr(fs, ds_id, stable_ino,
+                                            name, name_len,
+                                            value, sizeof value, 0u, NULL));
+    }
+
+    lf3d_ctx wc = { 0 }, rc = { 0 };
+    wc.fs = fs; wc.dataset_id = ds_id; wc.ino = churn_ino;
+    wc.iterations = LF3D_ITERATIONS;
+    rc.fs = fs; rc.dataset_id = ds_id; rc.ino = stable_ino;
+    rc.iterations = LF3D_ITERATIONS;
+
+    pthread_t wt, rt;
+    STM_ASSERT_EQ(0, pthread_create(&wt, NULL, lf3d_setxattr_thread, &wc));
+    STM_ASSERT_EQ(0, pthread_create(&rt, NULL, lf3d_getxattr_reader_thread, &rc));
+
+    STM_ASSERT(lf3d_wait_two(&wc, &rc, wt, rt));
+
+    STM_ASSERT_EQ(0, atomic_load(&wc.err));
+    STM_ASSERT_EQ(0, atomic_load(&rc.err));
+    STM_ASSERT_EQ(LF3D_ITERATIONS, atomic_load(&wc.completed));
+    STM_ASSERT_EQ(LF3D_ITERATIONS, atomic_load(&rc.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("test_compound_ops_concurrent")
