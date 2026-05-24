@@ -8,7 +8,7 @@ target_include_directories(stm_extent PUBLIC
 target_link_libraries(stm_extent
     PRIVATE stm_warnings stm_sanitize stm_coverage
     PUBLIC  stm_crypto stm_block stm_bootstrap
-            stm_btree_engine stm_metakey stm_dataset
+            stm_btree_engine stm_metakey stm_dataset stm_ebr
             Threads::Threads)
 # 9.7-impl-1c-v: stm_engine_store no longer needed (engine create / open
 # is now driven from stm_dataset_index's per-slot engine cache). Added

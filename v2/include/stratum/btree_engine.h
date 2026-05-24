@@ -351,6 +351,59 @@ stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
                                         const void *hi_key, size_t hi_key_len,
                                         stm_btree_engine_iter_cb cb, void *ctx);
 
+/*
+ * Lock-free metadata-read sibling of stm_btree_engine_scan_range — the
+ * range-scan counterpart of stm_btree_engine_lookup_concurrent. Phase
+ * 9.8-LF-3b substrate; underpins the per-subsystem _concurrent listing
+ * APIs (extent / dirent readdir / xattr list).
+ *
+ * Contract:
+ *   - `ebr` is the calling thread's registered handle. The caller MUST
+ *     have already called stm_ebr_enter(ebr) before this call and MUST
+ *     call stm_ebr_exit(ebr) after; nesting is forbidden. The engine
+ *     does NOT enter/exit itself — composable with multi-tree readers.
+ *   - Semantics IDENTICAL to stm_btree_engine_scan_range: same range
+ *     semantics, same ascending key order, same `cb` early-stop
+ *     convention.
+ *
+ * Reader-vs-commit safety (LF-2):
+ *   - Atomic mvcc_root acquire-load — the publish at commit_finalize is
+ *     the release-store synchronisation point. Same slow-warm
+ *     materialisation under commit_mu as lookup_concurrent.
+ *
+ * Preconditions still in force at LF-3b (lifted at LF-BE-prepend):
+ *   - No concurrent writer (insert / delete). Base-node mutation can
+ *     tear a reader's range walk just as it can a single-key lookup.
+ *     LF-3 production gate: fs->global EX for writers, SH for readers.
+ *   - No concurrent commit_abort. invalidate_memtree frees the
+ *     in-memory tree without EBR-retire.
+ *   - Cache-warmed working set. load_child lazy-load is not yet
+ *     thread-safe; concurrent descents MUST hit cached child.mem.
+ *
+ * Walks the in-memory Bε delta chain at every node visited; at LF-2
+ * the chain is empty so chain-side messages contribute nothing and the
+ * impl falls through to the existing range walk. The chain-aware shape
+ * becomes load-bearing at 9.8-BE-prepend (range scans must apply
+ * INSERT/DELETE messages on top of the base scan; deferred until BE).
+ *
+ * Returns STM_EINVAL on NULL `eng` / `ebr` / `cb` or a NULL key with
+ * nonzero length, STM_ENOMEM / STM_ECORRUPT / device errors otherwise.
+ * STM_EBUSY not reachable (auto-rewarms invalidated engine — same
+ * posture as lookup_concurrent).
+ *
+ * Spec composition:
+ *   concurrency_mvcc.tla::ReaderObservesCoherentTree — EBR pin bounds
+ *     the lifetime of every node visited.
+ *   concurrency_mvcc.tla::RootAlwaysReachable — atomic acquire-load of
+ *     mvcc_root models the reader's "pin the published root" step.
+ */
+STM_MUST_USE
+stm_status stm_btree_engine_scan_range_concurrent(stm_btree_engine *eng,
+                                                   stm_ebr_thread *ebr,
+                                                   const void *lo_key, size_t lo_key_len,
+                                                   const void *hi_key, size_t hi_key_len,
+                                                   stm_btree_engine_iter_cb cb, void *ctx);
+
 /* ========================================================================= */
 /* Commit + inspection.                                                       */
 /* ========================================================================= */

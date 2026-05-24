@@ -1236,6 +1236,89 @@ stm_status stm_dirent_readdir(const stm_dirent_index *idx,
     return STM_OK;
 }
 
+/* 9.8-LF-3b: concurrent (EBR-pinned) readdir.
+ *
+ * Same emit-shape as stm_dirent_readdir — same di_readdir_cb, same
+ * lo/hi bracket, same qsort by hash_probe + cursor-prefix-skip +
+ * window-emit + saturating-advance — but the engine is materialised
+ * through stm_dataset_index_get_engine (which takes dataset_index's
+ * internal mutex) instead of this module's lock, and the scan runs via
+ * stm_btree_engine_scan_range_concurrent under the caller's EBR pin. */
+stm_status stm_dirent_readdir_concurrent(const stm_dirent_index *idx,
+                                            stm_ebr_thread *ebr,
+                                            uint64_t dataset_id, uint64_t dir_ino,
+                                            uint64_t *cursor,
+                                            stm_dirent_entry *out_entries,
+                                            size_t max_entries,
+                                            size_t *out_returned)
+{
+    if (out_returned) *out_returned = 0;
+
+    if (!idx || !ebr || !cursor || !out_entries || !out_returned) return STM_EINVAL;
+    if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
+    if (max_entries == 0u) return STM_EINVAL;
+
+    if (*cursor == UINT64_MAX) return STM_OK;
+
+    stm_dirent_index *m = (stm_dirent_index *)idx;
+    if (m->ds_idx == NULL) return STM_EINVAL;
+
+    stm_btree_engine *eng = NULL;
+    stm_status es = stm_dataset_index_get_engine(m->ds_idx, dataset_id, &eng);
+    if (es != STM_OK) {
+        if (es == STM_ENOENT) return STM_OK;   /* dataset absent → empty */
+        return es;
+    }
+
+    uint8_t lo[DI_KEY_LEN], hi[DI_KEY_LEN];
+    stm_status k1 = di_encode_key(dir_ino, 0u,         lo);
+    stm_status k2 = di_encode_key(dir_ino, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK)
+        return k1 != STM_OK ? k1 : k2;
+
+    di_readdir_ctx c = { .arr = NULL, .n = 0, .cap = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan_range_concurrent(
+        eng, ebr, lo, DI_KEY_LEN, hi, DI_KEY_LEN, di_readdir_cb, &c);
+    if (ss != STM_OK || c.err != STM_OK) {
+        free(c.arr);
+        return ss != STM_OK ? ss : c.err;
+    }
+    if (c.n == 0) {
+        free(c.arr);
+        return STM_OK;
+    }
+
+    qsort(c.arr, c.n, sizeof *c.arr, di_readdir_match_cmp);
+
+    size_t start = 0;
+    while (start < c.n && c.arr[start].hash_probe < *cursor) start++;
+    if (start == c.n) {
+        free(c.arr);
+        return STM_OK;
+    }
+
+    size_t avail = c.n - start;
+    size_t emit  = (max_entries < avail) ? max_entries : avail;
+    for (size_t k = 0; k < emit; k++) {
+        const stm_dirent_record *r = &c.arr[start + k].r;
+        out_entries[k].child_ino  = r->child_ino;
+        out_entries[k].child_gen  = r->child_gen;
+        out_entries[k].hash_probe = r->hash_probe;
+        out_entries[k].child_type = r->child_type;
+        out_entries[k].name_len   = r->name_len;
+        memset(out_entries[k].name, 0, sizeof out_entries[k].name);
+        if (r->name_len > 0u)
+            memcpy(out_entries[k].name, r->name, r->name_len);
+    }
+
+    uint64_t last_probe = c.arr[start + emit - 1].hash_probe;
+    *cursor = (last_probe == UINT64_MAX) ? UINT64_MAX : (last_probe + 1u);
+    *out_returned = emit;
+
+    free(c.arr);
+    return STM_OK;
+}
+
 /* P8-POSIX-2b R73 P2-1: bulk-drop every record (live + tombstone +
  * whiteout) keyed at (ds, dir_ino, *). Two-phase: scan_range
  * collects every probe under the prefix into a heap buffer, then a

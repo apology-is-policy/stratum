@@ -105,6 +105,7 @@
 #include <stratum/cas.h>
 #include <stratum/dataset.h>
 #include <stratum/btree_engine.h>
+#include <stratum/ebr.h>
 #include <stratum/metakey.h>
 #include <stratum/super.h>
 #include <stratum/types.h>
@@ -2069,6 +2070,81 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
     ex_collect_free(&c);
     must_unlock(lock);
     return got ? STM_OK : STM_ENOENT;
+}
+
+/* 9.8-LF-3b: concurrent (EBR-pinned) offset-covering extent lookup.
+ *
+ * Same first-match semantics as stm_extent_lookup_at (per
+ * extent.tla::NoOverlapWithinIno first-match suffices), but uses
+ * engine_scan_range_concurrent + the per-record cb-return-1 early
+ * stop instead of the two-pass collect-then-scan. Cost is bounded by
+ * (tree height + one record decode), NOT by the count of extents
+ * under (ds, ino). The cb encodes the same "off in [e->off, e->off +
+ * e->len)" predicate the serial loop uses. */
+typedef struct {
+    uint64_t           ds;
+    uint64_t           target_off;
+    stm_extent_record  hit;
+    bool               found;
+    stm_status         err;
+} ex_concurrent_lookup_ctx;
+
+static int ex_concurrent_lookup_cb(const void *k, size_t klen,
+                                     const void *v, size_t vlen, void *ctx_) {
+    ex_concurrent_lookup_ctx *c = ctx_;
+    uint64_t ino = 0, off = 0;
+    stm_status ks = ex_decode_key(k, klen, &ino, &off);
+    if (ks != STM_OK) { c->err = ks; return 1; }
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = ex_decode_value(v, vlen, c->ds, ino, off, &r);
+    if (vs != STM_OK) { c->err = vs; return 1; }
+    /* Past target_off — sorted-key walk; no later record can cover. */
+    if (off > c->target_off) return 1;             /* stop, miss */
+    if (c->target_off < off + r.len) {
+        c->hit = r;
+        c->found = true;
+        return 1;                                  /* stop, hit */
+    }
+    return 0;
+}
+
+stm_status stm_extent_lookup_at_concurrent(const stm_extent_index *idx,
+                                              stm_ebr_thread *ebr,
+                                              uint64_t dataset_id, uint64_t ino,
+                                              uint64_t off,
+                                              stm_extent_record *out_extent) {
+    if (!idx || !ebr || !out_extent) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+
+    stm_extent_index *m = (stm_extent_index *)idx;
+    if (m->ds_idx == NULL) return STM_EINVAL;
+
+    stm_btree_engine *eng = NULL;
+    stm_status es = stm_dataset_index_get_engine(m->ds_idx, dataset_id, &eng);
+    if (es != STM_OK) {
+        if (es == STM_ENOENT) return STM_ENOENT;   /* dataset absent → hole */
+        return es;
+    }
+
+    uint8_t lo[EX_KEY_LEN], hi[EX_KEY_LEN];
+    stm_status k1 = ex_encode_key(ino, 0u,         lo);
+    stm_status k2 = ex_encode_key(ino, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK)
+        return k1 != STM_OK ? k1 : k2;
+
+    ex_concurrent_lookup_ctx c = {
+        .ds = dataset_id, .target_off = off,
+        .hit = {0}, .found = false, .err = STM_OK,
+    };
+    stm_status ss = stm_btree_engine_scan_range_concurrent(
+        eng, ebr, lo, EX_KEY_LEN, hi, EX_KEY_LEN,
+        ex_concurrent_lookup_cb, &c);
+    if (ss != STM_OK) return ss;
+    if (c.err != STM_OK) return c.err;
+    if (!c.found) return STM_ENOENT;
+    *out_extent = c.hit;
+    return STM_OK;
 }
 
 typedef struct {

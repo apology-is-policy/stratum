@@ -1960,33 +1960,29 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                          size_t *out_read)
 {
     /* R76 P3-3: zero-init out_read BEFORE arg validation per the
-     * R57 P3-5 / R58 P3-1 uniform out-param contract. Callers that
-     * observe on STM_EINVAL get a defined value (0). */
+     * R57 P3-5 / R58 P3-1 uniform out-param contract. */
     if (out_read) *out_read = 0;
     if (!fs) return STM_EINVAL;
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
 
-    /* 9.7-impl-5 (INLINE) + 9.7-impl-5b (EXTENT): synth-ino read.
-     *
-     * INLINE data lives in the inode value; one frozen-tree inode
-     * lookup yields the bytes. EXTENT-mode regular files (size > 100
-     * bytes since impl-5b) route through stm_sync_read_extent_at_snap
-     * with the snapshot's captured triple. Dirs surface STM_EISDIR;
-     * other non-REG kinds STM_EINVAL (same shape as the live
-     * `stm_fs_read` for non-REG targets).
-     *
-     * The cross-dataset gate is enforced at fs_synth_snap_lookup —
-     * an attacker constructing a SNAP_VIEW ino for the wrong
-     * dataset_id gets STM_ENOENT before any cipher input flows. */
+    /* 9.8-LF-3 port (split-branch):
+     *   - synth-ino reads stay on fs->global SH (throwaway-engine
+     *     surface; impl-5/5b infrastructure).
+     *   - Live-tree INLINE read goes wait-free via EBR + concurrent
+     *     inode lookup — pure inode-value read, no extent/sync I/O.
+     *   - Live-tree EXTENT read stays on fs->global SH; the path
+     *     composes with writer-side SH+pin (PARALLEL-3 impl-5) +
+     *     stm_sync_read_extent's internal s->lock + dirty_buffer
+     *     overlay. Retiring SH here needs same-inode reader-pin to
+     *     exclude truncate/write mid-read — forward-noted to LF-3
+     *     followup or 9.8-BE-fs.c. */
     if (fs_ino_is_synth(ino)) {
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
+
         if (fs_ino_is_snaps_parent(ino)) {
             pthread_rwlock_unlock(&fs->global);
             return STM_EISDIR;
         }
-        /* Resolve the snap entry triple AND the frozen inode value
-         * in one branch — both EXTENT and INLINE paths need the
-         * inode's mode + size; EXTENT also needs the triple. */
         uint64_t snap_id    = fs_synth_snap_id(ino);
         uint64_t frozen_ino = fs_synth_frozen_ino(ino);
         if (snap_id == 0u || frozen_ino == 0u) {
@@ -2025,7 +2021,7 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         uint64_t cur_size = stm_load_le64(iv.si_size);
         if (off >= cur_size) {
             pthread_rwlock_unlock(&fs->global);
-            return STM_OK;                 /* EOF — *out_read stays 0 */
+            return STM_OK;
         }
         if (iv.si_data_kind == STM_DATA_INLINE) {
             if (iv.si_data_len > STM_INODE_INLINE_MAX) {
@@ -2042,13 +2038,6 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             return STM_OK;
         }
         if (iv.si_data_kind == STM_DATA_EXTENT) {
-            /* 9.7-impl-5b: throwaway-engine extent lookup against the
-             * snapshot's captured triple + shared AEAD decrypt path.
-             * sync's contract demands UB-aligned off; the caller's
-             * loop (9P client iounit) provides this. Clamp the
-             * returned slice by the frozen inode's si_size so reads
-             * don't surface block-padding bytes past EOF (R76 P2-1
-             * carry — same posture as fs_read_regular_locked). */
             size_t got = 0;
             stm_status rs = stm_sync_read_extent_at_snap(
                     fs->sync, dataset_id,
@@ -2068,7 +2057,56 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         return STM_EINVAL;
     }
 
-    /* Same dispatch shape as fs_write. */
+    /* Live-tree branch. Probe via EBR + concurrent inode lookup; if
+     * inode is INLINE-mode S_IFREG, serve from inode-value bytes
+     * directly (wait-free). All other paths (EXTENT, non-REG, missing
+     * from iidx) fall through to the SH-rdlock path. */
+    {
+        stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+        if (iidx) {
+            FS_GUARD_READ_LOCKLESS(fs);
+
+            stm_ebr_thread *ebr = fs_ebr_thread_current();
+            if (!ebr) return STM_ENOMEM;
+            stm_ebr_enter(ebr);
+
+            struct stm_inode_value iv = {0};
+            stm_status ls = stm_inode_lookup_concurrent(iidx, ebr,
+                                                          dataset_id, ino, &iv);
+            if (ls == STM_OK) {
+                uint32_t mode = stm_load_le32(iv.si_mode);
+                if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG
+                    && iv.si_data_kind == STM_DATA_INLINE) {
+                    /* INLINE wait-free serve. */
+                    if (iv.si_data_len > STM_INODE_INLINE_MAX) {
+                        stm_ebr_exit(ebr);
+                        return STM_ECORRUPT;
+                    }
+                    uint64_t cur_size = stm_load_le64(iv.si_size);
+                    if (off >= cur_size) {
+                        stm_ebr_exit(ebr);
+                        return STM_OK;
+                    }
+                    size_t avail = (size_t)(cur_size - off);
+                    size_t copy_n = (len < avail) ? len : avail;
+                    if (copy_n > 0u && buf) {
+                        memcpy(buf, iv.si_data.inline_data + off, copy_n);
+                    }
+                    if (out_read) *out_read = copy_n;
+                    stm_ebr_exit(ebr);
+                    return STM_OK;
+                }
+            }
+            stm_ebr_exit(ebr);
+            /* Fall through to SH path for EXTENT / non-REG / missing. */
+        }
+    }
+
+    /* EXTENT branch (and legacy direct-extent fallback): SH-rdlock +
+     * stm_sync_read_extent composes with writer-side per-inode pin. */
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_READ(fs);
+
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (iidx) {
         struct stm_inode_value iv = {0};
@@ -2124,6 +2162,23 @@ static stm_status fs_load_parent_dir(stm_inode_index *iidx,
 {
     stm_status ps = stm_inode_lookup(iidx, dataset_id, parent_ino, out_pv);
     if (ps != STM_OK) return ps;             /* STM_ENOENT if missing */
+    uint32_t pmode = stm_load_le32(out_pv->si_mode);
+    if ((pmode & (uint32_t)S_IFMT) != (uint32_t)S_IFDIR) return STM_ENOTDIR;
+    return STM_OK;
+}
+
+/* 9.8-LF-3b: EBR-pinned variant of fs_load_parent_dir for ports that
+ * drop fs->global SH. Same return shape as the serial helper; the
+ * caller is responsible for the EBR enter/exit bracket. */
+static stm_status fs_load_parent_dir_concurrent(stm_inode_index *iidx,
+                                                   stm_ebr_thread *ebr,
+                                                   uint64_t dataset_id,
+                                                   uint64_t parent_ino,
+                                                   struct stm_inode_value *out_pv)
+{
+    stm_status ps = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
+                                                  parent_ino, out_pv);
+    if (ps != STM_OK) return ps;
     uint32_t pmode = stm_load_le32(out_pv->si_mode);
     if ((pmode & (uint32_t)S_IFMT) != (uint32_t)S_IFDIR) return STM_ENOTDIR;
     return STM_OK;
@@ -4977,25 +5032,21 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
      * UINT64_MAX. */
     if (*cursor == UINT64_MAX) return STM_OK;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
-
-    /* 9.7-impl-5: synthetic .snaps namespace readdir.
+    /* 9.8-LF-3 port: synth-namespace branches keep fs->global SH
+     * (throwaway-engine surface); live-tree branch goes wait-free via
+     * EBR + concurrent inode lookup + concurrent readdir.
      *
-     * SNAPS_PARENT readdir enumerates the dataset's PRESENT snapshots
-     * (one dirent per snap, named after `e.name`). SNAP_VIEW readdir
-     * routes to the frozen tree via stm_dirent_readdir_at_root and
-     * translates each child_ino → SNAP_VIEW(snap_id, frozen_child_ino).
-     *
-     * Both branches synthesize "." and ".." in the same shape as the
-     * live readdir — POSIX expects every directory listing to include
-     * them. */
+     * 9.7-impl-5 .snaps namespace readdir routes through SH because
+     * the SNAPS_PARENT + SNAP_VIEW paths use snapshot index lookups +
+     * throwaway-engine readdirs that are not yet on the LF path. */
     if (fs_ino_is_synth(dir_ino)) {
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
+
         bool no_dots = (flags & STM_FS_READDIR_FLAG_NO_DOTS) != 0u;
         uint64_t local_cursor = *cursor;
         size_t emitted = 0;
 
-        /* Phase 0: emit "." (this inode). */
         if (local_cursor == 0u) {
             if (!no_dots && emitted < max_entries) {
                 fs_readdir_synth_dot(&out_entries[emitted], dir_ino, 1);
@@ -5003,9 +5054,6 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
             }
             local_cursor = 1u;
         }
-        /* Phase 1: emit "..". For SNAPS_PARENT, parent is the dataset
-         * root (live ino=1). For SNAP_VIEW, parent is whatever the
-         * caller passed — we trust it. */
         if (local_cursor == 1u && emitted < max_entries) {
             if (!no_dots) {
                 fs_readdir_synth_dot(&out_entries[emitted], parent_ino, 2);
@@ -5043,18 +5091,23 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
         return STM_OK;
     }
 
+    /* Live-tree branch: wait-free path. Atomic wedge gate + EBR pin
+     * for both the parent-dir-validation + the dirent readdir. */
+    FS_GUARD_READ_LOCKLESS(fs);
+
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
-    if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
-    }
+    if (!iidx || !didx) return STM_EINVAL;
 
-    /* Validate dir_ino exists + is a directory. */
+    stm_ebr_thread *ebr = fs_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+    stm_ebr_enter(ebr);
+
     struct stm_inode_value dv = {0};
-    stm_status ds = fs_load_parent_dir(iidx, dataset_id, dir_ino, &dv);
+    stm_status ds = fs_load_parent_dir_concurrent(iidx, ebr, dataset_id,
+                                                     dir_ino, &dv);
     if (ds != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_ebr_exit(ebr);
         return ds;
     }
 
@@ -5062,7 +5115,6 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
     uint64_t local_cursor = *cursor;
     size_t emitted = 0;
 
-    /* Phase 0: emit "." (or skip + advance). */
     if (local_cursor == 0u) {
         if (!no_dots) {
             if (emitted < max_entries) {
@@ -5070,14 +5122,11 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
                 emitted++;
                 local_cursor = 1u;
             }
-            /* If max_entries == 0 we'd have rejected above; the
-             * "no advance" branch isn't reachable. */
         } else {
             local_cursor = 1u;
         }
     }
 
-    /* Phase 1: emit ".." (or skip + advance). */
     if (local_cursor == 1u) {
         if (!no_dots) {
             if (emitted < max_entries) {
@@ -5090,52 +5139,37 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
-    /* Phase 2+: stored dirents. */
     if (local_cursor >= 2u && emitted < max_entries) {
-        /* Subtract the synth-phase offset to reach the dirent layer's
-         * cursor space. */
         uint64_t dirent_cursor = local_cursor - 2u;
         size_t dirent_max = max_entries - emitted;
 
-        /* Heap-allocate the temp dirent batch — caller's max_entries
-         * × ~280 bytes per stm_dirent_entry can be a few KB to many
-         * MB; the readdir uses STM_FS_READDIR's max_entries minus the
-         * already-emitted dot count, so the heap_alloc here matches
-         * the caller's space discipline. */
         if (dirent_max > SIZE_MAX / sizeof(stm_dirent_entry)) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_ebr_exit(ebr);
             return STM_ENOMEM;
         }
         stm_dirent_entry *batch = malloc(dirent_max * sizeof *batch);
         if (!batch) {
-            pthread_rwlock_unlock(&fs->global);
+            stm_ebr_exit(ebr);
             return STM_ENOMEM;
         }
 
         size_t batch_n = 0;
-        stm_status rs = stm_dirent_readdir(didx, dataset_id, dir_ino,
-                                              &dirent_cursor, batch, dirent_max,
-                                              &batch_n);
+        stm_status rs = stm_dirent_readdir_concurrent(didx, ebr, dataset_id,
+                                                         dir_ino, &dirent_cursor,
+                                                         batch, dirent_max,
+                                                         &batch_n);
         if (rs != STM_OK) {
             free(batch);
-            pthread_rwlock_unlock(&fs->global);
+            stm_ebr_exit(ebr);
             return rs;
         }
 
-        /* Copy into out_entries. */
         for (size_t k = 0; k < batch_n; k++) {
             /* R75 P3-4: defense-in-depth name_len bound at the
-             * fs.c → dirent.c trust boundary (R71 P1-1 lesson —
-             * symmetric guards across trust boundaries). The dirent
-             * decoder + alloc paths already reject name_len >
-             * STM_DIRENT_NAME_MAX, so reaching this branch implies
-             * a buggy refactor of the dirent layer. Treat as
-             * STM_ECORRUPT defensively rather than memcpy past the
-             * out-buffer's name[] array (which would be a stack
-             * overrun in caller-allocated batch[] storage). */
+             * fs.c → dirent.c trust boundary. */
             if (batch[k].name_len > STM_DIRENT_NAME_MAX) {
                 free(batch);
-                pthread_rwlock_unlock(&fs->global);
+                stm_ebr_exit(ebr);
                 return STM_ECORRUPT;
             }
             out_entries[emitted].child_ino  = batch[k].child_ino;
@@ -5150,9 +5184,6 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
         }
         free(batch);
 
-        /* Translate dirent-layer cursor back into fs-layer cursor.
-         * Saturate at UINT64_MAX so wraparound doesn't reset the
-         * iteration in pathological cases. */
         if (dirent_cursor > UINT64_MAX - 2u) {
             local_cursor = UINT64_MAX;
         } else {
@@ -5162,7 +5193,7 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
 
     *cursor = local_cursor;
     *out_returned = emitted;
-    pthread_rwlock_unlock(&fs->global);
+    stm_ebr_exit(ebr);
     return STM_OK;
 }
 
@@ -5355,85 +5386,83 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * at v1.0 — explicit STM_ENOTSUPPORTED. */
     if (fs_ino_is_synth(ino)) return STM_ENOTSUPPORTED;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
+    /* 9.8-LF-3 port: drop fs->global SH; atomic wedge gate + EBR pin
+     * for the inode-existence check + the two xattr_list_concurrent
+     * passes (probe count + materialise). Inode existence + listing
+     * both happen under a single EBR critical section so the inode
+     * cannot be unlinked between the require check + the listing. */
+    FS_GUARD_READ_LOCKLESS(fs);
 
-    stm_status ps = fs_xattr_require_inode(fs, dataset_id, ino);
+    stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!xidx || !iidx) return STM_EINVAL;
+
+    stm_ebr_thread *ebr = fs_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+    stm_ebr_enter(ebr);
+
+    struct stm_inode_value iv;
+    memset(&iv, 0, sizeof iv);
+    stm_status ps = stm_inode_lookup_concurrent(iidx, ebr,
+                                                  dataset_id, ino, &iv);
     if (ps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_ebr_exit(ebr);
         return ps;
     }
 
-    stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
-    if (!xidx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
-    }
-
-    /* First pass: probe the count via xa_list with max_entries=0 to
-     * compute the total. */
+    /* First pass: probe the count via xa_list_concurrent with
+     * max_entries=0 to compute the total. */
     size_t n_total = 0;
-    stm_status ps0 = stm_xattr_list(xidx, dataset_id, ino,
-                                       NULL, 0, &n_total);
+    stm_status ps0 = stm_xattr_list_concurrent(xidx, ebr, dataset_id, ino,
+                                                  NULL, 0, &n_total);
     if (ps0 != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_ebr_exit(ebr);
         return ps0;
     }
 
     if (n_total == 0) {
         *out_total_len = 0;
-        pthread_rwlock_unlock(&fs->global);
+        stm_ebr_exit(ebr);
         return STM_OK;
     }
 
-    /* Allocate a temp batch to receive the entries; we don't know the
-     * total byte length until we see the names. SIZE_MAX/sizeof
-     * guard against overflow. */
     if (n_total > SIZE_MAX / sizeof(stm_xattr_entry)) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_ebr_exit(ebr);
         return STM_ENOMEM;
     }
     stm_xattr_entry *batch = malloc(n_total * sizeof *batch);
     if (!batch) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_ebr_exit(ebr);
         return STM_ENOMEM;
     }
     size_t got = 0;
-    stm_status ls = stm_xattr_list(xidx, dataset_id, ino,
-                                      batch, n_total, &got);
+    stm_status ls = stm_xattr_list_concurrent(xidx, ebr, dataset_id, ino,
+                                                 batch, n_total, &got);
     if (ls != STM_OK || got != n_total) {
         free(batch);
-        pthread_rwlock_unlock(&fs->global);
+        stm_ebr_exit(ebr);
         return (ls != STM_OK) ? ls : STM_ECORRUPT;
     }
+    stm_ebr_exit(ebr);
 
     /* Compute total byte length (sum of (name_len + 1)). */
     size_t total_len = 0;
     for (size_t i = 0; i < got; i++) {
         /* R77 P1-1-style defense: cap name_len at the fs → xattr
          * trust boundary even though the xattr-layer + decoder both
-         * enforce ≤ STM_XATTR_NAME_MAX. Closes any future-bypass
-         * surface. R80 P3-5: same cap on value_len for forward-
-         * compat — fs_listxattr doesn't memcpy value bytes today,
-         * but a future maintainer extending this loop to use value_len
-         * would inherit the OOB shape if any future bypass slipped
-         * an oversize record past the writer/decoder symmetric
-         * guards. */
+         * enforce ≤ STM_XATTR_NAME_MAX. */
         if (batch[i].name_len == 0 ||
             batch[i].name_len > STM_FS_XATTR_NAME_MAX) {
             free(batch);
-            pthread_rwlock_unlock(&fs->global);
             return STM_ECORRUPT;
         }
         if (batch[i].value_len > STM_FS_XATTR_VALUE_MAX) {
             free(batch);
-            pthread_rwlock_unlock(&fs->global);
             return STM_ECORRUPT;
         }
         size_t entry_bytes = (size_t)batch[i].name_len + 1u;
         if (total_len > SIZE_MAX - entry_bytes) {
             free(batch);
-            pthread_rwlock_unlock(&fs->global);
             return STM_EOVERFLOW;
         }
         total_len += entry_bytes;
@@ -5441,29 +5470,22 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     *out_total_len = total_len;
 
     if (buf_max == 0) {
-        /* Probe-only call. */
         free(batch);
-        pthread_rwlock_unlock(&fs->global);
         return STM_OK;
     }
     if (buf_max < total_len) {
         free(batch);
-        pthread_rwlock_unlock(&fs->global);
         return STM_ERANGE;
     }
 
-    /* Copy out as NUL-separated strings. */
     size_t off = 0;
     for (size_t i = 0; i < got; i++) {
         memcpy(name_buf + off, batch[i].name, batch[i].name_len);
         off += batch[i].name_len;
         name_buf[off++] = 0;
     }
-    /* off must equal total_len; abort would be harsh, so leave as
-     * implicit invariant. */
 
     free(batch);
-    pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
 

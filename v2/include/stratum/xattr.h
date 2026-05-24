@@ -373,6 +373,42 @@ stm_status stm_xattr_list(const stm_xattr_index *idx,
                              size_t *out_total);
 
 /*
+ * Lock-free metadata-read sibling of stm_xattr_list — the listing
+ * counterpart of stm_xattr_get_concurrent. Phase 9.8-LF-3b: composes
+ * stm_dataset_index_get_engine + stm_btree_engine_scan_range_concurrent
+ * under the caller's EBR pin; skips this module's index lock entirely.
+ *
+ * Contract — identical to stm_xattr_list (semantics, refusals, the
+ * STM_ERANGE / *out_total interaction) EXCEPT:
+ *
+ *   - `ebr` is the calling thread's registered EBR handle. The caller
+ *     MUST have already called stm_ebr_enter(ebr) before this call and
+ *     stm_ebr_exit(ebr) after. The substrate scan honours that pin.
+ *
+ *   - No internal lock is taken on the xattr index. Atomicity of the
+ *     listing rests on the underlying engine's MVCC publish (LF-2)
+ *     and the EBR pin; the same caveat as stm_xattr_get_concurrent
+ *     applies — a concurrent writer can tear a base-node mutation
+ *     the listing observes mid-flight; LF-2's gate of "writers on
+ *     fs->global EX, readers on fs->global SH" excludes this until
+ *     9.8-BE-prepend.
+ *
+ *   - The dataset's engine is materialised through stm_dataset_index's
+ *     internal mutex (the dataset_index is its own thread-safety
+ *     domain), then the scan runs lock-free against it.
+ *
+ * Returns the same status codes as stm_xattr_list, plus STM_EINVAL if
+ * `ebr` is NULL.
+ */
+STM_MUST_USE
+stm_status stm_xattr_list_concurrent(const stm_xattr_index *idx,
+                                        stm_ebr_thread *ebr,
+                                        uint64_t dataset_id, uint64_t ino,
+                                        stm_xattr_entry *out_entries,
+                                        size_t max_entries,
+                                        size_t *out_total);
+
+/*
  * Drop EVERY record (live + tombstone) keyed at `(dataset_id, ino, *)`.
  * Used by `stm_fs_unlink` / `_rmdir` to GC an inode's xattrs when the
  * inode itself is freed. Without this, an inode whose ino is later

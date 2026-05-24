@@ -35,6 +35,7 @@ extern "C" {
 
 struct stm_bdev;       typedef struct stm_bdev       stm_bdev;
 struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
+struct stm_ebr_thread; typedef struct stm_ebr_thread stm_ebr_thread;
 
 /* Forward-decl (9.7-impl-1c-v): the extent module borrows a dataset
  * index via stm_extent_index_attach_dataset_index. */
@@ -945,6 +946,45 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
                                    uint64_t dataset_id, uint64_t ino,
                                    uint64_t off,
                                    stm_extent_record *out_extent);
+
+/*
+ * Lock-free metadata-read sibling of stm_extent_lookup_at — the
+ * offset-covering counterpart of stm_inode_lookup_concurrent. Phase
+ * 9.8-LF-3b: composes stm_dataset_index_get_engine +
+ * stm_btree_engine_scan_range_concurrent under the caller's EBR pin;
+ * skips the extent module's index lock entirely.
+ *
+ * Contract — identical to stm_extent_lookup_at (offset-covering match,
+ * STM_ENOENT for holes, the extent.tla::NoOverlapWithinIno first-match
+ * guarantee) EXCEPT:
+ *
+ *   - `ebr` is the calling thread's registered EBR handle. The caller
+ *     MUST have already called stm_ebr_enter(ebr) before this call and
+ *     stm_ebr_exit(ebr) after.
+ *
+ *   - No internal lock is taken on the extent index. Concurrency-safety
+ *     of the lookup rests on the engine's MVCC publish (LF-2) and the
+ *     EBR pin; same writer-vs-base-node tear caveat as the other
+ *     _concurrent reads (LF-2 production gate: writers on fs->global
+ *     EX, readers on fs->global SH).
+ *
+ *   - The dataset's engine is materialised through stm_dataset_index's
+ *     internal mutex, then the scan runs lock-free against it.
+ *
+ *   - Single-extent first-match (per `NoOverlapWithinIno`): the scan
+ *     terminates as soon as an offset-covering record is found, so the
+ *     cost is bounded by (tree height + spill walks for that one
+ *     record), NOT by the count of extents under (ds, ino).
+ *
+ * Returns the same status codes as stm_extent_lookup_at, plus
+ * STM_EINVAL if `ebr` is NULL.
+ */
+STM_MUST_USE
+stm_status stm_extent_lookup_at_concurrent(const stm_extent_index *idx,
+                                              stm_ebr_thread *ebr,
+                                              uint64_t dataset_id, uint64_t ino,
+                                              uint64_t off,
+                                              stm_extent_record *out_extent);
 
 /*
  * Look up the live extent backed by `paddr`. Used by the production

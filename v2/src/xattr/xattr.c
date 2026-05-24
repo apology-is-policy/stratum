@@ -1028,6 +1028,56 @@ stm_status stm_xattr_list(const stm_xattr_index *idx,
     return STM_OK;
 }
 
+/* 9.8-LF-3b: concurrent (EBR-pinned) listxattr.
+ *
+ * Same shape as stm_xattr_list — same xa_list_cb, same lo/hi bracket,
+ * same STM_ERANGE / *out_total post-scan handling — but the engine is
+ * materialised through stm_dataset_index_get_engine (which takes
+ * dataset_index's internal mutex) instead of this module's lock, and
+ * the scan runs via stm_btree_engine_scan_range_concurrent under the
+ * caller's EBR pin. */
+stm_status stm_xattr_list_concurrent(const stm_xattr_index *idx,
+                                        stm_ebr_thread *ebr,
+                                        uint64_t dataset_id, uint64_t ino,
+                                        stm_xattr_entry *out_entries,
+                                        size_t max_entries,
+                                        size_t *out_total) {
+    if (out_total) *out_total = 0;
+
+    if (!idx || !ebr || !out_total) return STM_EINVAL;
+    if (max_entries > 0u && !out_entries) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    stm_xattr_index *m = (stm_xattr_index *)idx;
+    if (m->ds_idx == NULL) return STM_EINVAL;
+
+    stm_btree_engine *eng = NULL;
+    stm_status es = stm_dataset_index_get_engine(m->ds_idx, dataset_id, &eng);
+    if (es != STM_OK) {
+        /* Dataset not present → empty listing (matches serial path). */
+        if (es == STM_ENOENT) return STM_OK;
+        return es;
+    }
+
+    uint8_t lo[XA_KEY_LEN], hi[XA_KEY_LEN];
+    stm_status k1 = xa_encode_key(ino, 0u,         lo);
+    stm_status k2 = xa_encode_key(ino, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK)
+        return k1 != STM_OK ? k1 : k2;
+
+    xa_list_ctx c = { .out = out_entries, .out_cap = max_entries,
+                       .out_n = 0, .n_total = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan_range_concurrent(
+        eng, ebr, lo, XA_KEY_LEN, hi, XA_KEY_LEN, xa_list_cb, &c);
+    if (ss != STM_OK || c.err != STM_OK)
+        return ss != STM_OK ? ss : c.err;
+
+    *out_total = c.n_total;
+    if (max_entries == 0u) return STM_OK;          /* probe-only */
+    if (max_entries < c.n_total) return STM_ERANGE;
+    return STM_OK;
+}
+
 /* drop_for_ino: bulk-drop every record (live + tombstone) keyed at
  * (ds, ino, *). Two-phase: scan_range collects every probe under the
  * prefix into a heap buffer, then a second pass engine_deletes each

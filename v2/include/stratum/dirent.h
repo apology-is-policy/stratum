@@ -479,6 +479,42 @@ stm_status stm_dirent_readdir(const stm_dirent_index *idx,
                                   size_t *out_returned);
 
 /*
+ * Lock-free metadata-read sibling of stm_dirent_readdir — the readdir
+ * counterpart of stm_dirent_lookup_concurrent. Phase 9.8-LF-3b:
+ * composes stm_dataset_index_get_engine +
+ * stm_btree_engine_scan_range_concurrent under the caller's EBR pin;
+ * skips the dirent module's index lock entirely.
+ *
+ * Contract — identical to stm_dirent_readdir (cursor semantics, the
+ * hash_probe-ascending emit order, the live-and-whiteout/no-tombstone
+ * filter, the UINT64_MAX-saturated cursor advance) EXCEPT:
+ *
+ *   - `ebr` is the calling thread's registered EBR handle. The caller
+ *     MUST have already called stm_ebr_enter(ebr) before this call and
+ *     stm_ebr_exit(ebr) after.
+ *
+ *   - No internal lock is taken on the dirent index. Atomicity of the
+ *     scan rests on the engine's MVCC publish (LF-2) and the EBR pin;
+ *     same writer-vs-base-node tear caveat as the other _concurrent
+ *     reads — LF-2 production gate: writers on fs->global EX, readers
+ *     on fs->global SH.
+ *
+ *   - The dataset's engine is materialised through stm_dataset_index's
+ *     internal mutex, then the scan runs lock-free against it.
+ *
+ * Refusals: same shape as stm_dirent_readdir, plus STM_EINVAL if `ebr`
+ * is NULL.
+ */
+STM_MUST_USE
+stm_status stm_dirent_readdir_concurrent(const stm_dirent_index *idx,
+                                            stm_ebr_thread *ebr,
+                                            uint64_t dataset_id, uint64_t dir_ino,
+                                            uint64_t *cursor,
+                                            stm_dirent_entry *out_entries,
+                                            size_t max_entries,
+                                            size_t *out_returned);
+
+/*
  * Drop EVERY record (live + tombstone) keyed at `(dataset_id, dir_ino,
  * *)`. Used by `stm_fs_rmdir` (P8-POSIX-2b R73 P2-1) to GC the
  * orphan-tombstone trail left by unlinks of the directory's prior

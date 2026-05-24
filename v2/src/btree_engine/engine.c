@@ -1378,6 +1378,52 @@ stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
                            cb, ctx, 0, &stopped);
 }
 
+/* 9.8-LF-3b: concurrent (EBR-pinned) range scan.
+ *
+ * Sibling of stm_btree_engine_lookup_concurrent — same slow-warm shape
+ * (mvcc_root acquire-load + double-checked load_root under commit_mu)
+ * and same LF-2 preconditions (no concurrent writer / commit_abort,
+ * cache-warmed working set). The chain walk at every node is currently
+ * a no-op (chain always empty at LF-2); the code shape is identical to
+ * the serial scan_range_node and is wired this way so 9.8-BE-prepend
+ * can plug delta-application in without rewriting callers. */
+stm_status stm_btree_engine_scan_range_concurrent(stm_btree_engine *eng,
+                                                   stm_ebr_thread *ebr,
+                                                   const void *lo_key, size_t lo_key_len,
+                                                   const void *hi_key, size_t hi_key_len,
+                                                   stm_btree_engine_iter_cb cb, void *ctx)
+{
+    if (!eng || !ebr || !cb)    return STM_EINVAL;
+    if (lo_key_len && !lo_key)  return STM_EINVAL;
+    if (hi_key_len && !hi_key)  return STM_EINVAL;
+    /* `ebr` value is documentation at LF-3b: caller's pre-`enter`
+     * keeps every node we touch alive (per the EBR contract). */
+    (void)ebr;
+
+    /* Acquire-load the published root; slow-warm under commit_mu if
+     * the engine was opened lazy or invalidated. Mirror of the
+     * lookup_concurrent entry. */
+    eng_node *root = atomic_load_explicit(&eng->mvcc_root,
+                                           memory_order_acquire);
+    stm_status s = STM_OK;
+    if (!root) {
+        pthread_mutex_lock(&eng->commit_mu);
+        root = atomic_load_explicit(&eng->mvcc_root, memory_order_acquire);
+        if (!root) {
+            s = load_root(eng, &root);
+            if (s != STM_OK) {
+                pthread_mutex_unlock(&eng->commit_mu);
+                return s;
+            }
+        }
+        pthread_mutex_unlock(&eng->commit_mu);
+    }
+
+    bool stopped = false;
+    return scan_range_node(eng, root, lo_key, lo_key_len, hi_key, hi_key_len,
+                           cb, ctx, 0, &stopped);
+}
+
 static int count_cb(const void *k, size_t kl, const void *v, size_t vl,
                      void *ctx)
 {
