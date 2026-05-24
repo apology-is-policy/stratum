@@ -54,6 +54,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(STM_PLATFORM_LINUX TRUE)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(STM_PLATFORM_DARWIN TRUE)
+elseif(CMAKE_C_COMPILER_TARGET STREQUAL "aarch64-thylacine")
+    # Thylacine cross-compile via pouch. The pouch CMake toolchain
+    # (thylacine/cmake/Toolchain-aarch64-pouch.cmake) sets
+    # CMAKE_SYSTEM_NAME=Generic + CMAKE_C_COMPILER_TARGET=aarch64-thylacine
+    # + -D__thylacine__ + -D_GNU_SOURCE at the toolchain level; we set
+    # STM_PLATFORM_THYLACINE here so per-platform branches below stay
+    # symmetric with Linux/Darwin.
+    set(STM_PLATFORM_THYLACINE TRUE)
 endif()
 
 # io_uring only on Linux.
@@ -99,7 +107,10 @@ endif()
 # - macOS: Clang on recent SDKs already defines _FORTIFY_SOURCE via system
 #   headers; setting it here triggers -Wmacro-redefined.
 # Gate on platform + sanitizer.
-if(NOT STM_PLATFORM_DARWIN AND STM_SANITIZE STREQUAL "off")
+if(NOT STM_PLATFORM_DARWIN AND NOT STM_PLATFORM_THYLACINE AND STM_SANITIZE STREQUAL "off")
+    # musl does not implement _FORTIFY_SOURCE — the macro would be a
+    # no-op there. Skip on Thylacine (pouch is musl-based) to avoid
+    # noise and keep the cross-compile flag set minimal.
     target_compile_options(stm_warnings INTERFACE -D_FORTIFY_SOURCE=2)
 endif()
 if(STM_WERROR)
@@ -130,10 +141,23 @@ endif()
 # ---------------------------------------------------------------------------
 # Dependencies.
 # ---------------------------------------------------------------------------
-find_package(Threads REQUIRED)
-find_package(PkgConfig REQUIRED)
-
-pkg_check_modules(LIBSODIUM REQUIRED IMPORTED_TARGET libsodium>=1.0.19)
+if(STM_PLATFORM_THYLACINE)
+    # Thylacine cross-compile via pouch — host pkg-config and FindThreads
+    # don't see the cross-sysroot (pouch's musl libc bundles pthread; no
+    # separate libpthread to find; libsodium ships pre-built in
+    # build/sysroot/lib without a .pc file). Synthesize the IMPORTED
+    # targets the rest of the tree references.
+    add_library(Threads::Threads INTERFACE IMPORTED)
+    add_library(PkgConfig::LIBSODIUM INTERFACE IMPORTED)
+    set_property(TARGET PkgConfig::LIBSODIUM PROPERTY
+        INTERFACE_LINK_LIBRARIES sodium)
+    # Sodium headers come via the toolchain's -isystem ${SYSROOT}/include;
+    # no explicit INTERFACE_INCLUDE_DIRECTORIES needed.
+else()
+    find_package(Threads REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBSODIUM REQUIRED IMPORTED_TARGET libsodium>=1.0.19)
+endif()
 
 if(STM_ENABLE_IOURING)
     pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing>=2.3)
