@@ -2141,24 +2141,25 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
 
     *out_child_ino = 0;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
-
-    /* 9.7-impl-5: synthetic .snaps namespace.
+    /* 9.8-LF-3c: synth branches use throwaway engines + snapshot index
+     * (still need fs->global SH); live-tree branch is wait-free via
+     * EBR-pinned concurrent lookups.
      *
+     * 9.7-impl-5 .snaps namespace cases (unchanged shape, routed lock
+     * choice):
      * 1. Lookup of ".snaps" at the LIVE dataset-root inode (=1) returns
-     *    the synthetic SNAPS_PARENT sentinel. The dirent ".snaps" is
-     *    NEVER stored on-disk; this branch is the only path that
-     *    surfaces it. R166 P2-4: verify the parent ino=1 actually
-     *    exists as a directory in `dataset_id` before returning the
-     *    sentinel — matches the existing "parent must be a dir"
-     *    contract; refuses a "phantom .snaps" surface on uninit'd
+     *    the synthetic SNAPS_PARENT sentinel. R166 P2-4: verify the
+     *    parent ino=1 actually exists as a directory in `dataset_id`
+     *    before returning the sentinel — matches the "parent must be a
+     *    dir" contract; refuses a "phantom .snaps" surface on uninit'd
      *    datasets.
      * 2. Lookup under SNAPS_PARENT resolves a snap name to the
      *    SNAP_VIEW root inode (snap_id, frozen_ino=1).
      * 3. Lookup under a SNAP_VIEW inode routes through the snapshot's
      *    frozen tree via stm_dirent_lookup_at_root. */
     if (parent_ino == 1u && fs_name_eq_snaps(name, name_len)) {
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
         stm_inode_index *iidx_chk = stm_sync_inode_index(fs->sync);
         if (!iidx_chk) {
             pthread_rwlock_unlock(&fs->global);
@@ -2175,6 +2176,8 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
         return STM_OK;
     }
     if (fs_ino_is_snaps_parent(parent_ino)) {
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
         stm_status s = fs_snaps_parent_lookup_by_name(fs, dataset_id,
                                                           name, name_len,
                                                           out_child_ino);
@@ -2182,6 +2185,8 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
         return s;
     }
     if (fs_ino_is_synth(parent_ino)) {
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
         stm_status s = fs_snap_view_lookup(fs, dataset_id, parent_ino,
                                               name, name_len,
                                               out_child_ino);
@@ -2189,25 +2194,37 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
         return s;
     }
 
+    /* Live-tree fast path — wait-free EBR. */
+    FS_GUARD_READ_LOCKLESS(fs);
+
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
-    if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
-    }
+    if (!iidx || !didx) return STM_EINVAL;
+
+    stm_ebr_thread *ebr = fs_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
 
     struct stm_inode_value pv = {0};
-    stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
-    if (ps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+    stm_ebr_enter(ebr);
+    stm_status ps = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
+                                                   parent_ino, &pv);
+    if (ps == STM_OK) {
+        uint32_t pmode = stm_load_le32(pv.si_mode);
+        if ((pmode & (uint32_t)S_IFMT) != (uint32_t)S_IFDIR) {
+            stm_ebr_exit(ebr);
+            return STM_ENOTDIR;
+        }
+    } else {
+        stm_ebr_exit(ebr);
         return ps;
     }
 
     uint64_t child_ino = 0;
-    stm_status ds = stm_dirent_lookup(didx, dataset_id, parent_ino,
-                                          name, name_len,
-                                          &child_ino, NULL, NULL);
-    pthread_rwlock_unlock(&fs->global);
+    stm_status ds = stm_dirent_lookup_concurrent(didx, ebr, dataset_id,
+                                                     parent_ino,
+                                                     name, name_len,
+                                                     &child_ino, NULL, NULL);
+    stm_ebr_exit(ebr);
     if (ds == STM_OK) *out_child_ino = child_ino;
     return ds;
 }
@@ -3834,46 +3851,37 @@ stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (target_max == 0u) return STM_EINVAL;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
-
-    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-    if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
-    }
-
-    /* 9.7-impl-5: synth-ino routes through the frozen tree. SNAPS_PARENT
-     * is a dir — POSIX EINVAL on readlink of a non-symlink. SNAP_VIEW
-     * inodes go through fs_snap_view_stat which delivers the same
-     * inode_value shape, including symlink_target bytes. */
     struct stm_inode_value iv = {0};
+
+    /* 9.8-LF-3c: synth-ino branch uses throwaway engines (snap-view
+     * stat), which still need fs->global SH; live-tree branch uses
+     * the wait-free EBR path. */
     if (fs_ino_is_synth(ino)) {
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
         stm_status vs = fs_snap_view_stat(fs, dataset_id, ino, &iv);
-        if (vs != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
-            return vs;
-        }
-        goto check_link;
-    }
-    {
-    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
-    if (ls != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
-        return ls;       /* STM_ENOENT */
+        if (vs != STM_OK) return vs;
+    } else {
+        FS_GUARD_READ_LOCKLESS(fs);
+        stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+        if (!iidx) return STM_EINVAL;
+        stm_ebr_thread *ebr = fs_ebr_thread_current();
+        if (!ebr) return STM_ENOMEM;
+        stm_ebr_enter(ebr);
+        stm_status ls = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
+                                                       ino, &iv);
+        stm_ebr_exit(ebr);
+        if (ls != STM_OK) return ls;       /* STM_ENOENT */
     }
-    }
-check_link:;
 
     uint32_t mode = stm_load_le32(iv.si_mode);
     if ((mode & (uint32_t)S_IFMT) != (uint32_t)S_IFLNK) {
-        pthread_rwlock_unlock(&fs->global);
         return STM_EINVAL;       /* POSIX EINVAL on non-symlink readlink */
     }
     if (iv.si_data_kind != STM_DATA_SYMLINK) {
         /* Decoder-vs-mode mismatch: the inode says S_IFLNK but the
          * data union doesn't carry SYMLINK bytes. Treat as corrupt. */
-        pthread_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
     /* R77 P1-1 defense-in-depth: even though `stm_inode_set` and
@@ -3882,7 +3890,6 @@ check_link:;
      * before the memcpy so a hypothetical bypass at either layer
      * (test seam, future refactor) can't OOB-read the union. */
     if (iv.si_data_len > STM_INODE_INLINE_MAX) {
-        pthread_rwlock_unlock(&fs->global);
         return STM_ECORRUPT;
     }
 
@@ -3890,8 +3897,6 @@ check_link:;
     size_t copy_n = (target_max < actual_len) ? target_max : actual_len;
     if (copy_n > 0u) memcpy(target_buf, iv.si_data.symlink_target, copy_n);
     *out_len = actual_len;       /* full length, even if truncated */
-
-    pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
 
@@ -4162,24 +4167,23 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * v1.0 — explicit STM_ENOTSUPPORTED. */
     if (fs_ino_is_synth(ino)) return STM_ENOTSUPPORTED;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
+    /* 9.8-LF-3c: wait-free read — atomic wedge gate + EBR pin around
+     * the concurrent inode lookup. No fs->global rwlock held. */
+    FS_GUARD_READ_LOCKLESS(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-    if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
-    }
+    if (!iidx) return STM_EINVAL;
+
+    stm_ebr_thread *ebr = fs_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
 
     struct stm_inode_value iv = {0};
-    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
-    if (ls != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return ls;
-    }
+    stm_ebr_enter(ebr);
+    stm_status ls = stm_inode_lookup_concurrent(iidx, ebr, dataset_id, ino, &iv);
+    stm_ebr_exit(ebr);
+    if (ls != STM_OK) return ls;
 
     *out_seals = stm_load_le32(iv.si_flags) & (uint32_t)STM_FS_SEAL_MASK;
-    pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
 
@@ -4205,32 +4209,45 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
+    /* 9.8-LF-3c: wait-free name-to-handle. All three subsystem reads
+     * (parent inode, dirent lookup, child inode) under a single EBR
+     * critical section. */
+    FS_GUARD_READ_LOCKLESS(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
-    if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
-    }
+    if (!iidx || !didx) return STM_EINVAL;
+
+    stm_ebr_thread *ebr = fs_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+
+    stm_ebr_enter(ebr);
 
     /* Validate parent is a directory + look up the child. */
     struct stm_inode_value pv = {0};
-    stm_status sps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
+    stm_status sps = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
+                                                    parent_ino, &pv);
     if (sps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_ebr_exit(ebr);
         return sps;
+    }
+    {
+        uint32_t pmode = stm_load_le32(pv.si_mode);
+        if ((pmode & (uint32_t)S_IFMT) != (uint32_t)S_IFDIR) {
+            stm_ebr_exit(ebr);
+            return STM_ENOTDIR;
+        }
     }
 
     uint64_t child_ino = 0, child_gen_ignored = 0;
     uint8_t  child_type = 0;
-    stm_status ds = stm_dirent_lookup(didx, dataset_id, parent_ino,
-                                          name, name_len,
-                                          &child_ino, &child_gen_ignored,
-                                          &child_type);
+    stm_status ds = stm_dirent_lookup_concurrent(didx, ebr, dataset_id,
+                                                     parent_ino,
+                                                     name, name_len,
+                                                     &child_ino, &child_gen_ignored,
+                                                     &child_type);
     if (ds != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        stm_ebr_exit(ebr);
         return ds;
     }
 
@@ -4246,11 +4263,10 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
      * — if the dirent's child_gen ever drifts from the inode's si_gen,
      * the handle should reflect the inode's authoritative value. */
     struct stm_inode_value cv = {0};
-    stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
-    if (cs != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return cs;
-    }
+    stm_status cs = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
+                                                   child_ino, &cv);
+    stm_ebr_exit(ebr);
+    if (cs != STM_OK) return cs;
 
     out_handle->h_magic      = stm_store_le32(STM_FS_HANDLE_MAGIC);
     out_handle->h_version    = stm_store_le32(STM_FS_HANDLE_VERSION);
@@ -4270,8 +4286,6 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
      * assignment is bit-equivalent to the prior load+store round-trip
      * and saves a byte-swap pair on big-endian builds. */
     out_handle->h_si_gen     = cv.si_gen;
-
-    pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
 
@@ -4307,75 +4321,49 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
      * "handle describes nothing under this mount". */
     if (fs_ino_is_synth(ino)) return STM_ESTALE;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
+    /* 9.8-LF-3c: wait-free open-by-handle. fs->pool is immutable
+     * post-mount (set in fs_new + never reassigned), so pool_uuid can
+     * be read outside any rwlock. */
+    FS_GUARD_READ_LOCKLESS(fs);
 
-    /* R83 P2-1: cross-pool isolation. Compare the handle's pool_uuid
-     * against the mounted fs's pool_uuid; mismatch → STM_ESTALE
-     * (the file the handle described isn't in THIS pool — could be
-     * a different mount, a different pool, or a forged tuple). */
+    /* R83 P2-1: cross-pool isolation. */
     {
         const uint64_t *pu = stm_pool_uuid(fs->pool);
         if (stm_load_le64(handle->h_pool_uuid[0]) != pu[0] ||
             stm_load_le64(handle->h_pool_uuid[1]) != pu[1]) {
-            pthread_rwlock_unlock(&fs->global);
             return STM_ESTALE;
         }
     }
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-    if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
-    }
+    if (!iidx) return STM_EINVAL;
+
+    stm_ebr_thread *ebr = fs_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
 
     /* R83 P2-2: distinguish STM_ENOENT (never existed) from STM_ESTALE
      * (was here, gone now). stm_inode_lookup currently fuses both
      * cases (no record OR record FREED) into a single STM_ENOENT
-     * return; we re-discriminate via the (ino < next_ino) heuristic.
-     * If ino < next_ino, the slot was at some point allocated — the
-     * inode is either FREED or never existed AT THIS ino but the
-     * allocator is past it, which is structurally impossible (alloc
-     * is monotonic + AllocReused returns to FREED slots). So
-     * lookup-fail with ino < next_ino ⇒ FREED ⇒ STM_ESTALE. ino >=
-     * next_ino ⇒ never existed in this dataset ⇒ STM_ENOENT.
-     *
-     * Lookup-success with gen mismatch ⇒ AllocReused since handle
-     * issuance ⇒ STM_ESTALE (the new (ino, gen) is a different
-     * file). Lookup-success with gen match ⇒ STM_OK. */
+     * return; we re-discriminate via the (ino < next_ino) heuristic. */
     struct stm_inode_value v = {0};
-    stm_status ls = stm_inode_lookup(iidx, ds, ino, &v);
+    stm_ebr_enter(ebr);
+    stm_status ls = stm_inode_lookup_concurrent(iidx, ebr, ds, ino, &v);
+    stm_ebr_exit(ebr);
     if (ls == STM_ENOENT) {
+        /* stm_inode_next_ino takes its own subsystem-internal mutex;
+         * safe without fs->global. */
         uint64_t next_ino = 0;
         stm_status ns = stm_inode_next_ino(iidx, ds, &next_ino);
-        pthread_rwlock_unlock(&fs->global);
-        if (ns == STM_OK && ino < next_ino) {
-            /* Slot was allocated at some point; either FREED-not-
-             * yet-reused or skipped-via-AllocFresh-monotonicity (no
-             * collision with ino since fresh paths bump next_ino).
-             * Either way, the file the handle described is gone. */
-            return STM_ESTALE;
-        }
-        /* Allocator never reached this ino in this dataset. */
+        if (ns == STM_OK && ino < next_ino) return STM_ESTALE;
         return STM_ENOENT;
     }
-    if (ls != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return ls;
-    }
+    if (ls != STM_OK) return ls;
 
-    /* Stale-handle detection: gen must match. A mismatch means the
-     * (ds, ino) tuple has been recycled via Free + AllocReused since
-     * the handle was issued. inode.tla's TupleUniqueAllTime invariant
-     * pins that the new (ino, gen) tuple is distinct from the old. */
+    /* Stale-handle detection: gen must match. */
     uint64_t cur_gen = stm_load_le64(v.si_gen);
-    if (cur_gen != want_gen) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_ESTALE;
-    }
+    if (cur_gen != want_gen) return STM_ESTALE;
 
     *out_ino = ino;
-    pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
 
@@ -5322,24 +5310,35 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (name_len == 0u || name_len > STM_FS_XATTR_NAME_MAX) return STM_EINVAL;
     if (!fs_xattr_name_in_posix_namespace(name, name_len)) return STM_EINVAL;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
+    /* 9.8-LF-3c: wait-free getxattr — inode existence check + xattr
+     * lookup both run under a single EBR critical section. No
+     * fs->global rwlock. */
+    FS_GUARD_READ_LOCKLESS(fs);
 
-    stm_status ps = fs_xattr_require_inode(fs, dataset_id, ino);
-    if (ps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return ps;
-    }
-
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
-    if (!xidx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
+    if (!iidx || !xidx) return STM_EINVAL;
+
+    stm_ebr_thread *ebr = fs_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+
+    stm_ebr_enter(ebr);
+
+    /* Require the inode exists (POSIX getxattr on a freed inode is
+     * ENOENT, NOT ENODATA). */
+    struct stm_inode_value iv;
+    memset(&iv, 0, sizeof iv);
+    stm_status is = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
+                                                   ino, &iv);
+    if (is != STM_OK) {
+        stm_ebr_exit(ebr);
+        return is;
     }
-    stm_status s = stm_xattr_get(xidx, dataset_id, ino,
-                                    name, name_len,
-                                    value_buf, value_max, out_size);
-    pthread_rwlock_unlock(&fs->global);
+
+    stm_status s = stm_xattr_get_concurrent(xidx, ebr, dataset_id, ino,
+                                               name, name_len,
+                                               value_buf, value_max, out_size);
+    stm_ebr_exit(ebr);
     return s;
 }
 
@@ -6826,49 +6825,42 @@ stm_status stm_fs_effective_dataset_property(stm_fs *fs, uint64_t dataset_id,
     if (out_value) *out_value = 0;
     if (!fs || !out_value) return STM_EINVAL;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
+    /* 9.8-LF-3c: wait-free dataset property read. The dataset index has
+     * its own internal mutex; the read is atomic per-call without
+     * holding fs->global. EX mutators (stm_fs_create_dataset, set/clear
+     * property) still take fs->global EX AND the dataset index's
+     * internal mutex — the table-level mutex provides the cross-EX-mutator
+     * serialization. */
+    FS_GUARD_READ_LOCKLESS(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
-    if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_ECORRUPT;
-    }
+    if (!didx) return STM_ECORRUPT;
 
-    stm_status s = stm_dataset_effective_property(didx, dataset_id,
-                                                     prop, out_value);
-    pthread_rwlock_unlock(&fs->global);
-    return s;
+    return stm_dataset_effective_property(didx, dataset_id, prop, out_value);
 }
 
 /* P9-CTL-1c read-side wrappers: /ctl/datasets/ and similar consumers
  * need to enumerate, look up, and count datasets without piercing
  * fs's encapsulation via the test-only fs_testing.h chain.
  *
- * Lock posture: each wrapper takes fs->lock for the duration of the
- * dataset call. For stm_fs_dataset_iter, the user-supplied callback
- * runs WITH fs->lock held — the callback MUST NOT call back into
- * any stm_fs_* API (would deadlock). Typical usage (the /ctl/
- * readdir builder) only formats the entry into a buffer and emits
- * dirents, which is safe. */
+ * 9.8-LF-3c: wait-free against fs->global. The dataset index has its
+ * own internal mutex so each call is atomic at the table layer. For
+ * stm_fs_dataset_iter, the user-supplied callback runs WITH dataset
+ * index's internal lock held — the callback MUST NOT call back into
+ * any stm_fs_* API that touches the dataset index (would deadlock).
+ * Typical usage (the /ctl/ readdir builder) only formats the entry
+ * into a buffer and emits dirents, which is safe. */
 stm_status stm_fs_dataset_lookup(stm_fs *fs, uint64_t dataset_id,
                                     stm_dataset_entry *out)
 {
     if (out) memset(out, 0, sizeof *out);
     if (!fs || !out) return STM_EINVAL;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
+    FS_GUARD_READ_LOCKLESS(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
-    if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_ECORRUPT;
-    }
-
-    stm_status s = stm_dataset_lookup(didx, dataset_id, out);
-    pthread_rwlock_unlock(&fs->global);
-    return s;
+    if (!didx) return STM_ECORRUPT;
+    return stm_dataset_lookup(didx, dataset_id, out);
 }
 
 stm_status stm_fs_dataset_count(stm_fs *fs, size_t *out_count)
@@ -6876,36 +6868,22 @@ stm_status stm_fs_dataset_count(stm_fs *fs, size_t *out_count)
     if (out_count) *out_count = 0;
     if (!fs || !out_count) return STM_EINVAL;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
+    FS_GUARD_READ_LOCKLESS(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
-    if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_ECORRUPT;
-    }
-
-    stm_status s = stm_dataset_count(didx, out_count);
-    pthread_rwlock_unlock(&fs->global);
-    return s;
+    if (!didx) return STM_ECORRUPT;
+    return stm_dataset_count(didx, out_count);
 }
 
 stm_status stm_fs_dataset_iter(stm_fs *fs, stm_dataset_iter_cb cb, void *ctx)
 {
     if (!fs || !cb) return STM_EINVAL;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
+    FS_GUARD_READ_LOCKLESS(fs);
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
-    if (!didx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_ECORRUPT;
-    }
-
-    stm_status s = stm_dataset_iter(didx, cb, ctx);
-    pthread_rwlock_unlock(&fs->global);
-    return s;
+    if (!didx) return STM_ECORRUPT;
+    return stm_dataset_iter(didx, cb, ctx);
 }
 
 /* P9-CTL-1d-debug: per-device alloc stats accessor for /ctl/debug/
@@ -6935,27 +6913,20 @@ stm_status stm_fs_alloc_stats_get(const stm_fs *fs, uint16_t device_id,
     if (!fs || !out) return STM_EINVAL;
     if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
 
-    stm_fs *mfs = (stm_fs *)fs;
-    pthread_rwlock_rdlock(&mfs->global);
-    /* Allow reading stats on a wedged fs — matches stm_fs_stats_get
-     * (fs.c:4737) for the same reason: diagnostics. */
-
+    /* 9.8-LF-3c: wait-free + wedged-OK (matches stm_fs_stats_get).
+     * stm_sync_alloc returns a pointer that is valid for the lifetime
+     * of the mount: v2.0 has single-mutator attach (sync_create at
+     * mount + serial-accept at the daemon), so the pointer is stable.
+     * Forward-note (carries R102): future concurrent-attach-mutation
+     * paths MUST EITHER add per-call refcounting on stm_alloc OR
+     * extend this wrapper to take the attach-table mutex. */
     stm_alloc *a = stm_sync_alloc(fs->sync, device_id);
-    if (!a) {
-        pthread_rwlock_unlock(&mfs->global);
-        return STM_ENOENT;
-    }
-
-    stm_status s = stm_alloc_stats_get(a, out);
-    pthread_rwlock_unlock(&mfs->global);
-    return s;
+    if (!a) return STM_ENOENT;
+    return stm_alloc_stats_get(a, out);
 }
 
-/* R102 P3-1: lightweight is-attached predicate. The /ctl/ readdir
- * loop probes 64 slots per call; without this, each probe would
- * trigger a full alloc-tree scan via stm_alloc_stats_get on every
- * attached slot. Bypass the scan by checking only stm_sync_alloc's
- * NULL/non-NULL return. Same wedged-OK posture as the heavy variant. */
+/* R102 P3-1: lightweight is-attached predicate. Same posture as
+ * stm_fs_alloc_stats_get. */
 stm_status stm_fs_alloc_attached(const stm_fs *fs, uint16_t device_id,
                                     bool *out)
 {
@@ -6963,11 +6934,8 @@ stm_status stm_fs_alloc_attached(const stm_fs *fs, uint16_t device_id,
     if (!fs || !out) return STM_EINVAL;
     if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
 
-    stm_fs *mfs = (stm_fs *)fs;
-    pthread_rwlock_rdlock(&mfs->global);
     stm_alloc *a = stm_sync_alloc(fs->sync, device_id);
     *out = (a != NULL);
-    pthread_rwlock_unlock(&mfs->global);
     return STM_OK;
 }
 
@@ -9264,14 +9232,14 @@ stm_status stm_fs_lock_test(stm_fs *fs,
      * symmetry. */
     if (fs_ino_is_synth(ino)) return STM_EROFS;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
-    stm_status s = stm_lock_test(fs->locks, dataset_id, ino,
-                                       owner_id, type, off, len,
-                                       out_would_grant,
-                                       out_conflicting_owner);
-    pthread_rwlock_unlock(&fs->global);
-    return s;
+    /* 9.8-LF-3c: stm_lock_test takes its own internal mutex; safe to
+     * call without holding fs->global. fs->locks is set at mount + never
+     * reassigned. */
+    FS_GUARD_READ_LOCKLESS(fs);
+    return stm_lock_test(fs->locks, dataset_id, ino,
+                            owner_id, type, off, len,
+                            out_would_grant,
+                            out_conflicting_owner);
 }
 
 stm_status stm_fs_release_lock_owner(stm_fs *fs, uint64_t owner_id)
@@ -9296,11 +9264,9 @@ stm_status stm_fs_lock_count(stm_fs *fs, size_t *out_count)
     if (out_count) *out_count = 0;
     if (!fs || !out_count) return STM_EINVAL;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
-    stm_status s = stm_lock_count(fs->locks, out_count);
-    pthread_rwlock_unlock(&fs->global);
-    return s;
+    /* 9.8-LF-3c: stm_lock_count takes its own internal mutex. */
+    FS_GUARD_READ_LOCKLESS(fs);
+    return stm_lock_count(fs->locks, out_count);
 }
 
 /* ========================================================================= */
@@ -9392,26 +9358,16 @@ stm_status stm_fs_stats_get(const stm_fs *fs, stm_fs_stats *out)
      * buffer deterministic, not partially-populated. */
     memset(out, 0, sizeof *out);
 
-    stm_fs *mfs = (stm_fs *)fs;
-    pthread_rwlock_rdlock(&mfs->global);
-    /* Allow reading stats on a wedged fs — useful for diagnostics. */
-
-    /* R7e-P2-1: sync first, then alloc — matches the nesting used by
-     * stm_fs_commit (sync_commit -> alloc_commit). Keeps a single
-     * canonical lock order across all stm_fs entries. */
+    /* 9.8-LF-3c: wait-free + wedged-OK. fs->sync + fs->alloc are
+     * immutable post-mount; stm_sync_info_get + stm_alloc_stats_get
+     * each take their own internal mutex. No fs->global needed. */
     stm_sync_info sinfo;
     stm_status s = stm_sync_info_get(fs->sync, &sinfo);
-    if (s != STM_OK) {
-        pthread_rwlock_unlock(&mfs->global);
-        return s;
-    }
+    if (s != STM_OK) return s;
 
     stm_alloc_stats astats;
     s = stm_alloc_stats_get(fs->alloc, &astats);
-    if (s != STM_OK) {
-        pthread_rwlock_unlock(&mfs->global);
-        return s;
-    }
+    if (s != STM_OK) return s;
 
     out->data_total_blocks     = astats.data_total_blocks;
     out->data_allocated_blocks = astats.data_allocated_blocks;
@@ -9422,10 +9378,11 @@ stm_status stm_fs_stats_get(const stm_fs *fs, stm_fs_stats *out)
     out->current_gen       = sinfo.current_gen;
     out->alloc_root_paddr  = sinfo.alloc_root_paddr;
 
-    out->read_only = atomic_load_explicit(&fs->read_only, memory_order_relaxed);
-    out->wedged    = atomic_load_explicit(&fs->wedged, memory_order_relaxed);
+    /* Acquire-load for wedged/read_only pairs with the release-store
+     * in stm_fs_mark_wedged + the EX-held flips in unmount paths. */
+    out->read_only = atomic_load_explicit(&fs->read_only, memory_order_acquire);
+    out->wedged    = atomic_load_explicit(&fs->wedged, memory_order_acquire);
 
-    pthread_rwlock_unlock(&mfs->global);
     return STM_OK;
 }
 
@@ -9445,14 +9402,10 @@ void stm_fs_mark_wedged(stm_fs *fs)
 stm_status stm_fs_verify(const stm_fs *fs)
 {
     if (!fs) return STM_EINVAL;
-    /* Verify is side-effect-free: takes fs->lock so state can't
-     * shift under us, but ignores read_only + wedged (both make
-     * sense for scrubbing). */
-    stm_fs *mfs = (stm_fs *)fs;
-    pthread_rwlock_rdlock(&mfs->global);
-    stm_status s = stm_alloc_verify(fs->alloc);
-    pthread_rwlock_unlock(&mfs->global);
-    return s;
+    /* 9.8-LF-3c: side-effect-free + wedged-OK. fs->alloc is immutable
+     * post-mount and stm_alloc_verify takes the allocator's internal
+     * mutex. No fs->global needed. */
+    return stm_alloc_verify(fs->alloc);
 }
 
 /* ========================================================================= */

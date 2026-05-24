@@ -78,6 +78,7 @@
 #include <stratum/xattr.h>
 #include <stratum/dataset.h>
 #include <stratum/btree_engine.h>
+#include <stratum/ebr.h>              /* 9.8-LF-3: stm_xattr_get_concurrent */
 #include <stratum/metakey.h>
 #include <stratum/types.h>
 
@@ -754,6 +755,99 @@ stm_status stm_xattr_get(const stm_xattr_index *idx,
     }
 
     must_unlock(lk);
+    return STM_ENODATA;
+}
+
+/*
+ * 9.8-LF-3: wait-free sibling of stm_xattr_get. See xattr.h for the
+ * contract.
+ *
+ * Same reader-vs-writer caveat as stm_inode_lookup_concurrent: a
+ * same-engine concurrent writer's stm_btree_engine_insert can tear
+ * the per-probe descent at LF-2; BE-prepend lifts that.
+ *
+ * No xattr-index mutex is taken; the descent uses the per-probe
+ * engine_lookup_concurrent which pins each visited node under the
+ * caller's EBR handle.
+ */
+stm_status stm_xattr_get_concurrent(const stm_xattr_index *idx,
+                                       stm_ebr_thread *ebr,
+                                       uint64_t dataset_id, uint64_t ino,
+                                       const uint8_t *name, uint8_t name_len,
+                                       uint8_t *value_buf, uint32_t value_max,
+                                       uint32_t *out_size) {
+    /* Match stm_xattr_get's R75 P3-1 zero-init posture. */
+    if (out_size) *out_size = 0;
+
+    if (!idx || !ebr || !name || !out_size) return STM_EINVAL;
+    if (value_max > 0u && !value_buf) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (name_len == 0u || name_len > STM_XATTR_NAME_MAX) return STM_EINVAL;
+
+    stm_xattr_index *m = (stm_xattr_index *)idx;
+    if (m->ds_idx == NULL) return STM_EINVAL;
+
+    stm_btree_engine *eng = NULL;
+    stm_status es = stm_dataset_index_get_engine(m->ds_idx, dataset_id, &eng);
+    if (es != STM_OK) {
+        /* Dataset not present → POSIX getxattr maps to ENODATA. */
+        if (es == STM_ENOENT) return STM_ENODATA;
+        return es;
+    }
+
+    uint64_t hash_base = fnv1a64(name, (size_t)name_len);
+
+    for (uint32_t k = 0; k < STM_XATTR_PROBE_MAX; k++) {
+        uint64_t probe = hash_base + (uint64_t)k;
+
+        uint8_t key[XA_KEY_LEN];
+        stm_status ks = xa_encode_key(ino, probe, key);
+        if (ks != STM_OK) return ks;
+
+        bool found = false;
+        void *vbuf = NULL;
+        size_t vlen = 0;
+        stm_status ls = stm_btree_engine_lookup_concurrent(
+                              eng, ebr, key, XA_KEY_LEN,
+                              &found, &vbuf, &vlen);
+        if (ls != STM_OK) return ls;
+        if (!found) return STM_ENODATA;
+
+        stm_xattr_record r;
+        memset(&r, 0, sizeof r);
+        stm_status vs = xa_decode_value(vbuf, vlen, &r);
+        free(vbuf);
+        if (vs != STM_OK) return vs;
+
+        if (record_is_tombstone(&r)) {
+            /* Tombstone — no heap allocated by decoder. Continue. */
+            continue;
+        }
+        if (record_name_eq(&r, name, name_len)) {
+            /* R77 P1-1 defense-in-depth: re-cap value_len. */
+            if (r.value_len > STM_XATTR_VALUE_MAX) {
+                record_clear_value(&r);
+                return STM_ECORRUPT;
+            }
+            *out_size = r.value_len;
+            if (value_max == 0u) {
+                record_clear_value(&r);
+                return STM_OK;
+            }
+            if (value_max < r.value_len) {
+                record_clear_value(&r);
+                return STM_ERANGE;
+            }
+            if (r.value_len > 0u && r.value) {
+                memcpy(value_buf, r.value, r.value_len);
+            }
+            record_clear_value(&r);
+            return STM_OK;
+        }
+        /* Different live name → free the heap value, continue. */
+        record_clear_value(&r);
+    }
+
     return STM_ENODATA;
 }
 

@@ -77,6 +77,11 @@ extern "C" {
 struct stm_dataset_index;
 typedef struct stm_dataset_index stm_dataset_index;
 
+/* Forward-decl (9.8-LF-3): callers of stm_xattr_get_concurrent pull in
+ * <stratum/ebr.h> themselves. */
+struct stm_ebr_thread;
+typedef struct stm_ebr_thread stm_ebr_thread;
+
 /* ========================================================================= */
 /* On-disk constants. ARCH §11.5.                                            */
 /* ========================================================================= */
@@ -267,6 +272,40 @@ stm_status stm_xattr_get(const stm_xattr_index *idx,
                             const uint8_t *name, uint8_t name_len,
                             uint8_t *value_buf, uint32_t value_max,
                             uint32_t *out_size);
+
+/*
+ * 9.8-LF-3: wait-free sibling of stm_xattr_get. Skips the xattr
+ * index's internal mutex; descends each probe via
+ * stm_btree_engine_lookup_concurrent under the caller-supplied EBR
+ * pin. Same shape as stm_inode_lookup_concurrent / _dirent_lookup_concurrent.
+ *
+ * Same reader-vs-writer tear caveat as the inode/dirent siblings: at
+ * LF-2 a same-engine concurrent writer's stm_btree_engine_insert can
+ * tear the descent (in-place base-node mutation). Closed by
+ * 9.8-BE-prepend's CAS chain. Production gate at LF-3: writers hold
+ * fs->global EX which mutually excludes readers entering the EBR path
+ * via FS_GUARD_READ_LOCKLESS.
+ *
+ * `ebr` is the caller's registered EBR handle. The caller MUST
+ * stm_ebr_enter / _exit around this call (the fs.c wrapper at
+ * stm_fs_getxattr does the bracket; this function does not enter the
+ * critical section on its own). The function takes no other locks.
+ *
+ * Identical contract to stm_xattr_get on output:
+ *   - *out_size always set to the FULL value byte count regardless of
+ *     `value_max`. value_max=0 probe pattern supported.
+ *   - value_max < *out_size → STM_ERANGE.
+ *   - value_max >= *out_size → copies the full value, returns STM_OK.
+ *
+ * Refusals same as stm_xattr_get plus NULL ebr → STM_EINVAL.
+ */
+STM_MUST_USE
+stm_status stm_xattr_get_concurrent(const stm_xattr_index *idx,
+                                       stm_ebr_thread *ebr,
+                                       uint64_t dataset_id, uint64_t ino,
+                                       const uint8_t *name, uint8_t name_len,
+                                       uint8_t *value_buf, uint32_t value_max,
+                                       uint32_t *out_size);
 
 /*
  * Remove `name` from inode `ino`. Models `xattr.tla::Remove`.
