@@ -218,10 +218,11 @@ struct stm_fs {
      * it reads them only. Unmount tears the fs down without a wedge
      * transition + without quiescing wait-free readers — the caller
      * MUST ensure no concurrent stm_fs_* calls are in flight before
-     * invoking stm_fs_unmount (see R171 P0-3 / docs/REFERENCE.md
-     * §"Unmount discipline under LF-3"). Stratumd's accept-loop
-     * shutdown drain provides this in production; embedded callers
-     * must mirror that pattern.
+     * invoking stm_fs_unmount (R171 P0-3, forward-noted to task
+     * #1232 R171-followup: "draining" flag + EBR-advance-until-empty
+     * loop in unmount). Stratumd's accept-loop shutdown drain
+     * provides this quiesce in production; embedded callers must
+     * mirror that pattern.
      *
      * Race window vs mark_wedged: a reader's `atomic_load_explicit(
      * acquire)` can return `false` an instant before a wedge-firing
@@ -2108,9 +2109,23 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                      * path rather than propagating a spurious
                      * STM_ECORRUPT — the serial path re-reads under the
                      * idx mutex and either confirms or refutes the
-                     * torn-state observation. */
-                    if (iv.si_data_len <= STM_INODE_INLINE_MAX) {
-                        uint64_t cur_size = stm_load_le64(iv.si_size);
+                     * torn-state observation.
+                     *
+                     * R172 P1-2 / P2-5: ALSO check cur_size <=
+                     * STM_INODE_INLINE_MAX. A torn read where bytes pass
+                     * in_validate_value with (kind=INLINE,
+                     * si_data_len <= 100, si_size > 100) — theoretically
+                     * reachable via the R171 P0-1 UAF window if freed-
+                     * buffer bytes happen to mix a current INLINE
+                     * lifetime's small data_len with a prior EXTENT
+                     * lifetime's large si_size — would otherwise memcpy
+                     * (cur_size - off) bytes past the 100-byte
+                     * inline_data[] array end into adjacent stack memory
+                     * (an OOB-stack-read leaking caller-buffer-visible
+                     * bytes). Gate the memcpy on BOTH bounds. */
+                    uint64_t cur_size = stm_load_le64(iv.si_size);
+                    if (iv.si_data_len <= STM_INODE_INLINE_MAX
+                        && cur_size <= (uint64_t)STM_INODE_INLINE_MAX) {
                         if (off >= cur_size) {
                             stm_ebr_exit(ebr);
                             return STM_OK;
@@ -2124,7 +2139,8 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                         stm_ebr_exit(ebr);
                         return STM_OK;
                     }
-                    /* torn data_len > MAX → fall through to SH path. */
+                    /* torn data_len > MAX OR torn si_size > MAX → fall
+                     * through to SH path. R172 P1-2 closure. */
                 }
             }
             stm_ebr_exit(ebr);
@@ -5720,9 +5736,21 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         }
         stm_status ls = stm_xattr_list_concurrent(xidx, ebr, dataset_id, ino,
                                                      batch, n_total, &got);
-        /* R171 P1-2: count-vs-materialize TOCTOU under same-engine
-         * writer → treat count-mismatch as STM_ECORRUPT + fall back. */
-        if (ls == STM_ECORRUPT || (ls == STM_OK && got != n_total)) {
+        /* R171 P1-2 / R172 P1-1: count-vs-materialize TOCTOU under
+         * same-engine concurrent writer. THREE symptoms:
+         *   - STM_ECORRUPT: writer mid-record-mutation → torn decode.
+         *   - STM_OK + got != n_total: writer REMOVED an xattr between
+         *     passes (materialize saw fewer).
+         *   - STM_ERANGE: writer ADDED an xattr between passes; the
+         *     materialize's xattr.c-level count saw n_total+1 >
+         *     max_entries (sized to the wait-free pass-1 count) and
+         *     refused. R172 P1-1: pre-R172 this propagated as a
+         *     spurious "buffer too small" lie to the caller.
+         * All three fall to the SH-fallback, where fs->global SH
+         * excludes fs->global EX (writers) so the two passes see a
+         * consistent index. */
+        if (ls == STM_ECORRUPT || ls == STM_ERANGE
+            || (ls == STM_OK && got != n_total)) {
             free(batch);
             batch = NULL;
             need_fallback = true;
@@ -5735,7 +5763,17 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_ebr_exit(ebr);
 
     if (need_fallback) {
-        /* R171 P1-1/P1-2 SH-fallback. See stm_fs_stat for rationale. */
+        /* R171 P1-1/P1-2 + R172 P1-1 SH-fallback. The fs->global SH
+         * here excludes the EX-holding xattr writers (setxattr /
+         * removexattr both take EX), so the two-pass count + materialize
+         * sees a consistent xattr-index for this inode. R172 P2-2: this
+         * exclusion is provided by fs->global SH-vs-EX, NOT by the xattr
+         * index's internal mutex (which serializes individual calls
+         * but NOT the call SEQUENCE). If a future xattr writer is
+         * lifted to SH (PARALLEL-3-style), the two-pass shape MUST be
+         * revisited — wrap both passes in a per-inode pin or fold into
+         * a single-pass primitive. See stm_fs_stat for the general
+         * SH-fallback rationale. */
         pthread_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         iidx = stm_sync_inode_index(fs->sync);

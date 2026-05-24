@@ -365,7 +365,17 @@ STM_TEST(inode_set_then_lookup_roundtrip) {
     struct stm_inode_value v = {0};
     STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
 
-    /* Stamp some timestamps + size + flags. */
+    /* Stamp some timestamps + size + flags. R172 P1-2: setting
+     * si_size = 4096 on a regular file requires data_kind = EXTENT
+     * (INLINE-kind inodes must have si_size <= STM_INODE_INLINE_MAX
+     * per the validator's INLINE/SYMLINK invariant — closes the OOB
+     * stack-read window where torn data_kind=INLINE + si_size > 100
+     * would feed stm_fs_read's INLINE memcpy past inline_data[]'s
+     * end). The stm_inode_alloc default is INLINE; flip to EXTENT
+     * before persisting a >100-byte size. */
+    v.si_data_kind  = STM_DATA_EXTENT;
+    v.si_data_len   = 0;
+    memset(&v.si_data, 0, sizeof v.si_data);
     v.si_btime_sec  = stm_store_le64(1700000000ULL);
     v.si_btime_nsec = stm_store_le32(123456789u);
     v.si_size       = stm_store_le64(4096ULL);

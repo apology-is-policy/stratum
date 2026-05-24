@@ -245,10 +245,23 @@ static stm_status in_validate_value(const struct stm_inode_value *v,
     }
 
     /* R77 P1-1: bound si_data_len by STM_INODE_INLINE_MAX for INLINE
-     * and SYMLINK kinds — the union slot is exactly that many bytes. */
+     * and SYMLINK kinds — the union slot is exactly that many bytes.
+     *
+     * R172 P1-2 defense-in-depth: ALSO bound si_size by
+     * STM_INODE_INLINE_MAX for INLINE/SYMLINK. A coherent record
+     * MUST have size ≤ data_len ≤ INLINE_MAX; if a torn read produces
+     * (kind=INLINE, data_len ≤ 100, size > 100) — theoretically
+     * reachable via the LF-3 P0-1 leaf-value UAF window when freed-
+     * buffer bytes mix a current INLINE lifetime's small data_len with
+     * a prior EXTENT lifetime's large si_size — validate-reject it as
+     * STM_ECORRUPT so the wait-free caller's SH-fallback fires. On the
+     * serial path this also catches durable on-disk corruption of an
+     * inconsistent INLINE record. */
     if (v->si_data_kind == STM_DATA_INLINE ||
         v->si_data_kind == STM_DATA_SYMLINK) {
         if (v->si_data_len > STM_INODE_INLINE_MAX) return STM_ECORRUPT;
+        if (stm_load_le64(v->si_size) > (uint64_t)STM_INODE_INLINE_MAX)
+            return STM_ECORRUPT;
     }
 
     /* R70 P3-3 + P8-POSIX-7a-anon: the FREED / ORPHAN / nlink
