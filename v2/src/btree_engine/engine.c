@@ -57,6 +57,11 @@ static void pending_reset(eng_pending *p);
 static void pending_free_paddrs(stm_btree_engine *eng,
                                  const paddr_vec *v, uint64_t free_gen);
 
+/* 9.8-LF-2: load_root is the single materialisation chokepoint for
+ * eng->root + eng->mvcc_root; forward-declared so stm_btree_engine_open
+ * can eager-warm post-engine_alloc. Defined in the Node loading section. */
+static stm_status load_root(stm_btree_engine *eng, eng_node **out);
+
 /* ========================================================================= */
 /* Lifecycle.                                                                  */
 /* ========================================================================= */
@@ -86,6 +91,12 @@ static stm_status engine_alloc(const stm_btree_store_vtable *vt, void *vt_ctx,
         return STM_ENOMEM;
     }
     atomic_init(&eng->next_delta_seq, (uint64_t)0);
+    /* 9.8-LF-2: mvcc_root is NULL until the in-memory root materialises.
+     * engine_create publishes the empty leaf immediately; engine_open
+     * leaves it NULL and the first descent — serial-path (load_root via
+     * lookup/insert/etc.) OR concurrent-path (slow-warm path inside
+     * stm_btree_engine_lookup_concurrent) — publishes via load_root. */
+    atomic_init(&eng->mvcc_root, (eng_node *)NULL);
     *out = eng;
     return STM_OK;
 }
@@ -109,6 +120,11 @@ stm_status stm_btree_engine_create(const stm_btree_store_vtable *vt,
         return STM_ENOMEM;
     }
     eng->has_durable_root = false;
+    /* 9.8-LF-2: publish for concurrent readers. The empty leaf is
+     * reachable immediately — a stm_btree_engine_lookup_concurrent
+     * issued right after engine_create returns a miss for any key
+     * (well-defined behaviour). */
+    atomic_store_explicit(&eng->mvcc_root, eng->root, memory_order_release);
     *out_eng = eng;
     return STM_OK;
 }
@@ -131,6 +147,22 @@ stm_status stm_btree_engine_open(const stm_btree_store_vtable *vt,
     eng->root_gen         = root_gen;
     memcpy(eng->root_csum, root_csum, STM_BTNODE_CSUM_SIZE);
     eng->has_durable_root = true;
+
+    /* 9.8-LF-2: mvcc_root left NULL post-open. The first call to either
+     * a serial-path op (lookup / insert / etc.) OR
+     * stm_btree_engine_lookup_concurrent will materialise the durable
+     * root via load_root which publishes mvcc_root release-store.
+     *
+     * Why lazy + not eager: corruption (tampered ciphertext, wrong
+     * csum) is detected at first descent — established contract
+     * (engine_ciphertext_tamper_detected + engine_wrong_csum_open_rejected
+     * regression tests). An eager warm would surface STM_ECORRUPT at
+     * open and is a strictly-more-aggressive failure-surface contract;
+     * not worth the contract change for the 1 disk-read amortisation.
+     *
+     * Concurrent-path first call without a prior serial-path op:
+     * stm_btree_engine_lookup_concurrent's slow warm under `commit_mu`
+     * single-shot materialises (double-checked locking pattern). */
     *out_eng = eng;
     return STM_OK;
 }
@@ -159,7 +191,14 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
 /* ========================================================================= */
 
 /* Resolve the root node, reading it from disk on the first descent of
- * an opened tree. */
+ * an opened tree.
+ *
+ * 9.8-LF-2: every code path that sets eng->root to a non-NULL node
+ * MUST atomic-store-release that pointer into eng->mvcc_root — this
+ * is the single source of root materialisations, so publishing here
+ * keeps the (eng->root, eng->mvcc_root) invariant: mvcc_root mirrors
+ * eng->root, except briefly inside invalidate_memtree where mvcc_root
+ * is cleared FIRST. */
 static stm_status load_root(stm_btree_engine *eng, eng_node **out)
 {
     if (eng->root) { *out = eng->root; return STM_OK; }
@@ -173,6 +212,7 @@ static stm_status load_root(stm_btree_engine *eng, eng_node **out)
         eng_node *e = eng_node_new_leaf();
         if (!e) return STM_ENOMEM;
         eng->root = e;
+        atomic_store_explicit(&eng->mvcc_root, e, memory_order_release);
         *out = e;
         return STM_OK;
     }
@@ -183,6 +223,7 @@ static stm_status load_root(stm_btree_engine *eng, eng_node **out)
     if (s != STM_OK) return s;
     (void)eng_cache_put(&eng->cache, eng->root_paddr, r);   /* best-effort */
     eng->root = r;
+    atomic_store_explicit(&eng->mvcc_root, r, memory_order_release);
     *out = r;
     return STM_OK;
 }
@@ -459,11 +500,53 @@ stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
      * keeps every node we touch alive. Suppress unused-arg under
      * compilers that don't see through the validation check. */
     (void)ebr;
-    if (eng->pending.active) return STM_EBUSY;
 
-    eng_node *node = NULL;
-    stm_status s = load_root(eng, &node);
-    if (s != STM_OK) return s;
+    /* 9.8-LF-2: enter via the atomically-published mvcc_root.
+     *
+     * No `pending.active` check at LF-2 — between commit_flush and
+     * commit_finalize the in-memory tree is mid-rewrite (paddr/gen/
+     * csum/dirty mutated on each dirty node), but those fields are
+     * reader-irrelevant for resident (cache-warmed) descents:
+     * lookup_concurrent traverses via `entries[] / pivots[] /
+     * children[].mem`, none of which commit_node mutates during the
+     * flush window. The publish at commit_finalize is the
+     * release-store synchronisation point.
+     *
+     * Spec composition: concurrency_mvcc.tla::ReaderEnter — the
+     * acquire-load of mvcc_root models the reader's "atomically
+     * pin the current published root" step. The descent walks the
+     * pinned reachable-set; EBR (caller responsibility) keeps it
+     * alive.
+     */
+    eng_node *node = atomic_load_explicit(&eng->mvcc_root,
+                                           memory_order_acquire);
+    stm_status s = STM_OK;
+    if (!node) {
+        /* 9.8-LF-2 slow-warm: first descent after engine_open (lazy)
+         * or after invalidate_memtree (failed flush / commit_abort).
+         * Materialise eng->root via load_root under commit_mu so we
+         * serialise against (future) commit-concurrent regimes;
+         * double-checked locking pattern. load_root publishes
+         * mvcc_root on success.
+         *
+         * At LF-2 production callers serialise serial-path ops via
+         * fs->global EX vs concurrent-path ops via fs->global SH —
+         * the slow-warm path therefore only races against itself
+         * (multiple concurrent readers all triggering the warm), and
+         * commit_mu serialises that. A serial-path load_root running
+         * outside commit_mu is excluded by the fs->global lock at
+         * the layer above. */
+        pthread_mutex_lock(&eng->commit_mu);
+        node = atomic_load_explicit(&eng->mvcc_root, memory_order_acquire);
+        if (!node) {
+            s = load_root(eng, &node);
+            if (s != STM_OK) {
+                pthread_mutex_unlock(&eng->commit_mu);
+                return s;
+            }
+        }
+        pthread_mutex_unlock(&eng->commit_mu);
+    }
 
     /* Descent — walk the chain at every node before consulting the
      * base. The chain at every internal node is empty at LF-1 (no
@@ -668,6 +751,22 @@ static void cache_reset(stm_btree_engine *eng)
  */
 static void invalidate_memtree(stm_btree_engine *eng)
 {
+    /* 9.8-LF-2: clear mvcc_root BEFORE freeing the tree so a fresh
+     * lookup_concurrent acquire-loads NULL and short-circuits to
+     * STM_EBUSY rather than dereferencing about-to-be-freed memory.
+     *
+     * LF-2 LIMITATION (closes at LF-BE-prepend with EBR retire): a
+     * reader that already acquire-loaded the soon-to-be-stale root
+     * pointer BEFORE this store is STILL holding it when the
+     * subsequent eng_node_free_recursive runs — that is a UAF.
+     * The contract: invalidate_memtree (failed flush + commit_abort)
+     * must NEVER run concurrent with a pinned reader; production
+     * callers serialise via fs->global EX, and the LF-2 test gate
+     * runs reader-quiescent abort scenarios only. Once LF-BE-prepend
+     * lands EBR retire of the full tree, this clear becomes part of
+     * a publish-then-retire pair and the UAF closes. */
+    atomic_store_explicit(&eng->mvcc_root, (eng_node *)NULL,
+                          memory_order_release);
     eng_node_free_recursive(eng->root);
     eng->root = NULL;
     cache_reset(eng);
@@ -957,6 +1056,31 @@ stm_status stm_btree_engine_commit_finalize(stm_btree_engine *eng)
     eng->root_gen         = p->new_root_gen;
     memcpy(eng->root_csum, p->new_root_csum, STM_BTNODE_CSUM_SIZE);
     eng->has_durable_root = true;
+
+    /* 9.8-LF-2: re-publish mvcc_root.
+     *
+     * At LF-2 commit_node mutates eng->root nodes in place (paddr/gen/
+     * csum/dirty fields updated; entries/pivots/children-mem fields are
+     * NOT touched on resident nodes), so the in-memory root POINTER
+     * value is unchanged across the commit. The publish here is
+     * semantically a release-fence — a concurrent reader's subsequent
+     * acquire-load synchronises-with this store, guaranteeing it
+     * observes every byte the commit_node mutated. At LF-2 there is
+     * no superseded in-memory eng_node pointer (in-place mutation), so
+     * NOTHING goes to stm_ebr_retire here.
+     *
+     * LF-BE-prepend's consolidator will COW the dirty root-to-leaf
+     * path producing a FRESH root pointer; at that point the
+     * pre-publish acquire-load of old_root + the post-publish
+     * stm_ebr_retire(old_root, eng_node_free_recursive) pair lands
+     * HERE — the realisation of concurrency_mvcc.tla::WriterCommit's
+     * correct branch (atomically publish new root, then retire
+     * superseded). The forward-note is intentionally just before
+     * pending_reset so the retire site is co-located with the
+     * superseded-paddr free; both are the writer's "the prior tree
+     * is gone" step.
+     */
+    atomic_store_explicit(&eng->mvcc_root, eng->root, memory_order_release);
 
     /* Deferred-free the superseded paddrs — the previous tree's
      * rewritten nodes, now unreachable from the new durable root. The

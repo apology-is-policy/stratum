@@ -375,21 +375,53 @@ struct stm_btree_engine {
      * the dropped in-memory tree); destroy frees the backing store. */
     paddr_vec   orphaned_spill_blocks;
 
-    /* 9.8-LF-1: lock-free concurrency substrate.
+    /* 9.8-LF-1 / 9.8-LF-2: lock-free concurrency substrate.
      *
      * `commit_mu` serialises engine-internal commits (one in-flight
-     * three-phase commit per engine). LF-2 wires this around the
-     * mvcc_root CAS publish + EBR retire of the prior root; LF-1
-     * reserves it.
+     * three-phase commit per engine). LF-2 reserves it for the
+     * future concurrent-commit regime; the LF-2 atomic-publish at
+     * commit_finalize relies on atomic-store-release alone and does
+     * not yet take this mutex (the production caller still serialises
+     * commits via its own lock — single-writer regime). When
+     * LF-BE-prepend's consolidator becomes commit-concurrent with
+     * writes, finalize/abort/flush will all acquire this mutex.
      *
      * `next_delta_seq` is the engine-wide monotonic source for
      * `eng_delta::seq` — gives every prepended message a total order
      * across nodes (used by the future consolidator to merge LIFO
      * chains from sibling pivots into a single timeline). Atomic
      * fetch-add at the prepend site. LF-1 reserves it.
+     *
+     * 9.8-LF-2: `mvcc_root` is the atomically-published in-memory
+     * root pointer for concurrent readers. Acquire-loaded by every
+     * `stm_btree_engine_lookup_concurrent` call; release-stored
+     * whenever `eng->root` is set (every `load_root` materialisation
+     * + `commit_finalize`'s republish) and release-stored to NULL
+     * BEFORE every in-memory-tree teardown (`invalidate_memtree`).
+     *
+     * The 9.6 codebase mutates eng->root nodes in place during
+     * commit (paddr/gen/csum/dirty updates) — the root POINTER value
+     * stays the same across commits, so at LF-2 the republished
+     * value is typically identical to the pre-publish value, and
+     * there is no superseded root pointer to EBR-retire. LF-BE-prepend
+     * lifts this: the consolidator will COW the dirty path,
+     * producing a fresh root, and at that point the publish becomes
+     * a true pointer swap + EBR-retire of the old root + every
+     * COW'd-superseded eng_node struct.
+     *
+     * Spec composition (concurrency_mvcc.tla):
+     *   - RootAlwaysReachable: every published root is a coherent
+     *     tree at the moment of publish; in-place mutation is
+     *     reader-invisible because resident readers traverse via
+     *     `entries[] / pivots[] / children[].mem`, none of which
+     *     commit_node mutates.
+     *   - ReaderObservesCoherentTree: at LF-2 the trivial case —
+     *     there are no retired nodes because nothing is yet COW'd.
+     *     LF-BE-prepend exercises this invariant for real.
      */
-    pthread_mutex_t   commit_mu;
-    _Atomic(uint64_t) next_delta_seq;
+    pthread_mutex_t       commit_mu;
+    _Atomic(uint64_t)     next_delta_seq;
+    _Atomic(eng_node *)   mvcc_root;
 };
 
 /* ========================================================================= */

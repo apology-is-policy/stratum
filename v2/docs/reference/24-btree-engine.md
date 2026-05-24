@@ -606,6 +606,111 @@ similarly run readers against an already-loaded tree (the dataset's
 working set sits in the cache after the first read in the op's
 lifetime).
 
+### 9.8-LF-2 — mvcc_root atomic publish
+
+LF-2 wires the **publication primitive** that LF-3 will consume:
+an atomic root-pointer per engine that readers acquire-load and
+writers (on commit) release-store. At LF-2 the actual root pointer
+value is unchanged across a commit (the in-place commit-node
+mutation is preserved), but the publish establishes the
+release/acquire synchronisation point so a concurrent reader
+observes every byte the writer's `commit_node` wrote.
+
+**Struct additions** (engine_internal.h):
+
+```c
+struct stm_btree_engine {
+    /* ... existing 9.6 + 9.8-LF-1 fields ... */
+    _Atomic(eng_node *)   mvcc_root;     /* LF-2 — publish target */
+};
+```
+
+**The invariant**: `eng->mvcc_root` mirrors `eng->root`, except
+briefly inside `invalidate_memtree` where `mvcc_root` is cleared
+release-store BEFORE `eng->root` is freed. Every code path that
+sets `eng->root` to a non-NULL value also release-stores
+`mvcc_root`:
+
+| Site | When | Why |
+|---|---|---|
+| `engine_create` | empty-leaf root constructed | immediate concurrent readability |
+| `load_root` | both branches (re-create empty leaf + disk-read existing root) | first descent (serial or concurrent slow-warm) materialises the root + publishes |
+| `commit_finalize` | end of the commit body | release-store synchronises every byte `commit_node` mutated with subsequent reader acquire-loads |
+| `invalidate_memtree` | BEFORE `eng_node_free_recursive` | a fresh reader sees NULL → STM_EBUSY rather than dereferencing freed memory |
+
+**Reader protocol** (`stm_btree_engine_lookup_concurrent`):
+
+```c
+eng_node *node = atomic_load_explicit(&eng->mvcc_root,
+                                       memory_order_acquire);
+if (!node) {
+    /* Slow warm under commit_mu — engine_open is lazy, OR
+     * invalidate_memtree cleared mvcc_root. Double-checked locking. */
+    pthread_mutex_lock(&eng->commit_mu);
+    node = atomic_load_explicit(&eng->mvcc_root, memory_order_acquire);
+    if (!node) { /* call load_root which publishes */ }
+    pthread_mutex_unlock(&eng->commit_mu);
+}
+/* Descend from `node` ... */
+```
+
+The `if (eng->pending.active) return STM_EBUSY` gate carried over
+from LF-1 is **removed** at LF-2 — the flush window mutates
+`paddr/gen/csum/dirty/spill-bookkeeping` on in-memory nodes but
+NOT the reader-visible fields (`entries[] / pivots[] /
+children[].mem`). A reader descending mid-flush traverses a
+coherent tree; the post-flush `commit_finalize` republish is the
+synchronisation point for any subsequent reader.
+
+**EBR retire is forward-noted** (`commit_finalize` comment in
+`engine.c`): at LF-2 commits mutate `eng->root` in place — same
+pointer before and after — so there is no superseded `eng_node`
+struct to retire. LF-BE-prepend's consolidator will COW the dirty
+root-to-leaf path producing a fresh root pointer; at that point
+the retire site lands at exactly the same place in
+`commit_finalize`, retiring the prior root + every COW'd-superseded
+node via `stm_ebr_retire(node, eng_node_free_recursive)`.
+
+**Spec composition (LF-2 realisation)**:
+
+| Spec invariant | How LF-2 realises it |
+|---|---|
+| `concurrency_mvcc.tla::RootAlwaysReachable` | `mvcc_root` release-store at `commit_finalize` publishes a coherent tree (`eng->root` is fully constructed before the publish); the static published-state invariant |
+| `concurrency_mvcc.tla::ReaderObservesCoherentTree` | trivially satisfied at LF-2 — no nodes are retired, so no reader sees a freed node. Becomes load-bearing at LF-BE-prepend's first true root swap |
+| `concurrency_mvcc.tla::ReclaimBookkeeping` | trivially — no retire ring is exercised at LF-2 |
+| `concurrency_mvcc.tla::ReaderEpochStable` | covered by EBR primitive (caller's `stm_ebr_enter`); engine-side responsibility is preserving the acquire-loaded pointer during descent, which the EBR contract handles |
+
+**LF-2 limitations** (closed at LF-BE-prepend):
+
+- **Concurrent writes (insert / delete)** still mutate base nodes
+  in place — a reader racing an insert sees torn entries. The
+  LF-2 production gate is `fs->global` EX for writers vs SH for
+  readers; the LF-BE-prepend writer-side chain prepend (CAS on
+  `chain_head`, no base mutation) closes this.
+- **Concurrent `commit_abort` / failed flush** invalidates the
+  in-memory tree without EBR-retire; a reader pinned during the
+  abort would UAF. LF-2 contract: `invalidate_memtree` runs only
+  under serial-path discipline. LF-BE-prepend's EBR-retire of the
+  full in-memory tree closes this gap.
+- **load_child lazy disk load** is still not thread-safe — the
+  LF-1 cache-warming caveat carries to LF-2 verbatim.
+
+**Tests** (`tests/test_btree_engine.c::engine_lf2_*`):
+
+- `_create_publishes_mvcc_root` — engine_create + immediate
+  lookup_concurrent on empty tree (no prior serial op).
+- `_lazy_open_warms_on_first_concurrent_lookup` — engine_open + first
+  lookup_concurrent triggers the slow-warm path under `commit_mu`.
+- `_commit_finalize_republishes` — post-commit reader observes the
+  newly-inserted key (verifies the acquire-load picks up the
+  release-store's mutations).
+- `_invalidate_clears_then_serial_rewarms` — failed flush →
+  serial-path recovery → concurrent lookup succeeds.
+- `_concurrent_reader_vs_commit` — 4-thread × 2000-iter readers
+  concurrent with 100-iter writer doing gen-bump commits on a
+  pre-warmed 300-key tree; no STM_ECORRUPT, no STM_EBUSY,
+  every-lookup-finds-its-key.
+
 ## Spec cross-reference
 
 | Spec | Pins |
@@ -620,7 +725,8 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 47 cases. 46 run against an in-RAM
+`tests/test_btree_engine.c` — 56 cases (47 9.6 + 4 9.8-LF-1 +
+5 9.8-LF-2). 55 run against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
 can both assert which paddrs were superseded and still open a prior
@@ -642,6 +748,8 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
 | Hostile trees | a forged on-disk DAG (two child slots → one paddr) and a forged child-kind mismatch are both rejected with `STM_ECORRUPT`, and `destroy` does not double-free (R150 P1 regressions) |
 | Validation | a value past the inline bound spills (no longer refused); a value over `STM_BTREE_ENGINE_MAX_VALUE_BYTES` and a key too large to fit even a spilled entry → `STM_ERANGE`; NULL-argument matrix |
 | Production vtable (impl-4b-i) | `STM_ENGINE_STORE_VT` over a real `stm_bdev` + `stm_bootstrap`: a 1500-key 2-level tree commits at 16-KiB node granularity, the bitmap is made durable, the bdev + bootstrap close and reopen, the engine reopens at the durable root, verifies, every key looks up, and an incremental commit round-trips |
+| Concurrent reader substrate (9.8-LF-1) | single-level + multilevel concurrent-lookup smoke; NULL-arg matrix + reader-during-flush succeeds (LF-2 contract); 4-thread × 2000-iter pre-warmed multi-reader against a static committed tree exercises the EBR-pinned descent + LIFO chain walk (currently always empty) |
+| mvcc_root publish (9.8-LF-2) | `engine_create` publishes empty leaf for immediate concurrent reads; lazy `engine_open` + first `lookup_concurrent` triggers the slow-warm path under `commit_mu`; `commit_finalize`'s republish synchronises post-commit reader acquire-loads with `commit_node`'s in-place mutations; `invalidate_memtree` clears mvcc_root → `lookup_concurrent` returns STM_EBUSY → serial re-warm recovers; 4-thread × 2000-iter readers concurrent with 100-iter writer doing gen-bump commits on a 300-key pre-warmed tree — no STM_ECORRUPT, no STM_EBUSY, every-lookup-finds-its-key |
 
 ## Status
 

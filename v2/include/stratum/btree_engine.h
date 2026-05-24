@@ -32,15 +32,25 @@
  *   - The serial APIs (lookup / insert / delete / scan / commit) are
  *     NOT thread-safe — one engine handle is used by one thread at a
  *     time on these paths.
- *   - The `_concurrent` API (Phase 9.8-LF-1; one lookup variant at
- *     present) IS safe to call from multiple readers concurrently,
- *     subject to the per-function contract: caller pre-`stm_ebr_enter`d,
- *     no concurrent writer, and the tree's working set pre-warmed into
- *     RAM (the LF-1 cache-warming caveat; lifted at LF-2 / LF-3 as the
- *     production read-side wires up).
+ *   - The `_concurrent` API (Phase 9.8-LF-1 + LF-2) IS safe to call
+ *     from multiple readers concurrently, AND safely descends the
+ *     in-memory tree CONCURRENT with a single writer's three-phase
+ *     commit (`commit_flush` → `commit_finalize`). At LF-2 the
+ *     publish at `commit_finalize` is an atomic-store-release of
+ *     `mvcc_root`; readers atomic-acquire-load it. Cache-warming
+ *     caveat (load_child not yet thread-safe at LF-2) still applies:
+ *     the working set must be resident in RAM before the concurrent
+ *     phase opens, OR the caller serialises descents via fs->global
+ *     SH against writer EX. LF-BE-prepend lifts the load_child
+ *     constraint.
+ *   - Concurrent WRITES (insert / delete) and concurrent commit_abort
+ *     remain unsafe at LF-2 — base-node mutation is still in place,
+ *     and invalidate_memtree free's the tree. Production callers
+ *     serialise via fs->global EX; LF-BE-prepend lands chain-prepend
+ *     writes that close this gap.
  *   - Full read-side concurrency lands at 9.8-LF-3 — fs.c's pure-read
- *     ops drop `fs->global` SH and pin EBR instead, against an
- *     mvcc_root atomic published by LF-2's commit-time CAS.
+ *     ops drop `fs->global` SH and pin EBR instead, against the
+ *     `mvcc_root` atomic.
  */
 #ifndef STRATUM_V2_BTREE_ENGINE_H
 #define STRATUM_V2_BTREE_ENGINE_H
@@ -201,11 +211,12 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
  * Lookup `key` from a thread that pre-entered the EBR epoch — the
  * lock-free metadata-read sibling of stm_btree_engine_lookup.
  *
- * Phase 9.8-LF-1 ships the surface; LF-2 wires the mvcc_root atomic
- * publish so concurrent commits become invisible to readers; LF-3
- * ports fs.c pure-read ops to drop fs->global SH and pin EBR instead.
- * The crown-jewel claim — wait-free metadata reads against an
- * arbitrarily-loaded tree — lands at LF-3.
+ * Phase 9.8-LF-1 shipped the surface (chain-walk substrate); LF-2
+ * wired the mvcc_root atomic publish so concurrent commits become
+ * invisible to readers; LF-3 ports fs.c pure-read ops to drop
+ * fs->global SH and pin EBR instead. The crown-jewel claim —
+ * wait-free metadata reads against an arbitrarily-loaded tree —
+ * lands at LF-3.
  *
  * Contract:
  *   - `ebr` is the calling thread's registered handle. The caller
@@ -217,37 +228,53 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
  *   - Semantics IDENTICAL to stm_btree_engine_lookup: same return
  *     codes, same value-copy contract, same key-len bounds.
  *
- * Preconditions at LF-1 (lifted at LF-2 / LF-3 as the production
- * read-side wires up):
- *   - No concurrent writer / committer. The serial mutation APIs
- *     (insert / delete / commit_*) and this concurrent reader are
- *     serially-ordered: a commit MUST quiesce before concurrent
- *     readers run; readers MUST quiesce before a new commit starts.
- *     LF-2 lifts this by introducing the mvcc_root atomic publish so
- *     concurrent readers can race a commit safely.
- *   - Cache-warmed working set. Every node the descent may touch must
- *     already be RAM-resident (a serial `_lookup` / `_scan` pass over
- *     the working set completes before the readers start). LF-1's
- *     `load_child` lazy-load path is not yet thread-safe; concurrent
- *     readers MUST hit only cached `child.mem` pointers and never
- *     trigger lazy disk loads. LF-2 / LF-3 retire this caveat as the
- *     node cache becomes EBR-managed.
+ * Reader-vs-commit safety (LF-2):
+ *   - Atomic mvcc_root acquire-load — the publish at commit_finalize
+ *     is the release-store synchronisation point. Readers descending
+ *     in the middle of a commit_flush window see the in-place-mutated
+ *     tree, but commit_node only touches paddr/gen/csum/dirty (NOT
+ *     entries / pivots / children[].mem), so descent stays coherent.
+ *   - Slow-warm: an engine opened lazy (engine_open) or invalidated
+ *     (failed flush / commit_abort) has mvcc_root NULL; the first
+ *     concurrent lookup materialises the durable root via load_root
+ *     under commit_mu (double-checked locking). Subsequent calls take
+ *     the atomic-load fast path.
+ *
+ * Preconditions still in force at LF-2 (lifted at LF-BE-prepend):
+ *   - No concurrent writer (insert / delete). The base nodes are
+ *     mutated in place by inserts; concurrent reads against active
+ *     mutation see torn state. The LF-2 production gate is fs->global
+ *     EX for writers, SH for readers; the writer-side chain prepend
+ *     at LF-BE-prepend replaces this with CAS prepends + delta walks.
+ *   - No concurrent commit_abort. invalidate_memtree frees the
+ *     in-memory tree without first EBR-retiring it; a reader pinned
+ *     during the abort would UAF. Closes at LF-BE-prepend's full
+ *     EBR-retire wiring of the in-memory tree.
+ *   - Cache-warmed working set. load_child lazy-load is not yet
+ *     thread-safe; concurrent descents MUST hit cached child.mem
+ *     pointers. Lifted as the node cache becomes EBR-managed at
+ *     LF-ARC.
  *
  * Walks the in-memory Bε delta chain at every node visited during
- * descent, newest-first, BEFORE the base-node lookup. At LF-1 the
- * chain is always empty (no writer prepends yet); the walk is O(1)
- * and the impl falls through to the existing single-threaded descent.
- * The chain-aware shape becomes load-bearing at 9.8-BE-prepend.
+ * descent, newest-first, BEFORE the base-node lookup. At LF-1 / LF-2
+ * the chain is always empty (no writer prepends yet); the walk is
+ * O(1) and the impl falls through to the existing single-threaded
+ * descent. The chain-aware shape becomes load-bearing at 9.8-BE-prepend.
  *
  * Returns STM_EINVAL on NULL `eng` / `ebr` / out params or a NULL
- * `key` with nonzero key_len, STM_EBUSY during an un-finalized commit
- * flush, STM_ENOMEM / STM_ECORRUPT / device errors otherwise.
+ * `key` with nonzero key_len, STM_EBUSY in the unwarmed window after
+ * an invalidate_memtree (failed flush / commit_abort) until the next
+ * serial-path op re-materialises the root, STM_ENOMEM / STM_ECORRUPT /
+ * device errors otherwise.
  *
  * Spec composition:
  *   bepsilon.tla::PerKeyNewestWins — chain walk is LIFO; first
  *     matching delta wins.
  *   concurrency_mvcc.tla::ReaderObservesCoherentTree — EBR pin
  *     bounds the lifetime of every node the descent visits.
+ *   concurrency_mvcc.tla::RootAlwaysReachable — the atomic acquire-load
+ *     of mvcc_root models the reader's "pin the current published
+ *     root" step; the LF-2 publish is the writer's reciprocal.
  */
 STM_MUST_USE
 stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
