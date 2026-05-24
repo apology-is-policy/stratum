@@ -15,6 +15,26 @@
 \*                    every reader at every intermediate phase
 \*                    observing the correct logical state.
 \*
+\* Phase 9.8 sibling extensions (introduced 2026-05-24):
+\*
+\*   concurrency_mvcc.tla — multi-node MVCC root publication
+\*                          (the EBR-vs-publish ordering reasoning
+\*                          this spec's 3-step protocol composes
+\*                          with at the engine level).
+\*   bepsilon.tla         — Bε message buffer correctness
+\*                          (per-key newest-wins under flush /
+\*                          drop / reorder; the orthogonal
+\*                          "messages-in-flight" property the 9.8
+\*                          buffer-driven splits compose with).
+\*
+\* The 9.8 buffer-driven-internal-split scenario the design doc
+\* (`v2/docs/phase-9.8-design.md` §6.2) names "balanced.tla
+\* extension" is realized by composition: balanced.tla covers the
+\* structural 3-step split (unchanged); bepsilon.tla covers the
+\* message-preservation under flush; together they prove the
+\* flush-induced split case sound. No invasive in-place extension
+\* to this module — the spec's structural shape is reused as-is.
+\*
 \* Scenario. Parent P is an internal node with two children:
 \*
 \*     P:  BASE_INTERNAL([Sep1 → L0, L1])           \* routes k < Sep1 to L0

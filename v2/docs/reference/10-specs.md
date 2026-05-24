@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Stratum v2 ships 27 TLA+ spec modules covering every load-bearing
+Stratum v2 ships 29 TLA+ spec modules covering every load-bearing
 invariant in the implementation. The specs are the **source of
 truth** for protocol-level behavior; code is an implementation of
 the spec (CLAUDE.md: "spec-first policy"). When the two disagree,
@@ -24,6 +24,8 @@ chapter as specs get wider cross-reference tables).
 | `concurrency.tla` | 2 | MVCC + delta chains + EBR. | readers=2, chain≤2, deltas=3, epochs=3 → 3150 states | — |
 | `structural.tla` | 2 | Bε-tree structural ops. | bounded | — |
 | `balanced.tla` | 2 | Three-CAS SPLIT protocol. | 65536 states at depth 18 | — |
+| `concurrency_mvcc.tla` | 9.8 | Multi-node MVCC root publication + EBR retire ordering for the lock-free metadata path. Headline invariants `RootAlwaysReachable` (the published root's tree intersects no reclaimed nodes — static published-state) + `ReaderObservesCoherentTree` (no reader's pinned view intersects reclaimed — EBR safety lifted to multi-node MVCC). Composes with `concurrency.tla`'s single-node EBR baseline + `balanced.tla`'s 3-step split protocol. | concurrency_mvcc.cfg: 7828 distinct states / 20817 generated (ReaderThreads={r0,r1}, MaxNodes=4, MaxCommits=2, MaxGlobalEpoch=5; init: 2-node tree at root=1 reaching {1,2}). | `concurrency_mvcc_retire_before_publish_buggy.cfg` (fires RootAlwaysReachable — retire without publish; mvcc_root stays + nodes reclaimed), `concurrency_mvcc_immediate_free_buggy.cfg` (fires ReaderObservesCoherentTree — free() direct, skip retire; pinned readers hold reclaimed), `concurrency_mvcc_no_publish_buggy.cfg` (fires RootAlwaysReachable — retire without computing new root) |
+| `bepsilon.tla` | 9.8 | Bε message buffer correctness for the lock-free metadata path. One internal node (root) + two leaves (LEFT, RIGHT) by `Sep`; bounded message buffer; flush propagates in seq order. Headline invariants `BufferBounded` (len ≤ MaxBufferSize) + `PerKeyNewestWins` (Lookup returns newest matching message OR leaf value) + `FlushPreservesNewestWins` (post-flush leaf state = from-init replay). Orthogonal to concurrency_mvcc.tla — covers per-node message semantics independent of concurrency. | bepsilon.cfg: 769 distinct states / 1021 generated (Keys={1,2}, Values={a,b}, Sep=2, MaxBufferSize=2, MaxOps=3). | `bepsilon_flush_reorders_buggy.cfg` (fires PerKeyNewestWins — flush newest-first; older overwrites newer), `bepsilon_flush_drops_buggy.cfg` (fires PerKeyNewestWins — flush silently drops one message), `bepsilon_overflow_buggy.cfg` (fires BufferBounded — append past MaxBufferSize) |
 | `merge.tla` | 2 | Three-CAS MERGE (under PurgeSplitOnL). | 65536 states at depth 18 | — |
 | `allocator.tla` | 3 | Refcount + deferred-free. | bounded | — |
 | `merkle.tla` | 4 | Per-node Merkle chain. | bounded | — |
