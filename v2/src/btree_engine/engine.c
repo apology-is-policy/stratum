@@ -203,11 +203,29 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
  *   - The slow-warm path inside `stm_btree_engine_lookup_concurrent`
  *     — holds `eng->commit_mu` across the load_root call, so multiple
  *     concurrent readers don't trip each other.
- * At LF-2 the serial and concurrent paths are mutually excluded by
- * `fs->global`'s EX-vs-SH; they don't actually race. LF-BE-prepend's
- * concurrent-commit regime will require the serial commit path to
- * also acquire commit_mu before calling load_root (any new caller
- * MUST follow the established discipline).
+ * R171 update post-LF-3: serial-path writers (commit_flush, insert,
+ * delete) now hold `fs->global` SH (PARALLEL-3 impl-5/6) and
+ * wait-free readers hold NO `fs->global` lock at all. They DO race
+ * on the same engine on the same key. The race is observable as:
+ *   - Same-engine concurrent reader + writer on the same key: leaf
+ *     value upsert in node.c does `free(old) → assign(new)` non-
+ *     atomically. A reader's `memcpy(v, entries[i].val, vl)` between
+ *     the free and the reassign reads from freed memory (R171 P0-1
+ *     UAF). Stopgap: SH-fallback at every public reader (R171 P1-1)
+ *     turns the visible symptom into a slow-path retry. True
+ *     closure: BE-prepend (#1218) replaces the in-place leaf upsert
+ *     with a CAS-prepend on a per-node delta chain.
+ *   - Engine struct freed by rollback / dataset_destroy / sync_close
+ *     while a reader holds the engine pointer (R171 P0-2 UAF).
+ *     Closure: EBR-retire the engine struct in
+ *     dataset_engine_close_locked (forward-noted to a dedicated
+ *     R171-followup chunk).
+ *   - invalidate_memtree's tree-free race against a pinned reader
+ *     (R171 P0-4 UAF). Closure: EBR-retire the eng_node tree at
+ *     LF-BE-prepend.
+ * LF-BE-prepend's concurrent-commit regime will require the serial
+ * commit path to also acquire commit_mu before calling load_root
+ * (any new caller MUST follow the established discipline).
  *
  * 9.8-LF-2: every code path that sets eng->root to a non-NULL node
  * MUST atomic-store-release that pointer into eng->mvcc_root — this

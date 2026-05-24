@@ -45,18 +45,33 @@
  *     each target inode via stm_inode_pin/_unpin. Two such ops on
  *     disjoint inodes proceed concurrently; on the same inode they
  *     serialize on the per-inode mutex.
- *   - PARALLEL-3 impl-6 pure-read ops (stm_fs_read / stat / lookup /
- *     readlink / readdir / get_seals / getxattr / listxattr / fadvise /
- *     name_to_handle / open_by_handle / the dataset-read + aggregate +
- *     lock-table-read getters): take fs->global SH (rdlock) and NO
- *     per-inode pin. A pure read issues internally-atomic subsystem
- *     calls (inode/dirent/xattr indices each guard records[] with their
- *     own mutex); it never mutates fs/inode/dirent/xattr/sync/alloc
- *     state, so concurrent SH readers + SH mutators are safe. The pin
- *     is for compound lookup-then-mutate atomicity only — a reader has
- *     no compound mutation to make atomic, and pinning would also kill
- *     read-read concurrency on the same inode (the pin is a mutex).
- *     See docs/p9.5-parallel-3-design.md §12.
+ *   - PARALLEL-3 impl-6 pure-read ops (the "v2 baseline" residual SH
+ *     surface): take fs->global SH (rdlock) and NO per-inode pin.
+ *
+ *   - 9.8-LF-3 wait-free pure-read ops (stm_fs_read INLINE / stat /
+ *     lookup / readlink / readdir / get_seals / getxattr / listxattr /
+ *     fadvise / name_to_handle / open_by_handle / dataset getters /
+ *     aggregate getters): take FS_GUARD_READ_LOCKLESS (atomic wedge
+ *     check, NO rwlock) + per-thread EBR pin around the engine
+ *     descent. A wait-free read issues a concurrent inode/dirent/xattr
+ *     lookup that descends mvcc_root via atomic-acquire-load.
+ *     R171 P1-1 SH-fallback: on transient STM_ECORRUPT (a torn-state
+ *     observation under same-engine concurrent writer), the reader
+ *     drops EBR + acquires fs->global SH + retries via the serial
+ *     subsystem call (the idx-mutex excludes the writer's torn
+ *     window). The user-visible result is a slow-path retry on
+ *     contention, not propagation of a spurious STM_ECORRUPT.
+ *
+ *     **R171 caller obligation** (P1-3): the wait-free path's atomic
+ *     wedge gate does NOT exclude stm_fs_unmount. Embedded callers
+ *     MUST quiesce all in-flight stm_fs_* read calls before invoking
+ *     stm_fs_unmount; LF-3 wait-free readers do not synchronize
+ *     against unmount. Stratumd's accept-loop shutdown drains workers
+ *     before unmount, so the obligation is satisfied in production.
+ *     The same wait-free regime also lacks EBR retire for the engine
+ *     struct freed by rollback / dataset_destroy / sync_close — these
+ *     are R171 P0-2/P0-3/P0-4 closure items, deferred to a dedicated
+ *     R171-followup chunk + BE-prepend (#1218).
  *
  * stm_sync_commit nests stm_alloc_commit under sync->lock. Every reader-
  * path inside stm_fs (stats_get) acquires the same order. Do not add a
@@ -194,20 +209,30 @@ struct stm_fs {
     stm_hybrid_keys *cached_keys;    /* owned (malloc + mlock) */
 
     /* 9.8-LF-3: wedged + read_only are atomic so 9.8 wait-free read ops
-     * can check them without holding fs->global. Writers (stm_fs_unmount /
-     * stm_fs_mark_wedged / commit-failure rollback) still hold fs->global
-     * EX when they set these — the EX exclusion serialises writer-vs-
-     * writer; the atomic provides reader-side acquire/release pairing.
+     * can check them without holding fs->global. The ONLY writer is
+     * stm_fs_mark_wedged (which holds fs->global EX) — the EX
+     * exclusion serialises writer-vs-writer; the atomic provides
+     * reader-side acquire/release pairing.
      *
-     * Race window: a reader's `atomic_load_explicit(acquire)` can return
-     * `false` an instant before a wedge-firing write does `store(true,
-     * release)`. The reader then proceeds, may touch state about to be
-     * declared wedged, and either (a) succeeds on data still coherent or
-     * (b) hits a downstream subsystem error that surfaces as some other
-     * status. Both outcomes are acceptable — the wedge transition only
-     * defines behavior FORWARD from the store. POSIX precedent: stat()
-     * concurrent with fs going read-only on disk error returns whatever
-     * was true at the syscall boundary. */
+     * R171 P3-3: stm_fs_unmount does NOT transition wedged/read_only;
+     * it reads them only. Unmount tears the fs down without a wedge
+     * transition + without quiescing wait-free readers — the caller
+     * MUST ensure no concurrent stm_fs_* calls are in flight before
+     * invoking stm_fs_unmount (see R171 P0-3 / docs/REFERENCE.md
+     * §"Unmount discipline under LF-3"). Stratumd's accept-loop
+     * shutdown drain provides this in production; embedded callers
+     * must mirror that pattern.
+     *
+     * Race window vs mark_wedged: a reader's `atomic_load_explicit(
+     * acquire)` can return `false` an instant before a wedge-firing
+     * write does `store(true, release)`. The reader then proceeds,
+     * may touch state about to be declared wedged, and either (a)
+     * succeeds on data still coherent or (b) hits a downstream
+     * subsystem error that surfaces as some other status. Both
+     * outcomes are acceptable — the wedge transition only defines
+     * behavior FORWARD from the store. POSIX precedent: stat()
+     * concurrent with fs going read-only on disk error returns
+     * whatever was true at the syscall boundary. */
     _Atomic(bool) read_only;
     _Atomic(bool) wedged;
 };
@@ -277,7 +302,7 @@ struct stm_fs {
 /* thread lazily registers; the pthread destructor releases at thread exit.  */
 /* Initialization of the key is a one-shot pthread_once.                     */
 /*                                                                            */
-/* Caller contract: stm_fs_ebr_thread_current() returns a stm_ebr_thread *   */
+/* Caller contract: fs_ebr_thread_current() returns a stm_ebr_thread *      */
 /* the caller MUST stm_ebr_enter / _exit around shared-data access. NULL on  */
 /* allocation failure — caller refuses with STM_ENOMEM.                      */
 /*                                                                            */
@@ -2077,28 +2102,34 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                 uint32_t mode = stm_load_le32(iv.si_mode);
                 if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG
                     && iv.si_data_kind == STM_DATA_INLINE) {
-                    /* INLINE wait-free serve. */
-                    if (iv.si_data_len > STM_INODE_INLINE_MAX) {
-                        stm_ebr_exit(ebr);
-                        return STM_ECORRUPT;
-                    }
-                    uint64_t cur_size = stm_load_le64(iv.si_size);
-                    if (off >= cur_size) {
+                    /* INLINE wait-free serve. R171 P2-6: a torn-state
+                     * si_data_len > MAX read can come from a concurrent
+                     * writer mid-stm_inode_set. Fall back to the SH
+                     * path rather than propagating a spurious
+                     * STM_ECORRUPT — the serial path re-reads under the
+                     * idx mutex and either confirms or refutes the
+                     * torn-state observation. */
+                    if (iv.si_data_len <= STM_INODE_INLINE_MAX) {
+                        uint64_t cur_size = stm_load_le64(iv.si_size);
+                        if (off >= cur_size) {
+                            stm_ebr_exit(ebr);
+                            return STM_OK;
+                        }
+                        size_t avail = (size_t)(cur_size - off);
+                        size_t copy_n = (len < avail) ? len : avail;
+                        if (copy_n > 0u && buf) {
+                            memcpy(buf, iv.si_data.inline_data + off, copy_n);
+                        }
+                        if (out_read) *out_read = copy_n;
                         stm_ebr_exit(ebr);
                         return STM_OK;
                     }
-                    size_t avail = (size_t)(cur_size - off);
-                    size_t copy_n = (len < avail) ? len : avail;
-                    if (copy_n > 0u && buf) {
-                        memcpy(buf, iv.si_data.inline_data + off, copy_n);
-                    }
-                    if (out_read) *out_read = copy_n;
-                    stm_ebr_exit(ebr);
-                    return STM_OK;
+                    /* torn data_len > MAX → fall through to SH path. */
                 }
             }
             stm_ebr_exit(ebr);
-            /* Fall through to SH path for EXTENT / non-REG / missing. */
+            /* Fall through to SH path for EXTENT / non-REG / missing /
+             * R171 P2-6 torn-state. */
         }
     }
 
@@ -2269,9 +2300,13 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
             stm_ebr_exit(ebr);
             return STM_ENOTDIR;
         }
-    } else {
+    } else if (ps != STM_ECORRUPT) {
         stm_ebr_exit(ebr);
         return ps;
+    } else {
+        /* fall through to SH-fallback below */
+        stm_ebr_exit(ebr);
+        goto lookup_fallback;
     }
 
     uint64_t child_ino = 0;
@@ -2280,8 +2315,37 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
                                                      name, name_len,
                                                      &child_ino, NULL, NULL);
     stm_ebr_exit(ebr);
-    if (ds == STM_OK) *out_child_ino = child_ino;
-    return ds;
+    if (ds == STM_OK) {
+        *out_child_ino = child_ino;
+        return STM_OK;
+    }
+    if (ds != STM_ECORRUPT) return ds;
+
+    /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
+lookup_fallback:
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_READ(fs);
+    iidx = stm_sync_inode_index(fs->sync);
+    didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_EINVAL;
+    }
+    {
+        struct stm_inode_value pv2 = {0};
+        stm_status ps2 = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv2);
+        if (ps2 != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ps2;
+        }
+        uint64_t ci = 0;
+        stm_status ds2 = stm_dirent_lookup(didx, dataset_id, parent_ino,
+                                              name, name_len,
+                                              &ci, NULL, NULL);
+        pthread_rwlock_unlock(&fs->global);
+        if (ds2 == STM_OK) *out_child_ino = ci;
+        return ds2;
+    }
 }
 
 /* Common path for create_file / mkdir. `child_mode_type` is S_IFREG
@@ -3235,6 +3299,26 @@ stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_status s = stm_inode_lookup_concurrent(iidx, ebr, dataset_id, ino,
                                                 out_value);
     stm_ebr_exit(ebr);
+    if (s != STM_ECORRUPT) return s;
+
+    /* R171 P1-1 SH-fallback. A wait-free reader can observe a torn
+     * inode-value decode (in_validate_value → STM_ECORRUPT) when a
+     * concurrent writer is mid-stm_inode_set on the same record. The
+     * underlying disk state is NOT corrupt; only the wait-free read
+     * was torn. Re-read under fs->global SH so the writer's serial
+     * idx-mutex excludes us from the torn window. The fallback turns
+     * a transient STM_ECORRUPT into a coherent answer at the cost of
+     * one round-trip on the slow path. BE-prepend (#1218) closes the
+     * underlying race; this fallback becomes a no-op once it lands. */
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_READ(fs);
+    iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_EINVAL;
+    }
+    s = stm_inode_lookup(iidx, dataset_id, ino, out_value);
+    pthread_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -3927,6 +4011,18 @@ stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         stm_status ls = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
                                                        ino, &iv);
         stm_ebr_exit(ebr);
+        if (ls == STM_ECORRUPT) {
+            /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
+            pthread_rwlock_rdlock(&fs->global);
+            FS_GUARD_READ(fs);
+            iidx = stm_sync_inode_index(fs->sync);
+            if (!iidx) {
+                pthread_rwlock_unlock(&fs->global);
+                return STM_EINVAL;
+            }
+            ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+            pthread_rwlock_unlock(&fs->global);
+        }
         if (ls != STM_OK) return ls;       /* STM_ENOENT */
     }
 
@@ -4236,6 +4332,18 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_ebr_enter(ebr);
     stm_status ls = stm_inode_lookup_concurrent(iidx, ebr, dataset_id, ino, &iv);
     stm_ebr_exit(ebr);
+    if (ls == STM_ECORRUPT) {
+        /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
+        iidx = stm_sync_inode_index(fs->sync);
+        if (!iidx) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+        ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+        pthread_rwlock_unlock(&fs->global);
+    }
     if (ls != STM_OK) return ls;
 
     *out_seals = stm_load_le32(iv.si_flags) & (uint32_t)STM_FS_SEAL_MASK;
@@ -4280,13 +4388,18 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
 
     /* Validate parent is a directory + look up the child. */
     struct stm_inode_value pv = {0};
+    struct stm_inode_value cv = {0};
+    uint64_t child_ino = 0, child_gen_ignored = 0;
+    uint8_t  child_type = 0;
+    bool need_fallback = false;
     stm_status sps = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
                                                     parent_ino, &pv);
-    if (sps != STM_OK) {
+    if (sps == STM_ECORRUPT) {
+        need_fallback = true;
+    } else if (sps != STM_OK) {
         stm_ebr_exit(ebr);
         return sps;
-    }
-    {
+    } else {
         uint32_t pmode = stm_load_le32(pv.si_mode);
         if ((pmode & (uint32_t)S_IFMT) != (uint32_t)S_IFDIR) {
             stm_ebr_exit(ebr);
@@ -4294,16 +4407,18 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
-    uint64_t child_ino = 0, child_gen_ignored = 0;
-    uint8_t  child_type = 0;
-    stm_status ds = stm_dirent_lookup_concurrent(didx, ebr, dataset_id,
-                                                     parent_ino,
-                                                     name, name_len,
-                                                     &child_ino, &child_gen_ignored,
-                                                     &child_type);
-    if (ds != STM_OK) {
-        stm_ebr_exit(ebr);
-        return ds;
+    if (!need_fallback) {
+        stm_status ds = stm_dirent_lookup_concurrent(didx, ebr, dataset_id,
+                                                         parent_ino,
+                                                         name, name_len,
+                                                         &child_ino, &child_gen_ignored,
+                                                         &child_type);
+        if (ds == STM_ECORRUPT) {
+            need_fallback = true;
+        } else if (ds != STM_OK) {
+            stm_ebr_exit(ebr);
+            return ds;
+        }
     }
 
     /* R83 P3-6 defense-in-depth: re-read the inode's si_gen from the
@@ -4317,11 +4432,45 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
      * provides defense-in-depth against any future invariant violation
      * — if the dirent's child_gen ever drifts from the inode's si_gen,
      * the handle should reflect the inode's authoritative value. */
-    struct stm_inode_value cv = {0};
-    stm_status cs = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
-                                                   child_ino, &cv);
+    if (!need_fallback) {
+        stm_status cs = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
+                                                       child_ino, &cv);
+        if (cs == STM_ECORRUPT) {
+            need_fallback = true;
+        } else if (cs != STM_OK) {
+            stm_ebr_exit(ebr);
+            return cs;
+        }
+    }
     stm_ebr_exit(ebr);
-    if (cs != STM_OK) return cs;
+
+    if (need_fallback) {
+        /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
+        iidx = stm_sync_inode_index(fs->sync);
+        didx = stm_sync_dirent_index(fs->sync);
+        if (!iidx || !didx) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+        stm_status ps2 = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
+        if (ps2 != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ps2;
+        }
+        stm_status ds2 = stm_dirent_lookup(didx, dataset_id, parent_ino,
+                                              name, name_len,
+                                              &child_ino, &child_gen_ignored,
+                                              &child_type);
+        if (ds2 != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ds2;
+        }
+        stm_status cs2 = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
+        pthread_rwlock_unlock(&fs->global);
+        if (cs2 != STM_OK) return cs2;
+    }
 
     out_handle->h_magic      = stm_store_le32(STM_FS_HANDLE_MAGIC);
     out_handle->h_version    = stm_store_le32(STM_FS_HANDLE_VERSION);
@@ -4404,6 +4553,18 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
     stm_ebr_enter(ebr);
     stm_status ls = stm_inode_lookup_concurrent(iidx, ebr, ds, ino, &v);
     stm_ebr_exit(ebr);
+    if (ls == STM_ECORRUPT) {
+        /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
+        iidx = stm_sync_inode_index(fs->sync);
+        if (!iidx) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+        ls = stm_inode_lookup(iidx, ds, ino, &v);
+        pthread_rwlock_unlock(&fs->global);
+    }
     if (ls == STM_ENOENT) {
         /* stm_inode_next_ino takes its own subsystem-internal mutex;
          * safe without fs->global. */
@@ -5103,97 +5264,192 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
     if (!ebr) return STM_ENOMEM;
     stm_ebr_enter(ebr);
 
+    bool no_dots = (flags & STM_FS_READDIR_FLAG_NO_DOTS) != 0u;
+    bool need_fallback = false;
     struct stm_inode_value dv = {0};
     stm_status ds = fs_load_parent_dir_concurrent(iidx, ebr, dataset_id,
                                                      dir_ino, &dv);
-    if (ds != STM_OK) {
+    if (ds == STM_ECORRUPT) need_fallback = true;
+    else if (ds != STM_OK) {
         stm_ebr_exit(ebr);
         return ds;
     }
 
-    bool no_dots = (flags & STM_FS_READDIR_FLAG_NO_DOTS) != 0u;
     uint64_t local_cursor = *cursor;
     size_t emitted = 0;
 
-    if (local_cursor == 0u) {
-        if (!no_dots) {
-            if (emitted < max_entries) {
-                fs_readdir_synth_dot(&out_entries[emitted], dir_ino, 1);
-                emitted++;
+    if (!need_fallback) {
+        if (local_cursor == 0u) {
+            if (!no_dots) {
+                if (emitted < max_entries) {
+                    fs_readdir_synth_dot(&out_entries[emitted], dir_ino, 1);
+                    emitted++;
+                    local_cursor = 1u;
+                }
+            } else {
                 local_cursor = 1u;
             }
-        } else {
-            local_cursor = 1u;
         }
-    }
 
-    if (local_cursor == 1u) {
-        if (!no_dots) {
-            if (emitted < max_entries) {
-                fs_readdir_synth_dot(&out_entries[emitted], parent_ino, 2);
-                emitted++;
+        if (local_cursor == 1u) {
+            if (!no_dots) {
+                if (emitted < max_entries) {
+                    fs_readdir_synth_dot(&out_entries[emitted], parent_ino, 2);
+                    emitted++;
+                    local_cursor = 2u;
+                }
+            } else {
                 local_cursor = 2u;
             }
-        } else {
-            local_cursor = 2u;
-        }
-    }
-
-    if (local_cursor >= 2u && emitted < max_entries) {
-        uint64_t dirent_cursor = local_cursor - 2u;
-        size_t dirent_max = max_entries - emitted;
-
-        if (dirent_max > SIZE_MAX / sizeof(stm_dirent_entry)) {
-            stm_ebr_exit(ebr);
-            return STM_ENOMEM;
-        }
-        stm_dirent_entry *batch = malloc(dirent_max * sizeof *batch);
-        if (!batch) {
-            stm_ebr_exit(ebr);
-            return STM_ENOMEM;
         }
 
-        size_t batch_n = 0;
-        stm_status rs = stm_dirent_readdir_concurrent(didx, ebr, dataset_id,
-                                                         dir_ino, &dirent_cursor,
-                                                         batch, dirent_max,
-                                                         &batch_n);
-        if (rs != STM_OK) {
-            free(batch);
-            stm_ebr_exit(ebr);
-            return rs;
-        }
+        if (local_cursor >= 2u && emitted < max_entries) {
+            uint64_t dirent_cursor = local_cursor - 2u;
+            size_t dirent_max = max_entries - emitted;
 
-        for (size_t k = 0; k < batch_n; k++) {
-            /* R75 P3-4: defense-in-depth name_len bound at the
-             * fs.c → dirent.c trust boundary. */
-            if (batch[k].name_len > STM_DIRENT_NAME_MAX) {
+            if (dirent_max > SIZE_MAX / sizeof(stm_dirent_entry)) {
+                stm_ebr_exit(ebr);
+                return STM_ENOMEM;
+            }
+            stm_dirent_entry *batch = malloc(dirent_max * sizeof *batch);
+            if (!batch) {
+                stm_ebr_exit(ebr);
+                return STM_ENOMEM;
+            }
+
+            size_t batch_n = 0;
+            stm_status rs = stm_dirent_readdir_concurrent(didx, ebr, dataset_id,
+                                                             dir_ino, &dirent_cursor,
+                                                             batch, dirent_max,
+                                                             &batch_n);
+            if (rs == STM_ECORRUPT) {
+                free(batch);
+                need_fallback = true;
+            } else if (rs != STM_OK) {
                 free(batch);
                 stm_ebr_exit(ebr);
-                return STM_ECORRUPT;
-            }
-            out_entries[emitted].child_ino  = batch[k].child_ino;
-            out_entries[emitted].child_gen  = batch[k].child_gen;
-            out_entries[emitted].child_type = batch[k].child_type;
-            out_entries[emitted].name_len   = batch[k].name_len;
-            memset(out_entries[emitted].name, 0, sizeof out_entries[emitted].name);
-            if (batch[k].name_len > 0u)
-                memcpy(out_entries[emitted].name, batch[k].name,
-                          batch[k].name_len);
-            emitted++;
-        }
-        free(batch);
+                return rs;
+            } else {
+                for (size_t k = 0; k < batch_n; k++) {
+                    /* R75 P3-4: defense-in-depth name_len bound. */
+                    if (batch[k].name_len > STM_DIRENT_NAME_MAX) {
+                        free(batch);
+                        stm_ebr_exit(ebr);
+                        return STM_ECORRUPT;
+                    }
+                    out_entries[emitted].child_ino  = batch[k].child_ino;
+                    out_entries[emitted].child_gen  = batch[k].child_gen;
+                    out_entries[emitted].child_type = batch[k].child_type;
+                    out_entries[emitted].name_len   = batch[k].name_len;
+                    memset(out_entries[emitted].name, 0, sizeof out_entries[emitted].name);
+                    if (batch[k].name_len > 0u)
+                        memcpy(out_entries[emitted].name, batch[k].name,
+                                  batch[k].name_len);
+                    emitted++;
+                }
+                free(batch);
 
-        if (dirent_cursor > UINT64_MAX - 2u) {
-            local_cursor = UINT64_MAX;
-        } else {
-            local_cursor = dirent_cursor + 2u;
+                if (dirent_cursor > UINT64_MAX - 2u) {
+                    local_cursor = UINT64_MAX;
+                } else {
+                    local_cursor = dirent_cursor + 2u;
+                }
+            }
         }
+    }
+    stm_ebr_exit(ebr);
+
+    if (need_fallback) {
+        /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale.
+         * Reset emitted + local_cursor so the serial path replays
+         * the synth-dot + scan from the caller's *cursor. */
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
+        iidx = stm_sync_inode_index(fs->sync);
+        didx = stm_sync_dirent_index(fs->sync);
+        if (!iidx || !didx) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+        memset(&dv, 0, sizeof dv);
+        ds = fs_load_parent_dir(iidx, dataset_id, dir_ino, &dv);
+        if (ds != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ds;
+        }
+        local_cursor = *cursor;
+        emitted = 0;
+        if (local_cursor == 0u) {
+            if (!no_dots) {
+                if (emitted < max_entries) {
+                    fs_readdir_synth_dot(&out_entries[emitted], dir_ino, 1);
+                    emitted++;
+                    local_cursor = 1u;
+                }
+            } else {
+                local_cursor = 1u;
+            }
+        }
+        if (local_cursor == 1u) {
+            if (!no_dots) {
+                if (emitted < max_entries) {
+                    fs_readdir_synth_dot(&out_entries[emitted], parent_ino, 2);
+                    emitted++;
+                    local_cursor = 2u;
+                }
+            } else {
+                local_cursor = 2u;
+            }
+        }
+        if (local_cursor >= 2u && emitted < max_entries) {
+            uint64_t dirent_cursor = local_cursor - 2u;
+            size_t dirent_max = max_entries - emitted;
+            if (dirent_max > SIZE_MAX / sizeof(stm_dirent_entry)) {
+                pthread_rwlock_unlock(&fs->global);
+                return STM_ENOMEM;
+            }
+            stm_dirent_entry *batch = malloc(dirent_max * sizeof *batch);
+            if (!batch) {
+                pthread_rwlock_unlock(&fs->global);
+                return STM_ENOMEM;
+            }
+            size_t batch_n = 0;
+            stm_status rs = stm_dirent_readdir(didx, dataset_id, dir_ino,
+                                                  &dirent_cursor,
+                                                  batch, dirent_max, &batch_n);
+            if (rs != STM_OK) {
+                free(batch);
+                pthread_rwlock_unlock(&fs->global);
+                return rs;
+            }
+            for (size_t k = 0; k < batch_n; k++) {
+                if (batch[k].name_len > STM_DIRENT_NAME_MAX) {
+                    free(batch);
+                    pthread_rwlock_unlock(&fs->global);
+                    return STM_ECORRUPT;
+                }
+                out_entries[emitted].child_ino  = batch[k].child_ino;
+                out_entries[emitted].child_gen  = batch[k].child_gen;
+                out_entries[emitted].child_type = batch[k].child_type;
+                out_entries[emitted].name_len   = batch[k].name_len;
+                memset(out_entries[emitted].name, 0, sizeof out_entries[emitted].name);
+                if (batch[k].name_len > 0u)
+                    memcpy(out_entries[emitted].name, batch[k].name,
+                              batch[k].name_len);
+                emitted++;
+            }
+            free(batch);
+            if (dirent_cursor > UINT64_MAX - 2u) {
+                local_cursor = UINT64_MAX;
+            } else {
+                local_cursor = dirent_cursor + 2u;
+            }
+        }
+        pthread_rwlock_unlock(&fs->global);
     }
 
     *cursor = local_cursor;
     *out_returned = emitted;
-    stm_ebr_exit(ebr);
     return STM_OK;
 }
 
@@ -5361,15 +5617,35 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     memset(&iv, 0, sizeof iv);
     stm_status is = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
                                                    ino, &iv);
-    if (is != STM_OK) {
-        stm_ebr_exit(ebr);
-        return is;
+    stm_status s = STM_ECORRUPT;
+    if (is == STM_OK) {
+        s = stm_xattr_get_concurrent(xidx, ebr, dataset_id, ino,
+                                        name, name_len,
+                                        value_buf, value_max, out_size);
     }
-
-    stm_status s = stm_xattr_get_concurrent(xidx, ebr, dataset_id, ino,
-                                               name, name_len,
-                                               value_buf, value_max, out_size);
     stm_ebr_exit(ebr);
+    if (is != STM_OK && is != STM_ECORRUPT) return is;
+    if (is == STM_OK && s != STM_ECORRUPT) return s;
+
+    /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_READ(fs);
+    iidx = stm_sync_inode_index(fs->sync);
+    xidx = stm_sync_xattr_index(fs->sync);
+    if (!iidx || !xidx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_EINVAL;
+    }
+    memset(&iv, 0, sizeof iv);
+    stm_status is2 = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+    if (is2 != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return is2;
+    }
+    if (out_size) *out_size = 0;
+    s = stm_xattr_get(xidx, dataset_id, ino, name, name_len,
+                         value_buf, value_max, out_size);
+    pthread_rwlock_unlock(&fs->global);
     return s;
 }
 
@@ -5401,49 +5677,106 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!ebr) return STM_ENOMEM;
     stm_ebr_enter(ebr);
 
+    bool need_fallback = false;
     struct stm_inode_value iv;
     memset(&iv, 0, sizeof iv);
     stm_status ps = stm_inode_lookup_concurrent(iidx, ebr,
                                                   dataset_id, ino, &iv);
-    if (ps != STM_OK) {
+    if (ps == STM_ECORRUPT) need_fallback = true;
+    else if (ps != STM_OK) {
         stm_ebr_exit(ebr);
         return ps;
     }
 
-    /* First pass: probe the count via xa_list_concurrent with
-     * max_entries=0 to compute the total. */
     size_t n_total = 0;
-    stm_status ps0 = stm_xattr_list_concurrent(xidx, ebr, dataset_id, ino,
-                                                  NULL, 0, &n_total);
-    if (ps0 != STM_OK) {
-        stm_ebr_exit(ebr);
-        return ps0;
+    size_t got = 0;
+    stm_xattr_entry *batch = NULL;
+    if (!need_fallback) {
+        /* First pass: probe the count. */
+        stm_status ps0 = stm_xattr_list_concurrent(xidx, ebr, dataset_id, ino,
+                                                      NULL, 0, &n_total);
+        if (ps0 == STM_ECORRUPT) need_fallback = true;
+        else if (ps0 != STM_OK) {
+            stm_ebr_exit(ebr);
+            return ps0;
+        }
     }
 
-    if (n_total == 0) {
+    if (!need_fallback && n_total == 0) {
         *out_total_len = 0;
         stm_ebr_exit(ebr);
         return STM_OK;
     }
 
-    if (n_total > SIZE_MAX / sizeof(stm_xattr_entry)) {
-        stm_ebr_exit(ebr);
-        return STM_ENOMEM;
-    }
-    stm_xattr_entry *batch = malloc(n_total * sizeof *batch);
-    if (!batch) {
-        stm_ebr_exit(ebr);
-        return STM_ENOMEM;
-    }
-    size_t got = 0;
-    stm_status ls = stm_xattr_list_concurrent(xidx, ebr, dataset_id, ino,
-                                                 batch, n_total, &got);
-    if (ls != STM_OK || got != n_total) {
-        free(batch);
-        stm_ebr_exit(ebr);
-        return (ls != STM_OK) ? ls : STM_ECORRUPT;
+    if (!need_fallback) {
+        if (n_total > SIZE_MAX / sizeof(stm_xattr_entry)) {
+            stm_ebr_exit(ebr);
+            return STM_ENOMEM;
+        }
+        batch = malloc(n_total * sizeof *batch);
+        if (!batch) {
+            stm_ebr_exit(ebr);
+            return STM_ENOMEM;
+        }
+        stm_status ls = stm_xattr_list_concurrent(xidx, ebr, dataset_id, ino,
+                                                     batch, n_total, &got);
+        /* R171 P1-2: count-vs-materialize TOCTOU under same-engine
+         * writer → treat count-mismatch as STM_ECORRUPT + fall back. */
+        if (ls == STM_ECORRUPT || (ls == STM_OK && got != n_total)) {
+            free(batch);
+            batch = NULL;
+            need_fallback = true;
+        } else if (ls != STM_OK) {
+            free(batch);
+            stm_ebr_exit(ebr);
+            return ls;
+        }
     }
     stm_ebr_exit(ebr);
+
+    if (need_fallback) {
+        /* R171 P1-1/P1-2 SH-fallback. See stm_fs_stat for rationale. */
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
+        iidx = stm_sync_inode_index(fs->sync);
+        xidx = stm_sync_xattr_index(fs->sync);
+        if (!iidx || !xidx) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+        memset(&iv, 0, sizeof iv);
+        stm_status ps2 = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+        if (ps2 != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ps2;
+        }
+        stm_status ls2 = stm_xattr_list(xidx, dataset_id, ino, NULL, 0,
+                                             &n_total);
+        if (ls2 != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ls2;
+        }
+        if (n_total == 0) {
+            *out_total_len = 0;
+            pthread_rwlock_unlock(&fs->global);
+            return STM_OK;
+        }
+        if (n_total > SIZE_MAX / sizeof(stm_xattr_entry)) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_ENOMEM;
+        }
+        batch = malloc(n_total * sizeof *batch);
+        if (!batch) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_ENOMEM;
+        }
+        ls2 = stm_xattr_list(xidx, dataset_id, ino, batch, n_total, &got);
+        pthread_rwlock_unlock(&fs->global);
+        if (ls2 != STM_OK || got != n_total) {
+            free(batch);
+            return (ls2 != STM_OK) ? ls2 : STM_ECORRUPT;
+        }
+    }
 
     /* Compute total byte length (sum of (name_len + 1)). */
     size_t total_len = 0;
