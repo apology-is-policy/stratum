@@ -13,6 +13,9 @@
 #include <stratum/btree_store.h>
 #include <stratum/btnode.h>
 
+#include <pthread.h>
+#include <stdatomic.h>
+
 /* Payload bytes available in one engine node — between the 128-byte
  * header and the trailing 32-byte csum slot. */
 #define ENG_PAYLOAD_CAP   STM_BTNODE_PAYLOAD_CAP(STM_BTREE_ENGINE_NODE_SIZE)
@@ -85,6 +88,48 @@
      ENG_SPILL_CHUNK_CAP)
 
 typedef struct eng_node eng_node;
+
+/* ========================================================================= */
+/* Bw-tree-shaped delta chain (9.8-LF-1).                                      */
+/* ========================================================================= */
+
+/*
+ * Per-node in-memory message buffer — Bε in motion. Every non-leaf root
+ * and every node can carry a LIFO chain of pending mutations that
+ * readers must walk newest-first BEFORE consulting the base node;
+ * consolidation (commit time, 9.8-LF-2+) drains the chain into the
+ * base node's sorted entries (leaf) or the sorted on-disk buffer
+ * region (internal — 9.8-BE-format).
+ *
+ * LF-1 ships the structure + the reader-side walk (`chain_resolve` in
+ * engine.c). No code path PREPENDS yet — the writer-side CAS-prepend
+ * is 9.8-BE-prepend. So at LF-1 the chain is always empty; the
+ * `_concurrent` lookup walks an empty chain in O(1) and falls through
+ * to the existing single-threaded descent.
+ *
+ * Spec composition: realizes the message-resolution side of
+ * v2/specs/bepsilon.tla::PerKeyNewestWins (the reader sees the newest
+ * applicable message); `next` pointers stable for the EBR epoch
+ * duration realizes concurrency_mvcc.tla::ReaderObservesCoherentTree.
+ *
+ * Ownership: every delta owns its `key` + `value` heap; freed once
+ * the delta is past EBR retire grace at LF-2.
+ */
+typedef enum {
+    ENG_DELTA_INSERT = 1,           /* upsert (key, value) */
+    ENG_DELTA_DELETE = 2,           /* remove key — tombstone */
+} eng_delta_op;
+
+typedef struct eng_delta eng_delta;
+struct eng_delta {
+    eng_delta_op  op;
+    uint64_t      seq;              /* monotonic per engine — total order */
+    uint8_t      *key;              /* owned; NULL iff key_len == 0 */
+    uint32_t      key_len;
+    uint8_t      *value;            /* owned; INSERT only; NULL iff val_len == 0 */
+    uint32_t      value_len;
+    eng_delta    *next;             /* LIFO — newest at chain head */
+};
 
 /*
  * Out-of-line state for a spilled leaf value. NULL on an eng_entry
@@ -184,6 +229,23 @@ struct eng_node {
     uint32_t   pivots_cap;
     eng_child *children;
     uint32_t   children_cap;
+
+    /* 9.8-LF-1: in-memory Bε delta chain (RAM-only; never persisted).
+     *
+     * `chain_head` is CAS-prepended by the writer and atomically loaded
+     * by the reader. Walked newest-first; consolidation at commit time
+     * (9.8-LF-2+) drains it. NULL means an empty chain — the steady
+     * state at LF-1 where no prepend path exists yet.
+     *
+     * `flush_mu` serialises future per-node consolidation (the commit
+     * thread acquires it before draining `chain_head`); readers don't
+     * touch it. `chain_depth` is observability — atomically incremented
+     * on prepend, decremented on drain; used by flush triggers and
+     * tests. Both reserved at LF-1; first writer at 9.8-BE-prepend.
+     */
+    _Atomic(eng_delta *)  chain_head;
+    pthread_mutex_t       flush_mu;
+    _Atomic(uint32_t)     chain_depth;
 };
 
 /* ========================================================================= */
@@ -312,6 +374,22 @@ struct stm_btree_engine {
      * them); invalidate_memtree clears it (a delete is reverted with
      * the dropped in-memory tree); destroy frees the backing store. */
     paddr_vec   orphaned_spill_blocks;
+
+    /* 9.8-LF-1: lock-free concurrency substrate.
+     *
+     * `commit_mu` serialises engine-internal commits (one in-flight
+     * three-phase commit per engine). LF-2 wires this around the
+     * mvcc_root CAS publish + EBR retire of the prior root; LF-1
+     * reserves it.
+     *
+     * `next_delta_seq` is the engine-wide monotonic source for
+     * `eng_delta::seq` — gives every prepended message a total order
+     * across nodes (used by the future consolidator to merge LIFO
+     * chains from sibling pivots into a single timeline). Atomic
+     * fetch-add at the prepend site. LF-1 reserves it.
+     */
+    pthread_mutex_t   commit_mu;
+    _Atomic(uint64_t) next_delta_seq;
 };
 
 /* ========================================================================= */
@@ -328,6 +406,12 @@ eng_node  *eng_node_new_internal(void);
 eng_node  *eng_node_new_internal_sized(uint32_t np, uint32_t nc);
 void       eng_node_free(eng_node *n);            /* one node only */
 void       eng_node_free_recursive(eng_node *n);  /* node + in-memory subtree */
+
+/* 9.8-LF-1: free a single delta (key/value heap + the record). NULL-safe.
+ * Used (a) by node.c at node-destroy time to drain any residual chain,
+ * and (b) at 9.8-LF-2 as the EBR retire destructor for consolidated
+ * deltas. */
+void       eng_delta_free(eng_delta *d);
 
 /* Lower-bound index of `key` among a leaf's entries; *out_found set
  * TRUE iff an exact match sits at that index. */

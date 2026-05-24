@@ -76,6 +76,16 @@ static stm_status engine_alloc(const stm_btree_store_vtable *vt, void *vt_ctx,
     eng->cx      = *cx;          /* metadata_key pointer borrowed */
     eng->tree_id = tree_id;
     eng_cache_init(&eng->cache);
+    /* 9.8-LF-1: concurrency substrate. commit_mu serialises future
+     * three-phase commits (LF-2 wires it around the mvcc_root CAS);
+     * next_delta_seq is the engine-wide monotonic source for delta
+     * seq numbers (LF-BE-prepend's CAS-prepend site reads it). */
+    if (pthread_mutex_init(&eng->commit_mu, NULL) != 0) {
+        eng_cache_destroy(&eng->cache);
+        free(eng);
+        return STM_ENOMEM;
+    }
+    atomic_init(&eng->next_delta_seq, (uint64_t)0);
     *out = eng;
     return STM_OK;
 }
@@ -134,6 +144,7 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
     eng_node_free_recursive(eng->root);    /* frees every in-memory node */
     eng_cache_destroy(&eng->cache);        /* frees the index, not nodes */
     paddr_vec_free(&eng->orphaned_spill_blocks);
+    pthread_mutex_destroy(&eng->commit_mu);
     free(eng);
 }
 
@@ -345,6 +356,137 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
         s = load_child(eng, node, idx, &node);
         if (s != STM_OK) return s;
     }
+
+    bool found = false;
+    uint32_t i = eng_leaf_lower_bound(node, key, key_len, &found);
+    if (!found) return STM_OK;             /* miss — outs already cleared */
+
+    *out_found = true;
+    uint32_t vl = node->entries[i].val_len;
+    if (vl) {
+        void *v = malloc(vl);
+        if (!v) return STM_ENOMEM;
+        memcpy(v, node->entries[i].val, vl);
+        *out_value = v;
+    }
+    *out_value_len = vl;
+    return STM_OK;
+}
+
+/* ========================================================================= */
+/* 9.8-LF-1: concurrent (EBR-pinned) lookup.                                   */
+/* ========================================================================= */
+
+/*
+ * Walk node `n`'s in-memory delta chain newest-first looking for an
+ * applicable message for `key`. On a hit, populate `*out_kind` with
+ * the delta op (INSERT / DELETE) and — for INSERT — copy the value
+ * into a freshly malloc'd buffer at (*out_value, *out_value_len);
+ * the caller frees *out_value. On a miss, *out_kind = 0 and the value
+ * outs are left untouched.
+ *
+ * Memory ordering:
+ *   - Head load is `acquire` so that the (currently absent) writer's
+ *     CAS-release publish at LF-BE-prepend synchronises-with the
+ *     reader's chain traversal — the reader sees every byte of every
+ *     delta that's reachable from `head`.
+ *   - `next` pointers are stable for the EBR epoch duration (a delta
+ *     ever made reachable stays alive until at least one EBR advance
+ *     past the consolidator's retire). The reader is inside an EBR
+ *     epoch (caller contract), so the walk is wait-free + safe.
+ *
+ * Spec composition: realizes bepsilon.tla::PerKeyNewestWins (LIFO
+ * walk; first applicable delta wins) and the chain-side of
+ * concurrency_mvcc.tla::ReaderObservesCoherentTree (the EBR epoch
+ * bounds delta lifetime).
+ *
+ * Returns STM_OK with *out_kind == 0 when the chain has no message
+ * for `key`. STM_ENOMEM when an INSERT's value copy fails.
+ */
+static stm_status chain_resolve_for_key(const eng_node *n,
+                                         const void *key, size_t key_len,
+                                         uint32_t *out_kind,
+                                         void **out_value,
+                                         size_t *out_value_len)
+{
+    *out_kind = 0;
+    eng_delta *d = atomic_load_explicit(&n->chain_head, memory_order_acquire);
+    while (d) {
+        if (eng_key_cmp(d->key, d->key_len, key, key_len) == 0) {
+            if (d->op == ENG_DELTA_DELETE) {
+                *out_kind = ENG_DELTA_DELETE;
+                return STM_OK;
+            }
+            /* ENG_DELTA_INSERT — newest wins; copy the value out. */
+            *out_kind = ENG_DELTA_INSERT;
+            if (d->value_len) {
+                void *v = malloc(d->value_len);
+                if (!v) return STM_ENOMEM;
+                memcpy(v, d->value, d->value_len);
+                *out_value     = v;
+                *out_value_len = d->value_len;
+            } else {
+                *out_value     = NULL;
+                *out_value_len = 0;
+            }
+            return STM_OK;
+        }
+        d = d->next;
+    }
+    return STM_OK;                          /* miss — chain has no msg */
+}
+
+stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
+                                               stm_ebr_thread *ebr,
+                                               const void *key, size_t key_len,
+                                               bool *out_found,
+                                               void **out_value,
+                                               size_t *out_value_len)
+{
+    if (!eng || !ebr || !out_found || !out_value || !out_value_len)
+        return STM_EINVAL;
+    if (key_len && !key) return STM_EINVAL;
+    *out_found     = false;
+    *out_value     = NULL;
+    *out_value_len = 0;
+    /* `ebr` value is documentation at LF-1: caller's pre-`enter`
+     * keeps every node we touch alive. Suppress unused-arg under
+     * compilers that don't see through the validation check. */
+    (void)ebr;
+    if (eng->pending.active) return STM_EBUSY;
+
+    eng_node *node = NULL;
+    stm_status s = load_root(eng, &node);
+    if (s != STM_OK) return s;
+
+    /* Descent — walk the chain at every node before consulting the
+     * base. The chain at every internal node is empty at LF-1 (no
+     * writer-side prepend exists yet); LF-BE-prepend lights the
+     * code paths up. */
+    for (uint32_t depth = 0; !node->is_leaf; depth++) {
+        if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+
+        uint32_t kind = 0;
+        s = chain_resolve_for_key(node, key, key_len, &kind,
+                                  out_value, out_value_len);
+        if (s != STM_OK) return s;
+        if (kind == ENG_DELTA_INSERT) { *out_found = true;  return STM_OK; }
+        if (kind == ENG_DELTA_DELETE) { *out_found = false; return STM_OK; }
+
+        uint32_t idx = eng_pivot_child_for(node, key, key_len);
+        s = load_child(eng, node, idx, &node);
+        if (s != STM_OK) return s;
+    }
+
+    /* Leaf — consult the leaf's chain first, then its sorted entries.
+     * (The leaf-side chain hosts the same message vocabulary; useful
+     * once a flush cascades messages all the way to leaves, 9.8-BE.) */
+    uint32_t kind = 0;
+    s = chain_resolve_for_key(node, key, key_len, &kind,
+                              out_value, out_value_len);
+    if (s != STM_OK) return s;
+    if (kind == ENG_DELTA_INSERT) { *out_found = true;  return STM_OK; }
+    if (kind == ENG_DELTA_DELETE) { *out_found = false; return STM_OK; }
 
     bool found = false;
     uint32_t i = eng_leaf_lower_bound(node, key, key_len, &found);

@@ -45,6 +45,11 @@
 extern "C" {
 #endif
 
+/* Forward decl of the EBR per-thread handle; the full type lives in
+ * <stratum/ebr.h>. Callers of the *_concurrent API include ebr.h and
+ * pass a registered handle that they have already stm_ebr_enter'd. */
+typedef struct stm_ebr_thread stm_ebr_thread;
+
 /* ========================================================================= */
 /* Constants.                                                                 */
 /* ========================================================================= */
@@ -183,6 +188,50 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
                                     const void *key, size_t key_len,
                                     bool *out_found,
                                     void **out_value, size_t *out_value_len);
+
+/*
+ * Lookup `key` from a thread that pre-entered the EBR epoch — the
+ * lock-free metadata-read sibling of stm_btree_engine_lookup.
+ *
+ * Phase 9.8-LF-1 ships the surface; LF-2 wires the mvcc_root atomic
+ * publish so concurrent commits become invisible to readers; LF-3
+ * ports fs.c pure-read ops to drop fs->global SH and pin EBR instead.
+ * The crown-jewel claim — wait-free metadata reads against an
+ * arbitrarily-loaded tree — lands at LF-3.
+ *
+ * Contract:
+ *   - `ebr` is the calling thread's registered handle. The caller
+ *     MUST have already called stm_ebr_enter(ebr) before this call
+ *     and MUST call stm_ebr_exit(ebr) after; nesting is forbidden
+ *     (the EBR contract). The engine does NOT enter/exit itself —
+ *     composability with multi-tree readers (one EBR enter spans
+ *     descents across N engines).
+ *   - Semantics IDENTICAL to stm_btree_engine_lookup: same return
+ *     codes, same value-copy contract, same key-len bounds.
+ *
+ * Walks the in-memory Bε delta chain at every node visited during
+ * descent, newest-first, BEFORE the base-node lookup. At LF-1 the
+ * chain is always empty (no writer prepends yet); the walk is O(1)
+ * and the impl falls through to the existing single-threaded descent.
+ * The chain-aware shape becomes load-bearing at 9.8-BE-prepend.
+ *
+ * Returns STM_EINVAL on NULL `eng` / `ebr` / out params or a NULL
+ * `key` with nonzero key_len, STM_EBUSY during an un-finalized commit
+ * flush, STM_ENOMEM / STM_ECORRUPT / device errors otherwise.
+ *
+ * Spec composition:
+ *   bepsilon.tla::PerKeyNewestWins — chain walk is LIFO; first
+ *     matching delta wins.
+ *   concurrency_mvcc.tla::ReaderObservesCoherentTree — EBR pin
+ *     bounds the lifetime of every node the descent visits.
+ */
+STM_MUST_USE
+stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
+                                               stm_ebr_thread *ebr,
+                                               const void *key, size_t key_len,
+                                               bool *out_found,
+                                               void **out_value,
+                                               size_t *out_value_len);
 
 /*
  * Delete `key`. On a hit the entry is removed and — if `out_found` is

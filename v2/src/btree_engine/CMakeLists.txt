@@ -9,7 +9,7 @@ target_include_directories(stm_btree_engine PUBLIC
 
 target_link_libraries(stm_btree_engine
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  stm_btnode stm_btree_store stm_hash)
+    PUBLIC  stm_btnode stm_btree_store stm_hash Threads::Threads)
 
 # Phase 9.6-impl-4b: the production storage vtable binding the engine to
 # stm_bootstrap + stm_bdev. A separate library so stm_btree_engine itself

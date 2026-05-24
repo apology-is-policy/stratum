@@ -91,12 +91,29 @@ static stm_status grow_children(eng_node *n, uint32_t want)
 /* Node lifecycle.                                                            */
 /* ========================================================================= */
 
+/* 9.8-LF-1: per-node concurrency-substrate initialisation.
+ *
+ * `chain_head` + `chain_depth` are zero from calloc — explicit
+ * atomic_init makes the publication explicit and traps the (rare)
+ * platform where _Atomic types need non-trivial init.
+ * `flush_mu` is pthread_mutex_init; pthread_mutex_destroy in
+ * eng_node_free. */
+static stm_status node_init_chain_substrate(eng_node *n)
+{
+    atomic_init(&n->chain_head, NULL);
+    atomic_init(&n->chain_depth, 0u);
+    if (pthread_mutex_init(&n->flush_mu, NULL) != 0)
+        return STM_ENOMEM;
+    return STM_OK;
+}
+
 eng_node *eng_node_new_leaf(void)
 {
     eng_node *n = calloc(1, sizeof *n);
     if (!n) return NULL;
     n->is_leaf = true;
     n->dirty   = true;          /* fresh in RAM — never written */
+    if (node_init_chain_substrate(n) != STM_OK) { free(n); return NULL; }
     return n;
 }
 
@@ -106,6 +123,7 @@ eng_node *eng_node_new_internal(void)
     if (!n) return NULL;
     n->is_leaf = false;
     n->dirty   = true;
+    if (node_init_chain_substrate(n) != STM_OK) { free(n); return NULL; }
     return n;
 }
 
@@ -126,9 +144,38 @@ eng_node *eng_node_new_internal_sized(uint32_t np, uint32_t nc)
     return n;
 }
 
+void eng_delta_free(eng_delta *d)
+{
+    if (!d) return;
+    free(d->key);
+    free(d->value);
+    free(d);
+}
+
+/* Drain any residual delta chain at node-destroy. Safe whether the
+ * chain is empty (the LF-1 steady state, every node) or carries
+ * mutations a writer prepended after LF-2; either way the deltas die
+ * with the node. Single-threaded: destroy is the engine teardown
+ * path, no concurrent reader / writer can be touching the node.
+ *
+ * LF-2 retires consolidated deltas via EBR; this path frees only the
+ * never-consolidated residue at engine destroy. */
+static void node_drain_chain(eng_node *n)
+{
+    eng_delta *d = atomic_load_explicit(&n->chain_head, memory_order_relaxed);
+    atomic_store_explicit(&n->chain_head, NULL, memory_order_relaxed);
+    while (d) {
+        eng_delta *next = d->next;
+        eng_delta_free(d);
+        d = next;
+    }
+}
+
 void eng_node_free(eng_node *n)
 {
     if (!n) return;
+    node_drain_chain(n);
+    pthread_mutex_destroy(&n->flush_mu);
     for (uint32_t i = 0; i < n->n_entries; i++) {
         free(n->entries[i].key);
         free(n->entries[i].val);

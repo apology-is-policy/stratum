@@ -27,7 +27,10 @@
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
 #include <stratum/crypto.h>
+#include <stratum/ebr.h>           /* 9.8-LF-1: concurrent-lookup harness */
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2640,6 +2643,321 @@ STM_TEST(engine_walk_paddrs_args) {
                    STM_EBUSY);
     STM_ASSERT_OK(stm_btree_engine_commit_finalize(eng));
 
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+/* ========================================================================= */
+/* 9.8-LF-1: concurrent-lookup (EBR-pinned) tests.                             */
+/* ========================================================================= */
+
+/*
+ * LF-1 ships the surface. The writer-side CAS-prepend lands at
+ * 9.8-BE-prepend; at LF-1 the in-memory delta chain at every node is
+ * always empty, and the concurrent lookup walks an empty chain in
+ * O(1) at each node, then falls through to the existing serial
+ * descent. These tests pin the contract that lookup_concurrent
+ * returns the SAME (found, value) tuple lookup does, across a tree
+ * shape that exercises every code path the concurrent walk has
+ * (single-level, multi-level, leaf-chain, internal-chain — the
+ * chain code paths are exercised even when the chain is empty
+ * because chain_resolve_for_key runs on every node visited).
+ */
+
+/* Helper: assert lookup_concurrent's return matches lookup's. */
+static void assert_concurrent_matches_serial(stm_btree_engine *eng,
+                                              stm_ebr_thread *me,
+                                              const void *key, size_t kl)
+{
+    bool   ser_found = false; void *ser_val = NULL; size_t ser_vl = 0;
+    bool   con_found = false; void *con_val = NULL; size_t con_vl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, key, kl,
+                                          &ser_found, &ser_val, &ser_vl));
+    STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me, key, kl,
+                                                    &con_found, &con_val, &con_vl));
+    STM_ASSERT_EQ(con_found ? 1 : 0, ser_found ? 1 : 0);
+    STM_ASSERT_EQ((long long)con_vl, (long long)ser_vl);
+    if (ser_found && ser_vl > 0) {
+        STM_ASSERT_TRUE(con_val != NULL);
+        if (con_val) STM_ASSERT_MEM_EQ(con_val, ser_val, ser_vl);
+    }
+    free(ser_val); free(con_val);
+}
+
+STM_TEST(engine_lf1_concurrent_lookup_single_level) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    /* A few entries — small enough to stay one leaf, so the descent
+     * touches only the root (a leaf), exercising the leaf-chain
+     * walk path. */
+    static const char *keys[] = { "alpha", "bravo", "charlie", "delta" };
+    static const char *vals[] = { "A",     "BB",    "CCC",     "DDDD"   };
+    for (size_t i = 0; i < 4; i++)
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, keys[i], strlen(keys[i]),
+                                              vals[i], strlen(vals[i])));
+
+    uint64_t rp = 0; uint8_t rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+
+    /* Pre-warm: a serial lookup of each key loads the root + leaves
+     * into RAM so subsequent _concurrent calls hit cached `mem`
+     * pointers and don't trigger I/O via the (non-thread-safe at
+     * LF-1) load_root / load_child. */
+    bool found = false; void *val = NULL; size_t vl = 0;
+    for (size_t i = 0; i < 4; i++) {
+        STM_ASSERT_OK(stm_btree_engine_lookup(eng, keys[i], strlen(keys[i]),
+                                              &found, &val, &vl));
+        free(val); val = NULL;
+    }
+
+    stm_ebr_enter(me);
+    for (size_t i = 0; i < 4; i++)
+        assert_concurrent_matches_serial(eng, me, keys[i], strlen(keys[i]));
+    /* Miss case — chain miss + leaf-lower-bound miss. */
+    assert_concurrent_matches_serial(eng, me, "missing", 7);
+    /* Zero-length key — the engine accepts the empty key as the minimum. */
+    assert_concurrent_matches_serial(eng, me, NULL, 0);
+    stm_ebr_exit(me);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
+STM_TEST(engine_lf1_concurrent_lookup_multilevel) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    /* Enough entries to force a multi-level tree. The descent walks
+     * internal nodes — exercising chain_resolve_for_key on every
+     * internal node visited (chain is empty; falls through to the
+     * pivot descent). */
+    enum { N = 600u };
+    char k[32], v[32];
+    for (uint32_t i = 0; i < N; i++) {
+        int kl = snprintf(k, sizeof k, "key-%06u", i);
+        int vl = snprintf(v, sizeof v, "val-%06u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, k, (size_t)kl, v, (size_t)vl));
+    }
+    uint64_t rp = 0; uint8_t rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+
+    /* Verify the tree is genuinely multi-level — otherwise the test
+     * doesn't exercise the internal-node chain-walk path. */
+    stm_btree_engine_stats st = { 0 };
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st));
+    STM_ASSERT_TRUE(st.height >= 2u);
+
+    /* Pre-warm via a full serial scan-ish pass so every node is in
+     * RAM before the concurrent walks fire. */
+    bool found = false; void *val = NULL; size_t vlen = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        int kl = snprintf(k, sizeof k, "key-%06u", i);
+        STM_ASSERT_OK(stm_btree_engine_lookup(eng, k, (size_t)kl,
+                                              &found, &val, &vlen));
+        free(val); val = NULL;
+    }
+
+    /* Now exercise lookup_concurrent over the same key set. */
+    stm_ebr_enter(me);
+    for (uint32_t i = 0; i < N; i += 17u) {       /* every 17th key */
+        int kl = snprintf(k, sizeof k, "key-%06u", i);
+        assert_concurrent_matches_serial(eng, me, k, (size_t)kl);
+    }
+    /* A miss in the middle of the key space — internal-pivot
+     * descent that finds nothing in its leaf. */
+    int kl = snprintf(k, sizeof k, "key-%06u_x", N / 2u);
+    assert_concurrent_matches_serial(eng, me, k, (size_t)kl);
+    stm_ebr_exit(me);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
+STM_TEST(engine_lf1_concurrent_lookup_args) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    bool   f = false; void *v = NULL; size_t vl = 0;
+    /* NULL eng / ebr / out params. */
+    STM_ASSERT_ERR(stm_btree_engine_lookup_concurrent(NULL, me, "k", 1, &f, &v, &vl),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_lookup_concurrent(eng, NULL, "k", 1, &f, &v, &vl),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_lookup_concurrent(eng, me, "k", 1, NULL, &v, &vl),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_lookup_concurrent(eng, me, "k", 1, &f, NULL, &vl),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_btree_engine_lookup_concurrent(eng, me, "k", 1, &f, &v, NULL),
+                   STM_EINVAL);
+    /* NULL key with nonzero key_len. */
+    STM_ASSERT_ERR(stm_btree_engine_lookup_concurrent(eng, me, NULL, 1, &f, &v, &vl),
+                   STM_EINVAL);
+
+    /* STM_EBUSY during an un-finalized commit flush — mirrors the
+     * serial lookup's contract. */
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "k", 1, "v", 1));
+    uint64_t fp = 0, fg = 0;
+    uint8_t  fc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 1, &fp, &fg, fc));
+    STM_ASSERT_ERR(stm_btree_engine_lookup_concurrent(eng, me, "k", 1,
+                                                       &f, &v, &vl),
+                   STM_EBUSY);
+    STM_ASSERT_OK(stm_btree_engine_commit_finalize(eng));
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
+/* Multi-reader correctness — N reader threads each pin EBR and
+ * repeatedly lookup_concurrent against a committed, fully-loaded
+ * tree. The "single writer" is the main thread that built and
+ * committed the tree before spawning readers; no writes happen
+ * during the concurrent phase (the writer-side prepend lands at
+ * 9.8-BE-prepend).
+ *
+ * What this test pins at LF-1:
+ *   - The concurrent reader API is callable from multiple threads
+ *     simultaneously without corruption (chain_head atomic load is
+ *     the only mutating contact point at LF-1, and even that is
+ *     reader-only here since no writer prepends).
+ *   - EBR enter / exit symmetric pairing across N threads holds.
+ *   - The two-result invariant: every reader sees the same
+ *     committed result for the same key.
+ *
+ * What LF-2 + LF-BE will extend this to: concurrent commits, then
+ * concurrent commits + concurrent writer-side prepends.
+ */
+typedef struct {
+    stm_btree_engine        *eng;
+    const char             **keys;
+    size_t                   n_keys;
+    uint32_t                 iters;
+    _Atomic(uint32_t)       *go;
+    _Atomic(uint64_t)       *hits;
+    _Atomic(int)            *first_err;
+} reader_ctx;
+
+static void *reader_thread(void *arg)
+{
+    reader_ctx *c = arg;
+    stm_ebr_thread *me = stm_ebr_register();
+    if (!me) {
+        atomic_compare_exchange_strong(c->first_err, &(int){0}, (int)STM_ENOMEM);
+        return NULL;
+    }
+    /* Spin until the main thread releases all readers together. */
+    while (atomic_load_explicit(c->go, memory_order_acquire) == 0u)
+        ;
+    stm_ebr_enter(me);
+    for (uint32_t i = 0; i < c->iters; i++) {
+        const char *k = c->keys[i % c->n_keys];
+        bool   found = false; void *val = NULL; size_t vl = 0;
+        stm_status s = stm_btree_engine_lookup_concurrent(c->eng, me, k, strlen(k),
+                                                           &found, &val, &vl);
+        if (s != STM_OK) {
+            atomic_compare_exchange_strong(c->first_err, &(int){0}, (int)s);
+            free(val);
+            break;
+        }
+        if (!found) {
+            /* The keyset is wholly resident; a miss is a correctness bug. */
+            atomic_compare_exchange_strong(c->first_err, &(int){0}, -1);
+            free(val);
+            break;
+        }
+        atomic_fetch_add_explicit(c->hits, 1, memory_order_relaxed);
+        free(val);
+    }
+    stm_ebr_exit(me);
+    stm_ebr_thread_free(me);
+    return NULL;
+}
+
+STM_TEST(engine_lf1_concurrent_multi_reader) {
+    STM_ASSERT_OK(stm_ebr_init());
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    /* Build a tree wide enough to force a multi-level shape so
+     * descent visits internal nodes (exercises the internal-chain
+     * walk path). */
+    enum { N = 400u };
+    char **keys = calloc(N, sizeof *keys);
+    STM_ASSERT_TRUE(keys != NULL);
+    if (!keys) { stm_btree_engine_destroy(eng); memstore_destroy(&ms); return; }
+    for (uint32_t i = 0; i < N; i++) {
+        char buf[32];
+        int kl = snprintf(buf, sizeof buf, "lf1-key-%05u", i);
+        keys[i] = strndup(buf, (size_t)kl);
+        STM_ASSERT_TRUE(keys[i] != NULL);
+        char vbuf[16];
+        int vl = snprintf(vbuf, sizeof vbuf, "v-%05u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, keys[i], strlen(keys[i]),
+                                              vbuf, (size_t)vl));
+    }
+    uint64_t rp = 0; uint8_t rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+
+    /* Pre-warm every key into RAM so concurrent readers hit cached
+     * `mem` pointers and never trigger the (not-yet-thread-safe at
+     * LF-1) load_child. */
+    for (uint32_t i = 0; i < N; i++) {
+        bool   found = false; void *val = NULL; size_t vl = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup(eng, keys[i], strlen(keys[i]),
+                                              &found, &val, &vl));
+        STM_ASSERT_TRUE(found);
+        free(val);
+    }
+
+    enum { N_READERS = 4u, ITERS_PER_READER = 2000u };
+    _Atomic(uint32_t) go     = 0u;
+    _Atomic(uint64_t) hits   = 0u;
+    _Atomic(int)      ferr   = STM_OK;
+    pthread_t threads[N_READERS];
+    reader_ctx ctx = {
+        .eng = eng, .keys = (const char **)keys, .n_keys = N,
+        .iters = ITERS_PER_READER,
+        .go = &go, .hits = &hits, .first_err = &ferr,
+    };
+    for (uint32_t i = 0; i < N_READERS; i++)
+        STM_ASSERT_EQ(pthread_create(&threads[i], NULL, reader_thread, &ctx), 0);
+    /* Release the readers together — bounded barrier so we see real
+     * concurrency rather than serialised threads. */
+    atomic_store_explicit(&go, 1u, memory_order_release);
+    for (uint32_t i = 0; i < N_READERS; i++)
+        pthread_join(threads[i], NULL);
+
+    STM_ASSERT_EQ(atomic_load(&ferr), (int)STM_OK);
+    STM_ASSERT_EQ(atomic_load(&hits),
+                  (long long)(N_READERS * ITERS_PER_READER));
+
+    for (uint32_t i = 0; i < N; i++) free(keys[i]);
+    free(keys);
     stm_btree_engine_destroy(eng);
     memstore_destroy(&ms);
 }

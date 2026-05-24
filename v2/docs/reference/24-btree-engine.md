@@ -99,6 +99,11 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
                                     const void *key, size_t key_len,
                                     bool *out_found,
                                     void **out_value, size_t *out_value_len);
+stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
+                                    stm_ebr_thread *ebr,
+                                    const void *key, size_t key_len,
+                                    bool *out_found,
+                                    void **out_value, size_t *out_value_len);
 stm_status stm_btree_engine_scan  (stm_btree_engine *eng,
                                     stm_btree_engine_iter_cb cb, void *ctx);
 stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
@@ -115,6 +120,11 @@ value). `scan` enumerates every entry in ascending key order;
 key range — the bounded-prefix form, cost O(matched + height) not
 O(tree). Spill is transparent: every query path sees the full value —
 the engine materialises a spilled value at load (§Large-value spill).
+
+`lookup_concurrent` is the LF-1 lock-free read sibling — see
+§"9.8-LF-1 — concurrent lookup substrate" below. Same return
+semantics as `lookup`; takes an additional `stm_ebr_thread *` that
+the caller MUST have already `stm_ebr_enter`'d.
 
 ### Commit + inspection
 
@@ -488,6 +498,113 @@ exercise the in-RAM vtable; only the 9.6-impl-4 cutover modules link
 `stm_bootstrap_commit`** — which the sync layer issues, strictly
 before the uberblock write
 (`phase-9.6-impl-4b-sync-wiring-design.md` §5).
+
+### 9.8-LF-1 — concurrent lookup substrate
+
+The first impl chunk of Phase 9.8 (the lock-free metadata path —
+mission item #4, the crown jewel). LF-1 ships the **surface**: the
+struct fields, the `_concurrent` API, and an EBR-pinned reader path
+that walks an empty delta chain at every node and falls through to
+the existing serial descent. The writer-side CAS-prepend lands at
+**9.8-BE-prepend**; the `mvcc_root` atomic publish at **9.8-LF-2**;
+the production read-side wiring (fs.c ports) at **9.8-LF-3**.
+
+**Per-node state** (`eng_node`):
+
+```c
+_Atomic(eng_delta *)  chain_head;   /* LIFO message buffer head */
+pthread_mutex_t       flush_mu;     /* future consolidator's per-node lock */
+_Atomic(uint32_t)     chain_depth;  /* observability — depth of the chain */
+```
+
+`chain_head` is the natural Bε buffer insertion point at every node
+in motion. A writer CAS-prepends; a reader atomically loads + walks
+newest-first. At LF-1 nothing prepends — every chain is empty in
+steady state.
+
+**Per-engine state** (`stm_btree_engine`):
+
+```c
+pthread_mutex_t   commit_mu;        /* serialises three-phase commits */
+_Atomic(uint64_t) next_delta_seq;   /* total order across delta chains */
+```
+
+`commit_mu` is the engine-internal serialisation point that gives
+every committed root a unique gen — LF-2 wires it around the
+`mvcc_root` CAS publish + EBR retire of the prior root. LF-1 reserves
+it. `next_delta_seq` is the engine-wide monotonic source for
+`eng_delta::seq` — the CAS-prepend site (9.8-BE-prepend) reads it.
+
+**Delta record** (`eng_delta`):
+
+```c
+typedef enum { ENG_DELTA_INSERT = 1, ENG_DELTA_DELETE = 2 } eng_delta_op;
+struct eng_delta {
+    eng_delta_op  op;
+    uint64_t      seq;
+    uint8_t      *key;   uint32_t key_len;
+    uint8_t      *value; uint32_t value_len;   /* INSERT only */
+    eng_delta    *next;                        /* LIFO */
+};
+```
+
+`eng_delta_free(d)` releases the key/value heap + the record itself
+— used (a) by `node.c` at node-destroy to drain any residual chain,
+and (b) at 9.8-LF-2 as the EBR retire destructor for consolidated
+deltas.
+
+**Reader protocol** (`stm_btree_engine_lookup_concurrent`):
+
+```c
+caller: stm_ebr_enter(me)               /* before; the engine doesn't enter */
+        ...
+        stm_btree_engine_lookup_concurrent(eng, me, key, klen, ...);
+        ...
+        stm_ebr_exit(me)                /* after */
+```
+
+The descent walks the chain at every node visited BEFORE consulting
+the base node, newest-first; the first applicable delta wins.
+`chain_resolve_for_key` is the chokepoint (acquire-load on
+`chain_head`; LIFO walk; copy-out on INSERT). At LF-1 the chain is
+always empty → the helper returns `kind == 0` in O(1) and the
+descent identically follows the serial-lookup path. The
+chain-walk-on-every-node shape becomes load-bearing at
+9.8-BE-prepend.
+
+**The two reader paths coexist**: the serial `stm_btree_engine_lookup`
+stays for single-threaded callers (commit internals, engine
+machinery); the concurrent variant is for fs.c's read ops once they
+port to drop `fs->global` SH (at LF-3). The engine remains
+single-thread-safe under the serial path — LF-1 is purely additive.
+
+**Memory ordering**:
+
+- `chain_head` is `_Atomic`; the reader uses `memory_order_acquire`
+  on the head load so the 9.8-BE-prepend writer's CAS-release
+  synchronises-with the reader's chain traversal.
+- `next` pointers inside the chain are stable for the EBR epoch
+  duration — a delta ever made reachable stays alive until the
+  consolidator's retire is past one EBR advance (LF-2). LF-1 has no
+  consolidator; deltas never appear; the requirement is structural.
+
+**Spec composition**:
+
+| Invariant | Realised by |
+|---|---|
+| `bepsilon.tla::PerKeyNewestWins` | `chain_resolve_for_key` walks newest-first; first matching delta wins |
+| `bepsilon.tla::BufferBounded` | enforced at LF-BE-flush; LF-1 has an empty chain so the bound trivially holds |
+| `concurrency_mvcc.tla::ReaderObservesCoherentTree` | the EBR epoch bounds delta + node lifetime; LF-1's reader observes nodes the caller's pre-`enter` pinned (a stable snapshot in single-writer regime) |
+| `concurrency_mvcc.tla::RootAlwaysReachable` | enforced at LF-2 (commit-time CAS publish); LF-1 doesn't yet replace the root via atomic store, so the invariant is trivially preserved |
+
+**LF-1 cache-warming caveat**: the engine's node cache + `load_child`
+are not yet thread-safe (LF-2 / LF-3 work). The LF-1 multi-reader
+test pre-warms the cache via a serial scan-pass before spawning
+readers, so concurrent descents touch only cached `child.mem`
+pointers and never trigger I/O. fs.c-side callers at LF-3 will
+similarly run readers against an already-loaded tree (the dataset's
+working set sits in the cache after the first read in the op's
+lifetime).
 
 ## Spec cross-reference
 
