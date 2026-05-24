@@ -56,6 +56,12 @@ extern "C" {
 struct stm_dataset_index;
 typedef struct stm_dataset_index stm_dataset_index;
 
+/* Forward-decl (9.8-LF-3): per-thread EBR handle for the wait-free
+ * lookup variant. The opaque type lives in stratum/ebr.h; callers that
+ * use stm_inode_lookup_concurrent pull in that header themselves. */
+struct stm_ebr_thread;
+typedef struct stm_ebr_thread stm_ebr_thread;
+
 /* ========================================================================= */
 /* On-disk inode value. ARCH §11.3.                                          */
 /* ========================================================================= */
@@ -426,6 +432,37 @@ STM_MUST_USE
 stm_status stm_inode_lookup(const stm_inode_index *idx,
                                uint64_t dataset_id, uint64_t ino,
                                struct stm_inode_value *out_value);
+
+/*
+ * 9.8-LF-3: wait-free sibling of stm_inode_lookup. Same semantics, same
+ * arg shape, but skips the inode-index internal mutex and reads through
+ * the engine's lock-free concurrent path. Used by stm_fs_stat / _lookup /
+ * other LF-3 ported read ops.
+ *
+ * Caller contract:
+ *   - `ebr` is the calling thread's registered EBR handle; the caller
+ *     MUST have already called stm_ebr_enter(ebr) before this call and
+ *     MUST call stm_ebr_exit(ebr) after. Composability across multiple
+ *     subsystem reads in one fs op (e.g. dirent+inode for lookup) — one
+ *     enter spans them all.
+ *   - Returns IDENTICAL refusal codes to stm_inode_lookup.
+ *
+ * Reader-vs-writer caveat (LF-2 carry, lifted at LF-BE-prepend): the
+ * inode index's internal mutex normally serialises mutators (set / alloc
+ * / free) against lookup. The concurrent variant skips that mutex; a
+ * concurrent writer's stm_btree_engine_insert mutates base nodes in
+ * place, which can tear the reader's descent. The LF-2 substrate's
+ * mvcc_root publish + EBR pin protects against retired-node UAF but not
+ * against in-flight base-node mutation. BE-prepend closes the gap by
+ * shifting writers to chain-prepend instead of in-place mutate. Pre-LF-
+ * BE-prepend, callers should expect to OCCASIONALLY surface
+ * STM_ECORRUPT under contention; the v1.0 audit (R171) pins the gap.
+ */
+STM_MUST_USE
+stm_status stm_inode_lookup_concurrent(const stm_inode_index *idx,
+                                          stm_ebr_thread *ebr,
+                                          uint64_t dataset_id, uint64_t ino,
+                                          struct stm_inode_value *out_value);
 
 /*
  * Replace the inode value at (dataset_id, ino). The caller-provided

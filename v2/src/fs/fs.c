@@ -72,6 +72,7 @@
 #include <stratum/dataset.h>
 #include <stratum/dirent.h>
 #include <stratum/dirty_buffer.h>
+#include <stratum/ebr.h>             /* 9.8-LF-3: per-thread EBR handle */
 #include <stratum/extent.h>
 #include <stratum/inode.h>
 #include <stratum/locks.h>
@@ -91,6 +92,7 @@
 #include <unistd.h>              /* geteuid (TLY-A3-keyslot token-mode gate) */
 
 #include <pthread.h>
+#include <stdatomic.h>           /* 9.8-LF-3: atomic wedged + read_only */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -191,14 +193,30 @@ struct stm_fs {
      * janus client connects fresh each time). */
     stm_hybrid_keys *cached_keys;    /* owned (malloc + mlock) */
 
-    bool read_only;
-    bool wedged;
+    /* 9.8-LF-3: wedged + read_only are atomic so 9.8 wait-free read ops
+     * can check them without holding fs->global. Writers (stm_fs_unmount /
+     * stm_fs_mark_wedged / commit-failure rollback) still hold fs->global
+     * EX when they set these — the EX exclusion serialises writer-vs-
+     * writer; the atomic provides reader-side acquire/release pairing.
+     *
+     * Race window: a reader's `atomic_load_explicit(acquire)` can return
+     * `false` an instant before a wedge-firing write does `store(true,
+     * release)`. The reader then proceeds, may touch state about to be
+     * declared wedged, and either (a) succeeds on data still coherent or
+     * (b) hits a downstream subsystem error that surfaces as some other
+     * status. Both outcomes are acceptable — the wedge transition only
+     * defines behavior FORWARD from the store. POSIX precedent: stat()
+     * concurrent with fs going read-only on disk error returns whatever
+     * was true at the syscall boundary. */
+    _Atomic(bool) read_only;
+    _Atomic(bool) wedged;
 };
 
-/* Guard macros. MUST be called while holding fs->global (EX or SH). On the
- * refusal path they UNLOCK fs->global and return from the enclosing
- * function. The caller's happy path is responsible for its own unlock;
- * the guard only takes ownership of the unlock when it bails.
+/* Guard macros. The lock-holding variants (FS_GUARD_READ / FS_GUARD_WRITE)
+ * MUST be called while holding fs->global (EX or SH). On the refusal path
+ * they UNLOCK fs->global and return from the enclosing function. The
+ * caller's happy path is responsible for its own unlock; the guard only
+ * takes ownership of the unlock when it bails.
  *
  * The same pthread_rwlock_unlock() call works for both SH and EX holders,
  * so the guard composes with EITHER the pre-PARALLEL-3 EX (wrlock) sites
@@ -208,24 +226,102 @@ struct stm_fs {
  * the very next acquisition (from any API, including unmount) into a
  * deadlock — the bug that the removed RO/wedged end-to-end tests had
  * been tripping over and that was misdiagnosed as a POSIX-bdev thread-
- * pool hang.                                                            */
+ * pool hang.
+ *
+ * 9.8-LF-3 adds FS_GUARD_READ_LOCKLESS for the wait-free read path: no
+ * rwlock acquired; checks fs->wedged via atomic acquire-load. Used by the
+ * 21 pure-read ops that drop fs->global SH per the design doc §7.1.    */
 #define FS_GUARD_READ(fs) do {                                             \
-    if ((fs)->wedged) {                                                    \
+    if (atomic_load_explicit(&(fs)->wedged, memory_order_acquire)) {       \
         pthread_rwlock_unlock(&(fs)->global);                              \
         return STM_EWEDGED;                                                \
     }                                                                      \
 } while (0)
 
 #define FS_GUARD_WRITE(fs) do {                                            \
-    if ((fs)->wedged) {                                                    \
+    if (atomic_load_explicit(&(fs)->wedged, memory_order_acquire)) {       \
         pthread_rwlock_unlock(&(fs)->global);                              \
         return STM_EWEDGED;                                                \
     }                                                                      \
-    if ((fs)->read_only) {                                                 \
+    if (atomic_load_explicit(&(fs)->read_only, memory_order_acquire)) {    \
         pthread_rwlock_unlock(&(fs)->global);                              \
         return STM_EROFS;                                                  \
     }                                                                      \
 } while (0)
+
+/* 9.8-LF-3: lock-free wedge gate for the 21 pure-read ops. Pairs with
+ * stm_ebr_enter/exit at the caller — does NOT acquire fs->global. The
+ * caller invokes this BEFORE stm_ebr_enter, so a wedge refusal returns
+ * without entering an epoch (cheaper) and without unlocking anything.
+ *
+ * Atomic acquire-load synchronises with stm_fs_mark_wedged's release-
+ * store. A reader that sees `wedged=false` is guaranteed to be ordered
+ * before the wedge transition in modification order — any wedge fired
+ * AFTER this load is the reader's race window, and the reader is allowed
+ * to proceed (POSIX precedent — clause 9.8-LF-3 atomic-wedged comment
+ * block on the struct). */
+#define FS_GUARD_READ_LOCKLESS(fs) do {                                    \
+    if (atomic_load_explicit(&(fs)->wedged, memory_order_acquire))         \
+        return STM_EWEDGED;                                                \
+} while (0)
+
+/* ========================================================================= */
+/* 9.8-LF-3: per-thread EBR handle cache (pthread_getspecific).               */
+/*                                                                            */
+/* The 21 pure-read ops drop fs->global SH and instead pin EBR for memory    */
+/* safety against retired engine nodes (the LF-2 substrate). EBR's contract  */
+/* is one stm_ebr_register() per thread, NOT per call — register-per-call    */
+/* would defeat the cost target (5 ns enter/exit vs ~500 ns alloc).          */
+/*                                                                            */
+/* We cache the handle in TLS via pthread_getspecific. First call on a       */
+/* thread lazily registers; the pthread destructor releases at thread exit.  */
+/* Initialization of the key is a one-shot pthread_once.                     */
+/*                                                                            */
+/* Caller contract: stm_fs_ebr_thread_current() returns a stm_ebr_thread *   */
+/* the caller MUST stm_ebr_enter / _exit around shared-data access. NULL on  */
+/* allocation failure — caller refuses with STM_ENOMEM.                      */
+/*                                                                            */
+/* Lifecycle: stm_ebr_init() is called from stm_fs_mount on the first mount; */
+/* it's idempotent. Per-thread registration is lazy on first use. The key's  */
+/* destructor runs at thread exit and calls stm_ebr_thread_free, which is    */
+/* safe to call outside an enter/exit pair. Process exit destroys the key    */
+/* itself (pthread_key_create has no matching destroy — keys leak, which is  */
+/* fine at process scope).                                                   */
+/* ========================================================================= */
+
+static pthread_key_t  fs_ebr_key;
+static pthread_once_t fs_ebr_key_once = PTHREAD_ONCE_INIT;
+
+static void fs_ebr_destructor(void *handle)
+{
+    if (handle) stm_ebr_thread_free((stm_ebr_thread *)handle);
+}
+
+static void fs_ebr_key_init(void)
+{
+    /* Failure to create the key would force every reader through the
+     * stm_ebr_register/free pair per call. We accept the alloc cost over
+     * a crash here — the key allocation failing at process startup is
+     * basically OOM territory, which the system has bigger problems
+     * with. Caller surfaces it as STM_ENOMEM downstream. */
+    (void)pthread_key_create(&fs_ebr_key, fs_ebr_destructor);
+}
+
+static stm_ebr_thread *fs_ebr_thread_current(void)
+{
+    pthread_once(&fs_ebr_key_once, fs_ebr_key_init);
+    stm_ebr_thread *t = (stm_ebr_thread *)pthread_getspecific(fs_ebr_key);
+    if (t != NULL) return t;
+    t = stm_ebr_register();
+    if (t == NULL) return NULL;
+    if (pthread_setspecific(fs_ebr_key, t) != 0) {
+        /* Setspecific failure is rare (the key must be valid). Don't leak
+         * the handle — free it and report failure. */
+        stm_ebr_thread_free(t);
+        return NULL;
+    }
+    return t;
+}
 
 /* ========================================================================= */
 /* 9.7-impl-5: synthetic inode encoding for .snaps/ mount surface.            */
@@ -942,8 +1038,10 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         free(fs);
         return NULL;
     }
-    fs->read_only = ro;
-    fs->wedged    = false;
+    /* 9.8-LF-3: atomic init at fs allocation (single-threaded — no race
+     * with the wait-free readers, which never see fs until fs_new returns). */
+    atomic_init(&fs->read_only, ro);
+    atomic_init(&fs->wedged, false);
     return fs;
 }
 
@@ -952,6 +1050,13 @@ stm_status stm_fs_mount(const char *path,
                          stm_fs **out_fs)
 {
     if (!path || !opts || !out_fs) return STM_EINVAL;
+
+    /* 9.8-LF-3: ensure EBR substrate is initialised before any code path
+     * that might enter an epoch. Idempotent — safe to call on every mount.
+     * The first mount after process start does the real init; subsequent
+     * mounts are a noop. */
+    stm_status ers = stm_ebr_init();
+    if (ers != STM_OK) return ers;
 
     /* P4-4b: exactly one key source. */
     int have_kf = opts->keyfile_path != NULL;
@@ -1270,7 +1375,11 @@ stm_status stm_fs_unmount(stm_fs *fs)
     pthread_rwlock_wrlock(&fs->global);
 
     stm_status commit_status = STM_OK;
-    if (!fs->read_only && !fs->wedged) {
+    /* 9.8-LF-3: read under fs->global EX; relaxed is sufficient (no
+     * reader-thread synchronisation needed — the EX excludes everything
+     * but ourselves). Acquire-load works too, just unnecessary. */
+    if (!atomic_load_explicit(&fs->read_only, memory_order_relaxed) &&
+        !atomic_load_explicit(&fs->wedged, memory_order_relaxed)) {
         /* SWISS-4q-flush: drain dirty buffer before final commit so
          * every buffered write becomes a committed extent in the
          * three-phase sync. If drain fails, propagate but skip
@@ -3028,23 +3137,32 @@ stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!fs || !out_value) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
+    /* 9.8-LF-3: wait-free read path. Atomic wedge check + EBR pin
+     * around the engine descent. NO fs->global SH acquire. The 9.7-impl-5
+     * synth-ino branch goes through fs_snap_view_stat which uses a
+     * throwaway engine — that path still takes fs->global SH internally
+     * (deferred to a follow-on LF-3 chunk; synth-ino reads are rare). */
+    FS_GUARD_READ_LOCKLESS(fs);
 
-    /* 9.7-impl-5: synth ino → frozen-tree stat or SNAPS_PARENT synth dir. */
     if (fs_ino_is_synth(ino)) {
+        /* Throwaway-engine path. v1.0 keeps the rwlock path for this
+         * branch; lift to EBR at LF-3 follow-on. */
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
         stm_status s = fs_snap_view_stat(fs, dataset_id, ino, out_value);
         pthread_rwlock_unlock(&fs->global);
         return s;
     }
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-    if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
-    }
-    stm_status s = stm_inode_lookup(iidx, dataset_id, ino, out_value);
-    pthread_rwlock_unlock(&fs->global);
+    if (!iidx) return STM_EINVAL;
+
+    stm_ebr_thread *ebr = fs_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+    stm_ebr_enter(ebr);
+    stm_status s = stm_inode_lookup_concurrent(iidx, ebr, dataset_id, ino,
+                                                out_value);
+    stm_ebr_exit(ebr);
     return s;
 }
 
@@ -6355,13 +6473,13 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
     }
 
     pthread_rwlock_wrlock(&fs->global);
-    if (fs->wedged) {
+    if (atomic_load_explicit(&fs->wedged, memory_order_relaxed)) {
         pthread_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return STM_EWEDGED;
     }
-    if (fs->read_only) {
+    if (atomic_load_explicit(&fs->read_only, memory_order_relaxed)) {
         pthread_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
@@ -6518,13 +6636,13 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
     }
 
     pthread_rwlock_wrlock(&fs->global);
-    if (fs->wedged) {
+    if (atomic_load_explicit(&fs->wedged, memory_order_relaxed)) {
         pthread_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return STM_EWEDGED;
     }
-    if (fs->read_only) {
+    if (atomic_load_explicit(&fs->read_only, memory_order_relaxed)) {
         pthread_rwlock_unlock(&fs->global);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
@@ -9223,17 +9341,12 @@ stm_status stm_fs_fadvise(stm_fs *fs,
         return STM_EINVAL;
     }
 
-    /* Wedged check via FS_GUARD_READ. RO mounts pass — the
-     * WILLNEED/DONTNEED delegate's own FS_GUARD_WRITE will refuse
-     * with STM_EROFS, which we then SWALLOW (advisory). No
-     * existence check: posix_fadvise(2) doesn't validate file
-     * contents, and stratum's legacy direct-extent files have no
-     * inode-index entry but are valid fadvise targets (the inner
-     * promote/migrate primitives accept them). The delegate's
-     * own ino-not-found path is also swallowed. */
-    pthread_rwlock_rdlock(&fs->global);
-    FS_GUARD_READ(fs);
-    pthread_rwlock_unlock(&fs->global);
+    /* 9.8-LF-3: wedged check is now lockless via atomic acquire-load.
+     * No EBR enter needed — this function does not descend any engine
+     * (the WILLNEED / DONTNEED delegates take their own EX locks).
+     * RO mounts pass — the delegate's own FS_GUARD_WRITE refuses with
+     * STM_EROFS, which we SWALLOW (advisory). */
+    FS_GUARD_READ_LOCKLESS(fs);
 
     /* Drop fs->lock BEFORE delegating — stm_fs_promote_to_hot /
      * stm_fs_migrate_to_cold take fs->lock + FS_GUARD_WRITE themselves;
@@ -9309,8 +9422,8 @@ stm_status stm_fs_stats_get(const stm_fs *fs, stm_fs_stats *out)
     out->current_gen       = sinfo.current_gen;
     out->alloc_root_paddr  = sinfo.alloc_root_paddr;
 
-    out->read_only = fs->read_only;
-    out->wedged    = fs->wedged;
+    out->read_only = atomic_load_explicit(&fs->read_only, memory_order_relaxed);
+    out->wedged    = atomic_load_explicit(&fs->wedged, memory_order_relaxed);
 
     pthread_rwlock_unlock(&mfs->global);
     return STM_OK;
@@ -9319,8 +9432,13 @@ stm_status stm_fs_stats_get(const stm_fs *fs, stm_fs_stats *out)
 void stm_fs_mark_wedged(stm_fs *fs)
 {
     if (!fs) return;
+    /* 9.8-LF-3: hold fs->global EX to serialise with other writers (e.g.,
+     * a concurrent unmount), AND release-store the atomic flag so 9.8
+     * wait-free readers (which check this WITHOUT taking fs->global)
+     * synchronise via acquire-load. EX excludes other writers; the atomic
+     * provides the reader-side pairing. */
     pthread_rwlock_wrlock(&fs->global);
-    fs->wedged = true;
+    atomic_store_explicit(&fs->wedged, true, memory_order_release);
     pthread_rwlock_unlock(&fs->global);
 }
 

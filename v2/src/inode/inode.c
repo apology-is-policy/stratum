@@ -40,6 +40,7 @@
 #include <stratum/inode.h>
 #include <stratum/dataset.h>
 #include <stratum/btree_engine.h>
+#include <stratum/ebr.h>            /* 9.8-LF-3: stm_inode_lookup_concurrent */
 #include <stratum/metakey.h>
 #include <stratum/types.h>
 
@@ -869,6 +870,73 @@ stm_status stm_inode_lookup(const stm_inode_index *idx,
     }
     *out_value = v;
     must_unlock(idx_lock(midx));
+    return STM_OK;
+}
+
+/*
+ * 9.8-LF-3: wait-free sibling of stm_inode_lookup. Composes
+ * stm_dataset_index_get_engine (which acquires the dataset_idx's own
+ * brief mutex) + stm_btree_engine_lookup_concurrent (which uses the LF-2
+ * atomic mvcc_root acquire-load + delta-chain walk; the caller's EBR pin
+ * bounds the lifetime of every node the descent touches).
+ *
+ * NOT taken: this function's `idx_lock`. Pre-LF-3 lookups serialised
+ * against same-index mutators (set / alloc / free) via that mutex. At
+ * LF-3 the safety contract shifts to the engine's LF-2 substrate:
+ *   - mvcc_root atomic load — readers see a coherent root snapshot.
+ *   - EBR pin — superseded nodes outlive any reader still descending.
+ * Concurrent writers' in-place mutation (the LF-2 limitation lifted at
+ * 9.8-BE-prepend) is the residual race; see header docstring caveat.
+ *
+ * Lifetime: `ebr` MUST already be in an entered epoch (caller's
+ * stm_ebr_enter). This function does NOT enter/exit on its behalf —
+ * composability with multi-subsystem reads (one enter spans them all).
+ */
+stm_status stm_inode_lookup_concurrent(const stm_inode_index *idx,
+                                          stm_ebr_thread *ebr,
+                                          uint64_t dataset_id, uint64_t ino,
+                                          struct stm_inode_value *out_value) {
+    if (!idx || !ebr || !out_value) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+
+    stm_inode_index *midx = (stm_inode_index *)idx;
+    /* ds_idx is set ONCE at attach + never rewritten — safe to read
+     * without idx_lock (the same posture inode_lookup_at_root uses). */
+    if (midx->ds_idx == NULL) return STM_EINVAL;
+
+    stm_btree_engine *eng = NULL;
+    stm_status es = stm_dataset_index_get_engine(midx->ds_idx, dataset_id,
+                                                  &eng);
+    if (es != STM_OK) return es;
+
+    uint8_t key[IN_KEY_LEN];
+    stm_status ks = in_encode_key(ino, key);
+    if (ks != STM_OK) return ks;
+
+    bool found = false;
+    void *vbuf = NULL;
+    size_t vlen = 0;
+    stm_status ls = stm_btree_engine_lookup_concurrent(
+                          eng, ebr, key, IN_KEY_LEN,
+                          &found, &vbuf, &vlen);
+    if (ls != STM_OK) return ls;
+    if (!found) return STM_ENOENT;
+    if (vlen != IN_VAL_LEN || !vbuf) {
+        free(vbuf);
+        return STM_ECORRUPT;
+    }
+
+    struct stm_inode_value v;
+    memcpy(&v, vbuf, IN_VAL_LEN);
+    free(vbuf);
+
+    /* Full R69/R70/R71/R77/R85 carry — same decoder gates as the
+     * serial in_engine_get path. */
+    stm_status vs = in_validate_value(&v, dataset_id, ino);
+    if (vs != STM_OK) return vs;
+
+    if (stm_load_le32(v.si_flags) & STM_INO_FLAG_FREED) return STM_ENOENT;
+    *out_value = v;
     return STM_OK;
 }
 

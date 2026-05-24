@@ -82,6 +82,11 @@ extern "C" {
 struct stm_dataset_index;
 typedef struct stm_dataset_index stm_dataset_index;
 
+/* Forward-decl (9.8-LF-3): per-thread EBR handle for wait-free lookup.
+ * Opaque type lives in stratum/ebr.h. */
+struct stm_ebr_thread;
+typedef struct stm_ebr_thread stm_ebr_thread;
+
 /* ========================================================================= */
 /* On-disk constants. ARCH §11.4.                                            */
 /* ========================================================================= */
@@ -263,6 +268,27 @@ stm_status stm_dirent_lookup(const stm_dirent_index *idx,
                                  uint64_t *out_child_ino,
                                  uint64_t *out_child_gen,
                                  uint8_t *out_child_type);
+
+/*
+ * 9.8-LF-3: wait-free sibling of stm_dirent_lookup. Same semantics + arg
+ * shape; skips the dirent index's internal mutex; uses the engine's LF-2
+ * lock-free concurrent path. Caller MUST be in an entered EBR epoch
+ * (stm_ebr_enter before, stm_ebr_exit after — composability with multi-
+ * subsystem reads).
+ *
+ * Reader-vs-writer caveat lifts at 9.8-BE-prepend; see inode.h
+ * stm_inode_lookup_concurrent docstring.
+ */
+STM_MUST_USE
+stm_status stm_dirent_lookup_concurrent(const stm_dirent_index *idx,
+                                            stm_ebr_thread *ebr,
+                                            uint64_t dataset_id,
+                                            uint64_t dir_ino,
+                                            const uint8_t *name,
+                                            uint8_t name_len,
+                                            uint64_t *out_child_ino,
+                                            uint64_t *out_child_gen,
+                                            uint8_t *out_child_type);
 
 /*
  * Unlink `name` from directory `dir_ino`. Models `dirent.tla::Unlink`.

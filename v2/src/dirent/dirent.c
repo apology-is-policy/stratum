@@ -71,6 +71,7 @@
 #include <stratum/dirent_testing.h>
 #include <stratum/dataset.h>
 #include <stratum/btree_engine.h>
+#include <stratum/ebr.h>            /* 9.8-LF-3: stm_dirent_lookup_concurrent */
 #include <stratum/metakey.h>
 #include <stratum/types.h>
 
@@ -682,6 +683,87 @@ stm_status stm_dirent_lookup(const stm_dirent_index *idx,
     }
 
     must_unlock(lk);
+    return STM_ENOENT;
+}
+
+/*
+ * 9.8-LF-3: wait-free sibling of stm_dirent_lookup. Walks the same
+ * open-addressing probe chain (newest-first chain semantics from
+ * dirent.tla::LookupWalk), but resolves each probe's record through
+ * stm_btree_engine_lookup_concurrent + skips this index's internal
+ * mutex.
+ *
+ * Caller MUST be in an entered EBR epoch — composability across multi-
+ * subsystem reads (one stm_ebr_enter spans dirent_lookup_concurrent +
+ * the subsequent inode_lookup_concurrent in stm_fs_lookup).
+ *
+ * Same reader-vs-writer caveat as inode_lookup_concurrent: a same-engine
+ * concurrent writer's stm_btree_engine_insert can tear the descent at
+ * LF-2; BE-prepend lifts that.
+ */
+stm_status stm_dirent_lookup_concurrent(const stm_dirent_index *idx,
+                                            stm_ebr_thread *ebr,
+                                            uint64_t dataset_id,
+                                            uint64_t dir_ino,
+                                            const uint8_t *name,
+                                            uint8_t name_len,
+                                            uint64_t *out_child_ino,
+                                            uint64_t *out_child_gen,
+                                            uint8_t *out_child_type) {
+    if (!idx || !ebr || !name || !out_child_ino) return STM_EINVAL;
+    if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
+    if (name_len == 0u || name_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
+
+    *out_child_ino = 0;
+    if (out_child_gen)  *out_child_gen  = 0;
+    if (out_child_type) *out_child_type = 0;
+
+    stm_dirent_index *m = (stm_dirent_index *)idx;
+    if (m->ds_idx == NULL) return STM_EINVAL;
+
+    stm_btree_engine *eng = NULL;
+    stm_status es = stm_dataset_index_get_engine(m->ds_idx, dataset_id, &eng);
+    if (es != STM_OK) return es;
+
+    uint64_t hash_base = fnv1a64(name, (size_t)name_len);
+
+    for (uint32_t k = 0; k < STM_DIRENT_PROBE_MAX; k++) {
+        uint64_t probe = hash_base + (uint64_t)k;
+
+        uint8_t key[DI_KEY_LEN];
+        stm_status ks = di_encode_key(dir_ino, probe, key);
+        if (ks != STM_OK) return ks;
+
+        bool found = false;
+        void *vbuf = NULL;
+        size_t vlen = 0;
+        stm_status ls = stm_btree_engine_lookup_concurrent(
+                              eng, ebr, key, DI_KEY_LEN,
+                              &found, &vbuf, &vlen);
+        if (ls != STM_OK) return ls;
+        if (!found) return STM_ENOENT;
+
+        stm_dirent_record r;
+        memset(&r, 0, sizeof r);
+        stm_status vs = di_decode_value(vbuf, vlen, &r);
+        free(vbuf);
+        if (vs != STM_OK) return vs;
+        r.dataset_id = dataset_id;
+        r.dir_ino    = dir_ino;
+        r.hash_probe = probe;
+
+        if (record_is_tombstone(&r)) continue;
+        if (record_is_whiteout(&r)) {
+            if (record_name_eq(&r, name, name_len)) return STM_ENOENT;
+            continue;
+        }
+        if (record_name_eq(&r, name, name_len)) {
+            *out_child_ino = r.child_ino;
+            if (out_child_gen)  *out_child_gen  = r.child_gen;
+            if (out_child_type) *out_child_type = r.child_type;
+            return STM_OK;
+        }
+    }
     return STM_ENOENT;
 }
 
