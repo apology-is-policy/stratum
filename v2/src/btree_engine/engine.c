@@ -101,7 +101,13 @@ stm_status stm_btree_engine_create(const stm_btree_store_vtable *vt,
     if (s != STM_OK) return s;
 
     eng->root = eng_node_new_leaf();       /* fresh empty-leaf root, dirty */
-    if (!eng->root) { free(eng); return STM_ENOMEM; }
+    if (!eng->root) {
+        /* engine_alloc initialised the cache + commit_mu; full teardown
+         * required to symmetric-destroy both. NULL-safe + partial-init
+         * tolerant (R169 P1-1). */
+        stm_btree_engine_destroy(eng);
+        return STM_ENOMEM;
+    }
     eng->has_durable_root = false;
     *out_eng = eng;
     return STM_OK;

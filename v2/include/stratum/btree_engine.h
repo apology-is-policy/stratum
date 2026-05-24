@@ -28,11 +28,19 @@
  * indirection record). Only a value over STM_BTREE_ENGINE_MAX_VALUE_BYTES
  * is refused with STM_ERANGE.
  *
- * Concurrency: NOT thread-safe at impl-1b. One engine handle is used
- * by one thread at a time. The rwlock-over-the-node-cache from design
- * §3.5 lands when the engine is wired into the concurrent path; the
- * node-cache + dirty-tracking interfaces are shaped so that (and, in
- * Phase 9.8, the Bw-tree lock-free layer) drop in without re-work.
+ * Concurrency:
+ *   - The serial APIs (lookup / insert / delete / scan / commit) are
+ *     NOT thread-safe — one engine handle is used by one thread at a
+ *     time on these paths.
+ *   - The `_concurrent` API (Phase 9.8-LF-1; one lookup variant at
+ *     present) IS safe to call from multiple readers concurrently,
+ *     subject to the per-function contract: caller pre-`stm_ebr_enter`d,
+ *     no concurrent writer, and the tree's working set pre-warmed into
+ *     RAM (the LF-1 cache-warming caveat; lifted at LF-2 / LF-3 as the
+ *     production read-side wires up).
+ *   - Full read-side concurrency lands at 9.8-LF-3 — fs.c's pure-read
+ *     ops drop `fs->global` SH and pin EBR instead, against an
+ *     mvcc_root atomic published by LF-2's commit-time CAS.
  */
 #ifndef STRATUM_V2_BTREE_ENGINE_H
 #define STRATUM_V2_BTREE_ENGINE_H
@@ -208,6 +216,22 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
  *     descents across N engines).
  *   - Semantics IDENTICAL to stm_btree_engine_lookup: same return
  *     codes, same value-copy contract, same key-len bounds.
+ *
+ * Preconditions at LF-1 (lifted at LF-2 / LF-3 as the production
+ * read-side wires up):
+ *   - No concurrent writer / committer. The serial mutation APIs
+ *     (insert / delete / commit_*) and this concurrent reader are
+ *     serially-ordered: a commit MUST quiesce before concurrent
+ *     readers run; readers MUST quiesce before a new commit starts.
+ *     LF-2 lifts this by introducing the mvcc_root atomic publish so
+ *     concurrent readers can race a commit safely.
+ *   - Cache-warmed working set. Every node the descent may touch must
+ *     already be RAM-resident (a serial `_lookup` / `_scan` pass over
+ *     the working set completes before the readers start). LF-1's
+ *     `load_child` lazy-load path is not yet thread-safe; concurrent
+ *     readers MUST hit only cached `child.mem` pointers and never
+ *     trigger lazy disk loads. LF-2 / LF-3 retire this caveat as the
+ *     node cache becomes EBR-managed.
  *
  * Walks the in-memory Bε delta chain at every node visited during
  * descent, newest-first, BEFORE the base-node lookup. At LF-1 the
