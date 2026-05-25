@@ -29,7 +29,9 @@ stm_status stm_bdev_open(const char *path,
     stm_bdev_open_opts local = opts ? *opts : stm_bdev_open_opts_default();
 
     if (local.backend == STM_BDEV_BACKEND_AUTO) {
-#if STM_HAVE_IOURING
+#if defined(__thylacine__)
+        local.backend = STM_BDEV_BACKEND_THYLACINE;
+#elif STM_HAVE_IOURING
         local.backend = STM_BDEV_BACKEND_IOURING;
 #else
         local.backend = STM_BDEV_BACKEND_POSIX;
@@ -37,11 +39,22 @@ stm_status stm_bdev_open(const char *path,
     }
 
     switch (local.backend) {
+#if !defined(__thylacine__)
+    /* The pouch POSIX surface lacks pread/pwrite/fsync at v1.0; the
+     * posix backend would compile-clean but fail at runtime via the
+     * 0xFFFF ENOSYS sentinel. Excluded from the Thylacine build so a
+     * caller passing STM_BDEV_BACKEND_POSIX explicitly gets a clean
+     * STM_ENOTSUPPORTED rather than a runtime ENOSYS. */
     case STM_BDEV_BACKEND_POSIX:
         return stm_bdev_open_posix(path, &local, out_dev);
+#endif
 #if STM_HAVE_IOURING
     case STM_BDEV_BACKEND_IOURING:
         return stm_bdev_open_iouring(path, &local, out_dev);
+#endif
+#if defined(__thylacine__)
+    case STM_BDEV_BACKEND_THYLACINE:
+        return stm_bdev_open_thylacine(path, &local, out_dev);
 #endif
     default:
         return STM_ENOTSUPPORTED;

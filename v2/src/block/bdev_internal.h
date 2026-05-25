@@ -47,4 +47,9 @@ stm_status stm_bdev_open_iouring(const char *path, const stm_bdev_open_opts *opt
                                  stm_bdev **out);
 #endif
 
+#if defined(__thylacine__)
+stm_status stm_bdev_open_thylacine(const char *path, const stm_bdev_open_opts *opts,
+                                    stm_bdev **out);
+#endif
+
 #endif

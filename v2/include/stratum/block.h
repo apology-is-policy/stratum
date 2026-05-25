@@ -44,9 +44,10 @@ typedef struct stm_bdev stm_bdev;
 /* ========================================================================= */
 
 typedef enum {
-    STM_BDEV_BACKEND_AUTO    = 0,   /* pick best available                   */
-    STM_BDEV_BACKEND_POSIX   = 1,   /* pread/pwrite + thread-pool async       */
-    STM_BDEV_BACKEND_IOURING = 2,   /* Linux io_uring                        */
+    STM_BDEV_BACKEND_AUTO      = 0, /* pick best available                   */
+    STM_BDEV_BACKEND_POSIX     = 1, /* pread/pwrite + thread-pool async       */
+    STM_BDEV_BACKEND_IOURING   = 2, /* Linux io_uring                        */
+    STM_BDEV_BACKEND_THYLACINE = 3, /* Thylacine in-process virtio-blk driver */
 } stm_bdev_backend;
 
 typedef struct {

@@ -1,6 +1,15 @@
 set(STM_BLOCK_SRCS
-    bdev.c
-    posix.c)
+    bdev.c)
+
+if(STM_PLATFORM_THYLACINE)
+    # Thylacine arm: in-process virtio-blk driver replaces the POSIX
+    # backend. pouch's musl lacks pread/pwrite/fsync at v1.0 so the
+    # POSIX arm would be a runtime hazard (ENOSYS via the 0xFFFF
+    # sentinel). See src/block/bdev_thylacine.c.
+    list(APPEND STM_BLOCK_SRCS bdev_thylacine.c)
+else()
+    list(APPEND STM_BLOCK_SRCS posix.c)
+endif()
 
 if(STM_ENABLE_IOURING)
     list(APPEND STM_BLOCK_SRCS iouring.c)
