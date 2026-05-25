@@ -169,11 +169,13 @@
 /* Cap on spurious IRQ wakes (config-change without used-buffer). */
 #define MAX_NON_USED_BUFFER_WAKES    16u
 
-/* Thylacine kobj-rights bits (mirror kernel/include/thylacine/syscall.h). */
+/* Thylacine kobj-rights bits. Mirror of kernel/include/thylacine/handle.h
+ * (and libthyla_rs / libt). The kernel reserves (1u << 3) for
+ * RIGHT_TRANSFER and (1u << 4) for RIGHT_DMA; do NOT collide. */
 #define T_RIGHT_READ                 (1u << 0)
 #define T_RIGHT_WRITE                (1u << 1)
 #define T_RIGHT_MAP                  (1u << 2)
-#define T_RIGHT_SIGNAL               (1u << 3)
+#define T_RIGHT_SIGNAL               (1u << 5)
 
 /* Thylacine PROT bits for MMIO/DMA mapping. */
 #define T_PROT_READ                  1u
