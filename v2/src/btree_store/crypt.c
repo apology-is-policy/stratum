@@ -44,6 +44,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __thylacine__
+#include <sys/mman.h>
+#endif
+
 _Static_assert(STM_AEAD_TAG_LEN_AEGIS256 == STM_BTNODE_CSUM_SIZE,
                "AEGIS-256 tag must fit exactly the btnode's trailing csum slot");
 _Static_assert(STM_AEAD_NONCE_LEN == 32,
@@ -148,9 +152,26 @@ stm_status stm_btree_node_decrypt(const stm_btree_crypt_ctx *cx,
     /* Heap scratch for the ciphertext+tag input. libsodium's
      * aegis256_decrypt verifies the tag before committing any
      * plaintext, so a tag-fail leaves buf in undefined state (the
-     * caller must discard it). */
+     * caller must discard it).
+     *
+     * Thylacine pouch carve-out: pouch musl's mallocng exhibits
+     * slot-footer corruption on the second 128 KiB alloc/free cycle
+     * (sizeclass-63 path, > MMAP_THRESHOLD). The root cause is not
+     * yet identified (Thylacine docs/reference/86-pouch-stratumd-boot.md
+     * "16b-γ-mount-bind deep-dive"). Bypass mallocng with a direct
+     * page-grain mmap so no allocator-side slot footer sits at
+     * ct[node_size..] for memcpy's adjacency to perturb. munmap
+     * returns the pages cleanly with no integrity check. Other
+     * platforms keep the malloc path -- the workaround is scoped
+     * to the pouch-specific bug. */
+#ifdef __thylacine__
+    uint8_t *ct = mmap(NULL, node_size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ct == MAP_FAILED) return STM_ENOMEM;
+#else
     uint8_t *ct = malloc(node_size);
     if (!ct) return STM_ENOMEM;
+#endif
     memcpy(ct, buf, node_size);
 
     size_t pt_len = 0;
@@ -159,7 +180,11 @@ stm_status stm_btree_node_decrypt(const stm_btree_crypt_ctx *cx,
                                       ad, AD_LEN,
                                       ct, node_size,
                                       buf, &pt_len);
+#ifdef __thylacine__
+    munmap(ct, node_size);
+#else
     free(ct);
+#endif
     if (s != STM_OK) return s;
     if (pt_len != ciphertext_len) return STM_EBACKEND;
     return STM_OK;
