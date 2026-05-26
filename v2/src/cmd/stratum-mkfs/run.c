@@ -104,8 +104,45 @@ static void usage(void)
 "                   exclusive with the unencrypted-keyfile path.\n"
 "  --bootstrap SIZE Bootstrap pool size. Default: 16M (auto-scaled to\n"
 "                   max(64MiB, device/1024) by libfs if 0).\n"
+"  --seed HEX64     Pin the UUID-derivation seed to a fixed 64-bit\n"
+"                   hex value (optional 0x prefix; up to 16 hex chars).\n"
+"                   Same seed -> identical pool/device UUIDs but pool\n"
+"                   on-disk bytes are still NOT byte-identical because\n"
+"                   the keyfile + libsodium nonces add per-run entropy.\n"
+"                   For full byte reproduction, pin the keyfile (use\n"
+"                   --keyfile with an existing file) AND the seed.\n"
+"                   When omitted, derives from time+pid (default).\n"
 "  -h, --help       Print this help.\n",
         stderr);
+}
+
+/* Optional seed for derive_uuid (Thylacine-pouch-arm: pin pool.img
+ * byte layout for content-sensitive bug reproduction). Set by
+ * --seed; consumed by derive_uuid. */
+static bool     g_mkfs_seed_set = false;
+static uint64_t g_mkfs_seed     = 0;
+
+/* Parse a hex string up to 16 chars into a uint64_t. Returns false
+ * on empty / non-hex / overlong input. Tolerates a leading "0x". */
+static bool parse_hex64(const char *s, uint64_t *out)
+{
+    if (!s) return false;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    if (*s == '\0') return false;
+    uint64_t v = 0;
+    int      n = 0;
+    for (; *s; s++, n++) {
+        if (n >= 16) return false;
+        char c = *s;
+        unsigned d;
+        if (c >= '0' && c <= '9')      d = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A' + 10);
+        else return false;
+        v = (v << 4) | d;
+    }
+    *out = v;
+    return true;
 }
 
 /* Parse a size like "64M", "1G", "512K", "1048576". Returns 0 on
@@ -124,20 +161,34 @@ static uint64_t parse_size(const char *s)
     return (uint64_t)v;
 }
 
-/* Derive a 128-bit UUID-shape value from current time + pid. Not
- * cryptographically random; "unique enough" for early v2. */
+/* Derive a 128-bit UUID-shape value from current time + pid (or from
+ * the --seed value if set). Not cryptographically random;
+ * "unique enough" for early v2. The --seed path lets callers pin the
+ * derivation across runs (Thylacine-pouch-arm extension: same seed ->
+ * same pool/device UUIDs -> reproducible on-disk byte layout for
+ * content-sensitive bug investigation). */
 static void derive_uuid(uint64_t out[2], uint64_t salt)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t pid = (uint64_t)getpid();
-    out[0] = ((uint64_t)ts.tv_sec << 32)
+    uint64_t hi, lo;
+    if (g_mkfs_seed_set) {
+        /* Seed-pinned: mix the seed into hi/lo with two distinct
+         * multiplicative constants so the two halves don't collapse
+         * into the same value. Salt then differentiates per-UUID
+         * (POOL vs DEV). */
+        hi = g_mkfs_seed;
+        lo = g_mkfs_seed * 0x9e3779b97f4a7c15ULL;
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t pid = (uint64_t)getpid();
+        hi = ((uint64_t)ts.tv_sec << 32)
            ^ ((uint64_t)ts.tv_nsec)
-           ^ (pid << 16)
-           ^ salt;
-    out[1] = ((uint64_t)ts.tv_nsec * 0x9e3779b97f4a7c15ULL)
-           ^ (pid * 0x100000001b3ULL)
-           ^ ~salt;
+           ^ (pid << 16);
+        lo = ((uint64_t)ts.tv_nsec * 0x9e3779b97f4a7c15ULL)
+           ^ (pid * 0x100000001b3ULL);
+    }
+    out[0] = hi ^ salt;
+    out[1] = lo ^ ~salt;
 }
 
 int stm_cmd_mkfs_main(int argc, char **argv)
@@ -180,6 +231,20 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             i++;
         } else if (strcmp(argv[i], "--passphrase-stdin") == 0) {
             passphrase_stdin = true;
+        } else if (strcmp(argv[i], "--seed") == 0) {
+            if (i + 1 >= argc) {
+                fputs("--seed requires a hex64 argument\n", stderr);
+                return 1;
+            }
+            if (!parse_hex64(argv[i + 1], &g_mkfs_seed)) {
+                fprintf(stderr,
+                    "stratum-mkfs: bad --seed: %s (expect <=16 hex chars, "
+                    "optional 0x prefix)\n",
+                    argv[i + 1]);
+                return 1;
+            }
+            g_mkfs_seed_set = true;
+            i++;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage();
             return 0;
@@ -282,6 +347,15 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     uint64_t pool_uuid[2], device_uuid[2];
     derive_uuid(pool_uuid,   0x504F4F4C);  /* 'POOL' */
     derive_uuid(device_uuid, 0x44455600);  /* 'DEV\0' */
+    if (g_mkfs_seed_set) {
+        fprintf(stderr, "stratum-mkfs: seed=0x%016llx (pinned via --seed)\n",
+                (unsigned long long)g_mkfs_seed);
+    } else {
+        fprintf(stderr, "stratum-mkfs: pool_uuid=%016llx%016llx "
+                "(time+pid; pass --seed HEX to pin)\n",
+                (unsigned long long)pool_uuid[0],
+                (unsigned long long)pool_uuid[1]);
+    }
 
     stm_fs_format_opts fopts = {
         .device_size_bytes        = device_bytes,
