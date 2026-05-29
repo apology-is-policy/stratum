@@ -4068,4 +4068,87 @@ STM_TEST(p9_nested_create_then_write) {
     unlink(g_key_path);
 }
 
+/* Faithful repro of the corvus A-1b runtime failure: kernel client
+ * negotiates msize=4096 (SYS_ATTACH_DEFAULT_MSIZE), then writes 2048 B.
+ * Probes 256/512/1024/2048/3752 to pin the threshold + ecode. */
+STM_TEST(p9_write_msize4096_sizes) {
+    make_tmp("9p_msize4096");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = NULL;
+    STM_ASSERT_OK(stm_9p_server_create(fs, 1u, 0, 0,
+                                          STM_9P_MSIZE_MIN /*=4096*/, &s));
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz;
+
+    /* Tversion msize=4096, then Tattach. */
+    sz = build_tversion(req, STM_9P_MSIZE_MIN, "9P2000.L");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RVERSION);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_MSIZE_MIN);
+    sz = build_tattach(req, 1, 100);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RATTACH);
+
+    static uint8_t big[4096];
+    for (int i = 0; i < 4096; i++) big[i] = (uint8_t)((i * 7 + 3) & 0xff);
+
+    uint32_t sizes[] = { 256u, 512u, 1024u, 2048u, 3752u };
+    uint16_t tag = 2;
+    uint32_t newfid = 110;
+    for (unsigned k = 0; k < sizeof(sizes)/sizeof(sizes[0]); k++) {
+        uint32_t wlen = sizes[k];
+        char name[32];
+        snprintf(name, sizeof name, "f%u", wlen);
+        /* clone root -> newfid, lcreate, Twrite wlen, clunk. */
+        sz = build_twalk(req, tag++, 100, newfid, 0, NULL);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+        sz = build_tlcreate(req, tag++, newfid, name, 1u, 0600u, 0u);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+        sz = build_twrite(req, tag++, newfid, 0, big, wlen);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+        STM_ASSERT_EQ(load_u32(resp + 7), wlen);
+        sz = build_tclunk(req, tag++, newfid);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        newfid++;
+    }
+
+    /* NESTED large write -- mirrors corvus's users/<name>/hybrid.corvus
+     * (the actual A-1b failure shape: nested dirs + a >100 B extent write). */
+    sz = build_tmkdir(req, tag++, 100, "users", 0755u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RMKDIR);
+    walk_to(s, 100, 200, "users");
+    sz = build_tmkdir(req, tag++, 200, "michael", 0755u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RMKDIR);
+    walk_to(s, 200, 201, "michael");
+    sz = build_twalk(req, tag++, 201, 202, 0, NULL);  /* clone for lcreate */
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    sz = build_tlcreate(req, tag++, 202, "hybrid.corvus", 1u, 0600u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    sz = build_twrite(req, tag++, 202, 0, big, 2048u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    STM_ASSERT_EQ(load_u32(resp + 7), 2048u);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("9p")

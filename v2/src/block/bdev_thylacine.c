@@ -535,8 +535,15 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
 static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
 {
     if ((off % SECTOR_SIZE) != 0) return STM_EINVAL;
-    if ((len % SECTOR_SIZE) != 0) return STM_EINVAL;
-
+    /* `len` need NOT be a SECTOR_SIZE multiple. Stratum's extent layer
+     * reads/writes (block-aligned-plaintext + AEAD-tag), e.g. 4096+32 =
+     * 4128 -- never sector-aligned because of the trailing tag. The
+     * posix backend (pread) accepts arbitrary lengths; we honor the same
+     * bdev contract by rounding the final partial sector UP to a whole
+     * sector for the device transfer, then copying out only `len` real
+     * bytes. Reading the extra tail bytes is safe: every Stratum extent
+     * is reserved as N block-aligned blocks (N*4096 >= round_up(len,512)),
+     * so the rounded read stays within the extent + on-device. */
     thyla_bdev *d = (thyla_bdev *)base;
     uint8_t *p = buf;
     uint64_t cur_off = off;
@@ -545,7 +552,7 @@ static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
     while (len > 0) {
         size_t chunk_bytes = (len > VQ_DATA_DMA_SIZE) ? (size_t)VQ_DATA_DMA_SIZE : len;
         uint64_t lba       = cur_off / SECTOR_SIZE;
-        uint32_t sectors   = (uint32_t)(chunk_bytes / SECTOR_SIZE);
+        uint32_t sectors   = (uint32_t)((chunk_bytes + SECTOR_SIZE - 1) / SECTOR_SIZE);
 
         stm_status s = do_request(d, lba, sectors, /*is_write=*/false);
         if (s != STM_OK) { pthread_mutex_unlock(&d->lock); return s; }
@@ -563,8 +570,13 @@ static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
 static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t len)
 {
     if ((off % SECTOR_SIZE) != 0) return STM_EINVAL;
-    if ((len % SECTOR_SIZE) != 0) return STM_EINVAL;
-
+    /* `len` need NOT be a SECTOR_SIZE multiple -- see op_read. The extent
+     * layer writes (block-aligned-plaintext + AEAD-tag) = e.g. 4128 bytes.
+     * We round the final partial sector UP and zero-pad the DMA region's
+     * tail so a whole sector is transferred. The zero pad lands in the
+     * extent's reserved-but-unused tail (N*4096 >= round_up(len,512)), so
+     * it never clobbers an adjacent extent and reads back harmlessly
+     * (the reader decrypts only the real `total_bytes`). */
     thyla_bdev *d = (thyla_bdev *)base;
     const uint8_t *p = buf;
     uint64_t cur_off = off;
@@ -573,9 +585,14 @@ static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t
     while (len > 0) {
         size_t chunk_bytes = (len > VQ_DATA_DMA_SIZE) ? (size_t)VQ_DATA_DMA_SIZE : len;
         uint64_t lba       = cur_off / SECTOR_SIZE;
-        uint32_t sectors   = (uint32_t)(chunk_bytes / SECTOR_SIZE);
+        uint32_t sectors   = (uint32_t)((chunk_bytes + SECTOR_SIZE - 1) / SECTOR_SIZE);
+        size_t   dma_bytes = (size_t)sectors * SECTOR_SIZE;
 
         memcpy((void *)THYLA_DATA_USER_VA, p, chunk_bytes);
+        if (dma_bytes > chunk_bytes) {
+            memset((uint8_t *)THYLA_DATA_USER_VA + chunk_bytes, 0,
+                   dma_bytes - chunk_bytes);
+        }
         dsb_sy();  /* CPU stores visible to device before kick (the dsb_sy
                     * inside do_request also covers this; redundant but
                     * documents intent). */
