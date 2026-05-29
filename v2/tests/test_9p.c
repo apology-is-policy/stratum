@@ -3998,4 +3998,74 @@ STM_TEST(p9_link_invalid_args) {
     unlink(g_key_path);
 }
 
+/* Thylacine A-1b repro: create+write a file whose parent is a clone-walked
+ * subdir fid (NOT the attach root). corvus hit Rlerror(EINVAL = !is_open) on
+ * the nested Twrite while the identical sequence at the attach root worked.
+ * Control (root file) must pass; the nested file is the bug under test. */
+STM_TEST(p9_nested_create_then_write) {
+    make_tmp("9p_nested_cw");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz;
+
+    /* A 512-byte payload -- the corvus failure is write-SIZE dependent
+     * (64 B ok, 256 B fails at runtime); the earlier 10-12 B writes never
+     * exercised Stratum's large-write path. */
+    static uint8_t bigdata[512];
+    for (int i = 0; i < 512; i++) bigdata[i] = (uint8_t)((i * 7 + 3) & 0xff);
+
+    /* Control: clone root -> 110, lcreate "rootfile", large Twrite. */
+    sz = build_twalk(req, 1, 100, 110, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    sz = build_tlcreate(req, 2, 110, "rootfile", 1u /*O_WRONLY*/, 0600u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    sz = build_twrite(req, 3, 110, 0, bigdata, 512u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    if (resp[4] != STM_9P_RWRITE) {
+        fprintf(stderr, "REPRO: root 512B Twrite -> Rlerror ecode=%u\n",
+                load_u32(resp + 7));
+    }
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    sz = build_tclunk(req, 4, 110);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+
+    /* Repro: mkdir "sub", walk to it (nwname=1), clone it (nwname=0),
+     * lcreate "f" under the clone, Twrite. The nested Twrite is the bug. */
+    sz = build_tmkdir(req, 5, 100, "sub", 0755u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RMKDIR);
+    walk_to(s, 100, 120, "sub");
+    sz = build_twalk(req, 6, 120, 121, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    sz = build_tlcreate(req, 7, 121, "f", 1u /*O_WRONLY*/, 0600u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    sz = build_twrite(req, 8, 121, 0, "hello-nested", 12u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    if (resp[4] != STM_9P_RWRITE) {
+        fprintf(stderr, "REPRO: nested Twrite -> Rlerror ecode=%u (expected RWRITE)\n",
+                load_u32(resp + 7));
+    }
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("9p")
