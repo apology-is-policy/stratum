@@ -545,6 +545,14 @@ static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
      * is reserved as N block-aligned blocks (N*4096 >= round_up(len,512)),
      * so the rounded read stays within the extent + on-device. */
     thyla_bdev *d = (thyla_bdev *)base;
+    /* Bound the (rounded-up) device span against the device's sector
+     * capacity, so an out-of-range LBA is a deterministic local reject
+     * rather than a device-dependent EIO. The partial-sector round-up
+     * can enlarge the addressed span by up to one sector. */
+    if (off / SECTOR_SIZE + (uint64_t)((len + SECTOR_SIZE - 1) / SECTOR_SIZE)
+        > d->base.caps.size_bytes / SECTOR_SIZE) {
+        return STM_EINVAL;
+    }
     uint8_t *p = buf;
     uint64_t cur_off = off;
 
@@ -578,6 +586,12 @@ static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t
      * it never clobbers an adjacent extent and reads back harmlessly
      * (the reader decrypts only the real `total_bytes`). */
     thyla_bdev *d = (thyla_bdev *)base;
+    /* Bound the (rounded-up) device span against the device's sector
+     * capacity -- see op_read. */
+    if (off / SECTOR_SIZE + (uint64_t)((len + SECTOR_SIZE - 1) / SECTOR_SIZE)
+        > d->base.caps.size_bytes / SECTOR_SIZE) {
+        return STM_EINVAL;
+    }
     const uint8_t *p = buf;
     uint64_t cur_off = off;
 
