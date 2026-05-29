@@ -1605,6 +1605,46 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
     return ws;
 }
 
+/* Read-side counterpart to fs_write_extent_aligned_locked: the extent layer
+ * requires the read offset to be 4 KiB-aligned (stm_sync_read_extent rejects
+ * (off % STM_UB_SIZE != 0) with STM_EINVAL). A client reading at a non-aligned
+ * offset -- e.g. the 2nd chunk of a multi-chunk 9P Tread, which starts at 2048
+ * -- would otherwise fail. Align the offset down, read the covering aligned
+ * span into scratch, and copy out the caller's [off, off+len) slice. `len`
+ * need not be aligned (the extent layer only constrains the offset). Returns
+ * the number of real bytes copied in *out_read (the caller clamps to EOF).
+ * Caller holds fs->lock. */
+static stm_status fs_read_extent_aligned_locked(stm_fs *fs,
+                                                     uint64_t ds, uint64_t ino,
+                                                     uint64_t off,
+                                                     void *buf, size_t len,
+                                                     size_t *out_read)
+{
+    if (out_read) *out_read = 0;
+    if (len == 0u) return STM_OK;
+    const uint64_t BLK = 4096u;
+    if (off % BLK == 0u) {
+        return stm_sync_read_extent(fs->sync, ds, ino, off, buf, len, out_read);
+    }
+    uint64_t aligned_off = off & ~(BLK - 1u);
+    uint64_t end_off     = off + (uint64_t)len;
+    uint64_t aligned_end = (end_off + BLK - 1u) & ~(BLK - 1u);
+    uint64_t aligned_len = aligned_end - aligned_off;
+    uint8_t *scratch = (uint8_t *)calloc(1, (size_t)aligned_len);
+    if (!scratch) return STM_ENOMEM;
+    size_t got = 0;
+    stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, aligned_off,
+                                               scratch, (size_t)aligned_len, &got);
+    if (rs != STM_OK && rs != STM_ENOENT) { free(scratch); return rs; }
+    uint64_t skip   = off - aligned_off;
+    size_t   avail  = (got > skip) ? (size_t)(got - skip) : 0u;
+    size_t   copy_n = (len < avail) ? len : avail;
+    if (copy_n > 0u) memcpy(buf, scratch + skip, copy_n);
+    free(scratch);
+    if (out_read) *out_read = copy_n;
+    return STM_OK;
+}
+
 /* SWISS-4q-flush drain callback: each buffered range becomes one
  * stm_sync_write_extent via fs_write_extent_aligned_locked. The
  * callback runs under stm_dirty_buffer's internal mutex AND under
@@ -1893,8 +1933,8 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
         bool buffer_has_data =
             stm_dirty_buffer_has_ino(fs->dirty_buffer, ds, ino);
         if (!buffer_has_data) {
-            stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, off,
-                                                    buf, len, out_read);
+            stm_status rs = fs_read_extent_aligned_locked(fs, ds, ino, off,
+                                                              buf, len, out_read);
             if (rs == STM_OK && out_read) {
                 uint64_t logical_avail = cur_size - off;
                 if ((uint64_t)*out_read > logical_avail) {
@@ -1916,8 +1956,8 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
                                   ? len : (size_t)logical_avail;
         if (effective_len > 0u) memset(buf, 0, effective_len);
         size_t got_ext = 0;
-        stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, off,
-                                                buf, effective_len, &got_ext);
+        stm_status rs = fs_read_extent_aligned_locked(fs, ds, ino, off,
+                                                          buf, effective_len, &got_ext);
         if (rs != STM_OK && rs != STM_ENOENT) return rs;
         stm_dirty_buffer_overlay(fs->dirty_buffer, ds, ino, off,
                                     effective_len, buf);

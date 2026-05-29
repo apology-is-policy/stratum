@@ -578,13 +578,19 @@ static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
 static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t len)
 {
     if ((off % SECTOR_SIZE) != 0) return STM_EINVAL;
-    /* `len` need NOT be a SECTOR_SIZE multiple -- see op_read. The extent
-     * layer writes (block-aligned-plaintext + AEAD-tag) = e.g. 4128 bytes.
-     * We round the final partial sector UP and zero-pad the DMA region's
-     * tail so a whole sector is transferred. The zero pad lands in the
-     * extent's reserved-but-unused tail (N*4096 >= round_up(len,512)), so
-     * it never clobbers an adjacent extent and reads back harmlessly
-     * (the reader decrypts only the real `total_bytes`). */
+    if (len == 0) return STM_OK;
+    /* `len` need NOT be a SECTOR_SIZE multiple. The extent layer writes
+     * (block-aligned-plaintext + AEAD-tag), e.g. 4128 B. A block device can
+     * only transfer whole sectors, so the final partial sector is handled by
+     * READ-MODIFY-WRITE: read the on-disk sector, overlay the real bytes,
+     * write it back. This preserves the bytes beyond `len` in that sector,
+     * matching the posix backend's byte-granular pwrite. The prior approach
+     * (round up + zero-pad the tail) CLOBBERED those bytes; Stratum packs an
+     * adjacent object / extent into the same sector, so the zero-pad
+     * destroyed a neighbour's bytes -> read-back AEAD failure (STM_EBADTAG).
+     * A whole-sector zero-pad is correct ONLY when `len` is a sector multiple;
+     * for any partial tail, RMW is mandatory on a block backend that cannot
+     * write sub-sector. (posix pwrite is byte-granular and never had this.) */
     thyla_bdev *d = (thyla_bdev *)base;
     /* Bound the (rounded-up) device span against the device's sector
      * capacity -- see op_read. */
@@ -594,30 +600,39 @@ static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t
     }
     const uint8_t *p = buf;
     uint64_t cur_off = off;
+    size_t aligned = (len / SECTOR_SIZE) * SECTOR_SIZE; /* whole-sector prefix */
+    size_t tail    = len - aligned;                     /* 0 .. SECTOR_SIZE-1  */
 
     pthread_mutex_lock(&d->lock);
-    while (len > 0) {
-        size_t chunk_bytes = (len > VQ_DATA_DMA_SIZE) ? (size_t)VQ_DATA_DMA_SIZE : len;
-        uint64_t lba       = cur_off / SECTOR_SIZE;
-        uint32_t sectors   = (uint32_t)((chunk_bytes + SECTOR_SIZE - 1) / SECTOR_SIZE);
-        size_t   dma_bytes = (size_t)sectors * SECTOR_SIZE;
 
-        memcpy((void *)THYLA_DATA_USER_VA, p, chunk_bytes);
-        if (dma_bytes > chunk_bytes) {
-            memset((uint8_t *)THYLA_DATA_USER_VA + chunk_bytes, 0,
-                   dma_bytes - chunk_bytes);
-        }
-        dsb_sy();  /* CPU stores visible to device before kick (the dsb_sy
-                    * inside do_request also covers this; redundant but
-                    * documents intent). */
-
-        stm_status s = do_request(d, lba, sectors, /*is_write=*/true);
+    /* 1. Whole-sector prefix, chunked by the DMA buffer size. Every transfer
+     *    here is an exact sector multiple -- no padding, no RMW. */
+    size_t remaining = aligned;
+    while (remaining > 0) {
+        size_t   chunk   = (remaining > VQ_DATA_DMA_SIZE) ? (size_t)VQ_DATA_DMA_SIZE : remaining;
+        uint32_t sectors = (uint32_t)(chunk / SECTOR_SIZE);
+        memcpy((void *)THYLA_DATA_USER_VA, p, chunk);
+        dsb_sy();
+        stm_status s = do_request(d, cur_off / SECTOR_SIZE, sectors, /*is_write=*/true);
         if (s != STM_OK) { pthread_mutex_unlock(&d->lock); return s; }
-
-        p       += chunk_bytes;
-        cur_off += chunk_bytes;
-        len     -= chunk_bytes;
+        p        += chunk;
+        cur_off  += chunk;
+        remaining -= chunk;
     }
+
+    /* 2. Partial tail sector: read-modify-write to preserve [tail, SECTOR_SIZE).
+     *    The lock is held across the read+write so no concurrent op can touch
+     *    this sector (or the shared DMA buffer) between them. */
+    if (tail > 0) {
+        uint64_t lba = cur_off / SECTOR_SIZE;
+        stm_status rs = do_request(d, lba, 1, /*is_write=*/false);
+        if (rs != STM_OK) { pthread_mutex_unlock(&d->lock); return rs; }
+        memcpy((void *)THYLA_DATA_USER_VA, p, tail);
+        dsb_sy();
+        stm_status ws = do_request(d, lba, 1, /*is_write=*/true);
+        if (ws != STM_OK) { pthread_mutex_unlock(&d->lock); return ws; }
+    }
+
     pthread_mutex_unlock(&d->lock);
     return STM_OK;
 }
