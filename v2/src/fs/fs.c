@@ -1629,6 +1629,13 @@ static stm_status fs_read_extent_aligned_locked(stm_fs *fs,
     uint64_t aligned_off = off & ~(BLK - 1u);
     uint64_t end_off     = off + (uint64_t)len;
     uint64_t aligned_end = (end_off + BLK - 1u) & ~(BLK - 1u);
+    /* Bound the scratch allocation, symmetric to fs_write_extent_aligned_locked.
+     * Unreachable via 9P (h_read clamps count to iounit_for_msize before
+     * stm_fs_read), but a future direct caller passing a huge non-aligned len
+     * would otherwise attempt an unbounded calloc. */
+    if (aligned_end > (uint64_t)STM_FS_RECORDSIZE_MAX + aligned_off) {
+        return STM_ERANGE;
+    }
     uint64_t aligned_len = aligned_end - aligned_off;
     uint8_t *scratch = (uint8_t *)calloc(1, (size_t)aligned_len);
     if (!scratch) return STM_ENOMEM;
