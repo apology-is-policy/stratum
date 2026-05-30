@@ -406,6 +406,13 @@ const uint8_t *stm_sync_metadata_key(const stm_sync *s);
  */
 uint64_t stm_sync_current_gen(const stm_sync *s);
 
+/* #791: count of crash-orphaned bootstrap (metadata) nodes the mount-time
+ * reconcile reclaimed at stm_sync_open. 0 on a cleanly-unmounted pool (every
+ * allocated node was reachable from the durable UB). Diagnostic + the
+ * completeness regression oracle: a clean remount MUST report 0, else the
+ * reconcile under-marked (swept a live node). */
+uint64_t stm_sync_reconcile_freed_nodes(const stm_sync *s);
+
 /* ========================================================================= */
 /* P5-3c: multi-device alloc attach + mirror APIs.                             */
 /* ========================================================================= */

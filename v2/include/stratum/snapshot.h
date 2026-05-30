@@ -961,6 +961,15 @@ STM_MUST_USE
 stm_status stm_snapshot_index_get_gen(const stm_snapshot_index *idx,
                                          uint64_t *out_root_gen);
 
+/* #791 mount reconcile: report every live bootstrap node the snapshot subsystem
+ * occupies via `fn` -- the index btree_store tree (UNIT_BLOCKS) plus every
+ * snapshot's captured content engine root (NODE_BLOCKS, the pinned older
+ * dataset root). See the reconcile API in stratum/bootstrap.h. */
+STM_MUST_USE
+stm_status stm_snapshot_index_reconcile_mark(stm_snapshot_index *idx,
+                                                stm_reconcile_mark_fn fn,
+                                                void *ctx);
+
 STM_MUST_USE
 stm_status stm_snapshot_index_verify(const stm_snapshot_index *idx);
 

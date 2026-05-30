@@ -159,6 +159,14 @@ struct stm_sync {
      * stm_sync_open and cached here for /ctl/ exposure. */
     uint8_t    pool_serial[16];
 
+    /* #791: orphan bootstrap nodes reclaimed by the mount-time reconcile pass
+     * (sync_reconcile_bootstrap, run once at the tail of stm_sync_open). 0 on a
+     * cleanly-unmounted pool (every allocated node reachable from the durable
+     * UB -> nothing to free); > 0 means crash-orphaned metadata nodes were
+     * reclaimed. Exposed via stm_sync_reconcile_freed_nodes for diagnostics +
+     * the completeness regression test (clean remount MUST report 0). */
+    uint64_t   reconcile_freed_nodes;
+
     /* Commit gen state (P5-2, aligned with quorum.tla):
      *   auth_gen    — most recent committed final gen with quorum.
      *                 0 if no commits yet. Advances by 1 on mount-
@@ -1546,6 +1554,64 @@ static uint64_t compute_auth_gen(const sync_scan *scans, size_t n, size_t quorum
     return gens[quorum - 1];
 }
 
+/* ========================================================================= */
+/* #791 mount-time bootstrap reconcile -- the sync-layer driver.              */
+/*                                                                            */
+/* The bootstrap (metadata) allocator's 1-bit bitmap cannot distinguish a     */
+/* crash-orphaned node (unswept deferred-free, or a rolled-back alloc whose   */
+/* root never reached the durable UB) from a live one, and open does no       */
+/* pending rebuild -- so under a crash-loop these orphans accumulate and brick */
+/* the pool (#791). This pass is the complete fix: mark every node reachable  */
+/* from the durable UB across every bootstrap-backed tree, then sweep every   */
+/* allocated-but-unmarked node (stm_bootstrap_reconcile_*).                   */
+/*                                                                            */
+/* It is BEST-EFFORT and never fails the mount: a mark error or a missing     */
+/* handle ABORTS the pass without sweeping (an incomplete mark must never free */
+/* a live node -- abort leaves the bitmap as found, reclaiming nothing). On a  */
+/* cleanly-unmounted pool every allocated node is reachable, so freed == 0;    */
+/* freed > 0 is exactly the reclaimed crash-orphans.                          */
+/*                                                                            */
+/* COMPLETENESS is the obligation here -- a bootstrap-backed tree left unwalked */
+/* has its live nodes swept -> corruption. The full set: alloc (data-area     */
+/* tree, device 0) + alloc_roots + keyschema + repair_log + cas + the dataset  */
+/* index AND every present dataset's content engine + the snapshot index AND   */
+/* every snapshot's captured content engine. All metadata is device-0-backed   */
+/* and the bootstrap is device-0-addressed, so device 0's bootstrap is         */
+/* reconciled and any stray non-device-0 paddr is ignored by reconcile_mark;   */
+/* additional devices' allocator trees (multi-device pools) are left untouched */
+/* -- safe (no sweep on their bootstraps), at the cost of not reclaiming their  */
+/* orphans until the bootstrap layer itself becomes multi-device-aware.       */
+struct sync_recon_route { stm_bootstrap *boot; };
+static void sync_recon_mark(void *ctx, uint64_t paddr, uint32_t nblocks) {
+    struct sync_recon_route *r = ctx;
+    (void)stm_bootstrap_reconcile_mark(r->boot, paddr, nblocks);
+}
+static void sync_reconcile_bootstrap(stm_sync *s) {
+    s->reconcile_freed_nodes = 0;
+    stm_bootstrap *boot = stm_alloc_bootstrap(s->alloc);
+    if (!boot) return;
+    if (!s->roots || !s->keyschema || !s->repair_log || !s->cas_idx ||
+        !s->dataset_idx || !s->snap_idx) return;   /* a tree would go unmarked */
+    if (stm_bootstrap_reconcile_begin(boot) != STM_OK) return;
+
+    struct sync_recon_route route = { boot };
+    stm_status rs = STM_OK;
+    #define SYNC_RECON_MARK(call) do { if (rs == STM_OK) rs = (call); } while (0)
+    SYNC_RECON_MARK(stm_alloc_reconcile_mark(s->alloc, sync_recon_mark, &route));
+    SYNC_RECON_MARK(stm_alloc_roots_reconcile_mark(s->roots, sync_recon_mark, &route));
+    SYNC_RECON_MARK(stm_keyschema_reconcile_mark(s->keyschema, sync_recon_mark, &route));
+    SYNC_RECON_MARK(stm_repair_log_index_reconcile_mark(s->repair_log, sync_recon_mark, &route));
+    SYNC_RECON_MARK(stm_cas_index_reconcile_mark(s->cas_idx, sync_recon_mark, &route));
+    SYNC_RECON_MARK(stm_dataset_index_reconcile_mark(s->dataset_idx, sync_recon_mark, &route));
+    SYNC_RECON_MARK(stm_snapshot_index_reconcile_mark(s->snap_idx, sync_recon_mark, &route));
+    #undef SYNC_RECON_MARK
+
+    if (rs != STM_OK) { stm_bootstrap_reconcile_abort(boot); return; }
+    uint64_t freed = 0;
+    if (stm_bootstrap_reconcile_end(boot, &freed) == STM_OK)
+        s->reconcile_freed_nodes = freed;
+}
+
 stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                           const stm_hybrid_keys *wk,
                           struct stm_janus_client *janus,
@@ -2256,6 +2322,13 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
     /* P7-CAS: same advance for the CAS index. */
     if (s2->cas_idx) (void)stm_cas_index_advance_txg(s2->cas_idx, s2->current_gen);
 
+    /* #791: reclaim crash-orphaned bootstrap (metadata) nodes now that every
+     * tree is loaded -- BEFORE the pool starts serving, so the reclaimed bits
+     * are reusable this mount (durable on the next commit). Best-effort; never
+     * fails the mount. Skipped on a read-only pool (no commit will persist the
+     * swept bitmap, and a RO pool issues no reserves to brick on). */
+    if (!s2->read_only) sync_reconcile_bootstrap(s2);
+
     *out_sync = s2;
     return STM_OK;
 }
@@ -2940,6 +3013,13 @@ uint64_t stm_sync_current_gen(const stm_sync *s)
     uint64_t g = s->current_gen;
     pthread_mutex_unlock(&ms->lock);
     return g;
+}
+
+uint64_t stm_sync_reconcile_freed_nodes(const stm_sync *s)
+{
+    /* #791: set once at the tail of stm_sync_open by sync_reconcile_bootstrap;
+     * immutable thereafter, so no lock. 0 on a cleanly-unmounted pool. */
+    return s ? s->reconcile_freed_nodes : 0;
 }
 
 stm_alloc *stm_sync_alloc(const stm_sync *s, uint16_t device_id)

@@ -192,6 +192,13 @@ stm_status stm_repair_log_index_get_root(const stm_repair_log_index *rl,
                                            uint64_t *out_root_paddr,
                                            uint8_t out_root_csum[32]);
 
+/* #791 mount reconcile: report every live bootstrap node this repair log's
+ * durable form occupies (one node at root_paddr) via `fn`. */
+STM_MUST_USE
+stm_status stm_repair_log_index_reconcile_mark(stm_repair_log_index *rl,
+                                                 stm_reconcile_mark_fn fn,
+                                                 void *ctx);
+
 /* ========================================================================= */
 /* Entry append + read.                                                       */
 /* ========================================================================= */

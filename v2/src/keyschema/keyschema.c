@@ -575,6 +575,18 @@ stm_status stm_keyschema_get_root(const stm_keyschema *ks,
     return STM_OK;
 }
 
+stm_status stm_keyschema_reconcile_mark(stm_keyschema *ks,
+                                          stm_reconcile_mark_fn fn, void *ctx)
+{
+    if (!ks || !fn) return STM_EINVAL;
+    /* #791: the keyschema persists as ONE durable node at root_paddr (single-
+     * leaf MVP; multi-leaf graduation hits STM_ERANGE at commit today). Mark
+     * that node at its UNIT_BLOCKS reserve span. If keyschema ever graduates to
+     * a btree_store tree, this MUST become a stm_btree_store_walk_paddrs. */
+    if (ks->root_paddr != 0) fn(ctx, ks->root_paddr, STM_BOOTSTRAP_UNIT_BLOCKS);
+    return STM_OK;
+}
+
 /* ========================================================================= */
 /* Entry manipulation.                                                        */
 /* ========================================================================= */

@@ -2021,6 +2021,55 @@ stm_status stm_dataset_index_get_gen(const stm_dataset_index *idx,
     return STM_OK;
 }
 
+/* #791: report every live bootstrap node the dataset subsystem occupies. Two
+ * tiers: (1) the dataset INDEX btree_store tree (dataset_id -> per-dataset root
+ * triple), at UNIT_BLOCKS; (2) each PRESENT dataset's per-dataset content
+ * engine (inode/dirent/xattr/extent all live here, keyed by metakey subspace),
+ * at NODE_BLOCKS. The content engine is opened at the slot's durable root (the
+ * same triple a lazy get_engine would use) and closed again if this pass opened
+ * it -- at mount every slot->engine is NULL, so reconcile leaves the index's
+ * engine-open state as found. An empty (all-zero) triple has no durable nodes
+ * and is skipped. Holds idx->lock for the whole pass (dataset_engine_*_locked
+ * require it). */
+struct ds_recon_relay { stm_reconcile_mark_fn fn; void *ctx; uint32_t nblocks; };
+static int ds_recon_cb(uint64_t paddr, void *p) {
+    struct ds_recon_relay *r = p;
+    r->fn(r->ctx, paddr, r->nblocks);
+    return 0;
+}
+stm_status stm_dataset_index_reconcile_mark(stm_dataset_index *idx,
+                                               stm_reconcile_mark_fn fn,
+                                               void *ctx) {
+    if (!idx || !fn) return STM_EINVAL;
+    must_lock(&idx->lock);
+    stm_status s = STM_OK;
+
+    if (idx->root_paddr != 0) {
+        ds_store_ctx        sc = ds_make_store_ctx(idx);
+        stm_btree_crypt_ctx cx = ds_make_crypt_ctx(idx);
+        struct ds_recon_relay relay = { fn, ctx, STM_BOOTSTRAP_UNIT_BLOCKS };
+        s = stm_btree_store_walk_paddrs(idx->root_paddr, idx->root_gen,
+                                          idx->root_csum, &DS_STORE_VT, &sc, &cx,
+                                          ds_recon_cb, &relay);
+    }
+
+    for (size_t i = 0; s == STM_OK && i < idx->slots_len; i++) {
+        dataset_slot *slot = &idx->slots[i];
+        if (!slot->present) continue;
+        if (dataset_triple_is_empty(slot->e.di_tree_root, slot->e.di_root_gen))
+            continue;
+        bool was_open = (slot->engine != NULL);
+        s = dataset_engine_open_locked(idx, slot);
+        if (s != STM_OK) break;
+        struct ds_recon_relay relay = { fn, ctx, STM_BOOTSTRAP_NODE_BLOCKS };
+        s = stm_btree_engine_walk_paddrs(slot->engine, ds_recon_cb, &relay);
+        if (!was_open) dataset_engine_close_locked(slot);
+    }
+
+    must_unlock(&idx->lock);
+    return s;
+}
+
 stm_status stm_dataset_index_get_next_id(const stm_dataset_index *idx,
                                             uint64_t *out_next_id) {
     if (!idx || !out_next_id) return STM_EINVAL;

@@ -303,6 +303,21 @@ stm_status stm_bootstrap_reconcile_mark(stm_bootstrap *a, uint64_t paddr,
 STM_MUST_USE
 stm_status stm_bootstrap_reconcile_end(stm_bootstrap *a, uint64_t *out_freed_nodes);
 
+/* Abort an open reconcile pass: drop the marked-bitmap WITHOUT sweeping. The
+ * fail-safe when a mark walk could not complete (an integrity error, a missing
+ * handle) -- the allocated bitmap is left exactly as found, so an incomplete
+ * mark can never free a live node. NULL-safe; a no-op outside a pass. */
+void stm_bootstrap_reconcile_abort(stm_bootstrap *a);
+
+/* The reconcile sink the subsystem reconcile-mark accessors report through is
+ * stm_reconcile_mark_fn (defined in stratum/types.h so every subsystem header
+ * can declare its accessor). `nblocks` is the node's reserve span -- UNIT_BLOCKS
+ * for the btree_store / single-node trees (alloc / alloc_roots / keyschema /
+ * repair_log / cas / the dataset+snapshot indices), NODE_BLOCKS for engine
+ * nodes (per-dataset + per-snapshot content trees). The sync-layer driver
+ * implements it, routing each (paddr, nblocks) to the owning device's bootstrap
+ * via stm_bootstrap_reconcile_mark. */
+
 /* ========================================================================= */
 /* Inspection.                                                                */
 /* ========================================================================= */

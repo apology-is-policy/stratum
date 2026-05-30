@@ -271,6 +271,34 @@ stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t root_gen,
                                       void *vt_ctx,
                                       const stm_btree_crypt_ctx *cx);
 
+/* #791 mount-reconcile: per-node-paddr callback. Return 0 to continue, nonzero
+ * to stop early (walk then returns STM_OK). Signature matches
+ * stm_btree_engine_paddr_cb so one relay can feed both walks. */
+typedef int (*stm_btree_store_paddr_cb)(uint64_t paddr, void *ctx);
+
+/*
+ * Walk the tree rooted at `root_paddr` (the on-disk shape produced by
+ * stm_btree_store_serialize, two levels max) and call `cb` once for every
+ * node paddr -- the read-only twin of stm_btree_store_free_tree. Each node is
+ * Merkle-verified (against `expected_root_csum` for the root) then AEAD-
+ * decrypted (so internal children can be enumerated); a csum/MAC failure
+ * aborts with STM_ECORRUPT / STM_EBADTAG before cb sees the unreachable
+ * remainder. Needs only `vt->read` + `cx` (never frees). The #791 mount
+ * reconcile feeds the reported paddrs to stm_bootstrap_reconcile_mark at the
+ * UNIT_BLOCKS span (btree_store nodes are reserved at UNIT_BLOCKS).
+ *
+ * Returns STM_EINVAL on NULL args / missing read vtable / NULL csum, and
+ * propagates read / decrypt errors.
+ */
+STM_MUST_USE
+stm_status stm_btree_store_walk_paddrs(uint64_t root_paddr, uint64_t root_gen,
+                                         const uint8_t expected_root_csum[32],
+                                         const stm_btree_store_vtable *vt,
+                                         void *vt_ctx,
+                                         const stm_btree_crypt_ctx *cx,
+                                         stm_btree_store_paddr_cb cb,
+                                         void *cb_ctx);
+
 #ifdef __cplusplus
 }
 #endif

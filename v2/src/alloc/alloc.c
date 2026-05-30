@@ -785,6 +785,39 @@ stm_status stm_alloc_get_tree_root(const stm_alloc *a,
     return STM_OK;
 }
 
+/* #791: report every bootstrap node the durable data-allocator tree occupies,
+ * so the mount reconcile keeps it (vs sweeping it as an orphan). Walks the SAME
+ * durable tree stm_alloc_commit's free_tree would walk (current_tree_root) via
+ * the same ALLOC_STORE_VT + crypt ctx; each btree_store node is UNIT_BLOCKS. */
+struct alloc_recon_relay { stm_reconcile_mark_fn fn; void *ctx; };
+static int alloc_recon_cb(uint64_t paddr, void *p) {
+    struct alloc_recon_relay *r = p;
+    r->fn(r->ctx, paddr, STM_BOOTSTRAP_UNIT_BLOCKS);
+    return 0;
+}
+stm_status stm_alloc_reconcile_mark(stm_alloc *a,
+                                       stm_reconcile_mark_fn fn, void *ctx)
+{
+    if (!a || !fn) return STM_EINVAL;
+    pthread_mutex_lock(&a->lock);
+    stm_status s = STM_OK;
+    if (a->current_tree_root != 0) {
+        stm_btree_crypt_ctx cx;
+        if (!build_crypt_ctx_locked(a, &cx)) {
+            pthread_mutex_unlock(&a->lock);
+            return STM_EINVAL;
+        }
+        store_ctx scx = { .boot = a->boot, .bdev = a->bdev,
+                          .device_id = a->device_id };
+        struct alloc_recon_relay relay = { fn, ctx };
+        s = stm_btree_store_walk_paddrs(a->current_tree_root, a->current_tree_gen,
+                                          a->current_tree_csum, &ALLOC_STORE_VT,
+                                          &scx, &cx, alloc_recon_cb, &relay);
+    }
+    pthread_mutex_unlock(&a->lock);
+    return s;
+}
+
 stm_status stm_alloc_get_tree_gen(const stm_alloc *a, uint64_t *out_root_gen)
 {
     if (!a || !out_root_gen) return STM_EINVAL;

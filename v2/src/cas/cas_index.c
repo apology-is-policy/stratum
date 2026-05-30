@@ -648,6 +648,34 @@ stm_status stm_cas_index_get_gen(const stm_cas_index *idx,
     return STM_OK;
 }
 
+/* #791: report every bootstrap node the durable CAS index tree occupies, via
+ * the same CAS_STORE_VT + crypt ctx stm_cas_index_commit's free_tree uses. The
+ * durable form is the serialized btree_store tree at idx->root_paddr (the
+ * in-RAM record array is rebuilt from it); btree_store nodes are UNIT_BLOCKS. */
+struct cas_recon_relay { stm_reconcile_mark_fn fn; void *ctx; };
+static int cas_recon_cb(uint64_t paddr, void *p) {
+    struct cas_recon_relay *r = p;
+    r->fn(r->ctx, paddr, STM_BOOTSTRAP_UNIT_BLOCKS);
+    return 0;
+}
+stm_status stm_cas_index_reconcile_mark(stm_cas_index *idx,
+                                           stm_reconcile_mark_fn fn, void *ctx) {
+    if (!idx || !fn) return STM_EINVAL;
+    pthread_mutex_t *lock = cas_lock(idx);
+    must_lock(lock);
+    stm_status s = STM_OK;
+    if (idx->root_paddr != 0) {
+        cas_store_ctx       sc = cas_make_store_ctx(idx);
+        stm_btree_crypt_ctx cx = cas_make_crypt_ctx(idx);
+        struct cas_recon_relay relay = { fn, ctx };
+        s = stm_btree_store_walk_paddrs(idx->root_paddr, idx->root_gen,
+                                          idx->root_csum, &CAS_STORE_VT, &sc, &cx,
+                                          cas_recon_cb, &relay);
+    }
+    must_unlock(lock);
+    return s;
+}
+
 static stm_status cas_build_btree_locked(const stm_cas_index *idx,
                                             stm_btree_mt **out_tree) {
     stm_btree_opts opts = stm_btree_opts_default();

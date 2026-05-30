@@ -136,6 +136,13 @@ typedef enum {
 
 const char *stm_strerror(stm_status s);
 
+/* #791 reconcile sink (see stratum/bootstrap.h reconcile API). A subsystem's
+ * reconcile-mark accessor reports every live bootstrap node its durable tree(s)
+ * occupy through this callback; `nblocks` is the node's reserve span. Defined
+ * here so every subsystem header (which includes only types.h + forward-decls
+ * stm_bootstrap) can declare its accessor. */
+typedef void (*stm_reconcile_mark_fn)(void *ctx, uint64_t paddr, uint32_t nblocks);
+
 /* ------------------------------------------------------------------------- */
 /* Slices: pointer + length, immutable and mutable variants. The output      */
 /* type convention for "caller provides buffer, callee fills in" is          */

@@ -645,6 +645,15 @@ STM_MUST_USE
 stm_status stm_dataset_index_get_gen(const stm_dataset_index *idx,
                                         uint64_t *out_root_gen);
 
+/* #791 mount reconcile: report every live bootstrap node the dataset subsystem
+ * occupies via `fn` -- the index btree_store tree (UNIT_BLOCKS) plus every
+ * present dataset's content engine (NODE_BLOCKS, opened at the slot's durable
+ * root). See the reconcile API in stratum/bootstrap.h. */
+STM_MUST_USE
+stm_status stm_dataset_index_reconcile_mark(stm_dataset_index *idx,
+                                               stm_reconcile_mark_fn fn,
+                                               void *ctx);
+
 /*
  * Walk the on-disk tree's Merkle + AEAD chain without mutating
  * in-RAM state.  STM_OK trivially if no commit has persisted yet

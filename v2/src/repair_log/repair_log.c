@@ -497,6 +497,21 @@ stm_status stm_repair_log_index_get_root(const stm_repair_log_index *rl,
     return STM_OK;
 }
 
+stm_status stm_repair_log_index_reconcile_mark(stm_repair_log_index *rl,
+                                                 stm_reconcile_mark_fn fn,
+                                                 void *ctx)
+{
+    if (!rl || !fn) return STM_EINVAL;
+    /* #791: the repair log persists as ONE durable node at root_paddr (append-
+     * only single leaf; multi-leaf graduation is future work). Mark that node
+     * at its UNIT_BLOCKS reserve span. */
+    must_lock(&rl->lock);
+    uint64_t root = rl->root_paddr;
+    must_unlock(&rl->lock);
+    if (root != 0) fn(ctx, root, STM_BOOTSTRAP_UNIT_BLOCKS);
+    return STM_OK;
+}
+
 /* ========================================================================= */
 /* Emit + iterate.                                                            */
 /* ========================================================================= */

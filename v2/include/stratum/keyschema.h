@@ -162,6 +162,13 @@ stm_status stm_keyschema_get_root(const stm_keyschema *ks,
                                     uint64_t *out_root_paddr,
                                     uint8_t out_root_csum[32]);
 
+/* #791 mount reconcile: report every live bootstrap node this keyschema's
+ * durable form occupies (one node at root_paddr) via `fn`. See the reconcile
+ * API in stratum/bootstrap.h. */
+STM_MUST_USE
+stm_status stm_keyschema_reconcile_mark(stm_keyschema *ks,
+                                          stm_reconcile_mark_fn fn, void *ctx);
+
 /* ========================================================================= */
 /* Entry manipulation.                                                        */
 /* ========================================================================= */

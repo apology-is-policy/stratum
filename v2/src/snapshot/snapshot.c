@@ -17,6 +17,8 @@
 #include <stratum/btnode.h>
 #include <stratum/btree.h>
 #include <stratum/btree_store.h>
+#include <stratum/btree_engine.h>   /* #791 reconcile: walk captured snap content roots */
+#include <stratum/engine_store.h>   /* #791 reconcile: STM_ENGINE_STORE_VT + ctx */
 #include <stratum/super.h>
 
 #include <pthread.h>
@@ -1840,6 +1842,64 @@ stm_status stm_snapshot_index_get_gen(const stm_snapshot_index *idx,
     *out_root_gen = idx->root_gen;
     must_unlock(lock);
     return STM_OK;
+}
+
+/* #791: report every live bootstrap node the snapshot subsystem occupies. Two
+ * tiers: (1) the snapshot INDEX btree_store tree, at UNIT_BLOCKS; (2) each
+ * snapshot's CAPTURED content engine root -- a verbatim older dataset
+ * btree_engine root (snapshot.c capture-triple) -- at NODE_BLOCKS. A snapshot
+ * retains (pins) the engine nodes the live dataset has since superseded; those
+ * nodes are reachable from the snapshot's older root, NOT the live dataset
+ * root, so they MUST be walked here or the reconcile would free still-pinned
+ * metadata -> corruption. Each captured root is opened as a TEMP engine (tree_id
+ * = the snapshot's dataset_id, so the AEAD bind matches what the dataset wrote)
+ * using the index's boot/bdev/crypt, walked, then destroyed. snap_idx routing
+ * is NULL (a read-only walk never frees). An all-zero captured root (empty
+ * snapshot) has no engine nodes and is skipped. */
+struct sp_recon_relay { stm_reconcile_mark_fn fn; void *ctx; uint32_t nblocks; };
+static int sp_recon_cb(uint64_t paddr, void *p) {
+    struct sp_recon_relay *r = p;
+    r->fn(r->ctx, paddr, r->nblocks);
+    return 0;
+}
+stm_status stm_snapshot_index_reconcile_mark(stm_snapshot_index *idx,
+                                                stm_reconcile_mark_fn fn,
+                                                void *ctx) {
+    if (!idx || !fn) return STM_EINVAL;
+    must_lock(&idx->lock);
+    stm_status s = STM_OK;
+
+    if (idx->root_paddr != 0) {
+        sp_store_ctx        sc = sp_make_store_ctx(idx);
+        stm_btree_crypt_ctx cx = sp_make_crypt_ctx(idx);
+        struct sp_recon_relay relay = { fn, ctx, STM_BOOTSTRAP_UNIT_BLOCKS };
+        s = stm_btree_store_walk_paddrs(idx->root_paddr, idx->root_gen,
+                                          idx->root_csum, &SP_STORE_VT, &sc, &cx,
+                                          sp_recon_cb, &relay);
+    }
+
+    stm_btree_crypt_ctx ecx = sp_make_crypt_ctx(idx);   /* engine cx == index cx */
+    for (size_t i = 0; s == STM_OK && i < idx->slots_len; i++) {
+        snapshot_slot *sl = &idx->slots[i];
+        if (!sl->present) continue;
+        if (sl->e.tree_root_paddr == 0) continue;       /* no captured engine root */
+        stm_engine_store_ctx ectx = {
+            .boot = idx->boot, .bdev = idx->bdev, .snap_idx = NULL,
+            .dataset_id = sl->e.dataset_id, .origin_snap_id = 0,
+        };
+        stm_btree_engine *eng = NULL;
+        s = stm_btree_engine_open(&STM_ENGINE_STORE_VT, &ectx, &ecx,
+                                    /*tree_id=*/sl->e.dataset_id,
+                                    sl->e.tree_root_paddr, sl->e.root_gen,
+                                    sl->e.root_csum, &eng);
+        if (s != STM_OK) break;
+        struct sp_recon_relay relay = { fn, ctx, STM_BOOTSTRAP_NODE_BLOCKS };
+        s = stm_btree_engine_walk_paddrs(eng, sp_recon_cb, &relay);
+        stm_btree_engine_destroy(eng);
+    }
+
+    must_unlock(&idx->lock);
+    return s;
 }
 
 stm_status stm_snapshot_index_get_next_id(const stm_snapshot_index *idx,

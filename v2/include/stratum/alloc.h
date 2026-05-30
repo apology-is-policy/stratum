@@ -180,6 +180,13 @@ stm_status stm_alloc_get_tree_root(const stm_alloc *a,
                                      uint64_t *out_root_paddr,
                                      uint8_t out_root_csum[32]);
 
+/* #791 mount reconcile: report every live bootstrap node the durable data-
+ * allocator tree occupies via `fn` (btree_store nodes, UNIT_BLOCKS). See the
+ * reconcile API in stratum/bootstrap.h. */
+STM_MUST_USE
+stm_status stm_alloc_reconcile_mark(stm_alloc *a,
+                                       stm_reconcile_mark_fn fn, void *ctx);
+
 /*
  * Gen at which the current tree root was last AEAD-encrypted. This is
  * the value that ub_alloc_root_gen should carry in the next uberblock

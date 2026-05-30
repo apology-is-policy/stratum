@@ -532,6 +532,28 @@ stm_status stm_alloc_roots_get_gen(const stm_alloc_roots *r,
     return STM_OK;
 }
 
+/* #791: report every bootstrap node the durable alloc-roots tree occupies, via
+ * the same ROOTS_STORE_VT + crypt ctx stm_alloc_roots_commit's free_tree uses.
+ * btree_store nodes are UNIT_BLOCKS. */
+struct ar_recon_relay { stm_reconcile_mark_fn fn; void *ctx; };
+static int ar_recon_cb(uint64_t paddr, void *p) {
+    struct ar_recon_relay *r = p;
+    r->fn(r->ctx, paddr, STM_BOOTSTRAP_UNIT_BLOCKS);
+    return 0;
+}
+stm_status stm_alloc_roots_reconcile_mark(stm_alloc_roots *r,
+                                             stm_reconcile_mark_fn fn, void *ctx)
+{
+    if (!r || !fn) return STM_EINVAL;
+    if (r->root_paddr == 0) return STM_OK;
+    store_ctx sc = make_store_ctx(r);
+    stm_btree_crypt_ctx cx = make_crypt_ctx(r);
+    struct ar_recon_relay relay = { fn, ctx };
+    return stm_btree_store_walk_paddrs(r->root_paddr, r->root_gen, r->root_csum,
+                                         &ROOTS_STORE_VT, &sc, &cx,
+                                         ar_recon_cb, &relay);
+}
+
 /* ========================================================================= */
 /* Scrubber.                                                                  */
 /* ========================================================================= */

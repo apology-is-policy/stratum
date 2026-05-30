@@ -1002,6 +1002,18 @@ stm_status stm_bootstrap_reconcile_end(stm_bootstrap *a, uint64_t *out_freed_nod
     return STM_OK;
 }
 
+void stm_bootstrap_reconcile_abort(stm_bootstrap *a)
+{
+    if (!a || !a->reconcile_marked) return;
+    /* Drop the marked-bitmap WITHOUT sweeping. The fail-safe for an
+     * incomplete mark pass: if any tree walk errored (a node failed integrity,
+     * a handle was missing) the live set is unknown, so sweeping could free a
+     * live node. Abort leaves the allocated bitmap exactly as found -- the
+     * reconcile is a best-effort reclaimer, never a corruptor. */
+    free(a->reconcile_marked);
+    a->reconcile_marked = NULL;
+}
+
 /* ========================================================================= */
 /* Inspection.                                                                */
 /* ========================================================================= */

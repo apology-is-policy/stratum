@@ -1014,6 +1014,71 @@ STM_TEST(fs_io_cow_with_snapshot_routes_to_dead_list) {
     unlink(g_tmp_path);
 }
 
+/* #791 completeness oracle. The mount-time reconcile mark-sweep must NEVER free
+ * a node reachable from the durable uberblock -- a swept-then-reused live node
+ * is silent metadata corruption. The fixture exercises every tree class (alloc
+ * + alloc_roots + keyschema + repair_log + cas + the dataset index + a present
+ * dataset's content engine + the snapshot index + a snapshot's CAPTURED content
+ * engine) and proves nothing live was freed by reading every reachable view
+ * back after the reconcile runs:
+ *   - the LIVE dataset (post-CoW content + a sibling inode), and
+ *   - the SNAPSHOT's frozen view (via rollback) -- the subtle case: the CoW
+ *     superseded ino-1's engine node, which is retained by the snapshot and
+ *     reachable ONLY from its captured root, not the live root. Omit the
+ *     snapshot-engine walk and the reconcile frees that node -> this rollback
+ *     read returns corruption / fails the AEAD gate.
+ * NOTE freed > 0 is EXPECTED, not a bug: a clean unmount's final commit leaves
+ * its own deferred-frees (the superseded prior index roots) unswept -- there is
+ * no next commit to sweep them -- and the reconcile legitimately reclaims those
+ * dead nodes. Correctness is "every reachable view survives", not "freed == 0".
+ * The bootstrap unit tests + the host crash-repro cover the reclaim efficacy. */
+STM_TEST(fs_reconcile_preserves_live_and_snapshot) {
+    make_tmp("recon_live_snap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096], b[4096], out[4096];
+    memset(a, 0xA1, sizeof a);
+    memset(b, 0x5B, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, /*ds=*/1, /*ino=*/1, /*off=*/0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_write(fs, /*ds=*/1, /*ino=*/2, /*off=*/0, a, sizeof a));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, /*ds=*/1, "snap0", 5, &snap_id));
+    STM_ASSERT(snap_id != 0);
+
+    /* CoW after the snapshot: ino 1 off 0's old engine node is now snapshot-
+     * retained while the live tree gets fresh nodes. */
+    STM_ASSERT_OK(stm_fs_write(fs, /*ds=*/1, /*ino=*/1, /*off=*/0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));        /* clean: final commit */
+
+    /* Remount -> the mount-time reconcile runs (sync_reconcile_bootstrap). */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Live view survived the reconcile. */
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(b, out, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+
+    /* Snapshot's frozen view survived -- the retained (CoW-superseded) engine
+     * node was marked by the snapshot-engine walk, NOT swept. Rolling back and
+     * reading ino 1 must return the pre-CoW content. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap_id, /*force=*/false));
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 STM_TEST(fs_io_cross_mount_durability) {
     /* Write an extent, commit, unmount, remount, read back — content
      * must round-trip via persistence. */

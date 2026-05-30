@@ -195,6 +195,12 @@ STM_MUST_USE
 stm_status stm_alloc_roots_get_gen(const stm_alloc_roots *r,
                                       uint64_t *out_root_gen);
 
+/* #791 mount reconcile: report every live bootstrap node this alloc-roots tree
+ * occupies via `fn` (btree_store nodes, UNIT_BLOCKS). */
+STM_MUST_USE
+stm_status stm_alloc_roots_reconcile_mark(stm_alloc_roots *r,
+                                             stm_reconcile_mark_fn fn, void *ctx);
+
 /* ========================================================================= */
 /* Entry manipulation (pre-commit, in-RAM).                                   */
 /* ========================================================================= */

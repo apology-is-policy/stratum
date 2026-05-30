@@ -903,3 +903,80 @@ stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t root_gen,
 
     return vt->free(vt_ctx, root_paddr, free_gen);
 }
+
+stm_status stm_btree_store_walk_paddrs(uint64_t root_paddr, uint64_t root_gen,
+                                         const uint8_t expected_root_csum[32],
+                                         const stm_btree_store_vtable *vt,
+                                         void *vt_ctx,
+                                         const stm_btree_crypt_ctx *cx,
+                                         stm_btree_store_paddr_cb cb,
+                                         void *cb_ctx)
+{
+    if (!vt || !vt->read) return STM_EINVAL;
+    if (!cb)              return STM_EINVAL;
+    if (!cx || !cx->metadata_key)  return STM_EINVAL;
+    if (!expected_root_csum)       return STM_EINVAL;
+
+    /* Same node enumeration as stm_btree_store_free_tree (two-level shape,
+     * Merkle-verify-before-decrypt, AEAD decrypt to read child paddrs) but
+     * reports each node paddr to `cb` instead of vt->free-ing it. #791 mount
+     * reconcile feeds these to stm_bootstrap_reconcile_mark. A nonzero cb
+     * return stops the walk early (returns STM_OK), matching
+     * stm_btree_engine_walk_paddrs; the reconcile caller never stops. */
+    uint8_t *buf = malloc(STM_BTNODE_SIZE);
+    if (!buf) return STM_ENOMEM;
+
+    stm_status s = vt->read(vt_ctx, root_paddr, buf, STM_BTNODE_SIZE);
+    if (s != STM_OK) { free(buf); return s; }
+    s = check_merkle_link(buf, expected_root_csum);
+    if (s != STM_OK) { free(buf); return s; }
+    s = stm_btree_node_decrypt(cx, root_paddr, root_gen, buf, STM_BTNODE_SIZE);
+    if (s != STM_OK) { free(buf); return s; }
+    restore_plaintext_self_csum(buf);
+
+    stm_btnode_info info;
+    s = stm_btnode_peek(buf, STM_BTNODE_SIZE, &info);
+    if (s != STM_OK) { free(buf); return s; }
+
+    if (info.kind == STM_BTNODE_KIND_LEAF) {
+        free(buf);
+        (void)cb(root_paddr, cb_ctx);
+        return STM_OK;
+    }
+
+    uint32_t cap = info.n_entries + 1u;
+    child_collect cc = { 0 };
+    cc.child_paddrs = calloc(cap, sizeof *cc.child_paddrs);
+    cc.child_kinds  = calloc(cap, sizeof *cc.child_kinds);
+    cc.child_csums  = calloc((size_t)cap * 32u, sizeof *cc.child_csums);
+    cc.cap          = cap;
+    if (!cc.child_paddrs || !cc.child_kinds || !cc.child_csums) {
+        free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
+        free(buf);
+        return STM_ENOMEM;
+    }
+
+    s = stm_btnode_internal_decode(buf, STM_BTNODE_SIZE, NULL,
+                                     NULL, child_record_cb, &cc);
+    if (s == STM_OK && cc.err != STM_OK) s = cc.err;
+    free(buf);
+    if (s != STM_OK) {
+        free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
+        return s;
+    }
+
+    for (uint32_t i = 0; i < cc.n_children; i++) {
+        if (cc.child_kinds[i] != STM_BPTR_KIND_LEAF) { s = STM_ENOTSUPPORTED; break; }
+        if (cb(cc.child_paddrs[i], cb_ctx) != 0) {  /* early stop */
+            free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
+            return STM_OK;
+        }
+    }
+    free(cc.child_paddrs);
+    free(cc.child_kinds);
+    free(cc.child_csums);
+    if (s != STM_OK) return s;
+
+    (void)cb(root_paddr, cb_ctx);
+    return STM_OK;
+}
