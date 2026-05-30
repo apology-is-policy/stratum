@@ -175,10 +175,11 @@ STM_TEST(bootstrap_reconcile_frees_unmarked) {
     STM_ASSERT_OK(stm_bootstrap_reconcile_begin(a));
     /* A second begin while a pass is open is rejected. */
     STM_ASSERT(stm_bootstrap_reconcile_begin(a) != STM_OK);
-    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p1));
-    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p2));
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p1, TEST_NODE_BLOCKS));
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p2, TEST_NODE_BLOCKS));
     /* A non-bootstrap paddr (wrong device) is silently ignored, not an error. */
-    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, stm_paddr_make(1, 0)));
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, stm_paddr_make(1, 0),
+                                               TEST_NODE_BLOCKS));
     uint64_t freed = 0;
     STM_ASSERT_OK(stm_bootstrap_reconcile_end(a, &freed));
     STM_ASSERT_EQ(freed, 2u);
@@ -215,11 +216,10 @@ STM_TEST(bootstrap_reconcile_mark_all_keeps_all) {
     STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p2));
 
     STM_ASSERT_OK(stm_bootstrap_reconcile_begin(a));
-    /* p1 is a 2-node run: mark both node paddrs. */
-    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p1));
-    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a,
-        stm_paddr_make(0, stm_paddr_offset(p1) + TEST_NODE_BLOCKS)));
-    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p2));
+    /* p1 is a 2-node run. A walk yields only its FIRST paddr; mark must cover
+     * the whole run from that single paddr + span (the driver's situation). */
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p1, 2u * TEST_NODE_BLOCKS));
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p2, TEST_NODE_BLOCKS));
     uint64_t freed = 0;
     STM_ASSERT_OK(stm_bootstrap_reconcile_end(a, &freed));
     STM_ASSERT_EQ(freed, 0u);
@@ -227,6 +227,54 @@ STM_TEST(bootstrap_reconcile_mark_all_keeps_all) {
     stm_bootstrap_stats st;
     STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
     STM_ASSERT_EQ(st.allocated_nodes, 3u);
+
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* #791 regression: a UNIT_BLOCKS node is 8 bitmap bits but a walk yields ONE
+ * paddr for it. Marking that single paddr at the UNIT_BLOCKS span must protect
+ * all 8 bits. Pre-fix (mark set only the first bit) _end freed the live 7-bit
+ * tail -> metadata corruption; this asserts freed==0 + all 8 bits retained. */
+STM_TEST(bootstrap_reconcile_marks_full_unit_run) {
+    make_tmp("recon_unit");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+
+    /* One legacy btree_store node = UNIT_BLOCKS = 8 consecutive bitmap nodes. */
+    uint64_t unit = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_UNIT_BLOCKS, 0, &unit));
+    /* A trailing single engine node, to prove the run mark stops at the run. */
+    uint64_t tail = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &tail));
+
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.allocated_nodes, 9u);   /* 8 + 1 */
+
+    STM_ASSERT_OK(stm_bootstrap_reconcile_begin(a));
+    /* Mark ONLY the unit's first paddr, at its reserve span: covers all 8. */
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, unit, TEST_UNIT_BLOCKS));
+    /* `tail` deliberately left unmarked -> it is the lone orphan. */
+    uint64_t freed = 0;
+    STM_ASSERT_OK(stm_bootstrap_reconcile_end(a, &freed));
+    STM_ASSERT_EQ(freed, 1u);                /* only `tail`, not the unit tail */
+
+    /* Every one of the unit's 8 nodes survives. */
+    for (uint32_t i = 0; i < 8u; i++) {
+        bool al = false;
+        uint64_t pa = stm_paddr_make(0, stm_paddr_offset(unit) +
+                                        (uint64_t)i * TEST_NODE_BLOCKS);
+        STM_ASSERT_OK(stm_bootstrap_is_allocated(a, pa, &al));
+        STM_ASSERT(al);
+    }
+    bool tal = false;
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a, tail, &tal));
+    STM_ASSERT(!tal);
+
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.allocated_nodes, 8u);
 
     stm_bootstrap_close(a);
     stm_bdev_close(d);

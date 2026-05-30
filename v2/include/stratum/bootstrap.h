@@ -282,13 +282,24 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen);
  *
  * COMPLETENESS IS THE CALLER'S OBLIGATION: a live node left unmarked is freed
  * -> corruption. The bootstrap-backed trees that MUST all be walked: alloc
- * (per device) + alloc_roots + keyschema + repair_log + cas + dataset +
- * snapshot + engine_store. Run the pass at mount BEFORE any free (so
- * pending_head is empty). Sequence: begin -> mark* -> end. */
+ * (per device) + alloc_roots + keyschema + repair_log + cas + dataset-index +
+ * snapshot-index (all btree_store / single-node, marked at UNIT_BLOCKS) +
+ * every present dataset's current content engine root AND every snapshot's
+ * content engine root (btree_engine, marked at NODE_BLOCKS). Run the pass at
+ * mount BEFORE any free (so pending_head is empty). Sequence: begin -> mark*
+ * -> end.
+ *
+ * `nblocks` is the reserve span of the node at `paddr` -- a reserve sets
+ * nblocks/NODE_BLOCKS consecutive bits and returns the FIRST node's paddr, so
+ * mark must pass the SAME span the node was reserved at (UNIT_BLOCKS for the
+ * btree_store/single-node trees, NODE_BLOCKS for engine nodes), symmetric with
+ * stm_bootstrap_free. Passing too small a span leaves the live tail unmarked
+ * -> _end frees it -> corruption. Must be a nonzero multiple of NODE_BLOCKS. */
 STM_MUST_USE
 stm_status stm_bootstrap_reconcile_begin(stm_bootstrap *a);
 STM_MUST_USE
-stm_status stm_bootstrap_reconcile_mark(stm_bootstrap *a, uint64_t paddr);
+stm_status stm_bootstrap_reconcile_mark(stm_bootstrap *a, uint64_t paddr,
+                                        uint32_t nblocks);
 STM_MUST_USE
 stm_status stm_bootstrap_reconcile_end(stm_bootstrap *a, uint64_t *out_freed_nodes);
 

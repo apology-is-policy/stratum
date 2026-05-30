@@ -962,15 +962,26 @@ stm_status stm_bootstrap_reconcile_begin(stm_bootstrap *a)
     return STM_OK;
 }
 
-stm_status stm_bootstrap_reconcile_mark(stm_bootstrap *a, uint64_t paddr)
+stm_status stm_bootstrap_reconcile_mark(stm_bootstrap *a, uint64_t paddr,
+                                        uint32_t nblocks)
 {
     if (!a || !a->reconcile_marked) return STM_EINVAL;
+    if (nblocks == 0 || nblocks % STM_BOOTSTRAP_NODE_BLOCKS != 0) return STM_EINVAL;
     /* Filter: only paddrs that land in THIS bootstrap's node space are marks.
      * The caller may pass every paddr a tree walk yields (data-area blocks,
      * other devices' paddrs); paddr_to_node rejects those and we ignore them. */
     uint64_t node = 0;
     if (!paddr_to_node(a, paddr, &node)) return STM_OK;
-    bit_set(a->reconcile_marked, node);
+    /* A reserve sets nblocks/NODE_BLOCKS CONSECUTIVE bits and returns only the
+     * FIRST node's paddr (stm_bootstrap_reserve); a tree walk likewise yields
+     * one paddr per on-disk node. So mark must cover the WHOLE run -- a
+     * UNIT_BLOCKS btree_store node is 8 bits; marking only the first would let
+     * _end free the live 7-bit tail -> metadata corruption. Symmetric with
+     * stm_bootstrap_free's (paddr, nblocks) span. */
+    uint64_t nnodes = nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
+    if (node + nnodes > a->total_nodes) return STM_EINVAL;
+    for (uint64_t i = 0; i < nnodes; i++)
+        bit_set(a->reconcile_marked, node + i);
     return STM_OK;
 }
 
