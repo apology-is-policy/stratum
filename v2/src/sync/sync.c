@@ -1581,10 +1581,16 @@ static uint64_t compute_auth_gen(const sync_scan *scans, size_t n, size_t quorum
 /* additional devices' allocator trees (multi-device pools) are left untouched */
 /* -- safe (no sweep on their bootstraps), at the cost of not reclaiming their  */
 /* orphans until the bootstrap layer itself becomes multi-device-aware.       */
-struct sync_recon_route { stm_bootstrap *boot; };
+struct sync_recon_route { stm_bootstrap *boot; stm_status mark_err; };
 static void sync_recon_mark(void *ctx, uint64_t paddr, uint32_t nblocks) {
     struct sync_recon_route *r = ctx;
-    (void)stm_bootstrap_reconcile_mark(r->boot, paddr, nblocks);
+    /* Capture the FIRST non-OK reconcile_mark so an in-range-but-overflowing
+     * paddr (STM_EINVAL on node+nnodes > total_nodes) aborts the pass rather
+     * than leaving a node unmarked-then-swept -- making the fail-closed
+     * contract exact (the integrity-gated walk already rejects corrupt bptrs,
+     * so this is defense-in-depth). A non-bootstrap paddr returns STM_OK. */
+    stm_status m = stm_bootstrap_reconcile_mark(r->boot, paddr, nblocks);
+    if (m != STM_OK && r->mark_err == STM_OK) r->mark_err = m;
 }
 static void sync_reconcile_bootstrap(stm_sync *s) {
     s->reconcile_freed_nodes = 0;
@@ -1594,7 +1600,7 @@ static void sync_reconcile_bootstrap(stm_sync *s) {
         !s->dataset_idx || !s->snap_idx) return;   /* a tree would go unmarked */
     if (stm_bootstrap_reconcile_begin(boot) != STM_OK) return;
 
-    struct sync_recon_route route = { boot };
+    struct sync_recon_route route = { boot, STM_OK };
     stm_status rs = STM_OK;
     #define SYNC_RECON_MARK(call) do { if (rs == STM_OK) rs = (call); } while (0)
     SYNC_RECON_MARK(stm_alloc_reconcile_mark(s->alloc, sync_recon_mark, &route));
@@ -1606,7 +1612,12 @@ static void sync_reconcile_bootstrap(stm_sync *s) {
     SYNC_RECON_MARK(stm_snapshot_index_reconcile_mark(s->snap_idx, sync_recon_mark, &route));
     #undef SYNC_RECON_MARK
 
-    if (rs != STM_OK) { stm_bootstrap_reconcile_abort(boot); return; }
+    /* Abort (no sweep) on either a walk-level error OR a leaf-mark rejection:
+     * an incomplete mark must never free a live node. */
+    if (rs != STM_OK || route.mark_err != STM_OK) {
+        stm_bootstrap_reconcile_abort(boot);
+        return;
+    }
     uint64_t freed = 0;
     if (stm_bootstrap_reconcile_end(boot, &freed) == STM_OK)
         s->reconcile_freed_nodes = freed;

@@ -504,7 +504,9 @@ stm_status stm_repair_log_index_reconcile_mark(stm_repair_log_index *rl,
     if (!rl || !fn) return STM_EINVAL;
     /* #791: the repair log persists as ONE durable node at root_paddr (append-
      * only single leaf; multi-leaf graduation is future work). Mark that node
-     * at its UNIT_BLOCKS reserve span. */
+     * at its UNIT_BLOCKS reserve span. If repair_log ever graduates to a
+     * multi-node btree_store tree, this MUST become a
+     * stm_btree_store_walk_paddrs -- else every non-root node is swept. */
     must_lock(&rl->lock);
     uint64_t root = rl->root_paddr;
     must_unlock(&rl->lock);

@@ -557,7 +557,16 @@ stm_status stm_dataset_destroy(stm_dataset_index *idx, uint64_t id) {
      * the destroy is safe. A future public stm_fs_destroy_dataset API
      * MUST reconcile this: either refuse when the engine has uncommitted
      * state, OR force-flush first, OR walk the engine's records to free
-     * the referenced data paddrs before destroying. */
+     * the referenced data paddrs before destroying.
+     *
+     * #791 forward-note: that same future API MUST ALSO synchronously
+     * bootstrap-free the engine's committed metadata NODES. The mount-time
+     * reconcile (stm_dataset_index_reconcile_mark) walks present slots ONLY,
+     * so a committed dataset's engine nodes, once the slot flips !present,
+     * are reachable from no walked tree -> the next mount's reconcile sweeps
+     * them. That is correct iff they are genuinely dead; if a clone/snapshot
+     * still references shared subtrees, destroy must not have flipped present
+     * while a holder exists (the existing snapshot-hold discipline). */
     dataset_engine_close_locked(&idx->slots[s]);
     idx->slots[s].present = false;
     idx->dirty = true;
@@ -2061,6 +2070,9 @@ stm_status stm_dataset_index_reconcile_mark(stm_dataset_index *idx,
         bool was_open = (slot->engine != NULL);
         s = dataset_engine_open_locked(idx, slot);
         if (s != STM_OK) break;
+        /* The opened engine carries snap_idx in its ctx (for vt->free dead-list
+         * routing), but walk_paddrs is READ-ONLY and never calls vt->free, so
+         * the dataset-lock-held -> snapshot-lock edge never arms here. */
         struct ds_recon_relay relay = { fn, ctx, STM_BOOTSTRAP_NODE_BLOCKS };
         s = stm_btree_engine_walk_paddrs(slot->engine, ds_recon_cb, &relay);
         if (!was_open) dataset_engine_close_locked(slot);

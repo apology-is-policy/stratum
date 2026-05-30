@@ -1878,7 +1878,14 @@ stm_status stm_snapshot_index_reconcile_mark(stm_snapshot_index *idx,
                                           sp_recon_cb, &relay);
     }
 
-    stm_btree_crypt_ctx ecx = sp_make_crypt_ctx(idx);   /* engine cx == index cx */
+    /* engine cx == index cx today: a single pool-wide metadata_key + uuids,
+     * and tree_id is NOT AEAD-bound (plaintext n_tree_id only), so opening the
+     * captured engine with the snapshot index's key decrypts correctly.
+     * TLY-A6 forward-note: when DEKs split per-dataset, this MUST resolve the
+     * captured snapshot's dataset DEK (via keyschema) instead of idx's key, or
+     * every captured-engine walk returns STM_EBADTAG -> abort -> no snapshot-
+     * tier reclaim (the #791 leak silently returns for pools with snapshots). */
+    stm_btree_crypt_ctx ecx = sp_make_crypt_ctx(idx);
     for (size_t i = 0; s == STM_OK && i < idx->slots_len; i++) {
         snapshot_slot *sl = &idx->slots[i];
         if (!sl->present) continue;
