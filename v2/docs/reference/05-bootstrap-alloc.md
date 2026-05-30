@@ -91,6 +91,45 @@ sweeps every PENDING entry with `free_gen < committed_gen`, deletes
 the tree entry, drops the PENDING list record, and persists the
 bootstrap pool state.
 
+### Mount-time reconcile (#791)
+
+```c
+stm_status stm_bootstrap_reconcile_begin(stm_bootstrap *a);
+stm_status stm_bootstrap_reconcile_mark (stm_bootstrap *a, uint64_t paddr,
+                                          uint32_t nblocks);
+stm_status stm_bootstrap_reconcile_end  (stm_bootstrap *a, uint64_t *out_freed);
+void       stm_bootstrap_reconcile_abort(stm_bootstrap *a);
+```
+
+The deferred-free bitmap is 1-bit-per-node and cannot distinguish a
+crash-orphaned node (the last commit's unswept PENDING, or a rolled-back
+alloc whose root never reached the durable uberblock) from a live one,
+and `stm_bootstrap_open` does no PENDING rebuild — so across a crash-loop
+these orphans accumulate and brick the pool (#791). The fix is a mark-sweep
+rooted at the durable uberblock, run once at `stm_sync_open` by the
+sync-layer driver `sync_reconcile_bootstrap`:
+
+- `begin` allocates a transient marked-bitmap.
+- `mark(paddr, nblocks)` sets the `nblocks/NODE_BLOCKS` consecutive bits for
+  the node at `paddr` — the span MUST match how that node was reserved
+  (UNIT_BLOCKS for the btree_store / single-node trees, NODE_BLOCKS for engine
+  nodes), symmetric with `free`. A non-bootstrap paddr is ignored, so the
+  driver may feed every paddr a tree walk yields.
+- `end` frees every ALLOCATED-but-UNMARKED node (the orphans), reports the
+  count, and the freed bits become durable on the next `stm_bootstrap_commit`.
+- `abort` drops the marked-bitmap WITHOUT sweeping — the fail-safe when a mark
+  pass could not complete (an incomplete mark must never free a live node).
+
+**Completeness is the caller's obligation**: a bootstrap-backed tree left
+unwalked has its live nodes swept → corruption. The driver walks alloc +
+alloc_roots + keyschema + repair_log + cas + the dataset index (and every
+present dataset's content engine) + the snapshot index (and every snapshot's
+captured content engine, via `stm_btree_store_walk_paddrs` for the btree_store
+trees and `stm_btree_engine_walk_paddrs` for the engines). `freed > 0` on a
+clean remount is EXPECTED: a clean unmount leaves its final commit's
+deferred-frees unswept (no next commit), and the reconcile reclaims those dead
+nodes — which is exactly the leak class.
+
 ### Inspection + cursor helpers
 
 ```c
@@ -307,9 +346,11 @@ carries a dirty flag; a clean-state commit returns the cached
   the tree to fresh on-disk nodes AND persists the bootstrap bitmap
   (which owns the paddrs for those new nodes). A crash between them
   leaks bootstrap bits (orphan) but does NOT corrupt — the next
-  mount picks the previous tree + previous bitmap, and the orphan
-  bits are reclaimable via a future fsck pass. R7d P0-2 flagged
-  this as known-bounded leak.
+  mount picks the previous tree + previous bitmap. R7d P0-2 flagged
+  this as known-bounded leak; **the #791 mount-time reconcile (see
+  "Mount-time reconcile" above) now reclaims these orphans on every
+  mount**, so they no longer accumulate across a crash-loop (which
+  otherwise bricked the pool — #791).
 - **`stm_alloc_verify` requires `set_crypt_ctx`** — no admin-scrub
   path without the key. Future: a key-aware scrub that pulls the
   key from a keyfile or janus.
