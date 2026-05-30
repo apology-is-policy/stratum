@@ -268,6 +268,31 @@ STM_MUST_USE
 stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen);
 
 /* ========================================================================= */
+/* #791 mount-time reconcile (rollback / crash orphan reclamation).           */
+/* ========================================================================= */
+
+/* Mark-sweep rooted at the durable uberblock. After mount loads every
+ * bootstrap-backed tree, the caller marks every LIVE node paddr (walk each
+ * tree via stm_btree_engine_walk_paddrs and feed every paddr to _mark; non-
+ * bootstrap paddrs are ignored), then _end frees every ALLOCATED-but-UNMARKED
+ * node -- rolled-back orphan allocations AND unswept-pending frees, both
+ * unreachable from the durable UB (#791: these otherwise accumulate ~9
+ * nodes/boot under a crash-loop and brick the pool). Freed bits become durable
+ * on the next stm_bootstrap_commit.
+ *
+ * COMPLETENESS IS THE CALLER'S OBLIGATION: a live node left unmarked is freed
+ * -> corruption. The bootstrap-backed trees that MUST all be walked: alloc
+ * (per device) + alloc_roots + keyschema + repair_log + cas + dataset +
+ * snapshot + engine_store. Run the pass at mount BEFORE any free (so
+ * pending_head is empty). Sequence: begin -> mark* -> end. */
+STM_MUST_USE
+stm_status stm_bootstrap_reconcile_begin(stm_bootstrap *a);
+STM_MUST_USE
+stm_status stm_bootstrap_reconcile_mark(stm_bootstrap *a, uint64_t paddr);
+STM_MUST_USE
+stm_status stm_bootstrap_reconcile_end(stm_bootstrap *a, uint64_t *out_freed_nodes);
+
+/* ========================================================================= */
 /* Inspection.                                                                */
 /* ========================================================================= */
 

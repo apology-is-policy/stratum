@@ -152,6 +152,87 @@ STM_TEST(bootstrap_reserve_one_node) {
     unlink(g_tmp_path);
 }
 
+/* #791: the mount-time reconcile mechanism in isolation. Reserve 4 nodes, mark
+ * 2 live, sweep -> exactly the 2 unmarked nodes free; the freed bits are
+ * genuinely reusable. (The cross-layer driver that supplies the live marks by
+ * walking every bootstrap-backed tree is a separate chunk; this proves the
+ * leaf mechanism + the non-bootstrap-paddr filter.) */
+STM_TEST(bootstrap_reconcile_frees_unmarked) {
+    make_tmp("recon");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0, p2 = 0, p3 = 0, p4 = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p1));
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p2));
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p3));
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p4));
+
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.allocated_nodes, 4u);
+
+    STM_ASSERT_OK(stm_bootstrap_reconcile_begin(a));
+    /* A second begin while a pass is open is rejected. */
+    STM_ASSERT(stm_bootstrap_reconcile_begin(a) != STM_OK);
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p1));
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p2));
+    /* A non-bootstrap paddr (wrong device) is silently ignored, not an error. */
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, stm_paddr_make(1, 0)));
+    uint64_t freed = 0;
+    STM_ASSERT_OK(stm_bootstrap_reconcile_end(a, &freed));
+    STM_ASSERT_EQ(freed, 2u);
+
+    bool al = false;
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a, p1, &al)); STM_ASSERT(al);
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a, p2, &al)); STM_ASSERT(al);
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a, p3, &al)); STM_ASSERT(!al);
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a, p4, &al)); STM_ASSERT(!al);
+
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.allocated_nodes, 2u);
+
+    /* The reclaimed nodes are genuinely free -> re-reservable. The roving
+     * cursor would pick a fresh node past p4 (also correct), so use the hint
+     * to pin the reuse check onto the just-reclaimed p3. */
+    uint64_t q = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, p3, &q));
+    STM_ASSERT_EQ(q, p3);
+
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* #791: marking every allocated node frees nothing (no over-free). */
+STM_TEST(bootstrap_reconcile_mark_all_keeps_all) {
+    make_tmp("recon_all");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, 2u * TEST_NODE_BLOCKS, 0, &p1));
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p2));
+
+    STM_ASSERT_OK(stm_bootstrap_reconcile_begin(a));
+    /* p1 is a 2-node run: mark both node paddrs. */
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p1));
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a,
+        stm_paddr_make(0, stm_paddr_offset(p1) + TEST_NODE_BLOCKS)));
+    STM_ASSERT_OK(stm_bootstrap_reconcile_mark(a, p2));
+    uint64_t freed = 0;
+    STM_ASSERT_OK(stm_bootstrap_reconcile_end(a, &freed));
+    STM_ASSERT_EQ(freed, 0u);
+
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.allocated_nodes, 3u);
+
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(bootstrap_reserve_multi_node) {
     make_tmp("resv_m");
     stm_bdev *d = open_fresh_device();

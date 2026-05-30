@@ -122,6 +122,11 @@ struct stm_bootstrap {
     /* Roving allocation cursor (in nodes). */
     uint64_t   rove_next_node;
 
+    /* #791 mount-time reconcile: a transient "marked-live" bitmap, allocated
+     * by stm_bootstrap_reconcile_begin and freed by _end. NULL outside a
+     * reconcile pass. See the reconcile section below. */
+    uint8_t   *reconcile_marked;
+
     /* Chunk 5d: opaque user-data region stored in the header. Persisted
      * atomically with the bootstrap commit. */
     uint8_t    user_data[STM_BOOTSTRAP_USER_DATA_SIZE];
@@ -654,6 +659,7 @@ void stm_bootstrap_close(stm_bootstrap *a)
         free(e);
         e = next;
     }
+    free(a->reconcile_marked);   /* #791: defensive -- frees an abandoned pass */
     free(a->bitmap);
     free(a);
 }
@@ -917,6 +923,72 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
 out:
     free(new_region);
     return s;
+}
+
+/* ========================================================================= */
+/* #791 mount-time reconcile (rollback / crash orphan reclamation).           */
+/*                                                                            */
+/* Deferred-free (R50 / P7-CAS-3): a CoW commit frees metadata nodes as       */
+/* PENDING(free_gen=committed_gen), NOT swept until the NEXT commit; and the   */
+/* final bootstrap commit precedes the UB write, so a crash in that window     */
+/* "leaks the freshly-flushed nodes" (sync.c 9.6-impl-4b). Across repeated     */
+/* crashes (a reboot loop) these orphans accumulate and exhaust the bootstrap  */
+/* pool (#791: ~9 nodes/boot -> brick at ~boot 50). The 1-bit allocated bitmap */
+/* can't tell an orphan from a live node, so reclamation needs the LIVE set.   */
+/*                                                                            */
+/* Mark-sweep rooted at the durable uberblock: after mount loads every         */
+/* bootstrap-backed tree, the caller walks each (stm_btree_engine_walk_paddrs) */
+/* and marks every reachable node; the sweep frees every ALLOCATED-but-        */
+/* UNMARKED node -- both rolled-back orphan allocs AND unswept-pending frees   */
+/* are, by definition, unreachable from the durable UB. Freed bits become      */
+/* durable on the next stm_bootstrap_commit.                                   */
+/*                                                                            */
+/* COMPLETENESS IS THE CALLER'S OBLIGATION: every node reachable from the      */
+/* durable UB MUST be marked, or the sweep frees a live node -> corruption.    */
+/* The bootstrap-backed trees to walk (the completeness checklist for the      */
+/* sync-layer driver, a separate chunk): alloc (per device) + alloc_roots +    */
+/* keyschema + repair_log + cas + dataset + snapshot + engine_store. The pass  */
+/* must run at mount BEFORE any free, so pending_head is empty (this format    */
+/* does no pending rebuild on open) and the sweep need not touch it.           */
+/* ========================================================================= */
+
+stm_status stm_bootstrap_reconcile_begin(stm_bootstrap *a)
+{
+    if (!a) return STM_EINVAL;
+    if (a->reconcile_marked) return STM_EBUSY;   /* a pass is already open */
+    uint8_t *marked = calloc(1, a->bitmap_bytes);
+    if (!marked) return STM_ENOMEM;
+    a->reconcile_marked = marked;
+    return STM_OK;
+}
+
+stm_status stm_bootstrap_reconcile_mark(stm_bootstrap *a, uint64_t paddr)
+{
+    if (!a || !a->reconcile_marked) return STM_EINVAL;
+    /* Filter: only paddrs that land in THIS bootstrap's node space are marks.
+     * The caller may pass every paddr a tree walk yields (data-area blocks,
+     * other devices' paddrs); paddr_to_node rejects those and we ignore them. */
+    uint64_t node = 0;
+    if (!paddr_to_node(a, paddr, &node)) return STM_OK;
+    bit_set(a->reconcile_marked, node);
+    return STM_OK;
+}
+
+stm_status stm_bootstrap_reconcile_end(stm_bootstrap *a, uint64_t *out_freed_nodes)
+{
+    if (!a || !a->reconcile_marked) return STM_EINVAL;
+    uint64_t freed = 0;
+    for (uint64_t node = 0; node < a->total_nodes; node++) {
+        if (bit_is_set(a->bitmap, node) &&
+            !bit_is_set(a->reconcile_marked, node)) {
+            bit_clear(a->bitmap, node);   /* orphan -> free; durable on next commit */
+            freed++;
+        }
+    }
+    free(a->reconcile_marked);
+    a->reconcile_marked = NULL;
+    if (out_freed_nodes) *out_freed_nodes = freed;
+    return STM_OK;
 }
 
 /* ========================================================================= */
