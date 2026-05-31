@@ -104,6 +104,11 @@ static void usage(void)
 "                   exclusive with the unencrypted-keyfile path.\n"
 "  --bootstrap SIZE Bootstrap pool size. Default: 16M (auto-scaled to\n"
 "                   max(64MiB, device/1024) by libfs if 0).\n"
+"  --root-uid N     Owner uid for the dataset root inode (default 0).\n"
+"  --root-gid N     Owner gid for the dataset root inode (default 0).\n"
+"                   N <= 4294967294. Used by Thylacine's host-bake to own\n"
+"                   the root as PRINCIPAL_SYSTEM so the boot chain can\n"
+"                   populate it once the OS enforces 9P-mount rwx.\n"
 "  --seed HEX64     Pin the UUID-derivation seed to a fixed 64-bit\n"
 "                   hex value (optional 0x prefix; up to 16 hex chars).\n"
 "                   Same seed -> identical pool/device UUIDs but pool\n"
@@ -204,6 +209,13 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     uint64_t   bootstrap_bytes   = 0;   /* 0 = auto from device_bytes */
     const char *keyfile_path     = NULL;
     bool       passphrase_stdin  = false;
+    /* Dataset-root owner. Default 0/0 (historical behavior). Thylacine's
+     * A-3 host-bake passes --root-uid/--root-gid = PRINCIPAL_SYSTEM so the
+     * root is owned by the boot chain once the OS enforces 9P-mount rwx --
+     * otherwise the boot chain, judged as `other` on the 0755 root, cannot
+     * create top-level entries and the boot bricks. */
+    uint32_t   root_uid          = 0;
+    uint32_t   root_gid          = 0;
 
     /* Parse remaining flags. */
     for (int i = 2; i < argc; i++) {
@@ -244,6 +256,26 @@ int stm_cmd_mkfs_main(int argc, char **argv)
                 return 1;
             }
             g_mkfs_seed_set = true;
+            i++;
+        } else if (strcmp(argv[i], "--root-uid") == 0) {
+            if (i + 1 >= argc) { fputs("--root-uid requires an argument\n", stderr); return 1; }
+            char *end = NULL;
+            unsigned long long v = strtoull(argv[i + 1], &end, 10);
+            if (!end || *end != '\0' || v > 0xFFFFFFFEULL) {
+                fprintf(stderr, "stratum-mkfs: bad --root-uid: %s (<= 4294967294)\n", argv[i + 1]);
+                return 1;
+            }
+            root_uid = (uint32_t)v;
+            i++;
+        } else if (strcmp(argv[i], "--root-gid") == 0) {
+            if (i + 1 >= argc) { fputs("--root-gid requires an argument\n", stderr); return 1; }
+            char *end = NULL;
+            unsigned long long v = strtoull(argv[i + 1], &end, 10);
+            if (!end || *end != '\0' || v > 0xFFFFFFFEULL) {
+                fprintf(stderr, "stratum-mkfs: bad --root-gid: %s (<= 4294967294)\n", argv[i + 1]);
+                return 1;
+            }
+            root_gid = (uint32_t)v;
             i++;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage();
@@ -396,7 +428,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     uint64_t root_ino = 0;
     rc = stm_fs_init_dataset_root(fs, /*ds=*/1u,
                                        /*mode=*/0755u,
-                                       /*uid=*/0, /*gid=*/0,
+                                       /*uid=*/root_uid, /*gid=*/root_gid,
                                        &root_ino);
     if (rc != STM_OK) {
         fprintf(stderr, "stratum-mkfs: init_dataset_root failed: status=%d\n", (int)rc);
