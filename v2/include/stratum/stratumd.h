@@ -225,6 +225,21 @@ typedef struct stm_stratumd_opts {
     bool        coordinator_uid_check_enabled;
     uid_t       coordinator_uid;
 
+    /* A-3 (Thylacine host-bake). When `bake_owner_enabled` is true
+     * (set by --bake-owner-uid / --bake-owner-gid), every file created
+     * on the coordinator FS connection is stamped with `bake_owner_uid`
+     * / `bake_owner_gid` instead of the SO_PEERCRED peer creds. Used at
+     * Thylacine build time to stamp the pool PRINCIPAL_SYSTEM-owned so
+     * the boot chain (owner) is not denied once kernel rwx enforcement
+     * is live (IDENTITY-DESIGN.md section 9.7 M2). A per-axis value of
+     * (uid_t)-1 / (gid_t)-1 leaves that axis on peer creds. Forensic /
+     * bake-only -- the runtime per-user stratumd leaves this disabled
+     * and stamps via SO_PEERCRED. NOT an on-disk-format change (only the
+     * stamped value of the existing si_uid/si_gid differs). */
+    bool        bake_owner_enabled;
+    uid_t       bake_owner_uid;
+    gid_t       bake_owner_gid;
+
     /* TLY-A4: corvus SESSION_CLOSED notify consumer. When `corvus_user`
      * is non-NULL, stratumd spawns a consumer thread that subscribes
      * to `corvus_notify_socket` (default "/srv/corvus/notify") and

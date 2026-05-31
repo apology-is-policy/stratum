@@ -50,6 +50,17 @@
 #  include <sys/socket.h>     /* SO_PEERCRED */
 #endif
 
+/* A-3 (Thylacine host-bake) FS create-owner override. Published ONCE at
+ * the top of stm_stratumd_run from opts, BEFORE any listen/accept/worker
+ * spawn; the per-connection FS workers only read it (the pthread_create
+ * barrier makes the publish safe). Default disabled => the server stamps
+ * the SO_PEERCRED peer creds (the runtime per-user stratumd path). A
+ * per-axis (uid_t)-1 / (gid_t)-1 leaves that axis on peer creds. The sole
+ * read site is the stm_9p_server_create call in stm_stratumd_serve_client. */
+static bool  g_bake_owner_enabled = false;
+static uid_t g_bake_owner_uid     = (uid_t)-1;
+static gid_t g_bake_owner_gid     = (gid_t)-1;
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* Robust read/write with EINTR handling.                                 */
 /* ────────────────────────────────────────────────────────────────────── */
@@ -377,8 +388,17 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
     }
 
     stm_9p_server *srv = NULL;
+    /* A-3 host-bake: stamp the configured owner instead of the peer creds
+     * (per-axis (uid_t)-1 leaves that axis on peer creds). Disabled by
+     * default -> the runtime per-user stratumd stamps via SO_PEERCRED. */
+    uid_t create_uid = peer_uid;
+    gid_t create_gid = peer_gid;
+    if (g_bake_owner_enabled) {
+        if (g_bake_owner_uid != (uid_t)-1) create_uid = g_bake_owner_uid;
+        if (g_bake_owner_gid != (gid_t)-1) create_gid = g_bake_owner_gid;
+    }
     stm_status rc = stm_9p_server_create(fs, root_dataset,
-                                            peer_uid, peer_gid,
+                                            create_uid, create_gid,
                                             msize_max, &srv);
     if (rc != STM_OK) {
         close(fd);
@@ -1372,6 +1392,13 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
 {
     if (!opts || !opts->socket_path)
         return STM_EINVAL;
+
+    /* A-3: publish the host-bake owner override before any worker spawns
+     * (one-shot publication; workers only read). Disabled by default --
+     * only --bake-owner-uid / --bake-owner-gid set it. */
+    g_bake_owner_enabled = opts->bake_owner_enabled;
+    g_bake_owner_uid     = opts->bake_owner_uid;
+    g_bake_owner_gid     = opts->bake_owner_gid;
 
     /* TLY-A2-impl-2: client-mode dispatch BEFORE the mount-related
      * argument checks. Client mode validates its own argument shape

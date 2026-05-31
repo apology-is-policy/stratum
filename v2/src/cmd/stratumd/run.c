@@ -191,6 +191,12 @@ static void usage(const char *argv0)
         "                           provisioned dataset (e.g. users/<name>).\n"
         "  --provision-parent <id>  Parent dataset id for the provisioned\n"
         "                           dataset (default: 1, the root dataset).\n"
+        "  --bake-owner-uid <N>     Stamp files created on the FS connection\n"
+        "                           with owner uid N (and --bake-owner-gid <N>\n"
+        "                           for the group) instead of the SO_PEERCRED\n"
+        "                           peer creds. Thylacine host-bake only (A-3);\n"
+        "                           N <= 4294967294. Coordinator only; omit for\n"
+        "                           normal peer-cred ownership stamping.\n"
         "  -h, --help               This message\n");
 }
 
@@ -244,6 +250,11 @@ int stm_cmd_stratumd_main(int argc, char **argv)
      * pool budget on tiny workloads. SWISS-4q's writeback-aggregation
      * layer is the architectural fix; this is the bandaid. */
     opts.msize_max    = STM_9P_MSIZE_MAX;
+    /* A-3 host-bake owner override: per-axis (uid_t)-1 == "leave on peer
+     * creds". bake_owner_enabled (memset 0 == false) gates the whole
+     * thing; --bake-owner-uid / --bake-owner-gid flip it on. */
+    opts.bake_owner_uid = (uid_t)-1;
+    opts.bake_owner_gid = (gid_t)-1;
 
     bool want_passphrase_stdin = false;
 
@@ -349,6 +360,52 @@ int stm_cmd_stratumd_main(int argc, char **argv)
             }
             opts.coordinator_uid = (uid_t)v;
             opts.coordinator_uid_check_enabled = true;
+            continue;
+        }
+        if (!strcmp(a, "--bake-owner-uid") && i + 1 < argc) {
+            const char *arg = argv[++i];
+            if (*arg < '0' || *arg > '9') {
+                fprintf(stderr,
+                    "stratumd: invalid --bake-owner-uid: %s "
+                    "(expected non-empty unsigned integer)\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            char *end = NULL;
+            unsigned long long v = strtoull(arg, &end, 10);
+            if (!end || *end != '\0'
+                || v > (unsigned long long)((uid_t)-2)) {
+                fprintf(stderr,
+                    "stratumd: invalid --bake-owner-uid: %s "
+                    "(must be <= 4294967294)\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            opts.bake_owner_uid = (uid_t)v;
+            opts.bake_owner_enabled = true;
+            continue;
+        }
+        if (!strcmp(a, "--bake-owner-gid") && i + 1 < argc) {
+            const char *arg = argv[++i];
+            if (*arg < '0' || *arg > '9') {
+                fprintf(stderr,
+                    "stratumd: invalid --bake-owner-gid: %s "
+                    "(expected non-empty unsigned integer)\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            char *end = NULL;
+            unsigned long long v = strtoull(arg, &end, 10);
+            if (!end || *end != '\0'
+                || v > (unsigned long long)((gid_t)-2)) {
+                fprintf(stderr,
+                    "stratumd: invalid --bake-owner-gid: %s "
+                    "(must be <= 4294967294)\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            opts.bake_owner_gid = (gid_t)v;
+            opts.bake_owner_enabled = true;
             continue;
         }
         if (!strcmp(a, "--datasets-allowed") && i + 1 < argc) {
