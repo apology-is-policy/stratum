@@ -161,6 +161,23 @@ duration of the mount and then `stm_ct_memzero`'d). The corvus
 dataset-name binding is v1.0 provisional — see
 `v2/docs/thylacine-keyslot-design.md` §10.
 
+**TLY-A5b deferred-unwrap (per-user encrypted home).** The mount-time
+fail-fast on a CURRENT corvus slot is *scoped*. When NO session token is
+configured, a CURRENT corvus slot at a *non-system* dataset (`dataset_id`
+other than the pool `0` / root `1`) SOFT-SKIPS instead of aborting the
+mount: the long-lived system coordinator boots the pool with every
+user-sealed home dataset present-but-LOCKED, and a runtime install-dek
+(driven by login forwarding the user's bearer token) fills its DEK in
+later. A read/write of a locked dataset returns the distinct `STM_ELOCKED`
+(wire: `EACCES`), never `STM_ECORRUPT` — a locked dataset is
+access-deferred, not damaged, so it never feeds an integrity/wedge policy.
+The pool/root system datasets still fail-fast (a sound pool never
+CORVUS-wraps those — `sync_create` wk-seals them — so a silent half-mount
+of an unreadable root is worse than refusing). Tamper is unaffected: an
+*attempted* UNWRAP that fails still hard-fails the CURRENT slot (the
+soft-skip fires only on the passive no-token case, never on
+attempted-and-failed).
+
 ### Rotation + sweep
 
 ```c

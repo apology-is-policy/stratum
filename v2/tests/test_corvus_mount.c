@@ -341,22 +341,49 @@ STM_TEST(corvus_mount_resolves_corvus_slot) {
     unlink(g_tmp_path);
 }
 
-STM_TEST(corvus_mount_fails_fast_without_corvus) {
-    make_tmp("nocorvus");
-    build_pool_with_corvus_slot();
+STM_TEST(corvus_mount_soft_skips_locked_user_dataset) {
+    /* TLY-A5b deferred-unwrap: the long-lived system coordinator boots
+     * with NO user session token, so a user-sealed (CORVUS-wrapped) home
+     * dataset must mount present-but-LOCKED rather than aborting -- a
+     * runtime install-dek fills the DEK in later. Before TLY-A5b this
+     * exact configuration hard-failed the mount with STM_EINVAL. The
+     * locked dataset's write path returns the distinct STM_ELOCKED (NOT
+     * STM_ECORRUPT, which would feed a wedge/integrity policy -- F6). */
+    make_tmp("softskip");
+    build_pool_with_corvus_slot();   /* CURRENT CORVUS slot at ds=200 */
 
-    /* Reopen with NO corvus cfg — the CURRENT CORVUS slot cannot be
-     * unwrapped, so the mount must abort (never a half-mount). */
+    /* Reopen with NO corvus cfg. ds=200 is a non-system dataset, so its
+     * CURRENT CORVUS slot soft-skips and the mount SUCCEEDS. (A CORVUS
+     * CURRENT at the pool/root system datasets would still fail-fast: a
+     * sound pool never CORVUS-wraps those -- sync_create wk-seals them --
+     * so that leg is a defense-in-depth guard, unconstructible via the
+     * create path.) */
     stm_bdev *d = open_fresh_device();
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_pool *pool2 = make_test_pool(d);
 
     stm_sync *s2 = NULL;
-    STM_ASSERT_ERR(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2),
-                     STM_EINVAL);
-    STM_ASSERT(s2 == NULL);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+    STM_ASSERT(s2 != NULL);
 
+    /* The locked dataset has a CURRENT keyslot but no DEK in the RAM
+     * map. get_dek is a raw map query -> STM_ENOENT (DEK simply absent). */
+    uint8_t dek[32];
+    STM_ASSERT_ERR(stm_sync_get_dek(s2, CORVUS_DATASET_ID, CORVUS_KEY_ID,
+                                      dek), STM_ENOENT);
+
+    /* A write resolves the dataset's CURRENT DEK first: the keyslot
+     * exists (lookup_current succeeds) but its DEK is not installed ->
+     * STM_ELOCKED. This is the load-bearing F6 property: locked, not
+     * corrupt. */
+    uint8_t buf[4096];   /* one STM_UB_SIZE block */
+    memset(buf, 0xA5, sizeof buf);
+    STM_ASSERT_ERR(stm_sync_write_extent(s2, CORVUS_DATASET_ID,
+                                           /*ino=*/1u, /*off=*/0u,
+                                           buf, sizeof buf), STM_ELOCKED);
+
+    stm_sync_close(s2);
     stm_alloc_close(a2);
     stm_pool_close(pool2);
     stm_bdev_close(d);

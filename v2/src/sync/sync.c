@@ -553,12 +553,35 @@ static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
          * handle), means a CURRENT corvus slot that won't unwrap
          * aborts the mount before any data block is observable. */
         if (!u->corvus || !u->corvus->session_token) {
-            /* Pool carries a corvus slot but the operator gave no
-             * --corvus-session-token-file. CURRENT → fail-fast abort;
-             * RETIRED → soft-skip (degraded reads of pre-rotation
-             * data only, same posture as a local unwrap failure). */
+            /* No session token for a CORVUS slot. Two cases:
+             *
+             * TLY-A5b deferred-unwrap: the long-lived system coordinator
+             * mounts the pool at boot with NO user token, so every
+             * user-sealed home dataset is present-but-LOCKED here, and a
+             * runtime install-dek (driven by login over /ctl) fills its
+             * DEK in later. A CURRENT user-dataset slot therefore
+             * SOFT-SKIPS -- the read/write path returns STM_ELOCKED until
+             * the DEK is installed -- rather than aborting the mount.
+             * RETIRED slots already soft-skip (degraded reads of
+             * pre-rotation data only).
+             *
+             * SCOPED: the pool (0,0) and root (1,0) datasets are the
+             * mounting identity's own scope and are never CORVUS-wrapped
+             * in a sound pool (sync_create wk-seals them; add_dataset_
+             * key_corvus refuses ds=0). A CORVUS-tagged CURRENT at a
+             * system dataset with no token is a misconfiguration, so it
+             * still fail-fast aborts -- a silent half-mount of an
+             * unreadable root is worse than refusing.
+             *
+             * This is the PASSIVE no-token branch only; an ATTEMPTED
+             * unwrap that FAILS (tamper) still hard-fails CURRENT at the
+             * R42 check below, so the soft-skip never masks tamper. */
             stm_ct_memzero(dek, sizeof dek);
-            if (state == STM_KS_STATE_CURRENT) return (int)STM_EINVAL;
+            if (state == STM_KS_STATE_CURRENT &&
+                (dataset_id == STM_SYNC_POOL_DATASET_ID ||
+                 dataset_id == STM_SYNC_ROOT_DATASET_ID)) {
+                return (int)STM_EINVAL;
+            }
             return 0;
         }
         /* TLY-A3-keyslot-wrap: corvus's stable identity for the
@@ -5025,8 +5048,17 @@ static stm_status sync_resolve_current_dek_locked(const stm_sync *s,
                                                     /*out_len=*/NULL);
     if (rc != STM_OK) return rc;  /* ENOENT / ECORRUPT bubble up */
 
+    /* The CURRENT keyslot is present (lookup_current succeeded) but its
+     * DEK is absent from the in-RAM map. Pre-TLY-A5b this was unreachable
+     * for CURRENT -- the R42 mount hard-fail guarantees every CURRENT
+     * keyslot resolves a DEK at mount. The deferred-unwrap soft-skip
+     * makes it reachable as the legitimate LOCKED state (a user-sealed
+     * dataset mounted before its session installed the DEK), so it is
+     * STM_ELOCKED, NOT STM_ECORRUPT -- a locked dataset is access-
+     * deferred, not damaged, and must never feed an integrity/wedge
+     * policy. */
     sync_dek_slot *slot = sync_dek_find((stm_sync *)s, dataset_id, kid);
-    if (!slot) return STM_ECORRUPT;
+    if (!slot) return STM_ELOCKED;
 
     *out_key_id = kid;
     memcpy(out_dek, slot->dek, 32);

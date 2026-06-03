@@ -115,6 +115,7 @@ static uint32_t status_to_ecode(stm_status s)
     case STM_EOVERFLOW:         return STM_LP9_ECODE_EOVERFLOW;
     case STM_ENOTSUPPORTED:     return STM_LP9_ECODE_ENOSYS;
     case STM_ECOMPROMISED:      return STM_LP9_ECODE_EACCES; /* refusal */
+    case STM_ELOCKED:           return STM_LP9_ECODE_EACCES; /* DEK not installed (TLY-A5b) */
     default:                    return STM_LP9_ECODE_EIO;
     }
 }

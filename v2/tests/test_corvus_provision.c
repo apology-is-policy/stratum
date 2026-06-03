@@ -214,15 +214,29 @@ STM_TEST(provision_via_stratumd_run) {
         STM_ASSERT_OK(stm_fs_unmount(fs));
     }
 
-    /* --- Verify: a remount WITHOUT corvus FAILS — confirms the
-     *     provisioned slot is a genuine CURRENT CORVUS slot, not a
-     *     no-op. --- */
+    /* --- Verify: a remount WITHOUT corvus now SUCCEEDS (TLY-A5b
+     *     deferred-unwrap soft-skip) -- the system coordinator boots with
+     *     alice's user-sealed dataset present-but-LOCKED. The provisioned
+     *     slot is genuine, not a no-op: a write into ds=2 resolves the
+     *     CURRENT CORVUS slot, finds no installed DEK, and returns the
+     *     distinct STM_ELOCKED (a no-op provision would leave no slot, so
+     *     the write would lookup_current-miss with STM_ENOENT instead).
+     *     The locked-read posture is also unit-tested in
+     *     test_corvus_mount::corvus_mount_soft_skips_locked_user_dataset. --- */
     {
         stm_fs_mount_opts mopts = rw_mount_opts();
         /* no corvus_socket / corvus_session_token_file */
         stm_fs *fs = NULL;
-        STM_ASSERT(stm_fs_mount(g_tmp_path, &mopts, &fs) != STM_OK);
-        STM_ASSERT(fs == NULL);
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        STM_ASSERT(fs != NULL);
+
+        uint8_t buf[4096];   /* one STM_UB_SIZE block */
+        memset(buf, 0x5A, sizeof buf);
+        STM_ASSERT_ERR(stm_fs_write(fs, /*dataset_id=*/2u, /*ino=*/1u,
+                                      /*off=*/0u, buf, sizeof buf),
+                         STM_ELOCKED);
+
+        STM_ASSERT_OK(stm_fs_unmount(fs));
     }
 
     fake_corvus_stop(&fc);

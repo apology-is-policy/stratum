@@ -101,6 +101,14 @@ typedef enum {
                                      rollback-compromised (TLY-A5; non-forced
                                      rollback of a STM_SNAP_FLAG_ROLLBACK_COMPROMISED
                                      snap) */
+    STM_ELOCKED         = -218,   /* dataset present but its DEK is not
+                                     installed (TLY-A5b deferred-unwrap: a
+                                     user-sealed home dataset is mounted-but-
+                                     LOCKED until a session installs the DEK).
+                                     Kept distinct from STM_ECORRUPT so a
+                                     locked read/write is never misclassified
+                                     as integrity damage or fed to a wedge
+                                     policy. Wire: EACCES. */
 
     /* P8-POSIX-2b: dirent / directory-shape errors. POSIX-aligned values
      * (matches Linux errno.h) so callers can interpret without translation. */
