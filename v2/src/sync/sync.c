@@ -4697,6 +4697,117 @@ stm_status stm_sync_get_dek(const stm_sync *s,
     return STM_OK;
 }
 
+/* TLY-A5b deferred-unwrap runtime INSTALL: resolve a previously
+ * soft-skipped (LOCKED) corvus-sealed dataset's DEK and install it into
+ * the in-RAM map. The keyslot already exists (provisioned earlier + read
+ * back at mount, then soft-skipped because no session token was held);
+ * this is the UNWRAP-and-install half sync_unwrap_cb runs at mount,
+ * driven here for a single dataset with a caller-supplied session token
+ * (the login-forwarded bearer credential travelling over the
+ * coordinator's /ctl). The corvus socket cannot come from `s` (stm_sync
+ * does not retain the mount cfg), so the caller passes it -- the same
+ * shape as stm_sync_add_dataset_key_corvus.
+ *
+ * No durable state changes: the DEK map is RAM-only (the keyslot was
+ * persisted at provisioning), so there is no commit. Idempotent: an
+ * already-installed dataset returns STM_OK without re-unwrapping. Only
+ * a CORVUS-wrapped dataset is installable here (a keyfile/janus slot
+ * resolves at mount, never via a session token). */
+stm_status stm_sync_install_dek(stm_sync *s, uint64_t dataset_id,
+                                  const stm_corvus_mount_cfg *corvus)
+{
+    if (!s || !corvus || !corvus->session_token) return STM_EINVAL;
+    if (dataset_id == STM_SYNC_POOL_DATASET_ID) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+
+    uint64_t key_id = 0;
+    stm_keyschema_wrapper wrapper = STM_KS_WRAPPER_LEGACY;
+    uint8_t wrapped[STM_KEYSCHEMA_WRAPPED_MAX];
+    size_t  wrapped_len = 0;
+    stm_status rc = stm_keyschema_lookup_current(s->keyschema, dataset_id,
+                                                   &key_id, &wrapper,
+                                                   wrapped, sizeof wrapped,
+                                                   &wrapped_len);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
+    if (wrapper != STM_KS_WRAPPER_CORVUS) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+    /* Already unlocked -> no-op success (no re-unwrap, no double-insert). */
+    if (sync_dek_find(s, dataset_id, key_id) != NULL) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_OK;
+    }
+
+    /* corvus binds the envelope (AEAD-AD) to the dataset path recorded
+     * in the slot; the UNWRAP must send that same binding back. */
+    char   ds_path[STM_KEYSCHEMA_CORVUS_PATH_MAX];
+    size_t ds_path_len = 0;
+    rc = stm_keyschema_get_corvus_path(s->keyschema, dataset_id, key_id,
+                                         ds_path, sizeof ds_path, &ds_path_len);
+    if (rc != STM_OK || ds_path_len == 0) {
+        pthread_mutex_unlock(&s->lock);
+        return (rc != STM_OK) ? rc : STM_ECORRUPT;
+    }
+
+    /* Pre-reserve the map slot so the post-unwrap insert is infallible
+     * (mirrors stm_sync_add_dataset_key_corvus). */
+    rc = sync_dek_grow(s, s->dek_count + 1);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
+
+    stm_corvus_transport_opts t = {
+        .socket_path        = corvus->socket_path,
+        .connect_timeout_ms = corvus->connect_timeout_ms,
+        .io_timeout_ms      = corvus->io_timeout_ms,
+        .n_retries          = corvus->n_retries,
+    };
+    uint8_t dek[32];
+    rc = stm_corvus_unwrap(&t, corvus->session_token,
+                             ds_path, ds_path_len, key_id,
+                             wrapped, wrapped_len, dek);
+    if (rc != STM_OK) {
+        stm_ct_memzero(dek, sizeof dek);
+        pthread_mutex_unlock(&s->lock);
+        return rc;
+    }
+
+    rc = sync_dek_insert(s, dataset_id, key_id, dek);
+    stm_ct_memzero(dek, sizeof dek);
+    pthread_mutex_unlock(&s->lock);
+    return rc;
+}
+
+/* TLY-A5b runtime EVICT: remove + zero a corvus-sealed dataset's DEK
+ * from the in-RAM map (the logout half). The dataset returns to its
+ * LOCKED posture -- a subsequent read/write resolves no DEK and yields
+ * STM_ELOCKED. Idempotent: a dataset with no installed DEK returns
+ * STM_OK. CORVUS-only: evicting a keyfile/janus dataset's DEK would
+ * leave it permanently unreadable (its local key source only runs at
+ * mount, with no runtime re-install), so a non-CORVUS slot is refused. */
+stm_status stm_sync_evict_dek(stm_sync *s, uint64_t dataset_id)
+{
+    if (!s) return STM_EINVAL;
+    if (dataset_id == STM_SYNC_POOL_DATASET_ID) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    uint64_t key_id = 0;
+    stm_keyschema_wrapper wrapper = STM_KS_WRAPPER_LEGACY;
+    stm_status rc = stm_keyschema_lookup_current(s->keyschema, dataset_id,
+                                                   &key_id, &wrapper,
+                                                   NULL, 0, NULL);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
+    if (wrapper != STM_KS_WRAPPER_CORVUS) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+
+    rc = sync_dek_remove(s, dataset_id, key_id);   /* zeroes the slot */
+    pthread_mutex_unlock(&s->lock);
+    return (rc == STM_ENOENT) ? STM_OK : rc;       /* already-evicted is OK */
+}
+
 /* P6-clone: callback the snapshot module invokes during delete to
  * enforce clone.tla::SnapWithClonesUndeletable. ctx is the dataset
  * index handle (registered at sync_create / sync_open). Returns true

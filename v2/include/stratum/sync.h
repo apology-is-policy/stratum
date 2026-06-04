@@ -913,6 +913,36 @@ stm_status stm_sync_get_dek(const stm_sync *s,
  */
 size_t stm_sync_dek_count(const stm_sync *s);
 
+/*
+ * TLY-A5b deferred-unwrap runtime DEK install / evict (per-user
+ * encrypted home). After stm_sync_open soft-skips a corvus-sealed
+ * dataset (mounted present-but-LOCKED because no session token was
+ * held), the long-lived coordinator installs the dataset's DEK at
+ * runtime when the owning user logs in, and evicts it at logout.
+ *
+ * stm_sync_install_dek resolves the dataset's CURRENT corvus keyslot,
+ * UNWRAPs it over the corvus key agent with the caller-supplied session
+ * token (the login-forwarded bearer credential -- the socket comes from
+ * `corvus` because stm_sync does not retain the mount cfg), and installs
+ * the plaintext DEK into the in-RAM map. The keyslot already exists, so
+ * nothing durable changes (no commit). Idempotent: an already-installed
+ * dataset returns STM_OK without re-unwrapping. CORVUS-only: STM_EINVAL
+ * on a keyfile/janus dataset (those resolve only at mount). STM_ENOENT
+ * if the dataset has no CURRENT keyslot; the typed corvus errors
+ * (STM_ECORVUSAUTH / STM_ECORVUSPERM / ...) on an UNWRAP rejection.
+ *
+ * stm_sync_evict_dek removes + zeroes the dataset's DEK, returning it to
+ * the LOCKED posture (a subsequent read/write yields STM_ELOCKED).
+ * Idempotent (already-evicted -> STM_OK); CORVUS-only (evicting a local
+ * dataset's DEK would leave it permanently unreadable -- no runtime
+ * re-install path exists for the keyfile/janus sources).
+ */
+STM_MUST_USE
+stm_status stm_sync_install_dek(stm_sync *s, uint64_t dataset_id,
+                                  const stm_corvus_mount_cfg *corvus);
+STM_MUST_USE
+stm_status stm_sync_evict_dek(stm_sync *s, uint64_t dataset_id);
+
 /* Forward decls for index accessors below. */
 struct stm_dataset_index;  typedef struct stm_dataset_index  stm_dataset_index;
 struct stm_snapshot_index; typedef struct stm_snapshot_index stm_snapshot_index;

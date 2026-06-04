@@ -390,6 +390,77 @@ STM_TEST(corvus_mount_soft_skips_locked_user_dataset) {
     unlink(g_tmp_path);
 }
 
+STM_TEST(corvus_install_evict_dek_roundtrip) {
+    /* TLY-A5b: the runtime DEK install/evict round-trip. A user-sealed
+     * dataset mounts LOCKED (no session token at boot); the coordinator
+     * installs the DEK when the user logs in (stm_sync_install_dek with
+     * the login-forwarded token) and evicts it at logout. The write-path
+     * STM_ELOCKED is the lock-state indicator -- get_dek confirms the DEK
+     * is/ isn't in the map. */
+    make_tmp("instevict");
+    build_pool_with_corvus_slot();   /* CURRENT CORVUS slot at ds=200 */
+
+    uint8_t canned_dek[32];
+    for (int i = 0; i < 32; i++) canned_dek[i] = (uint8_t)(0x70 + i);
+
+    fake_corvus fc;
+    fake_corvus_start(&fc, "instevict", STM_CORVUS_STATUS_OK, canned_dek);
+
+    /* Mount with NO corvus cfg -> ds=200 soft-skips, present-but-LOCKED. */
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+
+    /* Locked: no DEK in the map; a write resolves no CURRENT DEK. */
+    uint8_t dek[32];
+    STM_ASSERT_ERR(stm_sync_get_dek(s2, CORVUS_DATASET_ID, CORVUS_KEY_ID,
+                                      dek), STM_ENOENT);
+    uint8_t buf[4096];   /* one STM_UB_SIZE block */
+    memset(buf, 0xC3, sizeof buf);
+    STM_ASSERT_ERR(stm_sync_write_extent(s2, CORVUS_DATASET_ID, 1u, 0u,
+                                           buf, sizeof buf), STM_ELOCKED);
+
+    /* CORVUS-only guard: install/evict on a keyfile-wrapped dataset
+     * (root ds=1) is refused before any map mutation. */
+    stm_corvus_mount_cfg cc = {
+        .socket_path   = fc.sock_path,
+        .session_token = TEST_TOKEN,
+        .n_retries     = 0,
+    };
+    STM_ASSERT_ERR(stm_sync_install_dek(s2, /*root*/1u, &cc), STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_evict_dek(s2, /*root*/1u), STM_EINVAL);
+
+    /* install_dek with the session token -> UNWRAPs over the fake corvus
+     * and installs the canned DEK. The dataset is now unlocked. */
+    STM_ASSERT_OK(stm_sync_install_dek(s2, CORVUS_DATASET_ID, &cc));
+    STM_ASSERT_OK(stm_sync_get_dek(s2, CORVUS_DATASET_ID, CORVUS_KEY_ID,
+                                     dek));
+    STM_ASSERT_MEM_EQ(dek, canned_dek, 32);
+
+    /* Idempotent re-install -> OK, no re-unwrap, no double-insert. */
+    STM_ASSERT_OK(stm_sync_install_dek(s2, CORVUS_DATASET_ID, &cc));
+
+    /* evict_dek removes + zeroes the DEK -> the dataset re-locks. */
+    STM_ASSERT_OK(stm_sync_evict_dek(s2, CORVUS_DATASET_ID));
+    STM_ASSERT_ERR(stm_sync_get_dek(s2, CORVUS_DATASET_ID, CORVUS_KEY_ID,
+                                      dek), STM_ENOENT);
+    STM_ASSERT_ERR(stm_sync_write_extent(s2, CORVUS_DATASET_ID, 1u, 0u,
+                                           buf, sizeof buf), STM_ELOCKED);
+
+    /* Idempotent re-evict -> OK. */
+    STM_ASSERT_OK(stm_sync_evict_dek(s2, CORVUS_DATASET_ID));
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(d);
+    fake_corvus_stop(&fc);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(corvus_mount_fails_fast_on_corvus_reject) {
     make_tmp("badauth");
     build_pool_with_corvus_slot();
