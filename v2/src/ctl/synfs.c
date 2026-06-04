@@ -2397,6 +2397,29 @@ static stm_status getattr_at(stm_ctl *c, uint64_t qid_path,
          * size in advance. Standard 9P pattern (see /proc on Linux);
          * clients read until EOF. */
     }
+
+    /* TLY-A5b #827a-login: report the SYSTEM-gated DEK trigger nodes as
+     * SYSTEM-owned. A remote Thylacine kernel enforces owner-first POSIX
+     * rwx on the dev9p attach of /ctl (A-3 dev9p.perm_enforced), reading
+     * the owner from this getattr; the login coordinator opening these
+     * 0200 (owner-write-only) nodes runs as PRINCIPAL_SYSTEM, so it must
+     * BE the owner for the write to pass -- which is exactly what 0200 +
+     * SYSTEM-gate (ctl_caller_is_system) means. This makes the kernel's
+     * rwx check coherent with the server's own SYSTEM gate (the A-3
+     * "wire owner == authorized principal" reconciliation, applied to the
+     * control surface). Every other node keeps uid/gid 0: the
+     * world-readable status/properties (0444/0555) grant `other`, and the
+     * admin-gated 0200 triggers are not driven over the kernel rwx path at
+     * v1.0 (only the SYSTEM coordinator attaches /ctl through a kernel).
+     * When system_uid is unconfigured ((uid_t)-1 -> 0xFFFFFFFF) the node is
+     * owned by the invalid sentinel and the kernel denies -- fail-closed,
+     * matching ctl_caller_is_system's own unconfigured-deny. */
+    if (k == KIND_DATASETS_PROVISION_DEK || k == KIND_DATASET_INSTALL_DEK
+            || k == KIND_DATASET_EVICT_DEK) {
+        out->uid = (uint32_t)c->system_uid;
+        out->gid = (uint32_t)c->system_uid;
+    }
+
     if (out_dyn_name && out_dyn_len) {
         if (name_len > UUID_HEX_LEN) name_len = UUID_HEX_LEN;
         memcpy(out_dyn_name, name, name_len);

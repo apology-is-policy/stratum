@@ -706,4 +706,89 @@ STM_TEST(provision_via_ctl) {
     (void)unlink(g_tmp_path);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* TLY-A5b #827a-login: the three SYSTEM-gated DEK trigger nodes report      */
+/* uid/gid == system_uid via getattr, so a remote Thylacine kernel's         */
+/* owner-first rwx check on the /ctl dev9p attach (A-3) is COHERENT with     */
+/* this server's own SYSTEM gate -- the login coordinator runs as            */
+/* PRINCIPAL_SYSTEM and must OWN the 0200 (owner-write-only) nodes to write  */
+/* them. World-readable nodes (0444/0555) stay uid/gid 0: `other` carries    */
+/* them, so their owner is immaterial to the kernel check.                   */
+/* ────────────────────────────────────────────────────────────────────── */
+STM_TEST(dek_nodes_report_system_owner) {
+    make_tmp("dekowner");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    char token_path[256];
+    write_token_file(token_path, sizeof token_path, "dekowner");
+
+    fake_corvus fc;
+    fake_corvus_start(&fc, "dekowner", STM_CORVUS_STATUS_OK);
+    stm_fs *fs = provision_and_remount_locked(&fc, "dekowner", token_path); /* ds=2 alice */
+
+    const stm_lp9_vops *v = stm_ctl_vops();
+    stm_lp9_attr a;
+
+    /* (1) system_uid configured -> the three DEK verbs are SYSTEM-owned. */
+    {
+        stm_ctl *ctl = NULL;
+        STM_ASSERT_OK(stm_ctl_create(fs, &ctl));
+        STM_ASSERT_OK(stm_ctl_set_system_uid(ctl, SYS_UID));
+        uint64_t root = stm_ctl_root(ctl);
+        stm_ctl_conn *cn = NULL;
+        STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &cn));
+
+        /* datasets-level provision-dek */
+        stm_lp9_qid q;
+        STM_ASSERT_OK(v->walk(cn, root, "datasets", 8, &q));
+        STM_ASSERT_OK(v->walk(cn, q.path, "provision-dek",
+                                strlen("provision-dek"), &q));
+        STM_ASSERT_OK(v->getattr(cn, q.path, STM_LP9_GETATTR_BASIC, &a));
+        STM_ASSERT_EQ(a.uid, (uint32_t)SYS_UID);
+        STM_ASSERT_EQ(a.gid, (uint32_t)SYS_UID);
+
+        /* per-dataset install-dek + evict-dek (ds=2) */
+        STM_ASSERT_OK(v->getattr(cn, ctl_walk_verb(v, cn, root, 2u, "install-dek"),
+                                   STM_LP9_GETATTR_BASIC, &a));
+        STM_ASSERT_EQ(a.uid, (uint32_t)SYS_UID);
+        STM_ASSERT_EQ(a.gid, (uint32_t)SYS_UID);
+        STM_ASSERT_OK(v->getattr(cn, ctl_walk_verb(v, cn, root, 2u, "evict-dek"),
+                                   STM_LP9_GETATTR_BASIC, &a));
+        STM_ASSERT_EQ(a.uid, (uint32_t)SYS_UID);
+
+        /* world-readable properties keeps uid/gid 0 (other-r carries it). */
+        STM_ASSERT_OK(v->getattr(cn, ctl_walk_verb(v, cn, root, 2u, "properties"),
+                                   STM_LP9_GETATTR_BASIC, &a));
+        STM_ASSERT_EQ(a.uid, 0u);
+        STM_ASSERT_EQ(a.gid, 0u);
+
+        stm_ctl_conn_destroy(cn);
+        stm_ctl_destroy(ctl);
+    }
+
+    /* (2) system_uid UNCONFIGURED -> provision-dek owned by the invalid
+     *     sentinel ((uid_t)-1): a real principal never matches it, so the
+     *     kernel rwx check fail-closes, mirroring ctl_caller_is_system. */
+    {
+        stm_ctl *ctl = NULL;
+        STM_ASSERT_OK(stm_ctl_create(fs, &ctl));   /* no set_system_uid */
+        uint64_t root = stm_ctl_root(ctl);
+        stm_ctl_conn *cn = NULL;
+        STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &cn));
+        stm_lp9_qid q;
+        STM_ASSERT_OK(v->walk(cn, root, "datasets", 8, &q));
+        STM_ASSERT_OK(v->walk(cn, q.path, "provision-dek",
+                                strlen("provision-dek"), &q));
+        STM_ASSERT_OK(v->getattr(cn, q.path, STM_LP9_GETATTR_BASIC, &a));
+        STM_ASSERT_EQ(a.uid, (uint32_t)(uid_t)-1);
+        stm_ctl_conn_destroy(cn);
+        stm_ctl_destroy(ctl);
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fake_corvus_stop(&fc);
+    (void)unlink(token_path);
+    (void)unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("corvus_provision")
