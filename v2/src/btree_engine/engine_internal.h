@@ -395,9 +395,13 @@ struct stm_btree_engine {
      * (commit_mu outer, vtable inner) — reversal risks deadlock if
      * a future caller takes the vtable lock then upcalls into a
      * function that would acquire commit_mu. The bootstrap allocator
-     * is the production vtable (`STM_ENGINE_STORE_VT`); its internal
-     * locks are inside the vtable layer + therefore inside commit_mu
-     * by construction.
+     * is the production vtable (`STM_ENGINE_STORE_VT`); it holds NO
+     * internal lock -- its mutating callbacks (`reserve` / `free` /
+     * `write`) are race-free only because they are reached EXCLUSIVELY
+     * from the commit path, which runs under `fs->global` EX (NOT
+     * because of any vtable-internal lock). The serial-path engine ops
+     * under serial_mu drive only `vt->read` (via load_root), never the
+     * mutating callbacks.
      *
      * `next_delta_seq` is the engine-wide monotonic source for
      * `eng_delta::seq` — gives every prepended message a total order
@@ -433,6 +437,32 @@ struct stm_btree_engine {
      *     LF-BE-prepend exercises this invariant for real.
      */
     pthread_mutex_t       commit_mu;
+
+    /* P9.5-PARALLEL-3 fix: serialises the SERIAL-PATH tree ops
+     * (insert / delete / lookup / scan / scan_range / stats_get) against
+     * each other. The engine mutates `root` and its nodes IN PLACE on a
+     * plain (non-atomic) pointer; the LF-2 substrate publishes `mvcc_root`
+     * only for the wait-free `*_concurrent` readers. The original design
+     * relied on the production caller holding `fs->global` EX to give the
+     * serial path a single writer (see the commit_mu note above). Once the
+     * fs layer ported its compound mutators to `fs->global` SH + per-inode
+     * pins, two ops reaching the SAME per-dataset engine through DIFFERENT
+     * index locks (inode / dirent / extent / xattr each carry their own
+     * private idx->lock, but all four share one engine per dataset) raced
+     * on `root`/the nodes -> btree corruption (spurious STM_EEXIST on a
+     * torn dirent probe chain, STM_ECORRUPT on a torn node). `serial_mu`
+     * restores the single-serial-op-at-a-time invariant inside the engine,
+     * independent of which caller-side lock was held. The `*_concurrent`
+     * EBR readers DO NOT take it (they stay wait-free via mvcc_root); the
+     * commit path does not take it either (it runs under `fs->global` EX).
+     * Lock order: serial_mu and commit_mu are currently NEVER co-held -- the
+     * serial-path load_root runs OUTSIDE commit_mu (commit_mu is taken only by
+     * the `*_concurrent` EBR slow-warm path, which does not take serial_mu).
+     * The required discipline for any FUTURE code that would hold both (e.g.
+     * the BE-prepend commit-concurrent consolidator) is serial_mu OUTER ->
+     * commit_mu INNER; never the reverse. */
+    pthread_mutex_t       serial_mu;
+
     _Atomic(uint64_t)     next_delta_seq;
     _Atomic(eng_node *)   mvcc_root;
 };

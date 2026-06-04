@@ -254,6 +254,12 @@ static bool wait_for_threads(const writer_ctx *w, const reader_ctx *r,
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) {
+            /* audit F1: JOIN before returning -- never leave workers running
+             * while the caller unmounts fs / drops the stack ctx (UAF). A
+             * genuine deadlock then hangs to the ctest TIMEOUT (the correct
+             * signal), not a memory-corruption abort. */
+            (void)pthread_join(wtid, NULL);
+            (void)pthread_join(rtid, NULL);
             return false;
         }
         struct timespec sleep_for = { 0, 10 * 1000 * 1000 };  /* 10 ms */
@@ -382,7 +388,15 @@ static bool wait_two_threads(const setattr_ctx *a, const setattr_ctx *b,
         if (atomic_load(&a->done) && atomic_load(&b->done)) break;
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) {
+            /* audit F1: JOIN before returning -- never leave workers running
+             * while the caller unmounts fs / drops the stack ctx (UAF). A
+             * genuine deadlock then hangs to the ctest TIMEOUT (the correct
+             * signal), not a memory-corruption abort. */
+            (void)pthread_join(at, NULL);
+            (void)pthread_join(bt, NULL);
+            return false;
+        }
         struct timespec ns = { 0, 10 * 1000 * 1000 };  /* 10 ms */
         nanosleep(&ns, NULL);
     }
@@ -546,7 +560,15 @@ static bool wait_two_cu(const create_unlink_ctx *a, const create_unlink_ctx *b,
         if (atomic_load(&a->done) && atomic_load(&b->done)) break;
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) {
+            /* audit F1: JOIN before returning -- never leave workers running
+             * while the caller unmounts fs / drops the stack ctx (UAF). A
+             * genuine deadlock then hangs to the ctest TIMEOUT (the correct
+             * signal), not a memory-corruption abort. */
+            (void)pthread_join(at, NULL);
+            (void)pthread_join(bt, NULL);
+            return false;
+        }
         struct timespec ns = { 0, 10 * 1000 * 1000 };
         nanosleep(&ns, NULL);
     }
@@ -689,7 +711,15 @@ static bool wait_two_rename(const rename_ctx *a, const rename_ctx *b,
         if (atomic_load(&a->done) && atomic_load(&b->done)) break;
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) {
+            /* audit F1: JOIN before returning -- never leave workers running
+             * while the caller unmounts fs / drops the stack ctx (UAF). A
+             * genuine deadlock then hangs to the ctest TIMEOUT (the correct
+             * signal), not a memory-corruption abort. */
+            (void)pthread_join(at, NULL);
+            (void)pthread_join(bt, NULL);
+            return false;
+        }
         struct timespec ns = { 0, 10 * 1000 * 1000 };
         nanosleep(&ns, NULL);
     }
@@ -918,7 +948,15 @@ static bool wait_two_reflink(const reflink_ctx *a, const reflink_ctx *b,
         if (atomic_load(&a->done) && atomic_load(&b->done)) break;
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) {
+            /* audit F1: JOIN before returning -- never leave workers running
+             * while the caller unmounts fs / drops the stack ctx (UAF). A
+             * genuine deadlock then hangs to the ctest TIMEOUT (the correct
+             * signal), not a memory-corruption abort. */
+            (void)pthread_join(at, NULL);
+            (void)pthread_join(bt, NULL);
+            return false;
+        }
         struct timespec ns = { 0, 10 * 1000 * 1000 };
         nanosleep(&ns, NULL);
     }
@@ -1585,7 +1623,15 @@ static bool lf3d_wait_two(const lf3d_ctx *a, const lf3d_ctx *b,
         if (atomic_load(&a->done) && atomic_load(&b->done)) break;
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) {
+            /* audit F1: JOIN before returning -- never leave workers running
+             * while the caller unmounts fs / drops the stack ctx (UAF). A
+             * genuine deadlock then hangs to the ctest TIMEOUT (the correct
+             * signal), not a memory-corruption abort. */
+            (void)pthread_join(at, NULL);
+            (void)pthread_join(bt, NULL);
+            return false;
+        }
         struct timespec ns = { 0, 10 * 1000 * 1000 };
         nanosleep(&ns, NULL);
     }
@@ -1821,7 +1867,15 @@ static bool lf3d_wait_readdir(const lf3d_readdir_ctx *a,
         if (atomic_load(&a->done) && atomic_load(&b->done)) break;
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) {
+            /* audit F1: JOIN before returning -- never leave workers running
+             * while the caller unmounts fs / drops the stack ctx (UAF). A
+             * genuine deadlock then hangs to the ctest TIMEOUT (the correct
+             * signal), not a memory-corruption abort. */
+            (void)pthread_join(at, NULL);
+            (void)pthread_join(bt, NULL);
+            return false;
+        }
         struct timespec ns = { 0, 10 * 1000 * 1000 };
         nanosleep(&ns, NULL);
     }

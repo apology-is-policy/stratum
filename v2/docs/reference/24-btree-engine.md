@@ -683,10 +683,25 @@ node via `stm_ebr_retire(node, eng_node_free_recursive)`.
 **LF-2 limitations** (closed at LF-BE-prepend):
 
 - **Concurrent writes (insert / delete)** still mutate base nodes
-  in place — a reader racing an insert sees torn entries. The
-  LF-2 production gate is `fs->global` EX for writers vs SH for
-  readers; the LF-BE-prepend writer-side chain prepend (CAS on
-  `chain_head`, no base mutation) closes this.
+  in place — a reader racing an insert sees torn entries.
+  **P9.5-PARALLEL-3 correction (serial_mu):** this bullet's
+  "`fs->global` EX for writers" premise was BROKEN once the fs layer
+  ported its compound mutators to `fs->global` SH + per-inode pins.
+  All four per-dataset indices (inode / dirent / extent / xattr)
+  share ONE engine per dataset (`stm_dataset_index_get_engine` keys
+  only on dataset_id) yet each serialises only its OWN writers via
+  its OWN `idx->lock`, so two ops on different inodes/indices of the
+  same dataset reached this single-writer engine through DIFFERENT
+  locks and raced on `root`/the nodes → btree corruption (spurious
+  STM_EEXIST on a torn dirent probe chain; STM_ECORRUPT on a torn
+  node). The per-engine `serial_mu` (engine_internal.h) now serialises
+  the serial-path ops (`insert`/`delete`/`lookup`/`scan`/`scan_range`/
+  `stats_get`) per engine, restoring the single-serial-op-at-a-time
+  invariant independent of the caller-side lock. **What remains for
+  LF-BE-prepend:** the reader-vs-in-place-writer torn read for the
+  wait-free `*_concurrent` EBR readers (which intentionally do NOT
+  take serial_mu) — the writer-side chain prepend (CAS on
+  `chain_head`, no base mutation) closes that.
 - **Concurrent `commit_abort` / failed flush** invalidates the
   in-memory tree without EBR-retire; a reader pinned during the
   abort would UAF. LF-2 contract: `invalidate_memtree` runs only
@@ -796,11 +811,19 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
 
 ## Known caveats
 
-- **Not thread-safe.** One engine handle is used by one thread at a
-  time. The rwlock-over-the-node-cache (design §3.5) lands when the
-  engine joins the concurrent path; the cache + dirty-tracking
-  interfaces are shaped so that — and Phase 9.8's Bw-tree lock-free
-  layer — drop in without re-architecting the engine.
+- **Serial-path ops self-serialise per engine (P9.5-PARALLEL-3).** The
+  six serial-path entry points (`insert` / `delete` / `lookup` / `scan`
+  / `scan_range` / `stats_get`) take the per-engine `serial_mu`, so a
+  shared per-dataset engine reached concurrently through several index
+  `idx->lock`s (the fs layer holding `fs->global` SH + per-inode pins)
+  stays structurally sound — see the 9.8-LF-2 "Concurrent writes (insert
+  / delete)" limitation for the full root-cause + fix rationale. The
+  wait-free `*_concurrent` EBR readers stay lock-free (they do NOT take
+  serial_mu); the commit ops run under `fs->global` EX. NOT yet closed:
+  the reader-vs-in-place-writer torn read for the EBR readers
+  (LF-BE-prepend's chain-prepend closes it), and `load_child` lazy
+  disk-load thread-safety (the LF-1 cache-warming caveat). Phase 9.8's
+  Bw-tree lock-free layer is the eventual full replacement.
 - **A commit_abort / failed flush drops the whole in-memory tree**, so
   the next access re-reads it from the durable root. Correct (it is the
   crash-equivalent state) but not free — acceptable for an error /

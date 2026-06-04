@@ -90,6 +90,13 @@ static stm_status engine_alloc(const stm_btree_store_vtable *vt, void *vt_ctx,
         free(eng);
         return STM_ENOMEM;
     }
+    /* P9.5-PARALLEL-3 fix: serial-path mutual exclusion (see engine_internal.h). */
+    if (pthread_mutex_init(&eng->serial_mu, NULL) != 0) {
+        pthread_mutex_destroy(&eng->commit_mu);
+        eng_cache_destroy(&eng->cache);
+        free(eng);
+        return STM_ENOMEM;
+    }
     atomic_init(&eng->next_delta_seq, (uint64_t)0);
     /* 9.8-LF-2: mvcc_root is NULL until the in-memory root materialises.
      * engine_create publishes the empty leaf immediately; engine_open
@@ -182,6 +189,7 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
     eng_node_free_recursive(eng->root);    /* frees every in-memory node */
     eng_cache_destroy(&eng->cache);        /* frees the index, not nodes */
     paddr_vec_free(&eng->orphaned_spill_blocks);
+    pthread_mutex_destroy(&eng->serial_mu);
     pthread_mutex_destroy(&eng->commit_mu);
     free(eng);
 }
@@ -363,7 +371,7 @@ static stm_status node_insert(stm_btree_engine *eng, eng_node *node,
     return STM_OK;
 }
 
-stm_status stm_btree_engine_insert(stm_btree_engine *eng,
+static stm_status engine_insert_locked(stm_btree_engine *eng,
                                     const void *key, size_t key_len,
                                     const void *value, size_t value_len)
 {
@@ -423,11 +431,22 @@ stm_status stm_btree_engine_insert(stm_btree_engine *eng,
     return STM_OK;
 }
 
+stm_status stm_btree_engine_insert(stm_btree_engine *eng,
+                                   const void *key, size_t key_len,
+                                   const void *value, size_t value_len)
+{
+    if (!eng) return STM_EINVAL;
+    pthread_mutex_lock(&eng->serial_mu);
+    stm_status s = engine_insert_locked(eng, key, key_len, value, value_len);
+    pthread_mutex_unlock(&eng->serial_mu);
+    return s;
+}
+
 /* ========================================================================= */
 /* Lookup.                                                                     */
 /* ========================================================================= */
 
-stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
+static stm_status engine_lookup_locked(stm_btree_engine *eng,
                                     const void *key, size_t key_len,
                                     bool *out_found,
                                     void **out_value, size_t *out_value_len)
@@ -464,6 +483,19 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
     }
     *out_value_len = vl;
     return STM_OK;
+}
+
+stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
+                                   const void *key, size_t key_len,
+                                   bool *out_found,
+                                   void **out_value, size_t *out_value_len)
+{
+    if (!eng) return STM_EINVAL;
+    pthread_mutex_lock(&eng->serial_mu);
+    stm_status s = engine_lookup_locked(eng, key, key_len, out_found,
+                                        out_value, out_value_len);
+    pthread_mutex_unlock(&eng->serial_mu);
+    return s;
 }
 
 /* ========================================================================= */
@@ -681,7 +713,7 @@ static stm_status node_delete(stm_btree_engine *eng, eng_node *node,
     return STM_OK;
 }
 
-stm_status stm_btree_engine_delete(stm_btree_engine *eng,
+static stm_status engine_delete_locked(stm_btree_engine *eng,
                                     const void *key, size_t key_len,
                                     bool *out_found)
 {
@@ -700,6 +732,17 @@ stm_status stm_btree_engine_delete(stm_btree_engine *eng,
     if (s != STM_OK) return s;
     if (out_found) *out_found = removed;
     return STM_OK;
+}
+
+stm_status stm_btree_engine_delete(stm_btree_engine *eng,
+                                   const void *key, size_t key_len,
+                                   bool *out_found)
+{
+    if (!eng) return STM_EINVAL;
+    pthread_mutex_lock(&eng->serial_mu);
+    stm_status s = engine_delete_locked(eng, key, key_len, out_found);
+    pthread_mutex_unlock(&eng->serial_mu);
+    return s;
 }
 
 /* ========================================================================= */
@@ -1322,7 +1365,7 @@ static stm_status scan_node(stm_btree_engine *eng, eng_node *node,
     return STM_OK;
 }
 
-stm_status stm_btree_engine_scan(stm_btree_engine *eng,
+static stm_status engine_scan_locked(stm_btree_engine *eng,
                                   stm_btree_engine_iter_cb cb, void *ctx)
 {
     if (!eng || !cb) return STM_EINVAL;
@@ -1332,6 +1375,16 @@ stm_status stm_btree_engine_scan(stm_btree_engine *eng,
     if (s != STM_OK) return s;
     bool stopped = false;
     return scan_node(eng, root, cb, ctx, 0, &stopped);
+}
+
+stm_status stm_btree_engine_scan(stm_btree_engine *eng,
+                                 stm_btree_engine_iter_cb cb, void *ctx)
+{
+    if (!eng) return STM_EINVAL;
+    pthread_mutex_lock(&eng->serial_mu);
+    stm_status s = engine_scan_locked(eng, cb, ctx);
+    pthread_mutex_unlock(&eng->serial_mu);
+    return s;
 }
 
 /* Enumerate the entries of `node`'s subtree whose keys fall in the
@@ -1378,7 +1431,7 @@ static stm_status scan_range_node(stm_btree_engine *eng, eng_node *node,
     return STM_OK;
 }
 
-stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
+static stm_status engine_scan_range_locked(stm_btree_engine *eng,
                                         const void *lo_key, size_t lo_key_len,
                                         const void *hi_key, size_t hi_key_len,
                                         stm_btree_engine_iter_cb cb, void *ctx)
@@ -1394,6 +1447,19 @@ stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
     bool stopped = false;
     return scan_range_node(eng, root, lo_key, lo_key_len, hi_key, hi_key_len,
                            cb, ctx, 0, &stopped);
+}
+
+stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
+                                       const void *lo_key, size_t lo_key_len,
+                                       const void *hi_key, size_t hi_key_len,
+                                       stm_btree_engine_iter_cb cb, void *ctx)
+{
+    if (!eng) return STM_EINVAL;
+    pthread_mutex_lock(&eng->serial_mu);
+    stm_status s = engine_scan_range_locked(eng, lo_key, lo_key_len,
+                                            hi_key, hi_key_len, cb, ctx);
+    pthread_mutex_unlock(&eng->serial_mu);
+    return s;
 }
 
 /* 9.8-LF-3b: concurrent (EBR-pinned) range scan.
@@ -1450,7 +1516,7 @@ static int count_cb(const void *k, size_t kl, const void *v, size_t vl,
     return 0;
 }
 
-stm_status stm_btree_engine_stats_get(stm_btree_engine *eng,
+static stm_status engine_stats_get_locked(stm_btree_engine *eng,
                                        stm_btree_engine_stats *out)
 {
     if (!eng || !out) return STM_EINVAL;
@@ -1479,4 +1545,14 @@ stm_status stm_btree_engine_stats_get(stm_btree_engine *eng,
     out->n_keys = n_keys;
     out->height = height;
     return STM_OK;
+}
+
+stm_status stm_btree_engine_stats_get(stm_btree_engine *eng,
+                                      stm_btree_engine_stats *out)
+{
+    if (!eng) return STM_EINVAL;
+    pthread_mutex_lock(&eng->serial_mu);
+    stm_status s = engine_stats_get_locked(eng, out);
+    pthread_mutex_unlock(&eng->serial_mu);
+    return s;
 }

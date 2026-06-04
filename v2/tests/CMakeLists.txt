@@ -94,6 +94,17 @@ stm_add_test(test_ctl_conn_lifecycle test_ctl_conn_lifecycle.c)
 target_link_libraries(test_ctl_conn_lifecycle PRIVATE stm_lp9)
 stm_add_test(test_compound_ops_concurrent
              test_compound_ops_concurrent.c test_fs_common.c)
+# Timing-sensitive concurrency test: two worker threads churn same-dataset
+# compound ops, each guarded by an internal 30s deadlock-detector deadline.
+# After the P9.5-PARALLEL-3 engine-serialisation fix (btree_engine serial_mu)
+# same-dataset writes correctly serialise, so the write-heavy cfr /
+# write-truncate variants are CPU+disk bound -- slower than the prior racy
+# (corruption-prone) concurrent version. Run alongside the disk-heavy
+# test_fs / test_fs_phase8 / test_crash_inject under -j8 the host
+# oversubscribes and the internal deadline trips. The test's OWN 2-thread
+# concurrency is the subject; competing test PROCESSES are noise, so
+# RUN_SERIAL gives it the host to itself (solo it completes in ~6s).
+set_tests_properties(test_compound_ops_concurrent PROPERTIES RUN_SERIAL TRUE)
 stm_add_test(test_lp9        test_lp9.c)
 target_link_libraries(test_lp9 PRIVATE stm_lp9)
 stm_add_test(test_stratum_fs test_stratum_fs.c test_fs_common.c)
