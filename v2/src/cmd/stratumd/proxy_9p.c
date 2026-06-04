@@ -173,16 +173,20 @@ static int dial_coord(const char *path, uint32_t timeout_ms)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -errno;
 
-    /* Set O_NONBLOCK on the socket. connect() will return
-     * -EINPROGRESS; we poll(POLLOUT) bounded by timeout_ms,
-     * then check SO_ERROR. */
+    /* Best-effort non-blocking connect with a bounded poll. A platform
+     * without fcntl / non-blocking sockets (Thylacine's v1.0 pouch sockets:
+     * fcntl is ENOSYS and sockets are synchronous-blocking by design) falls
+     * back to a plain blocking connect -- correct, just unbounded; the /srv
+     * connect-walk there is a fast local open, so an unbounded blocking dial
+     * is acceptable. `nonblocking` gates every step that only makes sense in
+     * non-blocking mode (the EINPROGRESS poll + the post-connect restore).
+     * Mirrors corvus_client.c::dial_corvus (TLY-A5b: the same pouch-ENOSYS
+     * fix -- the per-user proxy dials the coordinator over pouch sockets). */
+    bool nonblocking = false;
     if (timeout_ms > 0u) {
         int fl = fcntl(fd, F_GETFL);
-        if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {
-            int e = errno;
-            close(fd);
-            return -e;
-        }
+        if (fl >= 0 && fcntl(fd, F_SETFL, fl | O_NONBLOCK) >= 0)
+            nonblocking = true;
     }
 
     struct sockaddr_un addr;
@@ -196,7 +200,7 @@ static int dial_coord(const char *path, uint32_t timeout_ms)
         close(fd);
         return -e;
     }
-    if (rc < 0 /* EINPROGRESS */ && timeout_ms > 0u) {
+    if (rc < 0 /* EINPROGRESS */ && nonblocking) {
         struct pollfd pfd = { fd, POLLOUT, 0 };
         int prc = poll(&pfd, 1, (int)timeout_ms);
         if (prc < 0) {
@@ -222,7 +226,7 @@ static int dial_coord(const char *path, uint32_t timeout_ms)
     }
 
     /* Restore blocking mode for the steady-state serve loop. */
-    if (timeout_ms > 0u) {
+    if (nonblocking) {
         int fl = fcntl(fd, F_GETFL);
         if (fl >= 0) (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
     }

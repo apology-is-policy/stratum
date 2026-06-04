@@ -159,6 +159,11 @@ static void usage(const char *argv0)
             "                           Opt in to running --role client with no\n"
             "                           --datasets-allowed (open relay; tests +\n"
             "                           non-Thylacine deployments only).\n"
+        "  --single-session         Serve exactly one upstream client then exit\n"
+            "                           (TLY-A5b; client mode only). The per-login\n"
+            "                           proxy lifetime: a Thylacine login attaches\n"
+            "                           one 9P session and the proxy exits on its\n"
+            "                           close so login can reap it.\n"
         "  --coordinator-uid <N>    Verify the dialed coordinator socket's peer\n"
             "                           uid equals N via SO_PEERCRED after\n"
             "                           connect (TLY-A2-impl-3; client mode\n"
@@ -340,6 +345,13 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         }
         if (!strcmp(a, "--allow-empty-datasets-allowed")) {
             allow_empty_datasets = true;
+            continue;
+        }
+        if (!strcmp(a, "--single-session")) {
+            /* TLY-A5b (#827b): serve exactly one upstream client then exit.
+             * Valid only with --role client (validated below). The per-login
+             * proxy lifetime lever. */
+            opts.single_session = true;
             continue;
         }
         if (!strcmp(a, "--coordinator-uid") && i + 1 < argc) {
@@ -704,6 +716,16 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         fprintf(stderr,
             "stratumd: --coordinator-uid requires --role client "
             "(coord mode does not dial; the flag has no effect)\n");
+        stm_ds_policy_table_close(&user_policy_table);
+        return 1;
+    }
+    /* TLY-A5b (#827b): --single-session bounds the PROXY's lifetime to one
+     * upstream client; it is meaningless for the coord serving loop. Refuse
+     * loudly if set without --role client. */
+    if (!opts.client_mode && opts.single_session) {
+        fprintf(stderr,
+            "stratumd: --single-session requires --role client "
+            "(coord mode serves many clients; the flag has no effect)\n");
         stm_ds_policy_table_close(&user_policy_table);
         return 1;
     }

@@ -1006,11 +1006,20 @@ static stm_status h_attach(stm_9p_server *s,
      *
      * n_uname (4 bytes after aname) is .L's numeric uid hint; we
      * already have peer-creds, so ignore. */
-    enum { ANAME_DEFAULT, ANAME_ABS_PATH, ANAME_SPEC } aname_kind;
+    enum { ANAME_DEFAULT, ANAME_ABS_PATH, ANAME_SPEC, ANAME_DATASET } aname_kind;
     if (alen == 0u || (alen == 1u && aname && aname[0] == '/')) {
         aname_kind = ANAME_DEFAULT;
     } else if (aname && alen >= 5u && memcmp(aname, "spec:", 5) == 0) {
         aname_kind = ANAME_SPEC;
+    } else if (aname && alen >= 4u && memcmp(aname, "ds:", 3) == 0) {
+        /* TLY-A5b (#827b-beta): `ds:<name>` selects a CHILD dataset by name
+         * under the server's root dataset (the per-user encrypted home --
+         * a separate dataset with its own DEK). The proxy's --datasets-allowed
+         * gates which aname a connection may request (the I-1 user-vs-user
+         * boundary); the child dataset's 0700 owner + its installed DEK are the
+         * other two access gates (an un-unlocked dataset's root stat fails ->
+         * the attach is inert). */
+        aname_kind = ANAME_DATASET;
     } else if (aname && alen >= 1u && aname[0] == '/') {
         aname_kind = ANAME_ABS_PATH;
     } else {
@@ -1025,9 +1034,10 @@ static stm_status h_attach(stm_9p_server *s,
     /* Compute (resolved_ino, gen, qid_type) for the root fid based on
      * the aname kind. ANAME_DEFAULT and ANAME_SPEC bind to ino==1;
      * ANAME_ABS_PATH walks the path and binds to the resolved ino. */
-    uint64_t bound_ino = 1u;
-    uint32_t bound_gen = 0;
-    uint8_t  bound_qt  = 0;
+    uint64_t bound_ino     = 1u;
+    uint32_t bound_gen     = 0;
+    uint8_t  bound_qt      = 0;
+    uint64_t bound_dataset = s->root_dataset;
 
     if (aname_kind == ANAME_ABS_PATH) {
         stm_status rc = ns_walk_abs_path(s, s->root_dataset,
@@ -1038,8 +1048,32 @@ static stm_status h_attach(stm_9p_server *s,
             fid_release_locked(s, f);
             return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
         }
+    } else if (aname_kind == ANAME_DATASET) {
+        /* Resolve `ds:<name>` -> the child dataset id under the root, then
+         * bind the connection root to THAT dataset's root inode (ino==1). The
+         * root-inode stat reads the child dataset -- which requires its DEK be
+         * installed, so an un-provisioned / locked home attach fails here (the
+         * third access gate). */
+        uint64_t child_ds = 0;
+        stm_status rc = stm_fs_lookup_child_dataset(s->fs, s->root_dataset,
+                                                      aname + 3, (size_t)(alen - 3u),
+                                                      &child_ds);
+        if (rc != STM_OK) {
+            fid_release_locked(s, f);
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        }
+        struct stm_inode_value root_iv;
+        rc = stm_fs_stat(s->fs, child_ds, 1u, &root_iv);
+        if (rc != STM_OK) {
+            fid_release_locked(s, f);
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        }
+        bound_dataset = child_ds;
+        bound_ino     = 1u;
+        bound_gen     = (uint32_t)stm_load_le64(root_iv.si_gen);
+        bound_qt      = qid_type_from_mode(stm_load_le32(root_iv.si_mode));
     } else {
-        /* DEFAULT and SPEC both root at ino==1. */
+        /* DEFAULT and SPEC both root at ino==1 of the server's root dataset. */
         struct stm_inode_value root_iv;
         stm_status rc = stm_fs_stat(s->fs, s->root_dataset, 1u, &root_iv);
         if (rc != STM_OK) {
@@ -1051,7 +1085,7 @@ static stm_status h_attach(stm_9p_server *s,
         bound_qt  = qid_type_from_mode(stm_load_le32(root_iv.si_mode));
     }
 
-    f->dataset_id = s->root_dataset;
+    f->dataset_id = bound_dataset;
     f->ino        = bound_ino;
     f->cached_gen = bound_gen;
     f->qid_type   = bound_qt;
@@ -1061,7 +1095,7 @@ static stm_status h_attach(stm_9p_server *s,
      * it's (root_dataset, 1); for the chroot form it's (root_dataset,
      * resolved_ino). Used by Twalk to resolve "." / ".." that would
      * otherwise pop above the underlying-tree parent. R93 P3-1 fix. */
-    f->conn_root_dataset = s->root_dataset;
+    f->conn_root_dataset = bound_dataset;
     f->conn_root_ino     = bound_ino;
 
     /* ns_path = "/" — the root of the connection's namespace. Even for

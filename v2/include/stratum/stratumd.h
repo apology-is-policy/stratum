@@ -225,6 +225,19 @@ typedef struct stm_stratumd_opts {
     bool        coordinator_uid_check_enabled;
     uid_t       coordinator_uid;
 
+    /* TLY-A5b (#827b): serve-one-session proxy mode. When `single_session`
+     * is true (set by --single-session; valid only with --role client), the
+     * proxy accept loop serves exactly ONE upstream client -- inline, on the
+     * accept thread, no detached worker -- and returns when that client's
+     * upstream connection closes. This is the per-login proxy lifetime lever:
+     * a Thylacine /sbin/login spawns the proxy AS the user, attaches its single
+     * 9P session, and on logout closes that attach; the proxy then exits and
+     * login reaps it. The default (single_session == false) is the long-running
+     * loop-accept relay (the boot coordinator + test proxies). Does NOT alter
+     * the per-client isolation invariants -- it only bounds the proxy lifetime
+     * to one upstream session (v2/specs/multi_stratumd.tla unaffected). */
+    bool        single_session;
+
     /* A-3 (Thylacine host-bake). When `bake_owner_enabled` is true
      * (set by --bake-owner-uid / --bake-owner-gid), every file created
      * on the coordinator FS connection is stamped with `bake_owner_uid`

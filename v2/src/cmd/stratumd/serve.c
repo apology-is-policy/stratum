@@ -728,7 +728,8 @@ static stm_status stratumd_accept_proxy_loop(int listen_fd,
                                                 bool allow_unauthenticated_peer,
                                                 atomic_bool *stop_flag,
                                                 bool coord_uid_check_enabled,
-                                                uid_t coord_uid)
+                                                uid_t coord_uid,
+                                                bool single_session)
 {
     if (listen_fd < 0 || !coord_socket_path) return STM_EINVAL;
 
@@ -775,6 +776,25 @@ static stm_status stratumd_accept_proxy_loop(int listen_fd,
             }
             peer_uid = (uid_t)getuid();
             peer_gid = (gid_t)getgid();
+        }
+
+        /* TLY-A5b (#827b): serve-one-session mode. The per-login proxy serves
+         * exactly one upstream client -- inline, on this thread, no detached
+         * worker -- and exits when that client closes its connection. The
+         * Thylacine /sbin/login attaches its single 9P session over this fd;
+         * on logout it closes the attach, stm_proxy_9p_serve_client returns,
+         * and we return so the proxy process exits (login reaps it). */
+        if (single_session) {
+            stm_status sc = stm_proxy_9p_serve_client(client_fd,
+                                                        coord_socket_path,
+                                                        datasets_allowed,
+                                                        n_datasets_allowed,
+                                                        peer_uid, peer_gid,
+                                                        msize_max,
+                                                        idle_timeout_ms,
+                                                        coord_uid_check_enabled,
+                                                        coord_uid);
+            return sc;
         }
 
         stratumd_proxy_worker_ctx *ctx = malloc(sizeof *ctx);
@@ -1189,7 +1209,8 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
                                                   opts->allow_unauthenticated_peer,
                                                   opts->stop_flag,
                                                   opts->coordinator_uid_check_enabled,
-                                                  opts->coordinator_uid);
+                                                  opts->coordinator_uid,
+                                                  opts->single_session);
 
     close(listen_fd);
     (void)unlink(opts->socket_path);

@@ -307,6 +307,19 @@ stm_status stm_dataset_lookup(const stm_dataset_index *idx, uint64_t id,
                                 stm_dataset_entry *out);
 
 /*
+ * Resolve a PRESENT child of `parent_id` by name to its id (TLY-A5b #827b-beta:
+ * the `ds:<name>` 9P attach form). `name` is a single component (1..255 bytes,
+ * UTF-8). STM_ENOENT if no present child matches; STM_EINVAL on a bad name.
+ * Names are unique among present siblings (SiblingNameUnique), so the match is
+ * unambiguous.
+ */
+STM_MUST_USE
+stm_status stm_dataset_lookup_child_by_name(const stm_dataset_index *idx,
+                                              uint64_t parent_id,
+                                              const char *name, size_t name_len,
+                                              uint64_t *out_id);
+
+/*
  * Count PRESENT datasets. Always STM_OK on valid args.
  */
 STM_MUST_USE

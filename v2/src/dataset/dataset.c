@@ -676,6 +676,40 @@ stm_status stm_dataset_lookup(const stm_dataset_index *idx, uint64_t id,
     return STM_OK;
 }
 
+/* TLY-A5b (#827b-beta): resolve a PRESENT child of `parent_id` by name to its
+ * id. The per-user-home `ds:<name>` 9P attach form resolves the child dataset
+ * this way (parent = the connection's root dataset). Single-component name; the
+ * scan mirrors sibling_name_taken_locked. STM_ENOENT if no present child
+ * matches; STM_EINVAL on a bad name. */
+stm_status stm_dataset_lookup_child_by_name(const stm_dataset_index *idx,
+                                              uint64_t parent_id,
+                                              const char *name, size_t name_len,
+                                              uint64_t *out_id) {
+    if (!idx || !name || !out_id) return STM_EINVAL;
+    *out_id = 0;
+    if (name_len == 0 || name_len > STM_DATASET_NAME_MAX) return STM_EINVAL;
+    if (!name_chars_valid(name, name_len)) return STM_EINVAL;
+    pthread_mutex_t *lock = dataset_lock(idx);
+    must_lock(lock);
+    if (!is_present_locked(idx, parent_id)) {
+        must_unlock(lock);
+        return STM_ENOENT;
+    }
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        const dataset_slot *s = &idx->slots[i];
+        if (!s->present) continue;
+        if (s->e.parent_id != parent_id) continue;
+        if (s->e.name_len != (uint32_t)name_len) continue;
+        if (memcmp(s->e.name, name, name_len) == 0) {
+            *out_id = s->e.id;
+            must_unlock(lock);
+            return STM_OK;
+        }
+    }
+    must_unlock(lock);
+    return STM_ENOENT;
+}
+
 stm_status stm_dataset_count(const stm_dataset_index *idx,
                                 size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;

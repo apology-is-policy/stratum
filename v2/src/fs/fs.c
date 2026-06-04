@@ -6985,6 +6985,28 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
  * has for the janus-wrap network round-trip, and dataset creation is
  * a rare operation.
  */
+/* TLY-A5b (#827b-beta): resolve a child dataset by name under `parent_id` to
+ * its id. The 9P server's `ds:<name>` attach form uses this to map the aname to
+ * the per-user home dataset (parent = the connection's root dataset). Read path
+ * (fs->global SH + the wedge guard), delegating to the dataset index. */
+stm_status stm_fs_lookup_child_dataset(stm_fs *fs, uint64_t parent_id,
+                                          const char *name, size_t name_len,
+                                          uint64_t *out_id)
+{
+    if (!fs || !name || !out_id) return STM_EINVAL;
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_READ(fs);
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ECORRUPT;
+    }
+    stm_status s = stm_dataset_lookup_child_by_name(didx, parent_id,
+                                                      name, name_len, out_id);
+    pthread_rwlock_unlock(&fs->global);
+    return s;
+}
+
 stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
                                            const char *name,
                                            const char *corvus_dataset_path,

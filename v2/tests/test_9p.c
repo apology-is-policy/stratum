@@ -2842,6 +2842,76 @@ STM_TEST(p9_attach_aname_abs_path_unknown_returns_enoent) {
     unlink(g_key_path);
 }
 
+STM_TEST(p9_attach_aname_ds_selects_child_dataset) {
+    /* TLY-A5b (#827b-beta): aname = "ds:<name>" binds the connection root to a
+     * CHILD dataset's root inode (the per-user encrypted home). Create child
+     * "home1", init its root (ino 1), attach "ds:home1" -> the root fid's qid
+     * path must encode (child_ds << 32) | 1, NOT the server root dataset. */
+    make_tmp("9p_aname_ds");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    uint64_t child_ds = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1u, "home1", &child_ds));
+    STM_ASSERT(child_ds != 0u && child_ds != 1u);
+    uint64_t child_root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, child_ds, 0700u, 1000u, 1000u,
+                                              &child_root_ino));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach_aname(s, 100, "ds:home1");
+
+    /* Stat root fid: qid path == (child_ds << 32) | child_root_ino. */
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tgetattr(req, 2, 100, STM_9P_GETATTR_INO);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETATTR);
+    uint64_t qid_path_v = load_u64(resp + 7 + 8 + 1 + 4);
+    STM_ASSERT_EQ(qid_path_v,
+                  (child_ds << 32) | (child_root_ino & 0xFFFFFFFFu));
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_attach_aname_ds_unknown_returns_enoent) {
+    /* aname = "ds:nope" with no such child dataset -> Rlerror(ENOENT). The
+     * proxy's --datasets-allowed is the FIRST gate (a foreign name never
+     * reaches the coord); this is the coord's own fail-closed on a name that
+     * resolves to no present child. */
+    make_tmp("9p_aname_ds_unknown");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tversion(req, STM_9P_MSIZE_DEFAULT, "9P2000.L");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tattach_with_aname(req, 1, 100, "ds:nope");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOENT);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(p9_attach_aname_spec_seeds_bindings) {
     /* aname = "spec:/sub=/alias" — bind /alias → /sub at attach time;
      * subsequent Twalk("alias") routes to sub_ino. */

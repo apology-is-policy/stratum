@@ -1404,6 +1404,17 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
  * failure). On any post-create_child failure the dataset entry is
  * rolled back; the index is never left with an orphan dataset.
  */
+/*
+ * TLY-A5b (#827b-beta): resolve a child dataset by name under `parent_id` to its
+ * id (the 9P `ds:<name>` attach form's name->dataset map; parent = the
+ * connection's root dataset). Read path (fs->global SH + wedge guard).
+ * STM_ENOENT if no present child matches; STM_EINVAL on a bad name; STM_EWEDGED.
+ */
+STM_MUST_USE
+stm_status stm_fs_lookup_child_dataset(stm_fs *fs, uint64_t parent_id,
+                                          const char *name, size_t name_len,
+                                          uint64_t *out_id);
+
 STM_MUST_USE
 stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
                                            const char *name,
