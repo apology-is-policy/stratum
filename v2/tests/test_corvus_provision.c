@@ -19,7 +19,9 @@
 #include "test_fs_common.h"
 
 #include <stratum/corvus_client.h>
+#include <stratum/ctl.h>
 #include <stratum/fs.h>
+#include <stratum/lp9.h>
 #include <stratum/stratumd.h>
 #include <stratum/sync.h>
 #include <stratum/types.h>
@@ -350,6 +352,213 @@ STM_TEST(provision_create_dataset_corvus_rollback) {
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     fake_corvus_stop(&fc);
+    (void)unlink(g_tmp_path);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* TLY-A5b: the /ctl install-dek / evict-dek control surface + F7          */
+/* connection-binding, driven directly through the ctl vops over an fs     */
+/* with a soft-skipped (LOCKED) corvus dataset.                            */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* The A-5b login coordinator runs as PRINCIPAL_SYSTEM (= the A-3 host-bake
+ * owner uid). Any non-system uid must be denied the DEK verbs. */
+#define SYS_UID    ((uid_t)4294967294u)   /* PRINCIPAL_SYSTEM */
+#define SYS_GID    ((gid_t)4294967294u)
+#define OTHER_UID  ((uid_t)1234u)
+#define OTHER_GID  ((gid_t)1234u)
+
+/* Walk /datasets/<dsid>/<verb> and return the leaf qid (walk is never
+ * gated -- only Tlopen is; so this succeeds for any caller). */
+static uint64_t ctl_walk_verb(const stm_lp9_vops *v, stm_ctl_conn *cn,
+                                uint64_t root, uint64_t dsid, const char *verb)
+{
+    stm_lp9_qid q;
+    STM_ASSERT_OK(v->walk(cn, root, "datasets", 8, &q));
+    char dsbuf[24];
+    int n = snprintf(dsbuf, sizeof dsbuf, "%llu", (unsigned long long)dsid);
+    STM_ASSERT(n > 0 && n < (int)sizeof dsbuf);
+    STM_ASSERT_OK(v->walk(cn, q.path, dsbuf, (size_t)n, &q));
+    STM_ASSERT_OK(v->walk(cn, q.path, verb, strlen(verb), &q));
+    return q.path;
+}
+
+/* Drive install-dek: walk + Tlopen(WRONLY) + Twrite(token). Returns the
+ * lopen rc if it fails (the SYSTEM gate), else the write rc. Clunks the
+ * fid whenever the open succeeded. */
+static stm_status ctl_drive_install(const stm_lp9_vops *v, stm_ctl_conn *cn,
+                                      uint64_t root, uint64_t dsid,
+                                      const uint8_t *token, uint32_t tok_len,
+                                      uint32_t fid)
+{
+    uint64_t q = ctl_walk_verb(v, cn, root, dsid, "install-dek");
+    stm_status rc = v->lopen(cn, fid, q, STM_LP9_O_WRONLY);
+    if (rc != STM_OK) return rc;
+    uint32_t written = 0;
+    rc = v->write(cn, fid, q, 0, token, tok_len, &written);
+    v->clunk(cn, fid, q);
+    return rc;
+}
+
+/* Drive evict-dek: a single trigger byte (content ignored). */
+static stm_status ctl_drive_evict(const stm_lp9_vops *v, stm_ctl_conn *cn,
+                                    uint64_t root, uint64_t dsid, uint32_t fid)
+{
+    uint64_t q = ctl_walk_verb(v, cn, root, dsid, "evict-dek");
+    stm_status rc = v->lopen(cn, fid, q, STM_LP9_O_WRONLY);
+    if (rc != STM_OK) return rc;
+    uint32_t written = 0;
+    uint8_t  trig = 'x';
+    rc = v->write(cn, fid, q, 0, &trig, 1u, &written);
+    v->clunk(cn, fid, q);
+    return rc;
+}
+
+/* Provision alice (ds=2) via the stratumd one-shot, then remount WITHOUT
+ * corvus so ds=2 is soft-skipped LOCKED. `fc` must already be running and
+ * stays the corvus the ctl install verb later UNWRAPs over. */
+static stm_fs *provision_and_remount_locked(fake_corvus *fc, const char *tag,
+                                              const char *token_path)
+{
+    stm_stratumd_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.fs_path                   = g_tmp_path;
+    opts.keyfile_path              = g_key_path;
+    opts.socket_path               = "/tmp/stm_dekctl_unused.sock";
+    opts.corvus_unwrap_socket      = fc->sock_path;
+    opts.corvus_session_token_file = token_path;
+    opts.provision_corvus          = true;
+    opts.provision_dataset_name    = "alice";
+    opts.provision_corvus_path     = "users/alice";
+    opts.provision_parent          = 1u;
+    STM_ASSERT_OK(stm_stratumd_run(&opts));
+    (void)tag;
+
+    stm_fs_mount_opts mopts = rw_mount_opts();   /* no corvus → soft-skip */
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    return fs;
+}
+
+STM_TEST(dek_install_evict_via_ctl) {
+    make_tmp("dekctl");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    char token_path[256];
+    write_token_file(token_path, sizeof token_path, "dekctl");
+
+    fake_corvus fc;
+    fake_corvus_start(&fc, "dekctl", STM_CORVUS_STATUS_OK);
+    stm_fs *fs = provision_and_remount_locked(&fc, "dekctl", token_path);
+    stm_sync *sync = stm_fs_sync(fs);
+
+    uint8_t dek[32];
+    /* Soft-skipped: ds=2 present-but-LOCKED (no DEK in the map). */
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, 2u, 0u, dek), STM_ENOENT);
+
+    stm_ctl *ctl = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &ctl));
+    STM_ASSERT_OK(stm_ctl_set_system_uid(ctl, SYS_UID));
+    STM_ASSERT_OK(stm_ctl_set_corvus_socket(ctl, fc.sock_path, 0, 0, 0));
+    uint64_t root = stm_ctl_root(ctl);
+    const stm_lp9_vops *v = stm_ctl_vops();
+    stm_ctl_conn *cn = NULL;
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &cn));
+
+    /* install-dek → the DEK lands (LOCKED lifts). */
+    STM_ASSERT_OK(ctl_drive_install(v, cn, root, 2u,
+                                      TEST_TOKEN, STM_CORVUS_TOKEN_LEN, 1u));
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+
+    /* Idempotent re-install from the owning conn. */
+    STM_ASSERT_OK(ctl_drive_install(v, cn, root, 2u,
+                                      TEST_TOKEN, STM_CORVUS_TOKEN_LEN, 2u));
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+
+    /* evict-dek → back to LOCKED. */
+    STM_ASSERT_OK(ctl_drive_evict(v, cn, root, 2u, 3u));
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, 2u, 0u, dek), STM_ENOENT);
+
+    /* Idempotent evict (no lease) → STM_OK no-op. */
+    STM_ASSERT_OK(ctl_drive_evict(v, cn, root, 2u, 4u));
+
+    /* Re-install, then a conn drop AUTO-EVICTS (F7). */
+    STM_ASSERT_OK(ctl_drive_install(v, cn, root, 2u,
+                                      TEST_TOKEN, STM_CORVUS_TOKEN_LEN, 5u));
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+    stm_ctl_conn_destroy(cn);
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, 2u, 0u, dek), STM_ENOENT);
+
+    stm_ctl_destroy(ctl);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fake_corvus_stop(&fc);
+    (void)unlink(token_path);
+    (void)unlink(g_tmp_path);
+}
+
+STM_TEST(dek_ctl_authz) {
+    make_tmp("dekauthz");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    char token_path[256];
+    write_token_file(token_path, sizeof token_path, "dekauthz");
+
+    fake_corvus fc;
+    fake_corvus_start(&fc, "dekauthz", STM_CORVUS_STATUS_OK);
+    stm_fs *fs = provision_and_remount_locked(&fc, "dekauthz", token_path);
+    stm_sync *sync = stm_fs_sync(fs);
+    uint8_t dek[32];
+
+    stm_ctl *ctl = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &ctl));
+    STM_ASSERT_OK(stm_ctl_set_system_uid(ctl, SYS_UID));
+    STM_ASSERT_OK(stm_ctl_set_corvus_socket(ctl, fc.sock_path, 0, 0, 0));
+    uint64_t root = stm_ctl_root(ctl);
+    const stm_lp9_vops *v = stm_ctl_vops();
+
+    /* (1) A non-SYSTEM caller is refused at Tlopen (the gate is system-
+     *     only -- NOT admin/root). The walk itself still succeeds. */
+    stm_ctl_conn *other = NULL;
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, OTHER_UID, OTHER_GID, &other));
+    {
+        uint64_t q = ctl_walk_verb(v, other, root, 2u, "install-dek");
+        STM_ASSERT_ERR(v->lopen(other, 1u, q, STM_LP9_O_WRONLY), STM_EACCES);
+    }
+
+    stm_ctl_conn *sysA = NULL;
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &sysA));
+
+    /* (2) SYSTEM caller, wrong token length → EINVAL; stays LOCKED. */
+    STM_ASSERT_ERR(ctl_drive_install(v, sysA, root, 2u,
+                                       TEST_TOKEN, 32u, 2u), STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, 2u, 0u, dek), STM_ENOENT);
+
+    /* (3) sysA installs → lease owned by sysA; DEK present. */
+    STM_ASSERT_OK(ctl_drive_install(v, sysA, root, 2u,
+                                      TEST_TOKEN, STM_CORVUS_TOKEN_LEN, 3u));
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+
+    /* (4) A DIFFERENT SYSTEM conn cannot install (cross-conn) nor evict
+     *     (non-owning) the leased dataset → EACCES; DEK stays sysA's. */
+    stm_ctl_conn *sysB = NULL;
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &sysB));
+    STM_ASSERT_ERR(ctl_drive_install(v, sysB, root, 2u,
+                                       TEST_TOKEN, STM_CORVUS_TOKEN_LEN, 4u),
+                     STM_EACCES);
+    STM_ASSERT_ERR(ctl_drive_evict(v, sysB, root, 2u, 5u), STM_EACCES);
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+
+    /* (5) The owning conn evicts cleanly. */
+    STM_ASSERT_OK(ctl_drive_evict(v, sysA, root, 2u, 6u));
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, 2u, 0u, dek), STM_ENOENT);
+
+    stm_ctl_conn_destroy(other);
+    stm_ctl_conn_destroy(sysA);
+    stm_ctl_conn_destroy(sysB);
+    stm_ctl_destroy(ctl);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fake_corvus_stop(&fc);
+    (void)unlink(token_path);
     (void)unlink(g_tmp_path);
 }
 

@@ -7787,6 +7787,33 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
                                           false, out_changed);
 }
 
+/* TLY-A5b: runtime DEK install / evict (per-user encrypted home).
+ * fs->global EX serializes the sync-layer DEK-map mutation against the
+ * rest of the fs, matching every other fs mutator. The install's corvus
+ * UNWRAP round-trip runs under EX -- acceptable because the /ctl/ driver
+ * already serializes DEK lifecycle ops on its own lease lock and logins
+ * are console-paced (see src/ctl/synfs.c). */
+stm_status stm_fs_install_dek(stm_fs *fs, uint64_t dataset_id,
+                                const stm_corvus_mount_cfg *corvus)
+{
+    if (!fs) return STM_EINVAL;
+    pthread_rwlock_wrlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+    stm_status s = stm_sync_install_dek(fs->sync, dataset_id, corvus);
+    pthread_rwlock_unlock(&fs->global);
+    return s;
+}
+
+stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id)
+{
+    if (!fs) return STM_EINVAL;
+    pthread_rwlock_wrlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+    stm_status s = stm_sync_evict_dek(fs->sync, dataset_id);
+    pthread_rwlock_unlock(&fs->global);
+    return s;
+}
+
 /* ========================================================================= */
 /* 9.7-impl-4b: rollback metadata-node reclamation.                            */
 /* ========================================================================= */

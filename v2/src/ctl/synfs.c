@@ -135,6 +135,7 @@
  * verifies under the new concurrent regime.
  */
 
+#include <stratum/corvus_client.h>  /* STM_CORVUS_TOKEN_LEN (TLY-A5b) */
 #include <stratum/crypto.h>         /* stm_ct_memzero (R101 P3-1) */
 #include <stratum/ctl.h>
 #include <stratum/dataset.h>        /* stm_property + stm_dataset_entry */
@@ -192,6 +193,8 @@ typedef enum {
     KIND_DATASET_MARK_SNAPSHOT_COMPROMISED   = 29, /* /datasets/<id>/mark-snapshot-compromised — admin write (TLY-A5) */
     KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED = 30, /* /datasets/<id>/unmark-snapshot-compromised — admin write (TLY-A5) */
     KIND_DATASET_ROLLBACK_SNAPSHOT           = 31, /* /datasets/<id>/rollback-snapshot — admin write (TLY-A5-impl-2) */
+    KIND_DATASET_INSTALL_DEK                  = 32, /* /datasets/<id>/install-dek — SYSTEM write (TLY-A5b) */
+    KIND_DATASET_EVICT_DEK                    = 33, /* /datasets/<id>/evict-dek — SYSTEM write (TLY-A5b) */
     KIND_MAX
 } ctl_kind;
 
@@ -237,6 +240,11 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
     [KIND_DATASET_MARK_SNAPSHOT_COMPROMISED]   = { false, true, 0200, "mark-snapshot-compromised"   }, /* TLY-A5 admin write trigger */
     [KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED] = { false, true, 0200, "unmark-snapshot-compromised" }, /* TLY-A5 admin write trigger */
     [KIND_DATASET_ROLLBACK_SNAPSHOT] = { false, true, 0200, "rollback-snapshot" }, /* TLY-A5-impl-2 admin write trigger */
+    /* TLY-A5b: SYSTEM-only DEK lifecycle verbs. admin_required gates the
+     * surface; the vops_lopen custom branch routes them to the SYSTEM
+     * principal (NOT admin/root) -- see ctl_caller_is_system. */
+    [KIND_DATASET_INSTALL_DEK] = { false, true, 0200, "install-dek" },
+    [KIND_DATASET_EVICT_DEK]   = { false, true, 0200, "evict-dek"   },
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_LP9_NAME_MAX
@@ -273,6 +281,8 @@ _Static_assert(sizeof("snapshots") - 1  <= STM_LP9_NAME_MAX, "/ctl/ /datasets/..
 _Static_assert(sizeof("mark-snapshot-compromised") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../mark-snapshot-compromised literal");
 _Static_assert(sizeof("unmark-snapshot-compromised") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../unmark-snapshot-compromised literal");
 _Static_assert(sizeof("rollback-snapshot") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../rollback-snapshot literal");
+_Static_assert(sizeof("install-dek") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../install-dek literal");
+_Static_assert(sizeof("evict-dek") - 1   <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../evict-dek literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -283,7 +293,7 @@ _Static_assert(sizeof("rollback-snapshot") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /data
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 32,
+_Static_assert(KIND_MAX == 34,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -457,6 +467,25 @@ typedef struct ctl_session {
  * (admin-only). */
 #define STM_CTL_EVENT_MAX  (8u * 1024u * 1024u)
 
+/* TLY-A5b: DEK lease table bounds. STM_CTL_DEK_LEASE_MAX caps the
+ * number of datasets with a runtime-installed DEK at once (= concurrent
+ * encrypted-home sessions); generous for v1.0's single-console login.
+ * STM_CTL_CORVUS_SOCKET_MAX bounds the copied corvus socket path (the
+ * AF_UNIX sun_path ceiling). */
+#define STM_CTL_DEK_LEASE_MAX      64
+#define STM_CTL_CORVUS_SOCKET_MAX  108
+
+/* TLY-A5b: per-dataset DEK lease (F7 connection-binding). Records which
+ * conn installed a dataset's runtime DEK so only that conn may evict it
+ * and a conn drop auto-evicts it. `owner` is a bare identity pointer --
+ * compared, never dereferenced -- kept stale-free by clearing every
+ * lease a conn owns under dek_mu before that conn is freed. */
+typedef struct {
+    bool                   active;
+    uint64_t               dataset_id;
+    const struct stm_ctl_conn *owner;
+} ctl_dek_lease;
+
 struct stm_ctl {
     struct stm_fs    *fs;             /* may be NULL (unattached) */
     struct stm_pool  *pool;           /* may be NULL (no pool attached) */
@@ -472,6 +501,25 @@ struct stm_ctl {
      * stm_ctl_set_corvus_admin_uid; immutable on read paths.
      * (uid_t)-1 = no corvus principal — mark stays strict-admin. */
     uid_t            corvus_admin_uid;
+    /* TLY-A5b: the SYSTEM principal admitted by install-dek/evict-dek
+     * (NOT admin/root). (uid_t)-1 = unconfigured → both verbs fail
+     * closed. Set once at startup via stm_ctl_set_system_uid. */
+    uid_t            system_uid;
+    /* TLY-A5b: corvus UNWRAP socket + transport budget the install verb
+     * forwards the login token to. Copied (not borrowed) so it does not
+     * depend on the opts lifetime; corvus_socket_set gates use. Set once
+     * via stm_ctl_set_corvus_socket; immutable on the install path. */
+    char             corvus_socket_path[STM_CTL_CORVUS_SOCKET_MAX];
+    bool             corvus_socket_set;
+    uint32_t         corvus_connect_timeout_ms;
+    uint32_t         corvus_io_timeout_ms;
+    uint32_t         corvus_n_retries;
+    /* TLY-A5b: DEK lease table (F7). dek_mu is a leaf w.r.t. fs->global
+     * (install/evict take dek_mu OUTER → stm_fs_*_dek → fs->global); it
+     * is never nested under cn->mu (the DEK verbs release cn->mu before
+     * taking dek_mu). */
+    pthread_mutex_t  dek_mu;
+    ctl_dek_lease    dek_leases[STM_CTL_DEK_LEASE_MAX];
     /* P9.5-PARALLEL-1 test-compat: stm_ctl_set_caller stashes here
      * so the test harness's make_ctl_server() helper can pull the
      * configured uid when creating its stm_ctl_conn. NOT used by
@@ -548,6 +596,106 @@ static bool ctl_caller_may_mark_compromised(const stm_ctl_conn *cn)
             && cn->caller_uid == cn->ctl->corvus_admin_uid)
         return true;
     return false;
+}
+
+/* TLY-A5b: gate for install-dek / evict-dek. Admits ONLY the configured
+ * SYSTEM principal (the A-5b login coordinator runs as PRINCIPAL_SYSTEM)
+ * -- NOT admin, NOT root: the DEK lifecycle is the coordinator's job,
+ * orthogonal to operator admin. Fails closed: an unset caller_uid
+ * ((uid_t)-1) never matches, and an unconfigured system_uid ((uid_t)-1)
+ * denies every caller. */
+static bool ctl_caller_is_system(const stm_ctl_conn *cn)
+{
+    if (cn->caller_uid == (uid_t)-1) return false;
+    if (cn->ctl->system_uid == (uid_t)-1) return false;
+    return cn->caller_uid == cn->ctl->system_uid;
+}
+
+/* TLY-A5b F7 connection-binding: install `dataset_id`'s runtime DEK and
+ * record this conn as its owner. Idempotent for the owning conn; refuses
+ * a dataset already leased to a DIFFERENT conn (STM_EACCES). The corvus
+ * UNWRAP runs under dek_mu -- logins are console-serialized in v1.0, so
+ * the cross-dataset serialization costs nothing and keeps the lease
+ * reservation + the sync install atomic (no pending-lease TOCTOU). The
+ * corvus client's own connect/io timeouts bound the hold. A future
+ * multi-console deployment needing concurrent installs would split this
+ * to a pending-lease state that drops dek_mu across the UNWRAP. */
+static stm_status ctl_dek_install(stm_ctl_conn *cn, uint64_t dataset_id,
+                                  const uint8_t *token)
+{
+    stm_ctl *c = cn->ctl;
+    if (!c->corvus_socket_set) return STM_EINVAL;  /* no UNWRAP socket */
+
+    pthread_mutex_lock(&c->dek_mu);
+
+    int free_slot = -1;
+    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
+        if (!c->dek_leases[i].active) {
+            if (free_slot < 0) free_slot = i;
+            continue;
+        }
+        if (c->dek_leases[i].dataset_id == dataset_id) {
+            /* Leased by us → idempotent OK (DEK already installed; the
+             * sync layer would also no-op). Leased by another session →
+             * refuse before any UNWRAP. */
+            stm_status rc =
+                (c->dek_leases[i].owner == cn) ? STM_OK : STM_EACCES;
+            pthread_mutex_unlock(&c->dek_mu);
+            return rc;
+        }
+    }
+    if (free_slot < 0) {
+        pthread_mutex_unlock(&c->dek_mu);
+        return STM_ENOSPC;   /* lease table full */
+    }
+
+    stm_corvus_mount_cfg cfg = {
+        .socket_path        = c->corvus_socket_path,
+        .session_token      = token,
+        .connect_timeout_ms = c->corvus_connect_timeout_ms,
+        .io_timeout_ms      = c->corvus_io_timeout_ms,
+        .n_retries          = c->corvus_n_retries,
+    };
+    stm_status rc = stm_fs_install_dek(c->fs, dataset_id, &cfg);
+    if (rc == STM_OK) {
+        c->dek_leases[free_slot].active     = true;
+        c->dek_leases[free_slot].dataset_id = dataset_id;
+        c->dek_leases[free_slot].owner      = cn;
+    }
+    pthread_mutex_unlock(&c->dek_mu);
+    return rc;
+}
+
+/* TLY-A5b F7: evict `dataset_id`'s runtime DEK. Only the owning conn may
+ * evict (else STM_EACCES). Idempotent: a dataset with no lease (never
+ * installed at runtime, or already evicted) returns STM_OK WITHOUT
+ * touching the sync map -- so this verb can never evict a mount-time
+ * DEK (a system/token-bearing-mount dataset is never leased). The lease
+ * is cleared only on a clean evict so a transient failure stays
+ * retryable; conn-destroy clears unconditionally. */
+static stm_status ctl_dek_evict(stm_ctl_conn *cn, uint64_t dataset_id)
+{
+    stm_ctl *c = cn->ctl;
+    pthread_mutex_lock(&c->dek_mu);
+    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
+        if (!c->dek_leases[i].active
+                || c->dek_leases[i].dataset_id != dataset_id)
+            continue;
+        if (c->dek_leases[i].owner != cn) {
+            pthread_mutex_unlock(&c->dek_mu);
+            return STM_EACCES;   /* not your lease */
+        }
+        stm_status rc = stm_fs_evict_dek(c->fs, dataset_id);
+        if (rc == STM_OK) {
+            c->dek_leases[i].active     = false;
+            c->dek_leases[i].dataset_id = 0;
+            c->dek_leases[i].owner      = NULL;
+        }
+        pthread_mutex_unlock(&c->dek_mu);
+        return rc;
+    }
+    pthread_mutex_unlock(&c->dek_mu);
+    return STM_OK;   /* no lease → idempotent no-op */
 }
 
 static ctl_session *session_get_locked(stm_ctl_conn *cn, uint32_t fid)
@@ -1943,6 +2091,8 @@ static stm_status materialize_locked(stm_ctl_conn *cn, ctl_session *s)
     case KIND_DATASET_MARK_SNAPSHOT_COMPROMISED:  /* write-only; no body */
     case KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED:/* write-only; no body */
     case KIND_DATASET_ROLLBACK_SNAPSHOT:          /* write-only; no body */
+    case KIND_DATASET_INSTALL_DEK:                /* write-only; no body */
+    case KIND_DATASET_EVICT_DEK:                  /* write-only; no body */
     case KIND_MAX:
         break;
     }
@@ -2058,6 +2208,8 @@ static stm_status getattr_at(stm_ctl *c, uint64_t qid_path,
             || k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED
             || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED
             || k == KIND_DATASET_ROLLBACK_SNAPSHOT
+            || k == KIND_DATASET_INSTALL_DEK
+            || k == KIND_DATASET_EVICT_DEK
             || k == KIND_DATASET_SNAPSHOTS_DIR) {
         if (!c->fs) return STM_ENOENT;
         uint64_t dsid = qid_dataset_id(qid_path);
@@ -2317,6 +2469,14 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
                      KIND_META[KIND_DATASET_ROLLBACK_SNAPSHOT].static_name))
             return walk_to_qid(c,
                 qid_of(KIND_DATASET_ROLLBACK_SNAPSHOT, 0, (uint32_t)dsid), out);
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_DATASET_INSTALL_DEK].static_name))
+            return walk_to_qid(c,
+                qid_of(KIND_DATASET_INSTALL_DEK, 0, (uint32_t)dsid), out);
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_DATASET_EVICT_DEK].static_name))
+            return walk_to_qid(c,
+                qid_of(KIND_DATASET_EVICT_DEK, 0, (uint32_t)dsid), out);
         return STM_ENOENT;
     }
 
@@ -2409,6 +2569,8 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_MARK_SNAPSHOT_COMPROMISED:
     case KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED:
     case KIND_DATASET_ROLLBACK_SNAPSHOT:
+    case KIND_DATASET_INSTALL_DEK:
+    case KIND_DATASET_EVICT_DEK:
     case KIND_POOL_METRICS_PROMETHEUS:
     case KIND_DATASET_SNAPSHOT_INFO:  /* leaf; no children */
     case KIND_MAX:
@@ -2643,6 +2805,14 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         rc = emit_entry(c, &em,
             qid_of(KIND_DATASET_ROLLBACK_SNAPSHOT, 0, (uint32_t)dsid));
         if (rc != STM_OK) return rc;
+        /* TLY-A5b: SYSTEM-only DEK lifecycle verbs (mode 0200; visible
+         * in readdir per POSIX, gated at Tlopen). */
+        rc = emit_entry(c, &em,
+            qid_of(KIND_DATASET_INSTALL_DEK, 0, (uint32_t)dsid));
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(c, &em,
+            qid_of(KIND_DATASET_EVICT_DEK, 0, (uint32_t)dsid));
+        if (rc != STM_OK) return rc;
         /* S5-PRE-C: emit /datasets/<id>/snapshots/ subtree dirent. */
         return emit_entry(c, &em,
             qid_of(KIND_DATASET_SNAPSHOTS_DIR, 0, (uint32_t)dsid));
@@ -2749,6 +2919,8 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_MARK_SNAPSHOT_COMPROMISED:
     case KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED:
     case KIND_DATASET_ROLLBACK_SNAPSHOT:
+    case KIND_DATASET_INSTALL_DEK:
+    case KIND_DATASET_EVICT_DEK:
     case KIND_POOL_METRICS_PROMETHEUS:
     case KIND_DATASET_SNAPSHOT_INFO:  /* leaf — no readdir */
     case KIND_MAX:
@@ -2790,7 +2962,9 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
             || k == KIND_DATASET_RELEASE_SNAPSHOT
             || k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED
             || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED
-            || k == KIND_DATASET_ROLLBACK_SNAPSHOT) {
+            || k == KIND_DATASET_ROLLBACK_SNAPSHOT
+            || k == KIND_DATASET_INSTALL_DEK
+            || k == KIND_DATASET_EVICT_DEK) {
         if (accmode != STM_LP9_O_WRONLY) return STM_EACCES;
     } else {
         if (accmode != STM_LP9_O_RDONLY) return STM_EACCES;
@@ -2805,11 +2979,16 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
      * mode 0500 directories. */
     if (meta->admin_required) {
         /* TLY-A5-impl-1c: the mark-snapshot-compromised verb admits
-         * the corvus principal alongside admin; every other admin
-         * kind (incl. unmark) stays strict-admin-only. */
-        bool gate_ok = (k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED)
-                           ? ctl_caller_may_mark_compromised(cn)
-                           : ctl_caller_is_admin(cn);
+         * the corvus principal alongside admin. TLY-A5b: install-dek /
+         * evict-dek admit ONLY the SYSTEM principal (NOT admin/root).
+         * Every other admin kind (incl. unmark) stays strict-admin. */
+        bool gate_ok;
+        if (k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED)
+            gate_ok = ctl_caller_may_mark_compromised(cn);
+        else if (k == KIND_DATASET_INSTALL_DEK || k == KIND_DATASET_EVICT_DEK)
+            gate_ok = ctl_caller_is_system(cn);
+        else
+            gate_ok = ctl_caller_is_admin(cn);
         if (!gate_ok) return STM_EACCES;
     }
 
@@ -2861,7 +3040,9 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
             || k == KIND_DATASET_RELEASE_SNAPSHOT
             || k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED
             || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED
-            || k == KIND_DATASET_ROLLBACK_SNAPSHOT) {
+            || k == KIND_DATASET_ROLLBACK_SNAPSHOT
+            || k == KIND_DATASET_INSTALL_DEK
+            || k == KIND_DATASET_EVICT_DEK) {
         if (!c->fs) return STM_ENOENT;
         /* Dataset must still be PRESENT (R98 P2-1 carry — destroyed
          * mid-walk-then-Tlopen returns ENOENT). */
@@ -2931,7 +3112,9 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
             || k == KIND_DATASET_RELEASE_SNAPSHOT
             || k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED
             || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED
-            || k == KIND_DATASET_ROLLBACK_SNAPSHOT) {
+            || k == KIND_DATASET_ROLLBACK_SNAPSHOT
+            || k == KIND_DATASET_INSTALL_DEK
+            || k == KIND_DATASET_EVICT_DEK) {
         pthread_mutex_lock(&cn->mu);
         ctl_session *s = session_alloc_locked(cn, fid, qid_path);
         if (!s) {
@@ -3623,6 +3806,60 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         return STM_OK;
     }
 
+    /* TLY-A5b: KIND_DATASET_INSTALL_DEK / KIND_DATASET_EVICT_DEK — the
+     * runtime DEK lifecycle for per-user encrypted home (A-5b). SYSTEM-
+     * only (NOT admin/root); F7 connection-binding records the installing
+     * conn so only it may evict + a conn drop auto-evicts (vops_clunk's
+     * caller stm_ctl_conn_destroy). install body = the raw 33-byte corvus
+     * session token (binary -- NO whitespace trimming); evict body is the
+     * trigger act (content ignored, but a 0-byte write isn't "data" per
+     * the writable-kind family doctrine -> EINVAL). */
+    if (k == KIND_DATASET_INSTALL_DEK || k == KIND_DATASET_EVICT_DEK) {
+        bool is_install = (k == KIND_DATASET_INSTALL_DEK);
+        const char *verb = is_install ? "install-dek" : "evict-dek";
+
+        /* Defense-in-depth: re-check the SYSTEM gate (vops_lopen already
+         * gated; a forged-qid write still fails here). */
+        if (!ctl_caller_is_system(cn)) return STM_EACCES;
+        if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
+        pthread_mutex_lock(&cn->mu);
+        ctl_session *s = session_get_locked(cn, fid);
+        if (!s || s->qid_path != qid_path) {
+            pthread_mutex_unlock(&cn->mu);
+            return STM_EBACKEND;
+        }
+        pthread_mutex_unlock(&cn->mu);
+
+        uint64_t dsid = qid_dataset_id(qid_path);
+        stm_status rc;
+        if (is_install) {
+            if (len != STM_CORVUS_TOKEN_LEN) {
+                stm_ctl_log_event(c,
+                    "install-dek uid=%u dataset=%llu result=err:einval "
+                    "(token len %u != %u)",
+                    (unsigned)cn->caller_uid, (unsigned long long)dsid,
+                    (unsigned)len, (unsigned)STM_CORVUS_TOKEN_LEN);
+                return STM_EINVAL;
+            }
+            rc = ctl_dek_install(cn, dsid, (const uint8_t *)buf);
+        } else {
+            if (len == 0) {
+                stm_ctl_log_event(c,
+                    "evict-dek uid=%u dataset=%llu result=err:einval "
+                    "(zero-byte)",
+                    (unsigned)cn->caller_uid, (unsigned long long)dsid);
+                return STM_EINVAL;
+            }
+            rc = ctl_dek_evict(cn, dsid);
+        }
+        stm_ctl_log_event(c, "%s uid=%u dataset=%llu result=%s%s",
+            verb, (unsigned)cn->caller_uid, (unsigned long long)dsid,
+            rc == STM_OK ? "" : "err:", status_short_name(rc));
+        if (rc != STM_OK) return rc;
+        *out_written = len;
+        return STM_OK;
+    }
+
     /* TLY-A5-impl-2: KIND_DATASET_ROLLBACK_SNAPSHOT — ninth writable
      * kind. Roll the dataset back to a snapshot. Body shapes:
      *   "<sid>"        — normal rollback
@@ -3775,6 +4012,13 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out)
         free(c);
         return STM_EIO;
     }
+    if (pthread_mutex_init(&c->dek_mu, NULL) != 0) {
+        pthread_cond_destroy(&c->worker_cv);
+        pthread_mutex_destroy(&c->worker_mu);
+        pthread_mutex_destroy(&c->event_mu);
+        free(c);
+        return STM_EIO;
+    }
     c->fs = fs;
     c->pool = NULL;
     /* admin_uid defaults to "unset" sentinel; stratumd typically calls
@@ -3786,6 +4030,12 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out)
     /* TLY-A5-impl-1c: no corvus principal until stratumd configures
      * one via --corvus-admin-uid → stm_ctl_set_corvus_admin_uid. */
     c->corvus_admin_uid = (uid_t)-1;
+    /* TLY-A5b: no SYSTEM principal + no corvus socket until stratumd
+     * configures them; install-dek/evict-dek fail closed meanwhile.
+     * dek_leases[] zeroed by calloc (every slot inactive). */
+    c->system_uid = (uid_t)-1;
+    c->corvus_socket_set = false;
+    c->corvus_socket_path[0] = '\0';
     c->pending_caller_uid = (uid_t)-1;
     c->pending_caller_gid = (gid_t)-1;
     /* P9.5-PARALLEL-1: event_gen starts at 1 so a stm_ctl_conn that
@@ -3865,6 +4115,24 @@ void stm_ctl_conn_destroy(stm_ctl_conn *cn)
      * back-pointer onto a local before freeing cn so a malicious
      * compiler can't reorder the load past the free. */
     stm_ctl *ctl = cn->ctl;
+
+    /* TLY-A5b F7 connection-binding: auto-evict every DEK this conn
+     * installed (logout-via-disconnect, or a dropped login session).
+     * Done under dek_mu BEFORE free(cn) so no lease retains the about-
+     * to-be-freed `cn` identity pointer; cleared unconditionally (the
+     * conn is dying -- best-effort eviction, but the lease MUST go). */
+    pthread_mutex_lock(&ctl->dek_mu);
+    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
+        if (!ctl->dek_leases[i].active || ctl->dek_leases[i].owner != cn)
+            continue;
+        if (ctl->fs)
+            (void)stm_fs_evict_dek(ctl->fs, ctl->dek_leases[i].dataset_id);
+        ctl->dek_leases[i].active     = false;
+        ctl->dek_leases[i].dataset_id = 0;
+        ctl->dek_leases[i].owner      = NULL;
+    }
+    pthread_mutex_unlock(&ctl->dek_mu);
+
     free(cn);
 
     pthread_mutex_lock(&ctl->worker_mu);
@@ -3927,6 +4195,34 @@ stm_status stm_ctl_set_corvus_admin_uid(stm_ctl *c, uid_t corvus_admin_uid)
 {
     if (!c) return STM_EINVAL;
     c->corvus_admin_uid = corvus_admin_uid;
+    return STM_OK;
+}
+
+stm_status stm_ctl_set_system_uid(stm_ctl *c, uid_t system_uid)
+{
+    if (!c) return STM_EINVAL;
+    c->system_uid = system_uid;
+    return STM_OK;
+}
+
+stm_status stm_ctl_set_corvus_socket(stm_ctl *c, const char *socket,
+                                       uint32_t connect_timeout_ms,
+                                       uint32_t io_timeout_ms,
+                                       uint32_t n_retries)
+{
+    if (!c) return STM_EINVAL;
+    if (!socket || !*socket) {
+        c->corvus_socket_set     = false;
+        c->corvus_socket_path[0] = '\0';
+        return STM_OK;   /* clear */
+    }
+    size_t n = strlen(socket);
+    if (n >= sizeof c->corvus_socket_path) return STM_EINVAL;  /* too long */
+    memcpy(c->corvus_socket_path, socket, n + 1);  /* includes NUL */
+    c->corvus_socket_set          = true;
+    c->corvus_connect_timeout_ms  = connect_timeout_ms;
+    c->corvus_io_timeout_ms       = io_timeout_ms;
+    c->corvus_n_retries           = n_retries;
     return STM_OK;
 }
 
@@ -4000,6 +4296,10 @@ void stm_ctl_destroy(stm_ctl *c)
     pthread_cond_destroy(&c->worker_cv);
     pthread_mutex_destroy(&c->worker_mu);
     pthread_mutex_destroy(&c->event_mu);
+    /* TLY-A5b: worker_count==0 (waited above) means every conn was
+     * destroyed, so every DEK lease was already auto-evicted -- the
+     * table is empty here. Just release the lock. */
+    pthread_mutex_destroy(&c->dek_mu);
     free(c);
 }
 

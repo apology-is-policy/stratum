@@ -345,6 +345,39 @@ STM_MUST_USE
 stm_status stm_ctl_set_corvus_admin_uid(stm_ctl *c, uid_t corvus_admin_uid);
 
 /*
+ * TLY-A5b: set the "system principal" uid + the corvus socket the DEK
+ * lifecycle verbs (`/ctl/datasets/<id>/install-dek` + `evict-dek`) use.
+ *
+ * stm_ctl_set_system_uid configures the SOLE principal admitted by the
+ * two DEK verbs. Unlike the admin gate this does NOT admit root or
+ * admin_uid -- the DEK lifecycle is the coordinator's job (the A-5b
+ * login session runs as PRINCIPAL_SYSTEM), not the operator's. Stratumd
+ * wires it from `--bake-owner-uid` (= PRINCIPAL_SYSTEM under Thylacine).
+ * Default (set at stm_ctl_create) is `(uid_t)-1`: unconfigured, so both
+ * verbs fail closed for every caller (back-compat for non-Thylacine
+ * deployments that never install DEKs at runtime).
+ *
+ * stm_ctl_set_corvus_socket records the corvus UNWRAP socket + transport
+ * budget the install verb sends the login-forwarded token to. `socket`
+ * is copied (bounded by the Unix sun_path length); NULL / empty clears
+ * it (install then refuses STM_EINVAL -- no socket to UNWRAP over).
+ * Timeouts of 0 let the corvus client substitute its production default.
+ *
+ * Same timing posture as the other setters: call BEFORE the first server
+ * handle (the value is read without a lock on the install path).
+ *
+ * Returns STM_EINVAL if `c` is NULL, or (for set_corvus_socket) if
+ * `socket` overflows the internal path buffer.
+ */
+STM_MUST_USE
+stm_status stm_ctl_set_system_uid(stm_ctl *c, uid_t system_uid);
+STM_MUST_USE
+stm_status stm_ctl_set_corvus_socket(stm_ctl *c, const char *socket,
+                                       uint32_t connect_timeout_ms,
+                                       uint32_t io_timeout_ms,
+                                       uint32_t n_retries);
+
+/*
  * DEPRECATED (P9.5-PARALLEL-1): sessions[] now live on
  * `stm_ctl_conn`, NOT on shared `stm_ctl`. Per-conn sessions die
  * with the conn via `stm_ctl_conn_destroy`; the "drop_all between

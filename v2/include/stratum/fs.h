@@ -1842,6 +1842,27 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
                                                 bool *out_changed);
 
 /*
+ * TLY-A5b: runtime DEK install / evict (per-user encrypted home). Thin
+ * fs-layer wrappers over stm_sync_install_dek / stm_sync_evict_dek
+ * (see stratum/sync.h for the full contract); they take fs->global EX
+ * for the duration so the sync-layer DEK-map mutation is serialized
+ * against the rest of the fs the same way every other fs mutator is.
+ *
+ * stm_fs_install_dek UNWRAPs `dataset_id`'s CURRENT corvus keyslot over
+ * the corvus key agent named by `corvus` (socket + the login-forwarded
+ * session token) and installs the plaintext DEK, lifting the dataset
+ * out of the deferred-unwrap LOCKED posture. Idempotent; CORVUS-only;
+ * RAM-only (no commit). stm_fs_evict_dek removes + zeroes the DEK,
+ * returning the dataset to LOCKED. The /ctl/ install-dek / evict-dek
+ * verbs (src/ctl/synfs.c) are the production drivers.
+ */
+STM_MUST_USE
+stm_status stm_fs_install_dek(stm_fs *fs, uint64_t dataset_id,
+                                const stm_corvus_mount_cfg *corvus);
+STM_MUST_USE
+stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id);
+
+/*
  * TLY-A5-impl-2 / 9.7-impl-4: roll the dataset back to a snapshot.
  *
  * Mechanism (9.7-impl-4, validate-then-swap): VALIDATE the snapshot's

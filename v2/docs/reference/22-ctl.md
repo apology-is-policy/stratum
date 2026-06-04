@@ -53,6 +53,8 @@ KIND_DATASET_HOLD_SNAPSHOT     /datasets/<id>/hold-snapshot      0200    admin-w
 KIND_DATASET_RELEASE_SNAPSHOT  /datasets/<id>/release-snapshot   0200    admin-write
 KIND_DATASET_MARK_SNAPSHOT_COMPROMISED   /datasets/<id>/mark-snapshot-compromised   0200  admin-write (TLY-A5)
 KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED /datasets/<id>/unmark-snapshot-compromised 0200  admin-write (TLY-A5)
+KIND_DATASET_INSTALL_DEK       /datasets/<id>/install-dek        0200    SYSTEM-write (TLY-A5b)
+KIND_DATASET_EVICT_DEK         /datasets/<id>/evict-dek          0200    SYSTEM-write (TLY-A5b)
 KIND_EVENTS                    /events                           0444    file (snapshot-at-Tlopen)
 KIND_ADMIN_DIR                 /admin/                           0500    admin-dir
 KIND_ADMIN_PEER                /admin/peer                       0400    admin-file
@@ -201,6 +203,53 @@ only. Default (`corvus_admin_uid == (uid_t)-1`) = no corvus principal;
 the mark verb collapses back to strict-admin (back-compat). Fails
 closed: an unset `caller_uid` never matches.
 
+### SYSTEM principal + DEK lifecycle (TLY-A5b)
+
+`install-dek` / `evict-dek` are the runtime DEK lifecycle for per-user
+encrypted home (Thylacine A-5b). After `stm_sync_open` soft-skips a
+corvus-sealed dataset (mounted present-but-LOCKED because no session
+token was held at mount), the long-lived coordinator installs the
+dataset's DEK when the owning user logs in and evicts it at logout.
+
+These two verbs are gated by a THIRD principal: `stm_ctl::system_uid`
+(set once via `stm_ctl_set_system_uid`, fed by stratumd's
+`--bake-owner-uid` -- the A-5b login coordinator runs as
+`PRINCIPAL_SYSTEM`, the same uid the host-bake stamps). `ctl_caller_is_system`
+admits ONLY that uid -- NOT admin, NOT root: the DEK lifecycle is the
+coordinator's job, orthogonal to operator admin. Default
+(`system_uid == (uid_t)-1`) fails closed (both verbs deny every caller).
+
+- **install-dek** body = the raw 33-byte corvus session token (binary;
+  NO whitespace trimming). The handler UNWRAPs the dataset's CURRENT
+  corvus keyslot over `stm_ctl::corvus_socket_path` (set via
+  `stm_ctl_set_corvus_socket`, fed by `--corvus-socket`) with that
+  token and installs the plaintext DEK -- `stm_fs_install_dek` ->
+  `stm_sync_install_dek` (idempotent, CORVUS-only, RAM-only, no commit).
+- **evict-dek** body = any non-empty trigger (content ignored). Removes
+  + zeroes the DEK -> `stm_fs_evict_dek` -> `stm_sync_evict_dek`.
+
+**F7 connection-binding.** A per-`stm_ctl` DEK lease table
+(`dek_leases[]`, guarded by `dek_mu`) records which `stm_ctl_conn`
+installed each dataset's runtime DEK:
+
+- install records the installing conn as the lease owner. A dataset
+  already leased to a DIFFERENT conn refuses with `STM_EACCES` BEFORE
+  any UNWRAP; the owning conn re-installing is an idempotent `STM_OK`.
+- evict is permitted only from the owning conn (else `STM_EACCES`). A
+  dataset with no lease is an idempotent no-op (`STM_OK`) -- so the verb
+  can never evict a mount-time DEK (a system / token-bearing-mount
+  dataset is never leased).
+- a conn DROP auto-evicts every DEK it installed (`stm_ctl_conn_destroy`,
+  under `dek_mu`, before the conn is freed) -- logout-by-disconnect.
+
+The login coordinator therefore holds ONE persistent ctl connection per
+session: install at login, evict at logout, both on the same conn; a
+crashed session's DEKs evict automatically. The UNWRAP runs under
+`dek_mu` (logins are console-serialized in v1.0; bounded by the corvus
+client's own connect/io timeouts). Lock order:
+`dek_mu` OUTER -> `stm_fs_*_dek` -> `fs->global`; `dek_mu` is never
+nested under `cn->mu`.
+
 ### Writable kinds discipline
 
 All writable kinds inherit:
@@ -225,6 +274,8 @@ Live writable kinds:
 | `KIND_DATASET_MARK_SNAPSHOT_COMPROMISED` | `<snap_id>` | stm_fs_mark_snapshot_compromised (TLY-A5; commits synchronously; admits the corvus principal — see above) |
 | `KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED` | `force <snap_id>` | stm_fs_unmark_snapshot_compromised (TLY-A5; `force` token required per Q15) |
 | `KIND_DATASET_ROLLBACK_SNAPSHOT` | `<snap_id>` or `force <snap_id>` | stm_fs_rollback_snapshot (TLY-A5-impl-2; strict-admin). The consultation gate refuses a `STM_SNAP_FLAG_ROLLBACK_COMPROMISED` snap with `STM_ECOMPROMISED` unless `force` is given (`snapshot.tla::RollbackBlockedIffCompromised`). The rollback *mechanism* is a Phase 9.7 stub → `STM_ENOTSUPPORTED` on a non-compromised / forced path. |
+| `KIND_DATASET_INSTALL_DEK` | 33-byte corvus session token (binary) | stm_fs_install_dek (TLY-A5b; SYSTEM-only; F7 connection-binding — see above) |
+| `KIND_DATASET_EVICT_DEK` | any non-empty trigger (ignored) | stm_fs_evict_dek (TLY-A5b; SYSTEM-only; owning-conn only; auto-evicted on conn drop) |
 
 Every successful admin write logs `result=ok` to /events via
 `stm_ctl_log_event`; every failed admin write logs
