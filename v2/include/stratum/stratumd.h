@@ -240,6 +240,16 @@ typedef struct stm_stratumd_opts {
     uid_t       bake_owner_uid;
     gid_t       bake_owner_gid;
 
+    /* TLY-A5b (#827): the /ctl SYSTEM-principal uid for the DEK-lifecycle
+     * verbs (provision-dek / install-dek / evict-dek). Set by --system-uid;
+     * forwarded to stm_ctl_set_system_uid. DECOUPLED from bake_owner_uid:
+     * the runtime A-5b coordinator runs as PRINCIPAL_SYSTEM and must gate
+     * the DEK verbs on it, but must NOT enable bake-owner (that would stamp
+     * every per-user home file SYSTEM-owned instead of honoring the per-user
+     * proxy's SO_PEERCRED -- breaking kernel rwx ownership). Default
+     * (uid_t)-1 -> ctl_caller_is_system fails closed (verbs unusable). */
+    uid_t       system_uid;
+
     /* TLY-A4: corvus SESSION_CLOSED notify consumer. When `corvus_user`
      * is non-NULL, stratumd spawns a consumer thread that subscribes
      * to `corvus_notify_socket` (default "/srv/corvus/notify") and

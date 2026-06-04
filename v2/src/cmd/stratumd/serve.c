@@ -1513,15 +1513,18 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
             (void)stm_ctl_set_corvus_admin_uid(ctl, opts->corvus_admin_uid);
 
         /* TLY-A5b: the SYSTEM principal + corvus socket for the DEK
-         * lifecycle verbs (install-dek / evict-dek). The A-5b login
-         * coordinator runs as PRINCIPAL_SYSTEM -- the same uid the
-         * host-bake stamps via --bake-owner-uid -- so reuse it as the
-         * system_uid (no separate flag). With bake_owner_uid unset
-         * ((uid_t)-1) the verbs fail closed. The corvus socket is the
-         * same --corvus-socket the mount-time UNWRAP uses (NULL when
-         * corvus is not configured -> install refuses). Same timing
-         * barrier as the gates above (set before the accept pthread). */
-        (void)stm_ctl_set_system_uid(ctl, opts->bake_owner_uid);
+         * lifecycle verbs (provision-dek / install-dek / evict-dek). The
+         * A-5b login coordinator runs as PRINCIPAL_SYSTEM and gates the
+         * verbs on it via --system-uid. DECOUPLED from --bake-owner-uid
+         * (#827): the runtime coordinator must NOT enable bake-owner --
+         * that would stamp every per-user home file SYSTEM-owned instead
+         * of honoring the per-user proxy's SO_PEERCRED, breaking kernel
+         * rwx ownership. With system_uid unset ((uid_t)-1) the verbs fail
+         * closed. The corvus socket is the same --corvus-socket the
+         * mount-time UNWRAP uses (NULL when corvus is not configured ->
+         * install refuses). Same timing barrier as the gates above (set
+         * before the accept pthread). */
+        (void)stm_ctl_set_system_uid(ctl, opts->system_uid);
         (void)stm_ctl_set_corvus_socket(ctl, opts->corvus_unwrap_socket,
                                           0, 0, 0);
 

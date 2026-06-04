@@ -197,6 +197,10 @@ static void usage(const char *argv0)
         "                           peer creds. Thylacine host-bake only (A-3);\n"
         "                           N <= 4294967294. Coordinator only; omit for\n"
         "                           normal peer-cred ownership stamping.\n"
+        "  --system-uid <N>         /ctl SYSTEM principal for the DEK-lifecycle\n"
+        "                           verbs (provision/install/evict-dek; A-5b).\n"
+        "                           Decoupled from --bake-owner-uid. N <= 4294967294;\n"
+        "                           omit -> verbs fail closed.\n"
         "  -h, --help               This message\n");
 }
 
@@ -255,6 +259,9 @@ int stm_cmd_stratumd_main(int argc, char **argv)
      * thing; --bake-owner-uid / --bake-owner-gid flip it on. */
     opts.bake_owner_uid = (uid_t)-1;
     opts.bake_owner_gid = (gid_t)-1;
+    /* TLY-A5b (#827): /ctl SYSTEM-principal uid; (uid_t)-1 -> fail-closed
+     * (DEK verbs unusable). Set by --system-uid, decoupled from bake-owner. */
+    opts.system_uid = (uid_t)-1;
 
     bool want_passphrase_stdin = false;
 
@@ -383,6 +390,32 @@ int stm_cmd_stratumd_main(int argc, char **argv)
             }
             opts.bake_owner_uid = (uid_t)v;
             opts.bake_owner_enabled = true;
+            continue;
+        }
+        if (!strcmp(a, "--system-uid") && i + 1 < argc) {
+            /* TLY-A5b (#827): the /ctl SYSTEM principal for the DEK
+             * verbs. Decoupled from --bake-owner-uid so the runtime
+             * coordinator can gate the verbs on PRINCIPAL_SYSTEM WITHOUT
+             * forcing every per-user home file SYSTEM-owned. */
+            const char *arg = argv[++i];
+            if (*arg < '0' || *arg > '9') {
+                fprintf(stderr,
+                    "stratumd: invalid --system-uid: %s "
+                    "(expected non-empty unsigned integer)\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            char *end = NULL;
+            unsigned long long v = strtoull(arg, &end, 10);
+            if (!end || *end != '\0'
+                || v > (unsigned long long)((uid_t)-2)) {
+                fprintf(stderr,
+                    "stratumd: invalid --system-uid: %s "
+                    "(must be <= 4294967294)\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            opts.system_uid = (uid_t)v;
             continue;
         }
         if (!strcmp(a, "--bake-owner-gid") && i + 1 < argc) {
