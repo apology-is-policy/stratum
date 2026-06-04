@@ -195,6 +195,7 @@ typedef enum {
     KIND_DATASET_ROLLBACK_SNAPSHOT           = 31, /* /datasets/<id>/rollback-snapshot — admin write (TLY-A5-impl-2) */
     KIND_DATASET_INSTALL_DEK                  = 32, /* /datasets/<id>/install-dek — SYSTEM write (TLY-A5b) */
     KIND_DATASET_EVICT_DEK                    = 33, /* /datasets/<id>/evict-dek — SYSTEM write (TLY-A5b) */
+    KIND_DATASETS_PROVISION_DEK               = 34, /* /datasets/provision-dek — SYSTEM write (TLY-A5b #826c); datasets-LEVEL (creates a dataset; not per-<id>) */
     KIND_MAX
 } ctl_kind;
 
@@ -245,6 +246,11 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
      * principal (NOT admin/root) -- see ctl_caller_is_system. */
     [KIND_DATASET_INSTALL_DEK] = { false, true, 0200, "install-dek" },
     [KIND_DATASET_EVICT_DEK]   = { false, true, 0200, "evict-dek"   },
+    /* TLY-A5b #826c: first-login home provisioning. datasets-LEVEL (a child
+     * of /datasets, NOT per-<id>): it CREATES the user's encrypted home
+     * dataset, so there is no id to address yet. SYSTEM-gated like the DEK
+     * verbs (vops_lopen routes admin_required -> ctl_caller_is_system). */
+    [KIND_DATASETS_PROVISION_DEK] = { false, true, 0200, "provision-dek" },
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_LP9_NAME_MAX
@@ -283,6 +289,7 @@ _Static_assert(sizeof("unmark-snapshot-compromised") - 1 <= STM_LP9_NAME_MAX, "/
 _Static_assert(sizeof("rollback-snapshot") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../rollback-snapshot literal");
 _Static_assert(sizeof("install-dek") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../install-dek literal");
 _Static_assert(sizeof("evict-dek") - 1   <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../evict-dek literal");
+_Static_assert(sizeof("provision-dek") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/provision-dek literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -293,7 +300,7 @@ _Static_assert(sizeof("evict-dek") - 1   <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 34,
+_Static_assert(KIND_MAX == 35,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -696,6 +703,95 @@ static stm_status ctl_dek_evict(stm_ctl_conn *cn, uint64_t dataset_id)
     }
     pthread_mutex_unlock(&c->dek_mu);
     return STM_OK;   /* no lease → idempotent no-op */
+}
+
+/* TLY-A5b #826c: first-login home provisioning. SYSTEM-only (gated at
+ * vops_lopen + re-checked by the caller). Creates `name`'s corvus-encrypted
+ * dataset under `parent` (the login coordinator's homes parent), WRAPs a
+ * fresh DEK to its CURRENT keyslot via corvus (the login-forwarded session
+ * token authorizes the WRAP for this user), inits the root inode user-owned
+ * 0700, and commits for durability. Idempotent: a returning user's name
+ * collides -> STM_EEXIST, which the caller maps to OK WITHOUT re-minting or
+ * re-WRAPping. NO dek_lease / NO conn-binding: provision writes the DURABLE
+ * on-disk keyslot, not the session-scoped RAM DEK map (install-dek's job,
+ * driven per login AFTER provision). The token in the payload is pointed at
+ * directly (valid for this synchronous call); no copy.
+ *
+ * Payload (binary, single Twrite; bounded by STM_CTL_BODY_MAX):
+ *   [0..3]  owner_uid (u32 LE)              -- the home owner; != (u32)-1
+ *   [4..7]  owner_gid (u32 LE)              -- != (u32)-1
+ *   [8]     name_len  (u8)                  -- 1..STM_DATASET_NAME_MAX
+ *   [9..]   name[name_len]                  -- no '/', NUL, or control byte
+ *   [..]    path_len  (u8)                  -- 1..STM_CORVUS_DATASET_MAX
+ *   [..]    corvus_path[path_len]           -- no control byte (UTF-8 ok)
+ *   [..]    token[STM_CORVUS_TOKEN_LEN]     -- corvus session token, verbatim
+ * The total length must match EXACTLY (trailing garbage rejected). The
+ * owner uid/gid are LOAD-BEARING: the home root is born user-owned 0700 so a
+ * second user cannot read it (the A-3 kernel rwx keys on owner). A SYSTEM
+ * coordinator passing an arbitrary owner is safe -- the token is corvus-
+ * owner-gated to the real user, so the WRAP only succeeds for that user;
+ * owner merely stamps the root inode. */
+static stm_status ctl_provision_dek(stm_ctl_conn *cn, uint64_t parent,
+                                      const uint8_t *body, uint32_t len)
+{
+    stm_ctl *c = cn->ctl;
+    if (!c->corvus_socket_set) return STM_EINVAL;   /* no WRAP socket */
+
+    if (len < 9u) return STM_EINVAL;                /* uid+gid+name_len */
+    uint32_t owner_uid = (uint32_t)body[0] | ((uint32_t)body[1] << 8)
+                       | ((uint32_t)body[2] << 16) | ((uint32_t)body[3] << 24);
+    uint32_t owner_gid = (uint32_t)body[4] | ((uint32_t)body[5] << 8)
+                       | ((uint32_t)body[6] << 16) | ((uint32_t)body[7] << 24);
+    if (owner_uid == (uint32_t)-1 || owner_gid == (uint32_t)-1)
+        return STM_EINVAL;                          /* unset sentinel */
+
+    uint32_t off = 8u;
+    uint8_t name_len = body[off++];
+    if (name_len == 0u || name_len > STM_DATASET_NAME_MAX) return STM_EINVAL;
+    /* Need name_len bytes + at least the path_len byte after them. */
+    if ((uint64_t)off + (uint64_t)name_len + 1u > (uint64_t)len)
+        return STM_EINVAL;
+    const uint8_t *name = body + off;
+    for (uint8_t i = 0; i < name_len; i++) {
+        uint8_t ch = name[i];
+        if (ch == '/' || ch == '\0' || ch < 0x20u || ch == 0x7Fu)
+            return STM_EINVAL;                       /* R99 line-injection */
+    }
+    off += name_len;
+
+    uint8_t path_len = body[off++];
+    if (path_len == 0u || path_len > STM_CORVUS_DATASET_MAX) return STM_EINVAL;
+    /* Exact: corvus_path + the 33-byte token close out the payload. */
+    if ((uint64_t)off + (uint64_t)path_len + STM_CORVUS_TOKEN_LEN
+            != (uint64_t)len)
+        return STM_EINVAL;
+    const uint8_t *path = body + off;
+    for (uint8_t i = 0; i < path_len; i++) {
+        uint8_t ch = path[i];
+        if (ch < 0x20u || ch == 0x7Fu) return STM_EINVAL;  /* R99; UTF-8 ok */
+    }
+    off += path_len;
+    const uint8_t *token = body + off;
+
+    /* NUL-terminate the name: stm_dataset_create_child takes a C string
+     * (length re-validated internally). */
+    char namebuf[STM_DATASET_NAME_MAX + 1u];
+    memcpy(namebuf, name, name_len);
+    namebuf[name_len] = '\0';
+
+    stm_corvus_mount_cfg cfg = {
+        .socket_path        = c->corvus_socket_path,
+        .session_token      = token,
+        .connect_timeout_ms = c->corvus_connect_timeout_ms,
+        .io_timeout_ms      = c->corvus_io_timeout_ms,
+        .n_retries          = c->corvus_n_retries,
+    };
+    uint64_t new_id = 0;
+    return stm_fs_provision_corvus_dataset(c->fs, parent, namebuf,
+                                             (const char *)path,
+                                             (size_t)path_len,
+                                             owner_uid, owner_gid,
+                                             &cfg, &new_id);
 }
 
 static ctl_session *session_get_locked(stm_ctl_conn *cn, uint32_t fid)
@@ -2093,6 +2189,7 @@ static stm_status materialize_locked(stm_ctl_conn *cn, ctl_session *s)
     case KIND_DATASET_ROLLBACK_SNAPSHOT:          /* write-only; no body */
     case KIND_DATASET_INSTALL_DEK:                /* write-only; no body */
     case KIND_DATASET_EVICT_DEK:                  /* write-only; no body */
+    case KIND_DATASETS_PROVISION_DEK:             /* write-only; no body */
     case KIND_MAX:
         break;
     }
@@ -2229,6 +2326,11 @@ static stm_status getattr_at(stm_ctl *c, uint64_t qid_path,
             name_len = (size_t)n;
         }
     }
+
+    /* TLY-A5b #826c: /datasets/provision-dek exists iff an fs is attached
+     * (the verb creates a dataset under it). datasets-LEVEL leaf -- no
+     * dataset_id to validate. meta->static_name already gave name/name_len. */
+    if (k == KIND_DATASETS_PROVISION_DEK && !c->fs) return STM_ENOENT;
 
     /* S5-PRE-C: KIND_DATASET_SNAPSHOT_INFO existence-check. Snap-id is
      * encoded in the qid's low 56 bits; the lookup confirms it's
@@ -2425,6 +2527,12 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
 
     case KIND_DATASETS_DIR: {
         if (!c->fs) return STM_ENOENT;
+        /* TLY-A5b #826c: the datasets-LEVEL provision verb (a fixed name,
+         * never a decimal id -- checked before parse_dataset_id, which
+         * would reject it anyway). */
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_DATASETS_PROVISION_DEK].static_name))
+            return walk_to_qid(c, qid_root(KIND_DATASETS_PROVISION_DEK), out);
         uint64_t dsid = 0;
         if (parse_dataset_id(name, name_len, &dsid) != 0) return STM_ENOENT;
         return walk_to_qid(c, qid_of(KIND_DATASET_DIR, 0, (uint32_t)dsid), out);
@@ -2571,6 +2679,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_ROLLBACK_SNAPSHOT:
     case KIND_DATASET_INSTALL_DEK:
     case KIND_DATASET_EVICT_DEK:
+    case KIND_DATASETS_PROVISION_DEK:
     case KIND_POOL_METRICS_PROMETHEUS:
     case KIND_DATASET_SNAPSHOT_INFO:  /* leaf; no children */
     case KIND_MAX:
@@ -2769,7 +2878,9 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
             if (erc == STM_ENOENT) continue;   /* destroyed mid-readdir */
             if (erc != STM_OK) return erc;
         }
-        return STM_OK;
+        /* TLY-A5b #826c: the datasets-LEVEL provision verb (mode 0200;
+         * visible in readdir per POSIX, gated to SYSTEM only at Tlopen). */
+        return emit_entry(c, &em, qid_root(KIND_DATASETS_PROVISION_DEK));
     }
 
     case KIND_DATASET_DIR: {
@@ -2921,6 +3032,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_ROLLBACK_SNAPSHOT:
     case KIND_DATASET_INSTALL_DEK:
     case KIND_DATASET_EVICT_DEK:
+    case KIND_DATASETS_PROVISION_DEK:
     case KIND_POOL_METRICS_PROMETHEUS:
     case KIND_DATASET_SNAPSHOT_INFO:  /* leaf — no readdir */
     case KIND_MAX:
@@ -2964,7 +3076,8 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
             || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED
             || k == KIND_DATASET_ROLLBACK_SNAPSHOT
             || k == KIND_DATASET_INSTALL_DEK
-            || k == KIND_DATASET_EVICT_DEK) {
+            || k == KIND_DATASET_EVICT_DEK
+            || k == KIND_DATASETS_PROVISION_DEK) {
         if (accmode != STM_LP9_O_WRONLY) return STM_EACCES;
     } else {
         if (accmode != STM_LP9_O_RDONLY) return STM_EACCES;
@@ -2985,7 +3098,8 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
         bool gate_ok;
         if (k == KIND_DATASET_MARK_SNAPSHOT_COMPROMISED)
             gate_ok = ctl_caller_may_mark_compromised(cn);
-        else if (k == KIND_DATASET_INSTALL_DEK || k == KIND_DATASET_EVICT_DEK)
+        else if (k == KIND_DATASET_INSTALL_DEK || k == KIND_DATASET_EVICT_DEK
+                     || k == KIND_DATASETS_PROVISION_DEK)
             gate_ok = ctl_caller_is_system(cn);
         else
             gate_ok = ctl_caller_is_admin(cn);
@@ -3051,6 +3165,11 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
         stm_status drc = stm_fs_dataset_lookup(c->fs, dsid, &tmp);
         if (drc != STM_OK) return drc;
     }
+    /* TLY-A5b #826c: provision-dek is datasets-LEVEL -- it CREATES a
+     * dataset, so there is NO dataset_id to look up; just require an
+     * attached fs. (Kept out of the per-dataset block above whose
+     * stm_fs_dataset_lookup(dsid=0) would spuriously hit the pool root.) */
+    if (k == KIND_DATASETS_PROVISION_DEK && !c->fs) return STM_ENOENT;
     /* /pools/<uuid>/scrub + /pools/<uuid>/scrub-trigger both require
      * pool + scrub attached. The dual-gate mirrors getattr_at — without
      * scrub, the file doesn't exist (consistent operator semantics). */
@@ -3114,7 +3233,8 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
             || k == KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED
             || k == KIND_DATASET_ROLLBACK_SNAPSHOT
             || k == KIND_DATASET_INSTALL_DEK
-            || k == KIND_DATASET_EVICT_DEK) {
+            || k == KIND_DATASET_EVICT_DEK
+            || k == KIND_DATASETS_PROVISION_DEK) {
         pthread_mutex_lock(&cn->mu);
         ctl_session *s = session_alloc_locked(cn, fid, qid_path);
         if (!s) {
@@ -3854,6 +3974,37 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         }
         stm_ctl_log_event(c, "%s uid=%u dataset=%llu result=%s%s",
             verb, (unsigned)cn->caller_uid, (unsigned long long)dsid,
+            rc == STM_OK ? "" : "err:", status_short_name(rc));
+        if (rc != STM_OK) return rc;
+        *out_written = len;
+        return STM_OK;
+    }
+
+    /* TLY-A5b #826c: KIND_DATASETS_PROVISION_DEK -- first-login home
+     * provisioning. datasets-LEVEL (no dataset_id; the verb CREATES one).
+     * SYSTEM-only; the structured payload carries owner uid/gid + name +
+     * corvus-path + the session token (parsed + bounded in ctl_provision_dek).
+     * Parent is the pool root (ds=1) for v1.0 -- login's homes live directly
+     * under it; a homes-subtree parent is a future payload-field add. */
+    if (k == KIND_DATASETS_PROVISION_DEK) {
+        if (!ctl_caller_is_system(cn)) return STM_EACCES;  /* defense-in-depth */
+        if (!c->fs) return STM_EBACKEND;                   /* gated at vops_lopen */
+        pthread_mutex_lock(&cn->mu);
+        ctl_session *s = session_get_locked(cn, fid);
+        if (!s || s->qid_path != qid_path) {
+            pthread_mutex_unlock(&cn->mu);
+            return STM_EBACKEND;
+        }
+        pthread_mutex_unlock(&cn->mu);
+
+        stm_status rc = ctl_provision_dek(cn, /*parent=*/1u, buf, len);
+        /* Idempotent: a returning user's home already exists -> create_child
+         * collides STM_EEXIST. Map to OK -- the coordinator's contract is
+         * "the home exists + is keyed," which a collision already satisfies;
+         * it never re-mints/re-WRAPs the existing DEK. */
+        if (rc == STM_EEXIST) rc = STM_OK;
+        stm_ctl_log_event(c, "provision-dek uid=%u result=%s%s",
+            (unsigned)cn->caller_uid,
             rc == STM_OK ? "" : "err:", status_short_name(rc));
         if (rc != STM_OK) return rc;
         *out_written = len;

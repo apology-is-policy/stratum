@@ -7040,6 +7040,65 @@ stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
     return STM_OK;
 }
 
+/*
+ * TLY-A5b #826c: first-login home provisioning -- the runtime composition the
+ * login coordinator's /ctl provision-dek verb drives. Mints `name`'s corvus-
+ * encrypted dataset under `parent_id`, inits its root inode user-owned 0700
+ * (F1 isolation), and commits for durability:
+ *   1. stm_fs_create_dataset_corvus -- create the child + mint a fresh DEK +
+ *      corvus WRAP -> CURRENT keyslot (rolls the child back on a WRAP fail).
+ *   2. stm_fs_init_dataset_root(0700, owner) -- born user-owned so a second
+ *      user cannot read this home (the A-3 kernel rwx keys on owner).
+ *   3. stm_fs_commit -- the running coordinator has no unmount to ride, so it
+ *      commits explicitly; a minted keyslot lost to a crash = the home DEK
+ *      gone.
+ *
+ * Idempotency is the CALLER's concern: a returning user's name collides at
+ * step 1 with STM_EEXIST (out_id unset), which the /ctl handler maps to OK
+ * WITHOUT re-minting -- so this never re-WRAPs an existing home's DEK.
+ *
+ * Failure handling: an init_dataset_root failure (step 2) is ENOMEM/ECORRUPT
+ * only (catastrophic + rare on a fresh dataset) -- we return WITHOUT
+ * committing, so the keyed-but-rootless dataset stays in-RAM-only and a
+ * coordinator restart re-mounts a clean pool (the provision never landed). If
+ * an intervening successful provision commits first, the rootless leftover
+ * persists; a later retry's EEXIST (mapped to OK) then leaves it rootless and
+ * login's Tattach to ino=1 fails closed -- no corruption, no mis-attributed
+ * home; the user simply cannot log in until re-provisioned. The fully-atomic
+ * single-transaction create+key+root with rollback is a v1.x lift.
+ */
+stm_status stm_fs_provision_corvus_dataset(stm_fs *fs, uint64_t parent_id,
+                                              const char *name,
+                                              const char *corvus_dataset_path,
+                                              size_t corvus_dataset_path_len,
+                                              uint32_t owner_uid,
+                                              uint32_t owner_gid,
+                                              const stm_corvus_mount_cfg *corvus,
+                                              uint64_t *out_id)
+{
+    if (!fs || !out_id) return STM_EINVAL;
+    *out_id = 0;
+
+    uint64_t new_id = 0;
+    stm_status s = stm_fs_create_dataset_corvus(fs, parent_id, name,
+                                                  corvus_dataset_path,
+                                                  corvus_dataset_path_len,
+                                                  corvus, &new_id);
+    if (s != STM_OK) return s;   /* EEXIST (caller maps to OK) OR a real
+                                  * failure already rolled back inside. */
+
+    uint64_t root_ino = 0;
+    s = stm_fs_init_dataset_root(fs, new_id, 0700u, owner_uid, owner_gid,
+                                   &root_ino);
+    if (s != STM_OK) return s;   /* rootless; uncommitted -> not durable. */
+
+    s = stm_fs_commit(fs);
+    if (s != STM_OK) return s;
+
+    *out_id = new_id;
+    return STM_OK;
+}
+
 /* ========================================================================= */
 /* Clones (9.7-impl-6e).                                                      */
 /* ========================================================================= */

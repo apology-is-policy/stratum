@@ -1413,6 +1413,35 @@ stm_status stm_fs_create_dataset_corvus(stm_fs *fs, uint64_t parent_id,
                                            uint64_t *out_id);
 
 /*
+ * TLY-A5b #826c: first-login home provisioning. Composes
+ * stm_fs_create_dataset_corvus (create child + mint DEK + corvus WRAP) +
+ * stm_fs_init_dataset_root(mode 0700, owner_uid/owner_gid) + stm_fs_commit,
+ * so the login coordinator's /ctl provision-dek verb mints a user's
+ * encrypted home in one durable step. The root inode is born user-owned
+ * 0700 (F1 isolation: a second user must not read this home -- the A-3
+ * kernel rwx keys on owner).
+ *
+ * Returns STM_OK with `*out_id` set to the new dataset id. STM_EINVAL on
+ * NULL fs / out_id (the rest are checked by stm_fs_create_dataset_corvus).
+ * STM_EEXIST when `name` collides with an existing sibling -- the caller
+ * treats this as the idempotent returning-user case (the home is already
+ * provisioned; never re-minted). Other errors propagate from the three
+ * composed steps; on an init_dataset_root failure the function returns
+ * WITHOUT committing (the keyed-but-rootless dataset is in-RAM-only; see the
+ * fs.c header for the crash-recovery semantics). The corvus session token is
+ * supplied via `corvus->session_token`.
+ */
+STM_MUST_USE
+stm_status stm_fs_provision_corvus_dataset(stm_fs *fs, uint64_t parent_id,
+                                              const char *name,
+                                              const char *corvus_dataset_path,
+                                              size_t corvus_dataset_path_len,
+                                              uint32_t owner_uid,
+                                              uint32_t owner_gid,
+                                              const stm_corvus_mount_cfg *corvus,
+                                              uint64_t *out_id);
+
+/*
  * 9.7-impl-6e: create a clone — a new dataset that originates from a
  * PRESENT snapshot. Composes `stm_dataset_create_clone` (mints the
  * clone's id, stamps `origin_snap_id`) + `stm_snapshot_hold` (keeps

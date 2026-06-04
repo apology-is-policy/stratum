@@ -55,6 +55,7 @@ KIND_DATASET_MARK_SNAPSHOT_COMPROMISED   /datasets/<id>/mark-snapshot-compromise
 KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED /datasets/<id>/unmark-snapshot-compromised 0200  admin-write (TLY-A5)
 KIND_DATASET_INSTALL_DEK       /datasets/<id>/install-dek        0200    SYSTEM-write (TLY-A5b)
 KIND_DATASET_EVICT_DEK         /datasets/<id>/evict-dek          0200    SYSTEM-write (TLY-A5b)
+KIND_DATASETS_PROVISION_DEK    /datasets/provision-dek           0200    SYSTEM-write (TLY-A5b #826c; datasets-LEVEL)
 KIND_EVENTS                    /events                           0444    file (snapshot-at-Tlopen)
 KIND_ADMIN_DIR                 /admin/                           0500    admin-dir
 KIND_ADMIN_PEER                /admin/peer                       0400    admin-file
@@ -250,6 +251,44 @@ client's own connect/io timeouts). Lock order:
 `dek_mu` OUTER -> `stm_fs_*_dek` -> `fs->global`; `dek_mu` is never
 nested under `cn->mu`.
 
+**`provision-dek` (TLY-A5b #826c) — first-login home creation.** A THIRD
+SYSTEM verb, but at the **`/datasets` LEVEL** (`KIND_DATASETS_PROVISION_DEK`,
+a fixed-name child of `/datasets`, NOT per-`<id>`) because it *creates* the
+dataset -- there is no id to address yet. Same SYSTEM gate
+(`ctl_caller_is_system`); same write-only 0200; reachable at walk +
+readdir of `/datasets` when an fs is attached. Body is a structured binary
+payload (parsed + bounded in `ctl_provision_dek`):
+
+```
+owner_uid (u32 LE)  owner_gid (u32 LE)  name_len (u8)  name[name_len]
+path_len (u8)  corvus_path[path_len]  token[STM_CORVUS_TOKEN_LEN=33]
+```
+
+The handler builds an `stm_corvus_mount_cfg{socket = the ctl's stored
+corvus socket, session_token = the payload token}` and calls
+`stm_fs_provision_corvus_dataset` (parent = pool root ds=1): create the
+child + mint a fresh DEK + corvus WRAP -> CURRENT keyslot, init the root
+inode user-owned **0700** (F1 isolation -- a second user must not read this
+home, since the A-3 kernel rwx keys on owner), then `stm_fs_commit` for
+durability. The `owner_uid`/`owner_gid` are LOAD-BEARING and login-supplied;
+a SYSTEM coordinator passing an arbitrary owner is safe because the token is
+corvus-owner-gated to the real user (the WRAP only succeeds for that user) --
+`owner` merely stamps the root inode.
+
+**Idempotent** (the returning-user case): a name collision returns
+`STM_EEXIST` from `stm_dataset_create_child` BEFORE the WRAP, and the
+handler maps it to `STM_OK` -- so a 2nd login never re-mints or re-WRAPs the
+existing home's DEK. Unlike install/evict, provision has **no `dek_lease` /
+no conn-binding**: it writes the DURABLE on-disk keyslot, not the
+session-scoped RAM DEK map (that is install-dek's job, driven per login
+AFTER provision). v1.0 residual: an `init_dataset_root` failure
+(ENOMEM/ECORRUPT only, ~unreachable on a fresh dataset) returns without
+committing -> the keyed-but-rootless dataset is RAM-only and heals on
+coordinator restart; if persisted by an intervening commit, a retry's
+EEXIST->OK leaves it rootless and login's Tattach to ino=1 fails closed (no
+corruption, no mis-attributed home). The fully-atomic
+create+key+root+rollback single transaction is a v1.x lift.
+
 ### Writable kinds discipline
 
 All writable kinds inherit:
@@ -276,6 +315,7 @@ Live writable kinds:
 | `KIND_DATASET_ROLLBACK_SNAPSHOT` | `<snap_id>` or `force <snap_id>` | stm_fs_rollback_snapshot (TLY-A5-impl-2; strict-admin). The consultation gate refuses a `STM_SNAP_FLAG_ROLLBACK_COMPROMISED` snap with `STM_ECOMPROMISED` unless `force` is given (`snapshot.tla::RollbackBlockedIffCompromised`). The rollback *mechanism* is a Phase 9.7 stub → `STM_ENOTSUPPORTED` on a non-compromised / forced path. |
 | `KIND_DATASET_INSTALL_DEK` | 33-byte corvus session token (binary) | stm_fs_install_dek (TLY-A5b; SYSTEM-only; F7 connection-binding — see above) |
 | `KIND_DATASET_EVICT_DEK` | any non-empty trigger (ignored) | stm_fs_evict_dek (TLY-A5b; SYSTEM-only; owning-conn only; auto-evicted on conn drop) |
+| `KIND_DATASETS_PROVISION_DEK` | `owner_uid,owner_gid,name,corvus_path,token` (binary) | stm_fs_provision_corvus_dataset (TLY-A5b #826c; SYSTEM-only; datasets-LEVEL; creates the user's encrypted home 0700; idempotent EEXIST->OK; no conn-binding) |
 
 Every successful admin write logs `result=ok` to /events via
 `stm_ctl_log_event`; every failed admin write logs
@@ -441,6 +481,12 @@ Three buggy configs (`ctl_conn_shared_caller_buggy.cfg`,
 - `tests/test_ctl_conn_lifecycle.c` — 6 tests on the refcount
   discipline: destroy-blocks-on-cv, N short conns, NULL safety,
   caller_uid accessor.
+- `tests/test_corvus_provision.c` — the SYSTEM-gated DEK lifecycle over
+  the ctl vops: `dek_install_evict_via_ctl` + `dek_ctl_authz` (install /
+  evict / F7 connection-binding / cross-conn refusal) and
+  `provision_via_ctl` (TLY-A5b #826c: SYSTEM provisions a user's
+  encrypted home -- create + corvus WRAP + root-init 0700 + commit;
+  non-SYSTEM EACCES; truncated payload EINVAL; idempotent EEXIST->OK).
 - `v2/tools/stratum/tests/concurrent_ctl.rs` — e2e Rust harness
   driving 2-way + 3-way concurrent libstratum-9p clients;
   wall-time-bounds the concurrent-accept payoff.
@@ -449,7 +495,9 @@ Three buggy configs (`ctl_conn_shared_caller_buggy.cfg`,
 
 | Feature | State | Notes |
 |---|---|---|
-| Kind table (29 kinds) | LIVE | KIND_MAX = 29 |
+| Kind table (35 kinds) | LIVE | KIND_MAX = 35 |
+| /datasets/<id>/{install,evict}-dek (TLY-A5b) | LIVE | SYSTEM-gated runtime DEK lifecycle; F7 connection-binding |
+| /datasets/provision-dek (TLY-A5b #826c) | LIVE | SYSTEM-gated first-login home creation; datasets-LEVEL; idempotent |
 | Admin gate (P9-CTL-1d-uid) | LIVE | Immutable per-conn caller_uid |
 | /events + /admin/clear-events (P9-CTL-1d-events) | LIVE | 8 MiB cap; gen-bump invalidation |
 | /pools/<uuid>/scrub + scrub-trigger (1d-scrub) | LIVE | start/pause/resume/abort |

@@ -20,7 +20,9 @@
 
 #include <stratum/corvus_client.h>
 #include <stratum/ctl.h>
+#include <stratum/dataset.h>
 #include <stratum/fs.h>
+#include <stratum/inode.h>
 #include <stratum/lp9.h>
 #include <stratum/stratumd.h>
 #include <stratum/sync.h>
@@ -555,6 +557,148 @@ STM_TEST(dek_ctl_authz) {
     stm_ctl_conn_destroy(other);
     stm_ctl_conn_destroy(sysA);
     stm_ctl_conn_destroy(sysB);
+    stm_ctl_destroy(ctl);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fake_corvus_stop(&fc);
+    (void)unlink(token_path);
+    (void)unlink(g_tmp_path);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* TLY-A5b #826c: the datasets-LEVEL provision-dek control surface, driven  */
+/* directly through the ctl vops. Mints a user's encrypted home at runtime  */
+/* (create + corvus WRAP + root-init 0700 + commit), idempotent, SYSTEM-    */
+/* gated. The first-login coordinator path -- login drives this, then       */
+/* install-dek per session.                                                 */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Serialize a provision-dek payload into `out` (>= 9+namelen+pathlen+33).
+ * Layout: owner_uid(LE32) owner_gid(LE32) name_len(u8) name path_len(u8)
+ * path token[33]. Returns the encoded length. */
+static uint32_t build_provision_payload(uint8_t *out,
+                                          uint32_t owner_uid, uint32_t owner_gid,
+                                          const char *name, const char *path,
+                                          const uint8_t *token)
+{
+    uint32_t n = 0;
+    out[n++] = (uint8_t)(owner_uid & 0xFFu);
+    out[n++] = (uint8_t)((owner_uid >> 8) & 0xFFu);
+    out[n++] = (uint8_t)((owner_uid >> 16) & 0xFFu);
+    out[n++] = (uint8_t)((owner_uid >> 24) & 0xFFu);
+    out[n++] = (uint8_t)(owner_gid & 0xFFu);
+    out[n++] = (uint8_t)((owner_gid >> 8) & 0xFFu);
+    out[n++] = (uint8_t)((owner_gid >> 16) & 0xFFu);
+    out[n++] = (uint8_t)((owner_gid >> 24) & 0xFFu);
+    size_t nl = strlen(name);
+    out[n++] = (uint8_t)nl;
+    memcpy(out + n, name, nl); n += (uint32_t)nl;
+    size_t pl = strlen(path);
+    out[n++] = (uint8_t)pl;
+    memcpy(out + n, path, pl); n += (uint32_t)pl;
+    memcpy(out + n, token, STM_CORVUS_TOKEN_LEN);
+    n += STM_CORVUS_TOKEN_LEN;
+    return n;
+}
+
+/* Walk /datasets/provision-dek + Tlopen(WRONLY) + Twrite(payload). Returns
+ * the lopen rc if it fails (the SYSTEM gate), else the write rc. */
+static stm_status ctl_drive_provision(const stm_lp9_vops *v, stm_ctl_conn *cn,
+                                        uint64_t root, const uint8_t *payload,
+                                        uint32_t plen, uint32_t fid)
+{
+    stm_lp9_qid q;
+    STM_ASSERT_OK(v->walk(cn, root, "datasets", 8, &q));
+    STM_ASSERT_OK(v->walk(cn, q.path, "provision-dek",
+                            strlen("provision-dek"), &q));
+    stm_status rc = v->lopen(cn, fid, q.path, STM_LP9_O_WRONLY);
+    if (rc != STM_OK) return rc;
+    uint32_t written = 0;
+    rc = v->write(cn, fid, q.path, 0, payload, plen, &written);
+    v->clunk(cn, fid, q.path);
+    return rc;
+}
+
+STM_TEST(provision_via_ctl) {
+    make_tmp("provctl");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    char token_path[256];
+    write_token_file(token_path, sizeof token_path, "provctl");
+
+    fake_corvus fc;
+    fake_corvus_start(&fc, "provctl", STM_CORVUS_STATUS_OK);
+
+    /* A fresh pool has only LEGACY slots -> mounts with no corvus. The
+     * runtime coordinator then provisions the user's home over /ctl. */
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_sync *sync = stm_fs_sync(fs);
+
+    stm_ctl *ctl = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &ctl));
+    STM_ASSERT_OK(stm_ctl_set_system_uid(ctl, SYS_UID));
+    STM_ASSERT_OK(stm_ctl_set_corvus_socket(ctl, fc.sock_path, 0, 0, 0));
+    uint64_t root = stm_ctl_root(ctl);
+    const stm_lp9_vops *v = stm_ctl_vops();
+
+    uint8_t payload[600];
+    uint32_t plen = build_provision_payload(payload, OTHER_UID, OTHER_GID,
+                                              "alice", "users/alice",
+                                              TEST_TOKEN);
+
+    /* (1) A non-SYSTEM caller is refused at Tlopen (walk still succeeds). */
+    stm_ctl_conn *other = NULL;
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, OTHER_UID, OTHER_GID, &other));
+    {
+        stm_lp9_qid q;
+        STM_ASSERT_OK(v->walk(other, root, "datasets", 8, &q));
+        STM_ASSERT_OK(v->walk(other, q.path, "provision-dek",
+                                strlen("provision-dek"), &q));
+        STM_ASSERT_ERR(v->lopen(other, 1u, q.path, STM_LP9_O_WRONLY),
+                         STM_EACCES);
+    }
+
+    stm_ctl_conn *sys = NULL;
+    STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &sys));
+
+    /* (2) A truncated payload is refused with EINVAL; nothing is created. */
+    STM_ASSERT_ERR(ctl_drive_provision(v, sys, root, payload, 8u, 2u),
+                     STM_EINVAL);
+    {
+        stm_dataset_entry e;
+        STM_ASSERT_ERR(stm_fs_dataset_lookup(fs, 2u, &e), STM_ENOENT);
+    }
+
+    /* (3) SYSTEM provisions alice (the first child -> ds=2). */
+    STM_ASSERT_OK(ctl_drive_provision(v, sys, root, payload, plen, 3u));
+
+    /* The dataset exists, its CURRENT corvus keyslot resolved (the WRAP
+     * installs the minted DEK into the live map), and its root inode is
+     * born user-owned 0700 (the F1 isolation property). */
+    {
+        stm_dataset_entry e;
+        STM_ASSERT_OK(stm_fs_dataset_lookup(fs, 2u, &e));
+        uint8_t dek[32];
+        STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+        struct stm_inode_value iv;
+        STM_ASSERT_OK(stm_fs_stat(fs, 2u, 1u, &iv));
+        STM_ASSERT_EQ(stm_load_le32(iv.si_uid), (uint32_t)OTHER_UID);
+        STM_ASSERT_EQ(stm_load_le32(iv.si_gid), (uint32_t)OTHER_GID);
+        STM_ASSERT_EQ(stm_load_le32(iv.si_mode) & 0777u, 0700u);
+    }
+
+    /* (4) Idempotent: a returning user re-provisions -> name collision maps
+     *     to OK; no NEW dataset (ds=3 must not exist) and the DEK is
+     *     unchanged (never re-minted). */
+    STM_ASSERT_OK(ctl_drive_provision(v, sys, root, payload, plen, 4u));
+    {
+        stm_dataset_entry e;
+        STM_ASSERT_ERR(stm_fs_dataset_lookup(fs, 3u, &e), STM_ENOENT);
+    }
+
+    stm_ctl_conn_destroy(other);
+    stm_ctl_conn_destroy(sys);
     stm_ctl_destroy(ctl);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     fake_corvus_stop(&fc);
