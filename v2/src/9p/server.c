@@ -1053,7 +1053,11 @@ static stm_status h_attach(stm_9p_server *s,
          * bind the connection root to THAT dataset's root inode (ino==1). The
          * root-inode stat reads the child dataset -- which requires its DEK be
          * installed, so an un-provisioned / locked home attach fails here (the
-         * third access gate). */
+         * third access gate). The lookup + the stat are separate locked steps
+         * (not one critical section); a concurrent destroy of child_ds in the
+         * window only makes the stat fail -> clean attach abort. Dataset ids are
+         * monotonic + never reused, so the resolved child_ds can never alias a
+         * different dataset created later -- no id-confusion (#828 B-F2). */
         uint64_t child_ds = 0;
         stm_status rc = stm_fs_lookup_child_dataset(s->fs, s->root_dataset,
                                                       aname + 3, (size_t)(alen - 3u),

@@ -278,10 +278,14 @@ corvus-owner-gated to the real user (the WRAP only succeeds for that user) --
 **Idempotent** (the returning-user case): a name collision returns
 `STM_EEXIST` from `stm_dataset_create_child` BEFORE the WRAP, and the
 handler maps it to `STM_OK` -- so a 2nd login never re-mints or re-WRAPs the
-existing home's DEK. Unlike install/evict, provision has **no `dek_lease` /
-no conn-binding**: it writes the DURABLE on-disk keyslot, not the
-session-scoped RAM DEK map (that is install-dek's job, driven per login
-AFTER provision). v1.0 residual: an `init_dataset_root` failure
+existing home's DEK. provision writes the DURABLE on-disk keyslot AND installs
+the minted DEK into the session RAM map (init_dataset_root needs it to encrypt
+the root inode); it records a **conn-bound `dek_lease`** for that DEK (#828
+A-F2) so conn-destroy auto-evicts it on any login exit -- closing the window
+where a provision NOT followed by a successful install-dek (the install fails,
+or login exits/crashes before it) would leave the cleartext DEK resident until
+unmount. The per-login install-dek that follows finds the lease (owner==cn) ->
+idempotent OK. v1.0 residual: an `init_dataset_root` failure
 (ENOMEM/ECORRUPT only, ~unreachable on a fresh dataset) returns without
 committing -> the keyed-but-rootless dataset is RAM-only and heals on
 coordinator restart; if persisted by an intervening commit, a retry's

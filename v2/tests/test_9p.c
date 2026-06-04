@@ -2912,6 +2912,36 @@ STM_TEST(p9_attach_aname_ds_unknown_returns_enoent) {
     unlink(g_key_path);
 }
 
+STM_TEST(p9_attach_aname_ds_empty_name_returns_einval) {
+    /* #828 B-F3: aname = "ds:" (alen==3, empty child name) must be rejected at
+     * the dispatch -- the ANAME_DATASET guard is `alen >= 4`, so "ds:" falls
+     * through to EINVAL. Proves there is no empty-name path (and no `alen - 3`
+     * underflow) into the child-dataset resolver. */
+    make_tmp("9p_aname_ds_empty");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tversion(req, STM_9P_MSIZE_DEFAULT, "9P2000.L");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tattach_with_aname(req, 1, 100, "ds:");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(p9_attach_aname_spec_seeds_bindings) {
     /* aname = "spec:/sub=/alias" — bind /alias → /sub at attach time;
      * subsequent Twalk("alias") routes to sub_ino. */

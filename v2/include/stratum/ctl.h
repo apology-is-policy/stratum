@@ -83,6 +83,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>       /* bool (stm_ctl_system_uid_configured) */
 #include <sys/types.h>     /* uid_t, gid_t */
 
 #ifdef __cplusplus
@@ -371,6 +372,15 @@ stm_status stm_ctl_set_corvus_admin_uid(stm_ctl *c, uid_t corvus_admin_uid);
  */
 STM_MUST_USE
 stm_status stm_ctl_set_system_uid(stm_ctl *c, uid_t system_uid);
+
+/*
+ * True iff a SYSTEM principal has been configured (stm_ctl_set_system_uid with
+ * a value != (uid_t)-1). The /ctl accept loop refuses an unauthenticated peer
+ * UNCONDITIONALLY when this holds -- the A-5b DEK lifecycle verbs (provision/
+ * install/evict-dek) are too sensitive to admit a peer-creds-failure caller as
+ * the daemon uid even under allow_unauthenticated_peer (#828 A-F4).
+ */
+bool stm_ctl_system_uid_configured(const stm_ctl *c);
 STM_MUST_USE
 stm_status stm_ctl_set_corvus_socket(stm_ctl *c, const char *socket,
                                        uint32_t connect_timeout_ms,

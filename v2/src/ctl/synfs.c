@@ -712,9 +712,11 @@ static stm_status ctl_dek_evict(stm_ctl_conn *cn, uint64_t dataset_id)
  * token authorizes the WRAP for this user), inits the root inode user-owned
  * 0700, and commits for durability. Idempotent: a returning user's name
  * collides -> STM_EEXIST, which the caller maps to OK WITHOUT re-minting or
- * re-WRAPping. NO dek_lease / NO conn-binding: provision writes the DURABLE
- * on-disk keyslot, not the session-scoped RAM DEK map (install-dek's job,
- * driven per login AFTER provision). The token in the payload is pointed at
+ * re-WRAPping. The mint installs the DEK into the live map (init_dataset_root
+ * needs it to encrypt the root inode) and provision records a conn-bound lease
+ * for it (#828 A-F2) so conn-destroy auto-evicts the DEK if no successful
+ * install-dek follows; the per-login install-dek then finds that lease
+ * (owner==cn) -> idempotent OK. The token in the payload is pointed at
  * directly (valid for this synchronous call); no copy.
  *
  * Payload (binary, single Twrite; bounded by STM_CTL_BODY_MAX):
@@ -787,11 +789,34 @@ static stm_status ctl_provision_dek(stm_ctl_conn *cn, uint64_t parent,
         .n_retries          = c->corvus_n_retries,
     };
     uint64_t new_id = 0;
-    return stm_fs_provision_corvus_dataset(c->fs, parent, namebuf,
-                                             (const char *)path,
-                                             (size_t)path_len,
-                                             owner_uid, owner_gid,
-                                             &cfg, &new_id);
+    stm_status rc = stm_fs_provision_corvus_dataset(c->fs, parent, namebuf,
+                                                      (const char *)path,
+                                                      (size_t)path_len,
+                                                      owner_uid, owner_gid,
+                                                      &cfg, &new_id);
+    /* #828 A-F2: the mint installs the DEK into the live map (init_dataset_root
+     * needs it to encrypt the root inode), so record a conn-bound lease for it.
+     * Without the lease, a provision NOT followed by a successful install-dek
+     * (the install fails, or login exits/crashes before it) would leave the
+     * cleartext DEK resident until the coordinator unmounts -- conn-destroy's
+     * auto-evict only fires for LEASED datasets. With the lease, conn-destroy
+     * evicts the DEK when this /ctl connection drops (crash-safe); the per-login
+     * install-dek that follows finds the lease (owner==cn) -> idempotent OK. A
+     * full lease table degrades to the same ENOSPC the install path handles
+     * (the DEK stays installed, unleased -- the pre-A-F2 behavior). */
+    if (rc == STM_OK) {
+        pthread_mutex_lock(&c->dek_mu);
+        for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
+            if (!c->dek_leases[i].active) {
+                c->dek_leases[i].active     = true;
+                c->dek_leases[i].dataset_id = new_id;
+                c->dek_leases[i].owner      = cn;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&c->dek_mu);
+    }
+    return rc;
 }
 
 static ctl_session *session_get_locked(stm_ctl_conn *cn, uint32_t fid)
@@ -4377,6 +4402,11 @@ stm_status stm_ctl_set_system_uid(stm_ctl *c, uid_t system_uid)
     if (!c) return STM_EINVAL;
     c->system_uid = system_uid;
     return STM_OK;
+}
+
+bool stm_ctl_system_uid_configured(const stm_ctl *c)
+{
+    return c && c->system_uid != (uid_t)-1;
 }
 
 stm_status stm_ctl_set_corvus_socket(stm_ctl *c, const char *socket,

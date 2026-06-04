@@ -1023,9 +1023,13 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
         gid_t peer_gid = (gid_t)-1;
         int   pc_rc    = peer_creds(client_fd, &peer_uid, &peer_gid);
         if (pc_rc != 0) {
-            /* R95 P2-2 carry — refuse on peer-credential failure
-             * unless the caller opted in. */
-            if (!allow_unauthenticated_peer) {
+            /* R95 P2-2 carry -- refuse on peer-credential failure unless the
+             * caller opted in. #828 A-F4: when a SYSTEM principal is configured,
+             * the DEK lifecycle verbs make this loop too sensitive to admit a
+             * creds-failure peer as the daemon uid -- refuse unconditionally,
+             * mirroring the FS loop's policy-active hardening. */
+            if (!allow_unauthenticated_peer
+                    || stm_ctl_system_uid_configured(ctl)) {
                 fprintf(stderr,
                     "stratumd: refusing /ctl/ connection: "
                     "peer credentials unavailable (errno=%d); "
