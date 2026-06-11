@@ -223,6 +223,7 @@ typedef struct {
 
     /* avail.idx counter. Monotonic across all requests; invariant B-4. */
     uint16_t         avail_idx;
+    bool             failed;      /* latched on any do_request error (R4-F1) */
 } thyla_bdev;
 
 /* ------------------------------------------------------------------------- */
@@ -456,6 +457,14 @@ static void init_descriptors(uint64_t ring_va, uint64_t ring_pa, uint64_t data_p
 static stm_status do_request(thyla_bdev *d, uint64_t lba,
                               uint32_t sector_count, bool is_write)
 {
+    /* R4-F1: once any request has failed, the avail/used ring state is
+     * uncertain (the device may have consumed a published avail.idx whose
+     * completion we never matched). Refuse all further I/O so Stratum tears
+     * down + re-opens (re-init resets avail_idx) rather than re-publishing a
+     * stale idx (-> the device sees no new buffer -> hang) or mis-matching a
+     * prior completion with this request's wait (-> silent stale read). */
+    if (d->failed) return STM_EIO;
+
     /* Pre-poison status byte so a missing device write surfaces. */
     *(volatile uint8_t *)(THYLA_RING_USER_VA + VQ_STATUS_OFF) = 0xff;
 
@@ -495,9 +504,9 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
      * change wakes before giving up. */
     uint32_t spurious = 0;
     for (;;) {
-        if (spurious >= MAX_NON_USED_BUFFER_WAKES) return STM_EIO;
+        if (spurious >= MAX_NON_USED_BUFFER_WAKES) goto io_fail;
         int64_t count = t_irq_wait(d->irq_handle);
-        if (count < 0) return STM_EIO;
+        if (count < 0) goto io_fail;
 
         uint32_t int_status = mmio_read32(d->slot_va + VREG_INTERRUPT_STATUS);
         mmio_write32(d->slot_va + VREG_INTERRUPT_ACK, int_status);
@@ -511,21 +520,28 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
     /* Barrier between observing used.idx advance and reading used-ring
      * + data payload. */
     virtio_rmb();
-    if (used_idx != new_idx) return STM_EIO;
+    if (used_idx != new_idx) goto io_fail;
 
     /* used.ring[(new_idx - 1) % QUEUE_SIZE].id must be 0 (the head). */
     uint32_t used_slot = (uint32_t)(new_idx - 1) % VQ_QUEUE_SIZE;
     uint32_t used_id   = *(volatile uint32_t *)(used_va + 4 + used_slot * 8);
-    if (used_id != 0) return STM_EIO;
+    if (used_id != 0) goto io_fail;
 
     /* Status byte. */
     uint8_t st = mmio_read_u8(THYLA_RING_USER_VA + VQ_STATUS_OFF);
-    if (st != VIRTIO_BLK_S_OK) return STM_EIO;
+    if (st != VIRTIO_BLK_S_OK) goto io_fail;
 
     /* Advance the bdev's counter. avail_idx wraps on uint16_t which
      * matches the device's 16-bit idx; invariant B-4 wrap-safe. */
     d->avail_idx = new_idx;
     return STM_OK;
+
+io_fail:
+    /* R4-F1: the avail.idx was published to the device but the outcome is
+     * uncertain; latch failed so every later op short-circuits to STM_EIO
+     * (above) and Stratum re-opens the bdev (re-init resets avail_idx). */
+    d->failed = true;
+    return STM_EIO;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -639,11 +655,15 @@ static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t
 
 static stm_status op_fsync(stm_bdev *base)
 {
-    /* We do NOT negotiate VIRTIO_BLK_F_FLUSH; QEMU's backing file is
-     * write-through from our perspective (qemu sync semantics). For
-     * v1.0 this is a no-op. When the boot image moves to a real disk
-     * (or to a qcow2 with cache=writeback), this becomes a flush
-     * request via VIRTIO_BLK_T_FLUSH. Tracked as v1.x followup. */
+    /* No-op flush -- correct ONLY because the boot launch attaches the
+     * virtio-blk drives cache=writethrough (tools/run-vm.sh), so every
+     * op_write is already synchronously durable and there is nothing to
+     * flush. The driver does NOT negotiate VIRTIO_BLK_F_FLUSH; under a
+     * writeback backing store this no-op would silently lose committed
+     * writes on a host crash (RW-8 R4-F3 -- the prior "write-through from
+     * our perspective" comment was false for QEMU's default writeback).
+     * v1.x: negotiate VIRTIO_BLK_F_FLUSH + issue VIRTIO_BLK_T_FLUSH here so
+     * durability no longer depends on the launch cache mode. */
     (void)base;
     return STM_OK;
 }
