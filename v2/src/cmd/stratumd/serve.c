@@ -1760,6 +1760,21 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
         }
     }
 
+    /* Deterministic boot-readiness signal (Thylacine launcher contract).
+     * Every fallible step has now succeeded: the FS is mounted, the listen
+     * socket is bound + posted (on Thylacine the bind() registers /srv via the
+     * pouch sockets shim), /ctl is up, the worker threads are spawned. Emit ONE
+     * readiness line so a launcher can BLOCK on this EVENT instead of polling
+     * the namespace with a wall-clock retry budget -- which races the
+     * crypto-heavy mount above (fine on a fast host, but not under emulation).
+     * This is the TRUTHFUL post-bind signal; the earlier "serving" line
+     * (run.c) is printed before the mount/bind and is therefore optimistic.
+     * The launcher waits for this exact "bound and ready" token, or for pipe
+     * EOF (== stratumd died before readiness). A benign extra log line for any
+     * launcher that does not consume it. */
+    fprintf(stderr, "stratumd: bound and ready (serving %s)\n", opts->socket_path);
+    fflush(stderr);
+
     /* Run FS accept loop on the calling thread. Returns when
      * stop_flag is set (or on fatal accept error). */
     rc = stm_stratumd_accept_loop(listen_fd, fs, msize_max, root_ds,
