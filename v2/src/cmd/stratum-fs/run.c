@@ -34,6 +34,7 @@
 #include <stratum/9p.h>
 #include <stratum/types.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -628,6 +629,205 @@ static int cmd_mkdir(stm_9p_client *c, int argc, char **argv)
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* Subcommand: put — recursively copy a host directory tree into the pool. */
+/*                                                                         */
+/* `stratum-fs put LOCAL_DIR REMOTE_DIR` mirrors the CONTENTS of host dir  */
+/* LOCAL_DIR into pool dir REMOTE_DIR (created if absent), in ONE 9P        */
+/* session. Unlike repeated `write`/`mkdir` calls (a process + Tversion+    */
+/* Tattach each), put descends incrementally with a current-directory fid,  */
+/* so each op walks <=1 component: it never hits the 16-component Twalk cap  */
+/* on deep trees AND avoids thousands of process spawns. Symlinks and other  */
+/* non-regular entries are skipped with a warning (the caller is expected to */
+/* stage a deref'd, regular-file tree). Exec bits are preserved (0755 vs     */
+/* 0644). Used by the Thylacine build to bake a ~150 MB Go GOROOT into       */
+/* pool.img -- a per-file CLI loop over that tree is infeasible.             */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Fids for the put descent: a per-depth directory fid (based at 200 to clear
+ * ROOT_FID/WORK_FID) + a scratch fid for file creation. lcreate rebinds its
+ * fid, so a file uses a 0-walk clone of the current dir fid. */
+#define PUT_DIR_FID_BASE 200u
+#define PUT_FILE_FID     199u
+#define PUT_MAX_DEPTH    48u     /* dir fids 200..247; deeper trees refused */
+
+/* Stream a host file into a freshly-created file `name` under `dir_fid`. */
+static int put_one_file(stm_9p_client *c, uint32_t dir_fid, const char *name,
+                        const char *local_path, uint32_t mode,
+                        uint8_t *buf, size_t bufsz)
+{
+    FILE *f = fopen(local_path, "rb");
+    if (!f) {
+        fprintf(stderr, "stratum-fs: put: open host file %s: %s\n",
+                local_path, strerror(errno));
+        return EXIT_IO;
+    }
+    stm_9p_qid qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    /* Clone dir_fid -> PUT_FILE_FID (0-component walk) so lcreate can rebind
+     * it to the new file without losing the directory fid. */
+    stm_status rc = stm_9p_walk(c, dir_fid, PUT_FILE_FID, 0, NULL, qids, &walked);
+    if (rc != STM_OK) { perr("put clone dir", rc); fclose(f); return status_to_exit(rc); }
+    stm_9p_qid q;
+    rc = stm_9p_lcreate(c, PUT_FILE_FID, name, STM_9P_O_WRONLY | STM_9P_O_TRUNC,
+                            mode, (uint32_t)getgid(), &q, NULL);
+    if (rc == STM_EEXIST || rc == STM_ENOTSUPPORTED) {
+        /* Re-run over an existing tree: clunk the clone, re-clone, walk to the
+         * existing file by name, open + truncate. */
+        (void)stm_9p_clunk(c, PUT_FILE_FID);
+        const char *nm = name;
+        rc = stm_9p_walk(c, dir_fid, PUT_FILE_FID, 1, &nm, qids, &walked);
+        if (rc != STM_OK) { perr("put walk existing", rc); fclose(f); return status_to_exit(rc); }
+        rc = stm_9p_lopen(c, PUT_FILE_FID, STM_9P_O_WRONLY | STM_9P_O_TRUNC, &q, NULL);
+        if (rc != STM_OK) {
+            perr("put open existing", rc);
+            (void)stm_9p_clunk(c, PUT_FILE_FID);
+            fclose(f);
+            return status_to_exit(rc);
+        }
+    } else if (rc != STM_OK) {
+        perr("put lcreate", rc);
+        (void)stm_9p_clunk(c, PUT_FILE_FID);
+        fclose(f);
+        return status_to_exit(rc);
+    }
+    uint64_t offset = 0;
+    int ret = 0;
+    while (1) {
+        size_t got = fread(buf, 1, bufsz, f);
+        if (got == 0) break;
+        uint32_t pos = 0;
+        while (pos < (uint32_t)got) {
+            uint32_t written = 0;
+            rc = stm_9p_write(c, PUT_FILE_FID, offset + pos, buf + pos,
+                                  (uint32_t)got - pos, &written);
+            if (rc != STM_OK) { perr("put write", rc); ret = status_to_exit(rc); goto done; }
+            if (written == 0) {
+                fprintf(stderr, "stratum-fs: put: server returned written=0\n");
+                ret = EXIT_IO; goto done;
+            }
+            pos += written;
+        }
+        offset += got;
+    }
+    if (ferror(f)) {
+        fprintf(stderr, "stratum-fs: put: read error on %s\n", local_path);
+        ret = EXIT_IO;
+    }
+done:
+    (void)stm_9p_clunk(c, PUT_FILE_FID);
+    fclose(f);
+    return ret;
+}
+
+/* Recursively mirror the contents of host dir `local_path` into the open pool
+ * directory `dir_fid`. `depth` indexes the per-level dir fid. */
+static int put_tree(stm_9p_client *c, uint32_t dir_fid, const char *local_path,
+                    uint32_t depth, uint8_t *buf, size_t bufsz)
+{
+    if (depth >= PUT_MAX_DEPTH) {
+        fprintf(stderr, "stratum-fs: put: tree deeper than %u levels at %s\n",
+                PUT_MAX_DEPTH, local_path);
+        return EXIT_IO;
+    }
+    DIR *d = opendir(local_path);
+    if (!d) {
+        fprintf(stderr, "stratum-fs: put: opendir %s: %s\n",
+                local_path, strerror(errno));
+        return EXIT_IO;
+    }
+    int ret = 0;
+    char child[4096];
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.' && (de->d_name[1] == '\0' ||
+            (de->d_name[1] == '.' && de->d_name[2] == '\0'))) continue;
+        int n = snprintf(child, sizeof child, "%s/%s", local_path, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof child) {
+            fprintf(stderr, "stratum-fs: put: host path too long under %s\n", local_path);
+            ret = EXIT_IO; break;
+        }
+        struct stat st;
+        if (lstat(child, &st) != 0) {
+            fprintf(stderr, "stratum-fs: put: lstat %s: %s\n", child, strerror(errno));
+            ret = EXIT_IO; break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            stm_9p_qid q;
+            stm_status rc = stm_9p_mkdir(c, dir_fid, de->d_name, 0755u,
+                                             (uint32_t)getgid(), &q);
+            if (rc != STM_OK && rc != STM_EEXIST) {
+                perr("put mkdir", rc); ret = status_to_exit(rc); break;
+            }
+            uint32_t child_fid = PUT_DIR_FID_BASE + depth + 1u;
+            stm_9p_qid qids[STM_9P_MAX_WALK];
+            uint16_t walked = 0;
+            const char *nm = de->d_name;
+            rc = stm_9p_walk(c, dir_fid, child_fid, 1, &nm, qids, &walked);
+            if (rc != STM_OK) { perr("put walk child", rc); ret = status_to_exit(rc); break; }
+            ret = put_tree(c, child_fid, child, depth + 1u, buf, bufsz);
+            (void)stm_9p_clunk(c, child_fid);
+            if (ret != 0) break;
+        } else if (S_ISREG(st.st_mode)) {
+            uint32_t mode = (st.st_mode & 0111u) ? 0755u : 0644u;
+            ret = put_one_file(c, dir_fid, de->d_name, child, mode, buf, bufsz);
+            if (ret != 0) break;
+        } else {
+            fprintf(stderr, "stratum-fs: put: skipping non-regular %s\n", child);
+        }
+    }
+    closedir(d);
+    return ret;
+}
+
+static int cmd_put(stm_9p_client *c, int argc, char **argv)
+{
+    if (argc != 2) {
+        fprintf(stderr, "usage: stratum-fs put LOCAL_DIR REMOTE_DIR\n");
+        return EXIT_USAGE;
+    }
+    const char *local_dir = argv[0];
+    const char *remote_dir = argv[1];
+    struct stat lst;
+    if (stat(local_dir, &lst) != 0 || !S_ISDIR(lst.st_mode)) {
+        fprintf(stderr, "stratum-fs: put: %s is not a host directory\n", local_dir);
+        return EXIT_USAGE;
+    }
+    /* Ensure REMOTE_DIR exists: walk its parent + mkdir the leaf (idempotent). */
+    path_t parent;
+    const char *leaf = NULL;
+    if (split_parent_name(remote_dir, &parent, &leaf) < 0) return EXIT_USAGE;
+    stm_9p_qid qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    stm_status rc = stm_9p_walk(c, ROOT_FID, WORK_FID, parent.count, parent.names,
+                                    qids, &walked);
+    if (rc != STM_OK) { perr("put walk remote parent", rc); return status_to_exit(rc); }
+    stm_9p_qid q;
+    rc = stm_9p_mkdir(c, WORK_FID, leaf, 0755u, (uint32_t)getgid(), &q);
+    (void)stm_9p_clunk(c, WORK_FID);
+    if (rc != STM_OK && rc != STM_EEXIST) {
+        perr("put mkdir remote base", rc); return status_to_exit(rc);
+    }
+    /* Walk ROOT -> the base dir fid for REMOTE_DIR (a shallow mount-point, so
+     * <=16 components); the recursion below never re-walks from root. */
+    path_t base;
+    if (parse_path(remote_dir, &base) < 0) return EXIT_USAGE;
+    rc = stm_9p_walk(c, ROOT_FID, PUT_DIR_FID_BASE, base.count, base.names,
+                         qids, &walked);
+    if (rc != STM_OK) { perr("put walk remote base", rc); return status_to_exit(rc); }
+    enum { PUT_BUF = 8u << 20 };    /* match the write-path 8 MiB extent buffer */
+    uint8_t *buf = (uint8_t *)malloc(PUT_BUF);
+    if (!buf) {
+        fprintf(stderr, "stratum-fs: put: alloc buffer failed\n");
+        (void)stm_9p_clunk(c, PUT_DIR_FID_BASE);
+        return EXIT_IO;
+    }
+    int ret = put_tree(c, PUT_DIR_FID_BASE, local_dir, 0, buf, PUT_BUF);
+    free(buf);
+    (void)stm_9p_clunk(c, PUT_DIR_FID_BASE);
+    return ret;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Subcommand: create (touch).                                            */
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -1088,6 +1288,7 @@ static const cmd_entry CMDS[] = {
     { "read",     cmd_read,     "write file contents to stdout",                 false },
     { "write",    cmd_write,    "write stdin to file (creates / truncates)",     true  },
     { "mkdir",    cmd_mkdir,    "create directory",                              true  },
+    { "put",      cmd_put,      "recursively copy a host dir tree into the pool",true  },
     { "create",   cmd_create,   "create empty file (touch)",                     true  },
     { "rm",       cmd_rm,       "remove file",                                   true  },
     { "rmdir",    cmd_rmdir,    "remove empty directory",                        true  },
