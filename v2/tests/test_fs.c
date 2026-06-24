@@ -844,6 +844,155 @@ STM_TEST(fs_io_multipiece_split_pullback_no_bisect) {
     unlink(g_tmp_path);
 }
 
+/* Area B / F2 (review P2, pre-existing): a read spanning TWO committed
+ * extents while the inode has a DISJOINT buffered (un-flushed) range must
+ * return BOTH extents, not zeros for the second. The buffered read path
+ * returns the full requested length (to surface a buffer-only tail past the
+ * extent edge via overlay), which defeats the caller's short-read loop -- so
+ * before the F2 fix its single-extent read left the 2nd committed extent
+ * zero. Non-vacuous: pre-fix the [4K,8K) half reads back zeros. */
+STM_TEST(fs_io_buffered_read_spans_two_extents) {
+    make_tmp("buf_2ext");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"b", 1,
+                                        0644u, 0, 0, &fino));
+
+    uint8_t chunk[4096], out[8192];
+    /* Two SEPARATE commits -> two distinct committed extents [0,4K)+[4K,8K). */
+    for (uint64_t k = 0; k < 2; k++) {
+        for (uint64_t i = 0; i < 4096u; i++)
+            chunk[i] = (uint8_t)((k * 4096u + i) & 0xFF);   /* abs-offset keyed */
+        STM_ASSERT_OK(stm_fs_write(fs, 1, fino, k * 4096u, chunk, 4096u));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+
+    /* A DISJOINT buffered write at [8K,12K), NOT committed -> the inode now
+     * has buffered data (the buffered read path triggers) that does NOT
+     * cover [0,8K). */
+    for (uint64_t i = 0; i < 4096u; i++) chunk[i] = (uint8_t)((0xE0u + i) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 8192u, chunk, 4096u));
+    /* deliberately no commit -- keep the range buffered */
+
+    /* Read [0,8K) in ONE call -> the buffered path. Both committed extents
+     * must be present (abs-offset keyed); the 2nd ([4K,8K)) is the F2 loss
+     * region (read back as zeros pre-fix). */
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 0, out, 8192u, &got));
+    STM_ASSERT_EQ(got, (size_t)8192u);
+    for (uint64_t i = 0; i < 8192u; i++)
+        STM_ASSERT_EQ((int)out[i], (int)(i & 0xFF));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* Area B / F2 (round-1 review): the multi-extent buffered fill must zero an
+ * INTERIOR hole between two committed extents WITHOUT truncating the extent
+ * AFTER it -- the per-extent-bounded looped read's novel defense. Layout:
+ * extent [0,4K), hole [4K,8K), extent [8K,12K), a disjoint buffered tail.
+ * Read [0,12K) -> data | zeros | data. Non-vacuous: a single-extent read (or
+ * the hole-zero-fills-whole-len contract) drops the post-hole extent. */
+STM_TEST(fs_io_buffered_read_interior_hole) {
+    make_tmp("buf_ihole");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"h", 1,
+                                        0644u, 0, 0, &fino));
+
+    uint8_t chunk[4096], out[12288];
+    /* extent [0,4K) + extent [8K,12K) (gap [4K,8K) stays a hole), each its
+     * own commit; abs-offset keyed. */
+    uint64_t exts[] = { 0u, 8192u };
+    for (size_t e = 0; e < 2; e++) {
+        for (uint64_t i = 0; i < 4096u; i++)
+            chunk[i] = (uint8_t)((exts[e] + i) & 0xFF);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, fino, exts[e], chunk, 4096u));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+    /* disjoint buffered tail -> buffered read path. */
+    for (uint64_t i = 0; i < 4096u; i++) chunk[i] = (uint8_t)((0xA5u + i) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 16384u, chunk, 4096u));
+
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 0, out, 12288u, &got));
+    STM_ASSERT_EQ(got, (size_t)12288u);
+    for (uint64_t f = 0; f < 12288u; f++) {
+        int want = (f < 4096u || (f >= 8192u && f < 12288u))
+                     ? (int)(f & 0xFF)   /* the two committed extents */
+                     : 0;                /* the interior hole [4K,8K)  */
+        STM_ASSERT_EQ((int)out[f], want);
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* Area B / F2 (round-1 review): a read whose OFFSET lands in a hole, followed
+ * by a committed extent -- exercises fs_rmw_read_span_locked's first-lookup-
+ * ENOENT path (the single-extent read's "hole zero-fills the WHOLE len"
+ * contract would zero the trailing extent). Layout: extent [0,4K), hole
+ * [4K,8K), extent [8K,12K), a disjoint buffered tail; read [4K,12K) -> the
+ * read starts IN the hole -> zeros | data. (Reads from a true sparse gap,
+ * avoiding the INLINE->EXTENT transition's leading zero-pad.) */
+STM_TEST(fs_io_buffered_read_offset_in_hole) {
+    make_tmp("buf_ohole");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"o", 1,
+                                        0644u, 0, 0, &fino));
+
+    uint8_t chunk[4096], out[8192];
+    /* extent [0,4K) (the offset-0 first write -> clean INLINE->EXTENT, no
+     * spurious pad) + extent [8K,12K) -> gap [4K,8K) is a TRUE hole. */
+    uint64_t exts[] = { 0u, 8192u };
+    for (size_t e = 0; e < 2; e++) {
+        for (uint64_t i = 0; i < 4096u; i++)
+            chunk[i] = (uint8_t)((exts[e] + i) & 0xFF);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, fino, exts[e], chunk, 4096u));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+    /* disjoint buffered tail -> buffered read path. */
+    for (uint64_t i = 0; i < 4096u; i++) chunk[i] = (uint8_t)((0x5Au + i) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 16384u, chunk, 4096u));
+
+    /* Read [4K,12K): the offset (4K) is in the hole [4K,8K) -> zeros, then the
+     * extent [8K,12K) -> data. abs-offset keyed. */
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 4096u, out, 8192u, &got));
+    STM_ASSERT_EQ(got, (size_t)8192u);
+    for (uint64_t j = 0; j < 8192u; j++) {
+        uint64_t fo = 4096u + j;                          /* file offset */
+        int want = (fo >= 8192u) ? (int)(fo & 0xFF) : 0;  /* hole then extent */
+        STM_ASSERT_EQ((int)out[j], want);
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 /* 9.7-impl-3: stm_fs_create_snapshot captures the dataset's real
  * committed per-dataset btree_engine root triple — not the
  * pre-impl-3 tree_root_paddr=0 stub. The snapshot's captured

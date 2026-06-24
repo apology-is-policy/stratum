@@ -2837,6 +2837,7 @@ reference below covers the as-built layers in bottom-up order.
 | [24-btree-engine.md](reference/24-btree-engine.md) | Metadata Tree Engine — COW B+tree (Phase 9.6-impl-1b) | large |
 | [25-metakey.md](reference/25-metakey.md) | Type-tagged metadata keys for per-dataset trees (Phase 9.7-impl-1a) | small |
 | [26-fs-write-path.md](reference/26-fs-write-path.md) | FS write path — flush/coalesce/RMW/extent-overwrite (Stabilization Area A) | medium |
+| [27-fs-read-path.md](reference/27-fs-read-path.md) | FS read path — single/multi-extent + buffered overlay (Stabilization Area B) | small |
 
 This is a live document — every phase-chunk commit that touches a
 subsystem updates the corresponding section in the same PR.

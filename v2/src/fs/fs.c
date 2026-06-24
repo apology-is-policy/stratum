@@ -1821,6 +1821,46 @@ static stm_status fs_read_extent_aligned_locked(stm_fs *fs,
     return STM_OK;
 }
 
+/* Fill buf[0, want) with the committed extent content of [off, off+want),
+ * looping across EVERY extent in the span (holes read as zeros). The
+ * MULTI-EXTENT counterpart to fs_read_extent_aligned_locked's single
+ * stm_sync_read_extent.
+ *
+ * Area B / F2: the buffered read path returns the FULL requested length
+ * (so the dirty-buffer overlay can surface a buffer-only tail past the
+ * extent edge), which defeats the caller's short-read loop -- so a read
+ * spanning >=2 committed extents whose gap is not in the dirty buffer must
+ * fill ALL of them HERE, or the 2nd+ extent reads back as zeros. Reuses the
+ * write side's already-audited per-extent-bounded looped read
+ * (fs_rmw_read_span_locked), which bounds each stm_sync_read_extent to the
+ * covering extent's end so a leading/interior hole zero-fills only its own
+ * block run, never a following extent.
+ *
+ * Contract: on STM_OK, buf[0, want) is FULLY written (the memcpy of the
+ * calloc'd, hole-zeroed scratch). Returns STM_OK or a real error -- NEVER
+ * STM_ENOENT (fs_rmw_read_span_locked consumes a hole-lookup as a zero run,
+ * not a return). The buffered-read caller relies on this: it propagates any
+ * non-OK and only overlays a fully-filled buf. Caller holds fs->lock. */
+static stm_status fs_read_span_filled_locked(stm_fs *fs, uint64_t ds,
+                                               uint64_t ino, uint64_t off,
+                                               uint8_t *buf, size_t want)
+{
+    if (want == 0u) return STM_OK;
+    const uint64_t BLK = 4096u;
+    uint64_t a_off   = off & ~(BLK - 1u);
+    uint64_t end_off = off + (uint64_t)want;
+    uint64_t a_end   = (end_off + BLK - 1u) & ~(BLK - 1u);
+    uint64_t a_len   = a_end - a_off;
+    /* F2-cap parity with the write RMW + fs_read_extent_aligned_locked. */
+    if (a_len > (uint64_t)STM_FS_RECORDSIZE_MAX * 4u) return STM_ERANGE;
+    uint8_t *scratch = (uint8_t *)calloc(1, (size_t)a_len);
+    if (!scratch) return STM_ENOMEM;
+    stm_status rs = fs_rmw_read_span_locked(fs, ds, ino, a_off, a_end, scratch);
+    if (rs == STM_OK) memcpy(buf, scratch + (off - a_off), want);
+    free(scratch);
+    return rs;
+}
+
 /* SWISS-4q-flush drain callback: each buffered range becomes one
  * stm_sync_write_extent via fs_write_extent_aligned_locked. The
  * callback runs under stm_dirty_buffer's internal mutex AND under
@@ -2136,11 +2176,16 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
         uint64_t logical_avail = cur_size - off;
         size_t effective_len = ((uint64_t)len < logical_avail)
                                   ? len : (size_t)logical_avail;
-        if (effective_len > 0u) memset(buf, 0, effective_len);
-        size_t got_ext = 0;
-        stm_status rs = fs_read_extent_aligned_locked(fs, ds, ino, off,
-                                                          buf, effective_len, &got_ext);
-        if (rs != STM_OK && rs != STM_ENOENT) return rs;
+        /* F2: fill the WHOLE effective range across every committed extent
+         * (fs_read_span_filled_locked zeros holes + pre-zeroes via calloc),
+         * THEN overlay the buffer's newer bytes. Returning effective_len is
+         * correct only because the fill is now multi-extent; the prior
+         * single-extent read left a 2nd+ committed extent zero. */
+        stm_status rs = fs_read_span_filled_locked(fs, ds, ino, off,
+                                                     (uint8_t *)buf, effective_len);
+        /* fs_read_span_filled_locked never returns STM_ENOENT; any non-OK is a
+         * real error -> propagate (the overlay only runs on a fully-filled buf). */
+        if (rs != STM_OK) return rs;
         stm_dirty_buffer_overlay(fs->dirty_buffer, ds, ino, off,
                                     effective_len, buf);
         if (out_read) *out_read = effective_len;
@@ -2286,6 +2331,11 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             return STM_OK;
         }
         if (iv.si_data_kind == STM_DATA_EXTENT) {
+            /* Single-extent snap read: like the live NON-buffered path, this
+             * returns a SHORT got at an extent boundary and RELIES on the
+             * caller's re-read loop (h_read re-Treads at off+got). A future
+             * non-looping snap consumer would lose a 2nd+ extent (the F2 trap
+             * class); add a multi-extent fill here if one ever appears. */
             size_t got = 0;
             stm_status rs = stm_sync_read_extent_at_snap(
                     fs->sync, dataset_id,
