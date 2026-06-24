@@ -2836,6 +2836,7 @@ reference below covers the as-built layers in bottom-up order.
 | [23-9p_client.md](reference/23-9p_client.md) | libstratum-9p — synchronous 9P2000.L client (P9-LIB-1..1d) | medium |
 | [24-btree-engine.md](reference/24-btree-engine.md) | Metadata Tree Engine — COW B+tree (Phase 9.6-impl-1b) | large |
 | [25-metakey.md](reference/25-metakey.md) | Type-tagged metadata keys for per-dataset trees (Phase 9.7-impl-1a) | small |
+| [26-fs-write-path.md](reference/26-fs-write-path.md) | FS write path — flush/coalesce/RMW/extent-overwrite (Stabilization Area A) | medium |
 
 This is a live document — every phase-chunk commit that touches a
 subsystem updates the corresponding section in the same PR.

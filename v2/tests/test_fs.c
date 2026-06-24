@@ -411,6 +411,439 @@ STM_TEST(fs_io_write_read_roundtrip) {
     unlink(g_tmp_path);
 }
 
+/* Read exactly `len` bytes, looping over short reads (stm_fs_read may
+ * return short at an extent boundary -- the kernel dev9p + Go read loops
+ * handle this). Stops early only on a genuine 0-length read (EOF/hole). */
+static stm_status read_full(stm_fs *fs, uint64_t ds, uint64_t ino,
+                              uint64_t off, uint8_t *buf, size_t len)
+{
+    size_t total = 0;
+    while (total < len) {
+        size_t got = 0;
+        stm_status rs = stm_fs_read(fs, ds, ino, off + total,
+                                       buf + total, len - total, &got);
+        if (rs != STM_OK) return rs;
+        if (got == 0) break;
+        total += got;
+    }
+    return STM_OK;
+}
+
+/* #352 regression: the dirty-buffer flush MUST coalesce contiguous
+ * buffered ranges into large extents -- not emit one extent per <=4 KiB
+ * write. Pre-fix, each range paid a full AEAD-tag block -> ~2x storage
+ * amplification that exhausted a near-full pool (the on-device `go build`
+ * `_pkg_.a` write: STM_ENOSPC at logical offset 8390469). This asserts
+ * the amplification bound DIRECTLY (device-size-independent + non-vacuous:
+ * pre-fix ~2x blows past the 1.5x ceiling) and verifies content is
+ * preserved across the 8 MiB record boundary.
+ *
+ * Writes are 4 KiB-aligned + dense from offset 0 (a large file grown
+ * sequentially). Content is keyed by ABSOLUTE file offset (byte at F ==
+ * F & 0xFF) for trivial readback verification.
+ *
+ * NOTE: the on-device pattern additionally DRIFTS off 4 KiB alignment
+ * (an odd-sized archive header first), which crosses the 8 MiB record
+ * boundary with a STRADDLING write. That exposes a SEPARATE pre-existing
+ * extent-layer corruption (overlapping block-aligned extents from the
+ * non-aligned RMW read back zeros) -- tracked as #355, present on
+ * pre-#352 code too, and orthogonal to this amplification fix. */
+STM_TEST(fs_io_write_grows_past_recordsize) {
+    make_tmp("grow_past_rec");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;  /* ample */
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* A real S_IFREG inode so writes take the buffered
+     * fs_write_regular_locked path (the on-device 9P Tlcreate'd file),
+     * NOT the legacy direct-extent path a bare ino falls through to. */
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                     0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, /*ds=*/1, dir,
+                                        (const uint8_t *)"pkg.a", 5,
+                                        0644u, 0, 0, &fino));
+
+    stm_alloc *a0 = stm_sync_alloc(stm_fs_sync(fs), 0);
+    STM_ASSERT(a0 != NULL);
+    stm_alloc_stats st0 = {0};
+    STM_ASSERT_OK(stm_alloc_stats_get(a0, &st0));
+
+    uint8_t chunk[4096];
+    const uint64_t TARGET = 9u * 1024u * 1024u; /* crosses 8 MiB */
+    for (uint64_t off = 0; off < TARGET; off += (uint64_t)sizeof chunk) {
+        for (uint64_t i = 0; i < sizeof chunk; i++)
+            chunk[i] = (uint8_t)((off + i) & 0xFF);   /* absolute-offset keyed */
+        STM_ASSERT_OK(stm_fs_write(fs, /*ds=*/1, fino, off, chunk, sizeof chunk));
+    }
+
+    /* Flush the whole file so the alloc stats reflect every byte. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_alloc_stats st1 = {0};
+    STM_ASSERT_OK(stm_alloc_stats_get(a0, &st1));
+    uint64_t logical_blk = (TARGET + 4095u) / 4096u;          /* 2304 */
+    uint64_t used_blk    = (st1.data_allocated_blocks + st1.data_pending_blocks)
+                         - (st0.data_allocated_blocks + st0.data_pending_blocks);
+    /* Coalesced ~1.0x; pre-fix ~2x. 1.5x is a comfortable ceiling the
+     * bug blows past (~4600 blk) and the fix clears (~2310 blk). */
+    STM_ASSERT_TRUE(used_blk < logical_blk + logical_blk / 2u);
+
+    /* Content correctness across the 8 MiB record boundary: read 4 KiB
+     * slices at + straddling 8 MiB; byte at file offset F must equal
+     * F & 0xFF. */
+    const uint64_t REC = (uint64_t)8u * 1024u * 1024u;
+    uint64_t reads[] = { REC - 4096u, REC, REC - 64u };
+    for (size_t r = 0; r < sizeof reads / sizeof reads[0]; r++) {
+        uint8_t out[4096] = {0};
+        STM_ASSERT_OK(read_full(fs, 1, fino, reads[r], out, sizeof out));
+        for (size_t i = 0; i < sizeof out; i++)
+            STM_ASSERT_EQ((int)out[i], (int)((reads[r] + i) & 0xFF));
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* #352-F1 (review P0): an interior sub-write of one block of a coalesced
+ * multi-block extent, after a commit, must preserve the non-overwritten
+ * blocks. Pre-fix, stm_extent_overwrite truncated/whole-dropped the
+ * partially-overlapped extent -> the remainder was silently lost (the
+ * go-build ar/ELF header-patch pattern: write file, fsync, patch header,
+ * fsync). Closed by fs_write_extent_aligned_locked's cover-the-overlap RMW. */
+STM_TEST(fs_io_interior_rewrite_preserves_remainder) {
+    make_tmp("interior_rw");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"o", 1,
+                                        0644u, 0, 0, &fino));
+
+    uint8_t chunk[4096], out[4096];
+    /* Write blocks 0,1,2 (absolute-offset keyed), commit -> blocks 1,2
+     * coalesce into one multi-block extent. */
+    for (uint64_t k = 0; k < 3; k++) {
+        for (uint64_t i = 0; i < 4096u; i++)
+            chunk[i] = (uint8_t)((k * 4096u + i) & 0xFF);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, fino, k * 4096u, chunk, 4096u));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Re-write ONLY the middle block (offset 4096) with a distinct
+     * pattern, commit. */
+    for (uint64_t i = 0; i < 4096u; i++) chunk[i] = (uint8_t)((0xA0u + i) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 4096u, chunk, 4096u));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Block 0 unchanged, block 1 = the new pattern, block 2 PRESERVED. */
+    struct { uint64_t off; uint64_t base; int distinct; } cases[] = {
+        { 0u,    0u,    0 },     /* block 0: (0+i)&0xFF       */
+        { 4096u, 0xA0u, 1 },     /* block 1: (0xA0+i)&0xFF    */
+        { 8192u, 8192u, 0 },     /* block 2: (8192+i)&0xFF -- the loss case */
+    };
+    for (size_t c = 0; c < 3; c++) {
+        size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, fino, cases[c].off, out, sizeof out, &got));
+        STM_ASSERT_EQ(got, (size_t)sizeof out);
+        for (size_t i = 0; i < sizeof out; i++) {
+            uint8_t want = cases[c].distinct
+                         ? (uint8_t)((cases[c].base + i) & 0xFF)
+                         : (uint8_t)((cases[c].off + i) & 0xFF);
+            STM_ASSERT_EQ((int)out[i], (int)want);
+        }
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* #355: dense NON-4 KiB-aligned ("drift") writes crossing the 8 MiB
+ * record boundary must read back correct content. Pre-fix, the drift's
+ * straddling write created overlapping block-aligned extents the
+ * overwrite would not split, so the straddle region read back zeros.
+ * Closed by the same extent-cover fix (the straddle write is split at the
+ * recordsize boundary; each piece covers the overlapped extent fully). */
+STM_TEST(fs_io_drift_writes_cross_recordsize) {
+    make_tmp("drift_rec");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"d", 1,
+                                        0644u, 0, 0, &fino));
+
+    uint8_t chunk[4096], out[4096];
+    const uint64_t HDR    = 1861u;
+    const uint64_t TARGET = 9u * 1024u * 1024u;
+    for (uint64_t off = 0; off < TARGET; ) {
+        uint64_t len = (off == 0) ? HDR : (uint64_t)sizeof chunk;
+        if (off + len > TARGET) len = TARGET - off;
+        for (uint64_t i = 0; i < len; i++)
+            chunk[i] = (uint8_t)((off + i) & 0xFF);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, fino, off, chunk, (size_t)len));
+        off += len;
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    const uint64_t REC = (uint64_t)8u * 1024u * 1024u;
+    uint64_t reads[] = { REC - 4096u, REC - 64u, REC };
+    for (size_t r = 0; r < sizeof reads / sizeof reads[0]; r++) {
+        STM_ASSERT_OK(read_full(fs, 1, fino, reads[r], out, sizeof out));
+        for (size_t i = 0; i < sizeof out; i++)
+            STM_ASSERT_EQ((int)out[i], (int)((reads[r] + i) & 0xFF));
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* #352-F2 (deep-fix review P0): an unaligned write spanning TWO distinct
+ * extents in one record slot must preserve BOTH ends. The prior deep fix's
+ * RMW read used the single-extent stm_sync_read_extent (stops at the first
+ * extent's end), so the second extent's bytes defaulted to zero in scratch
+ * and were written back as zeros -- a fresh-pool, public-API silent data
+ * loss. Closed by fs_rmw_read_span_locked's looped multi-extent read. */
+STM_TEST(fs_io_two_extents_in_slot_rewrite_spans_both) {
+    make_tmp("two_ext_slot");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"t", 1,
+                                        0644u, 0, 0, &fino));
+
+    uint8_t chunk[4096], out[4096];
+    /* Two SEPARATE commits -> two adjacent-but-distinct extents [0,4K) and
+     * [4K,8K) in slot 0 (coalescing is within one drain, not across
+     * already-flushed extents). */
+    for (uint64_t k = 0; k < 2; k++) {
+        for (uint64_t i = 0; i < 4096u; i++)
+            chunk[i] = (uint8_t)((k * 4096u + i) & 0xFF);   /* abs-offset keyed */
+        STM_ASSERT_OK(stm_fs_write(fs, 1, fino, k * 4096u, chunk, 4096u));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+
+    /* Unaligned rewrite [2K, 6K) spanning the tail of ext0 and the head of
+     * ext1 -> forces the RMW to read across BOTH extents. */
+    for (uint64_t i = 0; i < 4096u; i++) chunk[i] = (uint8_t)((0xC0u + i) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 2048u, chunk, 4096u));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* [0,2K) ext0 head preserved; [2K,6K) new; [6K,8K) ext1 tail preserved
+     * (the F2 loss region). */
+    STM_ASSERT_OK(read_full(fs, 1, fino, 0, out, 4096u));
+    for (uint64_t i = 0; i < 2048u; i++)                 /* ext0 head */
+        STM_ASSERT_EQ((int)out[i], (int)(i & 0xFF));
+    for (uint64_t i = 2048u; i < 4096u; i++)             /* new, first half */
+        STM_ASSERT_EQ((int)out[i], (int)((0xC0u + (i - 2048u)) & 0xFF));
+    STM_ASSERT_OK(read_full(fs, 1, fino, 4096u, out, 4096u));
+    for (uint64_t i = 0; i < 2048u; i++)                 /* new, second half */
+        STM_ASSERT_EQ((int)out[i], (int)((0xC0u + (2048u + i)) & 0xFF));
+    for (uint64_t i = 2048u; i < 4096u; i++)             /* ext1 tail (F2) */
+        STM_ASSERT_EQ((int)out[i], (int)((4096u + i) & 0xFF));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* #352-F1 (deep-fix review P0): a sub-block write into a slot containing a
+ * LEGACY cross-record extent (one an OLD Stratum wrote spanning the 8 MiB
+ * record boundary) must preserve the extent's far-slot tail. The prior deep
+ * fix CLAMPED the RMW cover to the current record slot, so the covering
+ * write partially overlapped the legacy extent -> stm_extent_overwrite
+ * whole-dropped it -> the [8 MiB, 10 MiB) tail was silently lost. Closed by
+ * the UNCLAMPED expansion + the recordsize-split covering write. */
+STM_TEST(fs_io_legacy_crossslot_extent_subwrite_preserves_tail) {
+    make_tmp("legacy_xslot");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"L", 1,
+                                        0644u, 0, 0, &fino));
+
+    const uint64_t MiB = 1024u * 1024u;
+    /* Transition the inode to EXTENT mode (a >inline_max write), then grow
+     * sparse to 10 MiB. EXTENT grow has no recordsize cap; a direct
+     * INLINE->EXTENT truncate past 8 MiB would ERANGE (fs.h). */
+    uint8_t blk[4096], out[4096];
+    for (uint64_t i = 0; i < 4096u; i++) blk[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 0, blk, 4096u));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, fino, 10u * MiB));
+
+    /* Plant a LEGACY cross-record extent [6 MiB, 10 MiB) directly at the
+     * sync layer -- as a pre-record-split Stratum would have: one 4 MiB
+     * blob straddling the 8 MiB slot boundary. abs-offset keyed. */
+    uint8_t *planted = (uint8_t *)malloc((size_t)(4u * MiB));
+    STM_ASSERT(planted != NULL);
+    for (uint64_t i = 0; i < 4u * MiB; i++)
+        planted[i] = (uint8_t)((6u * MiB + i) & 0xFF);
+    STM_ASSERT_OK(stm_sync_write_extent(stm_fs_sync(fs), 1, fino,
+                                          6u * MiB, planted, (size_t)(4u * MiB)));
+    free(planted);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Sub-write a single block at 7 MiB (first slot, inside the legacy
+     * extent) with a distinct pattern -> the RMW that the clamp broke. */
+    for (uint64_t i = 0; i < 4096u; i++) blk[i] = (uint8_t)((0x5Au + i) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 7u * MiB, blk, 4096u));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* [6 MiB, 7 MiB): planted, preserved. */
+    STM_ASSERT_OK(read_full(fs, 1, fino, 6u * MiB, out, 4096u));
+    for (uint64_t i = 0; i < 4096u; i++)
+        STM_ASSERT_EQ((int)out[i], (int)((6u * MiB + i) & 0xFF));
+    /* [7 MiB, 7 MiB+4K): the new sub-write. */
+    STM_ASSERT_OK(read_full(fs, 1, fino, 7u * MiB, out, 4096u));
+    for (uint64_t i = 0; i < 4096u; i++)
+        STM_ASSERT_EQ((int)out[i], (int)((0x5Au + i) & 0xFF));
+    /* [8 MiB, 10 MiB) sampled: the FAR-SLOT TAIL -- the F1 loss region. */
+    uint64_t taps[] = { 8u * MiB, 9u * MiB, 10u * MiB - 4096u };
+    for (size_t t = 0; t < sizeof taps / sizeof taps[0]; t++) {
+        STM_ASSERT_OK(read_full(fs, 1, fino, taps[t], out, 4096u));
+        for (uint64_t i = 0; i < 4096u; i++)
+            STM_ASSERT_EQ((int)out[i], (int)((taps[t] + i) & 0xFF));
+    }
+
+    /* F1/SA-1 structural proof (the partial-split-failure fix): the sub-write
+     * produced ONE covering extent over the WHOLE [6 MiB, 10 MiB) span -- an
+     * atomic single stm_sync_write_extent (cover <= recordsize), NOT the
+     * recordsize-bisecting [6 MiB, 8 MiB) + [8 MiB, 10 MiB) split that opened
+     * the mid-split-ENOSPC data-loss window. A single write is atomic w.r.t.
+     * the extents it drops (reserve/write/encrypt precede the overwrite-drop),
+     * so a failure leaves the legacy extent intact. Non-vacuous: the pre-fix
+     * recordsize-split makes lookup_at(7 MiB) report end == 8 MiB. */
+    stm_extent_index *eidx = stm_sync_extent_index(stm_fs_sync(fs));
+    STM_ASSERT(eidx != NULL);
+    stm_extent_record cov;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, fino, 7u * MiB, &cov));
+    STM_ASSERT_EQ(cov.off, 6u * MiB);
+    STM_ASSERT_EQ(cov.off + cov.len, 10u * MiB);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* F1 round-3 (review P2): the >recordsize MULTI-PIECE split + the
+ * extent-boundary pullback -- the exact logic round 2 found broken -- must
+ * not bisect a cross-slot extent at a split point. Plants three legacy
+ * extents (E1 [0,7M), Emid [7M,9M) CROSSING the 8 MiB record boundary, E2
+ * [9M,16M)) and a sub-write spanning all three (cover [0,16M) > 8 MiB
+ * recordsize -> a 3-piece split with a pullback at BOTH interior split
+ * points). Asserts data preserved AND that Emid is re-covered WHOLE as
+ * [7M,9M) (the pullback), not bisected at the 8 MiB slot boundary. Non-
+ * vacuous: the pre-fix recordsize-slot-split makes lookup_at(8M) report
+ * off == 8 MiB (a [8M,16M) piece) instead of 7 MiB. */
+STM_TEST(fs_io_multipiece_split_pullback_no_bisect) {
+    make_tmp("multipiece");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)128u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"M", 1,
+                                        0644u, 0, 0, &fino));
+
+    const uint64_t MiB = 1024u * 1024u;
+    uint8_t blk[4096], out[4096];
+    for (uint64_t i = 0; i < 4096u; i++) blk[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 0, blk, 4096u));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, fino, 16u * MiB));
+
+    /* Plant three adjacent legacy extents; Emid straddles 8 MiB. abs-keyed. */
+    struct { uint64_t off, len; } plant[] = {
+        { 0u,        7u * MiB },   /* E1                       */
+        { 7u * MiB,  2u * MiB },   /* Emid -- crosses 8 MiB    */
+        { 9u * MiB,  7u * MiB },   /* E2                       */
+    };
+    for (size_t p = 0; p < 3; p++) {
+        uint8_t *buf = (uint8_t *)malloc((size_t)plant[p].len);
+        STM_ASSERT(buf != NULL);
+        for (uint64_t i = 0; i < plant[p].len; i++)
+            buf[i] = (uint8_t)((plant[p].off + i) & 0xFF);
+        STM_ASSERT_OK(stm_sync_write_extent(stm_fs_sync(fs), 1, fino,
+                                              plant[p].off, buf,
+                                              (size_t)plant[p].len));
+        free(buf);
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Sub-write [4 MiB, 14 MiB) overlapping all three -> cover expands to
+     * [0, 16 MiB) (16 MiB > recordsize) -> 3-piece pullback split. distinct. */
+    uint64_t w_off = 4u * MiB, w_len = 10u * MiB;
+    uint8_t *wbuf = (uint8_t *)malloc((size_t)w_len);
+    STM_ASSERT(wbuf != NULL);
+    for (uint64_t i = 0; i < w_len; i++) wbuf[i] = (uint8_t)((0x33u + i) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, w_off, wbuf, (size_t)w_len));
+    free(wbuf);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Data: E1 head preserved / the overlay / E2 tail preserved, sampled at
+     * + straddling the split boundaries (4 MiB, 8 MiB, 14 MiB). */
+    uint64_t samp[] = { 0u, 2u * MiB, 4u * MiB - 4096u,      /* E1 head    */
+                        4u * MiB, 8u * MiB - 4096u, 8u * MiB, /* overlay    */
+                        12u * MiB, 14u * MiB - 4096u,         /* overlay    */
+                        14u * MiB, 16u * MiB - 4096u };       /* E2 tail    */
+    for (size_t s = 0; s < sizeof samp / sizeof samp[0]; s++) {
+        STM_ASSERT_OK(read_full(fs, 1, fino, samp[s], out, 4096u));
+        for (uint64_t i = 0; i < 4096u; i++) {
+            uint64_t f = samp[s] + i;
+            uint8_t want = (f >= w_off && f < w_off + w_len)
+                         ? (uint8_t)((0x33u + (f - w_off)) & 0xFF)  /* overlay */
+                         : (uint8_t)(f & 0xFF);                      /* planted */
+            STM_ASSERT_EQ((int)out[i], (int)want);
+        }
+    }
+
+    /* Structural: Emid re-covered WHOLE as [7 MiB, 9 MiB) (the pullback),
+     * NOT bisected at 8 MiB. Non-vacuous vs the recordsize-slot-split. */
+    stm_extent_index *eidx2 = stm_sync_extent_index(stm_fs_sync(fs));
+    stm_extent_record m;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx2, 1, fino, 8u * MiB, &m));
+    STM_ASSERT_EQ(m.off, 7u * MiB);
+    STM_ASSERT_EQ(m.off + m.len, 9u * MiB);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 /* 9.7-impl-3: stm_fs_create_snapshot captures the dataset's real
  * committed per-dataset btree_engine root triple — not the
  * pre-impl-3 tree_root_paddr=0 stub. The snapshot's captured

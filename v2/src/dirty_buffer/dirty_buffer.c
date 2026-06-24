@@ -31,6 +31,7 @@
  */
 
 #include <stratum/dirty_buffer.h>
+#include <stratum/super.h>     /* STM_UB_SIZE — extent block granularity */
 
 #include <pthread.h>
 #include <stdint.h>
@@ -348,6 +349,93 @@ void stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
     pthread_mutex_unlock(&buf->mu);
 }
 
+/* Coalesce contiguous buffered ranges into as few extent writes as
+ * possible — realizing the dirty buffer's stated purpose ("absorbs
+ * many-small-writes ... and emits them as fewer/larger extents at
+ * flush time"). Without coalescing, each <=4 KiB range becomes its own
+ * extent, and each extent pays a full AEAD-tag block -> ~2-2.7x storage
+ * amplification that prematurely exhausts the pool (the #352 on-device
+ * `go build` ENOSPC: an 8 MiB file consumed ~16-24 MiB, failing at the
+ * exact on-device offset on a near-full pool).
+ *
+ * A run is the maximal prefix of contiguous ranges whose 4 KiB-aligned
+ * span stays within inode_cap (== the extent recordsize), so each
+ * emitted extent passes the extent layer's per-record size check
+ * (fs_write_extent_aligned_locked's ERANGE guard / stm_sync_write_extent
+ * len<=RECORDSIZE). The run's bytes are copied into one contiguous
+ * buffer and emitted as a single cb. A fully-contiguous 8 MiB buffer
+ * collapses from ~2048 tiny extents to 1-2 -> ~1x amplification.
+ *
+ * Pop-on-success is preserved at RUN granularity (the per-range
+ * pop-on-success rationale, post-c60b9e9, generalizes): on cb failure
+ * the run + all later ranges stay buffered (the fs retry dance
+ * re-drains them, no duplicate-extent cycle since nothing was popped);
+ * on success the whole run is freed. The spec's Flush (writeback.tla)
+ * models draining ranges into committed extents abstractly — it does
+ * not constrain extent granularity — so coalescing preserves
+ * ReadHidesFlushOrder / FlushPaddrFreshness / FlushPreservesNoOverlap.
+ *
+ * Caller holds buf->mu. */
+static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
+                                                  stm_dbuf_inode *e,
+                                                  stm_dirty_buffer_drain_cb cb,
+                                                  void *user)
+{
+    const uint64_t ds = e->dataset_id, ino = e->ino;
+    const uint64_t BLK = (uint64_t)STM_UB_SIZE;
+
+    while (e->head) {
+        stm_dbuf_range *first = e->head;
+        uint64_t run_start   = first->off;
+        uint64_t run_end     = first->off + first->len;
+        uint64_t aligned_off = run_start & ~(BLK - 1u);
+
+        /* Extend over contiguous ranges while the emitted extent's
+         * 4 KiB-aligned span stays within the recordsize cap. */
+        stm_dbuf_range *stop = first->next;
+        while (stop && stop->off == run_end) {
+            uint64_t cand_end    = stop->off + stop->len;
+            uint64_t aligned_end = (cand_end + BLK - 1u) & ~(BLK - 1u);
+            if (aligned_end - aligned_off > (uint64_t)buf->inode_cap) break;
+            run_end = cand_end;
+            stop    = stop->next;
+        }
+
+        uint64_t    run_len   = run_end - run_start;
+        const void *emit_data = first->data;   /* single-range fast path */
+        uint8_t    *coal      = NULL;
+        if (first->next != stop) {
+            coal = malloc((size_t)run_len);
+            if (coal) {
+                for (stm_dbuf_range *x = first; x != stop; x = x->next)
+                    memcpy(coal + (x->off - run_start), x->data,
+                           (size_t)x->len);
+                emit_data = coal;
+            } else {
+                /* Transient OOM: degrade to a single-range emit so the
+                 * flush still makes progress (never wedges). */
+                stop      = first->next;
+                run_len   = first->len;
+                emit_data = first->data;
+            }
+        }
+
+        stm_status crc = cb(user, ds, ino, run_start, run_len, emit_data);
+        free(coal);
+        if (crc != STM_OK) return crc;
+
+        /* Pop the emitted run on success. */
+        while (e->head != stop) {
+            stm_dbuf_range *done = e->head;
+            e->head = done->next;
+            e->bytes         -= done->len;
+            buf->total_bytes -= done->len;
+            free_range(done);
+        }
+    }
+    return STM_OK;
+}
+
 stm_status stm_dirty_buffer_drain_ino(stm_dirty_buffer *buf,
                                           uint64_t dataset_id, uint64_t ino,
                                           stm_dirty_buffer_drain_cb cb,
@@ -360,45 +448,7 @@ stm_status stm_dirty_buffer_drain_ino(stm_dirty_buffer *buf,
         pthread_mutex_unlock(&buf->mu);
         return STM_OK;
     }
-    /* SWISS-4q-flush BUG-FIX (post-c60b9e9): pop-on-success.
-     *
-     * Each successful callback CONSUMES the range from the buffer
-     * IMMEDIATELY. On callback failure (e.g., ENOSPC at the extent
-     * layer), the failed range and all subsequent un-tried ranges
-     * remain in the buffer; the SUCCEEDED-SO-FAR ranges are gone.
-     *
-     * The original "all-or-nothing per writeback.tla::Flush"
-     * semantics kept ALL ranges in the buffer on any failure —
-     * which created a CYCLE: range 1 succeeds → extent written →
-     * but buffer still contains range 1 → next drain re-emits
-     * range 1 → second extent (duplicate). Each retry doubled the
-     * extent count, amplifying user-visible storage usage.
-     *
-     * The spec's Flush models a single atomic state transition;
-     * the impl realizes that transition iteratively across N
-     * range emissions, each of which IS an independent state
-     * transition at the extent layer. Popping on success is the
-     * faithful impl translation. v2 of writeback.tla will split
-     * Flush into a per-range PerRangeFlush action; v1's Flush
-     * covers the all-success case, and the impl's partial-success
-     * is a degenerate prefix of the spec's reachable states. */
-    stm_status rc = STM_OK;
-    while (e->head) {
-        stm_dbuf_range *r = e->head;
-        uint64_t r_off = r->off;
-        uint64_t r_len = r->len;
-        stm_status crc = cb(user, dataset_id, ino, r_off, r_len, r->data);
-        if (crc != STM_OK) {
-            rc = crc;
-            break;
-        }
-        /* Successful flush — remove this range from the buffer
-         * before the next iteration. */
-        e->head = r->next;
-        e->bytes -= r_len;
-        buf->total_bytes -= r_len;
-        free_range(r);
-    }
+    stm_status rc = drain_inode_coalesced_locked(buf, e, cb, user);
     if (e->head == NULL) {
         /* Fully drained — destroy entry. */
         destroy_inode_locked(buf, e);
@@ -420,20 +470,7 @@ stm_status stm_dirty_buffer_drain_all(stm_dirty_buffer *buf,
         stm_dbuf_inode *e = buf->buckets[b];
         while (e) {
             stm_dbuf_inode *next = e->bucket_next;
-            stm_status rc = STM_OK;
-            while (e->head) {
-                stm_dbuf_range *r = e->head;
-                uint64_t r_off = r->off;
-                uint64_t r_len = r->len;
-                stm_status crc = cb(user, e->dataset_id, e->ino,
-                                       r_off, r_len, r->data);
-                if (crc != STM_OK) { rc = crc; break; }
-                /* Pop on success. */
-                e->head = r->next;
-                e->bytes -= r_len;
-                buf->total_bytes -= r_len;
-                free_range(r);
-            }
+            stm_status rc = drain_inode_coalesced_locked(buf, e, cb, user);
             if (e->head == NULL) {
                 destroy_inode_locked(buf, e);
             } else {

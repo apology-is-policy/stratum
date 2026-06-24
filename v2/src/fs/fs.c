@@ -123,6 +123,15 @@
 #define STM_FLUSH_INODE_CAP_BYTES   (8u * 1024u * 1024u)
 #define STM_FLUSH_GLOBAL_CAP_BYTES  (256u * 1024u * 1024u)
 
+/* A coalesced flush run targets a single record: the dirty-buffer drain
+ * extends a run up to the per-inode cap, and the extent layer's natural
+ * write granularity is the recordsize. fs_write_covering_split_locked
+ * would chunk a larger run at recordsize boundaries anyway, but keeping
+ * the cap <= recordsize bounds one flush run to at most one cross-slot
+ * pair rather than an arbitrary fan-out of tiny extents. */
+_Static_assert(STM_FLUSH_INODE_CAP_BYTES <= STM_FS_RECORDSIZE_MAX,
+               "dirty-buffer inode cap must not exceed the extent recordsize");
+
 /* SWISS-4q-flush: direct-write threshold. Writes ≥ this size bypass
  * the dirty buffer and go straight to the extent layer — they're
  * already large enough that buffering adds a memcpy without a real
@@ -1560,14 +1569,155 @@ static void fs_inode_bump_size(struct stm_inode_value *iv, uint64_t end_off)
     if (end_off > cur_size) iv->si_size = stm_store_le64(end_off);
 }
 
-/* SWISS-4q-flush helper: 4 KiB-aligned extent write with auto-RMW for
- * non-aligned (off, len). Does NOT update si_size or stamp timestamps
- * — that's the caller's responsibility (different for direct writes
- * vs. flush-callback writes). Used by both fs_write_regular_locked's
- * direct branch AND the dirty-buffer drain callback at flush time.
+/* Read [a_off, a_end) (both 4 KiB-aligned) into pre-zeroed `scratch`,
+ * accumulating each covering extent's plaintext and leaving holes zero.
  *
- * Realizes the alignment-RMW logic SWISS-4q P1 introduced for the
- * file-tail case (extent layer requires (off, len) ≡ 0 mod 4 KiB).
+ * Why a loop and not one stm_sync_read_extent: that primitive zero-fills
+ * the ENTIRE requested len at a hole and reports it as fully read (the
+ * sync hole-as-zeros contract, sync.c). So a single read over a span whose
+ * head -- or any interior gap -- is a hole would zero straight over a LATER
+ * extent in the span and then re-write those zeros as live data (the
+ * deep-fix F2 class, re-triggered by a leading/interior hole). This loop
+ * classifies each block-aligned position via stm_extent_lookup_at and
+ * bounds each read to the covering extent's end, so a hole only zero-fills
+ * its own block run, never a following extent. Holes stay zero (calloc),
+ * which is the correct content for an unallocated range.
+ *
+ * Caller holds fs->lock. */
+static stm_status fs_rmw_read_span_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
+                                            uint64_t a_off, uint64_t a_end,
+                                            uint8_t *scratch)
+{
+    const uint64_t BLK = 4096u;
+    stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
+    if (!eidx) return STM_OK;   /* no index reachable -> treat span as a hole */
+    uint64_t cur = a_off;
+    while (cur < a_end) {
+        stm_extent_record e;
+        stm_status ls = stm_extent_lookup_at(eidx, ds, ino, cur, &e);
+        if (ls == STM_ENOENT) { cur += BLK; continue; }   /* hole: stays zero */
+        if (ls != STM_OK) return ls;
+        uint64_t ext_end = e.off + e.len;
+        uint64_t want = (a_end < ext_end ? a_end : ext_end) - cur;
+        size_t got = 0;
+        stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, cur,
+                                               scratch + (cur - a_off),
+                                               (size_t)want, &got);
+        if (rs != STM_OK && rs != STM_ENOENT) return rs;
+        /* got==want for a covering extent; a raced removal returns a hole-
+         * filled `want` (still progress). 0 is defensive only. */
+        cur += (got > 0u) ? (uint64_t)got : BLK;
+    }
+    return STM_OK;
+}
+
+/* Write [a_off, a_off+a_len) (both 4 KiB-aligned) as covering extents.
+ *
+ * A single stm_sync_write_extent is ATOMIC w.r.t. the extents it would drop:
+ * it reserves blocks, writes + encrypts the payload, and only THEN runs
+ * stm_extent_overwrite (which drops the overlapped records + immediately
+ * frees their paddrs). Any failure -- ENOSPC on reserve, a bdev write error,
+ * an encrypt error -- returns BEFORE the drop, leaving the old extents
+ * intact. The covering write exploits that: when the whole cover fits one
+ * record (a_len <= recordsize) it is written as ONE extent -- atomic, no
+ * partial-failure window, and a cross-slot span is fine (stm_sync_write_extent
+ * has no slot-alignment requirement, only len <= recordsize). This is the
+ * common case and CLOSES the #352-arc partial-split-failure data loss (F1 /
+ * SA-1): a mid-split ENOSPC on a near-full pool that drops a straddling extent
+ * the failed piece can no longer re-cover, after which the dirty-buffer retry
+ * reads the now-hole as zeros and makes the loss durable.
+ *
+ * Only a cover EXCEEDING the recordsize (a large direct write, or a legacy
+ * double-straddle expansion) must split. There each piece is bounded to
+ * <= recordsize AND its end is pulled back so it never BISECTS an existing
+ * extent -- so each piece fully contains every extent it drops and stays
+ * atomic; a failed piece drops nothing, and the dirty-buffer retry converges
+ * (the not-yet-written extents are still intact in the index). cur always
+ * starts at an extent boundary or a hole (a_off is head.off or a gap), so by
+ * induction it never lands inside an extent.
+ *
+ * Caller holds fs->lock. */
+static stm_status fs_write_covering_split_locked(stm_fs *fs, uint64_t ds,
+                                                   uint64_t ino, uint64_t a_off,
+                                                   const uint8_t *buf,
+                                                   uint64_t a_len)
+{
+    const uint64_t REC = (uint64_t)STM_FS_RECORDSIZE_MAX;
+    stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
+    uint64_t a_end = a_off + a_len;
+    uint64_t cur = a_off;
+    while (cur < a_end) {
+        uint64_t remain    = a_end - cur;
+        uint64_t piece_end = (remain <= REC) ? a_end : (cur + REC);
+        /* Don't bisect an existing extent straddling the split point: the
+         * piece would partially overlap it, stm_extent_overwrite would
+         * whole-drop it, and a later piece's failure would lose its far part
+         * (F1). Pull the split back to that extent's start so it goes WHOLE
+         * into the next piece. (Unreached when a_len <= recordsize:
+         * piece_end == a_end already.) */
+        if (eidx && piece_end < a_end) {
+            stm_extent_record e;
+            stm_status ls = stm_extent_lookup_at(eidx, ds, ino, piece_end, &e);
+            if (ls == STM_OK) {
+                /* F3: the no-bisection induction (a covering extent at
+                 * cur+REC must have e.off > cur, else it would span >REC)
+                 * rests on no extent exceeding the recordsize -- which the
+                 * index layer does not itself enforce. A corrupt oversized
+                 * record (surfaced past AEAD) would break it; fail closed,
+                 * matching stm_sync_truncate's posture (sync.c). */
+                if (e.len > REC) return STM_ECORRUPT;
+                if (e.off > cur && e.off < piece_end) piece_end = e.off;
+            } else if (ls != STM_ENOENT) {
+                return ls;
+            }
+        }
+        stm_status ws = stm_sync_write_extent(fs->sync, ds, ino, cur,
+                                                buf + (cur - a_off),
+                                                (size_t)(piece_end - cur));
+        if (ws != STM_OK) return ws;
+        cur = piece_end;
+    }
+    return STM_OK;
+}
+
+/* Write [off, off+len) at the extent layer, preserving every byte the write
+ * does not itself cover. The #352-F1 / #355 fix, and the fix for the prior
+ * deep fix's own F1 (slot clamp) + F2 (single-extent read).
+ *
+ * Does NOT update si_size or stamp timestamps -- the caller's responsibility
+ * (differs for direct writes vs flush-callback writes). Used by both
+ * fs_write_regular_locked's direct branch AND the dirty-buffer drain callback.
+ *
+ * stm_extent_overwrite maintains extent.tla::NoOverlapWithinIno by
+ * REPLACING a same-off record and WHOLE-DROPPING any other-off record that
+ * overlaps the NEW record's [off, len) (extent_index.c) -- each extent is
+ * one AEAD blob, so the index cannot split one. So a covering write must
+ * FULLY contain every existing extent it overlaps, with scratch holding
+ * those extents' live bytes; else a partially-overlapped extent is dropped
+ * and its sticking-out head/tail is silently lost.
+ *
+ *   1. UNCLAMPED expansion: the only extents that can stick out beyond
+ *      [off, end_off) are the two covering the ends (interior overlapped
+ *      extents are fully contained, by NoOverlap), so a two-end lookup
+ *      computes [exp_off, exp_end). It MUST NOT be clamped to a recordsize
+ *      slot (the deep-fix F1 bug) -- a legacy cross-slot extent dropped
+ *      against a clamped cover loses its far-slot tail.
+ *   2. Fast path: nothing sticks out AND the write is block-aligned -> the
+ *      write fully covers every extent it touches, nothing to preserve.
+ *      Write directly (split at recordsize). Sequential dense fill takes
+ *      this with no RMW read, preserving the coalescing amplification win.
+ *   3. RMW: read the WHOLE [a_off, a_end) looping across every extent
+ *      (fs_rmw_read_span_locked), overlay the new bytes, write the covering
+ *      span (fs_write_covering_split_locked). Reading the whole span BEFORE
+ *      any write is load-bearing: a >recordsize cover's later piece may
+ *      re-cover an extent an earlier piece dropped -- the re-cover bytes must
+ *      already be in scratch.
+ *
+ * F4 (v1.x seam): an interior hole inside the RMW cover is materialized as a
+ * zero-filled extent (it joins the covering write rather than staying sparse)
+ * -- a sparse-file space cost, never data loss (a hole and an explicit-zero
+ * extent both read zero). Only on the RMW path; the dense fast path is sparse-
+ * preserving.
  *
  * Caller holds fs->lock. */
 static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
@@ -1579,28 +1729,47 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
     if (len == 0u) return STM_OK;
     const uint64_t BLK = 4096u;
     uint64_t end_off = off + (uint64_t)len;
-    bool aligned = (off % BLK == 0u) && ((uint64_t)len % BLK == 0u);
-    if (aligned) {
-        return stm_sync_write_extent(fs->sync, ds, ino, off, buf, len);
+
+    stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
+    uint64_t exp_off = off, exp_end = end_off;
+    if (eidx) {
+        stm_extent_record e;
+        stm_status ls = stm_extent_lookup_at(eidx, ds, ino, off, &e);
+        if (ls == STM_OK) { if (e.off < exp_off) exp_off = e.off; }
+        else if (ls != STM_ENOENT) return ls;
+        ls = stm_extent_lookup_at(eidx, ds, ino, end_off - 1u, &e);
+        if (ls == STM_OK) { if (e.off + e.len > exp_end) exp_end = e.off + e.len; }
+        else if (ls != STM_ENOENT) return ls;
     }
-    uint64_t aligned_off = off & ~(BLK - 1u);
-    uint64_t aligned_end = (end_off + BLK - 1u) & ~(BLK - 1u);
-    if (aligned_end > (uint64_t)STM_FS_RECORDSIZE_MAX + aligned_off) {
-        return STM_ERANGE;
+
+    uint64_t a_off = exp_off & ~(BLK - 1u);
+    uint64_t a_end = (exp_end + BLK - 1u) & ~(BLK - 1u);
+
+    /* Fast path: no existing extent sticks out beyond the write and the
+     * write is block-aligned -> every overlapped extent is fully covered,
+     * nothing to preserve. */
+    if (a_off == off && a_end == end_off
+            && (off % BLK == 0u) && ((uint64_t)len % BLK == 0u)) {
+        return fs_write_covering_split_locked(fs, ds, ino, off,
+                                                (const uint8_t *)buf,
+                                                (uint64_t)len);
     }
-    uint64_t aligned_len = aligned_end - aligned_off;
-    uint8_t *scratch = (uint8_t *)calloc(1, (size_t)aligned_len);
+
+    uint64_t a_len = a_end - a_off;
+    /* F2: bound the RMW scratch. The unclamped expansion can legitimately
+     * reach ~3*recordsize (a <=recordsize cover whose two ends each abut a
+     * full-recordsize legacy cross-slot extent, plus block rounding); cap
+     * generously above that so a future direct caller passing a huge
+     * non-aligned len cannot drive an unbounded calloc (the symmetric read
+     * path bounds its scratch the same way, fs_read_extent_aligned_locked). */
+    if (a_len > (uint64_t)STM_FS_RECORDSIZE_MAX * 4u) return STM_ERANGE;
+    uint8_t *scratch = (uint8_t *)calloc(1, (size_t)a_len);
     if (!scratch) return STM_ENOMEM;
-    size_t got = 0;
-    stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, aligned_off,
-                                               scratch, (size_t)aligned_len, &got);
-    if (rs != STM_OK && rs != STM_ENOENT) {
-        free(scratch);
-        return rs;
-    }
-    memcpy(scratch + (off - aligned_off), buf, len);
-    stm_status ws = stm_sync_write_extent(fs->sync, ds, ino, aligned_off,
-                                              scratch, (size_t)aligned_len);
+    stm_status rs = fs_rmw_read_span_locked(fs, ds, ino, a_off, a_end, scratch);
+    if (rs != STM_OK) { free(scratch); return rs; }
+    memcpy(scratch + (off - a_off), buf, len);
+    stm_status ws = fs_write_covering_split_locked(fs, ds, ino, a_off,
+                                                     scratch, a_len);
     free(scratch);
     return ws;
 }
@@ -1705,6 +1874,12 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
      * STM_EINVAL, so this short-circuit makes INLINE behavior
      * symmetric with EXTENT. Linux ext4/XFS short-circuit similarly. */
     if (len == 0u) return STM_OK;
+
+    /* F3: bound off+len so end_off -- and the extent path's exp_end / a_end
+     * roundup -- cannot wrap. The eventual stm_sync_write_extent rejects the
+     * same condition, but the expansion lookups + scratch sizing run first;
+     * guard here so they never operate on a wrapped offset. */
+    if (off > UINT64_MAX - (uint64_t)len) return STM_EOVERFLOW;
 
     uint8_t kind = iv->si_data_kind;
     uint64_t end_off = off + (uint64_t)len;
