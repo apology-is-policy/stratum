@@ -166,7 +166,7 @@ host-CPU-bound, the *ratios* are the portable signal):
 | **AEGIS-256** dec | 6096 | 7751 | 7897 | 7824 |
 | **XChaCha20-SIV** enc (fallback, no-AES) | 199 | 209 | 210 | 203 |
 | **XChaCha20-SIV** dec | 193 | 208 | 209 | 203 |
-| **BLAKE3-256** (Merkle / CAS hash) | 848 | 819 | 832 | 835 |
+| **BLAKE3-256** (Merkle / CAS hash, NEON) | 1808 | 1888 | 1898 | 1907 |
 | **xxHash3-64** (unencrypted-volume csum) | 38033 | 36766 | 38531 | 38427 |
 
 (all MiB/s).
@@ -177,12 +177,13 @@ the crypto extensions), the AEAD layer runs at **~7.6 GiB/s decrypt / ~8.6 GiB/s
 encrypt** — *far* above any single-NVMe bandwidth (~1–7 GB/s). The crypto layer
 is **not** the bottleneck for sequential I/O on the target hardware; the
 "accepted delta" is small. Integrity hashing is near-parity (BTRFS/ZFS checksum
-too) — xxHash3 at ~37 GiB/s is far above any device, and BLAKE3 is comparable to
-portable SHA-256 (with a 2.3× SIMD lever available, 32.8).
+too) — xxHash3 at ~37 GiB/s is far above any device, and BLAKE3 at ~1.9 GiB/s
+(NEON, enabled in Area E — 32.8) is comfortably above NVMe.
 
 **The dcache benefit** (`bench_crypto`'s last row): a 1 MiB extent re-read is
-a `decrypt → memcpy` swap — **~7.4 GiB/s decrypt (miss) → ~75 GiB/s memcpy (hit),
-a 10.1× speedup** (the memcpy timed under a compiler barrier so the number is
+a `decrypt → memcpy` swap — **~7.6 GiB/s decrypt (miss) → ~65–77 GiB/s memcpy
+(hit), an ~8–10× speedup** (the memcpy column is host-cache-sensitive; the
+decrypt is stable; the memcpy is timed under a compiler barrier so it is
 elision-proof). For REVENANT (a binary's text faulted in many page slices), the
 cache eliminates `(N−1)/N` of the decrypt work.
 
@@ -200,16 +201,16 @@ cache eliminates `(N−1)/N` of the decrypt work.
 
 ## 32.8 Known caveats / tracked perf debt
 
-- **BLAKE3 runs the portable (non-SIMD) path** — `third_party/CMakeLists.txt`
-  compiles only `blake3_portable.c` ("re-enable SIMD in Phase 9 once benchmarks
-  justify"). Area E is that benchmark, and it justifies: enabling the vendored,
-  byte-pristine `blake3_neon.c` (NEON is baseline on ARMv8) + `BLAKE3_USE_NEON=1`
-  measures **~830 → ~1900 MiB/s (2.3×)** on this ARM core with the AEAD/tamper
-  vectors still passing. An ~8-line ARM-gated CMake change; left as **tracked
-  perf debt pending a greenlight to touch `third_party/`** (a build-config
-  change with Stratum-wide blast radius; the pre-apply gate is a full-suite run
-  with NEON, which validates the hashes are byte-identical — BLAKE3 SIMD is
-  bit-for-bit the portable hash, so existing pools' Merkle/CAS stay valid).
+- **BLAKE3 SIMD (NEON) enabled in Area E.** The original wiring compiled only
+  `blake3_portable.c` ("re-enable SIMD once benchmarks justify"); the crypto
+  bench measured the portable path leaving ~2.3× on the integrity layer (Merkle
+  / CAS hashing). `third_party/CMakeLists.txt` now compiles the vendored
+  `blake3_neon.c` (NEON is baseline on ARMv8) with `BLAKE3_USE_NEON=1`, ARM-gated
+  (x86 stays portable). **~830 → ~1900 MiB/s (2.3×)**, AEAD/tamper vectors still
+  passing. BLAKE3 SIMD is bit-for-bit the portable hash, so on-disk Merkle/CAS
+  values are unchanged — validated by the full suite passing with NEON (existing
+  pools stay valid). A remaining lever: x86 SIMD (SSE/AVX) is still off (no
+  on-target need; would want the BLAKE3 runtime-dispatch wiring).
 - **The XChaCha20-SIV fallback is ~40× slower than AEGIS-256** (~200 MB/s). It
   is the AEAD only on hardware *without* AES acceleration; the Thylacine ARM64
   target has the crypto extensions, so AEGIS-256 is used. On an AES-less
@@ -231,5 +232,6 @@ cache eliminates `(N−1)/N` of the decrypt work.
 Implemented (Area E): the dcache (`src/sync/sync.c`), the
 `stm_sync_dcache_stats` accessor (`include/stratum/sync.h`), the two
 correctness regressions (`tests/test_fs.c`), and the crypto throughput baseline
-(`tests/bench_crypto.c`). The BLAKE3-NEON SIMD enable is tracked perf debt
-(32.8). Closed list: `memory/audit_stratum_E_closed_list.md`.
+(`tests/bench_crypto.c`) + the BLAKE3-NEON SIMD enable (`third_party/CMakeLists.txt`,
+2.3× integrity throughput, 32.8). Closed list:
+`memory/audit_stratum_E_closed_list.md`.
