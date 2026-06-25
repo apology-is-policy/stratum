@@ -105,6 +105,16 @@ stm_add_test(test_compound_ops_concurrent
 # concurrency is the subject; competing test PROCESSES are noise, so
 # RUN_SERIAL gives it the host to itself (solo it completes in ~6s).
 set_tests_properties(test_compound_ops_concurrent PROPERTIES RUN_SERIAL TRUE)
+# Area D R171 ground-truth repro: wait-free LF-3 read vs same-key writer upsert.
+# NOT a default gate -- reproduces the documented #1218 UAF; run explicitly
+# under ASan (TSan is host-broken on macOS arm64 post-2026-06).
+stm_add_test(test_concurrent_lf_read
+             test_concurrent_lf_read.c test_fs_common.c)
+set_tests_properties(test_concurrent_lf_read PROPERTIES RUN_SERIAL TRUE)
+# Area D throughput probe: concurrent-writer scaling. A bench, not a ctest.
+add_executable(bench_concurrent_write bench_concurrent_write.c test_fs_common.c)
+target_link_libraries(bench_concurrent_write PRIVATE stm_testlib stratum
+                                             stm_warnings stm_sanitize stm_coverage)
 stm_add_test(test_lp9        test_lp9.c)
 target_link_libraries(test_lp9 PRIVATE stm_lp9)
 stm_add_test(test_stratum_fs test_stratum_fs.c test_fs_common.c)

@@ -2839,6 +2839,7 @@ reference below covers the as-built layers in bottom-up order.
 | [26-fs-write-path.md](reference/26-fs-write-path.md) | FS write path — flush/coalesce/RMW/extent-overwrite (Stabilization Area A) | medium |
 | [27-fs-read-path.md](reference/27-fs-read-path.md) | FS read path — single/multi-extent + buffered overlay (Stabilization Area B) | small |
 | [28-bdev-error-recovery.md](reference/28-bdev-error-recovery.md) | I/O-error handling + recovery — bdev re-init, FS wedge contract, dev9p errno (Stabilization Area F) | medium |
+| [29-concurrency.md](reference/29-concurrency.md) | Concurrency model — threading, lock hierarchy, EBR/wait-free reads, R171 status, write-scaling (Stabilization Area D) | medium |
 
 This is a live document — every phase-chunk commit that touches a
 subsystem updates the corresponding section in the same PR.
