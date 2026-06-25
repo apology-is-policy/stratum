@@ -169,6 +169,12 @@
 /* Cap on spurious IRQ wakes (config-change without used-buffer). */
 #define MAX_NON_USED_BUFFER_WAKES    16u
 
+/* Bounded transient-fault recovery: a failed request triggers up to this
+ * many (device re-init + re-submit) cycles before the bdev is latched
+ * permanently. A transient virtio hiccup self-heals on the first re-init;
+ * a genuinely dead device exhausts the budget + latches (Area F #2). */
+#define DO_REQUEST_MAX_REINIT        2u
+
 /* Thylacine kobj-rights bits. Mirror of kernel/include/thylacine/handle.h
  * (and libthyla_rs / libt). The kernel reserves (1u << 3) for
  * RIGHT_TRANSFER and (1u << 4) for RIGHT_DMA; do NOT collide. */
@@ -221,9 +227,17 @@ typedef struct {
     uint32_t         slot;
     uint32_t         intid;
 
-    /* avail.idx counter. Monotonic across all requests; invariant B-4. */
+    /* avail.idx counter. Monotonic across all requests; invariant B-4.
+     * Reset to 0 by a device re-init (the recovery path), which also
+     * resets the device's own idx via a VIRTIO reset. */
     uint16_t         avail_idx;
-    bool             failed;      /* latched on any do_request error (R4-F1) */
+    /* Latched PERMANENTLY only after a request fails AND the bounded
+     * re-init recovery (reinit_device_locked + retry) has been exhausted
+     * -- i.e. a genuinely dead device, not a transient hiccup (R4-F1
+     * recovery, Area F #2). Once true, every op short-circuits to
+     * STM_EIO. */
+    bool             failed;
+    uint64_t         reinit_count;  /* diagnostics: device recoveries fired */
 } thyla_bdev;
 
 /* ------------------------------------------------------------------------- */
@@ -454,17 +468,34 @@ static void init_descriptors(uint64_t ring_va, uint64_t ring_pa, uint64_t data_p
 /* the bytes to write (for OUT) or receives the bytes read (for IN).          */
 /* ------------------------------------------------------------------------- */
 
-static stm_status do_request(thyla_bdev *d, uint64_t lba,
-                              uint32_t sector_count, bool is_write)
+/* Recover a failed virtio device IN PLACE. init_device writes STATUS=0
+ * first -- a full VIRTIO 1.2 reset (sec 4.2.3.1 / 2.1: the device MUST
+ * re-initialise all state, dropping any in-flight request and resetting
+ * its avail/used idx to 0) -- then re-negotiates + re-programs the rings;
+ * init_descriptors rebuilds the 3-entry chain; avail_idx resets to 0 to
+ * match the freshly-reset device. The MMIO bank + DMA mappings persist
+ * (claimed once at open; invariant B-6) -- only the device-side state
+ * machine + the rings reset, so the data DMA buffer's contents survive
+ * (a re-submit re-uses them). This is the recovery the R4-F1 latch always
+ * assumed ("Stratum tears down + re-opens") but which no caller ever
+ * drove -- done in place so a transient hiccup self-heals before the FS
+ * sees EIO (Area F #2). Returns false iff the re-negotiation fails (an
+ * unrecoverable device). Caller holds d->lock. */
+static bool reinit_device_locked(thyla_bdev *d)
 {
-    /* R4-F1: once any request has failed, the avail/used ring state is
-     * uncertain (the device may have consumed a published avail.idx whose
-     * completion we never matched). Refuse all further I/O so Stratum tears
-     * down + re-opens (re-init resets avail_idx) rather than re-publishing a
-     * stale idx (-> the device sees no new buffer -> hang) or mis-matching a
-     * prior completion with this request's wait (-> silent stale read). */
-    if (d->failed) return STM_EIO;
+    if (!init_device(d->slot_va, d->ring_pa)) return false;
+    init_descriptors(THYLA_RING_USER_VA, d->ring_pa, d->data_pa);
+    d->avail_idx = 0;
+    d->reinit_count++;
+    return true;
+}
 
+/* Submit one virtqueue request + wait for completion. STM_OK on a clean
+ * completion; STM_EIO on any failure WITHOUT latching -- the recovery /
+ * latch decision is do_request()'s. Caller holds d->lock. */
+static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
+                                   uint32_t sector_count, bool is_write)
+{
     /* Pre-poison status byte so a missing device write surfaces. */
     *(volatile uint8_t *)(THYLA_RING_USER_VA + VQ_STATUS_OFF) = 0xff;
 
@@ -537,11 +568,50 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
     return STM_OK;
 
 io_fail:
-    /* R4-F1: the avail.idx was published to the device but the outcome is
-     * uncertain; latch failed so every later op short-circuits to STM_EIO
-     * (above) and Stratum re-opens the bdev (re-init resets avail_idx). */
-    d->failed = true;
+    /* The avail.idx was published but the outcome is uncertain. Surface
+     * STM_EIO to do_request(), which owns the re-init recovery + the
+     * permanent latch -- a re-init resets both ends to idx 0, so this
+     * uncertain state cannot strand a re-submitted request. */
     return STM_EIO;
+}
+
+/* Submit a request with bounded transient-fault recovery. A failed
+ * do_request_once is a (possibly transient) virtio hiccup: re-init the
+ * device (resyncs both ends to idx 0) + re-submit, up to
+ * DO_REQUEST_MAX_REINIT times. Only after the recovery budget is
+ * exhausted -- or a re-init itself fails -- is the bdev latched
+ * PERMANENTLY (d->failed), surfacing STM_EIO to the FS (whose extent
+ * writes are then retryable / commits wedge per the FS's own contract;
+ * see tests/test_fs.c::fs_io_transient_write_eio_flush_recovers). A
+ * re-submit is idempotent: a READ re-reads the same LBA; a WRITE
+ * re-writes the same LBA from the unchanged data DMA buffer (the re-init
+ * does not touch it). Caller holds d->lock (the request is serialised;
+ * invariant B-2), so the latch + reinit_count are single-writer here. */
+static stm_status do_request(thyla_bdev *d, uint64_t lba,
+                              uint32_t sector_count, bool is_write)
+{
+    /* Already permanently dead (recovery previously exhausted). R4-F1:
+     * never re-publish onto a device whose ring state we abandoned. */
+    if (d->failed) return STM_EIO;
+
+    for (uint32_t attempt = 0; ; attempt++) {
+        stm_status s = do_request_once(d, lba, sector_count, is_write);
+        if (s == STM_OK) return STM_OK;
+
+        if (attempt >= DO_REQUEST_MAX_REINIT) {
+            /* Recovery budget exhausted -- the device is genuinely dead.
+             * Latch so every later op short-circuits + the FS surfaces
+             * the durable failure. */
+            d->failed = true;
+            return STM_EIO;
+        }
+        if (!reinit_device_locked(d)) {
+            /* The device cannot even be re-negotiated -- unrecoverable. */
+            d->failed = true;
+            return STM_EIO;
+        }
+        /* Re-submit against the freshly reset rings. */
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -655,6 +725,14 @@ static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t
 
 static stm_status op_fsync(stm_bdev *base)
 {
+    /* A permanently-latched device cannot honestly report a flush as durable
+     * -- fail closed so the latch is consistent across the whole vtable, not
+     * just read/write (Area F #2 makes d->failed a reachable long-lived state).
+     * Today every durability path writes-then-fsyncs the same device, so a
+     * latched write fails first + this is never reached; the guard keeps a
+     * bare fsync() honest. */
+    if (((thyla_bdev *)base)->failed) return STM_EIO;
+
     /* No-op flush -- correct ONLY because the boot launch attaches the
      * virtio-blk drives cache=writethrough (tools/run-vm.sh), so every
      * op_write is already synchronously durable and there is nothing to

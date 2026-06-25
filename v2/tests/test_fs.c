@@ -993,6 +993,96 @@ STM_TEST(fs_io_buffered_read_offset_in_hole) {
     unlink(g_tmp_path);
 }
 
+/* Area F (I/O-error recovery contract): a TRANSIENT bdev write EIO
+ * during the dirty-buffer flush -- the extent-write half of
+ * stm_fs_commit -- is RECOVERABLE. The flush failure leaves the
+ * buffered ranges in-RAM (fs.c:1505 "the inode's buffered ranges
+ * remain in-RAM for retry") and does NOT wedge the fs; only a failed
+ * sync_commit (the tree-write half) wedges (R154 -- pinned by
+ * test_crash_inject.c::r154_failed_commit_wedges_fs). Once the
+ * transient clears, a retried stm_fs_commit succeeds and the data is
+ * byte-intact -- no silent loss.
+ *
+ * This is the FS-layer half of the Area F recovery contract -- the
+ * property the bdev_thylacine in-place re-init (the #2 fix) relies on.
+ * A bdev that RECOVERS from a transient virtio fault (re-init resets
+ * the rings) instead of latching d->failed permanently lets the FS's
+ * existing retry path complete. The posix backend's fault injection is
+ * transient by construction (fires once, then proceeds), so it models
+ * exactly the recovered-bdev case. bdev_thylacine itself is
+ * Thylacine-only (not host-compilable -- #error-guarded on
+ * __NR_mmio_create); its re-init fix is verified by the in-guest
+ * go-build E2E, with this test pinning the FS-side contract it depends
+ * on.
+ *
+ * Non-vacuous: if the extent-flush failure wedged the fs, the
+ * not-wedged assertion fails; if a failed flush dropped the buffered
+ * data, the post-recovery byte-check fails. */
+STM_TEST(fs_io_transient_write_eio_flush_recovers) {
+    make_tmp("xient_eio");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;  /* ample */
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                     0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, /*ds=*/1, dir,
+                                        (const uint8_t *)"obj.o", 5,
+                                        0644u, 0, 0, &fino));
+
+    /* Write a 20 KiB file into the dirty buffer (absolute-offset keyed);
+     * NOT yet flushed -- the bytes live only in RAM until commit. */
+    const uint64_t LEN = 20u * 1024u;
+    uint8_t chunk[4096];
+    for (uint64_t off = 0; off < LEN; off += (uint64_t)sizeof chunk) {
+        for (uint64_t i = 0; i < sizeof chunk; i++)
+            chunk[i] = (uint8_t)((off + i) & 0xFF);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, fino, off, chunk, sizeof chunk));
+    }
+
+    /* Arm the bdev so the FIRST state-changing op of the next commit
+     * fails once. fs_flush_all (the dirty-buffer drain -> extent writes)
+     * runs BEFORE sync_commit's tree/UB writes, so op 1 is the file's
+     * extent WRITE -- the recoverable path. */
+    stm_bdev *bdev = stm_fs_bdev_for_test(fs);
+    STM_ASSERT(bdev != NULL);
+    stm_bdev_inject_fail_after(bdev, 1);
+
+    /* The commit fails with the injected I/O error. */
+    stm_status cs = stm_fs_commit(fs);
+    STM_ASSERT(cs != STM_OK);
+    STM_ASSERT_EQ(stm_bdev_inject_fired_count(bdev), 1u);
+
+    /* The flush-failure path does NOT wedge -- buffered data stays
+     * in-RAM for retry. (A wedge here would be the bug.) */
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.wedged, false);
+
+    /* Transient cleared (the inject fired once): a retried commit
+     * succeeds against the recovered bdev. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Data is byte-intact across the transient -- no silent loss. */
+    for (uint64_t off = 0; off < LEN; off += 4096u) {
+        uint8_t out[4096] = {0};
+        STM_ASSERT_OK(read_full(fs, 1, fino, off, out, sizeof out));
+        for (uint64_t i = 0; i < sizeof out; i++)
+            STM_ASSERT_EQ((int)out[i], (int)((off + i) & 0xFF));
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 /* 9.7-impl-3: stm_fs_create_snapshot captures the dataset's real
  * committed per-dataset btree_engine root triple — not the
  * pre-impl-3 tree_root_paddr=0 stub. The snapshot's captured
