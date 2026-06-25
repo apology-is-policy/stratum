@@ -627,6 +627,21 @@ three rows above, and is NOT in the original closure enumeration. The BE-write
 chunk MUST also make `eng->root`'s slow-warm mutation atomic-or-`commit_mu`-
 covered on both paths. Added here so the seam ledger is complete.
 
+**A second in-RAM cache stale on the same root-swap event (Area S audit F1):**
+the per-dataset inode `dsstate` (`inode.c` -- `next_ino` plus the Area-S
+`freed_count` / `freed_scan_lo` O(1)-reuse-gate fields) is NOT re-seeded by the
+snapshot-rollback engine-root swap (`stm_fs_rollback_snapshot` ->
+`stm_dataset_index_set_engine_root`), so after a rollback it reflects the
+discarded post-snapshot tree. SAFE-DEGRADED at v1.0 (single-threaded under
+`fs->global` EX; the alloc scan reads the LIVE engine, and `next_ino` stays a
+monotone high-water mark >= the rolled-back tree's max, so AllocFresh never
+re-issues a live ino -- pre-existing for `next_ino`, inherited by the new
+fields). The fix is the inode twin of F2: the BE-write / concurrent-FS chunk
+must invalidate (`seeded=false`) the inode `dsstate` for the rolled-back
+dataset at `set_engine_root`, AND re-validate the `next_ino`-monotonicity
+argument under the multi-connection model (a second connection allocating on a
+just-rolled-back dataset).
+
 **Thylacine relevance -- why this is load-bearing, not optional.**
 Thylacine's `stratumd` is thread-per-connection with **serial**
 per-connection processing, so a single 9P session (the v1.0 boot, the

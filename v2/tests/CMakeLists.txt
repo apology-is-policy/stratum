@@ -115,6 +115,13 @@ set_tests_properties(test_concurrent_lf_read PROPERTIES RUN_SERIAL TRUE)
 add_executable(bench_concurrent_write bench_concurrent_write.c test_fs_common.c)
 target_link_libraries(bench_concurrent_write PRIVATE stm_testlib stratum
                                              stm_warnings stm_sanitize stm_coverage)
+# Area S many-small-files correctness stress (2000-file create / readdir
+# completeness / chain integrity at N=1000 / churn / inline<->extent boundary).
+stm_add_test(test_pleiades   test_pleiades.c test_fs_common.c)
+# Area S throughput probe: create/metadata rate. A bench, not a ctest.
+add_executable(bench_create_many bench_create_many.c test_fs_common.c)
+target_link_libraries(bench_create_many PRIVATE stm_testlib stratum
+                                        stm_warnings stm_sanitize stm_coverage)
 stm_add_test(test_lp9        test_lp9.c)
 target_link_libraries(test_lp9 PRIVATE stm_lp9)
 stm_add_test(test_stratum_fs test_stratum_fs.c test_fs_common.c)

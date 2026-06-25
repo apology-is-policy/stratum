@@ -329,6 +329,56 @@ STM_TEST(inode_reuse_gen_monotonic_across_cycles) {
     inode_test_idx_close(idx);
 }
 
+/* Area S (S-1/S-1b): the freed_count scan-gate + freed_scan_lo cursor that make
+ * alloc O(1) must preserve AllocReused semantics EXACTLY -- reuse the LOWEST
+ * freed ino first (gen-bumped), fall through to a fresh ino once the freed set
+ * drains (gate off), and still find a freed ino that appears BELOW the advanced
+ * cursor. A broken gate would skip a reuse (hand back a fresh ino instead of
+ * the freed one); a broken cursor would skip a freed ino or never find one
+ * freed behind it. */
+STM_TEST(inode_reuse_scattered_lowest_first) {
+    stm_inode_index *idx = inode_test_idx();
+
+    /* Fresh inos 1..10 (gen 0). */
+    for (unsigned i = 0; i < 10u; i++) {
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+        STM_ASSERT_EQ(ino, (uint64_t)(i + 1u));
+    }
+
+    /* Free a scattered, out-of-order subset. */
+    STM_ASSERT_OK(stm_inode_free(idx, 1, 5u));
+    STM_ASSERT_OK(stm_inode_free(idx, 1, 3u));
+    STM_ASSERT_OK(stm_inode_free(idx, 1, 8u));
+    STM_ASSERT_OK(stm_inode_free(idx, 1, 1u));
+
+    /* AllocReused returns the lowest freed first: 1, 3, 5, 8 -- each gen-bumped
+     * from 0 to 1. */
+    const uint64_t expect[4] = { 1u, 3u, 5u, 8u };
+    for (unsigned i = 0; i < 4u; i++) {
+        uint64_t got = 0;
+        STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &got));
+        STM_ASSERT_EQ(got, expect[i]);
+        struct stm_inode_value v = {0};
+        STM_ASSERT_OK(stm_inode_lookup(idx, 1, got, &v));
+        STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)1);
+    }
+
+    /* Freed set drained -> the gate is off -> a fresh ino (11). */
+    uint64_t fresh = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &fresh));
+    STM_ASSERT_EQ(fresh, (uint64_t)11);
+
+    /* A free BELOW the advanced cursor must still be found: free 2, realloc
+     * returns 2 (the cursor lowers to it). */
+    STM_ASSERT_OK(stm_inode_free(idx, 1, 2u));
+    uint64_t reused2 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &reused2));
+    STM_ASSERT_EQ(reused2, (uint64_t)2);
+
+    inode_test_idx_close(idx);
+}
+
 /* P8-POSIX-1b: stm_inode_set rejects an in_value with the FREED
  * flag set in si_flags. The flag is the allocator's internal
  * lifecycle marker; callers reach FREED via stm_inode_free. */

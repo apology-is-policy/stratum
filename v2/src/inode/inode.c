@@ -79,6 +79,35 @@ typedef struct {
      * alloc-shaped op (or stm_inode_next_ino) is reached for the
      * dataset. */
     bool      seeded;
+    /* Count of FREED inode records in this dataset's engine subspace.
+     * Seeded by the same one-time scan as next_ino (in_seed_cb), then
+     * maintained: ++ on free / cascade-unlink, -- on AllocReused. Gates
+     * the O(N) AllocReused scan (in_find_freed) so a fresh-create storm
+     * with no recyclable inos skips it entirely -- the create path is
+     * O(1) instead of O(N) per alloc. A stale count is safe: it can only
+     * skip a possible reuse (-> AllocFresh, always valid per inode.tla),
+     * never mis-allocate. The seed re-derives it on (re)mount. NOTE the
+     * snapshot-rollback engine-root swap (stm_fs_rollback_snapshot ->
+     * stm_dataset_index_set_engine_root) does NOT re-seed, so this +
+     * next_ino + freed_scan_lo go stale across a rollback -- still
+     * safe-degraded (the scan reads the LIVE engine; next_ino stays a
+     * monotone high-water mark >= the rolled-back tree's max, so AllocFresh
+     * never re-issues a live ino). The concurrent-FS arc must invalidate
+     * (seeded=false) here -- the inode twin of Area-D's eng->root F2, on
+     * the phase-9.8 ledger. */
+    uint64_t  freed_count;
+    /* Lower bound on the ino of any FREED record (invariant: no FREED
+     * record has ino < freed_scan_lo). The AllocReused scan starts here
+     * instead of ino 0, so consuming freed inos in key order does not
+     * re-walk the consumed prefix. Always >= 1 and <= every freed ino, so
+     * the scan is STRICTLY never broader than the old from-0 scan.
+     * Amortized-O(1) for the sequential / storm reuse patterns (the common
+     * case); the worst case -- an adversarial free-high-while-cursor-low
+     * interleave -- is bounded by, and never worse than, the pre-fix from-0
+     * O(N) scan. Maintained: lowered to `ino` on a free below it; advanced
+     * to the consumed ino on reuse. Only meaningful when freed_count > 0
+     * (else the scan is gated off). */
+    uint64_t  freed_scan_lo;
 } stm_inode_dsstate;
 
 /* P9.5-PARALLEL-3 impl-1: per-inode lock slot. Refcounted; lives in a
@@ -159,9 +188,11 @@ static stm_inode_dsstate *get_or_create_dsstate(stm_inode_index *idx,
         idx->cap_datasets = new_cap;
     }
     s = &idx->dsstate[idx->n_datasets++];
-    s->dataset_id = dataset_id;
-    s->next_ino   = 1u;          /* ino 0 reserved as "invalid" sentinel */
-    s->seeded     = false;
+    s->dataset_id    = dataset_id;
+    s->next_ino      = 1u;        /* ino 0 reserved as "invalid" sentinel */
+    s->seeded        = false;
+    s->freed_count   = 0u;
+    s->freed_scan_lo = 1u;        /* lowest valid ino */
     return s;
 }
 
@@ -424,8 +455,11 @@ static int in_freed_cb(const void *k, size_t klen,
     return 1;                                            /* first FREED wins */
 }
 
-/* Caller holds idx->lock. */
+/* Caller holds idx->lock. Scans the INODE subspace from `lo_ino` upward for
+ * the first FREED record (the dsstate freed_scan_lo cursor bounds the start
+ * so a reuse burst does not re-walk consumed inos). */
 static stm_status in_find_freed(stm_inode_index *idx, uint64_t ds,
+                                uint64_t lo_ino,
                                 bool *out_found, uint64_t *out_ino,
                                 uint64_t *out_prior_gen) {
     *out_found     = false;
@@ -436,7 +470,7 @@ static stm_status in_find_freed(stm_inode_index *idx, uint64_t ds,
     if (es != STM_OK) return es;
 
     uint8_t lo[IN_KEY_LEN], hi[IN_KEY_LEN];
-    stm_status k1 = in_encode_key(0u, lo);
+    stm_status k1 = in_encode_key(lo_ino, lo);
     if (k1 != STM_OK) return k1;
     stm_status k2 = in_encode_key(UINT64_MAX, hi);
     if (k2 != STM_OK) return k2;
@@ -462,6 +496,8 @@ static stm_status in_find_freed(stm_inode_index *idx, uint64_t ds,
 typedef struct {
     uint64_t   ds;
     uint64_t   max_ino_plus_one;   /* next_ino candidate */
+    uint64_t   freed_count;        /* FREED records seen during the seed scan */
+    uint64_t   min_freed;          /* lowest FREED ino (UINT64_MAX if none) */
     stm_status err;
 } in_seed_ctx;
 
@@ -481,6 +517,10 @@ static int in_seed_cb(const void *k, size_t klen,
     stm_status vs = in_validate_value(&val, c->ds, ino);
     if (vs != STM_OK) { c->err = vs; return 1; }
     if (ino + 1u > c->max_ino_plus_one) c->max_ino_plus_one = ino + 1u;
+    if (stm_load_le32(val.si_flags) & STM_INO_FLAG_FREED) {
+        c->freed_count++;
+        if (ino < c->min_freed) c->min_freed = ino;
+    }
     return 0;
 }
 
@@ -503,14 +543,17 @@ static stm_status in_seed_dsstate_locked(stm_inode_index *idx,
     if (k2 != STM_OK) return k2;
 
     in_seed_ctx c = { .ds = s->dataset_id, .max_ino_plus_one = s->next_ino,
+                      .freed_count = 0u, .min_freed = UINT64_MAX,
                       .err = STM_OK };
     stm_status ss = stm_btree_engine_scan_range(eng, lo, IN_KEY_LEN,
                                                 hi, IN_KEY_LEN,
                                                 in_seed_cb, &c);
     if (ss != STM_OK) return ss;
     if (c.err != STM_OK) return c.err;
-    s->next_ino = c.max_ino_plus_one;
-    s->seeded   = true;
+    s->next_ino      = c.max_ino_plus_one;
+    s->freed_count   = c.freed_count;
+    s->freed_scan_lo = (c.freed_count > 0u) ? c.min_freed : 1u;
+    s->seeded        = true;
     return STM_OK;
 }
 
@@ -641,14 +684,20 @@ static stm_status in_alloc_common(stm_inode_index *idx, uint64_t dataset_id,
     }
 
     /* AllocReused path (preferred): reuse a FREED ino with si_gen += 1.
-     * The bump preserves the (ino, gen) tuple-uniqueness invariant. */
+     * The bump preserves the (ino, gen) tuple-uniqueness invariant.
+     * Gated on freed_count: with no recyclable inos the O(N) keyspace
+     * scan is skipped, so a fresh-create storm is O(1) per alloc. When
+     * freed_count == 0 the scan would find nothing anyway, so the gate
+     * is behavior-identical (just faster). */
     bool     freed = false;
     uint64_t freed_ino = 0, freed_prior_gen = 0;
-    stm_status fs = in_find_freed(idx, dataset_id, &freed, &freed_ino,
-                                  &freed_prior_gen);
-    if (fs != STM_OK) {
-        must_unlock(idx_lock(idx));
-        return fs;
+    if (s->freed_count > 0u) {
+        stm_status fs = in_find_freed(idx, dataset_id, s->freed_scan_lo,
+                                      &freed, &freed_ino, &freed_prior_gen);
+        if (fs != STM_OK) {
+            must_unlock(idx_lock(idx));
+            return fs;
+        }
     }
 
     uint32_t nlink = anon ? 0u : 1u;
@@ -680,8 +729,13 @@ static stm_status in_alloc_common(stm_inode_index *idx, uint64_t dataset_id,
         must_unlock(idx_lock(idx));
         return ps;
     }
-    if (!freed) s->next_ino = chosen + 1u;    /* bump only on the fresh
+    if (!freed) {
+        s->next_ino = chosen + 1u;            /* bump only on the fresh
                                                * path, only after success */
+    } else if (s->freed_count > 0u) {
+        s->freed_count--;                     /* a FREED record was reused */
+        s->freed_scan_lo = chosen;            /* skip the consumed prefix next scan */
+    }
     *out_ino = chosen;
     must_unlock(idx_lock(idx));
     return STM_OK;
@@ -772,6 +826,16 @@ stm_status stm_inode_free(stm_inode_index *idx, uint64_t dataset_id,
     v.si_flags = stm_store_le32(flags);
     v.si_nlink = stm_store_le32(0u);
     stm_status ps = in_engine_put(idx, dataset_id, ino, &v);
+    if (ps == STM_OK) {
+        /* A record became FREED -> recyclable by AllocReused. Count it so
+         * the alloc scan-gate sees it (find_dsstate, not get_or_create:
+         * if unseeded, the lazy seed tallies this record when it runs). */
+        stm_inode_dsstate *s = find_dsstate(idx, dataset_id);
+        if (s && s->seeded) {
+            s->freed_count++;
+            if (ino < s->freed_scan_lo) s->freed_scan_lo = ino;
+        }
+    }
     must_unlock(idx_lock(idx));
     return ps;
 }
@@ -858,7 +922,17 @@ stm_status stm_inode_unlink(stm_inode_index *idx, uint64_t dataset_id,
         v.si_nlink = stm_store_le32(new_nlink);
     }
     stm_status ps = in_engine_put(idx, dataset_id, ino, &v);
-    if (ps == STM_OK && out_freed) *out_freed = cascade;
+    if (ps == STM_OK) {
+        if (out_freed) *out_freed = cascade;
+        if (cascade) {
+            /* Cascade-free transitioned the record to FREED -- recyclable. */
+            stm_inode_dsstate *s = find_dsstate(idx, dataset_id);
+            if (s && s->seeded) {
+                s->freed_count++;
+                if (ino < s->freed_scan_lo) s->freed_scan_lo = ino;
+            }
+        }
+    }
     must_unlock(idx_lock(idx));
     return ps;
 }
