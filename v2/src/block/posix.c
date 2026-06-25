@@ -92,6 +92,15 @@ typedef struct {
      * the fact that it's a no-op on any backend other than POSIX. */
     atomic_int_fast64_t     inject_countdown;  /* 0/negative = disabled */
     atomic_uint_fast32_t    inject_fired;      /* running counter       */
+
+    /* Area G bench instrumentation: per-op I/O accounting. Relaxed
+     * counters, incremented once a state-changing op clears the inject
+     * guard -- no behavior change. Read via stm_bdev_io_stats, zeroed via
+     * stm_bdev_io_stats_reset. Used by bench_commit to measure per-commit
+     * device writes + write-amplification (bytes-to-device per user byte). */
+    atomic_uint_fast64_t    io_writes;
+    atomic_uint_fast64_t    io_write_bytes;
+    atomic_uint_fast64_t    io_fsyncs;
 } posix_bdev;
 
 /* ------------------------------------------------------------------------- */
@@ -190,6 +199,9 @@ static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t
 {
     posix_bdev *d = (posix_bdev *)base;
     if (posix_inject_should_fail(d)) return STM_EIO;
+    atomic_fetch_add_explicit(&d->io_writes, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&d->io_write_bytes, (uint_fast64_t)len,
+                              memory_order_relaxed);
     return posix_pwrite_full(d->fd, buf, len, (off_t)off);
 }
 
@@ -197,6 +209,7 @@ static stm_status op_fsync(stm_bdev *base)
 {
     posix_bdev *d = (posix_bdev *)base;
     if (posix_inject_should_fail(d)) return STM_EIO;
+    atomic_fetch_add_explicit(&d->io_fsyncs, 1, memory_order_relaxed);
 #if defined(__APPLE__)
     /* On macOS, fsync() does not flush the disk cache. F_FULLFSYNC does. */
     if (fcntl(d->fd, F_FULLFSYNC) == -1) return errno_to_status(errno);
@@ -211,6 +224,7 @@ static stm_status op_fdatasync(stm_bdev *base)
 {
     posix_bdev *d = (posix_bdev *)base;
     if (posix_inject_should_fail(d)) return STM_EIO;
+    atomic_fetch_add_explicit(&d->io_fsyncs, 1, memory_order_relaxed);
 #if defined(__APPLE__)
     /* macOS has no fdatasync; F_BARRIERFSYNC (10.14+) is closest. */
     if (fcntl(d->fd, F_BARRIERFSYNC) == -1) {
@@ -687,4 +701,30 @@ uint32_t stm_bdev_inject_fired_count(const stm_bdev *base)
     const posix_bdev *d = (const posix_bdev *)base;
     return (uint32_t)atomic_load_explicit(&d->inject_fired,
                                             memory_order_relaxed);
+}
+
+void stm_bdev_io_stats(const stm_bdev *base, uint64_t *writes,
+                       uint64_t *write_bytes, uint64_t *fsyncs)
+{
+    uint64_t w = 0, wb = 0, f = 0;
+    if (base && base->caps.backend == STM_BDEV_BACKEND_POSIX) {
+        const posix_bdev *d = (const posix_bdev *)base;
+        w  = (uint64_t)atomic_load_explicit(&d->io_writes, memory_order_relaxed);
+        wb = (uint64_t)atomic_load_explicit(&d->io_write_bytes,
+                                            memory_order_relaxed);
+        f  = (uint64_t)atomic_load_explicit(&d->io_fsyncs, memory_order_relaxed);
+    }
+    if (writes)      *writes      = w;
+    if (write_bytes) *write_bytes = wb;
+    if (fsyncs)      *fsyncs      = f;
+}
+
+void stm_bdev_io_stats_reset(stm_bdev *base)
+{
+    if (!base) return;
+    if (base->caps.backend != STM_BDEV_BACKEND_POSIX) return;
+    posix_bdev *d = (posix_bdev *)base;
+    atomic_store_explicit(&d->io_writes, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->io_write_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->io_fsyncs, 0, memory_order_relaxed);
 }

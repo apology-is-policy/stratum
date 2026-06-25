@@ -147,7 +147,17 @@
 
 #define VIRTIO_BLK_T_IN              0u
 #define VIRTIO_BLK_T_OUT             1u
+#define VIRTIO_BLK_T_FLUSH           4u
 #define VIRTIO_BLK_S_OK              0u
+
+/* VIRTIO_BLK_F_FLUSH (feature bit 9, bank 0): the device has a writeback
+ * cache and honors VIRTIO_BLK_T_FLUSH. Negotiating it lets op_fsync issue a
+ * real durability barrier instead of relying on the launch cache mode. */
+#define VIRTIO_BLK_F_FLUSH_BIT       (1u << 9)
+
+/* Request kind for the single-virtqueue submit path. READ/WRITE carry a
+ * data descriptor; FLUSH is a header->status chain with no data. */
+typedef enum { REQ_READ, REQ_WRITE, REQ_FLUSH } req_kind;
 
 #define VINT_USED_BUFFER             (1u << 0)
 
@@ -238,6 +248,12 @@ typedef struct {
      * STM_EIO. */
     bool             failed;
     uint64_t         reinit_count;  /* diagnostics: device recoveries fired */
+
+    /* VIRTIO_BLK_F_FLUSH negotiated at init -> op_fsync issues a real
+     * VIRTIO_BLK_T_FLUSH barrier. When false (device offers no cache),
+     * every completed write is already durable + op_fsync is a no-op.
+     * Re-derived on every (re)init so a recovered device keeps it correct. */
+    bool             flush_supported;
 } thyla_bdev;
 
 /* ------------------------------------------------------------------------- */
@@ -370,17 +386,21 @@ static bool find_blk_slot(thyla_bdev *d)
 /* VirtIO 1.2 init (sec 3.1.1).                                               */
 /* ------------------------------------------------------------------------- */
 
-static bool init_device(uint64_t slot_va, uint64_t ring_pa)
+static bool init_device(uint64_t slot_va, uint64_t ring_pa,
+                        bool *out_flush_supported)
 {
+    if (out_flush_supported) *out_flush_supported = false;
+
     /* Reset + ACKNOWLEDGE + DRIVER. */
     mmio_write32(slot_va + VREG_STATUS, 0);
     mmio_write32(slot_va + VREG_STATUS, VSTATUS_ACKNOWLEDGE);
     mmio_write32(slot_va + VREG_STATUS, VSTATUS_ACKNOWLEDGE | VSTATUS_DRIVER);
 
-    /* Read bank-0 features (per sec 3.1.1 step 4; required even if we
-     * only depend on bank-1 bits). */
+    /* Read both feature banks (per sec 3.1.1 step 4). Bank 0 carries the
+     * blk feature bits (VIRTIO_BLK_F_FLUSH = bit 9); bank 1 carries
+     * VIRTIO_F_VERSION_1. */
     mmio_write32(slot_va + VREG_DEVICE_FEATURES_SEL, 0);
-    (void)mmio_read32(slot_va + VREG_DEVICE_FEATURES);
+    uint32_t dev_feat_lo = mmio_read32(slot_va + VREG_DEVICE_FEATURES);
     mmio_write32(slot_va + VREG_DEVICE_FEATURES_SEL, 1);
     uint32_t dev_feat_hi = mmio_read32(slot_va + VREG_DEVICE_FEATURES);
     if ((dev_feat_hi & VIRTIO_F_VERSION_1_BIT_BANK1) == 0) {
@@ -388,9 +408,14 @@ static bool init_device(uint64_t slot_va, uint64_t ring_pa)
         return false;
     }
 
-    /* Negotiate: we accept only VIRTIO_F_VERSION_1 (modern mode). */
+    /* Negotiate VIRTIO_F_VERSION_1 (bank 1, mandatory) + VIRTIO_BLK_F_FLUSH
+     * (bank 0) iff the device offers it. The flush is what makes op_fsync a
+     * real durability barrier instead of relying on the launch cache mode.
+     * We never request a feature the device did not offer, so FEATURES_OK
+     * cannot be refused on our account. */
+    bool flush = (dev_feat_lo & VIRTIO_BLK_F_FLUSH_BIT) != 0;
     mmio_write32(slot_va + VREG_DRIVER_FEATURES_SEL, 0);
-    mmio_write32(slot_va + VREG_DRIVER_FEATURES, 0);
+    mmio_write32(slot_va + VREG_DRIVER_FEATURES, flush ? VIRTIO_BLK_F_FLUSH_BIT : 0u);
     mmio_write32(slot_va + VREG_DRIVER_FEATURES_SEL, 1);
     mmio_write32(slot_va + VREG_DRIVER_FEATURES, VIRTIO_F_VERSION_1_BIT_BANK1);
 
@@ -425,6 +450,7 @@ static bool init_device(uint64_t slot_va, uint64_t ring_pa)
     mmio_write32(slot_va + VREG_STATUS,
                  VSTATUS_ACKNOWLEDGE | VSTATUS_DRIVER |
                  VSTATUS_FEATURES_OK | VSTATUS_DRIVER_OK);
+    if (out_flush_supported) *out_flush_supported = flush;
     return true;
 }
 
@@ -483,7 +509,7 @@ static void init_descriptors(uint64_t ring_va, uint64_t ring_pa, uint64_t data_p
  * unrecoverable device). Caller holds d->lock. */
 static bool reinit_device_locked(thyla_bdev *d)
 {
-    if (!init_device(d->slot_va, d->ring_pa)) return false;
+    if (!init_device(d->slot_va, d->ring_pa, &d->flush_supported)) return false;
     init_descriptors(THYLA_RING_USER_VA, d->ring_pa, d->data_pa);
     d->avail_idx = 0;
     d->reinit_count++;
@@ -494,28 +520,38 @@ static bool reinit_device_locked(thyla_bdev *d)
  * completion; STM_EIO on any failure WITHOUT latching -- the recovery /
  * latch decision is do_request()'s. Caller holds d->lock. */
 static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
-                                   uint32_t sector_count, bool is_write)
+                                   uint32_t sector_count, req_kind kind)
 {
     /* Pre-poison status byte so a missing device write surfaces. */
     *(volatile uint8_t *)(THYLA_RING_USER_VA + VQ_STATUS_OFF) = 0xff;
 
-    /* Update request header (type + sector). */
+    /* Update request header (type + sector). FLUSH ignores the sector. */
     uint64_t req_va  = THYLA_RING_USER_VA + VQ_REQ_OFF;
-    uint32_t req_type = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+    uint32_t req_type = (kind == REQ_WRITE) ? VIRTIO_BLK_T_OUT
+                      : (kind == REQ_FLUSH) ? VIRTIO_BLK_T_FLUSH
+                      :                       VIRTIO_BLK_T_IN;
     mmio_write32(req_va + 0, req_type);
     mmio_write32(req_va + 4, 0);
-    mmio_write64(req_va + 8, lba);
+    mmio_write64(req_va + 8, (kind == REQ_FLUSH) ? 0u : lba);
 
-    /* Update desc[1].len to exactly the request size (not the full
-     * data DMA region) so the device transfers only the sectors the
-     * caller asked for. The descriptor's stored addr stays the data
-     * buffer base. */
     uint64_t desc_va = THYLA_RING_USER_VA + VQ_DESC_OFF;
-    mmio_write32(desc_va + 16 + 8, sector_count * (uint32_t)SECTOR_SIZE);
-    uint16_t data_flags = is_write
-        ? VIRTQ_DESC_F_NEXT
-        : (VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
-    mmio_write16(desc_va + 16 + 12, data_flags);
+    if (kind == REQ_FLUSH) {
+        /* FLUSH carries no data buffer: chain header -> status directly by
+         * repointing desc[0].next from 1 to 2, skipping desc[1]. The head
+         * (id 0) + the terminal status descriptor (id 2) are unchanged, so
+         * the completion checks below hold identically. (VIRTIO 1.2 5.2.6.) */
+        mmio_write16(desc_va + 14, 2);
+    } else {
+        /* Header -> data -> status. Restore desc[0].next to 1 in case a
+         * prior FLUSH repointed it, then set desc[1].len to exactly the
+         * request size (not the full DMA region) + the direction flag. */
+        mmio_write16(desc_va + 14, 1);
+        mmio_write32(desc_va + 16 + 8, sector_count * (uint32_t)SECTOR_SIZE);
+        uint16_t data_flags = (kind == REQ_WRITE)
+            ? VIRTQ_DESC_F_NEXT
+            : (VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
+        mmio_write16(desc_va + 16 + 12, data_flags);
+    }
 
     /* avail.ring[(avail_idx) % QUEUE_SIZE] = head id (= 0). */
     uint64_t avail_va = THYLA_RING_USER_VA + VQ_AVAIL_OFF;
@@ -588,14 +624,14 @@ io_fail:
  * does not touch it). Caller holds d->lock (the request is serialised;
  * invariant B-2), so the latch + reinit_count are single-writer here. */
 static stm_status do_request(thyla_bdev *d, uint64_t lba,
-                              uint32_t sector_count, bool is_write)
+                              uint32_t sector_count, req_kind kind)
 {
     /* Already permanently dead (recovery previously exhausted). R4-F1:
      * never re-publish onto a device whose ring state we abandoned. */
     if (d->failed) return STM_EIO;
 
     for (uint32_t attempt = 0; ; attempt++) {
-        stm_status s = do_request_once(d, lba, sector_count, is_write);
+        stm_status s = do_request_once(d, lba, sector_count, kind);
         if (s == STM_OK) return STM_OK;
 
         if (attempt >= DO_REQUEST_MAX_REINIT) {
@@ -648,7 +684,7 @@ static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
         uint64_t lba       = cur_off / SECTOR_SIZE;
         uint32_t sectors   = (uint32_t)((chunk_bytes + SECTOR_SIZE - 1) / SECTOR_SIZE);
 
-        stm_status s = do_request(d, lba, sectors, /*is_write=*/false);
+        stm_status s = do_request(d, lba, sectors, REQ_READ);
         if (s != STM_OK) { pthread_mutex_unlock(&d->lock); return s; }
 
         memcpy(p, (const void *)THYLA_DATA_USER_VA, chunk_bytes);
@@ -699,7 +735,7 @@ static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t
         uint32_t sectors = (uint32_t)(chunk / SECTOR_SIZE);
         memcpy((void *)THYLA_DATA_USER_VA, p, chunk);
         dsb_sy();
-        stm_status s = do_request(d, cur_off / SECTOR_SIZE, sectors, /*is_write=*/true);
+        stm_status s = do_request(d, cur_off / SECTOR_SIZE, sectors, REQ_WRITE);
         if (s != STM_OK) { pthread_mutex_unlock(&d->lock); return s; }
         p        += chunk;
         cur_off  += chunk;
@@ -711,11 +747,11 @@ static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t
      *    this sector (or the shared DMA buffer) between them. */
     if (tail > 0) {
         uint64_t lba = cur_off / SECTOR_SIZE;
-        stm_status rs = do_request(d, lba, 1, /*is_write=*/false);
+        stm_status rs = do_request(d, lba, 1, REQ_READ);
         if (rs != STM_OK) { pthread_mutex_unlock(&d->lock); return rs; }
         memcpy((void *)THYLA_DATA_USER_VA, p, tail);
         dsb_sy();
-        stm_status ws = do_request(d, lba, 1, /*is_write=*/true);
+        stm_status ws = do_request(d, lba, 1, REQ_WRITE);
         if (ws != STM_OK) { pthread_mutex_unlock(&d->lock); return ws; }
     }
 
@@ -725,25 +761,32 @@ static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t
 
 static stm_status op_fsync(stm_bdev *base)
 {
+    thyla_bdev *d = (thyla_bdev *)base;
+
     /* A permanently-latched device cannot honestly report a flush as durable
      * -- fail closed so the latch is consistent across the whole vtable, not
-     * just read/write (Area F #2 makes d->failed a reachable long-lived state).
-     * Today every durability path writes-then-fsyncs the same device, so a
-     * latched write fails first + this is never reached; the guard keeps a
-     * bare fsync() honest. */
-    if (((thyla_bdev *)base)->failed) return STM_EIO;
+     * just read/write (Area F #2 makes d->failed a reachable long-lived
+     * state). */
+    if (d->failed) return STM_EIO;
 
-    /* No-op flush -- correct ONLY because the boot launch attaches the
-     * virtio-blk drives cache=writethrough (tools/run-vm.sh), so every
-     * op_write is already synchronously durable and there is nothing to
-     * flush. The driver does NOT negotiate VIRTIO_BLK_F_FLUSH; under a
-     * writeback backing store this no-op would silently lose committed
-     * writes on a host crash (RW-8 R4-F3 -- the prior "write-through from
-     * our perspective" comment was false for QEMU's default writeback).
-     * v1.x: negotiate VIRTIO_BLK_F_FLUSH + issue VIRTIO_BLK_T_FLUSH here so
-     * durability no longer depends on the launch cache mode. */
-    (void)base;
-    return STM_OK;
+    /* Device negotiated no writeback cache (VIRTIO_BLK_F_FLUSH absent): every
+     * completed op_write is already durable, so there is nothing to flush.
+     * This also keeps a writethrough-only device (no FLUSH offered) correct. */
+    if (!d->flush_supported) return STM_OK;
+
+    /* Issue VIRTIO_BLK_T_FLUSH: the device flushes its writeback cache so
+     * every previously-completed write becomes durable. This makes Stratum's
+     * durability SELF-CONTAINED -- the commit's write-then-fsync barriers
+     * (src/sync/sync.c + src/bootstrap/pool.c) are real on-device regardless
+     * of the launch cache mode, rather than silently depending on
+     * cache=writethrough (RW-8 R4-F3). lba/sector_count are unused for FLUSH.
+     * d->lock serialises the shared descriptor chain (invariant B-2), exactly
+     * as read/write do; a transient flush hiccup self-heals via the same
+     * bounded reinit recovery in do_request. */
+    pthread_mutex_lock(&d->lock);
+    stm_status s = do_request(d, 0, 0, REQ_FLUSH);
+    pthread_mutex_unlock(&d->lock);
+    return s;
 }
 
 static stm_status op_fdatasync(stm_bdev *base)
@@ -937,7 +980,7 @@ stm_status stm_bdev_open_thylacine(const char *path,
         *(volatile uint8_t *)(THYLA_DATA_USER_VA + o) = 0;
 
     /* Phase 7: VirtIO init. */
-    if (!init_device(d->slot_va, d->ring_pa)) goto fail;
+    if (!init_device(d->slot_va, d->ring_pa, &d->flush_supported)) goto fail;
 
     /* Phase 8: descriptor chain (one-time). */
     init_descriptors(THYLA_RING_USER_VA, d->ring_pa, d->data_pa);

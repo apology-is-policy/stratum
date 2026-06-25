@@ -44,6 +44,18 @@ struct stm_bdev;
 void     stm_bdev_inject_fail_after(struct stm_bdev *d, int64_t n_ops);
 uint32_t stm_bdev_inject_fired_count(const struct stm_bdev *d);
 
+/*
+ * Area G bench instrumentation (POSIX backend only; no-op / zero on other
+ * backends). stm_bdev_io_stats reports the running per-op I/O accounting:
+ * total state-changing writes, total bytes written to the device, and
+ * total flush (fsync + fdatasync) ops. stm_bdev_io_stats_reset zeroes the
+ * counters. Used by bench_commit to measure per-commit device I/O +
+ * write-amplification. Any out pointer may be NULL. Testing-only surface.
+ */
+void stm_bdev_io_stats(const struct stm_bdev *d, uint64_t *writes,
+                       uint64_t *write_bytes, uint64_t *fsyncs);
+void stm_bdev_io_stats_reset(struct stm_bdev *d);
+
 #ifdef __cplusplus
 }
 #endif

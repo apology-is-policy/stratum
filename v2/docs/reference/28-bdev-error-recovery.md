@@ -112,6 +112,13 @@ A re-submit re-issues the *same* request:
   later chunk's re-init (a device reset resets state, not the writethrough
   backing store); the tail RMW's read-then-overlay-then-write keeps the DMA
   contents stable across either op's internal retry.
+- A **FLUSH** (Area G; `op_fsync` issues `VIRTIO_BLK_T_FLUSH` when the device
+  negotiated `VIRTIO_BLK_F_FLUSH`) re-flushes — idempotent. It shares the
+  `do_request` path, so a transient flush hiccup self-heals via the same
+  bounded reinit recovery; only an exhausted budget latches + surfaces STM_EIO,
+  which wedges the in-flight commit (fail-closed durability). The flush is a
+  header→status descriptor chain with no data buffer; see
+  `31-durability-commit.md` §31.4.
 
 ## Layer 3 — the FS commit wedge (integrity, not a defect)
 

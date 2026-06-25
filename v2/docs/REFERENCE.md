@@ -2841,6 +2841,7 @@ reference below covers the as-built layers in bottom-up order.
 | [28-bdev-error-recovery.md](reference/28-bdev-error-recovery.md) | I/O-error handling + recovery — bdev re-init, FS wedge contract, dev9p errno (Stabilization Area F) | medium |
 | [29-concurrency.md](reference/29-concurrency.md) | Concurrency model — threading, lock hierarchy, EBR/wait-free reads, R171 status, write-scaling (Stabilization Area D) | medium |
 | [30-inode-dirent-create.md](reference/30-inode-dirent-create.md) | Inode/dirent create path — allocator (O(1) reuse-gate), dirent open-addressing, inline storage, metadata-region scaling (Stabilization Area S) | medium |
+| [31-durability-commit.md](reference/31-durability-commit.md) | Durability + the commit path — 2-phase COW commit, barrier ordering, 252-uberblock torn-write defense, the bdev FLUSH (VIRTIO_BLK_F_FLUSH), crash consistency, commit-throughput (Stabilization Area G) | medium |
 
 This is a live document — every phase-chunk commit that touches a
 subsystem updates the corresponding section in the same PR.
