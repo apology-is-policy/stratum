@@ -126,6 +126,12 @@ target_link_libraries(bench_create_many PRIVATE stm_testlib stratum
 add_executable(bench_commit bench_commit.c test_fs_common.c)
 target_link_libraries(bench_commit PRIVATE stm_testlib stratum
                                    stm_warnings stm_sanitize stm_coverage)
+# Area E crypto/integrity throughput baseline (the G2 measurement reference:
+# AEAD enc/dec + BLAKE3/xxh3 + the dcache decrypt->memcpy ratio). Pure
+# primitives, no FS. A bench, not a ctest.
+add_executable(bench_crypto bench_crypto.c)
+target_link_libraries(bench_crypto PRIVATE stratum
+                                   stm_warnings stm_sanitize stm_coverage)
 stm_add_test(test_lp9        test_lp9.c)
 target_link_libraries(test_lp9 PRIVATE stm_lp9)
 stm_add_test(test_stratum_fs test_stratum_fs.c test_fs_common.c)

@@ -125,8 +125,57 @@ _Static_assert(STM_SYNC_WRAPPED_KEY_LEN <= STM_KEYSCHEMA_WRAPPED_MAX,
  * preserved, perf identical to pre-cache for the overflow set. */
 #define STM_SYNC_PROMOTE_CACHE_CAP   64u
 
+/* #343: decrypted-extent cache. A file read decrypts the WHOLE covering
+ * extent (AEAD verifies the entire ciphertext) even to satisfy a small
+ * slice. REVENANT demand-paged exec faults a large binary's text in
+ * page-sized slices, so without a cache the same extent is re-decrypted
+ * once per fault (read amplification ~ extent_size / page_size). This
+ * cache holds the decrypted plaintext keyed by the extent's IMMUTABLE
+ * identity, so repeated reads of one extent decrypt it once.
+ *
+ * Invalidation-free for BOTH extent kinds:
+ *   - COLD: content-addressed -> content_hash is a stable key.
+ *   - HOT:  copy-on-write + a strictly-monotonic per-commit gen, so
+ *           (paddrs[0], gen) is the same pair the AEAD nonce is built
+ *           from -- the FS already guarantees it unique for the pool's
+ *           lifetime (nonce reuse would break AEGIS). A CoW overwrite
+ *           writes a NEW (paddr|gen); a freed paddr can only be reused
+ *           at a strictly-greater gen. So a key never names two plaintexts.
+ * Both identities canonicalize to a 32-byte key + a kind tag, so one
+ * cache + key space serves HOT, COLD, and snap-view reads. */
+#define STM_DCACHE_ENTRIES     16u
+#define STM_DCACHE_BYTES_MAX   (64u * 1024u * 1024u)   /* 64 MiB ceiling */
+#define STM_DCACHE_LOG_EVERY   1024u                   /* STM_DCACHE_STATS dev log cadence */
+
+struct sync_dcache_entry {
+    uint8_t  key[STM_CAS_HASH_LEN];   /* COLD: content_hash; HOT: paddr0||gen||0 */
+    uint8_t  kind_tag;                /* STM_EXTENT_KIND_* -- disambiguates key space */
+    uint8_t *plaintext;               /* malloc(len); NULL == empty slot */
+    size_t   len;
+    uint64_t lru_tick;
+};
+
+/* The COLD key is the extent record's content_hash (STM_EXTENT_HASH_LEN)
+ * copied into / compared against this STM_CAS_HASH_LEN-wide key. They are
+ * both 32 today; pin the equality so a future divergence is a build error,
+ * not a silent OOB read or under-comparison on the COLD-key memcmp/memcpy. */
+_Static_assert(STM_EXTENT_HASH_LEN == STM_CAS_HASH_LEN,
+               "dcache COLD key copies content_hash into a CAS-hash-wide slot");
+
+/* Forward decl: stm_sync_close (above the decrypt path) drains the cache. */
+static void dcache_drain(stm_sync *s);
+
 struct stm_sync {
     pthread_mutex_t lock;
+
+    /* #343 decrypted-extent cache -- lock-protected (every accessor runs
+     * under s->lock). All-zero (from calloc) is a valid empty cache, so
+     * no explicit init; dcache_drain frees the live plaintexts at close. */
+    struct sync_dcache_entry dcache[STM_DCACHE_ENTRIES];
+    uint64_t dcache_tick;
+    size_t   dcache_bytes;
+    uint64_t dcache_hits;
+    uint64_t dcache_misses;
 
     /* P5-2: sync coordinates commits across every device in the pool.
      * There is no "self" in multi-device; the coordinator writes the
@@ -2407,6 +2456,8 @@ void stm_sync_close(stm_sync *s)
     stm_ct_memzero(s->metadata_key, sizeof s->metadata_key);
     /* P4-4c: wipe + free the per-dataset DEK map. */
     sync_dek_wipe_all(s);
+    /* #343: free + zero any cached decrypted-extent plaintexts. */
+    dcache_drain(s);
     pthread_mutex_destroy(&s->lock);
     free(s);
 }
@@ -4904,6 +4955,25 @@ stm_xattr_index *stm_sync_xattr_index(stm_sync *s)
     return s ? s->xattr_idx : NULL;
 }
 
+/* #343: decrypted-extent cache stats. Snapshot under s->lock so a concurrent
+ * reader (the dcache is shared across the elected reader + any /ctl probe)
+ * sees a consistent (hits, misses, bytes) triple. */
+void stm_sync_dcache_stats(stm_sync *s, uint64_t *out_hits,
+                           uint64_t *out_misses, size_t *out_cached_bytes)
+{
+    if (!s) {
+        if (out_hits)         *out_hits = 0;
+        if (out_misses)       *out_misses = 0;
+        if (out_cached_bytes) *out_cached_bytes = 0;
+        return;
+    }
+    pthread_mutex_lock(&s->lock);
+    if (out_hits)         *out_hits = s->dcache_hits;
+    if (out_misses)       *out_misses = s->dcache_misses;
+    if (out_cached_bytes) *out_cached_bytes = s->dcache_bytes;
+    pthread_mutex_unlock(&s->lock);
+}
+
 /* P7-CAS-5: out-of-band CAS auto-GC sweep entry point. See sync.h
  * for the contract.
  *
@@ -5634,6 +5704,106 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
                                                        void *buf, size_t len,
                                                        size_t *out_read);
 
+/* #343 decrypted-extent cache helpers. Caller holds s->lock. */
+
+static void dcache_key_hot(uint8_t out[STM_CAS_HASH_LEN],
+                            uint64_t paddr0, uint64_t gen) {
+    memset(out, 0, STM_CAS_HASH_LEN);
+    le64 p = stm_store_le64(paddr0);
+    le64 g = stm_store_le64(gen);
+    memcpy(out + 0, p.v, 8);
+    memcpy(out + 8, g.v, 8);
+}
+
+static const uint8_t *dcache_lookup(stm_sync *s,
+                                     const uint8_t key[STM_CAS_HASH_LEN],
+                                     uint8_t kind_tag, size_t len) {
+    for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
+        struct sync_dcache_entry *e = &s->dcache[i];
+        if (e->plaintext && e->kind_tag == kind_tag && e->len == len
+                && memcmp(e->key, key, STM_CAS_HASH_LEN) == 0) {
+            e->lru_tick = ++s->dcache_tick;
+            return e->plaintext;
+        }
+    }
+    return NULL;
+}
+
+static void dcache_insert(stm_sync *s,
+                           const uint8_t key[STM_CAS_HASH_LEN],
+                           uint8_t kind_tag,
+                           const uint8_t *plaintext, size_t len) {
+    /* Never cache an extent that alone exceeds the budget; the byte cap
+     * also bounds the per-sync RAM the cache can pin. */
+    if (len == 0 || len > STM_DCACHE_BYTES_MAX) return;
+
+    for (;;) {
+        struct sync_dcache_entry *slot = NULL;
+        for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
+            if (!s->dcache[i].plaintext) { slot = &s->dcache[i]; break; }
+        }
+        if (slot && s->dcache_bytes + len <= STM_DCACHE_BYTES_MAX) {
+            uint8_t *copy = malloc(len);
+            if (!copy) return;                 /* best-effort: skip on OOM */
+            memcpy(copy, plaintext, len);
+            memcpy(slot->key, key, STM_CAS_HASH_LEN);
+            slot->kind_tag  = kind_tag;
+            slot->plaintext = copy;
+            slot->len       = len;
+            slot->lru_tick  = ++s->dcache_tick;
+            s->dcache_bytes += len;
+            return;
+        }
+        /* No free slot OR inserting would exceed the byte budget -- evict
+         * the least-recently-used live entry and retry. Terminates: each
+         * pass frees one entry + reduces bytes; once empty, bytes==0 and
+         * len<=max (guarded above) guarantees a fit. */
+        struct sync_dcache_entry *victim = NULL;
+        for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
+            struct sync_dcache_entry *e = &s->dcache[i];
+            if (!e->plaintext) continue;
+            if (!victim || e->lru_tick < victim->lru_tick) victim = e;
+        }
+        if (!victim) return;                   /* defensive: nothing to evict */
+        stm_ct_memzero(victim->plaintext, victim->len);
+        free(victim->plaintext);
+        s->dcache_bytes -= victim->len;
+        victim->plaintext = NULL;
+        victim->len = 0;
+    }
+}
+
+static void dcache_drain(stm_sync *s) {
+    for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
+        struct sync_dcache_entry *e = &s->dcache[i];
+        if (e->plaintext) {
+            stm_ct_memzero(e->plaintext, e->len);
+            free(e->plaintext);
+            e->plaintext = NULL;
+            e->len = 0;
+        }
+    }
+    s->dcache_bytes = 0;
+}
+
+static void dcache_account(stm_sync *s, bool hit) {
+    /* The counters are always-on (cheap, and read by stm_sync_dcache_stats);
+     * the periodic stderr line is a dev convenience compiled out by default
+     * so it never spews on the production read path. Build with
+     * -DSTM_DCACHE_STATS to watch the hit rate live. */
+    if (hit) s->dcache_hits++; else s->dcache_misses++;
+#ifdef STM_DCACHE_STATS
+    uint64_t total = s->dcache_hits + s->dcache_misses;
+    if ((total % STM_DCACHE_LOG_EVERY) == 0) {
+        fprintf(stderr,
+                "STRATUM-DCACHE: hits=%llu misses=%llu cached_bytes=%zu\n",
+                (unsigned long long)s->dcache_hits,
+                (unsigned long long)s->dcache_misses,
+                s->dcache_bytes);
+    }
+#endif
+}
+
 static stm_status stm_sync_read_extent_locked(stm_sync *s,
                                                  uint64_t dataset_id, uint64_t ino,
                                                  uint64_t off, void *buf,
@@ -5757,6 +5927,18 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
      * shape but with metadata_key (CAS uses pool-wide key per
      * ARCH §7.6.3 for cross-dataset shareability) and the CAS AD. */
     if (rec.kind == STM_EXTENT_KIND_COLD) {
+        /* #343: serve the slice from the decrypted-extent cache if the
+         * content_hash is resident -- no disk read, no AEAD decrypt. */
+        {
+            const uint8_t *hit = dcache_lookup(s, rec.content_hash,
+                                                STM_EXTENT_KIND_COLD, rec.len);
+            if (hit) {
+                memcpy(buf, hit + slice_off, slice_len);
+                dcache_account(s, true);
+                *out_read = slice_len;
+                return STM_OK;
+            }
+        }
         if (!s->cas_idx) return STM_ECORRUPT;
         stm_cas_record cas_rec;
         stm_status cs = stm_cas_lookup(s->cas_idx, rec.content_hash, &cas_rec);
@@ -5841,6 +6023,8 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
             return clast_err;
         }
         memcpy(buf, (uint8_t *)cpbuf + slice_off, slice_len);
+        dcache_insert(s, rec.content_hash, STM_EXTENT_KIND_COLD, cpbuf, rec.len);
+        dcache_account(s, false);
         stm_ct_memzero(cpbuf, rec.len);
         free(cpbuf);
 
@@ -5850,6 +6034,21 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
 
     if (rec.n_replicas < 1 || rec.n_replicas > STM_EXTENT_MAX_REPLICAS)
         return STM_ECORRUPT;
+
+    /* #343: HOT decrypted-extent cache. Key = (paddrs[0], gen) -- the
+     * AEAD nonce identity (line below feeds the same pair to the cipher);
+     * CoW + monotonic gen make it unique + immutable for the pool's life. */
+    {
+        uint8_t hkey[STM_CAS_HASH_LEN];
+        dcache_key_hot(hkey, rec.paddrs[0], rec.gen);
+        const uint8_t *hit = dcache_lookup(s, hkey, STM_EXTENT_KIND_HOT, rec.len);
+        if (hit) {
+            memcpy(buf, hit + slice_off, slice_len);
+            dcache_account(s, true);
+            *out_read = slice_len;
+            return STM_OK;
+        }
+    }
 
     /* P7-10: resolve the DEK by the extent's stamped key_id (NOT
      * the dataset's CURRENT — old extents written before a rotation
@@ -5956,6 +6155,12 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
     }
 
     memcpy(buf, (uint8_t *)pbuf + slice_off, slice_len);
+    {
+        uint8_t hkey[STM_CAS_HASH_LEN];
+        dcache_key_hot(hkey, rec.paddrs[0], rec.gen);
+        dcache_insert(s, hkey, STM_EXTENT_KIND_HOT, pbuf, rec.len);
+    }
+    dcache_account(s, false);
     stm_ct_memzero(pbuf, rec.len);
     free(pbuf);
     *out_read = slice_len;

@@ -1040,6 +1040,19 @@ typedef struct stm_dirent_index stm_dirent_index;
 stm_dirent_index *stm_sync_dirent_index(stm_sync *s);
 
 /*
+ * #343: decrypted-extent cache statistics (read-only introspection). A read
+ * that hits the cache serves the slice with no disk read + no AEAD decrypt;
+ * a miss decrypts the whole covering extent (the slice is memcpy'd, the
+ * plaintext cached). `out_hits` / `out_misses` are the lifetime read-slice
+ * counts; `out_cached_bytes` is the resident plaintext the cache currently
+ * pins (bounded by the 64 MiB ceiling). Any out-param may be NULL. Snapshot
+ * is taken under s->lock. This is the supported observability path (the
+ * STM_DCACHE_STATS periodic stderr line is a compile-time dev convenience).
+ */
+void stm_sync_dcache_stats(stm_sync *s, uint64_t *out_hits,
+                           uint64_t *out_misses, size_t *out_cached_bytes);
+
+/*
  * P8-POSIX-6: per-pool xattr index handle. Same lifetime + thread-
  * safety contract as the other index accessors above. The xattr index
  * is owned by sync and persists across commits via the lifecycle

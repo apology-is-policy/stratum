@@ -512,6 +512,144 @@ STM_TEST(fs_io_write_grows_past_recordsize) {
     unlink(g_tmp_path);
 }
 
+/* #343 dcache (Area E): a slice read that HITS the decrypted-extent cache
+ * serves byte-identical plaintext to the MISS that populated it, with no
+ * second decrypt -- and the MISS caches the WHOLE extent, so a disjoint
+ * never-read slice of the same extent also hits. Non-vacuous two ways: a
+ * disabled cache never advances `hits` (the delta assert fails); a cache
+ * that serves wrong bytes fails the content compare. */
+STM_TEST(dcache_hit_serves_same_plaintext) {
+    make_tmp("dcache_hit");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"d", 1,
+                                        0644u, 0, 0, &fino));
+
+    /* One 64 KiB extent (> inline, << the >=128 KiB recordsize), committed
+     * so the read takes the committed-extent decrypt path the cache lives
+     * on, not the dirty-buffer overlay. */
+    const size_t EXT = 64u * 1024u;
+    uint8_t *src = malloc(EXT);
+    STM_ASSERT(src != NULL);
+    for (size_t i = 0; i < EXT; i++) src[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 0, src, EXT));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    struct stm_sync *sy = stm_fs_sync(fs);
+    uint64_t h0 = 0, m0 = 0; size_t b0 = 0;
+    stm_sync_dcache_stats(sy, &h0, &m0, &b0);
+
+    /* First read of [0,8192): cold -> MISS, decrypts + caches the extent. */
+    uint8_t out1[8192] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 0, out1, sizeof out1, &got));
+    STM_ASSERT_EQ((int)got, (int)sizeof out1);
+    uint64_t h1 = 0, m1 = 0; size_t b1 = 0;
+    stm_sync_dcache_stats(sy, &h1, &m1, &b1);
+    STM_ASSERT_EQ((int)(m1 - m0), 1);              /* exactly one miss */
+    STM_ASSERT_EQ((int)(h1 - h0), 0);              /* not a hit */
+    STM_ASSERT_TRUE(b1 - b0 >= EXT);               /* whole extent resident */
+
+    /* Re-read the SAME slice: same extent identity -> HIT, no decrypt. */
+    uint8_t out2[8192] = {0};
+    STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 0, out2, sizeof out2, &got));
+    uint64_t h2 = 0, m2 = 0; size_t b2 = 0;
+    stm_sync_dcache_stats(sy, &h2, &m2, &b2);
+    STM_ASSERT_EQ((int)(h2 - h1), 1);              /* exactly one hit */
+    STM_ASSERT_EQ((int)(m2 - m1), 0);              /* no new miss */
+    STM_ASSERT_EQ((int)(b2 - b1), 0);              /* nothing re-cached */
+
+    /* A DISJOINT, never-read slice of the same extent also hits: proves the
+     * MISS cached the whole plaintext, not just the first slice. */
+    uint8_t out3[8192] = {0};
+    STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 16384, out3, sizeof out3, &got));
+    uint64_t h3 = 0, m3 = 0; size_t b3 = 0;
+    stm_sync_dcache_stats(sy, &h3, &m3, &b3);
+    STM_ASSERT_EQ((int)(h3 - h2), 1);              /* whole-extent hit */
+    STM_ASSERT_EQ((int)(m3 - m2), 0);
+
+    /* Content: hit == miss == source, at both offsets. */
+    STM_ASSERT_EQ(memcmp(out1, out2, sizeof out1), 0);
+    STM_ASSERT_EQ(memcmp(out1, src, sizeof out1), 0);
+    STM_ASSERT_EQ(memcmp(out3, src + 16384, sizeof out3), 0);
+
+    free(src);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* #343 dcache (Area E) -- THE safety-critical property. After a copy-on-write
+ * overwrite (a new commit -> a new extent gen, the AEAD-nonce identity), a
+ * re-read of the same offset MUST decrypt the NEW extent (a MISS on the new
+ * (paddr,gen) key) and serve the NEW bytes -- never the stale cached plaintext
+ * from the pre-overwrite extent. Non-vacuous: a cache keyed without the gen
+ * (e.g. ino+offset) would HIT and serve the stale bytes, failing BOTH the
+ * miss-stat delta AND the content compare. */
+STM_TEST(dcache_cow_overwrite_serves_new_plaintext) {
+    make_tmp("dcache_cow");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"d", 1,
+                                        0644u, 0, 0, &fino));
+
+    const size_t EXT = 64u * 1024u;
+    uint8_t *a = malloc(EXT), *b = malloc(EXT);
+    STM_ASSERT(a != NULL && b != NULL);
+    for (size_t i = 0; i < EXT; i++) {
+        a[i] = (uint8_t)(i & 0xFF);
+        b[i] = (uint8_t)(~i & 0xFF);          /* every byte differs from A */
+    }
+
+    /* Write A, commit, read [0,8192) -> caches A's plaintext. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 0, a, EXT));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    uint8_t out[8192] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(memcmp(out, a, sizeof out), 0);
+
+    /* Full-extent overwrite with B (fully covers -> no RMW read), commit. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 0, b, EXT));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    struct stm_sync *sy = stm_fs_sync(fs);
+    uint64_t h0 = 0, m0 = 0; size_t bb0 = 0;
+    stm_sync_dcache_stats(sy, &h0, &m0, &bb0);
+
+    /* Re-read the same offset: the new extent's (paddr,gen) key is fresh
+     * -> MISS -> decrypts B. The stale A entry is never served. */
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ((int)got, (int)sizeof out);
+    uint64_t h1 = 0, m1 = 0; size_t bb1 = 0;
+    stm_sync_dcache_stats(sy, &h1, &m1, &bb1);
+    STM_ASSERT_EQ((int)(m1 - m0), 1);              /* a fresh decrypt, not a stale hit */
+    STM_ASSERT_EQ((int)(h1 - h0), 0);
+    STM_ASSERT_EQ(memcmp(out, b, sizeof out), 0);  /* NEW bytes, not stale A */
+
+    free(a); free(b);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 /* #352-F1 (review P0): an interior sub-write of one block of a coalesced
  * multi-block extent, after a commit, must preserve the non-overwritten
  * blocks. Pre-fix, stm_extent_overwrite truncated/whole-dropped the
