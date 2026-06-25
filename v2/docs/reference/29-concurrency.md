@@ -102,25 +102,51 @@ reads). Disposition: **seam to the post-Go concurrent-FS arc** — schedule the
 
 ## 29.6 — Throughput characterization
 
-`tests/bench_concurrent_write.c` (N writers, distinct inodes, 64 KiB records,
-AEAD on; non-sanitized build):
+`tests/bench_concurrent_write.c` (N writers, distinct inodes, AEAD on,
+non-sanitized build; env-knobbed `STM_BENCH_WRSZ`/`NWRITES`/`COMMIT`/`THREADS`).
+
+**Multi-thread scaling (64 KiB records, commit/32):**
 
 ```
-threads   agg_MB/s   per-thread_MB/s   scaling_vs_1
-   1        59.2          59.2          1.00x
-   2        57.5          28.7          0.97x
-   4        57.3          14.3          0.97x
-   8        56.6           7.1          0.96x
+threads   agg_MB/s   scaling_vs_1
+   1        ~62          1.00x
+   2        ~60          ~0.96x
+   4        ~54          ~0.86x
+   8        ~58          ~0.93x   (run-to-run host noise; the point is: no gain)
 ```
 
 Aggregate throughput is **flat** across thread count — concurrent writers all
 funnel through the global `dirty_buffer->mu`, the per-dataset
 `extent_index->lock`, the global `alloc->lock`, and the one-in-flight
-`bdev d->lock`. This is fine for a single serial session (the go-build); it is
-the multi-connection (A-5b) write-scaling ceiling, a **separate** perf-debt axis
-from the R171 read-UAF. The absolute crypto delta (with/without AEAD) is **Area
-E's** headline; Stratum has no unencrypted mode (the keyfile gates everything),
-so isolating it needs a cipher-bypass build (an Area E prerequisite).
+`bdev d->lock`. The multi-connection (A-5b) write-scaling ceiling.
+
+**Single-thread decomposition (the absolute number is per-extent-overhead-
+bound, NOT crypto- or commit-bound):**
+
+```
+record size   commit cadence       MB/s
+   64 KiB      every 32 (8 commits)  52.8
+   64 KiB      end-only (1 commit)   51.7   <- commit cadence is IRRELEVANT
+    1 MiB      every 8              166.2
+    4 MiB      every 2              199.5   <- ~4x, approaching the AEAD ceiling
+```
+
+The dominant single-thread cost is a **fixed per-extent overhead** (extent-index
+btree insert + a Merkle node + AEAD nonce/tag setup + alloc), independent of
+write size. Small (64 KiB) records pay it on every write -> ~52 MB/s; 4 MiB
+records amortize it -> ~200 MB/s, roughly the 2-pass XChaCha20-SIV software-AEAD
+ceiling (so at large records it genuinely is approaching crypto-bound). fsync /
+commit cadence is NOT the bottleneck (1 commit == 8 commits).
+
+**Implication for the go-build (perf-debt, designed fix).** A `go build` is a
+small-write storm (object files, `$WORK` intermediates) -> the
+per-extent-overhead-bound ~52 MB/s regime, not the 200. The fix is the **9.8
+BE-write half's Bε buffer** (batches N small updates into O(N/B) physical
+writes -- `docs/phase-9.8-design.md` §5) -- the SAME work that closes R171 and
+unlocks concurrency -- plus **Area S** (small-files/small-write batching). The
+absolute crypto delta (with/without AEAD) is **Area E's** headline; Stratum has
+no unencrypted mode (the keyfile gates everything), so isolating it needs a
+cipher-bypass build (an Area E prerequisite).
 
 ## 29.7 — Tests + the TSan caveat
 

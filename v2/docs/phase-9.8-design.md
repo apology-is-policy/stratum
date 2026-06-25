@@ -617,6 +617,16 @@ rest on the EBR retire ring `concurrency_mvcc.tla` already models
 (`BuggyImmediateFree` is the executable counterexample). Audit folds
 into the BE-arc close.
 
+**One more mechanism in the same envelope (Area D audit F2):** `load_root`
+(`engine.c`) plain-stores `eng->root` on its slow-warm path, and BOTH the
+serial path (under `serial_mu`) and the wait-free reader's slow-warm (under
+`commit_mu`) reach it -- a plain-store data race on `eng->root` if a wait-free
+reader and a serial op run on one engine concurrently. This is the SAME
+unreachable-at-v1.0 envelope (one serial worker per engine), distinct from the
+three rows above, and is NOT in the original closure enumeration. The BE-write
+chunk MUST also make `eng->root`'s slow-warm mutation atomic-or-`commit_mu`-
+covered on both paths. Added here so the seam ledger is complete.
+
 **Thylacine relevance -- why this is load-bearing, not optional.**
 Thylacine's `stratumd` is thread-per-connection with **serial**
 per-connection processing, so a single 9P session (the v1.0 boot, the

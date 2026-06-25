@@ -38,11 +38,24 @@
 #include <unistd.h>
 
 #define BENCH_DEVICE_BYTES   (UINT64_C(512) * 1024u * 1024u)
-#define WRITE_SZ             (64u * 1024u)      /* 64 KiB records */
-#define WRITES_PER_THREAD    256u               /* 16 MiB per thread */
-#define COMMIT_EVERY         32u
+
+/* Runtime knobs (env-overridable so the bottleneck can be decomposed without a
+ * recompile): STM_BENCH_WRSZ (record bytes), STM_BENCH_NWRITES (writes/thread),
+ * STM_BENCH_COMMIT (commit every N writes; 0 = commit once at the end),
+ * STM_BENCH_THREADS (single thread count; default sweeps 1/2/4/8). */
+static unsigned WRITE_SZ          = 64u * 1024u;
+static unsigned WRITES_PER_THREAD = 256u;
+static unsigned COMMIT_EVERY      = 32u;
 
 static const unsigned THREAD_COUNTS[] = { 1u, 2u, 4u, 8u };
+
+static unsigned env_u(const char *k, unsigned dflt)
+{
+    const char *v = getenv(k);
+    if (!v || !*v) return dflt;
+    unsigned long n = strtoul(v, NULL, 10);
+    return n ? (unsigned)n : dflt;
+}
 
 typedef struct {
     stm_fs *fs;
@@ -66,7 +79,7 @@ static void *writer(void *arg)
         stm_status s = stm_fs_write(c->fs, c->ds, c->ino,
                                       (uint64_t)i * WRITE_SZ, c->buf, WRITE_SZ);
         if (s != STM_OK) { atomic_store(&c->err, (int)s); return NULL; }
-        if ((i % COMMIT_EVERY) == COMMIT_EVERY - 1u) {
+        if (COMMIT_EVERY && (i % COMMIT_EVERY) == COMMIT_EVERY - 1u) {
             s = stm_fs_commit(c->fs);
             if (s != STM_OK) { atomic_store(&c->err, (int)s); return NULL; }
         }
@@ -107,7 +120,11 @@ static int run_n(unsigned n, uint8_t *buf, double *out_mbps)
     for (unsigned i = 0; i < n; i++)
         if (pthread_create(&tids[i], NULL, writer, &ctxs[i]) != 0) return -1;
     for (unsigned i = 0; i < n; i++) pthread_join(tids[i], NULL);
+    /* Final durability commit -- part of making the writes durable, so it is
+     * inside the timed window. With COMMIT_EVERY=0 this is the ONLY commit. */
+    stm_status fc = stm_fs_commit(fs);
     double dt = now_s() - t0;
+    if (fc != STM_OK) { fprintf(stderr, "  final commit err=%d\n", (int)fc); return -1; }
 
     for (unsigned i = 0; i < n; i++)
         if (atomic_load(&ctxs[i].err) != 0) {
@@ -126,20 +143,31 @@ static int run_n(unsigned n, uint8_t *buf, double *out_mbps)
 
 int main(void)
 {
+    WRITE_SZ          = env_u("STM_BENCH_WRSZ", WRITE_SZ);
+    WRITES_PER_THREAD = env_u("STM_BENCH_NWRITES", WRITES_PER_THREAD);
+    COMMIT_EVERY      = env_u("STM_BENCH_COMMIT", COMMIT_EVERY);   /* 0 = once at end */
+    unsigned thr_override = env_u("STM_BENCH_THREADS", 0u);
+
     uint8_t *buf = malloc(WRITE_SZ);
     if (!buf) return 1;
     for (unsigned i = 0; i < WRITE_SZ; i++) buf[i] = (uint8_t)(i * 31u + 7u);
 
-    printf("# Area D concurrent-write scaling (64 KiB records, %u writes/thread, "
-           "commit/%u, AEAD on)\n", WRITES_PER_THREAD, COMMIT_EVERY);
+    unsigned single[1] = { thr_override };
+    const unsigned *tlist = thr_override ? single : THREAD_COUNTS;
+    unsigned tn = thr_override ? 1u : (unsigned)(sizeof THREAD_COUNTS / sizeof THREAD_COUNTS[0]);
+
+    printf("# Area D concurrent-write scaling: %u KiB records, %u writes/thread "
+           "(%.0f MiB/thread), commit_every=%u (0=end-only), AEAD on\n",
+           WRITE_SZ / 1024u, WRITES_PER_THREAD,
+           (double)WRITES_PER_THREAD * WRITE_SZ / (1024.0 * 1024.0), COMMIT_EVERY);
     printf("# threads   agg_MB/s   per-thread_MB/s   scaling_vs_1\n");
 
     double base = 0.0;
-    for (unsigned k = 0; k < sizeof THREAD_COUNTS / sizeof THREAD_COUNTS[0]; k++) {
-        unsigned n = THREAD_COUNTS[k];
+    for (unsigned k = 0; k < tn; k++) {
+        unsigned n = tlist[k];
         double mbps = 0.0;
         if (run_n(n, buf, &mbps) != 0) { fprintf(stderr, "run n=%u failed\n", n); free(buf); return 1; }
-        if (n == 1u) base = mbps;
+        if (k == 0u) base = mbps;
         printf("  %5u   %9.1f   %14.1f   %.2fx\n",
                n, mbps, mbps / n, base > 0.0 ? mbps / base : 1.0);
         fflush(stdout);
