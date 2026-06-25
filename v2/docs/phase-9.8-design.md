@@ -584,6 +584,57 @@ the engine call, not an engine-internal mechanism.
 | 9.8-BE-fs.c | port write fs.c ops: drop `fs->global` EX (the per-inode pin still gates compound-op atomicity); engine writes go lock-free | R175 |
 | 9.8-BE-bench | sequential-write benchmark (creat-many-files, write-many-small-extents); compare against 9.7 baseline | (folded into R175 close) |
 
+### 5.1.1 — R171 closure status + Thylacine A-5b relevance (Area D addendum, 2026-06-25)
+
+The five 9.8-BE chunks above are the **unbuilt write half** of Phase
+9.8. The LF-read half (chunks 1-6) landed -- the wait-free read path
+plus the **R171 P1-1 SH-fallback STOPGAP**. The BE-write half (chunks
+7-11) was designed, spec-framed, and scheduled here but never
+implemented: the project hit the crown-jewel read checkpoint (chunk 5)
+and moved to the Thylacine integration. The `eng_node.chain_head`
+substrate (9.8-LF-1) therefore sits **built-but-unused** -- no writer
+prepends onto it, so reads fall through to the base node and the
+writer's in-place `eng_leaf_put` `free(old); val = new` upsert
+(`node.c`) remains live. That in-place free->assign **is** the R171 P0
+use-after-free family (`engine.c` R171 doctrine; `fs.c` LF-3 header).
+The BE-write half is its **closure** -- not merely "write-side
+optimisation" (the §8 framing); for a multi-connection deployment it
+is a **soundness** prerequisite.
+
+| R171 item | The race | Closure | Roadmap |
+|---|---|---|---|
+| P0-1 | a wait-free reader's leaf-value memcpy races the writer's in-place `free(old); val=new` upsert (`node.c eng_leaf_put`) | `9.8-BE-prepend` (chunk 9): writers CAS-prepend a delta message; the old base value is superseded + EBR-retired, never freed under a reader | scheduled, **unbuilt** |
+| P0-4 | `invalidate_memtree` frees the eng_node tree under a pinned reader | EBR-retire the eng_node tree at BE-prepend | folds into chunk 9, **unbuilt** |
+| P0-2 | the engine struct itself is freed by rollback / `dataset_destroy` while a reader holds the engine pointer | EBR-retire the engine struct in `dataset_engine_close_locked` | **chunk 9b (NEW, this addendum)** -- was a floating forward-note |
+| P0-3 | `stm_fs_unmount` is not excluded by the wait-free wedge gate | "draining" flag + EBR-advance-until-empty (task #1232) | production-mitigated: stratumd drains workers before unmount |
+
+**Chunk 9b -- `9.8-BE-engine-retire`** (NEW): EBR-retire the
+`stm_btree_engine` struct in `dataset_engine_close_locked` (and the
+rollback / `dataset_destroy` paths) instead of freeing it directly, so a
+wait-free reader holding the engine pointer across an `stm_ebr_enter` /
+`_exit` never dereferences freed memory. Composes with chunk 9 -- both
+rest on the EBR retire ring `concurrency_mvcc.tla` already models
+(`BuggyImmediateFree` is the executable counterexample). Audit folds
+into the BE-arc close.
+
+**Thylacine relevance -- why this is load-bearing, not optional.**
+Thylacine's `stratumd` is thread-per-connection with **serial**
+per-connection processing, so a single 9P session (the v1.0 boot, the
+on-device `go build`) never drives a concurrent reader+writer on one
+engine -- the R171 family is **unreachable** there. It becomes
+reachable under **multi-connection-same-dataset**, which Thylacine's
+A-5b per-user-session model introduces (two sessions reading+writing
+one shared dataset). Ground truth (Stratum Stabilization **Area D**,
+2026-06-25): the race is real **by construction** (in-place insert, no
+COW, lockless reader -- `engine.c node_insert`) but did **not**
+reproduce under direct ASan stress (2,000,000 wait-free reads racing
+2,000,000 same-inode writes, **zero** torn reads) -- the free->assign
+window is vanishingly narrow. Net: **high stakes** (UAF /
+cross-session corruption) x **low reachability today** (not
+v1.0-reachable; hard to trigger) = a **seam to the A-5b milestone**,
+not a v1.0 blocker. **Schedule the BE-write half (chunks 7-11 + 9b)
+before A-5b multi-connection-same-dataset ships.**
+
 ### 5.2 — Bε buffer semantics
 
 Each internal node carries a sorted on-disk buffer of pending
@@ -953,7 +1004,8 @@ fs.c port chunks after the engine support is in place.
 | 6 | 9.8-LF-bench | concurrent-read benchmark vs 9.7 baseline (1/4/16/64 cores) | (folded into R171 close) |
 | 7 | 9.8-BE-format | internal-node on-disk format extension; STM_UB_VERSION 32 → 33 | R172 |
 | 8 | 9.8-BE-flush | engine-internal Bε flush logic + recursive-flush cap | R173 |
-| 9 | 9.8-BE-prepend | writer-side CAS prepend + `_concurrent` insert/delete API | R174 |
+| 9 | 9.8-BE-prepend | writer-side CAS prepend + `_concurrent` insert/delete API (closes R171 P0-1 + P0-4 -- see §5.1.1) | R174 |
+| 9b | 9.8-BE-engine-retire | EBR-retire the engine struct in `dataset_engine_close_locked` (closes R171 P0-2 -- §5.1.1) | (folds into the BE-arc close) |
 | 10 | 9.8-BE-fs.c | port write fs.c ops to per-inode-pin + EBR | R175 |
 | 11 | 9.8-BE-bench | sequential-write benchmark vs 9.7 baseline | (folded into R175 close) |
 | 12 | 9.8-ARC | ARC-style node cache eviction (replaces 1024-bucket fixed cache) | R176 |
@@ -966,7 +1018,13 @@ updated in the same commit.
 
 The **crown-jewel checkpoint is chunk 5** (9.8-LF-3 close):
 mission item #4 lives here. The bench at chunk 6 publishes the
-numbers; chunks 7-13 are write-side optimisation + housekeeping.
+numbers; chunks 12-13 are housekeeping. **Chunks 7-11 + 9b are NOT
+merely write-side optimisation** -- they are the **closure of the R171
+P0 use-after-free family** (the wait-free read path's
+in-place-free-vs-read race; §5.1.1). At v1.0 Thylacine they are
+unreachable (single-session serial stratumd) and currently held by the
+R171 P1-1 SH-fallback stopgap, but they are a **soundness prerequisite
+for A-5b multi-connection-same-dataset** and MUST land before it ships.
 
 ## 9 — Perf claims + bench targets
 

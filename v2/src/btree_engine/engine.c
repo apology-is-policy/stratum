@@ -221,16 +221,25 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
  *     the free and the reassign reads from freed memory (R171 P0-1
  *     UAF). Stopgap: SH-fallback at every public reader (R171 P1-1)
  *     turns the visible symptom into a slow-path retry. True
- *     closure: BE-prepend (#1218) replaces the in-place leaf upsert
- *     with a CAS-prepend on a per-node delta chain.
+ *     closure: 9.8-BE-prepend (chunk 9; phase-9.8-design.md 5.1.1)
+ *     replaces the in-place leaf upsert with a CAS-prepend on a
+ *     per-node delta chain.
  *   - Engine struct freed by rollback / dataset_destroy / sync_close
  *     while a reader holds the engine pointer (R171 P0-2 UAF).
  *     Closure: EBR-retire the engine struct in
- *     dataset_engine_close_locked (forward-noted to a dedicated
- *     R171-followup chunk).
+ *     dataset_engine_close_locked -- scheduled as 9.8-BE-engine-retire
+ *     (chunk 9b; phase-9.8-design.md 5.1.1).
  *   - invalidate_memtree's tree-free race against a pinned reader
  *     (R171 P0-4 UAF). Closure: EBR-retire the eng_node tree at
- *     LF-BE-prepend.
+ *     9.8-BE-prepend (chunk 9).
+ * Thylacine reachability (Stratum Stabilization Area D, 2026-06-25):
+ * this whole family needs a concurrent reader+writer on ONE engine,
+ * which a single serial stratumd connection never produces -- so it is
+ * UNREACHABLE at v1.0 (the boot + the go-build) and reachable only
+ * under A-5b multi-connection-same-dataset. Real by construction yet
+ * it did NOT reproduce under direct ASan stress (2e6 reads x 2e6
+ * same-inode writes, zero torn reads); the BE-write half must land
+ * before A-5b ships.
  * LF-BE-prepend's concurrent-commit regime will require the serial
  * commit path to also acquire commit_mu before calling load_root
  * (any new caller MUST follow the established discipline).
