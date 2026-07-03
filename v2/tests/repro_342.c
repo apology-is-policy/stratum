@@ -132,10 +132,14 @@ static uint64_t max_end(const struct wop *w, size_t n)
 }
 
 static int run_variant(const char *variant);
+static int run_space_probe(void);
 
 int main(int argc, char **argv)
 {
-    if (argc > 1) return run_variant(argv[1]);
+    if (argc > 1) {
+        if (!strcmp(argv[1], "space")) return run_space_probe();
+        return run_variant(argv[1]);
+    }
     /* ctest mode: every variant must be clean. */
     static const char *all[] = { "full", "safe", "nobf", "head5",
                                  "lone", "dense", "backf" };
@@ -207,4 +211,75 @@ static int run_variant(const char *variant)
     printf(bad ? "repro_342: REPRODUCED (divergence above)\n"
                : "repro_342: clean -- no divergence on this tier\n");
     return bad ? 1 : 0;
+}
+
+/* space: amplification probe (task #39 hunt tool, NOT part of the ctest
+ * run). Writes the traced go-archive pattern file-after-file with NO
+ * commit until the first ENOSPC, then commits and writes a second wave.
+ * At ~1x amplification the 16 MiB test pool (8 MiB bootstrap) holds
+ * ~150 files of 48,676 B. A much earlier ENOSPC = space consumed above
+ * the logical bytes; second-wave success after the commit = the excess
+ * was uncommitted-CoW/PENDING garbage a commit sweeps (the fix then is
+ * commit-on-allocation-pressure); second-wave ENOSPC = a real leak. */
+static int run_space_probe(void)
+{
+    make_tmp("repro342sp");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs *fs = NULL;
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                  0, 0, &dir));
+
+    uint8_t wbuf[4096];
+    int wave1 = 0, wave2 = 0;
+    stm_status rc = STM_OK;
+    for (int f = 0; f < 4000 && rc == STM_OK; f++) {
+        char nm[16];
+        int nl = snprintf(nm, sizeof nm, "f%04d", f);
+        uint64_t ino = 0;
+        rc = stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm,
+                                (uint8_t)nl, 0644, 0, 0, &ino);
+        if (rc != STM_OK) break;
+        for (size_t w = 0; w < sizeof(phase1)/sizeof(phase1[0]) && rc == STM_OK; w++) {
+            fill_pattern(wbuf, phase1[w].off, phase1[w].len, (int)w);
+            rc = stm_fs_write(fs, 1, ino, phase1[w].off, wbuf, phase1[w].len);
+        }
+        for (size_t w = 0; w < sizeof(phase2)/sizeof(phase2[0]) && rc == STM_OK; w++) {
+            fill_pattern(wbuf, phase2[w].off, phase2[w].len, 100 + (int)w);
+            rc = stm_fs_write(fs, 1, ino, phase2[w].off, wbuf, phase2[w].len);
+        }
+        if (rc == STM_OK) wave1++;
+    }
+    printf("space: wave1 files=%d logical=%.1f MiB before rc=%d "
+           "(pool 16 MiB, 8 MiB bootstrap)\n",
+           wave1, wave1 * (double)FILE_SIZE / (1024.0 * 1024.0), (int)rc);
+
+    stm_status crc_ = stm_fs_commit(fs);
+    printf("space: commit rc=%d\n", (int)crc_);
+
+    rc = STM_OK;
+    for (int f = 0; f < 4000 && rc == STM_OK; f++) {
+        char nm[16];
+        int nl = snprintf(nm, sizeof nm, "g%04d", f);
+        uint64_t ino = 0;
+        rc = stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm,
+                                (uint8_t)nl, 0644, 0, 0, &ino);
+        if (rc != STM_OK) break;
+        for (size_t w = 0; w < sizeof(phase1)/sizeof(phase1[0]) && rc == STM_OK; w++) {
+            fill_pattern(wbuf, phase1[w].off, phase1[w].len, (int)w);
+            rc = stm_fs_write(fs, 1, ino, phase1[w].off, wbuf, phase1[w].len);
+        }
+        if (rc == STM_OK) wave2++;
+    }
+    printf("space: wave2 (post-commit) files=%d logical=%.1f MiB rc=%d\n",
+           wave2, wave2 * (double)FILE_SIZE / (1024.0 * 1024.0), (int)rc);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    return 0;
 }
