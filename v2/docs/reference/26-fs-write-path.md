@@ -93,10 +93,25 @@ buffer overlay surfaces them on intervening reads.
 
 ### Dirty buffer + flush coalescing (`src/dirty_buffer/dirty_buffer.c`)
 
-The dirty buffer holds per-inode sorted+disjoint ranges (insert overlays/merges
-overlaps). Caps: `STM_FLUSH_INODE_CAP_BYTES` (8 MiB, == recordsize) per inode,
+The dirty buffer holds per-inode sorted+disjoint ranges. Insert **split-salvages**
+a partial overlap (the **Thylacine #342 fix**): the new write supersedes exactly
+the bytes it covers; an overlapped range's sticking-out head/tail bytes are
+preserved as remnant ranges (at most two — only the first overlapped range can
+stick out before the write, only the last past it). The pre-fix insert
+whole-dropped any overlapping range, silently discarding its non-covered bytes —
+the on-device `go build` corruption: `updateBuildID`'s 41-byte in-place stamp
+dropped the compiler's still-buffered 186-byte header flush, and the lost bytes
+read back as the underlying extent's zero pad (`"not package main"` at link; a
+second silent zero window in the object body via the same mechanism on the
+compiler's 96-byte backfill). Same lost-head/tail class the extent layer's
+covering write closed (#352-F1), one layer up. Regression: `tests/repro_342.c`
+(the traced in-guest write sequence, all variants byte-verified) +
+`dbuf_overlap_split_salvages_head` / `_head_and_tail` / `dbuf_overlap_multi_range_remnants`.
+Caps: `STM_FLUSH_INODE_CAP_BYTES` (8 MiB, == recordsize) per inode,
 `STM_FLUSH_GLOBAL_CAP_BYTES` (256 MiB) global. On insert-ENOSPC the writer runs
 the writeback.tla retry dance: flush this inode → retry; flush all → retry.
+(Remnants retain bytes the old drop freed, so a near-cap partial overwrite can
+now ENOSPC where it previously "fit" by losing data — the retry dance covers it.)
 
 `drain_inode_coalesced_locked` (`src/dirty_buffer/dirty_buffer.c:352`) is the
 **#352 amplification fix**. Without it each ≤ 4 KiB range became its own extent,

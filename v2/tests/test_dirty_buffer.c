@@ -135,20 +135,16 @@ STM_TEST(dbuf_lookup_stops_at_first_gap)
     stm_dirty_buffer_destroy(b);
 }
 
-STM_TEST(dbuf_overlap_replaces_old_range)
+STM_TEST(dbuf_overlap_split_salvages_head)
 {
-    /* v1 impl semantics: any range that overlaps the new write is
-     * DROPPED in its entirety (writeback.tla::BufferedWrite). A later
-     * v2 may add split-overwrite (preserve non-overlapping prefix/
-     * suffix); for v1 the simpler model is sufficient because the C
-     * caller always re-inserts the prefix bytes IF they're still
-     * needed (the FS layer's read-modify-write at the boundary handles
-     * the tail-pad case independently).
+    /* Split-salvage semantics (the Thylacine #342 fix,
+     * writeback.tla::BufferedWrite): a partial overlap supersedes only
+     * the covered bytes; the overlapped range's sticking-out head is
+     * preserved as a remnant. The pre-fix impl whole-dropped the range
+     * (this test's ancestor ASSERTED that loss -- [0,50) as a gap).
      *
-     * Test: insert [0, 100) of 1s, then [50, 120) of 2s. The first
-     * range is overlapped → DROPPED. Only the second remains. Reads
-     * of [0, 50) return covered=0 (gap), reads of [50, 120) return
-     * 70 covered with 2s. */
+     * Test: insert [0, 100) of 1s, then [50, 120) of 2s. [0, 50) stays
+     * 1s (the salvaged remnant), [50, 120) is 2s. */
 
     stm_dirty_buffer *b = NULL;
     STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
@@ -161,11 +157,12 @@ STM_TEST(dbuf_overlap_replaces_old_range)
     for (int i = 0; i < 70; i++) second[i] = (uint8_t)2;
     STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 50, 70, second));
 
-    /* [0, 50) is a gap — covered=0. */
+    /* [0, 50) is the salvaged head remnant -- covered=50 with 1s. */
     uint8_t outA[50] = {0xff};
     size_t covA = 99;
     STM_ASSERT_OK(stm_dirty_buffer_lookup(b, 1, 1, 0, 50, outA, &covA));
-    STM_ASSERT_EQ(covA, (size_t)0);
+    STM_ASSERT_EQ(covA, (size_t)50);
+    STM_ASSERT_EQ(memcmp(outA, first, 50), 0);
 
     /* [50, 120) is the second range — covered=70 with 2s. */
     uint8_t outB[70] = {0};
@@ -174,8 +171,67 @@ STM_TEST(dbuf_overlap_replaces_old_range)
     STM_ASSERT_EQ(covB, (size_t)70);
     STM_ASSERT_EQ(memcmp(outB, second, 70), 0);
 
-    /* Per-inode bytes reflects only the second range's 70. */
-    STM_ASSERT_EQ(stm_dirty_buffer_inode_bytes(b, 1, 1), (size_t)70);
+    /* Per-inode bytes = 50 (remnant) + 70 (new). */
+    STM_ASSERT_EQ(stm_dirty_buffer_inode_bytes(b, 1, 1), (size_t)120);
+
+    stm_dirty_buffer_destroy(b);
+}
+
+STM_TEST(dbuf_overlap_split_salvages_head_and_tail)
+{
+    /* The #342 guest shape: a small stamp fully INSIDE a larger
+     * buffered range must preserve both sides. Insert [100, 286) of
+     * 1s (the 186-byte compiler flush), stamp [230, 271) of 2s (the
+     * 41-byte buildid rewrite). [100,230) + [271,286) stay 1s. */
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+
+    uint8_t flush[186];
+    for (int i = 0; i < 186; i++) flush[i] = (uint8_t)1;
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 100, 186, flush));
+
+    uint8_t stamp[41];
+    for (int i = 0; i < 41; i++) stamp[i] = (uint8_t)2;
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 230, 41, stamp));
+
+    uint8_t out[186] = {0};
+    size_t cov = 0;
+    STM_ASSERT_OK(stm_dirty_buffer_lookup(b, 1, 1, 100, 186, out, &cov));
+    STM_ASSERT_EQ(cov, (size_t)186);
+    for (int i = 0; i < 130; i++) STM_ASSERT_EQ(out[i], (uint8_t)1);
+    for (int i = 130; i < 171; i++) STM_ASSERT_EQ(out[i], (uint8_t)2);
+    for (int i = 171; i < 186; i++) STM_ASSERT_EQ(out[i], (uint8_t)1);
+    STM_ASSERT_EQ(stm_dirty_buffer_inode_bytes(b, 1, 1), (size_t)186);
+
+    stm_dirty_buffer_destroy(b);
+}
+
+STM_TEST(dbuf_overlap_multi_range_remnants)
+{
+    /* A write spanning several buffered ranges: only the FIRST can
+     * leave a head remnant and only the LAST a tail remnant; interior
+     * ranges are fully superseded. Ranges [0,40) 1s, [40,80) 2s,
+     * [80,120) 3s; write [20,100) of 9s. Expect [0,20)=1, [20,100)=9,
+     * [100,120)=3. */
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+
+    uint8_t v1[40], v2[40], v3[40], w[80];
+    memset(v1, 1, sizeof v1); memset(v2, 2, sizeof v2);
+    memset(v3, 3, sizeof v3); memset(w, 9, sizeof w);
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1,  0, 40, v1));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 40, 40, v2));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 80, 40, v3));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 20, 80, w));
+
+    uint8_t out[120] = {0};
+    size_t cov = 0;
+    STM_ASSERT_OK(stm_dirty_buffer_lookup(b, 1, 1, 0, 120, out, &cov));
+    STM_ASSERT_EQ(cov, (size_t)120);
+    for (int i = 0;   i < 20;  i++) STM_ASSERT_EQ(out[i], (uint8_t)1);
+    for (int i = 20;  i < 100; i++) STM_ASSERT_EQ(out[i], (uint8_t)9);
+    for (int i = 100; i < 120; i++) STM_ASSERT_EQ(out[i], (uint8_t)3);
+    STM_ASSERT_EQ(stm_dirty_buffer_inode_bytes(b, 1, 1), (size_t)120);
 
     stm_dirty_buffer_destroy(b);
 }

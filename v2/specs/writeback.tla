@@ -208,8 +208,16 @@ Init ==
 (*   - next_seq ≤ MaxSeq (TLC bound).                                        *)
 (*   - per-inode + global cap respected (post-overlap-removal).             *)
 (*                                                                          *)
-(* Effect: any buffered range that overlaps the new range is REPLACED      *)
-(* (last-writer-wins). A fresh BufRange is inserted with seq = next_seq.   *)
+(* Effect (SPLIT-SALVAGE, the Thylacine-#342 fix): the new write            *)
+(* supersedes exactly the bytes it covers. An overlapped range's            *)
+(* non-covered head/tail bytes are preserved as REMNANT ranges (keeping     *)
+(* their original seq -- the bytes are the old writer's). Only the FIRST    *)
+(* overlapped range can stick out before the write and only the LAST past   *)
+(* it (sorted non-overlap), so at most two remnants arise. The original     *)
+(* whole-range REPLACE dropped a partial overlap's sticking-out bytes --    *)
+(* real data loss the range-only abstraction could not see (this model      *)
+(* carries no byte content; the C repro + regression tests carry that       *)
+(* half). BufferRangesNonOverlapWithinIno + the caps re-verify the shape.   *)
 (***************************************************************************)
 BufferedWrite(ino, off, len) ==
     /\ ino \in InoIds /\ off \in Offsets /\ len \in Lengths
@@ -218,13 +226,23 @@ BufferedWrite(ino, off, len) ==
     /\ LET overlapping ==
               { b \in BufferedFor(ino) :
                   RangesOverlap(b.off, b.len, off, len) }
+           head_rems ==
+              { [ino |-> b.ino, off |-> b.off, len |-> off - b.off,
+                 seq |-> b.seq] :
+                b \in { c \in overlapping : c.off < off } }
+           tail_rems ==
+              { [ino |-> b.ino, off |-> off + len,
+                 len |-> (b.off + b.len) - (off + len), seq |-> b.seq] :
+                b \in { c \in overlapping : c.off + c.len > off + len } }
+           remnants == head_rems \union tail_rems
            kept_inode_bytes ==
               InodeBufBytes(ino) - SumBufLen(overlapping)
+                                 + SumBufLen(remnants)
            kept_global_bytes ==
-              GlobalBufBytes - SumBufLen(overlapping)
+              GlobalBufBytes - SumBufLen(overlapping) + SumBufLen(remnants)
        IN  /\ kept_inode_bytes + len <= InodeCapBlocks
            /\ kept_global_bytes + len <= GlobalCapBlocks
-           /\ buffer' = (buffer \ overlapping) \union
+           /\ buffer' = ((buffer \ overlapping) \union remnants) \union
                 {[ino |-> ino, off |-> off, len |-> len, seq |-> next_seq]}
     /\ next_seq' = next_seq + 1
     /\ UNCHANGED <<committed, durable_disk, used_paddrs, current_txg>>

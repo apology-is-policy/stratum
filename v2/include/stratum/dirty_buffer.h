@@ -75,34 +75,23 @@ void stm_dirty_buffer_destroy(stm_dirty_buffer *buf);
  * Insert a write at (dataset_id, ino, off, off+len). The caller's
  * `data` is COPIED into the buffer (the buffer owns the storage).
  *
- * Per writeback.tla::BufferedWrite: any existing buffered range for
- * (dataset_id, ino) that OVERLAPS [off, off+len) is REPLACED. The
- * unique-bytes effect is last-writer-wins.
+ * Per writeback.tla::BufferedWrite: the new write supersedes exactly
+ * the bytes it covers. A partially-overlapped existing range is
+ * SPLIT-SALVAGED -- its non-overlapped head/tail bytes are preserved
+ * as remnant ranges; only the covered middle is replaced. The
+ * unique-bytes effect is last-writer-wins PER BYTE.
  *
- * v1 semantics — entire-range replacement on overlap:
- *   The v1 impl DROPS any overlapping existing range in its entirety,
- *   even if the new write only partially overlaps it. Example: existing
- *   [0, 100), new write [50, 120) → existing is dropped; only the new
- *   range remains. Bytes [0, 50) that the writer expected to persist
- *   are LOST from the buffer.
- *
- *   This is correct under the writer's mental model PROVIDED the FS
- *   layer above always re-reads through to the extent layer for any
- *   buffer-miss range (which it does — the lookup-then-fallthrough
- *   path in stm_fs_read covers this). In practice, the existing
- *   range's bytes are either (a) already on disk from a prior flush
- *   that the new write partially-shadows, or (b) part of a pending
- *   write that gets fully overwritten by the new one. Case (a) means
- *   bytes [0, 50) are recoverable via the extent layer. Case (b) is
- *   the writer rewriting their own pending data — they don't care
- *   about the discarded prefix.
- *
- *   v2 forward-note: a smarter impl would SPLIT the existing range
- *   into non-overlapping prefix [0, 50) + suffix (none in this case)
- *   and keep them in the buffer. This avoids the buffer-miss cost
- *   for partial overlap. Until that lands, callers can assume the
- *   simpler "any overlap drops the old range" semantics and the
- *   extent-layer fallback covers correctness.
+ * History (Thylacine #342): the original impl whole-dropped any
+ * overlapping range, arguing the lost bytes were either (a) already
+ * on disk (extent-layer fallback re-reads them) or (b) a pending
+ * write fully rewritten by the new one. Both legs are false for a
+ * PARTIAL overlap of a never-flushed range: the sticking-out bytes
+ * exist nowhere but the buffer, and dropping them made reads fall
+ * through to an underlying hole / extent zero-pad -- durable
+ * on-disk zeros in a go compiler archive (a 41-byte in-place
+ * buildid stamp destroyed the surrounding 186-byte pending flush).
+ * The same lost-head/tail class the extent layer's covering write
+ * closed (#352-F1), one layer up.
  *
  * Returns:
  *   STM_OK       — success.

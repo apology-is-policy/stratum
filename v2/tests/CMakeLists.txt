@@ -132,6 +132,11 @@ target_link_libraries(bench_commit PRIVATE stm_testlib stratum
 add_executable(bench_crypto bench_crypto.c)
 target_link_libraries(bench_crypto PRIVATE stratum
                                    stm_warnings stm_sanitize stm_coverage)
+# Thylacine #342 regression: replay of the in-guest go-build write sequence
+# that exposed stm_dirty_buffer_insert's whole-drop-on-partial-overlap data
+# loss. No-arg = ctest mode (all variants must be byte-clean); an argv[1]
+# variant name runs one shape for hunting.
+stm_add_test(repro_342 repro_342.c test_fs_common.c)
 stm_add_test(test_lp9        test_lp9.c)
 target_link_libraries(test_lp9 PRIVATE stm_lp9)
 stm_add_test(test_stratum_fs test_stratum_fs.c test_fs_common.c)

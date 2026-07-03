@@ -22,8 +22,18 @@
  *   Ranges within an inode_entry are kept in a singly-linked list
  *   sorted by `off`, with the invariant that pairwise ranges are
  *   NON-OVERLAPPING (writeback.tla::BufferRangesNonOverlapWithinIno).
- *   Insert maintains this by removing overlapping ranges before
- *   placing the new one.
+ *   Insert maintains this by SPLIT-SALVAGING overlapped ranges: the
+ *   new range supersedes only the bytes it actually covers; a
+ *   partially-overlapped range's sticking-out head/tail bytes are
+ *   preserved as remnant ranges (at most two exist -- only the first
+ *   overlapped range can stick out before the write, only the last
+ *   can stick out past it). Whole-dropping a partially-overlapped
+ *   range would DISCARD its non-overlapped bytes -- the Thylacine
+ *   #342 on-disk zeros corruption (a 41-byte updateBuildID stamp
+ *   dropped a buffered 186-byte compiler flush; the lost bytes fell
+ *   through to an underlying extent's zero pad). The same lost-tail
+ *   class the extent layer's covering write closed (#352-F1), one
+ *   layer up.
  *
  * Concurrency: every public call locks buf->mu before touching state.
  * Drain callbacks run UNDER buf->mu — caller MUST NOT re-enter the
@@ -192,81 +202,127 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
 
     pthread_mutex_lock(&buf->mu);
 
-    /* Compute what the inode_bytes would be AFTER removing overlap. */
+    /* Pre-scan: find the overlapped ranges + the split-salvage remnants.
+     * The list is sorted + non-overlapping, so the overlapped ranges are
+     * consecutive and only the FIRST can stick out before the new write
+     * (head remnant) and only the LAST past it (tail remnant); one range
+     * fully containing the write yields both. The new range supersedes
+     * only [off, off+len) -- the remnants keep every other live byte
+     * (whole-dropping them was the Thylacine #342 data loss). */
     stm_dbuf_inode *e = find_inode_locked(buf, dataset_id, ino);
-    size_t overlap_bytes = 0;
+    stm_dbuf_range *first_ov = NULL, *last_ov = NULL;
+    size_t dropped_bytes = 0;
     if (e) {
         for (stm_dbuf_range *r = e->head; r; r = r->next) {
             if (ranges_overlap(r->off, r->len, off, len)) {
-                overlap_bytes += r->len;
+                if (!first_ov) first_ov = r;
+                last_ov = r;
+                dropped_bytes += r->len;
             }
         }
     }
+    uint64_t end = off + len;
+    uint64_t head_len = (first_ov && first_ov->off < off)
+                            ? off - first_ov->off : 0u;
+    uint64_t last_end = last_ov ? last_ov->off + last_ov->len : 0u;
+    uint64_t tail_len = (last_ov && last_end > end) ? last_end - end : 0u;
+
+    /* Per writeback.tla::BufferedWrite cap clauses: after superseding the
+     * covered bytes (dropped minus the salvaged remnants) and adding
+     * `len`, the per-inode + global byte counters must respect the caps.
+     * superseded >= 0 always: the remnants are sub-spans of the dropped
+     * ranges. */
+    size_t superseded = dropped_bytes - (size_t)head_len - (size_t)tail_len;
     size_t cur_inode_bytes = e ? e->bytes : 0;
     size_t cur_global_bytes = buf->total_bytes;
-    /* Per writeback.tla::BufferedWrite cap clauses: after dropping
-     * overlapping ranges and adding `len`, the per-inode + global
-     * byte counters must respect the caps. */
-    if (cur_inode_bytes - overlap_bytes + len > buf->inode_cap) {
+    if (cur_inode_bytes - superseded + len > buf->inode_cap) {
         pthread_mutex_unlock(&buf->mu);
         return STM_ENOSPC;
     }
-    if (cur_global_bytes - overlap_bytes + len > buf->global_cap) {
+    if (cur_global_bytes - superseded + len > buf->global_cap) {
         pthread_mutex_unlock(&buf->mu);
         return STM_ENOSPC;
     }
 
-    /* Allocate the new range up-front (so a malloc failure leaves
-     * the buffer unmodified). */
-    stm_dbuf_range *newr = malloc(sizeof *newr);
-    if (!newr) {
-        pthread_mutex_unlock(&buf->mu);
-        return STM_ENOMEM;
-    }
+    /* Allocate the new range AND both remnants up-front (so a malloc
+     * failure leaves the buffer unmodified). The remnant data is copied
+     * out of the still-live overlapped ranges before any mutation. */
+    stm_dbuf_range *newr = NULL, *headr = NULL, *tailr = NULL;
+    newr = malloc(sizeof *newr);
+    if (!newr) goto oom;
     newr->off = off;
     newr->len = len;
     newr->next = NULL;
     newr->data = malloc((size_t)len);
-    if (!newr->data) {
-        free(newr);
-        pthread_mutex_unlock(&buf->mu);
-        return STM_ENOMEM;
-    }
+    if (!newr->data) goto oom;
     memcpy(newr->data, data, (size_t)len);
 
-    /* Find-or-create the inode entry. We allocated the new range
-     * already; if get_or_create fails we have to clean up. */
-    e = get_or_create_inode_locked(buf, dataset_id, ino);
-    if (!e) {
-        free(newr->data);
-        free(newr);
-        pthread_mutex_unlock(&buf->mu);
-        return STM_ENOMEM;
+    if (head_len > 0u) {
+        headr = malloc(sizeof *headr);
+        if (!headr) goto oom;
+        headr->off = first_ov->off;
+        headr->len = head_len;
+        headr->next = NULL;
+        headr->data = malloc((size_t)head_len);
+        if (!headr->data) goto oom;
+        memcpy(headr->data, first_ov->data, (size_t)head_len);
+    }
+    if (tail_len > 0u) {
+        tailr = malloc(sizeof *tailr);
+        if (!tailr) goto oom;
+        tailr->off = end;
+        tailr->len = tail_len;
+        tailr->next = NULL;
+        tailr->data = malloc((size_t)tail_len);
+        if (!tailr->data) goto oom;
+        memcpy(tailr->data, last_ov->data + (last_ov->len - tail_len),
+               (size_t)tail_len);
     }
 
-    /* Walk the sorted range list. Drop overlapping ranges + accumulate
-     * bytes freed. Find the insertion point for the new range. */
+    /* Find-or-create the inode entry. We allocated the new ranges
+     * already; if get_or_create fails we have to clean up. */
+    e = get_or_create_inode_locked(buf, dataset_id, ino);
+    if (!e) goto oom;
+
+    /* Walk the sorted range list. Drop overlapped ranges + find the
+     * insertion point, then splice head-remnant -> new -> tail-remnant.
+     * Order stays sorted: headr->off < off (a strict prefix of the first
+     * overlapped range), tailr->off == end, and any kept range past the
+     * splice has r->off >= end but cannot start inside [end, end+tail_len)
+     * (it would have overlapped last_ov, violating the invariant). */
     stm_dbuf_range **slot = &e->head;
     while (*slot) {
         stm_dbuf_range *r = *slot;
         if (ranges_overlap(r->off, r->len, off, len)) {
-            /* Drop r. */
+            /* Superseded: its salvageable head/tail already live in
+             * headr/tailr. */
             *slot = r->next;
             e->bytes -= r->len;
             buf->total_bytes -= r->len;
             free_range(r);
             continue;
         }
-        if (r->off >= off + len) break;   /* insertion point reached */
+        if (r->off >= end) break;   /* insertion point reached */
         slot = &r->next;
     }
-    newr->next = *slot;
-    *slot = newr;
-    e->bytes      += len;
-    buf->total_bytes += len;
+    if (tailr) { tailr->next = *slot; *slot = tailr; }
+    else       { newr->next  = *slot; }
+    if (tailr) newr->next = tailr;
+    if (headr) { headr->next = newr; *slot = headr; }
+    else       { *slot = newr; }
+    size_t added = (size_t)len + (size_t)head_len + (size_t)tail_len;
+    e->bytes         += added;
+    buf->total_bytes += added;
 
     pthread_mutex_unlock(&buf->mu);
     return STM_OK;
+
+oom:
+    if (newr)  { free(newr->data);  free(newr);  }
+    if (headr) { free(headr->data); free(headr); }
+    if (tailr) { free(tailr->data); free(tailr); }
+    pthread_mutex_unlock(&buf->mu);
+    return STM_ENOMEM;
 }
 
 stm_status stm_dirty_buffer_lookup(stm_dirty_buffer *buf,
