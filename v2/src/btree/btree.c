@@ -238,6 +238,45 @@ static stm_status internal_split(stm_bt_node *node,
     memset(&node->pivots[mid], 0, rcount * sizeof(stm_bt_pivot));
     node->npivots = mid;
 
+    /* Partition the buffered messages by the separator: a message whose
+     * key is >= sep belongs to the right sibling's subtree. Leaving it
+     * behind routes it through the LEFT node's pivots on the next flush
+     * -- the key exceeds every remaining pivot, so it is delivered into
+     * the left's LAST child and materializes as a silently out-of-order
+     * entry (the #35 allocator-tree corruption: the gap-finder then
+     * proposes an occupied start and every extent write fails
+     * STM_ECORRUPT). A split-with-live-buffer is reachable because
+     * flush_all_recursive flushes a child directly (growing its pivot
+     * count past target with no split), and the parent's next flush pass
+     * buffers fresh messages into that child before its overflow-split
+     * runs. Move (not copy) so ownership transfers; relative order
+     * within each side is preserved (append order carries INSERT/DELETE
+     * override semantics). */
+    if (node->nmsgs > 0) {
+        stm_status ms = stm_bt_node_grow_messages(right, node->nmsgs);
+        if (ms != STM_OK) {
+            /* Undo the pivot move so the caller sees an unchanged node. */
+            memcpy(&node->pivots[mid], right->pivots,
+                   rcount * sizeof(stm_bt_pivot));
+            node->npivots = mid + rcount;
+            right->npivots = 0;
+            stm_bt_node_free(right);
+            free(sep_key);
+            return ms;
+        }
+        uint32_t kept = 0;
+        for (uint32_t m = 0; m < node->nmsgs; m++) {
+            stm_bt_msg *msg = &node->msgs[m];
+            if (stm_bt_key_cmp(msg->key, msg->key_len,
+                               sep_key, right->pivots[0].key_len) >= 0) {
+                right->msgs[right->nmsgs++] = *msg;   /* move ownership */
+            } else {
+                node->msgs[kept++] = *msg;
+            }
+        }
+        node->nmsgs = kept;
+    }
+
     *out_pivot_key = sep_key;
     *out_pivot_len = right->pivots[0].key_len;
     *out_right     = right;
@@ -733,3 +772,4 @@ void stm_btree_stats_of(const stm_btree *t, stm_btree_stats *out)
     out->n_entries = t->n_entries;
     walk_stats(t->root, 0, out);
 }
+

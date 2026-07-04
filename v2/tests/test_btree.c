@@ -240,4 +240,100 @@ STM_TEST(btree_scan_in_order) {
     stm_btree_free(t);
 }
 
+/* ------------------------------------------------------------------------- */
+/* #35 regression: internal_split must partition the message buffer          */
+/* ------------------------------------------------------------------------- */
+
+/* An internal node can be split while its message buffer is non-empty
+ * (flush_all_recursive flushes a child directly, growing its pivot count
+ * past target with no split; the parent's next flush buffers fresh
+ * messages into it before the overflow-split runs). Pre-fix, the split
+ * left ALL buffered messages in the left sibling; a message keyed >= the
+ * separator was then routed through the left node's pivots on the next
+ * flush -- past every pivot, into the left's LAST child -- and became a
+ * silently out-of-order entry. In production this corrupted the
+ * allocator's in-memory tree after mounting a large baked pool: the
+ * gap-finder scan walked the misplaced entry, proposed an occupied
+ * start_block, and every extent write failed STM_ECORRUPT (the fsync
+ * cascade that killed every post-go-build boot).
+ *
+ * Recipe (the organic shape, scaled down by small targets): ascending
+ * "bake" inserts to depth >= 3, a flush-all scan, then gap-fill inserts
+ * with a flush-all scan between each (the allocator reserve pattern).
+ * Scan order is asserted at every step. */
+
+typedef struct {
+    uint64_t prev;
+    int      have;
+    int      violations;
+    long     count;
+} order8_ctx;
+
+static uint64_t dec_be64(const void *p)
+{
+    const uint8_t *b = p;
+    uint64_t k = 0;
+    for (int i = 0; i < 8; i++) k = (k << 8) | b[i];
+    return k;
+}
+
+static void enc_be64(uint64_t k, uint8_t out[8])
+{
+    for (int i = 7; i >= 0; i--) { out[i] = (uint8_t)(k & 0xff); k >>= 8; }
+}
+
+static int order8_cb(const void *k, size_t kl, const void *v, size_t vl,
+                     void *ctx_)
+{
+    (void)v; (void)vl;
+    order8_ctx *c = ctx_;
+    uint64_t key = (kl == 8) ? dec_be64(k) : 0;
+    c->count++;
+    if (c->have && key <= c->prev) c->violations++;
+    c->prev = key;
+    c->have = 1;
+    return 0;
+}
+
+STM_TEST(btree_internal_split_partitions_buffered_messages) {
+    static const uint32_t targets[] = { 6, 8, 12 };
+    for (size_t ti = 0; ti < sizeof(targets) / sizeof(targets[0]); ti++) {
+        stm_btree *t = make_tree(targets[ti]);
+        STM_ASSERT(t != NULL);
+
+        uint8_t kb[8], vb[8];
+        memset(vb, 0x22, sizeof vb);
+
+        /* "Bake": ascending even keys, enough for depth >= 3 at these
+         * targets. */
+        enum { N = 500 };
+        for (uint64_t i = 0; i < N; i++) {
+            enc_be64(2 * i + 100, kb);
+            STM_ASSERT_OK(stm_btree_insert(t, kb, 8, vb, 8));
+        }
+        {
+            order8_ctx oc = { 0 };
+            STM_ASSERT_OK(stm_btree_scan(t, NULL, 0, NULL, 0, order8_cb, &oc));
+            STM_ASSERT_EQ(oc.violations, 0);
+        }
+
+        /* Gap-fill with a flush-all scan before each insert (the
+         * allocator reserve pattern); order must hold at every step. */
+        for (uint64_t i = 0; i < N; i++) {
+            order8_ctx oc = { 0 };
+            STM_ASSERT_OK(stm_btree_scan(t, NULL, 0, NULL, 0, order8_cb, &oc));
+            STM_ASSERT_EQ(oc.violations, 0);
+            enc_be64(2 * i + 101, kb);
+            STM_ASSERT_OK(stm_btree_insert(t, kb, 8, vb, 8));
+        }
+        {
+            order8_ctx oc = { 0 };
+            STM_ASSERT_OK(stm_btree_scan(t, NULL, 0, NULL, 0, order8_cb, &oc));
+            STM_ASSERT_EQ(oc.violations, 0);
+            STM_ASSERT_EQ(oc.count, 2 * N);
+        }
+        stm_btree_free(t);
+    }
+}
+
 STM_TEST_MAIN("btree")
