@@ -23,6 +23,7 @@
 #include <stratum/sync.h>
 #include <stratum/types.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -133,11 +134,17 @@ static uint64_t max_end(const struct wop *w, size_t n)
 
 static int run_variant(const char *variant);
 static int run_space_probe(void);
+static int wedge_load(stm_fs *fs, uint64_t dir);
+static int run_wedge_probe(void);
+static int run_baked_probe(const char *pool_path, const char *key_path);
 
 int main(int argc, char **argv)
 {
     if (argc > 1) {
         if (!strcmp(argv[1], "space")) return run_space_probe();
+        if (!strcmp(argv[1], "wedge")) return run_wedge_probe();
+        if (!strcmp(argv[1], "baked") && argc == 4)
+            return run_baked_probe(argv[2], argv[3]);
         return run_variant(argv[1]);
     }
     /* ctest mode: every variant must be clean. */
@@ -282,4 +289,161 @@ static int run_space_probe(void)
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     return 0;
+}
+
+/* --- #35 fsync-cascade probes (wedge / baked) ------------------------- */
+
+/* The go-build-shaped load, shared by the empty-pool (`wedge`) and the
+ * baked-pool (`baked`) probes: buffered smalls + DIRECT bigs (>= the
+ * 1 MiB flush threshold -> immediate uncommitted extents) + buffered
+ * stamps ONTO those extents + an unlink storm of files-with-extents
+ * (reclaim commits fire mid-load), x3 cycles, then the fsync-equivalent
+ * stm_fs_commit + a post cascade probe. Prints every failing rc; the
+ * in-guest cascade is EVERY extent write failing STM_ECORRUPT(-200)
+ * from the $WORK-cleanup window onward. Returns nonzero if dirty. */
+static int wedge_load(stm_fs *fs, uint64_t dir)
+{
+    size_t big_len = 2u * 1024u * 1024u;
+    uint8_t *big = malloc(big_len);
+    STM_ASSERT(big != NULL);
+    for (size_t i = 0; i < big_len; i++) big[i] = (uint8_t)(i * 131u + 7u);
+    uint8_t wbuf[4096];
+
+    stm_status rc = STM_OK;
+    int cycle = 0, smalls = 0, bigs = 0, unlinks = 0;
+    const char *died = NULL;
+
+    for (cycle = 0; cycle < 3 && rc == STM_OK; cycle++) {
+        for (int f = 0; f < 300 && rc == STM_OK; f++) {
+            char nm[24];
+            int nl = snprintf(nm, sizeof nm, "c%d-s%04d", cycle, f);
+            uint64_t ino = 0;
+            rc = stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm,
+                                    (uint8_t)nl, 0644, 0, 0, &ino);
+            if (rc != STM_OK) { died = "small-create"; break; }
+            for (size_t w = 0; w < sizeof(phase1)/sizeof(phase1[0]); w++) {
+                fill_pattern(wbuf, phase1[w].off, phase1[w].len, (int)w);
+                rc = stm_fs_write(fs, 1, ino, phase1[w].off, wbuf,
+                                  phase1[w].len);
+                if (rc != STM_OK) { died = "small-write"; break; }
+            }
+            if (rc == STM_OK) smalls++;
+        }
+
+        for (int f = 0; f < 8 && rc == STM_OK; f++) {
+            char nm[24];
+            int nl = snprintf(nm, sizeof nm, "c%d-b%02d", cycle, f);
+            uint64_t ino = 0;
+            rc = stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm,
+                                    (uint8_t)nl, 0644, 0, 0, &ino);
+            if (rc != STM_OK) { died = "big-create"; break; }
+            rc = stm_fs_write(fs, 1, ino, 0, big, big_len);
+            if (rc != STM_OK) { died = "big-direct-write"; break; }
+            fill_pattern(wbuf, 3176, 186, 42);
+            rc = stm_fs_write(fs, 1, ino, 3176, wbuf, 186);
+            if (rc != STM_OK) { died = "stamp1"; break; }
+            fill_pattern(wbuf, 3306, 41, 43);
+            rc = stm_fs_write(fs, 1, ino, 3306, wbuf, 41);
+            if (rc != STM_OK) { died = "stamp2"; break; }
+            bigs++;
+        }
+
+        for (int f = 0; f < 300 && rc == STM_OK; f += 2) {
+            char nm[24];
+            int nl = snprintf(nm, sizeof nm, "c%d-s%04d", cycle, f);
+            rc = stm_fs_unlink(fs, 1, dir, (const uint8_t *)nm, (uint8_t)nl);
+            if (rc != STM_OK) { died = "small-unlink"; break; }
+            unlinks++;
+        }
+        for (int f = 0; f < 8 && rc == STM_OK; f += 2) {
+            char nm[24];
+            int nl = snprintf(nm, sizeof nm, "c%d-b%02d", cycle, f);
+            rc = stm_fs_unlink(fs, 1, dir, (const uint8_t *)nm, (uint8_t)nl);
+            if (rc != STM_OK) { died = "big-unlink"; break; }
+            unlinks++;
+        }
+        printf("wedge: cycle %d done smalls=%d bigs=%d unlinks=%d rc=%d\n",
+               cycle, smalls, bigs, unlinks, (int)rc);
+    }
+
+    if (rc != STM_OK)
+        printf("wedge: FIRST FAILURE at %s rc=%d (cycle %d)\n",
+               died ? died : "?", (int)rc, cycle);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    stm_status crc_ = stm_fs_commit(fs);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    printf("wedge: commit rc=%d in %.0f ms\n", (int)crc_, ms);
+
+    uint64_t ino2 = 0;
+    stm_status c2 = stm_fs_create_file(fs, 1, dir, (const uint8_t *)"after", 5,
+                                       0644, 0, 0, &ino2);
+    stm_status w2 = STM_EINVAL;
+    if (c2 == STM_OK) {
+        fill_pattern(wbuf, 0, 4096, 7);
+        w2 = stm_fs_write(fs, 1, ino2, 0, wbuf, 4096);
+    }
+    stm_status s2 = stm_fs_commit(fs);
+    printf("wedge: post create rc=%d write rc=%d commit2 rc=%d\n",
+           (int)c2, (int)w2, (int)s2);
+
+    free(big);
+    int bad = (rc != STM_OK) || (crc_ != STM_OK) || (c2 != STM_OK) ||
+              (w2 != STM_OK) || (s2 != STM_OK);
+    printf(bad ? "wedge: DIRTY\n" : "wedge: CLEAN\n");
+    return bad;
+}
+
+static int run_wedge_probe(void)
+{
+    make_tmp("repro342w");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes    = UINT64_C(4) * 1024 * 1024 * 1024;
+    fopts.bootstrap_size_bytes = UINT64_C(16) * 1024 * 1024;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs *fs = NULL;
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                  0, 0, &dir));
+
+    int bad = wedge_load(fs, dir);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    return bad;
+}
+
+/* baked: the wedge load against a COPY of the REAL baked GOROOT pool
+ * (build/fixtures/pool.img.baked-snapshot + system.key.baked-snapshot)
+ * -- the guest-fidelity delta the empty-pool wedge lacks: the committed
+ * bake tree (extent/alloc/Merkle state at real depth) that the guest
+ * then mutates. argv: repro_342 baked <pool-copy> <keyfile>. The pool
+ * file IS MUTATED -- pass a throwaway copy, never the snapshot. */
+static int run_baked_probe(const char *pool_path, const char *key_path)
+{
+    stm_fs *fs = NULL;
+    stm_fs_mount_opts mopts = {
+        .read_only    = false,
+        .keyfile_path = key_path,
+    };
+    stm_status mrc = stm_fs_mount(pool_path, &mopts, &fs);
+    printf("baked: mount rc=%d (%s)\n", (int)mrc, pool_path);
+    if (mrc != STM_OK) return 2;
+    printf("baked: verify-at-mount rc=%d\n", (int)stm_fs_verify(fs));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                  0, 0, &dir));
+
+    int bad = wedge_load(fs, dir);
+    printf("baked: verify-post-load rc=%d\n", (int)stm_fs_verify(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    return bad;
 }

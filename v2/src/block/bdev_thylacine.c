@@ -63,6 +63,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -516,11 +517,59 @@ static bool reinit_device_locked(thyla_bdev *d)
     return true;
 }
 
+/* BDEVDIAG: which do_request_once check failed, for the recovery/latch
+ * diagnostics in do_request. A bdev that silently latches dead is
+ * undiagnosable in the field -- one line per recovery attempt + one on
+ * the permanent latch names the failing arm. Emitted via raw write(2)
+ * (no stdio: I/O runs on server worker threads; a bounded stack buffer
+ * + one write syscall is thread-safe and allocation-free). */
+typedef struct {
+    uint8_t  arm;        /* 0=none 1=spurious 2=irqwait 3=used_idx 4=used_id 5=status */
+    uint8_t  st;         /* device status byte (arm 5) */
+    int64_t  irq_rc;     /* t_irq_wait return (arm 2) */
+    uint16_t used_idx;   /* observed used.idx (arm 3) */
+    uint16_t want_idx;   /* expected used.idx (arm 3) */
+} bdev_fail_info;
+
+static const char *bdev_fail_arm_str(uint8_t arm)
+{
+    switch (arm) {
+    case 1:  return "spurious-wakes";
+    case 2:  return "irq-wait";
+    case 3:  return "used-idx";
+    case 4:  return "used-id";
+    case 5:  return "status";
+    default: return "none";
+    }
+}
+
+static void bdev_diag(thyla_bdev *d, const char *what, uint64_t lba,
+                      uint32_t sector_count, req_kind kind,
+                      uint32_t attempt, const bdev_fail_info *fi)
+{
+    char buf[192];
+    int n = snprintf(buf, sizeof buf,
+                     "BDEVDIAG: %s kind=%c lba=%llu n=%u attempt=%u "
+                     "arm=%s st=%u irq_rc=%lld used=%u want=%u reinits=%llu\n",
+                     what,
+                     (kind == REQ_WRITE) ? 'W' : (kind == REQ_FLUSH) ? 'F' : 'R',
+                     (unsigned long long)lba, sector_count, attempt,
+                     bdev_fail_arm_str(fi->arm), fi->st,
+                     (long long)fi->irq_rc, fi->used_idx, fi->want_idx,
+                     (unsigned long long)d->reinit_count);
+    if (n > 0) {
+        ssize_t w = write(2, buf, (size_t)n);
+        (void)w;
+    }
+}
+
 /* Submit one virtqueue request + wait for completion. STM_OK on a clean
  * completion; STM_EIO on any failure WITHOUT latching -- the recovery /
- * latch decision is do_request()'s. Caller holds d->lock. */
+ * latch decision is do_request()'s. On failure `fi` names the failing
+ * arm (BDEVDIAG). Caller holds d->lock. */
 static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
-                                   uint32_t sector_count, req_kind kind)
+                                   uint32_t sector_count, req_kind kind,
+                                   bdev_fail_info *fi)
 {
     /* Pre-poison status byte so a missing device write surfaces. */
     *(volatile uint8_t *)(THYLA_RING_USER_VA + VQ_STATUS_OFF) = 0xff;
@@ -571,9 +620,16 @@ static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
      * change wakes before giving up. */
     uint32_t spurious = 0;
     for (;;) {
-        if (spurious >= MAX_NON_USED_BUFFER_WAKES) goto io_fail;
+        if (spurious >= MAX_NON_USED_BUFFER_WAKES) {
+            fi->arm = 1;
+            goto io_fail;
+        }
         int64_t count = t_irq_wait(d->irq_handle);
-        if (count < 0) goto io_fail;
+        if (count < 0) {
+            fi->arm = 2;
+            fi->irq_rc = count;
+            goto io_fail;
+        }
 
         uint32_t int_status = mmio_read32(d->slot_va + VREG_INTERRUPT_STATUS);
         mmio_write32(d->slot_va + VREG_INTERRUPT_ACK, int_status);
@@ -587,16 +643,28 @@ static stm_status do_request_once(thyla_bdev *d, uint64_t lba,
     /* Barrier between observing used.idx advance and reading used-ring
      * + data payload. */
     virtio_rmb();
-    if (used_idx != new_idx) goto io_fail;
+    if (used_idx != new_idx) {
+        fi->arm = 3;
+        fi->used_idx = used_idx;
+        fi->want_idx = new_idx;
+        goto io_fail;
+    }
 
     /* used.ring[(new_idx - 1) % QUEUE_SIZE].id must be 0 (the head). */
     uint32_t used_slot = (uint32_t)(new_idx - 1) % VQ_QUEUE_SIZE;
     uint32_t used_id   = *(volatile uint32_t *)(used_va + 4 + used_slot * 8);
-    if (used_id != 0) goto io_fail;
+    if (used_id != 0) {
+        fi->arm = 4;
+        goto io_fail;
+    }
 
     /* Status byte. */
     uint8_t st = mmio_read_u8(THYLA_RING_USER_VA + VQ_STATUS_OFF);
-    if (st != VIRTIO_BLK_S_OK) goto io_fail;
+    if (st != VIRTIO_BLK_S_OK) {
+        fi->arm = 5;
+        fi->st = st;
+        goto io_fail;
+    }
 
     /* Advance the bdev's counter. avail_idx wraps on uint16_t which
      * matches the device's 16-bit idx; invariant B-4 wrap-safe. */
@@ -631,18 +699,24 @@ static stm_status do_request(thyla_bdev *d, uint64_t lba,
     if (d->failed) return STM_EIO;
 
     for (uint32_t attempt = 0; ; attempt++) {
-        stm_status s = do_request_once(d, lba, sector_count, kind);
+        bdev_fail_info fi = {0};
+        stm_status s = do_request_once(d, lba, sector_count, kind, &fi);
         if (s == STM_OK) return STM_OK;
+
+        bdev_diag(d, "io-fail", lba, sector_count, kind, attempt, &fi);
 
         if (attempt >= DO_REQUEST_MAX_REINIT) {
             /* Recovery budget exhausted -- the device is genuinely dead.
              * Latch so every later op short-circuits + the FS surfaces
              * the durable failure. */
+            bdev_diag(d, "LATCHED-DEAD", lba, sector_count, kind, attempt, &fi);
             d->failed = true;
             return STM_EIO;
         }
         if (!reinit_device_locked(d)) {
             /* The device cannot even be re-negotiated -- unrecoverable. */
+            bdev_diag(d, "LATCHED-DEAD (reinit failed)", lba, sector_count,
+                      kind, attempt, &fi);
             d->failed = true;
             return STM_EIO;
         }
