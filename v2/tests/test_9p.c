@@ -4251,4 +4251,61 @@ STM_TEST(p9_write_msize4096_sizes) {
     unlink(g_key_path);
 }
 
+/* #46 (Thylacine go-cache layer 4): Tgetattr must see an UNFSYNCED
+ * write's size. cmd/go's putIndexEntry does lcreate -> write(175) ->
+ * fstat (the Ftruncate no-op gate) with NO intervening fsync; a stale
+ * size makes the gate self-delete the just-written cache entry. The
+ * 66-char name + 175-byte payload mirror the device shape exactly (a
+ * content-addressed <64-hex>-a index entry whose first write crosses
+ * the INLINE->EXTENT transition). */
+STM_TEST(p9_46_getattr_sees_unfsynced_write_size) {
+    make_tmp("9p_46_unfsynced_size");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    static const char name[] =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-a";
+    uint8_t entry[175];
+    for (size_t i = 0; i < sizeof entry; i++)
+        entry[i] = (uint8_t)('A' + (i % 26u));
+
+    uint32_t sz = build_twalk(req, 2, 100, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    sz = build_tlcreate(req, 3, 101, name, 1u /* O_WRONLY */, 0644u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+
+    sz = build_twrite(req, 4, 101, 0, entry, (uint32_t)sizeof entry);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)sizeof entry);
+
+    /* Tgetattr with NO fsync/commit in between -- the putIndexEntry gate. */
+    sz = build_tgetattr(req, 5, 101, STM_9P_GETATTR_BASIC);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETATTR);
+    /* size @ 7(hdr) + 8(valid) + 13(qid) + 4+4+4(mode,uid,gid)
+     * + 8(nlink) + 8(rdev) = 56. */
+    uint64_t got = load_u64(resp + 56);
+    STM_ASSERT_EQ(got, (uint64_t)sizeof entry);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("9p")

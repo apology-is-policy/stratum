@@ -137,6 +137,7 @@ static int run_space_probe(void);
 static int wedge_load(stm_fs *fs, uint64_t dir);
 static int run_wedge_probe(void);
 static int run_baked_probe(const char *pool_path, const char *key_path);
+static int run_getattr46_probe(const char *pool_path, const char *key_path);
 
 int main(int argc, char **argv)
 {
@@ -145,6 +146,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "wedge")) return run_wedge_probe();
         if (!strcmp(argv[1], "baked") && argc == 4)
             return run_baked_probe(argv[2], argv[3]);
+        if (!strcmp(argv[1], "getattr46") && argc == 4)
+            return run_getattr46_probe(argv[2], argv[3]);
         return run_variant(argv[1]);
     }
     /* ctest mode: every variant must be clean. */
@@ -444,6 +447,102 @@ static int run_baked_probe(const char *pool_path, const char *key_path)
 
     int bad = wedge_load(fs, dir);
     printf("baked: verify-post-load rc=%d\n", (int)stm_fs_verify(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    return bad;
+}
+
+/* getattr46 (#46 / the Thylacine go-cache layer-4 residue): the cmd/go
+ * putIndexEntry shape against a COPY of the REAL baked pool. Per
+ * iteration: a chunked buffered "-d output" write (cmd/go copyFile's
+ * chunking -- 40 x 64 KiB buffered inserts, enough dirty-buffer pressure
+ * to trip mid-run flushes), then a FRESH 66-char "-a" index entry:
+ * create -> write(175) -> IMMEDIATE stm_fs_stat with NO fsync/commit --
+ * asserting si_size == 175 (the port Ftruncate no-op gate). ZERO commits
+ * across the load (the on-device go build issues none). argv:
+ * repro_342 getattr46 <pool-copy> <keyfile>. Pool file IS MUTATED. */
+static int run_getattr46_probe(const char *pool_path, const char *key_path)
+{
+    stm_fs *fs = NULL;
+    stm_fs_mount_opts mopts = {
+        .read_only    = false,
+        .keyfile_path = key_path,
+    };
+    stm_status mrc = stm_fs_mount(pool_path, &mopts, &fs);
+    printf("getattr46: mount rc=%d (%s)\n", (int)mrc, pool_path);
+    if (mrc != STM_OK) return 2;
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                  0, 0, &dir));
+
+    const size_t chunk_len = 64u * 1024u;
+    uint8_t *chunk = malloc(chunk_len);
+    STM_ASSERT(chunk != NULL);
+    uint8_t entry[175];
+    int bad = 0;
+
+    for (int it = 0; it < 40 && !bad; it++) {
+        char nm[80];
+        /* The -d output file: chunked buffered writes. */
+        int nl = snprintf(nm, sizeof nm, "%02x%062d-d", it & 0xff, it);
+        uint64_t dino = 0;
+        stm_status rc = stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm,
+                                           (uint8_t)nl, 0644, 0, 0, &dino);
+        if (rc != STM_OK) {
+            printf("getattr46: it=%d -d create rc=%d\n", it, (int)rc);
+            bad = 1; break;
+        }
+        for (int c = 0; c < 40 && rc == STM_OK; c++) {
+            for (size_t i = 0; i < chunk_len; i++)
+                chunk[i] = (uint8_t)(i * 31u + (size_t)c + (size_t)it);
+            rc = stm_fs_write(fs, 1, dino, (uint64_t)c * chunk_len,
+                              chunk, chunk_len);
+        }
+        if (rc != STM_OK) {
+            printf("getattr46: it=%d -d write rc=%d\n", it, (int)rc);
+            bad = 1; break;
+        }
+
+        /* The -a index entry: create -> write(175) -> stat, no fsync. */
+        nl = snprintf(nm, sizeof nm, "%02x%062d-a", it & 0xff, it);
+        uint64_t aino = 0;
+        rc = stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm,
+                                (uint8_t)nl, 0644, 0, 0, &aino);
+        if (rc != STM_OK) {
+            printf("getattr46: it=%d -a create rc=%d\n", it, (int)rc);
+            bad = 1; break;
+        }
+        for (size_t i = 0; i < sizeof entry; i++)
+            entry[i] = (uint8_t)('A' + ((i + (size_t)it) % 26u));
+        rc = stm_fs_write(fs, 1, aino, 0, entry, sizeof entry);
+        if (rc != STM_OK) {
+            printf("getattr46: it=%d -a write rc=%d\n", it, (int)rc);
+            bad = 1; break;
+        }
+
+        struct stm_inode_value iv;
+        rc = stm_fs_stat(fs, 1, aino, &iv);
+        uint64_t sz = (rc == STM_OK) ? stm_load_le64(iv.si_size) : 0u;
+        if (rc != STM_OK || sz != sizeof entry) {
+            printf("getattr46: it=%d STALE -a stat rc=%d size=%llu (want %zu)\n",
+                   it, (int)rc, (unsigned long long)sz, sizeof entry);
+            bad = 1;
+        }
+        /* The -d inode too (cmd/go's Get trusts its size on every hit). */
+        rc = stm_fs_stat(fs, 1, dino, &iv);
+        sz = (rc == STM_OK) ? stm_load_le64(iv.si_size) : 0u;
+        if (rc != STM_OK || sz != (uint64_t)(40u * chunk_len)) {
+            printf("getattr46: it=%d STALE -d stat rc=%d size=%llu (want %llu)\n",
+                   it, (int)rc, (unsigned long long)sz,
+                   (unsigned long long)(40u * chunk_len));
+            bad = 1;
+        }
+    }
+
+    free(chunk);
+    printf(bad ? "getattr46: STALE/DIRTY\n" : "getattr46: CLEAN\n");
     STM_ASSERT_OK(stm_fs_unmount(fs));
     return bad;
 }
