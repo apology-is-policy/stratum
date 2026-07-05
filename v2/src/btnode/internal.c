@@ -96,6 +96,7 @@ stm_status stm_btnode_internal_encode_msgs(const stm_btnode_pivot *pivots,
                                              const stm_btnode_msg *msgs,
                                              uint32_t n_msgs,
                                              uint64_t gen, uint64_t tree_id,
+                                             uint64_t seq_hw,
                                              void *buf, size_t buf_size)
 {
     if (!buf) return STM_EINVAL;
@@ -136,7 +137,7 @@ stm_status stm_btnode_internal_encode_msgs(const stm_btnode_pivot *pivots,
 
     btnode_hdr_write(out, STM_BTNODE_KIND_INTERNAL,
                      n_pivots, (uint32_t)msg_bytes,
-                     (uint32_t)payload_bytes, gen, tree_id);
+                     (uint32_t)payload_bytes, gen, tree_id, seq_hw);
 
     uint8_t *p = out + STM_BTNODE_HDR_SIZE;
 
@@ -191,7 +192,8 @@ stm_status stm_btnode_internal_encode(const stm_btnode_pivot *pivots,
     return stm_btnode_internal_encode_msgs(pivots, n_pivots,
                                            children, children_len,
                                            NULL, 0,
-                                           gen, tree_id, buf, buf_size);
+                                           gen, tree_id, /*seq_hw=*/0,
+                                           buf, buf_size);
 }
 
 stm_status stm_btnode_internal_decode_msgs(const void *buf, size_t buf_size,

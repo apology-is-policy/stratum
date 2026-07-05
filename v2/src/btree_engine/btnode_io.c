@@ -453,7 +453,7 @@ stm_status eng_node_write(stm_btree_engine *eng, eng_node *n, uint64_t gen)
         s = stm_btnode_internal_encode_msgs(pivs, np, blob,
                                        (size_t)nc * STM_BTNODE_CHILD_BPTR_SIZE,
                                        wm, n->buf_count,
-                                       gen, eng->tree_id,
+                                       gen, eng->tree_id, n->seq_hw,
                                        buf, STM_BTREE_ENGINE_NODE_SIZE);
         free(wm);
         free(pivs);
@@ -724,10 +724,11 @@ stm_status eng_node_read(stm_btree_engine *eng,
     }
     free(buf);
 
-    n->paddr = paddr;
-    n->gen   = gen;
+    n->paddr  = paddr;
+    n->gen    = gen;
     memcpy(n->csum, expected_csum, STM_BTNODE_CSUM_SIZE);
-    n->dirty = false;
+    n->dirty  = false;
+    n->seq_hw = info.seq_hw;    /* 0 on leaves + pre-9.8 nodes */
     *out_node = n;
     return STM_OK;
 }

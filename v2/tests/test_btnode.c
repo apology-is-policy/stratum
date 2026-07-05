@@ -725,7 +725,7 @@ static void msg_encode_node(uint8_t *buf, size_t node_size,
                                                     children,
                                                     sizeof children,
                                                     msgs, n_msgs,
-                                                    7, 42,
+                                                    7, 42, /*seq_hw=*/0,
                                                     buf, node_size));
 }
 
@@ -784,7 +784,7 @@ STM_TEST(btnode_msgs_empty_byte_compat) {
     STM_ASSERT_OK(stm_btnode_internal_encode_msgs(&pv, 1, children,
                                                     sizeof children,
                                                     NULL, 0,
-                                                    7, 42, b, MSG_NODE_SIZE));
+                                                    7, 42, /*seq_hw=*/0, b, MSG_NODE_SIZE));
     STM_ASSERT_EQ(memcmp(a, b, MSG_NODE_SIZE), 0);
     STM_ASSERT_EQ(msg_get_le32(a + MSG_HDR_OFF_BUFFER_USED), 0u);
 
@@ -812,14 +812,14 @@ STM_TEST(btnode_msgs_encode_rejects) {
     stm_btnode_msg m = { 0x07, 1, "k", 1, NULL, 0 };
     STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
                                                      sizeof children, &m, 1,
-                                                     0, 0, buf, MSG_NODE_SIZE),
+                                                     0, 0, /*seq_hw=*/0, buf, MSG_NODE_SIZE),
                    STM_EINVAL);
 
     /* Valued tombstone. */
     m = (stm_btnode_msg){ STM_BTNODE_MSG_DELETE, 1, "k", 1, "v", 1 };
     STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
                                                      sizeof children, &m, 1,
-                                                     0, 0, buf, MSG_NODE_SIZE),
+                                                     0, 0, /*seq_hw=*/0, buf, MSG_NODE_SIZE),
                    STM_EINVAL);
 
     /* seq past 48 bits. */
@@ -827,7 +827,7 @@ STM_TEST(btnode_msgs_encode_rejects) {
                           STM_BTNODE_MSG_SEQ_MAX + 1u, "k", 1, NULL, 0 };
     STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
                                                      sizeof children, &m, 1,
-                                                     0, 0, buf, MSG_NODE_SIZE),
+                                                     0, 0, /*seq_hw=*/0, buf, MSG_NODE_SIZE),
                    STM_ERANGE);
 
     /* Key over the metakey-mirror bound. */
@@ -836,13 +836,13 @@ STM_TEST(btnode_msgs_encode_rejects) {
                           longkey, sizeof longkey, NULL, 0 };
     STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
                                                      sizeof children, &m, 1,
-                                                     0, 0, buf, MSG_NODE_SIZE),
+                                                     0, 0, /*seq_hw=*/0, buf, MSG_NODE_SIZE),
                    STM_ERANGE);
 
     /* NULL msgs with nonzero count. */
     STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
                                                      sizeof children, NULL, 1,
-                                                     0, 0, buf, MSG_NODE_SIZE),
+                                                     0, 0, /*seq_hw=*/0, buf, MSG_NODE_SIZE),
                    STM_EINVAL);
     free(buf);
 }
@@ -864,12 +864,12 @@ STM_TEST(btnode_msgs_region_cap) {
     STM_ASSERT_EQ(stm_btnode_msgs_encoded_bytes(&m, 1), region_max);
     STM_ASSERT_OK(stm_btnode_internal_encode_msgs(&pv, 1, children,
                                                     sizeof children, &m, 1,
-                                                    0, 0, buf, MSG_NODE_SIZE));
+                                                    0, 0, /*seq_hw=*/0, buf, MSG_NODE_SIZE));
     /* ...and one byte more rejects. */
     m.value_len = vfit + 1u;
     STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
                                                      sizeof children, &m, 1,
-                                                     0, 0, buf, MSG_NODE_SIZE),
+                                                     0, 0, /*seq_hw=*/0, buf, MSG_NODE_SIZE),
                    STM_ERANGE);
     free(big);
     free(buf);

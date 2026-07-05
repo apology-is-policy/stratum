@@ -94,7 +94,7 @@ stm_status stm_btnode_leaf_encode(const stm_btnode_entry *entries,
     /* Header. payload_used = total bytes from offset 128 onward that
      * carry valid entry data. */
     btnode_hdr_write(out, STM_BTNODE_KIND_LEAF, n_entries, /*buffer_used=*/0,
-                     (uint32_t)payload_bytes, gen, tree_id);
+                     (uint32_t)payload_bytes, gen, tree_id, /*seq_hw=*/0);
 
     /* Entries. */
     uint8_t *p = out + STM_BTNODE_HDR_SIZE;

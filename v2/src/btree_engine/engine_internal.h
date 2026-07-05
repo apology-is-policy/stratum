@@ -189,6 +189,46 @@ void eng_msg_array_free(eng_msg *msgs, uint32_t n);
  * corrupt shape stalling a commit. Exceeding it is STM_ECORRUPT. */
 #define ENG_FLUSH_MAX_RECURSION   32u
 
+/* 9.8-BE-prepend (chunk 9): a prepending writer whose CAS leaves the
+ * root chain at least this deep attempts an inline mini-consolidation
+ * (trylock serial_mu -> commit_mu; bails on contention, so a long
+ * commit just lets the chain grow until the next prepend retries).
+ * Matches btree_lf's STM_BT_LF_CONSOLIDATE_THRESHOLD + headroom
+ * (design §5.3); tunable post-bench. */
+#define ENG_CONSOLIDATE_THRESHOLD 8u
+
+/*
+ * The chain SEAL sentinel (9.8-BE-prepend). A consolidator (the mini,
+ * or commit_finalize's residue migration) detaches a chain with
+ * xchg(chain_head, ENG_CHAIN_SEALED); the sentinel tells a concurrent
+ * prepender/reader that this node is being superseded RIGHT NOW —
+ * both re-load mvcc_root and retry (the publisher stores the
+ * replacement within a few RAM instructions; there is no I/O inside a
+ * seal window). A seal is never left dangling: every sealer publishes
+ * a replacement root and retires the sealed husk before releasing
+ * commit_mu. The sentinel is a static dummy — never dereferenced,
+ * compared by address only.
+ */
+extern eng_delta eng_chain_sealed_sentinel;
+#define ENG_CHAIN_SEALED (&eng_chain_sealed_sentinel)
+
+/*
+ * The child-slot TOMBSTONE (9.8-BE-prepend). A superseded husk whose
+ * retire destructor is NON-recursive (the mini-consolidation's
+ * single-node clone shares the subtree with its replacement) must not
+ * let a pinned wait-free descent CAS-link a freshly-loaded child into
+ * one of its cold slots after the supersede — the husk's single-node
+ * free would leak it (or worse, nobody would own it). The consolidator
+ * therefore sweeps every husk slot post-publish with
+ * xchg(mem, ENG_CHILD_TOMBSTONE): a link that landed before the sweep
+ * is returned by the xchg and adopted (or retired); a descent arriving
+ * after observes the tombstone and restarts from mvcc_root — the
+ * child-slot analog of ENG_CHAIN_SEALED. Compared by address, never
+ * dereferenced.
+ */
+extern eng_node eng_child_tombstone;
+#define ENG_CHILD_TOMBSTONE (&eng_child_tombstone)
+
 /*
  * Siblings peeled off one node by a flush (9.8-BE-flush, chunk 8).
  *
@@ -305,6 +345,40 @@ typedef struct {
 } eng_child;
 
 /*
+ * Atomic access to eng_child.mem (9.8-BE-prepend). The published
+ * tree's ONLY structural mutation is a wait-free cold descent lazily
+ * linking a loaded child into its slot — which can race a second
+ * descent on the same slot and the clone-commit's resident walk. The
+ * slot stays a PLAIN pointer (eng_child is memcpy'd wholesale by the
+ * split partitioners, which an _Atomic member would poison), so the
+ * racy accesses go through GCC/Clang __atomic builtins — the one
+ * deliberate deviation from the stdatomic idiom, confined to these
+ * two helpers. Quiescent contexts (private clones, the commit-owned
+ * shadow, serial descents under the caller-exclusion contract,
+ * teardown) keep plain access.
+ *
+ * Link protocol: load-acquire; on NULL, read the child from disk and
+ * CAS(NULL -> child, release). The loser frees its copy and adopts
+ * the winner (returned through *expected). Release/acquire pairing
+ * makes every byte of the winner's fully-built child visible to the
+ * adopting walker.
+ */
+static inline eng_node *eng_child_mem_acquire(const eng_child *ch)
+{
+    return __atomic_load_n(&((eng_child *)(uintptr_t)ch)->mem,
+                           __ATOMIC_ACQUIRE);
+}
+
+static inline bool eng_child_mem_cas_link(eng_child *ch,
+                                          eng_node **expected,
+                                          eng_node *desired)
+{
+    return __atomic_compare_exchange_n(&ch->mem, expected, desired,
+                                       false /* strong */,
+                                       __ATOMIC_RELEASE, __ATOMIC_ACQUIRE);
+}
+
+/*
  * One in-memory metadata-tree node.
  *
  *   dirty — mutated since it was last written; commit assigns it a
@@ -361,6 +435,11 @@ struct eng_node {
      * a flush (chunk 8) or a buffered read materialises one. */
     eng_msg  *buf_msgs;
     uint32_t  buf_count;
+
+    /* 9.8-BE-prepend (chunk 9): RAM mirror of the header's n_seq_hw
+     * (see btnode.h). Populated at decode; stamped by the commit path
+     * on the ROOT just before its write. Meaningful only at a root. */
+    uint64_t  seq_hw;
 };
 
 /* ========================================================================= */
@@ -459,6 +538,26 @@ typedef struct {
     uint8_t   new_root_csum[STM_BTNODE_CSUM_SIZE];
     paddr_vec superseded;      /* prior paddrs of rewritten nodes + chains */
     paddr_vec fresh;           /* paddrs the flush wrote this commit       */
+
+    /* 9.8-BE-prepend (chunk 9): the clone-commit window. When `clone`
+     * is set, `shadow_root` is the fully-flushed private shadow tree
+     * (unpublished — no reader can reach it) that finalize adopts and
+     * abort discards; `consumed_head` is the live root's chain head as
+     * of flush start — every delta from it down was consolidated into
+     * the shadow, so finalize migrates only the strictly-newer prefix
+     * and retires the whole detached chain. `orphan_base` is
+     * orphaned_spill_blocks.n as of flush start: the clone flush
+     * COPIES the list into pending.superseded without zeroing it
+     * (finalize zeroes; abort and every mid-flush failure truncate
+     * back to orphan_base instead — the shadow's message-applies
+     * pushed entries [orphan_base..n) that only the discarded shadow
+     * justified, while [0..orphan_base) must survive an abort or the
+     * old tree's still-pending serial-era deletes leak their spill
+     * chains on disk). */
+    bool       clone;
+    eng_node  *shadow_root;
+    eng_delta *consumed_head;
+    uint32_t   orphan_base;
 } eng_pending;
 
 /* ========================================================================= */
@@ -580,6 +679,19 @@ struct stm_btree_engine {
 
     _Atomic(uint64_t)     next_delta_seq;
     _Atomic(eng_node *)   mvcc_root;
+
+    /* 9.8-BE-prepend (chunk 9): sticky concurrent-regime latch. Set
+     * (release) by the first insert/delete_concurrent and never
+     * cleared; read (acquire) by commit_flush to pick the CLONE commit
+     * arm. Why sticky rather than chain-empty-tested: a mini-
+     * consolidation can leave the chain empty while message state from
+     * _concurrent writers lives in PUBLISHED buffers — wait-free
+     * readers then rely on the whole published tree being immutable,
+     * so every subsequent commit must COW (mutate only the private
+     * shadow) and retire, even when it catches an empty chain. A
+     * never-latched engine keeps the byte-identical legacy in-place
+     * commit. */
+    _Atomic(bool)         concurrent_regime;
 };
 
 /* ========================================================================= */
@@ -602,6 +714,62 @@ void       eng_node_free_recursive(eng_node *n);  /* node + in-memory subtree */
  * and (b) at 9.8-LF-2 as the EBR retire destructor for consolidated
  * deltas. */
 void       eng_delta_free(eng_delta *d);
+
+/* 9.8-BE-prepend (chunk 9): allocate a delta with deep-copied key and
+ * value bytes (allocations via eng_buf_alloc — OOM-injectable).
+ * Returns NULL on OOM with nothing leaked. `seq`/`op` stored verbatim;
+ * `next` NULL. */
+eng_delta *eng_delta_new(eng_delta_op op, uint64_t seq,
+                         const void *key, uint32_t key_len,
+                         const void *value, uint32_t value_len);
+
+/* Free a whole detached delta chain (walks ->next; sentinel-safe: a
+ * chain must never contain ENG_CHAIN_SEALED — the sealers detach
+ * before installing the sentinel). Shape-compatible with
+ * stm_ebr_destructor: the EBR retire callback for a consolidated
+ * chain. NULL-safe. */
+void       eng_delta_chain_free(void *head);
+
+/*
+ * Deep-clone the resident tree rooted at `n` (9.8-BE-prepend): every
+ * resident node is copied — entries (keys, values, spill bookkeeping),
+ * pivots, children slots, buf_msgs, seq_hw, dirty/paddr/gen/csum —
+ * and resident children are cloned recursively (cold slots keep their
+ * bptr with mem == NULL). The clone's chain substrate is FRESH and
+ * empty: chains are root-only at chunk 9 and the caller owns the live
+ * root's chain explicitly (consolidate / migrate), so a source chain
+ * is deliberately NOT copied. The clone is private (unpublished) —
+ * the commit path may mutate it freely under the R172 F1 COW
+ * doctrine. Node-struct + array allocations route through
+ * eng_buf_alloc (OOM-injectable); returns NULL on any failure with
+ * the partial clone fully freed.
+ *
+ * A PUBLISHED source tree has exactly two concurrently-mutable
+ * locations, both tolerated: chain_head (not copied — see above) and
+ * children[].mem, which a racing wait-free cold descent may CAS-link
+ * mid-clone. The clone's acquire load of each mem slot sees either
+ * NULL (keep the cold bptr; the shadow loads from disk on demand) or
+ * the fully-initialised linked child (clone it) — coherent either
+ * way. Everything else on a published tree is immutable by the R172
+ * F1 doctrine. Links landing AFTER the clone's read need no sweep
+ * here (unlike the shallow clone): the source tree retires with the
+ * RECURSIVE destructor, which owns whatever hangs off the slots when
+ * grace ends.
+ */
+eng_node  *eng_node_clone_resident(const eng_node *n);
+
+/*
+ * Single-node clone for the mini-consolidation (9.8-BE-prepend):
+ * pivots + buf_msgs + entries deep-copied; the children ARRAY copied
+ * with the mem pointers SHARED (acquire-read per slot) — subtree
+ * ownership transfers to the clone when the source husk is retired
+ * with the single-node destructor. The clone's chain substrate is
+ * fresh and empty. Fallible allocations via eng_buf_alloc; NULL on
+ * OOM with the partial clone freed. A failed-path clone must be freed
+ * with eng_node_free (NEVER _recursive — the shared mem pointers
+ * still belong to the live tree).
+ */
+eng_node  *eng_node_clone_shallow(const eng_node *n);
 
 /* Lower-bound index of `key` among a leaf's entries; *out_found set
  * TRUE iff an exact match sits at that index. */

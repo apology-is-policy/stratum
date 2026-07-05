@@ -33,14 +33,17 @@
 /*
  * Write a header. kind must be a valid stm_btnode_kind. Zeros reserved
  * regions; caller fills payload AFTER STM_BTNODE_HDR_SIZE. Node-size
- * independent — the header is a fixed 128 bytes at offset 0.
+ * independent — the header is a fixed 128 bytes at offset 0. `seq_hw`
+ * is the message-seq high water (9.8-BE-prepend; 0 when the node
+ * carries no seq bookkeeping — every leaf, every pre-9.8 writer).
  */
 void btnode_hdr_write(uint8_t *buf,
                        stm_btnode_kind kind,
                        uint32_t n_entries,
                        uint32_t buffer_used,
                        uint32_t payload_used,
-                       uint64_t gen, uint64_t tree_id);
+                       uint64_t gen, uint64_t tree_id,
+                       uint64_t seq_hw);
 
 /*
  * Read + validate a header for a node of size `node_size`. Returns:

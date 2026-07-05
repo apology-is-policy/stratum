@@ -16,7 +16,8 @@ void btnode_hdr_write(uint8_t *buf,
                        uint32_t n_entries,
                        uint32_t buffer_used,
                        uint32_t payload_used,
-                       uint64_t gen, uint64_t tree_id)
+                       uint64_t gen, uint64_t tree_id,
+                       uint64_t seq_hw)
 {
     memset(buf, 0, STM_BTNODE_HDR_SIZE);
 
@@ -30,6 +31,7 @@ void btnode_hdr_write(uint8_t *buf,
     hdr.n_payload_used = stm_store_le32(payload_used);
     hdr.n_gen          = stm_store_le64(gen);
     hdr.n_tree_id      = stm_store_le64(tree_id);
+    hdr.n_seq_hw       = stm_store_le64(seq_hw);
     /* n_merkle left zero — chunk 7 will populate. */
 
     memcpy(buf, &hdr, sizeof hdr);
@@ -68,6 +70,7 @@ stm_status btnode_hdr_read(const uint8_t *buf, size_t node_size,
     out->payload_used = payload_used;
     out->gen          = stm_load_le64(hdr->n_gen);
     out->tree_id      = stm_load_le64(hdr->n_tree_id);
+    out->seq_hw       = stm_load_le64(hdr->n_seq_hw);
     return STM_OK;
 }
 

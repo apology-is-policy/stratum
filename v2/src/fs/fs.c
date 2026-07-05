@@ -69,10 +69,12 @@
  *     against unmount. Stratumd's accept-loop shutdown drains workers
  *     before unmount, so the obligation is satisfied in production.
  *     The same wait-free regime also lacks EBR retire for the engine
- *     struct freed by rollback / dataset_destroy / sync_close — these
- *     are R171 P0-2/P0-3/P0-4 closure items, scheduled as
- *     9.8-BE-engine-retire (chunk 9b) + 9.8-BE-prepend (chunk 9) +
- *     task #1232; see phase-9.8-design.md §5.1.1. Unreachable at v1.0
+ *     struct freed by rollback / dataset_destroy / sync_close — R171
+ *     P0-2 (chunk 9b, 9.8-BE-engine-retire) + P0-3 (task #1232) stay
+ *     open; P0-4 (invalidate_memtree free-under-reader) and P0-1's
+ *     ENGINE half (in-place upsert) CLOSED at 9.8-BE-prepend (chunk
+ *     9) — the fs.c write-op port onto the `_concurrent` APIs is
+ *     chunk 10; see phase-9.8-design.md §5.1.1. Unreachable at v1.0
  *     Thylacine (serial single-session stratumd); A-5b prerequisite.
  *
  * stm_sync_commit nests stm_alloc_commit under sync->lock. Every reader-

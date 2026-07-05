@@ -129,8 +129,26 @@ typedef struct {
     le64    n_gen;                  /*  32 :  8 — creation gen (MVCC)     */
     le64    n_tree_id;              /*  40 :  8 — future: multi-tree pool */
     uint8_t n_merkle[32];           /*  48 : 32 — Merkle hash (chunk 7)   */
-    uint8_t n_reserved_b[48];       /*  80 : 48 — align to 128            */
+    le64    n_seq_hw;               /*  80 :  8 — message-seq high water
+                                     *            (9.8-BE-prepend; root-
+                                     *            meaningful, see below)   */
+    uint8_t n_reserved_b[40];       /*  88 : 40 — align to 128            */
 } stm_btnode_hdr;
+
+/*
+ * n_seq_hw (9.8-BE-prepend, chunk 9): an upper bound on every message
+ * seq buffered anywhere in the subtree rooted at this node AT THE TIME
+ * THE NODE WAS WRITTEN. Load-bearing only at a tree ROOT: the engine
+ * seeds its per-engine delta-seq counter from the root's value at
+ * open/load, so seqs minted after a restart stay strictly above every
+ * persisted message and per-key newest-wins ordering never inverts
+ * across process lifetimes. Written by the engine commit path (the
+ * root is rewritten by any commit that minted new seqs); zero on leaf
+ * nodes, on pre-9.8 pools, and on internal nodes never carrying
+ * messages — a zero seed is correct for all three. Best-effort
+ * metadata, not a validated invariant: the verify path checks per-node
+ * message ORDER (R172 F2), not seq-vs-hw.
+ */
 
 _Static_assert(sizeof(stm_btnode_hdr) == STM_BTNODE_HDR_SIZE,
                "stm_btnode_hdr must be 128 bytes");
@@ -157,6 +175,7 @@ typedef struct {
     uint32_t         payload_used;
     uint64_t         gen;
     uint64_t         tree_id;
+    uint64_t         seq_hw;       /* n_seq_hw — 0 on pre-9.8 nodes */
 } stm_btnode_info;
 
 /* Validate + decode only the header. Does NOT validate csum — use
@@ -400,6 +419,10 @@ size_t stm_btnode_msgs_encoded_bytes(const stm_btnode_msg *msgs,
  * (which is now a thin wrapper over this). Message order is preserved
  * verbatim — the caller supplies (target_child, seq) order.
  *
+ * `seq_hw` lands in the header's n_seq_hw field (see the header
+ * comment); pass 0 for a node that carries no seq bookkeeping (the
+ * thin wrapper does).
+ *
  * Returns STM_ERANGE if the message region exceeds
  * STM_BTNODE_BUFFER_REGION_MAX(buf_size), if any key exceeds
  * STM_BTNODE_MSG_KEY_MAX, if any seq exceeds STM_BTNODE_MSG_SEQ_MAX,
@@ -412,7 +435,7 @@ stm_status stm_btnode_internal_encode_msgs(
     const stm_btnode_pivot *pivots, uint32_t n_pivots,
     const uint8_t *children, size_t children_len,
     const stm_btnode_msg *msgs, uint32_t n_msgs,
-    uint64_t gen, uint64_t tree_id,
+    uint64_t gen, uint64_t tree_id, uint64_t seq_hw,
     void *buf, size_t buf_size);
 
 /*

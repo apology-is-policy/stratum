@@ -603,8 +603,8 @@ is a **soundness** prerequisite.
 
 | R171 item | The race | Closure | Roadmap |
 |---|---|---|---|
-| P0-1 | a wait-free reader's leaf-value memcpy races the writer's in-place `free(old); val=new` upsert (`node.c eng_leaf_put`) | `9.8-BE-prepend` (chunk 9): writers CAS-prepend a delta message; the old base value is superseded + EBR-retired, never freed under a reader | scheduled, **unbuilt** |
-| P0-4 | `invalidate_memtree` frees the eng_node tree under a pinned reader | EBR-retire the eng_node tree at BE-prepend | folds into chunk 9, **unbuilt** |
+| P0-1 | a wait-free reader's leaf-value memcpy races the writer's in-place `free(old); val=new` upsert (`node.c eng_leaf_put`) | `9.8-BE-prepend` (chunk 9): writers CAS-prepend a delta message; the old base value is superseded + EBR-retired, never freed under a reader | **BUILT (chunk 9)** at the engine layer — `insert/delete_concurrent` + the clone commit (a latched engine never mutates a published node; supersedes retire via EBR). The PRODUCTION closure completes when chunk 10 ports fs.c's write ops onto the `_concurrent` APIs; until then the serial writers keep the R171 P1-1 stopgap envelope. |
+| P0-4 | `invalidate_memtree` frees the eng_node tree under a pinned reader | EBR-retire the eng_node tree at BE-prepend | **BUILT (chunk 9)** — `invalidate_memtree` publishes NULL then `stm_ebr_retire`s the tree (recursive destructor); the clone commit's failure paths additionally never invalidate at all (the published tree is byte-untouched). |
 | P0-2 | the engine struct itself is freed by rollback / `dataset_destroy` while a reader holds the engine pointer | EBR-retire the engine struct in `dataset_engine_close_locked` | **chunk 9b (NEW, this addendum)** -- was a floating forward-note |
 | P0-3 | `stm_fs_unmount` is not excluded by the wait-free wedge gate | "draining" flag + EBR-advance-until-empty (task #1232) | production-mitigated: stratumd drains workers before unmount |
 
@@ -1175,8 +1175,8 @@ ships.
 
 | Spec | New / changed actions | Impl site |
 |---|---|---|
-| `concurrency.tla::WriterPrependDelta` | atomic CAS prepend onto chain head | `eng_chain_prepend` (LF-1) |
-| `concurrency.tla::WriterPublishRoot` | atomic_store on `mvcc_root` + EBR-retire of previous root | `commit_finalize` (LF-2) |
+| `concurrency.tla::WriterPrependDelta` | atomic CAS prepend onto chain head | `chain_prepend` (engine.c, chunk 9 AS-BUILT — the planned `eng_chain_prepend` name) |
+| `concurrency.tla::WriterPublishRoot` | atomic_store on `mvcc_root` + EBR-retire of previous root | `commit_finalize_clone` + `engine_try_mini_consolidate` + `invalidate_memtree` (chunk 9 AS-BUILT: publish-then-retire at all three supersede sites; `concurrency_mvcc.tla::WriterCommit`'s correct branch) |
 | `concurrency.tla::ReaderObservesCoherentTree` (NEW) | reader-vs-commit boundary | `eng_descent_concurrent` + `commit_finalize` (LF-1 + LF-2) |
 | `balanced.tla::InstallSibling+PostFlush+UpdateParent` (EXTENDED to internal splits) | 3-step protocol for buffer-flush-driven internal split | `eng_flush_buffer_split` (BE-flush) |
 | `balanced.tla::FlushPreservesMessages` (NEW) | flush-split preserves message ordering | same |

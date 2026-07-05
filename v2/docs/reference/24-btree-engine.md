@@ -471,6 +471,153 @@ OOM tests above, `engine_serial_write_refuses_buffered_path`,
 `pool_commit_stamps_current_version_on_v32_pool` (the R172 F5 stamp
 leg — the live upgrade boot proved the mount leg).
 
+### The lock-free writer path (9.8-BE-prepend, chunk 9)
+
+Chunk 9 lights up the writer half of the dual-shape design: mutations
+enter as `eng_delta` messages CAS-prepended onto the **published
+root's** chain, and every reader-visible structure becomes immutable
+once published — the R172 F1 doctrine ("reader safety is COW, never
+writer exclusion") turned from an obligation into the architecture.
+This closes R171 **P0-1** (the in-place `free(old); val = new` upsert
+under a wait-free reader — message-regime writers never mutate a
+published node) and **P0-4** (`invalidate_memtree` now EBR-retires the
+tree instead of freeing it under a pinned reader).
+
+**The write path.** `stm_btree_engine_insert_concurrent` /
+`delete_concurrent` (EBR-pinned callers, like the `_concurrent`
+reads): validate bounds, latch the engine's sticky
+`concurrent_regime`, resolve the published root (the slow-warm seeds
+the seq counter — see the high water below), mint a seq
+(`next_delta_seq` fetch-add, 48-bit wire bound), deep-copy the
+mutation into an `eng_delta`, and CAS-prepend
+(`concurrency.tla::WriterPrependDelta`). Reads resolve the chain
+first at every node (newest-wins; chain seqs sit strictly above every
+buffered seq), so a prepend is immediately visible to both read
+paths. The serial write APIs refuse a chained root
+(`STM_ENOTSUPPORTED` — the buffered-node guard's chain twin): one
+engine never mixes write regimes, and a serial root-grow would
+otherwise orphan the chain one level down.
+
+**The seal protocol.** A consolidator supersedes the root by
+publishing a replacement and retiring the husk; the handoff is made
+race-free by two address-compared sentinels. `ENG_CHAIN_SEALED`
+(xchg'd into `chain_head` at detach) tells prepends and chain-reads
+"this node is being replaced right now" — they re-load `mvcc_root`
+and retry (the replacement publishes within a few RAM instructions;
+`ENG_SEAL_RETRY_MAX` is the wedged-process safety valve, surfacing
+`STM_EBUSY`). `ENG_CHILD_TOMBSTONE` (xchg'd into every husk child
+slot post-publish by the mini) closes the late-link leak: a pinned
+cold descent that CAS-links a freshly-loaded child into a husk slot
+either lands before the sweep (the xchg returns it; the clone adopts
+it, or retires it recursively if a reader independently linked the
+clone's slot) or observes the tombstone and restarts. The
+commit-path's deep clone needs no sweep — the whole old tree retires
+with the RECURSIVE destructor, which owns whatever hangs off its
+slots when grace ends.
+
+**The mini-consolidation.** A prepend that leaves the chain at
+`ENG_CONSOLIDATE_THRESHOLD` (8) attempts an inline consolidation
+(trylock `serial_mu` then `commit_mu` — the documented lock order —
+bailing on any contention, a pending window, or a leaf root): build a
+SINGLE-node shallow clone of the root (pivots/buffers deep-copied;
+children array copied with `mem` pointers SHARED), seal-detach the
+chain, fold it into the clone's buffer ascending-seq
+(`chain_fold_into_buffer`), publish, tombstone-sweep the husk slots,
+and EBR-retire the husk (single-node destructor — ownership of the
+shared subtree transferred at publish) plus the detached chain. An
+OOM mid-fold restores the detached chain (no other sealer can exist
+under `commit_mu`) — nothing lost, nothing published. This bounds the
+reader's chain-walk cost between commits at ~threshold, the
+`btree_lf` consolidate analog.
+
+**The clone commit.** A latched engine's `commit_flush` dispatches to
+`commit_flush_clone`: deep-clone the resident tree
+(`eng_node_clone_resident` — every node copied, cold bptrs kept, a
+racing cold-link tolerated by acquire slot reads), consolidate the
+chain snapshot (`consumed_head`) into the shadow root
+(`shadow_consolidate` — internal roots buffer the deltas; a LEAF root
+has them APPLIED ascending, splitting + growing to an internal root
+on overflow with the remainder buffered), then run the UNCHANGED
+chunk-8 flush walk + `commit_node` COW rewrite entirely on the
+private shadow. The chain itself stays in place serving readers for
+the whole flush; deltas prepended during it sit strictly above
+`consumed_head`. `commit_finalize`'s clone arm seals the old root's
+chain, migrates that prefix onto the shadow as fresh copies
+(`migrate_residue` — the originals' `->next` pointers are never
+touched: a pinned reader may be mid-walk; the whole detached chain
+retires as one unit), publishes the durable triple + the shadow
+(`eng->root` + `mvcc_root` — the true pointer swap the LF-2
+forward-note reserved), and EBR-retires the whole superseded tree —
+`concurrency_mvcc.tla::WriterCommit`'s correct branch.
+
+**Failure atomicity, clone arm.** The published tree is BYTE-UNTOUCHED
+on every clone-path failure: a mid-flush OOM / write error frees the
+private shadow and returns (NO `invalidate_memtree` — readers keep a
+coherent tree and the chain keeps its deltas; the next commit
+re-consolidates). `commit_abort`'s clone arm likewise discards only
+the shadow — an aborted clone commit loses nothing in RAM
+(deliberately asymmetric with the legacy arm's revert-everything,
+whose in-place flush has already scrambled the tree by that point).
+Orphaned spill paddrs are COPIED (not drained) into
+`pending.superseded` at flush, and truncated back to
+`pending.orphan_base` on abort/failure — the shadow's message-applies
+pushed entries only the discarded shadow justified, while the
+pre-flush prefix (serial-era deletes still live in the old tree) must
+survive or their chains leak on disk.
+
+**The seq high water (`n_seq_hw`).** Newest-wins is seq-ordered, and
+buffered messages PERSIST — so a restart must not mint seqs below
+them. Eight header bytes carved from `n_reserved_b` (btnode.h) carry
+an upper bound on every message seq in the subtree, stamped on the
+outgoing root by both commit arms (max of the counter, the prior hw,
+and the root buffer's max — the last covers forged test trees);
+`load_root` seeds `next_delta_seq` from it, and the prepend path
+resolves the root BEFORE minting so a lazily-opened engine seeds
+first. Leaf roots persist hw 0 — correct, since applied messages
+leave no seqs on disk. Zero on pre-9.8 pools (a zero seed is right:
+no buffered messages exist). Best-effort metadata, not a validated
+invariant.
+
+**The wait-free cold descent.** `load_child` gained the shared link
+protocol: acquire-load the slot; on NULL, disk-read and
+CAS-link (release); the loser frees its copy and adopts the winner —
+two racing descents converge on one linked child, preserving the
+strict tree. The slot stays a PLAIN pointer (eng_child is memcpy'd
+wholesale by the split partitioners) with the racy accesses confined
+to two `__atomic` helpers (`eng_child_mem_acquire` /
+`eng_child_mem_cas_link` — the one deliberate deviation from the
+stdatomic idiom, documented at the helpers). The wait-free path runs
+UNCACHED (`use_cache = false`): the node cache is a plain hash table
+for caller-serialized contexts only, and the shadow flush must not
+consult it at all (old-tree nodes sit there under the same paddrs
+the shadow re-loads). An uncached descent loses the early DAG gate —
+cycles remain caught by the depth caps, and a double-loaded DAG node
+yields two singly-parented copies (degraded detection, never
+unsafety). A pinned reader racing the paddr's DISK lifecycle
+(superseded, reclaimed, rewritten commits later) surfaces as a
+Merkle-gate `STM_ECORRUPT` — fail-closed; the fs-layer SH-fallback
+retries against the current root.
+
+**Scans + serial reads.** All four scan entries (serial + concurrent,
+full + range) route through `scan_tree`, which snapshots the root
+chain into a key-sorted per-key-newest window of borrowed views
+(`chain_window_build`) and feeds it to the chunk-8 merged
+`scan_subtree` walk — chain deltas overlay buffers overlay the base.
+A seal observed at the window build (before any callback) restarts
+against the fresh root; a tombstone mid-walk surfaces `STM_EBUSY`
+(a silent restart would re-emit callbacks). The serial lookup gained
+the same chain consult (root-only in practice; `STM_EBUSY` on a seal
+— unreachable in legal serial use).
+
+**Locking as-built.** `commit_flush` / `commit_finalize` /
+`commit_abort` now hold `commit_mu` for their whole span (design 3.4
+step 1); the mini holds `serial_mu` OUTER + `commit_mu` INNER (the
+documented order, realised); the slow-warm readers keep `commit_mu`.
+Writers and readers hold NO engine mutex on their fast paths. The
+regime-transition contract: the FIRST `_concurrent` op must not race
+an in-flight legacy commit (caller-sequenced; production: `fs->global`
+EX commits vs SH writers).
+
 ### Node cache
 
 `node_cache.c` — a chained hash table mapping a clean node's paddr to
@@ -999,6 +1146,9 @@ node via `stm_ebr_retire(node, eng_node_free_recursive)`.
 | `btree.tla` | The incremental COW-commit mechanism. `commit_flush` / `commit_finalize` / `commit_abort` realise `WriteNode` / `FinalCommit` / `Crash`; the three invariants map directly — `DurableTreeWellFormed` (finalize publishes a complete flushed tree; a flush failure or abort leaves the prior durable root, never a torn one), `CommittedTreeMerkleConsistent` (`eng_node_write`'s ciphertext-BLAKE3 Merkle link, propagated bottom-up by `commit_node`), `FreedNodesNotReachable` (finalize frees only the superseded set — a clean/shared subtree is never recorded, never freed). TLC-verified green; the three buggy configs (partial-COW, early-publish, over-free) each trip exactly one invariant. 9.6-impl-3 large-value spill needs **no** `btree.tla` extension — a spill block is another COWed paddr written by the existing flush, freed by finalize/abort, and Merkle-linked by its parent; the spec's COW-commit mechanism already covers it (`phase-9.6-impl-3-spill-design.md` §7). 9.6-impl-4a `delete` likewise needs **no** extension — a delete is a leaf-content mutation that COWs the root-to-leaf path exactly as an insert (the `BeginCommit` abstraction), and delete-without-merge changes no *node-set* structure (no node is ever merged or removed), so the COW-commit mechanism is mechanically identical for delete and insert. An empty *non-root* leaf is well-formed in the spec (a `btree.tla` leaf's `content` carries no minimum occupancy). The one shape `btree.tla` does not reach is a height-1 *leaf-root* tree — its `Init` + `DurableTreeWellFormed` model only a depth-2 internal-root tree — so delete-to-empty of a height-1 tree (an empty leaf as the durable root) sits outside the depth-2 frame exactly as arbitrary depth does (`btree.tla` §Abstraction delegates tree *shape* to the design doc); the implementation handles it — `verify` / `open` / descent are root-kind-agnostic — and the tests pin it. `scan_range` is a pure read with no spec implication (`phase-9.6-impl-4-cutover-design.md` §9). |
 | `allocator.tla` / `sync.tla` | `(paddr, gen)` AEAD-nonce uniqueness composes from the allocator (fresh paddrs) and sync (monotone gen); `btree.tla` and the engine model the tree-shape mechanism on that composition. `btree.tla` comment §Composition. |
 
+| `concurrency.tla` | The EBR substrate the chunk-9 retire discipline rests on (register/enter/exit/retire/advance; 4 invariants, TLC-green). `WriterPrependDelta` — the atomic CAS prepend onto a chain head — is realised by `chain_prepend`. |
+| `concurrency_mvcc.tla` | The publish-then-retire protocol. `WriterCommit`'s correct branch = `commit_finalize_clone` (publish the shadow, THEN `stm_ebr_retire` the old tree) and the mini-consolidation (publish the clone, then retire the husk + chain); `invalidate_memtree`'s clear-then-retire realises the same discipline on the failure paths. `BuggyImmediateFree` (retire skipped -> `ReaderObservesCoherentTree` trips) is the executable counterexample of the pre-chunk-9 free-without-retire — the R171 P0-4 shape. `RootAlwaysReachable` pins the single-publish discipline (`no_publish` / `retire_before_publish` buggy cfgs). |
+
 The multi-level B+tree split / descent is a structural-algorithm
 property the design doc covers (`btree.tla` §Abstraction explicitly
 bounds itself to depth 2 and delegates arbitrary depth to design §3.2);
@@ -1006,8 +1156,8 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 57 cases (47 9.6 + 4 9.8-LF-1 +
-6 9.8-LF-2). 56 run against an in-RAM
+`tests/test_btree_engine.c` — 78 cases (47 9.6 + 4 9.8-LF-1 +
+6 9.8-LF-2 + 14 9.8-BE chunks 7-8 + 7 9.8-BE-prepend chunk 9). 56 run against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
 can both assert which paddrs were superseded and still open a prior
@@ -1030,6 +1180,7 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
 | Validation | a value past the inline bound spills (no longer refused); a value over `STM_BTREE_ENGINE_MAX_VALUE_BYTES` and a key too large to fit even a spilled entry → `STM_ERANGE`; NULL-argument matrix |
 | Production vtable (impl-4b-i) | `STM_ENGINE_STORE_VT` over a real `stm_bdev` + `stm_bootstrap`: a 1500-key 2-level tree commits at 16-KiB node granularity, the bitmap is made durable, the bdev + bootstrap close and reopen, the engine reopens at the durable root, verifies, every key looks up, and an incremental commit round-trips |
 | Concurrent reader substrate (9.8-LF-1) | single-level + multilevel concurrent-lookup smoke; NULL-arg matrix + reader-during-flush succeeds (LF-2 contract); 4-thread × 2000-iter pre-warmed multi-reader against a static committed tree exercises the EBR-pinned descent + LIFO chain walk (currently always empty) |
+| Lock-free writers (9.8-BE-prepend, chunk 9) | prepend visibility on BOTH read paths + tombstone-hides-base + serial-API refusal + arg/bound matrix; threshold mini-consolidation (fresh published root, drained chain -> buffer, reads correct across the swap, commit + reopen); clone-commit persistence (overwrites + tombstones durable, shadow adoption = fresh root pointer, merged stats count, reopen + verify); the cross-restart seq high water (fails without the hw seeding: the second-generation delta would consolidate BELOW the persisted seq and buffer_resolve would serve the stale value); clone-arm failure atomicity (flushed-then-aborted keeps every delta readable; a 64-point OOM sweep over the hooked clone/fold/append allocations asserts old-tree-intact + retry-lands-everything); leaf-root consolidation grow (7 x 3-KiB deltas overflow the leaf mid-apply -> split + grow + buffered remainder, reopen + verify); the reader/writer/commit soak — 2 wait-free readers asserting full-value integrity x 2 CAS-prepend writers over 8 hot keys x 40 clone commits through the middle (consolidate + publish + whole-tree retire + residue migration every cycle), then a quiesced final commit + reopen asserting untorn durable values (the R171 P0-1/P0-4 closure witness; ASan-clean) |
 | mvcc_root publish (9.8-LF-2) | `engine_create` publishes empty leaf for immediate concurrent reads; lazy `engine_open` + first `lookup_concurrent` triggers the slow-warm path under `commit_mu`; `commit_finalize`'s republish synchronises post-commit reader acquire-loads with `commit_node`'s in-place mutations; failed-flush-on-never-committed → slow-warm re-creates empty leaf (load_root's `!has_durable_root` branch); failed-flush-AFTER-durable-commit → slow-warm re-reads durable root from disk (load_root's `has_durable_root == true` branch — R170 P2-2 sibling) + the un-flushed insert correctly reverts; 4-thread × 2000-iter readers concurrent with 100-iter writer inserting one fresh key per iteration + commit_flush + commit_finalize on a 300-key pre-warmed tree — readers concurrently descend nodes whose `paddr/gen/csum` the writer is mid-mutating (R170 P2-1 fix: the original test wrote no-op clean commits so commit_node short-circuited; now every iteration walks a dirty leaf + dirty root) — no STM_ECORRUPT, every-lookup-finds-its-key |
 
 ## Status
@@ -1044,6 +1195,17 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
       `commit_flush` / `commit_finalize` / `commit_abort` split with a
       pending-commit `STM_EBUSY` window; crash-revert to the last
       durable root.
+- [x] **The lock-free writer path (9.8-BE-prepend, chunk 9)**:
+      `insert/delete_concurrent` CAS-prepend + the sticky regime
+      latch; the threshold mini-consolidation (seal / publish /
+      tombstone-sweep / single-node retire); the clone commit (deep
+      shadow + consolidate + the chunk-8 flush on the shadow +
+      publish-then-retire at finalize + residue migration); clone-arm
+      failure atomicity (published tree byte-untouched, no
+      invalidate); `n_seq_hw` cross-restart seq seeding; the CAS-link
+      cold descent (uncached, tombstone-aware). Closes R171 P0-1 +
+      P0-4 at the engine layer (the fs.c port is chunk 10; P0-2 is
+      chunk 9b).
 - [x] R150 audit close — 2 P1 (`load_child` DAG double-free +
       child-kind-mismatch UAF) + 3 P2. R151 audit close (impl-2) —
       0 P0 / 0 P1; 1 P2 (the abort-path nonce-safety rationale, doc
@@ -1076,6 +1238,36 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
       See `docs/phase-9.6-impl-4-cutover-design.md`.
 
 ## Known caveats
+
+- **The serial-write chain guard is sequential, not racy-proof
+  (chunk 9).** `insert`/`delete` refuse a root whose chain is
+  non-empty (`STM_ENOTSUPPORTED`), but the check is an acquire load —
+  a `_concurrent` prepend RACING the serial descent can land after
+  it. That interleaving is caller misuse (one engine never mixes
+  write regimes; production sequences the transition via `fs->global`
+  EX vs SH), and the guard exists to catch the sequential form of the
+  mistake loudly, not to arbitrate a race.
+- **Leaf-rooted engines skip the mini-consolidation (chunk 9).** A
+  leaf root has no message buffer to fold into and an apply could
+  force a structural grow (the commit consolidator's job), so its
+  chain grows unbounded between commits — reader cost O(chain). A
+  leaf-rooted tree is a single node (tiny); the first clone commit
+  applies + grows it and minis engage thereafter. Bounded by the
+  caller's commit cadence.
+- **The clone commit copies the whole RESIDENT tree, O(resident) per
+  commit (chunk 9).** Deliberate: full-clone keeps the strict-tree
+  ownership invariant everywhere (recursive retire = the existing
+  destructor; no per-node lifetime accounting). The path-COW-with-
+  shared-clean-subtrees optimisation is a named seam — it requires
+  per-node retire discipline throughout and should be justified by
+  the CF-5 bench, not built speculatively.
+- **macOS sanitizer gap at the chunk-9 close (task #52).** The host's
+  ASan runtime hung pre-main and TSan segfaulted instantly (both
+  proven environmental with hello-world reproducers) on close day;
+  the chunk closed on UBSan (78/78, zero reports) + the native suite
+  x20 + the threaded soak. macOS ASan+TSan re-runs are owed when the
+  host recovers, and the R174 Linux ASan/LeakSan pass covers
+  independently.
 
 - **Serial-path ops self-serialise per engine (P9.5-PARALLEL-3).** The
   six serial-path entry points (`insert` / `delete` / `lookup` / `scan`

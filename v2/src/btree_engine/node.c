@@ -152,6 +152,47 @@ void eng_delta_free(eng_delta *d)
     free(d);
 }
 
+/* The chain SEAL sentinel (9.8-BE-prepend) — compared by address,
+ * never dereferenced or freed. See engine_internal.h. */
+eng_delta eng_chain_sealed_sentinel;
+
+/* The child-slot TOMBSTONE — same discipline. */
+eng_node eng_child_tombstone;
+
+eng_delta *eng_delta_new(eng_delta_op op, uint64_t seq,
+                         const void *key, uint32_t key_len,
+                         const void *value, uint32_t value_len)
+{
+    eng_delta *d = eng_buf_alloc(sizeof *d);
+    if (!d) return NULL;
+    memset(d, 0, sizeof *d);
+    d->op  = op;
+    d->seq = seq;
+    if (key_len) {
+        d->key = eng_buf_alloc(key_len);
+        if (!d->key) { free(d); return NULL; }
+        memcpy(d->key, key, key_len);
+        d->key_len = key_len;
+    }
+    if (value_len) {
+        d->value = eng_buf_alloc(value_len);
+        if (!d->value) { free(d->key); free(d); return NULL; }
+        memcpy(d->value, value, value_len);
+        d->value_len = value_len;
+    }
+    return d;
+}
+
+void eng_delta_chain_free(void *head)
+{
+    eng_delta *d = head;
+    while (d) {
+        eng_delta *next = d->next;
+        eng_delta_free(d);
+        d = next;
+    }
+}
+
 /* Drain any residual delta chain at node-destroy. Safe whether the
  * chain is empty (the LF-1 steady state, every node) or carries
  * mutations a writer prepended after LF-2; either way the deltas die
@@ -164,6 +205,10 @@ static void node_drain_chain(eng_node *n)
 {
     eng_delta *d = atomic_load_explicit(&n->chain_head, memory_order_relaxed);
     atomic_store_explicit(&n->chain_head, NULL, memory_order_relaxed);
+    /* A sealed husk (its chain was detached by a consolidator; the
+     * sentinel marks it) has nothing left to drain — and the sentinel
+     * itself must never be freed. */
+    if (d == ENG_CHAIN_SEALED) return;
     while (d) {
         eng_delta *next = d->next;
         eng_delta_free(d);
@@ -272,6 +317,238 @@ static void node_free_rec(eng_node *n, uint32_t depth)
 void eng_node_free_recursive(eng_node *n)
 {
     node_free_rec(n, 0);
+}
+
+/* ========================================================================= */
+/* Resident-tree clone (9.8-BE-prepend).                                      */
+/* ========================================================================= */
+
+/* Allocate a bare clone-node via the OOM-injectable allocator,
+ * mirroring eng_node_new_*'s init (fresh chain substrate, fresh
+ * flush_mu). Counts start zero and are advanced only past fully-owned
+ * elements, so eng_node_free_recursive is safe on a partial clone at
+ * any bail point. */
+static eng_node *clone_node_bare(const eng_node *src)
+{
+    eng_node *c = eng_buf_alloc(sizeof *c);
+    if (!c) return NULL;
+    memset(c, 0, sizeof *c);
+    c->is_leaf = src->is_leaf;
+    c->dirty   = src->dirty;
+    c->paddr   = src->paddr;
+    c->gen     = src->gen;
+    memcpy(c->csum, src->csum, STM_BTNODE_CSUM_SIZE);
+    c->seq_hw  = src->seq_hw;
+    atomic_init(&c->chain_head, NULL);
+    atomic_init(&c->chain_depth, 0u);
+    if (pthread_mutex_init(&c->flush_mu, NULL) != 0) { free(c); return NULL; }
+    return c;
+}
+
+/* Deep-copy `len` bytes via the OOM-injectable allocator; zero-length
+ * stays NULL (the eng_dup convention). */
+static stm_status clone_dup(const void *src, size_t len, uint8_t **out)
+{
+    if (len == 0) { *out = NULL; return STM_OK; }
+    uint8_t *p = eng_buf_alloc(len);
+    if (!p) return STM_ENOMEM;
+    memcpy(p, src, len);
+    *out = p;
+    return STM_OK;
+}
+
+static eng_node *node_clone_rec(const eng_node *n, uint32_t depth)
+{
+    if (depth > ENG_MAX_DEPTH) return NULL;
+
+    eng_node *c = clone_node_bare(n);
+    if (!c) return NULL;
+
+    if (n->is_leaf) {
+        if (n->n_entries) {
+            c->entries = eng_buf_alloc((size_t)n->n_entries
+                                       * sizeof *c->entries);
+            if (!c->entries) goto fail;
+            memset(c->entries, 0,
+                   (size_t)n->n_entries * sizeof *c->entries);
+            c->entries_cap = n->n_entries;
+            for (uint32_t i = 0; i < n->n_entries; i++) {
+                const eng_entry *e = &n->entries[i];
+                eng_entry ce = { 0 };
+                if (clone_dup(e->key, e->key_len, &ce.key) != STM_OK)
+                    goto fail;
+                ce.key_len = e->key_len;
+                if (clone_dup(e->val, e->val_len, &ce.val) != STM_OK) {
+                    free(ce.key);
+                    goto fail;
+                }
+                ce.val_len = e->val_len;
+                if (e->spill) {
+                    eng_spill *sp = eng_buf_alloc(sizeof *sp);
+                    if (!sp) { free(ce.key); free(ce.val); goto fail; }
+                    *sp = *e->spill;
+                    sp->blocks = NULL;
+                    if (e->spill->n_blocks) {
+                        sp->blocks = eng_buf_alloc(
+                            (size_t)e->spill->n_blocks * sizeof *sp->blocks);
+                        if (!sp->blocks) {
+                            free(sp); free(ce.key); free(ce.val);
+                            goto fail;
+                        }
+                        memcpy(sp->blocks, e->spill->blocks,
+                               (size_t)e->spill->n_blocks
+                               * sizeof *sp->blocks);
+                    }
+                    ce.spill = sp;
+                }
+                c->entries[i] = ce;
+                c->n_entries  = i + 1u;
+            }
+        }
+        return c;
+    }
+
+    /* Internal: pivots, then children structs (mem NULLed), then the
+     * recursive child clones, then the message buffer. */
+    uint32_t nc = n->n_pivots + 1u;
+    if (n->n_pivots) {
+        c->pivots = eng_buf_alloc((size_t)n->n_pivots * sizeof *c->pivots);
+        if (!c->pivots) goto fail;
+        memset(c->pivots, 0, (size_t)n->n_pivots * sizeof *c->pivots);
+        c->pivots_cap = n->n_pivots;
+        for (uint32_t i = 0; i < n->n_pivots; i++) {
+            uint8_t *k = NULL;
+            if (clone_dup(n->pivots[i].key, n->pivots[i].key_len, &k)
+                != STM_OK)
+                goto fail;
+            c->pivots[i].key     = k;
+            c->pivots[i].key_len = n->pivots[i].key_len;
+            c->n_pivots          = i + 1u;
+        }
+    }
+    /* All pivots owned; pin the count for the child loop + free paths. */
+    c->n_pivots = n->n_pivots;
+
+    c->children = eng_buf_alloc((size_t)nc * sizeof *c->children);
+    if (!c->children) goto fail;
+    c->children_cap = nc;
+    for (uint32_t i = 0; i < nc; i++) {
+        c->children[i]     = n->children[i];
+        c->children[i].mem = NULL;
+    }
+    for (uint32_t i = 0; i < nc; i++) {
+        /* Acquire: a racing wait-free cold descent may CAS-link this
+         * slot mid-clone. NULL keeps the cold bptr (the shadow loads
+         * from disk on demand); non-NULL is a fully-built child. */
+        eng_node *src_child = eng_child_mem_acquire(&n->children[i]);
+        if (!src_child) continue;
+        eng_node *cc = node_clone_rec(src_child, depth + 1u);
+        if (!cc) goto fail;
+        c->children[i].mem = cc;
+    }
+
+    if (n->buf_count) {
+        c->buf_msgs = eng_buf_alloc((size_t)n->buf_count
+                                    * sizeof *c->buf_msgs);
+        if (!c->buf_msgs) goto fail;
+        memset(c->buf_msgs, 0, (size_t)n->buf_count * sizeof *c->buf_msgs);
+        for (uint32_t i = 0; i < n->buf_count; i++) {
+            const eng_msg *m = &n->buf_msgs[i];
+            eng_msg cm = { 0 };
+            cm.op  = m->op;
+            cm.seq = m->seq;
+            if (clone_dup(m->key, m->key_len, &cm.key) != STM_OK)
+                goto fail;
+            cm.key_len = m->key_len;
+            if (clone_dup(m->value, m->value_len, &cm.value) != STM_OK) {
+                free(cm.key);
+                goto fail;
+            }
+            cm.value_len   = m->value_len;
+            c->buf_msgs[i] = cm;
+            c->buf_count   = i + 1u;
+        }
+    }
+    return c;
+
+fail:
+    eng_node_free_recursive(c);
+    return NULL;
+}
+
+eng_node *eng_node_clone_resident(const eng_node *n)
+{
+    if (!n) return NULL;
+    return node_clone_rec(n, 0);
+}
+
+eng_node *eng_node_clone_shallow(const eng_node *n)
+{
+    eng_node *c = clone_node_bare(n);
+    if (!c) return NULL;
+
+    if (n->n_pivots) {
+        c->pivots = eng_buf_alloc((size_t)n->n_pivots * sizeof *c->pivots);
+        if (!c->pivots) goto fail;
+        memset(c->pivots, 0, (size_t)n->n_pivots * sizeof *c->pivots);
+        c->pivots_cap = n->n_pivots;
+        for (uint32_t i = 0; i < n->n_pivots; i++) {
+            uint8_t *k = NULL;
+            if (clone_dup(n->pivots[i].key, n->pivots[i].key_len, &k)
+                != STM_OK)
+                goto fail;
+            c->pivots[i].key     = k;
+            c->pivots[i].key_len = n->pivots[i].key_len;
+            c->n_pivots          = i + 1u;
+        }
+    }
+    c->n_pivots = n->n_pivots;
+
+    if (!n->is_leaf) {
+        uint32_t nc = n->n_pivots + 1u;
+        c->children = eng_buf_alloc((size_t)nc * sizeof *c->children);
+        if (!c->children) goto fail;
+        c->children_cap = nc;
+        for (uint32_t i = 0; i < nc; i++) {
+            c->children[i]     = n->children[i];
+            /* Shared inheritance — acquire per slot (a wait-free cold
+             * descent may be CAS-linking it right now). */
+            c->children[i].mem = eng_child_mem_acquire(&n->children[i]);
+        }
+    }
+
+    if (n->buf_count) {
+        c->buf_msgs = eng_buf_alloc((size_t)n->buf_count
+                                    * sizeof *c->buf_msgs);
+        if (!c->buf_msgs) goto fail;
+        memset(c->buf_msgs, 0, (size_t)n->buf_count * sizeof *c->buf_msgs);
+        for (uint32_t i = 0; i < n->buf_count; i++) {
+            const eng_msg *m = &n->buf_msgs[i];
+            eng_msg cm = { 0 };
+            cm.op  = m->op;
+            cm.seq = m->seq;
+            if (clone_dup(m->key, m->key_len, &cm.key) != STM_OK)
+                goto fail;
+            cm.key_len = m->key_len;
+            if (clone_dup(m->value, m->value_len, &cm.value) != STM_OK) {
+                free(cm.key);
+                goto fail;
+            }
+            cm.value_len   = m->value_len;
+            c->buf_msgs[i] = cm;
+            c->buf_count   = i + 1u;
+        }
+    }
+
+    /* The mini's clone source is always an internal root (no entries);
+     * entries handling deliberately absent — assert-by-construction. */
+    return c;
+
+fail:
+    /* SINGLE-node free: the shared children[].mem still belong to the
+     * live tree. */
+    eng_node_free(c);
+    return NULL;
 }
 
 /* ========================================================================= */

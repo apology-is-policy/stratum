@@ -240,36 +240,31 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
  *     under commit_mu (double-checked locking). Subsequent calls take
  *     the atomic-load fast path.
  *
- * Preconditions still in force at LF-2 (lifted at LF-BE-prepend):
- *   - No concurrent writer (insert / delete). The base nodes are
- *     mutated in place by inserts; concurrent reads against active
- *     mutation see torn state. The LF-2 production gate is fs->global
- *     EX for writers, SH for readers; the writer-side chain prepend
- *     at LF-BE-prepend replaces this with CAS prepends + delta walks.
- *   - No concurrent commit_abort. invalidate_memtree frees the
- *     in-memory tree without first EBR-retiring it; a reader pinned
- *     during the abort would UAF. Closes at LF-BE-prepend's full
- *     EBR-retire wiring of the in-memory tree.
- *   - Cache-warmed working set. load_child lazy-load is not yet
- *     thread-safe; concurrent descents MUST hit cached child.mem
- *     pointers. Lifted as the node cache becomes EBR-managed at
- *     LF-ARC.
+ * The LF-2 preconditions, revised at 9.8-BE-prepend (chunk 9):
+ *   - Concurrent MESSAGE-REGIME writers (insert/delete_concurrent)
+ *     are fully supported: they CAS-prepend deltas the descent
+ *     resolves newest-first, and commits on a latched engine mutate
+ *     only a private shadow (published tree immutable; supersedes
+ *     retire via EBR). Concurrent SERIAL writers remain excluded by
+ *     the caller (fs->global EX/SH + idx pins — the R171 stopgap
+ *     envelope, unchanged for unported ops).
+ *   - commit_abort / failed flushes now EBR-retire the in-memory
+ *     tree (never free it under a pinned reader) — the LF-2
+ *     invalidate UAF window is closed (R171 P0-4).
+ *   - Cold descents lazily link children via a CAS protocol (two
+ *     racing descents converge on one linked child; the loser frees
+ *     its copy) — the cache-warmed-working-set precondition is
+ *     lifted.
  *
  * Walks the in-memory Bε delta chain at every node visited during
- * descent, newest-first, BEFORE the base-node lookup. At LF-1 / LF-2
- * the chain is always empty (no writer prepends yet); the walk is
- * O(1) and the impl falls through to the existing single-threaded
- * descent. The chain-aware shape becomes load-bearing at 9.8-BE-prepend.
+ * descent, newest-first, BEFORE the buffered messages and the base
+ * lookup (chain seqs sit strictly above every buffered seq).
  *
  * Returns STM_EINVAL on NULL `eng` / `ebr` / out params or a NULL
  * `key` with nonzero key_len, STM_ENOMEM / STM_ECORRUPT / device
- * errors otherwise. STM_EBUSY is not reachable at LF-2 — an
- * invalidated engine (failed flush / commit_abort) is auto-rewarmed
- * by the slow-warm path's load_root call inside lookup_concurrent;
- * a failure of THAT load_root surfaces as STM_ENOMEM (for the
- * never-committed empty-leaf re-creation branch) OR STM_ECORRUPT /
- * STM_EBADTAG / device errors (for the disk-read branch when a
- * durable root exists). (R170 P3-4 carry.)
+ * errors otherwise. STM_EBUSY surfaces only as a safety valve when a
+ * consolidation seal never resolves (a wedged process) — transient
+ * seal windows are retried internally and invisibly.
  *
  * Spec composition:
  *   bepsilon.tla::PerKeyNewestWins — chain walk is LIFO; first
@@ -287,6 +282,60 @@ stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
                                                bool *out_found,
                                                void **out_value,
                                                size_t *out_value_len);
+
+/*
+ * Lock-free upsert from a thread that pre-entered the EBR epoch
+ * (9.8-BE-prepend, chunk 9). Deep-copies (key, value) into a Bε delta
+ * message and CAS-prepends it onto the published root's chain — no
+ * engine mutex on the fast path; two writers contend only on the one
+ * CAS. The mutation is immediately visible to every subsequent read
+ * (chain-resolved, newest-wins) and becomes durable at the next
+ * commit, exactly like a serial insert's in-memory mutation.
+ *
+ * Calling this LATCHES the engine into the concurrent regime
+ * permanently: all later commits run the COW clone arm (private
+ * shadow + publish + EBR retire), and the SERIAL write APIs refuse
+ * (STM_ENOTSUPPORTED) whenever pending deltas exist — one engine
+ * never mixes write regimes. The first _concurrent call must not race
+ * an in-flight commit (caller-sequenced; production: fs->global EX
+ * commits vs SH writers).
+ *
+ * Contract mirrors lookup_concurrent: the caller MUST hold an entered
+ * EBR epoch across the call (the prepend touches the published root,
+ * which a racing consolidation may retire). Writers may run
+ * concurrently with readers, other _concurrent writers, and commits.
+ *
+ * At ENG_CONSOLIDATE_THRESHOLD chain depth the calling thread
+ * opportunistically consolidates the chain into the root's message
+ * buffer (trylock; bails on any contention — bounded read cost, never
+ * a blocked writer).
+ *
+ * Returns STM_EINVAL on NULL args; STM_ERANGE on value/key bounds
+ * (the serial insert's bounds plus key_len <= STM_BTNODE_MSG_KEY_MAX)
+ * or delta-seq exhaustion (2^48 mutations); STM_ENOMEM; STM_EBUSY
+ * only as the wedged-sealer safety valve.
+ */
+STM_MUST_USE
+stm_status stm_btree_engine_insert_concurrent(stm_btree_engine *eng,
+                                              stm_ebr_thread *ebr,
+                                              const void *key, size_t key_len,
+                                              const void *value,
+                                              size_t value_len);
+
+/*
+ * Lock-free delete tombstone (9.8-BE-prepend) — the _concurrent
+ * sibling of stm_btree_engine_delete, same contract as
+ * insert_concurrent. Unconditional: a tombstone for an absent key is
+ * a benign no-op applied at flush time, and no out_found is possible
+ * without a read (callers needing the signal do a lookup_concurrent
+ * first, accepting its raciness, or use the serial path under the
+ * serial regime).
+ */
+STM_MUST_USE
+stm_status stm_btree_engine_delete_concurrent(stm_btree_engine *eng,
+                                              stm_ebr_thread *ebr,
+                                              const void *key,
+                                              size_t key_len);
 
 /*
  * Delete `key`. On a hit the entry is removed and — if `out_found` is
