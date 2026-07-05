@@ -314,6 +314,131 @@ stm_status stm_btnode_internal_decode(
 size_t stm_btnode_internal_encoded_bytes(
     const stm_btnode_pivot *pivots, uint32_t n_pivots);
 
+/* ========================================================================= */
+/* Internal-node message buffer (9.8-BE-format).                              */
+/* ========================================================================= */
+
+/*
+ * Phase 9.8-BE: an internal node may carry a region of buffered Bε
+ * messages after the children table:
+ *
+ *   payload = [pivots ‖ children ‖ messages]
+ *
+ * `n_payload_used` counts the WHOLE payload (pivots + children +
+ * messages); `n_buffer_used` counts the trailing message region only,
+ * so the pivot/child prefix is (payload_used − buffer_used) bytes.
+ * A node with `n_buffer_used == 0` is byte-identical to the pre-9.8
+ * encoding — the extension is strictly additive (phase-9.8-design.md
+ * §3.1).
+ *
+ * Each message on the wire:
+ *
+ *   [op:1][reserved:1][seq:6 LE][key_len:2 LE][value_len:4 LE][key][value]
+ *
+ * The region holds whole messages only (a partial trailing message is
+ * corruption). Messages are ordered (target_child, seq) by the WRITER
+ * (the flush's per-child linear-sweep precondition); target_child is
+ * not stored — it derives from routing the key through the pivots, so
+ * ORDER validation is the tree layer's job (it owns routing), while
+ * this codec validates structure: op range, tombstone-has-no-value,
+ * key bound, exact region consumption, region caps.
+ *
+ * The engine additionally bounds a buffered value to its inline cap
+ * (larger values bypass the buffer and go direct-to-leaf); that bound
+ * is the tree layer's, not this codec's — the codec's structural bound
+ * is the region itself.
+ */
+
+/* Message ops. Foreign values on disk are corruption (R71 P1-1
+ * doctrine). 0x03 RANGE_DELETE is reserved for a future phase. */
+#define STM_BTNODE_MSG_INSERT      0x01u
+#define STM_BTNODE_MSG_DELETE      0x02u
+
+/* Fixed per-message wire header:
+ * op(1) + reserved(1) + seq(6) + key_len(2) + value_len(4). */
+#define STM_BTNODE_MSG_HDR_SIZE    14u
+
+/* seq is 48-bit on the wire. Encode rejects larger with STM_ERANGE. */
+#define STM_BTNODE_MSG_SEQ_MAX     ((UINT64_C(1) << 48) - 1u)
+
+/* Buffered-message key bound. Mirrors the metakey bound (design §3.1:
+ * key_len <= STM_METAKEY_MAX == 256); kept as a local constant so the
+ * codec stays self-contained. */
+#define STM_BTNODE_MSG_KEY_MAX     256u
+
+/* The Bε buffer region cap: ε = 1/4 of the payload budget
+ * (phase-9.8-design.md §5.3). The pivot/child budget is the remaining
+ * 3/4 — enforced by the TREE layer's capacity checks, not here: the
+ * codec accepts any [pivots ‖ children ‖ messages] mix that fits the
+ * payload cap, because pre-9.8 pools may legitimately carry internal
+ * nodes whose pivot/child bytes exceed the 3/4 carve (they split on
+ * their next mutation). */
+#define STM_BTNODE_BUFFER_REGION_MAX(node_size) \
+    (STM_BTNODE_PAYLOAD_CAP(node_size) / 4u)
+
+typedef struct {
+    uint8_t     op;          /* STM_BTNODE_MSG_INSERT / _DELETE */
+    uint64_t    seq;         /* <= STM_BTNODE_MSG_SEQ_MAX */
+    const void *key;
+    size_t      key_len;     /* <= STM_BTNODE_MSG_KEY_MAX */
+    const void *value;       /* INSERT only; DELETE carries none */
+    size_t      value_len;
+} stm_btnode_msg;
+
+typedef int (*stm_btnode_msg_cb)(uint8_t op, uint64_t seq,
+                                   const void *key, size_t key_len,
+                                   const void *value, size_t value_len,
+                                   uint32_t msg_index, void *ctx);
+
+/* Predict the encoded byte size of a message array. */
+size_t stm_btnode_msgs_encoded_bytes(const stm_btnode_msg *msgs,
+                                       uint32_t n_msgs);
+
+/*
+ * Encode an internal node WITH a message buffer. `msgs == NULL` /
+ * `n_msgs == 0` produces bytes identical to stm_btnode_internal_encode
+ * (which is now a thin wrapper over this). Message order is preserved
+ * verbatim — the caller supplies (target_child, seq) order.
+ *
+ * Returns STM_ERANGE if the message region exceeds
+ * STM_BTNODE_BUFFER_REGION_MAX(buf_size), if any key exceeds
+ * STM_BTNODE_MSG_KEY_MAX, if any seq exceeds STM_BTNODE_MSG_SEQ_MAX,
+ * or if the total payload exceeds the payload cap. STM_EINVAL on a
+ * foreign op, a DELETE carrying a value, or NULL key/value pointers
+ * with nonzero lengths.
+ */
+STM_MUST_USE
+stm_status stm_btnode_internal_encode_msgs(
+    const stm_btnode_pivot *pivots, uint32_t n_pivots,
+    const uint8_t *children, size_t children_len,
+    const stm_btnode_msg *msgs, uint32_t n_msgs,
+    uint64_t gen, uint64_t tree_id,
+    void *buf, size_t buf_size);
+
+/*
+ * Decode an internal node, message-buffer-aware. Enumerates pivots,
+ * then children, then messages (msg_cb may be NULL to skip
+ * enumeration — the message region is STILL fully validated). The
+ * legacy stm_btnode_internal_decode instead REJECTS a nonzero
+ * n_buffer_used with STM_ECORRUPT (fail-closed: trees that never
+ * write buffers — btree_store's flush-before-serialize contract —
+ * must treat a buffered node as corruption).
+ *
+ * Structural validation of the message region (all STM_ECORRUPT):
+ * buffer_used <= payload_used, buffer_used <=
+ * STM_BTNODE_BUFFER_REGION_MAX(buf_size), whole messages only with
+ * exact region consumption, op in {INSERT, DELETE}, DELETE with
+ * value_len != 0 rejected, key_len <= STM_BTNODE_MSG_KEY_MAX.
+ */
+STM_MUST_USE
+stm_status stm_btnode_internal_decode_msgs(
+    const void *buf, size_t buf_size,
+    stm_btnode_info *out_info,
+    stm_btnode_pivot_cb pivot_cb,
+    stm_btnode_child_cb child_cb,
+    stm_btnode_msg_cb msg_cb,
+    void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

@@ -205,6 +205,44 @@ in `bp_reserved2[0..8)` (`btnode_io.c::encode_child_bptr`). Legacy
 `btree_store` threads a single gen for a whole rebuilt tree and leaves
 `bp_reserved2` zero; the per-node gen is an engine-only field.
 
+### Internal-node message buffer — the on-disk region (9.8-BE-format, chunk 7a)
+
+The codec half of the Bε write path (`phase-9.8-design.md` §3.1/§5):
+an internal node's payload may now carry a trailing region of buffered
+messages —
+
+```
+payload = [pivots ‖ children ‖ messages]
+message = [op:1][reserved:1][seq:6 LE][key_len:2 LE][value_len:4 LE][key][value]
+```
+
+`n_payload_used` counts the whole payload; `n_buffer_used` the message
+suffix only (so the pivot/child prefix is `payload_used − buffer_used`
+bytes). A zero-message node encodes **byte-identical** to the pre-9.8
+format (memcmp-pinned by `btnode_msgs_empty_byte_compat`) — the
+extension is strictly additive. Ops: `0x01` INSERT / `0x02` DELETE
+(tombstone, MUST carry no value); anything else on disk is
+`STM_ECORRUPT` (R71 doctrine). `seq` is 48-bit; keys are bounded by
+`STM_BTNODE_MSG_KEY_MAX` (256, the metakey mirror); the whole region by
+`STM_BTNODE_BUFFER_REGION_MAX(node_size)` = payload/4 (ε = 1/4, design
+§5.3). Message ORDER — `(target_child, seq)` — is the writer's
+contract; the codec cannot validate it (routing needs pivot-compare
+semantics it does not own), so order validation is the engine's job at
+decode (chunk 7b).
+
+Two decode surfaces (`include/stratum/btnode.h`):
+`stm_btnode_internal_decode_msgs` (buffer-aware; the message region is
+fully validated even with a NULL `msg_cb`) and the legacy
+`stm_btnode_internal_decode`, which now **fail-closes** on a nonzero
+`n_buffer_used` — a buffer-unaware tree (`btree_store`'s
+flush-before-serialize contract) silently ignoring persisted messages
+would serve stale reads, so a buffered node there is corruption by
+definition. Leaves reject nonzero `n_buffer_used` outright
+(`leaf.c`). Nothing in the ENGINE writes a nonzero buffer yet — the
+eng_node adoption + capacity carve + read consult + the
+`STM_UB_VERSION 32 → 33` bump land as chunk 7b; the version bump is
+arc-approved (Thylacine `docs/CONCURRENT-FS.md` §5).
+
 ### Node cache
 
 `node_cache.c` — a chained hash table mapping a clean node's paddr to

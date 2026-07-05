@@ -139,6 +139,10 @@ stm_status stm_btnode_leaf_decode(const void *buf, size_t buf_size,
      * caller-bad-arg. Surface as STM_ECORRUPT. */
     if (info.kind != STM_BTNODE_KIND_LEAF) return STM_ECORRUPT;
 
+    /* 9.8-BE-format: only internal nodes carry a message buffer. A
+     * leaf with nonzero n_buffer_used is corruption. */
+    if (info.buffer_used != 0) return STM_ECORRUPT;
+
     /* Verify csum before trusting any payload bytes. */
     s = btnode_verify_csum(in, buf_size);
     if (s != STM_OK) return s;

@@ -643,4 +643,353 @@ STM_TEST(btnode_internal_encoded_bytes_helper) {
     STM_ASSERT_EQ(stm_btnode_internal_encoded_bytes(NULL, 0), (size_t)64);
 }
 
+
+/* ========================================================================= */
+/* 9.8-BE-format: internal-node message buffer (chunk 7a).                    */
+/* ========================================================================= */
+
+/* Private csum helper (non-static across the codec's TUs); declared
+ * here so hostile-structure tests can tamper bytes and re-checksum —
+ * a valid-csum-but-bad-structure node is what the decode gates must
+ * catch (a broken csum would mask the structural gate under test). */
+void btnode_compute_csum(const uint8_t *buf, size_t node_size,
+                          uint8_t out[STM_BTNODE_CSUM_SIZE]);
+
+#define MSG_NODE_SIZE 16384u   /* the engine node size; REGION_MAX = 4056 */
+
+static void msg_recsum(uint8_t *buf, size_t node_size)
+{
+    btnode_compute_csum(buf, node_size,
+                        buf + node_size - STM_BTNODE_CSUM_SIZE);
+}
+
+static void msg_put_le32(uint8_t *at, uint32_t v)
+{
+    at[0] = (uint8_t)(v & 0xffu);
+    at[1] = (uint8_t)((v >> 8) & 0xffu);
+    at[2] = (uint8_t)((v >> 16) & 0xffu);
+    at[3] = (uint8_t)((v >> 24) & 0xffu);
+}
+
+static uint32_t msg_get_le32(const uint8_t *at)
+{
+    return (uint32_t)at[0] | ((uint32_t)at[1] << 8) |
+           ((uint32_t)at[2] << 16) | ((uint32_t)at[3] << 24);
+}
+
+/* Header field offsets (see stm_btnode_hdr). */
+#define MSG_HDR_OFF_BUFFER_USED   24u
+#define MSG_HDR_OFF_PAYLOAD_USED  28u
+
+typedef struct {
+    uint8_t  op[8];
+    uint64_t seq[8];
+    uint8_t  key[8][300];
+    size_t   key_len[8];
+    uint8_t  val[8][512];
+    size_t   val_len[8];
+    uint32_t n_seen;
+    int      stop_at;      /* return 1 at this index; -1 = never */
+} msg_collect_ctx;
+
+static int msg_collect_cb(uint8_t op, uint64_t seq,
+                           const void *key, size_t key_len,
+                           const void *value, size_t value_len,
+                           uint32_t idx, void *ctx_)
+{
+    msg_collect_ctx *c = ctx_;
+    if (idx < 8) {
+        c->op[idx]      = op;
+        c->seq[idx]     = seq;
+        c->key_len[idx] = key_len;
+        if (key_len && key_len <= sizeof c->key[0])
+            memcpy(c->key[idx], key, key_len);
+        c->val_len[idx] = value_len;
+        if (value_len && value_len <= sizeof c->val[0])
+            memcpy(c->val[idx], value, value_len);
+    }
+    c->n_seen++;
+    if (c->stop_at >= 0 && idx == (uint32_t)c->stop_at) return 1;
+    return 0;
+}
+
+/* Encode a 1-pivot 2-child internal node with the given messages. */
+static void msg_encode_node(uint8_t *buf, size_t node_size,
+                             const stm_btnode_msg *msgs, uint32_t n_msgs)
+{
+    stm_btnode_pivot pv = { "m", 1 };
+    uint8_t children[2u * STM_BTNODE_CHILD_BPTR_SIZE];
+    for (size_t i = 0; i < sizeof children; i++)
+        children[i] = (uint8_t)(i & 0xffu);
+    STM_ASSERT_OK(stm_btnode_internal_encode_msgs(&pv, 1,
+                                                    children,
+                                                    sizeof children,
+                                                    msgs, n_msgs,
+                                                    7, 42,
+                                                    buf, node_size));
+}
+
+STM_TEST(btnode_msgs_round_trip) {
+    uint8_t *buf = malloc(MSG_NODE_SIZE);
+    STM_ASSERT(buf != NULL);
+
+    uint8_t bigval[300];
+    for (size_t i = 0; i < sizeof bigval; i++) bigval[i] = (uint8_t)(i * 7u);
+
+    stm_btnode_msg msgs[4] = {
+        { STM_BTNODE_MSG_INSERT, 1,                       "alpha", 5, "v1", 2 },
+        { STM_BTNODE_MSG_INSERT, 2,                       "beta",  4, bigval, sizeof bigval },
+        { STM_BTNODE_MSG_DELETE, 3,                       "alpha", 5, NULL, 0 },
+        { STM_BTNODE_MSG_INSERT, STM_BTNODE_MSG_SEQ_MAX,  "z",     1, NULL, 0 },
+    };
+    msg_encode_node(buf, MSG_NODE_SIZE, msgs, 4);
+
+    stm_btnode_info info;
+    msg_collect_ctx c;
+    memset(&c, 0, sizeof c);
+    c.stop_at = -1;
+    STM_ASSERT_OK(stm_btnode_internal_decode_msgs(buf, MSG_NODE_SIZE, &info,
+                                                    NULL, NULL,
+                                                    msg_collect_cb, &c));
+    STM_ASSERT_EQ(c.n_seen, (uint32_t)4);
+    STM_ASSERT_EQ(info.n_entries, (uint32_t)1);
+    STM_ASSERT_EQ((size_t)info.buffer_used,
+                  stm_btnode_msgs_encoded_bytes(msgs, 4));
+    for (uint32_t i = 0; i < 4; i++) {
+        STM_ASSERT_EQ(c.op[i],  msgs[i].op);
+        STM_ASSERT_EQ(c.seq[i], msgs[i].seq);
+        STM_ASSERT_EQ(c.key_len[i], msgs[i].key_len);
+        if (msgs[i].key_len)
+            STM_ASSERT_EQ(memcmp(c.key[i], msgs[i].key, msgs[i].key_len), 0);
+        STM_ASSERT_EQ(c.val_len[i], msgs[i].value_len);
+        if (msgs[i].value_len)
+            STM_ASSERT_EQ(memcmp(c.val[i], msgs[i].value, msgs[i].value_len), 0);
+    }
+    free(buf);
+}
+
+STM_TEST(btnode_msgs_empty_byte_compat) {
+    /* n_msgs == 0 must be byte-identical to the legacy encoder — the
+     * strictly-additive-format claim (phase-9.8-design.md section 3.1),
+     * pinned by memcmp. */
+    uint8_t *a = malloc(MSG_NODE_SIZE);
+    uint8_t *b = malloc(MSG_NODE_SIZE);
+    STM_ASSERT(a != NULL && b != NULL);
+
+    stm_btnode_pivot pv = { "m", 1 };
+    uint8_t children[2u * STM_BTNODE_CHILD_BPTR_SIZE] = { 0 };
+    STM_ASSERT_OK(stm_btnode_internal_encode(&pv, 1, children,
+                                               sizeof children,
+                                               7, 42, a, MSG_NODE_SIZE));
+    STM_ASSERT_OK(stm_btnode_internal_encode_msgs(&pv, 1, children,
+                                                    sizeof children,
+                                                    NULL, 0,
+                                                    7, 42, b, MSG_NODE_SIZE));
+    STM_ASSERT_EQ(memcmp(a, b, MSG_NODE_SIZE), 0);
+    STM_ASSERT_EQ(msg_get_le32(a + MSG_HDR_OFF_BUFFER_USED), 0u);
+
+    /* Both decoders accept it; the msgs decoder reports zero messages. */
+    msg_collect_ctx c;
+    memset(&c, 0, sizeof c);
+    c.stop_at = -1;
+    STM_ASSERT_OK(stm_btnode_internal_decode_msgs(a, MSG_NODE_SIZE, NULL,
+                                                    NULL, NULL,
+                                                    msg_collect_cb, &c));
+    STM_ASSERT_EQ(c.n_seen, (uint32_t)0);
+    STM_ASSERT_OK(stm_btnode_internal_decode(a, MSG_NODE_SIZE, NULL,
+                                               NULL, NULL, NULL));
+    free(a);
+    free(b);
+}
+
+STM_TEST(btnode_msgs_encode_rejects) {
+    uint8_t *buf = malloc(MSG_NODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    stm_btnode_pivot pv = { "m", 1 };
+    uint8_t children[2u * STM_BTNODE_CHILD_BPTR_SIZE] = { 0 };
+
+    /* Foreign op. */
+    stm_btnode_msg m = { 0x07, 1, "k", 1, NULL, 0 };
+    STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
+                                                     sizeof children, &m, 1,
+                                                     0, 0, buf, MSG_NODE_SIZE),
+                   STM_EINVAL);
+
+    /* Valued tombstone. */
+    m = (stm_btnode_msg){ STM_BTNODE_MSG_DELETE, 1, "k", 1, "v", 1 };
+    STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
+                                                     sizeof children, &m, 1,
+                                                     0, 0, buf, MSG_NODE_SIZE),
+                   STM_EINVAL);
+
+    /* seq past 48 bits. */
+    m = (stm_btnode_msg){ STM_BTNODE_MSG_INSERT,
+                          STM_BTNODE_MSG_SEQ_MAX + 1u, "k", 1, NULL, 0 };
+    STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
+                                                     sizeof children, &m, 1,
+                                                     0, 0, buf, MSG_NODE_SIZE),
+                   STM_ERANGE);
+
+    /* Key over the metakey-mirror bound. */
+    static uint8_t longkey[STM_BTNODE_MSG_KEY_MAX + 1u];
+    m = (stm_btnode_msg){ STM_BTNODE_MSG_INSERT, 1,
+                          longkey, sizeof longkey, NULL, 0 };
+    STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
+                                                     sizeof children, &m, 1,
+                                                     0, 0, buf, MSG_NODE_SIZE),
+                   STM_ERANGE);
+
+    /* NULL msgs with nonzero count. */
+    STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
+                                                     sizeof children, NULL, 1,
+                                                     0, 0, buf, MSG_NODE_SIZE),
+                   STM_EINVAL);
+    free(buf);
+}
+
+STM_TEST(btnode_msgs_region_cap) {
+    uint8_t *buf = malloc(MSG_NODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    stm_btnode_pivot pv = { "m", 1 };
+    uint8_t children[2u * STM_BTNODE_CHILD_BPTR_SIZE] = { 0 };
+
+    size_t region_max = STM_BTNODE_BUFFER_REGION_MAX(MSG_NODE_SIZE);
+    STM_ASSERT_EQ(region_max, STM_BTNODE_PAYLOAD_CAP(MSG_NODE_SIZE) / 4u);
+
+    /* One message filling the region EXACTLY encodes... */
+    size_t vfit = region_max - STM_BTNODE_MSG_HDR_SIZE - 1u;   /* key "k" */
+    uint8_t *big = calloc(1, vfit + 1u);
+    STM_ASSERT(big != NULL);
+    stm_btnode_msg m = { STM_BTNODE_MSG_INSERT, 1, "k", 1, big, vfit };
+    STM_ASSERT_EQ(stm_btnode_msgs_encoded_bytes(&m, 1), region_max);
+    STM_ASSERT_OK(stm_btnode_internal_encode_msgs(&pv, 1, children,
+                                                    sizeof children, &m, 1,
+                                                    0, 0, buf, MSG_NODE_SIZE));
+    /* ...and one byte more rejects. */
+    m.value_len = vfit + 1u;
+    STM_ASSERT_ERR(stm_btnode_internal_encode_msgs(&pv, 1, children,
+                                                     sizeof children, &m, 1,
+                                                     0, 0, buf, MSG_NODE_SIZE),
+                   STM_ERANGE);
+    free(big);
+    free(buf);
+}
+
+STM_TEST(btnode_msgs_legacy_decode_rejects_buffered) {
+    uint8_t *buf = malloc(MSG_NODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    stm_btnode_msg m = { STM_BTNODE_MSG_INSERT, 9, "key", 3, "val", 3 };
+    msg_encode_node(buf, MSG_NODE_SIZE, &m, 1);
+
+    /* The buffer-aware decoder accepts it... */
+    msg_collect_ctx c;
+    memset(&c, 0, sizeof c);
+    c.stop_at = -1;
+    STM_ASSERT_OK(stm_btnode_internal_decode_msgs(buf, MSG_NODE_SIZE, NULL,
+                                                    NULL, NULL,
+                                                    msg_collect_cb, &c));
+    STM_ASSERT_EQ(c.n_seen, (uint32_t)1);
+
+    /* ...the legacy (buffer-unaware) decoder fail-closes, and no
+     * callback fires before the reject. */
+    collect_ctx legacy;
+    memset(&legacy, 0, sizeof legacy);
+    STM_ASSERT_ERR(stm_btnode_internal_decode(buf, MSG_NODE_SIZE, NULL,
+                                                NULL, NULL, &legacy),
+                   STM_ECORRUPT);
+    free(buf);
+}
+
+STM_TEST(btnode_msgs_hostile_decode) {
+    uint8_t *good = malloc(MSG_NODE_SIZE);
+    uint8_t *buf  = malloc(MSG_NODE_SIZE);
+    STM_ASSERT(good != NULL && buf != NULL);
+    stm_btnode_msg m = { STM_BTNODE_MSG_INSERT, 5, "key", 3, "value", 5 };
+    msg_encode_node(good, MSG_NODE_SIZE, &m, 1);
+
+    uint32_t payload_used = msg_get_le32(good + MSG_HDR_OFF_PAYLOAD_USED);
+    uint32_t buffer_used  = msg_get_le32(good + MSG_HDR_OFF_BUFFER_USED);
+    size_t msg_off = STM_BTNODE_HDR_SIZE + payload_used - buffer_used;
+
+#define HOSTILE(mutate) do {                                                  \
+        memcpy(buf, good, MSG_NODE_SIZE);                                     \
+        { mutate; }                                                           \
+        msg_recsum(buf, MSG_NODE_SIZE);                                       \
+        STM_ASSERT_ERR(stm_btnode_internal_decode_msgs(buf, MSG_NODE_SIZE,    \
+                                                         NULL, NULL, NULL,    \
+                                                         NULL, NULL),         \
+                       STM_ECORRUPT);                                         \
+    } while (0)
+
+    /* Foreign op on disk. */
+    HOSTILE(buf[msg_off] = 0x07);
+    /* Nonzero reserved byte. */
+    HOSTILE(buf[msg_off + 1] = 1);
+    /* Valued tombstone on disk (flip INSERT -> DELETE, value stays). */
+    HOSTILE(buf[msg_off] = STM_BTNODE_MSG_DELETE);
+    /* key_len over the bound (patch le16 at msg+8). */
+    HOSTILE({ buf[msg_off + 8] = 0x2c; buf[msg_off + 9] = 0x01; }); /* 300 */
+    /* Partial trailing message: grow the region by one byte. */
+    HOSTILE({
+        msg_put_le32(buf + MSG_HDR_OFF_BUFFER_USED,  buffer_used + 1u);
+        msg_put_le32(buf + MSG_HDR_OFF_PAYLOAD_USED, payload_used + 1u);
+    });
+    /* Message body overruns the region (value_len inflated). */
+    HOSTILE(msg_put_le32(buf + msg_off + 10, 5u + 10u));
+    /* buffer_used > payload_used. */
+    HOSTILE(msg_put_le32(buf + MSG_HDR_OFF_BUFFER_USED, payload_used + 1u));
+    /* buffer_used past the region cap (payload_used stretched to keep
+     * buffer_used <= payload_used so the REGION gate is what fires). */
+    HOSTILE({
+        uint32_t over = (uint32_t)STM_BTNODE_BUFFER_REGION_MAX(MSG_NODE_SIZE) + 1u;
+        msg_put_le32(buf + MSG_HDR_OFF_BUFFER_USED,  over);
+        msg_put_le32(buf + MSG_HDR_OFF_PAYLOAD_USED,
+                     (payload_used - buffer_used) + over);
+    });
+#undef HOSTILE
+
+    /* Control: the untampered node still decodes. */
+    STM_ASSERT_OK(stm_btnode_internal_decode_msgs(good, MSG_NODE_SIZE, NULL,
+                                                    NULL, NULL, NULL, NULL));
+    free(good);
+    free(buf);
+}
+
+STM_TEST(btnode_msgs_leaf_rejects_buffer) {
+    uint8_t *buf = malloc(MSG_NODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    stm_btnode_entry e = { "k", 1, "v", 1 };
+    STM_ASSERT_OK(stm_btnode_leaf_encode(&e, 1, 0, 0, buf, MSG_NODE_SIZE));
+
+    /* A leaf with nonzero n_buffer_used is corruption. */
+    msg_put_le32(buf + MSG_HDR_OFF_BUFFER_USED, 8u);
+    msg_recsum(buf, MSG_NODE_SIZE);
+    collect_ctx c;
+    memset(&c, 0, sizeof c);
+    STM_ASSERT_ERR(stm_btnode_leaf_decode(buf, MSG_NODE_SIZE, NULL,
+                                            collect_cb, &c),
+                   STM_ECORRUPT);
+    free(buf);
+}
+
+STM_TEST(btnode_msgs_cb_early_stop) {
+    uint8_t *buf = malloc(MSG_NODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    stm_btnode_msg msgs[3] = {
+        { STM_BTNODE_MSG_INSERT, 1, "a", 1, "1", 1 },
+        { STM_BTNODE_MSG_INSERT, 2, "b", 1, "2", 1 },
+        { STM_BTNODE_MSG_DELETE, 3, "a", 1, NULL, 0 },
+    };
+    msg_encode_node(buf, MSG_NODE_SIZE, msgs, 3);
+
+    msg_collect_ctx c;
+    memset(&c, 0, sizeof c);
+    c.stop_at = 0;
+    STM_ASSERT_OK(stm_btnode_internal_decode_msgs(buf, MSG_NODE_SIZE, NULL,
+                                                    NULL, NULL,
+                                                    msg_collect_cb, &c));
+    STM_ASSERT_EQ(c.n_seen, (uint32_t)1);
+    free(buf);
+}
+
 STM_TEST_MAIN("btnode")
