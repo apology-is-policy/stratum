@@ -248,6 +248,22 @@ Used by the rollback mechanism (9.7-impl-4) which swaps the
 dataset's triple and needs the in-RAM tree dropped so the swapped
 root governs the next access.
 
+Since 9.8-BE-engine-retire (chunk 9b — the R171 P0-2 closure), every
+close path funnels through `dataset_engine_close_locked`, which
+UNPUBLISHES the slot (`slot->engine = NULL`, under `idx->lock`) and
+then `stm_btree_engine_retire`s the engine instead of destroying it
+in place: a wait-free reader that resolved the engine via
+`get_engine` inside its `stm_ebr_enter` pin (the fs.c LF-3
+acquisition order — get_engine takes the same `idx->lock` the
+unpublish holds) keeps a usable engine until it exits its epoch; a
+post-unpublish reader sees NULL and lazily re-opens. The
+pool-touching implicit abort of a flushed-but-unfinalized commit
+still runs synchronously in the closer's thread. Serial ops and
+`_concurrent` writers are excluded by the close callers' fs-level EX
+envelope. The throwaway engines (`verify_engine_at` /
+`collect_engine_paddrs_at` — opened locally, never slot-published)
+correctly keep immediate destroy.
+
 `set_engine_root` (9.7-impl-4) is the rollback primitive: it forces
 a PRESENT dataset's slot triple to an arbitrary `(root_paddr,
 root_gen, root_csum)`. Normally a slot triple is updated only as a

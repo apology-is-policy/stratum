@@ -677,6 +677,25 @@ stm_status stm_inode_next_ino(const stm_inode_index *idx,
                                  uint64_t dataset_id,
                                  uint64_t *out_next);
 
+/*
+ * Drop the cached per-dataset alloc seed (next_ino high-water +
+ * freed-reuse gate) so the NEXT alloc-shaped op re-seeds from the LIVE
+ * engine. Call after an engine-root swap discards the tree the seed
+ * was derived from — stm_fs_rollback_snapshot's set_engine_root is the
+ * caller (9.8-BE chunk 9b; the Area-S audit F1 / "inode twin of
+ * Area-D F2" closure from phase-9.8-design.md 5.1.1).
+ *
+ * next_ino itself stays MONOTONE across the re-seed (the seed takes
+ * max with the in-RAM value): a rollback never re-issues an ino the
+ * discarded tree handed out, so a stale fid/qid held across the
+ * rollback can never alias a recycled ino. The re-seed makes the
+ * freed_count / freed_scan_lo reuse gate exact again.
+ *
+ * A dataset with no cached seed is a no-op. NULL idx / dataset_id 0
+ * are no-ops (nothing to invalidate).
+ */
+void stm_inode_dsstate_invalidate(stm_inode_index *idx, uint64_t dataset_id);
+
 /* ========================================================================= */
 /* Persistence (9.7-impl-1c-ii: per-dataset metadata-tree engines).            */
 /*                                                                            */

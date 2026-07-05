@@ -86,15 +86,15 @@ typedef struct {
      * with no recyclable inos skips it entirely -- the create path is
      * O(1) instead of O(N) per alloc. A stale count is safe: it can only
      * skip a possible reuse (-> AllocFresh, always valid per inode.tla),
-     * never mis-allocate. The seed re-derives it on (re)mount. NOTE the
+     * never mis-allocate. The seed re-derives it on (re)mount. The
      * snapshot-rollback engine-root swap (stm_fs_rollback_snapshot ->
-     * stm_dataset_index_set_engine_root) does NOT re-seed, so this +
-     * next_ino + freed_scan_lo go stale across a rollback -- still
-     * safe-degraded (the scan reads the LIVE engine; next_ino stays a
-     * monotone high-water mark >= the rolled-back tree's max, so AllocFresh
-     * never re-issues a live ino). The concurrent-FS arc must invalidate
-     * (seeded=false) here -- the inode twin of Area-D's eng->root F2, on
-     * the phase-9.8 ledger. */
+     * stm_dataset_index_set_engine_root) invalidates the seed via
+     * stm_inode_dsstate_invalidate (9.8-BE chunk 9b — the Area-S F1 /
+     * "inode twin of Area-D F2" closure), so the next alloc-shaped op
+     * re-derives this + freed_scan_lo from the rolled-back tree;
+     * next_ino stays a monotone high-water mark across the re-seed
+     * (max-with-existing in in_seed_dsstate_locked), so AllocFresh
+     * never re-issues an ino the discarded tree handed out. */
     uint64_t  freed_count;
     /* Lower bound on the ino of any FREED record (invariant: no FREED
      * record has ino < freed_scan_lo). The AllocReused scan starts here
@@ -1260,6 +1260,20 @@ stm_status stm_inode_next_ino(const stm_inode_index *idx,
     *out_next = s ? s->next_ino : 0u;
     must_unlock(idx_lock(midx));
     return STM_OK;
+}
+
+void stm_inode_dsstate_invalidate(stm_inode_index *idx, uint64_t dataset_id) {
+    if (!idx || dataset_id == 0) return;
+    must_lock(idx_lock(idx));
+    stm_inode_dsstate *s = find_dsstate(idx, dataset_id);
+    /* seeded=false alone: the next alloc-shaped op re-runs
+     * in_seed_dsstate_locked, which recomputes freed_count /
+     * freed_scan_lo exactly from the LIVE tree and takes MAX with the
+     * in-RAM next_ino — the high-water mark deliberately survives the
+     * rollback (monotone; no ino the discarded tree issued is ever
+     * re-issued, so a stale fid/qid cannot alias a recycled ino). */
+    if (s) s->seeded = false;
+    must_unlock(idx_lock(idx));
 }
 
 /* ====================================================================== */

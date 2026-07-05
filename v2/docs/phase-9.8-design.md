@@ -605,10 +605,10 @@ is a **soundness** prerequisite.
 |---|---|---|---|
 | P0-1 | a wait-free reader's leaf-value memcpy races the writer's in-place `free(old); val=new` upsert (`node.c eng_leaf_put`) | `9.8-BE-prepend` (chunk 9): writers CAS-prepend a delta message; the old base value is superseded + EBR-retired, never freed under a reader | **BUILT (chunk 9)** at the engine layer — `insert/delete_concurrent` + the clone commit (a latched engine never mutates a published node; supersedes retire via EBR). The PRODUCTION closure completes when chunk 10 ports fs.c's write ops onto the `_concurrent` APIs; until then the serial writers keep the R171 P1-1 stopgap envelope. |
 | P0-4 | `invalidate_memtree` frees the eng_node tree under a pinned reader | EBR-retire the eng_node tree at BE-prepend | **BUILT (chunk 9)** — `invalidate_memtree` publishes NULL then `stm_ebr_retire`s the tree (recursive destructor); the clone commit's failure paths additionally never invalidate at all (the published tree is byte-untouched). |
-| P0-2 | the engine struct itself is freed by rollback / `dataset_destroy` while a reader holds the engine pointer | EBR-retire the engine struct in `dataset_engine_close_locked` | **chunk 9b (NEW, this addendum)** -- was a floating forward-note |
+| P0-2 | the engine struct itself is freed by rollback / `dataset_destroy` while a reader holds the engine pointer | EBR-retire the engine struct in `dataset_engine_close_locked` | **BUILT (chunk 9b)** — `stm_btree_engine_retire` (the pool-touching implicit abort stays synchronous; the RAM half — published tree + chains + mutexes + struct — defers through EBR); `dataset_engine_close_locked` unpublishes under `idx->lock` then retires, covering close_engine / set_engine_root (rollback) / dataset_destroy / index-close uniformly. Non-vacuity: reverting to destroy fails `dataset_engine_retire_defers_free_across_close_paths` deterministically. |
 | P0-3 | `stm_fs_unmount` is not excluded by the wait-free wedge gate | "draining" flag + EBR-advance-until-empty (task #1232) | production-mitigated: stratumd drains workers before unmount |
 
-**Chunk 9b -- `9.8-BE-engine-retire`** (NEW): EBR-retire the
+**Chunk 9b -- `9.8-BE-engine-retire`** (BUILT): EBR-retire the
 `stm_btree_engine` struct in `dataset_engine_close_locked` (and the
 rollback / `dataset_destroy` paths) instead of freeing it directly, so a
 wait-free reader holding the engine pointer across an `stm_ebr_enter` /
@@ -616,6 +616,32 @@ wait-free reader holding the engine pointer across an `stm_ebr_enter` /
 rest on the EBR retire ring `concurrency_mvcc.tla` already models
 (`BuggyImmediateFree` is the executable counterexample). Audit folds
 into the BE-arc close.
+
+As-built (chunk 9b): the teardown split in engine.c --
+`engine_implicit_abort_pending` (the pool-touching implicit abort of a
+flushed-but-unfinalized commit; commit-private state no reader can
+hold; must not outlive the pool) runs synchronously in the closer's
+thread for BOTH `stm_btree_engine_destroy` and the new
+`stm_btree_engine_retire`; the RAM half (`engine_free_ram_cb`: the
+published tree + delta chains, the cache index, the orphan vec, BOTH
+mutexes, the struct) is the EBR destructor. Retire-record OOM leaks
+the engine (the invalidate_memtree posture). The soundness argument
+for the dataset close: a wait-free reader resolves the engine via
+`stm_dataset_index_get_engine` INSIDE its EBR pin, and get_engine
+takes the same `idx->lock` the unpublish holds -- so a pre-unpublish
+resolver is pinned at retire time (EBR defers the free past its exit)
+and a post-unpublish resolver sees NULL + lazily re-opens. Serial ops
+and `_concurrent` writers are excluded by the close callers' fs-level
+EX envelope. Throwaway engines (verify_engine_at /
+collect_engine_paddrs_at / snapshot reconcile-mark / create-OOM
+rollback -- never published to a slot) correctly keep immediate
+destroy. Regressions: `engine_retire_defers_free_under_pin`,
+`dataset_engine_retire_defers_free_across_close_paths` (fails
+deterministically on revert-to-destroy),
+`dataset_engine_retire_close_race` (2 readers x 400 close cycles; the
+UAF becomes deterministic under Linux ASan -- R175),
+`fs_rollback_reseeds_inode_alloc_gate` (the Area-S F1 companion,
+below; fails i5=fresh vs i2 on the neutered invalidate).
 
 **One more mechanism in the same envelope (Area D audit F2):** `load_root`
 (`engine.c`) plain-stores `eng->root` on its slow-warm path, and BOTH the
@@ -636,10 +662,18 @@ discarded post-snapshot tree. SAFE-DEGRADED at v1.0 (single-threaded under
 `fs->global` EX; the alloc scan reads the LIVE engine, and `next_ino` stays a
 monotone high-water mark >= the rolled-back tree's max, so AllocFresh never
 re-issues a live ino -- pre-existing for `next_ino`, inherited by the new
-fields). The fix is the inode twin of F2: the BE-write / concurrent-FS chunk
-must invalidate (`seeded=false`) the inode `dsstate` for the rolled-back
-dataset at `set_engine_root`, AND re-validate the `next_ino`-monotonicity
-argument under the multi-connection model (a second connection allocating on a
+fields). The fix is the inode twin of F2 — **BUILT (chunk 9b)**:
+`stm_inode_dsstate_invalidate` (seeded=false only; `next_ino` deliberately
+stays monotone — the re-seed takes max with the in-RAM high water, so a
+stale fid/qid held across the rollback can never alias a recycled ino,
+while `freed_count` / `freed_scan_lo` re-derive exactly from the
+rolled-back tree). Called at both fs.c `set_engine_root` sites: the
+rollback (the real case) and the snapshot-clone (defensive — a fresh id
+has no seed today). Regression `fs_rollback_reseeds_inode_alloc_gate`
+(free → snapshot → reuse → rollback → the re-seeded gate reuses the
+FREED ino again; fails i5=fresh on the neutered invalidate). STILL OWED
+to chunk 10: re-validate the `next_ino`-monotonicity argument under the
+multi-connection model (a second connection allocating on a
 just-rolled-back dataset).
 
 **Thylacine relevance -- why this is load-bearing, not optional.**
@@ -1030,7 +1064,7 @@ fs.c port chunks after the engine support is in place.
 | 7 | 9.8-BE-format | internal-node on-disk format extension; STM_UB_VERSION 32 → 33 | R172 |
 | 8 | 9.8-BE-flush | engine-internal Bε flush logic + recursive-flush cap | R173 |
 | 9 | 9.8-BE-prepend | writer-side CAS prepend + `_concurrent` insert/delete API (closes R171 P0-1 + P0-4 -- see §5.1.1) | R174 |
-| 9b | 9.8-BE-engine-retire | EBR-retire the engine struct in `dataset_engine_close_locked` (closes R171 P0-2 -- §5.1.1) | (folds into the BE-arc close) |
+| 9b | 9.8-BE-engine-retire | EBR-retire the engine struct in `dataset_engine_close_locked` (closes R171 P0-2 -- §5.1.1). **BUILT** (+ the Area-S F1 dsstate reseed pulled in — the same rollback-staleness family) | (folds into the BE-arc close; R175 covers the 9b surface) |
 | 10 | 9.8-BE-fs.c | port write fs.c ops to per-inode-pin + EBR | R175 |
 | 11 | 9.8-BE-bench | sequential-write benchmark vs 9.7 baseline | (folded into R175 close) |
 | 12 | 9.8-ARC | ARC-style node cache eviction (replaces 1024-bucket fixed cache) | R176 |

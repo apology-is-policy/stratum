@@ -221,6 +221,19 @@ noise).
 `stm_inode_next_ino` returns the high-water mark — the value the NEXT
 fresh alloc would return. FREED inos reused before next_ino bumps.
 
+`stm_inode_dsstate_invalidate(idx, ds)` (9.8-BE chunk 9b — the Area-S
+F1 closure) drops the cached per-dataset alloc seed (`seeded=false`
+only) so the next alloc-shaped op re-seeds from the LIVE engine.
+Called by fs.c after an engine-root swap (`stm_fs_rollback_snapshot` /
+the snapshot-clone) discards the tree the seed was derived from.
+`next_ino` deliberately stays monotone across the re-seed (the seed
+takes max with the in-RAM value — a stale fid/qid held across a
+rollback can never alias a recycled ino); `freed_count` /
+`freed_scan_lo` re-derive exactly, so the reuse gate is exact again
+(pre-9b a post-rollback create could silently skip a FREED slot the
+rolled-back tree holds, or scan for one it lacks — both safe-degraded,
+now neither). No-op on NULL idx / ds 0 / no cached slot.
+
 ### Persistence
 
 ```c

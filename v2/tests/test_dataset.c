@@ -25,8 +25,11 @@
 #include <stratum/btree_engine.h>     /* 9.7-impl-1c engine substrate tests */
 #include <stratum/crypto.h>
 #include <stratum/dataset.h>
+#include <stratum/ebr.h>              /* chunk 9b engine-retire tests */
 
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2455,6 +2458,197 @@ STM_TEST(dataset_scan_engine_range_empty_triple) {
     STM_ASSERT_EQ(cc.n, (size_t)0);
 
     stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+/* ====================================================================== */
+/* chunk 9b: 9.8-BE-engine-retire — the R171 P0-2 closure.                 */
+/*                                                                          */
+/* dataset_engine_close_locked now UNPUBLISHES the slot (under idx->lock)  */
+/* and EBR-RETIRES the engine instead of freeing it in place. A wait-free  */
+/* reader that resolved the engine inside its stm_ebr_enter pin (the fs.c  */
+/* LF-3 acquisition order) keeps a usable engine across every close path   */
+/* — close_engine / set_engine_root (rollback) / dataset_destroy — until   */
+/* it exits its epoch. Pre-9b each path freed the struct + tree + mutexes  */
+/* under the reader.                                                        */
+/* ====================================================================== */
+
+STM_TEST(dataset_engine_retire_defers_free_across_close_paths) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+
+    dsp_make_tmp("eng_retire");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    uint8_t key[16] = { 0x01, 0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0x42 };
+    uint8_t val[8]  = { 1,2,3,4,5,6,7,8 };
+
+    /* --- Path 1: the manual close API. Pin FIRST, resolve INSIDE the
+     * pin (the LF-3 order), close, then keep using the held engine. */
+    stm_ebr_enter(me);
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID,
+                                                 &eng));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, key, sizeof key,
+                                            val, sizeof val));
+    STM_ASSERT_OK(stm_dataset_index_close_engine(idx, STM_DATASET_ROOT_ID));
+    STM_ASSERT_TRUE(stm_ebr_pending_retires() >= 1u);
+    bool found = false; void *vbuf = NULL; size_t vlen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me,
+                                                     key, sizeof key,
+                                                     &found, &vbuf, &vlen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ(vlen, sizeof val);
+    STM_ASSERT_TRUE(vlen == sizeof val && memcmp(vbuf, val, vlen) == 0);
+    free(vbuf); vbuf = NULL;
+    stm_ebr_exit(me);
+
+    /* --- Path 2: set_engine_root (the rollback shape — the P0-2
+     * headline). The re-resolved engine is a FRESH lazy open (the
+     * uncommitted insert died with engine 1); the property under test
+     * is the LIFETIME across the swap, not the value. */
+    stm_ebr_enter(me);
+    eng = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID,
+                                                 &eng));
+    STM_ASSERT_OK(stm_dataset_index_set_engine_root(idx,
+                                                       STM_DATASET_ROOT_ID,
+                                                       0, 0, NULL));
+    found = false;
+    STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me,
+                                                     key, sizeof key,
+                                                     &found, &vbuf, &vlen));
+    STM_ASSERT_TRUE(!found);
+    stm_ebr_exit(me);
+
+    /* --- Path 3: dataset_destroy. */
+    uint64_t cid = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "retire-child", &cid));
+    stm_ebr_enter(me);
+    eng = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, cid, &eng));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, key, sizeof key,
+                                            val, sizeof val));
+    STM_ASSERT_OK(stm_dataset_destroy(idx, cid));
+    found = false;
+    STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me,
+                                                     key, sizeof key,
+                                                     &found, &vbuf, &vlen));
+    STM_ASSERT_TRUE(found);
+    free(vbuf); vbuf = NULL;
+    stm_ebr_exit(me);
+
+    /* Unpinned: everything ages out. */
+    for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
+        (void)stm_ebr_try_advance();
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+    stm_ebr_thread_free(me);
+}
+
+/* The P0-2 race itself: readers resolve + descend inside their pin
+ * while the closer churns set_engine_root (close + lazy re-open each
+ * cycle). Pre-9b the reader's held engine is freed mid-descent — a
+ * UAF (deterministically fatal under ASan/Linux; probabilistic malloc
+ * scribble here). Post-9b every iteration is clean. */
+typedef struct {
+    stm_dataset_index *idx;
+    _Atomic(uint32_t) *stop;
+    _Atomic(int)      *first_err;
+} retire_reader_ctx;
+
+static void *retire_race_reader(void *p) {
+    retire_reader_ctx *c = p;
+    stm_ebr_thread *me = stm_ebr_register();
+    if (!me) {
+        atomic_store(c->first_err, (int)STM_ENOMEM);
+        return NULL;
+    }
+    uint8_t key[16] = { 0x01, 0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0x42 };
+    while (!atomic_load_explicit(c->stop, memory_order_acquire)) {
+        stm_ebr_enter(me);
+        stm_btree_engine *eng = NULL;
+        stm_status s = stm_dataset_index_get_engine(c->idx,
+                                                      STM_DATASET_ROOT_ID,
+                                                      &eng);
+        if (s == STM_OK) {
+            bool found = false; void *v = NULL; size_t vl = 0;
+            s = stm_btree_engine_lookup_concurrent(eng, me, key, sizeof key,
+                                                   &found, &v, &vl);
+            free(v);
+        }
+        if (s != STM_OK) {
+            int expect = (int)STM_OK;
+            atomic_compare_exchange_strong(c->first_err, &expect, (int)s);
+        }
+        stm_ebr_exit(me);
+    }
+    stm_ebr_thread_free(me);
+    return NULL;
+}
+
+STM_TEST(dataset_engine_retire_close_race) {
+    STM_ASSERT_OK(stm_ebr_init());
+
+    dsp_make_tmp("eng_retire_race");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    enum { N_READERS = 2, CLOSE_ITERS = 400 };
+    _Atomic(uint32_t) stop = 0u;
+    _Atomic(int) first_err = (int)STM_OK;
+    retire_reader_ctx ctx = { .idx = idx, .stop = &stop,
+                              .first_err = &first_err };
+    pthread_t th[N_READERS];
+    for (int i = 0; i < N_READERS; i++)
+        STM_ASSERT_EQ(pthread_create(&th[i], NULL, retire_race_reader,
+                                     &ctx), 0);
+
+    /* The closer: every set_engine_root closes (retires) the live
+     * engine; the readers' next get_engine lazily re-mints one. The
+     * all-zero triple never dirties the slot (changed=false), so the
+     * loop is pure engine churn. */
+    for (int i = 0; i < CLOSE_ITERS; i++) {
+        STM_ASSERT_OK(stm_dataset_index_set_engine_root(idx,
+                                                           STM_DATASET_ROOT_ID,
+                                                           0, 0, NULL));
+        if ((i & 63) == 0) sched_yield();
+    }
+
+    atomic_store_explicit(&stop, 1u, memory_order_release);
+    for (int i = 0; i < N_READERS; i++)
+        pthread_join(th[i], NULL);
+    STM_ASSERT_EQ(atomic_load(&first_err), (int)STM_OK);
+
+    stm_dataset_index_close(idx);
+    /* index_close retires whatever engine the last reader-minted onto
+     * the slot — drain AFTER it so nothing sits on the ring at test
+     * exit (Linux LeakSan hygiene). */
+    for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
+        (void)stm_ebr_try_advance();
     stm_bootstrap_close(b);
     stm_bdev_close(d);
     unlink(dsp_tmp_path);

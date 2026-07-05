@@ -79,12 +79,31 @@ stm_status stm_btree_engine_open  (const stm_btree_store_vtable *vt,
                                     const uint8_t root_csum[32],
                                     stm_btree_engine **out_eng);
 void       stm_btree_engine_destroy(stm_btree_engine *eng);
+void       stm_btree_engine_retire(stm_btree_engine *eng);
 ```
 
 `create` starts with an in-memory empty-leaf root (dirty); nothing
 touches the device until `commit`. `open` is lazy — no I/O until the
 first descent. `vt` and `cx->metadata_key` are **borrowed**; the caller
 keeps them alive for the engine's lifetime.
+
+`destroy` frees immediately — correct only for an engine no concurrent
+reader can hold (never published to a reader-visible slot, or a
+single-threaded caller). `retire` (9.8-BE-engine-retire, chunk 9b — the
+R171 P0-2 closure) is the reader-safe teardown for a PUBLISHED engine:
+the pool-touching implicit abort of a flushed-but-unfinalized commit
+runs synchronously in the caller's thread (commit-private state; must
+not outlive the pool), and the RAM half — the published tree + delta
+chains, the cache index, both mutexes, the struct — defers through EBR
+(`engine_free_ram_cb`), so a reader that resolved the engine inside its
+`stm_ebr_enter` pin never dereferences freed memory. Caller contract:
+unpublish first (no new reader can acquire the pointer) and exclude
+serial ops + `_concurrent` writers (the fs layer's EX-vs-SH envelope);
+a retire-record OOM leaks the engine (the `invalidate_memtree`
+posture). `dataset_engine_close_locked` (dataset.c) is the production
+caller — every dataset-slot engine close (manual close / rollback
+`set_engine_root` / `dataset_destroy` / index close) unpublishes under
+`idx->lock` then retires.
 
 ### Mutation + query
 
@@ -1218,8 +1237,19 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
       failure atomicity (published tree byte-untouched, no
       invalidate); `n_seq_hw` cross-restart seq seeding; the CAS-link
       cold descent (uncached, tombstone-aware). Closes R171 P0-1 +
-      P0-4 at the engine layer (the fs.c port is chunk 10; P0-2 is
-      chunk 9b).
+      P0-4 at the engine layer (the fs.c port is chunk 10).
+- [x] **Engine retire (9.8-BE-engine-retire, chunk 9b)**:
+      `stm_btree_engine_retire` — the synchronous implicit-abort +
+      EBR-deferred RAM teardown split; `dataset_engine_close_locked`
+      unpublishes-then-retires across every dataset close path, and
+      the rollback/clone `set_engine_root` sites additionally
+      invalidate the inode-alloc dsstate seed
+      (`stm_inode_dsstate_invalidate` — the Area-S F1 twin). Closes
+      R171 P0-2. Regressions: `engine_retire_defers_free_under_pin`,
+      `dataset_engine_retire_defers_free_across_close_paths` +
+      `dataset_engine_retire_close_race` (test_dataset.c),
+      `fs_rollback_reseeds_inode_alloc_gate` (test_fs.c) — the
+      dataset + fs ones fail deterministically on the neutered fixes.
 - [x] R150 audit close — 2 P1 (`load_child` DAG double-free +
       child-kind-mismatch UAF) + 3 P2. R151 audit close (impl-2) —
       0 P0 / 0 P1; 1 P2 (the abort-path nonce-safety rationale, doc

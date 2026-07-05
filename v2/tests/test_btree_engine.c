@@ -5530,4 +5530,62 @@ STM_TEST(engine_cold_descent_cas_link_race) {
     memstore_destroy(&ms);
 }
 
+/* ---- chunk 9b: 9.8-BE-engine-retire ---- */
+
+/* stm_btree_engine_retire defers the RAM teardown through EBR: a
+ * pinned reader that acquired the engine pointer BEFORE the retire
+ * keeps a fully-usable engine (struct + published tree + commit_mu)
+ * until it exits its epoch; the free happens on a later try_advance.
+ * This is the engine half of the R171 P0-2 closure (the dataset-slot
+ * unpublish half is exercised in test_dataset.c). */
+STM_TEST(engine_retire_defers_free_under_pin) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "held", 4, "H", 1));
+
+    /* NULL-safe like destroy. */
+    stm_btree_engine_retire(NULL);
+
+    uint64_t before = stm_ebr_pending_retires();
+
+    /* Pin FIRST (the LF-3 acquisition order), then retire the engine
+     * out from under the pin — the caller-side unpublish is the test
+     * body dropping its own use of `eng` after this block. */
+    stm_ebr_enter(me);
+    stm_btree_engine_retire(eng);
+    /* Our record cannot have been reclaimed: it was retired at the
+     * epoch we are pinned in, and reclaim needs the global epoch two
+     * past it — our pin blocks the second advance. (Not `>= before+1`:
+     * retire's internal try_advance may reclaim OLDER objects.) */
+    STM_ASSERT_TRUE(stm_ebr_pending_retires() >= 1u);
+
+    /* Still pinned: the engine must remain fully usable — the exact
+     * reader-mid-descent-across-close scenario. On pre-9b code (free
+     * in place) this dereferences freed memory. */
+    bool found = false; void *val = NULL; size_t vl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me, "held", 4,
+                                                     &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ((long long)vl, 1ll);
+    STM_ASSERT_TRUE(vl == 1 && ((const char *)val)[0] == 'H');
+    free(val);
+    stm_ebr_exit(me);
+
+    /* Unpinned: advances now reclaim (2 epochs to age out; bound the
+     * loop rather than assuming batch shape). */
+    for (int i = 0; i < 8 && stm_ebr_pending_retires() > before; i++)
+        (void)stm_ebr_try_advance();
+    STM_ASSERT_TRUE(stm_ebr_pending_retires() <= before);
+
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
 STM_TEST_MAIN("btree_engine")

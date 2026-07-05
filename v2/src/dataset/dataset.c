@@ -1517,16 +1517,29 @@ static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
  *     stale engines here).
  *   - stm_dataset_index_close_engine (the manual close API).
  *
- * stm_btree_engine_destroy is NULL-safe per its docstring; an engine
+ * stm_btree_engine_retire is NULL-safe per its docstring; an engine
  * with a flushed-but-unrooted commit pending implicitly aborts on
- * destroy (the flushed paddrs are deferred-freed; sync's commit
- * cascade is the only caller that holds an un-finalized flush, and
- * sync wedges the fs if it can't finalize).
+ * retire (the flushed paddrs are deferred-freed synchronously here;
+ * sync's commit cascade is the only caller that holds an un-finalized
+ * flush, and sync wedges the fs if it can't finalize).
+ *
+ * 9.8-BE-engine-retire (chunk 9b — the R171 P0-2 closure): the engine
+ * is UNPUBLISHED (slot->engine = NULL, under idx->lock) and then
+ * EBR-RETIRED, never freed in place. A wait-free reader resolves the
+ * engine via stm_dataset_index_get_engine INSIDE its stm_ebr_enter
+ * pin (fs.c LF-3 discipline), and get_engine takes this same
+ * idx->lock — so a reader that acquired the pointer before the
+ * unpublish is pinned at retire time and EBR defers the free past its
+ * exit; a reader arriving after sees NULL and lazily re-opens from
+ * the durable triple. Serial ops and _concurrent writers are excluded
+ * by the callers' fs-level EX envelope (rollback / destroy / unmount
+ * all hold fs->global EX).
  */
 static void dataset_engine_close_locked(dataset_slot *slot) {
     if (slot->engine == NULL) return;
-    stm_btree_engine_destroy(slot->engine);
-    slot->engine = NULL;
+    stm_btree_engine *eng = slot->engine;
+    slot->engine = NULL;                   /* unpublish first */
+    stm_btree_engine_retire(eng);
 }
 
 /* ---- Public per-dataset engine API. ---- */

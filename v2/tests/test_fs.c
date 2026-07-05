@@ -1329,6 +1329,70 @@ STM_TEST(fs_rollback_restores_snapshot_view) {
     unlink(g_tmp_path);
 }
 
+/* chunk 9b (Area-S F1): the rollback engine-root swap invalidates the
+ * cached per-dataset inode-alloc seed, so the freed-reuse gate
+ * re-derives from the ROLLED-BACK tree. Scenario: free an ino, snapshot
+ * (the captured tree holds the FREED record), reuse it (the in-RAM gate
+ * drops to 0), roll back (the tree holds the FREED record again).
+ * Pre-9b the stale in-RAM gate (freed_count==0) skipped reuse and the
+ * next create allocated FRESH; post-9b the re-seeded gate reuses the
+ * FREED ino. next_ino stays monotone throughout (the seed takes max
+ * with the in-RAM high water). */
+STM_TEST(fs_rollback_reseeds_inode_alloc_gate) {
+    make_tmp("rb_dsstate");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                     0, 0, &dir));
+
+    uint64_t i1 = 0, i2 = 0, i3 = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f1", 2,
+                                        0644u, 0, 0, &i1));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f2", 2,
+                                        0644u, 0, 0, &i2));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f3", 2,
+                                        0644u, 0, 0, &i3));
+
+    /* FREE i2, then freeze exactly that state. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"f2", 2));
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "with-freed", 10, &snap_id));
+
+    /* The live gate sees the FREED slot — the next create REUSES i2. */
+    uint64_t i4 = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f4", 2,
+                                        0644u, 0, 0, &i4));
+    STM_ASSERT_EQ(i4, i2);
+
+    uint64_t next_before = 0;
+    STM_ASSERT_OK(stm_inode_next_ino(iidx, 1, &next_before));
+
+    /* Roll back: the tree again holds i2 FREED, but the in-RAM gate
+     * said freed_count==0 after i4 consumed it. The 9b invalidation
+     * makes the next alloc re-seed from the rolled-back tree. */
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap_id, /*force=*/false));
+
+    uint64_t i5 = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f5", 2,
+                                        0644u, 0, 0, &i5));
+    STM_ASSERT_EQ(i5, i2);          /* pre-9b: a fresh ino > i3 */
+
+    /* Monotone across the re-seed: the high water never went down. */
+    uint64_t next_after = 0;
+    STM_ASSERT_OK(stm_inode_next_ino(iidx, 1, &next_after));
+    STM_ASSERT_TRUE(next_after >= next_before);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 /* 9.7-impl-4 v1.0 limitation: a rollback is refused (STM_ENOTSUPPORTED)
  * when a newer snapshot of the dataset exists — the operator deletes
  * newer snapshots first. A rollback to the most-recent snapshot

@@ -160,8 +160,36 @@ stm_status stm_btree_engine_open(const stm_btree_store_vtable *vt,
  * caller with uncommitted changes must commit first. If a commit was
  * flushed but neither finalized nor aborted, destroy implicitly aborts
  * it — the flushed-but-unrooted paddrs are handed back to the allocator
- * (deferred-free) so they do not leak on disk. NULL-safe. */
+ * (deferred-free) so they do not leak on disk. NULL-safe.
+ *
+ * Frees IMMEDIATELY — correct only when no concurrent reader can hold
+ * the engine pointer (an engine never published to a reader-visible
+ * slot, or a single-threaded caller). A published engine must use
+ * stm_btree_engine_retire instead. */
 void stm_btree_engine_destroy(stm_btree_engine *eng);
+
+/* The reader-safe teardown for a PUBLISHED engine (9.8-BE-engine-retire,
+ * chunk 9b — the R171 P0-2 closure). Identical teardown to
+ * stm_btree_engine_destroy, split in two:
+ *
+ *   - The implicit abort of a flushed-but-unfinalized commit (the
+ *     pool-touching half) runs synchronously in the calling thread.
+ *     The pending state is commit-private — no reader can hold it —
+ *     and the paddr hand-back must not outlive the pool.
+ *   - The RAM half (the published tree + delta chains, the mutexes,
+ *     the struct itself) is deferred through EBR, so a concurrent
+ *     reader that acquired the engine pointer inside an
+ *     stm_ebr_enter/_exit pair never dereferences freed memory.
+ *
+ * Caller contract: the engine must already be UNPUBLISHED (no new
+ * reader can acquire the pointer — e.g. the dataset slot cleared under
+ * its lock), and the caller must exclude serial-path ops and
+ * _concurrent WRITERS on this engine (the fs layer's EX-vs-SH
+ * envelope). Pinned concurrent READERS are exactly what the deferral
+ * protects. On retire-record OOM (~32 bytes) the engine leaks —
+ * strictly safer than freeing under a possibly-pinned reader.
+ * NULL-safe. */
+void stm_btree_engine_retire(stm_btree_engine *eng);
 
 /* ========================================================================= */
 /* Mutation + query.                                                          */

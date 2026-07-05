@@ -198,26 +198,61 @@ stm_status stm_btree_engine_open(const stm_btree_store_vtable *vt,
     return STM_OK;
 }
 
-void stm_btree_engine_destroy(stm_btree_engine *eng)
+/* The pure-RAM half of engine teardown — everything a pinned concurrent
+ * reader may still be touching (the published tree + its delta chains,
+ * commit_mu on the slow-warm path) plus the engine-private allocations.
+ * Touches NO store/pool state and takes no locks, so it is safe as an
+ * EBR destructor invoked from any thread at any later time
+ * (9.8-BE-engine-retire, chunk 9b). */
+static void engine_free_ram_cb(void *eng_)
 {
-    if (!eng) return;
-    /* A commit flushed but never finalized/aborted: hand the
-     * flushed-but-unrooted paddrs back to the allocator (deferred-free)
-     * so they do not leak on disk — an implicit abort. The pending
-     * tracking arrays themselves are freed by pending_reset; when no
-     * commit is pending those arrays are already NULL. */
-    if (eng->pending.active) {
-        pending_free_paddrs(eng, &eng->pending.fresh, eng->pending.gen);
-        if (eng->pending.clone)
-            eng_node_free_recursive(eng->pending.shadow_root);
-        pending_reset(&eng->pending);
-    }
+    stm_btree_engine *eng = eng_;
     eng_node_free_recursive(eng->root);    /* frees every in-memory node */
     eng_cache_destroy(&eng->cache);        /* frees the index, not nodes */
     paddr_vec_free(&eng->orphaned_spill_blocks);
     pthread_mutex_destroy(&eng->serial_mu);
     pthread_mutex_destroy(&eng->commit_mu);
     free(eng);
+}
+
+/* A commit flushed but never finalized/aborted: hand the
+ * flushed-but-unrooted paddrs back to the allocator (deferred-free)
+ * so they do not leak on disk — an implicit abort. The pending
+ * tracking arrays themselves are freed by pending_reset; when no
+ * commit is pending those arrays are already NULL.
+ *
+ * Runs synchronously in the tearing-down thread for BOTH destroy and
+ * retire: the pending state is commit-private (a concurrent reader can
+ * never reach it — commits mutate only the un-published shadow), and
+ * the paddr hand-back calls into the store vtable, which must not
+ * outlive the pool the way an EBR-deferred callback could. */
+static void engine_implicit_abort_pending(stm_btree_engine *eng)
+{
+    if (!eng->pending.active) return;
+    pending_free_paddrs(eng, &eng->pending.fresh, eng->pending.gen);
+    if (eng->pending.clone)
+        eng_node_free_recursive(eng->pending.shadow_root);
+    pending_reset(&eng->pending);
+}
+
+void stm_btree_engine_destroy(stm_btree_engine *eng)
+{
+    if (!eng) return;
+    engine_implicit_abort_pending(eng);
+    engine_free_ram_cb(eng);
+}
+
+void stm_btree_engine_retire(stm_btree_engine *eng)
+{
+    if (!eng) return;
+    engine_implicit_abort_pending(eng);
+    if (stm_ebr_retire(eng, engine_free_ram_cb) != STM_OK) {
+        /* Retire-record OOM (~32 bytes): leak the engine rather than
+         * free under a possibly-pinned reader — the invalidate_memtree
+         * posture. Strictly safer, once, on an already-OOM path. */
+        return;
+    }
+    (void)stm_ebr_try_advance();
 }
 
 /* ========================================================================= */
@@ -249,8 +284,10 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
  *     writers keep the R171 P1-1 SH-fallback stopgap envelope until
  *     chunk 10 ports them onto the `_concurrent` APIs.
  *   - R171 P0-2 (the ENGINE STRUCT freed under a reader by rollback /
- *     dataset_destroy / sync_close) — still open; scheduled as
- *     9.8-BE-engine-retire (chunk 9b; phase-9.8-design.md 5.1.1).
+ *     dataset_destroy / sync_close) — CLOSED at chunk 9b
+ *     (9.8-BE-engine-retire): stm_btree_engine_retire defers the RAM
+ *     teardown through EBR; dataset_engine_close_locked unpublishes
+ *     then retires (phase-9.8-design.md 5.1.1).
  *   - R171 P0-4 (invalidate_memtree freeing the tree under a pinned
  *     reader) — CLOSED at chunk 9: invalidate publishes NULL then
  *     EBR-retires the tree; the clone-commit failure paths never

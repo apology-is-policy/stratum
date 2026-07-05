@@ -68,14 +68,17 @@
  *     stm_fs_unmount; LF-3 wait-free readers do not synchronize
  *     against unmount. Stratumd's accept-loop shutdown drains workers
  *     before unmount, so the obligation is satisfied in production.
- *     The same wait-free regime also lacks EBR retire for the engine
- *     struct freed by rollback / dataset_destroy / sync_close — R171
- *     P0-2 (chunk 9b, 9.8-BE-engine-retire) + P0-3 (task #1232) stay
- *     open; P0-4 (invalidate_memtree free-under-reader) and P0-1's
- *     ENGINE half (in-place upsert) CLOSED at 9.8-BE-prepend (chunk
- *     9) — the fs.c write-op port onto the `_concurrent` APIs is
- *     chunk 10; see phase-9.8-design.md §5.1.1. Unreachable at v1.0
- *     Thylacine (serial single-session stratumd); A-5b prerequisite.
+
+ *     R171 P0-2 (the engine struct freed under a reader by rollback /
+ *     dataset_destroy / sync_close) CLOSED at chunk 9b
+ *     (9.8-BE-engine-retire: dataset_engine_close_locked unpublishes
+ *     then EBR-retires); P0-4 (invalidate_memtree free-under-reader)
+ *     and P0-1's ENGINE half (in-place upsert) CLOSED at
+ *     9.8-BE-prepend (chunk 9). P0-3 (task #1232, unmount drain)
+ *     stays open — production-mitigated as above. The fs.c write-op
+ *     port onto the `_concurrent` APIs is chunk 10; see
+ *     phase-9.8-design.md §5.1.1. Unreachable at v1.0 Thylacine
+ *     (serial single-session stratumd); A-5b prerequisite.
  *
  * stm_sync_commit nests stm_alloc_commit under sync->lock. Every reader-
  * path inside stm_fs (stats_get) acquires the same order. Do not add a
@@ -7474,6 +7477,11 @@ stm_status stm_fs_create_clone(stm_fs *fs, uint64_t parent_id,
         return s;
     }
 
+    /* Defensive twin of the rollback-site invalidation (chunk 9b): a
+     * fresh new_id has no cached inode-alloc seed today, but any
+     * engine-root swap must drop whatever seed exists for the id. */
+    stm_inode_dsstate_invalidate(stm_sync_inode_index(fs->sync), new_id);
+
     /* Provision the clone's per-dataset DEK (§9.1.3). The clone's new
      * writes will stamp the clone's key_id; reads of shared extents
      * use the origin's stamped key_id via the pool-global keyschema. */
@@ -9466,6 +9474,12 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         pthread_rwlock_unlock(&fs->global);
         return s;
     }
+
+    /* The root swap just discarded the tree the cached inode-alloc seed
+     * was derived from — drop it so the next alloc re-seeds from the
+     * rolled-back tree (9.8-BE chunk 9b; the Area-S F1 closure). Runs
+     * under fs->global EX, so no alloc races the invalidation. */
+    stm_inode_dsstate_invalidate(stm_sync_inode_index(fs->sync), dataset_id);
 
     /* Reclaim the post-snapshot divergence — blocks reachable from the
      * pre-rollback live tree but not from the snapshot's frozen tree.
