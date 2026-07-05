@@ -3420,4 +3420,302 @@ STM_TEST(engine_lf2_concurrent_reader_vs_commit) {
     memstore_destroy(&ms);
 }
 
+
+/* ========================================================================= */
+/* 9.8-BE-format chunk 7b: the engine's persisted message buffer.             */
+/* ========================================================================= */
+
+/* The buffer-injection tests reach the in-memory tree directly (the
+ * only writer of buf_msgs before the chunk-8 flush / chunk-9 prepend
+ * land) — the same relative-include pattern test_corvus_notify uses. */
+#include "../src/btree_engine/engine_internal.h"
+
+static int msgs_count_cb(const void *k, size_t kl, const void *v,
+                          size_t vl, void *ctx)
+{
+    (void)k; (void)kl; (void)v; (void)vl;
+    (*(uint64_t *)ctx)++;
+    return 0;
+}
+
+static void mkmsg(eng_msg *m, uint8_t op, uint64_t seq,
+                   const char *key, const char *val)
+{
+    memset(m, 0, sizeof *m);
+    m->op  = op;
+    m->seq = seq;
+    size_t kl = strlen(key);
+    m->key = malloc(kl);
+    STM_ASSERT(m->key != NULL);
+    memcpy(m->key, key, kl);
+    m->key_len = (uint32_t)kl;
+    if (val) {
+        size_t vl = strlen(val);
+        m->value = malloc(vl);
+        STM_ASSERT(m->value != NULL);
+        memcpy(m->value, val, vl);
+        m->value_len = (uint32_t)vl;
+    }
+}
+
+/* Encode + encrypt an internal root with one pivot "m", two children,
+ * and a caller-supplied message array (any order — the codec cannot
+ * route, which is exactly what the read-side order gate is for). */
+static void forge_internal_root_msgs(memstore *ms,
+                                      const stm_btree_crypt_ctx *cx,
+                                      uint64_t gen,
+                                      const uint8_t children[2 * 64],
+                                      const stm_btnode_msg *msgs,
+                                      uint32_t n_msgs,
+                                      uint64_t *out_paddr,
+                                      uint8_t out_csum[32])
+{
+    uint8_t *buf = calloc(1, STM_BTREE_ENGINE_NODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    if (!buf) return;
+    stm_btnode_pivot pv = { .key = "m", .key_len = 1 };
+    STM_ASSERT_OK(stm_btnode_internal_encode_msgs(&pv, 1, children, 2u * 64u,
+                                                    msgs, n_msgs,
+                                                    gen, 0, buf,
+                                                    STM_BTREE_ENGINE_NODE_SIZE));
+    uint64_t p = 0;
+    STM_ASSERT_OK(memstore_reserve(ms, &p));
+    STM_ASSERT_OK(stm_btree_node_encrypt(cx, p, gen, buf,
+                                          STM_BTREE_ENGINE_NODE_SIZE));
+    stm_blake3_hash h;
+    stm_blake3(buf, STM_BTREE_ENGINE_NODE_SIZE - 32u, &h);
+    memcpy(out_csum, h.bytes, 32);
+    STM_ASSERT_OK(memstore_write(ms, p, buf, STM_BTREE_ENGINE_NODE_SIZE));
+    *out_paddr = p;
+    free(buf);
+}
+
+STM_TEST(engine_msgs_persist_lookup_scan) {
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    /* Enough bulk to force an internal root. */
+    uint8_t bigval[400];
+    memset(bigval, 0xa5, sizeof bigval);
+    char kb[16];
+    for (uint32_t i = 0; i < 60; i++) {
+        snprintf(kb, sizeof kb, "key-%04u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, kb, strlen(kb),
+                                              bigval, sizeof bigval));
+    }
+    STM_ASSERT(eng->root != NULL);
+    STM_ASSERT_TRUE(!eng->root->is_leaf);
+
+    /* Attach three messages DELIBERATELY un-normalised (descending
+     * target child): eng_node_write must sort by (route, seq) — a
+     * verbatim write would fail the read-side order gate at reopen,
+     * so the green reopen below proves the normalisation. */
+    eng_msg *msgs = malloc(3 * sizeof *msgs);
+    STM_ASSERT(msgs != NULL);
+    mkmsg(&msgs[0], ENG_DELTA_INSERT, 100, "zzz-buf", "bufval-z");
+    mkmsg(&msgs[1], ENG_DELTA_DELETE, 101, "key-0005", NULL);
+    mkmsg(&msgs[2], ENG_DELTA_INSERT, 102, "aaa-buf", "bufval-a");
+    eng->root->buf_msgs  = msgs;
+    eng->root->buf_count = 3;
+    eng->root->dirty     = true;
+
+    uint64_t rp = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    stm_btree_engine_destroy(eng);
+
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         rp, 1, rc, &eng));
+
+    /* Serial lookups consult the persisted buffer (design 5.2). */
+    bool found = false; void *val = NULL; size_t vl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "zzz-buf", 7,
+                                          &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ((long long)vl, (long long)8);
+    STM_ASSERT_MEM_EQ(val, "bufval-z", 8);
+    free(val); val = NULL;
+
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "aaa-buf", 7,
+                                          &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_MEM_EQ(val, "bufval-a", 8);
+    free(val); val = NULL;
+
+    /* The buffered tombstone hides a committed leaf entry. */
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "key-0005", 8,
+                                          &found, &val, &vl));
+    STM_ASSERT_TRUE(!found);
+
+    /* An unbuffered key still descends through. */
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "key-0010", 8,
+                                          &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ((long long)vl, (long long)sizeof bigval);
+    free(val); val = NULL;
+
+    /* The concurrent lookup sees the same buffer. */
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT(me != NULL);
+    stm_ebr_enter(me);
+    assert_concurrent_matches_serial(eng, me, "zzz-buf", 7);
+    assert_concurrent_matches_serial(eng, me, "key-0005", 8);
+    assert_concurrent_matches_serial(eng, me, "key-0010", 8);
+    stm_ebr_exit(me);
+    stm_ebr_thread_free(me);
+
+    /* Scans refuse a buffered node until the chunk-8 flush teaches
+     * them to merge (fail-closed beats silently wrong results). */
+    uint64_t n_seen = 0;
+    STM_ASSERT_ERR(stm_btree_engine_scan(eng, msgs_count_cb, &n_seen),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_btree_engine_scan_range(eng, "a", 1, "z", 1,
+                                               msgs_count_cb, &n_seen),
+                   STM_ENOTSUPPORTED);
+
+    /* Verify walks the buffered root structurally clean. */
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_msgs_disorder_on_disk_rejected) {
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+
+    /* Engine-readable leaves: the shared forge_leaf writes a RAW value
+     * (its consumers only ever expect downstream ECORRUPT); the (c)
+     * control's leaf pass-through needs the engine's TAGGED value
+     * ([ENG_VAL_INLINE | bytes]), so forge them here with the tag. */
+    uint64_t lp1 = 0, lp2 = 0;
+    uint8_t  lc1[32], lc2[32];
+    {
+        uint8_t tagged_v[2] = { ENG_VAL_INLINE, 'v' };
+        stm_btnode_entry te = { .key = "k", .key_len = 1,
+                                .value = tagged_v, .value_len = 2 };
+        uint8_t *lb = calloc(1, STM_BTREE_ENGINE_NODE_SIZE);
+        STM_ASSERT(lb != NULL);
+        for (int li = 0; li < 2; li++) {
+            STM_ASSERT_OK(stm_btnode_leaf_encode(&te, 1, 3, 0, lb,
+                                                 STM_BTREE_ENGINE_NODE_SIZE));
+            uint64_t p_ = 0;
+            STM_ASSERT_OK(memstore_reserve(&ms, &p_));
+            STM_ASSERT_OK(stm_btree_node_encrypt(&cx, p_, 3, lb,
+                                                 STM_BTREE_ENGINE_NODE_SIZE));
+            stm_blake3_hash h_;
+            stm_blake3(lb, STM_BTREE_ENGINE_NODE_SIZE - 32u, &h_);
+            STM_ASSERT_OK(memstore_write(&ms, p_, lb,
+                                         STM_BTREE_ENGINE_NODE_SIZE));
+            if (li == 0) { lp1 = p_; memcpy(lc1, h_.bytes, 32); }
+            else         { lp2 = p_; memcpy(lc2, h_.bytes, 32); }
+        }
+        free(lb);
+    }
+    uint8_t children[2 * 64];
+    pack_bptr(children,      lp1, BPTR_KIND_LEAF, lc1, 3);
+    pack_bptr(children + 64, lp2, BPTR_KIND_LEAF, lc2, 3);
+
+    bool found = false; void *val = NULL; size_t vl = 0;
+    uint64_t rp = 0;
+    uint8_t  rc[32];
+    stm_btree_engine *eng = NULL;
+
+    /* (a) Descending target child ("z" routes child 1, "a" child 0). */
+    {
+        stm_btnode_msg mm[2] = {
+            { STM_BTNODE_MSG_INSERT, 1, "z", 1, "vz", 2 },
+            { STM_BTNODE_MSG_INSERT, 2, "a", 1, "va", 2 },
+        };
+        forge_internal_root_msgs(&ms, &cx, 3, children, mm, 2, &rp, rc);
+        STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                             rp, 3, rc, &eng));
+        STM_ASSERT_ERR(stm_btree_engine_lookup(eng, "k", 1,
+                                               &found, &val, &vl),
+                       STM_ECORRUPT);
+        stm_btree_engine_destroy(eng);
+    }
+
+    /* (b) Equal child, non-increasing seq. */
+    {
+        stm_btnode_msg mm[2] = {
+            { STM_BTNODE_MSG_INSERT, 5, "a", 1, "v1", 2 },
+            { STM_BTNODE_MSG_INSERT, 5, "a", 1, "v2", 2 },
+        };
+        forge_internal_root_msgs(&ms, &cx, 3, children, mm, 2, &rp, rc);
+        STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                             rp, 3, rc, &eng));
+        STM_ASSERT_ERR(stm_btree_engine_lookup(eng, "k", 1,
+                                               &found, &val, &vl),
+                       STM_ECORRUPT);
+        stm_btree_engine_destroy(eng);
+    }
+
+    /* (c) Control: the same messages correctly ordered load, resolve
+     * through the buffer, and pass through to the leaf. */
+    {
+        stm_btnode_msg mm[2] = {
+            { STM_BTNODE_MSG_INSERT, 1, "a", 1, "va", 2 },
+            { STM_BTNODE_MSG_INSERT, 2, "z", 1, "vz", 2 },
+        };
+        forge_internal_root_msgs(&ms, &cx, 3, children, mm, 2, &rp, rc);
+        STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                             rp, 3, rc, &eng));
+        STM_ASSERT_OK(stm_btree_engine_lookup(eng, "a", 1,
+                                              &found, &val, &vl));
+        STM_ASSERT_TRUE(found);
+        STM_ASSERT_MEM_EQ(val, "va", 2);
+        free(val); val = NULL;
+        STM_ASSERT_OK(stm_btree_engine_lookup(eng, "k", 1,
+                                              &found, &val, &vl));
+        STM_ASSERT_TRUE(found);            /* the forged leaf's ("k","v") */
+        STM_ASSERT_MEM_EQ(val, "v", 1);
+        free(val); val = NULL;
+        stm_btree_engine_destroy(eng);
+    }
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_msgs_split_partitions_buffer) {
+    /* The #35 internal_split class, engine edition: a split must
+     * partition buffered messages by the separator, or a message on
+     * the wrong side mis-routes past that side's pivots forever. */
+    eng_node *n = eng_node_new_internal_sized(3, 4);
+    STM_ASSERT(n != NULL);
+    STM_ASSERT_OK(eng_internal_set_pivot(n, 0, "b", 1));
+    STM_ASSERT_OK(eng_internal_set_pivot(n, 1, "d", 1));
+    STM_ASSERT_OK(eng_internal_set_pivot(n, 2, "f", 1));
+    for (uint32_t i = 0; i < 4; i++) n->children[i].is_leaf = true;
+
+    eng_msg *msgs = malloc(4 * sizeof *msgs);
+    STM_ASSERT(msgs != NULL);
+    mkmsg(&msgs[0], ENG_DELTA_INSERT, 1, "a", "v1");   /* child 0 -> left  */
+    mkmsg(&msgs[1], ENG_DELTA_INSERT, 2, "c", "v2");   /* child 1 -> left  */
+    mkmsg(&msgs[2], ENG_DELTA_DELETE, 3, "e", NULL);   /* child 2 -> right */
+    mkmsg(&msgs[3], ENG_DELTA_INSERT, 4, "g", "v4");   /* child 3 -> right */
+    n->buf_msgs  = msgs;
+    n->buf_count = 4;
+
+    eng_node *right = NULL;
+    uint8_t  *sep = NULL;
+    uint32_t  sl  = 0;
+    STM_ASSERT_OK(eng_split_internal(n, &right, &sep, &sl));
+    STM_ASSERT_EQ((long long)sl, (long long)1);
+    STM_ASSERT_MEM_EQ(sep, "d", 1);
+
+    STM_ASSERT_EQ(n->buf_count, (uint32_t)2);
+    STM_ASSERT_MEM_EQ(n->buf_msgs[0].key, "a", 1);
+    STM_ASSERT_MEM_EQ(n->buf_msgs[1].key, "c", 1);
+    STM_ASSERT_EQ(right->buf_count, (uint32_t)2);
+    STM_ASSERT_MEM_EQ(right->buf_msgs[0].key, "e", 1);
+    STM_ASSERT_MEM_EQ(right->buf_msgs[1].key, "g", 1);
+
+    free(sep);
+    eng_node_free(n);
+    eng_node_free(right);
+}
+
 STM_TEST_MAIN("btree_engine")

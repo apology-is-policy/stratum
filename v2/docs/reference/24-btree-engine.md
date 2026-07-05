@@ -237,11 +237,60 @@ fully validated even with a NULL `msg_cb`) and the legacy
 `n_buffer_used` — a buffer-unaware tree (`btree_store`'s
 flush-before-serialize contract) silently ignoring persisted messages
 would serve stale reads, so a buffered node there is corruption by
-definition. Leaves reject nonzero `n_buffer_used` outright
-(`leaf.c`). Nothing in the ENGINE writes a nonzero buffer yet — the
-eng_node adoption + capacity carve + read consult + the
-`STM_UB_VERSION 32 → 33` bump land as chunk 7b; the version bump is
-arc-approved (Thylacine `docs/CONCURRENT-FS.md` §5).
+definition. Leaves reject nonzero `n_buffer_used` outright (`leaf.c`).
+
+### The engine adoption (chunk 7b) — eng_msg, the order discipline, the carve, v33
+
+`eng_node` carries the materialised buffer as `buf_msgs[]`/`buf_count`
+(`eng_msg`: op/seq/owned key+value — the `eng_delta` vocabulary,
+static-asserted equal to the wire ops). The load-bearing pieces:
+
+- **The (target_child, seq) order discipline.** Target child is not
+  stored — it derives from routing the key through the node's pivots —
+  so the in-memory array's order can rot when a pivot splice re-routes
+  targets. Three-point discipline: `eng_split_internal` **PARTITIONS**
+  messages across the two sides by the separator (a message on the
+  wrong SIDE mis-routes past that side's pivots forever — the #35
+  internal_split class, closed here preemptively);
+  `eng_node_write` **NORMALISES** (stable in-place insertion sort by
+  current routing; design §5.2's sort step) before encoding; and
+  `eng_node_read` **VALIDATES** at the trust boundary
+  (`btnode_io.c::msgs_validate_order` — ascending child, seq strictly
+  increasing within a child; disorder on disk is `STM_ECORRUPT`).
+- **The read consult** (`engine.c::buffer_resolve_for_key`): both
+  lookups — serial and `_concurrent` — consult a node's buffer between
+  the delta chain (seqs strictly greater, §5.2) and the pivot descent.
+  Deliberately ORDER-INDEPENDENT (max-seq match), so in-memory rot is
+  harmless to reads. Newest wins: INSERT resolves, DELETE hides.
+- **Scans refuse buffered nodes** (`STM_ENOTSUPPORTED`) until the
+  chunk-8 flush teaches them to merge — fail-closed beats silently
+  omitting/resurrecting keys. Unreachable in production before chunk 9
+  (no writer); pinned by `engine_msgs_persist_lookup_scan`.
+- **The ε carve**: internal pivot/child bytes budget against
+  `ENG_INTERNAL_PC_CAP` (= payload − region/4) at the post-splice check
+  and the split-point chooser, so a full buffer can never displace the
+  split-bound proofs' pivot capacity. Pre-9.8 nodes packed past the
+  carve split on their next mutation.
+- **STM_UB_VERSION 32 → 33** with the FIRST ranged mount gate:
+  `[STM_UB_VERSION_MIN_COMPAT=32, 33]` mounts (upgrade-on-mount — a
+  v32 pool's buffer regions are all zero; it stamps v33 at its next
+  commit), older/newer refuses (`sb/uberblock.c`). Arc-approved
+  (Thylacine `docs/CONCURRENT-FS.md` §5). Pinned by
+  `pool_mount_accepts_v32_ub_upgrade_window` /
+  `pool_mount_refuses_v34_ub_from_the_future`.
+- **Verify** (`eng_verify_subtree`) decodes buffer-aware (structural
+  validation; NULL msg_cb) — the ORDER gate lives on the load path,
+  which every descent and `eng_collect_paddrs` inherit; the streaming
+  verify walker keeps no pivot array to route against (a chunk-8
+  candidate extension).
+
+Tests: `engine_msgs_persist_lookup_scan` (inject un-normalised →
+commit → reopen → serial+concurrent consults + tombstone +
+scan-refusal + verify), `engine_msgs_disorder_on_disk_rejected` (two
+forged-disorder variants ECORRUPT at the read gate + an ordered
+control that resolves through the buffer AND passes through to a
+tagged leaf), `engine_msgs_split_partitions_buffer` (the #35-class
+partition).
 
 ### Node cache
 

@@ -524,7 +524,21 @@ extern "C" {
  *
  * See `v2/docs/phase-9.7-design.md` §3.1 / §3.3 + §4 + §5 for the
  * staging. */
-#define STM_UB_VERSION        32u
+#define STM_UB_VERSION        33u
+
+/* 9.8-BE-format (chunk 7b; STM_UB_VERSION 32 -> 33): internal btree-
+ * engine nodes may carry a persisted Be message region (n_buffer_used
+ * becomes load-bearing). The extension is strictly additive, so
+ * UPGRADE-ON-MOUNT applies for the first time: a pool at
+ * STM_UB_VERSION_MIN_COMPAT (v32 -- every internal node's buffer
+ * region is zero) mounts under this binary and becomes v33 at its
+ * next commit (sync stamps STM_UB_VERSION). No downgrade: a
+ * v33-written buffered node would be rejected by a v32 binary's
+ * equality gate (and silently mis-read by anything older that ignored
+ * the field -- which is why the bump is real even though the format
+ * is additive). Pre-release; no converter. The bump is arc-approved
+ * (Thylacine docs/CONCURRENT-FS.md section 5, user 2026-07-05). */
+#define STM_UB_VERSION_MIN_COMPAT  32u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

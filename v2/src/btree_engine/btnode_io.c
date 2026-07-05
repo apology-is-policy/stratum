@@ -399,10 +399,58 @@ stm_status eng_node_write(stm_btree_engine *eng, eng_node *n, uint64_t gen)
                               n->children[i].csum,
                               blob + (size_t)i * STM_BTNODE_CHILD_BPTR_SIZE);
         }
-        s = stm_btnode_internal_encode(pivs, np, blob,
+
+        /* 9.8-BE (chunk 7b): NORMALISE the message buffer before
+         * encoding — design 5.2's sort step. A pivot splice since the
+         * messages were materialised can have re-routed targets, so
+         * the in-memory array order is not trustworthy; the on-disk
+         * order (target_child, seq) is normative. Stable insertion
+         * sort IN PLACE (n->buf_msgs then mirrors the disk bytes) over
+         * a per-message routing scratch; buf_count is bounded by the
+         * region cap (~tens), so O(n^2) is noise. */
+        stm_btnode_msg *wm = NULL;
+        if (n->buf_count) {
+            uint32_t *route = malloc((size_t)n->buf_count * sizeof *route);
+            wm = malloc((size_t)n->buf_count * sizeof *wm);
+            if (!route || !wm) {
+                free(route); free(wm);
+                free(pivs); free(blob); free(buf);
+                return STM_ENOMEM;
+            }
+            for (uint32_t i = 0; i < n->buf_count; i++)
+                route[i] = eng_pivot_child_for(n, n->buf_msgs[i].key,
+                                               n->buf_msgs[i].key_len);
+            for (uint32_t i = 1; i < n->buf_count; i++) {
+                eng_msg  mv = n->buf_msgs[i];
+                uint32_t rv = route[i];
+                uint32_t j  = i;
+                while (j > 0 &&
+                       (route[j - 1u] > rv ||
+                        (route[j - 1u] == rv &&
+                         n->buf_msgs[j - 1u].seq > mv.seq))) {
+                    n->buf_msgs[j] = n->buf_msgs[j - 1u];
+                    route[j]       = route[j - 1u];
+                    j--;
+                }
+                n->buf_msgs[j] = mv;
+                route[j]       = rv;
+            }
+            free(route);
+            for (uint32_t i = 0; i < n->buf_count; i++) {
+                wm[i].op        = n->buf_msgs[i].op;
+                wm[i].seq       = n->buf_msgs[i].seq;
+                wm[i].key       = n->buf_msgs[i].key;
+                wm[i].key_len   = n->buf_msgs[i].key_len;
+                wm[i].value     = n->buf_msgs[i].value;
+                wm[i].value_len = n->buf_msgs[i].value_len;
+            }
+        }
+        s = stm_btnode_internal_encode_msgs(pivs, np, blob,
                                        (size_t)nc * STM_BTNODE_CHILD_BPTR_SIZE,
+                                       wm, n->buf_count,
                                        gen, eng->tree_id,
                                        buf, STM_BTREE_ENGINE_NODE_SIZE);
+        free(wm);
         free(pivs);
         free(blob);
         if (s != STM_OK) { free(buf); return s; }
@@ -507,7 +555,75 @@ static int leaf_load_cb(const void *key, size_t key_len,
 typedef struct {
     eng_node  *node;
     stm_status err;
+    /* 9.8-BE (chunk 7b): the message collector. Grown by doubling;
+     * ownership transfers to node->buf_msgs on success; freed by the
+     * read error path otherwise. */
+    eng_msg   *msgs;
+    uint32_t   n_msgs;
+    uint32_t   msgs_cap;
 } internal_load_ctx;
+
+static int msg_load_cb(uint8_t op, uint64_t seq,
+                        const void *key, size_t key_len,
+                        const void *value, size_t value_len,
+                        uint32_t idx, void *ctx_)
+{
+    internal_load_ctx *c = ctx_;
+    (void)idx;
+    if (c->n_msgs == c->msgs_cap) {
+        uint32_t ncap = c->msgs_cap ? c->msgs_cap * 2u : 8u;
+        eng_msg *g = realloc(c->msgs, (size_t)ncap * sizeof *g);
+        if (!g) { c->err = STM_ENOMEM; return 1; }
+        c->msgs = g;
+        c->msgs_cap = ncap;
+    }
+    eng_msg *m = &c->msgs[c->n_msgs];
+    memset(m, 0, sizeof *m);
+    m->op  = op;
+    m->seq = seq;
+    if (key_len) {
+        m->key = malloc(key_len);
+        if (!m->key) { c->err = STM_ENOMEM; return 1; }
+        memcpy(m->key, key, key_len);
+    }
+    m->key_len = (uint32_t)key_len;
+    if (value_len) {
+        m->value = malloc(value_len);
+        if (!m->value) { free(m->key); m->key = NULL;
+                         c->err = STM_ENOMEM; return 1; }
+        memcpy(m->value, value, value_len);
+    }
+    m->value_len = (uint32_t)value_len;
+    c->n_msgs++;
+    return 0;
+}
+
+/*
+ * Order validation at the trust boundary (9.8-BE chunk 7b): the wire
+ * region must be ascending (target_child, seq), seq strictly
+ * increasing within one child. The codec cannot validate this — it
+ * cannot route keys — so it happens here, with the node's pivots fully
+ * built. Disorder on disk mis-routes flushes (the #35 class), so it is
+ * corruption, not tolerated-and-resorted.
+ */
+static stm_status msgs_validate_order(const eng_node *n,
+                                       const eng_msg *msgs, uint32_t count)
+{
+    uint32_t prev_child = 0;
+    uint64_t prev_seq   = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t child = eng_pivot_child_for(n, msgs[i].key,
+                                             msgs[i].key_len);
+        if (i > 0) {
+            if (child < prev_child) return STM_ECORRUPT;
+            if (child == prev_child && msgs[i].seq <= prev_seq)
+                return STM_ECORRUPT;
+        }
+        prev_child = child;
+        prev_seq   = msgs[i].seq;
+    }
+    return STM_OK;
+}
 
 static int pivot_load_cb(const void *key, size_t key_len,
                           uint32_t idx, void *ctx_)
@@ -580,11 +696,26 @@ stm_status eng_node_read(stm_btree_engine *eng,
         n = eng_node_new_internal_sized(np, np + 1u);
         if (!n) { free(buf); return STM_ENOMEM; }
         internal_load_ctx ic = { .node = n, .err = STM_OK };
-        s = stm_btnode_internal_decode(buf, STM_BTREE_ENGINE_NODE_SIZE, NULL,
-                                       pivot_load_cb, child_load_cb, &ic);
+        s = stm_btnode_internal_decode_msgs(buf, STM_BTREE_ENGINE_NODE_SIZE,
+                                            NULL,
+                                            pivot_load_cb, child_load_cb,
+                                            msg_load_cb, &ic);
         if (s == STM_OK) s = ic.err;
-        if (s != STM_OK) { eng_node_free(n); free(buf); return s; }
+        if (s != STM_OK) {
+            eng_msg_array_free(ic.msgs, ic.n_msgs);
+            eng_node_free(n); free(buf); return s;
+        }
         n->n_pivots = np;
+        /* 9.8-BE (chunk 7b): order validation needs the pivots built
+         * (routing); attach the buffer only after it passes, so
+         * eng_node_free never double-frees the collector's array. */
+        s = msgs_validate_order(n, ic.msgs, ic.n_msgs);
+        if (s != STM_OK) {
+            eng_msg_array_free(ic.msgs, ic.n_msgs);
+            eng_node_free(n); free(buf); return s;
+        }
+        n->buf_msgs  = ic.msgs;
+        n->buf_count = ic.n_msgs;
     }
     free(buf);
 
@@ -757,8 +888,15 @@ stm_status eng_verify_subtree(stm_btree_engine *eng,
         return STM_ENOMEM;
     }
 
-    s = stm_btnode_internal_decode(buf, STM_BTREE_ENGINE_NODE_SIZE, NULL,
-                                   verify_pivot_cb, verify_child_cb, &cc);
+    /* 9.8-BE (chunk 7b): buffer-aware decode — the message region is
+     * structurally validated (NULL msg_cb skips enumeration only).
+     * The (target_child, seq) ORDER gate lives on the LOAD path
+     * (eng_node_read::msgs_validate_order), which every descent — and
+     * eng_collect_paddrs — inherits; this streaming walker keeps no
+     * pivot array to route against. */
+    s = stm_btnode_internal_decode_msgs(buf, STM_BTREE_ENGINE_NODE_SIZE, NULL,
+                                   verify_pivot_cb, verify_child_cb,
+                                   NULL, &cc);
     if (s == STM_OK) s = cc.pchk.err;          /* pivots strictly sorted */
     if (s == STM_OK) s = cc.err;
     free(cc.pchk.prev);

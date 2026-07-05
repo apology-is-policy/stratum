@@ -395,12 +395,11 @@ STM_TEST(dirent_arg_validation) {
 /* test_fs.                                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(dirent_ub_version_is_v32) {
-    /* 9.7-impl-3 bumped STM_UB_VERSION 31 → 32 for the snap-record
-     * tree-root triple (root_gen + root_csum). The dirent layer's
-     * on-disk format is unchanged since v25 but rides the latest
-     * version constant. */
-    STM_ASSERT_EQ(STM_UB_VERSION, 32u);
+STM_TEST(dirent_ub_version_is_v33) {
+    /* 9.8-BE-format (chunk 7b) bumped STM_UB_VERSION 32 → 33 for the
+     * internal-node message buffers. The dirent layer's on-disk format
+     * is unchanged since v25 but rides the latest version constant. */
+    STM_ASSERT_EQ(STM_UB_VERSION, 33u);
 }
 
 /* R73 P2-1: stm_dirent_drop_for_dir bulk-removes every record keyed

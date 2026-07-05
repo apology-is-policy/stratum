@@ -668,12 +668,12 @@ STM_TEST(xattr_op_without_attach_refused) {
 /* Compile-time invariants.                                            */
 /* ------------------------------------------------------------------ */
 
-STM_TEST(xattr_ub_version_is_v32) {
-    /* 9.7-impl-3 bumps STM_UB_VERSION 31 → 32 for the snap-record
-     * tree-root triple (root_gen + root_csum). The xattr layer's
-     * on-disk value format is unchanged since v26 but rides the
-     * latest version constant. */
-    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)32u);
+STM_TEST(xattr_ub_version_is_v33) {
+    /* 9.8-BE-format (chunk 7b) bumps STM_UB_VERSION 32 → 33 for the
+     * internal-node message buffers. The xattr layer's on-disk value
+     * format is unchanged since v26 but rides the latest version
+     * constant. */
+    STM_ASSERT_EQ((unsigned)STM_UB_VERSION, (unsigned)33u);
 }
 
 /* ------------------------------------------------------------------ */

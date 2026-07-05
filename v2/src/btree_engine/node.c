@@ -171,11 +171,22 @@ static void node_drain_chain(eng_node *n)
     }
 }
 
+void eng_msg_array_free(eng_msg *msgs, uint32_t n)
+{
+    if (!msgs) return;
+    for (uint32_t i = 0; i < n; i++) {
+        free(msgs[i].key);
+        free(msgs[i].value);
+    }
+    free(msgs);
+}
+
 void eng_node_free(eng_node *n)
 {
     if (!n) return;
     node_drain_chain(n);
     pthread_mutex_destroy(&n->flush_mu);
+    eng_msg_array_free(n->buf_msgs, n->buf_count);
     for (uint32_t i = 0; i < n->n_entries; i++) {
         free(n->entries[i].key);
         free(n->entries[i].val);
@@ -545,7 +556,10 @@ stm_status eng_split_internal(eng_node *n, eng_node **out_right,
         size_t L = pc[s] + (size_t)(s + 1u) * STM_BTNODE_CHILD_BPTR_SIZE;
         size_t R = (pc[m] - pc[s + 1u]) +
                    (size_t)(m - s) * STM_BTNODE_CHILD_BPTR_SIZE;
-        if (L > ENG_PAYLOAD_CAP || R > ENG_PAYLOAD_CAP) continue;
+        /* 9.8-BE (chunk 7b): split products must fit the CARVED
+         * pivot/child budget (payload minus the epsilon buffer region),
+         * so a future full buffer can never wedge a just-split node. */
+        if (L > ENG_INTERNAL_PC_CAP || R > ENG_INTERNAL_PC_CAP) continue;
         size_t d = (L > R) ? (L - R) : (R - L);
         if (!found || d < best_diff) {
             found = true;
@@ -561,17 +575,43 @@ stm_status eng_split_internal(eng_node *n, eng_node **out_right,
     uint32_t r_nc = m - s;           /* = r_np + 1 */
     uint32_t sl   = n->pivots[s].key_len;
 
+    /* 9.8-BE (chunk 7b): PARTITION the message buffer by the separator
+     * — a message keyed < sep belongs to the left side, >= sep to the
+     * right (== routes right: the separator is extracted, and child
+     * s+1 — the right side's child 0 — covers [sep, next)). Leaving a
+     * message on the wrong SIDE mis-routes it past that side's pivots
+     * forever: the #35 internal_split data-loss class, closed here
+     * preemptively before any production writer exists. The stable
+     * partition preserves per-side (target_child, seq) order.
+     * Allocate-early / commit-late: an ENOMEM here fails the split
+     * with n untouched. */
+    eng_msg *lm = NULL, *rm = NULL;
+    uint32_t lm_n = 0, rm_n = 0;
+    if (n->buf_count) {
+        lm = malloc((size_t)n->buf_count * sizeof *lm);
+        rm = malloc((size_t)n->buf_count * sizeof *rm);
+        if (!lm || !rm) { free(lm); free(rm); return STM_ENOMEM; }
+        for (uint32_t i = 0; i < n->buf_count; i++) {
+            const eng_msg *msg = &n->buf_msgs[i];
+            if (eng_key_cmp(msg->key, msg->key_len,
+                            n->pivots[s].key, sl) < 0)
+                lm[lm_n++] = *msg;           /* struct copy; heap moves */
+            else
+                rm[rm_n++] = *msg;
+        }
+    }
+
     eng_node *r = eng_node_new_internal();
-    if (!r) return STM_ENOMEM;
+    if (!r) { free(lm); free(rm); return STM_ENOMEM; }
 
     uint8_t *sk = NULL;
     stm_status st = eng_dup(n->pivots[s].key, sl, &sk);
-    if (st != STM_OK) { eng_node_free(r); return st; }
+    if (st != STM_OK) { free(lm); free(rm); eng_node_free(r); return st; }
 
     eng_pivot *rp = malloc((size_t)r_np * sizeof *rp);
-    if (!rp) { free(sk); eng_node_free(r); return STM_ENOMEM; }
+    if (!rp) { free(lm); free(rm); free(sk); eng_node_free(r); return STM_ENOMEM; }
     eng_child *rc = malloc((size_t)r_nc * sizeof *rc);
-    if (!rc) { free(rp); free(sk); eng_node_free(r); return STM_ENOMEM; }
+    if (!rc) { free(lm); free(rm); free(rp); free(sk); eng_node_free(r); return STM_ENOMEM; }
 
     /* Infallible: move the right half. Pivot key-pointer ownership and
      * child slots (no owned heap) transfer to r. */
@@ -586,6 +626,19 @@ stm_status eng_split_internal(eng_node *n, eng_node **out_right,
 
     free(n->pivots[s].key);          /* separator extracted into sk */
     n->n_pivots = s;                 /* left keeps [0, s) pivots, [0, s] kids */
+
+    /* Install the partitioned buffers (infallible from here). The old
+     * array is freed WITHOUT its heap (key/value ownership moved into
+     * lm/rm by the struct copies above). */
+    if (n->buf_count) {
+        free(n->buf_msgs);
+        n->buf_msgs  = lm_n ? lm : NULL;
+        n->buf_count = lm_n;
+        if (!lm_n) free(lm);
+        r->buf_msgs  = rm_n ? rm : NULL;
+        r->buf_count = rm_n;
+        if (!rm_n) free(rm);
+    }
 
     *out_right   = r;
     *out_sep_key = sk;

@@ -491,7 +491,8 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
      * restated here so a future version bump that forgets to
      * update this test fails loudly. */
     STM_ASSERT_EQ(stm_load_le32(ub.ub_version), STM_UB_VERSION);
-    STM_ASSERT_EQ(STM_UB_VERSION, 32u);  /* 9.7-impl-3 snap-record tree-root triple v31 → v32 */
+    STM_ASSERT_EQ(STM_UB_VERSION, 33u);  /* 9.8-BE-format message buffers v32 → v33 (chunk 7b) */
+    STM_ASSERT_EQ(STM_UB_VERSION_MIN_COMPAT, 32u);  /* upgrade-on-mount floor */
 
     /* Roster fields are populated. */
     STM_ASSERT_EQ(stm_load_le16(ub.ub_device_count), 1u);
@@ -628,6 +629,14 @@ static void format_and_tamper_live_ub(const char *keyfile, ub_mutate_fn mutate)
     stm_bdev_close(d);
 }
 
+static void mutate_version_to_32(stm_uberblock *ub) {
+    ub->ub_version = stm_store_le32(32u);
+}
+
+static void mutate_version_to_34(stm_uberblock *ub) {
+    ub->ub_version = stm_store_le32(34u);
+}
+
 static void mutate_version_to_4(stm_uberblock *ub) {
     ub->ub_version = stm_store_le32(4u);
 }
@@ -655,6 +664,52 @@ static void mutate_device_count_to_over_cap(stm_uberblock *ub) {
 static void mutate_device_id_out_of_range(stm_uberblock *ub) {
     /* count stays 1 (set at format); bump id to 5 — out of range. */
     ub->ub_device_id = stm_store_le16(5);
+}
+
+/* 9.8-BE (chunk 7b): the FIRST upgrade-on-mount window. A v32 pool
+ * (every internal node's buffer region zero — the strictly-additive
+ * claim) MOUNTS under the v33 binary; the ranged gate
+ * [STM_UB_VERSION_MIN_COMPAT, STM_UB_VERSION] replaces the old
+ * equality. A version PAST the binary's still refuses. */
+STM_TEST(pool_mount_accepts_v32_ub_upgrade_window) {
+    make_tmp("v32_ub");
+    char kf[256];
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_v32_kf_%d.bin", (int)getpid());
+    unlink(kf);
+    make_keyfile(kf);
+
+    format_and_tamper_live_ub(kf, mutate_version_to_32);
+
+    stm_fs_mount_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.keyfile_path = kf;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT(fs != NULL);
+    stm_fs_unmount(fs);
+
+    unlink(g_tmp_path);
+    unlink(kf);
+}
+
+STM_TEST(pool_mount_refuses_v34_ub_from_the_future) {
+    make_tmp("v34_ub");
+    char kf[256];
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_v34_kf_%d.bin", (int)getpid());
+    unlink(kf);
+    make_keyfile(kf);
+
+    format_and_tamper_live_ub(kf, mutate_version_to_34);
+
+    stm_fs_mount_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.keyfile_path = kf;
+    stm_fs *fs = NULL;
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_EBADVERSION);
+    STM_ASSERT(fs == NULL);
+
+    unlink(g_tmp_path);
+    unlink(kf);
 }
 
 /* R13 P2-1 / P3-5 #2: every ring slot at an incompatible version

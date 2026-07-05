@@ -61,6 +61,13 @@ static void pending_free_paddrs(stm_btree_engine *eng,
  * eng->root + eng->mvcc_root; forward-declared so stm_btree_engine_open
  * can eager-warm post-engine_alloc. Defined in the Node loading section. */
 static stm_status load_root(stm_btree_engine *eng, eng_node **out);
+/* 9.8-BE (chunk 7b): the on-disk-buffer read consult — defined with the
+ * concurrent-lookup block; the serial lookup above it also calls it. */
+static stm_status buffer_resolve_for_key(const eng_node *n,
+                                          const void *key, size_t key_len,
+                                          uint32_t *out_kind,
+                                          void **out_value,
+                                          size_t *out_value_len);
 
 /* ========================================================================= */
 /* Lifecycle.                                                                  */
@@ -370,7 +377,11 @@ static stm_status node_insert(stm_btree_engine *eng, eng_node *node,
 
     if (cs.happened) {
         eng_internal_splice(node, idx, cs.sep_key, cs.sep_len, cs.right);
-        if (eng_internal_payload_bytes(node) > ENG_PAYLOAD_CAP) {
+        /* 9.8-BE (chunk 7b): internal pivot/child bytes budget against
+         * the CARVED cap (payload minus the ε buffer region, §5.3) so
+         * a full buffer can never displace pivot capacity. Pre-9.8
+         * nodes packed past the carve split here on first touch. */
+        if (eng_internal_payload_bytes(node) > ENG_INTERNAL_PC_CAP) {
             s = eng_split_internal(node, &out_split->right,
                                    &out_split->sep_key, &out_split->sep_len);
             if (s != STM_OK) return s;     /* node left over-cap but complete */
@@ -473,6 +484,17 @@ static stm_status engine_lookup_locked(stm_btree_engine *eng,
 
     for (uint32_t depth = 0; !node->is_leaf; depth++) {
         if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+        /* 9.8-BE (chunk 7b): a persisted message on the descent path
+         * resolves the key before the leaf does (newest-wins; the
+         * design-§5.2 read protocol). Serial lookups see buffered
+         * nodes exactly like concurrent ones — a node read from disk
+         * carries its buffer regardless of which path reads it. */
+        uint32_t bkind = 0;
+        s = buffer_resolve_for_key(node, key, key_len, &bkind,
+                                   out_value, out_value_len);
+        if (s != STM_OK) return s;
+        if (bkind == ENG_DELTA_INSERT) { *out_found = true;  return STM_OK; }
+        if (bkind == ENG_DELTA_DELETE) { *out_found = false; return STM_OK; }
         uint32_t idx = eng_pivot_child_for(node, key, key_len);
         s = load_child(eng, node, idx, &node);
         if (s != STM_OK) return s;
@@ -570,6 +592,50 @@ static stm_status chain_resolve_for_key(const eng_node *n,
     return STM_OK;                          /* miss — chain has no msg */
 }
 
+/*
+ * 9.8-BE (chunk 7b): consult an internal node's DECODED on-disk
+ * message buffer for `key` — the design-§5.2 read step between the
+ * chain (whose seqs are strictly greater by construction) and the
+ * pivot descent. Same out contract as chain_resolve_for_key.
+ *
+ * Deliberately ORDER-INDEPENDENT (tracks the max-seq match) — the
+ * in-memory array's order can rot when a pivot splice re-routes
+ * targets (the on-disk order is re-normalised at eng_node_write), so
+ * the resolver must not lean on it. buf_count is bounded by the
+ * region cap (~tens); a linear pass matches the §5.5 read budget.
+ */
+static stm_status buffer_resolve_for_key(const eng_node *n,
+                                          const void *key, size_t key_len,
+                                          uint32_t *out_kind,
+                                          void **out_value,
+                                          size_t *out_value_len)
+{
+    *out_kind = 0;
+    const eng_msg *best = NULL;
+    for (uint32_t i = 0; i < n->buf_count; i++) {
+        const eng_msg *m = &n->buf_msgs[i];
+        if (eng_key_cmp(m->key, m->key_len, key, key_len) != 0) continue;
+        if (!best || m->seq > best->seq) best = m;
+    }
+    if (!best) return STM_OK;
+    if (best->op == ENG_DELTA_DELETE) {
+        *out_kind = ENG_DELTA_DELETE;
+        return STM_OK;
+    }
+    *out_kind = ENG_DELTA_INSERT;
+    if (best->value_len) {
+        void *v = malloc(best->value_len);
+        if (!v) return STM_ENOMEM;
+        memcpy(v, best->value, best->value_len);
+        *out_value     = v;
+        *out_value_len = best->value_len;
+    } else {
+        *out_value     = NULL;
+        *out_value_len = 0;
+    }
+    return STM_OK;
+}
+
 stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
                                                stm_ebr_thread *ebr,
                                                const void *key, size_t key_len,
@@ -648,6 +714,20 @@ stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
         if (s != STM_OK) return s;
         if (kind == ENG_DELTA_INSERT) { *out_found = true;  return STM_OK; }
         if (kind == ENG_DELTA_DELETE) { *out_found = false; return STM_OK; }
+
+        /* 9.8-BE (chunk 7b): the on-disk buffer sits BELOW the chain
+         * (chain seqs strictly greater by construction, §5.2) and
+         * ABOVE the descent. Reader-safety under EBR: buf_msgs is
+         * immutable on a clean resident node (only eng_node_write
+         * re-normalises it, on a DIRTY node under the writer's
+         * exclusion; the flush that drains it is chunk 8, which runs
+         * under commit_mu + COW). */
+        uint32_t bkind = 0;
+        s = buffer_resolve_for_key(node, key, key_len, &bkind,
+                                   out_value, out_value_len);
+        if (s != STM_OK) return s;
+        if (bkind == ENG_DELTA_INSERT) { *out_found = true;  return STM_OK; }
+        if (bkind == ENG_DELTA_DELETE) { *out_found = false; return STM_OK; }
 
         uint32_t idx = eng_pivot_child_for(node, key, key_len);
         s = load_child(eng, node, idx, &node);
@@ -1362,6 +1442,14 @@ static stm_status scan_node(stm_btree_engine *eng, eng_node *node,
         return STM_OK;
     }
 
+    /* 9.8-BE (chunk 7b): scans do not merge buffered messages yet —
+     * that lands with the chunk-8 flush (which also gives scan the
+     * flush-on-path option). Until then a buffered node on a scan
+     * path REFUSES rather than silently omitting/resurrecting keys.
+     * No production writer exists before chunk 9, so this is
+     * unreachable outside crafted tests. */
+    if (node->buf_count) return STM_ENOTSUPPORTED;
+
     uint32_t nc = node->n_pivots + 1u;
     for (uint32_t i = 0; i < nc; i++) {
         eng_node *child = NULL;
@@ -1425,6 +1513,11 @@ static stm_status scan_range_node(stm_btree_engine *eng, eng_node *node,
         }
         return STM_OK;
     }
+
+    /* 9.8-BE (chunk 7b): same refusal as scan_node — range scans do
+     * not merge buffered messages until the chunk-8 flush lands.
+     * Covers the concurrent walker too (it reuses this body). */
+    if (node->buf_count) return STM_ENOTSUPPORTED;
 
     uint32_t c_lo = eng_pivot_child_for(node, lo, lo_len);
     uint32_t c_hi = eng_pivot_child_for(node, hi, hi_len);

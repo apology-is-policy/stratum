@@ -131,6 +131,58 @@ struct eng_delta {
     eng_delta    *next;             /* LIFO — newest at chain head */
 };
 
+/* ========================================================================= */
+/* Decoded on-disk message buffer (9.8-BE-format, chunk 7b).                   */
+/* ========================================================================= */
+
+/*
+ * The materialised form of an internal node's persisted Bε message
+ * region (design §3.1/§5.2). DISTINCT from the delta chain: the chain
+ * is RAM-only pending mutations (seqs strictly greater than every
+ * buffered seq by construction); this array mirrors the on-disk
+ * region — committed messages not yet flushed to children.
+ *
+ * Order invariant: ascending (target_child, seq), seq strictly
+ * increasing within one child. Target child is NOT stored — it derives
+ * from routing `key` through the node's pivots — so the order can rot
+ * IN MEMORY when a pivot splice re-routes targets. The discipline:
+ *   - eng_split_internal PARTITIONS messages across the two sides by
+ *     the separator (a message on the wrong SIDE mis-routes forever —
+ *     the #35 internal_split lesson applied preemptively);
+ *   - eng_node_write NORMALISES (stable-sorts by current routing)
+ *     before encoding (design §5.2 flush step 2's sort);
+ *   - eng_node_read VALIDATES the order (the trust boundary; disorder
+ *     on disk is STM_ECORRUPT).
+ *
+ * Ownership: key/value heap owned by the message; freed by
+ * eng_msg_array_free from eng_node_free (and the btnode_io read
+ * failure paths).
+ */
+typedef struct {
+    uint8_t   op;               /* the ENG_DELTA_* vocabulary (== wire) */
+    uint64_t  seq;              /* <= STM_BTNODE_MSG_SEQ_MAX */
+    uint8_t  *key;              /* owned; NULL iff key_len == 0 */
+    uint32_t  key_len;
+    uint8_t  *value;            /* owned; INSERT only */
+    uint32_t  value_len;
+} eng_msg;
+
+_Static_assert(ENG_DELTA_INSERT == STM_BTNODE_MSG_INSERT,
+               "eng_msg op vocabulary must match the wire");
+_Static_assert(ENG_DELTA_DELETE == STM_BTNODE_MSG_DELETE,
+               "eng_msg op vocabulary must match the wire");
+
+void eng_msg_array_free(eng_msg *msgs, uint32_t n);
+
+/* The ε = 1/4 capacity carve (design §5.3): an internal node's
+ * pivot/child bytes are budgeted against the NON-buffer 3/4 of the
+ * payload, so a full buffer can never displace the split-bound
+ * proofs' pivot capacity. Nodes from pre-9.8 pools may exceed this
+ * (they packed to the full cap); they split on their next mutation. */
+#define ENG_BUFFER_REGION_MAX \
+    STM_BTNODE_BUFFER_REGION_MAX(STM_BTREE_ENGINE_NODE_SIZE)
+#define ENG_INTERNAL_PC_CAP   (ENG_PAYLOAD_CAP - ENG_BUFFER_REGION_MAX)
+
 /*
  * Out-of-line state for a spilled leaf value. NULL on an eng_entry
  * whose value fits inline. `eng_entry.val` ALWAYS holds the full
@@ -246,6 +298,13 @@ struct eng_node {
     _Atomic(eng_delta *)  chain_head;
     pthread_mutex_t       flush_mu;
     _Atomic(uint32_t)     chain_depth;
+
+    /* 9.8-BE-format (chunk 7b): the decoded on-disk message buffer
+     * (internal nodes only; see the eng_msg block above). Owned by the
+     * node; freed by eng_node_free. Empty (NULL/0) on every node until
+     * a flush (chunk 8) or a buffered read materialises one. */
+    eng_msg  *buf_msgs;
+    uint32_t  buf_count;
 };
 
 /* ========================================================================= */

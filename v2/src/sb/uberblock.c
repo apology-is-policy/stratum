@@ -64,7 +64,12 @@ stm_status stm_ub_decode(const void *buf, size_t buf_len, stm_uberblock *out_ub)
     uint64_t magic = stm_load_le64(on_disk->ub_magic);
     if (magic != STM_UB_MAGIC) return STM_ENOENT;
     uint32_t version = stm_load_le32(on_disk->ub_version);
-    if (version != STM_UB_VERSION) return STM_EBADVERSION;
+    /* 9.8-BE (chunk 7b): ranged gate — the first upgrade-on-mount
+     * window. [MIN_COMPAT, STM_UB_VERSION] mounts; the pool is
+     * stamped STM_UB_VERSION at its next commit (sync.c). Anything
+     * older or newer refuses as before. */
+    if (version < STM_UB_VERSION_MIN_COMPAT || version > STM_UB_VERSION)
+        return STM_EBADVERSION;
 
     /* R14 P3-3: ub_gen == 0 is not a valid committed UB. The first
      * durable UB a pool ever writes is at gen=1 (fresh first commit
