@@ -232,8 +232,8 @@ size_t eng_msgs_region_bytes(const eng_msg *msgs, uint32_t n);
  * (R172 F5). -1 = disabled (production steady state; one relaxed load
  * on cold paths). A test stores N >= 0: the (N+1)-th allocation
  * through eng_buf_alloc / eng_buf_realloc returns NULL. Hooked sites
- * are ONLY the Bε buffer machinery (split partition, flush append) —
- * this is not a general malloc shim.
+ * are ONLY the Bε buffer machinery (the split partition, the flush
+ * append, the peel-vector push) — this is not a general malloc shim.
  */
 extern _Atomic(int) eng_test_oom_countdown;
 void *eng_buf_alloc(size_t sz);

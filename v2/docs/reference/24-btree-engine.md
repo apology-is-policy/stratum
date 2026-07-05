@@ -345,17 +345,28 @@ message by routing at delivery time:
 child-flush splices), so a single `split_result` cannot carry the
 outcome. Instead the over-cap check runs after EVERY splice
 (`flush_eager_split`) — each `eng_split_internal` call therefore sees
-a total at most one splice past the cap, inside the chooser's proven
-`<= 2 × PC_CAP − max_pivot` envelope (the R172 F4 argument's safe
-region), so the `STM_ERANGE` no-cut arm stays unreachable for every
-producible tree. Peeled siblings accumulate in an `eng_split_vec`
-(disjoint ascending ranges at the flushed node's level), and
-mid-flush message routing goes through the FAMILY — the node plus its
-peels so far (`flush_family_route`: the member with the largest
-separator `<= key` covers the key; `key == sep` routes to the peel,
-matching the split partition's `>= sep → right`). Child-level peels
-splice into the family at their routed position
-(`flush_absorb_peel`), each splice followed by the eager re-check.
+a total at most one splice past the cap, so the `STM_ERANGE` no-cut
+arm stays unreachable for every producible tree. **The band argument
+(R173 F3 — this is NOT covered by R172 F4's 4/3 × PC_CAP middle-cut
+proof; the eager worst case is `PC_CAP + max-splice ≈ 17.6 KiB >
+16.2 KiB):** for a total `T <= 2 × PC_CAP − S_max` (`S_max` = the
+largest prefix-sum step, ≈ 4 + max_key + BPTR ≈ 5.4 KiB; the bound ≈
+18.9 KiB covers the eager case), a cut `s` is feasible iff `L(s) ∈
+[T′ − PC_CAP, PC_CAP]` — a band of width `2 × PC_CAP − T′ >= S_max`,
+wider than any single step of the monotone prefix sum, so the sweep
+cannot jump over it; `L` at the first cut is `<= 4 + max_key + 2 ×
+BPTR <= PC_CAP` (never starts infeasibly high) and `R` at the last
+cut is bounded the same way (never ends infeasibly low), so some cut
+lands inside the band; the degenerate `m == 3` has both halves
+`<= 4 + max_key + 2 × BPTR` unconditionally. Peeled siblings
+accumulate in an `eng_split_vec` (disjoint ascending ranges at the
+flushed node's level), and mid-flush message routing goes through the
+FAMILY — the node plus its peels so far (`flush_family_route`: the
+member with the largest separator `<= key` covers the key; `key ==
+sep` routes to the peel, matching the split partition's `>= sep →
+right`). Child-level peels splice into the family at their routed
+position (`flush_absorb_peel`), each splice followed by the eager
+re-check — and each splice DIRTIES its target (R173 F1; see below).
 
 **Commit integration.** `stm_btree_engine_commit_flush` runs
 `flush_walk` BEFORE `count_dirty` (a flush dirties more nodes) and
@@ -363,12 +374,26 @@ before the pending window opens: every resident internal node whose
 buffer exceeds the region cap flushes toward the leaves; root-level
 peels grow the tree upward (`grow_root_absorb`: a fresh root takes
 the old root as child 0, splices every peel at its routed position,
-publishes `mvcc_root` on each root reassignment per R170 P2-3, and
-its own eager peels feed the next round). The walk re-runs until
-quiescent so subtrees under fresh peels are covered. On ANY failure
-the half-flushed memtree is dropped (`invalidate_memtree`) — the
-durable tree still holds every message in its on-disk buffers, so
-nothing is lost or duplicated (COW failure atomicity;
+and its own eager peels feed the next round). The walk re-runs until
+quiescent so subtrees under fresh peels are covered. **Dirtiness
+bubbles to the commit root (R173 F1)**: `commit_node` short-circuits
+on a clean node ("a clean node implies a wholly-clean subtree"), so
+`flush_absorb_peel` dirties every splice target and `flush_walk`
+propagates a dirtied child to its parent — without this, a flush
+under a clean ancestor "committed" successfully while persisting
+nothing (acked-commit data loss; proven by compiled reproduction,
+pinned by `engine_flush_deep_node_dirties_ancestors`, which fails on
+the pre-fix code). **`mvcc_root` is published once, after the grow
+reaches quiescence (R173 F2)** — a per-round publish exposed a
+mid-construction root (0 pivots, peeled ranges un-spliced) to the
+lock-free reader, which holds no lock the commit's `fs->global` EX
+could exclude; the brief `eng->root`/`mvcc_root` divergence during
+the grow matches `invalidate_memtree`'s documented exception to the
+R170 P2-3 mirror invariant, and every error arm funnels to
+`invalidate_memtree`, which publishes NULL. On ANY failure the
+half-flushed memtree is dropped (`invalidate_memtree`) — the durable
+tree still holds every message in its on-disk buffers, so nothing is
+lost or duplicated (COW failure atomicity;
 `bepsilon.tla::FlushPreservesMessages`). Buffers at or under the cap
 ride across the commit unchanged — that retention is the Bε
 write-amp win; only overflow cascades.
@@ -412,11 +437,19 @@ into `buf_msgs` stay stable because published buffers are immutable.
 allocations route through `eng_buf_alloc` / `eng_buf_realloc`
 (node.c), hooked by the test-only `eng_test_oom_countdown` (−1 =
 disabled; N ≥ 0 fails the (N+1)-th hooked call — one relaxed load on
-cold paths). Hooked sites: the split partition's lm/rm and the flush
-append. `engine_split_partition_oom_fails_clean` pins
+cold paths). Hooked sites: the split partition's lm/rm, the flush
+append, and the peel-vector push (R173 F4c).
+`engine_split_partition_oom_fails_clean` pins
 allocate-early/commit-late (node untouched on either leg's failure);
 `engine_flush_mid_oom_fails_clean` pins the flush failure contract
-(memtree dropped, durable tree intact, engine recovers, ASan-clean).
+(memtree dropped, durable tree intact, engine recovers);
+`engine_flush_oom_sweep_fails_clean` sweeps the failure point across
+every hooked allocation of the full cascade commit (30 countdowns —
+appends, the peel push, whatever fires), asserting the same contract
+at each. The ASan+UBSan suite run is the UAF/double-free/UB witness;
+macOS ASan carries no LeakSanitizer, so pure-leak freedom rests on
+the R173-traced ownership discipline (a Linux LeakSanitizer pass is
+a cheap R174 add-on when the GCP bench gate runs).
 
 Tests: `engine_flush_delivers_one_level_and_applies` (one-level
 movement + leaf application + merged views at every intermediate
@@ -427,8 +460,13 @@ range clipping, early stop, concurrent parity),
 persistence + reopen + tombstone/overwrite),
 `engine_flush_splits_leaf_and_grows_root` (huge-key fixture: leaf
 split → huge separator splice → eager root split → peel → root grow;
-height 3 after reopen + verify), the two OOM tests above,
-`engine_serial_write_refuses_buffered_path`,
+height 3 after reopen + verify),
+`engine_flush_deep_node_dirties_ancestors` (the R173 F1 regression —
+fails on the pre-fix code),
+`engine_flush_inline_cascade_absorbs_child_peel` (R173 F4b: the
+mid-batch inline child cascade → leaf split → child eager split →
+peel absorbed into the root family, then commit + reopen), the three
+OOM tests above, `engine_serial_write_refuses_buffered_path`,
 `engine_verify_rejects_disordered_buffer`, and
 `pool_commit_stamps_current_version_on_v32_pool` (the R172 F5 stamp
 leg — the live upgrade boot proved the mount leg).
@@ -1071,6 +1109,8 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
   every real metadata tree (inode/dirent/xattr keys are ≤ ~300 B, and
   an over-carve node splits down on its first serial write-touch
   before any buffer can target it); constructing it requires a
-  hand-forged pool. Recorded for the R173+ audits to weigh; the
-  chunk-9 consolidator can retire it outright by write-touch-splitting
+  hand-forged pool. (Precisely: an over-carve node splits on a
+  CHILD-SPLIT SPLICE — the post-splice check in `node_insert` — not
+  on arbitrary write-touches; R173 F3 wording fix.) Weighed at R173;
+  the chunk-9 consolidator can retire it outright by splitting
   over-carve nodes before buffering into them.

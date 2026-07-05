@@ -864,8 +864,10 @@ stm_status stm_btree_engine_delete(stm_btree_engine *eng,
  * a leaf child has them APPLIED. Splits are handled EAGERLY — the
  * over-cap check runs after every single splice, so every
  * eng_split_internal call sees a total at most one splice past
- * ENG_INTERNAL_PC_CAP, inside the chooser's proven envelope (R172
- * F4). Because one flush can peel a node more than once, peels
+ * ENG_INTERNAL_PC_CAP — within the chooser's feasible band
+ * T <= 2 x PC_CAP - max_pivot (the band argument in the reference
+ * doc's chunk-8 section; R173 F3 — NOT R172 F4's narrower 4/3-cap
+ * proof). Because one flush can peel a node more than once, peels
  * accumulate in an eng_split_vec instead of a single split_result;
  * message routing mid-flush goes through the FAMILY (the node plus
  * its peels so far) so a peel's key range keeps receiving its
@@ -893,7 +895,7 @@ static stm_status split_vec_push(eng_split_vec *vec,
 {
     if (vec->n == vec->cap) {
         uint32_t nc = vec->cap ? vec->cap * 2u : 4u;
-        eng_split_ent *nv = realloc(vec->v, (size_t)nc * sizeof *nv);
+        eng_split_ent *nv = eng_buf_realloc(vec->v, (size_t)nc * sizeof *nv);
         if (!nv) return STM_ENOMEM;        /* caller frees sep_key/right */
         vec->v   = nv;
         vec->cap = nc;
@@ -974,6 +976,10 @@ static stm_status flush_absorb_peel(eng_node *node, eng_split_vec *out_vec,
     }
     eng_internal_splice(t, eng_pivot_child_for(t, sep, sep_len),
                         sep, sep_len, right);
+    /* The splice mutated t's structure — commit_node must rewrite it.
+     * flush_walk's absorb target need not be otherwise dirty (its own
+     * buffer may be under-cap): R173 F1. */
+    t->dirty = true;
     return flush_eager_split(t, out_vec);
 }
 
@@ -1123,6 +1129,13 @@ static stm_status flush_walk(stm_btree_engine *eng, eng_node *node,
             e->right   = NULL;
         }
         eng_split_vec_free_deep(&cvec);
+        /* A dirtied descendant re-binds its parent's child bptr at
+         * commit — but commit_node only visits children of DIRTY
+         * nodes, so the dirtiness must bubble to the commit root or
+         * the rewritten subtree is never reached and the "successful"
+         * commit persists nothing of it (R173 F1: acked-commit data
+         * loss; proven by reproduction against a clean ancestor). */
+        if (s == STM_OK && c->dirty) node->dirty = true;
     }
     return s;
 }
@@ -1132,8 +1145,17 @@ static stm_status flush_walk(stm_btree_engine *eng, eng_node *node,
  * internal root takes the old root as child 0 and splices every peel
  * at its routed position (peel ranges are disjoint, so any splice
  * order lands sorted). Splicing can push the new root over the cap —
- * its own eager peels feed the next round. Publishes mvcc_root on
- * every root reassignment (R170 P2-3). Consumes *vec.
+ * its own eager peels feed the next round. Consumes *vec.
+ *
+ * mvcc_root is published ONCE, after the last peel is spliced (R173
+ * F2): a mid-construction root (0 pivots, half its ranges still in
+ * un-spliced peels) must never be reader-visible — a wait-free
+ * reader holds no lock, so a per-round publish would route peeled
+ * ranges into the wrong remaining subtree. The brief eng->root /
+ * mvcc_root divergence during the grow matches invalidate_memtree's
+ * documented exception to the R170 P2-3 mirror invariant; the error
+ * arms leave the unpublished half-built root for the caller's
+ * invalidate_memtree.
  */
 static stm_status grow_root_absorb(stm_btree_engine *eng, eng_split_vec *vec)
 {
@@ -1152,7 +1174,6 @@ static stm_status grow_root_absorb(stm_btree_engine *eng, eng_split_vec *vec)
         nr->children[0] = (eng_child){ .mem     = eng->root,
                                        .is_leaf = eng->root->is_leaf };
         eng->root = nr;        /* prior root reachable as children[0].mem */
-        atomic_store_explicit(&eng->mvcc_root, nr, memory_order_release);
 
         eng_split_vec next = { 0 };
         stm_status    s    = STM_OK;
@@ -1170,6 +1191,7 @@ static stm_status grow_root_absorb(stm_btree_engine *eng, eng_split_vec *vec)
             return s;
         }
     }
+    atomic_store_explicit(&eng->mvcc_root, eng->root, memory_order_release);
     return STM_OK;
 }
 
@@ -1820,7 +1842,12 @@ static int msg_key_seq_cmp(const void *a, const void *b)
     const eng_msg *mb = *(const eng_msg *const *)b;
     int c = eng_key_cmp(ma->key, ma->key_len, mb->key, mb->key_len);
     if (c) return c;
-    return (ma->seq > mb->seq) ? -1 : 1;   /* newest first within a key */
+    /* Newest first within a key. Equal (key, seq) cannot come from one
+     * codec-validated node, but a hostile pool can stage the pair
+     * across LEVELS — the tie must compare consistently or the qsort
+     * is UB (R173 F5); dedupe then keeps whichever sorted first. */
+    if (ma->seq != mb->seq) return (ma->seq > mb->seq) ? -1 : 1;
+    return 0;
 }
 
 /*
@@ -1991,7 +2018,8 @@ static stm_status scan_subtree(stm_btree_engine *eng, eng_node *node,
         s = load_child(eng, node, i, &child);
         if (s != STM_OK) break;
         s = scan_subtree(eng, child, bounded, lo, lo_len, hi, hi_len,
-                         win + wbeg, w - wbeg, cb, ctx, depth + 1u, stopped);
+                         win ? win + wbeg : NULL, w - wbeg,
+                         cb, ctx, depth + 1u, stopped);
         if (s != STM_OK || *stopped) break;
     }
     free(merged);

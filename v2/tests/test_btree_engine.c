@@ -4272,6 +4272,253 @@ STM_TEST(engine_serial_write_refuses_buffered_path) {
     memstore_destroy(&ms);
 }
 
+STM_TEST(engine_flush_deep_node_dirties_ancestors) {
+    /* R173 F1 regression: a commit-time flush of a buffered node under
+     * a CLEAN ancestor must bubble dirtiness to the commit root, or
+     * commit_node short-circuits at the clean root and the
+     * "successful" commit persists nothing of the flush (acked-commit
+     * data loss — proven by compiled reproduction pre-fix). The
+     * injection marks inner0 dirty, the chunk-9 consolidator's
+     * dirty-what-you-mutate shape; the root stays clean. */
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    eng_node *inner0 = NULL;
+    eng->root = forge_tree3(&inner0, NULL);
+    atomic_store(&eng->mvcc_root, eng->root);
+
+    uint64_t rp1 = 0;
+    uint8_t  rc1[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp1, rc1));
+    STM_ASSERT_TRUE(!eng->root->dirty);
+    STM_ASSERT_TRUE(!inner0->dirty);
+
+    enum { NMSG = 30 };
+    uint8_t mval[150];
+    memset(mval, 0x22, sizeof mval);
+    eng_msg *msgs = malloc((size_t)NMSG * sizeof *msgs);
+    STM_ASSERT(msgs != NULL);
+    char mk[8];
+    for (uint32_t i = 0; i < NMSG; i++) {
+        snprintf(mk, sizeof mk, "e%02u", i);      /* routes to inner0/leafA */
+        mkmsg_buf(&msgs[i], ENG_DELTA_INSERT, 400 + i, mk,
+                  mval, sizeof mval);
+    }
+    inner0->buf_msgs  = msgs;
+    inner0->buf_count = NMSG;
+    inner0->dirty     = true;
+    STM_ASSERT_TRUE(eng_msgs_region_bytes(inner0->buf_msgs,
+                                          inner0->buf_count) >
+                    ENG_BUFFER_REGION_MAX);
+
+    uint64_t rp2 = 0;
+    uint8_t  rc2[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &rp2, rc2));
+    STM_ASSERT_TRUE(rp2 != rp1);          /* the root WAS rewritten */
+    STM_ASSERT_TRUE(!eng->root->dirty);   /* no dirty node survives */
+    STM_ASSERT_TRUE(!inner0->dirty);
+    stm_btree_engine_destroy(eng);
+
+    /* The flush is IN the durable tree named by the new triple. */
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         rp2, 2, rc2, &eng));
+    bool found = false; void *val = NULL; size_t vl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "e00", 3, &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ((long long)vl, (long long)sizeof mval);
+    free(val); val = NULL;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "e29", 3, &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    free(val); val = NULL;
+    lookup_expect(eng, "aa", "va");       /* pre-existing content intact */
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+}
+
+/* The R173 F4(b) fixture: a small-pivot root over a huge-pivot inner0
+ * ([g-blob, q-blob], middle leaf pre-filled to ~16.1 KiB with three
+ * huge i/j/k-blob keys) and a normal inner1. A root flush targeting
+ * inner0's middle range forces, mid-batch: the inline child cascade
+ * (inner0's buffer crosses the cap) -> leaf split (huge separator) ->
+ * splice -> inner0 over ENG_INTERNAL_PC_CAP -> eager split -> a peel
+ * absorbed into the ROOT's family. Returns the engine with the tree
+ * installed; out params expose the pieces. HK-sized key buffers are
+ * heap-allocated and owned by the caller. */
+enum { CASCADE_HK = 5300, CASCADE_NMSG = 30 };
+
+static void forge_cascade_fixture(memstore *ms, stm_btree_crypt_ctx *cx,
+                                   stm_btree_engine **out_eng,
+                                   eng_node **out_root,
+                                   eng_node **out_inner0,
+                                   char **out_ik, char **out_jk,
+                                   char **out_kk)
+{
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, ms, cx, 0, &eng));
+
+    char *gk = malloc(CASCADE_HK), *qk = malloc(CASCADE_HK);
+    char *ik = malloc(CASCADE_HK), *jk = malloc(CASCADE_HK);
+    char *kk = malloc(CASCADE_HK);
+    STM_ASSERT(gk && qk && ik && jk && kk);
+    memset(gk, 'g', CASCADE_HK); memset(qk, 'q', CASCADE_HK);
+    memset(ik, 'i', CASCADE_HK); memset(jk, 'j', CASCADE_HK);
+    memset(kk, 'k', CASCADE_HK);
+    char val59[59];
+    memset(val59, 0x66, sizeof val59);
+
+    eng_node *leaf0 = forge_leaf2("a1", "xx", "b2", "yy");
+    eng_node *leaf2 = forge_leaf2("r1", "zz", "s2", "ww");
+    eng_node *leaf1 = eng_node_new_leaf();
+    STM_ASSERT(leaf1 != NULL);
+    STM_ASSERT_OK(eng_leaf_put(leaf1, ik, CASCADE_HK, val59, sizeof val59));
+    STM_ASSERT_OK(eng_leaf_put(leaf1, jk, CASCADE_HK, val59, sizeof val59));
+    STM_ASSERT_OK(eng_leaf_put(leaf1, kk, CASCADE_HK, val59, sizeof val59));
+    leaf1->dirty = true;
+
+    eng_node *inner0 = eng_node_new_internal_sized(2, 3);
+    STM_ASSERT(inner0 != NULL);
+    STM_ASSERT_OK(eng_internal_set_pivot(inner0, 0, gk, CASCADE_HK));
+    STM_ASSERT_OK(eng_internal_set_pivot(inner0, 1, qk, CASCADE_HK));
+    inner0->children[0] = (eng_child){ .mem = leaf0, .is_leaf = true };
+    inner0->children[1] = (eng_child){ .mem = leaf1, .is_leaf = true };
+    inner0->children[2] = (eng_child){ .mem = leaf2, .is_leaf = true };
+    inner0->dirty = true;
+
+    eng_node *inner1 = forge_inner1("t",
+                                    forge_leaf2("nn", "n1", "oo", "o1"),
+                                    forge_leaf2("uu", "u1", "vv", "v1"));
+    eng_node *root = forge_inner1("m", inner0, inner1);
+
+    uint8_t mval[150];
+    memset(mval, 0x5b, sizeof mval);
+    eng_msg *msgs = malloc((size_t)CASCADE_NMSG * sizeof *msgs);
+    STM_ASSERT(msgs != NULL);
+    char mk[8];
+    for (uint32_t i = 0; i < CASCADE_NMSG; i++) {
+        snprintf(mk, sizeof mk, "h%02u", i);   /* root->inner0->leaf1 */
+        mkmsg_buf(&msgs[i], ENG_DELTA_INSERT, 500 + i, mk,
+                  mval, sizeof mval);
+    }
+    root->buf_msgs  = msgs;
+    root->buf_count = CASCADE_NMSG;
+
+    eng->root = root;
+    atomic_store(&eng->mvcc_root, root);
+
+    free(gk); free(qk);
+    *out_eng = eng; *out_root = root; *out_inner0 = inner0;
+    *out_ik = ik; *out_jk = jk; *out_kk = kk;
+}
+
+STM_TEST(engine_flush_inline_cascade_absorbs_child_peel) {
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    eng_node *root = NULL, *inner0 = NULL;
+    char *ik = NULL, *jk = NULL, *kk = NULL;
+    forge_cascade_fixture(&ms, &cx, &eng, &root, &inner0, &ik, &jk, &kk);
+
+    /* Drive the flush directly: the appends into inner0 cross the
+     * region cap mid-batch -> inline cascade -> leaf1 splits (huge
+     * separator) -> inner0 over the carve -> eager split -> the peel
+     * absorbs into the ROOT family: root gains the separator pivot.
+     * (Dirty propagation under a CLEAN ancestor is pinned by
+     * engine_flush_deep_node_dirties_ancestors — the forged fixture
+     * here is dirty by construction.) */
+    eng_split_vec vec = { 0 };
+    STM_ASSERT_OK(eng_flush_node(eng, root, 0, &vec));
+    STM_ASSERT_EQ(vec.n, (uint32_t)0);         /* absorbed, not peeled */
+    STM_ASSERT_EQ(root->n_pivots, (uint32_t)2);
+    STM_ASSERT_EQ(root->buf_count, (uint32_t)0);
+    STM_ASSERT_TRUE(inner0->buf_count > 0);    /* post-cascade remainder */
+    STM_ASSERT_TRUE(inner0->buf_count < (uint32_t)CASCADE_NMSG);
+
+    /* Every message + every pre-existing key resolves through the
+     * mixed leaf/buffer state. */
+    bool found = false; void *val = NULL; size_t vl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "h00", 3, &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    free(val); val = NULL;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "h29", 3, &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    free(val); val = NULL;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, kk, CASCADE_HK,
+                                          &found, &val, &vl));
+    STM_ASSERT_TRUE(found);                    /* reached via the peel */
+    free(val); val = NULL;
+    lookup_expect(eng, "a1", "xx");
+    lookup_expect(eng, "uu", "u1");
+
+    /* And the whole shape commits + survives a reopen. */
+    uint64_t rp = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+    STM_ASSERT_OK(stm_btree_engine_verify(eng));
+    stm_btree_engine_destroy(eng);
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                         rp, 1, rc, &eng));
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "h15", 3, &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    free(val); val = NULL;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, jk, CASCADE_HK,
+                                          &found, &val, &vl));
+    STM_ASSERT_TRUE(found);
+    free(val); val = NULL;
+    stm_btree_engine_destroy(eng);
+
+    free(ik); free(jk); free(kk);
+    memstore_destroy(&ms);
+}
+
+STM_TEST(engine_flush_oom_sweep_fails_clean) {
+    /* R173 F4(c): sweep the allocation-failure point across EVERY
+     * hooked allocation of the full cascade commit (appends, the peel
+     * vector push, the partition legs) — the crash-injection
+     * discipline applied to ENOMEM. Whatever call fails, the contract
+     * holds: the commit reports ENOMEM, the memtree is dropped, and
+     * the engine recovers; a countdown that outlives the commit means
+     * no injection fired and the commit must have succeeded. ASan is
+     * the no-leak witness at every point. */
+    for (int cd = 0; cd < 30; cd++) {
+        memstore ms; memstore_init(&ms);
+        stm_btree_crypt_ctx cx = test_cx();
+        stm_btree_engine *eng = NULL;
+        eng_node *root = NULL, *inner0 = NULL;
+        char *ik = NULL, *jk = NULL, *kk = NULL;
+        forge_cascade_fixture(&ms, &cx, &eng, &root, &inner0,
+                              &ik, &jk, &kk);
+
+        atomic_store(&eng_test_oom_countdown, cd);
+        uint64_t rp = 0;
+        uint8_t  rc[32];
+        stm_status s = stm_btree_engine_commit(eng, 1, &rp, rc);
+        int residue = atomic_load(&eng_test_oom_countdown);
+        atomic_store(&eng_test_oom_countdown, -1);
+
+        if (s == STM_OK) {
+            /* The countdown outlived the hooked calls — no injection. */
+            STM_ASSERT_TRUE(residue >= 0);
+            bool found = false; void *val = NULL; size_t vl = 0;
+            STM_ASSERT_OK(stm_btree_engine_lookup(eng, "h00", 3,
+                                                  &found, &val, &vl));
+            STM_ASSERT_TRUE(found);
+            free(val);
+        } else {
+            STM_ASSERT_EQ((long long)s, (long long)STM_ENOMEM);
+            STM_ASSERT(eng->root == NULL);       /* memtree dropped */
+            /* Recovery: the engine still works. */
+            STM_ASSERT_OK(stm_btree_engine_insert(eng, "k1", 2, "v1", 2));
+            STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+        }
+        stm_btree_engine_destroy(eng);
+        free(ik); free(jk); free(kk);
+        memstore_destroy(&ms);
+    }
+}
+
 STM_TEST(engine_verify_rejects_disordered_buffer) {
     /* R172 F2: scrub must reject the disorder a load would. The forged
      * roots reuse the disorder test's shapes; pre-chunk-8 verify
