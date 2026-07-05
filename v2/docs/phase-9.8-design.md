@@ -1018,6 +1018,86 @@ reader-vs-writer-and-commit coherence (the new
 inode pin is a per-(ds, ino) mutex; the EBR pin is a
 process-global epoch counter.
 
+#### 7.2.1 — As-built cutover (chunk 10, 2026-07-05): keep `fs->global` SH
+
+The "9.8" sketch above (`NO fs->global`) is the **9.9+ aspiration**,
+not the chunk-10 target. Chunk 10 keeps the **PARALLEL-3 impl-5
+intermediate** shape for every single-inode write — `fs->global`
+**SH** + per-inode pin + a fresh outer EBR pin — and flips only the
+*engine access* from the serial APIs to the `_concurrent` ones:
+
+```c
+/* 9.8 chunk-10 as-built: fs->global SH + per-inode pin + EBR pin */
+stm_status stm_fs_chmod(stm_fs *fs, uint64_t ds, uint64_t ino, ...)
+{
+    pthread_rwlock_rdlock(&fs->global);           /* SH -- KEPT */
+    FS_GUARD_WRITE(fs);
+    stm_inode_handle *h; stm_inode_pin(iidx, ds, ino, &h);
+    stm_ebr_thread *ebr = fs_ebr_thread_current(); /* NEW: one pin, outermost */
+    stm_ebr_enter(ebr);
+      stm_inode_lookup_concurrent(iidx, ebr, ds, ino, &v);  /* chain-aware read */
+      /* modify v */
+      stm_inode_set(iidx, ebr, ds, ino, &v);       /* threads ebr; _concurrent write */
+    stm_ebr_exit(ebr);
+    stm_inode_unpin(iidx, h);
+    pthread_rwlock_unlock(&fs->global);
+}
+```
+
+Three grounded reasons the SH stays and the reads move to
+`_concurrent`:
+
+1. **SH is the load-bearing exclusion, not incidental.** The R171
+   P0-2 engine-retire contract (`dataset_engine_close_locked`, chunk
+   9b) requires that no `_concurrent` writer touches an engine while
+   rollback / `dataset_destroy` / unmount retires it. Those admin ops
+   ALL hold `fs->global` **EX** (verified: `stm_fs_commit`,
+   `stm_fs_rollback_snapshot` across `set_engine_root`,
+   `stm_dataset_destroy` [only reached from create-failure paths under
+   EX], `stm_fs_unmount`). A writer holding SH across
+   `get_engine`->`chain_prepend` is therefore mutually excluded from
+   the retire — the exclusion §7.3's EX provides is real ONLY because
+   the writers still take SH. `concurrent_root`'s own comment names
+   this ("excluded by the `fs->global` contract one layer up"). §7.2's
+   `NO fs->global` sketch, taken literally, would reopen a lost-write /
+   stale-engine race against rollback (the R174-F1 loss shape at the fs
+   layer). Closing that without SH needs a per-dataset write gate (a
+   9.9+ optimization); until then, SH is kept.
+
+2. **Every write-path READ must move to the chain-aware `_concurrent`
+   lookup — not just the writes.** The serial
+   `stm_btree_engine_lookup` resolves only the on-disk buffer + base
+   tree; it does NOT walk the in-memory delta chain
+   (`chain_resolve_for_key`, the `_concurrent`-only path with SEALED
+   restart). On a **latched** engine that would MISS the recently
+   CAS-prepended deltas -> a stale read -> wrong validation / merge.
+   So the fs.c-level read AND the setter's own validation read
+   (`stm_inode_set`'s `in_engine_get`, `ex_engine_get`, ...) both
+   switch to the `_concurrent` lookup. EBR is non-reentrant (ebr.h),
+   so the pin is entered ONCE at the outermost fs.c op and the `ebr`
+   handle is threaded down through the subsystem setters (matching the
+   read path's `stm_*_lookup_concurrent(idx, ebr, ...)` convention);
+   the setters never enter their own pin.
+
+3. **SEVEN engine funnels flip, not five — regime purity.** All four
+   metadata subsystems share ONE per-dataset engine (keys
+   tag-prefixed): `inode.c:in_engine_put`,
+   `dirent.c:di_engine_put`/`di_engine_del`,
+   `xattr.c:xa_engine_put`/`xa_engine_del`, AND
+   `extent_index.c:ex_engine_put`/`ex_engine_del`. The concurrent-regime
+   latch is sticky, so the first `_concurrent` prepend from ANY
+   subsystem latches the shared engine and any remaining SERIAL
+   insert/delete on it then refuses (`STM_ENOTSUPPORTED`). All seven
+   must flip together (the extent index is engine-coupled even though
+   the extent DATA path -- `dirty_buffer` / `alloc` -- is not; that S8
+   granularity stays out of chunk 10).
+
+The `NO fs->global` end-state (writers take nothing; a per-dataset
+write gate or a frozen-flag re-check replaces the SH-vs-EX exclusion so
+commit/rollback on dataset A never stall writers on dataset B) is a
+9.9+ scalability item, not required for CF-1's soundness or the
+mission-item-#4 claim. Recorded as a §10 seam.
+
 ### 7.3 — What still holds `fs->global` EX after 9.8
 
 The wedged/RO guard composition: `STM_FS_GUARD_WRITE` still
@@ -1173,6 +1253,23 @@ The bench numbers feed into Phase 9.9's WORKLOAD chunk (kernel-
 9.8's perf claims are **per-API**; 9.9's are **workload-end-to-
 end**. The two together prove the crown-jewel claim at both
 microbenchmark and realistic-workload scales.
+
+### 10.6 — Single-inode writers drop `fs->global` (the §7.2 `NO fs->global` end-state)
+
+Chunk 10 keeps single-inode writers on `fs->global` **SH** (see
+§7.2.1) — the SH is the exclusion that keeps a `_concurrent` writer
+off an engine while rollback / `dataset_destroy` / unmount retire it
+(the chunk-9b R171 P0-2 contract), since those admin ops hold
+`fs->global` **EX**. Dropping the SH entirely (§7.2's aspirational
+sketch) requires replacing that coarse SH-vs-EX exclusion with a
+**per-dataset write gate** (writers take the dataset's own SH; only
+same-dataset commit / rollback / destroy take it EX) OR an
+engine-`frozen`-flag re-check inside the writer's pin, so commit /
+rollback on dataset A never stall writers on dataset B and a writer
+never CAS-prepends onto a retiring engine. Forward-noted to **9.9+**
+as a scalability item; not required for CF-1's soundness (SH already
+delivers it) or the mission-item-#4 claim. The `commit_mu`-at-fs-level
+relaxation (§7.3) folds into the same pass.
 
 ## 11 — Risk + reversal
 
