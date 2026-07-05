@@ -3690,14 +3690,18 @@ STM_TEST(engine_msgs_split_partitions_buffer) {
     STM_ASSERT_OK(eng_internal_set_pivot(n, 2, "f", 1));
     for (uint32_t i = 0; i < 4; i++) n->children[i].is_leaf = true;
 
-    eng_msg *msgs = malloc(4 * sizeof *msgs);
+    eng_msg *msgs = malloc(5 * sizeof *msgs);
     STM_ASSERT(msgs != NULL);
     mkmsg(&msgs[0], ENG_DELTA_INSERT, 1, "a", "v1");   /* child 0 -> left  */
     mkmsg(&msgs[1], ENG_DELTA_INSERT, 2, "c", "v2");   /* child 1 -> left  */
-    mkmsg(&msgs[2], ENG_DELTA_DELETE, 3, "e", NULL);   /* child 2 -> right */
-    mkmsg(&msgs[3], ENG_DELTA_INSERT, 4, "g", "v4");   /* child 3 -> right */
+    mkmsg(&msgs[2], ENG_DELTA_INSERT, 3, "d", "vd");   /* == sep -> RIGHT
+        (R172 F5: the boundary the partition's `<` hinges on — the
+        separator is extracted; child s+1, the right side's child 0,
+        covers [sep, next)) */
+    mkmsg(&msgs[3], ENG_DELTA_DELETE, 4, "e", NULL);   /* child 2 -> right */
+    mkmsg(&msgs[4], ENG_DELTA_INSERT, 5, "g", "v4");   /* child 3 -> right */
     n->buf_msgs  = msgs;
-    n->buf_count = 4;
+    n->buf_count = 5;
 
     eng_node *right = NULL;
     uint8_t  *sep = NULL;
@@ -3709,9 +3713,10 @@ STM_TEST(engine_msgs_split_partitions_buffer) {
     STM_ASSERT_EQ(n->buf_count, (uint32_t)2);
     STM_ASSERT_MEM_EQ(n->buf_msgs[0].key, "a", 1);
     STM_ASSERT_MEM_EQ(n->buf_msgs[1].key, "c", 1);
-    STM_ASSERT_EQ(right->buf_count, (uint32_t)2);
-    STM_ASSERT_MEM_EQ(right->buf_msgs[0].key, "e", 1);
-    STM_ASSERT_MEM_EQ(right->buf_msgs[1].key, "g", 1);
+    STM_ASSERT_EQ(right->buf_count, (uint32_t)3);
+    STM_ASSERT_MEM_EQ(right->buf_msgs[0].key, "d", 1);
+    STM_ASSERT_MEM_EQ(right->buf_msgs[1].key, "e", 1);
+    STM_ASSERT_MEM_EQ(right->buf_msgs[2].key, "g", 1);
 
     free(sep);
     eng_node_free(n);

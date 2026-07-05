@@ -262,6 +262,17 @@ static-asserted equal to the wire ops). The load-bearing pieces:
   the delta chain (seqs strictly greater, §5.2) and the pivot descent.
   Deliberately ORDER-INDEPENDENT (max-seq match), so in-memory rot is
   harmless to reads. Newest wins: INSERT resolves, DELETE hides.
+- **The COW mutation obligation (R172 F1 — BINDING on chunk 8/9).**
+  The wait-free reader holds NO rwlock (fs.c PARALLEL-3), so writer
+  exclusion protects nothing here — reader-safety rests on **COW**:
+  `buf_msgs` may be mutated (the write-path normalise, the split
+  partition + its `free`, the future flush drain / prepend
+  consolidation) ONLY on a node that is not mvcc-published — a dirty
+  COW copy no reader can reach. A published node's buffer is immutable
+  until the node is superseded and EBR-retired. True of every mutator
+  today (all run on serial-path dirty copies; the machinery is dormant
+  before chunk 9's first production writer); chunk 8/9 MUST uphold it
+  and their audits prosecute it.
 - **Scans refuse buffered nodes** (`STM_ENOTSUPPORTED`) until the
   chunk-8 flush teaches them to merge — fail-closed beats silently
   omitting/resurrecting keys. Unreachable in production before chunk 9
@@ -270,7 +281,18 @@ static-asserted equal to the wire ops). The load-bearing pieces:
   `ENG_INTERNAL_PC_CAP` (= payload − region/4) at the post-splice check
   and the split-point chooser, so a full buffer can never displace the
   split-bound proofs' pivot capacity. Pre-9.8 nodes packed past the
-  carve split on their next mutation.
+  carve split on their next mutation. **Why the tightened chooser
+  cannot wedge on a pre-9.8 over-carve node (R172 F4):** the §Split
+  5/6-cap argument was proved against the FULL payload cap, so it does
+  not directly cover a node loaded above the carve; but the chooser's
+  middle-pivot extraction always finds a fitting cut for any total
+  `T <= 4/3 × PC_CAP` — each side of the s-th cut carries at most
+  `T − (smallest excluded half)` and sweeping s from the middle
+  outward, the minimising cut bounds both sides under `PC_CAP` for
+  every reachable pre-9.8 packing (worst case `T = full payload cap =
+  4/3 × PC_CAP` exactly); verified by construction at m=4 and m=5 in
+  the R172 audit. A node it still cannot cut returns `STM_ERANGE`
+  (fail-clean, never corrupt), unreachable under `ENG_MAX_ITEM_BYTES`.
 - **STM_UB_VERSION 32 → 33** with the FIRST ranged mount gate:
   `[STM_UB_VERSION_MIN_COMPAT=32, 33]` mounts (upgrade-on-mount — a
   v32 pool's buffer regions are all zero; it stamps v33 at its next

@@ -111,14 +111,20 @@ stm_status stm_btnode_internal_encode_msgs(const stm_btnode_pivot *pivots,
         ((size_t)n_pivots + 1u) * STM_BTNODE_CHILD_BPTR_SIZE;
     if (children_len != expected_children) return STM_EINVAL;
 
-    /* Message-region validation. */
+    /* Message-region validation. The byte total accumulates with an
+     * incremental region-cap bail (R172 F3): key_len/value_len are
+     * size_t, so a hostile near-SIZE_MAX length must hit ERANGE here
+     * — never wrap the sum past the cap into an OOB memcpy below. */
+    size_t region_max = STM_BTNODE_BUFFER_REGION_MAX(buf_size);
+    size_t msg_bytes = 0;
     for (uint32_t i = 0; i < n_msgs; i++) {
         stm_status ms = msg_validate_for_encode(&msgs[i]);
         if (ms != STM_OK) return ms;
+        if (msgs[i].value_len > region_max) return STM_ERANGE;
+        msg_bytes += STM_BTNODE_MSG_HDR_SIZE
+                   + msgs[i].key_len + msgs[i].value_len;
+        if (msg_bytes > region_max) return STM_ERANGE;
     }
-    size_t msg_bytes = stm_btnode_msgs_encoded_bytes(msgs, n_msgs);
-    if (msg_bytes > STM_BTNODE_BUFFER_REGION_MAX(buf_size))
-        return STM_ERANGE;
 
     size_t pc_bytes = stm_btnode_internal_encoded_bytes(pivots, n_pivots);
     size_t payload_bytes = pc_bytes + msg_bytes;

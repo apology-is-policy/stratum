@@ -715,13 +715,19 @@ stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
         if (kind == ENG_DELTA_INSERT) { *out_found = true;  return STM_OK; }
         if (kind == ENG_DELTA_DELETE) { *out_found = false; return STM_OK; }
 
-        /* 9.8-BE (chunk 7b): the on-disk buffer sits BELOW the chain
-         * (chain seqs strictly greater by construction, §5.2) and
-         * ABOVE the descent. Reader-safety under EBR: buf_msgs is
-         * immutable on a clean resident node (only eng_node_write
-         * re-normalises it, on a DIRTY node under the writer's
-         * exclusion; the flush that drains it is chunk 8, which runs
-         * under commit_mu + COW). */
+        /* 9.8-BE (chunk 7b; doctrine corrected per R172 F1): the
+         * on-disk buffer sits BELOW the chain (chain seqs strictly
+         * greater by construction, §5.2) and ABOVE the descent.
+         * Reader-safety under EBR rests on COW, NOT writer exclusion:
+         * this wait-free reader holds NO rwlock (fs.c PARALLEL-3), so
+         * fs->global EX excludes nothing here. The binding obligation
+         * — on chunk 8/9's flush/prepend and on every existing
+         * mutator (eng_node_write's in-place normalise,
+         * eng_split_internal's partition + free) — is that buf_msgs
+         * is MUTATED only on a node that is not mvcc-published (a
+         * dirty COW copy no reader can reach); a published node's
+         * buffer is immutable until the node is superseded and
+         * EBR-retired. Dormant at chunk 7 (no production writer). */
         uint32_t bkind = 0;
         s = buffer_resolve_for_key(node, key, key_len, &bkind,
                                    out_value, out_value_len);

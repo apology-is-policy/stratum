@@ -584,7 +584,13 @@ stm_status eng_split_internal(eng_node *n, eng_node **out_right,
      * preemptively before any production writer exists. The stable
      * partition preserves per-side (target_child, seq) order.
      * Allocate-early / commit-late: an ENOMEM here fails the split
-     * with n untouched. */
+     * with n untouched.
+     * R172 F1: this partition MUTATES buf_msgs (and frees the old
+     * array), so it may only ever run on a node that is not
+     * mvcc-published — a wait-free reader holds no rwlock; its safety
+     * rests on COW, not exclusion. True today (splits happen on the
+     * serial insert path against dirty descent copies); BINDING on
+     * chunk 8/9. */
     eng_msg *lm = NULL, *rm = NULL;
     uint32_t lm_n = 0, rm_n = 0;
     if (n->buf_count) {

@@ -407,7 +407,12 @@ stm_status eng_node_write(stm_btree_engine *eng, eng_node *n, uint64_t gen)
          * order (target_child, seq) is normative. Stable insertion
          * sort IN PLACE (n->buf_msgs then mirrors the disk bytes) over
          * a per-message routing scratch; buf_count is bounded by the
-         * region cap (~tens), so O(n^2) is noise. */
+         * region cap (~tens), so O(n^2) is noise.
+         * R172 F1: the in-place sort is a buf_msgs MUTATION — legal
+         * only on a node no wait-free reader can reach (readers hold
+         * no rwlock; safety is COW, not exclusion). Holds today:
+         * eng_node_write runs on dirty commit-path copies. BINDING on
+         * chunk 8/9's mutators. */
         stm_btnode_msg *wm = NULL;
         if (n->buf_count) {
             uint32_t *route = malloc((size_t)n->buf_count * sizeof *route);
