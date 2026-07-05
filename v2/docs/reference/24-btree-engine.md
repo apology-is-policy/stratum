@@ -503,9 +503,13 @@ publishing a replacement and retiring the husk; the handoff is made
 race-free by two address-compared sentinels. `ENG_CHAIN_SEALED`
 (xchg'd into `chain_head` at detach) tells prepends and chain-reads
 "this node is being replaced right now" — they re-load `mvcc_root`
-and retry (the replacement publishes within a few RAM instructions;
-`ENG_SEAL_RETRY_MAX` is the wedged-process safety valve, surfacing
-`STM_EBUSY`). `ENG_CHILD_TOMBSTONE` (xchg'd into every husk child
+and retry, yielding periodically. A seal window does no I/O and is
+bounded by the deltas that arrived during one unsealed fold pass
+(the mini folds its bulk from a pre-seal snapshot — R174 F2) or one
+commit flush (the finalize migration; empty in production);
+`ENG_SEAL_RETRY_MAX` surfaces `STM_EBUSY` past the budget — a
+retriable back-pressure signal callers handle at their level, never
+corruption. `ENG_CHILD_TOMBSTONE` (xchg'd into every husk child
 slot post-publish by the mini) closes the late-link leak: a pinned
 cold descent that CAS-links a freshly-loaded child into a husk slot
 either lands before the sweep (the xchg returns it; the clone adopts
@@ -520,15 +524,25 @@ slots when grace ends.
 (trylock `serial_mu` then `commit_mu` — the documented lock order —
 bailing on any contention, a pending window, or a leaf root): build a
 SINGLE-node shallow clone of the root (pivots/buffers deep-copied;
-children array copied with `mem` pointers SHARED), seal-detach the
-chain, fold it into the clone's buffer ascending-seq
-(`chain_fold_into_buffer`), publish, tombstone-sweep the husk slots,
-and EBR-retire the husk (single-node destructor — ownership of the
-shared subtree transferred at publish) plus the detached chain. An
-OOM mid-fold restores the detached chain (no other sealer can exist
-under `commit_mu`) — nothing lost, nothing published. This bounds the
-reader's chain-walk cost between commits at ~threshold, the
-`btree_lf` consolidate analog.
+children array copied with `mem` pointers SHARED), fold the chain's
+BULK into the clone's buffer from a pre-seal head snapshot — the
+segment below a captured head is immutable (prepend-only), so the
+O(chain) alloc+copy work runs with readers and writers fully live
+(R174 F2) — then seal-detach and fold only the suffix that arrived
+during the bulk pass inside the seal window, publish, tombstone-sweep
+the husk slots, and EBR-retire the husk (single-node destructor —
+ownership of the shared subtree transferred at publish) plus the
+detached chain. A bulk-fold OOM discards the clone with the live
+chain untouched; a suffix-fold OOM restores the detached chain (no
+other sealer can exist under `commit_mu`) — nothing lost, nothing
+published either way. This bounds the reader's CHAIN-walk cost
+between commits at ~threshold (the `btree_lf` consolidate analog);
+the folded messages accumulate in the live root's RAM buffer until
+the next commit flushes, so the buffer-scan cost grows with the
+write burst — the caller's commit cadence is the bound (R174 F4),
+and a sustained hot-key burst (a mini every ~threshold prepends)
+also makes a concurrent scan straddling the sweeps retry via
+`STM_EBUSY` — callers loop per the back-pressure contract.
 
 **The clone commit.** A latched engine's `commit_flush` dispatches to
 `commit_flush_clone`: deep-clone the resident tree
@@ -1247,6 +1261,14 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
   write regimes; production sequences the transition via `fs->global`
   EX vs SH), and the guard exists to catch the sequential form of the
   mistake loudly, not to arbitrate a race.
+- **A permanently-failing commit accretes RAM on a latched engine
+  (chunk 9).** Clone-arm failures deliberately keep everything (the
+  chain + the mini-folded root buffer grow until a commit lands), so
+  an engine whose commits ALWAYS fail (a wedged pool) accumulates
+  unbounded deltas+messages in RAM. The legacy arm's
+  invalidate-on-failure dropped them; the clone arm trades that data
+  loss for RAM growth — the R154 Q2 wedge discipline (a failing
+  commit wedges the fs) bounds it in production.
 - **Leaf-rooted engines skip the mini-consolidation (chunk 9).** A
   leaf root has no message buffer to fold into and an apply could
   force a structural grow (the commit consolidator's job), so its

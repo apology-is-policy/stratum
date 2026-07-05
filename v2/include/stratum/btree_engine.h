@@ -262,9 +262,12 @@ stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
  *
  * Returns STM_EINVAL on NULL `eng` / `ebr` / out params or a NULL
  * `key` with nonzero key_len, STM_ENOMEM / STM_ECORRUPT / device
- * errors otherwise. STM_EBUSY surfaces only as a safety valve when a
- * consolidation seal never resolves (a wedged process) — transient
- * seal windows are retried internally and invisibly.
+ * errors otherwise. STM_EBUSY signals transient consolidation
+ * contention: seal windows are retried internally (with periodic
+ * yields) and are invisible in the common case, but a sustained
+ * adversarial write burst can outlast the retry budget — callers
+ * treat STM_EBUSY as retriable back-pressure (the fs-layer fallback
+ * shape), never as corruption.
  *
  * Spec composition:
  *   bepsilon.tla::PerKeyNewestWins — chain walk is LIFO; first
@@ -312,8 +315,9 @@ stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
  *
  * Returns STM_EINVAL on NULL args; STM_ERANGE on value/key bounds
  * (the serial insert's bounds plus key_len <= STM_BTNODE_MSG_KEY_MAX)
- * or delta-seq exhaustion (2^48 mutations); STM_ENOMEM; STM_EBUSY
- * only as the wedged-sealer safety valve.
+ * or delta-seq exhaustion (2^48 mutations); STM_ENOMEM; STM_EBUSY as
+ * retriable consolidation back-pressure (see lookup_concurrent's
+ * note) — the delta is NOT prepended when it surfaces.
  */
 STM_MUST_USE
 stm_status stm_btree_engine_insert_concurrent(stm_btree_engine *eng,

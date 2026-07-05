@@ -202,12 +202,17 @@ void eng_msg_array_free(eng_msg *msgs, uint32_t n);
  * or commit_finalize's residue migration) detaches a chain with
  * xchg(chain_head, ENG_CHAIN_SEALED); the sentinel tells a concurrent
  * prepender/reader that this node is being superseded RIGHT NOW —
- * both re-load mvcc_root and retry (the publisher stores the
- * replacement within a few RAM instructions; there is no I/O inside a
- * seal window). A seal is never left dangling: every sealer publishes
- * a replacement root and retires the sealed husk before releasing
- * commit_mu. The sentinel is a static dummy — never dereferenced,
- * compared by address only.
+ * both re-load mvcc_root and retry. A seal window does no I/O and is
+ * bounded by the deltas that arrived during one unsealed fold pass
+ * (the mini folds its bulk from a pre-seal snapshot — R174 F2) or,
+ * for the finalize residue migration, during one commit flush (empty
+ * in production, where fs->global EX excludes writers from commits);
+ * the retry loops yield periodically and surface STM_EBUSY only past
+ * ENG_SEAL_RETRY_MAX — a transient-contention signal, not corruption.
+ * A seal is never left dangling: every sealer publishes a replacement
+ * root and retires the sealed husk before releasing commit_mu, or
+ * restores the chain on its one fallible step. The sentinel is a
+ * static dummy — never dereferenced, compared by address only.
  */
 extern eng_delta eng_chain_sealed_sentinel;
 #define ENG_CHAIN_SEALED (&eng_chain_sealed_sentinel)

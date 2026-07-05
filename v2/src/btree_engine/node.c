@@ -433,13 +433,19 @@ static eng_node *node_clone_rec(const eng_node *n, uint32_t depth)
     if (!c->children) goto fail;
     c->children_cap = nc;
     for (uint32_t i = 0; i < nc; i++) {
-        c->children[i]     = n->children[i];
-        c->children[i].mem = NULL;
+        /* Field-wise, mem via the acquire helper — a racing wait-free
+         * cold descent may CAS-link the source slot mid-copy, and a
+         * whole-struct copy would read it plainly (R174 F3). */
+        const eng_child *sc = &n->children[i];
+        c->children[i].paddr   = sc->paddr;
+        c->children[i].gen     = sc->gen;
+        memcpy(c->children[i].csum, sc->csum, STM_BTNODE_CSUM_SIZE);
+        c->children[i].is_leaf = sc->is_leaf;
+        c->children[i].mem     = NULL;
     }
     for (uint32_t i = 0; i < nc; i++) {
-        /* Acquire: a racing wait-free cold descent may CAS-link this
-         * slot mid-clone. NULL keeps the cold bptr (the shadow loads
-         * from disk on demand); non-NULL is a fully-built child. */
+        /* Acquire: NULL keeps the cold bptr (the shadow loads from
+         * disk on demand); non-NULL is a fully-built child. */
         eng_node *src_child = eng_child_mem_acquire(&n->children[i]);
         if (!src_child) continue;
         eng_node *cc = node_clone_rec(src_child, depth + 1u);
@@ -510,10 +516,16 @@ eng_node *eng_node_clone_shallow(const eng_node *n)
         if (!c->children) goto fail;
         c->children_cap = nc;
         for (uint32_t i = 0; i < nc; i++) {
-            c->children[i]     = n->children[i];
-            /* Shared inheritance — acquire per slot (a wait-free cold
-             * descent may be CAS-linking it right now). */
-            c->children[i].mem = eng_child_mem_acquire(&n->children[i]);
+            /* Field-wise; the shared-inheritance mem read goes through
+             * the acquire helper (a wait-free cold descent may be
+             * CAS-linking it right now — R174 F3: a whole-struct copy
+             * would read the racing field plainly). */
+            const eng_child *sc = &n->children[i];
+            c->children[i].paddr   = sc->paddr;
+            c->children[i].gen     = sc->gen;
+            memcpy(c->children[i].csum, sc->csum, STM_BTNODE_CSUM_SIZE);
+            c->children[i].is_leaf = sc->is_leaf;
+            c->children[i].mem     = eng_child_mem_acquire(sc);
         }
     }
 

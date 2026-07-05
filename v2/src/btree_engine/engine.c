@@ -31,6 +31,8 @@
 
 #include <stratum/ebr.h>
 
+#include <sched.h>
+
 #include <stratum/bootstrap.h>
 
 #include <stdlib.h>
@@ -267,9 +269,12 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
  * is the single source of root materialisations, so publishing here
  * keeps the (eng->root, eng->mvcc_root) invariant: mvcc_root mirrors
  * eng->root, except briefly inside invalidate_memtree where mvcc_root
- * is cleared FIRST. The sole OTHER write site to eng->root + mvcc_root
- * is the root-grow path in `stm_btree_engine_insert` (which publishes
- * both fields directly; R170 P2-3). */
+ * is cleared FIRST. The OTHER write sites to the pair (chunk 9): the
+ * serial root-grow in `stm_btree_engine_insert` (R170 P2-3), the
+ * legacy-arm grow_root_absorb (publish-at-quiescence, R173 F2), the
+ * mini-consolidation's clone publish, and commit_finalize_clone's
+ * shadow swap — the latter two under commit_mu (+ serial_mu for the
+ * mini). */
 static stm_status load_root(stm_btree_engine *eng, eng_node **out)
 {
     if (eng->root) { *out = eng->root; return STM_OK; }
@@ -308,6 +313,35 @@ static stm_status load_root(stm_btree_engine *eng, eng_node **out)
     atomic_store_explicit(&eng->mvcc_root, r, memory_order_release);
     *out = r;
     return STM_OK;
+}
+
+/*
+ * Single-flight materialisation front for the SERIAL entry points
+ * (R174 F1). The serial ops hold only serial_mu and the concurrent
+ * slow-warm holds only commit_mu — disjoint — so two bare load_root
+ * bodies could race an engine's FIRST materialisation (lazy open, or
+ * post-invalidate): both read the disk root, both plain-store
+ * eng->root and publish, the loser's tree leaks unreachable, an
+ * acknowledged prepend CAS'd onto the loser's chain is silently
+ * lost, and the loser's late seq seed can clobber the counter back
+ * below already-minted seqs. The miss path therefore serialises with
+ * every other materialiser and publisher on commit_mu (double-checked
+ * on eng->root inside the lock). Lock order: the callers hold
+ * serial_mu, so this realises serial_mu OUTER -> commit_mu INNER —
+ * the documented order the mini also uses. The fast path stays a
+ * plain read: a non-NULL eng->root can only be swapped by the mini
+ * (excluded — it takes serial_mu) or a commit publish (excluded by
+ * the commit-vs-serial caller contract, unchanged since 9.6).
+ */
+static stm_status load_root_locked(stm_btree_engine *eng, eng_node **out)
+{
+    if (eng->root) { *out = eng->root; return STM_OK; }
+    pthread_mutex_lock(&eng->commit_mu);
+    stm_status s = STM_OK;
+    if (eng->root) *out = eng->root;
+    else           s = load_root(eng, out);
+    pthread_mutex_unlock(&eng->commit_mu);
+    return s;
 }
 
 /*
@@ -487,7 +521,7 @@ static stm_status engine_insert_locked(stm_btree_engine *eng,
     if (eng->pending.active)        return STM_EBUSY;
 
     eng_node *root = NULL;
-    stm_status s = load_root(eng, &root);
+    stm_status s = load_root_locked(eng, &root);
     if (s != STM_OK) return s;
 
     /* 9.8-BE-prepend regime purity (the buffered-node guard's chain
@@ -562,7 +596,7 @@ static stm_status engine_lookup_locked(stm_btree_engine *eng,
     if (eng->pending.active) return STM_EBUSY;
 
     eng_node *node = NULL;
-    stm_status s = load_root(eng, &node);
+    stm_status s = load_root_locked(eng, &node);
     if (s != STM_OK) return s;
 
     for (uint32_t depth = 0; ; depth++) {
@@ -713,7 +747,11 @@ static stm_status chain_resolve_for_key(const eng_node *n,
  * in-memory array's order can rot when a pivot splice re-routes
  * targets (the on-disk order is re-normalised at eng_node_write), so
  * the resolver must not lean on it. buf_count is bounded by the
- * region cap (~tens); a linear pass matches the §5.5 read budget.
+ * region cap (~tens) on any RELOADED node; on the LIVE root of a
+ * latched engine each mini-consolidation appends ~threshold more
+ * between commits, so the linear pass grows with the write burst
+ * until the next commit flushes (R174 F4 — the caller's commit
+ * cadence is the bound; see the reference doc's caveat).
  */
 static stm_status buffer_resolve_for_key(const eng_node *n,
                                           const void *key, size_t key_len,
@@ -780,11 +818,17 @@ static stm_status concurrent_root(stm_btree_engine *eng, eng_node **out)
     return STM_OK;
 }
 
-/* Bound on published-root reloads when a seal is observed (a sealer
- * publishes its replacement within a few RAM instructions — one or
- * two retries in practice; the bound is a safety valve against a
- * wedged sealer, surfacing STM_EBUSY instead of an unbounded spin). */
-#define ENG_SEAL_RETRY_MAX 65536u
+/* Bound on published-root reloads when a seal is observed. A seal
+ * window does no I/O and is bounded by the deltas that arrived during
+ * one unsealed fold pass (the mini) or one commit flush (the finalize
+ * residue migration) — zero-to-few in the common case, but NOT "a few
+ * instructions" under an adversarial burst, so the spin yields the
+ * CPU every ENG_SEAL_YIELD_EVERY attempts (the sealer may be
+ * preempted on this very core) and surfaces STM_EBUSY only past the
+ * cap. Callers treat that as a transient contention signal and retry
+ * at their level (the fs-layer fallback shape), not as corruption. */
+#define ENG_SEAL_RETRY_MAX   65536u
+#define ENG_SEAL_YIELD_EVERY 1024u
 
 /*
  * One EBR-pinned descent attempt (the body of
@@ -908,8 +952,10 @@ stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
                                                  out_found, out_value,
                                                  out_value_len, &retry);
         if (s != STM_OK || !retry) return s;
+        if ((attempt + 1u) % ENG_SEAL_YIELD_EVERY == 0u)
+            sched_yield();
     }
-    return STM_EBUSY;                      /* wedged sealer — see the cap */
+    return STM_EBUSY;                      /* see ENG_SEAL_RETRY_MAX */
 }
 
 /* ========================================================================= */
@@ -970,7 +1016,7 @@ static stm_status engine_delete_locked(stm_btree_engine *eng,
     if (eng->pending.active) return STM_EBUSY;
 
     eng_node *root = NULL;
-    stm_status s = load_root(eng, &root);
+    stm_status s = load_root_locked(eng, &root);
     if (s != STM_OK) return s;
 
     /* Serial-write chain guard — see engine_insert_locked. */
@@ -1041,10 +1087,12 @@ static stm_status chain_prepend(stm_btree_engine *eng, eng_delta *d,
             }
             /* h reloaded by the failed CAS; re-check the seal. */
         }
-        /* Sealed: the consolidator publishes its replacement within a
-         * few RAM instructions — re-load mvcc_root and retry. */
+        /* Sealed: re-load mvcc_root and retry; yield periodically so
+         * a preempted sealer can finish its window. */
+        if ((attempt + 1u) % ENG_SEAL_YIELD_EVERY == 0u)
+            sched_yield();
     }
-    return STM_EBUSY;                      /* wedged sealer — see the cap */
+    return STM_EBUSY;                      /* see ENG_SEAL_RETRY_MAX */
 }
 
 /*
@@ -1055,13 +1103,14 @@ static stm_status chain_prepend(stm_btree_engine *eng, eng_delta *d,
  * clone keeps whatever was appended (the caller frees it wholesale)
  * and the chain is untouched — restorable.
  */
-/* Reverse a LIFO chain into an ascending-seq pointer scratch (v[0] =
- * oldest). *out_k = length; NULL scratch iff empty. */
-static stm_status chain_to_ascending(eng_delta *head, eng_delta ***out_v,
-                                     uint32_t *out_k)
+/* Reverse the LIFO segment [head..stop) into an ascending-seq pointer
+ * scratch (v[0] = oldest; stop == NULL walks the whole chain). *out_k
+ * = length; NULL scratch iff empty. */
+static stm_status chain_to_ascending(eng_delta *head, eng_delta *stop,
+                                     eng_delta ***out_v, uint32_t *out_k)
 {
     uint32_t k = 0;
-    for (eng_delta *d = head; d; d = d->next) {
+    for (eng_delta *d = head; d != stop; d = d->next) {
         if (k == UINT32_MAX) return STM_ECORRUPT;   /* defensive */
         k++;
     }
@@ -1071,7 +1120,7 @@ static stm_status chain_to_ascending(eng_delta *head, eng_delta ***out_v,
     eng_delta **v = eng_buf_alloc((size_t)k * sizeof *v);
     if (!v) return STM_ENOMEM;
     uint32_t i = k;
-    for (eng_delta *d = head; d; d = d->next) v[--i] = d;
+    for (eng_delta *d = head; d != stop; d = d->next) v[--i] = d;
     *out_v = v;
     return STM_OK;
 }
@@ -1113,11 +1162,14 @@ static stm_status msgs_append_deltas(eng_node *node,
     return STM_OK;
 }
 
-static stm_status chain_fold_into_buffer(eng_node *clone, eng_delta *head)
+/* Fold the LIFO segment [head..stop) into `clone`'s buffer as deep
+ * copies, ascending seq. */
+static stm_status chain_fold_into_buffer(eng_node *clone, eng_delta *head,
+                                         eng_delta *stop)
 {
     eng_delta **v = NULL;
     uint32_t    k = 0;
-    stm_status s = chain_to_ascending(head, &v, &k);
+    stm_status s = chain_to_ascending(head, stop, &v, &k);
     if (s != STM_OK) return s;
     s = msgs_append_deltas(clone, v, 0, k);
     free(v);
@@ -1171,20 +1223,29 @@ static void engine_try_mini_consolidate(stm_btree_engine *eng)
     clone = eng_node_clone_shallow(root);
     if (!clone) goto out;
 
+    /* Round 1 — UNSEALED bulk fold (R174 F2): the segment below a
+     * captured head is immutable (prepend-only; ->next never mutated),
+     * so the O(chain) alloc+copy work runs with readers and writers
+     * fully live. A fold OOM here just discards the clone — the live
+     * chain was never touched. */
+    eng_delta *snap = atomic_load_explicit(&root->chain_head,
+                                           memory_order_acquire);
+    if (!snap) goto out;                   /* raced empty */
+    if (chain_fold_into_buffer(clone, snap, NULL) != STM_OK) goto out;
+
+    /* Seal + the suffix: only the deltas that arrived DURING round 1
+     * fold inside the seal window — bounded by the arrival rate over
+     * one fold pass, zero-to-few in practice. */
     detached = atomic_exchange_explicit(&root->chain_head, ENG_CHAIN_SEALED,
                                         memory_order_acq_rel);
-    if (!detached) {                       /* raced empty — revert */
-        atomic_store_explicit(&root->chain_head, (eng_delta *)NULL,
-                              memory_order_release);
-        goto out;
-    }
-
-    if (chain_fold_into_buffer(clone, detached) != STM_OK) {
-        /* OOM mid-fold: restore the detached chain (no other writer
+    if (detached != snap &&
+        chain_fold_into_buffer(clone, detached, snap) != STM_OK) {
+        /* OOM mid-suffix: restore the detached chain (no other sealer
          * exists under commit_mu; spinners CAS onto the restored
          * head) — nothing lost, nothing published. */
         atomic_store_explicit(&root->chain_head, detached,
                               memory_order_release);
+        detached = NULL;
         goto out;
     }
     clone->dirty = true;
@@ -1204,7 +1265,12 @@ static void engine_try_mini_consolidate(stm_btree_engine *eng)
         eng_node *late = __atomic_exchange_n(&root->children[i].mem,
                                              ENG_CHILD_TOMBSTONE,
                                              __ATOMIC_ACQ_REL);
-        if (late == clone->children[i].mem) continue;   /* shared/NULL */
+        /* Acquire: the published clone's slot may be CAS-linked by a
+         * cold descent at this instant (R174 F3 — the CAS below is
+         * authoritative either way; the atomic read keeps the module
+         * race-free formally, not just behaviorally). */
+        if (late == eng_child_mem_acquire(&clone->children[i]))
+            continue;                                   /* shared/NULL */
         eng_node *expect = NULL;
         if (!eng_child_mem_cas_link(&clone->children[i], &expect, late)) {
             if (stm_ebr_retire(late, node_free_recursive_cb) != STM_OK) {
@@ -1976,7 +2042,7 @@ static stm_status shadow_consolidate(stm_btree_engine *eng,
 
     eng_delta **v = NULL;
     uint32_t    k = 0;
-    stm_status s = chain_to_ascending(consumed, &v, &k);
+    stm_status s = chain_to_ascending(consumed, NULL, &v, &k);
     if (s != STM_OK) return s;
 
     eng_node *shadow = *shadowp;
@@ -2967,7 +3033,7 @@ static stm_status engine_scan_locked(stm_btree_engine *eng,
     if (!eng || !cb) return STM_EINVAL;
     if (eng->pending.active) return STM_EBUSY;
     eng_node *root = NULL;
-    stm_status s = load_root(eng, &root);
+    stm_status s = load_root_locked(eng, &root);
     if (s != STM_OK) return s;
     bool restart = false;
     s = scan_tree(eng, root, /*concurrent=*/false, /*bounded=*/false,
@@ -2997,7 +3063,7 @@ static stm_status engine_scan_range_locked(stm_btree_engine *eng,
     if (eng->pending.active)    return STM_EBUSY;
 
     eng_node *root = NULL;
-    stm_status s = load_root(eng, &root);
+    stm_status s = load_root_locked(eng, &root);
     if (s != STM_OK) return s;
     bool restart = false;
     s = scan_tree(eng, root, /*concurrent=*/false, /*bounded=*/true,
@@ -3055,8 +3121,10 @@ stm_status stm_btree_engine_scan_range_concurrent(stm_btree_engine *eng,
                       lo_key, lo_key_len, hi_key, hi_key_len,
                       cb, ctx, &restart);
         if (s != STM_OK || !restart) return s;
+        if ((attempt + 1u) % ENG_SEAL_YIELD_EVERY == 0u)
+            sched_yield();
     }
-    return STM_EBUSY;                      /* wedged sealer — see the cap */
+    return STM_EBUSY;                      /* see ENG_SEAL_RETRY_MAX */
 }
 
 static int count_cb(const void *k, size_t kl, const void *v, size_t vl,
@@ -3074,7 +3142,7 @@ static stm_status engine_stats_get_locked(stm_btree_engine *eng,
     if (eng->pending.active) return STM_EBUSY;
 
     eng_node *root = NULL;
-    stm_status s = load_root(eng, &root);
+    stm_status s = load_root_locked(eng, &root);
     if (s != STM_OK) return s;
 
     /* Height — descend the leftmost spine. */
