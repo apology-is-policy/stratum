@@ -63,6 +63,17 @@ stm_ebr_thread *stm_ebr_register(void);
  */
 void stm_ebr_thread_free(stm_ebr_thread *t);
 
+/*
+ * Return the calling thread's cached EBR handle, lazily registering on
+ * first use (via an internal pthread_key). Returns NULL only on OOM at
+ * first registration. The handle is released by the key's destructor at
+ * thread exit. This is the shared thread-current used by every engine
+ * access site (the fs read ops and the subsystem funnels), so one real
+ * thread maps to exactly one handle. Idempotent; wait-free after the
+ * first call. The caller still stm_ebr_enter/_exits around the handle.
+ */
+stm_ebr_thread *stm_ebr_thread_current(void);
+
 /* ------------------------------------------------------------------------- */
 /* Epoch participation.                                                       */
 /* ------------------------------------------------------------------------- */

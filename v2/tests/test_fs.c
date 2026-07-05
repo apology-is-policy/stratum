@@ -512,6 +512,95 @@ STM_TEST(fs_io_write_grows_past_recordsize) {
     unlink(g_tmp_path);
 }
 
+/* 9.8-BE-fs-port (chunk 10): all four metadata subsystems (inode /
+ * dirent / xattr / extent-index) share ONE per-dataset btree engine
+ * (keys tag-prefixed). The first _concurrent write from ANY subsystem
+ * sticky-latches that engine into concurrent regime; a still-serial
+ * write funnel (`stm_btree_engine_insert`/`_delete`) then REFUSES a
+ * chained root (STM_ENOTSUPPORTED). This drives a write from EACH
+ * subsystem onto the shared, latched engine and reads them ALL back
+ * WITHOUT a commit (every value lives only in the delta chain), so the
+ * writes MUST be `_concurrent` and the reads MUST resolve the chain.
+ *
+ * Non-vacuous: revert ANY write funnel to the serial insert/delete and a
+ * later subsystem's write on the now-latched shared engine refuses ->
+ * an STM_ASSERT_OK below trips (verified: neutering in_engine_put fails
+ * this at the chmod with -205). The serial engine LOOKUP is itself
+ * chain-aware (chain_resolve_for_key), so the read funnels' move to the
+ * wait-free `_concurrent` path is a serial_mu-avoidance + uniformity
+ * choice, not a chain-visibility fix -- the uncommitted read-backs here
+ * confirm both the writes landed and the reads resolve them. */
+STM_TEST(fs_be_port_shared_engine_uncommitted_roundtrip) {
+    make_tmp("be_port_shared");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)64u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT(iidx != NULL);
+
+    /* inode + dirent write: a dir and a regular file inside it. The
+     * create_file latches the shared engine via the inode + dirent
+     * _concurrent inserts. */
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                     0, 0, &dir));
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, /*ds=*/1, dir,
+                                        (const uint8_t *)"be", 2,
+                                        0644u, 0, 0, &fino));
+
+    /* extent-index write onto the same latched engine: file data. */
+    uint8_t data[512];
+    for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, fino, 0, data, sizeof data));
+
+    /* xattr write onto the same latched engine. */
+    const uint8_t xname[] = "user.be";
+    const uint8_t xval[]  = "chunk10";
+    bool replaced = false;
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, fino, xname,
+                                     (uint8_t)(sizeof xname - 1),
+                                     xval, (uint32_t)(sizeof xval - 1), 0,
+                                     &replaced));
+
+    /* inode read-modify-write: chmod. Its validation read
+     * (stm_inode_set's in_engine_get) must be chain-aware to see the
+     * just-created inode value on the latched engine. */
+    STM_ASSERT_OK(stm_fs_chmod(fs, 1, fino, 0600u));
+
+    /* --- read every subsystem back, STILL UNCOMMITTED --- */
+
+    struct stm_inode_value v = {0};                 /* inode (chain-aware) */
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, fino, &v));
+    STM_ASSERT_EQ((int)(stm_load_le32(v.si_mode) & 07777u), 0600);
+
+    uint8_t out[512] = {0};                          /* extent (chain-aware) */
+    STM_ASSERT_OK(read_full(fs, 1, fino, 0, out, sizeof out));
+    for (size_t i = 0; i < sizeof out; i++)
+        STM_ASSERT_EQ((int)out[i], (int)(i & 0xFF));
+
+    uint8_t xout[64] = {0};                          /* xattr (chain-aware) */
+    uint32_t xsize = 0;
+    STM_ASSERT_OK(stm_fs_getxattr(fs, 1, fino, xname,
+                                     (uint8_t)(sizeof xname - 1),
+                                     xout, sizeof xout, &xsize));
+    STM_ASSERT_EQ((int)xsize, (int)(sizeof xval - 1));
+    STM_ASSERT(memcmp(xout, xval, sizeof xval - 1) == 0);
+
+    uint64_t looked = 0;                             /* dirent (chain-aware) */
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"be", 2,
+                                   &looked));
+    STM_ASSERT_EQ((int)looked, (int)fino);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 /* #343 dcache (Area E): a slice read that HITS the decrypted-extent cache
  * serves byte-identical plaintext to the MISS that populated it, with no
  * second decrypt -- and the MISS caches the WHOLE extent, so a disjoint

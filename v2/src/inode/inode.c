@@ -350,6 +350,21 @@ static stm_status in_get_engine_locked(stm_inode_index *idx,
  * *out_found is set; if true, *out holds the validated 256-byte value
  * (FREED or not — the caller applies the FREED filter). A device /
  * engine / corruption error propagates verbatim.
+ *
+ * 9.8-BE-fs-port (chunk 10): resolves through the wait-free
+ * _concurrent lookup. NOTE the serial stm_btree_engine_lookup is ITSELF
+ * chain-aware (chain_resolve_for_key) and memory-safe on a latched
+ * engine under serial_mu + the fs->global SH envelope, so this is NOT a
+ * chain-visibility fix -- the read moves to _concurrent to AVOID holding
+ * serial_mu (which the mini-consolidation trylocks; a serial_mu-holding
+ * validation read would suppress consolidation under CF-2's worker pool)
+ * and to keep one EBR-pin safety model across all fs-driven engine
+ * access. The funnel enters its OWN EBR pin (the value is copied out of
+ * the tree under the pin, so it is safe to use after the exit).
+ * CONTRACT: the caller must NOT already hold an EBR pin (stm_ebr_enter
+ * is non-reentrant) -- every caller (the serial reads + the write
+ * setters) reaches it from an unpinned context; the wait-free read ops
+ * use the independent stm_inode_lookup_concurrent, never this funnel.
  */
 static stm_status in_engine_get(stm_inode_index *idx,
                                 uint64_t ds, uint64_t ino,
@@ -364,11 +379,17 @@ static stm_status in_engine_get(stm_inode_index *idx,
     stm_status ks = in_encode_key(ino, key);
     if (ks != STM_OK) return ks;
 
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+
     bool found = false;
     void *vbuf = NULL;
     size_t vlen = 0;
-    stm_status ls = stm_btree_engine_lookup(eng, key, IN_KEY_LEN,
-                                            &found, &vbuf, &vlen);
+    stm_ebr_enter(ebr);
+    stm_status ls = stm_btree_engine_lookup_concurrent(eng, ebr, key,
+                                                       IN_KEY_LEN,
+                                                       &found, &vbuf, &vlen);
+    stm_ebr_exit(ebr);
     if (ls != STM_OK) return ls;
     if (!found) return STM_OK;                  /* *out_found stays false */
     /* An inode value is always exactly 256 bytes — a short / NULL / over
@@ -389,7 +410,14 @@ static stm_status in_engine_get(stm_inode_index *idx,
 
 /* Encode + engine_insert (upsert). Caller holds idx->lock. The engine's
  * insert is failure-atomic — a failed put never loses the prior value
- * at this key. */
+ * at this key.
+ *
+ * 9.8-BE-fs-port (chunk 10): CAS-prepends a delta via the _concurrent
+ * insert (the serial in-place upsert is the R171 P0-1 UAF). The funnel
+ * enters its OWN EBR pin; same non-reentrant caller contract as
+ * in_engine_get. STM_EBUSY (seal-retry back-pressure, R174 F2)
+ * propagates -- unreachable pre-CF-2 (no concurrent sealer under a
+ * single serial connection). */
 static stm_status in_engine_put(stm_inode_index *idx,
                                 uint64_t ds, uint64_t ino,
                                 const struct stm_inode_value *v) {
@@ -403,7 +431,15 @@ static stm_status in_engine_put(stm_inode_index *idx,
 
     uint8_t val[IN_VAL_LEN];
     memcpy(val, v, IN_VAL_LEN);
-    return stm_btree_engine_insert(eng, key, IN_KEY_LEN, val, IN_VAL_LEN);
+
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+    stm_ebr_enter(ebr);
+    stm_status rc = stm_btree_engine_insert_concurrent(eng, ebr, key,
+                                                       IN_KEY_LEN,
+                                                       val, IN_VAL_LEN);
+    stm_ebr_exit(ebr);
+    return rc;
 }
 
 /*

@@ -141,6 +141,41 @@ void stm_ebr_thread_free(stm_ebr_thread *t)
      * concurrent try_advance walking the list. */
 }
 
+/* ------------------------------------------------------------------------- */
+/* Per-thread handle cache (moved here from fs.c so the subsystem write       */
+/* funnels can grab the same handle the fs read ops use — one handle per      */
+/* real thread). Lazily registers on first use; the key destructor releases   */
+/* at thread exit (safe outside an enter/exit pair). The pthread_key leaks at  */
+/* process exit, which is fine.                                               */
+/* ------------------------------------------------------------------------- */
+
+static pthread_key_t  g_current_key;
+static pthread_once_t g_current_key_once = PTHREAD_ONCE_INIT;
+
+static void current_key_destructor(void *handle)
+{
+    if (handle) stm_ebr_thread_free((stm_ebr_thread *)handle);
+}
+
+static void current_key_init(void)
+{
+    (void)pthread_key_create(&g_current_key, current_key_destructor);
+}
+
+stm_ebr_thread *stm_ebr_thread_current(void)
+{
+    pthread_once(&g_current_key_once, current_key_init);
+    stm_ebr_thread *t = (stm_ebr_thread *)pthread_getspecific(g_current_key);
+    if (t != NULL) return t;
+    t = stm_ebr_register();
+    if (t == NULL) return NULL;
+    if (pthread_setspecific(g_current_key, t) != 0) {
+        stm_ebr_thread_free(t);
+        return NULL;
+    }
+    return t;
+}
+
 /* ========================================================================= */
 /* Enter / exit.                                                              */
 /* ========================================================================= */

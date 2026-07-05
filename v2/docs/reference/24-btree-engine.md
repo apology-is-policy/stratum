@@ -1237,7 +1237,8 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
       failure atomicity (published tree byte-untouched, no
       invalidate); `n_seq_hw` cross-restart seq seeding; the CAS-link
       cold descent (uncached, tombstone-aware). Closes R171 P0-1 +
-      P0-4 at the engine layer (the fs.c port is chunk 10).
+      P0-4 at the engine layer (the fs.c PRODUCTION port is chunk 10,
+      below).
 - [x] **Engine retire (9.8-BE-engine-retire, chunk 9b)**:
       `stm_btree_engine_retire` — the synchronous implicit-abort +
       EBR-deferred RAM teardown split; `dataset_engine_close_locked`
@@ -1250,6 +1251,21 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
       `dataset_engine_retire_close_race` (test_dataset.c),
       `fs_rollback_reseeds_inode_alloc_gate` (test_fs.c) — the
       dataset + fs ones fail deterministically on the neutered fixes.
+- [x] **The fs.c production port (9.8-BE-fs-port, chunk 10)**: the 11
+      subsystem engine funnels (`in`/`di`/`xa`/`ex_engine_get` +
+      `in_engine_put` + `di`/`xa`/`ex_engine_put`/`_del`) flip from the
+      serial to the `_concurrent` engine APIs, self-pinning EBR via the
+      shared `stm_ebr_thread_current` (lifted into the EBR module). The
+      writes MUST be `_concurrent` (P0-1 + regime purity — serial
+      insert/delete refuse a latched root); the reads move too for
+      `serial_mu`-avoidance + uniformity (the serial lookup is itself
+      chain-aware). fs.c write ops are byte-unchanged (SH + per-inode pin
+      kept). Completes the R171 P0-1 PRODUCTION closure. See
+      `docs/reference/26-fs-write-path.md` "9.8-BE-fs-port" +
+      `phase-9.8-design.md` §7.2.1. Regression:
+      `fs_be_port_shared_engine_uncommitted_roundtrip` (test_fs.c;
+      non-vacuous — a neutered serial write funnel refuses on the
+      latched shared engine).
 - [x] R150 audit close — 2 P1 (`load_child` DAG double-free +
       child-kind-mismatch UAF) + 3 P2. R151 audit close (impl-2) —
       0 P0 / 0 P1; 1 P2 (the abort-path nonce-safety rationale, doc

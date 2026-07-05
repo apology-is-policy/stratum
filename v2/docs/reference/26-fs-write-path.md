@@ -277,6 +277,61 @@ As-built after Area-A round 1, **closed clean over 3 convergent audit rounds**
 
 No P0/P1/P2 open on the write path.
 
+### 9.8-BE-fs-port (chunk 10) — the metadata-engine write cutover
+
+The four metadata subsystems (inode / dirent / xattr / extent-index) share
+ONE per-dataset `stm_btree_engine` (keys tag-prefixed). Chunk 10 flipped every
+engine funnel from the SERIAL `stm_btree_engine_insert`/`_delete`/`_lookup` to
+the `_concurrent` (CAS-prepend / chain-aware) variants — the production closure
+of R171 P0-1 (the wait-free reader vs the writer's in-place free-and-assign) and
+P0-4. The 11 funnels: `in_engine_get`/`in_engine_put` (`inode.c`),
+`di_engine_get`/`di_engine_put`/`di_engine_del` (`dirent.c`),
+`xa_engine_get`/`xa_engine_put`/`xa_engine_del` (`xattr.c`),
+`ex_engine_get`/`ex_engine_put`/`ex_engine_del` (`extent_index.c`).
+
+Key as-built decisions (see `phase-9.8-design.md` §7.2.1):
+
+- **The WRITE funnels MUST be `_concurrent` (P0-1 + regime purity).** The serial
+  insert's in-place `free(old); val=new` is the R171 P0-1 UAF, and the serial
+  insert/delete REFUSE a chained (latched) root — so all 7 write funnels flip
+  together the moment any subsystem latches the shared engine.
+- **The READ funnels also move, but the serial lookup is NOT chain-blind.**
+  Ground truth (`engine_lookup_locked`): the serial lookup DOES resolve the
+  in-memory delta chain (`chain_resolve_for_key`, before the buffer + base) and
+  is memory-safe on a latched engine under `serial_mu` + the `fs->global` SH
+  envelope — a serial validation read would be correct. The 4 read funnels move
+  to the wait-free `_concurrent` lookup anyway for **`serial_mu` avoidance** (the
+  serial lookup holds `serial_mu`, which the mini-consolidation trylocks; under
+  CF-2's worker pool a `serial_mu`-holding validation read would suppress
+  consolidation and grow the chain unbounded — the #39/#40 family) and
+  **uniformity** (one EBR-pin safety model across all fs-driven engine access,
+  matching the wait-free read path). A deliberate CF-2-readiness step just past
+  §5.1.1's literal "write ops".
+- **Self-pinning funnels.** The `_concurrent` ops require an EBR-pinned caller.
+  Rather than thread an `stm_ebr_thread *` through ~100 call sites of a
+  semantically-vacuous token, each funnel grabs the shared per-thread handle
+  (`stm_ebr_thread_current`, lifted into the EBR module) and brackets its op in
+  `stm_ebr_enter`/`_exit` — the value is copied out of the tree under the pin, so
+  it is safe after the exit. CONTRACT: no caller of a funnel already holds a pin
+  (EBR is non-reentrant). This holds because the wait-free read ops use the
+  INDEPENDENT `stm_*_lookup_concurrent` wrappers (never the funnels), and the
+  serial reads + write setters reach the funnels only from unpinned contexts.
+- **`fs->global` SH is kept** on single-inode writes — it is the exclusion that
+  keeps a `_concurrent` writer off an engine while rollback / `dataset_destroy` /
+  unmount retires it (those hold `fs->global` EX; the chunk-9b R171 P0-2 retire
+  contract). The §7.2 `NO fs->global` end-state is deferred to 9.9+ (§10.6 seam).
+- **Regime purity.** The concurrent-regime latch is sticky, so all 11 funnels
+  (and every fs.c writer reaching them) flip in ONE chunk — a still-serial funnel
+  would refuse (`STM_ENOTSUPPORTED`) the moment any subsystem latches the shared
+  engine. `STM_EBUSY` (seal-retry back-pressure) propagates; unreachable pre-CF-2
+  (a single serial connection has no concurrent sealer).
+
+Regression: `test_fs.c::fs_be_port_shared_engine_uncommitted_roundtrip` writes
+from each subsystem onto the shared latched engine and reads them all back
+uncommitted (non-vacuous both ways — a serial write funnel refuses on the latch;
+a serial read funnel misses the chain). The existing 69-test suite is itself a
+regime-purity + chain-aware-read regression (a partial port fails it).
+
 ## Known caveats / footguns
 
 - **F4 (v1.x seam)** — an interior hole inside an RMW cover is materialized as a

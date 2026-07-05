@@ -402,11 +402,20 @@ static stm_status xa_engine_get(stm_xattr_index *idx,
     stm_status ks = xa_encode_key(ino, probe, key);
     if (ks != STM_OK) return ks;
 
+    /* 9.8-BE-fs-port (chunk 10): chain-aware _concurrent lookup + a
+     * self-entered EBR pin (value copied out under the pin).
+     * Non-reentrant caller contract -- see inode.c in_engine_get. */
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+
     bool found = false;
     void *vbuf = NULL;
     size_t vlen = 0;
-    stm_status ls = stm_btree_engine_lookup(eng, key, XA_KEY_LEN,
-                                            &found, &vbuf, &vlen);
+    stm_ebr_enter(ebr);
+    stm_status ls = stm_btree_engine_lookup_concurrent(eng, ebr, key,
+                                                       XA_KEY_LEN,
+                                                       &found, &vbuf, &vlen);
+    stm_ebr_exit(ebr);
     if (ls != STM_OK) return ls;
     if (!found) return STM_OK;                  /* *out_found stays false */
 
@@ -448,8 +457,15 @@ static stm_status xa_engine_put(stm_xattr_index *idx,
     if (!val) return STM_ENOMEM;
     size_t vlen = 0;
     xa_encode_value(r, val, &vlen);
-    stm_status is = stm_btree_engine_insert(eng, key, XA_KEY_LEN,
-                                            val, vlen);
+
+    /* 9.8-BE-fs-port (chunk 10): CAS-prepend via _concurrent insert;
+     * self-entered EBR pin; non-reentrant caller contract. */
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) { free(val); return STM_ENOMEM; }
+    stm_ebr_enter(ebr);
+    stm_status is = stm_btree_engine_insert_concurrent(eng, ebr, key,
+                                                       XA_KEY_LEN, val, vlen);
+    stm_ebr_exit(ebr);
     free(val);
     return is;
 }
@@ -466,7 +482,17 @@ static stm_status xa_engine_del(stm_xattr_index *idx,
     uint8_t key[XA_KEY_LEN];
     stm_status ks = xa_encode_key(ino, probe, key);
     if (ks != STM_OK) return ks;
-    return stm_btree_engine_delete(eng, key, XA_KEY_LEN, NULL);
+
+    /* 9.8-BE-fs-port (chunk 10): CAS-prepend a DELETE delta via
+     * _concurrent delete; self-entered EBR pin; non-reentrant caller
+     * contract. */
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+    stm_ebr_enter(ebr);
+    stm_status rc = stm_btree_engine_delete_concurrent(eng, ebr, key,
+                                                       XA_KEY_LEN);
+    stm_ebr_exit(ebr);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */

@@ -331,38 +331,13 @@ struct stm_fs {
 /* fine at process scope).                                                   */
 /* ========================================================================= */
 
-static pthread_key_t  fs_ebr_key;
-static pthread_once_t fs_ebr_key_once = PTHREAD_ONCE_INIT;
-
-static void fs_ebr_destructor(void *handle)
-{
-    if (handle) stm_ebr_thread_free((stm_ebr_thread *)handle);
-}
-
-static void fs_ebr_key_init(void)
-{
-    /* Failure to create the key would force every reader through the
-     * stm_ebr_register/free pair per call. We accept the alloc cost over
-     * a crash here — the key allocation failing at process startup is
-     * basically OOM territory, which the system has bigger problems
-     * with. Caller surfaces it as STM_ENOMEM downstream. */
-    (void)pthread_key_create(&fs_ebr_key, fs_ebr_destructor);
-}
-
+/* 9.8-BE-fs-port (chunk 10): the per-thread handle cache moved to the EBR
+ * module (stm_ebr_thread_current) so the subsystem write funnels grab the
+ * SAME handle these read ops use — one handle per real thread. This is now
+ * a thin delegating wrapper; the read-op call sites are unchanged. */
 static stm_ebr_thread *fs_ebr_thread_current(void)
 {
-    pthread_once(&fs_ebr_key_once, fs_ebr_key_init);
-    stm_ebr_thread *t = (stm_ebr_thread *)pthread_getspecific(fs_ebr_key);
-    if (t != NULL) return t;
-    t = stm_ebr_register();
-    if (t == NULL) return NULL;
-    if (pthread_setspecific(fs_ebr_key, t) != 0) {
-        /* Setspecific failure is rare (the key must be valid). Don't leak
-         * the handle — free it and report failure. */
-        stm_ebr_thread_free(t);
-        return NULL;
-    }
-    return t;
+    return stm_ebr_thread_current();
 }
 
 /* ========================================================================= */
