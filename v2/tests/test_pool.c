@@ -692,6 +692,44 @@ STM_TEST(pool_mount_accepts_v32_ub_upgrade_window) {
     unlink(kf);
 }
 
+/* 9.8-BE-flush (chunk 8, R172 F5): the other half of the upgrade
+ * window — a v32 pool STAMPS STM_UB_VERSION (33) at its next commit
+ * (sync.c builds every UB at the binary's version), read back raw.
+ * The live upgrade-on-mount boot proved the mount leg; this pins the
+ * stamp leg deterministically. */
+STM_TEST(pool_commit_stamps_current_version_on_v32_pool) {
+    make_tmp("v32_stamp");
+    char kf[256];
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_v32st_kf_%d.bin", (int)getpid());
+    unlink(kf);
+    make_keyfile(kf);
+
+    format_and_tamper_live_ub(kf, mutate_version_to_32);
+
+    stm_fs_mount_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.keyfile_path = kf;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_fs_reserve(fs, 4u, 0, &p));   /* a real mutation */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_unmount(fs);
+
+    stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bopts, &d));
+    stm_uberblock ub;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+    STM_ASSERT_EQ((long long)stm_load_le32(ub.ub_version),
+                  (long long)STM_UB_VERSION);
+    stm_bdev_close(d);
+
+    unlink(g_tmp_path);
+    unlink(kf);
+}
+
 STM_TEST(pool_mount_refuses_v34_ub_from_the_future) {
     make_tmp("v34_ub");
     char kf[256];

@@ -346,6 +346,15 @@ static stm_status node_insert(stm_btree_engine *eng, eng_node *node,
                                uint32_t depth, split_result *out_split)
 {
     if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+    /* 9.8-BE (chunk 8): the serial write path may not mutate THROUGH
+     * a buffered node — a direct leaf write racing pending messages
+     * for the same key breaks newest-wins (an older buffered DELETE
+     * would later flush over a newer direct INSERT). One engine never
+     * mixes regimes (today's serial fs.c writers have no message
+     * producer; chunk 10's ported writers go through messages), so a
+     * buffered node on a serial write descent is misuse — refused
+     * loudly rather than silently corrupting. */
+    if (node->buf_count) return STM_ENOTSUPPORTED;
     node->dirty = true;
 
     if (node->is_leaf) {
@@ -786,6 +795,10 @@ static stm_status node_delete(stm_btree_engine *eng, eng_node *node,
                                uint32_t depth, bool *removed)
 {
     if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+    /* Serial-writes-through-a-buffered-node guard — see node_insert.
+     * (A direct remove racing a buffered INSERT for the same key would
+     * be resurrected by the later flush.) */
+    if (node->buf_count) return STM_ENOTSUPPORTED;
 
     if (node->is_leaf) {
         bool found = false;
@@ -838,6 +851,326 @@ stm_status stm_btree_engine_delete(stm_btree_engine *eng,
     stm_status s = engine_delete_locked(eng, key, key_len, out_found);
     pthread_mutex_unlock(&eng->serial_mu);
     return s;
+}
+
+/* ========================================================================= */
+/* Bε flush (9.8-BE-flush, chunk 8).                                           */
+/* ========================================================================= */
+
+/*
+ * The flush moves an internal node's buffered messages exactly one
+ * tree level down (design §5.2): an internal child absorbs them into
+ * its own buffer (recursing when that buffer crosses the region cap);
+ * a leaf child has them APPLIED. Splits are handled EAGERLY — the
+ * over-cap check runs after every single splice, so every
+ * eng_split_internal call sees a total at most one splice past
+ * ENG_INTERNAL_PC_CAP, inside the chooser's proven envelope (R172
+ * F4). Because one flush can peel a node more than once, peels
+ * accumulate in an eng_split_vec instead of a single split_result;
+ * message routing mid-flush goes through the FAMILY (the node plus
+ * its peels so far) so a peel's key range keeps receiving its
+ * messages after the split.
+ *
+ * R172 F1 (BINDING): everything here mutates buf_msgs and node
+ * structure. It may only run on a subtree no wait-free reader can be
+ * traversing — reader safety is COW, never writer exclusion. The only
+ * production caller is the commit path (LF-2 regime: fs->global EX
+ * writers; production buffers stay empty until chunk 9); chunk 9's
+ * consolidator MUST route flushes through unpublished COW copies.
+ */
+
+static int msg_seq_cmp(const void *a, const void *b)
+{
+    const eng_msg *ma = a, *mb = b;
+    if (ma->seq < mb->seq) return -1;
+    if (ma->seq > mb->seq) return 1;
+    return 0;
+}
+
+static stm_status split_vec_push(eng_split_vec *vec,
+                                 uint8_t *sep_key, uint32_t sep_len,
+                                 eng_node *right)
+{
+    if (vec->n == vec->cap) {
+        uint32_t nc = vec->cap ? vec->cap * 2u : 4u;
+        eng_split_ent *nv = realloc(vec->v, (size_t)nc * sizeof *nv);
+        if (!nv) return STM_ENOMEM;        /* caller frees sep_key/right */
+        vec->v   = nv;
+        vec->cap = nc;
+    }
+    vec->v[vec->n++] = (eng_split_ent){ .sep_key = sep_key,
+                                        .sep_len = sep_len,
+                                        .right   = right };
+    return STM_OK;
+}
+
+/*
+ * Route `key` across the flush family: `node` plus the siblings
+ * peeled off it so far. A peel covers [its separator, the next-higher
+ * separator); node keeps (-inf, min separator) — so the member with
+ * the LARGEST separator <= key covers key (key == sep routes to the
+ * peel, matching the split partition's `>= sep -> right`).
+ */
+static eng_node *flush_family_route(eng_node *node, const eng_split_vec *vec,
+                                    const void *key, size_t key_len)
+{
+    eng_node            *best = node;
+    const eng_split_ent *bs   = NULL;
+    for (uint32_t i = 0; i < vec->n; i++) {
+        const eng_split_ent *e = &vec->v[i];
+        if (eng_key_cmp(e->sep_key, e->sep_len, key, key_len) <= 0 &&
+            (!bs || eng_key_cmp(e->sep_key, e->sep_len,
+                                bs->sep_key, bs->sep_len) > 0)) {
+            best = e->right;
+            bs   = e;
+        }
+    }
+    return best;
+}
+
+/*
+ * Eager self-split of family member `t`, run immediately after every
+ * splice into it. The while is defensive — the eager discipline keeps
+ * the total within one splice of the cap, so one split always
+ * suffices (and strictly reduces the byte count, so the loop
+ * terminates regardless).
+ */
+static stm_status flush_eager_split(eng_node *t, eng_split_vec *out_vec)
+{
+    while (eng_internal_payload_bytes(t) > ENG_INTERNAL_PC_CAP) {
+        eng_node *right = NULL;
+        uint8_t  *sep   = NULL;
+        uint32_t  sl    = 0;
+        stm_status s = eng_split_internal(t, &right, &sep, &sl);
+        if (s != STM_OK) return s;
+        s = split_vec_push(out_vec, sep, sl, right);
+        if (s != STM_OK) {
+            free(sep);
+            /* The moved-out half is no longer reachable from t —
+             * freeing it here cannot double-free with the caller's
+             * memtree invalidation. */
+            eng_node_free_recursive(right);
+            return s;
+        }
+    }
+    return STM_OK;
+}
+
+/*
+ * Splice one child-level peel (sep, right) into the family member
+ * covering sep, then eagerly re-split that member. Owns (sep, right):
+ * on failure both are freed (they are not tree-reachable).
+ */
+static stm_status flush_absorb_peel(eng_node *node, eng_split_vec *out_vec,
+                                    uint8_t *sep, uint32_t sep_len,
+                                    eng_node *right)
+{
+    eng_node *t = flush_family_route(node, out_vec, sep, sep_len);
+    stm_status s = eng_internal_reserve_splice(t);
+    if (s != STM_OK) {
+        free(sep);
+        eng_node_free_recursive(right);
+        return s;
+    }
+    eng_internal_splice(t, eng_pivot_child_for(t, sep, sep_len),
+                        sep, sep_len, right);
+    return flush_eager_split(t, out_vec);
+}
+
+/* Move message *m into an internal child's buffer (struct copy — the
+ * key/value heap transfers; the caller zeroes the source slot). Exact
+ * realloc per append: counts are bounded by the region cap plus the
+ * in-flight batch, both small. */
+static stm_status flush_buf_append(eng_node *child, const eng_msg *m)
+{
+    eng_msg *g = eng_buf_realloc(child->buf_msgs,
+                                 ((size_t)child->buf_count + 1u) * sizeof *g);
+    if (!g) return STM_ENOMEM;
+    child->buf_msgs = g;
+    g[child->buf_count++] = *m;
+    return STM_OK;
+}
+
+/*
+ * Apply one message to a leaf child. INSERT upserts (a message value
+ * is wire-bounded far below the spill threshold, but eng_leaf_put
+ * handles any size uniformly — spill is decided downstream by
+ * leaf_sync_spill at commit, which runs AFTER the flush). DELETE
+ * removes if present, routing an orphaned spill chain to the commit
+ * bookkeeping; a DELETE for an absent key is a no-op.
+ */
+static stm_status flush_leaf_apply(stm_btree_engine *eng, eng_node *leaf,
+                                   const eng_msg *m)
+{
+    if (m->op == ENG_DELTA_INSERT)
+        return eng_leaf_put(leaf, m->key, m->key_len,
+                            m->value, m->value_len);
+    bool found = false;
+    uint32_t i = eng_leaf_lower_bound(leaf, m->key, m->key_len, &found);
+    if (!found) return STM_OK;
+    return eng_leaf_remove(leaf, i, &eng->orphaned_spill_blocks);
+}
+
+stm_status eng_flush_node(stm_btree_engine *eng, eng_node *node,
+                           uint32_t depth, eng_split_vec *vec)
+{
+    if (depth >= ENG_FLUSH_MAX_RECURSION) return STM_ECORRUPT;
+    if (node->is_leaf || !node->buf_count) return STM_OK;
+
+    /* Detach the WHOLE buffer up front (design §5.2 step 5's clear) —
+     * a split of `node` mid-delivery then partitions an empty buffer.
+     * From here every exit leaves the buffer detached and node dirty;
+     * an error mid-delivery leaves the memtree half-mutated and the
+     * caller MUST drop it (the durable tree still holds every
+     * message — nothing is lost or duplicated). */
+    eng_msg  *msgs = node->buf_msgs;
+    uint32_t  n    = node->buf_count;
+    node->buf_msgs  = NULL;
+    node->buf_count = 0;
+    node->dirty     = true;
+
+    /* Deliver in ascending-seq order so per-key newest-wins holds at
+     * every recipient (bepsilon.tla::FlushPreservesNewestWins) — the
+     * in-memory array order is not trustworthy (chunk 7b). */
+    qsort(msgs, n, sizeof *msgs, msg_seq_cmp);
+
+    stm_status s = STM_OK;
+    for (uint32_t i = 0; i < n && s == STM_OK; i++) {
+        eng_msg  *m   = &msgs[i];
+        eng_node *f   = flush_family_route(node, vec, m->key, m->key_len);
+        uint32_t  idx = eng_pivot_child_for(f, m->key, m->key_len);
+        eng_node *child = NULL;
+        s = load_child(eng, f, idx, &child);
+        if (s != STM_OK) break;
+
+        if (!child->is_leaf) {
+            s = flush_buf_append(child, m);
+            if (s != STM_OK) break;
+            /* Heap ownership moved into the child; keep the source
+             * slot inert for the final array free. */
+            m->key = NULL;  m->value = NULL;
+            m->key_len = 0; m->value_len = 0;
+            child->dirty = true;
+            if (eng_msgs_region_bytes(child->buf_msgs, child->buf_count) >
+                ENG_BUFFER_REGION_MAX) {
+                /* The child's buffer crossed the region cap — flush it
+                 * in turn. Its peels sit at THIS node's level: splice
+                 * each into the family. */
+                eng_split_vec cvec = { 0 };
+                s = eng_flush_node(eng, child, depth + 1u, &cvec);
+                for (uint32_t j = 0; s == STM_OK && j < cvec.n; j++) {
+                    eng_split_ent *e = &cvec.v[j];
+                    s = flush_absorb_peel(node, vec, e->sep_key, e->sep_len,
+                                          e->right);
+                    e->sep_key = NULL;      /* consumed (or freed) */
+                    e->right   = NULL;
+                }
+                eng_split_vec_free_deep(&cvec);    /* un-spliced remainder */
+            }
+        } else {
+            s = flush_leaf_apply(eng, child, m);
+            if (s != STM_OK) break;
+            child->dirty = true;
+            if (eng_leaf_payload_bytes(child) > ENG_PAYLOAD_CAP) {
+                s = eng_internal_reserve_splice(f);
+                if (s != STM_OK) break;
+                eng_node *right = NULL;
+                uint8_t  *sep   = NULL;
+                uint32_t  sl    = 0;
+                s = eng_split_leaf(child, &right, &sep, &sl);
+                if (s != STM_OK) break;
+                eng_internal_splice(f, idx, sep, sl, right);
+                s = flush_eager_split(f, vec);
+            }
+        }
+    }
+
+    eng_msg_array_free(msgs, n);
+    return s;
+}
+
+/*
+ * Commit-time flush trigger (design §3.4 step 2): walk the RESIDENT
+ * in-memory tree; any internal node whose buffer exceeds the region
+ * cap flushes toward the leaves. A node's peels splice into its
+ * parent's family; the root's peels bubble to the commit wrapper for
+ * the root grow. Children are read at a live bound — splices from a
+ * child's flush grow the count, and the freshly spliced siblings
+ * (already flushed / empty-buffered) re-check as no-ops.
+ */
+static stm_status flush_walk(stm_btree_engine *eng, eng_node *node,
+                             uint32_t depth, eng_split_vec *vec)
+{
+    if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+    if (node->is_leaf) return STM_OK;
+
+    stm_status s = STM_OK;
+    if (node->buf_count &&
+        eng_msgs_region_bytes(node->buf_msgs, node->buf_count) >
+            ENG_BUFFER_REGION_MAX)
+        s = eng_flush_node(eng, node, depth, vec);
+
+    for (uint32_t i = 0; s == STM_OK && i < node->n_pivots + 1u; i++) {
+        eng_node *c = node->children[i].mem;
+        if (!c || c->is_leaf) continue;
+        eng_split_vec cvec = { 0 };
+        s = flush_walk(eng, c, depth + 1u, &cvec);
+        for (uint32_t j = 0; s == STM_OK && j < cvec.n; j++) {
+            eng_split_ent *e = &cvec.v[j];
+            s = flush_absorb_peel(node, vec, e->sep_key, e->sep_len,
+                                  e->right);
+            e->sep_key = NULL;
+            e->right   = NULL;
+        }
+        eng_split_vec_free_deep(&cvec);
+    }
+    return s;
+}
+
+/*
+ * Absorb root-level peels by growing the tree upward: a fresh
+ * internal root takes the old root as child 0 and splices every peel
+ * at its routed position (peel ranges are disjoint, so any splice
+ * order lands sorted). Splicing can push the new root over the cap —
+ * its own eager peels feed the next round. Publishes mvcc_root on
+ * every root reassignment (R170 P2-3). Consumes *vec.
+ */
+static stm_status grow_root_absorb(stm_btree_engine *eng, eng_split_vec *vec)
+{
+    uint32_t rounds = 0;
+    while (vec->n) {
+        if (++rounds > ENG_FLUSH_MAX_RECURSION) {
+            eng_split_vec_free_deep(vec);
+            return STM_ECORRUPT;
+        }
+        eng_node *nr = eng_node_new_internal_sized(vec->n, vec->n + 1u);
+        if (!nr) {
+            eng_split_vec_free_deep(vec);
+            return STM_ENOMEM;
+        }
+        nr->dirty       = true;
+        nr->children[0] = (eng_child){ .mem     = eng->root,
+                                       .is_leaf = eng->root->is_leaf };
+        eng->root = nr;        /* prior root reachable as children[0].mem */
+        atomic_store_explicit(&eng->mvcc_root, nr, memory_order_release);
+
+        eng_split_vec next = { 0 };
+        stm_status    s    = STM_OK;
+        for (uint32_t i = 0; s == STM_OK && i < vec->n; i++) {
+            eng_split_ent *e = &vec->v[i];
+            s = flush_absorb_peel(nr, &next, e->sep_key, e->sep_len,
+                                  e->right);
+            e->sep_key = NULL;
+            e->right   = NULL;
+        }
+        eng_split_vec_free_deep(vec);          /* un-consumed remainder */
+        *vec = next;
+        if (s != STM_OK) {
+            eng_split_vec_free_deep(vec);
+            return s;
+        }
+    }
+    return STM_OK;
 }
 
 /* ========================================================================= */
@@ -1158,6 +1491,37 @@ stm_status stm_btree_engine_commit_flush(stm_btree_engine *eng, uint64_t gen,
     stm_status s = load_root(eng, &root);
     if (s != STM_OK) return s;             /* no pending window opened */
 
+    /* 9.8-BE-flush (chunk 8): commit-time Bε flush — any resident node
+     * whose message buffer exceeds the region cap flushes toward the
+     * leaves (design §3.4 step 2). Runs BEFORE count_dirty (a flush
+     * dirties more nodes) and before the pending window opens, so a
+     * failure needs no pending rollback. Root-level peels grow the
+     * tree upward; the walk re-runs until quiescent so subtrees under
+     * fresh peels are covered too. On any failure the half-flushed
+     * memtree is dropped — the durable tree still holds every message
+     * (bepsilon.tla::FlushPreservesMessages via full-clear delivery +
+     * COW failure atomicity). */
+    for (uint32_t round = 0; ; round++) {
+        if (round > ENG_FLUSH_MAX_RECURSION) {
+            invalidate_memtree(eng);
+            return STM_ECORRUPT;
+        }
+        eng_split_vec rvec = { 0 };
+        s = flush_walk(eng, root, 0, &rvec);
+        if (s != STM_OK) {
+            eng_split_vec_free_deep(&rvec);
+            invalidate_memtree(eng);
+            return s;
+        }
+        if (!rvec.n) break;                /* quiescent — no peels */
+        s = grow_root_absorb(eng, &rvec);  /* consumes rvec */
+        if (s != STM_OK) {
+            invalidate_memtree(eng);
+            return s;
+        }
+        root = eng->root;                  /* the tree grew a level */
+    }
+
     /* count_dirty gives the initial-capacity hint for the paddr vectors
      * (spill chains grow them further during the walk). p is zeroed —
      * calloc at create/open, pending_reset after every commit and after
@@ -1431,41 +1795,198 @@ stm_status stm_btree_engine_walk_paddrs(stm_btree_engine *eng,
 /* Scan + stats.                                                                */
 /* ========================================================================= */
 
-static stm_status scan_node(stm_btree_engine *eng, eng_node *node,
-                             stm_btree_engine_iter_cb cb, void *ctx,
-                             uint32_t depth, bool *stopped)
-{
-    if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+/* ---- Scan message overlay (9.8-BE-flush, chunk 8). ------------------------ */
 
-    if (node->is_leaf) {
-        for (uint32_t i = 0; i < node->n_entries; i++) {
-            if (cb(node->entries[i].key, node->entries[i].key_len,
-                   node->entries[i].val, node->entries[i].val_len, ctx) != 0) {
+/*
+ * A scan descending through buffered internal nodes carries down an
+ * OVERLAY window: per key, the newest (max-seq) pending message
+ * applicable to the subtree. At the leaf the window merges with the
+ * stored entries — an INSERT overrides or introduces its key, a
+ * DELETE hides it — so the enumeration observes exactly what a
+ * lookup would (bepsilon.tla::PerKeyNewestWins). READ-ONLY by design:
+ * a scan never flushes (R172 F1 — a published node's buffer is
+ * immutable under wait-free readers; a reader cannot COW), so the
+ * concurrent walker gets the merge for free.
+ *
+ * The window is a key-sorted array of message POINTERS into the
+ * nodes' buf_msgs arrays; those stay stable for the walk's lifetime
+ * (the serial path holds serial_mu; the concurrent path is EBR-pinned
+ * over immutable published buffers).
+ */
+
+static int msg_key_seq_cmp(const void *a, const void *b)
+{
+    const eng_msg *ma = *(const eng_msg *const *)a;
+    const eng_msg *mb = *(const eng_msg *const *)b;
+    int c = eng_key_cmp(ma->key, ma->key_len, mb->key, mb->key_len);
+    if (c) return c;
+    return (ma->seq > mb->seq) ? -1 : 1;   /* newest first within a key */
+}
+
+/*
+ * Fold `node`'s buffered messages into the inherited window: clip to
+ * [lo, hi] when bounded, dedupe to max-seq per key, and merge with
+ * the (already unique-keyed) inherited entries — newest seq wins on a
+ * key collision. *out gets a fresh array the caller frees; the
+ * inherited window is never modified.
+ */
+static stm_status overlay_merge(const eng_node *node, bool bounded,
+                                const void *lo, size_t lo_len,
+                                const void *hi, size_t hi_len,
+                                const eng_msg **win, uint32_t win_n,
+                                const eng_msg ***out, uint32_t *out_n)
+{
+    const eng_msg **own = malloc((size_t)node->buf_count * sizeof *own);
+    if (!own) return STM_ENOMEM;
+    uint32_t on = 0;
+    for (uint32_t i = 0; i < node->buf_count; i++) {
+        const eng_msg *m = &node->buf_msgs[i];
+        if (bounded &&
+            (eng_key_cmp(m->key, m->key_len, lo, lo_len) < 0 ||
+             eng_key_cmp(m->key, m->key_len, hi, hi_len) > 0))
+            continue;
+        own[on++] = m;
+    }
+    qsort(own, on, sizeof *own, msg_key_seq_cmp);
+    uint32_t dn = 0;                       /* keep first per key = max seq */
+    for (uint32_t i = 0; i < on; i++) {
+        if (dn && eng_key_cmp(own[i]->key, own[i]->key_len,
+                              own[dn - 1u]->key, own[dn - 1u]->key_len) == 0)
+            continue;
+        own[dn++] = own[i];
+    }
+    on = dn;
+
+    const eng_msg **mg = malloc(((size_t)on + win_n) * sizeof *mg);
+    if (!mg) { free(own); return STM_ENOMEM; }
+    uint32_t n = 0, a = 0, b = 0;
+    while (a < on && b < win_n) {
+        int c = eng_key_cmp(own[a]->key, own[a]->key_len,
+                            win[b]->key, win[b]->key_len);
+        if (c < 0)      mg[n++] = own[a++];
+        else if (c > 0) mg[n++] = win[b++];
+        else {
+            /* Same key at two levels — newest wins. (An inherited
+             * message is an ancestor's, strictly newer than any of
+             * node's for that key; the seq comparison encodes that
+             * without leaning on it.) */
+            mg[n++] = (own[a]->seq > win[b]->seq) ? own[a] : win[b];
+            a++; b++;
+        }
+    }
+    while (a < on)    mg[n++] = own[a++];
+    while (b < win_n) mg[n++] = win[b++];
+    free(own);
+    *out   = mg;
+    *out_n = n;
+    return STM_OK;
+}
+
+/*
+ * Merge-emit a leaf's in-range entries with its overlay window. Both
+ * sequences ascend by key; on a key match the overlay wins (a stored
+ * entry predates every buffered message above it).
+ */
+static stm_status leaf_merge_emit(const eng_node *leaf, bool bounded,
+                                  const void *lo, size_t lo_len,
+                                  const void *hi, size_t hi_len,
+                                  const eng_msg **win, uint32_t win_n,
+                                  stm_btree_engine_iter_cb cb, void *ctx,
+                                  bool *stopped)
+{
+    uint32_t ei = 0;
+    if (bounded) {
+        bool dummy = false;
+        ei = eng_leaf_lower_bound(leaf, lo, lo_len, &dummy);
+    }
+    uint32_t wi = 0;
+    for (;;) {
+        const eng_entry *e = (ei < leaf->n_entries) ? &leaf->entries[ei]
+                                                    : NULL;
+        if (e && bounded &&
+            eng_key_cmp(e->key, e->key_len, hi, hi_len) > 0)
+            e = NULL;                      /* sorted leaf — past hi */
+        const eng_msg *m = (wi < win_n) ? win[wi] : NULL;
+        if (!e && !m) break;
+
+        int c;
+        if (!e)      c = 1;                /* window only */
+        else if (!m) c = -1;               /* entry only */
+        else c = eng_key_cmp(e->key, e->key_len, m->key, m->key_len);
+
+        if (c < 0) {
+            if (cb(e->key, e->key_len, e->val, e->val_len, ctx) != 0) {
                 *stopped = true;
                 return STM_OK;
             }
+            ei++;
+        } else {
+            /* The window covers this key (c > 0: introduced; c == 0:
+             * overrides the stored entry). A DELETE emits nothing. */
+            if (m->op == ENG_DELTA_INSERT &&
+                cb(m->key, m->key_len, m->value, m->value_len, ctx) != 0) {
+                *stopped = true;
+                return STM_OK;
+            }
+            if (c == 0) ei++;
+            wi++;
         }
-        return STM_OK;
-    }
-
-    /* 9.8-BE (chunk 7b): scans do not merge buffered messages yet —
-     * that lands with the chunk-8 flush (which also gives scan the
-     * flush-on-path option). Until then a buffered node on a scan
-     * path REFUSES rather than silently omitting/resurrecting keys.
-     * No production writer exists before chunk 9, so this is
-     * unreachable outside crafted tests. */
-    if (node->buf_count) return STM_ENOTSUPPORTED;
-
-    uint32_t nc = node->n_pivots + 1u;
-    for (uint32_t i = 0; i < nc; i++) {
-        eng_node *child = NULL;
-        stm_status s = load_child(eng, node, i, &child);
-        if (s != STM_OK) return s;
-        s = scan_node(eng, child, cb, ctx, depth + 1u, stopped);
-        if (s != STM_OK) return s;
-        if (*stopped) return STM_OK;
     }
     return STM_OK;
+}
+
+/*
+ * The unified subtree scan (full when !bounded, [lo, hi] otherwise;
+ * both serial and concurrent walks run this body). `win` holds the
+ * ancestors' pending messages routed into this subtree, key-sorted
+ * and unique per key.
+ */
+static stm_status scan_subtree(stm_btree_engine *eng, eng_node *node,
+                               bool bounded,
+                               const void *lo, size_t lo_len,
+                               const void *hi, size_t hi_len,
+                               const eng_msg **win, uint32_t win_n,
+                               stm_btree_engine_iter_cb cb, void *ctx,
+                               uint32_t depth, bool *stopped)
+{
+    if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
+
+    if (node->is_leaf)
+        return leaf_merge_emit(node, bounded, lo, lo_len, hi, hi_len,
+                               win, win_n, cb, ctx, stopped);
+
+    /* Fold this node's buffered messages into the inherited window. */
+    const eng_msg **merged   = NULL;
+    uint32_t        merged_n = 0;
+    stm_status s = STM_OK;
+    if (node->buf_count) {
+        s = overlay_merge(node, bounded, lo, lo_len, hi, hi_len,
+                          win, win_n, &merged, &merged_n);
+        if (s != STM_OK) return s;
+        win   = merged;
+        win_n = merged_n;
+    }
+
+    uint32_t c_lo = bounded ? eng_pivot_child_for(node, lo, lo_len) : 0;
+    uint32_t c_hi = bounded ? eng_pivot_child_for(node, hi, hi_len)
+                            : node->n_pivots;
+    uint32_t w = 0;
+    for (uint32_t i = c_lo; i <= c_hi; i++) {
+        /* The window slice routing to child i — contiguous, since the
+         * window is key-sorted and routing is monotone in the key. */
+        uint32_t wbeg = w;
+        while (w < win_n &&
+               eng_pivot_child_for(node, win[w]->key, win[w]->key_len) == i)
+            w++;
+        eng_node *child = NULL;
+        s = load_child(eng, node, i, &child);
+        if (s != STM_OK) break;
+        s = scan_subtree(eng, child, bounded, lo, lo_len, hi, hi_len,
+                         win + wbeg, w - wbeg, cb, ctx, depth + 1u, stopped);
+        if (s != STM_OK || *stopped) break;
+    }
+    free(merged);
+    return s;
 }
 
 static stm_status engine_scan_locked(stm_btree_engine *eng,
@@ -1477,7 +1998,8 @@ static stm_status engine_scan_locked(stm_btree_engine *eng,
     stm_status s = load_root(eng, &root);
     if (s != STM_OK) return s;
     bool stopped = false;
-    return scan_node(eng, root, cb, ctx, 0, &stopped);
+    return scan_subtree(eng, root, false, NULL, 0, NULL, 0,
+                        NULL, 0, cb, ctx, 0, &stopped);
 }
 
 stm_status stm_btree_engine_scan(stm_btree_engine *eng,
@@ -1488,55 +2010,6 @@ stm_status stm_btree_engine_scan(stm_btree_engine *eng,
     stm_status s = engine_scan_locked(eng, cb, ctx);
     pthread_mutex_unlock(&eng->serial_mu);
     return s;
-}
-
-/* Enumerate the entries of `node`'s subtree whose keys fall in the
- * inclusive range [lo, hi] (9.6-impl-4a). A leaf binary-searches to
- * the first key >= lo and walks until a key > hi; an internal node
- * recurses only into children whose key-ranges can overlap [lo, hi]
- * — child(lo) .. child(hi) inclusive (children below child(lo) hold
- * keys < lo, children above child(hi) hold keys > hi). When lo sorts
- * strictly after hi, child(lo) > child(hi) and the range is empty. */
-static stm_status scan_range_node(stm_btree_engine *eng, eng_node *node,
-                                   const void *lo, size_t lo_len,
-                                   const void *hi, size_t hi_len,
-                                   stm_btree_engine_iter_cb cb, void *ctx,
-                                   uint32_t depth, bool *stopped)
-{
-    if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
-
-    if (node->is_leaf) {
-        bool dummy = false;
-        for (uint32_t i = eng_leaf_lower_bound(node, lo, lo_len, &dummy);
-             i < node->n_entries; i++) {
-            const eng_entry *e = &node->entries[i];
-            if (eng_key_cmp(e->key, e->key_len, hi, hi_len) > 0)
-                break;                      /* sorted leaf — past hi, done */
-            if (cb(e->key, e->key_len, e->val, e->val_len, ctx) != 0) {
-                *stopped = true;
-                return STM_OK;
-            }
-        }
-        return STM_OK;
-    }
-
-    /* 9.8-BE (chunk 7b): same refusal as scan_node — range scans do
-     * not merge buffered messages until the chunk-8 flush lands.
-     * Covers the concurrent walker too (it reuses this body). */
-    if (node->buf_count) return STM_ENOTSUPPORTED;
-
-    uint32_t c_lo = eng_pivot_child_for(node, lo, lo_len);
-    uint32_t c_hi = eng_pivot_child_for(node, hi, hi_len);
-    for (uint32_t i = c_lo; i <= c_hi; i++) {
-        eng_node *child = NULL;
-        stm_status s = load_child(eng, node, i, &child);
-        if (s != STM_OK) return s;
-        s = scan_range_node(eng, child, lo, lo_len, hi, hi_len,
-                            cb, ctx, depth + 1u, stopped);
-        if (s != STM_OK) return s;
-        if (*stopped) return STM_OK;
-    }
-    return STM_OK;
 }
 
 static stm_status engine_scan_range_locked(stm_btree_engine *eng,
@@ -1553,8 +2026,8 @@ static stm_status engine_scan_range_locked(stm_btree_engine *eng,
     stm_status s = load_root(eng, &root);
     if (s != STM_OK) return s;
     bool stopped = false;
-    return scan_range_node(eng, root, lo_key, lo_key_len, hi_key, hi_key_len,
-                           cb, ctx, 0, &stopped);
+    return scan_subtree(eng, root, true, lo_key, lo_key_len,
+                        hi_key, hi_key_len, NULL, 0, cb, ctx, 0, &stopped);
 }
 
 stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
@@ -1576,9 +2049,9 @@ stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
  * (mvcc_root acquire-load + double-checked load_root under commit_mu)
  * and same LF-2 preconditions (no concurrent writer / commit_abort,
  * cache-warmed working set). The chain walk at every node is currently
- * a no-op (chain always empty at LF-2); the code shape is identical to
- * the serial scan_range_node and is wired this way so 9.8-BE-prepend
- * can plug delta-application in without rewriting callers. */
+ * a no-op (chain always empty at LF-2); the body is the shared
+ * scan_subtree — buffered messages merge (chunk 8), and 9.8-BE-prepend
+ * plugs delta-application in without rewriting callers. */
 stm_status stm_btree_engine_scan_range_concurrent(stm_btree_engine *eng,
                                                    stm_ebr_thread *ebr,
                                                    const void *lo_key, size_t lo_key_len,
@@ -1612,8 +2085,8 @@ stm_status stm_btree_engine_scan_range_concurrent(stm_btree_engine *eng,
     }
 
     bool stopped = false;
-    return scan_range_node(eng, root, lo_key, lo_key_len, hi_key, hi_key_len,
-                           cb, ctx, 0, &stopped);
+    return scan_subtree(eng, root, true, lo_key, lo_key_len,
+                        hi_key, hi_key_len, NULL, 0, cb, ctx, 0, &stopped);
 }
 
 static int count_cb(const void *k, size_t kl, const void *v, size_t vl,
@@ -1644,10 +2117,12 @@ static stm_status engine_stats_get_locked(stm_btree_engine *eng,
         height++;
     }
 
-    /* Key count — full scan. */
+    /* Key count — full scan (buffer-merged: counts the logical view,
+     * so a buffered INSERT counts and a buffered DELETE does not). */
     uint64_t n_keys = 0;
     bool stopped = false;
-    s = scan_node(eng, root, count_cb, &n_keys, 0, &stopped);
+    s = scan_subtree(eng, root, false, NULL, 0, NULL, 0,
+                     NULL, 0, count_cb, &n_keys, 0, &stopped);
     if (s != STM_OK) return s;
 
     out->n_keys = n_keys;

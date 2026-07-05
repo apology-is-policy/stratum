@@ -815,15 +815,58 @@ typedef struct {
     uint32_t   cap;
     uint32_t   n;
     sortchk    pchk;       /* pivot sort check */
+    /* 9.8-BE-flush (chunk 8, R172 F2): pivots collected as BORROWED
+     * pointers into the decode buffer (valid for the decode's
+     * duration) so the message region's (target_child, seq) order is
+     * validated here too, not only on the load path — a scrub must
+     * reject what a load would. The wire layout puts pivots before
+     * messages, so the array is complete before the first msg cb. */
+    eng_pivot *pivs;
+    uint32_t   np;
+    uint32_t   np_cap;
+    uint32_t   prev_child;
+    uint64_t   prev_seq;
+    bool       have_msg;
     stm_status err;
 } verify_child_ctx;
 
 static int verify_pivot_cb(const void *key, size_t key_len,
                             uint32_t idx, void *ctx_)
 {
-    (void)idx;
     verify_child_ctx *c = ctx_;
+    if (idx >= c->np_cap) { c->err = STM_ECORRUPT; return 1; }
+    c->pivs[idx].key     = (uint8_t *)(uintptr_t)key;   /* borrowed */
+    c->pivs[idx].key_len = (uint32_t)key_len;
+    if (idx + 1u > c->np) c->np = idx + 1u;
     return sortchk_step(&c->pchk, key, key_len);
+}
+
+/* The load path's msgs_validate_order, streamed: route each message
+ * through a stack shell over the collected pivots (the SAME router a
+ * descent uses — no reimplementation to drift) and require ascending
+ * (target_child, seq), seq strictly increasing within one child. */
+static int verify_msg_cb(uint8_t op, uint64_t seq,
+                          const void *key, size_t key_len,
+                          const void *value, size_t value_len,
+                          uint32_t idx, void *ctx_)
+{
+    (void)op; (void)value; (void)value_len; (void)idx;
+    verify_child_ctx *c = ctx_;
+    eng_node shell;
+    memset(&shell, 0, sizeof shell);
+    shell.pivots   = c->pivs;
+    shell.n_pivots = c->np;
+    uint32_t child = eng_pivot_child_for(&shell, key, key_len);
+    if (c->have_msg &&
+        (child < c->prev_child ||
+         (child == c->prev_child && seq <= c->prev_seq))) {
+        c->err = STM_ECORRUPT;
+        return 1;
+    }
+    c->prev_child = child;
+    c->prev_seq   = seq;
+    c->have_msg   = true;
+    return 0;
 }
 
 static int verify_child_cb(const uint8_t bptr[STM_BTNODE_CHILD_BPTR_SIZE],
@@ -886,25 +929,28 @@ stm_status eng_verify_subtree(stm_btree_engine *eng,
     cc.gen   = calloc(nc, sizeof *cc.gen);
     cc.kind  = calloc(nc, sizeof *cc.kind);
     cc.csum  = calloc((size_t)nc * STM_BTNODE_CSUM_SIZE, 1);
+    cc.pivs  = calloc(info.n_entries ? info.n_entries : 1u, sizeof *cc.pivs);
+    cc.np_cap = info.n_entries;
     cc.cap   = nc;
-    if (!cc.paddr || !cc.gen || !cc.kind || !cc.csum) {
+    if (!cc.paddr || !cc.gen || !cc.kind || !cc.csum || !cc.pivs) {
         free(cc.paddr); free(cc.gen); free(cc.kind); free(cc.csum);
+        free(cc.pivs);
         free(buf);
         return STM_ENOMEM;
     }
 
-    /* 9.8-BE (chunk 7b): buffer-aware decode — the message region is
-     * structurally validated (NULL msg_cb skips enumeration only).
-     * The (target_child, seq) ORDER gate lives on the LOAD path
-     * (eng_node_read::msgs_validate_order), which every descent — and
-     * eng_collect_paddrs — inherits; this streaming walker keeps no
-     * pivot array to route against. */
+    /* 9.8-BE: buffer-aware decode. The message region's structure is
+     * validated by the codec walk; the (target_child, seq) ORDER gate
+     * runs here too (chunk 8, R172 F2) via verify_msg_cb over the
+     * borrowed pivot array — so scrub rejects exactly what a load
+     * (eng_node_read::msgs_validate_order) would. */
     s = stm_btnode_internal_decode_msgs(buf, STM_BTREE_ENGINE_NODE_SIZE, NULL,
                                    verify_pivot_cb, verify_child_cb,
-                                   NULL, &cc);
+                                   verify_msg_cb, &cc);
     if (s == STM_OK) s = cc.pchk.err;          /* pivots strictly sorted */
     if (s == STM_OK) s = cc.err;
     free(cc.pchk.prev);
+    free(cc.pivs);
     free(buf);
 
     for (uint32_t i = 0; s == STM_OK && i < cc.n; i++) {

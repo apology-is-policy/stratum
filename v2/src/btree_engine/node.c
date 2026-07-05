@@ -181,6 +181,53 @@ void eng_msg_array_free(eng_msg *msgs, uint32_t n)
     free(msgs);
 }
 
+size_t eng_msgs_region_bytes(const eng_msg *msgs, uint32_t n)
+{
+    size_t s = 0;
+    for (uint32_t i = 0; i < n; i++)
+        s += (size_t)STM_BTNODE_MSG_HDR_SIZE +
+             msgs[i].key_len + msgs[i].value_len;
+    return s;
+}
+
+void eng_split_vec_free_deep(eng_split_vec *vec)
+{
+    if (!vec) return;
+    for (uint32_t i = 0; i < vec->n; i++) {
+        free(vec->v[i].sep_key);
+        eng_node_free_recursive(vec->v[i].right);
+    }
+    free(vec->v);
+    vec->v   = NULL;
+    vec->n   = 0;
+    vec->cap = 0;
+}
+
+/* R172 F5: the buffer machinery's hooked allocator — see the
+ * engine_internal.h contract. Countdown semantics: a test stores
+ * N >= 0 and the (N+1)-th hooked allocation returns NULL. */
+_Atomic(int) eng_test_oom_countdown = -1;
+
+void *eng_buf_alloc(size_t sz)
+{
+    if (atomic_load_explicit(&eng_test_oom_countdown,
+                             memory_order_relaxed) >= 0 &&
+        atomic_fetch_sub_explicit(&eng_test_oom_countdown, 1,
+                                  memory_order_relaxed) == 0)
+        return NULL;
+    return malloc(sz);
+}
+
+void *eng_buf_realloc(void *p, size_t sz)
+{
+    if (atomic_load_explicit(&eng_test_oom_countdown,
+                             memory_order_relaxed) >= 0 &&
+        atomic_fetch_sub_explicit(&eng_test_oom_countdown, 1,
+                                  memory_order_relaxed) == 0)
+        return NULL;
+    return realloc(p, sz);
+}
+
 void eng_node_free(eng_node *n)
 {
     if (!n) return;
@@ -594,8 +641,8 @@ stm_status eng_split_internal(eng_node *n, eng_node **out_right,
     eng_msg *lm = NULL, *rm = NULL;
     uint32_t lm_n = 0, rm_n = 0;
     if (n->buf_count) {
-        lm = malloc((size_t)n->buf_count * sizeof *lm);
-        rm = malloc((size_t)n->buf_count * sizeof *rm);
+        lm = eng_buf_alloc((size_t)n->buf_count * sizeof *lm);
+        rm = eng_buf_alloc((size_t)n->buf_count * sizeof *rm);
         if (!lm || !rm) { free(lm); free(rm); return STM_ENOMEM; }
         for (uint32_t i = 0; i < n->buf_count; i++) {
             const eng_msg *msg = &n->buf_msgs[i];

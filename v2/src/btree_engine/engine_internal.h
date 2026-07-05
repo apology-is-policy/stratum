@@ -183,6 +183,62 @@ void eng_msg_array_free(eng_msg *msgs, uint32_t n);
     STM_BTNODE_BUFFER_REGION_MAX(STM_BTREE_ENGINE_NODE_SIZE)
 #define ENG_INTERNAL_PC_CAP   (ENG_PAYLOAD_CAP - ENG_BUFFER_REGION_MAX)
 
+/* Bε flush recursion cap (design §3.4): a flush cascade descends at
+ * most one tree level per recursion, so real depth is bounded by the
+ * tree height; the cap (== ENG_MAX_DEPTH) is a hard stop against a
+ * corrupt shape stalling a commit. Exceeding it is STM_ECORRUPT. */
+#define ENG_FLUSH_MAX_RECURSION   32u
+
+/*
+ * Siblings peeled off one node by a flush (9.8-BE-flush, chunk 8).
+ *
+ * A flush can grow a node past ENG_INTERNAL_PC_CAP more than once
+ * (leaf-split splices + child-flush splices), so a single
+ * split_result cannot carry the peels: the flush splits EAGERLY —
+ * immediately after the splice that crossed the cap, while the total
+ * is still within the §Split chooser's proven <= 4/3 × PC_CAP
+ * envelope (R172 F4) — and accumulates each (separator, right) here.
+ * Entries hold DISJOINT key ranges at the flushed node's level:
+ * entry i covers [sep_i, next-higher sep); the flushed node keeps
+ * (-inf, min sep). The caller either splices them into the parent
+ * (the absorb step) or grows the root around them.
+ *
+ * Ownership: sep_key + right are owned by the vec until spliced;
+ * eng_split_vec_free_deep frees any still-owned remainder (error
+ * paths — the peels are not reachable from the tree root, so
+ * invalidate_memtree alone would leak them).
+ */
+typedef struct {
+    uint8_t  *sep_key;
+    uint32_t  sep_len;
+    eng_node *right;
+} eng_split_ent;
+
+typedef struct {
+    eng_split_ent *v;
+    uint32_t       n;
+    uint32_t       cap;
+} eng_split_vec;
+
+void eng_split_vec_free_deep(eng_split_vec *vec);
+
+/* Encoded byte size of a message array (mirrors the codec:
+ * Σ per-message header + key + value). The flush trigger compares
+ * this against ENG_BUFFER_REGION_MAX. */
+size_t eng_msgs_region_bytes(const eng_msg *msgs, uint32_t n);
+
+/*
+ * Deterministic allocation-failure injection for the buffer machinery
+ * (R172 F5). -1 = disabled (production steady state; one relaxed load
+ * on cold paths). A test stores N >= 0: the (N+1)-th allocation
+ * through eng_buf_alloc / eng_buf_realloc returns NULL. Hooked sites
+ * are ONLY the Bε buffer machinery (split partition, flush append) —
+ * this is not a general malloc shim.
+ */
+extern _Atomic(int) eng_test_oom_countdown;
+void *eng_buf_alloc(size_t sz);
+void *eng_buf_realloc(void *p, size_t sz);
+
 /*
  * Out-of-line state for a spilled leaf value. NULL on an eng_entry
  * whose value fits inline. `eng_entry.val` ALWAYS holds the full
@@ -618,6 +674,36 @@ stm_status eng_split_leaf(eng_node *n, eng_node **out_right,
 STM_MUST_USE
 stm_status eng_split_internal(eng_node *n, eng_node **out_right,
                                uint8_t **out_sep_key, uint32_t *out_sep_len);
+
+/*
+ * Bε flush of one internal node's message buffer (9.8-BE-flush,
+ * chunk 8; engine.c). Detaches the node's ENTIRE buffer and delivers
+ * every message one tree level down in ascending-seq order: an
+ * internal child receives the message into its own buffer (recursing
+ * when that buffer crosses ENG_BUFFER_REGION_MAX); a leaf child has
+ * the message APPLIED (INSERT = upsert, DELETE = remove-if-present,
+ * orphaned spill chains routed to eng->orphaned_spill_blocks). Leaf
+ * and self splits are handled eagerly; peeled siblings accumulate in
+ * *vec (see eng_split_vec) for the caller to splice or root-grow.
+ *
+ * R172 F1 (BINDING): this MUTATES buf_msgs — the flushed node's, its
+ * children's — and node entries/pivots/children. It may only run on
+ * a subtree no wait-free reader can be traversing: reader safety is
+ * COW, never writer exclusion. At chunk 8 its only production caller
+ * is the commit path under the LF-2 regime (fs->global EX writers;
+ * production buffers empty until chunk 9); chunk 9's consolidator
+ * MUST route it through unpublished COW copies before populating
+ * buffers on live mvcc-reachable nodes.
+ *
+ * Failure contract: on any error the memtree is mid-flush-mutated and
+ * MUST be dropped by the caller (invalidate_memtree) — the durable
+ * tree still holds every message (nothing was written), so no message
+ * is lost or duplicated. *vec may hold peels on error; the caller
+ * frees them (eng_split_vec_free_deep) — they are NOT tree-reachable.
+ */
+STM_MUST_USE
+stm_status eng_flush_node(stm_btree_engine *eng, eng_node *node,
+                           uint32_t depth, eng_split_vec *vec);
 
 /* ========================================================================= */
 /* btnode_io.c — per-node device I/O (encode/encrypt/write, read/decrypt).     */

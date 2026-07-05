@@ -273,10 +273,10 @@ static-asserted equal to the wire ops). The load-bearing pieces:
   today (all run on serial-path dirty copies; the machinery is dormant
   before chunk 9's first production writer); chunk 8/9 MUST uphold it
   and their audits prosecute it.
-- **Scans refuse buffered nodes** (`STM_ENOTSUPPORTED`) until the
-  chunk-8 flush teaches them to merge — fail-closed beats silently
-  omitting/resurrecting keys. Unreachable in production before chunk 9
-  (no writer); pinned by `engine_msgs_persist_lookup_scan`.
+- **Scans refuse buffered nodes** (`STM_ENOTSUPPORTED`) — the chunk-7
+  fail-closed stance, **RETIRED at chunk 8**: scans now MERGE the
+  buffered messages read-only (see "The Bε flush + scan merge" below);
+  `engine_msgs_persist_lookup_scan` pins the merged counts.
 - **The ε carve**: internal pivot/child bytes budget against
   `ENG_INTERNAL_PC_CAP` (= payload − region/4) at the post-splice check
   and the split-point chooser, so a full buffer can never displace the
@@ -300,19 +300,138 @@ static-asserted equal to the wire ops). The load-bearing pieces:
   (Thylacine `docs/CONCURRENT-FS.md` §5). Pinned by
   `pool_mount_accepts_v32_ub_upgrade_window` /
   `pool_mount_refuses_v34_ub_from_the_future`.
-- **Verify** (`eng_verify_subtree`) decodes buffer-aware (structural
-  validation; NULL msg_cb) — the ORDER gate lives on the load path,
-  which every descent and `eng_collect_paddrs` inherit; the streaming
-  verify walker keeps no pivot array to route against (a chunk-8
-  candidate extension).
+- **Verify** (`eng_verify_subtree`) decodes buffer-aware — and since
+  chunk 8 (R172 F2) runs the SAME (target_child, seq) ORDER gate the
+  load path does: pivots are collected as borrowed in-buffer pointers
+  and each message routes through a stack shell over
+  `eng_pivot_child_for` (the descent's own router — no reimplemented
+  routing to drift), streamed in `verify_msg_cb`. Scrub rejects
+  exactly what a load would; pinned by
+  `engine_verify_rejects_disordered_buffer`.
 
 Tests: `engine_msgs_persist_lookup_scan` (inject un-normalised →
 commit → reopen → serial+concurrent consults + tombstone +
-scan-refusal + verify), `engine_msgs_disorder_on_disk_rejected` (two
-forged-disorder variants ECORRUPT at the read gate + an ordered
+merged-scan counts + verify), `engine_msgs_disorder_on_disk_rejected`
+(two forged-disorder variants ECORRUPT at the read gate + an ordered
 control that resolves through the buffer AND passes through to a
 tagged leaf), `engine_msgs_split_partitions_buffer` (the #35-class
 partition).
+
+### The Bε flush + scan merge (9.8-BE-flush, chunk 8)
+
+The flush (`engine.c::eng_flush_node`) moves an internal node's
+buffered messages exactly ONE tree level down (design §5.2): detach
+the WHOLE buffer (the §5.2 step-5 clear, done first so any mid-flush
+split of the node partitions an empty buffer), sort the detached batch
+by ascending seq (`bepsilon.tla::FlushPreservesNewestWins` — the
+in-memory order is untrustworthy, chunk 7b), then deliver each
+message by routing at delivery time:
+
+- an **internal child** absorbs the message into its own buffer
+  (`flush_buf_append` — struct copy, heap ownership moves, the source
+  slot zeroed so the final `eng_msg_array_free` stays uniform); when
+  the child's encoded region bytes cross `ENG_BUFFER_REGION_MAX`, the
+  child flushes in turn (recursive, `ENG_FLUSH_MAX_RECURSION` = 32 —
+  one level per recursion, so real depth is tree height; the cap is a
+  hard stop against corrupt shapes);
+- a **leaf child** has the message APPLIED (`flush_leaf_apply`:
+  INSERT = `eng_leaf_put` upsert — spill composes free, since
+  `leaf_sync_spill` runs later in the same commit; DELETE =
+  remove-if-present routing orphaned spill chains to the commit
+  bookkeeping; DELETE-of-absent is a no-op).
+
+**Eager splits + the peel vector.** One flush can grow a node past
+`ENG_INTERNAL_PC_CAP` more than once (leaf-split splices +
+child-flush splices), so a single `split_result` cannot carry the
+outcome. Instead the over-cap check runs after EVERY splice
+(`flush_eager_split`) — each `eng_split_internal` call therefore sees
+a total at most one splice past the cap, inside the chooser's proven
+`<= 2 × PC_CAP − max_pivot` envelope (the R172 F4 argument's safe
+region), so the `STM_ERANGE` no-cut arm stays unreachable for every
+producible tree. Peeled siblings accumulate in an `eng_split_vec`
+(disjoint ascending ranges at the flushed node's level), and
+mid-flush message routing goes through the FAMILY — the node plus its
+peels so far (`flush_family_route`: the member with the largest
+separator `<= key` covers the key; `key == sep` routes to the peel,
+matching the split partition's `>= sep → right`). Child-level peels
+splice into the family at their routed position
+(`flush_absorb_peel`), each splice followed by the eager re-check.
+
+**Commit integration.** `stm_btree_engine_commit_flush` runs
+`flush_walk` BEFORE `count_dirty` (a flush dirties more nodes) and
+before the pending window opens: every resident internal node whose
+buffer exceeds the region cap flushes toward the leaves; root-level
+peels grow the tree upward (`grow_root_absorb`: a fresh root takes
+the old root as child 0, splices every peel at its routed position,
+publishes `mvcc_root` on each root reassignment per R170 P2-3, and
+its own eager peels feed the next round). The walk re-runs until
+quiescent so subtrees under fresh peels are covered. On ANY failure
+the half-flushed memtree is dropped (`invalidate_memtree`) — the
+durable tree still holds every message in its on-disk buffers, so
+nothing is lost or duplicated (COW failure atomicity;
+`bepsilon.tla::FlushPreservesMessages`). Buffers at or under the cap
+ride across the commit unchanged — that retention is the Bε
+write-amp win; only overflow cascades.
+
+**R172 F1 (BINDING).** Every flush-path mutator (detach, append,
+leaf-apply, partition, splice) runs only on subtrees no wait-free
+reader can be traversing — reader safety is COW, never exclusion. At
+chunk 8 the only production caller is the commit path under the LF-2
+regime (fs->global EX writers; production buffers stay EMPTY until
+chunk 9's first producer, so the machinery is production-dormant);
+chunk 9's consolidator MUST route flushes through unpublished COW
+copies, and R174 prosecutes that.
+
+**The serial-write guard.** `node_insert` / `node_delete` REFUSE
+(`STM_ENOTSUPPORTED`) any serial write descending THROUGH a buffered
+node: a direct leaf write racing pending messages for the same key
+breaks newest-wins (an older buffered DELETE would later flush over a
+newer direct INSERT; a direct remove would be resurrected by a
+buffered INSERT). One engine never mixes regimes — today's serial
+fs.c writers have no message producer, and chunk 10's ported writers
+go through messages — so a buffered node on a serial write descent is
+misuse, refused loudly rather than silently corrupting. Pinned by
+`engine_serial_write_refuses_buffered_path`.
+
+**The scan merge.** Scans (`scan_subtree` — ONE body for full +
+range, serial + concurrent) carry down a read-only OVERLAY window:
+per key, the newest applicable pending message, folded level by level
+(`overlay_merge`: clip to [lo,hi], dedupe to max-seq per key, merge
+with the inherited window) and windowed per child by routing (the
+window is key-sorted, so per-child slices are contiguous). At the
+leaf, `leaf_merge_emit` interleaves stored entries with the window in
+key order — an INSERT overrides or introduces its key, a DELETE hides
+it — so a scan observes exactly what a lookup would
+(`bepsilon.tla::PerKeyNewestWins`). READ-ONLY by construction: a scan
+never flushes (R172 F1 — a reader cannot COW), which is what makes
+the merge safe on the EBR-pinned concurrent walker; window pointers
+into `buf_msgs` stay stable because published buffers are immutable.
+`stm_btree_engine_stats_get` counts the merged logical view.
+
+**Allocation-failure injection (R172 F5).** The buffer machinery's
+allocations route through `eng_buf_alloc` / `eng_buf_realloc`
+(node.c), hooked by the test-only `eng_test_oom_countdown` (−1 =
+disabled; N ≥ 0 fails the (N+1)-th hooked call — one relaxed load on
+cold paths). Hooked sites: the split partition's lm/rm and the flush
+append. `engine_split_partition_oom_fails_clean` pins
+allocate-early/commit-late (node untouched on either leg's failure);
+`engine_flush_mid_oom_fails_clean` pins the flush failure contract
+(memtree dropped, durable tree intact, engine recovers, ASan-clean).
+
+Tests: `engine_flush_delivers_one_level_and_applies` (one-level
+movement + leaf application + merged views at every intermediate
+state), `engine_scan_merge_exact_and_bounds` (exact merged sequence,
+overwrite bytes, hidden keys, in-window overlay-introduced keys,
+range clipping, early stop, concurrent parity),
+`engine_commit_flush_triggers_on_overflow` (the commit-time trigger +
+persistence + reopen + tombstone/overwrite),
+`engine_flush_splits_leaf_and_grows_root` (huge-key fixture: leaf
+split → huge separator splice → eager root split → peel → root grow;
+height 3 after reopen + verify), the two OOM tests above,
+`engine_serial_write_refuses_buffered_path`,
+`engine_verify_rejects_disordered_buffer`, and
+`pool_commit_stamps_current_version_on_v32_pool` (the R172 F5 stamp
+leg — the live upgrade boot proved the mount leg).
 
 ### Node cache
 
@@ -940,3 +1059,18 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
 - **The node cache is fixed-size** (1024 buckets, chained). Adequate
   for a metadata tree's node count; a resize / eviction policy is a
   later concern (and is where Phase 9.8's ARC-style cache lands).
+- **Pre-9.8 over-carve × maximal-pivot flush-splice edge (chunk 8).**
+  The eager-split discipline keeps every split's total within
+  `PC_CAP + one splice`; the chooser finds a cut whenever
+  `T <= 2 × PC_CAP − max_pivot`. A node loaded from a pre-9.8 pool
+  packed to the FULL payload cap (= 4/3 × PC_CAP) that then receives a
+  flush splice carrying a near-`ENG_MAX_ITEM_BYTES` separator
+  (~5.4 KiB) can exceed that envelope → `STM_ERANGE` → the flush
+  fails CLEAN (memtree dropped, durable tree intact) but a retry sees
+  the same state — a commit wedge, never corruption. Unreachable for
+  every real metadata tree (inode/dirent/xattr keys are ≤ ~300 B, and
+  an over-carve node splits down on its first serial write-touch
+  before any buffer can target it); constructing it requires a
+  hand-forged pool. Recorded for the R173+ audits to weigh; the
+  chunk-9 consolidator can retire it outright by write-touch-splitting
+  over-carve nodes before buffering into them.
