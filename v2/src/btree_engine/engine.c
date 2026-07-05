@@ -1857,6 +1857,15 @@ static stm_status overlay_merge(const eng_node *node, bool bounded,
     }
     on = dn;
 
+    /* Everything clipped out and nothing inherited — malloc(0) may
+     * legally return NULL, which must not read as ENOMEM. */
+    if (on + win_n == 0) {
+        free(own);
+        *out   = NULL;
+        *out_n = 0;
+        return STM_OK;
+    }
+
     const eng_msg **mg = malloc(((size_t)on + win_n) * sizeof *mg);
     if (!mg) { free(own); return STM_ENOMEM; }
     uint32_t n = 0, a = 0, b = 0;
