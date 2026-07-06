@@ -905,8 +905,28 @@ and walks until a key `> hi`; an internal node recurses only into the
 children whose key-ranges overlap `[lo, hi]` — `child(lo) ..
 child(hi)` inclusive — so the cost is O(matched entries + height),
 not O(tree). It is a pure read (no commit, no `btree.tla`
-implication). The 9.6-impl-4 cutover modules use it for per-prefix
-iteration — `readdir`, `listxattr`, extent iterate-for-inode.
+implication). The serial form holds `serial_mu` for the entire walk —
+which excludes sealers (it cannot EBUSY, the forward-progress property
+the fs-layer SH-fallbacks rely on) but also suppresses the trylock
+mini-consolidation for the walk's duration. As of CF-2c its remaining
+production caller is the listxattr SH-fallback (fs.c, R172 P1-1);
+every other scan — the LF-3b read listings AND the four write-path
+scan families (inode seed / find_freed, extent collect/overlap, dirent
+drop_for_dir, xattr drop_for_ino) — goes through
+`stm_btree_engine_scan_range_concurrent`.
+
+`stm_btree_engine_scan_range_concurrent` (EBR-pinned, no `serial_mu`)
+walks the merged chain + buffer + base view. Its STM_EBUSY contract
+(CF-2c): a seal observed BEFORE any callback fires restarts internally
+against the fresh root (up to `ENG_SEAL_RETRY_MAX`); a seal or chain
+tombstone observed MID-WALK surfaces STM_EBUSY IMMEDIATELY — the walk
+cannot restart once entries were emitted (duplicate emission), and
+only the caller can reset its accumulation state. Callers either
+propagate into an SH-fallback (the R175-F2 read legs) or wrap the
+whole scan in a bounded retry that resets the callback ctx and
+re-enters a fresh EBR pin per attempt
+(`STM_BTREE_ENGINE_EBUSY_RETRY_MAX` = 64, `sched_yield` between
+attempts, honest STM_EBUSY at the bound — the CF-2c write-path legs).
 
 ### Failure atomicity
 

@@ -45,6 +45,7 @@
 #include <stratum/types.h>
 
 #include <pthread.h>
+#include <sched.h>               /* sched_yield: CF-2c EBUSY retry */
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -493,7 +494,14 @@ static int in_freed_cb(const void *k, size_t klen,
 
 /* Caller holds idx->lock. Scans the INODE subspace from `lo_ino` upward for
  * the first FREED record (the dsstate freed_scan_lo cursor bounds the start
- * so a reuse burst does not re-walk consumed inos). */
+ * so a reuse burst does not re-walk consumed inos).
+ *
+ * CF-2c: EBR-pinned concurrent scan (no serial_mu — a FREED scan on the
+ * alloc path must not suppress the mini-consolidation under the pool;
+ * cf-2-design.md section 6a). A mid-walk seal from a cross-subsystem
+ * writer on the shared per-dataset engine surfaces STM_EBUSY; bounded
+ * whole-scan retry with a fresh pin + reset ctx per attempt, honest
+ * STM_EBUSY at the bound (STM_BTREE_ENGINE_EBUSY_RETRY_MAX contract). */
 static stm_status in_find_freed(stm_inode_index *idx, uint64_t ds,
                                 uint64_t lo_ino,
                                 bool *out_found, uint64_t *out_ino,
@@ -511,11 +519,23 @@ static stm_status in_find_freed(stm_inode_index *idx, uint64_t ds,
     stm_status k2 = in_encode_key(UINT64_MAX, hi);
     if (k2 != STM_OK) return k2;
 
-    in_freed_ctx c = { .ds = ds, .found = false, .ino = 0,
-                       .prior_gen = 0, .err = STM_OK };
-    stm_status ss = stm_btree_engine_scan_range(eng, lo, IN_KEY_LEN,
-                                                hi, IN_KEY_LEN,
-                                                in_freed_cb, &c);
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+    in_freed_ctx c = {0};
+    stm_status ss = STM_EBUSY;
+    for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        c = (in_freed_ctx){ .ds = ds, .found = false, .ino = 0,
+                            .prior_gen = 0, .err = STM_OK };
+        stm_ebr_enter(ebr);
+        ss = stm_btree_engine_scan_range_concurrent(eng, ebr,
+                                                    lo, IN_KEY_LEN,
+                                                    hi, IN_KEY_LEN,
+                                                    in_freed_cb, &c);
+        stm_ebr_exit(ebr);
+        if (ss != STM_EBUSY) break;
+        sched_yield();
+    }
     if (ss != STM_OK) return ss;
     if (c.err != STM_OK) return c.err;
     *out_found     = c.found;
@@ -565,7 +585,12 @@ static int in_seed_cb(const void *k, size_t klen,
  * Caller holds idx->lock and verified !s->seeded. After return, on
  * STM_OK, s->seeded is TRUE and s->next_ino == max(stored ino) + 1
  * (or unchanged from its in-RAM default if the engine has no records).
- */
+ *
+ * CF-2c: EBR-pinned concurrent scan + bounded retry — the full-subspace
+ * seed walk is the LONGEST inode-side scan, exactly the walk that must
+ * not hold serial_mu under the pool (see in_find_freed). The dsstate
+ * fields are written only after a fully-clean walk, so an EBUSY'd
+ * attempt leaves s untouched (still !seeded — the next alloc re-seeds). */
 static stm_status in_seed_dsstate_locked(stm_inode_index *idx,
                                          stm_inode_dsstate *s) {
     stm_btree_engine *eng = NULL;
@@ -578,12 +603,25 @@ static stm_status in_seed_dsstate_locked(stm_inode_index *idx,
     stm_status k2 = in_encode_key(UINT64_MAX, hi);
     if (k2 != STM_OK) return k2;
 
-    in_seed_ctx c = { .ds = s->dataset_id, .max_ino_plus_one = s->next_ino,
-                      .freed_count = 0u, .min_freed = UINT64_MAX,
-                      .err = STM_OK };
-    stm_status ss = stm_btree_engine_scan_range(eng, lo, IN_KEY_LEN,
-                                                hi, IN_KEY_LEN,
-                                                in_seed_cb, &c);
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+    in_seed_ctx c = {0};
+    stm_status ss = STM_EBUSY;
+    for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        c = (in_seed_ctx){ .ds = s->dataset_id,
+                           .max_ino_plus_one = s->next_ino,
+                           .freed_count = 0u, .min_freed = UINT64_MAX,
+                           .err = STM_OK };
+        stm_ebr_enter(ebr);
+        ss = stm_btree_engine_scan_range_concurrent(eng, ebr,
+                                                    lo, IN_KEY_LEN,
+                                                    hi, IN_KEY_LEN,
+                                                    in_seed_cb, &c);
+        stm_ebr_exit(ebr);
+        if (ss != STM_EBUSY) break;
+        sched_yield();
+    }
     if (ss != STM_OK) return ss;
     if (c.err != STM_OK) return c.err;
     s->next_ino      = c.max_ino_plus_one;

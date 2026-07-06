@@ -83,6 +83,7 @@
 #include <stratum/types.h>
 
 #include <pthread.h>
+#include <sched.h>               /* sched_yield: CF-2c EBUSY retry */
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -991,6 +992,16 @@ static int xa_list_cb(const void *k, size_t klen,
     return 0;
 }
 
+/* CF-2c disposition: this serial body DELIBERATELY keeps the
+ * serial_mu-holding stm_btree_engine_scan_range. Its only production
+ * caller is the fs-layer listxattr SH-fallback (fs.c, the R172 P1-1
+ * two-pass count + materialize under fs->global SH), which exists
+ * precisely to guarantee forward progress when the _concurrent leg
+ * returns STM_EBUSY — the serial walk's serial_mu excludes sealers for
+ * the whole walk, so it CANNOT EBUSY. Porting it to the concurrent
+ * scan would reintroduce the failure mode the fallback escapes. The
+ * mini-consolidation suppression cost is bounded by the fallback's
+ * rarity (it runs only after a torn or EBUSY'd concurrent attempt). */
 stm_status stm_xattr_list(const stm_xattr_index *idx,
                              uint64_t dataset_id, uint64_t ino,
                              stm_xattr_entry *out_entries,
@@ -1173,10 +1184,32 @@ stm_status stm_xattr_drop_for_ino(stm_xattr_index *idx,
         return k1 != STM_OK ? k1 : k2;
     }
 
+    /* CF-2c: EBR-pinned concurrent scan for the phase-1 collect (no
+     * serial_mu; cf-2-design.md section 6a — the dirent drop_for_dir
+     * twin). A mid-walk seal surfaces STM_EBUSY; bounded whole-scan
+     * retry with a fresh EBR pin + a reset probe list per attempt,
+     * honest STM_EBUSY at the bound. Phase 2's deletes go through the
+     * (already _concurrent) xa_engine_del funnel. */
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOMEM;
+    }
     xa_drop_ctx c = { .probes = NULL, .n = 0, .cap = 0, .err = STM_OK };
-    stm_status ss = stm_btree_engine_scan_range(eng, lo, XA_KEY_LEN,
-                                                hi, XA_KEY_LEN,
-                                                xa_drop_cb, &c);
+    stm_status ss = STM_EBUSY;
+    for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        free(c.probes);
+        c = (xa_drop_ctx){ .probes = NULL, .n = 0, .cap = 0, .err = STM_OK };
+        stm_ebr_enter(ebr);
+        ss = stm_btree_engine_scan_range_concurrent(eng, ebr,
+                                                    lo, XA_KEY_LEN,
+                                                    hi, XA_KEY_LEN,
+                                                    xa_drop_cb, &c);
+        stm_ebr_exit(ebr);
+        if (ss != STM_EBUSY) break;
+        sched_yield();
+    }
     if (ss != STM_OK || c.err != STM_OK) {
         free(c.probes);
         must_unlock(idx_lock(idx));

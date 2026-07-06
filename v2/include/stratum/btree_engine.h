@@ -474,25 +474,31 @@ stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
  *     the release-store synchronisation point. Same slow-warm
  *     materialisation under commit_mu as lookup_concurrent.
  *
- * Preconditions still in force at LF-3b (lifted at LF-BE-prepend):
- *   - No concurrent writer (insert / delete). Base-node mutation can
- *     tear a reader's range walk just as it can a single-key lookup.
- *     LF-3 production gate: fs->global EX for writers, SH for readers.
- *   - No concurrent commit_abort. invalidate_memtree frees the
- *     in-memory tree without EBR-retire.
- *   - Cache-warmed working set. load_child lazy-load is not yet
- *     thread-safe; concurrent descents MUST hit cached child.mem.
+ * Concurrent writers are SUPPORTED as of 9.8-BE-prepend (the LF-3b
+ * no-concurrent-writer / no-commit_abort / cache-warm preconditions
+ * are lifted): writers CAS-prepend deltas onto per-node chains and
+ * never mutate a published base node in place; teardown EBR-retires
+ * (engine_retire); load_child materialisation is serialized.
  *
- * Walks the in-memory Bε delta chain at every node visited; at LF-2
- * the chain is empty so chain-side messages contribute nothing and the
- * impl falls through to the existing range walk. The chain-aware shape
- * becomes load-bearing at 9.8-BE-prepend (range scans must apply
- * INSERT/DELETE messages on top of the base scan; deferred until BE).
+ * Walks the in-memory Bε delta chain at every node visited and merges
+ * chain-window + buffered messages onto the base scan (9.8-BE chunk 8),
+ * so the emitted view is the same merged view the _concurrent point
+ * lookups see.
  *
  * Returns STM_EINVAL on NULL `eng` / `ebr` / `cb` or a NULL key with
  * nonzero length, STM_ENOMEM / STM_ECORRUPT / device errors otherwise.
- * STM_EBUSY not reachable (auto-rewarms invalidated engine — same
- * posture as lookup_concurrent).
+ *
+ * STM_EBUSY (transient by construction — the R174-F2 retriable
+ * contract): a seal/fold/tombstone observed BEFORE any callback fires
+ * restarts internally against the fresh root (up to ENG_SEAL_RETRY_MAX);
+ * one observed MID-WALK surfaces STM_EBUSY IMMEDIATELY instead — the
+ * walk cannot restart once entries were emitted (duplicate emission is
+ * worse than a transient retry), and only the caller can reset its
+ * accumulation state. Callers either propagate it into an SH-fallback
+ * (the R175-F2 read legs) or wrap the whole scan in a bounded retry
+ * that RESETS the callback ctx per attempt and re-enters a FRESH EBR
+ * pin per attempt (the CF-2c write-path scan legs;
+ * STM_BTREE_ENGINE_EBUSY_RETRY_MAX below).
  *
  * Spec composition:
  *   concurrency_mvcc.tla::ReaderObservesCoherentTree — EBR pin bounds
@@ -506,6 +512,23 @@ stm_status stm_btree_engine_scan_range_concurrent(stm_btree_engine *eng,
                                                    const void *lo_key, size_t lo_key_len,
                                                    const void *hi_key, size_t hi_key_len,
                                                    stm_btree_engine_iter_cb cb, void *ctx);
+
+/*
+ * Bounded caller-retry policy for transient STM_EBUSY from the
+ * _concurrent engine surface (CF-2c/2d). A mid-walk seal or a
+ * seal-retry-exhausted prepend is transient by construction (the
+ * sealer's serial_mu critical section completes independently of the
+ * retrier), so callers that cannot surface EBUSY to their own caller
+ * (the write-path scan + funnel legs, where the 9P wire would turn it
+ * into a spurious EAGAIN on a blocking POSIX op) retry the WHOLE op up
+ * to this bound: fresh stm_ebr_enter/exit per attempt (no epoch pinned
+ * across yields), callback ctx fully reset per attempt (re-emission is
+ * safe only from a clean slate), sched_yield between attempts, honest
+ * STM_EBUSY when the bound expires (a genuinely wedged seal must stay
+ * visible). 64 whole-op retries with yields covers any realistic seal
+ * cadence; the residue is the documented retriable contract.
+ */
+#define STM_BTREE_ENGINE_EBUSY_RETRY_MAX 64u
 
 /* ========================================================================= */
 /* Commit + inspection.                                                       */

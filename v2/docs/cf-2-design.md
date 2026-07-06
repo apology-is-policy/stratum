@@ -401,6 +401,39 @@ interval regardless of mini suppression; Thylacine's fsync-heavy
 workloads commit constantly. The bound is the documented backstop
 either way.
 
+**CF-2c as-built.** The retry wraps the ENGINE SCAN CALL inside each
+scan function (not every transitive public caller —
+`ex_collect_in_ino_locked` alone has 15 callers sharing the helper, so
+the loop lives once per scan site): fresh `stm_ebr_enter`/`exit` per
+attempt, the callback ctx FULLY RESET per attempt (an EBUSY'd walk
+leaves a partial collect; re-emitting into it would duplicate
+records), `sched_yield` between attempts, honest STM_EBUSY after
+`STM_BTREE_ENGINE_EBUSY_RETRY_MAX` (= 64, the shared 2c/2d policy
+constant, defined + documented in btree_engine.h next to the scan).
+The outer retry is LOAD-BEARING, not belt-and-braces: the engine's
+internal ENG_SEAL_RETRY_MAX loop restarts only a seal observed BEFORE
+any callback fires; a MID-WALK seal/tombstone returns STM_EBUSY
+IMMEDIATELY (restarting after emission would duplicate entries — only
+the caller can reset its accumulation state). Ported sites: the two
+inode scans, `ex_collect_in_ino_locked` (+ `overlap_in_ino_locked` and
+all 15 collect callers inherit), `drop_for_dir`'s phase-1 collect,
+`drop_for_ino`'s phase-1 collect. ONE deliberate exception:
+`stm_xattr_list`'s serial body is KEPT — its only production caller is
+the fs.c listxattr SH-fallback (R172 P1-1), whose serial_mu-holding
+walk IS the forward-progress guarantee the fallback exists to provide
+(porting it would reintroduce the EBUSY the fallback escapes);
+mini-suppression there is bounded by the fallback's rarity. The stale
+btree_engine.h contract ("STM_EBUSY not reachable" + the lifted LF-3b
+preconditions) was corrected to the as-built contract in the same
+chunk. Coverage note: the targeted stress
+(`cf2c_scan_ports_alloc_reuse_vs_write_storm`, create/unlink churn vs
+a write+commit storm on one dataset) proves scan correctness under
+live concurrent prepend/fold traffic and is gmalloc-clean, but a
+bound=1 experiment (10/10 pass) showed the workload never actually
+lands a MID-WALK seal — the EBUSY retry leg is exercised
+deterministically by CF-2d's injected-seal hook (the ratified 2d
+verify column), which must also drive one scan site per family.
+
 **(b) The write funnels' STM_EBUSY.** The 7 write funnels
 (`in_engine_put` inode.c:421; `di_engine_put/del` dirent.c:414/441;
 `xa_engine_put/del` xattr.c:446/476; `ex_engine_put/del`
@@ -516,7 +549,7 @@ multi-threaded-writer-process reality).
 |---|---|---|
 | CF-2a **BUILT** | fs_pool.{c,h} + serve_client branch + opts/--fs-workers + run.c publish + test_9p_pool.c (13 tests; F1 tag-reuse-after-queued-flush [self-audit; revert-proven] + F2 tag-0 completion race [found by the FIRST pool-on boot gate killing the mount at probe46; fixed by REPLYING-with-split-lookup]) | pool tests 13/13 x5 + gmalloc x3 + default ctest 70/70 + UBSan 70/70 + werror + boot gate GREEN (pool-on: boot OK, 0 EXT, login E2E, Go-4c) |
 | CF-2b **BUILT** | server.c pin (`p9_fid.busy` + `s->fid_cv`) + the 3-phase surgery across the full §4.3 hot set + `verify_fresh_snapshot` refactor + the walk `walk_components`/`walk_finish_locked` factoring (fast path vs bindings fallback) + identity-guarded (c) mutations + h_clunk busy-wait (re-lookup after every wake) + the `fid_release_locked` tripwire + `src/9p/server_internal.h` phase_b test hook + 4 `pin_*` tests (clunk-wait REVERT-PROVEN via the unpin abort, SIGABRT/134). **F3 found in-chunk**: `duplicate_tag_fatal` (CF-2a, pre-existing) raced its park release against the reader's dup-check — the losing interleave turned the dup into LEGAL F2 reuse and the drain-to-EOF hung (ctest -j4 timeout; standalone repro at iter 8; sample(1) ground truth: reader between frames, 0 in flight). Fixed: pool `on_fatal` test hook + the test holds the park until the latch is observed (100/100 post-fix). | pool 17/17 x3 + x10 binary loop + gmalloc + the 100x watchdog + default ctest 70/70 (-j4, the F3-exposing config) + UBSan 70/70 + werror + boot gate GREEN pool-on |
-| CF-2c | R175-(a): port the 4 write-path scan families to `scan_range_concurrent` + bounded caller retry (commit-cadence bound = documented backstop) | targeted engine/fs tests + soak |
+| CF-2c **BUILT** | R175-(a): the 4 write-path scan families ported to `scan_range_concurrent` + the bounded whole-scan EBUSY retry (fresh EBR pin + reset ctx per attempt; `STM_BTREE_ENGINE_EBUSY_RETRY_MAX` = 64, shared with 2d) at the 5 scan sites (`in_seed_dsstate_locked` / `in_find_freed` / `ex_collect_in_ino_locked` [+ overlap + all 15 collect callers inherit] / `drop_for_dir` / `drop_for_ino`); `stm_xattr_list` KEPT serial deliberately (the R172 P1-1 SH-fallback's forward-progress guarantee); the stale btree_engine.h "STM_EBUSY not reachable" contract corrected (mid-walk seal = immediate EBUSY; the outer retry is load-bearing). See section 6(a) "CF-2c as-built". | subsystem suites (inode 62 / extent 11 / dirent 43 / xattr 25 / fs 226) + engine soak (84) + the targeted `cf2c_scan_ports_alloc_reuse_vs_write_storm` stress (churn-vs-write-storm on one dataset + post-join truncate/rewrite/memcmp integrity probe) + gmalloc on all 5 suites + default ctest 70/70 (-j4) + UBSan 70/70 + werror + boot gate GREEN pool-on (0 EXT, 1026/1026, probe46 pre+post, Go-4c status=0, login E2E, boot-ms 27829). Bound=1 experiment: the EBUSY leg is NOT reached by the stress (10/10) — deterministic retry-leg coverage lands with 2d's injected-seal hook, which must also drive one scan site per family. |
 | CF-2d | R175-(b): bounded retry-at-funnel across the 7 write funnels (fresh EBR pin per attempt) | funnel retry tests (injected seal) |
 | CF-2e **BUILT** (with 2a) | #57 stale-fixture sweep: atexit unlinks THIS pid's stm_v2_* (make_tmp never cleaned at exit) + once-per-process 6h-age sweep (crashed runs; parallel-ctest-safe) | the leak class closed at both ends |
 | CF-2f | bench (gofmt/fsbench re-measure) + docs (29-concurrency.md as-built rewrite + reference) + the focused Fable audit (R176) over the whole CF-2 surface | audit converged clean |

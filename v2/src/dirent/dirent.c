@@ -76,6 +76,7 @@
 #include <stratum/types.h>
 
 #include <pthread.h>
+#include <sched.h>               /* sched_yield: CF-2c EBUSY retry */
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1417,10 +1418,34 @@ stm_status stm_dirent_drop_for_dir(stm_dirent_index *idx,
         return k1 != STM_OK ? k1 : k2;
     }
 
+    /* CF-2c: EBR-pinned concurrent scan for the phase-1 collect (no
+     * serial_mu — a whole-dir sweep is unbounded-length, exactly the
+     * walk that must not suppress the mini-consolidation under the
+     * pool; cf-2-design.md section 6a). A mid-walk seal surfaces
+     * STM_EBUSY; bounded whole-scan retry with a fresh EBR pin + a
+     * reset probe list per attempt (an EBUSY'd walk leaves a partial
+     * collect), honest STM_EBUSY at the bound. Phase 2's deletes go
+     * through the (already _concurrent) di_engine_del funnel. */
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOMEM;
+    }
     di_drop_ctx c = { .probes = NULL, .n = 0, .cap = 0, .err = STM_OK };
-    stm_status ss = stm_btree_engine_scan_range(eng, lo, DI_KEY_LEN,
-                                                hi, DI_KEY_LEN,
-                                                di_drop_cb, &c);
+    stm_status ss = STM_EBUSY;
+    for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        free(c.probes);
+        c = (di_drop_ctx){ .probes = NULL, .n = 0, .cap = 0, .err = STM_OK };
+        stm_ebr_enter(ebr);
+        ss = stm_btree_engine_scan_range_concurrent(eng, ebr,
+                                                    lo, DI_KEY_LEN,
+                                                    hi, DI_KEY_LEN,
+                                                    di_drop_cb, &c);
+        stm_ebr_exit(ebr);
+        if (ss != STM_EBUSY) break;
+        sched_yield();
+    }
     if (ss != STM_OK || c.err != STM_OK) {
         free(c.probes);
         must_unlock(idx_lock(idx));

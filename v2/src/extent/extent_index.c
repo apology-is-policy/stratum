@@ -111,6 +111,7 @@
 #include <stratum/types.h>
 
 #include <pthread.h>
+#include <sched.h>               /* sched_yield: CF-2c EBUSY retry */
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -371,7 +372,17 @@ static int ex_collect_cb(const void *k, size_t klen,
 }
 
 /* Collect every record under (ds, ino) into out_ctx. Caller holds
- * idx->lock. */
+ * idx->lock.
+ *
+ * CF-2c: EBR-pinned concurrent scan (no serial_mu — the per-ino collect
+ * runs on EVERY RMW write/truncate, the hottest of the four write-path
+ * scan families; a serial walk here suppresses the mini-consolidation
+ * under the pool; cf-2-design.md section 6a). A mid-walk seal surfaces
+ * STM_EBUSY; bounded whole-scan retry with a fresh EBR pin + a fully
+ * reset collect ctx per attempt (an EBUSY'd walk leaves a PARTIAL
+ * collect — re-emitting into it would duplicate records), honest
+ * STM_EBUSY at the bound. Every caller (read- and write-shaped) already
+ * propagates non-OK. */
 static stm_status ex_collect_in_ino_locked(stm_extent_index *idx,
                                             uint64_t ds, uint64_t ino,
                                             ex_collect_ctx *out_ctx) {
@@ -389,9 +400,26 @@ static stm_status ex_collect_in_ino_locked(stm_extent_index *idx,
     if (k1 != STM_OK || k2 != STM_OK) {
         return k1 != STM_OK ? k1 : k2;
     }
-    stm_status ss = stm_btree_engine_scan_range(eng, lo, EX_KEY_LEN,
-                                                hi, EX_KEY_LEN,
-                                                ex_collect_cb, out_ctx);
+
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) return STM_ENOMEM;
+    stm_status ss = STM_EBUSY;
+    for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        /* Reset any partial collect from an EBUSY'd prior walk. */
+        free(out_ctx->records);
+        free(out_ctx->offs);
+        memset(out_ctx, 0, sizeof *out_ctx);
+        out_ctx->ds = ds;
+        stm_ebr_enter(ebr);
+        ss = stm_btree_engine_scan_range_concurrent(eng, ebr,
+                                                    lo, EX_KEY_LEN,
+                                                    hi, EX_KEY_LEN,
+                                                    ex_collect_cb, out_ctx);
+        stm_ebr_exit(ebr);
+        if (ss != STM_EBUSY) break;
+        sched_yield();
+    }
     if (ss != STM_OK) {
         free(out_ctx->records);
         free(out_ctx->offs);

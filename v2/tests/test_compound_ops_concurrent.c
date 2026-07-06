@@ -624,6 +624,183 @@ STM_TEST(per_inode_create_unlink_same_parent_disjoint_names) {
     unlink(g_key_path);
 }
 
+/* ── CF-2c: write-path scan ports under live seal traffic ──────────── */
+
+#define CF2C_SCAN_ITERATIONS  200u
+#define CF2C_SLOT_BYTES       4096u
+#define CF2C_SLOTS            8u
+
+typedef struct {
+    stm_fs *fs;
+    uint64_t dataset_id;
+    uint64_t ino;                /* pre-created data file */
+    unsigned iterations;
+    atomic_int err;
+    atomic_uint completed;
+    atomic_bool done;
+} write_storm_ctx;
+
+/* Rotates writes across CF2C_SLOTS disjoint 4-KiB slots and commits
+ * every 8th iteration. The commit materializes the buffered writes as
+ * extent records via insert/overwrite, so every subsequent overwrite
+ * of a slot runs ex_collect_in_ino_locked + overlap_in_ino_locked (the
+ * CF-2c-ported per-ino collect scans) against REAL records — while the
+ * commit's fold + the funnel-fired mini-consolidations supply the
+ * seal traffic the OTHER thread's ported scans (inode seed/find_freed,
+ * dirent drop) must retry through. */
+static void *write_storm_thread(void *arg)
+{
+    write_storm_ctx *s = (write_storm_ctx *)arg;
+    uint8_t buf[CF2C_SLOT_BYTES];
+    for (unsigned i = 0; i < s->iterations; i++) {
+        memset(buf, (int)(i & 0xff), sizeof buf);
+        uint64_t off = (uint64_t)(i % CF2C_SLOTS) * CF2C_SLOT_BYTES;
+        stm_status rc = stm_fs_write(s->fs, s->dataset_id, s->ino,
+                                        off, buf, sizeof buf);
+        if (rc != STM_OK) {
+            atomic_store(&s->err, (int)rc);
+            break;
+        }
+        if ((i % 8u) == 7u) {
+            rc = stm_fs_commit(s->fs);
+            if (rc != STM_OK) {
+                atomic_store(&s->err, (int)rc);
+                break;
+            }
+        }
+        atomic_fetch_add(&s->completed, 1u);
+    }
+    atomic_store(&s->done, true);
+    return NULL;
+}
+
+static bool wait_cu_storm(const create_unlink_ctx *a,
+                              const write_storm_ctx *b,
+                              pthread_t at, pthread_t bt)
+{
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        if (atomic_load(&a->done) && atomic_load(&b->done)) break;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) {
+            (void)pthread_join(at, NULL);
+            (void)pthread_join(bt, NULL);
+            return false;
+        }
+        struct timespec ns = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ns, NULL);
+    }
+    (void)pthread_join(at, NULL);
+    (void)pthread_join(bt, NULL);
+    return true;
+}
+
+/* CF-2c regression: the four write-path scan families run EBR-pinned
+ * (scan_range_concurrent, no serial_mu) with a bounded whole-scan
+ * EBUSY retry that RESETS the collect ctx per attempt. Thread A's
+ * create+unlink churn traverses the inode seed + find_freed scans
+ * (freed_count stays > 0 after the priming unlink, so allocs take the
+ * AllocReused FREED scan) and the dirent scans; thread B's
+ * write+commit storm traverses the extent collect/overlap scans and
+ * generates the prepend + fold + seal traffic on the SHARED
+ * per-dataset engine that makes A's scans hit mid-walk seals (and vice
+ * versa via A's own funnel prepends). Zero spurious failures is the
+ * assertion: the retry must absorb every transient EBUSY, and a
+ * non-reset retry ctx would surface as duplicate collected records
+ * (wrong drop sets / EEXIST on overwrite) or as leaks under gmalloc.
+ *
+ * The post-join single-threaded probe truncates to zero (whole-file
+ * collect + drop over the concurrent-phase-built index), rewrites all
+ * slots with a known pattern, commits, and memcmp-verifies the read-
+ * back — a duplicated or stale extent record from a corrupted collect
+ * would surface as EEXIST at insert or wrong bytes here. */
+STM_TEST(cf2c_scan_ports_alloc_reuse_vs_write_storm) {
+    make_tmp("cf2c_scan_ports");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "cf2c_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    STM_ASSERT_EQ(root_ino, 1u);
+
+    uint64_t data_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, root_ino,
+                                        (const uint8_t *)"storm", 5,
+                                        0100644, 0, 0, &data_ino));
+
+    /* Prime the FREED pool so thread A's very first alloc already takes
+     * the find_freed scan (not only after its own first unlink). */
+    uint64_t prime_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, root_ino,
+                                        (const uint8_t *)"prime", 5,
+                                        0100644, 0, 0, &prime_ino));
+    STM_ASSERT_OK(stm_fs_unlink(fs, ds_id, root_ino,
+                                   (const uint8_t *)"prime", 5));
+
+    create_unlink_ctx ca = { 0 };
+    ca.fs = fs; ca.dataset_id = ds_id; ca.parent_ino = root_ino;
+    ca.name_prefix = "churn"; ca.iterations = CF2C_SCAN_ITERATIONS;
+
+    write_storm_ctx wb = { 0 };
+    wb.fs = fs; wb.dataset_id = ds_id; wb.ino = data_ino;
+    wb.iterations = CF2C_SCAN_ITERATIONS;
+
+    pthread_t at, bt;
+    STM_ASSERT_EQ(0, pthread_create(&at, NULL, create_unlink_thread, &ca));
+    STM_ASSERT_EQ(0, pthread_create(&bt, NULL, write_storm_thread, &wb));
+
+    STM_ASSERT(wait_cu_storm(&ca, &wb, at, bt));
+
+    STM_ASSERT_EQ(0, atomic_load(&ca.err));
+    STM_ASSERT_EQ(0, atomic_load(&wb.err));
+    STM_ASSERT_EQ(CF2C_SCAN_ITERATIONS, atomic_load(&ca.completed));
+    STM_ASSERT_EQ(CF2C_SCAN_ITERATIONS, atomic_load(&wb.completed));
+
+    /* Post-join integrity probe (single-threaded, deterministic). */
+    STM_ASSERT_OK(stm_fs_truncate(fs, ds_id, data_ino, 0u));
+    uint8_t pat[CF2C_SLOT_BYTES];
+    for (unsigned sl = 0; sl < CF2C_SLOTS; sl++) {
+        memset(pat, (int)(0xA0u + sl), sizeof pat);
+        STM_ASSERT_OK(stm_fs_write(fs, ds_id, data_ino,
+                                      (uint64_t)sl * CF2C_SLOT_BYTES,
+                                      pat, sizeof pat));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    for (unsigned sl = 0; sl < CF2C_SLOTS; sl++) {
+        uint8_t got[CF2C_SLOT_BYTES];
+        memset(got, 0, sizeof got);
+        size_t nread = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, ds_id, data_ino,
+                                     (uint64_t)sl * CF2C_SLOT_BYTES,
+                                     got, sizeof got, &nread));
+        STM_ASSERT_EQ(nread, sizeof got);
+        memset(pat, (int)(0xA0u + sl), sizeof pat);
+        STM_ASSERT_EQ(0, memcmp(got, pat, sizeof pat));
+    }
+
+    /* Alloc sanity after the reuse cycles: a fresh create still works
+     * and stats back cleanly. */
+    uint64_t post_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, root_ino,
+                                        (const uint8_t *)"post", 4,
+                                        0100644, 0, 0, &post_ino));
+    struct stm_inode_value iv;
+    memset(&iv, 0, sizeof iv);
+    STM_ASSERT_OK(stm_fs_stat(fs, ds_id, post_ino, &iv));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 /* ── PARALLEL-3 impl-3: 4-inode rename overwrite concurrency ───────── */
 
 #define RENAME_ITERATIONS    150u
