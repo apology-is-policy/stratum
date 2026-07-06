@@ -1475,19 +1475,21 @@ disciplined.
   ship with documented forward-notes).
 - The crown-jewel bench at chunk 6 shows ≥ 4× concurrent-read
   scaling at 16 cores vs Phase 9.7.
-- The Bε bench at chunk 11 shows ≥ 10× write-amp reduction for
-  the 100K-files-in-1K-dirs workload.
-  **[MEASURED AT CHUNK 11 — NOT MET as modeled: 1.83–2.04× at
-  fsync-per-op, 1.00× at the workload's natural batch cadence; the
-  criterion's model conflated regimes (see §9.2 as-measured + the
-  corrected model). The criterion's INTENT — the small-write storm
-  becomes cheap — is delivered by in-RAM commit batching (both
-  regimes) + the CF-2 wait-free write concurrency that chunks 7–10
-  actually bought; chunks 7–11's load-bearing deliverable was always
-  the R171 P0 UAF-family closure. DISPOSITION (amend the criterion
-  to the measured mechanism / waive / pursue the §9.2 ε-flush seam)
-  IS THE USER'S CALL — flagged at the chunk-11 close, not silently
-  rewritten.]**
+- **AMENDED (user-ratified 2026-07-06, at the chunk-11 close).**
+  Originally: "the Bε bench at chunk 11 shows ≥ 10× write-amp
+  reduction for the 100K-files-in-1K-dirs workload." The figure came
+  from the §5.4 model, both sides of which the chunk-11 measurement
+  corrected (measured 1.83–2.04× at fsync-per-op, 1.00× at the
+  workload's natural batch cadence — §9.2 as-measured); it is
+  RETIRED as a ship gate. The amended chunk-7..11 criterion is the
+  measured mechanism, and it is MET: (i) the R171 P0 UAF family is
+  closed and audited (R172–R175) — the arc's soundness gate;
+  (ii) wait-free writers landed (the CF-2 prerequisite); (iii) the
+  write-amp counters + bench exist and publish honest numbers. The
+  ε-re-parameterization / peel-flush seam stays named in §9.2, to be
+  picked up only if a MEASURED workload becomes metadata-node-write
+  bound (e.g. flash wear on real hardware, or the 9.9 soak) — not
+  before.
 - ctest 64/64 stays green at every chunk-close commit.
 - No regression in any Phase 9.6 or 9.7 invariant (the
   audit-trigger surfaces in CLAUDE.md re-validate at every
