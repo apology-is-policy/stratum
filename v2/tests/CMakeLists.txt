@@ -126,6 +126,13 @@ target_link_libraries(bench_create_many PRIVATE stm_testlib stratum
 add_executable(bench_commit bench_commit.c test_fs_common.c)
 target_link_libraries(bench_commit PRIVATE stm_testlib stratum
                                    stm_warnings stm_sanitize stm_coverage)
+# CF-1 chunk 11 (9.8-BE-bench): metadata write-amplification, serial (9.7
+# write regime) vs Be concurrent (9.8), counted at the engine's
+# eng_node_write chokepoint over a commit-cadence sweep. Pure engine, no
+# FS. A bench, not a ctest.
+add_executable(bench_write_amp bench_write_amp.c)
+target_link_libraries(bench_write_amp PRIVATE stratum
+                                      stm_warnings stm_sanitize stm_coverage)
 # Area E crypto/integrity throughput baseline (the G2 measurement reference:
 # AEAD enc/dec + BLAKE3/xxh3 + the dcache decrypt->memcpy ratio). Pure
 # primitives, no FS. A bench, not a ctest.

@@ -113,6 +113,18 @@ typedef struct {
     uint64_t n_keys;    /* total (key, value) pairs in the tree           */
     uint32_t height;    /* 1 = root is a leaf; 2 = root + leaf children;  */
                         /* grows by 1 per internal level                  */
+
+    /* Cumulative physical node I/O since engine create/open (chunk 11,
+     * 9.8-BE-bench). Diagnostic-only counters; monotonic; relaxed
+     * atomics internally so they are safe to accumulate under
+     * concurrent writers. Snapshotted BEFORE the getter's own
+     * key-count walk, so that walk's loads do not pollute node_reads.
+     * node_writes counts successful COW node writes (the commit path's
+     * single physical writer); tree nodes only — spill-block I/O is
+     * excluded. Write-amplification = node_writes / logical updates. */
+    uint64_t node_writes;
+    uint64_t node_leaf_writes;  /* subset of node_writes: leaf nodes    */
+    uint64_t node_reads;        /* successful node loads from the store */
 } stm_btree_engine_stats;
 
 /* ========================================================================= */

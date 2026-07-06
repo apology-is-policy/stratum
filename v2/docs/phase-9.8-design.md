@@ -582,7 +582,7 @@ the engine call, not an engine-internal mechanism.
 | 9.8-BE-flush | engine-internal Bε flush logic at commit time; buffer-overflow recursive child flush; the flush_max_recursion cap | R173 |
 | 9.8-BE-prepend | writer-side CAS prepend; `_concurrent` insert/delete APIs; chain-depth threshold triggers consolidation | R174 |
 | 9.8-BE-fs.c | port write fs.c ops: drop `fs->global` EX (the per-inode pin still gates compound-op atomicity); engine writes go lock-free | R175 |
-| 9.8-BE-bench | sequential-write benchmark (creat-many-files, write-many-small-extents); compare against 9.7 baseline | (folded into R175 close) |
+| 9.8-BE-bench | sequential-write benchmark (creat-many-files, write-many-small-extents); compare against 9.7 baseline. **BUILT** — `tests/bench_write_amp.c` + the chunk-11 engine counters; measured 1.0–2.0× (NOT the modeled 20×; §9.2 as-measured + the corrected model) | (folded into R175 close) |
 
 ### 5.1.1 — R171 closure status + Thylacine A-5b relevance (Area D addendum, 2026-06-25)
 
@@ -775,6 +775,17 @@ filesystem), the write-amp ratio is approximately:
 **50× reduction** in metadata COW writes for a bulk-write
 workload. The bench at 9.8-BE-bench measures this; the design
 target is 20× minimum at the close commit.
+
+**AS MEASURED (chunk 11): this section's math is corrected by
+§9.2.** Both sides of the model were wrong: the plain-COW baseline
+ignores in-RAM dirty batching (one commit writes each distinct dirty
+node once — the modeled 400K is measured at 912 for a single-commit
+bulk create), and the Bε side assumed per-child flush batches of
+~N/B with B ≈ buffer ≈ fanout, while as built the buffer holds ~52
+messages against a fanout of ~150 (a whole-buffer flush delivers
+~0–1 message per spread child). The honest same-cadence reduction is
+1.0×–2.0× (§9.2 as-measured tables + the corrected model + the named
+ε/flush-strategy seam). The read-cost trade in §5.5 is unaffected.
 
 ### 5.5 — The read-cost trade
 
@@ -1184,7 +1195,7 @@ fs.c port chunks after the engine support is in place.
 | 9 | 9.8-BE-prepend | writer-side CAS prepend + `_concurrent` insert/delete API (closes R171 P0-1 + P0-4 -- see §5.1.1) | R174 |
 | 9b | 9.8-BE-engine-retire | EBR-retire the engine struct in `dataset_engine_close_locked` (closes R171 P0-2 -- §5.1.1). **BUILT** (+ the Area-S F1 dsstate reseed pulled in — the same rollback-staleness family) | (folds into the BE-arc close; R175 covers the 9b surface) |
 | 10 | 9.8-BE-fs.c | port write fs.c ops to per-inode-pin + EBR | R175 |
-| 11 | 9.8-BE-bench | sequential-write benchmark vs 9.7 baseline | (folded into R175 close) |
+| 11 | 9.8-BE-bench | sequential-write benchmark vs 9.7 baseline. **BUILT** — counters + `bench_write_amp` + the R174-#2 clone-arm write-fault sweep; measured 1.0–2.0× (§9.2 as-measured) | (folded into R175 close) |
 | 12 | 9.8-ARC | ARC-style node cache eviction (replaces 1024-bucket fixed cache) | R176 |
 | 13 | 9.8-cleanup | retire `v2/src/btree/btree.c` + `btree_lf.c` + `btree_mt.c` (NO — keep btree_mt: still used by alloc; only retire the Bε-buffer code in btree.c that 9.8 obsoletes); audit close umbrella | R177 |
 
@@ -1228,20 +1239,114 @@ atomic increment per op. At 64 cores the EBR counter saturates
 around 10M ops/sec (a single cache line in flight), which is
 2 orders of magnitude past the rwlock-bound 9.7 baseline.
 
-### 9.2 — Bε write-amp target (9.8-BE-bench)
+### 9.2 — Bε write-amp target (9.8-BE-bench) — AS MEASURED (chunk 11)
 
-Workload: create 100K files in 1K directories (100 files per
-dir), measure node COW writes via the engine's internal counters.
+The original target table (kept below for the record) modeled a 20×
+floor / 50× design reduction. **Measured: the honest apples-to-apples
+reduction is 1.0×–2.0×, and the original model was wrong twice over**
+— see "The corrected model" below. The prior speculative table:
 
-| Phase | Node COW writes (target) | Ratio |
+| Phase | Node COW writes (modeled) | Ratio |
 |---|---|---|
 | 9.7 baseline | 400K (~4 levels × 100K updates) | 1× |
-| 9.8 with Bε | 20K | 20× reduction (target floor) |
-| 9.8 with Bε (design target) | 8K | 50× reduction |
+| 9.8 with Bε | 20K | 20× reduction (modeled floor) |
+| 9.8 with Bε (design target) | 8K | 50× reduction (literature) |
 
-50× is the published Bε literature target; 20× is the
-implementable-with-safety-margin floor. The bench at 9.8-BE-bench
-publishes which we hit.
+**The measurement** (`tests/bench_write_amp.c`, chunk 11; node COW
+writes counted at `eng_node_write` — the single physical writer — via
+the chunk-11 engine counters; both regimes in ONE binary, fresh store
++ tree + identical deterministic key stream per leg; `C` = updates
+per commit, `C=0` = one commit at the end; M2 host, in-RAM store —
+counts are deterministic and host-independent):
+
+Workload A — create-storm (N inserts into an empty tree; `dirs` =
+1K interleaved ascending cursors, the 100K-files-in-1K-dirs shape):
+
+| pat | C | N | serial w/op | Bε w/op | ratio |
+|---|---|---|---|---|---|
+| seq | 1 | 20K | 2.104 | 1.030 | **2.04×** |
+| seq | 10 | 20K | 0.219 | 0.127 | 1.72× |
+| seq | 100..0 | 100K | 0.037..0.009 | same | 1.00× |
+| dirs | 1 | 20K | 1.996 | 1.089 | 1.83× |
+| dirs | 10 | 20K | 0.265 | 0.187 | 1.42× |
+| dirs | 100..0 | 100K | 0.355..0.006 | same | 1.00–1.03× |
+| rand | 1 | 20K | 1.995 | 1.605 | 1.24× |
+| rand | 10 | 20K | 0.975 | 0.676 | 1.44× |
+| rand | 100..0 | 100K | 0.817..0.006 | ~same | 1.00–1.07× |
+
+Workload B — sparse-update (S sequential keys seeded identically on
+both legs + one commit, then M uniform-random updates — the §5.4
+regime, batch << leaves):
+
+| S | C | M | serial w/op | Bε w/op | ratio |
+|---|---|---|---|---|---|
+| 500K | 1 | 2K | 3.000 | 1.633 | 1.84× |
+| 500K | 10 | 5K | 2.026 | 1.151 | 1.76× |
+| 500K | 100 | 20K | 1.467 | 1.157 | 1.27× |
+| 500K | 1000 | 20K | 0.954 | 0.735 | 1.30× |
+| 500K | 0 | 20K | 0.225 | 0.224 | 1.00× |
+| 2M | 100 | 20K | 1.836 | 1.251 | 1.47× |
+| 2M | 1000 | 20K | 1.196 | 0.672 | **1.78×** |
+| 2M | 10000 | 20K | 0.785 | 0.469 | 1.67× |
+
+**The corrected model.** Both regimes write nodes ONLY at commit
+(`commit_node` → `eng_node_write`), batching dirty state in RAM, so
+write amplification is a function of COMMIT CADENCE, and the original
+model erred on both sides:
+
+1. *The baseline ignored in-RAM dirty batching.* "400K = 4 levels ×
+   100K updates" assumed a fresh path COW is WRITTEN per update; in
+   reality one commit writes each distinct dirty node once — 100K
+   sequential creates + one commit = **912** node writes measured,
+   not 400K. The modeled baseline was ~438× worse than the real one.
+   Per-update path WRITES happen only at commit-per-update cadence
+   (fsync-per-op), where the serial cost is ~tree-depth writes per
+   op (2.0–3.0 measured at depths 2–3).
+
+2. *The Bε amortization assumed per-child batches of ~N/B with
+   B ≈ 50 ≈ fanout.* As built, the ε=1/4 buffer region holds ~52
+   messages (~4 KB / ~78 B per 8-B-key + 56-B-value message) while
+   the internal fanout is ~150 — buffer < fanout, and `eng_flush_node`
+   detaches and delivers the WHOLE buffer — so on spread keys a flush
+   delivers ~0–1 message per child and leaf writes approach one per
+   message. Amortization concentrates in the root/upper levels only:
+   at C=1 the Bε leg writes ~1 node per commit (the root-write floor;
+   leaf writes defer — 20K seq inserts at C=1 wrote 20,179 leaves
+   serial vs 775 Bε, a 26× LEAF amortization masked by the per-commit
+   root write in the total).
+
+The measured law: **ratio ≈ (serial path-depth) / (Bε root-floor +
+cascade) at commit-per-op (≈ 1.2–2.0× at depths 2–3), decaying to
+1.00× as cadence grows** (both regimes batch in RAM). The §5.4
+20–50× figure compared MIXED regimes: a per-op-flush baseline against
+a batch-amortized Bε — a comparison no single workload produces.
+
+**Wall-clock (secondary; in-RAM store, so CPU only):** the clone-arm
+commit costs more CPU than the serial commit on a large resident tree
+(B S=500K C=1: 24 ms vs 1.6 ms per commit — shadow consolidate +
+flush walk + whole-tree EBR retire per cycle; resident-size-dependent,
+negligible at boot-scale trees, and invisible when a real device
+fsync dominates). Where the Bε leg writes materially fewer nodes
+(B-BIG C=1000) it is also FASTER (9.1 s vs 13.5 s — fewer 16-KiB
+AEAD encrypts).
+
+**Verdict vs the targets:** the ≥20× floor (and §14's ≥10× ship
+criterion for the 100K-files-in-1K-dirs workload) is NOT met in any
+same-cadence regime — measured 1.83–2.04× at fsync-per-op, 1.00× at
+the workload's natural batch cadence. What chunks 7–11 deliver
+instead: the R171 P0 UAF-family CLOSURE (the arc's soundness gate),
+wait-free writers (CF-2's prerequisite), the C=1 root-floor (~2× at
+fsync-per-op + 26× leaf-write deferral), and the honest counters +
+bench that measured all of this. The write-amp *number* was the
+model's promise, not the mechanism's.
+
+**The named seam (forward-note, NOT built):** if a write-amp-bound
+workload materializes, the lever is ε re-parameterization (a larger
+buffer region so buffer ≥ fanout) and/or a pick-max-child peel flush
+(deliver only the heaviest child's messages, keep the rest buffered)
+— both change the §5.3 capacity carve and re-open the split-bound
+proof, so they are a design pass, not a tuning knob. Chunk 12's ARC
+cache is orthogonal (reads).
 
 ### 9.3 — Cross-comparison vs ZFS / btrfs / bcachefs
 
@@ -1372,6 +1477,17 @@ disciplined.
   scaling at 16 cores vs Phase 9.7.
 - The Bε bench at chunk 11 shows ≥ 10× write-amp reduction for
   the 100K-files-in-1K-dirs workload.
+  **[MEASURED AT CHUNK 11 — NOT MET as modeled: 1.83–2.04× at
+  fsync-per-op, 1.00× at the workload's natural batch cadence; the
+  criterion's model conflated regimes (see §9.2 as-measured + the
+  corrected model). The criterion's INTENT — the small-write storm
+  becomes cheap — is delivered by in-RAM commit batching (both
+  regimes) + the CF-2 wait-free write concurrency that chunks 7–10
+  actually bought; chunks 7–11's load-bearing deliverable was always
+  the R171 P0 UAF-family closure. DISPOSITION (amend the criterion
+  to the measured mechanism / waive / pursue the §9.2 ε-flush seam)
+  IS THE USER'S CALL — flagged at the chunk-11 close, not silently
+  rewritten.]**
 - ctest 64/64 stays green at every chunk-close commit.
 - No regression in any Phase 9.6 or 9.7 invariant (the
   audit-trigger surfaces in CLAUDE.md re-validate at every

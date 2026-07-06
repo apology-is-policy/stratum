@@ -30,6 +30,7 @@
 #include <stratum/ebr.h>           /* 9.8-LF-1: concurrent-lookup harness */
 
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5069,11 +5070,25 @@ static void *be9_soak_writer(void *arg)
         /* A full-length single-byte pattern: any torn read shows a
          * mixed or truncated buffer. */
         memset(val, (int)('A' + ((c->id + i) % 26u)), sizeof val);
-        stm_ebr_enter(me);
-        stm_status s = stm_btree_engine_insert_concurrent(c->eng, me,
-                                                          key, strlen(key),
-                                                          val, sizeof val);
-        stm_ebr_exit(me);
+        /* STM_EBUSY is the API's documented-retriable consolidation /
+         * seal back-pressure ("the delta is NOT prepended when it
+         * surfaces") — retry it like a production funnel would, do
+         * not record it as a failure. Under guard-malloc's ~100x
+         * slowdown the mini-consolidation's seal window stretches
+         * enough that a peer writer lands in it deterministically
+         * (#366; unobservable at normal timing). Any other status is
+         * a real error. */
+        stm_status s;
+        uint32_t   tries = 0;
+        for (;;) {
+            stm_ebr_enter(me);
+            s = stm_btree_engine_insert_concurrent(c->eng, me,
+                                                   key, strlen(key),
+                                                   val, sizeof val);
+            stm_ebr_exit(me);
+            if (s != STM_EBUSY || ++tries > 1000000u) break;
+            if ((tries & 63u) == 0u) sched_yield();
+        }
         if (s != STM_OK) {
             atomic_compare_exchange_strong(c->first_err, &(int){0}, (int)s);
             break;
@@ -5098,11 +5113,25 @@ static void *be9_soak_reader(void *arg)
          atomic_load_explicit(c->stop, memory_order_acquire) == 0u; i++) {
         be9_soak_key(key, sizeof key, i % BE9_SOAK_KEYS);
         bool found = false; void *val = NULL; size_t vl = 0;
-        stm_ebr_enter(me);
-        stm_status s = stm_btree_engine_lookup_concurrent(c->eng, me,
-                                                          key, strlen(key),
-                                                          &found, &val, &vl);
-        stm_ebr_exit(me);
+        /* A surfaced STM_EBUSY here means lookup_concurrent exhausted
+         * its INTERNAL ENG_SEAL_RETRY_MAX attempts inside one seal
+         * window — under guard-malloc the sealer (allocation-heavy
+         * mini fold) is slowed ~100x while the allocation-free retry
+         * descents are not, so the internal budget can expire inside
+         * one legitimate seal (#366). Retry boundedly like the
+         * writer: a genuinely wedged seal still exhausts the outer
+         * bound and fails the test. */
+        stm_status s;
+        uint32_t   tries = 0;
+        for (;;) {
+            stm_ebr_enter(me);
+            s = stm_btree_engine_lookup_concurrent(c->eng, me,
+                                                   key, strlen(key),
+                                                   &found, &val, &vl);
+            stm_ebr_exit(me);
+            if (s != STM_EBUSY || ++tries > 1000u) break;
+            sched_yield();
+        }
         if (s != STM_OK) {
             atomic_compare_exchange_strong(c->first_err, &(int){0}, (int)s);
             free(val);
@@ -5586,6 +5615,163 @@ STM_TEST(engine_retire_defers_free_under_pin) {
 
     memstore_destroy(&ms);
     stm_ebr_thread_free(me);
+}
+
+STM_TEST(engine_clone_commit_write_fault_sweep_small_tree) {
+    /* R174 obligation #2 (closed at chunk 11): the memstore fail_after
+     * knob swept over EVERY device-write ordinal of a CLONE-arm commit
+     * on a small tree — the hooked-allocator OOM sweeps stop at
+     * eng_buf_alloc sites and never reach commit_node's write of a
+     * shadow node. Every physical write of a clone commit flows
+     * through eng_node_write <- commit_node over the PRIVATE shadow,
+     * so each injection point f exercises a distinct partial-flush
+     * crash there. The clone-arm contract under a failed flush is
+     * STRONGER than the serial revert (engine_commit_failed_flush_
+     * reverts): the published tree AND the un-flushed chain deltas
+     * are untouched, so the concurrent updates SURVIVE the failure
+     * and a retry commit persists them — no acked message is lost
+     * (the #35 / R173-F1 loss class). The chunk-11 node_writes
+     * counter pins each iteration: exactly f COWs land before the
+     * injected failure. */
+    enum { BASE = 1200, UPD = 60, BVLEN = 100 };
+    uint64_t writes_seen = 0;   /* W of the clean run — set on success */
+    int64_t  f;
+    for (f = 0; f < 64; f++) {
+        STM_ASSERT_OK(stm_ebr_init());
+        stm_ebr_thread *me = stm_ebr_register();
+        STM_ASSERT_TRUE(me != NULL);
+        memstore ms; memstore_init(&ms);
+        stm_btree_crypt_ctx cx = test_cx();
+        stm_btree_engine *eng = NULL;
+        STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0,
+                                              &eng));
+
+        /* Phase A: a durable depth->=2 base (even keys, tiny values). */
+        for (uint32_t i = 0; i < BASE; i++) {
+            uint8_t key[4];
+            be32_key(2u * i, key);
+            STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, "a", 1));
+        }
+        uint64_t rp1 = 0;
+        uint8_t  rc1[32];
+        STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp1, rc1));
+        stm_btree_engine_stats st0;
+        STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &st0));
+        STM_ASSERT_TRUE(st0.height >= 2u);
+
+        /* Phase B: concurrent updates big enough that the shadow
+         * root's folded buffer crosses ENG_BUFFER_REGION_MAX, so the
+         * commit's flush cascades to the leaves — and STRIDED across
+         * the whole key range so EVERY leaf receives messages: the
+         * sweep then covers each leaf write plus the root, in
+         * commit_node's child-first order (W >= 3). */
+        uint8_t bval[BVLEN];
+        for (uint32_t i = 0; i < UPD; i++) {
+            uint8_t key[4];
+            be32_key(2u * (i * (BASE / UPD)) + 1u, key);
+            memset(bval, (int)(i & 0xFFu), sizeof bval);
+            stm_ebr_enter(me);
+            STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, key, 4,
+                                                             bval,
+                                                             sizeof bval));
+            stm_ebr_exit(me);
+        }
+
+        stm_btree_engine_stats stb;
+        STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &stb));
+        ms.fail_after = f;                 /* f writes land; f+1 fails */
+        uint64_t rp2 = 0, rg2 = 0;
+        uint8_t  rc2[32];
+        stm_status s = stm_btree_engine_commit_flush(eng, 2, &rp2, &rg2, rc2);
+        ms.fail_after = -1;                /* disarm any residual */
+
+        if (s == STM_OK) {
+            /* f exceeded the commit's write count W: the sweep is
+             * complete. Finalize and prove the messages persisted. */
+            stm_btree_engine_stats stc;
+            STM_ASSERT_OK(stm_btree_engine_commit_finalize(eng));
+            STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &stc));
+            writes_seen = stc.node_writes - stb.node_writes;
+            STM_ASSERT_EQ(stc.n_keys, (uint64_t)(BASE + UPD));
+
+            /* Reopen from the durable root — the acked updates are on
+             * disk, not just in RAM (the no-loss proof). */
+            uint64_t gp = 0, gg = 0;
+            uint8_t  gc[32];
+            STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+            stm_btree_engine *eng2 = NULL;
+            STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                                gp, gg, gc, &eng2));
+            stm_btree_engine_stats str;
+            STM_ASSERT_OK(stm_btree_engine_stats_get(eng2, &str));
+            STM_ASSERT_EQ(str.n_keys, (uint64_t)(BASE + UPD));
+            stm_btree_engine_destroy(eng2);
+        } else {
+            /* A genuine partial flush at write ordinal f. */
+            STM_ASSERT_ERR(s, STM_EBACKEND);
+
+            /* Exactly f COWs landed before the injection (the chunk-11
+             * counter is the write-ordinal witness). */
+            stm_btree_engine_stats stf;
+            STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &stf));
+            STM_ASSERT_EQ(stf.node_writes - stb.node_writes, (uint64_t)f);
+
+            /* Durable root untouched; no double-free of reclaimed
+             * paddrs; the failed flush left no pending window. */
+            uint64_t gp = 0, gg = 0;
+            uint8_t  gc[32];
+            STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+            STM_ASSERT_EQ(gp, rp1);
+            STM_ASSERT_EQ(gg, UINT64_C(1));
+            STM_ASSERT(memcmp(gc, rc1, 32) == 0);
+            STM_ASSERT_TRUE(memstore_no_double_free(&ms));
+
+            /* The CLONE-arm survival contract: every phase-B update is
+             * still visible (published tree + chain untouched by the
+             * private shadow's death) — spot-check via the concurrent
+             * reader, count via the logical scan. */
+            STM_ASSERT_EQ(stf.n_keys, (uint64_t)(BASE + UPD));
+            stm_ebr_enter(me);
+            for (uint32_t i = 0; i < UPD; i += 7) {
+                uint8_t key[4];
+                be32_key(2u * (i * (BASE / UPD)) + 1u, key);
+                bool  found = false;
+                void *val = NULL;
+                size_t vl = 0;
+                STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me,
+                                                                 key, 4,
+                                                                 &found,
+                                                                 &val, &vl));
+                STM_ASSERT_TRUE(found);
+                STM_ASSERT_EQ((long long)vl, (long long)BVLEN);
+                STM_ASSERT_EQ((long long)((uint8_t *)val)[0],
+                              (long long)(i & 0xFFu));
+                free(val);
+            }
+            stm_ebr_exit(me);
+
+            /* A retry commit succeeds and persists everything. */
+            STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &rp2, rc2));
+            stm_btree_engine_stats str;
+            STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &str));
+            STM_ASSERT_EQ(str.n_keys, (uint64_t)(BASE + UPD));
+            STM_ASSERT_TRUE(memstore_no_double_free(&ms));
+        }
+
+        stm_btree_engine_destroy(eng);
+        for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
+            (void)stm_ebr_try_advance();
+        memstore_destroy(&ms);
+        stm_ebr_thread_free(me);
+        if (s == STM_OK) break;
+    }
+
+    /* The sweep must have covered a real multi-write cascade: leaves
+     * before the root (child-first commit_node order), so W >= 3 means
+     * f = 0..W-1 injected into leaf AND root writes of the clone arm. */
+    STM_ASSERT_TRUE(f >= 3);
+    STM_ASSERT_TRUE(writes_seen >= 3u);
+    STM_ASSERT_TRUE(f == (int64_t)writes_seen);
 }
 
 STM_TEST_MAIN("btree_engine")

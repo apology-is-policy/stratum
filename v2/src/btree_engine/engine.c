@@ -3184,6 +3184,16 @@ static stm_status engine_stats_get_locked(stm_btree_engine *eng,
     if (!eng || !out) return STM_EINVAL;
     if (eng->pending.active) return STM_EBUSY;
 
+    /* Snapshot the node-I/O counters BEFORE the walk below, so the
+     * getter's own load_root/load_child/scan reads do not count into
+     * the node_reads it returns (chunk 11). */
+    out->node_writes      = atomic_load_explicit(&eng->stat_node_writes,
+                                                 memory_order_relaxed);
+    out->node_leaf_writes = atomic_load_explicit(&eng->stat_node_leaf_writes,
+                                                 memory_order_relaxed);
+    out->node_reads       = atomic_load_explicit(&eng->stat_node_reads,
+                                                 memory_order_relaxed);
+
     eng_node *root = NULL;
     stm_status s = load_root_locked(eng, &root);
     if (s != STM_OK) return s;

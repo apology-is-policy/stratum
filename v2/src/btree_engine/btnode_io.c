@@ -493,6 +493,14 @@ stm_status eng_node_write(stm_btree_engine *eng, eng_node *n, uint64_t gen)
     n->gen   = gen;
     memcpy(n->csum, csum, STM_BTNODE_CSUM_SIZE);
     n->dirty = false;
+
+    /* Diagnostic write-amp counters (chunk 11) — successful COW writes
+     * only; an injected/real device failure above is not a COW. */
+    atomic_fetch_add_explicit(&eng->stat_node_writes, 1u,
+                              memory_order_relaxed);
+    if (n->is_leaf)
+        atomic_fetch_add_explicit(&eng->stat_node_leaf_writes, 1u,
+                                  memory_order_relaxed);
     return STM_OK;
 }
 
@@ -673,6 +681,8 @@ stm_status eng_node_read(stm_btree_engine *eng,
     stm_status s = eng->vt->read(eng->vt_ctx, paddr, buf,
                                  STM_BTREE_ENGINE_NODE_SIZE);
     if (s != STM_OK) { free(buf); return s; }
+    atomic_fetch_add_explicit(&eng->stat_node_reads, 1u,
+                              memory_order_relaxed);
 
     /* Merkle gate before AEAD — a ciphertext byte-flip surfaces here. */
     s = check_merkle_link(buf, expected_csum);

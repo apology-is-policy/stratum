@@ -177,7 +177,16 @@ on-disk tree, checking the Merkle chain and AEAD tag at every node
 crypto-valid but unsorted node would silently mis-route the
 binary-search descents, so verify catches structural corruption, not
 just bit-rot / substitution. `stats_get` returns key count + tree
-height.
+height, plus the cumulative physical node-I/O counters (chunk 11,
+9.8-BE-bench): `node_writes` / `node_leaf_writes` (successful COW node
+writes — `eng_node_write` is the single physical writer, reached only
+from `commit_node`, so `node_writes` is exactly the write-amplification
+numerator) and `node_reads` (successful store loads in
+`eng_node_read`). The counters are diagnostic-only relaxed atomics,
+monotonic over the engine's lifetime, snapshotted BEFORE the getter's
+own key-count walk (so that walk's loads never pollute the returned
+`node_reads`); spill-block I/O is deliberately excluded — the metric is
+tree-node amplification.
 
 `walk_paddrs` (9.7-impl-4b) enumerates every on-disk block reachable
 from the durable root — every tree NODE and every large-value
@@ -1189,8 +1198,10 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 78 cases (47 9.6 + 4 9.8-LF-1 +
-6 9.8-LF-2 + 14 9.8-BE chunks 7-8 + 7 9.8-BE-prepend chunk 9). 56 run against an in-RAM
+`tests/test_btree_engine.c` — 84 cases (47 9.6 + 4 9.8-LF-1 +
+6 9.8-LF-2 + 14 9.8-BE chunks 7-8 + 11 9.8-BE-prepend chunk 9 incl.
+the R174 failure arms + the load_root race regression + 1
+engine-retire chunk 9b + 1 clone-arm write-fault sweep chunk 11). Most run against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
 can both assert which paddrs were superseded and still open a prior
@@ -1215,6 +1226,23 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
 | Concurrent reader substrate (9.8-LF-1) | single-level + multilevel concurrent-lookup smoke; NULL-arg matrix + reader-during-flush succeeds (LF-2 contract); 4-thread × 2000-iter pre-warmed multi-reader against a static committed tree exercises the EBR-pinned descent + LIFO chain walk (currently always empty) |
 | Lock-free writers (9.8-BE-prepend, chunk 9) | prepend visibility on BOTH read paths + tombstone-hides-base + serial-API refusal + arg/bound matrix; threshold mini-consolidation (fresh published root, drained chain -> buffer, reads correct across the swap, commit + reopen); clone-commit persistence (overwrites + tombstones durable, shadow adoption = fresh root pointer, merged stats count, reopen + verify); the cross-restart seq high water (fails without the hw seeding: the second-generation delta would consolidate BELOW the persisted seq and buffer_resolve would serve the stale value); clone-arm failure atomicity (flushed-then-aborted keeps every delta readable; a 64-point OOM sweep over the hooked clone/fold/append allocations asserts old-tree-intact + retry-lands-everything); leaf-root consolidation grow (7 x 3-KiB deltas overflow the leaf mid-apply -> split + grow + buffered remainder, reopen + verify); the reader/writer/commit soak — 2 wait-free readers asserting full-value integrity x 2 CAS-prepend writers over 8 hot keys x 40 clone commits through the middle (consolidate + publish + whole-tree retire + residue migration every cycle), then a quiesced final commit + reopen asserting untorn durable values (the R171 P0-1/P0-4 closure witness; ASan-clean) |
 | mvcc_root publish (9.8-LF-2) | `engine_create` publishes empty leaf for immediate concurrent reads; lazy `engine_open` + first `lookup_concurrent` triggers the slow-warm path under `commit_mu`; `commit_finalize`'s republish synchronises post-commit reader acquire-loads with `commit_node`'s in-place mutations; failed-flush-on-never-committed → slow-warm re-creates empty leaf (load_root's `!has_durable_root` branch); failed-flush-AFTER-durable-commit → slow-warm re-reads durable root from disk (load_root's `has_durable_root == true` branch — R170 P2-2 sibling) + the un-flushed insert correctly reverts; 4-thread × 2000-iter readers concurrent with 100-iter writer inserting one fresh key per iteration + commit_flush + commit_finalize on a 300-key pre-warmed tree — readers concurrently descend nodes whose `paddr/gen/csum` the writer is mid-mutating (R170 P2-1 fix: the original test wrote no-op clean commits so commit_node short-circuited; now every iteration walks a dirty leaf + dirty root) — no STM_ECORRUPT, every-lookup-finds-its-key |
+| Clone-arm write-fault sweep (chunk 11 — R174 obligation #2) | `engine_clone_commit_write_fault_sweep_small_tree`: the memstore `fail_after` knob swept over EVERY device-write ordinal of a clone-arm commit on a depth-2 tree whose folded shadow buffer crosses the region cap (60 strided 100-B concurrent updates → the flush cascades to BOTH leaves + the root, W >= 3) — each injection point f asserts `STM_EBACKEND`, exactly-f-COWs-landed (the chunk-11 `node_writes` counter is the write-ordinal witness), durable root untouched, no double-free, and the CLONE-arm survival contract (published tree + chain intact: every concurrent update still reads back via `lookup_concurrent`, logical count correct) followed by a retry commit that persists everything; the clean pass reopens from the new durable root and proves the acked updates are on disk (the #35 / R173-F1 loss class). The hooked-allocator OOM sweeps stop at `eng_buf_alloc` sites; this sweep is the one that reaches `commit_node`'s writes of shadow nodes |
+
+`tests/bench_write_amp.c` (chunk 11, 9.8-BE-bench — a bench, not a
+ctest): metadata write amplification, 9.7 serial write regime vs 9.8
+Be concurrent regime, counted at the `eng_node_write` chokepoint via
+the chunk-11 counters over a commit-cadence sweep. Two workloads —
+A "create-storm" (N inserts into an empty tree; seq / dirs / rand key
+patterns) and B "sparse-update" (S seeded keys, then M uniform-random
+updates; the section-5.4 regime) — each run on BOTH legs with a fresh
+store + tree and the same deterministic key stream. The store is a
+self-contained in-RAM vtable whose `free` really frees (paddrs never
+reused, so a read-after-free fails loudly). Env knobs
+(`STM_BENCH_WORKLOAD/PATTERN/N/SEED/UPDATES/VAL/CADENCES`) size each
+row; the serial leg's commit walks the whole resident memtree, so
+commit-heavy (small-cadence) rows run at a smaller N. Measured
+results: the phase design's section 9.2 (as-measured table + the
+corrected write-amp model).
 
 ## Status
 
@@ -1266,6 +1294,14 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
       `fs_be_port_shared_engine_uncommitted_roundtrip` (test_fs.c;
       non-vacuous — a neutered serial write funnel refuses on the
       latched shared engine).
+- [x] **Write-amp counters + bench (9.8-BE-bench, chunk 11)**: the
+      `stat_node_writes` / `stat_node_leaf_writes` / `stat_node_reads`
+      relaxed-atomic counters (diagnostic-only; surfaced through
+      `stm_btree_engine_stats`), `tests/bench_write_amp.c` (the
+      serial-vs-Be cadence sweep — see §Tests), and the clone-arm
+      write-fault sweep closing R174 obligation #2. As-measured
+      numbers + the corrected write-amp model:
+      `phase-9.8-design.md` §9.2.
 - [x] R150 audit close — 2 P1 (`load_child` DAG double-free +
       child-kind-mismatch UAF) + 3 P2. R151 audit close (impl-2) —
       0 P0 / 0 P1; 1 P2 (the abort-path nonce-safety rationale, doc

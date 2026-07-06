@@ -697,6 +697,21 @@ struct stm_btree_engine {
      * never-latched engine keeps the byte-identical legacy in-place
      * commit. */
     _Atomic(bool)         concurrent_regime;
+
+    /* 9.8-BE-bench (chunk 11): cumulative physical node-I/O counters,
+     * monotonic over the engine's lifetime. DIAGNOSTIC-ONLY — never
+     * load-bearing (no code path may branch on them); relaxed atomics
+     * so concurrent commit/read paths never order on a statistic.
+     * `stat_node_writes` counts SUCCESSFUL eng_node_write COWs — the
+     * single physical node writer, reached only from commit_node — so
+     * it IS the write-amplification numerator (section 9.2 of the
+     * phase design). `stat_node_reads` counts successful store reads
+     * in eng_node_read (spill-block I/O is deliberately excluded from
+     * both: the metric is TREE-NODE amplification). Surfaced through
+     * stm_btree_engine_stats. */
+    _Atomic(uint64_t)     stat_node_writes;
+    _Atomic(uint64_t)     stat_node_leaf_writes;
+    _Atomic(uint64_t)     stat_node_reads;
 };
 
 /* ========================================================================= */
