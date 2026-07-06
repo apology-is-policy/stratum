@@ -285,6 +285,28 @@ void *eng_buf_alloc(size_t sz);
 void *eng_buf_realloc(void *p, size_t sz);
 
 /*
+ * Deterministic transient-STM_EBUSY injection for the _concurrent
+ * write/scan surface (CF-2d — the injected-seal hook the funnel +
+ * scan bounded-retry loops are tested against). -1 = disabled
+ * (production steady state; one relaxed load per hooked crossing).
+ * A test stores:
+ *   N >= 0 — skip N crossings, then the (N+1)-th returns STM_EBUSY
+ *            ONCE and the knob self-disables back to -1 (so the
+ *            retried attempt runs uninjected; the post-op knob value
+ *            of -1 is the test's proof the injection actually fired);
+ *   -2     — EVERY crossing returns STM_EBUSY until the test resets
+ *            to -1 (the honest-EBUSY-at-the-retry-bound leg).
+ * Hooked crossings: the top of stm_btree_engine_insert_concurrent +
+ * stm_btree_engine_delete_concurrent (post arg-checks — the funnel
+ * paths), and each CONCURRENT-walk callback emission in
+ * leaf_merge_emit (so a scan test can land the EBUSY mid-emission,
+ * with the caller's collect ctx partially filled — the ctx-reset
+ * proof). Test-only, single-op-at-a-time: arm from the test thread
+ * with no concurrent engine traffic besides the op under test.
+ */
+extern _Atomic(int) eng_test_busy_countdown;
+
+/*
  * Out-of-line state for a spilled leaf value. NULL on an eng_entry
  * whose value fits inline. `eng_entry.val` ALWAYS holds the full
  * materialized value (inline or spilled) — spill is purely an on-disk

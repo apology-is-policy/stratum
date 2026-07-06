@@ -462,6 +462,42 @@ idx_lock-serialized), which the in-VM deployment first produces at
 CF-2's pool; the funnel headers' "unreachable pre-CF-2" note retires
 with this chunk.
 
+**CF-2d as-built.** All 7 funnels carry the bounded retry
+(`STM_BTREE_ENGINE_EBUSY_RETRY_MAX` = 64, the shared 2c constant;
+fresh EBR pin per attempt, `sched_yield` between, honest STM_EBUSY at
+the bound); the "unreachable pre-CF-2" note is retired. The
+**injected-seal determinism hook** is `eng_test_busy_countdown`
+(engine_internal.h; the `eng_test_oom_countdown` sibling): -1
+disabled, N >= 0 = skip-N-then-fire-STM_EBUSY-once (self-disables to
+-1, so the post-op knob value proves the fire), -2 = fire-always (the
+honest-bound leg). Hooked crossings: the top of
+`insert_concurrent`/`delete_concurrent` (the funnel legs) and each
+CONCURRENT-walk callback emission in `leaf_merge_emit` (so a scan
+test lands the EBUSY MID-EMISSION with the collect ctx partially
+filled — the CF-2c ctx-reset proof; the serial walk never fires — it
+must not EBUSY). Ten injected tests across the four subsystem suites
+cover: funnel put/del retry-absorbs (arm 0 / crossing-positioned),
+honest-EBUSY-at-the-bound (-2 then reset), and the mid-emit
+partial-ctx reset for the extent collect (overwrite `out_n_dropped ==
+3` exact), dirent drop, xattr drop, and inode find_freed
+(AllocReused survives the retry). REVERT-PROVEN: bound=1 (no retry)
+fails exactly the 9 retry-dependent tests; the honest-bound test
+alone still passes.
+
+**A CF-2c survey gap closed here**: `ex_global_walk_locked` — the
+cross-pool paddr-collision + cohabit walk run on EVERY extent
+insert/overwrite/reflink — still used the serial scan (the section-6a
+survey listed only the per-ino collect family). Ported behind a
+`concurrent_retry` mode flag: the two HOT write-path checks
+(`any_paddr_in_use_global_locked` / `cohabit_check_global_locked`,
+whose shared callback is MONOTONE — it only ever sets
+`collision = true` / `cohabit_ok = false`, so a re-walked dataset's
+re-emission is idempotent and needs no ctx reset) run the per-dataset
+concurrent scan + bounded retry; the COLD accumulating walkers
+(global count, validate-collect, lookup_by_paddr — callbacks NOT
+re-emission-safe) keep the serial scan, documented at the helper (the
+stm_xattr_list-fallback rarity trade).
+
 ## 7. Invariants (the audit prosecutes these)
 
 - **CF2-I1 (reply integrity):** every admitted request produces exactly
@@ -550,6 +586,6 @@ multi-threaded-writer-process reality).
 | CF-2a **BUILT** | fs_pool.{c,h} + serve_client branch + opts/--fs-workers + run.c publish + test_9p_pool.c (13 tests; F1 tag-reuse-after-queued-flush [self-audit; revert-proven] + F2 tag-0 completion race [found by the FIRST pool-on boot gate killing the mount at probe46; fixed by REPLYING-with-split-lookup]) | pool tests 13/13 x5 + gmalloc x3 + default ctest 70/70 + UBSan 70/70 + werror + boot gate GREEN (pool-on: boot OK, 0 EXT, login E2E, Go-4c) |
 | CF-2b **BUILT** | server.c pin (`p9_fid.busy` + `s->fid_cv`) + the 3-phase surgery across the full §4.3 hot set + `verify_fresh_snapshot` refactor + the walk `walk_components`/`walk_finish_locked` factoring (fast path vs bindings fallback) + identity-guarded (c) mutations + h_clunk busy-wait (re-lookup after every wake) + the `fid_release_locked` tripwire + `src/9p/server_internal.h` phase_b test hook + 4 `pin_*` tests (clunk-wait REVERT-PROVEN via the unpin abort, SIGABRT/134). **F3 found in-chunk**: `duplicate_tag_fatal` (CF-2a, pre-existing) raced its park release against the reader's dup-check — the losing interleave turned the dup into LEGAL F2 reuse and the drain-to-EOF hung (ctest -j4 timeout; standalone repro at iter 8; sample(1) ground truth: reader between frames, 0 in flight). Fixed: pool `on_fatal` test hook + the test holds the park until the latch is observed (100/100 post-fix). | pool 17/17 x3 + x10 binary loop + gmalloc + the 100x watchdog + default ctest 70/70 (-j4, the F3-exposing config) + UBSan 70/70 + werror + boot gate GREEN pool-on |
 | CF-2c **BUILT** | R175-(a): the 4 write-path scan families ported to `scan_range_concurrent` + the bounded whole-scan EBUSY retry (fresh EBR pin + reset ctx per attempt; `STM_BTREE_ENGINE_EBUSY_RETRY_MAX` = 64, shared with 2d) at the 5 scan sites (`in_seed_dsstate_locked` / `in_find_freed` / `ex_collect_in_ino_locked` [+ overlap + all 15 collect callers inherit] / `drop_for_dir` / `drop_for_ino`); `stm_xattr_list` KEPT serial deliberately (the R172 P1-1 SH-fallback's forward-progress guarantee); the stale btree_engine.h "STM_EBUSY not reachable" contract corrected (mid-walk seal = immediate EBUSY; the outer retry is load-bearing). See section 6(a) "CF-2c as-built". | subsystem suites (inode 62 / extent 11 / dirent 43 / xattr 25 / fs 226) + engine soak (84) + the targeted `cf2c_scan_ports_alloc_reuse_vs_write_storm` stress (churn-vs-write-storm on one dataset + post-join truncate/rewrite/memcmp integrity probe) + gmalloc on all 5 suites + default ctest 70/70 (-j4) + UBSan 70/70 + werror + boot gate GREEN pool-on (0 EXT, 1026/1026, probe46 pre+post, Go-4c status=0, login E2E, boot-ms 27829). Bound=1 experiment: the EBUSY leg is NOT reached by the stress (10/10) — deterministic retry-leg coverage lands with 2d's injected-seal hook, which must also drive one scan site per family. |
-| CF-2d | R175-(b): bounded retry-at-funnel across the 7 write funnels (fresh EBR pin per attempt) | funnel retry tests (injected seal) |
+| CF-2d **BUILT** | R175-(b): the bounded retry across all 7 write funnels (fresh EBR pin per attempt; the shared 64 bound; honest EBUSY at expiry; the "unreachable pre-CF-2" notes retired) + the `eng_test_busy_countdown` injected-seal hook (insert/delete tops + per-emission in the CONCURRENT leaf walk; skip-N-fire-once self-disabling / -2 fire-always) + the CF-2c survey-gap closure (`ex_global_walk_locked` gains `concurrent_retry`: the hot monotone-callback write-path checks [any_paddr/cohabit] go concurrent+retry; the cold accumulating walkers stay serial, documented). See section 6(b) "CF-2d as-built". | 10 injected tests across the 4 subsystem suites (funnel put/del arm-0/positioned; honest-bound -2; mid-emit partial-ctx reset for extent collect [dropped==3 exact] / dirent drop / xattr drop / inode find_freed) — REVERT-PROVEN (bound=1 fails exactly the 9 retry-dependent tests) + suites inode 65 / dirent 46 / xattr 27 / extent_index 61 / engine 84 / fs 226 / compound 17 + gmalloc x5 + default ctest 70/70 (-j4) + UBSan 70/70 + werror + boot gate GREEN pool-on. |
 | CF-2e **BUILT** (with 2a) | #57 stale-fixture sweep: atexit unlinks THIS pid's stm_v2_* (make_tmp never cleaned at exit) + once-per-process 6h-age sweep (crashed runs; parallel-ctest-safe) | the leak class closed at both ends |
 | CF-2f | bench (gofmt/fsbench re-measure) + docs (29-concurrency.md as-built rewrite + reference) + the focused Fable audit (R176) over the whole CF-2 surface | audit converged clean |

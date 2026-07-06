@@ -44,6 +44,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdatomic.h>
+
+/* CF-2d: the injected-seal knob (eng_test_busy_countdown). */
+#include "../src/btree_engine/engine_internal.h"
 
 #define DI_DEVICE_BYTES        (UINT64_C(64) * 1024u * 1024u)
 #define DI_BOOTSTRAP_BYTES     (UINT64_C(8)  * 1024u * 1024u)
@@ -1479,6 +1483,85 @@ STM_TEST(dirent_op_without_attach_refused) {
     STM_ASSERT_ERR(stm_dirent_alloc(idx, 1, 2, name, 1, 100, 0, STM_DT_REG),
                    STM_EINVAL);
     stm_dirent_index_close(idx);
+}
+
+/* ── CF-2d: injected-seal retry (the deterministic EBUSY legs) ─────── */
+
+/* The CF-2c drop_for_dir phase-1 collect absorbs an injected MID-WALK
+ * EBUSY with the probe list PARTIALLY FILLED: arm N=1 so the SECOND
+ * emitted record fires (1 probe already collected). The scan-site
+ * retry must reset the list and re-walk — a non-reset retry would
+ * carry the stale probe (4 collected -> a double-delete + dropped==4).
+ * out_dropped == 3 EXACT + the knob's -1 post-state are the asserts. */
+STM_TEST(dirent_cf2d_drop_scan_retries_mid_emit_reset) {
+    stm_dirent_index *idx = di_test_idx();
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"a", 1,
+                                       100, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"b", 1,
+                                       101, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"c", 1,
+                                       102, 0, STM_DT_REG));
+
+    atomic_store(&eng_test_busy_countdown, 1);
+    size_t dropped = 0;
+    STM_ASSERT_OK(stm_dirent_drop_for_dir(idx, 1, 2, &dropped));
+    STM_ASSERT_EQ((long long)atomic_load(&eng_test_busy_countdown),
+                  (long long)-1);
+    STM_ASSERT_EQ(dropped, (size_t)3);
+
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_count_for_dir(idx, 1, 2, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    di_test_idx_close(idx);
+}
+
+/* The DELETE funnel's bounded retry: arm N=3 so the drop's phase-1
+ * collect consumes crossings 1..3 (its three emits) and the fire
+ * lands on crossing 4 — the FIRST di_engine_del. The funnel retries;
+ * the drop completes exactly. */
+STM_TEST(dirent_cf2d_del_funnel_retries_injected_ebusy) {
+    stm_dirent_index *idx = di_test_idx();
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"a", 1,
+                                       100, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"b", 1,
+                                       101, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"c", 1,
+                                       102, 0, STM_DT_REG));
+
+    atomic_store(&eng_test_busy_countdown, 3);
+    size_t dropped = 0;
+    STM_ASSERT_OK(stm_dirent_drop_for_dir(idx, 1, 2, &dropped));
+    STM_ASSERT_EQ((long long)atomic_load(&eng_test_busy_countdown),
+                  (long long)-1);
+    STM_ASSERT_EQ(dropped, (size_t)3);
+
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_count_for_dir(idx, 1, 2, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    di_test_idx_close(idx);
+}
+
+/* The INSERT funnel's bounded retry: arm N=0 so di_engine_put's first
+ * insert_concurrent EBUSYs; the alloc still lands + resolves. */
+STM_TEST(dirent_cf2d_put_funnel_retries_injected_ebusy) {
+    stm_dirent_index *idx = di_test_idx();
+
+    atomic_store(&eng_test_busy_countdown, 0);
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"z", 1,
+                                       900, 0, STM_DT_REG));
+    STM_ASSERT_EQ((long long)atomic_load(&eng_test_busy_countdown),
+                  (long long)-1);
+
+    uint64_t ci = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 2, (const uint8_t *)"z", 1,
+                                        &ci, NULL, NULL));
+    STM_ASSERT_EQ(ci, (uint64_t)900);
+
+    di_test_idx_close(idx);
 }
 
 STM_TEST_MAIN("test_dirent")

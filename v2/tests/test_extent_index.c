@@ -40,6 +40,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdatomic.h>
+
+/* CF-2d: the injected-seal knob (eng_test_busy_countdown). */
+#include "../src/btree_engine/engine_internal.h"
 
 /* Convenience: free + zero a uint64_t* pair returned by overwrite /
  * truncate / delete_file. */
@@ -1541,6 +1545,70 @@ STM_TEST(ex_collect_engine_cold_records_empty_triple) {
     STM_ASSERT_OK(stm_extent_index_collect_engine_cold_records_at(
                       idx, 2, 0, 0, zero, ex_collect_cold_count_cb, &cc));
     STM_ASSERT_EQ(cc.n, (size_t)0);
+
+    ex_test_idx_close(idx);
+}
+
+/* ── CF-2d: injected-seal retry (the deterministic EBUSY legs) ─────── */
+
+/* The CF-2c ex_collect_in_ino_locked scan absorbs an injected MID-WALK
+ * EBUSY with the collect ctx PARTIALLY FILLED: arm N=1 so the SECOND
+ * emitted record fires (1 record already collected). The scan-site
+ * retry must fully reset the ctx and re-walk — a non-reset retry would
+ * carry the stale record into the second attempt (4 collected -> a
+ * duplicate paddr in the drop set / n == 4). The overwrite's
+ * out_n_dropped == 3 EXACT + the knob's -1 post-state (the injection
+ * provably fired) are the assertions; the overwrite's collect is the
+ * FIRST hooked crossing in the op (deterministic placement). */
+STM_TEST(ex_cf2d_collect_scan_retries_mid_emit_reset) {
+    stm_extent_index *idx = ex_test_idx(0);
+
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0,        4096, 0xAA, 0));
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096,     4096, 0xBB, 0));
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096 * 2, 4096, 0xCC, 0));
+
+    atomic_store(&eng_test_busy_countdown, 1);
+    uint64_t *dropped = NULL;
+    size_t    n = 0;
+    STM_ASSERT_OK(EX_OVERWRITE1(idx, 1, 1, 0, 4096 * 3, 0xDD, 0,
+                                          &dropped, &n));
+    STM_ASSERT_EQ((long long)atomic_load(&eng_test_busy_countdown),
+                  (long long)-1);
+    STM_ASSERT_EQ(n, (size_t)3);
+    bool seen_aa = false, seen_bb = false, seen_cc = false;
+    for (size_t i = 0; i < n; i++) {
+        if (dropped[i] == 0xAA) seen_aa = true;
+        if (dropped[i] == 0xBB) seen_bb = true;
+        if (dropped[i] == 0xCC) seen_cc = true;
+    }
+    STM_ASSERT_TRUE(seen_aa);
+    STM_ASSERT_TRUE(seen_bb);
+    STM_ASSERT_TRUE(seen_cc);
+
+    size_t cnt = 0;
+    STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
+    STM_ASSERT_EQ(cnt, (size_t)1);
+
+    free_dropped(&dropped, &n);
+    ex_test_idx_close(idx);
+}
+
+/* The extent INSERT funnel's bounded retry: on an EMPTY dataset the
+ * insert's pre-check walks (cross-pool paddr + per-ino overlap) emit
+ * nothing, so the FIRST hooked crossing is ex_engine_put's insert —
+ * arm N=0 lands the fire there deterministically. The insert still
+ * lands + counts. */
+STM_TEST(ex_cf2d_put_funnel_retries_injected_ebusy) {
+    stm_extent_index *idx = ex_test_idx(0);
+
+    atomic_store(&eng_test_busy_countdown, 0);
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 4096, 0xAA, 0));
+    STM_ASSERT_EQ((long long)atomic_load(&eng_test_busy_countdown),
+                  (long long)-1);
+
+    size_t cnt = 0;
+    STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
+    STM_ASSERT_EQ(cnt, (size_t)1);
 
     ex_test_idx_close(idx);
 }

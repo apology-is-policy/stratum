@@ -1380,6 +1380,25 @@ static stm_status engine_prepend_op(stm_btree_engine *eng, eng_delta_op op,
     return STM_OK;
 }
 
+/* CF-2d: the injected-seal test knob — see the engine_internal.h
+ * contract. Same countdown idiom as eng_test_oom_countdown (the
+ * fetch_sub that returns 0 fires AND lands the value on -1 =
+ * disabled, so skip-N-fire-once needs no explicit re-arm), plus the
+ * -2 fire-always sentinel for the honest-EBUSY-at-the-bound leg. */
+_Atomic(int) eng_test_busy_countdown = -1;
+
+static bool eng_test_busy_fire(void)
+{
+    int v = atomic_load_explicit(&eng_test_busy_countdown,
+                                 memory_order_relaxed);
+    if (v == -2) return true;
+    if (v >= 0 &&
+        atomic_fetch_sub_explicit(&eng_test_busy_countdown, 1,
+                                  memory_order_relaxed) == 0)
+        return true;
+    return false;
+}
+
 stm_status stm_btree_engine_insert_concurrent(stm_btree_engine *eng,
                                               stm_ebr_thread *ebr,
                                               const void *key, size_t key_len,
@@ -1400,6 +1419,8 @@ stm_status stm_btree_engine_insert_concurrent(stm_btree_engine *eng,
                            ENG_VAL_TAG_SIZE + ENG_SPILL_INDIRECT_SIZE;
     if (spilled_entry > ENG_MAX_ITEM_BYTES) return STM_ERANGE;
 
+    if (eng_test_busy_fire()) return STM_EBUSY;   /* CF-2d injection */
+
     return engine_prepend_op(eng, ENG_DELTA_INSERT, key, key_len,
                              value, value_len);
 }
@@ -1412,6 +1433,8 @@ stm_status stm_btree_engine_delete_concurrent(stm_btree_engine *eng,
     if (key_len && !key)   return STM_EINVAL;
     (void)ebr;
     if (key_len > STM_BTNODE_MSG_KEY_MAX) return STM_ERANGE;
+
+    if (eng_test_busy_fire()) return STM_EBUSY;   /* CF-2d injection */
 
     return engine_prepend_op(eng, ENG_DELTA_DELETE, key, key_len, NULL, 0);
 }
@@ -2853,7 +2876,8 @@ static stm_status overlay_merge(const eng_node *node, bool bounded,
  * sequences ascend by key; on a key match the overlay wins (a stored
  * entry predates every buffered message above it).
  */
-static stm_status leaf_merge_emit(const eng_node *leaf, bool bounded,
+static stm_status leaf_merge_emit(const eng_node *leaf, bool concurrent,
+                                  bool bounded,
                                   const void *lo, size_t lo_len,
                                   const void *hi, size_t hi_len,
                                   const eng_msg **win, uint32_t win_n,
@@ -2881,6 +2905,12 @@ static stm_status leaf_merge_emit(const eng_node *leaf, bool bounded,
         else c = eng_key_cmp(e->key, e->key_len, m->key, m->key_len);
 
         if (c < 0) {
+            /* CF-2d injection: land STM_EBUSY mid-emission on the
+             * concurrent walk (the caller's ctx is partially filled
+             * — exactly the mid-walk-seal shape). Never on the
+             * serial walk (serial_mu excludes sealers; the serial
+             * scan MUST NOT EBUSY). */
+            if (concurrent && eng_test_busy_fire()) return STM_EBUSY;
             if (cb(e->key, e->key_len, e->val, e->val_len, ctx) != 0) {
                 *stopped = true;
                 return STM_OK;
@@ -2889,10 +2919,13 @@ static stm_status leaf_merge_emit(const eng_node *leaf, bool bounded,
         } else {
             /* The window covers this key (c > 0: introduced; c == 0:
              * overrides the stored entry). A DELETE emits nothing. */
-            if (m->op == ENG_DELTA_INSERT &&
-                cb(m->key, m->key_len, m->value, m->value_len, ctx) != 0) {
-                *stopped = true;
-                return STM_OK;
+            if (m->op == ENG_DELTA_INSERT) {
+                if (concurrent && eng_test_busy_fire()) return STM_EBUSY;
+                if (cb(m->key, m->key_len, m->value, m->value_len,
+                       ctx) != 0) {
+                    *stopped = true;
+                    return STM_OK;
+                }
             }
             if (c == 0) ei++;
             wi++;
@@ -2918,7 +2951,8 @@ static stm_status scan_subtree(stm_btree_engine *eng, eng_node *node,
     if (depth > ENG_MAX_DEPTH) return STM_ECORRUPT;
 
     if (node->is_leaf)
-        return leaf_merge_emit(node, bounded, lo, lo_len, hi, hi_len,
+        return leaf_merge_emit(node, concurrent, bounded,
+                               lo, lo_len, hi, hi_len,
                                win, win_n, cb, ctx, stopped);
 
     /* Fold this node's buffered messages into the inherited window. */

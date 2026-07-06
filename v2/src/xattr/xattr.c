@@ -460,13 +460,21 @@ static stm_status xa_engine_put(stm_xattr_index *idx,
     xa_encode_value(r, val, &vlen);
 
     /* 9.8-BE-fs-port (chunk 10): CAS-prepend via _concurrent insert;
-     * self-entered EBR pin; non-reentrant caller contract. */
+     * self-entered EBR pin; non-reentrant caller contract. CF-2d:
+     * bounded whole-op retry on transient STM_EBUSY (fresh pin per
+     * attempt; see in_engine_put's rationale in inode.c). */
     stm_ebr_thread *ebr = stm_ebr_thread_current();
     if (!ebr) { free(val); return STM_ENOMEM; }
-    stm_ebr_enter(ebr);
-    stm_status is = stm_btree_engine_insert_concurrent(eng, ebr, key,
-                                                       XA_KEY_LEN, val, vlen);
-    stm_ebr_exit(ebr);
+    stm_status is = STM_EBUSY;
+    for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        stm_ebr_enter(ebr);
+        is = stm_btree_engine_insert_concurrent(eng, ebr, key,
+                                                XA_KEY_LEN, val, vlen);
+        stm_ebr_exit(ebr);
+        if (is != STM_EBUSY) break;
+        sched_yield();
+    }
     free(val);
     return is;
 }
@@ -486,13 +494,20 @@ static stm_status xa_engine_del(stm_xattr_index *idx,
 
     /* 9.8-BE-fs-port (chunk 10): CAS-prepend a DELETE delta via
      * _concurrent delete; self-entered EBR pin; non-reentrant caller
-     * contract. */
+     * contract. CF-2d: bounded whole-op retry on transient STM_EBUSY
+     * (fresh pin per attempt; see in_engine_put in inode.c). */
     stm_ebr_thread *ebr = stm_ebr_thread_current();
     if (!ebr) return STM_ENOMEM;
-    stm_ebr_enter(ebr);
-    stm_status rc = stm_btree_engine_delete_concurrent(eng, ebr, key,
-                                                       XA_KEY_LEN);
-    stm_ebr_exit(ebr);
+    stm_status rc = STM_EBUSY;
+    for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        stm_ebr_enter(ebr);
+        rc = stm_btree_engine_delete_concurrent(eng, ebr, key,
+                                                XA_KEY_LEN);
+        stm_ebr_exit(ebr);
+        if (rc != STM_EBUSY) break;
+        sched_yield();
+    }
     return rc;
 }
 

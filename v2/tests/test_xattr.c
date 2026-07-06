@@ -48,6 +48,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdatomic.h>
+
+/* CF-2d: the injected-seal knob (eng_test_busy_countdown). */
+#include "../src/btree_engine/engine_internal.h"
 
 #define XA_DEVICE_BYTES        (UINT64_C(64) * 1024u * 1024u)
 #define XA_BOOTSTRAP_BYTES     (UINT64_C(8)  * 1024u * 1024u)
@@ -747,5 +751,56 @@ STM_TEST(xattr_r80_p0_1_install_failure_no_zombie_record) {
  * In the meantime, the chain walk's loop bound `k < STM_XATTR_PROBE_MAX`
  * is structurally identical to the dirent layer's tested path; the
  * symmetry argument carries the soundness through. */
+
+/* ── CF-2d: injected-seal retry (the deterministic EBUSY legs) ─────── */
+
+/* The CF-2c drop_for_ino phase-1 collect absorbs an injected MID-WALK
+ * EBUSY with the probe list partially filled (arm N=1 — fire on the
+ * second emitted record); the scan-site retry resets + re-walks and
+ * the drop completes exactly (the dirent drop test's twin). */
+STM_TEST(xattr_cf2d_drop_scan_retries_mid_emit_reset) {
+    stm_xattr_index *idx = xa_test_idx();
+
+    STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.a", 6,
+                                   (const uint8_t *)"x", 1, 0, NULL));
+    STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.b", 6,
+                                   (const uint8_t *)"x", 1, 0, NULL));
+    STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.c", 6,
+                                   (const uint8_t *)"x", 1, 0, NULL));
+
+    atomic_store(&eng_test_busy_countdown, 1);
+    size_t dropped = 0;
+    STM_ASSERT_OK(stm_xattr_drop_for_ino(idx, 1, 1, &dropped));
+    STM_ASSERT_EQ((long long)atomic_load(&eng_test_busy_countdown),
+                  (long long)-1);
+    STM_ASSERT_EQ(dropped, (size_t)3);
+
+    size_t total = 0;
+    STM_ASSERT_OK(stm_xattr_list(idx, 1, 1, NULL, 0, &total));
+    STM_ASSERT_EQ(total, (size_t)0);
+
+    xa_test_idx_close(idx);
+}
+
+/* The xattr INSERT funnel's bounded retry: arm N=0 so xa_engine_put's
+ * first insert_concurrent EBUSYs; the set still lands + reads back. */
+STM_TEST(xattr_cf2d_put_funnel_retries_injected_ebusy) {
+    stm_xattr_index *idx = xa_test_idx();
+
+    atomic_store(&eng_test_busy_countdown, 0);
+    STM_ASSERT_OK(stm_xattr_set(idx, 1, 1, (const uint8_t *)"user.q", 6,
+                                   (const uint8_t *)"vv", 2, 0, NULL));
+    STM_ASSERT_EQ((long long)atomic_load(&eng_test_busy_countdown),
+                  (long long)-1);
+
+    uint8_t  buf[8] = { 0 };
+    uint32_t sz = 0;
+    STM_ASSERT_OK(stm_xattr_get(idx, 1, 1, (const uint8_t *)"user.q", 6,
+                                   buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)2);
+    STM_ASSERT_EQ(0, memcmp(buf, "vv", 2));
+
+    xa_test_idx_close(idx);
+}
 
 STM_TEST_MAIN("test_xattr")

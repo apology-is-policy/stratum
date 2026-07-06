@@ -416,9 +416,15 @@ static stm_status in_engine_get(stm_inode_index *idx,
  * 9.8-BE-fs-port (chunk 10): CAS-prepends a delta via the _concurrent
  * insert (the serial in-place upsert is the R171 P0-1 UAF). The funnel
  * enters its OWN EBR pin; same non-reentrant caller contract as
- * in_engine_get. STM_EBUSY (seal-retry back-pressure, R174 F2)
- * propagates -- unreachable pre-CF-2 (no concurrent sealer under a
- * single serial connection). */
+ * in_engine_get.
+ *
+ * CF-2d: STM_EBUSY (seal-retry back-pressure, R174 F2) is REACHABLE
+ * under the worker pool (a cross-subsystem writer's seal/fold on the
+ * shared per-dataset engine) and transient by construction, so the
+ * funnel retries the whole insert — fresh EBR pin per attempt (no
+ * epoch pinned across yields), sched_yield between, honest STM_EBUSY
+ * at the bound. A serial-write fallback is structurally impossible
+ * (the serial APIs refuse a chained root). */
 static stm_status in_engine_put(stm_inode_index *idx,
                                 uint64_t ds, uint64_t ino,
                                 const struct stm_inode_value *v) {
@@ -435,11 +441,17 @@ static stm_status in_engine_put(stm_inode_index *idx,
 
     stm_ebr_thread *ebr = stm_ebr_thread_current();
     if (!ebr) return STM_ENOMEM;
-    stm_ebr_enter(ebr);
-    stm_status rc = stm_btree_engine_insert_concurrent(eng, ebr, key,
-                                                       IN_KEY_LEN,
-                                                       val, IN_VAL_LEN);
-    stm_ebr_exit(ebr);
+    stm_status rc = STM_EBUSY;
+    for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        stm_ebr_enter(ebr);
+        rc = stm_btree_engine_insert_concurrent(eng, ebr, key,
+                                                IN_KEY_LEN,
+                                                val, IN_VAL_LEN);
+        stm_ebr_exit(ebr);
+        if (rc != STM_EBUSY) break;
+        sched_yield();
+    }
     return rc;
 }
 

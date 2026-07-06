@@ -37,6 +37,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdatomic.h>
+
+/* CF-2d: the injected-seal knob (eng_test_busy_countdown). */
+#include "../src/btree_engine/engine_internal.h"
 
 /* ------------------------------------------------------------------ */
 /* Storage fixture.                                                    */
@@ -1528,6 +1532,87 @@ STM_TEST(inode_op_without_attach_refused) {
     uint64_t ino = 0;
     STM_ASSERT_ERR(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino), STM_EINVAL);
     stm_inode_index_close(idx);
+}
+
+/* ── CF-2d: injected-seal retry (the deterministic EBUSY legs) ─────── */
+
+/* The PUT funnel absorbs a single injected transient STM_EBUSY: arm
+ * N=0 so in_engine_put's FIRST insert_concurrent returns EBUSY; the
+ * funnel's bounded retry re-drives it (fresh EBR pin) and the op
+ * succeeds. The knob's -1 post-state proves the injection actually
+ * fired (a vacuous run would leave it at 0). */
+STM_TEST(inode_cf2d_put_funnel_retries_injected_ebusy) {
+    stm_inode_index *idx = inode_test_idx();
+
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &a));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, a, &v));
+    /* R172 P1-2: a >inline size needs data_kind = EXTENT. */
+    v.si_data_kind = STM_DATA_EXTENT;
+    v.si_data_len  = 0;
+    memset(&v.si_data, 0, sizeof v.si_data);
+    v.si_size      = stm_store_le64(4096ULL);
+
+    atomic_store(&eng_test_busy_countdown, 0);
+    STM_ASSERT_OK(stm_inode_set(idx, 1, a, &v));
+    STM_ASSERT_EQ((long long)atomic_load(&eng_test_busy_countdown),
+                  (long long)-1);
+
+    struct stm_inode_value back = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, a, &back));
+    STM_ASSERT_EQ(stm_load_le64(back.si_size), (uint64_t)4096u);
+
+    inode_test_idx_close(idx);
+}
+
+/* The honest-EBUSY-at-the-bound leg: -2 fires on EVERY crossing, so
+ * the funnel's 64 retries all EBUSY and the op surfaces the honest
+ * residue (a genuinely wedged seal must stay visible). Reset to -1
+ * and the same op succeeds. */
+STM_TEST(inode_cf2d_put_funnel_honest_ebusy_at_bound) {
+    stm_inode_index *idx = inode_test_idx();
+
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &a));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, a, &v));
+    v.si_data_kind = STM_DATA_EXTENT;
+    v.si_data_len  = 0;
+    memset(&v.si_data, 0, sizeof v.si_data);
+    v.si_size      = stm_store_le64(8192ULL);
+
+    atomic_store(&eng_test_busy_countdown, -2);
+    STM_ASSERT_ERR(stm_inode_set(idx, 1, a, &v), STM_EBUSY);
+    atomic_store(&eng_test_busy_countdown, -1);
+
+    STM_ASSERT_OK(stm_inode_set(idx, 1, a, &v));
+
+    inode_test_idx_close(idx);
+}
+
+/* The CF-2c find_freed scan absorbs an injected mid-walk EBUSY: with
+ * a FREED slot present, arm N=0 so the scan's FIRST emitted record
+ * returns EBUSY mid-walk; the scan-site bounded retry re-walks (reset
+ * ctx, fresh pin) and the alloc still reuses the freed ino. */
+STM_TEST(inode_cf2d_freed_scan_retries_injected_ebusy) {
+    stm_inode_index *idx = inode_test_idx();
+
+    uint64_t a = 0, b = 0, c = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &a));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &b));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &c));
+    STM_ASSERT_OK(stm_inode_free(idx, 1, b));
+
+    atomic_store(&eng_test_busy_countdown, 0);
+    uint64_t d = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &d));
+    STM_ASSERT_EQ((long long)atomic_load(&eng_test_busy_countdown),
+                  (long long)-1);
+    STM_ASSERT_EQ(d, b);                    /* AllocReused survived the retry */
+
+    inode_test_idx_close(idx);
 }
 
 STM_TEST_MAIN("test_inode")

@@ -927,6 +927,14 @@ whole scan in a bounded retry that resets the callback ctx and
 re-enters a fresh EBR pin per attempt
 (`STM_BTREE_ENGINE_EBUSY_RETRY_MAX` = 64, `sched_yield` between
 attempts, honest STM_EBUSY at the bound — the CF-2c write-path legs).
+The write funnels (`in/di/xa/ex_engine_put/del`) carry the same
+bounded retry around `insert_concurrent`/`delete_concurrent` (CF-2d).
+Caller retry loops are tested deterministically against
+`eng_test_busy_countdown` (engine_internal.h — the injected-seal knob:
+skip-N-then-fire-STM_EBUSY-once self-disabling to -1, or -2
+fire-always; hooked at the `_concurrent` insert/delete tops and at
+each CONCURRENT-walk callback emission in `leaf_merge_emit`, so a test
+can land the EBUSY mid-emission with a partially-filled caller ctx).
 
 ### Failure atomicity
 

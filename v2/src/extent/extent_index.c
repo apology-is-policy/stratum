@@ -281,14 +281,22 @@ static stm_status ex_engine_put(stm_extent_index *idx,
     if (vs != STM_OK) return vs;
 
     /* 9.8-BE-fs-port (chunk 10): CAS-prepend via _concurrent insert;
-     * self-entered EBR pin; non-reentrant caller contract. */
+     * self-entered EBR pin; non-reentrant caller contract. CF-2d:
+     * bounded whole-op retry on transient STM_EBUSY (fresh pin per
+     * attempt; see in_engine_put's rationale in inode.c). */
     stm_ebr_thread *ebr = stm_ebr_thread_current();
     if (!ebr) return STM_ENOMEM;
-    stm_ebr_enter(ebr);
-    stm_status rc = stm_btree_engine_insert_concurrent(eng, ebr, key,
-                                                       EX_KEY_LEN,
-                                                       val, EX_VAL_LEN);
-    stm_ebr_exit(ebr);
+    stm_status rc = STM_EBUSY;
+    for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        stm_ebr_enter(ebr);
+        rc = stm_btree_engine_insert_concurrent(eng, ebr, key,
+                                                EX_KEY_LEN,
+                                                val, EX_VAL_LEN);
+        stm_ebr_exit(ebr);
+        if (rc != STM_EBUSY) break;
+        sched_yield();
+    }
     return rc;
 }
 
@@ -314,13 +322,21 @@ static stm_status ex_engine_del(stm_extent_index *idx,
      * contract. Extent needs STRUCTURAL removal (a stale extent record
      * would read back as a live extent -> data corruption); the flush
      * of a DELETE delta annihilates the base record, matching the
-     * serial delete's structural semantics (chunk-8 flush). */
+     * serial delete's structural semantics (chunk-8 flush). CF-2d:
+     * bounded whole-op retry on transient STM_EBUSY (fresh pin per
+     * attempt; see in_engine_put's rationale in inode.c). */
     stm_ebr_thread *ebr = stm_ebr_thread_current();
     if (!ebr) return STM_ENOMEM;
-    stm_ebr_enter(ebr);
-    stm_status rc = stm_btree_engine_delete_concurrent(eng, ebr, key,
-                                                       EX_KEY_LEN);
-    stm_ebr_exit(ebr);
+    stm_status rc = STM_EBUSY;
+    for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        stm_ebr_enter(ebr);
+        rc = stm_btree_engine_delete_concurrent(eng, ebr, key,
+                                                EX_KEY_LEN);
+        stm_ebr_exit(ebr);
+        if (rc != STM_EBUSY) break;
+        sched_yield();
+    }
     return rc;
 }
 
@@ -540,9 +556,28 @@ static int ex_global_scan_adapter(const void *k, size_t klen,
 
 /* Walk every PRESENT dataset's engine over the EXTENT subspace
  * [tag||0||0 .. tag||MAX||MAX]. Caller holds idx->lock. */
+/* `concurrent_retry` selects the phase-2 scan mode (CF-2d):
+ *
+ *   false — the serial scan_range (holds serial_mu per dataset
+ *     walked). For the COLD accumulating walkers (global count,
+ *     validate-collect, lookup_by_paddr) whose callbacks are NOT
+ *     re-emission-safe (a re-walked dataset would double-count /
+ *     double-collect); their rarity bounds the mini-suppression cost,
+ *     the stm_xattr_list-fallback trade.
+ *
+ *   true — the CF-2c EBR-pinned concurrent scan + bounded whole-scan
+ *     EBUSY retry, PER DATASET. REQUIRES a re-emission-safe callback:
+ *     a transient mid-walk seal re-walks THAT dataset from scratch,
+ *     so the callback must accumulate monotonically / idempotently
+ *     (ex_check_record_cb qualifies — it only ever sets
+ *     collision = true / cohabit_ok = false). For the HOT write-path
+ *     checks (any_paddr / cohabit run on EVERY extent insert +
+ *     overwrite + reflink), where a serial whole-subspace walk would
+ *     suppress the mini-consolidation under the pool. */
 static stm_status ex_global_walk_locked(stm_extent_index *idx,
                                             ex_global_record_cb cb,
-                                            void *ctx) {
+                                            void *ctx,
+                                            bool concurrent_retry) {
     if (idx->ds_idx == NULL) return STM_EINVAL;
 
     /* Phase 1: collect PRESENT dataset ids. */
@@ -562,6 +597,12 @@ static stm_status ex_global_walk_locked(stm_extent_index *idx,
         return k1 != STM_OK ? k1 : k2;
     }
 
+    stm_ebr_thread *ebr = NULL;
+    if (concurrent_retry) {
+        ebr = stm_ebr_thread_current();
+        if (!ebr) { free(dc.ids); return STM_ENOMEM; }
+    }
+
     for (size_t i = 0; i < dc.n; i++) {
         uint64_t ds = dc.ids[i];
         stm_btree_engine *eng = NULL;
@@ -572,10 +613,28 @@ static stm_status ex_global_walk_locked(stm_extent_index *idx,
         ex_global_scan_ctx gc = { .user_cb = cb, .user_ctx = ctx,
                                     .ds = ds, .user_signal = 0,
                                     .err = STM_OK };
-        stm_status ss = stm_btree_engine_scan_range(eng, lo, EX_KEY_LEN,
-                                                    hi, EX_KEY_LEN,
-                                                    ex_global_scan_adapter,
-                                                    &gc);
+        stm_status ss;
+        if (!concurrent_retry) {
+            ss = stm_btree_engine_scan_range(eng, lo, EX_KEY_LEN,
+                                             hi, EX_KEY_LEN,
+                                             ex_global_scan_adapter,
+                                             &gc);
+        } else {
+            ss = STM_EBUSY;
+            for (uint32_t attempt = 0;
+                 attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX; attempt++) {
+                gc = (ex_global_scan_ctx){ .user_cb = cb, .user_ctx = ctx,
+                                             .ds = ds, .user_signal = 0,
+                                             .err = STM_OK };
+                stm_ebr_enter(ebr);
+                ss = stm_btree_engine_scan_range_concurrent(
+                         eng, ebr, lo, EX_KEY_LEN, hi, EX_KEY_LEN,
+                         ex_global_scan_adapter, &gc);
+                stm_ebr_exit(ebr);
+                if (ss != STM_EBUSY) break;
+                sched_yield();
+            }
+        }
         if (ss != STM_OK || gc.err != STM_OK) {
             free(dc.ids);
             return ss != STM_OK ? ss : gc.err;
@@ -696,7 +755,8 @@ static stm_status any_paddr_in_use_global_locked(stm_extent_index *idx,
     gc.skip_keys    = skip_keys;
     gc.n_skip       = n_skip;
     gc.cohabit_ok   = true;
-    stm_status ss = ex_global_walk_locked(idx, ex_check_record_cb, &gc);
+    stm_status ss = ex_global_walk_locked(idx, ex_check_record_cb, &gc,
+                                          /*concurrent_retry=*/true);
     if (ss != STM_OK) return ss;
     *out_collision = gc.collision;
     return STM_OK;
@@ -722,7 +782,8 @@ static stm_status cohabit_check_global_locked(stm_extent_index *idx,
     gc.cand_origin_ino    = origin_ino;
     gc.cand_origin_off    = origin_off;
     gc.cohabit_ok         = true;
-    stm_status ss = ex_global_walk_locked(idx, ex_check_record_cb, &gc);
+    stm_status ss = ex_global_walk_locked(idx, ex_check_record_cb, &gc,
+                                          /*concurrent_retry=*/true);
     if (ss != STM_OK) return ss;
     *out_ok = gc.cohabit_ok;
     return STM_OK;
@@ -2242,7 +2303,8 @@ stm_status stm_extent_lookup_by_paddr(const stm_extent_index *idx,
     }
 
     ex_paddr_lookup_ctx lc = { .probe = paddr, .hit = {0}, .found = false };
-    stm_status ss = ex_global_walk_locked(m, ex_paddr_lookup_cb, &lc);
+    stm_status ss = ex_global_walk_locked(m, ex_paddr_lookup_cb, &lc,
+                                           /*concurrent_retry=*/false);
     must_unlock(lock);
     if (ss != STM_OK) return ss;
     if (!lc.found) return STM_ENOENT;
@@ -2389,7 +2451,8 @@ stm_status stm_extent_count(const stm_extent_index *idx,
     }
 
     ex_count_ctx cc = { .n = 0 };
-    stm_status ss = ex_global_walk_locked(m, ex_count_cb_g, &cc);
+    stm_status ss = ex_global_walk_locked(m, ex_count_cb_g, &cc,
+                                           /*concurrent_retry=*/false);
     must_unlock(lock);
     if (ss != STM_OK) return ss;
     *out_count = cc.n;
@@ -2769,7 +2832,8 @@ stm_status stm_extent_index_mount_validate(stm_extent_index *idx) {
 
     ex_validate_ctx m = { .records = NULL, .n = 0, .cap = 0,
                             .max_write_gen = 0, .err = STM_OK };
-    stm_status ws = ex_global_walk_locked(idx, ex_validate_collect_cb, &m);
+    stm_status ws = ex_global_walk_locked(idx, ex_validate_collect_cb, &m,
+                                           /*concurrent_retry=*/false);
     if (ws != STM_OK || m.err != STM_OK) {
         free(m.records);
         must_unlock(&idx->lock);
@@ -2801,7 +2865,8 @@ stm_status stm_extent_index_verify(const stm_extent_index *idx) {
 
     ex_validate_ctx ctx = { .records = NULL, .n = 0, .cap = 0,
                               .max_write_gen = 0, .err = STM_OK };
-    stm_status ws = ex_global_walk_locked(m, ex_validate_collect_cb, &ctx);
+    stm_status ws = ex_global_walk_locked(m, ex_validate_collect_cb, &ctx,
+                                           /*concurrent_retry=*/false);
     if (ws != STM_OK || ctx.err != STM_OK) {
         free(ctx.records);
         must_unlock(lock);
