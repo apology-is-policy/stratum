@@ -42,9 +42,19 @@ struct stm_ds_policy_table;
 /* Test-only hooks (NULL in production). pre_handle fires on the worker
  * thread after a slot is popped for execution and before
  * stm_9p_server_handle — a test can park there (semaphore / sleep) to
- * make "Tflush of an EXECUTING op" and worker-overlap deterministic. */
+ * make "Tflush of an EXECUTING op" and worker-overlap deterministic.
+ * on_fatal fires (under the pool mutex) when the connection FIRST
+ * latches dead, with the fatal rc — a test that provokes a fatal while
+ * holding an op parked orders its release strictly after the latch.
+ * Without that ordering, the release races the reader's processing of
+ * the offending frame, and the losing interleave turns the intended
+ * violation into a LEGAL one (the duplicate_tag_fatal hang: the parked
+ * op completed into REPLYING first, so the dup was admitted as legal
+ * tag reuse per the F2 rule and the connection never died — the test's
+ * drain-to-EOF then blocked forever). */
 typedef struct stm_fs_pool_test_hooks {
     void (*pre_handle)(void *arg, uint16_t tag, uint8_t type);
+    void (*on_fatal)(void *arg, stm_status rc);
     void  *arg;
 } stm_fs_pool_test_hooks;
 

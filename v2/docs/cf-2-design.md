@@ -239,9 +239,20 @@ engine_internal.h precedent) or via opts.
   bounded by op finiteness). h_version + server_destroy release-all
   with busy == 0 by construction (the §3.3 barrier / pool-join
   precede them); the tripwire enforces it.
+- **As built**: h_clunk's wait RE-LOOKUPS the fid after every wake
+  (`fid_get` again) — while it waited, a concurrent
+  (protocol-violating) clunk of the same fid may have released the
+  slot, or released it AND a walk/attach repurposed the slot under a
+  different fid number; testing the ORIGINAL pointer's `busy` would
+  then read a different fid's pin. A vanished fid → EBADF.
 - Pin starvation of a clunk by a client that keeps pinning the same
   fid is self-harm within one connection (per-connection server), not
   cross-client DoS — accepted, documented.
+- A clunk waits only for ops that are already EXECUTING on another
+  worker (a QUEUED op has not pinned yet — pins are taken at (a)
+  inside execution), so the wait can never deadlock on worker-count
+  exhaustion: the pinned op already owns a worker and completes
+  without needing another.
 
 ### 4.2 The 3-phase split
 
@@ -271,6 +282,40 @@ forbids them); the server's obligation is memory safety + SOME legal
 serialization, both of which the snapshot discipline provides —
 NOT semantic exclusivity (no exclusive-pin machinery; double-lopen
 double-truncates idempotently, last-writer-wins fid state, etc.).
+
+**As built — the identity guard.** Where a (c) mutation DERIVES from
+the (a) snapshot (lopen's open-state stamp, lcreate's repurpose,
+setattr's post-truncate cached_gen refresh), it applies only if the
+fid still means what (b) operated on: `kind == NODE && dataset_id ==
+ds && ino == ino`. If a concurrent same-fid op rebound or repurposed
+the fid during (b), the mutation is SKIPPED — realizing the pure
+"our op serialized first, the mutator superseded it" order instead
+of grafting derived state onto the new binding (which for a
+kind-flip would orphan the AUX xattr_buf/xattr_name — the R93 P2-2
+leak). h_walk's newfid==fid rebind carries the same kind guard
+(EINVAL on a flipped fid); walk's rebind is otherwise a COMPLETE
+overwrite, so last-writer-wins needs no identity term. The reply
+reports the (b) outcome either way (the FS mutation happened).
+
+**As built — verify precedence + immutable (b) reads.** Every gate
+that reads fid state runs in (a) under the lock, in the original
+order; the freshness verify (`verify_fresh_snapshot`, the fid.tla
+IOReject gate) moved into (b) but keeps its wire-visible precedence
+(it was already ordered after all static gates). The only server
+fields a (b) phase reads are `s->fs` (immutable pointer) and
+`s->auth_uid` (written once at create); `s->msize` is snapshotted in
+(a) (mutated only by the barriered h_version).
+
+**As built — the walk factoring.** The component loop is
+`walk_components(consult_bindings, ...)` over a stack `walk_cursor`
+(the (a) identity + ns_path snapshot): the FALLBACK (num_bindings >
+0, checked in (a)) runs it fully locked with the per-component
+bindings consult; the FAST PATH (0 bindings — the Thylacine
+deployment) runs it in (b) with the consult compiled to NULL — a
+Tbind installed concurrently serializes after the walk. The bind
+tail is `walk_finish_locked` (partial/ENOENT replies, ns_path
+malloc-before-mutate, fid_alloc / rebind), shared by both paths and
+always run under `s->lock` — on the fast path it IS phase (c).
 
 ### 4.3 Handler classification
 
@@ -443,11 +488,23 @@ multi-threaded-writer-process reality).
   not timing-dependent. Compiled out of production.
 - `tests/test_9p_socket.c` gains a pool-mode E2E variant (the existing
   socket harness with fs_workers=4).
-- server.c surgery tests ride test_9p_pool.c: concurrent same-fid
-  read+clunk (pin makes clunk wait — assert both complete, no UAF
-  under guard-malloc); concurrent walk+walk to the same newfid (one
-  EBADF); pipelined reads on distinct fids complete concurrently
-  (the stall hook proves overlap: total wall < sum of stalls).
+- server.c surgery tests ride test_9p_pool.c — **as built** (the
+  determinism substrate is `stm_9p_server_set_test_hooks` /
+  `src/9p/server_internal.h`: a phase_b hook fired at the start of
+  every 3-phase (b), s->lock NOT held, pin(s) HELD — a plain
+  process-global runtime hook like the pool's pre_handle, NOT the
+  ifdef-gated stall sketched above):
+  `pin_read_clunk_waits` (park a Tread mid-(b); Tclunk must NOT
+  complete while pinned [150 ms quiet window]; release → both replies
+  correct + fid gone; REVERT-PROVEN: neutering h_clunk's wait crashes
+  the test on the busy==0 unpin abort, SIGABRT/134);
+  `pin_walk_walk_same_newfid` (two clone-walks from ONE source fid
+  parked in (b) SIMULTANEOUSLY — busy==2, the overlap proof — then
+  exactly one binds the shared newfid, the loser EBADF);
+  `pin_getattr_overlaps_parked_write` (a Tgetattr completes WHILE a
+  Twrite on the same fid is parked mid-(b) — the pin is shared, not
+  exclusive); `pin_version_barrier_waits` (Tversion held back behind
+  a PINNED op; a barrier hole would abort on the release tripwire).
 - The full matrix: default + UBSan ctest; guard-malloc engine+pool
   suites; the Thylacine boot gate (the VM coordinator defaults to
   pool-on — every boot becomes a pool E2E); the SMP gate on the
@@ -458,7 +515,7 @@ multi-threaded-writer-process reality).
 | # | Scope | Verify |
 |---|---|---|
 | CF-2a **BUILT** | fs_pool.{c,h} + serve_client branch + opts/--fs-workers + run.c publish + test_9p_pool.c (13 tests; F1 tag-reuse-after-queued-flush [self-audit; revert-proven] + F2 tag-0 completion race [found by the FIRST pool-on boot gate killing the mount at probe46; fixed by REPLYING-with-split-lookup]) | pool tests 13/13 x5 + gmalloc x3 + default ctest 70/70 + UBSan 70/70 + werror + boot gate GREEN (pool-on: boot OK, 0 EXT, login E2E, Go-4c) |
-| CF-2b | server.c pin + 3-phase surgery (the §4.3 table) + verify_fresh_snapshot refactor + concurrency tests | pool tests incl. overlap proof + gmalloc + ctest + boot gate |
+| CF-2b **BUILT** | server.c pin (`p9_fid.busy` + `s->fid_cv`) + the 3-phase surgery across the full §4.3 hot set + `verify_fresh_snapshot` refactor + the walk `walk_components`/`walk_finish_locked` factoring (fast path vs bindings fallback) + identity-guarded (c) mutations + h_clunk busy-wait (re-lookup after every wake) + the `fid_release_locked` tripwire + `src/9p/server_internal.h` phase_b test hook + 4 `pin_*` tests (clunk-wait REVERT-PROVEN via the unpin abort, SIGABRT/134). **F3 found in-chunk**: `duplicate_tag_fatal` (CF-2a, pre-existing) raced its park release against the reader's dup-check — the losing interleave turned the dup into LEGAL F2 reuse and the drain-to-EOF hung (ctest -j4 timeout; standalone repro at iter 8; sample(1) ground truth: reader between frames, 0 in flight). Fixed: pool `on_fatal` test hook + the test holds the park until the latch is observed (100/100 post-fix). | pool 17/17 x3 + x10 binary loop + gmalloc + the 100x watchdog + default ctest 70/70 (-j4, the F3-exposing config) + UBSan 70/70 + werror + boot gate GREEN pool-on |
 | CF-2c | R175-(a): port the 4 write-path scan families to `scan_range_concurrent` + bounded caller retry (commit-cadence bound = documented backstop) | targeted engine/fs tests + soak |
 | CF-2d | R175-(b): bounded retry-at-funnel across the 7 write funnels (fresh EBR pin per attempt) | funnel retry tests (injected seal) |
 | CF-2e **BUILT** (with 2a) | #57 stale-fixture sweep: atexit unlinks THIS pid's stm_v2_* (make_tmp never cleaned at exit) + once-per-process 6h-age sweep (crashed runs; parallel-ctest-safe) | the leak class closed at both ends |

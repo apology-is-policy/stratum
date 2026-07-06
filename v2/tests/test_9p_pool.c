@@ -19,6 +19,7 @@
 #include "tharness.h"
 #include "test_fs_common.h"
 
+#include "../src/9p/server_internal.h"
 #include "../src/cmd/stratumd/fs_pool.h"
 
 #include <stratum/9p.h>
@@ -27,6 +28,7 @@
 #include <stratum/types.h>
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -237,6 +239,7 @@ static void fix_down(pool_fix *fx)
     (void)pthread_join(fx->tid, NULL);
     if (fx->fs) (void)stm_fs_unmount(fx->fs);
     stm_fs_pool_set_test_hooks(NULL);
+    stm_9p_server_set_test_hooks(NULL, NULL);
 }
 
 /* Handshake over the client fd: Tversion + Tattach(fid). */
@@ -269,6 +272,7 @@ typedef struct {
     bool     released;
     int      n_entered;
     uint16_t entered[STALL_MAX];
+    bool     fatal_seen;        /* on_fatal fired (first dead latch) */
 } stall_ctl;
 
 static void stall_init(stall_ctl *c, const uint16_t *tags, int n)
@@ -313,6 +317,27 @@ static void stall_await_entered(stall_ctl *c, int n)
     pthread_mutex_unlock(&c->mu);
 }
 
+/* on_fatal hook + its waiter: order a park release strictly AFTER the
+ * connection's dead latch. Runs under the POOL mutex — touches only
+ * the ctl's own mutex (no lock-order interaction). */
+static void stall_on_fatal(void *arg, stm_status rc)
+{
+    (void)rc;
+    stall_ctl *c = arg;
+    pthread_mutex_lock(&c->mu);
+    c->fatal_seen = true;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void stall_await_fatal(stall_ctl *c)
+{
+    pthread_mutex_lock(&c->mu);
+    while (!c->fatal_seen)
+        pthread_cond_wait(&c->cv, &c->mu);
+    pthread_mutex_unlock(&c->mu);
+}
+
 static void stall_release(stall_ctl *c)
 {
     pthread_mutex_lock(&c->mu);
@@ -325,6 +350,19 @@ static void stall_install(stall_ctl *c)
 {
     stm_fs_pool_test_hooks h = { .pre_handle = stall_pre_handle, .arg = c };
     stm_fs_pool_set_test_hooks(&h);
+}
+
+/* CF-2b: park inside a 3-phase handler's unlocked (b) phase — the fid
+ * pin(s) HELD, s->lock NOT held. Same park logic / controller as the
+ * pool-level pre_handle stall, different hook point. */
+static void bstall_phase_b(uint8_t type, uint16_t tag, void *arg)
+{
+    stall_pre_handle(arg, tag, type);
+}
+
+static void bstall_install(stall_ctl *c)
+{
+    stm_9p_server_set_test_hooks(bstall_phase_b, c);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -648,7 +686,10 @@ STM_TEST(p9_pool_duplicate_tag_fatal) {
     stall_ctl st;
     uint16_t park[1] = { 700 };
     stall_init(&st, park, 1);
-    stall_install(&st);
+    stm_fs_pool_test_hooks h = { .pre_handle = stall_pre_handle,
+                                 .on_fatal   = stall_on_fatal,
+                                 .arg        = &st };
+    stm_fs_pool_set_test_hooks(&h);
 
     STM_ASSERT_TRUE(fix_up(&fx, "pool_dup_tag", 2));
     STM_ASSERT_EQ(fix_handshake(&fx, 0), 0);
@@ -656,8 +697,16 @@ STM_TEST(p9_pool_duplicate_tag_fatal) {
     uint8_t buf[512];
     STM_ASSERT_EQ(send_all(fx.client_fd, buf, build_tgetattr(buf, 700, 0)), 0);
     stall_await_entered(&st, 1);
-    /* Same tag again while in flight. */
+    /* Same tag again while in flight — and provably STILL in flight
+     * when the reader runs its dup-check: the first incarnation's
+     * worker stays parked (slot pinned EXECUTING) until the fatal
+     * latch is OBSERVED via the on_fatal hook. Releasing before that
+     * races the reader — the losing interleave completes op #1 into
+     * REPLYING first, the dup is then admitted as LEGAL tag reuse (the
+     * F2 rule), the connection stays healthy, and the drain below
+     * blocks forever (the ctest -j4 timeout that exposed this). */
     STM_ASSERT_EQ(send_all(fx.client_fd, buf, build_tgetattr(buf, 700, 0)), 0);
+    stall_await_fatal(&st);
     stall_release(&st);
 
     /* The connection dies: whatever frames may still drain, the stream
@@ -870,4 +919,300 @@ STM_TEST(p9_pool_serial_byte_equivalence) {
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 
-STM_TEST_MAIN("9p pool (CF-2a)")
+/* ────────────────────────────────────────────────────────────────────── */
+/* CF-2b — the s->lock 3-phase surgery + per-fid pin.                     */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static uint32_t build_twalk_clone(uint8_t *buf, uint16_t tag,
+                                     uint32_t fid, uint32_t newfid)
+{
+    uint8_t *p = buf + 7;
+    pack_u32(p, fid);    p += 4;
+    pack_u32(p, newfid); p += 4;
+    pack_u16(p, 0);      p += 2;    /* nwname = 0 (clone) */
+    uint32_t sz = (uint32_t)(p - buf);
+    pack_u32(buf, sz);
+    buf[4] = STM_9P_TWALK;
+    pack_u16(buf + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tlcreate(uint8_t *buf, uint16_t tag, uint32_t fid,
+                                  const char *name, uint32_t flags,
+                                  uint32_t mode)
+{
+    uint16_t nlen = (uint16_t)strlen(name);
+    uint8_t *p = buf + 7;
+    pack_u32(p, fid);        p += 4;
+    pack_u16(p, nlen);       p += 2;
+    memcpy(p, name, nlen);   p += nlen;
+    pack_u32(p, flags);      p += 4;
+    pack_u32(p, mode);       p += 4;
+    pack_u32(p, 0);          p += 4;    /* gid */
+    uint32_t sz = (uint32_t)(p - buf);
+    pack_u32(buf, sz);
+    buf[4] = STM_9P_TLCREATE;
+    pack_u16(buf + 5, tag);
+    return sz;
+}
+
+static uint32_t build_twrite(uint8_t *buf, uint16_t tag, uint32_t fid,
+                                uint64_t off, const void *data, uint32_t n)
+{
+    uint8_t *p = buf + 7;
+    pack_u32(p, fid);      p += 4;
+    pack_u64(p, off);      p += 8;
+    pack_u32(p, n);        p += 4;
+    memcpy(p, data, n);    p += n;
+    uint32_t sz = (uint32_t)(p - buf);
+    pack_u32(buf, sz);
+    buf[4] = STM_9P_TWRITE;
+    pack_u16(buf + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tread(uint8_t *buf, uint16_t tag, uint32_t fid,
+                               uint64_t off, uint32_t count)
+{
+    uint8_t *p = buf + 7;
+    pack_u32(p, fid);   p += 4;
+    pack_u64(p, off);   p += 8;
+    pack_u32(p, count); p += 4;
+    uint32_t sz = (uint32_t)(p - buf);
+    pack_u32(buf, sz);
+    buf[4] = STM_9P_TREAD;
+    pack_u16(buf + 5, tag);
+    return sz;
+}
+
+/* Expect NO bytes on fd within ms (poll returns 0). */
+static bool fd_quiet_for(int fd, int ms)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    return poll(&pfd, 1, ms) == 0;
+}
+
+/* Clone root fid 0 -> fid, lcreate name O_RDWR 0644 (fid becomes the
+ * open file), write payload at 0. Uses tags 90..92. */
+static int fix_open_file(pool_fix *fx, uint32_t fid, const char *name,
+                            const void *payload, uint32_t n)
+{
+    uint8_t  buf[512];
+    uint32_t rlen = 0;
+    if (send_all(fx->client_fd, buf,
+                  build_twalk_clone(buf, 90, 0, fid)) != 0) return -1;
+    if (recv_frame(fx->client_fd, buf, sizeof buf, &rlen) != 0) return -2;
+    if (buf[4] != STM_9P_RWALK) return -3;
+    if (send_all(fx->client_fd, buf,
+                  build_tlcreate(buf, 91, fid, name,
+                                  STM_9P_O_RDWR, 0644u)) != 0) return -4;
+    if (recv_frame(fx->client_fd, buf, sizeof buf, &rlen) != 0) return -5;
+    if (buf[4] != STM_9P_RLCREATE) return -6;
+    if (n > 0) {
+        if (send_all(fx->client_fd, buf,
+                      build_twrite(buf, 92, fid, 0, payload, n)) != 0)
+            return -7;
+        if (recv_frame(fx->client_fd, buf, sizeof buf, &rlen) != 0) return -8;
+        if (buf[4] != STM_9P_RWRITE) return -9;
+    }
+    return 0;
+}
+
+/* Tclunk must WAIT for a pinned fid: park a Tread mid-(b) (pin held),
+ * send Tclunk on the same fid, prove the clunk does NOT complete while
+ * the pin is held, then release and prove both complete correctly and
+ * the fid is gone. Revert-proof: without h_clunk's busy-wait the
+ * release memsets the slot under the parked op and its (c) unpin hits
+ * the busy==0 abort tripwire (crash = test failure). */
+STM_TEST(p9_pool_pin_read_clunk_waits) {
+    pool_fix fx;
+    STM_ASSERT_TRUE(fix_up(&fx, "pool_pin_clunk", /*workers=*/4));
+    STM_ASSERT_EQ(fix_handshake(&fx, /*fid=*/0), 0);
+    static const char payload[] = "thylacine";   /* 9 bytes, no NUL */
+    STM_ASSERT_EQ(fix_open_file(&fx, 1, "pinf", payload, 9), 0);
+
+    stall_ctl ctl;
+    uint16_t park[] = { 200 };
+    stall_init(&ctl, park, 1);
+    bstall_install(&ctl);
+
+    uint8_t  buf[512];
+    uint32_t rlen = 0;
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tread(buf, 200, 1, 0, 64)), 0);
+    stall_await_entered(&ctl, 1);       /* the read is mid-(b), pinned */
+
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tclunk(buf, 201, 1)), 0);
+    /* The clunk must be waiting on the pin — nothing may arrive. */
+    STM_ASSERT_TRUE(fd_quiet_for(fx.client_fd, 150));
+
+    stall_release(&ctl);
+    /* Both replies arrive (wire order unspecified — the two workers'
+     * writes race to the writer mutex after the pin drops). */
+    bool got_read = false, got_clunk = false;
+    for (int i = 0; i < 2; i++) {
+        STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+        uint16_t tag = load_u16(buf + 5);
+        if (tag == 200) {
+            STM_ASSERT_EQ(buf[4], STM_9P_RREAD);
+            STM_ASSERT_EQ(load_u32(buf + 7), 9u);
+            STM_ASSERT_EQ(memcmp(buf + 11, payload, 9), 0);
+            got_read = true;
+        } else {
+            STM_ASSERT_EQ(tag, 201);
+            STM_ASSERT_EQ(buf[4], STM_9P_RCLUNK);
+            got_clunk = true;
+        }
+    }
+    STM_ASSERT_TRUE(got_read);
+    STM_ASSERT_TRUE(got_clunk);
+
+    /* The fid is gone. */
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tgetattr(buf, 202, 1)), 0);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(buf + 7), STM_9P_ECODE_EBADF);
+
+    fix_down(&fx);
+    stall_destroy(&ctl);
+}
+
+/* The pin is SHARED, not exclusive: two clone-walks from ONE source
+ * fid to the SAME newfid park mid-(b) SIMULTANEOUSLY (source busy == 2
+ * — the overlap proof), then their (c) phases serialize on the bind:
+ * exactly one Rwalk binds the newfid, the loser gets EBADF. */
+STM_TEST(p9_pool_pin_walk_walk_same_newfid) {
+    pool_fix fx;
+    STM_ASSERT_TRUE(fix_up(&fx, "pool_pin_ww", /*workers=*/4));
+    STM_ASSERT_EQ(fix_handshake(&fx, /*fid=*/0), 0);
+
+    stall_ctl ctl;
+    uint16_t park[] = { 300, 301 };
+    stall_init(&ctl, park, 2);
+    bstall_install(&ctl);
+
+    uint8_t  buf[512];
+    uint32_t rlen = 0;
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_twalk_clone(buf, 300, 0, 7)), 0);
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_twalk_clone(buf, 301, 0, 7)), 0);
+    /* BOTH walks are parked inside (b) at once — two ops overlapping
+     * on one pinned source fid. */
+    stall_await_entered(&ctl, 2);
+    stall_release(&ctl);
+
+    int n_walk = 0, n_ebadf = 0;
+    for (int i = 0; i < 2; i++) {
+        STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+        uint16_t tag = load_u16(buf + 5);
+        STM_ASSERT_TRUE(tag == 300 || tag == 301);
+        if (buf[4] == STM_9P_RWALK) {
+            n_walk++;
+        } else {
+            STM_ASSERT_EQ(buf[4], STM_9P_RLERROR);
+            STM_ASSERT_EQ(load_u32(buf + 7), STM_9P_ECODE_EBADF);
+            n_ebadf++;
+        }
+    }
+    STM_ASSERT_EQ(n_walk, 1);
+    STM_ASSERT_EQ(n_ebadf, 1);
+
+    /* The winner's newfid is live. */
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tgetattr(buf, 302, 7)), 0);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
+
+    fix_down(&fx);
+    stall_destroy(&ctl);
+}
+
+/* Non-exclusivity the other way: while a Twrite is parked mid-(b) on
+ * an open file fid, a Tgetattr on the SAME fid completes — same-fid
+ * ops overlap under the shared pin instead of serializing. */
+STM_TEST(p9_pool_pin_getattr_overlaps_parked_write) {
+    pool_fix fx;
+    STM_ASSERT_TRUE(fix_up(&fx, "pool_pin_ov", /*workers=*/4));
+    STM_ASSERT_EQ(fix_handshake(&fx, /*fid=*/0), 0);
+    STM_ASSERT_EQ(fix_open_file(&fx, 1, "ovf", NULL, 0), 0);
+
+    stall_ctl ctl;
+    uint16_t park[] = { 400 };
+    stall_init(&ctl, park, 1);
+    bstall_install(&ctl);
+
+    uint8_t  buf[512];
+    uint32_t rlen = 0;
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_twrite(buf, 400, 1, 0, "x", 1)), 0);
+    stall_await_entered(&ctl, 1);       /* write parked, fid 1 pinned */
+
+    /* The getattr must complete WHILE the write is parked. */
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tgetattr(buf, 401, 1)), 0);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
+    STM_ASSERT_EQ(load_u16(buf + 5), 401);
+
+    stall_release(&ctl);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RWRITE);
+    STM_ASSERT_EQ(load_u16(buf + 5), 400);
+
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf, build_tclunk(buf, 402, 1)), 0);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RCLUNK);
+
+    fix_down(&fx);
+    stall_destroy(&ctl);
+}
+
+/* Tversion's quiesce barrier vs a PINNED op: the pool must drain the
+ * pinned op before running h_version inline — h_version releases every
+ * fid, and fid_release_locked abort-tripwires on busy > 0, so a
+ * barrier hole is a crash, not a silent corruption. */
+STM_TEST(p9_pool_pin_version_barrier_waits) {
+    pool_fix fx;
+    STM_ASSERT_TRUE(fix_up(&fx, "pool_pin_ver", /*workers=*/4));
+    STM_ASSERT_EQ(fix_handshake(&fx, /*fid=*/0), 0);
+
+    stall_ctl ctl;
+    uint16_t park[] = { 500 };
+    stall_init(&ctl, park, 1);
+    bstall_install(&ctl);
+
+    uint8_t  buf[512];
+    uint32_t rlen = 0;
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tgetattr(buf, 500, 0)), 0);
+    stall_await_entered(&ctl, 1);       /* getattr parked, fid 0 pinned */
+
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tversion(buf, STM_9P_MSIZE_DEFAULT)), 0);
+    /* The barrier must hold Rversion back while the pin is live. */
+    STM_ASSERT_TRUE(fd_quiet_for(fx.client_fd, 150));
+
+    stall_release(&ctl);
+    /* Drained reply first (its worker writes before the reader runs
+     * h_version), then Rversion. */
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
+    STM_ASSERT_EQ(load_u16(buf + 5), 500);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RVERSION);
+
+    /* Tversion abandoned every fid. */
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tgetattr(buf, 501, 0)), 0);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(buf + 7), STM_9P_ECODE_EBADF);
+
+    fix_down(&fx);
+    stall_destroy(&ctl);
+}
+
+STM_TEST_MAIN("9p pool (CF-2a/2b)")

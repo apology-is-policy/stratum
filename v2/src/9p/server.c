@@ -38,6 +38,7 @@
 #include <stratum/locks.h>      /* STM_LOCK_SHARED / EXCLUSIVE */
 #include <stratum/types.h>
 
+#include "server_internal.h"
 #include "wire.h"
 
 #include <errno.h>
@@ -129,6 +130,17 @@ typedef enum {
 typedef struct p9_fid {
     p9_fid_kind kind;
     uint32_t    fid;            /* fid number from the client */
+
+    /* CF-2b shared pin count. A 3-phase handler pins its fid(s) under
+     * s->lock before dropping the lock for its FS-core (b) phase, and
+     * unpins under s->lock in (c). While busy > 0 the slot can neither
+     * be released nor repurposed-to-FREE (h_clunk waits on s->fid_cv;
+     * h_version / server_destroy run with the connection quiesced and
+     * fid_release_locked abort-tripwires on a pinned fid). Bounded by
+     * the pool's in-flight cap (64 slots x <= 2 pins per op), so
+     * uint16_t cannot overflow. */
+    uint16_t    busy;
+
     uint64_t    dataset_id;
     uint64_t    ino;
     uint32_t    cached_gen;     /* fid.tla cached_gen — si_gen at bind time */
@@ -209,6 +221,11 @@ typedef struct p9_binding {
 struct stm_9p_server {
     pthread_mutex_t lock;
 
+    /* CF-2b: broadcast whenever a fid's busy count reaches 0. Shared
+     * across all fids (waiters re-check their own fid's busy under
+     * s->lock — the while-loop discipline absorbs cross-fid wakes). */
+    pthread_cond_t  fid_cv;
+
     stm_fs       *fs;             /* non-owning */
     uint64_t      root_dataset;
     uid_t         auth_uid;
@@ -250,6 +267,32 @@ static inline void must_lock(pthread_mutex_t *m) {
 }
 static inline void must_unlock(pthread_mutex_t *m) {
     if (pthread_mutex_unlock(m) != 0) abort();
+}
+static inline void must_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
+    if (pthread_cond_wait(c, m) != 0) abort();
+}
+static inline void must_broadcast(pthread_cond_t *c) {
+    if (pthread_cond_broadcast(c) != 0) abort();
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* CF-2b test hooks (server_internal.h).                                  */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Process-global, set only by tests (before traffic) — a test parks a
+ * chosen (type, tag) INSIDE a 3-phase handler's unlocked (b) phase,
+ * with the fid pin(s) held, to schedule pin/clunk/overlap races
+ * deterministically. NULL in production. */
+static struct stm_9p_server_test_hooks {
+    void (*phase_b)(uint8_t type, uint16_t tag, void *arg);
+    void  *arg;
+} g_9p_test_hooks;
+
+void stm_9p_server_set_test_hooks(
+    void (*phase_b)(uint8_t type, uint16_t tag, void *arg), void *arg)
+{
+    g_9p_test_hooks.phase_b = phase_b;
+    g_9p_test_hooks.arg     = arg;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -385,6 +428,12 @@ static inline uint64_t fid_owner_id(stm_9p_server *s, uint32_t fid)
 static void fid_release_locked(stm_9p_server *s, p9_fid *f)
 {
     if (!f || f->kind == P9_FID_FREE) return;
+    /* CF-2b tripwire: releasing a pinned fid is a missed wait, never a
+     * legal state — h_clunk waits busy == 0 on s->fid_cv; h_version and
+     * server_destroy run only with the connection quiesced (the pool's
+     * Tversion barrier / worker join; serial mode is single-threaded).
+     * Errorcheck-mutex house style: abort loudly. */
+    if (f->busy) abort();
     /* Always drop locks, regardless of fid kind (R92 P2-1). */
     (void)stm_fs_release_lock_owner(s->fs, fid_owner_id(s, f->fid));
     free(f->ns_path);
@@ -394,6 +443,51 @@ static void fid_release_locked(stm_9p_server *s, p9_fid *f)
     }
     memset(f, 0, sizeof *f);
     f->kind = P9_FID_FREE;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* CF-2b — the 3-phase handler discipline (docs/cf-2-design.md §4).       */
+/*                                                                         */
+/* A hot-set handler splits into:                                          */
+/*   (a) under s->lock: parse -> fid_get -> gates -> SNAPSHOT the fid      */
+/*       fields it needs (scalars; ns_path copied to a stack buffer) ->    */
+/*       fid_pin_locked -> phase_b_enter (drops the lock);                 */
+/*   (b) unlocked: verify_fresh_snapshot + the FS-core call(s) + the       */
+/*       reply build into the caller-private resp buffer. A (b) phase      */
+/*       MUST NOT dereference fid-owned heap pointers (ns_path,            */
+/*       xattr_*) — those are read/written only under s->lock;             */
+/*   (c) under s->lock: apply fid-state mutations (identity-guarded        */
+/*       where the mutation derives from the (a) snapshot) ->              */
+/*       fid_unpin_locked -> return (the dispatcher unlocks).              */
+/*                                                                         */
+/* The pin keeps the SLOT alive (never released / repurposed-to-FREE       */
+/* while busy > 0), not the fid's semantic state: a concurrent same-fid    */
+/* op (a client protocol violation — the kernel client forbids it) may     */
+/* mutate identity in its own (c); the pinned op then completes against    */
+/* its (a) snapshot, which is a legal serialization. Lock order:           */
+/* s->lock is OUTER to every stm_fs_* internal lock; a (c) phase           */
+/* re-acquires s->lock only after all core calls completed.                */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static inline void fid_pin_locked(p9_fid *f)
+{
+    f->busy++;
+}
+
+static inline void fid_unpin_locked(stm_9p_server *s, p9_fid *f)
+{
+    if (f->busy == 0) abort();      /* unbalanced unpin */
+    f->busy--;
+    if (f->busy == 0) must_broadcast(&s->fid_cv);
+}
+
+/* The (a) -> (b) transition: drop s->lock, then give a test its chance
+ * to park this op mid-(b) with the pin held. */
+static void phase_b_enter(stm_9p_server *s, uint8_t type, uint16_t tag)
+{
+    must_unlock(&s->lock);
+    if (g_9p_test_hooks.phase_b)
+        g_9p_test_hooks.phase_b(type, tag, g_9p_test_hooks.arg);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -888,22 +982,36 @@ static stm_status reply_rlerror_status(uint8_t *resp, uint32_t resp_cap,
 /* Stale-fid detection (fid.tla IOReject gate).                          */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* Verifies the fid's cached_gen against the current si_gen via
- * stm_fs_stat. If mismatched OR the inode is gone, returns ESTALE.
- * Maps to fid.tla's IOReject precondition (cached_gen != current OR
- * !alive). On STM_OK the loaded inode-value record is copied into
- * *out (caller may need fields for Tgetattr / type checks / etc.).
- */
+/* Verifies a fid-identity SNAPSHOT's cached_gen against the current
+ * si_gen via stm_fs_stat. If mismatched OR the inode is gone, returns
+ * ESTALE. Maps to fid.tla's IOReject precondition (cached_gen !=
+ * current OR !alive). On STM_OK the loaded inode-value record is
+ * copied into *out (caller may need fields for Tgetattr / type
+ * checks / etc.).
+ *
+ * CF-2b: takes the (ds, ino, gen) triple by VALUE so a 3-phase
+ * handler's unlocked (b) phase can verify against its (a) snapshot
+ * without touching the p9_fid. verify_fid_fresh wraps it for the
+ * full-lock handlers. */
+static stm_status verify_fresh_snapshot(stm_fs *fs,
+                                           uint64_t ds, uint64_t ino,
+                                           uint32_t cached_gen,
+                                           struct stm_inode_value *out)
+{
+    struct stm_inode_value iv;
+    stm_status rc = stm_fs_stat(fs, ds, ino, &iv);
+    if (rc != STM_OK) return rc;
+    uint64_t cur_gen = stm_load_le64(iv.si_gen);
+    if ((uint32_t)cur_gen != cached_gen) return STM_ESTALE;
+    if (out) *out = iv;
+    return STM_OK;
+}
+
 static stm_status verify_fid_fresh(stm_9p_server *s, p9_fid *f,
                                        struct stm_inode_value *out)
 {
-    struct stm_inode_value iv;
-    stm_status rc = stm_fs_stat(s->fs, f->dataset_id, f->ino, &iv);
-    if (rc != STM_OK) return rc;
-    uint64_t cur_gen = stm_load_le64(iv.si_gen);
-    if ((uint32_t)cur_gen != f->cached_gen) return STM_ESTALE;
-    if (out) *out = iv;
-    return STM_OK;
+    return verify_fresh_snapshot(s->fs, f->dataset_id, f->ino,
+                                    f->cached_gen, out);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -1156,6 +1264,22 @@ static stm_status h_clunk(stm_9p_server *s,
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
 
+    /* CF-2b: a 3-phase op holds a shared pin (busy > 0) on this fid
+     * while its unlocked (b) phase runs — Tclunk must not release the
+     * slot under it. cond_wait releases s->lock so the pinned op's (c)
+     * can complete; every handler is finite-duration (stm_fs_lock is
+     * non-blocking), so the wait is bounded. Re-lookup after every
+     * wake: while we waited, a concurrent (protocol-violating) clunk
+     * of the same fid may have released the slot — or released it AND
+     * a walk/attach repurposed it under a different fid number. */
+    while (f->busy) {
+        must_cond_wait(&s->fid_cv, &s->lock);
+        f = fid_get(s, fid);
+        if (!f)
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                  STM_9P_ECODE_EBADF);
+    }
+
     /* AUX_XATTR_WRITE clunk-time commit: if the fid was opened via
      * Txattrcreate AND the announced attr_size has been fully filled
      * via Twrite, commit via stm_fs_setxattr atomically. Mismatched
@@ -1222,7 +1346,248 @@ static stm_status h_flush(stm_9p_server *s,
 /* components resolve, newfid is NOT bound; we reply Rlerror(ENOENT).      */
 /* nwname=0 with newfid=fid: clones fid identity into newfid (rewound      */
 /* walk). Identity-change drops cached state on the rebound fid.           */
+/*                                                                         */
+/* CF-2b split: the component loop + the bind tail are factored out of     */
+/* the handler so the 0-bindings FAST PATH can run the loop unlocked       */
+/* (3-phase, source fid pinned) while the bindings > 0 FALLBACK keeps      */
+/* the original fully-locked body (ns_bindings_lookup reads the mutable    */
+/* s->bindings array — unreachable from an unlocked (b); a binding         */
+/* installed concurrently with a fast-path walk serializes after it).      */
 /* ────────────────────────────────────────────────────────────────────── */
+
+/* The walk's cumulative cursor — the source fid's identity snapshot,
+ * advanced per resolved component. */
+struct walk_cursor {
+    uint64_t ds;
+    uint64_t ino;
+    uint32_t gen;
+    uint8_t  qt;
+    char     path[STM_9P_NS_PATH_MAX + 1u];
+    size_t   path_len;
+};
+
+/* Resolve up to nwname components, advancing *cur and emitting one qid
+ * per resolved component into qids (caller-sized for STM_9P_MAX_WALK).
+ * Component failures stop the loop (partial walk — *out_nwqid < nwname);
+ * a malformed wire string returns STM_EPROTOCOL. consult_bindings
+ * requires s->lock held; the fast path passes false and runs unlocked
+ * (it reads only s->fs, which is immutable). */
+static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
+                                     uint64_t conn_root_ds,
+                                     uint64_t conn_root_ino,
+                                     const uint8_t *bp, const uint8_t *end,
+                                     uint16_t nwname,
+                                     struct walk_cursor *cur,
+                                     uint8_t *qids, uint16_t *out_nwqid)
+{
+    uint16_t nwqid = 0;
+
+    for (uint16_t i = 0; i < nwname; i++) {
+        uint16_t slen;
+        const char *name = p9l_gstr(&bp, end, &slen);
+        if (!name) {
+            *out_nwqid = nwqid;
+            return STM_EPROTOCOL;
+        }
+        /* stm_fs_lookup name_len is uint8_t (NAME_MAX = 255). */
+        if (slen == 0 || slen > STM_9P_NAME_MAX) break;
+
+        /* Compose the new ns_path. */
+        char   new_path[STM_9P_NS_PATH_MAX + 1u];
+        size_t new_path_len = 0;
+        stm_status rc = ns_join(cur->path, cur->path_len, name, slen,
+                                  new_path, sizeof new_path, &new_path_len);
+        if (rc != STM_OK) break;
+
+        uint64_t next_ds  = cur->ds;
+        uint64_t next_ino = 0;
+
+        /* "." (no-op on cumulative state) and ".." (pops a component
+         * via canonicalization) are wire-legal Twalk components per
+         * the .L spec, but the underlying fs_validate_dirent_name
+         * rejects them. Detect via length-prefix to avoid pattern
+         * mistakes (a name "..foo" is NOT ".."). R93 P3-1 fix. */
+        bool is_dot    = (slen == 1u && name[0] == '.');
+        bool is_dotdot = (slen == 2u && name[0] == '.' && name[1] == '.');
+
+        /* namespace.tla::Lookup — exact-match on the cumulative path.
+         * A binding routes (cur_ds, cur_ino) to the binding's source. */
+        p9_binding *b = consult_bindings
+                        ? ns_bindings_lookup(s, new_path, new_path_len)
+                        : NULL;
+        if (b) {
+            next_ds  = b->source_dataset;
+            next_ino = b->source_ino;
+        } else if (is_dot ||
+                    (is_dotdot && new_path_len == cur->path_len &&
+                     memcmp(new_path, cur->path, cur->path_len) == 0)) {
+            /* "." anywhere or ".." that canonicalizes to the same
+             * path (i.e., already at the namespace root) — no state
+             * change. cur_ino is preserved; we re-stat below for
+             * fresh gen. Composes against fid.tla::Walk: the audit
+             * record at this step binds at current_gen[cur_ino]. */
+            next_ds  = cur->ds;
+            next_ino = cur->ino;
+        } else if (is_dotdot) {
+            /* ".." that popped a component AND no binding fired —
+             * re-resolve new_path from the connection's namespace
+             * root. ns_walk_abs_path_from canonicalizes again
+             * (idempotent on already-canonical input) and walks
+             * each remaining component via stm_fs_lookup. Bindings
+             * are NOT consulted along the way — the spec's
+             * lookup-then-fallthrough order has already had its
+             * chance for new_path itself; intermediate paths during
+             * the re-resolution were already considered as binding
+             * candidates during the original forward walk that
+             * brought us to cur_path. */
+            rc = ns_walk_abs_path_from(s, conn_root_ds,
+                                          conn_root_ino,
+                                          new_path, new_path_len,
+                                          &next_ino, NULL, NULL);
+            if (rc != STM_OK) break;
+            next_ds = conn_root_ds;
+        } else {
+            rc = stm_fs_lookup(s->fs, cur->ds, cur->ino,
+                                 (const uint8_t *)name, (uint8_t)slen,
+                                 &next_ino);
+            if (rc != STM_OK) break;
+        }
+
+        /* Stat the resolved ino — captures si_gen (cached_gen snapshot
+         * per fid.tla::Walk's bind-time gen) AND si_mode (qid_type).
+         * Fires on bindings too so the qid encoding reflects the
+         * underlying source's current state. */
+        struct stm_inode_value next_iv;
+        rc = stm_fs_stat(s->fs, next_ds, next_ino, &next_iv);
+        if (rc != STM_OK) break;
+
+        cur->ds  = next_ds;
+        cur->ino = next_ino;
+        cur->gen = (uint32_t)stm_load_le64(next_iv.si_gen);
+        cur->qt  = qid_type_from_mode(stm_load_le32(next_iv.si_mode));
+        memcpy(cur->path, new_path, new_path_len);
+        cur->path[new_path_len] = '\0';
+        cur->path_len = new_path_len;
+
+        p9l_pqid(qids + nwqid * STM_9P_QID_SIZE,
+                  cur->qt, cur->gen, qid_path(cur->ds, cur->ino));
+        nwqid++;
+    }
+
+    *out_nwqid = nwqid;
+    return STM_OK;
+}
+
+/* The walk's bind tail — caller holds s->lock. Handles the partial /
+ * ENOENT replies (no bind), then binds newfid (allocating it, or
+ * rebinding the source when newfid == fid) and builds the Rwalk. */
+static stm_status walk_finish_locked(stm_9p_server *s, p9_fid *f,
+                                        uint32_t fid_num, uint32_t newfid,
+                                        uint16_t nwname,
+                                        const uint8_t *qids, uint16_t nwqid,
+                                        const struct walk_cursor *cur,
+                                        uint64_t conn_root_ds,
+                                        uint64_t conn_root_ino,
+                                        uint16_t tag,
+                                        uint8_t *resp, uint32_t resp_cap,
+                                        uint32_t *resp_len)
+{
+    if (nwname > 0 && nwqid == 0)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ENOENT);
+    if (nwname > 0 && nwqid < nwname) {
+        /* Partial walk: reply with fewer qids; newfid NOT bound. */
+        uint32_t need = STM_9P_HDR_SIZE + 2u + (uint32_t)nwqid * STM_9P_QID_SIZE;
+        if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+        uint8_t *wp = resp + 4;
+        *wp++ = STM_9P_RWALK;
+        p9l_p16(wp, tag); wp += 2;
+        p9l_p16(wp, nwqid); wp += 2;
+        if (nwqid) {
+            memcpy(wp, qids, (size_t)nwqid * STM_9P_QID_SIZE);
+            wp += nwqid * STM_9P_QID_SIZE;
+        }
+        resp_finish(resp, resp_len, wp);
+        return STM_OK;
+    }
+
+    /* CF-2b: on the fast path the source fid was only PINNED during
+     * the unlocked component loop — a concurrent (protocol-violating)
+     * same-fid Txattrcreate may have repurposed it to AUX_XATTR.
+     * Rebinding it to NODE here would orphan its xattr_buf/xattr_name
+     * (the R93 P2-2 leak); serialize as walk-after-repurpose instead.
+     * Unreachable from the full-lock fallback (its gates ran under
+     * the same lock hold). */
+    if (newfid == fid_num && f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
+
+    /* Pre-allocate the new ns_path BEFORE any structural mutation of
+     * the bound fid. Otherwise an ENOMEM here would leave a rewound-
+     * self fid (newfid == fid) with stale ns_path but new (ds, ino) —
+     * a glitched state where subsequent walks compose paths from an
+     * outdated cursor. Allocating first means the only remaining
+     * failure mode is fid_alloc (newfid != fid) which we handle
+     * before any state mutation. */
+    char *new_ns = malloc(cur->path_len + 1u);
+    if (!new_ns)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_ENOMEM);
+    memcpy(new_ns, cur->path, cur->path_len);
+    new_ns[cur->path_len] = '\0';
+
+    /* Full walk (nwname == nwqid OR nwname == 0). Bind newfid. */
+    p9_fid *nf;
+    if (newfid == fid_num) {
+        nf = f;
+    } else {
+        nf = fid_alloc(s, newfid);
+        if (!nf) {
+            free(new_ns);
+            return reply_rlerror(resp, resp_cap, resp_len, tag, EBADF);
+        }
+    }
+
+    /* Identity change drops open/aux state on the rebound fid (fid.tla
+     * Walk action's audit_walk record is a fresh observation, not a
+     * carry-over). nwname == 0 with newfid == fid is the rewound-walk
+     * semantic — same identity, same state retained. */
+    if (nwname > 0 && (nf->ino != cur->ino || nf->dataset_id != cur->ds)) {
+        nf->is_open    = false;
+        nf->open_flags = 0;
+        nf->open_iounit = 0;
+    }
+
+    nf->dataset_id = cur->ds;
+    nf->ino        = cur->ino;
+    nf->cached_gen = cur->gen;      /* fid.tla cached_gen snapshot */
+    nf->qid_type   = cur->qt;
+    nf->kind       = P9_FID_NODE;
+
+    /* Inherit the connection-namespace root from the source fid. All
+     * fids on the same connection share the same conn_root, so a
+     * cloned/walked fid sees the same "/" interpretation as its
+     * progenitor. R93 P3-1 fix. */
+    nf->conn_root_dataset = conn_root_ds;
+    nf->conn_root_ino     = conn_root_ino;
+
+    /* Publish ns_path onto the bound fid (P9-9P-2). new_ns was already
+     * allocated above; this is now infallible. */
+    free(nf->ns_path);
+    nf->ns_path     = new_ns;
+    nf->ns_path_len = cur->path_len;
+
+    uint32_t need = STM_9P_HDR_SIZE + 2u + (uint32_t)nwqid * STM_9P_QID_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RWALK;
+    p9l_p16(wp, tag); wp += 2;
+    p9l_p16(wp, nwqid); wp += 2;
+    if (nwqid) {
+        memcpy(wp, qids, (size_t)nwqid * STM_9P_QID_SIZE);
+        wp += nwqid * STM_9P_QID_SIZE;
+    }
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
 
 static stm_status h_walk(stm_9p_server *s,
                            const uint8_t *body, uint32_t body_len,
@@ -1259,217 +1624,83 @@ static stm_status h_walk(stm_9p_server *s,
     if (f->is_open)
         return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
 
-    /* Verify the source fid is fresh (cached_gen matches) before
-     * walking from it — fid.tla::IOReject gate. */
-    stm_status vrc = verify_fid_fresh(s, f, NULL);
-    if (vrc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
-
-    /* Walk over the components, accumulating qids. Partial resolution
-     * is the 9P2000.L convention: if k < nwname components resolved,
-     * Rwalk returns k qids (k > 0) AND newfid is NOT bound. k = 0 with
-     * nwname > 0 returns Rlerror(ENOENT).
-     *
-     * P9-9P-2: at each component, the cumulative ns_path is consulted
-     * against the per-connection bindings table BEFORE falling through
-     * to stm_fs_lookup. A binding hit reroutes the underlying
-     * (cur_ds, cur_ino) to the binding's source while keeping the
-     * client-visible ns_path. ns_path is published onto newfid only
-     * after the full walk succeeds (or onto fid itself if newfid == fid). */
-    uint8_t  qids[STM_9P_MAX_WALK * STM_9P_QID_SIZE];
-    uint16_t nwqid = 0;
-    uint64_t cur_ds  = f->dataset_id;
-    uint64_t cur_ino = f->ino;
-    uint32_t cur_gen = f->cached_gen;
-    uint8_t  cur_qt  = f->qid_type;
-
-    /* Stack-allocated ns_path scratch — sized for the longest canonical
-     * path the namespace allows (STM_9P_NS_PATH_MAX) plus NUL. */
-    char   cur_path[STM_9P_NS_PATH_MAX + 1u];
-    size_t cur_path_len = 0;
-    /* The source fid's ns_path is the starting cursor. f->ns_path must
+    /* (a) snapshot the source fid into the walk cursor. The source's
+     * ns_path is a fid-owned heap pointer — copied to the stack HERE;
+     * the fast path's unlocked loop must not touch it. f->ns_path must
      * be non-NULL for any NODE fid since Tattach sets it; defensive
      * null-check returns EINVAL if a future code path neglected it. */
     if (!f->ns_path || f->ns_path_len == 0 ||
         f->ns_path_len > STM_9P_NS_PATH_MAX)
         return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
-    memcpy(cur_path, f->ns_path, f->ns_path_len);
-    cur_path[f->ns_path_len] = '\0';
-    cur_path_len = f->ns_path_len;
 
-    for (uint16_t i = 0; i < nwname; i++) {
-        uint16_t slen;
-        const char *name = p9l_gstr(&bp, end, &slen);
-        if (!name)
+    struct walk_cursor cur;
+    cur.ds  = f->dataset_id;
+    cur.ino = f->ino;
+    cur.gen = f->cached_gen;
+    cur.qt  = f->qid_type;
+    memcpy(cur.path, f->ns_path, f->ns_path_len);
+    cur.path[f->ns_path_len] = '\0';
+    cur.path_len = f->ns_path_len;
+    uint64_t conn_root_ds  = f->conn_root_dataset;
+    uint64_t conn_root_ino = f->conn_root_ino;
+
+    uint8_t  qids[STM_9P_MAX_WALK * STM_9P_QID_SIZE];
+    uint16_t nwqid = 0;
+
+    /* Bindings > 0: the FULL-LOCK FALLBACK — the component loop
+     * consults the mutable s->bindings array per component, so it
+     * cannot run unlocked. The Thylacine deployment never binds. */
+    if (s->num_bindings > 0) {
+        stm_status vrc = verify_fid_fresh(s, f, NULL);
+        if (vrc != STM_OK)
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+        stm_status wrc = walk_components(s, /*consult_bindings=*/true,
+                                            conn_root_ds, conn_root_ino,
+                                            bp, end, nwname,
+                                            &cur, qids, &nwqid);
+        if (wrc != STM_OK)
             return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
-        /* stm_fs_lookup name_len is uint8_t (NAME_MAX = 255). */
-        if (slen == 0 || slen > STM_9P_NAME_MAX) break;
-
-        /* Compose the new ns_path. */
-        char   new_path[STM_9P_NS_PATH_MAX + 1u];
-        size_t new_path_len = 0;
-        stm_status rc = ns_join(cur_path, cur_path_len, name, slen,
-                                  new_path, sizeof new_path, &new_path_len);
-        if (rc != STM_OK) break;
-
-        uint64_t next_ds  = cur_ds;
-        uint64_t next_ino = 0;
-
-        /* "." (no-op on cumulative state) and ".." (pops a component
-         * via canonicalization) are wire-legal Twalk components per
-         * the .L spec, but the underlying fs_validate_dirent_name
-         * rejects them. Detect via length-prefix to avoid pattern
-         * mistakes (a name "..foo" is NOT ".."). R93 P3-1 fix. */
-        bool is_dot    = (slen == 1u && name[0] == '.');
-        bool is_dotdot = (slen == 2u && name[0] == '.' && name[1] == '.');
-
-        /* namespace.tla::Lookup — exact-match on the cumulative path.
-         * A binding routes (cur_ds, cur_ino) to the binding's source. */
-        p9_binding *b = ns_bindings_lookup(s, new_path, new_path_len);
-        if (b) {
-            next_ds  = b->source_dataset;
-            next_ino = b->source_ino;
-        } else if (is_dot ||
-                    (is_dotdot && new_path_len == cur_path_len &&
-                     memcmp(new_path, cur_path, cur_path_len) == 0)) {
-            /* "." anywhere or ".." that canonicalizes to the same
-             * path (i.e., already at the namespace root) — no state
-             * change. cur_ino is preserved; we re-stat below for
-             * fresh gen. Composes against fid.tla::Walk: the audit
-             * record at this step binds at current_gen[cur_ino]. */
-            next_ds  = cur_ds;
-            next_ino = cur_ino;
-        } else if (is_dotdot) {
-            /* ".." that popped a component AND no binding fired —
-             * re-resolve new_path from the connection's namespace
-             * root. ns_walk_abs_path_from canonicalizes again
-             * (idempotent on already-canonical input) and walks
-             * each remaining component via stm_fs_lookup. Bindings
-             * are NOT consulted along the way — the spec's
-             * lookup-then-fallthrough order has already had its
-             * chance for new_path itself; intermediate paths during
-             * the re-resolution were already considered as binding
-             * candidates during the original forward walk that
-             * brought us to cur_path. */
-            rc = ns_walk_abs_path_from(s, f->conn_root_dataset,
-                                          f->conn_root_ino,
-                                          new_path, new_path_len,
-                                          &next_ino, NULL, NULL);
-            if (rc != STM_OK) break;
-            next_ds = f->conn_root_dataset;
-        } else {
-            rc = stm_fs_lookup(s->fs, cur_ds, cur_ino,
-                                 (const uint8_t *)name, (uint8_t)slen,
-                                 &next_ino);
-            if (rc != STM_OK) break;
-        }
-
-        /* Stat the resolved ino — captures si_gen (cached_gen snapshot
-         * per fid.tla::Walk's bind-time gen) AND si_mode (qid_type).
-         * Fires on bindings too so the qid encoding reflects the
-         * underlying source's current state. */
-        struct stm_inode_value next_iv;
-        rc = stm_fs_stat(s->fs, next_ds, next_ino, &next_iv);
-        if (rc != STM_OK) break;
-
-        cur_ds  = next_ds;
-        cur_ino = next_ino;
-        cur_gen = (uint32_t)stm_load_le64(next_iv.si_gen);
-        cur_qt  = qid_type_from_mode(stm_load_le32(next_iv.si_mode));
-        memcpy(cur_path, new_path, new_path_len);
-        cur_path[new_path_len] = '\0';
-        cur_path_len = new_path_len;
-
-        p9l_pqid(qids + nwqid * STM_9P_QID_SIZE,
-                  cur_qt, cur_gen, qid_path(cur_ds, cur_ino));
-        nwqid++;
+        return walk_finish_locked(s, f, fid, newfid, nwname,
+                                     qids, nwqid, &cur,
+                                     conn_root_ds, conn_root_ino,
+                                     tag, resp, resp_cap, resp_len);
     }
 
-    if (nwname > 0 && nwqid == 0)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, ENOENT);
-    if (nwname > 0 && nwqid < nwname) {
-        /* Partial walk: reply with fewer qids; newfid NOT bound. */
-        uint32_t need = STM_9P_HDR_SIZE + 2u + (uint32_t)nwqid * STM_9P_QID_SIZE;
-        if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
-        uint8_t *wp = resp + 4;
-        *wp++ = STM_9P_RWALK;
-        p9l_p16(wp, tag); wp += 2;
-        p9l_p16(wp, nwqid); wp += 2;
-        if (nwqid) {
-            memcpy(wp, qids, (size_t)nwqid * STM_9P_QID_SIZE);
-            wp += nwqid * STM_9P_QID_SIZE;
-        }
-        resp_finish(resp, resp_len, wp);
-        return STM_OK;
-    }
+    /* 0 bindings: the 3-PHASE FAST PATH. Pin the source; run the
+     * verify + component loop unlocked; bind under the re-acquired
+     * lock. A binding installed concurrently by Tbind (full-lock)
+     * serializes after this walk — skipping the consult is exactly
+     * the walk-before-bind order. */
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TWALK, tag);
 
-    /* Pre-allocate the new ns_path BEFORE any structural mutation of
-     * the bound fid. Otherwise an ENOMEM here would leave a rewound-
-     * self fid (newfid == fid) with stale ns_path but new (ds, ino) —
-     * a glitched state where subsequent walks compose paths from an
-     * outdated cursor. Allocating first means the only remaining
-     * failure mode is fid_alloc (newfid != fid) which we handle
-     * before any state mutation. */
-    char *new_ns = malloc(cur_path_len + 1u);
-    if (!new_ns)
-        return reply_rlerror(resp, resp_cap, resp_len, tag,
-                              STM_9P_ECODE_ENOMEM);
-    memcpy(new_ns, cur_path, cur_path_len);
-    new_ns[cur_path_len] = '\0';
-
-    /* Full walk (nwname == nwqid OR nwname == 0). Bind newfid. */
-    p9_fid *nf;
-    if (newfid == fid) {
-        nf = f;
+    /* (b) unlocked: fid.tla::IOReject gate + the component loop. */
+    uint32_t ecode = 0;
+    stm_status vrc = verify_fresh_snapshot(s->fs, cur.ds, cur.ino,
+                                              cur.gen, NULL);
+    if (vrc != STM_OK) {
+        ecode = status_to_errno(vrc);
     } else {
-        nf = fid_alloc(s, newfid);
-        if (!nf) {
-            free(new_ns);
-            return reply_rlerror(resp, resp_cap, resp_len, tag, EBADF);
-        }
+        stm_status wrc = walk_components(s, /*consult_bindings=*/false,
+                                            conn_root_ds, conn_root_ino,
+                                            bp, end, nwname,
+                                            &cur, qids, &nwqid);
+        if (wrc != STM_OK)
+            ecode = EPROTO;
     }
 
-    /* Identity change drops open/aux state on the rebound fid (fid.tla
-     * Walk action's audit_walk record is a fresh observation, not a
-     * carry-over). nwname == 0 with newfid == fid is the rewound-walk
-     * semantic — same identity, same state retained. */
-    if (nwname > 0 && (nf->ino != cur_ino || nf->dataset_id != cur_ds)) {
-        nf->is_open    = false;
-        nf->open_flags = 0;
-        nf->open_iounit = 0;
-    }
-
-    nf->dataset_id = cur_ds;
-    nf->ino        = cur_ino;
-    nf->cached_gen = cur_gen;       /* fid.tla cached_gen snapshot */
-    nf->qid_type   = cur_qt;
-    nf->kind       = P9_FID_NODE;
-
-    /* Inherit the connection-namespace root from the source fid. All
-     * fids on the same connection share the same conn_root, so a
-     * cloned/walked fid sees the same "/" interpretation as its
-     * progenitor. R93 P3-1 fix. */
-    nf->conn_root_dataset = f->conn_root_dataset;
-    nf->conn_root_ino     = f->conn_root_ino;
-
-    /* Publish ns_path onto the bound fid (P9-9P-2). new_ns was already
-     * allocated above; this is now infallible. */
-    free(nf->ns_path);
-    nf->ns_path     = new_ns;
-    nf->ns_path_len = cur_path_len;
-
-    uint32_t need = STM_9P_HDR_SIZE + 2u + (uint32_t)nwqid * STM_9P_QID_SIZE;
-    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
-    uint8_t *wp = resp + 4;
-    *wp++ = STM_9P_RWALK;
-    p9l_p16(wp, tag); wp += 2;
-    p9l_p16(wp, nwqid); wp += 2;
-    if (nwqid) {
-        memcpy(wp, qids, (size_t)nwqid * STM_9P_QID_SIZE);
-        wp += nwqid * STM_9P_QID_SIZE;
-    }
-    resp_finish(resp, resp_len, wp);
-    return STM_OK;
+    /* (c) under s->lock: bind newfid (or reply the error); unpin. */
+    must_lock(&s->lock);
+    stm_status ret;
+    if (ecode)
+        ret = reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
+    else
+        ret = walk_finish_locked(s, f, fid, newfid, nwname,
+                                    qids, nwqid, &cur,
+                                    conn_root_ds, conn_root_ino,
+                                    tag, resp, resp_cap, resp_len);
+    fid_unpin_locked(s, f);
+    return ret;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -1502,8 +1733,20 @@ static stm_status h_getattr(stm_9p_server *s,
     if (f->kind != P9_FID_NODE)
         return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
 
+    /* (a) snapshot + pin (CF-2b). */
+    uint64_t ds  = f->dataset_id;
+    uint64_t ino = f->ino;
+    uint32_t gen = f->cached_gen;
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TGETATTR, tag);
+
+    /* (b) unlocked. */
     struct stm_inode_value iv;
-    stm_status rc = verify_fid_fresh(s, f, &iv);
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, &iv);
+
+    /* (c) no fid mutation; unpin. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, f);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
 
@@ -1543,8 +1786,7 @@ static stm_status h_getattr(stm_9p_server *s,
     *wp++ = STM_9P_RGETATTR;
     p9l_p16(wp, tag); wp += 2;
     p9l_p64(wp, valid); wp += 8;
-    p9l_pqid(wp, qid_type_from_mode(mode), f->cached_gen,
-              qid_path(f->dataset_id, f->ino));
+    p9l_pqid(wp, qid_type_from_mode(mode), gen, qid_path(ds, ino));
     wp += STM_9P_QID_SIZE;
     p9l_p32(wp, mode);  wp += 4;
     p9l_p32(wp, uid);   wp += 4;
@@ -1562,7 +1804,7 @@ static stm_status h_getattr(stm_9p_server *s,
     p9l_p64(wp, ctime_nsec); wp += 8;
     p9l_p64(wp, btime_sec);  wp += 8;
     p9l_p64(wp, btime_nsec); wp += 8;
-    p9l_p64(wp, (uint64_t)f->cached_gen); wp += 8;
+    p9l_p64(wp, (uint64_t)gen); wp += 8;
     p9l_p64(wp, 0u); wp += 8;               /* data_version unsupported */
     resp_finish(resp, resp_len, wp);
     return STM_OK;
@@ -1607,26 +1849,45 @@ static stm_status h_lopen(stm_9p_server *s,
     if (f->is_open)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
 
-    struct stm_inode_value iv;
-    stm_status rc = verify_fid_fresh(s, f, &iv);
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    /* (a) snapshot + pin (CF-2b). */
+    uint64_t ds     = f->dataset_id;
+    uint64_t ino    = f->ino;
+    uint32_t gen    = f->cached_gen;
+    uint64_t iounit = iounit_for_msize(s->msize);
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TLOPEN, tag);
 
-    uint32_t mode = stm_load_le32(iv.si_mode);
+    /* (b) unlocked: verify + type/flag gates + optional O_TRUNC. */
+    uint32_t ecode     = 0;         /* != 0 -> Rlerror(ecode) */
+    uint32_t reply_gen = gen;       /* refreshed if O_TRUNC bumps si_gen */
+    uint32_t mode      = 0;
+
+    struct stm_inode_value iv;
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, &iv);
+    if (rc != STM_OK) {
+        ecode = status_to_errno(rc);
+        goto phase_c;
+    }
+
+    mode = stm_load_le32(iv.si_mode);
     bool is_dir = ((mode & 0170000u) == 0040000u);
 
     /* O_DIRECTORY on a non-directory: ENOTDIR.
      * Non-O_DIRECTORY open of a dir is allowed (Linux v9fs uses
      * Tlopen on directories before Treaddir). */
-    if ((flags & STM_9P_O_DIRECTORY) && !is_dir)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
+    if ((flags & STM_9P_O_DIRECTORY) && !is_dir) {
+        ecode = STM_9P_ECODE_ENOTDIR;
+        goto phase_c;
+    }
 
     /* Directories: only O_RDONLY makes sense (the Linux kernel uses
      * O_RDONLY | O_DIRECTORY when opening a dir for Treaddir). Other
      * access modes return EISDIR. */
     uint32_t accmode = flags & STM_9P_O_ACCMODE;
-    if (is_dir && accmode != STM_9P_O_RDONLY)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EISDIR);
+    if (is_dir && accmode != STM_9P_O_RDONLY) {
+        ecode = STM_9P_ECODE_EISDIR;
+        goto phase_c;
+    }
 
     /* O_TRUNC on a regular file: truncate to 0. Refused on dirs +
      * symlinks. POSIX-correct error mapping (R128 P1-1 — user-reported
@@ -1638,39 +1899,58 @@ static stm_status h_lopen(stm_9p_server *s,
      * never follow symlinks at the 9P server boundary). RO opens
      * with O_TRUNC are EACCES per Linux. */
     if (flags & STM_9P_O_TRUNC) {
-        if (is_dir)
-            return reply_rlerror(resp, resp_cap, resp_len, tag,
-                                  STM_9P_ECODE_EISDIR);
-        if ((mode & 0170000u) == 0120000u)
-            return reply_rlerror(resp, resp_cap, resp_len, tag,
-                                  STM_9P_ECODE_EINVAL);
-        if (accmode == STM_9P_O_RDONLY)
-            return reply_rlerror(resp, resp_cap, resp_len, tag,
-                                  STM_9P_ECODE_EACCES);
-        rc = stm_fs_truncate(s->fs, f->dataset_id, f->ino, /*new_size=*/0);
-        if (rc != STM_OK)
-            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        if (is_dir) {
+            ecode = STM_9P_ECODE_EISDIR;
+            goto phase_c;
+        }
+        if ((mode & 0170000u) == 0120000u) {
+            ecode = STM_9P_ECODE_EINVAL;
+            goto phase_c;
+        }
+        if (accmode == STM_9P_O_RDONLY) {
+            ecode = STM_9P_ECODE_EACCES;
+            goto phase_c;
+        }
+        rc = stm_fs_truncate(s->fs, ds, ino, /*new_size=*/0);
+        if (rc != STM_OK) {
+            ecode = status_to_errno(rc);
+            goto phase_c;
+        }
         /* Refresh cached_gen — truncate may bump si_gen depending on
          * the impl; defensive re-stat. */
         struct stm_inode_value post;
-        rc = stm_fs_stat(s->fs, f->dataset_id, f->ino, &post);
+        rc = stm_fs_stat(s->fs, ds, ino, &post);
         if (rc == STM_OK)
-            f->cached_gen = (uint32_t)stm_load_le64(post.si_gen);
+            reply_gen = (uint32_t)stm_load_le64(post.si_gen);
     }
 
-    f->is_open     = true;
-    f->open_flags  = flags;
-    f->open_iounit = iounit_for_msize(s->msize);
+phase_c:
+    /* (c) under s->lock: stamp open state, identity-guarded — a
+     * concurrent (protocol-violating) same-fid op may have rebound or
+     * repurposed the fid during (b); stamping then would graft open
+     * state onto the NEW binding. Skipping realizes the "our op
+     * serialized first, the mutator superseded it" order. */
+    must_lock(&s->lock);
+    if (ecode == 0 &&
+        f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino) {
+        if (reply_gen != gen)           /* O_TRUNC re-stat bumped si_gen */
+            f->cached_gen = reply_gen;
+        f->is_open     = true;
+        f->open_flags  = flags;
+        f->open_iounit = iounit;
+    }
+    fid_unpin_locked(s, f);
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
 
     uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE + 4u;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RLOPEN;
     p9l_p16(wp, tag); wp += 2;
-    p9l_pqid(wp, qid_type_from_mode(mode), f->cached_gen,
-              qid_path(f->dataset_id, f->ino));
+    p9l_pqid(wp, qid_type_from_mode(mode), reply_gen, qid_path(ds, ino));
     wp += STM_9P_QID_SIZE;
-    p9l_p32(wp, (uint32_t)f->open_iounit); wp += 4;
+    p9l_p32(wp, (uint32_t)iounit); wp += 4;
     resp_finish(resp, resp_len, wp);
     return STM_OK;
 }
@@ -1740,35 +2020,58 @@ static stm_status h_read(stm_9p_server *s,
     if (accmode == STM_9P_O_WRONLY)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EACCES);
 
-    /* Verify the fid is still fresh before forwarding to stm_fs_read
-     * — the file may have been unlinked + reused since open. fid.tla
-     * IOReject gate. */
-    stm_status vrc = verify_fid_fresh(s, f, NULL);
-    if (vrc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
-
+    /* (a) snapshot + pin (CF-2b). */
+    uint64_t ds  = f->dataset_id;
+    uint64_t ino = f->ino;
+    uint32_t gen = f->cached_gen;
     uint32_t max_payload = iounit_for_msize(s->msize);
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TREAD, tag);
+
+    /* (b) unlocked: verify the fid identity is still fresh before
+     * forwarding to stm_fs_read — the file may have been unlinked +
+     * reused since open. fid.tla IOReject gate. */
+    uint32_t ecode = 0;
+    stm_status fatal = STM_OK;
+    uint8_t *wp = NULL;
+
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
+    if (rc != STM_OK) {
+        ecode = status_to_errno(rc);
+        goto phase_c;
+    }
+
     if (count > max_payload) count = max_payload;
     if (resp_cap < STM_9P_HDR_SIZE + 4u + count) {
         *resp_len = 0;
-        return STM_EINVAL;
+        fatal = STM_EINVAL;
+        goto phase_c;
     }
 
-    uint8_t *wp = resp + 4;
+    wp = resp + 4;
     *wp++ = STM_9P_RREAD;
     p9l_p16(wp, tag); wp += 2;
     uint8_t *count_field = wp;
     wp += 4;
 
     size_t got = 0;
-    stm_status rc = stm_fs_read(s->fs, f->dataset_id, f->ino,
-                                  offset, wp, (size_t)count, &got);
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    rc = stm_fs_read(s->fs, ds, ino, offset, wp, (size_t)count, &got);
+    if (rc != STM_OK) {
+        ecode = status_to_errno(rc);
+        goto phase_c;
+    }
     if (got > UINT32_MAX) got = UINT32_MAX;
     p9l_p32(count_field, (uint32_t)got);
     wp += got;
     resp_finish(resp, resp_len, wp);
+
+phase_c:
+    /* (c) no fid mutation; unpin. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, f);
+    if (fatal != STM_OK) return fatal;
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
     return STM_OK;
 }
 
@@ -1835,20 +2138,40 @@ static stm_status h_write(stm_9p_server *s,
     if (accmode == STM_9P_O_RDONLY)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EACCES);
 
-    /* fid.tla IOReject gate + fetch current size for O_APPEND. */
+    /* (a) snapshot + pin (CF-2b). */
+    uint64_t ds         = f->dataset_id;
+    uint64_t ino        = f->ino;
+    uint32_t gen        = f->cached_gen;
+    uint32_t open_flags = f->open_flags;
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TWRITE, tag);
+
+    /* (b) unlocked: fid.tla IOReject gate + fetch current size for
+     * O_APPEND. The offset = stat-then-write is a pre-existing TOCTOU
+     * vs concurrent appends (already cross-connection-reachable
+     * today) — documented in cf-2-design.md §4.3, unchanged. */
+    uint32_t ecode = 0;
     struct stm_inode_value iv;
-    stm_status vrc = verify_fid_fresh(s, f, &iv);
-    if (vrc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, &iv);
+    if (rc != STM_OK) {
+        ecode = status_to_errno(rc);
+        goto phase_c;
+    }
 
     /* O_APPEND: ignore the client's offset; write at current size. */
-    if (f->open_flags & STM_9P_O_APPEND)
+    if (open_flags & STM_9P_O_APPEND)
         offset = stm_load_le64(iv.si_size);
 
-    stm_status rc = stm_fs_write(s->fs, f->dataset_id, f->ino,
-                                   offset, body + 16, (size_t)count);
+    rc = stm_fs_write(s->fs, ds, ino, offset, body + 16, (size_t)count);
     if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        ecode = status_to_errno(rc);
+
+phase_c:
+    /* (c) no fid mutation; unpin. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, f);
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
 
     uint32_t need = STM_9P_HDR_SIZE + 4u;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -1900,15 +2223,29 @@ static stm_status h_readdir(stm_9p_server *s,
     if (!(f->qid_type & STM_9P_QTDIR))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
 
-    stm_status vrc = verify_fid_fresh(s, f, NULL);
-    if (vrc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
-
+    /* (a) snapshot + pin (CF-2b). */
+    uint64_t ds  = f->dataset_id;
+    uint64_t ino = f->ino;
+    uint32_t gen = f->cached_gen;
     uint32_t max_payload = iounit_for_msize(s->msize);
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TREADDIR, tag);
+
+    /* (b) unlocked. */
+    uint32_t ecode = 0;
+    stm_status fatal = STM_OK;
+
+    stm_status vrc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
+    if (vrc != STM_OK) {
+        ecode = status_to_errno(vrc);
+        goto phase_c;
+    }
+
     if (count > max_payload) count = max_payload;
     if (resp_cap < STM_9P_HDR_SIZE + 4u + count) {
         *resp_len = 0;
-        return STM_EINVAL;
+        fatal = STM_EINVAL;
+        goto phase_c;
     }
 
     uint8_t *wp = resp + 4;
@@ -1937,20 +2274,22 @@ static stm_status h_readdir(stm_9p_server *s,
      * the synthesized ".." cookie may be incorrect — clients that
      * rely on Twalk for parent traversal won't notice. Future
      * improvement: track each fid's lineage). */
-    uint64_t parent_ino = f->ino;
+    uint64_t parent_ino = ino;
 
     uint64_t cursor = offset;
 
     for (;;) {
         uint64_t pre_cursor = cursor;
         size_t got = 0;
-        stm_status rc = stm_fs_readdir(s->fs, f->dataset_id, f->ino,
+        stm_status rc = stm_fs_readdir(s->fs, ds, ino,
                                           parent_ino,
                                           /*flags=*/0,
                                           &cursor,
                                           &one, 1, &got);
-        if (rc != STM_OK)
-            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        if (rc != STM_OK) {
+            ecode = status_to_errno(rc);
+            goto phase_c;
+        }
         if (got == 0) break;        /* exhausted */
 
         uint32_t entry_size = STM_9P_QID_SIZE + 8u + 1u + 2u + one.name_len;
@@ -1971,7 +2310,7 @@ static stm_status h_readdir(stm_9p_server *s,
         if (one.child_type == STM_DT_DIR)      qt = STM_9P_QTDIR;
         else if (one.child_type == STM_DT_LNK) qt = STM_9P_QTSYMLINK;
         p9l_pqid(wp, qt, (uint32_t)one.child_gen,
-                  qid_path(f->dataset_id, one.child_ino));
+                  qid_path(ds, one.child_ino));
         wp += STM_9P_QID_SIZE;
         /* offset cookie — the post-entry cursor is the next Treaddir's
          * starting point. */
@@ -1984,6 +2323,14 @@ static stm_status h_readdir(stm_9p_server *s,
 
     p9l_p32(count_field, (uint32_t)(wp - data_start));
     resp_finish(resp, resp_len, wp);
+
+phase_c:
+    /* (c) no fid mutation; unpin. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, f);
+    if (fatal != STM_OK) return fatal;
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
     return STM_OK;
 }
 
@@ -2046,23 +2393,57 @@ static stm_status h_lcreate(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTDIR))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
-    stm_status vrc = verify_fid_fresh(s, f, NULL);
-    if (vrc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
 
-    uint64_t new_ino = 0;
-    stm_status rc = stm_fs_create_file(s->fs, f->dataset_id, f->ino,
-                                          (const uint8_t *)name, (uint8_t)nlen,
-                                          mode & 07777u,
-                                          s->auth_uid, gid, &new_ino);
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    /* (a) snapshot + pin (CF-2b). The parent's ns_path is a fid-owned
+     * heap pointer — copy it to the stack HERE; (b) must not touch it. */
+    uint64_t ds         = f->dataset_id;
+    uint64_t parent_ino = f->ino;
+    uint32_t gen        = f->cached_gen;
+    uint64_t iounit     = iounit_for_msize(s->msize);
+    char   parent_ns[STM_9P_NS_PATH_MAX + 1u];
+    size_t parent_ns_len = 0;
+    bool   have_ns = false;
+    if (f->ns_path && f->ns_path_len <= STM_9P_NS_PATH_MAX) {
+        memcpy(parent_ns, f->ns_path, f->ns_path_len);
+        parent_ns[f->ns_path_len] = '\0';
+        parent_ns_len = f->ns_path_len;
+        have_ns = true;
+    }
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TLCREATE, tag);
+
+    /* (b) unlocked. */
+    uint32_t ecode      = 0;
+    uint64_t new_ino    = 0;
+    uint32_t new_gen    = 0;
+    uint8_t  new_qt     = 0;
+    char    *new_ns     = NULL;
+    size_t   new_ns_len = 0;
+
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, parent_ino, gen, NULL);
+    if (rc != STM_OK) {
+        ecode = status_to_errno(rc);
+        goto phase_c;
+    }
+
+    rc = stm_fs_create_file(s->fs, ds, parent_ino,
+                              (const uint8_t *)name, (uint8_t)nlen,
+                              mode & 07777u,
+                              s->auth_uid, gid, &new_ino);
+    if (rc != STM_OK) {
+        ecode = status_to_errno(rc);
+        goto phase_c;
+    }
 
     /* Stat the new inode to get its si_gen + actual mode. */
     struct stm_inode_value iv;
-    rc = stm_fs_stat(s->fs, f->dataset_id, new_ino, &iv);
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    rc = stm_fs_stat(s->fs, ds, new_ino, &iv);
+    if (rc != STM_OK) {
+        ecode = status_to_errno(rc);
+        goto phase_c;
+    }
+    new_gen = (uint32_t)stm_load_le64(iv.si_gen);
+    new_qt  = qid_type_from_mode(stm_load_le32(iv.si_mode));
 
     /* Compose the new logical ns_path for the repurposed fid (parent's
      * ns_path + "/" + name, canonicalized) BEFORE mutating fid state.
@@ -2073,12 +2454,10 @@ static stm_status h_lcreate(stm_9p_server *s,
      * with its parent ns_path; this is a benign glitch since the fid
      * is now is_open=true and accepts only Tread/Twrite/Tclunk —
      * none of which reference ns_path. */
-    char  *new_ns = NULL;
-    size_t new_ns_len = 0;
-    if (f->ns_path) {
+    if (have_ns) {
         char   tmp[STM_9P_NS_PATH_MAX + 1u];
         size_t tmp_len = 0;
-        if (ns_join(f->ns_path, f->ns_path_len, name, nlen,
+        if (ns_join(parent_ns, parent_ns_len, name, nlen,
                      tmp, sizeof tmp, &tmp_len) == STM_OK) {
             new_ns = malloc(tmp_len + 1u);
             if (new_ns) {
@@ -2089,30 +2468,44 @@ static stm_status h_lcreate(stm_9p_server *s,
         }
     }
 
-    /* Repurpose fid: now points at the new file, with the requested
-     * open flags. Per .L semantics. */
-    f->ino        = new_ino;
-    f->cached_gen = (uint32_t)stm_load_le64(iv.si_gen);
-    f->qid_type   = qid_type_from_mode(stm_load_le32(iv.si_mode));
-    f->is_open    = true;
-    f->open_flags = flags;
-    f->open_iounit = iounit_for_msize(s->msize);
-
-    if (new_ns) {
-        free(f->ns_path);
-        f->ns_path     = new_ns;
-        f->ns_path_len = new_ns_len;
+phase_c:
+    /* (c) under s->lock: repurpose the fid — identity-guarded (a
+     * concurrent same-fid op rebinding / kind-flipping the fid during
+     * (b) supersedes us; grafting open-file state onto ITS binding —
+     * or clobbering an AUX repurpose, leaking xattr state — would be
+     * unsound). On a skipped repurpose the created file exists with
+     * no fid pointing at it, exactly the "create serialized first,
+     * mutator second" order; the Rlcreate still reports the create. */
+    must_lock(&s->lock);
+    if (ecode == 0 &&
+        f->kind == P9_FID_NODE && f->dataset_id == ds &&
+        f->ino == parent_ino) {
+        f->ino        = new_ino;
+        f->cached_gen = new_gen;
+        f->qid_type   = new_qt;
+        f->is_open    = true;
+        f->open_flags = flags;
+        f->open_iounit = iounit;
+        if (new_ns) {
+            free(f->ns_path);
+            f->ns_path     = new_ns;
+            f->ns_path_len = new_ns_len;
+            new_ns = NULL;              /* ownership transferred */
+        }
     }
+    fid_unpin_locked(s, f);
+    free(new_ns);                       /* NULL unless repurpose skipped */
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
 
     uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE + 4u;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RLCREATE;
     p9l_p16(wp, tag); wp += 2;
-    p9l_pqid(wp, f->qid_type, f->cached_gen,
-              qid_path(f->dataset_id, f->ino));
+    p9l_pqid(wp, new_qt, new_gen, qid_path(ds, new_ino));
     wp += STM_9P_QID_SIZE;
-    p9l_p32(wp, (uint32_t)f->open_iounit); wp += 4;
+    p9l_p32(wp, (uint32_t)iounit); wp += 4;
     resp_finish(resp, resp_len, wp);
     return STM_OK;
 }
@@ -2156,30 +2549,45 @@ static stm_status h_mkdir(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTDIR))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
-    stm_status vrc = verify_fid_fresh(s, f, NULL);
-    if (vrc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
 
+    /* (a) snapshot + pin (CF-2b). */
+    uint64_t ds  = f->dataset_id;
+    uint64_t ino = f->ino;
+    uint32_t gen = f->cached_gen;
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TMKDIR, tag);
+
+    /* (b) unlocked. */
+    uint32_t ecode   = 0;
     uint64_t new_ino = 0;
-    stm_status rc = stm_fs_mkdir(s->fs, f->dataset_id, f->ino,
-                                    (const uint8_t *)name, (uint8_t)nlen,
-                                    mode & 07777u,
-                                    s->auth_uid, gid, &new_ino);
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    uint32_t new_gen = 0;
 
-    struct stm_inode_value iv;
-    rc = stm_fs_stat(s->fs, f->dataset_id, new_ino, &iv);
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
+    if (rc == STM_OK)
+        rc = stm_fs_mkdir(s->fs, ds, ino,
+                            (const uint8_t *)name, (uint8_t)nlen,
+                            mode & 07777u,
+                            s->auth_uid, gid, &new_ino);
+    if (rc == STM_OK) {
+        struct stm_inode_value iv;
+        rc = stm_fs_stat(s->fs, ds, new_ino, &iv);
+        if (rc == STM_OK)
+            new_gen = (uint32_t)stm_load_le64(iv.si_gen);
+    }
+    if (rc != STM_OK) ecode = status_to_errno(rc);
+
+    /* (c) no fid mutation (dfid stays bound to the parent); unpin. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, f);
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
 
     uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RMKDIR;
     p9l_p16(wp, tag); wp += 2;
-    p9l_pqid(wp, STM_9P_QTDIR, (uint32_t)stm_load_le64(iv.si_gen),
-              qid_path(f->dataset_id, new_ino));
+    p9l_pqid(wp, STM_9P_QTDIR, new_gen, qid_path(ds, new_ino));
     wp += STM_9P_QID_SIZE;
     resp_finish(resp, resp_len, wp);
     return STM_OK;
@@ -2237,20 +2645,34 @@ static stm_status h_link(stm_9p_server *s,
     if (sf->dataset_id != df->dataset_id)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EXDEV);
 
-    stm_status v1 = verify_fid_fresh(s, sf, NULL);
-    if (v1 != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, v1);
-    stm_status v2 = verify_fid_fresh(s, df, NULL);
-    if (v2 != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, v2);
+    /* (a) snapshot + pin BOTH fids (CF-2b). One lock acquisition pins
+     * both, so there is no ordering hazard; dfid == fid pins the same
+     * slot twice (balanced by the double unpin). */
+    uint64_t ds     = sf->dataset_id;
+    uint64_t s_ino  = sf->ino;
+    uint32_t s_gen  = sf->cached_gen;
+    uint64_t d_ino  = df->ino;
+    uint32_t d_gen  = df->cached_gen;
+    fid_pin_locked(sf);
+    fid_pin_locked(df);
+    phase_b_enter(s, STM_9P_TLINK, tag);
 
-    stm_status rc = stm_fs_link_by_ino(s->fs, sf->dataset_id,
-                                          sf->ino,
-                                          df->ino,
-                                          (const uint8_t *)name,
-                                          (uint8_t)nlen);
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    /* (b) unlocked. */
+    uint32_t ecode = 0;
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, s_ino, s_gen, NULL);
+    if (rc == STM_OK)
+        rc = verify_fresh_snapshot(s->fs, ds, d_ino, d_gen, NULL);
+    if (rc == STM_OK)
+        rc = stm_fs_link_by_ino(s->fs, ds, s_ino, d_ino,
+                                   (const uint8_t *)name, (uint8_t)nlen);
+    if (rc != STM_OK) ecode = status_to_errno(rc);
+
+    /* (c) no fid mutation; unpin both. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, sf);
+    fid_unpin_locked(s, df);
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
 
     uint32_t need = STM_9P_HDR_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -2301,30 +2723,45 @@ static stm_status h_symlink(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTDIR))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
-    stm_status vrc = verify_fid_fresh(s, f, NULL);
-    if (vrc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
 
+    /* (a) snapshot + pin (CF-2b). */
+    uint64_t ds  = f->dataset_id;
+    uint64_t ino = f->ino;
+    uint32_t gen = f->cached_gen;
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TSYMLINK, tag);
+
+    /* (b) unlocked. */
+    uint32_t ecode   = 0;
     uint64_t new_ino = 0;
-    stm_status rc = stm_fs_symlink(s->fs, f->dataset_id, f->ino,
-                                      (const uint8_t *)name, (uint8_t)nlen,
-                                      (const uint8_t *)symtgt, tlen,
-                                      s->auth_uid, gid, &new_ino);
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    uint32_t new_gen = 0;
 
-    struct stm_inode_value iv;
-    rc = stm_fs_stat(s->fs, f->dataset_id, new_ino, &iv);
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
+    if (rc == STM_OK)
+        rc = stm_fs_symlink(s->fs, ds, ino,
+                              (const uint8_t *)name, (uint8_t)nlen,
+                              (const uint8_t *)symtgt, tlen,
+                              s->auth_uid, gid, &new_ino);
+    if (rc == STM_OK) {
+        struct stm_inode_value iv;
+        rc = stm_fs_stat(s->fs, ds, new_ino, &iv);
+        if (rc == STM_OK)
+            new_gen = (uint32_t)stm_load_le64(iv.si_gen);
+    }
+    if (rc != STM_OK) ecode = status_to_errno(rc);
+
+    /* (c) no fid mutation; unpin. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, f);
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
 
     uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RSYMLINK;
     p9l_p16(wp, tag); wp += 2;
-    p9l_pqid(wp, STM_9P_QTSYMLINK, (uint32_t)stm_load_le64(iv.si_gen),
-              qid_path(f->dataset_id, new_ino));
+    p9l_pqid(wp, STM_9P_QTSYMLINK, new_gen, qid_path(ds, new_ino));
     wp += STM_9P_QID_SIZE;
     resp_finish(resp, resp_len, wp);
     return STM_OK;
@@ -2352,18 +2789,32 @@ static stm_status h_readlink(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTSYMLINK))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
-    stm_status vrc = verify_fid_fresh(s, f, NULL);
-    if (vrc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
 
+    /* (a) snapshot + pin (CF-2b). */
+    uint64_t ds  = f->dataset_id;
+    uint64_t ino = f->ino;
+    uint32_t gen = f->cached_gen;
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TREADLINK, tag);
+
+    /* (b) unlocked. */
+    uint32_t ecode = 0;
     uint8_t buf[STM_9P_NAME_MAX + 1];
     size_t got = 0;
-    stm_status rc = stm_fs_readlink(s->fs, f->dataset_id, f->ino,
-                                       buf, sizeof buf, &got);
+
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
+    if (rc == STM_OK)
+        rc = stm_fs_readlink(s->fs, ds, ino, buf, sizeof buf, &got);
     if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
-    if (got > UINT16_MAX)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EOVERFLOW);
+        ecode = status_to_errno(rc);
+    else if (got > UINT16_MAX)
+        ecode = STM_9P_ECODE_EOVERFLOW;
+
+    /* (c) no fid mutation; unpin. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, f);
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
 
     uint32_t need = STM_9P_HDR_SIZE + 2u + (uint32_t)got;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -2413,20 +2864,33 @@ static stm_status h_unlinkat(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTDIR))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
-    stm_status vrc = verify_fid_fresh(s, f, NULL);
-    if (vrc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
 
-    stm_status rc;
-    if (flags & STM_9P_AT_REMOVEDIR) {
-        rc = stm_fs_rmdir(s->fs, f->dataset_id, f->ino,
-                           (const uint8_t *)name, (uint8_t)nlen);
-    } else {
-        rc = stm_fs_unlink(s->fs, f->dataset_id, f->ino,
-                            (const uint8_t *)name, (uint8_t)nlen);
+    /* (a) snapshot + pin (CF-2b). */
+    uint64_t ds  = f->dataset_id;
+    uint64_t ino = f->ino;
+    uint32_t gen = f->cached_gen;
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TUNLINKAT, tag);
+
+    /* (b) unlocked. */
+    uint32_t ecode = 0;
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
+    if (rc == STM_OK) {
+        if (flags & STM_9P_AT_REMOVEDIR) {
+            rc = stm_fs_rmdir(s->fs, ds, ino,
+                               (const uint8_t *)name, (uint8_t)nlen);
+        } else {
+            rc = stm_fs_unlink(s->fs, ds, ino,
+                                (const uint8_t *)name, (uint8_t)nlen);
+        }
     }
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    if (rc != STM_OK) ecode = status_to_errno(rc);
+
+    /* (c) no fid mutation; unpin. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, f);
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
 
     uint32_t need = STM_9P_HDR_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -2493,21 +2957,36 @@ static stm_status h_renameat(stm_9p_server *s,
     if (of->dataset_id != nf->dataset_id)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EXDEV);
 
-    stm_status v1 = verify_fid_fresh(s, of, NULL);
-    if (v1 != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, v1);
-    stm_status v2 = verify_fid_fresh(s, nf, NULL);
-    if (v2 != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, v2);
+    /* (a) snapshot + pin BOTH dir fids (CF-2b; same-slot double pin
+     * when old_dirfid == new_dirfid is balanced by the double unpin). */
+    uint64_t ds     = of->dataset_id;
+    uint64_t o_ino  = of->ino;
+    uint32_t o_gen  = of->cached_gen;
+    uint64_t n_ino  = nf->ino;
+    uint32_t n_gen  = nf->cached_gen;
+    fid_pin_locked(of);
+    fid_pin_locked(nf);
+    phase_b_enter(s, STM_9P_TRENAMEAT, tag);
 
-    stm_status rc = stm_fs_rename(s->fs, of->dataset_id,
-                                     of->ino,
-                                     (const uint8_t *)old_name, (uint8_t)old_nlen,
-                                     nf->ino,
-                                     (const uint8_t *)new_name, (uint8_t)new_nlen,
-                                     /*flags=*/0);
-    if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    /* (b) unlocked. */
+    uint32_t ecode = 0;
+    stm_status rc = verify_fresh_snapshot(s->fs, ds, o_ino, o_gen, NULL);
+    if (rc == STM_OK)
+        rc = verify_fresh_snapshot(s->fs, ds, n_ino, n_gen, NULL);
+    if (rc == STM_OK)
+        rc = stm_fs_rename(s->fs, ds, o_ino,
+                              (const uint8_t *)old_name, (uint8_t)old_nlen,
+                              n_ino,
+                              (const uint8_t *)new_name, (uint8_t)new_nlen,
+                              /*flags=*/0);
+    if (rc != STM_OK) ecode = status_to_errno(rc);
+
+    /* (c) no fid mutation; unpin both. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, of);
+    fid_unpin_locked(s, nf);
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
 
     uint32_t need = STM_9P_HDR_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -2554,36 +3033,57 @@ static stm_status h_setattr(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
     if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
-    /* Snapshot current attrs for the chown(-1, ...) "leave unchanged"
-     * semantics — Linux uses UINT32_MAX as the sentinel; .L's valid
-     * mask is the cleaner mechanism but stm_fs_chown takes the
-     * sentinel, so we plumb both. */
+
+    /* (a) snapshot + pin (CF-2b). */
+    uint64_t ds  = f->dataset_id;
+    uint64_t ino = f->ino;
+    uint32_t gen = f->cached_gen;
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TSETATTR, tag);
+
+    /* (b) unlocked. Snapshot current attrs for the chown(-1, ...)
+     * "leave unchanged" semantics — Linux uses UINT32_MAX as the
+     * sentinel; .L's valid mask is the cleaner mechanism but
+     * stm_fs_chown takes the sentinel, so we plumb both. */
+    uint32_t ecode = 0;
+    bool     refresh_gen = false;
+    uint32_t fresh_gen   = 0;
+
     struct stm_inode_value iv;
-    stm_status vrc = verify_fid_fresh(s, f, &iv);
-    if (vrc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+    stm_status vrc = verify_fresh_snapshot(s->fs, ds, ino, gen, &iv);
+    if (vrc != STM_OK) {
+        ecode = status_to_errno(vrc);
+        goto phase_c;
+    }
 
     /* SIZE — refused on dirs/symlinks (Linux POSIX). */
     if (valid & STM_9P_SETATTR_SIZE) {
         uint32_t curmode = stm_load_le32(iv.si_mode);
-        if ((curmode & 0170000u) != 0100000u)   /* not S_IFREG */
-            return reply_rlerror(resp, resp_cap, resp_len, tag,
-                                  STM_9P_ECODE_EINVAL);
-        stm_status rc = stm_fs_truncate(s->fs, f->dataset_id, f->ino, new_size);
-        if (rc != STM_OK)
-            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
-        /* Refresh cached_gen after potential gen bump. */
+        if ((curmode & 0170000u) != 0100000u) {   /* not S_IFREG */
+            ecode = STM_9P_ECODE_EINVAL;
+            goto phase_c;
+        }
+        stm_status rc = stm_fs_truncate(s->fs, ds, ino, new_size);
+        if (rc != STM_OK) {
+            ecode = status_to_errno(rc);
+            goto phase_c;
+        }
+        /* Refresh cached_gen after potential gen bump — captured here,
+         * applied in (c) under s->lock. */
         struct stm_inode_value post;
-        if (stm_fs_stat(s->fs, f->dataset_id, f->ino, &post) == STM_OK)
-            f->cached_gen = (uint32_t)stm_load_le64(post.si_gen);
+        if (stm_fs_stat(s->fs, ds, ino, &post) == STM_OK) {
+            refresh_gen = true;
+            fresh_gen   = (uint32_t)stm_load_le64(post.si_gen);
+        }
     }
 
     /* MODE. */
     if (valid & STM_9P_SETATTR_MODE) {
-        stm_status rc = stm_fs_chmod(s->fs, f->dataset_id, f->ino,
-                                        new_mode & 07777u);
-        if (rc != STM_OK)
-            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        stm_status rc = stm_fs_chmod(s->fs, ds, ino, new_mode & 07777u);
+        if (rc != STM_OK) {
+            ecode = status_to_errno(rc);
+            goto phase_c;
+        }
     }
 
     /* UID / GID. .L sends both fields always; the valid mask says
@@ -2592,10 +3092,11 @@ static stm_status h_setattr(stm_9p_server *s,
     if ((valid & STM_9P_SETATTR_UID) || (valid & STM_9P_SETATTR_GID)) {
         uint32_t pass_uid = (valid & STM_9P_SETATTR_UID) ? new_uid : UINT32_MAX;
         uint32_t pass_gid = (valid & STM_9P_SETATTR_GID) ? new_gid : UINT32_MAX;
-        stm_status rc = stm_fs_chown(s->fs, f->dataset_id, f->ino,
-                                        pass_uid, pass_gid);
-        if (rc != STM_OK)
-            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        stm_status rc = stm_fs_chown(s->fs, ds, ino, pass_uid, pass_gid);
+        if (rc != STM_OK) {
+            ecode = status_to_errno(rc);
+            goto phase_c;
+        }
     }
 
     /* ATIME / MTIME. ATIME_SET / MTIME_SET indicate the sec/nsec is
@@ -2615,14 +3116,27 @@ static stm_status h_setattr(stm_9p_server *s,
                               : stm_load_le32(iv.si_mtime_nsec);
         /* ctime stamped to "now" by the wrapper — pass 0/0 to signal
          * "use current time". */
-        stm_status rc = stm_fs_utimens(s->fs, f->dataset_id, f->ino,
+        stm_status rc = stm_fs_utimens(s->fs, ds, ino,
                                           use_at_sec, use_at_nsec,
                                           use_mt_sec, use_mt_nsec,
                                           /*ctime_sec=*/0,
                                           /*ctime_nsec=*/0);
-        if (rc != STM_OK)
-            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        if (rc != STM_OK) {
+            ecode = status_to_errno(rc);
+            goto phase_c;
+        }
     }
+
+phase_c:
+    /* (c) under s->lock: apply the truncate's gen refresh, identity-
+     * guarded (a concurrent same-fid rebind supersedes it); unpin. */
+    must_lock(&s->lock);
+    if (refresh_gen &&
+        f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino)
+        f->cached_gen = fresh_gen;
+    fid_unpin_locked(s, f);
+    if (ecode)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
 
     uint32_t need = STM_9P_HDR_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -2720,7 +3234,19 @@ static stm_status h_fsync(stm_9p_server *s,
     if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
 
+    /* (a) pin (CF-2b — no snapshot needed: the commit is pool-wide).
+     * The commit is the LONGEST handler by far (device-durable
+     * write-out); holding s->lock across it was the single worst
+     * full-lock stall in the pre-CF-2b server. */
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TFSYNC, tag);
+
+    /* (b) unlocked. */
     stm_status rc = stm_fs_commit(s->fs);
+
+    /* (c) no fid mutation; unpin. */
+    must_lock(&s->lock);
+    fid_unpin_locked(s, f);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
 
@@ -3551,6 +4077,11 @@ stm_status stm_9p_server_create(stm_fs *fs,
     int rc = pthread_mutex_init(&s->lock, &attr);
     pthread_mutexattr_destroy(&attr);
     if (rc != 0) { free(s); return STM_ENOMEM; }
+    if (pthread_cond_init(&s->fid_cv, NULL) != 0) {
+        pthread_mutex_destroy(&s->lock);
+        free(s);
+        return STM_ENOMEM;
+    }
 
     s->fs           = fs;
     s->root_dataset = root_dataset;
@@ -3589,6 +4120,7 @@ void stm_9p_server_destroy(stm_9p_server *s)
     for (size_t i = 0; i < STM_9P_MAX_FIDS; i++)
         fid_release_locked(s, &s->fids[i]);
     ns_bindings_clear(s);
+    pthread_cond_destroy(&s->fid_cv);
     pthread_mutex_destroy(&s->lock);
     free(s);
 }

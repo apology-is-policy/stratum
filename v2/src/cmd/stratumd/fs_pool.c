@@ -129,6 +129,8 @@ static void pool_latch_dead_locked(fs_pool *p, stm_status rc)
     if (!p->dead) {
         p->dead     = true;
         p->fatal_rc = rc;
+        if (g_test_hooks.on_fatal)
+            g_test_hooks.on_fatal(g_test_hooks.arg, rc);
     }
     pthread_cond_broadcast(&p->work_cv);
     pthread_cond_broadcast(&p->slot_cv);
