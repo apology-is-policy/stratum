@@ -195,6 +195,49 @@ stm_9p_server_destroy(s)
 close(fd)
 ```
 
+### The CF-2a dispatch pool (per-connection worker pool)
+
+`--fs-workers N` (opts `fs_workers`; 0 = auto = 4 flat, 1 = the serial
+loop above byte-unchanged, 2..16 = pool). Published process-wide once
+at the top of `stm_stratumd_run` (the `g_bake_owner_*` discipline);
+every direct caller of `stm_stratumd_serve_client` (tests, proxy)
+defaults to serial. Design + invariants: `docs/cf-2-design.md` §3
+(CF2-I1..I8); implementation `src/cmd/stratumd/fs_pool.{c,h}`.
+
+```
+serve_client:  workers >= 2 → stm_fs_pool_serve(fd, s, workers, uid, policy)
+
+reader (the connection thread)      N workers
+──────────────────────────────      ─────────────────────────────────
+read frame (idle-aware header:      pop slot from the FIFO ring
+ RCVTIMEO expiry retries while       cancelled/dead → discard frame
+ ops are in flight; fatal only       stm_9p_server_handle → private
+ when fully idle)                     resp buffer (sized to the
+Tversion → barrier (drain all),       negotiated msize, re-sized at
+ handle inline, republish msize       the version barrier)
+Tflush   → cancel QUEUED +Rflush;    flush_pending → discard reply
+ wait EXECUTING/REPLYING, then       else REPLYING (tag retired for
+ Rflush (ordered after the            admission — tag-0 reuse is
+ flushed op's reply/discard)          race-free) → write_full under
+                                      write_mu → FREE + broadcast
+Tattach  → policy gate inline
+else     → admit: 64 slots, dup-
+ in-flight tag = fatal, frame
+ gate = NEGOTIATED msize, queued-
+ bytes budget max(1MiB, 4×msize);
+ back-pressure blocks the reader
+```
+
+Teardown: clean EOF drains (queued + executing ops reply — a client
+may half-close and still read); errors abandon the queue; reader joins
+every worker BEFORE `stm_9p_server_destroy` + `close(fd)`. Exactly one
+reply per admitted request, zero for flushed-before-reply. The pool is
+STRICTER than the serial loop in two documented ways: frames above the
+negotiated msize (serial: msize_max) and duplicate in-flight tags
+(serial: unobservable) are connection-fatal. A test hook
+(`stm_fs_pool_set_test_hooks`) parks chosen tags inside the worker for
+deterministic flush/overlap tests — NULL in production.
+
 ### Per-connection /ctl/ lifecycle (P9-CTL-2c → PARALLEL-1)
 
 ```
@@ -339,6 +382,20 @@ session token is loaded into an mlock'd buffer for the WRAP and
 
 ## Tests
 
+- `tests/test_9p_pool.c` — CF-2a: 13 pool tests over a
+  socketpair (the test hook parks chosen tags inside a worker, so
+  flush-of-EXECUTING / worker-overlap / queued-cancellation are test-
+  scheduled): pipelined exactly-once storm, provable 2-worker
+  overlap, Tflush of unknown/EXECUTING (both legal outcomes:
+  discard-then-Rflush or reply-then-Rflush — never Rflush-first)/
+  QUEUED (never executes; Rflush precedes worker release), tag reuse
+  straight after a queued-flush (the self-audit F1 regression —
+  non-vacuity proven by reverting the lookup fix), a 5000-op
+  synchronous tag-0 storm (the boot-gate F2 shape; the race window is
+  substrate-dependent, so the pool-on boot gate is its true witness),
+  Tversion barrier + fid reset, duplicate-tag + oversize-frame
+  connection-fatal, clean-EOF pipeline drain, 82-op back-pressure
+  with zero drops, serial-vs-pool byte equivalence (CF2-I7).
 - `tests/test_stratumd_ctl.c` — exercises the daemon end-to-end:
   spawn stratumd as a child process via the standalone binary
   (`stratumd`), dial both sockets via libstratum-9p, drive both
@@ -378,6 +435,7 @@ session token is loaded into an mlock'd buffer for the WRAP and
 | TLY-A3-impl-2: corvus UNWRAP transport + retry | LIVE | `stm_corvus_unwrap_once` + `stm_corvus_unwrap` (Q9 backoff); raw AF_UNIX (`58a7253`) |
 | TLY-A3-keyslot-impl-3b: mount-time UNWRAP wiring + CLI | LIVE | `--corvus-socket` + `--corvus-session-token-file` → `stm_fs_mount_opts` → `stm_sync_open`'s `stm_corvus_mount_cfg`; `sync_unwrap_cb` routes `STM_KS_WRAPPER_CORVUS` slots |
 | TLY-A5-impl-1c: corvus-principal gate `--corvus-admin-uid` | LIVE | CLI → `stm_stratumd_opts.corvus_admin_uid` → `stm_ctl_set_corvus_admin_uid`; the `/ctl/` `mark-snapshot-compromised` verb admits that uid alongside admin (`unmark` stays strict-admin). Requires `--ctl-listen` |
+| CF-2a: per-connection FS worker pool (`--fs-workers`, default auto=4) | LIVE | `fs_pool.{c,h}`; reader-demux + N workers + writer mutex; real Tflush; Tversion barrier; N=1 = the serial loop byte-unchanged. Design `docs/cf-2-design.md`; audit folds into the CF-2 close (R176) |
 | TLY-A3-keyslot-wrap: one-shot `--provision-corvus-dataset` mode | LIVE | `stratumd_run_provision` → `stm_fs_create_dataset_corvus` (corvus WRAP) + `stm_fs_init_dataset_root`; non-serving; `test_corvus_provision.c` |
 
 The corvus UNWRAP client (`v2/src/corvus_client/`) is a standalone

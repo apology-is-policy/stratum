@@ -171,6 +171,12 @@ typedef struct stm_stratumd_opts {
     uint32_t    idle_timeout_ms;  /* per-conn idle timeout (0 → DEFAULT 30s);
                                    * applied to accepted client fds via
                                    * SO_RCVTIMEO + SO_SNDTIMEO */
+    uint32_t    fs_workers;       /* CF-2a: per-connection FS worker-pool
+                                   * size. 0 = auto (4); 1 = the serial
+                                   * loop (byte-identical pre-CF-2
+                                   * behavior -- the bisect lever);
+                                   * 2..16 = pool with that many workers.
+                                   * CLI: --fs-workers N. */
 
     /* TLY-A2 (impl-1): coordinator mode — per-uid Tattach pattern
      * enforcement. `user_policy` is a borrowed pointer; caller owns

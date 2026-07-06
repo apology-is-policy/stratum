@@ -99,12 +99,23 @@ throughput). A slot is the registry entry AND the queue element:
   the frame body — frames are heap-owned per-request, NOT preallocated
   at msize_max; see §3.5 memory bounds) and appending the slot index to
   a FIFO ring. Workers pop the ring, skip `cancelled` entries, run
-  `stm_9p_server_handle` into their private resp buffer, then:
-  lock registry; if `flush_pending` -> DISCARD (skip the write);
-  else state=REPLYING; unlock; write under the writer mutex;
-  lock; state=FREE (+ free req); broadcast. A handler-fatal return
-  (rc != STM_OK || resp_len == 0) latches the connection dead
-  (matching the serial loop's close-the-connection contract).
+  `stm_9p_server_handle` into their private resp buffer, then decide
+  send under mu (`flush_pending`/dead -> discard), mark REPLYING,
+  write under the writer mutex, and free the slot. REPLYING is the
+  load-bearing subtlety (the boot-gate F2 fix, refined by its own
+  revert-proof): the TAG must retire before the write — the kernel
+  client's tags are table indices, so a synchronous stream reuses
+  tag 0 the instant a reply lands, faster than the worker re-locks;
+  the admission dup-check therefore treats REPLYING (and cancelled)
+  as NOT live. But the SLOT must stay findable through the write —
+  the naive retire-to-FREE variant let a not-found Tflush's Rflush
+  race the committed in-flight reply to the writer mutex (an
+  Rflush-before-reply wire violation, caught by the flush test).
+  Split lookups deliver both: `find_live_tag` (admission: QUEUED/
+  EXECUTING, non-cancelled) vs `find_flush_target` (live first, else
+  REPLYING -> wait for FREE -> Rflush strictly after the reply). A
+  handler-fatal return (rc != STM_OK || resp_len == 0) latches the
+  connection dead (matching the serial loop's contract).
 - Duplicate in-flight tag = protocol violation -> connection-fatal
   (STM_EPROTOCOL, close), consistent with the serial loop's
   out-of-range-size handling. (Serial mode never checked — it could
@@ -117,11 +128,12 @@ throughput). A slot is the registry entry AND the queue element:
 ### 3.3 Inline ops (reader-executed, never queued)
 
 - **Tflush (the S5 contract):** look up oldtag in the registry.
-  QUEUED -> mark cancelled, free its frame, Rflush. EXECUTING/REPLYING
-  -> set flush_pending (EXECUTING only; REPLYING means the reply is
-  already being sent — too late to discard), WAIT for the slot to
-  reach FREE, then Rflush. Unknown oldtag (already completed, or never
-  seen) -> Rflush immediately. Ordering: Rflush is written strictly
+  QUEUED -> mark cancelled, free its frame, Rflush. EXECUTING -> set
+  flush_pending (the worker completes but discards the reply), WAIT
+  for the slot to reach FREE, then Rflush. REPLYING -> too late to
+  discard; WAIT for the write to drain, then Rflush (strict CF2-I2).
+  Unknown oldtag (fully completed or never seen) -> Rflush
+  immediately. Ordering: Rflush is written strictly
   after the flushed op's reply is sent or discarded — the 9P contract.
   The wait is bounded (every handler is finite; see §2). The reader
   stalls while waiting — acceptable: Tflush is rare (the kernel client
@@ -445,9 +457,9 @@ multi-threaded-writer-process reality).
 
 | # | Scope | Verify |
 |---|---|---|
-| CF-2a | fs_pool.{c,h} + serve_client branch + opts/--fs-workers + run.c publish + test_9p_pool.c core | pool tests + full ctest + boot gate (pool-on) |
+| CF-2a **BUILT** | fs_pool.{c,h} + serve_client branch + opts/--fs-workers + run.c publish + test_9p_pool.c (13 tests; F1 tag-reuse-after-queued-flush [self-audit; revert-proven] + F2 tag-0 completion race [found by the FIRST pool-on boot gate killing the mount at probe46; fixed by REPLYING-with-split-lookup]) | pool tests 13/13 x5 + gmalloc x3 + default ctest 70/70 + UBSan 70/70 + werror + boot gate GREEN (pool-on: boot OK, 0 EXT, login E2E, Go-4c) |
 | CF-2b | server.c pin + 3-phase surgery (the §4.3 table) + verify_fresh_snapshot refactor + concurrency tests | pool tests incl. overlap proof + gmalloc + ctest + boot gate |
 | CF-2c | R175-(a): port the 4 write-path scan families to `scan_range_concurrent` + bounded caller retry (commit-cadence bound = documented backstop) | targeted engine/fs tests + soak |
 | CF-2d | R175-(b): bounded retry-at-funnel across the 7 write funnels (fresh EBR pin per attempt) | funnel retry tests (injected seal) |
-| CF-2e | #57 stale-fixture harness sweep (rides along) | suite start sweeps /tmp/stm_v2_* |
+| CF-2e **BUILT** (with 2a) | #57 stale-fixture sweep: atexit unlinks THIS pid's stm_v2_* (make_tmp never cleaned at exit) + once-per-process 6h-age sweep (crashed runs; parallel-ctest-safe) | the leak class closed at both ends |
 | CF-2f | bench (gofmt/fsbench re-measure) + docs (29-concurrency.md as-built rewrite + reference) + the focused Fable audit (R176) over the whole CF-2 surface | audit converged clean |

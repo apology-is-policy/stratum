@@ -106,6 +106,8 @@ static void usage(const char *argv0)
         "  --read-only              Mount the filesystem read-only\n"
         "  --msize <bytes>          Max negotiated 9P msize "
             "(default: 128 KiB)\n"
+        "  --fs-workers <n>         Per-connection FS worker-pool size "
+            "(0 = auto [4]; 1 = serial; max 16) [CF-2]\n"
         "  --root-dataset <id>      Dataset ID for new attachers "
             "(default: 1)\n"
         "  --backlog <n>            listen() backlog "
@@ -653,6 +655,20 @@ int stm_cmd_stratumd_main(int argc, char **argv)
                 return 1;
             }
             opts.backlog = (int)v;
+            continue;
+        }
+        if (!strcmp(a, "--fs-workers") && i + 1 < argc) {
+            /* CF-2a: per-connection FS worker-pool size. 0 = auto (4);
+             * 1 = the serial loop (byte-identical pre-CF-2 behavior,
+             * the bisect lever); values above the pool max clamp. */
+            char *end = NULL;
+            long v = strtol(argv[++i], &end, 10);
+            if (!end || *end != '\0' || v < 0 || v > 1024) {
+                fprintf(stderr,
+                    "stratumd: invalid --fs-workers: %s\n", argv[i]);
+                return 1;
+            }
+            opts.fs_workers = (uint32_t)v;
             continue;
         }
         if (!strcmp(a, "--idle-timeout") && i + 1 < argc) {

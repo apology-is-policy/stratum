@@ -15,6 +15,7 @@
 
 #include "corvus_notify.h"
 #include "dataset_pattern.h"
+#include "fs_pool.h"
 #include "peer_creds.h"
 #include "proxy_9p.h"
 
@@ -61,6 +62,24 @@ static bool  g_bake_owner_enabled = false;
 static uid_t g_bake_owner_uid     = (uid_t)-1;
 static gid_t g_bake_owner_gid     = (gid_t)-1;
 
+/* CF-2a: per-connection FS worker-pool size. Published ONCE at the top
+ * of stm_stratumd_run from opts (the g_bake_owner_* discipline: before
+ * any listen/accept/worker spawn; per-connection threads only read).
+ * 1 = the untouched serial loop (CF2-I7 — also what every direct
+ * caller of stm_stratumd_serve_client gets: tests, the proxy path).
+ * >= 2 = the fs_pool dispatch path (docs/cf-2-design.md §3). */
+static uint32_t g_fs_workers = 1u;
+
+/* Resolve the opts knob: 0 = auto (4 flat — ncpu probing would read 1
+ * in-VM and silently disable the pool; cf-2-design.md §3.6); clamp to
+ * the pool's max. */
+static uint32_t fs_workers_resolve(uint32_t opt)
+{
+    if (opt == 0u) return STM_FS_POOL_WORKERS_AUTO;
+    if (opt > STM_FS_POOL_WORKERS_MAX) return STM_FS_POOL_WORKERS_MAX;
+    return opt;
+}
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* Robust read/write with EINTR handling.                                 */
 /* ────────────────────────────────────────────────────────────────────── */
@@ -71,7 +90,7 @@ static gid_t g_bake_owner_gid     = (gid_t)-1;
  *  -errno → fatal io error OR EOF mid-message (truncated).
  * Retries on EINTR; treats EAGAIN/EWOULDBLOCK as fatal (sockets are
  * blocking by default — no nonblocking is configured here). */
-static int read_full(int fd, void *buf, size_t len)
+int stratumd_read_full(int fd, void *buf, size_t len)
 {
     uint8_t *p = (uint8_t *)buf;
     size_t   done = 0;
@@ -93,7 +112,7 @@ static int read_full(int fd, void *buf, size_t len)
 /* Write exactly `len` bytes from `buf` to `fd`. Returns 0 on success
  * or -errno on fatal io error. EINTR retried; EAGAIN treated as
  * fatal (blocking sockets). */
-static int write_full(int fd, const void *buf, size_t len)
+int stratumd_write_full(int fd, const void *buf, size_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
     size_t         done = 0;
@@ -110,7 +129,7 @@ static int write_full(int fd, const void *buf, size_t len)
 }
 
 /* Decode 4-byte little-endian size header. */
-static uint32_t decode_le32(const uint8_t *p)
+uint32_t stratumd_decode_le32(const uint8_t *p)
 {
     return (uint32_t)p[0] |
            ((uint32_t)p[1] << 8) |
@@ -145,7 +164,7 @@ static uint32_t decode_le32(const uint8_t *p)
  *
  * Non-Tattach types AND no-policy configurations pass through
  * unchanged. */
-static bool stratumd_check_tattach(const uint8_t *req, uint32_t req_len,
+bool stratumd_check_tattach(const uint8_t *req, uint32_t req_len,
                                      uid_t peer_uid,
                                      const struct stm_ds_policy_table *policy,
                                      uint8_t *resp, uint32_t resp_cap,
@@ -375,7 +394,7 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
      * accept slot. The serial accept loop is one-client-at-a-time, so
      * a misbehaving peer that opens but never sends would otherwise
      * DoS every other mount user. Apply SO_RCVTIMEO + SO_SNDTIMEO;
-     * read_full / write_full surface EAGAIN/EWOULDBLOCK and the
+     * stratumd_read_full / stratumd_write_full surface EAGAIN/EWOULDBLOCK and the
      * connection ends with STM_EIO. Default 30 s matches janus's
      * R11 P2-4. idle_timeout_ms == 0 is "no timeout" (intended for
      * tests that drive the wire synchronously). */
@@ -405,6 +424,18 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
         return rc;
     }
 
+    /* CF-2a: the worker-pool dispatch path (docs/cf-2-design.md §3).
+     * g_fs_workers == 1 (the default for every direct caller; run()
+     * publishes the knob) keeps the serial loop below UNTOUCHED —
+     * byte-identical behavior, the bisect lever (CF2-I7). */
+    if (g_fs_workers >= 2u) {
+        rc = stm_fs_pool_serve(fd, srv, g_fs_workers,
+                                  peer_uid, user_policy);
+        stm_9p_server_destroy(srv);
+        close(fd);
+        return rc;
+    }
+
     /* Per-connection req/resp buffers. Allocated once at msize_max;
      * the negotiated msize never exceeds this. Heap-allocated to keep
      * stack pressure bounded (msize_max can be up to 1 MiB). */
@@ -421,7 +452,7 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
     rc = STM_OK;
     while (1) {
         /* Read the 4-byte size header. EOF here = clean disconnect. */
-        int r = read_full(fd, req, 4u);
+        int r = stratumd_read_full(fd, req, 4u);
         if (r == 1) {
             rc = STM_OK;
             break;
@@ -430,7 +461,7 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
             rc = STM_EIO;
             break;
         }
-        uint32_t size = decode_le32(req);
+        uint32_t size = stratumd_decode_le32(req);
         if (size < STM_9P_HDR_SIZE || size > msize_max) {
             /* Protocol violation: out-of-range size. The 9P spec
              * doesn't define a recovery path; close the connection. */
@@ -438,7 +469,7 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
             break;
         }
         /* Read the rest of the message. */
-        r = read_full(fd, req + 4, size - 4u);
+        r = stratumd_read_full(fd, req + 4, size - 4u);
         if (r != 0) {
             rc = STM_EIO;
             break;
@@ -465,7 +496,7 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
             }
         }
 
-        if (write_full(fd, resp, resp_len) != 0) {
+        if (stratumd_write_full(fd, resp, resp_len) != 0) {
             rc = STM_EIO;
             break;
         }
@@ -897,16 +928,16 @@ stm_status stm_stratumd_serve_ctl_client(int fd, stm_ctl *ctl,
 
     rc = STM_OK;
     while (1) {
-        int r = read_full(fd, req, 4u);
+        int r = stratumd_read_full(fd, req, 4u);
         if (r == 1) { rc = STM_OK; break; }
         if (r != 0) { rc = STM_EIO; break; }
 
-        uint32_t size = decode_le32(req);
+        uint32_t size = stratumd_decode_le32(req);
         if (size < STM_LP9_HDR_SIZE || size > msize_max) {
             rc = STM_EPROTOCOL;
             break;
         }
-        r = read_full(fd, req + 4, size - 4u);
+        r = stratumd_read_full(fd, req + 4, size - 4u);
         if (r != 0) { rc = STM_EIO; break; }
 
         uint32_t resp_len = 0;
@@ -918,7 +949,7 @@ stm_status stm_stratumd_serve_ctl_client(int fd, stm_ctl *ctl,
             break;
         }
 
-        if (write_full(fd, resp, resp_len) != 0) {
+        if (stratumd_write_full(fd, resp, resp_len) != 0) {
             rc = STM_EIO;
             break;
         }
@@ -1424,6 +1455,10 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
     g_bake_owner_enabled = opts->bake_owner_enabled;
     g_bake_owner_uid     = opts->bake_owner_uid;
     g_bake_owner_gid     = opts->bake_owner_gid;
+
+    /* CF-2a: publish the FS worker-pool size (same one-shot discipline;
+     * the per-connection threads only read it). */
+    g_fs_workers = fs_workers_resolve(opts->fs_workers);
 
     /* TLY-A2-impl-2: client-mode dispatch BEFORE the mount-related
      * argument checks. Client mode validates its own argument shape

@@ -9,6 +9,7 @@
 
 add_library(stm_stratumd STATIC
     serve.c
+    fs_pool.c
     corvus_notify.c
     dataset_pattern.c
     peer_creds.c
