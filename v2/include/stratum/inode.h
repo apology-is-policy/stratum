@@ -19,13 +19,12 @@
  *   - In-memory only. Persistence (per-dataset inode tree backed by
  *     the existing btree_store envelope) lands at P8-POSIX-1b
  *     alongside the STM_UB_VERSION 23 → 24 format break.
- *   - Alloc-fresh only — `stm_inode_alloc` always returns
- *     `next_ino++`. Re-use of FREED inos is deferred to P8-POSIX-1b.
- *     The (ino, si_gen) uniqueness invariant still holds: every
- *     freshly-allocated ino has si_gen=0 and the same ino is never
- *     issued twice (no AllocReused path yet). Future P8-POSIX-1b
- *     add the reuse path with si_gen += 1, exactly as inode.tla
- *     models AllocReused.
+ *   - (HISTORICAL — superseded; R175 SA-2) "Alloc-fresh only" was
+ *     the P8-POSIX-1 MVP state. FREED-ino reuse with si_gen += 1
+ *     (inode.tla's AllocReused) IS implemented today — see the
+ *     "Allocation policy" section below (in_find_freed: prefer
+ *     reuse, fall back to `next_ino++`). The (ino, si_gen)
+ *     tuple-uniqueness invariant holds on both paths.
  *   - No nlink-driven cascade-free yet — caller-driven Free only.
  *     nlink semantics + auto-delete on nlink == 0 land at P8-POSIX-3.
  *   - No tagged data union state machine (extent vs inline vs

@@ -2967,8 +2967,14 @@ static stm_status scan_subtree(stm_btree_engine *eng, eng_node *node,
  * carries the backing msg structs, *win the sorted view pointers;
  * both freed by the caller (free(), never eng_msg_array_free — the
  * bytes are borrowed). A SEALED head sets *sealed. Chain seqs sit
- * strictly above every buffered seq, so overlay_merge's newest-wins
- * comparisons compose unchanged.
+ * strictly above every buffered seq PER KEY — that rests on the
+ * _concurrent mutators' per-key caller obligation (R175 F4, see
+ * btree_engine.h): seq is fetch_add'd BEFORE the CAS prepend, so
+ * mint order can trail prepend order across KEYS, but same-key
+ * writers are externally serialized (the subsystem idx->lock in
+ * production), so per-key chain seqs stay above folded/buffered
+ * seqs and overlay_merge's per-key newest-wins comparisons compose
+ * unchanged.
  */
 static stm_status chain_window_build(const eng_node *root, bool bounded,
                                      const void *lo, size_t lo_len,

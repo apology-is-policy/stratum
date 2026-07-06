@@ -328,8 +328,12 @@ Key as-built decisions (see `phase-9.8-design.md` §7.2.1):
 
 Regression: `test_fs.c::fs_be_port_shared_engine_uncommitted_roundtrip` writes
 from each subsystem onto the shared latched engine and reads them all back
-uncommitted (non-vacuous both ways — a serial write funnel refuses on the latch;
-a serial read funnel misses the chain). The existing 69-test suite is itself a
+uncommitted (non-vacuous via the WRITE leg: a serial write funnel refuses on the
+latched root with STM_ENOTSUPPORTED — neutering `in_engine_put` fails the test at
+the chmod. The READ funnels are NOT pinned by this test: the serial lookup is
+itself chain-aware, so a neutered read funnel would still pass — the read move is
+prosecuted by behavior-parity across the suite, per the corrected 7.2.1
+rationale). The existing 69-test suite is itself a
 regime-purity + chain-aware-read regression (a partial port fails it).
 
 ## Known caveats / footguns

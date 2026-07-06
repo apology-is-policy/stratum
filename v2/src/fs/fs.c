@@ -2570,7 +2570,7 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
             stm_ebr_exit(ebr);
             return STM_ENOTDIR;
         }
-    } else if (ps != STM_ECORRUPT) {
+    } else if (ps != STM_ECORRUPT && ps != STM_EBUSY) {
         stm_ebr_exit(ebr);
         return ps;
     } else {
@@ -2589,7 +2589,7 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
         *out_child_ino = child_ino;
         return STM_OK;
     }
-    if (ds != STM_ECORRUPT) return ds;
+    if (ds != STM_ECORRUPT && ds != STM_EBUSY) return ds;
 
     /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
 lookup_fallback:
@@ -3569,7 +3569,7 @@ stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_status s = stm_inode_lookup_concurrent(iidx, ebr, dataset_id, ino,
                                                 out_value);
     stm_ebr_exit(ebr);
-    if (s != STM_ECORRUPT) return s;
+    if (s != STM_ECORRUPT && s != STM_EBUSY) return s;
 
     /* R171 P1-1 SH-fallback. A wait-free reader can observe a torn
      * inode-value decode (in_validate_value → STM_ECORRUPT) when a
@@ -3579,7 +3579,26 @@ stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * idx-mutex excludes us from the torn window. The fallback turns
      * a transient STM_ECORRUPT into a coherent answer at the cost of
      * one round-trip on the slow path. BE-prepend (#1218) closes the
-     * underlying race; this fallback becomes a no-op once it lands. */
+     * underlying race; this fallback becomes a no-op once it lands.
+     *
+     * R175 F2: STM_EBUSY joins the trigger set at EVERY wait-free
+     * fallback (this comment is the canonical rationale). The
+     * _concurrent engine ops surface transient seal/tombstone
+     * back-pressure from the mini-consolidation as STM_EBUSY (the
+     * R174-F2 retriable contract). What the SH fallback excludes
+     * (round-2 F2 precision): the subsystem idx->lock excludes
+     * SAME-subsystem writers and their inline minis, and SH-vs-EX
+     * excludes the commit finalize + pending.active. The GET-shaped
+     * fallbacks re-read through the chunk-10 _concurrent funnels (no
+     * serial_mu), so a CROSS-subsystem writer's mini on the shared
+     * engine can still seal mid-fallback: the fallback NARROWS the
+     * EBUSY leak to a 65536-consecutive-seal bounded-retry residue
+     * rather than eliminating it, and a residual EBUSY stays within
+     * the retriable contract. The deterministic no-seal claim holds
+     * only for the scan-shaped legs (readdir / listxattr), whose
+     * serial scan_range holds serial_mu for the whole walk.
+     * Unreachable single-connection (the mini runs inline in the
+     * writer's own call); load-bearing under the CF-2 pool. */
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
     iidx = stm_sync_inode_index(fs->sync);
@@ -4281,7 +4300,7 @@ stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         stm_status ls = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
                                                        ino, &iv);
         stm_ebr_exit(ebr);
-        if (ls == STM_ECORRUPT) {
+        if (ls == STM_ECORRUPT || ls == STM_EBUSY) {
             /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
             pthread_rwlock_rdlock(&fs->global);
             FS_GUARD_READ(fs);
@@ -4602,7 +4621,7 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_ebr_enter(ebr);
     stm_status ls = stm_inode_lookup_concurrent(iidx, ebr, dataset_id, ino, &iv);
     stm_ebr_exit(ebr);
-    if (ls == STM_ECORRUPT) {
+    if (ls == STM_ECORRUPT || ls == STM_EBUSY) {
         /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
         pthread_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
@@ -4664,7 +4683,7 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
     bool need_fallback = false;
     stm_status sps = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
                                                     parent_ino, &pv);
-    if (sps == STM_ECORRUPT) {
+    if (sps == STM_ECORRUPT || sps == STM_EBUSY) {
         need_fallback = true;
     } else if (sps != STM_OK) {
         stm_ebr_exit(ebr);
@@ -4683,7 +4702,7 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
                                                          name, name_len,
                                                          &child_ino, &child_gen_ignored,
                                                          &child_type);
-        if (ds == STM_ECORRUPT) {
+        if (ds == STM_ECORRUPT || ds == STM_EBUSY) {
             need_fallback = true;
         } else if (ds != STM_OK) {
             stm_ebr_exit(ebr);
@@ -4705,7 +4724,7 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
     if (!need_fallback) {
         stm_status cs = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
                                                        child_ino, &cv);
-        if (cs == STM_ECORRUPT) {
+        if (cs == STM_ECORRUPT || cs == STM_EBUSY) {
             need_fallback = true;
         } else if (cs != STM_OK) {
             stm_ebr_exit(ebr);
@@ -4823,7 +4842,7 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
     stm_ebr_enter(ebr);
     stm_status ls = stm_inode_lookup_concurrent(iidx, ebr, ds, ino, &v);
     stm_ebr_exit(ebr);
-    if (ls == STM_ECORRUPT) {
+    if (ls == STM_ECORRUPT || ls == STM_EBUSY) {
         /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
         pthread_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
@@ -5539,7 +5558,7 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
     struct stm_inode_value dv = {0};
     stm_status ds = fs_load_parent_dir_concurrent(iidx, ebr, dataset_id,
                                                      dir_ino, &dv);
-    if (ds == STM_ECORRUPT) need_fallback = true;
+    if (ds == STM_ECORRUPT || ds == STM_EBUSY) need_fallback = true;
     else if (ds != STM_OK) {
         stm_ebr_exit(ebr);
         return ds;
@@ -5592,7 +5611,7 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
                                                              dir_ino, &dirent_cursor,
                                                              batch, dirent_max,
                                                              &batch_n);
-            if (rs == STM_ECORRUPT) {
+            if (rs == STM_ECORRUPT || rs == STM_EBUSY) {
                 free(batch);
                 need_fallback = true;
             } else if (rs != STM_OK) {
@@ -5894,8 +5913,8 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                         value_buf, value_max, out_size);
     }
     stm_ebr_exit(ebr);
-    if (is != STM_OK && is != STM_ECORRUPT) return is;
-    if (is == STM_OK && s != STM_ECORRUPT) return s;
+    if (is != STM_OK && is != STM_ECORRUPT && is != STM_EBUSY) return is;
+    if (is == STM_OK && s != STM_ECORRUPT && s != STM_EBUSY) return s;
 
     /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
     pthread_rwlock_rdlock(&fs->global);
@@ -5952,7 +5971,7 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     memset(&iv, 0, sizeof iv);
     stm_status ps = stm_inode_lookup_concurrent(iidx, ebr,
                                                   dataset_id, ino, &iv);
-    if (ps == STM_ECORRUPT) need_fallback = true;
+    if (ps == STM_ECORRUPT || ps == STM_EBUSY) need_fallback = true;
     else if (ps != STM_OK) {
         stm_ebr_exit(ebr);
         return ps;
@@ -5965,7 +5984,7 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         /* First pass: probe the count. */
         stm_status ps0 = stm_xattr_list_concurrent(xidx, ebr, dataset_id, ino,
                                                       NULL, 0, &n_total);
-        if (ps0 == STM_ECORRUPT) need_fallback = true;
+        if (ps0 == STM_ECORRUPT || ps0 == STM_EBUSY) need_fallback = true;
         else if (ps0 != STM_OK) {
             stm_ebr_exit(ebr);
             return ps0;
@@ -6000,10 +6019,12 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
          *     max_entries (sized to the wait-free pass-1 count) and
          *     refused. R172 P1-1: pre-R172 this propagated as a
          *     spurious "buffer too small" lie to the caller.
-         * All three fall to the SH-fallback, where fs->global SH
+         *   - STM_EBUSY: transient seal/tombstone back-pressure from
+         *     the mini-consolidation (R175 F2; see stm_fs_stat).
+         * All four fall to the SH-fallback, where fs->global SH
          * excludes fs->global EX (writers) so the two passes see a
          * consistent index. */
-        if (ls == STM_ECORRUPT || ls == STM_ERANGE
+        if (ls == STM_ECORRUPT || ls == STM_ERANGE || ls == STM_EBUSY
             || (ls == STM_OK && got != n_total)) {
             free(batch);
             batch = NULL;

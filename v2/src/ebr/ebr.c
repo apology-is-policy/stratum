@@ -372,8 +372,10 @@ void stm_ebr_shutdown(void)
         (void)drain_list_all(head);
     }
 
-    /* Free dead thread entries. We keep alive ones (should not happen if
-     * caller observed the contract). */
+    /* Free EVERY thread entry, alive or dead -- shutdown is
+     * process-teardown-only (see ebr.h); there is no liveness check,
+     * and a surviving thread's TLS-cached handle dangles after this
+     * (R175 F6 / round-2 F1). */
     stm_ebr_thread *t = atomic_load(&g.threads);
     atomic_store(&g.threads, NULL);
     while (t) {

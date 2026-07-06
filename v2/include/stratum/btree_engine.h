@@ -336,6 +336,16 @@ stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
  * which a racing consolidation may retire). Writers may run
  * concurrently with readers, other _concurrent writers, and commits.
  *
+ * PER-KEY caller obligation (R175 F4): concurrent writers to the SAME
+ * key must be externally serialized (production: each subsystem's
+ * idx->lock). The delta seq is minted (fetch_add) BEFORE the CAS
+ * prepend, so two racing same-key writers could land seqs out of
+ * prepend order — and a mini-consolidation between them could fold
+ * the newer seq into the buffer while the older lands on the fresh
+ * chain, breaking the per-key "chain seqs sit above buffered seqs"
+ * resolution invariant (lookup-vs-scan divergence). Cross-KEY
+ * mint/prepend divergence is harmless: every resolver is per-key.
+ *
  * At ENG_CONSOLIDATE_THRESHOLD chain depth the calling thread
  * opportunistically consolidates the chain into the root's message
  * buffer (trylock; bails on any contention — bounded read cost, never

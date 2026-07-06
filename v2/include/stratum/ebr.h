@@ -149,8 +149,18 @@ stm_status stm_ebr_init(void);
 
 /*
  * Teardown. Forces reclamation of all pending retires regardless of
- * active readers (only safe at shutdown). Panics if any threads are
- * still registered.
+ * active readers (only safe at shutdown). Frees every thread struct
+ * on the registry, alive or dead -- there is no liveness check (R175
+ * round-2 F1: an earlier "panics if still registered" claim was
+ * never true of the code).
+ *
+ * Interaction with stm_ebr_thread_current (R175 F6): shutdown frees
+ * every registered thread struct, but a surviving thread's pthread-TLS
+ * cache still points at its (now freed) handle — a later
+ * thread_current / enter on that thread is a UAF. Call shutdown only
+ * when no thread will touch EBR again (process teardown). No
+ * production caller exists today; a re-init-capable lifecycle needs a
+ * generation check in thread_current first.
  */
 void stm_ebr_shutdown(void);
 

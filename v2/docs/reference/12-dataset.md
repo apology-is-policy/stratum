@@ -261,7 +261,8 @@ pool-touching implicit abort of a flushed-but-unfinalized commit
 still runs synchronously in the closer's thread. Serial ops and
 `_concurrent` writers are excluded by the close callers' fs-level EX
 envelope. The throwaway engines (`verify_engine_at` /
-`collect_engine_paddrs_at` — opened locally, never slot-published)
+`collect_engine_paddrs_at` / `scan_engine_range_at` /
+`lookup_engine_at` — opened locally, never slot-published)
 correctly keep immediate destroy.
 
 `set_engine_root` (9.7-impl-4) is the rollback primitive: it forces

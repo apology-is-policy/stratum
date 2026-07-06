@@ -520,9 +520,13 @@ static bool count_iter_cb(const stm_dataset_entry *e, void *ctx) {
 }
 
 /* ------------------------------------------------------------------ */
-/* R28 P2-2: realloc path — exercise capacity doubling beyond the    */
+/* R28 P2-2: growth path — exercise capacity doubling beyond the     */
 /* initial 8 slots. Lookup of an early id must remain valid post-     */
-/* grow (the slot's content survives realloc, since we copy by value).*/
+/* grow. (The original "content survives realloc, we copy by value"   */
+/* argument was FALSIFIED the day 9.7-impl-2 handed a slot's          */
+/* &engine_ctx to a long-lived engine — R175 F1; slots are now        */
+/* per-slot heap allocations with construction-stable addresses. The  */
+/* engine-open growth case is dataset_engine_survives_slot_growth.)   */
 /* ------------------------------------------------------------------ */
 
 STM_TEST(dataset_grows_past_initial_capacity) {
@@ -2461,6 +2465,95 @@ STM_TEST(dataset_scan_engine_range_empty_triple) {
     stm_bootstrap_close(b);
     stm_bdev_close(d);
     unlink(dsp_tmp_path);
+}
+
+/* ====================================================================== */
+/* R175 F1: slot-array growth must not dangle an OPEN engine's vt_ctx.    */
+/*                                                                          */
+/* Pre-R175 idx->slots was a flat dataset_slot array: append_slot_locked's */
+/* realloc past the 8-slot boundary MOVED it, and every open engine's      */
+/* cached vt_ctx (&slot->engine_ctx, captured at engine open) pointed      */
+/* into the freed old array — the next engine I/O read freed memory and    */
+/* dereferenced garbage boot/bdev pointers. Reachable single-threaded:     */
+/* open an engine, create datasets past the boundary, touch the engine.    */
+/* slots[] is now a POINTER array of per-slot heap allocations, so a       */
+/* slot's address is stable for its lifetime by construction. The UAF     */
+/* leg is PROVEN non-vacuous on macOS via guard-malloc (pre-fix:          */
+/*   DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib ./tests/test_dataset */
+/* SIGSEGVs inside THIS test; post-fix the full binary passes) and is     */
+/* deterministic under ASan (the owed Linux pass, R174 ob. #3); the       */
+/* functional leg — post-growth insert + full flush/finalize commit +      */
+/* readback through the pre-growth engine — is asserted here.              */
+/* ====================================================================== */
+
+STM_TEST(dataset_engine_survives_slot_growth) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+
+    dsp_make_tmp("eng_grow");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    /* Open the ROOT engine while the slot array is at its initial
+     * capacity (root = slot 0 of 8) and write through it. */
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID,
+                                                 &eng));
+    uint8_t key[16] = { 0x01, 0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0x77 };
+    uint8_t val[8]  = { 9,9,9,9, 1,2,3,4 };
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, key, sizeof key,
+                                            val, sizeof val));
+
+    /* Cross the growth boundary hard: 8 -> 16 -> 32 -> 64. Pre-R175
+     * every doubling here moved slot 0 out from under eng->vt_ctx. */
+    enum { GROW_N = 40 };
+    for (int i = 0; i < GROW_N; i++) {
+        char name[16];
+        snprintf(name, sizeof name, "grow_%d", i);
+        uint64_t cid = 0;
+        STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                                  name, &cid));
+    }
+
+    /* Engine I/O through the pre-growth engine: a second insert, then
+     * a full flush + finalize commit — vt->reserve/write/free all
+     * dereference vt_ctx (boot/bdev/snap_idx) for real pool I/O. */
+    uint8_t key2[16] = { 0x01, 0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0x78 };
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, key2, sizeof key2,
+                                            val, sizeof val));
+    STM_ASSERT_OK(stm_dataset_index_commit_engines_flush(idx, 1u));
+    STM_ASSERT_OK(stm_dataset_index_commit_engines_finalize(idx));
+
+    /* Read both keys back through the still-open engine. */
+    bool found = false; void *vbuf = NULL; size_t vlen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, key, sizeof key,
+                                            &found, &vbuf, &vlen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_TRUE(vlen == sizeof val && memcmp(vbuf, val, vlen) == 0);
+    free(vbuf); vbuf = NULL;
+    found = false;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, key2, sizeof key2,
+                                            &found, &vbuf, &vlen));
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_TRUE(vlen == sizeof val && memcmp(vbuf, val, vlen) == 0);
+    free(vbuf); vbuf = NULL;
+
+    stm_dataset_index_close(idx);
+    for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
+        (void)stm_ebr_try_advance();
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+    stm_ebr_thread_free(me);
 }
 
 /* ====================================================================== */

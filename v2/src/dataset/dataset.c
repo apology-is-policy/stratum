@@ -134,18 +134,36 @@ typedef struct {
      * stm_dataset_index_set_snap_idx at mount); dataset_id mirrors
      * slot->e.id.
      *
-     * Lifetime: tied to the slot. Engine destruction at
+     * Lifetime: tied to the slot. Engine RETIRE at
      * `dataset_engine_close_locked` happens-before the slot's
-     * deallocation. The engine's vt_ctx pointer (`&slot->engine_ctx`)
-     * stays valid through the engine's lifetime per the engine_store.h
-     * borrowed-pointer contract.
+     * deallocation -- but since 9b the RAM half of destruction
+     * (engine_free_ram_cb) is EBR-DEFERRED and can run AFTER the slot
+     * is freed (index close / load swap). Sound ONLY because the
+     * deferred destructor is pure-RAM and never dereferences
+     * vt/vt_ctx (engine.c's contract); the sole vt-touching half
+     * (engine_implicit_abort_pending) runs synchronously inside
+     * retire, before the slot free. Do NOT add a vt_ctx deref to the
+     * deferred destructor (R175 round-2 F3). Within the engine's LIVE
+     * lifetime the vt_ctx pointer (`&slot->engine_ctx`) stays valid
+     * per the engine_store.h borrowed-pointer contract -- guaranteed
+     * BY CONSTRUCTION since R175 F1: slots[] holds per-slot heap
+     * POINTERS, so index growth never moves a slot. (Pre-R175 the
+     * flat dataset_slot array's realloc past the 8-slot boundary
+     * dangled every open engine's vt_ctx -- a single-threaded UAF on
+     * the next engine I/O.)
      */
     stm_engine_store_ctx engine_ctx;
 } dataset_slot;
 
 struct stm_dataset_index {
     pthread_mutex_t lock;
-    dataset_slot   *slots;        /* dynamic array indexed by slot index */
+    dataset_slot  **slots;        /* per-slot heap allocations, indexed by
+                                   * slot index. POINTER array (R175 F1): a
+                                   * slot's ADDRESS is stable for its whole
+                                   * lifetime (an open engine captures
+                                   * &slot->engine_ctx as vt_ctx), so growth
+                                   * moves only the pointer array, never a
+                                   * slot. */
     size_t          slots_len;    /* count of allocated slots */
     size_t          slots_cap;    /* capacity */
     uint64_t        next_id;      /* next id to assign — monotonic */
@@ -268,7 +286,7 @@ static void dataset_engine_close_locked(dataset_slot *slot);
 
 static size_t find_slot_locked(const stm_dataset_index *idx, uint64_t id) {
     for (size_t i = 0; i < idx->slots_len; i++) {
-        if (idx->slots[i].e.id == id) return i;
+        if (idx->slots[i]->e.id == id) return i;
     }
     return (size_t)-1;
 }
@@ -280,7 +298,7 @@ static size_t find_slot_locked(const stm_dataset_index *idx, uint64_t id) {
 static bool is_present_locked(const stm_dataset_index *idx, uint64_t id) {
     if (id == STM_DATASET_NO_PARENT) return false;
     size_t s = find_slot_locked(idx, id);
-    return s != (size_t)-1 && idx->slots[s].present;
+    return s != (size_t)-1 && idx->slots[s]->present;
 }
 
 /*
@@ -293,7 +311,7 @@ static bool sibling_name_taken_locked(const stm_dataset_index *idx,
                                         const uint8_t *name, uint32_t name_len,
                                         uint64_t exclude_id) {
     for (size_t i = 0; i < idx->slots_len; i++) {
-        const dataset_slot *s = &idx->slots[i];
+        const dataset_slot *s = idx->slots[i];
         if (!s->present) continue;
         if (s->e.id == exclude_id) continue;
         if (s->e.parent_id != parent_id) continue;
@@ -325,7 +343,7 @@ static bool is_descendant_or_self_locked(const stm_dataset_index *idx,
         if (cur == STM_DATASET_NO_PARENT) return false;
         size_t s = find_slot_locked(idx, cur);
         if (s == (size_t)-1) return false;        /* unallocated id */
-        cur = idx->slots[s].e.parent_id;
+        cur = idx->slots[s]->e.parent_id;
     }
     return false;  /* exceeded bound — treat as no path */
 }
@@ -335,7 +353,7 @@ static bool is_descendant_or_self_locked(const stm_dataset_index *idx,
  */
 static bool has_children_locked(const stm_dataset_index *idx, uint64_t id) {
     for (size_t i = 0; i < idx->slots_len; i++) {
-        const dataset_slot *s = &idx->slots[i];
+        const dataset_slot *s = idx->slots[i];
         if (s->present && s->e.parent_id == id) return true;
     }
     return false;
@@ -348,14 +366,19 @@ static bool has_children_locked(const stm_dataset_index *idx, uint64_t id) {
 static size_t append_slot_locked(stm_dataset_index *idx) {
     if (idx->slots_len == idx->slots_cap) {
         size_t new_cap = idx->slots_cap == 0 ? 8 : idx->slots_cap * 2;
-        dataset_slot *new_slots = realloc(idx->slots,
-                                            new_cap * sizeof(dataset_slot));
+        dataset_slot **new_slots = realloc(idx->slots,
+                                             new_cap * sizeof(dataset_slot *));
         if (!new_slots) return (size_t)-1;
         idx->slots = new_slots;
         idx->slots_cap = new_cap;
     }
+    /* Per-slot heap allocation (R175 F1): the slot's address must stay
+     * stable for its whole lifetime, so slots are never stored by value
+     * in the growable array. */
+    dataset_slot *ns = calloc(1, sizeof *ns);
+    if (!ns) return (size_t)-1;
     size_t new_idx = idx->slots_len++;
-    memset(&idx->slots[new_idx], 0, sizeof(dataset_slot));
+    idx->slots[new_idx] = ns;
     return new_idx;
 }
 
@@ -401,18 +424,20 @@ stm_status stm_dataset_index_create(uint64_t current_txg,
      * sentinel. */
     size_t root_slot = append_slot_locked(idx);
     if (root_slot == (size_t)-1) {
+        free(idx->slots);   /* the pointer array may exist when only the
+                             * per-slot calloc failed */
         pthread_mutex_destroy(&idx->lock);
         free(idx);
         return STM_ENOMEM;
     }
-    idx->slots[root_slot].e.id          = STM_DATASET_ROOT_ID;
-    idx->slots[root_slot].e.parent_id   = STM_DATASET_NO_PARENT;
-    idx->slots[root_slot].e.name_len    = 0;
-    idx->slots[root_slot].e.name[0]     = '\0';
-    idx->slots[root_slot].e.created_txg = current_txg;
-    idx->slots[root_slot].e.flags       = 0;
-    idx->slots[root_slot].e.next_ino    = 0;
-    idx->slots[root_slot].present       = true;
+    idx->slots[root_slot]->e.id          = STM_DATASET_ROOT_ID;
+    idx->slots[root_slot]->e.parent_id   = STM_DATASET_NO_PARENT;
+    idx->slots[root_slot]->e.name_len    = 0;
+    idx->slots[root_slot]->e.name[0]     = '\0';
+    idx->slots[root_slot]->e.created_txg = current_txg;
+    idx->slots[root_slot]->e.flags       = 0;
+    idx->slots[root_slot]->e.next_ino    = 0;
+    idx->slots[root_slot]->present       = true;
 
     idx->next_id     = 2;  /* root = 1 used; next allocation starts at 2 */
     idx->current_txg = current_txg;
@@ -430,7 +455,8 @@ void stm_dataset_index_close(stm_dataset_index *idx) {
      * engine NULL'd via stm_dataset_destroy, but a bug there would
      * leak the engine here. */
     for (size_t i = 0; i < idx->slots_len; i++) {
-        dataset_engine_close_locked(&idx->slots[i]);
+        dataset_engine_close_locked(idx->slots[i]);
+        free(idx->slots[i]);
     }
     pthread_mutex_destroy(&idx->lock);
     free(idx->slots);
@@ -509,7 +535,7 @@ stm_status stm_dataset_create_child(stm_dataset_index *idx,
     idx->current_txg += 1;
 
     uint64_t id = idx->next_id++;
-    dataset_slot *s = &idx->slots[new_slot];
+    dataset_slot *s = idx->slots[new_slot];
     s->e.id              = id;
     s->e.parent_id       = parent_id;
     s->e.name_len        = (uint32_t)name_len;
@@ -534,7 +560,7 @@ stm_status stm_dataset_destroy(stm_dataset_index *idx, uint64_t id) {
 
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
@@ -567,8 +593,8 @@ stm_status stm_dataset_destroy(stm_dataset_index *idx, uint64_t id) {
      * them. That is correct iff they are genuinely dead; if a clone/snapshot
      * still references shared subtrees, destroy must not have flipped present
      * while a holder exists (the existing snapshot-hold discipline). */
-    dataset_engine_close_locked(&idx->slots[s]);
-    idx->slots[s].present = false;
+    dataset_engine_close_locked(idx->slots[s]);
+    idx->slots[s]->present = false;
     idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
@@ -586,11 +612,11 @@ stm_status stm_dataset_rename(stm_dataset_index *idx, uint64_t id,
 
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
-    uint64_t parent_id = idx->slots[s].e.parent_id;
+    uint64_t parent_id = idx->slots[s]->e.parent_id;
     if (sibling_name_taken_locked(idx, parent_id,
                                     (const uint8_t *)new_name,
                                     (uint32_t)name_len, id)) {
@@ -599,14 +625,14 @@ stm_status stm_dataset_rename(stm_dataset_index *idx, uint64_t id,
     }
     /* R31 P3-2: no-op rename (same name) shouldn't dirty the handle —
      * matches set_pool_default's idempotency guard. */
-    if (idx->slots[s].e.name_len == name_len &&
-        memcmp(idx->slots[s].e.name, new_name, name_len) == 0) {
+    if (idx->slots[s]->e.name_len == name_len &&
+        memcmp(idx->slots[s]->e.name, new_name, name_len) == 0) {
         must_unlock(&idx->lock);
         return STM_OK;
     }
-    idx->slots[s].e.name_len = (uint32_t)name_len;
-    memcpy(idx->slots[s].e.name, new_name, name_len);
-    idx->slots[s].e.name[name_len] = '\0';
+    idx->slots[s]->e.name_len = (uint32_t)name_len;
+    memcpy(idx->slots[s]->e.name, new_name, name_len);
+    idx->slots[s]->e.name[name_len] = '\0';
     idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
@@ -628,7 +654,7 @@ stm_status stm_dataset_move(stm_dataset_index *idx, uint64_t id,
     must_lock(&idx->lock);
 
     size_t s = find_slot_locked(idx, id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
@@ -644,12 +670,12 @@ stm_status stm_dataset_move(stm_dataset_index *idx, uint64_t id,
     }
     /* Sibling-name uniqueness in the new parent's children. */
     if (sibling_name_taken_locked(idx, new_parent_id,
-                                    idx->slots[s].e.name,
-                                    idx->slots[s].e.name_len, id)) {
+                                    idx->slots[s]->e.name,
+                                    idx->slots[s]->e.name_len, id)) {
         must_unlock(&idx->lock);
         return STM_EEXIST;
     }
-    idx->slots[s].e.parent_id = new_parent_id;
+    idx->slots[s]->e.parent_id = new_parent_id;
     idx->dirty = true;
     /* P7-CAS-14: a Move changes the moved dataset's parent chain →
      * effective INHERITABLE values change for the dataset and every
@@ -667,11 +693,11 @@ stm_status stm_dataset_lookup(const stm_dataset_index *idx, uint64_t id,
     pthread_mutex_t *lock = dataset_lock(idx);
     must_lock(lock);
     size_t s = find_slot_locked(idx, id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(lock);
         return STM_ENOENT;
     }
-    *out = idx->slots[s].e;
+    *out = idx->slots[s]->e;
     must_unlock(lock);
     return STM_OK;
 }
@@ -696,7 +722,7 @@ stm_status stm_dataset_lookup_child_by_name(const stm_dataset_index *idx,
         return STM_ENOENT;
     }
     for (size_t i = 0; i < idx->slots_len; i++) {
-        const dataset_slot *s = &idx->slots[i];
+        const dataset_slot *s = idx->slots[i];
         if (!s->present) continue;
         if (s->e.parent_id != parent_id) continue;
         if (s->e.name_len != (uint32_t)name_len) continue;
@@ -717,7 +743,7 @@ stm_status stm_dataset_count(const stm_dataset_index *idx,
     must_lock(lock);
     size_t n = 0;
     for (size_t i = 0; i < idx->slots_len; i++) {
-        if (idx->slots[i].present) n++;
+        if (idx->slots[i]->present) n++;
     }
     *out_count = n;
     must_unlock(lock);
@@ -736,7 +762,7 @@ stm_status stm_dataset_children_count(const stm_dataset_index *idx,
     }
     size_t n = 0;
     for (size_t i = 0; i < idx->slots_len; i++) {
-        if (idx->slots[i].present && idx->slots[i].e.parent_id == parent_id) n++;
+        if (idx->slots[i]->present && idx->slots[i]->e.parent_id == parent_id) n++;
     }
     *out_count = n;
     must_unlock(lock);
@@ -752,8 +778,8 @@ stm_status stm_dataset_iter(const stm_dataset_index *idx,
      * (next_id is monotonic), so a linear walk over slots[] is already
      * id-ordered. */
     for (size_t i = 0; i < idx->slots_len; i++) {
-        if (!idx->slots[i].present) continue;
-        if (!cb(&idx->slots[i].e, ctx)) break;
+        if (!idx->slots[i]->present) continue;
+        if (!cb(&idx->slots[i]->e, ctx)) break;
     }
     must_unlock(lock);
     return STM_OK;
@@ -808,9 +834,9 @@ static uint64_t effective_property_locked(const stm_dataset_index *idx,
     uint64_t cur = id;
     for (size_t hops = 0; hops <= idx->slots_len; hops++) {
         size_t s = find_slot_locked(idx, cur);
-        if (s == (size_t)-1 || !idx->slots[s].present) break;
-        if (idx->slots[s].local_set[p]) {
-            return idx->slots[s].local_value[p];
+        if (s == (size_t)-1 || !idx->slots[s]->present) break;
+        if (idx->slots[s]->local_set[p]) {
+            return idx->slots[s]->local_value[p];
         }
         /* Non-inheritable: short-circuit to pool default once we've
          * checked d's own slot (no parent walk).
@@ -819,7 +845,7 @@ static uint64_t effective_property_locked(const stm_dataset_index *idx,
         /* Inheritable / Immutable: walk to parent. (Immutable is
          * inherited if not locally set — see ARCH §8.4.2 encryption
          * "can be inherited from parent or declared at creation".) */
-        uint64_t parent = idx->slots[s].e.parent_id;
+        uint64_t parent = idx->slots[s]->e.parent_id;
         if (parent == STM_DATASET_NO_PARENT) break;
         cur = parent;
     }
@@ -850,7 +876,7 @@ stm_status stm_dataset_set_property(stm_dataset_index *idx, uint64_t id,
     if (!prop_in_range(p)) return STM_EINVAL;
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
@@ -860,12 +886,12 @@ stm_status stm_dataset_set_property(stm_dataset_index *idx, uint64_t id,
      * `immutable_was_mutated` ghost flag and BuggyMutateEncryption
      * gate; the impl rejects at the action's enabling condition. */
     if (stm_property_kind_of(p) == STM_PROP_KIND_IMMUTABLE
-        && idx->slots[s].local_set[p]) {
+        && idx->slots[s]->local_set[p]) {
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
-    idx->slots[s].local_set[p]   = true;
-    idx->slots[s].local_value[p] = value;
+    idx->slots[s]->local_set[p]   = true;
+    idx->slots[s]->local_value[p] = value;
     idx->dirty = true;
     /* P7-CAS-14: bump the property-mutation gen (see set_pool_default). */
     atomic_fetch_add_explicit(&idx->prop_mutation_gen, 1u,
@@ -880,7 +906,7 @@ stm_status stm_dataset_clear_property(stm_dataset_index *idx, uint64_t id,
     if (!prop_in_range(p)) return STM_EINVAL;
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
@@ -894,8 +920,8 @@ stm_status stm_dataset_clear_property(stm_dataset_index *idx, uint64_t id,
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
-    if (idx->slots[s].local_set[p]) {
-        idx->slots[s].local_set[p] = false;
+    if (idx->slots[s]->local_set[p]) {
+        idx->slots[s]->local_set[p] = false;
         /* Leave local_value[p] in place; it's not observed when
          * local_set[p] is FALSE. */
         idx->dirty = true;
@@ -915,7 +941,7 @@ stm_status stm_dataset_effective_property(const stm_dataset_index *idx,
     pthread_mutex_t *lock = dataset_lock(idx);
     must_lock(lock);
     size_t s = find_slot_locked(idx, id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(lock);
         return STM_ENOENT;
     }
@@ -984,7 +1010,7 @@ stm_status stm_dataset_create_clone(stm_dataset_index *idx,
     idx->current_txg += 1;
 
     uint64_t id = idx->next_id++;
-    dataset_slot *s = &idx->slots[new_slot];
+    dataset_slot *s = idx->slots[new_slot];
     s->e.id              = id;
     s->e.parent_id       = parent_id;
     s->e.name_len        = (uint32_t)name_len;
@@ -1007,16 +1033,16 @@ stm_status stm_dataset_promote(stm_dataset_index *idx, uint64_t id) {
     if (!idx) return STM_EINVAL;
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
     /* clone.tla::Promote precondition: dataset must be a clone. */
-    if (idx->slots[s].e.origin_snap_id == STM_DATASET_NO_ORIGIN) {
+    if (idx->slots[s]->e.origin_snap_id == STM_DATASET_NO_ORIGIN) {
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
-    idx->slots[s].e.origin_snap_id = STM_DATASET_NO_ORIGIN;
+    idx->slots[s]->e.origin_snap_id = STM_DATASET_NO_ORIGIN;
     idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
@@ -1037,7 +1063,7 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
     must_lock(lock);
     size_t n = 0;
     for (size_t i = 0; i < idx->slots_len; i++) {
-        const dataset_slot *s = &idx->slots[i];
+        const dataset_slot *s = idx->slots[i];
         if (!s->present) continue;
         if (s->e.origin_snap_id == snapshot_id) n++;
     }
@@ -1553,16 +1579,16 @@ stm_status stm_dataset_index_get_engine(stm_dataset_index *idx,
 
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, dataset_id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
-    stm_status rc = dataset_engine_open_locked(idx, &idx->slots[s]);
+    stm_status rc = dataset_engine_open_locked(idx, idx->slots[s]);
     if (rc != STM_OK) {
         must_unlock(&idx->lock);
         return rc;
     }
-    *out_engine = idx->slots[s].engine;
+    *out_engine = idx->slots[s]->engine;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -1574,11 +1600,11 @@ stm_status stm_dataset_index_close_engine(stm_dataset_index *idx,
 
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, dataset_id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
-    dataset_engine_close_locked(&idx->slots[s]);
+    dataset_engine_close_locked(idx->slots[s]);
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -1595,11 +1621,11 @@ stm_status stm_dataset_index_set_engine_root(stm_dataset_index *idx,
 
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, dataset_id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
+    if (s == (size_t)-1 || !idx->slots[s]->present) {
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
-    dataset_slot *slot = &idx->slots[s];
+    dataset_slot *slot = idx->slots[s];
 
     /* An un-finalised commit flush in progress is a caller-sequencing
      * bug — refuse rather than tear an engine down mid-three-phase. A
@@ -1884,7 +1910,7 @@ stm_status stm_dataset_index_lookup_engine_at(
  * Caller holds idx->lock. */
 static bool any_pending_flush_locked(const stm_dataset_index *idx) {
     for (size_t i = 0; i < idx->slots_len; i++) {
-        if (idx->slots[i].pending_flush) return true;
+        if (idx->slots[i]->pending_flush) return true;
     }
     return false;
 }
@@ -1912,7 +1938,7 @@ stm_status stm_dataset_index_commit_engines_flush(stm_dataset_index *idx,
      * On per-engine flush failure mid-walk, abort every previously-
      * flushed engine + restore each slot's saved pre-flush triple. */
     for (size_t i = 0; i < idx->slots_len; i++) {
-        dataset_slot *slot = &idx->slots[i];
+        dataset_slot *slot = idx->slots[i];
         if (!slot->present) continue;
         if (slot->engine == NULL) continue;
 
@@ -1938,7 +1964,7 @@ stm_status stm_dataset_index_commit_engines_flush(stm_dataset_index *idx,
              * but never overwrote slot->e.*), so just leave it. */
             bool restored_any = false;
             for (size_t j = 0; j < i; j++) {
-                dataset_slot *prior = &idx->slots[j];
+                dataset_slot *prior = idx->slots[j];
                 if (!prior->pending_flush) continue;
                 (void)stm_btree_engine_commit_abort(prior->engine);
                 /* Restore the saved triple. */
@@ -2002,7 +2028,7 @@ stm_status stm_dataset_index_commit_engines_finalize(stm_dataset_index *idx) {
      * cleared as bookkeeping. No-pending is the NORMAL case when no
      * dataset had an open engine at the paired flush — return STM_OK. */
     for (size_t i = 0; i < idx->slots_len; i++) {
-        dataset_slot *slot = &idx->slots[i];
+        dataset_slot *slot = idx->slots[i];
         if (!slot->pending_flush) continue;
         stm_status fs = stm_btree_engine_commit_finalize(slot->engine);
         if (fs != STM_OK) {
@@ -2029,7 +2055,7 @@ stm_status stm_dataset_index_commit_engines_abort(stm_dataset_index *idx) {
     must_lock(&idx->lock);
     bool restored_any = false;
     for (size_t i = 0; i < idx->slots_len; i++) {
-        dataset_slot *slot = &idx->slots[i];
+        dataset_slot *slot = idx->slots[i];
         if (!slot->pending_flush) continue;
         /* Discard the pending root + restore the saved triple. abort
          * is infallible after a successful flush per the engine
@@ -2110,7 +2136,7 @@ stm_status stm_dataset_index_reconcile_mark(stm_dataset_index *idx,
     }
 
     for (size_t i = 0; s == STM_OK && i < idx->slots_len; i++) {
-        dataset_slot *slot = &idx->slots[i];
+        dataset_slot *slot = idx->slots[i];
         if (!slot->present) continue;
         if (dataset_triple_is_empty(slot->e.di_tree_root, slot->e.di_root_gen))
             continue;
@@ -2147,8 +2173,8 @@ stm_status stm_dataset_index_set_next_id(stm_dataset_index *idx,
      * IdMonotonic on subsequent creates. Equal-or-greater advance is OK. */
     uint64_t max_present = 0;
     for (size_t i = 0; i < idx->slots_len; i++) {
-        if (!idx->slots[i].present) continue;
-        if (idx->slots[i].e.id > max_present) max_present = idx->slots[i].e.id;
+        if (!idx->slots[i]->present) continue;
+        if (idx->slots[i]->e.id > max_present) max_present = idx->slots[i]->e.id;
     }
     if (next_id <= max_present) {
         must_unlock(&idx->lock);
@@ -2193,7 +2219,7 @@ static stm_status ds_build_btree_locked(const stm_dataset_index *idx,
     uint8_t key[DS_KEY_LEN];
     uint8_t val[DS_VAL_MAX];
     for (size_t i = 0; i < idx->slots_len; i++) {
-        const dataset_slot *s = &idx->slots[i];
+        const dataset_slot *s = idx->slots[i];
         if (!s->present) continue;
         ds_encode_key(s->e.id, key);
         size_t vlen = ds_encode_dataset_value(s, val, sizeof val);
@@ -2309,7 +2335,7 @@ stm_status stm_dataset_index_commit(stm_dataset_index *idx,
 
 typedef struct {
     /* Shadow buffers (we own them until swap). */
-    dataset_slot *shadow_slots;
+    dataset_slot **shadow_slots;  /* pointer array, mirroring idx->slots */
     size_t        shadow_len;
     size_t        shadow_cap;
     uint64_t      shadow_pool_default[STM_PROP_COUNT];
@@ -2324,16 +2350,26 @@ typedef struct {
     stm_status    err;
 } ds_load_ctx;
 
+static void ds_shadow_free(ds_load_ctx *lc) {
+    for (size_t i = 0; i < lc->shadow_len; i++) free(lc->shadow_slots[i]);
+    free(lc->shadow_slots);
+    lc->shadow_slots = NULL;
+    lc->shadow_len = lc->shadow_cap = 0;
+}
+
 static stm_status ds_shadow_append(ds_load_ctx *lc, const dataset_slot *src) {
     if (lc->shadow_len == lc->shadow_cap) {
         size_t new_cap = lc->shadow_cap == 0 ? 8 : lc->shadow_cap * 2;
-        dataset_slot *new_buf = realloc(lc->shadow_slots,
-                                          new_cap * sizeof(dataset_slot));
+        dataset_slot **new_buf = realloc(lc->shadow_slots,
+                                           new_cap * sizeof(dataset_slot *));
         if (!new_buf) return STM_ENOMEM;
         lc->shadow_slots = new_buf;
         lc->shadow_cap = new_cap;
     }
-    lc->shadow_slots[lc->shadow_len++] = *src;
+    dataset_slot *ns = malloc(sizeof *ns);
+    if (!ns) return STM_ENOMEM;
+    *ns = *src;
+    lc->shadow_slots[lc->shadow_len++] = ns;
     return STM_OK;
 }
 
@@ -2378,7 +2414,7 @@ static int ds_load_iter(const void *k, size_t klen,
 static stm_status ds_validate_shadow(const ds_load_ctx *lc) {
     /* Pass 1: per-slot local checks. */
     for (size_t i = 0; i < lc->shadow_len; i++) {
-        const dataset_slot *si = &lc->shadow_slots[i];
+        const dataset_slot *si = lc->shadow_slots[i];
         if (!si->present) continue;
 
         if (si->e.id == STM_DATASET_ROOT_ID) {
@@ -2415,7 +2451,7 @@ static stm_status ds_validate_shadow(const ds_load_ctx *lc) {
         /* Parent must reference an existing shadow slot. */
         bool parent_found = false;
         for (size_t j = 0; j < lc->shadow_len; j++) {
-            if (lc->shadow_slots[j].e.id == si->e.parent_id) {
+            if (lc->shadow_slots[j]->e.id == si->e.parent_id) {
                 parent_found = true;
                 break;
             }
@@ -2426,7 +2462,7 @@ static stm_status ds_validate_shadow(const ds_load_ctx *lc) {
     /* Pass 2: cycle detection — every present slot's parent chain must
      * reach root within ≤ shadow_len steps. */
     for (size_t i = 0; i < lc->shadow_len; i++) {
-        const dataset_slot *si = &lc->shadow_slots[i];
+        const dataset_slot *si = lc->shadow_slots[i];
         if (!si->present) continue;
         uint64_t cur = si->e.id;
         bool reached_root = false;
@@ -2435,8 +2471,8 @@ static stm_status ds_validate_shadow(const ds_load_ctx *lc) {
             if (cur == STM_DATASET_NO_PARENT) return STM_ECORRUPT;
             bool found = false;
             for (size_t j = 0; j < lc->shadow_len; j++) {
-                if (lc->shadow_slots[j].e.id == cur) {
-                    cur = lc->shadow_slots[j].e.parent_id;
+                if (lc->shadow_slots[j]->e.id == cur) {
+                    cur = lc->shadow_slots[j]->e.parent_id;
                     found = true;
                     break;
                 }
@@ -2448,10 +2484,10 @@ static stm_status ds_validate_shadow(const ds_load_ctx *lc) {
 
     /* Pass 3: sibling-name uniqueness (per parent_id). */
     for (size_t i = 0; i < lc->shadow_len; i++) {
-        const dataset_slot *si = &lc->shadow_slots[i];
+        const dataset_slot *si = lc->shadow_slots[i];
         if (!si->present) continue;
         for (size_t j = i + 1; j < lc->shadow_len; j++) {
-            const dataset_slot *sj = &lc->shadow_slots[j];
+            const dataset_slot *sj = lc->shadow_slots[j];
             if (!sj->present) continue;
             if (si->e.parent_id != sj->e.parent_id) continue;
             if (si->e.name_len != sj->e.name_len) continue;
@@ -2501,12 +2537,12 @@ stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
     stm_btree_mt_free(t);
 
     if (sr != STM_OK) {
-        free(lc.shadow_slots);
+        ds_shadow_free(&lc);
         must_unlock(&idx->lock);
         return sr;
     }
     if (lc.err != STM_OK) {
-        free(lc.shadow_slots);
+        ds_shadow_free(&lc);
         must_unlock(&idx->lock);
         return lc.err;
     }
@@ -2514,7 +2550,7 @@ stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
      * corruption / tamper; refusing here keeps post-load_at invariants
      * identical to fresh-create. */
     if (!lc.saw_root) {
-        free(lc.shadow_slots);
+        ds_shadow_free(&lc);
         must_unlock(&idx->lock);
         return STM_ECORRUPT;
     }
@@ -2523,7 +2559,7 @@ stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
      * invariants before committing to in-RAM state. */
     stm_status vs = ds_validate_shadow(&lc);
     if (vs != STM_OK) {
-        free(lc.shadow_slots);
+        ds_shadow_free(&lc);
         must_unlock(&idx->lock);
         return vs;
     }
@@ -2537,7 +2573,8 @@ stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
      * their engine fields are NULL (ds_decode_dataset_value memsets
      * the slot first). */
     for (size_t i = 0; i < idx->slots_len; i++) {
-        dataset_engine_close_locked(&idx->slots[i]);
+        dataset_engine_close_locked(idx->slots[i]);
+        free(idx->slots[i]);
     }
     free(idx->slots);
     idx->slots     = lc.shadow_slots;

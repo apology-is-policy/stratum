@@ -1097,6 +1097,23 @@ Grounded reasons for the shape:
    the write-PATH reads slightly beyond §5.1.1's literal "write ops" — a
    deliberate CF-2-readiness measure, recorded here.
 
+   **Residue (R175 F5): the point-read funnels close only PART of the
+   `serial_mu`-suppression surface.** The write path's own SERIAL
+   range scans remain: `in_seed_dsstate` + `in_find_freed` (every
+   alloc), the extent collect/overlap scans (every RMW write /
+   truncate), the dirent unlink sweep, and the xattr serial list — all
+   `stm_btree_engine_scan_range`, which holds `serial_mu` for the
+   whole walk. Under CF-2's pool a scan-heavy workload keeps the
+   mini's trylock failing exactly as the moved GET funnels would have.
+   NOT a soundness gap: a fold requires `serial_mu` (the mini) or the
+   `fs->global` EX envelope (commit finalize / close), so a serial
+   scanner is never raced by a retire — the residue is
+   chain-growth/space-amp pressure (the #39/#40 family) plus
+   `serial_mu` contention. Candidate CF-2 closure: `_concurrent` scan
+   variants for the alloc-path scans (the readdir/lookup scans already
+   have them), or a commit-cadence chain bound. Recorded as a CF-2
+   obligation in the arc plan (CONCURRENT-FS.md §4, CF-2).
+
 4. **Self-pinning funnels, not `ebr`-threading.** The `_concurrent`
    ops require an EBR-pinned caller (the pin is documentation to the op;
    the real protection is the active epoch). Rather than thread an
