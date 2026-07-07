@@ -1314,6 +1314,38 @@ static bool mini_ctx_family_references(const eng_mini_ctx *ctx,
     return false;
 }
 
+/*
+ * Tombstone-sweep one superseded internal node's child slots and
+ * dispose of each occupant by IDENTITY (R177 F1). Applies to BOTH
+ * single-retired classes of a flushed round — the husk root and every
+ * COW-replaced node: a pinned wait-free descent can CAS-link a fresh
+ * cold load into a superseded node's NULL slot right up to grace end,
+ * and the single-node free would leak it (the exact late-link class
+ * ENG_CHILD_TOMBSTONE exists for). Dispositions: NULL — nothing;
+ * COW-replaced this round — single-retired by the caller's replaced
+ * loop; still referenced anywhere in the round family — ownership
+ * transferred, leave it; otherwise a reader's late link (a disjoint
+ * fresh-load subtree) — recursive retire. No index adoption ever (a
+ * shifted slot could bind it to the wrong key range). A reader that
+ * hits the tombstone mid-descent restarts from mvcc_root
+ * (load_child's out_stale arm).
+ */
+static void mini_sweep_node_slots(eng_mini_ctx *ctx, eng_node *n)
+{
+    if (n->is_leaf || !n->children) return;
+    for (uint32_t i = 0; i < n->n_pivots + 1u; i++) {
+        eng_node *late = __atomic_exchange_n(&n->children[i].mem,
+                                             ENG_CHILD_TOMBSTONE,
+                                             __ATOMIC_ACQ_REL);
+        if (!late) continue;
+        if (mini_ctx_is_replaced(ctx, late)) continue;
+        if (mini_ctx_family_references(ctx, late)) continue;
+        if (stm_ebr_retire(late, node_free_recursive_cb) != STM_OK) {
+            /* leak — safer than freeing under a pinned reader */
+        }
+    }
+}
+
 /* Free a peel vector's separator keys + backing array WITHOUT touching
  * the right nodes — the cow-mode counterpart of
  * eng_split_vec_free_deep (rights are round-tracked; the round sweep
@@ -1493,11 +1525,11 @@ static void engine_try_mini_consolidate(stm_btree_engine *eng)
      * under the husk (a disjoint fresh load) -> recursive retire. No
      * adoption — a shifted slot could bind it to the wrong key range. */
     if (!root->is_leaf) {
-        for (uint32_t i = 0; i < root->n_pivots + 1u; i++) {
-            eng_node *late = __atomic_exchange_n(&root->children[i].mem,
-                                                 ENG_CHILD_TOMBSTONE,
-                                                 __ATOMIC_ACQ_REL);
-            if (!flushed) {
+        if (!flushed) {
+            for (uint32_t i = 0; i < root->n_pivots + 1u; i++) {
+                eng_node *late = __atomic_exchange_n(
+                    &root->children[i].mem, ENG_CHILD_TOMBSTONE,
+                    __ATOMIC_ACQ_REL);
                 /* Acquire: the published clone's slot may be
                  * CAS-linked by a cold descent at this instant (R174
                  * F3 — the CAS below is authoritative either way; the
@@ -1515,18 +1547,21 @@ static void engine_try_mini_consolidate(stm_btree_engine *eng)
                          * retire rejects it with EINVAL) */
                     }
                 }
-                continue;
             }
-            if (!late) continue;
-            if (mini_ctx_is_replaced(&ctx, late))
-                continue;                  /* single-retired below */
-            if (mini_ctx_family_references(&ctx, late))
-                continue;                  /* transferred to the family */
-            if (stm_ebr_retire(late, node_free_recursive_cb) != STM_OK) {
-                /* leak — safer than freeing under a pinned reader */
-            }
+        } else {
+            mini_sweep_node_slots(&ctx, root);
         }
     }
+
+    /* R177 F1: every COW-replaced node retires SINGLE below, so its
+     * slots need the same tombstone discipline as the husk root — a
+     * reader pinned on the OLD tree can cold-CAS a fresh load into a
+     * replaced node's NULL slot until grace ends, and without the
+     * sweep the single free would leak that whole fresh subtree.
+     * (Replaced nodes exist only on flushed rounds; internal ones
+     * only — the helper no-ops on leaves.) */
+    for (uint32_t i = 0; i < ctx.n_repl; i++)
+        mini_sweep_node_slots(&ctx, ctx.replaced[i]);
 
     /* The husk's cache entry (keyed by its paddr) must not outlive it;
      * safe to reset wholesale — readers never touch the cache and both

@@ -5093,6 +5093,92 @@ STM_TEST(engine_mini_flush_shifted_slot_survives) {
     while (stm_ebr_try_advance() > 0) { }
 }
 
+/* R177 F1 — a COW-replaced node's slots are tombstone-swept at
+ * publish: it retires SINGLE-node, so (like the husk root) a reader
+ * pinned on the old tree must not be able to cold-CAS a fresh load
+ * into one of its slots after the supersede — the single free would
+ * leak that subtree. The test pins the pre-mini root, captures the
+ * internal child the flush will COW, drives a flushed mini into its
+ * key range, and asserts (a) the child really was replaced and
+ * (b) EVERY slot of the captured original is ENG_CHILD_TOMBSTONE.
+ * Fails on pre-R177-F1 code at (b): the slots keep their old
+ * pointers/NULLs. Needs a depth-3 tree so the replaced child is
+ * internal. */
+STM_TEST(engine_mini_flush_replaced_slots_tombstoned) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    /* Depth-3: ~6500 x 300-byte values -> ~160 leaves over ~118-wide
+     * internals -> root / internal / leaf. Serial build + commit. */
+    char big[300];
+    memset(big, 'T', sizeof big);
+    for (uint32_t i = 0; i < 6500u; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof k, "d3-key-%05u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, k, (size_t)kl,
+                                              big, sizeof big));
+    }
+    uint64_t rp = 0; uint8_t rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+    STM_ASSERT_FALSE(eng->root->is_leaf);
+    eng_node *c0 = eng->root->children[0].mem;
+    STM_ASSERT_TRUE(c0 != NULL);
+    STM_ASSERT_FALSE(c0->is_leaf);          /* depth 3 achieved */
+
+    /* Pin BEFORE the minis so the captured original stays readable
+     * (every retire this window defers past our epoch). Keys "a-*"
+     * sort below every "d3-*" pivot -> route to child 0 -> the first
+     * flush COWs c0. */
+    stm_ebr_enter(me);
+    for (uint32_t i = 0; i < 40u; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof k, "a-%04u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         big, sizeof big));
+    }
+
+    /* (a) the flush really replaced c0 (non-vacuity guard)... */
+    STM_ASSERT_TRUE(eng->root->children[0].mem != c0);
+    /* ...and (b) every slot of the RETIRED original is tombstoned. */
+    for (uint32_t i = 0; i < c0->n_pivots + 1u; i++) {
+        STM_ASSERT_TRUE(eng_child_mem_acquire(&c0->children[i]) ==
+                        ENG_CHILD_TOMBSTONE);
+    }
+    stm_ebr_exit(me);
+
+    /* Reads through the replacement stay correct — both the hammered
+     * range and the original one. */
+    {
+        stm_ebr_enter(me);
+        bool found = false; void *val = NULL; size_t vl = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me,
+                                                         "a-0039", 6,
+                                                         &found, &val, &vl));
+        stm_ebr_exit(me);
+        STM_ASSERT_TRUE(found && vl == sizeof big);
+        free(val);
+        stm_ebr_enter(me);
+        found = false; val = NULL; vl = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me,
+                                                         "d3-key-00000", 12,
+                                                         &found, &val, &vl));
+        stm_ebr_exit(me);
+        STM_ASSERT_TRUE(found && vl == sizeof big);
+        free(val);
+    }
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+    while (stm_ebr_try_advance() > 0) { }
+}
+
 /* #367 — mini failure atomicity: an allocation failure ANYWHERE in
  * the mini (clone / track / fold / COW / split / grow / suffix) must
  * discard the round completely — the published tree and live chain

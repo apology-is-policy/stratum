@@ -823,8 +823,14 @@ trylocks, `pending.active` bail — all unchanged):
    only).** Deltas that arrived during 1-3 fold into the (possibly
    grown) top's buffer; on a still-leaf top they apply (a suffix
    overflow split is memory-only). Suffix seqs are strictly greater
-   than round-1 seqs and land *above* the flushed content in resolve
-   order, so newest-wins holds across the phases.
+   than round-1 seqs **per key** (R177 F2: seqs are minted BEFORE the
+   CAS prepend, so cross-key mint order can trail prepend order — the
+   R175-F4 property; same-key ordering rests on the external fs-layer
+   per-key serialization, and every consumer is per-key:
+   `buffer_resolve_for_key` is order-independent max-seq, the flush
+   delivers qsort-ascending, the leaf arm applies ascending) and the
+   suffix lands *above* the flushed content in resolve order, so
+   newest-wins holds across the phases.
 5. **Publish + sweep + retire.** One release-store of the new top
    (readers see old-or-new, never intermediate — the same
    `concurrency_mvcc.tla` publish shape as today's mini). The husk

@@ -581,7 +581,14 @@ still references anywhere is left alone [ownership transferred], and
 only a reader's late link under the husk retires recursively; no
 adoption, since a shifted slot could bind it to the wrong key
 range). A fold-only round keeps the original index-paired sweep
-verbatim. EBR-retires: the husk (single), the detached chain, each
+verbatim. **Every COW-replaced internal node gets the same
+tombstone-sweep over its own slots before retiring (R177 F1)** — it
+is single-retired, so a reader pinned on the old tree could
+otherwise cold-CAS a fresh load into one of its NULL slots up to
+grace end and the single free would leak that subtree (the exact
+late-link class the tombstone exists for; regression:
+`engine_mini_flush_replaced_slots_tombstoned`, non-vacuity-proven).
+EBR-retires: the husk (single), the detached chain, each
 COW-replaced node (single). Failure anywhere before publish discards
 the round — every round node freed single-node, un-spliced peel
 separators freed, the stale orphaned-spill pushes truncated back to
@@ -1252,7 +1259,7 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 90 cases (47 9.6 + 4 9.8-LF-1 +
+`tests/test_btree_engine.c` — 91 cases (47 9.6 + 4 9.8-LF-1 +
 6 9.8-LF-2 + 14 9.8-BE chunks 7-8 + 11 9.8-BE-prepend chunk 9 incl.
 the R174 failure arms + the load_root race regression + 1
 engine-retire chunk 9b + 1 clone-arm write-fault sweep chunk 11 +
@@ -1264,7 +1271,9 @@ newest-wins across fold->flush->suffix cycles + commit + reopen, the
 flushed-round shifted-slot sweep survival [the by-identity husk-sweep
 regression — deterministic under guard-malloc], and a 400-point OOM
 countdown sweep over the whole mini round [clone / track / fold /
-COW / split / grow / suffix] asserting discard-atomicity + recovery).
+COW / split / grow / suffix] asserting discard-atomicity + recovery;
++ 1 R177-F1: replaced-node slots tombstoned at publish,
+non-vacuity-proven by neutering the sweep).
 Most run against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
