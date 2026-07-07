@@ -35,8 +35,12 @@ tags into the pool.
   admits them into a slot table, and `stm_fs_pool_serve` (fs_pool.h:72)
   spawns **N handler workers** that pull queued requests and execute
   `stm_9p_server_handle` concurrently.
-- N defaults to `STM_FS_POOL_WORKERS_AUTO` = 4 (flat — an in-VM `ncpu`
-  probe would read 1 and silently disable the pool), capped at
+- N defaults to **1 (the serial loop; the pool is OPT-IN via an
+  explicit `--fs-workers >= 2`)** — user-decided 2026-07-07 on the
+  §29.9 + #368 data (measured workloads run ~84% at in-flight depth 1;
+  the pool taxes single-in-flight paths 15-24% and gofmt is a wash);
+  the earlier auto=4-flat default is retired (an in-VM `ncpu` probe
+  reading 1 was the reason auto existed at all). Capped at
   `STM_FS_POOL_WORKERS_MAX` = 16; CLI `--fs-workers N`
   (`src/cmd/stratumd/run.c:660`, `stratumd.h:174`).
 - **`--fs-workers 1` takes the untouched pre-CF-2 serial loop**
@@ -248,6 +252,14 @@ walk — they cannot EBUSY, but they suppress the mini for the duration (the
 above remain on that path.
 
 ## 29.9 — Throughput characterization
+
+**The default decision (2026-07-07, user call closed)**: `--fs-workers`
+defaults to **1** (serial); the pool is opt-in. Basis: the A/B below —
+gofmt inside noise between modes, fsbench single-in-flight −15..24%
+under the pool — plus the #368 in-flight histogram (84% depth-1,
+hw=5): today's clients cannot feed 4 workers, so the handoff tax buys
+nothing. Revisit when a client can offer real depth (parallel build
+actions / multi-user sessions / a pipelining kernel client).
 
 **Core-level (Area D, `tests/bench_concurrent_write.c` — still current):**
 aggregate multi-thread write throughput is flat ~52–62 MB/s across 1→8

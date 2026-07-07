@@ -34,10 +34,10 @@ struct stm_ds_policy_table;
 
 /* Worker-count clamp + the auto default. Auto is 4 FLAT, not
  * ncpu-probed: in-VM musl sysconf(_SC_NPROCESSORS_ONLN) has no
- * substrate and would report 1, silently disabling the pool exactly
- * where it matters (docs/cf-2-design.md §3.6). */
+ * substrate and would report 1 (docs/cf-2-design.md §3.6); the default
+ * is serial (pool opt-in via --fs-workers >= 2, user-decided
+ * 2026-07-07), so the deployment states its worker count explicitly. */
 #define STM_FS_POOL_WORKERS_MAX  16u
-#define STM_FS_POOL_WORKERS_AUTO 4u
 
 /* Test-only hooks (NULL in production). pre_handle fires on the worker
  * thread after a slot is popped for execution and before

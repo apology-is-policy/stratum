@@ -107,7 +107,7 @@ static void usage(const char *argv0)
         "  --msize <bytes>          Max negotiated 9P msize "
             "(default: 128 KiB)\n"
         "  --fs-workers <n>         Per-connection FS worker-pool size "
-            "(0 = auto [4]; 1 = serial; max 16) [CF-2]\n"
+            "(default 1 = serial; >= 2 enables the pool; max 16) [CF-2]\n"
         "  --root-dataset <id>      Dataset ID for new attachers "
             "(default: 1)\n"
         "  --backlog <n>            listen() backlog "

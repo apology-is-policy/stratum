@@ -70,12 +70,17 @@ static gid_t g_bake_owner_gid     = (gid_t)-1;
  * >= 2 = the fs_pool dispatch path (docs/cf-2-design.md §3). */
 static uint32_t g_fs_workers = 1u;
 
-/* Resolve the opts knob: 0 = auto (4 flat — ncpu probing would read 1
- * in-VM and silently disable the pool; cf-2-design.md §3.6); clamp to
- * the pool's max. */
+/* Resolve the opts knob: 0 (unset) = 1 = the serial loop — the pool is
+ * OPT-IN via an explicit --fs-workers >= 2 (user-decided 2026-07-07 on
+ * the CF-2f + #368 data: measured workloads run ~84% at in-flight
+ * depth 1, and the pool's per-op handoff taxes single-in-flight paths
+ * 15-24% [fsbench reread -24%, create -18%] while gofmt is a wash;
+ * flip the default back when clients can actually offer depth —
+ * docs/reference/29-concurrency.md section 29.9). Clamp to the pool
+ * max. */
 static uint32_t fs_workers_resolve(uint32_t opt)
 {
-    if (opt == 0u) return STM_FS_POOL_WORKERS_AUTO;
+    if (opt == 0u) return 1u;
     if (opt > STM_FS_POOL_WORKERS_MAX) return STM_FS_POOL_WORKERS_MAX;
     return opt;
 }

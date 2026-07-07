@@ -209,10 +209,12 @@ serial loop's 2 x 8 MiB, scaled by explicit config.
 
 ### 3.6 The knob
 
-`stm_stratumd_opts.fs_workers` (uint32_t; 0 = auto) + `--fs-workers N`.
-Auto = 4, flat — NOT ncpu-probed: in-VM musl sysconf(_SC_NPROCESSORS_ONLN)
-has no substrate and would return 1, silently disabling the pool exactly
-where it matters (the deviation from the charter's "min(4, ncpu)" is
+`stm_stratumd_opts.fs_workers` (uint32_t; 0 = unset -> 1) + `--fs-workers N`.
+DEFAULT = 1 (serial; the pool is opt-in via an explicit >= 2) — user-decided
+2026-07-07 on the CF-2f/#368 data; the original auto = 4, flat design is
+retired (it existed because ncpu probing is useless in-VM: musl
+sysconf(_SC_NPROCESSORS_ONLN) has no substrate and would return 1, silently
+disabling the pool — the deviation from the charter's "min(4, ncpu)" was
 deliberate and recorded here; the device has 4 vCPUs, hosts have >= 4).
 Cap `STM_FS_POOL_WORKERS_MAX = 16`. Published process-wide once at the
 top of `stm_stratumd_run` (the g_bake_owner_* precedent) so no public
