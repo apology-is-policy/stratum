@@ -751,6 +751,126 @@ bit; tunable post-bench). A writer hitting threshold attempts
 the flush; another writer racing the same node bails (see
 `btree_lf`'s `t->consolidating` pattern).
 
+### 5.3.1 — The bounded mini (#367): size-triggered COW flush + the leaf-root fold
+
+**The problem (measured, 2026-07-07 — the #367 root cause).** As built
+through CF-1 chunk 10, every resident container that holds uncommitted
+metadata is bounded only by the caller's commit cadence:
+
+- On a **leaf root**, `engine_try_mini_consolidate` structurally bails
+  (buffers are an internal-node feature), so the root chain holds every
+  uncommitted delta and `chain_resolve_for_key` scans it per lookup.
+- On an **internal root**, minis fold the chain into the root *buffer*
+  every `ENG_CONSOLIDATE_THRESHOLD` prepends — but the buffer drains
+  only at a commit flush, `buffer_resolve_for_key` is a full linear
+  scan, and each mini's `eng_node_clone_shallow` deep-copies the whole
+  accumulated buffer. Per-mini cost is O(buffered), so even an indexed
+  resolver would leave the aggregate O(N²/threshold).
+
+R174 F4 documented the internal-root half as "bounded by commit
+cadence"; the fsync-less `go build` (and any bulk create/untar) drives
+zero commits, so the bound never engages. Measured: host create path
+133k -> 5.6-5.9k files/s (21x) at CF-1 chunk 10 exactly; per-file cost
+grows 48/97/177 µs at 1k/4k/8k uncommitted (O(N²) aggregate); in-guest
+the same mechanism owns the warm-gofmt per-op inflation (#367,
+task #59; mission register).
+
+**The fix.** Bound every resident container at the caps the on-disk
+format already enforces, *independent of commit cadence*, by extending
+the mini-consolidation from fold-only to **fold + size-triggered COW
+flush**, and by giving it a **leaf-root arm**. No new caps: the flush
+trigger is the same `ENG_BUFFER_REGION_MAX` the commit flush uses; the
+chain trigger stays `ENG_CONSOLIDATE_THRESHOLD`. After this chunk the
+resident invariants are:
+
+- root chain depth ≤ threshold + in-flight arrivals (unchanged), on
+  BOTH leaf and internal roots;
+- every node's message buffer ≤ region cap + one fold quantum (the
+  sealed-suffix fold may briefly exceed the cap by the arrivals of one
+  flush window; the next mini re-checks);
+- therefore read cost is O(depth × cap) — restoring §5.5's shape with
+  a *linear* scan over ≤ cap messages (see the as-built note below).
+
+**Mechanism (one publish cycle, extending the existing mini).** Phase
+order inside `engine_try_mini_consolidate` (serial_mu → commit_mu
+trylocks, `pending.active` bail — all unchanged):
+
+1. **Clone.** Internal root: `eng_node_clone_shallow` (existing —
+   deep pivots + deep buffer, shared children). Leaf root (NEW arm):
+   `eng_node_clone_resident` — for a leaf that is a full entry
+   deep-copy, bounded by the payload cap, amortized ~cap/threshold
+   bytes per op and only until the first split grows the root.
+2. **Round-1 fold (unsealed).** The captured chain segment folds via
+   `shadow_consolidate` (the commit clone-arm's consolidator, gaining
+   a `stop` parameter): internal → append to the clone's buffer;
+   leaf → apply ascending with split + grow-to-internal on overflow
+   (the machinery the commit arm already uses). The live chain keeps
+   serving readers and absorbing writers.
+3. **COW flush (NEW; unsealed — child disk reads are allowed here).**
+   If the clone's buffer region exceeds `ENG_BUFFER_REGION_MAX`, run
+   the §5.2 flush on the private clone with a **round context**: the
+   set of nodes created this round (clone, COW children, split
+   products, grow roots) is the privacy discriminator. A child is
+   COW'd (single-node clone; leaf children entry-deep) on first
+   mutation this round; children loaded from disk land directly in
+   private slots and join the round set. Root-level peels grow the
+   tree via `grow_root_absorb(publish=false)`. The flush body is the
+   *same* `eng_flush_node` parameterized by the context — one body,
+   two modes (commit shadow = context-free, mini = COW-on-first-touch)
+   — so `bepsilon.tla::FlushPreservesNewestWins` / ascending delivery
+   / detach-whole-buffer semantics are shared, not forked.
+4. **Seal + suffix fold (no I/O — the seal window stays allocation-
+   only).** Deltas that arrived during 1-3 fold into the (possibly
+   grown) top's buffer; on a still-leaf top they apply (a suffix
+   overflow split is memory-only). Suffix seqs are strictly greater
+   than round-1 seqs and land *above* the flushed content in resolve
+   order, so newest-wins holds across the phases.
+5. **Publish + sweep + retire.** One release-store of the new top
+   (readers see old-or-new, never intermediate — the same
+   `concurrency_mvcc.tla` publish shape as today's mini). The husk
+   sweep gains one discipline: a husk slot whose old child was
+   deliberately COW'd this round retires that child **single-node**
+   (its subtree is shared with the COW replacement); reader-adopted
+   late links keep the existing recursive retire (disjoint subtrees);
+   the husk itself retires single-node as today (a leaf husk skips the
+   sweep — no child slots). `cache_reset` as today.
+
+**Failure atomicity.** Any failure before publish discards the round:
+every round-set node is freed single-node (round products never own
+each other's arrays), un-consumed peel separators are freed shallow,
+and the published tree + live chain are byte-untouched (round 1-3 run
+unsealed; the suffix-OOM arm restores the detached head exactly as
+today). Nothing is lost: the live tree still holds every message.
+
+**What this deliberately does NOT change.**
+
+- **Durability is untouched.** The mini-flush moves *resident* state
+  only — no `eng_node_write`, no pool allocation, no pending window.
+  Dirty COW products are written by the next commit exactly as any
+  dirty node; crash semantics are identical (uncommitted work rolls
+  back to the durable root). Leaf-apply DELETEs route orphaned spill
+  chains into `eng->orphaned_spill_blocks` as the commit flush does;
+  the `pending.active` bail keeps the commit's `orphan_base`
+  bracketing sound.
+- **No sorted/indexed buffer.** §5.5's "binary search" sentence was
+  never built — the as-built resolver is a deliberately
+  order-independent linear scan (in-memory order rots under pivot
+  splices; `eng_node_write` re-normalises on encode). With buffers
+  re-bounded at the region cap (~50 messages), a linear scan is ≤
+  ~50 key-compares per level — the index would be dead weight.
+  Recorded as a seam only if a future ε retune raises the cap.
+- **Serial-regime purity unchanged.** The mini runs only in the
+  concurrent regime; serial writers still refuse latched roots.
+
+**Invariant obligations (the audit's prosecution list).** R172 F1
+(every mutated node is round-private; a published node is immutable
+until superseded + EBR-retired — the round set is the proof
+discriminator); the retire taxonomy (husk single / COW-replaced
+single / reader-adopted recursive / chain); failure atomicity per
+above; dirty propagation root→every dirty COW product (the R173 F1
+commit-reachability obligation); the no-I/O seal window; newest-wins
+across fold/flush/suffix; the bounds themselves (chain, buffer).
+
 ### 5.4 — Write-amplification claim — the crown-jewel math
 
 Without Bε, a sync of N metadata writes touching N distinct
@@ -791,13 +911,18 @@ messages against a fanout of ~150 (a whole-buffer flush delivers
 
 Reads now consult both the delta chain and the on-disk buffer
 at every internal node on the descent path. For a tree of depth
-4, a read does up to 4 buffer scans on the way down. Each scan
-is O(log buffer_size) via binary search on the sorted on-disk
-buffer + O(chain_depth) on the chain — bounded by the
-consolidation threshold (= 8). So a read's added cost is
-4 × O(log 50 + 8) ≈ 4 × 14 = 56 comparisons. Negligible
-compared to AEGIS-256 decrypt (cycles per byte vs cycles per
-comparison).
+4, a read does up to 4 buffer scans on the way down. **As built**
+each scan is a LINEAR pass over the node's buffer (the resolver
+is deliberately order-independent — in-memory order rots under
+pivot splices, so the §5.2 "sorted + binary search" sentence was
+never realised) + O(chain_depth) on the chain. Both are bounded:
+the chain by the consolidation threshold (= 8), the buffer by the
+region cap (~50 messages) — a bound that holds *independent of
+commit cadence* only since §5.3.1's size-triggered mini-flush
+(pre-#367 the root buffer grew with the uncommitted burst, which
+is exactly the measured 21x collapse). So a read's added cost is
+4 × O(50 + 8) ≈ 232 comparisons. Negligible compared to AEGIS-256
+decrypt (cycles per byte vs cycles per comparison).
 
 The trade is one-sided: writes get 50× cheaper, reads pay <1%
 more. This is the published Bε win — Stratum just operationalises
