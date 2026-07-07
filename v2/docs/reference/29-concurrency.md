@@ -1,178 +1,337 @@
 # 29 — Concurrency model (as-built)
 
-> Stratum Stabilization Arc, **Area D** ("heavy concurrent writes through one
-> session"). As-built reference for the threading model, lock hierarchy, EBR
-> reclamation, and the wait-free read path. Written 2026-06-25 from the Area D
-> line-by-line audit + the ASan + bench ground truth. Companion specs:
-> `specs/concurrency.tla`, `specs/concurrency_mvcc.tla`.
+> As-built reference for the threading model, the 9P dispatch pool, the
+> 3-phase server, the lock hierarchy, the 9.8-BE lock-free metadata engine,
+> EBR reclamation, the wait-free read path, and the STM_EBUSY retry policy.
+> First written 2026-06-25 from the Stabilization **Area D** audit; rewritten
+> 2026-07-07 at the close of the **concurrent-FS arc** (CF-1 chunks 7–11 + 9b
+> = the 9.8-BE engine, R172–R175; CF-2 = the stratumd per-connection worker
+> pool, `docs/cf-2-design.md`). Companion specs: `specs/concurrency.tla`,
+> `specs/concurrency_mvcc.tla`.
 
 ## 29.1 — Purpose + the one-paragraph model
 
-Stratum's FS core (`stm_fs`) is **concurrency-capable**: it permits parallel
-single-inode mutators (per-inode locks), wait-free metadata reads (EBR-pinned
-MVCC), and serializes only the genuinely shared resources (the dirty buffer,
-the per-dataset extent index, the allocator, the block device). Its model
-mirrors a kernel FS's `i_rwsem` + RCU shape: **reads are wait-free; writes
-serialize per-inode; disjoint inodes proceed in parallel**. The serialization a
-Thylacine workload actually sees, however, comes from a layer ABOVE the core —
-see §29.6.
+Stratum's concurrency is now a **two-layer** story. At the top, `stratumd`
+dispatches the 9P requests of a single connection onto a per-connection
+worker pool (CF-2), so pipelined requests from one client execute
+concurrently server-side. Below it, the FS core (`stm_fs`) permits parallel
+single-inode mutators (per-inode pins), wait-free metadata reads (EBR-pinned
+MVCC), and — since the 9.8-BE engine (CF-1) — **lock-free metadata writers**
+(CAS-prepend delta chains), serializing only the genuinely shared resources
+(the dirty buffer, the allocator, the block device, commits). The model
+mirrors a kernel FS's `i_rwsem` + RCU shape, with the Bε-tree engine playing
+the role of a lock-free index. The pre-arc situation ("the FS core's
+concurrency machinery sits unused at v1.0" — one serial connection) is
+retired: the shared Thylacine kernel mount now drives concurrent in-flight
+tags into the pool.
 
-## 29.2 — Threading model — where concurrency does and does not arise
+## 29.2 — Threading model — where concurrency arises
 
-`stratumd` is **thread-per-connection with serial per-connection processing**
-(`src/cmd/stratumd/serve.c`): the accept loop spawns one detached worker
-pthread per connection; each worker reads + handles one 9P request at a time
-(`stm_9p_server_handle`), strictly serially. **Two requests on one connection
-never execute concurrently server-side.** True concurrency on the FS core
-therefore arises only across **multiple** connections (multiple workers).
+`stratumd` is **thread-per-connection PLUS a per-connection dispatch pool**
+(`src/cmd/stratumd/serve.c` + `src/cmd/stratumd/fs_pool.{c,h}`, CF-2a):
 
-Consequence for Thylacine (the only client): every Proc resolves through one
-shared kernel dev9p mount = **one** connection = **one** serial worker, so a
-single user's concurrent FS workload (`make -j`, parallel `go build`) is
-serialized at the 9P server even though the kernel pipelines the wire (the #841
-elected reader). The FS core's concurrency machinery sits **unused** at v1.0.
+- The accept loop spawns one worker pthread per connection (unchanged).
+- That thread becomes the connection's **reader**: it reads frames and
+  admits them into a slot table, and `stm_fs_pool_serve` (fs_pool.h:72)
+  spawns **N handler workers** that pull queued requests and execute
+  `stm_9p_server_handle` concurrently.
+- N defaults to `STM_FS_POOL_WORKERS_AUTO` = 4 (flat — an in-VM `ncpu`
+  probe would read 1 and silently disable the pool), capped at
+  `STM_FS_POOL_WORKERS_MAX` = 16; CLI `--fs-workers N`
+  (`src/cmd/stratumd/run.c:660`, `stratumd.h:174`).
+- **`--fs-workers 1` takes the untouched pre-CF-2 serial loop**
+  (serve.c:431 branches only on `g_fs_workers >= 2`) — byte-identical
+  behavior, the serial-fidelity bisect lever (CF2-I7).
 
-## 29.3 — Lock hierarchy (held in this order, never reversed)
+Two requests on one connection **do** execute concurrently server-side now.
+Consequence for Thylacine (the primary client): every Proc resolves through
+one shared kernel dev9p mount = one connection, and the kernel client
+pipelines the wire (the #841 elected reader, multi-in-flight tags), so a
+parallel guest workload (`go build -p 4`, parallel Procs) fans out across
+the pool's workers. The `/ctl` control surface and the proxy path stay
+serial (deliberately out of CF-2's scope).
 
-From `src/fs/fs.c:23-79` (the authoritative comment):
+## 29.3 — The 9P dispatch pool (CF-2a; `src/cmd/stratumd/fs_pool.c`)
+
+- **Slots + back-pressure (CF2-I6):** a 64-slot table
+  (`STM_FS_POOL_SLOTS`), byte-budgeted against the negotiated msize; when
+  slots/budget are exhausted the READER blocks — back-pressure propagates to
+  the wire, never unbounded allocation. The frame-size gate is the
+  negotiated msize.
+- **Reply integrity (CF2-I1):** every admitted request produces exactly one
+  reply unless flushed-before-reply (exactly zero) or the connection latches
+  dead. Every reply is a single atomic `stratumd_write_full` under the
+  connection's **`write_mu`** (fs_pool.c:247) — the single-writer guarantee
+  the Thylacine kernel srvconn server-send path assumes (the #354-class S12
+  re-verification: stratumd never issues two concurrent writes on one fd).
+- **Flush state machine (CF2-I2):** slots move QUEUED → EXECUTING →
+  REPLYING → FREE. A Tflush of a QUEUED op cancels it (it never executes);
+  of an EXECUTING op, waits and discards the reply; Rflush is written only
+  after the flushed op's reply is sent or discarded. The REPLYING state
+  exists so a completed-tag's slot stays findable by Tflush until its reply
+  has committed to the wire while the TAG becomes reusable the instant the
+  reply lands (the in-chunk F2 tag-0 completion race fix — split lookup).
+- **Tversion barrier (CF2-I4):** h_version runs with zero in-flight ops;
+  worker response buffers resize only under that barrier (msize
+  renegotiate).
+- **Teardown (CF2-I8):** pool join precedes server destroy; no worker
+  touches srv/fd after the join; frames are freed on every exit path (clean
+  EOF, error, flush-cancel, dead-latch). A fatal (dup in-flight tag,
+  oversized frame, write failure) latches the connection dead
+  (`pool_latch_dead_locked`); the `on_fatal` test hook observes the latch.
+
+## 29.4 — The 3-phase server (CF-2b; `src/9p/server.c` + `server_internal.h`)
+
+`stm_9p_server` was written single-caller; the pool makes it multi-threaded.
+The surgery (design `docs/cf-2-design.md` §4):
+
+- **`s->lock`** serializes the fid table and all fid-owned state; it is
+  **OUTER to every `stm_fs_*` internal lock** (server.c:467 comment) and is
+  NEVER held across a core call.
+- **The per-fid shared pin (CF2-I3):** `p9_fid.busy` (server.c:142) +
+  `s->fid_cv`. The 15 hot handlers split 3-phase: **(a)** gates + a by-value
+  snapshot of fid state + pin, under `s->lock`; **(b)** UNLOCKED
+  `verify_fresh_snapshot` + the core call + reply build — NO fid deref
+  (mechanically verified; only `s->fs` and write-once `auth_uid` are read);
+  **(c)** identity-guarded mutations (`kind==NODE && ds && ino` — the lopen
+  stamp / lcreate repurpose / setattr gen refresh) + unpin (broadcast at 0),
+  under `s->lock` again.
+- The pin keeps the **slot** alive, not the fid's semantic state: a
+  concurrent same-fid op (a client protocol violation) resolves to a legal
+  serialization against its (a) snapshot (CF2-I5).
+- **h_clunk waits `busy == 0`** with a RE-LOOKUP after every wake (the slot
+  may be released + repurposed by a concurrent protocol-violating clunk);
+  `fid_release_locked` abort-tripwires on `busy > 0` (server.c:436). A clunk
+  only ever waits for EXECUTING ops (QUEUED ops have not pinned), so worker
+  exhaustion cannot deadlock it.
+- h_walk is factored into `walk_components` over a stack cursor +
+  `walk_finish_locked` (the always-locked bind tail); with bindings present
+  the original full-lock body runs.
+
+## 29.5 — Lock hierarchy (held in this order, never reversed)
+
+The full as-built stack, outermost first:
 
 ```
-fs->global  (rwlock; EX for compound ops, SH for per-inode + pure-read ops;
-             writer-preference attr to prevent EX starvation, R133 P1-1)
-   -> per-inode handle->mu        (PARALLEL-3 SH path; stm_inode_pin)
-   -> dirty_buffer->mu            (global; src/dirty_buffer/dirty_buffer.c:59)
-   -> sync->lock                  (src/sync/sync.c:163)
-   -> alloc->lock                 (src/alloc/alloc.c:77)
+s->lock / pool locks        (9P layer; NEVER held across a core call)
+fs->global                  (rwlock; EX compound, SH per-inode + reads;
+                             writer-preference, R133 P1-1)
+   -> per-inode handle->mu  (PARALLEL-3 SH path; stm_inode_pin)
+   -> subsystem idx->lock   (inode idx->lock -> dataset idx->lock; R175 SA-3)
+   -> engine serial_mu      (serial APIs + serial scans + the mini's trylock)
+   -> engine commit_mu      (chain fold/commit; load_root_locked single-flight)
+   -> dirty_buffer->mu      (global; src/dirty_buffer/dirty_buffer.c:59)
+   -> sync->lock            (src/sync/sync.c:163)
+   -> alloc->lock           (src/alloc/alloc.c:77)
    -> alloc's btree rwlock
 ```
 
-Plus the per-dataset `extent_index->lock` (`src/extent/extent_index.c:146`) and
-the one-in-flight `bdev d->lock` (`src/block/bdev_thylacine.c:209`, invariant
-B-2). Documented deadlock-avoidance rules:
+Plus the per-dataset `extent_index->lock` (`src/extent/extent_index.c`) and
+the one-in-flight `bdev d->lock` (invariant B-2). Deadlock-avoidance rules:
 
-- **Never** `stm_fs_mark_wedged` under a held `fs->global` EX (recursive
-  same-thread wrlock is POSIX-undefined; capture intent, unlock, then wedge —
-  R133 P1-2).
+- **Never** `stm_fs_mark_wedged` under a held `fs->global` EX (R133 P1-2).
 - **Never** take `alloc->lock` then `sync->lock` (commit owns the reverse).
-- Multi-inode ops pin in **ascending `(dataset_id, ino)` order**
-  (`stm_inode_pin_two`/`_pin_many`; `src/stratum/inode.h:509`) — `NoCircularWait`.
-- Dirty-buffer drain callbacks run **under `buf->mu`**; a callback must not
-  re-enter the buffer.
+- Multi-inode ops pin in ascending `(dataset_id, ino)` order — `NoCircularWait`.
+- Dirty-buffer drain callbacks run under `buf->mu`; no re-entry.
+- `serial_mu -> commit_mu` (engine_internal.h:631, R170 P3-2); the mini
+  realizes it via **trylock** only, so it bails rather than blocks.
+- The engine never calls up: the R175 SA-3 chain
+  (inode idx->lock -> dataset idx->lock -> serial_mu -> commit_mu) is
+  acyclic; `stm_inode_alloc`'s whole body runs under the inode idx->lock.
+- The CF-2c/2d retry loops `sched_yield` while HOLDING their subsystem
+  idx->lock but never an EBR pin (fresh `stm_ebr_enter/exit` per attempt) —
+  starvation-bounded (64 attempts), never a deadlock (the seal holder does
+  not take the waiter's idx->lock).
 
-## 29.4 — The three op classes (PARALLEL-3)
+## 29.6 — The three op classes (PARALLEL-3)
 
 | Class | Lock taken | Concurrency |
 |---|---|---|
-| Compound ops (commit, snapshot, unmount, legacy writes) | `fs->global` **EX** | fully serialized |
-| Single-inode mutators (chmod/chown/utimens/unlink/rename/reflink/truncate/write) | `fs->global` **SH** + per-inode pin(s) | parallel on disjoint inodes; serialized on the same inode |
+| Compound ops (commit, snapshot, unmount, rollback) | `fs->global` **EX** | fully serialized |
+| Single-inode mutators (chmod/chown/utimens/unlink/rename/reflink/truncate/write) | `fs->global` **SH** + per-inode pin(s) | parallel on disjoint inodes; serialized per inode |
 | Pure reads (stat/read-INLINE/lookup/readlink/readdir/getxattr/...) | **none** (LF-3 wait-free): atomic wedge gate + EBR pin | fully wait-free |
 
-A single-inode write holds `fs->global` SH; a commit takes EX, which drains the
-SH holders first — so **writes and commit are mutually exclusive**, no quiesce
-primitive needed.
+A single-inode write holds `fs->global` SH; a commit takes EX, which drains
+SH holders first — writes and commit are mutually exclusive, no quiesce
+primitive needed. Since CF-1 chunk 10, the mutators' metadata funnels are
+`_concurrent` (CAS-prepend) under those pins, so two mutators on DISTINCT
+inodes no longer serialize on the metadata index either.
 
-## 29.5 — EBR + the wait-free read path
+## 29.7 — The 9.8-BE lock-free metadata engine (CF-1)
 
-Wait-free reads (`src/fs/fs.c` `FS_GUARD_READ_LOCKLESS` sites) take no rwlock:
-they `stm_ebr_enter`, atomic-acquire-load `mvcc_root`, descend, `stm_ebr_exit`.
-EBR (`src/ebr/ebr.c`, `specs/concurrency_mvcc.tla`) keeps a COW-superseded node
-alive until every reader that could observe it has exited its epoch; writers
-`stm_ebr_retire` instead of freeing.
+The Bε-tree engine (`src/btree_engine/engine.c`) carries per-node **delta
+chains**: a writer CAS-prepends a delta (`chain_prepend`, engine.c:1104)
+instead of mutating the node; readers resolve chain → buffer → base. The
+pieces:
 
-**R171 status (the lock-free-read UAF family — known, dispositioned, NOT
-v1.0-reachable).** The wait-free read path has a documented P0 use-after-free
-family (`src/btree_engine/engine.c:214-233`): a wait-free reader's leaf-value
-memcpy can race the writer's **in-place** `eng_leaf_put` `free(old);val=new`
-upsert (P0-1); the engine struct can be freed by rollback/`dataset_destroy`
-under a reader (P0-2); `invalidate_memtree` can free the tree under a pinned
-reader (P0-4). The shipped mitigation is the **R171 P1-1 SH-fallback** (a
-wait-free read that observes a torn decode as `STM_ECORRUPT` retries under
-`fs->global` SH). The **true closure is the unbuilt Phase 9.8 BE-write half**
-(writers CAS-prepend onto the per-node delta chain + EBR-retire; chunks 7-11 +
-9b — see `docs/phase-9.8-design.md` §5.1.1).
+- **CAS-prepend + seal windows:** a consolidation SEALS a chain head before
+  folding; a prepend that observes a seal spins bounded
+  (`ENG_SEAL_RETRY_MAX` = 65536, engine.c:867, `sched_yield` every 1024)
+  then returns retriable `STM_EBUSY`. The mini-consolidation folds the BULK
+  from a pre-seal head snapshot (the segment below a captured head is
+  immutable — prepend-only); only the arrived-during-bulk suffix folds
+  inside the seal (R174-F2: seal windows are O(suffix), not O(chain)).
+- **The mini** runs opportunistically at a chain-depth threshold under
+  **trylock** `serial_mu` (engine_internal.h:194) — it bails on contention;
+  the commit-cadence chain bound (a commit's fold under `fs->global` EX
+  cannot be starved) is the backstop.
+- **Lazy-open single-flight:** the six serial `*_locked` bodies and the
+  concurrent slow-warm path materialize a root only via `load_root_locked`
+  on `commit_mu` (R174-F1: the double-materialise race — a lost acked
+  prepend — is closed by construction).
+- **Teardown (chunk 9b):** `stm_btree_engine_retire` splits teardown — the
+  pool-touching implicit abort runs synchronously in the closer's thread;
+  the RAM half (published tree + chains, cache, both mutexes, the struct)
+  is **EBR-deferred** (`engine_free_ram_cb`), so a pinned reader that
+  resolved the engine before its unpublish can never deref freed memory.
+  Dataset slots are pointer-stable per-slot heap allocations (R175-F1: the
+  realloc-moved flat array dangled every open engine's `vt_ctx`).
+- **The funnels (chunk 10):** all 11 metadata funnels (inode/dirent/xattr/
+  extent put/del/get shapes) run `_concurrent` with a self-pinning EBR
+  discipline (`stm_ebr_thread_current`); the serial write APIs REFUSE a
+  chained root (regime purity) — no production serial writer remains.
 
-The family needs a concurrent reader+writer on ONE engine, which a single
-serial connection never produces, so it is **unreachable at v1.0** (the boot,
-the go-build) and reachable only under **multi-connection-same-dataset** (A-5b
-multi-user, or any concurrent-FS-throughput lift). Ground truth (Area D): real
-by construction yet it did **not** reproduce under direct ASan stress
-(2,000,000 wait-free reads racing 2,000,000 same-inode writes, zero torn
-reads). Disposition: **seam to the post-Go concurrent-FS arc** — schedule the
-9.8 BE-write half before multi-connection-same-dataset ships.
+**R171 status update (was: a known-open P0 UAF family).** P0-1 (in-place
+`eng_leaf_put` upsert vs a wait-free reader), P0-2 (engine freed under a
+reader by rollback/`dataset_destroy`), and P0-4 (`invalidate_memtree` frees
+the tree under a pinned reader) are **CLOSED** by chunks 9b + 10 (the
+CAS-prepend write regime + the EBR-retire teardown + unpublish-then-retire
+under `idx->lock`). P0-3 (#1232, unmount drain) remains the only open R171
+row — production-mitigated (stratumd's shutdown drains workers first; see
+§29.11).
 
-## 29.6 — Throughput characterization
+## 29.8 — EBR, wait-free reads, and the STM_EBUSY retry policy
 
-`tests/bench_concurrent_write.c` (N writers, distinct inodes, AEAD on,
-non-sanitized build; env-knobbed `STM_BENCH_WRSZ`/`NWRITES`/`COMMIT`/`THREADS`).
+Wait-free reads take no rwlock: `stm_ebr_enter`, atomic-acquire-load the
+root, descend chain → buffer → base, `stm_ebr_exit`. EBR (`src/ebr/ebr.c`)
+keeps superseded nodes alive until every reader that could observe them has
+exited its epoch; `stm_ebr_shutdown` is process-teardown-only (R175-F6).
 
-**Multi-thread scaling (64 KiB records, commit/32):**
+**The EBUSY contract** (`include/stratum/btree_engine.h:501`): the engine's
+internal retry restarts only a seal observed BEFORE any callback fired; a
+MID-WALK seal/tombstone returns `STM_EBUSY` **immediately** (restarting
+after emission would duplicate entries — only the caller can reset its
+accumulation state). `STM_EBUSY` from any `_concurrent` API is retriable
+back-pressure under adversarial bursts, never corruption. The caller
+policies, all sharing `STM_BTREE_ENGINE_EBUSY_RETRY_MAX` = 64
+(btree_engine.h:531):
 
-```
-threads   agg_MB/s   scaling_vs_1
-   1        ~62          1.00x
-   2        ~60          ~0.96x
-   4        ~54          ~0.86x
-   8        ~58          ~0.93x   (run-to-run host noise; the point is: no gain)
-```
+- **Read ops (fs.c):** 13 wait-free sites fall back to a serial re-read
+  under `fs->global` SH on `STM_ECORRUPT || STM_EBUSY` (R175-F2). The
+  scan-shaped fallbacks are deterministic (the serial scan holds `serial_mu`
+  — it cannot EBUSY); the GET-shaped ones narrow the residue to a
+  bounded-retry within the retriable contract.
+- **Write-path scans (CF-2c):** the 5 scan sites (`in_seed_dsstate_locked`,
+  `in_find_freed`, `ex_collect_in_ino_locked` [+ overlap + 15 collect
+  callers inherit], dirent `drop_for_dir`, xattr `drop_for_ino`) run
+  `stm_btree_engine_scan_range_concurrent` in a bounded whole-scan retry:
+  fresh EBR pin per attempt, the collect ctx FULLY RESET per attempt,
+  `sched_yield` between, honest `STM_EBUSY` at the bound. ONE deliberate
+  exception: `stm_xattr_list` keeps its serial body — its only production
+  caller is the listxattr SH-fallback whose serial walk IS the
+  forward-progress guarantee.
+- **Write funnels (CF-2d):** all 7 write funnels (`in_engine_put`;
+  `di_engine_put/del`; `xa_engine_put/del`; `ex_engine_put/del`) wrap their
+  `_concurrent` call in the same bounded retry, so a transient seal never
+  surfaces to the public `stm_fs_*` API as a spurious failure; a genuinely
+  wedged seal still surfaces as `STM_EBUSY` after 64 attempts.
+- **`ex_global_walk_locked`** (the cross-pool paddr/cohabit walk on every
+  extent insert/overwrite/reflink): the two HOT write-path checks run
+  concurrent + retry WITHOUT a ctx reset — their shared callback is MONOTONE
+  (it only ever sets `collision`/`cohabit_ok`), so re-emission is
+  idempotent; the four COLD accumulating walkers (count, validate-collect
+  ×2, lookup_by_paddr) keep the serial scan, documented at the helper.
 
-Aggregate throughput is **flat** across thread count — concurrent writers all
-funnel through the global `dirty_buffer->mu`, the per-dataset
-`extent_index->lock`, the global `alloc->lock`, and the one-in-flight
-`bdev d->lock`. The multi-connection (A-5b) write-scaling ceiling.
+Serial scans (`stm_btree_engine_scan_range`) hold `serial_mu` for the whole
+walk — they cannot EBUSY, but they suppress the mini for the duration (the
+#39/#40 chain-growth family); post-CF-2c only the deliberate exceptions
+above remain on that path.
 
-**Single-thread decomposition (the absolute number is per-extent-overhead-
-bound, NOT crypto- or commit-bound):**
+## 29.9 — Throughput characterization
 
-```
-record size   commit cadence       MB/s
-   64 KiB      every 32 (8 commits)  52.8
-   64 KiB      end-only (1 commit)   51.7   <- commit cadence is IRRELEVANT
-    1 MiB      every 8              166.2
-    4 MiB      every 2              199.5   <- ~4x, approaching the AEAD ceiling
-```
+**Core-level (Area D, `tests/bench_concurrent_write.c` — still current):**
+aggregate multi-thread write throughput is flat ~52–62 MB/s across 1→8
+threads (writers funnel through the global `dirty_buffer->mu`, the
+per-dataset `extent_index->lock`, `alloc->lock`, and the one-in-flight
+bdev); the dominant single-thread cost is a fixed per-extent overhead
+(64 KiB records ~52 MB/s; 4 MiB records ~200 MB/s, approaching the software
+AEAD ceiling); commit cadence is irrelevant (1 commit == 8 commits).
 
-The dominant single-thread cost is a **fixed per-extent overhead** (extent-index
-btree insert + a Merkle node + AEAD nonce/tag setup + alloc), independent of
-write size. Small (64 KiB) records pay it on every write -> ~52 MB/s; 4 MiB
-records amortize it -> ~200 MB/s, roughly the 2-pass XChaCha20-SIV software-AEAD
-ceiling (so at large records it genuinely is approaching crypto-bound). fsync /
-commit cadence is NOT the bottleneck (1 commit == 8 commits).
+**End-to-end (CF-2f, 2026-07-07; in-guest, HVF, cpus=4; identical
+seed-restored pool per leg; `usr/fsbench` + the gofmt 91-pkg build):**
 
-**Implication for the go-build (perf-debt, designed fix).** A `go build` is a
-small-write storm (object files, `$WORK` intermediates) -> the
-per-extent-overhead-bound ~52 MB/s regime, not the 200. The fix is the **9.8
-BE-write half's Bε buffer** (batches N small updates into O(N/B) physical
-writes -- `docs/phase-9.8-design.md` §5) -- the SAME work that closes R171 and
-unlocks concurrency -- plus **Area S** (small-files/small-write batching). The
-absolute crypto delta (with/without AEAD) is **Area E's** headline; Stratum has
-no unencrypted mode (the keyfile gates everything), so isolating it needs a
-cipher-bypass build (an Area E prerequisite).
+| measure | pool (workers=4) | serial (--fs-workers=1) |
+|---|---|---|
+| gofmt cold (91 pkgs) | 26.9 s | 27.6 s |
+| gofmt warm | 3.7 s | 3.5 s |
+| hello build / build2 | 6.0 / 6.0 s | 5.2 / 5.2 s |
+| fsbench seqwrite | 9.16 MiB/s | 9.32 MiB/s |
+| fsbench seqread (cold) | 26.8 MiB/s | 28.7 MiB/s |
+| fsbench reread (dcache) | 78.3 MiB/s | 102.8 MiB/s |
+| fsbench create | 1283 files/s | 1558 files/s |
+| fsbench fsync | 39 files/s | 41 files/s |
 
-## 29.7 — Tests + the TSan caveat
+Two honest findings, both tracked: (1) on op-dense SINGLE-in-flight
+workloads the pool pays a per-op reader→worker handoff cost (reread −24%,
+create −18%, hello −15%) and buys nothing on the gofmt build despite `-p 4`
+— where parallel build actions actually serialize is an open question
+(#368: guest-side tag concurrency? the package DAG? the core locks below
+the pool?). (2) gofmt cold regressed ~23% vs the pre-CF-1 bar (21.8/21.9 s
+→ 26.9/27.6 s) in BOTH pool modes with a byte-identical kernel — the delta
+is CF-1-chunk-8-11-shaped (per-op EBR + chain machinery on the metadata
+path), tracked as #367. The pool's designed win case — genuinely concurrent
+in-flight tags — is real but not yet demonstrated by this workload.
 
-- `tests/test_compound_ops_concurrent.c` — the mature PARALLEL-3 suite
-  (per-inode chmod/create-unlink/rename-NoCircularWait/reflink/cfr + a
-  compound-op-vs-reader); **ASan-clean** (R132/R134-audited).
-- `tests/test_concurrent_lf_read.c` (Area D) — the wait-free-read-vs-writer
-  stress/characterization (the gap the suite above lacked); ASan-clean,
-  permanent coverage. NOT a default gate.
-- `tests/bench_concurrent_write.c` (Area D) — the §29.6 scaling probe.
+## 29.10 — Tests
 
-**TSan caveat:** ThreadSanitizer is **broken on macOS arm64** after the 2026-06
-OS update (it crashes inside `__tsan::SlotLock` dereferencing a null
-ThreadState — a runtime defect, not a Stratum bug). So the data-race class that
-ASan cannot catch (lost updates, non-crashing torn reads) is currently covered
-by **adversarial code review + the mature suite + ASan**, not by TSan. Re-run
-the concurrency suite under TSan on a Linux host or a fixed toolchain when
-available.
+- `tests/test_9p_pool.c` (CF-2a/2b; 17 tests) — raw-frame client over a
+  socketpair: pipelined mixed ops, Tflush of QUEUED/EXECUTING/UNKNOWN,
+  duplicate-tag fatal, Tversion barrier + msize renegotiate, frame > msize,
+  clean-EOF drain, back-pressure (64 slots), N=1 bypass equivalence, and the
+  4 `pin_*` tests (clunk-wait REVERT-PROVEN via the busy==0 unpin abort;
+  same-newfid walk/walk; shared-pin overlap; version-barrier wait). The
+  determinism substrate is `stm_9p_server_set_test_hooks` (a phase-(b) park
+  hook) + the pool's `pre_handle`/`on_fatal` hooks.
+- `tests/test_compound_ops_concurrent.c` — the mature PARALLEL-3 suite +
+  `cf2c_scan_ports_alloc_reuse_vs_write_storm` (create/unlink churn vs a
+  write+commit storm + a post-join integrity probe).
+- The 10 CF-2d injected tests across `test_inode/test_dirent/test_xattr/
+  test_extent_index.c`, driven by `eng_test_busy_countdown`
+  (engine_internal.h; skip-N-fire-once self-disabling / −2 fire-always;
+  hooked at `insert/delete_concurrent` tops + per-emission in the CONCURRENT
+  `leaf_merge_emit`) — funnel retry-absorbs, honest-EBUSY-at-the-bound, and
+  the mid-emission partial-ctx reset per scan family. REVERT-PROVEN: bound=1
+  fails exactly the 9 retry-dependent tests.
+- `tests/test_concurrent_lf_read.c` + `tests/bench_concurrent_write.c`
+  (Area D) — the wait-free-read stress + the §29.9 core scaling probe.
 
-## 29.8 — Known caveats / footguns
+**Sanitizer posture:** macOS ASan + TSan are host-broken (hello-world-proven
+environmental breakage, task #52); guard-malloc + UBSan are the local
+substitutes (both green across the arc). A Linux ASan/LeakSan/TSan pass is
+OWED infra (propose-then-execute; three deterministic payloads are staged:
+the R175-F1 slot-growth regression, the 9b close race, the R174 leak
+points).
 
-- The wait-free read path does NOT synchronize against `stm_fs_unmount`
-  (R171 P1-3); callers MUST quiesce in-flight reads before unmount. stratumd's
-  shutdown drains workers first, so the production obligation holds.
+## 29.11 — Known caveats / footguns
+
+- **R171 P0-3 (#1232):** the wait-free read path does not synchronize
+  against `stm_fs_unmount`; callers MUST quiesce in-flight reads before
+  unmount. stratumd's shutdown joins the pool (CF2-I8) then the connection
+  threads, so the production obligation holds. The only open R171 row.
+- **O_APPEND cross-connection TOCTOU** — pre-existing, documented in
+  `docs/cf-2-design.md` §4.3; not a CF-2 regression (same-connection appends
+  serialize per-inode).
+- The dirty buffer is a single global mutex; concurrent writers to distinct
+  inodes still serialize there (§29.9 is why).
 - The per-inode mutex is released between `stm_inode_lookup` and
-  `stm_inode_set` (fs.c:3629-3632), but the caller's per-inode PIN excludes any
-  other writer across that window — do not remove the pin.
-- The dirty buffer is a single global mutex, not per-inode; concurrent writers
-  to distinct inodes still serialize there (§29.6 is why).
+  `stm_inode_set`, but the caller's per-inode PIN excludes any other writer
+  across that window — do not remove the pin.
+- The CF-2c/2d retry loops hold their subsystem `idx->lock` across up to 64
+  yields — bounded starvation by design; do NOT widen the bound without
+  re-deriving the seal-holder's progress argument.
+- A serial scan under `serial_mu` suppresses the mini for its duration; do
+  not add new serial-scan callers without the `stm_xattr_list`-style
+  forward-progress justification.
+- The pool adds a measurable per-op cost on single-in-flight workloads
+  (§29.9); `--fs-workers 1` is the untouched serial loop if a deployment is
+  known single-threaded.
