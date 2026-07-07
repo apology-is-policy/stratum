@@ -4308,4 +4308,277 @@ STM_TEST(p9_46_getattr_sees_unfsynced_write_size) {
     unlink(g_key_path);
 }
 
+/* ── Twalkgetattr / Rwalkgetattr (Thylacine POUNCE extension, 140/141) ── */
+
+static uint32_t build_twalkgetattr(uint8_t *req, uint16_t tag,
+                                   uint32_t fid, uint32_t newfid,
+                                   uint64_t mask,
+                                   uint16_t n, const char **names)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid);    p += 4;
+    pack_u32(p, newfid); p += 4;
+    pack_u64(p, mask);   p += 8;
+    pack_u16(p, n);      p += 2;
+    for (uint16_t i = 0; i < n; i++) {
+        uint16_t nl = (uint16_t)strlen(names[i]);
+        pack_u16(p, nl); p += 2;
+        memcpy(p, names[i], nl); p += nl;
+    }
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TWALKGETATTR;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+/* Rwalkgetattr element i base: 7-byte hdr + nwqid[2] + i * body(153).
+ * Within an element: valid@0 qid@8 mode@21 uid@25 gid@29 nlink@33
+ * rdev@41 size@49. */
+#define WGA_BODY 153u
+#define WGA_EL(resp, i) ((resp) + 9u + (size_t)(i) * WGA_BODY)
+
+/* Fixture: mkdir "a" under the root (fid 100) + create "a/f" with 5
+ * bytes via a scratch fid. Leaves only fid 100 live. */
+static void wga_make_a_f(stm_9p_server *s)
+{
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tmkdir(req, 60, 100, "a", 0755u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RMKDIR);
+    const char *pa[] = { "a" };
+    sz = build_twalk(req, 61, 100, 105, 1, pa);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    sz = build_tlcreate(req, 62, 105, "f", 1u /* O_WRONLY */, 0644u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    sz = build_twrite(req, 63, 105, 0, (const uint8_t *)"hello", 5u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    sz = build_tclunk(req, 64, 105);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RCLUNK);
+    free(req); free(resp);
+}
+
+STM_TEST(p9_walkgetattr_parity_and_bind) {
+    make_tmp("9p_wga_parity");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)root;
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    wga_make_a_f(s);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint8_t *ref = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    /* Reference: Twalk(100->102, [a,f]) qids + Tgetattr(102). */
+    const char *path[] = { "a", "f" };
+    uint32_t sz = build_twalk(req, 2, 100, 102, 2, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, ref, RBUF, &rlen));
+    STM_ASSERT_EQ(ref[4], STM_9P_RWALK);
+    STM_ASSERT_EQ(load_u16(ref + 7), 2u);
+    /* ref qids at +9 (a) and +22 (f); keep the whole frame. */
+    uint8_t ref_qids[2 * 13];
+    memcpy(ref_qids, ref + 9, sizeof ref_qids);
+    sz = build_tgetattr(req, 3, 102, STM_9P_GETATTR_ALL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, ref, RBUF, &rlen));
+    STM_ASSERT_EQ(ref[4], STM_9P_RGETATTR);
+    uint32_t ref_mode_f = load_u32(ref + 28);   /* 7+8+13 */
+    uint64_t ref_size_f = load_u64(ref + 56);
+    sz = build_tclunk(req, 4, 102);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, ref, RBUF, &rlen));
+
+    /* Fused: Twalkgetattr(100->103, [a,f]). */
+    sz = build_twalkgetattr(req, 5, 100, 103, STM_9P_GETATTR_ALL, 2, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALKGETATTR);
+    STM_ASSERT_EQ(load_u16(resp + 7), 2u);
+    /* Per-component qids byte-match Twalk's. */
+    STM_ASSERT_EQ(memcmp(WGA_EL(resp, 0) + 8, ref_qids, 13), 0);
+    STM_ASSERT_EQ(memcmp(WGA_EL(resp, 1) + 8, ref_qids + 13, 13), 0);
+    /* Component 0 ("a") is a directory qid (QTDIR = 0x80). */
+    STM_ASSERT_EQ(WGA_EL(resp, 0)[8], 0x80u);
+    /* Component 1 ("f") attrs match the sequential Tgetattr. */
+    STM_ASSERT_EQ(load_u32(WGA_EL(resp, 1) + 21), ref_mode_f);
+    STM_ASSERT_EQ(load_u64(WGA_EL(resp, 1) + 49), ref_size_f);
+    STM_ASSERT_EQ(load_u64(WGA_EL(resp, 1) + 49), 5u);
+
+    /* newfid 103 is BOUND: Tgetattr(103) works and returns f's qid. */
+    sz = build_tgetattr(req, 6, 103, STM_9P_GETATTR_BASIC);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETATTR);
+    STM_ASSERT_EQ(memcmp(resp + 15, ref_qids + 13, 13), 0);
+    sz = build_tclunk(req, 7, 103);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RCLUNK);
+
+    free(req); free(resp); free(ref);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_walkgetattr_query_nofid_binds_nothing) {
+    make_tmp("9p_wga_nofid");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)root;
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    wga_make_a_f(s);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    /* Query walk: newfid == NOFID. Attrs come back; NOTHING binds. */
+    const char *path[] = { "a", "f" };
+    uint32_t sz = build_twalkgetattr(req, 2, 100, 0xFFFFFFFFu,
+                                     STM_9P_GETATTR_ALL, 2, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALKGETATTR);
+    STM_ASSERT_EQ(load_u16(resp + 7), 2u);
+    STM_ASSERT_EQ(load_u64(WGA_EL(resp, 1) + 49), 5u);   /* f size */
+
+    /* NOFID was never bound: Tgetattr(0xFFFFFFFF) -> EBADF. */
+    sz = build_tgetattr(req, 3, 0xFFFFFFFFu, STM_9P_GETATTR_BASIC);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)EBADF);
+
+    /* The source fid survives a query untouched. */
+    sz = build_tgetattr(req, 4, 100, STM_9P_GETATTR_BASIC);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETATTR);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_walkgetattr_partial_walk_binds_nothing) {
+    make_tmp("9p_wga_partial");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)root;
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    wga_make_a_f(s);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    /* [a, missing]: partial walk -> nwqid=1 with a's attrs; newfid
+     * NOT bound (Twalk parity). */
+    const char *path[] = { "a", "missing" };
+    uint32_t sz = build_twalkgetattr(req, 2, 100, 104,
+                                     STM_9P_GETATTR_ALL, 2, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALKGETATTR);
+    STM_ASSERT_EQ(load_u16(resp + 7), 1u);
+    STM_ASSERT_EQ(WGA_EL(resp, 0)[8], 0x80u);            /* a: QTDIR */
+
+    sz = build_tgetattr(req, 3, 104, STM_9P_GETATTR_BASIC);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)EBADF);
+
+    /* First-component miss -> ENOENT (Twalk parity). */
+    const char *missing[] = { "missing" };
+    sz = build_twalkgetattr(req, 4, 100, 104, STM_9P_GETATTR_ALL,
+                            1, missing);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)ENOENT);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_walkgetattr_gates) {
+    make_tmp("9p_wga_gates");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)root;
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    wga_make_a_f(s);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    /* Truncated body (body_len < 18) -> EPROTO. */
+    uint8_t *p = req + 7;
+    pack_u32(p, 100u); p += 4;
+    pack_u32(p, 106u); p += 4;
+    pack_u16(p, 0u);   p += 2;      /* 10-byte body: mask+nwname cut */
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TWALKGETATTR;
+    pack_u16(req + 5, 2u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)EPROTO);
+
+    /* An OPEN source fid is rejected EINVAL (h_walk parity). */
+    const char *pa[] = { "a" };
+    sz = build_twalk(req, 3, 100, 107, 1, pa);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    sz = build_tlopen(req, 4, 107, 0u /* O_RDONLY */);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    const char *pf[] = { "f" };
+    sz = build_twalkgetattr(req, 5, 107, 108, STM_9P_GETATTR_ALL, 1, pf);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)EINVAL);
+    sz = build_tclunk(req, 6, 107);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+
+    /* nwname > 16 -> EINVAL. */
+    const char *many[17] = {
+        "a","a","a","a","a","a","a","a","a","a","a","a","a","a","a","a","a" };
+    sz = build_twalkgetattr(req, 7, 100, 109, STM_9P_GETATTR_ALL, 17, many);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)EINVAL);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("9p")

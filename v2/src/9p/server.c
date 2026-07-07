@@ -1371,14 +1371,18 @@ struct walk_cursor {
  * Component failures stop the loop (partial walk — *out_nwqid < nwname);
  * a malformed wire string returns STM_EPROTOCOL. consult_bindings
  * requires s->lock held; the fast path passes false and runs unlocked
- * (it reads only s->fs, which is immutable). */
+ * (it reads only s->fs, which is immutable). ivs_out (optional, NULL
+ * from Twalk): the per-step stm_fs_stat value already fetched for the
+ * qid encoding is ALSO stored at ivs_out[i] for each emitted qid — the
+ * Twalkgetattr per-component attrs come for free (POUNCE). */
 static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
                                      uint64_t conn_root_ds,
                                      uint64_t conn_root_ino,
                                      const uint8_t *bp, const uint8_t *end,
                                      uint16_t nwname,
                                      struct walk_cursor *cur,
-                                     uint8_t *qids, uint16_t *out_nwqid)
+                                     uint8_t *qids, uint16_t *out_nwqid,
+                                     struct stm_inode_value *ivs_out)
 {
     uint16_t nwqid = 0;
 
@@ -1471,6 +1475,8 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
 
         p9l_pqid(qids + nwqid * STM_9P_QID_SIZE,
                   cur->qt, cur->gen, qid_path(cur->ds, cur->ino));
+        if (ivs_out)
+            ivs_out[nwqid] = next_iv;
         nwqid++;
     }
 
@@ -1478,38 +1484,64 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
     return STM_OK;
 }
 
+/* One Rgetattr body: valid[8] qid[13] mode[4] uid[4] gid[4] nlink[8]
+ * rdev[8] size[8] blksize[8] blocks[8] 4x(sec[8],nsec[8]) gen[8]
+ * data_version[8]. */
+#define STM_9P_GETATTR_BODY_SIZE \
+    (8u + STM_9P_QID_SIZE + 4u + 4u + 4u + 8u + 8u + 8u + 8u + 8u + \
+     8u * 8u + 8u + 8u)
+
+/* Pack one Rgetattr body from a raw inode value. The single source of
+ * truth for the Rgetattr payload AND the per-component Rwalkgetattr
+ * element (POUNCE) — the two MUST stay byte-identical, so both pack
+ * through here. qid13 = the 13-byte packed qid (the caller owns the
+ * qid encoding — h_getattr from the fid snapshot, Twalkgetattr from
+ * the walk loop's per-step pack). rdev / data_version are zero and
+ * blksize is the synthetic 4096, exactly as h_getattr has always
+ * replied; gen is the u32-truncated si_gen (the fid cached_gen width).
+ * Returns wp advanced by STM_9P_GETATTR_BODY_SIZE. */
+static uint8_t *pack_getattr_body(uint8_t *wp, uint64_t valid,
+                                  const uint8_t *qid13,
+                                  const struct stm_inode_value *iv)
+{
+    uint64_t size = stm_load_le64(iv->si_size);
+    p9l_p64(wp, valid); wp += 8;
+    memcpy(wp, qid13, STM_9P_QID_SIZE); wp += STM_9P_QID_SIZE;
+    p9l_p32(wp, stm_load_le32(iv->si_mode)); wp += 4;
+    p9l_p32(wp, stm_load_le32(iv->si_uid));  wp += 4;
+    p9l_p32(wp, stm_load_le32(iv->si_gid));  wp += 4;
+    p9l_p64(wp, (uint64_t)stm_load_le32(iv->si_nlink)); wp += 8;
+    p9l_p64(wp, 0u);    wp += 8;            /* rdev (no device files yet) */
+    p9l_p64(wp, size);  wp += 8;
+    p9l_p64(wp, 4096u); wp += 8;            /* blksize — synthetic */
+    p9l_p64(wp, (size + 511u) / 512u); wp += 8;  /* blocks — 512B units */
+    p9l_p64(wp, stm_load_le64(iv->si_atime_sec));            wp += 8;
+    p9l_p64(wp, (uint64_t)stm_load_le32(iv->si_atime_nsec)); wp += 8;
+    p9l_p64(wp, stm_load_le64(iv->si_mtime_sec));            wp += 8;
+    p9l_p64(wp, (uint64_t)stm_load_le32(iv->si_mtime_nsec)); wp += 8;
+    p9l_p64(wp, stm_load_le64(iv->si_ctime_sec));            wp += 8;
+    p9l_p64(wp, (uint64_t)stm_load_le32(iv->si_ctime_nsec)); wp += 8;
+    p9l_p64(wp, stm_load_le64(iv->si_btime_sec));            wp += 8;
+    p9l_p64(wp, (uint64_t)stm_load_le32(iv->si_btime_nsec)); wp += 8;
+    p9l_p64(wp, (uint64_t)(uint32_t)stm_load_le64(iv->si_gen)); wp += 8;
+    p9l_p64(wp, 0u); wp += 8;               /* data_version unsupported */
+    return wp;
+}
+
 /* The walk's bind tail — caller holds s->lock. Handles the partial /
  * ENOENT replies (no bind), then binds newfid (allocating it, or
  * rebinding the source when newfid == fid) and builds the Rwalk. */
-static stm_status walk_finish_locked(stm_9p_server *s, p9_fid *f,
-                                        uint32_t fid_num, uint32_t newfid,
-                                        uint16_t nwname,
-                                        const uint8_t *qids, uint16_t nwqid,
-                                        const struct walk_cursor *cur,
-                                        uint64_t conn_root_ds,
-                                        uint64_t conn_root_ino,
-                                        uint16_t tag,
-                                        uint8_t *resp, uint32_t resp_cap,
-                                        uint32_t *resp_len)
+/* Bind newfid to the walk cursor — the full-walk arm shared by Twalk
+ * (walk_finish_locked) and Twalkgetattr (walkgetattr_finish_locked).
+ * Returns 0 on success, else a positive ecode for reply_rlerror. The
+ * caller has already dispatched the partial-walk / nwqid==0 arms. */
+static int walk_bind_locked(stm_9p_server *s, p9_fid *f,
+                            uint32_t fid_num, uint32_t newfid,
+                            uint16_t nwname,
+                            const struct walk_cursor *cur,
+                            uint64_t conn_root_ds,
+                            uint64_t conn_root_ino)
 {
-    if (nwname > 0 && nwqid == 0)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, ENOENT);
-    if (nwname > 0 && nwqid < nwname) {
-        /* Partial walk: reply with fewer qids; newfid NOT bound. */
-        uint32_t need = STM_9P_HDR_SIZE + 2u + (uint32_t)nwqid * STM_9P_QID_SIZE;
-        if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
-        uint8_t *wp = resp + 4;
-        *wp++ = STM_9P_RWALK;
-        p9l_p16(wp, tag); wp += 2;
-        p9l_p16(wp, nwqid); wp += 2;
-        if (nwqid) {
-            memcpy(wp, qids, (size_t)nwqid * STM_9P_QID_SIZE);
-            wp += nwqid * STM_9P_QID_SIZE;
-        }
-        resp_finish(resp, resp_len, wp);
-        return STM_OK;
-    }
-
     /* CF-2b: on the fast path the source fid was only PINNED during
      * the unlocked component loop — a concurrent (protocol-violating)
      * same-fid Txattrcreate may have repurposed it to AUX_XATTR.
@@ -1518,7 +1550,7 @@ static stm_status walk_finish_locked(stm_9p_server *s, p9_fid *f,
      * Unreachable from the full-lock fallback (its gates ran under
      * the same lock hold). */
     if (newfid == fid_num && f->kind != P9_FID_NODE)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
+        return EINVAL;
 
     /* Pre-allocate the new ns_path BEFORE any structural mutation of
      * the bound fid. Otherwise an ENOMEM here would leave a rewound-
@@ -1529,8 +1561,7 @@ static stm_status walk_finish_locked(stm_9p_server *s, p9_fid *f,
      * before any state mutation. */
     char *new_ns = malloc(cur->path_len + 1u);
     if (!new_ns)
-        return reply_rlerror(resp, resp_cap, resp_len, tag,
-                              STM_9P_ECODE_ENOMEM);
+        return STM_9P_ECODE_ENOMEM;
     memcpy(new_ns, cur->path, cur->path_len);
     new_ns[cur->path_len] = '\0';
 
@@ -1542,7 +1573,7 @@ static stm_status walk_finish_locked(stm_9p_server *s, p9_fid *f,
         nf = fid_alloc(s, newfid);
         if (!nf) {
             free(new_ns);
-            return reply_rlerror(resp, resp_cap, resp_len, tag, EBADF);
+            return EBADF;
         }
     }
 
@@ -1574,6 +1605,42 @@ static stm_status walk_finish_locked(stm_9p_server *s, p9_fid *f,
     free(nf->ns_path);
     nf->ns_path     = new_ns;
     nf->ns_path_len = cur->path_len;
+    return 0;
+}
+
+static stm_status walk_finish_locked(stm_9p_server *s, p9_fid *f,
+                                        uint32_t fid_num, uint32_t newfid,
+                                        uint16_t nwname,
+                                        const uint8_t *qids, uint16_t nwqid,
+                                        const struct walk_cursor *cur,
+                                        uint64_t conn_root_ds,
+                                        uint64_t conn_root_ino,
+                                        uint16_t tag,
+                                        uint8_t *resp, uint32_t resp_cap,
+                                        uint32_t *resp_len)
+{
+    if (nwname > 0 && nwqid == 0)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ENOENT);
+    if (nwname > 0 && nwqid < nwname) {
+        /* Partial walk: reply with fewer qids; newfid NOT bound. */
+        uint32_t need = STM_9P_HDR_SIZE + 2u + (uint32_t)nwqid * STM_9P_QID_SIZE;
+        if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+        uint8_t *wp = resp + 4;
+        *wp++ = STM_9P_RWALK;
+        p9l_p16(wp, tag); wp += 2;
+        p9l_p16(wp, nwqid); wp += 2;
+        if (nwqid) {
+            memcpy(wp, qids, (size_t)nwqid * STM_9P_QID_SIZE);
+            wp += nwqid * STM_9P_QID_SIZE;
+        }
+        resp_finish(resp, resp_len, wp);
+        return STM_OK;
+    }
+
+    int ec = walk_bind_locked(s, f, fid_num, newfid, nwname, cur,
+                              conn_root_ds, conn_root_ino);
+    if (ec)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ec);
 
     uint32_t need = STM_9P_HDR_SIZE + 2u + (uint32_t)nwqid * STM_9P_QID_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -1657,7 +1724,7 @@ static stm_status h_walk(stm_9p_server *s,
         stm_status wrc = walk_components(s, /*consult_bindings=*/true,
                                             conn_root_ds, conn_root_ino,
                                             bp, end, nwname,
-                                            &cur, qids, &nwqid);
+                                            &cur, qids, &nwqid, NULL);
         if (wrc != STM_OK)
             return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
         return walk_finish_locked(s, f, fid, newfid, nwname,
@@ -1684,7 +1751,7 @@ static stm_status h_walk(stm_9p_server *s,
         stm_status wrc = walk_components(s, /*consult_bindings=*/false,
                                             conn_root_ds, conn_root_ino,
                                             bp, end, nwname,
-                                            &cur, qids, &nwqid);
+                                            &cur, qids, &nwqid, NULL);
         if (wrc != STM_OK)
             ecode = EPROTO;
     }
@@ -1699,6 +1766,156 @@ static stm_status h_walk(stm_9p_server *s,
                                     qids, nwqid, &cur,
                                     conn_root_ds, conn_root_ino,
                                     tag, resp, resp_cap, resp_len);
+    fid_unpin_locked(s, f);
+    return ret;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_walkgetattr — Twalkgetattr / Rwalkgetattr (Thylacine POUNCE           */
+/* extension, 138/139; thylacine docs/POUNCE-DESIGN.md).                   */
+/* Twalkgetattr: fid[4] newfid[4] request_mask[8] nwname[2]                */
+/*               nwname*(wname[s])                                         */
+/* Rwalkgetattr: nwqid[2] nwqid*(getattr_body)                             */
+/* Twalk semantics (same fid gates, same partial-walk rule, same bind)     */
+/* PLUS one Rgetattr body per walked component — the walk-fused attrs the  */
+/* Thylacine kernel's per-component X-search consumes. newfid ==           */
+/* STM_9P_NOFID is permitted as a WALK-QUERY: walk + sample, bind          */
+/* NOTHING (nothing to clunk — the 1-RPC stat).                            */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status walkgetattr_finish_locked(stm_9p_server *s, p9_fid *f,
+                                              uint32_t fid_num,
+                                              uint32_t newfid,
+                                              uint64_t request_mask,
+                                              uint16_t nwname,
+                                              const uint8_t *qids,
+                                              uint16_t nwqid,
+                                              const struct stm_inode_value *ivs,
+                                              const struct walk_cursor *cur,
+                                              uint64_t conn_root_ds,
+                                              uint64_t conn_root_ino,
+                                              uint16_t tag,
+                                              uint8_t *resp, uint32_t resp_cap,
+                                              uint32_t *resp_len)
+{
+    if (nwname > 0 && nwqid == 0)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, ENOENT);
+
+    /* Bind only on a FULL walk with a real newfid. A partial walk binds
+     * nothing (Twalk parity: the reply carries the walked prefix); a
+     * NOFID query never binds. */
+    bool partial = (nwname > 0 && nwqid < nwname);
+    if (!partial && newfid != STM_9P_NOFID) {
+        int ec = walk_bind_locked(s, f, fid_num, newfid, nwname, cur,
+                                  conn_root_ds, conn_root_ino);
+        if (ec)
+            return reply_rlerror(resp, resp_cap, resp_len, tag, ec);
+    }
+
+    uint64_t valid = request_mask & STM_9P_GETATTR_ALL;
+    uint32_t need = STM_9P_HDR_SIZE + 2u
+                  + (uint32_t)nwqid * STM_9P_GETATTR_BODY_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RWALKGETATTR;
+    p9l_p16(wp, tag); wp += 2;
+    p9l_p16(wp, nwqid); wp += 2;
+    for (uint16_t i = 0; i < nwqid; i++)
+        wp = pack_getattr_body(wp, valid,
+                               qids + (size_t)i * STM_9P_QID_SIZE, &ivs[i]);
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+static stm_status h_walkgetattr(stm_9p_server *s,
+                                  const uint8_t *body, uint32_t body_len,
+                                  uint16_t tag,
+                                  uint8_t *resp, uint32_t resp_cap,
+                                  uint32_t *resp_len)
+{
+    if (body_len < 18)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+    uint32_t fid          = p9l_g32(body);
+    uint32_t newfid       = p9l_g32(body + 4);
+    uint64_t request_mask = p9l_g64(body + 8);
+    uint16_t nwname       = p9l_g16(body + 16);
+    const uint8_t *bp  = body + 18;
+    const uint8_t *end = body + body_len;
+
+    if (nwname > STM_9P_MAX_WALK)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
+
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, EBADF);
+    /* Same gates as h_walk (see the R93 rationale there). */
+    if (f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
+    if (f->is_open)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
+    if (!f->ns_path || f->ns_path_len == 0 ||
+        f->ns_path_len > STM_9P_NS_PATH_MAX)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
+
+    struct walk_cursor cur;
+    cur.ds  = f->dataset_id;
+    cur.ino = f->ino;
+    cur.gen = f->cached_gen;
+    cur.qt  = f->qid_type;
+    memcpy(cur.path, f->ns_path, f->ns_path_len);
+    cur.path[f->ns_path_len] = '\0';
+    cur.path_len = f->ns_path_len;
+    uint64_t conn_root_ds  = f->conn_root_dataset;
+    uint64_t conn_root_ino = f->conn_root_ino;
+
+    uint8_t  qids[STM_9P_MAX_WALK * STM_9P_QID_SIZE];
+    struct stm_inode_value ivs[STM_9P_MAX_WALK];
+    uint16_t nwqid = 0;
+
+    /* Bindings > 0: the FULL-LOCK FALLBACK (h_walk parity). */
+    if (s->num_bindings > 0) {
+        stm_status vrc = verify_fid_fresh(s, f, NULL);
+        if (vrc != STM_OK)
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+        stm_status wrc = walk_components(s, /*consult_bindings=*/true,
+                                            conn_root_ds, conn_root_ino,
+                                            bp, end, nwname,
+                                            &cur, qids, &nwqid, ivs);
+        if (wrc != STM_OK)
+            return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+        return walkgetattr_finish_locked(s, f, fid, newfid, request_mask,
+                                           nwname, qids, nwqid, ivs, &cur,
+                                           conn_root_ds, conn_root_ino,
+                                           tag, resp, resp_cap, resp_len);
+    }
+
+    /* 0 bindings: the 3-PHASE FAST PATH (h_walk parity). */
+    fid_pin_locked(f);
+    phase_b_enter(s, STM_9P_TWALKGETATTR, tag);
+
+    uint32_t ecode = 0;
+    stm_status vrc = verify_fresh_snapshot(s->fs, cur.ds, cur.ino,
+                                              cur.gen, NULL);
+    if (vrc != STM_OK) {
+        ecode = status_to_errno(vrc);
+    } else {
+        stm_status wrc = walk_components(s, /*consult_bindings=*/false,
+                                            conn_root_ds, conn_root_ino,
+                                            bp, end, nwname,
+                                            &cur, qids, &nwqid, ivs);
+        if (wrc != STM_OK)
+            ecode = EPROTO;
+    }
+
+    must_lock(&s->lock);
+    stm_status ret;
+    if (ecode)
+        ret = reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
+    else
+        ret = walkgetattr_finish_locked(s, f, fid, newfid, request_mask,
+                                          nwname, qids, nwqid, ivs, &cur,
+                                          conn_root_ds, conn_root_ino,
+                                          tag, resp, resp_cap, resp_len);
     fid_unpin_locked(s, f);
     return ret;
 }
@@ -1750,62 +1967,23 @@ static stm_status h_getattr(stm_9p_server *s,
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
 
-    uint32_t mode  = stm_load_le32(iv.si_mode);
-    uint32_t uid   = stm_load_le32(iv.si_uid);
-    uint32_t gid   = stm_load_le32(iv.si_gid);
-    uint32_t nlink = stm_load_le32(iv.si_nlink);
-    uint64_t size  = stm_load_le64(iv.si_size);
-    uint64_t atime_sec  = stm_load_le64(iv.si_atime_sec);
-    uint32_t atime_nsec = stm_load_le32(iv.si_atime_nsec);
-    uint64_t mtime_sec  = stm_load_le64(iv.si_mtime_sec);
-    uint32_t mtime_nsec = stm_load_le32(iv.si_mtime_nsec);
-    uint64_t ctime_sec  = stm_load_le64(iv.si_ctime_sec);
-    uint32_t ctime_nsec = stm_load_le32(iv.si_ctime_nsec);
-    uint64_t btime_sec  = stm_load_le64(iv.si_btime_sec);
-    uint32_t btime_nsec = stm_load_le32(iv.si_btime_nsec);
-
     /* The actual returned `valid` mask is the intersection of what the
      * client requested with what we can fill. We can fill all of
      * STM_9P_GETATTR_BASIC + BTIME + GEN. RDEV / DATA_VERSION return
-     * zero (no device numbers; data_version is unsupported). */
+     * zero (no device numbers; data_version is unsupported). The body
+     * itself packs through pack_getattr_body (shared with Twalkgetattr;
+     * iv.si_gen == gen here — verify_fresh_snapshot proved it). */
     uint64_t valid = request_mask & STM_9P_GETATTR_ALL;
+    uint8_t  qid13[STM_9P_QID_SIZE];
+    p9l_pqid(qid13, qid_type_from_mode(stm_load_le32(iv.si_mode)),
+              gen, qid_path(ds, ino));
 
-    uint32_t need = STM_9P_HDR_SIZE
-                  + 8u                /* valid */
-                  + STM_9P_QID_SIZE   /* qid */
-                  + 4u + 4u + 4u      /* mode, uid, gid */
-                  + 8u + 8u           /* nlink, rdev */
-                  + 8u + 8u + 8u      /* size, blksize, blocks */
-                  + 8u + 8u           /* atime sec/nsec */
-                  + 8u + 8u           /* mtime sec/nsec */
-                  + 8u + 8u           /* ctime sec/nsec */
-                  + 8u + 8u           /* btime sec/nsec */
-                  + 8u + 8u;          /* gen, data_version */
+    uint32_t need = STM_9P_HDR_SIZE + STM_9P_GETATTR_BODY_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RGETATTR;
     p9l_p16(wp, tag); wp += 2;
-    p9l_p64(wp, valid); wp += 8;
-    p9l_pqid(wp, qid_type_from_mode(mode), gen, qid_path(ds, ino));
-    wp += STM_9P_QID_SIZE;
-    p9l_p32(wp, mode);  wp += 4;
-    p9l_p32(wp, uid);   wp += 4;
-    p9l_p32(wp, gid);   wp += 4;
-    p9l_p64(wp, (uint64_t)nlink); wp += 8;
-    p9l_p64(wp, 0u);    wp += 8;            /* rdev (no device files yet) */
-    p9l_p64(wp, size);  wp += 8;
-    p9l_p64(wp, 4096u); wp += 8;            /* blksize — synthetic */
-    p9l_p64(wp, (size + 511u) / 512u); wp += 8;  /* blocks — 512B units */
-    p9l_p64(wp, atime_sec);  wp += 8;
-    p9l_p64(wp, atime_nsec); wp += 8;
-    p9l_p64(wp, mtime_sec);  wp += 8;
-    p9l_p64(wp, mtime_nsec); wp += 8;
-    p9l_p64(wp, ctime_sec);  wp += 8;
-    p9l_p64(wp, ctime_nsec); wp += 8;
-    p9l_p64(wp, btime_sec);  wp += 8;
-    p9l_p64(wp, btime_nsec); wp += 8;
-    p9l_p64(wp, (uint64_t)gen); wp += 8;
-    p9l_p64(wp, 0u); wp += 8;               /* data_version unsupported */
+    wp = pack_getattr_body(wp, valid, qid13, &iv);
     resp_finish(resp, resp_len, wp);
     return STM_OK;
 }
@@ -4155,6 +4333,9 @@ stm_status stm_9p_server_handle(stm_9p_server *s,
         break;
     case STM_9P_TWALK:
         rc = h_walk(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TWALKGETATTR:
+        rc = h_walkgetattr(s, body, body_len, tag, resp, resp_cap, resp_len);
         break;
     case STM_9P_TCLUNK:
         rc = h_clunk(s, body, body_len, tag, resp, resp_cap, resp_len);

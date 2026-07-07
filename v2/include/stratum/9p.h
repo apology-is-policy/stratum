@@ -110,7 +110,15 @@ enum {
     STM_9P_TFALLOCATE     = 132,  STM_9P_RFALLOCATE     = 133,
     STM_9P_TFADVISE       = 134,  STM_9P_RFADVISE       = 135,
     STM_9P_TPIN           = 136,  STM_9P_RPIN           = 137,
-    STM_9P_TUNPIN         = 138,  STM_9P_RUNPIN         = 139
+    STM_9P_TUNPIN         = 138,  STM_9P_RUNPIN         = 139,
+    /* Thylacine POUNCE extension (fused walk+getattr; thylacine
+     * docs/POUNCE-DESIGN.md): Twalk semantics + one Rgetattr body per
+     * walked component; newfid == STM_9P_NOFID is a walk-query (binds
+     * nothing). NOTE the Thylacine kernel<->netd Weft family separately
+     * uses 134..137 on ITS domain (never sent to stratumd) — the
+     * cross-project numbering registry reconciliation is tracked
+     * (thylacine #371); 140/141 are free in BOTH registries. */
+    STM_9P_TWALKGETATTR   = 140,  STM_9P_RWALKGETATTR   = 141
 };
 
 /* ────────────────────────────────────────────────────────────────────── */
