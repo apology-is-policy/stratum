@@ -3838,7 +3838,7 @@ STM_TEST(engine_flush_delivers_one_level_and_applies) {
     /* One flush moves messages exactly ONE level down: into the
      * internal children's buffers, not the leaves. */
     eng_split_vec vec = { 0 };
-    STM_ASSERT_OK(eng_flush_node(eng, eng->root, 0, &vec));
+    STM_ASSERT_OK(eng_flush_node(eng, eng->root, 0, &vec, NULL));
     STM_ASSERT_EQ(vec.n, (uint32_t)0);
     STM_ASSERT_EQ(eng->root->buf_count, (uint32_t)0);
     STM_ASSERT_EQ(inner0->buf_count, (uint32_t)3);   /* ab, cc, hh */
@@ -3857,8 +3857,8 @@ STM_TEST(engine_flush_delivers_one_level_and_applies) {
     STM_ASSERT_EQ((long long)n_seen, (long long)10);
 
     /* The second level of flushes APPLIES to the leaves. */
-    STM_ASSERT_OK(eng_flush_node(eng, inner0, 0, &vec));
-    STM_ASSERT_OK(eng_flush_node(eng, inner1, 0, &vec));
+    STM_ASSERT_OK(eng_flush_node(eng, inner0, 0, &vec, NULL));
+    STM_ASSERT_OK(eng_flush_node(eng, inner1, 0, &vec, NULL));
     STM_ASSERT_EQ(vec.n, (uint32_t)0);
     STM_ASSERT_EQ(inner0->buf_count, (uint32_t)0);
     STM_ASSERT_EQ(inner1->buf_count, (uint32_t)0);
@@ -4430,7 +4430,7 @@ STM_TEST(engine_flush_inline_cascade_absorbs_child_peel) {
      * engine_flush_deep_node_dirties_ancestors — the forged fixture
      * here is dirty by construction.) */
     eng_split_vec vec = { 0 };
-    STM_ASSERT_OK(eng_flush_node(eng, root, 0, &vec));
+    STM_ASSERT_OK(eng_flush_node(eng, root, 0, &vec, NULL));
     STM_ASSERT_EQ(vec.n, (uint32_t)0);         /* absorbed, not peeled */
     STM_ASSERT_EQ(root->n_pivots, (uint32_t)2);
     STM_ASSERT_EQ(root->buf_count, (uint32_t)0);
@@ -4758,6 +4758,408 @@ STM_TEST(engine_prepend_mini_consolidates) {
     memstore_destroy(&ms);
     stm_ebr_thread_free(me);
     while (stm_ebr_try_advance() > 0) { }
+}
+
+/* #367 (design 5.3.1) — the leaf-root mini fold. Pre-#367 the mini
+ * structurally bailed on a leaf root, so a fresh (never-committed)
+ * engine's chain held EVERY uncommitted delta and each lookup scanned
+ * it (the measured O(N^2) create collapse). Post: the mini's leaf arm
+ * applies the chain into a resident deep clone every threshold
+ * prepends. Non-vacuity: on pre-#367 code the chain-depth assert
+ * fails (depth == 3 x threshold). */
+STM_TEST(engine_mini_leaf_root_folds) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    stm_ebr_enter(me);
+    for (uint32_t i = 0; i < 3u * ENG_CONSOLIDATE_THRESHOLD; i++) {
+        char k[32], v[32];
+        int kl = snprintf(k, sizeof k, "lr-key-%02u", i);
+        int vl = snprintf(v, sizeof v, "lr-val-%02u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         v, (size_t)vl));
+    }
+    stm_ebr_exit(me);
+
+    /* Small load: the leaf never overflows — the root stays a LEAF
+     * with the deltas APPLIED as entries and the chain bounded. */
+    STM_ASSERT_TRUE(eng->root->is_leaf);
+    STM_ASSERT_TRUE(atomic_load(&eng->root->chain_depth) <
+                    ENG_CONSOLIDATE_THRESHOLD);
+    STM_ASSERT_TRUE(eng->root->n_entries > 0);
+
+    for (uint32_t i = 0; i < 3u * ENG_CONSOLIDATE_THRESHOLD; i++) {
+        char k[32], v[32];
+        snprintf(k, sizeof k, "lr-key-%02u", i);
+        snprintf(v, sizeof v, "lr-val-%02u", i);
+        expect_value(eng, me, k, v);
+    }
+
+    /* Overwrite + tombstone across further folds resolve newest-wins. */
+    stm_ebr_enter(me);
+    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, "lr-key-00",
+                                                     9, "REWRITE", 7));
+    STM_ASSERT_OK(stm_btree_engine_delete_concurrent(eng, me, "lr-key-01",
+                                                     9));
+    for (uint32_t i = 0; i < 2u * ENG_CONSOLIDATE_THRESHOLD; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof k, "lr-fill-%02u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         "f", 1));
+    }
+    stm_ebr_exit(me);
+    expect_value(eng, me, "lr-key-00", "REWRITE");
+    expect_value(eng, me, "lr-key-01", NULL);
+
+    /* The uncommitted state survives a commit + reopen. */
+    uint64_t rp = 0, rg = 0; uint8_t rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &rp, &rg, rc));
+    stm_btree_engine_destroy(eng);
+    stm_btree_engine *re = NULL;
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                        rp, rg, rc, &re));
+    STM_ASSERT_OK(stm_btree_engine_verify(re));
+    expect_value(re, me, "lr-key-00", "REWRITE");
+    expect_value(re, me, "lr-key-01", NULL);
+    expect_value(re, me, "lr-key-02", "lr-val-02");
+    stm_btree_engine_destroy(re);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+    while (stm_ebr_try_advance() > 0) { }
+}
+
+/* #367 — the leaf-root arm's split + grow: a never-committed engine
+ * outgrows one leaf entirely through mini folds (no commit anywhere),
+ * ending with an internal root and every key readable. Pre-#367 the
+ * root stayed a leaf with a 200-deep chain. */
+STM_TEST(engine_mini_leaf_root_grows_internal) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    char big[300];
+    memset(big, 'B', sizeof big);
+    stm_ebr_enter(me);
+    for (uint32_t i = 0; i < 200u; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof k, "grow-key-%03u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         big, sizeof big));
+    }
+    stm_ebr_exit(me);
+
+    STM_ASSERT_FALSE(eng->root->is_leaf);      /* grew without a commit */
+    STM_ASSERT_TRUE(atomic_load(&eng->root->chain_depth) <
+                    ENG_CONSOLIDATE_THRESHOLD);
+    for (uint32_t i = 0; i < 200u; i++) {
+        char k[32];
+        snprintf(k, sizeof k, "grow-key-%03u", i);
+        stm_ebr_enter(me);
+        bool found = false; void *val = NULL; size_t vl = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me,
+                                                         k, strlen(k),
+                                                         &found, &val, &vl));
+        stm_ebr_exit(me);
+        STM_ASSERT_TRUE(found);
+        STM_ASSERT_EQ((long long)vl, (long long)sizeof big);
+        STM_ASSERT_TRUE(memcmp(val, big, vl) == 0);
+        free(val);
+    }
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+    while (stm_ebr_try_advance() > 0) { }
+}
+
+/* #367 — the size-triggered flush bounds the ROOT buffer independent
+ * of commit cadence. Pre-#367 every mini folded ~threshold more
+ * messages into the root buffer and only a commit drained it, so 400
+ * uncommitted writes left ~400 messages there (the linear-scan +
+ * whole-buffer-clone O(N^2)). Post: the resident bound is the region
+ * cap + one fold quantum. */
+STM_TEST(engine_mini_flush_bounds_root_buffer) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+    be9_build_tree(eng, 1000u, 1);
+    STM_ASSERT_FALSE(eng->root->is_leaf);
+
+    stm_ebr_enter(me);
+    for (uint32_t i = 0; i < 400u; i++) {
+        char k[32], v[32];
+        int kl = snprintf(k, sizeof k, "fl-key-%04u", i);
+        int vl = snprintf(v, sizeof v, "fl-val-%04u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         v, (size_t)vl));
+    }
+    stm_ebr_exit(me);
+
+    STM_ASSERT_TRUE(atomic_load(&eng->root->chain_depth) <
+                    ENG_CONSOLIDATE_THRESHOLD);
+    if (!eng->root->is_leaf) {
+        size_t region = eng_msgs_region_bytes(eng->root->buf_msgs,
+                                              eng->root->buf_count);
+        /* <= cap + one fold's worth; 2x cap is the generous structural
+         * bound (pre-#367 this is ~400 messages, way past it). */
+        STM_ASSERT_TRUE(region <= 2u * (size_t)ENG_BUFFER_REGION_MAX);
+    }
+    for (uint32_t i = 0; i < 400u; i += 37u) {
+        char k[32], v[32];
+        snprintf(k, sizeof k, "fl-key-%04u", i);
+        snprintf(v, sizeof v, "fl-val-%04u", i);
+        expect_value(eng, me, k, v);
+    }
+    expect_value(eng, me, "be9-key-00000", "base-00000");
+    expect_value(eng, me, "be9-key-00999", "base-00999");
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+    while (stm_ebr_try_advance() > 0) { }
+}
+
+/* #367 — newest-wins holds across fold -> flush -> suffix phases: a
+ * key rewritten / tombstoned / re-inserted across several flush
+ * cycles always resolves to its newest state, uncommitted AND after a
+ * commit + reopen. */
+STM_TEST(engine_mini_flush_newest_wins) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+    be9_build_tree(eng, 500u, 1);
+
+    char pad[64];
+    memset(pad, 'p', sizeof pad);
+    stm_ebr_enter(me);
+    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, "nw-a", 4,
+                                                     "v1", 2));
+    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, "nw-b", 4,
+                                                     "keep", 4));
+    for (uint32_t i = 0; i < 120u; i++) {      /* force flush cycles */
+        char k[32];
+        int kl = snprintf(k, sizeof k, "nw-pad1-%03u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         pad, sizeof pad));
+    }
+    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, "nw-a", 4,
+                                                     "v2", 2));
+    for (uint32_t i = 0; i < 120u; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof k, "nw-pad2-%03u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         pad, sizeof pad));
+    }
+    STM_ASSERT_OK(stm_btree_engine_delete_concurrent(eng, me, "nw-a", 4));
+    STM_ASSERT_OK(stm_btree_engine_delete_concurrent(eng, me, "nw-gone", 7));
+    for (uint32_t i = 0; i < 120u; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof k, "nw-pad3-%03u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         pad, sizeof pad));
+    }
+    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, "nw-a", 4,
+                                                     "v3", 2));
+    stm_ebr_exit(me);
+
+    expect_value(eng, me, "nw-a", "v3");
+    expect_value(eng, me, "nw-b", "keep");
+    expect_value(eng, me, "nw-gone", NULL);
+    expect_value(eng, me, "be9-key-00000", "base-00000");
+
+    uint64_t rp = 0, rg = 0; uint8_t rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &rp, rc));
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &rp, &rg, rc));
+    stm_btree_engine_destroy(eng);
+    stm_btree_engine *re = NULL;
+    STM_ASSERT_OK(stm_btree_engine_open(&g_memstore_vt, &ms, &cx, 0,
+                                        rp, rg, rc, &re));
+    STM_ASSERT_OK(stm_btree_engine_verify(re));
+    expect_value(re, me, "nw-a", "v3");
+    expect_value(re, me, "nw-b", "keep");
+    expect_value(re, me, "nw-gone", NULL);
+    stm_btree_engine_destroy(re);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+    while (stm_ebr_try_advance() > 0) { }
+}
+
+/* #367 — the flushed-round husk-sweep discipline: a flush that splits
+ * one child SHIFTS its siblings' slot indices, so the sweep must
+ * dispose of husk children by IDENTITY, not index. The regression
+ * shape: hammer child-0's key range (COW + split + splice at index 0)
+ * while child-1 stays untouched-shared; then read child-1's keys.
+ * Pre-fix the index-paired sweep recursively EBR-retired the live,
+ * still-reachable child-1 — a UAF this test makes deterministic under
+ * guard-malloc (the plain run may read stale-but-intact bytes). */
+STM_TEST(engine_mini_flush_shifted_slot_survives) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+
+    char big[300];
+    memset(big, 'S', sizeof big);
+    /* Grow to an internal root through the leaf arm with keys spread
+     * across two ranges, so the split leaves a low (aa) and a high
+     * (zz) child. */
+    stm_ebr_enter(me);
+    for (uint32_t i = 0; i < 30u; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof k, "aa-key-%03u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         big, sizeof big));
+        kl = snprintf(k, sizeof k, "zz-key-%03u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         big, sizeof big));
+    }
+    STM_ASSERT_FALSE(eng->root->is_leaf);
+
+    /* Hammer the LOW range only: flushes COW + split the aa child and
+     * splice at index 0, shifting the zz child's slot. */
+    for (uint32_t i = 30u; i < 150u; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof k, "aa-key-%03u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         k, (size_t)kl,
+                                                         big, sizeof big));
+    }
+    stm_ebr_exit(me);
+
+    /* Force reclamation of anything wrongly retired before reading. */
+    while (stm_ebr_try_advance() > 0) { }
+
+    for (uint32_t i = 0; i < 30u; i++) {
+        char k[32];
+        snprintf(k, sizeof k, "zz-key-%03u", i);
+        stm_ebr_enter(me);
+        bool found = false; void *val = NULL; size_t vl = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me,
+                                                         k, strlen(k),
+                                                         &found, &val, &vl));
+        stm_ebr_exit(me);
+        STM_ASSERT_TRUE(found);
+        STM_ASSERT_TRUE(vl == sizeof big && memcmp(val, big, vl) == 0);
+        free(val);
+    }
+    for (uint32_t i = 0; i < 150u; i++) {
+        char k[32];
+        snprintf(k, sizeof k, "aa-key-%03u", i);
+        stm_ebr_enter(me);
+        bool found = false; void *val = NULL; size_t vl = 0;
+        STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me,
+                                                         k, strlen(k),
+                                                         &found, &val, &vl));
+        stm_ebr_exit(me);
+        STM_ASSERT_TRUE(found);
+        free(val);
+    }
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+    while (stm_ebr_try_advance() > 0) { }
+}
+
+/* #367 — mini failure atomicity: an allocation failure ANYWHERE in
+ * the mini (clone / track / fold / COW / split / grow / suffix) must
+ * discard the round completely — the published tree and live chain
+ * stay coherent, no accepted write is lost, and the engine keeps
+ * working once memory returns. The mini swallows its own OOM (it is
+ * best-effort), so every injected op still returns OK or ENOMEM (the
+ * prepend's own allocs); the countdown sweep drives the injection
+ * point through the whole round. */
+STM_TEST(engine_mini_flush_oom_atomic) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+
+    char big[220];
+    memset(big, 'O', sizeof big);
+
+    for (int f = 0; f < 400; f += 1) {
+        memstore ms; memstore_init(&ms);
+        stm_btree_crypt_ctx cx = test_cx();
+        stm_btree_engine *eng = NULL;
+        STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0,
+                                              &eng));
+        bool written[120] = { false };
+
+        atomic_store(&eng_test_oom_countdown, f);
+        stm_ebr_enter(me);
+        for (uint32_t i = 0; i < 120u; i++) {
+            char k[32];
+            int kl = snprintf(k, sizeof k, "oom-key-%03u", i);
+            stm_status s = stm_btree_engine_insert_concurrent(
+                eng, me, k, (size_t)kl, big, sizeof big);
+            STM_ASSERT_TRUE(s == STM_OK || s == STM_ENOMEM);
+            written[i] = (s == STM_OK);
+        }
+        stm_ebr_exit(me);
+        atomic_store(&eng_test_oom_countdown, -1);
+
+        /* Every accepted write resolves; every refused one is absent
+         * (each key is written at most once). The engine keeps
+         * accepting writes after recovery. */
+        for (uint32_t i = 0; i < 120u; i++) {
+            char k[32];
+            snprintf(k, sizeof k, "oom-key-%03u", i);
+            stm_ebr_enter(me);
+            bool found = false; void *val = NULL; size_t vl = 0;
+            STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(
+                eng, me, k, strlen(k), &found, &val, &vl));
+            stm_ebr_exit(me);
+            STM_ASSERT_TRUE(found == written[i]);
+            if (found) {
+                STM_ASSERT_TRUE(vl == sizeof big &&
+                                memcmp(val, big, vl) == 0);
+            }
+            free(val);
+        }
+        stm_ebr_enter(me);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me,
+                                                         "oom-post", 8,
+                                                         "alive", 5));
+        stm_ebr_exit(me);
+        expect_value(eng, me, "oom-post", "alive");
+
+        stm_btree_engine_destroy(eng);
+        memstore_destroy(&ms);
+        while (stm_ebr_try_advance() > 0) { }
+    }
+    stm_ebr_thread_free(me);
 }
 
 /* The clone-arm commit: overwrites + tombstones from the chain land

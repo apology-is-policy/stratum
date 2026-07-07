@@ -561,12 +561,18 @@ static stm_status engine_insert_locked(stm_btree_engine *eng,
     stm_status s = load_root_locked(eng, &root);
     if (s != STM_OK) return s;
 
-    /* 9.8-BE-prepend regime purity (the buffered-node guard's chain
-     * twin): a serial write through a root carrying pending deltas
-     * would race newest-wins with the message stream — and a serial
-     * root-grow would orphan the chain one level down where no
-     * consolidator looks. One engine never mixes write regimes. */
-    if (atomic_load_explicit(&root->chain_head, memory_order_acquire))
+    /* 9.8-BE-prepend regime purity: one engine never mixes write
+     * regimes, and the STICKY LATCH is the guard (#367). The old
+     * chain-head test is no longer sufficient — the mini's
+     * size-triggered flush routinely leaves a latched engine with an
+     * EMPTY chain and a DRAINED root while deeper nodes carry
+     * messages, and an in-place serial descent would then mutate
+     * mvcc-published nodes under wait-free readers (R172 F1). The
+     * per-node buf_count refuse in node_insert stays as the
+     * unlatched-tree belt (a reloaded pre-latch tree with on-disk
+     * buffers). */
+    if (atomic_load_explicit(&eng->concurrent_regime,
+                             memory_order_acquire))
         return STM_ENOTSUPPORTED;
 
     /* Pre-allocate the node a root split would need, so a root split
@@ -1056,8 +1062,10 @@ static stm_status engine_delete_locked(stm_btree_engine *eng,
     stm_status s = load_root_locked(eng, &root);
     if (s != STM_OK) return s;
 
-    /* Serial-write chain guard — see engine_insert_locked. */
-    if (atomic_load_explicit(&root->chain_head, memory_order_acquire))
+    /* Serial-write regime guard (sticky latch) — see
+     * engine_insert_locked. */
+    if (atomic_load_explicit(&eng->concurrent_regime,
+                             memory_order_acquire))
         return STM_ENOTSUPPORTED;
 
     bool removed = false;
@@ -1199,27 +1207,143 @@ static stm_status msgs_append_deltas(eng_node *node,
     return STM_OK;
 }
 
-/* Fold the LIFO segment [head..stop) into `clone`'s buffer as deep
- * copies, ascending seq. */
-static stm_status chain_fold_into_buffer(eng_node *clone, eng_delta *head,
-                                         eng_delta *stop)
+/*
+ * The mini-flush round context (design §5.3.1). `round` is the set of
+ * nodes CREATED this round — the clone, COW'd children, split
+ * products, grow roots — i.e. the R172-F1 privacy discriminator: a
+ * node in the round set is unpublished and mutable; anything else
+ * reachable from the flush is (or may be) published and immutable.
+ * `replaced` records the published nodes superseded by a COW copy;
+ * they retire SINGLE-node at publish (their subtrees are shared with
+ * the replacement) and are NEVER freed on failure (still published).
+ *
+ * Ownership rule (failure atomicity): every node the flush family
+ * creates under a non-NULL cow ctx is tracked IMMEDIATELY at creation
+ * (on track-OOM the creator frees it and fails), and no local error
+ * path frees a tracked node — mini_ctx_free_round() is the single
+ * owner on the discard path (single-node frees: round products never
+ * own each other's arrays, only child POINTERS, which eng_node_free
+ * ignores). Separator keys stay locally owned until spliced.
+ */
+struct eng_mini_ctx {            /* typedef'd in engine_internal.h */
+    eng_node **round;
+    uint32_t   n_round, cap_round;
+    eng_node **replaced;
+    uint32_t   n_repl, cap_repl;
+};
+
+static stm_status mini_vec_push(eng_node ***v, uint32_t *n, uint32_t *cap,
+                                eng_node *node)
 {
-    eng_delta **v = NULL;
-    uint32_t    k = 0;
-    stm_status s = chain_to_ascending(head, stop, &v, &k);
-    if (s != STM_OK) return s;
-    s = msgs_append_deltas(clone, v, 0, k);
-    free(v);
+    if (*n == *cap) {
+        uint32_t nc = *cap ? *cap * 2u : 8u;
+        eng_node **nv = eng_buf_realloc(*v, (size_t)nc * sizeof *nv);
+        if (!nv) return STM_ENOMEM;
+        *v   = nv;
+        *cap = nc;
+    }
+    (*v)[(*n)++] = node;
+    return STM_OK;
+}
+
+/* Track a round-created node. On OOM the node is freed HERE (single —
+ * at track time it is never linked anywhere yet) so the caller just
+ * propagates the error. */
+static stm_status mini_ctx_track(eng_mini_ctx *ctx, eng_node *node)
+{
+    stm_status s = mini_vec_push(&ctx->round, &ctx->n_round,
+                                 &ctx->cap_round, node);
+    if (s != STM_OK) eng_node_free(node);
     return s;
 }
 
+static bool mini_ctx_is_private(const eng_mini_ctx *ctx, const eng_node *n)
+{
+    for (uint32_t i = 0; i < ctx->n_round; i++)
+        if (ctx->round[i] == n) return true;
+    return false;
+}
+
+static bool mini_ctx_is_replaced(const eng_mini_ctx *ctx, const eng_node *n)
+{
+    for (uint32_t i = 0; i < ctx->n_repl; i++)
+        if (ctx->replaced[i] == n) return true;
+    return false;
+}
+
+/* Discard the round: single-free every round node (their child
+ * pointers reference published nodes or round siblings — never owned)
+ * and drop the vectors. Replaced nodes are NOT touched — they are
+ * still the published tree. */
+static void mini_ctx_free_round(eng_mini_ctx *ctx)
+{
+    for (uint32_t i = 0; i < ctx->n_round; i++)
+        eng_node_free(ctx->round[i]);
+    free(ctx->round);
+    free(ctx->replaced);
+    *ctx = (eng_mini_ctx){ 0 };
+}
+
+/* Publish-path teardown: the round nodes now ARE the published tree —
+ * drop only the tracking vectors. (The replaced nodes were EBR-retired
+ * by the caller.) */
+static void mini_ctx_free_vectors(eng_mini_ctx *ctx)
+{
+    free(ctx->round);
+    free(ctx->replaced);
+    *ctx = (eng_mini_ctx){ 0 };
+}
+
+/* Does any round node reference `n` as a direct child? The flushed-
+ * round husk sweep's transfer test: a husk child that the round family
+ * still references (at ANY index — splices shift slots, splits move
+ * children to peel-rights) has its ownership transferred to the
+ * published family and must NOT be retired. The scan reads slots with
+ * acquire — the round nodes are published by the time the sweep runs,
+ * so a cold reader may be CAS-linking a slot concurrently (its fresh
+ * load is a different allocation and can never equal `n`). */
+static bool mini_ctx_family_references(const eng_mini_ctx *ctx,
+                                       const eng_node *n)
+{
+    for (uint32_t i = 0; i < ctx->n_round; i++) {
+        const eng_node *r = ctx->round[i];
+        if (r->is_leaf || !r->children) continue;
+        for (uint32_t j = 0; j < r->n_pivots + 1u; j++)
+            if (eng_child_mem_acquire(&r->children[j]) == n) return true;
+    }
+    return false;
+}
+
+/* Free a peel vector's separator keys + backing array WITHOUT touching
+ * the right nodes — the cow-mode counterpart of
+ * eng_split_vec_free_deep (rights are round-tracked; the round sweep
+ * owns them). */
+static void split_vec_free_cow(eng_split_vec *vec)
+{
+    for (uint32_t i = 0; i < vec->n; i++)
+        free(vec->v[i].sep_key);
+    free(vec->v);
+    *vec = (eng_split_vec){ 0 };
+}
+
+/* Defined with the flush family / commit clone arm below; the mini
+ * (which lexically precedes them) drives all three. */
+static stm_status shadow_consolidate(stm_btree_engine *eng,
+                                     eng_node **shadowp,
+                                     eng_delta *head, eng_delta *stop,
+                                     eng_mini_ctx *cow);
+static stm_status grow_root_absorb(stm_btree_engine *eng, eng_node **rootp,
+                                   eng_split_vec *vec, bool publish,
+                                   eng_mini_ctx *cow);
+
 /*
- * Inline mini-consolidation (design 2.2 / 5.3, the btree_lf
- * consolidate analog): drain the root chain into a single-node COW
- * clone's message buffer, publish the clone, EBR-retire the husk and
- * the detached chain. Trylock-only — a running commit, another mini,
- * or any serial op just leaves the chain long until a later prepend
- * retries (bounded reader cost, never blocked writers).
+ * Inline mini-consolidation (design 2.2 / 5.3 / 5.3.1, the btree_lf
+ * consolidate analog): drain the root chain into a COW clone, bound
+ * the clone's buffer with a size-triggered Bε flush (#367), publish,
+ * EBR-retire the superseded nodes and the detached chain.
+ * Trylock-only — a running commit, another mini, or any serial op
+ * just leaves the chain long until a later prepend retries (bounded
+ * reader cost, never blocked writers).
  *
  * Lock order: serial_mu OUTER -> commit_mu INNER (the documented
  * future-co-holder order from engine_internal.h, realised here).
@@ -1227,14 +1351,26 @@ static stm_status chain_fold_into_buffer(eng_node *clone, eng_delta *head,
  * clone; commit_mu excludes commits and other minis, and makes the
  * (eng->root, mvcc_root) swap atomic against slow-warm readers.
  *
- * The single-node clone SHARES the subtree (children[].mem pointers
- * copied) — sound because the husk retires with the SINGLE-node
- * destructor: ownership of the shared children transfers atomically
- * to the clone at publish; a reader pinned on the husk still descends
- * them (immutable, alive) until its epoch exits. Internal roots only:
- * a leaf root has no buffer to consolidate into and applying could
- * force a split (a structural grow is the commit consolidator's job);
- * its chain just grows until the next commit.
+ * An INTERNAL root clones shallow: the clone SHARES the subtree
+ * (children[].mem pointers copied) — sound because the husk retires
+ * with the SINGLE-node destructor: ownership of the shared children
+ * transfers atomically to the clone at publish; a reader pinned on
+ * the husk still descends them (immutable, alive) until its epoch
+ * exits. A LEAF root (#367 — pre-5.3.1 the mini bailed and the chain
+ * grew unboundedly between commits) clones RESIDENT (a deep entry
+ * copy, bounded by the payload cap) and has the segment APPLIED,
+ * splitting + growing to an internal root on overflow — the
+ * shadow_consolidate leaf arm the commit clone path already uses.
+ *
+ * #367 phase order (design §5.3.1). Everything fallible — the clone,
+ * the round-1 bulk fold, the size-triggered COW flush (which may READ
+ * child nodes from the pool) — runs UNSEALED, with the live chain
+ * serving readers and absorbing writers; the seal window stays
+ * allocation-only (suffix fold + publish + sweep), preserving the
+ * chain_prepend spinners' "a seal window does no I/O" bound. Failure
+ * anywhere before publish discards the round: every round-created
+ * node is freed single (mini_ctx_free_round), the published tree and
+ * the live chain are byte-untouched.
  */
 static void engine_try_mini_consolidate(stm_btree_engine *eng)
 {
@@ -1246,70 +1382,146 @@ static void engine_try_mini_consolidate(stm_btree_engine *eng)
 
     eng_node *root = eng->root;            /* mirror of mvcc_root here */
     eng_delta *detached = NULL;
-    eng_node  *clone    = NULL;
+    eng_node  *clone    = NULL;   /* the direct copy of root (sweep pair) */
+    eng_node  *top      = NULL;   /* the round's outgoing root (may grow) */
     bool       published = false;
+    eng_mini_ctx  ctx  = { 0 };
+    eng_split_vec rvec = { 0 };
+    /* Leaf applies route tombstoned spill chains into the commit
+     * bookkeeping; a DISCARDED round must truncate them back or the
+     * next commit frees spill blocks the published tree still
+     * references (the commit_flush_clone orphan_base discipline). */
+    uint32_t orphan_base = eng->orphaned_spill_blocks.n;
 
     if (eng->pending.active) goto out;     /* commit window open */
-    if (!root || root->is_leaf) goto out;
+    if (!root) goto out;
     if (atomic_load_explicit(&root->chain_depth, memory_order_relaxed) <
         ENG_CONSOLIDATE_THRESHOLD)
         goto out;                          /* raced a prior mini */
 
     /* Build the clone BEFORE sealing — the live chain keeps serving
      * readers and writers across the fallible part. */
-    clone = eng_node_clone_shallow(root);
+    clone = root->is_leaf ? eng_node_clone_resident(root)
+                          : eng_node_clone_shallow(root);
     if (!clone) goto out;
+    if (mini_ctx_track(&ctx, clone) != STM_OK) {   /* frees clone on OOM */
+        clone = NULL;
+        goto out;
+    }
+    top = clone;
 
     /* Round 1 — UNSEALED bulk fold (R174 F2): the segment below a
      * captured head is immutable (prepend-only; ->next never mutated),
      * so the O(chain) alloc+copy work runs with readers and writers
-     * fully live. A fold OOM here just discards the clone — the live
-     * chain was never touched. */
+     * fully live. A fold failure here just discards the round — the
+     * live chain was never touched. Internal top: append to the
+     * buffer; leaf top: apply + split + grow (§5.3.1). */
     eng_delta *snap = atomic_load_explicit(&root->chain_head,
                                            memory_order_acquire);
     if (!snap) goto out;                   /* raced empty */
-    if (chain_fold_into_buffer(clone, snap, NULL) != STM_OK) goto out;
+    if (shadow_consolidate(eng, &top, snap, NULL, &ctx) != STM_OK)
+        goto out;
 
-    /* Seal + the suffix: only the deltas that arrived DURING round 1
-     * fold inside the seal window — bounded by the arrival rate over
-     * one fold pass, zero-to-few in practice. */
+    /* #367: the size-triggered COW flush. Still UNSEALED — the flush
+     * may read cold children from the pool, which must never sit in
+     * the spinners' seal window. Each pass fully drains the top's
+     * buffer (detach-up-front); root-level peels grow the tree; the
+     * grown root's buffer is empty, so the loop terminates — the cap
+     * is defensive (corrupt-shape backstop, the commit loop's twin). */
+    bool flushed = false;
+    for (uint32_t round = 0; ; round++) {
+        if (round > ENG_FLUSH_MAX_RECURSION) goto out;
+        if (top->is_leaf || !top->buf_count ||
+            eng_msgs_region_bytes(top->buf_msgs, top->buf_count) <=
+                ENG_BUFFER_REGION_MAX)
+            break;
+        flushed = true;
+        if (eng_flush_node(eng, top, 0, &rvec, &ctx) != STM_OK)
+            goto out;
+        if (rvec.n &&
+            grow_root_absorb(eng, &top, &rvec, /*publish=*/false,
+                             &ctx) != STM_OK) {
+            rvec = (eng_split_vec){ 0 };   /* freed inside on failure */
+            goto out;
+        }
+    }
+
+    /* Seal + the suffix: only the deltas that arrived DURING the fold
+     * + flush window — bounded by the arrival rate over one pass,
+     * zero-to-few in practice. Allocation-only (an internal top
+     * appends; a still-leaf top applies in memory). */
     detached = atomic_exchange_explicit(&root->chain_head, ENG_CHAIN_SEALED,
                                         memory_order_acq_rel);
     if (detached != snap &&
-        chain_fold_into_buffer(clone, detached, snap) != STM_OK) {
-        /* OOM mid-suffix: restore the detached chain (no other sealer
-         * exists under commit_mu; spinners CAS onto the restored
-         * head) — nothing lost, nothing published. */
+        shadow_consolidate(eng, &top, detached, snap, &ctx) != STM_OK) {
+        /* Failure mid-suffix: restore the detached chain (no other
+         * sealer exists under commit_mu; spinners CAS onto the
+         * restored head) — nothing lost, nothing published. */
         atomic_store_explicit(&root->chain_head, detached,
                               memory_order_release);
         detached = NULL;
         goto out;
     }
-    clone->dirty = true;
+    top->dirty = true;
 
-    eng->root = clone;
-    atomic_store_explicit(&eng->mvcc_root, clone, memory_order_release);
+    eng->root = top;
+    atomic_store_explicit(&eng->mvcc_root, top, memory_order_release);
     published = true;
 
     /* Tombstone sweep (see ENG_CHILD_TOMBSTONE): claim every husk
      * child slot so a pinned descent can no longer link into a node
-     * whose retire is NON-recursive. A link that landed between the
-     * shallow copy and this xchg is adopted into the clone's still-
-     * cold slot — or, if a reader already linked the clone's slot
-     * independently, retired (recursively: deeper links may hang off
-     * it by the time grace ends). */
-    for (uint32_t i = 0; i < root->n_pivots + 1u; i++) {
-        eng_node *late = __atomic_exchange_n(&root->children[i].mem,
-                                             ENG_CHILD_TOMBSTONE,
-                                             __ATOMIC_ACQ_REL);
-        /* Acquire: the published clone's slot may be CAS-linked by a
-         * cold descent at this instant (R174 F3 — the CAS below is
-         * authoritative either way; the atomic read keeps the module
-         * race-free formally, not just behaviorally). */
-        if (late == eng_child_mem_acquire(&clone->children[i]))
-            continue;                                   /* shared/NULL */
-        eng_node *expect = NULL;
-        if (!eng_child_mem_cas_link(&clone->children[i], &expect, late)) {
+     * whose retire is NON-recursive. A LEAF husk has no child slots —
+     * no sweep.
+     *
+     * FOLD-ONLY round (the pre-#367 shape — clone structure identical
+     * to the husk, index pairing exact): a link that landed between
+     * the shallow copy and this xchg is adopted into the clone's
+     * still-cold slot — or, if a reader already linked the clone's
+     * slot independently, retired (recursively: deeper links may hang
+     * off it by the time grace ends).
+     *
+     * FLUSHED round (#367): splices SHIFT the clone's child slots and
+     * splits MOVE children into peel-rights, so index pairing is
+     * unsound for both the adopt and the retire — a slot-i mismatch
+     * proves nothing about slot-i's OLD child, which may live on
+     * elsewhere in the family (retiring it recursively would free
+     * live, published-reachable nodes: the UAF this comment is the
+     * scar of). Instead: claim the slot, then dispose `late` by
+     * IDENTITY — COW-replaced this round -> single-retired below;
+     * still referenced anywhere in the round family -> ownership
+     * transferred, leave it; otherwise it is a reader's late link
+     * under the husk (a disjoint fresh load) -> recursive retire. No
+     * adoption — a shifted slot could bind it to the wrong key range. */
+    if (!root->is_leaf) {
+        for (uint32_t i = 0; i < root->n_pivots + 1u; i++) {
+            eng_node *late = __atomic_exchange_n(&root->children[i].mem,
+                                                 ENG_CHILD_TOMBSTONE,
+                                                 __ATOMIC_ACQ_REL);
+            if (!flushed) {
+                /* Acquire: the published clone's slot may be
+                 * CAS-linked by a cold descent at this instant (R174
+                 * F3 — the CAS below is authoritative either way; the
+                 * atomic read keeps the module race-free formally,
+                 * not just behaviorally). */
+                if (late == eng_child_mem_acquire(&clone->children[i]))
+                    continue;                           /* shared/NULL */
+                eng_node *expect = NULL;
+                if (!eng_child_mem_cas_link(&clone->children[i], &expect,
+                                            late)) {
+                    if (stm_ebr_retire(late, node_free_recursive_cb)
+                        != STM_OK) {
+                        /* leak — safer than freeing under a pinned
+                         * reader (late == NULL lands here harmlessly:
+                         * retire rejects it with EINVAL) */
+                    }
+                }
+                continue;
+            }
+            if (!late) continue;
+            if (mini_ctx_is_replaced(&ctx, late))
+                continue;                  /* single-retired below */
+            if (mini_ctx_family_references(&ctx, late))
+                continue;                  /* transferred to the family */
             if (stm_ebr_retire(late, node_free_recursive_cb) != STM_OK) {
                 /* leak — safer than freeing under a pinned reader */
             }
@@ -1322,14 +1534,32 @@ static void engine_try_mini_consolidate(stm_btree_engine *eng)
     cache_reset(eng);
 
     /* Grace-deferred reclamation; a retire-record OOM leaks (strictly
-     * safer than freeing under a pinned reader). */
+     * safer than freeing under a pinned reader). The COW-replaced
+     * nodes retire SINGLE — each one's subtree lives on, shared with
+     * its round replacement (deeper replaced nodes never appear in
+     * the husk sweep; this loop is their only retire site). */
     if (stm_ebr_retire(root, node_free_single_cb) != STM_OK) { /* leak */ }
     if (stm_ebr_retire(detached, eng_delta_chain_free) != STM_OK) { /* leak */ }
+    for (uint32_t i = 0; i < ctx.n_repl; i++) {
+        if (stm_ebr_retire(ctx.replaced[i], node_free_single_cb)
+            != STM_OK) { /* leak */ }
+    }
     (void)stm_ebr_try_advance();
 
 out:
-    if (clone && !published)
-        eng_node_free(clone);   /* SINGLE free — shared subtree pointers */
+    if (published) {
+        mini_ctx_free_vectors(&ctx);   /* nodes ARE the published tree */
+    } else {
+        /* Discard the round: single-free every round-created node
+         * (clone, COW children, split products, grow roots — child
+         * POINTERS are never owned); free any peel seps + vec array
+         * (the rights are round nodes); truncate the stale orphan
+         * pushes. The published tree and the live chain are
+         * byte-untouched. */
+        eng->orphaned_spill_blocks.n = orphan_base;
+        split_vec_free_cow(&rvec);
+        mini_ctx_free_round(&ctx);
+    }
     pthread_mutex_unlock(&eng->commit_mu);
     pthread_mutex_unlock(&eng->serial_mu);
 }
@@ -1461,10 +1691,12 @@ stm_status stm_btree_engine_delete_concurrent(stm_btree_engine *eng,
  *
  * R172 F1 (BINDING): everything here mutates buf_msgs and node
  * structure. It may only run on a subtree no wait-free reader can be
- * traversing — reader safety is COW, never writer exclusion. The only
- * production caller is the commit path (LF-2 regime: fs->global EX
- * writers; production buffers stay empty until chunk 9); chunk 9's
- * consolidator MUST route flushes through unpublished COW copies.
+ * traversing — reader safety is COW, never writer exclusion. Two
+ * callers satisfy that differently: the commit path runs on a fully
+ * private shadow / the caller-serialized legacy memtree (cow == NULL —
+ * no per-node discrimination needed), and the #367 mini-flush (design
+ * §5.3.1) runs on the LIVE tree's node graph with a round context
+ * (cow != NULL) that COWs every published node before mutating it.
  */
 
 static int msg_seq_cmp(const void *a, const void *b)
@@ -1522,8 +1754,14 @@ static eng_node *flush_family_route(eng_node *node, const eng_split_vec *vec,
  * the total within one splice of the cap, so one split always
  * suffices (and strictly reduces the byte count, so the loop
  * terminates regardless).
+ *
+ * cow (§5.3.1): a split right is round-tracked at creation; on any
+ * later failure it is the round sweep's to free — never freed here
+ * (and never RECURSIVELY: under cow its moved-over child pointers are
+ * published nodes).
  */
-static stm_status flush_eager_split(eng_node *t, eng_split_vec *out_vec)
+static stm_status flush_eager_split(eng_node *t, eng_split_vec *out_vec,
+                                    eng_mini_ctx *cow)
 {
     while (eng_internal_payload_bytes(t) > ENG_INTERNAL_PC_CAP) {
         eng_node *right = NULL;
@@ -1531,13 +1769,18 @@ static stm_status flush_eager_split(eng_node *t, eng_split_vec *out_vec)
         uint32_t  sl    = 0;
         stm_status s = eng_split_internal(t, &right, &sep, &sl);
         if (s != STM_OK) return s;
+        if (cow) {
+            s = mini_ctx_track(cow, right);    /* frees right on OOM */
+            if (s != STM_OK) { free(sep); return s; }
+        }
         s = split_vec_push(out_vec, sep, sl, right);
         if (s != STM_OK) {
             free(sep);
             /* The moved-out half is no longer reachable from t —
              * freeing it here cannot double-free with the caller's
-             * memtree invalidation. */
-            eng_node_free_recursive(right);
+             * memtree invalidation. Under cow the round sweep owns
+             * it instead. */
+            if (!cow) eng_node_free_recursive(right);
             return s;
         }
     }
@@ -1547,17 +1790,18 @@ static stm_status flush_eager_split(eng_node *t, eng_split_vec *out_vec)
 /*
  * Splice one child-level peel (sep, right) into the family member
  * covering sep, then eagerly re-split that member. Owns (sep, right):
- * on failure both are freed (they are not tree-reachable).
+ * on failure the sep is freed, and right too UNLESS a cow ctx owns it
+ * (round-tracked by the split that created it).
  */
 static stm_status flush_absorb_peel(eng_node *node, eng_split_vec *out_vec,
                                     uint8_t *sep, uint32_t sep_len,
-                                    eng_node *right)
+                                    eng_node *right, eng_mini_ctx *cow)
 {
     eng_node *t = flush_family_route(node, out_vec, sep, sep_len);
     stm_status s = eng_internal_reserve_splice(t);
     if (s != STM_OK) {
         free(sep);
-        eng_node_free_recursive(right);
+        if (!cow) eng_node_free_recursive(right);
         return s;
     }
     eng_internal_splice(t, eng_pivot_child_for(t, sep, sep_len),
@@ -1566,7 +1810,7 @@ static stm_status flush_absorb_peel(eng_node *node, eng_split_vec *out_vec,
      * flush_walk's absorb target need not be otherwise dirty (its own
      * buffer may be under-cap): R173 F1. */
     t->dirty = true;
-    return flush_eager_split(t, out_vec);
+    return flush_eager_split(t, out_vec, cow);
 }
 
 /* Move message *m into an internal child's buffer (struct copy — the
@@ -1603,8 +1847,76 @@ static stm_status flush_leaf_apply(stm_btree_engine *eng, eng_node *leaf,
     return eng_leaf_remove(leaf, i, &eng->orphaned_spill_blocks);
 }
 
+/*
+ * Resolve child `idx` of round-private `parent` for MUTATION under the
+ * mini-flush ctx (design §5.3.1). Only private nodes are ever flushed
+ * under cow, so the slot is plainly accessible (no reader can reach
+ * an unpublished parent). Three cases:
+ *
+ *  - resident + round-private: already ours — return it;
+ *  - resident + published (inherited by the shallow clone, or a COW
+ *    survivor of an earlier round now reachable from the published
+ *    tree): COW single-node — a leaf child deep (it owns its entries),
+ *    an internal child shallow (deep pivots + deep buffer, shared
+ *    grandchildren) — replace the slot, record the old node for a
+ *    SINGLE-node retire at publish (its subtree is shared with the
+ *    replacement);
+ *  - cold: read from disk straight into the private slot (fresh
+ *    memory is private by construction). Same kind gate as
+ *    load_child; no cache consult (the mini resets it at publish, and
+ *    old-tree nodes sit there under the same paddrs — the shadow-
+ *    flush rationale at load_child applies verbatim).
+ *
+ * The bptr identity (paddr/gen/csum) is untouched — the COW copies it,
+ * and the next commit rewrites the dirty node + rebinds the bptr as
+ * for any dirty node.
+ */
+static stm_status cow_load_child(stm_btree_engine *eng, eng_mini_ctx *cow,
+                                 eng_node *parent, uint32_t idx,
+                                 eng_node **out)
+{
+    eng_child *ch  = &parent->children[idx];
+    eng_node  *mem = ch->mem;              /* private parent — plain */
+
+    if (mem == ENG_CHILD_TOMBSTONE)
+        return STM_ECORRUPT;               /* private slots are never swept */
+
+    if (mem && mini_ctx_is_private(cow, mem)) {
+        *out = mem;
+        return STM_OK;
+    }
+
+    if (mem) {
+        eng_node *copy = mem->is_leaf ? eng_node_clone_resident(mem)
+                                      : eng_node_clone_shallow(mem);
+        if (!copy) return STM_ENOMEM;
+        stm_status s = mini_ctx_track(cow, copy);   /* frees copy on OOM */
+        if (s != STM_OK) return s;
+        s = mini_vec_push(&cow->replaced, &cow->n_repl, &cow->cap_repl,
+                          mem);
+        if (s != STM_OK) return s;         /* copy is round-owned — swept */
+        ch->mem = copy;
+        *out = copy;
+        return STM_OK;
+    }
+
+    eng_node *child = NULL;
+    stm_status s = eng_node_read(eng, ch->paddr, ch->gen, ch->csum, &child);
+    if (s != STM_OK) return s;
+    if (child->is_leaf != ch->is_leaf) {
+        eng_node_free(child);              /* never linked — plain free */
+        return STM_ECORRUPT;
+    }
+    s = mini_ctx_track(cow, child);        /* frees child on OOM */
+    if (s != STM_OK) return s;
+    ch->mem = child;
+    *out = child;
+    return STM_OK;
+}
+
 stm_status eng_flush_node(stm_btree_engine *eng, eng_node *node,
-                           uint32_t depth, eng_split_vec *vec)
+                           uint32_t depth, eng_split_vec *vec,
+                           eng_mini_ctx *cow)
 {
     if (depth >= ENG_FLUSH_MAX_RECURSION) return STM_ECORRUPT;
     if (node->is_leaf || !node->buf_count) return STM_OK;
@@ -1632,7 +1944,8 @@ stm_status eng_flush_node(stm_btree_engine *eng, eng_node *node,
         eng_node *f   = flush_family_route(node, vec, m->key, m->key_len);
         uint32_t  idx = eng_pivot_child_for(f, m->key, m->key_len);
         eng_node *child = NULL;
-        s = load_child(eng, f, idx, /*use_cache=*/false, &child, NULL);
+        s = cow ? cow_load_child(eng, cow, f, idx, &child)
+                : load_child(eng, f, idx, /*use_cache=*/false, &child, NULL);
         if (s != STM_OK) break;
 
         if (!child->is_leaf) {
@@ -1649,15 +1962,18 @@ stm_status eng_flush_node(stm_btree_engine *eng, eng_node *node,
                  * in turn. Its peels sit at THIS node's level: splice
                  * each into the family. */
                 eng_split_vec cvec = { 0 };
-                s = eng_flush_node(eng, child, depth + 1u, &cvec);
+                s = eng_flush_node(eng, child, depth + 1u, &cvec, cow);
                 for (uint32_t j = 0; s == STM_OK && j < cvec.n; j++) {
                     eng_split_ent *e = &cvec.v[j];
                     s = flush_absorb_peel(node, vec, e->sep_key, e->sep_len,
-                                          e->right);
+                                          e->right, cow);
                     e->sep_key = NULL;      /* consumed (or freed) */
                     e->right   = NULL;
                 }
-                eng_split_vec_free_deep(&cvec);    /* un-spliced remainder */
+                /* Un-spliced remainder: under cow the rights are
+                 * round-tracked — free the seps + array only. */
+                if (cow) split_vec_free_cow(&cvec);
+                else     eng_split_vec_free_deep(&cvec);
             }
         } else {
             s = flush_leaf_apply(eng, child, m);
@@ -1671,8 +1987,12 @@ stm_status eng_flush_node(stm_btree_engine *eng, eng_node *node,
                 uint32_t  sl    = 0;
                 s = eng_split_leaf(child, &right, &sep, &sl);
                 if (s != STM_OK) break;
+                if (cow) {
+                    s = mini_ctx_track(cow, right);  /* frees right on OOM */
+                    if (s != STM_OK) { free(sep); break; }
+                }
                 eng_internal_splice(f, idx, sep, sl, right);
-                s = flush_eager_split(f, vec);
+                s = flush_eager_split(f, vec, cow);
             }
         }
     }
@@ -1700,7 +2020,7 @@ static stm_status flush_walk(stm_btree_engine *eng, eng_node *node,
     if (node->buf_count &&
         eng_msgs_region_bytes(node->buf_msgs, node->buf_count) >
             ENG_BUFFER_REGION_MAX)
-        s = eng_flush_node(eng, node, depth, vec);
+        s = eng_flush_node(eng, node, depth, vec, NULL);
 
     for (uint32_t i = 0; s == STM_OK && i < node->n_pivots + 1u; i++) {
         eng_node *c = node->children[i].mem;
@@ -1710,7 +2030,7 @@ static stm_status flush_walk(stm_btree_engine *eng, eng_node *node,
         for (uint32_t j = 0; s == STM_OK && j < cvec.n; j++) {
             eng_split_ent *e = &cvec.v[j];
             s = flush_absorb_peel(node, vec, e->sep_key, e->sep_len,
-                                  e->right);
+                                  e->right, NULL);
             e->sep_key = NULL;
             e->right   = NULL;
         }
@@ -1741,21 +2061,33 @@ static stm_status flush_walk(stm_btree_engine *eng, eng_node *node,
  * mvcc_root divergence during the grow matches invalidate_memtree's
  * documented exception to the R170 P2-3 mirror invariant; the error
  * arms leave the unpublished half-built root for the caller's
- * invalidate_memtree.
+ * invalidate_memtree — or, under a cow ctx (§5.3.1), for the round
+ * sweep (every fresh root is round-tracked; peel rights already are;
+ * the vec frees drop only seps + arrays).
  */
 static stm_status grow_root_absorb(stm_btree_engine *eng, eng_node **rootp,
-                                   eng_split_vec *vec, bool publish)
+                                   eng_split_vec *vec, bool publish,
+                                   eng_mini_ctx *cow)
 {
     uint32_t rounds = 0;
     while (vec->n) {
         if (++rounds > ENG_FLUSH_MAX_RECURSION) {
-            eng_split_vec_free_deep(vec);
+            if (cow) split_vec_free_cow(vec);
+            else     eng_split_vec_free_deep(vec);
             return STM_ECORRUPT;
         }
         eng_node *nr = eng_node_new_internal_sized(vec->n, vec->n + 1u);
         if (!nr) {
-            eng_split_vec_free_deep(vec);
+            if (cow) split_vec_free_cow(vec);
+            else     eng_split_vec_free_deep(vec);
             return STM_ENOMEM;
+        }
+        if (cow) {
+            stm_status ts = mini_ctx_track(cow, nr);  /* frees nr on OOM */
+            if (ts != STM_OK) {
+                split_vec_free_cow(vec);
+                return ts;
+            }
         }
         nr->dirty       = true;
         /* Carry the seq high water with the root identity (the stamp
@@ -1770,14 +2102,17 @@ static stm_status grow_root_absorb(stm_btree_engine *eng, eng_node **rootp,
         for (uint32_t i = 0; s == STM_OK && i < vec->n; i++) {
             eng_split_ent *e = &vec->v[i];
             s = flush_absorb_peel(nr, &next, e->sep_key, e->sep_len,
-                                  e->right);
+                                  e->right, cow);
             e->sep_key = NULL;
             e->right   = NULL;
         }
-        eng_split_vec_free_deep(vec);          /* un-consumed remainder */
+        /* Un-consumed remainder (error mid-splices). */
+        if (cow) split_vec_free_cow(vec);
+        else     eng_split_vec_free_deep(vec);
         *vec = next;
         if (s != STM_OK) {
-            eng_split_vec_free_deep(vec);
+            if (cow) split_vec_free_cow(vec);
+            else     eng_split_vec_free_deep(vec);
             return s;
         }
     }
@@ -2084,7 +2419,7 @@ static stm_status commit_node(stm_btree_engine *eng, eng_node *node,
 }
 
 /*
- * Consolidate the consumed chain segment into the private shadow
+ * Consolidate the chain segment [head..stop) into the private shadow
  * (9.8-BE-prepend): an internal shadow root absorbs the deltas as
  * buffered messages (the RAM buffer is unbounded; the flush loop
  * distributes anything over-cap); a LEAF shadow root has them APPLIED
@@ -2093,16 +2428,22 @@ static stm_status commit_node(stm_btree_engine *eng, eng_node *node,
  * internal root. *shadowp may be replaced by the grow. Every failure
  * leaves a coherent (possibly half-consolidated) PRIVATE tree the
  * caller frees wholesale; the live tree and the chain are untouched.
+ *
+ * The commit clone arm passes stop = NULL (the whole consumed chain)
+ * and cow = NULL (the shadow is wholly private). The #367 mini
+ * (§5.3.1) uses the same body for its round-1 bulk fold and the
+ * sealed-suffix fold, with the round ctx tracking any grow products.
  */
 static stm_status shadow_consolidate(stm_btree_engine *eng,
                                      eng_node **shadowp,
-                                     eng_delta *consumed)
+                                     eng_delta *head, eng_delta *stop,
+                                     eng_mini_ctx *cow)
 {
-    if (!consumed) return STM_OK;
+    if (!head || head == stop) return STM_OK;
 
     eng_delta **v = NULL;
     uint32_t    k = 0;
-    stm_status s = chain_to_ascending(consumed, NULL, &v, &k);
+    stm_status s = chain_to_ascending(head, stop, &v, &k);
     if (s != STM_OK) return s;
 
     eng_node *shadow = *shadowp;
@@ -2134,12 +2475,22 @@ static stm_status shadow_consolidate(stm_btree_engine *eng,
             uint32_t  sl    = 0;
             s = eng_split_leaf(shadow, &right, &sep, &sl);
             if (s != STM_OK) { free(v); return s; }
+            if (cow) {
+                s = mini_ctx_track(cow, right);   /* frees right on OOM */
+                if (s != STM_OK) { free(sep); free(v); return s; }
+            }
             eng_node *nr = eng_node_new_internal_sized(1, 2);
             if (!nr) {
                 free(sep);
-                eng_node_free_recursive(right);
+                /* Under cow the round sweep owns right (a fresh leaf —
+                 * recursive == single there anyway). */
+                if (!cow) eng_node_free_recursive(right);
                 free(v);
                 return STM_ENOMEM;
+            }
+            if (cow) {
+                s = mini_ctx_track(cow, nr);      /* frees nr on OOM */
+                if (s != STM_OK) { free(sep); free(v); return s; }
             }
             nr->dirty            = true;
             nr->seq_hw           = shadow->seq_hw;
@@ -2192,7 +2543,7 @@ static stm_status commit_flush_clone(stm_btree_engine *eng, uint64_t gen,
     eng_node *shadow = eng_node_clone_resident(root);
     if (!shadow) return STM_ENOMEM;
 
-    s = shadow_consolidate(eng, &shadow, consumed);
+    s = shadow_consolidate(eng, &shadow, consumed, NULL, NULL);
     if (s != STM_OK) goto fail_shadow;
 
     /* The commit-time Bε flush (chunk 8) on the private shadow —
@@ -2210,7 +2561,7 @@ static stm_status commit_flush_clone(stm_btree_engine *eng, uint64_t gen,
             goto fail_shadow;
         }
         if (!rvec.n) break;
-        s = grow_root_absorb(eng, &shadow, &rvec, /*publish=*/false);
+        s = grow_root_absorb(eng, &shadow, &rvec, /*publish=*/false, NULL);
         if (s != STM_OK) goto fail_shadow;
     }
 
@@ -2333,7 +2684,8 @@ static stm_status commit_flush_locked(stm_btree_engine *eng, uint64_t gen,
             return s;
         }
         if (!rvec.n) break;                /* quiescent — no peels */
-        s = grow_root_absorb(eng, &eng->root, &rvec, /*publish=*/true);
+        s = grow_root_absorb(eng, &eng->root, &rvec, /*publish=*/true,
+                             NULL);
         if (s != STM_OK) {
             invalidate_memtree(eng);
             return s;

@@ -547,30 +547,56 @@ commit-path's deep clone needs no sweep — the whole old tree retires
 with the RECURSIVE destructor, which owns whatever hangs off its
 slots when grace ends.
 
-**The mini-consolidation.** A prepend that leaves the chain at
-`ENG_CONSOLIDATE_THRESHOLD` (8) attempts an inline consolidation
-(trylock `serial_mu` then `commit_mu` — the documented lock order —
-bailing on any contention, a pending window, or a leaf root): build a
-SINGLE-node shallow clone of the root (pivots/buffers deep-copied;
-children array copied with `mem` pointers SHARED), fold the chain's
-BULK into the clone's buffer from a pre-seal head snapshot — the
-segment below a captured head is immutable (prepend-only), so the
-O(chain) alloc+copy work runs with readers and writers fully live
-(R174 F2) — then seal-detach and fold only the suffix that arrived
-during the bulk pass inside the seal window, publish, tombstone-sweep
-the husk slots, and EBR-retire the husk (single-node destructor —
-ownership of the shared subtree transferred at publish) plus the
-detached chain. A bulk-fold OOM discards the clone with the live
-chain untouched; a suffix-fold OOM restores the detached chain (no
-other sealer can exist under `commit_mu`) — nothing lost, nothing
-published either way. This bounds the reader's CHAIN-walk cost
-between commits at ~threshold (the `btree_lf` consolidate analog);
-the folded messages accumulate in the live root's RAM buffer until
-the next commit flushes, so the buffer-scan cost grows with the
-write burst — the caller's commit cadence is the bound (R174 F4),
-and a sustained hot-key burst (a mini every ~threshold prepends)
-also makes a concurrent scan straddling the sweeps retry via
-`STM_EBUSY` — callers loop per the back-pressure contract.
+**The mini-consolidation (bounded since #367 — design §5.3.1).** A
+prepend that leaves the chain at `ENG_CONSOLIDATE_THRESHOLD` (8)
+attempts an inline consolidation (trylock `serial_mu` then
+`commit_mu` — the documented lock order — bailing on any contention
+or a pending window). An INTERNAL root builds a SINGLE-node shallow
+clone (pivots/buffers deep-copied; children array copied with `mem`
+pointers SHARED); a LEAF root (#367 — pre-5.3.1 the mini bailed here
+and the chain grew with the whole uncommitted burst) builds a
+resident deep clone and has the segment APPLIED via
+`shadow_consolidate`'s leaf arm, splitting + growing to an internal
+root on overflow. The chain's BULK folds from a pre-seal head
+snapshot — the segment below a captured head is immutable
+(prepend-only), so the O(chain) alloc+copy work runs with readers
+and writers fully live (R174 F2). **The size-triggered COW flush
+(#367)** then bounds the clone: while the clone's buffer region
+exceeds `ENG_BUFFER_REGION_MAX`, the §5.2 flush runs on the private
+clone under a ROUND CONTEXT (`eng_mini_ctx`) — every published node
+is COW'd on first mutation (leaf children entry-deep, internal
+children shallow), children loaded cold land directly in private
+slots, split products and grow roots are round-tracked, and
+root-level peels grow the tree via `grow_root_absorb`
+(publish=false). The round set is the R172-F1 privacy discriminator:
+only round-created nodes are ever mutated. The flush (and its child
+POOL READS) runs UNSEALED so the spinners' "a seal window does no
+I/O" bound survives; only the suffix fold (allocation-only) sits
+inside the seal window. Publish is one release-store; the husk sweep
+then disposes of husk children BY IDENTITY when a flush ran (splices
+shift slot indices and splits move children into peel-rights, so
+index pairing is unsound — a COW-replaced child retires SINGLE-node
+[its subtree lives on in the replacement], a child the round family
+still references anywhere is left alone [ownership transferred], and
+only a reader's late link under the husk retires recursively; no
+adoption, since a shifted slot could bind it to the wrong key
+range). A fold-only round keeps the original index-paired sweep
+verbatim. EBR-retires: the husk (single), the detached chain, each
+COW-replaced node (single). Failure anywhere before publish discards
+the round — every round node freed single-node, un-spliced peel
+separators freed, the stale orphaned-spill pushes truncated back to
+the entry watermark (the `commit_flush_clone` `orphan_base`
+discipline), the published tree and live chain byte-untouched; a
+suffix-fold failure additionally restores the detached chain (no
+other sealer can exist under `commit_mu`). Net resident bounds,
+independent of commit cadence: chain ≤ ~threshold, every node's
+buffer ≤ region cap + one fold quantum — the #367 close of the R174
+F4 "commit cadence is the bound" caveat (measured: the fsync-less
+host create path 5.6k -> 56k files/s at 8k uncommitted files, the
+growth curve superlinear -> amortized-flat). A sustained hot-key
+burst (a mini every ~threshold prepends) still makes a concurrent
+scan straddling the sweeps retry via `STM_EBUSY` — callers loop per
+the back-pressure contract.
 
 **The clone commit.** A latched engine's `commit_flush` dispatches to
 `commit_flush_clone`: deep-clone the resident tree
@@ -1226,10 +1252,20 @@ it is pinned by tests, not a `btree.tla`-class invariant.
 
 ## Tests
 
-`tests/test_btree_engine.c` — 84 cases (47 9.6 + 4 9.8-LF-1 +
+`tests/test_btree_engine.c` — 90 cases (47 9.6 + 4 9.8-LF-1 +
 6 9.8-LF-2 + 14 9.8-BE chunks 7-8 + 11 9.8-BE-prepend chunk 9 incl.
 the R174 failure arms + the load_root race regression + 1
-engine-retire chunk 9b + 1 clone-arm write-fault sweep chunk 11). Most run against an in-RAM
+engine-retire chunk 9b + 1 clone-arm write-fault sweep chunk 11 +
+6 #367 bounded-mini: the leaf-root fold + newest-wins-over-folds
+[non-vacuity-proven: fails the chain-depth assert on pre-#367 code],
+the leaf-root split+grow without a commit [fails is_leaf pre-#367],
+the root-buffer resident bound [fails the region assert pre-#367],
+newest-wins across fold->flush->suffix cycles + commit + reopen, the
+flushed-round shifted-slot sweep survival [the by-identity husk-sweep
+regression — deterministic under guard-malloc], and a 400-point OOM
+countdown sweep over the whole mini round [clone / track / fold /
+COW / split / grow / suffix] asserting discard-atomicity + recovery).
+Most run against an in-RAM
 `stm_btree_store_vtable` that also models deferred-free (`free` records
 the call's `(paddr, free_gen)` but keeps the slot readable, so a test
 can both assert which paddrs were superseded and still open a prior
@@ -1372,20 +1408,24 @@ corrected write-amp model).
   EX vs SH), and the guard exists to catch the sequential form of the
   mistake loudly, not to arbitrate a race.
 - **A permanently-failing commit accretes RAM on a latched engine
-  (chunk 9).** Clone-arm failures deliberately keep everything (the
-  chain + the mini-folded root buffer grow until a commit lands), so
-  an engine whose commits ALWAYS fail (a wedged pool) accumulates
-  unbounded deltas+messages in RAM. The legacy arm's
-  invalidate-on-failure dropped them; the clone arm trades that data
-  loss for RAM growth — the R154 Q2 wedge discipline (a failing
-  commit wedges the fs) bounds it in production.
-- **Leaf-rooted engines skip the mini-consolidation (chunk 9).** A
-  leaf root has no message buffer to fold into and an apply could
-  force a structural grow (the commit consolidator's job), so its
-  chain grows unbounded between commits — reader cost O(chain). A
-  leaf-rooted tree is a single node (tiny); the first clone commit
-  applies + grows it and minis engage thereafter. Bounded by the
-  caller's commit cadence.
+  (chunk 9; shape changed by #367).** Clone-arm failures deliberately
+  keep everything, so an engine whose commits ALWAYS fail (a wedged
+  pool) accumulates uncommitted state in RAM. Since #367 that state
+  is APPLIED/DISTRIBUTED resident tree (leaves + bounded buffers)
+  rather than an unbounded root chain/buffer — same RAM order, no
+  scan blowup. The legacy arm's invalidate-on-failure dropped it; the
+  clone arm trades that data loss for RAM growth — the R154 Q2 wedge
+  discipline (a failing commit wedges the fs) bounds it in
+  production.
+- **Leaf-rooted engines fold + grow through the mini since #367
+  (design §5.3.1).** The chunk-9 bail ("its chain grows unbounded
+  between commits — reader cost O(chain), bounded by the caller's
+  commit cadence") was the measured 21x create collapse for
+  fsync-less workloads: the leaf arm now applies the chain into a
+  resident deep clone every threshold prepends and grows to an
+  internal root on overflow, so a never-committed engine keeps
+  O(threshold) chains from birth. The chunk-9 caveat text is retained
+  here only as history.
 - **The clone commit copies the whole RESIDENT tree, O(resident) per
   commit (chunk 9).** Deliberate: full-clone keeps the strict-tree
   ownership invariant everywhere (recursive retire = the existing

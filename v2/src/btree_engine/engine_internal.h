@@ -910,10 +910,21 @@ stm_status eng_split_internal(eng_node *n, eng_node **out_right,
  * tree still holds every message (nothing was written), so no message
  * is lost or duplicated. *vec may hold peels on error; the caller
  * frees them (eng_split_vec_free_deep) — they are NOT tree-reachable.
+ *
+ * `cow` (9.8-BE #367, design §5.3.1): NULL = the commit context above
+ * (byte-for-byte the pre-#367 behavior — private shadow / caller-
+ * serialized memtree). Non-NULL = the mini-flush round context defined
+ * in engine.c: the flush runs against the LIVE tree's node graph and
+ * COWs every published node before mutating it; created nodes are
+ * round-tracked, superseded ones recorded for single-node EBR retire
+ * at publish, and the failure contract changes to "discard the round"
+ * (the published tree is byte-untouched — no invalidate needed).
  */
+typedef struct eng_mini_ctx eng_mini_ctx;
 STM_MUST_USE
 stm_status eng_flush_node(stm_btree_engine *eng, eng_node *node,
-                           uint32_t depth, eng_split_vec *vec);
+                           uint32_t depth, eng_split_vec *vec,
+                           eng_mini_ctx *cow);
 
 /* ========================================================================= */
 /* btnode_io.c — per-node device I/O (encode/encrypt/write, read/decrypt).     */
