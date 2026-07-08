@@ -652,6 +652,13 @@ STM_TEST(ctl_r96_p2_3_vops_read_no_session_rejects)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    /* Pass a real stm_ctl_conn as the vops ctx -- never the bare stm_ctl
+     * (see make_ctl_server_for's contract). vops_read casts ctx to
+     * stm_ctl_conn and scans cn->sessions[STM_CTL_MAX_SESSIONS]; a bare
+     * stm_ctl is a smaller allocation, so the scan reads past it (an OOB
+     * that only accidentally lands on zeroed .active bytes and "passes"). */
+    stm_ctl_conn *cn = NULL;
+    STM_ASSERT_OK(stm_ctl_conn_create(c, (uid_t)-1, (gid_t)-1, &cn));
 
     const stm_lp9_vops *v = stm_ctl_vops();
     uint8_t buf[64];
@@ -659,17 +666,18 @@ STM_TEST(ctl_r96_p2_3_vops_read_no_session_rejects)
     /* fid 999 was never allocated; qid_path encodes a valid kind so
      * the kind-check passes and we hit the session-lookup branch. */
     uint64_t fake_qid = ((uint64_t)1 << 56);  /* KIND_VERSION */
-    stm_status rc = v->read(c, 999, fake_qid, 0, buf, &len);
+    stm_status rc = v->read(cn, 999, fake_qid, 0, buf, &len);
     STM_ASSERT_EQ(rc, STM_EBACKEND);
     STM_ASSERT_EQ(len, 0u);
 
     /* Symmetric: bad kind → STM_ENOENT (different defensive path). */
     uint64_t bad_qid = ((uint64_t)99 << 56);
     len = sizeof buf;
-    rc = v->read(c, 999, bad_qid, 0, buf, &len);
+    rc = v->read(cn, 999, bad_qid, 0, buf, &len);
     STM_ASSERT_EQ(rc, STM_ENOENT);
     STM_ASSERT_EQ(len, 0u);
 
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
