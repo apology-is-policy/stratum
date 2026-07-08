@@ -261,6 +261,19 @@ hw=5): today's clients cannot feed 4 workers, so the handoff tax buys
 nothing. Revisit when a client can offer real depth (parallel build
 actions / multi-user sessions / a pipelining kernel client).
 
+**Re-tested 2026-07-08 (the Thylacine CF-4 measurement pass); the
+default STANDS for a new reason**: post-CF-3 the ops are ms-scale
+(bulk-Tread AEAD units, not the us-scale metadata ops the handoff-tax
+verdict was measured on), but `--fs-workers 4` was still FLAT on the
+go-build window (cold 20723 vs 20706 ms) — the 4-vCPU guest is
+CPU-saturated by the compile processes plus the server's decrypt, so
+parallelizing a CPU-BOUND server merely re-slices the same cores. The
+lever that actually moved the window was cutting the work itself (the
+Thylacine-side AT_HWCAP + libsodium-armcrypto chunk: hardware AEGIS
+decrypt, ~43 MB/s -> ~2.2 GB/s measured in-guest; gofmt cold 21.3 ->
+4.4 s). The pool's win case remains a server-CPU-idle configuration
+(more vCPUs than active clients, or I/O-bound ops).
+
 **Core-level (Area D, `tests/bench_concurrent_write.c` — still current):**
 aggregate multi-thread write throughput is flat ~52–62 MB/s across 1→8
 threads (writers funnel through the global `dirty_buffer->mu`, the
