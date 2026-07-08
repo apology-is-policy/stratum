@@ -135,6 +135,65 @@ STM_TEST(ebr_many_retires_per_epoch) {
     stm_ebr_thread_free(t);
 }
 
+/* Terminal drain (stm_dataset_index_close's reclaim) frees everything a
+ * quiescent teardown retired -- the objects a single try_advance leaves
+ * behind (the 2-epoch distance), which previously leaked until process exit
+ * because nothing drove the epoch after a final close. */
+STM_TEST(ebr_drain_reclaims_all) {
+    reset_and_init();
+    stm_ebr_thread *t = stm_ebr_register();   /* registered but INACTIVE */
+
+    enum { N = 8 };
+    for (int i = 0; i < N; i++) {
+        int *obj = malloc(sizeof *obj);
+        *obj = i;
+        STM_ASSERT_OK(stm_ebr_retire(obj, count_destroy));
+    }
+
+    /* A SINGLE try_advance -- exactly what stm_btree_engine_retire drives at
+     * a close -- cannot reclaim what was just retired (the 2-epoch safety
+     * distance). This is the residue that leaked at a final close. */
+    stm_ebr_try_advance();
+    STM_ASSERT_EQ(atomic_load(&g_freed), 0);
+    STM_ASSERT(stm_ebr_pending_retires() >= (uint64_t)N);
+
+    /* stm_ebr_drain -- the bounded terminal reclaim index-close now runs --
+     * clears the residue in one call. */
+    stm_ebr_drain();
+    STM_ASSERT_EQ(atomic_load(&g_freed), N);
+    STM_ASSERT_EQ(stm_ebr_pending_retires(), 0u);
+
+    stm_ebr_thread_free(t);
+}
+
+/* A pinned reader must still block drain (drain is bounded-advance, never a
+ * force-free): a lagging reader's object stays reachable and unreclaimed. */
+STM_TEST(ebr_drain_respects_pinned_reader) {
+    reset_and_init();
+    stm_ebr_thread *reader = stm_ebr_register();
+    stm_ebr_thread *writer = stm_ebr_register();
+    (void)writer;
+
+    stm_ebr_enter(reader);                 /* pin epoch 1 */
+    stm_ebr_try_advance();                 /* 1 -> 2 allowed (1 >= 1) */
+
+    int *obj = malloc(sizeof *obj);
+    STM_ASSERT_OK(stm_ebr_retire(obj, count_destroy));   /* retire at 2 */
+
+    /* Reader pinned at 1 < 2: drain cannot advance past it, so the object is
+     * NOT freed (force-free would be a UAF). */
+    stm_ebr_drain();
+    STM_ASSERT_EQ(atomic_load(&g_freed), 0);
+
+    /* Reader exits; a second drain reclaims it. */
+    stm_ebr_exit(reader);
+    stm_ebr_drain();
+    STM_ASSERT_EQ(atomic_load(&g_freed), 1);
+
+    stm_ebr_thread_free(reader);
+    stm_ebr_thread_free(writer);
+}
+
 /* ------------------------------------------------------------------------- */
 /* Multi-threaded stress test.                                                */
 /* ------------------------------------------------------------------------- */

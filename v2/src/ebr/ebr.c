@@ -44,6 +44,13 @@
 #define INACTIVE          0u
 #define DEAD_SENTINEL     (~(uint64_t)0)
 
+/* Bounded rounds for stm_ebr_drain. Each round's try_advance moves the epoch
+ * +1 when quiescent and reclaims two epochs back, so a handful clears anything
+ * retired at or before drain entry; the extra headroom absorbs the +2 reclaim
+ * distance with margin. Cheap short thread-list walks -- a fixed count is
+ * robust to the best-effort pending_retires counter's skew. */
+#define STM_EBR_DRAIN_ROUNDS 16
+
 /* 64-byte cache line pad to avoid false sharing between threads. */
 #define STM_CACHELINE_PAD 64
 
@@ -338,6 +345,29 @@ int stm_ebr_try_advance(void)
         }
     }
     return freed;
+}
+
+/*
+ * Bounded terminal reclaim for a quiescent teardown (index close / unmount).
+ *
+ * Drives the ordinary try_advance path a fixed, bounded number of rounds.
+ * Unlike stm_ebr_shutdown this is ALWAYS safe: try_advance never frees an
+ * object a live reader could still reach -- a lagging reader simply leaves
+ * its (still-reachable) object pending, and drain returns having reclaimed
+ * only what was epoch-safe. Without this, the objects retired at the LAST
+ * close have nothing left to drive the epoch forward, so they sit in the
+ * global buckets until process exit (stm_ebr_shutdown, which has no
+ * production caller) -- the trailing residue LSan flags at exit.
+ *
+ * Not a substitute for shutdown: it does not free thread registrations and
+ * does not force-reclaim past a pinned reader. It closes the common
+ * quiescent-teardown residue; a reader pinned exactly across the final close
+ * (then a fully idle process) leaves a bounded remainder for shutdown.
+ */
+void stm_ebr_drain(void)
+{
+    for (int round = 0; round < STM_EBR_DRAIN_ROUNDS; round++)
+        (void)stm_ebr_try_advance();
 }
 
 /* ========================================================================= */

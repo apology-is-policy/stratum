@@ -23,6 +23,7 @@
 #include <stratum/btree.h>
 #include <stratum/btree_engine.h>     /* 9.7-impl-1c per-dataset engine */
 #include <stratum/btree_store.h>
+#include <stratum/ebr.h>              /* stm_ebr_drain -- terminal reclaim at close */
 #include <stratum/engine_store.h>     /* 9.7-impl-1c STM_ENGINE_STORE_VT */
 #include <stratum/super.h>
 
@@ -458,6 +459,14 @@ void stm_dataset_index_close(stm_dataset_index *idx) {
         dataset_engine_close_locked(idx->slots[i]);
         free(idx->slots[i]);
     }
+    /* Terminal reclaim: the engines above are EBR-RETIRED (a wait-free
+     * reader may still hold a pointer past the unpublish), and each retire
+     * drives only a single try_advance -- insufficient to reclaim what it
+     * just retired (that needs the epoch two rounds further). At this
+     * quiescent teardown nothing else will drive the epoch, so drain here or
+     * the last-close engines leak until process exit (stm_ebr_shutdown has no
+     * production caller). Always safe: drain reclaims only epoch-safe objects. */
+    stm_ebr_drain();
     pthread_mutex_destroy(&idx->lock);
     free(idx->slots);
     free(idx);

@@ -124,6 +124,15 @@ stm_status stm_ebr_retire(void *ptr, stm_ebr_destructor destructor);
  */
 int stm_ebr_try_advance(void);
 
+/*
+ * Bounded terminal reclaim for a quiescent teardown (index close / unmount).
+ * Drives try_advance a bounded number of rounds; ALWAYS safe (never
+ * force-frees past a live reader, unlike stm_ebr_shutdown). Reclaims the
+ * objects retired at a final close that would otherwise sit in the global
+ * buckets until process exit. Does NOT free thread registrations.
+ */
+void stm_ebr_drain(void);
+
 /* ------------------------------------------------------------------------- */
 /* Observability.                                                             */
 /* ------------------------------------------------------------------------- */
