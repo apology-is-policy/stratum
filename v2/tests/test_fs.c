@@ -750,6 +750,66 @@ STM_TEST(dcache_cow_overwrite_serves_new_plaintext) {
     unlink(g_tmp_path);
 }
 
+/* #40 commit-on-pressure: a fresh over-commit of the data pool via small
+ * (buffered) writes must be REFUSED at write time, not accepted-then-failed
+ * at commit. The writes stay under the 8 MiB per-inode + 256 MiB global RAM
+ * caps, so PRE-FIX nothing forces a flush and every write returns OK (the
+ * false success #40 reports -- "38.6 MiB OK'd into an 8 MiB pool"); the
+ * commit would then ENOSPC. WITH commit-on-pressure the write that would
+ * push the buffered total past data_free is refused here. Non-vacuous:
+ * neutering fs_commit_on_pressure_locked to `return STM_OK` makes every
+ * write succeed -> STM_ASSERT(refused) fails. */
+STM_TEST(fs_cop_fresh_overcommit_refused) {
+    make_tmp("cop_overcommit");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)32u * 1024u * 1024u;  /* formats; data_free ~= tens of MiB */
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+
+    stm_alloc_stats st;
+    STM_ASSERT_OK(stm_fs_alloc_stats_get(fs, 0, &st));
+    uint64_t free_bytes = st.data_free_blocks * 4096ull;
+    STM_ASSERT(free_bytes > 0 && free_bytes < (uint64_t)56u * 1024u * 1024u);
+
+    /* Spread the over-commit across NF files so no single inode reaches its
+     * 8 MiB per-inode RAM cap (which would force a flush -> refuse pre-fix
+     * too, making the test vacuous). NF=8 keeps per-file bytes ~= (free +
+     * 4 MiB)/8 < 8 MiB for any free < 56 MiB. The total exceeds data_free
+     * but stays under the 256 MiB global cap, so PRE-FIX every write buffers
+     * OK (no flush) and only the commit would ENOSPC; POST-FIX the write
+     * that breaches data_free is refused here. */
+    enum { NF = 8 };
+    uint64_t fino[NF];
+    for (int i = 0; i < NF; i++) {
+        char nm[3] = { 'f', (char)('0' + i), 0 };
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm, 2,
+                                            0644u, 0, 0, &fino[i]));
+    }
+    const size_t W = 64u * 1024u;
+    static uint8_t chunk[64u * 1024u];
+    memset(chunk, 0xAB, sizeof chunk);
+    uint64_t target = free_bytes + (uint64_t)4u * 1024u * 1024u;
+    bool refused = false;
+    uint64_t total = 0;
+    for (uint64_t wc = 0; total < target; wc++) {
+        int f = (int)(wc % NF);
+        uint64_t off = (wc / NF) * (uint64_t)W;
+        stm_status ws = stm_fs_write(fs, 1, fino[f], off, chunk, W);
+        if (ws == STM_ENOSPC) { refused = true; break; }
+        STM_ASSERT_OK(ws);
+        total += W;
+    }
+    STM_ASSERT(refused);   /* refused at write time; pre-fix buffers all -> fail here */
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 /* #352-F1 (review P0): an interior sub-write of one block of a coalesced
  * multi-block extent, after a commit, must preserve the non-overwritten
  * blocks. Pre-fix, stm_extent_overwrite truncated/whole-dropped the
