@@ -97,7 +97,7 @@ static void udp_fixture_init(udp_fixture *f, const char *tag,
     memset(&f->policy, 0, sizeof f->policy);
     STM_ASSERT_OK(stm_ds_policy_parse_cli(&f->policy, policy_str));
 
-    f->listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    f->listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT(f->listen_fd >= 0);
 
     f->ctx.listen_fd = f->listen_fd;

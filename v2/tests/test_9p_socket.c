@@ -232,7 +232,7 @@ STM_TEST(p9_socket_listen_path_too_long_rejected) {
     char too_long[200];
     memset(too_long, 'a', sizeof too_long - 1);
     too_long[sizeof too_long - 1] = '\0';
-    int fd = stm_stratumd_listen_unix(too_long, 4, 0600);
+    int fd = stm_stratumd_listen_unix(too_long, 4, 0600, 0);
     STM_ASSERT_TRUE(fd < 0);
     STM_ASSERT_EQ(fd, -ENAMETOOLONG);
 }
@@ -253,7 +253,7 @@ STM_TEST(p9_socket_listen_then_handshake) {
                                               /*uid=*/0, /*gid=*/0,
                                               &root_ino));
 
-    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(listen_fd >= 0);
 
     accept_ctx ctx = { .listen_fd = listen_fd, .fs = fs,
@@ -297,7 +297,7 @@ STM_TEST(p9_socket_two_sequential_clients) {
     uint64_t root_ino = 0;
     STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1u, 0755u, 0, 0, &root_ino));
 
-    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(listen_fd >= 0);
 
     accept_ctx ctx = { .listen_fd = listen_fd, .fs = fs,
@@ -348,7 +348,7 @@ STM_TEST(p9_socket_protocol_violation_disconnects) {
     uint64_t root_ino = 0;
     STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1u, 0755u, 0, 0, &root_ino));
 
-    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(listen_fd >= 0);
     accept_ctx ctx = { .listen_fd = listen_fd, .fs = fs,
                         .run_status = STM_EBACKEND };
@@ -401,7 +401,7 @@ STM_TEST(p9_socket_protocol_violation_disconnects) {
  * here. */
 STM_TEST(p9_socket_r95_p1_1_socket_mode_is_0600) {
     build_sock_path("r95_p1_1_mode");
-    int fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    int fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(fd >= 0);
 
     struct stat st;
@@ -420,7 +420,7 @@ STM_TEST(p9_socket_r95_p3_1_non_socket_refused) {
     STM_ASSERT_TRUE(rfd >= 0);
     close(rfd);
 
-    int fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    int fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_EQ(fd, -EEXIST);
 
     /* The pre-existing regular file must still be there (we refused
@@ -448,7 +448,7 @@ STM_TEST(p9_socket_r95_p2_1_slow_loris_releases_slot) {
     uint64_t root_ino = 0;
     STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1u, 0755u, 0, 0, &root_ino));
 
-    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(listen_fd >= 0);
 
     accept_ctx ctx = { .listen_fd = listen_fd, .fs = fs,

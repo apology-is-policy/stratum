@@ -110,7 +110,7 @@ static client_fixture make_client_fixture(const char *tag)
                                               /*uid=*/0, /*gid=*/0,
                                               &f.root_ino));
 
-    f.listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    f.listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(f.listen_fd >= 0);
 
     f.ctx.listen_fd = f.listen_fd;
@@ -686,7 +686,7 @@ STM_TEST(p9_client_walk_malicious_nwqid_refused_no_oob)
     /* Set up a mock server (NOT stratumd — a hand-rolled accept loop
      * that replies with malformed Rwalk). */
     build_sock_path("walk_mal");
-    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(listen_fd >= 0);
 
     mock_walk_ctx ctx = { .listen_fd = listen_fd, .malicious_nwqid = 99,
@@ -837,7 +837,7 @@ fail:
 STM_TEST(p9_client_tag_mismatch_poisons_subsequent_ops_refused)
 {
     build_sock_path("poison");
-    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(listen_fd >= 0);
 
     mock_poison_ctx ctx = { .listen_fd = listen_fd, .run_status = -1 };

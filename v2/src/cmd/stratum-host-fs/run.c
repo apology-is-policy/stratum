@@ -302,7 +302,7 @@ int stm_cmd_host_fs_main(int argc, char **argv)
         stm_host_fs_destroy(probe);
     }
 
-    int listen_fd = stm_stratumd_listen_unix(socket_path, DEFAULT_BACKLOG, 0600);
+    int listen_fd = stm_stratumd_listen_unix(socket_path, DEFAULT_BACKLOG, 0600, 0);
     if (listen_fd < 0) {
         fprintf(stderr,
             "stratum-host-fs: listen on %s failed: %s\n",

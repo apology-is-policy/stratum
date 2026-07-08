@@ -109,7 +109,7 @@ static fixture make_fixture(const char *tag)
                                               /*uid=*/0, /*gid=*/0,
                                               &f.root_ino));
 
-    f.listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    f.listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(f.listen_fd >= 0);
     /* Set FD_CLOEXEC so the listen_fd does NOT propagate into our
      * fork+exec'd stratum-fs children. Without this, the child's

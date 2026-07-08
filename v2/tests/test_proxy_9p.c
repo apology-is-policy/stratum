@@ -318,14 +318,14 @@ static void bilateral_init_with_uid_check(bilateral_fixture *f,
     stm_fs_mount_opts mopts = rw_mount_opts();
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &f->fs));
 
-    int coord_fd = stm_stratumd_listen_unix(g_coord_sock, 4, 0600);
+    int coord_fd = stm_stratumd_listen_unix(g_coord_sock, 4, 0600, 0);
     STM_ASSERT(coord_fd >= 0);
     f->cc.listen_fd = coord_fd;
     f->cc.fs        = f->fs;
     atomic_init(&f->cc.stop_flag, false);
     pthread_create(&f->coord_tid, NULL, coord_main, &f->cc);
 
-    int proxy_fd = stm_stratumd_listen_unix(g_proxy_sock, 4, 0600);
+    int proxy_fd = stm_stratumd_listen_unix(g_proxy_sock, 4, 0600, 0);
     STM_ASSERT(proxy_fd >= 0);
     f->pc.listen_fd  = proxy_fd;
     f->pc.coord_path = g_coord_sock;

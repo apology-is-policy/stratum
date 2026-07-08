@@ -432,7 +432,7 @@ static int run_serve(const char *socket_path, uint32_t msize_max,
     }
 
     int listen_fd = stm_stratumd_listen_unix(socket_path,
-                                                  DEFAULT_BACKLOG, 0600);
+                                                  DEFAULT_BACKLOG, 0600, 0);
     if (listen_fd < 0) {
         fprintf(stderr,
             "stratum-slate: listen on %s failed: %s\n",

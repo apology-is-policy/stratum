@@ -179,7 +179,7 @@ static void setup_fixture(slate_fixture *f, const char *tag)
     memset(f, 0, sizeof *f);
     build_sock_path(tag);
     STM_ASSERT_OK(stm_slate_create(&f->slate));
-    f->listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    f->listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(f->listen_fd >= 0);
     f->ctx.listen_fd = f->listen_fd;
     f->ctx.slate     = f->slate;
@@ -551,7 +551,7 @@ static void setup_backend_fixture(slate_backend_fixture *f, const char *tag)
              "/tmp/stm_slate_be_%d_%s.sock", (int)getpid(), tag);
     (void)unlink(f->sock_path);
     STM_ASSERT_OK(stm_slate_create(&f->slate));
-    f->listen_fd = stm_stratumd_listen_unix(f->sock_path, 4, 0600);
+    f->listen_fd = stm_stratumd_listen_unix(f->sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(f->listen_fd >= 0);
     f->ctx.listen_fd = f->listen_fd;
     f->ctx.slate     = f->slate;
@@ -1996,7 +1996,7 @@ STM_TEST(slate_socket_panel_entries_after_backend_respawn_smoke)
     be2.sock_path[be_path_len] = '\0';
     (void)unlink(be2.sock_path);
     STM_ASSERT_OK(stm_slate_create(&be2.slate));
-    be2.listen_fd = stm_stratumd_listen_unix(be2.sock_path, 4, 0600);
+    be2.listen_fd = stm_stratumd_listen_unix(be2.sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(be2.listen_fd >= 0);
     be2.ctx.listen_fd = be2.listen_fd;
     be2.ctx.slate     = be2.slate;

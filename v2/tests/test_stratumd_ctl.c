@@ -110,7 +110,7 @@ static void setup_ctl_fixture(ctl_socket_fixture *f,
         STM_ASSERT_OK(stm_ctl_set_admin_uid(f->ctl, admin_uid));
     }
 
-    f->listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    f->listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(f->listen_fd >= 0);
 
     f->ctx.listen_fd  = f->listen_fd;

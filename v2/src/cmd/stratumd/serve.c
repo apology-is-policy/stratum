@@ -279,7 +279,8 @@ refuse:
 /* listen_unix.                                                           */
 /* ────────────────────────────────────────────────────────────────────── */
 
-int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode)
+int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode,
+                             int sockbuf)
 {
     if (!path || !*path) return -EINVAL;
     if (strlen(path) >= sizeof((struct sockaddr_un *)0)->sun_path)
@@ -316,6 +317,18 @@ int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode)
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -errno;
+
+    /* Socket-buffer request BEFORE bind (TLY CF-3 B: on Thylacine the
+     * pouch layer folds a >= 128 KiB value into the bind-time service
+     * post as the BULK ring class; on a host it is the normal advisory
+     * SO_*BUF hint). Best-effort by design -- the listener works either
+     * way, just at the default frame class. */
+    if (sockbuf > 0) {
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                         &sockbuf, sizeof sockbuf);
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                         &sockbuf, sizeof sockbuf);
+    }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof addr);
@@ -1207,7 +1220,8 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
                     : STM_STRATUMD_DEFAULT_SOCKET_MODE;
 
     int listen_fd = stm_stratumd_listen_unix(opts->socket_path,
-                                                backlog, mode);
+                                                backlog, mode,
+                                                STM_STRATUMD_FS_SOCKBUF);
     if (listen_fd < 0) {
         fprintf(stderr,
             "stratumd: listen on %s failed: %s\n",
@@ -1521,7 +1535,8 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
 
     /* Bind FS listen socket. */
     int listen_fd = stm_stratumd_listen_unix(opts->socket_path,
-                                                backlog, mode);
+                                                backlog, mode,
+                                                STM_STRATUMD_FS_SOCKBUF);
     if (listen_fd < 0) {
         fprintf(stderr,
             "stratumd: listen on %s failed: %s\n",
@@ -1664,7 +1679,7 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
         }
 
         ctl_fd = stm_stratumd_listen_unix(opts->ctl_socket_path,
-                                              backlog, mode);
+                                              backlog, mode, 0);
         if (ctl_fd < 0) {
             fprintf(stderr,
                 "stratumd: listen on %s (/ctl/) failed: %s\n",

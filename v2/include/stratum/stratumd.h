@@ -116,6 +116,14 @@ extern "C" {
  * by default. R95 P1-1 fix. */
 #define STM_STRATUMD_DEFAULT_SOCKET_MODE  ((mode_t)0600)
 
+/* The FS listeners' socket-buffer request (stm_stratumd_listen_unix's
+ * `sockbuf`): 2x STM_9P_MSIZE_DEFAULT, comfortably past the Thylacine
+ * pouch layer's 128 KiB BULK threshold (CF-3 B -- the bind-time service
+ * post then carries the bulk ring class and a kernel-attached mount
+ * negotiates a 128 KiB msize). On a host this is an ordinary advisory
+ * buffer-size request. */
+#define STM_STRATUMD_FS_SOCKBUF  ((int)(2u * STM_9P_MSIZE_DEFAULT))
+
 /* Default per-connection socket idle timeout. Bounds the time one
  * client can hold the serial accept slot (R95 P2-1 fix). 30 s
  * matches janus's R11 P2-4 fix; legitimate 9P clients exchange
@@ -408,8 +416,19 @@ int stm_stratumd_parse_pool_serial_hex(const char *hex, uint8_t out[16]);
  *
  * `backlog` is clamped to [1, SOMAXCONN]. `mode` of 0 substitutes
  * STM_STRATUMD_DEFAULT_SOCKET_MODE (0600).
+ *
+ * `sockbuf` of 0 keeps the platform-default socket buffers. A non-zero
+ * value is set as SO_SNDBUF + SO_RCVBUF on the listener BEFORE bind(),
+ * best-effort (a refusal is ignored). On a POSIX host this is the usual
+ * advisory buffer-size request; on Thylacine's pouch socket layer a
+ * value >= 128 KiB marks the bind-time service post BULK (DMSRVBULK,
+ * CONCURRENT-FS.md CF-3 B): every connection gets 128 KiB-frame rings
+ * and a kernel-attached mount negotiates a 128 KiB msize
+ * (STM_9P_MSIZE_DEFAULT-matched). The FS listeners pass it; the /ctl/
+ * listener does not (small verb frames; bulk rings would be waste).
  */
-int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode);
+int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode,
+                             int sockbuf);
 
 /*
  * Serve a single already-accepted client connection until disconnect.
