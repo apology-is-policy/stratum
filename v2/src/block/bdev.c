@@ -92,6 +92,10 @@ stm_status stm_bdev_fsync(stm_bdev *d)
 {
     if (!d) return STM_EINVAL;
     if (d->read_only) return STM_OK;
+    if (atomic_load_explicit(&d->barrier_defer, memory_order_relaxed)) {
+        atomic_store_explicit(&d->barrier_pending, true, memory_order_relaxed);
+        return STM_OK;
+    }
     return d->ops->fsync(d);
 }
 
@@ -99,7 +103,43 @@ stm_status stm_bdev_fdatasync(stm_bdev *d)
 {
     if (!d) return STM_EINVAL;
     if (d->read_only) return STM_OK;
+    if (atomic_load_explicit(&d->barrier_defer, memory_order_relaxed)) {
+        atomic_store_explicit(&d->barrier_pending, true, memory_order_relaxed);
+        return STM_OK;
+    }
     return d->ops->fdatasync(d);
+}
+
+void stm_bdev_barrier_defer_begin(stm_bdev *d)
+{
+    if (!d || d->read_only) return;
+    /* Arming an already-armed device would indicate a second concurrent
+     * commit — structurally excluded by s->lock; keep the flag monotone
+     * rather than asserting on a dying box. Pending is guaranteed false
+     * here (_end and _cancel both clear it). */
+    atomic_store_explicit(&d->barrier_defer, true, memory_order_relaxed);
+}
+
+stm_status stm_bdev_barrier_defer_end(stm_bdev *d)
+{
+    if (!d) return STM_EINVAL;
+    atomic_store_explicit(&d->barrier_defer, false, memory_order_relaxed);
+    bool pending = atomic_exchange_explicit(&d->barrier_pending, false,
+                                              memory_order_relaxed);
+    if (!pending || d->read_only) return STM_OK;
+    return d->ops->fsync(d);
+}
+
+void stm_bdev_barrier_defer_cancel(stm_bdev *d)
+{
+    if (!d) return;
+    atomic_store_explicit(&d->barrier_defer,   false, memory_order_relaxed);
+    atomic_store_explicit(&d->barrier_pending, false, memory_order_relaxed);
+}
+
+bool stm_bdev_barrier_defer_armed(const stm_bdev *d)
+{
+    return d && atomic_load_explicit(&d->barrier_defer, memory_order_relaxed);
 }
 
 stm_status stm_bdev_discard(stm_bdev *d, uint64_t offset, uint64_t len)

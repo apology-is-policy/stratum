@@ -443,7 +443,9 @@ STM_TEST(bootstrap_pending_drain) {
 }
 
 STM_TEST(bootstrap_commit_ping_pong_slots) {
-    /* Each commit flips hdr and bitmap slots between 0 and 1. */
+    /* Each DIRTY commit flips hdr and bitmap slots between 0 and 1.
+     * CF-4 B: a CLEAN commit (nothing reserved/swept/user_data'd since
+     * the last COW) short-circuits and does NOT flip. */
     make_tmp("pp");
     stm_bdev *d = open_fresh_device();
     stm_bootstrap *a = make_fresh_alloc(d);
@@ -453,15 +455,27 @@ STM_TEST(bootstrap_commit_ping_pong_slots) {
     STM_ASSERT_EQ(st.header_slot_live, 0u);
     STM_ASSERT_EQ(st.bitmap_slot_live, 0u);
 
+    uint64_t pp = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &pp));
     STM_ASSERT_OK(stm_bootstrap_commit(a, 1));
     STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
     STM_ASSERT_EQ(st.header_slot_live, 1u);
     STM_ASSERT_EQ(st.bitmap_slot_live, 1u);
 
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &pp));
     STM_ASSERT_OK(stm_bootstrap_commit(a, 2));
     STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
     STM_ASSERT_EQ(st.header_slot_live, 0u);
     STM_ASSERT_EQ(st.bitmap_slot_live, 0u);
+
+    /* CF-4 B clean short-circuit: no mutation since the last COW --
+     * commit returns STM_OK without flipping slots or advancing gen. */
+    uint64_t gen_before = st.bitmap_gen;
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 3));
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.header_slot_live, 0u);
+    STM_ASSERT_EQ(st.bitmap_slot_live, 0u);
+    STM_ASSERT_EQ(st.bitmap_gen, gen_before);
 
     stm_bootstrap_close(a);
     stm_bdev_close(d);
@@ -671,9 +685,12 @@ STM_TEST(bootstrap_reserve_hint_honored) {
 }
 
 STM_TEST(bootstrap_commit_idempotent_for_empty_pending) {
-    /* Commit with no PENDING entries still COWs the header/bitmap and
-     * bumps bitmap_gen. This keeps mount-time selection deterministic
-     * even when the allocator had nothing to sweep. */
+    /* CF-4 B contract: a commit with no PENDING entries AND no bitmap /
+     * user_data mutation since the last COW is a clean no-op -- STM_OK,
+     * no COW, no bitmap_gen advance (a byte-identical region re-write
+     * is unobservable at open; bitmap_gen exists solely as the
+     * dual-slot tiebreak). A commit with a fresh mutation but still no
+     * sweepable PENDING COWs exactly once. */
     make_tmp("idem");
     stm_bdev *d = open_fresh_device();
     stm_bootstrap *a = make_fresh_alloc(d);
@@ -681,13 +698,22 @@ STM_TEST(bootstrap_commit_idempotent_for_empty_pending) {
     stm_bootstrap_stats before;
     STM_ASSERT_OK(stm_bootstrap_stats_get(a, &before));
 
+    /* Clean: no-op. */
     STM_ASSERT_OK(stm_bootstrap_commit(a, 42));
     stm_bootstrap_stats after;
     STM_ASSERT_OK(stm_bootstrap_stats_get(a, &after));
-
-    STM_ASSERT_EQ(after.bitmap_gen, before.bitmap_gen + 1);
-    STM_ASSERT_EQ(after.header_slot_live, 1u - before.header_slot_live);
+    STM_ASSERT_EQ(after.bitmap_gen,       before.bitmap_gen);
+    STM_ASSERT_EQ(after.header_slot_live, before.header_slot_live);
     STM_ASSERT_EQ(after.allocated_nodes,  before.allocated_nodes);
+
+    /* Dirty (a reserve), still empty pending: exactly one COW. */
+    uint64_t pp = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &pp));
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 43));
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &after));
+    STM_ASSERT_EQ(after.bitmap_gen,       before.bitmap_gen + 1);
+    STM_ASSERT_EQ(after.header_slot_live, 1u - before.header_slot_live);
+    STM_ASSERT_EQ(after.allocated_nodes,  before.allocated_nodes + 1);
 
     stm_bootstrap_close(a);
     stm_bdev_close(d);
@@ -905,6 +931,203 @@ STM_TEST(bootstrap_bitmap_corruption_late_block_rejects) {
     d = reopen_device();
     stm_bootstrap *a2 = NULL;
     STM_ASSERT_ERR(stm_bootstrap_open(d, &a2), STM_ECORRUPT);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* ========================================================================= */
+/* CF-4 B: the commit-defer window + the R7a torn-staged-pair fallback       */
+/* (docs/cf-4-design.md section 4).                                          */
+/* ========================================================================= */
+
+/* Device byte offset of an in-pool block (mirrors pool.c's private
+ * helper via the public layout constants). */
+static uint64_t bs_block_off(uint64_t pool_block)
+{
+    return STM_BOOTSTRAP_OFFSET + pool_block * (uint64_t)STM_UB_SIZE;
+}
+
+/* The defer window collapses N recorded commits into ONE staged COW:
+ * begin -> commit(record) x2 -> stage (writes, no promote) -> finalize
+ * (promote). Durability proven by reopen. */
+STM_TEST(bootstrap_cf4b_defer_single_cow) {
+    make_tmp("defer");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p1));
+
+    stm_bootstrap_commit_defer_begin(a);
+    /* Two recorded commits (the multi-component shape). */
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 5));
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p2));
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 5));
+
+    /* Nothing promoted yet: gen unchanged, slots unchanged. */
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.bitmap_gen, 0u);
+    STM_ASSERT_EQ(st.header_slot_live, 0u);
+
+    STM_ASSERT_OK(stm_bootstrap_commit_defer_stage(a));
+    /* Stage wrote but did not promote. */
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.bitmap_gen, 0u);
+
+    stm_bootstrap_commit_defer_finalize(a);
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.bitmap_gen, 1u);          /* exactly ONE COW */
+    STM_ASSERT_EQ(st.header_slot_live, 1u);
+
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+
+    /* Reopen: both reserves durable at gen 1. */
+    d = reopen_device();
+    stm_bootstrap *a2 = NULL;
+    STM_ASSERT_OK(stm_bootstrap_open(d, &a2));
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a2, &st));
+    STM_ASSERT_EQ(st.bitmap_gen, 1u);
+    bool alloc1 = false, alloc2 = false;
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a2, p1, &alloc1));
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a2, p2, &alloc2));
+    STM_ASSERT_TRUE(alloc1);
+    STM_ASSERT_TRUE(alloc2);
+    stm_bootstrap_close(a2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Cancel drops the window WITHOUT promotion; the dirty taint survives,
+ * so a subsequent plain commit re-COWs into the same non-live pair and
+ * everything persists (the failed-commit retry semantics). */
+STM_TEST(bootstrap_cf4b_defer_cancel_then_retry) {
+    make_tmp("cancel");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p1));
+
+    stm_bootstrap_commit_defer_begin(a);
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 7));
+    STM_ASSERT_OK(stm_bootstrap_commit_defer_stage(a));
+    /* Simulated later-step failure: cancel without finalize. */
+    stm_bootstrap_commit_defer_cancel(a);
+
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.bitmap_gen, 0u);           /* no promote */
+
+    /* The retry (plain path) must still persist the reserve. */
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 7));
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.bitmap_gen, 1u);
+
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+
+    d = reopen_device();
+    stm_bootstrap *a2 = NULL;
+    STM_ASSERT_OK(stm_bootstrap_open(d, &a2));
+    bool alloc1 = false;
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a2, p1, &alloc1));
+    STM_ASSERT_TRUE(alloc1);
+    stm_bootstrap_close(a2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Contract defense: a plain stm_bootstrap_commit inside an armed bdev
+ * barrier-defer window (without the bootstrap defer) would promote an
+ * UNDURABLE COW -- it must refuse with STM_EINVAL. */
+STM_TEST(bootstrap_cf4b_plain_commit_inside_bdev_window_refused) {
+    make_tmp("window_guard");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p1));
+
+    stm_bdev_barrier_defer_begin(d);
+    STM_ASSERT_ERR(stm_bootstrap_commit(a, 3), STM_EINVAL);
+    stm_bdev_barrier_defer_cancel(d);
+
+    /* Outside the window it works. */
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 3));
+
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* The R7a fallback under the CF-4 B crash matrix (design section 5.2):
+ * a crash can leave the STAGED (non-live) pair torn in any combination
+ * -- open must fall back to the durable live pair. Simulate each torn
+ * outcome by scribbling the non-live slots directly. */
+STM_TEST(bootstrap_cf4b_torn_staged_pair_falls_back) {
+    make_tmp("torn");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+
+    /* Two dirty commits: live pair = slot 0 pair at gen 2 (the second
+     * commit flipped back), non-live = slot 1 pair at gen 1. */
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p1));
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 1));
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p2));
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 2));
+    stm_bootstrap_stats live;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &live));
+    STM_ASSERT_EQ(live.header_slot_live, 0u);
+    STM_ASSERT_EQ(live.bitmap_gen, 2u);
+    stm_bootstrap_close(a);
+
+    uint8_t junk[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof junk; i++) junk[i] = (uint8_t)(0xA5u ^ i);
+
+    /* Case 1: torn staged HEADER (slot B = block 1). */
+    STM_ASSERT_OK(stm_bdev_write(d, bs_block_off(STM_BOOTSTRAP_HDR_SLOT_B),
+                                   junk, sizeof junk));
+    stm_bootstrap *a2 = NULL;
+    STM_ASSERT_OK(stm_bootstrap_open(d, &a2));
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a2, &st));
+    STM_ASSERT_EQ(st.bitmap_gen, 2u);           /* live pair mounted */
+    stm_bootstrap_close(a2);
+
+    /* Case 2: valid-looking staged header, torn staged BITMAP. Rebuild
+     * a real gen-3 state in the non-live pair via a dirty commit, then
+     * scribble ONLY its bitmap region -- open must reject the higher-
+     * gen header on h_bitmap_csum mismatch and fall back. */
+    stm_bootstrap *a3 = NULL;
+    STM_ASSERT_OK(stm_bootstrap_open(d, &a3));
+    uint64_t p3 = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a3, TEST_NODE_BLOCKS, 0, &p3));
+    STM_ASSERT_OK(stm_bootstrap_commit(a3, 3)); /* live now slot 1, gen 3 */
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a3, &st));
+    STM_ASSERT_EQ(st.header_slot_live, 1u);
+    STM_ASSERT_EQ(st.bitmap_gen, 3u);
+    stm_bootstrap_close(a3);
+    /* Scribble the slot-B BITMAP region the gen-3 header points at. */
+    for (uint32_t b = 0; b < STM_BOOTSTRAP_BITMAP_BLOCKS; b++) {
+        STM_ASSERT_OK(stm_bdev_write(d,
+            bs_block_off(STM_BOOTSTRAP_BITMAP_SLOT_B + b), junk, sizeof junk));
+    }
+    stm_bootstrap *a4 = NULL;
+    STM_ASSERT_OK(stm_bootstrap_open(d, &a4));
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a4, &st));
+    /* Fell back to the gen-2 pair (slot A). */
+    STM_ASSERT_EQ(st.bitmap_gen, 2u);
+    STM_ASSERT_EQ(st.header_slot_live, 0u);
+    bool alloc1 = false, alloc2 = false;
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a4, p1, &alloc1));
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a4, p2, &alloc2));
+    STM_ASSERT_TRUE(alloc1);
+    STM_ASSERT_TRUE(alloc2);
+    stm_bootstrap_close(a4);
 
     stm_bdev_close(d);
     unlink(g_tmp_path);

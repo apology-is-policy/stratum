@@ -237,6 +237,15 @@ stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
  * stm_bootstrap_commit(committed_gen) with `free_gen < committed_gen` will
  * transition the entry to FREE (clearing the bitmap bits).
  *
+ * free_gen contract (CF-4 B): commits no longer advance the pool gens
+ * when nothing else changed (the clean-commit short-circuit), so a bare
+ * free stamped `free_gen == current_gen` on an otherwise-quiescent pool
+ * defers its sweep to the next MUTATING commit — pass a gen <= the
+ * authoritative gen for next-commit reclamation. Every in-tree caller
+ * either rides other dirt or stamps auth_gen. The entry is in-RAM only;
+ * a crash loses it and the still-set bits are reclaimed by the mount
+ * reconcile (#791).
+ *
  * Returns STM_EINVAL for alignment/range errors.
  */
 STM_MUST_USE
@@ -255,17 +264,65 @@ stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks
  *      fsync.
  * After both fsyncs complete, the new slots become live. A crash between
  * steps 1 and 2 leaves the old header pointing at the old (still valid)
- * bitmap, so recovery picks the old state cleanly.
+ * bitmap, so recovery picks the old state cleanly. (The two fsyncs are
+ * belt-and-braces even standalone: the header's bitmap csum detects a
+ * header-durable-bitmap-torn reorder and open falls back to the other
+ * pair — the R7a fallback the CF-4 B defer window leans on.)
  *
- * bitmap_gen advances by 1 per commit call regardless of whether any
- * PENDING entries swept — ensuring the header monotonically moves
- * forward and a crashed-then-resumed sequence of commits can be
- * ordered by the reader.
+ * CF-4 B clean short-circuit: when the bitmap + user_data are unchanged
+ * since the last persisted COW AND no PENDING entry is sweepable at
+ * `committed_gen`, commit returns STM_OK without I/O and WITHOUT
+ * advancing bitmap_gen (a byte-identical region re-write is
+ * unobservable at open; bitmap_gen exists solely as the dual-slot
+ * tiebreak). Callers that mutated state always get a real COW — every
+ * mutator taints the dirty flag.
  *
  * Returns STM_OK on success. Device-level I/O errors propagate.
  */
 STM_MUST_USE
 stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen);
+
+/* ========================================================================= */
+/* CF-4 B commit-defer window (see docs/cf-4-design.md §4).                    */
+/* ========================================================================= */
+
+/*
+ * Collapse the N per-component stm_bootstrap_commit calls inside one
+ * stm_sync_commit into ONE staged slot-pair COW. While armed (_begin),
+ * stm_bootstrap_commit records max(committed_gen) and returns STM_OK
+ * without I/O or in-RAM mutation. The window is then driven in three
+ * steps:
+ *
+ *   _stage:    run the scan + write the staged (bitmap, header) pair to
+ *              the non-live slots at the recorded gen — its two fsyncs
+ *              ride the caller's bdev barrier-defer window. NO in-RAM
+ *              promotion. Clean short-circuits to a no-op. Idempotent
+ *              on retry (rewrites the same non-live pair).
+ *   _finalize: promote in-RAM state (live-slot swap, bitmap adopt,
+ *              pending sweep, dirty clear). Call ONLY after the bdev
+ *              barrier made the staged pair durable — promoting an
+ *              undurable COW would let a later clean short-circuit
+ *              skip a re-write the disk never saw.
+ *   _cancel:   drop the window + staged bookkeeping without promotion;
+ *              the dirty flag survives, so a retry re-runs the COW into
+ *              the same (still non-live) pair — exactly the pre-CF-4-B
+ *              failed-commit semantics.
+ *
+ * WHY single-COW is load-bearing (not just fewer fsyncs): two COWs in
+ * one un-barriered window would ping-pong onto BOTH slot pairs — the
+ * second scribbling the pre-commit durable pair — and a crash could
+ * then tear both headers = unmountable bootstrap. One staged COW leaves
+ * the pre-window pair untouched; the R7a self-csum fallback covers
+ * every torn/partial staged outcome.
+ *
+ * Single-armer contract: stm_sync_commit only, under fs->global EX +
+ * s->lock (same envelope as the barrier-defer window).
+ */
+void       stm_bootstrap_commit_defer_begin   (stm_bootstrap *a);
+STM_MUST_USE
+stm_status stm_bootstrap_commit_defer_stage   (stm_bootstrap *a);
+void       stm_bootstrap_commit_defer_finalize(stm_bootstrap *a);
+void       stm_bootstrap_commit_defer_cancel  (stm_bootstrap *a);
 
 /* ========================================================================= */
 /* #791 mount-time reconcile (rollback / crash orphan reclamation).           */

@@ -28,40 +28,98 @@ Two properties define correctness (both proven by `tests/test_durability.c`):
 ## 31.2 The commit path — `stm_sync_commit` (`src/sync/sync.c`)
 
 The commit is a **two-phase, copy-on-write checkpoint** (the fresh-pool case
-collapses to one phase). Sequence for an established pool (`auth_gen > 0`),
+collapses to one phase) with **exactly two durability barriers** (CF-4 B,
+`docs/cf-4-design.md`). Sequence for an established pool (`auth_gen > 0`),
 target gen `G = auth + 2`:
 
-1. **Reservation UB** (`reservation_gen = auth + 1`) — a copy of the previous
-   authoritative uberblock with the gen bumped, written to every device under
-   quorum. This is the **rollback target** if the rest of the commit fails.
-2. **Flush all metadata** at `G`:
+1. **Build the reservation prototype** (`reservation_gen = auth + 1`) — a copy
+   of the previous authoritative uberblock with the gen bumped (content from
+   the pre-flush mirrors, which phase 2 never mutates). Written in step 5.
+2. **Arm the CF-4 B defer windows**: the bdev barrier-defer window on every
+   pool device (fsyncs record "pending" instead of flushing) + the bootstrap
+   commit-defer window on every attached alloc's bootstrap (the per-component
+   `stm_bootstrap_commit` calls RECORD instead of COWing).
+3. **Flush all metadata** at `G` (unchanged content + order):
    - keyschema commit
    - CAS auto-GC sweep (frees expired content-addressed entries)
-   - per-device alloc commit (writes the allocator bitmap tree + grabs each
-     device's tree root paddr/csum)
+   - per-device alloc commit (writes the allocator tree; its internal
+     bootstrap commit records into the window)
    - alloc-roots, per-dataset M-engine cascade flush (inode / dirent / xattr /
      extent records — folded into `main_csum` since v30), dataset / snapshot /
      CAS / repair-log index commits.
-3. **The durable-bitmap barrier** — `stm_bootstrap_commit` (`src/bootstrap/pool.c`)
-   COWs the in-RAM allocation bitmap to its alternate slot + **fsyncs**, then
-   COWs the bootstrap header to its alternate slot + **fsyncs**. This is what
-   makes the bitmap bits set during step 2 *durable*; it MUST run strictly
-   before the final UB.
-4. **Compute the Merkle root** over all persisted metadata trees.
-5. **The commit point** — write the final UB at gen `G` to every device +
-   **fsync** (`stm_sb_label_write` → `stm_bdev_write` + `stm_bdev_fsync`),
-   under quorum.
-6. **Post-commit** — advance the in-RAM `auth_gen` / `current_gen` / root
-   pointers under `s->lock`.
+4. **Merkle root + the final-UB prototype + the clean check** — if the
+   would-be final UB is content-identical (mod `ub_gen`/`ub_txg`/
+   `ub_repair_log_root_gen`) to the last UB this session durably wrote, the
+   commit returns `STM_OK` **writing nothing**: no reservation, no COW, no
+   barrier, gens unchanged (31.2.1).
+5. **Reservation UB write** to every device under quorum (fsyncs deferred).
+   This is the **rollback target** if the rest of the commit fails.
+6. **The staged bootstrap COW** — ONE (bitmap, header) slot-pair write per
+   bootstrap into the NON-live slots (`stm_bootstrap_commit_defer_stage`;
+   fsyncs deferred; no in-RAM promotion yet).
+7. **THE data barrier** — `stm_bdev_barrier_defer_end` per device: one real
+   flush that makes the reservation + the staged pair + every phase-3 node
+   write durable, strictly before the final UB write. Then the staged
+   bootstrap state promotes (`_defer_finalize`: live-slot swap + pending
+   sweep + dirty-taint clear).
+8. **The commit point** — write the final UB at gen `G` to every device +
+   **fsync** (`stm_sb_label_write` → `stm_bdev_write` + `stm_bdev_fsync`,
+   real — the window is disarmed), under quorum.
+9. **Post-commit** — engines finalize; advance the in-RAM `auth_gen` /
+   `current_gen` / root pointers under `s->lock`; stash the final prototype
+   for the next commit's clean check.
 
-The durability hinge is the ordering **{all data + bitmap + header durable}
-→ {final UB durable}**:
+Every error exit inside the armed region routes through one ladder that
+cancels both defer layers **without issuing barriers** — fail-closed: the
+final UB never landed, COW discipline keeps the auth state intact, and the
+fs wedges per R154 wherever an engine flushed. The bootstrap cancel keeps
+the dirty taint and never promotes, so a retry re-COWs into the same
+still-non-live pair (regression: `sync_cf4b_inject_fail_then_retry`, an
+injected-failure sweep over every device op with in-process retries).
 
-- Crash after the bitmap/header fsync but before the final UB → the previous
-  authoritative UB is still the highest-gen valid one; the new metadata nodes
-  are unreferenced garbage, reclaimed by the next mount's mark-and-sweep.
+The durability hinge is the ordering **{all data + bitmap + header +
+reservation durable} → {final UB durable}** — one barrier instead of ~8,
+same invariant:
+
+- Crash before the barrier → any SUBSET of the un-barriered writes may be
+  durable: new nodes are unreferenced COW blocks; the staged bootstrap pair
+  is torn-detected by the header's bitmap csum (open falls back to the live
+  pair — R7a); a whole staged pair mounted with the old UB is the bounded
+  case-A leak; the reservation is self-csummed and content-equals the auth
+  UB. Every combination mounts to the auth state.
+- Crash after the barrier, before the final UB → the previous authoritative
+  UB is still the highest-gen valid one; the new metadata nodes are
+  unreferenced garbage, reclaimed by the next mount's mark-and-sweep.
 - Crash after the final UB fsync → the new tree is live; every node it
-  references was made durable in steps 2–3.
+  references was made durable at the barrier.
+
+### 31.2.1 The clean-commit short-circuit
+
+`stm_sync` stashes the shared (device-0-normalized) prototype of the last UB
+it durably wrote. A commit whose would-be prototype is byte-identical outside
+three masked fields — `ub_gen` + `ub_txg` (the monotone counters) and
+`ub_repair_log_root_gen` (stamped `target_gen` unconditionally; informational
+— repair-log nodes are plaintext, the gen is never validated or used as a
+nonce at mount) — skips ALL I/O and does NOT advance gens (in-RAM auth state
+keeps equaling durable state). Structural consequence: any durable-relevant
+activity (a tree write, a CAS-GC/PENDING sweep via the alloc tree, a roster
+change, a scrub-cursor push) changes a compared byte and defeats the skip —
+no flag plumbing. One deliberate composition delta (CF-4 B audit F2): the
+BOOTSTRAP-tier pending sweep is invisible to the UB (the bootstrap is
+self-rooted), so a commit whose only pending work is sweeping the previous
+commit's node retires IS skipped — those bits stay conservatively SET
+(never re-handed) until the next UB-dirty commit or the next mount's #791
+reconcile. Delay-only, bounded, self-healing. The stash starts invalid at
+open, so a session's first commit always writes. Deliberate semantics
+change: gen-age is now REAL-commit count (a quiescent pool does not age;
+the CAS `min_age_txgs` policy ages with activity) — and a caller of the
+raw `stm_fs_free`/`stm_alloc_free` API who stamps `free_gen ==
+current_gen` on an otherwise-quiescent pool defers that free's durability
+to the next mutating commit (gens frozen ⇒ the strict-less-than sweep
+never fires; no production path does this — every in-tree free rides
+dirt or stamps `auth_gen`). The engine pending windows opened by the flush
+are closed by FINALIZE on the clean path (a clean engine flush keeps its
+prior root triple; abort would drop the resident memtree).
 
 A failed `stm_sync_commit` **wedges** the fs (`stm_fs_commit`, R154 P2-1): the
 inode engine's three-phase abort drops the in-RAM tree, so an in-process retry
@@ -93,10 +151,17 @@ give torn-write recovery without a separate journal.
 
 ## 31.4 Write-ordering barriers (the bdev flush primitive)
 
-Every durability barrier is `stm_bdev_fsync`. There are three per commit-phase
-group: the bitmap fsync, the header fsync (both in `stm_bootstrap_commit`), and
-the final-UB fsync (`stm_sb_label_write`). The barrier's strength is the
-backend's:
+Every durability barrier is `stm_bdev_fsync`. Since CF-4 B a dirty commit
+issues exactly **two real barriers per device**: the pre-final-UB data
+barrier (`stm_bdev_barrier_defer_end` — covering the reservation UB, the
+staged bootstrap pair, and every phase-3 node write) and the final-UB fsync
+(`stm_sb_label_write`). All intermediate fsyncs issued inside the commit's
+armed window (bootstrap COW fsyncs, reservation-UB fsyncs) are recorded and
+folded into the data barrier; a clean commit issues zero. Outside a commit
+(`stm_sync_mirror_write`, `stm_sync_evacuation_step`, mount/format) fsyncs
+are immediate as before — the window is armed only inside `stm_sync_commit`,
+under the same lock envelope that excludes every other fsync caller. The
+barrier's strength is the backend's:
 
 ### POSIX backend (`src/block/posix.c`) — host tests
 
@@ -163,33 +228,38 @@ the fs is read-only or wedged.
 device I/O via the `stm_bdev_io_stats` POSIX counter). Measured (256 MiB pool,
 AEAD on; macOS `F_FULLFSYNC` host, so absolute commits/s reflects the host's
 disk-cache-flush latency — the *structural* per-commit costs are
-host-independent):
+host-independent). BEFORE = pre-CF-4-B, AFTER = as-built:
 
-| Scenario | fsyncs/commit | dev-KiB/commit | write-amp |
-|---|---|---|---|
-| empty (nothing dirty) | 6 | 128 | — |
-| metadata (reserve) | 8 | 444 | — |
-| data-4k | 10 | 652 | **163×** |
-| data-64k | 10 | 712 | 11× |
+| Scenario | fsyncs/c (before → after) | dev-KiB/c | us/commit | write-amp |
+|---|---|---|---|---|
+| empty (nothing dirty) | 6 → **0** | 128 → **0** | 19,756 → **13.6** | — |
+| metadata (reserve) | 8 → **2** | 444 → 324 | 36,081 → 19,489 | — |
+| data-4k | 10 → **2** | 652 → 472 | 51,324 → 27,732 | 163× → **118×** |
+| data-64k | 10 → **2** | 712 → 532 | 48,149 → 27,250 | 11× → 8.3× |
 
-**Findings (tracked Area-G perf debt → the concurrent-FS / Bε arc):**
+In-guest (Thylacine fsbench, write+fsync per 4-KiB file): **39 → 340
+files/s** (2,933 us/durable-file).
 
-- **No clean-commit short-circuit.** An empty commit (nothing dirty) still
-  writes a full reservation+bitmap+header+UB cycle: 6 fsyncs + 128 KiB. A
-  dirty-flag short-circuit (CLAUDE.md idempotency-on-retry) would make a
-  redundant `Tsync` near-free — but it must account for the in-commit CAS GC +
-  deferred-free sweeps, so it is a careful change, not a one-liner.
-- **Large fixed per-commit overhead.** ~10 fsync barriers + ~650 KiB of metadata
-  re-COW *independent of payload* → 163× write-amplification for a 4 KiB sync.
-  This is the same per-commit-metadata-re-COW root as Area-S's S-2
-  (metadata-region pressure) and is far outside BTRFS parity for a sync-heavy
-  workload. The fix is a commit-path redesign (barrier batching: the ~10
-  independent fsyncs → 2, one data-durable barrier + one UB-durable barrier;
-  and metadata density) — crash-consistency-critical, so it is surfaced
-  scripture-first to the metadata-density / Bε work, not point-patched.
+**The two Area-G findings this table used to carry are CLOSED by CF-4 B**
+(`docs/cf-4-design.md`): the clean-commit short-circuit landed (31.2.1 —
+including the CAS-GC/PENDING-sweep accounting, which falls out structurally
+from the prototype comparison), and barrier batching landed (31.2/31.4: one
+data barrier + one UB barrier). Remaining per-commit debt, tracked:
+
+- **Metadata re-COW density.** ~470 KiB of metadata re-COW per 4-KiB data
+  sync (118× write-amp) — the Area-S S-2 metadata-density axis, untouched by
+  barrier work.
+- **The per-engine O(resident) flush cycle.** `commit_engines_flush` walks
+  every open engine's resident tree per commit even when clean (clone +
+  consolidate + EBR retire; ~24 ms CPU at 500K resident keys — the chunk-11
+  datum). CPU-only: a clean engine keeps its prior root triple, so the
+  top-level skip already zeroes the I/O. A per-engine dirtiness skip is a
+  wrong-skip-loses-acked-data hazard class (R174-F1 lineage), so it lands
+  only on a provably-sound mutation-counter choke point — the named seam in
+  cf-4-design.md §6.1.
 
 The FLUSH negotiation (31.4) is also a throughput *enabler*: it lets the launch
-use `cache=writeback` (writes batch in the device cache; only the ~10 fsyncs
+use `cache=writeback` (writes batch in the device cache; only the 2 fsyncs
 become real barriers) instead of `cache=writethrough` (every write a synchronous
 barrier). That default-posture change is a separate decision (surfaced with
 measured data), not part of the FLUSH-correctness fix.
@@ -202,8 +272,21 @@ measured data), not part of the FLUSH-correctness fix.
   `committed_write_survives_crash`, `uncommitted_write_rolls_back_atomic`, and
   `crash_during_data_commit_is_atomic` (sweeps a power-cut across every device
   op of a data commit; each survivor reads exactly old XOR exactly new).
+  Passes unchanged over the CF-4 B ordering.
 - `tests/test_crash_inject.c` — structural recovery (mountable-or-clean-error;
-  deferred-free sweep; R154 wedge-on-failed-commit).
+  deferred-free sweep; R154 wedge-on-failed-commit). Passes unchanged.
+- CF-4 B (`tests/test_sync.c`): `sync_cf4b_dirty_commit_two_fsyncs` (the
+  exactly-2 witness — a swallowed barrier would read < 2),
+  `sync_cf4b_clean_commit_skips` (0 writes / 0 fsyncs / gens unchanged +
+  remount verify), `sync_cf4b_first_commit_of_session_writes`,
+  `sync_cf4b_inject_fail_then_retry` (the fsyncgate axis: injected failure at
+  every device op + in-process retry + remount verify).
+- CF-4 B (`tests/test_bootstrap.c`): `bootstrap_cf4b_defer_single_cow`,
+  `bootstrap_cf4b_defer_cancel_then_retry`,
+  `bootstrap_cf4b_plain_commit_inside_bdev_window_refused`, and
+  `bootstrap_cf4b_torn_staged_pair_falls_back` (torn staged header AND
+  valid-header-torn-bitmap both fall back per R7a — the §31.2 crash-matrix
+  outcomes constructed by direct slot scribble).
 - `tests/bench_commit.c` (Area G) — the commit-throughput probe (31.7).
 
 ---
@@ -215,7 +298,15 @@ measured data), not part of the FLUSH-correctness fix.
   FS-level toggle (the AEAD primitive's MB/s is measured by `test_crypto`; the
   data-vs-metadata commit delta is the available proxy). Per-dataset
   `encryption=off` is an unbuilt future design.
-- **Per-commit overhead (31.7)** is the open Area-G perf debt.
+- **Per-commit overhead**: the barrier + clean-commit halves are CLOSED
+  (CF-4 B, 31.7); the metadata re-COW density + the per-engine O(resident)
+  flush cycle remain (31.7's tracked list).
+- **Clean-commit gen semantics (CF-4 B)**: a content-identical
+  `stm_sync_commit` returns STM_OK without advancing gens — callers must not
+  infer "gens advanced" from a successful commit; gen-age counts REAL
+  commits. Multi-device: a data-barrier failure on any live device fails the
+  commit (matches the alloc-loop's per-device strictness; UB writes keep
+  quorum tolerance).
 - **No per-file fsync** (31.6).
 - **bdev_thylacine durability rests on the device honoring `VIRTIO_BLK_T_FLUSH`.**
   QEMU's virtio-blk does (it issues `bdrv_flush`); a device that advertises

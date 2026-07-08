@@ -199,10 +199,32 @@ blocks 36..39: data node 1
   write anywhere in it mismatches and the reader falls back to the
   other slot. Devices needing a larger bootstrap return
   `STM_ENOTSUPPORTED` at create until a dynamically sized bitmap lands.
-- **Slot A/B ping-pong**: every commit writes to the OTHER slot
-  from the one the current state lives in, then fsyncs, then the
+- **Slot A/B ping-pong**: every *persisting* commit writes to the OTHER
+  slot from the one the current state lives in, then fsyncs, then the
   header points at the new slot. Torn-write safe: either slot can
-  be the authoritative one on mount based on a higher `bitmap_gen`.
+  be the authoritative one on mount based on a higher `bitmap_gen`
+  (a header whose bitmap fails `h_bitmap_csum` is rejected and open
+  falls back to the other pair — the R7a fallback).
+- **CF-4 B clean short-circuit**: a commit with no bitmap/user_data
+  mutation since the last persisted COW AND nothing sweepable is a
+  no-op — no COW, no fsync, `bitmap_gen` unchanged (the gen exists
+  solely as the dual-slot tiebreak; a byte-identical re-write is
+  unobservable at open). Mutators taint an atomic dirty flag
+  (reserve / reconcile-sweep / set_user_data; `free` deliberately
+  not — a PENDING append changes no durable state until swept).
+- **CF-4 B commit-defer window** (`stm_bootstrap_commit_defer_begin`
+  / `_stage` / `_finalize` / `_cancel`): inside one `stm_sync_commit`
+  the N per-component `stm_bootstrap_commit` calls RECORD instead of
+  COWing; the 4b-iii barrier site stages ONE (bitmap, header) pair
+  into the non-live slots (its fsyncs ride the bdev barrier-defer
+  window), and promotion runs only after the pool-wide data barrier
+  fired. Single-COW-per-window is load-bearing: two un-barriered COWs
+  would ping-pong onto BOTH pairs and a crash could tear both headers
+  (unmountable). Stage-without-promote keeps failed-commit retries
+  sound (the retry re-COWs into the same still-non-live pair). A
+  plain `stm_bootstrap_commit` inside an armed bdev window without
+  defer mode is refused `STM_EINVAL` (it would promote an undurable
+  COW). See `docs/cf-4-design.md` §4 + `31-durability-commit.md`.
 
 Deferred-free matches `allocator.tla`:
 
@@ -211,7 +233,8 @@ Deferred-free matches `allocator.tla`:
 2. `stm_bootstrap_commit(committed_gen)` — sweeps every PENDING
    with `free_gen < committed_gen`; clears bitmap bit; drops entry;
    COWs bitmap to the other slot; writes new header to the other
-   header slot; fsyncs before return.
+   header slot; fsyncs before return (fsyncs deferred to the pool
+   barrier when staged inside a CF-4 B window).
 
 Caller-supplied `free_gen` and `committed_gen` are the pool's
 commit gens from sync.tla. The strict-less-than criterion

@@ -7,6 +7,8 @@
 
 #include <stratum/block.h>
 
+#include <stdatomic.h>
+
 struct stm_bdev_ops {
     stm_status (*read)       (stm_bdev *d, uint64_t offset, void *buf, size_t len);
     stm_status (*write)      (stm_bdev *d, uint64_t offset, const void *buf, size_t len);
@@ -36,6 +38,12 @@ struct stm_bdev {
     stm_bdev_caps              caps;
     char                      *path;        /* strdup'd */
     bool                       read_only;
+
+    /* CF-4 B barrier-defer window (block.h). Zero-init = disarmed —
+     * every backend calloc's its struct. Single-armer contract: mutated
+     * only under stm_sync_commit's lock envelope; atomics for visibility. */
+    atomic_bool                barrier_defer;
+    atomic_bool                barrier_pending;
 };
 
 /* Backend constructors. */

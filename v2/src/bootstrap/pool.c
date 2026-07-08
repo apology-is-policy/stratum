@@ -39,6 +39,7 @@
 #include <stratum/hash.h>
 #include <stratum/super.h>       /* STM_UB_SIZE = 4096 */
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -130,6 +131,25 @@ struct stm_bootstrap {
     /* Chunk 5d: opaque user-data region stored in the header. Persisted
      * atomically with the bootstrap commit. */
     uint8_t    user_data[STM_BOOTSTRAP_USER_DATA_SIZE];
+
+    /* CF-4 B: monotone taint — bitmap bits or user_data changed since the
+     * last persisted COW. Set by reserve / reconcile-sweep / set_user_data;
+     * cleared at COW finalize. Relaxed atomic: mutators are serialized
+     * against commit by the callers' locks; the atomic is visibility
+     * belt-and-braces, not a concurrency license. */
+    atomic_bool dirty;
+
+    /* CF-4 B commit-defer window (bootstrap.h). Armed/driven only from
+     * stm_sync_commit under its lock envelope — single-threaded state. */
+    bool       defer_armed;
+    bool       defer_recorded;      /* any stm_bootstrap_commit landed?    */
+    uint64_t   defer_gen;           /* max recorded committed_gen          */
+    uint8_t   *staged_region;       /* non-NULL iff a staged COW is open   */
+    uint32_t   staged_bitmap_slot;
+    uint32_t   staged_hdr_slot;
+    uint64_t   staged_gen;
+    uint64_t   staged_swept_count;
+    uint64_t   staged_swept_nodes;
 };
 
 /* ========================================================================= */
@@ -660,6 +680,7 @@ void stm_bootstrap_close(stm_bootstrap *a)
         e = next;
     }
     free(a->reconcile_marked);   /* #791: defensive -- frees an abandoned pass */
+    free(a->staged_region);      /* CF-4 B: defensive -- an abandoned window */
     free(a->bitmap);
     free(a);
 }
@@ -744,6 +765,7 @@ stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
     for (uint64_t i = 0; i < nnodes; i++) {
         bit_set(a->bitmap, first_node + i);
     }
+    atomic_store_explicit(&a->dirty, true, memory_order_relaxed);
 
     a->rove_next_node = (first_node + nnodes) % a->total_nodes;
     *out_paddr = node_to_paddr(a, first_node);
@@ -810,29 +832,39 @@ stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks
     return STM_OK;
 }
 
-stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
+/* Any PENDING entry sweepable at `committed_gen`? (The clean check's
+ * second axis: a sweep mutates the bitmap even when nothing reserved.) */
+static bool bootstrap_has_sweepable(const stm_bootstrap *a,
+                                     uint64_t committed_gen)
 {
-    if (!a) return STM_EINVAL;
+    for (const pending_entry *e = a->pending_head; e; e = e->next)
+        if (e->free_gen < committed_gen) return true;
+    return false;
+}
 
-    /*
-     * Three-phase commit (R7a P1-2 fix):
-     *   Phase 1 — scan: compute the new bitmap in a scratch region and
-     *     count which PENDING entries *would* sweep. Do NOT touch the
-     *     pending list or the in-RAM bitmap yet.
-     *   Phase 2 — I/O: write new bitmap → fsync → write new header →
-     *     fsync. On failure, return without mutating in-RAM state.
-     *   Phase 3 — finalize: I/O succeeded, so commit the sweep to
-     *     in-RAM state (unlink + free entries, update counters, swap
-     *     live slots, promote bitmap + gen).
-     *
-     * A failed commit leaves the caller's view of the allocator exactly
-     * as it was. The on-disk new-slot write may partially succeed, but
-     * the old slot is still live and mount recovers the pre-commit state.
-     */
-
-    /* The bitmap region is 56 KiB — heap, not stack. */
-    uint8_t *new_region = malloc(BITMAP_REGION_BYTES);
-    if (!new_region) return STM_ENOMEM;
+/*
+ * Phases 1+2 of the three-phase commit (R7a P1-2 fix): scan + compute
+ * the new bitmap into a->staged_region and write the staged (bitmap,
+ * header) pair to the NON-live slots. NO in-RAM promotion — the caller
+ * pairs this with bootstrap_cow_finalize (promote) or discards the
+ * staged state (bootstrap_cow_drop). Idempotent on retry: promote never
+ * ran, so a re-stage rewrites the same non-live pair.
+ *
+ * A failed stage leaves the caller's view of the allocator exactly as
+ * it was. The on-disk new-slot write may partially succeed, but the old
+ * slot is still live and mount recovers the pre-commit state (the R7a
+ * header-csum fallback also covers a torn/unsynced pair when the fsyncs
+ * ride a CF-4 B barrier-defer window).
+ */
+static stm_status bootstrap_cow_stage(stm_bootstrap *a, uint64_t committed_gen)
+{
+    /* The bitmap region is 56 KiB — heap, not stack. Reuse a staged
+     * region left by a previous failed attempt. */
+    if (!a->staged_region) {
+        a->staged_region = malloc(BITMAP_REGION_BYTES);
+        if (!a->staged_region) return STM_ENOMEM;
+    }
+    uint8_t *new_region = a->staged_region;
 
     stm_status s = STM_OK;
 
@@ -849,7 +881,7 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
         bool ok = paddr_to_node(a, e->paddr, &first_node);
         /* Invariant: every PENDING entry's paddr was validated on free().
          * A failure here means a pending_head link was corrupted — fatal. */
-        if (!ok) { s = STM_ECORRUPT; goto out; }
+        if (!ok) { s = STM_ECORRUPT; goto out_fail; }
 
         uint64_t nnodes = e->nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
         for (uint64_t i = 0; i < nnodes; i++) {
@@ -866,9 +898,9 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
     uint32_t new_bitmap_slot = 1u - a->bitmap_slot_live;
     s = stm_bdev_write(a->d, bitmap_slot_offset(new_bitmap_slot),
                        new_region, BITMAP_REGION_BYTES);
-    if (s != STM_OK) goto out;
+    if (s != STM_OK) goto out_fail;
     s = stm_bdev_fsync(a->d);
-    if (s != STM_OK) goto out;
+    if (s != STM_OK) goto out_fail;
 
     stm_bootstrap_hdr hdr = { 0 };
     hdr.h_magic                 = stm_store_le64(STM_BOOTSTRAP_HDR_MAGIC);
@@ -894,16 +926,33 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
     uint32_t new_hdr_slot = 1u - a->hdr_slot_live;
     s = stm_bdev_write(a->d, hdr_slot_offset(new_hdr_slot),
                        hdr_buf, sizeof hdr_buf);
-    if (s != STM_OK) goto out;
+    if (s != STM_OK) goto out_fail;
     s = stm_bdev_fsync(a->d);
-    if (s != STM_OK) goto out;
+    if (s != STM_OK) goto out_fail;
 
-    /* Phase 3 — finalize. I/O succeeded; promote in-RAM state. */
+    a->staged_bitmap_slot = new_bitmap_slot;
+    a->staged_hdr_slot    = new_hdr_slot;
+    a->staged_gen         = committed_gen;
+    a->staged_swept_count = swept_count;
+    a->staged_swept_nodes = swept_nodes;
+    return STM_OK;
+
+out_fail:
+    free(a->staged_region);
+    a->staged_region = NULL;
+    return s;
+}
+
+/* Phase 3 — finalize: the staged pair's durability is established, so
+ * promote in-RAM state (sweep the pending list, adopt the bitmap, swap
+ * live slots, clear the dirty taint). */
+static void bootstrap_cow_finalize(stm_bootstrap *a)
+{
     pending_entry **link = &a->pending_head;
     pending_entry  *e    = a->pending_head;
     while (e) {
         pending_entry *next = e->next;
-        if (e->free_gen < committed_gen) {
+        if (e->free_gen < a->staged_gen) {
             *link = next;
             free(e);
         } else {
@@ -912,17 +961,104 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
         e = next;
     }
 
-    memcpy(a->bitmap, new_region, a->bitmap_bytes);
-    a->bitmap_slot_live = new_bitmap_slot;
-    a->hdr_slot_live    = new_hdr_slot;
+    memcpy(a->bitmap, a->staged_region, a->bitmap_bytes);
+    a->bitmap_slot_live = a->staged_bitmap_slot;
+    a->hdr_slot_live    = a->staged_hdr_slot;
     a->bitmap_gen      += 1;
-    a->pending_count   -= swept_count;
-    a->pending_nodes   -= swept_nodes;
-    s = STM_OK;
+    a->pending_count   -= a->staged_swept_count;
+    a->pending_nodes   -= a->staged_swept_nodes;
+    atomic_store_explicit(&a->dirty, false, memory_order_relaxed);
 
-out:
-    free(new_region);
-    return s;
+    free(a->staged_region);
+    a->staged_region = NULL;
+}
+
+static void bootstrap_cow_drop(stm_bootstrap *a)
+{
+    free(a->staged_region);
+    a->staged_region = NULL;
+}
+
+stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
+{
+    if (!a) return STM_EINVAL;
+
+    /* CF-4 B defer window: record + return. The single staged COW runs
+     * at stm_bootstrap_commit_defer_stage. */
+    if (a->defer_armed) {
+        if (committed_gen > a->defer_gen) a->defer_gen = committed_gen;
+        a->defer_recorded = true;
+        return STM_OK;
+    }
+
+    /* CF-4 B clean short-circuit: byte-identical bitmap + user_data and
+     * nothing sweepable — a re-COW would be unobservable at open. */
+    if (!atomic_load_explicit(&a->dirty, memory_order_relaxed) &&
+        !bootstrap_has_sweepable(a, committed_gen))
+        return STM_OK;
+
+    /* Contract defense: a caller who armed the bdev barrier-defer window
+     * MUST also arm this bootstrap's defer mode (stm_sync_commit arms
+     * both together). A plain commit inside the window would promote an
+     * UNDURABLE COW — a later clean short-circuit could then skip a
+     * re-write the disk never saw. Fail loudly instead. */
+    if (stm_bdev_barrier_defer_armed(a->d)) return STM_EINVAL;
+
+    stm_status s = bootstrap_cow_stage(a, committed_gen);
+    if (s != STM_OK) return s;
+    /* Standalone caller: the stage's two fsyncs were real (the window is
+     * not armed), so durability is established here. */
+    bootstrap_cow_finalize(a);
+    return STM_OK;
+}
+
+void stm_bootstrap_commit_defer_begin(stm_bootstrap *a)
+{
+    if (!a) return;
+    a->defer_armed    = true;
+    a->defer_recorded = false;
+    a->defer_gen      = 0;
+}
+
+stm_status stm_bootstrap_commit_defer_stage(stm_bootstrap *a)
+{
+    if (!a) return STM_EINVAL;
+    if (!a->defer_armed) return STM_EINVAL;
+    /* The recorder today is stm_alloc_commit's UNCONDITIONAL tail call
+     * (alloc.c: "The bootstrap pool still commits"), reached for every
+     * armed+staged bootstrap because sync_commit's stage loop and its
+     * alloc-commit loop share the same REMOVED/FAULTED skip set. The
+     * dirty disjunct below makes INV-1 independent of that cross-file
+     * convention (CF-4 B audit F1): engine reserves taint `dirty` but
+     * never call stm_bootstrap_commit themselves, so if a future change
+     * made alloc's tail call conditional, a dirty bitmap still stages
+     * here — rather than the final UB naming nodes whose bitmap bits
+     * were never made durable (the 4b-iii corruption class). */
+    if (!a->defer_recorded &&
+        !atomic_load_explicit(&a->dirty, memory_order_relaxed))
+        return STM_OK;
+    if (!atomic_load_explicit(&a->dirty, memory_order_relaxed) &&
+        !bootstrap_has_sweepable(a, a->defer_gen))
+        return STM_OK;
+    return bootstrap_cow_stage(a, a->defer_gen);
+}
+
+void stm_bootstrap_commit_defer_finalize(stm_bootstrap *a)
+{
+    if (!a) return;
+    if (a->staged_region) bootstrap_cow_finalize(a);
+    a->defer_armed    = false;
+    a->defer_recorded = false;
+    a->defer_gen      = 0;
+}
+
+void stm_bootstrap_commit_defer_cancel(stm_bootstrap *a)
+{
+    if (!a) return;
+    bootstrap_cow_drop(a);
+    a->defer_armed    = false;
+    a->defer_recorded = false;
+    a->defer_gen      = 0;
 }
 
 /* ========================================================================= */
@@ -996,6 +1132,8 @@ stm_status stm_bootstrap_reconcile_end(stm_bootstrap *a, uint64_t *out_freed_nod
             freed++;
         }
     }
+    if (freed > 0)
+        atomic_store_explicit(&a->dirty, true, memory_order_relaxed);
     free(a->reconcile_marked);
     a->reconcile_marked = NULL;
     if (out_freed_nodes) *out_freed_nodes = freed;
@@ -1062,6 +1200,7 @@ stm_status stm_bootstrap_set_user_data(stm_bootstrap *a,
 
     memset(a->user_data, 0, STM_BOOTSTRAP_USER_DATA_SIZE);
     if (len) memcpy(a->user_data, data, len);
+    atomic_store_explicit(&a->dirty, true, memory_order_relaxed);
     return STM_OK;
 }
 

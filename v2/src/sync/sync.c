@@ -473,6 +473,18 @@ struct stm_sync {
      * Initially zero (= scrub IDLE / all counters zero); fresh
      * pools see this naturally. */
     uint8_t           scrub_durable[64];
+
+    /* CF-4 B clean-commit short-circuit: the shared (device-0-
+     * normalized) prototype of the last uberblock THIS SESSION durably
+     * wrote. A commit whose would-be prototype is content-identical
+     * (mod ub_gen/ub_txg/ub_repair_log_root_gen — see
+     * ub_content_equal_masked) skips all I/O and gen advancement.
+     * Invalid at open/create — the first commit of a session never
+     * skips (reconstructing a comparable prototype from a scanned UB
+     * would drag per-device identity + mount-claim gen complexity in
+     * for one commit's saving). */
+    stm_uberblock     last_fin_ub;
+    bool              have_last_fin_ub;
 };
 
 /* ========================================================================= */
@@ -1132,6 +1144,36 @@ static void build_uberblock(stm_uberblock *out,
      * an invariant here. */
     sync_redundancy_encode(&s->redundancy, &out->ub_redundancy_kind,
                               out->ub_redundancy_params);
+}
+
+/* CF-4 B: content comparison for the clean-commit short-circuit.
+ * Masks exactly three fields: ub_gen + ub_txg (the monotone counters —
+ * they differ by construction on every commit) and
+ * ub_repair_log_root_gen (stamped target_gen unconditionally by the
+ * commit; informational — plaintext repair-log nodes take no AEAD nonce
+ * from it, mount only round-trips it, and the log's paddr/csum/next_seq
+ * are compared UNMASKED). ub_csum is zero in both prototypes (stamped
+ * at encode time into the wire buffer, never the struct) but zeroed
+ * anyway for robustness. Everything else — roots, csums, per-tree gens,
+ * next-ids, stats, roster + hash, redundancy, scrub state, keyschema
+ * header, merkle root, pool serial, the device-0-normalized identity
+ * fields — compares byte-for-byte, so ANY durable-relevant phase-2
+ * activity (a tree write, a CAS-GC/PENDING sweep via the alloc tree, a
+ * roster change, a scrub-cursor push) defeats the skip structurally.
+ * Padding-safe: both prototypes are memset-built by build_uberblock. */
+static bool ub_content_equal_masked(const stm_uberblock *a,
+                                     const stm_uberblock *b)
+{
+    stm_uberblock ca = *a, cb = *b;
+    memset(&ca.ub_gen, 0, sizeof ca.ub_gen);
+    memset(&cb.ub_gen, 0, sizeof cb.ub_gen);
+    memset(&ca.ub_txg, 0, sizeof ca.ub_txg);
+    memset(&cb.ub_txg, 0, sizeof cb.ub_txg);
+    memset(&ca.ub_repair_log_root_gen, 0, sizeof ca.ub_repair_log_root_gen);
+    memset(&cb.ub_repair_log_root_gen, 0, sizeof cb.ub_repair_log_root_gen);
+    memset(ca.ub_csum, 0, sizeof ca.ub_csum);
+    memset(cb.ub_csum, 0, sizeof cb.ub_csum);
+    return memcmp(&ca, &cb, sizeof ca) == 0;
 }
 
 /* ========================================================================= */
@@ -2517,7 +2559,17 @@ stm_status stm_sync_commit(stm_sync *s)
 
     /* Phase 1 (non-fresh only): reservation UB = copy of previous
      * authoritative state with gen bumped. Pre-flush roots; rollback
-     * target on Phase 3 failure. */
+     * target on Phase 3 failure.
+     *
+     * CF-4 B: BUILT here (from the pre-phase-2 mirrors, exactly as
+     * before — phase 2 never mutates the s->* mirrors) but WRITTEN
+     * only after the clean-commit check below, so a content-identical
+     * commit writes nothing at all. Under the barrier-defer window the
+     * reservation's durability point was already the pre-final-UB
+     * barrier, so moving the write keeps the same durable ordering
+     * (reservation durable-before final — quorum.tla; see
+     * docs/cf-4-design.md section 5.1). */
+    stm_uberblock res_prototype;
     if (!is_fresh) {
         stm_alloc_stats astats_res;
         stm_status gs = stm_alloc_stats_get(s->alloc, &astats_res);
@@ -2525,7 +2577,6 @@ stm_status stm_sync_commit(stm_sync *s)
             pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return gs;
         }
-        stm_uberblock res_prototype;
         build_uberblock(&res_prototype, s,
                          /*target_device_id=*/ 0,   /* overwritten per-device */
                          /*new_gen=*/           reservation_gen,
@@ -2551,14 +2602,28 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*cas_index_gen=*/     s->cas_index_root_gen,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
-        uint32_t res_label = ring_label_for_gen(reservation_gen);
-        uint32_t res_slot  = ring_slot_for_gen(reservation_gen);
-        stm_status rw = write_ub_to_all_devices(s, &res_prototype,
-                                                    res_label, res_slot);
-        if (rw != STM_OK) {
-            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
-            return rw;
-        }
+    }
+
+    /* CF-4 B: arm the barrier-defer windows. Every fsync issued between
+     * here and the explicit barrier below (component bootstrap commits
+     * — which now merely RECORD, the staged COW, the reservation UB
+     * write) is deferred to ONE real fsync per device strictly before
+     * the final UB write; the final UB's own fsync runs after disarm
+     * and stays real (the second barrier). Both layers are cancelled on
+     * every error exit via the out ladder — nothing a durable UB names
+     * has been made nameable (the final UB never landed; the fs wedges
+     * per R154 where an engine flushed). Single-armer contract: this
+     * function only, under fs->global EX + s->lock + pool SH. */
+    stm_status out_rc;
+    {
+        size_t ndev = stm_pool_device_count(s->pool);
+        for (size_t i = 0; i < ndev; i++)
+            stm_bdev_barrier_defer_begin(stm_pool_device_bdev(s->pool,
+                                                                (uint16_t)i));
+    }
+    for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++) {
+        stm_alloc *ai = s->allocs[dev];
+        if (ai) stm_bootstrap_commit_defer_begin(stm_alloc_bootstrap(ai));
     }
 
     /* Phase 2: Flush. Keyschema first (its tree nodes get allocated
@@ -2570,8 +2635,7 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status kcs = stm_keyschema_commit(s->keyschema, target_gen,
                                             &ks_root_paddr, ks_root_csum);
     if (kcs != STM_OK) {
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return kcs;
+        { out_rc = kcs; goto out_cancel; }
     }
 
     /* P7-CAS-3: auto-GC sweep moved BEFORE the per-device alloc_commit
@@ -2591,8 +2655,7 @@ stm_status stm_sync_commit(stm_sync *s)
     if (s->cas_idx) {
         stm_status gc_err = cas_auto_gc_sweep_locked(s);
         if (gc_err != STM_OK) {
-            pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-            return gc_err;
+            { out_rc = gc_err; goto out_cancel; }
         }
     }
 
@@ -2633,21 +2696,18 @@ stm_status stm_sync_commit(stm_sync *s)
                    di->state == STM_DEV_STATE_FAULTED)) continue;
         stm_status s_alloc = stm_alloc_commit(ai, target_gen);
         if (s_alloc != STM_OK) {
-            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
-            return s_alloc;
+            { out_rc = s_alloc; goto out_cancel; }
         }
         uint64_t ti_paddr = 0;
         uint8_t  ti_csum[32];
         stm_status gs = stm_alloc_get_tree_root(ai, &ti_paddr, ti_csum);
         if (gs != STM_OK) {
-            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
-            return gs;
+            { out_rc = gs; goto out_cancel; }
         }
         uint64_t ti_gen = 0;
         gs = stm_alloc_get_tree_gen(ai, &ti_gen);
         if (gs != STM_OK) {
-            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
-            return gs;
+            { out_rc = gs; goto out_cancel; }
         }
         /* roots.set is a no-op when the entire (paddr, csum, gen)
          * triple matches the existing entry → propagates per-device
@@ -2656,8 +2716,7 @@ stm_status stm_sync_commit(stm_sync *s)
         stm_status rs = stm_alloc_roots_set(s->roots, dev,
                                                ti_paddr, ti_csum, ti_gen);
         if (rs != STM_OK) {
-            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
-            return rs;
+            { out_rc = rs; goto out_cancel; }
         }
     }
 
@@ -2668,8 +2727,7 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status rc = stm_alloc_roots_commit(s->roots, target_gen,
                                               &roots_paddr, roots_csum);
     if (rc != STM_OK) {
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return rc;
+        { out_rc = rc; goto out_cancel; }
     }
     /* Gen at which the roots object was encrypted. May differ from
      * target_gen when _commit short-circuits (clean). Same semantics
@@ -2677,8 +2735,7 @@ stm_status stm_sync_commit(stm_sync *s)
     uint64_t roots_gen = 0;
     rc = stm_alloc_roots_get_gen(s->roots, &roots_gen);
     if (rc != STM_OK) {
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return rc;
+        { out_rc = rc; goto out_cancel; }
     }
 
     /* 9.7-impl-1c-ii: M-engine cascade flush. For each PRESENT dataset
@@ -2697,8 +2754,7 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status ecs2 = stm_dataset_index_commit_engines_flush(s->dataset_idx,
                                                               target_gen);
     if (ecs2 != STM_OK) {
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return ecs2;
+        { out_rc = ecs2; goto out_cancel; }
     }
 
     /* P6-persist: commit the dataset + snapshot indices. Each is
@@ -2722,20 +2778,17 @@ stm_status stm_sync_commit(stm_sync *s)
                                                   &main_paddr, main_csum);
     if (mcs != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return mcs;
+        { out_rc = mcs; goto out_cancel; }
     }
     mcs = stm_dataset_index_get_gen(s->dataset_idx, &main_gen);
     if (mcs != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return mcs;
+        { out_rc = mcs; goto out_cancel; }
     }
     mcs = stm_dataset_index_get_next_id(s->dataset_idx, &main_next_id);
     if (mcs != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return mcs;
+        { out_rc = mcs; goto out_cancel; }
     }
     uint64_t snap_paddr = 0;
     uint8_t  snap_csum[32] = {0};
@@ -2745,20 +2798,17 @@ stm_status stm_sync_commit(stm_sync *s)
                                                    &snap_paddr, snap_csum);
     if (scs != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return scs;
+        { out_rc = scs; goto out_cancel; }
     }
     scs = stm_snapshot_index_get_gen(s->snap_idx, &snap_gen);
     if (scs != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return scs;
+        { out_rc = scs; goto out_cancel; }
     }
     scs = stm_snapshot_index_get_next_id(s->snap_idx, &snap_next_id);
     if (scs != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return scs;
+        { out_rc = scs; goto out_cancel; }
     }
 
     /* P7-15 (v16): commit the repair-log index. Plaintext +
@@ -2774,8 +2824,7 @@ stm_status stm_sync_commit(stm_sync *s)
                                                     &repair_log_seq);
     if (rls != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return rls;
+        { out_rc = rls; goto out_cancel; }
     }
 
     /* P7-CAS (v18): commit the CAS index. Same shape as extent_idx.
@@ -2790,14 +2839,12 @@ stm_status stm_sync_commit(stm_sync *s)
                                             &cas_paddr, cas_csum);
     if (ccs != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return ccs;
+        { out_rc = ccs; goto out_cancel; }
     }
     ccs = stm_cas_index_get_gen(s->cas_idx, &cas_gen);
     if (ccs != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return ccs;
+        { out_rc = ccs; goto out_cancel; }
     }
 
     /* 9.7-impl-1c-ii / 1c-iii / 1c-iv / 1c-v / 1c-vi: the four pool-
@@ -2824,8 +2871,7 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return sr;
+        { out_rc = sr; goto out_cancel; }
     }
 
     /* P4-1 / P5-3b / P6-persist / P7-3 / P7-15 R47 P2-1 / P8-POSIX-1b
@@ -2862,49 +2908,12 @@ stm_status stm_sync_commit(stm_sync *s)
                                           new_merkle_root);
     if (ms != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return ms;
+        { out_rc = ms; goto out_cancel; }
     }
 
-    /* 9.6-impl-4b-iii: the explicit durable-bitmap barrier. Every
-     * engine's commit_flush above did vt->reserve (set node bits in
-     * the bootstrap bitmap IN RAM) + vt->write (node bytes straight
-     * to the device); stm_bootstrap_commit is what makes those
-     * bitmap bits DURABLE — it COWs the bitmap to its other slot +
-     * fsyncs. It MUST run strictly BEFORE the final uberblock write
-     * (9.6-impl-4b design §5.2 case A): a crash with the bitmap
-     * durable but the UB stale leaks the freshly-flushed nodes
-     * (bounded, non-corrupting); the reverse order — UB durable,
-     * bitmap stale — would let a later reserve re-hand a still-
-     * rooted paddr and corrupt the tree.
-     *
-     * `boot` is device 0's shared bootstrap — the same handle every
-     * metadata index borrows.
-     *
-     * 9.7-impl-1c-v: the four pool-global engines (inode, dirent,
-     * xattr, extent) are RETIRED. The M-engine cascade's
-     * commit_engines_flush above is the SOLE source of dirty bitmap
-     * bits at v30; the remaining btree_store-backed trees (dataset /
-     * snapshot / cas / repair_log) ALSO call stm_bootstrap_commit
-     * internally at this same target_gen, so this explicit call is
-     * redundant-but-cheap for them (idempotent at the same gen).
-     *
-     * On failure the M-cascade is aborted (crash-equivalent) and the
-     * commit returns — the fs wedges + remounts off the previous
-     * (still-consistent) uberblock. */
-    stm_bootstrap *boot = stm_alloc_bootstrap(s->alloc);
-    if (!boot) {
-        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return STM_EINVAL;
-    }
-    stm_status bcs = stm_bootstrap_commit(boot, target_gen);
-    if (bcs != STM_OK) {
-        (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return bcs;
-    }
-
+    /* Build the final prototype EARLY (CF-4 B): both the clean-commit
+     * check and the write use it. Pure computation — build_uberblock
+     * reads only s->* + the params; no I/O. */
     stm_uberblock fin_prototype;
     build_uberblock(&fin_prototype, s,
                      /*target_device_id=*/ 0,   /* overwritten per-device */
@@ -2920,14 +2929,106 @@ stm_status stm_sync_commit(stm_sync *s)
                      /*cas_index_gen=*/  cas_gen,
                      new_merkle_root, &astats);
 
+    /* CF-4 B clean-commit short-circuit: the would-be UB is content-
+     * identical (mod the masked monotone counters) to the last UB this
+     * session durably wrote — everything it names is already durable,
+     * so writing it again adds nothing. Return STM_OK WITHOUT advancing
+     * gens (in-RAM auth state must keep equaling durable state), without
+     * the reservation write, without a bootstrap COW, without barriers:
+     * zero device writes, zero fsyncs. Any durable-relevant phase-2
+     * activity (tree write, sweep via the alloc tree, roster change,
+     * scrub push) changed a compared byte and defeats the skip.
+     *
+     * The engine pending windows the flush above opened are closed by
+     * FINALIZE — the flush of a clean engine kept its prior root triple
+     * (engine.c: a no-op commit preserves root gen), so adoption is a
+     * no-op; ABORT would drop the resident memtree (crash-equivalent),
+     * wrong for a no-op. A finalize failure wedges via the caller
+     * exactly as on the commit path. */
+    if (s->have_last_fin_ub &&
+        ub_content_equal_masked(&fin_prototype, &s->last_fin_ub)) {
+        stm_status cfs = stm_dataset_index_commit_engines_finalize(s->dataset_idx);
+        out_rc = cfs;
+        goto out_cancel;
+    }
+
+    /* Phase 1' (CF-4 B: moved from before phase 2): the reservation UB
+     * write. Content was built from the pre-phase-2 mirrors above; its
+     * per-device fsyncs are deferred to the barrier below, which fires
+     * strictly before the final UB write — the same durable ordering as
+     * the old position (reservation durable-before final, quorum.tla). */
+    if (!is_fresh) {
+        uint32_t res_label = ring_label_for_gen(reservation_gen);
+        uint32_t res_slot  = ring_slot_for_gen(reservation_gen);
+        stm_status rw = write_ub_to_all_devices(s, &res_prototype,
+                                                    res_label, res_slot);
+        if (rw != STM_OK) {
+            (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
+            { out_rc = rw; goto out_cancel; }
+        }
+    }
+
+    /* 9.6-impl-4b-iii, CF-4 B form: the durable-bitmap barrier. Every
+     * engine's commit_flush above did vt->reserve (set node bits in the
+     * bootstrap bitmap IN RAM) + vt->write (node bytes straight to the
+     * device); the per-component stm_bootstrap_commit calls RECORDED
+     * into the defer window instead of COWing. Stage the ONE slot-pair
+     * COW per bootstrap now (INV-2: the pre-commit live pair is never
+     * written inside the window), then fire the single data barrier per
+     * device — making the staged pair + the reservation UB + every
+     * phase-2 node write durable strictly BEFORE the final uberblock
+     * write (9.6-impl-4b design §5.2 case A: bitmap-durable-before-UB;
+     * the reverse order would let a later reserve re-hand a still-
+     * rooted paddr and corrupt the tree).
+     *
+     * On failure the M-cascade is aborted (crash-equivalent) and the
+     * commit returns — the fs wedges + remounts off the previous
+     * (still-consistent) uberblock; the out ladder cancels the still-
+     * armed windows (a cancelled window issues no barrier — nothing the
+     * auth UB names was touched, COW discipline). */
+    for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++) {
+        stm_alloc *ai = s->allocs[dev];
+        if (!ai) continue;
+        const stm_pool_device *di = stm_pool_device_info(s->pool, dev);
+        if (di && (di->state == STM_DEV_STATE_REMOVED ||
+                   di->state == STM_DEV_STATE_FAULTED)) continue;
+        stm_status bcs = stm_bootstrap_commit_defer_stage(stm_alloc_bootstrap(ai));
+        if (bcs != STM_OK) {
+            (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
+            { out_rc = bcs; goto out_cancel; }
+        }
+    }
+    {
+        size_t ndev = stm_pool_device_count(s->pool);
+        for (size_t i = 0; i < ndev; i++) {
+            stm_bdev *bd = stm_pool_device_bdev(s->pool, (uint16_t)i);
+            if (!bd) continue;
+            const stm_pool_device *di = stm_pool_device_info(s->pool,
+                                                                (uint16_t)i);
+            if (di && di->state == STM_DEV_STATE_FAULTED) continue;
+            stm_status bs = stm_bdev_barrier_defer_end(bd);
+            if (bs != STM_OK) {
+                (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
+                { out_rc = bs; goto out_cancel; }
+            }
+        }
+    }
+    /* Durability established — promote the staged bootstrap state
+     * (live-slot swap + pending sweep + dirty clear). In-RAM only; a
+     * final-UB failure past this point leaves bitmap-ahead-of-UB, the
+     * safe 4b case-A direction, exactly as the pre-CF-4-B ordering. */
+    for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++) {
+        stm_alloc *ai = s->allocs[dev];
+        if (ai) stm_bootstrap_commit_defer_finalize(stm_alloc_bootstrap(ai));
+    }
+
     uint32_t fin_label = ring_label_for_gen(target_gen);
     uint32_t fin_slot  = ring_slot_for_gen(target_gen);
     stm_status fw = write_ub_to_all_devices(s, &fin_prototype,
                                                 fin_label, fin_slot);
     if (fw != STM_OK) {
         (void)stm_dataset_index_commit_engines_abort(s->dataset_idx);
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return fw;
+        { out_rc = fw; goto out_cancel; }
     }
 
     /* 9.7-impl-1c-v: the final uberblock landed — THIS is the commit
@@ -2948,8 +3049,7 @@ stm_status stm_sync_commit(stm_sync *s)
      * trees intact, superseded nodes merely leaked. */
     stm_status mfs = stm_dataset_index_commit_engines_finalize(s->dataset_idx);
     if (mfs != STM_OK) {
-        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-        return mfs;
+        { out_rc = mfs; goto out_cancel; }
     }
 
     /* Publish: advance in-RAM state. auth_gen = target, current_gen =
@@ -3000,8 +3100,40 @@ stm_status stm_sync_commit(stm_sync *s)
     /* P7-CAS: same advance for the CAS index. */
     if (s->cas_idx) (void)stm_cas_index_advance_txg(s->cas_idx, s->current_gen);
 
+    /* CF-4 B: stash the shared prototype for the next commit's clean
+     * check. Only a DURABLY-written UB is ever stashed (we are past the
+     * final write + its real fsync). */
+    s->last_fin_ub      = fin_prototype;
+    s->have_last_fin_ub = true;
+
+    out_rc = STM_OK;
+    /* FALLTHROUGH into the ladder: on this path both defer layers are
+     * already properly closed (barrier fired, bootstrap finalized), so
+     * the cancels below are no-ops — kept unconditional so EVERY exit
+     * of this function provably disarms the windows (INV-6). */
+
+out_cancel:
+    /* CF-4 B exit ladder. Error exits arrive with the windows still
+     * armed: cancel discards the defer state WITHOUT issuing barriers —
+     * correct because the final UB never landed (nothing durable names
+     * the unsynced writes; COW discipline keeps the auth state intact)
+     * and the fs wedges per R154 wherever an engine flushed. The
+     * bootstrap cancel keeps the dirty taint, so a hypothetical retry
+     * re-COWs into the same still-non-live pair (pre-CF-4-B failed-
+     * commit semantics). Cancels are idempotent no-ops on closed
+     * windows (the success + clean paths). */
+    for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++) {
+        stm_alloc *ai = s->allocs[dev];
+        if (ai) stm_bootstrap_commit_defer_cancel(stm_alloc_bootstrap(ai));
+    }
+    {
+        size_t ndev = stm_pool_device_count(s->pool);
+        for (size_t i = 0; i < ndev; i++)
+            stm_bdev_barrier_defer_cancel(stm_pool_device_bdev(s->pool,
+                                                                 (uint16_t)i));
+    }
     pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
-    return STM_OK;
+    return out_rc;
 }
 
 /* ========================================================================= */

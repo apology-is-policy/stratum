@@ -147,6 +147,26 @@ stm_status stm_bdev_fdatasync(stm_bdev *d);
 STM_MUST_USE
 stm_status stm_bdev_discard  (stm_bdev *d, uint64_t offset, uint64_t len);
 
+/* CF-4 B barrier-defer window. While armed, stm_bdev_fsync / _fdatasync
+ * record "barrier pending" and return STM_OK without touching the device;
+ * _end issues ONE real flush iff anything was deferred, then disarms.
+ * _cancel disarms without I/O (correct only when nothing the caller wrote
+ * inside the window can be named by durable state — the commit error path,
+ * where the final uberblock never lands and the fs wedges).
+ *
+ * Single-armer contract: exactly one arming site (stm_sync_commit), which
+ * runs under fs->global EX + s->lock; no other thread issues fsyncs on the
+ * pool's devices while a commit is in flight (mirror_write / evacuation
+ * serialize behind the same locks). The flags are atomics as belt-and-
+ * braces for visibility, not as a concurrency license. Covers only the
+ * synchronous facade; stm_bdev_submit_fsync is not gated (no commit-path
+ * caller). */
+void       stm_bdev_barrier_defer_begin (stm_bdev *d);
+STM_MUST_USE
+stm_status stm_bdev_barrier_defer_end   (stm_bdev *d);
+void       stm_bdev_barrier_defer_cancel(stm_bdev *d);
+bool       stm_bdev_barrier_defer_armed (const stm_bdev *d);
+
 /* Grow only. Returns STM_ENOTSUPPORTED for non-file backends. */
 STM_MUST_USE
 stm_status stm_bdev_resize(stm_bdev *d, uint64_t new_size);

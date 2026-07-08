@@ -285,6 +285,17 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
  *     `free_gen`; bits stay reserved against reuse until sweep).
  *   - refcount = 0 (already PENDING): STM_EINVAL (double-free).
  *
+ * free_gen contract (CF-4 B): the free itself mutates the alloc tree,
+ * so the NEXT commit always runs — but its sweep requires `free_gen <
+ * target_gen`, and commits after that no longer advance gens when
+ * nothing else changed (the clean-commit short-circuit). A free stamped
+ * `free_gen == current_gen` on an otherwise-quiescent pool therefore
+ * reaches durable-PENDING on the next commit but is reclaimed (swept to
+ * FREE) only by the next MUTATING commit after that. Stamp a gen <= the
+ * authoritative gen when prompt reclamation matters (every in-tree
+ * production caller does, or rides other dirt — e.g. the fs unlink
+ * path's reclaim double-commit).
+ *
  * Returns STM_ENOENT if no entry starts at `paddr`.
  */
 STM_MUST_USE

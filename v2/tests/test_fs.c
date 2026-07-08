@@ -347,9 +347,20 @@ STM_TEST(fs_stats_reports_gen_progression) {
 
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
-    /* P5-2: 2-phase commits advance current_gen by 2. */
+    /* P5-2: 2-phase commits advance current_gen by 2. (The session's
+     * first commit never clean-skips -- CF-4 B.) */
     STM_ASSERT_EQ(st.current_gen, gen0 + 2u);
 
+    /* CF-4 B: a DIRTY commit advances by 2 ... */
+    uint64_t agep = 0;
+    STM_ASSERT_OK(stm_fs_reserve(fs, 4u, 0, &agep));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.current_gen, gen0 + 4u);
+
+    /* ... and a content-identical commit is a durability no-op: STM_OK,
+     * gens UNCHANGED (in-RAM auth state keeps equaling durable state --
+     * the CF-4 B clean-commit short-circuit). */
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
     STM_ASSERT_EQ(st.current_gen, gen0 + 4u);
@@ -6462,10 +6473,15 @@ STM_TEST(fs_p7cas7_policy_step_recent_extent_blocked_by_age) {
     STM_ASSERT_EQ(stats_strict.inos_eligible, 0u);
     STM_ASSERT_EQ(stats_strict.inos_migrated, 0u);
 
-    /* Advance current_gen by committing repeatedly. Each commit
-     * advances current_gen by 2 (sync's auth+2 publish). Run >= 50
-     * commits → current_gen - link_gen >= 100. */
+    /* Advance current_gen by committing repeatedly. Each DIRTY commit
+     * advances current_gen by 2 (sync's auth+2 publish); CF-4 B makes a
+     * content-identical commit a gen-preserving no-op, so the aging
+     * clock is REAL commits -- age each iteration with a small reserve
+     * (the txg-age semantics: a quiescent pool does not age). Run >= 50
+     * dirty commits → current_gen - link_gen >= 100. */
     for (int i = 0; i < 60; i++) {
+        uint64_t agep = 0;
+        STM_ASSERT_OK(stm_fs_reserve(fs, 4u, 0, &agep));
         STM_ASSERT_OK(stm_fs_commit(fs));
     }
 

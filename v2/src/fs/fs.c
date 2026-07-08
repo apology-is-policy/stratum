@@ -2618,6 +2618,34 @@ lookup_fallback:
     }
 }
 
+/* #369 (R176 F1, CF-4 B rider): the create/link rollback's inode free.
+ * The rollback path used to `(void)`-discard the free's status; under a
+ * doubly-wedged engine (CF-2d makes STM_EBUSY reachable from BOTH the
+ * failing forward op AND the rollback free, each after 64 whole-op
+ * retries) the just-allocated child inode then leaks SILENTLY — an
+ * unreferenced orphan no dirent names. The repair log cannot carry it
+ * (its record is replica-rewrite-shaped: paddr pair + replica indices,
+ * no dataset/inode fields — repair_log.h:94), so surface it loudly on
+ * stderr instead (durable-visible for the daemon's lifetime since
+ * Thylacine #370) and proceed with the original error return. The
+ * orphan is leak-not-corruption (the dirent prepend is CAS-atomic, so
+ * nothing references the child) and reclaimable by a future
+ * orphan-record kind + scrub pass — the named seam in
+ * docs/cf-4-design.md section 7. */
+static void fs_rollback_inode_free(stm_inode_index *iidx, uint64_t dataset_id,
+                                    uint64_t child_ino)
+{
+    stm_status s = stm_inode_free(iidx, dataset_id, child_ino);
+    if (s != STM_OK) {
+        fprintf(stderr,
+                "STRATUM-FS: create rollback could not free inode "
+                "ds=%llu ino=%llu (status %d) -- orphaned; "
+                "unreferenced + scrub-reclaimable\n",
+                (unsigned long long)dataset_id,
+                (unsigned long long)child_ino, (int)s);
+    }
+}
+
 /* Common path for create_file / mkdir. `child_mode_type` is S_IFREG
  * or S_IFDIR; `child_dt_type` is STM_DT_REG or STM_DT_DIR. Caller
  * has already validated the name + verified mode's S_IFMT bits are
@@ -2684,7 +2712,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     stm_inode_handle *h_child = NULL;
     stm_status cp = stm_inode_pin(iidx, dataset_id, child_ino, &h_child);
     if (cp != STM_OK) {
-        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return cp;
@@ -2699,7 +2727,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     if (cs != STM_OK) {
         /* Defensive: should never happen right after alloc. Roll back. */
         stm_inode_unpin(iidx, h_child);
-        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return cs;
@@ -2724,7 +2752,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     stm_status ts = stm_inode_set(iidx, dataset_id, child_ino, &cv);
     if (ts != STM_OK) {
         stm_inode_unpin(iidx, h_child);
-        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return ts;
@@ -2736,7 +2764,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
                                           child_ino, child_gen, child_dt_type);
     if (ds != STM_OK) {
         stm_inode_unpin(iidx, h_child);
-        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return ds;
@@ -4212,7 +4240,7 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     stm_inode_handle *h_child = NULL;
     stm_status cp = stm_inode_pin(iidx, dataset_id, child_ino, &h_child);
     if (cp != STM_OK) {
-        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return cp;
@@ -4225,7 +4253,7 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
     if (cs != STM_OK) {
         stm_inode_unpin(iidx, h_child);
-        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return cs;
@@ -4240,7 +4268,7 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     stm_status sse = stm_inode_set(iidx, dataset_id, child_ino, &cv);
     if (sse != STM_OK) {
         stm_inode_unpin(iidx, h_child);
-        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return sse;
@@ -4254,7 +4282,7 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
                                           child_ino, child_gen, STM_DT_LNK);
     if (ds != STM_OK) {
         stm_inode_unpin(iidx, h_child);
-        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return ds;

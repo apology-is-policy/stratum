@@ -15,6 +15,7 @@
 #include "tharness.h"
 #include <stratum/alloc.h>
 #include <stratum/block.h>
+#include <stratum/block_inject.h>
 #include <stratum/bootstrap.h>
 #include <stratum/btnode.h>
 #include <stratum/crypto.h>
@@ -1717,6 +1718,199 @@ STM_TEST(sync_impl2_routing_engine_nodes_route_to_bootstrap_dead_list) {
     STM_ASSERT_TRUE(bdl1 > bdl0);
 
     teardown(a, s, pool);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* ========================================================================= */
+/* CF-4 B: barrier batching + clean-commit short-circuit                      */
+/* (docs/cf-4-design.md sections 3-6).                                        */
+/* ========================================================================= */
+
+/* A dirty 2-phase commit issues exactly TWO real fsyncs: the pre-final-UB
+ * data barrier (covering the reservation UB + the single staged bootstrap
+ * COW + every phase-2 node write) and the final UB's own fsync. Pre-CF-4-B
+ * this was ~6-10. The count is the structural witness that no window was
+ * left armed (a swallowed barrier would read 1 or 0). */
+STM_TEST(sync_cf4b_dirty_commit_two_fsyncs) {
+    make_tmp("cf4b_two");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    /* First commit (fresh, 1-phase) primes the pool + the stash. */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Dirty 2-phase commit. */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    stm_bdev_io_stats_reset(d);
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    uint64_t w = 0, wb = 0, f = 0;
+    stm_bdev_io_stats(d, &w, &wb, &f);
+    STM_ASSERT_EQ(f, 2u);
+    STM_ASSERT_TRUE(w > 0);
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A content-identical commit is a no-op: STM_OK, zero device writes, zero
+ * fsyncs, gens UNCHANGED (in-RAM auth state keeps equaling durable state).
+ * A subsequent dirty commit still works, and a remount sees everything. */
+STM_TEST(sync_cf4b_clean_commit_skips) {
+    make_tmp("cf4b_clean");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    uint64_t p1 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p1));
+    STM_ASSERT_OK(stm_sync_commit(s));          /* fresh 1-phase, gen=1  */
+    /* Settle: the first 2-phase commit sweeps the fresh commit's alloc
+     * PENDING retires (tree mutates -> dirty -> writes). */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    stm_sync_info before;
+    STM_ASSERT_OK(stm_sync_info_get(s, &before));
+
+    /* Now the fixed point: nothing changed since the settle commit. */
+    stm_bdev_io_stats_reset(d);
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    uint64_t w = 0, wb = 0, f = 0;
+    stm_bdev_io_stats(d, &w, &wb, &f);
+    STM_ASSERT_EQ(w, 0u);
+    STM_ASSERT_EQ(wb, 0u);
+    STM_ASSERT_EQ(f, 0u);
+
+    stm_sync_info after;
+    STM_ASSERT_OK(stm_sync_info_get(s, &after));
+    STM_ASSERT_EQ(after.auth_gen,    before.auth_gen);
+    STM_ASSERT_EQ(after.current_gen, before.current_gen);
+
+    /* Dirty again: the skip must not have poisoned the machinery. */
+    uint64_t p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_info dirty;
+    STM_ASSERT_OK(stm_sync_info_get(s, &dirty));
+    STM_ASSERT_EQ(dirty.auth_gen, before.auth_gen + 2u);
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    /* Remount: both reserves durable. */
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_sync *s2 = NULL;
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+    uint64_t len = 0; uint32_t rc = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(a2, p1, &len, &rc));
+    STM_ASSERT_OK(stm_alloc_lookup(a2, p2, &len, &rc));
+    teardown(a2, s2, pool2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* The first commit of a session never skips (the stash starts invalid),
+ * even when the session made no changes — conservative by design. */
+STM_TEST(sync_cf4b_first_commit_of_session_writes) {
+    make_tmp("cf4b_first");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_sync *s2 = NULL;
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+
+    stm_sync_info before;
+    STM_ASSERT_OK(stm_sync_info_get(s2, &before));
+    stm_bdev_io_stats_reset(d);
+    STM_ASSERT_OK(stm_sync_commit(s2));
+    uint64_t w = 0, wb = 0, f = 0;
+    stm_bdev_io_stats(d, &w, &wb, &f);
+    /* Wrote a UB (+ possibly more): the session's first commit is real. */
+    STM_ASSERT_TRUE(w > 0);
+    STM_ASSERT_TRUE(f > 0);
+    stm_sync_info after;
+    STM_ASSERT_OK(stm_sync_info_get(s2, &after));
+    STM_ASSERT_EQ(after.auth_gen, before.auth_gen + 2u);
+
+    teardown(a2, s2, pool2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Injected-failure sweep over EVERY device op of a dirty commit, with an
+ * IN-PROCESS retry after each failure (the fsyncgate axis: a transient
+ * fsync/write failure followed by a retry WITHOUT remount must still
+ * produce a durable, consistent commit — the staged bootstrap COW must
+ * not have been promoted by the failed attempt). The final remount
+ * verifies every reserve the sweep committed. */
+STM_TEST(sync_cf4b_inject_fail_then_retry) {
+    make_tmp("cf4b_retry");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    uint64_t p0 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p0));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    enum { N_INJECT = 40 };
+    uint64_t paddrs[N_INJECT];
+    unsigned n_failed = 0;
+    for (unsigned k = 1; k <= N_INJECT; k++) {
+        uint64_t p = 0;
+        STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+        paddrs[k - 1] = p;
+
+        stm_bdev_inject_fail_after(d, (int64_t)k);
+        stm_status cs = stm_sync_commit(s);
+        stm_bdev_inject_fail_after(d, 0);       /* disarm */
+
+        if (cs != STM_OK) {
+            n_failed++;
+            /* The in-process retry must succeed and be durable. */
+            STM_ASSERT_OK(stm_sync_commit(s));
+        }
+    }
+    /* The sweep must have actually exercised failures (k=1 always fails
+     * the first phase-2 write). */
+    STM_ASSERT_TRUE(n_failed > 0);
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    /* Remount: every reserve from the sweep is durable. */
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_sync *s2 = NULL;
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+    for (unsigned k = 0; k < N_INJECT; k++) {
+        uint64_t len = 0; uint32_t rc = 0;
+        STM_ASSERT_OK(stm_alloc_lookup(a2, paddrs[k], &len, &rc));
+        STM_ASSERT_EQ(len, 4u);
+    }
+    teardown(a2, s2, pool2);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

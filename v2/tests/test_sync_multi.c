@@ -220,6 +220,9 @@ STM_TEST(sync_multi_mount_survives_single_device_loss) {
     stm_sync *s = NULL;
     STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
     STM_ASSERT_OK(stm_sync_commit(s));
+    /* CF-4 B: a content-identical commit clean-skips, so DIRTY the
+     * second commit (a reserve) for a real 2-phase at auth=3. */
+    { uint64_t dp = 0; STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp)); }
     STM_ASSERT_OK(stm_sync_commit(s));   /* 2-phase. auth=3 post-commit. */
 
     stm_sync_close(s);
@@ -664,9 +667,13 @@ STM_TEST(sync_multi_keyschema_commit_idempotent_on_clean) {
     uint32_t lbl1 = 0, slot1 = 0;
     STM_ASSERT_OK(stm_sb_mount_scan(bds[0], &ub1, &lbl1, &slot1));
 
-    /* Commit #2 with no intervening schema mutation. ks should still
-     * be clean; commit should short-circuit and return the SAME
-     * (ks_root_paddr, ks_root_csum). ub_key_schema bytes identical. */
+    /* Commit #2 with no intervening SCHEMA mutation (a non-keyschema
+     * alloc reserve dirties the commit so it really writes -- CF-4 B
+     * clean-skips a fully-identical commit, which would make this
+     * test vacuous). ks stays clean; keyschema_commit short-circuits
+     * and returns the SAME (ks_root_paddr, ks_root_csum):
+     * ub_key_schema bytes identical across genuinely-written UBs. */
+    { uint64_t dp = 0; STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &dp)); }
     STM_ASSERT_OK(stm_sync_commit(s));
     stm_uberblock ub2;
     uint32_t lbl2 = 0, slot2 = 0;
@@ -2141,13 +2148,17 @@ STM_TEST(sync_multi_replace_resumes_after_step3_commit_failure) {
         .bdev   = bd4,
     };
 
-    /* Arm injection on TWO of the 4 post-add devices (bd4 + bds[2]).
-     * With n=4 devices, quorum = 3. Failing 2 writes per phase drops
-     * confirmations to 2 → STM_EQUORUM. Each inject is a one-shot,
-     * fires on the first state-changing op on that bdev (the
-     * reservation UB write in sync_commit's Phase 1). */
+    /* Arm a one-shot injection on the NEW device. CF-4 B moved the
+     * reservation-UB write after phase 2, so the first state-changing
+     * op on bd4 inside step 3's commit is the fresh alloc's tree
+     * serialize (current_tree_root == 0 always persists) -- failing it
+     * fails the commit deterministically before any UB lands, which is
+     * exactly the R22 scenario: new roster entry + attached alloc in
+     * RAM, no durable progress. (Pre-CF-4-B this test also armed
+     * bds[2] to prove a phase-1 quorum loss; the quorum machinery is
+     * covered by write_ub_to_all_devices tests -- the resume path only
+     * needs SOME step-3 commit failure.) */
     stm_bdev_inject_fail_after(bd4, 1);
-    stm_bdev_inject_fail_after(bds[2], 1);
 
     uint16_t new_slot1 = UINT16_MAX;
     stm_status r1 = stm_sync_replace_device_online(
@@ -2157,9 +2168,8 @@ STM_TEST(sync_multi_replace_resumes_after_step3_commit_failure) {
      * this point has the new roster entry + attached alloc but no
      * durable progress — the scenario R22 targets. */
     STM_ASSERT_NE((int)r1, (int)STM_OK);
-    /* Confirm both injections fired. */
+    /* Confirm the injection fired. */
     STM_ASSERT(stm_bdev_inject_fired_count(bd4)    >= 1);
-    STM_ASSERT(stm_bdev_inject_fired_count(bds[2]) >= 1);
 
     /* Partial-state check: pool has the new slot in RAM at ONLINE with
      * new_alloc attached; dev 1 is still ONLINE (begin_evacuation
