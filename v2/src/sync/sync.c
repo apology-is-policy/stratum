@@ -143,8 +143,17 @@ _Static_assert(STM_SYNC_WRAPPED_KEY_LEN <= STM_KEYSCHEMA_WRAPPED_MAX,
  *           at a strictly-greater gen. So a key never names two plaintexts.
  * Both identities canonicalize to a 32-byte key + a kind tag, so one
  * cache + key space serves HOT, COLD, and snap-view reads. */
-#define STM_DCACHE_ENTRIES     16u
-#define STM_DCACHE_BYTES_MAX   (64u * 1024u * 1024u)   /* 64 MiB ceiling */
+/* #343 sizing (measured 2026-07-08, on-device go build). 16 slots hit ~51%
+ * and the cache was SLOT-bound -- it peaked at ~20 MB, well under the byte
+ * ceiling, so it evicted extents it had budget to keep. 128 slots lifts the
+ * hit rate to ~55% and cuts the 91-pkg gofmt cold build ~20% (3278 -> ~2600
+ * ms, deterministic across boots). The win is queueing-amplified: stratumd is
+ * serial, so every avoided miss frees it from a bdev-read + whole-extent
+ * decrypt that all subsequent ops wait behind. 256 slots is marginal (~56%,
+ * +1 MB cached) -- 128 is the knee; the hot working set is ~46 MB, and the
+ * 128 MiB ceiling is the per-sync RAM cap (a runtime-tunable is a v1.x seam). */
+#define STM_DCACHE_ENTRIES     128u
+#define STM_DCACHE_BYTES_MAX   (128u * 1024u * 1024u)  /* 128 MiB per-sync cap */
 #define STM_DCACHE_LOG_EVERY   1024u                   /* STM_DCACHE_STATS dev log cadence */
 
 struct sync_dcache_entry {
