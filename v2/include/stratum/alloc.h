@@ -334,6 +334,14 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen);
 STM_MUST_USE
 stm_status stm_alloc_stats_get(const stm_alloc *a, stm_alloc_stats *out);
 
+/* O(1) total blocks currently on the PENDING free-list (refcount=0,
+ * awaiting a commit whose committed_gen exceeds their free_gen). Cheap
+ * (a single counter read under a->lock, no tree scan, unlike
+ * stm_alloc_stats_get). The reclaim-on-ENOSPC gate (CF-4 C): non-zero
+ * means an allocation that hit ENOSPC may be able to recover space by
+ * committing to sweep the PENDING list. Returns 0 for a NULL alloc. */
+uint64_t stm_alloc_pending_blocks(const stm_alloc *a);
+
 /*
  * Query the entry at `paddr`. On success `*out_length_blocks` (if
  * non-NULL) gets the range's length and `*out_refcount` (if non-NULL)

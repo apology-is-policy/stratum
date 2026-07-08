@@ -126,6 +126,55 @@ inode engine's three-phase abort drops the in-RAM tree, so an in-process retry
 would silently commit the reverted-to-previous-durable state. The wedge refuses
 the retry with `STM_EWEDGED` (regression: `test_crash_inject.c::r154_*`).
 
+### 31.2.2 Deferred block reclaim + reclaim-on-ENOSPC (CF-4 C)
+
+An extent unlink / rmdir / overwriting-rename / truncate-shrink frees the
+file's data blocks: the free stamps each block `free_gen = current_gen = G`
+and moves it to the allocator's PENDING list (refcount 0). The sweep that
+returns PENDING to FREE runs inside `stm_alloc_commit` under the strict
+`free_gen < committed_gen` predicate (R50 P2-1 crash-safety — a freed block is
+reusable only once a generation ≥ G is durable). So reclaiming G within a
+session needs a commit at a gen > G.
+
+Pre-CF-4-C, the three inode-*free* paths (`fs_unlink_inode_and_dirent`,
+`stm_fs_unlink_anon`, `stm_fs_rename` overwrite) fired an eager **double-commit**
+(`fs_post_inode_free_reclaim_locked`) at unlink to reclaim immediately — one
+commit to make UB-gen-G durable, a second at G+2 to sweep. That was **the**
+cost of the go-build `$WORK` cleanup: 222 extent unlinks = 444 commits, 3.2 s
+(Thylacine #374). truncate-shrink and COW-overwrite already DEFERRED (no eager
+reclaim), so the eager double-commit was the inconsistent special case, and
+there was no reclaim-on-ENOSPC backstop anywhere (truncate/overwrite-then-
+rewrite near-full-no-commit was a latent ENOSPC gap).
+
+CF-4 C removes the eager double-commit and defers all three: freed blocks stay
+PENDING (crash-safe — #791 mount reconcile rebuilds `pending_head`; any later
+commit's sweep reclaims), returning to FREE either **lazily** at the next
+commit (which rides a commit that was happening anyway) or **on demand** via a
+reserve-path backstop. `fs_reclaim_on_enospc_locked`: when a data reserve
+returns `STM_ENOSPC` and `stm_sync_pending_free_blocks(fs->sync) > 0`, it fires
+the double-commit (sweeping the deferred PENDING) and the caller retries the
+reserve once. Gated on pending > 0 + retried at most once ⇒ loop-free (a
+still-ENOSPC retry is a genuinely-full pool). Wired at every data-reserve
+choke: `fs_flush_ino_locked` / `fs_flush_all_locked` (the buffer drain — covers
+buffered writes + the pre-flush of reflink/cfr/migrate/promote/truncate + the
+commit flush), the direct `stm_fs_write` paths, the inline→extent transitions,
+and the migrate/promote tier reserves. (reflink + cfr share existing blocks —
+no new data reserve — so need no backstop.) A failed reclaim commit is
+crash-equivalent ⇒ it wedges in place (`fs_mark_wedged_locked`, a monotone
+release-store safe under either lock mode).
+
+Deliberate semantics change (documented, POSIX-correct): unlink no longer
+commits, so it is no longer durable-without-fsync and no longer advances the
+generation — aligned with every other lazy-durable mutation and with 31.2.1's
+"gen-age = real-commit count". Freed space is visible in
+`stm_fs_stats.data_pending_blocks` longer (the ZFS `freeing` shape). The
+double-commit runs under whatever `fs->global` mode the reserving op holds (SH
+for the per-inode write/truncate/migrate/promote paths, EX for commit) — the
+SAME posture the pre-CF-4-C eager reclaim had on the SH-held unlink path, moved
+onto the rare ENOSPC path. Design: `docs/cf-4c-design.md`. SOTA parallels:
+Btrfs pinned-extents + delayed-refs + `flush_space`→`COMMIT_TRANS`; ZFS
+`ms_defer` 2-txg deferral + `async_destroy`; WAFL consistency-point deferral.
+
 ---
 
 ## 31.3 The superblock — redundancy + torn-write defense (`src/sb/mount.c`)
@@ -287,6 +336,17 @@ measured data), not part of the FLUSH-correctness fix.
   `bootstrap_cf4b_torn_staged_pair_falls_back` (torn staged header AND
   valid-header-torn-bitmap both fall back per R7a — the §31.2 crash-matrix
   outcomes constructed by direct slot scribble).
+- CF-4 C (`tests/test_fs.c`, §31.2.2): `fs_cf4c_unlink_defers_reclaim`
+  (unlink does NOT commit — gen unchanged — and moves blocks to PENDING, then
+  two commits sweep), `fs_cf4c_reclaim_on_enospc_after_unlink` (the
+  availability guarantee: fill near-full, unlink deferred, rewrite the volume
+  with no commit → the reserve-path backstop reclaims + succeeds;
+  non-vacuous — `data_free_blocks < a_blocks` after the unlink proves the
+  reclaim is load-bearing, and neutering `fs_reclaim_on_enospc_locked` fails
+  it), `fs_cf4c_reclaim_on_enospc_after_truncate` (the closed latent gap),
+  `fs_cf4c_loop_freedom_genuinely_full` (a genuinely-full pool returns clean
+  STM_ENOSPC, not wedged, no hang). `tests/bench_create_many.c` CHURN — the
+  extent-unlink collapse (47,000 → 15 µs/file host, gen_delta 888 → 0).
 - `tests/bench_commit.c` (Area G) — the commit-throughput probe (31.7).
 
 ---

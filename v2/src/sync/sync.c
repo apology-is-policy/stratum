@@ -3250,6 +3250,25 @@ stm_alloc *stm_sync_alloc(const stm_sync *s, uint16_t device_id)
     return a;
 }
 
+uint64_t stm_sync_pending_free_blocks(stm_sync *s)
+{
+    if (!s) return 0;
+    /* Snapshot the attached-alloc pointers under s->lock (the canonical
+     * fs->global -> s->lock ordering; the caller holds fs->global), then
+     * sum each alloc's O(1) pending counter. stm_alloc_pending_blocks
+     * takes a->lock -- s->lock -> a->lock is the established commit-path
+     * order (stm_sync_commit holds s->lock across stm_alloc_commit). */
+    stm_alloc *snap[STM_POOL_DEVICES_MAX];
+    pthread_mutex_lock(&s->lock);
+    for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++)
+        snap[dev] = s->allocs[dev];
+    uint64_t total = 0;
+    for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++)
+        if (snap[dev]) total += stm_alloc_pending_blocks(snap[dev]);
+    pthread_mutex_unlock(&s->lock);
+    return total;
+}
+
 /* ========================================================================= */
 /* P5-durable-cursors: scrub-state durable bytes (push from scrub).           */
 /* ========================================================================= */

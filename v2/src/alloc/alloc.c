@@ -1364,6 +1364,19 @@ static int stats_scan_cb(const void *key, size_t key_len,
     return 0;
 }
 
+uint64_t stm_alloc_pending_blocks(const stm_alloc *a)
+{
+    if (!a) return 0;
+    /* Cast away const for the mutex: pending_blocks is an O(1) counter
+     * maintained under a->lock (stm_alloc_free ++, stm_alloc_commit
+     * sweep --). We read it, we do not mutate. */
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    uint64_t n = ma->pending_blocks;
+    pthread_mutex_unlock(&ma->lock);
+    return n;
+}
+
 stm_status stm_alloc_stats_get(const stm_alloc *a, stm_alloc_stats *out)
 {
     if (!a || !out) return STM_EINVAL;

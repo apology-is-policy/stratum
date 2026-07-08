@@ -973,6 +973,10 @@ static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs, uint64_t ds,
                                                   uint64_t ino,
                                                   const struct stm_inode_value *cv);
 static bool fs_post_inode_free_reclaim_locked(stm_fs *fs);
+/* CF-4 C: reclaim-on-ENOSPC backstop -- sweep deferred PENDING then signal
+ * a retry (wedges in place on a crash-equivalent commit failure). Used by
+ * the reserve-bearing paths (write, the flush helpers, commit). */
+static bool fs_reclaim_on_enospc_locked(stm_fs *fs);
 
 static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
                        stm_alloc *a, stm_sync *sync, bool ro,
@@ -1487,6 +1491,9 @@ stm_status stm_fs_commit(stm_fs *fs)
      * drain fails (e.g., allocator out of space mid-flush), the inode's
      * buffered ranges remain in-RAM for retry — the caller sees the
      * failure and can decide whether to fsync again. */
+    /* CF-4 C: fs_flush_all_locked reclaims-on-ENOSPC internally (sweeps
+     * deferred PENDING + re-drains), so a flush shortfall recoverable from
+     * un-swept freed blocks is handled here without an extra retry. */
     stm_status fr = fs_flush_all_locked(fs);
     if (fr != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
@@ -1863,21 +1870,40 @@ static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
 
 /* Flush one inode's buffered ranges. Caller holds the outer fs lock
  * (fs->global EX, or fs->global SH + this (ds,ino)'s pin per impl-1..5
- * doctrine). */
+ * doctrine).
+ *
+ * CF-4 C: the drain reserves an extent per buffered range and can hit
+ * STM_ENOSPC on a near-full pool holding deferred PENDING (from an
+ * unlink/truncate/overwrite whose reclaim CF-4 C no longer eager-commits).
+ * On ENOSPC, sweep the PENDING (reclaim-on-ENOSPC) and re-drain once --
+ * the drain is convergent (already-written ranges are gone from the
+ * buffer, so the retry only re-attempts the un-drained tail). This is the
+ * single choke that also covers the buffer-full flush (stm_fs_write), the
+ * pre-flush of reflink/cfr/migrate/promote/truncate, and (via
+ * fs_flush_all_locked) the commit flush. */
 static stm_status fs_flush_ino_locked(stm_fs *fs, uint64_t ds, uint64_t ino)
 {
-    return stm_dirty_buffer_drain_ino(fs->dirty_buffer, ds, ino,
-                                            fs_flush_drain_cb, fs);
+    stm_status s = stm_dirty_buffer_drain_ino(fs->dirty_buffer, ds, ino,
+                                                    fs_flush_drain_cb, fs);
+    if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
+        s = stm_dirty_buffer_drain_ino(fs->dirty_buffer, ds, ino,
+                                             fs_flush_drain_cb, fs);
+    return s;
 }
 
 /* Flush every inode's buffered ranges. Caller holds fs->global
  * (EX or SH; SH callers do NOT need to pin every inode — dbuf->mu
  * serializes the drain itself, and the drained extents land at the
- * sync layer's own mutex). */
+ * sync layer's own mutex). CF-4 C reclaim-on-ENOSPC as in
+ * fs_flush_ino_locked. */
 static stm_status fs_flush_all_locked(stm_fs *fs)
 {
-    return stm_dirty_buffer_drain_all(fs->dirty_buffer,
-                                            fs_flush_drain_cb, fs);
+    stm_status s = stm_dirty_buffer_drain_all(fs->dirty_buffer,
+                                                    fs_flush_drain_cb, fs);
+    if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
+        s = stm_dirty_buffer_drain_all(fs->dirty_buffer,
+                                             fs_flush_drain_cb, fs);
+    return s;
 }
 
 /* Inline-aware write for S_IFREG inode `iv` at (ds, ino). On entry:
@@ -2205,6 +2231,14 @@ stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                     stm_status rs = fs_write_regular_locked(fs, iidx,
                                                                   dataset_id, ino,
                                                                   &iv, off, buf, len);
+                    /* CF-4 C: reclaim-on-ENOSPC. A reserve out of space may
+                     * be recoverable if an unlink/truncate/overwrite left
+                     * blocks PENDING; sweep them + retry once. iv is not
+                     * mutated on the ENOSPC path (the reserve precedes the
+                     * si_size update), so the retry reuses it. */
+                    if (rs == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
+                        rs = fs_write_regular_locked(fs, iidx, dataset_id, ino,
+                                                         &iv, off, buf, len);
                     stm_inode_unpin(iidx, h);
                     pthread_rwlock_unlock(&fs->global);
                     return rs;
@@ -2226,6 +2260,8 @@ stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     FS_GUARD_WRITE(fs);
     stm_status s = stm_sync_write_extent(fs->sync, dataset_id, ino, off,
                                             buf, len);
+    if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))  /* CF-4 C */
+        s = stm_sync_write_extent(fs->sync, dataset_id, ino, off, buf, len);
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
@@ -3117,8 +3153,7 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
      * inode slot's free and surfaces as a confused-deputy write into
      * whatever inode reuses the slot. Same shape as the canonical
      * unlink path and rename's overwrite branch. */
-    bool cleanup_did_truncate =
-        fs_pre_inode_free_cleanup_locked(fs, dataset_id, ino, &iv);
+    (void)fs_pre_inode_free_cleanup_locked(fs, dataset_id, ino, &iv);
 
     /* stm_inode_free transitions ALLOCATED → FREED, sets FREED flag,
      * clears nlink. The ORPHAN flag survives in si_flags but is moot
@@ -3127,23 +3162,16 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
      * both flags. */
     stm_status fs_free = stm_inode_free(iidx, dataset_id, ino);
 
-    /* R128 P1-2 close: reclaim trigger. Same R50 P2-1 strict-less-than
-     * shape as the canonical unlink path's reclaim. Gate on (a) the
-     * pre-cleanup actually truncated extents (otherwise nothing
-     * PENDING needs reclaiming — anon-inode-with-no-data, inline-
-     * only files, directories, symlinks ALL skip the ~200ms commit
-     * pair) AND (b) fs_free == STM_OK so a failed free doesn't
-     * commit half-baked state. */
-    bool needs_wedge = false;
-    if (cleanup_did_truncate && fs_free == STM_OK) {
-        needs_wedge = fs_post_inode_free_reclaim_locked(fs);
-    }
+    /* CF-4 C: no eager reclaim. The pre-cleanup dropped this inode's
+     * extents to PENDING (free_gen=current_gen); they return to FREE
+     * lazily at the next commit's sweep, or on-demand via the
+     * reserve-path reclaim-on-ENOSPC backstop (fs_reclaim_on_enospc_
+     * locked). Pre-CF-4-C fired a double-commit here per orphan free;
+     * that cost moved off this path onto the rare ENOSPC path. PENDING
+     * is crash-safe (#791 reconcile rebuilds pending_head). */
 
     stm_inode_unpin(iidx, h);
     pthread_rwlock_unlock(&fs->global);
-    /* R154 P1-1: a failed reclaim commit is crash-equivalent — wedge
-     * AFTER the unlock (stm_fs_mark_wedged takes fs->global; fs.c:31). */
-    if (needs_wedge) stm_fs_mark_wedged(fs);
     return fs_free;
 }
 
@@ -3234,6 +3262,54 @@ static bool fs_post_inode_free_reclaim_locked(stm_fs *fs)
     if (stm_sync_commit(fs->sync) != STM_OK) return true;
     if (stm_sync_commit(fs->sync) != STM_OK) return true;
     return false;
+}
+
+/* CF-4 C: wedge the fs while ALREADY holding fs->global (SH or EX). The
+ * public stm_fs_mark_wedged re-takes fs->global EX and MUST NOT be called
+ * from a held lock (fs.c:31); this variant does only the monotonic
+ * release-store. Safe under either lock mode: `wedged` is a one-way latch
+ * (only ever false->true), so a concurrent store from another SH holder is
+ * an idempotent write of the same value -- no torn write, no lost update.
+ * Lets the reclaim-on-ENOSPC backstop signal a crash-equivalent commit
+ * failure from deep in the reserve path without the deferred-unlock dance.
+ * Caller holds fs->global. */
+static void fs_mark_wedged_locked(stm_fs *fs)
+{
+    atomic_store_explicit(&fs->wedged, true, memory_order_release);
+}
+
+/* CF-4 C: the reclaim-on-ENOSPC backstop (cf-4c-design.md §4.2). A data-
+ * block reserve that returned STM_ENOSPC may be able to recover space: an
+ * unlink / truncate-shrink / overwrite deferred its freed blocks to
+ * PENDING (CF-4 C removes the eager per-unlink double-commit), and the
+ * sweep that returns them to FREE runs at commit. Sweep them via the
+ * double-commit, then tell the caller to retry its reserve ONCE.
+ *
+ * Returns true iff the caller should RETRY. On a failed reclaim commit
+ * (crash-equivalent per R154: the engine three-phase abort drops the
+ * in-memory tree) it wedges in place (fs_mark_wedged_locked) and returns
+ * false -- the fs is going down; the caller propagates the STM_ENOSPC (or
+ * the reserve's own error) and every subsequent op sees STM_EWEDGED.
+ *
+ * Loop-free: gated on stm_sync_pending_free_blocks > 0 (the second commit
+ * sweeps every free_gen < committed_gen block, driving pending toward 0),
+ * and every caller retries AT MOST ONCE -- a still-ENOSPC retry is a
+ * genuinely-full pool -> STM_ENOSPC.
+ *
+ * The double-commit runs under whatever fs->global mode the caller holds
+ * (SH for the per-inode write/truncate/flush paths, EX for commit). This
+ * is the SAME posture as the pre-CF-4-C eager reclaim, which fired this
+ * exact double-commit from the SH-held unlink path
+ * (fs_unlink_inode_and_dirent); CF-4 C moves that commit off the common
+ * unlink path onto the rare ENOSPC path. Caller holds fs->global. */
+static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
+{
+    if (stm_sync_pending_free_blocks(fs->sync) == 0) return false;
+    if (fs_post_inode_free_reclaim_locked(fs)) {
+        fs_mark_wedged_locked(fs);
+        return false;
+    }
+    return true;
 }
 
 /* Common path for unlink / rmdir. `expect_dir` selects the type
@@ -3443,7 +3519,6 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
      * the leak is permanent until offline scrub) but doesn't break
      * the unlink itself. Returns STM_OK on a fresh-inode no-extent
      * case (nothing to drop). */
-    bool cleanup_did_truncate = false;
     {
         uint32_t cur_nlink = stm_load_le32(cv.si_nlink);
         if (cur_nlink == 1u) {
@@ -3454,11 +3529,8 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
              * prevents a future flush from emitting extents under
              * a freed inode. R128 P1-1 close: helper extracted so
              * rename's overwrite branch + stm_fs_unlink_anon share
-             * the same cleanup. Helper returns true iff it truncated
-             * extents — the post-reclaim double-commit below gates on
-             * that signal so dir/symlink/inline-only unlinks skip the
-             * ~200 ms commit pair entirely. */
-            cleanup_did_truncate = fs_pre_inode_free_cleanup_locked(
+             * the same cleanup. */
+            (void)fs_pre_inode_free_cleanup_locked(
                 fs, dataset_id, child_ino, &cv);
         }
     }
@@ -3485,51 +3557,27 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         }
     }
 
-    /* SWISS-4q P2 reclaim trigger: when we just freed an inode AND
-     * dropped its extents (the truncate-to-0 above), the allocator
-     * now holds PENDING entries with free_gen=current_gen. The
-     * allocator's sweep predicate is `free_gen < committed_gen`
-     * (sync.c:2412); a single commit at target_gen=current_gen
-     * persists the PENDING entries but does NOT reclaim them — the
-     * sweep skips because free_gen == committed_gen (strict less-
-     * than). The NEXT commit at committed_gen+2 catches them.
-     *
-     * Without this double-commit, blocks freed via unlink remain
-     * PENDING for the rest of the stratumd session; the next
-     * allocation hits ENOSPC even though the volume "looks empty"
-     * to the user. User-reported 2026-05-10: "copy 1.8 GB to stm,
-     * delete, repeat → ENOSPC after one cycle."
-     *
-     * The double commit is wired here (NOT in stm_fs_commit) so
-     * the public commit semantics (gen advance by 2 per call)
-     * remain unchanged for tests that pin it. The unlink path is
-     * the only mutator that drops extents AND assumes they're
-     * immediately reusable.
-     *
-     * Cost: each unlink-of-regular-file takes ~2× longer for the
-     * Tfsync that comes from auto-fsync. Acceptable; without this
-     * the volume is unusable past one cycle.
-     *
-     * R128 P1-1 close: helper extracted; rename + unlink_anon share.
-     *
-     * R130 fix: only fire the double-commit when (a) we actually freed
-     * the inode AND (b) the pre-cleanup truncated extents — i.e.,
-     * there's reclaim work pending. Pre-R130 the gate was just
-     * `if (freed)`, so dir/symlink/inline-only files paid the ~200ms
-     * commit pair per unlink even though they had no extents to
-     * reclaim. Triggered by ctest's parallel-4 timeouts when test_fs's
-     * 159 tests each ran a few unlinks. */
-    bool needs_wedge = false;
-    if (freed && cleanup_did_truncate) {
-        needs_wedge = fs_post_inode_free_reclaim_locked(fs);
-    }
+    /* CF-4 C: no eager reclaim (cf-4c-design.md §4.1). The pre-cleanup
+     * dropped this inode's extents to PENDING (free_gen=current_gen);
+     * the sweep predicate is strict `free_gen < committed_gen` (R50 P2-1
+     * crash-safety), so reclaiming within-session needs a commit at a
+     * later gen. Pre-CF-4-C fired that as an eager double-commit HERE, on
+     * every extent unlink -- the go-build $WORK cleanup's 222 unlinks =
+     * 444 commits (#374, 3.2 s/build). CF-4 C defers: the PENDING blocks
+     * return to FREE lazily at the next commit's sweep (which rides a
+     * commit that was happening anyway), or on-demand when a reserve
+     * would otherwise ENOSPC (fs_reclaim_on_enospc_locked, the backstop
+     * that preserves the "write-to-full / rm / rewrite" availability
+     * guarantee -- user-reported 2026-05-10 "copy 1.8 GB, delete, repeat
+     * -> ENOSPC after one cycle"). This aligns unlink with truncate-shrink
+     * and COW-overwrite, which already deferred. PENDING is crash-safe
+     * (#791 mount reconcile rebuilds pending_head; a later commit sweeps).
+     * unlink is no longer durable-without-fsync -- POSIX-correct and
+     * consistent with every other lazy-durable mutation. */
 
     stm_inode_unpin(iidx, h_parent);
     stm_inode_unpin(iidx, h_child);
     pthread_rwlock_unlock(&fs->global);
-    /* R154 P1-1: a failed reclaim commit is crash-equivalent — wedge
-     * AFTER the unlock (stm_fs_mark_wedged takes fs->global; fs.c:31). */
-    if (needs_wedge) stm_fs_mark_wedged(fs);
     return STM_OK;
 }
 
@@ -4493,6 +4541,11 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                                   /*off=*/0u,
                                                   combined,
                                                   (size_t)aligned_size);
+        /* CF-4 C: reclaim-on-ENOSPC before freeing combined so the retry
+         * still has the source bytes. */
+        if (ws == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
+            ws = stm_sync_write_extent(fs->sync, dataset_id, ino, 0u,
+                                           combined, (size_t)aligned_size);
         free(combined);
         if (ws != STM_OK) { rs = ws; goto out; }
 
@@ -5295,7 +5348,6 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
      * the chain probes deterministically by hash, so subsequent
      * lookups of dst_name will find the new record). */
     bool dst_freed_unused = false;
-    bool dst_cleanup_did_truncate = false;
     if (dst_exists) {
         /* R128 P1-1: if dst is about to cascade-free (nlink==1), drop
          * its dirty-buffer entry AND truncate its extents BEFORE the
@@ -5303,15 +5355,14 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
          * outlives the inode slot's free and a future flush emits
          * extents under whatever inode reuses the slot at a bumped
          * si_gen — confused-deputy-class data corruption. Inode lookup
-         * is best-effort; the returned truncate-flag gates the post-
-         * reclaim double-commit below (R130 perf: skip the ~200ms
-         * commit pair when the overwritten dst has no extents). Runs
+         * is best-effort. The freed extents drop to PENDING; CF-4 C
+         * reclaims them lazily (no eager double-commit here). Runs
          * under dst_ino's pin (acquired above via pin_many). */
         struct stm_inode_value dcv = {0};
         if (stm_inode_lookup(iidx, dataset_id, dst_ino, &dcv) == STM_OK) {
             uint32_t dst_cur_nlink = stm_load_le32(dcv.si_nlink);
             if (dst_cur_nlink == 1u) {
-                dst_cleanup_did_truncate = fs_pre_inode_free_cleanup_locked(
+                (void)fs_pre_inode_free_cleanup_locked(
                     fs, dataset_id, dst_ino, &dcv);
             }
         }
@@ -5439,22 +5490,15 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
-    /* R128 P1-1 close: reclaim trigger for the overwrite-cascade-free
-     * path. If dst was overwritten + cascade-freed (dst_freed_unused
-     * is true), its extents were truncated above via
-     * fs_pre_inode_free_cleanup_locked. The allocator now holds
-     * PENDING entries with free_gen=current_gen; without the double-
-     * commit, R50 P2-1's strict-less-than predicate skips the sweep
-     * and the blocks leak as PENDING for the session. R130: also
-     * gate on whether the pre-cleanup truncated extents — overwriting
-     * a directory or symlink target (no extents) skips the ~200 ms
-     * commit pair. */
-    if (dst_freed_unused && dst_cleanup_did_truncate) {
-        /* R154 P1-1: capture wedge-intent; a failed reclaim commit is
-         * crash-equivalent. Reuses rename's should_wedge — fired AFTER
-         * the unlock per the R133 P1-2 deferred-wedge doctrine. */
-        if (fs_post_inode_free_reclaim_locked(fs)) should_wedge = true;
-    }
+    /* CF-4 C: no eager reclaim for the overwrite-cascade-free path
+     * (cf-4c-design.md §4.1). If dst was overwritten + cascade-freed, its
+     * extents were dropped to PENDING above via fs_pre_inode_free_cleanup_
+     * locked; they return to FREE at the next commit's sweep or on-demand
+     * via the reserve-path backstop (fs_reclaim_on_enospc_locked) -- same
+     * deferral as unlink / truncate-shrink / COW-overwrite. Pre-CF-4-C
+     * fired a double-commit here per overwriting rename. (rename's own
+     * swap-durability commits, which also set should_wedge, are
+     * unchanged.) PENDING is crash-safe (#791 reconcile). */
 
     FS_RENAME_UNPIN_ALL();
     pthread_rwlock_unlock(&fs->global);
@@ -6585,6 +6629,10 @@ stm_status stm_fs_migrate_to_cold(stm_fs *fs,
             stm_status s = (fr == STM_OK)
                 ? stm_sync_migrate_to_cold(fs->sync, dataset_id, ino)
                 : fr;
+            /* CF-4 C: the cold-tier reserve may recover from deferred
+             * PENDING. */
+            if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
+                s = stm_sync_migrate_to_cold(fs->sync, dataset_id, ino);
             stm_inode_unpin(iidx, h);
             pthread_rwlock_unlock(&fs->global);
             return s;
@@ -6604,6 +6652,8 @@ stm_status stm_fs_migrate_to_cold(stm_fs *fs,
         return fr;
     }
     stm_status s = stm_sync_migrate_to_cold(fs->sync, dataset_id, ino);
+    if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))  /* CF-4 C */
+        s = stm_sync_migrate_to_cold(fs->sync, dataset_id, ino);
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
@@ -6904,6 +6954,10 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
             stm_status rc = (fr == STM_OK)
                 ? stm_sync_promote_to_hot(fs->sync, dataset_id, ino)
                 : fr;
+            /* CF-4 C: the hot-tier reserve may recover from deferred
+             * PENDING. */
+            if (rc == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
+                rc = stm_sync_promote_to_hot(fs->sync, dataset_id, ino);
             stm_inode_unpin(iidx, h);
             pthread_rwlock_unlock(&fs->global);
             return rc;
@@ -6923,6 +6977,8 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
         return fr;
     }
     stm_status rc = stm_sync_promote_to_hot(fs->sync, dataset_id, ino);
+    if (rc == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))  /* CF-4 C */
+        rc = stm_sync_promote_to_hot(fs->sync, dataset_id, ino);
     pthread_rwlock_unlock(&fs->global);
     return rc;
 }

@@ -112,16 +112,38 @@ static int create_batch(stm_fs *fs, uint64_t ds, const uint64_t *dir_inos,
     return 0;
 }
 
+/* #374: the unlink phase is timed + attributed. The go-build $WORK
+ * cleanup is exactly this shape (N serial unlinks of extent-bearing
+ * files); gen_delta counts commits the sweep itself fired (each
+ * stm_sync_commit advances current_gen by 2 -- the SWISS-4q reclaim
+ * pair per extent unlink shows up as gen_delta == 4*N). The trailing
+ * commit is timed separately: it is the batch's own durability point,
+ * not part of the per-unlink cost. */
 static int unlink_batch(stm_fs *fs, uint64_t ds, const uint64_t *dir_inos, char name_tag)
 {
+    stm_fs_stats st0, st1;
+    (void)stm_fs_stats_get(fs, &st0);
+    double t0 = now_s(), max_op = 0.0;
     for (unsigned i = 0; i < NFILES; i++) {
         char name[40];
         int nl = snprintf(name, sizeof name, "%c%u", name_tag, i);
         uint64_t parent = dir_inos[i % DIRS];
+        double o0 = now_s();
         stm_status us = stm_fs_unlink(fs, ds, parent, (const uint8_t *)name, (uint8_t)nl);
+        double od = now_s() - o0;
+        if (od > max_op) max_op = od;
         if (us != STM_OK) { fprintf(stderr, "  unlink %u err=%d\n", i, (int)us); return -1; }
     }
-    return stm_fs_commit(fs) == STM_OK ? 0 : -1;
+    double dt = now_s() - t0;
+    (void)stm_fs_stats_get(fs, &st1);
+    double c0 = now_s();
+    if (stm_fs_commit(fs) != STM_OK) return -1;
+    double cdt = now_s() - c0;
+    printf("  unlink        %10.0f files/s   (%.2f us/file, max %.0f us)   "
+           "gen_delta=%llu   trailing_commit=%.1f ms\n",
+           (double)NFILES / dt, dt * 1e6 / (double)NFILES, max_op * 1e6,
+           (unsigned long long)(st1.current_gen - st0.current_gen), cdt * 1e3);
+    return 0;
 }
 
 int main(void)
@@ -133,7 +155,12 @@ int main(void)
     CHURN   = env_u("STM_BENCH_CHURN", CHURN);
     VERBOSE = env_u("STM_BENCH_VERBOSE", VERBOSE);
     if (DIRS == 0u) DIRS = 1u;
-    if (FSIZE > 100u) { fprintf(stderr, "FSIZE>100 is the extent path (Area D/E bench); clamping to 100\n"); FSIZE = 100u; }
+    /* #374: FSIZE > STM_INODE_INLINE_MAX (100) is now allowed -- a create
+     * + first-write > 100 B transitions the inode INLINE -> EXTENT and
+     * allocates a real extent at write time, which is exactly the go-build
+     * $WORK shape (every object/importcfg file is extent-bearing). The
+     * CHURN unlink of such files exercises the extent-unlink reclaim
+     * path; keep FSIZE <= 100 for the pure-metadata Area S numbers. */
 
     uint8_t *wbuf = NULL;
     if (FSIZE) {

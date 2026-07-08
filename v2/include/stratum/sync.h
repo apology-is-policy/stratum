@@ -279,6 +279,16 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
 STM_MUST_USE
 stm_status stm_sync_commit(stm_sync *s);
 
+/* CF-4 C: O(1) total PENDING free blocks across every attached device
+ * allocator (sum of stm_alloc_pending_blocks). The reclaim-on-ENOSPC
+ * gate: a reserve that returned STM_ENOSPC may recover space by
+ * committing (twice) to sweep the PENDING list iff this is non-zero.
+ * Cheap counter reads, no tree scan. Caller holds fs->global (which
+ * stabilizes the attached-alloc set); this takes s->lock + each
+ * a->lock in the canonical fs->global -> s->lock -> a->lock order.
+ * Returns 0 for a NULL sync. */
+uint64_t stm_sync_pending_free_blocks(stm_sync *s);
+
 /*
  * Release the handle. Does NOT commit; callers who need durability
  * must call stm_sync_commit first. Does NOT close the underlying

@@ -10740,4 +10740,222 @@ STM_TEST(snap_view_read_side_ops_refuse_explicitly) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* CF-4 C: deferred block reclaim + reclaim-on-ENOSPC (cf-4c-design.md).       */
+/* ========================================================================= */
+
+/* Create a regular file `name` under the dataset root and DIRECT-write
+ * `nbytes` (> STM_FLUSH_DIRECT_THRESHOLD_BYTES so the reserve happens
+ * synchronously, not deferred to a flush). Content keyed to absolute
+ * offset for readback. Returns the new ino via *out_ino. */
+static void cf4c_make_big_file(stm_fs *fs, uint64_t ds, uint64_t root,
+                               const char *name, size_t nbytes,
+                               uint64_t *out_ino)
+{
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds, root, (const uint8_t *)name,
+                                        (uint8_t)strlen(name), 0100644u, 0, 0,
+                                        &ino));
+    uint8_t *buf = malloc(nbytes);
+    STM_ASSERT_TRUE(buf != NULL);
+    for (size_t i = 0; i < nbytes; i++) buf[i] = (uint8_t)((i * 131u + 7u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, ds, ino, 0, buf, nbytes));
+    free(buf);
+    if (out_ino) *out_ino = ino;
+}
+
+/* CF-4 C §4.1: an extent unlink DEFERS reclaim -- it does NOT commit (gen
+ * unchanged), the freed blocks move to PENDING (not FREE), and the next
+ * commit's sweep returns them. Pre-CF-4-C this fired an eager double-commit
+ * (gen += 4) at unlink; #374's 3.2 s/build go-cleanup was 222 x that. */
+STM_TEST(fs_cf4c_unlink_defers_reclaim) {
+    make_tmp("cf4c_defer");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds = 0, root = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "d", &ds));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0755u, 0, 0, &root));
+
+    cf4c_make_big_file(fs, ds, root, "A", 2u * 1024u * 1024u, NULL);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_fs_stats st0;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st0));
+    STM_ASSERT_TRUE(st0.data_allocated_blocks > 0u);
+    STM_ASSERT_EQ(st0.data_pending_blocks, (uint64_t)0);
+
+    /* Unlink A -- CF-4 C defers: no commit, blocks -> PENDING. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, ds, root, (const uint8_t *)"A", 1));
+
+    stm_fs_stats st1;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st1));
+    STM_ASSERT_EQ(st1.current_gen, st0.current_gen);            /* NO eager commit */
+    STM_ASSERT_TRUE(st1.data_pending_blocks >= st0.data_allocated_blocks);
+    STM_ASSERT_TRUE(st1.data_allocated_blocks < st0.data_allocated_blocks);
+    STM_ASSERT_EQ(st1.data_free_blocks, st0.data_free_blocks);  /* PENDING != FREE yet */
+
+    /* Two commits sweep the PENDING (strict free_gen < committed_gen). */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_stats st2;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st2));
+    STM_ASSERT_EQ(st2.data_pending_blocks, (uint64_t)0);        /* reclaimed */
+    STM_ASSERT_TRUE(st2.data_free_blocks > st1.data_free_blocks);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* CF-4 C §4.2: the availability guarantee -- fill near-full, unlink (which
+ * now DEFERS the reclaim), then re-allocate the same volume with NO commit
+ * between. The rewrite's reserve hits ENOSPC (the freed blocks are PENDING,
+ * not FREE), the reserve-path backstop sweeps them, and the retry succeeds.
+ * This had no regression test before CF-4 C (only a code comment). Load-
+ * bearing + non-vacuous: `data_free_blocks < a_blocks` after the unlink
+ * proves B cannot fit without the reclaim -- neuter fs_reclaim_on_enospc_
+ * locked to `return false` and this test fails with STM_ENOSPC. */
+STM_TEST(fs_cf4c_reclaim_on_enospc_after_unlink) {
+    make_tmp("cf4c_avail_unlink");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds = 0, root = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "d", &ds));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0755u, 0, 0, &root));
+
+    /* A = 6 MiB fills ~3/4 of the 8 MiB data area. */
+    const size_t BIG = 6u * 1024u * 1024u;
+    cf4c_make_big_file(fs, ds, root, "A", BIG, NULL);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    uint64_t a_blocks = st.data_allocated_blocks;
+    uint64_t gen_a    = st.current_gen;
+    /* Near-full sanity: a second A cannot fit alongside the first. */
+    STM_ASSERT_TRUE(st.data_free_blocks < a_blocks);
+
+    /* Unlink A -- deferred (PENDING, no commit). */
+    STM_ASSERT_OK(stm_fs_unlink(fs, ds, root, (const uint8_t *)"A", 1));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.current_gen, gen_a);                 /* deferred, no commit */
+    STM_ASSERT_TRUE(st.data_pending_blocks >= a_blocks);  /* A's blocks are PENDING */
+    STM_ASSERT_TRUE(st.data_free_blocks < a_blocks);      /* B cannot fit w/o reclaim */
+
+    /* B = same size, NO explicit commit. Its reserve ENOSPCs, the backstop
+     * sweeps A's PENDING, the retry succeeds. */
+    uint64_t ino_b = 0;
+    cf4c_make_big_file(fs, ds, root, "B", BIG, &ino_b);   /* asserts stm_fs_write OK */
+
+    /* Content readback (a sample across the file). */
+    uint8_t chk[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, ds, ino_b, BIG - sizeof chk, chk, sizeof chk, &got));
+    STM_ASSERT_EQ(got, sizeof chk);
+    for (size_t i = 0; i < sizeof chk; i++) {
+        size_t abs = (BIG - sizeof chk) + i;
+        STM_ASSERT_EQ(chk[i], (uint8_t)((abs * 131u + 7u) & 0xFFu));
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* CF-4 C §4.2 (the latent gap it closes): truncate-shrink NEVER eager-
+ * reclaimed even pre-CF-4-C, and there was no backstop -- so truncate-to-0
+ * then rewrite-near-full-no-commit would ENOSPC. The reserve-path backstop
+ * now covers it uniformly. Same structure as the unlink test but the space
+ * is freed via stm_fs_truncate(A, 0) instead of unlink. */
+STM_TEST(fs_cf4c_reclaim_on_enospc_after_truncate) {
+    make_tmp("cf4c_avail_trunc");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds = 0, root = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "d", &ds));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0755u, 0, 0, &root));
+
+    const size_t BIG = 6u * 1024u * 1024u;
+    uint64_t ino_a = 0;
+    cf4c_make_big_file(fs, ds, root, "A", BIG, &ino_a);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    uint64_t a_blocks = st.data_allocated_blocks;
+    STM_ASSERT_TRUE(st.data_free_blocks < a_blocks);
+
+    /* Truncate A to 0 -- frees its extents to PENDING, no eager reclaim. */
+    STM_ASSERT_OK(stm_fs_truncate(fs, ds, ino_a, 0));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.data_pending_blocks >= a_blocks);
+    STM_ASSERT_TRUE(st.data_free_blocks < a_blocks);
+
+    /* B = same size, no commit -> reserve ENOSPC -> backstop reclaims. */
+    cf4c_make_big_file(fs, ds, root, "B", BIG, NULL);     /* asserts write OK */
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* CF-4 C §4.2 loop-freedom: a GENUINELY full pool (no reclaimable PENDING)
+ * returns STM_ENOSPC without hanging -- the backstop gate short-circuits
+ * (pending == 0) and the reserve is not retried. */
+STM_TEST(fs_cf4c_loop_freedom_genuinely_full) {
+    make_tmp("cf4c_full");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds = 0, root = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "d", &ds));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0755u, 0, 0, &root));
+
+    /* Fill until ENOSPC, committing after each so nothing stays PENDING. */
+    const size_t BIG = 6u * 1024u * 1024u;
+    uint8_t *buf = malloc(BIG);
+    STM_ASSERT_TRUE(buf != NULL);
+    for (size_t i = 0; i < BIG; i++) buf[i] = (uint8_t)(i & 0xFFu);
+    stm_status last = STM_OK;
+    for (int i = 0; i < 8 && last == STM_OK; i++) {
+        char nm[8];
+        snprintf(nm, sizeof nm, "f%d", i);
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, ds, root, (const uint8_t *)nm,
+                                            (uint8_t)strlen(nm), 0100644u, 0, 0,
+                                            &ino));
+        last = stm_fs_write(fs, ds, ino, 0, buf, BIG);
+        if (last == STM_OK) STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+    free(buf);
+    /* We hit ENOSPC (the pool is genuinely full, all committed = 0 PENDING). */
+    STM_ASSERT_EQ(last, STM_ENOSPC);
+
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.data_pending_blocks, (uint64_t)0);   /* nothing to reclaim */
+    /* Clean ENOSPC, not wedged: a subsequent commit still succeeds (a wedged
+     * fs would return STM_EWEDGED). */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")
