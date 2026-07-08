@@ -225,10 +225,15 @@ struct stm_fs {
     stm_hybrid_keys *cached_keys;    /* owned (malloc + mlock) */
 
     /* 9.8-LF-3: wedged + read_only are atomic so 9.8 wait-free read ops
-     * can check them without holding fs->global. The ONLY writer is
-     * stm_fs_mark_wedged (which holds fs->global EX) — the EX
-     * exclusion serialises writer-vs-writer; the atomic provides
-     * reader-side acquire/release pairing.
+     * can check them without holding fs->global. `wedged` has two writers:
+     * stm_fs_mark_wedged (holds fs->global EX -- the primary path) and
+     * CF-4 C's fs_mark_wedged_locked (called with fs->global held in SH or
+     * EX from the reserve-path reclaim backstop). Both are sound because
+     * `wedged` is a MONOTONE one-way latch (only ever false->true): the
+     * release-store is atomic, so a concurrent SH-holder's store is an
+     * idempotent same-value write -- no torn write, no lost update, and the
+     * reader-side acquire pairing is preserved regardless of writer count.
+     * (`read_only` keeps the single-EX-writer discipline.)
      *
      * R171 P3-3: stm_fs_unmount does NOT transition wedged/read_only;
      * it reads them only. Unmount tears the fs down without a wedge
@@ -1465,6 +1470,12 @@ stm_status stm_fs_reserve(stm_fs *fs, uint64_t nblocks, uint64_t hint_paddr,
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_status s = stm_alloc_reserve(fs->alloc, nblocks, hint_paddr, out_paddr);
+    /* CF-4 C (audit F1): the raw data-reserve API gets the same reclaim-on-
+     * ENOSPC backstop as every other reserve choke, for uniformity. No
+     * production caller today (the 9P/CLI paths reserve via write/create),
+     * so this is future-proofing rather than a live gap. */
+    if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
+        s = stm_alloc_reserve(fs->alloc, nblocks, hint_paddr, out_paddr);
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
@@ -2233,9 +2244,14 @@ stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                                                   &iv, off, buf, len);
                     /* CF-4 C: reclaim-on-ENOSPC. A reserve out of space may
                      * be recoverable if an unlink/truncate/overwrite left
-                     * blocks PENDING; sweep them + retry once. iv is not
-                     * mutated on the ENOSPC path (the reserve precedes the
-                     * si_size update), so the retry reuses it. */
+                     * blocks PENDING; sweep them + retry once, reusing iv.
+                     * Safe because every ENOSPC-returning path in
+                     * fs_write_regular_locked leaves iv unmutated: the
+                     * EXTENT + inline->EXTENT paths reserve BEFORE the
+                     * si_size/kind update, and the inline fast path -- which
+                     * DOES mutate iv -- never reserves, so it cannot ENOSPC
+                     * (stm_inode_set on the delta-chain engine cannot ENOSPC
+                     * either). */
                     if (rs == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
                         rs = fs_write_regular_locked(fs, iidx, dataset_id, ino,
                                                          &iv, off, buf, len);

@@ -10911,6 +10911,62 @@ STM_TEST(fs_cf4c_reclaim_on_enospc_after_truncate) {
     unlink(g_key_path);
 }
 
+/* CF-4 C §4.2, audit F3: the FLUSH-internal reclaim path specifically (the
+ * other availability tests use 6 MiB DIRECT writes; here B is filled with
+ * sub-1-MiB BUFFERED writes so the reserve happens at drain time, exercising
+ * fs_flush_ino_locked/fs_flush_all_locked's reclaim + re-drain rather than the
+ * direct stm_fs_write reclaim). Fill A near-full, unlink (deferred), then
+ * buffer-write B past the free watermark and commit -> the commit's flush
+ * ENOSPCs, reclaims A's PENDING, re-drains, succeeds. */
+STM_TEST(fs_cf4c_reclaim_on_enospc_buffered_write) {
+    make_tmp("cf4c_avail_buf");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds = 0, root = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "d", &ds));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0755u, 0, 0, &root));
+
+    const size_t BIG = 6u * 1024u * 1024u;
+    cf4c_make_big_file(fs, ds, root, "A", BIG, NULL);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    uint64_t a_blocks = st.data_allocated_blocks;
+    STM_ASSERT_TRUE(st.data_free_blocks < a_blocks);
+    uint64_t free_bytes = st.data_free_blocks * 4096u;
+
+    STM_ASSERT_OK(stm_fs_unlink(fs, ds, root, (const uint8_t *)"A", 1));
+
+    /* B: buffered writes (256 KiB < the 1 MiB direct threshold) totaling well
+     * past the free watermark, so the drained reserve MUST reclaim A. The
+     * first write transitions inline->extent (a small direct write that fits
+     * the residual free); the rest buffer. */
+    uint64_t ino_b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds, root, (const uint8_t *)"B", 1,
+                                        0100644u, 0, 0, &ino_b));
+    const size_t CHUNK = 256u * 1024u;
+    size_t total = free_bytes + 2u * 1024u * 1024u;   /* comfortably over free */
+    uint8_t *cbuf = malloc(CHUNK);
+    STM_ASSERT_TRUE(cbuf != NULL);
+    for (size_t i = 0; i < CHUNK; i++) cbuf[i] = (uint8_t)((i * 71u + 3u) & 0xFFu);
+    for (size_t off = 0; off < total; off += CHUNK) {
+        STM_ASSERT_OK(stm_fs_write(fs, ds, ino_b, off, cbuf, CHUNK));
+    }
+    free(cbuf);
+    /* Commit -> the flush drains B's buffered ranges; the reserve ENOSPCs on
+     * the residual free and the flush-internal reclaim sweeps A's PENDING. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 /* CF-4 C §4.2 loop-freedom: a GENUINELY full pool (no reclaimable PENDING)
  * returns STM_ENOSPC without hanging -- the backstop gate short-circuits
  * (pending == 0) and the reserve is not retried. */

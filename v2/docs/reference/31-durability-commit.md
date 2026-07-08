@@ -159,9 +159,26 @@ choke: `fs_flush_ino_locked` / `fs_flush_all_locked` (the buffer drain — cover
 buffered writes + the pre-flush of reflink/cfr/migrate/promote/truncate + the
 commit flush), the direct `stm_fs_write` paths, the inline→extent transitions,
 and the migrate/promote tier reserves. (reflink + cfr share existing blocks —
-no new data reserve — so need no backstop.) A failed reclaim commit is
-crash-equivalent ⇒ it wedges in place (`fs_mark_wedged_locked`, a monotone
-release-store safe under either lock mode).
+no new data reserve — so need no backstop. `stm_fs_reserve` — the raw
+data-reserve API, test-only, no production caller — is also wrapped for
+uniformity, CF-4 C audit F1.) A failed reclaim commit is crash-equivalent ⇒ it
+wedges in place (`fs_mark_wedged_locked`, a monotone release-store safe under
+either lock mode). NOTE that metadata and data draw from **disjoint** pools
+(B-tree engine nodes + the alloc-tree's own COW nodes come from the bootstrap
+bitmap via `stm_bootstrap_reserve`; only file-data extents come from the data
+`stm_alloc_reserve`), so a data-full pool holding deferred DATA pending can
+never starve a metadata commit's engine flush — the fsync path cannot wedge on
+deferred data (CF-4 C audit, the withdrawn concern).
+
+fsync-ENOSPC durability nuance (CF-4 C audit F2): the flush-internal reclaim
+pops+commits successfully-drained runs before it retries, so a `stm_fs_commit`
+that still returns `STM_ENOSPC` (a genuinely-full pool) leaves the
+drained-so-far runs **durable** — a torn-partial file (si_size set at
+write-time, only part of the extents durable → sparse holes past the drained
+prefix) is exposed on a crash after such a failed fsync. This is POSIX-legal
+(a failed fsync grants no durability guarantee) and is a deliberate consequence
+of moving the reclaim into the drain; pre-CF-4-C a flush-ENOSPC committed
+nothing (the buffer stayed intact for retry).
 
 Deliberate semantics change (documented, POSIX-correct): unlink no longer
 commits, so it is no longer durable-without-fsync and no longer advances the

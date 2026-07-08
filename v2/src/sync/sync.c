@@ -2613,7 +2613,11 @@ stm_status stm_sync_commit(stm_sync *s)
      * every error exit via the out ladder — nothing a durable UB names
      * has been made nameable (the final UB never landed; the fs wedges
      * per R154 where an engine flushed). Single-armer contract: this
-     * function only, under fs->global EX + s->lock + pool SH. */
+     * function only, serialized by s->lock (held across arm..disarm). The
+     * caller's fs->global mode is NOT the serializer -- most commits hold
+     * EX, but CF-4 C's reclaim-on-ENOSPC backstop fires stm_sync_commit
+     * under fs->global SH; s->lock (not fs->global EX) is what guarantees
+     * a single armer, so the SH path composes correctly. */
     stm_status out_rc;
     {
         size_t ndev = stm_pool_device_count(s->pool);
