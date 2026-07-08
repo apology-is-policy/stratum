@@ -377,7 +377,8 @@ static int wedge_load(stm_fs *fs, uint64_t dir)
     clock_gettime(CLOCK_MONOTONIC, &t0);
     stm_status crc_ = stm_fs_commit(fs);
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3
+              + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
     printf("wedge: commit rc=%d in %.0f ms\n", (int)crc_, ms);
 
     uint64_t ino2 = 0;
