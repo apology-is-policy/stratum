@@ -110,7 +110,14 @@ struct stm_inode_value (256 bytes, packed):
     STM_DATA_INLINE  → u8 inline_data[100]
     STM_DATA_SYMLINK → u8 symlink_target[100]
     STM_DATA_DEVICE  → { le32 dev_major; le32 dev_minor; u8 pad[92]; }
-  Reserved (44 bytes):  zero-padded; future-extension space
+  Content-version (4 bytes):
+    le32    si_cvers           L1/Larder content-version — bumped on every
+                               real Set (content/metadata mutation), monotonic
+                               across ino reuse (AllocReused seeds prior+1),
+                               DECOUPLED from si_gen; surfaced as 9P qid.version
+                               so a guest cache validates close-to-open. Old
+                               pools read 0 (carved from the former reserved).
+  Reserved (40 bytes):  zero-padded; future-extension space
 ```
 
 ### `si_flags` bit allocation
@@ -210,10 +217,23 @@ stm_status stm_inode_next_ino     (idx, ds, *out_next);
 `stm_inode_set` REPLACES the record at `(ds, ino)`. Validates:
 `si_ino` matches lookup key, `si_dataset_id` matches, **`si_gen`
 matches stored gen** (protects tuple-uniqueness from caller error),
-`si_data_kind` is one of `STM_DATA_*`. The 44-byte `si_reserved`
+`si_data_kind` is one of `STM_DATA_*`. The 40-byte `si_reserved`
 region is zeroed on every successful Set (R69 P3-2 doctrine — future
 format extensions inherit defined-zero rather than caller-controlled
 noise).
+
+**L1/Larder content-version.** `si_cvers` is OWNED by the Set path, not
+the caller: the caller-supplied `si_cvers` is ignored; Set preserves the
+stored value across a no-op (byte-identical elision, so the version does
+not churn on a re-persist) and bumps it by one on a real write. It is
+monotonic per inode and DECOUPLED from `si_gen` — a content write bumps
+`si_cvers` and leaves `si_gen` untouched (a live 9P fid keys staleness on
+`si_gen`, so a write must not ESTALE the writer's own fid). AllocReused
+seeds `si_cvers = prior + 1` (carried from the FREED record) so a recycled
+ino never re-issues a `(qid.path, qid.version)` pair a guest may still have
+cached. Modeled by `inode.tla`'s cvers model (`CversUniqueAllTime` +
+`AllocatedReflectedInHistory`); surfaced as 9P `qid.version` at the server
+(the Larder guest-cache coherence key — see `docs/LARDER-DESIGN.md`).
 
 `stm_inode_count_for_ds` returns the count of ALLOCATED records
 (excludes FREED).

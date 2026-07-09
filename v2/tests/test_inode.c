@@ -1615,4 +1615,117 @@ STM_TEST(inode_cf2d_freed_scan_retries_injected_ebusy) {
     inode_test_idx_close(idx);
 }
 
+/* ------------------------------------------------------------------ */
+/* L1/Larder — si_cvers content-version (spec: inode.tla cvers model). */
+/* ------------------------------------------------------------------ */
+
+/* A freshly-allocated inode starts at content-version 0 (also the
+ * old-pool-compat proof: an old record's zeroed si_reserved region reads
+ * si_cvers=0, byte-identical to a fresh inode's carved bytes). */
+STM_TEST(inode_cvers_fresh_is_zero) {
+    stm_inode_index *idx = inode_test_idx();
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 3, 0100644, 0, 0, &ino));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 3, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_cvers), (uint32_t)0);
+
+    inode_test_idx_close(idx);
+}
+
+/* Every real (field-changing) stm_inode_set bumps si_cvers by one. The
+ * caller-provided si_cvers is IGNORED — the write path owns it. */
+STM_TEST(inode_cvers_set_bumps_on_real_write) {
+    stm_inode_index *idx = inode_test_idx();
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 4, 0100644, 0, 0, &ino));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 4, ino, &v));
+    v.si_mode  = stm_store_le32(0100600);   /* a real change */
+    v.si_cvers = stm_store_le32(999);        /* caller's value must be ignored */
+    STM_ASSERT_OK(stm_inode_set(idx, 4, ino, &v));
+    STM_ASSERT_OK(stm_inode_lookup(idx, 4, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_cvers), (uint32_t)1);
+
+    v.si_mode = stm_store_le32(0100640);     /* another real change */
+    STM_ASSERT_OK(stm_inode_set(idx, 4, ino, &v));
+    STM_ASSERT_OK(stm_inode_lookup(idx, 4, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_cvers), (uint32_t)2);
+
+    inode_test_idx_close(idx);
+}
+
+/* A no-op stm_inode_set (byte-identical record) is elided and does NOT
+ * bump si_cvers — the close-to-open coherence must not churn on re-persist. */
+STM_TEST(inode_cvers_set_noop_does_not_bump) {
+    stm_inode_index *idx = inode_test_idx();
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 5, 0100644, 0, 0, &ino));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 5, ino, &v));   /* cvers 0 */
+    STM_ASSERT_OK(stm_inode_set(idx, 5, ino, &v));      /* identical -> elided */
+    STM_ASSERT_OK(stm_inode_lookup(idx, 5, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_cvers), (uint32_t)0);
+
+    inode_test_idx_close(idx);
+}
+
+/* Decoupling: a content write bumps si_cvers but leaves si_gen unchanged
+ * (else a live 9P fid would ESTALE on the writer's own write). */
+STM_TEST(inode_cvers_gen_unchanged_by_content_write) {
+    stm_inode_index *idx = inode_test_idx();
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 6, 0100644, 0, 0, &ino));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 6, ino, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)0);
+    v.si_mode = stm_store_le32(0100600);
+    STM_ASSERT_OK(stm_inode_set(idx, 6, ino, &v));
+    STM_ASSERT_OK(stm_inode_lookup(idx, 6, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_cvers), (uint32_t)1);   /* content bumped */
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen),   (uint64_t)0);   /* lifecycle NOT */
+
+    inode_test_idx_close(idx);
+}
+
+/* Monotonic across ino reuse (the guest-cache collision guard): a reused
+ * ino's cvers strictly exceeds the prior incarnation's final cvers, so no
+ * (qid.path, qid.version) pair a guest cached for the prior file can alias
+ * the reused one. si_gen also bumps (the independent lifecycle axis). */
+STM_TEST(inode_cvers_reuse_is_monotonic) {
+    stm_inode_index *idx = inode_test_idx();
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 8, 0100644, 0, 0, &ino));
+
+    /* Bump the prior incarnation's cvers to 2. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 8, ino, &v));
+    v.si_mode = stm_store_le32(0100600);
+    STM_ASSERT_OK(stm_inode_set(idx, 8, ino, &v));      /* cvers 1 */
+    STM_ASSERT_OK(stm_inode_lookup(idx, 8, ino, &v));
+    v.si_mode = stm_store_le32(0100640);
+    STM_ASSERT_OK(stm_inode_set(idx, 8, ino, &v));      /* cvers 2 */
+
+    STM_ASSERT_OK(stm_inode_free(idx, 8, ino));
+
+    uint64_t reused = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 8, 0100644, 0, 0, &reused));
+    STM_ASSERT_EQ(reused, ino);                         /* the ino was recycled */
+
+    struct stm_inode_value r = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 8, reused, &r));
+    STM_ASSERT_EQ(stm_load_le32(r.si_cvers), (uint32_t)3);  /* prior 2 + 1 */
+    STM_ASSERT_EQ(stm_load_le64(r.si_gen),   (uint64_t)1);  /* gen bumped too */
+
+    inode_test_idx_close(idx);
+}
+
 STM_TEST_MAIN("test_inode")

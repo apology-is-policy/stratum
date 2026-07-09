@@ -100,7 +100,7 @@ CONSTANTS
                                    \*   every ino, so the reformulated
                                    \*   LinkedAllocatedHasPositiveNlink
                                    \*   reduces to its pre-7a form).
-    BuggyAllocAnonClaimsLinked     \* TRUE → AllocAnon sets
+    BuggyAllocAnonClaimsLinked,    \* TRUE → AllocAnon sets
                                    \*   ever_linked = TRUE while
                                    \*   leaving nlink = 0. Demonstrates
                                    \*   the "linked file with nlink=0"
@@ -111,6 +111,22 @@ CONSTANTS
                                    \*   impl that conflates linked +
                                    \*   orphan states is provably
                                    \*   detected.
+    \* ── L1/Larder content-version (si_cvers) model ──────────────────────
+    EnableCversModel,              \* TRUE → enable the si_cvers content-
+                                   \*   version shadow + ContentMutate.
+                                   \*   FALSE → the cvers vars stay at Init,
+                                   \*   so existing cfgs are unperturbed.
+    MaxCvers,                      \* bound on cvers (TLC tractability;
+                                   \*   real impl is a uint32_t).
+    BuggyCversResetOnReuse,        \* TRUE → AllocReused resets cvers to 0
+                                   \*   instead of prior+1 — the (ino,cvers)
+                                   \*   guest-cache-collision bug (a reused
+                                   \*   ino aliases a prior incarnation's
+                                   \*   cached content-version).
+    BuggyContentMutateBumpsGen     \* TRUE → ContentMutate bumps gen too —
+                                   \*   the fid-ESTALE-on-own-write bug.
+                                   \*   Caught by AllocatedReflectedInHistory
+                                   \*   (gen moves with no history stamp).
 
 ASSUME /\ Inos # {}
        /\ MaxGen \in Nat /\ MaxGen >= 1
@@ -125,6 +141,10 @@ ASSUME /\ Inos # {}
        /\ BuggyInlineWriteSpills \in BOOLEAN
        /\ EnableOrphanModel \in BOOLEAN
        /\ BuggyAllocAnonClaimsLinked \in BOOLEAN
+       /\ EnableCversModel \in BOOLEAN
+       /\ MaxCvers \in Nat /\ MaxCvers >= 1
+       /\ BuggyCversResetOnReuse \in BOOLEAN
+       /\ BuggyContentMutateBumpsGen \in BOOLEAN
 
 \* Inode states.
 NEVER_USED == "never_used"
@@ -220,9 +240,25 @@ VARIABLES
                                    \*   leave ever_linked unchanged
                                    \*   (FREED inos don't use it; reset
                                    \*   happens at the next allocation).
+    ,
+    cvers,                         \* per-ino content-version (si_cvers):
+                                   \*   0 at AllocFresh; prior+1 at
+                                   \*   AllocReused (monotonic across reuse);
+                                   \*   +1 at ContentMutate; preserved on
+                                   \*   free. Surfaced as 9P qid.version.
+    cvers_history,                 \* per-ino set of <<cvers, event_id>>
+                                   \*   stamped at each content-defining
+                                   \*   event; CversUniqueAllTime asserts no
+                                   \*   cvers value is ever stamped twice.
+    cvers_event_counter            \* monotonic event id for cvers stamps.
 
 vars == <<state, gen, nlink, history, alloc_event_counter,
-          data_kind, data_len, ever_extent, ever_linked>>
+          data_kind, data_len, ever_extent, ever_linked,
+          cvers, cvers_history, cvers_event_counter>>
+
+\* L1/Larder content-version shadow vars — every non-cvers action leaves
+\* them UNCHANGED; only AllocFresh / AllocReused / ContentMutate touch them.
+cvers_vars == <<cvers, cvers_history, cvers_event_counter>>
 
 \* --------------------------------------------------------------------------
 \* Initial state — all inos NEVER_USED, all gen=0, empty history.
@@ -238,6 +274,9 @@ Init ==
     /\ data_len            = [i \in Inos |-> 0]
     /\ ever_extent         = [i \in Inos |-> FALSE]
     /\ ever_linked         = [i \in Inos |-> TRUE]
+    /\ cvers               = [i \in Inos |-> 0]
+    /\ cvers_history       = [i \in Inos |-> {}]
+    /\ cvers_event_counter = 0
 
 \* --------------------------------------------------------------------------
 \* Helpers.
@@ -288,6 +327,16 @@ AllocFresh(i) ==
           /\ ever_extent' = [ever_extent EXCEPT ![i] = FALSE]
        \/ /\ ~EnableInlineDataModel
           /\ UNCHANGED <<data_kind, data_len, ever_extent>>
+    \* L1/Larder: a fresh inode starts at content-version 0 (a brand-new
+    \* ino has no prior incarnation, so 0 cannot alias a cached entry).
+    /\ \/ /\ EnableCversModel
+          /\ cvers'               = [cvers EXCEPT ![i] = 0]
+          /\ cvers_event_counter' = cvers_event_counter + 1
+          /\ cvers_history'       = [cvers_history EXCEPT
+                                        ![i] = cvers_history[i] \cup
+                                                {<<0, cvers_event_counter + 1>>}]
+       \/ /\ ~EnableCversModel
+          /\ UNCHANGED cvers_vars
 
 \* AllocReused: pick a FREED ino, mark ALLOCATED. Healthy: bump gen.
 \* BuggyReuseNoGenBump: keep prior gen — the canonical (ino, gen)
@@ -323,6 +372,24 @@ AllocReused(i) ==
               /\ ever_extent' = [ever_extent EXCEPT ![i] = FALSE]
            \/ /\ ~EnableInlineDataModel
               /\ UNCHANGED <<data_kind, data_len, ever_extent>>
+        \* L1/Larder: reuse carries the content-version MONOTONICALLY
+        \* (prior+1) so a reused ino never re-issues a cached (ino,cvers).
+        \* The freed record preserved cvers[i] (Unlink/FreeAnon UNCHANGED
+        \* it); AllocReused bumps from there. BuggyCversResetOnReuse resets
+        \* to 0 — the collision bug (CversUniqueAllTime fires).
+        /\ \/ /\ EnableCversModel
+              /\ LET new_cvers ==
+                       IF BuggyCversResetOnReuse THEN 0 ELSE cvers[i] + 1
+                 IN
+                  /\ new_cvers <= MaxCvers
+                  /\ cvers'               = [cvers EXCEPT ![i] = new_cvers]
+                  /\ cvers_event_counter' = cvers_event_counter + 1
+                  /\ cvers_history'       = [cvers_history EXCEPT
+                                                ![i] = cvers_history[i] \cup
+                                                        {<<new_cvers,
+                                                           cvers_event_counter + 1>>}]
+           \/ /\ ~EnableCversModel
+              /\ UNCHANGED cvers_vars
 
 \* Link: ALLOCATED ino with nlink in [1, MaxNlink-1] gets nlink + 1.
 \* Models stm_fs_link adding a new dirent that references this ino.
@@ -335,6 +402,7 @@ AllocReused(i) ==
 \* invariant LinkedAllocatedHasPositiveNlink + FreedHasZeroNlink
 \* via the cascade-free that Unlink performs.
 Link(i) ==
+    /\ UNCHANGED cvers_vars
     /\ state[i] = ALLOCATED
     /\ nlink[i] >= 1
     /\ nlink[i] < MaxNlink
@@ -348,6 +416,7 @@ Link(i) ==
 \* nlink reaches 0 — produces the (ALLOCATED, nlink=0) orphan that
 \* R71 P1-1 caught at the writer-side guard.
 Unlink(i) ==
+    /\ UNCHANGED cvers_vars
     /\ state[i] = ALLOCATED
     /\ nlink[i] >= 1
     /\ LET new_nlink == nlink[i] - 1
@@ -415,6 +484,7 @@ Unlink(i) ==
 \* BuggyInlineWriteSpills: new_len > MaxInline allowed — fires
 \* InlineLenBounded.
 WriteInline(i, new_len) ==
+    /\ UNCHANGED cvers_vars
     /\ state[i] = ALLOCATED
     /\ data_kind[i] = KIND_INLINE
     /\ new_len \in 0..MaxFileLen
@@ -437,6 +507,7 @@ WriteInline(i, new_len) ==
 \* setting ever_extent[i] := TRUE. data_len is reset to 0 because
 \* the extent layer now manages length.
 TransitionToExtent(i) ==
+    /\ UNCHANGED cvers_vars
     /\ state[i] = ALLOCATED
     /\ data_kind[i] = KIND_INLINE
     /\ data_kind'   = [data_kind EXCEPT ![i] = KIND_EXTENT]
@@ -452,11 +523,13 @@ WriteExtent(i) ==
     /\ state[i] = ALLOCATED
     /\ data_kind[i] = KIND_EXTENT
     /\ UNCHANGED vars
+    \* (cvers_vars is a subset of vars; already UNCHANGED above.)
 
 \* TruncateInline: truncate an INLINE inode to `new_len`. Shrinks
 \* data_len; kind stays INLINE. (Growing truncate would land in the
 \* WriteInline / TransitionToExtent path depending on size.)
 TruncateInline(i, new_len) ==
+    /\ UNCHANGED cvers_vars
     /\ state[i] = ALLOCATED
     /\ data_kind[i] = KIND_INLINE
     /\ new_len \in 0..MaxFileLen
@@ -474,6 +547,7 @@ TruncateInline(i, new_len) ==
 \*   to INLINE. Fires OneWayInlineToExtent (ever_extent[i] is
 \*   still TRUE from the prior TransitionToExtent).
 TruncateExtent(i, new_len) ==
+    /\ UNCHANGED cvers_vars
     /\ state[i] = ALLOCATED
     /\ data_kind[i] = KIND_EXTENT
     /\ new_len \in 0..MaxFileLen
@@ -550,6 +624,24 @@ AllocAnon(i) ==
               /\ ever_extent' = [ever_extent EXCEPT ![i] = FALSE]
            \/ /\ ~EnableInlineDataModel
               /\ UNCHANGED <<data_kind, data_len, ever_extent>>
+        \* L1/Larder: an orphan mint (shared in_alloc_common) seeds cvers
+        \* like a regular alloc — 0 when fresh, prior+1 when reusing a
+        \* FREED ino (monotonic; the reuse-collision guard applies here too).
+        /\ \/ /\ EnableCversModel
+              /\ LET new_cvers ==
+                       IF state[i] = NEVER_USED THEN 0
+                       ELSE IF BuggyCversResetOnReuse THEN 0
+                       ELSE cvers[i] + 1
+                 IN
+                  /\ new_cvers <= MaxCvers
+                  /\ cvers'               = [cvers EXCEPT ![i] = new_cvers]
+                  /\ cvers_event_counter' = cvers_event_counter + 1
+                  /\ cvers_history'       = [cvers_history EXCEPT
+                                                ![i] = cvers_history[i] \cup
+                                                        {<<new_cvers,
+                                                           cvers_event_counter + 1>>}]
+           \/ /\ ~EnableCversModel
+              /\ UNCHANGED cvers_vars
 
 \* Materialize: orphan → linked. ALLOCATED + nlink=0 + ~ever_linked
 \* transitions to ALLOCATED + nlink=1 + ever_linked=TRUE. Models
@@ -558,6 +650,7 @@ AllocAnon(i) ==
 \* identity is stable across materialization — POSIX file_handle
 \* semantics).
 Materialize(i) ==
+    /\ UNCHANGED cvers_vars
     /\ EnableOrphanModel
     /\ state[i] = ALLOCATED
     /\ nlink[i] = 0
@@ -574,6 +667,7 @@ Materialize(i) ==
 \* case). gen preserved so the next AllocReused / AllocAnon at this
 \* ino bumps it.
 FreeAnon(i) ==
+    /\ UNCHANGED cvers_vars
     /\ EnableOrphanModel
     /\ state[i] = ALLOCATED
     /\ nlink[i] = 0
@@ -586,6 +680,40 @@ FreeAnon(i) ==
        \/ /\ ~EnableInlineDataModel
           /\ UNCHANGED <<data_kind, data_len, ever_extent>>
     /\ UNCHANGED <<gen, nlink, history, alloc_event_counter, ever_linked>>
+
+\* --------------------------------------------------------------------------
+\* L1/Larder — content-version mutation.
+\*
+\* Models ANY stm_inode_set that changes a content-or-metadata field of an
+\* ALLOCATED inode (write / setattr / truncate / a create-or-unlink touching
+\* THIS dir's mtime). The impl bumps si_cvers in the single stm_inode_set
+\* choke point on every real (non-elided) write; the spec abstracts that as
+\* one action that bumps cvers and leaves gen UNTOUCHED.
+\*
+\* Healthy: cvers += 1, gen UNCHANGED. The (ino,cvers) stamp is strictly
+\* greater than every prior stamp for this ino, so CversUniqueAllTime holds.
+\*
+\* BuggyContentMutateBumpsGen: gen += 1 as well — the fid-ESTALE-on-own-
+\* write bug (a live fid bound at gen G would ESTALE on the writer's own
+\* write). Caught by AllocatedReflectedInHistory: gen moves to a value with
+\* no history entry (ContentMutate never stamps history), so the ALLOCATED
+\* ino's gen matches no recorded allocation event.
+\* --------------------------------------------------------------------------
+ContentMutate(i) ==
+    /\ EnableCversModel
+    /\ state[i] = ALLOCATED
+    /\ cvers[i] < MaxCvers
+    /\ cvers'               = [cvers EXCEPT ![i] = cvers[i] + 1]
+    /\ cvers_event_counter' = cvers_event_counter + 1
+    /\ cvers_history'       = [cvers_history EXCEPT
+                                  ![i] = cvers_history[i] \cup
+                                          {<<cvers[i] + 1,
+                                             cvers_event_counter + 1>>}]
+    /\ gen' = IF BuggyContentMutateBumpsGen /\ gen[i] < MaxGen
+              THEN [gen EXCEPT ![i] = gen[i] + 1]
+              ELSE gen
+    /\ UNCHANGED <<state, nlink, history, alloc_event_counter,
+                    data_kind, data_len, ever_extent, ever_linked>>
 
 \* --------------------------------------------------------------------------
 \* Next.
@@ -606,6 +734,8 @@ Next ==
        /\ \/ \E i \in Inos : AllocAnon(i)
           \/ \E i \in Inos : Materialize(i)
           \/ \E i \in Inos : FreeAnon(i)
+    \/ /\ EnableCversModel
+       /\ \E i \in Inos : ContentMutate(i)
 
 Spec == Init /\ [][Next]_vars
 
@@ -624,6 +754,10 @@ TypeOK ==
     /\ data_len \in [Inos -> 0..MaxFileLen]
     /\ ever_extent \in [Inos -> BOOLEAN]
     /\ ever_linked \in [Inos -> BOOLEAN]
+    /\ cvers \in [Inos -> 0..MaxCvers]
+    /\ cvers_event_counter \in Nat
+    /\ \A i \in Inos :
+           cvers_history[i] \subseteq ((0..MaxCvers) \X (0..cvers_event_counter))
 
 \* HEADLINE INVARIANT — (ino, gen) uniqueness across all time.
 \*
@@ -787,6 +921,27 @@ OneWayInlineToExtent ==
             (state[i] = ALLOCATED /\ ever_extent[i])
                 => data_kind[i] = KIND_EXTENT
 
+\* L1/Larder — CONTENT-VERSION UNIQUENESS ACROSS ALL TIME. The guest-cache
+\* safety property (I-38): for every ino, no cvers value is ever stamped by
+\* two distinct content-defining events (same shape as TupleUniqueAllTime
+\* for gen). Because the healthy AllocFresh (0) / AllocReused (prior+1) /
+\* ContentMutate (+1) each stamp a STRICTLY GREATER cvers than every prior
+\* stamp for that ino, all stamped values are distinct — so a Larder entry
+\* keyed on (qid.path=ino) + validated on (qid.version=cvers) can never
+\* alias a different content-state across time.
+\*
+\* BuggyCversResetOnReuse fires this: an AllocReused (or AllocAnon-reuse)
+\* that resets cvers to 0 re-stamps a value (0) the ino's AllocFresh already
+\* published — two events, same cvers → the reused ino aliases the prior
+\* incarnation's cached content-version (the stale-serve collision).
+\*
+\* Vacuously TRUE when EnableCversModel = FALSE (cvers_history stays {} for
+\* every ino, so the doubly-quantified body ranges over the empty set).
+CversUniqueAllTime ==
+    \A i \in Inos :
+        \A e1, e2 \in cvers_history[i] :
+            (e1[1] = e2[1]) => (e1[2] = e2[2])
+
 \* --------------------------------------------------------------------------
 \* Bundle.
 \* --------------------------------------------------------------------------
@@ -803,5 +958,6 @@ Invariants ==
     /\ InlineLenBounded
     /\ OneWayInlineToExtent
     /\ OrphanHasZeroNlink
+    /\ CversUniqueAllTime
 
 =============================================================================

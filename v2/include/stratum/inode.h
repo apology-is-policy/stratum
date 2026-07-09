@@ -236,8 +236,19 @@ struct __attribute__((packed)) stm_inode_value {
         } device;                           /* STM_DATA_DEVICE */
     } si_data;
 
-    /* Reserved (44 bytes) — padding to STM_INODE_SIZE_BYTES. */
-    uint8_t si_reserved[44];
+    /* Content-version (L1/Larder). Bumped on every content/metadata
+     * mutation via the single stm_inode_set choke point; monotonic across
+     * ino reuse (AllocReused seeds prior+1); preserved through free.
+     * DECOUPLED from si_gen — si_gen is the inode-LIFECYCLE generation
+     * (fid-staleness), si_cvers is the CONTENT version. Surfaced as the 9P
+     * qid.version so a guest cache validates close-to-open (Plan 9 cfs).
+     * Carved from the former si_reserved[44]; old pools read 0 (a valid
+     * starting version). u32 matches the 9P qid.version width — a wrap
+     * after 2^32 mutations to one inode is the inherent-9P v1.x seam. */
+    le32    si_cvers;
+
+    /* Reserved (40 bytes) — padding to STM_INODE_SIZE_BYTES. */
+    uint8_t si_reserved[40];
 };
 
 STM_STATIC_ASSERT(sizeof(struct stm_inode_value) == STM_INODE_SIZE_BYTES,
@@ -469,10 +480,16 @@ stm_status stm_inode_lookup_concurrent(const stm_inode_index *idx,
  * lookup key; `si_gen` MUST match the record's stored gen (so callers
  * cannot accidentally overwrite the spec's tuple-uniqueness invariant
  * via a buggy gen value); `si_data_kind` MUST be one of STM_DATA_*.
- * The 44-byte `si_reserved` region is zeroed on every successful
+ * The 40-byte `si_reserved` region is zeroed on every successful
  * Set so a future format extension reading those bytes inherits a
  * defined-zero value rather than caller-controlled noise. [R69 P3-2
  * + P3-3: reserved-passthrough + data_kind-passthrough hardened.]
+ *
+ * L1/Larder: `si_cvers` (the content-version) is OWNED by this path,
+ * not the caller — the caller-provided si_cvers is ignored; Set
+ * preserves the stored value across a no-op and bumps it by one on a
+ * real (non-elided) write. si_gen stays the caller-matched lifecycle
+ * generation (only the allocator bumps it, on reuse).
  *
  * Refusals:
  *   - NULL idx OR NULL in_value (STM_EINVAL).

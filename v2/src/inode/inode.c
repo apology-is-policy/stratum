@@ -470,6 +470,7 @@ typedef struct {
     bool       found;
     uint64_t   ino;
     uint64_t   prior_gen;
+    uint32_t   prior_cvers;   /* L1/Larder: freed record's content-version */
     stm_status err;
 } in_freed_ctx;
 
@@ -498,9 +499,10 @@ static int in_freed_cb(const void *k, size_t klen,
     if (!(flags & STM_INO_FLAG_FREED)) return 0;         /* ALLOCATED — skip */
     uint64_t prior_gen = stm_load_le64(val.si_gen);
     if (prior_gen == UINT64_MAX) return 0;               /* would wrap — skip */
-    c->found     = true;
-    c->ino       = ino;
-    c->prior_gen = prior_gen;
+    c->found      = true;
+    c->ino        = ino;
+    c->prior_gen  = prior_gen;
+    c->prior_cvers = stm_load_le32(val.si_cvers);        /* carry cvers fwd */
     return 1;                                            /* first FREED wins */
 }
 
@@ -517,10 +519,12 @@ static int in_freed_cb(const void *k, size_t klen,
 static stm_status in_find_freed(stm_inode_index *idx, uint64_t ds,
                                 uint64_t lo_ino,
                                 bool *out_found, uint64_t *out_ino,
-                                uint64_t *out_prior_gen) {
-    *out_found     = false;
-    *out_ino       = 0;
-    *out_prior_gen = 0;
+                                uint64_t *out_prior_gen,
+                                uint32_t *out_prior_cvers) {
+    *out_found       = false;
+    *out_ino         = 0;
+    *out_prior_gen   = 0;
+    *out_prior_cvers = 0;
     stm_btree_engine *eng = NULL;
     stm_status es = in_get_engine_locked(idx, ds, &eng);
     if (es != STM_OK) return es;
@@ -538,7 +542,8 @@ static stm_status in_find_freed(stm_inode_index *idx, uint64_t ds,
     for (uint32_t attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
          attempt++) {
         c = (in_freed_ctx){ .ds = ds, .found = false, .ino = 0,
-                            .prior_gen = 0, .err = STM_OK };
+                            .prior_gen = 0, .prior_cvers = 0,
+                            .err = STM_OK };
         stm_ebr_enter(ebr);
         ss = stm_btree_engine_scan_range_concurrent(eng, ebr,
                                                     lo, IN_KEY_LEN,
@@ -550,9 +555,10 @@ static stm_status in_find_freed(stm_inode_index *idx, uint64_t ds,
     }
     if (ss != STM_OK) return ss;
     if (c.err != STM_OK) return c.err;
-    *out_found     = c.found;
-    *out_ino       = c.ino;
-    *out_prior_gen = c.prior_gen;
+    *out_found       = c.found;
+    *out_ino         = c.ino;
+    *out_prior_gen   = c.prior_gen;
+    *out_prior_cvers = c.prior_cvers;
     return STM_OK;
 }
 
@@ -777,9 +783,11 @@ static stm_status in_alloc_common(stm_inode_index *idx, uint64_t dataset_id,
      * is behavior-identical (just faster). */
     bool     freed = false;
     uint64_t freed_ino = 0, freed_prior_gen = 0;
+    uint32_t freed_prior_cvers = 0;   /* L1/Larder: reuse seeds cvers=prior+1 */
     if (s->freed_count > 0u) {
         stm_status fs = in_find_freed(idx, dataset_id, s->freed_scan_lo,
-                                      &freed, &freed_ino, &freed_prior_gen);
+                                      &freed, &freed_ino, &freed_prior_gen,
+                                      &freed_prior_cvers);
         if (fs != STM_OK) {
             must_unlock(idx_lock(idx));
             return fs;
@@ -795,6 +803,11 @@ static stm_status in_alloc_common(stm_inode_index *idx, uint64_t dataset_id,
         chosen = freed_ino;
         in_init_value(&v, dataset_id, chosen, freed_prior_gen + 1u,
                       mode, uid, gid, nlink, flags);
+        /* L1/Larder: carry the content-version forward MONOTONICALLY so a
+         * reused ino never re-issues a (qid.path, qid.version) pair a guest
+         * may still have cached from the prior incarnation. in_init_value's
+         * memset seeded cvers=0 (correct for AllocFresh); reuse bumps. */
+        v.si_cvers = stm_store_le32(freed_prior_cvers + 1u);
     } else {
         /* AllocFresh path: ino = next_ino[ds]. UINT64_MAX is reserved
          * as the saturation sentinel (inode.h R69 P3-1). */
@@ -1259,10 +1272,18 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
     {
         struct stm_inode_value candidate = *in_value;
         memset(candidate.si_reserved, 0, sizeof candidate.si_reserved);
+        /* L1/Larder: the content-version is owned by this write path, not
+         * the caller. Preserve cur's cvers for the no-op compare (so an
+         * unchanged record stays byte-identical and is elided WITHOUT a
+         * bump), then bump it by one on a real write. Monotonic per inode;
+         * decoupled from si_gen (only the allocator bumps gen, on reuse). */
+        candidate.si_cvers = cur.si_cvers;
         if (memcmp(&candidate, &cur, sizeof candidate) == 0) {
             rc = STM_OK;
             goto out;
         }
+        candidate.si_cvers =
+            stm_store_le32(stm_load_le32(cur.si_cvers) + 1u);
         rc = in_engine_put(idx, dataset_id, ino, &candidate);
     }
 
