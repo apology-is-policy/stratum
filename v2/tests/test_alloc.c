@@ -137,6 +137,52 @@ STM_TEST(alloc_reserve_contiguous_runs) {
     unlink(g_tmp_path);
 }
 
+/* #40 A-F1: the O(1) stm_alloc_data_free_blocks counter must agree with the
+ * scanned stm_alloc_stats_get(...).data_free_blocks across EVERY transition --
+ * reserve, ref (refcount stays >=1), free-not-to-zero, free-to-pending,
+ * commit-sweep, re-reserve into the freed gap -- or the admission fast path
+ * drifts from ground truth. Non-vacuous: it compares the COUNTER to the SCAN,
+ * so any missed maintenance site diverges. */
+STM_TEST(alloc_free_blocks_counter_matches_scan) {
+    make_tmp("freeblk");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+#define CHECK_MATCHES()                                                        \
+    do {                                                                       \
+        stm_alloc_stats _st;                                                   \
+        STM_ASSERT_OK(stm_alloc_stats_get(a, &_st));                           \
+        STM_ASSERT_EQ(stm_alloc_data_free_blocks(a), _st.data_free_blocks);    \
+    } while (0)
+
+    CHECK_MATCHES();                                        /* fresh: free==total */
+
+    uint64_t p1 = 0, p2 = 0, p3 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p1));   CHECK_MATCHES();  /* alloc + */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, 0, &p2));  CHECK_MATCHES();
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p3));   CHECK_MATCHES();
+
+    STM_ASSERT_OK(stm_alloc_ref(a, p1));               CHECK_MATCHES();  /* rc 1->2: no change */
+    STM_ASSERT_OK(stm_alloc_free(a, p1, 1));           CHECK_MATCHES();  /* rc 2->1: still allocated */
+
+    STM_ASSERT_OK(stm_alloc_free(a, p2, 1));           CHECK_MATCHES();  /* rc->0: alloc -> pending */
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));             CHECK_MATCHES();  /* pending swept */
+
+    uint64_t p4 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, 0, &p4));  CHECK_MATCHES();  /* fills the gap: alloc + */
+
+    STM_ASSERT_OK(stm_alloc_free(a, p1, 3));           CHECK_MATCHES();  /* rc 1->0 */
+    STM_ASSERT_OK(stm_alloc_free(a, p3, 3));           CHECK_MATCHES();
+    STM_ASSERT_OK(stm_alloc_free(a, p4, 3));           CHECK_MATCHES();
+    STM_ASSERT_OK(stm_alloc_commit(a, 4));             CHECK_MATCHES();  /* all swept: free==total */
+
+#undef CHECK_MATCHES
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(alloc_reserve_fills_gap) {
     make_tmp("gap");
     stm_bdev *d = open_fresh_device();

@@ -3346,8 +3346,8 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
  * not after a false OK. The direct (large-write) path already reserves at
  * write time and skips this.
  *
- * Lock posture: caller holds fs->global; stm_alloc_stats_get takes only the
- * leaf alloc lock (fs->global -> alloc, the commit-path order). Under the
+ * Lock posture: caller holds fs->global; stm_alloc_data_free_blocks takes only
+ * the leaf alloc lock (fs->global -> alloc, the commit-path order). Under the
  * v1.0 serial-accept daemon (stratumd workers=1 default) the check + insert
  * are effectively atomic (no concurrent writer), so the invariant holds
  * strictly. Under workers>1 (SH-concurrent writers) two admissions can race
@@ -3358,10 +3358,11 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
 static stm_status fs_commit_on_pressure_locked(stm_fs *fs, uint64_t add)
 {
     if (!fs->alloc) return STM_OK;                        /* defensive */
-    stm_alloc_stats st;
-    if (stm_alloc_stats_get(fs->alloc, &st) != STM_OK) return STM_OK;
+    /* stm_alloc_data_free_blocks is an O(1) counter read (total - allocated -
+     * pending), NOT the full B-tree scan stm_alloc_stats_get does -- this runs
+     * on every buffered small write, so the fast path must not scan. */
     uint64_t buffered   = stm_dirty_buffer_total_bytes(fs->dirty_buffer);
-    uint64_t free_bytes = st.data_free_blocks * 4096ull;  /* data block = 4096 (alloc.c) */
+    uint64_t free_bytes = stm_alloc_data_free_blocks(fs->alloc) * 4096ull;
     if (buffered + add <= free_bytes) return STM_OK;       /* fits: fast path, batching kept */
 
     /* Would breach the pool free -> move the buffered bytes into the pool. */
@@ -3369,8 +3370,7 @@ static stm_status fs_commit_on_pressure_locked(stm_fs *fs, uint64_t add)
     if (fr != STM_OK) return fr;                           /* full even after reclaim: refuse */
 
     /* After the flush the pool consumed `buffered`; can this write still fit? */
-    if (stm_alloc_stats_get(fs->alloc, &st) != STM_OK) return STM_OK;
-    free_bytes = st.data_free_blocks * 4096ull;
+    free_bytes = stm_alloc_data_free_blocks(fs->alloc) * 4096ull;
     if (add > free_bytes) return STM_ENOSPC;               /* the write alone won't fit */
     return STM_OK;
 }

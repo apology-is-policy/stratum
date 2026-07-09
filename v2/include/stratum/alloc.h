@@ -342,6 +342,12 @@ stm_status stm_alloc_stats_get(const stm_alloc *a, stm_alloc_stats *out);
  * committing to sweep the PENDING list. Returns 0 for a NULL alloc. */
 uint64_t stm_alloc_pending_blocks(const stm_alloc *a);
 
+/* O(1) free data-block count: total - allocated - pending, all counter reads
+ * (no B-tree scan, unlike stm_alloc_stats_get). The admission fast-path read
+ * for the #40 pool-aware dirty-buffer check. Agrees exactly with
+ * stm_alloc_stats_get(...).data_free_blocks. Returns 0 for a NULL alloc. */
+uint64_t stm_alloc_data_free_blocks(const stm_alloc *a);
+
 /*
  * Query the entry at `paddr`. On success `*out_length_blocks` (if
  * non-NULL) gets the range's length and `*out_refcount` (if non-NULL)

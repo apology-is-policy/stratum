@@ -96,6 +96,10 @@ struct stm_alloc {
     pending_entry  *pending_head;
     uint64_t        pending_count;
     uint64_t        pending_blocks;
+    /* O(1) mirror of the sum of refcount>=1 range lengths, so the free-block
+     * count (total - allocated - pending) is a counter read, not a B-tree
+     * scan. Maintained at reserve (+), unref-to-0 (-), recovery-rebuild, init. */
+    uint64_t        allocated_blocks;
 
     /* Chunk 5d: most-recently-persisted tree root paddr. 0 if no tree
      * has been committed yet. Used to free the previous snapshot's
@@ -663,6 +667,7 @@ typedef struct {
     uint64_t        root_gen;      /* free_gen to stamp on emitted entries */
     uint64_t       *count_out;     /* &a->pending_count */
     uint64_t       *blocks_out;    /* &a->pending_blocks */
+    uint64_t       *allocated_out; /* &a->allocated_blocks (refcount>=1 sum) */
     stm_status      err;
 } alloc_pending_rebuild_ctx;
 
@@ -677,10 +682,13 @@ static int alloc_pending_rebuild_cb(const void *key, size_t key_len,
     }
     uint32_t length_blocks = 0, refcount = 0;
     decode_val(value, &length_blocks, &refcount);
-    if (refcount != 0) return 0;       /* live entry — skip */
     if (length_blocks == 0) {
         ctx->err = STM_ECORRUPT;
         return 1;
+    }
+    if (refcount != 0) {               /* live (allocated) entry */
+        *ctx->allocated_out += length_blocks;
+        return 0;
     }
 
     pending_entry *e = malloc(sizeof *e);
@@ -741,6 +749,7 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
             .root_gen   = root_gen,
             .count_out  = &a->pending_count,
             .blocks_out = &a->pending_blocks,
+            .allocated_out = &a->allocated_blocks,
             .err        = STM_OK,
         };
         stm_status rs = stm_btree_mt_scan(a->tree, NULL, 0, NULL, 0,
@@ -761,6 +770,7 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
             a->pending_head   = NULL;
             a->pending_count  = 0;
             a->pending_blocks = 0;
+            a->allocated_blocks = 0;
             pthread_mutex_unlock(&a->lock);
             return rs;
         }
@@ -1066,6 +1076,7 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
         pthread_mutex_unlock(&a->lock);
         return s;
     }
+    a->allocated_blocks += nblocks;   /* new refcount=1 range enters allocated */
 
     /* P5-3c: stamp this alloc's device_id into the top 16 bits of
      * the returned paddr. Callers that dereference this paddr (bdev
@@ -1152,6 +1163,7 @@ stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint64_t free_gen)
         a->pending_head          = new_entry;
         a->pending_count++;
         a->pending_blocks += length;
+        a->allocated_blocks -= length;   /* refcount hit 0: allocated -> pending */
     }
 
     a->tree_dirty = true;
@@ -1373,6 +1385,25 @@ uint64_t stm_alloc_pending_blocks(const stm_alloc *a)
     stm_alloc *ma = (stm_alloc *)a;
     pthread_mutex_lock(&ma->lock);
     uint64_t n = ma->pending_blocks;
+    pthread_mutex_unlock(&ma->lock);
+    return n;
+}
+
+uint64_t stm_alloc_data_free_blocks(const stm_alloc *a)
+{
+    if (!a) return 0;
+    /* O(1) free-block count: total - allocated - pending, all counter reads
+     * under a->lock -- the admission fast path's read, without the full
+     * B-tree scan stm_alloc_stats_get does. allocated_blocks + pending_blocks
+     * are maintained at the same reserve / unref-to-0 / commit-sweep sites, so
+     * this agrees exactly with stm_alloc_stats_get(...).data_free_blocks (the
+     * alloc.free_blocks_counter_matches_scan test is the drift guard). The
+     * subtraction is clamped defensively; a healthy allocator never wraps. */
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    uint64_t used = ma->allocated_blocks + ma->pending_blocks;
+    uint64_t n = (used <= ma->data_total_blocks)
+               ? (ma->data_total_blocks - used) : 0;
     pthread_mutex_unlock(&ma->lock);
     return n;
 }
