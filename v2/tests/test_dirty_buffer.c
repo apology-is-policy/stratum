@@ -515,4 +515,79 @@ STM_TEST(dbuf_arg_validation)
     stm_dirty_buffer_destroy(b);
 }
 
+/* #40 A-F2: the admission counts BLOCK footprint, not logical bytes. N 1-byte
+ * writes to distinct blocks are ~N bytes but N blocks -- the gap the old
+ * logical-byte check missed (tiny bytes, many blocks -> pool overrun). */
+STM_TEST(dbuf_footprint_counts_blocks_not_bytes)
+{
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+
+    enum { BLK = 4096u, N = 5 };   /* BLK == STM_UB_SIZE */
+    uint8_t one = 0x5a;
+    for (uint64_t i = 0; i < N; i++)
+        STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, i * BLK, 1, &one));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_bytes(b), (size_t)N);               /* N bytes */
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)N);  /* N blocks */
+
+    /* A write straddling a block boundary counts 2 blocks. */
+    uint8_t two[8] = {0};
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 2, BLK - 2u, 4, two)); /* [4094,4098): blocks 0+1 */
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)(N + 2));
+
+    stm_dirty_buffer_destroy(b);
+}
+
+/* #40 A-F3: insert_bounded admits up to the footprint bound, then refuses --
+ * atomically with the insert (under buf->mu), so a stale free snapshot cannot
+ * let it over-admit. An overwrite (footprint delta 0) still fits at the bound. */
+STM_TEST(dbuf_insert_bounded_refuses_over_footprint)
+{
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+
+    enum { BLK = 4096u, MAXF = 3 };
+    uint8_t one = 0x11;
+    for (uint64_t i = 0; i < MAXF; i++)   /* 3 distinct blocks: footprint 1,2,3 -- all fit */
+        STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, i * BLK, 1, &one, MAXF));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)MAXF);
+
+    /* The 4th distinct block would make footprint 4 > MAXF -> refused, no mutation. */
+    stm_status rc = stm_dirty_buffer_insert_bounded(b, 1, 1,
+                                                    (uint64_t)MAXF * BLK, 1, &one, MAXF);
+    STM_ASSERT_EQ((int)rc, (int)STM_ENOSPC);
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)MAXF);
+
+    /* Overwriting an already-resident block (delta 0) is admitted at the bound. */
+    uint8_t z = 0x22;
+    STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, 0, 1, &z, MAXF));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)MAXF);
+
+    stm_dirty_buffer_destroy(b);
+}
+
+/* #40: the footprint counter is consistent -- inserts, an overwrite, a second
+ * inode, and a full drain leave it at 0 (a missed maintenance site would
+ * leave residue). */
+STM_TEST(dbuf_footprint_zero_after_full_drain)
+{
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+
+    enum { BLK = 4096u };
+    uint8_t pad[64] = {0};
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 0, 10, pad));        /* block 0 */
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, BLK, 10, pad));      /* block 1 */
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 5, 20, pad));        /* overwrites into block 0 */
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 2, 9, 3u * BLK, 8, pad));  /* 2nd inode, block 3 */
+    STM_ASSERT_TRUE(stm_dirty_buffer_total_footprint_blocks(b) > 0);
+
+    drain_recorder rec = {0};
+    STM_ASSERT_OK(stm_dirty_buffer_drain_all(b, drain_record_cb, &rec));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)0);
+    STM_ASSERT_EQ(stm_dirty_buffer_total_bytes(b), (size_t)0);
+
+    stm_dirty_buffer_destroy(b);
+}
+
 STM_TEST_MAIN("test_dirty_buffer")

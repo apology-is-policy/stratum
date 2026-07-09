@@ -1,8 +1,10 @@
 # Commit-on-pressure: pool-aware dirty-buffer admission (#40 / #27)
 
-Status: design (scripture-first). Impl follows in a separate commit.
-Surface: `src/fs/fs.c` (the buffered small-write path). Audit-bearing
-(durability contract). Composes CF-4 C (reclaim-on-ENOSPC).
+Status: AS-BUILT (strict redesign, post-audit). Surface: `src/fs/fs.c` (the
+buffered small-write path) + `src/dirty_buffer/dirty_buffer.c` (block-footprint
+accounting + atomic admission) + `src/alloc/alloc.c` (the O(1) free-block
+counter). Audit-bearing (durability contract). Composes CF-4 C
+(reclaim-on-ENOSPC). See section 9 for the strict-redesign delta.
 
 ## 1. The gap (#40, the #27 breeding ground)
 
@@ -38,12 +40,20 @@ ever hold): there is no deferred-free to reclaim.
 exceeds the pool's free capacity, so a commit can always flush the buffer
 without `STM_ENOSPC`. Formally, at every write-accept point:
 
-    buffered_total_blocks <= data_free_blocks
+    buffered_footprint_blocks <= data_free_blocks
 
-where `buffered_total_blocks` = `stm_dirty_buffer_total_bytes` rounded up
-to blocks, and `data_free_blocks` = `total - allocated - pending` (the
-immediately-available pool blocks; `pending` = CF-4 C deferred-free,
-reclaimable by the flush's internal backstop).
+where `buffered_footprint_blocks` = the sum over every buffered range of the
+distinct `STM_UB_SIZE` blocks it touches (`blocks_spanned` in
+`dirty_buffer.c`) -- NOT logical bytes rounded up. This distinction is
+load-bearing: a flush reserves a whole block per touched block, so a 1-byte
+write to a fresh block costs a block; a logical-byte count under-counts the
+pool footprint of sub-block-scattered writes (the audit's A-F2). The
+per-range sum is conservative (two sub-block ranges in one block count it
+twice) -- safe, since it never under-counts, so admission never over-admits.
+`data_free_blocks` = `total - allocated - pending` (the immediately-available
+pool blocks; `pending` = CF-4 C deferred-free, reclaimable by the flush's
+internal backstop) -- read in O(1) via `stm_alloc_data_free_blocks` (a
+counter read, not a B-tree scan; the audit's A-F1).
 
 The invariant makes the durability contract sound: **an accepted buffered
 write is always committable.** A write that would breach it is either
@@ -54,31 +64,33 @@ re-reserves) or refused at write time with `STM_ENOSPC`.
 The direct path already upholds a stronger property (it reserves at write
 time), so it needs no change.
 
-## 3. Mechanism (commit-on-pressure)
+## 3. Mechanism (commit-on-pressure) -- atomic, block-granular
 
-In the buffered branch of `stm_fs_write`, BEFORE `stm_dirty_buffer_insert`:
+In the buffered branch of `stm_fs_write`, the admission is FUSED with the
+insert (`stm_dirty_buffer_insert_bounded`), not a separate pre-check:
 
-1. `buffered = stm_dirty_buffer_total_bytes(fs->dirty_buffer)`.
-2. `free = data_free_blocks * STM_BLOCK_SIZE` (via `stm_alloc_stats_get`
-   on device 0 -- the same accessor CF-4 C's reclaim path uses; O(1), a
-   locked read of three counters; lock order `fs->global -> alloc` is the
-   established commit-path order).
-3. If `blocks(buffered + len) > free_blocks`: the buffer would exceed the
-   pool. **Flush** (`fs_flush_all_locked`, which reclaims-on-ENOSPC
-   internally per CF-4 C, handling COW double-occupancy). On flush failure
-   (pool genuinely full even after reclaim) return the error -- the write
-   is refused at write time, NOT accepted-then-failed-at-commit. After a
-   successful flush the buffer is empty and the pool consumed `buffered`;
-   re-read `free`; if `blocks(len) > free_blocks` the write alone exceeds
-   the free pool -> return `STM_ENOSPC`.
-4. Proceed with the existing `stm_dirty_buffer_insert` + `BufferBoundedSize`
-   RAM retry (unchanged).
+1. `freeb = stm_alloc_data_free_blocks(fs->alloc)` -- an O(1) counter read
+   (`total - allocated - pending`), not a B-tree scan. Lock order
+   `fs->global -> alloc` is the established commit-path order.
+2. `stm_dirty_buffer_insert_bounded(buf, ..., freeb)`: under the buffer lock
+   (`buf->mu`), compute this insert's block-footprint delta and, IF
+   `total_footprint_blocks - removed + added > freeb`, return `STM_ENOSPC`
+   WITHOUT mutating; else insert. The check and the mutation are one critical
+   section, so two concurrent SH writers cannot both pass a stale free
+   snapshot and jointly over-admit (the audit's A-F3).
+3. On `STM_ENOSPC` (the RAM cap OR the pool-footprint breach), run the
+   `writeback.tla::BufferBoundedSize` dance: `fs_flush_ino_locked` (cheap),
+   re-read `freeb`, retry; still full -> `fs_flush_all_locked` (reclaims-
+   on-ENOSPC per CF-4 C), re-read, retry. After `flush_all` the buffer is
+   empty, so a final `STM_ENOSPC` means the write alone won't fit the drained
+   pool -- refused at write time, never accepted-then-failed-at-commit.
 
-**Fast path**: when the pool has room (`buffered + len <= free`, the
-common case), step 3 is skipped -- no extra flush, batching preserved. The
-extra cost per small write is one O(1) locked alloc-stats read; measured
-against the go-build harness to confirm it is negligible (the pool-free
-read is three counter loads under a leaf lock).
+**Fast path**: when the pool has room the footprint check passes inline (no
+extra flush, batching preserved). The per-write cost is one O(1) counter read
++ the footprint arithmetic already computed for the RAM-cap check -- no scan.
+(The pre-audit design read the pool-free via `stm_alloc_stats_get`, a full
+allocator B-tree scan per small write -- the audit's A-F1; the O(1) counter
+replaces it.)
 
 ## 4. Crash-safety (unchanged)
 
@@ -122,6 +134,17 @@ until `sync_commit` -- it only guarantees the commit can succeed.
 - Crash-inject: a commit after near-full admission leaves a mountable
   pool (compose with `test_crash_inject`).
 - Re-run `writeback.tla`'s existing buggy cfgs (the mechanism is touched).
+- **As-built (strict) additions**:
+  - `alloc.free_blocks_counter_matches_scan` -- the O(1) `data_free_blocks`
+    counter agrees with the scanned `stm_alloc_stats_get` across every
+    reserve/ref/free/commit transition (the A-F1 drift guard).
+  - `dbuf_footprint_counts_blocks_not_bytes` -- footprint counts distinct
+    blocks, not logical bytes (the A-F2 fix).
+  - `dbuf_insert_bounded_refuses_over_footprint` -- the atomic bounded insert
+    admits to the footprint bound then refuses (the A-F3 fix); an overwrite
+    (delta 0) still fits at the bound.
+  - `dbuf_footprint_zero_after_full_drain` -- the footprint counter is
+    consistent through insert/overwrite/second-inode/drain.
 
 ## 8. Rigor
 
@@ -131,3 +154,32 @@ is not extended (it models the buffer/flush/extent layer, not pool
 capacity), but its buggy cfgs are re-run. Audit-bearing: a focused
 holotype-reviewer prosecutor round over the admission path + the CF-4 C
 composition before merge, plus the host suite + the guest boot.
+
+## 9. As-built: the strict redesign (post-audit)
+
+The first landing (`6f2b93c`) worked for the GROSS over-commit but a focused
+Opus-4.8-max audit found three issues; the strict redesign (this doc's
+current form) closes all three as one coherent mechanism (an O(1) free read +
+block-granular, atomic admission -- the durability soundness falls out of
+doing the performance fix right):
+
+- **A-F1 (perf, load-bearing):** the "O(1)" pool-free read was actually a full
+  allocator B-tree scan per buffered small write (`stm_alloc_stats_get` derives
+  `allocated_blocks` only by scanning). Fixed by an O(1) `allocated_blocks`
+  counter in `stm_alloc` + `stm_alloc_data_free_blocks` (commit `6d9c0eb`).
+- **A-F2 (soundness, workers=1-reachable):** the admission compared logical
+  bytes to block-aligned pool space, so sub-block-scattered writes under-count
+  the footprint and could overrun the pool. Fixed by block-footprint
+  accounting in the dirty buffer (`blocks_spanned` + the per-inode/global
+  footprint counters).
+- **A-F3 (soundness, workers>1):** the check and the insert were separate lock
+  acquisitions, so concurrent SH writers could jointly over-admit. Fixed by
+  fusing the footprint check into the insert under `buf->mu`
+  (`stm_dirty_buffer_insert_bounded`).
+
+A-F4 (fail-open on a scan error) dissolved -- there is no scan. A-F5 (the
+`*4096` overflow) is gone -- the admission now compares blocks to blocks, no
+byte conversion. The residual conservatism (per-range footprint over-counts
+two sub-block ranges sharing a block) upholds the invariant strictly (never
+over-admits); an exact block-union footprint would only avoid a rare spurious
+refusal -- a v-next availability refinement, not a soundness item.

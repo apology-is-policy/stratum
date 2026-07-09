@@ -61,6 +61,7 @@ typedef struct stm_dbuf_inode {
     uint64_t                dataset_id;
     uint64_t                ino;
     size_t                  bytes;   /* sum of all ranges' len */
+    uint64_t                footprint_blocks; /* sum of ranges' blocks_spanned */
     stm_dbuf_range         *head;    /* sorted by off, ascending */
     struct stm_dbuf_inode  *bucket_next;
 } stm_dbuf_inode;
@@ -70,6 +71,7 @@ struct stm_dirty_buffer {
     size_t            inode_cap;
     size_t            global_cap;
     size_t            total_bytes;
+    uint64_t          total_footprint_blocks; /* #40: sum of inodes' footprint */
     stm_dbuf_inode   *buckets[STM_DBUF_BUCKETS];
 };
 
@@ -133,6 +135,7 @@ static void destroy_inode_locked(stm_dirty_buffer *buf, stm_dbuf_inode *e)
         r = n;
     }
     buf->total_bytes -= e->bytes;
+    buf->total_footprint_blocks -= e->footprint_blocks;
     free(e);
 }
 
@@ -141,6 +144,22 @@ static bool ranges_overlap(uint64_t a, uint64_t la,
 {
     if (la == 0 || lb == 0) return false;
     return a < b + lb && b < a + la;
+}
+
+/* Distinct STM_UB_SIZE blocks a byte range touches -- the pool footprint a
+ * flush reserves for it, since a write aligns to block boundaries (a 1-byte
+ * write to a fresh block costs a whole block). The #40 admission counts in
+ * these, not logical bytes. Per-range summing is CONSERVATIVE (two adjacent
+ * sub-block ranges in one block count it twice) -- safe: it never under-counts
+ * the footprint, so admission never over-admits; the only cost is a rare, at
+ * most spurious refusal on sub-block scatter within a block. len==0 -> 0. */
+static uint64_t blocks_spanned(uint64_t off, uint64_t len)
+{
+    if (len == 0) return 0;
+    uint64_t blk   = (uint64_t)STM_UB_SIZE;
+    uint64_t first = off / blk;
+    uint64_t last  = (off + len - 1u) / blk;
+    return last - first + 1u;
 }
 
 /* ───────────────────────────── public API ─────────────────────────── */
@@ -189,10 +208,11 @@ void stm_dirty_buffer_destroy(stm_dirty_buffer *buf)
     free(buf);
 }
 
-stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
-                                       uint64_t dataset_id, uint64_t ino,
-                                       uint64_t off, uint64_t len,
-                                       const void *data)
+static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
+                                        uint64_t dataset_id, uint64_t ino,
+                                        uint64_t off, uint64_t len,
+                                        const void *data,
+                                        uint64_t max_footprint_blocks)
 {
     if (!buf || !data) return STM_EINVAL;
     if (len == 0) return STM_EINVAL;
@@ -212,12 +232,14 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
     stm_dbuf_inode *e = find_inode_locked(buf, dataset_id, ino);
     stm_dbuf_range *first_ov = NULL, *last_ov = NULL;
     size_t dropped_bytes = 0;
+    uint64_t removed_footprint = 0;   /* #40: block-spans the overlapped ranges vacate */
     if (e) {
         for (stm_dbuf_range *r = e->head; r; r = r->next) {
             if (ranges_overlap(r->off, r->len, off, len)) {
                 if (!first_ov) first_ov = r;
                 last_ov = r;
                 dropped_bytes += r->len;
+                removed_footprint += blocks_spanned(r->off, r->len);
             }
         }
     }
@@ -226,6 +248,12 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
                             ? off - first_ov->off : 0u;
     uint64_t last_end = last_ov ? last_ov->off + last_ov->len : 0u;
     uint64_t tail_len = (last_ov && last_end > end) ? last_end - end : 0u;
+    /* #40: block-spans the head-remnant + new range + tail-remnant occupy.
+     * Per-range (each stored separately) so it matches the drain-time
+     * subtraction; conservative vs the contiguous union (see blocks_spanned). */
+    uint64_t added_footprint = blocks_spanned(off, len)
+        + (head_len > 0u ? blocks_spanned(first_ov->off, head_len) : 0u)
+        + (tail_len > 0u ? blocks_spanned(end, tail_len) : 0u);
 
     /* Per writeback.tla::BufferedWrite cap clauses: after superseding the
      * covered bytes (dropped minus the salvaged remnants) and adding
@@ -240,6 +268,18 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
         return STM_ENOSPC;
     }
     if (cur_global_bytes - superseded + len > buf->global_cap) {
+        pthread_mutex_unlock(&buf->mu);
+        return STM_ENOSPC;
+    }
+    /* #40 pool-aware admission: the buffered block footprint (what a flush
+     * reserves from the pool) must stay <= max_footprint_blocks (the pool's
+     * free blocks), so an accepted buffered write is always committable.
+     * Checked HERE -- atomically with the insert under buf->mu -- so two
+     * concurrent SH writers cannot both pass a stale free-space snapshot and
+     * jointly over-admit (the check-then-insert race). removed_footprint <=
+     * total_footprint_blocks always (the overlapped ranges are resident). */
+    if (buf->total_footprint_blocks - removed_footprint + added_footprint
+            > max_footprint_blocks) {
         pthread_mutex_unlock(&buf->mu);
         return STM_ENOSPC;
     }
@@ -299,6 +339,9 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
             *slot = r->next;
             e->bytes -= r->len;
             buf->total_bytes -= r->len;
+            uint64_t sp = blocks_spanned(r->off, r->len);
+            e->footprint_blocks         -= sp;
+            buf->total_footprint_blocks -= sp;
             free_range(r);
             continue;
         }
@@ -313,6 +356,8 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
     size_t added = (size_t)len + (size_t)head_len + (size_t)tail_len;
     e->bytes         += added;
     buf->total_bytes += added;
+    e->footprint_blocks         += added_footprint;
+    buf->total_footprint_blocks += added_footprint;
 
     pthread_mutex_unlock(&buf->mu);
     return STM_OK;
@@ -323,6 +368,28 @@ oom:
     if (tailr) { free(tailr->data); free(tailr); }
     pthread_mutex_unlock(&buf->mu);
     return STM_ENOMEM;
+}
+
+stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
+                                       uint64_t dataset_id, uint64_t ino,
+                                       uint64_t off, uint64_t len,
+                                       const void *data)
+{
+    /* Unbounded by pool footprint (the RAM caps still apply). The footprint
+     * counters are maintained regardless, so a later bounded insert sees a
+     * correct total. */
+    return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
+                                UINT64_MAX);
+}
+
+stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
+                                               uint64_t dataset_id, uint64_t ino,
+                                               uint64_t off, uint64_t len,
+                                               const void *data,
+                                               uint64_t max_footprint_blocks)
+{
+    return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
+                                max_footprint_blocks);
 }
 
 stm_status stm_dirty_buffer_lookup(stm_dirty_buffer *buf,
@@ -486,6 +553,9 @@ static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
             e->head = done->next;
             e->bytes         -= done->len;
             buf->total_bytes -= done->len;
+            uint64_t sp = blocks_spanned(done->off, done->len);
+            e->footprint_blocks         -= sp;
+            buf->total_footprint_blocks -= sp;
             free_range(done);
         }
     }
@@ -558,6 +628,15 @@ size_t stm_dirty_buffer_inode_bytes(stm_dirty_buffer *buf,
     size_t bytes = e ? e->bytes : 0;
     pthread_mutex_unlock(&buf->mu);
     return bytes;
+}
+
+uint64_t stm_dirty_buffer_total_footprint_blocks(stm_dirty_buffer *buf)
+{
+    if (!buf) return 0;
+    pthread_mutex_lock(&buf->mu);
+    uint64_t f = buf->total_footprint_blocks;
+    pthread_mutex_unlock(&buf->mu);
+    return f;
 }
 
 size_t stm_dirty_buffer_total_bytes(stm_dirty_buffer *buf)

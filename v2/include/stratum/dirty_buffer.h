@@ -110,6 +110,23 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
                                        const void *data);
 
 /*
+ * #40 pool-aware admission (block-granular + atomic). As stm_dirty_buffer_insert,
+ * but the insert is REFUSED with STM_ENOSPC if it would push the buffer's total
+ * block footprint (the pool space a flush will reserve -- distinct STM_UB_SIZE
+ * blocks touched, NOT logical bytes) past `max_footprint_blocks`. The footprint
+ * check runs atomically with the insert under the buffer lock, so two concurrent
+ * writers cannot both pass a stale free-space snapshot and jointly over-admit.
+ * Pass the pool's current free-block count (e.g. stm_alloc_data_free_blocks) as
+ * max_footprint_blocks; on STM_ENOSPC the caller flushes to free pool space,
+ * re-reads free, and retries. The per-inode + global RAM caps still apply.
+ */
+stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
+                                               uint64_t dataset_id, uint64_t ino,
+                                               uint64_t off, uint64_t len,
+                                               const void *data,
+                                               uint64_t max_footprint_blocks);
+
+/*
  * Read-overlay lookup: copies into `out_buf` the LONGEST contiguous
  * prefix of [off, off+len) that is covered by buffered ranges for
  * (dataset_id, ino), and sets *out_covered to the byte count copied.
@@ -249,6 +266,12 @@ size_t stm_dirty_buffer_inode_bytes(stm_dirty_buffer *buf,
  * Concurrency: takes buf->mu internally.
  */
 size_t stm_dirty_buffer_total_bytes(stm_dirty_buffer *buf);
+
+/*
+ * Return the total buffered block footprint across all inodes (the pool space
+ * a full flush reserves; #40 admission's currency). Concurrency: takes buf->mu.
+ */
+uint64_t stm_dirty_buffer_total_footprint_blocks(stm_dirty_buffer *buf);
 
 /*
  * Return true if the buffer holds any range for (dataset_id, ino).

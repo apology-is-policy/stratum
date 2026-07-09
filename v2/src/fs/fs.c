@@ -982,8 +982,6 @@ static bool fs_post_inode_free_reclaim_locked(stm_fs *fs);
  * a retry (wedges in place on a crash-equivalent commit failure). Used by
  * the reserve-bearing paths (write, the flush helpers, commit). */
 static bool fs_reclaim_on_enospc_locked(stm_fs *fs);
-/* #40: pool-aware dirty-buffer admission (commit-on-pressure). */
-static stm_status fs_commit_on_pressure_locked(stm_fs *fs, uint64_t add);
 
 static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
                        stm_alloc *a, stm_sync *sync, bool ro,
@@ -2074,31 +2072,37 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * stale buffered range doesn't shadow newer direct data
          * post-overlay. */
         if (len < STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
-            /* #40: pool-aware admission -- flush-or-refuse if this buffered
-             * write would push the buffered total past the pool's free
-             * space, so an accepted write is always committable (no false
-             * write-success that the commit then can't flush). */
-            stm_status cp = fs_commit_on_pressure_locked(fs, (uint64_t)len);
-            if (cp != STM_OK) return cp;
-            stm_status ic = stm_dirty_buffer_insert(fs->dirty_buffer,
-                                                        ds, ino, off,
-                                                        (uint64_t)len, buf);
+            /* #40 pool-aware admission (atomic, block-granular): admit the
+             * buffered write only if the buffered block FOOTPRINT would stay
+             * within the pool's free blocks -- so an accepted buffered write
+             * is always committable (no false write-success the commit then
+             * can't flush). The check runs under buf->mu WITH the insert, so
+             * concurrent SH writers cannot both pass a stale free snapshot and
+             * jointly over-admit. On STM_ENOSPC (RAM cap OR pool-footprint
+             * breach) run the writeback.tla::BufferBoundedSize dance -- flush
+             * this inode, re-read free, retry; still full -> flush every inode,
+             * re-read, retry -- then a true ENOSPC only if the write alone
+             * won't fit the drained pool. NULL alloc (test seam) -> unbounded
+             * by footprint, RAM caps still apply. */
+            uint64_t freeb = fs->alloc
+                ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
+            stm_status ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
+                                        ds, ino, off, (uint64_t)len, buf, freeb);
             if (ic == STM_ENOSPC) {
-                /* Per writeback.tla::BufferBoundedSize retry-on-ENOSPC
-                 * dance: flush this inode, retry; if still ENOSPC the
-                 * global cap is the issue, flush every inode + retry. */
                 stm_status fr = fs_flush_ino_locked(fs, ds, ino);
                 if (fr == STM_OK) {
-                    ic = stm_dirty_buffer_insert(fs->dirty_buffer,
-                                                    ds, ino, off,
-                                                    (uint64_t)len, buf);
+                    freeb = fs->alloc
+                        ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
+                    ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
+                                        ds, ino, off, (uint64_t)len, buf, freeb);
                 }
                 if (ic == STM_ENOSPC) {
                     fr = fs_flush_all_locked(fs);
                     if (fr == STM_OK) {
-                        ic = stm_dirty_buffer_insert(fs->dirty_buffer,
-                                                        ds, ino, off,
-                                                        (uint64_t)len, buf);
+                        freeb = fs->alloc
+                            ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
+                        ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
+                                        ds, ino, off, (uint64_t)len, buf, freeb);
                     }
                 }
             }
@@ -3336,44 +3340,6 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
     return true;
 }
 
-/* #40 commit-on-pressure: pool-aware dirty-buffer admission. Keep the total
- * buffered (uncommitted, not-yet-in-pool) bytes <= the data pool's free
- * space, so a commit can always flush the buffer without ENOSPC -- closing
- * the false-write-success gap where the buffered path accepts more than the
- * pool can ever commit (#40, the #27 breeding ground). On a would-breach,
- * drain the buffer into the pool now (fs_flush_all_locked reclaims-on-ENOSPC
- * internally per CF-4 C); a genuinely-full pool then refuses the write HERE,
- * not after a false OK. The direct (large-write) path already reserves at
- * write time and skips this.
- *
- * Lock posture: caller holds fs->global; stm_alloc_data_free_blocks takes only
- * the leaf alloc lock (fs->global -> alloc, the commit-path order). Under the
- * v1.0 serial-accept daemon (stratumd workers=1 default) the check + insert
- * are effectively atomic (no concurrent writer), so the invariant holds
- * strictly. Under workers>1 (SH-concurrent writers) two admissions can race
- * at the exact pool boundary and jointly over-admit; the commit's flush +
- * CF-4 C reclaim is the backstop for that bounded residual, and the CLEAR
- * over-commit (buffered >> free -- the #40 repro) is closed regardless.
- * See docs/commit-on-pressure-design.md. */
-static stm_status fs_commit_on_pressure_locked(stm_fs *fs, uint64_t add)
-{
-    if (!fs->alloc) return STM_OK;                        /* defensive */
-    /* stm_alloc_data_free_blocks is an O(1) counter read (total - allocated -
-     * pending), NOT the full B-tree scan stm_alloc_stats_get does -- this runs
-     * on every buffered small write, so the fast path must not scan. */
-    uint64_t buffered   = stm_dirty_buffer_total_bytes(fs->dirty_buffer);
-    uint64_t free_bytes = stm_alloc_data_free_blocks(fs->alloc) * 4096ull;
-    if (buffered + add <= free_bytes) return STM_OK;       /* fits: fast path, batching kept */
-
-    /* Would breach the pool free -> move the buffered bytes into the pool. */
-    stm_status fr = fs_flush_all_locked(fs);
-    if (fr != STM_OK) return fr;                           /* full even after reclaim: refuse */
-
-    /* After the flush the pool consumed `buffered`; can this write still fit? */
-    free_bytes = stm_alloc_data_free_blocks(fs->alloc) * 4096ull;
-    if (add > free_bytes) return STM_ENOSPC;               /* the write alone won't fit */
-    return STM_OK;
-}
 
 /* Common path for unlink / rmdir. `expect_dir` selects the type
  * filter: true → child must be S_IFDIR (rmdir), false → child must
