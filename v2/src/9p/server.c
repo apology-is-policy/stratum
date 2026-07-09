@@ -2132,14 +2132,21 @@ static stm_status h_lopen(stm_9p_server *s,
             ecode = status_to_errno(rc);
             goto phase_c;
         }
-        /* Refresh cached_gen — truncate may bump si_gen depending on
-         * the impl; defensive re-stat. */
+        /* Refresh gen/cvers after the truncate. The truncate bumped
+         * si_cvers (content changed), so the pre-truncate reply_cvers is
+         * now STALE -- unlike si_gen (unchanged by truncate), we cannot
+         * fall back to the pre-value. If the re-stat fails we cannot build
+         * a coherent Rlopen (its qid.version would lie about content), so
+         * fail the open with the stat error; the truncate stands and the
+         * client's retry re-stats fresh (L1a-2 F2). */
         struct stm_inode_value post;
         rc = stm_fs_stat(s->fs, ds, ino, &post);
-        if (rc == STM_OK) {
-            reply_gen   = (uint32_t)stm_load_le64(post.si_gen);
-            reply_cvers = qid_version(&post);
+        if (rc != STM_OK) {
+            ecode = status_to_errno(rc);
+            goto phase_c;
         }
+        reply_gen   = (uint32_t)stm_load_le64(post.si_gen);
+        reply_cvers = qid_version(&post);
     }
 
 phase_c:
@@ -2528,9 +2535,14 @@ static stm_status h_readdir(stm_9p_server *s,
          * emitter that keeps si_gen (child_gen) rather than si_cvers —
          * the readdir dirent record carries no cheap content-version, and
          * LARDER §11 defers readdir-caching to v1.x, so the guest never
-         * consumes a readdir qid's version. The deliberate L1a seam:
-         * switches to a content-version when readdir-caching lands (needs a
-         * per-child stat or a dirent-format field). */
+         * consumes a readdir qid's version at v1.0 (Linux v9fs uses the
+         * readdir qid only for qid.path + d_type, validating identity off
+         * getattr qids). The deliberate L1a-2 seam. *** L1b BLOCKER (F1):
+         * this MUST switch to a content-version (carry si_cvers in the
+         * dirent record, or per-child stat here) BEFORE the guest Larder
+         * caches readdir qids -- else a readdir qid.version (si_gen, ~0)
+         * contradicts the same inode's getattr qid.version (si_cvers) and
+         * the cache reads backwards. *** */
         uint8_t qt = STM_9P_QTFILE;
         if (one.child_type == STM_DT_DIR)      qt = STM_9P_QTDIR;
         else if (one.child_type == STM_DT_LNK) qt = STM_9P_QTSYMLINK;
