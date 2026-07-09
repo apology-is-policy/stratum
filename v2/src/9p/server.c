@@ -2532,17 +2532,28 @@ static stm_status h_readdir(stm_9p_server *s,
             break;
         }
         /* qid: type from STM_DT_ → STM_9P_QT_. NOTE: this is the ONE qid
-         * emitter that keeps si_gen (child_gen) rather than si_cvers —
-         * the readdir dirent record carries no cheap content-version, and
-         * LARDER §11 defers readdir-caching to v1.x, so the guest never
-         * consumes a readdir qid's version at v1.0 (Linux v9fs uses the
-         * readdir qid only for qid.path + d_type, validating identity off
-         * getattr qids). The deliberate L1a-2 seam. *** L1b BLOCKER (F1):
-         * this MUST switch to a content-version (carry si_cvers in the
-         * dirent record, or per-child stat here) BEFORE the guest Larder
-         * caches readdir qids -- else a readdir qid.version (si_gen, ~0)
-         * contradicts the same inode's getattr qid.version (si_cvers) and
-         * the cache reads backwards. *** */
+         * emitter that keeps si_gen (child_gen) rather than si_cvers. The
+         * dirent record stores child_gen as a LINK-TIME si_gen snapshot
+         * (dirent.h:138); stm_fs_readdir does NOT read the child inode, so
+         * there is no cheap fresh content-version available here.
+         *
+         * L1a-2 audit F1 -- ground-truth-corrected disposition (L1b): this
+         * seam is closed on the GUEST side, not here. The Larder never
+         * populates its cache from a readdir qid (LARDER-DESIGN §3.2/§11 +
+         * specs/fs_cache.tla "MODELING ASSUMPTIONS"): it caches only from
+         * getattr/walk_attrs qids (which carry a true si_cvers), so a
+         * readdir version can never read backwards against a getattr
+         * si_cvers for the same inode. No server change is needed at v1.0
+         * (v9fs uses the readdir qid only for qid.path + d_type).
+         *
+         * The two server-side "fixes" the audit floated both FAIL on ground
+         * truth: carrying si_cvers in the dirent record is an on-disk format
+         * break AND a stale snapshot (it never tracks the child's later
+         * content writes); a per-child stat here is a perf regression on the
+         * go-build readdir path (readdir is 30%+ of the op mix). The correct
+         * v1.x readdir-listing cache needs a per-child content-version
+         * REVALIDATION (a batched getattr/POUNCE over the listing at open),
+         * designed with that cache -- not a dirent snapshot. */
         uint8_t qt = STM_9P_QTFILE;
         if (one.child_type == STM_DT_DIR)      qt = STM_9P_QTDIR;
         else if (one.child_type == STM_DT_LNK) qt = STM_9P_QTSYMLINK;
