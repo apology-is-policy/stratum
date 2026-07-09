@@ -526,6 +526,11 @@ STM_TEST(alloc_open_after_commit_is_blank) {
     STM_ASSERT_OK(stm_alloc_load_tree_at(a2, root, /*gen=*/ 1, root_csum));
     STM_ASSERT_OK(stm_alloc_stats_get(a2, &st));
     STM_ASSERT_EQ(st.n_allocated_ranges, 1u);
+    /* #40: the O(1) allocated_blocks counter is REBUILT from disk here
+     * (alloc_pending_rebuild_cb sums refcount>=1 lengths) -- a load-bearing
+     * production path (every remount of a non-empty pool feeds the admission
+     * counter). Assert the rebuilt O(1) free-block count matches the scan. */
+    STM_ASSERT_EQ(stm_alloc_data_free_blocks(a2), st.data_free_blocks);
 
     stm_alloc_close(a2);
     stm_bdev_close(d2);

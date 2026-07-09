@@ -682,6 +682,12 @@ static int alloc_pending_rebuild_cb(const void *key, size_t key_len,
     }
     uint32_t length_blocks = 0, refcount = 0;
     decode_val(value, &length_blocks, &refcount);
+    /* #40: the length==0 check now precedes the refcount branch, so a
+     * length==0 LIVE (refcount>=1) entry fails the mount (STM_ECORRUPT) where
+     * it was previously silently skipped. Fail-CLOSED improvement: a length==0
+     * entry is genuinely corrupt (reserve rejects nblocks==0), and skipping it
+     * would leave reserve_scan_cb's cursor un-advanced -> a later reserve
+     * overlaps it -> data corruption. Refusing to mount is safer. */
     if (length_blocks == 0) {
         ctx->err = STM_ECORRUPT;
         return 1;

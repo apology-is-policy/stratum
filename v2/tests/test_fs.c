@@ -755,10 +755,11 @@ STM_TEST(dcache_cow_overwrite_serves_new_plaintext) {
  * at commit. The writes stay under the 8 MiB per-inode + 256 MiB global RAM
  * caps, so PRE-FIX nothing forces a flush and every write returns OK (the
  * false success #40 reports -- "38.6 MiB OK'd into an 8 MiB pool"); the
- * commit would then ENOSPC. WITH commit-on-pressure the write that would
- * push the buffered total past data_free is refused here. Non-vacuous:
- * neutering fs_commit_on_pressure_locked to `return STM_OK` makes every
- * write succeed -> STM_ASSERT(refused) fails. */
+ * commit would then ENOSPC. WITH commit-on-pressure the write whose block
+ * footprint would push the buffered total past data_free is refused here.
+ * Non-vacuous: passing UINT64_MAX as the insert_bounded footprint limit
+ * (or reverting to the unbounded stm_dirty_buffer_insert) makes every write
+ * succeed -> STM_ASSERT(refused) fails. */
 STM_TEST(fs_cop_fresh_overcommit_refused) {
     make_tmp("cop_overcommit");
     stm_fs_format_opts fopts = default_format_opts();
