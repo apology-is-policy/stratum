@@ -144,6 +144,14 @@ typedef struct p9_fid {
     uint64_t    dataset_id;
     uint64_t    ino;
     uint32_t    cached_gen;     /* fid.tla cached_gen — si_gen at bind time */
+    uint32_t    cached_cvers;   /* content-version snapshot (L1/Larder). The
+                                 * si_cvers partner to cached_gen: refreshed
+                                 * wherever cached_gen is (from a fresh stat),
+                                 * emitted as qid.version. A bind-time snapshot,
+                                 * NOT a live si_cvers mirror — like cached_gen,
+                                 * every wire emission immediately follows the
+                                 * stat that set it, so a between-op drift is
+                                 * never observed on the wire. */
     uint8_t     qid_type;       /* STM_9P_QTDIR / QTFILE / QTSYMLINK */
     bool        is_open;
     uint32_t    open_flags;     /* Linux O_* from Tlopen */
@@ -349,8 +357,11 @@ static uint32_t status_to_errno(stm_status s)
 /* qid.path = (dataset_id << 32) | (ino & 0xFFFFFFFF). Each (ds, ino)
  * pair has a unique 64-bit path while ino fits in 32 bits. The
  * (path, version) tuple is unique-across-time given inode.tla's
- * TupleUniqueAllTime contract — version (= si_gen) strictly
- * increases on inode reuse.
+ * TupleUniqueAllTime contract. NOTE: qid.version on the wire is the
+ * CONTENT-version si_cvers (see qid_version below), not si_gen; both are
+ * monotonic-across-ino-reuse (inode.tla CversUniqueAllTime + the si_gen
+ * reuse bump), so the (path, version) tuple stays unique-across-time
+ * either way. si_gen remains the fid cached_gen staleness key.
  *
  * (R92 P3-3) Limitation: the inode allocator allows ino up to
  * UINT64_MAX, but this encoding truncates to 32 bits. Distinct
@@ -364,6 +375,16 @@ static uint32_t status_to_errno(stm_status s)
  */
 static inline uint64_t qid_path(uint64_t dataset_id, uint64_t ino) {
     return (dataset_id << 32) | (ino & 0xFFFFFFFFu);
+}
+
+/* qid.version = the inode's content-version (si_cvers), NOT si_gen. si_gen is
+ * the lifecycle generation (bumps only on free+ino-reuse) and stays the fid
+ * cached_gen staleness key; si_cvers bumps on every content/metadata mutation
+ * (the single stm_inode_set choke point) and is the L1/Larder close-to-open
+ * coherence key the guest cache compares. Old pools read si_cvers==0 (a valid
+ * starting version) — codec-transparent, no on-disk format break. */
+static inline uint32_t qid_version(const struct stm_inode_value *iv) {
+    return stm_load_le32(iv->si_cvers);
 }
 
 static uint8_t qid_type_from_mode(uint32_t mode)
@@ -740,6 +761,7 @@ static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
                                             const char *path, size_t path_len,
                                             uint64_t *out_ino,
                                             uint32_t *out_gen,
+                                            uint32_t *out_cvers,
                                             uint8_t  *out_qt)
 {
     char   canon[STM_9P_NS_PATH_MAX + 1u];
@@ -770,9 +792,10 @@ static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
     struct stm_inode_value iv;
     rc = stm_fs_stat(s->fs, ds, cur_ino, &iv);
     if (rc != STM_OK) return rc;
-    if (out_ino) *out_ino = cur_ino;
-    if (out_gen) *out_gen = (uint32_t)stm_load_le64(iv.si_gen);
-    if (out_qt)  *out_qt  = qid_type_from_mode(stm_load_le32(iv.si_mode));
+    if (out_ino)   *out_ino   = cur_ino;
+    if (out_gen)   *out_gen   = (uint32_t)stm_load_le64(iv.si_gen);
+    if (out_cvers) *out_cvers = qid_version(&iv);
+    if (out_qt)    *out_qt    = qid_type_from_mode(stm_load_le32(iv.si_mode));
     return STM_OK;
 }
 
@@ -781,10 +804,12 @@ static stm_status ns_walk_abs_path(stm_9p_server *s, uint64_t ds,
                                        const char *path, size_t path_len,
                                        uint64_t *out_ino,
                                        uint32_t *out_gen,
+                                       uint32_t *out_cvers,
                                        uint8_t  *out_qt)
 {
     return ns_walk_abs_path_from(s, ds, /* start_ino */ 1u,
-                                    path, path_len, out_ino, out_gen, out_qt);
+                                    path, path_len, out_ino, out_gen,
+                                    out_cvers, out_qt);
 }
 
 /* Cap on entries in a single Tattach spec string. Spec entries are
@@ -902,7 +927,7 @@ static stm_status apply_attach_spec(stm_9p_server *s,
         }
 
         uint64_t src_ino = 0;
-        rc = ns_walk_abs_path(s, ds, src, src_len, &src_ino, NULL, NULL);
+        rc = ns_walk_abs_path(s, ds, src, src_len, &src_ino, NULL, NULL, NULL);
         if (rc != STM_OK) goto fail;
 
         char   canon_tgt[STM_9P_NS_PATH_MAX + 1u];
@@ -1144,6 +1169,7 @@ static stm_status h_attach(stm_9p_server *s,
      * ANAME_ABS_PATH walks the path and binds to the resolved ino. */
     uint64_t bound_ino     = 1u;
     uint32_t bound_gen     = 0;
+    uint32_t bound_cvers   = 0;
     uint8_t  bound_qt      = 0;
     uint64_t bound_dataset = s->root_dataset;
 
@@ -1151,7 +1177,7 @@ static stm_status h_attach(stm_9p_server *s,
         stm_status rc = ns_walk_abs_path(s, s->root_dataset,
                                               aname, alen,
                                               &bound_ino, &bound_gen,
-                                              &bound_qt);
+                                              &bound_cvers, &bound_qt);
         if (rc != STM_OK) {
             fid_release_locked(s, f);
             return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
@@ -1183,6 +1209,7 @@ static stm_status h_attach(stm_9p_server *s,
         bound_dataset = child_ds;
         bound_ino     = 1u;
         bound_gen     = (uint32_t)stm_load_le64(root_iv.si_gen);
+        bound_cvers   = qid_version(&root_iv);
         bound_qt      = qid_type_from_mode(stm_load_le32(root_iv.si_mode));
     } else {
         /* DEFAULT and SPEC both root at ino==1 of the server's root dataset. */
@@ -1192,15 +1219,17 @@ static stm_status h_attach(stm_9p_server *s,
             fid_release_locked(s, f);
             return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
         }
-        bound_ino = 1u;
-        bound_gen = (uint32_t)stm_load_le64(root_iv.si_gen);
-        bound_qt  = qid_type_from_mode(stm_load_le32(root_iv.si_mode));
+        bound_ino   = 1u;
+        bound_gen   = (uint32_t)stm_load_le64(root_iv.si_gen);
+        bound_cvers = qid_version(&root_iv);
+        bound_qt    = qid_type_from_mode(stm_load_le32(root_iv.si_mode));
     }
 
-    f->dataset_id = bound_dataset;
-    f->ino        = bound_ino;
-    f->cached_gen = bound_gen;
-    f->qid_type   = bound_qt;
+    f->dataset_id   = bound_dataset;
+    f->ino          = bound_ino;
+    f->cached_gen   = bound_gen;
+    f->cached_cvers = bound_cvers;
+    f->qid_type     = bound_qt;
 
     /* The (conn_root_dataset, conn_root_ino) pair pins this fid's
      * connection-namespace root. For the default + spec aname kinds
@@ -1239,7 +1268,7 @@ static stm_status h_attach(stm_9p_server *s,
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RATTACH;
     p9l_p16(wp, tag); wp += 2;
-    p9l_pqid(wp, f->qid_type, f->cached_gen,
+    p9l_pqid(wp, f->qid_type, f->cached_cvers,
               qid_path(f->dataset_id, f->ino));
     wp += STM_9P_QID_SIZE;
     resp_finish(resp, resp_len, wp);
@@ -1361,6 +1390,7 @@ struct walk_cursor {
     uint64_t ds;
     uint64_t ino;
     uint32_t gen;
+    uint32_t cvers;         /* content-version — the wire qid.version */
     uint8_t  qt;
     char     path[STM_9P_NS_PATH_MAX + 1u];
     size_t   path_len;
@@ -1447,7 +1477,7 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
             rc = ns_walk_abs_path_from(s, conn_root_ds,
                                           conn_root_ino,
                                           new_path, new_path_len,
-                                          &next_ino, NULL, NULL);
+                                          &next_ino, NULL, NULL, NULL);
             if (rc != STM_OK) break;
             next_ds = conn_root_ds;
         } else {
@@ -1465,16 +1495,17 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
         rc = stm_fs_stat(s->fs, next_ds, next_ino, &next_iv);
         if (rc != STM_OK) break;
 
-        cur->ds  = next_ds;
-        cur->ino = next_ino;
-        cur->gen = (uint32_t)stm_load_le64(next_iv.si_gen);
-        cur->qt  = qid_type_from_mode(stm_load_le32(next_iv.si_mode));
+        cur->ds    = next_ds;
+        cur->ino   = next_ino;
+        cur->gen   = (uint32_t)stm_load_le64(next_iv.si_gen);
+        cur->cvers = qid_version(&next_iv);
+        cur->qt    = qid_type_from_mode(stm_load_le32(next_iv.si_mode));
         memcpy(cur->path, new_path, new_path_len);
         cur->path[new_path_len] = '\0';
         cur->path_len = new_path_len;
 
         p9l_pqid(qids + nwqid * STM_9P_QID_SIZE,
-                  cur->qt, cur->gen, qid_path(cur->ds, cur->ino));
+                  cur->qt, cur->cvers, qid_path(cur->ds, cur->ino));
         if (ivs_out)
             ivs_out[nwqid] = next_iv;
         nwqid++;
@@ -1496,9 +1527,11 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
  * element (POUNCE) — the two MUST stay byte-identical, so both pack
  * through here. qid13 = the 13-byte packed qid (the caller owns the
  * qid encoding — h_getattr from the fid snapshot, Twalkgetattr from
- * the walk loop's per-step pack). rdev / data_version are zero and
- * blksize is the synthetic 4096, exactly as h_getattr has always
- * replied; gen is the u32-truncated si_gen (the fid cached_gen width).
+ * the walk loop's per-step pack). rdev is zero and blksize is the
+ * synthetic 4096, exactly as h_getattr has always replied; the `gen`
+ * attr is the u32-truncated si_gen (the fid cached_gen width), while
+ * data_version carries si_cvers (== qid.version) so Rgetattr's content
+ * field stays coherent with the qid the caller packed.
  * Returns wp advanced by STM_9P_GETATTR_BODY_SIZE. */
 static uint8_t *pack_getattr_body(uint8_t *wp, uint64_t valid,
                                   const uint8_t *qid13,
@@ -1524,7 +1557,7 @@ static uint8_t *pack_getattr_body(uint8_t *wp, uint64_t valid,
     p9l_p64(wp, stm_load_le64(iv->si_btime_sec));            wp += 8;
     p9l_p64(wp, (uint64_t)stm_load_le32(iv->si_btime_nsec)); wp += 8;
     p9l_p64(wp, (uint64_t)(uint32_t)stm_load_le64(iv->si_gen)); wp += 8;
-    p9l_p64(wp, 0u); wp += 8;               /* data_version unsupported */
+    p9l_p64(wp, (uint64_t)qid_version(iv)); wp += 8;  /* data_version = si_cvers */
     return wp;
 }
 
@@ -1587,11 +1620,12 @@ static int walk_bind_locked(stm_9p_server *s, p9_fid *f,
         nf->open_iounit = 0;
     }
 
-    nf->dataset_id = cur->ds;
-    nf->ino        = cur->ino;
-    nf->cached_gen = cur->gen;      /* fid.tla cached_gen snapshot */
-    nf->qid_type   = cur->qt;
-    nf->kind       = P9_FID_NODE;
+    nf->dataset_id  = cur->ds;
+    nf->ino         = cur->ino;
+    nf->cached_gen  = cur->gen;      /* fid.tla cached_gen snapshot */
+    nf->cached_cvers = cur->cvers;   /* content-version snapshot (L1/Larder) */
+    nf->qid_type    = cur->qt;
+    nf->kind        = P9_FID_NODE;
 
     /* Inherit the connection-namespace root from the source fid. All
      * fids on the same connection share the same conn_root, so a
@@ -1701,10 +1735,11 @@ static stm_status h_walk(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
 
     struct walk_cursor cur;
-    cur.ds  = f->dataset_id;
-    cur.ino = f->ino;
-    cur.gen = f->cached_gen;
-    cur.qt  = f->qid_type;
+    cur.ds    = f->dataset_id;
+    cur.ino   = f->ino;
+    cur.gen   = f->cached_gen;
+    cur.cvers = f->cached_cvers;
+    cur.qt    = f->qid_type;
     memcpy(cur.path, f->ns_path, f->ns_path_len);
     cur.path[f->ns_path_len] = '\0';
     cur.path_len = f->ns_path_len;
@@ -1858,10 +1893,11 @@ static stm_status h_walkgetattr(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
 
     struct walk_cursor cur;
-    cur.ds  = f->dataset_id;
-    cur.ino = f->ino;
-    cur.gen = f->cached_gen;
-    cur.qt  = f->qid_type;
+    cur.ds    = f->dataset_id;
+    cur.ino   = f->ino;
+    cur.gen   = f->cached_gen;
+    cur.cvers = f->cached_cvers;
+    cur.qt    = f->qid_type;
     memcpy(cur.path, f->ns_path, f->ns_path_len);
     cur.path[f->ns_path_len] = '\0';
     cur.path_len = f->ns_path_len;
@@ -1969,14 +2005,14 @@ static stm_status h_getattr(stm_9p_server *s,
 
     /* The actual returned `valid` mask is the intersection of what the
      * client requested with what we can fill. We can fill all of
-     * STM_9P_GETATTR_BASIC + BTIME + GEN. RDEV / DATA_VERSION return
-     * zero (no device numbers; data_version is unsupported). The body
+     * STM_9P_GETATTR_BASIC + BTIME + GEN + DATA_VERSION. RDEV returns
+     * zero (no device numbers); data_version carries si_cvers. The body
      * itself packs through pack_getattr_body (shared with Twalkgetattr;
      * iv.si_gen == gen here — verify_fresh_snapshot proved it). */
     uint64_t valid = request_mask & STM_9P_GETATTR_ALL;
     uint8_t  qid13[STM_9P_QID_SIZE];
     p9l_pqid(qid13, qid_type_from_mode(stm_load_le32(iv.si_mode)),
-              gen, qid_path(ds, ino));
+              qid_version(&iv), qid_path(ds, ino));
 
     uint32_t need = STM_9P_HDR_SIZE + STM_9P_GETATTR_BODY_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -2038,6 +2074,7 @@ static stm_status h_lopen(stm_9p_server *s,
     /* (b) unlocked: verify + type/flag gates + optional O_TRUNC. */
     uint32_t ecode     = 0;         /* != 0 -> Rlerror(ecode) */
     uint32_t reply_gen = gen;       /* refreshed if O_TRUNC bumps si_gen */
+    uint32_t reply_cvers = 0;       /* si_cvers -> qid.version (fresh below) */
     uint32_t mode      = 0;
 
     struct stm_inode_value iv;
@@ -2046,6 +2083,7 @@ static stm_status h_lopen(stm_9p_server *s,
         ecode = status_to_errno(rc);
         goto phase_c;
     }
+    reply_cvers = qid_version(&iv);
 
     mode = stm_load_le32(iv.si_mode);
     bool is_dir = ((mode & 0170000u) == 0040000u);
@@ -2098,8 +2136,10 @@ static stm_status h_lopen(stm_9p_server *s,
          * the impl; defensive re-stat. */
         struct stm_inode_value post;
         rc = stm_fs_stat(s->fs, ds, ino, &post);
-        if (rc == STM_OK)
-            reply_gen = (uint32_t)stm_load_le64(post.si_gen);
+        if (rc == STM_OK) {
+            reply_gen   = (uint32_t)stm_load_le64(post.si_gen);
+            reply_cvers = qid_version(&post);
+        }
     }
 
 phase_c:
@@ -2113,6 +2153,7 @@ phase_c:
         f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino) {
         if (reply_gen != gen)           /* O_TRUNC re-stat bumped si_gen */
             f->cached_gen = reply_gen;
+        f->cached_cvers = reply_cvers;  /* fresh content-version (L1/Larder) */
         f->is_open     = true;
         f->open_flags  = flags;
         f->open_iounit = iounit;
@@ -2126,7 +2167,7 @@ phase_c:
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RLOPEN;
     p9l_p16(wp, tag); wp += 2;
-    p9l_pqid(wp, qid_type_from_mode(mode), reply_gen, qid_path(ds, ino));
+    p9l_pqid(wp, qid_type_from_mode(mode), reply_cvers, qid_path(ds, ino));
     wp += STM_9P_QID_SIZE;
     p9l_p32(wp, (uint32_t)iounit); wp += 4;
     resp_finish(resp, resp_len, wp);
@@ -2483,7 +2524,13 @@ static stm_status h_readdir(stm_9p_server *s,
             cursor = pre_cursor;
             break;
         }
-        /* qid: type from STM_DT_ → STM_9P_QT_ */
+        /* qid: type from STM_DT_ → STM_9P_QT_. NOTE: this is the ONE qid
+         * emitter that keeps si_gen (child_gen) rather than si_cvers —
+         * the readdir dirent record carries no cheap content-version, and
+         * LARDER §11 defers readdir-caching to v1.x, so the guest never
+         * consumes a readdir qid's version. The deliberate L1a seam:
+         * switches to a content-version when readdir-caching lands (needs a
+         * per-child stat or a dirent-format field). */
         uint8_t qt = STM_9P_QTFILE;
         if (one.child_type == STM_DT_DIR)      qt = STM_9P_QTDIR;
         else if (one.child_type == STM_DT_LNK) qt = STM_9P_QTSYMLINK;
@@ -2594,6 +2641,7 @@ static stm_status h_lcreate(stm_9p_server *s,
     uint32_t ecode      = 0;
     uint64_t new_ino    = 0;
     uint32_t new_gen    = 0;
+    uint32_t new_cvers  = 0;
     uint8_t  new_qt     = 0;
     char    *new_ns     = NULL;
     size_t   new_ns_len = 0;
@@ -2620,8 +2668,9 @@ static stm_status h_lcreate(stm_9p_server *s,
         ecode = status_to_errno(rc);
         goto phase_c;
     }
-    new_gen = (uint32_t)stm_load_le64(iv.si_gen);
-    new_qt  = qid_type_from_mode(stm_load_le32(iv.si_mode));
+    new_gen   = (uint32_t)stm_load_le64(iv.si_gen);
+    new_cvers = qid_version(&iv);
+    new_qt    = qid_type_from_mode(stm_load_le32(iv.si_mode));
 
     /* Compose the new logical ns_path for the repurposed fid (parent's
      * ns_path + "/" + name, canonicalized) BEFORE mutating fid state.
@@ -2658,12 +2707,13 @@ phase_c:
     if (ecode == 0 &&
         f->kind == P9_FID_NODE && f->dataset_id == ds &&
         f->ino == parent_ino) {
-        f->ino        = new_ino;
-        f->cached_gen = new_gen;
-        f->qid_type   = new_qt;
-        f->is_open    = true;
-        f->open_flags = flags;
-        f->open_iounit = iounit;
+        f->ino          = new_ino;
+        f->cached_gen   = new_gen;
+        f->cached_cvers = new_cvers;
+        f->qid_type     = new_qt;
+        f->is_open      = true;
+        f->open_flags   = flags;
+        f->open_iounit  = iounit;
         if (new_ns) {
             free(f->ns_path);
             f->ns_path     = new_ns;
@@ -2681,7 +2731,7 @@ phase_c:
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RLCREATE;
     p9l_p16(wp, tag); wp += 2;
-    p9l_pqid(wp, new_qt, new_gen, qid_path(ds, new_ino));
+    p9l_pqid(wp, new_qt, new_cvers, qid_path(ds, new_ino));
     wp += STM_9P_QID_SIZE;
     p9l_p32(wp, (uint32_t)iounit); wp += 4;
     resp_finish(resp, resp_len, wp);
@@ -2736,9 +2786,9 @@ static stm_status h_mkdir(stm_9p_server *s,
     phase_b_enter(s, STM_9P_TMKDIR, tag);
 
     /* (b) unlocked. */
-    uint32_t ecode   = 0;
-    uint64_t new_ino = 0;
-    uint32_t new_gen = 0;
+    uint32_t ecode     = 0;
+    uint64_t new_ino   = 0;
+    uint32_t new_cvers = 0;         /* si_cvers -> qid.version */
 
     stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
     if (rc == STM_OK)
@@ -2750,7 +2800,7 @@ static stm_status h_mkdir(stm_9p_server *s,
         struct stm_inode_value iv;
         rc = stm_fs_stat(s->fs, ds, new_ino, &iv);
         if (rc == STM_OK)
-            new_gen = (uint32_t)stm_load_le64(iv.si_gen);
+            new_cvers = qid_version(&iv);
     }
     if (rc != STM_OK) ecode = status_to_errno(rc);
 
@@ -2765,7 +2815,7 @@ static stm_status h_mkdir(stm_9p_server *s,
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RMKDIR;
     p9l_p16(wp, tag); wp += 2;
-    p9l_pqid(wp, STM_9P_QTDIR, new_gen, qid_path(ds, new_ino));
+    p9l_pqid(wp, STM_9P_QTDIR, new_cvers, qid_path(ds, new_ino));
     wp += STM_9P_QID_SIZE;
     resp_finish(resp, resp_len, wp);
     return STM_OK;
@@ -2910,9 +2960,9 @@ static stm_status h_symlink(stm_9p_server *s,
     phase_b_enter(s, STM_9P_TSYMLINK, tag);
 
     /* (b) unlocked. */
-    uint32_t ecode   = 0;
-    uint64_t new_ino = 0;
-    uint32_t new_gen = 0;
+    uint32_t ecode     = 0;
+    uint64_t new_ino   = 0;
+    uint32_t new_cvers = 0;         /* si_cvers -> qid.version */
 
     stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
     if (rc == STM_OK)
@@ -2924,7 +2974,7 @@ static stm_status h_symlink(stm_9p_server *s,
         struct stm_inode_value iv;
         rc = stm_fs_stat(s->fs, ds, new_ino, &iv);
         if (rc == STM_OK)
-            new_gen = (uint32_t)stm_load_le64(iv.si_gen);
+            new_cvers = qid_version(&iv);
     }
     if (rc != STM_OK) ecode = status_to_errno(rc);
 
@@ -2939,7 +2989,7 @@ static stm_status h_symlink(stm_9p_server *s,
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RSYMLINK;
     p9l_p16(wp, tag); wp += 2;
-    p9l_pqid(wp, STM_9P_QTSYMLINK, new_gen, qid_path(ds, new_ino));
+    p9l_pqid(wp, STM_9P_QTSYMLINK, new_cvers, qid_path(ds, new_ino));
     wp += STM_9P_QID_SIZE;
     resp_finish(resp, resp_len, wp);
     return STM_OK;
@@ -3226,6 +3276,7 @@ static stm_status h_setattr(stm_9p_server *s,
     uint32_t ecode = 0;
     bool     refresh_gen = false;
     uint32_t fresh_gen   = 0;
+    uint32_t fresh_cvers = 0;
 
     struct stm_inode_value iv;
     stm_status vrc = verify_fresh_snapshot(s->fs, ds, ino, gen, &iv);
@@ -3252,6 +3303,7 @@ static stm_status h_setattr(stm_9p_server *s,
         if (stm_fs_stat(s->fs, ds, ino, &post) == STM_OK) {
             refresh_gen = true;
             fresh_gen   = (uint32_t)stm_load_le64(post.si_gen);
+            fresh_cvers = qid_version(&post);
         }
     }
 
@@ -3310,8 +3362,10 @@ phase_c:
      * guarded (a concurrent same-fid rebind supersedes it); unpin. */
     must_lock(&s->lock);
     if (refresh_gen &&
-        f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino)
-        f->cached_gen = fresh_gen;
+        f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino) {
+        f->cached_gen   = fresh_gen;
+        f->cached_cvers = fresh_cvers;
+    }
     fid_unpin_locked(s, f);
     if (ecode)
         return reply_rlerror(resp, resp_cap, resp_len, tag, ecode);
@@ -3659,9 +3713,10 @@ static stm_status h_xattrwalk(stm_9p_server *s,
     }
     if (!nf)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
-    nf->dataset_id = f->dataset_id;
-    nf->ino        = f->ino;
-    nf->cached_gen = f->cached_gen;
+    nf->dataset_id  = f->dataset_id;
+    nf->ino         = f->ino;
+    nf->cached_gen  = f->cached_gen;
+    nf->cached_cvers = f->cached_cvers;  /* symmetry; aux fid emits no qid */
 
     uint64_t size = 0;
     if (nlen == 0) {
@@ -4012,17 +4067,15 @@ static stm_status h_sync(stm_9p_server *s,
 /* shares src's extents via refcount; dst's si_size + si_data_kind +     */
 /* mtime + ctime update. Cross-dataset is STM_EXDEV per stm_fs_reflink.  */
 /*                                                                         */
-/* Caveat (R94 P3-1): dst's si_gen does NOT bump on reflink — stm_inode_ */
-/* set enforces gen-unchanged, and only the inode allocator (free + ino  */
-/* reuse) increments gen. Consequently the Rreflink-returned qid carries */
-/* the SAME version as before reflink, and a v9fs client that keys cache */
-/* invalidation on qid.version may serve stale bytes from a fd open at   */
-/* reflink time. POSIX FICLONE expects post-clone reads to see new       */
-/* content; this is a known v9fs cache-coherence concern, forward-noted  */
-/* for v2.1+ (would need an inode.tla extension to model "content swap   */
-/* without gen bump" before the impl can safely add a gen-incrementing   */
-/* path through the allocator). Clients that re-open dst after reflink   */
-/* see the new content (fresh stm_fs_stat).                               */
+/* Cache coherence (was R94 P3-1, CLOSED by L1a): qid.version is now the  */
+/* CONTENT-version si_cvers, not si_gen. stm_fs_reflink updates dst's     */
+/* si_size/si_data_kind/mtime/ctime through the stm_inode_set choke point */
+/* (inode.tla ContentMutate), which bumps si_cvers — so the Rreflink qid  */
+/* carries a STRICTLY NEW version and a v9fs / L1-Larder client keying     */
+/* cache invalidation on qid.version correctly drops its stale pages. The  */
+/* old caveat (si_gen unchanged on reflink -> stale-serve) no longer       */
+/* applies; si_gen legitimately stays put (no ino reuse), and the fid's    */
+/* cached_gen staleness key is unaffected.                                 */
 /* ────────────────────────────────────────────────────────────────────── */
 
 static stm_status h_reflink(stm_9p_server *s,
@@ -4069,20 +4122,23 @@ static stm_status h_reflink(stm_9p_server *s,
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
 
-    /* Re-stat dst to refresh cached_gen + emit the post-reflink qid. */
+    /* Re-stat dst to refresh cached_gen/cached_cvers + emit the post-
+     * reflink qid. The reflink bumped dst's si_cvers (its content
+     * changed), so qid.version advances — the guest cache invalidates. */
     struct stm_inode_value iv;
     rc = stm_fs_stat(s->fs, df->dataset_id, df->ino, &iv);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
-    df->cached_gen = (uint32_t)stm_load_le64(iv.si_gen);
-    df->qid_type   = qid_type_from_mode(stm_load_le32(iv.si_mode));
+    df->cached_gen   = (uint32_t)stm_load_le64(iv.si_gen);
+    df->cached_cvers = qid_version(&iv);
+    df->qid_type     = qid_type_from_mode(stm_load_le32(iv.si_mode));
 
     uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RREFLINK;
     p9l_p16(wp, tag); wp += 2;
-    p9l_pqid(wp, df->qid_type, df->cached_gen,
+    p9l_pqid(wp, df->qid_type, df->cached_cvers,
               qid_path(df->dataset_id, df->ino));
     wp += STM_9P_QID_SIZE;
     resp_finish(resp, resp_len, wp);

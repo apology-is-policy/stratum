@@ -4581,4 +4581,92 @@ STM_TEST(p9_walkgetattr_gates) {
     unlink(g_key_path);
 }
 
+/* L1a-2: qid.version is the CONTENT-version si_cvers, DECOUPLED from si_gen.
+ * A content write bumps qid.version (the guest close-to-open cache key) but
+ * leaves si_gen (the fid cached_gen staleness key) untouched -- so the writing
+ * fid does NOT self-ESTALE. data_version mirrors qid.version, and the three
+ * qid emitters (getattr / lopen / walkgetattr) all carry the same fresh cvers.
+ * This is the decoupling the whole Larder cache rests on: pre-L1a qid.version
+ * was si_gen, constant across writes, so a content-keyed cache could never
+ * see a change. */
+STM_TEST(p9_qid_version_tracks_content_not_gen) {
+    make_tmp("9p_qid_cvers");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)root;
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    /* Clone root -> 101, create "f" (repurposes 101 to the open file). */
+    uint32_t sz = build_twalk(req, 2, 100, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    sz = build_tlcreate(req, 3, 101, "f", STM_9P_O_RDWR, 0644, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+
+    /* Getattr(101) BEFORE the write. Rgetattr body (WGA_BODY layout):
+     * qid.version @ resp+7+8+1; gen @ resp+7+137; data_version @ resp+7+145. */
+    sz = build_tgetattr(req, 4, 101, STM_9P_GETATTR_ALL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETATTR);
+    uint32_t qv1  = load_u32(resp + 7 + 8 + 1);
+    uint64_t gen1 = load_u64(resp + 7 + 137);
+    uint64_t dv1  = load_u64(resp + 7 + 145);
+    STM_ASSERT_EQ(dv1, (uint64_t)qv1);      /* data_version mirrors qid.version */
+
+    /* Write to 101 (content mutation -> si_cvers bump, si_gen unchanged). */
+    sz = build_twrite(req, 5, 101, 0, "hello", 5);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    STM_ASSERT_EQ(load_u32(resp + 7), 5u);
+
+    /* Getattr(101) AFTER the write, on the SAME fid. It must NOT self-ESTALE
+     * (RGETATTR, not RLERROR) -- the content write left si_gen alone. The
+     * content-version advanced; gen is unchanged; data_version stays coherent. */
+    sz = build_tgetattr(req, 6, 101, STM_9P_GETATTR_ALL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETATTR);
+    uint32_t qv2  = load_u32(resp + 7 + 8 + 1);
+    uint64_t gen2 = load_u64(resp + 7 + 137);
+    uint64_t dv2  = load_u64(resp + 7 + 145);
+    STM_ASSERT_TRUE(qv2 > qv1);             /* content-version bumped */
+    STM_ASSERT_EQ(gen2, gen1);              /* lifecycle gen DECOUPLED */
+    STM_ASSERT_EQ(dv2, (uint64_t)qv2);      /* data_version stays coherent */
+
+    /* The Rlopen emitter also carries si_cvers: a fresh walk+open of "f"
+     * reports the post-write content-version. Rlopen: qid[13] iounit[4];
+     * qid.version @ resp+7+1. */
+    walk_to(s, 100, 102, "f");
+    sz = build_tlopen(req, 7, 102, STM_9P_O_RDONLY);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    STM_ASSERT_EQ(load_u32(resp + 7 + 1), qv2);
+
+    /* The POUNCE (Twalkgetattr) emitter carries the SAME fresh content-version.
+     * Query from root (NOFID = walk+sample, bind nothing); element 0's
+     * qid.version must equal the post-write cvers. */
+    const char *pf[] = { "f" };
+    sz = build_twalkgetattr(req, 8, 100, STM_9P_NOFID,
+                            STM_9P_GETATTR_BASIC, 1, pf);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALKGETATTR);
+    STM_ASSERT_EQ(load_u16(resp + 7), 1u);
+    STM_ASSERT_EQ(load_u32(WGA_EL(resp, 0) + 8 + 1), qv2);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("9p")
