@@ -32,6 +32,7 @@
 #include <stratum/bootstrap.h>
 #include <stratum/crypto.h>
 #include <stratum/dataset.h>
+#include <stratum/ebr.h>
 #include <stratum/extent.h>
 #include <stratum/types.h>
 
@@ -691,6 +692,63 @@ STM_TEST(ex_lookup_at_unknown_ino) {
     idx = ex_test_idx(0);
     stm_extent_record e;
     STM_ASSERT_ERR(stm_extent_lookup_at(idx, 1, 999, 0, &e), STM_ENOENT);
+    ex_test_idx_close(idx);
+}
+
+/* RC-2 regression: the concurrent covering lookup must scan the FULL
+ * per-ino range — ex_encode_key stores `off` LITTLE-ENDIAN, so the
+ * btree walk's lex order does not match integer off order across byte
+ * boundaries: LE(65536) = 00 00 01.. lex-sorts BEFORE LE(4096) =
+ * 00 10 00... The pre-fix cb early-stopped on the first record with
+ * off > target ("sorted-key walk"), so with extents at BOTH 4096 and
+ * 65536 a lookup at 4096 saw 65536 first and returned a FALSE HOLE —
+ * zero-filled reads for any file with an extent at or past 64 KiB
+ * (`go tool compile`'s demand-paged text in the Thylacine guest, the
+ * boot that surfaced this). Fails on the pre-fix cb by construction. */
+STM_TEST(ex_lookup_at_concurrent_le_key_order) {
+    stm_extent_index *idx = NULL;
+    idx = ex_test_idx(0);
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4096,  4096, 0xAA, 0));
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 65536, 4096, 0xBB, 0));
+
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    STM_ASSERT(ebr != NULL);
+
+    stm_extent_record e;
+
+    /* The lex-late, integer-early extent: the pre-fix miss-stop. */
+    stm_ebr_enter(ebr);
+    stm_status rc = stm_extent_lookup_at_concurrent(idx, ebr, 1, 1, 4096, &e);
+    stm_ebr_exit(ebr);
+    STM_ASSERT_OK(rc);
+    STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xAA);
+
+    /* The lex-early extent still hits. */
+    stm_ebr_enter(ebr);
+    rc = stm_extent_lookup_at_concurrent(idx, ebr, 1, 1, 65536, &e);
+    stm_ebr_exit(ebr);
+    STM_ASSERT_OK(rc);
+    STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xBB);
+
+    /* Full parity with the serial lookup at every probe (holes before,
+     * between, and past both extents; hits at every covered edge). */
+    static const uint64_t probes[] = { 0u, 4095u, 4096u, 8191u, 8192u,
+                                       65535u, 65536u, 69631u, 69632u };
+    for (size_t i = 0; i < sizeof probes / sizeof probes[0]; i++) {
+        stm_extent_record se, ce;
+        stm_status srs = stm_extent_lookup_at(idx, 1, 1, probes[i], &se);
+        stm_ebr_enter(ebr);
+        stm_status crs = stm_extent_lookup_at_concurrent(idx, ebr, 1, 1,
+                                                           probes[i], &ce);
+        stm_ebr_exit(ebr);
+        STM_ASSERT_EQ((int)crs, (int)srs);
+        if (srs == STM_OK) {
+            STM_ASSERT_EQ(ce.paddrs[0], se.paddrs[0]);
+            STM_ASSERT_EQ(ce.off, se.off);
+            STM_ASSERT_EQ(ce.len, se.len);
+        }
+    }
+
     ex_test_idx_close(idx);
 }
 

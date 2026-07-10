@@ -2197,11 +2197,25 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
  *
  * Same first-match semantics as stm_extent_lookup_at (per
  * extent.tla::NoOverlapWithinIno first-match suffices), but uses
- * engine_scan_range_concurrent + the per-record cb-return-1 early
- * stop instead of the two-pass collect-then-scan. Cost is bounded by
- * (tree height + one record decode), NOT by the count of extents
- * under (ds, ino). The cb encodes the same "off in [e->off, e->off +
- * e->len)" predicate the serial loop uses. */
+ * engine_scan_range_concurrent + a per-record covering test over the
+ * FULL per-ino subspace. Cost is bounded by the count of extents
+ * under (ds, ino) — the same bound as the serial collect-then-scan
+ * and the at_root variant.
+ *
+ * RC-2 CORRECTNESS FIX (found by the Thylacine boot the moment this
+ * function gained its first caller): the original cb early-stopped
+ * with "past target_off — sorted-key walk; no later record can
+ * cover". That assumption is FALSE: ex_encode_key stores `off` as
+ * LITTLE-ENDIAN bytes, so the walk's lex order does not match integer
+ * off order across byte boundaries (LE(65536) = 00 00 01.. lex-sorts
+ * BEFORE LE(4096) = 00 10 00..) — the exact reason
+ * stm_extent_index_lookup_at_root scans the FULL per-ino range and
+ * cannot bound its hi key. The early miss-stop turned a real covering
+ * extent into a false hole (a zero-filled read) for any ino whose
+ * extents span a byte boundary in off — e.g. every file with an
+ * extent at or past 64 KiB — which zero-filled `go tool compile`'s
+ * demand-paged text in the guest. No early miss-stop; the HIT stop is
+ * still sound (NoOverlapWithinIno makes the covering extent unique). */
 typedef struct {
     uint64_t           ds;
     uint64_t           target_off;
@@ -2216,12 +2230,13 @@ static int ex_concurrent_lookup_cb(const void *k, size_t klen,
     uint64_t ino = 0, off = 0;
     stm_status ks = ex_decode_key(k, klen, &ino, &off);
     if (ks != STM_OK) { c->err = ks; return 1; }
+    if (off > c->target_off) return 0;             /* cannot cover; keep
+                                                    * scanning (lex order
+                                                    * != integer order) */
     stm_extent_record r;
     memset(&r, 0, sizeof r);
     stm_status vs = ex_decode_value(v, vlen, c->ds, ino, off, &r);
     if (vs != STM_OK) { c->err = vs; return 1; }
-    /* Past target_off — sorted-key walk; no later record can cover. */
-    if (off > c->target_off) return 1;             /* stop, miss */
     if (c->target_off < off + r.len) {
         c->hit = r;
         c->found = true;
