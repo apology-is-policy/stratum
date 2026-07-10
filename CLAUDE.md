@@ -146,6 +146,45 @@ If a chunk's diff doesn't include a reference-doc update, the reviewer should as
 
 - Every audit finding that can be made to fail without the fix should land a regression test. See `tests/test_fs.c::test_fs_sync_two_phase_gen_invariant`, `test_fs_mount_bump_encrypted`, `test_fs_write_gap_is_zeroed*`, `tests/test_snap.c::test_snap_rollback_bumps_gen_encrypted`, `tests/test_p9.c::test_p9_wire_validation`, `test_p9_fid_cache_and_dup` for the pattern.
 - Before committing, run all 11 C suites + 10 Rust integration tests: `cmake --build build && for t in types key block node btree fs compress crypto snap p9 alloc; do build/tests/test_$t; done && (cd tui && cargo test --test integration --release)`.
+- v2: the ctest suite is the gate (`ctest --test-dir v2/build --output-on-failure`).
+
+## Sanitizers (ASan / LeakSan / TSan) — GCP disposable VM ONLY
+
+**ASan and TSan are BROKEN on the macOS dev host** (Apple Silicon, Darwin
+25.x) — do NOT burn time re-trying them locally:
+
+- **TSan**: any `-fsanitize=thread` binary SIGSEGVs inside
+  `__tsan::InitializePlatform` (dyld shared-cache iteration) during the
+  libSystem initializer, before the first user instruction. lldb-proven
+  2026-07-10 (the RC-1 dcache hammer); a TSan-runtime x Darwin
+  incompatibility, not our code.
+- **ASan**: an `-fsanitize=address` binary hangs producing ZERO output
+  (probe 2026-07-10: >7 min silent on a seconds-long suite; the standing
+  `feedback-skip-asan-local` fact). gmalloc covers UAF locally but NOT
+  leaks or races.
+
+**The sanitizer home is a DISPOSABLE GCP Linux VM** — create, run, tear
+down, always minimizing price. Canonical recipe (full detail in the
+stratum session memory `reference_gcp_compute.md`):
+
+- Project `wired-epsilon-337013` ("Project Cora"), region `europe-west4`;
+  `gcloud` is authenticated locally as the user.
+- **Spot** `e2-standard-4` (~$0.04/h) + `ubuntu-2404-lts-amd64` (clang 18
+  — use clang, NOT gcc 13). A sanitizer ctest run needs NO scratch disk
+  (boot-disk-only; ~30–60 min, **~$0.02–0.05 total**); add a `pd-balanced`
+  scratch disk only when the payload genuinely needs multi-GiB data.
+- Build with `-DSTM_SANITIZE=asan` / `=tsan` (v2 CMake); libsodium >= 1.0.19
+  must be built from source (apt ships 1.0.18).
+- **Tear the VM down IMMEDIATELY after the run** — never leave it running;
+  spot + smallest-fitting machine + zero idle time is the standing cost
+  discipline. Never touch the preserved `cora-bbs` VM or the `treeso-net`
+  disk/snapshots.
+- Mutating `gcloud` operations are **propose-then-execute** (the user
+  confirms before the VM spins).
+
+Batch standing sanitizer payloads onto ONE VM run rather than spinning one
+each; currently queued: the TSan pass over `v2/tests/test_dcache_concurrent`
+(the RC-1 lock-free dcache hammer) alongside the ASan/LeakSan follow-ups.
 
 ## Clangd false positives
 
