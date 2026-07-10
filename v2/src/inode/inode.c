@@ -125,7 +125,13 @@ struct stm_inode_handle {
     uint64_t                  dataset_id;
     uint64_t                  ino;
     uint32_t                  refcount;     /* under idx->lock */
-    pthread_mutex_t           mu;           /* the per-inode lock */
+    /* RC-2: the per-inode lock is a rwlock so the extent READ path can
+     * hold it SHARED (stm_inode_pin_shared) while mutators keep the
+     * EXCLUSIVE side (stm_inode_pin) — same-inode readers proceed in
+     * parallel with each other and exclude same-inode write/truncate/
+     * punch mid-read (RC-I2, docs/rc-design.md). unpin is mode-blind
+     * (pthread_rwlock_unlock releases either side). */
+    pthread_rwlock_t          rw;           /* the per-inode lock */
     struct stm_inode_handle  *next;         /* hash-chain link, under idx->lock */
 };
 
@@ -709,7 +715,7 @@ void stm_inode_index_close(stm_inode_index *idx) {
         struct stm_inode_handle *h = idx->handle_buckets[b];
         while (h) {
             struct stm_inode_handle *next = h->next;
-            pthread_mutex_destroy(&h->mu);
+            pthread_rwlock_destroy(&h->rw);
             free(h);
             h = next;
         }
@@ -1432,22 +1438,29 @@ handle_get_or_alloc_locked(stm_inode_index *idx,
     h->refcount   = 1u;
     h->next       = idx->handle_buckets[b];
 
-    pthread_mutexattr_t attr;
-    if (pthread_mutexattr_init(&attr) != 0) {
-        free(h);
-        return NULL;
+    /* RC-2 posture note: the pre-RC mutex was ERRORCHECK so a buggy
+     * same-thread double-pin aborted loudly. pthread rwlocks have no
+     * errorcheck attr — a same-thread double-wrlock returns EDEADLK on
+     * macOS (surfaced as STM_EBACKEND by the pin) and deadlocks on
+     * glibc; either way the bug stays loud rather than silently
+     * recursive. On glibc, prefer writers so a stream of shared
+     * readers cannot starve a truncate/write pin indefinitely. */
+    int rc;
+#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
+    {
+        pthread_rwlockattr_t attr;
+        if (pthread_rwlockattr_init(&attr) != 0) {
+            free(h);
+            return NULL;
+        }
+        (void)pthread_rwlockattr_setkind_np(
+                &attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        rc = pthread_rwlock_init(&h->rw, &attr);
+        pthread_rwlockattr_destroy(&attr);
     }
-    /* ERRORCHECK: a buggy double-pin from the same thread aborts here
-     * rather than silently allowing a recursive lock — matches the
-     * spec's WriterAtomicPerInode posture (at most one writer per
-     * inode at any time). */
-    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK) != 0) {
-        pthread_mutexattr_destroy(&attr);
-        free(h);
-        return NULL;
-    }
-    int rc = pthread_mutex_init(&h->mu, &attr);
-    pthread_mutexattr_destroy(&attr);
+#else
+    rc = pthread_rwlock_init(&h->rw, NULL);
+#endif
     if (rc != 0) {
         free(h);
         return NULL;
@@ -1472,17 +1485,25 @@ static void handle_release_locked(stm_inode_index *idx,
      * (handle_get_or_alloc_locked is the only inserter). */
     if (*pp != h) abort();
     *pp = h->next;
-    pthread_mutex_destroy(&h->mu);
+    pthread_rwlock_destroy(&h->rw);
     free(h);
 }
 
-stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
-                            uint64_t ino, stm_inode_handle **out_handle) {
+/* Common pin body. `shared` selects the rwlock side: false = exclusive
+ * (mutators — the pre-RC-2 stm_inode_pin semantics, byte-equivalent),
+ * true = shared (the RC-2 extent-read side; same-inode shared pins
+ * coexist, any shared pin excludes an exclusive pin and vice versa).
+ * The existence pre-check + TOCTOU re-validate are identical for both
+ * modes: a reader pinning a freed inode gets STM_ENOENT exactly like a
+ * writer. */
+static stm_status inode_pin_mode(stm_inode_index *idx, uint64_t dataset_id,
+                                    uint64_t ino, bool shared,
+                                    stm_inode_handle **out_handle) {
     if (!idx || !out_handle) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
     /* Validate the record exists + is allocated BEFORE taking the
-     * per-inode mutex. This pre-check avoids alloc-then-fail thrash
+     * per-inode lock. This pre-check avoids alloc-then-fail thrash
      * for the common missing-inode case. */
     must_lock(idx_lock(idx));
     if (idx->ds_idx == NULL) {
@@ -1508,18 +1529,20 @@ stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
     }
     must_unlock(idx_lock(idx));
 
-    /* Acquire the per-inode mutex; may block on a concurrent holder.
+    /* Acquire the per-inode lock; may block on a concurrent holder.
      * The slot remains live (refcount >= 1 thanks to our bump) for
      * the duration of this wait. */
-    if (pthread_mutex_lock(&h->mu) != 0) {
+    int lrc = shared ? pthread_rwlock_rdlock(&h->rw)
+                     : pthread_rwlock_wrlock(&h->rw);
+    if (lrc != 0) {
         must_lock(idx_lock(idx));
         handle_release_locked(idx, h);
         must_unlock(idx_lock(idx));
         return STM_EBACKEND;
     }
 
-    /* TOCTOU re-validate: between the pre-check and acquiring h->mu,
-     * the holding writer may have freed the inode. Re-check under
+    /* TOCTOU re-validate: between the pre-check and acquiring h->rw,
+     * a holding writer may have freed the inode. Re-check under
      * both locks. */
     must_lock(idx_lock(idx));
     found = false;
@@ -1528,7 +1551,7 @@ stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
         (stm_load_le32(v.si_flags) & STM_INO_FLAG_FREED)) {
         stm_status rc = (gs != STM_OK) ? gs : STM_ENOENT;
         must_unlock(idx_lock(idx));
-        pthread_mutex_unlock(&h->mu);
+        pthread_rwlock_unlock(&h->rw);
         must_lock(idx_lock(idx));
         handle_release_locked(idx, h);
         must_unlock(idx_lock(idx));
@@ -1540,9 +1563,20 @@ stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
     return STM_OK;
 }
 
+stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
+                            uint64_t ino, stm_inode_handle **out_handle) {
+    return inode_pin_mode(idx, dataset_id, ino, /*shared=*/false, out_handle);
+}
+
+stm_status stm_inode_pin_shared(stm_inode_index *idx, uint64_t dataset_id,
+                                   uint64_t ino,
+                                   stm_inode_handle **out_handle) {
+    return inode_pin_mode(idx, dataset_id, ino, /*shared=*/true, out_handle);
+}
+
 void stm_inode_unpin(stm_inode_index *idx, stm_inode_handle *handle) {
     if (!idx || !handle) return;
-    pthread_mutex_unlock(&handle->mu);
+    pthread_rwlock_unlock(&handle->rw);
     must_lock(idx_lock(idx));
     handle_release_locked(idx, handle);
     must_unlock(idx_lock(idx));

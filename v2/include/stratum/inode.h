@@ -511,12 +511,14 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
 /* ========================================================================= */
 /* Per-inode locks (P9.5-PARALLEL-3 impl-1).                                 */
 /*                                                                            */
-/* `stm_inode_pin` acquires a per-inode mutex for (dataset_id, ino) and       */
-/* returns an opaque handle. While the handle is held, no other pin on the    */
-/* SAME (dataset_id, ino) succeeds — pins on disjoint inodes proceed in       */
-/* parallel. The handle's mutex is allocated from a hash-keyed slot pool      */
-/* owned by the inode index; slots are refcounted and reclaimed when the      */
-/* last unpin drops the refcount to zero.                                     */
+/* `stm_inode_pin` acquires a per-inode lock for (dataset_id, ino) and        */
+/* returns an opaque handle. While an EXCLUSIVE handle is held, no other pin  */
+/* on the SAME (dataset_id, ino) succeeds — pins on disjoint inodes proceed   */
+/* in parallel. RC-2 made the slot lock a rwlock: `stm_inode_pin_shared`      */
+/* takes the read side (same-inode shared pins coexist; either side excludes  */
+/* the other). The slot is allocated from a hash-keyed pool owned by the      */
+/* inode index; slots are refcounted and reclaimed when the last unpin drops  */
+/* the refcount to zero.                                                      */
 /*                                                                            */
 /* Spec composition: realizes the `inode_lock_holder[i] = w` action of        */
 /* `v2/specs/compound_ops_per_inode.tla` — the writer acquires the per-inode  */
@@ -560,8 +562,36 @@ stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
                             uint64_t ino, stm_inode_handle **out_handle);
 
 /*
- * Release the per-inode mutex held by `handle`. Safe with NULL handle
- * (no-op). After return the handle is invalid — do not dereference.
+ * RC-2: acquire the per-inode lock SHARED for (dataset_id, ino).
+ *
+ * The reader-side pin of docs/rc-design.md RC-I2: the extent read path
+ * holds this across its whole multi-extent read so a same-inode
+ * write/truncate/punch (which hold the EXCLUSIVE pin) cannot interleave
+ * mid-read — the read observes either the pre-image or the post-image,
+ * never a mix. Same-inode SHARED pins coexist (concurrent readers of
+ * one file proceed in parallel); disjoint inodes never contend.
+ *
+ * Identical refusals + TOCTOU re-validation as stm_inode_pin (a reader
+ * pinning a freed/missing inode gets STM_ENOENT). Release with the same
+ * stm_inode_unpin (mode-blind). A thread MUST NOT take a shared pin on
+ * an inode it already holds exclusively (same-thread rd-after-wr is
+ * EDEADLK/deadlock); no in-tree path does — the shared pin's only
+ * caller is stm_fs_read, which is never invoked under a held pin.
+ *
+ * Writer starvation posture: on glibc the slot rwlock is initialized
+ * PREFER_WRITER_NONRECURSIVE so a stream of readers cannot starve a
+ * pinned mutator; macOS fairness is implementation-managed (roughly
+ * FIFO). Documented in docs/reference/29-concurrency.md.
+ */
+STM_MUST_USE
+stm_status stm_inode_pin_shared(stm_inode_index *idx, uint64_t dataset_id,
+                                   uint64_t ino,
+                                   stm_inode_handle **out_handle);
+
+/*
+ * Release the per-inode lock held by `handle` (either mode). Safe with
+ * NULL handle (no-op). After return the handle is invalid — do not
+ * dereference.
  *
  * If this unpin drops the slot's refcount to zero, the slot is freed.
  * If other pinners hold references (refcount > 0 after decrement), the

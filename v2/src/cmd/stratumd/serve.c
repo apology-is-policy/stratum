@@ -551,6 +551,48 @@ typedef struct {
     const struct stm_ds_policy_table *user_policy;
 } stratumd_fs_worker_ctx;
 
+/* RC-2 P0-3 (#1232) close: the FS-worker drain. The per-connection FS
+ * workers are detached pthreads BORROWING `fs`; the pre-RC teardown
+ * (accept loop exits on stop_flag -> stm_fs_unmount) had NO ordered-
+ * shutdown contract with them — an in-flight worker mid-request at
+ * unmount dereferenced a freed stm_fs/stm_sync. The gap predates the
+ * RC arc; RC-4 (workers ON) makes it load-bearing. Close = the /ctl/
+ * side's worker_count discipline mirrored here: the accept loop bumps
+ * BEFORE spawning (so the count is never transiently under), the
+ * worker decrements + broadcasts at exit, and stm_stratumd_run waits
+ * for zero after the accept loop exits, BEFORE ctl/scrub/fs teardown.
+ * The wait is bounded in practice by the per-connection idle timeout
+ * (STM_STRATUMD_DEFAULT_IDLE_MS default) — a worker blocked on a live
+ * but idle client exits within it; a busy worker finishes its
+ * request stream. Module-static (one daemon per process — the
+ * g_fs_workers precedent). */
+static pthread_mutex_t g_fs_inflight_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_fs_inflight_cv = PTHREAD_COND_INITIALIZER;
+static uint32_t        g_fs_inflight    = 0u;
+
+static void fs_inflight_bump(void)
+{
+    pthread_mutex_lock(&g_fs_inflight_mu);
+    g_fs_inflight++;
+    pthread_mutex_unlock(&g_fs_inflight_mu);
+}
+
+static void fs_inflight_drop(void)
+{
+    pthread_mutex_lock(&g_fs_inflight_mu);
+    if (g_fs_inflight > 0u) g_fs_inflight--;
+    if (g_fs_inflight == 0u) pthread_cond_broadcast(&g_fs_inflight_cv);
+    pthread_mutex_unlock(&g_fs_inflight_mu);
+}
+
+static void stratumd_fs_workers_drain(void)
+{
+    pthread_mutex_lock(&g_fs_inflight_mu);
+    while (g_fs_inflight > 0u)
+        pthread_cond_wait(&g_fs_inflight_cv, &g_fs_inflight_mu);
+    pthread_mutex_unlock(&g_fs_inflight_mu);
+}
+
 static void *stratumd_fs_worker(void *arg)
 {
     /* SWISS-4g R128 (next round) carry: signal-mask discipline
@@ -574,6 +616,7 @@ static void *stratumd_fs_worker(void *arg)
                                         ctx->idle_timeout_ms,
                                         ctx->user_policy);
     free(ctx);
+    fs_inflight_drop();
     return NULL;
 }
 
@@ -699,17 +742,22 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
         ctx->idle_timeout_ms = idle_timeout_ms;
         ctx->user_policy     = user_policy;
 
+        /* Bump BEFORE create so the in-flight count is never under
+         * (the worker's first act cannot precede its accounting). */
+        fs_inflight_bump();
         pthread_t tid;
         int wprc = pthread_create(&tid, NULL, stratumd_fs_worker, ctx);
         if (wprc != 0) {
             fprintf(stderr,
                 "stratumd: pthread_create failed (rc=%d)\n", wprc);
+            fs_inflight_drop();
             close(client_fd);
             free(ctx);
             continue;
         }
-        /* Detached: stratumd has no ordered-shutdown contract with
-         * workers. They exit on EOF/error; OS reclaims stacks. */
+        /* Detached: stacks reclaim on exit; the ordered-shutdown
+         * contract is the fs_inflight bracket above (RC-2 P0-3 close) —
+         * stm_stratumd_run drains it before any fs/ctl/scrub teardown. */
         (void)pthread_detach(tid);
     }
     return STM_OK;
@@ -1837,6 +1885,13 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
                                        opts->allow_unauthenticated_peer,
                                        opts->stop_flag,
                                        opts->user_policy);
+
+    /* RC-2 P0-3 (#1232) close: drain the in-flight FS workers BEFORE
+     * any teardown below — they borrow `fs` (and transitively sync +
+     * every index the RC read path walks lock-free); unmounting under
+     * a live worker is a use-after-free. Bounded in practice by the
+     * per-connection idle timeout. */
+    stratumd_fs_workers_drain();
 
     /* TLY-A4: stop the corvus notify consumer FIRST so its log lines
      * (consumer-exiting) land in /ctl/events BEFORE stm_ctl_destroy

@@ -120,7 +120,10 @@ The full as-built stack, outermost first:
 s->lock / pool locks        (9P layer; NEVER held across a core call)
 fs->global                  (rwlock; EX compound, SH per-inode + reads;
                              writer-preference, R133 P1-1)
-   -> per-inode handle->mu  (PARALLEL-3 SH path; stm_inode_pin)
+   -> per-inode handle->rw  (PARALLEL-3 SH path; stm_inode_pin = wrlock,
+                             stm_inode_pin_shared = rdlock since RC-2 — the
+                             extent-read side; glibc slots init
+                             PREFER_WRITER_NONRECURSIVE)
    -> subsystem idx->lock   (inode idx->lock -> dataset idx->lock; R175 SA-3)
    -> engine serial_mu      (serial APIs + serial scans + the mini's trylock)
    -> engine commit_mu      (chain fold/commit; load_root_locked single-flight)
@@ -128,6 +131,8 @@ fs->global                  (rwlock; EX compound, SH per-inode + reads;
    -> sync->lock            (src/sync/sync.c:163)
       -> sync->dcache_wlock (RC-1 dcache writer mutex; readers EBR-pinned
                              lock-free; never takes sync->lock; section 29.12)
+      -> sync->promote_lock (RC-2 promote_cache leaf; never held across the
+                             dataset_idx slow path or any other lock)
    -> alloc->lock           (src/alloc/alloc.c:77)
    -> alloc's btree rwlock
 ```
@@ -394,10 +399,33 @@ stages:
   `tests/test_dcache_concurrent.c` (the pinned-reader hammer). At RC-1 the
   extent paths still hold `s->lock` — the cache no longer NEEDS it, which is
   what RC-2 harvests.
-- **RC-2 (planned):** the read path drops `s->lock` — brief locked prologue,
-  the EBR `_concurrent` extent lookup, unlocked bdev+decrypt, RC-1 dcache
-  insert; the DEK map becomes EBR-published immutable snapshots
-  (`dek_guard.tla`; the one genuinely new synchronization).
+- **RC-2 (BUILT):** the read path holds NO `s->lock` on the common path.
+  `stm_sync_read_extent`: atomic wedged gate → ONE EBR pin over the
+  `_concurrent` extent lookup + the dcache probe (the record returns BY
+  VALUE; nothing tree-resident outlives the pin) → on a miss,
+  `sync_extent_fetch_decrypt` UNPINNED (the CAS index self-locks, the bdev
+  self-locks, the decrypt is thread-local; a pin must never span device
+  I/O) with a SHORT own pin around the DEK-map copy → RC-1 dcache insert.
+  STM_EBUSY (mid-walk seal) retries whole with a fresh pin, then falls back
+  to the serial locked path; so does a thread with no EBR handle. The snap
+  read went lock-free on the same dispatch (its frozen-root lookup is
+  self-locked). The under-lock decrypt entry
+  (`sync_decrypt_extent_record_locked`) survives byte-equivalent for the
+  truncate / migrate / snap-view / send compounds that legitimately hold
+  `s->lock`. The DEK map is EBR-published immutable COW snapshots
+  (`dek_guard.tla`; mutators under `s->lock` build-publish-retire; the
+  swap-with-last in-place remove and the realloc-moving grow are DELETED —
+  the modeled bugs are structurally gone). The same-inode read-vs-mutate
+  exclusion moved to the fs layer: the per-inode slot lock is a rwlock and
+  `stm_fs_read`'s extent arm holds it SHARED across the whole read (RC-I2;
+  §29.5 + §29.6). `promote_cache` rides its own leaf mutex; `wedged` /
+  `current_gen` are atomics. P0-3 (#1232) closed for real: stratumd's FS
+  workers now carry a bump-before-spawn/drop-at-exit in-flight count that
+  `stm_stratumd_run` drains after the accept loop exits, before any
+  fs/ctl/scrub teardown — the pre-RC "drain" did not exist. Runtime
+  witnesses: `tests/test_rc2_concurrent.c` (the read/overwrite hammer, the
+  rotate+re-encrypt+sweep DEK hammer, the fs-level single-version RC-I2
+  test, the pin-mode semantics).
 - **RC-3 (planned):** the write path — brief locked reservation, unlocked
   encrypt + device write, brief locked epilogue. Commit exclusion
   (`fs->global` EX) unchanged.
@@ -405,4 +433,11 @@ stages:
   regression A/B flipping to a win.
 
 Compounds/admin/getters KEEP `s->lock` (brief). Lock order: `s->lock ->
-dcache_wlock`; the dcache functions never take `s->lock` (§29.5).
+dcache_wlock` and `s->lock -> promote_lock`; the dcache + promote-cache
+functions never take `s->lock` (§29.5).
+
+The RC-2 op-class table update for §29.6: the extent READ moved from the
+"stm_sync serializes it anyway" implicit class to `fs->global` SH + the
+per-inode SHARED pin + EBR pins in the sync layer — same-inode reads
+parallel with each other, excluded against same-inode mutators (their
+EXCLUSIVE pin), fully parallel across disjoint inodes.

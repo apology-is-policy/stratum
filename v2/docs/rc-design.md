@@ -165,6 +165,62 @@ the engine's seq_cst-load idiom. RC-2's DEK-map published-pointer load and
 any future EBR-protected reader may use acquire loads freely BECAUSE the
 fence is in enter; never remove or weaken it.
 
+**As-built (RC-2, 2026-07-10):**
+
+- **Pin structure**: ONE pin covers the `_concurrent` extent lookup + the
+  dcache probe (`sync_dcache_probe_pinned` — pure, no pin management; the
+  record comes back BY VALUE so nothing tree-resident is referenced after
+  the exit). The MISS path runs UNPINNED — a pin must never span the
+  blocking bdev read (it would stall epoch advance globally); the HOT DEK
+  resolve takes its own short pin inside `sync_extent_fetch_decrypt`. The
+  RC-1 probe pins were hoisted, never nested (nested enter silently unpins).
+- **STM_EBUSY** (a mid-walk engine seal): whole-op retry with a FRESH pin
+  per attempt (the CF-2c contract, `STM_BTREE_ENGINE_EBUSY_RETRY_MAX`);
+  exhaustion falls back to the serial locked path (different lookup
+  machinery — cannot EBUSY), so a read never surfaces EBUSY.
+- **The snap read** (`stm_sync_read_extent_at_snap`) went lock-free on the
+  same dispatch: the frozen-root lookup is self-locked (`ex_lock(idx)`
+  inside `stm_extent_index_lookup_at_root`), then the shared probe + fetch.
+- **The under-lock decrypt entry survives**: truncate / migrate / snap-view
+  / send compounds keep `sync_decrypt_extent_record_locked` (slice bounds →
+  self-pinned probe → `sync_extent_fetch_decrypt(ebr=NULL)`), byte-
+  equivalent to the pre-split body — the DEK resolve there is the borrowed
+  `sync_dek_find` walk, safe under `s->lock` because publishing requires it.
+- **The DEK guard**: COW snapshots per `dek_guard.tla` (see SPEC-TO-CODE
+  for the full mapping). `sync_dek_remove_at`'s swap-with-last and
+  `sync_dek_grow`'s realloc are DELETED — the modeled `inplace_mutate` /
+  `free_old_map` bugs are gone by construction. Remove is newly ENOMEM-
+  fallible (evict propagates; the keyschema sweep skips with a lingering
+  in-RAM slot scrubbed at close). The pre-reserve contract survives as a
+  staged unpublished buffer (`s->dek_staged`).
+- **The reader-side pin is SHARED for real**: the PARALLEL-3 per-inode slot
+  lock became a rwlock (`stm_inode_pin_shared` = rdlock; `stm_inode_pin` =
+  wrlock, all mutators unchanged; glibc slots init
+  PREFER_WRITER_NONRECURSIVE against reader streams starving a truncate).
+  `stm_fs_read`'s regular-file EXTENT arm pins shared, RE-LOADS the inode
+  value under the pin (the route-then-pin TOCTOU), and holds across the
+  whole multi-extent + dirty-buffer-overlay read (RC-I2). ERRORCHECK
+  posture note: a buggy same-thread double-pin is EDEADLK on macOS /
+  deadlock on glibc instead of abort.
+- **P0-3 (#1232) CLOSED, not just re-verified**: ground truth showed the
+  assumed stratumd drain DID NOT EXIST for FS workers (the /ctl side had
+  `worker_count`; the FS side was detached with "no ordered-shutdown
+  contract"). Closed with the mirrored bracket: `fs_inflight` bump-before-
+  spawn / drop-at-exit / `stratumd_fs_workers_drain()` in
+  `stm_stratumd_run` after the accept loop exits, BEFORE ctl/scrub/fs
+  teardown. Bounded by the per-connection idle timeout.
+- **promote_cache** got its own leaf mutex (`s->promote_lock`; not held
+  across the dataset_idx slow path; the insert re-verifies the property
+  gen). `s->wedged` is `_Atomic bool`, `s->current_gen` `_Atomic uint64_t`
+  (relaxed advisory snapshot on the read path).
+- **Runtime witnesses**: `tests/test_rc2_concurrent.c` — the lock-free
+  read/overwrite hammer (single-version content), the rotate + re-encrypt
+  + sweep hammer (an install AND a remove publish per cycle under pinned
+  readers; zero read failures), the fs-level RC-I2 single-version test
+  (whole-file rewrite in ONE call = the atomicity unit; truncate churn),
+  and the pin-mode semantics (SH||SH coexist, SH excludes EX, EX excludes
+  SH).
+
 ### RC-3 — retire `s->lock` from the WRITE path (user-voted scope)
 
 `stm_sync_write_extent` / `stm_sync_truncate` / `stm_sync_punch_range`

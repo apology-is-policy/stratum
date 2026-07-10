@@ -67,6 +67,7 @@
 #include <string.h>
 #include <time.h>
 
+
 /* Dataset id for the pool's metadata-encryption key. Every pool has
  * a fixed (0, 0) entry for the metadata-node AEAD. Rotating dataset 0
  * would require re-encrypting every metadata node under the new key;
@@ -87,6 +88,33 @@ typedef struct sync_dek_slot {
     uint64_t key_id;
     uint8_t  dek[32];
 } sync_dek_slot;
+
+/* RC-2 (dek_guard.tla): the DEK map is an IMMUTABLE-ONCE-PUBLISHED
+ * snapshot. Every mutation (install / remove / rotate — all under
+ * s->lock) builds a fresh copy, publishes it with one atomic pointer
+ * store, and EBR-retires the old map; the retire's destructor memzeroes
+ * every key byte before freeing. The pre-RC shapes this designs out:
+ *   - sync_dek_grow's realloc MOVED the array under a would-be lock-free
+ *     reader (the modeled free_old_map UAF);
+ *   - sync_dek_remove_at's swap-with-last REWROTE a slot in place under
+ *     a reader mid-walk (the modeled inplace_mutate torn/wrong-key read).
+ * Readers:
+ *   - lock-free (the RC-2 read path): under an EBR pin, acquire-load
+ *     `published`, walk, memcpy the 32-byte DEK out. The pin keeps a
+ *     concurrently-retired map alive (ReaderMapAlive); the acquire pairs
+ *     with the publish release for content visibility; the pin-publish
+ *     StoreLoad edge is stm_ebr_enter's trailing seq_cst fence
+ *     (rc-design.md section 4 — never rely on the loads alone).
+ *   - under s->lock (admin / mutator / scrub paths): a plain load + walk
+ *     is safe WITHOUT a pin — publishing requires s->lock, so the loaded
+ *     map is the published one and cannot have been retired.
+ * `cap` may exceed `count` when the map came from a pre-staged buffer
+ * (sync_dek_grow); unused slots are zero. The destructor zeroes by cap. */
+typedef struct sync_dek_map {
+    size_t        count;
+    size_t        cap;
+    sync_dek_slot slots[];
+} sync_dek_map;
 
 /* R10 P2-2: wrap-AD layout = pool_uuid(16) || dataset_id(8) ||
  * key_id(8). Binds the wrapped blob to its schema-tree coordinates
@@ -294,7 +322,12 @@ struct stm_sync {
      *                 at auth+1, final at auth+2). Retained under
      *                 the pre-P5-2 name for API continuity. */
     uint64_t   auth_gen;
-    uint64_t   current_gen;
+    /* RC-2: _Atomic so the lock-free read path can snapshot it (relaxed
+     * — an advisory input to the COLD promotion heuristic + alloc-free
+     * gen stamps taken under s->lock). All pre-RC sites access it under
+     * s->lock and are unchanged; C11 plain-looking accesses on an
+     * _Atomic field are seq_cst, which those sites tolerate. */
+    _Atomic uint64_t current_gen;
     uint64_t   mount_max_durable;   /* auth observed at mount time */
 
     /* Most recent final UB's ring location (all devices synchronized). */
@@ -348,13 +381,20 @@ struct stm_sync {
     uint64_t          keyschema_root_paddr;
     uint8_t           keyschema_root_csum[32];
 
-    /* P4-4c: per-(dataset_id, key_id) DEK map. `deks[0]` (if present)
-     * is always (0, 0) so `metadata_key` above is an alias for its
-     * `dek[32]` — updating one implies updating the other. Additional
-     * datasets + rotated key_ids populate subsequent slots. */
-    sync_dek_slot    *deks;
-    size_t            dek_count;
-    size_t            dek_cap;
+    /* P4-4c: per-(dataset_id, key_id) DEK map. The pool slot (if
+     * present) duplicates `metadata_key` above — updating one implies
+     * updating the other. Additional datasets + rotated key_ids
+     * populate subsequent slots.
+     *
+     * RC-2: COW snapshots (see sync_dek_map above). `dek_map` is the
+     * published map (NULL until the first insert); mutators build a
+     * copy under s->lock, publish, and EBR-retire the old one.
+     * `dek_staged` is an optional pre-allocated (never-published) next
+     * map that sync_dek_grow stages so a grow-then-insert sequence
+     * keeps its infallible-insert-after-grow contract; consumed by the
+     * next insert, freed at close. */
+    sync_dek_map *_Atomic dek_map;
+    sync_dek_map     *dek_staged;
 
     /* P5-3a: pool-wide redundancy profile. Set from caller at create,
      * from on-disk UB at open. Consumed by build_uberblock (stamps
@@ -486,6 +526,12 @@ struct stm_sync {
             uint64_t decay_window;
         } entries[STM_SYNC_PROMOTE_CACHE_CAP];
     } promote_cache;
+    /* RC-2: own lock for promote_cache — the COLD promotion heuristic
+     * runs on the now-lock-free read path, so the cache can no longer
+     * ride s->lock. Leaf: held only across the gen-check/scan/insert
+     * of the tiny in-RAM array, never across the dataset_idx slow path
+     * or any other lock. */
+    pthread_mutex_t   promote_lock;
 
     /* Durable mirror of ub_main_root / ub_snap_root state, last-
      * committed. Updated on successful sync_commit; consumed by
@@ -530,7 +576,13 @@ struct stm_sync {
      * read_only — it's the R/O recovery path — but still refuses
      * on wedged (the handle is no longer trustworthy). */
     bool              read_only;
-    bool              wedged;
+    /* RC-2: _Atomic so the lock-free read path can check it without
+     * s->lock. One-way false->true; setters run under s->lock as
+     * before (plain accesses on an _Atomic field are seq_cst). A
+     * lock-free reader that races the wedge transition may complete
+     * one already-in-flight read — acceptable: the bytes it returns
+     * were AEAD-verified, and every SUBSEQUENT entry observes wedged. */
+    _Atomic bool      wedged;
 
     /* P5-durable-cursors: 64-byte opaque scrub state region.
      * sync_open reads ub_scrub_state[] from disk into this buffer;
@@ -556,97 +608,226 @@ struct stm_sync {
 };
 
 /* ========================================================================= */
-/* DEK map helpers (P4-4c).                                                   */
+/* DEK map helpers (P4-4c; RC-2 COW snapshots — dek_guard.tla).                */
+/*                                                                            */
+/* Every mutator below runs under s->lock (they serialize among               */
+/* themselves; the model's Install/Evict). Mutation = build a fresh map,      */
+/* publish it with one atomic store, EBR-retire the displaced one. The       */
+/* R12 P1-1 no-realloc hygiene rule is inherited structurally: the old        */
+/* map's key bytes are scrubbed by the retire destructor, never left on       */
+/* the heap unscrubbed.                                                       */
 /* ========================================================================= */
 
+static size_t dek_map_bytes(size_t cap)
+{
+    return sizeof(sync_dek_map) + cap * sizeof(sync_dek_slot);
+}
+
+/* EBR destructor for a displaced map: scrub every key byte (by cap —
+ * staged-oversized maps have zero tails, harmless), then free. Complies
+ * with the RC-1 F2 destructor lock contract (memzero/free only — safe
+ * under any lock a retiring/advancing path may hold). */
+static void dek_map_destroy(void *p)
+{
+    sync_dek_map *m = p;
+    if (!m) return;
+    size_t total = dek_map_bytes(m->cap);
+    stm_ct_memzero(m, total);
+    free(m);
+}
+
+/* Allocate a zeroed, unpublished map buffer with room for `cap` slots. */
+static sync_dek_map *dek_map_alloc(size_t cap)
+{
+    if (cap == 0) cap = 4;
+    sync_dek_map *m = malloc(dek_map_bytes(cap));
+    if (!m) return NULL;
+    memset(m, 0, dek_map_bytes(cap));
+    m->cap   = cap;
+    m->count = 0;
+    return m;
+}
+
+/* Publish `newm` as the current map and retire the displaced one.
+ * Caller holds s->lock. The release side of the reader's acquire-load;
+ * a retire-ENOMEM leaks the old map WITHOUT scrubbing (the RC-1
+ * posture: zeroing under a possibly-pinned reader would corrupt an
+ * in-flight DEK copy; the leak is bounded and the map is unreachable). */
+static void dek_map_publish_locked(stm_sync *s, sync_dek_map *newm)
+{
+    sync_dek_map *old = atomic_exchange_explicit(&s->dek_map, newm,
+                                                    memory_order_acq_rel);
+    if (old) {
+        if (stm_ebr_retire(old, dek_map_destroy) != STM_OK) {
+            /* Leak: see above. */
+        }
+    }
+    (void)stm_ebr_try_advance();
+}
+
+/* The published map, loaded from a context where it cannot be retired
+ * out from under the caller: either s->lock is held (publishing
+ * requires it, so the loaded map IS the published one), or the caller
+ * holds an EBR pin (a concurrent retire cannot reclaim it). */
+static sync_dek_map *dek_map_load(stm_sync *s)
+{
+    return atomic_load_explicit(&s->dek_map, memory_order_acquire);
+}
+
+/* Ensure a staged (unpublished) map with capacity >= need exists.
+ * Preserves the pre-RC infallible-insert-after-grow contract: after
+ * sync_dek_grow(s, count+1) == STM_OK, the next sync_dek_insert cannot
+ * fail — load-bearing at the add-key / rotate sites, where a durable
+ * keyschema mutation lands between the grow and the in-RAM insert.
+ * Caller holds s->lock. */
 static stm_status sync_dek_grow(stm_sync *s, size_t need)
 {
-    if (need <= s->dek_cap) return STM_OK;
-    size_t new_cap = s->dek_cap ? s->dek_cap : 4;
+    if (s->dek_staged && s->dek_staged->cap >= need) return STM_OK;
+    size_t new_cap = 4;
+    sync_dek_map *cur = dek_map_load(s);
+    if (cur && cur->cap > new_cap) new_cap = cur->cap;
     while (new_cap < need) {
         size_t grown = new_cap * 2;
         if (grown < new_cap) return STM_ENOMEM;
         new_cap = grown;
     }
-    /* R12 P1-1: do NOT realloc. realloc that relocates leaves the old
-     * allocation (which holds plaintext DEK bytes) on the heap with
-     * no hygiene pass — a subsequent allocation of the same size
-     * can land on top of it and observe key material. Hand-roll a
-     * malloc → memcpy → ct_memzero(old) → free(old) sequence so the
-     * DEK bytes are scrubbed the moment they leave our ownership. */
-    sync_dek_slot *grown = malloc(new_cap * sizeof *grown);
-    if (!grown) return STM_ENOMEM;
-    if (s->deks && s->dek_count > 0)
-        memcpy(grown, s->deks, s->dek_count * sizeof *grown);
-    memset(grown + s->dek_count, 0,
-             (new_cap - s->dek_count) * sizeof *grown);
-    if (s->deks) {
-        stm_ct_memzero(s->deks, s->dek_cap * sizeof *s->deks);
-        free(s->deks);
-    }
-    s->deks = grown;
-    s->dek_cap = new_cap;
+    sync_dek_map *staged = dek_map_alloc(new_cap);
+    if (!staged) return STM_ENOMEM;
+    if (s->dek_staged) dek_map_destroy(s->dek_staged);  /* never published */
+    s->dek_staged = staged;
     return STM_OK;
 }
 
+/* Live slot count. Caller holds s->lock. */
+static size_t sync_dek_count(stm_sync *s)
+{
+    sync_dek_map *m = dek_map_load(s);
+    return m ? m->count : 0;
+}
+
+/* Borrowed-pointer lookup. Caller holds s->lock (the admin / mutator /
+ * scrub / open paths); the returned pointer is valid for the lock
+ * window only — the map is immutable, so no field can change under the
+ * borrow, and no new map can be published while s->lock is held. The
+ * lock-free read path uses sync_dek_lookup_copy_pinned instead. */
 static sync_dek_slot *sync_dek_find(stm_sync *s,
                                       uint64_t dataset_id, uint64_t key_id)
 {
-    for (size_t i = 0; i < s->dek_count; i++) {
-        if (s->deks[i].dataset_id == dataset_id &&
-             s->deks[i].key_id     == key_id) return &s->deks[i];
+    sync_dek_map *m = dek_map_load(s);
+    if (!m) return NULL;
+    for (size_t i = 0; i < m->count; i++) {
+        if (m->slots[i].dataset_id == dataset_id &&
+             m->slots[i].key_id     == key_id) return &m->slots[i];
     }
     return NULL;
 }
 
+/* Lock-free copy-out lookup for the RC-2 read path. REQUIRES the
+ * caller's EBR pin (stm_ebr_enter held across the call): the pin keeps
+ * a concurrently-retired map alive for the walk + copy (dek_guard.tla
+ * ReaderMapAlive), and enter's trailing seq_cst fence provides the
+ * pin-publish edge (rc-design.md section 4). Returns true + fills
+ * out_dek[32] on a match. */
+static bool sync_dek_lookup_copy_pinned(stm_sync *s,
+                                          uint64_t dataset_id,
+                                          uint64_t key_id,
+                                          uint8_t out_dek[32])
+{
+    sync_dek_map *m = dek_map_load(s);
+    if (!m) return false;
+    for (size_t i = 0; i < m->count; i++) {
+        if (m->slots[i].dataset_id == dataset_id &&
+             m->slots[i].key_id     == key_id) {
+            memcpy(out_dek, m->slots[i].dek, 32);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Insert (dataset_id, key_id, dek) via COW: fill the staged map (or
+ * allocate one) with old slots + the new slot, publish, retire the old
+ * map. Caller holds s->lock. Infallible after a successful
+ * sync_dek_grow(s, count+1) — the fill is pure memcpy. */
 static stm_status sync_dek_insert(stm_sync *s,
                                     uint64_t dataset_id, uint64_t key_id,
                                     const uint8_t dek[32])
 {
     if (sync_dek_find(s, dataset_id, key_id) != NULL) return STM_EEXIST;
-    stm_status rc = sync_dek_grow(s, s->dek_count + 1);
+    sync_dek_map *cur = dek_map_load(s);
+    size_t old_count = cur ? cur->count : 0;
+    stm_status rc = sync_dek_grow(s, old_count + 1);
     if (rc != STM_OK) return rc;
-    sync_dek_slot *slot = &s->deks[s->dek_count++];
-    slot->dataset_id = dataset_id;
-    slot->key_id     = key_id;
-    memcpy(slot->dek, dek, 32);
+
+    sync_dek_map *newm = s->dek_staged;
+    s->dek_staged = NULL;
+    if (old_count > 0)
+        memcpy(newm->slots, cur->slots, old_count * sizeof newm->slots[0]);
+    newm->slots[old_count].dataset_id = dataset_id;
+    newm->slots[old_count].key_id     = key_id;
+    memcpy(newm->slots[old_count].dek, dek, 32);
+    newm->count = old_count + 1;
+
+    dek_map_publish_locked(s, newm);
     return STM_OK;
 }
 
-/* Remove the slot at index `i` by swap-with-last. O(1). */
-static void sync_dek_remove_at(stm_sync *s, size_t i)
-{
-    if (i >= s->dek_count) return;
-    stm_ct_memzero(s->deks[i].dek, 32);
-    size_t last = s->dek_count - 1;
-    if (i != last) s->deks[i] = s->deks[last];
-    memset(&s->deks[last], 0, sizeof s->deks[last]);
-    s->dek_count--;
-}
-
+/* Remove (dataset_id, key_id) via COW: build a copy WITHOUT the entry
+ * (fresh ordered copy — the pre-RC swap-with-last in-place rewrite is
+ * the modeled inplace_mutate bug and is gone by construction), publish,
+ * retire the old map. Caller holds s->lock.
+ *
+ * NEW failure mode vs pre-RC: STM_ENOMEM when the copy cannot be
+ * allocated (the pre-RC in-place remove could not fail). The evict path
+ * propagates it honestly (retryable); the keyschema sweep ignores it —
+ * a pruned key's DEK then lingers in RAM until close (unreachable via
+ * keyschema; scrubbed at close; memory-hygiene-only). */
 static stm_status sync_dek_remove(stm_sync *s,
                                     uint64_t dataset_id, uint64_t key_id)
 {
-    for (size_t i = 0; i < s->dek_count; i++) {
-        if (s->deks[i].dataset_id == dataset_id &&
-             s->deks[i].key_id     == key_id) {
-            sync_dek_remove_at(s, i);
-            return STM_OK;
-        }
+    sync_dek_map *cur = dek_map_load(s);
+    if (!cur) return STM_ENOENT;
+    size_t at = cur->count;
+    for (size_t i = 0; i < cur->count; i++) {
+        if (cur->slots[i].dataset_id == dataset_id &&
+             cur->slots[i].key_id     == key_id) { at = i; break; }
     }
-    return STM_ENOENT;
+    if (at == cur->count) return STM_ENOENT;
+
+    sync_dek_map *newm = dek_map_alloc(cur->cap);
+    if (!newm) return STM_ENOMEM;
+    size_t w = 0;
+    for (size_t i = 0; i < cur->count; i++) {
+        if (i == at) continue;
+        newm->slots[w++] = cur->slots[i];
+    }
+    newm->count = w;
+
+    dek_map_publish_locked(s, newm);
+    return STM_OK;
 }
 
+/* Close-time teardown. Runs on the single-threaded close/unwind path
+ * (the stratumd drain has quiesced every reader; see the P0-3 note in
+ * stm_sync_close). The published map is retired through EBR (uniform
+ * with every other displacement; stm_sync_close's stm_ebr_drain
+ * reclaims it); the staged map was never published, so it is destroyed
+ * directly. */
 static void sync_dek_wipe_all(stm_sync *s)
 {
-    if (!s->deks) return;
-    for (size_t i = 0; i < s->dek_count; i++)
-        stm_ct_memzero(s->deks[i].dek, 32);
-    stm_ct_memzero(s->deks, s->dek_cap * sizeof *s->deks);
-    free(s->deks);
-    s->deks = NULL;
-    s->dek_count = 0;
-    s->dek_cap = 0;
+    sync_dek_map *old = atomic_exchange_explicit(&s->dek_map, NULL,
+                                                    memory_order_acq_rel);
+    if (old) {
+        if (stm_ebr_retire(old, dek_map_destroy) != STM_OK) {
+            /* Leak (bounded, unreachable) — the RC-1 retire-ENOMEM
+             * posture; see dek_map_publish_locked. */
+        }
+        (void)stm_ebr_try_advance();
+    }
+    if (s->dek_staged) {
+        dek_map_destroy(s->dek_staged);
+        s->dek_staged = NULL;
+    }
 }
 
 /* Shared iterate-and-unwrap context used by stm_sync_open to
@@ -1363,9 +1544,16 @@ static stm_sync *sync_new(stm_pool *p, stm_alloc *a)
         free(s);
         return NULL;
     }
+    if (pthread_mutex_init(&s->promote_lock, NULL) != 0) {
+        pthread_mutex_destroy(&s->dcache_wlock);
+        pthread_mutex_destroy(&s->lock);
+        free(s);
+        return NULL;
+    }
     /* RC-1: the dcache retires through EBR, and a sync can exist without
      * an fs mount (tools, tests), so init here too -- idempotent, cheap. */
     if (stm_ebr_init() != STM_OK) {
+        pthread_mutex_destroy(&s->promote_lock);
         pthread_mutex_destroy(&s->dcache_wlock);
         pthread_mutex_destroy(&s->lock);
         free(s);
@@ -1392,6 +1580,7 @@ static stm_sync *sync_new(stm_pool *p, stm_alloc *a)
     stm_cdc_params cdc_params;
     stm_cdc_default_params(&cdc_params);
     if (stm_cdc_init(&s->cdc, &cdc_params) != STM_OK) {
+        pthread_mutex_destroy(&s->promote_lock);
         pthread_mutex_destroy(&s->dcache_wlock);
         pthread_mutex_destroy(&s->lock);
         free(s);
@@ -2587,6 +2776,7 @@ void stm_sync_close(stm_sync *s)
      * strand them in the global buckets until process exit -- the
      * dataset.c teardown posture. */
     stm_ebr_drain();
+    pthread_mutex_destroy(&s->promote_lock);
     pthread_mutex_destroy(&s->dcache_wlock);
     pthread_mutex_destroy(&s->lock);
     free(s);
@@ -4519,7 +4709,7 @@ stm_status stm_sync_add_dataset_key(stm_sync *s,
      * an orphan CURRENT in the schema that no caller could remove.
      * By growing first we turn the subsequent sync_dek_insert into
      * an infallible in-place write. */
-    rc = sync_dek_grow(s, s->dek_count + 1);
+    rc = sync_dek_grow(s, sync_dek_count(s) + 1);
     if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
 
     uint8_t dek[32];
@@ -4612,7 +4802,7 @@ stm_status stm_sync_add_dataset_key_corvus(stm_sync *s,
 
     /* R12 P1-2: pre-reserve the DEK map slot BEFORE any schema
      * mutation so the post-insert sync_dek_insert is infallible. */
-    rc = sync_dek_grow(s, s->dek_count + 1);
+    rc = sync_dek_grow(s, sync_dek_count(s) + 1);
     if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
 
     /* Generate a fresh 32-byte DEK. corvus seals it into an opaque
@@ -4713,7 +4903,7 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
      * mirror missing — future DEK lookups would spuriously ENOENT
      * until the next full sync_open rebuilt the map. Grow first so
      * the post-rotate sync_dek_insert is infallible. */
-    rc = sync_dek_grow(s, s->dek_count + 1);
+    rc = sync_dek_grow(s, sync_dek_count(s) + 1);
     if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
 
     uint8_t dek[32];
@@ -5048,7 +5238,7 @@ stm_status stm_sync_install_dek(stm_sync *s, uint64_t dataset_id,
 
     /* Pre-reserve the map slot so the post-unwrap insert is infallible
      * (mirrors stm_sync_add_dataset_key_corvus). */
-    rc = sync_dek_grow(s, s->dek_count + 1);
+    rc = sync_dek_grow(s, sync_dek_count(s) + 1);
     if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
 
     stm_corvus_transport_opts t = {
@@ -5962,8 +6152,17 @@ static uint64_t sync_resolve_promote_decay_window_cached(stm_sync *s,
         return STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS;
     }
 
+    /* RC-2: promote_cache no longer rides s->lock — the COLD promotion
+     * heuristic runs on the lock-free read path, so the tiny array is
+     * guarded by its own leaf mutex. The lock is NOT held across the
+     * stm_dataset_effective_property slow path (which takes
+     * dataset_idx->lock internally); the insert re-takes it and
+     * re-verifies the gen so a stale resolve cannot overwrite a
+     * post-invalidation cache. */
     uint64_t cur_gen =
             stm_dataset_index_property_mutation_gen(s->dataset_idx);
+
+    pthread_mutex_lock(&s->promote_lock);
     if (cur_gen != s->promote_cache.observed_prop_gen) {
         s->promote_cache.observed_prop_gen = cur_gen;
         s->promote_cache.n_entries = 0;
@@ -5973,12 +6172,14 @@ static uint64_t sync_resolve_promote_decay_window_cached(stm_sync *s,
     for (size_t i = 0; i < s->promote_cache.n_entries; i++) {
         if (s->promote_cache.entries[i].dataset_id == dataset_id) {
             uint64_t v = s->promote_cache.entries[i].decay_window;
+            pthread_mutex_unlock(&s->promote_lock);
             return (v != 0u) ? v
                              : STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS;
         }
     }
+    pthread_mutex_unlock(&s->promote_lock);
 
-    /* Cache miss — slow path. */
+    /* Cache miss — slow path (no promote_lock held). */
     uint64_t v = 0;
     stm_status rc = stm_dataset_effective_property(
             s->dataset_idx, dataset_id,
@@ -5991,12 +6192,28 @@ static uint64_t sync_resolve_promote_decay_window_cached(stm_sync *s,
     }
 
     /* Insert into cache if room. Refuse-new-on-full: pools beyond the
-     * cap see the slow path each time but remain correct. */
-    if (s->promote_cache.n_entries < STM_SYNC_PROMOTE_CACHE_CAP) {
-        size_t i = s->promote_cache.n_entries++;
-        s->promote_cache.entries[i].dataset_id   = dataset_id;
-        s->promote_cache.entries[i].decay_window = v;
+     * cap see the slow path each time but remain correct. Skip the
+     * insert when the gen moved during the slow path (a concurrent
+     * property mutation — the resolved value may be stale) or when a
+     * concurrent miss already inserted this dataset (first match wins;
+     * a duplicate would be benign but wastes a slot). */
+    pthread_mutex_lock(&s->promote_lock);
+    if (cur_gen == s->promote_cache.observed_prop_gen) {
+        bool present = false;
+        for (size_t i = 0; i < s->promote_cache.n_entries; i++) {
+            if (s->promote_cache.entries[i].dataset_id == dataset_id) {
+                present = true;
+                break;
+            }
+        }
+        if (!present
+            && s->promote_cache.n_entries < STM_SYNC_PROMOTE_CACHE_CAP) {
+            size_t i = s->promote_cache.n_entries++;
+            s->promote_cache.entries[i].dataset_id   = dataset_id;
+            s->promote_cache.entries[i].decay_window = v;
+        }
     }
+    pthread_mutex_unlock(&s->promote_lock);
 
     return (v != 0u) ? v : STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS;
 }
@@ -6372,33 +6589,81 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
     return STM_OK;
 }
 
-/* 9.7-impl-5b refactor — decrypt a single extent record's
- * [off, off+len) slice. `rec` may originate from the live tree OR a
- * frozen snap tree; the decrypt path doesn't care — every cipher
- * input lives in `rec`, `s->cas_idx`, `s->pool`, `s->metadata_key`,
- * and `s->deks`. Caller holds s->lock.
- *
- * Forward-references stm_sync_read_extent_locked's slice math
- * verbatim (the function block below was extracted from there). The
- * COLD promote-read-hit bump stays in the live caller — it queries
- * `s->extent_idx` for the LIVE `(dataset_id, ino, off)`, which is
- * meaningless for snap-view reads. */
-static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
-                                                       const stm_extent_record *rec_in,
-                                                       uint64_t off,
-                                                       void *buf, size_t len,
-                                                       size_t *out_read) {
-    stm_extent_record rec = *rec_in;
-    if (off < rec.off) return STM_EINVAL;     /* lookup invariant violation */
-    uint64_t slice_off = off - rec.off;
-    if (slice_off >= rec.len) {
-        /* Past end of this extent — POSIX-EOF for this segment. */
-        *out_read = 0;
+/* RC-2 slice math, factored from the pre-RC decrypt helper verbatim.
+ * Maps the caller's [off, off+len) request onto the extent record:
+ *   STM_EINVAL  — off below the record (lookup invariant violation);
+ *   STM_OK + *out_slice_len == 0 — past this extent (POSIX-EOF for
+ *   the segment; the caller returns *out_read = 0);
+ *   STM_OK + *out_slice_len > 0 — the [slice_off, slice_off+slice_len)
+ *   window of the record's plaintext. */
+static stm_status sync_slice_bounds(const stm_extent_record *rec,
+                                       uint64_t off, size_t len,
+                                       uint64_t *out_slice_off,
+                                       size_t *out_slice_len) {
+    if (off < rec->off) return STM_EINVAL;
+    uint64_t slice_off = off - rec->off;
+    if (slice_off >= rec->len) {
+        *out_slice_off = 0;
+        *out_slice_len = 0;
         return STM_OK;
     }
-    size_t slice_len = (len < (size_t)(rec.len - slice_off))
-                            ? len
-                            : (size_t)(rec.len - slice_off);
+    *out_slice_off = slice_off;
+    *out_slice_len = (len < (size_t)(rec->len - slice_off))
+                          ? len
+                          : (size_t)(rec->len - slice_off);
+    return STM_OK;
+}
+
+/* RC-2: pure dcache probe against the record's cache arm (COLD =
+ * content-hash key, HOT = (paddrs[0], gen) nonce-identity key).
+ * MUST be called under the caller's EBR pin — the copy-under-pin
+ * contract (RC-I1); no pin management inside (nesting is forbidden).
+ * Returns true on a hit with buf filled; the caller accounts. */
+static bool sync_dcache_probe_pinned(stm_sync *s,
+                                        const stm_extent_record *rec,
+                                        uint64_t slice_off, size_t slice_len,
+                                        void *buf) {
+    if (rec->kind == STM_EXTENT_KIND_COLD) {
+        return dcache_lookup_copy(s, rec->content_hash,
+                                    STM_EXTENT_KIND_COLD, rec->len,
+                                    slice_off, slice_len, buf);
+    }
+    uint8_t hkey[STM_CAS_HASH_LEN];
+    dcache_key_hot(hkey, rec->paddrs[0], rec->gen);
+    return dcache_lookup_copy(s, hkey, STM_EXTENT_KIND_HOT,
+                                rec->len, slice_off, slice_len, buf);
+}
+
+/* 9.7-impl-5b refactor, RC-2 shape — fetch + decrypt a single extent
+ * record's [slice_off, slice_off+slice_len) window on a dcache MISS.
+ * `rec` may originate from the live tree OR a frozen snap tree; the
+ * decrypt path doesn't care — every cipher input lives in `rec`,
+ * `s->cas_idx`, `s->pool`, `s->metadata_key`, and the DEK map.
+ *
+ * Context dispatch (`ebr`):
+ *   NULL     — the caller holds s->lock (the pre-RC contract: truncate /
+ *              migrate / snap-read / send compounds). The HOT DEK
+ *              resolve is the borrowed sync_dek_find walk (safe under
+ *              s->lock — see dek_map_load).
+ *   non-NULL — the RC-2 lock-free read path: the caller holds NO lock
+ *              and NO pin (a pin must never span the blocking bdev
+ *              read below). The HOT DEK resolve takes its own SHORT
+ *              pin around sync_dek_lookup_copy_pinned.
+ * Everything else — CAS lookup (self-locked cas_lock), bdev read
+ * (self-locked d->lock), AEAD decrypt (thread-local buffers), dcache
+ * insert (dcache_wlock) — is context-independent.
+ *
+ * The COLD promote-read-hit bump stays in the live callers — it
+ * queries `s->extent_idx` for the LIVE `(dataset_id, ino, off)`,
+ * which is meaningless for snap-view reads. */
+static stm_status sync_extent_fetch_decrypt(stm_sync *s,
+                                               stm_ebr_thread *ebr,
+                                               const stm_extent_record *rec_in,
+                                               uint64_t slice_off,
+                                               size_t slice_len,
+                                               void *buf,
+                                               size_t *out_read) {
+    stm_extent_record rec = *rec_in;
 
     /* P7-CAS-2: COLD-extent read. Resolve content_hash → CAS index
      * entry → AEAD-decrypt one of the replicas under stm_ad_cas
@@ -6406,27 +6671,6 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
      * shape but with metadata_key (CAS uses pool-wide key per
      * ARCH §7.6.3 for cross-dataset shareability) and the CAS AD. */
     if (rec.kind == STM_EXTENT_KIND_COLD) {
-        /* #343: serve the slice from the decrypted-extent cache if the
-         * content_hash is resident -- no disk read, no AEAD decrypt.
-         * RC-1: the probe runs under an EBR pin (the copy-under-pin
-         * contract); a NULL handle (registration OOM) degrades to a
-         * plain miss. At RC-2 this enter/exit hoists to the top of the
-         * unlocked read path, one pin across extent lookup + probe. */
-        {
-            stm_ebr_thread *ebr = stm_ebr_thread_current();
-            if (ebr) {
-                stm_ebr_enter(ebr);
-                bool hit = dcache_lookup_copy(s, rec.content_hash,
-                                              STM_EXTENT_KIND_COLD, rec.len,
-                                              slice_off, slice_len, buf);
-                stm_ebr_exit(ebr);
-                if (hit) {
-                    dcache_account(s, true);
-                    *out_read = slice_len;
-                    return STM_OK;
-                }
-            }
-        }
         if (!s->cas_idx) return STM_ECORRUPT;
         stm_cas_record cas_rec;
         stm_status cs = stm_cas_lookup(s->cas_idx, rec.content_hash, &cas_rec);
@@ -6523,27 +6767,6 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
     if (rec.n_replicas < 1 || rec.n_replicas > STM_EXTENT_MAX_REPLICAS)
         return STM_ECORRUPT;
 
-    /* #343: HOT decrypted-extent cache. Key = (paddrs[0], gen) -- the
-     * AEAD nonce identity (line below feeds the same pair to the cipher);
-     * CoW + monotonic gen make it unique + immutable for the pool's life.
-     * RC-1: probe under an EBR pin (see the COLD arm's note). */
-    {
-        uint8_t hkey[STM_CAS_HASH_LEN];
-        dcache_key_hot(hkey, rec.paddrs[0], rec.gen);
-        stm_ebr_thread *ebr = stm_ebr_thread_current();
-        if (ebr) {
-            stm_ebr_enter(ebr);
-            bool hit = dcache_lookup_copy(s, hkey, STM_EXTENT_KIND_HOT,
-                                          rec.len, slice_off, slice_len, buf);
-            stm_ebr_exit(ebr);
-            if (hit) {
-                dcache_account(s, true);
-                *out_read = slice_len;
-                return STM_OK;
-            }
-        }
-    }
-
     /* P7-10: resolve the DEK by the extent's stamped key_id (NOT
      * the dataset's CURRENT — old extents written before a rotation
      * decrypt under their original RETIRED key_id). STM_ENOENT here
@@ -6564,12 +6787,28 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
      * STM_EBADTAG. Using origin_dataset_id makes the per-extent
      * cross-DEK dispatch self-describing per impl-6e's docstring
      * claim, and matches the AEAD-AD reconstruction at line 5652
-     * which already uses `rec.origin_*` for the same reason. */
-    sync_dek_slot *rd_slot = sync_dek_find(s, rec.origin_dataset_id,
-                                              rec.key_id);
-    if (!rd_slot) return STM_ECORRUPT;
+     * which already uses `rec.origin_*` for the same reason.
+     *
+     * RC-2 context dispatch: lock-free callers (ebr != NULL) copy the
+     * DEK out of the published COW map under a SHORT own pin — taken
+     * here, NOT spanning the bdev read below (a pin must never cover
+     * device I/O; it would stall epoch advance globally). Locked
+     * callers (ebr == NULL) keep the borrowed walk. A miss in either
+     * context is the same ECORRUPT signal. */
     uint8_t dek[32];
-    memcpy(dek, rd_slot->dek, 32);
+    bool dek_found;
+    if (ebr) {
+        stm_ebr_enter(ebr);
+        dek_found = sync_dek_lookup_copy_pinned(s, rec.origin_dataset_id,
+                                                   rec.key_id, dek);
+        stm_ebr_exit(ebr);
+    } else {
+        sync_dek_slot *rd_slot = sync_dek_find(s, rec.origin_dataset_id,
+                                                  rec.key_id);
+        dek_found = (rd_slot != NULL);
+        if (rd_slot) memcpy(dek, rd_slot->dek, 32);
+    }
+    if (!dek_found) return STM_ECORRUPT;
 
     /* R36 P1-3: hardcode AEGIS-256 — see write path for rationale. */
     stm_aead_mode mode = STM_AEAD_AEGIS256;
@@ -6661,6 +6900,44 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
     return STM_OK;
 }
 
+/* The pre-RC under-lock decrypt entry: slice math → self-pinned dcache
+ * probe (the RC-1 shape — a NULL EBR handle degrades to a plain miss)
+ * → fetch+decrypt in the locked context. Caller holds s->lock
+ * (truncate / migrate / snap-read / send compounds). Behavior is
+ * byte-equivalent to the pre-split function. */
+static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
+                                                       const stm_extent_record *rec_in,
+                                                       uint64_t off,
+                                                       void *buf, size_t len,
+                                                       size_t *out_read) {
+    uint64_t slice_off = 0;
+    size_t   slice_len = 0;
+    stm_status bs = sync_slice_bounds(rec_in, off, len,
+                                        &slice_off, &slice_len);
+    if (bs != STM_OK) return bs;
+    if (slice_len == 0) {
+        /* Past end of this extent — POSIX-EOF for this segment. */
+        *out_read = 0;
+        return STM_OK;
+    }
+
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (ebr) {
+        stm_ebr_enter(ebr);
+        bool hit = sync_dcache_probe_pinned(s, rec_in, slice_off,
+                                              slice_len, buf);
+        stm_ebr_exit(ebr);
+        if (hit) {
+            dcache_account(s, true);
+            *out_read = slice_len;
+            return STM_OK;
+        }
+    }
+
+    return sync_extent_fetch_decrypt(s, /*ebr=*/NULL, rec_in,
+                                       slice_off, slice_len, buf, out_read);
+}
+
 stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                    uint64_t off, void *buf, size_t len,
                                    size_t *out_read) {
@@ -6670,6 +6947,104 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
 
     *out_read = 0;
+
+    /* RC-2: the lock-free read path (docs/rc-design.md "RC-2"). No
+     * s->lock anywhere on the common path:
+     *   wedged        — atomic check (racing an in-flight wedge may
+     *                   complete one AEAD-verified read; every later
+     *                   entry refuses);
+     *   extent lookup — the EBR _concurrent engine walk, under ONE pin
+     *                   shared with the dcache probe (the record comes
+     *                   back BY VALUE, so nothing tree-resident is
+     *                   referenced after the exit);
+     *   dcache probe  — under the same pin (RC-I1 copy-under-pin);
+     *   miss          — sync_extent_fetch_decrypt UNPINNED (CAS lookup
+     *                   self-locks, bdev read self-locks, decrypt is
+     *                   thread-local; the HOT DEK resolve takes its own
+     *                   short pin over the published COW map);
+     *   promote bump  — promote_lock (own leaf) + idx->lock (self-
+     *                   locked), current_gen a relaxed snapshot.
+     * STM_EBUSY from the lookup (a mid-walk engine seal) retries whole
+     * with a FRESH pin per attempt (the CF-2c contract); exhaustion
+     * falls back to the serial locked path, which does not touch the
+     * seal machinery — a read never surfaces EBUSY.
+     *
+     * The !ebr fallback (thread-handle registration OOM) and the
+     * EBUSY-exhaustion fallback keep the pre-RC locked body verbatim
+     * below — also the honest wait-measurement point (the concurrent
+     * path reports zero lock wait by construction). */
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (ebr && s->extent_idx) {
+        if (atomic_load_explicit(&s->wedged, memory_order_relaxed))
+            return STM_EWEDGED;
+
+        for (unsigned attempt = 0;
+             attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX; attempt++) {
+            stm_extent_record rec;
+            uint64_t slice_off = 0;
+            size_t   slice_len = 0;
+            bool     hit = false;
+
+            stm_ebr_enter(ebr);
+            stm_status ls = stm_extent_lookup_at_concurrent(
+                    s->extent_idx, ebr, dataset_id, ino, off, &rec);
+            if (ls == STM_OK) {
+                ls = sync_slice_bounds(&rec, off, len,
+                                         &slice_off, &slice_len);
+                if (ls == STM_OK && slice_len > 0) {
+                    hit = sync_dcache_probe_pinned(s, &rec, slice_off,
+                                                     slice_len, buf);
+                }
+            }
+            stm_ebr_exit(ebr);
+
+            if (ls == STM_EBUSY) {
+                sched_yield();
+                continue;                      /* fresh pin per attempt */
+            }
+            if (ls == STM_ENOENT) {
+                /* Hole — return zeros (the locked path's contract). */
+                memset(buf, 0, len);
+                *out_read = len;
+                return STM_OK;
+            }
+            if (ls != STM_OK) return ls;
+            if (slice_len == 0) {
+                /* Past end of this extent — POSIX-EOF for the segment. */
+                *out_read = 0;
+                return STM_OK;
+            }
+
+            stm_status rc;
+            if (hit) {
+                dcache_account(s, true);
+                *out_read = slice_len;
+                rc = STM_OK;
+            } else {
+                rc = sync_extent_fetch_decrypt(s, ebr, &rec, slice_off,
+                                                 slice_len, buf, out_read);
+            }
+
+            /* P7-CAS-11/12/14: COLD promote-read-hit bump (live reads
+             * only). Best-effort + race-tolerant — see the locked
+             * body's comment. current_gen is a relaxed snapshot (an
+             * advisory heuristic input; race list #4). */
+            if (rc == STM_OK && rec.kind == STM_EXTENT_KIND_COLD
+                && *out_read > 0) {
+                uint64_t decay_window =
+                        sync_resolve_promote_decay_window_cached(s,
+                                                                  dataset_id);
+                (void)stm_extent_record_promote_read_hit(
+                        s->extent_idx, dataset_id, ino, off,
+                        atomic_load_explicit(&s->current_gen,
+                                              memory_order_relaxed),
+                        decay_window);
+            }
+            return rc;
+        }
+        /* EBUSY retries exhausted — fall through to the serial locked
+         * path (different lookup machinery; cannot EBUSY). */
+    }
 
     pthread_mutex_lock(&s->lock);
     if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
@@ -6732,6 +7107,52 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
     if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
 
     *out_read = 0;
+
+    /* RC-2: the snap read drops s->lock on the same dispatch as the
+     * live path. The frozen-root lookup is self-locked (ex_lock(idx)
+     * inside stm_extent_index_lookup_at_root — serial throwaway-engine
+     * machinery, no EBUSY); the probe runs under a short pin; the miss
+     * fetch is the shared unlocked body. No promote bump (frozen view;
+     * the pre-RC contract). The !ebr fallback keeps the locked body. */
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (ebr && s->extent_idx) {
+        if (atomic_load_explicit(&s->wedged, memory_order_relaxed))
+            return STM_EWEDGED;
+
+        stm_extent_record rec;
+        stm_status ls = stm_extent_index_lookup_at_root(s->extent_idx,
+                                                          dataset_id,
+                                                          root_paddr, root_gen,
+                                                          root_csum,
+                                                          ino, off, &rec);
+        if (ls == STM_ENOENT) {
+            /* Hole in the frozen tree — zero-fill the slice. Mirrors
+             * the live read path's hole-as-zeros contract. */
+            memset(buf, 0, len);
+            *out_read = len;
+            return STM_OK;
+        }
+        if (ls != STM_OK) return ls;
+
+        uint64_t slice_off = 0;
+        size_t   slice_len = 0;
+        stm_status bs = sync_slice_bounds(&rec, off, len,
+                                            &slice_off, &slice_len);
+        if (bs != STM_OK) return bs;
+        if (slice_len == 0) { *out_read = 0; return STM_OK; }
+
+        stm_ebr_enter(ebr);
+        bool hit = sync_dcache_probe_pinned(s, &rec, slice_off,
+                                              slice_len, buf);
+        stm_ebr_exit(ebr);
+        if (hit) {
+            dcache_account(s, true);
+            *out_read = slice_len;
+            return STM_OK;
+        }
+        return sync_extent_fetch_decrypt(s, ebr, &rec, slice_off,
+                                           slice_len, buf, out_read);
+    }
 
     pthread_mutex_lock(&s->lock);
     if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
@@ -9810,7 +10231,7 @@ size_t stm_sync_dek_count(const stm_sync *s)
     if (!s) return 0;
     stm_sync *ms = (stm_sync *)s;
     pthread_mutex_lock(&ms->lock);
-    size_t n = ms->dek_count;
+    size_t n = sync_dek_count(ms);
     pthread_mutex_unlock(&ms->lock);
     return n;
 }

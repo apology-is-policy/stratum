@@ -85,26 +85,27 @@ tag, so one cache and one key space serve HOT, COLD, and snap-view reads:
 
 ---
 
-## 32.3 The read-path integration — `sync_decrypt_extent_record_locked`
+## 32.3 The read-path integration — probe + fetch (RC-2 as-built)
 
-The cache wraps the per-extent decrypt at the two decrypt sites in
-`sync_decrypt_extent_record_locked` (the function the live read +
-the snap-view read both funnel through; the extent WRITE path additionally
-populates it at commit — CF-5a). At RC-1 the callers still run under
-`s->lock` (RC-2 removes it from the read path); the cache itself no longer
-relies on it.
+The RC-2 restructure split the pre-RC decrypt body into
+`sync_slice_bounds` (pure slice math) + `sync_dcache_probe_pinned` (the
+pure probe — computes the arm key, calls `dcache_lookup_copy`; NO pin
+management inside) + `sync_extent_fetch_decrypt` (the miss body: CAS
+lookup / DEK resolve / bdev read / AEAD decrypt / `dcache_insert`).
+The probe is reached from two shapes:
 
-**The reader protocol (both branches):** resolve the thread's EBR handle
-(`stm_ebr_thread_current()`; a NULL — registration OOM — degrades to a plain
-miss), `stm_ebr_enter`, `dcache_lookup_copy(s, key, kind, rec.len, slice_off,
-slice_len, buf)` — the bucket walk **and the plaintext memcpy both run under
-the pin** — then `stm_ebr_exit`. The lookup copies the requested slice
-directly into the caller's buffer and returns hit/miss; no pointer into the
-cache ever escapes the pin. (At RC-2 the enter/exit pair hoists to the top of
-the unlocked read path — one pin across the extent lookup and this probe;
-nested `stm_ebr_enter` is NOT supported and an inner exit would silently
-unpin the outer walk, so the RC-2 restructure REMOVES these inner pairs
-rather than nesting.)
+- **The lock-free read paths** (`stm_sync_read_extent` + the snap read):
+  ONE `stm_ebr_enter` covers the `_concurrent` extent lookup AND the
+  probe — the RC-1 forward note's hoist, realized (nested enter is NOT
+  supported; the inner pairs were removed, never nested). The bucket walk
+  **and the plaintext memcpy both run under the pin**; no pointer into
+  the cache escapes it. The miss fetch runs UNPINNED (a pin must never
+  span the blocking bdev read).
+- **The under-lock compounds** (truncate / migrate / snap-view / send via
+  `sync_decrypt_extent_record_locked`): the RC-1 protocol verbatim —
+  resolve the thread's EBR handle (`stm_ebr_thread_current()`; a NULL —
+  registration OOM — degrades to a plain miss), enter, probe, exit, then
+  the shared fetch with the borrowed under-lock DEK walk.
 
 **COLD branch:** the probe keyed by `rec.content_hash` sits before the CAS
 lookup + AEAD decrypt; on a miss, decrypt as before, then

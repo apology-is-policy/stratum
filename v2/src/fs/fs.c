@@ -2308,12 +2308,16 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      *     surface; impl-5/5b infrastructure).
      *   - Live-tree INLINE read goes wait-free via EBR + concurrent
      *     inode lookup — pure inode-value read, no extent/sync I/O.
-     *   - Live-tree EXTENT read stays on fs->global SH; the path
-     *     composes with writer-side SH+pin (PARALLEL-3 impl-5) +
-     *     stm_sync_read_extent's internal s->lock + dirty_buffer
-     *     overlay. Retiring SH here needs same-inode reader-pin to
-     *     exclude truncate/write mid-read — forward-noted to LF-3
-     *     followup or 9.8-BE-fs.c. */
+     *   - Live-tree EXTENT read: fs->global SH + the SHARED per-inode
+     *     pin (RC-2, discharging the pre-RC forward note). The sync
+     *     layer's s->lock no longer serializes reads, so the pin is
+     *     what excludes a same-inode truncate/write/punch (all SH +
+     *     EXCLUSIVE pin) mid-read — the whole multi-extent span +
+     *     dirty-buffer overlay observes either the pre-image or the
+     *     post-image of any same-inode mutation, never a mix (RC-I2,
+     *     docs/rc-design.md). Same-inode readers share the pin and
+     *     proceed in parallel; pre-PARALLEL-3 EX mutators + commit
+     *     are excluded by fs->global SH as before. */
     if (fs_ino_is_synth(ino)) {
         pthread_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
@@ -2468,7 +2472,10 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     }
 
     /* EXTENT branch (and legacy direct-extent fallback): SH-rdlock +
-     * stm_sync_read_extent composes with writer-side per-inode pin. */
+     * the RC-2 SHARED per-inode pin around the regular-file read (see
+     * the split-branch comment above). The legacy fallback needs no
+     * pin: its only mutator (the legacy direct-extent write arm) takes
+     * fs->global EX, which our SH already excludes. */
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
 
@@ -2479,9 +2486,36 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         if (ls == STM_OK) {
             uint32_t mode = stm_load_le32(iv.si_mode);
             if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG) {
-                stm_status rs = fs_read_regular_locked(fs, dataset_id, ino,
-                                                            &iv, off, buf, len,
-                                                            out_read);
+                /* Pin BEFORE re-reading the inode value: the unpinned
+                 * lookup above only routed us here; a same-inode
+                 * mutator may land between it and the pin. Re-load
+                 * under the pin so si_size / si_data_kind / the extent
+                 * walk all belong to one coherent image (RC-I2). Pin
+                 * ENOENT = raced unlink — honest ENOENT, the same
+                 * result an instant-earlier read would have returned. */
+                stm_inode_handle *h = NULL;
+                stm_status pp = stm_inode_pin_shared(iidx, dataset_id,
+                                                        ino, &h);
+                if (pp != STM_OK) {
+                    pthread_rwlock_unlock(&fs->global);
+                    return pp;
+                }
+                stm_status rs = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+                if (rs == STM_OK) {
+                    mode = stm_load_le32(iv.si_mode);
+                    if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG) {
+                        rs = fs_read_regular_locked(fs, dataset_id, ino,
+                                                       &iv, off, buf, len,
+                                                       out_read);
+                    } else {
+                        /* Mode changed under us pre-pin (unlink +
+                         * recreate as non-REG) — fall to the legacy
+                         * arm's contract via EINVAL-shape below is
+                         * wrong; surface ENOENT like a raced unlink. */
+                        rs = STM_ENOENT;
+                    }
+                }
+                stm_inode_unpin(iidx, h);
                 pthread_rwlock_unlock(&fs->global);
                 return rs;
             }

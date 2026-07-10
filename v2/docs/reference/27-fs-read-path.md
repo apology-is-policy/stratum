@@ -18,7 +18,9 @@ closed the F2 buffered-read multi-extent-zeros bug surfaced by the Area-A audit.
 ```c
 /* src/fs/fs.c — caller holds fs->global (SH; the rwlock — there is no
  * fs->lock; the INLINE arm is additionally served wait-free BEFORE this
- * path, see 29-concurrency.md 29.7); iv already loaded. */
+ * path, see 29-concurrency.md 29.7) PLUS, since RC-2, the per-inode
+ * SHARED pin (stm_inode_pin_shared) for the whole call; iv is RE-loaded
+ * under the pin. */
 static stm_status fs_read_regular_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
                                          const struct stm_inode_value *iv,
                                          uint64_t off, void *buf, size_t len,
@@ -28,6 +30,20 @@ static stm_status fs_read_regular_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
 `*out_read` is the bytes produced; **a read may legitimately return SHORT** (less
 than `len`) and the caller loops (the 9P `h_read` per-iounit loop; the test
 `read_full`). EOF is `*out_read == 0`.
+
+**RC-2 concurrency shape** (`docs/rc-design.md`; 29-concurrency.md §29.12):
+`stm_sync_read_extent` beneath this path no longer takes `s->lock` — the
+extent lookup is the EBR `_concurrent` walk, the bdev read + AEAD decrypt
+run unlocked, the decrypted-extent cache is the RC-1 lock-free probe. The
+same-inode read-vs-truncate/write exclusion that `s->lock` incidentally
+provided moved HERE: `stm_fs_read`'s extent arm takes the inode's SHARED
+pin before re-loading `iv` and holds it across the whole multi-extent +
+overlay read, so one `stm_fs_read` call observes either the pre-image or
+the post-image of any same-inode mutation, never a mix (RC-I2; mutators
+hold the EXCLUSIVE pin). Same-inode readers share the pin and proceed in
+parallel; a pin `STM_ENOENT` is a raced unlink and surfaces as `ENOENT`.
+Runtime witness: `tests/test_rc2_concurrent.c::rc2_fs_read_vs_mutate_
+single_version`.
 
 ## Implementation
 

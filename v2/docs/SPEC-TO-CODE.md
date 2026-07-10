@@ -73,7 +73,7 @@ user-voted 2026-07-10); the code column names the RC-1 targets in
 | Inv `LinkedNeverReclaimed` | unlink-before-retire                               | Buggy cfg `retire_still_linked`. |
 | Prop `EventuallyReclaimed` | no permanent entry/buffer leak once unpinned       | Liveness witness (rc-design §6). |
 
-## `dek_guard.tla` ↔ v2 code (RC arc, spec-first — impl lands at RC-2)
+## `dek_guard.tla` ↔ v2 code (RC arc, spec-first — impl LANDED at RC-2)
 
 Models the RC-2 DEK read guard (`docs/rc-design.md` §4, "The DEK guard").
 Resolves the scripture's deferred mechanism fork to EBR-published immutable
@@ -81,18 +81,18 @@ DEK-map snapshots (COW publish + EBR retire) — the seqlock alternative is
 unsound over `sync_dek_grow`'s realloc-moving array (a retrying reader
 dereferences freed memory), and COW+EBR reuses the RC-1 idiom.
 
-| Spec variable / action | Code correspondent (RC-2)                             | Notes |
+| Spec variable / action | Code correspondent (RC-2, `src/sync/sync.c`)          | Notes |
 |------------------------|-------------------------------------------------------|-------|
-| `map_slots[m]`         | an immutable heap DEK-map array (replaces mutable `s->deks`) | Built full, then published; never mutated after publish. |
-| `published`            | an atomic pointer to the current map                   | Readers acquire-load it under an EBR pin. |
-| `Install(d)`/`Evict(d)`| `stm_sync_install_dek` / `stm_sync_evict_dek` / rotate | Admin mutators KEEP `s->lock` among themselves; each builds a copy, publishes, retires the old map. |
-| `map_ring` / `AdvanceEpoch` | `stm_ebr_retire(old_map, destructor)`             | The destructor memzeroes all key material before free (secret hygiene; below the model's abstraction — audit obligation). |
-| `rd_map[t]`            | the reader's loaded map pointer                        | Valid only within the pin. |
-| `rd_want`/`rd_slot`/`rd_got` | `sync_dek_find`'s match + the 32-byte DEK memcpy | Find and copy are separate steps — the window the guard closes. |
+| `map_slots[m]`         | `struct sync_dek_map` (count + cap + flexible slots)  | Built full, then published; never mutated after publish. `s->deks`/`dek_count`/`dek_cap` are retired. |
+| `published`            | `s->dek_map` (`sync_dek_map *_Atomic`)                | `dek_map_publish_locked` = release exchange; readers acquire-load via `dek_map_load` under an EBR pin (`sync_dek_lookup_copy_pinned`); the pin-publish edge is stm_ebr_enter's trailing seq_cst fence (RC-1 audit F1). |
+| `Install(d)`/`Evict(d)`| `sync_dek_insert` / `sync_dek_remove` (reached by add/rotate/sweep/`stm_sync_install_dek`/`stm_sync_evict_dek`) | Admin mutators KEEP `s->lock` among themselves; each builds a copy (insert may consume the `s->dek_staged` pre-allocation — the infallible-insert-after-grow contract), publishes, retires the old map. Remove is newly ENOMEM-fallible (COW copy); evict propagates, the sweep skips (lingering slot scrubbed at close). |
+| `map_ring` / `AdvanceEpoch` | `stm_ebr_retire(old, dek_map_destroy)` + `stm_ebr_try_advance` | The destructor memzeroes header+cap slots before free (secret hygiene; satisfies the RC-1 F2 destructor lock contract). Retire-ENOMEM leaks WITHOUT scrubbing (zeroing under a possibly-pinned reader corrupts an in-flight copy — the RC-1 posture). |
+| `rd_map[t]`            | `sync_dek_lookup_copy_pinned`'s loaded map pointer     | Valid only within the caller's pin. Under-`s->lock` readers (`sync_dek_find`, borrowed pointer) need no pin: publish requires `s->lock`, so the loaded map cannot be retired. |
+| `rd_want`/`rd_slot`/`rd_got` | the walk match + the 32-byte DEK memcpy inside `sync_dek_lookup_copy_pinned` | Find and copy are one pinned window — the guard the model demands. |
 | `evicted` (ghost)      | — (history variable)                                   | States the fail-closed contract. |
-| Inv `ReaderGetsWanted` | RC-I3 NoTornDEK: matched (dataset,key) never yields other key material | Buggy cfg `inplace_mutate` = today's swap-with-last (`sync_dek_remove_at`) minus `s->lock`. |
-| Inv `ReaderMapAlive`   | RC-I3: no reader dereferences a freed map (realloc/free UAF) | Buggy cfg `free_old_map`. |
-| Inv `PublishedExcludesEvicted` | RC-I3 fail-closed-after-evict (the A-5 post-logout contract; the dcache-plaintext half is RC-1's drain) | Buggy cfg `evict_no_publish`. |
+| Inv `ReaderGetsWanted` | RC-I3 NoTornDEK: matched (dataset,key) never yields other key material | Buggy cfg `inplace_mutate` = the retired swap-with-last (`sync_dek_remove_at`, now deleted — remove builds a fresh ordered copy, so the modeled bug is gone by construction). Runtime witness: `tests/test_rc2_concurrent.c::rc2_dek_rotate_sweep_hammer`. |
+| Inv `ReaderMapAlive`   | RC-I3: no reader dereferences a freed map (realloc/free UAF) | Buggy cfg `free_old_map`. The realloc-moving `sync_dek_grow` is retired (grow now stages an unpublished buffer). |
+| Inv `PublishedExcludesEvicted` | RC-I3 fail-closed-after-evict (the A-5 post-logout contract; the dcache-plaintext half is RC-1's drain) | Buggy cfg `evict_no_publish`. `stm_sync_evict_dek` → `sync_dek_remove` publishes the without-entry map before returning. |
 
 ## Change process
 
