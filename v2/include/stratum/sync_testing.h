@@ -57,6 +57,18 @@ stm_status stm_sync_set_cdc_params_for_test(stm_sync *s,
                                               const stm_cdc_params *params);
 
 /*
+ * Drop every decrypted-extent cache entry (takes s->lock).
+ *
+ * The extent WRITE path populates the cache (the plaintext is in hand
+ * at write time), so a freshly-written extent's first read is served
+ * from RAM. Tests that exercise the DISK read path — replica
+ * fallback, corrupted-replica error surfacing, decrypt-on-read —
+ * call this between the write and the read; without it those reads
+ * never consult the device and pass (or fail) vacuously.
+ */
+void stm_sync_dcache_drain_for_test(stm_sync *s);
+
+/*
  * TLY-A3-keyslot: insert a keyschema slot carrying a chosen
  * `wrapper` tag and an opaque `wrapped` blob, WITHOUT performing a
  * real cryptographic wrap. Persisted on the next stm_sync_commit.

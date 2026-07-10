@@ -645,6 +645,29 @@ STM_TEST(dcache_hit_serves_same_plaintext) {
     STM_ASSERT_OK(stm_fs_commit(fs));
 
     struct stm_sync *sy = stm_fs_sync(fs);
+
+    /* Write-populate: the committed write left this extent's plaintext
+     * resident, so a pre-drain read is a HIT serving the just-written
+     * bytes -- no device read, no decrypt. */
+    {
+        uint64_t hw0 = 0, mw0 = 0; size_t bw0 = 0;
+        stm_sync_dcache_stats(sy, &hw0, &mw0, &bw0);
+        uint8_t outw[8192] = {0};
+        size_t gotw = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 0, outw, sizeof outw, &gotw));
+        STM_ASSERT_EQ((int)gotw, (int)sizeof outw);
+        uint64_t hw1 = 0, mw1 = 0; size_t bw1 = 0;
+        stm_sync_dcache_stats(sy, &hw1, &mw1, &bw1);
+        STM_ASSERT_EQ((int)(hw1 - hw0), 1);        /* served from the write */
+        STM_ASSERT_EQ((int)(mw1 - mw0), 0);
+        STM_ASSERT_EQ(memcmp(outw, src, sizeof outw), 0);
+    }
+
+    /* Drain so the miss -> hit choreography below exercises the DISK
+     * path (decrypt-on-read + whole-extent fill), not the write-
+     * populated entry. */
+    stm_sync_dcache_drain_for_test(sy);
+
     uint64_t h0 = 0, m0 = 0; size_t b0 = 0;
     stm_sync_dcache_stats(sy, &h0, &m0, &b0);
 
@@ -689,11 +712,12 @@ STM_TEST(dcache_hit_serves_same_plaintext) {
 
 /* #343 dcache (Area E) -- THE safety-critical property. After a copy-on-write
  * overwrite (a new commit -> a new extent gen, the AEAD-nonce identity), a
- * re-read of the same offset MUST decrypt the NEW extent (a MISS on the new
- * (paddr,gen) key) and serve the NEW bytes -- never the stale cached plaintext
- * from the pre-overwrite extent. Non-vacuous: a cache keyed without the gen
- * (e.g. ino+offset) would HIT and serve the stale bytes, failing BOTH the
- * miss-stat delta AND the content compare. */
+ * re-read of the same offset MUST serve the NEW bytes -- never the stale
+ * cached plaintext from the pre-overwrite extent. Two legs: (1) the write
+ * populated the NEW (paddr,gen) identity, so an undrained re-read HITS and
+ * must carry B (a cache keyed without the gen -- e.g. ino+offset -- would
+ * serve stale A and fail the content compare); (2) after a drain, the
+ * fresh decrypt-from-disk on the new key must also serve B. */
 STM_TEST(dcache_cow_overwrite_serves_new_plaintext) {
     make_tmp("dcache_cow");
     stm_fs_format_opts fopts = default_format_opts();
@@ -734,16 +758,30 @@ STM_TEST(dcache_cow_overwrite_serves_new_plaintext) {
     uint64_t h0 = 0, m0 = 0; size_t bb0 = 0;
     stm_sync_dcache_stats(sy, &h0, &m0, &bb0);
 
-    /* Re-read the same offset: the new extent's (paddr,gen) key is fresh
-     * -> MISS -> decrypts B. The stale A entry is never served. */
+    /* Leg 1 -- write-populate under CoW: the overwrite committed and
+     * populated the NEW (paddr,gen) identity, so this read HITS and MUST
+     * carry B. Stale A here would mean the populated key aliased the
+     * dropped extent (the hazard the commit-point placement closes). */
     memset(out, 0, sizeof out);
     STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 0, out, sizeof out, &got));
     STM_ASSERT_EQ((int)got, (int)sizeof out);
     uint64_t h1 = 0, m1 = 0; size_t bb1 = 0;
     stm_sync_dcache_stats(sy, &h1, &m1, &bb1);
-    STM_ASSERT_EQ((int)(m1 - m0), 1);              /* a fresh decrypt, not a stale hit */
-    STM_ASSERT_EQ((int)(h1 - h0), 0);
+    STM_ASSERT_EQ((int)(h1 - h0), 1);              /* served from the write */
+    STM_ASSERT_EQ((int)(m1 - m0), 0);
     STM_ASSERT_EQ(memcmp(out, b, sizeof out), 0);  /* NEW bytes, not stale A */
+
+    /* Leg 2 -- fresh decrypt from disk: drain, re-read. The new extent's
+     * (paddr,gen) key MISSES and decrypts B off the device. */
+    stm_sync_dcache_drain_for_test(sy);
+    memset(out, 0, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, fino, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ((int)got, (int)sizeof out);
+    uint64_t h2 = 0, m2 = 0; size_t bb2 = 0;
+    stm_sync_dcache_stats(sy, &h2, &m2, &bb2);
+    STM_ASSERT_EQ((int)(m2 - m1), 1);              /* a fresh decrypt, not a stale hit */
+    STM_ASSERT_EQ((int)(h2 - h1), 0);
+    STM_ASSERT_EQ(memcmp(out, b, sizeof out), 0);  /* B off the device too */
 
     free(a); free(b);
     STM_ASSERT_OK(stm_fs_unmount(fs));

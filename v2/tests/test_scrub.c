@@ -38,6 +38,7 @@
 #include <stratum/scrub.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
+#include <stratum/sync_testing.h>   /* dcache drain: disk-path reads */
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -1899,8 +1900,11 @@ STM_TEST(scrub_p7_6_replica_walk_repairs_one_corrupt_replica) {
     /* Exactly one extent base reported REPAIRED. */
     STM_ASSERT_EQ(st.blocks_repaired,    1u);
 
-    /* Post-scrub: read the extent back. Both replicas should now
-     * AEAD-verify; stm_sync_read_extent picks the first OK. */
+    /* Post-scrub: read the extent back FROM DISK. Both replicas should
+     * now AEAD-verify; stm_sync_read_extent picks the first OK. The
+     * write populated the dcache, so drain first -- an undrained read
+     * would serve from RAM and prove nothing about the repaired disk. */
+    stm_sync_dcache_drain_for_test(fx.s);
     uint8_t out[4096] = {0};
     size_t got = 0;
     STM_ASSERT_OK(stm_sync_read_extent(fx.s, 1, 1, 0, out, sizeof out, &got));
@@ -1938,8 +1942,12 @@ STM_TEST(scrub_p7_6_replica_walk_unrepairable_when_all_corrupt) {
     /* The extent's base paddr charges UNREPAIRABLE. */
     STM_ASSERT(st.blocks_unrepairable >= 1u);
 
-    /* Read returns STM_EBADTAG (last error from the read replica
-     * walk; bptr.tla::NoOriginalOKMeansUnrepairable). */
+    /* A DISK read returns STM_EBADTAG (last error from the read replica
+     * walk; bptr.tla::NoOriginalOKMeansUnrepairable). Drain the write-
+     * populated dcache first: a cached read would (correctly) serve the
+     * pre-corruption plaintext and never consult the mangled replicas --
+     * this test exists to prove the disk path's error surfacing. */
+    stm_sync_dcache_drain_for_test(fx.s);
     uint8_t out[4096] = {0};
     size_t got = 0;
     stm_status rs = stm_sync_read_extent(fx.s, 1, 1, 0, out, sizeof out, &got);
@@ -1957,6 +1965,11 @@ STM_TEST(scrub_p7_6_read_path_falls_back_to_healthy_replica) {
     mirror2_extent_setup(&fx, "read_fallback");
 
     corrupt_replica_on_disk(fx.paths[0], fx.extent_rec.paddrs[0]);
+
+    /* Drain the write-populated dcache so the read actually walks the
+     * replicas on disk -- a cached hit would bypass the fallback logic
+     * this test exists to exercise. */
+    stm_sync_dcache_drain_for_test(fx.s);
 
     uint8_t out[4096] = {0};
     size_t got = 0;

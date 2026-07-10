@@ -35,6 +35,7 @@
 #include <stratum/block.h>
 #include <stratum/corvus_client.h>
 #include <stratum/crypto.h>
+#include <stratum/dataset.h>
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
 #include <stratum/pool.h>
@@ -443,12 +444,44 @@ STM_TEST(corvus_install_evict_dek_roundtrip) {
     /* Idempotent re-install -> OK, no re-unwrap, no double-insert. */
     STM_ASSERT_OK(stm_sync_install_dek(s2, CORVUS_DATASET_ID, &cc));
 
+    /* Regression: evict_dek must drain the decrypted-extent cache.
+     * A fresh CORVUS dataset (real create_child + real WRAP over the
+     * fake corvus -- CORVUS_DATASET_ID has a keyschema slot but no
+     * dataset-index presence, so extent writes to it ENOENT) is
+     * written while unlocked: the write path populates the cache with
+     * the plaintext -- the extent need never be READ for its cleartext
+     * to become resident. After evict, a read of that extent must be
+     * DENIED, not served from RAM past the DEK denial (pre-drain this
+     * returned STM_OK + the plaintext). Asserted as "not OK" rather
+     * than an exact code: the read path's missing-DEK error is
+     * STM_ECORRUPT today (the write path's is STM_ELOCKED -- a
+     * recorded alignment seam). */
+    {
+        uint64_t ds_ev = 0;
+        STM_ASSERT_OK(stm_dataset_create_child(stm_sync_dataset_index(s2),
+                                                  1u, "evictcache", &ds_ev));
+        static const char ev_path[] = "users/evictcache";
+        uint64_t ev_kid = 999;
+        STM_ASSERT_OK(stm_sync_add_dataset_key_corvus(
+                          s2, ds_ev, ev_path, sizeof ev_path - 1, &cc,
+                          &ev_kid));
+        STM_ASSERT_OK(stm_sync_write_extent(s2, ds_ev, 1u, 0u,
+                                              buf, sizeof buf));
+        STM_ASSERT_OK(stm_sync_evict_dek(s2, ds_ev));
+        uint8_t rout[4096] = {0};
+        size_t rgot = 0;
+        stm_status rrs = stm_sync_read_extent(s2, ds_ev, 1u, 0u,
+                                                rout, sizeof rout, &rgot);
+        STM_ASSERT(rrs != STM_OK);
+    }
+
     /* evict_dek removes + zeroes the DEK -> the dataset re-locks. */
     STM_ASSERT_OK(stm_sync_evict_dek(s2, CORVUS_DATASET_ID));
     STM_ASSERT_ERR(stm_sync_get_dek(s2, CORVUS_DATASET_ID, CORVUS_KEY_ID,
                                       dek), STM_ENOENT);
     STM_ASSERT_ERR(stm_sync_write_extent(s2, CORVUS_DATASET_ID, 1u, 0u,
                                            buf, sizeof buf), STM_ELOCKED);
+
 
     /* Idempotent re-evict -> OK. */
     STM_ASSERT_OK(stm_sync_evict_dek(s2, CORVUS_DATASET_ID));

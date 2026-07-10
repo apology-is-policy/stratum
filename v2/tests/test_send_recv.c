@@ -29,6 +29,7 @@
 #include <stratum/send_recv.h>
 #include <stratum/snapshot.h>
 #include <stratum/sync.h>
+#include <stratum/sync_testing.h>   /* dcache drain: on-disk decrypt proof */
 #include <stratum/types.h>
 
 #include <stdio.h>
@@ -172,7 +173,11 @@ STM_TEST(full_send_roundtrip_three_extents) {
     stm_send_close(sh);
     stm_recv_close(rh);
 
-    /* Verify target's extents byte-for-byte. */
+    /* Verify target's extents byte-for-byte FROM DISK: recv applied them
+     * via the write path, which populates the decrypted-extent cache --
+     * drain it so this read proves the target's on-disk ciphertext
+     * decrypts under the target key, not that the cache echoes back. */
+    stm_sync_dcache_drain_for_test(s_tgt);
     uint8_t out[4096] = {0};
     size_t got = 0;
     STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out, sizeof out, &got));
@@ -261,7 +266,9 @@ STM_TEST(incremental_send_filters_by_extent_txg) {
     stm_send_close(sh);
     stm_recv_close(rh);
 
-    /* Target should have B (post-snap_a) but NOT A (pre-snap_a). */
+    /* Target should have B (post-snap_a) but NOT A (pre-snap_a). Drain
+     * the write-populated dcache so the read proves the on-disk state. */
+    stm_sync_dcache_drain_for_test(s_tgt);
     uint8_t out[4096] = {0};
     size_t got = 0;
     STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0, out, sizeof out, &got));
@@ -753,6 +760,9 @@ STM_TEST(p7cas9_mixed_hot_cold_roundtrip) {
     STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_tgt));
     STM_ASSERT_EQ(n_tgt, (size_t)1);
 
+    /* Drain the write-populated dcache: the HOT read-back must prove the
+     * target's on-disk ciphertext decrypts, not echo the recv's cache. */
+    stm_sync_dcache_drain_for_test(tgt_sync);
     uint8_t out_hot[4096] = {0}, out_cold[4096] = {0};
     size_t got_h = 0, got_c = 0;
     STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out_hot,  sizeof out_hot,  &got_h));

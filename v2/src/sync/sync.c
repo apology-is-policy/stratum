@@ -150,9 +150,22 @@ _Static_assert(STM_SYNC_WRAPPED_KEY_LEN <= STM_KEYSCHEMA_WRAPPED_MAX,
  * ms, deterministic across boots). The win is queueing-amplified: stratumd is
  * serial, so every avoided miss frees it from a bdev-read + whole-extent
  * decrypt that all subsequent ops wait behind. 256 slots is marginal (~56%,
- * +1 MB cached) -- 128 is the knee; the hot working set is ~46 MB, and the
- * 128 MiB ceiling is the per-sync RAM cap (a runtime-tunable is a v1.x seam). */
-#define STM_DCACHE_ENTRIES     128u
+ * +1 MB cached) -- 128 was the knee THEN; the hot working set was ~46 MB, and
+ * the 128 MiB ceiling is the per-sync RAM cap (a runtime-tunable is a v1.x
+ * seam).
+ *
+ * Re-sized 2026-07-10 (measured on-device, post-guest-page-cache): with the
+ * guest absorbing short-range re-reads, the reads that REACH the server are
+ * working-set re-touches across whole builds -- a warm go build was 65% MISS
+ * because 128 slots retain ~10-40 MB while the cross-build read set is
+ * ~100-120 MB (well under the byte cap: the cache was SLOT-bound again, the
+ * same #343 signature one order up). 2048 slots puts the byte cap back in
+ * charge. At 2048 the old linear-scan lookup would cost ~30us/read, so the
+ * lookup goes through a chained hash (buckets + per-entry next; 1-based
+ * indices so calloc-zero stays a valid empty cache); insert-side scans
+ * (free slot, LRU victim) stay linear -- they run per-miss, not per-read. */
+#define STM_DCACHE_ENTRIES     2048u
+#define STM_DCACHE_HASH_BUCKETS 4096u                  /* 2x entries; power of 2 */
 #define STM_DCACHE_BYTES_MAX   (128u * 1024u * 1024u)  /* 128 MiB per-sync cap */
 #define STM_DCACHE_LOG_EVERY   1024u                   /* STM_DCACHE_STATS dev log cadence */
 
@@ -162,6 +175,7 @@ struct sync_dcache_entry {
     uint8_t *plaintext;               /* malloc(len); NULL == empty slot */
     size_t   len;
     uint64_t lru_tick;
+    int32_t  hnext;                   /* 1-based next-in-bucket; 0 == end */
 };
 
 /* The COLD key is the extent record's content_hash (STM_EXTENT_HASH_LEN)
@@ -171,8 +185,14 @@ struct sync_dcache_entry {
 _Static_assert(STM_EXTENT_HASH_LEN == STM_CAS_HASH_LEN,
                "dcache COLD key copies content_hash into a CAS-hash-wide slot");
 
-/* Forward decl: stm_sync_close (above the decrypt path) drains the cache. */
+/* Forward decls: stm_sync_close (above the decrypt path) drains the cache;
+ * the extent write path (above the cache impl) write-populates it. */
 static void dcache_drain(stm_sync *s);
+static void dcache_key_hot(uint8_t out[STM_CAS_HASH_LEN],
+                           uint64_t paddr0, uint64_t gen);
+static void dcache_insert(stm_sync *s, const uint8_t key[STM_CAS_HASH_LEN],
+                          uint8_t kind_tag,
+                          const uint8_t *plaintext, size_t len);
 
 struct stm_sync {
     pthread_mutex_t lock;
@@ -181,6 +201,7 @@ struct stm_sync {
      * under s->lock). All-zero (from calloc) is a valid empty cache, so
      * no explicit init; dcache_drain frees the live plaintexts at close. */
     struct sync_dcache_entry dcache[STM_DCACHE_ENTRIES];
+    int32_t  dcache_hash[STM_DCACHE_HASH_BUCKETS]; /* 1-based entry idx; 0 == empty */
     uint64_t dcache_tick;
     size_t   dcache_bytes;
     uint64_t dcache_hits;
@@ -5019,6 +5040,16 @@ stm_status stm_sync_evict_dek(stm_sync *s, uint64_t dataset_id)
     }
 
     rc = sync_dek_remove(s, dataset_id, key_id);   /* zeroes the slot */
+    /* The decrypted-extent cache holds CLEARTEXT the evicted DEK
+     * protected -- resident from both reads and writes while the
+     * dataset was unlocked. Drain it, or a post-logout read of a
+     * cached extent is served from RAM past the DEK denial, defeating
+     * the re-lock (and the memzero'd DEK's purpose). The HOT key
+     * carries no dataset_id, so selective invalidation is impossible;
+     * eviction is rare (logout) and the cache re-warms. Drained on the
+     * idempotent already-evicted path too, so a re-evict restores the
+     * locked posture even if a prior evict predates this guarantee. */
+    dcache_drain(s);
     pthread_mutex_unlock(&s->lock);
     return (rc == STM_ENOENT) ? STM_OK : rc;       /* already-evicted is OK */
 }
@@ -5235,6 +5266,16 @@ stm_status stm_sync_keyschema_insert_for_test(stm_sync *s,
                                                    corvus_dataset_path_len);
     pthread_mutex_unlock(&s->lock);
     return rc;
+}
+
+/* Test-only dcache drop. See <stratum/sync_testing.h> for why disk-
+ * path tests need it (the write path populates the cache). */
+void stm_sync_dcache_drain_for_test(stm_sync *s)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    dcache_drain(s);
+    pthread_mutex_unlock(&s->lock);
 }
 #endif /* STRATUM_BUILD_TESTING_HOOKS */
 
@@ -5681,6 +5722,23 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
         return os;
     }
 
+    /* Write-populate the decrypted-extent cache: the plaintext is in hand,
+     * so a later re-read of this extent becomes a hit instead of a bdev
+     * read + whole-extent decrypt. Keyed exactly as the HOT read path will
+     * look it up -- (paddr0 = replicas[0], gen = current_gen), the identity
+     * stm_extent_overwrite just committed. Cache only on the success path
+     * (after the extent is committed-live): a failed write must not leave
+     * its never-live bytes servable. Key uniqueness needs no placement
+     * help -- the monotonic gen + the allocator's PENDING discipline
+     * (a freed paddr, rollback included, re-reserves only after the gen
+     * advances) already guarantee (paddr0, gen) is never reused for
+     * different bytes. */
+    {
+        uint8_t wkey[STM_CAS_HASH_LEN];
+        dcache_key_hot(wkey, replicas[0], s->current_gen);
+        dcache_insert(s, wkey, STM_EXTENT_KIND_HOT, buf, len);
+    }
+
     /* R36 P1-1 + P2-1: best-effort drain. */
     stm_status drop_err = STM_OK;
     for (size_t i = 0; i < n_dropped; i++) {
@@ -5879,16 +5937,50 @@ static void dcache_key_hot(uint8_t out[STM_CAS_HASH_LEN],
     memcpy(out + 8, g.v, 8);
 }
 
+/* Bucket for a (key, kind) pair. Both key kinds carry their identity in the
+ * first 16 bytes (COLD: content_hash prefix; HOT: paddr0 || gen), so fold
+ * those and Fibonacci-mix -- a paddr reused across generations differs only
+ * in bytes [8..16), which the fold covers. */
+static uint32_t dcache_bucket(const uint8_t key[STM_CAS_HASH_LEN],
+                              uint8_t kind_tag) {
+    uint64_t a, b;
+    memcpy(&a, key, sizeof a);
+    memcpy(&b, key + 8, sizeof b);
+    uint64_t h = (a ^ (b * UINT64_C(0x9E3779B97F4A7C15)))
+                 ^ ((uint64_t)kind_tag << 56);
+    h *= UINT64_C(0x9E3779B97F4A7C15);
+    return (uint32_t)(h >> 33) & (STM_DCACHE_HASH_BUCKETS - 1u);
+}
+
+static void dcache_hash_link(stm_sync *s, struct sync_dcache_entry *e) {
+    uint32_t b = dcache_bucket(e->key, e->kind_tag);
+    e->hnext = s->dcache_hash[b];
+    s->dcache_hash[b] = (int32_t)(e - s->dcache) + 1;
+}
+
+static void dcache_hash_unlink(stm_sync *s, struct sync_dcache_entry *e) {
+    uint32_t b = dcache_bucket(e->key, e->kind_tag);
+    int32_t idx = (int32_t)(e - s->dcache) + 1;
+    int32_t *pp = &s->dcache_hash[b];
+    while (*pp != 0) {
+        if (*pp == idx) { *pp = e->hnext; e->hnext = 0; return; }
+        pp = &s->dcache[*pp - 1].hnext;
+    }
+    e->hnext = 0;   /* defensive: not linked == nothing to do */
+}
+
 static const uint8_t *dcache_lookup(stm_sync *s,
                                      const uint8_t key[STM_CAS_HASH_LEN],
                                      uint8_t kind_tag, size_t len) {
-    for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
-        struct sync_dcache_entry *e = &s->dcache[i];
+    for (int32_t idx = s->dcache_hash[dcache_bucket(key, kind_tag)];
+         idx != 0; ) {
+        struct sync_dcache_entry *e = &s->dcache[idx - 1];
         if (e->plaintext && e->kind_tag == kind_tag && e->len == len
                 && memcmp(e->key, key, STM_CAS_HASH_LEN) == 0) {
             e->lru_tick = ++s->dcache_tick;
             return e->plaintext;
         }
+        idx = e->hnext;
     }
     return NULL;
 }
@@ -5916,6 +6008,7 @@ static void dcache_insert(stm_sync *s,
             slot->len       = len;
             slot->lru_tick  = ++s->dcache_tick;
             s->dcache_bytes += len;
+            dcache_hash_link(s, slot);
             return;
         }
         /* No free slot OR inserting would exceed the byte budget -- evict
@@ -5929,6 +6022,7 @@ static void dcache_insert(stm_sync *s,
             if (!victim || e->lru_tick < victim->lru_tick) victim = e;
         }
         if (!victim) return;                   /* defensive: nothing to evict */
+        dcache_hash_unlink(s, victim);
         stm_ct_memzero(victim->plaintext, victim->len);
         free(victim->plaintext);
         s->dcache_bytes -= victim->len;
@@ -5946,7 +6040,9 @@ static void dcache_drain(stm_sync *s) {
             e->plaintext = NULL;
             e->len = 0;
         }
+        e->hnext = 0;
     }
+    memset(s->dcache_hash, 0, sizeof s->dcache_hash);
     s->dcache_bytes = 0;
 }
 
