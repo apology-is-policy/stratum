@@ -5287,7 +5287,15 @@ stm_status stm_sync_evict_dek(stm_sync *s, uint64_t dataset_id)
         return STM_EINVAL;
     }
 
-    rc = sync_dek_remove(s, dataset_id, key_id);   /* zeroes the slot */
+    /* RC-2: publishes a copy WITHOUT the entry; the removed key's bytes
+     * are scrubbed when the retired map is EBR-reclaimed
+     * (dek_map_destroy), not synchronously here — the COW hygiene
+     * window (audit F2): the raw DEK lingers in the unreachable
+     * retired map until the next epoch advance (driven at every
+     * publish), bounded and unreachable, matching the RC-1 retire
+     * posture. The dcache_drain below covers the PLAINTEXT the DEK
+     * protected. */
+    rc = sync_dek_remove(s, dataset_id, key_id);
     /* The decrypted-extent cache holds CLEARTEXT the evicted DEK
      * protected -- resident from both reads and writes while the
      * dataset was unlocked. Drain it, or a post-logout read of a

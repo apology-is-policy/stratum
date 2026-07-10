@@ -169,6 +169,15 @@ static void rc2_fill(uint8_t *b, uint64_t ino, uint32_t ver, size_t len)
     for (size_t j = 0; j < len; j++) b[j] = rc2_pat(ino, ver, j);
 }
 
+/* Fill for a write at file offset `base`: the pattern is FILE-absolute
+ * so a read at offset X verifies with j0 = X — two extents of one ino
+ * can never alias each other's content. */
+static void rc2_fill_at(uint8_t *b, uint64_t ino, uint32_t ver,
+                        size_t base, size_t len)
+{
+    for (size_t j = 0; j < len; j++) b[j] = rc2_pat(ino, ver, base + j);
+}
+
 /* Derive the version encoded at absolute offset `j0` of buffer byte 0. */
 static inline uint8_t rc2_ver_of(uint64_t ino, size_t j0, uint8_t byte0)
 {
@@ -196,9 +205,19 @@ static size_t rc2_verify_ver(const uint8_t *b, uint64_t ino, uint32_t ver,
 #define RWH_READERS     4
 #define RWH_WRITES_MAX  120u          /* bounded: no commit mid-hammer, so
                                        * CoW space grows monotonically —
-                                       * 120 * 4 KiB fits the 16 MiB dev. */
+                                       * 120 * 2 * 4 KiB fits the 16 MiB dev. */
 #define RWH_READS_MIN   4000u
 #define RWH_READS_CAP   (4u * 1000u * 1000u)
+
+/* Every ino carries an extent at BOTH offsets — one below and one at
+ * the LE-key byte boundary. LE(65536) = 00 00 01.. lex-sorts BEFORE
+ * LE(4096) = 00 10 00.., so every reader probe at 4096 exercises the
+ * exact per-ino key-order disorder that the pre-fix concurrent lookup
+ * turned into a false hole (the RC-2 audit F1 / the boot-found P0):
+ * an ENOENT or a zero-filled read here counts as read_err/content_bad
+ * and fails the hammer. The offset-0-only first cut of this test was
+ * structurally blind to that bug class. */
+static const uint64_t rwh_offs[2] = { 4096u, 65536u };
 
 typedef struct {
     stm_sync       *s;
@@ -218,19 +237,23 @@ static void *rwh_reader(void *arg)
          !(atomic_load(c->stop) && i >= RWH_READS_MIN) && i < RWH_READS_CAP;
          i++) {
         uint64_t ino = (uint64_t)(rr % RWH_INOS) + 1u;
+        uint64_t off = rwh_offs[(rr >> 8) & 1u];
         rr = rr * 1103515245u + 12345u;
         size_t got = 0;
-        stm_status rc = stm_sync_read_extent(c->s, 1u, ino, 0u,
+        stm_status rc = stm_sync_read_extent(c->s, 1u, ino, off,
                                                 buf, RWH_LEN, &got);
         if (rc != STM_OK) {
             /* No error is legal here: the extents exist for the whole
-             * hammer and their keys are never removed. */
+             * hammer and their keys are never removed. A false hole
+             * (the audit-F1 class) surfaces as... STM_OK-with-zeros,
+             * caught by the content check below; any other rc lands
+             * here. */
             atomic_fetch_add(c->read_err, 1u);
             continue;
         }
         if (got != RWH_LEN) { atomic_fetch_add(c->content_bad, 1u); continue; }
-        uint8_t ver = rc2_ver_of(ino, 0u, buf[0]);
-        if (rc2_verify_ver(buf, ino, ver, 0u, got) != 0)
+        uint8_t ver = rc2_ver_of(ino, (size_t)off, buf[0]);
+        if (rc2_verify_ver(buf, ino, ver, (size_t)off, got) != 0)
             atomic_fetch_add(c->content_bad, 1u);
         else
             atomic_fetch_add(c->reads_ok, 1u);
@@ -246,11 +269,14 @@ STM_TEST(rc2_sync_read_write_hammer) {
     uint8_t *wbuf = malloc(RWH_LEN);
     STM_ASSERT(wbuf != NULL);
 
-    /* Version 0 for every ino. */
+    /* Version 0 for every ino, at BOTH offsets (the LE-key-order pair). */
     for (uint64_t ino = 1; ino <= RWH_INOS; ino++) {
-        rc2_fill(wbuf, ino, 0u, RWH_LEN);
-        STM_ASSERT_OK(stm_sync_write_extent(f.sync, 1u, ino, 0u,
-                                              wbuf, RWH_LEN));
+        for (size_t k = 0; k < 2; k++) {
+            rc2_fill_at(wbuf, ino, 0u, (size_t)rwh_offs[k], RWH_LEN);
+            STM_ASSERT_OK(stm_sync_write_extent(f.sync, 1u, ino,
+                                                  rwh_offs[k],
+                                                  wbuf, RWH_LEN));
+        }
     }
 
     atomic_bool    stop        = false;
@@ -264,19 +290,26 @@ STM_TEST(rc2_sync_read_write_hammer) {
     for (int i = 0; i < RWH_READERS; i++)
         STM_ASSERT_EQ(pthread_create(&readers[i], NULL, rwh_reader, &rctx), 0);
 
-    /* Overwrite churn: bump each ino's version round-robin. Stop on
-     * ENOSPC (the bounded-device end) — the iteration floor below
-     * still guarantees a real interleaving window. */
+    /* Overwrite churn: bump each ino's version round-robin, rewriting
+     * BOTH offsets (each extent single-version per write; readers
+     * verify per-extent, so the momentary cross-extent version skew is
+     * fine). Stop on ENOSPC (the bounded-device end) — the iteration
+     * floor below still guarantees a real interleaving window. */
     uint32_t ver[RWH_INOS + 1] = {0};
     size_t   writes_done = 0;
     for (size_t w = 0; w < RWH_WRITES_MAX; w++) {
         uint64_t ino = (uint64_t)(w % RWH_INOS) + 1u;
         uint32_t v   = ++ver[ino];
-        rc2_fill(wbuf, ino, v, RWH_LEN);
-        stm_status rc = stm_sync_write_extent(f.sync, 1u, ino, 0u,
-                                                wbuf, RWH_LEN);
-        if (rc == STM_ENOSPC) break;
-        STM_ASSERT_OK(rc);
+        bool enospc = false;
+        for (size_t k = 0; k < 2; k++) {
+            rc2_fill_at(wbuf, ino, v, (size_t)rwh_offs[k], RWH_LEN);
+            stm_status rc = stm_sync_write_extent(f.sync, 1u, ino,
+                                                    rwh_offs[k],
+                                                    wbuf, RWH_LEN);
+            if (rc == STM_ENOSPC) { enospc = true; break; }
+            STM_ASSERT_OK(rc);
+        }
+        if (enospc) break;
         writes_done++;
         if ((w & 7u) == 7u) sched_yield();
     }

@@ -561,11 +561,16 @@ typedef struct {
  * BEFORE spawning (so the count is never transiently under), the
  * worker decrements + broadcasts at exit, and stm_stratumd_run waits
  * for zero after the accept loop exits, BEFORE ctl/scrub/fs teardown.
- * The wait is bounded in practice by the per-connection idle timeout
- * (STM_STRATUMD_DEFAULT_IDLE_MS default) — a worker blocked on a live
- * but idle client exits within it; a busy worker finishes its
- * request stream. Module-static (one daemon per process — the
- * g_fs_workers precedent). */
+ * The wait has NO hard deadline (RC-2 audit F3 — the deliberate
+ * graceful-shutdown posture, the /ctl worker_count precedent): a
+ * worker blocked on a live-but-idle client exits within the
+ * per-connection idle timeout (STM_STRATUMD_DEFAULT_IDLE_MS default),
+ * but a worker actively serving a request stream runs until its
+ * client stops — shutdown finishes in-flight work rather than
+ * corrupting it. A bounded force-quiesce (timedwait + force-close
+ * survivors) is the recorded seam if operational need arises.
+ * Module-static (one daemon per process — the g_fs_workers
+ * precedent). */
 static pthread_mutex_t g_fs_inflight_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_fs_inflight_cv = PTHREAD_COND_INITIALIZER;
 static uint32_t        g_fs_inflight    = 0u;
