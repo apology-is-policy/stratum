@@ -156,6 +156,15 @@ covers, which RC-1's drain provides).
 stratumd drain (workers quiesce before unmount) must cover the RC read paths;
 re-verify + document (or close #1232 properly if the drain shows a gap).
 
+**Memory-order rule for every RC lock-free reader (the RC-1 audit F1
+close):** the pin-before-observe StoreLoad edge is provided by
+`stm_ebr_enter`'s trailing seq_cst fence (ebr.c), NOT by the reader's own
+load orderings — acquire loads alone are UNSOUND on FEAT_LRCPC arm64
+(STLR->LDAPR is unordered), which is how RC-1's first cut silently weakened
+the engine's seq_cst-load idiom. RC-2's DEK-map published-pointer load and
+any future EBR-protected reader may use acquire loads freely BECAUSE the
+fence is in enter; never remove or weaken it.
+
 ### RC-3 — retire `s->lock` from the WRITE path (user-voted scope)
 
 `stm_sync_write_extent` / `stm_sync_truncate` / `stm_sync_punch_range`

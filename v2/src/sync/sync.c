@@ -6115,7 +6115,14 @@ static void dcache_evict_locked(stm_sync *s, size_t slot_idx) {
  * and returns true on a hit. The copy runs under the caller's pin: an
  * entry reachable from a chain cannot be reclaimed until every covering
  * pin exits, so the bytes under the memcpy are stable even against a
- * concurrent evict/drain of the same entry. */
+ * concurrent evict/drain of the same entry.
+ *
+ * Memory orders (RC-1 audit F1): the acquire loads below pair with the
+ * writers' release publishes for ENTRY-FIELD visibility only. The
+ * pin-before-observe StoreLoad edge -- without which can_advance() could
+ * miss this reader's pin and reclaim under the copy (STLR->LDAPR is
+ * unordered on FEAT_LRCPC arm64) -- is provided by stm_ebr_enter's
+ * trailing seq_cst fence, NOT by these loads. Do not weaken enter. */
 static bool dcache_lookup_copy(stm_sync *s,
                                const uint8_t key[STM_CAS_HASH_LEN],
                                uint8_t kind_tag, size_t len,

@@ -64,7 +64,7 @@ user-voted 2026-07-10); the code column names the RC-1 targets in
 | `entry[e].retired`     | passed to `stm_ebr_retire(entry, destructor)`          | The destructor memzeroes the plaintext (secret hygiene) then frees. |
 | `entry[e].reclaimed`   | the destructor has run                                 | Only after every covering epoch pin exits. |
 | `reader_ref[t]`        | a reader's pointer into the entry, held between the bucket-walk match and the plaintext memcpy | Held only within the reader's `stm_ebr_enter`/`_exit` window (by code structure of the lookup function). |
-| `reader_epoch[t]`      | `stm_ebr_thread` pin state (`stm_ebr_enter`/`_exit`)   | |
+| `reader_epoch[t]`      | `stm_ebr_thread` pin state (`stm_ebr_enter`/`_exit`)   | The model's atomic ReaderEnter is realized by enter's seq_cst store + trailing seq_cst fence (RC-1 audit F1): the pin is globally visible before the reader's first shared load. |
 | `ring` / `AdvanceEpoch`| the EBR retire ring / `stm_ebr_try_advance`            | Advance driven from the retire paths (insert/evict), matching the model's pending-gated advance. |
 | `insert_pending`       | the dcache writer mutex (insert/evict/drain serialize) | Readers never take it. |
 | `Evict(e)`             | LRU evict on pressure; `dcache_drain` = iterated evict | Drain (evict-dek, close) MUST use the same unlink+retire path — the CF-5a F1 fail-closed contract. |

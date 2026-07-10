@@ -148,6 +148,12 @@ the one-in-flight `bdev d->lock` (invariant B-2). Deadlock-avoidance rules:
   idx->lock but never an EBR pin (fresh `stm_ebr_enter/exit` per attempt) —
   starvation-bounded (64 attempts), never a deadlock (the seal holder does
   not take the waiter's idx->lock).
+- **EBR destructors are lock-free by contract** (RC-1 audit F2; ebr.h):
+  `stm_ebr_try_advance` is driven from paths that may hold subsystem locks
+  (the dcache drives it from extent paths holding sync->lock at RC-1) and
+  runs ALL epoch-safe destructors globally on the calling thread — a
+  destructor that acquired sync->lock (or anything ordered above it) would
+  be a lock-order inversion. memzero/free only.
 
 ## 29.6 — The three op classes (PARALLEL-3)
 

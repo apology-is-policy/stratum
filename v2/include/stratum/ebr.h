@@ -82,6 +82,13 @@ stm_ebr_thread *stm_ebr_thread_current(void);
  * Enter the current epoch. Pairs with stm_ebr_exit. Nested enter calls on
  * the same thread are NOT supported (no recursive re-entry) — callers with
  * nested logical operations should enter once at the outermost.
+ *
+ * ORDERING GUARANTEE (RC-1 audit F1): on return, the pin is globally
+ * visible BEFORE any of the caller's subsequent shared loads can observe
+ * a retirable object — enter carries a trailing seq_cst fence, so callers
+ * may read the protected structure with any ordering (acquire included);
+ * the pin-before-observe StoreLoad edge is provided here, not by the
+ * caller's load instructions.
  */
 void stm_ebr_enter(stm_ebr_thread *t);
 
@@ -104,6 +111,14 @@ void stm_ebr_heartbeat(stm_ebr_thread *t);
  * Schedule `ptr` for destruction once every observer has moved past the
  * current epoch. The destructor is called exactly once, from a thread
  * inside stm_ebr_try_advance. Must be safe to call from any thread.
+ *
+ * DESTRUCTOR LOCK CONTRACT (RC-1 audit F2): stm_ebr_try_advance is driven
+ * from paths that may hold subsystem locks (the dcache drives it from
+ * extent paths that hold s->lock at RC-1), and it runs the destructors of
+ * ALL epoch-safe retires globally on the calling thread. A destructor
+ * must therefore be LOCK-FREE with respect to any lock a retiring or
+ * advancing path may hold — in practice: memzero/free only; never acquire
+ * s->lock, fs->global, or anything ordered above them.
  *
  * Returns STM_OK on success, STM_ENOMEM on retire-record allocation
  * failure (rare; the record is ~32 bytes).

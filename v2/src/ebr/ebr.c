@@ -192,6 +192,18 @@ void stm_ebr_enter(stm_ebr_thread *t)
     uint64_t e = atomic_load(&g.current_epoch);
     /* Seq-cst store ensures a later retirer's load sees our local_epoch. */
     atomic_store(&t->local_epoch, e);
+    /* RC-1 audit F1: the pin-publish is a same-thread StoreLoad edge --
+     * the local_epoch store must be globally visible BEFORE this thread's
+     * first subsequent shared load can observe a retirable object, or
+     * can_advance() misses the pin and reclaims under the reader. A
+     * consumer whose loads are seq_cst (LDAR on arm64 -- the engine's
+     * idiom) gets that ordering from the STLR->LDAR RCsc pairing, but a
+     * consumer using memory_order_acquire loads may get LDAPR on
+     * FEAT_LRCPC cores (Apple M-series), and STLR->LDAPR is deliberately
+     * UNORDERED. Fence here once so EVERY consumer is correct regardless
+     * of its own load orderings; reclamation safety must not rest on
+     * which load instruction a compiler picks. */
+    atomic_thread_fence(memory_order_seq_cst);
 }
 
 void stm_ebr_exit(stm_ebr_thread *t)
