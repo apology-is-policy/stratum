@@ -57,7 +57,8 @@ stm_status stm_sync_set_cdc_params_for_test(stm_sync *s,
                                               const stm_cdc_params *params);
 
 /*
- * Drop every decrypted-extent cache entry (takes s->lock).
+ * Drop every decrypted-extent cache entry (self-serializes on the
+ * cache's own writer lock; RC-1 took the dcache off s->lock).
  *
  * The extent WRITE path populates the cache (the plaintext is in hand
  * at write time), so a freshly-written extent's first read is served
@@ -67,6 +68,26 @@ stm_status stm_sync_set_cdc_params_for_test(stm_sync *s,
  * never consult the device and pass (or fail) vacuously.
  */
 void stm_sync_dcache_drain_for_test(stm_sync *s);
+
+/*
+ * RC-1 concurrency-hammer pass-throughs into the (static) dcache
+ * writer/reader paths, so a test can drive lock-free readers against
+ * concurrent insert/evict/drain directly. The lookup hook carries the
+ * production contract: the CALLING THREAD must hold an active
+ * stm_ebr_enter pin (see <stratum/ebr.h>); it copies
+ * plaintext[slice_off .. slice_off+slice_len) into `out` and returns
+ * true on a hit. The insert hook is best-effort exactly like the
+ * production path (silently skips on OOM / oversize).
+ */
+void stm_sync_dcache_insert_for_test(stm_sync *s,
+                                     const uint8_t key[32],
+                                     uint8_t kind_tag,
+                                     const void *plaintext, size_t len);
+bool stm_sync_dcache_lookup_for_test(stm_sync *s,
+                                     const uint8_t key[32],
+                                     uint8_t kind_tag, size_t len,
+                                     size_t slice_off, size_t slice_len,
+                                     void *out);
 
 /*
  * TLY-A3-keyslot: insert a keyschema slot carrying a chosen

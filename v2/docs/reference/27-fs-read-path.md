@@ -16,7 +16,9 @@ closed the F2 buffered-read multi-extent-zeros bug surfaced by the Area-A audit.
 ## Public API (the entry)
 
 ```c
-/* src/fs/fs.c — caller holds fs->lock; iv already loaded. */
+/* src/fs/fs.c — caller holds fs->global (SH; the rwlock — there is no
+ * fs->lock; the INLINE arm is additionally served wait-free BEFORE this
+ * path, see 29-concurrency.md 29.7); iv already loaded. */
 static stm_status fs_read_regular_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
                                          const struct stm_inode_value *iv,
                                          uint64_t off, void *buf, size_t len,

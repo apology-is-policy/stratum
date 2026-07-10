@@ -126,6 +126,8 @@ fs->global                  (rwlock; EX compound, SH per-inode + reads;
    -> engine commit_mu      (chain fold/commit; load_root_locked single-flight)
    -> dirty_buffer->mu      (global; src/dirty_buffer/dirty_buffer.c:59)
    -> sync->lock            (src/sync/sync.c:163)
+      -> sync->dcache_wlock (RC-1 dcache writer mutex; readers EBR-pinned
+                             lock-free; never takes sync->lock; section 29.12)
    -> alloc->lock           (src/alloc/alloc.c:77)
    -> alloc's btree rwlock
 ```
@@ -360,3 +362,41 @@ points).
 - The pool adds a measurable per-op cost on single-in-flight workloads
   (§29.9); `--fs-workers 1` is the untouched serial loop if a deployment is
   known single-threaded.
+
+## 29.12 — The stm_sync layer (the RC arc)
+
+This section exists because its OMISSION is how the tree's biggest
+serializer went unmapped until the 2026-07-10 measurement (`docs/
+rc-design.md` §1): everything above documents the fs core + engine as
+concurrent, but every extent data op then funnels into `stm_sync_read_extent`
+/ `stm_sync_write_extent` / truncate / punch, each of which takes **one
+exclusive `s->lock` across the whole op** — extent-index lookup, blocking
+bdev I/O, AEAD en/decrypt, dcache. Measured under `--fs-workers 4`: the
+`s->lock` wait exploded ~4700× while the bdev wait stayed ~7 µs — the
+workers never reach the device concurrently. `stm_sync` is therefore a
+first-class concurrency surface, and the **RC arc** (`docs/rc-design.md`,
+ratified 2026-07-10; spec modules `specs/dcache_ebr.tla` +
+`specs/dek_guard.tla`) retires `s->lock` from the extent data path in
+stages:
+
+- **RC-1 (BUILT — this section's as-built):** the decrypted-extent cache is
+  EBR-pinned with LOCK-FREE readers: heap-allocated immutable entries,
+  atomic bucket chains, `dcache_wlock` serializing insert/evict/drain among
+  themselves, unlink-then-EBR-retire on every removal (the destructor
+  memzeroes + frees after the grace). Full as-built:
+  `32-decrypted-extent-cache.md` §32.2–§32.4; the runtime witness is
+  `tests/test_dcache_concurrent.c` (the pinned-reader hammer). At RC-1 the
+  extent paths still hold `s->lock` — the cache no longer NEEDS it, which is
+  what RC-2 harvests.
+- **RC-2 (planned):** the read path drops `s->lock` — brief locked prologue,
+  the EBR `_concurrent` extent lookup, unlocked bdev+decrypt, RC-1 dcache
+  insert; the DEK map becomes EBR-published immutable snapshots
+  (`dek_guard.tla`; the one genuinely new synchronization).
+- **RC-3 (planned):** the write path — brief locked reservation, unlocked
+  encrypt + device write, brief locked epilogue. Commit exclusion
+  (`fs->global` EX) unchanged.
+- **RC-4 (planned):** `--fs-workers` default ON, gated on the pre-RC
+  regression A/B flipping to a win.
+
+Compounds/admin/getters KEEP `s->lock` (brief). Lock order: `s->lock ->
+dcache_wlock`; the dcache functions never take `s->lock` (§29.5).

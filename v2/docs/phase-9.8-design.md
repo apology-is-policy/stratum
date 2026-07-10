@@ -586,6 +586,15 @@ the engine call, not an engine-internal mechanism.
 
 ### 5.1.1 — R171 closure status + Thylacine A-5b relevance (Area D addendum, 2026-06-25)
 
+> **AS-BUILT CORRECTION (2026-07-10, the RC-arc survey; code is ground
+> truth).** This section is a dated snapshot from BEFORE the CF arc built
+> the write half. The BE-write chunks 7-11 ARE NOW BUILT (the CF-1/CF-2
+> r172-r176 closes; chunk 10's fs.c cutover is section 7.2.1 below;
+> the as-built model is `29-concurrency.md` sections 29.7-29.8). R171
+> P0-1/P0-2/P0-4 are CLOSED; P0-3 (#1232, unmount-vs-readers) remains the
+> one open row, production-mitigated (29-concurrency.md 29.11). The text
+> below is kept as the design-time record; read it with that correction.
+
 The five 9.8-BE chunks above are the **unbuilt write half** of Phase
 9.8. The LF-read half (chunks 1-6) landed -- the wait-free read path
 plus the **R171 P1-1 SH-fallback STOPGAP**. The BE-write half (chunks

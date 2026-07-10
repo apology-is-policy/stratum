@@ -49,6 +49,7 @@
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
+#include <stratum/ebr.h>           /* RC-1: EBR-pinned dcache (rc-design.md) */
 #include <stratum/repair_log.h>
 #include <stratum/pool.h>
 #include <stratum/scrub.h>
@@ -60,6 +61,7 @@
 #endif
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -169,13 +171,34 @@ _Static_assert(STM_SYNC_WRAPPED_KEY_LEN <= STM_KEYSCHEMA_WRAPPED_MAX,
 #define STM_DCACHE_BYTES_MAX   (128u * 1024u * 1024u)  /* 128 MiB per-sync cap */
 #define STM_DCACHE_LOG_EVERY   1024u                   /* STM_DCACHE_STATS dev log cadence */
 
+/* RC-1 (docs/rc-design.md section 4; specs/dcache_ebr.tla): the dcache is
+ * EBR-pinned for LOCK-FREE READERS -- the first stage of retiring s->lock
+ * from the extent data path. Entries are heap-allocated, IMMUTABLE ONCE
+ * LINKED (identity + payload fields; lru_tick is advisory atomic metadata,
+ * hnext is chain plumbing mutated only under dcache_wlock), and allocated
+ * fresh per insert -- never rewritten in place, so a reader that matched an
+ * entry's key can never copy a different key's bytes (the slot-reuse ABA is
+ * designed out structurally, not guarded against). Readers walk the atomic
+ * bucket chains under an stm_ebr_enter pin and memcpy the plaintext out
+ * while pinned; writers (insert on miss / write-populate, evict on
+ * pressure, drain on evict-dek/close) serialize on dcache_wlock and
+ * UNLINK-then-EBR-RETIRE what they remove -- the free (the destructor:
+ * memzero + free) runs only after every pinned reader has exited its
+ * epoch. Publish order is init-everything-THEN-link (release store); an
+ * unlink leaves the victim's hnext intact so in-flight walkers already at
+ * the victim continue safely. Spec invariants: NoUseAfterReclaim /
+ * NoTornEntry / LinkedImpliesInit / LinkedNeverReclaimed + the
+ * EventuallyReclaimed liveness witness; the buggy cfgs
+ * (evict_frees_pinned / link_before_init / retire_still_linked) are the
+ * executable counterexamples. */
 struct sync_dcache_entry {
     uint8_t  key[STM_CAS_HASH_LEN];   /* COLD: content_hash; HOT: paddr0||gen||0 */
     uint8_t  kind_tag;                /* STM_EXTENT_KIND_* -- disambiguates key space */
-    uint8_t *plaintext;               /* malloc(len); NULL == empty slot */
     size_t   len;
-    uint64_t lru_tick;
-    int32_t  hnext;                   /* 1-based next-in-bucket; 0 == end */
+    _Atomic uint64_t lru_tick;        /* advisory LRU; relaxed stores/loads */
+    struct sync_dcache_entry *_Atomic hnext;  /* bucket chain; NULL == end */
+    uint8_t  plaintext[];             /* len bytes tail-allocated: one block,
+                                       * one retire, one memzero+free */
 };
 
 /* The COLD key is the extent record's content_hash (STM_EXTENT_HASH_LEN)
@@ -193,19 +216,34 @@ static void dcache_key_hot(uint8_t out[STM_CAS_HASH_LEN],
 static void dcache_insert(stm_sync *s, const uint8_t key[STM_CAS_HASH_LEN],
                           uint8_t kind_tag,
                           const uint8_t *plaintext, size_t len);
+static bool dcache_lookup_copy(stm_sync *s,
+                               const uint8_t key[STM_CAS_HASH_LEN],
+                               uint8_t kind_tag, size_t len,
+                               size_t slice_off, size_t slice_len,
+                               uint8_t *out);
 
 struct stm_sync {
     pthread_mutex_t lock;
 
-    /* #343 decrypted-extent cache -- lock-protected (every accessor runs
-     * under s->lock). All-zero (from calloc) is a valid empty cache, so
-     * no explicit init; dcache_drain frees the live plaintexts at close. */
-    struct sync_dcache_entry dcache[STM_DCACHE_ENTRIES];
-    int32_t  dcache_hash[STM_DCACHE_HASH_BUCKETS]; /* 1-based entry idx; 0 == empty */
-    uint64_t dcache_tick;
-    size_t   dcache_bytes;
-    uint64_t dcache_hits;
-    uint64_t dcache_misses;
+    /* #343 / RC-1 decrypted-extent cache. Readers are LOCK-FREE (EBR pin;
+     * see the sync_dcache_entry comment); dcache_wlock serializes
+     * insert/evict/drain among THEMSELVES only -- s->lock is not part of
+     * the cache's contract (RC-2 removes it from the read path). Lock
+     * order: s->lock -> dcache_wlock; the cache functions never take
+     * s->lock. All-NULL heads/slots (from calloc) are a valid empty
+     * cache; dcache_wlock is initialized with s->lock at sync_alloc.
+     * dcache_slots[] is the writer's bookkeeping index (free-slot +
+     * LRU-victim scans); readers never touch it. dcache_bytes counts
+     * LINKED bytes -- an evicted entry's bytes leave the budget at
+     * unlink, transiently before its EBR grace expires (the retire
+     * backlog is bounded by the try_advance driven from every insert). */
+    struct sync_dcache_entry *_Atomic dcache_hash[STM_DCACHE_HASH_BUCKETS];
+    struct sync_dcache_entry *dcache_slots[STM_DCACHE_ENTRIES];
+    pthread_mutex_t  dcache_wlock;
+    _Atomic uint64_t dcache_tick;
+    _Atomic size_t   dcache_bytes;
+    _Atomic uint64_t dcache_hits;
+    _Atomic uint64_t dcache_misses;
 
     /* P5-2: sync coordinates commits across every device in the pool.
      * There is no "self" in multi-device; the coordinator writes the
@@ -1320,6 +1358,19 @@ static stm_sync *sync_new(stm_pool *p, stm_alloc *a)
         free(s);
         return NULL;
     }
+    if (pthread_mutex_init(&s->dcache_wlock, NULL) != 0) {
+        pthread_mutex_destroy(&s->lock);
+        free(s);
+        return NULL;
+    }
+    /* RC-1: the dcache retires through EBR, and a sync can exist without
+     * an fs mount (tools, tests), so init here too -- idempotent, cheap. */
+    if (stm_ebr_init() != STM_OK) {
+        pthread_mutex_destroy(&s->dcache_wlock);
+        pthread_mutex_destroy(&s->lock);
+        free(s);
+        return NULL;
+    }
 
     s->pool  = p;
     s->alloc = a;
@@ -1341,6 +1392,7 @@ static stm_sync *sync_new(stm_pool *p, stm_alloc *a)
     stm_cdc_params cdc_params;
     stm_cdc_default_params(&cdc_params);
     if (stm_cdc_init(&s->cdc, &cdc_params) != STM_OK) {
+        pthread_mutex_destroy(&s->dcache_wlock);
         pthread_mutex_destroy(&s->lock);
         free(s);
         return NULL;
@@ -2530,6 +2582,12 @@ void stm_sync_close(stm_sync *s)
     sync_dek_wipe_all(s);
     /* #343: free + zero any cached decrypted-extent plaintexts. */
     dcache_drain(s);
+    /* RC-1: the drain RETIRES the entries; reclaim them now (bounded,
+     * never force-frees past a live reader) so a final close does not
+     * strand them in the global buckets until process exit -- the
+     * dataset.c teardown posture. */
+    stm_ebr_drain();
+    pthread_mutex_destroy(&s->dcache_wlock);
     pthread_mutex_destroy(&s->lock);
     free(s);
 }
@@ -5269,13 +5327,38 @@ stm_status stm_sync_keyschema_insert_for_test(stm_sync *s,
 }
 
 /* Test-only dcache drop. See <stratum/sync_testing.h> for why disk-
- * path tests need it (the write path populates the cache). */
+ * path tests need it (the write path populates the cache). RC-1: the
+ * drain self-serializes on dcache_wlock; s->lock is no longer part of
+ * the cache's contract. */
 void stm_sync_dcache_drain_for_test(stm_sync *s)
 {
     if (!s) return;
-    pthread_mutex_lock(&s->lock);
     dcache_drain(s);
-    pthread_mutex_unlock(&s->lock);
+}
+
+/* RC-1 test-only pass-throughs: the concurrency hammer drives the
+ * lock-free reader protocol + the writer paths directly from N threads
+ * (the dcache functions are static). The lookup hook carries the SAME
+ * contract as dcache_lookup_copy: the calling thread must hold an
+ * active stm_ebr_enter pin. */
+void stm_sync_dcache_insert_for_test(stm_sync *s,
+                                     const uint8_t key[32],
+                                     uint8_t kind_tag,
+                                     const void *plaintext, size_t len)
+{
+    if (!s || !key || !plaintext) return;
+    dcache_insert(s, key, kind_tag, plaintext, len);
+}
+
+bool stm_sync_dcache_lookup_for_test(stm_sync *s,
+                                     const uint8_t key[32],
+                                     uint8_t kind_tag, size_t len,
+                                     size_t slice_off, size_t slice_len,
+                                     void *out)
+{
+    if (!s || !key || !out) return false;
+    return dcache_lookup_copy(s, key, kind_tag, len,
+                              slice_off, slice_len, out);
 }
 #endif /* STRATUM_BUILD_TESTING_HOOKS */
 
@@ -5952,37 +6035,110 @@ static uint32_t dcache_bucket(const uint8_t key[STM_CAS_HASH_LEN],
     return (uint32_t)(h >> 33) & (STM_DCACHE_HASH_BUCKETS - 1u);
 }
 
+/* Link a fully-initialized entry at its bucket head; dcache_wlock held.
+ * The release store on the head IS the publish: every prior field write
+ * (key / kind / len / the plaintext bytes) happens-before any reader's
+ * acquire load of the head -- the spec's init-then-link discipline
+ * (LinkedImpliesInit / NoTornEntry; buggy cfg link_before_init). */
 static void dcache_hash_link(stm_sync *s, struct sync_dcache_entry *e) {
     uint32_t b = dcache_bucket(e->key, e->kind_tag);
-    e->hnext = s->dcache_hash[b];
-    s->dcache_hash[b] = (int32_t)(e - s->dcache) + 1;
+    atomic_store_explicit(&e->hnext,
+                          atomic_load_explicit(&s->dcache_hash[b],
+                                               memory_order_relaxed),
+                          memory_order_relaxed);
+    atomic_store_explicit(&s->dcache_hash[b], e, memory_order_release);
 }
 
+/* Unlink an entry from its bucket; dcache_wlock held. The victim's own
+ * hnext is left INTACT: a pinned reader already AT the victim keeps a
+ * valid path to the rest of the chain (below dcache_ebr.tla's atomic-
+ * lookup abstraction; recorded there as an implementation obligation).
+ * Unlink MUST precede retire (LinkedNeverReclaimed; buggy cfg
+ * retire_still_linked). Chain loads are relaxed -- only wlock holders
+ * mutate the chains; the stores are release for the reader pairing. */
 static void dcache_hash_unlink(stm_sync *s, struct sync_dcache_entry *e) {
     uint32_t b = dcache_bucket(e->key, e->kind_tag);
-    int32_t idx = (int32_t)(e - s->dcache) + 1;
-    int32_t *pp = &s->dcache_hash[b];
-    while (*pp != 0) {
-        if (*pp == idx) { *pp = e->hnext; e->hnext = 0; return; }
-        pp = &s->dcache[*pp - 1].hnext;
+    struct sync_dcache_entry *cur =
+        atomic_load_explicit(&s->dcache_hash[b], memory_order_relaxed);
+    if (cur == e) {
+        atomic_store_explicit(&s->dcache_hash[b],
+                              atomic_load_explicit(&e->hnext,
+                                                   memory_order_relaxed),
+                              memory_order_release);
+        return;
     }
-    e->hnext = 0;   /* defensive: not linked == nothing to do */
+    while (cur) {
+        struct sync_dcache_entry *nx =
+            atomic_load_explicit(&cur->hnext, memory_order_relaxed);
+        if (nx == e) {
+            atomic_store_explicit(&cur->hnext,
+                                  atomic_load_explicit(&e->hnext,
+                                                       memory_order_relaxed),
+                                  memory_order_release);
+            return;
+        }
+        cur = nx;
+    }
+    /* defensive: not linked == nothing to do */
 }
 
-static const uint8_t *dcache_lookup(stm_sync *s,
-                                     const uint8_t key[STM_CAS_HASH_LEN],
-                                     uint8_t kind_tag, size_t len) {
-    for (int32_t idx = s->dcache_hash[dcache_bucket(key, kind_tag)];
-         idx != 0; ) {
-        struct sync_dcache_entry *e = &s->dcache[idx - 1];
-        if (e->plaintext && e->kind_tag == kind_tag && e->len == len
-                && memcmp(e->key, key, STM_CAS_HASH_LEN) == 0) {
-            e->lru_tick = ++s->dcache_tick;
-            return e->plaintext;
-        }
-        idx = e->hnext;
+/* EBR destructor for a retired entry: scrub the key material-bearing
+ * plaintext (secret hygiene), then free. Runs inside stm_ebr_try_advance
+ * once no epoch pin that could have observed the entry remains
+ * (dcache_ebr.tla::NoUseAfterReclaim; buggy cfg evict_frees_pinned is
+ * the immediate-free counterexample this ordering closes). */
+static void dcache_entry_destroy(void *p) {
+    struct sync_dcache_entry *e = p;
+    size_t total = sizeof *e + e->len;
+    stm_ct_memzero(e, total);
+    free(e);
+}
+
+/* Unlink + retire the entry at dcache_slots[slot_idx]; dcache_wlock held. */
+static void dcache_evict_locked(stm_sync *s, size_t slot_idx) {
+    struct sync_dcache_entry *victim = s->dcache_slots[slot_idx];
+    dcache_hash_unlink(s, victim);
+    atomic_fetch_sub_explicit(&s->dcache_bytes, victim->len,
+                              memory_order_relaxed);
+    s->dcache_slots[slot_idx] = NULL;
+    if (stm_ebr_retire(victim, dcache_entry_destroy) != STM_OK) {
+        /* Retire-record OOM (~32 bytes): leak the entry rather than free
+         * under a possibly-pinned reader (the engine's posture). Already
+         * unlinked, so it can never be observed again. */
     }
-    return NULL;
+}
+
+/* RC-1 lock-free lookup. CONTRACT: the caller holds an active
+ * stm_ebr_enter pin on the current thread (enter-at-outermost per
+ * ebr.h; the RC-2 read path pins once across the extent lookup and this
+ * probe). Copies plaintext[slice_off .. slice_off+slice_len) into `out`
+ * and returns true on a hit. The copy runs under the caller's pin: an
+ * entry reachable from a chain cannot be reclaimed until every covering
+ * pin exits, so the bytes under the memcpy are stable even against a
+ * concurrent evict/drain of the same entry. */
+static bool dcache_lookup_copy(stm_sync *s,
+                               const uint8_t key[STM_CAS_HASH_LEN],
+                               uint8_t kind_tag, size_t len,
+                               size_t slice_off, size_t slice_len,
+                               uint8_t *out) {
+    uint32_t b = dcache_bucket(key, kind_tag);
+    for (struct sync_dcache_entry *e =
+             atomic_load_explicit(&s->dcache_hash[b], memory_order_acquire);
+         e != NULL;
+         e = atomic_load_explicit(&e->hnext, memory_order_acquire)) {
+        if (e->kind_tag == kind_tag && e->len == len
+                && memcmp(e->key, key, STM_CAS_HASH_LEN) == 0) {
+            if (slice_off > len || slice_len > len - slice_off)
+                return false;                  /* defensive; treat as miss */
+            memcpy(out, e->plaintext + slice_off, slice_len);
+            atomic_store_explicit(&e->lru_tick,
+                atomic_fetch_add_explicit(&s->dcache_tick, 1,
+                                          memory_order_relaxed) + 1,
+                memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
 }
 
 static void dcache_insert(stm_sync *s,
@@ -5993,57 +6149,105 @@ static void dcache_insert(stm_sync *s,
      * also bounds the per-sync RAM the cache can pin. */
     if (len == 0 || len > STM_DCACHE_BYTES_MAX) return;
 
-    for (;;) {
-        struct sync_dcache_entry *slot = NULL;
-        for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
-            if (!s->dcache[i].plaintext) { slot = &s->dcache[i]; break; }
+    pthread_mutex_lock(&s->dcache_wlock);
+
+    /* Dedup: at RC-2 two readers can miss the same key concurrently and
+     * both arrive here post-decrypt; the loser drops its copy (entries
+     * are immutable and a key names exactly one plaintext -- the nonce
+     * argument at the top of this block -- so the copies are
+     * byte-identical and keeping either is correct). */
+    {
+        uint32_t b = dcache_bucket(key, kind_tag);
+        for (struct sync_dcache_entry *e =
+                 atomic_load_explicit(&s->dcache_hash[b],
+                                      memory_order_relaxed);
+             e != NULL;
+             e = atomic_load_explicit(&e->hnext, memory_order_relaxed)) {
+            if (e->kind_tag == kind_tag && e->len == len
+                    && memcmp(e->key, key, STM_CAS_HASH_LEN) == 0) {
+                pthread_mutex_unlock(&s->dcache_wlock);
+                return;
+            }
         }
-        if (slot && s->dcache_bytes + len <= STM_DCACHE_BYTES_MAX) {
-            uint8_t *copy = malloc(len);
-            if (!copy) return;                 /* best-effort: skip on OOM */
-            memcpy(copy, plaintext, len);
-            memcpy(slot->key, key, STM_CAS_HASH_LEN);
-            slot->kind_tag  = kind_tag;
-            slot->plaintext = copy;
-            slot->len       = len;
-            slot->lru_tick  = ++s->dcache_tick;
-            s->dcache_bytes += len;
-            dcache_hash_link(s, slot);
+    }
+
+    size_t free_slot = STM_DCACHE_ENTRIES;
+    for (;;) {
+        if (free_slot == STM_DCACHE_ENTRIES) {
+            for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
+                if (!s->dcache_slots[i]) { free_slot = i; break; }
+            }
+        }
+        if (free_slot != STM_DCACHE_ENTRIES
+            && atomic_load_explicit(&s->dcache_bytes, memory_order_relaxed)
+                   + len <= STM_DCACHE_BYTES_MAX)
+            break;
+        /* No free slot OR over budget: unlink + retire the least-
+         * recently-used linked entry and retry. Terminates: each pass
+         * removes one linked entry + reduces linked bytes; once empty,
+         * bytes==0 and len<=max (guarded above) guarantees a fit. */
+        size_t vi = STM_DCACHE_ENTRIES;
+        uint64_t vt = 0;
+        for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
+            struct sync_dcache_entry *e = s->dcache_slots[i];
+            if (!e) continue;
+            uint64_t t = atomic_load_explicit(&e->lru_tick,
+                                              memory_order_relaxed);
+            if (vi == STM_DCACHE_ENTRIES || t < vt) { vi = i; vt = t; }
+        }
+        if (vi == STM_DCACHE_ENTRIES) {        /* defensive: nothing linked */
+            pthread_mutex_unlock(&s->dcache_wlock);
             return;
         }
-        /* No free slot OR inserting would exceed the byte budget -- evict
-         * the least-recently-used live entry and retry. Terminates: each
-         * pass frees one entry + reduces bytes; once empty, bytes==0 and
-         * len<=max (guarded above) guarantees a fit. */
-        struct sync_dcache_entry *victim = NULL;
-        for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
-            struct sync_dcache_entry *e = &s->dcache[i];
-            if (!e->plaintext) continue;
-            if (!victim || e->lru_tick < victim->lru_tick) victim = e;
-        }
-        if (!victim) return;                   /* defensive: nothing to evict */
-        dcache_hash_unlink(s, victim);
-        stm_ct_memzero(victim->plaintext, victim->len);
-        free(victim->plaintext);
-        s->dcache_bytes -= victim->len;
-        victim->plaintext = NULL;
-        victim->len = 0;
+        dcache_evict_locked(s, vi);
+        if (free_slot == STM_DCACHE_ENTRIES) free_slot = vi;
     }
+
+    struct sync_dcache_entry *e = malloc(sizeof *e + len);
+    if (!e) {                                  /* best-effort: skip on OOM */
+        pthread_mutex_unlock(&s->dcache_wlock);
+        return;
+    }
+    memcpy(e->key, key, STM_CAS_HASH_LEN);
+    e->kind_tag = kind_tag;
+    e->len      = len;
+    atomic_init(&e->lru_tick,
+                atomic_fetch_add_explicit(&s->dcache_tick, 1,
+                                          memory_order_relaxed) + 1);
+    atomic_init(&e->hnext, NULL);
+    memcpy(e->plaintext, plaintext, len);
+    /* Everything initialized -- NOW link (the release publish). */
+    dcache_hash_link(s, e);
+    s->dcache_slots[free_slot] = e;
+    atomic_fetch_add_explicit(&s->dcache_bytes, len, memory_order_relaxed);
+    pthread_mutex_unlock(&s->dcache_wlock);
+
+    /* Drive reclamation from the retire-bearing path (the spec's
+     * pending-gated advance). Non-blocking; takes no stratum locks. */
+    (void)stm_ebr_try_advance();
 }
 
 static void dcache_drain(stm_sync *s) {
+    pthread_mutex_lock(&s->dcache_wlock);
+    /* Unlink EVERYTHING first (clear the bucket heads), then retire --
+     * never the reverse (LinkedNeverReclaimed): a reader arriving after
+     * these stores finds empty buckets (the evict-dek fail-closed
+     * contract, CF-5a F1), and no entry still reachable from a bucket
+     * can ever be reclaimed. Pinned in-flight walkers keep their chain
+     * view; the EBR grace covers them until they exit. */
+    for (size_t b = 0; b < STM_DCACHE_HASH_BUCKETS; b++)
+        atomic_store_explicit(&s->dcache_hash[b], NULL, memory_order_release);
     for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
-        struct sync_dcache_entry *e = &s->dcache[i];
-        if (e->plaintext) {
-            stm_ct_memzero(e->plaintext, e->len);
-            free(e->plaintext);
-            e->plaintext = NULL;
-            e->len = 0;
+        struct sync_dcache_entry *e = s->dcache_slots[i];
+        if (!e) continue;
+        s->dcache_slots[i] = NULL;
+        if (stm_ebr_retire(e, dcache_entry_destroy) != STM_OK) {
+            /* leak -- safer than freeing under a pinned reader */
         }
-        e->hnext = 0;
     }
-    memset(s->dcache_hash, 0, sizeof s->dcache_hash);
-    s->dcache_bytes = 0;
+    atomic_store_explicit(&s->dcache_bytes, 0, memory_order_relaxed);
+    pthread_mutex_unlock(&s->dcache_wlock);
+    (void)stm_ebr_try_advance();
 }
 
 static void dcache_account(stm_sync *s, bool hit) {
@@ -6051,15 +6255,23 @@ static void dcache_account(stm_sync *s, bool hit) {
      * the periodic stderr line is a dev convenience compiled out by default
      * so it never spews on the production read path. Build with
      * -DSTM_DCACHE_STATS to watch the hit rate live. */
-    if (hit) s->dcache_hits++; else s->dcache_misses++;
+    if (hit)
+        atomic_fetch_add_explicit(&s->dcache_hits, 1, memory_order_relaxed);
+    else
+        atomic_fetch_add_explicit(&s->dcache_misses, 1, memory_order_relaxed);
 #ifdef STM_DCACHE_STATS
-    uint64_t total = s->dcache_hits + s->dcache_misses;
+    uint64_t total =
+        atomic_load_explicit(&s->dcache_hits, memory_order_relaxed)
+        + atomic_load_explicit(&s->dcache_misses, memory_order_relaxed);
     if ((total % STM_DCACHE_LOG_EVERY) == 0) {
         fprintf(stderr,
                 "STRATUM-DCACHE: hits=%llu misses=%llu cached_bytes=%zu\n",
-                (unsigned long long)s->dcache_hits,
-                (unsigned long long)s->dcache_misses,
-                s->dcache_bytes);
+                (unsigned long long)atomic_load_explicit(
+                    &s->dcache_hits, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(
+                    &s->dcache_misses, memory_order_relaxed),
+                atomic_load_explicit(&s->dcache_bytes,
+                                     memory_order_relaxed));
     }
 #endif
 }
@@ -6188,15 +6400,24 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
      * ARCH §7.6.3 for cross-dataset shareability) and the CAS AD. */
     if (rec.kind == STM_EXTENT_KIND_COLD) {
         /* #343: serve the slice from the decrypted-extent cache if the
-         * content_hash is resident -- no disk read, no AEAD decrypt. */
+         * content_hash is resident -- no disk read, no AEAD decrypt.
+         * RC-1: the probe runs under an EBR pin (the copy-under-pin
+         * contract); a NULL handle (registration OOM) degrades to a
+         * plain miss. At RC-2 this enter/exit hoists to the top of the
+         * unlocked read path, one pin across extent lookup + probe. */
         {
-            const uint8_t *hit = dcache_lookup(s, rec.content_hash,
-                                                STM_EXTENT_KIND_COLD, rec.len);
-            if (hit) {
-                memcpy(buf, hit + slice_off, slice_len);
-                dcache_account(s, true);
-                *out_read = slice_len;
-                return STM_OK;
+            stm_ebr_thread *ebr = stm_ebr_thread_current();
+            if (ebr) {
+                stm_ebr_enter(ebr);
+                bool hit = dcache_lookup_copy(s, rec.content_hash,
+                                              STM_EXTENT_KIND_COLD, rec.len,
+                                              slice_off, slice_len, buf);
+                stm_ebr_exit(ebr);
+                if (hit) {
+                    dcache_account(s, true);
+                    *out_read = slice_len;
+                    return STM_OK;
+                }
             }
         }
         if (!s->cas_idx) return STM_ECORRUPT;
@@ -6297,16 +6518,22 @@ static stm_status sync_decrypt_extent_record_locked(stm_sync *s,
 
     /* #343: HOT decrypted-extent cache. Key = (paddrs[0], gen) -- the
      * AEAD nonce identity (line below feeds the same pair to the cipher);
-     * CoW + monotonic gen make it unique + immutable for the pool's life. */
+     * CoW + monotonic gen make it unique + immutable for the pool's life.
+     * RC-1: probe under an EBR pin (see the COLD arm's note). */
     {
         uint8_t hkey[STM_CAS_HASH_LEN];
         dcache_key_hot(hkey, rec.paddrs[0], rec.gen);
-        const uint8_t *hit = dcache_lookup(s, hkey, STM_EXTENT_KIND_HOT, rec.len);
-        if (hit) {
-            memcpy(buf, hit + slice_off, slice_len);
-            dcache_account(s, true);
-            *out_read = slice_len;
-            return STM_OK;
+        stm_ebr_thread *ebr = stm_ebr_thread_current();
+        if (ebr) {
+            stm_ebr_enter(ebr);
+            bool hit = dcache_lookup_copy(s, hkey, STM_EXTENT_KIND_HOT,
+                                          rec.len, slice_off, slice_len, buf);
+            stm_ebr_exit(ebr);
+            if (hit) {
+                dcache_account(s, true);
+                *out_read = slice_len;
+                return STM_OK;
+            }
         }
     }
 
