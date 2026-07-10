@@ -19,6 +19,8 @@ is exercised by TLC in CI.
 | `allocator.tla`  | refcount + deferred-free | landed | P3 | §6.4, §6.7      |
 | `namespace.tla`  | per-conn isolation    | stub    | P8    | §8.8            |
 | `writeback.tla`  | dirty buffer + flush  | landed (v1) | SWISS-4q-flush | (forward-note in ARCH) |
+| `dcache_ebr.tla` | EBR-pinned dcache (lock-free readers; evict retires) | landed (spec-first; impl at RC-1) | RC | `docs/rc-design.md` §4/§6 |
+| `dek_guard.tla`  | DEK-map COW snapshots + EBR (NoTornDEK; fail-closed evict) | landed (spec-first; impl at RC-2) | RC | `docs/rc-design.md` §4/§6 |
 
 ## Running TLC locally
 

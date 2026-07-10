@@ -143,6 +143,8 @@ jobs:
           - { tla: namespace,           cfg: namespace_multi_bind }
           - { tla: inode,               cfg: inode }
           - { tla: fid,                 cfg: fid }
+          - { tla: dcache_ebr,          cfg: dcache_ebr }
+          - { tla: dek_guard,           cfg: dek_guard }
     steps:
       - uses: actions/checkout@v4
 
