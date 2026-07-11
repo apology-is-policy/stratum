@@ -475,8 +475,22 @@ stages:
   `tests/test_corvus_mount.c` (`corvus_rc3_write_evict_window`,
   `corvus_rc3_read_evict_window` — both deterministic via the
   `sync_testing.h` window hooks, compiled out of production builds).
-- **RC-4 (planned):** `--fs-workers` default ON, gated on the pre-RC
-  regression A/B flipping to a win.
+- **RC-4 (RAN — the gate HELD the default OFF):** the A/B re-ran
+  post-RC-3 (six instrumented guest boots, snapshot-restored pool per
+  boot). The pre-RC regression mechanism is GONE — `s->lock` wait is 0
+  under `--fs-workers 4` (pre-RC: 141 ms) and per-window bdev
+  count/service are byte-identical across arms — but workers=4 still
+  does not WIN: same-build-day pairs regress the depth-1-dominated
+  build windows +9-11% (disjoint ranges; within-arm spread <= 1.5%)
+  while the deep gofmt windows are a wash. The residual is the pool's
+  per-op dispatch handoff (reader->worker wake + writer-mutex), down
+  from the CF-2f 15-24% but not free; the bdev one-in-flight wait rose
+  0.006 -> ~27 ms cumulative (the stage-2 trigger fires; not
+  load-bearing under the host page cache). `--fs-workers` therefore
+  REMAINS OPT-IN; the recorded candidate that could flip it is
+  adaptive dispatch (execute inline at depth 1, dispatch at
+  depth >= 2) — a design fork, not silently built. Full record:
+  `docs/rc-design.md` "As-built (RC-4)".
 
 Compounds/admin/getters KEEP `s->lock` (brief). Lock order: `s->lock ->
 dcache_wlock` and `s->lock -> promote_lock`; the dcache + promote-cache
