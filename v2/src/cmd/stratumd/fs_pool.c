@@ -34,6 +34,7 @@
 #include "fs_pool.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -345,6 +346,26 @@ static int pool_read_header(fs_pool *p, uint8_t *buf)
     return 0;
 }
 
+/* RC-4b: is another frame (or part of one) already buffered on the
+ * connection? The adaptive-dispatch depth signal MUST come from the
+ * socket — the audit-F1 lesson: n_inflight alone self-starves, because
+ * inline execution never raises it and the reader cannot read frames
+ * while executing inline, so every op would inline forever and the
+ * pool would degenerate to the serial loop at every depth. Buffered
+ * bytes mean the client has pipelined: dispatch, and the burst
+ * overlaps. Zero-timeout poll rather than ioctl(FIONREAD) — the guest
+ * stratumd's AF_UNIX fd is a pouch srvconn stream where SYS_POLL is
+ * wired and FIONREAD is not. POLLHUP/POLLERR also report "pending":
+ * the dispatched op proceeds and the reader discovers EOF/error on its
+ * next header read — the normal teardown path. A probe failure
+ * reports "not pending" (fail toward inline == the serial-equivalent
+ * behavior). */
+static bool pool_socket_pending(int fd)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    return poll(&pfd, 1, 0) > 0;
+}
+
 /* Write an inline reply (Rflush / Rversion / refused-Tattach Rlerror)
  * from the reader. Returns 0 or -errno. */
 static int pool_write_inline(fs_pool *p, const uint8_t *buf, uint32_t len)
@@ -624,6 +645,14 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
             }
         }
 
+        /* RC-4b: sample the socket-pending depth signal BEFORE the
+         * pool lock (the fd is stable; no lock needed). A frame
+         * arriving after the sample waits one residual service time —
+         * the scripture's blessed item-3 semantics. On the dispatch
+         * path the syscall cost is noise against the handoff that
+         * follows. */
+        bool next_pending = pool_socket_pending(p->fd);
+
         /* Admission. */
         pool_lock(p);
 
@@ -638,13 +667,13 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
         }
 
         /* RC-4b adaptive dispatch (docs/rc-design.md): with NOTHING in
-         * flight, a worker handoff buys zero overlap and costs the
-         * wake round-trip on every op — the measured ~9-11% tax on
-         * depth-1-dominated windows. Execute inline on the reader
-         * instead: n_inflight == 0 means every slot is FREE (QUEUED /
-         * EXECUTING / REPLYING / cancelled corpses all count), so
-         * every worker is parked on work_cv and the reader is the only
-         * thread touching srv — the exact invariant
+         * flight AND no further frame buffered, a worker handoff buys
+         * zero overlap and costs the wake round-trip — the measured
+         * ~9-11% tax on depth-1-dominated windows. Execute inline on
+         * the reader instead: n_inflight == 0 means every slot is FREE
+         * (QUEUED / EXECUTING / REPLYING / cancelled corpses all
+         * count), so every worker is parked on work_cv and the reader
+         * is the only thread touching srv — the exact invariant
          * pool_handle_version's quiesce barrier establishes before ITS
          * inline execution; here the barrier condition already holds.
          * The observation is stable across the unlock: the reader is
@@ -656,8 +685,17 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
          * not-found arm: immediate Rflush, ordered after the reply by
          * program order + write_mu — CF2-I2 holds). Alloc failure
          * falls through to worker dispatch: inline is an optimization
-         * whose failure path is the normal path. */
-        if (p->n_inflight == 0 && !p->dead
+         * whose failure path is the normal path.
+         *
+         * BOTH depth terms are load-bearing (audit F1): n_inflight
+         * alone SELF-STARVES — inline execution never raises it and
+         * the reader cannot read frames while executing inline, so
+         * every op would inline forever and the pool would degenerate
+         * to the serial loop at every depth. next_pending is the
+         * signal that restores dispatch: buffered bytes mean the
+         * client has pipelined, so this op overlaps with the burst
+         * behind it. */
+        if (p->n_inflight == 0 && !next_pending && !p->dead
             && !(g_test_hooks.force_dispatch
                  && g_test_hooks.force_dispatch(g_test_hooks.arg))) {
             uint32_t need = p->resp_need;

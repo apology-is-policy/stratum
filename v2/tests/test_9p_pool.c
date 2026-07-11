@@ -633,6 +633,13 @@ STM_TEST(p9_pool_tag_reuse_after_flush_of_queued) {
  * host; post-fix it is structurally impossible. */
 STM_TEST(p9_pool_synchronous_same_tag_reuse_storm) {
     pool_fix fx;
+    /* RC-4b audit F2: this storm exists to hammer the WORKER
+     * completion path (the REPLYING-retire-before-reply-write race,
+     * the boot-gate F2 class). A synchronous client never has bytes
+     * pending at admission, so the adaptive path would inline every
+     * op and the storm would guard nothing — force dispatch. */
+    stm_fs_pool_test_hooks h = { .force_dispatch = stall_force_dispatch };
+    stm_fs_pool_set_test_hooks(&h);
     STM_ASSERT_TRUE(fix_up(&fx, "pool_tag0_storm", /*workers=*/4));
     STM_ASSERT_EQ(fix_handshake(&fx, 0), 0);
 
@@ -864,9 +871,12 @@ static void *serial_thread(void *arg)
 }
 
 STM_TEST(p9_pool_serial_byte_equivalence) {
-    /* One pool fixture; run the script twice against the SAME mounted
-     * fs — once through the serial loop, once through the pool — and
-     * compare every reply byte-for-byte. */
+    /* One pool fixture; run the script three times against the SAME
+     * mounted fs — the serial loop, the pool's INLINE path (hook-less:
+     * a synchronous script inlines every op under RC-4b), and the
+     * pool's WORKER path (force_dispatch) — and compare every reply
+     * byte-for-byte against the serial leg (CF2-I7 for both pool
+     * paths; RC-4b audit F3). */
     make_tmp("pool_equiv");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -876,14 +886,18 @@ STM_TEST(p9_pool_serial_byte_equivalence) {
     uint64_t root_ino = 0;
     STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1u, 0755u, 0, 0, &root_ino));
 
-    uint8_t serial_replies[4][512];
-    uint32_t serial_lens[4];
-    uint8_t pool_replies[4][512];
-    uint32_t pool_lens[4];
+    uint8_t  leg_replies[3][4][512];
+    uint32_t leg_lens[3][4];
 
     /* The script: Tversion, Tattach, Tgetattr, Tclunk — synchronous
      * (one op at a time), so ordering is forced identical. */
-    for (int leg = 0; leg < 2; leg++) {
+    for (int leg = 0; leg < 3; leg++) {
+        if (leg == 2) {
+            static stm_fs_pool_test_hooks h = {
+                .force_dispatch = stall_force_dispatch
+            };
+            stm_fs_pool_set_test_hooks(&h);
+        }
         int sv[2];
         STM_ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
         pthread_t tid;
@@ -899,8 +913,8 @@ STM_TEST(p9_pool_serial_byte_equivalence) {
             STM_ASSERT_EQ(pthread_create(&tid, NULL, serve_thread, &pc), 0);
         }
 
-        uint8_t  (*replies)[512] = leg == 0 ? serial_replies : pool_replies;
-        uint32_t *lens           = leg == 0 ? serial_lens    : pool_lens;
+        uint8_t  (*replies)[512] = leg_replies[leg];
+        uint32_t *lens           = leg_lens[leg];
 
         uint8_t  buf[512];
         uint32_t sz;
@@ -927,13 +941,17 @@ STM_TEST(p9_pool_serial_byte_equivalence) {
          * contract; serve_thread mirrors it). */
     }
 
-    for (int i = 0; i < 4; i++) {
-        STM_ASSERT_EQ(serial_lens[i], pool_lens[i]);
-        if (serial_lens[i] == pool_lens[i])
-            STM_ASSERT_EQ(memcmp(serial_replies[i], pool_replies[i],
-                                   serial_lens[i]), 0);
+    for (int leg = 1; leg < 3; leg++) {
+        for (int i = 0; i < 4; i++) {
+            STM_ASSERT_EQ(leg_lens[0][i], leg_lens[leg][i]);
+            if (leg_lens[0][i] == leg_lens[leg][i])
+                STM_ASSERT_EQ(memcmp(leg_replies[0][i],
+                                       leg_replies[leg][i],
+                                       leg_lens[0][i]), 0);
+        }
     }
 
+    stm_fs_pool_set_test_hooks(NULL);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 
@@ -1326,10 +1344,77 @@ STM_TEST(p9_pool_adaptive_inline_at_depth1) {
     STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
     STM_ASSERT_EQ(load_u16(buf + 5), 900);
 
-    /* Both depth-0 data ops ran on the reader thread. */
+    /* Both depth-0 data ops ran on the reader thread — the Tattach
+     * (tag 1, the handshake's data op) and the Tgetattr. */
+    STM_ASSERT_EQ(adaptive_fired_on(&a, 1, fx.tid), 1);
     STM_ASSERT_EQ(adaptive_fired_on(&a, 900, fx.tid), 1);
 
     fix_down(&fx);
+    adaptive_destroy(&a);
+}
+
+/* The PRODUCTION depth signal (RC-4b audit F1): two frames pre-buffered
+ * in ONE write mean the first op's admission sees bytes pending on the
+ * socket and dispatches to a worker — with NO force hook installed.
+ * This is the test that fails on the self-starving n_inflight-only
+ * gate (where the first op would inline on the reader and every
+ * production op would follow, the pool degenerating to the serial
+ * loop). The first op is parked via the stall forward to make the
+ * assertion window deterministic; on a regression the thread assert
+ * fails LOUDLY first and the test bails before any blocking recv. */
+STM_TEST(p9_pool_adaptive_burst_dispatches) {
+    pool_fix fx;
+    stall_ctl st;
+    uint16_t park[1] = { 920 };
+    stall_init(&st, park, 1);
+    adaptive_ctl a;
+    adaptive_init(&a, &st, /*force=*/false);   /* NO forced dispatch */
+    stm_fs_pool_test_hooks h = { .pre_handle     = adaptive_pre_handle,
+                                 .force_dispatch = adaptive_force,
+                                 .arg            = &a };
+    stm_fs_pool_set_test_hooks(&h);
+
+    STM_ASSERT_TRUE(fix_up(&fx, "pool_adp_burst", /*workers=*/2));
+    STM_ASSERT_EQ(fix_handshake(&fx, /*fid=*/0), 0);
+
+    /* Both frames in one buffer, one write: at tag 920's admission the
+     * socket still holds tag 921's bytes -> pending -> dispatch. */
+    uint8_t  two[512];
+    uint32_t sz1 = build_tgetattr(two, 920, 0);
+    uint32_t sz2 = build_tgetattr(two + sz1, 921, 0);
+    STM_ASSERT_EQ(send_all(fx.client_fd, two, sz1 + sz2), 0);
+
+    stall_await_entered(&st, 1);        /* 920 is EXECUTING, parked */
+
+    if (adaptive_fired_on(&a, 920, fx.tid) != 0) {
+        /* Regression: 920 inlined on the reader (the parked thread IS
+         * the reader) — 921 will never be read; bail without blocking. */
+        stm_test_fail(__FILE__, __LINE__,
+                      "burst head executed INLINE on the reader -- the "
+                      "pending-bytes dispatch signal is dead (audit F1)");
+        stall_release(&st);
+        fix_down(&fx);
+        stall_destroy(&st);
+        adaptive_destroy(&a);
+        return;
+    }
+
+    /* 920 is parked on a WORKER; the reader is free: 921 was read,
+     * admitted at n_inflight >= 1, dispatched, and completes while 920
+     * is still parked — its reply arrives first. */
+    uint8_t  buf[512];
+    uint32_t rlen = 0;
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
+    STM_ASSERT_EQ(load_u16(buf + 5), 921);
+
+    stall_release(&st);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
+    STM_ASSERT_EQ(load_u16(buf + 5), 920);
+
+    fix_down(&fx);
+    stall_destroy(&st);
     adaptive_destroy(&a);
 }
 

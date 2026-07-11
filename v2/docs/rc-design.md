@@ -472,6 +472,43 @@ dominates it by construction) and the default stays opt-in. Then the
 focused adversarial audit (the CF-2a-audited reader loop is
 restructured — a full round on fs_pool.c) + the SMP gate.
 
+#### RC-4b audit F1 [P1] — the depth signal was self-starving (fixed)
+
+The focused audit (Fable 5, MODEL start==end) proved the first cut's
+gate DEGENERATE: with `n_inflight == 0` as the sole inline condition,
+inline execution never raises `n_inflight` and the reader cannot read
+frames while executing inline, so by induction every production op
+inlines forever — the pool collapses to the serial loop at every depth,
+the workers park for the connection's lifetime, and the A/B acceptance
+is unpassable by construction. The two first-cut tests were green only
+because the test-only `force_dispatch` hook manufactures a busy state
+production cannot enter. (All 16 safety properties — idle stability,
+CF2-I2/I7/I8, buffer lifetimes, the dup gate, teardown liveness — were
+independently verified SOUND; the defect was the performance
+semantics, not safety.)
+
+**The corrected depth signal is the SOCKET, not the registry**: at
+admission the reader additionally samples "is another frame already
+buffered?" via a zero-timeout `poll(POLLIN)` on the connection fd
+(portable to the guest: stratumd-on-Thylacine's AF_UNIX fd is a pouch
+srvconn stream, where SYS_POLL is wired and `ioctl(FIONREAD)` is not).
+Inline requires `n_inflight == 0 && !pending`; buffered bytes mean the
+client has pipelined, so the op dispatches and the burst overlaps —
+realizing the "first op of a burst inline, the tail dispatches"
+semantics literally. The probe is sampled BEFORE the pool lock (a
+frame arriving after the sample waits one residual service time —
+exactly the blessed item-3 semantics); it costs one syscall per
+admission (~1-2 us host-side), paid on the deep path too where a full
+handoff follows anyway. Audit F2 [P2] (the same-tag-reuse storm now
+never drives the worker REPLYING-retire race it exists to pin) is
+fixed by forcing dispatch in that test; F3/F4 [P3] harden the
+byte-equivalence and inline tests. A NEW production-gate test
+(`p9_pool_adaptive_burst_dispatches`) pre-buffers two frames in one
+write and proves — WITHOUT any force hook — that the first op
+dispatches to a worker on the pending-bytes signal alone. The fix is
+a structural change to the gate → a round-2 audit on the fix precedes
+the A/B.
+
 ### RC-5 — measure, gate, audit, close
 
 - The STMD26/DIAG23 instruments re-measure the gofmt + build2 + fsbench set
