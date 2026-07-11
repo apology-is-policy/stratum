@@ -39,22 +39,32 @@ struct stm_ds_policy_table;
  * 2026-07-07), so the deployment states its worker count explicitly. */
 #define STM_FS_POOL_WORKERS_MAX  16u
 
-/* Test-only hooks (NULL in production). pre_handle fires on the worker
- * thread after a slot is popped for execution and before
- * stm_9p_server_handle — a test can park there (semaphore / sleep) to
- * make "Tflush of an EXECUTING op" and worker-overlap deterministic.
- * on_fatal fires (under the pool mutex) when the connection FIRST
- * latches dead, with the fatal rc — a test that provokes a fatal while
- * holding an op parked orders its release strictly after the latch.
- * Without that ordering, the release races the reader's processing of
- * the offending frame, and the losing interleave turns the intended
- * violation into a LEGAL one (the duplicate_tag_fatal hang: the parked
- * op completed into REPLYING first, so the dup was admitted as legal
- * tag reuse per the F2 rule and the connection never died — the test's
- * drain-to-EOF then blocked forever). */
+/* Test-only hooks (NULL in production). pre_handle fires after an op is
+ * committed for execution and before stm_9p_server_handle — on a WORKER
+ * thread for a dispatched op, on the READER thread for an op the
+ * RC-4b adaptive path executes inline — so a test can park there
+ * (semaphore / sleep) to make "Tflush of an EXECUTING op" and
+ * worker-overlap deterministic. A test that parks MUST also install
+ * force_dispatch (below): a parked inline op parks the READER, so a
+ * subsequently-sent Tflush is never read off the socket and the test
+ * hangs. on_fatal fires (under the pool mutex) when the connection
+ * FIRST latches dead, with the fatal rc — a test that provokes a fatal
+ * while holding an op parked orders its release strictly after the
+ * latch. Without that ordering, the release races the reader's
+ * processing of the offending frame, and the losing interleave turns
+ * the intended violation into a LEGAL one (the duplicate_tag_fatal
+ * hang: the parked op completed into REPLYING first, so the dup was
+ * admitted as legal tag reuse per the F2 rule and the connection never
+ * died — the test's drain-to-EOF then blocked forever).
+ * force_dispatch (RC-4b): consulted at admission UNDER the pool mutex
+ * (must not block, must not re-enter the pool); non-NULL + returning
+ * true suppresses the inline fast path for that op, forcing worker
+ * dispatch — how the parking tests keep their parked ops on worker
+ * threads, and how the depth>=2 arm is driven deterministically. */
 typedef struct stm_fs_pool_test_hooks {
     void (*pre_handle)(void *arg, uint16_t tag, uint8_t type);
     void (*on_fatal)(void *arg, stm_status rc);
+    bool (*force_dispatch)(void *arg);
     void  *arg;
 } stm_fs_pool_test_hooks;
 

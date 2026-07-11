@@ -346,15 +346,29 @@ static void stall_release(stall_ctl *c)
     pthread_mutex_unlock(&c->mu);
 }
 
+/* RC-4b: every parking test forces worker dispatch — a parked op that
+ * the adaptive path ran INLINE would park the READER, so the test's
+ * follow-up frame (Tflush / Tversion / the overlap partner) is never
+ * read off the socket: some tests would hang, others (the barrier
+ * ones) would pass vacuously with the reader parked instead of the
+ * barrier waiting. Forcing dispatch preserves every test's original
+ * worker-side semantics. */
+static bool stall_force_dispatch(void *arg) { (void)arg; return true; }
+
 static void stall_install(stall_ctl *c)
 {
-    stm_fs_pool_test_hooks h = { .pre_handle = stall_pre_handle, .arg = c };
+    stm_fs_pool_test_hooks h = { .pre_handle     = stall_pre_handle,
+                                 .force_dispatch = stall_force_dispatch,
+                                 .arg            = c };
     stm_fs_pool_set_test_hooks(&h);
 }
 
 /* CF-2b: park inside a 3-phase handler's unlocked (b) phase — the fid
  * pin(s) HELD, s->lock NOT held. Same park logic / controller as the
- * pool-level pre_handle stall, different hook point. */
+ * pool-level pre_handle stall, different hook point. The pool-side
+ * hooks are ALSO installed (force only): the park is inside
+ * stm_9p_server_handle, which the adaptive path would otherwise run
+ * on the reader. */
 static void bstall_phase_b(uint8_t type, uint16_t tag, void *arg)
 {
     stall_pre_handle(arg, tag, type);
@@ -363,6 +377,9 @@ static void bstall_phase_b(uint8_t type, uint16_t tag, void *arg)
 static void bstall_install(stall_ctl *c)
 {
     stm_9p_server_set_test_hooks(bstall_phase_b, c);
+    stm_fs_pool_test_hooks h = { .force_dispatch = stall_force_dispatch,
+                                 .arg            = c };
+    stm_fs_pool_set_test_hooks(&h);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -686,9 +703,10 @@ STM_TEST(p9_pool_duplicate_tag_fatal) {
     stall_ctl st;
     uint16_t park[1] = { 700 };
     stall_init(&st, park, 1);
-    stm_fs_pool_test_hooks h = { .pre_handle = stall_pre_handle,
-                                 .on_fatal   = stall_on_fatal,
-                                 .arg        = &st };
+    stm_fs_pool_test_hooks h = { .pre_handle     = stall_pre_handle,
+                                 .on_fatal       = stall_on_fatal,
+                                 .force_dispatch = stall_force_dispatch,
+                                 .arg            = &st };
     stm_fs_pool_set_test_hooks(&h);
 
     STM_ASSERT_TRUE(fix_up(&fx, "pool_dup_tag", 2));
@@ -1213,6 +1231,154 @@ STM_TEST(p9_pool_pin_version_barrier_waits) {
 
     fix_down(&fx);
     stall_destroy(&ctl);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* RC-4b adaptive dispatch (docs/rc-design.md RC-4b).                     */
+/* ────────────────────────────────────────────────────────────────────── */
+
+#define ADAPTIVE_MAX 8
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_t       thr[ADAPTIVE_MAX];   /* pre_handle thread, per fire */
+    uint16_t        tags[ADAPTIVE_MAX];
+    int             n;
+    bool            force;               /* consulted per-admission */
+    stall_ctl      *park;                /* optional stall forward */
+} adaptive_ctl;
+
+static void adaptive_init(adaptive_ctl *a, stall_ctl *park, bool force)
+{
+    memset(a, 0, sizeof *a);
+    pthread_mutex_init(&a->mu, NULL);
+    a->park  = park;
+    a->force = force;
+}
+
+static void adaptive_destroy(adaptive_ctl *a)
+{
+    pthread_mutex_destroy(&a->mu);
+}
+
+static void adaptive_pre_handle(void *arg, uint16_t tag, uint8_t type)
+{
+    adaptive_ctl *a = arg;
+    pthread_mutex_lock(&a->mu);
+    if (a->n < ADAPTIVE_MAX) {
+        a->thr[a->n]  = pthread_self();
+        a->tags[a->n] = tag;
+    }
+    a->n++;
+    pthread_mutex_unlock(&a->mu);
+    if (a->park) stall_pre_handle(a->park, tag, type);
+}
+
+static bool adaptive_force(void *arg)
+{
+    adaptive_ctl *a = arg;
+    pthread_mutex_lock(&a->mu);
+    bool f = a->force;
+    pthread_mutex_unlock(&a->mu);
+    return f;
+}
+
+static void adaptive_set_force(adaptive_ctl *a, bool f)
+{
+    pthread_mutex_lock(&a->mu);
+    a->force = f;
+    pthread_mutex_unlock(&a->mu);
+}
+
+/* Was tag's pre_handle fired on thread `t`? Returns -1 if the tag was
+ * never recorded, else 0/1. */
+static int adaptive_fired_on(adaptive_ctl *a, uint16_t tag, pthread_t t)
+{
+    int r = -1;
+    pthread_mutex_lock(&a->mu);
+    int lim = a->n < ADAPTIVE_MAX ? a->n : ADAPTIVE_MAX;
+    for (int i = 0; i < lim; i++)
+        if (a->tags[i] == tag) { r = pthread_equal(a->thr[i], t) ? 1 : 0; }
+    pthread_mutex_unlock(&a->mu);
+    return r;
+}
+
+/* At depth 1 the op executes INLINE on the reader (= the serve
+ * thread): its pre_handle thread equals fx.tid. Covers the Tattach
+ * (the handshake's data op, also depth-0) and a Tgetattr. */
+STM_TEST(p9_pool_adaptive_inline_at_depth1) {
+    pool_fix fx;
+    adaptive_ctl a;
+    adaptive_init(&a, NULL, /*force=*/false);
+    stm_fs_pool_test_hooks h = { .pre_handle     = adaptive_pre_handle,
+                                 .force_dispatch = adaptive_force,
+                                 .arg            = &a };
+    stm_fs_pool_set_test_hooks(&h);
+
+    STM_ASSERT_TRUE(fix_up(&fx, "pool_adp_inline", /*workers=*/4));
+    STM_ASSERT_EQ(fix_handshake(&fx, /*fid=*/0), 0);
+
+    uint8_t  buf[512];
+    uint32_t rlen = 0;
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tgetattr(buf, 900, 0)), 0);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
+    STM_ASSERT_EQ(load_u16(buf + 5), 900);
+
+    /* Both depth-0 data ops ran on the reader thread. */
+    STM_ASSERT_EQ(adaptive_fired_on(&a, 900, fx.tid), 1);
+
+    fix_down(&fx);
+    adaptive_destroy(&a);
+}
+
+/* With an op EXECUTING, the next admission dispatches to a worker —
+ * the adaptive check sees the pool busy. op1 (tag 910) is parked on a
+ * worker via force_dispatch; force is then CLEARED, so op2 (tag 911)
+ * dispatching anyway is attributable only to the busy branch (were the
+ * pool idle, 911 would have run inline per the test above). 911's
+ * reply arriving while 910 is still parked additionally re-proves the
+ * worker overlap. */
+STM_TEST(p9_pool_adaptive_dispatch_when_busy) {
+    pool_fix fx;
+    stall_ctl st;
+    uint16_t park[1] = { 910 };
+    stall_init(&st, park, 1);
+    adaptive_ctl a;
+    adaptive_init(&a, &st, /*force=*/true);
+    stm_fs_pool_test_hooks h = { .pre_handle     = adaptive_pre_handle,
+                                 .force_dispatch = adaptive_force,
+                                 .arg            = &a };
+    stm_fs_pool_set_test_hooks(&h);
+
+    STM_ASSERT_TRUE(fix_up(&fx, "pool_adp_busy", /*workers=*/2));
+    STM_ASSERT_EQ(fix_handshake(&fx, /*fid=*/0), 0);
+
+    uint8_t  buf[512];
+    uint32_t rlen = 0;
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tgetattr(buf, 910, 0)), 0);
+    stall_await_entered(&st, 1);        /* 910 parked on a worker */
+
+    adaptive_set_force(&a, false);
+    STM_ASSERT_EQ(send_all(fx.client_fd, buf,
+                            build_tgetattr(buf, 911, 0)), 0);
+    /* 911 completes while 910 is parked — its reply comes first. */
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
+    STM_ASSERT_EQ(load_u16(buf + 5), 911);
+    /* ...and it executed on a WORKER thread, not the reader. */
+    STM_ASSERT_EQ(adaptive_fired_on(&a, 911, fx.tid), 0);
+
+    stall_release(&st);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+    STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
+    STM_ASSERT_EQ(load_u16(buf + 5), 910);
+
+    fix_down(&fx);
+    stall_destroy(&st);
+    adaptive_destroy(&a);
 }
 
 STM_TEST_MAIN("9p pool (CF-2a/2b)")

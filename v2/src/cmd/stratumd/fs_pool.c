@@ -530,6 +530,13 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
     uint8_t inline_resp[4096];
     bool    clean_eof = false;
 
+    /* RC-4b adaptive dispatch: the reader-owned response buffer for
+     * inline-executed data ops (grown to the msize mirror on demand —
+     * a reply can be msize-sized, unlike the fixed-size Rflush /
+     * Rversion / Rlerror the stack inline_resp serves). */
+    uint8_t *ilr     = NULL;
+    uint32_t ilr_cap = 0;
+
     for (;;) {
         pool_lock(p);
         bool dead = p->dead;
@@ -630,6 +637,78 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
             break;
         }
 
+        /* RC-4b adaptive dispatch (docs/rc-design.md): with NOTHING in
+         * flight, a worker handoff buys zero overlap and costs the
+         * wake round-trip on every op — the measured ~9-11% tax on
+         * depth-1-dominated windows. Execute inline on the reader
+         * instead: n_inflight == 0 means every slot is FREE (QUEUED /
+         * EXECUTING / REPLYING / cancelled corpses all count), so
+         * every worker is parked on work_cv and the reader is the only
+         * thread touching srv — the exact invariant
+         * pool_handle_version's quiesce barrier establishes before ITS
+         * inline execution; here the barrier condition already holds.
+         * The observation is stable across the unlock: the reader is
+         * the sole admitter and workers only ever DECREASE n_inflight.
+         * The op takes no slot and never enters the registry — no
+         * frame can be read while it executes (same thread), so no
+         * duplicate tag can form against it, and a Tflush naming its
+         * tag arrives only after its reply is on the wire (the
+         * not-found arm: immediate Rflush, ordered after the reply by
+         * program order + write_mu — CF2-I2 holds). Alloc failure
+         * falls through to worker dispatch: inline is an optimization
+         * whose failure path is the normal path. */
+        if (p->n_inflight == 0 && !p->dead
+            && !(g_test_hooks.force_dispatch
+                 && g_test_hooks.force_dispatch(g_test_hooks.arg))) {
+            uint32_t need = p->resp_need;
+            pool_unlock(p);
+
+            if (ilr_cap < need) {
+                uint8_t *nr = realloc(ilr, need);
+                if (nr) { ilr = nr; ilr_cap = need; }
+            }
+            if (ilr_cap >= need) {
+                if (g_test_hooks.pre_handle)
+                    g_test_hooks.pre_handle(g_test_hooks.arg, tag, type);
+
+                uint32_t   rlen = 0;
+                stm_status hrc  = stm_9p_server_handle(p->srv, frame, size,
+                                                         ilr, ilr_cap,
+                                                         &rlen);
+                free(frame);
+                if (hrc != STM_OK || rlen == 0u) {
+                    /* Fatal per the handler contract — identical to the
+                     * worker path's latch. */
+                    pool_lock(p);
+                    pool_latch_dead_locked(
+                        p, (hrc == STM_OK) ? STM_EPROTOCOL : hrc);
+                    pool_unlock(p);
+                    break;
+                }
+                if (pool_write_inline(p, ilr, rlen) != 0) {
+                    pool_lock(p);
+                    pool_latch_dead_locked(p, STM_EIO);
+                    pool_unlock(p);
+                    break;
+                }
+                continue;
+            }
+            /* ilr alloc failed — dispatch instead (workers own their
+             * buffers; their ENOMEM path latches only on THEIR alloc
+             * failure). Re-lock and fall through; the registry is
+             * still empty (nothing was read or admitted since the
+             * check), so the duplicate gate needs no re-run. */
+            pool_lock(p);
+            if (p->dead) {          /* unreachable today (only this
+                                     * thread latches while idle) —
+                                     * defensive symmetry with the
+                                     * admission loop below. */
+                pool_unlock(p);
+                free(frame);
+                break;
+            }
+        }
+
         pool_slot *sl;
         size_t     budget = pool_byte_budget(gate);
         for (;;) {
@@ -689,6 +768,7 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
     if (p->dead) rc = p->fatal_rc;
     else if (!clean_eof) rc = STM_EIO;
 
+    free(ilr);
     free(wh);
     pthread_mutex_destroy(&p->write_mu);
     pthread_cond_destroy(&p->slot_cv);
