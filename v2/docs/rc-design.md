@@ -399,12 +399,78 @@ Recorded seams: (a) **adaptive dispatch** — execute inline when the queue
 is empty / depth 1, dispatch only at depth >= 2 (the direct-handoff
 hybrid); the candidate that would let the pool win the deep windows
 without taxing the shallow ones; a design fork for the user at RC-5, not
-silently built. (b) The A/B harness lesson: the worker count is baked
-into the disk image via joey's argv, so every arm switch costs a rebuild
-and cross-build pairs are confounded — a boot-time knob would make
-future A/Bs same-binary. (c) The serve.c `fs_workers_resolve` comment
-("flip the default back when clients can actually offer depth") remains
-accurate as written.
+silently built — **voted BUILD 2026-07-11 (RC-4b below)**. (b) The A/B
+harness lesson: the worker count is baked into the disk image via joey's
+argv, so every arm switch costs a rebuild and cross-build pairs are
+confounded — a boot-time knob would make future A/Bs same-binary. (c)
+The serve.c `fs_workers_resolve` comment ("flip the default back when
+clients can actually offer depth") remains accurate as written.
+
+### RC-4b — adaptive dispatch (user-voted 2026-07-11)
+
+**The vote:** build it now, while we are in the area. The rationale is
+the system's, not the benchmark's: Thylacine is an operating system, not
+a go-build appliance — shells, editors, netd traffic, and multi-process
+builds are mixed-depth clients forever, and the hybrid is what makes the
+pool **unconditionally safe to enable**, converting `--fs-workers` from
+a workload-dependent knob (only enable if your traffic is deep) into a
+correct default. Building it now means no future client rediscovers the
+depth-1 handoff tax.
+
+**Mechanism** (all inside `fs_pool.c`; `serve.c` untouched; the serial
+`workers == 1` loop stays byte-identical — CF2-I7 preserved): at
+admission, after the duplicate-tag gate and under `mu`, if
+`n_inflight == 0 && !dead` the reader executes the data op **inline** —
+no slot, no registry entry, no worker wake: grow a reader-owned response
+buffer to `resp_need` (on allocation failure fall through to DISPATCH —
+inline is an optimization whose failure path is the normal path), drop
+`mu`, run `stm_9p_server_handle`, reply via `pool_write_inline`
+(`write_mu`, the uniform reply discipline), with latch-dead semantics
+identical to the worker path (`hrc != STM_OK || rlen == 0` latches; a
+failed reply write latches EIO). Otherwise: today's enqueue + wake.
+
+**Soundness (why this is small):**
+
+1. *The idle observation is stable.* The reader is the sole admitter and
+   workers only ever DECREASE `n_inflight`; at `n_inflight == 0` every
+   worker is parked on `work_cv`, so the reader is the only thread
+   touching `srv` — **the exact invariant `pool_handle_version` already
+   relies on** for its quiesce-then-inline execution. Adaptive dispatch
+   is the Tversion pattern applied opportunistically whenever the
+   barrier condition already holds; no new concurrency assumption
+   enters the pool.
+2. *The inline op is registry-invisible and race-free by construction.*
+   No frame can be READ while it executes (same thread), so no
+   duplicate-tag can form against it, and a Tflush naming its tag
+   arrives only after completion — the existing not-found arm replies
+   Rflush immediately, ordered after the data reply by `write_mu` +
+   same-thread program order (CF2-I2 holds trivially).
+3. *Honest semantics:* a frame arriving DURING an inline execution
+   waits in the socket buffer for the residual service time — exactly
+   the serial loop's behavior (the first op of any burst runs inline;
+   the burst's tail dispatches and overlaps). Tflush responsiveness for
+   an inline op degrades to serial-loop level. No regression vs serial
+   anywhere; the pool's variance-compression benefit is kept wherever
+   depth exists.
+
+**Tests:** extend `stm_fs_pool_test_hooks` with `force_dispatch`
+(test-only; production passes NULL) so the existing worker-parking
+determinism tests keep parking on worker threads; `pre_handle` also
+fires on the inline path (doc note: may fire on the reader thread). Two
+NEW deterministic tests: (a) *inline-at-depth-1* — a single op's
+`pre_handle` fires ON the reader thread (pthread_self compared against
+the serve caller's); (b) *dispatch-at-depth>=2* — op1 parked on a worker
+via `force_dispatch`, then op2 admitted while the pool is busy executes
+on a worker thread, never the reader.
+
+**The gate:** the same-build-day A/B (serial vs hybrid-4) on the go4c
+set. Acceptance: the hybrid is >= serial on EVERY window (within noise)
+and > serial on at least the deep windows. If met, the Thylacine boot
+argv flips to `--fs-workers 4` permanently — the RC-4 acceptance
+realized. If not met, the hybrid still replaces the pure pool (it
+dominates it by construction) and the default stays opt-in. Then the
+focused adversarial audit (the CF-2a-audited reader loop is
+restructured — a full round on fs_pool.c) + the SMP gate.
 
 ### RC-5 — measure, gate, audit, close
 
