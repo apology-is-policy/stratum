@@ -355,6 +355,57 @@ restructure on the same pattern:
 - Tflush / fid-pin / writer-mutex (CF-2's built discipline) re-verified under
   real concurrency.
 
+#### As-built (RC-4, 2026-07-11) — the gate ran and HELD the default OFF
+
+The A/B ran post-RC-3 (joey argv `--fs-workers 4`, the CF-2a pool; six
+instrumented guest boots, snapshot-restored pool before every boot, all
+green: 1085/1085 in-kernel + full go4c probes + login E2E + 0 EXTINCTION).
+Verdict: **the pre-RC regression is gone, but workers=4 does not WIN — the
+default stays OFF (`--fs-workers` remains opt-in) and the Thylacine boot
+argv is unchanged.**
+
+Same-BUILD-day pairs (the load-bearing comparison; a cross-build pair hides
+~10% binary-to-binary variance — A2 from the RC-3-close build was the worst
+A sample on every axis and masked the signal in pooled means):
+
+| window (ms)  | w=1 (A3, A4) | w=4 (B1, B2) | read                     |
+|---|---|---|---|
+| build cold   | 857, 845     | 945, 945     | +10-11%, ranges disjoint |
+| build2-warm  | 561, 566     | 611, 616     | +9%, ranges disjoint     |
+| gofmt-cold   | 1866, 2095   | 1928, 1890   | wash (inside A spread)   |
+| gofmt-warm   | 864, 655     | 712, 704     | wash (inside A spread)   |
+
+The residual-serializer hunt CONCLUDED with a named mechanism, not a
+mystery. STMD26 per-window deltas: `re` (s->lock) wait = **0 under
+workers** (pre-RC Boot B: 141 ms — the RC retirement holds under the
+pool); bdev one-in-flight wait rose 0.006 ms -> ~27 ms cumulative (real
+queueing — the stage-2 trigger fires — but ~27 ms is not load-bearing
+under the host page cache); per-window bdev count/service byte-identical
+across arms. **No lock remains.** What remains is the pool's per-op
+dispatch handoff (reader->worker futex/condvar wake + writer-mutex reply
+serialization) taxing the depth-1-dominated build windows ~9-11% (down
+from the CF-2f 15-24% — RC removed the lock-contention component), while
+the overlap gain on the deep windows (gofmt-cold ge2 = 68%) only just
+cancels its own tax. The workers also compress within-arm variance
+strikingly (B pairs all within 1.5%) — the pool removes head-of-line
+blocking even where it does not win wall.
+
+Discharged here: the CF-2 discipline re-verify under REAL concurrency —
+the two workers=4 boots ran the pool live through the full boot + go
+builds + session E2E (plus the deterministic host pool suite in the
+73/73: Tflush-of-EXECUTING, dup-tag fatal, writer-mutex).
+
+Recorded seams: (a) **adaptive dispatch** — execute inline when the queue
+is empty / depth 1, dispatch only at depth >= 2 (the direct-handoff
+hybrid); the candidate that would let the pool win the deep windows
+without taxing the shallow ones; a design fork for the user at RC-5, not
+silently built. (b) The A/B harness lesson: the worker count is baked
+into the disk image via joey's argv, so every arm switch costs a rebuild
+and cross-build pairs are confounded — a boot-time knob would make
+future A/Bs same-binary. (c) The serve.c `fs_workers_resolve` comment
+("flip the default back when clients can actually offer depth") remains
+accurate as written.
+
 ### RC-5 — measure, gate, audit, close
 
 - The STMD26/DIAG23 instruments re-measure the gofmt + build2 + fsbench set
