@@ -849,6 +849,92 @@ STM_TEST(fs_cop_fresh_overcommit_refused) {
     unlink(g_tmp_path);
 }
 
+/* C-2-F2-audit F1: the reclaim-on-ENOSPC commit must not persist a
+ * transitioned inode's kind flip WITHOUT its extent bytes. Pre-fix,
+ * fs_reclaim_on_enospc_locked double-committed with NO dirty-buffer drain:
+ * a transitioned-but-undrained inode X (kind=EXTENT + si_data zeroed in the
+ * committed index; bytes RAM-only) became durably TORN -- a crash (modeled
+ * here as wedge + unmount, which skips the final flush per the crash-inject
+ * suite's pattern) then reads X as silent zeros. Post-fix the reclaim
+ * drains FIRST, so the same commit carries X's extent.
+ *
+ * Deterministic shape: PENDING from an unlinked committed file; X = a small
+ * transition (buffered); fillers use DIRECT (>= 1 MiB) writes so their
+ * ENOSPC reaches the RESERVE-path reclaim (stm_fs_write's retry) WITHOUT
+ * the buffered-insert flush dance (whose flush_all would drain X and mask
+ * the tear). */
+STM_TEST(fs_reclaim_commit_drains_transitioned_inode) {
+    make_tmp("reclaim_tear");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)32u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+
+    static uint8_t mb[1024u * 1024u];
+    memset(mb, 0xC3, sizeof mb);
+
+    /* 1. A committed-then-unlinked file -> PENDING blocks (CF-4 C defers
+     * the free to the reclaim sweep). */
+    uint64_t big = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"big", 3,
+                                          0644u, 0, 0, &big));
+    for (int i = 0; i < 4; i++)
+        STM_ASSERT_OK(stm_fs_write(fs, 1, big, (uint64_t)i * sizeof mb,
+                                        mb, sizeof mb));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"big", 3));
+
+    /* 2. X: a 4 KiB first write -> INLINE->EXTENT transition, BUFFERED. */
+    uint64_t xino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                          0644u, 0, 0, &xino));
+    uint8_t xpat[4096];
+    for (size_t i = 0; i < sizeof xpat; i++) xpat[i] = (uint8_t)(i * 13u + 5u);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, xino, 0, xpat, sizeof xpat));
+
+    /* 3. Fill with DIRECT writes until ENOSPC -> the reserve-path reclaim
+     * fires (pending > 0) at least once while X is undrained. */
+    bool hit_enospc = false;
+    for (uint64_t fi = 0; fi < 64 && !hit_enospc; fi++) {
+        char nm[4] = { 'f', (char)('a' + (fi / 26)), (char)('a' + (fi % 26)), 0 };
+        uint64_t fino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm, 3,
+                                              0644u, 0, 0, &fino));
+        for (int j = 0; j < 8; j++) {
+            stm_status ws = stm_fs_write(fs, 1, fino, (uint64_t)j * sizeof mb,
+                                              mb, sizeof mb);
+            if (ws == STM_ENOSPC) { hit_enospc = true; break; }
+            STM_ASSERT_OK(ws);
+        }
+    }
+    STM_ASSERT(hit_enospc);
+
+    /* 4. Crash-equivalent: wedge so unmount SKIPS its drain-first final
+     * commit (the crash-inject pattern) -- the durable state is exactly
+     * what the last (reclaim) commit left. */
+    stm_fs_mark_wedged(fs);
+    (void)stm_fs_unmount(fs);
+
+    /* 5. Remount: X must read its bytes back (post-fix the reclaim commit
+     * carried X's drained extent). Pre-fix: kind=EXTENT committed with NO
+     * extent -> silent zeros -> the pattern assert fails. */
+    stm_fs *fs2 = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs2));
+    uint8_t rb[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs2, 1, xino, 0, rb, sizeof rb, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    for (size_t i = 0; i < sizeof rb; i++)
+        STM_ASSERT_EQ(rb[i], xpat[i]);
+    STM_ASSERT_OK(stm_fs_unmount(fs2));
+    unlink(g_tmp_path);
+}
+
 /* #352-F1 (review P0): an interior sub-write of one block of a coalesced
  * multi-block extent, after a commit, must preserve the non-overwritten
  * blocks. Pre-fix, stm_extent_overwrite truncated/whole-dropped the

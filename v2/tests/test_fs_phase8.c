@@ -6978,6 +6978,55 @@ STM_TEST(fs_p7b_fallocate_keep_size_alone) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+/* C-2-F2-audit F4: pin the punch-refusal envelope on the COALESCED layout.
+ * Two adjacent uncommitted writes coalesce into ONE extent at fallocate's
+ * pre-flush (the transition-into-buffer behavior); punch of a sub-range of
+ * an AEAD-blob extent REFUSES (the MVP posture -- the blob cannot split).
+ * The refusal itself was previously untested: a regression that silently
+ * SPLIT the extent (or whole-dropped it, losing the sticking-out half --
+ * the #342/#352-F1 lost-bytes class) would have sailed through. Assert the
+ * refusal AND that both blocks read back intact afterward. */
+STM_TEST(fs_p7b_fallocate_punch_refuses_mid_extent) {
+    make_tmp("p7b_punch_refuse");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"r", 1,
+                                          0644u, 0, 0, &ino));
+
+    /* Two adjacent writes, NO commit between -- they coalesce at the
+     * fallocate pre-flush into one [0, 8192) extent. */
+    p7b_write_block(fs, ino, 0,    7);
+    p7b_write_block(fs, ino, 4096, 8);
+
+    /* Punch [0, 4096) = a sub-range of the coalesced extent: REFUSED. */
+    stm_status pr = stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_PUNCH_HOLE |
+                                              STM_FS_FALLOC_FL_KEEP_SIZE);
+    STM_ASSERT_EQ((int)pr, (int)STM_ENOTSUPPORTED);
+
+    /* Both blocks intact -- the refusal mutated nothing. */
+    uint8_t rb[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, ino, 0, rb, sizeof rb, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    for (size_t i = 0; i < sizeof rb; i++)
+        STM_ASSERT_EQ(rb[i], (uint8_t)((i * 7u + 7u) & 0xFFu));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, ino, 4096, rb, sizeof rb, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    for (size_t i = 0; i < sizeof rb; i++)
+        STM_ASSERT_EQ(rb[i], (uint8_t)((i * 7u + 8u) & 0xFFu));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST(fs_p7b_fallocate_punch_hole_drops_extent) {
     /* Write 2 blocks; punch the first; verify it's gone (sparse hole
      * via extent-index drop) but the second block survives. */
@@ -6998,9 +7047,18 @@ STM_TEST(fs_p7b_fallocate_punch_hole_drops_extent) {
                                           0644u, 0, 0, &ino));
 
     /* Write 2 blocks via fs_write — these go through the inode-aware
-     * path. The first write transitions inline → extent. */
+     * path. The first write transitions inline → extent. CHASE C-2: the
+     * transition now BUFFERS (no sync extent write), and adjacent
+     * buffered ranges coalesce into ONE extent at drain — which punch
+     * cannot split (an AEAD-blob extent is indivisible; the MVP refusal
+     * posture). Commit between the writes to drain each block as its
+     * OWN extent, constructing the per-block seam this test's punch
+     * granularity requires (extent layout has always been write-
+     * pattern-dependent; the old seam fell out of the sync transition). */
     p7b_write_block(fs, ino, 0,    1);
+    STM_ASSERT_OK(stm_fs_commit(fs));
     p7b_write_block(fs, ino, 4096, 2);
+    STM_ASSERT_OK(stm_fs_commit(fs));
 
     /* Punch [0, 4096). */
     STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
@@ -7061,9 +7119,14 @@ STM_TEST(fs_p7b_fallocate_collapse_range_shifts_extents) {
     STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
                                           0644u, 0, 0, &ino));
 
+    /* CHASE C-2: commit between writes so each block drains as its own
+     * extent (see the punch test's seam note). */
     p7b_write_block(fs, ino, 0,    11);
+    STM_ASSERT_OK(stm_fs_commit(fs));
     p7b_write_block(fs, ino, 4096, 22);
+    STM_ASSERT_OK(stm_fs_commit(fs));
     p7b_write_block(fs, ino, 8192, 33);
+    STM_ASSERT_OK(stm_fs_commit(fs));
 
     /* Punch first block, then collapse. */
     STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u,

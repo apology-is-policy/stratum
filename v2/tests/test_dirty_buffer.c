@@ -517,7 +517,11 @@ STM_TEST(dbuf_arg_validation)
 
 /* #40 A-F2: the admission counts BLOCK footprint, not logical bytes. N 1-byte
  * writes to distinct blocks are ~N bytes but N blocks -- the gap the old
- * logical-byte check missed (tiny bytes, many blocks -> pool overrun). */
+ * logical-byte check missed (tiny bytes, many blocks -> pool overrun).
+ * CHASE C-2 overhead hardening: each stored range additionally charges 1
+ * reserve block per started RECORDSIZE piece (the drained extent's AEAD
+ * tag + record-header rounding -- sync.c total_bytes = len + tag_len), so
+ * a small range costs blocks_spanned + 1. */
 STM_TEST(dbuf_footprint_counts_blocks_not_bytes)
 {
     stm_dirty_buffer *b = NULL;
@@ -528,12 +532,13 @@ STM_TEST(dbuf_footprint_counts_blocks_not_bytes)
     for (uint64_t i = 0; i < N; i++)
         STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, i * BLK, 1, &one));
     STM_ASSERT_EQ(stm_dirty_buffer_total_bytes(b), (size_t)N);               /* N bytes */
-    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)N);  /* N blocks */
+    /* N ranges x (1 block + 1 overhead). */
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)(2 * N));
 
-    /* A write straddling a block boundary counts 2 blocks. */
+    /* A write straddling a block boundary counts 2 blocks (+1 overhead). */
     uint8_t two[8] = {0};
     STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 2, BLK - 2u, 4, two)); /* [4094,4098): blocks 0+1 */
-    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)(N + 2));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)(2 * N + 3));
 
     stm_dirty_buffer_destroy(b);
 }
@@ -546,15 +551,17 @@ STM_TEST(dbuf_insert_bounded_refuses_over_footprint)
     stm_dirty_buffer *b = NULL;
     STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
 
-    enum { BLK = 4096u, MAXF = 3 };
+    /* C-2 overhead hardening: a 1-byte range costs 2 (1 block + 1 reserve
+     * overhead), so bound 3 ranges at MAXF = 6. */
+    enum { BLK = 4096u, NR = 3, MAXF = 6 };
     uint8_t one = 0x11;
-    for (uint64_t i = 0; i < MAXF; i++)   /* 3 distinct blocks: footprint 1,2,3 -- all fit */
+    for (uint64_t i = 0; i < NR; i++)   /* 3 ranges: footprint 2,4,6 -- all fit */
         STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, i * BLK, 1, &one, MAXF));
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)MAXF);
 
-    /* The 4th distinct block would make footprint 4 > MAXF -> refused, no mutation. */
+    /* A 4th distinct block would make footprint 8 > MAXF -> refused, no mutation. */
     stm_status rc = stm_dirty_buffer_insert_bounded(b, 1, 1,
-                                                    (uint64_t)MAXF * BLK, 1, &one, MAXF);
+                                                    (uint64_t)NR * BLK, 1, &one, MAXF);
     STM_ASSERT_EQ((int)rc, (int)STM_ENOSPC);
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)MAXF);
 

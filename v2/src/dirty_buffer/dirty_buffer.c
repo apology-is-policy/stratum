@@ -152,14 +152,38 @@ static bool ranges_overlap(uint64_t a, uint64_t la,
  * these, not logical bytes. Per-range summing is CONSERVATIVE (two adjacent
  * sub-block ranges in one block count it twice) -- safe: it never under-counts
  * the footprint, so admission never over-admits; the only cost is a rare, at
- * most spurious refusal on sub-block scatter within a block. len==0 -> 0. */
+ * most spurious refusal on sub-block scatter within a block. len==0 -> 0.
+ *
+ * #40 overhead hardening (CHASE C-2): the drain emits each range as
+ * <=RECORDSIZE extents whose ON-DISK reserve is plaintext + AEAD tag +
+ * record header (sync.c: total_bytes = len + tag_len), i.e. up to ONE
+ * block MORE per emitted extent than the plaintext span. Charge that
+ * overhead here -- 1 block per started RECORDSIZE piece -- so "accepted
+ * buffered write" stays "committable" exactly FOR EXTENTS LANDING ON
+ * HOLES (the transition/append shape: aligned, no prior extents; the
+ * charged sum >= the drain's reserve by ceil-subadditivity under run
+ * coalescing). Pre-fix the invariant held only when the refusal margin
+ * happened to exceed the summed per-extent overhead; the fs-level
+ * transition-into-buffer change shifted the margin and exposed it.
+ * REMAINING residual (C-2-F2-audit F3): a drain landing on PARTIALLY
+ * OVERLAPPED existing extents pays the covering-write RMW expansion
+ * (fs.c fs_write_extent_aligned_locked -- up to the neighbors' full
+ * spans), which is NOT charged here; that corner stays a
+ * conservative-retry residual (reclaim-on-ENOSPC + the fs retry dance),
+ * bounded to availability, never corruption. DBUF_RECPIECE
+ * mirrors STM_FS_RECORDSIZE_MAX (8 MiB) conservatively: a smaller real
+ * recordsize would only mean MORE pieces than charged -- so keep the
+ * mirror <= the fs constant. Used by every footprint site (insert add,
+ * overlap vacate, per-range remove) so accounting stays symmetric. */
+#define DBUF_RECPIECE (8ull * 1024u * 1024u)
 static uint64_t blocks_spanned(uint64_t off, uint64_t len)
 {
     if (len == 0) return 0;
     uint64_t blk   = (uint64_t)STM_UB_SIZE;
     uint64_t first = off / blk;
     uint64_t last  = (off + len - 1u) / blk;
-    return last - first + 1u;
+    uint64_t pieces = (len + DBUF_RECPIECE - 1u) / DBUF_RECPIECE;
+    return last - first + 1u + pieces;
 }
 
 /* ───────────────────────────── public API ─────────────────────────── */
@@ -442,19 +466,28 @@ stm_status stm_dirty_buffer_lookup(stm_dirty_buffer *buf,
     return STM_OK;
 }
 
-void stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
+size_t stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
                                   uint64_t dataset_id, uint64_t ino,
                                   uint64_t req_off, size_t req_len,
                                   void *out_buf)
 {
-    if (!buf || !out_buf || req_len == 0) return;
-    if (req_off > UINT64_MAX - req_len) return;
+    /* Returns the inode's post-overlay resident byte count (0 if absent) --
+     * the C-2-F2-audit F2 fix's coherence token: the buffered-read caller
+     * compares it to the pre-fill count and retries the fill+overlay while
+     * they differ (a cross-inode drain_all -- which holds buf->mu across
+     * the WHOLE drain, cbs included -- popped ranges between the reader's
+     * fill and this overlay, landing them as extents the fill predates).
+     * Termination is monotone: same-ino inserts are excluded by the
+     * reader's shared pin, so the count only DECREASES -- at most one
+     * retry per popped-run episode. */
+    if (!buf || !out_buf || req_len == 0) return 0;
+    if (req_off > UINT64_MAX - req_len) return 0;
 
     pthread_mutex_lock(&buf->mu);
     stm_dbuf_inode *e = find_inode_locked(buf, dataset_id, ino);
     if (!e) {
         pthread_mutex_unlock(&buf->mu);
-        return;
+        return 0;
     }
     uint8_t *dst = (uint8_t *)out_buf;
     uint64_t req_end = req_off + req_len;
@@ -469,8 +502,11 @@ void stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
         uint64_t src_off  = s - r->off;
         memcpy(dst + dst_off, r->data + src_off, (size_t)take_len);
     }
+    size_t resident = e->bytes;
     pthread_mutex_unlock(&buf->mu);
+    return resident;
 }
+
 
 /* Coalesce contiguous buffered ranges into as few extent writes as
  * possible — realizing the dirty buffer's stated purpose ("absorbs

@@ -172,6 +172,21 @@ struct stm_fs {
      * ops; impl-5 drops the residual EX takes that were just the
      * big-fs-lock semantics. */
     pthread_rwlock_t global;
+    /* C-2-F2-audit R2-F1: the writeback-transaction lock. A buffered
+     * writer's {dirty-buffer insert; inode iset} two-step must be ATOMIC
+     * against the reclaim-on-ENOSPC commit family -- the only committer
+     * that runs under fs->global SH (stm_fs_commit / snapshot / unmount
+     * hold EX, which excludes SH writers wholesale). Without it, a peer
+     * writer's transition landing inside reclaim's drain->commit window
+     * (tens of ms) makes the kind=EXTENT flip durable WITHOUT its
+     * RAM-only bytes -- the R1-F1 tear via concurrency. Writers RDLOCK
+     * around each insert->iset span (both the transition and buffered
+     * arms; released across the ENOSPC dance, whose reclaim takes the
+     * WRLOCK); reclaim WRLOCKs its whole drain->commit sequence. Order:
+     * fs->global -> per-inode pin -> dbuf_txn -> dbuf->mu -> sync locks
+     * (acyclic: never taken under buf->mu / sync locks; no pin taken
+     * under it; the drain cbs + commits take no pins). */
+    pthread_rwlock_t dbuf_txn;
 
     stm_bdev  *bdev;         /* owned — closed at unmount */
     stm_pool  *pool;         /* owned — P5-1 N=1 wrapper over bdev */
@@ -1011,9 +1026,38 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         free(fs);
         return NULL;
     }
+    /* R3-F1: dbuf_txn gets the SAME R133 writer-preference posture as
+     * fs->global -- its rd-takers are the hottest op class (sub-threshold
+     * writes on N worker threads) and its sole wr-taker is the rare
+     * ENOSPC reclaim; glibc/musl reader-preference would let the rd
+     * stream starve the queued wrlock at pool-full (an availability
+     * livelock, live on the Linux sanitizer VMs). macOS/musl residual =
+     * the shared R133 posture (scheduler fairness), not new debt. */
+#if defined(__linux__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
+    {
+        pthread_rwlockattr_t txnattr;
+        pthread_rwlockattr_init(&txnattr);
+        pthread_rwlockattr_setkind_np(&txnattr,
+            PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        int txnrc = pthread_rwlock_init(&fs->dbuf_txn, &txnattr);
+        pthread_rwlockattr_destroy(&txnattr);
+        if (txnrc != 0) {
+            pthread_rwlock_destroy(&fs->global);
+            free(fs);
+            return NULL;
+        }
+    }
+#else
+    if (pthread_rwlock_init(&fs->dbuf_txn, NULL) != 0) {
+        pthread_rwlock_destroy(&fs->global);
+        free(fs);
+        return NULL;
+    }
+#endif
     if (keyfile_path) {
         fs->keyfile_path = strdup(keyfile_path);
         if (!fs->keyfile_path) {
+            pthread_rwlock_destroy(&fs->dbuf_txn);
             pthread_rwlock_destroy(&fs->global);
             free(fs);
             return NULL;
@@ -1023,6 +1067,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         fs->janus_socket = strdup(janus_socket);
         if (!fs->janus_socket) {
             free(fs->keyfile_path);
+            pthread_rwlock_destroy(&fs->dbuf_txn);
             pthread_rwlock_destroy(&fs->global);
             free(fs);
             return NULL;
@@ -1045,6 +1090,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
     if (!fs->locks) {
         free(fs->janus_socket);
         free(fs->keyfile_path);
+        pthread_rwlock_destroy(&fs->dbuf_txn);
         pthread_rwlock_destroy(&fs->global);
         free(fs);
         return NULL;
@@ -1060,6 +1106,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         stm_lock_table_close(fs->locks);
         free(fs->janus_socket);
         free(fs->keyfile_path);
+        pthread_rwlock_destroy(&fs->dbuf_txn);
         pthread_rwlock_destroy(&fs->global);
         free(fs);
         return NULL;
@@ -1443,6 +1490,7 @@ stm_status stm_fs_unmount(stm_fs *fs)
     stm_dirty_buffer_destroy(fs->dirty_buffer);
 
     pthread_rwlock_unlock(&fs->global);
+    pthread_rwlock_destroy(&fs->dbuf_txn);
     pthread_rwlock_destroy(&fs->global);
     free(fs->keyfile_path);
     free(fs->janus_socket);
@@ -1490,7 +1538,13 @@ stm_status stm_fs_free(stm_fs *fs, uint64_t paddr, uint64_t free_gen)
     return s;
 }
 
+static stm_status stm_fs_commit_inner(stm_fs *fs);
 stm_status stm_fs_commit(stm_fs *fs)
+{
+    stm_status crc = stm_fs_commit_inner(fs);
+    return crc;
+}
+static stm_status stm_fs_commit_inner(stm_fs *fs)
 {
     if (!fs) return STM_EINVAL;
     pthread_rwlock_wrlock(&fs->global);
@@ -1876,7 +1930,9 @@ static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
                                         const void *data)
 {
     stm_fs *fs = (stm_fs *)user;
-    return fs_write_extent_aligned_locked(fs, ds, ino, off, data, (size_t)len);
+    stm_status drc = fs_write_extent_aligned_locked(fs, ds, ino, off, data,
+                                                        (size_t)len);
+    return drc;
 }
 
 /* Flush one inode's buffered ranges. Caller holds the outer fs lock
@@ -1993,7 +2049,8 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * Every successful fs_write is a content change → both
              * mtime + ctime advance per POSIX. */
             fs_stamp_mtime_ctime_now(iv);
-            return stm_inode_set(iidx, ds, ino, iv);
+            stm_status isr = stm_inode_set(iidx, ds, ino, iv);
+            return isr;
         }
 
         /* Transition: build a single block-aligned combined buffer
@@ -2027,10 +2084,58 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
             memcpy(combined + off, buf, len);
         }
 
-        stm_status fs1 = stm_sync_write_extent(fs->sync, ds, ino,
-                                                    /*off=*/0u,
-                                                    combined,
-                                                    (size_t)aligned_size);
+        /* CHASE C-2 F2 (task #46): the transition INSERTS the combined
+         * buffer into the dirty buffer instead of synchronously writing
+         * the extent -- the measured W-C band: 587 transitions/boot each
+         * paying one ~508 us virtio-blk round-trip mid-RPC for bytes
+         * that are not durable until commit anyway (commit drains the
+         * buffer FIRST -- stm_fs_commit's flush-then-sync order -- so
+         * every COMMITTED state still has its extents; crash pre-commit
+         * loses buffer + in-memory inode together, the documented
+         * posture). Reads of a transitioned-undrained file are already
+         * correct: the EXTENT read arm zero-fills holes (never ENOENT)
+         * then overlays the buffer (writeback.tla::ReadHidesFlushOrder).
+         * The insert keeps the block-aligned geometry so the eventual
+         * drain emits ONE aligned extent byte-identical to the old sync
+         * write (no RMW). Same #40 bounded admission as the buffered
+         * arm; on ENOSPC (RAM cap / pool footprint) fall back to the
+         * pre-F2 sync extent write -- fail-safe, no new failure mode.
+         * An INLINE-kind inode structurally has no prior buffered
+         * ranges (the buffered arm requires kind==EXTENT), so the
+         * insert cannot shadow stale data. */
+        /* C-2-F2-audit F5: honor the direct-write threshold here exactly as
+         * the steady-state EXTENT arm does -- a multi-MiB first write goes
+         * straight to the extent layer (buffering it whole would eat the
+         * per-inode cap + widen the undrained window for no measured need;
+         * the 587 measured transitions are all small). */
+        /* R2-F1: the {insert; iset} two-step below must be atomic vs the
+         * reclaim commit family -- RDLOCK dbuf_txn across it (reclaim
+         * WRLOCKs its drain->commit sequence). The sync-write fallback
+         * needs no lock: extent-before-iset is commit-consistent by
+         * construction (the pre-F2 order). */
+        stm_status fs1 = STM_ENOSPC;
+        bool txn_held = false;
+        if (aligned_size < (uint64_t)STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
+            uint64_t tr_freeb = fs->alloc
+                ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
+            pthread_rwlock_rdlock(&fs->dbuf_txn);
+            txn_held = true;
+            fs1 = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
+                                        ds, ino, /*off=*/0u,
+                                        (uint64_t)aligned_size, combined,
+                                        tr_freeb);
+        }
+        if (fs1 != STM_OK) {
+            if (txn_held) {
+                pthread_rwlock_unlock(&fs->dbuf_txn);
+                txn_held = false;
+            }
+            /* Fallback: the pre-F2 synchronous extent write. */
+            fs1 = stm_sync_write_extent(fs->sync, ds, ino,
+                                            /*off=*/0u,
+                                            combined,
+                                            (size_t)aligned_size);
+        }
         free(combined);
         if (fs1 != STM_OK) return fs1;
 
@@ -2058,7 +2163,22 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * extent) AND a kind transition (INLINE → EXTENT) — POSIX
          * stamps mtime + ctime on either alone. */
         fs_stamp_mtime_ctime_now(iv);
-        return stm_inode_set(iidx, ds, ino, iv);
+        {
+            stm_status trs = stm_inode_set(iidx, ds, ino, iv);
+            /* C-2-F2-audit F6 hardening: the R76-"infallible" set. If it
+             * ever fails (a future alloc path breaking the annotation's
+             * assumption), the inode stays INLINE while the buffer holds
+             * [0, aligned) -- and unlink's cleanup drops ranges only for
+             * EXTENT inos, so a reused ino would inherit the dead file's
+             * bytes through the overlay: a cross-file leak. Drop the
+             * ghost ranges here, restoring the pre-buffering blast radius
+             * (an orphan extent = space-only). */
+            if (trs != STM_OK)
+                stm_dirty_buffer_drop_ino(fs->dirty_buffer, ds, ino);
+            if (txn_held)
+                pthread_rwlock_unlock(&fs->dbuf_txn);
+            return trs;
+        }
     }
 
     if (kind == STM_DATA_EXTENT) {
@@ -2071,6 +2191,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * Direct writes pre-flush the inode's buffered ranges so a
          * stale buffered range doesn't shadow newer direct data
          * post-overlay. */
+        bool wb_txn_held = false;   /* R2-F1: dbuf_txn RD held into the iset */
         if (len < STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
             /* #40 pool-aware admission (atomic, block-granular): admit the
              * buffered write only if the buffered block FOOTPRINT would stay
@@ -2084,29 +2205,52 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * re-read, retry -- then a true ENOSPC only if the write alone
              * won't fit the drained pool. NULL alloc (test seam) -> unbounded
              * by footprint, RAM caps still apply. */
+            /* R2-F1: RDLOCK dbuf_txn across each {insert; ...; iset} span
+             * (the successful insert HOLDS through the epilogue iset below;
+             * a failed attempt RELEASES across the flush dance, whose
+             * reclaim takes the WRLOCK -- holding through it would
+             * self-deadlock). */
             uint64_t freeb = fs->alloc
                 ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
+            pthread_rwlock_rdlock(&fs->dbuf_txn);
+            wb_txn_held = true;
             stm_status ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
                                         ds, ino, off, (uint64_t)len, buf, freeb);
             if (ic == STM_ENOSPC) {
+                pthread_rwlock_unlock(&fs->dbuf_txn);
+                wb_txn_held = false;
                 stm_status fr = fs_flush_ino_locked(fs, ds, ino);
                 if (fr == STM_OK) {
                     freeb = fs->alloc
                         ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
+                    pthread_rwlock_rdlock(&fs->dbuf_txn);
+                    wb_txn_held = true;
                     ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
                                         ds, ino, off, (uint64_t)len, buf, freeb);
                 }
                 if (ic == STM_ENOSPC) {
+                    if (wb_txn_held) {
+                        pthread_rwlock_unlock(&fs->dbuf_txn);
+                        wb_txn_held = false;
+                    }
                     fr = fs_flush_all_locked(fs);
                     if (fr == STM_OK) {
                         freeb = fs->alloc
                             ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
+                        pthread_rwlock_rdlock(&fs->dbuf_txn);
+                        wb_txn_held = true;
                         ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
                                         ds, ino, off, (uint64_t)len, buf, freeb);
                     }
                 }
             }
-            if (ic != STM_OK) return ic;
+            if (ic != STM_OK) {
+                if (wb_txn_held) {
+                    pthread_rwlock_unlock(&fs->dbuf_txn);
+                    wb_txn_held = false;
+                }
+                return ic;
+            }
         } else {
             /* Direct path: pre-flush this inode's buffered ranges so
              * the overlay at read-after-direct-write doesn't shadow
@@ -2130,7 +2274,12 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         /* P8-POSIX-7a: stamp mtime + ctime on every successful extent
          * write — same posture for buffered + direct. */
         fs_stamp_mtime_ctime_now(iv);
-        return stm_inode_set(iidx, ds, ino, iv);
+        {
+            stm_status isr = stm_inode_set(iidx, ds, ino, iv);
+            if (wb_txn_held)
+                pthread_rwlock_unlock(&fs->dbuf_txn);   /* R2-F1 */
+            return isr;
+        }
     }
 
     /* SYMLINK / DEVICE / unknown: regular-file write rejected. The
@@ -2183,9 +2332,9 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
         /* SWISS-4q-flush: probe the dirty buffer. If this inode has
          * buffered ranges, we take the buffered read path; otherwise
          * preserve the original (non-buffer) behavior verbatim. */
-        bool buffer_has_data =
-            stm_dirty_buffer_has_ino(fs->dirty_buffer, ds, ino);
-        if (!buffer_has_data) {
+        size_t resident =
+            stm_dirty_buffer_inode_bytes(fs->dirty_buffer, ds, ino);
+        if (resident == 0) {
             stm_status rs = fs_read_extent_aligned_locked(fs, ds, ino, off,
                                                               buf, len, out_read);
             if (rs == STM_OK && out_read) {
@@ -2211,14 +2360,37 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
          * (fs_read_span_filled_locked zeros holes + pre-zeroes via calloc),
          * THEN overlay the buffer's newer bytes. Returning effective_len is
          * correct only because the fill is now multi-extent; the prior
-         * single-extent read left a 2nd+ committed extent zero. */
-        stm_status rs = fs_read_span_filled_locked(fs, ds, ino, off,
-                                                     (uint8_t *)buf, effective_len);
-        /* fs_read_span_filled_locked never returns STM_ENOENT; any non-OK is a
-         * real error -> propagate (the overlay only runs on a fully-filled buf). */
-        if (rs != STM_OK) return rs;
-        stm_dirty_buffer_overlay(fs->dirty_buffer, ds, ino, off,
-                                    effective_len, buf);
+         * single-extent read left a 2nd+ committed extent zero.
+         *
+         * C-2-F2-audit F2 (pre-existing, widened by the transition
+         * buffering): a CROSS-inode fs_flush_all_locked holds no per-inode
+         * pin, so it can drain THIS inode between the fill and the overlay
+         * -- the popped runs land as extents the fill predates and vanish
+         * from the overlay: a transient silent-zero read (neither pre- nor
+         * post-image, the RC-I2 violation). The fix: the resident-byte
+         * token. Retry the fill+overlay while the inode's resident count
+         * changed across them; termination is monotone (same-ino inserts
+         * are excluded by our shared pin, so the count only DECREASES --
+         * at most one retry per popped-run episode; resident==0 means
+         * everything landed extent-side and the final fill reads it all). */
+        for (;;) {
+            stm_status rs = fs_read_span_filled_locked(fs, ds, ino, off,
+                                                         (uint8_t *)buf, effective_len);
+            /* fs_read_span_filled_locked never returns STM_ENOENT; any non-OK is a
+             * real error -> propagate (the overlay only runs on a fully-filled buf). */
+            if (rs != STM_OK) return rs;
+            size_t after = stm_dirty_buffer_overlay(fs->dirty_buffer, ds, ino, off,
+                                                       effective_len, buf);
+            if (after == resident) break;      /* no drain interleaved: coherent */
+            resident = after;                   /* re-fill against the new state */
+            if (resident == 0) {
+                /* Fully drained mid-read: one final fill sees every extent. */
+                rs = fs_read_span_filled_locked(fs, ds, ino, off,
+                                                  (uint8_t *)buf, effective_len);
+                if (rs != STM_OK) return rs;
+                break;
+            }
+        }
         if (out_read) *out_read = effective_len;
         return STM_OK;
     }
@@ -3367,10 +3539,51 @@ static void fs_mark_wedged_locked(stm_fs *fs)
 static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
 {
     if (stm_sync_pending_free_blocks(fs->sync) == 0) return false;
+    /* C-2-F2-audit F1: DRAIN-FIRST. stm_sync_commit persists the inode
+     * index, so committing while the dirty buffer holds a transitioned
+     * inode's bytes would make the kind=EXTENT flip durable WITHOUT its
+     * extent -- a torn image (crash, or a commit#1-fails wedge whose
+     * unmount skips the final flush, turns it into silent zeros INCLUDING
+     * previously-committed inline content). Drain the buffer BEFORE the
+     * commit pair so the committed image is consistent. The RAW drain
+     * (not fs_flush_*_locked) cannot re-enter reclaim -- its cb's ENOSPC
+     * just propagates, keeping undrained ranges buffered (pop-on-success).
+     * If the pre-drain falls short (the deep-pressure corner: the drain
+     * itself needs the space only the sweep can free), run the pair, then
+     * re-drain, then ONE closing commit to persist the re-drained extents
+     * -- so the only residual torn window is (deep corner) x (crash before
+     * the closing commit / a later drain+commit; unmount drains-first and
+     * closes it). The #40 admission makes the transition's own drain fit
+     * by construction (hole-landing, exactly charged); the corner needs
+     * out-of-band free-space consumption between admission and drain. */
+    /* R2-F1: the whole drain->commit sequence runs under dbuf_txn WRLOCK,
+     * excluding every writer's {insert; iset} two-step (they RDLOCK it) --
+     * else a PEER writer's transition landing inside the ~20-100 ms commit
+     * window below makes its kind flip durable without its RAM-only bytes,
+     * resurrecting the R1-F1 tear via concurrency. EX-mode callers of this
+     * function already exclude writers via fs->global; taking the wrlock
+     * there too is uncontended by construction. */
+    pthread_rwlock_wrlock(&fs->dbuf_txn);
+    stm_status predrain = stm_dirty_buffer_drain_all(fs->dirty_buffer,
+                                                        fs_flush_drain_cb, fs);
     if (fs_post_inode_free_reclaim_locked(fs)) {
+        pthread_rwlock_unlock(&fs->dbuf_txn);
         fs_mark_wedged_locked(fs);
         return false;
     }
+    if (predrain != STM_OK) {
+        stm_status redrain = stm_dirty_buffer_drain_all(fs->dirty_buffer,
+                                                           fs_flush_drain_cb, fs);
+        (void)redrain;   /* a still-failing re-drain leaves bytes buffered;
+                            the closing commit below persists whatever DID
+                            land, so no NEW tear is added by this call. */
+        if (stm_sync_commit(fs->sync) != STM_OK) {
+            pthread_rwlock_unlock(&fs->dbuf_txn);
+            fs_mark_wedged_locked(fs);
+            return false;
+        }
+    }
+    pthread_rwlock_unlock(&fs->dbuf_txn);
     return true;
 }
 

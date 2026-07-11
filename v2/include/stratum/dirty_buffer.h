@@ -158,15 +158,23 @@ stm_status stm_dirty_buffer_lookup(stm_dirty_buffer *buf,
  * caller pre-fills `out_buf` with extent-layer data, then calls this
  * to overlay the in-RAM newer bytes (writeback.tla::ReadHidesFlushOrder).
  *
- * Best-effort, no return value: a NULL buffer / inode-not-present /
- * zero-length request is a no-op.
+ * Returns the inode's POST-overlay resident byte count (0 on a NULL
+ * buffer / inode-not-present / zero-length request -- those overlay
+ * nothing). The count is the C-2-F2-audit coherence token: the buffered
+ * read compares it to the pre-fill `stm_dirty_buffer_inode_bytes` and
+ * retries the fill+overlay while they differ (a cross-inode drain_all
+ * popped ranges between the two -- landing them as extents the fill
+ * predates -- so neither the fill nor the overlay carried those bytes).
+ * Termination: same-ino inserts are excluded by the reader's shared
+ * pin, so the count is monotone-decreasing across the read.
  *
  * Concurrency: takes buf->mu internally.
  */
-void stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
+size_t stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
                                   uint64_t dataset_id, uint64_t ino,
                                   uint64_t req_off, size_t req_len,
                                   void    *out_buf);
+
 
 /*
  * Per-range callback passed to drain_ino / drain_all. The callback's
@@ -255,6 +263,14 @@ void stm_dirty_buffer_drop_ino(stm_dirty_buffer *buf,
  * Return the per-inode buffered byte count. Used by callers to decide
  * whether to pre-flush (e.g., to keep latency low at fsync time).
  *
+ * ALSO the C-2-F2-audit coherence token's PRE-FILL probe: the buffered
+ * read captures this count, fills from the extent layer, overlays, and
+ * compares against overlay's returned count -- retrying while they
+ * differ (a cross-inode drain popped ranges between the two, landing
+ * them as extents the fill predates). Termination is monotone: same-ino
+ * inserts are excluded by the reader's shared pin, so the count only
+ * DECREASES across the read.
+ *
  * Concurrency: takes buf->mu internally.
  */
 size_t stm_dirty_buffer_inode_bytes(stm_dirty_buffer *buf,
@@ -275,7 +291,9 @@ uint64_t stm_dirty_buffer_total_footprint_blocks(stm_dirty_buffer *buf);
 
 /*
  * Return true if the buffer holds any range for (dataset_id, ino).
- * Used by fs_unlink to decide whether to call drop_ino (cheap probe).
+ * Test/introspection probe (fs.c has no production call sites since the
+ * C-2-F2-audit retry protocol moved the read path onto the byte-count
+ * token above; unlink's cleanup calls drop_ino directly, kind-gated).
  *
  * Concurrency: takes buf->mu internally.
  */
