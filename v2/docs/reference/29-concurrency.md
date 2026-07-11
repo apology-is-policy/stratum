@@ -426,9 +426,49 @@ stages:
   witnesses: `tests/test_rc2_concurrent.c` (the read/overwrite hammer, the
   rotate+re-encrypt+sweep DEK hammer, the fs-level single-version RC-I2
   test, the pin-mode semantics).
-- **RC-3 (planned):** the write path — brief locked reservation, unlocked
-  encrypt + device write, brief locked epilogue. Commit exclusion
-  (`fs->global` EX) unchanged.
+- **RC-3 (BUILT):** the public `stm_sync_write_extent` is three-phase:
+  `sync_write_reserve_locked` (brief `s->lock`: DEK resolve via the
+  borrowed under-lock map walk, size math, per-device replica reserves,
+  the gen capture) → `sync_write_encrypt_store` (NO `s->lock`: the AEAD
+  encrypt + per-replica `stm_bdev_write`, all thread-local or self-locked
+  — the measured bulk of a write; where disjoint-inode writers overlap)
+  → `sync_write_index_commit_locked` (brief `s->lock`: the cold-overlap
+  bookend + `stm_extent_overwrite` + the gated CF-5a dcache
+  write-populate + drop/deref routing — ONE lock hold, so the
+  scan-matches-overwrite atomicity vs every other extent mutator is
+  exactly pre-RC-3). `stm_sync_write_extent_locked` (truncate's prefix
+  re-encrypt) composes the same three helpers under its caller's single
+  lock span, sequence-equivalent to the old monolith. The captured
+  `write_gen` feeds the encrypt nonce, the record stamp, and the dcache
+  key — nonce-unique across a phase-straddling gen advance because the
+  allocator's PENDING discipline forbids same-gen paddr reuse. THE new
+  obligation the split opens: `stm_sync_keyschema_sweep` can prune the
+  resolved CURRENT key mid-window (the zero-refs gate cannot see an
+  un-indexed in-flight write) — closed by the epilogue's keyschema
+  re-validation under the same lock hold that indexes, with a bounded
+  whole-op retry against the fresh CURRENT (`write_key_liveness.tla`,
+  clean + the `no_revalidate` buggy counterexample; exhaustion = honest
+  `STM_EBUSY`). Evict-dek mid-window does NOT fail the write (the
+  keyschema entry persists; the record indexes,
+  decryptable-on-reinstall) but its plaintext must not outlive the DEK
+  denial: the write populate is pre-gated on DEK-slot liveness (fully
+  serialized — the epilogue holds `s->lock`), and the RC-2 read-fetch
+  populate — the same window, a pre-existing RC-2 latent — now
+  insert-then-re-checks and self-removes via `dcache_remove_key` (the
+  `dcache_wlock` hand-off makes the interleave airtight; COLD populates
+  need no gate — they decrypt under the pool-wide `metadata_key`,
+  backing-path-consistent). `stm_sync_truncate` / `stm_sync_punch_range`
+  keep their single-lock compounds: punch refuses crossing extents
+  (pure index work — nothing to unlock); truncate's crossing-extent
+  re-encrypt stays under the compound span whose R41/R55 atomicity
+  closures depend on it (the recorded sync.c "production extension"
+  seam; zero measured weight in the build workload). Runtime witnesses:
+  `tests/test_rc3_concurrent.c` (the disjoint-writer hammer, the
+  deterministic key-liveness-retry regression via the phase-2 test
+  hook, the writers-vs-rotate+sweep hammer) +
+  `tests/test_corvus_mount.c` (`corvus_rc3_write_evict_window`,
+  `corvus_rc3_read_evict_window` — both deterministic via the
+  `sync_testing.h` window hooks, compiled out of production builds).
 - **RC-4 (planned):** `--fs-workers` default ON, gated on the pre-RC
   regression A/B flipping to a win.
 

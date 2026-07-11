@@ -253,6 +253,87 @@ restructure on the same pattern:
   propagation: decide retry-at-dispatch vs propagate-to-client when the pool
   makes it reachable.
 
+#### As-built (RC-3, 2026-07-11)
+
+- **The three-phase split landed on `stm_sync_write_extent` alone** —
+  the workload's entire write volume. `sync_write_reserve_locked`
+  (brief `s->lock`: DEK resolve [the borrowed under-lock walk — RC-2's
+  publish-requires-the-lock argument], size math, replica reserves,
+  the `write_gen` capture) → `sync_write_encrypt_store` (UNLOCKED:
+  AEAD + per-replica `stm_bdev_write`; thread-local + self-locked
+  leaves; a reservation pins its device slots against removal via the
+  drained-probe) → `sync_write_index_commit_locked` (brief `s->lock`:
+  the WHOLE cold-overlap bookend + `stm_extent_overwrite` + the gated
+  dcache write-populate + drop/deref routing under ONE hold —
+  scan-matches-overwrite atomicity vs every other extent mutator is
+  byte-preserved). `stm_sync_write_extent_locked` composes the same
+  helpers under its caller's single span for the truncate compound.
+- **The captured-gen nonce argument**: `write_gen` (Phase-1, under the
+  lock) feeds the encrypt nonce, the record stamp, and the dcache key.
+  A phase-straddling commit (sync-layer-direct callers only — every
+  fs-mediated write holds `fs->global` SH/EX across the call while
+  commit runs EX) leaves the older stamp nonce-unique: the allocator's
+  PENDING sweep (`free_gen < committed_gen`) forbids same-gen paddr
+  reuse, and `stm_extent_overwrite` accepts `write_gen <=
+  idx->current_txg`.
+- **THE new obligation the split opens — key-sweep vs in-flight
+  write**: `stm_sync_keyschema_sweep` prunes a RETIRED key with zero
+  extent refs, and a Phase-2-in-flight write's resolved key is
+  invisible to that gate. Un-checked, a rotate+sweep inside the window
+  indexes a record whose durable wrapped key is GONE — silent data
+  loss. Closed by the epilogue's keyschema re-validation
+  (`stm_keyschema_lookup`, CURRENT-or-RETIRED = alive) under the SAME
+  lock hold that indexes (the sweep runs entirely under `s->lock` — no
+  TOCTOU), with a bounded whole-op retry (4) against the fresh CURRENT;
+  each attempt reserves fresh paddrs, so every nonce is fresh;
+  exhaustion is an honest `STM_EBUSY`. **Spec-first**:
+  `specs/write_key_liveness.tla` (clean cfg TLC-green incl. the
+  `EventuallyAllDone` retry-termination witness; +
+  `write_key_liveness_no_revalidate_buggy.cfg` — TLC finds
+  Resolve(K1) → Rotate → Sweep(K1) → CommitBuggy at depth 4, the
+  executable counterexample). The locked compound path needs no check
+  (its single span excludes the sweep — the pre-RC argument).
+- **Evict-dek vs the two unlocked windows (the populate gates)**:
+  evict removes only the in-RAM DEK slot (the keyschema entry
+  persists), so a mid-window write still INDEXES
+  (durable, decryptable-on-reinstall — the pre-RC outcome) but its
+  plaintext must not outlive the DEK denial (the CF-5a F1 contract).
+  The write populate is pre-gated on DEK-slot liveness (serialized —
+  the epilogue holds `s->lock`). The SAME window existed on the RC-2
+  read fetch (a pre-existing RC-2 latent, found at RC-3 design
+  review): the fetch now inserts, re-checks slot liveness, and
+  self-removes via `dcache_remove_key` — the `dcache_wlock` hand-off
+  makes every interleave clean (if the insert preceded the drain, the
+  drain wipes it; if the drain preceded the insert, the wlock
+  release/acquire edge makes the map publish visible to the re-check).
+  COLD populates are un-gated by design: COLD decrypts under the
+  pool-wide `metadata_key` — backing-path-consistent.
+- **Truncate / punch keep their single-lock compounds.** Punch refuses
+  crossing extents (`ENOTSUPPORTED`) — it is pure index work with no
+  Phase-2 to unlock; already pattern-conformant. Truncate's
+  crossing-extent re-encrypt stays inside the compound span its
+  R41 P3-1/P3-2 + R55 P2-2 atomicity closures (peek-into accuracy,
+  commit interleaving) depend on; its weight in the build workload is
+  zero (truncate(0)/aligned shrinks have no crossing extent). The
+  fine-grained-truncate extension remains the recorded sync.c seam.
+  Same-ino compound stability vs the new concurrent writers is the
+  fs-layer EX pin (write/truncate/punch/migrate all pin EX; reflink +
+  commit run under `fs->global` EX).
+- **Test seams**: `stm_sync_set_write_phase2_hook_for_test` +
+  `stm_sync_set_read_prepopulate_hook_for_test` (sync_testing.h;
+  compiled out of production — the Thylacine cross-build passes
+  `TESTING_HOOKS=OFF`) land deterministic evict / rotate+sweep strikes
+  inside the exact windows. Runtime witnesses:
+  `tests/test_rc3_concurrent.c` (disjoint-writer hammer at both
+  LE-boundary offsets; the deterministic key-liveness retry [pre-fix:
+  read-back ECORRUPT]; the writers-vs-rotate+sweep hammer) +
+  `tests/test_corvus_mount.c` (`corvus_rc3_write_evict_window` — write
+  survives a mid-window logout, post-evict read denied, post-reinstall
+  read verifies; `corvus_rc3_read_evict_window` — the #34 regression:
+  the in-flight read is served, the stale populate self-removes, the
+  second read is denied). All three gates proven non-vacuous by
+  revert-probes.
+
 ### RC-4 — turn the concurrency ON
 
 - `--fs-workers N` default ON (min(4, ncpu)) in the Thylacine boot (joey's

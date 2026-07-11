@@ -533,6 +533,21 @@ struct stm_sync {
      * or any other lock. */
     pthread_mutex_t   promote_lock;
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    /* RC-3 test seams (compiled out of production builds — the
+     * Thylacine cross-build passes TESTING_HOOKS=OFF):
+     *   write_phase2: called by the PUBLIC stm_sync_write_extent
+     *     between the unlocked Phase 2 and the index-commit epilogue;
+     *   read_prepopulate: called by the HOT fetch between the decrypt
+     *     and the dcache populate.
+     * Each lets a test land a deterministic evict / rotate+sweep /
+     * wedge inside the exact window the RC unlocked spans open. */
+    void            (*write_phase2_test_hook)(void *ctx);
+    void             *write_phase2_test_ctx;
+    void            (*read_prepopulate_test_hook)(void *ctx);
+    void             *read_prepopulate_test_ctx;
+#endif
+
     /* Durable mirror of ub_main_root / ub_snap_root state, last-
      * committed. Updated on successful sync_commit; consumed by
      * claim/reservation-phase build_uberblock to keep the prior
@@ -743,6 +758,32 @@ static bool sync_dek_lookup_copy_pinned(stm_sync *s,
         }
     }
     return false;
+}
+
+/* Existence probe for the populate-vs-evict gate (RC-3): is
+ * (dataset_id, key_id) present in the published DEK map? A slot's
+ * presence is exactly backing-path readability for a HOT extent
+ * stamped with that key (stm_sync_evict_dek removes the slot; the
+ * fetch path's DEK resolve then refuses), so gating a dcache populate
+ * on it keeps the cache consistent with the DEK denial. Lock-free
+ * callers pass their EBR handle (a SHORT own pin covers the walk —
+ * enter-at-outermost holds: the populate sites run pinless); locked
+ * callers pass NULL (publish requires s->lock, so the borrowed walk
+ * is stable). No DEK bytes are copied — presence only. */
+static bool sync_dek_slot_alive(stm_sync *s, stm_ebr_thread *ebr,
+                                  uint64_t dataset_id, uint64_t key_id)
+{
+    bool alive = false;
+    if (ebr) stm_ebr_enter(ebr);
+    sync_dek_map *m = dek_map_load(s);
+    if (m) {
+        for (size_t i = 0; i < m->count; i++) {
+            if (m->slots[i].dataset_id == dataset_id &&
+                 m->slots[i].key_id     == key_id) { alive = true; break; }
+        }
+    }
+    if (ebr) stm_ebr_exit(ebr);
+    return alive;
 }
 
 /* Insert (dataset_id, key_id, dek) via COW: fill the staged map (or
@@ -5534,6 +5575,28 @@ void stm_sync_dcache_drain_for_test(stm_sync *s)
     dcache_drain(s);
 }
 
+void stm_sync_set_write_phase2_hook_for_test(stm_sync *s,
+                                                void (*hook)(void *ctx),
+                                                void *ctx)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->write_phase2_test_hook = hook;
+    s->write_phase2_test_ctx  = ctx;
+    pthread_mutex_unlock(&s->lock);
+}
+
+void stm_sync_set_read_prepopulate_hook_for_test(stm_sync *s,
+                                                    void (*hook)(void *ctx),
+                                                    void *ctx)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->read_prepopulate_test_hook = hook;
+    s->read_prepopulate_test_ctx  = ctx;
+    pthread_mutex_unlock(&s->lock);
+}
+
 /* RC-1 test-only pass-throughs: the concurrency hammer drives the
  * lock-free reader protocol + the writer paths directly from N threads
  * (the dcache functions are static). The lookup hook carries the SAME
@@ -5804,92 +5867,163 @@ static bool cold_overlap_cb(const stm_extent_record *e, void *cx) {
     return true;
 }
 
-/* P7-11: write_extent core, lock-held variant.
+/* ------------------------------------------------------------------
+ * RC-3: the write path's three-phase decomposition
+ * (docs/rc-design.md "RC-3").
  *
- * Caller MUST hold s->lock AND have already passed the wedged / RO
- * guards. Caller MUST also have validated args:
- *   - dataset_id != 0, ino != 0
- *   - len in (0, STM_FS_RECORDSIZE_MAX], multiple of STM_UB_SIZE
- *   - off multiple of STM_UB_SIZE, off + len does not overflow
+ * The write body used to run reservation + AEAD encrypt + per-replica
+ * device write + index commit as one span under the caller's s->lock.
+ * bulk of a write) needs nothing s->lock protects: it computes into a
+ * thread-local buffer and stores to allocator-reserved paddrs no other
+ * thread can name (a reserved block is invisible until the index
+ * commit publishes it; the reservation itself also blocks device
+ * removal via sync_require_drained_locked's first-allocated probe).
+ * So the public stm_sync_write_extent runs:
  *
- * The arg-validation duplication between this helper and the public
- * wrapper would be untidy; instead the public wrapper validates and
- * the helper trusts. stm_sync_truncate composes this with
- * stm_sync_read_extent_locked under one lock acquisition to make
- * truncate atomic w.r.t. concurrent commit / write (R41 P3-1/P3-2).
+ *   Phase 1  sync_write_reserve_locked       (brief s->lock hold)
+ *   Phase 2  sync_write_encrypt_store        (NO s->lock)
+ *   Phase 3  sync_write_index_commit_locked  (brief s->lock hold)
  *
- * Lock-graph note: this body acquires extent_idx.lock and per-device
- * alloc.lock as inner leaves; sync.lock is OUTER. No back-edges.
+ * while stm_sync_write_extent_locked -- the compound callee
+ * (truncate's prefix re-encrypt) -- composes the same three helpers
+ * under the caller's single s->lock hold, sequence-equivalent to the
+ * pre-RC-3 body.
  *
- * P7-CAS-2: rehydrate-on-write. If the write target overlaps any COLD
- * extent, the pre-scan captures its content_hash; after extent_
- * overwrite drops the COLD record, we stm_cas_deref the captured
- * hash — completing cas.tla::RehydrateOnWrite (the cold extent is
- * replaced with a fresh hot extent + the CAS refcount drops by 1).
- */
-static stm_status stm_sync_write_extent_locked(stm_sync *s,
-                                                  uint64_t dataset_id, uint64_t ino,
-                                                  uint64_t off, const void *buf,
-                                                  size_t len) {
+ * The gen argument (why a phase-straddling commit cannot break the
+ * AEAD nonce): res->write_gen is captured under the Phase-1 lock and
+ * used for the encrypt nonce, the extent record's gen stamp, and the
+ * dcache write-populate key -- all three MUST agree (the record's gen
+ * recreates the decrypt nonce). Every fs-mediated write holds
+ * fs->global SH/EX across the whole call while commit runs under
+ * fs->global EX, so for fs traffic no commit interleaves the phases
+ * at all. A sync-layer-direct caller racing a commit stays
+ * nonce-sound stamping the OLDER captured gen: (paddr, gen) can only
+ * repeat if paddr was freed and re-reserved within one gen, and the
+ * allocator's PENDING discipline (stm_alloc_commit sweeps only
+ * free_gen < committed_gen) forbids exactly that.
+ * stm_extent_overwrite accepts write_gen <= idx->current_txg, so the
+ * older stamp also passes its gate.
+ * ------------------------------------------------------------------ */
+
+/* Per-op write reservation, carried across the three phases. The DEK
+ * copy is live from reserve until encrypt_store consumes it;
+ * encrypt_store scrubs it on EVERY exit (rollback re-scrubs,
+ * harmlessly). */
+typedef struct {
+    uint64_t      enc_key_id;
+    uint8_t       dek[32];
+    stm_aead_mode mode;
+    size_t        tag_len;
+    size_t        total_bytes;   /* len + tag_len */
+    uint64_t      nblocks;
+    size_t        n_replicas;
+    uint64_t      replicas[STM_EXTENT_MAX_REPLICAS];
+    size_t        reserved_count;
+    uint64_t      write_gen;     /* captured under the Phase-1 lock */
+} sync_write_reservation;
+
+/* Free every reserved replica and scrub the DEK copy. Callable with
+ * or without s->lock: stm_alloc_free self-locks (a->lock is a leaf),
+ * current_gen is an atomic read, and the s->allocs[j] slots consumed
+ * here are pinned against removal by the very reservation being
+ * rolled back (a live ALLOCATED entry fails the remove path's
+ * drained probe). The free gen is the CURRENT gen at rollback time
+ * (the pre-RC-3 error-path semantic): the block lands PENDING and
+ * re-enters circulation only after that gen commits, so an aborted
+ * write's (paddr, write_gen) ciphertext is never re-minted with
+ * different bytes. */
+static void sync_write_reserve_rollback(stm_sync *s,
+                                           sync_write_reservation *res)
+{
+    for (size_t j = 0; j < res->reserved_count; j++)
+        (void)stm_alloc_free(s->allocs[j], res->replicas[j], s->current_gen);
+    res->reserved_count = 0;
+    stm_ct_memzero(res->dek, sizeof res->dek);
+}
+
+/* Phase 1: DEK resolve + size math + replica reservation + gen
+ * capture. Caller holds s->lock and has passed the wedged/RO guards;
+ * args are caller-validated. On failure nothing is held (partial
+ * reserves freed, DEK scrubbed). On success the caller MUST reach
+ * sync_write_encrypt_store, then either the index commit or the
+ * rollback. */
+static stm_status sync_write_reserve_locked(stm_sync *s, uint64_t dataset_id,
+                                               size_t len,
+                                               sync_write_reservation *res)
+{
+    memset(res, 0, sizeof *res);
+
     /* P7-10: resolve the dataset's CURRENT DEK + key_id. STM_ENOENT
      * here means the caller skipped stm_sync_add_dataset_key for a
      * non-root dataset; surface as-is so the FS layer can either
-     * provision the key or fail the write deterministically. */
-    uint64_t enc_key_id = 0;
-    uint8_t  dek[32];
+     * provision the key or fail the write deterministically. The
+     * borrowed sync_dek_find walk inside is safe under s->lock
+     * because every DEK-map publish requires s->lock (RC-2). */
     stm_status rks = sync_resolve_current_dek_locked(s, dataset_id,
-                                                        &enc_key_id, dek);
+                                                        &res->enc_key_id,
+                                                        res->dek);
     if (rks != STM_OK) return rks;
 
     /* R36 P1-3: hardcode AEGIS-256 — see read path comment. */
-    stm_aead_mode mode = STM_AEAD_AEGIS256;
-    size_t tag_len = stm_aead_tag_len(mode);
-    if (tag_len == 0) {
-        stm_ct_memzero(dek, sizeof dek);
+    res->mode    = STM_AEAD_AEGIS256;
+    res->tag_len = stm_aead_tag_len(res->mode);
+    if (res->tag_len == 0) {
+        stm_ct_memzero(res->dek, sizeof res->dek);
         return STM_EINVAL;
     }
-    size_t total_bytes = len + tag_len;
-    uint64_t nblocks   = (total_bytes + STM_UB_SIZE - 1u) / STM_UB_SIZE;
+    res->total_bytes = len + res->tag_len;
+    res->nblocks     = (res->total_bytes + STM_UB_SIZE - 1u) / STM_UB_SIZE;
 
     /* P7-6: reserve N replica paddrs across N distinct devices. */
-    size_t n_replicas = sync_desired_replica_count_locked(s);
-    if (n_replicas < 1) {
-        stm_ct_memzero(dek, sizeof dek);
+    res->n_replicas = sync_desired_replica_count_locked(s);
+    if (res->n_replicas < 1) {
+        stm_ct_memzero(res->dek, sizeof res->dek);
         return STM_EINVAL;
     }
-    uint64_t replicas[STM_EXTENT_MAX_REPLICAS] = { 0 };
-    size_t   reserved_count = 0;
-
-    for (size_t i = 0; i < n_replicas; i++) {
+    for (size_t i = 0; i < res->n_replicas; i++) {
         if (i >= STM_POOL_DEVICES_MAX || s->allocs[i] == NULL) {
             /* Not enough attached allocs — should not happen because
              * sync_desired_replica_count_locked caps at n_attached.
              * Defensive abort. */
-            for (size_t j = 0; j < reserved_count; j++)
-                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
-            stm_ct_memzero(dek, sizeof dek);
+            sync_write_reserve_rollback(s, res);
             return STM_EINVAL;
         }
-        stm_status rs = stm_alloc_reserve(s->allocs[i], nblocks, 0, &replicas[i]);
+        stm_status rs = stm_alloc_reserve(s->allocs[i], res->nblocks, 0,
+                                             &res->replicas[i]);
         if (rs != STM_OK) {
-            for (size_t j = 0; j < reserved_count; j++)
-                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
-            stm_ct_memzero(dek, sizeof dek);
+            sync_write_reserve_rollback(s, res);
             return rs;
         }
-        reserved_count++;
+        res->reserved_count++;
     }
 
+    res->write_gen = s->current_gen;
+    return STM_OK;
+}
+
+/* Phase 2: AEAD encrypt + write every replica. NO s->lock
+ * requirement — the work is thread-local (cbuf) plus self-locked
+ * leaves: stm_bdev_write serializes on the bdev's own lock, and
+ * stm_pool_device_bdev reads the pool's device table exactly as the
+ * RC-2 unlocked read fetch already does (slots are write-once per
+ * attach; the slots consumed here are pinned by the live
+ * reservation). Scrubs res->dek on EVERY exit. Frees nothing — the
+ * caller owns the reservation (rollback on failure). */
+static stm_status sync_write_encrypt_store(stm_sync *s,
+                                              uint64_t dataset_id, uint64_t ino,
+                                              uint64_t off, const void *buf,
+                                              size_t len,
+                                              sync_write_reservation *res)
+{
     /* Encrypt ONCE under the canonical replica's nonce (replicas[0],
-     * gen). The same ciphertext+tag is written to every replica's
-     * paddr — bptr.tla's per-replica csum gate works because each
-     * replica's stored bytes are independently subject to bit-rot,
-     * but the AEAD MAC is computed against the canonical nonce. */
-    void *cbuf = malloc(total_bytes);
+     * write_gen). The same ciphertext+tag is written to every
+     * replica's paddr — bptr.tla's per-replica csum gate works
+     * because each replica's stored bytes are independently subject
+     * to bit-rot, but the AEAD MAC is computed against the canonical
+     * nonce. */
+    void *cbuf = malloc(res->total_bytes);
     if (!cbuf) {
-        for (size_t j = 0; j < reserved_count; j++)
-            (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
-        stm_ct_memzero(dek, sizeof dek);
+        stm_ct_memzero(res->dek, sizeof res->dek);
         return STM_ENOMEM;
     }
 
@@ -5911,41 +6045,67 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
      * — required for correctness across rotation, where the dataset's
      * CURRENT advances to a new key_id but already-written extents
      * stay decryptable under their original RETIRED key_id. */
-    stm_status es = stm_extent_encrypt(mode, dek,
-                                          replicas[0], s->current_gen,
+    stm_status es = stm_extent_encrypt(res->mode, res->dek,
+                                          res->replicas[0], res->write_gen,
                                           &ad, buf, len,
-                                          cbuf, total_bytes, &out_len);
+                                          cbuf, res->total_bytes, &out_len);
     if (es != STM_OK) {
         free(cbuf);
-        for (size_t j = 0; j < reserved_count; j++)
-            (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
-        stm_ct_memzero(dek, sizeof dek);
+        stm_ct_memzero(res->dek, sizeof res->dek);
         return es;
     }
 
     /* Write the same ciphertext+tag to each replica's paddr. */
-    for (size_t i = 0; i < n_replicas; i++) {
-        uint16_t dev = stm_paddr_device(replicas[i]);
-        uint64_t byte_off = stm_paddr_offset(replicas[i]) * (uint64_t)STM_UB_SIZE;
+    for (size_t i = 0; i < res->n_replicas; i++) {
+        uint16_t dev = stm_paddr_device(res->replicas[i]);
+        uint64_t byte_off = stm_paddr_offset(res->replicas[i])
+                            * (uint64_t)STM_UB_SIZE;
         stm_bdev *target_bdev = stm_pool_device_bdev(s->pool, dev);
         if (!target_bdev) {
             free(cbuf);
-            for (size_t j = 0; j < reserved_count; j++)
-                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
-            stm_ct_memzero(dek, sizeof dek);
+            stm_ct_memzero(res->dek, sizeof res->dek);
             return STM_EINVAL;
         }
-        stm_status ws = stm_bdev_write(target_bdev, byte_off, cbuf, total_bytes);
+        stm_status ws = stm_bdev_write(target_bdev, byte_off, cbuf,
+                                          res->total_bytes);
         if (ws != STM_OK) {
             free(cbuf);
-            for (size_t j = 0; j < reserved_count; j++)
-                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
-            stm_ct_memzero(dek, sizeof dek);
+            stm_ct_memzero(res->dek, sizeof res->dek);
             return ws;
         }
     }
     free(cbuf);
-    stm_ct_memzero(dek, sizeof dek);
+    stm_ct_memzero(res->dek, sizeof res->dek);
+    return STM_OK;
+}
+
+/* Phase 3: publish the written extent — cold-overlap bookend +
+ * stm_extent_overwrite + dcache write-populate + drop/deref routing.
+ * Caller holds s->lock, so the pre-scan / overwrite / deref bookend
+ * is atomic against every other s->lock-holding extent mutator
+ * exactly as pre-RC-3 (the scan-matches-overwrite guarantee, and the
+ * same-ino stability that truncate/migrate/reflink compounds rely
+ * on). On failure the reservation is released here — nothing for the
+ * caller to undo.
+ *
+ * P7-CAS-2: rehydrate-on-write. If the write target overlaps any COLD
+ * extent, the pre-scan captures its content_hash; after extent_
+ * overwrite drops the COLD record, we stm_cas_deref the captured
+ * hash — completing cas.tla::RehydrateOnWrite (the cold extent is
+ * replaced with a fresh hot extent + the CAS refcount drops by 1).
+ *
+ * Lock-graph note: this body acquires extent_idx.lock and per-device
+ * alloc.lock as inner leaves; sync.lock is OUTER. No back-edges. */
+static stm_status sync_write_index_commit_locked(stm_sync *s,
+                                                    uint64_t dataset_id,
+                                                    uint64_t ino, uint64_t off,
+                                                    const void *buf, size_t len,
+                                                    sync_write_reservation *res)
+{
+    const uint64_t *replicas       = res->replicas;
+    size_t          n_replicas     = res->n_replicas;
+    size_t          reserved_count = res->reserved_count;
+    uint64_t        enc_key_id     = res->enc_key_id;
 
     /* P7-CAS-2: pre-scan for COLD extents overlapping the write
      * target. Captured hashes will be dereffed AFTER extent_overwrite
@@ -5994,7 +6154,7 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
     size_t    n_dropped = 0;
     stm_status os = stm_extent_overwrite(s->extent_idx, dataset_id, ino, off,
                                             len, replicas, n_replicas,
-                                            s->current_gen, enc_key_id,
+                                            res->write_gen, enc_key_id,
                                             &dropped, &n_dropped);
     if (os != STM_OK) {
         free(cox.hashes);
@@ -6006,7 +6166,7 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
     /* Write-populate the decrypted-extent cache: the plaintext is in hand,
      * so a later re-read of this extent becomes a hit instead of a bdev
      * read + whole-extent decrypt. Keyed exactly as the HOT read path will
-     * look it up -- (paddr0 = replicas[0], gen = current_gen), the identity
+     * look it up -- (paddr0 = replicas[0], gen = write_gen), the identity
      * stm_extent_overwrite just committed. Cache only on the success path
      * (after the extent is committed-live): a failed write must not leave
      * its never-live bytes servable. Key uniqueness needs no placement
@@ -6016,8 +6176,21 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
      * different bytes. */
     {
         uint8_t wkey[STM_CAS_HASH_LEN];
-        dcache_key_hot(wkey, replicas[0], s->current_gen);
-        dcache_insert(s, wkey, STM_EXTENT_KIND_HOT, buf, len);
+        dcache_key_hot(wkey, replicas[0], res->write_gen);
+        /* Populate-vs-evict gate (RC-3): on the concurrent path,
+         * stm_sync_evict_dek (slot remove -> dcache_drain, one s->lock
+         * hold) can run during the unlocked Phase 2; this epilogue
+         * holds s->lock, so a simple pre-gate is fully serialized with
+         * the evict — slot alive means any evict is either entirely
+         * before us (resolve would have refused) or entirely after
+         * (its drain wipes this populate). Slot gone means the
+         * plaintext must not go resident past the DEK denial; the
+         * RECORD still indexes (durable + decryptable-on-reinstall,
+         * the pre-RC-3 outcome for a write completing before a
+         * logout). The locked compound path always sees the slot
+         * alive (its caller's s->lock spans resolve to here). */
+        if (sync_dek_find(s, dataset_id, res->enc_key_id) != NULL)
+            dcache_insert(s, wkey, STM_EXTENT_KIND_HOT, buf, len);
     }
 
     /* R36 P1-1 + P2-1: best-effort drain. */
@@ -6075,6 +6248,43 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
     return drop_err;
 }
 
+/* P7-11: write_extent core, lock-held variant.
+ *
+ * Caller MUST hold s->lock AND have already passed the wedged / RO
+ * guards. Caller MUST also have validated args:
+ *   - dataset_id != 0, ino != 0
+ *   - len in (0, STM_FS_RECORDSIZE_MAX], multiple of STM_UB_SIZE
+ *   - off multiple of STM_UB_SIZE, off + len does not overflow
+ *
+ * The arg-validation duplication between this helper and the public
+ * wrapper would be untidy; instead the public wrapper validates and
+ * the helper trusts. stm_sync_truncate composes this with
+ * stm_sync_read_extent_locked under one lock acquisition to make
+ * truncate atomic w.r.t. concurrent commit / write (R41 P3-1/P3-2).
+ *
+ * RC-3: the body is the three-phase composition run back-to-back
+ * under the caller's single s->lock hold — sequence-equivalent to
+ * the pre-RC-3 monolithic body (same operations, same order, same
+ * locks held throughout). */
+static stm_status stm_sync_write_extent_locked(stm_sync *s,
+                                                  uint64_t dataset_id, uint64_t ino,
+                                                  uint64_t off, const void *buf,
+                                                  size_t len) {
+    sync_write_reservation res;
+    stm_status rs = sync_write_reserve_locked(s, dataset_id, len, &res);
+    if (rs != STM_OK) return rs;
+
+    stm_status es = sync_write_encrypt_store(s, dataset_id, ino, off,
+                                                buf, len, &res);
+    if (es != STM_OK) {
+        sync_write_reserve_rollback(s, &res);
+        return es;
+    }
+
+    return sync_write_index_commit_locked(s, dataset_id, ino, off,
+                                             buf, len, &res);
+}
+
 stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                     uint64_t off, const void *buf, size_t len) {
     if (!s || !buf) return STM_EINVAL;
@@ -6085,14 +6295,100 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
     if (off > UINT64_MAX - len) return STM_EOVERFLOW;
 
-    pthread_mutex_lock(&s->lock);
-    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
-    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+    /* RC-3: the three-phase write (docs/rc-design.md "RC-3"). s->lock
+     * is held only for the reservation prologue and the index-commit
+     * epilogue; the AEAD encrypt + per-replica device writes — the
+     * measured bulk of the op — run unlocked, so concurrent writers
+     * to distinct extents overlap there. Same-inode writers are
+     * serialized ABOVE this layer (the fs EX inode pin; PARALLEL-3),
+     * and the epilogue's single lock hold keeps the cold-overlap
+     * bookend atomic against every other extent mutator, so per-op
+     * semantics are unchanged from the locked body.
+     *
+     * The wedged/RO re-check at the epilogue: both flags are only SET
+     * under s->lock, so a flag raised while Phase 2 runs unlocked is
+     * caught before the index commit — the write refuses, the
+     * reserves roll back, and the orphaned device bytes stay
+     * unreferenced (their blocks re-enter circulation via the PENDING
+     * sweep). Strictly narrower than the pre-RC-3 window, where a
+     * write already past its entry guard completed fully before a
+     * blocked setter could land. */
+    /* RC-3 key-liveness retry: the prologue resolves the dataset's
+     * CURRENT key under s->lock, but stm_sync_keyschema_sweep can
+     * rotate+prune that key while Phase 2 runs unlocked — the sweep's
+     * zero-refs probe cannot see a not-yet-indexed write. Indexing a
+     * record whose key was pruned would be silent data loss (the
+     * durable wrapped key is gone), so the epilogue re-validates the
+     * key under the SAME s->lock hold that indexes the record. The
+     * sweep also runs entirely under s->lock, so there is no TOCTOU:
+     * a key alive at the check is alive past the overwrite, and every
+     * later sweep counts the indexed record as a live ref and skips.
+     * On a pruned key the reservation rolls back and the WHOLE op
+     * retries against the fresh CURRENT key — each attempt reserves
+     * fresh paddrs (PENDING forbids same-gen reuse), so every
+     * attempt's nonce is fresh. Exhaustion needs a full rotate+sweep
+     * landing inside every attempt's unlocked window — pathological;
+     * surface honest EBUSY.
+     *
+     * Evict-dek is NOT in this class: it removes only the in-RAM DEK
+     * slot (the keyschema entry + wrapped blob persist), so a
+     * mid-flight write under an evicted key stays durable and
+     * decryptable-on-reinstall. The liveness probe reads the
+     * KEYSCHEMA, not the DEK map, so an evict does not fail the
+     * write (the pre-RC-3 outcome); the epilogue's populate gate
+     * separately keeps the plaintext out of the dcache.
+     *
+     * The locked compound path (stm_sync_write_extent_locked) needs
+     * none of this: its caller's single s->lock span excludes the
+     * sweep for the whole op — exactly the pre-RC-3 argument. */
+    for (unsigned attempt = 0; attempt < 4u; attempt++) {
+        sync_write_reservation res;
 
-    stm_status rc = stm_sync_write_extent_locked(s, dataset_id, ino,
-                                                    off, buf, len);
-    pthread_mutex_unlock(&s->lock);
-    return rc;
+        pthread_mutex_lock(&s->lock);
+        if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+        if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+        stm_status rs = sync_write_reserve_locked(s, dataset_id, len, &res);
+        pthread_mutex_unlock(&s->lock);
+        if (rs != STM_OK) return rs;
+
+        stm_status es = sync_write_encrypt_store(s, dataset_id, ino, off,
+                                                    buf, len, &res);
+        if (es != STM_OK) {
+            sync_write_reserve_rollback(s, &res);
+            return es;
+        }
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (s->write_phase2_test_hook)
+            s->write_phase2_test_hook(s->write_phase2_test_ctx);
+#endif
+
+        pthread_mutex_lock(&s->lock);
+        if (s->wedged || s->read_only) {
+            bool was_wedged = s->wedged;
+            pthread_mutex_unlock(&s->lock);
+            sync_write_reserve_rollback(s, &res);
+            return was_wedged ? STM_EWEDGED : STM_EROFS;
+        }
+        stm_keyschema_state kst = STM_KS_STATE_INVALID;
+        stm_status kls = stm_keyschema_lookup(s->keyschema, dataset_id,
+                                                 res.enc_key_id, &kst,
+                                                 NULL, NULL, 0, NULL);
+        if (kls != STM_OK || (kst != STM_KS_STATE_CURRENT
+                              && kst != STM_KS_STATE_RETIRED)) {
+            /* Pruned (or mid-prune) under us — retry fresh. Any other
+             * lookup failure retries too (bounded); the next attempt's
+             * resolve surfaces the real error. */
+            pthread_mutex_unlock(&s->lock);
+            sync_write_reserve_rollback(s, &res);
+            continue;
+        }
+        stm_status rc = sync_write_index_commit_locked(s, dataset_id, ino, off,
+                                                          buf, len, &res);
+        pthread_mutex_unlock(&s->lock);
+        return rc;
+    }
+    return STM_EBUSY;
 }
 
 /* P7-11: read_extent core, lock-held variant. Caller MUST hold
@@ -6331,6 +6627,28 @@ static void dcache_evict_locked(stm_sync *s, size_t slot_idx) {
          * under a possibly-pinned reader (the engine's posture). Already
          * unlinked, so it can never be observed again. */
     }
+}
+
+/* Unlink + retire every linked entry matching (key, kind_tag). The
+ * populate-vs-evict repair arm (RC-3): a populate that raced
+ * stm_sync_evict_dek's drain self-removes its own entry, so no HOT
+ * cleartext outlives the DEK denial (the CF-5a F1 contract). The
+ * O(slots) walk is drain's own shape and runs only on the
+ * pathological race path. */
+static void dcache_remove_key(stm_sync *s,
+                                const uint8_t key[STM_CAS_HASH_LEN],
+                                uint8_t kind_tag) {
+    pthread_mutex_lock(&s->dcache_wlock);
+    for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
+        struct sync_dcache_entry *e = s->dcache_slots[i];
+        if (!e) continue;
+        if (e->kind_tag == kind_tag
+                && memcmp(e->key, key, STM_CAS_HASH_LEN) == 0) {
+            dcache_evict_locked(s, i);
+        }
+    }
+    pthread_mutex_unlock(&s->dcache_wlock);
+    (void)stm_ebr_try_advance();
 }
 
 /* RC-1 lock-free lookup. CONTRACT: the caller holds an active
@@ -6897,9 +7215,30 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
 
     memcpy(buf, (uint8_t *)pbuf + slice_off, slice_len);
     {
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (s->read_prepopulate_test_hook)
+            s->read_prepopulate_test_hook(s->read_prepopulate_test_ctx);
+#endif
         uint8_t hkey[STM_CAS_HASH_LEN];
         dcache_key_hot(hkey, rec.paddrs[0], rec.gen);
         dcache_insert(s, hkey, STM_EXTENT_KIND_HOT, pbuf, rec.len);
+        /* Populate-vs-evict repair (RC-3; closes the RC-2 latent): the
+         * DEK was copied out BEFORE the decrypt, so stm_sync_evict_dek
+         * (remove slot -> dcache_drain, one s->lock hold) can run
+         * entirely inside this fetch — the insert above then lands
+         * AFTER the drain and post-logout cleartext would sit resident
+         * past the DEK denial (the CF-5a F1 contract). Re-check the
+         * slot AFTER the insert and self-remove on death. Airtight by
+         * the wlock hand-off: if our insert preceded the drain, the
+         * drain wipes it; if the drain preceded our insert, the
+         * drain's wlock release happens-before our insert's acquire,
+         * so everything before it — including the map publish — is
+         * visible to this probe, which then removes our own entry.
+         * COLD entries need no gate: they decrypt under the pool-wide
+         * metadata_key (no DEK-map dependency), so caching them is
+         * exactly backing-path-consistent. */
+        if (!sync_dek_slot_alive(s, ebr, rec.origin_dataset_id, rec.key_id))
+            dcache_remove_key(s, hkey, STM_EXTENT_KIND_HOT);
     }
     dcache_account(s, false);
     stm_ct_memzero(pbuf, rec.len);

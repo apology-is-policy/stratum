@@ -90,6 +90,34 @@ bool stm_sync_dcache_lookup_for_test(stm_sync *s,
                                      void *out);
 
 /*
+ * RC-3 write-window seam: `hook(ctx)` is invoked by the PUBLIC
+ * stm_sync_write_extent between its unlocked Phase 2 (encrypt +
+ * device write) and its locked index-commit epilogue — the exact
+ * window the three-phase split opens. Tests use it to land a
+ * deterministic rotate+sweep (the key-liveness retry), evict-dek
+ * (the populate gate), or wedge inside a single in-flight write.
+ * The hook runs with NO sync locks held and may call any public
+ * stm_sync_* API. Pass hook=NULL to clear.
+ */
+void stm_sync_set_write_phase2_hook_for_test(stm_sync *s,
+                                                void (*hook)(void *ctx),
+                                                void *ctx);
+
+/*
+ * RC-3 read-window seam, the fetch twin of the write hook: invoked
+ * by the HOT-extent fetch between the decrypt and the dcache
+ * populate — the maximal-late point of the DEK-copy .. populate
+ * window a concurrent stm_sync_evict_dek can land inside. Runs with
+ * NO sync locks held (the fetch is the RC-2 unlocked path). Fires on
+ * LOCKED-context fetches too (compounds under s->lock) — a hook that
+ * takes s->lock would self-deadlock there; the RC-3 regressions only
+ * arm it around lock-free reads. Pass hook=NULL to clear.
+ */
+void stm_sync_set_read_prepopulate_hook_for_test(stm_sync *s,
+                                                    void (*hook)(void *ctx),
+                                                    void *ctx);
+
+/*
  * TLY-A3-keyslot: insert a keyschema slot carrying a chosen
  * `wrapper` tag and an opaque `wrapped` blob, WITHOUT performing a
  * real cryptographic wrap. Persisted on the next stm_sync_commit.

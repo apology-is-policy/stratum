@@ -773,4 +773,179 @@ STM_TEST(corvus_keyslot_refuses_control_byte_path) {
     unlink(g_tmp_path);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* RC-3 evict-dek race windows (docs/rc-design.md "RC-3"). The three-    */
+/* phase write and the RC-2 unlocked read fetch both open a window       */
+/* between "DEK resolved/copied" and "plaintext cached" that             */
+/* stm_sync_evict_dek (slot remove -> dcache drain, one s->lock hold)    */
+/* can land inside. The populate gates must keep the cleartext out of    */
+/* the cache — the CF-5a F1 contract — while the WRITE still indexes     */
+/* its record (durable, decryptable-on-reinstall) and the in-flight      */
+/* READ still returns its bytes (it resolved before the logout           */
+/* completed). Deterministic via the sync_testing.h window hooks.        */
+/* ────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    stm_sync *s;
+    uint64_t  ds;
+    int       calls;
+    int       fired;
+} rc3_evict_hook_ctx;
+
+static void rc3_evict_hook(void *arg)
+{
+    rc3_evict_hook_ctx *c = arg;
+    c->calls++;
+    if (c->fired) return;
+    c->fired = 1;
+    STM_ASSERT_OK(stm_sync_evict_dek(c->s, c->ds));
+}
+
+/* Shared setup: a fresh CORVUS child dataset with a REAL-wrapped key
+ * (the fake's WRAP envelope carries the actual DEK, so a later
+ * install_dek round-trips it). Returns the new dataset id. */
+static uint64_t rc3_evict_fixture(stm_sync *s2, stm_corvus_mount_cfg *cc,
+                                    const char *name, const char *path,
+                                    size_t path_len)
+{
+    uint64_t ds_ev = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(stm_sync_dataset_index(s2),
+                                              1u, name, &ds_ev));
+    uint64_t ev_kid = 0;
+    STM_ASSERT_OK(stm_sync_add_dataset_key_corvus(s2, ds_ev, path,
+                                                     path_len, cc,
+                                                     &ev_kid));
+    return ds_ev;
+}
+
+STM_TEST(corvus_rc3_write_evict_window) {
+    make_tmp("rc3wev");
+    build_pool_with_corvus_slot();
+
+    uint8_t canned_dek[32];
+    for (int i = 0; i < 32; i++) canned_dek[i] = (uint8_t)(0x70 + i);
+    fake_corvus fc;
+    fake_corvus_start(&fc, "rc3wev", STM_CORVUS_STATUS_OK, canned_dek);
+
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+
+    stm_corvus_mount_cfg cc = {
+        .socket_path   = fc.sock_path,
+        .session_token = TEST_TOKEN,
+        .n_retries     = 0,
+    };
+    static const char ev_path[] = "users/rc3wev";
+    uint64_t ds_ev = rc3_evict_fixture(s2, &cc, "rc3wev", ev_path,
+                                         sizeof ev_path - 1);
+
+    uint8_t buf[4096];
+    for (size_t j = 0; j < sizeof buf; j++) buf[j] = (uint8_t)(0x5A ^ j);
+
+    /* The logout lands between the write's unlocked Phase 2 and its
+     * index-commit epilogue. The write must still SUCCEED — evict
+     * removes only the in-RAM DEK slot; the keyschema entry persists,
+     * so the epilogue's key-liveness check passes on attempt 1 (no
+     * retry: calls == 1) — but its plaintext must NOT go resident
+     * past the DEK denial (the populate gate). */
+    rc3_evict_hook_ctx hc = { .s = s2, .ds = ds_ev };
+    stm_sync_set_write_phase2_hook_for_test(s2, rc3_evict_hook, &hc);
+    STM_ASSERT_OK(stm_sync_write_extent(s2, ds_ev, 1u, 0u, buf, sizeof buf));
+    stm_sync_set_write_phase2_hook_for_test(s2, NULL, NULL);
+    STM_ASSERT_EQ(hc.fired, 1);
+    STM_ASSERT_EQ(hc.calls, 1);
+
+    /* Post-evict read: DENIED. Pre-gate, the write's populate landed
+     * after the evict's drain and this read was served from RAM. */
+    uint8_t rout[4096] = {0};
+    size_t  rgot = 0;
+    stm_status rrs = stm_sync_read_extent(s2, ds_ev, 1u, 0u,
+                                             rout, sizeof rout, &rgot);
+    STM_ASSERT(rrs != STM_OK);
+
+    /* Re-login: the record WAS indexed and decrypts under the
+     * reinstalled DEK — the write survived the mid-flight logout. */
+    STM_ASSERT_OK(stm_sync_install_dek(s2, ds_ev, &cc));
+    STM_ASSERT_OK(stm_sync_read_extent(s2, ds_ev, 1u, 0u,
+                                          rout, sizeof rout, &rgot));
+    STM_ASSERT_EQ(rgot, sizeof rout);
+    STM_ASSERT_MEM_EQ(rout, buf, sizeof buf);
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(d);
+    fake_corvus_stop(&fc);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(corvus_rc3_read_evict_window) {
+    make_tmp("rc3rev");
+    build_pool_with_corvus_slot();
+
+    uint8_t canned_dek[32];
+    for (int i = 0; i < 32; i++) canned_dek[i] = (uint8_t)(0x70 + i);
+    fake_corvus fc;
+    fake_corvus_start(&fc, "rc3rev", STM_CORVUS_STATUS_OK, canned_dek);
+
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+
+    stm_corvus_mount_cfg cc = {
+        .socket_path   = fc.sock_path,
+        .session_token = TEST_TOKEN,
+        .n_retries     = 0,
+    };
+    static const char ev_path[] = "users/rc3rev";
+    uint64_t ds_ev = rc3_evict_fixture(s2, &cc, "rc3rev", ev_path,
+                                         sizeof ev_path - 1);
+
+    uint8_t buf[4096];
+    for (size_t j = 0; j < sizeof buf; j++) buf[j] = (uint8_t)(0xA7 ^ j);
+    STM_ASSERT_OK(stm_sync_write_extent(s2, ds_ev, 1u, 0u, buf, sizeof buf));
+    /* Clear the write-populate so the armed read takes the fetch. */
+    stm_sync_dcache_drain_for_test(s2);
+
+    /* The RC-2 latent (task #34): the fetch copies the DEK, decrypts,
+     * then populates UNLOCKED — the logout (slot remove + drain) lands
+     * between the decrypt and the populate. The in-flight read itself
+     * is served (it resolved before the logout completed — pre-RC-3
+     * parity), but its populate must NOT survive: the post-insert
+     * liveness re-check self-removes the entry. */
+    rc3_evict_hook_ctx hc = { .s = s2, .ds = ds_ev };
+    stm_sync_set_read_prepopulate_hook_for_test(s2, rc3_evict_hook, &hc);
+    uint8_t rout[4096] = {0};
+    size_t  rgot = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(s2, ds_ev, 1u, 0u,
+                                          rout, sizeof rout, &rgot));
+    stm_sync_set_read_prepopulate_hook_for_test(s2, NULL, NULL);
+    STM_ASSERT_EQ(hc.fired, 1);
+    STM_ASSERT_EQ(rgot, sizeof rout);
+    STM_ASSERT_MEM_EQ(rout, buf, sizeof buf);
+
+    /* THE regression: a second read must be DENIED. Pre-fix the stale
+     * populate survived the drain and this read returned STM_OK + the
+     * plaintext from RAM, past the DEK denial. */
+    uint8_t r2[4096] = {0};
+    size_t  rg2 = 0;
+    stm_status rrs = stm_sync_read_extent(s2, ds_ev, 1u, 0u,
+                                             r2, sizeof r2, &rg2);
+    STM_ASSERT(rrs != STM_OK);
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(d);
+    fake_corvus_stop(&fc);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("corvus_mount")

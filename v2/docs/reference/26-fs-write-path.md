@@ -22,6 +22,16 @@ rewrites, near-full-pool ENOSPC). It records the as-built state after the
 Area-A round-1 close (the #352 amplification fix + the #352-F1 / #355 / F1
 silent-data-loss fixes).
 
+**RC-3 concurrency shape** (`docs/rc-design.md` "RC-3" as-built;
+29-concurrency.md §29.12): every `stm_sync_write_extent` this path issues is
+now three-phase inside the sync layer — brief locked reservation, UNLOCKED
+AEAD encrypt + device write, brief locked index-commit epilogue — so writes
+to distinct inodes overlap their expensive middle. Nothing changes at THIS
+layer: the fs EX inode pin still serializes same-inode writers, commit still
+runs under `fs->global` EX, and the per-op semantics (whole-blob replace,
+the cold-overlap bookend) are byte-preserved by the epilogue's single
+`s->lock` hold.
+
 ## The load-bearing invariant: extent-overwrite is whole-blob replace
 
 Every extent is **one AEAD blob (one MAC)**, so the extent index **cannot split

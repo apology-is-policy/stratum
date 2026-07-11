@@ -94,6 +94,26 @@ dereferences freed memory), and COW+EBR reuses the RC-1 idiom.
 | Inv `ReaderMapAlive`   | RC-I3: no reader dereferences a freed map (realloc/free UAF) | Buggy cfg `free_old_map`. The realloc-moving `sync_dek_grow` is retired (grow now stages an unpublished buffer). |
 | Inv `PublishedExcludesEvicted` | RC-I3 fail-closed-after-evict (the A-5 post-logout contract; the dcache-plaintext half is RC-1's drain) | Buggy cfg `evict_no_publish`. `stm_sync_evict_dek` → `sync_dek_remove` publishes the without-entry map before returning. |
 
+## `write_key_liveness.tla` ↔ v2 code (RC arc, spec-first — impl LANDED at RC-3)
+
+Models RC-3's one genuinely new synchronization obligation
+(`docs/rc-design.md` "RC-3" as-built): the three-phase write's unlocked
+Phase 2 makes the resolved CURRENT key prunable mid-op — the sweep's
+zero-refs gate cannot see an un-indexed in-flight write. The fix pins the
+key with an epilogue re-validation atomic (same `s->lock` hold) with the
+index insert, retrying the whole op against the fresh CURRENT.
+
+| Spec variable / action | Code correspondent (RC-3, `src/sync/sync.c`)          | Notes |
+|------------------------|-------------------------------------------------------|-------|
+| `Resolve(w)`           | `sync_write_reserve_locked` → `sync_resolve_current_dek_locked` (Phase 1, under `s->lock`) | The reservation/nonce mechanics are below the model (prose: PENDING forbids same-gen paddr reuse). |
+| `w_key[w] # 0` (the window) | the writer between `sync_write_reserve_locked` and the epilogue lock — `sync_write_encrypt_store` in flight | The unlocked span the model isolates. |
+| `Rotate` / `Sweep(k)`  | `stm_sync_rotate_dataset_key` / `stm_sync_keyschema_sweep` (each atomic under `s->lock`) | `Sweep`'s `k \notin indexed` guard = `sync_extent_refs_for_key_locked` == 0. |
+| `CommitChecked(w)`     | the epilogue's `stm_keyschema_lookup` (CURRENT-or-RETIRED = alive) + `sync_write_index_commit_locked`, ONE `s->lock` hold | No TOCTOU: the sweep also runs entirely under `s->lock`; a key alive at the check is alive past the insert, and later sweeps count the indexed record. |
+| `RetryDeadKey(w)`      | the pruned arm: unlock → `sync_write_reserve_rollback` → the retry loop's next attempt re-resolves | Bounded (4); exhaustion = honest `STM_EBUSY`. Model has no bound — `EventuallyAllDone` proves the retry cannot livelock (rotations are finite). |
+| `CommitBuggy(w)`       | the naive split (no re-validation)                     | Buggy cfg `no_revalidate`: TLC finds Resolve(K1) → Rotate → Sweep(K1) → CommitBuggy at depth 4 — the executable counterexample of the race found at RC-3 design review. |
+| Inv `NoDeadKeyIndexed` | every indexed record's `key_id` has a durable keyschema entry | Runtime witnesses: `tests/test_rc3_concurrent.c::rc3_write_key_liveness_retry` (deterministic, the phase-2 hook) + `rc3_writers_vs_rotate_sweep_hammer`. |
+| (out of model)         | the evict-dek populate gates                           | Evict does not prune the keyschema → not a `Sweep`; its hazard is dcache-plaintext-past-the-DEK-denial, closed by the populate gates (rc-design RC-3 as-built) + `tests/test_corvus_mount.c::corvus_rc3_{write,read}_evict_window`. |
+
 ## Change process
 
 1. Propose the code change.
