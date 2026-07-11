@@ -711,17 +711,17 @@ twin of the prepopulate seam — same contract: no sync locks held,
 fires on locked-context fetches too, so regressions arm it around
 lock-free reads only):
 
-- `corvus_rc4_read_evict_third_party` — the deterministic F1 witness:
+- `corvus_rc6_read_evict_third_party` — the deterministic F1 witness:
   the prepopulate hook lands the evict; the postinsert hook issues a
   re-entrant read INSIDE the window, which must FAIL (pre-fix it is
   served from the cache — the bug, witnessed); the outer in-flight
   read still succeeds; a final read is denied.
-- `corvus_rc4_read_populate_publish` — the anti-silent-regression pin:
+- `corvus_rc6_read_populate_publish` — the anti-silent-regression pin:
   with no evict, the in-window re-entrant read must MISS (dcache stats
   delta — the entry is provisional), and a post-publish read must HIT.
   A broken publish would otherwise silently turn every fetch-populate
   into a no-op cache — correct bytes, invisible perf loss, no test red.
-- `corvus_rc4_readers_vs_evict_hammer` — N readers vs evict/install
+- `corvus_rc6_readers_vs_evict_hammer` — N readers vs evict/install
   cycles with an odd/even phase stamp: a read that runs entirely
   inside an evicted-stable phase window must fail. The real-path
   runtime witness (probe → fetch → provisional insert → publish

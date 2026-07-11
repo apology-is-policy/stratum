@@ -118,6 +118,21 @@ void stm_sync_set_read_prepopulate_hook_for_test(stm_sync *s,
                                                     void *ctx);
 
 /*
+ * RC-6 (#35) read-window seam, the [insert, publish] twin of the
+ * prepopulate hook: invoked by the HOT-extent fetch between the
+ * PROVISIONAL dcache insert and its commit-or-kill publish
+ * (dcache_publish_hot_gated) — the exact span the RC-3 audit-F1
+ * third-party probe targets. Same contract as the prepopulate seam:
+ * runs with NO sync locks held; fires on LOCKED-context fetches too
+ * (compounds under s->lock) — a hook that takes s->lock would
+ * self-deadlock there; the RC-6 regressions only arm it around
+ * lock-free reads. Pass hook=NULL to clear.
+ */
+void stm_sync_set_read_postinsert_hook_for_test(stm_sync *s,
+                                                   void (*hook)(void *ctx),
+                                                   void *ctx);
+
+/*
  * TLY-A3-keyslot: insert a keyschema slot carrying a chosen
  * `wrapper` tag and an opaque `wrapped` blob, WITHOUT performing a
  * real cryptographic wrap. Persisted on the next stm_sync_commit.

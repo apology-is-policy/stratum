@@ -44,6 +44,7 @@
 #include <stratum/types.h>
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -939,6 +940,309 @@ STM_TEST(corvus_rc3_read_evict_window) {
     stm_status rrs = stm_sync_read_extent(s2, ds_ev, 1u, 0u,
                                              r2, sizeof r2, &rg2);
     STM_ASSERT(rrs != STM_OK);
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(d);
+    fake_corvus_stop(&fc);
+    unlink(g_tmp_path);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* RC-6 (#35): the provisional dcache insert. The RC-3 audit-F1          */
+/* residual was a THIRD reader probe-hitting the fetch populate inside   */
+/* the [insert, self-remove] span after evict_dek returned. RC-6 births  */
+/* the entry probe-INVISIBLE and commits-or-kills it with the liveness   */
+/* re-check under the same dcache_wlock hold that flips                  */
+/* (specs/dcache_provisional.tla). The read_postinsert seam exposes the  */
+/* exact [insert, publish] window deterministically.                     */
+/* ────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    stm_sync  *s;
+    uint64_t   ds;
+    int        fired;
+    stm_status inner_rc;             /* the in-window third-party read */
+    size_t     inner_got;
+    uint8_t    inner_buf[4096];
+    uint64_t   hits_before, misses_before;
+    uint64_t   hits_after,  misses_after;
+} rc6_postinsert_ctx;
+
+/* The third party: a read that STARTS inside the [insert, publish]
+ * window — i.e. strictly after any evict the prepopulate hook landed
+ * has returned. Runs on the fetching thread (the hook contract: no
+ * sync locks held), which is exactly a fresh reader's shape: the
+ * fetch path is pinless at the populate, so the re-entrant read's own
+ * probe pin is at-outermost. Guarded: the re-entrant read can reach
+ * this hook again only via its own successful fetch populate (it
+ * either probe-hits pre-fix or fails at the DEK resolve when evicted;
+ * with no evict it fetches fully — the guard stops the recursion). */
+static void rc6_third_party_hook(void *arg)
+{
+    rc6_postinsert_ctx *c = arg;
+    if (c->fired) return;
+    c->fired = 1;
+    stm_sync_dcache_stats(c->s, &c->hits_before, &c->misses_before, NULL);
+    c->inner_got = 0;
+    c->inner_rc = stm_sync_read_extent(c->s, c->ds, 1u, 0u,
+                                          c->inner_buf,
+                                          sizeof c->inner_buf,
+                                          &c->inner_got);
+    stm_sync_dcache_stats(c->s, &c->hits_after, &c->misses_after, NULL);
+}
+
+STM_TEST(corvus_rc6_read_evict_third_party) {
+    make_tmp("rc6tp");
+    build_pool_with_corvus_slot();
+
+    uint8_t canned_dek[32];
+    for (int i = 0; i < 32; i++) canned_dek[i] = (uint8_t)(0x70 + i);
+    fake_corvus fc;
+    fake_corvus_start(&fc, "rc6tp", STM_CORVUS_STATUS_OK, canned_dek);
+
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+
+    stm_corvus_mount_cfg cc = {
+        .socket_path   = fc.sock_path,
+        .session_token = TEST_TOKEN,
+        .n_retries     = 0,
+    };
+    static const char ev_path[] = "users/rc6tp";
+    uint64_t ds_ev = rc3_evict_fixture(s2, &cc, "rc6tp", ev_path,
+                                         sizeof ev_path - 1);
+
+    uint8_t buf[4096];
+    for (size_t j = 0; j < sizeof buf; j++) buf[j] = (uint8_t)(0x3C ^ j);
+    STM_ASSERT_OK(stm_sync_write_extent(s2, ds_ev, 1u, 0u, buf, sizeof buf));
+    stm_sync_dcache_drain_for_test(s2);   /* force the fetch path */
+
+    /* Arm BOTH windows: the prepopulate hook lands the logout BEFORE
+     * the insert (so the insert lands after the drain — the F1 setup),
+     * and the postinsert hook is the THIRD READER, probing strictly
+     * after evict_dek returned, inside the [insert, publish] span. */
+    rc3_evict_hook_ctx hc = { .s = s2, .ds = ds_ev };
+    rc6_postinsert_ctx pc = { .s = s2, .ds = ds_ev };
+    stm_sync_set_read_prepopulate_hook_for_test(s2, rc3_evict_hook, &hc);
+    stm_sync_set_read_postinsert_hook_for_test(s2, rc6_third_party_hook,
+                                                  &pc);
+    uint8_t rout[4096] = {0};
+    size_t  rgot = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(s2, ds_ev, 1u, 0u,
+                                          rout, sizeof rout, &rgot));
+    stm_sync_set_read_prepopulate_hook_for_test(s2, NULL, NULL);
+    stm_sync_set_read_postinsert_hook_for_test(s2, NULL, NULL);
+    STM_ASSERT_EQ(hc.fired, 1);
+    STM_ASSERT_EQ(pc.fired, 1);
+
+    /* The in-flight outer read is served (it resolved before the
+     * logout completed — pre-RC-3 parity, unchanged by RC-6). */
+    STM_ASSERT_EQ(rgot, sizeof rout);
+    STM_ASSERT_MEM_EQ(rout, buf, sizeof buf);
+
+    /* THE regression (the F1 exact denial): the third-party read ran
+     * entirely after evict_dek returned. Pre-RC-6 the just-inserted
+     * entry was probe-VISIBLE and this read returned STM_OK + the
+     * plaintext from RAM, past the DEK denial. Now the probe skips the
+     * provisional entry and the fetch's DEK resolve refuses. */
+    STM_ASSERT(pc.inner_rc != STM_OK);
+
+    /* Nothing was left servable either: the publish took the kill arm. */
+    uint8_t r2[4096] = {0};
+    size_t  rg2 = 0;
+    STM_ASSERT(stm_sync_read_extent(s2, ds_ev, 1u, 0u,
+                                       r2, sizeof r2, &rg2) != STM_OK);
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(d);
+    fake_corvus_stop(&fc);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(corvus_rc6_read_populate_publish) {
+    make_tmp("rc6pp");
+    build_pool_with_corvus_slot();
+
+    uint8_t canned_dek[32];
+    for (int i = 0; i < 32; i++) canned_dek[i] = (uint8_t)(0x70 + i);
+    fake_corvus fc;
+    fake_corvus_start(&fc, "rc6pp", STM_CORVUS_STATUS_OK, canned_dek);
+
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+
+    stm_corvus_mount_cfg cc = {
+        .socket_path   = fc.sock_path,
+        .session_token = TEST_TOKEN,
+        .n_retries     = 0,
+    };
+    static const char ev_path[] = "users/rc6pp";
+    uint64_t ds_ev = rc3_evict_fixture(s2, &cc, "rc6pp", ev_path,
+                                         sizeof ev_path - 1);
+
+    uint8_t buf[4096];
+    for (size_t j = 0; j < sizeof buf; j++) buf[j] = (uint8_t)(0xE1 ^ j);
+    STM_ASSERT_OK(stm_sync_write_extent(s2, ds_ev, 1u, 0u, buf, sizeof buf));
+    stm_sync_dcache_drain_for_test(s2);   /* force the fetch path */
+
+    /* No evict. The in-window third-party read probes while the entry
+     * is still PROVISIONAL: it must MISS (its own full fetch — a miss
+     * accounted, no hit) and still return the right bytes. Pre-RC-6
+     * the entry was already visible here: a HIT. */
+    rc6_postinsert_ctx pc = { .s = s2, .ds = ds_ev };
+    stm_sync_set_read_postinsert_hook_for_test(s2, rc6_third_party_hook,
+                                                  &pc);
+    uint8_t rout[4096] = {0};
+    size_t  rgot = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(s2, ds_ev, 1u, 0u,
+                                          rout, sizeof rout, &rgot));
+    stm_sync_set_read_postinsert_hook_for_test(s2, NULL, NULL);
+    STM_ASSERT_EQ(pc.fired, 1);
+    STM_ASSERT_EQ(rgot, sizeof rout);
+    STM_ASSERT_MEM_EQ(rout, buf, sizeof buf);
+
+    STM_ASSERT_OK(pc.inner_rc);
+    STM_ASSERT_EQ(pc.inner_got, sizeof buf);
+    STM_ASSERT_MEM_EQ(pc.inner_buf, buf, sizeof buf);
+    STM_ASSERT_EQ(pc.hits_after, pc.hits_before);         /* not a hit */
+    STM_ASSERT(pc.misses_after > pc.misses_before);       /* a real miss */
+
+    /* The anti-silent-regression pin: the publish must have flipped
+     * the entry visible — the next read is a cache HIT. A broken
+     * publish would leave every fetch populate invisible: correct
+     * bytes, the cache silently dead, and no other test red. */
+    uint64_t h0 = 0, m0 = 0, h1 = 0, m1 = 0;
+    stm_sync_dcache_stats(s2, &h0, &m0, NULL);
+    uint8_t r2[4096] = {0};
+    size_t  rg2 = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(s2, ds_ev, 1u, 0u,
+                                          r2, sizeof r2, &rg2));
+    stm_sync_dcache_stats(s2, &h1, &m1, NULL);
+    STM_ASSERT_EQ(rg2, sizeof r2);
+    STM_ASSERT_MEM_EQ(r2, buf, sizeof buf);
+    STM_ASSERT_EQ(h1, h0 + 1);
+    STM_ASSERT_EQ(m1, m0);
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(d);
+    fake_corvus_stop(&fc);
+    unlink(g_tmp_path);
+}
+
+/* corvus_rc6_readers_vs_evict_hammer — the real-path runtime witness:
+ * N lock-free readers against evict/install cycles. The odd/even phase
+ * stamp turns wall-clock "after logout" into a checkable predicate: the
+ * evictor bumps phase to ODD only AFTER stm_sync_evict_dek returns and
+ * to EVEN before any reinstall begins, so a read that observed the SAME
+ * ODD phase on both sides ran entirely inside an evicted-stable window
+ * (started causally after the logout — the reader's acquire of the odd
+ * value syncs-with the evictor's post-return bump) and MUST fail. */
+typedef struct {
+    stm_sync         *s;
+    uint64_t          ds;
+    _Atomic uint64_t *phase;
+    _Atomic int      *stop;
+    const uint8_t    *expect;        /* 4096 bytes */
+    int               violations;
+    int               reads;
+} rc6_reader_arg;
+
+static void *rc6_reader_main(void *arg)
+{
+    rc6_reader_arg *a = arg;
+    uint8_t out[4096];
+    while (!atomic_load(a->stop)) {
+        uint64_t p0 = atomic_load(a->phase);
+        size_t   got = 0;
+        stm_status rc = stm_sync_read_extent(a->s, a->ds, 1u, 0u,
+                                                out, sizeof out, &got);
+        uint64_t p1 = atomic_load(a->phase);
+        a->reads++;
+        if (rc == STM_OK) {
+            if (got != 4096u || memcmp(out, a->expect, 4096u) != 0)
+                a->violations++;     /* wrong bytes: always a bug */
+            if (p0 == p1 && (p0 & 1u) != 0u)
+                a->violations++;     /* served inside an evicted-stable
+                                      * window — the F1 class, live */
+        }
+    }
+    return NULL;
+}
+
+STM_TEST(corvus_rc6_readers_vs_evict_hammer) {
+    make_tmp("rc6hm");
+    build_pool_with_corvus_slot();
+
+    uint8_t canned_dek[32];
+    for (int i = 0; i < 32; i++) canned_dek[i] = (uint8_t)(0x70 + i);
+    fake_corvus fc;
+    fake_corvus_start(&fc, "rc6hm", STM_CORVUS_STATUS_OK, canned_dek);
+
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, NULL, &s2));
+
+    stm_corvus_mount_cfg cc = {
+        .socket_path   = fc.sock_path,
+        .session_token = TEST_TOKEN,
+        .n_retries     = 0,
+    };
+    static const char ev_path[] = "users/rc6hm";
+    uint64_t ds_ev = rc3_evict_fixture(s2, &cc, "rc6hm", ev_path,
+                                         sizeof ev_path - 1);
+
+    uint8_t buf[4096];
+    for (size_t j = 0; j < sizeof buf; j++) buf[j] = (uint8_t)(0x99 ^ j);
+    STM_ASSERT_OK(stm_sync_write_extent(s2, ds_ev, 1u, 0u, buf, sizeof buf));
+    stm_sync_dcache_drain_for_test(s2);   /* start every reader cold */
+
+    _Atomic uint64_t phase = 0;           /* even: installed / installing */
+    _Atomic int      stop  = 0;
+    enum { RC6_READERS = 4, RC6_CYCLES = 40 };
+    rc6_reader_arg ra[RC6_READERS];
+    pthread_t      rt[RC6_READERS];
+    for (int i = 0; i < RC6_READERS; i++) {
+        ra[i] = (rc6_reader_arg){ .s = s2, .ds = ds_ev, .phase = &phase,
+                                  .stop = &stop, .expect = buf };
+        STM_ASSERT(pthread_create(&rt[i], NULL, rc6_reader_main,
+                                  &ra[i]) == 0);
+    }
+
+    for (int c = 0; c < RC6_CYCLES; c++) {
+        STM_ASSERT_OK(stm_sync_evict_dek(s2, ds_ev));
+        atomic_fetch_add(&phase, 1);      /* ODD: evicted AND returned */
+        usleep(200);
+        atomic_fetch_add(&phase, 1);      /* EVEN: reinstall may begin */
+        STM_ASSERT_OK(stm_sync_install_dek(s2, ds_ev, &cc));
+        usleep(100);
+    }
+
+    atomic_store(&stop, 1);
+    int total_reads = 0, total_violations = 0;
+    for (int i = 0; i < RC6_READERS; i++) {
+        pthread_join(rt[i], NULL);
+        total_reads      += ra[i].reads;
+        total_violations += ra[i].violations;
+    }
+    STM_ASSERT(total_reads > 0);
+    STM_ASSERT_EQ(total_violations, 0);
 
     stm_sync_close(s2);
     stm_alloc_close(a2);

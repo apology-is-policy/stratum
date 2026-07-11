@@ -218,10 +218,19 @@ _Static_assert(STM_SYNC_WRAPPED_KEY_LEN <= STM_KEYSCHEMA_WRAPPED_MAX,
  * NoTornEntry / LinkedImpliesInit / LinkedNeverReclaimed + the
  * EventuallyReclaimed liveness witness; the buggy cfgs
  * (evict_frees_pinned / link_before_init / retire_still_linked) are the
- * executable counterexamples. */
+ * executable counterexamples.
+ *
+ * RC-6 (#35): `visible` joins lru_tick/hnext as the mutable-metadata
+ * exceptions to entry immutability -- a monotonic 0->1 policy gate. The
+ * lock-free probe skips a clear flag (a spurious MISS -- refetch -- never
+ * a wrong serve); only dcache_publish_hot_gated flips it, under
+ * dcache_wlock, after re-checking DEK-slot liveness under that same
+ * hold. Pinned by specs/dcache_provisional.tla (NoVisiblePostEvict /
+ * NoStuckProvisional; buggy cfgs visible_birth / stale_publish). */
 struct sync_dcache_entry {
     uint8_t  key[STM_CAS_HASH_LEN];   /* COLD: content_hash; HOT: paddr0||gen||0 */
     uint8_t  kind_tag;                /* STM_EXTENT_KIND_* -- disambiguates key space */
+    _Atomic uint8_t visible;          /* RC-6 probe-visibility gate; see above */
     size_t   len;
     _Atomic uint64_t lru_tick;        /* advisory LRU; relaxed stores/loads */
     struct sync_dcache_entry *_Atomic hnext;  /* bucket chain; NULL == end */
@@ -243,12 +252,16 @@ static void dcache_key_hot(uint8_t out[STM_CAS_HASH_LEN],
                            uint64_t paddr0, uint64_t gen);
 static void dcache_insert(stm_sync *s, const uint8_t key[STM_CAS_HASH_LEN],
                           uint8_t kind_tag,
-                          const uint8_t *plaintext, size_t len);
+                          const uint8_t *plaintext, size_t len,
+                          bool visible_at_birth);
 static bool dcache_lookup_copy(stm_sync *s,
                                const uint8_t key[STM_CAS_HASH_LEN],
                                uint8_t kind_tag, size_t len,
                                size_t slice_off, size_t slice_len,
                                uint8_t *out);
+static void dcache_publish_hot_gated(stm_sync *s, stm_ebr_thread *ebr,
+                                     const uint8_t key[STM_CAS_HASH_LEN],
+                                     uint64_t dataset_id, uint64_t key_id);
 
 struct stm_sync {
     pthread_mutex_t lock;
@@ -534,18 +547,25 @@ struct stm_sync {
     pthread_mutex_t   promote_lock;
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-    /* RC-3 test seams (compiled out of production builds — the
+    /* RC-3/RC-6 test seams (compiled out of production builds — the
      * Thylacine cross-build passes TESTING_HOOKS=OFF):
      *   write_phase2: called by the PUBLIC stm_sync_write_extent
      *     between the unlocked Phase 2 and the index-commit epilogue;
      *   read_prepopulate: called by the HOT fetch between the decrypt
-     *     and the dcache populate.
+     *     and the dcache populate;
+     *   read_postinsert (RC-6): called by the HOT fetch between the
+     *     provisional insert and its commit-or-kill publish — the
+     *     exact [insert, publish] window the F1 third-party probe
+     *     targets.
      * Each lets a test land a deterministic evict / rotate+sweep /
-     * wedge inside the exact window the RC unlocked spans open. */
+     * wedge / probe inside the exact window the RC unlocked spans
+     * open. */
     void            (*write_phase2_test_hook)(void *ctx);
     void             *write_phase2_test_ctx;
     void            (*read_prepopulate_test_hook)(void *ctx);
     void             *read_prepopulate_test_ctx;
+    void            (*read_postinsert_test_hook)(void *ctx);
+    void             *read_postinsert_test_ctx;
 #endif
 
     /* Durable mirror of ub_main_root / ub_snap_root state, last-
@@ -5597,6 +5617,17 @@ void stm_sync_set_read_prepopulate_hook_for_test(stm_sync *s,
     pthread_mutex_unlock(&s->lock);
 }
 
+void stm_sync_set_read_postinsert_hook_for_test(stm_sync *s,
+                                                   void (*hook)(void *ctx),
+                                                   void *ctx)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->read_postinsert_test_hook = hook;
+    s->read_postinsert_test_ctx  = ctx;
+    pthread_mutex_unlock(&s->lock);
+}
+
 /* RC-1 test-only pass-throughs: the concurrency hammer drives the
  * lock-free reader protocol + the writer paths directly from N threads
  * (the dcache functions are static). The lookup hook carries the SAME
@@ -5608,7 +5639,8 @@ void stm_sync_dcache_insert_for_test(stm_sync *s,
                                      const void *plaintext, size_t len)
 {
     if (!s || !key || !plaintext) return;
-    dcache_insert(s, key, kind_tag, plaintext, len);
+    dcache_insert(s, key, kind_tag, plaintext, len,
+                  /*visible_at_birth=*/true);
 }
 
 bool stm_sync_dcache_lookup_for_test(stm_sync *s,
@@ -6188,9 +6220,14 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
          * RECORD still indexes (durable + decryptable-on-reinstall,
          * the pre-RC-3 outcome for a write completing before a
          * logout). The locked compound path always sees the slot
-         * alive (its caller's s->lock spans resolve to here). */
+         * alive (its caller's s->lock spans resolve to here).
+         * Visible at birth (RC-6): the held s->lock excludes the
+         * WHOLE evict (slot remove -> drain, one s->lock hold), so
+         * this pre-gate is atomic with the insert -- the provisional
+         * dance is the unlocked fetch path's tool. */
         if (sync_dek_find(s, dataset_id, res->enc_key_id) != NULL)
-            dcache_insert(s, wkey, STM_EXTENT_KIND_HOT, buf, len);
+            dcache_insert(s, wkey, STM_EXTENT_KIND_HOT, buf, len,
+                          /*visible_at_birth=*/true);
     }
 
     /* R36 P1-1 + P2-1: best-effort drain. */
@@ -6644,16 +6681,15 @@ static void dcache_evict_locked(stm_sync *s, size_t slot_idx) {
     }
 }
 
-/* Unlink + retire every linked entry matching (key, kind_tag). The
- * populate-vs-evict repair arm (RC-3): a populate that raced
- * stm_sync_evict_dek's drain self-removes its own entry, so no HOT
- * cleartext outlives the DEK denial (the CF-5a F1 contract). The
- * O(slots) walk is drain's own shape and runs only on the
- * pathological race path. */
-static void dcache_remove_key(stm_sync *s,
-                                const uint8_t key[STM_CAS_HASH_LEN],
-                                uint8_t kind_tag) {
-    pthread_mutex_lock(&s->dcache_wlock);
+/* Unlink + retire every linked entry matching (key, kind_tag);
+ * dcache_wlock held. The kill arm of the RC-6 commit-or-kill publish
+ * (formerly the RC-3 self-remove repair, which ran as its own lock
+ * hold and left the [insert, self-remove] span probe-visible -- the
+ * audit-F1 residual RC-6 closes). The O(slots) walk is drain's own
+ * shape and runs only on the pathological race path. */
+static void dcache_remove_key_locked(stm_sync *s,
+                                       const uint8_t key[STM_CAS_HASH_LEN],
+                                       uint8_t kind_tag) {
     for (size_t i = 0; i < STM_DCACHE_ENTRIES; i++) {
         struct sync_dcache_entry *e = s->dcache_slots[i];
         if (!e) continue;
@@ -6662,8 +6698,6 @@ static void dcache_remove_key(stm_sync *s,
             dcache_evict_locked(s, i);
         }
     }
-    pthread_mutex_unlock(&s->dcache_wlock);
-    (void)stm_ebr_try_advance();
 }
 
 /* RC-1 lock-free lookup. CONTRACT: the caller holds an active
@@ -6691,6 +6725,15 @@ static bool dcache_lookup_copy(stm_sync *s,
              atomic_load_explicit(&s->dcache_hash[b], memory_order_acquire);
          e != NULL;
          e = atomic_load_explicit(&e->hnext, memory_order_acquire)) {
+        /* RC-6: a provisional entry is not servable -- skip it (the
+         * dedup arm guarantees at most one entry per (key, kind), so
+         * continuing the walk cannot find a visible twin; `continue`
+         * is chosen over an early miss for robustness, not reach).
+         * Acquire pairs with the publish's release flip -- the policy
+         * edge; a stale-clear read is a spurious MISS (refetch),
+         * fail-safe by construction. */
+        if (!atomic_load_explicit(&e->visible, memory_order_acquire))
+            continue;
         if (e->kind_tag == kind_tag && e->len == len
                 && memcmp(e->key, key, STM_CAS_HASH_LEN) == 0) {
             if (slice_off > len || slice_len > len - slice_off)
@@ -6706,10 +6749,19 @@ static bool dcache_lookup_copy(stm_sync *s,
     return false;
 }
 
+/* RC-6 (#35): `visible_at_birth` selects the visibility policy. TRUE =
+ * the caller's context makes the entry legitimately servable at link
+ * time (the write-populate epilogue holds s->lock, which the WHOLE
+ * evict also holds, so its pre-gate is atomic with this insert; COLD
+ * decrypts under the pool-wide metadata_key with no DEK-map
+ * dependency; the test shim has no slot to validate). FALSE = the
+ * unlocked read-fetch populate: the entry links probe-INVISIBLE and is
+ * committed-or-killed by dcache_publish_hot_gated. */
 static void dcache_insert(stm_sync *s,
                            const uint8_t key[STM_CAS_HASH_LEN],
                            uint8_t kind_tag,
-                           const uint8_t *plaintext, size_t len) {
+                           const uint8_t *plaintext, size_t len,
+                           bool visible_at_birth) {
     /* Never cache an extent that alone exceeds the budget; the byte cap
      * also bounds the per-sync RAM the cache can pin. */
     if (len == 0 || len > STM_DCACHE_BYTES_MAX) return;
@@ -6720,7 +6772,13 @@ static void dcache_insert(stm_sync *s,
      * both arrive here post-decrypt; the loser drops its copy (entries
      * are immutable and a key names exactly one plaintext -- the nonce
      * argument at the top of this block -- so the copies are
-     * byte-identical and keeping either is correct). */
+     * byte-identical and keeping either is correct). RC-6: the scan
+     * matches regardless of visibility -- dropping a visible-at-birth
+     * copy against a provisional twin at worst loses a populate (the
+     * twin's own key-addressed publish flips or kills it; best-effort
+     * cache, never a wrong visibility), and dropping a provisional
+     * copy against a visible twin leaves the caller's publish to
+     * re-gate that twin (idempotent flip / fail-closed kill). */
     {
         uint32_t b = dcache_bucket(key, kind_tag);
         for (struct sync_dcache_entry *e =
@@ -6775,6 +6833,7 @@ static void dcache_insert(stm_sync *s,
     }
     memcpy(e->key, key, STM_CAS_HASH_LEN);
     e->kind_tag = kind_tag;
+    atomic_init(&e->visible, visible_at_birth ? 1 : 0);
     e->len      = len;
     atomic_init(&e->lru_tick,
                 atomic_fetch_add_explicit(&s->dcache_tick, 1,
@@ -6790,6 +6849,61 @@ static void dcache_insert(stm_sync *s,
     /* Drive reclamation from the retire-bearing path (the spec's
      * pending-gated advance). Non-blocking; takes no stratum locks. */
     (void)stm_ebr_try_advance();
+}
+
+/* RC-6 (#35): commit-or-kill a provisional HOT populate -- the exact-
+ * denial close of the RC-3 audit-F1 residual. Under ONE dcache_wlock
+ * hold: re-check (dataset_id, key_id) liveness in the DEK map, then
+ * either flip the (key, HOT) entry probe-visible (alive) or unlink +
+ * retire it (dead). Key-addressed, not pointer-addressed: re-resolving
+ * under the wlock dodges the entry-lifetime problem (an entry
+ * evicted/drained in the window simply is not found -- fail-closed),
+ * and a same-key twin left by the dedup arm is byte-identical (the
+ * nonce-identity argument), so flipping whichever entry currently
+ * carries the key is equivalent.
+ *
+ * THE LIVENESS RE-CHECK MUST RUN UNDER THIS wlock HOLD (the
+ * stale_publish buggy cfg is the executable counterexample of the
+ * split design): a flip ordered after stm_sync_evict_dek's drain
+ * (wlock order) observes the slot removal that preceded that drain in
+ * the evictor's program order (mutex happens-before) and takes the
+ * kill arm; a flip ordered before the drain -- including one whose
+ * lock-free map read was STALE-alive in the dek_remove..drain window
+ * (no happens-before edge exists there) -- is wiped by the drain
+ * before evict returns. Every N-party interleave lands in one of
+ * those two buckets (specs/dcache_provisional.tla NoVisiblePostEvict).
+ *
+ * `ebr` follows the sync_dek_slot_alive contract (a SHORT own pin for
+ * lock-free callers; NULL for locked-context callers, whose held
+ * s->lock excludes the evict entirely). Pinning under dcache_wlock is
+ * safe: EBR enter/exit is non-blocking and nothing in the tree waits
+ * synchronously for an epoch grace. The flip is a release store,
+ * pairing with the probe's acquire load (the policy edge; a
+ * stale-clear read there is a spurious miss, fail-safe). */
+static void dcache_publish_hot_gated(stm_sync *s, stm_ebr_thread *ebr,
+                                     const uint8_t key[STM_CAS_HASH_LEN],
+                                     uint64_t dataset_id, uint64_t key_id) {
+    pthread_mutex_lock(&s->dcache_wlock);
+    bool alive = sync_dek_slot_alive(s, ebr, dataset_id, key_id);
+    if (alive) {
+        uint32_t b = dcache_bucket(key, STM_EXTENT_KIND_HOT);
+        for (struct sync_dcache_entry *e =
+                 atomic_load_explicit(&s->dcache_hash[b],
+                                      memory_order_relaxed);
+             e != NULL;
+             e = atomic_load_explicit(&e->hnext, memory_order_relaxed)) {
+            if (e->kind_tag == STM_EXTENT_KIND_HOT
+                    && memcmp(e->key, key, STM_CAS_HASH_LEN) == 0) {
+                atomic_store_explicit(&e->visible, 1,
+                                      memory_order_release);
+                break;               /* dedup: at most one entry per key */
+            }
+        }
+    } else {
+        dcache_remove_key_locked(s, key, STM_EXTENT_KIND_HOT);
+    }
+    pthread_mutex_unlock(&s->dcache_wlock);
+    if (!alive) (void)stm_ebr_try_advance();
 }
 
 static void dcache_drain(stm_sync *s) {
@@ -7096,7 +7210,10 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
             return clast_err;
         }
         memcpy(buf, (uint8_t *)cpbuf + slice_off, slice_len);
-        dcache_insert(s, rec.content_hash, STM_EXTENT_KIND_COLD, cpbuf, rec.len);
+        /* Visible at birth: COLD decrypts under the pool-wide
+         * metadata_key -- no DEK-map dependency (the RC-3 argument). */
+        dcache_insert(s, rec.content_hash, STM_EXTENT_KIND_COLD, cpbuf,
+                      rec.len, /*visible_at_birth=*/true);
         dcache_account(s, false);
         stm_ct_memzero(cpbuf, rec.len);
         free(cpbuf);
@@ -7236,31 +7353,30 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
 #endif
         uint8_t hkey[STM_CAS_HASH_LEN];
         dcache_key_hot(hkey, rec.paddrs[0], rec.gen);
-        dcache_insert(s, hkey, STM_EXTENT_KIND_HOT, pbuf, rec.len);
-        /* Populate-vs-evict repair (RC-3; closes the RC-2 latent): the
-         * DEK was copied out BEFORE the decrypt, so stm_sync_evict_dek
-         * (remove slot -> dcache_drain, one s->lock hold) can run
-         * entirely inside this fetch — the insert above then lands
-         * AFTER the drain and post-logout cleartext would sit resident
-         * past the DEK denial, INDEFINITELY (the CF-5a F1 contract).
-         * Re-check the slot AFTER the insert and self-remove on death.
-         * For THIS thread's path the wlock hand-off covers every
-         * interleave: insert-before-drain — the drain wipes it;
-         * drain-before-insert — the drain's wlock release
-         * happens-before our insert's acquire, so the map publish is
-         * visible to this probe, which then removes our own entry.
-         * RESIDUAL (RC-3 audit F1): a THIRD reader's probe can hit
-         * the entry inside the [insert, self-remove] span and be
-         * served — a transient bounded by these few instructions,
-         * carrying only bytes this (allowed) in-flight fetch is
-         * concurrently serving anyway. Exact-denial closure needs a
-         * provisional (probe-invisible-until-validated) insert — the
-         * tracked RC-4 hardening. COLD entries need no gate: they
-         * decrypt under the pool-wide metadata_key (no DEK-map
-         * dependency), so caching them is exactly
-         * backing-path-consistent. */
-        if (!sync_dek_slot_alive(s, ebr, rec.origin_dataset_id, rec.key_id))
-            dcache_remove_key(s, hkey, STM_EXTENT_KIND_HOT);
+        /* Populate-vs-evict (RC-3 -> RC-6): the DEK was copied out
+         * BEFORE the decrypt, so stm_sync_evict_dek (remove slot ->
+         * dcache_drain, one s->lock hold) can run entirely inside this
+         * fetch — this insert then lands AFTER the drain, and pre-RC-6
+         * the entry was probe-visible until the liveness re-check
+         * self-removed it: a THIRD reader whose read started after
+         * evict returned could hit inside that [insert, self-remove]
+         * span and be served post-logout plaintext (the RC-3 audit-F1
+         * residual). RC-6 closes it exactly: the entry links
+         * probe-INVISIBLE and dcache_publish_hot_gated commits-or-
+         * kills it with the liveness re-check UNDER the same
+         * dcache_wlock hold that flips — no party can observe an
+         * unvalidated entry (specs/dcache_provisional.tla). COLD
+         * entries need no gate: they decrypt under the pool-wide
+         * metadata_key (no DEK-map dependency), so caching them is
+         * exactly backing-path-consistent. */
+        dcache_insert(s, hkey, STM_EXTENT_KIND_HOT, pbuf, rec.len,
+                      /*visible_at_birth=*/false);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (s->read_postinsert_test_hook)
+            s->read_postinsert_test_hook(s->read_postinsert_test_ctx);
+#endif
+        dcache_publish_hot_gated(s, ebr, hkey,
+                                 rec.origin_dataset_id, rec.key_id);
     }
     dcache_account(s, false);
     stm_ct_memzero(pbuf, rec.len);
