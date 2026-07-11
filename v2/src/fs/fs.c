@@ -5578,17 +5578,31 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
  * for "." (single dot), 2 for ".." (double dot). The synthesized
  * child_ino is caller-provided (`dir_ino` for ".", `parent_ino` for
  * ".."). child_gen = 0 (synth entries never go stale; the dir's own
- * inode owns the gen bump). child_type = STM_DT_DIR. */
+ * inode owns the gen bump). child_type = STM_DT_DIR. next_cursor =
+ * dot_kind — the post-dot fs cursor (phase 1 after ".", phase 2 after
+ * ".."). */
 static void fs_readdir_synth_dot(stm_fs_dirent_entry *out_entry,
                                       uint64_t child_ino, uint8_t dot_kind)
 {
     memset(out_entry, 0, sizeof *out_entry);
-    out_entry->child_ino  = child_ino;
-    out_entry->child_gen  = 0;
-    out_entry->child_type = STM_DT_DIR;
-    out_entry->name_len   = dot_kind;
-    out_entry->name[0]    = '.';
+    out_entry->child_ino   = child_ino;
+    out_entry->child_gen   = 0;
+    out_entry->next_cursor = dot_kind;
+    out_entry->child_type  = STM_DT_DIR;
+    out_entry->name_len    = dot_kind;
+    out_entry->name[0]     = '.';
     if (dot_kind == 2u) out_entry->name[1] = '.';
+}
+
+/* Per-entry resume cursor for a stored dirent at hash_probe `p`: the
+ * fs-level cursor immediately after that entry. Exactly composes the
+ * two per-call advances (dirent layer: p -> p+1 saturating at
+ * UINT64_MAX; fs layer: +2 saturating), so a batched call's per-entry
+ * next_cursor values are byte-identical to the *cursor out-values the
+ * equivalent max_entries==1 call sequence would have produced. */
+static inline uint64_t fs_readdir_next_cursor(uint64_t p)
+{
+    return (p > UINT64_MAX - 3u) ? UINT64_MAX : p + 3u;
 }
 
 stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
@@ -5647,26 +5661,36 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
             local_cursor = 2u;
         }
 
-        size_t batch_returned = 0;
         if (emitted < max_entries) {
             uint64_t inner_cursor = local_cursor - 2u;
-            size_t max_inner = max_entries - emitted;
-            stm_status s;
-            if (fs_ino_is_snaps_parent(dir_ino)) {
-                s = fs_snaps_parent_readdir(fs, dataset_id, &inner_cursor,
+            /* Per-entry inner calls so each entry's next_cursor is the
+             * exact inner cursor after that entry (the +2 fs-phase
+             * mapping). The synth namespaces are small (snapshot
+             * listings) and stay under fs->global for the whole batch,
+             * so the 1-at-a-time loop costs one lock hold either way. */
+            while (emitted < max_entries) {
+                size_t got1 = 0;
+                stm_status s;
+                if (fs_ino_is_snaps_parent(dir_ino)) {
+                    s = fs_snaps_parent_readdir(fs, dataset_id, &inner_cursor,
+                                                    out_entries + emitted,
+                                                    1, &got1);
+                } else {
+                    s = fs_snap_view_readdir(fs, dataset_id, dir_ino,
+                                                &inner_cursor,
                                                 out_entries + emitted,
-                                                max_inner, &batch_returned);
-            } else {
-                s = fs_snap_view_readdir(fs, dataset_id, dir_ino,
-                                            &inner_cursor,
-                                            out_entries + emitted,
-                                            max_inner, &batch_returned);
+                                                1, &got1);
+                }
+                if (s != STM_OK) {
+                    pthread_rwlock_unlock(&fs->global);
+                    return s;
+                }
+                if (got1 == 0) break;
+                out_entries[emitted].next_cursor =
+                    (inner_cursor > UINT64_MAX - 2u)
+                        ? UINT64_MAX : (inner_cursor + 2u);
+                emitted++;
             }
-            if (s != STM_OK) {
-                pthread_rwlock_unlock(&fs->global);
-                return s;
-            }
-            emitted += batch_returned;
             local_cursor = (inner_cursor > UINT64_MAX - 2u)
                               ? UINT64_MAX : (inner_cursor + 2u);
         }
@@ -5763,6 +5787,8 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
                     }
                     out_entries[emitted].child_ino  = batch[k].child_ino;
                     out_entries[emitted].child_gen  = batch[k].child_gen;
+                    out_entries[emitted].next_cursor =
+                        fs_readdir_next_cursor(batch[k].hash_probe);
                     out_entries[emitted].child_type = batch[k].child_type;
                     out_entries[emitted].name_len   = batch[k].name_len;
                     memset(out_entries[emitted].name, 0, sizeof out_entries[emitted].name);
@@ -5854,6 +5880,8 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
                 }
                 out_entries[emitted].child_ino  = batch[k].child_ino;
                 out_entries[emitted].child_gen  = batch[k].child_gen;
+                out_entries[emitted].next_cursor =
+                    fs_readdir_next_cursor(batch[k].hash_probe);
                 out_entries[emitted].child_type = batch[k].child_type;
                 out_entries[emitted].name_len   = batch[k].name_len;
                 memset(out_entries[emitted].name, 0, sizeof out_entries[emitted].name);

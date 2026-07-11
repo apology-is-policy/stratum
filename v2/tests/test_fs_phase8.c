@@ -1086,6 +1086,89 @@ STM_TEST(fs_p4_readdir_pagination_one_at_a_time) {
     unlink(g_key_path);
 }
 
+STM_TEST(fs_p4_readdir_next_cursor_resume) {
+    /* The per-entry next_cursor contract (CHASE C-3, the h_readdir
+     * batch substrate): (a) at max_entries==1, each call's *cursor
+     * out-value equals the returned entry's next_cursor — the defining
+     * equivalence; (b) a batched call returns the same sequence with
+     * the same per-entry next_cursor values, and its final *cursor
+     * equals the LAST entry's next_cursor; (c) resuming a fresh
+     * iteration from ANY entry's next_cursor yields exactly the suffix
+     * after that entry (the un-emitted-tail re-fetch a partially-packed
+     * Rreaddir relies on); (d) synth dots carry next_cursor 1 / 2. */
+    make_tmp("p4_readdir_next_cursor");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t inos[8] = {0};
+    for (int k = 0; k < 8; k++) {
+        uint8_t nm[3] = { 'f', (uint8_t)('0' + k), 0 };
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, nm, 2,
+                                              0644u, 0, 0, &inos[k]));
+    }
+
+    /* (a) one-at-a-time reference walk: out-cursor == next_cursor. */
+    stm_fs_dirent_entry ref[16];
+    size_t ref_n = 0;
+    uint64_t cursor = 0;
+    for (int iter = 0; iter < 32; iter++) {
+        stm_fs_dirent_entry one;
+        size_t n = 0;
+        STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                           &cursor, &one, 1, &n));
+        if (n == 0) break;
+        STM_ASSERT_EQ(cursor, one.next_cursor);
+        STM_ASSERT_TRUE(ref_n < 16);
+        ref[ref_n++] = one;
+    }
+    STM_ASSERT_EQ(ref_n, (size_t)10);          /* "." + ".." + 8 */
+
+    /* (d) synth dots carry the post-dot phase cursors. */
+    STM_ASSERT_EQ(ref[0].next_cursor, (uint64_t)1);   /* "."  */
+    STM_ASSERT_EQ(ref[1].next_cursor, (uint64_t)2);   /* ".." */
+
+    /* (b) one batched call returns the identical sequence + cursors,
+     * and its final *cursor is the last entry's next_cursor. */
+    stm_fs_dirent_entry batch[16];
+    size_t bn = 0;
+    cursor = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 16, &bn));
+    STM_ASSERT_EQ(bn, ref_n);
+    for (size_t i = 0; i < bn; i++) {
+        STM_ASSERT_EQ(batch[i].child_ino,   ref[i].child_ino);
+        STM_ASSERT_EQ(batch[i].next_cursor, ref[i].next_cursor);
+        STM_ASSERT_EQ(batch[i].name_len,    ref[i].name_len);
+        STM_ASSERT_TRUE(memcmp(batch[i].name, ref[i].name,
+                                    ref[i].name_len) == 0);
+    }
+    STM_ASSERT_EQ(cursor, batch[bn - 1].next_cursor);
+
+    /* (c) resume from EVERY entry's next_cursor: exactly the suffix. */
+    for (size_t i = 0; i < ref_n; i++) {
+        stm_fs_dirent_entry tail[16];
+        size_t tn = 0;
+        uint64_t rc2 = ref[i].next_cursor;
+        STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                           &rc2, tail, 16, &tn));
+        STM_ASSERT_EQ(tn, ref_n - i - 1);
+        for (size_t j = 0; j < tn; j++) {
+            STM_ASSERT_EQ(tail[j].child_ino,   ref[i + 1 + j].child_ino);
+            STM_ASSERT_EQ(tail[j].next_cursor, ref[i + 1 + j].next_cursor);
+        }
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_p4_readdir_refuses_non_directory) {
     /* readdir on a regular file inode returns STM_ENOTDIR. */
     make_tmp("p4_readdir_notdir");

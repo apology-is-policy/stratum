@@ -1136,6 +1136,12 @@ typedef struct {
     di_readdir_match *arr;
     size_t            n;
     size_t            cap;
+    uint64_t          min_probe;   /* skip records with probe < this
+                                    * at collection time — the cursor
+                                    * prefix-filter hoisted into the
+                                    * scan so consumed entries are not
+                                    * copied + sorted every resume call
+                                    * (CHASE C-3). 0 = no filter. */
     stm_status        err;
 } di_readdir_ctx;
 
@@ -1157,6 +1163,9 @@ static int di_readdir_cb(const void *k, size_t klen,
     stm_status vs = di_decode_value(v, vlen, &r);
     if (vs != STM_OK) { c->err = vs; return 1; }
     if (record_is_tombstone(&r)) return 0;     /* never emit tombstones */
+    if (probe < c->min_probe) return 0;        /* consumed prefix — the
+                                                * post-sort cursor skip
+                                                * hoisted (CHASE C-3) */
     /* dataset_id stamped by the caller (it's the engine handle's
      * tree_id, not on-disk); dir + probe from the decoded key. */
     r.dir_ino    = dir;
@@ -1228,7 +1237,8 @@ stm_status stm_dirent_readdir(const stm_dirent_index *idx,
         return k1 != STM_OK ? k1 : k2;
     }
 
-    di_readdir_ctx c = { .arr = NULL, .n = 0, .cap = 0, .err = STM_OK };
+    di_readdir_ctx c = { .arr = NULL, .n = 0, .cap = 0,
+                         .min_probe = *cursor, .err = STM_OK };
     stm_status ss = stm_btree_engine_scan_range(eng, lo, DI_KEY_LEN,
                                                 hi, DI_KEY_LEN,
                                                 di_readdir_cb, &c);
@@ -1320,7 +1330,8 @@ stm_status stm_dirent_readdir_concurrent(const stm_dirent_index *idx,
     if (k1 != STM_OK || k2 != STM_OK)
         return k1 != STM_OK ? k1 : k2;
 
-    di_readdir_ctx c = { .arr = NULL, .n = 0, .cap = 0, .err = STM_OK };
+    di_readdir_ctx c = { .arr = NULL, .n = 0, .cap = 0,
+                         .min_probe = *cursor, .err = STM_OK };
     stm_status ss = stm_btree_engine_scan_range_concurrent(
         eng, ebr, lo, DI_KEY_LEN, hi, DI_KEY_LEN, di_readdir_cb, &c);
     if (ss != STM_OK || c.err != STM_OK) {

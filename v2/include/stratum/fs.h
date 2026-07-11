@@ -1090,10 +1090,21 @@ stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
  *     inode.tla's (ino, si_gen) tuple-uniqueness invariant). 0 for
  *     synthesized "." / ".." (which never become stale).
  *   - child_type: STM_DT_* (matches POSIX DT_*).
+ *   - next_cursor: the cursor value that resumes iteration immediately
+ *     AFTER this entry — i.e., a subsequent stm_fs_readdir call with
+ *     `*cursor = next_cursor` continues at this entry's successor.
+ *     Identical to the `*cursor` out-value a max_entries==1 call ending
+ *     at this entry would have produced, so per-entry resume points are
+ *     available from a BATCHED call: a consumer that emits only a
+ *     prefix of the returned batch (e.g. a 9P Rreaddir that ran out of
+ *     reply room) resumes from the last emitted entry's next_cursor and
+ *     the un-emitted tail is re-fetched — no per-entry calls needed
+ *     (the R92 P1-2 one-entry-per-call pattern generalized).
  */
 typedef struct stm_fs_dirent_entry {
     uint64_t child_ino;
     uint64_t child_gen;
+    uint64_t next_cursor;
     uint8_t  child_type;
     uint8_t  name_len;
     uint8_t  name[STM_DIRENT_NAME_MAX];

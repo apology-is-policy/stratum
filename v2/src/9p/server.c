@@ -2481,17 +2481,25 @@ static stm_status h_readdir(stm_9p_server *s,
     wp += 4;
     uint8_t *data_start = wp;
 
-    /* Per-entry cursor advance with rewind-on-no-room (R92 P1-2 fix).
-     * Pull one entry at a time so the cursor advances per-call; on
-     * OUT-OF-ROOM rewind cursor to the pre-fetch value (which the
-     * client recovers via the LAST emitted entry's offset cookie =
-     * the cursor immediately after that entry, i.e., the pre-fetch
-     * of the un-emitted next entry). The fs layer's cursor is
-     * monotonic + opaque per dirent.tla's readdir-cursor invariants;
-     * stm_fs_readdir is well-defined for the resume case. Each
-     * on-wire entry is 13 (qid) + 8 (offset) + 1 (type) + 2 (name_len)
-     * + name_len. */
-    stm_fs_dirent_entry one;
+    /* Batched fetch (CHASE C-3; generalizes the R92 P1-2 one-entry-
+     * per-call loop). Pull up to H_READDIR_BATCH entries per
+     * stm_fs_readdir call and pack until no room. Every entry carries
+     * its own resume point (next_cursor == the *cursor out-value a
+     * max_entries==1 call ending at that entry would have produced),
+     * so the per-entry offset cookie and the resume semantics are
+     * byte-identical to the one-at-a-time loop: an un-emitted fetched
+     * tail is simply re-fetched by the client's next Treaddir from the
+     * last emitted entry's cookie (the R92 rewind is subsumed — the
+     * server never persists a cursor between wire ops anyway; each op
+     * re-seeds from the wire offset). The batch amortizes the per-call
+     * fs stack (EBR pin + parent-dir validation + engine
+     * materialization + the whole-dir dirent scan + sort + heap
+     * alloc), which the C-3 instrument measured at ~100us/call =
+     * 99.75% of h_readdir time at max_entries==1 — 1835us/op on the
+     * go-build source-dir sweep. Each on-wire entry is 13 (qid) + 8
+     * (offset) + 1 (type) + 2 (name_len) + name_len. */
+    enum { H_READDIR_BATCH = 32 };
+    stm_fs_dirent_entry batch[H_READDIR_BATCH];
 
     /* Parent ino for ".." synthesis. For the dataset root the
      * convention is parent_ino = dir_ino (POSIX "/.." → "/"). The fid
@@ -2504,69 +2512,80 @@ static stm_status h_readdir(stm_9p_server *s,
 
     uint64_t cursor = offset;
 
-    for (;;) {
-        uint64_t pre_cursor = cursor;
+    bool room = true;
+    while (room) {
         size_t got = 0;
         stm_status rc = stm_fs_readdir(s->fs, ds, ino,
                                           parent_ino,
                                           /*flags=*/0,
                                           &cursor,
-                                          &one, 1, &got);
+                                          batch, H_READDIR_BATCH, &got);
         if (rc != STM_OK) {
             ecode = status_to_errno(rc);
             goto phase_c;
         }
         if (got == 0) break;        /* exhausted */
 
-        uint32_t entry_size = STM_9P_QID_SIZE + 8u + 1u + 2u + one.name_len;
-        if ((uint32_t)(wp - data_start) + entry_size > count) {
-            /* No room. Rewind cursor so a re-issued Treaddir from the
-             * last-emitted offset cookie (or the original `offset` if
-             * no entry was emitted yet) re-fetches THIS entry. The fs
-             * layer's cursor is opaque + monotonic; setting it back
-             * to pre_cursor is well-defined per dirent.tla's
-             * cursor-stability invariants. Without this rewind the
-             * entry would be silently dropped (the original P1-2
-             * bug). */
-            cursor = pre_cursor;
-            break;
+        for (size_t k = 0; k < got; k++) {
+            uint32_t entry_size = STM_9P_QID_SIZE + 8u + 1u + 2u
+                                  + batch[k].name_len;
+            if ((uint32_t)(wp - data_start) + entry_size > count) {
+                /* No room. The un-emitted tail of the batch is simply
+                 * discarded: the client's next Treaddir resumes from
+                 * the LAST emitted entry's offset cookie (= that
+                 * entry's next_cursor), re-fetching this entry first —
+                 * the R92 P1-2 no-silent-drop property carried by the
+                 * per-entry resume points instead of a cursor rewind
+                 * (`cursor` is dead after this loop; each wire op
+                 * re-seeds from the wire offset). */
+                room = false;
+                break;
+            }
+            /* qid: type from STM_DT_ → STM_9P_QT_. NOTE: this is the ONE
+             * qid emitter that keeps si_gen (child_gen) rather than
+             * si_cvers. The dirent record stores child_gen as a LINK-TIME
+             * si_gen snapshot (dirent.h:138); stm_fs_readdir does NOT read
+             * the child inode, so there is no cheap fresh content-version
+             * available here.
+             *
+             * L1a-2 audit F1 -- ground-truth-corrected disposition (L1b):
+             * this seam is closed on the GUEST side, not here. The Larder
+             * never populates its cache from a readdir qid (LARDER-DESIGN
+             * §3.2/§11 + specs/fs_cache.tla "MODELING ASSUMPTIONS"): it
+             * caches only from getattr/walk_attrs qids (which carry a true
+             * si_cvers), so a readdir version can never read backwards
+             * against a getattr si_cvers for the same inode. No server
+             * change is needed at v1.0 (v9fs uses the readdir qid only for
+             * qid.path + d_type).
+             *
+             * The two server-side "fixes" the audit floated both FAIL on
+             * ground truth: carrying si_cvers in the dirent record is an
+             * on-disk format break AND a stale snapshot (it never tracks
+             * the child's later content writes); a per-child stat here is
+             * a perf regression on the go-build readdir path (readdir is
+             * 30%+ of the op mix). The correct v1.x readdir-listing cache
+             * needs a per-child content-version REVALIDATION (a batched
+             * getattr/POUNCE over the listing at open), designed with that
+             * cache -- not a dirent snapshot. */
+            uint8_t qt = STM_9P_QTFILE;
+            if (batch[k].child_type == STM_DT_DIR)      qt = STM_9P_QTDIR;
+            else if (batch[k].child_type == STM_DT_LNK) qt = STM_9P_QTSYMLINK;
+            p9l_pqid(wp, qt, (uint32_t)batch[k].child_gen,
+                      qid_path(ds, batch[k].child_ino));
+            wp += STM_9P_QID_SIZE;
+            /* offset cookie — this entry's resume point is the next
+             * Treaddir's starting point. */
+            p9l_p64(wp, batch[k].next_cursor); wp += 8;
+            /* type */
+            *wp++ = batch[k].child_type;
+            /* name */
+            p9l_pstr(&wp, (const char *)batch[k].name, batch[k].name_len);
         }
-        /* qid: type from STM_DT_ → STM_9P_QT_. NOTE: this is the ONE qid
-         * emitter that keeps si_gen (child_gen) rather than si_cvers. The
-         * dirent record stores child_gen as a LINK-TIME si_gen snapshot
-         * (dirent.h:138); stm_fs_readdir does NOT read the child inode, so
-         * there is no cheap fresh content-version available here.
-         *
-         * L1a-2 audit F1 -- ground-truth-corrected disposition (L1b): this
-         * seam is closed on the GUEST side, not here. The Larder never
-         * populates its cache from a readdir qid (LARDER-DESIGN §3.2/§11 +
-         * specs/fs_cache.tla "MODELING ASSUMPTIONS"): it caches only from
-         * getattr/walk_attrs qids (which carry a true si_cvers), so a
-         * readdir version can never read backwards against a getattr
-         * si_cvers for the same inode. No server change is needed at v1.0
-         * (v9fs uses the readdir qid only for qid.path + d_type).
-         *
-         * The two server-side "fixes" the audit floated both FAIL on ground
-         * truth: carrying si_cvers in the dirent record is an on-disk format
-         * break AND a stale snapshot (it never tracks the child's later
-         * content writes); a per-child stat here is a perf regression on the
-         * go-build readdir path (readdir is 30%+ of the op mix). The correct
-         * v1.x readdir-listing cache needs a per-child content-version
-         * REVALIDATION (a batched getattr/POUNCE over the listing at open),
-         * designed with that cache -- not a dirent snapshot. */
-        uint8_t qt = STM_9P_QTFILE;
-        if (one.child_type == STM_DT_DIR)      qt = STM_9P_QTDIR;
-        else if (one.child_type == STM_DT_LNK) qt = STM_9P_QTSYMLINK;
-        p9l_pqid(wp, qt, (uint32_t)one.child_gen,
-                  qid_path(ds, one.child_ino));
-        wp += STM_9P_QID_SIZE;
-        /* offset cookie — the post-entry cursor is the next Treaddir's
-         * starting point. */
-        p9l_p64(wp, cursor); wp += 8;
-        /* type */
-        *wp++ = one.child_type;
-        /* name */
-        p9l_pstr(&wp, (const char *)one.name, one.name_len);
+        if (room && got < H_READDIR_BATCH)
+            break;                  /* short batch = exhausted (skip the
+                                     * confirming 0-entry call; the
+                                     * client's next Treaddir confirms
+                                     * EOF at the wire level) */
     }
 
     p9l_p32(count_field, (uint32_t)(wp - data_start));
