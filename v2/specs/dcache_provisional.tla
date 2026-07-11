@@ -89,9 +89,18 @@ vars == <<slot, evict_pc, entry, p_pc, p_ok>>
 
 \* A lock-free liveness read may still see "alive" until the drain
 \* completes (no happens-before edge to the map publish before then).
-\* After the drain, a wlock-section read is forced fresh by the mutex
-\* chain; a non-wlock read (Resolve) keeps only this window too — any
-\* causally-post-logout reader has a real HB edge to the evict.
+\* After the drain, a WLOCK-SECTION read (the publish's) is forced fresh
+\* by the mutex chain — that is the enforcement point, and it is modeled
+\* exactly. For the non-wlock Resolve this window is a SIMPLIFICATION,
+\* not a memory-model bound: a causally-unrelated concurrent reader's
+\* map load has no HB edge at drain-completion, so the impl genuinely
+\* permits a stale-alive resolve even after evict returns. That wider
+\* staleness is harmless by construction — it feeds only an
+\* in-flight-allowance serve plus a provisional insert whose publish is
+\* forced fresh (Insert births "prov", never "vis"; the post-done
+\* publish takes the kill arm) — and widening Resolve's guard changes
+\* neither invariant's verdict; the bound is kept only to keep traces
+\* readable.
 StaleAliveReadable == slot = "alive" \/ evict_pc = "removed"
 
 Init ==

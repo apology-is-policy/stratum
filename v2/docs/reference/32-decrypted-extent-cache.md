@@ -138,6 +138,34 @@ min(len, rec.len − slice_off)`. Because the cached entry holds the **whole**
 `rec.len`-byte plaintext, `hit + slice_off` reads within `[0, rec.len)` and
 `slice_off + slice_len ≤ rec.len` (32.4).
 
+**The provisional insert (RC-6, #35 — the F1 exact-denial close):** the HOT
+read-fetch populate births its entry probe-INVISIBLE (`sync_dcache_entry.
+visible`, a monotonic 0→1 atomic the lock-free probe skips before the key
+memcmp; a stale-clear read is a spurious MISS — refetch — never a wrong
+serve) and commits-or-kills it via `dcache_publish_hot_gated`: under ONE
+`dcache_wlock` hold, re-check `(dataset_id, key_id)` liveness in the DEK map
+(`sync_dek_slot_alive`; a short own EBR pin on the lock-free path, the
+borrowed s->lock walk on locked-context fetches), then flip the `(key, HOT)`
+entry visible (release store, paired with the probe's acquire) or remove it
+(`dcache_remove_key_locked`, the kill arm). Key-addressed, not
+pointer-addressed: an entry evicted/drained in the window is simply not
+found (fail-closed), and a dedup twin is byte-identical (I-dcache-1). The
+liveness re-check runs UNDER the flipping wlock hold — the load-bearing
+piece: a flip ordered after `stm_sync_evict_dek`'s drain observes the slot
+removal via mutex happens-before and takes the kill arm; a flip ordered
+before the drain (including one whose lock-free map read was stale-alive in
+the `dek_remove..drain` window) is wiped by the drain before evict returns.
+The split check-then-flip design is the modeled near-miss
+(`specs/dcache_provisional.tla::stale_publish` — a stale publish flips
+ANOTHER populator's post-drain provisional insert visible after evict
+returned). Visible-at-birth stays for the write-populate (its epilogue holds
+`s->lock`, which the whole evict also holds — the pre-gate is atomic with
+the insert), COLD (pool-wide `metadata_key`, no DEK dependency), and the
+test shim. A late publish that finds the slot REINSTALLED flips legitimately
+(the entry decrypted under the same key material the reinstall restored —
+equivalent to a fresh fetch); the denial contract binds the evicted state,
+not the reinstalled one.
+
 ---
 
 ## 32.4 Invariants
@@ -201,7 +229,25 @@ guaranteed by the entry guard). `dcache_bytes` is the exact sum of **linked**
 `len`s and cannot underflow (eviction subtracts a summand); retired-but-not-
 yet-reclaimed buffers transiently sit outside the budget, bounded by the EBR
 grace (`stm_ebr_try_advance` is driven from every insert). The linked
-plaintext is bounded by `min(2048 entries, 128 MiB)`.
+plaintext is bounded by `min(2048 entries, 128 MiB)`. A provisional entry
+(RC-6) occupies its slot + budget bytes while invisible — bounded by the
+same caps, evictable by the same LRU (the publish tolerates the entry
+vanishing), and never left provisional by any production path (the publish
+is straight-line after the insert; a dedup-dropped copy leaves the flip to
+the twin's own key-addressed publish).
+
+**I-dcache-6 — no post-logout serve (RC-6; the CF-5a F1 contract, exact).**
+Once `stm_sync_evict_dek` returns, no HOT entry under that dataset's key is
+probe-servable — for EVERY party, including a third reader racing an
+in-flight fetch populate. Pinned by `specs/dcache_provisional.tla`
+(`NoVisiblePostEvict` + `NoStuckProvisional`; buggy cfgs `visible_birth` =
+the pre-RC-6 three-party trace, `stale_publish` = the four-party
+split-publish trace). Runtime witnesses:
+`tests/test_corvus_mount.c::corvus_rc6_read_evict_third_party` (the
+deterministic F1 witness via the `read_postinsert` seam; revert-probed),
+`corvus_rc6_read_populate_publish` (the anti-silent-regression publish pin;
+revert-probed), `corvus_rc6_readers_vs_evict_hammer` (4 readers vs 40
+evict/install cycles, odd/even phase stamp).
 
 ---
 
@@ -304,13 +350,17 @@ cache eliminates `(N−1)/N` of the decrypt work.
 ## 32.9 Status
 
 Implemented (Area E; resized + write-populated at CF-5a; EBR-pinned lock-free
-readers at RC-1 — `docs/rc-design.md` §4, `specs/dcache_ebr.tla`): the dcache
+readers at RC-1 — `docs/rc-design.md` §4, `specs/dcache_ebr.tla`; the
+provisional insert + gated publish at RC-6 — `docs/rc-design.md` "RC-6",
+`specs/dcache_provisional.tla`): the dcache
 (`src/sync/sync.c`), the `stm_sync_dcache_stats` accessor
 (`include/stratum/sync.h`), the test hooks (`include/stratum/sync_testing.h`),
 the correctness regressions (`tests/test_fs.c`,
-`tests/test_dcache_concurrent.c`), and the crypto throughput baseline
+`tests/test_dcache_concurrent.c`, the `corvus_rc6_*` trio in
+`tests/test_corvus_mount.c`), and the crypto throughput baseline
 (`tests/bench_crypto.c`) + the BLAKE3-NEON SIMD enable
 (`third_party/CMakeLists.txt`, 2.3× integrity throughput, 32.8). Closed
 lists: `memory/audit_stratum_E_closed_list.md` (Area E),
-`audit_cf5a_closed_list` (CF-5a, in the Thylacine project memory); the RC-1
-focused audit rides the RC arc.
+`audit_cf5a_closed_list` (CF-5a, in the Thylacine project memory), the RC-1
+focused audit in the RC arc, `audit_rc6_closed_list` (RC-6, in the Thylacine
+project memory).

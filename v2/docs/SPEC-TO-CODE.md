@@ -112,7 +112,29 @@ index insert, retrying the whole op against the fresh CURRENT.
 | `RetryDeadKey(w)`      | the pruned arm: unlock → `sync_write_reserve_rollback` → the retry loop's next attempt re-resolves | Bounded (4); exhaustion degrades to the fully-locked body (sweep-immune — the RC-2 fallback precedent), so no transient escapes. Model has no bound — `EventuallyAllDone` proves the retry cannot livelock (rotations are finite); the impl's locked fallback guarantees the same termination unconditionally. |
 | `CommitBuggy(w)`       | the naive split (no re-validation)                     | Buggy cfg `no_revalidate`: TLC finds Resolve(K1) → Rotate → Sweep(K1) → CommitBuggy at depth 4 — the executable counterexample of the race found at RC-3 design review. |
 | Inv `NoDeadKeyIndexed` | every indexed record's `key_id` has a durable keyschema entry | Runtime witnesses: `tests/test_rc3_concurrent.c::rc3_write_key_liveness_retry` (deterministic, the phase-2 hook) + `rc3_writers_vs_rotate_sweep_hammer`. |
-| (out of model)         | the evict-dek populate gates                           | Evict does not prune the keyschema → not a `Sweep`; its hazard is dcache-plaintext-past-the-DEK-denial, closed by the populate gates (rc-design RC-3 as-built) + `tests/test_corvus_mount.c::corvus_rc3_{write,read}_evict_window`. |
+| (out of model)         | the evict-dek populate gates                           | Evict does not prune the keyschema → not a `Sweep`; its hazard is dcache-plaintext-past-the-DEK-denial, closed by the populate gates (write: the `s->lock` pre-gate, rc-design RC-3 as-built; read-fetch: the RC-6 provisional insert, modeled by `dcache_provisional.tla` below) + `tests/test_corvus_mount.c::corvus_rc3_{write,read}_evict_window`. |
+
+## `dcache_provisional.tla` ↔ v2 code (RC arc, spec-first — impl LANDED at RC-6, #35)
+
+Models the RC-6 provisional-insert policy (`docs/rc-design.md` "RC-6"): the
+read-fetch HOT populate births its entry probe-invisible and a
+commit-or-kill publish re-checks DEK-slot liveness UNDER the same
+`dcache_wlock` hold that flips it — the exact-denial close of the RC-3
+audit-F1 third-party residual. Written and TLC-verified BEFORE the
+implementation.
+
+| Spec variable / action | Code correspondent (RC-6, `src/sync/sync.c`)          | Notes |
+|------------------------|-------------------------------------------------------|-------|
+| `entry` = "prov"/"vis" | `sync_dcache_entry.visible` (monotonic 0→1 atomic)    | Init'd before the link (init-then-link, the RC-1 publish order); the lock-free probe skips a clear flag before the key memcmp (a stale-clear read is a spurious MISS — fail-safe). |
+| `Resolve(p)`           | the fetch's DEK copy-out (`sync_dek_lookup_copy_pinned` / the locked walk) | The stale-alive allowance covers the lock-free read's weak-memory window (see the module comment; over-approximating the window is safe — the publish is the enforcement point). |
+| `Insert(p)`            | `dcache_insert(..., visible_at_birth=false)` at the HOT fetch populate | Dedup = the model's no-op-on-present; refused inserts (oversize/OOM) = `Refuse`. |
+| `PublishFlip`/`PublishKill(p)` | `dcache_publish_hot_gated` — ONE `dcache_wlock` hold: `sync_dek_slot_alive` re-check, then the release flip OR `dcache_remove_key_locked` | THE fused action; the split check-then-flip is the modeled near-miss (buggy cfg `stale_publish` — the four-party re-insert trace). |
+| `EvictRemoveSlot` / `EvictDrain` | `stm_sync_evict_dek`: `sync_dek_remove` (map publish) → `dcache_drain` (wlock) under ONE `s->lock` hold | Split in the model so the publish-between-the-steps interleave exists; the mutex chain (drain's wlock release → publish's acquire) is what forces a post-drain publish fresh. |
+| `WriteInsert`          | the write-populate epilogue insert (`visible_at_birth=true`, pre-gated on `sync_dek_find` under `s->lock`) | Enabled only at evictor-idle in the model = the impl's s->lock exclusion of the whole evict. |
+| `EnvEvict`             | LRU pressure (`dcache_evict_locked`) + foreign-dataset drains | The publish tolerates the entry vanishing (fail-closed no-op). |
+| Inv `NoVisiblePostEvict` | I-dcache-6 (32-decrypted-extent-cache.md): post-evict-RETURN, nothing servable, for every party | Buggy cfgs: `visible_birth` (the pre-RC-6 code — the F1 three-party trace at depth 5) + `stale_publish` (depth 9). Runtime witnesses: `tests/test_corvus_mount.c::corvus_rc6_read_evict_third_party` (deterministic, revert-probed) + `corvus_rc6_readers_vs_evict_hammer`. |
+| Inv `NoStuckProvisional` | no production path strands an invisible entry (the publish is straight-line after the insert; a dedup-dropped copy leaves the flip to the twin's own publisher) | Runtime witness: `corvus_rc6_read_populate_publish` (the anti-silent-regression stats pin; revert-probed). |
+| Prop `EventuallyAllDone` | every populator terminates | Liveness witness. |
 
 ## Change process
 

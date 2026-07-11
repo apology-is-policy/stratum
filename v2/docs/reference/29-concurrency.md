@@ -455,15 +455,18 @@ stages:
   decryptable-on-reinstall) but its plaintext must not outlive the DEK
   denial: the write populate is pre-gated on DEK-slot liveness (fully
   serialized — the epilogue holds `s->lock`), and the RC-2 read-fetch
-  populate — the same window, a pre-existing RC-2 latent — now
-  insert-then-re-checks and self-removes via `dcache_remove_key` (the
-  `dcache_wlock` hand-off covers the populating thread's own
-  interleaves; a third reader's probe inside the [insert, self-remove]
-  span is the RC-3-audit-F1 transient residual — a few instructions,
-  same bytes the in-flight fetch legitimately serves — closed exactly
-  by the tracked RC-4 provisional-insert hardening; COLD populates
+  populate — the same window, a pre-existing RC-2 latent — is closed
+  EXACTLY at RC-6 (#35): the entry births probe-INVISIBLE (the
+  `visible` flag the lock-free probe skips) and
+  `dcache_publish_hot_gated` commits-or-kills it with the DEK-slot
+  liveness re-check UNDER the same `dcache_wlock` hold that flips —
+  no party can observe an unvalidated entry, retiring the
+  RC-3-audit-F1 third-party residual (`specs/dcache_provisional.tla`
+  `NoVisiblePostEvict`; the `stale_publish` buggy cfg is the
+  split-design counterexample; see 32-decrypted-extent-cache.md
+  I-dcache-6). COLD populates
   need no gate — they decrypt under the pool-wide `metadata_key`,
-  backing-path-consistent). `stm_sync_truncate` / `stm_sync_punch_range`
+  backing-path-consistent. `stm_sync_truncate` / `stm_sync_punch_range`
   keep their single-lock compounds: punch refuses crossing extents
   (pure index work — nothing to unlock); truncate's crossing-extent
   re-encrypt stays under the compound span whose R41/R55 atomicity

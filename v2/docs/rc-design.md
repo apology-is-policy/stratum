@@ -698,7 +698,7 @@ and a stale-clear read is a spurious miss, fail-safe).
 (resolve → insert → publish), a two-step evictor (slot-remove, then
 wlock-atomic drain — split so the publish-between-the-steps interleave
 exists in the model), a prober, and the visible-at-birth write path.
-Invariants: `NoServePostEvict` (no probe hit while evict has returned)
+Invariants: `NoVisiblePostEvict` (no visible entry once evict has returned)
 + `NoStuckProvisional` (all populators done ⇒ no provisional entry
 lingers). Two buggy cfgs, each the executable counterexample of a real
 design: `visible_birth` (the pre-RC-6 code — TLC finds the F1
@@ -729,6 +729,49 @@ lock-free reads only):
 
 **Non-goals**: no change to drain/evict/LRU mechanics (a provisional
 entry ages and evicts normally); no COLD gating; no promote-on-dedup.
+
+#### As-built (RC-6, 2026-07-11) — CLOSED CLEAN
+
+Landed as designed: scripture 266101f → spec 11d344f (model-first;
+TLC clean at 101 distinct/depth 7 incl. `EventuallyAllDone`;
+`visible_birth` finds the F1 three-party trace at depth 5,
+`stale_publish` the four-party trace at depth 9) → impl+tests b97278b →
+the close commit (this block + the audit's three P3 doc fixes +
+`docs/reference/29-concurrency.md` / `32-decrypted-extent-cache.md`
+[the new **I-dcache-6**: post-evict-RETURN nothing servable, every
+party] + the `docs/SPEC-TO-CODE.md` row).
+
+**The focused audit (Fable 5 prosecutor, MODEL end == Fable 5,
+independently re-ran the spec gate; + a concurrent self-audit):
+0 P0 / 0 P1 / 0 P2 / 3 P3 — NOT dirty, converged in ONE round.** The
+P3s (all doc/spec hygiene, fixed in the close commit): F1 the
+scripture's invariant-name drift (`NoServePostEvict` →
+`NoVisiblePostEvict`); F2 the missing SPEC-TO-CODE row; F3 the spec's
+stale-allowance comment over-claiming for causally-unrelated readers
+(the wider staleness is harmless — a post-done stale resolve feeds only
+an in-flight-allowance serve plus a provisional insert whose publish is
+mutex-chain-forced fresh; reworded, no impl change). The prosecutor
+could construct NO N-party interleave — four-party stale-publish,
+LRU/foreign-drain/dedup/re-install compositions, unbounded-stale
+resolves included — yielding a visible post-evict entry or a stuck
+provisional one.
+
+**Verification:** host ctest 73/73 + the RC suites 5/5 on the
+genuinely-stripped staged tree; corvus_mount 11 → 14 (the third-party
+witness + the publish stats pin both REVERT-PROBED — the pre-RC-6 code
+fails each at exactly its F1 assertion — + the readers-vs-evict
+phase-stamped hammer); a 50-iteration capturing loop under 4 CPU
+burners 0/50; gmalloc green; the spec gate 4 clean GREEN + 9 buggy RED
+across the whole RC family; guest build rc=0 (the TESTING_HOOKS=OFF
+cross-build is the ifdef-hygiene proof) + a full confirmation boot
+(boot OK, login/RECOVER/legate E2E, 0 EXTINCTION) whose dcache stats
+line — `dc=7762,1123`, an 87% hit rate — is the live in-guest witness
+that fetch-populated entries become servable through the publish (a
+broken publish would collapse hits to write-populate-only); the
+Thylacine SMP gate on the final code **40/40 PASS, 0 corruption, 0
+timing** (default+UBSan × smp4/smp8, N=10). Owed: the Linux TSan batch
+(task #13) now covers five binaries — the rc6 trio joins the
+dcache/rc2/rc3/9p_pool hammers.
 
 ### Stage 2 (DEFERRED, out of this arc): bdev multi-outstanding
 
