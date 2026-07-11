@@ -615,6 +615,121 @@ handoff tax is paid exactly where the overlap gain exists. Companion
 hardening already tracked: the provisional dcache insert
 (probe-invisible until the DEK-alive recheck; the RC-3 audit-F1 residual).
 
+### RC-6 (#35, post-arc hardening) — the provisional dcache insert
+
+Executes the hardening the RC-3 close tracked as task #35 (the close
+called it "the RC-4 hardening"; numbered RC-6 here — RC-4/RC-4b/RC-5
+were taken by the gate, the dispatcher, and the arc close). Touches the
+audited RC-1 probe/insert paths, so it lands with its own focused round.
+
+**The problem (RC-3 audit F1, P2).** The read-fetch HOT populate is
+insert-then-recheck-then-self-remove: it covers the populating thread's
+OWN interleaves against `stm_sync_evict_dek` (the `dcache_wlock`
+hand-off), but a THIRD reader whose read starts AFTER evict returns can
+probe-HIT the entry inside the [insert, self-remove] span and be served
+post-logout plaintext — a transient of a few instructions, but the
+CF-5a F1 contract asymptote is exact denial: post-evict-RETURN, no HOT
+plaintext under that dataset's key is servable.
+
+**The mechanism.** `sync_dcache_entry` gains a `visible` atomic flag
+(monotonic 0 → 1; joins `lru_tick`/`hnext` as the mutable-metadata
+exceptions to entry immutability — identity + payload stay immutable).
+
+- **Born invisible on the unlocked fetch path**: `dcache_insert` grows a
+  `visible_at_birth` parameter; the HOT read-fetch populate passes
+  false. The lock-free probe (`dcache_lookup_copy`) skips entries whose
+  `visible` flag is clear — the fail direction is a spurious MISS
+  (refetch), never a wrong serve.
+- **Commit-or-kill publish**: a new `dcache_publish_hot_gated(s, ebr,
+  key, dataset_id, key_id)` replaces the fetch site's
+  recheck-then-`dcache_remove_key`. Under ONE `dcache_wlock` hold it
+  re-checks `sync_dek_slot_alive` and either flips the (key, HOT)
+  entry visible (alive) or removes it (dead). Key-addressed, not
+  pointer-addressed: re-resolving under the wlock dodges the
+  entry-lifetime problem entirely (an entry evicted/drained in the
+  window simply isn't found — fail-closed), and a same-key twin left
+  by the dedup arm is byte-identical (the nonce-identity argument), so
+  flipping whichever entry currently carries the key is equivalent.
+
+**Why the liveness re-check must run UNDER the wlock (the design
+near-miss, spec-pinned).** A publish gated only on a pre-lock liveness
+observation re-opens the window through a FOURTH party: populator A
+observes alive; evict completes (its drain wipes A's provisional
+entry); populator D — which resolved its DEK before the evict — lands a
+new provisional insert for the same key post-drain; A's stale publish
+then flips D's entry visible AFTER evict returned, servable until D's
+own publish removes it. The wlock-atomic re-check closes every N-party
+interleave structurally: a flip ordered after the drain (wlock order)
+necessarily observes the slot removal that preceded that drain in the
+evictor's program order (mutex happens-before) and takes the remove
+arm; a flip ordered before the drain is wiped by it.
+
+**The stale-read allowance (weak-memory honesty).** A publish that wins
+the wlock BETWEEN `sync_dek_remove`'s map publish and the drain's wlock
+acquire has no happens-before edge to the removal and may read the OLD
+map (slot alive) and flip. Safe: the drain — strictly later in the
+evictor's program order — wipes the entry before `stm_sync_evict_dek`
+returns, and the invariant is scoped to post-evict-RETURN servability.
+The spec models the publish's liveness read with exactly this
+allowance (stale-alive readable until the drain completes) so the
+weak-memory case is covered, not assumed away.
+
+**What stays visible-at-birth (each argued, not defaulted):**
+
+- The **write-populate** (index-commit epilogue): the epilogue holds
+  `s->lock` and the WHOLE evict (slot remove → drain) runs under one
+  `s->lock` hold, so the existing `sync_dek_find` pre-gate is atomic
+  with the insert — the provisional dance is the unlocked path's tool.
+- **COLD populates**: decrypt under the pool-wide `metadata_key`; no
+  DEK-map dependency (backing-path-consistent, the RC-3 argument).
+- The **test shim** (`stm_sync_dcache_insert_for_test`): tests insert
+  arbitrary keys with no DEK slot to validate against.
+
+No promote-on-dedup: a visible-at-birth insert that dedup-drops against
+a provisional twin leaves the flip to the twin's own publisher — at
+worst a lost populate (best-effort cache), never a wrong visibility.
+
+**Memory orders**: flip = release store, probe = acquire load — the
+policy edge, chosen for clarity; correctness tolerates weaker (the
+entry's fields were published by the link's release store at insert,
+and a stale-clear read is a spurious miss, fail-safe).
+
+**Spec-first** (`specs/dcache_provisional.tla`): populators
+(resolve → insert → publish), a two-step evictor (slot-remove, then
+wlock-atomic drain — split so the publish-between-the-steps interleave
+exists in the model), a prober, and the visible-at-birth write path.
+Invariants: `NoServePostEvict` (no probe hit while evict has returned)
++ `NoStuckProvisional` (all populators done ⇒ no provisional entry
+lingers). Two buggy cfgs, each the executable counterexample of a real
+design: `visible_birth` (the pre-RC-6 code — TLC finds the F1
+three-party trace) and `stale_publish` (the check/flip split — TLC
+finds the four-party re-insert trace above).
+
+**Tests** (`tests/test_corvus_mount.c`; new seam
+`stm_sync_set_read_postinsert_hook_for_test`, the [insert, publish]
+twin of the prepopulate seam — same contract: no sync locks held,
+fires on locked-context fetches too, so regressions arm it around
+lock-free reads only):
+
+- `corvus_rc4_read_evict_third_party` — the deterministic F1 witness:
+  the prepopulate hook lands the evict; the postinsert hook issues a
+  re-entrant read INSIDE the window, which must FAIL (pre-fix it is
+  served from the cache — the bug, witnessed); the outer in-flight
+  read still succeeds; a final read is denied.
+- `corvus_rc4_read_populate_publish` — the anti-silent-regression pin:
+  with no evict, the in-window re-entrant read must MISS (dcache stats
+  delta — the entry is provisional), and a post-publish read must HIT.
+  A broken publish would otherwise silently turn every fetch-populate
+  into a no-op cache — correct bytes, invisible perf loss, no test red.
+- `corvus_rc4_readers_vs_evict_hammer` — N readers vs evict/install
+  cycles with an odd/even phase stamp: a read that runs entirely
+  inside an evicted-stable phase window must fail. The real-path
+  runtime witness (probe → fetch → provisional insert → publish
+  against real evicts); TSan-able later (task #13).
+
+**Non-goals**: no change to drain/evict/LRU mechanics (a provisional
+entry ages and evicts normally); no COLD gating; no promote-on-dedup.
+
 ### Stage 2 (DEFERRED, out of this arc): bdev multi-outstanding
 
 B-2 (one virtqueue request in flight) is ~7 us today (host page cache) —
