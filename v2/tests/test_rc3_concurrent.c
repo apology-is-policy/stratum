@@ -402,7 +402,6 @@ typedef struct {
     stm_sync       *s;
     uint64_t        ino;
     _Atomic size_t *write_err;
-    _Atomic size_t *ebusy_retries;
 } wrs_writer_ctx;
 
 static void *wrs_writer(void *arg)
@@ -412,15 +411,13 @@ static void *wrs_writer(void *arg)
     if (!buf) { atomic_fetch_add(c->write_err, 1u); return NULL; }
     for (uint32_t v = 1; v <= WRS_ROUNDS; v++) {
         rc3_fill_at(buf, c->ino, v, 0u, WRS_LEN);
+        /* EVERY write must succeed outright: a key-prune collision is
+         * absorbed by the bounded retry, and retry exhaustion (this
+         * hammer under host contention reached it — 4 collisions in
+         * one op) degrades to the fully-locked body, which the sweep
+         * cannot interleave. No STM_EBUSY may escape. */
         stm_status rc = stm_sync_write_extent(c->s, 1u, c->ino, 0u,
                                                  buf, WRS_LEN);
-        if (rc == STM_EBUSY) {
-            /* Legal under an adversarial rotate+sweep cadence (the
-             * bounded key-liveness retry exhausted); a real caller
-             * retries. Count it — it should stay rare. */
-            atomic_fetch_add(c->ebusy_retries, 1u);
-            rc = stm_sync_write_extent(c->s, 1u, c->ino, 0u, buf, WRS_LEN);
-        }
         if (rc != STM_OK) atomic_fetch_add(c->write_err, 1u);
         sched_yield();
     }
@@ -432,16 +429,14 @@ STM_TEST(rc3_writers_vs_rotate_sweep_hammer) {
     struct rc3_fixture f;
     rc3_fixture_open(&f, "wrs");
 
-    _Atomic size_t write_err     = 0;
-    _Atomic size_t ebusy_retries = 0;
+    _Atomic size_t write_err = 0;
 
     wrs_writer_ctx wctx[WRS_WRITERS];
     pthread_t      writers[WRS_WRITERS];
     for (int i = 0; i < WRS_WRITERS; i++) {
-        wctx[i].s             = f.sync;
-        wctx[i].ino           = (uint64_t)i + 1u;
-        wctx[i].write_err     = &write_err;
-        wctx[i].ebusy_retries = &ebusy_retries;
+        wctx[i].s         = f.sync;
+        wctx[i].ino       = (uint64_t)i + 1u;
+        wctx[i].write_err = &write_err;
         STM_ASSERT_EQ(pthread_create(&writers[i], NULL, wrs_writer,
                                        &wctx[i]), 0);
     }
@@ -466,9 +461,8 @@ STM_TEST(rc3_writers_vs_rotate_sweep_hammer) {
     for (int i = 0; i < WRS_WRITERS; i++)
         STM_ASSERT_EQ(pthread_join(writers[i], NULL), 0);
 
-    stm_test_info("rc3 wrs: cycles=%zu pruned=%zu write_err=%zu ebusy=%zu",
-                  cycles, total_pruned, atomic_load(&write_err),
-                  atomic_load(&ebusy_retries));
+    stm_test_info("rc3 wrs: cycles=%zu pruned=%zu write_err=%zu",
+                  cycles, total_pruned, atomic_load(&write_err));
 
     STM_ASSERT_EQ(atomic_load(&write_err), 0u);
 

@@ -286,7 +286,11 @@ restructure on the same pattern:
   lock hold that indexes (the sweep runs entirely under `s->lock` — no
   TOCTOU), with a bounded whole-op retry (4) against the fresh CURRENT;
   each attempt reserves fresh paddrs, so every nonce is fresh;
-  exhaustion is an honest `STM_EBUSY`. **Spec-first**:
+  exhaustion (the rc3 hammer reached it under host contention — 4
+  rotate+sweep collisions inside one op) degrades to the fully-locked
+  body, which the sweep cannot interleave — a write NEVER surfaces a
+  transient error (the RC-2 EBUSY-exhaustion → serial-fallback
+  precedent). **Spec-first**:
   `specs/write_key_liveness.tla` (clean cfg TLC-green incl. the
   `EventuallyAllDone` retry-termination witness; +
   `write_key_liveness_no_revalidate_buggy.cfg` — TLC finds

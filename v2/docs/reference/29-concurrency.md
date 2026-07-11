@@ -447,8 +447,10 @@ stages:
   un-indexed in-flight write) — closed by the epilogue's keyschema
   re-validation under the same lock hold that indexes, with a bounded
   whole-op retry against the fresh CURRENT (`write_key_liveness.tla`,
-  clean + the `no_revalidate` buggy counterexample; exhaustion = honest
-  `STM_EBUSY`). Evict-dek mid-window does NOT fail the write (the
+  clean + the `no_revalidate` buggy counterexample; exhaustion degrades
+  to the fully-locked body — sweep-immune by construction, so a write
+  never surfaces a transient, the RC-2 fallback precedent). Evict-dek
+  mid-window does NOT fail the write (the
   keyschema entry persists; the record indexes,
   decryptable-on-reinstall) but its plaintext must not outlive the DEK
   denial: the write populate is pre-gated on DEK-slot liveness (fully

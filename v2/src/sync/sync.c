@@ -6327,8 +6327,12 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
      * retries against the fresh CURRENT key — each attempt reserves
      * fresh paddrs (PENDING forbids same-gen reuse), so every
      * attempt's nonce is fresh. Exhaustion needs a full rotate+sweep
-     * landing inside every attempt's unlocked window — pathological;
-     * surface honest EBUSY.
+     * landing inside every attempt's unlocked window — reachable only
+     * under a tight admin rekey storm plus heavy contention (the rc3
+     * hammer manufactures exactly that) — and falls back to the
+     * fully-locked body, which the sweep cannot interleave, so a
+     * write NEVER surfaces a transient the caller must handle (the
+     * RC-2 EBUSY-exhaustion -> serial-fallback precedent).
      *
      * Evict-dek is NOT in this class: it removes only the in-RAM DEK
      * slot (the keyschema entry + wrapped blob persist), so a
@@ -6388,7 +6392,18 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         pthread_mutex_unlock(&s->lock);
         return rc;
     }
-    return STM_EBUSY;
+
+    /* Retry exhaustion: the rotate+sweep cadence out-paced the bounded
+     * lock-free attempts. Degrade to the pre-RC-3 single-lock span —
+     * the sweep serializes behind it, so this op cannot collide again.
+     * Progress over parallelism for one pathological op. */
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+    stm_status rc = stm_sync_write_extent_locked(s, dataset_id, ino,
+                                                    off, buf, len);
+    pthread_mutex_unlock(&s->lock);
+    return rc;
 }
 
 /* P7-11: read_extent core, lock-held variant. Caller MUST hold
