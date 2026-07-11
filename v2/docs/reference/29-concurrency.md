@@ -457,7 +457,11 @@ stages:
   serialized — the epilogue holds `s->lock`), and the RC-2 read-fetch
   populate — the same window, a pre-existing RC-2 latent — now
   insert-then-re-checks and self-removes via `dcache_remove_key` (the
-  `dcache_wlock` hand-off makes the interleave airtight; COLD populates
+  `dcache_wlock` hand-off covers the populating thread's own
+  interleaves; a third reader's probe inside the [insert, self-remove]
+  span is the RC-3-audit-F1 transient residual — a few instructions,
+  same bytes the in-flight fetch legitimately serves — closed exactly
+  by the tracked RC-4 provisional-insert hardening; COLD populates
   need no gate — they decrypt under the pool-wide `metadata_key`,
   backing-path-consistent). `stm_sync_truncate` / `stm_sync_punch_range`
   keep their single-lock compounds: punch refuses crossing extents

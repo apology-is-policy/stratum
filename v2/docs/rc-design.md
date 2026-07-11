@@ -306,11 +306,19 @@ restructure on the same pattern:
   the epilogue holds `s->lock`). The SAME window existed on the RC-2
   read fetch (a pre-existing RC-2 latent, found at RC-3 design
   review): the fetch now inserts, re-checks slot liveness, and
-  self-removes via `dcache_remove_key` — the `dcache_wlock` hand-off
-  makes every interleave clean (if the insert preceded the drain, the
-  drain wipes it; if the drain preceded the insert, the wlock
-  release/acquire edge makes the map publish visible to the re-check).
-  COLD populates are un-gated by design: COLD decrypts under the
+  self-removes via `dcache_remove_key` — for the populating thread's
+  own path the `dcache_wlock` hand-off covers every interleave (if
+  the insert preceded the drain, the drain wipes it; if the drain
+  preceded the insert, the wlock release/acquire edge makes the map
+  publish visible to the re-check). **Residual (RC-3 audit F1)**: a
+  THIRD reader's probe can hit the entry inside the
+  [insert, self-remove] span — a transient of a few instructions,
+  serving only bytes the allowed in-flight fetch concurrently holds;
+  the indefinite residency the RC-2 latent allowed is gone. Exact
+  denial needs a provisional (probe-invisible-until-validated)
+  insert — the tracked RC-4 hardening (it touches the audited RC-1
+  probe path, so it lands with its own focused round). COLD
+  populates are un-gated by design: COLD decrypts under the
   pool-wide `metadata_key` — backing-path-consistent.
 - **Truncate / punch keep their single-lock compounds.** Punch refuses
   crossing extents (`ENOTSUPPORTED`) — it is pure index work with no

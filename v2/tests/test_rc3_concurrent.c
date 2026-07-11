@@ -390,6 +390,63 @@ STM_TEST(rc3_write_key_liveness_retry) {
 }
 
 /* ========================================================================= */
+/* rc3_write_exhaustion_locked_fallback (deterministic; RC-3 audit F2)        */
+/* ========================================================================= */
+
+/* Non-disarming strike: rotate + sweep on EVERY phase-2 invocation, so
+ * every lock-free attempt's resolved key is pruned mid-window and the
+ * bounded retry EXHAUSTS — the locked fallback must carry the op (it
+ * runs no phase-2 hook and the sweep cannot interleave its single
+ * s->lock span). */
+static void klr_hook_always(void *arg)
+{
+    klr_hook_ctx *c = arg;
+    c->calls++;
+    uint64_t nk = 0, ok_ = 0;
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(c->s, 1u, rc3_wk(), NULL,
+                                                 &nk, &ok_));
+    size_t pruned_now = 0;
+    STM_ASSERT_OK(stm_sync_keyschema_sweep(c->s, 1u, &pruned_now));
+    c->pruned += pruned_now;
+    c->fired++;
+}
+
+STM_TEST(rc3_write_exhaustion_locked_fallback) {
+    struct rc3_fixture f;
+    rc3_fixture_open(&f, "exf");
+
+    klr_hook_ctx hc = { .s = f.sync };
+    stm_sync_set_write_phase2_hook_for_test(f.sync, klr_hook_always, &hc);
+
+    uint8_t *buf = malloc(4096u);
+    STM_ASSERT(buf != NULL);
+    rc3_fill_at(buf, 1u, 7u, 0u, 4096u);
+    /* Every attempt collides -> exhaustion -> the fallback. The write
+     * must still succeed outright (no STM_EBUSY may escape). */
+    STM_ASSERT_OK(stm_sync_write_extent(f.sync, 1u, 1u, 0u, buf, 4096u));
+    stm_sync_set_write_phase2_hook_for_test(f.sync, NULL, NULL);
+
+    /* All four lock-free attempts ran (the fallback calls no hook)... */
+    STM_ASSERT_EQ(hc.calls, 4);
+    /* ...and every strike really pruned the attempt's resolved key
+     * (fresh pool: each just-retired CURRENT has zero refs). */
+    STM_ASSERT_EQ(hc.pruned, 4u);
+
+    /* The record decrypts under the surviving key — the fallback
+     * indexed it inside one s->lock span (NoDeadKeyIndexed by the
+     * pre-RC-3 argument). */
+    uint8_t rbuf[4096u];
+    size_t  got = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(f.sync, 1u, 1u, 0u,
+                                          rbuf, sizeof rbuf, &got));
+    STM_ASSERT_EQ(got, sizeof rbuf);
+    STM_ASSERT_EQ(rc3_verify_ver(rbuf, 1u, 7u, 0u, got), 0u);
+
+    free(buf);
+    rc3_fixture_close(&f);
+}
+
+/* ========================================================================= */
 /* rc3_writers_vs_rotate_sweep_hammer                                         */
 /* ========================================================================= */
 

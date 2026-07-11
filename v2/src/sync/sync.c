@@ -7242,16 +7242,23 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
          * (remove slot -> dcache_drain, one s->lock hold) can run
          * entirely inside this fetch — the insert above then lands
          * AFTER the drain and post-logout cleartext would sit resident
-         * past the DEK denial (the CF-5a F1 contract). Re-check the
-         * slot AFTER the insert and self-remove on death. Airtight by
-         * the wlock hand-off: if our insert preceded the drain, the
-         * drain wipes it; if the drain preceded our insert, the
-         * drain's wlock release happens-before our insert's acquire,
-         * so everything before it — including the map publish — is
+         * past the DEK denial, INDEFINITELY (the CF-5a F1 contract).
+         * Re-check the slot AFTER the insert and self-remove on death.
+         * For THIS thread's path the wlock hand-off covers every
+         * interleave: insert-before-drain — the drain wipes it;
+         * drain-before-insert — the drain's wlock release
+         * happens-before our insert's acquire, so the map publish is
          * visible to this probe, which then removes our own entry.
-         * COLD entries need no gate: they decrypt under the pool-wide
-         * metadata_key (no DEK-map dependency), so caching them is
-         * exactly backing-path-consistent. */
+         * RESIDUAL (RC-3 audit F1): a THIRD reader's probe can hit
+         * the entry inside the [insert, self-remove] span and be
+         * served — a transient bounded by these few instructions,
+         * carrying only bytes this (allowed) in-flight fetch is
+         * concurrently serving anyway. Exact-denial closure needs a
+         * provisional (probe-invisible-until-validated) insert — the
+         * tracked RC-4 hardening. COLD entries need no gate: they
+         * decrypt under the pool-wide metadata_key (no DEK-map
+         * dependency), so caching them is exactly
+         * backing-path-consistent. */
         if (!sync_dek_slot_alive(s, ebr, rec.origin_dataset_id, rec.key_id))
             dcache_remove_key(s, hkey, STM_EXTENT_KIND_HOT);
     }
