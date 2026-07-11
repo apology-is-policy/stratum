@@ -1378,7 +1378,11 @@ STM_TEST(p9_pool_adaptive_burst_dispatches) {
     STM_ASSERT_EQ(fix_handshake(&fx, /*fid=*/0), 0);
 
     /* Both frames in one buffer, one write: at tag 920's admission the
-     * socket still holds tag 921's bytes -> pending -> dispatch. */
+     * socket still holds tag 921's bytes -> pending -> dispatch. The
+     * one-write atomic-enqueue guarantee is SIZE-BOUNDED: both frames
+     * must stay well under one skb/mbuf (~2 KiB) -- a multi-KB burst
+     * can be queued piecewise on Linux and the pending sample could
+     * see a partial first frame only (round-2 audit F1). */
     uint8_t  two[512];
     uint32_t sz1 = build_tgetattr(two, 920, 0);
     uint32_t sz2 = build_tgetattr(two + sz1, 921, 0);

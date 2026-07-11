@@ -509,6 +509,47 @@ dispatches to a worker on the pending-bytes signal alone. The fix is
 a structural change to the gate → a round-2 audit on the fix precedes
 the A/B.
 
+#### As-built (RC-4b, 2026-07-11) — CONVERGED CLEAN over 2 rounds; the flip LANDS
+
+**Round-2 audit (Fable 5, MODEL start==end): 0 P0 / 0 P1 / 0 P2 /
+1 P3** (the burst test's one-write atomic-enqueue assumption is
+size-bounded — documented in-test). The fix verified structurally
+correct: every wrong-decision direction of the pending heuristic lands
+on an already-audited path (stale-false → the blessed one-op inline
+wait; stale-true impossible — the reader is the sole fd consumer;
+dispatch-at-idle is the original CF-2a admission verbatim;
+POLLHUP/POLLERR-as-pending composes with the CF2-I8 drain;
+EINTR-fails-toward-inline is safe because pending is a performance
+signal only). The round-1 sound set holds verbatim under the new gate.
+
+**The A/B (same stratumd binary both arms — only the joey argv
+differs; same-build-day; pool snapshot-restored per boot; all four
+boots 1085/1085 + go4c + login E2E + 0 EXTINCTION):**
+
+| window (ms)  | serial (A'1, A'2) | hybrid-4 (B'1, B'2) | read |
+|---|---|---|---|
+| build cold   | 867, 872 | 933, 852 | parity (852 = best-of-day) |
+| build2-warm  | 566, 598 | 560, 556 | hybrid edges serial (both below both) |
+| gofmt-cold   | 1825, 1810 | 1844, 2082 | parity-to-noise (13% within-arm swings) |
+| gofmt-warm   | 654, 642 | 654, 673 | parity |
+
+The pure pool's disjoint +9-11% depth-1 tax is **GONE** — the RC-4b
+mechanism did its job. The mechanism witness: under the hybrid the
+cumulative bdev one-in-flight wait is 15.7-17.2 ms per boot vs
+~0.007 ms serial (with `s->lock` w0 in both) — dispatch genuinely
+engages where the client pipelines, which the self-starving first cut
+could never do. The acceptance's first clause (hybrid >= serial on
+every window, within noise) is met decisively; the second clause
+("> serial on at least the deep windows") is NOT demonstrable above
+this probe workload's noise at small N — the same structural
+limitation the RC-4 close recorded (the boot probes lack sustained
+depth). **The flip lands on the no-regression clause + the ratified
+rationale** (the RC-4b vote: an OS serves mixed-depth clients forever;
+the hybrid makes the pool unconditionally safe to enable): the
+Thylacine boot argv now passes `--fs-workers 4`, and the deep-window
+win materializes with workloads that offer sustained depth
+(multi-process builds, concurrent Procs, real NVMe).
+
 ### RC-5 — measure, gate, audit, close
 
 - The STMD26/DIAG23 instruments re-measure the gofmt + build2 + fsbench set
