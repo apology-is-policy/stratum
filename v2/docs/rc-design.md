@@ -420,6 +420,57 @@ accurate as written.
   section (its omission is how this serializer went undocumented);
   32-decrypted-extent-cache.md rewrites for RC-1; 27-fs-read-path.md updates.
 
+#### As-built (RC-5, 2026-07-11) — the arc close
+
+**Verification totals (the final tree, all on the RC-3-close code —
+RC-4/RC-5 changed no code):** the Thylacine SMP gate **40/40 PASS, 0
+corruption, 0 timing** (default+UBSan x smp4/smp8, N=10 — the cleanest
+possible); host ctest **73/73** (includes the crash/recovery suites:
+`test_crash_inject`'s 168-scenario format+mount fuzzer +
+`test_multi_stratumd_crash`); the **gmalloc-targeted pass** over the five
+RC/pool binaries (`test_dcache_concurrent` / `test_rc2_concurrent` /
+`test_rc3_concurrent` / `test_corvus_mount` / `test_9p_pool`) all green
+with GuardMalloc engaged; the spec gate green/red as of the RC-3 close
+(tree unchanged since); six instrumented guest boots (1085/1085 + go4c +
+login E2E + 0 EXTINCTION each). Per-stage focused audits closed at each
+stage (RC-1 0/0/1P2/1P3; RC-2 1P0-fixed/0/0/2P3; RC-3 0/0/1P2/1P3 — all
+NOT dirty). The owed runtime witness remains the Linux TSan pass over the
+rc2+rc3 hammers (the GCP batch, task #13) — named by the RC-3 prosecutor's
+confidence note; the reference rewrites landed incrementally at each stage
+close (29-concurrency §29.12, 32-decrypted-extent-cache §32.2-4,
+27-fs-read-path RC-2 shape, 26-fs-write-path RC-3 note).
+
+**The section-8 expectations, reconciled honestly:**
+
+- *"s->lock wait must collapse"* — **CONFIRMED**, and stronger than asked:
+  wait = 0 not just serial but UNDER THE POOL (pre-RC Boot B: 141 ms).
+- *"depth 1.6-1.9 converts to overlapped service"* — **the overlap is
+  real** (the workers reach the bdev concurrently for the first time; the
+  deep windows moved from a +7% regression to a wash; within-arm variance
+  compressed to <= 1.5%) — **but wall-neutral**.
+- *"the workers=4 A/B must flip to a win, or the arc has not done its
+  job"* — **REFUTED for the flip.** The honest reckoning: the arc DID
+  retire the serializer (its structural deliverable, proven under the
+  pool), but the acceptance line's premise — that the serializer was the
+  only thing between the workers and a win — was wrong twice over. (1)
+  The CF-2a pool's own per-op dispatch handoff costs ~9-11% on the
+  depth-1-dominated windows even with nothing left to contend on. (2) The
+  section-8 estimates ("-15-25% cold") predate the L1 Larder /
+  cached-open / CF-5a levers, which collapsed the server-visible windows
+  the estimate assumed would overlap — the overlap-able mass shrank under
+  the pool's fixed tax. The structural NOVEL claim (a
+  fully-concurrent-across-9P server on a lockless core) STANDS — the core
+  is concurrent and proven; what is missing is a dispatcher whose cost
+  model fits shallow depth.
+
+**The arc closes with `--fs-workers` OPT-IN** (the RC-4 gate's holding),
+and one design fork surfaced for the user rather than silently built:
+**adaptive dispatch** — the reader executes inline when the queue is
+empty (depth 1) and dispatches to workers only at depth >= 2, so the
+handoff tax is paid exactly where the overlap gain exists. Companion
+hardening already tracked: the provisional dcache insert
+(probe-invisible until the DEK-alive recheck; the RC-3 audit-F1 residual).
+
 ### Stage 2 (DEFERRED, out of this arc): bdev multi-outstanding
 
 B-2 (one virtqueue request in flight) is ~7 us today (host page cache) —
