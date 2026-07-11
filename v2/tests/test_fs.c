@@ -9954,6 +9954,102 @@ STM_TEST(snaps_readdir_lists_dataset_snaps) {
     unlink(g_tmp_path);
 }
 
+/* CHASE C-3 audit F3: the per-entry next_cursor contract on the SYNTH
+ * branch (SNAPS_PARENT + SNAP_VIEW), mirroring the live-branch
+ * fs_p4_readdir_next_cursor_resume properties: (a) at max_entries==1
+ * each call's *cursor out-value equals the entry's next_cursor; (b) a
+ * batched call returns the identical sequence + cursors; (c) resuming
+ * from ANY entry's next_cursor yields exactly the suffix; (d) the
+ * synth-branch dots carry next_cursor 1 / 2. */
+STM_TEST(snaps_readdir_next_cursor_resume) {
+    make_tmp("snaps_next_cursor");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1, 0755u, 0, 0, &r));
+
+    /* Content for the frozen view: 5 files in the live root, then two
+     * snapshots (so SNAPS_PARENT has 2 entries and each view has 5). */
+    for (int k = 0; k < 5; k++) {
+        uint8_t nm[3] = { 'v', (uint8_t)('0' + k), 0 };
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, r, nm, 2, 0644u, 0, 0, &ino));
+    }
+    uint64_t s1 = 0, s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "alpha", 5, &s1));
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "beta",  4, &s2));
+
+    /* The two synth dirs to prosecute: the SNAPS_PARENT itself and the
+     * "alpha" SNAP_VIEW root. Walk each with dots (flags=0) so the
+     * synth-branch dot phases are covered too (property (d)). */
+    uint64_t view_root = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, TFS_SNAPS_PARENT_INO,
+                                    (const uint8_t *)"alpha", 5, &view_root));
+    struct { uint64_t dir, parent; size_t expect; } dirs[2] = {
+        { TFS_SNAPS_PARENT_INO, 1u,        2u + 2u },   /* dots + 2 snaps  */
+        { view_root,            view_root, 2u + 5u },   /* dots + 5 files  */
+    };
+
+    for (int d = 0; d < 2; d++) {
+        /* (a) one-at-a-time reference walk: out-cursor == next_cursor. */
+        stm_fs_dirent_entry ref[12];
+        size_t ref_n = 0;
+        uint64_t cursor = 0;
+        for (int iter = 0; iter < 24; iter++) {
+            stm_fs_dirent_entry one;
+            size_t n = 0;
+            STM_ASSERT_OK(stm_fs_readdir(fs, 1, dirs[d].dir, dirs[d].parent,
+                                             0u, &cursor, &one, 1, &n));
+            if (n == 0) break;
+            STM_ASSERT_EQ(cursor, one.next_cursor);
+            STM_ASSERT_TRUE(ref_n < 12);
+            ref[ref_n++] = one;
+        }
+        STM_ASSERT_EQ(ref_n, dirs[d].expect);
+
+        /* (d) the synth-branch dots carry the post-dot phase cursors. */
+        STM_ASSERT_EQ(ref[0].next_cursor, (uint64_t)1);   /* "."  */
+        STM_ASSERT_EQ(ref[1].next_cursor, (uint64_t)2);   /* ".." */
+
+        /* (b) one batched call: identical sequence + cursors; the final
+         * *cursor equals the last entry's next_cursor. */
+        stm_fs_dirent_entry batch[12];
+        size_t bn = 0;
+        cursor = 0;
+        STM_ASSERT_OK(stm_fs_readdir(fs, 1, dirs[d].dir, dirs[d].parent,
+                                         0u, &cursor, batch, 12, &bn));
+        STM_ASSERT_EQ(bn, ref_n);
+        for (size_t i = 0; i < bn; i++) {
+            STM_ASSERT_EQ(batch[i].child_ino,   ref[i].child_ino);
+            STM_ASSERT_EQ(batch[i].next_cursor, ref[i].next_cursor);
+            STM_ASSERT_EQ(batch[i].name_len,    ref[i].name_len);
+            STM_ASSERT_TRUE(memcmp(batch[i].name, ref[i].name,
+                                       ref[i].name_len) == 0);
+        }
+        STM_ASSERT_EQ(cursor, batch[bn - 1].next_cursor);
+
+        /* (c) resume from EVERY entry's next_cursor: exactly the suffix. */
+        for (size_t i = 0; i < ref_n; i++) {
+            stm_fs_dirent_entry tail[12];
+            size_t tn = 0;
+            uint64_t rc2 = ref[i].next_cursor;
+            STM_ASSERT_OK(stm_fs_readdir(fs, 1, dirs[d].dir, dirs[d].parent,
+                                             0u, &rc2, tail, 12, &tn));
+            STM_ASSERT_EQ(tn, ref_n - i - 1);
+            for (size_t j = 0; j < tn; j++) {
+                STM_ASSERT_EQ(tail[j].child_ino,   ref[i + 1 + j].child_ino);
+                STM_ASSERT_EQ(tail[j].next_cursor, ref[i + 1 + j].next_cursor);
+            }
+        }
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 /* Lookup of a snap name under SNAPS_PARENT resolves to the synthetic
  * SNAP_VIEW root inode. Missing-name → STM_ENOENT. */
 STM_TEST(snaps_lookup_by_name_resolves_snap_root) {

@@ -5665,11 +5665,18 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
             uint64_t inner_cursor = local_cursor - 2u;
             /* Per-entry inner calls so each entry's next_cursor is the
              * exact inner cursor after that entry (the +2 fs-phase
-             * mapping). The synth namespaces are small (snapshot
-             * listings) and stay under fs->global for the whole batch,
-             * so the 1-at-a-time loop costs one lock hold either way. */
+             * mapping). SNAPS_PARENT listings are small (bounded by
+             * snapshot count); a SNAP_VIEW dir is a frozen copy of an
+             * arbitrary directory, so its per-entry at_root re-scan
+             * cost is an ACCEPTED fs-tier cost here (the sole
+             * production consumer, h_readdir, previously called this
+             * path one entry at a time anyway -- cost-identical; a
+             * future batched at_root arm needs the at_root variant to
+             * surface per-entry cursors, which it already does via
+             * hash_probe). Both hold fs->global for the whole batch. */
             while (emitted < max_entries) {
                 size_t got1 = 0;
+                uint64_t pre = inner_cursor;
                 stm_status s;
                 if (fs_ino_is_snaps_parent(dir_ino)) {
                     s = fs_snaps_parent_readdir(fs, dataset_id, &inner_cursor,
@@ -5685,7 +5692,19 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
                     pthread_rwlock_unlock(&fs->global);
                     return s;
                 }
-                if (got1 == 0) break;
+                if (got1 == 0) {
+                    /* got1 == 0 with an ADVANCED cursor is a skipped
+                     * entry, not exhaustion: the snap-view translator
+                     * drops a record whose synth encoding saturates
+                     * (frozen_ino >= 2^32) AFTER the at_root layer
+                     * advanced the cursor past it. Step over it and
+                     * keep iterating -- the pre-batch code absorbed
+                     * such skips inside one batched inner call, and
+                     * terminating here would truncate the listing at
+                     * the skipped entry permanently (audit C-3 F1). */
+                    if (inner_cursor == pre) break;    /* exhausted */
+                    continue;                          /* skipped */
+                }
                 out_entries[emitted].next_cursor =
                     (inner_cursor > UINT64_MAX - 2u)
                         ? UINT64_MAX : (inner_cursor + 2u);
