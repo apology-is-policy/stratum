@@ -315,35 +315,85 @@ static pool_slot *pool_find_free_locked(fs_pool *p)
     return NULL;
 }
 
-/* Read the 4-byte size header, idle-aware: an SO_RCVTIMEO expiry
- * (EAGAIN/EWOULDBLOCK) with ZERO bytes consumed and work still in
- * flight means the client is quietly waiting for a pipelined batch —
- * not idle — so retry. An expiry with the connection fully idle is a
- * real idle timeout (fatal, matching the serial loop). An expiry
- * MID-header is a stalled sender mid-frame — always fatal (a retry
- * could not resynchronize the stream). Returns 0 / +1 (clean EOF
- * before any byte) / -errno. */
-static int pool_read_header(fs_pool *p, uint8_t *buf)
+/* T4-A-1: the buffered frame reader. The unbuffered loop paid two
+ * read(2) syscalls per frame (the 4-byte size header, then the body);
+ * on the guest AF_UNIX srvconn path each read is a full syscall
+ * round-trip, and the T4-M frame-loop brackets priced the pair at
+ * ~55-60 ms body-read per S3 build window. One reader-private buffer
+ * collapses that: a single read pulls whatever the socket holds (up
+ * to the cap) and frames are carved out of it — a pipelined burst
+ * amortizes one syscall over many frames, and even the serial depth-1
+ * case does one read per frame instead of two (the client writes
+ * frames whole). A frame larger than the buffered bytes reads its
+ * remainder directly into the frame allocation, so big Twrite
+ * payloads are never double-copied.
+ *
+ * Semantics preserved exactly from the unbuffered pair:
+ *   - SO_RCVTIMEO idle-awareness: EAGAIN with the buffer at a frame
+ *     BOUNDARY and work in flight → retry (the client is quietly
+ *     waiting for replies, not idle); at a boundary and idle → fatal
+ *     idle timeout; MID-frame (a partial prefix buffered) → fatal, a
+ *     stalled sender cannot be resynchronized.
+ *   - clean EOF only at a frame boundary; EOF mid-frame → -EPIPE.
+ * The buffer is READER-PRIVATE (only stm_fs_pool_serve's thread
+ * touches it — no lock). RC-4b's depth signal consults it FIRST:
+ * buffered bytes ARE a pipelined next frame (the audit-F1 self-starve
+ * rule; see pool_socket_pending). */
+
+#define POOL_RDBUF_CAP (64u * 1024u)
+
+typedef struct {
+    uint8_t  *b;        /* heap, POOL_RDBUF_CAP */
+    uint32_t  pos;      /* consume cursor */
+    uint32_t  end;      /* fill cursor (pos <= end <= cap) */
+} pool_rdbuf;
+
+/* One read(2) into the buffer tail (compacting the consumed prefix
+ * first when the tail is full). Returns bytes added (>0), 0 on EOF,
+ * -errno (EINTR retried here; EAGAIN passed up — the caller knows
+ * whether the stream sits at a frame boundary). */
+static ssize_t pool_rdbuf_fill(fs_pool *p, pool_rdbuf *rb)
 {
-    size_t done = 0;
-    while (done < 4u) {
-        ssize_t n = read(p->fd, buf + done, 4u - done);
-        if (n == 0)
-            return (done == 0) ? 1 : -EPIPE;
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if ((errno == EAGAIN || errno == EWOULDBLOCK) && done == 0) {
-                bool busy;
-                pool_lock(p);
-                busy = (p->n_inflight > 0) && !p->dead;
-                pool_unlock(p);
-                if (busy) continue;
-            }
-            return -errno;
-        }
-        done += (size_t)n;
+    if (rb->pos == rb->end) {
+        rb->pos = 0;
+        rb->end = 0;
+    } else if (rb->end == POOL_RDBUF_CAP) {
+        memmove(rb->b, rb->b + rb->pos, rb->end - rb->pos);
+        rb->end -= rb->pos;
+        rb->pos  = 0;
     }
-    return 0;
+    for (;;) {
+        ssize_t n = read(p->fd, rb->b + rb->end,
+                         (size_t)(POOL_RDBUF_CAP - rb->end));
+        if (n > 0) { rb->end += (uint32_t)n; return n; }
+        if (n == 0) return 0;
+        if (errno == EINTR) continue;
+        return -errno;
+    }
+}
+
+/* Ensure >= need bytes buffered without consuming them. Returns 0 on
+ * success, +1 on clean EOF (only at a frame boundary), -errno fatal
+ * (EOF mid-frame → -EPIPE; idle timeout / mid-frame stall → -EAGAIN,
+ * exactly the unbuffered pool_read_header rules). */
+static int pool_rdbuf_ensure(fs_pool *p, pool_rdbuf *rb, uint32_t need)
+{
+    for (;;) {
+        uint32_t avail = rb->end - rb->pos;
+        if (avail >= need) return 0;
+        ssize_t n = pool_rdbuf_fill(p, rb);
+        if (n > 0) continue;
+        if (n == 0)
+            return (avail == 0u) ? 1 : -EPIPE;
+        if ((n == -EAGAIN || n == -EWOULDBLOCK) && avail == 0u) {
+            bool busy;
+            pool_lock(p);
+            busy = (p->n_inflight > 0) && !p->dead;
+            pool_unlock(p);
+            if (busy) continue;     /* waiting on replies, not idle */
+        }
+        return (int)n;
+    }
 }
 
 /* RC-4b: is another frame (or part of one) already buffered on the
@@ -353,16 +403,20 @@ static int pool_read_header(fs_pool *p, uint8_t *buf)
  * while executing inline, so every op would inline forever and the
  * pool would degenerate to the serial loop at every depth. Buffered
  * bytes mean the client has pipelined: dispatch, and the burst
- * overlaps. Zero-timeout poll rather than ioctl(FIONREAD) — the guest
- * stratumd's AF_UNIX fd is a pouch srvconn stream where SYS_POLL is
- * wired and FIONREAD is not. POLLHUP/POLLERR also report "pending":
- * the dispatched op proceeds and the reader discovers EOF/error on its
- * next header read — the normal teardown path. A probe failure
- * reports "not pending" (fail toward inline == the serial-equivalent
- * behavior). */
-static bool pool_socket_pending(int fd)
+ * overlaps. T4-A-1: the READER BUFFER is consulted first — bytes
+ * already pulled out of the socket are exactly as pipelined as bytes
+ * still in it (skipping this check would re-open the F1 self-starve
+ * through the buffer). Then a zero-timeout poll rather than
+ * ioctl(FIONREAD) — the guest stratumd's AF_UNIX fd is a pouch
+ * srvconn stream where SYS_POLL is wired and FIONREAD is not.
+ * POLLHUP/POLLERR also report "pending": the dispatched op proceeds
+ * and the reader discovers EOF/error on its next header read — the
+ * normal teardown path. A probe failure reports "not pending" (fail
+ * toward inline == the serial-equivalent behavior). */
+static bool pool_socket_pending(const fs_pool *p, const pool_rdbuf *rb)
 {
-    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    if (rb->end != rb->pos) return true;
+    struct pollfd pfd = { .fd = p->fd, .events = POLLIN };
     return poll(&pfd, 1, 0) > 0;
 }
 
@@ -527,6 +581,16 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
         pthread_mutex_destroy(&p->mu); free(p); return STM_ENOMEM;
     }
 
+    /* T4-A-1: the reader-private frame buffer. */
+    pool_rdbuf rb = { .b = malloc(POOL_RDBUF_CAP), .pos = 0, .end = 0 };
+    if (!rb.b) {
+        free(wh);
+        pthread_mutex_destroy(&p->write_mu);
+        pthread_cond_destroy(&p->slot_cv);
+        pthread_cond_destroy(&p->work_cv);
+        pthread_mutex_destroy(&p->mu); free(p); return STM_ENOMEM;
+    }
+
     uint32_t n_started = 0;
     for (uint32_t i = 0; i < workers; i++) {
         wh[i].pool = p;
@@ -547,7 +611,6 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
     /* A partial pool (n_started < workers) serves correctly — the
      * worker count is a throughput knob, not a correctness one. */
 
-    uint8_t hdr[4];
     uint8_t inline_resp[4096];
     bool    clean_eof = false;
 
@@ -564,7 +627,7 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
         pool_unlock(p);
         if (dead) break;
 
-        int r = pool_read_header(p, hdr);
+        int r = pool_rdbuf_ensure(p, &rb, 4u);
         if (r == 1) { clean_eof = true; break; }
         if (r != 0) {
             pool_lock(p);
@@ -573,7 +636,7 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
             break;
         }
 
-        uint32_t size = stratumd_decode_le32(hdr);
+        uint32_t size = stratumd_decode_le32(rb.b + rb.pos);
 
         /* Frame gate: the NEGOTIATED msize (spec-conformant; stricter
          * than the serial loop's msize_max leniency — documented,
@@ -595,8 +658,19 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
             pool_unlock(p);
             break;
         }
-        memcpy(frame, hdr, 4u);
-        r = stratumd_read_full(fd, frame + 4, size - 4u);
+        /* Body: consume the buffered prefix, then read any remainder
+         * straight into the frame (big Twrite payloads skip the
+         * buffer — no double copy; EAGAIN mid-frame is fatal there,
+         * the unbuffered body-read rule, via stratumd_read_full). */
+        {
+            uint32_t avail = rb.end - rb.pos;
+            uint32_t have  = (avail < size) ? avail : size;
+            memcpy(frame, rb.b + rb.pos, have);
+            rb.pos += have;
+            r = (have < size)
+                    ? stratumd_read_full(fd, frame + have, size - have)
+                    : 0;
+        }
         if (r != 0) {
             free(frame);
             pool_lock(p);
@@ -651,7 +725,7 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
          * the scripture's blessed item-3 semantics. On the dispatch
          * path the syscall cost is noise against the handoff that
          * follows. */
-        bool next_pending = pool_socket_pending(p->fd);
+        bool next_pending = pool_socket_pending(p, &rb);
 
         /* Admission. */
         pool_lock(p);
@@ -806,6 +880,7 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
     if (p->dead) rc = p->fatal_rc;
     else if (!clean_eof) rc = STM_EIO;
 
+    free(rb.b);
     free(ilr);
     free(wh);
     pthread_mutex_destroy(&p->write_mu);
