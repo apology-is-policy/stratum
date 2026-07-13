@@ -283,6 +283,13 @@ size_t stm_dirty_buffer_inode_bytes(stm_dirty_buffer *buf,
  */
 size_t stm_dirty_buffer_total_bytes(stm_dirty_buffer *buf);
 
+/* T4-A-2 shelf diagnostics: how often the range data-buffer shelf served
+ * an insert (hits) vs fell to a fresh malloc (misses). The shelf reuses
+ * drained ranges' buffers so the insert memcpy runs on resident,
+ * TLB-warm pages instead of demand-zero-faulting fresh ones. */
+void stm_dirty_buffer_shelf_stats(stm_dirty_buffer *buf,
+                                    uint64_t *hits, uint64_t *misses);
+
 /*
  * Return the total buffered block footprint across all inodes (the pool space
  * a full flush reserves; #40 admission's currency). Concurrency: takes buf->mu.

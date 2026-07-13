@@ -53,6 +53,10 @@
 typedef struct stm_dbuf_range {
     uint64_t                off;
     uint64_t                len;
+    uint64_t                cap;      /* data allocation size (>= len; a
+                                       * shelf-reused buffer keeps its true
+                                       * capacity so re-shelving never
+                                       * shrinks the shelf's metadata) */
     uint8_t                *data;     /* owned */
     struct stm_dbuf_range  *next;
 } stm_dbuf_range;
@@ -66,6 +70,21 @@ typedef struct stm_dbuf_inode {
     struct stm_dbuf_inode  *bucket_next;
 } stm_dbuf_inode;
 
+/* T4-A-2 (task #58): the range data-buffer shelf. The insert band was
+ * measured COPY-bound at ~2.3 GB/s -- demand-zero-fault speed, not
+ * memcpy speed: every big insert malloc'd a fresh buffer and first-
+ * touched all its pages inside the payload memcpy (one fault per 4 KiB
+ * page). Freed range buffers >= DBUF_SHELF_MIN park here (bounded
+ * slots; every alloc/free site already holds buf->mu), so the dominant
+ * homogeneous ~127 KiB flush class reuses resident, TLB-warm pages and
+ * the copy runs at memory speed. A reused buffer's stale prior bytes
+ * are unreachable: every consumer serves within [0, r->len) and the
+ * insert memcpys exactly that window. Worst-case shelf residency is
+ * DBUF_SHELF_SLOTS x the largest shelved cap (24 x ~256 KiB ~= 6 MiB),
+ * owned by the buffer and freed at destroy. */
+#define DBUF_SHELF_SLOTS 24u
+#define DBUF_SHELF_MIN   (32u * 1024u)
+
 struct stm_dirty_buffer {
     pthread_mutex_t   mu;
     size_t            inode_cap;
@@ -73,6 +92,10 @@ struct stm_dirty_buffer {
     size_t            total_bytes;
     uint64_t          total_footprint_blocks; /* #40: sum of inodes' footprint */
     stm_dbuf_inode   *buckets[STM_DBUF_BUCKETS];
+    struct { uint8_t *p; uint64_t cap; } shelf[DBUF_SHELF_SLOTS];
+    uint32_t          shelf_n;
+    uint64_t          shelf_hits;    /* shelf_alloc served from the shelf */
+    uint64_t          shelf_misses;  /* shelf_alloc fell to malloc */
 };
 
 /* ───────────────────────────── helpers ────────────────────────────── */
@@ -114,11 +137,54 @@ static stm_dbuf_inode *get_or_create_inode_locked(stm_dirty_buffer *buf,
     return e;
 }
 
-static void free_range(stm_dbuf_range *r)
+/* Free a range, shelving its data buffer for reuse when it is big
+ * enough to matter and the shelf has room (caller holds buf->mu). */
+static void free_range(stm_dirty_buffer *buf, stm_dbuf_range *r)
 {
     if (!r) return;
-    free(r->data);
+    if (r->data && r->cap >= DBUF_SHELF_MIN
+        && buf->shelf_n < DBUF_SHELF_SLOTS) {
+        buf->shelf[buf->shelf_n].p   = r->data;
+        buf->shelf[buf->shelf_n].cap = r->cap;
+        buf->shelf_n++;
+    } else {
+        free(r->data);
+    }
     free(r);
+}
+
+/* Shelf-first data-buffer alloc (caller holds buf->mu). Reuse a parked
+ * buffer when len fits within its capacity with bounded slack
+ * (cap/2 <= len keeps the waste under 2x; the homogeneous flush class
+ * matches near-exactly). *cap_out records the TRUE allocation size for
+ * the range's cap field. */
+static uint8_t *shelf_alloc(stm_dirty_buffer *buf, uint64_t len,
+                              uint64_t *cap_out)
+{
+    for (uint32_t i = 0; i < buf->shelf_n; i++) {
+        uint64_t cap = buf->shelf[i].cap;
+        if (len <= cap && len >= cap / 2u) {
+            uint8_t *ptr = buf->shelf[i].p;
+            buf->shelf_n--;
+            buf->shelf[i] = buf->shelf[buf->shelf_n];
+            *cap_out = cap;
+            buf->shelf_hits++;
+            return ptr;
+        }
+    }
+    *cap_out = len;
+    buf->shelf_misses++;
+    return malloc((size_t)len);
+}
+
+void stm_dirty_buffer_shelf_stats(stm_dirty_buffer *buf,
+                                    uint64_t *hits, uint64_t *misses)
+{
+    if (!buf) { if (hits) *hits = 0; if (misses) *misses = 0; return; }
+    pthread_mutex_lock(&buf->mu);
+    if (hits)   *hits   = buf->shelf_hits;
+    if (misses) *misses = buf->shelf_misses;
+    pthread_mutex_unlock(&buf->mu);
 }
 
 /* Unlink + free entire inode entry. */
@@ -131,7 +197,7 @@ static void destroy_inode_locked(stm_dirty_buffer *buf, stm_dbuf_inode *e)
     stm_dbuf_range *r = e->head;
     while (r) {
         stm_dbuf_range *n = r->next;
-        free_range(r);
+        free_range(buf, r);
         r = n;
     }
     buf->total_bytes -= e->bytes;
@@ -219,7 +285,7 @@ void stm_dirty_buffer_destroy(stm_dirty_buffer *buf)
             stm_dbuf_range *r = e->head;
             while (r) {
                 stm_dbuf_range *rn = r->next;
-                free_range(r);
+                free_range(buf, r);
                 r = rn;
             }
             free(e);
@@ -227,6 +293,9 @@ void stm_dirty_buffer_destroy(stm_dirty_buffer *buf)
         }
         buf->buckets[b] = NULL;
     }
+    for (uint32_t i = 0; i < buf->shelf_n; i++)
+        free(buf->shelf[i].p);
+    buf->shelf_n = 0;
     pthread_mutex_unlock(&buf->mu);
     pthread_mutex_destroy(&buf->mu);
     free(buf);
@@ -316,8 +385,9 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     if (!newr) goto oom;
     newr->off = off;
     newr->len = len;
+    newr->cap = 0;
     newr->next = NULL;
-    newr->data = malloc((size_t)len);
+    newr->data = shelf_alloc(buf, len, &newr->cap);
     if (!newr->data) goto oom;
     memcpy(newr->data, data, (size_t)len);
 
@@ -326,8 +396,9 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
         if (!headr) goto oom;
         headr->off = first_ov->off;
         headr->len = head_len;
+        headr->cap = 0;
         headr->next = NULL;
-        headr->data = malloc((size_t)head_len);
+        headr->data = shelf_alloc(buf, head_len, &headr->cap);
         if (!headr->data) goto oom;
         memcpy(headr->data, first_ov->data, (size_t)head_len);
     }
@@ -336,8 +407,9 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
         if (!tailr) goto oom;
         tailr->off = end;
         tailr->len = tail_len;
+        tailr->cap = 0;
         tailr->next = NULL;
-        tailr->data = malloc((size_t)tail_len);
+        tailr->data = shelf_alloc(buf, tail_len, &tailr->cap);
         if (!tailr->data) goto oom;
         memcpy(tailr->data, last_ov->data + (last_ov->len - tail_len),
                (size_t)tail_len);
@@ -366,7 +438,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
             uint64_t sp = blocks_spanned(r->off, r->len);
             e->footprint_blocks         -= sp;
             buf->total_footprint_blocks -= sp;
-            free_range(r);
+            free_range(buf, r);
             continue;
         }
         if (r->off >= end) break;   /* insertion point reached */
@@ -592,7 +664,7 @@ static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
             uint64_t sp = blocks_spanned(done->off, done->len);
             e->footprint_blocks         -= sp;
             buf->total_footprint_blocks -= sp;
-            free_range(done);
+            free_range(buf, done);
         }
     }
     return STM_OK;

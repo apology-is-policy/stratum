@@ -597,4 +597,45 @@ STM_TEST(dbuf_footprint_zero_after_full_drain)
     stm_dirty_buffer_destroy(b);
 }
 
+/* T4-A-2: a drained range's data buffer is REUSED by a subsequent
+ * big insert (the shelf: resident, TLB-warm pages instead of a fresh
+ * demand-zero-faulting malloc), and the reused buffer serves the NEW
+ * bytes exactly -- no stale-byte leak from the prior occupant. Fails
+ * without the shelf: hits stays 0. */
+STM_TEST(dbuf_shelf_reuses_drained_buffers)
+{
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+
+    enum { BIG = 64u * 1024u };
+    uint8_t *w1 = malloc(BIG), *w2 = malloc(BIG), *out = malloc(BIG);
+    STM_ASSERT_TRUE(w1 && w2 && out);
+    memset(w1, 0xA5, BIG);
+    memset(w2, 0x3C, BIG);
+
+    /* Insert a shelf-eligible range (>= DBUF_SHELF_MIN), drain it
+     * (free_range shelves the buffer), then insert again at the same
+     * size class: the second alloc must come from the shelf. */
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 7, 0, BIG, w1));
+    drain_recorder rec = {0};
+    STM_ASSERT_OK(stm_dirty_buffer_drain_ino(b, 1, 7, drain_record_cb, &rec));
+
+    uint64_t h0 = 0, m0 = 0;
+    stm_dirty_buffer_shelf_stats(b, &h0, &m0);
+
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 7, 0, BIG, w2));
+    uint64_t h1 = 0, m1 = 0;
+    stm_dirty_buffer_shelf_stats(b, &h1, &m1);
+    STM_ASSERT_TRUE(h1 > h0);           /* the reuse actually happened */
+
+    /* Byte-exactness on the reused buffer: only w2's bytes serve. */
+    size_t covered = 0;
+    STM_ASSERT_OK(stm_dirty_buffer_lookup(b, 1, 7, 0, BIG, out, &covered));
+    STM_ASSERT_EQ(covered, (size_t)BIG);
+    STM_ASSERT_EQ(memcmp(out, w2, BIG), 0);
+
+    free(w1); free(w2); free(out);
+    stm_dirty_buffer_destroy(b);
+}
+
 STM_TEST_MAIN("test_dirty_buffer")
