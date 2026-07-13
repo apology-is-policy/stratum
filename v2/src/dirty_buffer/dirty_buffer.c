@@ -79,7 +79,11 @@ typedef struct stm_dbuf_inode {
  * homogeneous ~127 KiB flush class reuses resident, TLB-warm pages and
  * the copy runs at memory speed. A reused buffer's stale prior bytes
  * are unreachable: every consumer serves within [0, r->len) and the
- * insert memcpys exactly that window. Worst-case shelf residency is
+ * insert memcpys exactly that window. (Detectability caveat inherent
+ * to any reuse pool: a reused buffer is cap >= len bytes, so a
+ * hypothetical consumer over-read past len would return stale bytes
+ * where a fresh exact-len malloc would ASan-trap -- the byte-exactness
+ * regression leg guards the real hazard.) Worst-case shelf residency is
  * DBUF_SHELF_SLOTS x the largest shelved cap (24 x ~256 KiB ~= 6 MiB),
  * owned by the buffer and freed at destroy. */
 #define DBUF_SHELF_SLOTS 24u

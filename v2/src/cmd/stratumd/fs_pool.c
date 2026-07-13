@@ -375,7 +375,10 @@ static ssize_t pool_rdbuf_fill(fs_pool *p, pool_rdbuf *rb)
 /* Ensure >= need bytes buffered without consuming them. Returns 0 on
  * success, +1 on clean EOF (only at a frame boundary), -errno fatal
  * (EOF mid-frame → -EPIPE; idle timeout / mid-frame stall → -EAGAIN,
- * exactly the unbuffered pool_read_header rules). */
+ * exactly the unbuffered pool_read_header rules). CONTRACT: need <=
+ * POOL_RDBUF_CAP - a full buffer never fills (avail >= need short-
+ * circuits), so the read(fd, ., 0)-misread-as-EOF shape is unreachable;
+ * a future caller with need > CAP would break that. */
 static int pool_rdbuf_ensure(fs_pool *p, pool_rdbuf *rb, uint32_t need)
 {
     for (;;) {
@@ -600,6 +603,7 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
     }
     if (n_started == 0) {
         /* Could not start a single worker — no pool to run. */
+        free(rb.b);
         free(wh);
         pthread_mutex_destroy(&p->write_mu);
         pthread_cond_destroy(&p->slot_cv);
