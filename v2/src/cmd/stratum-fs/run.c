@@ -752,8 +752,16 @@ static int put_tree(stm_9p_client *c, uint32_t dir_fid, const char *local_path,
             ret = EXIT_IO; break;
         }
         if (S_ISDIR(st.st_mode)) {
+            /* Carry the host directory's permission bits (TLY task #50:
+             * a world-writable staged game dir -- Quake's config.cfg
+             * lands there as the session user -- must stay writable in
+             * the pool; a hardcoded 0755 silently dropped the bake's
+             * chmod). Regular files below keep the exec-bit-derived
+             * 0755/0644 normalization (host artifacts carry odd modes;
+             * content-derived is the deliberate policy there). */
             stm_9p_qid q;
-            stm_status rc = stm_9p_mkdir(c, dir_fid, de->d_name, 0755u,
+            stm_status rc = stm_9p_mkdir(c, dir_fid, de->d_name,
+                                             (uint32_t)(st.st_mode & 0777u),
                                              (uint32_t)getgid(), &q);
             if (rc != STM_OK && rc != STM_EEXIST) {
                 perr("put mkdir", rc); ret = status_to_exit(rc); break;
@@ -802,7 +810,11 @@ static int cmd_put(stm_9p_client *c, int argc, char **argv)
                                     qids, &walked);
     if (rc != STM_OK) { perr("put walk remote parent", rc); return status_to_exit(rc); }
     stm_9p_qid q;
-    rc = stm_9p_mkdir(c, WORK_FID, leaf, 0755u, (uint32_t)getgid(), &q);
+    /* The remote base carries the local root's mode bits too (the
+     * put_tree child-dir rule, applied to the tree root; lst holds the
+     * already-verified stat of local_dir from the entry check). */
+    uint32_t base_mode = (uint32_t)(lst.st_mode & 0777u);
+    rc = stm_9p_mkdir(c, WORK_FID, leaf, base_mode, (uint32_t)getgid(), &q);
     (void)stm_9p_clunk(c, WORK_FID);
     if (rc != STM_OK && rc != STM_EEXIST) {
         perr("put mkdir remote base", rc); return status_to_exit(rc);
