@@ -779,8 +779,42 @@ static int put_tree(stm_9p_client *c, uint32_t dir_fid, const char *local_path,
             uint32_t mode = (st.st_mode & 0111u) ? 0755u : 0644u;
             ret = put_one_file(c, dir_fid, de->d_name, child, mode, buf, bufsz);
             if (ret != 0) break;
+        } else if (S_ISLNK(st.st_mode)) {
+            /* Recreate the link, do not follow it. A rootfs is mostly
+             * symlinks -- Alpine's /bin/sh IS one -- so dropping them
+             * produces an image whose shell does not exist. st_size is the
+             * target length for a link, but it can go stale between the
+             * lstat and the readlink, so size the buffer from PATH_MAX and
+             * treat a full buffer as truncation rather than trusting it. */
+            char target[4096];
+            ssize_t tlen = readlink(child, target, sizeof target - 1);
+            if (tlen < 0) {
+                fprintf(stderr, "stratum-fs: put: readlink %s: %s\n",
+                        child, strerror(errno));
+                ret = EXIT_IO; break;
+            }
+            if ((size_t)tlen >= sizeof target - 1) {
+                fprintf(stderr, "stratum-fs: put: symlink target too long at %s\n",
+                        child);
+                ret = EXIT_IO; break;
+            }
+            target[tlen] = '\0';
+            stm_9p_qid q;
+            stm_status rc = stm_9p_symlink(c, dir_fid, de->d_name, target,
+                                               (uint32_t)getgid(), &q);
+            if (rc != STM_OK && rc != STM_EEXIST) {
+                perr("put symlink", rc); ret = status_to_exit(rc); break;
+            }
         } else {
-            fprintf(stderr, "stratum-fs: put: skipping non-regular %s\n", child);
+            /* Device nodes, sockets, FIFOs. Still not carried -- but a HARD
+             * error now, not a skip. This arm used to swallow symlinks too,
+             * and because it left `ret` alone the whole put exited 0 with the
+             * links missing: a green ledger over an incomplete image. If a
+             * corpus legitimately contains one of these, that is a decision
+             * to make deliberately, not one to discover from a boot failure. */
+            fprintf(stderr, "stratum-fs: put: %s is not a file, directory, or "
+                            "symlink -- refusing to silently omit it\n", child);
+            ret = EXIT_IO; break;
         }
     }
     closedir(d);
