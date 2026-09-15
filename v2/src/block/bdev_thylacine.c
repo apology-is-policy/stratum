@@ -283,7 +283,12 @@ static inline int64_t t_irq_create(uint32_t intid, uint32_t rights)
 
 static inline int64_t t_irq_wait(int64_t handle)
 {
-    return syscall(__NR_irq_wait, (long)handle);
+    /* SYS_IRQ_WAIT gained x1 = timeout_ns (0 = wait forever) in the Thylacine
+       kernel (F-A1). musl's varargs syscall() loads x1 from the 2nd arg, so it
+       MUST be passed explicitly here -- an omitted arg leaves x1 indeterminate,
+       which the kernel would read as a bogus timeout. 0 = the pre-change
+       (block-until-IRQ) semantics this driver relies on. */
+    return syscall(__NR_irq_wait, (long)handle, 0L);
 }
 
 static inline int64_t t_dma_create(uint64_t size, uint32_t rights)
