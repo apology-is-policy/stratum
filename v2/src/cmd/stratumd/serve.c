@@ -1629,11 +1629,21 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
             (void)stm_fs_unmount(fs);
             return rc;
         }
-        /* Stamp daemon's effective uid as admin so the operator who
-         * starts stratumd has admin access on /ctl/. Without this,
-         * only uid 0 would qualify even if the daemon runs under a
-         * non-root operator. */
-        (void)stm_ctl_set_admin_uid(ctl, (uid_t)geteuid());
+        /* A-6: the admin identity is CONFIGURED, never INFERRED.
+         * Only set it when the operator NAMED a principal; otherwise
+         * leave stm_ctl_create's (uid_t)-1, which denies.
+         *
+         * This used to be `stm_ctl_set_admin_uid(ctl, geteuid())`. That
+         * inference is sound on Linux, where the daemon's euid names the
+         * daemon -- and wrong on Thylacine, where PRINCIPAL_SYSTEM is a
+         * SHARED TCB identity, so it would have granted /ctl admin to
+         * init, the warden and every boot service at once. It was masked
+         * until now only because pouch's geteuid() returned an -ENOSYS
+         * sentinel that matched no principal; making that call TRUTHFUL
+         * (the other half of A-6) would have turned the latent grant
+         * live. Both halves land together for that reason. */
+        if (opts->admin_uid_set)
+            (void)stm_ctl_set_admin_uid(ctl, opts->admin_uid);
 
         /* TLY-A5-impl-1c: optional corvus principal. When the
          * operator passed --corvus-admin-uid, that uid is admitted

@@ -38,10 +38,23 @@
  *     stm_9p_server_create (FS) / stm_ctl_conn_create (/ctl/).
  *     Auth backend plug-ins (factotum / SASL / token per ARCH
  *     §10.10.3) are forward-noted.
- *   - stm_ctl admin policy: stratumd calls
- *     `stm_ctl_set_admin_uid(c, geteuid())` ONCE at startup, BEFORE
- *     any worker pthread spawn. The pthread_create barrier
- *     guarantees workers see the post-set value (R97 P2-2 carry).
+ *   - stm_ctl admin policy: the admin identity is CONFIGURED, never
+ *     INFERRED. stratumd calls `stm_ctl_set_admin_uid(c, ...)` ONCE at
+ *     startup, BEFORE any worker pthread spawn, and ONLY when the
+ *     operator passed `--admin-uid` -- otherwise admin_uid stays at its
+ *     stm_ctl_create default of (uid_t)-1, which DENIES. The
+ *     pthread_create barrier guarantees workers see the post-set value
+ *     (R97 P2-2 carry).
+ *
+ *     It used to pass `geteuid()`. That is the Linux-shaped answer and
+ *     it is wrong on Thylacine (A-6, IDENTITY-DESIGN section 9.10):
+ *     PRINCIPAL_SYSTEM there is a SHARED TCB identity rather than one
+ *     daemon, so inferring admin from the daemon's own euid would hand
+ *     /ctl admin to every SYSTEM-principal peer -- init, the warden,
+ *     every boot service. On Linux `euid == admin` is sound because the
+ *     euid names the daemon; under a shared-TCB identity model it names
+ *     the whole trusted base. Hence a NAMED principal, the Plan 9
+ *     hostowner idiom.
  *
  * /ctl/ scope (S5-PRE-A): stratumd attaches `stm_fs *` at
  * stm_ctl_create, attaches `stm_fs_pool(fs)` via
@@ -326,6 +339,20 @@ typedef struct stm_stratumd_opts {
      * for non-Thylacine deployments). */
     bool        corvus_admin_uid_set;
     uid_t       corvus_admin_uid;
+
+    /* A-6 (Thylacine IDENTITY-DESIGN section 9.10): the /ctl admin
+     * principal, NAMED by the operator rather than inferred from the
+     * daemon's effective uid. When `admin_uid_set` is false the daemon
+     * does NOT call stm_ctl_set_admin_uid at all, so admin_uid keeps
+     * stm_ctl_create's (uid_t)-1 and `ctl_caller_is_admin` denies every
+     * caller except uid 0 -- FAIL CLOSED, and identical to the behaviour
+     * every Thylacine deployment already had, because geteuid() there
+     * returned a sentinel that matched no principal.
+     *
+     * Set by --admin-uid. Immutable after startup, same posture as
+     * corvus_admin_uid and system_uid above. */
+    bool        admin_uid_set;
+    uid_t       admin_uid;
 
     /* Auth fallback policy (R95 P2-2). When peer-credential
      * resolution fails (platform without SO_PEERCRED / getpeereid),

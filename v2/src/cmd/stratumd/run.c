@@ -208,6 +208,9 @@ static void usage(const char *argv0)
         "                           verbs (provision/install/evict-dek; A-5b).\n"
         "                           Decoupled from --bake-owner-uid. N <= 4294967294;\n"
         "                           omit -> verbs fail closed.\n"
+        "  --admin-uid <N>          /ctl admin principal, NAMED (A-6). Omit ->\n"
+        "                           no admin (fail closed). NOT inferred from\n"
+        "                           the daemon euid. N <= 4294967294.\n"
         "  -h, --help               This message\n");
 }
 
@@ -269,6 +272,9 @@ int stm_cmd_stratumd_main(int argc, char **argv)
     /* TLY-A5b (#827): /ctl SYSTEM-principal uid; (uid_t)-1 -> fail-closed
      * (DEK verbs unusable). Set by --system-uid, decoupled from bake-owner. */
     opts.system_uid = (uid_t)-1;
+    /* A-6: admin is OPT-IN. Unset => stm_ctl's (uid_t)-1 => deny. */
+    opts.admin_uid_set = false;
+    opts.admin_uid = (uid_t)-1;
 
     bool want_passphrase_stdin = false;
 
@@ -430,6 +436,34 @@ int stm_cmd_stratumd_main(int argc, char **argv)
                 return 1;
             }
             opts.system_uid = (uid_t)v;
+            continue;
+        }
+        if (!strcmp(a, "--admin-uid") && i + 1 < argc) {
+            /* A-6 (Thylacine IDENTITY-DESIGN section 9.10): the /ctl
+             * admin principal, NAMED rather than inferred from the
+             * daemon's euid. Omitting it leaves admin_uid unset, which
+             * DENIES -- the safe default, and the behaviour every
+             * Thylacine deployment already had. */
+            const char *arg = argv[++i];
+            if (*arg < '0' || *arg > '9') {
+                fprintf(stderr,
+                    "stratumd: invalid --admin-uid: %s "
+                    "(expected non-empty unsigned integer)\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            char *end = NULL;
+            unsigned long long v = strtoull(arg, &end, 10);
+            if (!end || *end != '\0'
+                || v > (unsigned long long)((uid_t)-2)) {
+                fprintf(stderr,
+                    "stratumd: invalid --admin-uid: %s "
+                    "(must be <= 4294967294)\n", arg);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            opts.admin_uid = (uid_t)v;
+            opts.admin_uid_set = true;
             continue;
         }
         if (!strcmp(a, "--bake-owner-gid") && i + 1 < argc) {
