@@ -128,13 +128,21 @@ throughput). A slot is the registry entry AND the queue element:
 ### 3.3 Inline ops (reader-executed, never queued)
 
 - **Tflush (the S5 contract):** look up oldtag in the registry.
-  QUEUED -> mark cancelled, free its frame, Rflush. EXECUTING -> set
-  flush_pending (the worker completes but discards the reply), WAIT
-  for the slot to reach FREE, then Rflush. REPLYING -> too late to
-  discard; WAIT for the write to drain, then Rflush (strict CF2-I2).
-  Unknown oldtag (fully completed or never seen) -> Rflush
-  immediately. Ordering: Rflush is written strictly
-  after the flushed op's reply is sent or discarded — the 9P contract.
+  QUEUED -> mark cancelled, free its frame, Rflush. EXECUTING or
+  REPLYING -> WAIT for the slot to reach FREE, then Rflush: the op has
+  run, so its reply goes out first (strict CF2-I2). Unknown oldtag
+  (fully completed or never seen) -> Rflush immediately. Ordering:
+  Rflush is written strictly after the flushed op's reply is sent, or
+  after the op was cancelled while queued -- the 9P contract.
+  An op that ran is never answered by the Rflush alone (2026-09-29).
+  flush(5): "a completed request may signify a state change in the
+  server", and the client must honour a reply that arrives before the
+  Rflush. A Twalk that ran bound its new fid on the server, and only
+  its Rwalk tells the client, which then clunks the fid (Thylacine
+  `docs/FID-LIFECYCLE-DESIGN.md` section 9). Until 2026-09-29 the
+  worker discarded the reply of an op flushed while it executed, so
+  such a fid stayed on the server, unknown to the client, until the
+  connection ended.
   The wait is bounded (every handler is finite; see §2). The reader
   stalls while waiting — acceptable: Tflush is rare (the kernel client
   sends it only on death/abandon paths), and head-of-line stall is
@@ -505,13 +513,13 @@ stm_xattr_list-fallback rarity trade).
 ## 7. Invariants (the audit prosecutes these)
 
 - **CF2-I1 (reply integrity):** every admitted request produces exactly
-  one wire reply UNLESS flushed-before-reply (then exactly zero) or the
-  connection latches dead; every reply is a single atomic write_full
+  one wire reply UNLESS flushed while queued (it never executes; then
+  exactly zero) or the connection latches dead; every reply is a single atomic write_full
   under the writer mutex; a tag is reusable only after its reply or
   Rflush (the I-10 analog, server-side).
 - **CF2-I2 (Tflush ordering):** Rflush is written only after the
-  flushed request's reply is sent or discarded. A flushed-while-queued
-  op never executes.
+  flushed request's reply is sent. A flushed-while-queued op never
+  executes and never replies; an op that executed always replies.
 - **CF2-I3 (fid pin):** no fid slot is released or repurposed-to-FREE
   while pinned; every pin is released on every path (incl. handler
   error paths); clunk/version/destroy observe busy == 0 at release.
@@ -547,8 +555,8 @@ multi-threaded-writer-process reality).
 - `tests/test_9p_pool.c` (new): drives fs_pool directly over a
   socketpair with a raw-frame client. Cases: pipelined mixed ops
   (reads/writes/getattrs) with out-of-order completion tolerance;
-  Tflush of QUEUED (never executes, CF2-I2), of EXECUTING (reply
-  discarded — deterministic via a stall hook, see below), of UNKNOWN
+  Tflush of QUEUED (never executes, CF2-I2), of EXECUTING (its reply
+  precedes the Rflush — deterministic via a stall hook, see below), of UNKNOWN
   (immediate Rflush); duplicate in-flight tag -> connection-fatal;
   Tversion mid-pipeline (barrier + clunk-all + msize renegotiate);
   frame > negotiated msize -> fatal; clean-EOF drain (send batch,

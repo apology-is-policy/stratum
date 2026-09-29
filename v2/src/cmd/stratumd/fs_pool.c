@@ -10,16 +10,18 @@
  *   read frame                      pop slot (FIFO ring)
  *   Tversion  -> barrier + inline   [cancelled/dead -> discard]
  *   Tflush    -> cancel/wait+Rflush stm_9p_server_handle
- *   Tattach   -> policy gate        [flush_pending -> discard reply]
+ *   Tattach   -> policy gate
  *   else      -> admit to a slot    write reply under write_mu
  *                (bounded: 64 slots mark slot FREE + broadcast
  *                + queued-bytes budget)
  *
  * The slot table doubles as the in-flight registry (Tflush's lookup
  * domain). Exactly one wire reply per admitted request UNLESS flushed
- * before its reply was started (then exactly zero) or the connection
+ * while queued (it never executes; then exactly zero) or the connection
  * latches dead (CF2-I1). Rflush is written only after the flushed
- * request's reply is sent or permanently discarded (CF2-I2).
+ * request's reply is sent (CF2-I2): a request that ran may have changed
+ * server state -- a Twalk bound its new fid -- and flush(5) has the
+ * client honour a reply that arrives before the Rflush.
  *
  * Locking: pool.mu guards every slot/ring/counter field; write_mu
  * serializes frame writes. Never nested (mu is always released before
@@ -72,7 +74,6 @@ typedef enum {
 typedef struct {
     slot_state state;
     bool       cancelled;       /* Tflush hit it while QUEUED */
-    bool       flush_pending;   /* Tflush hit it while EXECUTING */
     uint16_t   tag;
     uint8_t    type;
     uint8_t   *req;             /* heap frame, exact wire size */
@@ -177,7 +178,6 @@ static void *pool_worker_main(void *arg)
             sl->req   = NULL;
             sl->state = SLOT_FREE;
             sl->cancelled = false;
-            sl->flush_pending = false;
             p->n_inflight--;
             pthread_cond_broadcast(&p->slot_cv);
             continue;
@@ -198,7 +198,6 @@ static void *pool_worker_main(void *arg)
                 sl->req   = NULL;
                 sl->state = SLOT_FREE;
                 sl->cancelled = false;
-                sl->flush_pending = false;
                 p->n_inflight--;
                 pthread_cond_broadcast(&p->slot_cv);
                 continue;   /* holding mu */
@@ -224,9 +223,10 @@ static void *pool_worker_main(void *arg)
                 pool_latch_dead_locked(
                     p, (hrc == STM_OK) ? STM_EPROTOCOL : hrc);
             } else {
-                send = !sl->flush_pending && !p->dead;
-                /* else: flushed while executing (reply discarded) or
-                 * dead (peer gone) — the op completes reply-less. */
+                /* A flushed op that ran replies too, ahead of its
+                 * Rflush (CF2-I2): the Tflush handler waits for this
+                 * slot to drain. Only a dead peer gets no reply. */
+                send = !p->dead;
             }
 
             /* Retire the TAG before the reply write: state REPLYING is
@@ -255,7 +255,6 @@ static void *pool_worker_main(void *arg)
             sl->req   = NULL;
             sl->state = SLOT_FREE;
             sl->cancelled = false;
-            sl->flush_pending = false;
             p->n_inflight--;
             pthread_cond_broadcast(&p->slot_cv);
         }
@@ -468,15 +467,11 @@ static int pool_handle_flush(fs_pool *p, const uint8_t *frame,
             /* Never executes; a worker discards it on pop. Rflush may
              * go out immediately — the flushed op will never reply. */
             sl->cancelled = true;
-        } else if (sl && sl->state == SLOT_EXECUTING) {
-            /* Discard its reply, then wait for completion. */
-            sl->flush_pending = true;
-            while (sl->state != SLOT_FREE && !p->dead)
-                pthread_cond_wait(&p->slot_cv, &p->mu);
-        } else if (sl && sl->state == SLOT_REPLYING) {
-            /* Too late to discard — the reply is committed and its
-             * write is in flight. Wait for the slot to drain so the
-             * Rflush below is ordered after it (CF2-I2). */
+        } else if (sl && (sl->state == SLOT_EXECUTING ||
+                          sl->state == SLOT_REPLYING)) {
+            /* It ran, or is running: its reply goes out, and the
+             * Rflush below waits for the slot to drain so it follows
+             * that reply (CF2-I2). */
             while (sl->state != SLOT_FREE && !p->dead)
                 pthread_cond_wait(&p->slot_cv, &p->mu);
         }
@@ -845,7 +840,6 @@ stm_status stm_fs_pool_serve(int fd, stm_9p_server *srv,
 
         sl->state         = SLOT_QUEUED;
         sl->cancelled     = false;
-        sl->flush_pending = false;
         sl->tag           = tag;
         sl->type          = type;
         sl->req           = frame;

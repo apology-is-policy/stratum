@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -75,28 +76,45 @@ static int send_all(int fd, const uint8_t *buf, uint32_t len)
     return 0;
 }
 
-/* Receive one frame. Returns 0, or -EPIPE on EOF/short, -errno else. */
+/* Every wait on an expected event is bounded, so an event that never comes
+ * fails the test instead of hanging the suite (the harness's asserts are
+ * soft: a test runs on past a failure into its next wait). */
+#define WAIT_MS 10000
+
+/* One read of at most n bytes, waiting at most WAIT_MS for the first. */
+static ssize_t read_bounded(int fd, uint8_t *p, uint32_t n)
+{
+    for (;;) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, WAIT_MS);
+        if (pr == 0) return -ETIMEDOUT;
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        ssize_t r = read(fd, p, n);
+        if (r < 0 && errno == EINTR) continue;
+        return r < 0 ? -errno : r;
+    }
+}
+
+/* Receive one frame. Returns 0, or -EPIPE on EOF/short, -ETIMEDOUT when
+ * no byte came for WAIT_MS, -errno else. */
 static int recv_frame(int fd, uint8_t *buf, uint32_t cap, uint32_t *out_len)
 {
     uint32_t done = 0;
     while (done < 4u) {
-        ssize_t n = read(fd, buf + done, 4u - done);
+        ssize_t n = read_bounded(fd, buf + done, 4u - done);
         if (n == 0) return -EPIPE;
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -errno;
-        }
+        if (n < 0) return (int)n;
         done += (uint32_t)n;
     }
     uint32_t size = load_u32(buf);
     if (size < 7u || size > cap) return -EPROTO;
     while (done < size) {
-        ssize_t n = read(fd, buf + done, size - done);
+        ssize_t n = read_bounded(fd, buf + done, size - done);
         if (n == 0) return -EPIPE;
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -errno;
-        }
+        if (n < 0) return (int)n;
         done += (uint32_t)n;
     }
     *out_len = size;
@@ -308,13 +326,25 @@ static void stall_pre_handle(void *arg, uint16_t tag, uint8_t type)
     pthread_mutex_unlock(&c->mu);
 }
 
-/* Block until n ops are parked in the hook. */
+static struct timespec wait_deadline(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += WAIT_MS / 1000;
+    return ts;
+}
+
+/* Block until n ops are parked in the hook (WAIT_MS at most). */
 static void stall_await_entered(stall_ctl *c, int n)
 {
+    struct timespec dl = wait_deadline();
     pthread_mutex_lock(&c->mu);
     while (c->n_entered < n)
-        pthread_cond_wait(&c->cv, &c->mu);
+        if (pthread_cond_timedwait(&c->cv, &c->mu, &dl) == ETIMEDOUT) break;
+    int entered = c->n_entered;
     pthread_mutex_unlock(&c->mu);
+    if (entered < n)
+        stm_test_fail(__FILE__, __LINE__, "%d of %d ops parked", entered, n);
 }
 
 /* on_fatal hook + its waiter: order a park release strictly AFTER the
@@ -332,10 +362,13 @@ static void stall_on_fatal(void *arg, stm_status rc)
 
 static void stall_await_fatal(stall_ctl *c)
 {
+    struct timespec dl = wait_deadline();
     pthread_mutex_lock(&c->mu);
     while (!c->fatal_seen)
-        pthread_cond_wait(&c->cv, &c->mu);
+        if (pthread_cond_timedwait(&c->cv, &c->mu, &dl) == ETIMEDOUT) break;
+    bool seen = c->fatal_seen;
     pthread_mutex_unlock(&c->mu);
+    if (!seen) stm_test_fail(__FILE__, __LINE__, "the connection never died");
 }
 
 static void stall_release(stall_ctl *c)
@@ -471,9 +504,12 @@ STM_TEST(p9_pool_flush_unknown_tag) {
     STM_ASSERT_EQ(fx.sc.rc, STM_OK);
 }
 
-/* Tflush of an EXECUTING op: its reply is DISCARDED; only Rflush
- * arrives; the connection keeps working (CF2-I1 + I2). */
-STM_TEST(p9_pool_flush_executing_discards_reply) {
+/* Tflush of an EXECUTING op: the op ran, so its reply goes out, and the
+ * Rflush follows it (CF2-I1 + I2). A reply the server drops after the op
+ * ran hides a state change from the client -- a Twalk's new fid bound on
+ * the server -- which flush(5) has the client honour. The connection
+ * keeps working. */
+STM_TEST(p9_pool_flush_executing_replies_first) {
     pool_fix fx;
     stall_ctl st;
     uint16_t park[1] = { 300 };
@@ -491,20 +527,13 @@ STM_TEST(p9_pool_flush_executing_discards_reply) {
                              build_tflush(buf, 51, 300)), 0);
     stall_release(&st);
 
-    /* Two LEGAL wire outcomes (the reader's flush processing races the
-     * released worker's completion — both sides are correct 9P):
-     *   A (flush won):  Rflush(51) only — the reply was discarded;
-     *   B (worker won): Rgetattr(300) first, THEN Rflush(51) — the op
-     *     completed before the flush was seen; CF2-I2 requires the
-     *     reply to PRECEDE the Rflush, never follow it.
-     * In practice A dominates (the idle reader processes the queued
-     * Tflush in microseconds); both must be sound. */
+    /* The reply first, whether the reader saw the Tflush before the
+     * released worker finished or after: the op ran either way. */
     uint32_t rlen = 0;
     STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
-    if (buf[4] == STM_9P_RGETATTR) {           /* outcome B */
-        STM_ASSERT_EQ(load_u16(buf + 5), 300);
-        STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
-    }
+    STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
+    STM_ASSERT_EQ(load_u16(buf + 5), 300);
+    STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
     STM_ASSERT_EQ(buf[4], STM_9P_RFLUSH);
     STM_ASSERT_EQ(load_u16(buf + 5), 51);
 
