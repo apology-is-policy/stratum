@@ -60,11 +60,16 @@ struct stm_ds_policy_table;
  * (must not block, must not re-enter the pool); non-NULL + returning
  * true suppresses the inline fast path for that op, forcing worker
  * dispatch — how the parking tests keep their parked ops on worker
- * threads, and how the depth>=2 arm is driven deterministically. */
+ * threads, and how the depth>=2 arm is driven deterministically.
+ * on_flush_wait fires (under the pool mutex; must not block or re-enter
+ * the pool) when a Tflush finds its target EXECUTING or REPLYING, before
+ * it waits for that slot to drain — a test releases a parked op only
+ * after it, so the flush has provably classified the op as running. */
 typedef struct stm_fs_pool_test_hooks {
     void (*pre_handle)(void *arg, uint16_t tag, uint8_t type);
     void (*on_fatal)(void *arg, stm_status rc);
     bool (*force_dispatch)(void *arg);
+    void (*on_flush_wait)(void *arg, uint16_t oldtag);
     void  *arg;
 } stm_fs_pool_test_hooks;
 

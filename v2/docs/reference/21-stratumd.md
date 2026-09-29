@@ -215,10 +215,10 @@ read frame (idle-aware header:      pop slot from the FIFO ring
  when fully idle)                     resp buffer (sized to the
 Tversion → barrier (drain all),       negotiated msize, re-sized at
  handle inline, republish msize       the version barrier)
-Tflush   → cancel QUEUED +Rflush;    flush_pending → discard reply
+Tflush   → cancel QUEUED +Rflush;    dead peer → no reply,
  wait EXECUTING/REPLYING, then       else REPLYING (tag retired for
  Rflush (ordered after the            admission — tag-0 reuse is
- flushed op's reply/discard)          race-free) → write_full under
+ flushed op's reply)                  race-free) → write_full under
                                       write_mu → FREE + broadcast
 Tattach  → policy gate inline
 else     → admit: 64 slots, dup-
@@ -231,7 +231,7 @@ else     → admit: 64 slots, dup-
 Teardown: clean EOF drains (queued + executing ops reply — a client
 may half-close and still read); errors abandon the queue; reader joins
 every worker BEFORE `stm_9p_server_destroy` + `close(fd)`. Exactly one
-reply per admitted request, zero for flushed-before-reply. The pool is
+reply per admitted request, zero for flushed-while-queued. The pool is
 STRICTER than the serial loop in two documented ways: frames above the
 negotiated msize (serial: msize_max) and duplicate in-flight tags
 (serial: unobservable) are connection-fatal. A test hook
@@ -386,8 +386,8 @@ session token is loaded into an mlock'd buffer for the WRAP and
   socketpair (the test hook parks chosen tags inside a worker, so
   flush-of-EXECUTING / worker-overlap / queued-cancellation are test-
   scheduled): pipelined exactly-once storm, provable 2-worker
-  overlap, Tflush of unknown/EXECUTING (both legal outcomes:
-  discard-then-Rflush or reply-then-Rflush — never Rflush-first)/
+  overlap, Tflush of unknown/EXECUTING (the op ran: its reply, then
+  the Rflush — never Rflush-first, never the Rflush alone)/
   QUEUED (never executes; Rflush precedes worker release), tag reuse
   straight after a queued-flush (the self-audit F1 regression —
   non-vacuity proven by reverting the lookup fix), a 5000-op

@@ -472,6 +472,8 @@ static int pool_handle_flush(fs_pool *p, const uint8_t *frame,
             /* It ran, or is running: its reply goes out, and the
              * Rflush below waits for the slot to drain so it follows
              * that reply (CF2-I2). */
+            if (g_test_hooks.on_flush_wait)
+                g_test_hooks.on_flush_wait(g_test_hooks.arg, oldtag);
             while (sl->state != SLOT_FREE && !p->dead)
                 pthread_cond_wait(&p->slot_cv, &p->mu);
         }

@@ -63,15 +63,16 @@ serial (deliberately out of CF-2's scope).
   the wire, never unbounded allocation. The frame-size gate is the
   negotiated msize.
 - **Reply integrity (CF2-I1):** every admitted request produces exactly one
-  reply unless flushed-before-reply (exactly zero) or the connection latches
-  dead. Every reply is a single atomic `stratumd_write_full` under the
+  reply unless flushed while queued (it never executes: exactly zero) or the
+  connection latches dead. Every reply is a single atomic `stratumd_write_full` under the
   connection's **`write_mu`** (fs_pool.c:247) — the single-writer guarantee
   the Thylacine kernel srvconn server-send path assumes (the #354-class S12
   re-verification: stratumd never issues two concurrent writes on one fd).
 - **Flush state machine (CF2-I2):** slots move QUEUED → EXECUTING →
   REPLYING → FREE. A Tflush of a QUEUED op cancels it (it never executes);
-  of an EXECUTING op, waits and discards the reply; Rflush is written only
-  after the flushed op's reply is sent or discarded. The REPLYING state
+  of an EXECUTING op, waits for its reply to go out; Rflush is written only
+  after the flushed op's reply is sent (flush(5): an op that ran is
+  answered). The REPLYING state
   exists so a completed-tag's slot stays findable by Tflush until its reply
   has committed to the wire while the TAG becomes reusable the instant the
   reply lands (the in-chunk F2 tag-0 completion race fix — split lookup).

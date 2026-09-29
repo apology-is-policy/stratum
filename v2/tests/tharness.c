@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: ISC */
 #include "tharness.h"
 
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,10 @@ void stm_test_info(const char *fmt, ...)
 
 int stm_test_run_all(const char *suite_name)
 {
+    /* A socket test whose server died must fail on its write's EPIPE and
+     * report, not be killed by SIGPIPE with every later test unreported. */
+    (void)signal(SIGPIPE, SIG_IGN);
+
     /* Reverse list to restore declaration order. */
     stm_test_entry *list = NULL;
     for (stm_test_entry *e = g_head; e; ) {

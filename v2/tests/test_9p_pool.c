@@ -11,8 +11,9 @@
  * dependence anywhere (the flake-dismissal discipline).
  *
  * Invariants exercised: CF2-I1 (exactly one reply per admitted op,
- * zero for flushed-before-reply), CF2-I2 (Rflush ordering; a
- * flushed-while-queued op never executes), CF2-I4 (Tversion barrier),
+ * zero for flushed-while-queued), CF2-I2 (Rflush ordering: an op that
+ * ran replies first; a flushed-while-queued op never executes),
+ * CF2-I4 (Tversion barrier),
  * CF2-I6 (frame gate), CF2-I7 (serial-vs-pool byte equivalence),
  * CF2-I8 (clean-EOF drain).
  */
@@ -78,8 +79,11 @@ static int send_all(int fd, const uint8_t *buf, uint32_t len)
 
 /* Every wait on an expected event is bounded, so an event that never comes
  * fails the test instead of hanging the suite (the harness's asserts are
- * soft: a test runs on past a failure into its next wait). */
-#define WAIT_MS 10000
+ * soft: a test runs on past a failure into its next wait, so a loop that
+ * collects replies stops at its first failure). The pool answers in
+ * microseconds; 2 s leaves a sanitizer's slowdown room and keeps a broken
+ * pool's failed waits inside the binary's ctest TIMEOUT. */
+#define WAIT_MS 2000
 
 /* One read of at most n bytes, waiting at most WAIT_MS for the first. */
 static ssize_t read_bounded(int fd, uint8_t *p, uint32_t n)
@@ -98,14 +102,16 @@ static ssize_t read_bounded(int fd, uint8_t *p, uint32_t n)
     }
 }
 
-/* Receive one frame. Returns 0, or -EPIPE on EOF/short, -ETIMEDOUT when
- * no byte came for WAIT_MS, -errno else. */
+/* Receive one frame. Returns 0, or -EPIPE when the peer closed (EOF, a
+ * short frame, or the reset Linux delivers when the peer closed with our
+ * bytes still unread), -ETIMEDOUT when no byte came for WAIT_MS, -errno
+ * else. */
 static int recv_frame(int fd, uint8_t *buf, uint32_t cap, uint32_t *out_len)
 {
     uint32_t done = 0;
     while (done < 4u) {
         ssize_t n = read_bounded(fd, buf + done, 4u - done);
-        if (n == 0) return -EPIPE;
+        if (n == 0 || n == -ECONNRESET) return -EPIPE;
         if (n < 0) return (int)n;
         done += (uint32_t)n;
     }
@@ -113,7 +119,7 @@ static int recv_frame(int fd, uint8_t *buf, uint32_t cap, uint32_t *out_len)
     if (size < 7u || size > cap) return -EPROTO;
     while (done < size) {
         ssize_t n = read_bounded(fd, buf + done, size - done);
-        if (n == 0) return -EPIPE;
+        if (n == 0 || n == -ECONNRESET) return -EPIPE;
         if (n < 0) return (int)n;
         done += (uint32_t)n;
     }
@@ -250,7 +256,10 @@ static bool fix_up(pool_fix *fx, const char *tag, uint32_t workers)
 }
 
 /* Close the client side (EOF to the pool), join, unmount. The serve
- * thread closes its own fd. */
+ * thread closes its own fd. The join is the one unbounded wait: a pool
+ * that never exits is caught by the binary's ctest TIMEOUT, because
+ * giving up on the join would leave a pool thread running against a
+ * fixture (and a parked hook's stack) the test is about to free. */
 static void fix_down(pool_fix *fx)
 {
     if (fx->client_fd >= 0) close(fx->client_fd);
@@ -291,6 +300,7 @@ typedef struct {
     int      n_entered;
     uint16_t entered[STALL_MAX];
     bool     fatal_seen;        /* on_fatal fired (first dead latch) */
+    bool     flush_waiting;     /* on_flush_wait fired */
 } stall_ctl;
 
 static void stall_init(stall_ctl *c, const uint16_t *tags, int n)
@@ -371,6 +381,32 @@ static void stall_await_fatal(stall_ctl *c)
     if (!seen) stm_test_fail(__FILE__, __LINE__, "the connection never died");
 }
 
+/* on_flush_wait hook + its waiter: order a park release strictly AFTER a
+ * Tflush found the parked op running, so the flush of an executing op
+ * is driven, never raced against the op's completion. Runs under the
+ * POOL mutex — touches only the ctl's own mutex. */
+static void stall_on_flush_wait(void *arg, uint16_t oldtag)
+{
+    (void)oldtag;
+    stall_ctl *c = arg;
+    pthread_mutex_lock(&c->mu);
+    c->flush_waiting = true;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void stall_await_flush_wait(stall_ctl *c)
+{
+    struct timespec dl = wait_deadline();
+    pthread_mutex_lock(&c->mu);
+    while (!c->flush_waiting)
+        if (pthread_cond_timedwait(&c->cv, &c->mu, &dl) == ETIMEDOUT) break;
+    bool seen = c->flush_waiting;
+    pthread_mutex_unlock(&c->mu);
+    if (!seen)
+        stm_test_fail(__FILE__, __LINE__, "the Tflush never waited on its op");
+}
+
 static void stall_release(stall_ctl *c)
 {
     pthread_mutex_lock(&c->mu);
@@ -392,6 +428,7 @@ static void stall_install(stall_ctl *c)
 {
     stm_fs_pool_test_hooks h = { .pre_handle     = stall_pre_handle,
                                  .force_dispatch = stall_force_dispatch,
+                                 .on_flush_wait  = stall_on_flush_wait,
                                  .arg            = c };
     stm_fs_pool_set_test_hooks(&h);
 }
@@ -438,7 +475,9 @@ STM_TEST(p9_pool_pipeline_getattr_storm) {
     memset(seen, 0, sizeof seen);
     for (int i = 0; i < N; i++) {
         uint32_t rlen = 0;
-        STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+        int rc = recv_frame(fx.client_fd, buf, sizeof buf, &rlen);
+        STM_ASSERT_EQ(rc, 0);
+        if (rc != 0) break;
         STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
         uint16_t tag = load_u16(buf + 5);
         STM_ASSERT_TRUE(tag >= 100 && tag < 100 + N);
@@ -477,7 +516,9 @@ STM_TEST(p9_pool_workers_overlap) {
 
     for (int i = 0; i < 2; i++) {
         uint32_t rlen = 0;
-        STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+        int rc = recv_frame(fx.client_fd, buf, sizeof buf, &rlen);
+        STM_ASSERT_EQ(rc, 0);
+        if (rc != 0) break;
         STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
     }
 
@@ -525,10 +566,12 @@ STM_TEST(p9_pool_flush_executing_replies_first) {
 
     STM_ASSERT_EQ(send_all(fx.client_fd, buf,
                              build_tflush(buf, 51, 300)), 0);
+    stall_await_flush_wait(&st);           /* the Tflush found 300 running */
     stall_release(&st);
 
-    /* The reply first, whether the reader saw the Tflush before the
-     * released worker finished or after: the op ran either way. */
+    /* The flush met the op while it ran (a pool that drops a flushed
+     * op's reply drops this one every time): the reply, then the
+     * Rflush. */
     uint32_t rlen = 0;
     STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
     STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
@@ -587,7 +630,9 @@ STM_TEST(p9_pool_flush_queued_never_executes) {
     bool seen_402 = false, seen_400 = false, seen_401 = false,
          seen_500 = false;
     for (int i = 0; i < 3; i++) {
-        STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+        int rc = recv_frame(fx.client_fd, buf, sizeof buf, &rlen);
+        STM_ASSERT_EQ(rc, 0);
+        if (rc != 0) break;
         uint16_t tag = load_u16(buf + 5);
         if (tag == 402) seen_402 = true;
         if (tag == 400) seen_400 = true;
@@ -638,7 +683,9 @@ STM_TEST(p9_pool_tag_reuse_after_flush_of_queued) {
     /* Exactly three replies: 450, 451, and the REUSED 460 — once. */
     int got_460 = 0, got_parked = 0;
     for (int i = 0; i < 3; i++) {
-        STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+        int rc = recv_frame(fx.client_fd, buf, sizeof buf, &rlen);
+        STM_ASSERT_EQ(rc, 0);
+        if (rc != 0) break;
         STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
         uint16_t tag = load_u16(buf + 5);
         if (tag == 460) got_460++;
@@ -820,6 +867,7 @@ STM_TEST(p9_pool_clean_eof_drains_pipeline) {
         int rc = recv_frame(fx.client_fd, buf, sizeof buf, &rlen);
         if (rc == -EPIPE) break;
         STM_ASSERT_EQ(rc, 0);
+        if (rc != 0) break;
         STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
         got++;
     }
@@ -860,7 +908,9 @@ STM_TEST(p9_pool_backpressure_no_drops) {
     memset(seen, 0, sizeof seen);
     while (total < EXTRA + 2) {
         uint32_t rlen = 0;
-        STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+        int rc = recv_frame(fx.client_fd, buf, sizeof buf, &rlen);
+        STM_ASSERT_EQ(rc, 0);
+        if (rc != 0) break;
         STM_ASSERT_EQ(buf[4], STM_9P_RGETATTR);
         uint16_t tag = load_u16(buf + 5);
         int idx = -1;
@@ -1117,7 +1167,9 @@ STM_TEST(p9_pool_pin_read_clunk_waits) {
      * writes race to the writer mutex after the pin drops). */
     bool got_read = false, got_clunk = false;
     for (int i = 0; i < 2; i++) {
-        STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+        int rc = recv_frame(fx.client_fd, buf, sizeof buf, &rlen);
+        STM_ASSERT_EQ(rc, 0);
+        if (rc != 0) break;
         uint16_t tag = load_u16(buf + 5);
         if (tag == 200) {
             STM_ASSERT_EQ(buf[4], STM_9P_RREAD);
@@ -1171,7 +1223,9 @@ STM_TEST(p9_pool_pin_walk_walk_same_newfid) {
 
     int n_walk = 0, n_ebadf = 0;
     for (int i = 0; i < 2; i++) {
-        STM_ASSERT_EQ(recv_frame(fx.client_fd, buf, sizeof buf, &rlen), 0);
+        int rc = recv_frame(fx.client_fd, buf, sizeof buf, &rlen);
+        STM_ASSERT_EQ(rc, 0);
+        if (rc != 0) break;
         uint16_t tag = load_u16(buf + 5);
         STM_ASSERT_TRUE(tag == 300 || tag == 301);
         if (buf[4] == STM_9P_RWALK) {

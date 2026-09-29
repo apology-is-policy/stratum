@@ -28,15 +28,17 @@ The diod/exportfs model applied to `serve.c` + `server.c`:
   an executing op on the same fid.
 - Real Tflush (S5): an in-flight registry per connection; Tflush of a
   queued request drops it + Rflush; of an executing request, waits for
-  completion, discards the reply, then Rflush (the 9P contract).
+  completion, sends its reply, then Rflush (flush(5): a request that ran
+  is answered; the plan's "discards the reply" was corrected 2026-09-29,
+  see §3.3).
 - Per-worker response buffers.
 - Config: `--fs-workers N`; `N=1` degrades to byte-identical serial
   behavior (the fallback + bisect lever).
 - R175-carried obligations close within CF-2 (§6 below).
 
 9P semantics recap (the obligations a concurrent server carries): (a)
-Tflush replies only after the flushed request's reply is sent or
-discarded; (b) Tclunk must not race an executing op on the same fid;
+Tflush replies only after the flushed request's reply is sent (a
+request cancelled before it ran has none); (b) Tclunk must not race an executing op on the same fid;
 (c) Tversion resets must quiesce in-flight ops. No cross-tag ordering
 exists otherwise — clients enforce their own dependencies by waiting
 (the Thylacine kernel client refuses new ops on a fid with in-flight
@@ -93,14 +95,14 @@ throughput). A slot is the registry entry AND the queue element:
 
     state: FREE -> QUEUED -> EXECUTING -> [REPLYING] -> FREE
     fields: req (heap, per-frame exact-size), req_len, tag, type,
-            flush_pending (bool), cancelled (bool)
+            cancelled (bool)
 
 - The reader admits a frame by claiming a FREE slot (malloc(size) for
   the frame body — frames are heap-owned per-request, NOT preallocated
   at msize_max; see §3.5 memory bounds) and appending the slot index to
   a FIFO ring. Workers pop the ring, skip `cancelled` entries, run
   `stm_9p_server_handle` into their private resp buffer, then decide
-  send under mu (`flush_pending`/dead -> discard), mark REPLYING,
+  send under mu (a dead connection -> discard), mark REPLYING,
   write under the writer mutex, and free the slot. REPLYING is the
   load-bearing subtlety (the boot-gate F2 fix, refined by its own
   revert-proof): the TAG must retire before the write — the kernel
@@ -519,7 +521,9 @@ stm_xattr_list-fallback rarity trade).
   Rflush (the I-10 analog, server-side).
 - **CF2-I2 (Tflush ordering):** Rflush is written only after the
   flushed request's reply is sent. A flushed-while-queued op never
-  executes and never replies; an op that executed always replies.
+  executes and never replies; an op that executed replies unless the
+  connection latches dead (CF2-I1's exception), and is never answered
+  by an Rflush alone.
 - **CF2-I3 (fid pin):** no fid slot is released or repurposed-to-FREE
   while pinned; every pin is released on every path (incl. handler
   error paths); clunk/version/destroy observe busy == 0 at release.
