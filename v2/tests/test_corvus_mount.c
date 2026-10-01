@@ -32,6 +32,7 @@
 #include "tharness.h"
 
 #include <stratum/alloc.h>
+#include <stratum/fs.h>
 #include <stratum/block.h>
 #include <stratum/corvus_client.h>
 #include <stratum/crypto.h>
@@ -442,8 +443,21 @@ STM_TEST(corvus_install_evict_dek_roundtrip) {
                                      dek));
     STM_ASSERT_MEM_EQ(dek, canned_dek, 32);
 
-    /* Idempotent re-install -> OK, no re-unwrap, no double-insert. */
+    /* Re-install proves the new caller even when the key is already live. */
     STM_ASSERT_OK(stm_sync_install_dek(s2, CORVUS_DATASET_ID, &cc));
+    fake_corvus_stop(&fc);
+    fake_corvus_start(&fc, "instevict", STM_CORVUS_STATUS_BAD_AUTH, NULL);
+    STM_ASSERT(stm_sync_install_dek(s2, CORVUS_DATASET_ID, &cc) != STM_OK);
+    STM_ASSERT_OK(stm_sync_get_dek(s2, CORVUS_DATASET_ID, CORVUS_KEY_ID, dek));
+    STM_ASSERT_MEM_EQ(dek, canned_dek, 32);
+    fake_corvus_stop(&fc);
+    uint8_t wrong_dek[32] = {0};
+    fake_corvus_start(&fc, "instevict", STM_CORVUS_STATUS_OK, wrong_dek);
+    STM_ASSERT_ERR(stm_sync_install_dek(s2, CORVUS_DATASET_ID, &cc), STM_EACCES);
+    STM_ASSERT_OK(stm_sync_get_dek(s2, CORVUS_DATASET_ID, CORVUS_KEY_ID, dek));
+    STM_ASSERT_MEM_EQ(dek, canned_dek, 32);
+    fake_corvus_stop(&fc);
+    fake_corvus_start(&fc, "instevict", STM_CORVUS_STATUS_OK, canned_dek);
 
     /* Regression: evict_dek must drain the decrypted-extent cache.
      * A fresh CORVUS dataset (real create_child + real WRAP over the
@@ -1253,3 +1267,45 @@ STM_TEST(corvus_rc6_readers_vs_evict_hammer) {
 }
 
 STM_TEST_MAIN("corvus_mount")
+
+/* D7-R4: a logout must not strand buffered writes behind a removed DEK.
+ * A later unrelated fsync used to fail ELOCKED (Corvus account creation was
+ * the first visible victim). Drive the public filesystem, not sync alone. */
+STM_TEST(corvus_logout_flushes_dirty_home_before_key_eviction) {
+    make_tmp("dirtylogout");
+    char key_path[300];
+    snprintf(key_path, sizeof key_path, "%s.key", g_tmp_path);
+    unlink(key_path);
+    STM_ASSERT_OK(stm_keyfile_generate(key_path));
+    stm_fs_format_opts fo = {
+        .device_size_bytes = TEST_DEVICE_BYTES,
+        .bootstrap_size_bytes = TEST_BOOTSTRAP_BYTES,
+        .pool_uuid = {0xc0c0face, 0xfeed5151},
+        .device_uuid = {0x9090a0a0, 0xb0b0c0c0},
+        .keyfile_path = key_path,
+    };
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fo));
+    stm_fs_mount_opts mo = {.keyfile_path = key_path};
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mo, &fs));
+    fake_corvus fc;
+    fake_corvus_start(&fc, "dirtylogout", STM_CORVUS_STATUS_OK, NULL);
+    stm_corvus_mount_cfg cc = {.socket_path = fc.sock_path, .session_token = TEST_TOKEN};
+    uint64_t ds = 0, ino = 0;
+    STM_ASSERT_OK(stm_fs_provision_corvus_dataset(fs, 1, "home", "users/alice", 11,
+                                                 1000, 1000, &cc, &ds));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds, 1, (const uint8_t *)"file", 4,
+                                    0600, 1000, 1000, &ino));
+    uint8_t bytes[4096]; memset(bytes, 0x65, sizeof bytes);
+    STM_ASSERT_OK(stm_fs_write(fs, ds, ino, 0, bytes, sizeof bytes));
+    STM_ASSERT_OK(stm_fs_evict_dek(fs, ds));
+    STM_ASSERT_OK(stm_fs_commit(fs)); // unrelated user's durability barrier
+    STM_ASSERT_OK(stm_fs_install_dek(fs, ds, &cc));
+    uint8_t got[4096]; size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, ds, ino, 0, got, sizeof got, &n));
+    STM_ASSERT_EQ(n, sizeof bytes);
+    STM_ASSERT_MEM_EQ(got, bytes, sizeof bytes);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fake_corvus_stop(&fc);
+    unlink(g_tmp_path); unlink(key_path);
+}

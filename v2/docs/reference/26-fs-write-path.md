@@ -364,3 +364,19 @@ regime-purity + chain-aware-read regression (a partial port fails it).
 - The covering write's `fs->lock`-held RMW serializes (ds,ino) writes but drops
   the sync/extent locks between the lookup, read, and write calls. Concurrent
   cross-Proc reader/writer hardening is Area D.
+
+## Runtime key eviction and buffered writes (D7)
+
+`stm_fs_evict_dek` holds `fs->global` EX and calls `fs_flush_all_locked` before
+`stm_sync_evict_dek`. This encrypts outstanding buffered data while its keys
+are installed, with writers excluded through removal. Evicting first stranded
+dirty ranges: a later whole-pool commit returned ELOCKED, even when requested
+for unrelated account metadata. A failed drain returns its error and preserves
+the key. This is a buffer drain, not a durability commit; ordinary commit
+ordering is unchanged. The final-lease and disconnect-failure policy is in
+[the ctl reference](22-ctl.md#system-principal--dek-lifecycle-tly-a5b).
+
+`corvus_logout_flushes_dirty_home_before_key_eviction` in
+`tests/test_corvus_mount.c` drives the real public FS, then commits, reinstalls
+the key and compares the written bytes. It does not simulate a power loss or
+claim failure-injected disconnect recovery.

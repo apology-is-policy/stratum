@@ -5280,11 +5280,9 @@ stm_status stm_sync_install_dek(stm_sync *s, uint64_t dataset_id,
         pthread_mutex_unlock(&s->lock);
         return STM_EINVAL;
     }
-    /* Already unlocked -> no-op success (no re-unwrap, no double-insert). */
-    if (sync_dek_find(s, dataset_id, key_id) != NULL) {
-        pthread_mutex_unlock(&s->lock);
-        return STM_OK;
-    }
+    /* Every new ctl owner must prove its token, even for a live key.
+     * Keep the map immutable; verify equality instead of replacing the key. */
+    bool installed = sync_dek_find(s, dataset_id, key_id) != NULL;
 
     /* corvus binds the envelope (AEAD-AD) to the dataset path recorded
      * in the slot; the UNWRAP must send that same binding back. */
@@ -5299,7 +5297,7 @@ stm_status stm_sync_install_dek(stm_sync *s, uint64_t dataset_id,
 
     /* Pre-reserve the map slot so the post-unwrap insert is infallible
      * (mirrors stm_sync_add_dataset_key_corvus). */
-    rc = sync_dek_grow(s, sync_dek_count(s) + 1);
+    rc = installed ? STM_OK : sync_dek_grow(s, sync_dek_count(s) + 1);
     if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
 
     stm_corvus_transport_opts t = {
@@ -5318,7 +5316,12 @@ stm_status stm_sync_install_dek(stm_sync *s, uint64_t dataset_id,
         return rc;
     }
 
-    rc = sync_dek_insert(s, dataset_id, key_id, dek);
+    if (installed) {
+        sync_dek_slot *slot = sync_dek_find(s, dataset_id, key_id);
+        rc = slot && stm_ct_equal(slot->dek, dek, sizeof dek) ? STM_OK : STM_EACCES;
+    } else {
+        rc = sync_dek_insert(s, dataset_id, key_id, dek);
+    }
     stm_ct_memzero(dek, sizeof dek);
     pthread_mutex_unlock(&s->lock);
     return rc;

@@ -540,23 +540,25 @@ STM_TEST(dek_ctl_authz) {
                                       TEST_TOKEN, STM_CORVUS_TOKEN_LEN, 3u));
     STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
 
-    /* (4) A DIFFERENT SYSTEM conn cannot install (cross-conn) nor evict
-     *     (non-owning) the leased dataset → EACCES; DEK stays sysA's. */
+    /* (4) An unproven SYSTEM connection cannot evict another lease.
+     * A successful UNWRAP then gives it its own independent lease. */
     stm_ctl_conn *sysB = NULL;
     STM_ASSERT_OK(stm_ctl_conn_create(ctl, SYS_UID, SYS_GID, &sysB));
-    STM_ASSERT_ERR(ctl_drive_install(v, sysB, root, 2u,
-                                       TEST_TOKEN, STM_CORVUS_TOKEN_LEN, 4u),
-                     STM_EACCES);
-    STM_ASSERT_ERR(ctl_drive_evict(v, sysB, root, 2u, 5u), STM_EACCES);
+    STM_ASSERT_ERR(ctl_drive_evict(v, sysB, root, 2u, 4u), STM_EACCES);
+    STM_ASSERT_OK(ctl_drive_install(v, sysB, root, 2u,
+                                      TEST_TOKEN, STM_CORVUS_TOKEN_LEN, 5u));
     STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
 
-    /* (5) The owning conn evicts cleanly. */
+    /* (5) Releasing sysA cannot evict sysB's key. Once sysA has no
+     * lease, it cannot evict sysB; final owner disconnect removes it. */
     STM_ASSERT_OK(ctl_drive_evict(v, sysA, root, 2u, 6u));
-    STM_ASSERT_ERR(stm_sync_get_dek(sync, 2u, 0u, dek), STM_ENOENT);
-
-    stm_ctl_conn_destroy(other);
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
+    STM_ASSERT_ERR(ctl_drive_evict(v, sysA, root, 2u, 7u), STM_EACCES);
     stm_ctl_conn_destroy(sysA);
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 2u, 0u, dek));
     stm_ctl_conn_destroy(sysB);
+    STM_ASSERT_ERR(stm_sync_get_dek(sync, 2u, 0u, dek), STM_ENOENT);
+    stm_ctl_conn_destroy(other);
     stm_ctl_destroy(ctl);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     fake_corvus_stop(&fc);

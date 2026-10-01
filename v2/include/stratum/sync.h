@@ -935,8 +935,9 @@ size_t stm_sync_dek_count(const stm_sync *s);
  * token (the login-forwarded bearer credential -- the socket comes from
  * `corvus` because stm_sync does not retain the mount cfg), and installs
  * the plaintext DEK into the in-RAM map. The keyslot already exists, so
- * nothing durable changes (no commit). Idempotent: an already-installed
- * dataset returns STM_OK without re-unwrapping. CORVUS-only: STM_EINVAL
+ * nothing durable changes (no commit). An already-installed dataset still
+ * requires UNWRAP and constant-time equality with its live DEK; a bad proof
+ * or mismatched key leaves the live key unchanged. CORVUS-only: STM_EINVAL
  * on a keyfile/janus dataset (those resolve only at mount). STM_ENOENT
  * if the dataset has no CURRENT keyslot; the typed corvus errors
  * (STM_ECORVUSAUTH / STM_ECORVUSPERM / ...) on an UNWRAP rejection.

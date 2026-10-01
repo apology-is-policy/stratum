@@ -225,7 +225,8 @@ coordinator's job, orthogonal to operator admin. Default
   corvus keyslot over `stm_ctl::corvus_socket_path` (set via
   `stm_ctl_set_corvus_socket`, fed by `--corvus-socket`) with that
   token and installs the plaintext DEK -- `stm_fs_install_dek` ->
-  `stm_sync_install_dek` (idempotent, CORVUS-only, RAM-only, no commit).
+  `stm_sync_install_dek` (proof checked on each new ctl lease, CORVUS-only,
+  RAM-only, no commit).
 - **evict-dek** body = any non-empty trigger (content ignored). Removes
   + zeroes the DEK -> `stm_fs_evict_dek` -> `stm_sync_evict_dek`.
 
@@ -233,15 +234,25 @@ coordinator's job, orthogonal to operator admin. Default
 (`dek_leases[]`, guarded by `dek_mu`) records which `stm_ctl_conn`
 installed each dataset's runtime DEK:
 
-- install records the installing conn as the lease owner. A dataset
-  already leased to a DIFFERENT conn refuses with `STM_EACCES` BEFORE
-  any UNWRAP; the owning conn re-installing is an idempotent `STM_OK`.
-- evict is permitted only from the owning conn (else `STM_EACCES`). A
-  dataset with no lease is an idempotent no-op (`STM_OK`) -- so the verb
-  can never evict a mount-time DEK (a system / token-bearing-mount
-  dataset is never leased).
-- a conn DROP auto-evicts every DEK it installed (`stm_ctl_conn_destroy`,
-  under `dek_mu`, before the conn is freed) -- logout-by-disconnect.
+- Each `(connection, dataset)` pair owns one lease, within the existing 64
+  total lease slots. Re-install by that same connection is idempotent. A new
+  connection must successfully UNWRAP with its own live Corvus token even
+  when the DEK is already installed; the unwrapped key must equal the installed
+  key. Failed proof or exhaustion creates no lease and changes no live key.
+- Evict releases only the caller's lease; foreign leases return `STM_EACCES`.
+  The last lease first drains buffered writes under `fs->global` EX while
+  their keys are available, then evicts the DEK and drains plaintext caches.
+  Flush failure preserves the key for retry. This prevents logout from
+  stranding dirty home data and breaking a later unrelated whole-pool fsync. Earlier releases
+  leave the key available for surviving sessions. Explicit failed final eviction
+  retains the lease for retry; connection teardown clears its identity before
+  freeing it, with the existing best-effort final eviction semantics.
+- Provision reserves lease capacity under the same lock before creating a
+  home, so a successful creation never leaves its new DEK unleased.
+
+This D7 completion supports concurrent logins without changing the ctl wire
+format, disk format, SYSTEM-only gate, or Corvus token authority. Lock order
+remains `dek_mu -> fs->global -> sync lock`; bounded Corvus I/O stays serialized.
 
 The login coordinator therefore holds ONE persistent ctl connection per
 session: install at login, evict at logout, both on the same conn; a
@@ -318,7 +329,7 @@ Live writable kinds:
 | `KIND_DATASET_UNMARK_SNAPSHOT_COMPROMISED` | `force <snap_id>` | stm_fs_unmark_snapshot_compromised (TLY-A5; `force` token required per Q15) |
 | `KIND_DATASET_ROLLBACK_SNAPSHOT` | `<snap_id>` or `force <snap_id>` | stm_fs_rollback_snapshot (TLY-A5-impl-2; strict-admin). The consultation gate refuses a `STM_SNAP_FLAG_ROLLBACK_COMPROMISED` snap with `STM_ECOMPROMISED` unless `force` is given (`snapshot.tla::RollbackBlockedIffCompromised`). The rollback *mechanism* is a Phase 9.7 stub → `STM_ENOTSUPPORTED` on a non-compromised / forced path. |
 | `KIND_DATASET_INSTALL_DEK` | 33-byte corvus session token (binary) | stm_fs_install_dek (TLY-A5b; SYSTEM-only; F7 connection-binding — see above) |
-| `KIND_DATASET_EVICT_DEK` | any non-empty trigger (ignored) | stm_fs_evict_dek (TLY-A5b; SYSTEM-only; owning-conn only; auto-evicted on conn drop) |
+| `KIND_DATASET_EVICT_DEK` | any non-empty trigger (ignored) | stm_fs_evict_dek (TLY-A5b; SYSTEM-only; releases owning-conn lease; final lease alone evicts) |
 | `KIND_DATASETS_PROVISION_DEK` | `owner_uid,owner_gid,name,corvus_path,token` (binary) | stm_fs_provision_corvus_dataset (TLY-A5b #826c; SYSTEM-only; datasets-LEVEL; creates the user's encrypted home 0700; idempotent EEXIST->OK; no conn-binding) |
 
 Every successful admin write logs `result=ok` to /events via

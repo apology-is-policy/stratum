@@ -475,16 +475,16 @@ typedef struct ctl_session {
 #define STM_CTL_EVENT_MAX  (8u * 1024u * 1024u)
 
 /* TLY-A5b: DEK lease table bounds. STM_CTL_DEK_LEASE_MAX caps the
- * number of datasets with a runtime-installed DEK at once (= concurrent
- * encrypted-home sessions); generous for v1.0's single-console login.
+ * number of connection/dataset leases at once (= concurrent
+ * encrypted-home sessions); shared datasets consume one slot per connection.
  * STM_CTL_CORVUS_SOCKET_MAX bounds the copied corvus socket path (the
  * AF_UNIX sun_path ceiling). */
 #define STM_CTL_DEK_LEASE_MAX      64
 #define STM_CTL_CORVUS_SOCKET_MAX  108
 
-/* TLY-A5b: per-dataset DEK lease (F7 connection-binding). Records which
+/* D7: per-connection/dataset DEK lease (F7 connection-binding). Records which
  * conn installed a dataset's runtime DEK so only that conn may evict it
- * and a conn drop auto-evicts it. `owner` is a bare identity pointer --
+ * and the last lease release auto-evicts it. `owner` is a bare identity pointer --
  * compared, never dereferenced -- kept stale-free by clearing every
  * lease a conn owns under dek_mu before that conn is freed. */
 typedef struct {
@@ -618,15 +618,10 @@ static bool ctl_caller_is_system(const stm_ctl_conn *cn)
     return cn->caller_uid == cn->ctl->system_uid;
 }
 
-/* TLY-A5b F7 connection-binding: install `dataset_id`'s runtime DEK and
- * record this conn as its owner. Idempotent for the owning conn; refuses
- * a dataset already leased to a DIFFERENT conn (STM_EACCES). The corvus
- * UNWRAP runs under dek_mu -- logins are console-serialized in v1.0, so
- * the cross-dataset serialization costs nothing and keeps the lease
- * reservation + the sync install atomic (no pending-lease TOCTOU). The
- * corvus client's own connect/io timeouts bound the hold. A future
- * multi-console deployment needing concurrent installs would split this
- * to a pending-lease state that drops dek_mu across the UNWRAP. */
+/* D7: one authenticated lease per (connection,dataset), not a singleton
+ * dataset owner. A new connection always proves UNWRAP authority, including
+ * an already-unlocked dataset. Existing bounded I/O stays under dek_mu;
+ * no lease is published before proof, and the last lease alone evicts. */
 static stm_status ctl_dek_install(stm_ctl_conn *cn, uint64_t dataset_id,
                                   const uint8_t *token)
 {
@@ -641,14 +636,10 @@ static stm_status ctl_dek_install(stm_ctl_conn *cn, uint64_t dataset_id,
             if (free_slot < 0) free_slot = i;
             continue;
         }
-        if (c->dek_leases[i].dataset_id == dataset_id) {
-            /* Leased by us → idempotent OK (DEK already installed; the
-             * sync layer would also no-op). Leased by another session →
-             * refuse before any UNWRAP. */
-            stm_status rc =
-                (c->dek_leases[i].owner == cn) ? STM_OK : STM_EACCES;
+        if (c->dek_leases[i].dataset_id == dataset_id &&
+            c->dek_leases[i].owner == cn) {
             pthread_mutex_unlock(&c->dek_mu);
-            return rc;
+            return STM_OK; /* only this already-proven connection */
         }
     }
     if (free_slot < 0) {
@@ -673,36 +664,33 @@ static stm_status ctl_dek_install(stm_ctl_conn *cn, uint64_t dataset_id,
     return rc;
 }
 
-/* TLY-A5b F7: evict `dataset_id`'s runtime DEK. Only the owning conn may
- * evict (else STM_EACCES). Idempotent: a dataset with no lease (never
- * installed at runtime, or already evicted) returns STM_OK WITHOUT
- * touching the sync map -- so this verb can never evict a mount-time
- * DEK (a system/token-bearing-mount dataset is never leased). The lease
- * is cleared only on a clean evict so a transient failure stays
- * retryable; conn-destroy clears unconditionally. */
+/* Caller holds dek_mu. Removing one lease must not evict another's key. */
+static bool ctl_dek_other_lease(stm_ctl *c, int slot)
+{
+    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++)
+        if (i != slot && c->dek_leases[i].active &&
+            c->dek_leases[i].dataset_id == c->dek_leases[slot].dataset_id)
+            return true;
+    return false;
+}
+
 static stm_status ctl_dek_evict(stm_ctl_conn *cn, uint64_t dataset_id)
 {
     stm_ctl *c = cn->ctl;
     pthread_mutex_lock(&c->dek_mu);
+    bool foreign = false;
     for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
-        if (!c->dek_leases[i].active
-                || c->dek_leases[i].dataset_id != dataset_id)
+        if (!c->dek_leases[i].active || c->dek_leases[i].dataset_id != dataset_id)
             continue;
-        if (c->dek_leases[i].owner != cn) {
-            pthread_mutex_unlock(&c->dek_mu);
-            return STM_EACCES;   /* not your lease */
-        }
-        stm_status rc = stm_fs_evict_dek(c->fs, dataset_id);
-        if (rc == STM_OK) {
-            c->dek_leases[i].active     = false;
-            c->dek_leases[i].dataset_id = 0;
-            c->dek_leases[i].owner      = NULL;
-        }
+        if (c->dek_leases[i].owner != cn) { foreign = true; continue; }
+        stm_status rc = ctl_dek_other_lease(c, i) ? STM_OK :
+            stm_fs_evict_dek(c->fs, dataset_id);
+        if (rc == STM_OK) c->dek_leases[i] = (ctl_dek_lease){0};
         pthread_mutex_unlock(&c->dek_mu);
         return rc;
     }
     pthread_mutex_unlock(&c->dek_mu);
-    return STM_OK;   /* no lease → idempotent no-op */
+    return foreign ? STM_EACCES : STM_OK;
 }
 
 /* TLY-A5b #826c: first-login home provisioning. SYSTEM-only (gated at
@@ -788,34 +776,26 @@ static stm_status ctl_provision_dek(stm_ctl_conn *cn, uint64_t parent,
         .io_timeout_ms      = c->corvus_io_timeout_ms,
         .n_retries          = c->corvus_n_retries,
     };
+    pthread_mutex_lock(&c->dek_mu);
+    int free_slot = -1;
+    for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++)
+        if (!c->dek_leases[i].active) { free_slot = i; break; }
+    if (free_slot < 0) {
+        pthread_mutex_unlock(&c->dek_mu);
+        return STM_ENOSPC;
+    }
     uint64_t new_id = 0;
     stm_status rc = stm_fs_provision_corvus_dataset(c->fs, parent, namebuf,
                                                       (const char *)path,
                                                       (size_t)path_len,
                                                       owner_uid, owner_gid,
                                                       &cfg, &new_id);
-    /* #828 A-F2: the mint installs the DEK into the live map (init_dataset_root
-     * needs it to encrypt the root inode), so record a conn-bound lease for it.
-     * Without the lease, a provision NOT followed by a successful install-dek
-     * (the install fails, or login exits/crashes before it) would leave the
-     * cleartext DEK resident until the coordinator unmounts -- conn-destroy's
-     * auto-evict only fires for LEASED datasets. With the lease, conn-destroy
-     * evicts the DEK when this /ctl connection drops (crash-safe); the per-login
-     * install-dek that follows finds the lease (owner==cn) -> idempotent OK. A
-     * full lease table degrades to the same ENOSPC the install path handles
-     * (the DEK stays installed, unleased -- the pre-A-F2 behavior). */
     if (rc == STM_OK) {
-        pthread_mutex_lock(&c->dek_mu);
-        for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
-            if (!c->dek_leases[i].active) {
-                c->dek_leases[i].active     = true;
-                c->dek_leases[i].dataset_id = new_id;
-                c->dek_leases[i].owner      = cn;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&c->dek_mu);
+        c->dek_leases[free_slot] = (ctl_dek_lease){
+            .active = true, .dataset_id = new_id, .owner = cn,
+        };
     }
+    pthread_mutex_unlock(&c->dek_mu);
     return rc;
 }
 
@@ -4324,7 +4304,7 @@ void stm_ctl_conn_destroy(stm_ctl_conn *cn)
     for (int i = 0; i < STM_CTL_DEK_LEASE_MAX; i++) {
         if (!ctl->dek_leases[i].active || ctl->dek_leases[i].owner != cn)
             continue;
-        if (ctl->fs)
+        if (ctl->fs && !ctl_dek_other_lease(ctl, i))
             (void)stm_fs_evict_dek(ctl->fs, ctl->dek_leases[i].dataset_id);
         ctl->dek_leases[i].active     = false;
         ctl->dek_leases[i].dataset_id = 0;

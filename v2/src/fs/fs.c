@@ -8530,7 +8530,13 @@ stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id)
     if (!fs) return STM_EINVAL;
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
-    stm_status s = stm_sync_evict_dek(fs->sync, dataset_id);
+    /* D7-R4: encrypt outstanding buffered writes while their keys are still
+     * installed. Otherwise logout strands a dirty range and every subsequent
+     * whole-pool fsync fails ELOCKED, including unrelated Corvus persistence.
+     * EX excludes writers through drain + removal. A drain failure preserves
+     * the key and lease for retry; no new lock order or commit protocol. */
+    stm_status s = fs_flush_all_locked(fs);
+    if (s == STM_OK) s = stm_sync_evict_dek(fs->sync, dataset_id);
     pthread_rwlock_unlock(&fs->global);
     return s;
 }

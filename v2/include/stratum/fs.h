@@ -1902,9 +1902,11 @@ stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs, uint64_t dataset_id,
  * stm_fs_install_dek UNWRAPs `dataset_id`'s CURRENT corvus keyslot over
  * the corvus key agent named by `corvus` (socket + the login-forwarded
  * session token) and installs the plaintext DEK, lifting the dataset
- * out of the deferred-unwrap LOCKED posture. Idempotent; CORVUS-only;
- * RAM-only (no commit). stm_fs_evict_dek removes + zeroes the DEK,
- * returning the dataset to LOCKED. The /ctl/ install-dek / evict-dek
+ * out of the deferred-unwrap LOCKED posture. Reinstallation still proves
+ * the token and live-key equality; CORVUS-only; RAM-only (no commit).
+ * stm_fs_evict_dek drains buffered writes under EX before removing and
+ * zeroing the DEK, returning the dataset to LOCKED. Drain failure preserves
+ * the key and propagates the error; this operation is not a commit barrier. The /ctl/ install-dek / evict-dek
  * verbs (src/ctl/synfs.c) are the production drivers.
  */
 STM_MUST_USE
