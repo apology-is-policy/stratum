@@ -663,10 +663,10 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
  *       INLINE + new_size ≤ STM_INODE_INLINE_MAX: zero-fill
  *               si_inline_data[si_data_len .. new_size); update
  *               si_data_len + si_size; stays INLINE.
- *       INLINE + new_size > STM_INODE_INLINE_MAX: triggers the same
- *               combined-buffer transition as P8-POSIX-5's grow-
- *               write — flushes existing inline prefix + zero-pad to
- *               next 4 KiB boundary; flips si_data_kind=EXTENT.
+ *       INLINE + new_size > STM_INODE_INLINE_MAX: preserve any existing
+ *               inline prefix in one zero-padded 4 KiB extent (none for
+ *               an empty file), then publish EXTENT kind and logical size.
+ *               The remainder is sparse; no allocation scales with size.
  *       EXTENT: just update si_size. POSIX grow-truncate zero-fills
  *               the extended portion; the extent layer's sparse-
  *               read semantics return 0 for any offset in the
@@ -683,12 +683,9 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
  *     EISDIR for directory operands.
  *   - inode is not S_IFREG (STM_EINVAL — symlink / device truncate
  *     not supported in MVP).
- *   - EXTENT-mode truncate with non-4 KiB-aligned `new_size`
+ *   - EXTENT-mode shrink with non-4 KiB-aligned `new_size`
  *     (STM_EINVAL — sub-block truncate would require read-modify-
  *     write at the bdev; deferred).
- *   - INLINE-to-EXTENT transition where new_size > STM_FS_RECORDSIZE_MAX
- *     (STM_ERANGE — caller can split via stm_fs_write at smaller
- *     chunks, then truncate down).
  *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
  */
 STM_MUST_USE

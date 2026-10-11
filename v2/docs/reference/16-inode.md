@@ -591,3 +591,29 @@ Audit class: any change to allocator paths (alloc / alloc_anon /
 materialize / free), gen arithmetic, or persistence validators MUST
 be re-audited (R69 / R70 / R71 doctrine). The trigger lives in
 CLAUDE.md's "Inode allocator" row.
+
+## Sparse truncate growth (October 11, native toolchain fix)
+
+`stm_fs_truncate` no longer treats the 8 MiB recordsize as a new-file size
+limit. INLINE-to-EXTENT growth writes only a nonempty inline prefix, padded
+to one 4 KiB block; empty files need no extent allocation. The inode pin and
+existing pre-flush order protect the cutover. Kind and logical size publish
+after the prefix write succeeds; the rest reads as a sparse zero-filled hole.
+Growing an existing EXTENT inode permits non-block-aligned lengths. The
+existing aligned-shrink requirement is unchanged. No format or wire change.
+
+`fs_p10_truncate_large_sparse_growth_persists` covers empty/nonempty growth
+past 1 TiB, non-aligned regrowth, cold readback across remount, preserved inline
+bytes, zero holes, and discarded-tail non-resurrection. Baseline `61dde37` fails
+this regression; the corrected phase8 suite passes 224 tests. Runtime integration
+and broader suites are recorded in the Thylacine native-fixes work ledger.
+
+The full host CTest run passes all 73 suites. LLVM 22 address plus undefined-
+behavior sanitizers pass all 224 phase8 tests. The clean inode model and both
+existing mutant counterexamples retain their expected outcomes. A rebuilt
+Thylacine fixture passes ordinary-user native fresh-file growth through 64 MiB
+and a 51,362,272-byte OpenRCT2 link onto local storage; its output exactly
+matches the earlier remote-output control. The image required sufficient real
+free space: the first small-pool run correctly returned ENOSPC, preserved as
+a separate capacity failure. This is a prepared full-engine link, not a full
+native source or dependency build. Review was single-agent by Astra.

@@ -495,13 +495,15 @@ WriteInline(i, new_len) ==
     /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter,
                     data_kind, ever_extent, ever_linked>>
 
-\* TransitionToExtent: a write that grows an INLINE inode past
+\* TransitionToExtent: a write or sparse truncate growing an INLINE inode past
 \* MaxInline triggers the cutover. ARCH §11.3.3 step:
 \*   1. Allocate extent storage.
 \*   2. Write combined (existing inline + new) data to the extent.
 \*   3. Update inode: si_data_kind = STM_DATA_EXTENT,
 \*      si_extent_tree_root = <new extent tree root>.
 \*
+\* Sparse truncate preserves only an existing prefix block (none for empty
+\* files); the rest is a zero-filled hole. It has the same kind transition.
 \* The spec abstracts the extent allocation + write — the only
 \* state change relevant here is data_kind: INLINE → EXTENT, and
 \* setting ever_extent[i] := TRUE. data_len is reset to 0 because

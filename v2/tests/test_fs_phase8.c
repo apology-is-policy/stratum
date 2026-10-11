@@ -2373,6 +2373,66 @@ STM_TEST(fs_p10_truncate_inline_grow_past_cap_transitions) {
     unlink(g_key_path);
 }
 
+/* Native lld sizes a NEW output file before writing it. Sparse growth must
+ * not allocate the requested length or confuse recordsize with file size. */
+STM_TEST(fs_p10_truncate_large_sparse_growth_persists) {
+    make_tmp("p10_sparse_large");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0, files[2] = {0};
+    p2b_alloc_root_dir(fs, &root);
+    const uint64_t size = (UINT64_C(1) << 40) + 37u;
+    const uint8_t prefix[] = { 0x31, 0x00, 0xff, 0x74 };
+    for (unsigned i = 0; i < 2; ++i) {
+        const uint8_t name = (uint8_t)('a' + i);
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, &name, 1,
+                                        0644u, 1000u, 1000u, &files[i]));
+        if (i) STM_ASSERT_OK(stm_fs_write(fs, 1, files[i], 0,
+                                         prefix, sizeof prefix));
+        STM_ASSERT_OK(stm_fs_truncate(fs, 1, files[i], size));
+        /* A subsequent non-aligned grow is metadata-only as well. */
+        STM_ASSERT_OK(stm_fs_truncate(fs, 1, files[i], size + 2u));
+    }
+    /* Cold reads after remount: no dirty-buffer or warm-read masking. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    for (unsigned i = 0; i < 2; ++i) {
+        struct stm_inode_value iv = {0};
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, files[i], &iv));
+        STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+        STM_ASSERT_EQ(stm_load_le64(iv.si_size), size + 2u);
+        uint8_t out[4096];
+        size_t n = 0;
+        memset(out, 0xa5, sizeof out);
+        STM_ASSERT_OK(stm_fs_read(fs, 1, files[i], 0, out, sizeof out, &n));
+        STM_ASSERT_EQ(n, sizeof out);
+        for (size_t k = 0; k < n; ++k)
+            STM_ASSERT_EQ(out[k], (i && k < sizeof prefix) ? prefix[k] : 0);
+        memset(out, 0xa5, sizeof out);
+        STM_ASSERT_OK(stm_fs_read(fs, 1, files[i], size - 10u,
+                                 out, sizeof out, &n));
+        STM_ASSERT_EQ(n, 12u);
+        for (size_t k = 0; k < n; ++k) STM_ASSERT_EQ(out[k], 0u);
+        /* Writing into the hole, dropping it, and regrowing must not
+         * resurrect discarded bytes or move the inode back to INLINE. */
+        STM_ASSERT_OK(stm_fs_write(fs, 1, files[i], size - 10u,
+                                  prefix, sizeof prefix));
+        STM_ASSERT_OK(stm_fs_truncate(fs, 1, files[i], 4096u));
+        STM_ASSERT_OK(stm_fs_truncate(fs, 1, files[i], size + 2u));
+        memset(out, 0xa5, sizeof out);
+        STM_ASSERT_OK(stm_fs_read(fs, 1, files[i], size - 10u,
+                                 out, sizeof out, &n));
+        STM_ASSERT_EQ(n, 12u);
+        for (size_t k = 0; k < n; ++k) STM_ASSERT_EQ(out[k], 0u);
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_p10_truncate_extent_shrink) {
     /* EXTENT file shrink to a 4 KiB-aligned size. */
     make_tmp("p10_extent_shrink");

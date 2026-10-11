@@ -4796,34 +4796,26 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             goto out;
         }
 
-        /* Grow past inline cap → transition to EXTENT. Build a
-         * single block-aligned combined buffer (existing inline prefix
-         * + zero pad to next 4 KiB boundary). Same shape as
-         * fs_write_regular_locked's transition path. */
-        if (new_size > (uint64_t)STM_FS_RECORDSIZE_MAX) {
-            rs = STM_ERANGE; goto out;
-        }
-
-        const uint64_t BLK = 4096u;
-        uint64_t aligned_size = (new_size + BLK - 1u) & ~(BLK - 1u);
-        if (aligned_size == 0u) aligned_size = BLK;
-
-        uint8_t *combined = calloc(1, (size_t)aligned_size);
-        if (!combined) { rs = STM_ENOMEM; goto out; }
+        /* Sparse cutover: recordsize bounds one data record, not a file's
+         * logical length. Persist only the existing inline prefix in a
+         * zero-padded block; the rest is a hole. Empty files need no extent.
+         * The pin serializes extent readers and mutators; lock-free INLINE
+         * readers can still observe the old inode value until inode_set.
+         * The infallible inode update publishes kind + size only after a
+         * successful prefix write. Allocation stays bounded at 4 KiB. */
         if (iv.si_data_len > 0u) {
-            memcpy(combined, iv.si_data.inline_data, iv.si_data_len);
+            const size_t block_size = 4096u;
+            uint8_t *prefix = calloc(1, block_size);
+            if (!prefix) { rs = STM_ENOMEM; goto out; }
+            memcpy(prefix, iv.si_data.inline_data, iv.si_data_len);
+            stm_status ws = stm_sync_write_extent(fs->sync, dataset_id, ino,
+                                                  0u, prefix, block_size);
+            if (ws == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
+                ws = stm_sync_write_extent(fs->sync, dataset_id, ino,
+                                          0u, prefix, block_size);
+            free(prefix);
+            if (ws != STM_OK) { rs = ws; goto out; }
         }
-        stm_status ws = stm_sync_write_extent(fs->sync, dataset_id, ino,
-                                                  /*off=*/0u,
-                                                  combined,
-                                                  (size_t)aligned_size);
-        /* CF-4 C: reclaim-on-ENOSPC before freeing combined so the retry
-         * still has the source bytes. */
-        if (ws == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
-            ws = stm_sync_write_extent(fs->sync, dataset_id, ino, 0u,
-                                           combined, (size_t)aligned_size);
-        free(combined);
-        if (ws != STM_OK) { rs = ws; goto out; }
 
         iv.si_data_kind = STM_DATA_EXTENT;
         iv.si_data_len  = 0;
@@ -4838,8 +4830,8 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         /* EXTENT mode. Per ARCH §11.3.3 / inode.tla::OneWayInlineToExtent:
          * once EXTENT, stays EXTENT — even when new_size ≤ inline cap. */
         const uint64_t BLK = 4096u;
-        if ((new_size & (BLK - 1u)) != 0u) {
-            /* Sub-block truncate not supported. POSIX truncate(2) accepts
+        if (new_size < cur_size && (new_size & (BLK - 1u)) != 0u) {
+            /* Sub-block shrink not supported. POSIX truncate(2) accepts
              * arbitrary new_size; sync_truncate's MVP requires 4 KiB
              * alignment. */
             rs = STM_EINVAL; goto out;

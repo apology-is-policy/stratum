@@ -3803,6 +3803,15 @@ Cutover: a write that grows the file past 100 bytes migrates to extent storage:
 3. Update the inode: `si_data_kind = STM_DATA_EXTENT`, `si_extent_tree_root = <new extent tree root>`.
 4. The inline space becomes reserved (44 bytes padding + unused 100-byte union).
 
+Sparse growth by truncate follows the same one-way cutover but writes only
+an existing inline prefix, padded to one 4 KiB block. An empty inline file
+requires no data extent. Publish the new logical size only after preserving
+that prefix; the remaining range consists of holes and reads as zero. Neither
+recordsize nor the logical file size controls an allocation for this operation.
+Growing an extent-backed file likewise accepts an arbitrary byte length;
+the block-alignment restriction belongs to the existing shrink primitive.
+No on-disk layout or wire change is needed.
+
 Reverse direction (truncate from large to tiny): the inode could migrate back to inline, but we skip this — truncation to tiny is rare, and the code complexity isn't worth it. Once extent-backed, stays extent-backed.
 
 #### 11.3.4 Per-dataset inode numbering
