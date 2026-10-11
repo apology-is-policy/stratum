@@ -38,6 +38,13 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
+October 11 native-build follow-up: same-size regular-file truncation now
+refreshes mtime/ctime; the phase8 suite has 225 tests. All 73 host CTest
+suites and the LLVM22 ASan+UBSan phase8 run pass. See
+[the inode reference](reference/16-inode.md#same-size-truncate-timestamps-october-11-native-ninja-follow-up)
+and `native-truncate-timestamps-review.md` for scope and evidence. Earlier
+checkpoint records below remain historical.
+
 - **Tip**: 9.7-impl-6f — clone integration tests + two bug fixes
   uncovered at test time, closes the 9.7-impl-6 umbrella. Eight new
   tests in `tests/test_fs_clone.c` exercise the v1.0 clone surface

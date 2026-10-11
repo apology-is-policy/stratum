@@ -812,7 +812,7 @@ static inline void fs_stamp_create_times(struct stm_inode_value *iv)
 }
 
 /* Stamp mtime + ctime to "now". Used after content-change ops:
- * fs_write, fs_truncate (size or content change). POSIX: mtime
+ * fs_write and fs_truncate (including same-size truncation). POSIX: mtime
  * captures content modification + ctime captures any inode
  * metadata change (which a size/content change implies). btime
  * is preserved (immutable post-create per POSIX). */
@@ -4759,7 +4759,17 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     }
 
     uint64_t cur_size = stm_load_le64(iv.si_size);
-    if (new_size == cur_size) { rs = STM_OK; goto out; }       /* no-op */
+    if (new_size == cur_size) {
+        /* O_TRUNC on an already empty regular file still marks mtime and
+         * ctime for update. Ninja, for example, timestamps build edges by
+         * reopening an empty lock file. Keep same-size truncation allowed
+         * under seals: no contents, length or seal bits change. Publish
+         * metadata through the existing inode pin/set path (which also
+         * advances cvers on an actual record change). */
+        fs_stamp_mtime_ctime_now(&iv);
+        rs = stm_inode_set(iidx, dataset_id, ino, &iv);
+        goto out;
+    }
 
     /* P8-POSIX-7a-seals: refuse the truncate per the inode's seal mask
      * BEFORE any state mutation. SEAL_WRITE / SEAL_FUTURE_WRITE block

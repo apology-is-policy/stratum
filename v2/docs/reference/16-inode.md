@@ -617,3 +617,33 @@ matches the earlier remote-output control. The image required sufficient real
 free space: the first small-pool run correctly returned ENOSPC, preserved as
 a separate capacity failure. This is a prepared full-engine link, not a full
 native source or dependency build. Review was single-agent by Astra.
+
+## Same-size truncate timestamps (October 11, native Ninja follow-up)
+
+Successful `stm_fs_truncate` refreshes mtime/ctime even if length is unchanged.
+This corrects R81 P3-5's no-stamp assumption: POSIX ftruncate marks these
+clocks on successful regular-file truncation, and open with O_TRUNC does so
+for an existing file. An empty Ninja build lock file exposed the error: its
+stale timestamp made the next invocation unnecessarily relink its output.
+References: [ftruncate](https://pubs.opengroup.org/onlinepubs/9699919799/functions/ftruncate.html)
+and [open](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html).
+
+Only timestamps and the existing inode-set content version change. The
+per-inode pin, shared global guard, pre-flush, inode validation and publication
+path are unchanged. Same-size truncation remains permitted under seals;
+size-changing refusal paths remain unchanged. No allocator, extent, nonce,
+format or lock-order change. Existing inode-model Set covers publication;
+timestamps are outside that model's state, so no new model is introduced.
+
+The R81 clock-advance test now checks the corrected contract. The additional
+`fs_p10_truncate_same_size_stamps_and_persists` regression covers empty,
+nonempty inline and sealed extent files, unchanged contents and metadata,
+and persistence across commit/remount. Baseline 7cc86d9 fails it; verification
+and single-agent self-review are recorded in the native-build continuation.
+
+Final scoped verification: all73 host suites and225 LLVM22 ASan+UBSan phase8
+tests pass. The rebuilt-daemon guest trial now skips immediate unchanged
+builds, rebuilds on a header dependency change, runs parallel barrier jobs,
+and preserves a failing child's exit7. Runner and harness limitations remain
+explicit in `../native-truncate-timestamps-review.md`; this does not qualify
+Ninja's signal/descriptor semantics or a full native toolchain workflow.

@@ -143,3 +143,12 @@ substantive lands.
   failure mode here.
 - Memory primer roll at every chunk close: MEMORY.md index +
   project_v2_active.md tip / lineage table + project_v2_next_session.md.
+
+### October 11 native-build timestamp correction
+
+R81 P3-5's historical same-size-truncate no-stamp assumption is superseded.
+Successful regular-file truncation refreshes mtime/ctime, including an empty
+file opened with O_TRUNC. The original regression now checks clock advancement;
+new empty/inline/sealed-extent coverage checks unchanged data and remount.
+See reference/16-inode.md for the corrected contract and POSIX references.
+Review is by Astra as a single agent, not an independent audit round.

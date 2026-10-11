@@ -4040,12 +4040,12 @@ STM_TEST(fs_p7a_r81_p3_4_timestamps_persist_across_remount) {
     unlink(g_key_path);
 }
 
-/* R81 P3-5: truncate(new_size == cur_size) is a no-op and MUST NOT
- * bump mtime/ctime. The current short-circuit at fs.c:1687-1690
- * returns STM_OK before any stamping; this test pins the invariant
- * so a future refactor moving the no-op short-circuit below the
- * stamp call would regress visibly. */
-STM_TEST(fs_p7a_r81_p3_5_no_op_truncate_skips_stamp) {
+/* R81 P3-5 originally pinned a no-stamp assumption. POSIX ftruncate
+ * marks mtime/ctime on success even when length is unchanged; O_TRUNC
+ * of an empty file also requires it. Native Ninja exposed that distinction
+ * from a zero-length write. Retain this clock-advance witness with the
+ * corrected contract; the table-driven test also covers empty/extent/seals. */
+STM_TEST(fs_p7a_r81_p3_5_same_size_truncate_stamps) {
     make_tmp("p7a_r81_noop_trunc");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -4064,12 +4064,10 @@ STM_TEST(fs_p7a_r81_p3_5_no_op_truncate_skips_stamp) {
     struct stm_inode_value v0 = {0};
     STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
     uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
-    uint32_t mtime0_nsec = stm_load_le32(v0.si_mtime_nsec);
     uint64_t ctime0 = stm_load_le64(v0.si_ctime_sec);
-    uint32_t ctime0_nsec = stm_load_le32(v0.si_ctime_nsec);
     uint64_t cur_size = stm_load_le64(v0.si_size);
 
-    /* Sleep so a real stamp would advance, then call no-op truncate. */
+    /* Advance past second granularity to verify ctime as well as mtime. */
     struct timespec slp = {1, 0};
     (void)nanosleep(&slp, NULL);
 
@@ -4077,11 +4075,10 @@ STM_TEST(fs_p7a_r81_p3_5_no_op_truncate_skips_stamp) {
 
     struct stm_inode_value v1 = {0};
     STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
-    /* mtime + ctime UNCHANGED (no-op skipped the stamp). */
-    STM_ASSERT_EQ(stm_load_le64(v1.si_mtime_sec),  mtime0);
-    STM_ASSERT_EQ(stm_load_le32(v1.si_mtime_nsec), mtime0_nsec);
-    STM_ASSERT_EQ(stm_load_le64(v1.si_ctime_sec),  ctime0);
-    STM_ASSERT_EQ(stm_load_le32(v1.si_ctime_nsec), ctime0_nsec);
+    /* Successful same-size truncate advances both modification clocks. */
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_mtime_sec) > mtime0);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) > ctime0);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_size), cur_size);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -4497,7 +4494,7 @@ STM_TEST(fs_p7a_seals_write_blocks_truncate_in_either_direction) {
      * direction. */
     STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, 8u), STM_EPERM);
     STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, 32u), STM_EPERM);
-    /* No-op truncate (same size) is unconditionally OK. */
+    /* Same-size truncate is allowed; only timestamps/version change. */
     STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 16u));
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -8602,6 +8599,77 @@ STM_TEST(fs_p7e_fadvise_ro_mount_swallows_willneed_dontneed) {
     STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
     STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
 
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* Native Ninja reuses an empty lock file to timestamp each build edge.
+ * Same-length truncation must refresh metadata without changing bytes,
+ * representation, or seals. Exercise empty, inline and extent files, then
+ * check the published timestamps after a commit/remount. */
+STM_TEST(fs_p10_truncate_same_size_stamps_and_persists) {
+    make_tmp("p10_same_size_stamps");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    const size_t sizes[] = {0u, 16u, 4096u};
+    uint64_t inos[3];
+    struct stm_inode_value saved[3];
+    uint8_t data[4096];
+    memset(data, 0x5a, sizeof data);
+    for (size_t i = 0; i < 3; ++i) {
+        const uint8_t name = (uint8_t)('a' + i);
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, &name, 1,
+                                       0644u, 0, 0, &inos[i]));
+        if (sizes[i])
+            STM_ASSERT_OK(stm_fs_write(fs, 1, inos[i], 0, data, sizes[i]));
+        /* Pin an old mtime instead of relying on wall-clock sleeps. */
+        STM_ASSERT_OK(stm_fs_utimens(fs, 1, inos[i], 123u, 100u,
+                                    456u, 200u, 0u, 0u));
+        /* Existing same-size permission under seals must be preserved. */
+        if (i == 2)
+            STM_ASSERT_OK(stm_fs_add_seals(fs, 1, inos[i],
+                STM_FS_SEAL_WRITE | STM_FS_SEAL_FUTURE_WRITE |
+                STM_FS_SEAL_GROW | STM_FS_SEAL_SHRINK));
+        struct stm_inode_value before = {0};
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, inos[i], &before));
+        uint64_t now = fs_p7a_now_sec();
+        STM_ASSERT_OK(stm_fs_truncate(fs, 1, inos[i], sizes[i]));
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, inos[i], &saved[i]));
+        STM_ASSERT_TRUE(stm_load_le64(saved[i].si_mtime_sec) >= now);
+        STM_ASSERT_EQ(stm_load_le64(saved[i].si_mtime_sec),
+                      stm_load_le64(saved[i].si_ctime_sec));
+        STM_ASSERT_EQ(stm_load_le32(saved[i].si_mtime_nsec),
+                      stm_load_le32(saved[i].si_ctime_nsec));
+        /* Only mtime/ctime and the metadata version may change. Includes bytes, size, kind,
+         * ownership, flags, atime and immutable birth time. */
+        STM_ASSERT_EQ(stm_load_le32(saved[i].si_cvers),
+                      stm_load_le32(before.si_cvers) + 1u);
+        before.si_cvers = saved[i].si_cvers;
+        before.si_mtime_sec = saved[i].si_mtime_sec;
+        before.si_mtime_nsec = saved[i].si_mtime_nsec;
+        before.si_ctime_sec = saved[i].si_ctime_sec;
+        before.si_ctime_nsec = saved[i].si_ctime_nsec;
+        STM_ASSERT_MEM_EQ(&before, &saved[i], sizeof before);
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    for (size_t i = 0; i < 3; ++i) {
+        struct stm_inode_value after = {0};
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, inos[i], &after));
+        STM_ASSERT_MEM_EQ(&saved[i], &after, sizeof after);
+        uint8_t got[4096] = {0};
+        size_t nread = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, inos[i], 0, got, sizeof got, &nread));
+        STM_ASSERT_EQ(nread, sizes[i]);
+        STM_ASSERT_MEM_EQ(data, got, sizes[i]);
+    }
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);
 }

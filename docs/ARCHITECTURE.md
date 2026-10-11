@@ -3984,6 +3984,11 @@ Four timestamps per inode, 96-bit each:
 | `mtime` (modify) | Content write | Always updated on writes. |
 | `ctime` (change) | Metadata change | Updated on any inode field change (perms, owner, nlink, xattr, extent change). |
 
+Successful regular-file truncation marks mtime/ctime for update even when
+the requested length equals the current length, including O_TRUNC on an
+empty file. Data, size and seals remain unchanged in that case; same-size
+truncation is still allowed under seals. Zero-length writes remain no-ops.
+
 All four support nanosecond resolution. `statx` (Linux 4.11+) exposes them cleanly; older interfaces (`stat`) expose second resolution.
 
 #### 11.7.1 relatime semantics

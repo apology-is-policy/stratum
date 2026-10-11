@@ -673,7 +673,9 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
  *               [old_size, new_size) range that has no extent record,
  *               which is exactly what POSIX requires.
  *
- *   - NO-OP (new_size == si_size): inode unchanged; STM_OK.
+ *   - SAME SIZE (new_size == si_size): refresh mtime/ctime, preserving
+ *       contents, size, representation and seals. Metadata publication uses
+ *       the existing per-inode pin; allowed even for a sealed regular file.
  *
  * Refusals:
  *   - NULL fs (STM_EINVAL).
