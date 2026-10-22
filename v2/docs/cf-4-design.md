@@ -190,7 +190,13 @@ pending work is the BOOTSTRAP-tier sweep (the previous dirty commit's
 node retires) is skipped: those bits stay conservatively SET (never
 re-handed — the safe direction) until the next UB-dirty commit sweeps
 them, or the next mount's #791 reconcile reclaims them. Delay-only,
-bounded at one commit's retires, self-healing. The ALLOC-tier pending
+bounded at one commit's retires, self-healing. (Corrected 2026-10-22:
+not self-healing when the region is nearly full. The next UB-dirty commit
+needs those nodes for its own COW, and they are swept only at its
+promotion, after the barrier, so it answered `STM_ENOSPC` and wedged the
+filesystem with most of the region PENDING. A reserve that finds no free
+run now reuses the PENDING entries below the armed commit's target
+generation; `docs/reference/05-bootstrap-alloc.md`.) The ALLOC-tier pending
 sweep is different: it runs inside phase 2's alloc_commit, mutates the
 alloc tree, changes the roots — so it always defeats the skip.
 

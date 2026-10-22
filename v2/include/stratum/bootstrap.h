@@ -50,6 +50,16 @@
  *      It then COWs the bitmap to the other slot and writes a new header
  *      to the other header slot, fsyncing before returning.
  *
+ * One refinement the model does not have: under stm_sync_commit's defer
+ * window the sweep is promoted only after the barrier, so a commit's own
+ * COW cannot see it. A reserve that finds no free run therefore reuses the
+ * PENDING entries below the armed target generation early (see
+ * stm_bootstrap_reserve). They are exactly the entries that commit's stage
+ * would sweep, freed while building a generation at or before the
+ * authoritative one, so no durable uberblock names them; the reuse moves
+ * them from after the commit's promotion to its flush, which is where the
+ * per-component commits before CF-4 B swept them.
+ *
  * Caller-supplied `free_gen` is the current commit's generation at the
  * time of free; caller-supplied `committed_gen` is the highest generation
  * whose pre-commit state is no longer referenced by any reader. In Phase 3
@@ -220,6 +230,11 @@ void stm_bootstrap_close(stm_bootstrap *a);
  * Returned paddrs are node-aligned (a multiple of STM_BOOTSTRAP_NODE_BLOCKS
  * from the data start) — not necessarily 128-KiB unit-aligned.
  *
+ * When no run is free, PENDING entries freed below the armed commit's
+ * target generation (see stm_bootstrap_commit_defer_begin) are returned to
+ * the free set first: no durable uberblock names their nodes, so this
+ * commit's own COW may reuse them rather than fail.
+ *
  * Returns STM_ENOSPC if no run of the requested size is free.
  */
 STM_MUST_USE
@@ -290,8 +305,10 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen);
  * Collapse the N per-component stm_bootstrap_commit calls inside one
  * stm_sync_commit into ONE staged slot-pair COW. While armed (_begin),
  * stm_bootstrap_commit records max(committed_gen) and returns STM_OK
- * without I/O or in-RAM mutation. The window is then driven in three
- * steps:
+ * without I/O or in-RAM mutation. `target_gen` is the generation the
+ * commit will write; _begin also raises the bound below which a full
+ * stm_bootstrap_reserve may reuse PENDING nodes early. The window is then
+ * driven in three steps:
  *
  *   _stage:    run the scan + write the staged (bitmap, header) pair to
  *              the non-live slots at the recorded gen — its two fsyncs
@@ -318,7 +335,8 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen);
  * Single-armer contract: stm_sync_commit only, under fs->global EX +
  * s->lock (same envelope as the barrier-defer window).
  */
-void       stm_bootstrap_commit_defer_begin   (stm_bootstrap *a);
+void       stm_bootstrap_commit_defer_begin   (stm_bootstrap *a,
+                                               uint64_t target_gen);
 STM_MUST_USE
 stm_status stm_bootstrap_commit_defer_stage   (stm_bootstrap *a);
 void       stm_bootstrap_commit_defer_finalize(stm_bootstrap *a);

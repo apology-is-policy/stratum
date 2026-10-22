@@ -235,6 +235,19 @@ Deferred-free matches `allocator.tla`:
    COWs bitmap to the other slot; writes new header to the other
    header slot; fsyncs before return (fsyncs deferred to the pool
    barrier when staged inside a CF-4 B window).
+3. Inside a CF-4 B window the sweep reaches the in-RAM bitmap only at
+   `_finalize`, after the commit's own flushes. So a reserve that finds
+   no free run first returns to the free set every PENDING entry with
+   `free_gen` below the armed commit's target generation
+   (`stm_bootstrap_commit_defer_begin(a, target_gen)` sets the bound)
+   and retries. These are exactly the entries the commit's stage would
+   sweep; the reuse happens inside that commit, where the per-component
+   commits before CF-4 B swept them, so the deferred-free rule above is
+   kept at the granularity of a commit. Without it a commit whose COW
+   needed the previous commit's retires answered `STM_ENOSPC` with most
+   of the region PENDING, and the failed commit wedged the filesystem
+   (`test_fs` `fs_churn_commit_reuses_retired_metadata_nodes`,
+   `test_bootstrap` `bootstrap_full_reserve_reuses_settled_pending`).
 
 Caller-supplied `free_gen` and `committed_gen` are the pool's
 commit gens from sync.tla. The strict-less-than criterion

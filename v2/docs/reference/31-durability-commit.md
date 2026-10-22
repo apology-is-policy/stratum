@@ -107,9 +107,12 @@ change, a scrub-cursor push) changes a compared byte and defeats the skip —
 no flag plumbing. One deliberate composition delta (CF-4 B audit F2): the
 BOOTSTRAP-tier pending sweep is invisible to the UB (the bootstrap is
 self-rooted), so a commit whose only pending work is sweeping the previous
-commit's node retires IS skipped — those bits stay conservatively SET
-(never re-handed) until the next UB-dirty commit or the next mount's #791
-reconcile. Delay-only, bounded, self-healing. The stash starts invalid at
+commit's node retires IS skipped — those bits stay SET on disk until the
+next UB-dirty commit or the next mount's #791 reconcile. That commit cannot
+sweep them before its own flushes (promotion follows the barrier), so a
+reserve that finds the region full reuses them inside it (05 §"Deferred
+free", item 3); before that, a near-full region answered `STM_ENOSPC`
+there and the failed commit wedged the filesystem. The stash starts invalid at
 open, so a session's first commit always writes. Deliberate semantics
 change: gen-age is now REAL-commit count (a quiescent pool does not age;
 the CAS `min_age_txgs` policy ages with activity) — and a caller of the

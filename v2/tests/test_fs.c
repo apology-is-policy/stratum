@@ -11295,4 +11295,60 @@ STM_TEST(fs_cf4c_loop_freedom_genuinely_full) {
     unlink(g_key_path);
 }
 
+/* Create, unlink and recreate N files, one commit each, at the 8 MiB test
+ * bootstrap. The unlink commit retires the old tree's nodes as PENDING, and
+ * they are swept only when the next commit promotes, after its barrier, so
+ * the recreate commit's own COW must take them through the full-reserve
+ * reuse. Without it that commit ran out of nodes with most of the region
+ * pending, and the failure wedged the filesystem. */
+STM_TEST(fs_churn_commit_reuses_retired_metadata_nodes) {
+    make_tmp("churn_reuse");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t ds = 0, root = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "churn", &ds));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0755u, 0, 0, &root));
+
+    enum { N = 5000 };
+    char nm[16];
+    for (unsigned i = 0; i < N; i++) {
+        int nl = snprintf(nm, sizeof nm, "f%u", i);
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, ds, root, (const uint8_t *)nm,
+                                            (uint8_t)nl, 0100644u, 0, 0, &ino));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    for (unsigned i = 0; i < N; i++) {
+        int nl = snprintf(nm, sizeof nm, "f%u", i);
+        STM_ASSERT_OK(stm_fs_unlink(fs, ds, root, (const uint8_t *)nm,
+                                       (uint8_t)nl));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    for (unsigned i = 0; i < N; i++) {
+        int nl = snprintf(nm, sizeof nm, "f%u", i);
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, ds, root, (const uint8_t *)nm,
+                                            (uint8_t)nl, 0100644u, 0, 0, &ino));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(!st.wedged);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* The recreated set is what a remount reads. */
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t ino = 0;
+    int nl = snprintf(nm, sizeof nm, "f%u", (unsigned)N - 1u);
+    STM_ASSERT_OK(stm_fs_lookup(fs, ds, root, (const uint8_t *)nm, (uint8_t)nl,
+                                   &ino));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

@@ -150,6 +150,14 @@ struct stm_bootstrap {
     uint64_t   staged_gen;
     uint64_t   staged_swept_count;
     uint64_t   staged_swept_nodes;
+
+    /* A PENDING entry with free_gen below this names a node no durable
+     * uberblock can reach: it was freed while building a generation at or
+     * before the authoritative one. The sync layer raises it to each
+     * commit's target at stm_bootstrap_commit_defer_begin; it never falls,
+     * because the target only grows. 0 = no commit armed yet, nothing is
+     * reusable early. */
+    uint64_t   reuse_below_gen;
 };
 
 /* ========================================================================= */
@@ -736,6 +744,42 @@ static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nnode
     return false;
 }
 
+/* Return every PENDING entry below reuse_below_gen to the in-RAM bitmap so
+ * a reserve can hand it out before the commit that would sweep it. Only a
+ * reserve that found no free run calls this, so a pool with room keeps the
+ * sweep's normal delay. The durable bitmap still has the bits set; a crash
+ * before the next staged COW leaves them allocated-but-unreachable, which
+ * the #791 mount-time reconcile frees. Returns the nodes returned. */
+static uint64_t bootstrap_reclaim_settled(stm_bootstrap *a)
+{
+    uint64_t reclaimed = 0;
+    pending_entry **link = &a->pending_head;
+    pending_entry  *e    = a->pending_head;
+    while (e) {
+        pending_entry *next = e->next;
+        uint64_t first_node = 0;
+        /* A link that fails to map is left for the stage, which reports
+         * it as STM_ECORRUPT. */
+        if (e->free_gen < a->reuse_below_gen &&
+            paddr_to_node(a, e->paddr, &first_node)) {
+            uint64_t nnodes = e->nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
+            for (uint64_t i = 0; i < nnodes; i++)
+                bit_clear(a->bitmap, first_node + i);
+            a->pending_count--;
+            a->pending_nodes -= nnodes;
+            reclaimed += nnodes;
+            *link = next;
+            free(e);
+        } else {
+            link = &e->next;
+        }
+        e = next;
+    }
+    if (reclaimed)
+        atomic_store_explicit(&a->dirty, true, memory_order_relaxed);
+    return reclaimed;
+}
+
 stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
                               uint64_t hint_paddr,
                               uint64_t *out_paddr)
@@ -757,7 +801,9 @@ stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
     }
 
     uint64_t first_node = 0;
-    if (!find_free_run(a, start, nnodes, &first_node)) {
+    if (!find_free_run(a, start, nnodes, &first_node) &&
+        (bootstrap_reclaim_settled(a) == 0 ||
+         !find_free_run(a, start, nnodes, &first_node))) {
         return STM_ENOSPC;
     }
 
@@ -1012,9 +1058,10 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
     return STM_OK;
 }
 
-void stm_bootstrap_commit_defer_begin(stm_bootstrap *a)
+void stm_bootstrap_commit_defer_begin(stm_bootstrap *a, uint64_t target_gen)
 {
     if (!a) return;
+    if (target_gen > a->reuse_below_gen) a->reuse_below_gen = target_gen;
     a->defer_armed    = true;
     a->defer_recorded = false;
     a->defer_gen      = 0;

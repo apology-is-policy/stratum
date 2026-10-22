@@ -959,7 +959,7 @@ STM_TEST(bootstrap_cf4b_defer_single_cow) {
     uint64_t p1 = 0, p2 = 0;
     STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p1));
 
-    stm_bootstrap_commit_defer_begin(a);
+    stm_bootstrap_commit_defer_begin(a, 5);
     /* Two recorded commits (the multi-component shape). */
     STM_ASSERT_OK(stm_bootstrap_commit(a, 5));
     STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p2));
@@ -1011,7 +1011,7 @@ STM_TEST(bootstrap_cf4b_defer_cancel_then_retry) {
     uint64_t p1 = 0;
     STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p1));
 
-    stm_bootstrap_commit_defer_begin(a);
+    stm_bootstrap_commit_defer_begin(a, 7);
     STM_ASSERT_OK(stm_bootstrap_commit(a, 7));
     STM_ASSERT_OK(stm_bootstrap_commit_defer_stage(a));
     /* Simulated later-step failure: cancel without finalize. */
@@ -1129,6 +1129,64 @@ STM_TEST(bootstrap_cf4b_torn_staged_pair_falls_back) {
     STM_ASSERT_TRUE(alloc2);
     stm_bootstrap_close(a4);
 
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A full reserve reuses the PENDING nodes no durable uberblock can name:
+ * entries freed below the armed commit's target generation. An entry freed
+ * at the target is still named by the authoritative state and stays
+ * PENDING, and before any commit is armed nothing is reused early. The
+ * staged COW persists the reuse. */
+STM_TEST(bootstrap_full_reserve_reuses_settled_pending) {
+    make_tmp("settled");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+
+    uint64_t p[TEST_EXPECTED_NODES];
+    for (uint32_t i = 0; i < TEST_EXPECTED_NODES; i++)
+        STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p[i]));
+    STM_ASSERT_OK(stm_bootstrap_free(a, p[0], TEST_NODE_BLOCKS, 3));
+    STM_ASSERT_OK(stm_bootstrap_free(a, p[1], TEST_NODE_BLOCKS, 3));
+    STM_ASSERT_OK(stm_bootstrap_free(a, p[2], TEST_NODE_BLOCKS, 5));
+
+    uint64_t q = 0;
+    STM_ASSERT_ERR(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q),
+                   STM_ENOSPC);
+
+    stm_bootstrap_commit_defer_begin(a, 5);
+    uint64_t q1 = 0, q2 = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q1));
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q2));
+    STM_ASSERT_TRUE((q1 == p[0] && q2 == p[1]) || (q1 == p[1] && q2 == p[0]));
+    STM_ASSERT_ERR(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q),
+                   STM_ENOSPC);
+
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.pending_nodes, 1u);
+    STM_ASSERT_EQ(st.free_nodes, 0u);
+
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 5));
+    STM_ASSERT_OK(stm_bootstrap_commit_defer_stage(a));
+    stm_bootstrap_commit_defer_finalize(a);
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.pending_nodes, 1u);
+    STM_ASSERT_EQ(st.free_nodes, 0u);
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+
+    d = reopen_device();
+    stm_bootstrap *a2 = NULL;
+    STM_ASSERT_OK(stm_bootstrap_open(d, &a2));
+    for (uint32_t i = 0; i < 3; i++) {
+        bool alloc = false;
+        STM_ASSERT_OK(stm_bootstrap_is_allocated(a2, p[i], &alloc));
+        STM_ASSERT_TRUE(alloc);
+    }
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a2, &st));
+    STM_ASSERT_EQ(st.free_nodes, 0u);
+    stm_bootstrap_close(a2);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

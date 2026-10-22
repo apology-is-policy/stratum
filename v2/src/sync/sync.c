@@ -2966,7 +2966,8 @@ stm_status stm_sync_commit(stm_sync *s)
     }
     for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++) {
         stm_alloc *ai = s->allocs[dev];
-        if (ai) stm_bootstrap_commit_defer_begin(stm_alloc_bootstrap(ai));
+        if (ai) stm_bootstrap_commit_defer_begin(stm_alloc_bootstrap(ai),
+                                                  target_gen);
     }
 
     /* Phase 2: Flush. Keyschema first (its tree nodes get allocated
