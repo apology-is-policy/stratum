@@ -835,6 +835,25 @@ static inline void fs_stamp_ctime_now(struct stm_inode_value *iv)
     iv->si_ctime_sec = sec; iv->si_ctime_nsec = nsec;
 }
 
+/* Stamp a directory's mtime + ctime after an entry was added to or removed
+ * from it. POSIX: creating a file (open O_CREAT, mkdir, symlink, link) and
+ * removing one (unlink, rmdir) mark the PARENT's st_mtime + st_ctime for
+ * update; tools that cache a directory's listing (fontconfig, make) key on
+ * that mtime. rename stamps both parents itself. The caller holds the
+ * parent's pin, so the lookup sees the current record. Best-effort, as the
+ * other post-publish stamps are: the entry change is already published, so
+ * a failed stamp must not report the operation as failed. */
+static void fs_stamp_parent_dir_locked(stm_inode_index *iidx,
+                                       uint64_t dataset_id,
+                                       uint64_t parent_ino)
+{
+    struct stm_inode_value pv = {0};
+    if (stm_inode_lookup(iidx, dataset_id, parent_ino, &pv) == STM_OK) {
+        fs_stamp_mtime_ctime_now(&pv);
+        (void)stm_inode_set(iidx, dataset_id, parent_ino, &pv);
+    }
+}
+
 /* ========================================================================= */
 /* Format.                                                                    */
 /* ========================================================================= */
@@ -3040,6 +3059,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
         return ds;
     }
 
+    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino);
     *out_child_ino = child_ino;
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_parent);
@@ -3331,6 +3351,7 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
         fs_stamp_ctime_now(&iv2);
         (void)stm_inode_set(iidx, dataset_id, ino, &iv2);
     }
+    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino);
 
     stm_inode_unpin(iidx, h_parent);
     stm_inode_unpin(iidx, h_child);
@@ -3851,6 +3872,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
      * unlink is no longer durable-without-fsync -- POSIX-correct and
      * consistent with every other lazy-durable mutation. */
 
+    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino);
     stm_inode_unpin(iidx, h_parent);
     stm_inode_unpin(iidx, h_child);
     pthread_rwlock_unlock(&fs->global);
@@ -4341,6 +4363,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
             (void)stm_inode_set(iidx, dataset_id, child_ino, &cv2);
         }
     }
+    fs_stamp_parent_dir_locked(iidx, dataset_id, dst_parent_ino);
 
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_dst_p);
@@ -4482,6 +4505,7 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
             (void)stm_inode_set(iidx, dataset_id, src_ino, &cv2);
         }
     }
+    fs_stamp_parent_dir_locked(iidx, dataset_id, dst_parent_ino);
 
     stm_inode_unpin(iidx, h_src);
     stm_inode_unpin(iidx, h_dst_p);
@@ -4612,6 +4636,7 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
         return ds;
     }
 
+    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino);
     *out_child_ino = child_ino;
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_parent);

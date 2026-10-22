@@ -6625,6 +6625,185 @@ STM_TEST(fs_p11_r86_p2_2_rename_stamps_parent_mtime_ctime) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+/* Directory timestamps on entry changes: POSIX marks the parent's mtime +
+ * ctime when an entry is added (create, mkdir, symlink, link, O_TMPFILE
+ * linkat) or removed (unlink, rmdir). fontconfig and make decide a cached
+ * listing is stale from that mtime. A refused change moves neither. */
+struct p11_dt { uint64_t ms, cs; uint32_t mn, cn; };
+
+static struct p11_dt p11_dt_read(stm_fs *fs, uint64_t ino)
+{
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    struct p11_dt t = {
+        stm_load_le64(v.si_mtime_sec), stm_load_le64(v.si_ctime_sec),
+        stm_load_le32(v.si_mtime_nsec), stm_load_le32(v.si_ctime_nsec),
+    };
+    return t;
+}
+
+static bool p11_dt_later(uint64_t s1, uint32_t n1, uint64_t s0, uint32_t n0)
+{
+    return s1 > s0 || (s1 == s0 && n1 > n0);
+}
+
+/* Both clocks moved past `pre`. */
+static void p11_dt_assert_moved(struct p11_dt pre, struct p11_dt post)
+{
+    STM_ASSERT_TRUE(p11_dt_later(post.ms, post.mn, pre.ms, pre.mn));
+    STM_ASSERT_TRUE(p11_dt_later(post.cs, post.cn, pre.cs, pre.cn));
+}
+
+static void p11_dt_assert_same(struct p11_dt pre, struct p11_dt post)
+{
+    STM_ASSERT_EQ(post.ms, pre.ms);
+    STM_ASSERT_EQ(post.mn, pre.mn);
+    STM_ASSERT_EQ(post.cs, pre.cs);
+    STM_ASSERT_EQ(post.cn, pre.cn);
+}
+
+/* The realtime clock is read once per stamp; a short nap puts the
+ * operation's stamp strictly after the pre-read. */
+static void p11_dt_nap(void)
+{
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000 };
+    nanosleep(&ts, NULL);
+}
+
+/* A fresh volume with /d (holding file f) and /e. */
+static stm_fs *p11_dt_setup(const char *tag, uint64_t *d, uint64_t *e,
+                            uint64_t *f)
+{
+    make_tmp(tag);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"d", 1,
+                               0755u, 0, 0, d));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"e", 1,
+                               0755u, 0, 0, e));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, *d, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, f));
+    p11_dt_nap();
+    return fs;
+}
+
+static void p11_dt_teardown(stm_fs *fs)
+{
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_dir_times_create_file_stamps_parent) {
+    uint64_t d = 0, e = 0, f = 0, g = 0;
+    stm_fs *fs = p11_dt_setup("dt_create", &d, &e, &f);
+    struct p11_dt pre = p11_dt_read(fs, d);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, d, (const uint8_t *)"g", 1,
+                                     0644u, 0, 0, &g));
+    p11_dt_assert_moved(pre, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_create_refused_leaves_parent) {
+    uint64_t d = 0, e = 0, f = 0, g = 0;
+    stm_fs *fs = p11_dt_setup("dt_create_eexist", &d, &e, &f);
+    struct p11_dt pre = p11_dt_read(fs, d);
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, d, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &g), STM_EEXIST);
+    p11_dt_assert_same(pre, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_mkdir_stamps_parent) {
+    uint64_t d = 0, e = 0, f = 0, s = 0;
+    stm_fs *fs = p11_dt_setup("dt_mkdir", &d, &e, &f);
+    struct p11_dt pre = p11_dt_read(fs, d);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, d, (const uint8_t *)"s", 1,
+                               0755u, 0, 0, &s));
+    p11_dt_assert_moved(pre, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_symlink_stamps_parent) {
+    uint64_t d = 0, e = 0, f = 0, l = 0;
+    stm_fs *fs = p11_dt_setup("dt_symlink", &d, &e, &f);
+    struct p11_dt pre = p11_dt_read(fs, d);
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, d, (const uint8_t *)"l", 1,
+                                 (const uint8_t *)"f", 1, 0, 0, &l));
+    p11_dt_assert_moved(pre, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_link_stamps_only_the_new_parent) {
+    uint64_t d = 0, e = 0, f = 0;
+    stm_fs *fs = p11_dt_setup("dt_link", &d, &e, &f);
+    struct p11_dt pre_d = p11_dt_read(fs, d), pre_e = p11_dt_read(fs, e);
+    STM_ASSERT_OK(stm_fs_link(fs, 1, d, (const uint8_t *)"f", 1,
+                              e, (const uint8_t *)"h", 1));
+    p11_dt_assert_moved(pre_e, p11_dt_read(fs, e));
+    p11_dt_assert_same(pre_d, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_link_by_ino_stamps_parent) {
+    uint64_t d = 0, e = 0, f = 0;
+    stm_fs *fs = p11_dt_setup("dt_link_by_ino", &d, &e, &f);
+    struct p11_dt pre = p11_dt_read(fs, e);
+    STM_ASSERT_OK(stm_fs_link_by_ino(fs, 1, f, e, (const uint8_t *)"h", 1));
+    p11_dt_assert_moved(pre, p11_dt_read(fs, e));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_linkat_anon_stamps_parent) {
+    uint64_t d = 0, e = 0, f = 0, ino = 0;
+    stm_fs *fs = p11_dt_setup("dt_linkat_anon", &d, &e, &f);
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &ino));
+    struct p11_dt pre = p11_dt_read(fs, d);
+    STM_ASSERT_OK(stm_fs_linkat_anon(fs, 1, ino, d,
+                                     (const uint8_t *)"named", 5));
+    p11_dt_assert_moved(pre, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_unlink_stamps_parent) {
+    uint64_t d = 0, e = 0, f = 0;
+    stm_fs *fs = p11_dt_setup("dt_unlink", &d, &e, &f);
+    struct p11_dt pre = p11_dt_read(fs, d);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, d, (const uint8_t *)"f", 1));
+    p11_dt_assert_moved(pre, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_unlink_refused_leaves_parent) {
+    /* EISDIR is refused under both pins, past every lookup. */
+    uint64_t d = 0, e = 0, f = 0, s = 0;
+    stm_fs *fs = p11_dt_setup("dt_unlink_eisdir", &d, &e, &f);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, d, (const uint8_t *)"s", 1,
+                               0755u, 0, 0, &s));
+    p11_dt_nap();
+    struct p11_dt pre = p11_dt_read(fs, d);
+    STM_ASSERT_EQ(stm_fs_unlink(fs, 1, d, (const uint8_t *)"s", 1),
+                  STM_EISDIR);
+    p11_dt_assert_same(pre, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_rmdir_stamps_parent) {
+    uint64_t d = 0, e = 0, f = 0, s = 0;
+    stm_fs *fs = p11_dt_setup("dt_rmdir", &d, &e, &f);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, d, (const uint8_t *)"s", 1,
+                               0755u, 0, 0, &s));
+    p11_dt_nap();
+    struct p11_dt pre = p11_dt_read(fs, d);
+    STM_ASSERT_OK(stm_fs_rmdir(fs, 1, d, (const uint8_t *)"s", 1));
+    p11_dt_assert_moved(pre, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
 STM_TEST(fs_p11_r86_p2_1_rename_exchange_immediate_cycle_refused) {
     /* R86 P2-1 regression: RENAME_EXCHANGE that would create an
      * immediate parent-child cycle refuses with STM_EINVAL.

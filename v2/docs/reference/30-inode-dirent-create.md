@@ -33,10 +33,14 @@ probe walk + the per-commit metadata flush, **not** file-data bandwidth (§30.6)
    value and **re-write** it — `stm_inode_set`.
 5. **Link the dirent** — `stm_dirent_alloc` (§30.4). On failure, the inode is
    freed (full rollback).
+6. **Stamp the parent** — `fs_stamp_parent_dir_locked`: the parent's mtime +
+   ctime move (POSIX: creating an entry modifies the directory). Best-effort,
+   after the dirent is published; unlink and rmdir stamp the same way.
 
 > **Per-create metadata work** = TWO inode btree inserts to the same key
 > (alloc at step 2, the timestamp-stamped rewrite at step 4) + one read-back
-> lookup (step 3) + one dirent insert (step 5). Folding steps 2–4 into a single
+> lookup (step 3) + one dirent insert (step 5) + the parent's lookup and
+> rewrite (step 6). Folding steps 2–4 into a single
 > stamped insert (have `stm_inode_alloc` return the gen so the read-back is
 > unnecessary, and construct the final value once) is a tracked throughput seam
 > — **S-3** (§30.7). It is layering-sensitive: the inode layer allocs a bare
