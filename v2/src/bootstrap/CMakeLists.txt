@@ -6,4 +6,4 @@ target_include_directories(stm_bootstrap PUBLIC
 
 target_link_libraries(stm_bootstrap
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  stm_hash stm_block stm_sb)
+    PUBLIC  stm_hash stm_block stm_sb stm_ebr)

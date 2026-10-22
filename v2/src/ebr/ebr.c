@@ -391,6 +391,12 @@ uint64_t stm_ebr_current_epoch(void)
     return atomic_load(&g.current_epoch);
 }
 
+/* try_advance frees a record retired at r on the advance from r+2 to r+3. */
+bool stm_ebr_epoch_reclaimable(uint64_t retire_epoch)
+{
+    return atomic_load(&g.current_epoch) >= retire_epoch + 3u;
+}
+
 uint64_t stm_ebr_pending_retires(void)
 {
     return atomic_load(&g.pending_retires);

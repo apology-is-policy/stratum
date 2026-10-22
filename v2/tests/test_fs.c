@@ -16,6 +16,7 @@
 
 #include <stratum/alloc.h>
 #include <stratum/block_inject.h>
+#include <stratum/bootstrap.h>
 #include <stratum/cas.h>
 #include <stratum/cdc.h>
 #include <stratum/dataset.h>
@@ -11338,6 +11339,12 @@ STM_TEST(fs_churn_commit_reuses_retired_metadata_nodes) {
     stm_fs_stats st;
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
     STM_ASSERT_TRUE(!st.wedged);
+    /* The run needed the early reuse: a geometry change that let it fit
+     * without one would leave this test passing on the bug. */
+    stm_bootstrap_stats bs;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(
+        stm_alloc_bootstrap(stm_sync_alloc(stm_fs_sync(fs), 0)), &bs));
+    STM_ASSERT_TRUE(bs.early_reclaimed_nodes > 0);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 
     /* The recreated set is what a remount reads. */

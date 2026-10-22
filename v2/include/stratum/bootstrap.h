@@ -58,7 +58,12 @@
  * would sweep, freed while building a generation at or before the
  * authoritative one, so no durable uberblock names them; the reuse moves
  * them from after the commit's promotion to its flush, which is where the
- * per-component commits before CF-4 B swept them.
+ * per-component commits before CF-4 B swept them. The model's FREE also
+ * stands for "no reader holds it", which the generation alone does not
+ * give a commit that runs beside readers (CF-4 C's reclaim-on-ENOSPC
+ * commits hold fs->global SH; wait-free lookups hold no lock at all), so
+ * an early reuse also waits until EBR would free an object retired when
+ * the entry was freed (stm_ebr_epoch_reclaimable).
  *
  * Caller-supplied `free_gen` is the current commit's generation at the
  * time of free; caller-supplied `committed_gen` is the highest generation
@@ -161,6 +166,8 @@ typedef struct {
     uint64_t header_slot_live;        /* 0 or 1                                 */
     uint64_t bitmap_slot_live;        /* 0 or 1                                 */
     uint64_t bitmap_gen;              /* monotonic on each commit               */
+    uint64_t early_reclaimed_nodes;   /* PENDING nodes a full reserve took back
+                                         before their sweep (monotone)         */
 } stm_bootstrap_stats;
 
 /* ========================================================================= */
@@ -232,10 +239,14 @@ void stm_bootstrap_close(stm_bootstrap *a);
  *
  * When no run is free, PENDING entries freed below the armed commit's
  * target generation (see stm_bootstrap_commit_defer_begin) are returned to
- * the free set first: no durable uberblock names their nodes, so this
- * commit's own COW may reuse them rather than fail.
+ * the free set first, those whose EBR epoch every pinned reader has left:
+ * no durable uberblock names their nodes and no descent can still reach
+ * them, so this commit's own COW may reuse them rather than fail. It
+ * advances EBR (stm_ebr_try_advance, never waiting) to get there.
  *
- * Returns STM_ENOSPC if no run of the requested size is free.
+ * Returns STM_ENOSPC if no run of the requested size is free, and
+ * STM_EBUSY between stm_bootstrap_commit_defer_stage and _finalize, where
+ * the staged bitmap is about to replace the live one.
  */
 STM_MUST_USE
 stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
@@ -252,16 +263,21 @@ stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
  * stm_bootstrap_commit(committed_gen) with `free_gen < committed_gen` will
  * transition the entry to FREE (clearing the bitmap bits).
  *
- * free_gen contract (CF-4 B): commits no longer advance the pool gens
- * when nothing else changed (the clean-commit short-circuit), so a bare
- * free stamped `free_gen == current_gen` on an otherwise-quiescent pool
- * defers its sweep to the next MUTATING commit — pass a gen <= the
- * authoritative gen for next-commit reclamation. Every in-tree caller
- * either rides other dirt or stamps auth_gen. The entry is in-RAM only;
+ * free_gen contract: stamp the generation whose build made the node
+ * unreferenced -- the armed commit's target inside stm_sync_commit,
+ * stm_sync_current_gen outside it -- never an older one. A full reserve
+ * in a commit reuses entries stamped below that commit's target before
+ * the commit's uberblock lands, so a node stamped with the authoritative
+ * generation while that uberblock still names it would be overwritten
+ * live, and a crash would mount a corrupt tree. Under the clean-commit
+ * short-circuit (CF-4 B) a bare free may wait for the next MUTATING
+ * commit to be swept; that is a delay only, and a full reserve takes it
+ * early. Every in-tree caller stamps this way. The entry is in-RAM only;
  * a crash loses it and the still-set bits are reclaimed by the mount
  * reconcile (#791).
  *
- * Returns STM_EINVAL for alignment/range errors.
+ * Returns STM_EINVAL for alignment/range errors, and for a free_gen below
+ * the last armed target (the part of the contract this pool can see).
  */
 STM_MUST_USE
 stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks,
@@ -332,8 +348,10 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen);
  * the pre-window pair untouched; the R7a self-csum fallback covers
  * every torn/partial staged outcome.
  *
- * Single-armer contract: stm_sync_commit only, under fs->global EX +
- * s->lock (same envelope as the barrier-defer window).
+ * Single-armer contract: stm_sync_commit only, under s->lock (same
+ * envelope as the barrier-defer window). fs->global is EX for a commit and
+ * SH for CF-4 C's reclaim-on-ENOSPC commits, so readers may run beside the
+ * window: see the early reuse in stm_bootstrap_reserve.
  */
 void       stm_bootstrap_commit_defer_begin   (stm_bootstrap *a,
                                                uint64_t target_gen);

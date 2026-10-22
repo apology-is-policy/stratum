@@ -36,6 +36,7 @@
 
 #include <stratum/bootstrap.h>
 #include <stratum/block.h>
+#include <stratum/ebr.h>
 #include <stratum/hash.h>
 #include <stratum/super.h>       /* STM_UB_SIZE = 4096 */
 
@@ -95,6 +96,7 @@ struct pending_entry {
     uint64_t       paddr;       /* absolute device paddr of first block */
     uint32_t       nblocks;     /* multiple of STM_BOOTSTRAP_NODE_BLOCKS */
     uint64_t       free_gen;    /* free_gen stamp */
+    uint64_t       free_epoch;  /* stm_ebr_current_epoch() at the free */
     pending_entry *next;
 };
 
@@ -158,6 +160,7 @@ struct stm_bootstrap {
      * because the target only grows. 0 = no commit armed yet, nothing is
      * reusable early. */
     uint64_t   reuse_below_gen;
+    uint64_t   early_reclaimed_nodes;   /* monotone; stats */
 };
 
 /* ========================================================================= */
@@ -749,9 +752,18 @@ static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nnode
  * reserve that found no free run calls this, so a pool with room keeps the
  * sweep's normal delay. The durable bitmap still has the bits set; a crash
  * before the next staged COW leaves them allocated-but-unreachable, which
- * the #791 mount-time reconcile frees. Returns the nodes returned. */
+ * the #791 mount-time reconcile frees. Returns the nodes returned.
+ *
+ * The generation bound keeps every durable uberblock off the node; it says
+ * nothing about readers. A descent pinned in EBR before the previous
+ * commit published can still be on its way to the node's paddr (a
+ * wait-free lookup, or a reader under fs->global SH beside CF-4 C's
+ * reclaim-on-ENOSPC commits, which run under SH), so an entry is reused
+ * only once EBR would free an object retired when it was. The advances
+ * never wait: a lagging reader leaves its entries PENDING. */
 static uint64_t bootstrap_reclaim_settled(stm_bootstrap *a)
 {
+    for (int i = 0; i < 3; i++) (void)stm_ebr_try_advance();
     uint64_t reclaimed = 0;
     pending_entry **link = &a->pending_head;
     pending_entry  *e    = a->pending_head;
@@ -761,6 +773,7 @@ static uint64_t bootstrap_reclaim_settled(stm_bootstrap *a)
         /* A link that fails to map is left for the stage, which reports
          * it as STM_ECORRUPT. */
         if (e->free_gen < a->reuse_below_gen &&
+            stm_ebr_epoch_reclaimable(e->free_epoch) &&
             paddr_to_node(a, e->paddr, &first_node)) {
             uint64_t nnodes = e->nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
             for (uint64_t i = 0; i < nnodes; i++)
@@ -775,8 +788,10 @@ static uint64_t bootstrap_reclaim_settled(stm_bootstrap *a)
         }
         e = next;
     }
-    if (reclaimed)
+    if (reclaimed) {
+        a->early_reclaimed_nodes += reclaimed;
         atomic_store_explicit(&a->dirty, true, memory_order_relaxed);
+    }
     return reclaimed;
 }
 
@@ -787,8 +802,13 @@ stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
     if (!a || !out_paddr) return STM_EINVAL;
     if (nblocks == 0) return STM_EINVAL;
     if (nblocks % STM_BOOTSTRAP_NODE_BLOCKS != 0) return STM_EINVAL;
+    /* Between _stage and _finalize the staged bitmap is promoted wholesale
+     * and the staged sweep counts are subtracted, so a bit set or an entry
+     * reclaimed here would be lost or counted twice. */
+    if (a->staged_region) return STM_EBUSY;
 
     uint64_t nnodes = nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
+    if (nnodes > a->total_nodes) return STM_ENOSPC;
 
     /* Determine start node from hint + rove. */
     uint64_t start = a->rove_next_node;
@@ -825,6 +845,10 @@ stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks
     if (nblocks == 0) return STM_EINVAL;
     if (nblocks % STM_BOOTSTRAP_NODE_BLOCKS != 0) return STM_EINVAL;
 
+    /* An older stamp would let the armed commit's full reserve reuse the
+     * node before its uberblock lands (see the free_gen contract). */
+    if (free_gen < a->reuse_below_gen) return STM_EINVAL;
+
     uint64_t nnodes = nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
     uint64_t first_node = 0;
     if (!paddr_to_node(a, paddr, &first_node)) return STM_EINVAL;
@@ -859,6 +883,7 @@ stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks
         if (e->paddr == paddr && e->nblocks == nblocks) {
             /* Exact match: retry semantics. */
             if (free_gen > e->free_gen) e->free_gen = free_gen;
+            e->free_epoch = stm_ebr_current_epoch();
             return STM_OK;
         }
         if (first_node < e_first + e_nnodes && e_first < first_node + nnodes) {
@@ -871,6 +896,7 @@ stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks
     ent->paddr    = paddr;
     ent->nblocks  = nblocks;
     ent->free_gen = free_gen;
+    ent->free_epoch = stm_ebr_current_epoch();
     ent->next     = a->pending_head;
     a->pending_head = ent;
     a->pending_count++;
@@ -1221,6 +1247,7 @@ stm_status stm_bootstrap_stats_get(const stm_bootstrap *a, stm_bootstrap_stats *
     out->header_slot_live      = a->hdr_slot_live;
     out->bitmap_slot_live      = a->bitmap_slot_live;
     out->bitmap_gen            = a->bitmap_gen;
+    out->early_reclaimed_nodes = a->early_reclaimed_nodes;
     return STM_OK;
 }
 

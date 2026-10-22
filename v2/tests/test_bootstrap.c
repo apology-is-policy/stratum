@@ -23,6 +23,7 @@
 #include "tharness.h"
 #include <stratum/bootstrap.h>
 #include <stratum/block.h>
+#include <stratum/ebr.h>
 #include <stratum/super.h>
 
 #include <stdio.h>
@@ -1187,6 +1188,149 @@ STM_TEST(bootstrap_full_reserve_reuses_settled_pending) {
     STM_ASSERT_OK(stm_bootstrap_stats_get(a2, &st));
     STM_ASSERT_EQ(st.free_nodes, 0u);
     stm_bootstrap_close(a2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A descent pinned in EBR before the free may still read the node's paddr
+ * from disk, so while it stays pinned a full reserve leaves the entry
+ * PENDING; once it exits, the reserve takes the node. */
+STM_TEST(bootstrap_early_reuse_waits_for_pinned_reader) {
+    make_tmp("pinned");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *reader = stm_ebr_register();
+    STM_ASSERT_TRUE(reader != NULL);
+
+    uint64_t p[TEST_EXPECTED_NODES];
+    for (uint32_t i = 0; i < TEST_EXPECTED_NODES; i++)
+        STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p[i]));
+    stm_ebr_enter(reader);
+    STM_ASSERT_OK(stm_bootstrap_free(a, p[0], TEST_NODE_BLOCKS, 3));
+    stm_bootstrap_commit_defer_begin(a, 5);
+
+    uint64_t q = 0;
+    STM_ASSERT_ERR(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q),
+                   STM_ENOSPC);
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.pending_nodes, 1u);
+    STM_ASSERT_EQ(st.early_reclaimed_nodes, 0u);
+
+    stm_ebr_exit(reader);
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q));
+    STM_ASSERT_EQ(q, p[0]);
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.pending_nodes, 0u);
+    STM_ASSERT_EQ(st.early_reclaimed_nodes, 1u);
+
+    stm_ebr_thread_free(reader);
+    stm_bootstrap_commit_defer_cancel(a);
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A window cancelled after an early reuse keeps the in-RAM reuse and the
+ * dirty taint, so the next commit's COW makes the cleared bits durable. */
+STM_TEST(bootstrap_cancel_after_early_reuse_persists_on_next_commit) {
+    make_tmp("cancelreuse");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+
+    uint64_t p[TEST_EXPECTED_NODES];
+    for (uint32_t i = 0; i < TEST_EXPECTED_NODES; i++)
+        STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p[i]));
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 1));
+    STM_ASSERT_OK(stm_bootstrap_free(a, p[0], TEST_NODE_BLOCKS, 3));
+    STM_ASSERT_OK(stm_bootstrap_free(a, p[1], TEST_NODE_BLOCKS, 3));
+
+    stm_bootstrap_commit_defer_begin(a, 5);
+    uint64_t q = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q));
+    STM_ASSERT_TRUE(q == p[0] || q == p[1]);
+    uint64_t unused = (q == p[0]) ? p[1] : p[0];
+    stm_bootstrap_commit_defer_cancel(a);
+
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.pending_nodes, 0u);
+    STM_ASSERT_EQ(st.free_nodes, 1u);
+    STM_ASSERT_EQ(st.early_reclaimed_nodes, 2u);
+
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 7));
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+
+    d = reopen_device();
+    stm_bootstrap *a2 = NULL;
+    STM_ASSERT_OK(stm_bootstrap_open(d, &a2));
+    bool alloc = true;
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a2, unused, &alloc));
+    STM_ASSERT_TRUE(!alloc);
+    STM_ASSERT_OK(stm_bootstrap_is_allocated(a2, q, &alloc));
+    STM_ASSERT_TRUE(alloc);
+    stm_bootstrap_close(a2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* The pool refuses the part of the free_gen contract it can see: a stamp
+ * below the armed target would be reused before that commit's uberblock
+ * lands, while the authoritative one may still name the node. */
+STM_TEST(bootstrap_free_below_armed_target_refused) {
+    make_tmp("freebelow");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+    uint64_t p0 = 0, p1 = 0;
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p0));
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p1));
+    stm_bootstrap_commit_defer_begin(a, 5);
+    STM_ASSERT_ERR(stm_bootstrap_free(a, p0, TEST_NODE_BLOCKS, 3), STM_EINVAL);
+    STM_ASSERT_OK(stm_bootstrap_free(a, p1, TEST_NODE_BLOCKS, 5));
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.pending_nodes, 1u);
+    stm_bootstrap_commit_defer_cancel(a);
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Between _stage and _finalize the staged bitmap replaces the live one
+ * wholesale, so a reserve there is refused rather than lost. An oversized
+ * request fails before it can take anything back early. */
+STM_TEST(bootstrap_reserve_refused_while_staged_and_oversized) {
+    make_tmp("staged");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+
+    uint64_t p[TEST_EXPECTED_NODES];
+    for (uint32_t i = 0; i < TEST_EXPECTED_NODES; i++)
+        STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p[i]));
+    STM_ASSERT_OK(stm_bootstrap_free(a, p[0], TEST_NODE_BLOCKS, 3));
+    stm_bootstrap_commit_defer_begin(a, 5);
+
+    uint64_t q = 0;
+    STM_ASSERT_ERR(stm_bootstrap_reserve(a,
+                       (uint32_t)(TEST_EXPECTED_NODES + 1u) * TEST_NODE_BLOCKS,
+                       0, &q), STM_ENOSPC);
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.pending_nodes, 1u);
+    STM_ASSERT_EQ(st.early_reclaimed_nodes, 0u);
+
+    STM_ASSERT_OK(stm_bootstrap_commit(a, 5));
+    STM_ASSERT_OK(stm_bootstrap_commit_defer_stage(a));
+    STM_ASSERT_ERR(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q),
+                   STM_EBUSY);
+    stm_bootstrap_commit_defer_finalize(a);
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.pending_nodes, 0u);
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q));
+    STM_ASSERT_EQ(q, p[0]);
+    stm_bootstrap_close(a);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

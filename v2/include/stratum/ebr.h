@@ -154,6 +154,16 @@ void stm_ebr_drain(void);
 
 uint64_t stm_ebr_current_epoch(void);
 
+/*
+ * Whether every reader that could have seen an object retired at
+ * `retire_epoch` (a stm_ebr_current_epoch() read when it became
+ * unreachable) has exited: the rule stm_ebr_try_advance applies before it
+ * runs a destructor. For a resource EBR does not free itself, such as a
+ * bootstrap node's paddr, which a pinned descent may still be about to
+ * read from disk.
+ */
+bool stm_ebr_epoch_reclaimable(uint64_t retire_epoch);
+
 /* Approximate — reads atomics without locking. */
 uint64_t stm_ebr_pending_retires(void);
 
