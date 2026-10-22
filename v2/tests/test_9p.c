@@ -1824,6 +1824,65 @@ STM_TEST(p9_setattr_wide_nsec_refused_before_it_narrows) {
     unlink(g_key_path);
 }
 
+/* A bad time refuses the whole request: the size and mode arms that come
+ * first in the handler must not have run. */
+STM_TEST(p9_setattr_bad_nsec_refuses_before_any_arm) {
+    make_tmp("9p_setattr_nsec_whole");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t f = mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlopen(req, 2, 101, STM_9P_O_RDWR);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_twrite(req, 3, 101, 0, "ABCDE", 5);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    STM_ASSERT_EQ(stm_load_le64(v0.si_size), 5u);
+    uint32_t mode0 = stm_load_le32(v0.si_mode);
+    struct p9_ut pre = p9_ut_read(fs, f);
+
+    const uint32_t tbits[] = {
+        STM_9P_SETATTR_ATIME | STM_9P_SETATTR_ATIME_SET,
+        STM_9P_SETATTR_MTIME | STM_9P_SETATTR_MTIME_SET,
+    };
+    for (size_t i = 0; i < sizeof(tbits) / sizeof(tbits[0]); i++) {
+        p9_ut_nap();
+        sz = build_tsetattr(req, 4, 101,
+                            STM_9P_SETATTR_SIZE | STM_9P_SETATTR_MODE | tbits[i],
+                            0600, 0, 0, /*size=*/2,
+                            100, i == 0 ? 1000000000u : 0,
+                            200, i == 1 ? 1000000000u : 0);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+        STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+        struct stm_inode_value v = {0};
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+        STM_ASSERT_EQ(stm_load_le64(v.si_size), 5u);
+        STM_ASSERT_EQ(stm_load_le32(v.si_mode), mode0);
+        struct p9_ut post = p9_ut_read(fs, f);
+        STM_ASSERT_EQ(post.ms, pre.ms); STM_ASSERT_EQ(post.mn, pre.mn);
+        STM_ASSERT_EQ(post.cs, pre.cs); STM_ASSERT_EQ(post.cn, pre.cn);
+    }
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(p9_statfs_returns_stratum_magic) {
     make_tmp("9p_statfs");
     stm_fs_format_opts fopts = default_format_opts();

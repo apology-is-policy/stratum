@@ -3303,6 +3303,15 @@ static stm_status h_setattr(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
     if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
+    /* The request is judged whole before any arm mutates: a client time
+     * whose wire nsec is out of range is refused here, not after the
+     * truncate, chmod and chown arms below have run. The wire nsec is 64
+     * bits, so this also keeps the narrowing below exact. */
+    if (((valid & STM_9P_SETATTR_ATIME) && (valid & STM_9P_SETATTR_ATIME_SET) &&
+         at_nsec >= 1000000000u) ||
+        ((valid & STM_9P_SETATTR_MTIME) && (valid & STM_9P_SETATTR_MTIME_SET) &&
+         mt_nsec >= 1000000000u))
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
 
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds  = f->dataset_id;
@@ -3377,18 +3386,14 @@ static stm_status h_setattr(stm_9p_server *s,
      * mask is OMIT, which stm_fs_utimens reads under the inode pin (the
      * snapshot above predates the truncate, chmod and chown arms and any
      * concurrent write, so writing it back would undo their stamps). A
-     * _SET bit without its time is a modifier with nothing to modify. The
-     * wire nsec is 64 bits: it is range-checked before it narrows. */
+     * _SET bit without its time is a modifier with nothing to modify. Each
+     * _SET nsec was range-checked before the pin. */
     if ((valid & STM_9P_SETATTR_ATIME) || (valid & STM_9P_SETATTR_MTIME)) {
         uint64_t use_at_sec = 0, use_mt_sec = 0;
         uint32_t use_at_nsec = STM_UTIME_OMIT, use_mt_nsec = STM_UTIME_OMIT;
         if (valid & STM_9P_SETATTR_ATIME) {
             use_at_nsec = STM_UTIME_NOW;
             if (valid & STM_9P_SETATTR_ATIME_SET) {
-                if (at_nsec >= 1000000000u) {
-                    ecode = STM_9P_ECODE_EINVAL;
-                    goto phase_c;
-                }
                 use_at_sec  = at_sec;
                 use_at_nsec = (uint32_t)at_nsec;
             }
@@ -3396,10 +3401,6 @@ static stm_status h_setattr(stm_9p_server *s,
         if (valid & STM_9P_SETATTR_MTIME) {
             use_mt_nsec = STM_UTIME_NOW;
             if (valid & STM_9P_SETATTR_MTIME_SET) {
-                if (mt_nsec >= 1000000000u) {
-                    ecode = STM_9P_ECODE_EINVAL;
-                    goto phase_c;
-                }
                 use_mt_sec  = mt_sec;
                 use_mt_nsec = (uint32_t)mt_nsec;
             }
