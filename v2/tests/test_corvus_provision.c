@@ -16,6 +16,7 @@
  */
 
 #include "tharness.h"
+#include "tsock.h"
 #include "test_fs_common.h"
 
 #include <stratum/corvus_client.h>
@@ -55,6 +56,7 @@ typedef struct {
     char              sock_path[128];
     pthread_t         thread;
     bool              thread_started;
+    atomic_bool       stop;
     stm_corvus_status status;       /* status byte to return */
 } fake_corvus;
 
@@ -62,8 +64,8 @@ static void *fake_corvus_thread(void *arg)
 {
     fake_corvus *fc = arg;
     for (;;) {
-        int cfd = accept(fc->listen_fd, NULL, NULL);
-        if (cfd < 0) return NULL;   /* listen fd shut down → exit */
+        int cfd = tsock_accept(fc->listen_fd, &fc->stop);
+        if (cfd < 0) return NULL;   /* stopped, or the socket failed */
 
         uint8_t req[STM_CORVUS_REQUEST_MAX];
         size_t  got = 0;
@@ -120,6 +122,7 @@ static void fake_corvus_start(fake_corvus *fc, const char *tag,
                                 stm_corvus_status status)
 {
     memset(fc, 0, sizeof *fc);
+    atomic_init(&fc->stop, false);
     fc->status = status;
     snprintf(fc->sock_path, sizeof fc->sock_path,
              "/tmp/stm_cvprov_%d_%s.sock", (int)getpid(), tag);
@@ -139,16 +142,17 @@ static void fake_corvus_start(fake_corvus *fc, const char *tag,
     fc->thread_started = true;
 }
 
+/* Flag, join, then close (see tsock.h). */
 static void fake_corvus_stop(fake_corvus *fc)
 {
-    if (fc->listen_fd >= 0) {
-        (void)shutdown(fc->listen_fd, SHUT_RDWR);
-        close(fc->listen_fd);
-        fc->listen_fd = -1;
-    }
     if (fc->thread_started) {
+        atomic_store_explicit(&fc->stop, true, memory_order_release);
         pthread_join(fc->thread, NULL);
         fc->thread_started = false;
+    }
+    if (fc->listen_fd >= 0) {
+        close(fc->listen_fd);
+        fc->listen_fd = -1;
     }
     (void)unlink(fc->sock_path);
 }

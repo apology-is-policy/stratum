@@ -4,7 +4,8 @@
  *
  * Exposed separately from the daemon's main() so integration tests
  * can drive the same code paths in-process (spawn a thread running
- * `janus_serve_loop`, close the listen fd to shut down).
+ * `janus_serve_loop`; to shut down, set the flag, join, then close
+ * the listen fd).
  */
 #ifndef STRATUM_V2_JANUS_DAEMON_H
 #define STRATUM_V2_JANUS_DAEMON_H
@@ -26,12 +27,6 @@
 int janus_listen_unix(const char *path, mode_t mode);
 
 /*
- * Accept one client connection on `listen_fd`. Returns the client
- * fd on success or a negative stm_status.
- */
-int janus_accept_once(int listen_fd);
-
-/*
  * Get the peer UID on `client_fd`. Uses SO_PEERCRED on Linux,
  * LOCAL_PEERCRED on macOS. Returns STM_ENOTSUPPORTED on platforms
  * where peer-cred isn't available; caller decides whether to
@@ -49,9 +44,10 @@ stm_status janus_serve_client(int client_fd, janus_synfs *synfs);
 /*
  * Main accept loop. Accepts clients on `listen_fd` and serves each
  * in turn (single-threaded — one client at a time, keeping the
- * critical section small). Returns when `*shutdown_flag` becomes
- * non-zero (caller's signal handler sets it) or when listen_fd is
- * closed out from under us.
+ * critical section small). Returns STM_OK within one 200 ms poll of
+ * `*shutdown_flag` becoming non-zero, with `listen_fd` still open
+ * (closing it is the caller's job, after the loop returns); STM_EIO
+ * if the socket fails while no shutdown is requested.
  */
 stm_status janus_serve_loop(int listen_fd, janus_synfs *synfs,
                               atomic_int *shutdown_flag);

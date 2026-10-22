@@ -182,14 +182,13 @@ static int parse_pool_arg(char *s, pool_arg *out)
 }
 
 static atomic_int g_shutdown;       /* zero-initialised */
-static int         g_listen_fd = -1;
 
+/* The serve loop polls and sees the flag within one poll; the listen
+ * fd is closed by cmd_serve once the loop has returned. */
 static void on_sigterm(int sig)
 {
     (void)sig;
     atomic_store_explicit(&g_shutdown, 1, memory_order_release);
-    /* Interrupt accept() by closing the listen fd. */
-    if (g_listen_fd >= 0) { int fd = g_listen_fd; g_listen_fd = -1; close(fd); }
 }
 
 static int cmd_serve(int argc, char **argv)
@@ -278,7 +277,6 @@ static int cmd_serve(int argc, char **argv)
         fprintf(stderr, "serve: listen on %s failed\n", socket_path);
         goto fail_after_synfs;
     }
-    g_listen_fd = lfd;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -287,15 +285,7 @@ static int cmd_serve(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
 
     stm_status rc = janus_serve_loop(lfd, synfs, &g_shutdown);
-    /* R11 P2-2: close/null in the same order the signal handler uses
-     * (read → null → close) so a SIGTERM interleaved with the main
-     * thread's cleanup can't race us into a double-close that steals
-     * whichever fd the OS hands out next. */
-    {
-        int fd_to_close = g_listen_fd;
-        g_listen_fd = -1;
-        if (fd_to_close >= 0) close(fd_to_close);
-    }
+    close(lfd);
     unlink(socket_path);
     janus_synfs_destroy(synfs);
     for (size_t i = 0; i < n_pools; i++) free(pools_storage[i]);

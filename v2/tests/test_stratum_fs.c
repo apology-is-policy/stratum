@@ -63,18 +63,12 @@ static void *accept_loop_thread(void *arg)
 
 static void wake_and_join(accept_ctx *ctx, pthread_t worker)
 {
+    /* stm_stratumd_accept_loop polls and re-checks the flag, so the
+     * listen fd stays open until the caller closes it after the join.
+     * Closing it here, under the polling worker, would free the fd
+     * number for reuse while the worker can still poll or accept on
+     * it. */
     atomic_store_explicit(&ctx->stop_flag, true, memory_order_release);
-    /* On macOS, fork+exec'd stratum-fs children inherit listen_fd
-     * before exec — even with FD_CLOEXEC, the timing of the kernel's
-     * fd-table cleanup means a shutdown() may not unblock accept()
-     * if a recently-exited child still has a pending fd reference.
-     * close() forcibly invalidates the fd at the syscall level which
-     * always unblocks accept() with EBADF. We accept the small
-     * doubly-close cost: the destroy_fixture caller's later close()
-     * will then return EBADF (harmless). */
-    int saved_fd = ctx->listen_fd;
-    ctx->listen_fd = -1;
-    close(saved_fd);
     pthread_join(worker, NULL);
 }
 
@@ -141,8 +135,7 @@ static fixture make_fixture(const char *tag)
 static void destroy_fixture(fixture *f)
 {
     wake_and_join(&f->ctx, f->worker);
-    /* listen_fd already closed inside wake_and_join (set to -1). */
-    if (f->listen_fd >= 0) close(f->listen_fd);
+    close(f->listen_fd);
     STM_ASSERT_OK(stm_fs_unmount(f->fs));
     (void)unlink(g_sock_path);
 }

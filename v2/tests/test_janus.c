@@ -42,6 +42,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ── helpers ────────────────────────────────────────────────────────── */
@@ -68,6 +69,7 @@ typedef struct {
     int           listen_fd;
     janus_synfs  *synfs;
     atomic_int    shutdown_flag;
+    atomic_bool   returned;
     pthread_t     thread;
     stm_status    thread_rc;
 } daemon_thread;
@@ -76,6 +78,7 @@ static void *daemon_main(void *arg)
 {
     daemon_thread *d = arg;
     d->thread_rc = janus_serve_loop(d->listen_fd, d->synfs, &d->shutdown_flag);
+    atomic_store_explicit(&d->returned, true, memory_order_release);
     return NULL;
 }
 
@@ -120,10 +123,12 @@ static stm_status spawn_daemon(const uint8_t pool_uuid[16],
 static void stop_daemon(daemon_thread *d, const char *socket_path)
 {
     if (!d || !d->synfs) return;
+    /* The loop sees the flag on its own; closing the listen fd under a
+     * thread in accept() can deadlock it (see tsock.h), so it is closed
+     * only after the join. */
     atomic_store_explicit(&d->shutdown_flag, 1, memory_order_release);
-    /* close the listen fd so accept() returns immediately. */
-    if (d->listen_fd >= 0) { close(d->listen_fd); d->listen_fd = -1; }
     pthread_join(d->thread, NULL);
+    if (d->listen_fd >= 0) { close(d->listen_fd); d->listen_fd = -1; }
     unlink(socket_path);
     janus_synfs_destroy(d->synfs);
     d->synfs = NULL;
@@ -466,6 +471,55 @@ STM_TEST(janus_audit_log_records_unwrap)
 }
 
 /* ── R11 regression tests ───────────────────────────────────────────── */
+
+/* The serve loop must stop on its flag alone, leaving the listen fd
+ * open: the only other way to wake a blocked accept() from another
+ * thread is a close(), and on macOS a close() racing the loop's entry
+ * into accept() deadlocks both threads in the kernel. */
+STM_TEST(janus_serve_loop_stops_on_flag_with_listen_fd_open)
+{
+    char *dir = tmp_dir();
+    STM_ASSERT(dir);
+    char keyfile[1024], sock[1024];
+    snprintf(keyfile, sizeof keyfile, "%s/keyfile", dir);
+    snprintf(sock,     sizeof sock,     "%s/sock",     dir);
+    make_keyfile(keyfile);
+
+    daemon_thread d;
+    STM_ASSERT_OK(spawn_daemon(TEST_UUID, keyfile, sock, &d));
+    /* Let the loop pass its first flag check and wait for a client. */
+    struct timespec settle = { 0, 100 * 1000 * 1000 };
+    nanosleep(&settle, NULL);
+
+    atomic_store_explicit(&d.shutdown_flag, 1, memory_order_release);
+    bool returned = false;
+    for (int i = 0; i < 200 && !returned; i++) {
+        struct timespec tick = { 0, 10 * 1000 * 1000 };
+        nanosleep(&tick, NULL);
+        returned = atomic_load_explicit(&d.returned, memory_order_acquire);
+    }
+    if (!returned) {
+        /* Still in accept(): a client wakes it, so the join cannot hang
+         * and the test fails on the assertion below instead. */
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof addr);
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, sock, sizeof addr.sun_path - 1);
+        (void)connect(c, (struct sockaddr *)&addr, sizeof addr);
+        close(c);
+    }
+    pthread_join(d.thread, NULL);
+    STM_ASSERT_TRUE(returned);
+    STM_ASSERT_EQ((int)d.thread_rc, (int)STM_OK);
+    STM_ASSERT(fcntl(d.listen_fd, F_GETFD) != -1);
+
+    close(d.listen_fd);
+    unlink(sock);
+    janus_synfs_destroy(d.synfs);
+    tmp_rm(dir);
+    free(dir);
+}
 
 /* R11 P1-1: verify the socket file ends up at mode 0600 after
  * janus_listen_unix. Previously the chmod was best-effort (silent

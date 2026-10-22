@@ -11,6 +11,7 @@
  * conn-2 threads writing /event.
  */
 #include "tharness.h"
+#include "tsock.h"
 
 #include <stratum/9p.h>
 #include <stratum/9p_client.h>
@@ -129,15 +130,8 @@ static void *accept_thread(void *arg)
 {
     accept_ctx *ax = (accept_ctx *)arg;
     while (1) {
-        if (atomic_load_explicit(&ax->stop_flag, memory_order_acquire))
-            break;
-        int client_fd = accept(ax->listen_fd, NULL, NULL);
-        if (client_fd < 0) {
-            if (errno == EINTR || errno == ECONNABORTED) continue;
-            if (atomic_load_explicit(&ax->stop_flag, memory_order_acquire))
-                break;
-            return NULL;
-        }
+        int client_fd = tsock_accept(ax->listen_fd, &ax->stop_flag);
+        if (client_fd < 0) return NULL;
         conn_ctx *cx = malloc(sizeof *cx);
         if (!cx) { close(client_fd); continue; }
         cx->fd = client_fd;
@@ -190,19 +184,11 @@ static void setup_fixture(slate_fixture *f, const char *tag)
 
 static void destroy_fixture(slate_fixture *f)
 {
+    /* Flag, join, then close (see tsock.h). */
     atomic_store_explicit(&f->ctx.stop_flag, true, memory_order_release);
-    /* On macOS, shutdown(2) on AF_UNIX listen sockets does NOT always
-     * unblock accept(2) — close(2) is the reliable wakeup. We pay a
-     * small race risk (a connection that races accept() between the
-     * close and the kernel's fd invalidation could surface as
-     * EBADF on accept(), which the loop treats as stop) for the
-     * deterministic shutdown. Mirrors test_stratum_fs's wake_and_join.
-     * (R113-class lesson — also why stratum-slate's main.c uses
-     * close(listen_fd) for daemon shutdown.) */
-    int lf = f->listen_fd;
-    f->listen_fd = -1;
-    close(lf);
     pthread_join(f->accept_tid, NULL);
+    close(f->listen_fd);
+    f->listen_fd = -1;
     stm_slate_stop(f->slate);
     /* Per-conn pthreads are detached; they exit when their client
      * fd hits EOF (which is now, because the test client closed)

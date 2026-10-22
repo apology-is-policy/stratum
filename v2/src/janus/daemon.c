@@ -20,7 +20,9 @@
 #include <stratum/types.h>
 
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -84,16 +86,6 @@ int janus_listen_unix(const char *path, mode_t mode)
         return STM_EIO;
     }
     return fd;
-}
-
-int janus_accept_once(int listen_fd)
-{
-    for (;;) {
-        int fd = accept(listen_fd, NULL, NULL);
-        if (fd >= 0) return fd;
-        if (errno == EINTR) continue;
-        return STM_EIO;
-    }
 }
 
 stm_status janus_peer_uid(int client_fd, uid_t *out_uid)
@@ -224,6 +216,12 @@ stm_status janus_serve_client(int client_fd, janus_synfs *synfs)
     return rc;
 }
 
+static bool shutdown_requested(atomic_int *shutdown_flag)
+{
+    return shutdown_flag
+        && atomic_load_explicit(shutdown_flag, memory_order_acquire);
+}
+
 stm_status janus_serve_loop(int listen_fd, janus_synfs *synfs,
                               atomic_int *shutdown_flag)
 {
@@ -245,14 +243,34 @@ stm_status janus_serve_loop(int listen_fd, janus_synfs *synfs,
     uid_t self_uid = geteuid();
 
     for (;;) {
-        if (shutdown_flag && atomic_load_explicit(shutdown_flag,
-                                                    memory_order_acquire))
-            break;
-        int cfd = janus_accept_once(listen_fd);
+        if (shutdown_requested(shutdown_flag)) break;
+
+        /* Never block in accept(): another thread closing or shutting
+         * down the listening socket does not reliably wake it. On
+         * macOS shutdown() leaves it blocked, and a close() that races
+         * its entry into accept() deadlocks both threads in the kernel
+         * until a client connects; on Linux close() leaves it blocked.
+         * Poll with a timeout and re-check the flag instead, the shape
+         * of stratumd's SWISS-4g loops. */
+        struct pollfd pfd = { listen_fd, POLLIN, 0 };
+        int ready = poll(&pfd, 1, /*timeout_ms=*/200);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return STM_EIO;
+        }
+        if (ready == 0) continue;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            if (shutdown_requested(shutdown_flag)) break;
+            return STM_EIO;
+        }
+        if (!(pfd.revents & POLLIN)) continue;
+
+        int cfd = accept(listen_fd, NULL, NULL);
         if (cfd < 0) {
-            if (shutdown_flag && atomic_load_explicit(shutdown_flag,
-                                                        memory_order_acquire))
-                break;
+            /* A client that gave up before we took it is not a
+             * daemon failure. */
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            if (shutdown_requested(shutdown_flag)) break;
             /* Accept failure with shutdown not requested = abort. */
             return STM_EIO;
         }

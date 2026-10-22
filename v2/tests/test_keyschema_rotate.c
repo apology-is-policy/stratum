@@ -531,9 +531,11 @@ static stm_status spawn_daemon_with_keyfile(const uint8_t pool_uuid[16],
 static void stop_daemon(daemon_thread *d, const char *sock)
 {
     if (!d || !d->synfs) return;
+    /* Flag, join, then close: closing the listen fd under a thread in
+     * accept() can deadlock it (see tsock.h). */
     atomic_store_explicit(&d->shutdown_flag, 1, memory_order_release);
-    if (d->listen_fd >= 0) { close(d->listen_fd); d->listen_fd = -1; }
     pthread_join(d->thread, NULL);
+    if (d->listen_fd >= 0) { close(d->listen_fd); d->listen_fd = -1; }
     unlink(sock);
     janus_synfs_destroy(d->synfs);
     d->synfs = NULL;

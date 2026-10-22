@@ -13,6 +13,7 @@
  */
 
 #include "tharness.h"
+#include "tsock.h"
 
 #include <stratum/corvus_client.h>
 #include <stratum/types.h>
@@ -454,13 +455,14 @@ typedef struct {
     size_t       last_request_len;
     /* Counter — increments on every accept. */
     atomic_int   n_accepts;
+    atomic_bool  stop;
 } fake_corvus_unwrap;
 
 static void *fake_corvus_unwrap_thread(void *arg)
 {
     fake_corvus_unwrap *fc = arg;
     for (;;) {
-        int cfd = accept(fc->listen_fd, NULL, NULL);
+        int cfd = tsock_accept(fc->listen_fd, &fc->stop);
         if (cfd < 0) return NULL;
         int n = atomic_fetch_add(&fc->n_accepts, 1);
 
@@ -503,6 +505,7 @@ static int fake_corvus_unwrap_start(fake_corvus_unwrap *fc, const char *tag)
 {
     memset(fc, 0, sizeof *fc);
     atomic_init(&fc->n_accepts, 0);
+    atomic_init(&fc->stop, false);
     snprintf(fc->sock_path, sizeof fc->sock_path,
              "/tmp/stm_corvus_unwrap_%d_%s.sock", (int)getpid(), tag);
     (void)unlink(fc->sock_path);
@@ -525,11 +528,12 @@ static int fake_corvus_unwrap_start(fake_corvus_unwrap *fc, const char *tag)
     return 0;
 }
 
+/* Call after the harness thread is joined (see tsock.h). */
 static void fake_corvus_unwrap_stop(fake_corvus_unwrap *fc)
 {
     if (fc->listen_fd >= 0) {
-        (void)shutdown(fc->listen_fd, SHUT_RDWR);
         close(fc->listen_fd);
+        fc->listen_fd = -1;
     }
     (void)unlink(fc->sock_path);
 }
@@ -848,11 +852,11 @@ STM_TEST(corvus_unwrap_no_retry_on_bad_auth)
         STM_ASSERT_EQ((int)dek[i], 0);
     }
 
-    /* Cleanly stop the harness by accepting a probe connection — the
-     * thread is sitting in accept() since we configured n_responses=2.
-     * Easiest cleanup: shutdown the listener which wakes accept. */
-    fake_corvus_unwrap_stop(&fc);
+    /* The harness is still waiting for a second client (n_responses=2):
+     * raise its stop flag and join before closing the listener. */
+    atomic_store_explicit(&fc.stop, true, memory_order_release);
     pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
     free(r1);
     free(r2);
 }
@@ -1862,10 +1866,11 @@ STM_TEST(corvus_wrap_no_retry_on_perm_denied)
     STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 1);
     STM_ASSERT_EQ((long long)env_len, 0LL);
 
-    /* Harness is sitting in accept() (n_responses=2); shutdown wakes
-     * it so the join is clean. */
-    fake_corvus_unwrap_stop(&fc);
+    /* The harness is still waiting for a second client (n_responses=2):
+     * raise its stop flag and join before closing the listener. */
+    atomic_store_explicit(&fc.stop, true, memory_order_release);
     pthread_join(tid, NULL);
+    fake_corvus_unwrap_stop(&fc);
     free(r1);
     free(r2);
 }
