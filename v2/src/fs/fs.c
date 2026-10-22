@@ -824,6 +824,26 @@ static inline void fs_stamp_mtime_ctime_now(struct stm_inode_value *iv)
     iv->si_ctime_sec = sec; iv->si_ctime_nsec = nsec;
 }
 
+/* stm_fs_utimens: an nsec is a stored value in [0, 999999999] or one of
+ * the two sentinels. */
+static inline bool fs_utime_nsec_ok(uint32_t nsec)
+{
+    return nsec < 1000000000u || nsec == STM_UTIME_NOW ||
+           nsec == STM_UTIME_OMIT;
+}
+
+/* Apply one stm_fs_utimens field: NOW takes the shared clock read, OMIT
+ * leaves the field, anything else is stored as given. */
+static inline void fs_utime_apply(le64 *fsec, le32 *fnsec,
+                                  uint64_t sec, uint32_t nsec,
+                                  le64 now_sec, le32 now_nsec)
+{
+    if (nsec == STM_UTIME_OMIT) return;
+    if (nsec == STM_UTIME_NOW) { *fsec = now_sec; *fnsec = now_nsec; return; }
+    *fsec  = stm_store_le64(sec);
+    *fnsec = stm_store_le32(nsec);
+}
+
 /* Stamp ctime to "now". Used after metadata-change ops: chmod,
  * chown, link, unlink (the linked/unlinked inode), setxattr,
  * removexattr, rename. POSIX: ctime captures any inode metadata
@@ -4130,9 +4150,9 @@ stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     /* R81 P3-6: ctime_nsec arg is now ignored (P8-POSIX-7a auto-stamps
      * ctime to "now"); skip its validation so weird values don't
-     * spuriously reject. atime_nsec / mtime_nsec are still stored
-     * and need POSIX bounds. */
-    if (atime_nsec >= 1000000000u || mtime_nsec >= 1000000000u)
+     * spuriously reject. atime_nsec / mtime_nsec are stored or are one
+     * of the two sentinels. */
+    if (!fs_utime_nsec_ok(atime_nsec) || !fs_utime_nsec_ok(mtime_nsec))
         return STM_EINVAL;
 
     pthread_rwlock_rdlock(&fs->global);
@@ -4158,20 +4178,29 @@ stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         pthread_rwlock_unlock(&fs->global);
         return ls;
     }
-    v.si_atime_sec  = stm_store_le64(atime_sec);
-    v.si_atime_nsec = stm_store_le32(atime_nsec);
-    v.si_mtime_sec  = stm_store_le64(mtime_sec);
-    v.si_mtime_nsec = stm_store_le32(mtime_nsec);
+    /* Both omitted changes nothing, ctime included (utimensat(2)). */
+    if (atime_nsec == STM_UTIME_OMIT && mtime_nsec == STM_UTIME_OMIT) {
+        stm_inode_unpin(iidx, h);
+        pthread_rwlock_unlock(&fs->global);
+        return STM_OK;
+    }
+    /* One clock read serves a NOW field and ctime, so a NOW atime, a NOW
+     * mtime and the ctime they imply are the same instant. An OMIT field
+     * keeps the value read above, under the pin: a write or truncate that
+     * stamped it since the caller last looked is not undone. */
+    le64 now_sec; le32 now_nsec;
+    fs_clock_now_le(&now_sec, &now_nsec);
+    fs_utime_apply(&v.si_atime_sec, &v.si_atime_nsec,
+                   atime_sec, atime_nsec, now_sec, now_nsec);
+    fs_utime_apply(&v.si_mtime_sec, &v.si_mtime_nsec,
+                   mtime_sec, mtime_nsec, now_sec, now_nsec);
     /* P8-POSIX-7a: ctime auto-stamps to "now" on every utimens call
-     * (POSIX utimensat semantics: setting atime/mtime is a metadata
-     * change → ctime updates). The historical caller-supplied
-     * ctime_sec/ctime_nsec args are now IGNORED — kept in the
-     * signature for API stability. Future API cleanup may drop them.
-     * If caller-supplied ctime is non-zero, we still ignore it; the
-     * pre-7a "0/0 = leave unchanged" semantic is gone — the closest
-     * non-mutating equivalent is "don't call utimens at all". */
+     * that changes a time (POSIX utimensat semantics: setting atime/mtime
+     * is a metadata change → ctime updates). The historical caller-supplied
+     * ctime_sec/ctime_nsec args are IGNORED — kept in the signature for
+     * API stability. */
     (void)ctime_sec; (void)ctime_nsec;
-    fs_stamp_ctime_now(&v);
+    v.si_ctime_sec = now_sec; v.si_ctime_nsec = now_nsec;
 
     stm_status ss = stm_inode_set(iidx, dataset_id, ino, &v);
     stm_inode_unpin(iidx, h);

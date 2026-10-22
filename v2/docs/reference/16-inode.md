@@ -688,3 +688,35 @@ exchange, refusals at four gates (create EEXIST, link and link_by_ino EEXIST
 after the nlink bump, unlink EISDIR, rmdir ENOTEMPTY), and the link race
 (`fs_dir_times_link_rechecks_dst_parent_under_pin`, two threads: the test
 holds the child's pin so the link blocks past its first check).
+
+## Setting times: NOW and OMIT (October 22, Thylacine time setter)
+
+`stm_fs_utimens` takes two nsec sentinels, the Linux values:
+`STM_UTIME_NOW` (0x3FFFFFFF) sets that field from the filesystem's clock and
+`STM_UTIME_OMIT` (0x3FFFFFFE) leaves it as it is. Any other nsec at or past
+1e9 is STM_EINVAL. One clock read serves a NOW atime, a NOW mtime and the
+ctime they imply, so all three are the same instant. An OMIT field keeps the
+value read under the inode pin. With both fields OMIT nothing changes, ctime
+included, as utimensat(2) specifies.
+
+The 9P server's Tsetattr now follows 9P2000.L as the Linux v9fs client and
+QEMU's virtfs read it. A time in the mask takes the client's sec/nsec when
+its `_SET` bit is set and the server's clock when it is clear; a time not in
+the mask is OMIT. A `_SET` bit without its time changes nothing. The wire's
+64-bit nsec is range-checked before it narrows. Before, the handler ignored
+the `_SET` bits and always stored the client's fields, so a client asking for
+"now" with zeroed fields got the epoch. It also filled a time it was not
+setting from a snapshot taken before the truncate, chmod and chown arms ran.
+So a Tsetattr that truncated and set atime in one request wrote the old mtime
+back over the truncate's stamp, and an atime-only request could do the same
+to a concurrent write's.
+
+Thylacine's time setter exposed both: its SYS_WSTAT sends a "now" time as the
+bit without `_SET`. The Linux client fills the fields with its own clock even
+then, which is why the defect had stayed hidden.
+
+Tests: `tests/test_fs_phase8.c` `fs_utimens_*` (NOW, OMIT both ways, both
+OMIT, refused nsec values next to the sentinels) and `tests/test_9p.c`
+`p9_setattr_time_set_bits_choose_client_or_server_clock`,
+`p9_setattr_atime_with_size_keeps_the_truncates_mtime` and
+`p9_setattr_wide_nsec_refused_before_it_narrows`.

@@ -18,6 +18,7 @@
 
 #include <stratum/9p.h>
 #include <stratum/fs.h>
+#include <stratum/inode.h>
 #include <stratum/types.h>
 
 #include <errno.h>
@@ -26,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -1652,6 +1654,168 @@ STM_TEST(p9_setattr_size_on_dir_returns_einval) {
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
     STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Tsetattr times (9P2000.L): a time in the mask takes the client's sec/nsec
+ * with its _SET bit and the server's clock without; a time not in the mask
+ * is left as it is NOW, not as the handler's earlier snapshot had it. */
+struct p9_ut { uint64_t as, ms, cs; uint32_t an, mn, cn; };
+
+static struct p9_ut p9_ut_read(stm_fs *fs, uint64_t ino)
+{
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    struct p9_ut t = {
+        stm_load_le64(v.si_atime_sec), stm_load_le64(v.si_mtime_sec),
+        stm_load_le64(v.si_ctime_sec),
+        stm_load_le32(v.si_atime_nsec), stm_load_le32(v.si_mtime_nsec),
+        stm_load_le32(v.si_ctime_nsec),
+    };
+    return t;
+}
+
+static void p9_ut_nap(void)
+{
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000 };
+    nanosleep(&ts, NULL);
+}
+
+STM_TEST(p9_setattr_time_set_bits_choose_client_or_server_clock) {
+    make_tmp("9p_setattr_times");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t f = mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tsetattr(req, 2, 101,
+                                  STM_9P_SETATTR_ATIME | STM_9P_SETATTR_ATIME_SET |
+                                  STM_9P_SETATTR_MTIME | STM_9P_SETATTR_MTIME_SET,
+                                  0, 0, 0, 0, 100, 5, 200, 6);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RSETATTR);
+    struct p9_ut set = p9_ut_read(fs, f);
+    STM_ASSERT_EQ(set.as, 100u); STM_ASSERT_EQ(set.an, 5u);
+    STM_ASSERT_EQ(set.ms, 200u); STM_ASSERT_EQ(set.mn, 6u);
+
+    /* Without the _SET bits the wire's times are not the answer. */
+    p9_ut_nap();
+    sz = build_tsetattr(req, 3, 101,
+                        STM_9P_SETATTR_ATIME | STM_9P_SETATTR_MTIME,
+                        0, 0, 0, 0, 7, 8, 9, 10);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RSETATTR);
+    struct p9_ut now = p9_ut_read(fs, f);
+    STM_ASSERT_EQ(now.as, now.cs); STM_ASSERT_EQ(now.an, now.cn);
+    STM_ASSERT_EQ(now.ms, now.cs); STM_ASSERT_EQ(now.mn, now.cn);
+    STM_ASSERT_TRUE(now.cs > set.cs || (now.cs == set.cs && now.cn > set.cn));
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_setattr_atime_with_size_keeps_the_truncates_mtime) {
+    make_tmp("9p_setattr_size_atime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t f = mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlopen(req, 2, 101, STM_9P_O_RDWR);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_twrite(req, 3, 101, 0, "ABCDE", 5);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tsetattr(req, 4, 101,
+                        STM_9P_SETATTR_MTIME | STM_9P_SETATTR_MTIME_SET,
+                        0, 0, 0, 0, 0, 0, 200, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RSETATTR);
+    STM_ASSERT_EQ(p9_ut_read(fs, f).ms, 200u);
+
+    /* One request: truncate (stamps mtime) and set atime. */
+    p9_ut_nap();
+    sz = build_tsetattr(req, 5, 101,
+                        STM_9P_SETATTR_SIZE |
+                        STM_9P_SETATTR_ATIME | STM_9P_SETATTR_ATIME_SET,
+                        0, 0, 0, /*size=*/2, 100, 0, 0, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RSETATTR);
+    struct p9_ut post = p9_ut_read(fs, f);
+    STM_ASSERT_EQ(post.as, 100u); STM_ASSERT_EQ(post.an, 0u);
+    STM_ASSERT_TRUE(post.ms > 200u);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_setattr_wide_nsec_refused_before_it_narrows) {
+    make_tmp("9p_setattr_nsec");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t f = mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    struct p9_ut pre = p9_ut_read(fs, f);
+    /* 2^32 + 5 narrows to a valid 5; 1e9 is out of range as it stands. */
+    const uint64_t bad[] = { (1ull << 32) + 5u, 1000000000u };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        uint32_t sz = build_tsetattr(req, 2, 101,
+                                      STM_9P_SETATTR_ATIME | STM_9P_SETATTR_ATIME_SET,
+                                      0, 0, 0, 0, 100, bad[i], 0, 0);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+        STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+        sz = build_tsetattr(req, 3, 101,
+                            STM_9P_SETATTR_MTIME | STM_9P_SETATTR_MTIME_SET,
+                            0, 0, 0, 0, 0, 0, 100, bad[i]);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+        STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+    }
+    struct p9_ut post = p9_ut_read(fs, f);
+    STM_ASSERT_EQ(post.as, pre.as); STM_ASSERT_EQ(post.an, pre.an);
+    STM_ASSERT_EQ(post.ms, pre.ms); STM_ASSERT_EQ(post.mn, pre.mn);
 
     free(req); free(resp);
     stm_9p_server_destroy(s);

@@ -6919,6 +6919,99 @@ STM_TEST(fs_dir_times_link_rechecks_dst_parent_under_pin) {
     p11_dt_teardown(fs);
 }
 
+/* stm_fs_utimens sentinels: NOW takes the filesystem's clock, OMIT keeps
+ * the field as it is under the pin, and both OMIT changes nothing. */
+struct p11_ut { uint64_t as, ms, cs; uint32_t an, mn, cn; };
+
+static struct p11_ut p11_ut_read(stm_fs *fs, uint64_t ino)
+{
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    struct p11_ut t = {
+        stm_load_le64(v.si_atime_sec), stm_load_le64(v.si_mtime_sec),
+        stm_load_le64(v.si_ctime_sec),
+        stm_load_le32(v.si_atime_nsec), stm_load_le32(v.si_mtime_nsec),
+        stm_load_le32(v.si_ctime_nsec),
+    };
+    return t;
+}
+
+static void p11_ut_assert_same(struct p11_ut pre, struct p11_ut post)
+{
+    STM_ASSERT_EQ(post.as, pre.as); STM_ASSERT_EQ(post.an, pre.an);
+    STM_ASSERT_EQ(post.ms, pre.ms); STM_ASSERT_EQ(post.mn, pre.mn);
+    STM_ASSERT_EQ(post.cs, pre.cs); STM_ASSERT_EQ(post.cn, pre.cn);
+}
+
+STM_TEST(fs_utimens_now_is_one_clock_read_for_both_and_ctime) {
+    uint64_t d = 0, e = 0, f = 0;
+    stm_fs *fs = p11_dt_setup("ut_now", &d, &e, &f);
+    STM_ASSERT_OK(stm_fs_utimens(fs, 1, f, 100u, 1u, 200u, 2u, 0u, 0u));
+    struct p11_ut pre = p11_ut_read(fs, f);
+    p11_dt_nap();
+    STM_ASSERT_OK(stm_fs_utimens(fs, 1, f, 7u, STM_UTIME_NOW,
+                                 9u, STM_UTIME_NOW, 0u, 0u));
+    struct p11_ut post = p11_ut_read(fs, f);
+    STM_ASSERT_EQ(post.as, post.cs); STM_ASSERT_EQ(post.an, post.cn);
+    STM_ASSERT_EQ(post.ms, post.cs); STM_ASSERT_EQ(post.mn, post.cn);
+    STM_ASSERT_TRUE(p11_dt_later(post.cs, post.cn, pre.cs, pre.cn));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_utimens_omit_keeps_the_field_and_stamps_ctime) {
+    uint64_t d = 0, e = 0, f = 0;
+    stm_fs *fs = p11_dt_setup("ut_omit", &d, &e, &f);
+    STM_ASSERT_OK(stm_fs_utimens(fs, 1, f, 100u, 1u, 200u, 2u, 0u, 0u));
+    struct p11_ut pre = p11_ut_read(fs, f);
+    p11_dt_nap();
+    STM_ASSERT_OK(stm_fs_utimens(fs, 1, f, 300u, 3u,
+                                 0u, STM_UTIME_OMIT, 0u, 0u));
+    struct p11_ut mid = p11_ut_read(fs, f);
+    STM_ASSERT_EQ(mid.as, 300u); STM_ASSERT_EQ(mid.an, 3u);
+    STM_ASSERT_EQ(mid.ms, 200u); STM_ASSERT_EQ(mid.mn, 2u);
+    STM_ASSERT_TRUE(p11_dt_later(mid.cs, mid.cn, pre.cs, pre.cn));
+    /* The mirror: atime omitted, mtime now. */
+    p11_dt_nap();
+    STM_ASSERT_OK(stm_fs_utimens(fs, 1, f, 0u, STM_UTIME_OMIT,
+                                 0u, STM_UTIME_NOW, 0u, 0u));
+    struct p11_ut post = p11_ut_read(fs, f);
+    STM_ASSERT_EQ(post.as, 300u); STM_ASSERT_EQ(post.an, 3u);
+    STM_ASSERT_EQ(post.ms, post.cs); STM_ASSERT_EQ(post.mn, post.cn);
+    STM_ASSERT_TRUE(p11_dt_later(post.cs, post.cn, mid.cs, mid.cn));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_utimens_both_omit_changes_nothing) {
+    uint64_t d = 0, e = 0, f = 0;
+    stm_fs *fs = p11_dt_setup("ut_omit2", &d, &e, &f);
+    STM_ASSERT_OK(stm_fs_utimens(fs, 1, f, 100u, 1u, 200u, 2u, 0u, 0u));
+    struct p11_ut pre = p11_ut_read(fs, f);
+    p11_dt_nap();
+    STM_ASSERT_OK(stm_fs_utimens(fs, 1, f, 5u, STM_UTIME_OMIT,
+                                 6u, STM_UTIME_OMIT, 0u, 0u));
+    p11_ut_assert_same(pre, p11_ut_read(fs, f));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_utimens_refuses_an_nsec_that_is_no_time_and_no_sentinel) {
+    uint64_t d = 0, e = 0, f = 0;
+    stm_fs *fs = p11_dt_setup("ut_einval", &d, &e, &f);
+    STM_ASSERT_OK(stm_fs_utimens(fs, 1, f, 100u, 1u, 200u, 2u, 0u, 0u));
+    struct p11_ut pre = p11_ut_read(fs, f);
+    p11_dt_nap();
+    const uint32_t bad[] = { 1000000000u, STM_UTIME_OMIT - 1u,
+                             STM_UTIME_NOW + 1u, UINT32_MAX };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        STM_ASSERT_ERR(stm_fs_utimens(fs, 1, f, 1u, bad[i], 1u, 0u, 0u, 0u),
+                       STM_EINVAL);
+        STM_ASSERT_ERR(stm_fs_utimens(fs, 1, f, 1u, STM_UTIME_NOW,
+                                      1u, bad[i], 0u, 0u),
+                       STM_EINVAL);
+    }
+    p11_ut_assert_same(pre, p11_ut_read(fs, f));
+    p11_dt_teardown(fs);
+}
+
 STM_TEST(fs_p11_r86_p2_1_rename_exchange_immediate_cycle_refused) {
     /* R86 P2-1 regression: RENAME_EXCHANGE that would create an
      * immediate parent-child cycle refuses with STM_EINVAL.

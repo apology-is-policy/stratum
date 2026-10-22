@@ -480,12 +480,19 @@ STM_MUST_USE
 stm_status stm_fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                            uint32_t uid, uint32_t gid);
 
+/* stm_fs_utimens nsec sentinels, the Linux UTIME_NOW / UTIME_OMIT values:
+ * NOW sets the field from the filesystem's clock, OMIT leaves it as it is. */
+#define STM_UTIME_NOW   ((uint32_t)0x3FFFFFFFu)
+#define STM_UTIME_OMIT  ((uint32_t)0x3FFFFFFEu)
+
 /*
  * Set atime + mtime nanosecond-precision timestamps on an inode.
- * `*_nsec` are in [0, 999999999]. ctime is updated automatically by
- * the wrapper to reflect the metadata change (caller-supplied via
- * `ctime_sec` / `ctime_nsec`; pass 0 in both to leave unchanged —
- * future: integrate a real clock at P8-POSIX-7's `statx` shape).
+ * Each `*_nsec` is in [0, 999999999] (the field takes `*_sec` / `*_nsec`),
+ * STM_UTIME_NOW (the filesystem's clock; the `*_sec` argument is ignored)
+ * or STM_UTIME_OMIT (left unchanged, read under the inode pin); anything
+ * else is STM_EINVAL. ctime is stamped to the same clock read whenever a
+ * field changes; with both fields OMIT nothing changes. The `ctime_sec` /
+ * `ctime_nsec` arguments are ignored.
  */
 STM_MUST_USE
 stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,

@@ -3371,23 +3371,41 @@ static stm_status h_setattr(stm_9p_server *s,
         }
     }
 
-    /* ATIME / MTIME. ATIME_SET / MTIME_SET indicate the sec/nsec is
-     * client-supplied; without those bits but with ATIME / MTIME, the
-     * client wants "now" (Linux UTIME_NOW semantics). For v2.0 we
-     * always plumb the supplied sec/nsec; stm_fs_utimens stamps ctime
-     * automatically. */
+    /* ATIME / MTIME (9P2000.L, the Linux v9fs / QEMU virtfs reading): a
+     * time in the mask takes the client's sec/nsec when its _SET bit is
+     * set and the server's clock when it is clear; a time not in the
+     * mask is OMIT, which stm_fs_utimens reads under the inode pin (the
+     * snapshot above predates the truncate, chmod and chown arms and any
+     * concurrent write, so writing it back would undo their stamps). A
+     * _SET bit without its time is a modifier with nothing to modify. The
+     * wire nsec is 64 bits: it is range-checked before it narrows. */
     if ((valid & STM_9P_SETATTR_ATIME) || (valid & STM_9P_SETATTR_MTIME)) {
-        /* If a field isn't being updated, pass through current value. */
-        uint64_t use_at_sec = (valid & STM_9P_SETATTR_ATIME) ? at_sec
-                              : stm_load_le64(iv.si_atime_sec);
-        uint32_t use_at_nsec = (valid & STM_9P_SETATTR_ATIME) ? (uint32_t)at_nsec
-                              : stm_load_le32(iv.si_atime_nsec);
-        uint64_t use_mt_sec = (valid & STM_9P_SETATTR_MTIME) ? mt_sec
-                              : stm_load_le64(iv.si_mtime_sec);
-        uint32_t use_mt_nsec = (valid & STM_9P_SETATTR_MTIME) ? (uint32_t)mt_nsec
-                              : stm_load_le32(iv.si_mtime_nsec);
-        /* ctime stamped to "now" by the wrapper — pass 0/0 to signal
-         * "use current time". */
+        uint64_t use_at_sec = 0, use_mt_sec = 0;
+        uint32_t use_at_nsec = STM_UTIME_OMIT, use_mt_nsec = STM_UTIME_OMIT;
+        if (valid & STM_9P_SETATTR_ATIME) {
+            use_at_nsec = STM_UTIME_NOW;
+            if (valid & STM_9P_SETATTR_ATIME_SET) {
+                if (at_nsec >= 1000000000u) {
+                    ecode = STM_9P_ECODE_EINVAL;
+                    goto phase_c;
+                }
+                use_at_sec  = at_sec;
+                use_at_nsec = (uint32_t)at_nsec;
+            }
+        }
+        if (valid & STM_9P_SETATTR_MTIME) {
+            use_mt_nsec = STM_UTIME_NOW;
+            if (valid & STM_9P_SETATTR_MTIME_SET) {
+                if (mt_nsec >= 1000000000u) {
+                    ecode = STM_9P_ECODE_EINVAL;
+                    goto phase_c;
+                }
+                use_mt_sec  = mt_sec;
+                use_mt_nsec = (uint32_t)mt_nsec;
+            }
+        }
+        /* ctime is stamped by stm_fs_utimens; its ctime arguments are
+         * ignored. */
         stm_status rc = stm_fs_utimens(s->fs, ds, ino,
                                           use_at_sec, use_at_nsec,
                                           use_mt_sec, use_mt_nsec,
