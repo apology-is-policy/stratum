@@ -196,13 +196,18 @@ needs those nodes for its own COW, and they are swept only at its
 promotion, after the barrier, so it answered `STM_ENOSPC` and wedged the
 filesystem with most of the region PENDING. A reserve that finds no free
 run now reuses the PENDING entries below the armed commit's target
-generation; `docs/reference/05-bootstrap-alloc.md`.) The ALLOC-tier pending
+generation, once EBR would free an object retired when each was freed;
+`docs/reference/05-bootstrap-alloc.md`.) The ALLOC-tier pending
 sweep is different: it runs inside phase 2's alloc_commit, mutates the
 alloc tree, changes the roots — so it always defeats the skip.
 
 Relaxed atomics are sufficient: the flag is a monotone taint written by
 mutators (all serialized against commit by `fs->global`), read+cleared
-only inside the commit (exclusive).
+only inside the commit (exclusive). (Corrected 2026-10-22: since CF-4 C
+the reclaim-on-ENOSPC commits run under `fs->global` SH, so readers run
+beside a commit; the taint's writers still serialize, under `s->lock`
+or `fs->global` EX. The bootstrap early reuse, `05-bootstrap-alloc.md`
+deferred-free item 3, waits for EBR readers for that reason.)
 
 ## 5. The restructured stm_sync_commit
 

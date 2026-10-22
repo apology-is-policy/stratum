@@ -27,6 +27,14 @@
 \*   - MVCC reader safety across allocator updates: concurrency.tla
 \*     proves EBR reader-safety for the delta-chain substrate; that
 \*     applies verbatim when allocator operations are layered on it.
+\*   - The bootstrap pool's early reuse (docs/reference/05-bootstrap-
+\*     alloc.md, deferred-free item 3): inside a commit, a reserve that
+\*     finds no free run takes back PENDING ranges with free_gen below
+\*     that commit's target before its Commit lands. It rests on two
+\*     facts this spec does not state: every free stamps the generation
+\*     whose build made the range unreferenced, so no durable uberblock
+\*     names such a range; and the reuse waits until EBR would free an
+\*     object retired at the free, so no pinned reader can reach it.
 \*   - Bootstrap pool non-recursion (§6.5): an implementation invariant
 \*     rather than a protocol property. Enforced by keeping allocator-
 \*     tree node writes in a separate bitmap-managed region.

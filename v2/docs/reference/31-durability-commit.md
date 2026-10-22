@@ -110,8 +110,9 @@ self-rooted), so a commit whose only pending work is sweeping the previous
 commit's node retires IS skipped — those bits stay SET on disk until the
 next UB-dirty commit or the next mount's #791 reconcile. That commit cannot
 sweep them before its own flushes (promotion follows the barrier), so a
-reserve that finds the region full reuses them inside it (05 §"Deferred
-free", item 3); before that, a near-full region answered `STM_ENOSPC`
+reserve that finds the region full reuses them inside it, once no EBR
+reader can still reach them (`05-bootstrap-alloc.md`, the deferred-free
+list, item 3); before that, a near-full region answered `STM_ENOSPC`
 there and the failed commit wedged the filesystem. The stash starts invalid at
 open, so a session's first commit always writes. Deliberate semantics
 change: gen-age is now REAL-commit count (a quiescent pool does not age;

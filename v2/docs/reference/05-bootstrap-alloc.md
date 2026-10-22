@@ -226,7 +226,7 @@ blocks 36..39: data node 1
   defer mode is refused `STM_EINVAL` (it would promote an undurable
   COW). See `docs/cf-4-design.md` §4 + `31-durability-commit.md`.
 
-Deferred-free matches `allocator.tla`:
+Deferred-free follows `allocator.tla`, with the refinement in item 3:
 
 1. `stm_bootstrap_free(paddr, nblocks, free_gen)` — stamps PENDING
    entry. Bitmap bit stays set; in-RAM list remembers `free_gen`.
@@ -241,17 +241,33 @@ Deferred-free matches `allocator.tla`:
    `free_gen` below the armed commit's target generation
    (`stm_bootstrap_commit_defer_begin(a, target_gen)` sets the bound)
    and retries. These are exactly the entries the commit's stage would
-   sweep; the reuse happens inside that commit, where the per-component
-   commits before CF-4 B swept them, so the deferred-free rule above is
-   kept at the granularity of a commit. Without it a commit whose COW
-   needed the previous commit's retires answered `STM_ENOSPC` with most
-   of the region PENDING, and the failed commit wedged the filesystem
+   sweep: freed while building a generation at or before the
+   authoritative one, so no durable uberblock names them. The reuse
+   happens during that commit's flush, before its uberblock, where the
+   per-component commits before CF-4 B swept them. The spec does not
+   have this step: its `Commit` makes a node FREE atomically with the
+   uberblock that stops naming it, and FREE there also means no reader
+   holds it. The generation gives the first; readers need more, because
+   a commit can run beside them (CF-4 C's reclaim-on-ENOSPC commits hold
+   `fs->global` SH, wait-free lookups hold no lock). So each entry
+   records the EBR epoch of its free, and an entry is reused early only
+   once EBR would free an object retired at that moment
+   (`stm_ebr_epoch_reclaimable`); a reader still pinned leaves it
+   PENDING. Without the early reuse a commit whose COW needed the
+   previous commit's retires answered `STM_ENOSPC` with most of the
+   region PENDING, and the failed commit wedged the filesystem
    (`test_fs` `fs_churn_commit_reuses_retired_metadata_nodes`,
-   `test_bootstrap` `bootstrap_full_reserve_reuses_settled_pending`).
+   `test_bootstrap` `bootstrap_full_reserve_reuses_settled_pending`,
+   `bootstrap_early_reuse_waits_for_pinned_reader`).
 
 Caller-supplied `free_gen` and `committed_gen` are the pool's
 commit gens from sync.tla. The strict-less-than criterion
-(`free_gen < committed_gen`) mirrors the spec exactly.
+(`free_gen < committed_gen`) is the spec's. `free_gen` must be the
+generation whose build made the node unreferenced, never an older one:
+item 3 reuses anything below the armed target before that commit's
+uberblock lands, so an older stamp on a node the authoritative
+uberblock still names would be overwritten live.
+`stm_bootstrap_free` refuses a stamp below the last armed target.
 
 ### Data-area allocator — `src/alloc/alloc.c`
 
