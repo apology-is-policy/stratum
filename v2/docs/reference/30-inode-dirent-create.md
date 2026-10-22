@@ -148,6 +148,41 @@ is **flat** (~8 µs/file, O(1) per create). The reuse path (recreate-after-mass-
 unlink) tracks the same shape: before 33→58→95 µs/file (5k/10k/20k), after
 13→10→8.8 (the `freed_scan_lo` cursor; churn_ratio ≈ 1.0 — reuse ≈ fresh).
 
+**Re-measured 2026-10-22.** The S-1 table above was taken at `5227790`, and
+the per-file cost has moved since. Release build, `STM_BENCH_NFILES=20000`,
+`STM_BENCH_BOOT_MB=32` (device/16), AEAD on, one host, three rounds of each,
+µs/file as min–max; N was not varied, so the flatness above is still the
+`5227790` result:
+
+```
+single commit; churn = create, unlink, recreate, one commit each
+  build                        create       unlink      recreate
+  5227790                     5.6-6.0         --        5.8-6.5
+  7dd103d                    15.2-18.6    14.2-27.7    ENOSPC 3/3, wedged
+  af7f8a5                    17.4-19.4    18.1-21.5    ENOSPC 3/3, wedged
+  647f74a                    17.2-18.4    18.0-18.5    19.4-19.8
+
+commit every 1000 files, churn
+  5227790                    40.3-42.9        --       35.0-37.0
+  7dd103d                    30.1-32.2    14.5-14.6    27.7-28.5
+  af7f8a5                    33.0-33.5    18.4-18.9    32.0-33.9
+  647f74a                    33.7-38.5    18.4-19.3    33.9-38.4
+```
+
+(`5227790`'s bench did not time the unlink.) A bisect on the single-commit
+create names `2befe85`, the 9.8-BE metadata-engine write cutover, which closed
+a use-after-free (R171 P0-1) and took the create to 324 µs/file; `8cc3708`'s
+bounded mini brought most of it back. The remaining factor of about 2.5 is the
+cost of that change, not a separate defect. `af7f8a5` stamps the parent
+directory's times on every create and unlink, which costs about 15% on the
+create and 30% on the unlink. The churn ran out of metadata space at
+`7dd103d` and `af7f8a5` and wedged the filesystem: a commit could not reuse
+the nodes the previous commit retired (CF-4 B, `573a919`). From `dd0b772` a
+full reserve reuses them early once no reader can reach them
+(`05-bootstrap-alloc.md`, deferred-free item 3, `647f74a`), which costs the
+create nothing measurable. Commit-every-1000 is faster than at `5227790`
+because CF-4 B stages one bootstrap COW per commit.
+
 **S-2 — per-commit metadata amplification (NOT the S-1 fix; tracked seam).**
 Committing *frequently* re-COWs the growing metadata tree each commit:
 commit-every-2000 runs ~125 µs/file vs ~52 µs/file single-commit (20k files), and
