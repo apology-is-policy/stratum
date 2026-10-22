@@ -52,6 +52,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -6801,6 +6802,120 @@ STM_TEST(fs_dir_times_rmdir_stamps_parent) {
     struct p11_dt pre = p11_dt_read(fs, d);
     STM_ASSERT_OK(stm_fs_rmdir(fs, 1, d, (const uint8_t *)"s", 1));
     p11_dt_assert_moved(pre, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_link_refused_leaves_parent) {
+    /* EEXIST is refused by the dirent install, after the nlink bump: the
+     * R81 P3-1 shape. */
+    uint64_t d = 0, e = 0, f = 0;
+    stm_fs *fs = p11_dt_setup("dt_link_eexist", &d, &e, &f);
+    STM_ASSERT_OK(stm_fs_link(fs, 1, d, (const uint8_t *)"f", 1,
+                              e, (const uint8_t *)"h", 1));
+    p11_dt_nap();
+    struct p11_dt pre = p11_dt_read(fs, e);
+    STM_ASSERT_EQ(stm_fs_link(fs, 1, d, (const uint8_t *)"f", 1,
+                              e, (const uint8_t *)"h", 1), STM_EEXIST);
+    STM_ASSERT_EQ(stm_fs_link_by_ino(fs, 1, f, e, (const uint8_t *)"h", 1),
+                  STM_EEXIST);
+    p11_dt_assert_same(pre, p11_dt_read(fs, e));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_rmdir_refused_leaves_parent) {
+    /* ENOTEMPTY is refused under both pins, past the type checks. */
+    uint64_t d = 0, e = 0, f = 0, s2 = 0, x = 0;
+    stm_fs *fs = p11_dt_setup("dt_rmdir_enotempty", &d, &e, &f);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, d, (const uint8_t *)"s", 1,
+                               0755u, 0, 0, &s2));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, s2, (const uint8_t *)"x", 1,
+                                     0644u, 0, 0, &x));
+    p11_dt_nap();
+    struct p11_dt pre = p11_dt_read(fs, d);
+    STM_ASSERT_EQ(stm_fs_rmdir(fs, 1, d, (const uint8_t *)"s", 1),
+                  STM_ENOTEMPTY);
+    p11_dt_assert_same(pre, p11_dt_read(fs, d));
+    p11_dt_teardown(fs);
+}
+
+STM_TEST(fs_dir_times_rename_exchange_stamps_both_parents) {
+    uint64_t d = 0, e = 0, f = 0, g = 0;
+    stm_fs *fs = p11_dt_setup("dt_rename_exchange", &d, &e, &f);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, e, (const uint8_t *)"g", 1,
+                                     0644u, 0, 0, &g));
+    p11_dt_nap();
+    struct p11_dt pre_d = p11_dt_read(fs, d), pre_e = p11_dt_read(fs, e);
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, d, (const uint8_t *)"f", 1,
+                                e, (const uint8_t *)"g", 1,
+                                STM_FS_RENAME_EXCHANGE));
+    p11_dt_assert_moved(pre_d, p11_dt_read(fs, d));
+    p11_dt_assert_moved(pre_e, p11_dt_read(fs, e));
+    p11_dt_teardown(fs);
+}
+
+/* stm_fs_link checks its destination parent before the pins. Hold the
+ * child's pin so the link blocks in pin_two past that check; meanwhile the
+ * destination directory is removed and its slot reused by a regular file.
+ * The link must refuse (the file is not a directory), install no entry under
+ * the file and leave its times alone. The 200 ms head start only matters on
+ * a tree without the under-pin check: a link that reached the check late
+ * sees the file there too and refuses, so a slow scheduler can hide the
+ * defect but never fail a correct tree. */
+struct p11_link_race { stm_fs *fs; uint64_t d, e; stm_status rc; };
+
+static void *p11_link_race_thread(void *arg)
+{
+    struct p11_link_race *r = arg;
+    r->rc = stm_fs_link(r->fs, 1, r->d, (const uint8_t *)"f", 1,
+                        r->e, (const uint8_t *)"h", 1);
+    return NULL;
+}
+
+STM_TEST(fs_dir_times_link_rechecks_dst_parent_under_pin) {
+    make_tmp("dt_link_race");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0, d = 0, f = 0, e = 0, x = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"d", 1,
+                               0755u, 0, 0, &d));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, d, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"e", 1,
+                               0755u, 0, 0, &e));
+    /* pin_two pins in ascending ino order: the link blocks on f before
+     * it touches e. */
+    STM_ASSERT_TRUE(f < e);
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync_for_test(fs));
+    STM_ASSERT_TRUE(iidx != NULL);
+    stm_inode_handle *hf = NULL;
+    STM_ASSERT_OK(stm_inode_pin(iidx, 1, f, &hf));
+
+    struct p11_link_race r = { fs, d, e, STM_OK };
+    pthread_t th;
+    STM_ASSERT_EQ(pthread_create(&th, NULL, p11_link_race_thread, &r), 0);
+    struct timespec head = { .tv_sec = 0, .tv_nsec = 200000000 };
+    nanosleep(&head, NULL);
+
+    STM_ASSERT_OK(stm_fs_rmdir(fs, 1, root, (const uint8_t *)"e", 1));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"x", 1,
+                                     0644u, 0, 0, &x));
+    STM_ASSERT_EQ(x, e);    /* the regular file took the directory's slot */
+    p11_dt_nap();
+    struct p11_dt pre_x = p11_dt_read(fs, x);
+
+    stm_inode_unpin(iidx, hf);
+    STM_ASSERT_EQ(pthread_join(th, NULL), 0);
+
+    STM_ASSERT_EQ(r.rc, STM_ENOTDIR);
+    p11_dt_assert_same(pre_x, p11_dt_read(fs, x));
+    struct stm_inode_value fv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &fv));
+    STM_ASSERT_EQ(stm_load_le32(fv.si_nlink), 1u);   /* no hidden link */
     p11_dt_teardown(fs);
 }
 

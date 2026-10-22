@@ -39,8 +39,8 @@ probe walk + the per-commit metadata flush, **not** file-data bandwidth (§30.6)
 
 > **Per-create metadata work** = TWO inode btree inserts to the same key
 > (alloc at step 2, the timestamp-stamped rewrite at step 4) + one read-back
-> lookup (step 3) + one dirent insert (step 5) + the parent's lookup and
-> rewrite (step 6). Folding steps 2–4 into a single
+> lookup (step 3) + one dirent insert (step 5) + the parent's rewrite
+> (step 6, from the value step 1 loaded under the pin). Folding steps 2–4 into a single
 > stamped insert (have `stm_inode_alloc` return the gen so the read-back is
 > unnecessary, and construct the final value once) is a tracked throughput seam
 > — **S-3** (§30.7). It is layering-sensitive: the inode layer allocs a bare

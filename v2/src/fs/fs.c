@@ -839,19 +839,24 @@ static inline void fs_stamp_ctime_now(struct stm_inode_value *iv)
  * from it. POSIX: creating a file (open O_CREAT, mkdir, symlink, link) and
  * removing one (unlink, rmdir) mark the PARENT's st_mtime + st_ctime for
  * update; tools that cache a directory's listing (fontconfig, make) key on
- * that mtime. rename stamps both parents itself. The caller holds the
- * parent's pin, so the lookup sees the current record. Best-effort, as the
- * other post-publish stamps are: the entry change is already published, so
- * a failed stamp must not report the operation as failed. */
+ * that mtime. rename stamps its parents itself.
+ *
+ * `pv` is the parent's record as fs_load_parent_dir read it UNDER the
+ * parent's pin, which the caller still holds; nothing between that load and
+ * this call writes the parent's record (the entry change writes dirent and
+ * child records only), so it is current, and no second lookup can fail
+ * here. A non-directory is never stamped. Best-effort, as the other
+ * post-publish stamps are: the entry change is already published, so a
+ * failed write must not report the operation as failed. */
 static void fs_stamp_parent_dir_locked(stm_inode_index *iidx,
                                        uint64_t dataset_id,
-                                       uint64_t parent_ino)
+                                       uint64_t parent_ino,
+                                       struct stm_inode_value *pv)
 {
-    struct stm_inode_value pv = {0};
-    if (stm_inode_lookup(iidx, dataset_id, parent_ino, &pv) == STM_OK) {
-        fs_stamp_mtime_ctime_now(&pv);
-        (void)stm_inode_set(iidx, dataset_id, parent_ino, &pv);
-    }
+    uint32_t pmode = stm_load_le32(pv->si_mode);
+    if ((pmode & (uint32_t)S_IFMT) != (uint32_t)S_IFDIR) return;
+    fs_stamp_mtime_ctime_now(pv);
+    (void)stm_inode_set(iidx, dataset_id, parent_ino, pv);
 }
 
 /* ========================================================================= */
@@ -3059,7 +3064,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
         return ds;
     }
 
-    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino);
+    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino, &pv);
     *out_child_ino = child_ino;
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_parent);
@@ -3351,7 +3356,7 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
         fs_stamp_ctime_now(&iv2);
         (void)stm_inode_set(iidx, dataset_id, ino, &iv2);
     }
-    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino);
+    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino, &pv);
 
     stm_inode_unpin(iidx, h_parent);
     stm_inode_unpin(iidx, h_child);
@@ -3647,6 +3652,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     stm_inode_handle *h_child  = NULL;
     uint64_t child_ino = 0;
     struct stm_inode_value cv = {0};
+    struct stm_inode_value pv = {0};    /* the parent, loaded under its pin */
     int attempts = 0;
 
     for (;;) {
@@ -3677,7 +3683,6 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
 
         /* Under both pins: re-validate parent is still a dir AND the
          * dirent still points to observed_child. */
-        struct stm_inode_value pv = {0};
         stm_status pls = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
         if (pls != STM_OK) {
             stm_inode_unpin(iidx, h_parent);
@@ -3872,7 +3877,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
      * unlink is no longer durable-without-fsync -- POSIX-correct and
      * consistent with every other lazy-durable mutation. */
 
-    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino);
+    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino, &pv);
     stm_inode_unpin(iidx, h_parent);
     stm_inode_unpin(iidx, h_child);
     pthread_rwlock_unlock(&fs->global);
@@ -4235,6 +4240,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
     uint64_t child_ino = 0;
     uint64_t child_gen = 0;
     uint8_t  child_type = 0;
+    struct stm_inode_value dpv_pinned = {0};  /* dst parent, under its pin */
     int attempts = 0;
 
     for (;;) {
@@ -4293,6 +4299,22 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
                 return rds;
             }
             continue;
+        }
+
+        /* The destination parent was checked only before the pins; between
+         * that check and pin_two it could be rmdir'd and its slot reused as
+         * a regular file, which the pin accepts (the record is ALLOCATED).
+         * Re-verify it is a directory under its pin, as rename does. */
+        stm_status dp_chk = fs_load_parent_dir(iidx, dataset_id,
+                                               dst_parent_ino, &dpv_pinned);
+        if (dp_chk != STM_OK) {
+            stm_inode_unpin(iidx, h_child);
+            stm_inode_unpin(iidx, h_dst_p);
+            h_child = NULL;
+            h_dst_p = NULL;
+            if (dp_chk == STM_ENOENT) continue;
+            pthread_rwlock_unlock(&fs->global);
+            return dp_chk;
         }
 
         child_ino  = observed_child;
@@ -4363,7 +4385,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
             (void)stm_inode_set(iidx, dataset_id, child_ino, &cv2);
         }
     }
-    fs_stamp_parent_dir_locked(iidx, dataset_id, dst_parent_ino);
+    fs_stamp_parent_dir_locked(iidx, dataset_id, dst_parent_ino, &dpv_pinned);
 
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_dst_p);
@@ -4505,7 +4527,7 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
             (void)stm_inode_set(iidx, dataset_id, src_ino, &cv2);
         }
     }
-    fs_stamp_parent_dir_locked(iidx, dataset_id, dst_parent_ino);
+    fs_stamp_parent_dir_locked(iidx, dataset_id, dst_parent_ino, &dpv);
 
     stm_inode_unpin(iidx, h_src);
     stm_inode_unpin(iidx, h_dst_p);
@@ -4636,7 +4658,7 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
         return ds;
     }
 
-    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino);
+    fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino, &pv);
     *out_child_ino = child_ino;
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_parent);
@@ -5608,6 +5630,22 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
         if (stm_inode_lookup(iidx, dataset_id, dst_ino, &div2) == STM_OK) {
             fs_stamp_ctime_now(&div2);
             (void)stm_inode_set(iidx, dataset_id, dst_ino, &div2);
+        }
+        /* The swap rewrote an entry in each parent, so both directories'
+         * mtime + ctime move, as on the non-exchange path below (once
+         * when the parents are the same). All parents are pinned. */
+        struct stm_inode_value spv3 = {0};
+        if (stm_inode_lookup(iidx, dataset_id, src_parent_ino, &spv3) == STM_OK) {
+            fs_stamp_mtime_ctime_now(&spv3);
+            (void)stm_inode_set(iidx, dataset_id, src_parent_ino, &spv3);
+        }
+        if (src_parent_ino != dst_parent_ino) {
+            struct stm_inode_value dpv3 = {0};
+            if (stm_inode_lookup(iidx, dataset_id, dst_parent_ino,
+                                       &dpv3) == STM_OK) {
+                fs_stamp_mtime_ctime_now(&dpv3);
+                (void)stm_inode_set(iidx, dataset_id, dst_parent_ino, &dpv3);
+            }
         }
         FS_RENAME_UNPIN_ALL();
         pthread_rwlock_unlock(&fs->global);

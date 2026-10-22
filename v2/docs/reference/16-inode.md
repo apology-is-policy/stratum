@@ -653,22 +653,38 @@ Ninja's signal/descriptor semantics or a full native toolchain workflow.
 A directory's mtime and ctime now move whenever an entry is added to it or
 removed from it: `stm_fs_create_file`, `stm_fs_mkdir`, `stm_fs_symlink`,
 `stm_fs_link` and `stm_fs_link_by_ino` (the new parent only),
-`stm_fs_linkat_anon`, `stm_fs_unlink` and `stm_fs_rmdir`. Before, only
-`stm_fs_rename` stamped its parents (R86 P2-2); every other entry change left
-the directory's clocks where its own creation put them. POSIX marks the
-parent's st_mtime and st_ctime for update on each of these
+`stm_fs_linkat_anon`, `stm_fs_unlink`, `stm_fs_rmdir`, and
+`stm_fs_rename` with `STM_FS_RENAME_EXCHANGE` (both parents, once when they
+are the same). Before, only the non-exchange rename stamped its parents
+(R86 P2-2); every other entry change left the directory's clocks where its
+own creation put them. POSIX marks the parent's st_mtime and st_ctime for
+update on each of these
 ([open](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html),
 [unlink](https://pubs.opengroup.org/onlinepubs/9799919799/functions/unlink.html)).
 Thylacine's fontconfig port exposed the error: fontconfig decides that a
 cached font directory is stale from the directory's mtime, so a face added to
 or removed from a Stratum directory was never noticed.
 
-`fs_stamp_parent_dir_locked` (`src/fs/fs.c`) reads the parent's record under
-the parent's pin, stamps mtime and ctime from one clock read, and writes it
-back. It runs only after the entry change has succeeded, and it is
-best-effort, as the other post-publish stamps are: a failed write leaves the
-entry change in place and the operation reports success. A refused change
-(EEXIST, EISDIR, ENOTDIR, ENOTEMPTY, ENOENT) stamps nothing. The cost is one
-more inode lookup and write per entry change (§30.2).
-Tests: `tests/test_fs_phase8.c` `fs_dir_times_*` (one per operation, plus a
-refused create and a refused unlink).
+`fs_stamp_parent_dir_locked` (`src/fs/fs.c`) stamps the parent's record as
+`fs_load_parent_dir` read it under the parent's pin, which the caller still
+holds; the entry change writes only dirent and child records, so that value
+is current and no second lookup is made. It never stamps a non-directory. It
+runs only after the entry change has succeeded, and it is best-effort, as the
+other post-publish stamps are: a failed write leaves the entry change in place
+and the operation reports success. A refused change (EEXIST, EISDIR,
+ENOTDIR, ENOTEMPTY, ENOENT) stamps nothing. The exchange branch stamps with
+rename's own lookup-and-write, under the same pins. The cost is one more
+inode write per entry change (§30.2, §30.6).
+
+The same review found that `stm_fs_link` checked its destination parent only
+before taking the pins: the directory could be removed and its slot reused by
+a regular file in between, and the link then installed an entry under the
+file. It now re-checks the destination under its pin, as rename does, and
+refuses with ENOTDIR (a vanished parent retries). The 9P server's Tlink uses
+`stm_fs_link_by_ino`, which already checked under the pin.
+
+Tests: `tests/test_fs_phase8.c` `fs_dir_times_*`: one per operation, rename
+exchange, refusals at four gates (create EEXIST, link and link_by_ino EEXIST
+after the nlink bump, unlink EISDIR, rmdir ENOTEMPTY), and the link race
+(`fs_dir_times_link_rechecks_dst_parent_under_pin`, two threads: the test
+holds the child's pin so the link blocks past its first check).
