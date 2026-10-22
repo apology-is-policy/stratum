@@ -25,6 +25,7 @@
 #include <stratum/btree_engine.h>     /* 9.7-impl-1c engine substrate tests */
 #include <stratum/crypto.h>
 #include <stratum/dataset.h>
+#include <stratum/dataset_testing.h>
 #include <stratum/ebr.h>              /* chunk 9b engine-retire tests */
 
 #include <pthread.h>
@@ -2742,6 +2743,95 @@ STM_TEST(dataset_engine_retire_close_race) {
      * exit (Linux LeakSan hygiene). */
     for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
         (void)stm_ebr_try_advance();
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+/* A pinned reader that has to wait for the index lock (held across the
+ * commit cascade) must not hold the EBR epoch while it waits: the bootstrap
+ * pool's early reuse inside that cascade waits for every pinned reader. It
+ * is pinned again before the call returns, so the engine it gets is
+ * covered. */
+typedef struct {
+    stm_dataset_index *idx;
+    atomic_int         calling;
+    atomic_int         returned;
+    atomic_int         go;
+    stm_status         rc;
+    stm_btree_engine  *eng;
+    uint64_t           epoch_after;
+} pinned_get_arg;
+
+static void *pinned_get_thread(void *arg)
+{
+    pinned_get_arg *g = arg;
+    stm_ebr_thread *t = stm_ebr_register();
+    if (!t) { g->rc = STM_ENOMEM; atomic_store(&g->returned, 1); return NULL; }
+    stm_ebr_enter(t);
+    atomic_store(&g->calling, 1);
+    g->rc = stm_dataset_index_get_engine_pinned(g->idx, t, STM_DATASET_ROOT_ID,
+                                                &g->eng);
+    g->epoch_after = stm_ebr_current_epoch();
+    atomic_store(&g->returned, 1);
+    for (int i = 0; i < 10000 && !atomic_load(&g->go); i++) usleep(1000);
+    stm_ebr_exit(t);
+    stm_ebr_thread_free(t);
+    return NULL;
+}
+
+STM_TEST(dataset_engine_get_pinned_unpins_while_waiting) {
+    dsp_make_tmp("eng_pinned");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_btree_engine *plain = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID,
+                                                 &plain));
+
+    stm_dataset_index_lock_for_test(idx);
+    pinned_get_arg g = { .idx = idx };
+    atomic_init(&g.calling, 0);
+    atomic_init(&g.returned, 0);
+    atomic_init(&g.go, 0);
+    pthread_t th;
+    STM_ASSERT_EQ(pthread_create(&th, NULL, pinned_get_thread, &g), 0);
+    for (int i = 0; i < 5000 && !atomic_load(&g.calling); i++) usleep(1000);
+
+    /* Three advances need every pinned thread at the current epoch or
+     * later; a reader still pinned at its entry epoch stops them after
+     * one. */
+    uint64_t start = stm_ebr_current_epoch();
+    bool advanced = false;
+    for (int i = 0; i < 2000 && !advanced; i++) {
+        (void)stm_ebr_try_advance();
+        advanced = stm_ebr_current_epoch() >= start + 3u;
+        if (!advanced) usleep(1000);
+    }
+    bool still_inside = atomic_load(&g.returned) == 0;
+    stm_dataset_index_unlock_for_test(idx);
+
+    for (int i = 0; i < 5000 && !atomic_load(&g.returned); i++) usleep(1000);
+    /* Back inside its pin: the epoch stops one past where it re-entered. */
+    for (int i = 0; i < 3; i++) (void)stm_ebr_try_advance();
+    uint64_t pinned_after = stm_ebr_current_epoch();
+    atomic_store(&g.go, 1);
+    pthread_join(th, NULL);
+
+    STM_ASSERT_TRUE(atomic_load(&g.calling) != 0);
+    STM_ASSERT_TRUE(advanced);
+    STM_ASSERT_TRUE(still_inside);
+    STM_ASSERT_OK(g.rc);
+    STM_ASSERT_EQ(g.eng, plain);
+    STM_ASSERT_TRUE(pinned_after <= g.epoch_after + 1u);
+
+    stm_dataset_index_close(idx);
     stm_bootstrap_close(b);
     stm_bdev_close(d);
     unlink(dsp_tmp_path);

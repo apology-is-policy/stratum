@@ -766,7 +766,8 @@ stm_status stm_dirent_lookup_concurrent(const stm_dirent_index *idx,
     if (m->ds_idx == NULL) return STM_EINVAL;
 
     stm_btree_engine *eng = NULL;
-    stm_status es = stm_dataset_index_get_engine(m->ds_idx, dataset_id, &eng);
+    stm_status es = stm_dataset_index_get_engine_pinned(m->ds_idx, ebr,
+                                                        dataset_id, &eng);
     if (es != STM_OK) return es;
 
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
@@ -1318,7 +1319,8 @@ stm_status stm_dirent_readdir_concurrent(const stm_dirent_index *idx,
     if (m->ds_idx == NULL) return STM_EINVAL;
 
     stm_btree_engine *eng = NULL;
-    stm_status es = stm_dataset_index_get_engine(m->ds_idx, dataset_id, &eng);
+    stm_status es = stm_dataset_index_get_engine_pinned(m->ds_idx, ebr,
+                                                        dataset_id, &eng);
     if (es != STM_OK) {
         if (es == STM_ENOENT) return STM_OK;   /* dataset absent → empty */
         return es;

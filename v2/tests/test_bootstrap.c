@@ -26,6 +26,8 @@
 #include <stratum/ebr.h>
 #include <stratum/super.h>
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1193,8 +1195,9 @@ STM_TEST(bootstrap_full_reserve_reuses_settled_pending) {
 }
 
 /* A descent pinned in EBR before the free may still read the node's paddr
- * from disk, so while it stays pinned a full reserve leaves the entry
- * PENDING; once it exits, the reserve takes the node. */
+ * from disk, so while it stays pinned (here past the reserve's bounded wait)
+ * a full reserve leaves the entry PENDING; once it exits, the reserve takes
+ * the node. */
 STM_TEST(bootstrap_early_reuse_waits_for_pinned_reader) {
     make_tmp("pinned");
     stm_bdev *d = open_fresh_device();
@@ -1226,6 +1229,66 @@ STM_TEST(bootstrap_early_reuse_waits_for_pinned_reader) {
     STM_ASSERT_EQ(st.early_reclaimed_nodes, 1u);
 
     stm_ebr_thread_free(reader);
+    stm_bootstrap_commit_defer_cancel(a);
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A reader pinned for a moment is waited out: the full reserve advances
+ * EBR and naps until the reader leaves, rather than failing the commit it
+ * runs in. */
+typedef struct {
+    atomic_int pinned;
+    atomic_int leaving;
+} short_reader;
+
+static void *short_reader_thread(void *arg)
+{
+    short_reader *r = arg;
+    stm_ebr_thread *t = stm_ebr_register();
+    if (!t) { atomic_store(&r->pinned, -1); return NULL; }
+    stm_ebr_enter(t);
+    atomic_store(&r->pinned, 1);
+    usleep(50000);
+    atomic_store(&r->leaving, 1);
+    stm_ebr_exit(t);
+    stm_ebr_thread_free(t);
+    return NULL;
+}
+
+STM_TEST(bootstrap_early_reuse_waits_out_a_short_reader) {
+    make_tmp("shortreader");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+    STM_ASSERT_OK(stm_ebr_init());
+
+    uint64_t p[TEST_EXPECTED_NODES];
+    for (uint32_t i = 0; i < TEST_EXPECTED_NODES; i++)
+        STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p[i]));
+    short_reader r;
+    atomic_init(&r.pinned, 0);
+    atomic_init(&r.leaving, 0);
+    pthread_t th;
+    STM_ASSERT_EQ(pthread_create(&th, NULL, short_reader_thread, &r), 0);
+    for (int i = 0; i < 5000 && atomic_load(&r.pinned) == 0; i++) usleep(1000);
+    int pinned = atomic_load(&r.pinned);
+    STM_ASSERT_OK(stm_bootstrap_free(a, p[0], TEST_NODE_BLOCKS, 3));
+    stm_bootstrap_commit_defer_begin(a, 5);
+
+    uint64_t q = 0;
+    stm_status rs = stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q);
+    bool left_first = atomic_load(&r.leaving) != 0;
+    pthread_join(th, NULL);
+    STM_ASSERT_EQ(pinned, 1);
+    STM_ASSERT_OK(rs);
+    STM_ASSERT_EQ(q, p[0]);
+    STM_ASSERT_TRUE(left_first);
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.pending_nodes, 0u);
+    STM_ASSERT_EQ(st.early_reclaimed_nodes, 1u);
+
     stm_bootstrap_commit_defer_cancel(a);
     stm_bootstrap_close(a);
     stm_bdev_close(d);

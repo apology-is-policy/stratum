@@ -274,7 +274,9 @@ stm_status stm_dirent_lookup(const stm_dirent_index *idx,
  * shape; skips the dirent index's internal mutex; uses the engine's LF-2
  * lock-free concurrent path. Caller MUST be in an entered EBR epoch
  * (stm_ebr_enter before, stm_ebr_exit after — composability with multi-
- * subsystem reads).
+ * subsystem reads). The call may drop and re-enter that pin while it
+ * resolves the dataset engine (stm_dataset_index_get_engine_pinned), so
+ * the caller must hold no EBR-protected pointer across it.
  *
  * Reader-vs-writer caveat lifts at 9.8-BE-prepend; see inode.h
  * stm_inode_lookup_concurrent docstring.
@@ -492,6 +494,9 @@ stm_status stm_dirent_readdir(const stm_dirent_index *idx,
  *   - `ebr` is the calling thread's registered EBR handle. The caller
  *     MUST have already called stm_ebr_enter(ebr) before this call and
  *     stm_ebr_exit(ebr) after.
+ *     The call may drop and re-enter that pin while it resolves the
+ *     dataset engine (stm_dataset_index_get_engine_pinned), so hold
+ *     no EBR-protected pointer across it.
  *
  *   - No internal lock is taken on the dirent index. Atomicity of the
  *     scan rests on the engine's MVCC publish (LF-2) and the EBR pin;

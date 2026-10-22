@@ -454,7 +454,10 @@ stm_status stm_inode_lookup(const stm_inode_index *idx,
  *     MUST have already called stm_ebr_enter(ebr) before this call and
  *     MUST call stm_ebr_exit(ebr) after. Composability across multiple
  *     subsystem reads in one fs op (e.g. dirent+inode for lookup) — one
- *     enter spans them all.
+ *     enter spans them all, but each call may drop and re-enter the pin
+ *     while it resolves the dataset engine
+ *     (stm_dataset_index_get_engine_pinned): carry only copied values,
+ *     never an EBR-protected pointer, from one call to the next.
  *   - Returns IDENTICAL refusal codes to stm_inode_lookup.
  *
  * Reader-vs-writer caveat (LF-2 carry, lifted at LF-BE-prepend): the

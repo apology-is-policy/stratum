@@ -289,7 +289,10 @@ stm_status stm_xattr_get(const stm_xattr_index *idx,
  * `ebr` is the caller's registered EBR handle. The caller MUST
  * stm_ebr_enter / _exit around this call (the fs.c wrapper at
  * stm_fs_getxattr does the bracket; this function does not enter the
- * critical section on its own). The function takes no other locks.
+ * critical section on its own). The only lock it takes is the dataset
+ * index's, through stm_dataset_index_get_engine_pinned, which may drop
+ * and re-enter the pin while it waits: hold no EBR-protected pointer
+ * across the call.
  *
  * Identical contract to stm_xattr_get on output:
  *   - *out_size always set to the FULL value byte count regardless of
@@ -384,6 +387,9 @@ stm_status stm_xattr_list(const stm_xattr_index *idx,
  *   - `ebr` is the calling thread's registered EBR handle. The caller
  *     MUST have already called stm_ebr_enter(ebr) before this call and
  *     stm_ebr_exit(ebr) after. The substrate scan honours that pin.
+ *     The call may drop and re-enter that pin while it resolves the
+ *     dataset engine (stm_dataset_index_get_engine_pinned), so hold
+ *     no EBR-protected pointer across it.
  *
  *   - No internal lock is taken on the xattr index. Atomicity of the
  *     listing rests on the underlying engine's MVCC publish (LF-2)

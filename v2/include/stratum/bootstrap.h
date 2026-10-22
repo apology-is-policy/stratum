@@ -242,7 +242,13 @@ void stm_bootstrap_close(stm_bootstrap *a);
  * the free set first, those whose EBR epoch every pinned reader has left:
  * no durable uberblock names their nodes and no descent can still reach
  * them, so this commit's own COW may reuse them rather than fail. It
- * advances EBR (stm_ebr_try_advance, never waiting) to get there.
+ * advances EBR (stm_ebr_try_advance) to get there, napping between tries
+ * for at most about two seconds in all while pinned readers hold entries
+ * back. A pinned reader is one lookup or scan and never waits on a lock
+ * the reserving commit holds (stm_dataset_index_get_engine_pinned drops
+ * its pin to wait), so the wait ends when the reads in flight do; past
+ * the bound the entries stay PENDING, the reserve answers STM_ENOSPC and
+ * the commit fails, which wedges the filesystem.
  *
  * Returns STM_ENOSPC if no run of the requested size is free, and
  * STM_EBUSY between stm_bootstrap_commit_defer_stage and _finalize, where

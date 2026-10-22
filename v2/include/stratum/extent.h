@@ -961,6 +961,9 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
  *   - `ebr` is the calling thread's registered EBR handle. The caller
  *     MUST have already called stm_ebr_enter(ebr) before this call and
  *     stm_ebr_exit(ebr) after.
+ *     The call may drop and re-enter that pin while it resolves the
+ *     dataset engine (stm_dataset_index_get_engine_pinned), so hold
+ *     no EBR-protected pointer across it.
  *
  *   - No internal lock is taken on the extent index. Concurrency-safety
  *     of the lookup rests on the engine's MVCC publish (LF-2) and the

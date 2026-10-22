@@ -16,6 +16,7 @@
  * all O(n) under the lock.
  */
 #include <stratum/dataset.h>
+#include <stratum/dataset_testing.h>
 
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
@@ -1561,9 +1562,9 @@ static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
  * 9.8-BE-engine-retire (chunk 9b — the R171 P0-2 closure): the engine
  * is UNPUBLISHED (slot->engine = NULL, under idx->lock) and then
  * EBR-RETIRED, never freed in place. A wait-free reader resolves the
- * engine via stm_dataset_index_get_engine INSIDE its stm_ebr_enter
- * pin (fs.c LF-3 discipline), and get_engine takes this same
- * idx->lock — so a reader that acquired the pointer before the
+ * engine via stm_dataset_index_get_engine_pinned INSIDE its
+ * stm_ebr_enter pin (fs.c LF-3 discipline), which reads the slot under
+ * this same idx->lock with the pin held — so a reader that acquired the pointer before the
  * unpublish is pinned at retire time and EBR defers the free past its
  * exit; a reader arriving after sees NULL and lazily re-opens from
  * the durable triple. Serial ops and _concurrent writers are excluded
@@ -1579,6 +1580,17 @@ static void dataset_engine_close_locked(dataset_slot *slot) {
 
 /* ---- Public per-dataset engine API. ---- */
 
+static stm_status dataset_get_engine_locked(stm_dataset_index *idx,
+                                            uint64_t dataset_id,
+                                            stm_btree_engine **out_engine) {
+    size_t s = find_slot_locked(idx, dataset_id);
+    if (s == (size_t)-1 || !idx->slots[s]->present) return STM_ENOENT;
+    stm_status rc = dataset_engine_open_locked(idx, idx->slots[s]);
+    if (rc != STM_OK) return rc;
+    *out_engine = idx->slots[s]->engine;
+    return STM_OK;
+}
+
 stm_status stm_dataset_index_get_engine(stm_dataset_index *idx,
                                            uint64_t dataset_id,
                                            stm_btree_engine **out_engine) {
@@ -1587,20 +1599,42 @@ stm_status stm_dataset_index_get_engine(stm_dataset_index *idx,
     if (dataset_id == 0) return STM_EINVAL;
 
     must_lock(&idx->lock);
-    size_t s = find_slot_locked(idx, dataset_id);
-    if (s == (size_t)-1 || !idx->slots[s]->present) {
-        must_unlock(&idx->lock);
-        return STM_ENOENT;
-    }
-    stm_status rc = dataset_engine_open_locked(idx, idx->slots[s]);
-    if (rc != STM_OK) {
-        must_unlock(&idx->lock);
-        return rc;
-    }
-    *out_engine = idx->slots[s]->engine;
+    stm_status rc = dataset_get_engine_locked(idx, dataset_id, out_engine);
     must_unlock(&idx->lock);
-    return STM_OK;
+    return rc;
 }
+
+stm_status stm_dataset_index_get_engine_pinned(stm_dataset_index *idx,
+                                                  stm_ebr_thread *ebr,
+                                                  uint64_t dataset_id,
+                                                  stm_btree_engine **out_engine) {
+    if (!idx || !ebr || !out_engine) return STM_EINVAL;
+    *out_engine = NULL;
+    if (dataset_id == 0) return STM_EINVAL;
+
+    /* Re-entered while the lock is held, so the slot is read under the
+     * lock and the pin together: dataset_engine_close_locked unpublishes
+     * and retires under the same lock, and finds this reader pinned. */
+    if (pthread_mutex_trylock(&idx->lock) != 0) {
+        stm_ebr_exit(ebr);
+        must_lock(&idx->lock);
+        stm_ebr_enter(ebr);
+    }
+    stm_status rc = dataset_get_engine_locked(idx, dataset_id, out_engine);
+    must_unlock(&idx->lock);
+    return rc;
+}
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+/* Production callers MUST NOT use these. See <stratum/dataset_testing.h>. */
+void stm_dataset_index_lock_for_test(stm_dataset_index *idx) {
+    must_lock(&idx->lock);
+}
+
+void stm_dataset_index_unlock_for_test(stm_dataset_index *idx) {
+    must_unlock(&idx->lock);
+}
+#endif
 
 stm_status stm_dataset_index_close_engine(stm_dataset_index *idx,
                                              uint64_t dataset_id) {

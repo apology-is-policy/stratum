@@ -252,13 +252,23 @@ Deferred-free follows `allocator.tla`, with the refinement in item 3:
    `fs->global` SH, wait-free lookups hold no lock). So each entry
    records the EBR epoch of its free, and an entry is reused early only
    once EBR would free an object retired at that moment
-   (`stm_ebr_epoch_reclaimable`); a reader still pinned leaves it
-   PENDING. Without the early reuse a commit whose COW needed the
-   previous commit's retires answered `STM_ENOSPC` with most of the
-   region PENDING, and the failed commit wedged the filesystem
+   (`stm_ebr_epoch_reclaimable`). The reserve advances EBR and naps
+   between tries while pinned readers hold entries back, for at most
+   about two seconds in all; past that bound the entries stay PENDING
+   and the reserve answers `STM_ENOSPC`, which fails the commit and
+   wedges the filesystem. The wait is bounded by the reads in flight
+   because no pinned reader waits on a lock the reserving commit holds:
+   a wait-free op resolves its dataset engine through
+   `stm_dataset_index_get_engine_pinned`, which drops the pin while it
+   waits for the index lock the commit cascade holds across every
+   engine's node writes. Without the early reuse a commit whose COW
+   needed the previous commit's retires answered `STM_ENOSPC` with most
+   of the region PENDING, and the failed commit wedged the filesystem
    (`test_fs` `fs_churn_commit_reuses_retired_metadata_nodes`,
    `test_bootstrap` `bootstrap_full_reserve_reuses_settled_pending`,
-   `bootstrap_early_reuse_waits_for_pinned_reader`).
+   `bootstrap_early_reuse_waits_for_pinned_reader`,
+   `bootstrap_early_reuse_waits_out_a_short_reader`, `test_dataset`
+   `dataset_engine_get_pinned_unpins_while_waiting`).
 
 Caller-supplied `free_gen` and `committed_gen` are the pool's
 commit gens from sync.tla. The strict-less-than criterion

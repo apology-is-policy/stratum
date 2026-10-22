@@ -830,7 +830,8 @@ stm_status stm_xattr_get_concurrent(const stm_xattr_index *idx,
     if (m->ds_idx == NULL) return STM_EINVAL;
 
     stm_btree_engine *eng = NULL;
-    stm_status es = stm_dataset_index_get_engine(m->ds_idx, dataset_id, &eng);
+    stm_status es = stm_dataset_index_get_engine_pinned(m->ds_idx, ebr,
+                                                        dataset_id, &eng);
     if (es != STM_OK) {
         /* Dataset not present → POSIX getxattr maps to ENODATA. */
         if (es == STM_ENOENT) return STM_ENODATA;
@@ -1104,7 +1105,8 @@ stm_status stm_xattr_list_concurrent(const stm_xattr_index *idx,
     if (m->ds_idx == NULL) return STM_EINVAL;
 
     stm_btree_engine *eng = NULL;
-    stm_status es = stm_dataset_index_get_engine(m->ds_idx, dataset_id, &eng);
+    stm_status es = stm_dataset_index_get_engine_pinned(m->ds_idx, ebr,
+                                                        dataset_id, &eng);
     if (es != STM_OK) {
         /* Dataset not present → empty listing (matches serial path). */
         if (es == STM_ENOENT) return STM_OK;

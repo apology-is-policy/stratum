@@ -772,6 +772,26 @@ stm_status stm_dataset_index_get_engine(stm_dataset_index *idx,
                                            stm_btree_engine **out_engine);
 
 /*
+ * stm_dataset_index_get_engine for a caller already inside an EBR pin
+ * (`ebr` entered). When idx's lock is held by another thread the pin is
+ * dropped while waiting and re-entered before the slot is read, so the
+ * engine returned is covered by the pin exactly as with the plain call
+ * made inside it. The commit cascade (stm_dataset_index_commit_engines_flush)
+ * holds the lock across every engine's node writes, and the bootstrap
+ * pool's early reuse inside that cascade waits for every pinned reader
+ * (stm_bootstrap_reserve): a reader pinned behind the lock would hold
+ * the epoch back for the whole cascade and fail the commit.
+ *
+ * The caller must hold no EBR-protected pointer across the call. Same
+ * refusals as stm_dataset_index_get_engine, plus a NULL `ebr` (STM_EINVAL).
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_get_engine_pinned(stm_dataset_index *idx,
+                                                  stm_ebr_thread *ebr,
+                                                  uint64_t dataset_id,
+                                                  stm_btree_engine **out_engine);
+
+/*
  * Close the per-dataset engine for `dataset_id`, if open. The slot's
  * triple is unchanged (the engine's last durable root is already stamped
  * there from the most recent successful commit). After return the next

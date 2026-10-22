@@ -1097,8 +1097,8 @@ stm_status stm_inode_lookup_concurrent(const stm_inode_index *idx,
     if (midx->ds_idx == NULL) return STM_EINVAL;
 
     stm_btree_engine *eng = NULL;
-    stm_status es = stm_dataset_index_get_engine(midx->ds_idx, dataset_id,
-                                                  &eng);
+    stm_status es = stm_dataset_index_get_engine_pinned(midx->ds_idx, ebr,
+                                                         dataset_id, &eng);
     if (es != STM_OK) return es;
 
     uint8_t key[IN_KEY_LEN];

@@ -36,6 +36,8 @@
 #include <stratum/types.h>
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11353,6 +11355,95 @@ STM_TEST(fs_churn_commit_reuses_retired_metadata_nodes) {
     int nl = snprintf(nm, sizeof nm, "f%u", (unsigned)N - 1u);
     STM_ASSERT_OK(stm_fs_lookup(fs, ds, root, (const uint8_t *)nm, (uint8_t)nl,
                                    &ino));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* The same churn with wait-free stat and lookup running throughout: the
+ * early reuse must neither wedge a commit nor disturb a read. The creates'
+ * mini-consolidations advance the EBR epoch well past every reuse gate
+ * between commits, so this does not exercise a reader holding the gate
+ * shut; the pool and dataset tests do. */
+typedef struct {
+    stm_fs        *fs;
+    uint64_t       ds, root, ino;
+    atomic_int     stop;
+    uint64_t       ops;
+    stm_status     err;
+} churn_reader;
+
+static void *churn_reader_thread(void *arg)
+{
+    churn_reader *r = arg;
+    while (!atomic_load(&r->stop)) {
+        struct stm_inode_value v;
+        stm_status s = stm_fs_stat(r->fs, r->ds, r->ino, &v);
+        uint64_t got = 0;
+        if (s == STM_OK)
+            s = stm_fs_lookup(r->fs, r->ds, r->root,
+                              (const uint8_t *)"keep", 4, &got);
+        if (s == STM_OK && got != r->ino) s = STM_ECORRUPT;
+        if (s != STM_OK) { r->err = s; break; }
+        r->ops++;
+    }
+    return NULL;
+}
+
+STM_TEST(fs_churn_reuse_beside_a_wait_free_reader) {
+    make_tmp("churn_reader");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t ds = 0, root = 0, keep = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "churnr", &ds));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0755u, 0, 0, &root));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds, root, (const uint8_t *)"keep", 4,
+                                        0100644u, 0, 0, &keep));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    churn_reader r = { .fs = fs, .ds = ds, .root = root, .ino = keep };
+    atomic_init(&r.stop, 0);
+    pthread_t th;
+    STM_ASSERT_EQ(pthread_create(&th, NULL, churn_reader_thread, &r), 0);
+
+    enum { N = 5000 };
+    char nm[16];
+    stm_status s = STM_OK;
+    for (unsigned i = 0; i < N && s == STM_OK; i++) {
+        int nl = snprintf(nm, sizeof nm, "f%u", i);
+        uint64_t ino = 0;
+        s = stm_fs_create_file(fs, ds, root, (const uint8_t *)nm, (uint8_t)nl,
+                               0100644u, 0, 0, &ino);
+    }
+    if (s == STM_OK) s = stm_fs_commit(fs);
+    for (unsigned i = 0; i < N && s == STM_OK; i++) {
+        int nl = snprintf(nm, sizeof nm, "f%u", i);
+        s = stm_fs_unlink(fs, ds, root, (const uint8_t *)nm, (uint8_t)nl);
+    }
+    if (s == STM_OK) s = stm_fs_commit(fs);
+    for (unsigned i = 0; i < N && s == STM_OK; i++) {
+        int nl = snprintf(nm, sizeof nm, "f%u", i);
+        uint64_t ino = 0;
+        s = stm_fs_create_file(fs, ds, root, (const uint8_t *)nm, (uint8_t)nl,
+                               0100644u, 0, 0, &ino);
+    }
+    if (s == STM_OK) s = stm_fs_commit(fs);
+    atomic_store(&r.stop, 1);
+    pthread_join(th, NULL);
+
+    STM_ASSERT_OK(s);
+    STM_ASSERT_OK(r.err);
+    STM_ASSERT_TRUE(r.ops > 0);
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(!st.wedged);
+    stm_bootstrap_stats bs;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(
+        stm_alloc_bootstrap(stm_sync_alloc(stm_fs_sync(fs), 0)), &bs));
+    STM_ASSERT_TRUE(bs.early_reclaimed_nodes > 0);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);

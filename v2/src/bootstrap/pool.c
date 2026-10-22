@@ -43,6 +43,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* The on-disk bitmap region: STM_BOOTSTRAP_BITMAP_BLOCKS contiguous 4 KiB
  * blocks. 14 × 4096 = 57344 bytes = 458752 bits = STM_BOOTSTRAP_MAX_NODES. */
@@ -752,29 +753,32 @@ static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nnode
  * reserve that found no free run calls this, so a pool with room keeps the
  * sweep's normal delay. The durable bitmap still has the bits set; a crash
  * before the next staged COW leaves them allocated-but-unreachable, which
- * the #791 mount-time reconcile frees. Returns the nodes returned.
+ * the #791 mount-time reconcile frees. Returns the nodes returned, and sets
+ * *out_gated when an entry below the bound is still held back by a reader.
  *
  * The generation bound keeps every durable uberblock off the node; it says
  * nothing about readers. A descent pinned in EBR before the previous
  * commit published can still be on its way to the node's paddr (a
- * wait-free lookup, or a reader under fs->global SH beside CF-4 C's
+ * wait-free lookup beside an EX commit, or beside CF-4 C's
  * reclaim-on-ENOSPC commits, which run under SH), so an entry is reused
- * only once EBR would free an object retired when it was. The advances
- * never wait: a lagging reader leaves its entries PENDING. */
-static uint64_t bootstrap_reclaim_settled(stm_bootstrap *a)
+ * only once EBR would free an object retired when it was. */
+static uint64_t bootstrap_reclaim_settled(stm_bootstrap *a, bool *out_gated)
 {
-    for (int i = 0; i < 3; i++) (void)stm_ebr_try_advance();
+    *out_gated = false;
     uint64_t reclaimed = 0;
     pending_entry **link = &a->pending_head;
     pending_entry  *e    = a->pending_head;
     while (e) {
         pending_entry *next = e->next;
         uint64_t first_node = 0;
+        bool settled = e->free_gen < a->reuse_below_gen;
+        if (settled && !stm_ebr_epoch_reclaimable(e->free_epoch)) {
+            *out_gated = true;
+            settled = false;
+        }
         /* A link that fails to map is left for the stage, which reports
          * it as STM_ECORRUPT. */
-        if (e->free_gen < a->reuse_below_gen &&
-            stm_ebr_epoch_reclaimable(e->free_epoch) &&
-            paddr_to_node(a, e->paddr, &first_node)) {
+        if (settled && paddr_to_node(a, e->paddr, &first_node)) {
             uint64_t nnodes = e->nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
             for (uint64_t i = 0; i < nnodes; i++)
                 bit_clear(a->bitmap, first_node + i);
@@ -793,6 +797,37 @@ static uint64_t bootstrap_reclaim_settled(stm_bootstrap *a)
         atomic_store_explicit(&a->dirty, true, memory_order_relaxed);
     }
     return reclaimed;
+}
+
+/* The total a full reserve naps while pinned readers hold its reusable
+ * entries back. A reader stays pinned for one lookup or scan, a node read
+ * from the device at most, and does not wait on a lock the reserving
+ * commit holds (stm_dataset_index_get_engine_pinned drops the pin to
+ * wait); failing the reserve fails the commit, which wedges the
+ * filesystem, so the wait is generous. */
+#define BOOT_REUSE_WAIT_NS     2000000000ull
+#define BOOT_REUSE_NAP_MIN_NS       10000ull
+#define BOOT_REUSE_NAP_MAX_NS     1000000ull
+
+/* A reserve found no free run: reuse the settled PENDING entries, advancing
+ * EBR and napping until the readers they wait on have left or the bound is
+ * spent. True, with *out_first set, once a run of nnodes is free. */
+static bool bootstrap_reuse_settled(stm_bootstrap *a, uint64_t start,
+                                    uint64_t nnodes, uint64_t *out_first)
+{
+    uint64_t waited = 0, nap = BOOT_REUSE_NAP_MIN_NS;
+    for (;;) {
+        for (int i = 0; i < 3; i++) (void)stm_ebr_try_advance();
+        bool gated = false;
+        if (bootstrap_reclaim_settled(a, &gated) != 0 &&
+            find_free_run(a, start, nnodes, out_first))
+            return true;
+        if (!gated || waited >= BOOT_REUSE_WAIT_NS) return false;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)nap };
+        (void)nanosleep(&ts, NULL);
+        waited += nap;
+        nap = nap * 2u < BOOT_REUSE_NAP_MAX_NS ? nap * 2u : BOOT_REUSE_NAP_MAX_NS;
+    }
 }
 
 stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
@@ -822,8 +857,7 @@ stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
 
     uint64_t first_node = 0;
     if (!find_free_run(a, start, nnodes, &first_node) &&
-        (bootstrap_reclaim_settled(a) == 0 ||
-         !find_free_run(a, start, nnodes, &first_node))) {
+        !bootstrap_reuse_settled(a, start, nnodes, &first_node)) {
         return STM_ENOSPC;
     }
 
