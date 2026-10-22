@@ -367,8 +367,7 @@ static stm_status load_root(stm_btree_engine *eng, eng_node **out)
  * serial_mu, so this realises serial_mu OUTER -> commit_mu INNER —
  * the documented order the mini also uses. The fast path stays a
  * plain read: a non-NULL eng->root can only be swapped by the mini
- * (excluded — it takes serial_mu) or a commit publish (excluded by
- * the commit-vs-serial caller contract, unchanged since 9.6).
+ * or a commit publish, and both take serial_mu.
  */
 static stm_status load_root_locked(stm_btree_engine *eng, eng_node **out)
 {
@@ -2819,11 +2818,16 @@ stm_status stm_btree_engine_commit_flush(stm_btree_engine *eng, uint64_t gen,
     /* 9.8-BE-prepend: commits hold commit_mu for their whole span —
      * one commit per engine (design 3.4 step 1), mini-consolidations
      * excluded, slow-warm readers serialised. Lock order: commit_mu
-     * OUTER -> the store vtable I/O (R170 P3-2). */
+     * OUTER -> the store vtable I/O (R170 P3-2). serial_mu is taken
+     * first (serial_mu OUTER -> commit_mu INNER): a commit can run
+     * under fs->global SH beside a serial op, and the flush, finalize
+     * and abort all touch the tree or the cache that op is walking. */
+    pthread_mutex_lock(&eng->serial_mu);
     pthread_mutex_lock(&eng->commit_mu);
     stm_status s = commit_flush_locked(eng, gen, out_root_paddr,
                                        out_root_gen, out_root_csum);
     pthread_mutex_unlock(&eng->commit_mu);
+    pthread_mutex_unlock(&eng->serial_mu);
     return s;
 }
 
@@ -2983,9 +2987,11 @@ static stm_status commit_finalize_locked(stm_btree_engine *eng)
 stm_status stm_btree_engine_commit_finalize(stm_btree_engine *eng)
 {
     if (!eng) return STM_EINVAL;
+    pthread_mutex_lock(&eng->serial_mu);
     pthread_mutex_lock(&eng->commit_mu);
     stm_status s = commit_finalize_locked(eng);
     pthread_mutex_unlock(&eng->commit_mu);
+    pthread_mutex_unlock(&eng->serial_mu);
     return s;
 }
 
@@ -3027,9 +3033,11 @@ static stm_status commit_abort_locked(stm_btree_engine *eng)
 stm_status stm_btree_engine_commit_abort(stm_btree_engine *eng)
 {
     if (!eng) return STM_EINVAL;
+    pthread_mutex_lock(&eng->serial_mu);
     pthread_mutex_lock(&eng->commit_mu);
     stm_status s = commit_abort_locked(eng);
     pthread_mutex_unlock(&eng->commit_mu);
+    pthread_mutex_unlock(&eng->serial_mu);
     return s;
 }
 

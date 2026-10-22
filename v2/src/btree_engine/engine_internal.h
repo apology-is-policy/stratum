@@ -639,8 +639,9 @@ struct stm_btree_engine {
      * is the production vtable (`STM_ENGINE_STORE_VT`); it holds NO
      * internal lock -- its mutating callbacks (`reserve` / `free` /
      * `write`) are race-free only because they are reached EXCLUSIVELY
-     * from the commit path, which runs under `fs->global` EX (NOT
-     * because of any vtable-internal lock). The serial-path engine ops
+     * from the commit path, which stm_sync_commit runs under `s->lock`
+     * (whether `fs->global` is held EX or, for CF-4 C's reclaim pair,
+     * SH) -- NOT because of any vtable-internal lock. The serial-path engine ops
      * under serial_mu drive only `vt->read` (via load_root), never the
      * mutating callbacks.
      *
@@ -694,14 +695,15 @@ struct stm_btree_engine {
      * torn dirent probe chain, STM_ECORRUPT on a torn node). `serial_mu`
      * restores the single-serial-op-at-a-time invariant inside the engine,
      * independent of which caller-side lock was held. The `*_concurrent`
-     * EBR readers DO NOT take it (they stay wait-free via mvcc_root); the
-     * commit path does not take it either (it runs under `fs->global` EX).
-     * Lock order: serial_mu and commit_mu are currently NEVER co-held -- the
-     * serial-path load_root runs OUTSIDE commit_mu (commit_mu is taken only by
-     * the `*_concurrent` EBR slow-warm path, which does not take serial_mu).
-     * The required discipline for any FUTURE code that would hold both (e.g.
-     * the BE-prepend commit-concurrent consolidator) is serial_mu OUTER ->
-     * commit_mu INNER; never the reverse. */
+     * EBR readers DO NOT take it (they stay wait-free via mvcc_root). The
+     * commit flush, finalize and abort DO take it: a commit runs under
+     * `fs->global` SH as well as EX (CF-4 C's reclaim-on-ENOSPC pair), and
+     * a clone finalize swaps `root`, EBR-retires the old tree and resets the
+     * node cache under a serial op that is walking them (an unpinned serial
+     * walk is invisible to EBR, so the retire alone would free the tree
+     * under it). Lock order: serial_mu OUTER -> commit_mu INNER, never the
+     * reverse -- the commit entry points, load_root_locked's miss path and
+     * the mini-consolidation all co-hold them that way. */
     pthread_mutex_t       serial_mu;
 
     _Atomic(uint64_t)     next_delta_seq;

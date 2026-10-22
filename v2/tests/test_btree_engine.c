@@ -6262,4 +6262,122 @@ STM_TEST(engine_clone_commit_write_fault_sweep_small_tree) {
     STM_ASSERT_TRUE(f == (int64_t)writes_seen);
 }
 
+/* A commit can run under fs->global SH beside a serial op (CF-4 C's
+ * reclaim-on-ENOSPC pair), so its flush and finalize must wait for a
+ * serial scan already walking eng->root: a clone finalize swaps the root
+ * and EBR-retires the tree the unpinned scan stands on. The scan's
+ * callback parks mid-walk; the commit runs on another thread and must
+ * not finish until the scan is let go. */
+typedef struct {
+    stm_btree_engine *eng;
+    atomic_int        parked;
+    atomic_int        release;
+    uint64_t          seen;
+    stm_status        rc;
+} serial_scan_park;
+
+static int serial_scan_park_cb(const void *key, size_t key_len,
+                               const void *value, size_t value_len,
+                               void *ctx_)
+{
+    (void)key; (void)key_len; (void)value; (void)value_len;
+    serial_scan_park *p = ctx_;
+    p->seen++;
+    if (atomic_exchange(&p->parked, 1) == 0) {
+        /* Bounded so a failing test cannot hang the binary. */
+        for (int i = 0; i < 10000 && !atomic_load(&p->release); i++)
+            usleep(1000);
+    }
+    return 0;
+}
+
+static void *serial_scan_park_thread(void *arg)
+{
+    serial_scan_park *p = arg;
+    p->rc = stm_btree_engine_scan(p->eng, serial_scan_park_cb, p);
+    return NULL;
+}
+
+typedef struct {
+    stm_btree_engine *eng;
+    atomic_int        done;
+    stm_status        flush_rc;
+    stm_status        finalize_rc;
+} commit_beside_scan;
+
+static void *commit_beside_scan_thread(void *arg)
+{
+    commit_beside_scan *c = arg;
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    c->flush_rc = stm_btree_engine_commit_flush(c->eng, 2, &rp, &rg, rc);
+    c->finalize_rc = c->flush_rc == STM_OK
+                         ? stm_btree_engine_commit_finalize(c->eng)
+                         : c->flush_rc;
+    atomic_store(&c->done, 1);
+    return NULL;
+}
+
+STM_TEST(engine_commit_waits_for_serial_scan) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+    for (uint32_t i = 0; i < 64; i++) {
+        uint8_t key[4];
+        be32_key(2u * i, key);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, "a", 1));
+    }
+    uint64_t rp1 = 0;
+    uint8_t  rc1[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp1, rc1));
+
+    /* A concurrent insert latches the clone arm, whose finalize swaps
+     * the root and retires the old tree. */
+    uint8_t ck[4];
+    be32_key(1u, ck);
+    stm_ebr_enter(me);
+    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, ck, 4, "b", 1));
+    stm_ebr_exit(me);
+
+    serial_scan_park p = { .eng = eng };
+    atomic_init(&p.parked, 0);
+    atomic_init(&p.release, 0);
+    pthread_t st;
+    STM_ASSERT_EQ(pthread_create(&st, NULL, serial_scan_park_thread, &p), 0);
+    for (int i = 0; i < 5000 && !atomic_load(&p.parked); i++) usleep(1000);
+    bool parked = atomic_load(&p.parked) != 0;
+
+    commit_beside_scan c = { .eng = eng };
+    atomic_init(&c.done, 0);
+    pthread_t ct;
+    STM_ASSERT_EQ(pthread_create(&ct, NULL, commit_beside_scan_thread, &c), 0);
+    for (int i = 0; i < 300 && !atomic_load(&c.done); i++) usleep(1000);
+    bool committed_under_scan = atomic_load(&c.done) != 0;
+
+    atomic_store(&p.release, 1);
+    pthread_join(st, NULL);
+    pthread_join(ct, NULL);
+
+    STM_ASSERT_TRUE(parked);
+    STM_ASSERT_TRUE(!committed_under_scan);
+    STM_ASSERT_OK(p.rc);
+    STM_ASSERT_EQ(p.seen, (uint64_t)65);
+    STM_ASSERT_OK(c.flush_rc);
+    STM_ASSERT_OK(c.finalize_rc);
+
+    stm_btree_engine_stats stc;
+    STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &stc));
+    STM_ASSERT_EQ(stc.n_keys, (uint64_t)65);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
 STM_TEST_MAIN("btree_engine")
