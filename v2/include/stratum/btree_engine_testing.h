@@ -29,6 +29,20 @@ typedef void (*stm_btree_engine_cold_root_hook)(stm_btree_engine *eng,
                                                 void *arg);
 void stm_btree_engine_set_cold_root_hook_for_test(
     stm_btree_engine_cold_root_hook fn, void *arg);
+
+/* Called by a wait-free range scan each time it goes again, with the
+ * lower bound the next attempt starts from. */
+typedef void (*stm_btree_engine_resume_hook)(stm_btree_engine *eng,
+                                             const void *lo, size_t lo_len,
+                                             void *arg);
+void stm_btree_engine_set_resume_hook_for_test(
+    stm_btree_engine_resume_hook fn, void *arg);
+
+/* Called when a wait-free lookup or scan goes again because a node it read
+ * failed its Merkle gate after a commit published (a reused node). */
+typedef void (*stm_btree_engine_heal_hook)(stm_btree_engine *eng, void *arg);
+void stm_btree_engine_set_heal_hook_for_test(stm_btree_engine_heal_hook fn,
+                                             void *arg);
 #endif
 
 #ifdef __cplusplus

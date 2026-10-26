@@ -1243,6 +1243,7 @@ STM_TEST(bootstrap_early_reuse_takes_a_held_node_after_the_wait) {
     uint64_t waited_ns = test_now_ns() - t0;
     STM_ASSERT_EQ(q, p[0]);
     STM_ASSERT_TRUE(waited_ns >= TEST_REUSE_WAIT_NS);
+    STM_ASSERT_TRUE(waited_ns < 10u * TEST_REUSE_WAIT_NS);
     STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
     STM_ASSERT_EQ(st.pending_nodes, 0u);
     STM_ASSERT_EQ(st.early_reclaimed_nodes, 1u);
@@ -1258,7 +1259,8 @@ STM_TEST(bootstrap_early_reuse_takes_a_held_node_after_the_wait) {
 
 /* A reader pinned for a moment is waited out: the full reserve advances
  * EBR and naps until the reader leaves, rather than taking the node from
- * under it. */
+ * under it. The reader leaves as soon as the reserve's first advance
+ * moves the epoch, so it is gone long before the deadline. */
 typedef struct {
     atomic_int pinned;
     atomic_int leaving;
@@ -1270,8 +1272,10 @@ static void *short_reader_thread(void *arg)
     stm_ebr_thread *t = stm_ebr_register();
     if (!t) { atomic_store(&r->pinned, -1); return NULL; }
     stm_ebr_enter(t);
+    uint64_t entered = stm_ebr_current_epoch();
     atomic_store(&r->pinned, 1);
-    usleep(10000);
+    for (int i = 0; i < 1000000 && stm_ebr_current_epoch() == entered; i++)
+        usleep(10);
     atomic_store(&r->leaving, 1);
     stm_ebr_exit(t);
     stm_ebr_thread_free(t);
@@ -1311,6 +1315,52 @@ STM_TEST(bootstrap_early_reuse_waits_out_a_short_reader) {
     STM_ASSERT_EQ(st.early_reclaimed_nodes, 1u);
     STM_ASSERT_EQ(st.early_forced_nodes, 0u);
 
+    stm_bootstrap_commit_defer_cancel(a);
+    stm_bootstrap_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Two held nodes that are not adjacent cannot make a two-node run, though
+ * there are two of them: the reserve fails at once rather than waiting
+ * out the deadline and taking them from under the reader for nothing. */
+STM_TEST(bootstrap_early_reuse_skips_the_wait_when_no_run_can_form) {
+    make_tmp("norun");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *a = make_fresh_alloc(d);
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *reader = stm_ebr_register();
+    STM_ASSERT_TRUE(reader != NULL);
+
+    uint64_t p[TEST_EXPECTED_NODES];
+    for (uint32_t i = 0; i < TEST_EXPECTED_NODES; i++)
+        STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &p[i]));
+    /* p[1], still allocated, sits between the two nodes freed below. */
+    STM_ASSERT_TRUE(p[0] < p[1] && p[1] < p[2] && p[1] - p[0] == p[2] - p[1]);
+    stm_ebr_enter(reader);
+    STM_ASSERT_OK(stm_bootstrap_free(a, p[0], TEST_NODE_BLOCKS, 3));
+    STM_ASSERT_OK(stm_bootstrap_free(a, p[2], TEST_NODE_BLOCKS, 3));
+    stm_bootstrap_commit_defer_begin(a, 5);
+
+    uint64_t q = 0;
+    uint64_t t0 = test_now_ns();
+    STM_ASSERT_ERR(stm_bootstrap_reserve(a, 2u * TEST_NODE_BLOCKS, 0, &q),
+                   STM_ENOSPC);
+    uint64_t ns = test_now_ns() - t0;
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_TRUE(ns < TEST_REUSE_WAIT_NS / 2u);
+    STM_ASSERT_EQ(st.pending_nodes, 2u);
+    STM_ASSERT_EQ(st.early_forced_nodes, 0u);
+
+    /* Control: one node is a run, so the same pool waits and takes it. */
+    STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q));
+    STM_ASSERT_TRUE(q == p[0] || q == p[2]);
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_TRUE(st.early_forced_nodes >= 1u);
+
+    stm_ebr_exit(reader);
+    stm_ebr_thread_free(reader);
     stm_bootstrap_commit_defer_cancel(a);
     stm_bootstrap_close(a);
     stm_bdev_close(d);

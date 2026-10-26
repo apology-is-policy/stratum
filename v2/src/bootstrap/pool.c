@@ -704,27 +704,28 @@ void stm_bootstrap_close(stm_bootstrap *a)
 
 /* Scan for a run of `nnodes` consecutive free nodes starting at `start`.
  * Returns true + *out_first_node on success; false on no-fit. */
-static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nnodes,
-                           uint64_t *out_first_node)
+static bool find_free_run_in(const uint8_t *bitmap, uint64_t total_nodes,
+                              uint64_t start, uint64_t nnodes,
+                              uint64_t *out_first_node)
 {
-    if (nnodes == 0 || nnodes > a->total_nodes) return false;
+    if (nnodes == 0 || nnodes > total_nodes) return false;
 
     uint64_t scanned = 0;
-    uint64_t cursor  = start % a->total_nodes;
+    uint64_t cursor  = start % total_nodes;
 
-    while (scanned < a->total_nodes) {
-        if (bit_is_set(a->bitmap, cursor)) {
-            cursor = (cursor + 1) % a->total_nodes;
+    while (scanned < total_nodes) {
+        if (bit_is_set(bitmap, cursor)) {
+            cursor = (cursor + 1) % total_nodes;
             scanned++;
             continue;
         }
 
         /* Candidate run starts at `cursor`. Confirm nnodes free. */
         uint64_t end = cursor + nnodes;
-        if (end > a->total_nodes) {
+        if (end > total_nodes) {
             /* Wrap-around not allowed for a contiguous run. Skip past
              * the end and retry from 0. */
-            uint64_t skip = a->total_nodes - cursor;
+            uint64_t skip = total_nodes - cursor;
             scanned += skip;
             cursor = 0;
             continue;
@@ -733,7 +734,7 @@ static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nnode
         bool     ok    = true;
         uint64_t advance = nnodes;   /* nodes scanned forward this iter */
         for (uint64_t i = cursor; i < end; i++) {
-            if (bit_is_set(a->bitmap, i)) {
+            if (bit_is_set(bitmap, i)) {
                 ok = false;
                 advance = (i + 1) - cursor;
                 cursor  = i + 1;
@@ -747,6 +748,13 @@ static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nnode
         scanned += advance;
     }
     return false;
+}
+
+static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nnodes,
+                          uint64_t *out_first_node)
+{
+    return find_free_run_in(a->bitmap, a->total_nodes, start, nnodes,
+                            out_first_node);
 }
 
 /* Return every PENDING entry below reuse_below_gen to the in-RAM bitmap so
@@ -807,19 +815,38 @@ static uint64_t bootstrap_reclaim_settled(stm_bootstrap *a, bool force,
     return reclaimed;
 }
 
-static uint64_t bootstrap_free_nodes(const stm_bootstrap *a)
+/* Whether reusing every settled entry, held ones included, would leave a
+ * run of nnodes free. A reserve runs under the commit's lock, so nothing
+ * else changes the pool while it waits and this is asked once. Without
+ * memory for the scratch bitmap it answers yes, which costs only the
+ * wait. */
+static bool bootstrap_run_possible(const stm_bootstrap *a, uint64_t start,
+                                   uint64_t nnodes)
 {
-    uint64_t n = 0;
-    for (uint64_t i = 0; i < a->total_nodes; i++)
-        if (!bit_is_set(a->bitmap, i)) n++;
-    return n;
+    uint8_t *bm = malloc(a->bitmap_bytes);
+    if (!bm) return true;
+    memcpy(bm, a->bitmap, a->bitmap_bytes);
+    for (const pending_entry *e = a->pending_head; e; e = e->next) {
+        uint64_t first = 0;
+        if (e->free_gen >= a->reuse_below_gen ||
+            !paddr_to_node(a, e->paddr, &first))
+            continue;
+        uint64_t n = e->nblocks / (uint64_t)STM_BOOTSTRAP_NODE_BLOCKS;
+        for (uint64_t i = 0; i < n; i++) bit_clear(bm, first + i);
+    }
+    uint64_t first = 0;
+    bool ok = find_free_run_in(bm, a->total_nodes, start, nnodes, &first);
+    free(bm);
+    return ok;
 }
 
-static uint64_t boot_now_ns(void)
+/* False when the clock cannot be read; the caller stops waiting. */
+static bool boot_now_ns(uint64_t *out)
 {
-    struct timespec ts;
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    struct timespec ts = { 0 };
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return false;
+    *out = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return true;
 }
 
 /* How long a full reserve waits, on the monotonic clock, for pinned
@@ -834,7 +861,7 @@ static uint64_t boot_now_ns(void)
 /* A reserve found no free run: reuse the settled PENDING entries, advancing
  * EBR and napping while pinned readers hold some back, until a run of
  * nnodes is free or the wait is spent; then reuse the held-back entries
- * too. No wait when even they could not make up nnodes free nodes. True,
+ * too. No wait when even they could not complete a run of nnodes. True,
  * with *out_first set, once a run of nnodes is free. */
 static bool bootstrap_reuse_settled(stm_bootstrap *a, uint64_t start,
                                     uint64_t nnodes, uint64_t *out_first)
@@ -846,11 +873,13 @@ static bool bootstrap_reuse_settled(stm_bootstrap *a, uint64_t start,
         if (bootstrap_reclaim_settled(a, false, &gated) != 0 &&
             find_free_run(a, start, nnodes, out_first))
             return true;
-        if (gated == 0 || bootstrap_free_nodes(a) + gated < nnodes)
+        if (gated == 0) return false;
+        if (deadline == 0 && !bootstrap_run_possible(a, start, nnodes))
             return false;
-        uint64_t now = boot_now_ns();
-        if (deadline == 0) deadline = now + BOOT_REUSE_WAIT_NS;
-        if (now >= deadline) {
+        uint64_t now = 0;
+        bool timed = boot_now_ns(&now);
+        if (timed && deadline == 0) deadline = now + BOOT_REUSE_WAIT_NS;
+        if (!timed || now >= deadline) {
             (void)bootstrap_reclaim_settled(a, true, &gated);
             return find_free_run(a, start, nnodes, out_first);
         }

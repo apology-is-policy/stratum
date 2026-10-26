@@ -489,12 +489,11 @@ stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
  * nonzero length, STM_ENOMEM / STM_ECORRUPT / device errors otherwise.
  *
  * STM_EBUSY (transient by construction — the R174-F2 retriable
- * contract): a seal/fold/tombstone observed BEFORE any callback fires
- * restarts internally against the fresh root (up to ENG_SEAL_RETRY_MAX);
- * one observed MID-WALK surfaces STM_EBUSY IMMEDIATELY instead — the
- * walk cannot restart once entries were emitted (duplicate emission is
- * worse than a transient retry), and only the caller can reset its
- * accumulation state. Callers either propagate it into an SH-fallback
+ * contract): a seal/fold/tombstone, or a node a commit reused, goes
+ * again internally from the fresh root after the last delivered key,
+ * up to ENG_SEAL_RETRY_MAX attempts, so no key is delivered twice;
+ * STM_EBUSY surfaces past that bound (and from the CF-2d injection
+ * hook). Callers either propagate it into an SH-fallback
  * (the R175-F2 read legs) or wrap the whole scan in a bounded retry
  * that RESETS the callback ctx per attempt and re-enters a FRESH EBR
  * pin per attempt (the CF-2c write-path scan legs;

@@ -205,8 +205,9 @@ void eng_msg_array_free(eng_msg *msgs, uint32_t n);
  * both re-load mvcc_root and retry. A seal window does no I/O and is
  * bounded by the deltas that arrived during one unsealed fold pass
  * (the mini folds its bulk from a pre-seal snapshot — R174 F2) or,
- * for the finalize residue migration, during one commit flush (empty
- * in production, where fs->global EX excludes writers from commits);
+ * for the finalize residue migration, during one commit flush
+ * (non-empty when a commit runs under fs->global SH beside writers, as
+ * CF-4 C's reclaim pair does);
  * the retry loops yield periodically and surface STM_EBUSY only past
  * ENG_SEAL_RETRY_MAX — a transient-contention signal, not corruption.
  * A seal is never left dangling: every sealer publishes a replacement

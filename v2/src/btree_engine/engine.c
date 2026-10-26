@@ -266,7 +266,7 @@ void stm_btree_engine_retire(stm_btree_engine *eng)
  *
  * Threading (9.8-LF-2 R170 P2-4): load_root mutates `eng->root`
  * non-atomically; callers must ensure no concurrent execution of
- * load_root against the same engine. Two caller classes today:
+ * load_root against the same engine. Three caller classes today:
  *   - The serial ops (lookup / insert / delete / scan / stats) reach
  *     it through load_root_locked, which takes commit_mu around it
  *     (they hold serial_mu: serial_mu OUTER -> commit_mu INNER).
@@ -836,12 +836,30 @@ static stm_status buffer_resolve_for_key(const eng_node *n,
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 static stm_btree_engine_cold_root_hook cold_root_hook;
 static void *cold_root_hook_arg;
+static stm_btree_engine_resume_hook resume_hook;
+static void *resume_hook_arg;
+static stm_btree_engine_heal_hook heal_hook;
+static void *heal_hook_arg;
 
 void stm_btree_engine_set_cold_root_hook_for_test(
     stm_btree_engine_cold_root_hook fn, void *arg)
 {
     cold_root_hook = fn;
     cold_root_hook_arg = arg;
+}
+
+void stm_btree_engine_set_resume_hook_for_test(
+    stm_btree_engine_resume_hook fn, void *arg)
+{
+    resume_hook = fn;
+    resume_hook_arg = arg;
+}
+
+void stm_btree_engine_set_heal_hook_for_test(stm_btree_engine_heal_hook fn,
+                                             void *arg)
+{
+    heal_hook = fn;
+    heal_hook_arg = arg;
 }
 #endif
 
@@ -907,9 +925,12 @@ static stm_status concurrent_root(stm_btree_engine *eng, eng_node **out)
  * paddr out and rewrite it before the descent gets there; the read then
  * fails the Merkle gate. That can happen only if publish_seq moved since
  * the descent took `seq`, and then the descent goes again from the
- * current root, which never references a freed paddr. An unmoved count
- * makes the failure real corruption. The fence orders the device read
- * before the reload. */
+ * current root, which never references a freed paddr. With an unmoved
+ * count the failure is corruption as far as this engine can tell: the
+ * only frees that skip the count are a retired engine's (a rollback's
+ * diverged nodes, a dataset destroy), and a descent pinned on a retired
+ * engine is left to its caller's fallback, which resolves the engine
+ * again. The fence orders the device read before the reload. */
 static bool engine_published_since(stm_btree_engine *eng, uint64_t seq)
 {
     atomic_thread_fence(memory_order_seq_cst);
@@ -1040,10 +1061,14 @@ stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
         stm_status s = lookup_concurrent_attempt(eng, key, key_len,
                                                  out_found, out_value,
                                                  out_value_len, &retry);
-        if (s == STM_ECORRUPT && engine_published_since(eng, seq))
+        if (s == STM_ECORRUPT && engine_published_since(eng, seq)) {
             retry = true;                  /* a reused node — go again */
-        else if (s != STM_OK || !retry)
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+            if (heal_hook) heal_hook(eng, heal_hook_arg);
+#endif
+        } else if (s != STM_OK || !retry) {
             return s;
+        }
         if ((attempt + 1u) % ENG_SEAL_YIELD_EVERY == 0u)
             sched_yield();
     }
@@ -1660,10 +1685,15 @@ static stm_status engine_prepend_op(stm_btree_engine *eng, eng_delta_op op,
     /* Latch BEFORE the delta can become visible: any commit that can
      * observe the delta (chain load-acquire) then also observes the
      * latch (it is sequenced before the publishing CAS-release). The
-     * FIRST _concurrent op must not race an in-flight legacy commit —
-     * caller-sequenced (production: commits under fs->global EX vs
-     * writers under SH; the regime transition is a code boundary, not
-     * a runtime race). */
+     * FIRST _concurrent op can race an in-flight legacy-arm commit
+     * (CF-4 C's reclaim pair commits under fs->global SH beside SH
+     * writers), and that is benign: every production write is a
+     * _concurrent prepend, so a never-latched engine has no dirty node
+     * but a fresh empty root leaf, whose write touches nothing a reader
+     * reads; the legacy finalize republishes the same root and leaves
+     * chain_head alone, so the delta reaches the next (clone) commit. A
+     * failed legacy commit drops the chain with the in-memory tree, but
+     * a failed sync commit wedges the filesystem: a crash's loss. */
     atomic_store_explicit(&eng->concurrent_regime, true,
                           memory_order_release);
 
@@ -2953,6 +2983,11 @@ static stm_status commit_finalize_clone(stm_btree_engine *eng)
      * tree until their epochs exit. */
     eng->root = shadow;
     atomic_store_explicit(&eng->mvcc_root, shadow, memory_order_release);
+    /* The seal above precedes this store and the bump: a descent whose
+     * count shows the bump also sees the old root's chain sealed and goes
+     * again before it reads a node, whatever the order of the two. The
+     * count is for a descent already past the chain, whose snapshot
+     * predates the bump. */
     atomic_fetch_add_explicit(&eng->publish_seq, 1u, memory_order_release);
 
     /* Grace-deferred reclamation of the WHOLE superseded tree (the
@@ -3518,12 +3553,11 @@ static stm_status chain_window_build(const eng_node *root, bool bounded,
  * One whole-tree merged scan attempt from `root`: chain window +
  * subtree walk. A SEALED chain observed at the window build — BEFORE
  * any callback fired — sets *restart (safe to re-run against the
- * fresh mvcc_root). A tombstoned slot observed MID-WALK cannot
- * restart silently (callbacks already fired; a re-run would emit
- * duplicates) — it surfaces STM_EBUSY, and the caller's transient-
- * retry discipline (the fs-layer R171 P1-1 fallback shape) re-drives
- * the whole op. Both are seal-window-transient; production serial
- * callers can see neither (the exclusion contracts).
+ * fresh mvcc_root). A tombstoned slot observed MID-WALK sets it too:
+ * the only walk that can meet one is the wait-free scan, which
+ * resumes after the last key it delivered, so nothing is emitted
+ * twice. Production serial callers can see neither (the exclusion
+ * contracts).
  */
 static stm_status scan_tree(stm_btree_engine *eng, eng_node *root,
                             bool concurrent, bool bounded,
@@ -3547,7 +3581,7 @@ static stm_status scan_tree(stm_btree_engine *eng, eng_node *root,
                      win, win_n, cb, ctx, 0, &stopped, &stale);
     free(store);
     free(win);
-    if (s == STM_OK && stale) return STM_EBUSY;
+    if (s == STM_OK && stale) *restart = true;
     return s;
 }
 
@@ -3665,12 +3699,11 @@ stm_status stm_btree_engine_scan_range_concurrent(stm_btree_engine *eng,
 
     /* Acquire-load the published root (slow-warm under commit_mu via
      * concurrent_root); merged view = chain window + buffers + base.
-     * A seal observed BEFORE any callback restarts against the fresh
-     * root; a mid-walk tombstone surfaces STM_EBUSY (see scan_tree —
-     * duplicate emission is worse than a transient retry). A reused
-     * node (engine_published_since) resumes from the fresh root at the
-     * last delivered key instead: a scan longer than the gap between
-     * reusing commits must still finish. */
+     * A seal, a tombstoned slot met mid-walk (a mini superseded the
+     * node) and a reused node (engine_published_since) all go again
+     * from the fresh root after the last delivered key: the filter
+     * drops what was already delivered, and a scan longer than the gap
+     * between minis or reusing commits still finishes. */
     scan_resume r = { .cb = cb, .ctx = ctx };
     uint8_t    *lo_buf = NULL;
     const void *lo     = lo_key;
@@ -3687,20 +3720,24 @@ stm_status stm_btree_engine_scan_range_concurrent(stm_btree_engine *eng,
                       lo, lo_len, hi_key, hi_key_len,
                       scan_resume_cb, &r, &restart);
         if (r.oom) { s = STM_ENOMEM; break; }
-        if (s == STM_ECORRUPT && engine_published_since(eng, seq)) {
-            /* The bound gets its own copy: the filter's buffer can be
-             * reallocated by the next attempt's callbacks. */
-            if (r.have_last) {
-                uint8_t *nb = realloc(lo_buf, r.last_len ? r.last_len : 1u);
-                if (!nb) { s = STM_ENOMEM; break; }
-                lo_buf = nb;
-                if (r.last_len) memcpy(lo_buf, r.last, r.last_len);
-                lo     = lo_buf;
-                lo_len = r.last_len;
-            }
-        } else if (s != STM_OK || !restart) {
-            break;
+        bool healed = s == STM_ECORRUPT && engine_published_since(eng, seq);
+        if (!healed && (s != STM_OK || !restart)) break;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (healed && heal_hook) heal_hook(eng, heal_hook_arg);
+#endif
+        /* The bound gets its own copy: the filter's buffer can be
+         * reallocated by the next attempt's callbacks. */
+        if (r.have_last) {
+            uint8_t *nb = realloc(lo_buf, r.last_len ? r.last_len : 1u);
+            if (!nb) { s = STM_ENOMEM; break; }
+            lo_buf = nb;
+            if (r.last_len) memcpy(lo_buf, r.last, r.last_len);
+            lo     = lo_buf;
+            lo_len = r.last_len;
         }
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (resume_hook) resume_hook(eng, lo, lo_len, resume_hook_arg);
+#endif
         s = STM_EBUSY;
         if ((attempt + 1u) % ENG_SEAL_YIELD_EVERY == 0u)
             sched_yield();

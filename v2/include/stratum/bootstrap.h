@@ -249,8 +249,8 @@ void stm_bootstrap_close(stm_bootstrap *a);
  * (a long cold scan, a stopped thread) reads the rewritten node, fails its
  * Merkle gate and goes again from the current root (a lookup restarts, a
  * scan resumes after its last key), so the wait only spares it that
- * restart. There is no wait when even the held-back nodes could not make
- * up the request.
+ * restart. There is no wait when even the held-back nodes could not
+ * complete a contiguous run of the requested size.
  *
  * Returns STM_ENOSPC if no run of the requested size is free, and
  * STM_EBUSY between stm_bootstrap_commit_defer_stage and _finalize, where

@@ -6496,6 +6496,7 @@ typedef struct {
     size_t            scribbled;
     const reuse_scan *scan;       /* a scan's progress, read at the fire */
     uint32_t          delivered;
+    bool              serial;     /* serial inserts: the legacy arm */
 } reuse_hook;
 
 static void reuse_hook_fire(void *arg, uint64_t paddr)
@@ -6514,8 +6515,10 @@ static void reuse_hook_fire(void *arg, uint64_t paddr)
         uint8_t key[4];
         be32_key(2u * (i * (RU_BASE / RU_UPD)) + 1u, key);
         memset(v, (int)(i & 0xFFu), sizeof v);
-        h->rc = stm_btree_engine_insert_concurrent(h->eng, h->me, key, 4,
-                                                   v, sizeof v);
+        h->rc = h->serial
+                    ? stm_btree_engine_insert(h->eng, key, 4, v, sizeof v)
+                    : stm_btree_engine_insert_concurrent(h->eng, h->me, key,
+                                                         4, v, sizeof v);
     }
     uint64_t rp = 0;
     uint8_t  rc[32];
@@ -6564,6 +6567,19 @@ static stm_btree_engine *reuse_cold_engine(memstore *ms,
     return eng;
 }
 
+static void heal_count_hook(stm_btree_engine *eng, void *arg)
+{
+    (void)eng;
+    (*(int *)arg)++;
+}
+
+static void resume_count_hook(stm_btree_engine *eng, const void *lo,
+                              size_t lo_len, void *arg)
+{
+    (void)eng; (void)lo; (void)lo_len;
+    (*(int *)arg)++;
+}
+
 STM_TEST(engine_lookup_concurrent_survives_a_reused_node) {
     STM_ASSERT_OK(stm_ebr_init());
     stm_ebr_thread *me = stm_ebr_register();
@@ -6580,6 +6596,8 @@ STM_TEST(engine_lookup_concurrent_survives_a_reused_node) {
     reuse_hook h = { .eng = eng, .ms = &ms, .me = me, .commit = true };
     ms.hook = reuse_hook_fire;
     ms.hook_arg = &h;
+    int heals = 0;
+    stm_btree_engine_set_heal_hook_for_test(heal_count_hook, &heals);
     uint8_t key[4];
     be32_key(2u * 600u, key);
     bool found = false;
@@ -6589,10 +6607,12 @@ STM_TEST(engine_lookup_concurrent_survives_a_reused_node) {
     stm_status s = stm_btree_engine_lookup_concurrent(eng, me, key, 4,
                                                       &found, &val, &vl);
     stm_ebr_exit(me);
+    stm_btree_engine_set_heal_hook_for_test(NULL, NULL);
 
     STM_ASSERT_TRUE(h.fired);
     STM_ASSERT_OK(h.rc);
     STM_ASSERT_TRUE(h.scribbled > 0u);
+    STM_ASSERT_TRUE(heals >= 1);
     STM_ASSERT_OK(s);
     STM_ASSERT_TRUE(found);
     STM_ASSERT_EQ((long long)vl, 1ll);
@@ -6620,6 +6640,26 @@ static int reuse_scan_cb(const void *key, size_t key_len,
     return 0;
 }
 
+/* Each time the scan goes again, its lower bound must be the last key it
+ * delivered: restarting from the original bound with the filter would
+ * deliver the same keys, but a scan longer than the gap between reuses
+ * would never get past its first stretch. */
+typedef struct {
+    const reuse_scan *r;
+    int               resumes;
+    bool              at_last;
+} resume_check;
+
+static void resume_check_hook(stm_btree_engine *eng, const void *lo,
+                              size_t lo_len, void *arg)
+{
+    (void)eng;
+    resume_check *c = arg;
+    c->resumes++;
+    if (!c->r->have || lo_len != 4 || memcmp(lo, c->r->last, 4) != 0)
+        c->at_last = false;
+}
+
 /* The scan has delivered the first leaf when the commit lands: it resumes
  * from the new root after the last key it delivered, with no key twice. */
 STM_TEST(engine_scan_concurrent_resumes_after_a_reused_node) {
@@ -6641,6 +6681,10 @@ STM_TEST(engine_scan_concurrent_resumes_after_a_reused_node) {
     ms.hook_skip = height - 1u;            /* the path to the first leaf */
     reuse_scan r = { .in_order = true };
     h.scan = &r;
+    int heals = 0;
+    resume_check rc = { .r = &r, .at_last = true };
+    stm_btree_engine_set_heal_hook_for_test(heal_count_hook, &heals);
+    stm_btree_engine_set_resume_hook_for_test(resume_check_hook, &rc);
     uint8_t lo[4], hi[4];
     be32_key(0u, lo);
     be32_key(UINT32_MAX, hi);
@@ -6649,11 +6693,16 @@ STM_TEST(engine_scan_concurrent_resumes_after_a_reused_node) {
                                                           hi, 4,
                                                           reuse_scan_cb, &r);
     stm_ebr_exit(me);
+    stm_btree_engine_set_resume_hook_for_test(NULL, NULL);
+    stm_btree_engine_set_heal_hook_for_test(NULL, NULL);
 
     STM_ASSERT_TRUE(h.fired);
     STM_ASSERT_OK(h.rc);
     STM_ASSERT_TRUE(h.scribbled > 0u);
     STM_ASSERT_TRUE(h.delivered > 0u);
+    STM_ASSERT_TRUE(heals >= 1);
+    STM_ASSERT_TRUE(rc.resumes >= 1);
+    STM_ASSERT_TRUE(rc.at_last);
     STM_ASSERT_OK(s);
     STM_ASSERT_TRUE(r.in_order);
     STM_ASSERT_EQ(r.evens, (uint32_t)RU_BASE);
@@ -6684,6 +6733,8 @@ STM_TEST(engine_concurrent_reports_corruption_without_a_publish) {
         reuse_hook h = { .eng = eng, .ms = &ms, .me = me, .commit = false };
         ms.hook = reuse_hook_fire;
         ms.hook_arg = &h;
+        int heals = 0;
+        stm_btree_engine_set_heal_hook_for_test(heal_count_hook, &heals);
         stm_status s;
         stm_ebr_enter(me);
         if (leg == 0) {
@@ -6705,8 +6756,10 @@ STM_TEST(engine_concurrent_reports_corruption_without_a_publish) {
                                                        reuse_scan_cb, &r);
         }
         stm_ebr_exit(me);
+        stm_btree_engine_set_heal_hook_for_test(NULL, NULL);
         STM_ASSERT_TRUE(h.fired);
         STM_ASSERT_EQ((long long)h.scribbled, 1ll);
+        STM_ASSERT_EQ(heals, 0);
         STM_ASSERT_EQ(s, STM_ECORRUPT);
 
         stm_btree_engine_destroy(eng);
@@ -6717,13 +6770,67 @@ STM_TEST(engine_concurrent_reports_corruption_without_a_publish) {
     stm_ebr_thread_free(me);
 }
 
+/* On the legacy arm (no concurrent write ever latched the engine) a commit
+ * rewrites the tree in place and republishes the same root, and its
+ * finalize must still bump the count: a descent already reading a
+ * superseded leaf's paddr gets the reused bytes. The hook's updates are
+ * serial, so the engine stays unlatched. */
+STM_TEST(engine_legacy_lookup_survives_a_reused_node) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    uint32_t height = 0;
+    stm_btree_engine *eng = reuse_cold_engine(&ms, &cx, &height);
+    STM_ASSERT_TRUE(eng != NULL);
+    if (!eng) { memstore_destroy(&ms); stm_ebr_thread_free(me); return; }
+    STM_ASSERT_TRUE(height >= 2u);
+
+    reuse_hook h = { .eng = eng, .ms = &ms, .me = me, .commit = true,
+                     .serial = true };
+    ms.hook = reuse_hook_fire;
+    ms.hook_arg = &h;
+    int heals = 0;
+    stm_btree_engine_set_heal_hook_for_test(heal_count_hook, &heals);
+    uint8_t key[4];
+    be32_key(2u * 600u, key);
+    bool found = false;
+    void *val = NULL;
+    size_t vl = 0;
+    stm_ebr_enter(me);
+    stm_status s = stm_btree_engine_lookup_concurrent(eng, me, key, 4,
+                                                      &found, &val, &vl);
+    stm_ebr_exit(me);
+    stm_btree_engine_set_heal_hook_for_test(NULL, NULL);
+
+    STM_ASSERT_TRUE(h.fired);
+    STM_ASSERT_OK(h.rc);
+    STM_ASSERT_TRUE(h.scribbled > 0u);
+    STM_ASSERT_FALSE(atomic_load(&eng->concurrent_regime));
+    STM_ASSERT_TRUE(heals >= 1);
+    STM_ASSERT_OK(s);
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_TRUE(vl == 1 && ((const char *)val)[0] == 'a');
+    free(val);
+
+    stm_btree_engine_destroy(eng);
+    for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
+        (void)stm_ebr_try_advance();
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
 /* A wait-free descent that finds no published root must not wait on
  * commit_mu while pinned: a commit flush warms the root itself and then
  * keeps the lock through its writes and the pool's reserve, which may be
  * waiting for that very pin. The hook parks the descent after it saw no
- * root; a serial lookup then warms and publishes the root, and the test
- * holds commit_mu as such a flush would. The descent must finish from
- * the published root while the lock is still held. */
+ * root. The test warms the root with a serial lookup, takes commit_mu,
+ * withdraws the root and lets the descent go, then publishes the root
+ * again under the lock, as the flush's own load_root does: the descent
+ * must keep looking (one look and then a blocking lock would hang here)
+ * and finish while the lock is still held. */
 typedef struct {
     stm_btree_engine *eng;
     stm_ebr_thread   *me;
@@ -6790,11 +6897,16 @@ STM_TEST(engine_cold_concurrent_root_never_waits_on_commit_mu) {
     size_t svl = 0;
     STM_ASSERT_OK(stm_btree_engine_lookup(eng, key, 4, &sf, &sv, &svl));
     free(sv);
-    bool published = atomic_load_explicit(&eng->mvcc_root,
-                                          memory_order_acquire) != NULL;
+    eng_node *warm = atomic_load_explicit(&eng->mvcc_root,
+                                          memory_order_acquire);
+    bool published = warm != NULL;
 
     pthread_mutex_lock(&eng->commit_mu);
+    atomic_store_explicit(&eng->mvcc_root, NULL, memory_order_release);
     atomic_store(&p.go, 1);
+    usleep(50000);
+    bool waited_unpublished = !atomic_load(&p.done);
+    atomic_store_explicit(&eng->mvcc_root, warm, memory_order_release);
     for (int i = 0; i < 1000 && !atomic_load(&p.done); i++) usleep(1000);
     bool done_under_lock = atomic_load(&p.done) != 0;
     pthread_mutex_unlock(&eng->commit_mu);
@@ -6804,6 +6916,7 @@ STM_TEST(engine_cold_concurrent_root_never_waits_on_commit_mu) {
     STM_ASSERT_TRUE(parked);
     STM_ASSERT_TRUE(sf);
     STM_ASSERT_TRUE(published);
+    STM_ASSERT_TRUE(waited_unpublished);
     STM_ASSERT_TRUE(done_under_lock);
     STM_ASSERT_OK(p.rc);
     STM_ASSERT_TRUE(p.found);
@@ -6811,6 +6924,97 @@ STM_TEST(engine_cold_concurrent_root_never_waits_on_commit_mu) {
     stm_btree_engine_destroy(eng);
     memstore_destroy(&ms);
     if (p.me) stm_ebr_thread_free(p.me);
+}
+
+/* A mini that supersedes the node a wait-free scan is walking tombstones
+ * that node's slots; the scan goes again from the new root after its last
+ * delivered key instead of failing with STM_EBUSY. The callback lands the
+ * mini (the R177 F1 shape: a depth-3 tree, inserts below every pivot so
+ * the flush COWs child 0) while the scan is in child 0's first leaf. */
+typedef struct {
+    stm_btree_engine *eng;
+    stm_ebr_thread   *me;
+    eng_node         *c0;
+    uint32_t          seen;
+    bool              in_order;
+    bool              replaced;
+    stm_status        rc;
+    char              last[16];
+} tomb_scan;
+
+static int tomb_scan_cb(const void *key, size_t key_len,
+                        const void *val, size_t val_len, void *ctx)
+{
+    (void)val; (void)val_len;
+    tomb_scan *t = ctx;
+    if (key_len != 12u) { t->in_order = false; return 1; }
+    if (t->seen && memcmp(key, t->last, 12u) <= 0) t->in_order = false;
+    memcpy(t->last, key, 12u);
+    if (++t->seen == 5u) {
+        char big[300];
+        memset(big, 'T', sizeof big);
+        for (uint32_t i = 0; i < 40u && t->rc == STM_OK; i++) {
+            char k[32];
+            int kl = snprintf(k, sizeof k, "a-%04u", i);
+            t->rc = stm_btree_engine_insert_concurrent(t->eng, t->me,
+                                                       k, (size_t)kl,
+                                                       big, sizeof big);
+        }
+        t->replaced = t->eng->root->children[0].mem != t->c0;
+    }
+    return 0;
+}
+
+STM_TEST(engine_scan_concurrent_resumes_past_a_mid_walk_tombstone) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+    if (!eng) { memstore_destroy(&ms); stm_ebr_thread_free(me); return; }
+
+    char big[300];
+    memset(big, 'T', sizeof big);
+    for (uint32_t i = 0; i < 6500u; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof k, "d3-key-%05u", i);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, k, (size_t)kl,
+                                              big, sizeof big));
+    }
+    uint64_t rp = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp, rc));
+    STM_ASSERT_FALSE(eng->root->is_leaf);
+    eng_node *c0 = eng->root->children[0].mem;
+    STM_ASSERT_TRUE(c0 != NULL && !c0->is_leaf);   /* depth 3 */
+
+    tomb_scan ts = { .eng = eng, .me = me, .c0 = c0, .in_order = true };
+    int heals = 0, resumes = 0;
+    stm_btree_engine_set_heal_hook_for_test(heal_count_hook, &heals);
+    stm_btree_engine_set_resume_hook_for_test(resume_count_hook, &resumes);
+    stm_ebr_enter(me);
+    stm_status s = stm_btree_engine_scan_range_concurrent(
+        eng, me, "d3-key-00000", 12, "d3-key-99999", 12, tomb_scan_cb, &ts);
+    stm_ebr_exit(me);
+    stm_btree_engine_set_resume_hook_for_test(NULL, NULL);
+    stm_btree_engine_set_heal_hook_for_test(NULL, NULL);
+
+    STM_ASSERT_OK(ts.rc);
+    STM_ASSERT_TRUE(ts.replaced);
+    STM_ASSERT_OK(s);
+    STM_ASSERT_TRUE(ts.in_order);
+    STM_ASSERT_EQ(ts.seen, 6500u);
+    STM_ASSERT_TRUE(resumes >= 1);
+    STM_ASSERT_EQ(heals, 0);
+
+    stm_btree_engine_destroy(eng);
+    for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
+        (void)stm_ebr_try_advance();
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
 }
 
 STM_TEST_MAIN("btree_engine")

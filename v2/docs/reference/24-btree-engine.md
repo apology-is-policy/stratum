@@ -534,7 +534,8 @@ race-free by two address-compared sentinels. `ENG_CHAIN_SEALED`
 and retry, yielding periodically. A seal window does no I/O and is
 bounded by the deltas that arrived during one unsealed fold pass
 (the mini folds its bulk from a pre-seal snapshot — R174 F2) or one
-commit flush (the finalize migration; empty in production);
+commit flush (the finalize migration; non-empty beside CF-4 C's SH
+commits);
 `ENG_SEAL_RETRY_MAX` surfaces `STM_EBUSY` past the budget — a
 retriable back-pressure signal callers handle at their level, never
 corruption. `ENG_CHILD_TOMBSTONE` (xchg'd into every husk child
@@ -669,9 +670,14 @@ the shadow re-loads). An uncached descent loses the early DAG gate —
 cycles remain caught by the depth caps, and a double-loaded DAG node
 yields two singly-parented copies (degraded detection, never
 unsafety). A pinned reader racing the paddr's DISK lifecycle
-(superseded, reclaimed, rewritten commits later) surfaces as a
-Merkle-gate `STM_ECORRUPT` — fail-closed; the fs-layer SH-fallback
-retries against the current root.
+(superseded, reclaimed, rewritten commits later) fails the Merkle gate
+with `STM_ECORRUPT`; when the engine's `publish_seq` moved since the
+descent began, a lookup restarts and a scan resumes from the current
+root (`engine_published_since`; on the legacy arm too,
+`engine_legacy_lookup_survives_a_reused_node`). On the clone arm the
+finalize seals the old root's chain before it publishes and counts, so
+a descent that sees the new count restarts at the seal before it reads
+a node.
 
 **Scans + serial reads.** All four scan entries (serial + concurrent,
 full + range) route through `scan_tree`, which snapshots the root
@@ -679,8 +685,10 @@ chain into a key-sorted per-key-newest window of borrowed views
 (`chain_window_build`) and feeds it to the chunk-8 merged
 `scan_subtree` walk — chain deltas overlay buffers overlay the base.
 A seal observed at the window build (before any callback) restarts
-against the fresh root; a tombstone mid-walk surfaces `STM_EBUSY`
-(a silent restart would re-emit callbacks). The serial lookup gained
+against the fresh root; a tombstone met mid-walk resumes the
+wait-free scan from the fresh root after its last delivered key (the
+same filter as a reused node), so nothing is emitted twice
+(`engine_scan_concurrent_resumes_past_a_mid_walk_tombstone`). The serial lookup gained
 the same chain consult (root-only in practice; `STM_EBUSY` on a seal
 — unreachable in legal serial use).
 
@@ -695,9 +703,12 @@ that pin, so on contention they re-read `mvcc_root` and yield
 step's wait for a serial op has its own test, on both arms
 (`engine_commit_{flush,finalize,abort}_waits_for_serial_*`).
 Writers and readers hold NO engine mutex on their fast paths. The
-regime-transition contract: the FIRST `_concurrent` op must not race
-an in-flight legacy commit (caller-sequenced; production: `fs->global`
-EX commits vs SH writers).
+FIRST `_concurrent` op on an engine can race a legacy-arm commit
+(CF-4 C's SH reclaim pair beside SH writers); that is benign because
+every production write is a `_concurrent` prepend, so a never-latched
+engine has nothing dirty a reader can see, and the legacy finalize
+keeps `chain_head`, so the delta reaches the next (clone) commit (see
+`engine_prepend_op`).
 
 ### Node cache
 

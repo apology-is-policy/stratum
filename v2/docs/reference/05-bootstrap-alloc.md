@@ -255,8 +255,9 @@ Deferred-free follows `allocator.tla`, with the refinement in item 3:
    (`stm_ebr_epoch_reclaimable`): it advances EBR and naps between tries
    while pinned readers hold entries back, for up to 50 ms on the
    monotonic clock (`BOOT_REUSE_WAIT_NS`), then reuses them anyway, and
-   it skips the wait when even the held-back nodes could not make up the
-   request. The deadline is a preference, not the safety argument (vote
+   it skips the wait when even the held-back nodes could not complete a
+   contiguous run of the request (decided once, on a scratch copy of the
+   bitmap). The deadline is a preference, not the safety argument (vote
    22, 2026-10-26): a scan can stay pinned for hundreds of milliseconds
    (a cold readdir of 100k entries, about 410 ms) and a stopped thread
    for ever, and a hard gate then wedged the filesystem. A descent still
@@ -268,7 +269,9 @@ Deferred-free follows `allocator.tla`, with the refinement in item 3:
    scan resumes after its last delivered key, from the current root,
    which never references a freed paddr (`engine_published_since` in
    `src/btree_engine/engine.c`). An unmoved count leaves the failure
-   reported as corruption. The same check covers the ordinary sweep's
+   reported as corruption; the frees that skip the count are a retired
+   engine's (a rollback's diverged nodes, a dataset destroy), whose
+   pinned readers fall back and resolve the engine again. The same check covers the ordinary sweep's
    reuse, which has no EBR gate at all. A wait-free op resolves its
    dataset engine through `stm_dataset_index_get_engine_pinned`, which
    drops the pin while it waits for the index lock the commit cascade
