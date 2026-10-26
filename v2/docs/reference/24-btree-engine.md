@@ -819,15 +819,30 @@ Commit is **three-phase** so it composes with the three-phase sync:
   (`btree.tla::Crash`); the durable root is exactly what survives.
 
 `commit` is the single-shot convenience: `commit_flush` then
-`commit_finalize`. A re-commit of an all-clean tree is a no-op — it
-writes nothing, frees nothing, and returns the unchanged triple.
+`commit_finalize`, aborting the flush if the finalize fails. A re-commit
+of an all-clean tree is a no-op — it writes nothing, frees nothing, and
+returns the unchanged triple.
+
+A legacy-arm finalize cannot fail. A clone-arm finalize can: it
+copies the deltas prepended since the flush onto the new root, and if
+that copy runs out of memory it restores the old root's chain and
+returns `STM_ENOMEM` with nothing published and the window still open.
+A retried finalize or an abort closes it. `stm_sync_commit` sends
+neither (past the commit point an abort would desync the engine from
+the durable uberblock): the fs wedges, and
+`stm_dataset_index_commit_engines_finalize` still finalizes every other
+dataset's engine and returns the first failure.
 
 During the pending-commit window the six serial ops (`insert` /
 `lookup` / `delete` / `scan` / `scan_range` / `stats_get`) wait for it
 to close on the engine's `window_cv`, which `commit_finalize` and
-`commit_abort` broadcast under `serial_mu`, and return `STM_EBUSY` only
-when it is still open after `STM_BTREE_ENGINE_WINDOW_WAIT_MS` (5 s, on
-the monotonic clock). `commit`, `commit_flush`, `get_root`, `verify` and
+`commit_abort` broadcast under `serial_mu`, and return `STM_EBUSY` when
+it is still open after `STM_BTREE_ENGINE_WINDOW_WAIT_MS` (5 s, on the
+monotonic clock). A window whose finalize failed is refused at once,
+since nothing may ever close it: the failed finalize marks it
+(`eng_pending.finalize_failed`, cleared with the window) and still
+broadcasts, so a waiter already parked leaves too. `commit`,
+`commit_flush`, `get_root`, `verify` and
 `walk_paddrs` return `STM_EBUSY` at once; the `_concurrent` ops go on
 through the window. The wait exists because a commit runs under
 `fs->global` SH as well as EX: CF-4 C's reclaim pair commits beside SH
@@ -845,7 +860,13 @@ the caller's obligation. Tests: the four
 arm, finalize and abort; the bound set to 60 s, so a close that wakes
 nobody fails on time),
 `engine_serial_ops_refuse_a_window_that_outlasts_the_wait` (all six,
-each only after the bound) and `fs_rename_waits_out_a_commit_window`
+each only after the bound),
+`engine_serial_ops_refuse_a_failed_finalize_window_at_once` (a parked
+waiter and a fresh op leave at once; a retried finalize closes the
+window and the next window is waited out again),
+`engine_one_shot_commit_aborts_a_failed_finalize`,
+`dataset_finalize_goes_on_past_a_failed_engine` and
+`fs_rename_waits_out_a_commit_window`
 (rename answers `STM_ENOTEMPTY` after the abort lands from another
 thread).
 `destroy` of an engine with an un-finalized flush implicitly aborts —

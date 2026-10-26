@@ -7244,4 +7244,171 @@ STM_TEST(engine_serial_ops_refuse_a_window_that_outlasts_the_wait) {
     memstore_destroy(&ms);
 }
 
+/* Fails each clone finalize of the engine `arg` names. */
+static stm_status finalize_fail_hook(stm_btree_engine *eng, void *arg)
+{
+    return eng == (stm_btree_engine *)arg ? STM_ENOMEM : STM_OK;
+}
+
+/* A latched engine (so commits take the clone arm) holding 64 even keys,
+ * committed at gen 1, plus key 1 written concurrently since. */
+static stm_btree_engine *failed_finalize_engine(memstore *ms,
+                                                stm_btree_crypt_ctx *cx,
+                                                stm_ebr_thread *me,
+                                                uint64_t *out_rp1)
+{
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, ms, cx, 0, &eng));
+    if (!eng) return NULL;
+    for (uint32_t i = 0; i < 64; i++) {
+        uint8_t key[4];
+        be32_key(2u * i, key);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, "a", 1));
+    }
+    uint8_t rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, out_rp1, rc));
+    uint8_t ck[4];
+    be32_key(1u, ck);
+    stm_ebr_enter(me);
+    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, ck, 4, "b", 1));
+    stm_ebr_exit(me);
+    return eng;
+}
+
+/* A window whose finalize failed has nothing to close it: a serial op
+ * already waiting leaves when the failure broadcasts, and a new one
+ * refuses without waiting at all. The failure lost nothing, a retried
+ * finalize closes the window, and the next window is waited out again. */
+STM_TEST(engine_serial_ops_refuse_a_failed_finalize_window_at_once) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    uint64_t rp1 = 0;
+    stm_btree_engine *eng = failed_finalize_engine(&ms, &cx, me, &rp1);
+    if (!eng) { memstore_destroy(&ms); stm_ebr_thread_free(me); return; }
+    /* A finalize with no window open fails without marking the next one. */
+    STM_ASSERT_ERR(stm_btree_engine_commit_finalize(eng), STM_EINVAL);
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 2, &rp, &rg, rc));
+
+    atomic_int waits;
+    atomic_init(&waits, 0);
+    stm_btree_engine_set_window_wait_hook_for_test(window_wait_count_hook,
+                                                   &waits);
+    stm_btree_engine_set_window_wait_for_test(20ull * 1000000000ull);
+
+    window_op w = { .eng = eng, .scan = false };
+    pthread_t t;
+    STM_ASSERT_EQ(pthread_create(&t, NULL, window_op_thread, &w), 0);
+    for (int i = 0; i < 5000 && atomic_load(&waits) == 0; i++) usleep(1000);
+    bool parked = atomic_load(&waits) != 0;
+    stm_btree_engine_set_finalize_hook_for_test(finalize_fail_hook, eng);
+    uint64_t failed_ns = window_mono_ns();
+    STM_ASSERT_ERR(stm_btree_engine_commit_finalize(eng), STM_ENOMEM);
+    pthread_join(t, NULL);
+    STM_ASSERT_TRUE(parked);
+    STM_ASSERT_ERR(w.rc, STM_EBUSY);
+    STM_ASSERT_TRUE(w.done_ns >= failed_ns);
+    STM_ASSERT_TRUE(w.done_ns - failed_ns < 10ull * 1000000000ull);
+
+    uint8_t ck[4];
+    be32_key(1u, ck);
+    bool found = false;
+    void *v = NULL;
+    size_t vl = 0;
+    int before = atomic_load(&waits);
+    STM_ASSERT_ERR(stm_btree_engine_lookup(eng, ck, 4, &found, &v, &vl),
+                   STM_EBUSY);
+    STM_ASSERT_ERR(stm_btree_engine_insert(eng, ck, 4, "c", 1), STM_EBUSY);
+    STM_ASSERT_EQ(atomic_load(&waits), before);
+    uint64_t gp = 0, gg = 0;
+    uint8_t  gc[32];
+    STM_ASSERT_ERR(stm_btree_engine_get_root(eng, &gp, &gg, gc), STM_EBUSY);
+    stm_ebr_enter(me);
+    STM_ASSERT_OK(stm_btree_engine_lookup_concurrent(eng, me, ck, 4, &found,
+                                                     &v, &vl));
+    stm_ebr_exit(me);
+    STM_ASSERT_TRUE(found);
+    free(v);
+    v = NULL;
+
+    stm_btree_engine_set_finalize_hook_for_test(NULL, NULL);
+    STM_ASSERT_OK(stm_btree_engine_commit_finalize(eng));
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+    STM_ASSERT_EQ(gp, rp);
+    found = false;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, ck, 4, &found, &v, &vl));
+    free(v);
+    v = NULL;
+    STM_ASSERT_TRUE(found);
+
+    be32_key(3u, ck);
+    stm_ebr_enter(me);
+    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, ck, 4, "c", 1));
+    stm_ebr_exit(me);
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 3, &rp, &rg, rc));
+    atomic_store(&waits, 0);
+    window_op w2 = { .eng = eng, .scan = true };
+    STM_ASSERT_EQ(pthread_create(&t, NULL, window_op_thread, &w2), 0);
+    for (int i = 0; i < 5000 && atomic_load(&waits) == 0; i++) usleep(1000);
+    bool parked2 = atomic_load(&waits) != 0;
+    STM_ASSERT_OK(stm_btree_engine_commit_finalize(eng));
+    pthread_join(t, NULL);
+    stm_btree_engine_set_window_wait_hook_for_test(NULL, NULL);
+    stm_btree_engine_set_window_wait_for_test(0);
+    STM_ASSERT_TRUE(parked2);
+    STM_ASSERT_OK(w2.rc);
+    STM_ASSERT_EQ(w2.seen, (uint64_t)66);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
+/* A one-shot commit whose finalize fails aborts its flush: no window is
+ * left, the durable root is still the previous commit's, the concurrent
+ * write survives, and the same gen commits on the next try. */
+STM_TEST(engine_one_shot_commit_aborts_a_failed_finalize) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    uint64_t rp1 = 0;
+    stm_btree_engine *eng = failed_finalize_engine(&ms, &cx, me, &rp1);
+    if (!eng) { memstore_destroy(&ms); stm_ebr_thread_free(me); return; }
+
+    stm_btree_engine_set_finalize_hook_for_test(finalize_fail_hook, eng);
+    uint64_t rp = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_ERR(stm_btree_engine_commit(eng, 2, &rp, rc), STM_ENOMEM);
+    stm_btree_engine_set_finalize_hook_for_test(NULL, NULL);
+
+    uint64_t gp = 0, gg = 0;
+    uint8_t  gc[32];
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+    STM_ASSERT_EQ(gp, rp1);
+    uint8_t ck[4];
+    be32_key(1u, ck);
+    bool found = false;
+    void *v = NULL;
+    size_t vl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, ck, 4, &found, &v, &vl));
+    free(v);
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 2, &rp, rc));
+    STM_ASSERT_OK(stm_btree_engine_get_root(eng, &gp, &gg, gc));
+    STM_ASSERT_EQ(gp, rp);
+    STM_ASSERT_TRUE(rp != rp1);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
 STM_TEST_MAIN("btree_engine")

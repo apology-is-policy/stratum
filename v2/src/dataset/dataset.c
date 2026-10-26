@@ -2080,24 +2080,27 @@ stm_status stm_dataset_index_commit_engines_finalize(stm_dataset_index *idx) {
     if (!idx) return STM_EINVAL;
 
     must_lock(&idx->lock);
-    /* Walk pending engines + finalize each. Per the btree_engine
-     * contract a finalize after a successful flush is INFALLIBLE — the
-     * lone failure exit is STM_EINVAL (no pending flush). We surface
-     * any such failure but it's unreachable by construction. The
-     * triples currently in slot->e.* are now durable; saved_* is
-     * cleared as bookkeeping. No-pending is the NORMAL case when no
-     * dataset had an open engine at the paired flush — return STM_OK. */
+    /* Walk pending engines + finalize each. The triples currently in
+     * slot->e.* are now durable; saved_* is cleared as bookkeeping.
+     * No-pending is the NORMAL case when no dataset had an open engine
+     * at the paired flush — return STM_OK.
+     *
+     * A clone-arm finalize can fail (out of memory, nothing published;
+     * btree_engine.h). The caller wedges (R154 Q2 doctrine) and never
+     * aborts, so the failed slot keeps pending_flush, advertising the
+     * inconsistency for the remount, and its engine refuses serial ops
+     * at once. Every other slot is still finalized: each adopts the root
+     * the same commit names, and a slot left pending would hold its
+     * engine's window open for good, every serial op on it waiting out
+     * the full bound. The first failure is the one returned. */
+    stm_status first = STM_OK;
     for (size_t i = 0; i < idx->slots_len; i++) {
         dataset_slot *slot = idx->slots[i];
         if (!slot->pending_flush) continue;
         stm_status fs = stm_btree_engine_commit_finalize(slot->engine);
         if (fs != STM_OK) {
-            /* Unreachable per contract — defense-in-depth surface. The
-             * caller wedges (R154 Q2 doctrine); the slot's pending_flush
-             * stays set so the in-memory state advertises the
-             * inconsistency for the wedge'd remount. */
-            must_unlock(&idx->lock);
-            return fs;
+            if (first == STM_OK) first = fs;
+            continue;
         }
         slot->saved_tree_root = 0;
         slot->saved_root_gen  = 0;
@@ -2106,7 +2109,7 @@ stm_status stm_dataset_index_commit_engines_finalize(stm_dataset_index *idx) {
     }
 
     must_unlock(&idx->lock);
-    return STM_OK;
+    return first;
 }
 
 stm_status stm_dataset_index_commit_engines_abort(stm_dataset_index *idx) {

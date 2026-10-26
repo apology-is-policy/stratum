@@ -23,6 +23,7 @@
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
 #include <stratum/btree_engine.h>     /* 9.7-impl-1c engine substrate tests */
+#include <stratum/btree_engine_testing.h>
 #include <stratum/crypto.h>
 #include <stratum/dataset.h>
 #include <stratum/dataset_testing.h>
@@ -2872,6 +2873,74 @@ STM_TEST(dataset_engine_get_pinned_unpins_while_waiting) {
     stm_bootstrap_close(b);
     stm_bdev_close(d);
     unlink(dsp_tmp_path);
+}
+
+/* Fails each clone finalize of the engine `arg` names. */
+static stm_status ds_finalize_fail_hook(stm_btree_engine *eng, void *arg)
+{
+    return eng == (stm_btree_engine *)arg ? STM_ENOMEM : STM_OK;
+}
+
+/* A failed engine finalize does not stop the others: the root's engine
+ * (slot 0) fails, the child's (slot 1) is still finalized and its window
+ * closed, the root's stays open, and a second pass finalizes it. */
+STM_TEST(dataset_finalize_goes_on_past_a_failed_engine) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+
+    dsp_make_tmp("eng_finfail");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+    uint64_t cid = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "child", &cid));
+    stm_btree_engine *re = NULL, *ce = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, STM_DATASET_ROOT_ID,
+                                                 &re));
+    STM_ASSERT_OK(stm_dataset_index_get_engine(idx, cid, &ce));
+    uint8_t key[16] = { 0x01, 0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0x77 };
+    uint8_t val[8]  = { 9,9,9,9, 1,2,3,4 };
+    stm_ebr_enter(me);
+    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(re, me, key, sizeof key,
+                                                     val, sizeof val));
+    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(ce, me, key, sizeof key,
+                                                     val, sizeof val));
+    stm_ebr_exit(me);
+    STM_ASSERT_OK(stm_dataset_index_commit_engines_flush(idx, 1u));
+
+    stm_btree_engine_set_finalize_hook_for_test(ds_finalize_fail_hook, re);
+    STM_ASSERT_ERR(stm_dataset_index_commit_engines_finalize(idx),
+                   STM_ENOMEM);
+    stm_btree_engine_set_finalize_hook_for_test(NULL, NULL);
+    uint64_t gp = 0, gg = 0;
+    uint8_t  gc[32];
+    STM_ASSERT_OK(stm_btree_engine_get_root(ce, &gp, &gg, gc));
+    STM_ASSERT_ERR(stm_btree_engine_get_root(re, &gp, &gg, gc), STM_EBUSY);
+
+    STM_ASSERT_OK(stm_dataset_index_commit_engines_finalize(idx));
+    STM_ASSERT_OK(stm_btree_engine_get_root(re, &gp, &gg, gc));
+    bool found = false; void *vbuf = NULL; size_t vlen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(re, key, sizeof key,
+                                            &found, &vbuf, &vlen));
+    free(vbuf);
+    STM_ASSERT_TRUE(found);
+
+    stm_dataset_index_close(idx);
+    for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
+        (void)stm_ebr_try_advance();
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+    stm_ebr_thread_free(me);
 }
 
 STM_TEST_MAIN("dataset")

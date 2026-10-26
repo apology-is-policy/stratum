@@ -220,8 +220,8 @@ void stm_btree_engine_retire(stm_btree_engine *eng);
  * only when `value_len` exceeds STM_BTREE_ENGINE_MAX_VALUE_BYTES, or
  * when `key_len` is so large the entry could not fit even as a spilled
  * indirection. STM_EINVAL on NULL key/value with nonzero length,
- * STM_EBUSY if a commit window outlasts STM_BTREE_ENGINE_WINDOW_WAIT_MS,
- * STM_ENOMEM / STM_ECORRUPT / device errors otherwise. An insert that
+ * STM_EBUSY if a commit window outlasts STM_BTREE_ENGINE_WINDOW_WAIT_MS or
+ * its finalize failed, STM_ENOMEM / STM_ECORRUPT / device errors otherwise. An insert that
  * fails never loses an already-present key (see the reference doc
  * §"Failure atomicity").
  */
@@ -238,8 +238,8 @@ stm_status stm_btree_engine_insert(stm_btree_engine *eng,
  * *out_found is FALSE, *out_value == NULL, *out_value_len == 0.
  *
  * Returns STM_EINVAL on NULL arguments, STM_EBUSY if a commit window
- * outlasts STM_BTREE_ENGINE_WINDOW_WAIT_MS, STM_ENOMEM / STM_ECORRUPT / device
- * errors otherwise.
+ * outlasts STM_BTREE_ENGINE_WINDOW_WAIT_MS or its finalize failed,
+ * STM_ENOMEM / STM_ECORRUPT / device errors otherwise.
  */
 STM_MUST_USE
 stm_status stm_btree_engine_lookup(stm_btree_engine *eng,
@@ -408,8 +408,8 @@ stm_status stm_btree_engine_delete_concurrent(stm_btree_engine *eng,
  *
  * `key_len` may be 0. Returns STM_EINVAL on a NULL `eng` or a NULL
  * `key` with nonzero `key_len`, STM_EBUSY if a commit window outlasts
- * STM_BTREE_ENGINE_WINDOW_WAIT_MS, STM_ENOMEM / STM_ECORRUPT / device errors
- * otherwise.
+ * STM_BTREE_ENGINE_WINDOW_WAIT_MS or its finalize failed, STM_ENOMEM /
+ * STM_ECORRUPT / device errors otherwise.
  * A delete that fails never loses or corrupts an already-present key.
  */
 STM_MUST_USE
@@ -425,7 +425,8 @@ typedef int (*stm_btree_engine_iter_cb)(const void *key, size_t key_len,
                                          void *ctx);
 
 /* Enumerate every (key, value) pair in ascending key order. STM_EBUSY
- * if a commit window outlasts STM_BTREE_ENGINE_WINDOW_WAIT_MS. */
+ * if a commit window outlasts STM_BTREE_ENGINE_WINDOW_WAIT_MS or its
+ * finalize failed. */
 STM_MUST_USE
 stm_status stm_btree_engine_scan(stm_btree_engine *eng,
                                   stm_btree_engine_iter_cb cb, void *ctx);
@@ -447,8 +448,8 @@ stm_status stm_btree_engine_scan(stm_btree_engine *eng,
  *
  * Returns STM_EINVAL on NULL `eng` / `cb` or a NULL key with nonzero
  * length, STM_EBUSY if a commit window outlasts
- * STM_BTREE_ENGINE_WINDOW_WAIT_MS, STM_ENOMEM / STM_ECORRUPT / device errors
- * otherwise.
+ * STM_BTREE_ENGINE_WINDOW_WAIT_MS or its finalize failed, STM_ENOMEM /
+ * STM_ECORRUPT / device errors otherwise.
  */
 STM_MUST_USE
 stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
@@ -560,6 +561,9 @@ stm_status stm_btree_engine_scan_range_concurrent(stm_btree_engine *eng,
  * (the next access reloads the previous durable root). No torn tree is
  * ever published.
  *
+ * A commit whose finalize fails (see stm_btree_engine_commit_finalize)
+ * aborts its flush before it returns, so it too leaves no window open.
+ *
  * Committing an all-clean tree is a no-op. Returns STM_EINVAL on NULL
  * arguments or a non-monotonic `gen`, STM_EBUSY if a previous flush is
  * still un-finalized, STM_ENOMEM / STM_ERANGE / device errors otherwise.
@@ -591,7 +595,8 @@ stm_status stm_btree_engine_commit(stm_btree_engine *eng, uint64_t gen,
  * Between a successful flush and its finalize/abort the engine is in a
  * pending-commit window. The serial operations (insert, lookup, delete,
  * scan, scan_range, stats_get) wait for it to close, and return STM_EBUSY
- * only if it is still open after STM_BTREE_ENGINE_WINDOW_WAIT_MS; commit,
+ * if it is still open after STM_BTREE_ENGINE_WINDOW_WAIT_MS, or at once if
+ * a finalize of it has failed; commit,
  * commit_flush, get_root, verify and walk_paddrs return STM_EBUSY at once;
  * the _concurrent operations go on through it. A caller of a serial
  * operation must not hold a lock that the thread closing the window takes
@@ -622,11 +627,13 @@ stm_status stm_btree_engine_commit_flush(stm_btree_engine *eng, uint64_t gen,
  * pending-commit window is closed and stm_btree_engine_get_root returns
  * the new triple.
  *
- * Returns STM_EINVAL if no flush is pending. After a successful
- * commit_flush this is INFALLIBLE — it returns STM_OK; the no-pending
- * STM_EINVAL is the only failure exit. stm_btree_engine_commit relies
- * on that (it calls flush then finalize); a future change that gives
- * finalize a real failure path MUST revisit that caller.
+ * Returns STM_EINVAL if no flush is pending. A legacy commit cannot
+ * otherwise fail here. A clone commit (an engine that has taken a
+ * concurrent write) returns STM_ENOMEM if it cannot copy the deltas
+ * prepended since the flush onto the new root: nothing is published and
+ * the window stays open until a retried finalize or
+ * stm_btree_engine_commit_abort closes it. The serial operations refuse
+ * such a window at once with STM_EBUSY instead of waiting for it.
  */
 STM_MUST_USE
 stm_status stm_btree_engine_commit_finalize(stm_btree_engine *eng);
@@ -703,7 +710,8 @@ stm_status stm_btree_engine_walk_paddrs(stm_btree_engine *eng,
                                          void *ctx);
 
 /* Compute tree stats (key count + height) by an in-order walk.
- * STM_EBUSY if a commit window outlasts STM_BTREE_ENGINE_WINDOW_WAIT_MS. */
+ * STM_EBUSY if a commit window outlasts STM_BTREE_ENGINE_WINDOW_WAIT_MS or
+ * its finalize failed. */
 STM_MUST_USE
 stm_status stm_btree_engine_stats_get(stm_btree_engine *eng,
                                        stm_btree_engine_stats *out);

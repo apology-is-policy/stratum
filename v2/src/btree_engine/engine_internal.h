@@ -586,6 +586,13 @@ typedef struct {
     eng_node  *shadow_root;
     eng_delta *consumed_head;
     uint32_t   orphan_base;
+
+    /* A finalize of this window failed (the clone arm's out-of-memory
+     * exit; nothing published). Only a retried finalize or an abort
+     * closes it, and stm_sync_commit sends neither (the fs wedges), so
+     * the serial ops refuse it at once instead of waiting out the
+     * bound. */
+    bool       finalize_failed;
 } eng_pending;
 
 /* ========================================================================= */

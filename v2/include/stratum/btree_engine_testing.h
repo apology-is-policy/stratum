@@ -61,6 +61,14 @@ typedef void (*stm_btree_engine_window_wait_hook)(stm_btree_engine *eng,
                                                   void *arg);
 void stm_btree_engine_set_window_wait_hook_for_test(
     stm_btree_engine_window_wait_hook fn, void *arg);
+
+/* Called by a clone-arm finalize after it seals the old root and before it
+ * copies the residue; a status other than STM_OK fails the finalize there,
+ * as the copy running out of memory does. NULL clears it. */
+typedef stm_status (*stm_btree_engine_finalize_hook)(stm_btree_engine *eng,
+                                                     void *arg);
+void stm_btree_engine_set_finalize_hook_for_test(
+    stm_btree_engine_finalize_hook fn, void *arg);
 #endif
 
 #ifdef __cplusplus

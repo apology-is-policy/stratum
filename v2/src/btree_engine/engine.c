@@ -543,6 +543,16 @@ void stm_btree_engine_set_window_wait_hook_for_test(
     window_wait_hook = fn;
     window_wait_hook_arg = arg;
 }
+
+static stm_btree_engine_finalize_hook finalize_hook;
+static void *finalize_hook_arg;
+
+void stm_btree_engine_set_finalize_hook_for_test(
+    stm_btree_engine_finalize_hook fn, void *arg)
+{
+    finalize_hook = fn;
+    finalize_hook_arg = arg;
+}
 #endif
 
 static bool window_now_ns(uint64_t *out)
@@ -557,9 +567,11 @@ static bool window_now_ns(uint64_t *out)
  * A serial op that meets an open commit window (flushed, not yet finalized
  * or aborted) waits for it to close rather than refuse: under fs->global SH
  * the window is a CF-4 C reclaim commit beside the caller, and a refusal
- * would reach the 9P client. STM_EBUSY only past the bound, or when the
- * clock or the wait itself fails. The caller holds serial_mu and nothing
- * the thread closing the window takes first (btree_engine.h, commit_flush).
+ * would reach the 9P client. STM_EBUSY past the bound, when the clock or
+ * the wait itself fails, and at once for a window whose finalize failed,
+ * which nothing may ever close (eng_pending). The caller holds serial_mu
+ * and nothing the thread closing the window takes first (btree_engine.h,
+ * commit_flush).
  */
 static stm_status serial_wait_window(stm_btree_engine *eng)
 {
@@ -571,7 +583,8 @@ static stm_status serial_wait_window(stm_btree_engine *eng)
     uint64_t now = 0;
     if (!window_now_ns(&now)) return STM_EBUSY;
     uint64_t deadline = now + bound;
-    while (eng->pending.active && now < deadline) {
+    while (eng->pending.active && !eng->pending.finalize_failed &&
+           now < deadline) {
 #ifdef STRATUM_BUILD_TESTING_HOOKS
         if (window_wait_hook) window_wait_hook(eng, window_wait_hook_arg);
 #endif
@@ -3086,7 +3099,11 @@ static stm_status commit_finalize_clone(stm_btree_engine *eng)
     eng_delta *residue = atomic_exchange_explicit(&old->chain_head,
                                                   ENG_CHAIN_SEALED,
                                                   memory_order_acq_rel);
-    stm_status s = migrate_residue(shadow, residue, p->consumed_head);
+    stm_status s = STM_OK;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (finalize_hook) s = finalize_hook(eng, finalize_hook_arg);
+#endif
+    if (s == STM_OK) s = migrate_residue(shadow, residue, p->consumed_head);
     if (s != STM_OK) {
         atomic_store_explicit(&old->chain_head, residue,
                               memory_order_release);
@@ -3198,6 +3215,7 @@ stm_status stm_btree_engine_commit_finalize(stm_btree_engine *eng)
     pthread_mutex_lock(&eng->serial_mu);
     pthread_mutex_lock(&eng->commit_mu);
     stm_status s = commit_finalize_locked(eng);
+    if (s != STM_OK && eng->pending.active) eng->pending.finalize_failed = true;
     pthread_mutex_unlock(&eng->commit_mu);
     pthread_cond_broadcast(&eng->window_cv);    /* serial ops waiting it out */
     pthread_mutex_unlock(&eng->serial_mu);
@@ -3263,14 +3281,16 @@ stm_status stm_btree_engine_commit(stm_btree_engine *eng, uint64_t gen,
     stm_status s = stm_btree_engine_commit_flush(eng, gen, &rp, &rg, rc);
     if (s != STM_OK) return s;             /* a failed flush reverts itself */
 
-    /* The flush produced the new root triple — return it now, before
-     * the finalize, so the caller has a usable triple regardless of
-     * finalize's outcome. commit_finalize is infallible after a
-     * successful flush (its only failure exit is the no-pending guard,
-     * which cannot fire here), so its return value is the commit's. */
+    /* A clone finalize can fail with nothing published; a one-shot commit
+     * then leaves no window behind, as a failed flush does. */
+    s = stm_btree_engine_commit_finalize(eng);
+    if (s != STM_OK) {
+        (void)stm_btree_engine_commit_abort(eng);
+        return s;
+    }
     *out_root_paddr = rp;
     memcpy(out_root_csum, rc, STM_BTNODE_CSUM_SIZE);
-    return stm_btree_engine_commit_finalize(eng);
+    return STM_OK;
 }
 
 stm_status stm_btree_engine_get_root(const stm_btree_engine *eng,
