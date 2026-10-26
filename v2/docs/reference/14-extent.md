@@ -375,6 +375,15 @@ so the lookup walks each dataset's engine under an EBR pin and resolves
 the engine inside it: a rollback that retires the engine mid-walk
 cannot free it until the walk leaves.
 
+Extent records are keyed by `(ds, ino, off)` and their AD binds
+`(pool, ds, ino, offset, kind)`, with no inode generation. fs.c truncates
+an inode's extents before it frees the inode, best-effort; a create that
+is handed a reused ino (`si_gen != 0`) counts what is left under it and
+truncates that too, refusing if any survives
+(`fs_clean_reused_ino_locked`), so a free whose truncate failed never
+hands the old file's bytes to the new one (test
+`fs_create_clears_extents_a_reused_ino_still_holds`).
+
 ## On-disk encoding (v12+)
 
 ### Key (24 bytes, lexicographically sorted)

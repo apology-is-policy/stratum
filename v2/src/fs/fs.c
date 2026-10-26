@@ -2932,18 +2932,32 @@ lookup_fallback:
     }
 }
 
-/* A reused ino (gen != 0; AllocFresh stamps 0) can still hold a previous
- * tenant's xattrs: a volume written before the free path dropped them, a
- * rollback to such a tree, or a free whose drop failed. They go before the
- * new inode is linked; a create that cannot drop them refuses rather than
- * hand them on. */
-static stm_status fs_drop_reused_xattrs_locked(stm_fs *fs, uint64_t dataset_id,
-                                               uint64_t ino, uint64_t gen)
+/* A reused ino (gen != 0; AllocFresh stamps 0) can still hold records of
+ * a previous tenant, keyed by (ds, ino) with no gen: xattrs (a volume
+ * written before the free path dropped them, a rollback to such a tree, a
+ * free whose drop failed) and extents (a free whose truncate failed; the
+ * extent AD binds no gen either, so they would read back as the new
+ * file's data). They go before the new inode is linked; a create that
+ * cannot clear them refuses rather than hand them on. */
+static stm_status fs_clean_reused_ino_locked(stm_fs *fs, uint64_t dataset_id,
+                                             uint64_t ino, uint64_t gen)
 {
     if (gen == 0u) return STM_OK;
     stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
-    if (!xidx) return STM_EINVAL;
-    return stm_xattr_drop_for_ino(xidx, dataset_id, ino, NULL);
+    stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
+    if (!xidx || !eidx) return STM_EINVAL;
+    stm_status s = stm_xattr_drop_for_ino(xidx, dataset_id, ino, NULL);
+    if (s != STM_OK) return s;
+    size_t left = 0;
+    s = stm_extent_count_for_ino(eidx, dataset_id, ino, &left);
+    if (s != STM_OK || left == 0u) return s;
+    /* A truncate can report a failed per-paddr drop after removing every
+     * record (a leak, not a leftover), so the recount decides. */
+    stm_status ts = stm_sync_truncate(fs->sync, dataset_id, ino, 0u);
+    s = stm_extent_count_for_ino(eidx, dataset_id, ino, &left);
+    if (s != STM_OK) return s;
+    if (left == 0u) return STM_OK;
+    return ts != STM_OK ? ts : STM_EIO;
 }
 
 /* #369 (R176 F1, CF-4 B rider): the create/link rollback's inode free.
@@ -3061,7 +3075,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
         return cs;
     }
     uint64_t child_gen = stm_load_le64(cv.si_gen);
-    stm_status xd = fs_drop_reused_xattrs_locked(fs, dataset_id, child_ino,
+    stm_status xd = fs_clean_reused_ino_locked(fs, dataset_id, child_ino,
                                                  child_gen);
     if (xd != STM_OK) {
         stm_inode_unpin(iidx, h_child);
@@ -3279,7 +3293,7 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
         (void)stm_inode_set(iidx, dataset_id, new_ino, &iv);
     }
     /* An unreadable record gives no gen: drop as for a reuse. */
-    stm_status xd = fs_drop_reused_xattrs_locked(
+    stm_status xd = fs_clean_reused_ino_locked(
         fs, dataset_id, new_ino,
         ls == STM_OK ? stm_load_le64(iv.si_gen) : UINT64_MAX);
     if (xd != STM_OK) {
@@ -3539,7 +3553,7 @@ static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs,
     /* xattr records are keyed by (ds, ino) alone, so any left here would
      * surface on whichever inode reuses the slot. A failure is reported
      * and left to the create that reuses the ino, which drops them again
-     * and refuses if it cannot (fs_drop_reused_xattrs_locked). */
+     * and refuses if it cannot (fs_clean_reused_ino_locked). */
     stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
     stm_status xs = xidx ? stm_xattr_drop_for_ino(xidx, dataset_id, ino, NULL)
                          : STM_EINVAL;
@@ -3551,6 +3565,10 @@ static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs,
                 (unsigned long long)dataset_id, (unsigned long long)ino,
                 (int)xs);
     }
+    /* Advisory lock records are keyed by (ds, ino) alone as well. Every
+     * fid that took one answers ESTALE once the inode is freed, so none
+     * could release it, and it would refuse locks on the next tenant. */
+    (void)stm_lock_release_ino(fs->locks, dataset_id, ino);
     uint32_t cmode = stm_load_le32(cv->si_mode);
     if ((cmode & (uint32_t)S_IFMT) == (uint32_t)S_IFDIR) {
         /* An empty directory still holds the tombstones of its former
@@ -4702,7 +4720,7 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
         pthread_rwlock_unlock(&fs->global);
         return cs;
     }
-    stm_status xd = fs_drop_reused_xattrs_locked(fs, dataset_id, child_ino,
+    stm_status xd = fs_clean_reused_ino_locked(fs, dataset_id, child_ino,
                                                  stm_load_le64(cv.si_gen));
     if (xd != STM_OK) {
         stm_inode_unpin(iidx, h_child);

@@ -104,7 +104,7 @@ fs.c calls it from the pre-free cleanup (`fs_pre_inode_free_cleanup_locked`:
 the last unlink, rmdir, rename over an existing name, `unlink_anon`)
 before the inode is freed, reporting a failure on stderr; and every
 create that is handed a reused ino (`si_gen != 0`) calls it again before
-linking the inode (`fs_drop_reused_xattrs_locked`) and refuses if it
+linking the inode (`fs_clean_reused_ino_locked`) and refuses if it
 fails, so a create never inherits. The second call is also what clears
 volumes written before the first existed: until then nothing called
 the hook, and a reused ino carried its previous tenant's xattrs (tests

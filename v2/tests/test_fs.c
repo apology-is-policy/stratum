@@ -12052,4 +12052,116 @@ STM_TEST(fs_listxattr_fallback_stays_whole_beside_an_unlink) {
     reuse_fs_done(fs);
 }
 
+/* Extents left on a freed ino (here: an inode freed below the fs layer,
+ * as when the free-time truncate fails) are keyed by (ds, ino) alone, and
+ * their AD binds no gen: the create that reuses the ino clears them, so
+ * the new file never reads the old one's bytes. */
+static size_t extent_records(stm_fs *fs, uint64_t ino)
+{
+    size_t n = 0;
+    stm_status s = stm_extent_count_for_ino(
+        stm_sync_extent_index(stm_fs_sync(fs)), 1, ino, &n);
+    return s == STM_OK ? n : SIZE_MAX;
+}
+
+STM_TEST(fs_create_clears_extents_a_reused_ino_still_holds) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("reuse_stale_extents", &dir);
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    static uint8_t old_bytes[4096], got_bytes[4096];
+    memset(old_bytes, 0x5A, sizeof old_bytes);
+
+    for (int kind = 0; kind < 3; kind++) {
+        char nm[4] = { 'o', (char)('0' + kind), 0, 0 };
+        uint64_t old = 0, got = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm, 2,
+                                            0644u, 0, 0, &old));
+        STM_ASSERT_OK(stm_fs_write(fs, 1, old, 0, old_bytes,
+                                      sizeof old_bytes));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)nm, 2));
+        /* The fs free cleared them; put the case back: a second tenant
+         * whose records survive a free below the fs layer. */
+        uint64_t again = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm, 2,
+                                            0644u, 0, 0, &again));
+        STM_ASSERT_EQ(again, old);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, again, 0, old_bytes,
+                                      sizeof old_bytes));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_dirent_unlink(
+            stm_sync_dirent_index(stm_fs_sync(fs)), 1, dir,
+            (const uint8_t *)nm, 2));
+        STM_ASSERT_OK(stm_inode_free(iidx, 1, again));
+        STM_ASSERT(extent_records(fs, again) > 0u);      /* the control */
+        switch (kind) {
+        case 0:
+            STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir,
+                                                (const uint8_t *)"nf", 2,
+                                                0644u, 0, 0, &got));
+            break;
+        case 1:
+            STM_ASSERT_OK(stm_fs_symlink(fs, 1, dir,
+                                            (const uint8_t *)"ns", 2,
+                                            (const uint8_t *)"tgt", 3,
+                                            0, 0, &got));
+            break;
+        default:
+            STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &got));
+            break;
+        }
+        STM_ASSERT_EQ(got, again);
+        STM_ASSERT_EQ(extent_records(fs, got), (size_t)0);
+        if (kind == 0) {
+            /* Grown back over the old range, the new file reads zeros. */
+            STM_ASSERT_OK(stm_fs_truncate(fs, 1, got, sizeof got_bytes));
+            size_t n = 0;
+            memset(got_bytes, 0xFF, sizeof got_bytes);
+            STM_ASSERT_OK(stm_fs_read(fs, 1, got, 0, got_bytes,
+                                         sizeof got_bytes, &n));
+            STM_ASSERT_EQ(n, sizeof got_bytes);
+            size_t old_seen = 0;
+            for (size_t i = 0; i < n; i++)
+                if (got_bytes[i] == 0x5A) old_seen++;
+            STM_ASSERT_EQ(old_seen, (size_t)0);
+            STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"nf", 2));
+        } else if (kind == 1) {
+            STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"ns", 2));
+        } else {
+            STM_ASSERT_OK(stm_fs_unlink_anon(fs, 1, got));
+        }
+    }
+    reuse_fs_done(fs);
+}
+
+/* Advisory lock records are keyed by (ds, ino) alone: the free takes an
+ * inode's locks with it, so a lock held through a fid on a file that is
+ * then unlinked never refuses a lock on the file that reuses the ino. */
+STM_TEST(fs_freed_inode_takes_its_locks_with_it) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("reuse_locks", &dir);
+    if (!fs) return;
+    uint64_t x = 0, y = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                        0644u, 0, 0, &x));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, x, 101u, STM_FS_LOCK_EXCLUSIVE, 0, 0));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"x", 1));
+    size_t held = 99;
+    STM_ASSERT_OK(stm_fs_lock_count(fs, &held));
+    STM_ASSERT_EQ(held, (size_t)0);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"y", 1,
+                                        0644u, 0, 0, &y));
+    STM_ASSERT_EQ(y, x);
+    bool grant = false;
+    uint64_t who = 99;
+    STM_ASSERT_OK(stm_fs_lock_test(fs, 1, y, 202u, STM_FS_LOCK_EXCLUSIVE,
+                                      0, 0, &grant, &who));
+    STM_ASSERT_TRUE(grant);
+    STM_ASSERT_EQ(who, (uint64_t)0);
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, y, 202u, STM_FS_LOCK_EXCLUSIVE, 0, 0));
+    STM_ASSERT_OK(stm_fs_release_lock_owner(fs, 202u));
+    reuse_fs_done(fs);
+}
+
 STM_TEST_MAIN("fs")

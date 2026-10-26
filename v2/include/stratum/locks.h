@@ -113,6 +113,18 @@ STM_MUST_USE
 stm_status stm_lock_release_owner(stm_lock_table *t, uint64_t owner_id);
 
 /*
+ * Release every lock on (dataset_id, ino), whoever holds it. The fs
+ * calls it as it frees the inode: records carry no inode generation, so
+ * any left would apply to the inode that reuses the number.
+ *
+ * Refusals:
+ *   - NULL t (STM_EINVAL).
+ */
+STM_MUST_USE
+stm_status stm_lock_release_ino(stm_lock_table *t, uint64_t dataset_id,
+                                uint64_t ino);
+
+/*
  * Diagnostic: count the number of currently-held locks. Pure
  * read; safe under concurrent writers (locks the table for the
  * duration). Used by tests + admin tools.

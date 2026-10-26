@@ -265,6 +265,25 @@ stm_status stm_lock_release_owner(stm_lock_table *t, uint64_t owner_id) {
     return STM_OK;
 }
 
+stm_status stm_lock_release_ino(stm_lock_table *t, uint64_t dataset_id,
+                                uint64_t ino) {
+    if (!t) return STM_EINVAL;
+
+    must_lock(tbl_lock(t));
+
+    size_t kept = 0;
+    for (size_t i = 0; i < t->n_records; i++) {
+        if (t->records[i].dataset_id == dataset_id &&
+            t->records[i].ino == ino) continue;
+        if (kept != i) t->records[kept] = t->records[i];
+        kept++;
+    }
+    t->n_records = kept;
+
+    must_unlock(tbl_lock(t));
+    return STM_OK;
+}
+
 stm_status stm_lock_count(const stm_lock_table *t, size_t *out_count) {
     /* R90 P3-1: uniform out-param zero-init contract — set
      * `*out_count = 0` BEFORE arg validation so callers observing

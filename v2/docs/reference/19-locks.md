@@ -42,6 +42,7 @@ stm_status stm_lock_acquire        (t, dataset_id, ino, owner_id,
 stm_status stm_lock_release        (t, dataset_id, ino, owner_id,
                                        off, len);
 stm_status stm_lock_release_owner  (t, owner_id);
+stm_status stm_lock_release_ino    (t, dataset_id, ino);
 ```
 
 `stm_lock_acquire` is **non-blocking** (Linux `F_SETLK` shape) — returns
@@ -58,6 +59,14 @@ partial release is deferred.
 `stm_lock_release_owner` is the **post-close cleanup** path — releases
 EVERY lock held by `owner_id` across all inodes. Linux releases all OFD
 locks tied to a closing fd; bindings call this on fd-close.
+
+`stm_lock_release_ino` is the **inode-free** path — releases every lock on
+`(dataset_id, ino)`, whoever holds it. Records carry no inode generation,
+so fs.c's pre-free cleanup calls it as it frees the inode: a lock taken
+through a fid on a file that is then unlinked would otherwise refuse locks
+(and show in Tgetlock) on the next file to reuse the ino, until that fid
+clunked -- and the fid itself answers ESTALE once the inode is freed, so it
+could not release it (test `fs_freed_inode_takes_its_locks_with_it`).
 
 ### Inspection
 
