@@ -31,6 +31,12 @@ void stm_9p_server_set_test_hooks(
 void stm_9p_server_set_fresh_hook(
     void (*fresh)(uint64_t ds, uint64_t ino, void *arg), void *arg);
 
+/* Install (or clear, with step == NULL) the process-global hook called
+ * each time a walk resolves one component, with the inode it reached,
+ * before the next component is looked up. Same set/clear rules. */
+void stm_9p_server_set_step_hook(
+    void (*step)(uint64_t ds, uint64_t ino, void *arg), void *arg);
+
 #ifdef __cplusplus
 }
 #endif

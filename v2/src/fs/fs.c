@@ -2483,13 +2483,15 @@ static stm_status fs_gen_check_locked(stm_fs *fs, uint64_t dataset_id,
     return gen ? fs_live_gen_locked(fs, dataset_id, ino, gen, NULL) : STM_OK;
 }
 
-/* stm_inode_pin, then the identity check under the pin; a failed check
- * leaves the inode unpinned. */
-static stm_status fs_pin_if_gen(stm_fs *fs, stm_inode_index *iidx,
-                                uint64_t dataset_id, uint64_t ino,
-                                const uint64_t *gen, stm_inode_handle **out)
+/* stm_inode_pin (or _shared), then the identity check under the pin; a
+ * failed check leaves the inode unpinned. */
+static stm_status fs_pin_mode_if_gen(stm_fs *fs, stm_inode_index *iidx,
+                                     uint64_t dataset_id, uint64_t ino,
+                                     const uint64_t *gen, bool shared,
+                                     stm_inode_handle **out)
 {
-    stm_status s = stm_inode_pin(iidx, dataset_id, ino, out);
+    stm_status s = shared ? stm_inode_pin_shared(iidx, dataset_id, ino, out)
+                          : stm_inode_pin(iidx, dataset_id, ino, out);
     if (s != STM_OK) return fs_gen_status(s, gen);
     s = fs_gen_check_locked(fs, dataset_id, ino, gen);
     if (s != STM_OK) {
@@ -2497,6 +2499,27 @@ static stm_status fs_pin_if_gen(stm_fs *fs, stm_inode_index *iidx,
         *out = NULL;
     }
     return s;
+}
+
+static stm_status fs_pin_if_gen(stm_fs *fs, stm_inode_index *iidx,
+                                uint64_t dataset_id, uint64_t ino,
+                                const uint64_t *gen, stm_inode_handle **out)
+{
+    return fs_pin_mode_if_gen(fs, iidx, dataset_id, ino, gen, false, out);
+}
+
+/* The read twins' route. A gen-checked read takes no lockless leg: those
+ * read the target and then its records separately, under nothing a free
+ * or a rollback waits for. It reads under fs->global SH and the target's
+ * shared pin, which every free's exclusive pin excludes. A frozen view
+ * (a synth ino) needs no check: its snapshot id is never reissued and
+ * its content never changes. */
+static stm_status fs_pin_shared_if_gen(stm_fs *fs, stm_inode_index *iidx,
+                                       uint64_t dataset_id, uint64_t ino,
+                                       const uint64_t *gen,
+                                       stm_inode_handle **out)
+{
+    return fs_pin_mode_if_gen(fs, iidx, dataset_id, ino, gen, true, out);
 }
 
 static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
@@ -2575,9 +2598,10 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     return s;
 }
 
-stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
-                         uint64_t off, void *buf, size_t len,
-                         size_t *out_read)
+static stm_status fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                          const uint64_t *gen,
+                          uint64_t off, void *buf, size_t len,
+                          size_t *out_read)
 {
     /* R76 P3-3: zero-init out_read BEFORE arg validation per the
      * R57 P3-5 / R58 P3-1 uniform out-param contract. */
@@ -2684,6 +2708,33 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         }
         pthread_rwlock_unlock(&fs->global);
         return STM_EINVAL;
+    }
+
+    if (gen) {
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
+        stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+        if (!iidx) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+        stm_inode_handle *h = NULL;
+        stm_status gs = fs_pin_shared_if_gen(fs, iidx, dataset_id, ino, gen,
+                                             &h);
+        if (gs == STM_OK) {
+            struct stm_inode_value iv = {0};
+            gs = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+            if (gs == STM_OK) {
+                uint32_t mode = stm_load_le32(iv.si_mode);
+                gs = ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG)
+                         ? fs_read_regular_locked(fs, dataset_id, ino, &iv,
+                                                  off, buf, len, out_read)
+                         : STM_EINVAL;
+            }
+            stm_inode_unpin(iidx, h);
+        }
+        pthread_rwlock_unlock(&fs->global);
+        return gs;
     }
 
     /* Live-tree branch. Probe via EBR + concurrent inode lookup; if
@@ -2864,10 +2915,11 @@ static stm_status fs_load_parent_dir_concurrent(stm_inode_index *iidx,
     return STM_OK;
 }
 
-stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
-                            uint64_t parent_ino,
+static stm_status fs_lookup(stm_fs *fs, uint64_t dataset_id,
+                            uint64_t parent_ino, const uint64_t *gen,
                             const uint8_t *name, uint8_t name_len,
-                            uint64_t *out_child_ino)
+                            uint64_t *out_child_ino,
+                            struct stm_inode_value *out_child_iv)
 {
     if (!fs || !out_child_ino) return STM_EINVAL;
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
@@ -2904,11 +2956,19 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
         stm_status pcs = fs_load_parent_dir(iidx_chk, dataset_id, 1u, &pv);
         if (pcs != STM_OK) {
             pthread_rwlock_unlock(&fs->global);
-            return pcs;     /* STM_ENOENT for uninit'd dataset / freed root */
+            /* STM_ENOENT for uninit'd dataset / freed root */
+            return fs_gen_status(pcs, gen);
         }
-        *out_child_ino = FS_SNAPS_PARENT_INO;
+        if (!fs_gen_matches(&pv, gen)) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_ESTALE;
+        }
+        if (out_child_iv)
+            pcs = fs_snap_view_stat(fs, dataset_id, FS_SNAPS_PARENT_INO,
+                                    out_child_iv);
+        if (pcs == STM_OK) *out_child_ino = FS_SNAPS_PARENT_INO;
         pthread_rwlock_unlock(&fs->global);
-        return STM_OK;
+        return pcs;
     }
     if (fs_ino_is_snaps_parent(parent_ino)) {
         pthread_rwlock_rdlock(&fs->global);
@@ -2916,6 +2976,10 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
         stm_status s = fs_snaps_parent_lookup_by_name(fs, dataset_id,
                                                           name, name_len,
                                                           out_child_ino);
+        if (s == STM_OK && out_child_iv)
+            s = fs_snap_view_stat(fs, dataset_id, *out_child_ino,
+                                  out_child_iv);
+        if (s != STM_OK) *out_child_ino = 0;
         pthread_rwlock_unlock(&fs->global);
         return s;
     }
@@ -2925,15 +2989,23 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
         stm_status s = fs_snap_view_lookup(fs, dataset_id, parent_ino,
                                               name, name_len,
                                               out_child_ino);
+        if (s == STM_OK && out_child_iv)
+            s = fs_snap_view_stat(fs, dataset_id, *out_child_ino,
+                                  out_child_iv);
+        if (s != STM_OK) *out_child_ino = 0;
         pthread_rwlock_unlock(&fs->global);
         return s;
     }
 
+    stm_inode_index  *iidx = NULL;
+    stm_dirent_index *didx = NULL;
+    if (gen || out_child_iv) goto lookup_fallback;
+
     /* Live-tree fast path — wait-free EBR. */
     FS_GUARD_READ_LOCKLESS(fs);
 
-    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
-    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    iidx = stm_sync_inode_index(fs->sync);
+    didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) return STM_EINVAL;
 
     stm_ebr_thread *ebr = fs_ebr_thread_current();
@@ -2970,7 +3042,11 @@ stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
     }
     if (ds != STM_ECORRUPT && ds != STM_EBUSY) return ds;
 
-    /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
+    /* R171 P1-1 SH-fallback (see stm_fs_stat), and the gen-checked
+     * lookup's only route. The parent's shared pin holds the name to its
+     * child: unlinking, renaming over or removing it takes the parent's
+     * exclusive pin, and a child is freed only once no directory names
+     * it, so the child read here is the one the name names. */
 lookup_fallback:
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
@@ -2981,16 +3057,23 @@ lookup_fallback:
         return STM_EINVAL;
     }
     {
-        struct stm_inode_value pv2 = {0};
-        stm_status ps2 = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv2);
+        stm_inode_handle *h = NULL;
+        stm_status ps2 = fs_pin_shared_if_gen(fs, iidx, dataset_id,
+                                              parent_ino, gen, &h);
         if (ps2 != STM_OK) {
             pthread_rwlock_unlock(&fs->global);
             return ps2;
         }
+        struct stm_inode_value pv2 = {0};
         uint64_t ci = 0;
-        stm_status ds2 = stm_dirent_lookup(didx, dataset_id, parent_ino,
-                                              name, name_len,
-                                              &ci, NULL, NULL);
+        stm_status ds2 = fs_load_parent_dir(iidx, dataset_id, parent_ino,
+                                            &pv2);
+        if (ds2 == STM_OK)
+            ds2 = stm_dirent_lookup(didx, dataset_id, parent_ino,
+                                    name, name_len, &ci, NULL, NULL);
+        if (ds2 == STM_OK && out_child_iv)
+            ds2 = stm_inode_lookup(iidx, dataset_id, ci, out_child_iv);
+        stm_inode_unpin(iidx, h);
         pthread_rwlock_unlock(&fs->global);
         if (ds2 == STM_OK) *out_child_ino = ci;
         return ds2;
@@ -4836,7 +4919,8 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     return STM_OK;
 }
 
-stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+static stm_status fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              const uint64_t *gen,
                               uint8_t *target_buf, size_t target_max,
                               size_t *out_len)
 {
@@ -4859,6 +4943,23 @@ stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         stm_status vs = fs_snap_view_stat(fs, dataset_id, ino, &iv);
         pthread_rwlock_unlock(&fs->global);
         if (vs != STM_OK) return vs;
+    } else if (gen) {
+        pthread_rwlock_rdlock(&fs->global);
+        FS_GUARD_READ(fs);
+        stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+        if (!iidx) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+        stm_inode_handle *h = NULL;
+        stm_status ls = fs_pin_shared_if_gen(fs, iidx, dataset_id, ino, gen,
+                                             &h);
+        if (ls == STM_OK) {
+            ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+            stm_inode_unpin(iidx, h);
+        }
+        pthread_rwlock_unlock(&fs->global);
+        if (ls != STM_OK) return ls;
     } else {
         FS_GUARD_READ_LOCKLESS(fs);
         stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -6056,8 +6157,9 @@ static inline uint64_t fs_readdir_next_cursor(uint64_t p)
     return (p > UINT64_MAX - 3u) ? UINT64_MAX : p + 3u;
 }
 
-stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
-                              uint64_t dir_ino, uint64_t parent_ino,
+static stm_status fs_readdir(stm_fs *fs, uint64_t dataset_id,
+                              uint64_t dir_ino, const uint64_t *gen,
+                              uint64_t parent_ino,
                               uint32_t flags,
                               uint64_t *cursor,
                               stm_fs_dirent_entry *out_entries,
@@ -6183,10 +6285,12 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
     stm_ebr_enter(ebr);
 
     bool no_dots = (flags & STM_FS_READDIR_FLAG_NO_DOTS) != 0u;
-    bool need_fallback = false;
+    bool need_fallback = gen != NULL;
     struct stm_inode_value dv = {0};
-    stm_status ds = fs_load_parent_dir_concurrent(iidx, ebr, dataset_id,
-                                                     dir_ino, &dv);
+    stm_status ds = STM_OK;
+    if (!need_fallback)
+        ds = fs_load_parent_dir_concurrent(iidx, ebr, dataset_id, dir_ino,
+                                           &dv);
     if (ds == STM_ECORRUPT || ds == STM_EBUSY) need_fallback = true;
     else if (ds != STM_OK) {
         stm_ebr_exit(ebr);
@@ -6291,12 +6395,17 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
             pthread_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
-        memset(&dv, 0, sizeof dv);
-        ds = fs_load_parent_dir(iidx, dataset_id, dir_ino, &dv);
+        /* The dir's shared pin keeps the listing within one
+         * incarnation of it (a gen-checked readdir's only route). */
+        stm_inode_handle *h = NULL;
+        ds = fs_pin_shared_if_gen(fs, iidx, dataset_id, dir_ino, gen, &h);
         if (ds != STM_OK) {
             pthread_rwlock_unlock(&fs->global);
             return ds;
         }
+        memset(&dv, 0, sizeof dv);
+        ds = fs_load_parent_dir(iidx, dataset_id, dir_ino, &dv);
+        if (ds != STM_OK) goto fallback_out;
         local_cursor = *cursor;
         emitted = 0;
         if (local_cursor == 0u) {
@@ -6325,13 +6434,13 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
             uint64_t dirent_cursor = local_cursor - 2u;
             size_t dirent_max = max_entries - emitted;
             if (dirent_max > SIZE_MAX / sizeof(stm_dirent_entry)) {
-                pthread_rwlock_unlock(&fs->global);
-                return STM_ENOMEM;
+                ds = STM_ENOMEM;
+                goto fallback_out;
             }
             stm_dirent_entry *batch = malloc(dirent_max * sizeof *batch);
             if (!batch) {
-                pthread_rwlock_unlock(&fs->global);
-                return STM_ENOMEM;
+                ds = STM_ENOMEM;
+                goto fallback_out;
             }
             size_t batch_n = 0;
             stm_status rs = stm_dirent_readdir(didx, dataset_id, dir_ino,
@@ -6339,14 +6448,14 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
                                                   batch, dirent_max, &batch_n);
             if (rs != STM_OK) {
                 free(batch);
-                pthread_rwlock_unlock(&fs->global);
-                return rs;
+                ds = rs;
+                goto fallback_out;
             }
             for (size_t k = 0; k < batch_n; k++) {
                 if (batch[k].name_len > STM_DIRENT_NAME_MAX) {
                     free(batch);
-                    pthread_rwlock_unlock(&fs->global);
-                    return STM_ECORRUPT;
+                    ds = STM_ECORRUPT;
+                    goto fallback_out;
                 }
                 out_entries[emitted].child_ino  = batch[k].child_ino;
                 out_entries[emitted].child_gen  = batch[k].child_gen;
@@ -6367,7 +6476,10 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
                 local_cursor = dirent_cursor + 2u;
             }
         }
+fallback_out:
+        stm_inode_unpin(iidx, h);
         pthread_rwlock_unlock(&fs->global);
+        if (ds != STM_OK) return ds;
     }
 
     *cursor = local_cursor;
@@ -6504,7 +6616,8 @@ static stm_status fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     return s;
 }
 
-stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+static stm_status fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              const uint64_t *gen,
                               const uint8_t *name, uint8_t name_len,
                               uint8_t *value_buf, uint32_t value_max,
                               uint32_t *out_size) {
@@ -6521,13 +6634,18 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (name_len == 0u || name_len > STM_FS_XATTR_NAME_MAX) return STM_EINVAL;
     if (!fs_xattr_name_in_posix_namespace(name, name_len)) return STM_EINVAL;
 
+    stm_inode_index *iidx = NULL;
+    stm_xattr_index *xidx = NULL;
+    stm_status s = STM_ECORRUPT;
+    if (gen) goto getxattr_locked;
+
     /* 9.8-LF-3c: wait-free getxattr — inode existence check + xattr
      * lookup both run under a single EBR critical section. No
      * fs->global rwlock. */
     FS_GUARD_READ_LOCKLESS(fs);
 
-    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-    stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
+    iidx = stm_sync_inode_index(fs->sync);
+    xidx = stm_sync_xattr_index(fs->sync);
     if (!iidx || !xidx) return STM_EINVAL;
 
     stm_ebr_thread *ebr = fs_ebr_thread_current();
@@ -6541,7 +6659,6 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     memset(&iv, 0, sizeof iv);
     stm_status is = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
                                                    ino, &iv);
-    stm_status s = STM_ECORRUPT;
     if (is == STM_OK) {
         s = stm_xattr_get_concurrent(xidx, ebr, dataset_id, ino,
                                         name, name_len,
@@ -6551,7 +6668,11 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (is != STM_OK && is != STM_ECORRUPT && is != STM_EBUSY) return is;
     if (is == STM_OK && s != STM_ECORRUPT && s != STM_EBUSY) return s;
 
-    /* R171 P1-1 SH-fallback. See stm_fs_stat for rationale. */
+    /* R171 P1-1 SH-fallback (see stm_fs_stat), and the gen-checked
+     * read's only route. The shared pin keeps the inode, and so its
+     * xattrs, one incarnation: a free drops them under the exclusive
+     * pin, and the xattr writers run under fs->global EX. */
+getxattr_locked:
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
     iidx = stm_sync_inode_index(fs->sync);
@@ -6560,8 +6681,8 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         pthread_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
-    memset(&iv, 0, sizeof iv);
-    stm_status is2 = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+    stm_inode_handle *h = NULL;
+    stm_status is2 = fs_pin_shared_if_gen(fs, iidx, dataset_id, ino, gen, &h);
     if (is2 != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return is2;
@@ -6569,6 +6690,7 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (out_size) *out_size = 0;
     s = stm_xattr_get(xidx, dataset_id, ino, name, name_len,
                          value_buf, value_max, out_size);
+    stm_inode_unpin(iidx, h);
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
@@ -6588,7 +6710,8 @@ void stm_fs_set_listxattr_fallback_for_test(bool force,
 }
 #endif
 
-stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                               const uint64_t *gen,
                                uint8_t *name_buf, size_t buf_max,
                                size_t *out_total_len) {
     if (out_total_len) *out_total_len = 0;
@@ -6619,11 +6742,12 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!ebr) return STM_ENOMEM;
     stm_ebr_enter(ebr);
 
-    bool need_fallback = false;
+    bool need_fallback = gen != NULL;
     struct stm_inode_value iv;
     memset(&iv, 0, sizeof iv);
-    stm_status ps = stm_inode_lookup_concurrent(iidx, ebr,
-                                                  dataset_id, ino, &iv);
+    stm_status ps = STM_OK;
+    if (!need_fallback)
+        ps = stm_inode_lookup_concurrent(iidx, ebr, dataset_id, ino, &iv);
     if (ps == STM_ECORRUPT || ps == STM_EBUSY) need_fallback = true;
     else if (ps != STM_OK) {
         stm_ebr_exit(ebr);
@@ -6713,7 +6837,8 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             return STM_EINVAL;
         }
         stm_inode_handle *h = NULL;
-        stm_status pp = stm_inode_pin_shared(iidx, dataset_id, ino, &h);
+        stm_status pp = fs_pin_shared_if_gen(fs, iidx, dataset_id, ino, gen,
+                                             &h);
         if (pp != STM_OK) {
             pthread_rwlock_unlock(&fs->global);
             return pp;
@@ -10916,6 +11041,113 @@ stm_status stm_fs_lock_test_if_gen(stm_fs *fs, uint64_t dataset_id,
 {
     return fs_lock_test(fs, dataset_id, ino, &gen, owner_id, type, off, len,
                         out_would_grant, out_conflicting_owner);
+}
+
+stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                       uint64_t off, void *buf, size_t len, size_t *out_read)
+{
+    return fs_read(fs, dataset_id, ino, NULL, off, buf, len, out_read);
+}
+
+stm_status stm_fs_read_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              uint64_t gen,
+                              uint64_t off, void *buf, size_t len,
+                              size_t *out_read)
+{
+    return fs_read(fs, dataset_id, ino, &gen, off, buf, len, out_read);
+}
+
+stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
+                         uint64_t parent_ino,
+                         const uint8_t *name, uint8_t name_len,
+                         uint64_t *out_child_ino)
+{
+    return fs_lookup(fs, dataset_id, parent_ino, NULL, name, name_len,
+                     out_child_ino, NULL);
+}
+
+stm_status stm_fs_lookup_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                uint64_t parent_ino, uint64_t gen,
+                                const uint8_t *name, uint8_t name_len,
+                                uint64_t *out_child_ino,
+                                struct stm_inode_value *out_child_iv)
+{
+    return fs_lookup(fs, dataset_id, parent_ino, &gen, name, name_len,
+                     out_child_ino, out_child_iv);
+}
+
+stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           uint8_t *target_buf, size_t target_max,
+                           size_t *out_len)
+{
+    return fs_readlink(fs, dataset_id, ino, NULL, target_buf, target_max,
+                       out_len);
+}
+
+stm_status stm_fs_readlink_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino, uint64_t gen,
+                                  uint8_t *target_buf, size_t target_max,
+                                  size_t *out_len)
+{
+    return fs_readlink(fs, dataset_id, ino, &gen, target_buf, target_max,
+                       out_len);
+}
+
+stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
+                          uint64_t dir_ino, uint64_t parent_ino,
+                          uint32_t flags, uint64_t *cursor,
+                          stm_fs_dirent_entry *out_entries,
+                          size_t max_entries, size_t *out_returned)
+{
+    return fs_readdir(fs, dataset_id, dir_ino, NULL, parent_ino, flags,
+                      cursor, out_entries, max_entries, out_returned);
+}
+
+stm_status stm_fs_readdir_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t dir_ino, uint64_t gen,
+                                 uint64_t parent_ino,
+                                 uint32_t flags, uint64_t *cursor,
+                                 stm_fs_dirent_entry *out_entries,
+                                 size_t max_entries, size_t *out_returned)
+{
+    return fs_readdir(fs, dataset_id, dir_ino, &gen, parent_ino, flags,
+                      cursor, out_entries, max_entries, out_returned);
+}
+
+stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           const uint8_t *name, uint8_t name_len,
+                           uint8_t *value_buf, uint32_t value_max,
+                           uint32_t *out_size)
+{
+    return fs_getxattr(fs, dataset_id, ino, NULL, name, name_len,
+                       value_buf, value_max, out_size);
+}
+
+stm_status stm_fs_getxattr_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino, uint64_t gen,
+                                  const uint8_t *name, uint8_t name_len,
+                                  uint8_t *value_buf, uint32_t value_max,
+                                  uint32_t *out_size)
+{
+    return fs_getxattr(fs, dataset_id, ino, &gen, name, name_len,
+                       value_buf, value_max, out_size);
+}
+
+stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                            uint8_t *name_buf, size_t buf_max,
+                            size_t *out_total_len)
+{
+    return fs_listxattr(fs, dataset_id, ino, NULL, name_buf, buf_max,
+                        out_total_len);
+}
+
+stm_status stm_fs_listxattr_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                   uint64_t ino, uint64_t gen,
+                                   uint8_t *name_buf, size_t buf_max,
+                                   size_t *out_total_len)
+{
+    return fs_listxattr(fs, dataset_id, ino, &gen, name_buf, buf_max,
+                        out_total_len);
 }
 
 /* ========================================================================= */

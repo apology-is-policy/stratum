@@ -296,6 +296,8 @@ static struct stm_9p_server_test_hooks {
     void  *arg;
     void (*fresh)(uint64_t ds, uint64_t ino, void *arg);
     void  *fresh_arg;
+    void (*step)(uint64_t ds, uint64_t ino, void *arg);
+    void  *step_arg;
 } g_9p_test_hooks;
 
 void stm_9p_server_set_test_hooks(
@@ -310,6 +312,19 @@ void stm_9p_server_set_fresh_hook(
 {
     g_9p_test_hooks.fresh     = fresh;
     g_9p_test_hooks.fresh_arg = arg;
+}
+
+void stm_9p_server_set_step_hook(
+    void (*step)(uint64_t ds, uint64_t ino, void *arg), void *arg)
+{
+    g_9p_test_hooks.step     = step;
+    g_9p_test_hooks.step_arg = arg;
+}
+
+static void walk_step_hook(uint64_t ds, uint64_t ino)
+{
+    if (g_9p_test_hooks.step)
+        g_9p_test_hooks.step(ds, ino, g_9p_test_hooks.step_arg);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -769,9 +784,7 @@ static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
                                             uint64_t start_ino,
                                             const char *path, size_t path_len,
                                             uint64_t *out_ino,
-                                            uint64_t *out_gen,
-                                            uint32_t *out_cvers,
-                                            uint8_t  *out_qt)
+                                            struct stm_inode_value *out_iv)
 {
     char   canon[STM_9P_NS_PATH_MAX + 1u];
     size_t canon_len = 0;
@@ -779,6 +792,13 @@ static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
                                        canon, sizeof canon, &canon_len);
     if (rc != STM_OK) return rc;
 
+    /* Each component is looked up in the incarnation the one before it
+     * resolved to, and its value read under that directory's pin: a
+     * directory freed, and its number reused, between two steps ends
+     * the walk (STM_ESTALE) instead of continuing in its successor. */
+    struct stm_inode_value iv;
+    rc = stm_fs_stat(s->fs, ds, start_ino, &iv);
+    if (rc != STM_OK) return rc;
     uint64_t cur_ino = start_ino;
     if (canon_len > 1u) {
         size_t i = 1u;
@@ -789,22 +809,19 @@ static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
             if (comp_len == 0u) return STM_EINVAL;
             if (comp_len > STM_9P_NAME_MAX) return STM_ENAMETOOLONG;
             uint64_t next_ino = 0;
-            rc = stm_fs_lookup(s->fs, ds, cur_ino,
-                                 (const uint8_t *)(canon + start),
-                                 (uint8_t)comp_len, &next_ino);
+            rc = stm_fs_lookup_if_gen(s->fs, ds, cur_ino,
+                                      stm_load_le64(iv.si_gen),
+                                      (const uint8_t *)(canon + start),
+                                      (uint8_t)comp_len, &next_ino, &iv);
             if (rc != STM_OK) return rc;
             cur_ino = next_ino;
+            walk_step_hook(ds, cur_ino);
             if (i < canon_len) i++;
         }
     }
 
-    struct stm_inode_value iv;
-    rc = stm_fs_stat(s->fs, ds, cur_ino, &iv);
-    if (rc != STM_OK) return rc;
-    if (out_ino)   *out_ino   = cur_ino;
-    if (out_gen)   *out_gen   = stm_load_le64(iv.si_gen);
-    if (out_cvers) *out_cvers = qid_version(&iv);
-    if (out_qt)    *out_qt    = qid_type_from_mode(stm_load_le32(iv.si_mode));
+    if (out_ino) *out_ino = cur_ino;
+    if (out_iv)  *out_iv  = iv;
     return STM_OK;
 }
 
@@ -816,9 +833,14 @@ static stm_status ns_walk_abs_path(stm_9p_server *s, uint64_t ds,
                                        uint32_t *out_cvers,
                                        uint8_t  *out_qt)
 {
-    return ns_walk_abs_path_from(s, ds, /* start_ino */ 1u,
-                                    path, path_len, out_ino, out_gen,
-                                    out_cvers, out_qt);
+    struct stm_inode_value iv;
+    stm_status rc = ns_walk_abs_path_from(s, ds, /* start_ino */ 1u,
+                                          path, path_len, out_ino, &iv);
+    if (rc != STM_OK) return rc;
+    if (out_gen)   *out_gen   = stm_load_le64(iv.si_gen);
+    if (out_cvers) *out_cvers = qid_version(&iv);
+    if (out_qt)    *out_qt    = qid_type_from_mode(stm_load_le32(iv.si_mode));
+    return STM_OK;
 }
 
 /* Cap on entries in a single Tattach spec string. Spec entries are
@@ -1447,6 +1469,9 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
 
         uint64_t next_ds  = cur->ds;
         uint64_t next_ino = 0;
+        struct stm_inode_value next_iv;
+        bool have_iv = false;
+        bool self    = false;
 
         /* "." (no-op on cumulative state) and ".." (pops a component
          * via canonicalization) are wire-legal Twalk components per
@@ -1474,6 +1499,7 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
              * record at this step binds at current_gen[cur_ino]. */
             next_ds  = cur->ds;
             next_ino = cur->ino;
+            self     = true;
         } else if (is_dotdot) {
             /* ".." that popped a component AND no binding fired —
              * re-resolve new_path from the connection's namespace
@@ -1489,23 +1515,38 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
             rc = ns_walk_abs_path_from(s, conn_root_ds,
                                           conn_root_ino,
                                           new_path, new_path_len,
-                                          &next_ino, NULL, NULL, NULL);
+                                          &next_ino, &next_iv);
             if (rc != STM_OK) break;
             next_ds = conn_root_ds;
+            have_iv = true;
         } else {
-            rc = stm_fs_lookup(s->fs, cur->ds, cur->ino,
-                                 (const uint8_t *)name, (uint8_t)slen,
-                                 &next_ino);
-            if (rc != STM_OK) break;
+            /* The name is looked up in the cursor's own incarnation, and
+             * the child's value (its si_gen becomes the walked fid's
+             * cached_gen) is read under that directory's pin, so the
+             * child is the one the name named. */
+            rc = stm_fs_lookup_if_gen(s->fs, cur->ds, cur->ino, cur->gen,
+                                      (const uint8_t *)name, (uint8_t)slen,
+                                      &next_ino, &next_iv);
+            if (rc != STM_OK) {
+                if (rc == STM_ESTALE && nwqid == 0) goto stale;
+                break;
+            }
+            have_iv = true;
         }
 
-        /* Stat the resolved ino — captures si_gen (cached_gen snapshot
-         * per fid.tla::Walk's bind-time gen) AND si_mode (qid_type).
-         * Fires on bindings too so the qid encoding reflects the
-         * underlying source's current state. */
-        struct stm_inode_value next_iv;
-        rc = stm_fs_stat(s->fs, next_ds, next_ino, &next_iv);
-        if (rc != STM_OK) break;
+        /* Stat the resolved ino where no lookup read it — captures si_gen
+         * (cached_gen snapshot per fid.tla::Walk's bind-time gen) AND
+         * si_mode (qid_type). Fires on bindings too so the qid encoding
+         * reflects the underlying source's current state. */
+        if (!have_iv) {
+            rc = stm_fs_stat(s->fs, next_ds, next_ino, &next_iv);
+            if (rc != STM_OK) break;
+        }
+        /* "." re-reads the cursor itself: the same incarnation or none. */
+        if (self && stm_load_le64(next_iv.si_gen) != cur->gen) {
+            if (nwqid == 0) goto stale;
+            break;
+        }
 
         cur->ds    = next_ds;
         cur->ino   = next_ino;
@@ -1521,10 +1562,22 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
         if (ivs_out)
             ivs_out[nwqid] = next_iv;
         nwqid++;
+        walk_step_hook(cur->ds, cur->ino);
     }
 
     *out_nwqid = nwqid;
     return STM_OK;
+
+stale:
+    /* The walk's source is no longer the file its fid names. */
+    *out_nwqid = 0;
+    return STM_ESTALE;
+}
+
+/* A walk_components failure as an Rlerror ecode. */
+static uint32_t walk_ecode(stm_status wrc)
+{
+    return wrc == STM_ESTALE ? status_to_errno(wrc) : EPROTO;
 }
 
 /* One Rgetattr body: valid[8] qid[13] mode[4] uid[4] gid[4] nlink[8]
@@ -1773,7 +1826,8 @@ static stm_status h_walk(stm_9p_server *s,
                                             bp, end, nwname,
                                             &cur, qids, &nwqid, NULL);
         if (wrc != STM_OK)
-            return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                 walk_ecode(wrc));
         return walk_finish_locked(s, f, fid, newfid, nwname,
                                      qids, nwqid, &cur,
                                      conn_root_ds, conn_root_ino,
@@ -1800,7 +1854,7 @@ static stm_status h_walk(stm_9p_server *s,
                                             bp, end, nwname,
                                             &cur, qids, &nwqid, NULL);
         if (wrc != STM_OK)
-            ecode = EPROTO;
+            ecode = walk_ecode(wrc);
     }
 
     /* (c) under s->lock: bind newfid (or reply the error); unpin. */
@@ -1930,7 +1984,8 @@ static stm_status h_walkgetattr(stm_9p_server *s,
                                             bp, end, nwname,
                                             &cur, qids, &nwqid, ivs);
         if (wrc != STM_OK)
-            return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                 walk_ecode(wrc));
         return walkgetattr_finish_locked(s, f, fid, newfid, request_mask,
                                            nwname, qids, nwqid, ivs, &cur,
                                            conn_root_ds, conn_root_ino,
@@ -1952,7 +2007,7 @@ static stm_status h_walkgetattr(stm_9p_server *s,
                                             bp, end, nwname,
                                             &cur, qids, &nwqid, ivs);
         if (wrc != STM_OK)
-            ecode = EPROTO;
+            ecode = walk_ecode(wrc);
     }
 
     must_lock(&s->lock);
@@ -2293,7 +2348,8 @@ static stm_status h_read(stm_9p_server *s,
     wp += 4;
 
     size_t got = 0;
-    rc = stm_fs_read(s->fs, ds, ino, offset, wp, (size_t)count, &got);
+    rc = stm_fs_read_if_gen(s->fs, ds, ino, gen, offset, wp, (size_t)count,
+                            &got);
     if (rc != STM_OK) {
         ecode = status_to_errno(rc);
         goto phase_c;
@@ -2528,8 +2584,8 @@ static stm_status h_readdir(stm_9p_server *s,
     bool room = true;
     while (room) {
         size_t got = 0;
-        stm_status rc = stm_fs_readdir(s->fs, ds, ino,
-                                          parent_ino,
+        stm_status rc = stm_fs_readdir_if_gen(s->fs, ds, ino, gen,
+                                              parent_ino,
                                           /*flags=*/0,
                                           &cursor,
                                           batch, H_READDIR_BATCH, &got);
@@ -3087,7 +3143,8 @@ static stm_status h_readlink(stm_9p_server *s,
 
     stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
     if (rc == STM_OK)
-        rc = stm_fs_readlink(s->fs, ds, ino, buf, sizeof buf, &got);
+        rc = stm_fs_readlink_if_gen(s->fs, ds, ino, gen, buf, sizeof buf,
+                                    &got);
     if (rc != STM_OK)
         ecode = status_to_errno(rc);
     else if (got > UINT16_MAX)
@@ -3804,8 +3861,9 @@ static stm_status h_xattrwalk(stm_9p_server *s,
         /* LIST: fetch the xattr names buffer. Two-pass: ask for
          * size first (NULL buf), then alloc + fetch. */
         size_t total = 0;
-        stm_status rc = stm_fs_listxattr(s->fs, f->dataset_id, f->ino,
-                                            NULL, 0, &total);
+        stm_status rc = stm_fs_listxattr_if_gen(s->fs, f->dataset_id,
+                                                f->ino, f->cached_gen,
+                                                NULL, 0, &total);
         if (rc != STM_OK && rc != STM_ERANGE) {
             fid_release_locked(s, nf);
             return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
@@ -3818,8 +3876,9 @@ static stm_status h_xattrwalk(stm_9p_server *s,
                                       STM_9P_ECODE_ENOMEM);
             }
             size_t got = 0;
-            rc = stm_fs_listxattr(s->fs, f->dataset_id, f->ino,
-                                    nf->xattr_buf, total, &got);
+            rc = stm_fs_listxattr_if_gen(s->fs, f->dataset_id, f->ino,
+                                         f->cached_gen,
+                                         nf->xattr_buf, total, &got);
             if (rc != STM_OK) {
                 fid_release_locked(s, nf);
                 return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
@@ -3836,9 +3895,11 @@ static stm_status h_xattrwalk(stm_9p_server *s,
         }
         /* VALUE-READ: fetch the named xattr's value. Two-pass. */
         uint32_t want = 0;
-        stm_status rc = stm_fs_getxattr(s->fs, f->dataset_id, f->ino,
-                                           (const uint8_t *)name, (uint8_t)nlen,
-                                           NULL, 0, &want);
+        stm_status rc = stm_fs_getxattr_if_gen(s->fs, f->dataset_id, f->ino,
+                                               f->cached_gen,
+                                               (const uint8_t *)name,
+                                               (uint8_t)nlen,
+                                               NULL, 0, &want);
         if (rc != STM_OK && rc != STM_ERANGE) {
             fid_release_locked(s, nf);
             return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
@@ -3851,9 +3912,10 @@ static stm_status h_xattrwalk(stm_9p_server *s,
                                       STM_9P_ECODE_ENOMEM);
             }
             uint32_t got = 0;
-            rc = stm_fs_getxattr(s->fs, f->dataset_id, f->ino,
-                                   (const uint8_t *)name, (uint8_t)nlen,
-                                   nf->xattr_buf, want, &got);
+            rc = stm_fs_getxattr_if_gen(s->fs, f->dataset_id, f->ino,
+                                        f->cached_gen,
+                                        (const uint8_t *)name, (uint8_t)nlen,
+                                        nf->xattr_buf, want, &got);
             if (rc != STM_OK) {
                 fid_release_locked(s, nf);
                 return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);

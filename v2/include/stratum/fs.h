@@ -2564,6 +2564,51 @@ stm_status stm_fs_lock_test_if_gen(stm_fs *fs, uint64_t dataset_id,
                                    bool *out_would_grant,
                                    uint64_t *out_conflicting_owner);
 
+/*
+ * The reads below take no lockless leg when given a gen: each reads under
+ * fs->global SH with the target's shared pin held and its gen checked
+ * there. stm_fs_lookup_if_gen checks the PARENT's gen; a missing name is
+ * still STM_ENOENT. It also returns the child's inode value read under
+ * the parent's pin (out_child_iv, may be NULL), so the child it names and
+ * the value describe one incarnation. A synth (snapshot-view) ino is not
+ * checked: a snapshot id is never reissued and a frozen view never
+ * changes.
+ */
+STM_MUST_USE
+stm_status stm_fs_read_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              uint64_t gen,
+                              uint64_t off, void *buf, size_t len,
+                              size_t *out_read);
+STM_MUST_USE
+stm_status stm_fs_lookup_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                uint64_t parent_ino, uint64_t gen,
+                                const uint8_t *name, uint8_t name_len,
+                                uint64_t *out_child_ino,
+                                struct stm_inode_value *out_child_iv);
+STM_MUST_USE
+stm_status stm_fs_readlink_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino, uint64_t gen,
+                                  uint8_t *target_buf, size_t target_max,
+                                  size_t *out_len);
+STM_MUST_USE
+stm_status stm_fs_readdir_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t dir_ino, uint64_t gen,
+                                 uint64_t parent_ino,
+                                 uint32_t flags, uint64_t *cursor,
+                                 stm_fs_dirent_entry *out_entries,
+                                 size_t max_entries, size_t *out_returned);
+STM_MUST_USE
+stm_status stm_fs_getxattr_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino, uint64_t gen,
+                                  const uint8_t *name, uint8_t name_len,
+                                  uint8_t *value_buf, uint32_t value_max,
+                                  uint32_t *out_size);
+STM_MUST_USE
+stm_status stm_fs_listxattr_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                   uint64_t ino, uint64_t gen,
+                                   uint8_t *name_buf, size_t buf_max,
+                                   size_t *out_total_len);
+
 /* ========================================================================= */
 /* P8-POSIX-7b: fallocate(2) — every FALLOC_FL_* flag.                        */
 /* ========================================================================= */

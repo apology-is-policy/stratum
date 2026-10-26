@@ -5034,6 +5034,7 @@ typedef struct {
     stm_fs        *fs;
     stm_9p_server *s1, *s2;
     uint64_t       ino_x;
+    uint64_t       ino_tgt;     /* a leg's own target, when not "x" */
 } gap_fix;
 
 static void gap_fix_up(gap_fix *gf, const char *name)
@@ -5091,24 +5092,27 @@ static void gap_swap_x_for_y(gap_fix *gf)
     free(req); free(resp);
 }
 
-/* Runs `op` on session 1, parked in its freshness gap while session 2
- * swaps "x" for "y"; `in_gap` (optional) then runs more of session 2. */
-static void gap_run(gap_fix *gf, gap_op *op, void (*in_gap)(gap_fix *))
+/* Runs `op` on session 1, parked where it first reaches `ino` -- right
+ * after its freshness check, or (at_step) right after a walk step --
+ * while `swap` runs on session 2; `in_gap` (optional) then runs more. */
+static void gap_run_at(gap_fix *gf, gap_op *op, uint64_t ino, bool at_step,
+                       void (*swap)(gap_fix *), void (*in_gap)(gap_fix *))
 {
     gap_ctl g;
     memset(&g, 0, sizeof g);
     pthread_mutex_init(&g.mu, NULL);
     pthread_cond_init(&g.cv, NULL);
-    g.ino   = gf->ino_x;
+    g.ino   = ino;
     g.armed = true;
-    stm_9p_server_set_fresh_hook(gap_fresh, &g);
+    if (at_step) stm_9p_server_set_step_hook(gap_fresh, &g);
+    else         stm_9p_server_set_fresh_hook(gap_fresh, &g);
     op->s = gf->s1;
     pthread_t th;
     STM_ASSERT_EQ(pthread_create(&th, NULL, gap_op_run, op), 0);
     bool parked = gap_await_parked(&g);
     STM_ASSERT_TRUE(parked);
     if (parked) {
-        gap_swap_x_for_y(gf);
+        swap(gf);
         if (in_gap) in_gap(gf);
     }
     pthread_mutex_lock(&g.mu);
@@ -5118,8 +5122,15 @@ static void gap_run(gap_fix *gf, gap_op *op, void (*in_gap)(gap_fix *))
     pthread_mutex_unlock(&g.mu);
     pthread_join(th, NULL);
     stm_9p_server_set_fresh_hook(NULL, NULL);
+    stm_9p_server_set_step_hook(NULL, NULL);
     pthread_cond_destroy(&g.cv);
     pthread_mutex_destroy(&g.mu);
+}
+
+/* The freshness gap with session 2 swapping "x" for "y". */
+static void gap_run(gap_fix *gf, gap_op *op, void (*in_gap)(gap_fix *))
+{
+    gap_run_at(gf, op, gf->ino_x, false, gap_swap_x_for_y, in_gap);
 }
 
 static void gap_assert_estale(const gap_op *op)
@@ -5314,6 +5325,216 @@ STM_TEST(p9_xattr_commit_on_a_freed_fid_answers_estale) {
                                    6, v, sizeof v, &vsz),
                    STM_ENODATA);
     free(req); free(resp);
+    gap_fix_down(&gf);
+}
+
+/* ── the reads and the walk in the gap (PX-16 part 2) ─────────────────── */
+
+/* Session 1's fid 104 is "d", an empty directory, walked but not open. */
+static void gap_fix_dir(gap_fix *gf)
+{
+    STM_ASSERT_OK(stm_fs_mkdir(gf->fs, 1, 1, (const uint8_t *)"d", 1, 0755u,
+                               0, 0, &gf->ino_tgt));
+    walk_to(gf->s1, 100, 104, "d");
+}
+
+/* Session 2 removes "d" and makes "e" on the same ino, holding "n". */
+static void gap_swap_d_for_e(gap_fix *gf)
+{
+    uint64_t e = 0, n = 0;
+    STM_ASSERT_OK(stm_fs_rmdir(gf->fs, 1, 1, (const uint8_t *)"d", 1));
+    STM_ASSERT_OK(stm_fs_mkdir(gf->fs, 1, 1, (const uint8_t *)"e", 1, 0755u,
+                               0, 0, &e));
+    STM_ASSERT_EQ(e, gf->ino_tgt);
+    STM_ASSERT_OK(stm_fs_create_file(gf->fs, 1, e, (const uint8_t *)"n", 1,
+                                     0644u, 0, 0, &n));
+}
+
+/* Tread through the freed fid must not return "y"'s bytes. */
+STM_TEST(p9_read_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_read");
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_tread(op->req, 4, 101, 0, 16);
+    gap_run(&gf, op, NULL);
+    gap_assert_estale(op);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* Treaddir through the freed dir fid must not list "e". */
+STM_TEST(p9_readdir_through_a_dir_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_readdir");
+    gap_fix_dir(&gf);
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlopen(req, 4, 104, STM_9P_O_RDONLY);
+    STM_ASSERT_OK(stm_9p_server_handle(gf.s1, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    free(req); free(resp);
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_treaddir(op->req, 5, 104, 0, 4096);
+    gap_run_at(&gf, op, gf.ino_tgt, false, gap_swap_d_for_e, NULL);
+    gap_assert_estale(op);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* Session 1's fid 104 is the symlink "l" -> "old". */
+static void gap_fix_link(gap_fix *gf)
+{
+    STM_ASSERT_OK(stm_fs_symlink(gf->fs, 1, 1, (const uint8_t *)"l", 1,
+                                 (const uint8_t *)"old", 3, 0, 0,
+                                 &gf->ino_tgt));
+    walk_to(gf->s1, 100, 104, "l");
+}
+
+/* Session 2 replaces "l" by "m" -> "SECRET" on the same ino. */
+static void gap_swap_l_for_m(gap_fix *gf)
+{
+    uint64_t m = 0;
+    STM_ASSERT_OK(stm_fs_unlink(gf->fs, 1, 1, (const uint8_t *)"l", 1));
+    STM_ASSERT_OK(stm_fs_symlink(gf->fs, 1, 1, (const uint8_t *)"m", 1,
+                                 (const uint8_t *)"SECRET", 6, 0, 0, &m));
+    STM_ASSERT_EQ(m, gf->ino_tgt);
+}
+
+/* Treadlink through the freed fid must not return "m"'s target. */
+STM_TEST(p9_readlink_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_readlink");
+    gap_fix_link(&gf);
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_treadlink(op->req, 4, 104);
+    gap_run_at(&gf, op, gf.ino_tgt, false, gap_swap_l_for_m, NULL);
+    gap_assert_estale(op);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+static void gap_set_k_on_y(gap_fix *gf)
+{
+    bool rep = false;
+    STM_ASSERT_OK(stm_fs_setxattr(gf->fs, 1, gf->ino_x,
+                                  (const uint8_t *)"user.k", 6,
+                                  (const uint8_t *)"YV", 2, 0, &rep));
+}
+
+/* Txattrwalk through the freed fid must say nothing of "y": not read
+ * its xattr (a named read) nor list them (an empty name), and not
+ * report that it has none either -- the size probe alone answers then. */
+static void gap_xattrwalk_leg(const char *fixture, const char *name,
+                              void (*in_gap)(gap_fix *))
+{
+    gap_fix gf;
+    gap_fix_up(&gf, fixture);
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_txattrwalk(op->req, 4, 101, 105, name);
+    gap_run(&gf, op, in_gap);
+    gap_assert_estale(op);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+STM_TEST(p9_xattrwalk_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_xattrwalk_leg("9p_gap_xattrwalk_get", "user.k", gap_set_k_on_y);
+    gap_xattrwalk_leg("9p_gap_xattrwalk_list", NULL, gap_set_k_on_y);
+    gap_xattrwalk_leg("9p_gap_xattrwalk_get_none", "user.k", NULL);
+    gap_xattrwalk_leg("9p_gap_xattrwalk_list_none", NULL, NULL);
+}
+
+/* Twalk from the freed dir fid must not reach into "e": not its child
+ * "n", and not "e" itself through ".". */
+static void gap_walk_leg(const char *fixture, const char *comp)
+{
+    gap_fix gf;
+    gap_fix_up(&gf, fixture);
+    gap_fix_dir(&gf);
+    gap_op *op = calloc(1, sizeof *op);
+    const char *path[] = { comp };
+    op->sz = build_twalk(op->req, 4, 104, 105, 1, path);
+    gap_run_at(&gf, op, gf.ino_tgt, false, gap_swap_d_for_e, NULL);
+    gap_assert_estale(op);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+STM_TEST(p9_walk_from_a_dir_fid_freed_in_the_gap_answers_estale) {
+    gap_walk_leg("9p_gap_walk_name", "n");
+    gap_walk_leg("9p_gap_walk_dot", ".");
+}
+
+/* A walk "d/n" whose "d" is removed, and its ino reused by "e" holding
+ * "n", between its two steps stops after "d" (a partial Rwalk) instead
+ * of binding to "e/n". */
+STM_TEST(p9_walk_never_steps_into_a_dir_freed_mid_walk) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_walk_mid");
+    gap_fix_dir(&gf);
+    gap_op *op = calloc(1, sizeof *op);
+    const char *path[] = { "d", "n" };
+    op->sz = build_twalk(op->req, 4, 100, 105, 2, path);
+    gap_run_at(&gf, op, gf.ino_tgt, true, gap_swap_d_for_e, NULL);
+    STM_ASSERT_OK(op->rc);
+    STM_ASSERT_EQ(op->resp[4], STM_9P_RWALK);
+    STM_ASSERT_EQ(load_u16(op->resp + 7), 1u);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* "a/b/c" and session 1's fid 104 on "c". */
+static void gap_fix_abc(gap_fix *gf)
+{
+    uint64_t b = 0, c = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(gf->fs, 1, 1, (const uint8_t *)"a", 1, 0755u,
+                               0, 0, &gf->ino_tgt));
+    STM_ASSERT_OK(stm_fs_mkdir(gf->fs, 1, gf->ino_tgt, (const uint8_t *)"b",
+                               1, 0755u, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_mkdir(gf->fs, 1, b, (const uint8_t *)"c", 1, 0755u,
+                               0, 0, &c));
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    const char *path[] = { "a", "b", "c" };
+    uint32_t sz = build_twalk(req, 4, 100, 104, 3, path);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s1, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    STM_ASSERT_EQ(load_u16(resp + 7), 3u);
+    free(req); free(resp);
+}
+
+/* Session 2 tears "a/b/c" down and builds "a/b" again on "a"'s ino. */
+static void gap_rebuild_ab(gap_fix *gf)
+{
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_lookup(gf->fs, 1, gf->ino_tgt, (const uint8_t *)"b",
+                                1, &b));
+    STM_ASSERT_OK(stm_fs_rmdir(gf->fs, 1, b, (const uint8_t *)"c", 1));
+    STM_ASSERT_OK(stm_fs_rmdir(gf->fs, 1, gf->ino_tgt, (const uint8_t *)"b",
+                               1));
+    STM_ASSERT_OK(stm_fs_rmdir(gf->fs, 1, 1, (const uint8_t *)"a", 1));
+    STM_ASSERT_OK(stm_fs_mkdir(gf->fs, 1, 1, (const uint8_t *)"a", 1, 0755u,
+                               0, 0, &a));
+    STM_ASSERT_EQ(a, gf->ino_tgt);
+    STM_ASSERT_OK(stm_fs_mkdir(gf->fs, 1, a, (const uint8_t *)"b", 1, 0755u,
+                               0, 0, &b));
+}
+
+/* ".." from "a/b/c" re-resolves "/a/b" from the root. An "a" removed,
+ * and its ino reused by a new "a" holding a new "b", between that
+ * walk's two steps ends it (Rlerror) instead of binding to the new
+ * "b". */
+STM_TEST(p9_dotdot_walk_never_steps_into_a_dir_freed_mid_walk) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_walk_dotdot_mid");
+    gap_fix_abc(&gf);
+    gap_op *op = calloc(1, sizeof *op);
+    const char *path[] = { ".." };
+    op->sz = build_twalk(op->req, 5, 104, 105, 1, path);
+    gap_run_at(&gf, op, gf.ino_tgt, true, gap_rebuild_ab, NULL);
+    STM_ASSERT_OK(op->rc);
+    STM_ASSERT_EQ(op->resp[4], STM_9P_RLERROR);
+    free(op);
     gap_fix_down(&gf);
 }
 

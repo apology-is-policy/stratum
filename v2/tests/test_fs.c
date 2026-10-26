@@ -12493,4 +12493,110 @@ STM_TEST(fs_lock_on_a_rolled_back_file_never_refuses_its_successor) {
     unlink(g_key_path);
 }
 
+/* The read twins refuse another incarnation, and a gone inode, with
+ * ESTALE and disclose nothing; with the live gen they read. The lookup
+ * twin checks the parent and hands back the child it names with that
+ * child's own value; a missing name stays ENOENT. */
+STM_TEST(fs_if_gen_reads_act_only_on_their_incarnation) {
+    make_tmp("if_gen_reads");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t dir = 0, f = 0, l = 0;
+    STM_ASSERT_OK(stm_inode_alloc(stm_sync_inode_index(stm_fs_sync(fs)), 1,
+                                  (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, "hello", 5));
+    bool rep = false;
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.a", 6,
+                                  (const uint8_t *)"1", 1, 0, &rep));
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, dir, (const uint8_t *)"l", 1,
+                                 (const uint8_t *)"tgt", 3, 0, 0, &l));
+    uint64_t gd = if_gen_gen(fs, dir), gf = if_gen_gen(fs, f);
+    uint64_t gl = if_gen_gen(fs, l);
+    uint8_t buf[64];
+    size_t got = 0;
+
+    STM_ASSERT_ERR(stm_fs_read_if_gen(fs, 1, f, gf + 1u, 0, buf, sizeof buf,
+                                      &got), STM_ESTALE);
+    STM_ASSERT_EQ(got, 0u);
+    STM_ASSERT_OK(stm_fs_read_if_gen(fs, 1, f, gf, 0, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, 5u);
+    STM_ASSERT_MEM_EQ(buf, "hello", 5);
+    STM_ASSERT_ERR(stm_fs_read_if_gen(fs, 1, dir, gd, 0, buf, sizeof buf,
+                                      &got), STM_EINVAL);
+
+    STM_ASSERT_ERR(stm_fs_readlink_if_gen(fs, 1, l, gl + 1u, buf, sizeof buf,
+                                          &got), STM_ESTALE);
+    STM_ASSERT_OK(stm_fs_readlink_if_gen(fs, 1, l, gl, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, 3u);
+    STM_ASSERT_MEM_EQ(buf, "tgt", 3);
+
+    stm_fs_dirent_entry ents[8];
+    uint64_t cur = 0;
+    size_t n = 0;
+    STM_ASSERT_ERR(stm_fs_readdir_if_gen(fs, 1, dir, gd + 1u, dir, 0, &cur,
+                                         ents, 8, &n), STM_ESTALE);
+    STM_ASSERT_EQ(n, 0u);
+    STM_ASSERT_OK(stm_fs_readdir_if_gen(fs, 1, dir, gd, dir, 0, &cur,
+                                        ents, 8, &n));
+    STM_ASSERT_EQ(n, 4u);
+
+    uint8_t v[8];
+    uint32_t vsz = 0;
+    STM_ASSERT_ERR(stm_fs_getxattr_if_gen(fs, 1, f, gf + 1u,
+                                          (const uint8_t *)"user.a", 6,
+                                          v, sizeof v, &vsz), STM_ESTALE);
+    STM_ASSERT_OK(stm_fs_getxattr_if_gen(fs, 1, f, gf,
+                                         (const uint8_t *)"user.a", 6,
+                                         v, sizeof v, &vsz));
+    STM_ASSERT_EQ(vsz, 1u);
+    size_t tl = 0;
+    STM_ASSERT_ERR(stm_fs_listxattr_if_gen(fs, 1, f, gf + 1u, NULL, 0, &tl),
+                   STM_ESTALE);
+    STM_ASSERT_OK(stm_fs_listxattr_if_gen(fs, 1, f, gf, NULL, 0, &tl));
+    STM_ASSERT_TRUE(tl > 0u);
+
+    uint64_t ci = 0;
+    struct stm_inode_value civ;
+    memset(&civ, 0, sizeof civ);
+    STM_ASSERT_ERR(stm_fs_lookup_if_gen(fs, 1, dir, gd + 1u,
+                                        (const uint8_t *)"f", 1, &ci, &civ),
+                   STM_ESTALE);
+    STM_ASSERT_EQ(ci, 0u);
+    STM_ASSERT_OK(stm_fs_lookup_if_gen(fs, 1, dir, gd, (const uint8_t *)"f", 1,
+                                       &ci, &civ));
+    STM_ASSERT_EQ(ci, f);
+    STM_ASSERT_EQ(stm_load_le64(civ.si_gen), gf);
+    STM_ASSERT_ERR(stm_fs_lookup_if_gen(fs, 1, dir, gd,
+                                        (const uint8_t *)"nope", 4, &ci, NULL),
+                   STM_ENOENT);
+    STM_ASSERT_EQ(dir, 1u);
+    STM_ASSERT_ERR(stm_fs_lookup_if_gen(fs, 1, dir, gd + 1u,
+                                        (const uint8_t *)".snaps", 6,
+                                        &ci, &civ), STM_ESTALE);
+    STM_ASSERT_OK(stm_fs_lookup_if_gen(fs, 1, dir, gd,
+                                       (const uint8_t *)".snaps", 6,
+                                       &ci, &civ));
+    STM_ASSERT_EQ(stm_load_le32(civ.si_mode) & (uint32_t)S_IFMT,
+                  (uint32_t)S_IFDIR);
+
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"f", 1));
+    STM_ASSERT_ERR(stm_fs_read_if_gen(fs, 1, f, gf, 0, buf, sizeof buf, &got),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_getxattr_if_gen(fs, 1, f, gf,
+                                          (const uint8_t *)"user.a", 6,
+                                          v, sizeof v, &vsz), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_listxattr_if_gen(fs, 1, f, gf, NULL, 0, &tl),
+                   STM_ESTALE);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")
