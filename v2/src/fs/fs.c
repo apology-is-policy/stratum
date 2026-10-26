@@ -3183,21 +3183,26 @@ static void fs_xattr_read_gap(stm_fs *fs, stm_ebr_thread *ebr)
 /* A reused ino (gen != 0; AllocFresh stamps 0) can still hold records of
  * a previous tenant, keyed by (ds, ino) with no gen: xattrs (a volume
  * written before the free path dropped them, a rollback to such a tree, a
- * free whose drop failed) and extents (a free whose truncate failed; the
- * extent AD binds no gen either, so they would read back as the new
- * file's data). They go before the new inode is linked; a create that
- * cannot clear them refuses rather than hand them on. A failure that
- * persists (a damaged tree under the ino) so refuses every create in the
- * dataset, the allocator handing the same lowest freed ino back each
- * time: fail-closed, by choice. */
+ * free whose drop failed), a directory's dirent records (its tombstones,
+ * whiteouts, or entries of a directory freed below the fs layer; a
+ * directory on the ino would list them) and extents (a free whose
+ * truncate failed; the extent AD binds no gen either, so they would read
+ * back as the new file's data). They go before the new inode is linked,
+ * whatever its type; a create that cannot clear them refuses rather than
+ * hand them on. A failure that persists (a damaged tree under the ino) so
+ * refuses every create in the dataset, the allocator handing the same
+ * lowest freed ino back each time: fail-closed, by choice. */
 static stm_status fs_clean_reused_ino_locked(stm_fs *fs, uint64_t dataset_id,
                                              uint64_t ino, uint64_t gen)
 {
     if (gen == 0u) return STM_OK;
     stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
-    if (!xidx || !eidx) return STM_EINVAL;
+    if (!xidx || !didx || !eidx) return STM_EINVAL;
     stm_status s = stm_xattr_drop_for_ino(xidx, dataset_id, ino, NULL);
+    if (s != STM_OK) return s;
+    s = stm_dirent_drop_for_dir(didx, dataset_id, ino, NULL);
     if (s != STM_OK) return s;
     size_t left = 0;
     s = stm_extent_count_for_ino(eidx, dataset_id, ino, &left);
@@ -3836,7 +3841,8 @@ static bool fs_freed_inode_cleanup_locked(stm_fs *fs,
         /* An empty directory still holds the tombstones of its former
          * entries and any whiteouts (readdir lists those), keyed by its
          * ino alone: a directory reusing the slot would inherit them.
-         * Best-effort, as for rmdir since R73 P2-1. */
+         * Best-effort, as for rmdir since R73 P2-1: the create that
+         * reuses the ino drops them again and refuses if it cannot. */
         stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
         if (didx) (void)stm_dirent_drop_for_dir(didx, dataset_id, ino, NULL);
         return false;

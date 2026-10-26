@@ -11932,6 +11932,79 @@ STM_TEST(fs_freed_dir_leaves_no_dirent_records) {
     reuse_fs_done(fs);
 }
 
+/* A directory freed below the fs layer keeps its dirent records: a live
+ * entry, a tombstone and a whiteout. Whatever create reuses the ino drops
+ * them first, so a directory there lists nothing and a file holds none. */
+STM_TEST(fs_create_drops_dirent_records_a_reused_ino_still_holds) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("reuse_stale_dirents", &dir);
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    stm_dirent_index *didx = stm_sync_dirent_index(stm_fs_sync(fs));
+    uint64_t target = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"tgt", 3,
+                                        0644u, 0, 0, &target));
+
+    for (int kind = 0; kind < 4; kind++) {
+        uint64_t old = 0, got = 0, cino = 0, cgen = 0;
+        uint8_t ctype = 0;
+        STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                         0, 0, &old));
+        STM_ASSERT_OK(stm_dirent_alloc(didx, 1, old,
+                                          (const uint8_t *)"ghost", 5,
+                                          target, 0, STM_DT_REG));
+        STM_ASSERT_OK(stm_dirent_alloc(didx, 1, old,
+                                          (const uint8_t *)"gone", 4,
+                                          target, 0, STM_DT_REG));
+        STM_ASSERT_OK(stm_dirent_unlink(didx, 1, old,
+                                           (const uint8_t *)"gone", 4));
+        STM_ASSERT_OK(stm_dirent_alloc(didx, 1, old,
+                                          (const uint8_t *)"wo", 2,
+                                          target, 0, STM_DT_REG));
+        STM_ASSERT_OK(stm_dirent_whiteout(didx, 1, old,
+                                             (const uint8_t *)"wo", 2));
+        STM_ASSERT_OK(stm_inode_free(iidx, 1, old));
+        STM_ASSERT_OK(stm_dirent_lookup(didx, 1, old,
+                                           (const uint8_t *)"ghost", 5,
+                                           &cino, &cgen, &ctype));
+        STM_ASSERT_EQ(cino, target);
+        switch (kind) {
+        case 0:
+            STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, (const uint8_t *)"cd", 2,
+                                          0755u, 0, 0, &got));
+            break;
+        case 1:
+            STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir,
+                                                (const uint8_t *)"cf", 2,
+                                                0644u, 0, 0, &got));
+            break;
+        case 2:
+            STM_ASSERT_OK(stm_fs_symlink(fs, 1, dir,
+                                            (const uint8_t *)"cs", 2,
+                                            (const uint8_t *)"tgt", 3,
+                                            0, 0, &got));
+            break;
+        default:
+            STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &got));
+            break;
+        }
+        STM_ASSERT_EQ(got, old);
+        STM_ASSERT_EQ(stm_dirent_lookup(didx, 1, got,
+                                           (const uint8_t *)"ghost", 5,
+                                           &cino, &cgen, &ctype),
+                      STM_ENOENT);
+        if (kind == 0) {
+            assert_fresh_dir(fs, got, dir);
+            STM_ASSERT_OK(stm_fs_rmdir(fs, 1, dir, (const uint8_t *)"cd", 2));
+        } else {
+            size_t left = 99;
+            STM_ASSERT_OK(stm_dirent_drop_for_dir(didx, 1, got, &left));
+            STM_ASSERT_EQ(left, (size_t)0);
+        }
+    }
+    reuse_fs_done(fs);
+}
+
 /* The scrub's extent lookup holds no fs->global, so a rollback can retire a
  * dataset's engine while the lookup walks it: the walk's EBR pin is what
  * keeps the retired engine alive until the walk leaves. */

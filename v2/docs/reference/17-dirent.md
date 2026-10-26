@@ -116,7 +116,10 @@ EVERY record (live + tombstone + whiteout) keyed at `(ds, dir_ino,
 counts live records only), once the directory is freed, so a directory
 AllocReused at this
 `dir_ino` inherits neither the tombstone trail (probe budget) nor the
-whiteouts (readdir lists them).
+whiteouts (readdir lists them). That drop is best-effort, and a
+directory freed below the fs layer gets none, so every create handed a
+reused ino (`si_gen != 0`) calls it again before linking the new inode,
+whatever its type, and refuses the create if it fails.
 
 ### Inspection
 
