@@ -822,8 +822,32 @@ Commit is **three-phase** so it composes with the three-phase sync:
 `commit_finalize`. A re-commit of an all-clean tree is a no-op — it
 writes nothing, frees nothing, and returns the unchanged triple.
 
-During the pending-commit window every operation except
-`commit_finalize` / `commit_abort` / `destroy` returns `STM_EBUSY`.
+During the pending-commit window the six serial ops (`insert` /
+`lookup` / `delete` / `scan` / `scan_range` / `stats_get`) wait for it
+to close on the engine's `window_cv`, which `commit_finalize` and
+`commit_abort` broadcast under `serial_mu`, and return `STM_EBUSY` only
+when it is still open after `STM_BTREE_ENGINE_WINDOW_WAIT_MS` (5 s, on
+the monotonic clock). `commit`, `commit_flush`, `get_root`, `verify` and
+`walk_paddrs` return `STM_EBUSY` at once; the `_concurrent` ops go on
+through the window. The wait exists because a commit runs under
+`fs->global` SH as well as EX: CF-4 C's reclaim pair commits beside SH
+callers, whose serial `scan_range` calls (the dirent count and readdir,
+the inode count, the xattr list, the extent walks) would otherwise
+refuse, and the 9P servers hand `STM_EBUSY` to the client. It cannot
+deadlock: the waiter gives up `serial_mu`, and between flush and
+finalize `stm_sync_commit` takes only the dataset, snapshot, CAS and
+repair-log index locks, the allocator's and the devices', none of which
+a serial-op caller holds (the module `idx->lock`s are not among them;
+the dataset's own serial calls run on throwaway engines that never open
+a window), and it runs no serial op itself. The header states this as
+the caller's obligation. Tests: the four
+`engine_serial_*_waits_for_a_*` legs (scan and lookup, clone and legacy
+arm, finalize and abort; the bound set to 60 s, so a close that wakes
+nobody fails on time),
+`engine_serial_ops_refuse_a_window_that_outlasts_the_wait` (all six,
+each only after the bound) and `fs_rename_waits_out_a_commit_window`
+(rename answers `STM_ENOTEMPTY` after the abort lands from another
+thread).
 `destroy` of an engine with an un-finalized flush implicitly aborts —
 the flushed-but-unrooted paddrs are reclaimed, never leaked on disk.
 
@@ -967,11 +991,11 @@ drop_for_dir, xattr drop_for_ino) — goes through
 
 `stm_btree_engine_scan_range_concurrent` (EBR-pinned, no `serial_mu`)
 walks the merged chain + buffer + base view. Its STM_EBUSY contract
-(CF-2c): a seal observed BEFORE any callback fires restarts internally
-against the fresh root (up to `ENG_SEAL_RETRY_MAX`); a seal or chain
-tombstone observed MID-WALK surfaces STM_EBUSY IMMEDIATELY — the walk
-cannot restart once entries were emitted (duplicate emission), and
-only the caller can reset its accumulation state. Callers either
+(CF-2c): a seal, fold or chain tombstone, or a node a commit reused,
+sends the walk again from the fresh root, resuming after the last key
+it delivered, so no key is delivered twice (up to `ENG_SEAL_RETRY_MAX`
+attempts); STM_EBUSY surfaces only past that bound or from the CF-2d
+injection. Callers either
 propagate into an SH-fallback (the R175-F2 read legs) or wrap the
 whole scan in a bounded retry that resets the callback ctx and
 re-enters a fresh EBR pin per attempt
@@ -1305,7 +1329,7 @@ crash-revert path); one (9.6-impl-4b-i) runs against the production
 | Many entries | 3000 keys inserted ascending / descending / shuffled — scan is strictly sorted, every key looks up, commit + reopen + verify round-trips. `engine_many_descending` also pins the byte-balanced-split performance fix |
 | Multi-level | 150 large-key entries force `height >= 3` (the 2-level cap is gone); deep tree commits, reopens, verifies, spot-checks |
 | Commit | re-commit of a clean tree is a no-op (same root, no new nodes); the published gen stays the root's real write gen and the triple reopens; a non-monotonic commit gen → `STM_EINVAL`; incremental commit COWs the root to a new paddr and shares unchanged subtrees — the prior root stays intact and readable |
-| Three-phase commit | deferred-free — a second commit hands back exactly the superseded paddrs (the rewritten leaf + the old root), stamped with the commit gen, and never the shared subtrees (`FreedNodesNotReachable`); a three-commit chain confirms no paddr is freed twice; `commit_flush` + `commit_finalize` publishes the flushed root, and the pending-commit window rejects every other op with `STM_EBUSY`; `commit_abort` reverts to the last durable root and reclaims the flushed nodes — on both a committed tree and a never-committed one; a mid-flush device write error reverts identically (durable root intact, partial nodes reclaimed, engine usable); `destroy` of an un-finalized flush implicitly aborts; phased-API NULL + no-pending argument validation |
+| Three-phase commit | deferred-free — a second commit hands back exactly the superseded paddrs (the rewritten leaf + the old root), stamped with the commit gen, and never the shared subtrees (`FreedNodesNotReachable`); a three-commit chain confirms no paddr is freed twice; `commit_flush` + `commit_finalize` publishes the flushed root, and inside the pending-commit window every other op answers `STM_EBUSY`, the serial ones after their wait; `commit_abort` reverts to the last durable root and reclaims the flushed nodes — on both a committed tree and a never-committed one; a mid-flush device write error reverts identically (durable root intact, partial nodes reclaimed, engine usable); `destroy` of an un-finalized flush implicitly aborts; phased-API NULL + no-pending argument validation |
 | Large-value spill | a small-inline + single-block + multi-block (~200 KiB) value commits / reopens / verifies / round-trips; a value upserted inline→spilled→spilled→inline round-trips each way; **per-value COW** — changing a sibling entry does NOT rewrite an unchanged spilled value's chain (exactly the leaf node superseded), changing the value itself rewrites + supersedes the chain; `commit_abort` of a flush with a fresh multi-block chain reclaims every spill block; a mid-chain device write failure reverts cleanly — durable root intact, every started spill block reclaimed exactly once, no double-free; a tampered spill block is caught by `verify` + `lookup` (`STM_ECORRUPT`); 40 spilled values commit / reopen / verify / look up |
 | Delete (impl-4a) | delete removes a key, siblings survive, a miss is a benign no-op, the delete reopens durable; deleting a spilled-value key supersedes its chain — the next commit frees exactly the chain blocks + the COWed leaf, once each; `commit_abort` after a delete-flush reverts it (the entry returns, the chain is NOT freed); deleting every key of a multi-leaf tree leaves well-formed empty leaves that commit / reopen / verify; deleting one key COWs exactly `height` nodes — the path, never a shared sibling; deleting the only key of a height-1 tree leaves an empty leaf as the durable root — it commits, reopens, verifies, and accepts a fresh insert |
 | Range scan (impl-4a) | `scan_range` over `[lo, hi]` yields exactly the in-range keys ascending, bounds inclusive; a two-prefix tree scanned by prefix yields only that prefix's keys; a multi-level sub-range exercises the child pruning; an empty range (`lo > hi`), a no-match range, and an early-stopping callback all behave; NULL-argument matrix |
@@ -1475,7 +1499,8 @@ corrected write-amp model).
   stays structurally sound — see the 9.8-LF-2 "Concurrent writes (insert
   / delete)" limitation for the full root-cause + fix rationale. The
   wait-free `*_concurrent` EBR readers stay lock-free (they do NOT take
-  serial_mu); the commit ops run under `fs->global` EX. NOT yet closed:
+  serial_mu); the commit ops take it too, OUTER to `commit_mu`, since a
+  commit runs under `fs->global` SH as well as EX. NOT yet closed:
   the reader-vs-in-place-writer torn read for the EBR readers
   (LF-BE-prepend's chain-prepend closes it), and `load_child` lazy
   disk-load thread-safety (the LF-1 cache-warming caveat). Phase 9.8's

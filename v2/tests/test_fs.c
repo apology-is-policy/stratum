@@ -17,6 +17,7 @@
 #include <stratum/alloc.h>
 #include <stratum/block_inject.h>
 #include <stratum/bootstrap.h>
+#include <stratum/btree_engine_testing.h>
 #include <stratum/cas.h>
 #include <stratum/cdc.h>
 #include <stratum/dataset.h>
@@ -11450,10 +11451,10 @@ STM_TEST(fs_churn_reuse_beside_a_wait_free_reader) {
 }
 
 /* rename over an existing directory may replace it only when it is empty.
- * A commit's flush..finalize window (CF-4 C runs its reclaim commits under
- * fs->global SH, beside an SH rename) makes the destination's entry count
- * fail with STM_EBUSY; rename must refuse with that error rather than read
- * the failure as "empty" and replace the directory and its entries. */
+ * A commit window that outlasts the serial engine ops' wait (cut short
+ * here) makes the destination's entry count fail with STM_EBUSY; rename
+ * must refuse with that error rather than read the failure as "empty" and
+ * replace the directory and its entries. */
 STM_TEST(fs_rename_refuses_when_the_dst_count_fails) {
     make_tmp("rename_count_fails");
     stm_fs_format_opts fopts = default_format_opts();
@@ -11482,14 +11483,105 @@ STM_TEST(fs_rename_refuses_when_the_dst_count_fails) {
     stm_dataset_index *di = stm_sync_dataset_index(sync);
     STM_ASSERT_OK(stm_dataset_index_commit_engines_flush(
         di, stm_sync_current_gen(sync)));
+    stm_btree_engine_set_window_wait_for_test(1000000u);
     size_t n = 0;
     STM_ASSERT_EQ(stm_dirent_count_for_dir(stm_sync_dirent_index(sync), ds,
                                            dst, &n), STM_EBUSY);
     STM_ASSERT_EQ(stm_fs_rename(fs, ds, root, (const uint8_t *)"src", 3,
                                 root, (const uint8_t *)"dst", 3, 0),
                   STM_EBUSY);
+    stm_btree_engine_set_window_wait_for_test(0);
     (void)stm_dataset_index_commit_engines_abort(di);
 
+    uint64_t got = 0, k = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, ds, root, (const uint8_t *)"dst", 3, &got));
+    STM_ASSERT_EQ(got, dst);
+    STM_ASSERT_OK(stm_fs_lookup(fs, ds, dst, (const uint8_t *)"kid", 3, &k));
+    STM_ASSERT_EQ(k, kid);
+    STM_ASSERT_OK(stm_fs_lookup(fs, ds, root, (const uint8_t *)"src", 3, &got));
+    STM_ASSERT_EQ(got, src);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Beside an open commit window (CF-4 C runs its reclaim commits under
+ * fs->global SH, beside an SH rename) rename waits for the window to close
+ * and answers from the tree the close left: the destination still holds
+ * its entry, so STM_ENOTEMPTY, not the window's STM_EBUSY. The bound is
+ * set long, so an abort that wakes nobody fails on time. */
+static uint64_t fs_mono_ns(void)
+{
+    struct timespec ts = { 0 };
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+typedef struct {
+    stm_fs    *fs;
+    uint64_t   ds, root;
+    stm_status rc;
+    uint64_t   done_ns;
+} rename_in_window;
+
+static void *rename_in_window_thread(void *arg)
+{
+    rename_in_window *r = arg;
+    r->rc = stm_fs_rename(r->fs, r->ds, r->root, (const uint8_t *)"src", 3,
+                          r->root, (const uint8_t *)"dst", 3, 0);
+    r->done_ns = fs_mono_ns();
+    return NULL;
+}
+
+static void fs_window_wait_hook(stm_btree_engine *eng, void *arg)
+{
+    (void)eng;
+    atomic_fetch_add((atomic_int *)arg, 1);
+}
+
+STM_TEST(fs_rename_waits_out_a_commit_window) {
+    make_tmp("rename_window_wait");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t ds = 0, root = 0, src = 0, dst = 0, kid = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "renw", &ds));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0755u, 0, 0, &root));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, ds, root, (const uint8_t *)"src", 3,
+                               040755u, 0, 0, &src));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, ds, root, (const uint8_t *)"dst", 3,
+                               040755u, 0, 0, &dst));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds, dst, (const uint8_t *)"kid", 3,
+                                     0100644u, 0, 0, &kid));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_sync *sync = stm_fs_sync(fs);
+    stm_dataset_index *di = stm_sync_dataset_index(sync);
+    STM_ASSERT_OK(stm_dataset_index_commit_engines_flush(
+        di, stm_sync_current_gen(sync)));
+
+    atomic_int waits;
+    atomic_init(&waits, 0);
+    stm_btree_engine_set_window_wait_hook_for_test(fs_window_wait_hook,
+                                                   &waits);
+    stm_btree_engine_set_window_wait_for_test(60ull * 1000000000ull);
+    rename_in_window r = { .fs = fs, .ds = ds, .root = root };
+    pthread_t t;
+    STM_ASSERT_EQ(pthread_create(&t, NULL, rename_in_window_thread, &r), 0);
+    for (int i = 0; i < 5000 && atomic_load(&waits) == 0; i++) usleep(1000);
+    bool parked = atomic_load(&waits) != 0;
+    uint64_t closed_ns = fs_mono_ns();
+    STM_ASSERT_OK(stm_dataset_index_commit_engines_abort(di));
+    pthread_join(t, NULL);
+    stm_btree_engine_set_window_wait_hook_for_test(NULL, NULL);
+    stm_btree_engine_set_window_wait_for_test(0);
+
+    STM_ASSERT_TRUE(parked);
+    STM_ASSERT_EQ(r.rc, STM_ENOTEMPTY);
+    STM_ASSERT_TRUE(r.done_ns >= closed_ns);
+    STM_ASSERT_TRUE(r.done_ns - closed_ns < 10ull * 1000000000ull);
     uint64_t got = 0, k = 0;
     STM_ASSERT_OK(stm_fs_lookup(fs, ds, root, (const uint8_t *)"dst", 3, &got));
     STM_ASSERT_EQ(got, dst);

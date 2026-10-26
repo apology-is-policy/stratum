@@ -32,7 +32,9 @@
 
 #include <stratum/ebr.h>
 
+#include <errno.h>
 #include <sched.h>
+#include <time.h>
 
 #include <stratum/bootstrap.h>
 
@@ -84,6 +86,24 @@ static stm_status chain_resolve_for_key(const eng_node *n,
                                          bool *out_sealed);
 static void cache_reset(stm_btree_engine *eng);
 
+/* Window waits run on CLOCK_MONOTONIC, so a step of the wall clock neither
+ * stretches nor cuts them; macOS has no condattr clock and takes a
+ * relative timeout instead (serial_wait_window). */
+static int window_cv_init(pthread_cond_t *cv)
+{
+#if defined(__APPLE__)
+    return pthread_cond_init(cv, NULL);
+#else
+    pthread_condattr_t a;
+    int rc = pthread_condattr_init(&a);
+    if (rc != 0) return rc;
+    rc = pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+    if (rc == 0) rc = pthread_cond_init(cv, &a);
+    (void)pthread_condattr_destroy(&a);
+    return rc;
+#endif
+}
+
 /* ========================================================================= */
 /* Lifecycle.                                                                  */
 /* ========================================================================= */
@@ -114,6 +134,13 @@ static stm_status engine_alloc(const stm_btree_store_vtable *vt, void *vt_ctx,
     }
     /* P9.5-PARALLEL-3 fix: serial-path mutual exclusion (see engine_internal.h). */
     if (pthread_mutex_init(&eng->serial_mu, NULL) != 0) {
+        pthread_mutex_destroy(&eng->commit_mu);
+        eng_cache_destroy(&eng->cache);
+        free(eng);
+        return STM_ENOMEM;
+    }
+    if (window_cv_init(&eng->window_cv) != 0) {
+        pthread_mutex_destroy(&eng->serial_mu);
         pthread_mutex_destroy(&eng->commit_mu);
         eng_cache_destroy(&eng->cache);
         free(eng);
@@ -212,6 +239,7 @@ static void engine_free_ram_cb(void *eng_)
     eng_node_free_recursive(eng->root);    /* frees every in-memory node */
     eng_cache_destroy(&eng->cache);        /* frees the index, not nodes */
     paddr_vec_free(&eng->orphaned_spill_blocks);
+    pthread_cond_destroy(&eng->window_cv);
     pthread_mutex_destroy(&eng->serial_mu);
     pthread_mutex_destroy(&eng->commit_mu);
     free(eng);
@@ -472,6 +500,75 @@ static stm_status load_child(stm_btree_engine *eng, eng_node *node,
 }
 
 /* ========================================================================= */
+/* The commit window, as the serial ops see it.                                */
+/* ========================================================================= */
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static uint64_t window_wait_ns_for_test;
+static stm_btree_engine_window_wait_hook window_wait_hook;
+static void *window_wait_hook_arg;
+
+void stm_btree_engine_set_window_wait_for_test(uint64_t ns)
+{
+    window_wait_ns_for_test = ns;
+}
+
+void stm_btree_engine_set_window_wait_hook_for_test(
+    stm_btree_engine_window_wait_hook fn, void *arg)
+{
+    window_wait_hook = fn;
+    window_wait_hook_arg = arg;
+}
+#endif
+
+static bool window_now_ns(uint64_t *out)
+{
+    struct timespec ts = { 0 };
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return false;
+    *out = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return true;
+}
+
+/*
+ * A serial op that meets an open commit window (flushed, not yet finalized
+ * or aborted) waits for it to close rather than refuse: under fs->global SH
+ * the window is a CF-4 C reclaim commit beside the caller, and a refusal
+ * would reach the 9P client. STM_EBUSY only past the bound, or when the
+ * clock or the wait itself fails. The caller holds serial_mu and nothing
+ * the thread closing the window takes first (btree_engine.h, commit_flush).
+ */
+static stm_status serial_wait_window(stm_btree_engine *eng)
+{
+    if (!eng->pending.active) return STM_OK;
+    uint64_t bound = (uint64_t)STM_BTREE_ENGINE_WINDOW_WAIT_MS * 1000000ull;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (window_wait_ns_for_test != 0) bound = window_wait_ns_for_test;
+#endif
+    uint64_t now = 0;
+    if (!window_now_ns(&now)) return STM_EBUSY;
+    uint64_t deadline = now + bound;
+    while (eng->pending.active && now < deadline) {
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (window_wait_hook) window_wait_hook(eng, window_wait_hook_arg);
+#endif
+#if defined(__APPLE__)
+        uint64_t left = deadline - now;
+        struct timespec rel = { .tv_sec  = (time_t)(left / 1000000000ull),
+                                .tv_nsec = (long)(left % 1000000000ull) };
+        int rc = pthread_cond_timedwait_relative_np(&eng->window_cv,
+                                                    &eng->serial_mu, &rel);
+#else
+        struct timespec at = { .tv_sec  = (time_t)(deadline / 1000000000ull),
+                               .tv_nsec = (long)(deadline % 1000000000ull) };
+        int rc = pthread_cond_timedwait(&eng->window_cv, &eng->serial_mu, &at);
+#endif
+        if (rc != 0 && rc != ETIMEDOUT && rc != EINTR) break;
+        if (!window_now_ns(&now)) break;
+    }
+    return eng->pending.active ? STM_EBUSY : STM_OK;
+}
+
+/* ========================================================================= */
 /* Insert.                                                                     */
 /* ========================================================================= */
 
@@ -560,7 +657,7 @@ static stm_status engine_insert_locked(stm_btree_engine *eng,
     if (spilled_entry > ENG_MAX_ITEM_BYTES) return STM_ERANGE;  /* key too big */
 
     /* No mutation inside a flushed-but-unfinalized commit window. */
-    if (eng->pending.active)        return STM_EBUSY;
+    if (serial_wait_window(eng) != STM_OK) return STM_EBUSY;
 
     eng_node *root = NULL;
     stm_status s = load_root_locked(eng, &root);
@@ -641,7 +738,7 @@ static stm_status engine_lookup_locked(stm_btree_engine *eng,
     *out_found     = false;
     *out_value     = NULL;
     *out_value_len = 0;
-    if (eng->pending.active) return STM_EBUSY;
+    if (serial_wait_window(eng) != STM_OK) return STM_EBUSY;
 
     eng_node *node = NULL;
     stm_status s = load_root_locked(eng, &node);
@@ -1130,7 +1227,7 @@ static stm_status engine_delete_locked(stm_btree_engine *eng,
     if (key_len && !key) return STM_EINVAL;
     if (out_found) *out_found = false;
     /* The arg-shape checks above pre-empt STM_EBUSY (R135 doctrine). */
-    if (eng->pending.active) return STM_EBUSY;
+    if (serial_wait_window(eng) != STM_OK) return STM_EBUSY;
 
     eng_node *root = NULL;
     stm_status s = load_root_locked(eng, &root);
@@ -3078,6 +3175,7 @@ stm_status stm_btree_engine_commit_finalize(stm_btree_engine *eng)
     pthread_mutex_lock(&eng->commit_mu);
     stm_status s = commit_finalize_locked(eng);
     pthread_mutex_unlock(&eng->commit_mu);
+    pthread_cond_broadcast(&eng->window_cv);    /* serial ops waiting it out */
     pthread_mutex_unlock(&eng->serial_mu);
     return s;
 }
@@ -3124,6 +3222,7 @@ stm_status stm_btree_engine_commit_abort(stm_btree_engine *eng)
     pthread_mutex_lock(&eng->commit_mu);
     stm_status s = commit_abort_locked(eng);
     pthread_mutex_unlock(&eng->commit_mu);
+    pthread_cond_broadcast(&eng->window_cv);    /* serial ops waiting it out */
     pthread_mutex_unlock(&eng->serial_mu);
     return s;
 }
@@ -3589,7 +3688,7 @@ static stm_status engine_scan_locked(stm_btree_engine *eng,
                                   stm_btree_engine_iter_cb cb, void *ctx)
 {
     if (!eng || !cb) return STM_EINVAL;
-    if (eng->pending.active) return STM_EBUSY;
+    if (serial_wait_window(eng) != STM_OK) return STM_EBUSY;
     eng_node *root = NULL;
     stm_status s = load_root_locked(eng, &root);
     if (s != STM_OK) return s;
@@ -3618,7 +3717,7 @@ static stm_status engine_scan_range_locked(stm_btree_engine *eng,
     if (!eng || !cb)            return STM_EINVAL;
     if (lo_key_len && !lo_key)  return STM_EINVAL;
     if (hi_key_len && !hi_key)  return STM_EINVAL;
-    if (eng->pending.active)    return STM_EBUSY;
+    if (serial_wait_window(eng) != STM_OK) return STM_EBUSY;
 
     eng_node *root = NULL;
     stm_status s = load_root_locked(eng, &root);
@@ -3759,7 +3858,7 @@ static stm_status engine_stats_get_locked(stm_btree_engine *eng,
                                        stm_btree_engine_stats *out)
 {
     if (!eng || !out) return STM_EINVAL;
-    if (eng->pending.active) return STM_EBUSY;
+    if (serial_wait_window(eng) != STM_OK) return STM_EBUSY;
 
     /* Snapshot the node-I/O counters BEFORE the walk below, so the
      * getter's own load_root/load_child/scan reads do not count into

@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* stm_bptr_kind values (super.h) — used to forge child bptrs by hand. */
@@ -1026,7 +1027,8 @@ STM_TEST(engine_commit_deferred_free) {
 STM_TEST(engine_commit_phased_flush_finalize) {
     /* The three-phase commit: flush returns the prospective root and
      * opens a pending-commit window in which every op except finalize/
-     * abort is STM_EBUSY; finalize publishes the flushed root. */
+     * abort is STM_EBUSY (the serial ones once their wait runs out, cut
+     * short here); finalize publishes the flushed root. */
     memstore ms; memstore_init(&ms);
     stm_btree_crypt_ctx cx = test_cx();
     stm_btree_engine *eng = NULL;
@@ -1043,6 +1045,7 @@ STM_TEST(engine_commit_phased_flush_finalize) {
     STM_ASSERT_EQ(fgg, UINT64_C(7));
 
     /* The window: every op except finalize/abort is STM_EBUSY. */
+    stm_btree_engine_set_window_wait_for_test(1000000u);
     uint64_t gp = 0, gg = 0;
     uint8_t  gc[32];
     STM_ASSERT_ERR(stm_btree_engine_get_root(eng, &gp, &gg, gc), STM_EBUSY);
@@ -1063,6 +1066,7 @@ STM_TEST(engine_commit_phased_flush_finalize) {
     STM_ASSERT_ERR(stm_btree_engine_commit(eng, 8, &xp, xc), STM_EBUSY);
     STM_ASSERT_ERR(stm_btree_engine_commit_flush(eng, 8, &xp, &xg, xc),
                    STM_EBUSY);
+    stm_btree_engine_set_window_wait_for_test(0);
 
     /* Final phase — publishes the flushed root. */
     STM_ASSERT_OK(stm_btree_engine_commit_finalize(eng));
@@ -7015,6 +7019,229 @@ STM_TEST(engine_scan_concurrent_resumes_past_a_mid_walk_tombstone) {
         (void)stm_ebr_try_advance();
     memstore_destroy(&ms);
     stm_ebr_thread_free(me);
+}
+
+/* A serial op that meets an open commit window waits for the finalize or
+ * abort that closes it, then answers from the tree the close left. The
+ * bound is set long, so a close that wakes nobody shows as a wait to the
+ * bound rather than as a pass. */
+static uint64_t window_mono_ns(void)
+{
+    struct timespec ts = { 0 };
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void window_wait_count_hook(stm_btree_engine *eng, void *arg)
+{
+    (void)eng;
+    atomic_fetch_add((atomic_int *)arg, 1);
+}
+
+static int window_count_cb(const void *key, size_t key_len,
+                           const void *value, size_t value_len, void *ctx)
+{
+    (void)key; (void)key_len; (void)value; (void)value_len;
+    (*(uint64_t *)ctx)++;
+    return 0;
+}
+
+typedef struct {
+    stm_btree_engine *eng;
+    bool              scan;
+    stm_status        rc;
+    bool              found;
+    uint64_t          seen;
+    uint64_t          done_ns;
+} window_op;
+
+static void *window_op_thread(void *arg)
+{
+    window_op *w = arg;
+    if (w->scan) {
+        uint8_t lo[4], hi[4];
+        be32_key(0u, lo);
+        be32_key(UINT32_MAX, hi);
+        w->rc = stm_btree_engine_scan_range(w->eng, lo, 4, hi, 4,
+                                            window_count_cb, &w->seen);
+    } else {
+        uint8_t key[4];
+        be32_key(1u, key);
+        void *v = NULL;
+        size_t vl = 0;
+        w->rc = stm_btree_engine_lookup(w->eng, key, 4, &w->found, &v, &vl);
+        free(v);
+    }
+    w->done_ns = window_mono_ns();
+    return NULL;
+}
+
+static void serial_op_waits_out_the_window(bool latched, bool finalize,
+                                           bool scan)
+{
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+    if (!eng) { memstore_destroy(&ms); stm_ebr_thread_free(me); return; }
+    for (uint32_t i = 0; i < 64; i++) {
+        uint8_t key[4];
+        be32_key(2u * i, key);
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, key, 4, "a", 1));
+    }
+    uint64_t rp1 = 0;
+    uint8_t  rc1[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp1, rc1));
+
+    uint8_t ck[4];
+    be32_key(1u, ck);
+    if (latched) {
+        stm_ebr_enter(me);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, ck, 4,
+                                                         "b", 1));
+        stm_ebr_exit(me);
+    } else {
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, ck, 4, "b", 1));
+    }
+    uint64_t rp = 0, rg = 0;
+    uint8_t  rc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 2, &rp, &rg, rc));
+
+    atomic_int waits;
+    atomic_init(&waits, 0);
+    stm_btree_engine_set_window_wait_hook_for_test(window_wait_count_hook,
+                                                   &waits);
+    stm_btree_engine_set_window_wait_for_test(60ull * 1000000000ull);
+
+    window_op w = { .eng = eng, .scan = scan };
+    pthread_t t;
+    STM_ASSERT_EQ(pthread_create(&t, NULL, window_op_thread, &w), 0);
+    for (int i = 0; i < 5000 && atomic_load(&waits) == 0; i++) usleep(1000);
+    bool parked = atomic_load(&waits) != 0;
+    uint64_t closed_ns = window_mono_ns();
+    STM_ASSERT_OK(finalize ? stm_btree_engine_commit_finalize(eng)
+                           : stm_btree_engine_commit_abort(eng));
+    pthread_join(t, NULL);
+    stm_btree_engine_set_window_wait_hook_for_test(NULL, NULL);
+    stm_btree_engine_set_window_wait_for_test(0);
+
+    STM_ASSERT_TRUE(parked);
+    STM_ASSERT_OK(w.rc);
+    STM_ASSERT_TRUE(w.done_ns >= closed_ns);
+    STM_ASSERT_TRUE(w.done_ns - closed_ns < 10ull * 1000000000ull);
+    /* A legacy abort drops the uncommitted insert with the in-memory tree;
+     * a clone abort leaves its delta live. */
+    bool kept = finalize || latched;
+    if (scan) STM_ASSERT_EQ(w.seen, (uint64_t)(kept ? 65 : 64));
+    else      STM_ASSERT_TRUE(w.found == kept);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
+STM_TEST(engine_serial_scan_waits_for_a_clone_finalize) {
+    serial_op_waits_out_the_window(true, true, true);
+}
+
+STM_TEST(engine_serial_lookup_waits_for_a_clone_abort) {
+    serial_op_waits_out_the_window(true, false, false);
+}
+
+STM_TEST(engine_serial_lookup_waits_for_a_legacy_finalize) {
+    serial_op_waits_out_the_window(false, true, false);
+}
+
+STM_TEST(engine_serial_scan_waits_for_a_legacy_abort) {
+    serial_op_waits_out_the_window(false, false, true);
+}
+
+/* A window that outlasts the bound still answers STM_EBUSY, from every
+ * serial op and only once the wait has run out; outside a window nothing
+ * waits. */
+STM_TEST(engine_serial_ops_refuse_a_window_that_outlasts_the_wait) {
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+    if (!eng) { memstore_destroy(&ms); return; }
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "alpha", 5, "one", 3));
+
+    atomic_int waits;
+    atomic_init(&waits, 0);
+    stm_btree_engine_set_window_wait_hook_for_test(window_wait_count_hook,
+                                                   &waits);
+    const uint64_t bound = 20ull * 1000000ull;
+    stm_btree_engine_set_window_wait_for_test(bound);
+
+    bool found = false;
+    void *val = NULL;
+    size_t vlen = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "alpha", 5, &found, &val,
+                                          &vlen));
+    free(val);
+    val = NULL;
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ(atomic_load(&waits), 0);
+
+    uint64_t cp = 0;
+    uint8_t  cc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &cp, cc));
+    STM_ASSERT_OK(stm_btree_engine_insert(eng, "gamma", 5, "three", 5));
+    uint64_t fp = 0, fg = 0;
+    uint8_t  fc[32];
+    STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 2, &fp, &fg, fc));
+
+    uint64_t n = 0;
+    stm_btree_engine_stats st;
+    for (int op = 0; op < 6; op++) {
+        int before = atomic_load(&waits);
+        uint64_t t0 = window_mono_ns();
+        stm_status s;
+        switch (op) {
+        case 0:
+            s = stm_btree_engine_insert(eng, "beta", 4, "two", 3);
+            break;
+        case 1:
+            s = stm_btree_engine_lookup(eng, "alpha", 5, &found, &val, &vlen);
+            break;
+        case 2:
+            s = stm_btree_engine_delete(eng, "alpha", 5, &found);
+            break;
+        case 3:
+            s = stm_btree_engine_scan(eng, window_count_cb, &n);
+            break;
+        case 4:
+            s = stm_btree_engine_scan_range(eng, "a", 1, "z", 1,
+                                            window_count_cb, &n);
+            break;
+        default:
+            s = stm_btree_engine_stats_get(eng, &st);
+            break;
+        }
+        uint64_t waited = window_mono_ns() - t0;
+        STM_ASSERT_ERR(s, STM_EBUSY);
+        STM_ASSERT_TRUE(waited >= bound);
+        STM_ASSERT_TRUE(waited < 100u * bound);
+        STM_ASSERT_TRUE(atomic_load(&waits) > before);
+    }
+    STM_ASSERT_TRUE(val == NULL);
+    STM_ASSERT_EQ(n, (uint64_t)0);
+    stm_btree_engine_set_window_wait_hook_for_test(NULL, NULL);
+    stm_btree_engine_set_window_wait_for_test(0);
+
+    STM_ASSERT_OK(stm_btree_engine_commit_abort(eng));
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, "alpha", 5, &found, &val,
+                                          &vlen));
+    free(val);
+    STM_ASSERT_TRUE(found);
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
 }
 
 STM_TEST_MAIN("btree_engine")

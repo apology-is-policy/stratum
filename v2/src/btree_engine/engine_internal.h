@@ -706,6 +706,11 @@ struct stm_btree_engine {
      * the mini-consolidation all co-hold them that way. */
     pthread_mutex_t       serial_mu;
 
+    /* Broadcast under serial_mu when a commit window closes (finalize or
+     * abort); a serial op that finds one open waits on it, bounded, rather
+     * than refuse (serial_wait_window). */
+    pthread_cond_t        window_cv;
+
     _Atomic(uint64_t)     next_delta_seq;
     _Atomic(eng_node *)   mvcc_root;
 

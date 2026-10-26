@@ -43,6 +43,17 @@ void stm_btree_engine_set_resume_hook_for_test(
 typedef void (*stm_btree_engine_heal_hook)(stm_btree_engine *eng, void *arg);
 void stm_btree_engine_set_heal_hook_for_test(stm_btree_engine_heal_hook fn,
                                              void *arg);
+
+/* Replaces STM_BTREE_ENGINE_WINDOW_WAIT_MS for every engine with `ns`
+ * nanoseconds; 0 restores it. */
+void stm_btree_engine_set_window_wait_for_test(uint64_t ns);
+
+/* Called by a serial op each time it is about to wait for a commit window
+ * to close, holding serial_mu (which the wait then gives up). */
+typedef void (*stm_btree_engine_window_wait_hook)(stm_btree_engine *eng,
+                                                  void *arg);
+void stm_btree_engine_set_window_wait_hook_for_test(
+    stm_btree_engine_window_wait_hook fn, void *arg);
 #endif
 
 #ifdef __cplusplus
