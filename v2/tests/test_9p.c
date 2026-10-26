@@ -5072,8 +5072,8 @@ static void gap_fix_down(gap_fix *gf)
 }
 
 /* Session 2 unlinks "x" and creates "y" on the same ino, open RDWR as
- * its fid 202 and holding "YYYY". */
-static void gap_swap_x_for_y(gap_fix *gf)
+ * its fid 202 and holding `data` (when not NULL). */
+static void gap_swap_x_for_y_holding(gap_fix *gf, const char *data)
 {
     uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
     uint32_t rlen = 0, sz = 0;
@@ -5086,16 +5086,35 @@ static void gap_swap_x_for_y(gap_fix *gf)
     STM_ASSERT_OK(stm_9p_server_handle(gf->s2, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
     STM_ASSERT_EQ(qid_ino(resp + 7), gf->ino_x);
-    sz = build_twrite(req, 903, 202, 0, "YYYY", 4);
-    STM_ASSERT_OK(stm_9p_server_handle(gf->s2, req, sz, resp, RBUF, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    if (data) {
+        sz = build_twrite(req, 903, 202, 0, data, (uint32_t)strlen(data));
+        STM_ASSERT_OK(stm_9p_server_handle(gf->s2, req, sz, resp, RBUF,
+                                           &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    }
     free(req); free(resp);
 }
 
-/* Runs `op` on session 1, parked where it first reaches `ino` -- right
- * after its freshness check, or (at_step) right after a walk step --
- * while `swap` runs on session 2; `in_gap` (optional) then runs more. */
-static void gap_run_at(gap_fix *gf, gap_op *op, uint64_t ino, bool at_step,
+static void gap_swap_x_for_y(gap_fix *gf)
+{
+    gap_swap_x_for_y_holding(gf, "YYYY");
+}
+
+static void gap_swap_x_for_empty_y(gap_fix *gf)
+{
+    gap_swap_x_for_y_holding(gf, NULL);
+}
+
+typedef enum {
+    GAP_AT_FRESH,       /* right after a freshness check passes */
+    GAP_AT_STEP,        /* right after a walk step */
+    GAP_AT_RESTAT,      /* after an op, before the inode is read back */
+} gap_at;
+
+/* Runs `op` on session 1, parked where it first reaches `ino` at the
+ * point `at` names, while `swap` runs on session 2; `in_gap` (optional)
+ * then runs more. */
+static void gap_run_at(gap_fix *gf, gap_op *op, uint64_t ino, gap_at at,
                        void (*swap)(gap_fix *), void (*in_gap)(gap_fix *))
 {
     gap_ctl g;
@@ -5104,8 +5123,9 @@ static void gap_run_at(gap_fix *gf, gap_op *op, uint64_t ino, bool at_step,
     pthread_cond_init(&g.cv, NULL);
     g.ino   = ino;
     g.armed = true;
-    if (at_step) stm_9p_server_set_step_hook(gap_fresh, &g);
-    else         stm_9p_server_set_fresh_hook(gap_fresh, &g);
+    if (at == GAP_AT_STEP)        stm_9p_server_set_step_hook(gap_fresh, &g);
+    else if (at == GAP_AT_RESTAT) stm_9p_server_set_restat_hook(gap_fresh, &g);
+    else                          stm_9p_server_set_fresh_hook(gap_fresh, &g);
     op->s = gf->s1;
     pthread_t th;
     STM_ASSERT_EQ(pthread_create(&th, NULL, gap_op_run, op), 0);
@@ -5123,6 +5143,7 @@ static void gap_run_at(gap_fix *gf, gap_op *op, uint64_t ino, bool at_step,
     pthread_join(th, NULL);
     stm_9p_server_set_fresh_hook(NULL, NULL);
     stm_9p_server_set_step_hook(NULL, NULL);
+    stm_9p_server_set_restat_hook(NULL, NULL);
     pthread_cond_destroy(&g.cv);
     pthread_mutex_destroy(&g.mu);
 }
@@ -5130,7 +5151,7 @@ static void gap_run_at(gap_fix *gf, gap_op *op, uint64_t ino, bool at_step,
 /* The freshness gap with session 2 swapping "x" for "y". */
 static void gap_run(gap_fix *gf, gap_op *op, void (*in_gap)(gap_fix *))
 {
-    gap_run_at(gf, op, gf->ino_x, false, gap_swap_x_for_y, in_gap);
+    gap_run_at(gf, op, gf->ino_x, GAP_AT_FRESH, gap_swap_x_for_y, in_gap);
 }
 
 static void gap_assert_estale(const gap_op *op)
@@ -5338,16 +5359,19 @@ static void gap_fix_dir(gap_fix *gf)
     walk_to(gf->s1, 100, 104, "d");
 }
 
-/* Session 2 removes "d" and makes "e" on the same ino, holding "n". */
+/* Session 2 removes "d" and makes "e" on the same ino, holding the file
+ * "n" and the empty directory "s". */
 static void gap_swap_d_for_e(gap_fix *gf)
 {
-    uint64_t e = 0, n = 0;
+    uint64_t e = 0, n = 0, sd = 0;
     STM_ASSERT_OK(stm_fs_rmdir(gf->fs, 1, 1, (const uint8_t *)"d", 1));
     STM_ASSERT_OK(stm_fs_mkdir(gf->fs, 1, 1, (const uint8_t *)"e", 1, 0755u,
                                0, 0, &e));
     STM_ASSERT_EQ(e, gf->ino_tgt);
     STM_ASSERT_OK(stm_fs_create_file(gf->fs, 1, e, (const uint8_t *)"n", 1,
                                      0644u, 0, 0, &n));
+    STM_ASSERT_OK(stm_fs_mkdir(gf->fs, 1, e, (const uint8_t *)"s", 1, 0755u,
+                               0, 0, &sd));
 }
 
 /* Tread through the freed fid must not return "y"'s bytes. */
@@ -5375,7 +5399,7 @@ STM_TEST(p9_readdir_through_a_dir_fid_freed_in_the_gap_answers_estale) {
     free(req); free(resp);
     gap_op *op = calloc(1, sizeof *op);
     op->sz = build_treaddir(op->req, 5, 104, 0, 4096);
-    gap_run_at(&gf, op, gf.ino_tgt, false, gap_swap_d_for_e, NULL);
+    gap_run_at(&gf, op, gf.ino_tgt, GAP_AT_FRESH, gap_swap_d_for_e, NULL);
     gap_assert_estale(op);
     free(op);
     gap_fix_down(&gf);
@@ -5407,7 +5431,7 @@ STM_TEST(p9_readlink_through_a_fid_freed_in_the_gap_answers_estale) {
     gap_fix_link(&gf);
     gap_op *op = calloc(1, sizeof *op);
     op->sz = build_treadlink(op->req, 4, 104);
-    gap_run_at(&gf, op, gf.ino_tgt, false, gap_swap_l_for_m, NULL);
+    gap_run_at(&gf, op, gf.ino_tgt, GAP_AT_FRESH, gap_swap_l_for_m, NULL);
     gap_assert_estale(op);
     free(op);
     gap_fix_down(&gf);
@@ -5454,7 +5478,7 @@ static void gap_walk_leg(const char *fixture, const char *comp)
     gap_op *op = calloc(1, sizeof *op);
     const char *path[] = { comp };
     op->sz = build_twalk(op->req, 4, 104, 105, 1, path);
-    gap_run_at(&gf, op, gf.ino_tgt, false, gap_swap_d_for_e, NULL);
+    gap_run_at(&gf, op, gf.ino_tgt, GAP_AT_FRESH, gap_swap_d_for_e, NULL);
     gap_assert_estale(op);
     free(op);
     gap_fix_down(&gf);
@@ -5475,7 +5499,7 @@ STM_TEST(p9_walk_never_steps_into_a_dir_freed_mid_walk) {
     gap_op *op = calloc(1, sizeof *op);
     const char *path[] = { "d", "n" };
     op->sz = build_twalk(op->req, 4, 100, 105, 2, path);
-    gap_run_at(&gf, op, gf.ino_tgt, true, gap_swap_d_for_e, NULL);
+    gap_run_at(&gf, op, gf.ino_tgt, GAP_AT_STEP, gap_swap_d_for_e, NULL);
     STM_ASSERT_OK(op->rc);
     STM_ASSERT_EQ(op->resp[4], STM_9P_RWALK);
     STM_ASSERT_EQ(load_u16(op->resp + 7), 1u);
@@ -5531,9 +5555,273 @@ STM_TEST(p9_dotdot_walk_never_steps_into_a_dir_freed_mid_walk) {
     gap_op *op = calloc(1, sizeof *op);
     const char *path[] = { ".." };
     op->sz = build_twalk(op->req, 5, 104, 105, 1, path);
-    gap_run_at(&gf, op, gf.ino_tgt, true, gap_rebuild_ab, NULL);
+    gap_run_at(&gf, op, gf.ino_tgt, GAP_AT_STEP, gap_rebuild_ab, NULL);
     STM_ASSERT_OK(op->rc);
     STM_ASSERT_EQ(op->resp[4], STM_9P_RLERROR);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* ── the namespace ops in the gap (PX-16 part 3) ──────────────────────── */
+
+/* "e" (on "d"'s ino) still holds "n" and "s" and no "c"; the root
+ * still holds "x" and no "c". */
+static void gap_assert_e_untouched(gap_fix *gf)
+{
+    uint64_t i = 0;
+    STM_ASSERT_OK(stm_fs_lookup(gf->fs, 1, gf->ino_tgt,
+                                (const uint8_t *)"n", 1, &i));
+    STM_ASSERT_OK(stm_fs_lookup(gf->fs, 1, gf->ino_tgt,
+                                (const uint8_t *)"s", 1, &i));
+    STM_ASSERT_ERR(stm_fs_lookup(gf->fs, 1, gf->ino_tgt,
+                                 (const uint8_t *)"c", 1, &i), STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_lookup(gf->fs, 1, 1, (const uint8_t *)"x", 1, &i));
+    STM_ASSERT_ERR(stm_fs_lookup(gf->fs, 1, 1, (const uint8_t *)"c", 1, &i),
+                   STM_ENOENT);
+}
+
+/* An op through dir fid 104 ("d"), parked on "d" while "d" is swapped
+ * for "e": ESTALE, and neither directory changes. */
+static void gap_dir_leg(const char *fixture, uint32_t (*build)(uint8_t *))
+{
+    gap_fix gf;
+    gap_fix_up(&gf, fixture);
+    gap_fix_dir(&gf);
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build(op->req);
+    gap_run_at(&gf, op, gf.ino_tgt, GAP_AT_FRESH, gap_swap_d_for_e, NULL);
+    gap_assert_estale(op);
+    gap_assert_e_untouched(&gf);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+static uint32_t leg_lcreate(uint8_t *req)
+{
+    return build_tlcreate(req, 4, 104, "c", STM_9P_O_RDWR, 0644, 0);
+}
+static uint32_t leg_mkdir(uint8_t *req)
+{
+    return build_tmkdir(req, 4, 104, "c", 0755, 0);
+}
+static uint32_t leg_symlink(uint8_t *req)
+{
+    return build_tsymlink(req, 4, 104, "c", "t", 0);
+}
+static uint32_t leg_unlinkat(uint8_t *req)
+{
+    return build_tunlinkat(req, 4, 104, "n", 0);
+}
+static uint32_t leg_rmdir(uint8_t *req)
+{
+    return build_tunlinkat(req, 4, 104, "s", STM_9P_AT_REMOVEDIR);
+}
+static uint32_t leg_link_into(uint8_t *req)
+{
+    return build_tlink(req, 4, 104, 101, "c");
+}
+static uint32_t leg_rename_from(uint8_t *req)
+{
+    return build_trenameat(req, 4, 104, "n", 100, "c");
+}
+static uint32_t leg_rename_into(uint8_t *req)
+{
+    return build_trenameat(req, 4, 100, "x", 104, "c");
+}
+
+STM_TEST(p9_lcreate_in_a_dir_fid_freed_in_the_gap_answers_estale) {
+    gap_dir_leg("9p_gap_lcreate", leg_lcreate);
+}
+
+STM_TEST(p9_mkdir_in_a_dir_fid_freed_in_the_gap_answers_estale) {
+    gap_dir_leg("9p_gap_mkdir", leg_mkdir);
+}
+
+STM_TEST(p9_symlink_in_a_dir_fid_freed_in_the_gap_answers_estale) {
+    gap_dir_leg("9p_gap_symlink", leg_symlink);
+}
+
+STM_TEST(p9_unlinkat_in_a_dir_fid_freed_in_the_gap_answers_estale) {
+    gap_dir_leg("9p_gap_unlinkat", leg_unlinkat);
+}
+
+STM_TEST(p9_rmdir_in_a_dir_fid_freed_in_the_gap_answers_estale) {
+    gap_dir_leg("9p_gap_rmdir", leg_rmdir);
+}
+
+STM_TEST(p9_link_into_a_dir_fid_freed_in_the_gap_answers_estale) {
+    gap_dir_leg("9p_gap_link_into", leg_link_into);
+}
+
+STM_TEST(p9_renameat_from_a_dir_fid_freed_in_the_gap_answers_estale) {
+    gap_dir_leg("9p_gap_rename_from", leg_rename_from);
+}
+
+STM_TEST(p9_renameat_into_a_dir_fid_freed_in_the_gap_answers_estale) {
+    gap_dir_leg("9p_gap_rename_into", leg_rename_into);
+}
+
+/* Tlink of the freed fid 101 must not name "y" in the root. */
+STM_TEST(p9_link_of_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_link_of");
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_tlink(op->req, 4, 100, 101, "c");
+    gap_run(&gf, op, NULL);
+    gap_assert_estale(op);
+    uint64_t i = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(gf.fs, 1, 1, (const uint8_t *)"c", 1, &i),
+                   STM_ENOENT);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* Session 1's fid `fid` is open RDWR on a new file `name` holding one
+ * full block of `fill` (an extent, which reflink can share) or nothing. */
+static uint64_t gap_open_new(gap_fix *gf, uint32_t fid, const char *name,
+                             int fill)
+{
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_twalk(req, 30, 100, fid, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s1, req, sz, resp, RBUF, &rlen));
+    sz = build_tlcreate(req, 31, fid, name, STM_9P_O_RDWR, 0644, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s1, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    uint64_t ino = qid_ino(resp + 7);
+    if (fill >= 0) {
+        uint8_t blk[STM_UB_SIZE];
+        memset(blk, fill, sizeof blk);
+        STM_ASSERT_OK(stm_fs_write(gf->fs, 1, ino, 0, blk, sizeof blk));
+    }
+    free(req); free(resp);
+    return ino;
+}
+
+static uint64_t gap_size(gap_fix *gf, uint64_t ino)
+{
+    struct stm_inode_value iv;
+    STM_ASSERT_OK(stm_fs_stat(gf->fs, 1, ino, &iv));
+    return stm_load_le64(iv.si_size);
+}
+
+/* "y" grows to a full block of 'Y', an extent reflink could share. */
+static void gap_grow_y(gap_fix *gf)
+{
+    uint8_t blk[STM_UB_SIZE];
+    memset(blk, 'Y', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(gf->fs, 1, gf->ino_x, 0, blk, sizeof blk));
+}
+
+/* Treflink from the freed fid 101 must not copy "y" into "z". */
+STM_TEST(p9_reflink_from_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_reflink_from");
+    uint64_t z = gap_open_new(&gf, 105, "z", -1);
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_treflink(op->req, 4, 101, 105);
+    gap_run(&gf, op, gap_grow_y);
+    gap_assert_estale(op);
+    STM_ASSERT_EQ(gap_size(&gf, z), 0u);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* Treflink into the freed fid 101 must not fill an empty "y". */
+STM_TEST(p9_reflink_into_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_reflink_into");
+    (void)gap_open_new(&gf, 105, "w", 'W');
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_treflink(op->req, 4, 105, 101);
+    gap_run_at(&gf, op, gf.ino_x, GAP_AT_FRESH, gap_swap_x_for_empty_y,
+               NULL);
+    gap_assert_estale(op);
+    STM_ASSERT_EQ(gap_size(&gf, gf.ino_x), 0u);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* ── a fid's gen is set at bind, never read back (PX-16c) ─────────────── */
+
+/* After the op, session 1 writes "EVIL" through `fid`: it must not land
+ * in "y". */
+static void gap_assert_fid_never_reaches_y(gap_fix *gf, uint32_t fid)
+{
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 40, fid, 0, "EVIL", 4);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s1, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    free(req); free(resp);
+    gap_assert_y_holds_yyyy(gf);
+}
+
+/* "x" is replaced between Tlopen's truncate and its re-read. */
+STM_TEST(p9_lopen_trunc_never_adopts_the_file_that_replaced_its_own) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_restat_lopen");
+    walk_to(gf.s1, 100, 103, "x");
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_tlopen(op->req, 4, 103, STM_9P_O_RDWR | STM_9P_O_TRUNC);
+    gap_run_at(&gf, op, gf.ino_x, GAP_AT_RESTAT, gap_swap_x_for_y, NULL);
+    gap_assert_estale(op);
+    gap_assert_fid_never_reaches_y(&gf, 103);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* Session 2 unlinks "x"; nothing takes its number. */
+static void gap_unlink_x(gap_fix *gf)
+{
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tunlinkat(req, 900, 100, "x", 0);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s2, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RUNLINKAT);
+    free(req); free(resp);
+}
+
+/* "x" is freed between Tlopen's truncate and its re-read: the file the
+ * fid named is gone, which is ESTALE, not ENOENT. */
+STM_TEST(p9_lopen_trunc_of_a_file_freed_before_its_reread_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_restat_gone");
+    walk_to(gf.s1, 100, 103, "x");
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_tlopen(op->req, 4, 103, STM_9P_O_RDWR | STM_9P_O_TRUNC);
+    gap_run_at(&gf, op, gf.ino_x, GAP_AT_RESTAT, gap_unlink_x, NULL);
+    gap_assert_estale(op);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* "x" is replaced between Tsetattr's truncate and its re-read; the
+ * truncate itself landed on "x", so the Tsetattr succeeds. */
+STM_TEST(p9_setattr_size_never_adopts_the_file_that_replaced_its_own) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_restat_setattr");
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_tsetattr(op->req, 4, 101, STM_9P_SETATTR_SIZE, 0, 0, 0,
+                            0, 0, 0, 0, 0);
+    gap_run_at(&gf, op, gf.ino_x, GAP_AT_RESTAT, gap_swap_x_for_y, NULL);
+    STM_ASSERT_OK(op->rc);
+    STM_ASSERT_EQ(op->resp[4], STM_9P_RSETATTR);
+    gap_assert_fid_never_reaches_y(&gf, 101);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* "x" is replaced between Treflink's share and its re-read of dst. */
+STM_TEST(p9_reflink_never_adopts_the_file_that_replaced_its_dst) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_restat_reflink");
+    (void)gap_open_new(&gf, 105, "w", 'W');
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_treflink(op->req, 4, 105, 101);
+    gap_run_at(&gf, op, gf.ino_x, GAP_AT_RESTAT, gap_swap_x_for_y, NULL);
+    gap_assert_estale(op);
+    gap_assert_fid_never_reaches_y(&gf, 101);
     free(op);
     gap_fix_down(&gf);
 }

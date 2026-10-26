@@ -637,8 +637,9 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
  *   - dirent chain exhausted at dst's hash (STM_ENOSPC — pathological).
  *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
  *
- * Same-path rename (src == dst, both name and parent equal): no-op,
- * returns STM_OK.
+ * Same-path rename (src == dst, both name and parent equal): moves
+ * nothing, but the name must exist (STM_ENOENT otherwise) and
+ * RENAME_NOREPLACE finds it in place (STM_EEXIST), as on Linux.
  */
 STM_MUST_USE
 stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
@@ -2608,6 +2609,68 @@ stm_status stm_fs_listxattr_if_gen(stm_fs *fs, uint64_t dataset_id,
                                    uint64_t ino, uint64_t gen,
                                    uint8_t *name_buf, size_t buf_max,
                                    size_t *out_total_len);
+
+/*
+ * The namespace ops check the directory they act in (both, for a
+ * rename; the source file and the directory, for a link), and reflink
+ * both files, under the pins they take. A create also returns the new
+ * child's value, read under its pin (out_child_iv, may be NULL), so the
+ * caller never reads back an incarnation that replaced it. A refusal
+ * met before the pins (a missing name, say) is STM_ESTALE instead when
+ * the caller's directory is gone by then.
+ */
+STM_MUST_USE
+stm_status stm_fs_create_file_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                     uint64_t parent_ino, uint64_t gen,
+                                     const uint8_t *name, uint8_t name_len,
+                                     uint32_t mode, uint32_t uid, uint32_t gid,
+                                     uint64_t *out_child_ino,
+                                     struct stm_inode_value *out_child_iv);
+STM_MUST_USE
+stm_status stm_fs_mkdir_if_gen(stm_fs *fs, uint64_t dataset_id,
+                               uint64_t parent_ino, uint64_t gen,
+                               const uint8_t *name, uint8_t name_len,
+                               uint32_t mode, uint32_t uid, uint32_t gid,
+                               uint64_t *out_child_ino,
+                               struct stm_inode_value *out_child_iv);
+STM_MUST_USE
+stm_status stm_fs_symlink_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t parent_ino, uint64_t gen,
+                                 const uint8_t *name, uint8_t name_len,
+                                 const uint8_t *target, uint16_t target_len,
+                                 uint32_t uid, uint32_t gid,
+                                 uint64_t *out_child_ino,
+                                 struct stm_inode_value *out_child_iv);
+STM_MUST_USE
+stm_status stm_fs_unlink_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                uint64_t parent_ino, uint64_t gen,
+                                const uint8_t *name, uint8_t name_len);
+STM_MUST_USE
+stm_status stm_fs_rmdir_if_gen(stm_fs *fs, uint64_t dataset_id,
+                               uint64_t parent_ino, uint64_t gen,
+                               const uint8_t *name, uint8_t name_len);
+STM_MUST_USE
+stm_status stm_fs_link_by_ino_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                     uint64_t src_ino, uint64_t src_gen,
+                                     uint64_t dst_parent_ino,
+                                     uint64_t dst_parent_gen,
+                                     const uint8_t *dst_name,
+                                     uint8_t dst_name_len);
+STM_MUST_USE
+stm_status stm_fs_rename_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                uint64_t src_parent_ino,
+                                uint64_t src_parent_gen,
+                                const uint8_t *src_name, uint8_t src_name_len,
+                                uint64_t dst_parent_ino,
+                                uint64_t dst_parent_gen,
+                                const uint8_t *dst_name, uint8_t dst_name_len,
+                                uint32_t flags);
+STM_MUST_USE
+stm_status stm_fs_reflink_if_gen(stm_fs *fs,
+                                 uint64_t src_dataset_id, uint64_t src_ino,
+                                 uint64_t src_gen,
+                                 uint64_t dst_dataset_id, uint64_t dst_ino,
+                                 uint64_t dst_gen);
 
 /* ========================================================================= */
 /* P8-POSIX-7b: fallocate(2) — every FALLOC_FL_* flag.                        */

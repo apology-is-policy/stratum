@@ -12599,4 +12599,169 @@ STM_TEST(fs_if_gen_reads_act_only_on_their_incarnation) {
     unlink(g_key_path);
 }
 
+/* The namespace twins act only in their caller's directories (and on
+ * the caller's source file, for link and reflink): another gen is
+ * STM_ESTALE and changes nothing, even where the op would refuse first
+ * (a missing name); the live gen acts. A create hands back the child's
+ * own value. A rename onto itself looks its name up. */
+STM_TEST(fs_if_gen_namespace_ops_act_only_on_their_incarnation) {
+    make_tmp("if_gen_ns");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t dir = 0, d2 = 0, f = 0, w = 0, e = 0, i = 0;
+    STM_ASSERT_OK(stm_inode_alloc(stm_sync_inode_index(stm_fs_sync(fs)), 1,
+                                  (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, (const uint8_t *)"d2", 2, 0755u,
+                               0, 0, &d2));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"w", 1,
+                                     0644u, 0, 0, &w));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"e", 1,
+                                     0644u, 0, 0, &e));
+    uint8_t blk[STM_UB_SIZE];
+    memset(blk, 'W', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, w, 0, blk, sizeof blk));
+    uint64_t gd = if_gen_gen(fs, dir), g2 = if_gen_gen(fs, d2);
+    uint64_t gff = if_gen_gen(fs, f), gw = if_gen_gen(fs, w);
+    uint64_t ge = if_gen_gen(fs, e);
+    struct stm_inode_value civ;
+
+    uint64_t c = 0;
+    memset(&civ, 0, sizeof civ);
+    STM_ASSERT_ERR(stm_fs_create_file_if_gen(fs, 1, dir, gd + 1u,
+                                             (const uint8_t *)"c", 1, 0644u,
+                                             0, 0, &c, &civ), STM_ESTALE);
+    STM_ASSERT_EQ(c, 0u);
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"c", 1, &i),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_create_file_if_gen(fs, 1, dir, gd,
+                                            (const uint8_t *)"c", 1, 0644u,
+                                            0, 0, &c, &civ));
+    STM_ASSERT_EQ(stm_load_le64(civ.si_gen), if_gen_gen(fs, c));
+    STM_ASSERT_EQ(stm_load_le32(civ.si_mode) & (uint32_t)S_IFMT,
+                  (uint32_t)S_IFREG);
+
+    uint64_t m = 0;
+    STM_ASSERT_ERR(stm_fs_mkdir_if_gen(fs, 1, dir, gd + 1u,
+                                       (const uint8_t *)"m", 1, 0755u, 0, 0,
+                                       &m, &civ), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"m", 1, &i),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_mkdir_if_gen(fs, 1, dir, gd, (const uint8_t *)"m", 1,
+                                      0755u, 0, 0, &m, &civ));
+    uint64_t gm = stm_load_le64(civ.si_gen);
+    STM_ASSERT_EQ(gm, if_gen_gen(fs, m));
+    STM_ASSERT_EQ(stm_load_le32(civ.si_mode) & (uint32_t)S_IFMT,
+                  (uint32_t)S_IFDIR);
+
+    uint64_t l = 0;
+    STM_ASSERT_ERR(stm_fs_symlink_if_gen(fs, 1, dir, gd + 1u,
+                                         (const uint8_t *)"l", 1,
+                                         (const uint8_t *)"t", 1, 0, 0,
+                                         &l, &civ), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"l", 1, &i),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_symlink_if_gen(fs, 1, dir, gd,
+                                        (const uint8_t *)"l", 1,
+                                        (const uint8_t *)"t", 1, 0, 0,
+                                        &l, &civ));
+    STM_ASSERT_EQ(stm_load_le64(civ.si_gen), if_gen_gen(fs, l));
+    STM_ASSERT_EQ(stm_load_le32(civ.si_mode) & (uint32_t)S_IFMT,
+                  (uint32_t)S_IFLNK);
+
+    STM_ASSERT_ERR(stm_fs_unlink_if_gen(fs, 1, dir, gd + 1u,
+                                        (const uint8_t *)"c", 1), STM_ESTALE);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"c", 1, &i));
+    STM_ASSERT_ERR(stm_fs_unlink_if_gen(fs, 1, dir, gd + 1u,
+                                        (const uint8_t *)"nope", 4),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_unlink_if_gen(fs, 1, dir, gd,
+                                        (const uint8_t *)"nope", 4),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_unlink_if_gen(fs, 1, dir, gd,
+                                       (const uint8_t *)"c", 1));
+
+    STM_ASSERT_ERR(stm_fs_rmdir_if_gen(fs, 1, dir, gd + 1u,
+                                       (const uint8_t *)"m", 1), STM_ESTALE);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"m", 1, &i));
+    STM_ASSERT_OK(stm_fs_rmdir_if_gen(fs, 1, dir, gd,
+                                      (const uint8_t *)"m", 1));
+    STM_ASSERT_ERR(stm_fs_create_file_if_gen(fs, 1, m, gm,
+                                             (const uint8_t *)"z", 1, 0644u,
+                                             0, 0, &c, NULL), STM_ESTALE);
+
+    STM_ASSERT_ERR(stm_fs_link_by_ino_if_gen(fs, 1, f, gff + 1u, d2, g2,
+                                             (const uint8_t *)"h", 1),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_link_by_ino_if_gen(fs, 1, f, gff, d2, g2 + 1u,
+                                             (const uint8_t *)"h", 1),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, d2, (const uint8_t *)"h", 1, &i),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_link_by_ino_if_gen(fs, 1, f, gff, d2, g2,
+                                            (const uint8_t *)"h", 1));
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, d2, (const uint8_t *)"h", 1, &i));
+    STM_ASSERT_EQ(i, f);
+
+    STM_ASSERT_ERR(stm_fs_rename_if_gen(fs, 1, dir, gd + 1u,
+                                        (const uint8_t *)"f", 1, d2, g2,
+                                        (const uint8_t *)"r", 1, 0u),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_rename_if_gen(fs, 1, dir, gd,
+                                        (const uint8_t *)"f", 1, d2, g2 + 1u,
+                                        (const uint8_t *)"r", 1, 0u),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_rename_if_gen(fs, 1, dir, gd + 1u,
+                                        (const uint8_t *)"nope", 4, d2, g2,
+                                        (const uint8_t *)"r", 1, 0u),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, d2, (const uint8_t *)"r", 1, &i),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_rename_if_gen(fs, 1, dir, gd + 1u,
+                                        (const uint8_t *)"f", 1, dir,
+                                        gd + 1u, (const uint8_t *)"f", 1, 0u),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, (const uint8_t *)"nope", 4,
+                                 dir, (const uint8_t *)"nope", 4, 0u),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, (const uint8_t *)"f", 1,
+                                 dir, (const uint8_t *)"f", 1,
+                                 STM_FS_RENAME_NOREPLACE), STM_EEXIST);
+    STM_ASSERT_OK(stm_fs_rename_if_gen(fs, 1, dir, gd, (const uint8_t *)"f",
+                                       1, dir, gd, (const uint8_t *)"f", 1,
+                                       0u));
+    STM_ASSERT_OK(stm_fs_rename_if_gen(fs, 1, dir, gd, (const uint8_t *)"f",
+                                       1, d2, g2, (const uint8_t *)"r", 1,
+                                       0u));
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, d2, (const uint8_t *)"r", 1, &i));
+    STM_ASSERT_EQ(i, f);
+
+    struct stm_inode_value ev;
+    STM_ASSERT_ERR(stm_fs_reflink_if_gen(fs, 1, w, gw + 1u, 1, e, ge),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_reflink_if_gen(fs, 1, w, gw, 1, e, ge + 1u),
+                   STM_ESTALE);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, e, &ev));
+    STM_ASSERT_EQ(stm_load_le64(ev.si_size), 0u);
+    STM_ASSERT_OK(stm_fs_reflink_if_gen(fs, 1, w, gw, 1, e, ge));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, e, &ev));
+    STM_ASSERT_EQ(stm_load_le64(ev.si_size), (uint64_t)STM_UB_SIZE);
+    STM_ASSERT_EQ(stm_load_le64(ev.si_gen), ge);
+    uint64_t g = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"g", 1,
+                                     0644u, 0, 0, &g));
+    uint64_t gg = if_gen_gen(fs, g);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"g", 1));
+    STM_ASSERT_ERR(stm_fs_reflink_if_gen(fs, 1, w, gw, 1, g, gg), STM_ESTALE);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

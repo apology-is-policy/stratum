@@ -37,6 +37,12 @@ void stm_9p_server_set_fresh_hook(
 void stm_9p_server_set_step_hook(
     void (*step)(uint64_t ds, uint64_t ino, void *arg), void *arg);
 
+/* Install (or clear, with restat == NULL) the process-global hook called
+ * after an op on a fid's inode and before the handler reads that inode
+ * back, with the inode. Same set/clear rules. */
+void stm_9p_server_set_restat_hook(
+    void (*restat)(uint64_t ds, uint64_t ino, void *arg), void *arg);
+
 #ifdef __cplusplus
 }
 #endif

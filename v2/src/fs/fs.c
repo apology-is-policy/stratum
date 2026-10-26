@@ -2522,6 +2522,26 @@ static stm_status fs_pin_shared_if_gen(stm_fs *fs, stm_inode_index *iidx,
     return fs_pin_mode_if_gen(fs, iidx, dataset_id, ino, gen, true, out);
 }
 
+/* Ends an SH section on a refusal met before the op's inodes were
+ * pinned. When the caller's incarnation of either (a NULL gen names
+ * none) is gone by now, the answer is STM_ESTALE: under SH a live
+ * incarnation has been live since before the section began (gens are
+ * never reissued and a rollback waits for SH), so a refusal it outlived
+ * was its own. */
+static stm_status fs_refuse_unlock(stm_fs *fs, uint64_t dataset_id,
+                                   uint64_t a, const uint64_t *a_gen,
+                                   uint64_t b, const uint64_t *b_gen,
+                                   stm_status s)
+{
+    if (s != STM_OK) {
+        stm_status g = fs_gen_check_locked(fs, dataset_id, a, a_gen);
+        if (g == STM_OK) g = fs_gen_check_locked(fs, dataset_id, b, b_gen);
+        if (g != STM_OK) s = g;
+    }
+    pthread_rwlock_unlock(&fs->global);
+    return s;
+}
+
 static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                            const uint64_t *gen,
                            uint64_t off, const void *buf, size_t len)
@@ -3146,13 +3166,15 @@ static void fs_rollback_inode_free(stm_inode_index *iidx, uint64_t dataset_id,
 static stm_status fs_create_inode_and_link(stm_fs *fs,
                                                 uint64_t dataset_id,
                                                 uint64_t parent_ino,
+                                                const uint64_t *gen,
                                                 const uint8_t *name,
                                                 uint8_t name_len,
                                                 uint32_t mode,
                                                 uint32_t uid, uint32_t gid,
                                                 uint32_t child_mode_type,
                                                 uint8_t  child_dt_type,
-                                                uint64_t *out_child_ino)
+                                                uint64_t *out_child_ino,
+                                                struct stm_inode_value *out_child_iv)
 {
     /* PARALLEL-3 impl-2 CREATE-shape: SH + parent pin + fresh-child pin.
      * The new_ino isn't known until after alloc, but design doc §3.4
@@ -3172,7 +3194,8 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     /* Pin parent first so its type + dirent set are stable across
      * the alloc + dirent install. */
     stm_inode_handle *h_parent = NULL;
-    stm_status pp = stm_inode_pin(iidx, dataset_id, parent_ino, &h_parent);
+    stm_status pp = fs_pin_if_gen(fs, iidx, dataset_id, parent_ino, gen,
+                                  &h_parent);
     if (pp != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return pp;
@@ -3273,18 +3296,24 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     }
 
     fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino, &pv);
-    *out_child_ino = child_ino;
+    /* The child's value is read under its own pin: the incarnation just
+     * linked, never one that replaced it. */
+    stm_status out_s = out_child_iv
+        ? stm_inode_lookup(iidx, dataset_id, child_ino, out_child_iv)
+        : STM_OK;
+    if (out_s == STM_OK) *out_child_ino = child_ino;
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_parent);
     pthread_rwlock_unlock(&fs->global);
-    return STM_OK;
+    return out_s;
 }
 
-stm_status stm_fs_create_file(stm_fs *fs, uint64_t dataset_id,
-                                  uint64_t parent_ino,
-                                  const uint8_t *name, uint8_t name_len,
-                                  uint32_t mode, uint32_t uid, uint32_t gid,
-                                  uint64_t *out_child_ino)
+static stm_status fs_create_file(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t parent_ino, const uint64_t *gen,
+                                 const uint8_t *name, uint8_t name_len,
+                                 uint32_t mode, uint32_t uid, uint32_t gid,
+                                 uint64_t *out_child_ino,
+                                 struct stm_inode_value *out_child_iv)
 {
     if (!fs || !out_child_ino) return STM_EINVAL;
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
@@ -3296,10 +3325,10 @@ stm_status stm_fs_create_file(stm_fs *fs, uint64_t dataset_id,
     uint32_t mtype = mode & (uint32_t)S_IFMT;
     if (mtype != 0u && mtype != (uint32_t)S_IFREG) return STM_EINVAL;
     *out_child_ino = 0;
-    return fs_create_inode_and_link(fs, dataset_id, parent_ino,
+    return fs_create_inode_and_link(fs, dataset_id, parent_ino, gen,
                                        name, name_len, mode, uid, gid,
                                        (uint32_t)S_IFREG, STM_DT_REG,
-                                       out_child_ino);
+                                       out_child_ino, out_child_iv);
 }
 
 /* P8-POSIX-7a-anon: stm_fs_create_anon — Linux O_TMPFILE shape.
@@ -3653,11 +3682,12 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
     return fs_free;
 }
 
-stm_status stm_fs_mkdir(stm_fs *fs, uint64_t dataset_id,
-                            uint64_t parent_ino,
-                            const uint8_t *name, uint8_t name_len,
-                            uint32_t mode, uint32_t uid, uint32_t gid,
-                            uint64_t *out_child_ino)
+static stm_status fs_mkdir(stm_fs *fs, uint64_t dataset_id,
+                           uint64_t parent_ino, const uint64_t *gen,
+                           const uint8_t *name, uint8_t name_len,
+                           uint32_t mode, uint32_t uid, uint32_t gid,
+                           uint64_t *out_child_ino,
+                           struct stm_inode_value *out_child_iv)
 {
     if (!fs || !out_child_ino) return STM_EINVAL;
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
@@ -3667,10 +3697,10 @@ stm_status stm_fs_mkdir(stm_fs *fs, uint64_t dataset_id,
     uint32_t mtype = mode & (uint32_t)S_IFMT;
     if (mtype != 0u && mtype != (uint32_t)S_IFDIR) return STM_EINVAL;
     *out_child_ino = 0;
-    return fs_create_inode_and_link(fs, dataset_id, parent_ino,
+    return fs_create_inode_and_link(fs, dataset_id, parent_ino, gen,
                                        name, name_len, mode, uid, gid,
                                        (uint32_t)S_IFDIR, STM_DT_DIR,
-                                       out_child_ino);
+                                       out_child_ino, out_child_iv);
 }
 
 /* R128 P1-1 + P1-2: pre-free cleanup helper. Drops the inode's xattrs,
@@ -3875,6 +3905,7 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
 static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
                                                   uint64_t dataset_id,
                                                   uint64_t parent_ino,
+                                                  const uint64_t *gen,
                                                   const uint8_t *name,
                                                   uint8_t name_len,
                                                   bool expect_dir)
@@ -3903,29 +3934,35 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     int attempts = 0;
 
     for (;;) {
-        if (attempts++ >= FS_UNLINK_MAX_ATTEMPTS) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_EAGAIN;
-        }
+        if (attempts++ >= FS_UNLINK_MAX_ATTEMPTS)
+            return fs_refuse_unlock(fs, dataset_id, parent_ino, gen,
+                                    parent_ino, NULL, STM_EAGAIN);
 
         /* Pre-pin lookup. */
         uint64_t observed_child = 0;
         stm_status ds = stm_dirent_lookup(didx, dataset_id, parent_ino,
                                               name, name_len,
                                               &observed_child, NULL, NULL);
-        if (ds != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
-            return ds;       /* STM_ENOENT if not linked */
-        }
+        if (ds != STM_OK)       /* STM_ENOENT if not linked */
+            return fs_refuse_unlock(fs, dataset_id, parent_ino, gen,
+                                    parent_ino, NULL, ds);
 
         /* Pin parent + child in ascending (ds, ino) order. */
         stm_status ps = stm_inode_pin_two(iidx,
                                               dataset_id, parent_ino,
                                               dataset_id, observed_child,
                                               &h_parent, &h_child);
-        if (ps != STM_OK) {
+        if (ps != STM_OK)       /* STM_ENOENT if parent or child gone */
+            return fs_refuse_unlock(fs, dataset_id, parent_ino, gen,
+                                    parent_ino, NULL, ps);
+
+        /* Under both pins: the caller's directory, or none. */
+        stm_status gs = fs_gen_check_locked(fs, dataset_id, parent_ino, gen);
+        if (gs != STM_OK) {
+            stm_inode_unpin(iidx, h_parent);
+            stm_inode_unpin(iidx, h_child);
             pthread_rwlock_unlock(&fs->global);
-            return ps;       /* STM_ENOENT if parent or child gone */
+            return gs;
         }
 
         /* Under both pins: re-validate parent is still a dir AND the
@@ -4118,8 +4155,8 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     return STM_OK;
 }
 
-stm_status stm_fs_unlink(stm_fs *fs, uint64_t dataset_id,
-                            uint64_t parent_ino,
+static stm_status fs_unlink(stm_fs *fs, uint64_t dataset_id,
+                            uint64_t parent_ino, const uint64_t *gen,
                             const uint8_t *name, uint8_t name_len)
 {
     if (!fs) return STM_EINVAL;
@@ -4127,13 +4164,13 @@ stm_status stm_fs_unlink(stm_fs *fs, uint64_t dataset_id,
     if (fs_ino_is_synth(parent_ino)) return STM_EROFS;  /* 9.7-impl-5 */
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
-    return fs_unlink_inode_and_dirent(fs, dataset_id, parent_ino,
+    return fs_unlink_inode_and_dirent(fs, dataset_id, parent_ino, gen,
                                           name, name_len,
                                           /*expect_dir=*/false);
 }
 
-stm_status stm_fs_rmdir(stm_fs *fs, uint64_t dataset_id,
-                           uint64_t parent_ino,
+static stm_status fs_rmdir(stm_fs *fs, uint64_t dataset_id,
+                           uint64_t parent_ino, const uint64_t *gen,
                            const uint8_t *name, uint8_t name_len)
 {
     if (!fs) return STM_EINVAL;
@@ -4141,7 +4178,7 @@ stm_status stm_fs_rmdir(stm_fs *fs, uint64_t dataset_id,
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
-    return fs_unlink_inode_and_dirent(fs, dataset_id, parent_ino,
+    return fs_unlink_inode_and_dirent(fs, dataset_id, parent_ino, gen,
                                           name, name_len,
                                           /*expect_dir=*/true);
 }
@@ -4648,9 +4685,10 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
  * before; R74 P3-3: lock-posture infallibility for the rollback's
  * stm_inode_unlink (void)-cast).
  */
-stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
-                                 uint64_t src_ino,
+static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t src_ino, const uint64_t *gen_src,
                                  uint64_t dst_parent_ino,
+                                 const uint64_t *gen_dir,
                                  const uint8_t *dst_name, uint8_t dst_name_len)
 {
     if (!fs) return STM_EINVAL;
@@ -4689,9 +4727,19 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     stm_status ps2 = stm_inode_pin_two(iidx, dataset_id, src_ino,
                                             dataset_id, dst_parent_ino,
                                             &h_src, &h_dst_p);
-    if (ps2 != STM_OK) {
+    if (ps2 != STM_OK)
+        return fs_refuse_unlock(fs, dataset_id, src_ino, gen_src,
+                                dst_parent_ino, gen_dir, ps2);
+
+    /* Under both pins: the caller's source and directory, or none. */
+    stm_status gs = fs_gen_check_locked(fs, dataset_id, src_ino, gen_src);
+    if (gs == STM_OK)
+        gs = fs_gen_check_locked(fs, dataset_id, dst_parent_ino, gen_dir);
+    if (gs != STM_OK) {
+        stm_inode_unpin(iidx, h_src);
+        stm_inode_unpin(iidx, h_dst_p);
         pthread_rwlock_unlock(&fs->global);
-        return ps2;
+        return gs;
     }
 
     /* Verify dst_parent is a directory. */
@@ -4783,12 +4831,13 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
 /* P8-POSIX-8: symlinks.                                                      */
 /* ========================================================================= */
 
-stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
-                              uint64_t parent_ino,
-                              const uint8_t *name, uint8_t name_len,
-                              const uint8_t *target, uint16_t target_len,
-                              uint32_t uid, uint32_t gid,
-                              uint64_t *out_child_ino)
+static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
+                             uint64_t parent_ino, const uint64_t *gen,
+                             const uint8_t *name, uint8_t name_len,
+                             const uint8_t *target, uint16_t target_len,
+                             uint32_t uid, uint32_t gid,
+                             uint64_t *out_child_ino,
+                             struct stm_inode_value *out_child_iv)
 {
     /* R77 P3-1: zero-init out_child_ino BEFORE arg validation per
      * the R57 P3-5 / R76 P3-3 uniform out-param contract. */
@@ -4824,7 +4873,8 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     }
 
     stm_inode_handle *h_parent = NULL;
-    stm_status pp = stm_inode_pin(iidx, dataset_id, parent_ino, &h_parent);
+    stm_status pp = fs_pin_if_gen(fs, iidx, dataset_id, parent_ino, gen,
+                                  &h_parent);
     if (pp != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return pp;
@@ -4912,11 +4962,16 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     }
 
     fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino, &pv);
-    *out_child_ino = child_ino;
+    /* The child's value is read under its own pin: the incarnation just
+     * linked, never one that replaced it. */
+    stm_status out_s = out_child_iv
+        ? stm_inode_lookup(iidx, dataset_id, child_ino, out_child_iv)
+        : STM_OK;
+    if (out_s == STM_OK) *out_child_ino = child_ino;
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_parent);
     pthread_rwlock_unlock(&fs->global);
-    return STM_OK;
+    return out_s;
 }
 
 static stm_status fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
@@ -5553,10 +5608,51 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
 /* P8-POSIX-9: stm_fs_rename.                                                 */
 /* ========================================================================= */
 
-stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
+/* rename(d/a, d/a) moves nothing, but the name must exist (Linux:
+ * ENOENT) and NOREPLACE finds it in place (Linux: EEXIST, checked
+ * before the source == target return). The directory's shared pin
+ * holds the name. */
+static stm_status fs_rename_onto_itself(stm_fs *fs, uint64_t dataset_id,
+                                        uint64_t parent_ino,
+                                        const uint64_t *gen,
+                                        const uint8_t *name,
+                                        uint8_t name_len, uint32_t flags)
+{
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_EINVAL;
+    }
+    stm_inode_handle *h = NULL;
+    stm_status s = fs_pin_shared_if_gen(fs, iidx, dataset_id, parent_ino,
+                                        gen, &h);
+    if (s != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return s;
+    }
+    struct stm_inode_value pv = {0};
+    s = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
+    if (s == STM_OK) {
+        uint64_t ino = 0, child_gen = 0;
+        uint8_t  type = 0;
+        s = stm_dirent_lookup(didx, dataset_id, parent_ino, name, name_len,
+                              &ino, &child_gen, &type);
+    }
+    if (s == STM_OK && (flags & STM_FS_RENAME_NOREPLACE)) s = STM_EEXIST;
+    stm_inode_unpin(iidx, h);
+    pthread_rwlock_unlock(&fs->global);
+    return s;
+}
+
+static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                             uint64_t src_parent_ino,
+                            const uint64_t *gen_src_dir,
                             const uint8_t *src_name, uint8_t src_name_len,
                             uint64_t dst_parent_ino,
+                            const uint64_t *gen_dst_dir,
                             const uint8_t *dst_name, uint8_t dst_name_len,
                             uint32_t flags)
 {
@@ -5593,11 +5689,12 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
     nv = fs_validate_dirent_name(dst_name, dst_name_len);
     if (nv != STM_OK) return nv;
 
-    /* Same-path no-op. POSIX rename(src, src) returns 0. */
     if (src_parent_ino == dst_parent_ino &&
         src_name_len == dst_name_len &&
         memcmp(src_name, dst_name, src_name_len) == 0) {
-        return STM_OK;
+        return fs_rename_onto_itself(fs, dataset_id, src_parent_ino,
+                                     gen_src_dir, src_name, src_name_len,
+                                     flags);
     }
 
     /* R133 P1-2: capture wedge-intent through rollback failures and
@@ -5621,8 +5718,8 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
+        return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
+                                dst_parent_ino, gen_dst_dir, STM_EINVAL);
     }
 
     /* Pre-pin parent validation — fast-path STM_ENOENT/STM_ENOTDIR
@@ -5633,16 +5730,16 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
     struct stm_inode_value spv = {0};
     stm_status sps = fs_load_parent_dir(iidx, dataset_id, src_parent_ino, &spv);
     if (sps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return sps;
+        return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
+                                dst_parent_ino, gen_dst_dir, sps);
     }
     if (src_parent_ino != dst_parent_ino) {
         struct stm_inode_value dpv = {0};
         stm_status dps = fs_load_parent_dir(iidx, dataset_id,
                                                 dst_parent_ino, &dpv);
         if (dps != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
-            return dps;
+            return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
+                                    dst_parent_ino, gen_dst_dir, dps);
         }
     }
 
@@ -5662,8 +5759,8 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
 
     for (;;) {
         if (attempts++ >= FS_UNLINK_MAX_ATTEMPTS) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_EAGAIN;
+            return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
+                                    dst_parent_ino, gen_dst_dir, STM_EAGAIN);
         }
 
         /* Pre-pin lookup of src. */
@@ -5674,8 +5771,8 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
                                                 &src_ino_obs, &src_gen_obs,
                                                 &src_type_obs);
         if (srs != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
-            return srs;
+            return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
+                                    dst_parent_ino, gen_dst_dir, srs);
         }
 
         /* Pre-pin lookup of dst. */
@@ -5687,18 +5784,18 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
                                                 &dst_type_obs);
         bool dst_exists_obs = (drs == STM_OK);
         if (drs != STM_OK && drs != STM_ENOENT) {
-            pthread_rwlock_unlock(&fs->global);
-            return drs;
+            return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
+                                    dst_parent_ino, gen_dst_dir, drs);
         }
 
         /* Pre-pin flag checks that don't depend on inode state. */
         if (dst_exists_obs && (flags & STM_FS_RENAME_NOREPLACE)) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_EEXIST;
+            return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
+                                    dst_parent_ino, gen_dst_dir, STM_EEXIST);
         }
         if ((flags & STM_FS_RENAME_EXCHANGE) && !dst_exists_obs) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_ENOENT;
+            return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
+                                    dst_parent_ino, gen_dst_dir, STM_ENOENT);
         }
 
         /* Build the pin set, deduplicating against earlier entries.
@@ -5749,9 +5846,23 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
              * different inode, or src/dst may have moved). */
             continue;
         }
-        if (pp != STM_OK) {
+        if (pp != STM_OK)
+            return fs_refuse_unlock(fs, dataset_id, src_parent_ino,
+                                    gen_src_dir, dst_parent_ino, gen_dst_dir,
+                                    pp);
+
+        /* Under the pins: the caller's directories, or none. */
+        stm_status gs = fs_gen_check_locked(fs, dataset_id, src_parent_ino,
+                                            gen_src_dir);
+        if (gs == STM_OK)
+            gs = fs_gen_check_locked(fs, dataset_id, dst_parent_ino,
+                                     gen_dst_dir);
+        if (gs != STM_OK) {
+            for (size_t i = 0u; i < n_reqs; i++) {
+                stm_inode_unpin(iidx, new_handles[i]);
+            }
             pthread_rwlock_unlock(&fs->global);
-            return pp;
+            return gs;
         }
 
         /* Re-verify under pin: re-lookup src + dst, confirm they
@@ -7132,9 +7243,11 @@ static stm_status fs_reflink_locked(stm_fs *fs,
  *
  * Errors propagate from stm_sync_reflink + the inode-layer guards
  * documented in fs_reflink_locked. */
-stm_status stm_fs_reflink(stm_fs *fs,
-                            uint64_t src_dataset_id, uint64_t src_ino,
-                            uint64_t dst_dataset_id, uint64_t dst_ino)
+static stm_status fs_reflink(stm_fs *fs,
+                             uint64_t src_dataset_id, uint64_t src_ino,
+                             const uint64_t *src_gen,
+                             uint64_t dst_dataset_id, uint64_t dst_ino,
+                             const uint64_t *dst_gen)
 {
     if (!fs) return STM_EINVAL;
     if (src_dataset_id == 0u || src_ino == 0u) return STM_EINVAL;
@@ -7160,15 +7273,22 @@ stm_status stm_fs_reflink(stm_fs *fs,
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    stm_status ps = STM_EINVAL;
     if (iidx) {
         stm_inode_handle *h_src = NULL, *h_dst = NULL;
-        stm_status ps = stm_inode_pin_two(iidx,
-                                              src_dataset_id, src_ino,
-                                              dst_dataset_id, dst_ino,
-                                              &h_src, &h_dst);
+        ps = stm_inode_pin_two(iidx,
+                               src_dataset_id, src_ino,
+                               dst_dataset_id, dst_ino,
+                               &h_src, &h_dst);
         if (ps == STM_OK) {
-            /* SH+pin happy path. */
-            stm_status s = fs_flush_ino_locked(fs, src_dataset_id, src_ino);
+            /* SH+pin happy path; each side the caller's incarnation. */
+            stm_status s = fs_gen_check_locked(fs, src_dataset_id, src_ino,
+                                               src_gen);
+            if (s == STM_OK)
+                s = fs_gen_check_locked(fs, dst_dataset_id, dst_ino,
+                                        dst_gen);
+            if (s == STM_OK)
+                s = fs_flush_ino_locked(fs, src_dataset_id, src_ino);
             if (s == STM_OK) {
                 s = fs_flush_ino_locked(fs, dst_dataset_id, dst_ino);
             }
@@ -7187,6 +7307,11 @@ stm_status stm_fs_reflink(stm_fs *fs,
             pthread_rwlock_unlock(&fs->global);
             return ps;
         }
+    }
+    /* A gen names an inode in the index: no legacy path. */
+    if (src_gen || dst_gen) {
+        pthread_rwlock_unlock(&fs->global);
+        return (src_gen && ps == STM_ENOENT) ? STM_ESTALE : ps;
     }
     /* Legacy / transitional EX path: release SH and reacquire EX. */
     pthread_rwlock_unlock(&fs->global);
@@ -11148,6 +11273,163 @@ stm_status stm_fs_listxattr_if_gen(stm_fs *fs, uint64_t dataset_id,
 {
     return fs_listxattr(fs, dataset_id, ino, &gen, name_buf, buf_max,
                         out_total_len);
+}
+
+stm_status stm_fs_create_file(stm_fs *fs, uint64_t dataset_id,
+                              uint64_t parent_ino,
+                              const uint8_t *name, uint8_t name_len,
+                              uint32_t mode, uint32_t uid, uint32_t gid,
+                              uint64_t *out_child_ino)
+{
+    return fs_create_file(fs, dataset_id, parent_ino, NULL, name, name_len,
+                          mode, uid, gid, out_child_ino, NULL);
+}
+
+stm_status stm_fs_create_file_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                     uint64_t parent_ino, uint64_t gen,
+                                     const uint8_t *name, uint8_t name_len,
+                                     uint32_t mode, uint32_t uid, uint32_t gid,
+                                     uint64_t *out_child_ino,
+                                     struct stm_inode_value *out_child_iv)
+{
+    return fs_create_file(fs, dataset_id, parent_ino, &gen, name, name_len,
+                          mode, uid, gid, out_child_ino, out_child_iv);
+}
+
+stm_status stm_fs_mkdir(stm_fs *fs, uint64_t dataset_id,
+                        uint64_t parent_ino,
+                        const uint8_t *name, uint8_t name_len,
+                        uint32_t mode, uint32_t uid, uint32_t gid,
+                        uint64_t *out_child_ino)
+{
+    return fs_mkdir(fs, dataset_id, parent_ino, NULL, name, name_len,
+                    mode, uid, gid, out_child_ino, NULL);
+}
+
+stm_status stm_fs_mkdir_if_gen(stm_fs *fs, uint64_t dataset_id,
+                               uint64_t parent_ino, uint64_t gen,
+                               const uint8_t *name, uint8_t name_len,
+                               uint32_t mode, uint32_t uid, uint32_t gid,
+                               uint64_t *out_child_ino,
+                               struct stm_inode_value *out_child_iv)
+{
+    return fs_mkdir(fs, dataset_id, parent_ino, &gen, name, name_len,
+                    mode, uid, gid, out_child_ino, out_child_iv);
+}
+
+stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
+                          uint64_t parent_ino,
+                          const uint8_t *name, uint8_t name_len,
+                          const uint8_t *target, uint16_t target_len,
+                          uint32_t uid, uint32_t gid,
+                          uint64_t *out_child_ino)
+{
+    return fs_symlink(fs, dataset_id, parent_ino, NULL, name, name_len,
+                      target, target_len, uid, gid, out_child_ino, NULL);
+}
+
+stm_status stm_fs_symlink_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t parent_ino, uint64_t gen,
+                                 const uint8_t *name, uint8_t name_len,
+                                 const uint8_t *target, uint16_t target_len,
+                                 uint32_t uid, uint32_t gid,
+                                 uint64_t *out_child_ino,
+                                 struct stm_inode_value *out_child_iv)
+{
+    return fs_symlink(fs, dataset_id, parent_ino, &gen, name, name_len,
+                      target, target_len, uid, gid, out_child_ino,
+                      out_child_iv);
+}
+
+stm_status stm_fs_unlink(stm_fs *fs, uint64_t dataset_id,
+                         uint64_t parent_ino,
+                         const uint8_t *name, uint8_t name_len)
+{
+    return fs_unlink(fs, dataset_id, parent_ino, NULL, name, name_len);
+}
+
+stm_status stm_fs_unlink_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                uint64_t parent_ino, uint64_t gen,
+                                const uint8_t *name, uint8_t name_len)
+{
+    return fs_unlink(fs, dataset_id, parent_ino, &gen, name, name_len);
+}
+
+stm_status stm_fs_rmdir(stm_fs *fs, uint64_t dataset_id,
+                        uint64_t parent_ino,
+                        const uint8_t *name, uint8_t name_len)
+{
+    return fs_rmdir(fs, dataset_id, parent_ino, NULL, name, name_len);
+}
+
+stm_status stm_fs_rmdir_if_gen(stm_fs *fs, uint64_t dataset_id,
+                               uint64_t parent_ino, uint64_t gen,
+                               const uint8_t *name, uint8_t name_len)
+{
+    return fs_rmdir(fs, dataset_id, parent_ino, &gen, name, name_len);
+}
+
+stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
+                              uint64_t src_ino, uint64_t dst_parent_ino,
+                              const uint8_t *dst_name, uint8_t dst_name_len)
+{
+    return fs_link_by_ino(fs, dataset_id, src_ino, NULL, dst_parent_ino,
+                          NULL, dst_name, dst_name_len);
+}
+
+stm_status stm_fs_link_by_ino_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                     uint64_t src_ino, uint64_t src_gen,
+                                     uint64_t dst_parent_ino,
+                                     uint64_t dst_parent_gen,
+                                     const uint8_t *dst_name,
+                                     uint8_t dst_name_len)
+{
+    return fs_link_by_ino(fs, dataset_id, src_ino, &src_gen, dst_parent_ino,
+                          &dst_parent_gen, dst_name, dst_name_len);
+}
+
+stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
+                         uint64_t src_parent_ino,
+                         const uint8_t *src_name, uint8_t src_name_len,
+                         uint64_t dst_parent_ino,
+                         const uint8_t *dst_name, uint8_t dst_name_len,
+                         uint32_t flags)
+{
+    return fs_rename(fs, dataset_id, src_parent_ino, NULL,
+                     src_name, src_name_len, dst_parent_ino, NULL,
+                     dst_name, dst_name_len, flags);
+}
+
+stm_status stm_fs_rename_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                uint64_t src_parent_ino,
+                                uint64_t src_parent_gen,
+                                const uint8_t *src_name, uint8_t src_name_len,
+                                uint64_t dst_parent_ino,
+                                uint64_t dst_parent_gen,
+                                const uint8_t *dst_name, uint8_t dst_name_len,
+                                uint32_t flags)
+{
+    return fs_rename(fs, dataset_id, src_parent_ino, &src_parent_gen,
+                     src_name, src_name_len, dst_parent_ino, &dst_parent_gen,
+                     dst_name, dst_name_len, flags);
+}
+
+stm_status stm_fs_reflink(stm_fs *fs,
+                          uint64_t src_dataset_id, uint64_t src_ino,
+                          uint64_t dst_dataset_id, uint64_t dst_ino)
+{
+    return fs_reflink(fs, src_dataset_id, src_ino, NULL,
+                      dst_dataset_id, dst_ino, NULL);
+}
+
+stm_status stm_fs_reflink_if_gen(stm_fs *fs,
+                                 uint64_t src_dataset_id, uint64_t src_ino,
+                                 uint64_t src_gen,
+                                 uint64_t dst_dataset_id, uint64_t dst_ino,
+                                 uint64_t dst_gen)
+{
+    return fs_reflink(fs, src_dataset_id, src_ino, &src_gen,
+                      dst_dataset_id, dst_ino, &dst_gen);
 }
 
 /* ========================================================================= */

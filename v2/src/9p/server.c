@@ -298,6 +298,8 @@ static struct stm_9p_server_test_hooks {
     void  *fresh_arg;
     void (*step)(uint64_t ds, uint64_t ino, void *arg);
     void  *step_arg;
+    void (*restat)(uint64_t ds, uint64_t ino, void *arg);
+    void  *restat_arg;
 } g_9p_test_hooks;
 
 void stm_9p_server_set_test_hooks(
@@ -319,6 +321,13 @@ void stm_9p_server_set_step_hook(
 {
     g_9p_test_hooks.step     = step;
     g_9p_test_hooks.step_arg = arg;
+}
+
+void stm_9p_server_set_restat_hook(
+    void (*restat)(uint64_t ds, uint64_t ino, void *arg), void *arg)
+{
+    g_9p_test_hooks.restat     = restat;
+    g_9p_test_hooks.restat_arg = arg;
 }
 
 static void walk_step_hook(uint64_t ds, uint64_t ino)
@@ -1070,6 +1079,20 @@ static stm_status verify_fid_fresh(stm_9p_server *s, p9_fid *f,
 {
     return verify_fresh_snapshot(s->fs, f->dataset_id, f->ino,
                                     f->cached_gen, out);
+}
+
+/* Re-reads a fid's inode after an op on it: the value of the fid's own
+ * incarnation, or STM_ESTALE. A fid's gen is set when it is bound and
+ * never taken from a later read. */
+static stm_status restat_fresh(stm_fs *fs, uint64_t ds, uint64_t ino,
+                               uint64_t gen, struct stm_inode_value *out)
+{
+    if (g_9p_test_hooks.restat)
+        g_9p_test_hooks.restat(ds, ino, g_9p_test_hooks.restat_arg);
+    stm_status rc = stm_fs_stat(fs, ds, ino, out);
+    if (rc == STM_ENOENT) return STM_ESTALE;
+    if (rc != STM_OK) return rc;
+    return stm_load_le64(out->si_gen) == gen ? STM_OK : STM_ESTALE;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -2140,7 +2163,6 @@ static stm_status h_lopen(stm_9p_server *s,
 
     /* (b) unlocked: verify + type/flag gates + optional O_TRUNC. */
     uint32_t ecode     = 0;         /* != 0 -> Rlerror(ecode) */
-    uint64_t reply_gen = gen;       /* refreshed if O_TRUNC bumps si_gen */
     uint32_t reply_cvers = 0;       /* si_cvers -> qid.version (fresh below) */
     uint32_t mode      = 0;
 
@@ -2199,20 +2221,18 @@ static stm_status h_lopen(stm_9p_server *s,
             ecode = status_to_errno(rc);
             goto phase_c;
         }
-        /* Refresh gen/cvers after the truncate. The truncate bumped
-         * si_cvers (content changed), so the pre-truncate reply_cvers is
-         * now STALE -- unlike si_gen (unchanged by truncate), we cannot
-         * fall back to the pre-value. If the re-stat fails we cannot build
-         * a coherent Rlopen (its qid.version would lie about content), so
-         * fail the open with the stat error; the truncate stands and the
-         * client's retry re-stats fresh (L1a-2 F2). */
+        /* Refresh cvers after the truncate: it bumped si_cvers, so the
+         * pre-truncate reply_cvers is stale. If the re-stat fails (the
+         * file is gone, or another took its number) we cannot build a
+         * coherent Rlopen (its qid.version would lie about content), so
+         * fail the open; the truncate stands and the client's retry
+         * re-stats fresh (L1a-2 F2). */
         struct stm_inode_value post;
-        rc = stm_fs_stat(s->fs, ds, ino, &post);
+        rc = restat_fresh(s->fs, ds, ino, gen, &post);
         if (rc != STM_OK) {
             ecode = status_to_errno(rc);
             goto phase_c;
         }
-        reply_gen   = stm_load_le64(post.si_gen);
         reply_cvers = qid_version(&post);
     }
 
@@ -2225,8 +2245,6 @@ phase_c:
     must_lock(&s->lock);
     if (ecode == 0 &&
         f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino) {
-        if (reply_gen != gen)           /* O_TRUNC re-stat bumped si_gen */
-            f->cached_gen = reply_gen;
         f->cached_cvers = reply_cvers;  /* fresh content-version (L1/Larder) */
         f->is_open     = true;
         f->open_flags  = flags;
@@ -2763,18 +2781,11 @@ static stm_status h_lcreate(stm_9p_server *s,
         goto phase_c;
     }
 
-    rc = stm_fs_create_file(s->fs, ds, parent_ino,
-                              (const uint8_t *)name, (uint8_t)nlen,
-                              mode & 07777u,
-                              s->auth_uid, gid, &new_ino);
-    if (rc != STM_OK) {
-        ecode = status_to_errno(rc);
-        goto phase_c;
-    }
-
-    /* Stat the new inode to get its si_gen + actual mode. */
     struct stm_inode_value iv;
-    rc = stm_fs_stat(s->fs, ds, new_ino, &iv);
+    rc = stm_fs_create_file_if_gen(s->fs, ds, parent_ino, gen,
+                                   (const uint8_t *)name, (uint8_t)nlen,
+                                   mode & 07777u,
+                                   s->auth_uid, gid, &new_ino, &iv);
     if (rc != STM_OK) {
         ecode = status_to_errno(rc);
         goto phase_c;
@@ -2901,18 +2912,15 @@ static stm_status h_mkdir(stm_9p_server *s,
     uint64_t new_ino   = 0;
     uint32_t new_cvers = 0;         /* si_cvers -> qid.version */
 
+    struct stm_inode_value iv;
     stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
     if (rc == STM_OK)
-        rc = stm_fs_mkdir(s->fs, ds, ino,
-                            (const uint8_t *)name, (uint8_t)nlen,
-                            mode & 07777u,
-                            s->auth_uid, gid, &new_ino);
-    if (rc == STM_OK) {
-        struct stm_inode_value iv;
-        rc = stm_fs_stat(s->fs, ds, new_ino, &iv);
-        if (rc == STM_OK)
-            new_cvers = qid_version(&iv);
-    }
+        rc = stm_fs_mkdir_if_gen(s->fs, ds, ino, gen,
+                                 (const uint8_t *)name, (uint8_t)nlen,
+                                 mode & 07777u,
+                                 s->auth_uid, gid, &new_ino, &iv);
+    if (rc == STM_OK)
+        new_cvers = qid_version(&iv);
     if (rc != STM_OK) ecode = status_to_errno(rc);
 
     /* (c) no fid mutation (dfid stays bound to the parent); unpin. */
@@ -3002,8 +3010,8 @@ static stm_status h_link(stm_9p_server *s,
     if (rc == STM_OK)
         rc = verify_fresh_snapshot(s->fs, ds, d_ino, d_gen, NULL);
     if (rc == STM_OK)
-        rc = stm_fs_link_by_ino(s->fs, ds, s_ino, d_ino,
-                                   (const uint8_t *)name, (uint8_t)nlen);
+        rc = stm_fs_link_by_ino_if_gen(s->fs, ds, s_ino, s_gen, d_ino, d_gen,
+                                       (const uint8_t *)name, (uint8_t)nlen);
     if (rc != STM_OK) ecode = status_to_errno(rc);
 
     /* (c) no fid mutation; unpin both. */
@@ -3075,18 +3083,15 @@ static stm_status h_symlink(stm_9p_server *s,
     uint64_t new_ino   = 0;
     uint32_t new_cvers = 0;         /* si_cvers -> qid.version */
 
+    struct stm_inode_value iv;
     stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
     if (rc == STM_OK)
-        rc = stm_fs_symlink(s->fs, ds, ino,
-                              (const uint8_t *)name, (uint8_t)nlen,
-                              (const uint8_t *)symtgt, tlen,
-                              s->auth_uid, gid, &new_ino);
-    if (rc == STM_OK) {
-        struct stm_inode_value iv;
-        rc = stm_fs_stat(s->fs, ds, new_ino, &iv);
-        if (rc == STM_OK)
-            new_cvers = qid_version(&iv);
-    }
+        rc = stm_fs_symlink_if_gen(s->fs, ds, ino, gen,
+                                   (const uint8_t *)name, (uint8_t)nlen,
+                                   (const uint8_t *)symtgt, tlen,
+                                   s->auth_uid, gid, &new_ino, &iv);
+    if (rc == STM_OK)
+        new_cvers = qid_version(&iv);
     if (rc != STM_OK) ecode = status_to_errno(rc);
 
     /* (c) no fid mutation; unpin. */
@@ -3217,11 +3222,11 @@ static stm_status h_unlinkat(stm_9p_server *s,
     stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, NULL);
     if (rc == STM_OK) {
         if (flags & STM_9P_AT_REMOVEDIR) {
-            rc = stm_fs_rmdir(s->fs, ds, ino,
-                               (const uint8_t *)name, (uint8_t)nlen);
+            rc = stm_fs_rmdir_if_gen(s->fs, ds, ino, gen,
+                                     (const uint8_t *)name, (uint8_t)nlen);
         } else {
-            rc = stm_fs_unlink(s->fs, ds, ino,
-                                (const uint8_t *)name, (uint8_t)nlen);
+            rc = stm_fs_unlink_if_gen(s->fs, ds, ino, gen,
+                                      (const uint8_t *)name, (uint8_t)nlen);
         }
     }
     if (rc != STM_OK) ecode = status_to_errno(rc);
@@ -3314,11 +3319,11 @@ static stm_status h_renameat(stm_9p_server *s,
     if (rc == STM_OK)
         rc = verify_fresh_snapshot(s->fs, ds, n_ino, n_gen, NULL);
     if (rc == STM_OK)
-        rc = stm_fs_rename(s->fs, ds, o_ino,
-                              (const uint8_t *)old_name, (uint8_t)old_nlen,
-                              n_ino,
-                              (const uint8_t *)new_name, (uint8_t)new_nlen,
-                              /*flags=*/0);
+        rc = stm_fs_rename_if_gen(s->fs, ds, o_ino, o_gen,
+                                  (const uint8_t *)old_name, (uint8_t)old_nlen,
+                                  n_ino, n_gen,
+                                  (const uint8_t *)new_name, (uint8_t)new_nlen,
+                                  /*flags=*/0);
     if (rc != STM_OK) ecode = status_to_errno(rc);
 
     /* (c) no fid mutation; unpin both. */
@@ -3395,9 +3400,8 @@ static stm_status h_setattr(stm_9p_server *s,
      * sentinel; .L's valid mask is the cleaner mechanism but
      * stm_fs_chown takes the sentinel, so we plumb both. */
     uint32_t ecode = 0;
-    bool     refresh_gen = false;
-    uint64_t fresh_gen   = 0;
-    uint32_t fresh_cvers = 0;
+    bool     refresh_cvers = false;
+    uint32_t fresh_cvers   = 0;
 
     struct stm_inode_value iv;
     stm_status vrc = verify_fresh_snapshot(s->fs, ds, ino, gen, &iv);
@@ -3419,13 +3423,13 @@ static stm_status h_setattr(stm_9p_server *s,
             ecode = status_to_errno(rc);
             goto phase_c;
         }
-        /* Refresh cached_gen after potential gen bump — captured here,
-         * applied in (c) under s->lock. */
+        /* Refresh cached_cvers (the truncate bumped si_cvers) --
+         * captured here, applied in (c) under s->lock -- only while the
+         * inode is still the fid's own incarnation. */
         struct stm_inode_value post;
-        if (stm_fs_stat(s->fs, ds, ino, &post) == STM_OK) {
-            refresh_gen = true;
-            fresh_gen   = stm_load_le64(post.si_gen);
-            fresh_cvers = qid_version(&post);
+        if (restat_fresh(s->fs, ds, ino, gen, &post) == STM_OK) {
+            refresh_cvers = true;
+            fresh_cvers   = qid_version(&post);
         }
     }
 
@@ -3492,12 +3496,12 @@ static stm_status h_setattr(stm_9p_server *s,
     }
 
 phase_c:
-    /* (c) under s->lock: apply the truncate's gen refresh, identity-
+    /* (c) under s->lock: apply the truncate's cvers refresh, identity-
      * guarded (a concurrent same-fid rebind supersedes it); unpin. */
     must_lock(&s->lock);
-    if (refresh_gen &&
-        f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino) {
-        f->cached_gen   = fresh_gen;
+    if (refresh_cvers &&
+        f->kind == P9_FID_NODE && f->dataset_id == ds && f->ino == ino &&
+        f->cached_gen == gen) {
         f->cached_cvers = fresh_cvers;
     }
     fid_unpin_locked(s, f);
@@ -4259,20 +4263,21 @@ static stm_status h_reflink(stm_9p_server *s,
     /* stm_fs_reflink enforces: src and dst are regular files; dst is
      * empty (size == 0 + no extents); same dataset (else STM_EXDEV);
      * etc. */
-    stm_status rc = stm_fs_reflink(s->fs,
-                                       sf->dataset_id, sf->ino,
-                                       df->dataset_id, df->ino);
+    stm_status rc = stm_fs_reflink_if_gen(s->fs,
+                                          sf->dataset_id, sf->ino,
+                                          sf->cached_gen,
+                                          df->dataset_id, df->ino,
+                                          df->cached_gen);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
 
-    /* Re-stat dst to refresh cached_gen/cached_cvers + emit the post-
-     * reflink qid. The reflink bumped dst's si_cvers (its content
-     * changed), so qid.version advances — the guest cache invalidates. */
+    /* Re-stat dst to refresh cached_cvers + emit the post-reflink qid.
+     * The reflink bumped dst's si_cvers (its content changed), so
+     * qid.version advances — the guest cache invalidates. */
     struct stm_inode_value iv;
-    rc = stm_fs_stat(s->fs, df->dataset_id, df->ino, &iv);
+    rc = restat_fresh(s->fs, df->dataset_id, df->ino, df->cached_gen, &iv);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
-    df->cached_gen   = stm_load_le64(iv.si_gen);
     df->cached_cvers = qid_version(&iv);
     df->qid_type     = qid_type_from_mode(stm_load_le32(iv.si_mode));
 
