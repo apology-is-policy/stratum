@@ -143,6 +143,8 @@ short-circuit non-matching scans.
 - **`NoConflictingLocks`** — at every reachable state, no two locks
   satisfy the conflict predicate. Acquire and ReleaseOwner are the
   only mutators; both preserve the invariant.
+- **`OwnLocksNeverRefuse`** — an owner's own locks never refuse its
+  acquire, so it may stack or upgrade over any range it holds.
 
 Spec actions:
 
@@ -154,13 +156,15 @@ Spec actions:
 - `Test(t, ds, ino, owner, type, off, len)` — pure read; returns
   `would_grant ∈ BOOLEAN`.
 
-Buggy variants (in spec; need not be re-spelled in impl):
+Buggy variants change only what Acquire checks (`AcquireRefuses`); the
+invariants judge by the healthy `Conflicts`:
 
-- `BuggyAcquireIgnoresConflict` — Acquire admits records regardless
-  of overlap. Trips `NoConflictingLocks` within ~3 states.
-- `BuggyReleaseOwnerSkipsSomeInode` — partial-release of an owner.
-  Trips `NoConflictingLocks` only against a fid-clunk-mid-flock
-  scenario.
+- `BuggyShared_Excl_Granted` — Acquire refuses only EXCLUSIVE against
+  EXCLUSIVE. Fires `NoConflictingLocks` after two acquires
+  (`locks_shared_excl_granted_buggy.cfg`).
+- `BuggyOwnerCheckMissing` — Acquire ignores the owner, so an owner's
+  own exclusive lock refuses its next acquire. Fires
+  `OwnLocksNeverRefuse` (`locks_owner_check_missing_buggy.cfg`).
 
 ## SPEC-TO-CODE mapping
 

@@ -32,33 +32,26 @@
 \*     forward-note for the eventual blocking + lock-merge
 \*     refinement chunk.
 \*
-\* Buggy variants (each fires a healthy invariant):
+\* An inode here is one incarnation of it: the impl keys records by
+\* (dataset_id, ino, si_gen), so a lock on a freed file and a lock on
+\* the file that reuses its number are on different Inos.
+\*
+\* Buggy variants change only what Acquire checks (AcquireRefuses);
+\* the invariants judge by the healthy Conflicts, so each variant
+\* fires the invariant its bug breaks:
 \*
 \*   BuggyOwnerCheckMissing
-\*       Acquire's conflict check ignores the owner field. Two
-\*       locks of the same owner are reported as conflicting,
-\*       which the spec wouldn't refuse (in healthy mode the
-\*       conflict predicate skips same-owner overlap). But more
-\*       importantly, conflicts ACROSS owners are detected
-\*       correctly, but the absence of the owner check means
-\*       that a single owner trying to UPGRADE its own lock
-\*       (e.g., Acquire SHARED then Acquire EXCLUSIVE on same
-\*       range) is rejected — POSIX semantics say upgrade is
-\*       allowed for OFD locks. The healthy invariant is that
-\*       same-owner Acquires never conflict; under the bug,
-\*       they do. Doesn't fire NoConflictingLocks (a same-
-\*       owner Acquire would just be refused), but it DOES
-\*       break the upgrade-locked invariant we'd want
-\*       SameOwnerNoConflict to express.
+\*       Acquire's check ignores the owner: an owner's own
+\*       overlapping exclusive lock refuses its next acquire, so it
+\*       cannot stack or upgrade (POSIX allows both for OFD locks).
+\*       Fires OwnLocksNeverRefuse once an owner holds an exclusive
+\*       lock.
 \*
 \*   BuggyShared_Excl_Granted
-\*       Acquire's conflict check treats SHARED+EXCLUSIVE
-\*       overlap as a non-conflict. Fires NoConflictingLocks:
-\*       a SHARED lock at [0, 100) by owner A and an EXCLUSIVE
-\*       at [50, 100) by owner B coexist; the predicate
-\*       Conflicts(s, e) = TRUE in healthy mode but FALSE
-\*       under the bug. Linear chain: e SHARED then EXCL
-\*       admitted → 2 locks, predicate fires.
+\*       Acquire's check refuses only EXCLUSIVE against EXCLUSIVE,
+\*       so a SHARED lock by one owner and an overlapping EXCLUSIVE
+\*       by another coexist. Fires NoConflictingLocks after two
+\*       acquires.
 
 EXTENDS Integers, FiniteSets, TLC
 
@@ -94,17 +87,24 @@ Overlaps(l1, l2) ==
     /\ l1.off < l2.off + l2.len
     /\ l2.off < l1.off + l1.len
 
-\* Conflict predicate. Healthy:
-\*   conflict iff overlapping AND different owner AND at-least-one-
-\*   exclusive.
-\* Buggy variants weaken specific clauses to fire invariants.
+\* Conflict predicate: overlapping AND different owner AND at least
+\* one exclusive. The invariants judge by it in every mode.
 Conflicts(l1, l2) ==
     /\ Overlaps(l1, l2)
-    /\ \/ BuggyOwnerCheckMissing
-       \/ l1.owner /= l2.owner
-    /\ \/ BuggyShared_Excl_Granted
-       \/ l1.type = "exclusive"
+    /\ l1.owner /= l2.owner
+    /\ \/ l1.type = "exclusive"
        \/ l2.type = "exclusive"
+
+\* What Acquire refuses on: Conflicts, unless a buggy variant changes
+\* the check.
+AcquireRefuses(cand, other) ==
+    /\ Overlaps(cand, other)
+    /\ \/ BuggyOwnerCheckMissing
+       \/ cand.owner /= other.owner
+    /\ IF BuggyShared_Excl_Granted
+         THEN cand.type = "exclusive" /\ other.type = "exclusive"
+         ELSE \/ cand.type = "exclusive"
+              \/ other.type = "exclusive"
 
 \* Acquire — non-blocking. Adds the candidate iff no existing lock
 \* conflicts with it.
@@ -115,7 +115,7 @@ Acquire(ino, owner, type, off, len) ==
     /\ LET cand == [ino |-> ino, owner |-> owner, type |-> type,
                      off |-> off, len |-> len]
        IN
-        /\ ~ \E other \in locks : Conflicts(cand, other)
+        /\ ~ \E other \in locks : AcquireRefuses(cand, other)
         /\ locks' = locks \cup {cand}
 
 \* Release — exact-match removal. The C impl mirrors this: callers
@@ -175,9 +175,18 @@ ExclusiveExcludesDifferentOwner ==
                        /\ other.owner # excl.owner) =>
             FALSE
 
+\* An owner's own locks never refuse its acquire: it may stack or
+\* upgrade over any range it holds (POSIX OFD locks).
+OwnLocksNeverRefuse ==
+    \A l \in locks, t \in LockTypes :
+        ~ \E other \in locks :
+            /\ other.owner = l.owner
+            /\ AcquireRefuses([l EXCEPT !.type = t], other)
+
 Invariants ==
     /\ TypeOK
     /\ NoConflictingLocks
     /\ ExclusiveExcludesDifferentOwner
+    /\ OwnLocksNeverRefuse
 
 =============================================================================
