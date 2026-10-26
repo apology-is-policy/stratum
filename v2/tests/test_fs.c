@@ -11598,6 +11598,112 @@ STM_TEST(fs_rename_waits_out_a_commit_window) {
     unlink(g_key_path);
 }
 
+/* The window wait against real closers: stm_sync_commit runs with no
+ * fs->global (CF-4 C commits under SH) beside an SH creator and two serial
+ * dirent counts. At the production bound every window a count meets is
+ * waited out; at 1 us the same run refuses, so the counts did meet open
+ * windows. */
+typedef struct {
+    stm_fs      *fs;
+    uint64_t     dir;
+    atomic_bool  stop;
+    atomic_uint  ebusy, other;
+} real_window_ctx;
+
+static void *real_window_counter(void *arg)
+{
+    real_window_ctx *c = arg;
+    stm_dirent_index *di = stm_sync_dirent_index(stm_fs_sync(c->fs));
+    while (!atomic_load(&c->stop)) {
+        size_t n = 0;
+        stm_status s = stm_dirent_count_for_dir(di, 1, c->dir, &n);
+        if (s == STM_EBUSY)    atomic_fetch_add(&c->ebusy, 1);
+        else if (s != STM_OK)  atomic_fetch_add(&c->other, 1);
+    }
+    return NULL;
+}
+
+static void *real_window_creator(void *arg)
+{
+    real_window_ctx *c = arg;
+    char nm[16];
+    for (int i = 0; i < 400; i++) {
+        uint64_t ino = 0;
+        int l = snprintf(nm, sizeof nm, "w%d", i);
+        (void)stm_fs_create_file(c->fs, 1, c->dir, (const uint8_t *)nm,
+                                 (uint8_t)l, 0644u, 0, 0, &ino);
+    }
+    return NULL;
+}
+
+static void *real_window_committer(void *arg)
+{
+    real_window_ctx *c = arg;
+    stm_sync *sync = stm_fs_sync(c->fs);
+    for (int i = 0; i < 200; i++) (void)stm_sync_commit(sync);
+    return NULL;
+}
+
+static void real_windows_run(uint64_t bound_ns, const char *tag,
+                             int *out_waits, unsigned *out_ebusy,
+                             unsigned *out_other)
+{
+    *out_waits = 0;
+    *out_ebusy = *out_other = 0;
+    make_tmp(tag);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    real_window_ctx c = { .fs = fs };
+    STM_ASSERT_OK(stm_inode_alloc(stm_sync_inode_index(stm_fs_sync(fs)), 1,
+                                  (uint32_t)S_IFDIR | 0755u, 0, 0, &c.dir));
+    atomic_init(&c.stop, false);
+    atomic_init(&c.ebusy, 0);
+    atomic_init(&c.other, 0);
+    atomic_int waits;
+    atomic_init(&waits, 0);
+    stm_btree_engine_set_window_wait_hook_for_test(fs_window_wait_hook,
+                                                   &waits);
+    stm_btree_engine_set_window_wait_for_test(bound_ns);
+    pthread_t r1, r2, w, k;
+    STM_ASSERT_EQ(pthread_create(&r1, NULL, real_window_counter, &c), 0);
+    STM_ASSERT_EQ(pthread_create(&r2, NULL, real_window_counter, &c), 0);
+    STM_ASSERT_EQ(pthread_create(&w, NULL, real_window_creator, &c), 0);
+    STM_ASSERT_EQ(pthread_create(&k, NULL, real_window_committer, &c), 0);
+    pthread_join(w, NULL);
+    pthread_join(k, NULL);
+    atomic_store(&c.stop, true);
+    pthread_join(r1, NULL);
+    pthread_join(r2, NULL);
+    stm_btree_engine_set_window_wait_hook_for_test(NULL, NULL);
+    stm_btree_engine_set_window_wait_for_test(0);
+    *out_waits = atomic_load(&waits);
+    *out_ebusy = atomic_load(&c.ebusy);
+    *out_other = atomic_load(&c.other);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_serial_counts_wait_out_real_commit_windows) {
+    int waits = 0;
+    unsigned ebusy = 0, other = 0;
+    real_windows_run(0, "real_windows", &waits, &ebusy, &other);
+    printf("  production bound: waits=%d ebusy=%u other=%u\n", waits, ebusy,
+           other);
+    STM_ASSERT_TRUE(waits > 0);
+    STM_ASSERT_EQ(ebusy, 0u);
+    STM_ASSERT_EQ(other, 0u);
+    real_windows_run(1000, "real_windows_1us", &waits, &ebusy, &other);
+    printf("  1 us bound: waits=%d ebusy=%u other=%u\n", waits, ebusy, other);
+    STM_ASSERT_TRUE(waits > 0);
+    STM_ASSERT_TRUE(ebusy > 0);
+    STM_ASSERT_EQ(other, 0u);
+}
+
 /* An inode's xattrs go with it. Every path that frees an inode drops its
  * xattr records before the free, so a file created on the reused inode
  * number starts with none of the previous tenant's; a reused ino whose

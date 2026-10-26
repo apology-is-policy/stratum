@@ -105,7 +105,11 @@ the last unlink, rmdir, rename over an existing name, `unlink_anon`)
 before the inode is freed, reporting a failure on stderr; and every
 create that is handed a reused ino (`si_gen != 0`) calls it again before
 linking the inode (`fs_clean_reused_ino_locked`) and refuses if it
-fails, so a create never inherits. The second call is also what clears
+fails, so a create never inherits. A failure that persists (a damaged
+tree under that ino) therefore refuses every create in the dataset,
+since the allocator hands the same lowest freed ino back each time.
+That is deliberate: the other side of it is a new file holding its
+predecessor's xattrs or data. The second call is also what clears
 volumes written before the first existed: until then nothing called
 the hook, and a reused ino carried its previous tenant's xattrs (tests
 `fs_reused_ino_starts_without_the_old_xattrs`,

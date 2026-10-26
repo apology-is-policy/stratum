@@ -854,8 +854,14 @@ finalize `stm_sync_commit` takes only the dataset, snapshot, CAS and
 repair-log index locks, the allocator's and the devices', none of which
 a serial-op caller holds (the module `idx->lock`s are not among them;
 the dataset's own serial calls run on throwaway engines that never open
-a window), and it runs no serial op itself. The header states this as
-the caller's obligation. Tests: the four
+a window), and it runs no serial op itself. The scrub is the caller
+that holds the most outside the fs: each block it verifies runs under
+its own `sc->lock` and the pool's read lock, and the paddr lookup under
+the extent index lock, beside every commit. The closer takes none of
+them (it holds the pool's read lock itself, taken before the flush),
+and that lookup walks wait-free (`stm_extent_lookup_by_paddr`, each
+engine read inside its EBR pin), so the scrub no longer meets a window
+at all. The header states this as the caller's obligation. Tests: the four
 `engine_serial_*_waits_for_a_*` legs (scan and lookup, clone and legacy
 arm, finalize and abort; the bound set to 60 s, so a close that wakes
 nobody fails on time),

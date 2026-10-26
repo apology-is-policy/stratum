@@ -2938,7 +2938,10 @@ lookup_fallback:
  * free whose drop failed) and extents (a free whose truncate failed; the
  * extent AD binds no gen either, so they would read back as the new
  * file's data). They go before the new inode is linked; a create that
- * cannot clear them refuses rather than hand them on. */
+ * cannot clear them refuses rather than hand them on. A failure that
+ * persists (a damaged tree under the ino) so refuses every create in the
+ * dataset, the allocator handing the same lowest freed ino back each
+ * time: fail-closed, by choice. */
 static stm_status fs_clean_reused_ino_locked(stm_fs *fs, uint64_t dataset_id,
                                              uint64_t ino, uint64_t gen)
 {
