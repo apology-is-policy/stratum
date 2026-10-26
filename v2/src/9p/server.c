@@ -143,7 +143,7 @@ typedef struct p9_fid {
 
     uint64_t    dataset_id;
     uint64_t    ino;
-    uint32_t    cached_gen;     /* fid.tla cached_gen — si_gen at bind time */
+    uint64_t    cached_gen;     /* fid.tla cached_gen — si_gen at bind time */
     uint32_t    cached_cvers;   /* content-version snapshot (L1/Larder). The
                                  * si_cvers partner to cached_gen: refreshed
                                  * wherever cached_gen is (from a fresh stat),
@@ -294,6 +294,8 @@ static inline void must_broadcast(pthread_cond_t *c) {
 static struct stm_9p_server_test_hooks {
     void (*phase_b)(uint8_t type, uint16_t tag, void *arg);
     void  *arg;
+    void (*fresh)(uint64_t ds, uint64_t ino, void *arg);
+    void  *fresh_arg;
 } g_9p_test_hooks;
 
 void stm_9p_server_set_test_hooks(
@@ -301,6 +303,13 @@ void stm_9p_server_set_test_hooks(
 {
     g_9p_test_hooks.phase_b = phase_b;
     g_9p_test_hooks.arg     = arg;
+}
+
+void stm_9p_server_set_fresh_hook(
+    void (*fresh)(uint64_t ds, uint64_t ino, void *arg), void *arg)
+{
+    g_9p_test_hooks.fresh     = fresh;
+    g_9p_test_hooks.fresh_arg = arg;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -760,7 +769,7 @@ static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
                                             uint64_t start_ino,
                                             const char *path, size_t path_len,
                                             uint64_t *out_ino,
-                                            uint32_t *out_gen,
+                                            uint64_t *out_gen,
                                             uint32_t *out_cvers,
                                             uint8_t  *out_qt)
 {
@@ -793,7 +802,7 @@ static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
     rc = stm_fs_stat(s->fs, ds, cur_ino, &iv);
     if (rc != STM_OK) return rc;
     if (out_ino)   *out_ino   = cur_ino;
-    if (out_gen)   *out_gen   = (uint32_t)stm_load_le64(iv.si_gen);
+    if (out_gen)   *out_gen   = stm_load_le64(iv.si_gen);
     if (out_cvers) *out_cvers = qid_version(&iv);
     if (out_qt)    *out_qt    = qid_type_from_mode(stm_load_le32(iv.si_mode));
     return STM_OK;
@@ -803,7 +812,7 @@ static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
 static stm_status ns_walk_abs_path(stm_9p_server *s, uint64_t ds,
                                        const char *path, size_t path_len,
                                        uint64_t *out_ino,
-                                       uint32_t *out_gen,
+                                       uint64_t *out_gen,
                                        uint32_t *out_cvers,
                                        uint8_t  *out_qt)
 {
@@ -1020,15 +1029,17 @@ static stm_status reply_rlerror_status(uint8_t *resp, uint32_t resp_cap,
  * full-lock handlers. */
 static stm_status verify_fresh_snapshot(stm_fs *fs,
                                            uint64_t ds, uint64_t ino,
-                                           uint32_t cached_gen,
+                                           uint64_t cached_gen,
                                            struct stm_inode_value *out)
 {
     struct stm_inode_value iv;
     stm_status rc = stm_fs_stat(fs, ds, ino, &iv);
     if (rc != STM_OK) return rc;
     uint64_t cur_gen = stm_load_le64(iv.si_gen);
-    if ((uint32_t)cur_gen != cached_gen) return STM_ESTALE;
+    if (cur_gen != cached_gen) return STM_ESTALE;
     if (out) *out = iv;
+    if (g_9p_test_hooks.fresh)
+        g_9p_test_hooks.fresh(ds, ino, g_9p_test_hooks.fresh_arg);
     return STM_OK;
 }
 
@@ -1168,7 +1179,7 @@ static stm_status h_attach(stm_9p_server *s,
      * the aname kind. ANAME_DEFAULT and ANAME_SPEC bind to ino==1;
      * ANAME_ABS_PATH walks the path and binds to the resolved ino. */
     uint64_t bound_ino     = 1u;
-    uint32_t bound_gen     = 0;
+    uint64_t bound_gen     = 0;
     uint32_t bound_cvers   = 0;
     uint8_t  bound_qt      = 0;
     uint64_t bound_dataset = s->root_dataset;
@@ -1208,7 +1219,7 @@ static stm_status h_attach(stm_9p_server *s,
         }
         bound_dataset = child_ds;
         bound_ino     = 1u;
-        bound_gen     = (uint32_t)stm_load_le64(root_iv.si_gen);
+        bound_gen     = stm_load_le64(root_iv.si_gen);
         bound_cvers   = qid_version(&root_iv);
         bound_qt      = qid_type_from_mode(stm_load_le32(root_iv.si_mode));
     } else {
@@ -1220,7 +1231,7 @@ static stm_status h_attach(stm_9p_server *s,
             return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
         }
         bound_ino   = 1u;
-        bound_gen   = (uint32_t)stm_load_le64(root_iv.si_gen);
+        bound_gen   = stm_load_le64(root_iv.si_gen);
         bound_cvers = qid_version(&root_iv);
         bound_qt    = qid_type_from_mode(stm_load_le32(root_iv.si_mode));
     }
@@ -1321,7 +1332,8 @@ static stm_status h_clunk(stm_9p_server *s,
         if (f->xattr_buf_len == f->xattr_expected_size && f->xattr_name) {
             /* R92 P3-2: use the wire-supplied name_len, not strlen
              * (which would truncate embedded NULs). */
-            commit_rc = stm_fs_setxattr(s->fs, f->dataset_id, f->ino,
+            commit_rc = stm_fs_setxattr_if_gen(s->fs, f->dataset_id, f->ino,
+                                          f->cached_gen,
                                           (const uint8_t *)f->xattr_name,
                                           f->xattr_name_len,
                                           f->xattr_buf,
@@ -1389,7 +1401,7 @@ static stm_status h_flush(stm_9p_server *s,
 struct walk_cursor {
     uint64_t ds;
     uint64_t ino;
-    uint32_t gen;
+    uint64_t gen;
     uint32_t cvers;         /* content-version — the wire qid.version */
     uint8_t  qt;
     char     path[STM_9P_NS_PATH_MAX + 1u];
@@ -1497,7 +1509,7 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
 
         cur->ds    = next_ds;
         cur->ino   = next_ino;
-        cur->gen   = (uint32_t)stm_load_le64(next_iv.si_gen);
+        cur->gen   = stm_load_le64(next_iv.si_gen);
         cur->cvers = qid_version(&next_iv);
         cur->qt    = qid_type_from_mode(stm_load_le32(next_iv.si_mode));
         memcpy(cur->path, new_path, new_path_len);
@@ -1529,7 +1541,7 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
  * qid encoding — h_getattr from the fid snapshot, Twalkgetattr from
  * the walk loop's per-step pack). rdev is zero and blksize is the
  * synthetic 4096, exactly as h_getattr has always replied; the `gen`
- * attr is the u32-truncated si_gen (the fid cached_gen width), while
+ * attr is si_gen (the fid cached_gen), while
  * data_version carries si_cvers (== qid.version) so Rgetattr's content
  * field stays coherent with the qid the caller packed.
  * Returns wp advanced by STM_9P_GETATTR_BODY_SIZE. */
@@ -1556,7 +1568,7 @@ static uint8_t *pack_getattr_body(uint8_t *wp, uint64_t valid,
     p9l_p64(wp, (uint64_t)stm_load_le32(iv->si_ctime_nsec)); wp += 8;
     p9l_p64(wp, stm_load_le64(iv->si_btime_sec));            wp += 8;
     p9l_p64(wp, (uint64_t)stm_load_le32(iv->si_btime_nsec)); wp += 8;
-    p9l_p64(wp, (uint64_t)(uint32_t)stm_load_le64(iv->si_gen)); wp += 8;
+    p9l_p64(wp, stm_load_le64(iv->si_gen)); wp += 8;
     p9l_p64(wp, (uint64_t)qid_version(iv)); wp += 8;  /* data_version = si_cvers */
     return wp;
 }
@@ -1989,7 +2001,7 @@ static stm_status h_getattr(stm_9p_server *s,
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds  = f->dataset_id;
     uint64_t ino = f->ino;
-    uint32_t gen = f->cached_gen;
+    uint64_t gen = f->cached_gen;
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TGETATTR, tag);
 
@@ -2066,14 +2078,14 @@ static stm_status h_lopen(stm_9p_server *s,
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds     = f->dataset_id;
     uint64_t ino    = f->ino;
-    uint32_t gen    = f->cached_gen;
+    uint64_t gen    = f->cached_gen;
     uint64_t iounit = iounit_for_msize(s->msize);
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TLOPEN, tag);
 
     /* (b) unlocked: verify + type/flag gates + optional O_TRUNC. */
     uint32_t ecode     = 0;         /* != 0 -> Rlerror(ecode) */
-    uint32_t reply_gen = gen;       /* refreshed if O_TRUNC bumps si_gen */
+    uint64_t reply_gen = gen;       /* refreshed if O_TRUNC bumps si_gen */
     uint32_t reply_cvers = 0;       /* si_cvers -> qid.version (fresh below) */
     uint32_t mode      = 0;
 
@@ -2127,7 +2139,7 @@ static stm_status h_lopen(stm_9p_server *s,
             ecode = STM_9P_ECODE_EACCES;
             goto phase_c;
         }
-        rc = stm_fs_truncate(s->fs, ds, ino, /*new_size=*/0);
+        rc = stm_fs_truncate_if_gen(s->fs, ds, ino, gen, /*new_size=*/0);
         if (rc != STM_OK) {
             ecode = status_to_errno(rc);
             goto phase_c;
@@ -2145,7 +2157,7 @@ static stm_status h_lopen(stm_9p_server *s,
             ecode = status_to_errno(rc);
             goto phase_c;
         }
-        reply_gen   = (uint32_t)stm_load_le64(post.si_gen);
+        reply_gen   = stm_load_le64(post.si_gen);
         reply_cvers = qid_version(&post);
     }
 
@@ -2249,7 +2261,7 @@ static stm_status h_read(stm_9p_server *s,
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds  = f->dataset_id;
     uint64_t ino = f->ino;
-    uint32_t gen = f->cached_gen;
+    uint64_t gen = f->cached_gen;
     uint32_t max_payload = iounit_for_msize(s->msize);
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TREAD, tag);
@@ -2367,7 +2379,7 @@ static stm_status h_write(stm_9p_server *s,
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds         = f->dataset_id;
     uint64_t ino        = f->ino;
-    uint32_t gen        = f->cached_gen;
+    uint64_t gen        = f->cached_gen;
     uint32_t open_flags = f->open_flags;
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TWRITE, tag);
@@ -2388,7 +2400,8 @@ static stm_status h_write(stm_9p_server *s,
     if (open_flags & STM_9P_O_APPEND)
         offset = stm_load_le64(iv.si_size);
 
-    rc = stm_fs_write(s->fs, ds, ino, offset, body + 16, (size_t)count);
+    rc = stm_fs_write_if_gen(s->fs, ds, ino, gen, offset, body + 16,
+                             (size_t)count);
     if (rc != STM_OK)
         ecode = status_to_errno(rc);
 
@@ -2452,7 +2465,7 @@ static stm_status h_readdir(stm_9p_server *s,
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds  = f->dataset_id;
     uint64_t ino = f->ino;
-    uint32_t gen = f->cached_gen;
+    uint64_t gen = f->cached_gen;
     uint32_t max_payload = iounit_for_msize(s->msize);
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TREADDIR, tag);
@@ -2665,7 +2678,7 @@ static stm_status h_lcreate(stm_9p_server *s,
      * heap pointer — copy it to the stack HERE; (b) must not touch it. */
     uint64_t ds         = f->dataset_id;
     uint64_t parent_ino = f->ino;
-    uint32_t gen        = f->cached_gen;
+    uint64_t gen        = f->cached_gen;
     uint64_t iounit     = iounit_for_msize(s->msize);
     char   parent_ns[STM_9P_NS_PATH_MAX + 1u];
     size_t parent_ns_len = 0;
@@ -2682,7 +2695,7 @@ static stm_status h_lcreate(stm_9p_server *s,
     /* (b) unlocked. */
     uint32_t ecode      = 0;
     uint64_t new_ino    = 0;
-    uint32_t new_gen    = 0;
+    uint64_t new_gen    = 0;
     uint32_t new_cvers  = 0;
     uint8_t  new_qt     = 0;
     char    *new_ns     = NULL;
@@ -2710,7 +2723,7 @@ static stm_status h_lcreate(stm_9p_server *s,
         ecode = status_to_errno(rc);
         goto phase_c;
     }
-    new_gen   = (uint32_t)stm_load_le64(iv.si_gen);
+    new_gen   = stm_load_le64(iv.si_gen);
     new_cvers = qid_version(&iv);
     new_qt    = qid_type_from_mode(stm_load_le32(iv.si_mode));
 
@@ -2823,7 +2836,7 @@ static stm_status h_mkdir(stm_9p_server *s,
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds  = f->dataset_id;
     uint64_t ino = f->ino;
-    uint32_t gen = f->cached_gen;
+    uint64_t gen = f->cached_gen;
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TMKDIR, tag);
 
@@ -2920,9 +2933,9 @@ static stm_status h_link(stm_9p_server *s,
      * slot twice (balanced by the double unpin). */
     uint64_t ds     = sf->dataset_id;
     uint64_t s_ino  = sf->ino;
-    uint32_t s_gen  = sf->cached_gen;
+    uint64_t s_gen  = sf->cached_gen;
     uint64_t d_ino  = df->ino;
-    uint32_t d_gen  = df->cached_gen;
+    uint64_t d_gen  = df->cached_gen;
     fid_pin_locked(sf);
     fid_pin_locked(df);
     phase_b_enter(s, STM_9P_TLINK, tag);
@@ -2997,7 +3010,7 @@ static stm_status h_symlink(stm_9p_server *s,
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds  = f->dataset_id;
     uint64_t ino = f->ino;
-    uint32_t gen = f->cached_gen;
+    uint64_t gen = f->cached_gen;
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TSYMLINK, tag);
 
@@ -3063,7 +3076,7 @@ static stm_status h_readlink(stm_9p_server *s,
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds  = f->dataset_id;
     uint64_t ino = f->ino;
-    uint32_t gen = f->cached_gen;
+    uint64_t gen = f->cached_gen;
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TREADLINK, tag);
 
@@ -3138,7 +3151,7 @@ static stm_status h_unlinkat(stm_9p_server *s,
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds  = f->dataset_id;
     uint64_t ino = f->ino;
-    uint32_t gen = f->cached_gen;
+    uint64_t gen = f->cached_gen;
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TUNLINKAT, tag);
 
@@ -3231,9 +3244,9 @@ static stm_status h_renameat(stm_9p_server *s,
      * when old_dirfid == new_dirfid is balanced by the double unpin). */
     uint64_t ds     = of->dataset_id;
     uint64_t o_ino  = of->ino;
-    uint32_t o_gen  = of->cached_gen;
+    uint64_t o_gen  = of->cached_gen;
     uint64_t n_ino  = nf->ino;
-    uint32_t n_gen  = nf->cached_gen;
+    uint64_t n_gen  = nf->cached_gen;
     fid_pin_locked(of);
     fid_pin_locked(nf);
     phase_b_enter(s, STM_9P_TRENAMEAT, tag);
@@ -3316,7 +3329,7 @@ static stm_status h_setattr(stm_9p_server *s,
     /* (a) snapshot + pin (CF-2b). */
     uint64_t ds  = f->dataset_id;
     uint64_t ino = f->ino;
-    uint32_t gen = f->cached_gen;
+    uint64_t gen = f->cached_gen;
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TSETATTR, tag);
 
@@ -3326,7 +3339,7 @@ static stm_status h_setattr(stm_9p_server *s,
      * stm_fs_chown takes the sentinel, so we plumb both. */
     uint32_t ecode = 0;
     bool     refresh_gen = false;
-    uint32_t fresh_gen   = 0;
+    uint64_t fresh_gen   = 0;
     uint32_t fresh_cvers = 0;
 
     struct stm_inode_value iv;
@@ -3343,7 +3356,8 @@ static stm_status h_setattr(stm_9p_server *s,
             ecode = STM_9P_ECODE_EINVAL;
             goto phase_c;
         }
-        stm_status rc = stm_fs_truncate(s->fs, ds, ino, new_size);
+        stm_status rc = stm_fs_truncate_if_gen(s->fs, ds, ino, gen,
+                                               new_size);
         if (rc != STM_OK) {
             ecode = status_to_errno(rc);
             goto phase_c;
@@ -3353,14 +3367,15 @@ static stm_status h_setattr(stm_9p_server *s,
         struct stm_inode_value post;
         if (stm_fs_stat(s->fs, ds, ino, &post) == STM_OK) {
             refresh_gen = true;
-            fresh_gen   = (uint32_t)stm_load_le64(post.si_gen);
+            fresh_gen   = stm_load_le64(post.si_gen);
             fresh_cvers = qid_version(&post);
         }
     }
 
     /* MODE. */
     if (valid & STM_9P_SETATTR_MODE) {
-        stm_status rc = stm_fs_chmod(s->fs, ds, ino, new_mode & 07777u);
+        stm_status rc = stm_fs_chmod_if_gen(s->fs, ds, ino, gen,
+                                            new_mode & 07777u);
         if (rc != STM_OK) {
             ecode = status_to_errno(rc);
             goto phase_c;
@@ -3373,7 +3388,8 @@ static stm_status h_setattr(stm_9p_server *s,
     if ((valid & STM_9P_SETATTR_UID) || (valid & STM_9P_SETATTR_GID)) {
         uint32_t pass_uid = (valid & STM_9P_SETATTR_UID) ? new_uid : UINT32_MAX;
         uint32_t pass_gid = (valid & STM_9P_SETATTR_GID) ? new_gid : UINT32_MAX;
-        stm_status rc = stm_fs_chown(s->fs, ds, ino, pass_uid, pass_gid);
+        stm_status rc = stm_fs_chown_if_gen(s->fs, ds, ino, gen,
+                                            pass_uid, pass_gid);
         if (rc != STM_OK) {
             ecode = status_to_errno(rc);
             goto phase_c;
@@ -3407,7 +3423,7 @@ static stm_status h_setattr(stm_9p_server *s,
         }
         /* ctime is stamped by stm_fs_utimens; its ctime arguments are
          * ignored. */
-        stm_status rc = stm_fs_utimens(s->fs, ds, ino,
+        stm_status rc = stm_fs_utimens_if_gen(s->fs, ds, ino, gen,
                                           use_at_sec, use_at_nsec,
                                           use_mt_sec, use_mt_nsec,
                                           /*ctime_sec=*/0,
@@ -3600,6 +3616,8 @@ static stm_status h_lock(stm_9p_server *s,
     uint8_t status = STM_9P_LOCK_SUCCESS;
 
     if (type == STM_9P_LOCK_TYPE_UNLCK) {
+        /* No identity needed: it removes only this fid's own records,
+         * and those are all on the incarnation the fid locked. */
         stm_status rc = stm_fs_unlock(s->fs, f->dataset_id, f->ino,
                                          owner_id, start, length);
         if (rc != STM_OK)
@@ -3609,8 +3627,9 @@ static stm_status h_lock(stm_9p_server *s,
         uint8_t lock_type = (type == STM_9P_LOCK_TYPE_WRLCK)
                               ? STM_LOCK_EXCLUSIVE
                               : STM_LOCK_SHARED;
-        stm_status rc = stm_fs_lock(s->fs, f->dataset_id, f->ino,
-                                       owner_id, lock_type, start, length);
+        stm_status rc = stm_fs_lock_if_gen(s->fs, f->dataset_id, f->ino,
+                                           f->cached_gen,
+                                           owner_id, lock_type, start, length);
         if (rc == STM_EAGAIN) {
             /* Conflict. Per .L: BLOCK flag → return BLOCKED status,
              * client retries. Without BLOCK flag → return BLOCKED too
@@ -3680,9 +3699,10 @@ static stm_status h_getlock(stm_9p_server *s,
                           : STM_LOCK_SHARED;
     bool would_grant = false;
     uint64_t conflict_owner = 0;
-    stm_status rc = stm_fs_lock_test(s->fs, f->dataset_id, f->ino,
-                                        owner_id, lock_type, start, length,
-                                        &would_grant, &conflict_owner);
+    stm_status rc = stm_fs_lock_test_if_gen(s->fs, f->dataset_id, f->ino,
+                                            f->cached_gen,
+                                            owner_id, lock_type, start, length,
+                                            &would_grant, &conflict_owner);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
 
@@ -4190,7 +4210,7 @@ static stm_status h_reflink(stm_9p_server *s,
     rc = stm_fs_stat(s->fs, df->dataset_id, df->ino, &iv);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
-    df->cached_gen   = (uint32_t)stm_load_le64(iv.si_gen);
+    df->cached_gen   = stm_load_le64(iv.si_gen);
     df->cached_cvers = qid_version(&iv);
     df->qid_type     = qid_type_from_mode(stm_load_le32(iv.si_mode));
 
@@ -4249,8 +4269,9 @@ static stm_status h_fallocate(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag,
                               STM_9P_ECODE_EINVAL);
 
-    stm_status rc = stm_fs_fallocate(s->fs, f->dataset_id, f->ino,
-                                          offset, length, flags);
+    stm_status rc = stm_fs_fallocate_if_gen(s->fs, f->dataset_id, f->ino,
+                                            f->cached_gen,
+                                            offset, length, flags);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
 

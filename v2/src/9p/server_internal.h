@@ -24,6 +24,13 @@ extern "C" {
 void stm_9p_server_set_test_hooks(
     void (*phase_b)(uint8_t type, uint16_t tag, void *arg), void *arg);
 
+/* Install (or clear, with fresh == NULL) the process-global hook called
+ * each time a fid's freshness check PASSES, with the inode it checked,
+ * before the handler acts on that inode. A test parks there to free and
+ * reuse the inode in the gap. Same set/clear rules as above. */
+void stm_9p_server_set_fresh_hook(
+    void (*fresh)(uint64_t ds, uint64_t ino, void *arg), void *arg);
+
 #ifdef __cplusplus
 }
 #endif

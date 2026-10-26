@@ -4,7 +4,7 @@
 
 Per-fs, in-RAM advisory lock table backing the Linux `flock(2)` + `fcntl(2)`
 `F_SETLK` / `F_GETLK` / `F_OFD_SETLK` surface. The table tracks byte-range
-locks keyed by `(dataset_id, ino, owner_id, off, len, type)`, with conflict
+locks keyed by `(dataset_id, ino, gen, owner_id, off, len, type)`, with conflict
 detection at acquire time. POSIX advisory locks don't persist across mount
 (closing the fd releases them; a fresh mount has no fds), so this layer is
 deliberately memory-only — no btree, no AEAD, no Merkle binding.
@@ -37,7 +37,7 @@ it at unmount; lifetime is bounded by the `stm_fs` handle.
 ### Mutation
 
 ```c
-stm_status stm_lock_acquire        (t, dataset_id, ino, owner_id,
+stm_status stm_lock_acquire        (t, dataset_id, ino, gen, owner_id,
                                        type, off, len);
 stm_status stm_lock_release        (t, dataset_id, ino, owner_id,
                                        off, len);
@@ -61,17 +61,16 @@ EVERY lock held by `owner_id` across all inodes. Linux releases all OFD
 locks tied to a closing fd; bindings call this on fd-close.
 
 `stm_lock_release_ino` is the **inode-free** path — releases every lock on
-`(dataset_id, ino)`, whoever holds it. Records carry no inode generation,
-so fs.c's pre-free cleanup calls it as it frees the inode: a lock taken
-through a fid on a file that is then unlinked would otherwise refuse locks
-(and show in Tgetlock) on the next file to reuse the ino, until that fid
-clunked -- and the fid itself answers ESTALE once the inode is freed, so it
-could not release it (test `fs_freed_inode_takes_its_locks_with_it`).
+`(dataset_id, ino)`, every incarnation, whoever holds it. fs.c's pre-free
+cleanup calls it as it frees the inode, so a freed file's records go at
+once instead of when their owners close; a fid on the freed file answers
+ESTALE, so it could not release them itself (test
+`fs_freed_inode_takes_its_locks_with_it`).
 
 ### Inspection
 
 ```c
-stm_status stm_lock_test  (t, dataset_id, ino, owner_id, type, off, len,
+stm_status stm_lock_test  (t, dataset_id, ino, gen, owner_id, type, off, len,
                                 *out_would_grant, *out_conflicting_owner);
 stm_status stm_lock_count (t, *out_count);
 ```
@@ -89,7 +88,7 @@ Diagnostic; used by tests + admin tools.
 
 Two locks **conflict** iff ALL THREE hold:
 
-1. Overlapping byte ranges in the same `(dataset_id, ino)`.
+1. Overlapping byte ranges on the same incarnation `(dataset_id, ino, gen)`.
 2. **Different** owners (same-owner is admitted unconditionally).
 3. At least one is `STM_LOCK_EXCLUSIVE`.
 
@@ -97,6 +96,23 @@ This is the `NoConflictingLocks` invariant from `locks.tla` — the
 headline safety property. The acquire path checks this predicate
 against EVERY existing lock at the same `(ds, ino)` before insertion;
 a single conflict refuses the acquire.
+
+### Incarnations
+
+`gen` is the inode's `si_gen`. A record on one incarnation never
+conflicts with another incarnation of the same ino, so a lock left on a
+file that is gone cannot refuse the file that reuses its number. A free
+also drops the records (`stm_lock_release_ino`), but a snapshot rollback
+discards files without that path; their records stay inert until their
+owners close, and the reused ino gets a gen above every discarded one
+(16-inode's rollback floors).
+
+The fs wrappers name the incarnation themselves: `stm_fs_lock` reads the
+live `si_gen` under fs->global EX and refuses a missing inode
+(`STM_ENOENT`); `stm_fs_lock_test` reads it without the lock (the answer
+is about the incarnation it read). Their `*_if_gen` twins, which the 9P
+server calls with a fid's `cached_gen`, answer `STM_ESTALE` when the live
+incarnation is not that one.
 
 ### Range arithmetic
 
@@ -131,7 +147,8 @@ short-circuit non-matching scans.
 Spec actions:
 
 - `Acquire(t, ds, ino, owner, type, off, len)` — adds a record
-  unless any existing record conflicts.
+  unless any existing record conflicts. The spec's inode is the
+  impl's `(ds, ino, gen)`: one incarnation.
 - `Release(t, ds, ino, owner, off, len)` — exact-match drop.
 - `ReleaseOwner(t, owner)` — drop all records with matching owner_id.
 - `Test(t, ds, ino, owner, type, off, len)` — pure read; returns
@@ -161,7 +178,10 @@ Buggy variants (in spec; need not be re-spelled in impl):
   Test / ReleaseOwner happy paths + every refusal + the conflict matrix
   (same-owner same-range, same-owner overlapping-range, different-owner
   non-overlapping, different-owner overlapping shared-vs-shared,
-  different-owner overlapping with-exclusive).
+  different-owner overlapping with-exclusive, other incarnation
+  `locks_other_incarnation_never_conflicts`).
+- `tests/test_fs.c` — `fs_lock_on_a_rolled_back_file_never_refuses_its_successor`,
+  `fs_if_gen_ops_act_only_on_their_incarnation`.
 - `tests/test_fs.c` — composes with fs.c wrappers
   (`stm_fs_lock_acquire` / `_release` / `_test`) and validates that the
   9P-server's lock-owner-on-clunk pathway works end-to-end.

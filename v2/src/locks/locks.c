@@ -26,6 +26,7 @@
 typedef struct {
     uint64_t dataset_id;
     uint64_t ino;
+    uint64_t gen;         /* the inode incarnation the lock is on */
     uint64_t owner_id;
     uint8_t  type;        /* STM_LOCK_SHARED or STM_LOCK_EXCLUSIVE */
     uint64_t off;
@@ -113,6 +114,7 @@ static stm_status normalize_range(uint64_t off, uint64_t len,
 static bool conflicts(const lock_record *cand, const lock_record *other) {
     if (cand->dataset_id != other->dataset_id) return false;
     if (cand->ino        != other->ino)        return false;
+    if (cand->gen        != other->gen)        return false;
     if (!ranges_overlap(cand->off, cand->end, other->off, other->end))
         return false;
     if (cand->owner_id == other->owner_id) return false;
@@ -139,6 +141,7 @@ static lock_record *append_record(stm_lock_table *t) {
 
 stm_status stm_lock_acquire(stm_lock_table *t,
                                   uint64_t dataset_id, uint64_t ino,
+                                  uint64_t gen,
                                   uint64_t owner_id, uint8_t type,
                                   uint64_t off, uint64_t len) {
     if (!t) return STM_EINVAL;
@@ -152,7 +155,7 @@ stm_status stm_lock_acquire(stm_lock_table *t,
     must_lock(tbl_lock(t));
 
     lock_record cand = {
-        .dataset_id = dataset_id, .ino = ino,
+        .dataset_id = dataset_id, .ino = ino, .gen = gen,
         .owner_id = owner_id, .type = type,
         .off = off, .end = end,
     };
@@ -210,6 +213,7 @@ stm_status stm_lock_release(stm_lock_table *t,
 
 stm_status stm_lock_test(const stm_lock_table *t,
                               uint64_t dataset_id, uint64_t ino,
+                              uint64_t gen,
                               uint64_t owner_id, uint8_t type,
                               uint64_t off, uint64_t len,
                               bool *out_would_grant,
@@ -227,7 +231,7 @@ stm_status stm_lock_test(const stm_lock_table *t,
     must_lock(tbl_lock(t));
 
     lock_record cand = {
-        .dataset_id = dataset_id, .ino = ino,
+        .dataset_id = dataset_id, .ino = ino, .gen = gen,
         .owner_id = owner_id, .type = type,
         .off = off, .end = end,
     };

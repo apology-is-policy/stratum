@@ -16,12 +16,15 @@
 #include "tharness.h"
 #include "test_fs_common.h"
 
+#include "../src/9p/server_internal.h"
+
 #include <stratum/9p.h>
 #include <stratum/fs.h>
 #include <stratum/inode.h>
 #include <stratum/types.h>
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -4965,6 +4968,353 @@ STM_TEST(p9_stale_fid_stays_stale_across_a_rollback) {
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
+}
+
+/* ── the freshness gap ─────────────────────────────────────────────────
+ * A handler checks its fid's gen, then acts on the inode by number. The
+ * gap fixture parks one op right after its check passes (the fresh hook)
+ * so another session can free the inode and reuse its number in between. */
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    uint64_t        ino;
+    bool            armed, parked, released;
+} gap_ctl;
+
+static void gap_fresh(uint64_t ds, uint64_t ino, void *arg)
+{
+    gap_ctl *g = arg;
+    (void)ds;
+    pthread_mutex_lock(&g->mu);
+    if (g->armed && ino == g->ino) {
+        g->armed  = false;
+        g->parked = true;
+        pthread_cond_broadcast(&g->cv);
+        while (!g->released) pthread_cond_wait(&g->cv, &g->mu);
+    }
+    pthread_mutex_unlock(&g->mu);
+}
+
+/* Bounded: an op that never reaches its check must fail the test, not
+ * hang it. */
+static bool gap_await_parked(gap_ctl *g)
+{
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 10;
+    pthread_mutex_lock(&g->mu);
+    while (!g->parked)
+        if (pthread_cond_timedwait(&g->cv, &g->mu, &dl) != 0) break;
+    bool parked = g->parked;
+    pthread_mutex_unlock(&g->mu);
+    return parked;
+}
+
+typedef struct {
+    stm_9p_server *s;
+    uint8_t        req[RBUF];
+    uint8_t        resp[RBUF];
+    uint32_t       sz, rlen;
+    stm_status     rc;
+} gap_op;
+
+static void *gap_op_run(void *arg)
+{
+    gap_op *op = arg;
+    op->rc = stm_9p_server_handle(op->s, op->req, op->sz, op->resp, RBUF,
+                                  &op->rlen);
+    return NULL;
+}
+
+static uint64_t qid_ino(const uint8_t *qid) { return load_u64(qid + 5) & 0xFFFFFFFFull; }
+
+/* Two sessions on one fs; session 1's fid 101 is open RDWR on "x". */
+typedef struct {
+    stm_fs        *fs;
+    stm_9p_server *s1, *s2;
+    uint64_t       ino_x;
+} gap_fix;
+
+static void gap_fix_up(gap_fix *gf, const char *name)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    gf->fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &gf->fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(gf->fs, &root);
+    gf->s1 = make_server(gf->fs);
+    gf->s2 = make_server(gf->fs);
+    do_version_attach(gf->s1, 100);
+    do_version_attach(gf->s2, 100);
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz = 0;
+    sz = build_twalk(req, 2, 100, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s1, req, sz, resp, RBUF, &rlen));
+    sz = build_tlcreate(req, 3, 101, "x", STM_9P_O_RDWR, 0644, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s1, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    gf->ino_x = qid_ino(resp + 7);
+    free(req); free(resp);
+}
+
+static void gap_fix_down(gap_fix *gf)
+{
+    stm_9p_server_destroy(gf->s1);
+    stm_9p_server_destroy(gf->s2);
+    STM_ASSERT_OK(stm_fs_unmount(gf->fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Session 2 unlinks "x" and creates "y" on the same ino, open RDWR as
+ * its fid 202 and holding "YYYY". */
+static void gap_swap_x_for_y(gap_fix *gf)
+{
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz = 0;
+    sz = build_tunlinkat(req, 900, 100, "x", 0);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s2, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RUNLINKAT);
+    sz = build_twalk(req, 901, 100, 202, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s2, req, sz, resp, RBUF, &rlen));
+    sz = build_tlcreate(req, 902, 202, "y", STM_9P_O_RDWR, 0644, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s2, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    STM_ASSERT_EQ(qid_ino(resp + 7), gf->ino_x);
+    sz = build_twrite(req, 903, 202, 0, "YYYY", 4);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s2, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    free(req); free(resp);
+}
+
+/* Runs `op` on session 1, parked in its freshness gap while session 2
+ * swaps "x" for "y"; `in_gap` (optional) then runs more of session 2. */
+static void gap_run(gap_fix *gf, gap_op *op, void (*in_gap)(gap_fix *))
+{
+    gap_ctl g;
+    memset(&g, 0, sizeof g);
+    pthread_mutex_init(&g.mu, NULL);
+    pthread_cond_init(&g.cv, NULL);
+    g.ino   = gf->ino_x;
+    g.armed = true;
+    stm_9p_server_set_fresh_hook(gap_fresh, &g);
+    op->s = gf->s1;
+    pthread_t th;
+    STM_ASSERT_EQ(pthread_create(&th, NULL, gap_op_run, op), 0);
+    bool parked = gap_await_parked(&g);
+    STM_ASSERT_TRUE(parked);
+    if (parked) {
+        gap_swap_x_for_y(gf);
+        if (in_gap) in_gap(gf);
+    }
+    pthread_mutex_lock(&g.mu);
+    g.released = true;
+    g.armed    = false;
+    pthread_cond_broadcast(&g.cv);
+    pthread_mutex_unlock(&g.mu);
+    pthread_join(th, NULL);
+    stm_9p_server_set_fresh_hook(NULL, NULL);
+    pthread_cond_destroy(&g.cv);
+    pthread_mutex_destroy(&g.mu);
+}
+
+static void gap_assert_estale(const gap_op *op)
+{
+    STM_ASSERT_OK(op->rc);
+    STM_ASSERT_EQ(op->resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(op->resp + 7), STM_9P_ECODE_ESTALE);
+}
+
+static void gap_assert_y_holds_yyyy(gap_fix *gf)
+{
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tread(req, 950, 202, 0, 16);
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s2, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 4u);
+    STM_ASSERT_MEM_EQ(resp + 11, "YYYY", 4);
+    free(req); free(resp);
+}
+
+/* A Twrite whose file is unlinked, and its ino reused, between the
+ * freshness check and the write answers ESTALE and leaves "y" alone. */
+STM_TEST(p9_write_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_write");
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_twrite(op->req, 4, 101, 0, "STALE!!!", 8);
+    gap_run(&gf, op, NULL);
+    gap_assert_estale(op);
+    gap_assert_y_holds_yyyy(&gf);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* Tsetattr: a chmod through the freed fid must not reach "y". */
+STM_TEST(p9_setattr_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_setattr");
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_tsetattr(op->req, 4, 101, STM_9P_SETATTR_MODE, 04777u,
+                            0, 0, 0, 0, 0, 0, 0);
+    gap_run(&gf, op, NULL);
+    gap_assert_estale(op);
+    struct stm_inode_value iv;
+    STM_ASSERT_OK(stm_fs_stat(gf.fs, 1, gf.ino_x, &iv));
+    STM_ASSERT_EQ(stm_load_le32(iv.si_mode) & 07777u, 0644u);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* Tlopen O_TRUNC through the freed fid must not empty "y". */
+STM_TEST(p9_lopen_trunc_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_lopen");
+    walk_to(gf.s1, 100, 103, "x");
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_tlopen(op->req, 4, 103, STM_9P_O_RDWR | STM_9P_O_TRUNC);
+    gap_run(&gf, op, NULL);
+    gap_assert_estale(op);
+    gap_assert_y_holds_yyyy(&gf);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* Tlock through the freed fid must not land a lock on "y": session 2
+ * can still take "y" exclusively. */
+STM_TEST(p9_lock_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_lock");
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_tlock(op->req, 4, 101, STM_9P_LOCK_TYPE_WRLCK, 0, 0, 0,
+                         1, "c1");
+    gap_run(&gf, op, NULL);
+    gap_assert_estale(op);
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlock(req, 5, 202, STM_9P_LOCK_TYPE_WRLCK, 0, 0, 0,
+                              2, "c2");
+    STM_ASSERT_OK(stm_9p_server_handle(gf.s2, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+    free(req); free(resp);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* Each Tsetattr arm acts on its own: one leg per arm. */
+static void gap_setattr_leg(const char *name, uint32_t valid, uint32_t uid,
+                            uint64_t size, uint64_t mt_sec)
+{
+    gap_fix gf;
+    gap_fix_up(&gf, name);
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_tsetattr(op->req, 4, 101, valid, 0, uid, uid, size,
+                            0, 0, mt_sec, 0);
+    gap_run(&gf, op, NULL);
+    gap_assert_estale(op);
+    gap_assert_y_holds_yyyy(&gf);
+    struct stm_inode_value iv;
+    STM_ASSERT_OK(stm_fs_stat(gf.fs, 1, gf.ino_x, &iv));
+    STM_ASSERT_EQ(stm_load_le32(iv.si_uid), 0u);
+    STM_ASSERT_TRUE(stm_load_le64(iv.si_mtime_sec) != mt_sec);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+STM_TEST(p9_setattr_size_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_setattr_leg("9p_gap_setattr_size", STM_9P_SETATTR_SIZE, 0, 0, 7);
+}
+
+STM_TEST(p9_setattr_owner_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_setattr_leg("9p_gap_setattr_uid",
+                    STM_9P_SETATTR_UID | STM_9P_SETATTR_GID, 4242, 0, 7);
+}
+
+STM_TEST(p9_setattr_times_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_setattr_leg("9p_gap_setattr_times",
+                    STM_9P_SETATTR_MTIME | STM_9P_SETATTR_MTIME_SET, 0, 0, 7);
+}
+
+/* Tfallocate through the freed fid must not grow "y". */
+STM_TEST(p9_fallocate_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_fallocate");
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_tfallocate(op->req, 4, 101, 0, 0, 64);
+    gap_run(&gf, op, NULL);
+    gap_assert_estale(op);
+    struct stm_inode_value iv;
+    STM_ASSERT_OK(stm_fs_stat(gf.fs, 1, gf.ino_x, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), 4u);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+static void gap_lock_y(gap_fix *gf)
+{
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlock(req, 904, 202, STM_9P_LOCK_TYPE_WRLCK, 0, 0, 0,
+                              2, "c2");
+    STM_ASSERT_OK(stm_9p_server_handle(gf->s2, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+    free(req); free(resp);
+}
+
+/* Tgetlock through the freed fid must not report "y"'s lock. */
+STM_TEST(p9_getlock_through_a_fid_freed_in_the_gap_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_gap_getlock");
+    gap_op *op = calloc(1, sizeof *op);
+    uint8_t *p = op->req + 7;
+    p[0] = 101; p[1] = 0; p[2] = 0; p[3] = 0; p += 4;
+    *p++ = STM_9P_LOCK_TYPE_WRLCK;
+    memset(p, 0, 8 + 8 + 4); p += 8 + 8 + 4;
+    p[0] = 0; p[1] = 0; p += 2;
+    op->sz = (uint32_t)(p - op->req);
+    op->req[0] = (uint8_t)op->sz; op->req[1] = (uint8_t)(op->sz >> 8);
+    op->req[2] = 0; op->req[3] = 0;
+    op->req[4] = STM_9P_TGETLOCK; op->req[5] = 4; op->req[6] = 0;
+    gap_run(&gf, op, gap_lock_y);
+    gap_assert_estale(op);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+/* A Txattrcreate value committed at Tclunk after its file was unlinked
+ * and its ino reused answers ESTALE and sets nothing on "y" -- no race
+ * needed. */
+STM_TEST(p9_xattr_commit_on_a_freed_fid_answers_estale) {
+    gap_fix gf;
+    gap_fix_up(&gf, "9p_xattr_freed");
+    walk_to(gf.s1, 100, 103, "x");
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz = 0;
+    sz = build_txattrcreate(req, 4, 103, "user.k", 4, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(gf.s1, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RXATTRCREATE);
+    sz = build_twrite(req, 5, 103, 0, "evil", 4);
+    STM_ASSERT_OK(stm_9p_server_handle(gf.s1, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    gap_swap_x_for_y(&gf);
+    sz = build_tclunk(req, 6, 103);
+    STM_ASSERT_OK(stm_9p_server_handle(gf.s1, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ESTALE);
+    uint8_t v[8];
+    uint32_t vsz = 0;
+    STM_ASSERT_ERR(stm_fs_getxattr(gf.fs, 1, gf.ino_x, (const uint8_t *)"user.k",
+                                   6, v, sizeof v, &vsz),
+                   STM_ENODATA);
+    free(req); free(resp);
+    gap_fix_down(&gf);
 }
 
 STM_TEST_MAIN("9p")

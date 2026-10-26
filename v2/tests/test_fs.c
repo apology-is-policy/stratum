@@ -12337,4 +12337,160 @@ STM_TEST(fs_rollback_never_reissues_a_discarded_identity) {
     unlink(g_key_path);
 }
 
+static uint64_t if_gen_gen(stm_fs *fs, uint64_t ino)
+{
+    struct stm_inode_value iv = {0};
+    if (stm_fs_stat(fs, 1, ino, &iv) != STM_OK) return UINT64_MAX;
+    return stm_load_le64(iv.si_gen);
+}
+
+/* Every identity-checked twin refuses another incarnation and a gone
+ * inode with ESTALE and changes nothing; with the live gen it acts. A
+ * gen-less lock names a live inode, so a missing one is ENOENT. */
+STM_TEST(fs_if_gen_ops_act_only_on_their_incarnation) {
+    make_tmp("if_gen_ops");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t dir = 0, x = 0;
+    STM_ASSERT_OK(stm_inode_alloc(stm_sync_inode_index(stm_fs_sync(fs)), 1,
+                                  (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                     0644u, 0, 0, &x));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, x, 0, "data", 4));
+    uint64_t g = if_gen_gen(fs, x), w = g + 1u;
+    const uint8_t *k = (const uint8_t *)"user.k";
+    bool grant = false;
+    uint64_t who = 0;
+
+    STM_ASSERT_ERR(stm_fs_write_if_gen(fs, 1, x, w, 0, "XXXX", 4), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_truncate_if_gen(fs, 1, x, w, 0), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_chmod_if_gen(fs, 1, x, w, 0777u), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_chown_if_gen(fs, 1, x, w, 7, 7), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_utimens_if_gen(fs, 1, x, w, 5, 0, 5, 0, 0, 0),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_setxattr_if_gen(fs, 1, x, w, k, 6,
+                                          (const uint8_t *)"v", 1, 0, NULL),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_fallocate_if_gen(fs, 1, x, w, 0, 64, 0),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_lock_if_gen(fs, 1, x, w, 1, STM_FS_LOCK_EXCLUSIVE,
+                                      0, 0), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_lock_test_if_gen(fs, 1, x, w, 1,
+                                           STM_FS_LOCK_EXCLUSIVE, 0, 0,
+                                           &grant, &who), STM_ESTALE);
+
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, x, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), 4u);
+    STM_ASSERT_EQ(stm_load_le32(iv.si_mode) & 07777u, 0644u);
+    STM_ASSERT_EQ(stm_load_le32(iv.si_uid), 0u);
+    STM_ASSERT_TRUE(stm_load_le64(iv.si_mtime_sec) != 5u);
+    uint8_t buf[8];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, x, 0, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, 4u);
+    STM_ASSERT_MEM_EQ(buf, "data", 4);
+    uint32_t vsz = 0;
+    STM_ASSERT_ERR(stm_fs_getxattr(fs, 1, x, k, 6, buf, sizeof buf, &vsz),
+                   STM_ENODATA);
+    size_t nlocks = 1;
+    STM_ASSERT_OK(stm_fs_lock_count(fs, &nlocks));
+    STM_ASSERT_EQ(nlocks, 0u);
+
+    STM_ASSERT_OK(stm_fs_write_if_gen(fs, 1, x, g, 0, "DATA", 4));
+    STM_ASSERT_OK(stm_fs_chmod_if_gen(fs, 1, x, g, 0600u));
+    STM_ASSERT_OK(stm_fs_chown_if_gen(fs, 1, x, g, 7, 7));
+    STM_ASSERT_OK(stm_fs_setxattr_if_gen(fs, 1, x, g, k, 6,
+                                         (const uint8_t *)"v", 1, 0, NULL));
+    STM_ASSERT_OK(stm_fs_fallocate_if_gen(fs, 1, x, g, 0, 64, 0));
+    STM_ASSERT_OK(stm_fs_truncate_if_gen(fs, 1, x, g, 2));
+    STM_ASSERT_OK(stm_fs_utimens_if_gen(fs, 1, x, g, 5, 0, 5, 0, 0, 0));
+    STM_ASSERT_OK(stm_fs_lock_if_gen(fs, 1, x, g, 1, STM_FS_LOCK_EXCLUSIVE,
+                                     0, 0));
+    STM_ASSERT_OK(stm_fs_lock_test_if_gen(fs, 1, x, g, 2,
+                                          STM_FS_LOCK_EXCLUSIVE, 0, 0,
+                                          &grant, &who));
+    STM_ASSERT_TRUE(!grant);
+    STM_ASSERT_EQ(who, 1u);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, x, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), 2u);
+    STM_ASSERT_EQ(stm_load_le32(iv.si_mode) & 07777u, 0600u);
+    STM_ASSERT_EQ(stm_load_le32(iv.si_uid), 7u);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_mtime_sec), 5u);
+
+    /* The 9P path writes regular files only: a directory is refused, not
+     * handed to the legacy extent path (which takes a whole aligned block
+     * on any inode). */
+    static const uint8_t blk[STM_UB_SIZE];
+    STM_ASSERT_ERR(stm_fs_write_if_gen(fs, 1, dir, if_gen_gen(fs, dir), 0,
+                                       blk, sizeof blk), STM_EINVAL);
+    size_t dir_extents = 1;
+    STM_ASSERT_OK(stm_extent_count_for_ino(
+        stm_sync_extent_index(stm_fs_sync(fs)), 1, dir, &dir_extents));
+    STM_ASSERT_EQ(dir_extents, 0u);
+
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"x", 1));
+    STM_ASSERT_ERR(stm_fs_write_if_gen(fs, 1, x, g, 0, "XXXX", 4), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_chmod_if_gen(fs, 1, x, g, 0777u), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_setxattr_if_gen(fs, 1, x, g, k, 6,
+                                          (const uint8_t *)"v", 1, 0, NULL),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_lock_if_gen(fs, 1, x, g, 1, STM_FS_LOCK_SHARED, 0, 0),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_lock_test_if_gen(fs, 1, x, g, 1, STM_FS_LOCK_SHARED,
+                                           0, 0, &grant, &who), STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_lock(fs, 1, x, 1, STM_FS_LOCK_SHARED, 0, 0),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_lock_test(fs, 1, x, 1, STM_FS_LOCK_SHARED, 0, 0,
+                                    &grant, &who), STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_lock_count(fs, &nlocks));
+    STM_ASSERT_EQ(nlocks, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A rollback discards a file without the free-time lock drop; the lock
+ * left on it must not refuse the file that reuses its ino after the
+ * rollback (records name an incarnation, and the reuse gets a new one). */
+STM_TEST(fs_lock_on_a_rolled_back_file_never_refuses_its_successor) {
+    make_tmp("rollback_lock");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t dir = 0, a = 0, b = 0, c = 0;
+    STM_ASSERT_OK(stm_inode_alloc(stm_sync_inode_index(stm_fs_sync(fs)), 1,
+                                  (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"a", 1,
+                                     0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"a", 1));
+    uint64_t snap = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &snap));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"b", 1,
+                                     0644u, 0, 0, &b));
+    STM_ASSERT_EQ(b, a);
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, b, 1, STM_FS_LOCK_EXCLUSIVE, 0, 0));
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap, false));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1,
+                                     0644u, 0, 0, &c));
+    STM_ASSERT_EQ(c, b);
+    bool grant = false;
+    uint64_t who = 0;
+    STM_ASSERT_OK(stm_fs_lock_test(fs, 1, c, 2, STM_FS_LOCK_EXCLUSIVE, 0, 0,
+                                   &grant, &who));
+    STM_ASSERT_TRUE(grant);
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, c, 2, STM_FS_LOCK_EXCLUSIVE, 0, 0));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

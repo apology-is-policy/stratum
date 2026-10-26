@@ -2441,8 +2441,67 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
     return STM_ENOTSUPPORTED;
 }
 
-stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
-                          uint64_t off, const void *buf, size_t len)
+/* The *_if_gen entry points act only on the incarnation of an inode
+ * the caller holds (a 9P fid's cached si_gen): each compares the
+ * target's si_gen with *gen where the op holds the target against a
+ * free, and answers STM_ESTALE on a mismatch or when it is gone. Every
+ * free holds the freed inode's exclusive pin, and a rollback holds
+ * fs->global EX, so under the target's pin (either mode) or under EX
+ * the incarnation checked is the one acted on. A NULL gen checks
+ * nothing. */
+static inline bool fs_gen_matches(const struct stm_inode_value *iv,
+                                  const uint64_t *gen)
+{
+    return !gen || stm_load_le64(iv->si_gen) == *gen;
+}
+
+/* A gone target is a stale identity, not a missing file. */
+static inline stm_status fs_gen_status(stm_status s, const uint64_t *gen)
+{
+    return (gen && s == STM_ENOENT) ? STM_ESTALE : s;
+}
+
+/* The live incarnation of (dataset_id, ino); call it under the
+ * inode's pin or fs->global EX. */
+static stm_status fs_live_gen_locked(stm_fs *fs, uint64_t dataset_id,
+                                     uint64_t ino, const uint64_t *gen,
+                                     uint64_t *out_gen)
+{
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) return STM_EINVAL;
+    struct stm_inode_value iv;
+    stm_status s = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+    if (s != STM_OK) return fs_gen_status(s, gen);
+    if (!fs_gen_matches(&iv, gen)) return STM_ESTALE;
+    if (out_gen) *out_gen = stm_load_le64(iv.si_gen);
+    return STM_OK;
+}
+
+static stm_status fs_gen_check_locked(stm_fs *fs, uint64_t dataset_id,
+                                      uint64_t ino, const uint64_t *gen)
+{
+    return gen ? fs_live_gen_locked(fs, dataset_id, ino, gen, NULL) : STM_OK;
+}
+
+/* stm_inode_pin, then the identity check under the pin; a failed check
+ * leaves the inode unpinned. */
+static stm_status fs_pin_if_gen(stm_fs *fs, stm_inode_index *iidx,
+                                uint64_t dataset_id, uint64_t ino,
+                                const uint64_t *gen, stm_inode_handle **out)
+{
+    stm_status s = stm_inode_pin(iidx, dataset_id, ino, out);
+    if (s != STM_OK) return fs_gen_status(s, gen);
+    s = fs_gen_check_locked(fs, dataset_id, ino, gen);
+    if (s != STM_OK) {
+        stm_inode_unpin(iidx, *out);
+        *out = NULL;
+    }
+    return s;
+}
+
+static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           const uint64_t *gen,
+                           uint64_t off, const void *buf, size_t len)
 {
     if (!fs) return STM_EINVAL;
 
@@ -2460,7 +2519,7 @@ stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (iidx) {
         stm_inode_handle *h = NULL;
-        stm_status pp = stm_inode_pin(iidx, dataset_id, ino, &h);
+        stm_status pp = fs_pin_if_gen(fs, iidx, dataset_id, ino, gen, &h);
         if (pp == STM_OK) {
             struct stm_inode_value iv = {0};
             stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
@@ -2495,6 +2554,12 @@ stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             return pp;
         }
         /* STM_ENOENT or non-S_IFREG — fall through to legacy EX path. */
+    }
+    /* The legacy path serves in-process callers; an identity-checked
+     * write names a live regular file, checked under its pin above. */
+    if (gen) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_EINVAL;
     }
     /* Legacy direct-extent / non-regular fallback: release SH and
      * reacquire EX so concurrent unported writers still serialize.
@@ -4101,8 +4166,8 @@ stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 /* per-subsystem-linearizable design (PARALLEL-2 contract preserved).      */
 /* ========================================================================= */
 
-stm_status stm_fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
-                           uint32_t mode)
+static stm_status fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           const uint64_t *gen, uint32_t mode)
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
@@ -4120,7 +4185,7 @@ stm_status stm_fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     }
 
     stm_inode_handle *h = NULL;
-    stm_status ps = stm_inode_pin(iidx, dataset_id, ino, &h);
+    stm_status ps = fs_pin_if_gen(fs, iidx, dataset_id, ino, gen, &h);
     if (ps != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return ps;
@@ -4157,8 +4222,8 @@ stm_status stm_fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     return ss;
 }
 
-stm_status stm_fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
-                           uint32_t uid, uint32_t gid)
+static stm_status fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           const uint64_t *gen, uint32_t uid, uint32_t gid)
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
@@ -4174,7 +4239,7 @@ stm_status stm_fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     }
 
     stm_inode_handle *h = NULL;
-    stm_status ps = stm_inode_pin(iidx, dataset_id, ino, &h);
+    stm_status ps = fs_pin_if_gen(fs, iidx, dataset_id, ino, gen, &h);
     if (ps != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return ps;
@@ -4206,7 +4271,8 @@ stm_status stm_fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     return ss;
 }
 
-stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+static stm_status fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              const uint64_t *gen,
                               uint64_t atime_sec, uint32_t atime_nsec,
                               uint64_t mtime_sec, uint32_t mtime_nsec,
                               uint64_t ctime_sec, uint32_t ctime_nsec)
@@ -4231,7 +4297,7 @@ stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     }
 
     stm_inode_handle *h = NULL;
-    stm_status ps = stm_inode_pin(iidx, dataset_id, ino, &h);
+    stm_status ps = fs_pin_if_gen(fs, iidx, dataset_id, ino, gen, &h);
     if (ps != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return ps;
@@ -4847,8 +4913,8 @@ stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 /* P8-POSIX-10: stm_fs_truncate.                                              */
 /* ========================================================================= */
 
-stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
-                              uint64_t new_size)
+static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              const uint64_t *gen, uint64_t new_size)
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
@@ -4871,7 +4937,7 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     }
 
     stm_inode_handle *h = NULL;
-    stm_status pp = stm_inode_pin(iidx, dataset_id, ino, &h);
+    stm_status pp = fs_pin_if_gen(fs, iidx, dataset_id, ino, gen, &h);
     if (pp != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return pp;       /* STM_ENOENT */
@@ -6367,7 +6433,8 @@ static stm_status fs_xattr_require_inode(stm_fs *fs,
     return stm_inode_lookup(iidx, dataset_id, ino, &iv);
 }
 
-stm_status stm_fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+static stm_status fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              const uint64_t *gen,
                               const uint8_t *name, uint8_t name_len,
                               const uint8_t *value, uint32_t value_len,
                               uint32_t flags,
@@ -6393,7 +6460,8 @@ stm_status stm_fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
-    stm_status ps = fs_xattr_require_inode(fs, dataset_id, ino);
+    stm_status ps = fs_gen_check_locked(fs, dataset_id, ino, gen);
+    if (ps == STM_OK) ps = fs_xattr_require_inode(fs, dataset_id, ino);
     if (ps != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return ps;
@@ -10327,8 +10395,9 @@ static stm_status fs_fallocate_validate_target(stm_fs *fs,
     return STM_OK;
 }
 
-stm_status stm_fs_fallocate(stm_fs *fs,
+static stm_status fs_fallocate(stm_fs *fs,
                                   uint64_t dataset_id, uint64_t ino,
+                                  const uint64_t *gen,
                                   uint64_t off, uint64_t len,
                                   uint32_t flags)
 {
@@ -10396,7 +10465,8 @@ stm_status stm_fs_fallocate(stm_fs *fs,
         return STM_EINVAL;
     }
     stm_inode_handle *h_falloc = NULL;
-    stm_status pp_falloc = stm_inode_pin(iidx_pin, dataset_id, ino, &h_falloc);
+    stm_status pp_falloc = fs_pin_if_gen(fs, iidx_pin, dataset_id, ino, gen,
+                                         &h_falloc);
     if (pp_falloc != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return pp_falloc;       /* STM_ENOENT */
@@ -10550,7 +10620,9 @@ stm_status stm_fs_fallocate(stm_fs *fs,
          * promote_to_hot promotes EVERY COLD extent at the ino
          * (broader than POSIX requires for a partial range, but
          * correct + conservative). Drop pin + SH BEFORE chaining
-         * since stm_fs_promote_to_hot takes both fresh. */
+         * since stm_fs_promote_to_hot takes both fresh. Promotion moves
+         * extents between tiers without changing a byte, so it needs no
+         * identity: run on a successor, it changes nothing it can see. */
         stm_inode_unpin(iidx_pin, h_falloc);
         pthread_rwlock_unlock(&fs->global);
         stm_status ps = stm_fs_promote_to_hot(fs, dataset_id, ino);
@@ -10602,20 +10674,28 @@ _Static_assert(STM_FS_LOCK_EXCLUSIVE == STM_LOCK_EXCLUSIVE,
  * primary purpose post-fix is to guard the records[] array
  * against the (admittedly now-impossible) concurrent caller. */
 
-stm_status stm_fs_lock(stm_fs *fs,
-                              uint64_t dataset_id, uint64_t ino,
-                              uint64_t owner_id, uint8_t type,
-                              uint64_t off, uint64_t len)
+static stm_status fs_lock(stm_fs *fs,
+                          uint64_t dataset_id, uint64_t ino,
+                          const uint64_t *gen,
+                          uint64_t owner_id, uint8_t type,
+                          uint64_t off, uint64_t len)
 {
     if (!fs) return STM_EINVAL;
     /* 9.7-impl-5 R166 P2-2: advisory locks on snap-view inodes have
      * no semantic meaning — the snap is frozen. Refuse STM_EROFS. */
     if (fs_ino_is_synth(ino)) return STM_EROFS;
 
+    /* The record names the incarnation live under EX, so it can never
+     * refuse a successor on the same ino, whatever frees this one (an
+     * unlink drops it at once; a rollback leaves it inert until its
+     * owner closes). */
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_READ(fs);
-    stm_status s = stm_lock_acquire(fs->locks, dataset_id, ino,
-                                          owner_id, type, off, len);
+    uint64_t live_gen = 0;
+    stm_status s = fs_live_gen_locked(fs, dataset_id, ino, gen, &live_gen);
+    if (s == STM_OK)
+        s = stm_lock_acquire(fs->locks, dataset_id, ino, live_gen,
+                             owner_id, type, off, len);
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
@@ -10637,12 +10717,13 @@ stm_status stm_fs_unlock(stm_fs *fs,
     return s;
 }
 
-stm_status stm_fs_lock_test(stm_fs *fs,
-                                   uint64_t dataset_id, uint64_t ino,
-                                   uint64_t owner_id, uint8_t type,
-                                   uint64_t off, uint64_t len,
-                                   bool *out_would_grant,
-                                   uint64_t *out_conflicting_owner)
+static stm_status fs_lock_test(stm_fs *fs,
+                               uint64_t dataset_id, uint64_t ino,
+                               const uint64_t *gen,
+                               uint64_t owner_id, uint8_t type,
+                               uint64_t off, uint64_t len,
+                               bool *out_would_grant,
+                               uint64_t *out_conflicting_owner)
 {
     /* Uniform out-param zero-init contract. */
     if (out_would_grant) *out_would_grant = false;
@@ -10656,9 +10737,14 @@ stm_status stm_fs_lock_test(stm_fs *fs,
 
     /* 9.8-LF-3c: stm_lock_test takes its own internal mutex; safe to
      * call without holding fs->global. fs->locks is set at mount + never
-     * reassigned. */
+     * reassigned. Records name an incarnation, so the answer is about
+     * the one read here even if it is freed meanwhile. */
     FS_GUARD_READ_LOCKLESS(fs);
-    return stm_lock_test(fs->locks, dataset_id, ino,
+    struct stm_inode_value iv;
+    stm_status s = stm_fs_stat(fs, dataset_id, ino, &iv);
+    if (s != STM_OK) return fs_gen_status(s, gen);
+    if (!fs_gen_matches(&iv, gen)) return STM_ESTALE;
+    return stm_lock_test(fs->locks, dataset_id, ino, stm_load_le64(iv.si_gen),
                             owner_id, type, off, len,
                             out_would_grant,
                             out_conflicting_owner);
@@ -10689,6 +10775,147 @@ stm_status stm_fs_lock_count(stm_fs *fs, size_t *out_count)
     /* 9.8-LF-3c: stm_lock_count takes its own internal mutex. */
     FS_GUARD_READ_LOCKLESS(fs);
     return stm_lock_count(fs->locks, out_count);
+}
+
+/* ========================================================================= */
+/* Public entry points: in-process callers act on whatever inode the number   */
+/* names; the *_if_gen twins act only on the caller's incarnation.           */
+/* ========================================================================= */
+
+stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                        uint64_t off, const void *buf, size_t len)
+{
+    return fs_write(fs, dataset_id, ino, NULL, off, buf, len);
+}
+
+stm_status stm_fs_write_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                               uint64_t gen,
+                               uint64_t off, const void *buf, size_t len)
+{
+    return fs_write(fs, dataset_id, ino, &gen, off, buf, len);
+}
+
+stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           uint64_t new_size)
+{
+    return fs_truncate(fs, dataset_id, ino, NULL, new_size);
+}
+
+stm_status stm_fs_truncate_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino, uint64_t gen,
+                                  uint64_t new_size)
+{
+    return fs_truncate(fs, dataset_id, ino, &gen, new_size);
+}
+
+stm_status stm_fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                        uint32_t mode)
+{
+    return fs_chmod(fs, dataset_id, ino, NULL, mode);
+}
+
+stm_status stm_fs_chmod_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                               uint64_t gen, uint32_t mode)
+{
+    return fs_chmod(fs, dataset_id, ino, &gen, mode);
+}
+
+stm_status stm_fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                        uint32_t uid, uint32_t gid)
+{
+    return fs_chown(fs, dataset_id, ino, NULL, uid, gid);
+}
+
+stm_status stm_fs_chown_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                               uint64_t gen, uint32_t uid, uint32_t gid)
+{
+    return fs_chown(fs, dataset_id, ino, &gen, uid, gid);
+}
+
+stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                          uint64_t atime_sec, uint32_t atime_nsec,
+                          uint64_t mtime_sec, uint32_t mtime_nsec,
+                          uint64_t ctime_sec, uint32_t ctime_nsec)
+{
+    return fs_utimens(fs, dataset_id, ino, NULL, atime_sec, atime_nsec,
+                      mtime_sec, mtime_nsec, ctime_sec, ctime_nsec);
+}
+
+stm_status stm_fs_utimens_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t ino, uint64_t gen,
+                                 uint64_t atime_sec, uint32_t atime_nsec,
+                                 uint64_t mtime_sec, uint32_t mtime_nsec,
+                                 uint64_t ctime_sec, uint32_t ctime_nsec)
+{
+    return fs_utimens(fs, dataset_id, ino, &gen, atime_sec, atime_nsec,
+                      mtime_sec, mtime_nsec, ctime_sec, ctime_nsec);
+}
+
+stm_status stm_fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           const uint8_t *name, uint8_t name_len,
+                           const uint8_t *value, uint32_t value_len,
+                           uint32_t flags, bool *out_replaced)
+{
+    return fs_setxattr(fs, dataset_id, ino, NULL, name, name_len,
+                       value, value_len, flags, out_replaced);
+}
+
+stm_status stm_fs_setxattr_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino, uint64_t gen,
+                                  const uint8_t *name, uint8_t name_len,
+                                  const uint8_t *value, uint32_t value_len,
+                                  uint32_t flags, bool *out_replaced)
+{
+    return fs_setxattr(fs, dataset_id, ino, &gen, name, name_len,
+                       value, value_len, flags, out_replaced);
+}
+
+stm_status stm_fs_fallocate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                            uint64_t off, uint64_t len, uint32_t flags)
+{
+    return fs_fallocate(fs, dataset_id, ino, NULL, off, len, flags);
+}
+
+stm_status stm_fs_fallocate_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                   uint64_t ino, uint64_t gen,
+                                   uint64_t off, uint64_t len, uint32_t flags)
+{
+    return fs_fallocate(fs, dataset_id, ino, &gen, off, len, flags);
+}
+
+stm_status stm_fs_lock(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                       uint64_t owner_id, uint8_t type,
+                       uint64_t off, uint64_t len)
+{
+    return fs_lock(fs, dataset_id, ino, NULL, owner_id, type, off, len);
+}
+
+stm_status stm_fs_lock_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              uint64_t gen, uint64_t owner_id, uint8_t type,
+                              uint64_t off, uint64_t len)
+{
+    return fs_lock(fs, dataset_id, ino, &gen, owner_id, type, off, len);
+}
+
+stm_status stm_fs_lock_test(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                            uint64_t owner_id, uint8_t type,
+                            uint64_t off, uint64_t len,
+                            bool *out_would_grant,
+                            uint64_t *out_conflicting_owner)
+{
+    return fs_lock_test(fs, dataset_id, ino, NULL, owner_id, type, off, len,
+                        out_would_grant, out_conflicting_owner);
+}
+
+stm_status stm_fs_lock_test_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                   uint64_t ino, uint64_t gen,
+                                   uint64_t owner_id, uint8_t type,
+                                   uint64_t off, uint64_t len,
+                                   bool *out_would_grant,
+                                   uint64_t *out_conflicting_owner)
+{
+    return fs_lock_test(fs, dataset_id, ino, &gen, owner_id, type, off, len,
+                        out_would_grant, out_conflicting_owner);
 }
 
 /* ========================================================================= */

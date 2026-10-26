@@ -36,7 +36,7 @@ STM_TEST(locks_create_close_cycle) {
 
 STM_TEST(locks_acquire_shared_alone) {
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED, 0, 100));
     size_t n = 0;
     STM_ASSERT_OK(stm_lock_count(t, &n));
     STM_ASSERT_EQ(n, (size_t)1);
@@ -46,8 +46,8 @@ STM_TEST(locks_acquire_shared_alone) {
 STM_TEST(locks_acquire_two_shared_different_owners_admitted) {
     /* SHARED+SHARED across owners is compatible. */
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED, 0, 100));
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 2, STM_LOCK_SHARED, 50, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 2, STM_LOCK_SHARED, 50, 100));
     size_t n = 0;
     STM_ASSERT_OK(stm_lock_count(t, &n));
     STM_ASSERT_EQ(n, (size_t)2);
@@ -57,8 +57,8 @@ STM_TEST(locks_acquire_two_shared_different_owners_admitted) {
 STM_TEST(locks_acquire_shared_excl_across_owners_refused) {
     /* SHARED + EXCLUSIVE on overlapping range, different owners → EAGAIN. */
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED, 0, 100));
-    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 2, STM_LOCK_EXCLUSIVE, 50, 100),
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 0, 2, STM_LOCK_EXCLUSIVE, 50, 100),
                    STM_EAGAIN);
     /* Refused acquire didn't add a record. */
     size_t n = 0;
@@ -70,8 +70,8 @@ STM_TEST(locks_acquire_shared_excl_across_owners_refused) {
 STM_TEST(locks_acquire_two_excl_across_owners_refused) {
     /* EXCLUSIVE + EXCLUSIVE across owners → EAGAIN. */
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_EXCLUSIVE, 0, 100));
-    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 2, STM_LOCK_EXCLUSIVE, 0, 100),
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 0, 2, STM_LOCK_EXCLUSIVE, 0, 100),
                    STM_EAGAIN);
     stm_lock_table_close(t);
 }
@@ -80,8 +80,8 @@ STM_TEST(locks_same_owner_overlapping_admitted) {
     /* Same-owner re-lock is always admitted (POSIX upgrade/downgrade
      * stacking). MVP keeps each acquire as a discrete record. */
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED, 0, 100));
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_EXCLUSIVE, 50, 50));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_EXCLUSIVE, 50, 50));
     size_t n = 0;
     STM_ASSERT_OK(stm_lock_count(t, &n));
     STM_ASSERT_EQ(n, (size_t)2);
@@ -91,8 +91,8 @@ STM_TEST(locks_same_owner_overlapping_admitted) {
 STM_TEST(locks_acquire_non_overlapping_admitted) {
     /* Different ranges, even with EXCLUSIVE+EXCLUSIVE, are compatible. */
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_EXCLUSIVE, 0, 100));
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 2, STM_LOCK_EXCLUSIVE, 200, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 2, STM_LOCK_EXCLUSIVE, 200, 100));
     size_t n = 0;
     STM_ASSERT_OK(stm_lock_count(t, &n));
     STM_ASSERT_EQ(n, (size_t)2);
@@ -102,8 +102,8 @@ STM_TEST(locks_acquire_non_overlapping_admitted) {
 STM_TEST(locks_acquire_different_inos_admitted) {
     /* Same range on DIFFERENT inos: no conflict. */
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_EXCLUSIVE, 0, 100));
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 200, 2, STM_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 200, 0, 2, STM_LOCK_EXCLUSIVE, 0, 100));
     stm_lock_table_close(t);
 }
 
@@ -114,10 +114,10 @@ STM_TEST(locks_acquire_different_datasets_isolated) {
      * regression dropping the check would silently break every
      * multi-tenant deployment. */
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_EXCLUSIVE, 0, 100));
-    STM_ASSERT_OK(stm_lock_acquire(t, 2, 100, 2, STM_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 2, 100, 0, 2, STM_LOCK_EXCLUSIVE, 0, 100));
     /* Same owner across datasets also non-conflicting. */
-    STM_ASSERT_OK(stm_lock_acquire(t, 3, 100, 1, STM_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 3, 100, 0, 1, STM_LOCK_EXCLUSIVE, 0, 100));
     size_t n = 0;
     STM_ASSERT_OK(stm_lock_count(t, &n));
     STM_ASSERT_EQ(n, (size_t)3);
@@ -129,18 +129,18 @@ STM_TEST(locks_degenerate_zero_len_at_uint64_max_refused) {
      * normalize to [UINT64_MAX, UINT64_MAX) — empty range that
      * Linux fcntl refuses with EINVAL. Stratum mirrors. */
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED,
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED,
                                           UINT64_MAX, 0),
                    STM_EINVAL);
     /* But len=0 at any other off (means "to EOF") is admitted. */
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED,
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED,
                                          0, 0));
     stm_lock_table_close(t);
 }
 
 STM_TEST(locks_release_exact_match) {
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED, 0, 100));
     STM_ASSERT_OK(stm_lock_release(t, 1, 100, 1, 0, 100));
     size_t n = 999;
     STM_ASSERT_OK(stm_lock_count(t, &n));
@@ -154,7 +154,7 @@ STM_TEST(locks_release_exact_match) {
 STM_TEST(locks_release_wrong_range_keeps_lock) {
     /* MVP: exact-match-only release. */
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED, 0, 100));
     STM_ASSERT_OK(stm_lock_release(t, 1, 100, 1, 50, 50));   /* wrong range */
     size_t n = 0;
     STM_ASSERT_OK(stm_lock_count(t, &n));
@@ -164,10 +164,10 @@ STM_TEST(locks_release_wrong_range_keeps_lock) {
 
 STM_TEST(locks_release_owner_drops_all_for_owner) {
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED, 0, 100));
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 200, 1, STM_LOCK_SHARED, 0, 100));
-    STM_ASSERT_OK(stm_lock_acquire(t, 2, 300, 1, STM_LOCK_SHARED, 0, 100));
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 2, STM_LOCK_SHARED, 200, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 200, 0, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 2, 300, 0, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 2, STM_LOCK_SHARED, 200, 100));
 
     STM_ASSERT_OK(stm_lock_release_owner(t, 1));
 
@@ -179,22 +179,22 @@ STM_TEST(locks_release_owner_drops_all_for_owner) {
 
 STM_TEST(locks_test_grants_or_conflicts) {
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_EXCLUSIVE, 0, 100));
 
     bool would_grant = true;
     uint64_t conflicting = 0;
-    STM_ASSERT_OK(stm_lock_test(t, 1, 100, 2, STM_LOCK_SHARED, 0, 100,
+    STM_ASSERT_OK(stm_lock_test(t, 1, 100, 0, 2, STM_LOCK_SHARED, 0, 100,
                                        &would_grant, &conflicting));
     STM_ASSERT_TRUE(!would_grant);
     STM_ASSERT_EQ(conflicting, (uint64_t)1);
 
     /* Same owner: would_grant=true. */
-    STM_ASSERT_OK(stm_lock_test(t, 1, 100, 1, STM_LOCK_EXCLUSIVE, 0, 100,
+    STM_ASSERT_OK(stm_lock_test(t, 1, 100, 0, 1, STM_LOCK_EXCLUSIVE, 0, 100,
                                        &would_grant, &conflicting));
     STM_ASSERT_TRUE(would_grant);
 
     /* Different range: would_grant=true. */
-    STM_ASSERT_OK(stm_lock_test(t, 1, 100, 2, STM_LOCK_SHARED, 200, 100,
+    STM_ASSERT_OK(stm_lock_test(t, 1, 100, 0, 2, STM_LOCK_SHARED, 200, 100,
                                        &would_grant, &conflicting));
     STM_ASSERT_TRUE(would_grant);
 
@@ -205,28 +205,51 @@ STM_TEST(locks_len_zero_means_to_eof) {
     /* len=0 normalizes to UINT64_MAX − off internally — covers
      * everything from off to end-of-file. */
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_EXCLUSIVE, 0, 0));
-    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 2, STM_LOCK_SHARED, 1000, 100),
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_EXCLUSIVE, 0, 0));
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 0, 2, STM_LOCK_SHARED, 1000, 100),
                    STM_EAGAIN);
     stm_lock_table_close(t);
 }
 
 STM_TEST(locks_arg_validation) {
     stm_lock_table *t = stm_lock_table_create();
-    STM_ASSERT_ERR(stm_lock_acquire(NULL, 1, 100, 1, STM_LOCK_SHARED, 0, 100),
+    STM_ASSERT_ERR(stm_lock_acquire(NULL, 1, 100, 0, 1, STM_LOCK_SHARED, 0, 100),
                    STM_EINVAL);
-    STM_ASSERT_ERR(stm_lock_acquire(t, 0, 100, 1, STM_LOCK_SHARED, 0, 100),
+    STM_ASSERT_ERR(stm_lock_acquire(t, 0, 100, 0, 1, STM_LOCK_SHARED, 0, 100),
                    STM_EINVAL);
-    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 0, 1, STM_LOCK_SHARED, 0, 100),
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 0, 0, 1, STM_LOCK_SHARED, 0, 100),
                    STM_EINVAL);
-    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 0, STM_LOCK_SHARED, 0, 100),
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 0, 0, STM_LOCK_SHARED, 0, 100),
                    STM_EINVAL);
-    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 1, 99u, 0, 100),
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 0, 1, 99u, 0, 100),
                    STM_EINVAL);
     /* Overflow on off + len. */
-    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED,
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED,
                                           UINT64_MAX - 50, 100),
                    STM_EOVERFLOW);
+    stm_lock_table_close(t);
+}
+
+/* A record names one incarnation of the inode: a lock on a freed file's
+ * gen never refuses (nor shows to a test on) the file that reuses its
+ * number, while the same gen still conflicts. */
+STM_TEST(locks_other_incarnation_never_conflicts) {
+    stm_lock_table *t = stm_lock_table_create();
+    STM_ASSERT_TRUE(t != NULL);
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 7, 1, STM_LOCK_EXCLUSIVE, 0, 0));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 8, 2, STM_LOCK_EXCLUSIVE, 0, 0));
+    bool grant = false;
+    uint64_t who = 0;
+    STM_ASSERT_OK(stm_lock_test(t, 1, 100, 9, 3, STM_LOCK_EXCLUSIVE, 0, 0,
+                                &grant, &who));
+    STM_ASSERT_TRUE(grant);
+    STM_ASSERT_EQ(who, 0u);
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 8, 3, STM_LOCK_SHARED, 0, 10),
+                   STM_EAGAIN);
+    STM_ASSERT_OK(stm_lock_release_ino(t, 1, 100));
+    size_t n = 1;
+    STM_ASSERT_OK(stm_lock_count(t, &n));
+    STM_ASSERT_EQ(n, 0u);
     stm_lock_table_close(t);
 }
 

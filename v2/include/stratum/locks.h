@@ -41,8 +41,11 @@ void stm_lock_table_close(stm_lock_table *t);
 
 /*
  * Acquire a lock. Non-blocking — returns STM_EAGAIN if any
- * existing lock at (dataset_id, ino) overlapping [off, off+len)
- * conflicts (different owner + at-least-one-exclusive).
+ * existing lock at (dataset_id, ino, gen) overlapping [off, off+len)
+ * conflicts (different owner + at-least-one-exclusive). `gen` is the
+ * inode incarnation (si_gen) locked: records on another incarnation of
+ * the same ino never conflict, so a freed file's locks cannot refuse
+ * the file that reuses its number.
  *
  * Same-owner re-lock: ALWAYS admitted (POSIX permits an owner to
  * upgrade/downgrade/stack its own locks; this MVP doesn't merge
@@ -65,6 +68,7 @@ void stm_lock_table_close(stm_lock_table *t);
 STM_MUST_USE
 stm_status stm_lock_acquire(stm_lock_table *t,
                                   uint64_t dataset_id, uint64_t ino,
+                                  uint64_t gen,
                                   uint64_t owner_id, uint8_t type,
                                   uint64_t off, uint64_t len);
 
@@ -95,6 +99,7 @@ stm_status stm_lock_release(stm_lock_table *t,
 STM_MUST_USE
 stm_status stm_lock_test(const stm_lock_table *t,
                               uint64_t dataset_id, uint64_t ino,
+                              uint64_t gen,
                               uint64_t owner_id, uint8_t type,
                               uint64_t off, uint64_t len,
                               bool *out_would_grant,
@@ -113,9 +118,9 @@ STM_MUST_USE
 stm_status stm_lock_release_owner(stm_lock_table *t, uint64_t owner_id);
 
 /*
- * Release every lock on (dataset_id, ino), whoever holds it. The fs
- * calls it as it frees the inode: records carry no inode generation, so
- * any left would apply to the inode that reuses the number.
+ * Release every lock on (dataset_id, ino), every incarnation, whoever
+ * holds it. The fs calls it as it frees the inode, so the freed
+ * incarnation's records go at once rather than when their owners close.
  *
  * Refusals:
  *   - NULL t (STM_EINVAL).

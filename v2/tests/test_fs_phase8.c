@@ -7080,6 +7080,17 @@ STM_TEST(fs_p11_r86_p2_1_dir_to_dir_exchange_unrelated_allowed) {
 /* P8-POSIX-7d: advisory locks — flock(2) + fcntl(2) F_OFD_SETLK shape.       */
 /* ========================================================================= */
 
+/* Alloc a regular-file inode in dataset 1: a lock names a live inode. */
+static uint64_t p7d_alloc_file(stm_fs *fs)
+{
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync_for_test(fs));
+    STM_ASSERT_TRUE(iidx != NULL);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, /*ds=*/1, (uint32_t)S_IFREG | 0644u,
+                                  /*uid=*/0, /*gid=*/0, &ino));
+    return ino;
+}
+
 STM_TEST(fs_p7d_lock_basic_acquire_release) {
     make_tmp("p7d_lock_basic");
     stm_fs_format_opts fopts = default_format_opts();
@@ -7087,12 +7098,13 @@ STM_TEST(fs_p7d_lock_basic_acquire_release) {
     stm_fs_mount_opts mopts = rw_mount_opts();
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t a = p7d_alloc_file(fs);
 
-    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, a, 1, STM_FS_LOCK_SHARED, 0, 100));
     size_t n = 0;
     STM_ASSERT_OK(stm_fs_lock_count(fs, &n));
     STM_ASSERT_EQ(n, (size_t)1);
-    STM_ASSERT_OK(stm_fs_unlock(fs, 1, 100, 1, 0, 100));
+    STM_ASSERT_OK(stm_fs_unlock(fs, 1, a, 1, 0, 100));
     STM_ASSERT_OK(stm_fs_lock_count(fs, &n));
     STM_ASSERT_EQ(n, (size_t)0);
 
@@ -7107,11 +7119,12 @@ STM_TEST(fs_p7d_lock_excl_blocks_other_owner) {
     stm_fs_mount_opts mopts = rw_mount_opts();
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t a = p7d_alloc_file(fs);
 
-    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
-    STM_ASSERT_ERR(stm_fs_lock(fs, 1, 100, 2, STM_FS_LOCK_SHARED, 0, 100),
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, a, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_ERR(stm_fs_lock(fs, 1, a, 2, STM_FS_LOCK_SHARED, 0, 100),
                    STM_EAGAIN);
-    STM_ASSERT_ERR(stm_fs_lock(fs, 1, 100, 2, STM_FS_LOCK_EXCLUSIVE, 0, 100),
+    STM_ASSERT_ERR(stm_fs_lock(fs, 1, a, 2, STM_FS_LOCK_EXCLUSIVE, 0, 100),
                    STM_EAGAIN);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -7125,12 +7138,13 @@ STM_TEST(fs_p7d_lock_test_reports_conflict) {
     stm_fs_mount_opts mopts = rw_mount_opts();
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t a = p7d_alloc_file(fs);
 
-    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, a, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
 
     bool would_grant = true;
     uint64_t conflicting = 0;
-    STM_ASSERT_OK(stm_fs_lock_test(fs, 1, 100, 2, STM_FS_LOCK_SHARED,
+    STM_ASSERT_OK(stm_fs_lock_test(fs, 1, a, 2, STM_FS_LOCK_SHARED,
                                           0, 100, &would_grant, &conflicting));
     STM_ASSERT_TRUE(!would_grant);
     STM_ASSERT_EQ(conflicting, (uint64_t)1);
@@ -7146,10 +7160,12 @@ STM_TEST(fs_p7d_release_lock_owner_drops_all) {
     stm_fs_mount_opts mopts = rw_mount_opts();
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t a = p7d_alloc_file(fs);
+    uint64_t b = p7d_alloc_file(fs);
 
-    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_SHARED, 0, 100));
-    STM_ASSERT_OK(stm_fs_lock(fs, 1, 200, 1, STM_FS_LOCK_SHARED, 0, 100));
-    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 2, STM_FS_LOCK_SHARED, 200, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, a, 1, STM_FS_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, b, 1, STM_FS_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, a, 2, STM_FS_LOCK_SHARED, 200, 100));
 
     STM_ASSERT_OK(stm_fs_release_lock_owner(fs, 1));
     size_t n = 0;
@@ -7190,8 +7206,9 @@ STM_TEST(fs_p7d_r90_p3_5_lock_no_persistence_across_mount) {
     stm_fs_mount_opts mopts = rw_mount_opts();
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t a = p7d_alloc_file(fs);
 
-    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, a, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
     size_t n = 0;
     STM_ASSERT_OK(stm_fs_lock_count(fs, &n));
     STM_ASSERT_EQ(n, (size_t)1);
@@ -7208,7 +7225,7 @@ STM_TEST(fs_p7d_r90_p3_5_lock_no_persistence_across_mount) {
 
     /* Previously-conflicting range now acquirable by a different
      * owner — the prior lock didn't survive. */
-    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 99, STM_FS_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, a, 99, STM_FS_LOCK_EXCLUSIVE, 0, 100));
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);
@@ -7223,6 +7240,8 @@ STM_TEST(fs_p7d_lock_ro_mount_allowed) {
     stm_fs_mount_opts mopts = rw_mount_opts();
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t a = p7d_alloc_file(fs);
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_unmount(fs));
 
     stm_fs_mount_opts ro_mopts = mopts;
@@ -7230,8 +7249,8 @@ STM_TEST(fs_p7d_lock_ro_mount_allowed) {
     fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro_mopts, &fs));
 
-    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_SHARED, 0, 100));
-    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, a, 1, STM_FS_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, a, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);

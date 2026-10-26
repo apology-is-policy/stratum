@@ -2465,10 +2465,12 @@ stm_status stm_fs_promote_policy_pass_all(
  *   - Conflicting lock present → STM_EAGAIN.
  *   - STM_ENOMEM if the lock table can't grow.
  *
- * Lock posture: takes fs->lock + FS_GUARD_READ for the wedged
- * gate, drops it, then acquires the lock-table's internal mutex.
- * RO mounts MAY hold locks (advisory locks don't mutate on-disk
- * state).
+ *   - No live inode at (dataset_id, ino) (STM_ENOENT).
+ *
+ * Lock posture: holds fs->global EX across the inode lookup and the
+ * acquire. The record names the incarnation (si_gen) live then, so it
+ * never refuses a later inode on the same number. RO mounts MAY hold
+ * locks (advisory locks don't mutate on-disk state).
  */
 STM_MUST_USE
 stm_status stm_fs_lock(stm_fs *fs,
@@ -2488,7 +2490,8 @@ stm_status stm_fs_unlock(stm_fs *fs,
 /* F_GETLK shape — does NOT acquire. On STM_OK,
  * `*out_would_grant=true` means an acquire would succeed; `false`
  * means a conflict. `out_conflicting_owner` (optional) gets one
- * of the conflicting owners' id on `out_would_grant=false`. */
+ * of the conflicting owners' id on `out_would_grant=false`. Answers
+ * for the live incarnation; STM_ENOENT when there is none. */
 STM_MUST_USE
 stm_status stm_fs_lock_test(stm_fs *fs,
                                    uint64_t dataset_id, uint64_t ino,
@@ -2506,6 +2509,60 @@ stm_status stm_fs_release_lock_owner(stm_fs *fs, uint64_t owner_id);
  * Used by tests + admin tools. */
 STM_MUST_USE
 stm_status stm_fs_lock_count(stm_fs *fs, size_t *out_count);
+
+/* ========================================================================= */
+/* Identity-checked twins (the 9P server's).                                  */
+/* ========================================================================= */
+
+/*
+ * Each *_if_gen call is its gen-less namesake acting only on the inode
+ * incarnation `gen` -- the si_gen a 9P fid cached when it was bound.
+ * It answers STM_ESTALE when (dataset_id, ino) is gone or is another
+ * incarnation. The check is made where the op holds the inode against
+ * a free, so a file unlinked, and its number reused, between a
+ * caller's own freshness check and the op is refused, never acted on.
+ */
+STM_MUST_USE
+stm_status stm_fs_write_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                               uint64_t gen,
+                               uint64_t off, const void *buf, size_t len);
+STM_MUST_USE
+stm_status stm_fs_truncate_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino, uint64_t gen,
+                                  uint64_t new_size);
+STM_MUST_USE
+stm_status stm_fs_chmod_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                               uint64_t gen, uint32_t mode);
+STM_MUST_USE
+stm_status stm_fs_chown_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                               uint64_t gen, uint32_t uid, uint32_t gid);
+STM_MUST_USE
+stm_status stm_fs_utimens_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t ino, uint64_t gen,
+                                 uint64_t atime_sec, uint32_t atime_nsec,
+                                 uint64_t mtime_sec, uint32_t mtime_nsec,
+                                 uint64_t ctime_sec, uint32_t ctime_nsec);
+STM_MUST_USE
+stm_status stm_fs_setxattr_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino, uint64_t gen,
+                                  const uint8_t *name, uint8_t name_len,
+                                  const uint8_t *value, uint32_t value_len,
+                                  uint32_t flags, bool *out_replaced);
+STM_MUST_USE
+stm_status stm_fs_fallocate_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                   uint64_t ino, uint64_t gen,
+                                   uint64_t off, uint64_t len, uint32_t flags);
+STM_MUST_USE
+stm_status stm_fs_lock_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              uint64_t gen, uint64_t owner_id, uint8_t type,
+                              uint64_t off, uint64_t len);
+STM_MUST_USE
+stm_status stm_fs_lock_test_if_gen(stm_fs *fs, uint64_t dataset_id,
+                                   uint64_t ino, uint64_t gen,
+                                   uint64_t owner_id, uint8_t type,
+                                   uint64_t off, uint64_t len,
+                                   bool *out_would_grant,
+                                   uint64_t *out_conflicting_owner);
 
 /* ========================================================================= */
 /* P8-POSIX-7b: fallocate(2) — every FALLOC_FL_* flag.                        */
