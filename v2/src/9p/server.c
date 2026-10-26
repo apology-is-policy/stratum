@@ -185,9 +185,12 @@ typedef struct p9_fid {
      * (clamps to conn_root_ino, matching Plan 9 chroot semantics).
      * Inherited at every Twalk so cloned fids preserve the root
      * context; preserved at Tlcreate (the repurposed fid is in the
-     * same connection). R93 P3-1 fix. */
+     * same connection). R93 P3-1 fix. conn_root_gen is the root's
+     * incarnation at Tattach: a root freed and its number reused
+     * answers ESTALE, never its successor. */
     uint64_t    conn_root_dataset;
     uint64_t    conn_root_ino;
+    uint64_t    conn_root_gen;
 
     /* AUX_XATTR state. Used only when kind == P9_FID_AUX_XATTR. The
      * aux fid encapsulates one of two flavors:
@@ -223,6 +226,7 @@ typedef struct p9_binding {
     size_t    path_len;
     uint64_t  source_dataset;
     uint64_t  source_ino;
+    uint64_t  source_gen;       /* the incarnation bound, as Plan 9 binds a Chan */
     uint8_t   mode;             /* STM_9P_BIND_REPLACE only at v2.0 */
 } p9_binding;
 
@@ -683,12 +687,14 @@ static stm_status ns_bindings_set(stm_9p_server *s,
                                      const char *path, size_t path_len,
                                      uint64_t source_dataset,
                                      uint64_t source_ino,
+                                     uint64_t source_gen,
                                      uint8_t mode)
 {
     p9_binding *existing = ns_bindings_lookup(s, path, path_len);
     if (existing) {
         existing->source_dataset = source_dataset;
         existing->source_ino     = source_ino;
+        existing->source_gen     = source_gen;
         existing->mode           = mode;
         return STM_OK;
     }
@@ -712,6 +718,7 @@ static stm_status ns_bindings_set(stm_9p_server *s,
     b->path_len       = path_len;
     b->source_dataset = source_dataset;
     b->source_ino     = source_ino;
+    b->source_gen     = source_gen;
     b->mode           = mode;
     s->num_bindings++;
     return STM_OK;
@@ -791,6 +798,7 @@ static stm_status fid_set_ns_path(p9_fid *f,
  * path is malformed, STM_ENAMETOOLONG / STM_EOVERFLOW for size limits. */
 static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
                                             uint64_t start_ino,
+                                            const uint64_t *start_gen,
                                             const char *path, size_t path_len,
                                             uint64_t *out_ino,
                                             struct stm_inode_value *out_iv)
@@ -807,7 +815,10 @@ static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
      * the walk (STM_ESTALE) instead of continuing in its successor. */
     struct stm_inode_value iv;
     rc = stm_fs_stat(s->fs, ds, start_ino, &iv);
+    if (rc == STM_ENOENT && start_gen) return STM_ESTALE;
     if (rc != STM_OK) return rc;
+    if (start_gen && stm_load_le64(iv.si_gen) != *start_gen)
+        return STM_ESTALE;
     uint64_t cur_ino = start_ino;
     if (canon_len > 1u) {
         size_t i = 1u;
@@ -843,7 +854,7 @@ static stm_status ns_walk_abs_path(stm_9p_server *s, uint64_t ds,
                                        uint8_t  *out_qt)
 {
     struct stm_inode_value iv;
-    stm_status rc = ns_walk_abs_path_from(s, ds, /* start_ino */ 1u,
+    stm_status rc = ns_walk_abs_path_from(s, ds, /* start_ino */ 1u, NULL,
                                           path, path_len, out_ino, &iv);
     if (rc != STM_OK) return rc;
     if (out_gen)   *out_gen   = stm_load_le64(iv.si_gen);
@@ -966,8 +977,9 @@ static stm_status apply_attach_spec(stm_9p_server *s,
             goto fail;
         }
 
-        uint64_t src_ino = 0;
-        rc = ns_walk_abs_path(s, ds, src, src_len, &src_ino, NULL, NULL, NULL);
+        uint64_t src_ino = 0, src_gen = 0;
+        rc = ns_walk_abs_path(s, ds, src, src_len, &src_ino, &src_gen, NULL,
+                              NULL);
         if (rc != STM_OK) goto fail;
 
         char   canon_tgt[STM_9P_NS_PATH_MAX + 1u];
@@ -977,7 +989,7 @@ static stm_status apply_attach_spec(stm_9p_server *s,
         if (rc != STM_OK) goto fail;
 
         rc = ns_bindings_set(s, canon_tgt, canon_tgt_len,
-                                ds, src_ino, STM_9P_BIND_REPLACE);
+                                ds, src_ino, src_gen, STM_9P_BIND_REPLACE);
         if (rc != STM_OK) goto fail;
 
         parsed_entries++;
@@ -1294,6 +1306,7 @@ static stm_status h_attach(stm_9p_server *s,
      * otherwise pop above the underlying-tree parent. R93 P3-1 fix. */
     f->conn_root_dataset = bound_dataset;
     f->conn_root_ino     = bound_ino;
+    f->conn_root_gen     = bound_gen;
 
     /* ns_path = "/" — the root of the connection's namespace. Even for
      * the absolute-path "chroot" form, the connection sees its root
@@ -1443,6 +1456,14 @@ static stm_status h_flush(stm_9p_server *s,
 
 /* The walk's cumulative cursor — the source fid's identity snapshot,
  * advanced per resolved component. */
+/* The connection root a walk's ".." re-resolves from, and the
+ * incarnation it was bound to. */
+struct conn_root {
+    uint64_t ds;
+    uint64_t ino;
+    uint64_t gen;
+};
+
 struct walk_cursor {
     uint64_t ds;
     uint64_t ino;
@@ -1463,8 +1484,7 @@ struct walk_cursor {
  * qid encoding is ALSO stored at ivs_out[i] for each emitted qid — the
  * Twalkgetattr per-component attrs come for free (POUNCE). */
 static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
-                                     uint64_t conn_root_ds,
-                                     uint64_t conn_root_ino,
+                                     const struct conn_root *croot,
                                      const uint8_t *bp, const uint8_t *end,
                                      uint16_t nwname,
                                      struct walk_cursor *cur,
@@ -1495,6 +1515,8 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
         struct stm_inode_value next_iv;
         bool have_iv = false;
         bool self    = false;
+        bool bound   = false;
+        uint64_t want_gen = 0;
 
         /* "." (no-op on cumulative state) and ".." (pops a component
          * via canonicalization) are wire-legal Twalk components per
@@ -1512,6 +1534,8 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
         if (b) {
             next_ds  = b->source_dataset;
             next_ino = b->source_ino;
+            want_gen = b->source_gen;
+            bound    = true;
         } else if (is_dot ||
                     (is_dotdot && new_path_len == cur->path_len &&
                      memcmp(new_path, cur->path, cur->path_len) == 0)) {
@@ -1535,12 +1559,15 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
              * the re-resolution were already considered as binding
              * candidates during the original forward walk that
              * brought us to cur_path. */
-            rc = ns_walk_abs_path_from(s, conn_root_ds,
-                                          conn_root_ino,
+            rc = ns_walk_abs_path_from(s, croot->ds, croot->ino,
+                                          &croot->gen,
                                           new_path, new_path_len,
                                           &next_ino, &next_iv);
-            if (rc != STM_OK) break;
-            next_ds = conn_root_ds;
+            if (rc != STM_OK) {
+                if (rc == STM_ESTALE && nwqid == 0) goto stale;
+                break;
+            }
+            next_ds = croot->ds;
             have_iv = true;
         } else {
             /* The name is looked up in the cursor's own incarnation, and
@@ -1563,10 +1590,16 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
          * reflects the underlying source's current state. */
         if (!have_iv) {
             rc = stm_fs_stat(s->fs, next_ds, next_ino, &next_iv);
-            if (rc != STM_OK) break;
+            if (rc == STM_ENOENT && bound) rc = STM_ESTALE;
+            if (rc != STM_OK) {
+                if (rc == STM_ESTALE && nwqid == 0) goto stale;
+                break;
+            }
         }
-        /* "." re-reads the cursor itself: the same incarnation or none. */
-        if (self && stm_load_le64(next_iv.si_gen) != cur->gen) {
+        /* "." re-reads the cursor itself, and a binding its source: the
+         * same incarnation or none. */
+        if (self) want_gen = cur->gen;
+        if ((self || bound) && stm_load_le64(next_iv.si_gen) != want_gen) {
             if (nwqid == 0) goto stale;
             break;
         }
@@ -1660,8 +1693,7 @@ static int walk_bind_locked(stm_9p_server *s, p9_fid *f,
                             uint32_t fid_num, uint32_t newfid,
                             uint16_t nwname,
                             const struct walk_cursor *cur,
-                            uint64_t conn_root_ds,
-                            uint64_t conn_root_ino)
+                            const struct conn_root *croot)
 {
     /* CF-2b: on the fast path the source fid was only PINNED during
      * the unlocked component loop — a concurrent (protocol-violating)
@@ -1719,8 +1751,9 @@ static int walk_bind_locked(stm_9p_server *s, p9_fid *f,
      * fids on the same connection share the same conn_root, so a
      * cloned/walked fid sees the same "/" interpretation as its
      * progenitor. R93 P3-1 fix. */
-    nf->conn_root_dataset = conn_root_ds;
-    nf->conn_root_ino     = conn_root_ino;
+    nf->conn_root_dataset = croot->ds;
+    nf->conn_root_ino     = croot->ino;
+    nf->conn_root_gen     = croot->gen;
 
     /* Publish ns_path onto the bound fid (P9-9P-2). new_ns was already
      * allocated above; this is now infallible. */
@@ -1735,8 +1768,7 @@ static stm_status walk_finish_locked(stm_9p_server *s, p9_fid *f,
                                         uint16_t nwname,
                                         const uint8_t *qids, uint16_t nwqid,
                                         const struct walk_cursor *cur,
-                                        uint64_t conn_root_ds,
-                                        uint64_t conn_root_ino,
+                                        const struct conn_root *croot,
                                         uint16_t tag,
                                         uint8_t *resp, uint32_t resp_cap,
                                         uint32_t *resp_len)
@@ -1760,7 +1792,7 @@ static stm_status walk_finish_locked(stm_9p_server *s, p9_fid *f,
     }
 
     int ec = walk_bind_locked(s, f, fid_num, newfid, nwname, cur,
-                              conn_root_ds, conn_root_ino);
+                              croot);
     if (ec)
         return reply_rlerror(resp, resp_cap, resp_len, tag, ec);
 
@@ -1831,8 +1863,10 @@ static stm_status h_walk(stm_9p_server *s,
     memcpy(cur.path, f->ns_path, f->ns_path_len);
     cur.path[f->ns_path_len] = '\0';
     cur.path_len = f->ns_path_len;
-    uint64_t conn_root_ds  = f->conn_root_dataset;
-    uint64_t conn_root_ino = f->conn_root_ino;
+    const struct conn_root root_v = {
+        f->conn_root_dataset, f->conn_root_ino, f->conn_root_gen
+    };
+    const struct conn_root *croot = &root_v;
 
     uint8_t  qids[STM_9P_MAX_WALK * STM_9P_QID_SIZE];
     uint16_t nwqid = 0;
@@ -1845,7 +1879,7 @@ static stm_status h_walk(stm_9p_server *s,
         if (vrc != STM_OK)
             return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
         stm_status wrc = walk_components(s, /*consult_bindings=*/true,
-                                            conn_root_ds, conn_root_ino,
+                                            croot,
                                             bp, end, nwname,
                                             &cur, qids, &nwqid, NULL);
         if (wrc != STM_OK)
@@ -1853,7 +1887,7 @@ static stm_status h_walk(stm_9p_server *s,
                                  walk_ecode(wrc));
         return walk_finish_locked(s, f, fid, newfid, nwname,
                                      qids, nwqid, &cur,
-                                     conn_root_ds, conn_root_ino,
+                                     croot,
                                      tag, resp, resp_cap, resp_len);
     }
 
@@ -1873,7 +1907,7 @@ static stm_status h_walk(stm_9p_server *s,
         ecode = status_to_errno(vrc);
     } else {
         stm_status wrc = walk_components(s, /*consult_bindings=*/false,
-                                            conn_root_ds, conn_root_ino,
+                                            croot,
                                             bp, end, nwname,
                                             &cur, qids, &nwqid, NULL);
         if (wrc != STM_OK)
@@ -1888,7 +1922,7 @@ static stm_status h_walk(stm_9p_server *s,
     else
         ret = walk_finish_locked(s, f, fid, newfid, nwname,
                                     qids, nwqid, &cur,
-                                    conn_root_ds, conn_root_ino,
+                                    croot,
                                     tag, resp, resp_cap, resp_len);
     fid_unpin_locked(s, f);
     return ret;
@@ -1916,8 +1950,7 @@ static stm_status walkgetattr_finish_locked(stm_9p_server *s, p9_fid *f,
                                               uint16_t nwqid,
                                               const struct stm_inode_value *ivs,
                                               const struct walk_cursor *cur,
-                                              uint64_t conn_root_ds,
-                                              uint64_t conn_root_ino,
+                                              const struct conn_root *croot,
                                               uint16_t tag,
                                               uint8_t *resp, uint32_t resp_cap,
                                               uint32_t *resp_len)
@@ -1931,7 +1964,7 @@ static stm_status walkgetattr_finish_locked(stm_9p_server *s, p9_fid *f,
     bool partial = (nwname > 0 && nwqid < nwname);
     if (!partial && newfid != STM_9P_NOFID) {
         int ec = walk_bind_locked(s, f, fid_num, newfid, nwname, cur,
-                                  conn_root_ds, conn_root_ino);
+                                  croot);
         if (ec)
             return reply_rlerror(resp, resp_cap, resp_len, tag, ec);
     }
@@ -1990,8 +2023,10 @@ static stm_status h_walkgetattr(stm_9p_server *s,
     memcpy(cur.path, f->ns_path, f->ns_path_len);
     cur.path[f->ns_path_len] = '\0';
     cur.path_len = f->ns_path_len;
-    uint64_t conn_root_ds  = f->conn_root_dataset;
-    uint64_t conn_root_ino = f->conn_root_ino;
+    const struct conn_root root_v = {
+        f->conn_root_dataset, f->conn_root_ino, f->conn_root_gen
+    };
+    const struct conn_root *croot = &root_v;
 
     uint8_t  qids[STM_9P_MAX_WALK * STM_9P_QID_SIZE];
     struct stm_inode_value ivs[STM_9P_MAX_WALK];
@@ -2003,7 +2038,7 @@ static stm_status h_walkgetattr(stm_9p_server *s,
         if (vrc != STM_OK)
             return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
         stm_status wrc = walk_components(s, /*consult_bindings=*/true,
-                                            conn_root_ds, conn_root_ino,
+                                            croot,
                                             bp, end, nwname,
                                             &cur, qids, &nwqid, ivs);
         if (wrc != STM_OK)
@@ -2011,7 +2046,7 @@ static stm_status h_walkgetattr(stm_9p_server *s,
                                  walk_ecode(wrc));
         return walkgetattr_finish_locked(s, f, fid, newfid, request_mask,
                                            nwname, qids, nwqid, ivs, &cur,
-                                           conn_root_ds, conn_root_ino,
+                                           croot,
                                            tag, resp, resp_cap, resp_len);
     }
 
@@ -2026,7 +2061,7 @@ static stm_status h_walkgetattr(stm_9p_server *s,
         ecode = status_to_errno(vrc);
     } else {
         stm_status wrc = walk_components(s, /*consult_bindings=*/false,
-                                            conn_root_ds, conn_root_ino,
+                                            croot,
                                             bp, end, nwname,
                                             &cur, qids, &nwqid, ivs);
         if (wrc != STM_OK)
@@ -2040,7 +2075,7 @@ static stm_status h_walkgetattr(stm_9p_server *s,
     else
         ret = walkgetattr_finish_locked(s, f, fid, newfid, request_mask,
                                           nwname, qids, nwqid, ivs, &cur,
-                                          conn_root_ds, conn_root_ino,
+                                          croot,
                                           tag, resp, resp_cap, resp_len);
     fid_unpin_locked(s, f);
     return ret;
@@ -4112,7 +4147,7 @@ static stm_status h_bind(stm_9p_server *s,
      * BindCapBound enforced via STM_9P_MAX_BINDINGS. Cross-connection
      * isolation is structural (s->bindings is server-local). */
     rc = ns_bindings_set(s, tgt, tgt_len,
-                            sf->dataset_id, sf->ino, mode);
+                            sf->dataset_id, sf->ino, sf->cached_gen, mode);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
 

@@ -5826,4 +5826,207 @@ STM_TEST(p9_reflink_never_adopts_the_file_that_replaced_its_dst) {
     gap_fix_down(&gf);
 }
 
+/* ── bindings and the connection root name an incarnation ───────────── */
+
+typedef struct {
+    stm_fs        *fs;
+    stm_9p_server *s;
+    uint64_t       root, src;
+} bind_fix;
+
+/* A fresh fs whose root holds the empty directory "src", on a reused
+ * ino so its gen is not 0 (a gen never recorded reads as 0). */
+static void bind_fix_up(bind_fix *bf, const char *name)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    bf->fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &bf->fs));
+    p9_alloc_root_dir(bf->fs, &bf->root);
+    uint64_t tmp = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(bf->fs, 1, bf->root, (const uint8_t *)"tmp",
+                               3, 0755u, 0, 0, &tmp));
+    STM_ASSERT_OK(stm_fs_rmdir(bf->fs, 1, bf->root,
+                               (const uint8_t *)"tmp", 3));
+    STM_ASSERT_OK(stm_fs_mkdir(bf->fs, 1, bf->root, (const uint8_t *)"src",
+                               3, 0755u, 0, 0, &bf->src));
+    STM_ASSERT_EQ(bf->src, tmp);
+    struct stm_inode_value iv;
+    STM_ASSERT_OK(stm_fs_stat(bf->fs, 1, bf->src, &iv));
+    STM_ASSERT_TRUE(stm_load_le64(iv.si_gen) != 0u);
+    bf->s = make_server(bf->fs);
+}
+
+static void bind_fix_down(bind_fix *bf)
+{
+    stm_9p_server_destroy(bf->s);
+    STM_ASSERT_OK(stm_fs_unmount(bf->fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* "src" is removed and "other", holding "secret", takes its ino. */
+static void bind_swap_src_for_other(bind_fix *bf)
+{
+    uint64_t other = 0, secret = 0;
+    STM_ASSERT_OK(stm_fs_rmdir(bf->fs, 1, bf->root,
+                               (const uint8_t *)"src", 3));
+    STM_ASSERT_OK(stm_fs_mkdir(bf->fs, 1, bf->root, (const uint8_t *)"other",
+                               5, 0755u, 0, 0, &other));
+    STM_ASSERT_EQ(other, bf->src);
+    STM_ASSERT_OK(stm_fs_create_file(bf->fs, 1, other,
+                                     (const uint8_t *)"secret", 6, 0600u,
+                                     0, 0, &secret));
+}
+
+/* Twalk from fid 100 along one component into `newfid`: the reply type,
+ * and the errno when it is an Rlerror. */
+static uint8_t bind_walk(bind_fix *bf, uint32_t newfid, const char *comp,
+                         uint32_t *ecode)
+{
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *path[] = { comp };
+    uint32_t sz = build_twalk(req, 7, 100, newfid, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(bf->s, req, sz, resp, sizeof resp,
+                                       &rlen));
+    *ecode = resp[4] == STM_9P_RLERROR ? load_u32(resp + 7) : 0u;
+    return resp[4];
+}
+
+/* "/alias" is bound to fid 101 on "src" with Tbind. */
+static void bind_alias_by_tbind(bind_fix *bf)
+{
+    do_version_attach(bf->s, 100);
+    walk_to(bf->s, 100, 101, "src");
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tbind(req, 3, 101, "/alias", STM_9P_BIND_REPLACE);
+    STM_ASSERT_OK(stm_9p_server_handle(bf->s, req, sz, resp, sizeof resp,
+                                       &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RBIND);
+}
+
+/* A Tbind names its source's incarnation: once "src" is removed and its
+ * ino reused, walking the bound path answers ESTALE instead of entering
+ * the new directory. */
+STM_TEST(p9_walk_into_a_tbind_whose_source_was_replaced_answers_estale) {
+    bind_fix bf;
+    bind_fix_up(&bf, "9p_bind_replaced");
+    bind_alias_by_tbind(&bf);
+    uint32_t ec = 0;
+    STM_ASSERT_EQ(bind_walk(&bf, 102, "alias", &ec), STM_9P_RWALK);
+    bind_swap_src_for_other(&bf);
+    STM_ASSERT_EQ(bind_walk(&bf, 103, "alias", &ec), STM_9P_RLERROR);
+    STM_ASSERT_EQ(ec, STM_9P_ECODE_ESTALE);
+    bind_fix_down(&bf);
+}
+
+/* The same, for a binding made by an attach spec. */
+STM_TEST(p9_walk_into_a_spec_binding_whose_source_was_replaced_answers_estale) {
+    bind_fix bf;
+    bind_fix_up(&bf, "9p_spec_replaced");
+    do_version_attach_aname(bf.s, 100, "spec:/src=/alias");
+    uint32_t ec = 0;
+    STM_ASSERT_EQ(bind_walk(&bf, 102, "alias", &ec), STM_9P_RWALK);
+    bind_swap_src_for_other(&bf);
+    STM_ASSERT_EQ(bind_walk(&bf, 103, "alias", &ec), STM_9P_RLERROR);
+    STM_ASSERT_EQ(ec, STM_9P_ECODE_ESTALE);
+    bind_fix_down(&bf);
+}
+
+/* A bound source that is gone, its ino not reused, is ESTALE too: the
+ * file the binding named no longer exists. */
+STM_TEST(p9_walk_into_a_tbind_whose_source_is_gone_answers_estale) {
+    bind_fix bf;
+    bind_fix_up(&bf, "9p_bind_gone");
+    bind_alias_by_tbind(&bf);
+    STM_ASSERT_OK(stm_fs_rmdir(bf.fs, 1, bf.root, (const uint8_t *)"src", 3));
+    uint32_t ec = 0;
+    STM_ASSERT_EQ(bind_walk(&bf, 102, "alias", &ec), STM_9P_RLERROR);
+    STM_ASSERT_EQ(ec, STM_9P_ECODE_ESTALE);
+    bind_fix_down(&bf);
+}
+
+/* Binding a bound path again names the new source. */
+STM_TEST(p9_rebinding_a_path_names_the_new_source) {
+    bind_fix bf;
+    bind_fix_up(&bf, "9p_rebind");
+    bind_alias_by_tbind(&bf);
+    uint64_t src2 = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(bf.fs, 1, bf.root, (const uint8_t *)"src2", 4,
+                               0755u, 0, 0, &src2));
+    walk_to(bf.s, 100, 104, "src2");
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tbind(req, 5, 104, "/alias", STM_9P_BIND_REPLACE);
+    STM_ASSERT_OK(stm_9p_server_handle(bf.s, req, sz, resp, sizeof resp,
+                                       &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RBIND);
+    const char *path[] = { "alias" };
+    sz = build_twalk(req, 6, 100, 105, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(bf.s, req, sz, resp, sizeof resp,
+                                       &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    STM_ASSERT_EQ(qid_ino(resp + 9), src2);
+    bind_fix_down(&bf);
+}
+
+/* A connection rooted at "/src" with fid 101 on "/a"; then "a" is
+ * moved out of "src" (fid 101 stays live) and "src" is removed. */
+static void root_fix_up(bind_fix *bf, const char *name)
+{
+    bind_fix_up(bf, name);
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(bf->fs, 1, bf->src, (const uint8_t *)"a", 1,
+                               0755u, 0, 0, &a));
+    do_version_attach_aname(bf->s, 100, "/src");
+    walk_to(bf->s, 100, 101, "a");
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *up[] = { ".." };
+    uint32_t sz = build_twalk(req, 8, 101, 102, 1, up);
+    STM_ASSERT_OK(stm_9p_server_handle(bf->s, req, sz, resp, sizeof resp,
+                                       &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    STM_ASSERT_OK(stm_fs_rename(bf->fs, 1, bf->src, (const uint8_t *)"a", 1,
+                                bf->root, (const uint8_t *)"a", 1, 0u));
+}
+
+/* Once the root "src" is removed and its ino reused, ".." from below it
+ * must not re-resolve into the new directory. */
+STM_TEST(p9_dotdot_to_a_replaced_connection_root_answers_estale) {
+    bind_fix bf;
+    root_fix_up(&bf, "9p_root_replaced");
+    bind_swap_src_for_other(&bf);
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *up[] = { ".." };
+    uint32_t sz = build_twalk(req, 9, 101, 103, 1, up);
+    STM_ASSERT_OK(stm_9p_server_handle(bf.s, req, sz, resp, sizeof resp,
+                                       &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ESTALE);
+    bind_fix_down(&bf);
+}
+
+/* A connection root that is gone, its ino not reused: ".." from below
+ * it is ESTALE, not ENOENT. */
+STM_TEST(p9_dotdot_to_a_gone_connection_root_answers_estale) {
+    bind_fix bf;
+    root_fix_up(&bf, "9p_root_gone");
+    STM_ASSERT_OK(stm_fs_rmdir(bf.fs, 1, bf.root, (const uint8_t *)"src", 3));
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *up[] = { ".." };
+    uint32_t sz = build_twalk(req, 9, 101, 103, 1, up);
+    STM_ASSERT_OK(stm_9p_server_handle(bf.s, req, sz, resp, sizeof resp,
+                                       &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ESTALE);
+    bind_fix_down(&bf);
+}
+
 STM_TEST_MAIN("9p")
