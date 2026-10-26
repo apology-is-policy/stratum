@@ -2751,8 +2751,9 @@ STM_TEST(dataset_engine_retire_close_race) {
 /* A pinned reader that has to wait for the index lock (held across the
  * commit cascade) must not hold the EBR epoch while it waits: the bootstrap
  * pool's early reuse inside that cascade waits for every pinned reader. It
- * is pinned again before the call returns, so the engine it gets is
- * covered. */
+ * is pinned again before it reads the slot, so the engine it gets is
+ * covered: the slot-read hook checks the pin there, on the waiting path
+ * and on the uncontended one. */
 typedef struct {
     stm_dataset_index *idx;
     atomic_int         calling;
@@ -2761,7 +2762,20 @@ typedef struct {
     stm_status         rc;
     stm_btree_engine  *eng;
     uint64_t           epoch_after;
+    int                slot_reads;
+    bool               pinned_at_read;
 } pinned_get_arg;
+
+/* Runs on the getting thread with nothing else advancing: three advances
+ * stop after one only if this thread is pinned. */
+static void pinned_slot_read_hook(void *arg)
+{
+    pinned_get_arg *g = arg;
+    uint64_t e0 = stm_ebr_current_epoch();
+    for (int i = 0; i < 3; i++) (void)stm_ebr_try_advance();
+    g->slot_reads++;
+    g->pinned_at_read = stm_ebr_current_epoch() <= e0 + 1u;
+}
 
 static void *pinned_get_thread(void *arg)
 {
@@ -2800,6 +2814,7 @@ STM_TEST(dataset_engine_get_pinned_unpins_while_waiting) {
     atomic_init(&g.calling, 0);
     atomic_init(&g.returned, 0);
     atomic_init(&g.go, 0);
+    stm_dataset_index_set_slot_read_hook_for_test(pinned_slot_read_hook, &g);
     pthread_t th;
     STM_ASSERT_EQ(pthread_create(&th, NULL, pinned_get_thread, &g), 0);
     for (int i = 0; i < 5000 && !atomic_load(&g.calling); i++) usleep(1000);
@@ -2823,6 +2838,23 @@ STM_TEST(dataset_engine_get_pinned_unpins_while_waiting) {
     uint64_t pinned_after = stm_ebr_current_epoch();
     atomic_store(&g.go, 1);
     pthread_join(th, NULL);
+    int  waited_reads  = g.slot_reads;
+    bool waited_pinned = g.pinned_at_read;
+
+    /* Uncontended: the trylock wins and the pin is never dropped. */
+    g.slot_reads = 0;
+    g.pinned_at_read = false;
+    stm_ebr_thread *mt = stm_ebr_register();
+    STM_ASSERT_TRUE(mt != NULL);
+    stm_btree_engine *fast = NULL;
+    if (mt) {
+        stm_ebr_enter(mt);
+        STM_ASSERT_OK(stm_dataset_index_get_engine_pinned(
+            idx, mt, STM_DATASET_ROOT_ID, &fast));
+        stm_ebr_exit(mt);
+        stm_ebr_thread_free(mt);
+    }
+    stm_dataset_index_set_slot_read_hook_for_test(NULL, NULL);
 
     STM_ASSERT_TRUE(atomic_load(&g.calling) != 0);
     STM_ASSERT_TRUE(advanced);
@@ -2830,6 +2862,11 @@ STM_TEST(dataset_engine_get_pinned_unpins_while_waiting) {
     STM_ASSERT_OK(g.rc);
     STM_ASSERT_EQ(g.eng, plain);
     STM_ASSERT_TRUE(pinned_after <= g.epoch_after + 1u);
+    STM_ASSERT_EQ(waited_reads, 1);
+    STM_ASSERT_TRUE(waited_pinned);
+    STM_ASSERT_EQ(g.slot_reads, 1);
+    STM_ASSERT_TRUE(g.pinned_at_read);
+    STM_ASSERT_EQ(fast, plain);
 
     stm_dataset_index_close(idx);
     stm_bootstrap_close(b);

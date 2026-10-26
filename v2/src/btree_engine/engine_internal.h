@@ -622,11 +622,10 @@ struct stm_btree_engine {
      * three-phase commit per engine). LF-2 takes it in the slow-warm
      * path of `stm_btree_engine_lookup_concurrent` to serialise
      * multiple concurrent readers' first-descent load_root calls
-     * against each other (double-checked locking). LF-2 commits
-     * themselves still rely on atomic-store-release alone (the
-     * production caller's fs->global EX serialises commits). When
-     * LF-BE-prepend's consolidator becomes commit-concurrent with
-     * writes, finalize/abort/flush will all acquire this mutex.
+     * against each other (double-checked locking; a warmer only ever
+     * trylocks it, see concurrent_root). commit_flush / _finalize /
+     * _abort and the mini-consolidation hold it for their whole span,
+     * inside serial_mu.
      *
      * Lock order (R170 P3-2): `commit_mu` sits ABOVE the engine's
      * store-vtable I/O (`vt->reserve` / `vt->write` / `vt->read` /

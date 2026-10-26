@@ -1564,12 +1564,12 @@ static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
  * EBR-RETIRED, never freed in place. A wait-free reader resolves the
  * engine via stm_dataset_index_get_engine_pinned INSIDE its
  * stm_ebr_enter pin (fs.c LF-3 discipline), which reads the slot under
- * this same idx->lock with the pin held — so a reader that acquired the pointer before the
- * unpublish is pinned at retire time and EBR defers the free past its
- * exit; a reader arriving after sees NULL and lazily re-opens from
- * the durable triple. Serial ops and _concurrent writers are excluded
- * by the callers' fs-level EX envelope (rollback / destroy / unmount
- * all hold fs->global EX).
+ * this same idx->lock with the pin held — so a reader that acquired the
+ * pointer before the unpublish is pinned at retire time and EBR defers
+ * the free past its exit; a reader arriving after sees NULL and lazily
+ * re-opens from the durable triple. Serial ops and _concurrent writers
+ * are excluded by the callers' fs-level EX envelope (rollback / destroy
+ * / unmount all hold fs->global EX).
  */
 static void dataset_engine_close_locked(dataset_slot *slot) {
     if (slot->engine == NULL) return;
@@ -1580,9 +1580,24 @@ static void dataset_engine_close_locked(dataset_slot *slot) {
 
 /* ---- Public per-dataset engine API. ---- */
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static stm_dataset_index_slot_read_hook slot_read_hook;
+static void *slot_read_hook_arg;
+
+/* Production callers MUST NOT use this. See <stratum/dataset_testing.h>. */
+void stm_dataset_index_set_slot_read_hook_for_test(
+    stm_dataset_index_slot_read_hook fn, void *arg) {
+    slot_read_hook = fn;
+    slot_read_hook_arg = arg;
+}
+#endif
+
 static stm_status dataset_get_engine_locked(stm_dataset_index *idx,
                                             uint64_t dataset_id,
                                             stm_btree_engine **out_engine) {
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (slot_read_hook) slot_read_hook(slot_read_hook_arg);
+#endif
     size_t s = find_slot_locked(idx, dataset_id);
     if (s == (size_t)-1 || !idx->slots[s]->present) return STM_ENOENT;
     stm_status rc = dataset_engine_open_locked(idx, idx->slots[s]);

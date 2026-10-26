@@ -6880,10 +6880,11 @@ static void dcache_insert(stm_sync *s,
  * `ebr` follows the sync_dek_slot_alive contract (a SHORT own pin for
  * lock-free callers; NULL for locked-context callers, whose held
  * s->lock excludes the evict entirely). Pinning under dcache_wlock is
- * safe: EBR enter/exit is non-blocking and nothing in the tree waits
- * synchronously for an epoch grace. The flip is a release store,
- * pairing with the probe's acquire load (the policy edge; a
- * stale-clear read there is a spurious miss, fail-safe). */
+ * safe: EBR enter/exit is non-blocking, and the one synchronous wait on
+ * an epoch grace (the bootstrap pool's early reuse) gives up at a
+ * deadline, so no wait cycle through a pin can hold. The flip is a
+ * release store, pairing with the probe's acquire load (the policy
+ * edge; a stale-clear read there is a spurious miss, fail-safe). */
 static void dcache_publish_hot_gated(stm_sync *s, stm_ebr_thread *ebr,
                                      const uint8_t key[STM_CAS_HASH_LEN],
                                      uint64_t dataset_id, uint64_t key_id) {
@@ -7253,8 +7254,9 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
      *
      * RC-2 context dispatch: lock-free callers (ebr != NULL) copy the
      * DEK out of the published COW map under a SHORT own pin — taken
-     * here, NOT spanning the bdev read below (a pin must never cover
-     * device I/O; it would stall epoch advance globally). Locked
+     * here, NOT spanning the bdev read below: the pin protects only the
+     * DEK copy, and holding it across the read would hold epoch advance
+     * back for as long as the read takes. Locked
      * callers (ebr == NULL) keep the borrowed walk. A miss in either
      * context is the same ECORRUPT signal. */
     uint8_t dek[32];

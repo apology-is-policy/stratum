@@ -6443,11 +6443,14 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * at v1.0 — explicit STM_ENOTSUPPORTED. */
     if (fs_ino_is_synth(ino)) return STM_ENOTSUPPORTED;
 
-    /* 9.8-LF-3 port: drop fs->global SH; atomic wedge gate + EBR pin
-     * for the inode-existence check + the two xattr_list_concurrent
-     * passes (probe count + materialise). Inode existence + listing
-     * both happen under a single EBR critical section so the inode
-     * cannot be unlinked between the require check + the listing. */
+    /* 9.8-LF-3 port: drop fs->global SH; atomic wedge gate + one EBR
+     * pin over the inode-existence check and the two
+     * xattr_list_concurrent passes (probe count + materialise). The pin
+     * keeps alive every node those descents read; it does not order
+     * them against a writer, which never waits for readers. A count the
+     * materialise does not reproduce falls back to the SH path below;
+     * a destroy that lands between the existence check and the count is
+     * not caught here, and answers an empty list. */
     FS_GUARD_READ_LOCKLESS(fs);
 
     stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);

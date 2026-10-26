@@ -22,6 +22,7 @@
  */
 #include "tharness.h"
 #include <stratum/btree_engine.h>
+#include <stratum/btree_engine_testing.h>
 #include <stratum/hash.h>          /* stm_blake3 — for the corrupt-tree forges */
 #include <stratum/engine_store.h>  /* 4b-i: the production bootstrap-backed vtable */
 #include <stratum/block.h>
@@ -6280,11 +6281,15 @@ STM_TEST(engine_clone_commit_write_fault_sweep_small_tree) {
 }
 
 /* A commit can run under fs->global SH beside a serial op (CF-4 C's
- * reclaim-on-ENOSPC pair), so its flush and finalize must wait for a
- * serial scan already walking eng->root: a clone finalize swaps the root
- * and EBR-retires the tree the unpinned scan stands on. The scan's
- * callback parks mid-walk; the commit runs on another thread and must
- * not finish until the scan is let go. */
+ * reclaim-on-ENOSPC pair), so its flush, finalize and abort must each
+ * wait for a serial op already on the engine: a legacy flush rewrites
+ * the tree in place, a clone finalize swaps the root and EBR-retires the
+ * tree an unpinned serial walk stands on, and a legacy abort drops it.
+ * The flush legs park a real scan mid-walk. A serial op refuses to start
+ * inside the flush..finalize window (STM_EBUSY), so the finalize and
+ * abort legs hold serial_mu the way every serial op does for its span.
+ * Each step runs alone on its own thread and must not finish until the
+ * serial op lets go. */
 typedef struct {
     stm_btree_engine *eng;
     atomic_int        parked;
@@ -6315,27 +6320,40 @@ static void *serial_scan_park_thread(void *arg)
     return NULL;
 }
 
+typedef enum { STEP_FLUSH, STEP_FINALIZE, STEP_ABORT } commit_step_kind;
+
 typedef struct {
     stm_btree_engine *eng;
+    commit_step_kind  kind;
+    atomic_int        started;
     atomic_int        done;
-    stm_status        flush_rc;
-    stm_status        finalize_rc;
-} commit_beside_scan;
+    stm_status        rc;
+} commit_step;
 
-static void *commit_beside_scan_thread(void *arg)
+static void *commit_step_thread(void *arg)
 {
-    commit_beside_scan *c = arg;
+    commit_step *c = arg;
     uint64_t rp = 0, rg = 0;
     uint8_t  rc[32];
-    c->flush_rc = stm_btree_engine_commit_flush(c->eng, 2, &rp, &rg, rc);
-    c->finalize_rc = c->flush_rc == STM_OK
-                         ? stm_btree_engine_commit_finalize(c->eng)
-                         : c->flush_rc;
+    atomic_store(&c->started, 1);
+    switch (c->kind) {
+    case STEP_FLUSH:
+        c->rc = stm_btree_engine_commit_flush(c->eng, 2, &rp, &rg, rc);
+        break;
+    case STEP_FINALIZE:
+        c->rc = stm_btree_engine_commit_finalize(c->eng);
+        break;
+    case STEP_ABORT:
+        c->rc = stm_btree_engine_commit_abort(c->eng);
+        break;
+    }
     atomic_store(&c->done, 1);
     return NULL;
 }
 
-STM_TEST(engine_commit_waits_for_serial_scan) {
+static void commit_step_waits_for_serial_op(bool latched,
+                                            commit_step_kind kind)
+{
     STM_ASSERT_OK(stm_ebr_init());
     stm_ebr_thread *me = stm_ebr_register();
     STM_ASSERT_TRUE(me != NULL);
@@ -6345,6 +6363,7 @@ STM_TEST(engine_commit_waits_for_serial_scan) {
     stm_btree_crypt_ctx cx = test_cx();
     stm_btree_engine *eng = NULL;
     STM_ASSERT_OK(stm_btree_engine_create(&g_memstore_vt, &ms, &cx, 0, &eng));
+    if (!eng) { memstore_destroy(&ms); stm_ebr_thread_free(me); return; }
     for (uint32_t i = 0; i < 64; i++) {
         uint8_t key[4];
         be32_key(2u * i, key);
@@ -6354,47 +6373,101 @@ STM_TEST(engine_commit_waits_for_serial_scan) {
     uint8_t  rc1[32];
     STM_ASSERT_OK(stm_btree_engine_commit(eng, 1, &rp1, rc1));
 
-    /* A concurrent insert latches the clone arm, whose finalize swaps
-     * the root and retires the old tree. */
+    /* A concurrent insert latches the clone arm; a serial one keeps the
+     * engine on the legacy arm. */
     uint8_t ck[4];
     be32_key(1u, ck);
-    stm_ebr_enter(me);
-    STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, ck, 4, "b", 1));
-    stm_ebr_exit(me);
+    if (latched) {
+        stm_ebr_enter(me);
+        STM_ASSERT_OK(stm_btree_engine_insert_concurrent(eng, me, ck, 4,
+                                                         "b", 1));
+        stm_ebr_exit(me);
+    } else {
+        STM_ASSERT_OK(stm_btree_engine_insert(eng, ck, 4, "b", 1));
+    }
+    if (kind != STEP_FLUSH) {
+        uint64_t rp = 0, rg = 0;
+        uint8_t  rc[32];
+        STM_ASSERT_OK(stm_btree_engine_commit_flush(eng, 2, &rp, &rg, rc));
+    }
 
     serial_scan_park p = { .eng = eng };
     atomic_init(&p.parked, 0);
     atomic_init(&p.release, 0);
     pthread_t st;
-    STM_ASSERT_EQ(pthread_create(&st, NULL, serial_scan_park_thread, &p), 0);
-    for (int i = 0; i < 5000 && !atomic_load(&p.parked); i++) usleep(1000);
-    bool parked = atomic_load(&p.parked) != 0;
+    bool parked = false;
+    if (kind == STEP_FLUSH) {
+        STM_ASSERT_EQ(pthread_create(&st, NULL, serial_scan_park_thread,
+                                     &p), 0);
+        for (int i = 0; i < 5000 && !atomic_load(&p.parked); i++)
+            usleep(1000);
+        parked = atomic_load(&p.parked) != 0;
+    } else {
+        pthread_mutex_lock(&eng->serial_mu);
+    }
 
-    commit_beside_scan c = { .eng = eng };
+    commit_step c = { .eng = eng, .kind = kind };
+    atomic_init(&c.started, 0);
     atomic_init(&c.done, 0);
     pthread_t ct;
-    STM_ASSERT_EQ(pthread_create(&ct, NULL, commit_beside_scan_thread, &c), 0);
-    for (int i = 0; i < 300 && !atomic_load(&c.done); i++) usleep(1000);
-    bool committed_under_scan = atomic_load(&c.done) != 0;
+    STM_ASSERT_EQ(pthread_create(&ct, NULL, commit_step_thread, &c), 0);
+    for (int i = 0; i < 5000 && !atomic_load(&c.started); i++) usleep(1000);
+    bool started = atomic_load(&c.started) != 0;
+    for (int i = 0; i < 200 && !atomic_load(&c.done); i++) usleep(1000);
+    bool finished_under_op = atomic_load(&c.done) != 0;
 
-    atomic_store(&p.release, 1);
-    pthread_join(st, NULL);
+    if (kind == STEP_FLUSH) {
+        atomic_store(&p.release, 1);
+        pthread_join(st, NULL);
+    } else {
+        pthread_mutex_unlock(&eng->serial_mu);
+    }
     pthread_join(ct, NULL);
 
-    STM_ASSERT_TRUE(parked);
-    STM_ASSERT_TRUE(!committed_under_scan);
-    STM_ASSERT_OK(p.rc);
-    STM_ASSERT_EQ(p.seen, (uint64_t)65);
-    STM_ASSERT_OK(c.flush_rc);
-    STM_ASSERT_OK(c.finalize_rc);
+    STM_ASSERT_TRUE(started);
+    STM_ASSERT_TRUE(!finished_under_op);
+    STM_ASSERT_OK(c.rc);
+    if (kind == STEP_FLUSH) {
+        STM_ASSERT_TRUE(parked);
+        STM_ASSERT_OK(p.rc);
+        STM_ASSERT_EQ(p.seen, (uint64_t)65);
+        STM_ASSERT_OK(stm_btree_engine_commit_finalize(eng));
+    }
 
+    /* A legacy abort drops the in-memory tree with the uncommitted
+     * insert; a clone abort leaves the chain's deltas live. */
     stm_btree_engine_stats stc;
     STM_ASSERT_OK(stm_btree_engine_stats_get(eng, &stc));
-    STM_ASSERT_EQ(stc.n_keys, (uint64_t)65);
+    STM_ASSERT_EQ(stc.n_keys,
+                  (uint64_t)(kind == STEP_ABORT && !latched ? 64 : 65));
 
     stm_btree_engine_destroy(eng);
     memstore_destroy(&ms);
     stm_ebr_thread_free(me);
+}
+
+STM_TEST(engine_commit_flush_waits_for_serial_scan) {
+    commit_step_waits_for_serial_op(true, STEP_FLUSH);
+}
+
+STM_TEST(engine_commit_flush_waits_for_serial_scan_legacy) {
+    commit_step_waits_for_serial_op(false, STEP_FLUSH);
+}
+
+STM_TEST(engine_commit_finalize_waits_for_serial_op) {
+    commit_step_waits_for_serial_op(true, STEP_FINALIZE);
+}
+
+STM_TEST(engine_commit_finalize_waits_for_serial_op_legacy) {
+    commit_step_waits_for_serial_op(false, STEP_FINALIZE);
+}
+
+STM_TEST(engine_commit_abort_waits_for_serial_op) {
+    commit_step_waits_for_serial_op(true, STEP_ABORT);
+}
+
+STM_TEST(engine_commit_abort_waits_for_serial_op_legacy) {
+    commit_step_waits_for_serial_op(false, STEP_ABORT);
 }
 
 /* A wait-free descent pinned on an old root can read a cold child whose
@@ -6642,6 +6715,102 @@ STM_TEST(engine_concurrent_reports_corruption_without_a_publish) {
         memstore_destroy(&ms);
     }
     stm_ebr_thread_free(me);
+}
+
+/* A wait-free descent that finds no published root must not wait on
+ * commit_mu while pinned: a commit flush warms the root itself and then
+ * keeps the lock through its writes and the pool's reserve, which may be
+ * waiting for that very pin. The hook parks the descent after it saw no
+ * root; a serial lookup then warms and publishes the root, and the test
+ * holds commit_mu as such a flush would. The descent must finish from
+ * the published root while the lock is still held. */
+typedef struct {
+    stm_btree_engine *eng;
+    stm_ebr_thread   *me;
+    atomic_int        at_hook;
+    atomic_int        go;
+    atomic_int        done;
+    stm_status        rc;
+    bool              found;
+} cold_root_park;
+
+static void cold_root_park_hook(stm_btree_engine *eng, void *arg)
+{
+    cold_root_park *p = arg;
+    if (eng != p->eng || atomic_exchange(&p->at_hook, 1) != 0) return;
+    for (int i = 0; i < 10000 && !atomic_load(&p->go); i++) usleep(1000);
+}
+
+static void *cold_root_reader(void *arg)
+{
+    cold_root_park *p = arg;
+    p->me = stm_ebr_register();
+    if (!p->me) {
+        p->rc = STM_ENOMEM;
+        atomic_store(&p->at_hook, 1);
+        atomic_store(&p->done, 1);
+        return NULL;
+    }
+    uint8_t key[4];
+    be32_key(2u * 7u, key);
+    void  *v  = NULL;
+    size_t vl = 0;
+    stm_ebr_enter(p->me);
+    p->rc = stm_btree_engine_lookup_concurrent(p->eng, p->me, key, 4,
+                                               &p->found, &v, &vl);
+    stm_ebr_exit(p->me);
+    free(v);
+    atomic_store(&p->done, 1);
+    return NULL;
+}
+
+STM_TEST(engine_cold_concurrent_root_never_waits_on_commit_mu) {
+    STM_ASSERT_OK(stm_ebr_init());
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    uint32_t height = 0;
+    stm_btree_engine *eng = reuse_cold_engine(&ms, &cx, &height);
+    STM_ASSERT_TRUE(eng != NULL);
+    if (!eng) { memstore_destroy(&ms); return; }
+
+    cold_root_park p = { .eng = eng };
+    atomic_init(&p.at_hook, 0);
+    atomic_init(&p.go, 0);
+    atomic_init(&p.done, 0);
+    stm_btree_engine_set_cold_root_hook_for_test(cold_root_park_hook, &p);
+    pthread_t th;
+    STM_ASSERT_EQ(pthread_create(&th, NULL, cold_root_reader, &p), 0);
+    for (int i = 0; i < 5000 && !atomic_load(&p.at_hook); i++) usleep(1000);
+    bool parked = atomic_load(&p.at_hook) != 0 && !atomic_load(&p.done);
+
+    uint8_t key[4];
+    be32_key(0u, key);
+    bool   sf = false;
+    void  *sv = NULL;
+    size_t svl = 0;
+    STM_ASSERT_OK(stm_btree_engine_lookup(eng, key, 4, &sf, &sv, &svl));
+    free(sv);
+    bool published = atomic_load_explicit(&eng->mvcc_root,
+                                          memory_order_acquire) != NULL;
+
+    pthread_mutex_lock(&eng->commit_mu);
+    atomic_store(&p.go, 1);
+    for (int i = 0; i < 1000 && !atomic_load(&p.done); i++) usleep(1000);
+    bool done_under_lock = atomic_load(&p.done) != 0;
+    pthread_mutex_unlock(&eng->commit_mu);
+    pthread_join(th, NULL);
+    stm_btree_engine_set_cold_root_hook_for_test(NULL, NULL);
+
+    STM_ASSERT_TRUE(parked);
+    STM_ASSERT_TRUE(sf);
+    STM_ASSERT_TRUE(published);
+    STM_ASSERT_TRUE(done_under_lock);
+    STM_ASSERT_OK(p.rc);
+    STM_ASSERT_TRUE(p.found);
+
+    stm_btree_engine_destroy(eng);
+    memstore_destroy(&ms);
+    if (p.me) stm_ebr_thread_free(p.me);
 }
 
 STM_TEST_MAIN("btree_engine")

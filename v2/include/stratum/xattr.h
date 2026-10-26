@@ -289,10 +289,12 @@ stm_status stm_xattr_get(const stm_xattr_index *idx,
  * `ebr` is the caller's registered EBR handle. The caller MUST
  * stm_ebr_enter / _exit around this call (the fs.c wrapper at
  * stm_fs_getxattr does the bracket; this function does not enter the
- * critical section on its own). The only lock it takes is the dataset
- * index's, through stm_dataset_index_get_engine_pinned, which may drop
- * and re-enter the pin while it waits: hold no EBR-protected pointer
- * across the call.
+ * critical section on its own). It takes the dataset index's lock,
+ * through stm_dataset_index_get_engine_pinned, which may drop and
+ * re-enter the pin while it waits: hold no EBR-protected pointer across
+ * the call. On a cold engine it may also take the engine's commit_mu
+ * (by trylock only: it never waits for a commit) to warm the root, and
+ * a cold node read takes whatever the device read path takes.
  *
  * Identical contract to stm_xattr_get on output:
  *   - *out_size always set to the FULL value byte count regardless of

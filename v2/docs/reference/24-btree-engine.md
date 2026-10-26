@@ -685,9 +685,15 @@ the same chain consult (root-only in practice; `STM_EBUSY` on a seal
 — unreachable in legal serial use).
 
 **Locking as-built.** `commit_flush` / `commit_finalize` /
-`commit_abort` now hold `commit_mu` for their whole span (design 3.4
-step 1); the mini holds `serial_mu` OUTER + `commit_mu` INNER (the
-documented order, realised); the slow-warm readers keep `commit_mu`.
+`commit_abort` hold `serial_mu` OUTER + `commit_mu` INNER for their
+whole span (design 3.4 step 1; `serial_mu` because a commit can run
+under `fs->global` SH beside a serial op), and so does the mini. The
+slow-warm readers only trylock `commit_mu`: they are pinned, and a
+flush keeps `commit_mu` through the pool's reserve, which may wait for
+that pin, so on contention they re-read `mvcc_root` and yield
+(`engine_cold_concurrent_root_never_waits_on_commit_mu`). Each commit
+step's wait for a serial op has its own test, on both arms
+(`engine_commit_{flush,finalize,abort}_waits_for_serial_*`).
 Writers and readers hold NO engine mutex on their fast paths. The
 regime-transition contract: the FIRST `_concurrent` op must not race
 an in-flight legacy commit (caller-sequenced; production: `fs->global`

@@ -11,6 +11,13 @@ target_link_libraries(stm_btree_engine
     PRIVATE stm_warnings stm_sanitize stm_coverage
     PUBLIC  stm_btnode stm_btree_store stm_hash Threads::Threads)
 
+# Gate stm_btree_engine_set_cold_root_hook_for_test behind the same flag
+# as the dataset hooks. PUBLIC so test_btree_engine sees the prototype in
+# <stratum/btree_engine_testing.h> and the symbol exists in the archive.
+if(STRATUM_BUILD_TESTING_HOOKS)
+    target_compile_definitions(stm_btree_engine PUBLIC STRATUM_BUILD_TESTING_HOOKS)
+endif()
+
 # Phase 9.6-impl-4b: the production storage vtable binding the engine to
 # stm_bootstrap + stm_bdev. A separate library so stm_btree_engine itself
 # stays allocator-agnostic (the engine + its test exercise an in-RAM

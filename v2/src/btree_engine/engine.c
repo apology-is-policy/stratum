@@ -28,6 +28,7 @@
  */
 
 #include "engine_internal.h"
+#include <stratum/btree_engine_testing.h>
 
 #include <stratum/ebr.h>
 
@@ -266,12 +267,11 @@ void stm_btree_engine_retire(stm_btree_engine *eng)
  * Threading (9.8-LF-2 R170 P2-4): load_root mutates `eng->root`
  * non-atomically; callers must ensure no concurrent execution of
  * load_root against the same engine. Two caller classes today:
- *   - Serial-path callers (lookup / insert / delete / scan /
- *     commit_flush) — rely on the fs.c-level `fs->global` EX lock OR
- *     a test discipline of single-threaded use. They do NOT take
- *     commit_mu.
- *   - The slow-warm path inside `stm_btree_engine_lookup_concurrent`
- *     — holds `eng->commit_mu` across the load_root call, so multiple
+ *   - The serial ops (lookup / insert / delete / scan / stats) reach
+ *     it through load_root_locked, which takes commit_mu around it
+ *     (they hold serial_mu: serial_mu OUTER -> commit_mu INNER).
+ *   - commit_flush calls it holding serial_mu and commit_mu.
+ *   - The slow warm in concurrent_root holds commit_mu across it, so
  *     concurrent readers don't trip each other.
  * R171 update post-LF-3 (statuses as of 9.8-BE-prepend, chunk 9):
  * serial-path writers hold `fs->global` SH (PARALLEL-3 impl-5/6) and
@@ -833,6 +833,18 @@ static stm_status buffer_resolve_for_key(const eng_node *n,
     return STM_OK;
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static stm_btree_engine_cold_root_hook cold_root_hook;
+static void *cold_root_hook_arg;
+
+void stm_btree_engine_set_cold_root_hook_for_test(
+    stm_btree_engine_cold_root_hook fn, void *arg)
+{
+    cold_root_hook = fn;
+    cold_root_hook_arg = arg;
+}
+#endif
+
 /*
  * Shared entry for the wait-free paths (lookup / scan / prepend): an
  * mvcc_root acquire-load, slow-warming via load_root under commit_mu
@@ -842,9 +854,13 @@ static stm_status buffer_resolve_for_key(const eng_node *n,
  * (lazy) or after invalidate_memtree materialises eng->root under
  * commit_mu so concurrent warmers serialise against each other and
  * against commits (which hold commit_mu for their whole span since
- * 9.8-BE-prepend). Production serial-path load_root callers stay
- * outside commit_mu — excluded by the fs->global contract one layer
- * up.
+ * 9.8-BE-prepend). The caller is pinned, so it only ever trylocks:
+ * a commit flush warms the root itself and then keeps commit_mu
+ * through its writes and the pool's reserve, which may wait for this
+ * very pin. On contention the warmer re-reads mvcc_root and yields:
+ * a holder that leaves the root unpublished either reads it and
+ * publishes (a warm, the flush's own load_root) or does RAM work only
+ * (an abort's invalidate), so the yield loop is short.
  *
  * Spec composition: concurrency_mvcc.tla::ReaderEnter — the
  * acquire-load models the reader's "atomically pin the current
@@ -856,7 +872,14 @@ static stm_status concurrent_root(stm_btree_engine *eng, eng_node **out)
     eng_node *node = atomic_load_explicit(&eng->mvcc_root,
                                           memory_order_acquire);
     if (node) { *out = node; return STM_OK; }
-    pthread_mutex_lock(&eng->commit_mu);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (cold_root_hook) cold_root_hook(eng, cold_root_hook_arg);
+#endif
+    while (pthread_mutex_trylock(&eng->commit_mu) != 0) {
+        node = atomic_load_explicit(&eng->mvcc_root, memory_order_acquire);
+        if (node) { *out = node; return STM_OK; }
+        sched_yield();
+    }
     node = atomic_load_explicit(&eng->mvcc_root, memory_order_acquire);
     stm_status s = STM_OK;
     if (!node) s = load_root(eng, &node);
@@ -2864,9 +2887,9 @@ stm_status stm_btree_engine_commit_flush(stm_btree_engine *eng, uint64_t gen,
  * chain, preserving LIFO order. The originals are NOT relinked: a
  * pinned reader may be mid-walk anywhere in the detached chain, so its
  * ->next pointers must never change; the whole detached chain retires
- * as one unit and the prefix crosses as fresh copies. Empty in
- * production (fs->global EX excludes writers during commits) — the
- * engine-level guarantee is for embedded/test callers.
+ * as one unit and the prefix crosses as fresh copies. Non-empty in
+ * production whenever a commit runs under fs->global SH (CF-4 C's
+ * reclaim pair) beside the writers' prepends.
  */
 static stm_status migrate_residue(eng_node *shadow, eng_delta *residue,
                                   eng_delta *consumed)

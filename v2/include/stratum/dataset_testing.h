@@ -27,6 +27,15 @@ extern "C" {
  */
 void stm_dataset_index_lock_for_test(stm_dataset_index *idx);
 void stm_dataset_index_unlock_for_test(stm_dataset_index *idx);
+
+/*
+ * Called on the getting thread, under the index lock, as an engine get
+ * reads its slot, so a test can check that a pinned get's caller holds
+ * its pin at that moment. NULL clears it. Set it only while no get runs.
+ */
+typedef void (*stm_dataset_index_slot_read_hook)(void *arg);
+void stm_dataset_index_set_slot_read_hook_for_test(
+    stm_dataset_index_slot_read_hook fn, void *arg);
 #endif
 
 #ifdef __cplusplus
