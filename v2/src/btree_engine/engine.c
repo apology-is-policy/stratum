@@ -227,6 +227,24 @@ stm_status stm_btree_engine_open(const stm_btree_store_vtable *vt,
     return STM_OK;
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static _Atomic(stm_btree_engine_lifecycle_hook) lifecycle_hook;
+static _Atomic(void *) lifecycle_hook_arg;
+
+void stm_btree_engine_set_lifecycle_hook_for_test(
+    stm_btree_engine_lifecycle_hook fn, void *arg)
+{
+    atomic_store(&lifecycle_hook_arg, arg);
+    atomic_store(&lifecycle_hook, fn);
+}
+
+static void lifecycle_note(const stm_btree_engine *eng, bool freed)
+{
+    stm_btree_engine_lifecycle_hook fn = atomic_load(&lifecycle_hook);
+    if (fn) fn(eng, freed, atomic_load(&lifecycle_hook_arg));
+}
+#endif
+
 /* The pure-RAM half of engine teardown — everything a pinned concurrent
  * reader may still be touching (the published tree + its delta chains,
  * commit_mu on the slow-warm path) plus the engine-private allocations.
@@ -236,6 +254,9 @@ stm_status stm_btree_engine_open(const stm_btree_store_vtable *vt,
 static void engine_free_ram_cb(void *eng_)
 {
     stm_btree_engine *eng = eng_;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    lifecycle_note(eng, true);
+#endif
     eng_node_free_recursive(eng->root);    /* frees every in-memory node */
     eng_cache_destroy(&eng->cache);        /* frees the index, not nodes */
     paddr_vec_free(&eng->orphaned_spill_blocks);
@@ -275,6 +296,9 @@ void stm_btree_engine_destroy(stm_btree_engine *eng)
 void stm_btree_engine_retire(stm_btree_engine *eng)
 {
     if (!eng) return;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    lifecycle_note(eng, false);
+#endif
     engine_implicit_abort_pending(eng);
     if (stm_ebr_retire(eng, engine_free_ram_cb) != STM_OK) {
         /* Retire-record OOM (~32 bytes): leak the engine rather than

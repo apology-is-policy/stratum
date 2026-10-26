@@ -370,7 +370,10 @@ SPEC-TO-CODE mapping (in `src/extent/extent_index.c`):
 Note: `stm_extent_lookup_by_paddr` (P7-5) is a read path used by the
 production scrub cb; it doesn't realize a spec action — it leverages
 the live-paddr `PaddrFreshness` invariant (no two live extents share
-a paddr) to return at most one match.
+a paddr) to return at most one match. The scrub holds no `fs->global`,
+so the lookup walks each dataset's engine under an EBR pin and resolves
+the engine inside it: a rollback that retires the engine mid-walk
+cannot free it until the walk leaves.
 
 ## On-disk encoding (v12+)
 

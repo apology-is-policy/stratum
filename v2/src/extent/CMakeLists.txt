@@ -16,3 +16,9 @@ target_link_libraries(stm_extent
 # (per-dataset engine resolution via stm_dataset_index_get_engine). The
 # pool-global engine + its storage-binder APIs are RETIRED — see
 # extent_index.c header comment.
+
+# Gate the <stratum/extent_testing.h> hooks behind the same flag as the
+# other modules' test-only accessors.
+if(STRATUM_BUILD_TESTING_HOOKS)
+    target_compile_definitions(stm_extent PUBLIC STRATUM_BUILD_TESTING_HOOKS)
+endif()

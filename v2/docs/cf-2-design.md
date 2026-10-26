@@ -510,7 +510,9 @@ re-emission is idempotent and needs no ctx reset) run the per-dataset
 concurrent scan + bounded retry; the COLD accumulating walkers
 (global count, validate-collect, lookup_by_paddr — callbacks NOT
 re-emission-safe) keep the serial scan, documented at the helper (the
-stm_xattr_list-fallback rarity trade).
+stm_xattr_list-fallback rarity trade). (2026-10-26: lookup_by_paddr
+moved to the pinned walk -- its first-match callback is re-emission-safe,
+and its scrub caller holds no fs->global; see 29-concurrency.)
 
 ## 7. Invariants (the audit prosecutes these)
 

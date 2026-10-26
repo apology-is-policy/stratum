@@ -257,8 +257,14 @@ policies, all sharing `STM_BTREE_ENGINE_EBUSY_RETRY_MAX` = 64
   extent insert/overwrite/reflink): the two HOT write-path checks run
   concurrent + retry WITHOUT a ctx reset — their shared callback is MONOTONE
   (it only ever sets `collision`/`cohabit_ok`), so re-emission is
-  idempotent; the four COLD accumulating walkers (count, validate-collect
-  ×2, lookup_by_paddr) keep the serial scan, documented at the helper.
+  idempotent; the three COLD accumulating walkers (count, validate-collect
+  ×2) keep the serial scan, documented at the helper. `lookup_by_paddr`
+  runs concurrent too: its caller, the scrub verify callback, holds no
+  `fs->global`, so only an EBR pin keeps an engine a rollback retires under
+  it alive, and each attempt resolves the engine inside that pin
+  (`stm_dataset_index_get_engine_pinned`). Its callback stops at the first
+  match, and a stopped scan returns `STM_OK`, so a match never comes from
+  an attempt that went again.
 
 Serial scans (`stm_btree_engine_scan_range`) hold `serial_mu` for the whole
 walk — they cannot EBUSY, but they suppress the mini for the duration (the

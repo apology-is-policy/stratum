@@ -72,8 +72,11 @@
  * that serialization. The engine handle is BORROWED from the
  * dataset index per call; lifetime is safe because the fs.c layer
  * holds fs->global SH/EX across every extent op, and
- * `stm_dataset_destroy` takes fs->global EX (so a slot's engine
- * cannot be closed mid-op).
+ * `stm_dataset_destroy` and rollback take fs->global EX (so a slot's
+ * engine cannot be closed mid-op). The one caller outside fs->global
+ * is the scrub's `stm_extent_lookup_by_paddr`: it walks pinned and
+ * resolves each engine inside the pin, so an engine a rollback
+ * retires under it stays alive until the walk leaves.
  *
  * Audit-trigger surface: this module is on CLAUDE.md's trigger list.
  *
@@ -102,6 +105,7 @@
  *                                   → encoder + decoder checks.
  */
 #include <stratum/extent.h>
+#include <stratum/extent_testing.h>
 #include <stratum/cas.h>
 #include <stratum/dataset.h>
 #include <stratum/btree_engine.h>
@@ -560,10 +564,11 @@ static int ex_global_scan_adapter(const void *k, size_t klen,
  *
  *   false — the serial scan_range (holds serial_mu per dataset
  *     walked). For the COLD accumulating walkers (global count,
- *     validate-collect, lookup_by_paddr) whose callbacks are NOT
- *     re-emission-safe (a re-walked dataset would double-count /
- *     double-collect); their rarity bounds the mini-suppression cost,
- *     the stm_xattr_list-fallback trade.
+ *     validate-collect) whose callbacks are NOT re-emission-safe (a
+ *     re-walked dataset would double-count / double-collect); their
+ *     rarity bounds the mini-suppression cost, the
+ *     stm_xattr_list-fallback trade. Their callers hold fs->global or
+ *     run at mount, which is what keeps the engine alive.
  *
  *   true — the CF-2c EBR-pinned concurrent scan + bounded whole-scan
  *     EBUSY retry, PER DATASET. REQUIRES a re-emission-safe callback:
@@ -573,7 +578,13 @@ static int ex_global_scan_adapter(const void *k, size_t klen,
  *     collision = true / cohabit_ok = false). For the HOT write-path
  *     checks (any_paddr / cohabit run on EVERY extent insert +
  *     overwrite + reflink), where a serial whole-subspace walk would
- *     suppress the mini-consolidation under the pool. */
+ *     suppress the mini-consolidation under the pool. Also
+ *     lookup_by_paddr, whose callback stops at its first match (a
+ *     stopped scan returns STM_OK, so a match never comes from an
+ *     attempt that went again) and whose caller holds no fs->global.
+ *     Each attempt resolves the engine inside the pin that covers its
+ *     scan, so the pin alone keeps a concurrently retired engine
+ *     alive. */
 static stm_status ex_global_walk_locked(stm_extent_index *idx,
                                             ex_global_record_cb cb,
                                             void *ctx,
@@ -605,35 +616,41 @@ static stm_status ex_global_walk_locked(stm_extent_index *idx,
 
     for (size_t i = 0; i < dc.n; i++) {
         uint64_t ds = dc.ids[i];
-        stm_btree_engine *eng = NULL;
-        stm_status es = ex_get_engine_locked(idx, ds, &eng);
-        if (es == STM_ENOENT) continue;        /* concurrent destroy; skip */
-        if (es != STM_OK) { free(dc.ids); return es; }
-
         ex_global_scan_ctx gc = { .user_cb = cb, .user_ctx = ctx,
                                     .ds = ds, .user_signal = 0,
                                     .err = STM_OK };
         stm_status ss;
         if (!concurrent_retry) {
+            stm_btree_engine *eng = NULL;
+            stm_status es = ex_get_engine_locked(idx, ds, &eng);
+            if (es == STM_ENOENT) continue;    /* concurrent destroy; skip */
+            if (es != STM_OK) { free(dc.ids); return es; }
             ss = stm_btree_engine_scan_range(eng, lo, EX_KEY_LEN,
                                              hi, EX_KEY_LEN,
                                              ex_global_scan_adapter,
                                              &gc);
         } else {
+            stm_status es = STM_OK;
             ss = STM_EBUSY;
             for (uint32_t attempt = 0;
                  attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX; attempt++) {
                 gc = (ex_global_scan_ctx){ .user_cb = cb, .user_ctx = ctx,
                                              .ds = ds, .user_signal = 0,
                                              .err = STM_OK };
+                stm_btree_engine *eng = NULL;
                 stm_ebr_enter(ebr);
-                ss = stm_btree_engine_scan_range_concurrent(
+                es = stm_dataset_index_get_engine_pinned(idx->ds_idx, ebr,
+                                                         ds, &eng);
+                ss = (es == STM_OK)
+                   ? stm_btree_engine_scan_range_concurrent(
                          eng, ebr, lo, EX_KEY_LEN, hi, EX_KEY_LEN,
-                         ex_global_scan_adapter, &gc);
+                         ex_global_scan_adapter, &gc)
+                   : es;
                 stm_ebr_exit(ebr);
                 if (ss != STM_EBUSY) break;
                 sched_yield();
             }
+            if (es == STM_ENOENT) continue;    /* concurrent destroy; skip */
         }
         if (ss != STM_OK || gc.err != STM_OK) {
             free(dc.ids);
@@ -2290,9 +2307,26 @@ typedef struct {
     bool               found;
 } ex_paddr_lookup_ctx;
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static stm_extent_paddr_walk_hook paddr_walk_hook;
+static void *paddr_walk_hook_arg;
+
+void stm_extent_set_paddr_walk_hook_for_test(stm_extent_paddr_walk_hook fn,
+                                             void *arg)
+{
+    paddr_walk_hook = fn;
+    paddr_walk_hook_arg = arg;
+}
+#endif
+
 static int ex_paddr_lookup_cb(uint64_t ds, uint64_t ino, uint64_t off,
                                 const stm_extent_record *r, void *ctx_) {
-    (void)ds; (void)ino; (void)off;
+    (void)ino; (void)off;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (paddr_walk_hook) paddr_walk_hook(ds, paddr_walk_hook_arg);
+#else
+    (void)ds;
+#endif
     ex_paddr_lookup_ctx *p = ctx_;
     for (uint8_t i = 0; i < r->n_replicas; i++) {
         if (r->paddrs[i] == p->probe) {
@@ -2320,7 +2354,7 @@ stm_status stm_extent_lookup_by_paddr(const stm_extent_index *idx,
 
     ex_paddr_lookup_ctx lc = { .probe = paddr, .hit = {0}, .found = false };
     stm_status ss = ex_global_walk_locked(m, ex_paddr_lookup_cb, &lc,
-                                           /*concurrent_retry=*/false);
+                                           /*concurrent_retry=*/true);
     must_unlock(lock);
     if (ss != STM_OK) return ss;
     if (!lc.found) return STM_ENOENT;

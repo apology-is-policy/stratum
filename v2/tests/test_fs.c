@@ -21,8 +21,11 @@
 #include <stratum/cas.h>
 #include <stratum/cdc.h>
 #include <stratum/dataset.h>
+#include <stratum/dataset_testing.h>
 #include <stratum/dirent.h>
+#include <stratum/ebr.h>
 #include <stratum/extent.h>
+#include <stratum/extent_testing.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
 #include <stratum/inode.h>
@@ -11820,6 +11823,173 @@ STM_TEST(fs_freed_dir_leaves_no_dirent_records) {
     STM_ASSERT_EQ(h, r);
     assert_fresh_dir(fs, h, root);
 
+    reuse_fs_done(fs);
+}
+
+/* The scrub's extent lookup holds no fs->global, so a rollback can retire a
+ * dataset's engine while the lookup walks it: the walk's EBR pin is what
+ * keeps the retired engine alive until the walk leaves. */
+typedef struct {
+    pthread_mutex_t          mu;
+    pthread_cond_t           cv;
+    bool                     paused, resume;
+    const stm_btree_engine  *watched;
+    atomic_bool              retired, freed;
+} scrub_walk_gate;
+
+static void scrub_walk_park(uint64_t dataset_id, void *arg)
+{
+    scrub_walk_gate *g = arg;
+    if (dataset_id != 1u) return;
+    pthread_mutex_lock(&g->mu);
+    if (!g->paused) {
+        g->paused = true;
+        pthread_cond_broadcast(&g->cv);
+        while (!g->resume) pthread_cond_wait(&g->cv, &g->mu);
+    }
+    pthread_mutex_unlock(&g->mu);
+}
+
+static void scrub_walk_engine_note(const stm_btree_engine *eng, bool freed,
+                                   void *arg)
+{
+    scrub_walk_gate *g = arg;
+    if (eng != g->watched) return;
+    atomic_store(freed ? &g->freed : &g->retired, true);
+}
+
+typedef struct { stm_fs *fs; uint64_t snap; stm_status rc; } scrub_walk_arg;
+
+static void *scrub_walk_lookup(void *a_)
+{
+    scrub_walk_arg *a = a_;
+    stm_extent_record rec;
+    /* paddr 1 is no extent's: the walk visits every record. */
+    a->rc = stm_extent_lookup_by_paddr(
+        stm_sync_extent_index(stm_fs_sync(a->fs)), 1u, &rec);
+    return NULL;
+}
+
+static void *scrub_walk_rollback(void *a_)
+{
+    scrub_walk_arg *a = a_;
+    a->rc = stm_fs_rollback_snapshot(a->fs, 1, a->snap, false);
+    return NULL;
+}
+
+STM_TEST(fs_scrub_extent_walk_keeps_a_retired_engine_alive) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("scrub_walk_retire", &dir);
+    if (!fs) return;
+    stm_sync *sync = stm_fs_sync(fs);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &f));
+    static uint8_t buf[65536];
+    memset(buf, 0xAA, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, sizeof buf));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    uint64_t snap = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s1", 2, &snap));
+    memset(buf, 0xBB, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, sizeof buf, buf, sizeof buf));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    static scrub_walk_gate g;
+    memset(&g, 0, sizeof g);
+    pthread_mutex_init(&g.mu, NULL);
+    pthread_cond_init(&g.cv, NULL);
+    stm_btree_engine *eng = NULL;
+    STM_ASSERT_OK(stm_dataset_index_get_engine(stm_sync_dataset_index(sync),
+                                                  1, &eng));
+    g.watched = eng;
+    atomic_store(&g.retired, false);
+    atomic_store(&g.freed, false);
+    stm_btree_engine_set_lifecycle_hook_for_test(scrub_walk_engine_note, &g);
+    stm_extent_set_paddr_walk_hook_for_test(scrub_walk_park, &g);
+
+    scrub_walk_arg wa = { .fs = fs, .rc = STM_EINVAL };
+    pthread_t wt;
+    STM_ASSERT_EQ(pthread_create(&wt, NULL, scrub_walk_lookup, &wa), 0);
+    pthread_mutex_lock(&g.mu);
+    while (!g.paused) pthread_cond_wait(&g.cv, &g.mu);
+    pthread_mutex_unlock(&g.mu);
+
+    scrub_walk_arg ra = { .fs = fs, .snap = snap, .rc = STM_EINVAL };
+    pthread_t rt;
+    STM_ASSERT_EQ(pthread_create(&rt, NULL, scrub_walk_rollback, &ra), 0);
+    /* The race is set up only once the rollback has retired the engine
+     * the walk is inside. */
+    for (int i = 0; i < 10000 && !atomic_load(&g.retired); i++) usleep(1000);
+    STM_ASSERT_TRUE(atomic_load(&g.retired));
+    /* Readers' dcache inserts advance EBR; stand in for them. */
+    for (int i = 0; i < 200; i++) {
+        (void)stm_ebr_try_advance();
+        usleep(1000);
+    }
+    bool freed_under_walk = atomic_load(&g.freed);
+    if (freed_under_walk) {
+        /* Resuming would walk freed memory. */
+        fprintf(stderr, "  retired engine freed under the walk\n");
+        _exit(3);
+    }
+
+    pthread_mutex_lock(&g.mu);
+    g.resume = true;
+    pthread_cond_broadcast(&g.cv);
+    pthread_mutex_unlock(&g.mu);
+    pthread_join(wt, NULL);
+    pthread_join(rt, NULL);
+    stm_extent_set_paddr_walk_hook_for_test(NULL, NULL);
+    STM_ASSERT_ERR(wa.rc, STM_ENOENT);
+    STM_ASSERT_OK(ra.rc);
+    /* Control: with the walk gone, nothing holds the engine back. */
+    for (int i = 0; i < 1000 && !atomic_load(&g.freed); i++) {
+        (void)stm_ebr_try_advance();
+        usleep(1000);
+    }
+    STM_ASSERT_TRUE(atomic_load(&g.freed));
+    stm_btree_engine_set_lifecycle_hook_for_test(NULL, NULL);
+    pthread_cond_destroy(&g.cv);
+    pthread_mutex_destroy(&g.mu);
+    reuse_fs_done(fs);
+}
+
+/* The walk reads each dataset's engine slot inside its pin, so no retire
+ * can land between the read and the pin. With nothing else advancing,
+ * three advances stop after one only if this thread is pinned. */
+typedef struct { int reads, unpinned; } scrub_slot_reads;
+
+static void scrub_slot_read_check(void *arg)
+{
+    scrub_slot_reads *r = arg;
+    uint64_t e0 = stm_ebr_current_epoch();
+    for (int i = 0; i < 3; i++) (void)stm_ebr_try_advance();
+    r->reads++;
+    if (stm_ebr_current_epoch() > e0 + 1u) r->unpinned++;
+}
+
+STM_TEST(fs_scrub_extent_walk_reads_each_engine_pinned) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("scrub_walk_pinned", &dir);
+    if (!fs) return;
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &f));
+    static uint8_t buf[65536];
+    memset(buf, 0xAA, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, sizeof buf));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    scrub_slot_reads r = { 0, 0 };
+    stm_dataset_index_set_slot_read_hook_for_test(scrub_slot_read_check, &r);
+    stm_extent_record rec;
+    stm_status s = stm_extent_lookup_by_paddr(
+        stm_sync_extent_index(stm_fs_sync(fs)), 1u, &rec);
+    stm_dataset_index_set_slot_read_hook_for_test(NULL, NULL);
+    STM_ASSERT_ERR(s, STM_ENOENT);
+    STM_ASSERT(r.reads >= 1);
+    STM_ASSERT_EQ(r.unpinned, 0);
     reuse_fs_done(fs);
 }
 

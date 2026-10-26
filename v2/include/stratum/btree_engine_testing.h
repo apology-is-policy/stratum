@@ -48,6 +48,13 @@ void stm_btree_engine_set_heal_hook_for_test(stm_btree_engine_heal_hook fn,
  * nanoseconds; 0 restores it. */
 void stm_btree_engine_set_window_wait_for_test(uint64_t ns);
 
+/* Called as an engine is retired (`freed` false) and again as EBR frees
+ * it (`freed` true, from whichever thread reclaims it). NULL clears it. */
+typedef void (*stm_btree_engine_lifecycle_hook)(const stm_btree_engine *eng,
+                                                bool freed, void *arg);
+void stm_btree_engine_set_lifecycle_hook_for_test(
+    stm_btree_engine_lifecycle_hook fn, void *arg);
+
 /* Called by a serial op each time it is about to wait for a commit window
  * to close, holding serial_mu (which the wait then gives up). */
 typedef void (*stm_btree_engine_window_wait_hook)(stm_btree_engine *eng,
