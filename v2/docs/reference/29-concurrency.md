@@ -247,7 +247,9 @@ policies, all sharing `STM_BTREE_ENGINE_EBUSY_RETRY_MAX` = 64
   `sched_yield` between, honest `STM_EBUSY` at the bound. ONE deliberate
   exception: `stm_xattr_list` keeps its serial body — its only production
   caller is the listxattr SH-fallback whose serial walk IS the
-  forward-progress guarantee.
+  forward-progress guarantee. The fallback holds the inode's shared pin
+  across its two passes, because the xattr drops of an inode free or a
+  reusing create run under SH (each with the inode's exclusive pin).
 - **Write funnels (CF-2d):** all 7 write funnels (`in_engine_put`;
   `di_engine_put/del`; `xa_engine_put/del`; `ex_engine_put/del`) wrap their
   `_concurrent` call in the same bounded retry, so a transient seal never

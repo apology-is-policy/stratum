@@ -418,9 +418,12 @@ stm_status stm_xattr_list_concurrent(const stm_xattr_index *idx,
 
 /*
  * Drop EVERY record (live + tombstone) keyed at `(dataset_id, ino, *)`.
- * The fs calls it before every inode free and again in a create handed a
- * reused ino: the key carries no gen, so records left behind would
- * surface on whichever inode reuses the slot.
+ * The fs calls it before it frees a linked or anonymous inode and again
+ * in a create handed a reused ino (a create that rolls its own allocation
+ * back frees an inode no setxattr could reach, and leaves the rest to the
+ * next reuse): the key carries no gen, so records left behind would
+ * surface on whichever inode reuses the slot. Each of those calls holds
+ * the inode's exclusive pin.
  *
  * Output: `*out_dropped` (optional) is set to the number of records
  * removed (live + tombstone, summed). Pass NULL to ignore.

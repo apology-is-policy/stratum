@@ -64,6 +64,19 @@ struct stm_sync *stm_fs_sync_for_test(struct stm_fs *fs);
  */
 stm_status stm_fs_test_clear_pool_serial(const char *path);
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+/*
+ * Make stm_fs_listxattr take its SH fallback whatever its lockless legs
+ * answer, and call `fn` (when not NULL) between the fallback's count and
+ * materialize passes, with fs->global SH and the inode's shared pin held.
+ * false / NULL restore it. Set it only while no listxattr runs.
+ */
+typedef void (*stm_fs_listxattr_fallback_hook)(void *arg);
+void stm_fs_set_listxattr_fallback_for_test(bool force,
+                                            stm_fs_listxattr_fallback_hook fn,
+                                            void *arg);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

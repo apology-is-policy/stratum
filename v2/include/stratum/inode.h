@@ -578,8 +578,9 @@ stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
  * pinning a freed/missing inode gets STM_ENOENT). Release with the same
  * stm_inode_unpin (mode-blind). A thread MUST NOT take a shared pin on
  * an inode it already holds exclusively (same-thread rd-after-wr is
- * EDEADLK/deadlock); no in-tree path does — the shared pin's only
- * caller is stm_fs_read, which is never invoked under a held pin.
+ * EDEADLK/deadlock); no in-tree path does — the shared pin's callers
+ * are stm_fs_read and stm_fs_listxattr's SH fallback, neither invoked
+ * under a held pin.
  *
  * Writer starvation posture: on glibc the slot rwlock is initialized
  * PREFER_WRITER_NONRECURSIVE so a stream of readers cannot starve a

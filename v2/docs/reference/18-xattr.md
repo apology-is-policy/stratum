@@ -17,9 +17,10 @@ The xattr module is the bridge between:
 - **fs.c** (per-fs setxattr / getxattr / listxattr / removexattr
   wrappers; namespace gating).
 - **Inode free and reuse** (fs.c runs `stm_xattr_drop_for_ino` before
-  every inode free and again in a create that reuses an ino, so a
-  reused ino never carries the previous tenant's xattrs — composes with
-  `inode.tla::AllocReused`).
+  it frees a linked or anonymous inode and again in a create that reuses
+  an ino, so a reused ino never carries the previous tenant's xattrs —
+  composes with `inode.tla::AllocReused`; a create that rolls its own
+  allocation back leaves its never-reachable inode to the next reuse).
 
 In-RAM storage: NONE — the btree_engine COW B+tree IS the store
 (9.6-impl-4c cutover; the pre-cutover heap-allocated record array +
@@ -110,7 +111,12 @@ the hook, and a reused ino carried its previous tenant's xattrs (tests
 `fs_reused_ino_starts_without_the_old_xattrs`,
 `fs_create_drops_xattrs_a_reused_ino_still_holds`). Dropping before
 the free leaves the dying inode present without its xattrs for the
-span of the unlink, which a concurrent reader can observe.
+span of the unlink, which a concurrent lockless reader can observe.
+Every one of these drops runs under `fs->global` SH with the inode's
+EXCLUSIVE pin held, so listxattr's SH fallback takes the inode's shared
+pin across its count and materialize passes: without it, a drop
+between the passes made the two disagree and the fallback answer
+`STM_ECORRUPT` (test `fs_listxattr_fallback_stays_whole_beside_an_unlink`).
 
 ### Inspection
 

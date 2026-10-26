@@ -6484,6 +6484,21 @@ stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     return s;
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+static bool listxattr_force_fallback;
+static stm_fs_listxattr_fallback_hook listxattr_fallback_hook;
+static void *listxattr_fallback_hook_arg;
+
+void stm_fs_set_listxattr_fallback_for_test(bool force,
+                                            stm_fs_listxattr_fallback_hook fn,
+                                            void *arg)
+{
+    listxattr_force_fallback = force;
+    listxattr_fallback_hook = fn;
+    listxattr_fallback_hook_arg = arg;
+}
+#endif
+
 stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                uint8_t *name_buf, size_t buf_max,
                                size_t *out_total_len) {
@@ -6525,6 +6540,9 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         stm_ebr_exit(ebr);
         return ps;
     }
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (listxattr_force_fallback) need_fallback = true;
+#endif
 
     size_t n_total = 0;
     size_t got = 0;
@@ -6587,17 +6605,16 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_ebr_exit(ebr);
 
     if (need_fallback) {
-        /* R171 P1-1/P1-2 + R172 P1-1 SH-fallback. The fs->global SH
-         * here excludes the EX-holding xattr writers (setxattr /
-         * removexattr both take EX), so the two-pass count + materialize
-         * sees a consistent xattr-index for this inode. R172 P2-2: this
-         * exclusion is provided by fs->global SH-vs-EX, NOT by the xattr
-         * index's internal mutex (which serializes individual calls
-         * but NOT the call SEQUENCE). If a future xattr writer is
-         * lifted to SH (PARALLEL-3-style), the two-pass shape MUST be
-         * revisited — wrap both passes in a per-inode pin or fold into
-         * a single-pass primitive. See stm_fs_stat for the general
-         * SH-fallback rationale. */
+        /* R171 P1-1/P1-2 + R172 P1-1 SH-fallback: a two-pass count +
+         * materialize. fs->global SH excludes the EX xattr writers
+         * (setxattr / removexattr), but not the drops that run under SH:
+         * every inode free drops the inode's xattrs, and a create that
+         * reuses an ino drops what the last tenant left. Each of those
+         * holds the inode's EXCLUSIVE pin, so the shared pin taken here
+         * keeps both passes consistent (the R172 P2-2 caveat, now live);
+         * it also re-validates that the inode still exists, answering
+         * ENOENT for one freed meanwhile. See stm_fs_stat for the
+         * general SH-fallback rationale. */
         pthread_rwlock_rdlock(&fs->global);
         FS_GUARD_READ(fs);
         iidx = stm_sync_inode_index(fs->sync);
@@ -6606,33 +6623,49 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             pthread_rwlock_unlock(&fs->global);
             return STM_EINVAL;
         }
+        stm_inode_handle *h = NULL;
+        stm_status pp = stm_inode_pin_shared(iidx, dataset_id, ino, &h);
+        if (pp != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return pp;
+        }
         memset(&iv, 0, sizeof iv);
         stm_status ps2 = stm_inode_lookup(iidx, dataset_id, ino, &iv);
         if (ps2 != STM_OK) {
+            stm_inode_unpin(iidx, h);
             pthread_rwlock_unlock(&fs->global);
             return ps2;
         }
         stm_status ls2 = stm_xattr_list(xidx, dataset_id, ino, NULL, 0,
                                              &n_total);
         if (ls2 != STM_OK) {
+            stm_inode_unpin(iidx, h);
             pthread_rwlock_unlock(&fs->global);
             return ls2;
         }
         if (n_total == 0) {
             *out_total_len = 0;
+            stm_inode_unpin(iidx, h);
             pthread_rwlock_unlock(&fs->global);
             return STM_OK;
         }
         if (n_total > SIZE_MAX / sizeof(stm_xattr_entry)) {
+            stm_inode_unpin(iidx, h);
             pthread_rwlock_unlock(&fs->global);
             return STM_ENOMEM;
         }
         batch = malloc(n_total * sizeof *batch);
         if (!batch) {
+            stm_inode_unpin(iidx, h);
             pthread_rwlock_unlock(&fs->global);
             return STM_ENOMEM;
         }
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (listxattr_fallback_hook)
+            listxattr_fallback_hook(listxattr_fallback_hook_arg);
+#endif
         ls2 = stm_xattr_list(xidx, dataset_id, ino, batch, n_total, &got);
+        stm_inode_unpin(iidx, h);
         pthread_rwlock_unlock(&fs->global);
         if (ls2 != STM_OK || got != n_total) {
             free(batch);

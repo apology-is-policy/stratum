@@ -11993,4 +11993,63 @@ STM_TEST(fs_scrub_extent_walk_reads_each_engine_pinned) {
     reuse_fs_done(fs);
 }
 
+/* The last unlink drops the inode's xattrs under fs->global SH, so
+ * listxattr's SH fallback holds the inode's shared pin across its count
+ * and materialize passes: an unlink that arrives between them waits, and
+ * the list comes back whole rather than as STM_ECORRUPT. */
+typedef struct {
+    stm_fs     *fs;
+    uint64_t    dir;
+    pthread_t   thread;
+    bool        started;
+    atomic_int  done;
+    bool        done_between;
+    stm_status  rc;
+} lx_unlink_arg;
+
+static void *lx_unlink_thread(void *a_)
+{
+    lx_unlink_arg *a = a_;
+    a->rc = stm_fs_unlink(a->fs, 1, a->dir, (const uint8_t *)"f", 1);
+    atomic_store(&a->done, 1);
+    return NULL;
+}
+
+static void lx_between_passes(void *a_)
+{
+    lx_unlink_arg *a = a_;
+    if (a->started) return;
+    a->started = pthread_create(&a->thread, NULL, lx_unlink_thread, a) == 0;
+    for (int i = 0; i < 300 && !atomic_load(&a->done); i++) usleep(1000);
+    a->done_between = atomic_load(&a->done) != 0;
+}
+
+STM_TEST(fs_listxattr_fallback_stays_whole_beside_an_unlink) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("lx_fallback_unlink", &dir);
+    if (!fs) return;
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &f));
+    set_old_xattr(fs, f);
+
+    lx_unlink_arg a = { .fs = fs, .dir = dir, .started = false,
+                        .done_between = false, .rc = STM_EINVAL };
+    atomic_store(&a.done, 0);
+    stm_fs_set_listxattr_fallback_for_test(true, lx_between_passes, &a);
+    uint8_t names[64];
+    size_t total = 0;
+    stm_status s = stm_fs_listxattr(fs, 1, f, names, sizeof names, &total);
+    stm_fs_set_listxattr_fallback_for_test(false, NULL, NULL);
+    STM_ASSERT_TRUE(a.started);
+    if (a.started) pthread_join(a.thread, NULL);
+
+    STM_ASSERT_OK(s);
+    STM_ASSERT_EQ(total, (size_t)7);          /* "user.k\0" */
+    STM_ASSERT_TRUE(!a.done_between);         /* it waited for the pin */
+    STM_ASSERT_OK(a.rc);                      /* and then went through */
+    STM_ASSERT_ERR(stm_fs_listxattr(fs, 1, f, NULL, 0, &total), STM_ENOENT);
+    reuse_fs_done(fs);
+}
+
 STM_TEST_MAIN("fs")
