@@ -145,6 +145,8 @@ short-circuit non-matching scans.
   only mutators; both preserve the invariant.
 - **`OwnLocksNeverRefuse`** — an owner's own locks never refuse its
   acquire, so it may stack or upgrade over any range it holds.
+- **`DifferentInosNeverInteract`** — a lock on one inode never refuses
+  an acquire on another, whatever its owner, type or range.
 
 Spec actions:
 
@@ -165,6 +167,10 @@ invariants judge by the healthy `Conflicts`:
 - `BuggyOwnerCheckMissing` — Acquire ignores the owner, so an owner's
   own exclusive lock refuses its next acquire. Fires
   `OwnLocksNeverRefuse` (`locks_owner_check_missing_buggy.cfg`).
+- `BuggyInoBlind` — Acquire compares ranges without the inode, so a
+  lock on one file refuses an acquire on another. Fires
+  `DifferentInosNeverInteract` (`locks_ino_blind_buggy.cfg`).
+  `NoConflictingLocks` cannot see this bug: a refusal adds no record.
 
 ## SPEC-TO-CODE mapping
 
@@ -175,6 +181,7 @@ invariants judge by the healthy `Conflicts`:
 | `ReleaseOwner` | `stm_lock_release_owner` | same |
 | `Test` | `stm_lock_test` | same |
 | `NoConflictingLocks` invariant | conflict check inside `stm_lock_acquire` | same |
+| `DifferentInosNeverInteract` invariant | `conflicts`'s `(dataset_id, ino, gen)` match | same |
 
 ## Tests
 

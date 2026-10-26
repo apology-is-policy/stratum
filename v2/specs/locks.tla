@@ -52,6 +52,12 @@
 \*       so a SHARED lock by one owner and an overlapping EXCLUSIVE
 \*       by another coexist. Fires NoConflictingLocks after two
 \*       acquires.
+\*
+\*   BuggyInoBlind
+\*       Acquire's check compares ranges without the ino, so a lock
+\*       on one file refuses an acquire on another (or on a later
+\*       incarnation of the same number). Fires
+\*       DifferentInosNeverInteract after one acquire.
 
 EXTENDS Integers, FiniteSets, TLC
 
@@ -60,13 +66,15 @@ CONSTANTS
     Owners,                        \* finite set of lock-owner IDs
     MaxOff,                        \* upper bound on byte offsets
     BuggyOwnerCheckMissing,
-    BuggyShared_Excl_Granted
+    BuggyShared_Excl_Granted,
+    BuggyInoBlind
 
 ASSUME /\ Inos # {}
        /\ Owners # {}
        /\ MaxOff \in Nat /\ MaxOff >= 1
        /\ BuggyOwnerCheckMissing  \in BOOLEAN
        /\ BuggyShared_Excl_Granted \in BOOLEAN
+       /\ BuggyInoBlind \in BOOLEAN
 
 LockTypes == {"shared", "exclusive"}
 Offsets   == 0..MaxOff
@@ -82,10 +90,13 @@ Init == locks = {}
 
 \* Two byte ranges overlap iff their intervals' open intersection
 \* is non-empty.
-Overlaps(l1, l2) ==
-    /\ l1.ino = l2.ino
+RangesOverlap(l1, l2) ==
     /\ l1.off < l2.off + l2.len
     /\ l2.off < l1.off + l1.len
+
+Overlaps(l1, l2) ==
+    /\ l1.ino = l2.ino
+    /\ RangesOverlap(l1, l2)
 
 \* Conflict predicate: overlapping AND different owner AND at least
 \* one exclusive. The invariants judge by it in every mode.
@@ -98,7 +109,9 @@ Conflicts(l1, l2) ==
 \* What Acquire refuses on: Conflicts, unless a buggy variant changes
 \* the check.
 AcquireRefuses(cand, other) ==
-    /\ Overlaps(cand, other)
+    /\ \/ BuggyInoBlind
+       \/ cand.ino = other.ino
+    /\ RangesOverlap(cand, other)
     /\ \/ BuggyOwnerCheckMissing
        \/ cand.owner /= other.owner
     /\ IF BuggyShared_Excl_Granted
@@ -183,10 +196,17 @@ OwnLocksNeverRefuse ==
             /\ other.owner = l.owner
             /\ AcquireRefuses([l EXCEPT !.type = t], other)
 
+\* A lock on one ino never refuses an acquire on another, of any
+\* owner, type or range.
+DifferentInosNeverInteract ==
+    \A l \in locks, c \in LockRec :
+        c.ino # l.ino => ~AcquireRefuses(c, l)
+
 Invariants ==
     /\ TypeOK
     /\ NoConflictingLocks
     /\ ExclusiveExcludesDifferentOwner
     /\ OwnLocksNeverRefuse
+    /\ DifferentInosNeverInteract
 
 =============================================================================
