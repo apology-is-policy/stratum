@@ -3012,9 +3012,10 @@ STM_TEST(fs_p9_rename_arg_validation) {
 }
 
 /* R79 P2-1: rename(a, b) when a and b are hardlinks to the same
- * inode must be POSIX-correct — final state has dst preserved
- * pointing at the inode, src dirent dropped, nlink decremented by
- * exactly 1 (the dropped src reference). */
+ * inode. POSIX: "If the old argument and the new argument resolve to
+ * ... different directory entries for the same existing file, rename()
+ * shall return successfully and perform no other action." Both names
+ * stay, nlink stays 2. */
 STM_TEST(fs_p9_r79_p2_1_rename_hardlink_same_inode_consistent) {
     make_tmp("p9_r79_hardlink_rename");
     stm_fs_format_opts fopts = default_format_opts();
@@ -3041,17 +3042,15 @@ STM_TEST(fs_p9_r79_p2_1_rename_hardlink_same_inode_consistent) {
     STM_ASSERT_OK(stm_fs_rename(fs, 1, root, (const uint8_t *)"a", 1,
                                        root, (const uint8_t *)"b", 1, 0u));
 
-    /* Final state: a is gone, b → f, nlink = 1 (b still refs f;
-     * a's reference dropped). */
     uint64_t found = 0;
-    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, root, (const uint8_t *)"a", 1, &found),
-                   STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"a", 1, &found));
+    STM_ASSERT_EQ(found, f);
     STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"b", 1, &found));
     STM_ASSERT_EQ(found, f);
 
     struct stm_inode_value iv1 = {0};
     STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv1));
-    STM_ASSERT_EQ(stm_load_le32(iv1.si_nlink), (uint32_t)1);
+    STM_ASSERT_EQ(stm_load_le32(iv1.si_nlink), (uint32_t)2);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
