@@ -640,6 +640,11 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
  * Same-path rename (src == dst, both name and parent equal): moves
  * nothing, but the name must exist (STM_ENOENT otherwise) and
  * RENAME_NOREPLACE finds it in place (STM_EEXIST), as on Linux.
+ *
+ * Two names of one file (hard links, same or different directories):
+ * moves nothing and both names stay, for every flag but
+ * RENAME_NOREPLACE (STM_EEXIST); no time changes and no whiteout is
+ * made, as on Linux.
  */
 STM_MUST_USE
 stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,

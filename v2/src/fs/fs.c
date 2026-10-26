@@ -6021,6 +6021,17 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             n_handles = 0u;                                     \
         } while (0)
 
+    /* Two names of one file: the rename moves nothing and both names
+     * stay (POSIX; Linux's vfs_rename returns 0 when source == target,
+     * whatever the flags, and NOREPLACE answered EEXIST above). Left to
+     * the paths below, dst's name would go and the file would lose a
+     * link it still has. */
+    if (dst_exists && dst_ino == src_ino && dst_gen == src_gen) {
+        FS_RENAME_UNPIN_ALL();
+        pthread_rwlock_unlock(&fs->global);
+        return STM_OK;
+    }
+
     /* P8-POSIX-9b: RENAME_EXCHANGE — both src + dst MUST exist.
      * Atomically swap their (ino, gen, type) at the dirent layer
      * via stm_dirent_swap_two. NO inode is created or freed; nlink

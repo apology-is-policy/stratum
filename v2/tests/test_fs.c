@@ -12055,6 +12055,69 @@ STM_TEST(fs_name_to_handle_names_the_incarnation_the_name_resolved_to) {
     handle_gen_leg(true);
 }
 
+/* rename between two names of one file changes nothing, whatever the
+ * flags (NOREPLACE excepted: EEXIST), in one directory or across two:
+ * both names stay, nlink stays 2, no time moves, no whiteout appears. */
+static size_t rename_links_listed(stm_fs *fs, uint64_t d)
+{
+    stm_fs_dirent_entry e[8];
+    uint64_t cur = 0;
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, d, d, STM_FS_READDIR_FLAG_NO_DOTS,
+                                    &cur, e, 8, &n));
+    return n;
+}
+
+static void rename_links_leg(stm_fs *fs, uint64_t d1, uint64_t d2,
+                             uint32_t flags, stm_status want)
+{
+    uint64_t a = 0, ia = 0, ib = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, d1, (const uint8_t *)"a", 1,
+                                        0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_link_by_ino(fs, 1, a, d2, (const uint8_t *)"b", 1));
+    struct stm_inode_value fv0 = {0}, dv0 = {0}, fv1 = {0}, dv1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &fv0));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, d2, &dv0));
+    size_t n0 = rename_links_listed(fs, d1);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, d1, (const uint8_t *)"a", 1,
+                                 d2, (const uint8_t *)"b", 1, flags),
+                   want);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, d1, (const uint8_t *)"a", 1, &ia));
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, d2, (const uint8_t *)"b", 1, &ib));
+    STM_ASSERT_EQ(ia, a);
+    STM_ASSERT_EQ(ib, a);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &fv1));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, d2, &dv1));
+    STM_ASSERT_EQ(stm_load_le32(fv1.si_nlink), 2u);
+    STM_ASSERT_EQ(stm_load_le64(fv1.si_ctime_sec),
+                  stm_load_le64(fv0.si_ctime_sec));
+    STM_ASSERT_EQ(stm_load_le32(fv1.si_ctime_nsec),
+                  stm_load_le32(fv0.si_ctime_nsec));
+    STM_ASSERT_EQ(stm_load_le64(dv1.si_mtime_sec),
+                  stm_load_le64(dv0.si_mtime_sec));
+    STM_ASSERT_EQ(stm_load_le32(dv1.si_mtime_nsec),
+                  stm_load_le32(dv0.si_mtime_nsec));
+    STM_ASSERT_EQ(rename_links_listed(fs, d1), n0);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, d1, (const uint8_t *)"a", 1));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, d2, (const uint8_t *)"b", 1));
+}
+
+STM_TEST(fs_rename_between_two_links_of_one_file_changes_nothing) {
+    uint64_t dir = 0, other = 0;
+    stm_fs *fs = reuse_fs("rename_links", &dir);
+    if (!fs) return;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, (const uint8_t *)"O", 1, 0755u,
+                                  0, 0, &other));
+    for (int cross = 0; cross < 2; cross++) {
+        uint64_t d2 = cross ? other : dir;
+        rename_links_leg(fs, dir, d2, 0, STM_OK);
+        rename_links_leg(fs, dir, d2, STM_FS_RENAME_EXCHANGE, STM_OK);
+        rename_links_leg(fs, dir, d2, STM_FS_RENAME_WHITEOUT, STM_OK);
+        rename_links_leg(fs, dir, d2, STM_FS_RENAME_NOREPLACE, STM_EEXIST);
+    }
+    reuse_fs_done(fs);
+}
+
 /* The scrub's extent lookup holds no fs->global, so a rollback can retire a
  * dataset's engine while the lookup walks it: the walk's EBR pin is what
  * keeps the retired engine alive until the walk leaves. */
