@@ -127,7 +127,7 @@ CONSTANTS
                                    \*   the fid-ESTALE-on-own-write bug.
                                    \*   Caught by AllocatedReflectedInHistory
                                    \*   (gen moves with no history stamp).
-    \* ── Snapshot rollback (PX-10) ──────────────────────────────────────
+    \* ── Snapshot rollback ─────────────────────────────────────────────
     EnableRollbackModel,           \* TRUE → TakeSnapshot / Rollback join
                                    \*   Next. A rollback restores every
                                    \*   ino's state, gen, nlink and cvers
@@ -358,7 +358,7 @@ AllocFresh(i) ==
     /\ \/ state[i] = NEVER_USED
        \/ /\ BuggyDoubleAllocate
           /\ state[i] = ALLOCATED
-    \* PX-10: next_ino is a high-water mark a rollback does not rewind
+    \* next_ino is a high-water mark a rollback does not rewind
     \* (inode.c in_seed_dsstate_locked takes the max), so an ino the
     \* discarded state issued is never fresh again. Without a rollback a
     \* NEVER_USED ino has an empty history, so this guard is a no-op.
@@ -776,7 +776,7 @@ ContentMutate(i) ==
                     data_kind, data_len, ever_extent, ever_linked>>
 
 \* --------------------------------------------------------------------------
-\* PX-10 — snapshot rollback.
+\* Snapshot rollback.
 \*
 \* TakeSnapshot copies the identity state into the one snapshot slot.
 \* Rollback puts it back (stm_fs_rollback_snapshot swaps the dataset's

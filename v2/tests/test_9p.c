@@ -5349,7 +5349,7 @@ STM_TEST(p9_xattr_commit_on_a_freed_fid_answers_estale) {
     gap_fix_down(&gf);
 }
 
-/* ── the reads and the walk in the gap (PX-16 part 2) ─────────────────── */
+/* ── the reads and the walk in the gap ──────────────────────────────── */
 
 /* Session 1's fid 104 is "d", an empty directory, walked but not open. */
 static void gap_fix_dir(gap_fix *gf)
@@ -5562,7 +5562,7 @@ STM_TEST(p9_dotdot_walk_never_steps_into_a_dir_freed_mid_walk) {
     gap_fix_down(&gf);
 }
 
-/* ── the namespace ops in the gap (PX-16 part 3) ──────────────────────── */
+/* ── the namespace ops in the gap ───────────────────────────────────── */
 
 /* "e" (on "d"'s ino) still holds "n" and "s" and no "c"; the root
  * still holds "x" and no "c". */
@@ -5742,7 +5742,7 @@ STM_TEST(p9_reflink_into_a_fid_freed_in_the_gap_answers_estale) {
     gap_fix_down(&gf);
 }
 
-/* ── a fid's gen is set at bind, never read back (PX-16c) ─────────────── */
+/* ── a fid's gen is set at bind, never read back ────────────────────── */
 
 /* After the op, session 1 writes "EVIL" through `fid`: it must not land
  * in "y". */
