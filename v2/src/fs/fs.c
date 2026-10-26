@@ -286,6 +286,10 @@ struct stm_fs {
     bool listxattr_force_fallback;
     stm_fs_listxattr_fallback_hook listxattr_fallback_hook;
     void *listxattr_fallback_hook_arg;
+    stm_status rename_install_fail_next;
+    stm_status rename_src_drop_fail_next;
+    stm_fs_rename_rollback_hook rename_rollback_hook;
+    void *rename_rollback_hook_arg;
 #endif
 };
 
@@ -3144,6 +3148,24 @@ void stm_fs_force_name_to_handle_fallback_for_test(stm_fs *fs, bool force)
 {
     fs->name_to_handle_locked_only = force;
 }
+
+void stm_fs_fail_next_rename_install_for_test(stm_fs *fs, stm_status fail)
+{
+    fs->rename_install_fail_next = fail;
+}
+
+void stm_fs_fail_next_rename_src_drop_for_test(stm_fs *fs, stm_status fail)
+{
+    fs->rename_src_drop_fail_next = fail;
+}
+
+void stm_fs_set_rename_rollback_hook_for_test(stm_fs *fs,
+                                              stm_fs_rename_rollback_hook fn,
+                                              void *arg)
+{
+    fs->rename_rollback_hook = fn;
+    fs->rename_rollback_hook_arg = arg;
+}
 #endif
 
 /* The status an armed test injects, once, in place of the inode free it
@@ -3171,6 +3193,46 @@ static stm_status fs_name_back_injected_failure(stm_fs *fs)
 #else
     (void)fs;
     return STM_OK;
+#endif
+}
+
+/* The same, in place of the dirent a rename installs at dst, and of the
+ * drop (or whiteout) of its src name. */
+static stm_status fs_rename_install_injected_failure(stm_fs *fs)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    stm_status s = fs->rename_install_fail_next;
+    fs->rename_install_fail_next = STM_OK;
+    return s;
+#else
+    (void)fs;
+    return STM_OK;
+#endif
+}
+
+static stm_status fs_rename_src_drop_injected_failure(stm_fs *fs)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    stm_status s = fs->rename_src_drop_fail_next;
+    fs->rename_src_drop_fail_next = STM_OK;
+    return s;
+#else
+    (void)fs;
+    return STM_OK;
+#endif
+}
+
+/* Tells an armed test, as a rename's rollback ends and before it releases
+ * its pins and fs->global, whether the fs is wedged. */
+static void fs_rename_rollback_ends(stm_fs *fs)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->rename_rollback_hook)
+        fs->rename_rollback_hook(
+            atomic_load_explicit(&fs->wedged, memory_order_acquire),
+            fs->rename_rollback_hook_arg);
+#else
+    (void)fs;
 #endif
 }
 
@@ -5665,6 +5727,27 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
 /* P8-POSIX-9: stm_fs_rename.                                                 */
 /* ========================================================================= */
 
+/* Gives an overwriting rename's dst back its name and the link the
+ * rename took, under the pins and fs->global SH; false when it cannot,
+ * and the caller wedges. A dst the rename freed cannot come back: its
+ * records are gone, and a name restored to (dst_ino, dst_gen) would
+ * name whatever file reuses the ino next. */
+static bool fs_rename_restore_dst_locked(stm_inode_index *iidx,
+                                         stm_dirent_index *didx,
+                                         uint64_t dataset_id,
+                                         uint64_t dst_parent_ino,
+                                         const uint8_t *dst_name,
+                                         uint8_t dst_name_len,
+                                         uint64_t dst_ino, uint64_t dst_gen,
+                                         uint8_t dst_type, bool dst_freed)
+{
+    if (dst_freed) return false;
+    if (stm_dirent_alloc(didx, dataset_id, dst_parent_ino, dst_name,
+                         dst_name_len, dst_ino, dst_gen, dst_type) != STM_OK)
+        return false;
+    return stm_inode_link(iidx, dataset_id, dst_ino) == STM_OK;
+}
+
 /* rename(d/a, d/a) moves nothing, but the name must exist (Linux:
  * ENOENT) and NOREPLACE finds it in place (Linux: EEXIST, checked
  * before the source == target return). The directory's shared pin
@@ -5754,13 +5837,13 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                                      flags);
     }
 
-    /* R133 P1-2: capture wedge-intent through rollback failures and
-     * fire the actual mark_wedged AFTER pthread_rwlock_unlock. Calling
-     * stm_fs_mark_wedged from inside the held rdlock would self-
-     * deadlock on glibc rwlocks (POSIX: same-thread recursive lock is
-     * undefined; readers waiting on a queued writer block here). The
-     * wedge sites below are all "should not fire in current code-
-     * paths" defense-in-depth, but the latent deadlock was real. */
+    /* A rollback that cannot restore what it undid wedges the fs in
+     * place (fs_mark_wedged_locked), before it releases its pins and
+     * fs->global: stm_fs_mark_wedged would take fs->global itself (a
+     * self-deadlock under the held SH, R133 P1-2), and a wedge after the
+     * unlock leaves a window in which a writer queued behind this section
+     * (a commit takes EX, then checks the wedge) runs on, and can
+     * persist, the half-undone state. */
     bool should_wedge = false;
 
     /* PARALLEL-3 impl-3: SH path. Pin up to four inodes
@@ -6176,9 +6259,10 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                 nb = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
                                       dst_name, dst_name_len,
                                       dst_ino, dst_gen, dst_type);
+            if (nb != STM_OK) fs_mark_wedged_locked(fs);
+            fs_rename_rollback_ends(fs);
             FS_RENAME_UNPIN_ALL();
             pthread_rwlock_unlock(&fs->global);
-            if (nb != STM_OK) stm_fs_mark_wedged(fs);
             return iu;
         }
         /* The records keyed by dst's ino go once it is freed, still under
@@ -6189,34 +6273,20 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
     }
 
     /* Install dirent at dst pointing at src_ino. */
-    stm_status as = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
-                                          dst_name, dst_name_len,
-                                          src_ino, src_gen, src_type);
+    stm_status as = fs_rename_install_injected_failure(fs);
+    if (as == STM_OK)
+        as = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
+                              dst_name, dst_name_len,
+                              src_ino, src_gen, src_type);
     if (as != STM_OK) {
-        /* Rollback the dst-overwrite: re-create dst dirent + bump
-         * dst inode's nlink back. R133 P1-2 captures wedge intent
-         * here; the actual mark_wedged fires AFTER unlock. */
-        if (dst_exists) {
-            stm_status r1 = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
-                                                  dst_name, dst_name_len,
-                                                  dst_ino, dst_gen, dst_type);
-            stm_status r2 = STM_OK;
-            if (!dst_freed_unused) {
-                r2 = stm_inode_link(iidx, dataset_id, dst_ino);
-            } else {
-                /* dst inode was cascade-freed — can't bring it back
-                 * without an alloc-reuse cycle (gen bump required).
-                 * Wedge: data loss has already occurred from the
-                 * caller's perspective. */
-                should_wedge = true;
-            }
-            if (r1 != STM_OK || r2 != STM_OK) {
-                should_wedge = true;
-            }
-        }
+        /* Roll the overwrite back: dst's name and the link it held. */
+        if (dst_exists) should_wedge = !fs_rename_restore_dst_locked(
+            iidx, didx, dataset_id, dst_parent_ino, dst_name,
+            dst_name_len, dst_ino, dst_gen, dst_type, dst_freed_unused);
+        if (should_wedge) fs_mark_wedged_locked(fs);
+        fs_rename_rollback_ends(fs);
         FS_RENAME_UNPIN_ALL();
         pthread_rwlock_unlock(&fs->global);
-        if (should_wedge) stm_fs_mark_wedged(fs);
         return as;
     }
 
@@ -6227,35 +6297,27 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
      * P8-POSIX-9b RENAME_WHITEOUT: instead of unlinking src (which
      * leaves a TOMBSTONE invisible to readdir), convert src to a
      * WHITEOUT marker. */
-    stm_status su;
-    if (flags & STM_FS_RENAME_WHITEOUT) {
+    stm_status su = fs_rename_src_drop_injected_failure(fs);
+    if (su == STM_OK && (flags & STM_FS_RENAME_WHITEOUT)) {
         su = stm_dirent_whiteout(didx, dataset_id, src_parent_ino,
                                        src_name, src_name_len);
-    } else {
+    } else if (su == STM_OK) {
         su = stm_dirent_unlink(didx, dataset_id, src_parent_ino,
                                      src_name, src_name_len);
     }
     if (su != STM_OK) {
-        /* Defensive rollback: drop the dst dirent we just created
-         * and re-link the original (if overwrite). R79 P3-1 + R133
-         * P1-2: capture wedge intent. */
+        /* Defensive rollback (R79 P3-1): drop the dst dirent just
+         * installed, then restore the original dst as above. */
         stm_status r0 = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
                                                 dst_name, dst_name_len);
         if (r0 != STM_OK) should_wedge = true;
-        if (dst_exists) {
-            stm_status r1 = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
-                                                  dst_name, dst_name_len,
-                                                  dst_ino, dst_gen, dst_type);
-            if (!dst_freed_unused) {
-                stm_status r2 = stm_inode_link(iidx, dataset_id, dst_ino);
-                if (r1 != STM_OK || r2 != STM_OK) should_wedge = true;
-            } else {
-                should_wedge = true;
-            }
-        }
+        else if (dst_exists) should_wedge = !fs_rename_restore_dst_locked(
+            iidx, didx, dataset_id, dst_parent_ino, dst_name,
+            dst_name_len, dst_ino, dst_gen, dst_type, dst_freed_unused);
+        if (should_wedge) fs_mark_wedged_locked(fs);
+        fs_rename_rollback_ends(fs);
         FS_RENAME_UNPIN_ALL();
         pthread_rwlock_unlock(&fs->global);
-        if (should_wedge) stm_fs_mark_wedged(fs);
         return su;
     }
 
@@ -6294,13 +6356,11 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
      * locked; they return to FREE at the next commit's sweep or on-demand
      * via the reserve-path backstop (fs_reclaim_on_enospc_locked) -- same
      * deferral as unlink / truncate-shrink / COW-overwrite. Pre-CF-4-C
-     * fired a double-commit here per overwriting rename. (rename's own
-     * swap-durability commits, which also set should_wedge, are
-     * unchanged.) PENDING is crash-safe (#791 reconcile). */
+     * fired a double-commit here per overwriting rename. PENDING is
+     * crash-safe (#791 reconcile). */
 
     FS_RENAME_UNPIN_ALL();
     pthread_rwlock_unlock(&fs->global);
-    if (should_wedge) stm_fs_mark_wedged(fs);
     return STM_OK;
     #undef FS_RENAME_UNPIN_ALL
 }

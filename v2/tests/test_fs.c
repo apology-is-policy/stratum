@@ -12118,6 +12118,120 @@ STM_TEST(fs_rename_between_two_links_of_one_file_changes_nothing) {
     reuse_fs_done(fs);
 }
 
+/* A rename whose install or source drop fails after it freed the file it
+ * replaced cannot give that file back: it must not restore a name to the
+ * freed (ino, gen), which would name the next tenant of the ino, and it
+ * wedges before it releases its pins. A dst with another link comes back
+ * whole, with no wedge; so does a rename that replaced nothing. */
+typedef struct {
+    int  calls;
+    bool wedged;
+} rename_rb_seen;
+
+static void rename_rb_note(bool wedged, void *arg)
+{
+    rename_rb_seen *r = arg;
+    r->calls++;
+    r->wedged = wedged;
+}
+
+typedef enum { RB_INSTALL, RB_SRC_DROP } rename_rb_at;
+typedef enum { RB_DST_FREED, RB_DST_LINKED, RB_NO_DST } rename_rb_dst;
+
+static void rename_rollback_leg(rename_rb_at at, rename_rb_dst dst,
+                                uint32_t flags)
+{
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("rename_rollback", &dir);
+    if (!fs) return;
+    stm_dirent_index *didx = stm_sync_dirent_index(stm_fs_sync(fs));
+    uint64_t a = 0, b = 0, ino = 0, gen = 0, x = 0;
+    uint8_t type = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"a", 1,
+                                        0644u, 0, 0, &a));
+    if (dst != RB_NO_DST)
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"b", 1,
+                                            0644u, 0, 0, &b));
+    if (dst == RB_DST_LINKED)
+        STM_ASSERT_OK(stm_fs_link_by_ino(fs, 1, b, dir,
+                                            (const uint8_t *)"b2", 2));
+    rename_rb_seen seen = { 0, false };
+    stm_fs_set_rename_rollback_hook_for_test(fs, rename_rb_note, &seen);
+    if (at == RB_INSTALL)
+        stm_fs_fail_next_rename_install_for_test(fs, STM_EIO);
+    else
+        stm_fs_fail_next_rename_src_drop_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, (const uint8_t *)"a", 1,
+                                 dir, (const uint8_t *)"b", 1, flags),
+                   STM_EIO);
+    stm_fs_set_rename_rollback_hook_for_test(fs, NULL, NULL);
+    STM_ASSERT_EQ(seen.calls, 1);
+
+    /* src keeps its name in every case */
+    STM_ASSERT_OK(stm_dirent_lookup(didx, 1, dir, (const uint8_t *)"a", 1,
+                                       &ino, &gen, &type));
+    STM_ASSERT_EQ(ino, a);
+    stm_status bs = stm_dirent_lookup(didx, 1, dir, (const uint8_t *)"b", 1,
+                                      &ino, &gen, &type);
+    if (dst == RB_DST_FREED) {
+        STM_ASSERT_ERR(bs, STM_ENOENT);
+        STM_ASSERT_TRUE(seen.wedged);
+        STM_ASSERT_ERR(stm_fs_create_file(fs, 1, dir,
+                                             (const uint8_t *)"x", 1, 0644u,
+                                             0, 0, &x),
+                       STM_EWEDGED);
+    } else if (dst == RB_DST_LINKED) {
+        STM_ASSERT_OK(bs);
+        STM_ASSERT_EQ(ino, b);
+        struct stm_inode_value v = {0};
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, b, &v));
+        STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 2u);
+        STM_ASSERT_TRUE(!seen.wedged);
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                            0644u, 0, 0, &x));
+    } else {
+        STM_ASSERT_ERR(bs, STM_ENOENT);
+        STM_ASSERT_TRUE(!seen.wedged);
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                            0644u, 0, 0, &x));
+    }
+    reuse_fs_done(fs);
+}
+
+STM_TEST(fs_a_rename_rollback_never_names_a_freed_dst) {
+    rename_rollback_leg(RB_INSTALL, RB_DST_FREED, 0);
+    rename_rollback_leg(RB_SRC_DROP, RB_DST_FREED, 0);
+    rename_rollback_leg(RB_SRC_DROP, RB_DST_FREED, STM_FS_RENAME_WHITEOUT);
+    rename_rollback_leg(RB_INSTALL, RB_DST_LINKED, 0);
+    rename_rollback_leg(RB_SRC_DROP, RB_DST_LINKED, 0);
+    rename_rollback_leg(RB_INSTALL, RB_NO_DST, 0);
+    rename_rollback_leg(RB_SRC_DROP, RB_NO_DST, 0);
+}
+
+/* The dst-free rollback that cannot give dst its name back wedges before
+ * it releases its pins too. */
+STM_TEST(fs_a_rename_whose_dst_name_cannot_come_back_wedges_in_place) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("rename_name_back", &dir);
+    if (!fs) return;
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"a", 1,
+                                        0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"b", 1,
+                                        0644u, 0, 0, &b));
+    rename_rb_seen seen = { 0, false };
+    stm_fs_set_rename_rollback_hook_for_test(fs, rename_rb_note, &seen);
+    stm_fs_fail_next_inode_free_for_test(fs, STM_EIO);
+    stm_fs_fail_next_name_back_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, (const uint8_t *)"a", 1,
+                                 dir, (const uint8_t *)"b", 1, 0),
+                   STM_EIO);
+    stm_fs_set_rename_rollback_hook_for_test(fs, NULL, NULL);
+    STM_ASSERT_EQ(seen.calls, 1);
+    STM_ASSERT_TRUE(seen.wedged);
+    reuse_fs_done(fs);
+}
+
 /* The scrub's extent lookup holds no fs->global, so a rollback can retire a
  * dataset's engine while the lookup walks it: the walk's EBR pin is what
  * keeps the retired engine alive until the walk leaves. */

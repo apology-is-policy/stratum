@@ -637,6 +637,13 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
  *   - dirent chain exhausted at dst's hash (STM_ENOSPC — pathological).
  *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
  *
+ * A step that fails after the rename has changed something is rolled
+ * back under the same pins. When the rollback cannot restore what it
+ * undid (a replaced file the rename already freed, or a name that will
+ * not go back), the fs wedges before the pins are released, so no other
+ * op, and no commit, runs on the half-done state; the replaced file's
+ * name is never restored to a file that is gone.
+ *
  * Same-path rename (src == dst, both name and parent equal): moves
  * nothing, but the name must exist (STM_ENOENT otherwise) and
  * RENAME_NOREPLACE finds it in place (STM_EEXIST), as on Linux.

@@ -102,8 +102,8 @@ void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
 /*
  * Make the next inode free that unlink, rmdir, rename over an existing
  * name or unlink_anon attempts answer `fail` instead, leaving the inode
- * as it was. One-shot; STM_OK disarms. This, the three above and the two
- * below belong to `fs` and go with it at unmount.
+ * as it was. One-shot; STM_OK disarms. This, the three above and the
+ * five below belong to `fs` and go with it at unmount.
  */
 void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
 
@@ -120,6 +120,24 @@ void stm_fs_fail_next_name_back_for_test(stm_fs *fs, stm_status fail);
  * restores it.
  */
 void stm_fs_force_name_to_handle_fallback_for_test(stm_fs *fs, bool force);
+
+/*
+ * Make the next dirent an overwriting or plain rename installs at its
+ * destination, or the next drop (or whiteout) of its source name, answer
+ * `fail` instead. One-shot each; STM_OK disarms.
+ */
+void stm_fs_fail_next_rename_install_for_test(stm_fs *fs, stm_status fail);
+void stm_fs_fail_next_rename_src_drop_for_test(stm_fs *fs, stm_status fail);
+
+/*
+ * Call `fn` as a rename's rollback ends, before it releases its pins and
+ * fs->global SH, with whether the fs is wedged at that point. `fn` may
+ * not call the fs. NULL restores it.
+ */
+typedef void (*stm_fs_rename_rollback_hook)(bool wedged, void *arg);
+void stm_fs_set_rename_rollback_hook_for_test(stm_fs *fs,
+                                              stm_fs_rename_rollback_hook fn,
+                                              void *arg);
 #endif
 
 #ifdef __cplusplus
