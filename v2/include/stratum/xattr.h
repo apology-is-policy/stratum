@@ -418,9 +418,9 @@ stm_status stm_xattr_list_concurrent(const stm_xattr_index *idx,
 
 /*
  * Drop EVERY record (live + tombstone) keyed at `(dataset_id, ino, *)`.
- * Used by `stm_fs_unlink` / `_rmdir` to GC an inode's xattrs when the
- * inode itself is freed. Without this, an inode whose ino is later
- * AllocReused inherits the prior tenant's xattrs.
+ * The fs calls it before every inode free and again in a create handed a
+ * reused ino: the key carries no gen, so records left behind would
+ * surface on whichever inode reuses the slot.
  *
  * Output: `*out_dropped` (optional) is set to the number of records
  * removed (live + tombstone, summed). Pass NULL to ignore.

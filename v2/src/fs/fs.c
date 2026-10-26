@@ -2932,6 +2932,20 @@ lookup_fallback:
     }
 }
 
+/* A reused ino (gen != 0; AllocFresh stamps 0) can still hold a previous
+ * tenant's xattrs: a volume written before the free path dropped them, a
+ * rollback to such a tree, or a free whose drop failed. They go before the
+ * new inode is linked; a create that cannot drop them refuses rather than
+ * hand them on. */
+static stm_status fs_drop_reused_xattrs_locked(stm_fs *fs, uint64_t dataset_id,
+                                               uint64_t ino, uint64_t gen)
+{
+    if (gen == 0u) return STM_OK;
+    stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
+    if (!xidx) return STM_EINVAL;
+    return stm_xattr_drop_for_ino(xidx, dataset_id, ino, NULL);
+}
+
 /* #369 (R176 F1, CF-4 B rider): the create/link rollback's inode free.
  * The rollback path used to `(void)`-discard the free's status; under a
  * doubly-wedged engine (CF-2d makes STM_EBUSY reachable from BOTH the
@@ -3047,6 +3061,15 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
         return cs;
     }
     uint64_t child_gen = stm_load_le64(cv.si_gen);
+    stm_status xd = fs_drop_reused_xattrs_locked(fs, dataset_id, child_ino,
+                                                 child_gen);
+    if (xd != STM_OK) {
+        stm_inode_unpin(iidx, h_child);
+        fs_rollback_inode_free(iidx, dataset_id, child_ino);
+        stm_inode_unpin(iidx, h_parent);
+        pthread_rwlock_unlock(&fs->global);
+        return xd;
+    }
 
     /* P8-POSIX-7a: stamp btime + atime + mtime + ctime at creation.
      * POSIX requires btime set at create and never modified thereafter.
@@ -3254,6 +3277,16 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
          * (ORPHAN flag set + nlink=0) from the FREED⇔nlink≥1 check —
          * see the inode.c R71 P1-1 / P8-POSIX-7a-anon symmetry. */
         (void)stm_inode_set(iidx, dataset_id, new_ino, &iv);
+    }
+    /* An unreadable record gives no gen: drop as for a reuse. */
+    stm_status xd = fs_drop_reused_xattrs_locked(
+        fs, dataset_id, new_ino,
+        ls == STM_OK ? stm_load_le64(iv.si_gen) : UINT64_MAX);
+    if (xd != STM_OK) {
+        stm_inode_unpin(iidx, h_child);
+        (void)stm_inode_free(iidx, dataset_id, new_ino);
+        pthread_rwlock_unlock(&fs->global);
+        return xd;
     }
 
     *out_child_ino = new_ino;
@@ -3475,10 +3508,11 @@ stm_status stm_fs_mkdir(stm_fs *fs, uint64_t dataset_id,
                                        out_child_ino);
 }
 
-/* R128 P1-1 + P1-2: pre-free cleanup helper. Drops the dirty_buffer
- * entry for (ds, ino) AND truncates the inode's extents to 0. Caller
- * MUST hold fs->lock, have looked up `cv`, and be about to free the
- * inode (via stm_inode_unlink-with-cascade OR direct stm_inode_free).
+/* R128 P1-1 + P1-2: pre-free cleanup helper. Drops the inode's xattrs,
+ * the dirty_buffer entry for (ds, ino) AND truncates the inode's extents
+ * to 0. Caller MUST hold fs->lock, have looked up `cv`, and be about to
+ * free the inode (via stm_inode_unlink-with-cascade OR direct
+ * stm_inode_free).
  *
  * The helper is the load-bearing fix for the audit's P1 class: the
  * dirty buffer is keyed by (dataset_id, ino) ONLY — no si_gen — so
@@ -3502,6 +3536,21 @@ static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs,
                                                   const struct stm_inode_value *cv)
 {
     if (!cv) return false;
+    /* xattr records are keyed by (ds, ino) alone, so any left here would
+     * surface on whichever inode reuses the slot. A failure is reported
+     * and left to the create that reuses the ino, which drops them again
+     * and refuses if it cannot (fs_drop_reused_xattrs_locked). */
+    stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
+    stm_status xs = xidx ? stm_xattr_drop_for_ino(xidx, dataset_id, ino, NULL)
+                         : STM_EINVAL;
+    if (xs != STM_OK) {
+        fprintf(stderr,
+                "STRATUM-FS: could not drop the xattrs of freed inode "
+                "ds=%llu ino=%llu (status %d); a create that reuses it "
+                "drops them first\n",
+                (unsigned long long)dataset_id, (unsigned long long)ino,
+                (int)xs);
+    }
     uint32_t cmode = stm_load_le32(cv->si_mode);
     bool is_reg = ((cmode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG);
     bool is_extent = (cv->si_data_kind == STM_DATA_EXTENT);
@@ -4656,6 +4705,15 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
         stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return cs;
+    }
+    stm_status xd = fs_drop_reused_xattrs_locked(fs, dataset_id, child_ino,
+                                                 stm_load_le64(cv.si_gen));
+    if (xd != STM_OK) {
+        stm_inode_unpin(iidx, h_child);
+        fs_rollback_inode_free(iidx, dataset_id, child_ino);
+        stm_inode_unpin(iidx, h_parent);
+        pthread_rwlock_unlock(&fs->global);
+        return xd;
     }
     cv.si_data_kind = STM_DATA_SYMLINK;
     cv.si_data_len  = (uint8_t)target_len;

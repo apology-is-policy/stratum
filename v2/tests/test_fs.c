@@ -35,6 +35,7 @@
 #include <stratum/sync.h>
 #include <stratum/sync_testing.h>
 #include <stratum/types.h>
+#include <stratum/xattr.h>
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -11592,6 +11593,157 @@ STM_TEST(fs_rename_waits_out_a_commit_window) {
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
+}
+
+/* An inode's xattrs go with it. Every path that frees an inode drops its
+ * xattr records before the free, so a file created on the reused inode
+ * number starts with none of the previous tenant's; a reused ino whose
+ * records survived anyway (written before the free path dropped them)
+ * loses them in the create that reuses it. */
+static size_t xattr_records(stm_fs *fs, uint64_t ino)
+{
+    size_t n = 0;
+    stm_status s = stm_xattr_list(stm_sync_xattr_index(stm_fs_sync(fs)), 1,
+                                  ino, NULL, 0, &n);
+    return s == STM_OK ? n : SIZE_MAX;
+}
+
+static void set_old_xattr(stm_fs *fs, uint64_t ino)
+{
+    bool replaced = false;
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, ino, (const uint8_t *)"user.k", 6,
+                                     (const uint8_t *)"old", 3, 0,
+                                     &replaced));
+    STM_ASSERT_EQ(xattr_records(fs, ino), (size_t)1);
+}
+
+static void assert_no_old_xattr(stm_fs *fs, uint64_t ino)
+{
+    size_t total = 99;
+    STM_ASSERT_OK(stm_fs_listxattr(fs, 1, ino, NULL, 0, &total));
+    STM_ASSERT_EQ(total, (size_t)0);
+    uint8_t buf[16];
+    uint32_t sz = 0;
+    STM_ASSERT_ERR(stm_fs_getxattr(fs, 1, ino, (const uint8_t *)"user.k", 6,
+                                      buf, sizeof buf, &sz), STM_ENODATA);
+}
+
+static stm_fs *reuse_fs(const char *name, uint64_t *out_dir)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return NULL;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                     0, 0, out_dir));
+    return fs;
+}
+
+static void reuse_fs_done(stm_fs *fs)
+{
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reused_ino_starts_without_the_old_xattrs) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("reuse_xattrs", &dir);
+    if (!fs) return;
+
+    /* unlink of the last link */
+    uint64_t f1 = 0, f2 = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f1", 2,
+                                        0644u, 0, 0, &f1));
+    set_old_xattr(fs, f1);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"f1", 2));
+    STM_ASSERT_EQ(xattr_records(fs, f1), (size_t)0);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f2", 2,
+                                        0644u, 0, 0, &f2));
+    STM_ASSERT_EQ(f2, f1);
+    assert_no_old_xattr(fs, f2);
+
+    /* rmdir */
+    uint64_t d1 = 0, d2 = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, (const uint8_t *)"d1", 2,
+                                  040755u, 0, 0, &d1));
+    set_old_xattr(fs, d1);
+    STM_ASSERT_OK(stm_fs_rmdir(fs, 1, dir, (const uint8_t *)"d1", 2));
+    STM_ASSERT_EQ(xattr_records(fs, d1), (size_t)0);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, (const uint8_t *)"d2", 2,
+                                  040755u, 0, 0, &d2));
+    STM_ASSERT_EQ(d2, d1);
+    assert_no_old_xattr(fs, d2);
+
+    /* rename over an existing file frees the one it replaces */
+    uint64_t ra = 0, rb = 0, rc = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"ra", 2,
+                                        0644u, 0, 0, &ra));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"rb", 2,
+                                        0644u, 0, 0, &rb));
+    set_old_xattr(fs, ra);
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, dir, (const uint8_t *)"rb", 2,
+                                dir, (const uint8_t *)"ra", 2, 0));
+    STM_ASSERT_EQ(xattr_records(fs, ra), (size_t)0);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"rc", 2,
+                                        0644u, 0, 0, &rc));
+    STM_ASSERT_EQ(rc, ra);
+    assert_no_old_xattr(fs, rc);
+
+    /* an anonymous inode's free */
+    uint64_t a1 = 0, a2 = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &a1));
+    set_old_xattr(fs, a1);
+    STM_ASSERT_OK(stm_fs_unlink_anon(fs, 1, a1));
+    STM_ASSERT_EQ(xattr_records(fs, a1), (size_t)0);
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &a2));
+    STM_ASSERT_EQ(a2, a1);
+    assert_no_old_xattr(fs, a2);
+
+    reuse_fs_done(fs);
+}
+
+/* The records a free left behind (here: an inode freed below the fs layer,
+ * as on a volume written before the free path dropped them) go in the
+ * create that reuses the ino, for each kind of create. */
+STM_TEST(fs_create_drops_xattrs_a_reused_ino_still_holds) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("reuse_stale_xattrs", &dir);
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+
+    for (int kind = 0; kind < 3; kind++) {
+        uint64_t old = 0, got = 0;
+        STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFREG | 0644u,
+                                         0, 0, &old));
+        set_old_xattr(fs, old);
+        STM_ASSERT_OK(stm_inode_free(iidx, 1, old));
+        STM_ASSERT_EQ(xattr_records(fs, old), (size_t)1);
+        switch (kind) {
+        case 0:
+            STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir,
+                                                (const uint8_t *)"cf", 2,
+                                                0644u, 0, 0, &got));
+            break;
+        case 1:
+            STM_ASSERT_OK(stm_fs_symlink(fs, 1, dir,
+                                            (const uint8_t *)"cs", 2,
+                                            (const uint8_t *)"tgt", 3,
+                                            0, 0, &got));
+            break;
+        default:
+            STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &got));
+            break;
+        }
+        STM_ASSERT_EQ(got, old);
+        STM_ASSERT_EQ(xattr_records(fs, got), (size_t)0);
+        assert_no_old_xattr(fs, got);
+    }
+    reuse_fs_done(fs);
 }
 
 STM_TEST_MAIN("fs")

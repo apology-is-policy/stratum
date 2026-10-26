@@ -16,16 +16,18 @@ The xattr module is the bridge between:
   that dataset's per-dataset btree_engine).
 - **fs.c** (per-fs setxattr / getxattr / listxattr / removexattr
   wrappers; namespace gating).
-- **Inode cascade-free** (`stm_xattr_drop_for_ino` collects every
-  record under a freed inode so AllocReused can't inherit prior
-  tenant's xattrs — composes with `inode.tla::AllocReused`).
+- **Inode free and reuse** (fs.c runs `stm_xattr_drop_for_ino` before
+  every inode free and again in a create that reuses an ino, so a
+  reused ino never carries the previous tenant's xattrs — composes with
+  `inode.tla::AllocReused`).
 
 In-RAM storage: NONE — the btree_engine COW B+tree IS the store
 (9.6-impl-4c cutover; the pre-cutover heap-allocated record array +
 per-record value buffer are retired). Each chain walk issues
-`stm_btree_engine_lookup` per probe; list / drop_for_ino use
-`stm_btree_engine_scan_range` over the (ino, *) prefix within the
-resolved per-dataset engine. Decoded values are heap-allocated per-call
+`stm_btree_engine_lookup` per probe; list uses the serial
+`stm_btree_engine_scan_range` and drop_for_ino the EBR-pinned
+`stm_btree_engine_scan_range_concurrent` (CF-2c), each over the
+(ino, *) prefix within the resolved per-dataset engine. Decoded values are heap-allocated per-call
 (returned by the engine) and freed at the end of the op.
 
 Storage evolution:
@@ -94,10 +96,21 @@ refuses if absent. Models `xattr.tla::Set`.
 probe indices per `xattr.tla::BuggyUnlinkUsesEmpty`). Models
 `xattr.tla::Remove`.
 
-`stm_xattr_drop_for_ino` is the inode-cascade-free hook: drops EVERY
-record (live + tombstone) keyed at `(dataset_id, ino, *)`. Called by
-`stm_fs_unlink` / `_rmdir` so AllocReused at this `ino` doesn't
-inherit prior tenant's xattrs.
+`stm_xattr_drop_for_ino` is the inode-free hook: drops EVERY record
+(live + tombstone) keyed at `(dataset_id, ino, *)`. The key carries no
+gen, so records left behind surface on whichever inode reuses the slot.
+fs.c calls it from the pre-free cleanup (`fs_pre_inode_free_cleanup_locked`:
+the last unlink, rmdir, rename over an existing name, `unlink_anon`)
+before the inode is freed, reporting a failure on stderr; and every
+create that is handed a reused ino (`si_gen != 0`) calls it again before
+linking the inode (`fs_drop_reused_xattrs_locked`) and refuses if it
+fails, so a create never inherits. The second call is also what clears
+volumes written before the first existed: until then nothing called
+the hook, and a reused ino carried its previous tenant's xattrs (tests
+`fs_reused_ino_starts_without_the_old_xattrs`,
+`fs_create_drops_xattrs_a_reused_ino_still_holds`). Dropping before
+the free leaves the dying inode present without its xattrs for the
+span of the unlink, which a concurrent reader can observe.
 
 ### Inspection
 

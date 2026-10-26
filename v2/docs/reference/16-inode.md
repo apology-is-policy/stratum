@@ -60,8 +60,9 @@ The inode module is the bridge between:
   `ub_inode_root`; persists every commit).
 - **Dirent layer** (every `child_ino` resolves through this index;
   `child_gen` mirrors `si_gen`).
-- **Xattr layer** (every xattr key is `(ds, ino, hash_probe)` —
-  cascade-free on inode unlink composes with `xattr_drop_for_ino`).
+- **Xattr layer** (every xattr key is `(ds, ino, hash_probe)`, with no
+  gen — the fs drops an inode's xattrs before freeing it and again when
+  a create reuses its ino; see 18-xattr).
 - **Extent layer** (regular files with `si_data_kind = STM_DATA_EXTENT`
   reference an extent tree rooted at `si_data.extent_tree.{paddr, gen}`).
 - **fs.c** (per-fs create/link/unlink/stat/chmod/chown/utimens wrappers).
