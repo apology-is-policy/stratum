@@ -283,6 +283,9 @@ struct stm_fs {
     stm_fs_xattr_read_gap_hook xattr_read_gap_hook;
     void *xattr_read_gap_hook_arg;
     bool name_to_handle_locked_only;
+    bool listxattr_force_fallback;
+    stm_fs_listxattr_fallback_hook listxattr_fallback_hook;
+    void *listxattr_fallback_hook_arg;
 #endif
 };
 
@@ -6892,17 +6895,13 @@ getxattr_locked:
 }
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-static bool listxattr_force_fallback;
-static stm_fs_listxattr_fallback_hook listxattr_fallback_hook;
-static void *listxattr_fallback_hook_arg;
-
-void stm_fs_set_listxattr_fallback_for_test(bool force,
+void stm_fs_set_listxattr_fallback_for_test(stm_fs *fs, bool force,
                                             stm_fs_listxattr_fallback_hook fn,
                                             void *arg)
 {
-    listxattr_force_fallback = force;
-    listxattr_fallback_hook = fn;
-    listxattr_fallback_hook_arg = arg;
+    fs->listxattr_force_fallback = force;
+    fs->listxattr_fallback_hook = fn;
+    fs->listxattr_fallback_hook_arg = arg;
 }
 #endif
 
@@ -6950,7 +6949,7 @@ static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         return ps;
     }
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-    if (listxattr_force_fallback) need_fallback = true;
+    if (fs->listxattr_force_fallback) need_fallback = true;
 #endif
     if (!need_fallback) fs_xattr_read_gap(fs, ebr);
 
@@ -7089,8 +7088,8 @@ static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             return STM_ENOMEM;
         }
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-        if (listxattr_fallback_hook)
-            listxattr_fallback_hook(listxattr_fallback_hook_arg);
+        if (fs->listxattr_fallback_hook)
+            fs->listxattr_fallback_hook(fs->listxattr_fallback_hook_arg);
 #endif
         ls2 = stm_xattr_list(xidx, dataset_id, ino, batch, n_total, &got);
         stm_inode_unpin(iidx, h);

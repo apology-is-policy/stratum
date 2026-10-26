@@ -69,10 +69,10 @@ stm_status stm_fs_test_clear_pool_serial(const char *path);
  * Make stm_fs_listxattr take its SH fallback whatever its lockless legs
  * answer, and call `fn` (when not NULL) between the fallback's count and
  * materialize passes, with fs->global SH and the inode's shared pin held.
- * false / NULL restore it. Set it only while no listxattr runs.
+ * false / NULL restore it. Set it only while no listxattr runs on `fs`.
  */
 typedef void (*stm_fs_listxattr_fallback_hook)(void *arg);
-void stm_fs_set_listxattr_fallback_for_test(bool force,
+void stm_fs_set_listxattr_fallback_for_test(stm_fs *fs, bool force,
                                             stm_fs_listxattr_fallback_hook fn,
                                             void *arg);
 
@@ -102,7 +102,7 @@ void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
 /*
  * Make the next inode free that unlink, rmdir, rename over an existing
  * name or unlink_anon attempts answer `fail` instead, leaving the inode
- * as it was. One-shot; STM_OK disarms. This, the two above and the two
+ * as it was. One-shot; STM_OK disarms. This, the three above and the two
  * below belong to `fs` and go with it at unmount.
  */
 void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);

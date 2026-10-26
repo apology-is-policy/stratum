@@ -12265,11 +12265,11 @@ STM_TEST(fs_listxattr_fallback_stays_whole_beside_an_unlink) {
     lx_unlink_arg a = { .fs = fs, .dir = dir, .started = false,
                         .done_between = false, .rc = STM_EINVAL };
     atomic_store(&a.done, 0);
-    stm_fs_set_listxattr_fallback_for_test(true, lx_between_passes, &a);
+    stm_fs_set_listxattr_fallback_for_test(fs, true, lx_between_passes, &a);
     uint8_t names[64];
     size_t total = 0;
     stm_status s = stm_fs_listxattr(fs, 1, f, names, sizeof names, &total);
-    stm_fs_set_listxattr_fallback_for_test(false, NULL, NULL);
+    stm_fs_set_listxattr_fallback_for_test(fs, false, NULL, NULL);
     STM_ASSERT_TRUE(a.started);
     if (a.started) pthread_join(a.thread, NULL);
 
