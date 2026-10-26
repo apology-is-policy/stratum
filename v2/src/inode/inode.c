@@ -111,10 +111,11 @@ typedef struct {
     uint64_t  freed_scan_lo;
     /* What a snapshot rollback leaves behind for the rest of the mount
      * (stm_inode_dsstate_raise_floors): one past every si_gen and
-     * si_cvers the discarded tree held. A reuse stamps a gen of at least
-     * gen_floor and every cvers stamp is at least cvers_floor, so no
-     * (ino, si_gen) a 9P fid may still hold and no (ino, si_cvers) a
-     * Larder entry may still hold is issued again (inode.tla Rollback).
+     * si_cvers the discarded tree held, and next_ino past every ino it
+     * held. A reuse stamps a gen of at least gen_floor and every cvers
+     * stamp is at least cvers_floor, so no (ino, si_gen) a 9P fid may
+     * still hold and no (ino, si_cvers) a Larder entry may still hold is
+     * issued again (inode.tla Rollback).
      * Both holders die with the 9P session, which a remount ends, so RAM
      * is enough. 0 until a rollback; monotone; the re-seed keeps them. */
     uint64_t  gen_floor;
@@ -1439,6 +1440,12 @@ stm_status stm_inode_dsstate_raise_floors(stm_inode_index *idx,
     }
     in_seed_ctx c;
     stm_status rc = in_scan_dsstate_locked(idx, s, &c);
+    /* A mount that has not allocated in the dataset yet holds no seed:
+     * next_ino is still 1 and the re-seed would take its high-water from
+     * the rolled-back tree alone, making FRESH again (at gen 0) every ino
+     * only the discarded tree held. */
+    if (rc == STM_OK && c.max_ino_plus_one > s->next_ino)
+        s->next_ino = c.max_ino_plus_one;
     if (rc == STM_OK && c.any) {
         uint64_t g = c.max_gen == UINT64_MAX ? UINT64_MAX : c.max_gen + 1u;
         if (g > s->gen_floor) s->gen_floor = g;
@@ -1456,7 +1463,8 @@ void stm_inode_dsstate_invalidate(stm_inode_index *idx, uint64_t dataset_id) {
     /* seeded=false alone: the next alloc-shaped op re-runs
      * in_seed_dsstate_locked, which recomputes freed_count /
      * freed_scan_lo exactly from the LIVE tree and takes MAX with the
-     * in-RAM next_ino — the high-water mark deliberately survives the
+     * in-RAM next_ino, which raise_floors lifted past every ino of the
+     * discarded tree -- the high-water mark deliberately survives the
      * rollback, so no ino the discarded tree issued is ever FRESH again.
      * An ino the rolled-back tree holds FREED is reused, though, and the
      * floors raised before the swap keep its new gen and cvers past

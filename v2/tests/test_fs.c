@@ -13103,4 +13103,77 @@ STM_TEST(fs_lockless_xattr_reads_answer_for_the_inode_they_found) {
     reuse_fs_done(fs);
 }
 
+/* A rollback in a mount that had not allocated in the dataset yet (so
+ * held no allocator seed): the file the discarded tree held above the
+ * snapshot's highest ino keeps its identity to itself. The next create
+ * gets another ino, a holder of the old (ino, gen) is refused, and the
+ * old file's lock refuses nothing. `seed_first` allocates before the
+ * rollback, the shape every other rollback test has. */
+static void rollback_unseeded_leg(bool seed_first)
+{
+    make_tmp(seed_first ? "rb_seeded" : "rb_unseeded");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t dir = 0, keep = 0, x = 0, snap = 0;
+    STM_ASSERT_OK(stm_inode_alloc(stm_sync_inode_index(stm_fs_sync(fs)), 1,
+                                     (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"keep", 4,
+                                        0644u, 0, 0, &keep));
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &snap));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                        0644u, 0, 0, &x));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, x, 0, "OLD-X-SECRET", 12));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t xi = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"x", 1, &xi));
+    STM_ASSERT_EQ(xi, x);
+    uint64_t gx = ident_gen(fs, xi);
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, xi, 777u, STM_FS_LOCK_EXCLUSIVE, 0, 0));
+    if (seed_first) {
+        uint64_t t = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"t", 1,
+                                            0644u, 0, 0, &t));
+    }
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap, false));
+
+    uint64_t y = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"y", 1,
+                                        0644u, 0, 0, &y));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, y, 0, "NEW-Y-DATA!!", 12));
+    STM_ASSERT_TRUE(y != xi);
+    uint8_t buf[16] = {0};
+    size_t got = 0;
+    STM_ASSERT_ERR(stm_fs_read_if_gen(fs, 1, xi, gx, 0, buf, sizeof buf, &got),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_write_if_gen(fs, 1, xi, gx, 0, "STALE!", 6),
+                   STM_ESTALE);
+    bool grant = false;
+    uint64_t who = 99;
+    STM_ASSERT_OK(stm_fs_lock_test(fs, 1, y, 202u, STM_FS_LOCK_EXCLUSIVE,
+                                      0, 0, &grant, &who));
+    STM_ASSERT_TRUE(grant);
+    memset(buf, 0, sizeof buf);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, y, 0, buf, 12, &got));
+    STM_ASSERT_EQ(got, (size_t)12);
+    STM_ASSERT_EQ(memcmp(buf, "NEW-Y-DATA!!", 12), 0);
+    STM_ASSERT_OK(stm_fs_release_lock_owner(fs, 777u));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_rollback_in_an_unseeded_mount_never_reissues_a_discarded_ino) {
+    rollback_unseeded_leg(false);
+    rollback_unseeded_leg(true);
+}
+
 STM_TEST_MAIN("fs")

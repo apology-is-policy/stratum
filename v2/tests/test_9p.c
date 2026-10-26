@@ -6029,4 +6029,88 @@ STM_TEST(p9_dotdot_to_a_gone_connection_root_answers_estale) {
     bind_fix_down(&bf);
 }
 
+/* A fid opened in a mount that has not allocated in the dataset, on a
+ * file a rollback discards: the first create after the rollback must not
+ * hand the fid's (ino, gen) to the new file, so the fid answers Rlerror
+ * for both read and write and the new file keeps its bytes. `seed_first`
+ * allocates before the rollback (the seeded shape). */
+static void p9_rollback_unseeded_leg(bool seed_first)
+{
+    make_tmp(seed_first ? "p9_rb_seeded" : "p9_rb_unseeded");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0, keep = 0, x = 0, snap = 0;
+    p9_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"keep", 4,
+                                        0644u, 0, 0, &keep));
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &snap));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"x", 1,
+                                        0644u, 0, 0, &x));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, x, 0, "OLD-X-SECRET", 12));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz = 0;
+    const char *nx[] = { "x" };
+    sz = build_twalk(req, 2, 100, 101, 1, nx);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    sz = build_tlopen(req, 3, 101, STM_9P_O_RDWR);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    sz = build_tread(req, 4, 101, 0, 12);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+    STM_ASSERT_EQ(memcmp(resp + 11, "OLD-X-SECRET", 12), 0);
+    if (seed_first) {
+        uint64_t t = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"t", 1,
+                                            0644u, 0, 0, &t));
+    }
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap, false));
+
+    sz = build_twalk(req, 5, 100, 102, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    sz = build_tlcreate(req, 6, 102, "y", STM_9P_O_RDWR, 0644, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    sz = build_twrite(req, 7, 102, 0, "NEW-Y-OWNER!", 12);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+
+    sz = build_tread(req, 8, 101, 0, 12);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    sz = build_twrite(req, 9, 101, 0, "STALE-WRITE!", 12);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    sz = build_tread(req, 10, 102, 0, 12);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 12u);
+    STM_ASSERT_EQ(memcmp(resp + 11, "NEW-Y-OWNER!", 12), 0);
+
+    free(req);
+    free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_stale_fid_stays_stale_across_a_rollback_in_an_unseeded_mount) {
+    p9_rollback_unseeded_leg(false);
+    p9_rollback_unseeded_leg(true);
+}
+
 STM_TEST_MAIN("9p")
