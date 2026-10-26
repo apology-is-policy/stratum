@@ -1728,4 +1728,43 @@ STM_TEST(inode_cvers_reuse_is_monotonic) {
     inode_test_idx_close(idx);
 }
 
+/* The rollback floors hold at the reuse itself, before any stm_inode_set:
+ * a reuse after stm_inode_dsstate_raise_floors starts past the largest gen
+ * and cvers the scanned tree held, not at its own prior + 1. */
+STM_TEST(inode_reuse_after_raise_floors_starts_past_both_floors) {
+    stm_inode_index *idx = inode_test_idx();
+
+    uint64_t b = 0, a = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 4, 0100644, 0, 0, &b));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 4, 0100644, 0, 0, &a));
+    for (int i = 0; i < 3; i++) {                       /* a: gen 3, cvers 3 */
+        uint64_t again = 0;
+        STM_ASSERT_OK(stm_inode_free(idx, 4, a));
+        STM_ASSERT_OK(stm_inode_alloc(idx, 4, 0100644, 0, 0, &again));
+        STM_ASSERT_EQ(again, a);
+    }
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 4, a, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)3);
+    for (int m = 0; m < 4; m++) {                       /* a: cvers 7 */
+        v.si_mode = stm_store_le32((m & 1) ? 0100640u : 0100600u);
+        STM_ASSERT_OK(stm_inode_set(idx, 4, a, &v));
+        STM_ASSERT_OK(stm_inode_lookup(idx, 4, a, &v));
+    }
+    uint32_t a_cvers = stm_load_le32(v.si_cvers);
+    STM_ASSERT_EQ(a_cvers, (uint32_t)7);
+    STM_ASSERT_OK(stm_inode_free(idx, 4, b));           /* FREED, gen 0, cvers 0 */
+    STM_ASSERT_OK(stm_inode_dsstate_raise_floors(idx, 4));
+
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 4, 0100644, 0, 0, &r));
+    STM_ASSERT_EQ(r, b);
+    struct stm_inode_value rv = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 4, r, &rv));
+    STM_ASSERT_EQ(stm_load_le64(rv.si_gen), (uint64_t)4);
+    STM_ASSERT_EQ(stm_load_le32(rv.si_cvers), a_cvers + 1u);
+
+    inode_test_idx_close(idx);
+}
+
 STM_TEST_MAIN("test_inode")

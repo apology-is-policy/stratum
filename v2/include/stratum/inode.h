@@ -736,15 +736,36 @@ stm_status stm_inode_next_ino(const stm_inode_index *idx,
  * Area-D F2" closure from phase-9.8-design.md 5.1.1).
  *
  * next_ino itself stays MONOTONE across the re-seed (the seed takes
- * max with the in-RAM value): a rollback never re-issues an ino the
- * discarded tree handed out, so a stale fid/qid held across the
- * rollback can never alias a recycled ino. The re-seed makes the
- * freed_count / freed_scan_lo reuse gate exact again.
+ * max with the in-RAM value): a rollback never makes an ino the
+ * discarded tree handed out FRESH again. An ino the rolled-back tree
+ * holds FREED is reused as usual; stm_inode_dsstate_raise_floors, run
+ * before the swap, keeps that reuse from re-issuing an identity. The
+ * re-seed makes the freed_count / freed_scan_lo reuse gate exact again.
  *
  * A dataset with no cached seed is a no-op. NULL idx / dataset_id 0
  * are no-ops (nothing to invalidate).
  */
 void stm_inode_dsstate_invalidate(stm_inode_index *idx, uint64_t dataset_id);
+
+/*
+ * Run just before an engine-root swap discards a dataset's tree (the
+ * snapshot rollback): scans that tree's INODE subspace and raises the
+ * dataset's floors past the largest si_gen and si_cvers any record in it
+ * holds. For the rest of the mount a reuse stamps si_gen >= the gen
+ * floor and every si_cvers stamp (reuse or stm_inode_set) is >= the
+ * cvers floor, so no (ino, si_gen) or (ino, si_cvers) the discarded tree
+ * issued, which a live 9P fid or a Larder entry may still hold, is
+ * issued again. The floors live in RAM only (a remount ends the 9P
+ * sessions that hold either) and only ever rise. A tree with no records
+ * raises nothing.
+ *
+ * Returns STM_EINVAL on NULL idx / dataset_id 0 / no dataset index,
+ * STM_ENOMEM, or the scan's error (STM_EBUSY past the retry bound,
+ * STM_ECORRUPT on a bad record); on any error the floors are unchanged.
+ */
+STM_MUST_USE
+stm_status stm_inode_dsstate_raise_floors(stm_inode_index *idx,
+                                         uint64_t dataset_id);
 
 /* ========================================================================= */
 /* Persistence (9.7-impl-1c-ii: per-dataset metadata-tree engines).            */

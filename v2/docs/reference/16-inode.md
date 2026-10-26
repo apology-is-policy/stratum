@@ -248,12 +248,34 @@ only) so the next alloc-shaped op re-seeds from the LIVE engine.
 Called by fs.c after an engine-root swap (`stm_fs_rollback_snapshot` /
 the snapshot-clone) discards the tree the seed was derived from.
 `next_ino` deliberately stays monotone across the re-seed (the seed
-takes max with the in-RAM value — a stale fid/qid held across a
-rollback can never alias a recycled ino); `freed_count` /
+takes max with the in-RAM value), so an ino the discarded tree issued
+is never fresh again; `freed_count` /
 `freed_scan_lo` re-derive exactly, so the reuse gate is exact again
 (pre-9b a post-rollback create could silently skip a FREED slot the
 rolled-back tree holds, or scan for one it lacks — both safe-degraded,
 now neither). No-op on NULL idx / ds 0 / no cached slot.
+
+`stm_inode_dsstate_raise_floors(idx, ds)` covers the inos `next_ino`
+does not: one the rolled-back tree holds FREED is reused, and its
+prior gen and cvers are the snapshot's, so before this a reuse after
+the rollback could re-issue an `(ino, si_gen)` and an `(ino, si_cvers)`
+a file created after the snapshot had (a 9P fid bound to that file
+passed `verify_fid_fresh` on the new one, and a Larder entry validated
+against its `qid.version`). The rollback calls it just before
+`set_engine_root`, while the discarded tree is still the live one: one
+pass over the INODE subspace (the seed's scan) records the largest
+`si_gen` and `si_cvers` and raises the dataset's `gen_floor` /
+`cvers_floor` to one past them. For the rest of the mount a reuse
+stamps `max(prior + 1, gen_floor)` and every cvers stamp, at reuse or
+in `stm_inode_set`, `max(cur + 1, cvers_floor)`. The floors are RAM
+only, since both holders (fids and the Larder) belong to a 9P session
+and a remount ends it, and only rise; the re-seed leaves them alone.
+`inode.tla` models it (`TakeSnapshot` / `Rollback`, `inode_rollback.cfg`
+green; `inode_rollback_no_gen_floor_buggy`,
+`inode_rollback_no_cvers_floor_buggy` and
+`inode_rollback_rewinds_next_ino_buggy` each fire their invariant).
+Tests `fs_rollback_never_reissues_a_discarded_identity`,
+`p9_stale_fid_stays_stale_across_a_rollback`.
 
 ### Persistence
 

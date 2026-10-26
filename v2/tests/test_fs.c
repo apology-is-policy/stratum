@@ -12270,4 +12270,71 @@ STM_TEST(fs_freed_inode_takes_its_locks_with_it) {
     reuse_fs_done(fs);
 }
 
+static uint64_t ident_gen(stm_fs *fs, uint64_t ino)
+{
+    struct stm_inode_value iv = {0};
+    if (stm_fs_stat(fs, 1, ino, &iv) != STM_OK) return UINT64_MAX;
+    return stm_load_le64(iv.si_gen);
+}
+
+static uint32_t ident_cvers(stm_fs *fs, uint64_t ino)
+{
+    struct stm_inode_value iv = {0};
+    if (stm_fs_stat(fs, 1, ino, &iv) != STM_OK) return UINT32_MAX;
+    return stm_load_le32(iv.si_cvers);
+}
+
+/* A rollback discards the files the snapshot never had, not what clients
+ * still hold of them. An ino freed in the snapshot and reused after the
+ * rollback gets a gen and a cvers no discarded file had (else a stale fid
+ * reaches the new file and a Larder entry validates against it), and a
+ * file that survives the rollback moves its cvers past every version it
+ * reached before it. */
+STM_TEST(fs_rollback_never_reissues_a_discarded_identity) {
+    make_tmp("rollback_ident");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t dir = 0, a = 0, b = 0, c = 0, d = 0;
+    STM_ASSERT_OK(stm_inode_alloc(stm_sync_inode_index(stm_fs_sync(fs)), 1,
+                                  (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"d", 1,
+                                     0644u, 0, 0, &d));
+    static const uint8_t w[] = "0123456789";
+    STM_ASSERT_OK(stm_fs_write(fs, 1, d, 0, w, sizeof w));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"a", 1,
+                                     0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"a", 1));
+    uint64_t snap = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &snap));
+
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"b", 1,
+                                     0644u, 0, 0, &b));
+    STM_ASSERT_EQ(b, a);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, b, 0, w, sizeof w));
+    uint64_t gb = ident_gen(fs, b);
+    uint32_t cb = ident_cvers(fs, b);
+    for (int i = 0; i < 3; i++)
+        STM_ASSERT_OK(stm_fs_write(fs, 1, d, (uint64_t)i, w, sizeof w));
+    uint32_t cd = ident_cvers(fs, d);
+
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap, false));
+    STM_ASSERT_TRUE(ident_cvers(fs, d) < cd);
+
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1,
+                                     0644u, 0, 0, &c));
+    STM_ASSERT_EQ(c, b);
+    STM_ASSERT_TRUE(ident_gen(fs, c) > gb);
+    STM_ASSERT_TRUE(ident_cvers(fs, c) > cb);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, d, 0, w, sizeof w));
+    STM_ASSERT_TRUE(ident_cvers(fs, d) > cd);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

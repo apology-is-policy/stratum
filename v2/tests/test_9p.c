@@ -4892,4 +4892,79 @@ STM_TEST(p9_qid_version_tracks_content_not_gen) {
     unlink(g_key_path);
 }
 
+/* A fid opened on a file created after a snapshot stays stale once a
+ * rollback discards that file, even after a new file reuses its ino: the
+ * reuse gets a gen the fid never held (Rlerror ESTALE, not the new file's
+ * bytes) and a qid.version above any the discarded file showed, so a guest
+ * cache keyed on qid.path cannot take the new file for the old one. */
+STM_TEST(p9_stale_fid_stays_stale_across_a_rollback) {
+    make_tmp("9p_rollback_stale");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz = 0;
+
+    /* "a" is created and unlinked before the snapshot: its ino is FREED
+     * in the snapshot's tree. */
+    sz = build_twalk(req, 2, 100, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tlcreate(req, 3, 101, "a", STM_9P_O_RDWR, 0644, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    sz = build_tclunk(req, 4, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tunlinkat(req, 5, 100, "a", 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RUNLINKAT);
+    uint64_t snap = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &snap));
+
+    /* "b" reuses that ino and is written; fid 102 stays open on it. */
+    sz = build_twalk(req, 6, 100, 102, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tlcreate(req, 7, 102, "b", STM_9P_O_RDWR, 0644, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    uint64_t qpath_b = load_u64(resp + 7 + 5);
+    sz = build_twrite(req, 8, 102, 0, "B-SECRET", 8);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    sz = build_tgetattr(req, 9, 102, STM_9P_GETATTR_ALL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETATTR);
+    uint32_t qv_b = load_u32(resp + 7 + 8 + 1);
+
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap, false));
+
+    /* "c" reuses the same ino after the rollback. */
+    sz = build_twalk(req, 10, 100, 103, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tlcreate(req, 11, 103, "c", STM_9P_O_RDWR, 0644, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+    STM_ASSERT_EQ(load_u64(resp + 7 + 5), qpath_b);
+    STM_ASSERT_TRUE(load_u32(resp + 7 + 1) > qv_b);
+    sz = build_twrite(req, 12, 103, 0, "C-DATA!!", 8);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+
+    sz = build_tread(req, 13, 102, 0, 8);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ESTALE);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("9p")

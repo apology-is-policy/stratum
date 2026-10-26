@@ -123,10 +123,29 @@ CONSTANTS
                                    \*   guest-cache-collision bug (a reused
                                    \*   ino aliases a prior incarnation's
                                    \*   cached content-version).
-    BuggyContentMutateBumpsGen     \* TRUE → ContentMutate bumps gen too —
+    BuggyContentMutateBumpsGen,    \* TRUE → ContentMutate bumps gen too —
                                    \*   the fid-ESTALE-on-own-write bug.
                                    \*   Caught by AllocatedReflectedInHistory
                                    \*   (gen moves with no history stamp).
+    \* ── Snapshot rollback (PX-10) ──────────────────────────────────────
+    EnableRollbackModel,           \* TRUE → TakeSnapshot / Rollback join
+                                   \*   Next. A rollback restores every
+                                   \*   ino's state, gen, nlink and cvers
+                                   \*   to the snapshot's, while history
+                                   \*   and cvers_history (what live
+                                   \*   clients may hold) are kept. FALSE
+                                   \*   → the rollback vars stay at Init.
+    BuggyRollbackNoGenFloor,       \* TRUE → Rollback does not raise
+                                   \*   gen_floor: a reuse after it
+                                   \*   re-issues a discarded (ino, gen).
+    BuggyRollbackNoCversFloor,     \* TRUE → Rollback does not raise
+                                   \*   cvers_floor: a reuse or a
+                                   \*   mutation re-stamps a discarded
+                                   \*   (ino, cvers).
+    BuggyRollbackRewindsNextIno    \* TRUE → AllocFresh may pick an ino
+                                   \*   the snapshot never used but the
+                                   \*   discarded state did (next_ino
+                                   \*   rewound with the tree).
 
 ASSUME /\ Inos # {}
        /\ MaxGen \in Nat /\ MaxGen >= 1
@@ -145,6 +164,13 @@ ASSUME /\ Inos # {}
        /\ MaxCvers \in Nat /\ MaxCvers >= 1
        /\ BuggyCversResetOnReuse \in BOOLEAN
        /\ BuggyContentMutateBumpsGen \in BOOLEAN
+       /\ EnableRollbackModel \in BOOLEAN
+       /\ BuggyRollbackNoGenFloor \in BOOLEAN
+       /\ BuggyRollbackNoCversFloor \in BOOLEAN
+       /\ BuggyRollbackRewindsNextIno \in BOOLEAN
+       \* The rollback model restores the identity state only (state, gen,
+       \* nlink, cvers); the inline and orphan shadows are not snapshotted.
+       /\ EnableRollbackModel => (~EnableInlineDataModel /\ ~EnableOrphanModel)
 
 \* Inode states.
 NEVER_USED == "never_used"
@@ -250,11 +276,23 @@ VARIABLES
                                    \*   stamped at each content-defining
                                    \*   event; CversUniqueAllTime asserts no
                                    \*   cvers value is ever stamped twice.
-    cvers_event_counter            \* monotonic event id for cvers stamps.
+    cvers_event_counter,           \* monotonic event id for cvers stamps.
+    snap,                          \* the one snapshot slot: a record of
+                                   \*   state / gen / nlink / cvers.
+    snap_taken,                    \* BOOLEAN: snap holds a snapshot.
+    gen_floor,                     \* lowest gen a reuse may stamp:
+                                   \*   raised past every gen the state a
+                                   \*   rollback discards held (inode.c's
+                                   \*   dsstate gen_floor). 0 = none.
+    cvers_floor                    \* lowest cvers a reuse or mutation
+                                   \*   may stamp, raised the same way.
 
 vars == <<state, gen, nlink, history, alloc_event_counter,
           data_kind, data_len, ever_extent, ever_linked,
-          cvers, cvers_history, cvers_event_counter>>
+          cvers, cvers_history, cvers_event_counter,
+          snap, snap_taken, gen_floor, cvers_floor>>
+
+rollback_vars == <<snap, snap_taken, gen_floor, cvers_floor>>
 
 \* L1/Larder content-version shadow vars — every non-cvers action leaves
 \* them UNCHANGED; only AllocFresh / AllocReused / ContentMutate touch them.
@@ -277,6 +315,13 @@ Init ==
     /\ cvers               = [i \in Inos |-> 0]
     /\ cvers_history       = [i \in Inos |-> {}]
     /\ cvers_event_counter = 0
+    /\ snap        = [state |-> [i \in Inos |-> NEVER_USED],
+                      gen   |-> [i \in Inos |-> 0],
+                      nlink |-> [i \in Inos |-> 0],
+                      cvers |-> [i \in Inos |-> 0]]
+    /\ snap_taken  = FALSE
+    /\ gen_floor   = 0
+    /\ cvers_floor = 0
 
 \* --------------------------------------------------------------------------
 \* Helpers.
@@ -290,6 +335,11 @@ FreedSet == {i \in Inos : state[i] = FREED}
 
 \* The set of NEVER_USED inos.
 NeverUsedSet == {i \in Inos : state[i] = NEVER_USED}
+
+Max(a, b) == IF a >= b THEN a ELSE b
+
+\* The largest value a per-ino function takes.
+MaxOver(f) == CHOOSE m \in {f[i] : i \in Inos} : \A i \in Inos : f[i] <= m
 
 \* --------------------------------------------------------------------------
 \* Actions.
@@ -308,6 +358,12 @@ AllocFresh(i) ==
     /\ \/ state[i] = NEVER_USED
        \/ /\ BuggyDoubleAllocate
           /\ state[i] = ALLOCATED
+    \* PX-10: next_ino is a high-water mark a rollback does not rewind
+    \* (inode.c in_seed_dsstate_locked takes the max), so an ino the
+    \* discarded state issued is never fresh again. Without a rollback a
+    \* NEVER_USED ino has an empty history, so this guard is a no-op.
+    /\ (EnableRollbackModel /\ ~BuggyRollbackRewindsNextIno) =>
+           history[i] = {}
     /\ gen[i] + 0 <= MaxGen
     /\ state'               = [state EXCEPT ![i] = ALLOCATED]
     /\ gen'                 = [gen   EXCEPT ![i] = 0]
@@ -350,7 +406,7 @@ AllocReused(i) ==
     /\ state[i] = FREED
     /\ LET new_gen ==
             IF BuggyReuseNoGenBump THEN gen[i]
-            ELSE gen[i] + 1
+            ELSE Max(gen[i] + 1, gen_floor)
        IN
         /\ new_gen <= MaxGen
         /\ state'               = [state EXCEPT ![i] = ALLOCATED]
@@ -379,7 +435,8 @@ AllocReused(i) ==
         \* to 0 — the collision bug (CversUniqueAllTime fires).
         /\ \/ /\ EnableCversModel
               /\ LET new_cvers ==
-                       IF BuggyCversResetOnReuse THEN 0 ELSE cvers[i] + 1
+                       IF BuggyCversResetOnReuse THEN 0
+                       ELSE Max(cvers[i] + 1, cvers_floor)
                  IN
                   /\ new_cvers <= MaxCvers
                   /\ cvers'               = [cvers EXCEPT ![i] = new_cvers]
@@ -704,13 +761,14 @@ FreeAnon(i) ==
 ContentMutate(i) ==
     /\ EnableCversModel
     /\ state[i] = ALLOCATED
-    /\ cvers[i] < MaxCvers
-    /\ cvers'               = [cvers EXCEPT ![i] = cvers[i] + 1]
-    /\ cvers_event_counter' = cvers_event_counter + 1
-    /\ cvers_history'       = [cvers_history EXCEPT
-                                  ![i] = cvers_history[i] \cup
-                                          {<<cvers[i] + 1,
-                                             cvers_event_counter + 1>>}]
+    /\ LET new_cvers == Max(cvers[i] + 1, cvers_floor) IN
+        /\ new_cvers <= MaxCvers
+        /\ cvers'               = [cvers EXCEPT ![i] = new_cvers]
+        /\ cvers_event_counter' = cvers_event_counter + 1
+        /\ cvers_history'       = [cvers_history EXCEPT
+                                      ![i] = cvers_history[i] \cup
+                                              {<<new_cvers,
+                                                 cvers_event_counter + 1>>}]
     /\ gen' = IF BuggyContentMutateBumpsGen /\ gen[i] < MaxGen
               THEN [gen EXCEPT ![i] = gen[i] + 1]
               ELSE gen
@@ -718,10 +776,48 @@ ContentMutate(i) ==
                     data_kind, data_len, ever_extent, ever_linked>>
 
 \* --------------------------------------------------------------------------
+\* PX-10 — snapshot rollback.
+\*
+\* TakeSnapshot copies the identity state into the one snapshot slot.
+\* Rollback puts it back (stm_fs_rollback_snapshot swaps the dataset's
+\* tree root), but history and cvers_history stay: a 9P client may still
+\* hold any fid or cached qid.version the discarded state issued. Healthy,
+\* the rollback first raises gen_floor and cvers_floor past every value
+\* the discarded state holds (stm_inode_dsstate_raise_floors scans the
+\* live tree before the swap), and AllocReused / ContentMutate stamp at
+\* least the floor, so nothing discarded is ever stamped again. Per ino,
+\* gen and cvers only grow between rollbacks, so the discarded state's
+\* values bound everything issued since the last one, and the floors are
+\* monotone across rollbacks.
+\* --------------------------------------------------------------------------
+TakeSnapshot ==
+    /\ snap'       = [state |-> state, gen |-> gen, nlink |-> nlink,
+                      cvers |-> cvers]
+    /\ snap_taken' = TRUE
+    /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter,
+                    data_kind, data_len, ever_extent, ever_linked,
+                    cvers, cvers_history, cvers_event_counter,
+                    gen_floor, cvers_floor>>
+
+Rollback ==
+    /\ snap_taken
+    /\ state'  = snap.state
+    /\ gen'    = snap.gen
+    /\ nlink'  = snap.nlink
+    /\ cvers'  = snap.cvers
+    /\ gen_floor'   = IF BuggyRollbackNoGenFloor THEN gen_floor
+                      ELSE Max(gen_floor, MaxOver(gen) + 1)
+    /\ cvers_floor' = IF BuggyRollbackNoCversFloor THEN cvers_floor
+                      ELSE Max(cvers_floor, MaxOver(cvers) + 1)
+    /\ UNCHANGED <<history, alloc_event_counter, data_kind, data_len,
+                    ever_extent, ever_linked, cvers_history,
+                    cvers_event_counter, snap, snap_taken>>
+
+\* --------------------------------------------------------------------------
 \* Next.
 \* --------------------------------------------------------------------------
 
-Next ==
+Step ==
     \/ \E i \in Inos : AllocFresh(i)
     \/ \E i \in Inos : AllocReused(i)
     \/ \E i \in Inos : Link(i)
@@ -738,6 +834,10 @@ Next ==
           \/ \E i \in Inos : FreeAnon(i)
     \/ /\ EnableCversModel
        /\ \E i \in Inos : ContentMutate(i)
+
+Next ==
+    \/ Step /\ UNCHANGED rollback_vars
+    \/ EnableRollbackModel /\ (TakeSnapshot \/ Rollback)
 
 Spec == Init /\ [][Next]_vars
 
@@ -760,6 +860,9 @@ TypeOK ==
     /\ cvers_event_counter \in Nat
     /\ \A i \in Inos :
            cvers_history[i] \subseteq ((0..MaxCvers) \X (0..cvers_event_counter))
+    /\ snap_taken \in BOOLEAN
+    /\ gen_floor \in 0..(MaxGen + 1)
+    /\ cvers_floor \in 0..(MaxCvers + 1)
 
 \* HEADLINE INVARIANT — (ino, gen) uniqueness across all time.
 \*

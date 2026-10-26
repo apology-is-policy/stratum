@@ -109,6 +109,16 @@ typedef struct {
      * to the consumed ino on reuse. Only meaningful when freed_count > 0
      * (else the scan is gated off). */
     uint64_t  freed_scan_lo;
+    /* What a snapshot rollback leaves behind for the rest of the mount
+     * (stm_inode_dsstate_raise_floors): one past every si_gen and
+     * si_cvers the discarded tree held. A reuse stamps a gen of at least
+     * gen_floor and every cvers stamp is at least cvers_floor, so no
+     * (ino, si_gen) a 9P fid may still hold and no (ino, si_cvers) a
+     * Larder entry may still hold is issued again (inode.tla Rollback).
+     * Both holders die with the 9P session, which a remount ends, so RAM
+     * is enough. 0 until a rollback; monotone; the re-seed keeps them. */
+    uint64_t  gen_floor;
+    uint64_t  cvers_floor;
 } stm_inode_dsstate;
 
 /* P9.5-PARALLEL-3 impl-1: per-inode lock slot. Refcounted; lives in a
@@ -200,7 +210,18 @@ static stm_inode_dsstate *get_or_create_dsstate(stm_inode_index *idx,
     s->seeded        = false;
     s->freed_count   = 0u;
     s->freed_scan_lo = 1u;        /* lowest valid ino */
+    s->gen_floor     = 0u;
+    s->cvers_floor   = 0u;
     return s;
+}
+
+/* The content-version a stamp after `cur` takes: one more, and never
+ * below the dataset's rollback floor. The cast keeps the u32 wrap. */
+static uint32_t in_cvers_next(const stm_inode_dsstate *s, uint32_t cur)
+{
+    uint64_t want = (uint64_t)cur + 1u;
+    if (s && want < s->cvers_floor) want = s->cvers_floor;
+    return (uint32_t)want;
 }
 
 /* ------------------------------------------------------------------ */
@@ -578,6 +599,9 @@ typedef struct {
     uint64_t   max_ino_plus_one;   /* next_ino candidate */
     uint64_t   freed_count;        /* FREED records seen during the seed scan */
     uint64_t   min_freed;          /* lowest FREED ino (UINT64_MAX if none) */
+    bool       any;                /* at least one record */
+    uint64_t   max_gen;            /* largest si_gen of any record */
+    uint32_t   max_cvers;          /* largest si_cvers of any record */
     stm_status err;
 } in_seed_ctx;
 
@@ -601,6 +625,11 @@ static int in_seed_cb(const void *k, size_t klen,
         c->freed_count++;
         if (ino < c->min_freed) c->min_freed = ino;
     }
+    uint64_t g  = stm_load_le64(val.si_gen);
+    uint32_t cv = stm_load_le32(val.si_cvers);
+    if (!c->any || g > c->max_gen)    c->max_gen   = g;
+    if (!c->any || cv > c->max_cvers) c->max_cvers = cv;
+    c->any = true;
     return 0;
 }
 
@@ -615,8 +644,27 @@ static int in_seed_cb(const void *k, size_t klen,
  * not hold serial_mu under the pool (see in_find_freed). The dsstate
  * fields are written only after a fully-clean walk, so an EBUSY'd
  * attempt leaves s untouched (still !seeded — the next alloc re-seeds). */
+static stm_status in_scan_dsstate_locked(stm_inode_index *idx,
+                                         const stm_inode_dsstate *s,
+                                         in_seed_ctx *out);
+
 static stm_status in_seed_dsstate_locked(stm_inode_index *idx,
                                          stm_inode_dsstate *s) {
+    in_seed_ctx c;
+    stm_status ss = in_scan_dsstate_locked(idx, s, &c);
+    if (ss != STM_OK) return ss;
+    s->next_ino      = c.max_ino_plus_one;
+    s->freed_count   = c.freed_count;
+    s->freed_scan_lo = (c.freed_count > 0u) ? c.min_freed : 1u;
+    s->seeded        = true;
+    return STM_OK;
+}
+
+/* One clean pass over the dataset's INODE subspace into *out (the seed's
+ * scan; the rollback floors read the same pass). Caller holds idx->lock. */
+static stm_status in_scan_dsstate_locked(stm_inode_index *idx,
+                                         const stm_inode_dsstate *s,
+                                         in_seed_ctx *out) {
     stm_btree_engine *eng = NULL;
     stm_status es = in_get_engine_locked(idx, s->dataset_id, &eng);
     if (es != STM_OK) return es;
@@ -636,6 +684,7 @@ static stm_status in_seed_dsstate_locked(stm_inode_index *idx,
         c = (in_seed_ctx){ .ds = s->dataset_id,
                            .max_ino_plus_one = s->next_ino,
                            .freed_count = 0u, .min_freed = UINT64_MAX,
+                           .any = false, .max_gen = 0u, .max_cvers = 0u,
                            .err = STM_OK };
         stm_ebr_enter(ebr);
         ss = stm_btree_engine_scan_range_concurrent(eng, ebr,
@@ -648,10 +697,7 @@ static stm_status in_seed_dsstate_locked(stm_inode_index *idx,
     }
     if (ss != STM_OK) return ss;
     if (c.err != STM_OK) return c.err;
-    s->next_ino      = c.max_ino_plus_one;
-    s->freed_count   = c.freed_count;
-    s->freed_scan_lo = (c.freed_count > 0u) ? c.min_freed : 1u;
-    s->seeded        = true;
+    *out = c;
     return STM_OK;
 }
 
@@ -807,13 +853,15 @@ static stm_status in_alloc_common(stm_inode_index *idx, uint64_t dataset_id,
 
     if (freed) {
         chosen = freed_ino;
-        in_init_value(&v, dataset_id, chosen, freed_prior_gen + 1u,
+        uint64_t new_gen = freed_prior_gen + 1u;
+        if (new_gen < s->gen_floor) new_gen = s->gen_floor;
+        in_init_value(&v, dataset_id, chosen, new_gen,
                       mode, uid, gid, nlink, flags);
         /* L1/Larder: carry the content-version forward MONOTONICALLY so a
          * reused ino never re-issues a (qid.path, qid.version) pair a guest
          * may still have cached from the prior incarnation. in_init_value's
          * memset seeded cvers=0 (correct for AllocFresh); reuse bumps. */
-        v.si_cvers = stm_store_le32(freed_prior_cvers + 1u);
+        v.si_cvers = stm_store_le32(in_cvers_next(s, freed_prior_cvers));
     } else {
         /* AllocFresh path: ino = next_ino[ds]. UINT64_MAX is reserved
          * as the saturation sentinel (inode.h R69 P3-1). */
@@ -1288,8 +1336,9 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
             rc = STM_OK;
             goto out;
         }
-        candidate.si_cvers =
-            stm_store_le32(stm_load_le32(cur.si_cvers) + 1u);
+        candidate.si_cvers = stm_store_le32(
+            in_cvers_next(find_dsstate(idx, dataset_id),
+                          stm_load_le32(cur.si_cvers)));
         rc = in_engine_put(idx, dataset_id, ino, &candidate);
     }
 
@@ -1375,6 +1424,31 @@ stm_status stm_inode_next_ino(const stm_inode_index *idx,
     return STM_OK;
 }
 
+stm_status stm_inode_dsstate_raise_floors(stm_inode_index *idx,
+                                         uint64_t dataset_id) {
+    if (!idx || dataset_id == 0) return STM_EINVAL;
+    must_lock(idx_lock(idx));
+    if (idx->ds_idx == NULL) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
+    stm_inode_dsstate *s = get_or_create_dsstate(idx, dataset_id);
+    if (!s) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOMEM;
+    }
+    in_seed_ctx c;
+    stm_status rc = in_scan_dsstate_locked(idx, s, &c);
+    if (rc == STM_OK && c.any) {
+        uint64_t g = c.max_gen == UINT64_MAX ? UINT64_MAX : c.max_gen + 1u;
+        if (g > s->gen_floor) s->gen_floor = g;
+        uint64_t cv = (uint64_t)c.max_cvers + 1u;
+        if (cv > s->cvers_floor) s->cvers_floor = cv;
+    }
+    must_unlock(idx_lock(idx));
+    return rc;
+}
+
 void stm_inode_dsstate_invalidate(stm_inode_index *idx, uint64_t dataset_id) {
     if (!idx || dataset_id == 0) return;
     must_lock(idx_lock(idx));
@@ -1383,8 +1457,10 @@ void stm_inode_dsstate_invalidate(stm_inode_index *idx, uint64_t dataset_id) {
      * in_seed_dsstate_locked, which recomputes freed_count /
      * freed_scan_lo exactly from the LIVE tree and takes MAX with the
      * in-RAM next_ino — the high-water mark deliberately survives the
-     * rollback (monotone; no ino the discarded tree issued is ever
-     * re-issued, so a stale fid/qid cannot alias a recycled ino). */
+     * rollback, so no ino the discarded tree issued is ever FRESH again.
+     * An ino the rolled-back tree holds FREED is reused, though, and the
+     * floors raised before the swap keep its new gen and cvers past
+     * anything the discarded tree issued. */
     if (s) s->seeded = false;
     must_unlock(idx_lock(idx));
 }

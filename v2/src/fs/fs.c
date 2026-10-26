@@ -10070,6 +10070,20 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
+    /* The tree the swap below discards issued every si_gen and si_cvers a
+     * live fid or Larder entry may still hold, and the rolled-back tree
+     * knows none of them: raise the dataset's floors past them while the
+     * tree is still here, so no reuse or content bump after the rollback
+     * issues one again. A refusal here is no more destructive than
+     * set_engine_root's below (the drain is non-durable). */
+    s = stm_inode_dsstate_raise_floors(stm_sync_inode_index(fs->sync),
+                                       dataset_id);
+    if (s != STM_OK) {
+        free(newer_ids);
+        pthread_rwlock_unlock(&fs->global);
+        return s;
+    }
+
     /* Swap the dataset entry's triple to the snapshot's (already
      * validated) captured triple. set_engine_root drops the live in-RAM
      * engine so (a) the next get_engine re-opens at the swapped triple
