@@ -11746,4 +11746,81 @@ STM_TEST(fs_create_drops_xattrs_a_reused_ino_still_holds) {
     reuse_fs_done(fs);
 }
 
+/* A freed directory's dirent records go with it, whichever path frees
+ * it: a directory created on the reused ino lists none of the old
+ * whiteouts and holds none of the old tombstones. */
+static void churn_dir(stm_fs *fs, uint64_t d, uint64_t other)
+{
+    char nm[8];
+    for (int i = 0; i < 4; i++) {
+        snprintf(nm, sizeof nm, "t%d", i);
+        uint64_t inner = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, d, (const uint8_t *)nm,
+                                            (uint8_t)strlen(nm), 0644u, 0, 0,
+                                            &inner));
+        STM_ASSERT_OK(stm_fs_unlink(fs, 1, d, (const uint8_t *)nm,
+                                       (uint8_t)strlen(nm)));
+    }
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, d, (const uint8_t *)"secret", 6,
+                                        0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, d, (const uint8_t *)"secret", 6,
+                                other, (const uint8_t *)"moved", 5,
+                                STM_FS_RENAME_WHITEOUT));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, other, (const uint8_t *)"moved", 5));
+}
+
+static void assert_fresh_dir(stm_fs *fs, uint64_t dir, uint64_t parent)
+{
+    stm_fs_dirent_entry e[4];
+    uint64_t cur = 0;
+    size_t n = 99;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, dir, parent,
+                                    STM_FS_READDIR_FLAG_NO_DOTS, &cur, e, 4,
+                                    &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+    /* drop_for_dir counts what it removes: tombstones and whiteouts are
+     * the records readdir does not show. */
+    size_t left = 99;
+    STM_ASSERT_OK(stm_dirent_drop_for_dir(
+        stm_sync_dirent_index(stm_fs_sync(fs)), 1, dir, &left));
+    STM_ASSERT_EQ(left, (size_t)0);
+}
+
+STM_TEST(fs_freed_dir_leaves_no_dirent_records) {
+    uint64_t root = 0;
+    stm_fs *fs = reuse_fs("reuse_dir_records", &root);
+    if (!fs) return;
+    uint64_t other = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"O", 1, 0755u,
+                                  0, 0, &other));
+
+    /* rename over an empty directory frees the one it replaces */
+    uint64_t d = 0, e = 0, g = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"D", 1, 0755u,
+                                  0, 0, &d));
+    churn_dir(fs, d, other);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"E", 1, 0755u,
+                                  0, 0, &e));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, root, (const uint8_t *)"E", 1,
+                                root, (const uint8_t *)"D", 1, 0));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"G", 1, 0755u,
+                                  0, 0, &g));
+    STM_ASSERT_EQ(g, d);
+    assert_fresh_dir(fs, g, root);
+
+    /* rmdir */
+    uint64_t r = 0, h = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"R", 1, 0755u,
+                                  0, 0, &r));
+    churn_dir(fs, r, other);
+    STM_ASSERT_OK(stm_fs_rmdir(fs, 1, root, (const uint8_t *)"R", 1));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"H", 1, 0755u,
+                                  0, 0, &h));
+    STM_ASSERT_EQ(h, r);
+    assert_fresh_dir(fs, h, root);
+
+    reuse_fs_done(fs);
+}
+
 STM_TEST_MAIN("fs")

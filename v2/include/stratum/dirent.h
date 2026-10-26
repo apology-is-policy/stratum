@@ -520,15 +520,13 @@ stm_status stm_dirent_readdir_concurrent(const stm_dirent_index *idx,
                                             size_t *out_returned);
 
 /*
- * Drop EVERY record (live + tombstone) keyed at `(dataset_id, dir_ino,
- * *)`. Used by `stm_fs_rmdir` (P8-POSIX-2b R73 P2-1) to GC the
- * orphan-tombstone trail left by unlinks of the directory's prior
- * children before the directory itself is freed. Without this, a
- * directory with churn (create-then-unlink across many entries)
- * leaves tombstones in the btree that survive the rmdir; if the dir's
- * ino is later AllocReused for a fresh directory, that new directory
- * inherits the old tombstones and burns probe budget walking past
- * them.
+ * Drop EVERY record (live + tombstone + whiteout) keyed at
+ * `(dataset_id, dir_ino, *)`. fs.c calls it before every directory free
+ * (rmdir, rename over an empty directory; P8-POSIX-2b R73 P2-1) to GC
+ * the records an "empty" directory still holds: tombstones left by
+ * unlinks of its prior children, and whiteouts. Without it, a directory
+ * AllocReused at the same ino inherits them: the tombstones burn probe
+ * budget, and readdir lists the whiteouts.
  *
  * Output: `*out_dropped` (optional) is set to the number of records
  * removed (live + tombstone, summed). Pass NULL to ignore.

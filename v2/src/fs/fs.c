@@ -3509,10 +3509,10 @@ stm_status stm_fs_mkdir(stm_fs *fs, uint64_t dataset_id,
 }
 
 /* R128 P1-1 + P1-2: pre-free cleanup helper. Drops the inode's xattrs,
- * the dirty_buffer entry for (ds, ino) AND truncates the inode's extents
- * to 0. Caller MUST hold fs->lock, have looked up `cv`, and be about to
- * free the inode (via stm_inode_unlink-with-cascade OR direct
- * stm_inode_free).
+ * a directory's dirent records, the dirty_buffer entry for (ds, ino) AND
+ * truncates the inode's extents to 0. Caller MUST hold fs->lock, have
+ * looked up `cv`, and be about to free the inode (via
+ * stm_inode_unlink-with-cascade OR direct stm_inode_free).
  *
  * The helper is the load-bearing fix for the audit's P1 class: the
  * dirty buffer is keyed by (dataset_id, ino) ONLY — no si_gen — so
@@ -3552,6 +3552,15 @@ static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs,
                 (int)xs);
     }
     uint32_t cmode = stm_load_le32(cv->si_mode);
+    if ((cmode & (uint32_t)S_IFMT) == (uint32_t)S_IFDIR) {
+        /* An empty directory still holds the tombstones of its former
+         * entries and any whiteouts (readdir lists those), keyed by its
+         * ino alone: a directory reusing the slot would inherit them.
+         * Best-effort, as for rmdir since R73 P2-1. */
+        stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+        if (didx) (void)stm_dirent_drop_for_dir(didx, dataset_id, ino, NULL);
+        return false;
+    }
     bool is_reg = ((cmode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG);
     bool is_extent = (cv->si_data_kind == STM_DATA_EXTENT);
     if (is_reg && is_extent) {
@@ -3844,23 +3853,10 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         return us;
     }
 
-    /* P8-POSIX-2b R73 P2-1: rmdir cleans up every record keyed under
-     * the freed dir's ino — both live (none, by the empty-check above)
-     * and tombstones from prior unlinks of the dir's children. Without
-     * this, a directory with churn (create-then-unlink across many
-     * entries) leaves tombstones in the btree that survive rmdir. If
-     * the dir's ino is later reused via AllocReused (with bumped
-     * si_gen per inode.tla), the new directory inherits the orphan
-     * tombstones and burns probe budget walking past them. The
-     * cleanup is best-effort — a failure leaves the orphan tombstones
-     * behind but doesn't break the rmdir's correctness.
-     *
-     * For directories at P8-POSIX-3: directories themselves should
-     * never have nlink > 1 (POSIX hard-link-on-dir is forbidden), so
-     * unlink-of-dir always cascade-frees on the rmdir path. */
-    if (expect_dir) {
-        (void)stm_dirent_drop_for_dir(didx, dataset_id, child_ino, NULL);
-    }
+    /* P8-POSIX-2b R73 P2-1: a directory never has nlink > 1 (hard links
+     * to directories are refused), so rmdir always reaches the cleanup
+     * helper below, which drops every record keyed under the freed
+     * dir's ino (tombstones of its former children, whiteouts). */
 
     /* SWISS-4q P2: drop the inode's extents BEFORE the inode-unlink
      * cascade-frees the inode. stm_inode_unlink only mutates the

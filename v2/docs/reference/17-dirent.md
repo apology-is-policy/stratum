@@ -50,8 +50,8 @@ The dirent module is the bridge between:
 - **fs.c** (per-fs lookup / create_file / mkdir / unlink / rmdir / rename /
   link wrappers).
 - **Inode cascade-free** (`stm_dirent_drop_for_dir` collects every
-  record under a freed directory so AllocReused can't inherit prior
-  tombstone trail).
+  record under a freed directory so AllocReused can't inherit its
+  tombstones or whiteouts).
 
 In-RAM storage: NONE — each dataset's per-dataset `btree_engine` IS
 the store. The dirent module is now a lightweight chain walker over
@@ -111,8 +111,11 @@ shape. Models `dirent.tla::Whiteout`.
 
 `stm_dirent_drop_for_dir` is the directory-cascade-free hook: drops
 EVERY record (live + tombstone + whiteout) keyed at `(ds, dir_ino,
-*)`. Called by `stm_fs_rmdir` so AllocReused at this `dir_ino`
-doesn't inherit prior tombstone trail.
+*)`. fs.c's pre-free cleanup calls it for every directory it frees
+(rmdir, and rename over an empty directory, whose emptiness check
+counts live records only), so a directory AllocReused at this
+`dir_ino` inherits neither the tombstone trail (probe budget) nor the
+whiteouts (readdir lists them).
 
 ### Inspection
 
