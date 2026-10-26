@@ -709,6 +709,14 @@ struct stm_btree_engine {
     _Atomic(uint64_t)     next_delta_seq;
     _Atomic(eng_node *)   mvcc_root;
 
+    /* Bumped (release) by every commit finalize after it publishes the
+     * new root and before it frees the superseded paddrs. A wait-free
+     * descent snapshots it before loading mvcc_root: a node that then
+     * fails its Merkle gate can have been freed and rewritten only if the
+     * count moved (engine_published_since). The legacy arm republishes
+     * the same root pointer, so the pointer cannot tell. */
+    _Atomic(uint64_t)     publish_seq;
+
     /* 9.8-BE-prepend (chunk 9): sticky concurrent-regime latch. Set
      * (release) by the first insert/delete_concurrent and never
      * cleared; read (acquire) by commit_flush to pick the CLONE commit

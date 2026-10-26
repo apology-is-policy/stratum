@@ -125,6 +125,7 @@ static stm_status engine_alloc(const stm_btree_store_vtable *vt, void *vt_ctx,
      * lookup/insert/etc.) OR concurrent-path (slow-warm path inside
      * stm_btree_engine_lookup_concurrent) — publishes via load_root. */
     atomic_init(&eng->mvcc_root, (eng_node *)NULL);
+    atomic_init(&eng->publish_seq, (uint64_t)0);
     /* 9.8-BE-prepend: the sticky concurrent-regime latch (see
      * engine_internal.h). */
     atomic_init(&eng->concurrent_regime, false);
@@ -365,13 +366,17 @@ static stm_status load_root(stm_btree_engine *eng, eng_node **out)
  * every other materialiser and publisher on commit_mu (double-checked
  * on eng->root inside the lock). Lock order: the callers hold
  * serial_mu, so this realises serial_mu OUTER -> commit_mu INNER —
- * the documented order the mini also uses. The fast path stays a
- * plain read: a non-NULL eng->root can only be swapped by the mini
- * or a commit publish, and both take serial_mu.
+ * the documented order the mini also uses. The fast path reads the
+ * published mirror: the concurrent slow warm can materialise the root
+ * under commit_mu alone while a serial op runs, storing eng->root and
+ * then publishing mvcc_root with release, so only the acquire load sees
+ * the root and its contents together. Once non-NULL the root can only
+ * be swapped by the mini or a commit publish, and both take serial_mu.
  */
 static stm_status load_root_locked(stm_btree_engine *eng, eng_node **out)
 {
-    if (eng->root) { *out = eng->root; return STM_OK; }
+    eng_node *r = atomic_load_explicit(&eng->mvcc_root, memory_order_acquire);
+    if (r) { *out = r; return STM_OK; }
     pthread_mutex_lock(&eng->commit_mu);
     stm_status s = STM_OK;
     if (eng->root) *out = eng->root;
@@ -409,10 +414,11 @@ static stm_status load_root_locked(stm_btree_engine *eng, eng_node **out)
  * on-disk cycles remain caught by the descent depth caps, and a
  * double-loaded DAG node yields two singly-parented copies — degraded
  * detection, never unsafety. A pinned reader can also race the paddr's
- * DISK lifecycle (superseded at a commit it overlapped, reclaimed +
- * rewritten commits later): the bptr csum carried here makes that a
- * Merkle-gate STM_ECORRUPT — fail-closed; the fs-layer SH-fallback
- * (R171 P1-1) retries against the current root.
+ * DISK lifecycle (superseded at a commit it overlapped, then reclaimed
+ * and rewritten): the bptr csum carried here makes that a Merkle-gate
+ * STM_ECORRUPT, and the wait-free entry points go again from the current
+ * root when publish_seq shows a commit published under the descent
+ * (engine_published_since).
  */
 static stm_status load_child(stm_btree_engine *eng, eng_node *node,
                               uint32_t idx, bool use_cache,
@@ -872,6 +878,22 @@ static stm_status concurrent_root(stm_btree_engine *eng, eng_node **out)
 #define ENG_SEAL_RETRY_MAX   65536u
 #define ENG_SEAL_YIELD_EVERY 1024u
 
+/* A wait-free descent pinned on an older root reads a cold child by the
+ * (paddr, csum) its RAM parent holds. A commit that superseded the child
+ * frees the paddr after it publishes, and the bootstrap pool may hand the
+ * paddr out and rewrite it before the descent gets there; the read then
+ * fails the Merkle gate. That can happen only if publish_seq moved since
+ * the descent took `seq`, and then the descent goes again from the
+ * current root, which never references a freed paddr. An unmoved count
+ * makes the failure real corruption. The fence orders the device read
+ * before the reload. */
+static bool engine_published_since(stm_btree_engine *eng, uint64_t seq)
+{
+    atomic_thread_fence(memory_order_seq_cst);
+    return atomic_load_explicit(&eng->publish_seq, memory_order_acquire)
+           != seq;
+}
+
 /*
  * One EBR-pinned descent attempt (the body of
  * stm_btree_engine_lookup_concurrent). *retry is set — with the outs
@@ -989,11 +1011,16 @@ stm_status stm_btree_engine_lookup_concurrent(stm_btree_engine *eng,
      * on a seal (9.8-BE-prepend — the replacement root is published
      * within a few RAM instructions of any seal). */
     for (uint32_t attempt = 0; attempt < ENG_SEAL_RETRY_MAX; attempt++) {
+        uint64_t seq = atomic_load_explicit(&eng->publish_seq,
+                                            memory_order_acquire);
         bool retry = false;
         stm_status s = lookup_concurrent_attempt(eng, key, key_len,
                                                  out_found, out_value,
                                                  out_value_len, &retry);
-        if (s != STM_OK || !retry) return s;
+        if (s == STM_ECORRUPT && engine_published_since(eng, seq))
+            retry = true;                  /* a reused node — go again */
+        else if (s != STM_OK || !retry)
+            return s;
         if ((attempt + 1u) % ENG_SEAL_YIELD_EVERY == 0u)
             sched_yield();
     }
@@ -2903,6 +2930,7 @@ static stm_status commit_finalize_clone(stm_btree_engine *eng)
      * tree until their epochs exit. */
     eng->root = shadow;
     atomic_store_explicit(&eng->mvcc_root, shadow, memory_order_release);
+    atomic_fetch_add_explicit(&eng->publish_seq, 1u, memory_order_release);
 
     /* Grace-deferred reclamation of the WHOLE superseded tree (the
      * recursive destructor also owns any child a pinned descent
@@ -2966,6 +2994,7 @@ static stm_status commit_finalize_locked(stm_btree_engine *eng)
      * is gone" step.
      */
     atomic_store_explicit(&eng->mvcc_root, eng->root, memory_order_release);
+    atomic_fetch_add_explicit(&eng->publish_seq, 1u, memory_order_release);
 
     /* Deferred-free the superseded paddrs — the previous tree's
      * rewritten nodes, now unreachable from the new durable root. The
@@ -3557,6 +3586,38 @@ stm_status stm_btree_engine_scan_range(stm_btree_engine *eng,
     return s;
 }
 
+/* A scan that met a reused node resumes from the current root at the
+ * last key it delivered; this filter drops that key and every key before
+ * it, so the caller still sees each key once, in order. */
+typedef struct {
+    stm_btree_engine_iter_cb cb;
+    void                    *ctx;
+    uint8_t                 *last;
+    size_t                   last_len;
+    size_t                   last_cap;
+    bool                     have_last;
+    bool                     oom;
+} scan_resume;
+
+static int scan_resume_cb(const void *key, size_t key_len,
+                          const void *val, size_t val_len, void *ctx_)
+{
+    scan_resume *r = ctx_;
+    if (r->have_last &&
+        eng_key_cmp(key, key_len, r->last, r->last_len) <= 0)
+        return 0;
+    if (key_len > r->last_cap) {
+        uint8_t *p = realloc(r->last, key_len);
+        if (!p) { r->oom = true; return 1; }
+        r->last     = p;
+        r->last_cap = key_len;
+    }
+    if (key_len) memcpy(r->last, key, key_len);
+    r->last_len  = key_len;
+    r->have_last = true;
+    return r->cb(key, key_len, val, val_len, r->ctx);
+}
+
 /* 9.8-LF-3b: concurrent (EBR-pinned) range scan.
  *
  * Sibling of stm_btree_engine_lookup_concurrent — same slow-warm shape
@@ -3583,20 +3644,47 @@ stm_status stm_btree_engine_scan_range_concurrent(stm_btree_engine *eng,
      * concurrent_root); merged view = chain window + buffers + base.
      * A seal observed BEFORE any callback restarts against the fresh
      * root; a mid-walk tombstone surfaces STM_EBUSY (see scan_tree —
-     * duplicate emission is worse than a transient retry). */
+     * duplicate emission is worse than a transient retry). A reused
+     * node (engine_published_since) resumes from the fresh root at the
+     * last delivered key instead: a scan longer than the gap between
+     * reusing commits must still finish. */
+    scan_resume r = { .cb = cb, .ctx = ctx };
+    uint8_t    *lo_buf = NULL;
+    const void *lo     = lo_key;
+    size_t      lo_len = lo_key_len;
+    stm_status  s      = STM_EBUSY;        /* see ENG_SEAL_RETRY_MAX */
     for (uint32_t attempt = 0; attempt < ENG_SEAL_RETRY_MAX; attempt++) {
+        uint64_t seq = atomic_load_explicit(&eng->publish_seq,
+                                            memory_order_acquire);
         eng_node *root = NULL;
-        stm_status s = concurrent_root(eng, &root);
-        if (s != STM_OK) return s;
+        s = concurrent_root(eng, &root);
+        if (s != STM_OK) break;
         bool restart = false;
         s = scan_tree(eng, root, /*concurrent=*/true, /*bounded=*/true,
-                      lo_key, lo_key_len, hi_key, hi_key_len,
-                      cb, ctx, &restart);
-        if (s != STM_OK || !restart) return s;
+                      lo, lo_len, hi_key, hi_key_len,
+                      scan_resume_cb, &r, &restart);
+        if (r.oom) { s = STM_ENOMEM; break; }
+        if (s == STM_ECORRUPT && engine_published_since(eng, seq)) {
+            /* The bound gets its own copy: the filter's buffer can be
+             * reallocated by the next attempt's callbacks. */
+            if (r.have_last) {
+                uint8_t *nb = realloc(lo_buf, r.last_len ? r.last_len : 1u);
+                if (!nb) { s = STM_ENOMEM; break; }
+                lo_buf = nb;
+                if (r.last_len) memcpy(lo_buf, r.last, r.last_len);
+                lo     = lo_buf;
+                lo_len = r.last_len;
+            }
+        } else if (s != STM_OK || !restart) {
+            break;
+        }
+        s = STM_EBUSY;
         if ((attempt + 1u) % ENG_SEAL_YIELD_EVERY == 0u)
             sched_yield();
     }
-    return STM_EBUSY;                      /* see ENG_SEAL_RETRY_MAX */
+    free(lo_buf);
+    free(r.last);
+    return s;
 }
 
 static int count_cb(const void *k, size_t kl, const void *v, size_t vl,

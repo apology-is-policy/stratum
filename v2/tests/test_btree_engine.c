@@ -66,6 +66,14 @@ typedef struct {
      * `fail_after` writes succeed and the one after that fails once
      * (then re-disarms). Exercises the failed-flush crash-revert path. */
     int64_t   fail_after;
+
+    /* One-shot read hook: the (hook_skip+1)-th read after arming, not
+     * counting reads of hook_pass, first calls hook(hook_arg, paddr),
+     * disarmed before the call, then serves whatever the slot holds. */
+    void    (*hook)(void *arg, uint64_t paddr);
+    void     *hook_arg;
+    uint32_t  hook_skip;
+    uint64_t  hook_pass;
 } memstore;
 
 static void memstore_init(memstore *ms)
@@ -177,6 +185,15 @@ static stm_status memstore_read(void *ctx, uint64_t paddr,
     memstore *ms = ctx;
     if (paddr == 0 || paddr > ms->n) return STM_EINVAL;
     if (len > STM_BTREE_ENGINE_NODE_SIZE) return STM_EINVAL;
+    if (ms->hook && paddr != ms->hook_pass) {
+        if (ms->hook_skip) {
+            ms->hook_skip--;
+        } else {
+            void (*h)(void *, uint64_t) = ms->hook;
+            ms->hook = NULL;
+            h(ms->hook_arg, paddr);
+        }
+    }
     memcpy(buf, ms->slots[paddr - 1], len);
     return STM_OK;
 }
@@ -6377,6 +6394,253 @@ STM_TEST(engine_commit_waits_for_serial_scan) {
 
     stm_btree_engine_destroy(eng);
     memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
+/* A wait-free descent pinned on an old root can read a cold child whose
+ * paddr a later commit superseded, freed and the pool handed out again.
+ * The fixture reopens a committed depth->=2 tree cold, so a descent reads
+ * its children through memstore_read; the read hook then lands a commit
+ * that rewrites every leaf (concurrent updates strided over the range,
+ * big enough that the flush cascades), and scribbles every paddr that
+ * commit freed, before the read is served: the reuse, in one thread. */
+enum { RU_BASE = 1200, RU_UPD = 60, RU_VLEN = 100 };
+
+typedef struct {
+    uint8_t  last[4];
+    bool     have;
+    bool     in_order;
+    uint32_t evens, odds;
+} reuse_scan;
+
+typedef struct {
+    stm_btree_engine *eng;
+    memstore         *ms;
+    stm_ebr_thread   *me;
+    bool              commit;     /* false: scribble the read node only */
+    bool              fired;
+    stm_status        rc;
+    size_t            scribbled;
+    const reuse_scan *scan;       /* a scan's progress, read at the fire */
+    uint32_t          delivered;
+} reuse_hook;
+
+static void reuse_hook_fire(void *arg, uint64_t paddr)
+{
+    reuse_hook *h = arg;
+    h->fired = true;
+    if (h->scan) h->delivered = h->scan->evens + h->scan->odds;
+    if (!h->commit) {
+        memset(memstore_buf(h->ms, paddr), 0xA5, STM_BTREE_ENGINE_NODE_SIZE);
+        h->scribbled++;
+        return;
+    }
+    size_t before = h->ms->n_freed;
+    uint8_t v[RU_VLEN];
+    for (uint32_t i = 0; i < RU_UPD && h->rc == STM_OK; i++) {
+        uint8_t key[4];
+        be32_key(2u * (i * (RU_BASE / RU_UPD)) + 1u, key);
+        memset(v, (int)(i & 0xFFu), sizeof v);
+        h->rc = stm_btree_engine_insert_concurrent(h->eng, h->me, key, 4,
+                                                   v, sizeof v);
+    }
+    uint64_t rp = 0;
+    uint8_t  rc[32];
+    if (h->rc == STM_OK) h->rc = stm_btree_engine_commit(h->eng, 2, &rp, rc);
+    for (size_t i = before; i < h->ms->n_freed; i++) {
+        memset(memstore_buf(h->ms, h->ms->freed[i].paddr), 0xA5,
+               STM_BTREE_ENGINE_NODE_SIZE);
+        h->scribbled++;
+    }
+}
+
+/* Builds the tree, commits it at gen 1 and reopens it cold; *out_height
+ * is the committed height. The hook passes the root's read: the first
+ * descent reads it inside the slow warm, under commit_mu, where the
+ * hook's commit would wait on itself. */
+static stm_btree_engine *reuse_cold_engine(memstore *ms,
+                                           const stm_btree_crypt_ctx *cx,
+                                           uint32_t *out_height)
+{
+    stm_btree_engine *eng = NULL;
+    if (stm_btree_engine_create(&g_memstore_vt, ms, cx, 0, &eng) != STM_OK)
+        return NULL;
+    for (uint32_t i = 0; i < RU_BASE; i++) {
+        uint8_t key[4];
+        be32_key(2u * i, key);
+        if (stm_btree_engine_insert(eng, key, 4, "a", 1) != STM_OK) {
+            stm_btree_engine_destroy(eng);
+            return NULL;
+        }
+    }
+    uint64_t rp = 0;
+    uint8_t  rc[32];
+    stm_btree_engine_stats st;
+    if (stm_btree_engine_commit(eng, 1, &rp, rc) != STM_OK ||
+        stm_btree_engine_stats_get(eng, &st) != STM_OK) {
+        stm_btree_engine_destroy(eng);
+        return NULL;
+    }
+    *out_height   = st.height;
+    ms->hook_pass = rp;
+    stm_btree_engine_destroy(eng);
+    eng = NULL;
+    if (stm_btree_engine_open(&g_memstore_vt, ms, cx, 0, rp, 1, rc,
+                              &eng) != STM_OK)
+        return NULL;
+    return eng;
+}
+
+STM_TEST(engine_lookup_concurrent_survives_a_reused_node) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    uint32_t height = 0;
+    stm_btree_engine *eng = reuse_cold_engine(&ms, &cx, &height);
+    STM_ASSERT_TRUE(eng != NULL);
+    if (!eng) { memstore_destroy(&ms); stm_ebr_thread_free(me); return; }
+    STM_ASSERT_TRUE(height >= 2u);
+
+    reuse_hook h = { .eng = eng, .ms = &ms, .me = me, .commit = true };
+    ms.hook = reuse_hook_fire;
+    ms.hook_arg = &h;
+    uint8_t key[4];
+    be32_key(2u * 600u, key);
+    bool found = false;
+    void *val = NULL;
+    size_t vl = 0;
+    stm_ebr_enter(me);
+    stm_status s = stm_btree_engine_lookup_concurrent(eng, me, key, 4,
+                                                      &found, &val, &vl);
+    stm_ebr_exit(me);
+
+    STM_ASSERT_TRUE(h.fired);
+    STM_ASSERT_OK(h.rc);
+    STM_ASSERT_TRUE(h.scribbled > 0u);
+    STM_ASSERT_OK(s);
+    STM_ASSERT_TRUE(found);
+    STM_ASSERT_EQ((long long)vl, 1ll);
+    STM_ASSERT_TRUE(vl == 1 && ((const char *)val)[0] == 'a');
+    free(val);
+
+    stm_btree_engine_destroy(eng);
+    for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
+        (void)stm_ebr_try_advance();
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
+static int reuse_scan_cb(const void *key, size_t key_len,
+                         const void *val, size_t val_len, void *ctx)
+{
+    (void)val; (void)val_len;
+    reuse_scan *r = ctx;
+    if (key_len != 4) { r->in_order = false; return 1; }
+    if (r->have && memcmp(key, r->last, 4) <= 0) r->in_order = false;
+    memcpy(r->last, key, 4);
+    r->have = true;
+    if (((const uint8_t *)key)[3] & 1u) r->odds++;
+    else                                r->evens++;
+    return 0;
+}
+
+/* The scan has delivered the first leaf when the commit lands: it resumes
+ * from the new root after the last key it delivered, with no key twice. */
+STM_TEST(engine_scan_concurrent_resumes_after_a_reused_node) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+    memstore ms; memstore_init(&ms);
+    stm_btree_crypt_ctx cx = test_cx();
+    uint32_t height = 0;
+    stm_btree_engine *eng = reuse_cold_engine(&ms, &cx, &height);
+    STM_ASSERT_TRUE(eng != NULL);
+    if (!eng) { memstore_destroy(&ms); stm_ebr_thread_free(me); return; }
+    STM_ASSERT_TRUE(height >= 2u);
+
+    reuse_hook h = { .eng = eng, .ms = &ms, .me = me, .commit = true };
+    ms.hook = reuse_hook_fire;
+    ms.hook_arg = &h;
+    ms.hook_skip = height - 1u;            /* the path to the first leaf */
+    reuse_scan r = { .in_order = true };
+    h.scan = &r;
+    uint8_t lo[4], hi[4];
+    be32_key(0u, lo);
+    be32_key(UINT32_MAX, hi);
+    stm_ebr_enter(me);
+    stm_status s = stm_btree_engine_scan_range_concurrent(eng, me, lo, 4,
+                                                          hi, 4,
+                                                          reuse_scan_cb, &r);
+    stm_ebr_exit(me);
+
+    STM_ASSERT_TRUE(h.fired);
+    STM_ASSERT_OK(h.rc);
+    STM_ASSERT_TRUE(h.scribbled > 0u);
+    STM_ASSERT_TRUE(h.delivered > 0u);
+    STM_ASSERT_OK(s);
+    STM_ASSERT_TRUE(r.in_order);
+    STM_ASSERT_EQ(r.evens, (uint32_t)RU_BASE);
+    STM_ASSERT_TRUE(r.odds > 0u && r.odds <= (uint32_t)RU_UPD);
+
+    stm_btree_engine_destroy(eng);
+    for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
+        (void)stm_ebr_try_advance();
+    memstore_destroy(&ms);
+    stm_ebr_thread_free(me);
+}
+
+/* With no commit under the descent a node that fails its Merkle gate is
+ * corruption, and both entry points report it rather than going again. */
+STM_TEST(engine_concurrent_reports_corruption_without_a_publish) {
+    STM_ASSERT_OK(stm_ebr_init());
+    stm_ebr_thread *me = stm_ebr_register();
+    STM_ASSERT_TRUE(me != NULL);
+    if (!me) return;
+    for (int leg = 0; leg < 2; leg++) {
+        memstore ms; memstore_init(&ms);
+        stm_btree_crypt_ctx cx = test_cx();
+        uint32_t height = 0;
+        stm_btree_engine *eng = reuse_cold_engine(&ms, &cx, &height);
+        STM_ASSERT_TRUE(eng != NULL);
+        if (!eng) { memstore_destroy(&ms); break; }
+
+        reuse_hook h = { .eng = eng, .ms = &ms, .me = me, .commit = false };
+        ms.hook = reuse_hook_fire;
+        ms.hook_arg = &h;
+        stm_status s;
+        stm_ebr_enter(me);
+        if (leg == 0) {
+            uint8_t key[4];
+            be32_key(2u * 600u, key);
+            bool found = false;
+            void *val = NULL;
+            size_t vl = 0;
+            s = stm_btree_engine_lookup_concurrent(eng, me, key, 4,
+                                                   &found, &val, &vl);
+            free(val);
+        } else {
+            reuse_scan r = { .in_order = true };
+            uint8_t lo[4], hi[4];
+            be32_key(0u, lo);
+            be32_key(UINT32_MAX, hi);
+            s = stm_btree_engine_scan_range_concurrent(eng, me, lo, 4,
+                                                       hi, 4,
+                                                       reuse_scan_cb, &r);
+        }
+        stm_ebr_exit(me);
+        STM_ASSERT_TRUE(h.fired);
+        STM_ASSERT_EQ((long long)h.scribbled, 1ll);
+        STM_ASSERT_EQ(s, STM_ECORRUPT);
+
+        stm_btree_engine_destroy(eng);
+        for (int i = 0; i < 8 && stm_ebr_pending_retires() > 0; i++)
+            (void)stm_ebr_try_advance();
+        memstore_destroy(&ms);
+    }
     stm_ebr_thread_free(me);
 }
 

@@ -168,6 +168,8 @@ typedef struct {
     uint64_t bitmap_gen;              /* monotonic on each commit               */
     uint64_t early_reclaimed_nodes;   /* PENDING nodes a full reserve took back
                                          before their sweep (monotone)         */
+    uint64_t early_forced_nodes;      /* of those, taken while a pinned reader
+                                         still held them back (monotone)       */
 } stm_bootstrap_stats;
 
 /* ========================================================================= */
@@ -239,16 +241,16 @@ void stm_bootstrap_close(stm_bootstrap *a);
  *
  * When no run is free, PENDING entries freed below the armed commit's
  * target generation (see stm_bootstrap_commit_defer_begin) are returned to
- * the free set first, those whose EBR epoch every pinned reader has left:
- * no durable uberblock names their nodes and no descent can still reach
- * them, so this commit's own COW may reuse them rather than fail. It
- * advances EBR (stm_ebr_try_advance) to get there, napping between tries
- * for at most about two seconds in all while pinned readers hold entries
- * back. A pinned reader is one lookup or scan and never waits on a lock
- * the reserving commit holds (stm_dataset_index_get_engine_pinned drops
- * its pin to wait), so the wait ends when the reads in flight do; past
- * the bound the entries stay PENDING, the reserve answers STM_ENOSPC and
- * the commit fails, which wedges the filesystem.
+ * the free set first: no durable uberblock names their nodes, so this
+ * commit's own COW may reuse them rather than fail. An entry whose EBR
+ * epoch a pinned reader has not yet left is waited for: the reserve
+ * advances EBR (stm_ebr_try_advance) and naps for up to 50 ms on the
+ * monotonic clock, then takes it anyway. A descent still pinned past that
+ * (a long cold scan, a stopped thread) reads the rewritten node, fails its
+ * Merkle gate and goes again from the current root (a lookup restarts, a
+ * scan resumes after its last key), so the wait only spares it that
+ * restart. There is no wait when even the held-back nodes could not make
+ * up the request.
  *
  * Returns STM_ENOSPC if no run of the requested size is free, and
  * STM_EBUSY between stm_bootstrap_commit_defer_stage and _finalize, where

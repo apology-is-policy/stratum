@@ -250,25 +250,40 @@ Deferred-free follows `allocator.tla`, with the refinement in item 3:
    holds it. The generation gives the first; readers need more, because
    a commit can run beside them (CF-4 C's reclaim-on-ENOSPC commits hold
    `fs->global` SH, wait-free lookups hold no lock). So each entry
-   records the EBR epoch of its free, and an entry is reused early only
-   once EBR would free an object retired at that moment
-   (`stm_ebr_epoch_reclaimable`). The reserve advances EBR and naps
-   between tries while pinned readers hold entries back, for at most
-   about two seconds in all; past that bound the entries stay PENDING
-   and the reserve answers `STM_ENOSPC`, which fails the commit and
-   wedges the filesystem. The wait is bounded by the reads in flight
-   because no pinned reader waits on a lock the reserving commit holds:
-   a wait-free op resolves its dataset engine through
-   `stm_dataset_index_get_engine_pinned`, which drops the pin while it
-   waits for the index lock the commit cascade holds across every
-   engine's node writes. Without the early reuse a commit whose COW
+   records the EBR epoch of its free, and the reserve prefers to reuse
+   an entry only once EBR would free an object retired at that moment
+   (`stm_ebr_epoch_reclaimable`): it advances EBR and naps between tries
+   while pinned readers hold entries back, for up to 50 ms on the
+   monotonic clock (`BOOT_REUSE_WAIT_NS`), then reuses them anyway, and
+   it skips the wait when even the held-back nodes could not make up the
+   request. The deadline is a preference, not the safety argument (vote
+   22, 2026-10-26): a scan can stay pinned for hundreds of milliseconds
+   (a cold readdir of 100k entries, about 410 ms) and a stopped thread
+   for ever, and a hard gate then wedged the filesystem. A descent still
+   pinned when its node is rewritten reads it by the (paddr, csum) its
+   RAM parent holds, so the read fails the Merkle gate; every wait-free
+   engine entry point then checks the engine's `publish_seq`, bumped by
+   each commit finalize after it publishes and before it frees, and when
+   a commit has published since the descent began a lookup restarts and a
+   scan resumes after its last delivered key, from the current root,
+   which never references a freed paddr (`engine_published_since` in
+   `src/btree_engine/engine.c`). An unmoved count leaves the failure
+   reported as corruption. The same check covers the ordinary sweep's
+   reuse, which has no EBR gate at all. A wait-free op resolves its
+   dataset engine through `stm_dataset_index_get_engine_pinned`, which
+   drops the pin while it waits for the index lock the commit cascade
+   holds across every engine's node writes, so most readers leave well
+   inside the deadline. Without the early reuse a commit whose COW
    needed the previous commit's retires answered `STM_ENOSPC` with most
    of the region PENDING, and the failed commit wedged the filesystem
    (`test_fs` `fs_churn_commit_reuses_retired_metadata_nodes`,
    `test_bootstrap` `bootstrap_full_reserve_reuses_settled_pending`,
-   `bootstrap_early_reuse_waits_for_pinned_reader`,
+   `bootstrap_early_reuse_takes_a_held_node_after_the_wait`,
    `bootstrap_early_reuse_waits_out_a_short_reader`, `test_dataset`
-   `dataset_engine_get_pinned_unpins_while_waiting`).
+   `dataset_engine_get_pinned_unpins_while_waiting`, `test_btree_engine`
+   `engine_lookup_concurrent_survives_a_reused_node`,
+   `engine_scan_concurrent_resumes_after_a_reused_node`,
+   `engine_concurrent_reports_corruption_without_a_publish`).
 
 Caller-supplied `free_gen` and `committed_gen` are the pool's
 commit gens from sync.tla. The strict-less-than criterion

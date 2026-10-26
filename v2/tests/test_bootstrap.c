@@ -27,6 +27,7 @@
 #include <stratum/super.h>
 
 #include <pthread.h>
+#include <time.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1194,11 +1195,22 @@ STM_TEST(bootstrap_full_reserve_reuses_settled_pending) {
     unlink(g_tmp_path);
 }
 
+static uint64_t test_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* The reserve's wait for pinned readers (pool.c BOOT_REUSE_WAIT_NS). */
+#define TEST_REUSE_WAIT_NS 50000000ull
+
 /* A descent pinned in EBR before the free may still read the node's paddr
- * from disk, so while it stays pinned (here past the reserve's bounded wait)
- * a full reserve leaves the entry PENDING; once it exits, the reserve takes
- * the node. */
-STM_TEST(bootstrap_early_reuse_waits_for_pinned_reader) {
+ * from disk. A full reserve waits for it, then takes the node anyway: the
+ * descent that reads the rewritten node fails its Merkle gate and goes
+ * again from the current root. A request that the held nodes could not
+ * satisfy fails at once instead of waiting. */
+STM_TEST(bootstrap_early_reuse_takes_a_held_node_after_the_wait) {
     make_tmp("pinned");
     stm_bdev *d = open_fresh_device();
     stm_bootstrap *a = make_fresh_alloc(d);
@@ -1213,21 +1225,30 @@ STM_TEST(bootstrap_early_reuse_waits_for_pinned_reader) {
     STM_ASSERT_OK(stm_bootstrap_free(a, p[0], TEST_NODE_BLOCKS, 3));
     stm_bootstrap_commit_defer_begin(a, 5);
 
+    /* One held node cannot make a two-node run: no wait, no reuse. */
     uint64_t q = 0;
-    STM_ASSERT_ERR(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q),
+    uint64_t t0 = test_now_ns();
+    STM_ASSERT_ERR(stm_bootstrap_reserve(a, 2u * TEST_NODE_BLOCKS, 0, &q),
                    STM_ENOSPC);
+    uint64_t short_ns = test_now_ns() - t0;
     stm_bootstrap_stats st;
     STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_TRUE(short_ns < TEST_REUSE_WAIT_NS / 2u);
     STM_ASSERT_EQ(st.pending_nodes, 1u);
     STM_ASSERT_EQ(st.early_reclaimed_nodes, 0u);
 
-    stm_ebr_exit(reader);
+    /* One node: waited for, then taken while the reader still pins. */
+    t0 = test_now_ns();
     STM_ASSERT_OK(stm_bootstrap_reserve(a, TEST_NODE_BLOCKS, 0, &q));
+    uint64_t waited_ns = test_now_ns() - t0;
     STM_ASSERT_EQ(q, p[0]);
+    STM_ASSERT_TRUE(waited_ns >= TEST_REUSE_WAIT_NS);
     STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
     STM_ASSERT_EQ(st.pending_nodes, 0u);
     STM_ASSERT_EQ(st.early_reclaimed_nodes, 1u);
+    STM_ASSERT_EQ(st.early_forced_nodes, 1u);
 
+    stm_ebr_exit(reader);
     stm_ebr_thread_free(reader);
     stm_bootstrap_commit_defer_cancel(a);
     stm_bootstrap_close(a);
@@ -1236,8 +1257,8 @@ STM_TEST(bootstrap_early_reuse_waits_for_pinned_reader) {
 }
 
 /* A reader pinned for a moment is waited out: the full reserve advances
- * EBR and naps until the reader leaves, rather than failing the commit it
- * runs in. */
+ * EBR and naps until the reader leaves, rather than taking the node from
+ * under it. */
 typedef struct {
     atomic_int pinned;
     atomic_int leaving;
@@ -1250,7 +1271,7 @@ static void *short_reader_thread(void *arg)
     if (!t) { atomic_store(&r->pinned, -1); return NULL; }
     stm_ebr_enter(t);
     atomic_store(&r->pinned, 1);
-    usleep(50000);
+    usleep(10000);
     atomic_store(&r->leaving, 1);
     stm_ebr_exit(t);
     stm_ebr_thread_free(t);
@@ -1288,6 +1309,7 @@ STM_TEST(bootstrap_early_reuse_waits_out_a_short_reader) {
     STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
     STM_ASSERT_EQ(st.pending_nodes, 0u);
     STM_ASSERT_EQ(st.early_reclaimed_nodes, 1u);
+    STM_ASSERT_EQ(st.early_forced_nodes, 0u);
 
     stm_bootstrap_commit_defer_cancel(a);
     stm_bootstrap_close(a);
