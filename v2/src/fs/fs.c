@@ -28,11 +28,14 @@
  *      [per-inode handle->mu  →]      (PARALLEL-3 impl-1: SH path only)
  *      sync->lock  →  alloc->lock  →  alloc's btree rwlock
  *
- * NEVER call stm_fs_mark_wedged from inside a held fs->global wrlock —
- * recursive same-thread wrlock is POSIX-undefined and deadlocks on
- * glibc. R133 P1-2 fixed the latent rename rollback path; future
- * compound ops with internal wedge-on-failure paths MUST capture the
- * intent into a local bool and fire mark_wedged AFTER unlock.
+ * NEVER call stm_fs_mark_wedged from inside a held fs->global —
+ * it takes the wrlock itself, and a recursive same-thread lock is
+ * POSIX-undefined and deadlocks on glibc (R133 P1-2). A path that must
+ * wedge while holding fs->global calls fs_mark_wedged_locked, the
+ * in-place latch, BEFORE it unlocks: a wedge fired after the unlock
+ * leaves a window in which a writer queued on fs->global (a commit
+ * among them) runs on the state the wedge was meant to stop, and can
+ * make it durable.
  *
  * Public stm_fs entries:
  *   - Pre-PARALLEL-3 ops (the residual EX surface): take fs->global EX
@@ -241,9 +244,9 @@ struct stm_fs {
 
     /* 9.8-LF-3: wedged + read_only are atomic so 9.8 wait-free read ops
      * can check them without holding fs->global. `wedged` has two writers:
-     * stm_fs_mark_wedged (holds fs->global EX -- the primary path) and
-     * CF-4 C's fs_mark_wedged_locked (called with fs->global held in SH or
-     * EX from the reserve-path reclaim backstop). Both are sound because
+     * stm_fs_mark_wedged (takes fs->global EX; callers holding no fs lock)
+     * and fs_mark_wedged_locked (every path that wedges while it holds
+     * fs->global in SH or EX, before it unlocks). Both are sound because
      * `wedged` is a MONOTONE one-way latch (only ever false->true): the
      * release-store is atomic, so a concurrent SH-holder's store is an
      * idempotent same-value write -- no torn write, no lost update, and the
@@ -345,6 +348,21 @@ struct stm_fs {
     if (atomic_load_explicit(&(fs)->wedged, memory_order_acquire))         \
         return STM_EWEDGED;                                                \
 } while (0)
+
+/* CF-4 C: wedge the fs while ALREADY holding fs->global (SH or EX). The
+ * public stm_fs_mark_wedged re-takes fs->global EX and MUST NOT be called
+ * from a held lock (the lock-order note at the top); this variant does
+ * only the monotonic release-store. Safe under either lock mode: `wedged`
+ * is a one-way latch (only ever false->true), so a concurrent store from
+ * another SH holder is an idempotent write of the same value -- no torn
+ * write, no lost update. Every wedge under fs->global goes through it,
+ * before the unlock, so the first holder after this section already sees
+ * the wedge (the unlock orders the store before it). Caller holds
+ * fs->global. */
+static void fs_mark_wedged_locked(stm_fs *fs)
+{
+    atomic_store_explicit(&fs->wedged, true, memory_order_release);
+}
 
 /* ========================================================================= */
 /* 9.8-LF-3: per-thread EBR handle cache (pthread_getspecific).               */
@@ -1630,14 +1648,14 @@ static stm_status stm_fs_commit_inner(stm_fs *fs)
      * (9.6-impl-4b design §5.5). Wedge so a retry (fsync IS retryable;
      * the 9P Tfsync / Tsync handlers + /ctl/'s seal-bit commit re-issue
      * it) is refused with STM_EWEDGED instead of silently committing
-     * the reverted-to-previous-durable inode tree. Deferred past the
-     * unlock — stm_fs_mark_wedged itself takes fs->global (fs.c:31).
-     * The fs_flush_all_locked failure above is deliberately NOT wedged:
-     * it leaves the dirty buffer intact for retry — only the inode-
-     * engine abort makes a failure unrecoverable. */
-    bool should_wedge = (s != STM_OK);
+     * the reverted-to-previous-durable inode tree. In place, before the
+     * unlock: a commit queued behind this one would otherwise take the
+     * lock first and commit that tree. The fs_flush_all_locked failure
+     * above is deliberately NOT wedged: it leaves the dirty buffer
+     * intact for retry — only the inode-engine abort makes a failure
+     * unrecoverable. */
+    if (s != STM_OK) fs_mark_wedged_locked(fs);
     pthread_rwlock_unlock(&fs->global);
-    if (should_wedge) stm_fs_mark_wedged(fs);
     return s;
 }
 
@@ -3744,10 +3762,10 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
         /* Defense-in-depth — best-effort rollback (should never fire). */
         (void)stm_dirent_unlink(didx, dataset_id, parent_ino,
                                      name, name_len);
+        fs_mark_wedged_locked(fs);
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
         pthread_rwlock_unlock(&fs->global);
-        stm_fs_mark_wedged(fs);
         return ms;
     }
 
@@ -3949,9 +3967,8 @@ static bool fs_freed_inode_cleanup_locked(stm_fs *fs,
  * / an unmountable pool. So: on the first commit's failure, STOP — do
  * NOT issue the retry — and signal the caller to wedge. A failed
  * second commit also wedges (any failed stm_sync_commit is crash-
- * equivalent per §5.5). The caller fires stm_fs_mark_wedged AFTER its
- * own pthread_rwlock_unlock — the fs.c:31 deferred-wedge doctrine,
- * since stm_fs_mark_wedged itself takes fs->global.
+ * equivalent per §5.5). The caller wedges in place
+ * (fs_mark_wedged_locked) before it releases anything.
  */
 static bool fs_post_inode_free_reclaim_locked(stm_fs *fs)
 {
@@ -3960,19 +3977,6 @@ static bool fs_post_inode_free_reclaim_locked(stm_fs *fs)
     return false;
 }
 
-/* CF-4 C: wedge the fs while ALREADY holding fs->global (SH or EX). The
- * public stm_fs_mark_wedged re-takes fs->global EX and MUST NOT be called
- * from a held lock (fs.c:31); this variant does only the monotonic
- * release-store. Safe under either lock mode: `wedged` is a one-way latch
- * (only ever false->true), so a concurrent store from another SH holder is
- * an idempotent write of the same value -- no torn write, no lost update.
- * Lets the reclaim-on-ENOSPC backstop signal a crash-equivalent commit
- * failure from deep in the reserve path without the deferred-unlock dance.
- * Caller holds fs->global. */
-static void fs_mark_wedged_locked(stm_fs *fs)
-{
-    atomic_store_explicit(&fs->wedged, true, memory_order_release);
-}
 
 /* CF-4 C: the reclaim-on-ENOSPC backstop (cf-4c-design.md §4.2). A data-
  * block reserve that returned STM_ENOSPC may be able to recover space: an
@@ -4248,10 +4252,10 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
             nb = stm_dirent_alloc(didx, dataset_id, parent_ino, name,
                                   name_len, child_ino, child_dgen,
                                   child_dtype);
+        if (nb != STM_OK) fs_mark_wedged_locked(fs);
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
         pthread_rwlock_unlock(&fs->global);
-        if (nb != STM_OK) stm_fs_mark_wedged(fs);
         return ius;
     }
     if (freed)
@@ -8921,14 +8925,13 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
      *
      * R154 Q2: a failed stm_sync_commit is crash-equivalent (the
      * engines' three-phase abort dropped the in-memory trees), so we
-     * wedge the fs — mirroring stm_fs_commit. The wedge is deferred
-     * past the unlock since stm_fs_mark_wedged itself takes
-     * fs->global. */
+     * wedge the fs in place, before the unlock — mirroring
+     * stm_fs_commit. */
     {
         stm_status cr = stm_sync_commit(fs->sync);
         if (cr != STM_OK) {
+            fs_mark_wedged_locked(fs);
             pthread_rwlock_unlock(&fs->global);
-            stm_fs_mark_wedged(fs);
             return cr;
         }
     }
@@ -10699,8 +10702,8 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
          * not durable, crash-equivalent inconsistent state → wedge
          * (R154 Q2). */
         free(newer_ids);
+        fs_mark_wedged_locked(fs);
         pthread_rwlock_unlock(&fs->global);
-        stm_fs_mark_wedged(fs);
         return s;
     }
 
@@ -10742,14 +10745,13 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * it.)
      *
      * R154 Q2: a failed commit is crash-equivalent (the engines' three-
-     * phase abort dropped the in-memory trees) — wedge the fs. The wedge
-     * is deferred past the unlock; stm_fs_mark_wedged itself takes
-     * fs->global. */
+     * phase abort dropped the in-memory trees) — wedge the fs, in place
+     * before the unlock. */
     {
         stm_status cr = stm_sync_commit(fs->sync);
         if (cr != STM_OK) {
+            fs_mark_wedged_locked(fs);
             pthread_rwlock_unlock(&fs->global);
-            stm_fs_mark_wedged(fs);
             return cr;
         }
     }
