@@ -5699,13 +5699,16 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
             return STM_EISDIR;
         }
         if (src_is_dir && dst_is_dir) {
+            /* A count that failed says nothing about emptiness: refuse,
+             * as rmdir does, rather than replace a directory that may
+             * hold entries. */
             size_t n = 0;
             stm_status cs = stm_dirent_count_for_dir(didx, dataset_id,
                                                           dst_ino, &n);
-            if (cs == STM_OK && n > 0u) {
+            if (cs != STM_OK || n > 0u) {
                 FS_RENAME_UNPIN_ALL();
                 pthread_rwlock_unlock(&fs->global);
-                return STM_ENOTEMPTY;
+                return cs != STM_OK ? cs : STM_ENOTEMPTY;
             }
         }
     }

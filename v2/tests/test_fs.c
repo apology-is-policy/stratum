@@ -11449,4 +11449,57 @@ STM_TEST(fs_churn_reuse_beside_a_wait_free_reader) {
     unlink(g_key_path);
 }
 
+/* rename over an existing directory may replace it only when it is empty.
+ * A commit's flush..finalize window (CF-4 C runs its reclaim commits under
+ * fs->global SH, beside an SH rename) makes the destination's entry count
+ * fail with STM_EBUSY; rename must refuse with that error rather than read
+ * the failure as "empty" and replace the directory and its entries. */
+STM_TEST(fs_rename_refuses_when_the_dst_count_fails) {
+    make_tmp("rename_count_fails");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t ds = 0, root = 0, src = 0, dst = 0, kid = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "renc", &ds));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds, 0755u, 0, 0, &root));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, ds, root, (const uint8_t *)"src", 3,
+                               040755u, 0, 0, &src));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, ds, root, (const uint8_t *)"dst", 3,
+                               040755u, 0, 0, &dst));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds, dst, (const uint8_t *)"kid", 3,
+                                     0100644u, 0, 0, &kid));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Control: outside the window the count succeeds and rename says
+     * the destination is not empty. */
+    STM_ASSERT_EQ(stm_fs_rename(fs, ds, root, (const uint8_t *)"src", 3,
+                                root, (const uint8_t *)"dst", 3, 0),
+                  STM_ENOTEMPTY);
+
+    stm_sync *sync = stm_fs_sync(fs);
+    stm_dataset_index *di = stm_sync_dataset_index(sync);
+    STM_ASSERT_OK(stm_dataset_index_commit_engines_flush(
+        di, stm_sync_current_gen(sync)));
+    size_t n = 0;
+    STM_ASSERT_EQ(stm_dirent_count_for_dir(stm_sync_dirent_index(sync), ds,
+                                           dst, &n), STM_EBUSY);
+    STM_ASSERT_EQ(stm_fs_rename(fs, ds, root, (const uint8_t *)"src", 3,
+                                root, (const uint8_t *)"dst", 3, 0),
+                  STM_EBUSY);
+    (void)stm_dataset_index_commit_engines_abort(di);
+
+    uint64_t got = 0, k = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, ds, root, (const uint8_t *)"dst", 3, &got));
+    STM_ASSERT_EQ(got, dst);
+    STM_ASSERT_OK(stm_fs_lookup(fs, ds, dst, (const uint8_t *)"kid", 3, &k));
+    STM_ASSERT_EQ(k, kid);
+    STM_ASSERT_OK(stm_fs_lookup(fs, ds, root, (const uint8_t *)"src", 3, &got));
+    STM_ASSERT_EQ(got, src);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")
