@@ -943,9 +943,22 @@ STM_STATIC_ASSERT(sizeof(stm_fs_file_handle) == STM_FS_HANDLE_BYTES,
 /*
  * Resolve `name` in directory `parent_ino` of `dataset_id` and produce
  * a serializable file handle for the resulting child inode. The
- * handle captures the child's current `si_gen` so a later
+ * handle captures the `si_gen` the name's dirent record carries (the
+ * incarnation the name resolved to) so a later
  * `stm_fs_open_by_handle` call can detect AllocReused-after-Free
  * staleness via gen mismatch.
+ *
+ * **A handle does not survive a rollback and a remount.** A dataset
+ * rollback raises the allocator's gen and ino floors in RAM, so no
+ * (ino, si_gen) the discarded tree held is issued again while the fs
+ * stays mounted. The floors end with the mount: after a remount the
+ * allocator seeds from the rolled-back tree alone, a discarded file's
+ * (ino, si_gen) can be issued to a new file, and a handle taken for
+ * the discarded file before the rollback opens the new one. Every
+ * other holder of an (ino, si_gen) (a 9P fid, a client's cache keyed
+ * by it) ends with its 9P session, which ends before the unmount; a
+ * caller that keeps handles past a remount must drop them across a
+ * rollback.
  *
  * Refusals:
  *   - NULL fs OR NULL name OR NULL out_handle (STM_EINVAL).

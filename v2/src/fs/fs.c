@@ -282,6 +282,7 @@ struct stm_fs {
     void *free_cleanup_hook_arg;
     stm_fs_xattr_read_gap_hook xattr_read_gap_hook;
     void *xattr_read_gap_hook_arg;
+    bool name_to_handle_locked_only;
 #endif
 };
 
@@ -2453,10 +2454,11 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
  * the caller holds (a 9P fid's cached si_gen): each compares the
  * target's si_gen with *gen where the op holds the target against a
  * free, and answers STM_ESTALE on a mismatch or when it is gone. Every
- * free holds the freed inode's exclusive pin, and a rollback holds
- * fs->global EX, so under the target's pin (either mode) or under EX
- * the incarnation checked is the one acted on. A NULL gen checks
- * nothing. */
+ * free of a published inode holds its exclusive pin (a create's
+ * rollback frees an inode it never published, whose gen no caller can
+ * hold), and a rollback holds fs->global EX, so under the target's pin
+ * (either mode) or under EX the incarnation checked is the one acted
+ * on. A NULL gen checks nothing. */
 static inline bool fs_gen_matches(const struct stm_inode_value *iv,
                                   const uint64_t *gen)
 {
@@ -3133,6 +3135,11 @@ void stm_fs_set_xattr_read_gap_hook_for_test(stm_fs *fs,
 {
     fs->xattr_read_gap_hook = fn;
     fs->xattr_read_gap_hook_arg = arg;
+}
+
+void stm_fs_force_name_to_handle_fallback_for_test(stm_fs *fs, bool force)
+{
+    fs->name_to_handle_locked_only = force;
 }
 #endif
 
@@ -5477,12 +5484,16 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
 
     /* Validate parent is a directory + look up the child. */
     struct stm_inode_value pv = {0};
-    struct stm_inode_value cv = {0};
-    uint64_t child_ino = 0, child_gen_ignored = 0;
+    uint64_t child_ino = 0, child_gen = 0;
     uint8_t  child_type = 0;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    bool need_fallback = fs->name_to_handle_locked_only;
+#else
     bool need_fallback = false;
-    stm_status sps = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
-                                                    parent_ino, &pv);
+#endif
+    stm_status sps = need_fallback
+        ? STM_EBUSY
+        : stm_inode_lookup_concurrent(iidx, ebr, dataset_id, parent_ino, &pv);
     if (sps == STM_ECORRUPT || sps == STM_EBUSY) {
         need_fallback = true;
     } else if (sps != STM_OK) {
@@ -5500,7 +5511,7 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
         stm_status ds = stm_dirent_lookup_concurrent(didx, ebr, dataset_id,
                                                          parent_ino,
                                                          name, name_len,
-                                                         &child_ino, &child_gen_ignored,
+                                                         &child_ino, &child_gen,
                                                          &child_type);
         if (ds == STM_ECORRUPT || ds == STM_EBUSY) {
             need_fallback = true;
@@ -5509,28 +5520,11 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
             return ds;
         }
     }
-
-    /* R83 P3-6 defense-in-depth: re-read the inode's si_gen from the
-     * inode index rather than trusting the dirent's child_gen
-     * snapshot. The dirent's child_gen IS provably equal to the
-     * inode's current si_gen for any ALLOCATED inode (per inode.tla:
-     * si_gen is immutable for the ALLOCATED lifetime; only AllocReused
-     * bumps it during the FREED → ALLOCATED transition, at which point
-     * any dirent referencing the old (ino, gen) pair is also gone via
-     * cascade-free). The redundant lookup costs an O(records) scan but
-     * provides defense-in-depth against any future invariant violation
-     * — if the dirent's child_gen ever drifts from the inode's si_gen,
-     * the handle should reflect the inode's authoritative value. */
-    if (!need_fallback) {
-        stm_status cs = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
-                                                       child_ino, &cv);
-        if (cs == STM_ECORRUPT || cs == STM_EBUSY) {
-            need_fallback = true;
-        } else if (cs != STM_OK) {
-            stm_ebr_exit(ebr);
-            return cs;
-        }
-    }
+    /* The gen is the one the name's record carries, read with the ino:
+     * the handle names the file the name resolved to. Nothing holds the
+     * child here, so a second read of its inode could find a later
+     * tenant (the file freed and its ino reused in between) and hand out
+     * that file's identity. */
     stm_ebr_exit(ebr);
 
     if (need_fallback) {
@@ -5550,15 +5544,10 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
         }
         stm_status ds2 = stm_dirent_lookup(didx, dataset_id, parent_ino,
                                               name, name_len,
-                                              &child_ino, &child_gen_ignored,
+                                              &child_ino, &child_gen,
                                               &child_type);
-        if (ds2 != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
-            return ds2;
-        }
-        stm_status cs2 = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
         pthread_rwlock_unlock(&fs->global);
-        if (cs2 != STM_OK) return cs2;
+        if (ds2 != STM_OK) return ds2;
     }
 
     out_handle->h_magic      = stm_store_le32(STM_FS_HANDLE_MAGIC);
@@ -5575,10 +5564,7 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
     }
     out_handle->h_dataset_id = stm_store_le64(dataset_id);
     out_handle->h_ino        = stm_store_le64(child_ino);
-    /* R83 P3-5: cv.si_gen is already le64 + h_si_gen is le64; direct
-     * assignment is bit-equivalent to the prior load+store round-trip
-     * and saves a byte-swap pair on big-endian builds. */
-    out_handle->h_si_gen     = cv.si_gen;
+    out_handle->h_si_gen     = stm_store_le64(child_gen);
     return STM_OK;
 }
 

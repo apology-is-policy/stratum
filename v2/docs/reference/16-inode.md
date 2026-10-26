@@ -49,10 +49,18 @@ The inode module is the foundational Phase 8 layer:
   per-file derived key chain (ARCH §7.3.3) and the 9P fid-staleness
   detection (`fid.tla::IOReject` — see ARCH §11.3.2) have a stable
   ground truth: an ino can be reused but the tuple `(ino, gen)` is
-  NEVER reused across the volume's lifetime.
+  never reused while the fs stays mounted, rollbacks included. The
+  rollback floors that make that so are RAM only (below), so a
+  rollback followed by a remount can issue a discarded `(ino, gen)`
+  again. No key or nonce derives from `si_gen` today (the data AEAD
+  nonce is `(paddr, commit gen, pool_uuid)`); a key chain over
+  `(ino, gen)` would need the floors made durable first.
 - **NFS file handles** (P8-POSIX-7c): `name_to_handle_at` /
   `open_by_handle_at` encode `(ds, ino, gen)` and re-resolve through
-  this index; mismatched gen returns ESTALE.
+  this index; mismatched gen returns ESTALE. The gen is the one the
+  name's dirent record carries, so a handle names the file the name
+  resolved to. A handle kept across a rollback and a remount can open
+  the file that took its identity (fs.h).
 
 The inode module is the bridge between:
 
@@ -248,8 +256,11 @@ only) so the next alloc-shaped op re-seeds from the LIVE engine.
 Called by fs.c after an engine-root swap (`stm_fs_rollback_snapshot` /
 the snapshot-clone) discards the tree the seed was derived from.
 `next_ino` deliberately stays monotone across the re-seed (the seed
-takes max with the in-RAM value), so an ino the discarded tree issued
-is never fresh again; `freed_count` /
+takes max with the in-RAM value). That alone keeps an ino the
+discarded tree issued from coming back fresh only when the allocator
+was seeded before the rollback: in a mount that has not allocated in
+the dataset the in-RAM value is 1, so `stm_inode_dsstate_raise_floors`
+lifts it as well (below); `freed_count` /
 `freed_scan_lo` re-derive exactly, so the reuse gate is exact again
 (pre-9b a post-rollback create could silently skip a FREED slot the
 rolled-back tree holds, or scan for one it lacks — both safe-degraded,
@@ -265,17 +276,22 @@ against its `qid.version`). The rollback calls it just before
 `set_engine_root`, while the discarded tree is still the live one: one
 pass over the INODE subspace (the seed's scan) records the largest
 `si_gen` and `si_cvers` and raises the dataset's `gen_floor` /
-`cvers_floor` to one past them. For the rest of the mount a reuse
+`cvers_floor` to one past them, and `next_ino` to one past the
+largest ino, seeded or not. For the rest of the mount a reuse
 stamps `max(prior + 1, gen_floor)` and every cvers stamp, at reuse or
 in `stm_inode_set`, `max(cur + 1, cvers_floor)`. The floors are RAM
 only, since both holders (fids and the Larder) belong to a 9P session
 and a remount ends it, and only rise; the re-seed leaves them alone.
+File handles are the exception: they outlive a mount, and these
+floors do not cover them.
 `inode.tla` models it (`TakeSnapshot` / `Rollback`, `inode_rollback.cfg`
 green; `inode_rollback_no_gen_floor_buggy`,
 `inode_rollback_no_cvers_floor_buggy` and
 `inode_rollback_rewinds_next_ino_buggy` each fire their invariant).
 Tests `fs_rollback_never_reissues_a_discarded_identity`,
-`p9_stale_fid_stays_stale_across_a_rollback`.
+`p9_stale_fid_stays_stale_across_a_rollback`, and their unseeded-mount
+twins `fs_rollback_in_an_unseeded_mount_never_reissues_a_discarded_ino`,
+`p9_stale_fid_stays_stale_across_a_rollback_in_an_unseeded_mount`.
 
 ### Persistence
 

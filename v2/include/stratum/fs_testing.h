@@ -102,8 +102,8 @@ void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
 /*
  * Make the next inode free that unlink, rmdir, rename over an existing
  * name or unlink_anon attempts answer `fail` instead, leaving the inode
- * as it was. One-shot; STM_OK disarms. This and the three above belong to
- * `fs` and go with it at unmount.
+ * as it was. One-shot; STM_OK disarms. This, the two above and the two
+ * below belong to `fs` and go with it at unmount.
  */
 void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
 
@@ -113,6 +113,13 @@ void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
  * `fail` instead. One-shot; STM_OK disarms.
  */
 void stm_fs_fail_next_name_back_for_test(stm_fs *fs, stm_status fail);
+
+/*
+ * Make stm_fs_name_to_handle skip its lockless reads and take the
+ * fs->global SH path, as when a lockless read answers EBUSY. false
+ * restores it.
+ */
+void stm_fs_force_name_to_handle_fallback_for_test(stm_fs *fs, bool force);
 #endif
 
 #ifdef __cplusplus

@@ -12005,6 +12005,56 @@ STM_TEST(fs_create_drops_dirent_records_a_reused_ino_still_holds) {
     reuse_fs_done(fs);
 }
 
+/* A handle names the file its name resolved to. A name record carrying
+ * an older incarnation of a reused ino stands for a name read just before
+ * its file was freed and the ino reused: the handle must name the old
+ * file (and go stale), never the new tenant. Both the lockless reads and
+ * the SH path. */
+static void handle_gen_leg(bool locked_only)
+{
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs(locked_only ? "handle_gen_sh" : "handle_gen", &dir);
+    if (!fs) return;
+    stm_fs_force_name_to_handle_fallback_for_test(fs, locked_only);
+    stm_dirent_index *didx = stm_sync_dirent_index(stm_fs_sync(fs));
+    uint64_t f1 = 0, f2 = 0, got = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f1", 2,
+                                        0644u, 0, 0, &f1));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f1, &v));
+    uint64_t old_gen = stm_load_le64(v.si_gen);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"f1", 2));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f2", 2,
+                                        0644u, 0, 0, &f2));
+    STM_ASSERT_EQ(f2, f1);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f2, &v));
+    uint64_t new_gen = stm_load_le64(v.si_gen);
+    STM_ASSERT_TRUE(new_gen != old_gen);
+    STM_ASSERT_OK(stm_dirent_alloc(didx, 1, dir, (const uint8_t *)"old", 3,
+                                      f1, old_gen, STM_DT_REG));
+
+    stm_fs_file_handle h = {0};
+    STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, dir, (const uint8_t *)"old",
+                                           3, &h));
+    STM_ASSERT_EQ(stm_load_le64(h.h_ino), f1);
+    STM_ASSERT_EQ(stm_load_le64(h.h_si_gen), old_gen);
+    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &got), STM_ESTALE);
+    STM_ASSERT_EQ(got, 0u);
+
+    /* control: the live name gets the live file */
+    STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, dir, (const uint8_t *)"f2",
+                                           2, &h));
+    STM_ASSERT_EQ(stm_load_le64(h.h_si_gen), new_gen);
+    STM_ASSERT_OK(stm_fs_open_by_handle(fs, &h, &got));
+    STM_ASSERT_EQ(got, f2);
+    reuse_fs_done(fs);
+}
+
+STM_TEST(fs_name_to_handle_names_the_incarnation_the_name_resolved_to) {
+    handle_gen_leg(false);
+    handle_gen_leg(true);
+}
+
 /* The scrub's extent lookup holds no fs->global, so a rollback can retire a
  * dataset's engine while the lookup walks it: the walk's EBR pin is what
  * keeps the retired engine alive until the walk leaves. */
