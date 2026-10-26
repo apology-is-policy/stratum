@@ -5109,6 +5109,7 @@ typedef enum {
     GAP_AT_FRESH,       /* right after a freshness check passes */
     GAP_AT_STEP,        /* right after a walk step */
     GAP_AT_RESTAT,      /* after an op, before the inode is read back */
+    GAP_AT_XATTR,       /* between Txattrwalk's size probe and fetch */
 } gap_at;
 
 /* Runs `op` on session 1, parked where it first reaches `ino` at the
@@ -5125,6 +5126,7 @@ static void gap_run_at(gap_fix *gf, gap_op *op, uint64_t ino, gap_at at,
     g.armed = true;
     if (at == GAP_AT_STEP)        stm_9p_server_set_step_hook(gap_fresh, &g);
     else if (at == GAP_AT_RESTAT) stm_9p_server_set_restat_hook(gap_fresh, &g);
+    else if (at == GAP_AT_XATTR)  stm_9p_server_set_xattrwalk_hook(gap_fresh, &g);
     else                          stm_9p_server_set_fresh_hook(gap_fresh, &g);
     op->s = gf->s1;
     pthread_t th;
@@ -5144,6 +5146,7 @@ static void gap_run_at(gap_fix *gf, gap_op *op, uint64_t ino, gap_at at,
     stm_9p_server_set_fresh_hook(NULL, NULL);
     stm_9p_server_set_step_hook(NULL, NULL);
     stm_9p_server_set_restat_hook(NULL, NULL);
+    stm_9p_server_set_xattrwalk_hook(NULL, NULL);
     pthread_cond_destroy(&g.cv);
     pthread_mutex_destroy(&g.mu);
 }
@@ -5466,6 +5469,38 @@ STM_TEST(p9_xattrwalk_through_a_fid_freed_in_the_gap_answers_estale) {
     gap_xattrwalk_leg("9p_gap_xattrwalk_list", NULL, gap_set_k_on_y);
     gap_xattrwalk_leg("9p_gap_xattrwalk_get_none", "user.k", NULL);
     gap_xattrwalk_leg("9p_gap_xattrwalk_list_none", NULL, NULL);
+}
+
+/* The size probe passes on "x" (which holds user.k = "XV"); "x" is then
+ * swapped for "y" holding user.k = "YV", the same size, so only the
+ * fetch's own gen check stands between the fid and "y"'s xattr. It must
+ * answer ESTALE and leave no aux fid behind. */
+static void gap_xattrwalk_fetch_leg(const char *fixture, const char *name)
+{
+    gap_fix gf;
+    gap_fix_up(&gf, fixture);
+    bool rep = false;
+    STM_ASSERT_OK(stm_fs_setxattr(gf.fs, 1, gf.ino_x,
+                                  (const uint8_t *)"user.k", 6,
+                                  (const uint8_t *)"XV", 2, 0, &rep));
+    gap_op *op = calloc(1, sizeof *op);
+    op->sz = build_txattrwalk(op->req, 4, 101, 105, name);
+    gap_run_at(&gf, op, gf.ino_x, GAP_AT_XATTR, gap_swap_x_for_y,
+               gap_set_k_on_y);
+    gap_assert_estale(op);
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tread(req, 960, 105, 0, 16);
+    STM_ASSERT_OK(stm_9p_server_handle(gf.s1, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    free(req); free(resp);
+    free(op);
+    gap_fix_down(&gf);
+}
+
+STM_TEST(p9_xattrwalk_through_a_fid_freed_between_its_fetches_answers_estale) {
+    gap_xattrwalk_fetch_leg("9p_gap_xattrwalk_fetch_get", "user.k");
+    gap_xattrwalk_fetch_leg("9p_gap_xattrwalk_fetch_list", NULL);
 }
 
 /* Twalk from the freed dir fid must not reach into "e": not its child

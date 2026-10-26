@@ -304,6 +304,8 @@ static struct stm_9p_server_test_hooks {
     void  *step_arg;
     void (*restat)(uint64_t ds, uint64_t ino, void *arg);
     void  *restat_arg;
+    void (*xattrwalk)(uint64_t ds, uint64_t ino, void *arg);
+    void  *xattrwalk_arg;
 } g_9p_test_hooks;
 
 void stm_9p_server_set_test_hooks(
@@ -334,10 +336,23 @@ void stm_9p_server_set_restat_hook(
     g_9p_test_hooks.restat_arg = arg;
 }
 
+void stm_9p_server_set_xattrwalk_hook(
+    void (*xattrwalk)(uint64_t ds, uint64_t ino, void *arg), void *arg)
+{
+    g_9p_test_hooks.xattrwalk     = xattrwalk;
+    g_9p_test_hooks.xattrwalk_arg = arg;
+}
+
 static void walk_step_hook(uint64_t ds, uint64_t ino)
 {
     if (g_9p_test_hooks.step)
         g_9p_test_hooks.step(ds, ino, g_9p_test_hooks.step_arg);
+}
+
+static void xattrwalk_fetch_hook(uint64_t ds, uint64_t ino)
+{
+    if (g_9p_test_hooks.xattrwalk)
+        g_9p_test_hooks.xattrwalk(ds, ino, g_9p_test_hooks.xattrwalk_arg);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -3915,6 +3930,7 @@ static stm_status h_xattrwalk(stm_9p_server *s,
                                       STM_9P_ECODE_ENOMEM);
             }
             size_t got = 0;
+            xattrwalk_fetch_hook(f->dataset_id, f->ino);
             rc = stm_fs_listxattr_if_gen(s->fs, f->dataset_id, f->ino,
                                          f->cached_gen,
                                          nf->xattr_buf, total, &got);
@@ -3951,6 +3967,7 @@ static stm_status h_xattrwalk(stm_9p_server *s,
                                       STM_9P_ECODE_ENOMEM);
             }
             uint32_t got = 0;
+            xattrwalk_fetch_hook(f->dataset_id, f->ino);
             rc = stm_fs_getxattr_if_gen(s->fs, f->dataset_id, f->ino,
                                         f->cached_gen,
                                         (const uint8_t *)name, (uint8_t)nlen,
