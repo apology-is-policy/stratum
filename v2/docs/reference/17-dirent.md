@@ -111,9 +111,10 @@ shape. Models `dirent.tla::Whiteout`.
 
 `stm_dirent_drop_for_dir` is the directory-cascade-free hook: drops
 EVERY record (live + tombstone + whiteout) keyed at `(ds, dir_ino,
-*)`. fs.c's pre-free cleanup calls it for every directory it frees
+*)`. fs.c's freed-inode cleanup calls it for every directory it frees
 (rmdir, and rename over an empty directory, whose emptiness check
-counts live records only), so a directory AllocReused at this
+counts live records only), once the directory is freed, so a directory
+AllocReused at this
 `dir_ino` inherits neither the tombstone trail (probe budget) nor the
 whiteouts (readdir lists them).
 

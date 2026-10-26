@@ -272,6 +272,17 @@ struct stm_fs {
      * whatever was true at the syscall boundary. */
     _Atomic(bool) read_only;
     _Atomic(bool) wedged;
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    /* fs_testing.h's knobs; they die with the fs, so a test that fails
+     * while one is armed cannot leave it to the next. */
+    stm_status free_fail_next;
+    stm_status name_back_fail_next;
+    stm_fs_free_cleanup_hook free_cleanup_hook;
+    void *free_cleanup_hook_arg;
+    stm_fs_xattr_read_gap_hook xattr_read_gap_hook;
+    void *xattr_read_gap_hook_arg;
+#endif
 };
 
 /* Guard macros. The lock-holding variants (FS_GUARD_READ / FS_GUARD_WRITE)
@@ -1028,14 +1039,11 @@ stm_status stm_fs_format(const char *path, stm_fs_format_opts *opts)
  * stm_fs_unmount BEFORE the static definitions below. */
 static stm_status fs_flush_ino_locked(stm_fs *fs, uint64_t ds, uint64_t ino);
 static stm_status fs_flush_all_locked(stm_fs *fs);
-/* R128 P1-1 + P1-2 helpers. The pre returns true iff it actually
- * truncated extents (i.e., reclaim work is pending); callers gate the
- * post-reclaim double-commit on that signal so inodes with no extent
- * payload (directories, symlinks, fresh-anon-then-unlinked, inline-
- * data-only files) skip the ~200 ms commit pair entirely. */
-static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs, uint64_t ds,
-                                                  uint64_t ino,
-                                                  const struct stm_inode_value *cv);
+/* R128 P1-1 + P1-2 helpers. The cleanup returns true iff it actually
+ * truncated extents (i.e., reclaim work is pending). */
+static bool fs_freed_inode_cleanup_locked(stm_fs *fs, uint64_t ds,
+                                          uint64_t ino,
+                                          const struct stm_inode_value *cv);
 static bool fs_post_inode_free_reclaim_locked(stm_fs *fs);
 /* CF-4 C: reclaim-on-ENOSPC backstop -- sweep deferred PENDING then signal
  * a retry (wedges in place on a crash-equivalent commit failure). Used by
@@ -3100,6 +3108,78 @@ lookup_fallback:
     }
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail)
+{
+    fs->free_fail_next = fail;
+}
+
+void stm_fs_fail_next_name_back_for_test(stm_fs *fs, stm_status fail)
+{
+    fs->name_back_fail_next = fail;
+}
+
+void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
+                                           stm_fs_free_cleanup_hook fn,
+                                           void *arg)
+{
+    fs->free_cleanup_hook = fn;
+    fs->free_cleanup_hook_arg = arg;
+}
+
+void stm_fs_set_xattr_read_gap_hook_for_test(stm_fs *fs,
+                                             stm_fs_xattr_read_gap_hook fn,
+                                             void *arg)
+{
+    fs->xattr_read_gap_hook = fn;
+    fs->xattr_read_gap_hook_arg = arg;
+}
+#endif
+
+/* The status an armed test injects, once, in place of the inode free it
+ * precedes; STM_OK otherwise. */
+static stm_status fs_free_injected_failure(stm_fs *fs)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    stm_status s = fs->free_fail_next;
+    fs->free_fail_next = STM_OK;
+    return s;
+#else
+    (void)fs;
+    return STM_OK;
+#endif
+}
+
+/* The same, in place of the dirent that gives a name back after a free
+ * that failed. */
+static stm_status fs_name_back_injected_failure(stm_fs *fs)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    stm_status s = fs->name_back_fail_next;
+    fs->name_back_fail_next = STM_OK;
+    return s;
+#else
+    (void)fs;
+    return STM_OK;
+#endif
+}
+
+/* Runs the test's hook between a lockless xattr read's existence check
+ * and the read, outside the EBR section so the hook may write. */
+static void fs_xattr_read_gap(stm_fs *fs, stm_ebr_thread *ebr)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->xattr_read_gap_hook) {
+        stm_ebr_exit(ebr);
+        fs->xattr_read_gap_hook(fs->xattr_read_gap_hook_arg);
+        stm_ebr_enter(ebr);
+    }
+#else
+    (void)fs;
+    (void)ebr;
+#endif
+}
+
 /* A reused ino (gen != 0; AllocFresh stamps 0) can still hold records of
  * a previous tenant, keyed by (ds, ino) with no gen: xattrs (a volume
  * written before the free path dropped them, a rollback to such a tree, a
@@ -3653,23 +3733,20 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
         return STM_EINVAL;
     }
 
-    /* R128 P1-2: orphan-free has no nlink check (anonymous inodes
-     * always have nlink=0 when reachable via this entry point). Drop
-     * the dirty-buffer entry AND truncate the inode's extents BEFORE
-     * the free; otherwise the buffer's (ds, ino) entry outlives the
-     * inode slot's free and surfaces as a confused-deputy write into
-     * whatever inode reuses the slot. Same shape as the canonical
-     * unlink path and rename's overwrite branch. */
-    (void)fs_pre_inode_free_cleanup_locked(fs, dataset_id, ino, &iv);
-
     /* stm_inode_free transitions ALLOCATED → FREED, sets FREED flag,
      * clears nlink. The ORPHAN flag survives in si_flags but is moot
      * (FREED records aren't readable via lookup). The next AllocReused
      * on this slot's records[] entry will memset the value, clearing
-     * both flags. */
-    stm_status fs_free = stm_inode_free(iidx, dataset_id, ino);
+     * both flags. Orphan-free has no nlink check (anonymous inodes
+     * always have nlink=0 when reachable via this entry point). The
+     * records keyed by the ino go once it is freed, under its pin
+     * (R128 P1-2); a free that fails keeps them with the orphan. */
+    stm_status fs_free = fs_free_injected_failure(fs);
+    if (fs_free == STM_OK) fs_free = stm_inode_free(iidx, dataset_id, ino);
+    if (fs_free == STM_OK)
+        (void)fs_freed_inode_cleanup_locked(fs, dataset_id, ino, &iv);
 
-    /* CF-4 C: no eager reclaim. The pre-cleanup dropped this inode's
+    /* CF-4 C: no eager reclaim. The cleanup dropped this inode's
      * extents to PENDING (free_gen=current_gen); they return to FREE
      * lazily at the next commit's sweep, or on-demand via the
      * reserve-path reclaim-on-ENOSPC backstop (fs_reclaim_on_enospc_
@@ -3703,34 +3780,38 @@ static stm_status fs_mkdir(stm_fs *fs, uint64_t dataset_id,
                                        out_child_ino, out_child_iv);
 }
 
-/* R128 P1-1 + P1-2: pre-free cleanup helper. Drops the inode's xattrs,
- * a directory's dirent records, the dirty_buffer entry for (ds, ino) AND
- * truncates the inode's extents to 0. Caller MUST hold fs->lock, have
- * looked up `cv`, and be about to free the inode (via
- * stm_inode_unlink-with-cascade OR direct stm_inode_free).
+/* R128 P1-1 + P1-2: freed-inode cleanup. Drops the inode's xattrs, its
+ * lock records, a directory's dirent records, the dirty_buffer entry for
+ * (ds, ino) AND truncates the inode's extents to 0. Caller holds
+ * fs->global SH, looked `cv` up before the free, has just freed the inode
+ * (stm_inode_unlink's cascade or stm_inode_free) and still holds its
+ * EXCLUSIVE pin.
  *
- * The helper is the load-bearing fix for the audit's P1 class: the
- * dirty buffer is keyed by (dataset_id, ino) ONLY — no si_gen — so
- * a buffered range that outlives its inode's free path will surface
- * as a stale write to whatever inode reuses the slot next. Every
- * inode-freeing site MUST call this BEFORE the free.
+ * Each of those records is keyed by (dataset_id, ino) with no si_gen, so
+ * one that outlived the free would surface on the inode reusing the slot:
+ * a buffered range as a write into it, xattrs and extents as its own.
+ * They go AFTER the free, so that no reader sees the inode alive without
+ * them and a free that fails keeps them. Nothing re-creates one in
+ * between: a write, a per-inode drain or a truncate needs this pin; a
+ * lock acquire, setxattr and removexattr need fs->global EX; a
+ * cross-inode drain under SH may turn the buffered ranges into extents,
+ * which the truncate below drops (neither reads the inode). A create that
+ * reuses the ino allocates it before it pins it, so it waits on this pin
+ * and runs its own reuse cleanup after this one.
  *
- * Gates internally on (regular file, EXTENT data kind). nlink check
- * is the caller's responsibility — fs_unlink_inode_and_dirent guards
- * with `nlink == 1u` (about-to-cascade-free); stm_fs_unlink_anon does
- * NO guard (orphan-free is direct); stm_fs_rename's overwrite branch
- * guards via `dst_freed_unused`'s precondition (nlink == 1 → unlink
- * cascades).
- *
- * Best-effort: a stm_sync_truncate failure here leaves leaked paddrs
- * but doesn't break the free. Returns nothing.
+ * Best-effort: a stm_sync_truncate failure leaks paddrs, and a failed
+ * xattr drop is reported; the create that reuses the ino retries both.
  */
-static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs,
-                                                  uint64_t dataset_id,
-                                                  uint64_t ino,
-                                                  const struct stm_inode_value *cv)
+static bool fs_freed_inode_cleanup_locked(stm_fs *fs,
+                                          uint64_t dataset_id,
+                                          uint64_t ino,
+                                          const struct stm_inode_value *cv)
 {
     if (!cv) return false;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->free_cleanup_hook)
+        fs->free_cleanup_hook(dataset_id, ino, fs->free_cleanup_hook_arg);
+#endif
     /* xattr records are keyed by (ds, ino) alone, so any left here would
      * surface on whichever inode reuses the slot. A failure is reported
      * and left to the create that reuses the ino, which drops them again
@@ -3929,6 +4010,8 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     stm_inode_handle *h_parent = NULL;
     stm_inode_handle *h_child  = NULL;
     uint64_t child_ino = 0;
+    uint64_t child_dgen = 0;            /* the dirent's, to give the name back */
+    uint8_t  child_dtype = 0;
     struct stm_inode_value cv = {0};
     struct stm_inode_value pv = {0};    /* the parent, loaded under its pin */
     int attempts = 0;
@@ -3978,7 +4061,8 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         uint64_t revalidated_child = 0;
         stm_status rds = stm_dirent_lookup(didx, dataset_id, parent_ino,
                                                 name, name_len,
-                                                &revalidated_child, NULL, NULL);
+                                                &revalidated_child,
+                                                &child_dgen, &child_dtype);
         if (rds != STM_OK || revalidated_child != observed_child) {
             /* Dirent changed between pre-pin lookup and pin. Drop pins
              * and retry. Common cause: a racing rename swapped the
@@ -4059,63 +4143,41 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         return us;
     }
 
-    /* P8-POSIX-2b R73 P2-1: a directory never has nlink > 1 (hard links
-     * to directories are refused), so rmdir always reaches the cleanup
-     * helper below, which drops every record keyed under the freed
-     * dir's ino (tombstones of its former children, whiteouts). */
-
-    /* SWISS-4q P2: drop the inode's extents BEFORE the inode-unlink
-     * cascade-frees the inode. stm_inode_unlink only mutates the
-     * inode-index record (nlink-- + transition to FREED at nlink=0);
-     * it does NOT walk the extent index. Without this drop, every
-     * extent record + every paddr the inode owned LEAKS — the
-     * allocator never reclaims the blocks, and the volume hits
-     * ENOSPC after one cycle of "write 1.8 GB / rm" on a 3 GB
-     * pool (user-reported 2026-05-10).
-     *
-     * Conditions for the drop:
-     *   1. Regular file (S_IFREG) — dirs hold no extent data;
-     *      symlinks store the target inline; devices have no data.
-     *   2. EXTENT data_kind — INLINE data lives inside the inode
-     *      record itself and is freed when the inode transitions
-     *      to FREED.
-     *   3. nlink == 1 — this is the LAST link. With future hard
-     *      links (nlink > 1), unlinking one dirent leaves the
-     *      others reachable; we must NOT drop extents until the
-     *      last link goes away.
-     *
-     * stm_sync_truncate(ds, ino, 0) is the right primitive: it
-     * walks the extent index for (ds, ino) and routes every paddr
-     * through sync_drop_paddr_locked → allocator's free path. The
-     * call is best-effort — a failure here leaves leaked extents
-     * (worse: the inode also gets freed by the unlink below, so
-     * the leak is permanent until offline scrub) but doesn't break
-     * the unlink itself. Returns STM_OK on a fresh-inode no-extent
-     * case (nothing to drop). */
-    {
-        uint32_t cur_nlink = stm_load_le32(cv.si_nlink);
-        if (cur_nlink == 1u) {
-            /* SWISS-4q-flush: drop any buffered ranges for this inode
-             * BEFORE the extent-layer truncate. Once the inode is
-             * gone, buffered plaintext for it is unreachable —
-             * destroying it here keeps total_bytes accurate AND
-             * prevents a future flush from emitting extents under
-             * a freed inode. R128 P1-1 close: helper extracted so
-             * rename's overwrite branch + stm_fs_unlink_anon share
-             * the same cleanup. */
-            (void)fs_pre_inode_free_cleanup_locked(
-                fs, dataset_id, child_ino, &cv);
-        }
-    }
-
     /* P8-POSIX-3: nlink-aware unlink. Decrement nlink; cascade-free
-     * triggers atomically when nlink reaches 0. For the MVP-single-
-     * link case (no hard links yet, every alloc has nlink=1) this
-     * always cascades — same observable outcome as the prior
-     * unconditional stm_inode_free, but with the nlink semantics
-     * that hard-link-aware paths require. */
+     * triggers atomically when nlink reaches 0 (hard links bump nlink
+     * past 1). A directory never has nlink > 1 (hard links to
+     * directories are refused), so rmdir always frees.
+     *
+     * Only a free drops the records keyed by the ino alone, and only
+     * after it (fs_freed_inode_cleanup_locked): xattrs, lock records, a
+     * directory's tombstones and whiteouts (R73 P2-1), the buffered
+     * ranges (SWISS-4q-flush) and the extents (SWISS-4q P2:
+     * stm_inode_unlink touches only the inode record, so without the
+     * truncate every block the file owned leaks -- user-reported
+     * 2026-05-10, "write 1.8 GB / rm" ENOSPC after one cycle). INLINE
+     * data lives in the inode record and goes with it. A failed
+     * decrement keeps the inode linked and every record, so the name
+     * comes back: under the parent's pin the slot just tombstoned is
+     * free to take it; a name that cannot come back leaves an orphan,
+     * which wedges as rename's rollback does. */
     bool freed = false;
-    (void)stm_inode_unlink(iidx, dataset_id, child_ino, &freed);
+    stm_status ius = fs_free_injected_failure(fs);
+    if (ius == STM_OK)
+        ius = stm_inode_unlink(iidx, dataset_id, child_ino, &freed);
+    if (ius != STM_OK) {
+        stm_status nb = fs_name_back_injected_failure(fs);
+        if (nb == STM_OK)
+            nb = stm_dirent_alloc(didx, dataset_id, parent_ino, name,
+                                  name_len, child_ino, child_dgen,
+                                  child_dtype);
+        stm_inode_unpin(iidx, h_parent);
+        stm_inode_unpin(iidx, h_child);
+        pthread_rwlock_unlock(&fs->global);
+        if (nb != STM_OK) stm_fs_mark_wedged(fs);
+        return ius;
+    }
+    if (freed)
+        (void)fs_freed_inode_cleanup_locked(fs, dataset_id, child_ino, &cv);
 
     /* P8-POSIX-7a: unlink that decrements nlink without cascade-freeing
      * is a metadata change → ctime auto-stamps to "now" on the
@@ -4130,7 +4192,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         }
     }
 
-    /* CF-4 C: no eager reclaim (cf-4c-design.md §4.1). The pre-cleanup
+    /* CF-4 C: no eager reclaim (cf-4c-design.md §4.1). The cleanup
      * dropped this inode's extents to PENDING (free_gen=current_gen);
      * the sweep predicate is strict `free_gen < committed_gen` (R50 P2-1
      * crash-safety), so reclaiming within-session needs a commit at a
@@ -6075,22 +6137,15 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
      * lookups of dst_name will find the new record). */
     bool dst_freed_unused = false;
     if (dst_exists) {
-        /* R128 P1-1: if dst is about to cascade-free (nlink==1), drop
-         * its dirty-buffer entry AND truncate its extents BEFORE the
-         * inode-unlink. Otherwise the buffer's (ds, dst_ino) entry
-         * outlives the inode slot's free and a future flush emits
-         * extents under whatever inode reuses the slot at a bumped
-         * si_gen — confused-deputy-class data corruption. Inode lookup
-         * is best-effort. The freed extents drop to PENDING; CF-4 C
-         * reclaims them lazily (no eager double-commit here). Runs
-         * under dst_ino's pin (acquired above via pin_many). */
+        /* R128 P1-1: dst's value, read under its pin (pin_many above),
+         * for the cleanup that follows its free; a dst that cannot be
+         * read refuses before anything changes. */
         struct stm_inode_value dcv = {0};
-        if (stm_inode_lookup(iidx, dataset_id, dst_ino, &dcv) == STM_OK) {
-            uint32_t dst_cur_nlink = stm_load_le32(dcv.si_nlink);
-            if (dst_cur_nlink == 1u) {
-                (void)fs_pre_inode_free_cleanup_locked(
-                    fs, dataset_id, dst_ino, &dcv);
-            }
+        stm_status dls = stm_inode_lookup(iidx, dataset_id, dst_ino, &dcv);
+        if (dls != STM_OK) {
+            FS_RENAME_UNPIN_ALL();
+            pthread_rwlock_unlock(&fs->global);
+            return dls;
         }
         stm_status du = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
                                                 dst_name, dst_name_len);
@@ -6101,19 +6156,30 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             pthread_rwlock_unlock(&fs->global);
             return du;
         }
-        stm_status iu = stm_inode_unlink(iidx, dataset_id, dst_ino,
-                                            &dst_freed_unused);
+        stm_status iu = fs_free_injected_failure(fs);
+        if (iu == STM_OK)
+            iu = stm_inode_unlink(iidx, dataset_id, dst_ino,
+                                  &dst_freed_unused);
         if (iu != STM_OK) {
             /* Rollback: re-create dst dirent. Under dst_parent's pin
              * the slot is still a tombstone we just created; alloc
-             * reuses it. */
-            (void)stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
-                                       dst_name, dst_name_len,
-                                       dst_ino, dst_gen, dst_type);
+             * reuses it. A name that cannot come back leaves dst an
+             * orphan: wedge, as the rollbacks below do. */
+            stm_status nb = fs_name_back_injected_failure(fs);
+            if (nb == STM_OK)
+                nb = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
+                                      dst_name, dst_name_len,
+                                      dst_ino, dst_gen, dst_type);
             FS_RENAME_UNPIN_ALL();
             pthread_rwlock_unlock(&fs->global);
+            if (nb != STM_OK) stm_fs_mark_wedged(fs);
             return iu;
         }
+        /* The records keyed by dst's ino go once it is freed, still under
+         * its pin; the failed free above kept them, and a whole file. */
+        if (dst_freed_unused)
+            (void)fs_freed_inode_cleanup_locked(fs, dataset_id, dst_ino,
+                                                &dcv);
     }
 
     /* Install dirent at dst pointing at src_ino. */
@@ -6218,7 +6284,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
 
     /* CF-4 C: no eager reclaim for the overwrite-cascade-free path
      * (cf-4c-design.md §4.1). If dst was overwritten + cascade-freed, its
-     * extents were dropped to PENDING above via fs_pre_inode_free_cleanup_
+     * extents were dropped to PENDING above via fs_freed_inode_cleanup_
      * locked; they return to FREE at the next commit's sweep or on-demand
      * via the reserve-path backstop (fs_reclaim_on_enospc_locked) -- same
      * deferral as unlink / truncate-shrink / COW-overwrite. Pre-CF-4-C
@@ -6727,6 +6793,26 @@ static stm_status fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     return s;
 }
 
+/* A lockless xattr read stands only if the incarnation its existence check
+ * found is still there after the read: a free drops the inode's xattrs
+ * record by record AFTER freeing it, so a read that saw any part of that
+ * drop, an empty or a partial set, finds the free here. STM_ENOENT if the
+ * inode went or the ino holds another incarnation; STM_ECORRUPT / STM_EBUSY
+ * send the caller to its SH fallback. A rollback between the two lookups
+ * is outside this, as for every lockless read. */
+static stm_status fs_xattr_read_stands_concurrent(stm_inode_index *iidx,
+                                                  stm_ebr_thread *ebr,
+                                                  uint64_t ds, uint64_t ino,
+                                                  const struct stm_inode_value *seen)
+{
+    struct stm_inode_value now;
+    memset(&now, 0, sizeof now);
+    stm_status s = stm_inode_lookup_concurrent(iidx, ebr, ds, ino, &now);
+    if (s != STM_OK) return s;
+    return stm_load_le64(now.si_gen) == stm_load_le64(seen->si_gen)
+        ? STM_OK : STM_ENOENT;
+}
+
 static stm_status fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                               const uint64_t *gen,
                               const uint8_t *name, uint8_t name_len,
@@ -6771,12 +6857,19 @@ static stm_status fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     stm_status is = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
                                                    ino, &iv);
     if (is == STM_OK) {
+        fs_xattr_read_gap(fs, ebr);
         s = stm_xattr_get_concurrent(xidx, ebr, dataset_id, ino,
                                         name, name_len,
                                         value_buf, value_max, out_size);
+        if (s != STM_ECORRUPT && s != STM_EBUSY)
+            is = fs_xattr_read_stands_concurrent(iidx, ebr, dataset_id, ino,
+                                                 &iv);
     }
     stm_ebr_exit(ebr);
-    if (is != STM_OK && is != STM_ECORRUPT && is != STM_EBUSY) return is;
+    if (is != STM_OK && is != STM_ECORRUPT && is != STM_EBUSY) {
+        *out_size = 0;
+        return is;
+    }
     if (is == STM_OK && s != STM_ECORRUPT && s != STM_EBUSY) return s;
 
     /* R171 P1-1 SH-fallback (see stm_fs_stat), and the gen-checked
@@ -6836,13 +6929,13 @@ static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (fs_ino_is_synth(ino)) return STM_ENOTSUPPORTED;
 
     /* 9.8-LF-3 port: drop fs->global SH; atomic wedge gate + one EBR
-     * pin over the inode-existence check and the two
-     * xattr_list_concurrent passes (probe count + materialise). The pin
-     * keeps alive every node those descents read; it does not order
-     * them against a writer, which never waits for readers. A count the
-     * materialise does not reproduce falls back to the SH path below;
-     * a destroy that lands between the existence check and the count is
-     * not caught here, and answers an empty list. */
+     * pin over the inode-existence check, the two xattr_list_concurrent
+     * passes (probe count + materialise) and a second existence check.
+     * The pin keeps alive every node those descents read; it does not
+     * order them against a writer, which never waits for readers. A
+     * count the materialise does not reproduce falls back to the SH path
+     * below; a free during the passes answers ENOENT at the second check
+     * (fs_xattr_read_stands_concurrent). */
     FS_GUARD_READ_LOCKLESS(fs);
 
     stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
@@ -6867,6 +6960,7 @@ static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     if (listxattr_force_fallback) need_fallback = true;
 #endif
+    if (!need_fallback) fs_xattr_read_gap(fs, ebr);
 
     size_t n_total = 0;
     size_t got = 0;
@@ -6883,9 +6977,13 @@ static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     }
 
     if (!need_fallback && n_total == 0) {
-        *out_total_len = 0;
-        stm_ebr_exit(ebr);
-        return STM_OK;
+        stm_status rs = fs_xattr_read_stands_concurrent(iidx, ebr, dataset_id,
+                                                        ino, &iv);
+        if (rs != STM_ECORRUPT && rs != STM_EBUSY) {
+            stm_ebr_exit(ebr);
+            return rs;
+        }
+        need_fallback = true;
     }
 
     if (!need_fallback) {
@@ -6924,6 +7022,19 @@ static stm_status fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             free(batch);
             stm_ebr_exit(ebr);
             return ls;
+        }
+    }
+    if (!need_fallback) {
+        stm_status rs = fs_xattr_read_stands_concurrent(iidx, ebr, dataset_id,
+                                                        ino, &iv);
+        if (rs == STM_ECORRUPT || rs == STM_EBUSY) {
+            free(batch);
+            batch = NULL;
+            need_fallback = true;
+        } else if (rs != STM_OK) {
+            free(batch);
+            stm_ebr_exit(ebr);
+            return rs;
         }
     }
     stm_ebr_exit(ebr);

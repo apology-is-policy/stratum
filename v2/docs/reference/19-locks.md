@@ -61,8 +61,8 @@ EVERY lock held by `owner_id` across all inodes. Linux releases all OFD
 locks tied to a closing fd; bindings call this on fd-close.
 
 `stm_lock_release_ino` is the **inode-free** path — releases every lock on
-`(dataset_id, ino)`, every incarnation, whoever holds it. fs.c's pre-free
-cleanup calls it as it frees the inode, so a freed file's records go at
+`(dataset_id, ino)`, every incarnation, whoever holds it. fs.c's freed-inode
+cleanup calls it once the inode is freed, so a freed file's records go at
 once instead of when their owners close; a fid on the freed file answers
 ESTALE, so it could not release them itself (test
 `fs_freed_inode_takes_its_locks_with_it`).

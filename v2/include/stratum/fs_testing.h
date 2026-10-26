@@ -75,6 +75,44 @@ typedef void (*stm_fs_listxattr_fallback_hook)(void *arg);
 void stm_fs_set_listxattr_fallback_for_test(bool force,
                                             stm_fs_listxattr_fallback_hook fn,
                                             void *arg);
+
+/*
+ * Call `fn` in the lockless legs of stm_fs_getxattr and stm_fs_listxattr
+ * after the inode's existence check and before the xattr read, with no fs
+ * lock and no EBR section held, so it may write. NULL restores it. Set it
+ * only while no xattr read runs on `fs`.
+ */
+typedef void (*stm_fs_xattr_read_gap_hook)(void *arg);
+void stm_fs_set_xattr_read_gap_hook_for_test(stm_fs *fs,
+                                             stm_fs_xattr_read_gap_hook fn,
+                                             void *arg);
+
+/*
+ * Call `fn` as a freed inode's cleanup starts (the inode is already
+ * freed; its xattrs, lock records, dirent records and extents are not yet
+ * dropped), with fs->global SH and the inode's exclusive pin held: `fn`
+ * may read the indexes, not call the fs. NULL restores it.
+ */
+typedef void (*stm_fs_free_cleanup_hook)(uint64_t dataset_id, uint64_t ino,
+                                         void *arg);
+void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
+                                           stm_fs_free_cleanup_hook fn,
+                                           void *arg);
+
+/*
+ * Make the next inode free that unlink, rmdir, rename over an existing
+ * name or unlink_anon attempts answer `fail` instead, leaving the inode
+ * as it was. One-shot; STM_OK disarms. This and the three above belong to
+ * `fs` and go with it at unmount.
+ */
+void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
+
+/*
+ * Make the next dirent that unlink, rmdir or rename over an existing
+ * name installs to give a name back, after a free that failed, answer
+ * `fail` instead. One-shot; STM_OK disarms.
+ */
+void stm_fs_fail_next_name_back_for_test(stm_fs *fs, stm_status fail);
 #endif
 
 #ifdef __cplusplus

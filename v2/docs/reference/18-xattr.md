@@ -100,9 +100,10 @@ probe indices per `xattr.tla::BuggyUnlinkUsesEmpty`). Models
 `stm_xattr_drop_for_ino` is the inode-free hook: drops EVERY record
 (live + tombstone) keyed at `(dataset_id, ino, *)`. The key carries no
 gen, so records left behind surface on whichever inode reuses the slot.
-fs.c calls it from the pre-free cleanup (`fs_pre_inode_free_cleanup_locked`:
+fs.c calls it from the freed-inode cleanup (`fs_freed_inode_cleanup_locked`:
 the last unlink, rmdir, rename over an existing name, `unlink_anon`)
-before the inode is freed, reporting a failure on stderr; and every
+once the inode is freed, in the same `fs->global` SH section and still
+holding the inode's EXCLUSIVE pin, reporting a failure on stderr; and every
 create that is handed a reused ino (`si_gen != 0`) calls it again before
 linking the inode (`fs_clean_reused_ino_locked`) and refuses if it
 fails, so a create never inherits. A failure that persists (a damaged
@@ -113,10 +114,22 @@ predecessor's xattrs or data. The second call is also what clears
 volumes written before the first existed: until then nothing called
 the hook, and a reused ino carried its previous tenant's xattrs (tests
 `fs_reused_ino_starts_without_the_old_xattrs`,
-`fs_create_drops_xattrs_a_reused_ino_still_holds`). Dropping before
-the free leaves the dying inode present without its xattrs for the
-span of the unlink, which a concurrent lockless reader can observe.
-Every one of these drops runs under `fs->global` SH with the inode's
+`fs_create_drops_xattrs_a_reused_ino_still_holds`). Dropping only
+after the free means no reader sees the inode alive without its
+xattrs, and a free that fails keeps them: an unlink or rmdir whose free
+fails gives the name back and answers the error, a rename over a name
+whose free fails restores that name, and the file stays whole (tests
+`fs_a_failed_free_keeps_the_file_whole`,
+`fs_free_drops_an_inodes_records_only_after_freeing_it`). A create
+that reuses the ino allocates it before it pins it, so it waits for
+the cleanup and runs its own after. The lockless getxattr and
+listxattr legs look the inode up again after the read, in the same EBR
+section: the drop deletes record by record, so a read an unlink
+overtakes can find none or some of the xattrs, and it answers ENOENT
+when the inode is gone or the ino holds another incarnation, as a read
+after the unlink would (test
+`fs_lockless_xattr_reads_answer_for_the_inode_they_found`). Every one
+of these drops runs under `fs->global` SH with the inode's
 EXCLUSIVE pin held, so listxattr's SH fallback takes the inode's shared
 pin across its count and materialize passes: without it, a drop
 between the passes made the two disagree and the fallback answer
@@ -249,7 +262,10 @@ IS that serialization. No `btree_engine` API is ever touched without
 dataset index per call; lifetime is safe because the fs.c layer holds
 `fs->global` SH/EX across every xattr op, and `stm_dataset_destroy`
 takes `fs->global` EX — so a slot's engine cannot be closed mid-op.
-No cross-layer dependencies — the xattr module takes its own lock
+The `_concurrent` read siblings hold neither lock: they reach the
+engine through `stm_dataset_index_get_engine_pinned` under the
+caller's EBR pin, and a destroyed dataset's engine is retired through
+EBR. No cross-layer dependencies — the xattr module takes its own lock
 only.
 
 ### POSIX namespace gating

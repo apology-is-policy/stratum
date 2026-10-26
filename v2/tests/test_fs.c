@@ -12764,4 +12764,343 @@ STM_TEST(fs_if_gen_namespace_ops_act_only_on_their_incarnation) {
     unlink(g_key_path);
 }
 
+/* What a freed inode's cleanup finds as it starts: the inode already
+ * gone, its xattrs still there. */
+struct free_order_probe {
+    stm_fs    *fs;
+    uint64_t   ino;
+    int        calls;
+    stm_status inode_at_cleanup;
+    size_t     xattrs_at_cleanup;
+};
+
+static void free_order_hook(uint64_t ds, uint64_t ino, void *arg)
+{
+    struct free_order_probe *p = arg;
+    if (ds != 1u || ino != p->ino) return;
+    p->calls++;
+    struct stm_inode_value iv;
+    p->inode_at_cleanup = stm_inode_lookup(
+        stm_sync_inode_index(stm_fs_sync(p->fs)), 1, ino, &iv);
+    p->xattrs_at_cleanup = xattr_records(p->fs, ino);
+}
+
+static void free_order_arm(struct free_order_probe *p, uint64_t ino)
+{
+    p->ino = ino;
+    p->calls = 0;
+    p->inode_at_cleanup = STM_OK;
+    p->xattrs_at_cleanup = SIZE_MAX;
+}
+
+static void free_order_assert(stm_fs *fs, const struct free_order_probe *p)
+{
+    STM_ASSERT_EQ(p->calls, 1);
+    STM_ASSERT_ERR(p->inode_at_cleanup, STM_ENOENT);
+    STM_ASSERT_EQ(p->xattrs_at_cleanup, (size_t)1);
+    STM_ASSERT_EQ(xattr_records(fs, p->ino), (size_t)0);
+}
+
+/* Every free drops the records keyed by the ino only after the inode is
+ * freed, so no reader sees it alive without them; an unlink that leaves
+ * a link drops nothing. */
+STM_TEST(fs_free_drops_an_inodes_records_only_after_freeing_it) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("free_order", &dir);
+    if (!fs) return;
+    struct free_order_probe p = { .fs = fs };
+    stm_fs_set_free_cleanup_hook_for_test(fs, free_order_hook, &p);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &f));
+    set_old_xattr(fs, f);
+    STM_ASSERT_OK(stm_fs_link_by_ino(fs, 1, f, dir, (const uint8_t *)"f2", 2));
+    free_order_arm(&p, f);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"f", 1));
+    STM_ASSERT_EQ(p.calls, 0);
+    STM_ASSERT_EQ(xattr_records(fs, f), (size_t)1);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"f2", 2));
+    free_order_assert(fs, &p);
+
+    uint64_t d = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, (const uint8_t *)"d", 1,
+                                  040755u, 0, 0, &d));
+    set_old_xattr(fs, d);
+    free_order_arm(&p, d);
+    STM_ASSERT_OK(stm_fs_rmdir(fs, 1, dir, (const uint8_t *)"d", 1));
+    free_order_assert(fs, &p);
+
+    uint64_t ra = 0, rb = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"ra", 2,
+                                        0644u, 0, 0, &ra));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"rb", 2,
+                                        0644u, 0, 0, &rb));
+    set_old_xattr(fs, rb);
+    free_order_arm(&p, rb);
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, dir, (const uint8_t *)"ra", 2,
+                                dir, (const uint8_t *)"rb", 2, 0));
+    free_order_assert(fs, &p);
+
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &a));
+    set_old_xattr(fs, a);
+    free_order_arm(&p, a);
+    STM_ASSERT_OK(stm_fs_unlink_anon(fs, 1, a));
+    free_order_assert(fs, &p);
+
+    reuse_fs_done(fs);
+}
+
+static void fill_pattern(uint8_t *buf, size_t len, uint8_t seed)
+{
+    for (size_t i = 0; i < len; i++) buf[i] = (uint8_t)(seed + i * 7u);
+}
+
+/* The file `ino` still answers under `name` in `dir`, with the xattr
+ * set_old_xattr gave it and, when `data` is set, those bytes. */
+static void assert_file_whole(stm_fs *fs, uint64_t dir, const char *name,
+                              uint64_t ino, const uint8_t *data, size_t len)
+{
+    uint64_t got_ino = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)name,
+                                   (uint8_t)strlen(name), &got_ino));
+    STM_ASSERT_EQ(got_ino, ino);
+    uint8_t v[8];
+    uint32_t vsz = 0;
+    STM_ASSERT_OK(stm_fs_getxattr(fs, 1, ino, (const uint8_t *)"user.k", 6,
+                                     v, sizeof v, &vsz));
+    STM_ASSERT_EQ(vsz, 3u);
+    STM_ASSERT_EQ(memcmp(v, "old", 3), 0);
+    if (!data) return;
+    uint8_t back[8192];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, ino, 0, back, len, &got));
+    STM_ASSERT_EQ(got, len);
+    STM_ASSERT_EQ(memcmp(back, data, len), 0);
+}
+
+/* A free that fails leaves the file as it was: its name, its xattrs, its
+ * data. Nothing of it may go before the free has happened. */
+STM_TEST(fs_a_failed_free_keeps_the_file_whole) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("failed_free", &dir);
+    if (!fs) return;
+    struct free_order_probe p = { .fs = fs };
+    stm_fs_set_free_cleanup_hook_for_test(fs, free_order_hook, &p);
+    uint8_t data[8192];
+    fill_pattern(data, sizeof data, 0x31);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, data, sizeof data));
+    set_old_xattr(fs, f);
+    free_order_arm(&p, f);
+    stm_fs_fail_next_inode_free_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"f", 1),
+                   STM_EIO);
+    STM_ASSERT_EQ(p.calls, 0);
+    assert_file_whole(fs, dir, "f", f, data, sizeof data);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"f", 1));
+    free_order_assert(fs, &p);
+
+    uint64_t d = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, (const uint8_t *)"d", 1,
+                                  040755u, 0, 0, &d));
+    set_old_xattr(fs, d);
+    free_order_arm(&p, d);
+    stm_fs_fail_next_inode_free_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_rmdir(fs, 1, dir, (const uint8_t *)"d", 1),
+                   STM_EIO);
+    STM_ASSERT_EQ(p.calls, 0);
+    assert_file_whole(fs, dir, "d", d, NULL, 0);
+
+    uint64_t ra = 0, rb = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"ra", 2,
+                                        0644u, 0, 0, &ra));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"rb", 2,
+                                        0644u, 0, 0, &rb));
+    fill_pattern(data, sizeof data, 0x52);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, rb, 0, data, sizeof data));
+    set_old_xattr(fs, rb);
+    free_order_arm(&p, rb);
+    stm_fs_fail_next_inode_free_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, (const uint8_t *)"ra", 2,
+                                 dir, (const uint8_t *)"rb", 2, 0), STM_EIO);
+    STM_ASSERT_EQ(p.calls, 0);
+    assert_file_whole(fs, dir, "rb", rb, data, sizeof data);
+    uint64_t still = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"ra", 2, &still));
+    STM_ASSERT_EQ(still, ra);
+
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &a));
+    set_old_xattr(fs, a);
+    free_order_arm(&p, a);
+    stm_fs_fail_next_inode_free_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_unlink_anon(fs, 1, a), STM_EIO);
+    STM_ASSERT_EQ(p.calls, 0);
+    STM_ASSERT_EQ(xattr_records(fs, a), (size_t)1);
+    struct stm_inode_value av;
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &av));
+    STM_ASSERT_OK(stm_fs_unlink_anon(fs, 1, a));
+    free_order_assert(fs, &p);
+
+    reuse_fs_done(fs);
+}
+
+static bool fs_is_wedged(stm_fs *fs)
+{
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    return st.wedged;
+}
+
+/* A free that fails and a name that cannot come back leave an inode no
+ * name reaches: the fs wedges rather than answer as if nothing had
+ * happened. */
+STM_TEST(fs_a_free_whose_name_cannot_come_back_wedges) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("name_back_unlink", &dir);
+    if (!fs) return;
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &f));
+    stm_fs_fail_next_inode_free_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"f", 1),
+                   STM_EIO);
+    STM_ASSERT_TRUE(!fs_is_wedged(fs));
+    stm_fs_fail_next_inode_free_for_test(fs, STM_EIO);
+    stm_fs_fail_next_name_back_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"f", 1),
+                   STM_EIO);
+    STM_ASSERT_TRUE(fs_is_wedged(fs));
+    reuse_fs_done(fs);
+
+    fs = reuse_fs("name_back_rename", &dir);
+    if (!fs) return;
+    uint64_t ra = 0, rb = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"ra", 2,
+                                        0644u, 0, 0, &ra));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"rb", 2,
+                                        0644u, 0, 0, &rb));
+    stm_fs_fail_next_inode_free_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, (const uint8_t *)"ra", 2,
+                                 dir, (const uint8_t *)"rb", 2, 0), STM_EIO);
+    STM_ASSERT_TRUE(!fs_is_wedged(fs));
+    stm_fs_fail_next_inode_free_for_test(fs, STM_EIO);
+    stm_fs_fail_next_name_back_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, (const uint8_t *)"ra", 2,
+                                 dir, (const uint8_t *)"rb", 2, 0), STM_EIO);
+    STM_ASSERT_TRUE(fs_is_wedged(fs));
+    reuse_fs_done(fs);
+}
+
+/* Runs once, in a lockless xattr read's gap: unlinks `name` (none = an
+ * inert control) and, with `reuse`, creates "n" on the freed ino with an
+ * xattr of its own. */
+struct xattr_gap {
+    stm_fs     *fs;
+    uint64_t    dir;
+    const char *name;
+    bool        reuse;
+    uint64_t    reused;
+    int         fired;
+};
+
+static void xattr_gap_hook(void *arg)
+{
+    struct xattr_gap *g = arg;
+    stm_fs_set_xattr_read_gap_hook_for_test(g->fs, NULL, NULL);
+    g->fired++;
+    if (!g->name) return;
+    STM_ASSERT_OK(stm_fs_unlink(g->fs, 1, g->dir, (const uint8_t *)g->name,
+                                   (uint8_t)strlen(g->name)));
+    if (!g->reuse) return;
+    STM_ASSERT_OK(stm_fs_create_file(g->fs, 1, g->dir, (const uint8_t *)"n", 1,
+                                        0644u, 0, 0, &g->reused));
+    bool replaced = false;
+    STM_ASSERT_OK(stm_fs_setxattr(g->fs, 1, g->reused,
+                                     (const uint8_t *)"user.k", 6,
+                                     (const uint8_t *)"new", 3, 0, &replaced));
+}
+
+static uint64_t xattr_gap_file(stm_fs *fs, uint64_t dir, const char *name)
+{
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)name,
+                                        (uint8_t)strlen(name), 0644u, 0, 0,
+                                        &ino));
+    set_old_xattr(fs, ino);
+    return ino;
+}
+
+/* A lockless xattr read that an unlink overtakes answers ENOENT, as a
+ * read after the unlink would: never "no such attribute" or an empty
+ * list for an inode that had them, nor the xattrs of the inode that
+ * reused the ino. */
+STM_TEST(fs_lockless_xattr_reads_answer_for_the_inode_they_found) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("xattr_gap", &dir);
+    if (!fs) return;
+    uint8_t v[8];
+    uint32_t vsz = 0;
+    size_t total = 99;
+
+    /* control: an inert gap leaves both reads as they were */
+    uint64_t c = xattr_gap_file(fs, dir, "c");
+    struct xattr_gap g = { .fs = fs, .dir = dir };
+    stm_fs_set_xattr_read_gap_hook_for_test(fs, xattr_gap_hook, &g);
+    STM_ASSERT_OK(stm_fs_getxattr(fs, 1, c, (const uint8_t *)"user.k", 6,
+                                     v, sizeof v, &vsz));
+    STM_ASSERT_EQ(g.fired, 1);
+    STM_ASSERT_EQ(vsz, 3u);
+    STM_ASSERT_EQ(memcmp(v, "old", 3), 0);
+    g.fired = 0;
+    stm_fs_set_xattr_read_gap_hook_for_test(fs, xattr_gap_hook, &g);
+    STM_ASSERT_OK(stm_fs_listxattr(fs, 1, c, NULL, 0, &total));
+    STM_ASSERT_EQ(g.fired, 1);
+    STM_ASSERT_EQ(total, (size_t)7);
+
+    /* getxattr overtaken by the unlink */
+    uint64_t x = xattr_gap_file(fs, dir, "x");
+    g = (struct xattr_gap){ .fs = fs, .dir = dir, .name = "x" };
+    stm_fs_set_xattr_read_gap_hook_for_test(fs, xattr_gap_hook, &g);
+    vsz = 99;
+    STM_ASSERT_ERR(stm_fs_getxattr(fs, 1, x, (const uint8_t *)"user.k", 6,
+                                      v, sizeof v, &vsz), STM_ENOENT);
+    STM_ASSERT_EQ(g.fired, 1);
+    STM_ASSERT_EQ(vsz, 0u);
+
+    /* listxattr overtaken by the unlink */
+    uint64_t y = xattr_gap_file(fs, dir, "y");
+    g = (struct xattr_gap){ .fs = fs, .dir = dir, .name = "y" };
+    stm_fs_set_xattr_read_gap_hook_for_test(fs, xattr_gap_hook, &g);
+    total = 99;
+    STM_ASSERT_ERR(stm_fs_listxattr(fs, 1, y, NULL, 0, &total), STM_ENOENT);
+    STM_ASSERT_EQ(g.fired, 1);
+
+    /* both overtaken by an unlink and a create that reuses the ino and
+     * sets its own xattr: the new file's, not answered for the old */
+    uint64_t z = xattr_gap_file(fs, dir, "z");
+    g = (struct xattr_gap){ .fs = fs, .dir = dir, .name = "z", .reuse = true };
+    stm_fs_set_xattr_read_gap_hook_for_test(fs, xattr_gap_hook, &g);
+    STM_ASSERT_ERR(stm_fs_getxattr(fs, 1, z, (const uint8_t *)"user.k", 6,
+                                      v, sizeof v, &vsz), STM_ENOENT);
+    STM_ASSERT_EQ(vsz, 0u);
+    STM_ASSERT_EQ(g.reused, z);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"n", 1));
+    uint64_t z2 = xattr_gap_file(fs, dir, "z2");
+    g = (struct xattr_gap){ .fs = fs, .dir = dir, .name = "z2", .reuse = true };
+    stm_fs_set_xattr_read_gap_hook_for_test(fs, xattr_gap_hook, &g);
+    STM_ASSERT_ERR(stm_fs_listxattr(fs, 1, z2, NULL, 0, &total), STM_ENOENT);
+    STM_ASSERT_EQ(g.reused, z2);
+    STM_ASSERT_OK(stm_fs_getxattr(fs, 1, z2, (const uint8_t *)"user.k", 6,
+                                     v, sizeof v, &vsz));
+    STM_ASSERT_EQ(memcmp(v, "new", 3), 0);
+
+    reuse_fs_done(fs);
+}
+
 STM_TEST_MAIN("fs")
