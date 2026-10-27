@@ -85,9 +85,14 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
 Dispatch:
 
 - `len == 0` → no-op `STM_OK` (POSIX `write(fd, buf, 0)`; no mtime bump).
-- `off > UINT64_MAX - len` → `STM_EOVERFLOW` (Area-A F3 guard — bounds the
-  `end_off` / `exp_end` / `a_end` arithmetic that runs before the extent
-  layer's own overflow check).
+- an end past `STM_FS_FILE_MAX` (2^63 - 1, Linux's `MAX_LFS_FILESIZE`)
+  answers `STM_EOVERFLOW`; `stm_fs_pwrite` instead writes the part below it and
+  reports the short count, as write(2) does. Below that bound the
+  `end_off` / `exp_end` / `a_end` arithmetic cannot wrap: the old guard
+  bounded only `off + len`, so a write ending in the last 4 KiB below 2^64
+  rounded its cover's end to 0 and answered OK with nothing written.
+  Truncate and fallocate refuse an end past it too; over 9P all three
+  answer EFBIG.
 - seal mask (`SEAL_WRITE` / `SEAL_FUTURE_WRITE` / `SEAL_GROW`) → `STM_EPERM`.
 - **INLINE** (`si_data_kind == STM_DATA_INLINE`, file ≤ `STM_INODE_INLINE_MAX`
   = 100 B): bytes live in `si_inline_data`; a write past the inline cap triggers
@@ -272,7 +277,7 @@ full ctest suite is 65 binaries.
 
 ## Error paths
 
-- `STM_EOVERFLOW` — `off + len` would wrap (F3 guard).
+- `STM_EOVERFLOW` — the write passes `STM_FS_FILE_MAX` (EFBIG over 9P).
 - `STM_EPERM` — seal mask refuses the write.
 - `STM_ENOSPC` — reserve fails (the covering write is atomic for cover ≤
   recordsize, so the old extents survive; for cover > recordsize a failed piece

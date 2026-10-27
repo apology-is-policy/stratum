@@ -13160,6 +13160,75 @@ STM_TEST(fs_a_buffered_write_is_admitted_on_the_extent_its_drain_rewrites) {
     cover_admission_leg("cover_room", 9u * MIB, true);
 }
 
+/* A file ends at or below STM_FS_FILE_MAX. A write, truncate or fallocate
+ * whose end passes it answers EOVERFLOW and changes nothing; pwrite writes
+ * the part below it; a write that ends at it lands and survives a
+ * remount. */
+STM_TEST(fs_a_file_ends_at_the_largest_file_size) {
+    const uint64_t MAX = STM_FS_FILE_MAX;
+    uint64_t dir = 0, f = 0, g = 0;
+    stm_fs *fs = reuse_fs("file_max", &dir);
+    if (!fs) return;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"g", 1,
+                                     0644u, 0, 0, &g));
+    uint8_t a[4096], b[4096];
+    memset(a, 0xC3, sizeof a);
+    memset(b, 0x3C, sizeof b);
+    size_t n = 0;
+
+    /* The end's block round-up would wrap past 2^64. */
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, UINT64_MAX - 4096u, a, 4096u),
+                   STM_EOVERFLOW);
+    STM_ASSERT_ERR(stm_fs_pwrite(fs, 1, f, MAX, a, 1u, &n), STM_EOVERFLOW);
+    STM_ASSERT_EQ(n, (size_t)0);
+    STM_ASSERT_EQ(mid_op_size(fs, f), (uint64_t)0);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, MAX - 4096u, a, 4096u));
+    STM_ASSERT_EQ(mid_op_size(fs, f), MAX);
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, MAX - 100u, b, 4096u),
+                   STM_EOVERFLOW);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, MAX - 100u), 0xC3);
+    STM_ASSERT_OK(stm_fs_pwrite(fs, 1, f, MAX - 100u, b, 4096u, &n));
+    STM_ASSERT_EQ(n, (size_t)100);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, MAX - 100u), 0x3C);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, MAX - 101u), 0xC3);
+    STM_ASSERT_EQ(mid_op_size(fs, f), MAX);
+
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, MAX + 1u), STM_EOVERFLOW);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, MAX));
+    STM_ASSERT_EQ(mid_op_size(fs, f), MAX);
+
+    /* fallocate: the range's end, and INSERT_RANGE's new size. */
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, g, 8192u));
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, g, (MAX + 1u) - 4096u, 4096u, 0u),
+                   STM_EOVERFLOW);
+    STM_ASSERT_EQ(mid_op_size(fs, g), (uint64_t)8192);
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, g, (MAX + 1u) - 8192u, 4096u, 0u));
+    STM_ASSERT_EQ(mid_op_size(fs, g), (MAX + 1u) - 4096u);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, g, 0u, 4096u,
+                                    STM_FS_FALLOC_FL_INSERT_RANGE),
+                   STM_EOVERFLOW);
+    STM_ASSERT_EQ(mid_op_size(fs, g), (MAX + 1u) - 4096u);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, g, (MAX + 1u) - 8192u));
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, g, 0u, 4096u,
+                                   STM_FS_FALLOC_FL_INSERT_RANGE));
+    STM_ASSERT_EQ(mid_op_size(fs, g), (MAX + 1u) - 4096u);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_EQ(mid_op_size(fs, f), MAX);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, MAX - 4096u), 0xC3);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, MAX - 100u), 0x3C);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, 0), 0x00);
+    reuse_fs_done(fs);
+}
+
 /* A direct write split into pieces, whose second piece finds no room,
  * keeps the first and grows the size over it: nothing it wrote is left
  * past EOF for a later grow to read back as the file's content. */

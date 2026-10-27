@@ -1063,6 +1063,13 @@ static stm_status reply_rlerror(uint8_t *resp, uint32_t resp_cap,
     return STM_OK;
 }
 
+/* A write, truncate or fallocate past the largest file size is EFBIG, as
+ * on Linux; the client maps EFBIG back to STM_EOVERFLOW. */
+static uint32_t size_status_to_errno(stm_status s)
+{
+    return s == STM_EOVERFLOW ? STM_9P_ECODE_EFBIG : status_to_errno(s);
+}
+
 static stm_status reply_rlerror_status(uint8_t *resp, uint32_t resp_cap,
                                          uint32_t *resp_len,
                                          uint16_t tag, stm_status status)
@@ -2528,7 +2535,7 @@ static stm_status h_write(stm_9p_server *s,
     rc = stm_fs_pwrite_if_gen(s->fs, ds, ino, gen, offset, body + 16,
                               (size_t)count, &wrote);
     if (rc != STM_OK)
-        ecode = status_to_errno(rc);
+        ecode = size_status_to_errno(rc);
 
 phase_c:
     /* (c) no fid mutation; unpin. */
@@ -3472,7 +3479,7 @@ static stm_status h_setattr(stm_9p_server *s,
         stm_status rc = stm_fs_truncate_if_gen(s->fs, ds, ino, gen,
                                                new_size);
         if (rc != STM_OK) {
-            ecode = status_to_errno(rc);
+            ecode = size_status_to_errno(rc);
             goto phase_c;
         }
         /* Refresh cached_cvers (the truncate bumped si_cvers) --
@@ -4394,7 +4401,8 @@ static stm_status h_fallocate(stm_9p_server *s,
                                             f->cached_gen,
                                             offset, length, flags);
     if (rc != STM_OK)
-        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                             size_status_to_errno(rc));
 
     uint32_t need = STM_9P_HDR_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }

@@ -264,6 +264,11 @@ stm_status stm_fs_commit(stm_fs *fs);
  * with send_recv.h's STM_SEND_CHUNK_PLAIN_MAX. */
 #define STM_FS_RECORDSIZE_MAX   (8u * 1024u * 1024u)
 
+/* The largest file size, Linux's MAX_LFS_FILESIZE: a write, truncate or
+ * fallocate whose end passes it answers STM_EOVERFLOW (EFBIG over 9P).
+ * Below it, an offset's block round-up cannot wrap. */
+#define STM_FS_FILE_MAX         ((uint64_t)INT64_MAX)
+
 /* P7-4: POSIX-shape write/read.
  *
  * `stm_fs_write` writes [off, off+len) of a regular file at any offset and
@@ -274,7 +279,9 @@ stm_status stm_fs_commit(stm_fs *fs);
  * with a prefix of the range written and the size grown over it.
  * `stm_fs_pwrite` reports that prefix as pwrite(2) does: STM_OK with the
  * count in *out_written, short when it stopped early, and an error only when
- * it wrote nothing. An ino the inode index does not hold (the legacy
+ * it wrote nothing. A file ends at or below STM_FS_FILE_MAX: `stm_fs_write`
+ * refuses a write that passes it, and `stm_fs_pwrite` writes the part below
+ * it, as write(2) does. An ino the inode index does not hold (the legacy
  * direct-extent seam) takes the extent layer's rules: off and len 4 KiB
  * aligned, len at most the recordsize.
  *
@@ -286,7 +293,8 @@ stm_status stm_fs_commit(stm_fs *fs);
  *   - STM_EWEDGED / STM_EROFS if the FS is wedged or read-only
  *     (write only).
  *   - STM_EINVAL on bad args.
- *   - STM_EOVERFLOW if off + len wraps.
+ *   - STM_EOVERFLOW if the write passes STM_FS_FILE_MAX (pwrite: if it
+ *     starts at or past it).
  *   - STM_ENOSPC when the pool has no room.
  *   - STM_ENOMEM on allocation failure.
  *   - STM_EBADTAG on AEAD decrypt failure (read).
@@ -727,6 +735,7 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
  *   - EXTENT-mode shrink with non-4 KiB-aligned `new_size`
  *     (STM_EINVAL — sub-block truncate would require read-modify-
  *     write at the bdev; deferred).
+ *   - new_size past STM_FS_FILE_MAX (STM_EOVERFLOW).
  *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
  */
 STM_MUST_USE
@@ -2798,7 +2807,8 @@ stm_status stm_fs_reflink_if_gen(stm_fs *fs,
  *   - Inode does not exist (STM_ENOENT).
  *   - Not a regular file (STM_EINVAL).
  *   - len == 0 (STM_EINVAL — Linux refuses).
- *   - off + len overflows uint64_t (STM_EINVAL).
+ *   - off + len past STM_FS_FILE_MAX, or an INSERT_RANGE growing the
+ *     size past it (STM_EOVERFLOW).
  *   - PUNCH_HOLE without KEEP_SIZE (STM_EINVAL — Linux requires).
  *   - COLLAPSE_RANGE / INSERT_RANGE / UNSHARE_RANGE combined with any
  *     other flag (except UNSHARE+KEEP_SIZE legal) → STM_EINVAL.

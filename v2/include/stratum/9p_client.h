@@ -772,7 +772,8 @@ stm_status stm_9p_xattrwalk(stm_9p_client *c,
  *   - STM_OK on success — fid repurposed; caller must Twrite + Tclunk.
  *   - STM_EINVAL on NULL c / NULL or empty name, embedded NUL in name,
  *     or name length > STM_9P_NAME_MAX.
- *   - STM_EFBIG if attr_size > 64 KiB (server's STM_FS_XATTR_VALUE_MAX).
+ *   - STM_EOVERFLOW (Rlerror EFBIG) if attr_size > 64 KiB (the server's
+ *     STM_FS_XATTR_VALUE_MAX).
  *   - Any Rlerror's mapped status. */
 STM_MUST_USE
 stm_status stm_9p_xattrcreate(stm_9p_client *c, uint32_t fid,

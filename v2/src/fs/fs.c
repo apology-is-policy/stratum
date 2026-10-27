@@ -2380,11 +2380,13 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
      * symmetric with EXTENT. Linux ext4/XFS short-circuit similarly. */
     if (len == 0u) return STM_OK;
 
-    /* F3: bound off+len so end_off -- and the extent path's exp_end / a_end
-     * roundup -- cannot wrap. The eventual stm_sync_write_extent rejects the
-     * same condition, but the expansion lookups + scratch sizing run first;
-     * guard here so they never operate on a wrapped offset. */
-    if (off > UINT64_MAX - (uint64_t)len) return STM_EOVERFLOW;
+    /* A file ends at or below STM_FS_FILE_MAX. That keeps end_off and the
+     * extent path's block round-ups (a_end, of the write and of any extent
+     * its cover takes in, which starts below the end and spans at most a
+     * recordsize) far from wrapping, before the lookups and the scratch
+     * sizing run on them. */
+    if (off > STM_FS_FILE_MAX || (uint64_t)len > STM_FS_FILE_MAX - off)
+        return STM_EOVERFLOW;
 
     uint8_t kind = iv->si_data_kind;
     uint64_t end_off = off + (uint64_t)len;
@@ -2666,15 +2668,13 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                 return ws;
             }
             fs_step_gap(fs, ds, ino);
-            /* A split write that failed part way keeps the pieces it
-             * wrote, as write(2) keeps the bytes it counts: the size
-             * covers them, so none is left past EOF for a later grow to
-             * read back, and the caller learns the count. */
-            if (ws != STM_OK) {
-                part = ws;
-                wrote = landed;
-                end_off = off + (uint64_t)landed;
-            }
+            /* The size and the count cover what landed. A split write
+             * that failed part way keeps the pieces it wrote, as write(2)
+             * keeps the bytes it counts, so none is left past EOF for a
+             * later grow to read back, and the caller learns the count. */
+            part = ws;
+            wrote = landed;
+            end_off = off + (uint64_t)landed;
         }
         /* Size + timestamp update — common to both buffered and direct
          * paths. The buffered write's bytes aren't on-disk yet, but
@@ -5817,6 +5817,7 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
+    if (new_size > STM_FS_FILE_MAX) return STM_EOVERFLOW;
 
     /* P9.5-PARALLEL-3 impl-5: SH (rdlock) + per-inode pin. truncate is
      * a single-inode mutator — the (load + size-check + flush + extent
@@ -11540,7 +11541,8 @@ static stm_status fs_fallocate(stm_fs *fs,
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
     if (len == 0u) return STM_EINVAL;
-    if (off > UINT64_MAX - len) return STM_EINVAL;
+    if (off > STM_FS_FILE_MAX || len > STM_FS_FILE_MAX - off)
+        return STM_EOVERFLOW;
     if ((flags & ~(uint32_t)STM_FS_FALLOC_MASK) != 0u) return STM_EINVAL;
 
     /* Flag-combination matrix.
@@ -11739,7 +11741,7 @@ static stm_status fs_fallocate(stm_fs *fs,
          * R89 P2-2: Linux fallocate(2) refuses with EINVAL when
          * `off >= cur_size` (inserting past EOF is undefined). */
         if (off >= cur_size) { s = STM_EINVAL; goto falloc_out; }
-        if (cur_size > UINT64_MAX - len) {
+        if (cur_size > STM_FS_FILE_MAX || len > STM_FS_FILE_MAX - cur_size) {
             s = STM_EOVERFLOW; goto falloc_out;
         }
         bool torn = false;
@@ -11949,12 +11951,15 @@ stm_status stm_fs_write_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     return fs_write(fs, dataset_id, ino, &gen, off, buf, len, &wrote);
 }
 
-/* An error after some bytes landed is a short write. */
+/* An error after some bytes landed is a short write, and so is a write
+ * that passes the largest file size: it writes the part below it. */
 static stm_status fs_pwrite(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                             const uint64_t *gen, uint64_t off,
                             const void *buf, size_t len, size_t *out_written)
 {
     if (!out_written) return STM_EINVAL;
+    if (off < STM_FS_FILE_MAX && (uint64_t)len > STM_FS_FILE_MAX - off)
+        len = (size_t)(STM_FS_FILE_MAX - off);
     stm_status s = fs_write(fs, dataset_id, ino, gen, off, buf, len,
                             out_written);
     return *out_written > 0u ? STM_OK : s;

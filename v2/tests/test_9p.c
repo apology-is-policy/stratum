@@ -1182,6 +1182,62 @@ STM_TEST(p9_a_short_write_answers_what_landed) {
     unlink(g_key_path);
 }
 
+/* Past the largest file size is EFBIG on the wire, as on Linux: a Twrite
+ * starting at it, a Tsetattr or Tfallocate ending past it. A Twrite across
+ * it answers the bytes that fit. */
+STM_TEST(p9_a_size_past_the_largest_file_is_efbig) {
+    const uint64_t MAX = STM_FS_FILE_MAX;
+    make_tmp("9p_file_max");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlopen(req, 2, 101, STM_9P_O_RDWR);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    uint8_t b[4096];
+    memset(b, 0x5E, sizeof b);
+
+    sz = build_twrite(req, 3, 101, MAX, b, 1u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EFBIG);
+    sz = build_twrite(req, 4, 101, MAX - 100u, b, sizeof b);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    STM_ASSERT_EQ(load_u32(resp + 7), 100u);
+
+    sz = build_tsetattr(req, 5, 101, STM_9P_SETATTR_SIZE, 0, 0, 0, MAX + 1u,
+                        0, 0, 0, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EFBIG);
+    sz = build_tfallocate(req, 6, 101, 0, (MAX + 1u) - 4096u, 4096u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EFBIG);
+    sz = build_tfallocate(req, 7, 101, 0, (MAX + 1u) - 8192u, 4096u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RFALLOCATE);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(p9_read_with_wronly_open_returns_eacces) {
     make_tmp("9p_read_wo");
     stm_fs_format_opts fopts = default_format_opts();
