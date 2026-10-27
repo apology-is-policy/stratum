@@ -26,6 +26,9 @@
  *               per R133 P1-1 to prevent EX-taker starvation under
  *               sustained SH-traffic) →
  *      [per-inode handle->mu  →]      (PARALLEL-3 impl-1: SH path only)
+ *      [fs->txn  →]                   (SH spans + the ENOSPC reclaim's EX;
+ *                                      no blocking pin and no second span
+ *                                      inside a span: struct stm_fs)
  *      sync->lock  →  alloc->lock  →  alloc's btree rwlock
  *
  * NEVER call stm_fs_mark_wedged from inside a held fs->global —
@@ -177,21 +180,26 @@ struct stm_fs {
      * ops; impl-5 drops the residual EX takes that were just the
      * big-fs-lock semantics. */
     pthread_rwlock_t global;
-    /* C-2-F2-audit R2-F1: the writeback-transaction lock. A buffered
-     * writer's {dirty-buffer insert; inode iset} two-step must be ATOMIC
-     * against the reclaim-on-ENOSPC commit family -- the only committer
-     * that runs under fs->global SH (stm_fs_commit / snapshot / unmount
-     * hold EX, which excludes SH writers wholesale). Without it, a peer
-     * writer's transition landing inside reclaim's drain->commit window
-     * (tens of ms) makes the kind=EXTENT flip durable WITHOUT its
-     * RAM-only bytes -- the R1-F1 tear via concurrency. Writers RDLOCK
-     * around each insert->iset span (both the transition and buffered
-     * arms; released across the ENOSPC dance, whose reclaim takes the
-     * WRLOCK); reclaim WRLOCKs its whole drain->commit sequence. Order:
-     * fs->global -> per-inode pin -> dbuf_txn -> dbuf->mu -> sync locks
-     * (acyclic: never taken under buf->mu / sync locks; no pin taken
-     * under it; the drain cbs + commits take no pins). */
-    pthread_rwlock_t dbuf_txn;
+    /* The transaction lock: what the reclaim-on-ENOSPC commit family,
+     * the only committer that runs under fs->global SH, waits for
+     * (stm_fs_commit / snapshot / unmount hold EX, which excludes every
+     * SH op wholesale). Two kinds of span hold it SHARED, each a run of
+     * steps no commit may land inside:
+     *   - a buffered writer's {dirty-buffer insert; inode iset} two-step
+     *     (C-2-F2-audit R2-F1; both the transition and buffered arms,
+     *     released across the ENOSPC dance): inside it a commit makes
+     *     the kind=EXTENT flip durable WITHOUT its RAM-only bytes;
+     *   - a namespace op's mutations, from its first to the release of
+     *     fs->global (fs_txn): inside them a commit makes a half-done
+     *     create, link, unlink or rename durable.
+     * Reclaim WRLOCKs its whole drain->commit sequence. Order:
+     * fs->global -> per-inode pin -> txn -> dbuf->mu -> sync locks. No
+     * span waits for a pin (a pinned writer waits for txn, and the lock
+     * prefers writers, so a pin taken under a span closes a cycle with
+     * any reclaim queued meanwhile), and none takes txn twice (the
+     * nested RDLOCK waits behind that reclaim the same way); the drain
+     * cbs + commits take no pins. */
+    pthread_rwlock_t txn;
 
     stm_bdev  *bdev;         /* owned — closed at unmount */
     stm_pool  *pool;         /* owned — P5-1 N=1 wrapper over bdev */
@@ -297,6 +305,10 @@ struct stm_fs {
     void *rename_rollback_hook_arg;
     stm_fs_write_guard_hook write_guard_hook;
     void *write_guard_hook_arg;
+    stm_fs_reclaim_hook reclaim_hook;
+    void *reclaim_hook_arg;
+    stm_fs_fresh_pin_hook fresh_pin_hook;
+    void *fresh_pin_hook_arg;
 #endif
 };
 
@@ -367,6 +379,123 @@ static void fs_mark_wedged_locked(stm_fs *fs)
 {
     atomic_store_explicit(&fs->wedged, true, memory_order_release);
     stm_sync_mark_wedged(fs->sync);
+}
+
+/* A namespace op's span of fs->txn: begun just before its first mutation,
+ * after its last blocking pin, and ended where it drops fs->global, so a
+ * reclaim commit lands before the op's mutations or after them. Every
+ * fs->global release in such an op goes through fs_txn_unlock_global,
+ * whether or not the span began. */
+typedef struct {
+    bool held;
+} fs_txn;
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+/* The order fs->txn rests on, counted where the tests can see it: the
+ * spans this thread holds, every blocking pin or span taken inside one,
+ * and every namespace mutation made outside one (process-wide). */
+static _Thread_local unsigned fs_txn_depth_here;
+static atomic_uint fs_txn_order_violations;
+
+static void fs_txn_note_take(void)
+{
+    if (fs_txn_depth_here != 0u)
+        atomic_fetch_add_explicit(&fs_txn_order_violations, 1u,
+                                  memory_order_relaxed);
+}
+
+static void fs_txn_note_mutation(void)
+{
+    if (fs_txn_depth_here == 0u)
+        atomic_fetch_add_explicit(&fs_txn_order_violations, 1u,
+                                  memory_order_relaxed);
+}
+
+unsigned stm_fs_txn_order_violations_for_test(void)
+{
+    return atomic_load_explicit(&fs_txn_order_violations,
+                                memory_order_relaxed);
+}
+
+/* Every blocking pin below is counted; stm_inode_pin_try never waits. */
+#define stm_inode_pin(...) \
+    (fs_txn_note_take(), stm_inode_pin(__VA_ARGS__))
+#define stm_inode_pin_shared(...) \
+    (fs_txn_note_take(), stm_inode_pin_shared(__VA_ARGS__))
+#define stm_inode_pin_two(...) \
+    (fs_txn_note_take(), stm_inode_pin_two(__VA_ARGS__))
+#define stm_inode_pin_many(...) \
+    (fs_txn_note_take(), stm_inode_pin_many(__VA_ARGS__))
+
+/* Every namespace mutation below is counted when no span covers it. */
+#define stm_dirent_alloc(...) \
+    (fs_txn_note_mutation(), stm_dirent_alloc(__VA_ARGS__))
+#define stm_dirent_unlink(...) \
+    (fs_txn_note_mutation(), stm_dirent_unlink(__VA_ARGS__))
+#define stm_dirent_whiteout(...) \
+    (fs_txn_note_mutation(), stm_dirent_whiteout(__VA_ARGS__))
+#define stm_dirent_swap_two(...) \
+    (fs_txn_note_mutation(), stm_dirent_swap_two(__VA_ARGS__))
+#define stm_dirent_drop_for_dir(...) \
+    (fs_txn_note_mutation(), stm_dirent_drop_for_dir(__VA_ARGS__))
+#define stm_inode_alloc(...) \
+    (fs_txn_note_mutation(), stm_inode_alloc(__VA_ARGS__))
+#define stm_inode_alloc_anon(...) \
+    (fs_txn_note_mutation(), stm_inode_alloc_anon(__VA_ARGS__))
+#define stm_inode_free(...) \
+    (fs_txn_note_mutation(), stm_inode_free(__VA_ARGS__))
+#define stm_inode_link(...) \
+    (fs_txn_note_mutation(), stm_inode_link(__VA_ARGS__))
+#define stm_inode_unlink(...) \
+    (fs_txn_note_mutation(), stm_inode_unlink(__VA_ARGS__))
+#define stm_inode_materialize(...) \
+    (fs_txn_note_mutation(), stm_inode_materialize(__VA_ARGS__))
+#endif
+
+static void fs_txn_rd(stm_fs *fs)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    fs_txn_note_take();
+    fs_txn_depth_here++;
+#endif
+    pthread_rwlock_rdlock(&fs->txn);
+}
+
+static void fs_txn_rd_end(stm_fs *fs)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    fs_txn_depth_here--;
+#endif
+    pthread_rwlock_unlock(&fs->txn);
+}
+
+static void fs_txn_begin(stm_fs *fs, fs_txn *tx)
+{
+    fs_txn_rd(fs);
+    tx->held = true;
+}
+
+static void fs_txn_end(stm_fs *fs, fs_txn *tx)
+{
+    if (!tx->held) return;
+    tx->held = false;
+    fs_txn_rd_end(fs);
+}
+
+static void fs_txn_unlock_global(stm_fs *fs, fs_txn *tx)
+{
+    fs_txn_end(fs, tx);
+    pthread_rwlock_unlock(&fs->global);
+}
+
+static void fs_fresh_pin_event(stm_fs *fs, uint64_t ino, bool busy)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->fresh_pin_hook)
+        fs->fresh_pin_hook(ino, busy, fs->fresh_pin_hook_arg);
+#else
+    (void)fs; (void)ino; (void)busy;
+#endif
 }
 
 /* ========================================================================= */
@@ -1109,7 +1238,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         free(fs);
         return NULL;
     }
-    /* R3-F1: dbuf_txn gets the SAME R133 writer-preference posture as
+    /* R3-F1: txn gets the SAME R133 writer-preference posture as
      * fs->global -- its rd-takers are the hottest op class (sub-threshold
      * writes on N worker threads) and its sole wr-taker is the rare
      * ENOSPC reclaim; glibc/musl reader-preference would let the rd
@@ -1122,7 +1251,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         pthread_rwlockattr_init(&txnattr);
         pthread_rwlockattr_setkind_np(&txnattr,
             PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-        int txnrc = pthread_rwlock_init(&fs->dbuf_txn, &txnattr);
+        int txnrc = pthread_rwlock_init(&fs->txn, &txnattr);
         pthread_rwlockattr_destroy(&txnattr);
         if (txnrc != 0) {
             pthread_rwlock_destroy(&fs->global);
@@ -1131,7 +1260,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         }
     }
 #else
-    if (pthread_rwlock_init(&fs->dbuf_txn, NULL) != 0) {
+    if (pthread_rwlock_init(&fs->txn, NULL) != 0) {
         pthread_rwlock_destroy(&fs->global);
         free(fs);
         return NULL;
@@ -1140,7 +1269,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
     if (keyfile_path) {
         fs->keyfile_path = strdup(keyfile_path);
         if (!fs->keyfile_path) {
-            pthread_rwlock_destroy(&fs->dbuf_txn);
+            pthread_rwlock_destroy(&fs->txn);
             pthread_rwlock_destroy(&fs->global);
             free(fs);
             return NULL;
@@ -1150,7 +1279,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         fs->janus_socket = strdup(janus_socket);
         if (!fs->janus_socket) {
             free(fs->keyfile_path);
-            pthread_rwlock_destroy(&fs->dbuf_txn);
+            pthread_rwlock_destroy(&fs->txn);
             pthread_rwlock_destroy(&fs->global);
             free(fs);
             return NULL;
@@ -1173,7 +1302,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
     if (!fs->locks) {
         free(fs->janus_socket);
         free(fs->keyfile_path);
-        pthread_rwlock_destroy(&fs->dbuf_txn);
+        pthread_rwlock_destroy(&fs->txn);
         pthread_rwlock_destroy(&fs->global);
         free(fs);
         return NULL;
@@ -1189,7 +1318,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         stm_lock_table_close(fs->locks);
         free(fs->janus_socket);
         free(fs->keyfile_path);
-        pthread_rwlock_destroy(&fs->dbuf_txn);
+        pthread_rwlock_destroy(&fs->txn);
         pthread_rwlock_destroy(&fs->global);
         free(fs);
         return NULL;
@@ -1573,7 +1702,7 @@ stm_status stm_fs_unmount(stm_fs *fs)
     stm_dirty_buffer_destroy(fs->dirty_buffer);
 
     pthread_rwlock_unlock(&fs->global);
-    pthread_rwlock_destroy(&fs->dbuf_txn);
+    pthread_rwlock_destroy(&fs->txn);
     pthread_rwlock_destroy(&fs->global);
     free(fs->keyfile_path);
     free(fs->janus_socket);
@@ -2192,7 +2321,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * per-inode cap + widen the undrained window for no measured need;
          * the 587 measured transitions are all small). */
         /* R2-F1: the {insert; iset} two-step below must be atomic vs the
-         * reclaim commit family -- RDLOCK dbuf_txn across it (reclaim
+         * reclaim commit family -- RDLOCK txn across it (reclaim
          * WRLOCKs its drain->commit sequence). The sync-write fallback
          * needs no lock: extent-before-iset is commit-consistent by
          * construction (the pre-F2 order). */
@@ -2201,7 +2330,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         if (aligned_size < (uint64_t)STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
             uint64_t tr_freeb = fs->alloc
                 ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
-            pthread_rwlock_rdlock(&fs->dbuf_txn);
+            fs_txn_rd(fs);
             txn_held = true;
             fs1 = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
                                         ds, ino, /*off=*/0u,
@@ -2210,7 +2339,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         }
         if (fs1 != STM_OK) {
             if (txn_held) {
-                pthread_rwlock_unlock(&fs->dbuf_txn);
+                fs_txn_rd_end(fs);
                 txn_held = false;
             }
             /* Fallback: the pre-F2 synchronous extent write. */
@@ -2259,7 +2388,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
             if (trs != STM_OK)
                 stm_dirty_buffer_drop_ino(fs->dirty_buffer, ds, ino);
             if (txn_held)
-                pthread_rwlock_unlock(&fs->dbuf_txn);
+                fs_txn_rd_end(fs);
             return trs;
         }
     }
@@ -2274,7 +2403,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * Direct writes pre-flush the inode's buffered ranges so a
          * stale buffered range doesn't shadow newer direct data
          * post-overlay. */
-        bool wb_txn_held = false;   /* R2-F1: dbuf_txn RD held into the iset */
+        bool wb_txn_held = false;   /* R2-F1: txn RD held into the iset */
         if (len < STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
             /* #40 pool-aware admission (atomic, block-granular): admit the
              * buffered write only if the buffered block FOOTPRINT would stay
@@ -2288,39 +2417,39 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * re-read, retry -- then a true ENOSPC only if the write alone
              * won't fit the drained pool. NULL alloc (test seam) -> unbounded
              * by footprint, RAM caps still apply. */
-            /* R2-F1: RDLOCK dbuf_txn across each {insert; ...; iset} span
+            /* R2-F1: RDLOCK txn across each {insert; ...; iset} span
              * (the successful insert HOLDS through the epilogue iset below;
              * a failed attempt RELEASES across the flush dance, whose
              * reclaim takes the WRLOCK -- holding through it would
              * self-deadlock). */
             uint64_t freeb = fs->alloc
                 ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
-            pthread_rwlock_rdlock(&fs->dbuf_txn);
+            fs_txn_rd(fs);
             wb_txn_held = true;
             stm_status ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
                                         ds, ino, off, (uint64_t)len, buf, freeb);
             if (ic == STM_ENOSPC) {
-                pthread_rwlock_unlock(&fs->dbuf_txn);
+                fs_txn_rd_end(fs);
                 wb_txn_held = false;
                 stm_status fr = fs_flush_ino_locked(fs, ds, ino);
                 if (fr == STM_OK) {
                     freeb = fs->alloc
                         ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
-                    pthread_rwlock_rdlock(&fs->dbuf_txn);
+                    fs_txn_rd(fs);
                     wb_txn_held = true;
                     ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
                                         ds, ino, off, (uint64_t)len, buf, freeb);
                 }
                 if (ic == STM_ENOSPC) {
                     if (wb_txn_held) {
-                        pthread_rwlock_unlock(&fs->dbuf_txn);
+                        fs_txn_rd_end(fs);
                         wb_txn_held = false;
                     }
                     fr = fs_flush_all_locked(fs);
                     if (fr == STM_OK) {
                         freeb = fs->alloc
                             ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
-                        pthread_rwlock_rdlock(&fs->dbuf_txn);
+                        fs_txn_rd(fs);
                         wb_txn_held = true;
                         ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
                                         ds, ino, off, (uint64_t)len, buf, freeb);
@@ -2329,7 +2458,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
             }
             if (ic != STM_OK) {
                 if (wb_txn_held) {
-                    pthread_rwlock_unlock(&fs->dbuf_txn);
+                    fs_txn_rd_end(fs);
                     wb_txn_held = false;
                 }
                 return ic;
@@ -2360,7 +2489,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         {
             stm_status isr = stm_inode_set(iidx, ds, ino, iv);
             if (wb_txn_held)
-                pthread_rwlock_unlock(&fs->dbuf_txn);   /* R2-F1 */
+                fs_txn_rd_end(fs);   /* R2-F1 */
             return isr;
         }
     }
@@ -2578,6 +2707,11 @@ static stm_status fs_refuse_unlock(stm_fs *fs, uint64_t dataset_id,
         if (g == STM_OK) g = fs_gen_check_locked(fs, dataset_id, b, b_gen);
         if (g != STM_OK) s = g;
     }
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs_txn_depth_here != 0u)       /* a span would outlive the op */
+        atomic_fetch_add_explicit(&fs_txn_order_violations, 1u,
+                                  memory_order_relaxed);
+#endif
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
@@ -3201,6 +3335,20 @@ void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
     fs->write_guard_hook = fn;
     fs->write_guard_hook_arg = arg;
 }
+
+void stm_fs_set_reclaim_hook_for_test(stm_fs *fs, stm_fs_reclaim_hook fn,
+                                      void *arg)
+{
+    fs->reclaim_hook = fn;
+    fs->reclaim_hook_arg = arg;
+}
+
+void stm_fs_set_fresh_pin_hook_for_test(stm_fs *fs, stm_fs_fresh_pin_hook fn,
+                                        void *arg)
+{
+    fs->fresh_pin_hook = fn;
+    fs->fresh_pin_hook_arg = arg;
+}
 #endif
 
 /* The status an armed test injects, once, in place of the inode free it
@@ -3351,6 +3499,54 @@ static void fs_rollback_inode_free(stm_inode_index *iidx, uint64_t dataset_id,
     }
 }
 
+/* Pins a create's freshly allocated child inside the op's txn span. No
+ * dirent names the child yet, but its ino can still be pinned: by the op
+ * that freed it, still cleaning up, or by a stale by-ino caller, which can
+ * hold it while it waits for the parent the create holds (fs_link_by_ino
+ * pins both in ino order and checks the gen after). So the pin is only
+ * tried. When the try fails the op leaves its span and the parent, pins
+ * both in order, re-checks the parent and enters a new span; the child
+ * stays allocated and unnamed meanwhile, outside any span, so a reclaim
+ * commit then makes it durable unnamed (a leak a crash leaves). h_parent
+ * NULL: an anonymous create, which holds no other pin. On a failure the
+ * child is unpinned and the parent, if *h_parent is not NULL, pinned. */
+static stm_status fs_txn_pin_fresh(stm_fs *fs, fs_txn *tx,
+                                   stm_inode_index *iidx, uint64_t dataset_id,
+                                   uint64_t child_ino,
+                                   stm_inode_handle **h_child,
+                                   uint64_t parent_ino, const uint64_t *gen,
+                                   stm_inode_handle **h_parent,
+                                   struct stm_inode_value *pv)
+{
+    fs_fresh_pin_event(fs, child_ino, false);
+    if (stm_inode_pin_try(iidx, dataset_id, child_ino, h_child) == STM_OK)
+        return STM_OK;
+    fs_fresh_pin_event(fs, child_ino, true);
+    fs_txn_end(fs, tx);
+    stm_status s;
+    if (!h_parent) {
+        s = stm_inode_pin(iidx, dataset_id, child_ino, h_child);
+    } else {
+        stm_inode_unpin(iidx, *h_parent);
+        *h_parent = NULL;
+        s = stm_inode_pin_two(iidx, dataset_id, parent_ino,
+                              dataset_id, child_ino, h_parent, h_child);
+        if (s != STM_OK) {
+            s = fs_gen_status(s, gen);
+        } else {
+            s = fs_gen_check_locked(fs, dataset_id, parent_ino, gen);
+            if (s == STM_OK)
+                s = fs_load_parent_dir(iidx, dataset_id, parent_ino, pv);
+            if (s != STM_OK) {
+                stm_inode_unpin(iidx, *h_child);
+                *h_child = NULL;
+            }
+        }
+    }
+    fs_txn_begin(fs, tx);
+    return s;
+}
+
 /* Common path for create_file / mkdir. `child_mode_type` is S_IFREG
  * or S_IFDIR; `child_dt_type` is STM_DT_REG or STM_DT_DIR. Caller
  * has already validated the name + verified mode's S_IFMT bits are
@@ -3369,17 +3565,17 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
                                                 struct stm_inode_value *out_child_iv)
 {
     /* PARALLEL-3 impl-2 CREATE-shape: SH + parent pin + fresh-child pin.
-     * The new_ino isn't known until after alloc, but design doc §3.4
-     * notes that pinning new_ino out-of-order is safe — no other
-     * writer can have a reference until we publish via the dirent.
-     * The pin on new_ino is uncontended by construction. */
+     * The new_ino isn't known until after alloc, so it is pinned after
+     * the parent, out of ascending order: tried, never waited for while
+     * the parent is held (fs_txn_pin_fresh). */
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
@@ -3389,7 +3585,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     stm_status pp = fs_pin_if_gen(fs, iidx, dataset_id, parent_ino, gen,
                                   &h_parent);
     if (pp != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return pp;
     }
 
@@ -3397,10 +3593,11 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
     if (ps != STM_OK) {
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ps;
     }
 
+    fs_txn_begin(fs, &tx);
     /* Allocate the new inode. The wrapper composes file-type bits
      * over caller-supplied permission bits; if the caller passed
      * S_IFMT bits, they must agree with `child_mode_type`. */
@@ -3410,19 +3607,20 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
                                        &child_ino);
     if (as != STM_OK) {
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return as;
     }
 
     /* Pin the freshly-allocated inode. Until the dirent below
-     * publishes it, no other writer can resolve to it, so this pin
-     * is uncontended (design doc §3.4). */
+     * publishes it, no other op can resolve to it by name. */
     stm_inode_handle *h_child = NULL;
-    stm_status cp = stm_inode_pin(iidx, dataset_id, child_ino, &h_child);
+    stm_status cp = fs_txn_pin_fresh(fs, &tx, iidx, dataset_id, child_ino,
+                                     &h_child, parent_ino, gen, &h_parent,
+                                     &pv);
     if (cp != STM_OK) {
         fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return cp;
     }
 
@@ -3437,7 +3635,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
         stm_inode_unpin(iidx, h_child);
         fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return cs;
     }
     uint64_t child_gen = stm_load_le64(cv.si_gen);
@@ -3447,7 +3645,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
         stm_inode_unpin(iidx, h_child);
         fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return xd;
     }
 
@@ -3471,7 +3669,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
         stm_inode_unpin(iidx, h_child);
         fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ts;
     }
 
@@ -3483,7 +3681,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
         stm_inode_unpin(iidx, h_child);
         fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ds;
     }
 
@@ -3496,7 +3694,7 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     if (out_s == STM_OK) *out_child_ino = child_ino;
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_parent);
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return out_s;
 }
 
@@ -3568,8 +3766,9 @@ stm_status stm_fs_init_dataset_root(stm_fs *fs, uint64_t dataset_id,
     }
 
     uint64_t new_ino = 0;
-    stm_status as = stm_inode_alloc(iidx, dataset_id, effective_mode,
-                                         uid, gid, &new_ino);
+    /* Under fs->global EX, which no reclaim runs beside: no txn span. */
+    stm_status as = (stm_inode_alloc)(iidx, dataset_id, effective_mode,
+                                           uid, gid, &new_ino);
     if (as != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return as;
@@ -3617,37 +3816,39 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
      * R133 P2-1 (R133 close): defense-in-depth — also pin the
      * fresh new_ino across the stamp+set sequence. Matches the
      * design doc §3.4 posture used by every other CREATE-shape
-     * port (fs_create_inode_and_link, stm_fs_symlink). The pin
-     * is uncontended by construction (no dirent points to new_ino
-     * yet, and the caller hasn't published it) but keeps the per-
+     * port (fs_create_inode_and_link, stm_fs_symlink). No dirent
+     * points to new_ino yet (fs_txn_pin_fresh says who can still
+     * hold its pin); the pin keeps the per-
      * inode-mutex invariant uniform across the create surface so
      * a future feature that exposes new_ino mid-create (e.g., a
      * fid-bind hook for janus/9p before stamp completes) doesn't
      * become a latent race. */
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
+    fs_txn_begin(fs, &tx);
     uint64_t new_ino = 0;
     stm_status as = stm_inode_alloc_anon(iidx, dataset_id, effective_mode,
                                               uid, gid, &new_ino);
     if (as != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return as;
     }
 
-    /* Pin the freshly-allocated orphan inode (R133 P2-1). Uncontended
-     * by construction per design §3.4. */
+    /* Pin the freshly-allocated orphan inode (R133 P2-1). */
     stm_inode_handle *h_child = NULL;
-    stm_status cp = stm_inode_pin(iidx, dataset_id, new_ino, &h_child);
+    stm_status cp = fs_txn_pin_fresh(fs, &tx, iidx, dataset_id, new_ino,
+                                     &h_child, 0u, NULL, NULL, NULL);
     if (cp != STM_OK) {
         (void)stm_inode_free(iidx, dataset_id, new_ino);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return cp;
     }
 
@@ -3671,13 +3872,13 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
     if (xd != STM_OK) {
         stm_inode_unpin(iidx, h_child);
         (void)stm_inode_free(iidx, dataset_id, new_ino);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return xd;
     }
 
     *out_child_ino = new_ino;
     stm_inode_unpin(iidx, h_child);
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return STM_OK;
 }
 
@@ -3699,13 +3900,14 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
     /* PARALLEL-3 impl-2: 2-inode op (parent + existing orphan). Both
      * ids known upfront — use sorted pin to prevent the 2-cycle
      * deadlock with a concurrent linkat_anon on the swapped pair. */
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
@@ -3713,7 +3915,7 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
      * (which refuses it with STM_EINVAL anyway — keep the message
      * surface stable). */
     if (ino == parent_ino) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
@@ -3723,7 +3925,7 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
                                             dataset_id, ino,
                                             &h_parent, &h_child);
     if (ps2 != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ps2;
     }
 
@@ -3733,7 +3935,7 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
     if (ps != STM_OK) {
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ps;
     }
 
@@ -3746,14 +3948,14 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
     if (ls != STM_OK) {
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ls;
     }
     uint32_t flags = stm_load_le32(iv.si_flags);
     if (!(flags & STM_INO_FLAG_ORPHAN)) {
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
     uint64_t child_gen = stm_load_le64(iv.si_gen);
@@ -3765,13 +3967,14 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
      * On a hypothetical post-materialize-rollback we'd need to undo
      * the dirent — but materialize is provably infallible here (no
      * gen / nlink / FREED race), so no rollback path needed. */
+    fs_txn_begin(fs, &tx);
     stm_status das = stm_dirent_alloc(didx, dataset_id, parent_ino,
                                           name, name_len,
                                           ino, child_gen, STM_DT_REG);
     if (das != STM_OK) {
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return das;
     }
     stm_status ms = stm_inode_materialize(iidx, dataset_id, ino);
@@ -3782,7 +3985,7 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
         fs_mark_wedged_locked(fs);
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ms;
     }
 
@@ -3799,7 +4002,7 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
 
     stm_inode_unpin(iidx, h_parent);
     stm_inode_unpin(iidx, h_child);
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return STM_OK;
 }
 
@@ -3813,19 +4016,20 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
     if (fs_ino_is_synth(ino)) return STM_EROFS;        /* 9.7-impl-5 */
 
     /* PARALLEL-3 impl-2: single-inode op (just the orphan). SH + pin. */
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
     stm_inode_handle *h = NULL;
     stm_status pp = stm_inode_pin(iidx, dataset_id, ino, &h);
     if (pp != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return pp;
     }
 
@@ -3835,13 +4039,13 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
     stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
     if (ls != STM_OK) {
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ls;
     }
     uint32_t flags = stm_load_le32(iv.si_flags);
     if (!(flags & STM_INO_FLAG_ORPHAN)) {
         stm_inode_unpin(iidx, h);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
@@ -3853,6 +4057,7 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
      * always have nlink=0 when reachable via this entry point). The
      * records keyed by the ino go once it is freed, under its pin
      * (R128 P1-2); a free that fails keeps them with the orphan. */
+    fs_txn_begin(fs, &tx);
     stm_status fs_free = fs_free_injected_failure(fs);
     if (fs_free == STM_OK) fs_free = stm_inode_free(iidx, dataset_id, ino);
     if (fs_free == STM_OK)
@@ -3867,7 +4072,7 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
      * is crash-safe (#791 reconcile rebuilds pending_head). */
 
     stm_inode_unpin(iidx, h);
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return fs_free;
 }
 
@@ -4017,11 +4222,11 @@ static bool fs_post_inode_free_reclaim_locked(stm_fs *fs)
  * genuinely-full pool -> STM_ENOSPC.
  *
  * The double-commit runs under whatever fs->global mode the caller holds
- * (SH for the per-inode write/truncate/flush paths, EX for commit). This
- * is the SAME posture as the pre-CF-4-C eager reclaim, which fired this
- * exact double-commit from the SH-held unlink path
- * (fs_unlink_inode_and_dirent); CF-4 C moves that commit off the common
- * unlink path onto the rare ENOSPC path. Caller holds fs->global. */
+ * (SH for the per-inode write/truncate/flush paths, EX for commit). Under
+ * SH other ops run beside it, so it commits only between their spans of
+ * fs->txn: it takes txn exclusive, which waits out every writer's
+ * {insert; iset} span and every namespace op's mutations and holds off
+ * new ones. Caller holds fs->global and no txn span of its own. */
 static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
 {
     if (stm_sync_pending_free_blocks(fs->sync) == 0) return false;
@@ -4042,19 +4247,29 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
      * closes it). The #40 admission makes the transition's own drain fit
      * by construction (hole-landing, exactly charged); the corner needs
      * out-of-band free-space consumption between admission and drain. */
-    /* R2-F1: the whole drain->commit sequence runs under dbuf_txn WRLOCK,
-     * excluding every writer's {insert; iset} two-step (they RDLOCK it) --
-     * else a PEER writer's transition landing inside the ~20-100 ms commit
-     * window below makes its kind flip durable without its RAM-only bytes,
-     * resurrecting the R1-F1 tear via concurrency. EX-mode callers of this
-     * function already exclude writers via fs->global; taking the wrlock
-     * there too is uncontended by construction. */
-    pthread_rwlock_wrlock(&fs->dbuf_txn);
+    /* R2-F1: the whole drain->commit sequence runs under txn WRLOCK,
+     * excluding every writer's {insert; iset} two-step and every namespace
+     * op's mutations (they RDLOCK it) -- else a PEER writer's transition
+     * landing inside the ~20-100 ms commit window below makes its kind
+     * flip durable without its RAM-only bytes (the R1-F1 tear via
+     * concurrency), and a peer rename caught between its steps goes
+     * durable half done. EX-mode callers of this function already exclude
+     * both via fs->global; taking the wrlock there too is uncontended by
+     * construction. */
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    /* Under the thread's own span the WRLOCK would never return. */
+    if (fs_txn_depth_here != 0u) abort();
+    if (fs->reclaim_hook) fs->reclaim_hook(false, fs->reclaim_hook_arg);
+#endif
+    pthread_rwlock_wrlock(&fs->txn);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->reclaim_hook) fs->reclaim_hook(true, fs->reclaim_hook_arg);
+#endif
     stm_status predrain = stm_dirty_buffer_drain_all(fs->dirty_buffer,
                                                         fs_flush_drain_cb, fs);
     if (fs_post_inode_free_reclaim_locked(fs)) {
         fs_mark_wedged_locked(fs);
-        pthread_rwlock_unlock(&fs->dbuf_txn);
+        pthread_rwlock_unlock(&fs->txn);
         return false;
     }
     if (predrain != STM_OK) {
@@ -4065,11 +4280,11 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
                             land, so no NEW tear is added by this call. */
         if (stm_sync_commit(fs->sync) != STM_OK) {
             fs_mark_wedged_locked(fs);
-            pthread_rwlock_unlock(&fs->dbuf_txn);
+            pthread_rwlock_unlock(&fs->txn);
             return false;
         }
     }
-    pthread_rwlock_unlock(&fs->dbuf_txn);
+    pthread_rwlock_unlock(&fs->txn);
     return true;
 }
 
@@ -4093,13 +4308,14 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
                                                   uint8_t name_len,
                                                   bool expect_dir)
 {
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
@@ -4146,7 +4362,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         if (gs != STM_OK) {
             stm_inode_unpin(iidx, h_parent);
             stm_inode_unpin(iidx, h_child);
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return gs;
         }
 
@@ -4156,7 +4372,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         if (pls != STM_OK) {
             stm_inode_unpin(iidx, h_parent);
             stm_inode_unpin(iidx, h_child);
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return pls;
         }
 
@@ -4174,7 +4390,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
             h_parent = NULL;
             h_child  = NULL;
             if (rds != STM_OK) {
-                pthread_rwlock_unlock(&fs->global);
+                fs_txn_unlock_global(fs, &tx);
                 return rds;
             }
             continue;
@@ -4190,7 +4406,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
              * own pin. Surface the error. */
             stm_inode_unpin(iidx, h_parent);
             stm_inode_unpin(iidx, h_child);
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return cs;
         }
         break;  /* All locks held; cv loaded; proceed below. */
@@ -4200,13 +4416,13 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     if (expect_dir && !child_is_dir) {
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_ENOTDIR;
     }
     if (!expect_dir && child_is_dir) {
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EISDIR;
     }
     if (expect_dir) {
@@ -4215,17 +4431,18 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         if (cn != STM_OK) {
             stm_inode_unpin(iidx, h_parent);
             stm_inode_unpin(iidx, h_child);
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return cn;
         }
         if (n != 0u) {
             stm_inode_unpin(iidx, h_parent);
             stm_inode_unpin(iidx, h_child);
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return STM_ENOTEMPTY;
         }
     }
 
+    fs_txn_begin(fs, &tx);
     /* Unlink the dirent first so a concurrent lookup can no longer
      * resolve to the about-to-be-freed inode. Then decrement nlink;
      * cascade-free fires only on the last reference.
@@ -4241,7 +4458,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     if (us != STM_OK) {
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return us;
     }
 
@@ -4275,7 +4492,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         if (nb != STM_OK) fs_mark_wedged_locked(fs);
         stm_inode_unpin(iidx, h_parent);
         stm_inode_unpin(iidx, h_child);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ius;
     }
     if (freed)
@@ -4315,7 +4532,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino, &pv);
     stm_inode_unpin(iidx, h_parent);
     stm_inode_unpin(iidx, h_child);
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return STM_OK;
 }
 
@@ -4647,13 +4864,14 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
      * its own dirent layer's internal mutex protection. Since
      * src_ino is discovered via dirent lookup, use the TOCTOU
      * re-verify loop pattern from fs_unlink_inode_and_dirent. */
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
@@ -4662,7 +4880,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
     struct stm_inode_value spv = {0};
     stm_status ps1 = fs_load_parent_dir(iidx, dataset_id, src_parent_ino, &spv);
     if (ps1 != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ps1;
     }
     /* If src and dst share parent, skip the second lookup; otherwise
@@ -4671,7 +4889,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
         struct stm_inode_value dpv = {0};
         stm_status ps2 = fs_load_parent_dir(iidx, dataset_id, dst_parent_ino, &dpv);
         if (ps2 != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return ps2;
         }
     }
@@ -4690,7 +4908,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
 
     for (;;) {
         if (attempts++ >= FS_UNLINK_MAX_ATTEMPTS) {
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return STM_EAGAIN;
         }
 
@@ -4702,7 +4920,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
                                               &observed_child, &observed_gen,
                                               &observed_type);
         if (ds != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return ds;     /* STM_ENOENT if src not linked */
         }
         /* Degenerate self-link case (covered by EPERM below since src
@@ -4710,7 +4928,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
          * S_IFDIR refuses regardless). Refuse early so pin_two doesn't
          * trip on its duplicate guard. */
         if (observed_child == dst_parent_ino) {
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return STM_EINVAL;
         }
 
@@ -4719,7 +4937,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
                                                 dataset_id, dst_parent_ino,
                                                 &h_child, &h_dst_p);
         if (ps2 != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return ps2;
         }
 
@@ -4740,7 +4958,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
             h_child = NULL;
             h_dst_p = NULL;
             if (rds != STM_OK) {
-                pthread_rwlock_unlock(&fs->global);
+                fs_txn_unlock_global(fs, &tx);
                 return rds;
             }
             continue;
@@ -4758,7 +4976,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
             h_child = NULL;
             h_dst_p = NULL;
             if (dp_chk == STM_ENOENT) continue;
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return dp_chk;
         }
 
@@ -4779,16 +4997,17 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
     if (child_type == STM_DT_DIR) {
         stm_inode_unpin(iidx, h_child);
         stm_inode_unpin(iidx, h_dst_p);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EPERM;
     }
 
+    fs_txn_begin(fs, &tx);
     /* Bump nlink first; rollback if dirent install fails. */
     stm_status ils = stm_inode_link(iidx, dataset_id, child_ino);
     if (ils != STM_OK) {
         stm_inode_unpin(iidx, h_child);
         stm_inode_unpin(iidx, h_dst_p);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ils;
     }
     stm_status das = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
@@ -4810,7 +5029,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
         (void)stm_inode_unlink(iidx, dataset_id, child_ino, &freed_unused);
         stm_inode_unpin(iidx, h_child);
         stm_inode_unpin(iidx, h_dst_p);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return das;       /* STM_EEXIST if name already linked, etc. */
     }
 
@@ -4834,7 +5053,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
 
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_dst_p);
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return STM_OK;
 }
 
@@ -4866,13 +5085,14 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
 
     /* PARALLEL-3 impl-2: 2-inode op (src + dst_parent) with both ids
      * known upfront. SH + sorted pin. */
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
@@ -4882,7 +5102,7 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
      * a parent dir, so this is degenerate. Refuse with STM_EINVAL
      * (pin_two would otherwise refuse the duplicate too). */
     if (src_ino == dst_parent_ino) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
@@ -4902,7 +5122,7 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     if (gs != STM_OK) {
         stm_inode_unpin(iidx, h_src);
         stm_inode_unpin(iidx, h_dst_p);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return gs;
     }
 
@@ -4912,7 +5132,7 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     if (ps != STM_OK) {
         stm_inode_unpin(iidx, h_src);
         stm_inode_unpin(iidx, h_dst_p);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ps;
     }
 
@@ -4922,7 +5142,7 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     if (sl != STM_OK) {
         stm_inode_unpin(iidx, h_src);
         stm_inode_unpin(iidx, h_dst_p);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return sl;     /* STM_ENOENT */
     }
     uint32_t src_mode = stm_load_le32(siv.si_mode);
@@ -4933,7 +5153,7 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     if ((src_mode & 0170000u) == 0040000u) {       /* S_IFDIR */
         stm_inode_unpin(iidx, h_src);
         stm_inode_unpin(iidx, h_dst_p);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EPERM;
     } else if ((src_mode & 0170000u) == 0100000u) {/* S_IFREG */
         src_dt = STM_DT_REG;
@@ -4945,10 +5165,11 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
          * refuse to link any unsupported type. */
         stm_inode_unpin(iidx, h_src);
         stm_inode_unpin(iidx, h_dst_p);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EPERM;
     }
 
+    fs_txn_begin(fs, &tx);
     /* Bump nlink first; rollback if dirent install fails (mirror
      * stm_fs_link's order so the same R74 P3-3 lock-posture argument
      * applies). */
@@ -4956,7 +5177,7 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     if (ils != STM_OK) {
         stm_inode_unpin(iidx, h_src);
         stm_inode_unpin(iidx, h_dst_p);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ils;     /* STM_EOVERFLOW on UINT32_MAX */
     }
     stm_status das = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
@@ -4967,7 +5188,7 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
         (void)stm_inode_unlink(iidx, dataset_id, src_ino, &freed_unused);
         stm_inode_unpin(iidx, h_src);
         stm_inode_unpin(iidx, h_dst_p);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return das;       /* STM_EEXIST if name already linked, etc. */
     }
 
@@ -4987,7 +5208,7 @@ static stm_status fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
 
     stm_inode_unpin(iidx, h_src);
     stm_inode_unpin(iidx, h_dst_p);
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return STM_OK;
 }
 
@@ -5026,13 +5247,14 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
 
     /* PARALLEL-3 impl-2: CREATE-shape — SH + parent pin + fresh-child pin
      * (same posture as fs_create_inode_and_link). */
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     if (!iidx || !didx) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_EINVAL;
     }
 
@@ -5040,7 +5262,7 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
     stm_status pp = fs_pin_if_gen(fs, iidx, dataset_id, parent_ino, gen,
                                   &h_parent);
     if (pp != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return pp;
     }
 
@@ -5048,10 +5270,11 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
     stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
     if (ps != STM_OK) {
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ps;
     }
 
+    fs_txn_begin(fs, &tx);
     /* Allocate inode with mode = S_IFLNK | 0777 (POSIX convention —
      * symlink permission bits unused by the kernel; the resolved
      * target's perms gate access). */
@@ -5061,16 +5284,18 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
                                        &child_ino);
     if (as != STM_OK) {
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return as;
     }
 
     stm_inode_handle *h_child = NULL;
-    stm_status cp = stm_inode_pin(iidx, dataset_id, child_ino, &h_child);
+    stm_status cp = fs_txn_pin_fresh(fs, &tx, iidx, dataset_id, child_ino,
+                                     &h_child, parent_ino, gen, &h_parent,
+                                     &pv);
     if (cp != STM_OK) {
         fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return cp;
     }
 
@@ -5083,7 +5308,7 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
         stm_inode_unpin(iidx, h_child);
         fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return cs;
     }
     stm_status xd = fs_clean_reused_ino_locked(fs, dataset_id, child_ino,
@@ -5092,7 +5317,7 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
         stm_inode_unpin(iidx, h_child);
         fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return xd;
     }
     cv.si_data_kind = STM_DATA_SYMLINK;
@@ -5107,7 +5332,7 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
         stm_inode_unpin(iidx, h_child);
         fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return sse;
     }
 
@@ -5121,7 +5346,7 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
         stm_inode_unpin(iidx, h_child);
         fs_rollback_inode_free(iidx, dataset_id, child_ino);
         stm_inode_unpin(iidx, h_parent);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return ds;
     }
 
@@ -5134,7 +5359,7 @@ static stm_status fs_symlink(stm_fs *fs, uint64_t dataset_id,
     if (out_s == STM_OK) *out_child_ino = child_ino;
     stm_inode_unpin(iidx, h_child);
     stm_inode_unpin(iidx, h_parent);
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return out_s;
 }
 
@@ -5876,6 +6101,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
      * stm_inode_pin_many — the first place NoCircularWait in
      * compound_ops_per_inode.tla becomes load-bearing under more
      * than 2 inodes. */
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
@@ -6025,7 +6251,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             for (size_t i = 0u; i < n_reqs; i++) {
                 stm_inode_unpin(iidx, new_handles[i]);
             }
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return gs;
         }
 
@@ -6046,7 +6272,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                 stm_inode_unpin(iidx, new_handles[i]);
             }
             if (srs_chk != STM_OK && srs_chk != STM_ENOENT) {
-                pthread_rwlock_unlock(&fs->global);
+                fs_txn_unlock_global(fs, &tx);
                 return srs_chk;
             }
             continue;
@@ -6068,7 +6294,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                 stm_inode_unpin(iidx, new_handles[i]);
             }
             if (drs_chk != STM_OK && drs_chk != STM_ENOENT) {
-                pthread_rwlock_unlock(&fs->global);
+                fs_txn_unlock_global(fs, &tx);
                 return drs_chk;
             }
             continue;
@@ -6083,7 +6309,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                 stm_inode_unpin(iidx, new_handles[i]);
             }
             if (sp_chk == STM_ENOENT) continue;
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return sp_chk;
         }
         if (src_parent_ino != dst_parent_ino) {
@@ -6096,7 +6322,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                     stm_inode_unpin(iidx, new_handles[i]);
                 }
                 if (dp_chk == STM_ENOENT) continue;
-                pthread_rwlock_unlock(&fs->global);
+                fs_txn_unlock_global(fs, &tx);
                 return dp_chk;
             }
         }
@@ -6135,10 +6361,11 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
      * link it still has. */
     if (dst_exists && dst_ino == src_ino && dst_gen == src_gen) {
         FS_RENAME_UNPIN_ALL();
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_OK;
     }
 
+    fs_txn_begin(fs, &tx);
     /* P8-POSIX-9b: RENAME_EXCHANGE — both src + dst MUST exist.
      * Atomically swap their (ino, gen, type) at the dirent layer
      * via stm_dirent_swap_two. NO inode is created or freed; nlink
@@ -6161,7 +6388,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
         if (src_is_dir && dst_is_dir) {
             if (src_ino == dst_parent_ino || dst_ino == src_parent_ino) {
                 FS_RENAME_UNPIN_ALL();
-                pthread_rwlock_unlock(&fs->global);
+                fs_txn_unlock_global(fs, &tx);
                 return STM_EINVAL;
             }
         }
@@ -6177,7 +6404,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
              * all: nothing may commit it. */
             if (torn) fs_mark_wedged_locked(fs);
             FS_RENAME_UNPIN_ALL();
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return ws;
         }
         /* Stamp ctime on both inodes (post-swap). Best-effort under
@@ -6210,7 +6437,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             }
         }
         FS_RENAME_UNPIN_ALL();
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return STM_OK;
     }
 
@@ -6223,12 +6450,12 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
         bool dst_is_dir = (dst_type == STM_DT_DIR);
         if (src_is_dir && !dst_is_dir) {
             FS_RENAME_UNPIN_ALL();
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return STM_ENOTDIR;
         }
         if (!src_is_dir && dst_is_dir) {
             FS_RENAME_UNPIN_ALL();
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return STM_EISDIR;
         }
         if (src_is_dir && dst_is_dir) {
@@ -6240,7 +6467,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                                                           dst_ino, &n);
             if (cs != STM_OK || n > 0u) {
                 FS_RENAME_UNPIN_ALL();
-                pthread_rwlock_unlock(&fs->global);
+                fs_txn_unlock_global(fs, &tx);
                 return cs != STM_OK ? cs : STM_ENOTEMPTY;
             }
         }
@@ -6262,7 +6489,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
         stm_status dls = stm_inode_lookup(iidx, dataset_id, dst_ino, &dcv);
         if (dls != STM_OK) {
             FS_RENAME_UNPIN_ALL();
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return dls;
         }
         stm_status du = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
@@ -6271,7 +6498,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             /* Should not happen — we just looked up the entry under
              * the parent's pin AND re-verified it under pin. */
             FS_RENAME_UNPIN_ALL();
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return du;
         }
         stm_status iu = fs_free_injected_failure(fs);
@@ -6291,7 +6518,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             if (nb != STM_OK) fs_mark_wedged_locked(fs);
             fs_rename_rollback_ends(fs);
             FS_RENAME_UNPIN_ALL();
-            pthread_rwlock_unlock(&fs->global);
+            fs_txn_unlock_global(fs, &tx);
             return iu;
         }
         /* The records keyed by dst's ino go once it is freed, still under
@@ -6315,7 +6542,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
         if (should_wedge) fs_mark_wedged_locked(fs);
         fs_rename_rollback_ends(fs);
         FS_RENAME_UNPIN_ALL();
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return as;
     }
 
@@ -6346,7 +6573,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
         if (should_wedge) fs_mark_wedged_locked(fs);
         fs_rename_rollback_ends(fs);
         FS_RENAME_UNPIN_ALL();
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         return su;
     }
 
@@ -6389,7 +6616,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
      * crash-safe (#791 reconcile). */
 
     FS_RENAME_UNPIN_ALL();
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return STM_OK;
     #undef FS_RENAME_UNPIN_ALL
 }

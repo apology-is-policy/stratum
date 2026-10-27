@@ -33,6 +33,7 @@
 #include <stratum/inode.h>
 #include <stratum/types.h>
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -1206,6 +1207,82 @@ STM_TEST(inode_pin_slot_reused_after_unpin) {
         STM_ASSERT_OK(stm_inode_pin(idx, 1, ino, &h));
         stm_inode_unpin(idx, h);
     }
+
+    inode_test_idx_close(idx);
+}
+
+/* stm_inode_pin_try takes a free lock and refuses a held one, in either
+ * mode, without waiting and without keeping the slot. */
+typedef struct {
+    stm_inode_index *idx;
+    uint64_t         ino;
+    bool             shared;
+    pthread_mutex_t  mu;
+    pthread_cond_t   cv;
+    bool             held, release;
+} pin_try_holder;
+
+static void *pin_try_holder_run(void *arg)
+{
+    pin_try_holder *h = arg;
+    stm_inode_handle *ih = NULL;
+    stm_status s = h->shared ? stm_inode_pin_shared(h->idx, 1, h->ino, &ih)
+                             : stm_inode_pin(h->idx, 1, h->ino, &ih);
+    pthread_mutex_lock(&h->mu);
+    h->held = (s == STM_OK);
+    pthread_cond_broadcast(&h->cv);
+    while (!h->release) pthread_cond_wait(&h->cv, &h->mu);
+    pthread_mutex_unlock(&h->mu);
+    if (s == STM_OK) stm_inode_unpin(h->idx, ih);
+    return NULL;
+}
+
+static void pin_try_against_holder(stm_inode_index *idx, uint64_t ino,
+                                   bool shared)
+{
+    pin_try_holder h = { .idx = idx, .ino = ino, .shared = shared };
+    alarm(30);     /* a try that waits never returns */
+    pthread_mutex_init(&h.mu, NULL);
+    pthread_cond_init(&h.cv, NULL);
+    pthread_t th;
+    STM_ASSERT_EQ(pthread_create(&th, NULL, pin_try_holder_run, &h), 0);
+    pthread_mutex_lock(&h.mu);
+    while (!h.held) pthread_cond_wait(&h.cv, &h.mu);
+    pthread_mutex_unlock(&h.mu);
+
+    stm_inode_handle *t = NULL;
+    STM_ASSERT_ERR(stm_inode_pin_try(idx, 1, ino, &t), STM_EBUSY);
+    STM_ASSERT_TRUE(t == NULL);
+
+    pthread_mutex_lock(&h.mu);
+    h.release = true;
+    pthread_cond_broadcast(&h.cv);
+    pthread_mutex_unlock(&h.mu);
+    pthread_join(th, NULL);
+    pthread_cond_destroy(&h.cv);
+    pthread_mutex_destroy(&h.mu);
+
+    alarm(0);
+    STM_ASSERT_OK(stm_inode_pin_try(idx, 1, ino, &t));
+    STM_ASSERT_TRUE(t != NULL);
+    stm_inode_unpin(idx, t);
+}
+
+STM_TEST(inode_pin_try_refuses_a_held_lock_without_waiting) {
+    stm_inode_index *idx = inode_test_idx();
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+    pin_try_against_holder(idx, ino, false);
+    pin_try_against_holder(idx, ino, true);
+
+    /* Its other refusals are stm_inode_pin's. */
+    stm_inode_handle *t = NULL;
+    STM_ASSERT_ERR(stm_inode_pin_try(idx, 1, 42, &t), STM_ENOENT);
+    STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
+    STM_ASSERT_ERR(stm_inode_pin_try(idx, 1, ino, &t), STM_ENOENT);
+    STM_ASSERT_ERR(stm_inode_pin_try(idx, 0, ino, &t), STM_EINVAL);
+    STM_ASSERT_TRUE(t == NULL);
 
     inode_test_idx_close(idx);
 }

@@ -565,6 +565,17 @@ stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
                             uint64_t ino, stm_inode_handle **out_handle);
 
 /*
+ * stm_inode_pin that never waits for the per-inode lock: when another
+ * holder has it, returns STM_EBUSY with nothing pinned. Every other
+ * refusal is stm_inode_pin's, so STM_EBUSY can also come from the index
+ * (its seal-retry bound). For a caller that may hold what the lock's
+ * holder waits for.
+ */
+STM_MUST_USE
+stm_status stm_inode_pin_try(stm_inode_index *idx, uint64_t dataset_id,
+                                uint64_t ino, stm_inode_handle **out_handle);
+
+/*
  * RC-2: acquire the per-inode lock SHARED for (dataset_id, ino).
  *
  * The reader-side pin of docs/rc-design.md RC-I2: the extent read path

@@ -125,6 +125,10 @@ fs->global                  (rwlock; EX compound, SH per-inode + reads;
                              stm_inode_pin_shared = rdlock since RC-2 — the
                              extent-read side; glibc slots init
                              PREFER_WRITER_NONRECURSIVE)
+   -> fs->txn               (rwlock, writer-preference like fs->global; SH
+                             spans: a buffered writer's {insert; iset} and
+                             a namespace op's mutations; EX: the ENOSPC
+                             reclaim's drain->commit; section 29.6)
    -> subsystem idx->lock   (inode idx->lock -> dataset idx->lock; R175 SA-3)
    -> engine serial_mu      (serial APIs + serial scans + the mini's trylock)
    -> engine commit_mu      (chain fold/commit; load_root_locked single-flight)
@@ -144,6 +148,15 @@ the one-in-flight `bdev d->lock` (invariant B-2). Deadlock-avoidance rules:
 - **Never** `stm_fs_mark_wedged` under a held `fs->global` EX (R133 P1-2).
 - **Never** take `alloc->lock` then `sync->lock` (commit owns the reverse).
 - Multi-inode ops pin in ascending `(dataset_id, ino)` order — `NoCircularWait`.
+- **Never** wait for an inode pin, or take a second `fs->txn` span, while
+  holding one: a pinned writer waits for `fs->txn`, and the lock queues a
+  new SH behind a waiting reclaim, so either wait closes a cycle. A create
+  pins its new inode, which it takes after its parent and out of ascending
+  order, with `stm_inode_pin_try`; on a held lock it leaves its span and
+  the parent, pins both in order, re-checks the parent (its gen and that
+  it is still a directory) and starts a new span (`fs_txn_pin_fresh`).
+  Hooks builds count every breach, and every namespace mutation made
+  outside a span (`stm_fs_txn_order_violations_for_test`).
 - Dirty-buffer drain callbacks run under `buf->mu`; no re-entry.
 - `serial_mu -> commit_mu` (engine_internal.h:631, R170 P3-2); the mini
   realizes it via **trylock** only, so it bails rather than blocks.
@@ -171,7 +184,15 @@ the one-in-flight `bdev d->lock` (invariant B-2). Deadlock-avoidance rules:
 
 A single-inode write holds `fs->global` SH; a commit takes EX, which drains
 SH holders first — writes and commit are mutually exclusive, no quiesce
-primitive needed. Since CF-1 chunk 10, the mutators' metadata funnels are
+primitive needed. The one committer that runs under SH, the ENOSPC reclaim
+(31-durability-commit.md section 31.2.2), takes `fs->txn` EX instead. A
+namespace op (create, mkdir, symlink, link, unlink, rmdir, rename, and
+the anonymous create, link and unlink) holds `fs->txn` SH from just before
+its first mutation to its release of `fs->global`, so that commit lands
+before the op or after it, never between its steps. The one exception is a
+create that must wait for its new inode's pin (section 29.5): it leaves its
+span while it waits, and a commit then finds the new inode allocated with no
+name, which a crash leaves leaked (unreferenced, not corrupt). Since CF-1 chunk 10, the mutators' metadata funnels are
 `_concurrent` (CAS-prepend) under those pins, so two mutators on DISTINCT
 inodes no longer serialize on the metadata index either.
 

@@ -44,6 +44,7 @@
 #include <stratum/metakey.h>
 #include <stratum/types.h>
 
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>               /* sched_yield: CF-2c EBUSY retry */
 #include <stdint.h>
@@ -1579,9 +1580,10 @@ static void handle_release_locked(stm_inode_index *idx,
  * coexist, any shared pin excludes an exclusive pin and vice versa).
  * The existence pre-check + TOCTOU re-validate are identical for both
  * modes: a reader pinning a freed inode gets STM_ENOENT exactly like a
- * writer. */
+ * writer. `try_only` (exclusive only) refuses a held lock with
+ * STM_EBUSY instead of waiting for it. */
 static stm_status inode_pin_mode(stm_inode_index *idx, uint64_t dataset_id,
-                                    uint64_t ino, bool shared,
+                                    uint64_t ino, bool shared, bool try_only,
                                     stm_inode_handle **out_handle) {
     if (!idx || !out_handle) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
@@ -1616,13 +1618,14 @@ static stm_status inode_pin_mode(stm_inode_index *idx, uint64_t dataset_id,
     /* Acquire the per-inode lock; may block on a concurrent holder.
      * The slot remains live (refcount >= 1 thanks to our bump) for
      * the duration of this wait. */
-    int lrc = shared ? pthread_rwlock_rdlock(&h->rw)
-                     : pthread_rwlock_wrlock(&h->rw);
+    int lrc = shared   ? pthread_rwlock_rdlock(&h->rw)
+            : try_only ? pthread_rwlock_trywrlock(&h->rw)
+                       : pthread_rwlock_wrlock(&h->rw);
     if (lrc != 0) {
         must_lock(idx_lock(idx));
         handle_release_locked(idx, h);
         must_unlock(idx_lock(idx));
-        return STM_EBACKEND;
+        return (try_only && lrc == EBUSY) ? STM_EBUSY : STM_EBACKEND;
     }
 
     /* TOCTOU re-validate: between the pre-check and acquiring h->rw,
@@ -1649,13 +1652,21 @@ static stm_status inode_pin_mode(stm_inode_index *idx, uint64_t dataset_id,
 
 stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
                             uint64_t ino, stm_inode_handle **out_handle) {
-    return inode_pin_mode(idx, dataset_id, ino, /*shared=*/false, out_handle);
+    return inode_pin_mode(idx, dataset_id, ino, /*shared=*/false,
+                          /*try_only=*/false, out_handle);
+}
+
+stm_status stm_inode_pin_try(stm_inode_index *idx, uint64_t dataset_id,
+                                uint64_t ino, stm_inode_handle **out_handle) {
+    return inode_pin_mode(idx, dataset_id, ino, /*shared=*/false,
+                          /*try_only=*/true, out_handle);
 }
 
 stm_status stm_inode_pin_shared(stm_inode_index *idx, uint64_t dataset_id,
                                    uint64_t ino,
                                    stm_inode_handle **out_handle) {
-    return inode_pin_mode(idx, dataset_id, ino, /*shared=*/true, out_handle);
+    return inode_pin_mode(idx, dataset_id, ino, /*shared=*/true,
+                          /*try_only=*/false, out_handle);
 }
 
 void stm_inode_unpin(stm_inode_index *idx, stm_inode_handle *handle) {

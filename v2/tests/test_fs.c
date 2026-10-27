@@ -43,6 +43,7 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12435,6 +12436,401 @@ STM_TEST(fs_a_failed_exchange_never_leaves_a_half_swap_to_commit) {
     exchange_fail_leg(1u, false);
     exchange_fail_leg(2u, false);
     exchange_fail_leg(2u | 4u, true);
+}
+
+/* A writer's ENOSPC reclaim commit, started while a rename is between its
+ * steps (dst freed, src not yet installed there), waits until the rename
+ * is done. A crash right after that commit finds the rename whole: the
+ * destination names the renamed file, never nothing. */
+typedef struct {
+    stm_fs          *fs;
+    uint64_t         ino;
+    pthread_mutex_t  mu;
+    pthread_cond_t   cv;
+    bool             armed, spawned, reclaiming, locked, finished;
+    bool             committed_mid_rename;
+    stm_status       rc;
+    pthread_t        th;
+} mid_rename_writer;
+
+static void *mid_rename_writer_run(void *arg)
+{
+    mid_rename_writer *w = arg;
+    uint8_t *buf = malloc(LATE_WRITE_BYTES);
+    memset(buf, 0xD0, LATE_WRITE_BYTES);
+    stm_status rc = stm_fs_write(w->fs, 1, w->ino, 0, buf, LATE_WRITE_BYTES);
+    free(buf);
+    pthread_mutex_lock(&w->mu);
+    w->rc = rc;
+    w->finished = true;
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mu);
+    return NULL;
+}
+
+static void mid_rename_reclaim(bool locked, void *arg)
+{
+    mid_rename_writer *w = arg;
+    pthread_mutex_lock(&w->mu);
+    if (locked) w->locked = true;
+    else w->reclaiming = true;
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mu);
+}
+
+/* Inside the rename, after dst's free: start the writer, wait for its
+ * reclaim to ask for the commit lock, then give it 300 ms to get it. With
+ * the rename holding it off the wait times out, whatever the timing; when
+ * nothing holds it off, its commit runs here, and the rename waits for
+ * the write to finish so the commit is the rename's torn state. */
+static void mid_rename_start(uint64_t dataset_id, uint64_t ino, void *arg)
+{
+    (void)dataset_id; (void)ino;
+    mid_rename_writer *w = arg;
+    if (!w->armed) return;
+    w->armed = false;
+    w->spawned = true;
+    STM_ASSERT_EQ(pthread_create(&w->th, NULL, mid_rename_writer_run, w), 0);
+    pthread_mutex_lock(&w->mu);
+    while (!w->reclaiming && !w->finished) pthread_cond_wait(&w->cv, &w->mu);
+    if (w->reclaiming) {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 300L * 1000L * 1000L;
+        if (until.tv_nsec >= 1000000000L) {
+            until.tv_sec += 1;
+            until.tv_nsec -= 1000000000L;
+        }
+        while (!w->locked &&
+               pthread_cond_timedwait(&w->cv, &w->mu, &until) == 0) {
+        }
+        if (w->locked) {
+            while (!w->finished) pthread_cond_wait(&w->cv, &w->mu);
+            w->committed_mid_rename = true;
+        }
+    }
+    pthread_mutex_unlock(&w->mu);
+}
+
+STM_TEST(fs_a_reclaim_commit_waits_for_a_rename_between_its_steps) {
+    make_tmp("mid_rename");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)16u * 1024u * 1024u;
+    fopts.bootstrap_size_bytes = (uint64_t)8u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, a = 0, b = 0, c = 0, d = 0, f = 0, got = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                     &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"a", 1,
+                                        0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"b", 1,
+                                        0644u, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1,
+                                        0644u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"d", 1,
+                                        0644u, 0, 0, &d));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &f));
+    uint8_t *buf = malloc(LATE_WRITE_BYTES);
+    memset(buf, 0xAB, LATE_WRITE_BYTES);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, a, 0, buf, LATE_WRITE_BYTES));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, b, 0, buf, LATE_WRITE_BYTES));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, d, 0, buf, LATE_WRITE_BYTES));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    uint64_t off = 0;
+    for (;;) {
+        stm_status ws = stm_fs_write(fs, 1, f, off, buf, LATE_WRITE_BYTES);
+        if (ws != STM_OK) { STM_ASSERT_ERR(ws, STM_ENOSPC); break; }
+        off += LATE_WRITE_BYTES;
+    }
+    free(buf);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* d's blocks go PENDING: the writer's write fits only by reclaiming. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"d", 1));
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.data_pending_blocks > 0u);
+
+    mid_rename_writer w = { .fs = fs, .ino = c, .rc = STM_EINVAL,
+                            .armed = true };
+    pthread_mutex_init(&w.mu, NULL);
+    pthread_cond_init(&w.cv, NULL);
+    stm_fs_set_reclaim_hook_for_test(fs, mid_rename_reclaim, &w);
+    stm_fs_set_free_cleanup_hook_for_test(fs, mid_rename_start, &w);
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, dir, (const uint8_t *)"a", 1,
+                                dir, (const uint8_t *)"b", 1, 0));
+    STM_ASSERT_TRUE(w.spawned);
+    if (w.spawned) pthread_join(w.th, NULL);
+    stm_fs_set_free_cleanup_hook_for_test(fs, NULL, NULL);
+    stm_fs_set_reclaim_hook_for_test(fs, NULL, NULL);
+    pthread_cond_destroy(&w.cv);
+    pthread_mutex_destroy(&w.mu);
+
+    /* The premise: the writer asked for the commit lock mid-rename, and
+     * its reclaim, run after the rename, made the room it needed. */
+    STM_ASSERT_TRUE(w.reclaiming);
+    STM_ASSERT_TRUE(w.locked);
+    STM_ASSERT_TRUE(!w.committed_mid_rename);
+    STM_ASSERT_OK(w.rc);
+
+    /* A crash now: the wedged unmount commits nothing, so the image is
+     * the reclaim's last commit. */
+    stm_fs_mark_wedged(fs);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"b", 1, &got));
+    STM_ASSERT_EQ(got, a);
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"a", 1, &got),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+#define TXN_NAME(lit) (const uint8_t *)(lit), (uint8_t)(sizeof(lit) - 1u)
+
+/* Every namespace op, its refusals included, keeps the order its span
+ * rests on: no blocking pin and no second span inside it, no namespace
+ * mutation outside it, and no span left held at a refusal. */
+STM_TEST(fs_namespace_ops_never_wait_on_a_pin_inside_their_span) {
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("txn_order", &dir);
+    if (!fs) return;
+    unsigned before = stm_fs_txn_order_violations_for_test();
+    uint64_t a = 0, b = 0, d = 0, sl = 0, o = 0, o2 = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, TXN_NAME("a"), 0644u, 0, 0,
+                                        &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, TXN_NAME("b"), 0644u, 0, 0,
+                                        &b));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, TXN_NAME("d"), 0755u, 0, 0, &d));
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, dir, TXN_NAME("s"),
+                                 (const uint8_t *)"a", 1, 0, 0, &sl));
+    STM_ASSERT_OK(stm_fs_link(fs, 1, dir, TXN_NAME("a"), dir,
+                              TXN_NAME("a2")));
+    STM_ASSERT_OK(stm_fs_link_by_ino(fs, 1, a, d, TXN_NAME("a3")));
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0600u, 0, 0, &o));
+    STM_ASSERT_OK(stm_fs_linkat_anon(fs, 1, o, dir, TXN_NAME("o")));
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0600u, 0, 0, &o2));
+    STM_ASSERT_OK(stm_fs_unlink_anon(fs, 1, o2));
+    uint8_t buf[4096];
+    memset(buf, 0x3C, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, b, 0, buf, sizeof buf));
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, dir, TXN_NAME("a2"), dir,
+                                TXN_NAME("a4"), 0));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, dir, TXN_NAME("a4"), dir,
+                                TXN_NAME("b"), 0));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, dir, TXN_NAME("a"), dir,
+                                TXN_NAME("s"), STM_FS_RENAME_EXCHANGE));
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, TXN_NAME("o"), dir,
+                                 TXN_NAME("b"), STM_FS_RENAME_NOREPLACE),
+                   STM_EEXIST);
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, dir, TXN_NAME("o"), dir,
+                                TXN_NAME("o5"), STM_FS_RENAME_WHITEOUT));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, dir, TXN_NAME("b"), dir,
+                                TXN_NAME("b"), 0));
+
+    STM_ASSERT_ERR(stm_fs_unlink(fs, 1, dir, TXN_NAME("nope")), STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, TXN_NAME("nope"), dir,
+                                 TXN_NAME("x"), 0), STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_rmdir(fs, 1, dir, TXN_NAME("b")), STM_ENOTDIR);
+    STM_ASSERT_ERR(stm_fs_unlink(fs, 1, dir, TXN_NAME("d")), STM_EISDIR);
+    STM_ASSERT_ERR(stm_fs_rmdir(fs, 1, dir, TXN_NAME("d")), STM_ENOTEMPTY);
+    STM_ASSERT_ERR(stm_fs_link(fs, 1, dir, TXN_NAME("d"), dir,
+                               TXN_NAME("d2")), STM_EPERM);
+
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, d, TXN_NAME("a3")));
+    STM_ASSERT_OK(stm_fs_rmdir(fs, 1, dir, TXN_NAME("d")));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, TXN_NAME("s")));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, TXN_NAME("a")));
+
+    STM_ASSERT_EQ(stm_fs_txn_order_violations_for_test(), before);
+    reuse_fs_done(fs);
+}
+
+/* A create holds its parent's pin and its transaction span when it pins
+ * the inode it just allocated. Another holder of that inode's lock -- the
+ * shape of fs_link_by_ino with a stale ino, whose pin_two takes the
+ * child's lower ino first and then the directory -- must not wait on the
+ * create while the create waits on it: the create lets go of its span and
+ * its parent, takes both pins in order, re-checks the parent and
+ * finishes. The holder is the test's own thread, started from the
+ * create's pin hook so it holds the lock first; the new inode reuses a
+ * freed ino below the parent's, as link_by_ino's order needs. */
+typedef enum {
+    FRESH_FILE, FRESH_DIR, FRESH_SYMLINK, FRESH_ANON, FRESH_PARENT_REPLACED
+} fresh_kind;
+
+typedef struct {
+    stm_fs          *fs;
+    stm_inode_index *iidx;
+    fresh_kind       kind;
+    uint64_t         top, parent, child, file;
+    pthread_mutex_t  mu;
+    pthread_cond_t   cv;
+    bool             started, held, release;
+    int              busy;
+    stm_status       parent_rc, rmdir_rc, file_rc;
+    pthread_t        th;
+} fresh_pin_holder;
+
+static void *fresh_pin_holder_run(void *arg)
+{
+    fresh_pin_holder *h = arg;
+    stm_inode_handle *hc = NULL, *hp = NULL;
+    stm_status s = stm_inode_pin(h->iidx, 1, h->child, &hc);
+    pthread_mutex_lock(&h->mu);
+    h->held = (s == STM_OK);
+    pthread_cond_broadcast(&h->cv);
+    pthread_mutex_unlock(&h->mu);
+    if (s != STM_OK) return NULL;
+    if (h->kind == FRESH_ANON) {
+        pthread_mutex_lock(&h->mu);
+        while (!h->release) pthread_cond_wait(&h->cv, &h->mu);
+        pthread_mutex_unlock(&h->mu);
+    } else {
+        h->parent_rc = stm_inode_pin(h->iidx, 1, h->parent, &hp);
+        if (h->parent_rc == STM_OK) stm_inode_unpin(h->iidx, hp);
+        if (h->kind == FRESH_PARENT_REPLACED) {
+            /* The create has let go of its parent: replace it with a
+             * file on the same ino before the create pins it again. */
+            h->rmdir_rc = stm_fs_rmdir(h->fs, 1, h->top, TXN_NAME("p"));
+            h->file_rc = stm_fs_create_file(h->fs, 1, h->top, TXN_NAME("f"),
+                                            0644u, 0, 0, &h->file);
+        }
+    }
+    stm_inode_unpin(h->iidx, hc);
+    return NULL;
+}
+
+static void fresh_pin_holder_hook(uint64_t ino, bool busy, void *arg)
+{
+    fresh_pin_holder *h = arg;
+    if (busy) {
+        pthread_mutex_lock(&h->mu);
+        h->busy++;
+        h->release = true;
+        pthread_cond_broadcast(&h->cv);
+        pthread_mutex_unlock(&h->mu);
+        return;
+    }
+    if (h->started) return;
+    h->started = true;
+    h->child = ino;
+    STM_ASSERT_EQ(pthread_create(&h->th, NULL, fresh_pin_holder_run, h), 0);
+    pthread_mutex_lock(&h->mu);
+    while (!h->held) pthread_cond_wait(&h->cv, &h->mu);
+    pthread_mutex_unlock(&h->mu);
+}
+
+static void fresh_pin_deadlocked(int sig)
+{
+    (void)sig;
+    static const char msg[] =
+        "  FAIL a create and its new inode's holder wait on each other\n";
+    (void)!write(2, msg, sizeof msg - 1u);
+    _exit(1);
+}
+
+static void fresh_pin_leg(fresh_kind kind)
+{
+    uint64_t top = 0, v = 0, p = 0;
+    stm_fs *fs = reuse_fs("fresh_pin", &top);
+    if (!fs) return;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, top, TXN_NAME("v"), 0644u, 0, 0,
+                                        &v));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, top, TXN_NAME("p"), 0755u, 0, 0, &p));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, top, TXN_NAME("v")));
+    unsigned before = stm_fs_txn_order_violations_for_test();
+    fresh_pin_holder h = {
+        .fs = fs, .iidx = stm_sync_inode_index(stm_fs_sync(fs)),
+        .kind = kind, .top = top, .parent = p,
+        .parent_rc = STM_EINVAL, .rmdir_rc = STM_EINVAL,
+        .file_rc = STM_EINVAL,
+    };
+    pthread_mutex_init(&h.mu, NULL);
+    pthread_cond_init(&h.cv, NULL);
+    stm_fs_set_fresh_pin_hook_for_test(fs, fresh_pin_holder_hook, &h);
+    void (*prev)(int) = signal(SIGALRM, fresh_pin_deadlocked);
+    alarm(30);
+    uint64_t made = 0, got = 0;
+    stm_status rc = STM_EINVAL;
+    switch (kind) {
+    case FRESH_FILE:
+    case FRESH_PARENT_REPLACED:
+        rc = stm_fs_create_file(fs, 1, p, TXN_NAME("n"), 0644u, 0, 0, &made);
+        break;
+    case FRESH_DIR:
+        rc = stm_fs_mkdir(fs, 1, p, TXN_NAME("n"), 0755u, 0, 0, &made);
+        break;
+    case FRESH_SYMLINK:
+        rc = stm_fs_symlink(fs, 1, p, TXN_NAME("n"), (const uint8_t *)"t", 1,
+                            0, 0, &made);
+        break;
+    case FRESH_ANON:
+        rc = stm_fs_create_anon(fs, 1, 0600u, 0, 0, &made);
+        break;
+    }
+    if (h.started) pthread_join(h.th, NULL);
+    alarm(0);
+    signal(SIGALRM, prev);
+    stm_fs_set_fresh_pin_hook_for_test(fs, NULL, NULL);
+    pthread_cond_destroy(&h.cv);
+    pthread_mutex_destroy(&h.mu);
+
+    /* The premise: the new inode reused v's ino, below the parent's, and
+     * its pin found the lock held, once. */
+    STM_ASSERT_TRUE(h.started);
+    STM_ASSERT_EQ(h.child, v);
+    STM_ASSERT_TRUE(v < p);
+    STM_ASSERT_EQ(h.busy, 1);
+    switch (kind) {
+    case FRESH_ANON:
+        STM_ASSERT_OK(rc);
+        STM_ASSERT_EQ(made, v);
+        STM_ASSERT_OK(stm_fs_linkat_anon(fs, 1, made, p, TXN_NAME("n")));
+        break;
+    case FRESH_PARENT_REPLACED: {
+        /* The parent's ino is a file now: the create refuses and leaves
+         * nothing behind, no name under the file and no inode. */
+        STM_ASSERT_OK(h.parent_rc);
+        STM_ASSERT_OK(h.rmdir_rc);
+        STM_ASSERT_OK(h.file_rc);
+        STM_ASSERT_EQ(h.file, p);
+        STM_ASSERT_ERR(rc, STM_ENOTDIR);
+        stm_dirent_index *didx = stm_sync_dirent_index(stm_fs_sync(fs));
+        uint64_t ci = 0;
+        STM_ASSERT_ERR(stm_dirent_lookup(didx, 1, p, TXN_NAME("n"), &ci,
+                                         NULL, NULL), STM_ENOENT);
+        stm_inode_handle *t = NULL;
+        STM_ASSERT_ERR(stm_inode_pin_try(h.iidx, 1, v, &t), STM_ENOENT);
+        break;
+    }
+    default:
+        STM_ASSERT_OK(rc);
+        STM_ASSERT_EQ(made, v);
+        STM_ASSERT_OK(h.parent_rc);
+        STM_ASSERT_OK(stm_fs_lookup(fs, 1, p, TXN_NAME("n"), &got));
+        STM_ASSERT_EQ(got, made);
+        break;
+    }
+    STM_ASSERT_EQ(stm_fs_txn_order_violations_for_test(), before);
+    reuse_fs_done(fs);
+}
+
+STM_TEST(fs_a_create_whose_new_inode_is_held_lets_go_of_its_parent) {
+    fresh_pin_leg(FRESH_FILE);
+    fresh_pin_leg(FRESH_DIR);
+    fresh_pin_leg(FRESH_SYMLINK);
+    fresh_pin_leg(FRESH_ANON);
+    fresh_pin_leg(FRESH_PARENT_REPLACED);
 }
 
 /* The scrub's extent lookup holds no fs->global, so a rollback can retire a

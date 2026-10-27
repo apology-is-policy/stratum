@@ -381,6 +381,7 @@ these APIs.
 ```c
 struct stm_inode_handle;
 stm_status stm_inode_pin     (idx, dataset_id, ino, **handle);
+stm_status stm_inode_pin_try (idx, dataset_id, ino, **handle);
 void       stm_inode_unpin   (idx, handle);
 stm_status stm_inode_pin_two (idx, ds_a, ino_a, ds_b, ino_b, **out_a, **out_b);
 ```
@@ -392,6 +393,15 @@ INDEPENDENT of `idx->lock` so two writers can hold their respective
 inode mutexes concurrently while a third writer briefly bumps a
 refcount under `idx->lock`. Once the last unpin drops refcount to
 zero, the slot is removed from the chain + freed.
+
+`stm_inode_pin_try` is `stm_inode_pin` that never waits for the lock:
+when another holder has it (either mode) it returns `STM_EBUSY` with
+nothing pinned and the slot reference dropped; its other refusals are
+`stm_inode_pin`'s, so the index's seal-retry bound can answer
+`STM_EBUSY` too. Its caller is fs.c's `fs_txn_pin_fresh`: a create pins
+the inode it just allocated while holding its parent's pin and its
+`fs->txn` span, where a wait could close a cycle (29-concurrency.md
+section 29.5).
 
 `stm_inode_pin_two` (impl-2) acquires two inode pins in canonical
 ASCENDING `(dataset_id, ino)` order regardless of caller-specified
@@ -616,6 +626,7 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 | Merkle root binding | LIVE | `inode_csum` is the 1st input to `compute_merkle_root` |
 | Per-inode mutex (pin/unpin) | LIVE | P9.5-PARALLEL-3 impl-1; 256-bucket hash table; chmod/chown/utimens ported |
 | stm_inode_pin_two (sorted 2-inode pin) | LIVE | P9.5-PARALLEL-3 impl-2; ascending-order helper |
+| stm_inode_pin_try (non-waiting exclusive pin) | LIVE | trywrlock; STM_EBUSY on a held lock; a create's fresh-child pin |
 | 2-inode ops ported (parent+child OR src+dst) | LIVE | impl-2: unlink/rmdir/create_file/mkdir/symlink/linkat_anon/unlink_anon/create_anon/link/link_by_ino |
 | stm_inode_pin_many (sorted N-inode pin) | LIVE | P9.5-PARALLEL-3 impl-3; generalises pin_two; cap STM_INODE_PIN_MANY_MAX=16 |
 | 4-inode ops ported (rename overwrite/EXCHANGE) | LIVE | impl-3: stm_fs_rename — TOCTOU re-verify covers both src+dst dirents; R128/R130 wiring preserved on dst cascade-free |

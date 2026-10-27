@@ -103,7 +103,7 @@ void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
  * Make the next inode free that unlink, rmdir, rename over an existing
  * name or unlink_anon attempts answer `fail` instead, leaving the inode
  * as it was. One-shot; STM_OK disarms. This, the three above and the
- * six below belong to `fs` and go with it at unmount.
+ * eight below that take an `fs` belong to it and go with it at unmount.
  */
 void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
 
@@ -148,6 +148,37 @@ typedef void (*stm_fs_write_guard_hook)(uint64_t ino, void *arg);
 void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
                                           stm_fs_write_guard_hook fn,
                                           void *arg);
+
+/*
+ * Call `fn` as the ENOSPC reclaim is about to take fs->txn exclusive
+ * (locked false) and again once it holds it (locked true), with
+ * fs->global and the writer's pin held. `fn` may not call the fs. NULL
+ * restores it.
+ */
+typedef void (*stm_fs_reclaim_hook)(bool locked, void *arg);
+void stm_fs_set_reclaim_hook_for_test(stm_fs *fs, stm_fs_reclaim_hook fn,
+                                      void *arg);
+
+/*
+ * Call `fn` with a create's, mkdir's, symlink's or anonymous create's new
+ * inode as the op is about to pin it (busy false), with fs->global SH,
+ * the op's transaction span and the parent's pin held, and again when the
+ * pin finds the inode's lock held (busy true), before the op lets go of
+ * the span and the parent. `fn` may not call the fs. NULL restores it.
+ */
+typedef void (*stm_fs_fresh_pin_hook)(uint64_t ino, bool busy, void *arg);
+void stm_fs_set_fresh_pin_hook_for_test(stm_fs *fs, stm_fs_fresh_pin_hook fn,
+                                        void *arg);
+
+/*
+ * How many times, process-wide, a thread inside a span of fs->txn took a
+ * blocking inode pin or a second span or left an op with its span still
+ * held, or a thread outside one made a namespace mutation (a dirent's
+ * install, removal, whiteout or swap, an inode's alloc, free, link count
+ * change or materialize). 0 while every op keeps the order fs->txn rests
+ * on.
+ */
+unsigned stm_fs_txn_order_violations_for_test(void);
 #endif
 
 #ifdef __cplusplus
