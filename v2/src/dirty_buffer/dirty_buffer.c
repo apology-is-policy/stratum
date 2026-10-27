@@ -560,6 +560,21 @@ stm_status stm_dirty_buffer_lookup(stm_dirty_buffer *buf,
     return STM_OK;
 }
 
+/* Copies the inode's buffered bytes in [req_off, req_end) into dst, which
+ * holds that span. Caller holds buf->mu. */
+static void overlay_locked(const stm_dbuf_inode *e, uint64_t req_off,
+                           uint64_t req_end, uint8_t *dst)
+{
+    for (const stm_dbuf_range *r = e->head; r; r = r->next) {
+        if (r->off >= req_end) break;          /* list sorted; no more overlap */
+        if (r->off + r->len <= req_off) continue; /* range fully before req */
+        uint64_t s  = (r->off > req_off) ? r->off : req_off;
+        uint64_t en = (r->off + r->len < req_end) ? (r->off + r->len) : req_end;
+        if (en <= s) continue;
+        memcpy(dst + (s - req_off), r->data + (s - r->off), (size_t)(en - s));
+    }
+}
+
 size_t stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
                                   uint64_t dataset_id, uint64_t ino,
                                   uint64_t req_off, size_t req_len,
@@ -583,24 +598,36 @@ size_t stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
         pthread_mutex_unlock(&buf->mu);
         return 0;
     }
-    uint8_t *dst = (uint8_t *)out_buf;
-    uint64_t req_end = req_off + req_len;
-    for (stm_dbuf_range *r = e->head; r; r = r->next) {
-        if (r->off >= req_end) break;          /* list sorted; no more overlap */
-        if (r->off + r->len <= req_off) continue; /* range fully before req */
-        uint64_t s  = (r->off > req_off) ? r->off : req_off;
-        uint64_t en = (r->off + r->len < req_end) ? (r->off + r->len) : req_end;
-        if (en <= s) continue;
-        uint64_t take_len = en - s;
-        uint64_t dst_off  = s - req_off;
-        uint64_t src_off  = s - r->off;
-        memcpy(dst + dst_off, r->data + src_off, (size_t)take_len);
-    }
+    overlay_locked(e, req_off, req_off + req_len, (uint8_t *)out_buf);
     size_t resident = e->bytes;
     pthread_mutex_unlock(&buf->mu);
     return resident;
 }
 
+
+struct stm_dirty_buffer_drain_view {
+    const stm_dbuf_inode *e;
+};
+
+void stm_dirty_buffer_view_overlay(const stm_dirty_buffer_drain_view *view,
+                                   uint64_t off, uint64_t len, void *dst)
+{
+    if (!view || !dst || len == 0u || off > UINT64_MAX - len) return;
+    overlay_locked(view->e, off, off + len, (uint8_t *)dst);
+}
+
+/* Drops the first `cut` bytes of a range whose head a drain wrote. The
+ * charge stays: the rest lies inside the cover it was taken for. Caller
+ * holds buf->mu. */
+static void trim_range_head(stm_dirty_buffer *buf, stm_dbuf_inode *e,
+                            stm_dbuf_range *r, uint64_t cut)
+{
+    memmove(r->data, r->data + cut, (size_t)(r->len - cut));
+    r->off += cut;
+    r->len -= cut;
+    e->bytes         -= cut;
+    buf->total_bytes -= cut;
+}
 
 /* Coalesce contiguous buffered ranges into as few extent writes as
  * possible — realizing the dirty buffer's stated purpose ("absorbs
@@ -627,6 +654,14 @@ size_t stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
  * models draining ranges into committed extents abstractly — it does
  * not constrain extent granularity — so coalescing preserves
  * ReadHidesFlushOrder / FlushPaddrFreshness / FlushPreservesNoOverlap.
+ *
+ * A run's write can take in more than the run: the covering write
+ * rewrites whole every extent the run partly overlaps, as one new
+ * extent. It takes the other buffered bytes inside it from the view and
+ * reports where it ended, and everything below that is dropped here.
+ * Otherwise the next run, starting inside that new extent, would rewrite
+ * it whole again: runs that each straddle a block boundary rewrote a
+ * growing extent once per run, more blocks than they were admitted on.
  *
  * Caller holds buf->mu. */
 static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
@@ -673,12 +708,17 @@ static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
             }
         }
 
-        stm_status crc = cb(user, ds, ino, run_start, run_len, emit_data);
+        stm_dirty_buffer_drain_view view = { e };
+        uint64_t upto = run_start + run_len;
+        stm_status crc = cb(user, ds, ino, run_start, run_len, emit_data,
+                            &view, &upto);
         free(coal);
         if (crc != STM_OK) return crc;
+        if (upto < run_start + run_len) upto = run_start + run_len;
 
-        /* Pop the emitted run on success. */
-        while (e->head != stop) {
+        /* Pop what the write took: the run, and every later byte below
+         * upto. A range crossing upto keeps its tail. */
+        while (e->head && e->head->off + e->head->len <= upto) {
             stm_dbuf_range *done = e->head;
             e->head = done->next;
             e->bytes         -= done->len;
@@ -688,6 +728,8 @@ static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
             buf->total_footprint_blocks -= sp;
             free_range(buf, done);
         }
+        if (e->head && e->head->off < upto)
+            trim_range_head(buf, e, e->head, upto - e->head->off);
     }
     return STM_OK;
 }

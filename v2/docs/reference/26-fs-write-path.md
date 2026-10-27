@@ -152,6 +152,18 @@ and since every commit drains first, every later commit answered `STM_ENOSPC`
 (`fs_a_buffered_write_is_admitted_on_the_extent_its_drain_rewrites`,
 `dbuf_a_ranges_cover_charge_stays_with_it`).
 
+The charge holds because the drain writes each region once. A run's
+covering write is one new extent over its whole cover; it takes in every
+other buffered byte of the inode inside that cover (the drain hands the
+callback a view, `stm_dirty_buffer_view_overlay`) and reports the cover's
+end, and the drain drops everything below it, trimming a range that
+crosses it. Before, the next run, starting inside that new extent,
+rewrote it whole again: 63 writes of 200 bytes, each straddling a block
+boundary, drained through 2,142 blocks, and on a pool with 386 free
+blocks every commit and the unmount answered `STM_ENOSPC` and 14 of the
+acknowledged writes were gone after a remount
+(`fs_a_drain_writes_each_region_once`, `dbuf_a_drain_drops_what_its_write_took`).
+
 `drain_inode_coalesced_locked` (`src/dirty_buffer/dirty_buffer.c:352`) is the
 **#352 amplification fix**. Without it each ≤ 4 KiB range became its own extent,
 each paying a full AEAD-tag block → ~2–2.7× storage amplification that exhausted

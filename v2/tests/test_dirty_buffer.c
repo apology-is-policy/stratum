@@ -46,9 +46,11 @@ typedef struct {
 
 static stm_status drain_record_cb(void *user, uint64_t ds, uint64_t ino,
                                     uint64_t off, uint64_t len,
-                                    const void *data)
+                                    const void *data,
+                                    const stm_dirty_buffer_drain_view *view,
+                                    uint64_t *out_end)
 {
-    (void)ds; (void)ino;
+    (void)ds; (void)ino; (void)view; (void)out_end;
     drain_recorder *r = user;
     if (r->fail_at != 0 && (r->count + 1) == r->fail_at) {
         return STM_EIO;
@@ -639,6 +641,83 @@ STM_TEST(dbuf_a_ranges_cover_charge_stays_with_it)
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)11);
     drain_recorder all = {0};
     STM_ASSERT_OK(stm_dirty_buffer_drain_all(b, drain_record_cb, &all));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)0);
+    stm_dirty_buffer_destroy(b);
+}
+
+/* A drain callback whose write takes in more than its run reports where
+ * it ended: the buffer drops every byte below that, trims a range that
+ * crosses it (keeping its charge), and the next run starts there. */
+typedef struct {
+    int       calls;
+    uint64_t  off[4];
+    uint64_t  len[4];
+    uint8_t   span[4][4096];
+    int       fail_at;     /* fail on (calls+1) == fail_at; 0 = never */
+} cover_recorder;
+
+static stm_status drain_cover_cb(void *user, uint64_t ds, uint64_t ino,
+                                 uint64_t off, uint64_t len,
+                                 const void *data,
+                                 const stm_dirty_buffer_drain_view *view,
+                                 uint64_t *out_end)
+{
+    (void)ds; (void)ino; (void)data;
+    cover_recorder *r = user;
+    if (r->fail_at != 0 && (r->calls + 1) == r->fail_at) return STM_EIO;
+    if (r->calls >= 4) return STM_ENOMEM;
+    uint64_t lo = off & ~(uint64_t)4095u;
+    memset(r->span[r->calls], 0, 4096);
+    stm_dirty_buffer_view_overlay(view, lo, 4096u, r->span[r->calls]);
+    r->off[r->calls] = off;
+    r->len[r->calls] = len;
+    r->calls++;
+    *out_end = (off + len + 4095u) & ~(uint64_t)4095u;
+    return STM_OK;
+}
+
+STM_TEST(dbuf_a_drain_drops_what_its_write_took)
+{
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+    static uint8_t pa[100], pb[100], pc[200], pd[100];
+    memset(pa, 0xA1, sizeof pa);
+    memset(pb, 0xB2, sizeof pb);
+    memset(pc, 0xC3, sizeof pc);
+    memset(pd, 0xD4, sizeof pd);
+    /* Charges: a block and a piece each, two blocks for c. */
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 100, 100, pa));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 300, 100, pb));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 4000, 200, pc));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 9000, 100, pd));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)9);
+
+    /* The first run's write takes block 0: a, b and c's head. */
+    cover_recorder one = { .fail_at = 2 };
+    STM_ASSERT_ERR(stm_dirty_buffer_drain_ino(b, 1, 1, drain_cover_cb, &one),
+                   STM_EIO);
+    STM_ASSERT_EQ(one.calls, 1);
+    STM_ASSERT_EQ(one.off[0], (uint64_t)100);
+    STM_ASSERT_EQ(one.span[0][100], 0xA1);
+    STM_ASSERT_EQ(one.span[0][399], 0xB2);
+    STM_ASSERT_EQ(one.span[0][4000], 0xC3);
+    STM_ASSERT_EQ(one.span[0][4095], 0xC3);
+    STM_ASSERT_EQ(one.span[0][250], 0x00);
+    STM_ASSERT_EQ(stm_dirty_buffer_total_bytes(b), (size_t)(104 + 100));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)5);
+
+    /* c's tail is the next run, from the block boundary. */
+    cover_recorder all = {0};
+    STM_ASSERT_OK(stm_dirty_buffer_drain_all(b, drain_cover_cb, &all));
+    STM_ASSERT_EQ(all.calls, 2);
+    STM_ASSERT_EQ(all.off[0], (uint64_t)4096);
+    STM_ASSERT_EQ(all.len[0], (uint64_t)104);
+    STM_ASSERT_EQ(all.span[0][0], 0xC3);
+    STM_ASSERT_EQ(all.span[0][103], 0xC3);
+    STM_ASSERT_EQ(all.span[0][104], 0x00);
+    STM_ASSERT_EQ(all.off[1], (uint64_t)9000);
+    STM_ASSERT_EQ(all.span[1][9000 - 8192], 0xD4);
+    STM_ASSERT_EQ(stm_dirty_buffer_total_bytes(b), (size_t)0);
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)0);
     stm_dirty_buffer_destroy(b);
 }

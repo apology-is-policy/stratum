@@ -13291,6 +13291,82 @@ STM_TEST(fs_an_inline_file_refuses_a_cover_past_the_bound_before_its_cutover) {
     unlink(g_key_path);
 }
 
+/* Writes that each straddle a block boundary of a sparse file, one drain
+ * run each: the drain writes every block once, so on a pool with room for
+ * that, and not for each run rewriting the extent the run before it
+ * wrote, every acknowledged write commits and survives a remount. */
+static void drain_once_leg(const char *name, uint64_t spare)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 48u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, sp = 0, f = 0, y = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"y", 1,
+                                     0644u, 0, 0, &y));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"s", 1,
+                                     0644u, 0, 0, &sp));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, y, 1u * MIB));
+    if (spare) {
+        mid_op_put(fs, sp, 0, spare, 0x5A);
+        mid_op_fill(fs, f);
+        STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    uint64_t free0 = st.data_free_blocks;
+    bool acked[63];
+    unsigned n_acked = 0;
+    for (unsigned k = 0; k < 63u; k++) {
+        uint8_t b[200];
+        memset(b, (int)(0x40u + k), sizeof b);
+        stm_status ws = stm_fs_write(fs, 1, y, (uint64_t)k * 4096u + 4000u,
+                                     b, sizeof b);
+        acked[k] = ws == STM_OK;
+        if (!acked[k]) STM_ASSERT_ERR(ws, STM_ENOSPC);
+        n_acked += acked[k] ? 1u : 0u;
+    }
+    STM_ASSERT_EQ(n_acked, 63u);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    /* About two blocks per write (its block and the extent's tag), not a
+     * growing extent per write. */
+    STM_ASSERT_TRUE(free0 - st.data_free_blocks < 4u * 63u);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    for (unsigned k = 0; k < 63u; k++) {
+        if (!acked[k]) continue;
+        STM_ASSERT_EQ(mid_op_byte(fs, y, (uint64_t)k * 4096u + 4000u),
+                      (uint8_t)(0x40u + k));
+        STM_ASSERT_EQ(mid_op_byte(fs, y, (uint64_t)k * 4096u + 4184u),
+                      (uint8_t)(0x40u + k));
+    }
+    STM_ASSERT_EQ(mid_op_byte(fs, y, 4200u), 0x00);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_a_drain_writes_each_region_once) {
+    drain_once_leg("drain_once_roomy", 0);
+    drain_once_leg("drain_once_tight", 1536u * 1024u);
+}
+
 /* A direct write split into pieces, whose second piece finds no room,
  * keeps the first and grows the size over it: nothing it wrote is left
  * past EOF for a later grow to read back as the file's content. */

@@ -2035,7 +2035,9 @@ static stm_status fs_write_covering_split_locked(stm_fs *fs, uint64_t ds,
  * fs_write_regular_locked's direct branch AND the dirty-buffer drain callback.
  * *out_written counts the caller's bytes, from off, that landed: all of them
  * on success; on a failure part way through a split cover, the ones the
- * pieces before it hold.
+ * pieces before it hold. A drain passes its view: every buffered byte of
+ * the inode inside the cover goes in too, and *out_end reports the cover's
+ * end, below which the drain then drops everything.
  *
  * stm_extent_overwrite maintains extent.tla::NoOverlapWithinIno by
  * REPLACING a same-off record and WHOLE-DROPPING any other-off record that
@@ -2074,7 +2076,9 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
                                                        uint64_t off,
                                                        const void *buf,
                                                        size_t len,
-                                                       size_t *out_written)
+                                                       size_t *out_written,
+                                                       const stm_dirty_buffer_drain_view *view,
+                                                       uint64_t *out_end)
 {
     *out_written = 0;
     if (len == 0u) return STM_OK;
@@ -2121,6 +2125,7 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
     if (!scratch) return STM_ENOMEM;
     stm_status rs = fs_rmw_read_span_locked(fs, ds, ino, a_off, a_end, scratch);
     if (rs != STM_OK) { free(scratch); return rs; }
+    if (view) stm_dirty_buffer_view_overlay(view, a_off, a_len, scratch);
     memcpy(scratch + (off - a_off), buf, len);
     uint64_t done = a_off;
     stm_status ws = fs_write_covering_split_locked(fs, ds, ino, a_off,
@@ -2129,6 +2134,7 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
     /* The cover's bytes before off are ones the file already had. */
     if (done > off)
         *out_written = (size_t)((done < end_off ? done : end_off) - off);
+    if (ws == STM_OK && out_end) *out_end = a_end;
     return ws;
 }
 
@@ -2231,12 +2237,15 @@ static stm_status fs_read_span_filled_locked(stm_fs *fs, uint64_t ds,
  * → sync->lock holds. See header doctrine block lines 23-39. */
 static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
                                         uint64_t off, uint64_t len,
-                                        const void *data)
+                                        const void *data,
+                                        const stm_dirty_buffer_drain_view *view,
+                                        uint64_t *out_end)
 {
     stm_fs *fs = (stm_fs *)user;
     size_t landed = 0;
     stm_status drc = fs_write_extent_aligned_locked(fs, ds, ino, off, data,
-                                                        (size_t)len, &landed);
+                                                        (size_t)len, &landed,
+                                                        view, out_end);
     return drc;
 }
 
@@ -2671,7 +2680,8 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
             size_t landed = 0;
             stm_status ws = fs_write_extent_aligned_locked(fs, ds, ino,
                                                                 off, buf, len,
-                                                                &landed);
+                                                                &landed,
+                                                                NULL, NULL);
             if (ws != STM_OK && landed == 0u) {
                 fs_txn_rd_end(fs);
                 return ws;

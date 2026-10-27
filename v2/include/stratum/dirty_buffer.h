@@ -182,25 +182,44 @@ size_t stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
 
 
 /*
- * Per-range callback passed to drain_ino / drain_all. The callback's
- * responsibility is to encrypt + write the range to the extent layer
- * (stm_sync_write_extent or similar). The buffer-owned `data` is valid
- * only for the duration of the callback; after the callback returns
- * the buffer may free or reuse it.
+ * What a drain callback may read of the inode it drains: the bytes still
+ * buffered for it. Valid only inside the callback it was handed to.
+ */
+typedef struct stm_dirty_buffer_drain_view stm_dirty_buffer_drain_view;
+
+/*
+ * Copies every byte buffered for the view's inode in [off, off + len) into
+ * dst, which holds [off, off + len); a byte not buffered is left as it is.
+ * A drain callback runs under buf->mu, so it reads the buffer through this,
+ * not stm_dirty_buffer_overlay.
+ */
+void stm_dirty_buffer_view_overlay(const stm_dirty_buffer_drain_view *view,
+                                   uint64_t off, uint64_t len, void *dst);
+
+/*
+ * Per-run callback passed to drain_ino / drain_all: writes the run
+ * [off, off + len) to the extent layer. The buffer-owned `data` is valid
+ * only for the duration of the callback.
  *
- * Returns STM_OK if the range was successfully realized in the extent
- * layer; non-OK on failure. On non-OK return, the buffer treats the
- * drain as failed and LEAVES the range intact (per writeback.tla
- * "Flush is all-or-nothing per call" — partial drain is a buggy
- * variant and not allowed).
+ * A write that takes in more than the run (a covering write rewrites
+ * whole every extent the run partly overlaps) takes each buffered byte
+ * inside it from `view` and reports where it ended in *out_end. The
+ * buffer then drops every buffered byte below *out_end, trimming a range
+ * that crosses it, so no later run rewrites what this one wrote.
+ * *out_end starts at off + len; a smaller value is taken as that.
+ *
+ * Returns STM_OK once the bytes are in the extent layer. On non-OK the
+ * buffer keeps the run and everything after it.
  */
 typedef stm_status (*stm_dirty_buffer_drain_cb)(
-    void           *user,
-    uint64_t        dataset_id,
-    uint64_t        ino,
-    uint64_t        off,
-    uint64_t        len,
-    const void     *data);
+    void                              *user,
+    uint64_t                           dataset_id,
+    uint64_t                           ino,
+    uint64_t                           off,
+    uint64_t                           len,
+    const void                        *data,
+    const stm_dirty_buffer_drain_view *view,
+    uint64_t                          *out_end);
 
 /*
  * Drain all buffered ranges for one inode via `cb`. Ranges are emitted
