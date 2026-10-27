@@ -136,6 +136,17 @@ the writeback.tla retry dance: flush this inode → retry; flush all → retry.
 (Remnants retain bytes the old drop freed, so a near-cap partial overwrite can
 now ENOSPC where it previously "fit" by losing data — the retry dance covers it.)
 
+Pool admission (#40): a buffered insert is admitted only while the buffer's
+block footprint stays within the pool's free blocks, so an accepted write is
+committable. A range is charged its own blocks, one per started recordsize piece,
+and what its drain's covering write takes beyond it: every extent the range only
+partly overlaps is rewritten whole (`fs_cover_extra_blocks`), and the remnants a
+later insert leaves keep that extra. Uncharged, a 4 KiB write into an 8 MiB
+extent on a near-full pool was admitted on 2 blocks while its drain needed 2,049,
+and since every commit drains first, every later commit answered `STM_ENOSPC`
+(`fs_a_buffered_write_is_admitted_on_the_extent_its_drain_rewrites`,
+`dbuf_a_ranges_cover_charge_stays_with_it`).
+
 `drain_inode_coalesced_locked` (`src/dirty_buffer/dirty_buffer.c:352`) is the
 **#352 amplification fix**. Without it each ≤ 4 KiB range became its own extent,
 each paying a full AEAD-tag block → ~2–2.7× storage amplification that exhausted

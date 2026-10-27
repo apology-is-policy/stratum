@@ -53,6 +53,8 @@
 typedef struct stm_dbuf_range {
     uint64_t                off;
     uint64_t                len;
+    uint64_t                charge;   /* footprint blocks: its span plus
+                                       * its drain's cover beyond it */
     uint64_t                cap;      /* data allocation size (>= len; a
                                        * shelf-reused buffer keeps its true
                                        * capacity so re-shelving never
@@ -65,7 +67,7 @@ typedef struct stm_dbuf_inode {
     uint64_t                dataset_id;
     uint64_t                ino;
     size_t                  bytes;   /* sum of all ranges' len */
-    uint64_t                footprint_blocks; /* sum of ranges' blocks_spanned */
+    uint64_t                footprint_blocks; /* sum of ranges' charge */
     stm_dbuf_range         *head;    /* sorted by off, ascending */
     struct stm_dbuf_inode  *bucket_next;
 } stm_dbuf_inode;
@@ -235,16 +237,16 @@ static bool ranges_overlap(uint64_t a, uint64_t la,
  * coalescing). Pre-fix the invariant held only when the refusal margin
  * happened to exceed the summed per-extent overhead; the fs-level
  * transition-into-buffer change shifted the margin and exposed it.
- * REMAINING residual (C-2-F2-audit F3): a drain landing on PARTIALLY
- * OVERLAPPED existing extents pays the covering-write RMW expansion
- * (fs.c fs_write_extent_aligned_locked -- up to the neighbors' full
- * spans), which is NOT charged here; that corner stays a
- * conservative-retry residual (reclaim-on-ENOSPC + the fs retry dance),
- * bounded to availability, never corruption. DBUF_RECPIECE
+ * A drain landing on PARTIALLY OVERLAPPED existing extents also rewrites
+ * them whole (fs.c fs_write_extent_aligned_locked's covering write). The
+ * caller charges those blocks as the insert's extra_blocks; the range
+ * carries them, and so does each remnant of it. Left uncharged, a write
+ * admitted on a near-full pool could never drain, and every commit after
+ * it failed. DBUF_RECPIECE
  * mirrors STM_FS_RECORDSIZE_MAX (8 MiB) conservatively: a smaller real
  * recordsize would only mean MORE pieces than charged -- so keep the
- * mirror <= the fs constant. Used by every footprint site (insert add,
- * overlap vacate, per-range remove) so accounting stays symmetric. */
+ * mirror <= the fs constant. A range's charge is set once, at insert, and
+ * every removal subtracts that charge, so accounting stays symmetric. */
 #define DBUF_RECPIECE (8ull * 1024u * 1024u)
 static uint64_t blocks_spanned(uint64_t off, uint64_t len)
 {
@@ -254,6 +256,13 @@ static uint64_t blocks_spanned(uint64_t off, uint64_t len)
     uint64_t last  = (off + len - 1u) / blk;
     uint64_t pieces = (len + DBUF_RECPIECE - 1u) / DBUF_RECPIECE;
     return last - first + 1u + pieces;
+}
+
+/* The cover blocks a range was charged beyond its own span. A remnant of
+ * it lies in the same cover, so it keeps them. */
+static uint64_t dbuf_extra(const stm_dbuf_range *r)
+{
+    return r->charge - blocks_spanned(r->off, r->len);
 }
 
 /* ───────────────────────────── public API ─────────────────────────── */
@@ -309,9 +318,11 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
                                         uint64_t dataset_id, uint64_t ino,
                                         uint64_t off, uint64_t len,
                                         const void *data,
+                                        uint64_t extra_blocks,
                                         uint64_t max_footprint_blocks)
 {
     if (!buf || !data) return STM_EINVAL;
+    if (extra_blocks > (uint64_t)UINT32_MAX) return STM_EINVAL;
     if (len == 0) return STM_EINVAL;
     /* Overflow guard. */
     if (off > UINT64_MAX - len) return STM_EINVAL;
@@ -336,7 +347,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
                 if (!first_ov) first_ov = r;
                 last_ov = r;
                 dropped_bytes += r->len;
-                removed_footprint += blocks_spanned(r->off, r->len);
+                removed_footprint += r->charge;
             }
         }
     }
@@ -345,12 +356,15 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
                             ? off - first_ov->off : 0u;
     uint64_t last_end = last_ov ? last_ov->off + last_ov->len : 0u;
     uint64_t tail_len = (last_ov && last_end > end) ? last_end - end : 0u;
-    /* #40: block-spans the head-remnant + new range + tail-remnant occupy.
+    /* #40: the charges of the head-remnant + new range + tail-remnant.
      * Per-range (each stored separately) so it matches the drain-time
      * subtraction; conservative vs the contiguous union (see blocks_spanned). */
-    uint64_t added_footprint = blocks_spanned(off, len)
-        + (head_len > 0u ? blocks_spanned(first_ov->off, head_len) : 0u)
-        + (tail_len > 0u ? blocks_spanned(end, tail_len) : 0u);
+    uint64_t new_charge  = blocks_spanned(off, len) + extra_blocks;
+    uint64_t head_charge = head_len > 0u
+        ? blocks_spanned(first_ov->off, head_len) + dbuf_extra(first_ov) : 0u;
+    uint64_t tail_charge = tail_len > 0u
+        ? blocks_spanned(end, tail_len) + dbuf_extra(last_ov) : 0u;
+    uint64_t added_footprint = new_charge + head_charge + tail_charge;
 
     /* Per writeback.tla::BufferedWrite cap clauses: after superseding the
      * covered bytes (dropped minus the salvaged remnants) and adding
@@ -389,6 +403,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     if (!newr) goto oom;
     newr->off = off;
     newr->len = len;
+    newr->charge = new_charge;
     newr->cap = 0;
     newr->next = NULL;
     newr->data = shelf_alloc(buf, len, &newr->cap);
@@ -400,6 +415,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
         if (!headr) goto oom;
         headr->off = first_ov->off;
         headr->len = head_len;
+        headr->charge = head_charge;
         headr->cap = 0;
         headr->next = NULL;
         headr->data = shelf_alloc(buf, head_len, &headr->cap);
@@ -411,6 +427,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
         if (!tailr) goto oom;
         tailr->off = end;
         tailr->len = tail_len;
+        tailr->charge = tail_charge;
         tailr->cap = 0;
         tailr->next = NULL;
         tailr->data = shelf_alloc(buf, tail_len, &tailr->cap);
@@ -439,7 +456,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
             *slot = r->next;
             e->bytes -= r->len;
             buf->total_bytes -= r->len;
-            uint64_t sp = blocks_spanned(r->off, r->len);
+            uint64_t sp = r->charge;
             e->footprint_blocks         -= sp;
             buf->total_footprint_blocks -= sp;
             free_range(buf, r);
@@ -479,17 +496,18 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
      * counters are maintained regardless, so a later bounded insert sees a
      * correct total. */
     return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
-                                UINT64_MAX);
+                                0u, UINT64_MAX);
 }
 
 stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
                                                uint64_t dataset_id, uint64_t ino,
                                                uint64_t off, uint64_t len,
                                                const void *data,
+                                               uint64_t extra_blocks,
                                                uint64_t max_footprint_blocks)
 {
     return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
-                                max_footprint_blocks);
+                                extra_blocks, max_footprint_blocks);
 }
 
 stm_status stm_dirty_buffer_lookup(stm_dirty_buffer *buf,
@@ -665,7 +683,7 @@ static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
             e->head = done->next;
             e->bytes         -= done->len;
             buf->total_bytes -= done->len;
-            uint64_t sp = blocks_spanned(done->off, done->len);
+            uint64_t sp = done->charge;
             e->footprint_blocks         -= sp;
             buf->total_footprint_blocks -= sp;
             free_range(buf, done);

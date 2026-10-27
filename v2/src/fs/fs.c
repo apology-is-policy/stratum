@@ -2319,6 +2319,48 @@ static stm_status fs_write_cutover_locked(stm_fs *fs, stm_inode_index *iidx,
     return s;
 }
 
+/* The blocks a drain's covering write of [off, off+len) reserves beyond the
+ * range's own: it rewrites whole any extent the range only partly overlaps
+ * (fs_write_extent_aligned_locked), in pieces whose pullback can each add a
+ * block of overhead. 0 when the range's blocks are the whole cover. */
+static stm_status fs_cover_extra_blocks(stm_fs *fs, uint64_t ds, uint64_t ino,
+                                        uint64_t off, uint64_t len,
+                                        uint64_t *out_extra)
+{
+    const uint64_t BLK = 4096u, REC = (uint64_t)STM_FS_RECORDSIZE_MAX;
+    *out_extra = 0;
+    stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
+    if (!eidx || len == 0u) return STM_OK;
+    uint64_t end = off + len, lo = off, hi = end;
+    stm_extent_record e;
+    stm_status ls = stm_extent_lookup_at(eidx, ds, ino, off, &e);
+    if (ls == STM_OK) { if (e.off < lo) lo = e.off; }
+    else if (ls != STM_ENOENT) return ls;
+    ls = stm_extent_lookup_at(eidx, ds, ino, end - 1u, &e);
+    if (ls == STM_OK) { if (e.off + e.len > hi) hi = e.off + e.len; }
+    else if (ls != STM_ENOENT) return ls;
+    uint64_t c_lo = lo & ~(BLK - 1u), c_hi = (hi + BLK - 1u) & ~(BLK - 1u);
+    uint64_t r_lo = off & ~(BLK - 1u), r_hi = (end + BLK - 1u) & ~(BLK - 1u);
+    if (c_lo == r_lo && c_hi == r_hi) return STM_OK;
+    uint64_t span = c_hi - c_lo;
+    *out_extra = (span - (r_hi - r_lo)) / BLK + 2u * ((span + REC - 1u) / REC);
+    return STM_OK;
+}
+
+/* A buffered insert, admitted on everything its drain will reserve. */
+static stm_status fs_buffer_insert_locked(stm_fs *fs, uint64_t ds,
+                                          uint64_t ino, uint64_t off,
+                                          uint64_t len, const void *data,
+                                          uint64_t max_footprint_blocks)
+{
+    uint64_t extra = 0;
+    stm_status xs = fs_cover_extra_blocks(fs, ds, ino, off, len, &extra);
+    if (xs != STM_OK) return xs;
+    return stm_dirty_buffer_insert_bounded(fs->dirty_buffer, ds, ino, off,
+                                           len, data, extra,
+                                           max_footprint_blocks);
+}
+
 /* Inline-aware write for S_IFREG inode `iv` at (ds, ino). On entry:
  * caller holds fs->lock; iv has already been loaded. On STM_OK
  * return: inode + extent layer are in sync. */
@@ -2474,8 +2516,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         if (aligned_size < (uint64_t)STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
             uint64_t tr_freeb = fs->alloc
                 ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
-            fs1 = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
-                                        ds, ino, /*off=*/0u,
+            fs1 = fs_buffer_insert_locked(fs, ds, ino, /*off=*/0u,
                                         (uint64_t)aligned_size, combined,
                                         tr_freeb);
         }
@@ -2549,7 +2590,9 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * buffered write only if the buffered block FOOTPRINT would stay
              * within the pool's free blocks -- so an accepted buffered write
              * is always committable (no false write-success the commit then
-             * can't flush). The check runs under buf->mu WITH the insert, so
+             * can't flush). The footprint counts the drain's whole covering
+             * write, not just the range (fs_buffer_insert_locked). The check
+             * runs under buf->mu WITH the insert, so
              * concurrent SH writers cannot both pass a stale free snapshot and
              * jointly over-admit. On STM_ENOSPC (RAM cap OR pool-footprint
              * breach) run the writeback.tla::BufferBoundedSize dance -- flush
@@ -2566,8 +2609,8 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                 ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
             fs_txn_rd(fs);
             wb_txn_held = true;
-            stm_status ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
-                                        ds, ino, off, (uint64_t)len, buf, freeb);
+            stm_status ic = fs_buffer_insert_locked(fs, ds, ino, off,
+                                        (uint64_t)len, buf, freeb);
             if (ic == STM_ENOSPC) {
                 fs_txn_rd_end(fs);
                 wb_txn_held = false;
@@ -2577,8 +2620,8 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                         ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
                     fs_txn_rd(fs);
                     wb_txn_held = true;
-                    ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
-                                        ds, ino, off, (uint64_t)len, buf, freeb);
+                    ic = fs_buffer_insert_locked(fs, ds, ino, off,
+                                        (uint64_t)len, buf, freeb);
                 }
                 if (ic == STM_ENOSPC) {
                     if (wb_txn_held) {
@@ -2591,8 +2634,8 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                             ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
                         fs_txn_rd(fs);
                         wb_txn_held = true;
-                        ic = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
-                                        ds, ino, off, (uint64_t)len, buf, freeb);
+                        ic = fs_buffer_insert_locked(fs, ds, ino, off,
+                                        (uint64_t)len, buf, freeb);
                     }
                 }
             }

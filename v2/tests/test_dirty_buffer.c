@@ -556,18 +556,19 @@ STM_TEST(dbuf_insert_bounded_refuses_over_footprint)
     enum { BLK = 4096u, NR = 3, MAXF = 6 };
     uint8_t one = 0x11;
     for (uint64_t i = 0; i < NR; i++)   /* 3 ranges: footprint 2,4,6 -- all fit */
-        STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, i * BLK, 1, &one, MAXF));
+        STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, i * BLK, 1, &one, 0, MAXF));
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)MAXF);
 
     /* A 4th distinct block would make footprint 8 > MAXF -> refused, no mutation. */
     stm_status rc = stm_dirty_buffer_insert_bounded(b, 1, 1,
-                                                    (uint64_t)NR * BLK, 1, &one, MAXF);
+                                                    (uint64_t)NR * BLK, 1, &one, 0,
+                                                    MAXF);
     STM_ASSERT_EQ((int)rc, (int)STM_ENOSPC);
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)MAXF);
 
     /* Overwriting an already-resident block (delta 0) is admitted at the bound. */
     uint8_t z = 0x22;
-    STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, 0, 1, &z, MAXF));
+    STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, 0, 1, &z, 0, MAXF));
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)MAXF);
 
     stm_dirty_buffer_destroy(b);
@@ -594,6 +595,51 @@ STM_TEST(dbuf_footprint_zero_after_full_drain)
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)0);
     STM_ASSERT_EQ(stm_dirty_buffer_total_bytes(b), (size_t)0);
 
+    stm_dirty_buffer_destroy(b);
+}
+
+/* A range's cover charge stays with it: the remnants an overlapping
+ * insert leaves keep the cover's extra, admission counts it, and a drain
+ * gives back exactly what was charged. */
+STM_TEST(dbuf_a_ranges_cover_charge_stays_with_it)
+{
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+    enum { BLK = 4096u };
+    static uint8_t pad[3u * BLK];
+    /* 3 blocks + 1 piece + 10 extra. */
+    STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, 0, 3u * BLK, pad,
+                                                  10, UINT64_MAX));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)14);
+    /* A byte at BLK splits it: head [0, BLK) 2 + 10, new 2 + 10, tail
+     * [BLK + 1, 3 BLK) 3 + 10; admitted at exactly that, since the range
+     * it splits gives back its whole charge. */
+    STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, BLK, 1, pad,
+                                                  10, 37));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)37);
+    /* A second run of the same inode: 2 + 3. */
+    STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, 64u * BLK, 1, pad,
+                                                  3, UINT64_MAX));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)42);
+    /* Another inode's byte costs 2 + its extra: 5 does not fit in 48. */
+    STM_ASSERT_EQ((int)stm_dirty_buffer_insert_bounded(b, 1, 2, 0, 1, pad,
+                                                       5, 48),
+                  (int)STM_ENOSPC);
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)42);
+    STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 2, 0, 1, pad, 4, 48));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)48);
+    STM_ASSERT_EQ((int)stm_dirty_buffer_insert_bounded(
+                      b, 1, 3, 0, 1, pad, (uint64_t)UINT32_MAX + 1u,
+                      UINT64_MAX),
+                  (int)STM_EINVAL);
+    /* A drain that stops after the first run gives back just its charge. */
+    drain_recorder rec = { .fail_at = 2 };
+    STM_ASSERT_ERR(stm_dirty_buffer_drain_ino(b, 1, 1, drain_record_cb, &rec),
+                   STM_EIO);
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)11);
+    drain_recorder all = {0};
+    STM_ASSERT_OK(stm_dirty_buffer_drain_all(b, drain_record_cb, &all));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)0);
     stm_dirty_buffer_destroy(b);
 }
 

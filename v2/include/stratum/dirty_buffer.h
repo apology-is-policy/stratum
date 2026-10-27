@@ -119,11 +119,16 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
  * Pass the pool's current free-block count (e.g. stm_alloc_data_free_blocks) as
  * max_footprint_blocks; on STM_ENOSPC the caller flushes to free pool space,
  * re-reads free, and retries. The per-inode + global RAM caps still apply.
+ * extra_blocks is what the drain reserves beyond the range's own blocks (a
+ * covering write that rewrites a partly overlapped extent whole): the range
+ * is charged it until it drains, and so is each remnant a later insert
+ * leaves of it. More than UINT32_MAX is STM_EINVAL.
  */
 stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
                                                uint64_t dataset_id, uint64_t ino,
                                                uint64_t off, uint64_t len,
                                                const void *data,
+                                               uint64_t extra_blocks,
                                                uint64_t max_footprint_blocks);
 
 /*

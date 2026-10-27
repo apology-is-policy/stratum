@@ -13100,6 +13100,66 @@ static stm_fs *short_write_pool(const char *name, int layout,
     return fs;
 }
 
+/* A buffered write into a large extent is admitted on the whole extent
+ * its drain rewrites, not on its own blocks: with room for less, it
+ * answers ENOSPC and the fs still commits; with room, it lands. */
+static void cover_admission_leg(const char *name, uint64_t spare, bool fits)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 48u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, x = 0, sp = 0, f = 0, g = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                     0644u, 0, 0, &x));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"s", 1,
+                                     0644u, 0, 0, &sp));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    mid_op_put(fs, x, 0, 8u * MIB, 0xAB);
+    mid_op_put(fs, sp, 0, spare, 0x5A);
+    mid_op_fill(fs, f);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint8_t b[4096];
+    memset(b, 0xEE, sizeof b);
+    stm_status ws = stm_fs_write(fs, 1, x, 4u * MIB, b, sizeof b);
+    if (fits) STM_ASSERT_OK(ws);
+    else      STM_ASSERT_ERR(ws, STM_ENOSPC);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"g", 1,
+                                     0644u, 0, 0, &g));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 4u * MIB), fits ? 0xEE : 0xAB);
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 0), 0xAB);
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, g, &v));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_a_buffered_write_is_admitted_on_the_extent_its_drain_rewrites) {
+    const uint64_t MIB = 1024u * 1024u;
+    cover_admission_leg("cover_full", 4u * MIB, false);
+    cover_admission_leg("cover_room", 9u * MIB, true);
+}
+
 /* A direct write split into pieces, whose second piece finds no room,
  * keeps the first and grows the size over it: nothing it wrote is left
  * past EOF for a later grow to read back as the file's content. */
