@@ -321,6 +321,8 @@ struct stm_fs {
     void *fresh_pin_hook_arg;
     stm_fs_name_read_hook name_read_hook;
     void *name_read_hook_arg;
+    stm_fs_buffer_insert_hook buffer_insert_hook;
+    void *buffer_insert_hook_arg;
 #endif
 };
 
@@ -531,6 +533,18 @@ static void fs_name_read_gap(stm_fs *fs, uint64_t dataset_id)
         fs->name_read_hook(dataset_id, fs->name_read_hook_arg);
 #else
     (void)fs; (void)dataset_id;
+#endif
+}
+
+/* Just before a buffered write's insert (fs_testing.h). */
+static void fs_buffer_insert_gap(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t ino)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->buffer_insert_hook)
+        fs->buffer_insert_hook(dataset_id, ino, fs->buffer_insert_hook_arg);
+#else
+    (void)fs; (void)dataset_id; (void)ino;
 #endif
 }
 
@@ -2356,18 +2370,30 @@ static stm_status fs_cover_extra_blocks(stm_fs *fs, uint64_t ds, uint64_t ino,
     return STM_OK;
 }
 
+/* The buffer asks this under its lock, so the pool's free blocks and the
+ * extents the cover takes in are read after any drain: a peer's drain (a
+ * writer of another inode flushing every inode, which needs no pin of this
+ * one) spends blocks and can merge those extents. NULL alloc (test seam):
+ * unbounded by footprint. */
+static stm_status fs_buffer_admit(void *user, uint64_t ds, uint64_t ino,
+                                  uint64_t off, uint64_t len,
+                                  uint64_t *extra_blocks,
+                                  uint64_t *max_footprint_blocks)
+{
+    stm_fs *fs = (stm_fs *)user;
+    *max_footprint_blocks = fs->alloc
+        ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
+    return fs_cover_extra_blocks(fs, ds, ino, off, len, extra_blocks);
+}
+
 /* A buffered insert, admitted on everything its drain will reserve. */
 static stm_status fs_buffer_insert_locked(stm_fs *fs, uint64_t ds,
                                           uint64_t ino, uint64_t off,
-                                          uint64_t len, const void *data,
-                                          uint64_t max_footprint_blocks)
+                                          uint64_t len, const void *data)
 {
-    uint64_t extra = 0;
-    stm_status xs = fs_cover_extra_blocks(fs, ds, ino, off, len, &extra);
-    if (xs != STM_OK) return xs;
-    return stm_dirty_buffer_insert_bounded(fs->dirty_buffer, ds, ino, off,
-                                           len, data, extra,
-                                           max_footprint_blocks);
+    fs_buffer_insert_gap(fs, ds, ino);
+    return stm_dirty_buffer_insert_admitted(fs->dirty_buffer, ds, ino, off,
+                                            len, data, fs_buffer_admit, fs);
 }
 
 /* Inline-aware write for S_IFREG inode `iv` at (ds, ino). On entry:
@@ -2534,11 +2560,8 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         bool synced = false;        /* the fallback wrote the extent */
         fs_txn_rd(fs);
         if (aligned_size < (uint64_t)STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
-            uint64_t tr_freeb = fs->alloc
-                ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
             fs1 = fs_buffer_insert_locked(fs, ds, ino, /*off=*/0u,
-                                        (uint64_t)aligned_size, combined,
-                                        tr_freeb);
+                                        (uint64_t)aligned_size, combined);
         }
         if (fs1 != STM_OK) {
             /* Fallback: the pre-F2 synchronous extent write. */
@@ -2611,10 +2634,10 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * within the pool's free blocks -- so an accepted buffered write
              * is always committable (no false write-success the commit then
              * can't flush). The footprint counts the drain's whole covering
-             * write, not just the range (fs_buffer_insert_locked). The check
-             * runs under buf->mu WITH the insert, so
-             * concurrent SH writers cannot both pass a stale free snapshot and
-             * jointly over-admit. On STM_ENOSPC (RAM cap OR pool-footprint
+             * write, not just the range (fs_buffer_insert_locked). The free
+             * count, the cover and the check are read under buf->mu WITH the
+             * insert (fs_buffer_admit), so neither a concurrent SH writer nor
+             * a peer's drain of every inode leaves them stale. On STM_ENOSPC (RAM cap OR pool-footprint
              * breach) run the writeback.tla::BufferBoundedSize dance -- flush
              * this inode, re-read free, retry; still full -> flush every inode,
              * re-read, retry -- then a true ENOSPC only if the write alone
@@ -2625,23 +2648,19 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * a failed attempt RELEASES across the flush dance, whose
              * reclaim takes the WRLOCK -- holding through it would
              * self-deadlock). */
-            uint64_t freeb = fs->alloc
-                ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
             fs_txn_rd(fs);
             wb_txn_held = true;
             stm_status ic = fs_buffer_insert_locked(fs, ds, ino, off,
-                                        (uint64_t)len, buf, freeb);
+                                        (uint64_t)len, buf);
             if (ic == STM_ENOSPC) {
                 fs_txn_rd_end(fs);
                 wb_txn_held = false;
                 stm_status fr = fs_flush_ino_locked(fs, ds, ino);
                 if (fr == STM_OK) {
-                    freeb = fs->alloc
-                        ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
                     fs_txn_rd(fs);
                     wb_txn_held = true;
                     ic = fs_buffer_insert_locked(fs, ds, ino, off,
-                                        (uint64_t)len, buf, freeb);
+                                        (uint64_t)len, buf);
                 }
                 if (ic == STM_ENOSPC) {
                     if (wb_txn_held) {
@@ -2650,12 +2669,10 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                     }
                     fr = fs_flush_all_locked(fs);
                     if (fr == STM_OK) {
-                        freeb = fs->alloc
-                            ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
                         fs_txn_rd(fs);
                         wb_txn_held = true;
                         ic = fs_buffer_insert_locked(fs, ds, ino, off,
-                                        (uint64_t)len, buf, freeb);
+                                        (uint64_t)len, buf);
                     }
                 }
             }
@@ -3648,6 +3665,14 @@ void stm_fs_set_name_read_hook_for_test(stm_fs *fs, stm_fs_name_read_hook fn,
 {
     fs->name_read_hook = fn;
     fs->name_read_hook_arg = arg;
+}
+
+void stm_fs_set_buffer_insert_hook_for_test(stm_fs *fs,
+                                            stm_fs_buffer_insert_hook fn,
+                                            void *arg)
+{
+    fs->buffer_insert_hook = fn;
+    fs->buffer_insert_hook_arg = arg;
 }
 
 void stm_fs_set_fresh_pin_hook_for_test(stm_fs *fs, stm_fs_fresh_pin_hook fn,

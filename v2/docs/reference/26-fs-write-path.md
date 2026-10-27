@@ -164,6 +164,17 @@ blocks every commit and the unmount answered `STM_ENOSPC` and 14 of the
 acknowledged writes were gone after a remount
 (`fs_a_drain_writes_each_region_once`, `dbuf_a_drain_drops_what_its_write_took`).
 
+Both numbers the admission rests on, the pool's free blocks and the
+extents the cover takes in, are read under the buffer's lock with the
+insert (`stm_dirty_buffer_insert_admitted`, asking `fs_buffer_admit`).
+A drain holds that lock throughout, and a peer runs one without this
+file's pin: a writer of another file, refused on the pool, flushes every
+file. Read before the lock, a write was admitted on blocks that drain had
+already spent and on extents it had since merged into a larger cover;
+it answered OK and every commit after it answered `STM_ENOSPC`
+(`fs_a_buffered_write_is_admitted_on_the_pool_a_peer_drain_left`,
+`fs_a_buffered_write_is_admitted_on_the_extents_a_peer_drain_left`).
+
 `drain_inode_coalesced_locked` (`src/dirty_buffer/dirty_buffer.c:352`) is the
 **#352 amplification fix**. Without it each ≤ 4 KiB range became its own extent,
 each paying a full AEAD-tag block → ~2–2.7× storage amplification that exhausted

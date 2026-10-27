@@ -103,7 +103,7 @@ void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
  * Make the next inode free that unlink, rmdir, rename over an existing
  * name or unlink_anon attempts answer `fail` instead, leaving the inode
  * as it was. One-shot; STM_OK disarms. This, the three above and the
- * twelve below that take an `fs` belong to it and go with it at unmount.
+ * thirteen below that take an `fs` belong to it and go with it at unmount.
  */
 void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
 
@@ -206,6 +206,17 @@ void stm_fs_set_fresh_pin_hook_for_test(stm_fs *fs, stm_fs_fresh_pin_hook fn,
  * the inode as it was. One-shot; STM_OK disarms.
  */
 void stm_fs_fail_next_data_iset_for_test(stm_fs *fs, stm_status fail);
+
+/*
+ * Call `fn` in a buffered write just before its insert into the dirty
+ * buffer, with fs->global SH, the inode's pin and the write's transaction
+ * span held. `fn` may not call the fs. NULL restores it.
+ */
+typedef void (*stm_fs_buffer_insert_hook)(uint64_t dataset_id, uint64_t ino,
+                                          void *arg);
+void stm_fs_set_buffer_insert_hook_for_test(stm_fs *fs,
+                                            stm_fs_buffer_insert_hook fn,
+                                            void *arg);
 
 /*
  * How many times, process-wide, a thread inside a span of fs->txn took a

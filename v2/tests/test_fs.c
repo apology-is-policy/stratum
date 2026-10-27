@@ -42,6 +42,7 @@
 #include <stratum/xattr.h>
 
 #include <fcntl.h>
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -13365,6 +13366,191 @@ static void drain_once_leg(const char *name, uint64_t spare)
 STM_TEST(fs_a_drain_writes_each_region_once) {
     drain_once_leg("drain_once_roomy", 0);
     drain_once_leg("drain_once_tight", 1536u * 1024u);
+}
+
+/* A peer's drain, landing as a buffered write is about to insert: a writer
+ * of another file, refused on the pool, flushes every file, so it drains
+ * this file's earlier range, merging the extents the write's cover takes in
+ * and spending the blocks that range was charged. The write must be
+ * admitted on what that drain left: an acknowledged write is one the
+ * commit can drain. */
+typedef struct {
+    stm_fs *fs;
+    uint64_t z;              /* the peer's file */
+    uint64_t at;             /* the peer's write, inside z's extents */
+    bool armed;
+    uint64_t free_before, free_after;
+    pthread_t th;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool started, done, timed_out;
+} peer_drain;
+
+static void *peer_drain_write(void *arg)
+{
+    peer_drain *p = arg;
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(p->fs, &st));
+    p->free_before = st.data_free_blocks;
+    uint8_t b[200];
+    memset(b, 0xC3, sizeof b);
+    STM_ASSERT_ERR(stm_fs_write(p->fs, 1, p->z, p->at, b, sizeof b),
+                   STM_ENOSPC);
+    STM_ASSERT_OK(stm_fs_stats_get(p->fs, &st));
+    p->free_after = st.data_free_blocks;
+    pthread_mutex_lock(&p->mu);
+    p->done = true;
+    pthread_cond_signal(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+    return NULL;
+}
+
+/* The hook may not call the fs, so a thread does while the write waits.
+ * The write holds its span here, so a peer that reached the reclaim would
+ * wait it out: the wait is bounded, and the test joins after the write. */
+static void peer_drain_hook(uint64_t dataset_id, uint64_t ino, void *arg)
+{
+    (void)dataset_id; (void)ino;
+    peer_drain *p = arg;
+    if (!p->armed) return;
+    p->armed = false;
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_cond_init(&p->cv, NULL);
+    STM_ASSERT_EQ(pthread_create(&p->th, NULL, peer_drain_write, p), 0);
+    p->started = true;
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 30;
+    pthread_mutex_lock(&p->mu);
+    while (!p->done && !p->timed_out)
+        if (pthread_cond_timedwait(&p->cv, &p->mu, &dl) == ETIMEDOUT)
+            p->timed_out = true;
+    pthread_mutex_unlock(&p->mu);
+}
+
+static void peer_drain_join(peer_drain *p)
+{
+    if (!p->started) return;
+    pthread_join(p->th, NULL);
+    pthread_cond_destroy(&p->cv);
+    pthread_mutex_destroy(&p->mu);
+    STM_ASSERT_TRUE(!p->timed_out);
+}
+
+/* y gets an earlier range A whose drain rewrites [0, 8M) as one extent, and
+ * B straddling 8M; on the extents B looks up first its cover is smaller than
+ * after the peer's drain of A. hole: A is a run filling the hole between two
+ * one-block extents (its drain spends blocks no reclaim gives back, so a
+ * stale cover alone overcommits); else A straddles 4M between 4 MiB
+ * extents. */
+static void peer_drain_leg(const char *name, bool hole)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (hole ? 64u : 48u) * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, sp = 0, f = 0, y = 0, z = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"y", 1, 0644u, 0, 0, &y));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"z", 1, 0644u, 0, 0, &z));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"s", 1, 0644u, 0, 0, &sp));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1, 0644u, 0, 0, &f));
+    uint8_t *big = malloc((size_t)(8u * MIB));
+    if (hole) {
+        /* y: [0, 4K) 0x20, [8M-4K, 8M) 0x21, [8M, 12M) 0x22; z: two 8 MiB. */
+        memset(big, 0x20, 4096u);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, y, 0u, big, 4096u));
+        memset(big, 0x22, (size_t)(4u * MIB));
+        STM_ASSERT_OK(stm_fs_write(fs, 1, y, 8u * MIB, big, (size_t)(4u * MIB)));
+        memset(big, 0x21, 4096u);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, y, 8u * MIB - 4096u, big, 4096u));
+        memset(big, 0x30, (size_t)(8u * MIB));
+        STM_ASSERT_OK(stm_fs_write(fs, 1, z, 0u, big, (size_t)(8u * MIB)));
+        STM_ASSERT_OK(stm_fs_write(fs, 1, z, 8u * MIB, big, (size_t)(8u * MIB)));
+    } else {
+        /* y: three 4 MiB, 0x10 0x11 0x12; z: one 4 MiB. */
+        for (unsigned k = 0; k < 4u; k++) {
+            memset(big, (int)(0x10u + k), (size_t)(4u * MIB));
+            STM_ASSERT_OK(stm_fs_write(fs, 1, k < 3u ? y : z,
+                                       k < 3u ? (uint64_t)k * 4u * MIB : 0u,
+                                       big, (size_t)(4u * MIB)));
+        }
+    }
+    free(big);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    mid_op_put(fs, sp, 0, (hole ? 16u : 10u) * MIB, 0x5A);
+    mid_op_fill(fs, f);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* A snapshot keeps every extent A's drain supersedes, so the peer's
+     * refused write finds nothing to reclaim: a reclaim would wait out
+     * this write's span, which the hook holds while it waits for the
+     * peer. */
+    uint64_t snap = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "k", 1, &snap));
+
+    uint8_t b[200];
+    memset(b, 0xB2, sizeof b);
+    if (hole) {
+        /* A: [100, 8M - 100) in eight contiguous buffered writes. */
+        const size_t piece = (size_t)((8u * MIB - 200u) / 8u);
+        uint8_t *a = malloc(piece);
+        memset(a, 0xA1, piece);
+        for (unsigned k = 0; k < 8u; k++)
+            STM_ASSERT_OK(stm_fs_write(fs, 1, y, 100u + (uint64_t)k * piece,
+                                       a, piece));
+        free(a);
+    } else {
+        uint8_t a[200];
+        memset(a, 0xA1, sizeof a);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, y, 4u * MIB - 100u, a, sizeof a));
+    }
+    peer_drain p = { .fs = fs, .z = z, .armed = true,
+                     .at = hole ? 8u * MIB - 100u : 2u * MIB + 100u };
+    stm_fs_set_buffer_insert_hook_for_test(fs, peer_drain_hook, &p);
+    stm_status rb = stm_fs_write(fs, 1, y, 8u * MIB - 100u, b, sizeof b);
+    stm_fs_set_buffer_insert_hook_for_test(fs, NULL, NULL);
+    peer_drain_join(&p);
+    /* premise: the peer's flush drained A inside the window */
+    STM_ASSERT_TRUE(!p.armed);
+    STM_ASSERT_TRUE(p.free_before - p.free_after >= 2048u);
+    stm_fs_stats ps = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &ps));
+    STM_ASSERT_EQ(ps.data_pending_blocks, (uint64_t)0);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_EQ(mid_op_byte(fs, y, hole ? 100u : 4u * MIB - 100u), 0xA1);
+    if (rb == STM_OK) {
+        STM_ASSERT_EQ(mid_op_byte(fs, y, 8u * MIB - 100u), 0xB2);
+        STM_ASSERT_EQ(mid_op_byte(fs, y, 8u * MIB + 50u), 0xB2);
+    } else {
+        STM_ASSERT_ERR(rb, STM_ENOSPC);
+        STM_ASSERT_EQ(mid_op_byte(fs, y, 8u * MIB - 100u), hole ? 0x21 : 0x11);
+        STM_ASSERT_EQ(mid_op_byte(fs, y, 8u * MIB + 50u), hole ? 0x22 : 0x12);
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_a_buffered_write_is_admitted_on_the_pool_a_peer_drain_left) {
+    peer_drain_leg("peer_drain", false);
+}
+
+STM_TEST(fs_a_buffered_write_is_admitted_on_the_extents_a_peer_drain_left) {
+    peer_drain_leg("peer_drain_hole", true);
 }
 
 /* A direct write split into pieces, whose second piece finds no room,

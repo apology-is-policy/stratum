@@ -319,7 +319,9 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
                                         uint64_t off, uint64_t len,
                                         const void *data,
                                         uint64_t extra_blocks,
-                                        uint64_t max_footprint_blocks)
+                                        uint64_t max_footprint_blocks,
+                                        stm_dirty_buffer_admit_fn admit,
+                                        void *admit_user)
 {
     if (!buf || !data) return STM_EINVAL;
     if (extra_blocks > (uint64_t)UINT32_MAX) return STM_EINVAL;
@@ -329,6 +331,16 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     if (len > buf->inode_cap) return STM_ENOSPC;  /* impossibly large */
 
     pthread_mutex_lock(&buf->mu);
+    if (admit) {
+        stm_status as = admit(admit_user, dataset_id, ino, off, len,
+                              &extra_blocks, &max_footprint_blocks);
+        if (as == STM_OK && extra_blocks > (uint64_t)UINT32_MAX)
+            as = STM_EINVAL;
+        if (as != STM_OK) {
+            pthread_mutex_unlock(&buf->mu);
+            return as;
+        }
+    }
 
     /* Pre-scan: find the overlapped ranges + the split-salvage remnants.
      * The list is sorted + non-overlapping, so the overlapped ranges are
@@ -387,8 +399,10 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
      * free blocks), so an accepted buffered write is always committable.
      * Checked HERE -- atomically with the insert under buf->mu -- so two
      * concurrent SH writers cannot both pass a stale free-space snapshot and
-     * jointly over-admit (the check-then-insert race). removed_footprint <=
-     * total_footprint_blocks always (the overlapped ranges are resident). */
+     * jointly over-admit (the check-then-insert race). The bound itself is
+     * only as fresh as its reading: an admit callback reads it here, after
+     * any drain. removed_footprint <= total_footprint_blocks always (the
+     * overlapped ranges are resident). */
     if (buf->total_footprint_blocks - removed_footprint + added_footprint
             > max_footprint_blocks) {
         pthread_mutex_unlock(&buf->mu);
@@ -496,7 +510,7 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
      * counters are maintained regardless, so a later bounded insert sees a
      * correct total. */
     return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
-                                0u, UINT64_MAX);
+                                0u, UINT64_MAX, NULL, NULL);
 }
 
 stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
@@ -507,7 +521,20 @@ stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
                                                uint64_t max_footprint_blocks)
 {
     return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
-                                extra_blocks, max_footprint_blocks);
+                                extra_blocks, max_footprint_blocks,
+                                NULL, NULL);
+}
+
+stm_status stm_dirty_buffer_insert_admitted(stm_dirty_buffer *buf,
+                                            uint64_t dataset_id, uint64_t ino,
+                                            uint64_t off, uint64_t len,
+                                            const void *data,
+                                            stm_dirty_buffer_admit_fn admit,
+                                            void *admit_user)
+{
+    if (!admit) return STM_EINVAL;
+    return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
+                                0u, 0u, admit, admit_user);
 }
 
 stm_status stm_dirty_buffer_lookup(stm_dirty_buffer *buf,

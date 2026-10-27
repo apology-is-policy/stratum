@@ -123,6 +123,12 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
  * covering write that rewrites a partly overlapped extent whole): the range
  * is charged it until it drains, and so is each remnant a later insert
  * leaves of it. More than UINT32_MAX is STM_EINVAL.
+ *
+ * Both numbers are as fresh as the caller's reading of them. A drain that
+ * runs between that reading and the insert spends blocks the free count
+ * still shows and can merge the extents the cover was read from;
+ * stm_dirty_buffer_insert_admitted reads them under the buffer lock, which
+ * a drain holds throughout.
  */
 stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
                                                uint64_t dataset_id, uint64_t ino,
@@ -130,6 +136,31 @@ stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
                                                const void *data,
                                                uint64_t extra_blocks,
                                                uint64_t max_footprint_blocks);
+
+/*
+ * Answers, for a range about to be inserted, its extra_blocks and the
+ * max_footprint_blocks to admit it against, as stm_dirty_buffer_insert_bounded
+ * takes them. Runs under the buffer lock, so it must not call into the
+ * buffer. A non-OK answer refuses the insert with that status.
+ */
+typedef stm_status (*stm_dirty_buffer_admit_fn)(void     *user,
+                                                uint64_t  dataset_id,
+                                                uint64_t  ino,
+                                                uint64_t  off,
+                                                uint64_t  len,
+                                                uint64_t *extra_blocks,
+                                                uint64_t *max_footprint_blocks);
+
+/*
+ * As stm_dirty_buffer_insert_bounded, with the two numbers asked of `admit`
+ * under the buffer lock, so no drain lands between them and the insert.
+ */
+stm_status stm_dirty_buffer_insert_admitted(stm_dirty_buffer *buf,
+                                            uint64_t dataset_id, uint64_t ino,
+                                            uint64_t off, uint64_t len,
+                                            const void *data,
+                                            stm_dirty_buffer_admit_fn admit,
+                                            void *admit_user);
 
 /*
  * Read-overlay lookup: copies into `out_buf` the LONGEST contiguous
