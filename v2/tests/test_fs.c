@@ -11936,6 +11936,73 @@ STM_TEST(fs_freed_dir_leaves_no_dirent_records) {
     reuse_fs_done(fs);
 }
 
+/* A create handed a reused ino whose old dirent records it cannot drop
+ * refuses and leaves nothing: no name record, the ino free again, the old
+ * records still there. The next create takes the same ino and drops them.
+ * Each create that can reuse an ino: create_file (mkdir and mknod share
+ * its path), symlink and create_anon. */
+typedef enum { RD_FILE, RD_SYMLINK, RD_ANON } reuse_drop_kind;
+
+static stm_status reuse_drop_create(stm_fs *fs, uint64_t dir,
+                                    reuse_drop_kind kind, uint64_t *out)
+{
+    *out = 0;
+    switch (kind) {
+    case RD_FILE:
+        return stm_fs_create_file(fs, 1, dir, (const uint8_t *)"n", 1,
+                                  0644u, 0, 0, out);
+    case RD_SYMLINK:
+        return stm_fs_symlink(fs, 1, dir, (const uint8_t *)"n", 1,
+                              (const uint8_t *)"t", 1, 0, 0, out);
+    case RD_ANON:
+        return stm_fs_create_anon(fs, 1, 0644u, 0, 0, out);
+    }
+    return STM_EINVAL;
+}
+
+static void reuse_drop_fail_leg(reuse_drop_kind kind)
+{
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("reuse_drop_fail", &dir);
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    stm_dirent_index *didx = stm_sync_dirent_index(stm_fs_sync(fs));
+    uint64_t old = 0, got = 0, ci = 0, cg = 0;
+    uint8_t ct = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &old));
+    STM_ASSERT_OK(stm_dirent_alloc(didx, 1, old, (const uint8_t *)"ghost", 5,
+                                   dir, 0, STM_DT_DIR));
+    STM_ASSERT_OK(stm_inode_free(iidx, 1, old));
+
+    stm_fs_fail_next_reused_ino_drop_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(reuse_drop_create(fs, dir, kind, &got), STM_EIO);
+    STM_ASSERT_ERR(stm_dirent_lookup(didx, 1, dir, (const uint8_t *)"n", 1,
+                                     &ci, &cg, &ct),
+                   STM_ENOENT);
+    struct stm_inode_value v = {0};
+    STM_ASSERT_ERR(stm_fs_stat(fs, 1, old, &v), STM_ENOENT);
+    STM_ASSERT_OK(stm_dirent_lookup(didx, 1, old, (const uint8_t *)"ghost", 5,
+                                    &ci, &cg, &ct));
+
+    STM_ASSERT_OK(reuse_drop_create(fs, dir, kind, &got));
+    STM_ASSERT_EQ(got, old);
+    STM_ASSERT_ERR(stm_dirent_lookup(didx, 1, old, (const uint8_t *)"ghost", 5,
+                                     &ci, &cg, &ct),
+                   STM_ENOENT);
+    if (kind != RD_ANON) {
+        STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"n", 1, &ci));
+        STM_ASSERT_EQ(ci, old);
+    }
+    reuse_fs_done(fs);
+}
+
+STM_TEST(fs_a_create_that_cannot_drop_a_reused_inos_records_leaves_nothing) {
+    reuse_drop_fail_leg(RD_FILE);
+    reuse_drop_fail_leg(RD_SYMLINK);
+    reuse_drop_fail_leg(RD_ANON);
+}
+
 /* A directory freed below the fs layer keeps its dirent records: a live
  * entry, a tombstone and a whiteout. Whatever create reuses the ino drops
  * them first, so a directory there lists nothing and a file holds none. */
@@ -12120,6 +12187,39 @@ STM_TEST(fs_rename_between_two_links_of_one_file_changes_nothing) {
     reuse_fs_done(fs);
 }
 
+/* rename between two links of one file answers for its directories
+ * first: a stale gen on either one is STM_ESTALE, never the no-op. */
+STM_TEST(fs_rename_between_two_links_checks_its_directories_first) {
+    uint64_t dir = 0, f = 0, got = 0;
+    stm_fs *fs = reuse_fs("rename_links_gen", &dir);
+    if (!fs) return;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"a", 1,
+                                     0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_link(fs, 1, dir, (const uint8_t *)"a", 1,
+                              dir, (const uint8_t *)"b", 1));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dir, &v));
+    uint64_t g = stm_load_le64(v.si_gen);
+    STM_ASSERT_ERR(stm_fs_rename_if_gen(fs, 1, dir, g + 1u,
+                                        (const uint8_t *)"a", 1, dir, g,
+                                        (const uint8_t *)"b", 1, 0),
+                   STM_ESTALE);
+    STM_ASSERT_ERR(stm_fs_rename_if_gen(fs, 1, dir, g,
+                                        (const uint8_t *)"a", 1, dir, g + 1u,
+                                        (const uint8_t *)"b", 1, 0),
+                   STM_ESTALE);
+    /* control: the live gens get the no-op */
+    STM_ASSERT_OK(stm_fs_rename_if_gen(fs, 1, dir, g, (const uint8_t *)"a", 1,
+                                       dir, g, (const uint8_t *)"b", 1, 0));
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"a", 1, &got));
+    STM_ASSERT_EQ(got, f);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"b", 1, &got));
+    STM_ASSERT_EQ(got, f);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 2u);
+    reuse_fs_done(fs);
+}
+
 /* A rename whose install or source drop fails after it freed the file it
  * replaced cannot give that file back: it must not restore a name to the
  * freed (ino, gen), which would name the next tenant of the ino, and it
@@ -12157,6 +12257,7 @@ static void rename_rollback_leg(rename_rb_at at, rename_rb_dst dst,
     if (dst == RB_DST_LINKED)
         STM_ASSERT_OK(stm_fs_link_by_ino(fs, 1, b, dir,
                                             (const uint8_t *)"b2", 2));
+    STM_ASSERT_OK(stm_fs_commit(fs));
     rename_rb_seen seen = { 0, false };
     stm_fs_set_rename_rollback_hook_for_test(fs, rename_rb_note, &seen);
     if (at == RB_INSTALL)
@@ -12197,6 +12298,31 @@ static void rename_rollback_leg(rename_rb_at at, rename_rb_dst dst,
         STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
                                             0644u, 0, 0, &x));
     }
+
+    /* What a remount finds: the rollback's state once committed, or, when
+     * it wedged, the commit before the rename, with b whole. */
+    if (!seen.wedged) STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t got = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"a", 1, &got));
+    STM_ASSERT_EQ(got, a);
+    bs = stm_fs_lookup(fs, 1, dir, (const uint8_t *)"b", 1, &got);
+    if (dst == RB_NO_DST) {
+        STM_ASSERT_ERR(bs, STM_ENOENT);
+    } else {
+        STM_ASSERT_OK(bs);
+        STM_ASSERT_EQ(got, b);
+        struct stm_inode_value v = {0};
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, b, &v));
+        STM_ASSERT_EQ(stm_load_le32(v.si_nlink),
+                      dst == RB_DST_LINKED ? 2u : 1u);
+    }
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"x", 1, &got),
+                   seen.wedged ? STM_ENOENT : STM_OK);
     reuse_fs_done(fs);
 }
 

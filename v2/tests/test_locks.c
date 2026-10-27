@@ -253,4 +253,39 @@ STM_TEST(locks_other_incarnation_never_conflicts) {
     stm_lock_table_close(t);
 }
 
+/* A release drops its own owner's locks on that range of that inode in
+ * that dataset, and nothing else that matches the range. Its match omits
+ * the gen (locks.tla, Release): the owner's identical lock on another
+ * incarnation goes with it. */
+STM_TEST(locks_release_drops_only_its_owners_lock_there) {
+    stm_lock_table *t = stm_lock_table_create();
+    STM_ASSERT_TRUE(t != NULL);
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 0, 2, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 200, 0, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 2, 100, 0, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_release(t, 1, 100, 1, 0, 100));
+    size_t n = 0;
+    STM_ASSERT_OK(stm_lock_count(t, &n));
+    STM_ASSERT_EQ(n, 3u);
+    /* each survivor still refuses a third owner's exclusive lock */
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 0, 3, STM_LOCK_EXCLUSIVE,
+                                    0, 100), STM_EAGAIN);
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 200, 0, 3, STM_LOCK_EXCLUSIVE,
+                                    0, 100), STM_EAGAIN);
+    STM_ASSERT_ERR(stm_lock_acquire(t, 2, 100, 0, 3, STM_LOCK_EXCLUSIVE,
+                                    0, 100), STM_EAGAIN);
+    stm_lock_table_close(t);
+
+    t = stm_lock_table_create();
+    STM_ASSERT_TRUE(t != NULL);
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 7, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 8, 1, STM_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_lock_release(t, 1, 100, 1, 0, 100));
+    n = 1;
+    STM_ASSERT_OK(stm_lock_count(t, &n));
+    STM_ASSERT_EQ(n, 0u);
+    stm_lock_table_close(t);
+}
+
 STM_TEST_MAIN("test_locks")

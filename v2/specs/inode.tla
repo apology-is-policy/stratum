@@ -358,10 +358,12 @@ AllocFresh(i) ==
     /\ \/ state[i] = NEVER_USED
        \/ /\ BuggyDoubleAllocate
           /\ state[i] = ALLOCATED
-    \* next_ino is a high-water mark a rollback does not rewind
-    \* (inode.c in_seed_dsstate_locked takes the max), so an ino the
-    \* discarded state issued is never fresh again. Without a rollback a
-    \* NEVER_USED ino has an empty history, so this guard is a no-op.
+    \* next_ino is a high-water mark a rollback does not rewind: the
+    \* rollback lifts it past every ino the discarded state held (inode.c
+    \* stm_inode_dsstate_raise_floors, seeded or not) and a re-seed keeps
+    \* the max (in_seed_dsstate_locked), so an ino the discarded state
+    \* issued is never fresh again. Without a rollback a NEVER_USED ino
+    \* has an empty history, so this guard is a no-op.
     /\ (EnableRollbackModel /\ ~BuggyRollbackRewindsNextIno) =>
            history[i] = {}
     /\ gen[i] + 0 <= MaxGen

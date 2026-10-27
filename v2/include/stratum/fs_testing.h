@@ -103,7 +103,7 @@ void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
  * Make the next inode free that unlink, rmdir, rename over an existing
  * name or unlink_anon attempts answer `fail` instead, leaving the inode
  * as it was. One-shot; STM_OK disarms. This, the three above and the
- * eight below that take an `fs` belong to it and go with it at unmount.
+ * nine below that take an `fs` belong to it and go with it at unmount.
  */
 void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
 
@@ -113,6 +113,13 @@ void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
  * `fail` instead. One-shot; STM_OK disarms.
  */
 void stm_fs_fail_next_name_back_for_test(stm_fs *fs, stm_status fail);
+
+/*
+ * Make the next drop of a reused ino's old dirent records, which a create
+ * handed that ino runs before it links the new inode, answer `fail`
+ * instead. One-shot; STM_OK disarms.
+ */
+void stm_fs_fail_next_reused_ino_drop_for_test(stm_fs *fs, stm_status fail);
 
 /*
  * Make stm_fs_name_to_handle skip its lockless reads and take the

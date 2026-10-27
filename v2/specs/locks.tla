@@ -10,13 +10,13 @@
 \*   (b) they're held by DIFFERENT owners, AND
 \*   (c) at least one is EXCLUSIVE.
 \*
-\* This composes with two more invariants:
-\*   - ExclusiveLockMutuallyExclusive: an EXCLUSIVE lock excludes
-\*     every other lock at overlapping ranges OUTSIDE its own owner.
-\*   - SharedReaderCompatibility: SHARED locks may freely coexist
-\*     iff at least one of the conflicting predicates above is
-\*     false (e.g., all SHARED, or different inos, or
-\*     non-overlapping ranges).
+\* Around it: ExclusiveExcludesDifferentOwner (an EXCLUSIVE lock
+\* excludes every other owner's lock at overlapping ranges),
+\* OwnLocksNeverRefuse (an owner may stack or upgrade over its own
+\* ranges), DifferentInosNeverInteract (a lock on one inode never
+\* refuses an acquire on another), and the action property
+\* DropsAreReleases (a step removes exactly the locks of one Release
+\* or one ReleaseOwner, and nothing else).
 \*
 \* MVP scope:
 \*   - Non-blocking acquire ONLY (Linux F_SETLK shape; F_SETLKW
@@ -34,7 +34,8 @@
 \*
 \* An inode here is one incarnation of it: the impl keys records by
 \* (dataset_id, ino, si_gen), so a lock on a freed file and a lock on
-\* the file that reuses its number are on different Inos.
+\* the file that reuses its number are on different Inos. Release's
+\* match is the exception; see Release.
 \*
 \* Buggy variants change only what Acquire checks (AcquireRefuses);
 \* the invariants judge by the healthy Conflicts, so each variant
@@ -58,6 +59,20 @@
 \*       on one file refuses an acquire on another (or on a later
 \*       incarnation of the same number). Fires
 \*       DifferentInosNeverInteract after one acquire.
+\*
+\* Two more change Release. No invariant can see them, since a removal
+\* never makes a conflict, so the action property DropsAreReleases
+\* judges them:
+\*
+\*   BuggyReleaseOwnerBlind
+\*       Release drops the matching range of every owner, so one
+\*       owner's unlock frees another's lock. Fires DropsAreReleases
+\*       once two owners share a range and one of them releases it.
+\*
+\*   BuggyReleaseInoBlind
+\*       Release drops the owner's matching range on every inode.
+\*       Fires DropsAreReleases once an owner holds the range on two
+\*       inodes and some other lock besides.
 
 EXTENDS Integers, FiniteSets, TLC
 
@@ -67,7 +82,9 @@ CONSTANTS
     MaxOff,                        \* upper bound on byte offsets
     BuggyOwnerCheckMissing,
     BuggyShared_Excl_Granted,
-    BuggyInoBlind
+    BuggyInoBlind,
+    BuggyReleaseOwnerBlind,
+    BuggyReleaseInoBlind
 
 ASSUME /\ Inos # {}
        /\ Owners # {}
@@ -75,6 +92,8 @@ ASSUME /\ Inos # {}
        /\ BuggyOwnerCheckMissing  \in BOOLEAN
        /\ BuggyShared_Excl_Granted \in BOOLEAN
        /\ BuggyInoBlind \in BOOLEAN
+       /\ BuggyReleaseOwnerBlind \in BOOLEAN
+       /\ BuggyReleaseInoBlind \in BOOLEAN
 
 LockTypes == {"shared", "exclusive"}
 Offsets   == 0..MaxOff
@@ -131,16 +150,29 @@ Acquire(ino, owner, type, off, len) ==
         /\ ~ \E other \in locks : AcquireRefuses(cand, other)
         /\ locks' = locks \cup {cand}
 
-\* Release — exact-match removal. The C impl mirrors this: callers
-\* pass the same (ino, owner, off, len) as Acquire; range-merge /
-\* range-split semantics are deferred (forward-noted to the future
-\* blocking-wait extension that adds POSIX byte-range merge logic).
+\* Release — exact-match removal: every lock of the owner on that
+\* range of that ino goes, whatever its type. Callers pass the same
+\* (ino, owner, off, len) as Acquire; range-merge / range-split
+\* semantics are deferred (forward-noted to the future blocking-wait
+\* extension that adds POSIX byte-range merge logic).
+\*
+\* The C match (stm_lock_release) omits the gen: it also drops the
+\* owner's identical lock on another incarnation of the number. Nothing
+\* can observe that. A free drops its incarnation's locks, so only an
+\* incarnation a rollback discarded can still hold one; its locks refuse
+\* nothing here (another Ino), and its gen never comes back (16-inode's
+\* rollback floors), so no acquire or test ever meets them again.
+ReleaseMatches(l, ino, owner, off, len) ==
+    /\ \/ BuggyReleaseInoBlind
+       \/ l.ino = ino
+    /\ \/ BuggyReleaseOwnerBlind
+       \/ l.owner = owner
+    /\ l.off = off /\ l.len = len
+
 Release(ino, owner, off, len) ==
     /\ ino \in Inos /\ owner \in Owners
     /\ off \in Offsets /\ len \in Lengths
-    /\ locks' = { l \in locks :
-                    ~(l.ino = ino /\ l.owner = owner
-                      /\ l.off = off /\ l.len = len) }
+    /\ locks' = { l \in locks : ~ReleaseMatches(l, ino, owner, off, len) }
 
 \* ReleaseOwner — drop every lock held by the owner. Models the
 \* post-close cleanup pattern (Linux: when an FD owning OFD locks
@@ -208,5 +240,22 @@ Invariants ==
     /\ ExclusiveExcludesDifferentOwner
     /\ OwnLocksNeverRefuse
     /\ DifferentInosNeverInteract
+
+\* --------------------------------------------------------------------------
+\* Action property.
+\* --------------------------------------------------------------------------
+
+\* A step drops nothing, or exactly the locks of one Release (every lock
+\* of one owner on one range of one ino) or of one ReleaseOwner (every
+\* lock of one owner). The invariants above cannot see a removal that
+\* goes too far; this does.
+DropsAreReleases ==
+    [][ LET gone == locks \ locks' IN
+        \/ gone = {}
+        \/ \E o \in Owners :
+              \/ gone = { l \in locks : l.owner = o }
+              \/ \E i \in Inos, f \in Offsets, n \in Lengths :
+                    gone = { l \in locks : /\ l.ino = i /\ l.owner = o
+                                            /\ l.off = f /\ l.len = n } ]_locks
 
 =============================================================================

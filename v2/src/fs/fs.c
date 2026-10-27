@@ -291,6 +291,7 @@ struct stm_fs {
      * while one is armed cannot leave it to the next. */
     stm_status free_fail_next;
     stm_status name_back_fail_next;
+    stm_status reuse_drop_fail_next;
     stm_fs_free_cleanup_hook free_cleanup_hook;
     void *free_cleanup_hook_arg;
     stm_fs_xattr_read_gap_hook xattr_read_gap_hook;
@@ -3344,6 +3345,11 @@ void stm_fs_fail_next_name_back_for_test(stm_fs *fs, stm_status fail)
     fs->name_back_fail_next = fail;
 }
 
+void stm_fs_fail_next_reused_ino_drop_for_test(stm_fs *fs, stm_status fail)
+{
+    fs->reuse_drop_fail_next = fail;
+}
+
 void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
                                            stm_fs_free_cleanup_hook fn,
                                            void *arg)
@@ -3434,6 +3440,19 @@ static stm_status fs_name_back_injected_failure(stm_fs *fs)
 #endif
 }
 
+/* The same, in place of the drop of a reused ino's dirent records. */
+static stm_status fs_reuse_drop_injected_failure(stm_fs *fs)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    stm_status s = fs->reuse_drop_fail_next;
+    fs->reuse_drop_fail_next = STM_OK;
+    return s;
+#else
+    (void)fs;
+    return STM_OK;
+#endif
+}
+
 /* The same, in place of the dirent a rename installs at dst, and of the
  * drop (or whiteout) of its src name. */
 static stm_status fs_rename_install_injected_failure(stm_fs *fs)
@@ -3512,7 +3531,8 @@ static stm_status fs_clean_reused_ino_locked(stm_fs *fs, uint64_t dataset_id,
     if (!xidx || !didx || !eidx) return STM_EINVAL;
     stm_status s = stm_xattr_drop_for_ino(xidx, dataset_id, ino, NULL);
     if (s != STM_OK) return s;
-    s = stm_dirent_drop_for_dir(didx, dataset_id, ino, NULL);
+    s = fs_reuse_drop_injected_failure(fs);
+    if (s == STM_OK) s = stm_dirent_drop_for_dir(didx, dataset_id, ino, NULL);
     if (s != STM_OK) return s;
     size_t left = 0;
     s = stm_extent_count_for_ino(eidx, dataset_id, ino, &left);

@@ -94,7 +94,7 @@ Two locks **conflict** iff ALL THREE hold:
 
 This is the `NoConflictingLocks` invariant from `locks.tla` — the
 headline safety property. The acquire path checks this predicate
-against EVERY existing lock at the same `(ds, ino)` before insertion;
+against EVERY existing lock at the same `(ds, ino, gen)` before insertion;
 a single conflict refuses the acquire.
 
 ### Incarnations
@@ -113,6 +113,14 @@ live `si_gen` under fs->global EX and refuses a missing inode
 is about the incarnation it read). Their `*_if_gen` twins, which the 9P
 server calls with a fid's `cached_gen`, answer `STM_ESTALE` when the live
 incarnation is not that one.
+
+`stm_lock_release` is the exception: its match is `(ds, ino, owner, off,
+end)`, without the gen, so it also drops the owner's identical lock on
+another incarnation of the number. Nothing can observe that. A free drops
+its incarnation's locks, so only an incarnation a rollback discarded can
+still hold one; those locks refuse nothing on any other incarnation, and
+the discarded gen never comes back, so no acquire or test meets them
+again. (`locks_release_drops_only_its_owners_lock_there` pins the match.)
 
 ### Range arithmetic
 
@@ -141,22 +149,30 @@ short-circuit non-matching scans.
 `v2/specs/locks.tla` pins the load-bearing invariant:
 
 - **`NoConflictingLocks`** — at every reachable state, no two locks
-  satisfy the conflict predicate. Acquire and ReleaseOwner are the
-  only mutators; both preserve the invariant.
+  satisfy the conflict predicate. Acquire, Release and ReleaseOwner
+  are the mutators; each preserves it.
 - **`OwnLocksNeverRefuse`** — an owner's own locks never refuse its
   acquire, so it may stack or upgrade over any range it holds.
 - **`DifferentInosNeverInteract`** — a lock on one inode never refuses
   an acquire on another, whatever its owner, type or range.
+- **`DropsAreReleases`** (an action property) — a step removes nothing,
+  or exactly the locks of one Release (every lock of one owner on one
+  range of one inode) or of one ReleaseOwner (every lock of one owner).
+  The invariants cannot see a removal that goes too far, since a removal
+  never makes a conflict.
 
-Spec actions:
+Spec actions (the spec's inode is one incarnation, the impl's `(ds, ino,
+gen)`; it has no datasets and no table argument):
 
-- `Acquire(t, ds, ino, owner, type, off, len)` — adds a record
-  unless any existing record conflicts. The spec's inode is the
-  impl's `(ds, ino, gen)`: one incarnation.
-- `Release(t, ds, ino, owner, off, len)` — exact-match drop.
-- `ReleaseOwner(t, owner)` — drop all records with matching owner_id.
-- `Test(t, ds, ino, owner, type, off, len)` — pure read; returns
-  `would_grant ∈ BOOLEAN`.
+- `Acquire(ino, owner, type, off, len)` — adds a lock unless an existing
+  one refuses it (`AcquireRefuses`).
+- `Release(ino, owner, off, len)` — drops every lock of the owner on that
+  range of that inode, whatever its type. The impl matches without the
+  gen (above).
+- `ReleaseOwner(owner)` — drops every lock of the owner.
+
+`stm_lock_test` is a pure read with no spec action: it answers whether
+`Acquire` would admit the candidate, by the same refusal predicate.
 
 Buggy variants change only what Acquire checks (`AcquireRefuses`); the
 invariants judge by the healthy `Conflicts`:
@@ -172,6 +188,16 @@ invariants judge by the healthy `Conflicts`:
   `DifferentInosNeverInteract` (`locks_ino_blind_buggy.cfg`).
   `NoConflictingLocks` cannot see this bug: a refusal adds no record.
 
+Two more change Release, and only `DropsAreReleases` can see them:
+
+- `BuggyReleaseOwnerBlind` — Release drops the matching range of every
+  owner, so one owner's unlock frees another's lock
+  (`locks_release_owner_blind_buggy.cfg`, 4 steps).
+- `BuggyReleaseInoBlind` — Release drops the owner's matching range on
+  every inode (`locks_release_ino_blind_buggy.cfg`, 5 steps).
+
+Runtime twin of both: `locks_release_drops_only_its_owners_lock_there`.
+
 ## SPEC-TO-CODE mapping
 
 | Spec action | Impl function | File |
@@ -179,9 +205,10 @@ invariants judge by the healthy `Conflicts`:
 | `Acquire` | `stm_lock_acquire` | `v2/src/locks/locks.c` |
 | `Release` | `stm_lock_release` | same |
 | `ReleaseOwner` | `stm_lock_release_owner` | same |
-| `Test` | `stm_lock_test` | same |
+| `Test` (no spec action; `AcquireRefuses`) | `stm_lock_test` | same |
 | `NoConflictingLocks` invariant | conflict check inside `stm_lock_acquire` | same |
 | `DifferentInosNeverInteract` invariant | `conflicts`'s `(dataset_id, ino, gen)` match | same |
+| `DropsAreReleases` property | `stm_lock_release`'s `(dataset_id, ino, owner_id, off, end)` match; `stm_lock_release_owner` | same |
 
 ## Tests
 
@@ -190,7 +217,8 @@ invariants judge by the healthy `Conflicts`:
   (same-owner same-range, same-owner overlapping-range, different-owner
   non-overlapping, different-owner overlapping shared-vs-shared,
   different-owner overlapping with-exclusive, other incarnation
-  `locks_other_incarnation_never_conflicts`).
+  `locks_other_incarnation_never_conflicts`, and what a release leaves
+  `locks_release_drops_only_its_owners_lock_there`).
 - `tests/test_fs.c` — `fs_lock_on_a_rolled_back_file_never_refuses_its_successor`,
   `fs_if_gen_ops_act_only_on_their_incarnation`.
 - `tests/test_fs.c` — composes with fs.c wrappers

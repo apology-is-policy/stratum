@@ -94,9 +94,11 @@ typedef struct {
      * stm_inode_dsstate_invalidate (9.8-BE chunk 9b — the Area-S F1 /
      * "inode twin of Area-D F2" closure), so the next alloc-shaped op
      * re-derives this + freed_scan_lo from the rolled-back tree;
-     * next_ino stays a monotone high-water mark across the re-seed
-     * (max-with-existing in in_seed_dsstate_locked), so AllocFresh
-     * never re-issues an ino the discarded tree handed out. */
+     * next_ino stays a high-water mark across the re-seed: the rollback
+     * lifts it past every ino the discarded tree held
+     * (stm_inode_dsstate_raise_floors, seeded or not) and the re-seed
+     * keeps the max (in_seed_dsstate_locked), so AllocFresh never
+     * re-issues an ino the discarded tree handed out. */
     uint64_t  freed_count;
     /* Lower bound on the ino of any FREED record (invariant: no FREED
      * record has ino < freed_scan_lo). The AllocReused scan starts here
