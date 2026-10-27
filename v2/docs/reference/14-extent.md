@@ -312,6 +312,19 @@ inheritance) — passing dst's live identity instead is the buggy
   internally. Returns `STM_ERANGE` atomically (no index mutation) if
   either cap is insufficient. Used by `stm_sync_truncate` to make
   Phase 3 fault-free, closing R41 P3-1 case (b).
+- `stm_extent_shift_range_keys(idx, ds, ino, cutoff, delta, &torn)` — re-keys
+  every extent at or above `cutoff` by `delta` without touching its
+  blocks (fallocate's COLLAPSE_RANGE and INSERT_RANGE). It deletes
+  every moving record before putting any back: a put is an upsert, so a
+  record landing on the key of one still to move would overwrite it,
+  and that one's delete would then take the record that landed. The
+  walk runs in key order, and the key's offset is little-endian, so
+  key order is not offset order (64 KiB sorts before 60 KiB). A failed
+  delete puts back the records already taken out
+  (`fs_a_range_shift_moves_every_extent_once`). A failed put leaves its
+  record out of the index and sets `*out_torn`; fallocate then wedges
+  the fs inside its span, so no commit makes the loss durable
+  (`fs_a_range_shift_that_fails_loses_nothing_durable`).
 
 ### Read paths
 

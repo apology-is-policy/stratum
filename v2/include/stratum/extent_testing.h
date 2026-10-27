@@ -15,6 +15,9 @@
 
 #include <stdint.h>
 
+#include <stratum/extent.h>
+#include <stratum/types.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,6 +31,15 @@ extern "C" {
 typedef void (*stm_extent_paddr_walk_hook)(uint64_t dataset_id, void *arg);
 void stm_extent_set_paddr_walk_hook_for_test(stm_extent_paddr_walk_hook fn,
                                              void *arg);
+
+/*
+ * Make the next stm_extent_shift_range_keys answer `fail` from its
+ * del_n-th delete (1-based; 0 for none), or from its put_n-th put on
+ * (0 for none), in place of the engine call. One-shot.
+ */
+void stm_extent_fail_next_shift_for_test(stm_extent_index *idx,
+                                         unsigned del_n, unsigned put_n,
+                                         stm_status fail);
 #endif
 
 #ifdef __cplusplus

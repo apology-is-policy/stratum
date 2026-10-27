@@ -11524,9 +11524,12 @@ static stm_status fs_fallocate(stm_fs *fs,
          * R89 P2-1: Linux fallocate(2) refuses with EINVAL when
          * `off + len >= cur_size` (collapse beyond EOF is undefined). */
         if (off + len > cur_size) { s = STM_EINVAL; goto falloc_out; }
+        bool torn = false;
         s = stm_extent_shift_range_keys(eidx, dataset_id, ino,
                                              off + len,
-                                             -(int64_t)len);
+                                             -(int64_t)len, &torn);
+        /* A shift that lost a record: nothing may commit it. */
+        if (torn) fs_mark_wedged_locked(fs);
         if (s == STM_OK) {
             fs_step_gap(fs, dataset_id, ino);
             uint64_t new_size = cur_size - len;
@@ -11545,8 +11548,11 @@ static stm_status fs_fallocate(stm_fs *fs,
         if (cur_size > UINT64_MAX - len) {
             s = STM_EOVERFLOW; goto falloc_out;
         }
+        bool torn = false;
         s = stm_extent_shift_range_keys(eidx, dataset_id, ino,
-                                             off, (int64_t)len);
+                                             off, (int64_t)len, &torn);
+        /* A shift that lost a record: nothing may commit it. */
+        if (torn) fs_mark_wedged_locked(fs);
         if (s == STM_OK) {
             fs_step_gap(fs, dataset_id, ino);
             iv.si_size = stm_store_le64(cur_size + len);

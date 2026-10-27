@@ -156,6 +156,11 @@ struct stm_extent_index {
      * index's lifetime. NULL pre-attach — every op refuses with
      * STM_EINVAL. */
     stm_dataset_index    *ds_idx;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    unsigned              shift_fail_del;
+    unsigned              shift_fail_put;
+    stm_status            shift_fail;
+#endif
 };
 
 static inline pthread_mutex_t *ex_lock(const stm_extent_index *idx) {
@@ -1420,8 +1425,10 @@ stm_status stm_extent_punch_range(stm_extent_index *idx,
 stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
                                             uint64_t dataset_id, uint64_t ino,
                                             uint64_t cutoff,
-                                            int64_t  delta) {
-    if (!idx) return STM_EINVAL;
+                                            int64_t  delta,
+                                            bool *out_torn) {
+    if (!idx || !out_torn) return STM_EINVAL;
+    *out_torn = false;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
     if (delta == 0) return STM_EINVAL;
 
@@ -1480,22 +1487,57 @@ stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
         }
     }
 
+    /* Every moving record leaves its key before any lands on its new one:
+     * a put is an upsert, so a record landing on the key of one still to
+     * move would overwrite it, and that one's delete would then take the
+     * record that landed. The collect runs in key-encoding order, which is
+     * not offset order, so no single pass order avoids it. A failed delete
+     * puts back the records already taken out. A failed put leaves its
+     * record out of the index: *out_torn tells the caller, which must stop
+     * that state from committing. */
+    size_t n_moving = 0;
+    for (size_t i = 0; i < c.n; i++)
+        if (c.records[i].off >= cutoff) n_moving++;
+    size_t *moving = calloc(n_moving ? n_moving : 1u, sizeof *moving);
+    if (!moving) {
+        ex_collect_free(&c);
+        must_unlock(&idx->lock);
+        return STM_ENOMEM;
+    }
+    unsigned fail_del = 0u, fail_put = 0u;
+    stm_status fail = STM_OK;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    fail_del = idx->shift_fail_del;
+    fail_put = idx->shift_fail_put;
+    fail = idx->shift_fail;
+    idx->shift_fail_del = 0u;
+    idx->shift_fail_put = 0u;
+#endif
     stm_status last_status = STM_OK;
+    size_t n_out = 0;
     for (size_t i = 0; i < c.n; i++) {
         const stm_extent_record *e = &c.records[i];
         if (e->off < cutoff) continue;
-        stm_status ds_ = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
-        if (ds_ != STM_OK) { last_status = ds_; continue; }
-        stm_extent_record nr = *e;
-        if (delta < 0) {
-            uint64_t adelta = (uint64_t)(-delta);
-            nr.off = e->off - adelta;
-        } else {
-            nr.off = e->off + (uint64_t)delta;
-        }
-        stm_status ps = ex_engine_put(idx, &nr);
-        if (ps != STM_OK) last_status = ps;
+        stm_status ds_ = (fail_del == n_out + 1u)
+            ? fail : ex_engine_del(idx, e->dataset_id, e->ino, e->off);
+        if (ds_ != STM_OK) { last_status = ds_; break; }
+        moving[n_out++] = i;
     }
+    bool undo = (last_status != STM_OK);
+    for (size_t k = 0; k < n_out; k++) {
+        stm_extent_record nr = c.records[moving[k]];
+        if (!undo) {
+            if (delta < 0) nr.off -= (uint64_t)(-delta);
+            else           nr.off += (uint64_t)delta;
+        }
+        stm_status ps = (fail_put != 0u && k + 1u >= fail_put)
+            ? fail : ex_engine_put(idx, &nr);
+        if (ps != STM_OK) {
+            *out_torn = true;
+            if (last_status == STM_OK) last_status = ps;
+        }
+    }
+    free(moving);
     ex_collect_free(&c);
     must_unlock(&idx->lock);
     return last_status;
@@ -2316,6 +2358,18 @@ void stm_extent_set_paddr_walk_hook_for_test(stm_extent_paddr_walk_hook fn,
 {
     paddr_walk_hook = fn;
     paddr_walk_hook_arg = arg;
+}
+
+void stm_extent_fail_next_shift_for_test(stm_extent_index *idx,
+                                         unsigned del_n, unsigned put_n,
+                                         stm_status fail)
+{
+    if (!idx) return;
+    must_lock(&idx->lock);
+    idx->shift_fail_del = del_n;
+    idx->shift_fail_put = put_n;
+    idx->shift_fail = fail;
+    must_unlock(&idx->lock);
 }
 #endif
 

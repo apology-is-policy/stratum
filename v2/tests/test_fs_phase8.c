@@ -42,6 +42,7 @@
 #include <stratum/cas.h>
 #include <stratum/dirent.h>
 #include <stratum/extent.h>
+#include <stratum/extent_testing.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
 #include <stratum/inode.h>
@@ -7653,6 +7654,140 @@ STM_TEST(fs_p7b_fallocate_insert_range_shifts_extents_up) {
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* A range shift lands extents on the keys of others still to move, and
+ * walks them in key-encoding order, not offset order: each extent must
+ * still move exactly once, with its bytes. */
+static bool p7b_block_is(stm_fs *fs, uint64_t ino, uint64_t off, int pattern)
+{
+    uint8_t buf[4096];
+    size_t n = 0;
+    if (stm_fs_read(fs, 1, ino, off, buf, sizeof buf, &n) != STM_OK)
+        return false;
+    if (n != sizeof buf) return false;
+    for (size_t i = 0; i < sizeof buf; i++) {
+        uint8_t want = pattern < 0
+            ? 0u : (uint8_t)((i * 7u + (unsigned)pattern) & 0xFFu);
+        if (buf[i] != want) return false;
+    }
+    return true;
+}
+
+typedef struct { uint64_t off; int pattern; } p7b_block;
+
+static void p7b_shift_leg(const char *name, const p7b_block *before,
+                          size_t n_before, uint64_t off, uint64_t len,
+                          uint32_t flag, const p7b_block *after,
+                          size_t n_after, uint64_t size_after)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0, ino = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &ino));
+    for (size_t i = 0; i < n_before; i++) {   /* one extent each */
+        p7b_write_block(fs, ino, before[i].off, (uint8_t)before[i].pattern);
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, off, len, flag));
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < n_after; i++)
+            STM_ASSERT_TRUE(p7b_block_is(fs, ino, after[i].off,
+                                         after[i].pattern));
+        struct stm_inode_value v = {0};
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+        STM_ASSERT_EQ(stm_load_le64(v.si_size), size_after);
+        if (pass == 1) break;
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (!fs) return;
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_a_range_shift_moves_every_extent_once) {
+    const uint64_t K = 4096u;
+    /* insert: each block lands on its upper neighbour's key */
+    const p7b_block ins_before[] = { {0, 11}, {K, 22}, {2 * K, 33} };
+    const p7b_block ins_after[] = { {0, -1}, {K, 11}, {2 * K, 22},
+                                    {3 * K, 33} };
+    p7b_shift_leg("shift_insert", ins_before, 3, 0, K,
+                  STM_FS_FALLOC_FL_INSERT_RANGE, ins_after, 4, 4 * K);
+    /* collapse: 64 KiB's key sorts before 60 KiB's (offsets are
+     * little-endian in the key), so it moves first */
+    const p7b_block col_before[] = { {0, 11}, {15 * K, 22}, {16 * K, 33} };
+    const p7b_block col_after[] = { {0, 11}, {13 * K, -1}, {14 * K, 22},
+                                    {15 * K, 33} };
+    p7b_shift_leg("shift_collapse", col_before, 3, 14 * K, K,
+                  STM_FS_FALLOC_FL_COLLAPSE_RANGE, col_after, 4, 16 * K);
+}
+
+/* A range shift whose delete fails puts back what it took out and leaves
+ * the file as it was. One whose put fails has lost a record: the fs
+ * wedges, and the image keeps the file as it was before the shift. */
+static void p7b_shift_fail_leg(const char *name, unsigned del_n,
+                               unsigned put_n, bool want_wedged)
+{
+    const uint64_t K = 4096u;
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0, ino = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &ino));
+    for (unsigned b = 0; b < 3u; b++) {        /* one extent each */
+        p7b_write_block(fs, ino, b * K, (uint8_t)(11u * (b + 1u)));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+    stm_extent_fail_next_shift_for_test(
+        stm_sync_extent_index(stm_fs_sync(fs)), del_n, put_n, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, K,
+                                    STM_FS_FALLOC_FL_INSERT_RANGE), STM_EIO);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.wedged, want_wedged);
+    if (want_wedged) {
+        STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+        STM_ASSERT_ERR(stm_sync_commit(stm_fs_sync(fs)), STM_EWEDGED);
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1 || !want_wedged) {
+            for (unsigned b = 0; b < 3u; b++)
+                STM_ASSERT_TRUE(p7b_block_is(fs, ino, b * K,
+                                             (int)(11u * (b + 1u))));
+            struct stm_inode_value v = {0};
+            STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+            STM_ASSERT_EQ(stm_load_le64(v.si_size), 3u * K);
+        }
+        if (pass == 0 && !want_wedged) STM_ASSERT_OK(stm_fs_commit(fs));
+        if (pass == 1) break;
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (!fs) return;
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_a_range_shift_that_fails_loses_nothing_durable) {
+    p7b_shift_fail_leg("shift_del_fail", 2u, 0u, false);
+    p7b_shift_fail_leg("shift_put_fail", 0u, 2u, true);
+    p7b_shift_fail_leg("shift_undo_fail", 2u, 1u, true);
 }
 
 STM_TEST(fs_p7b_fallocate_zero_range_drops_extent) {

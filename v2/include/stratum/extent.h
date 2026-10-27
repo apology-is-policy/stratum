@@ -468,14 +468,16 @@ stm_status stm_extent_punch_range(stm_extent_index *idx,
  *     extent's range straddles cutoff). Shifted extents must not
  *     exceed STM_FS_RECORDSIZE_MAX-derived end-of-file cap.
  *
- * Effect: walks (ds, ino) extents. Below cutoff: untouched. At or
- * above cutoff: drops the original key + reinserts at off + delta.
- * paddrs/replicas/gen/key_id/origin all unchanged — only the (off)
- * key changes. Atomic at the C level (single mutex hold of the
- * extent index).
+ * Effect: below cutoff, untouched. Every record at or above it is
+ * taken out, then put back at off + delta; paddrs/replicas/gen/key_id/
+ * origin unchanged, only the (off) key changes. One hold of the extent
+ * index's mutex. A failed delete puts the records already taken out
+ * back where they were and answers its error. A failed put leaves its
+ * record out of the index and sets *out_torn: the caller must stop
+ * that state from committing. *out_torn is false otherwise.
  *
  * Refusals (more in addition to the preconditions above):
- *   - NULL idx (STM_EINVAL).
+ *   - NULL idx OR NULL out_torn (STM_EINVAL).
  *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
  *   - delta == 0 (STM_EINVAL — no-op caller; should short-circuit).
  *   - cutoff + delta underflows OR overflows uint64_t (STM_EINVAL).
@@ -485,7 +487,8 @@ STM_MUST_USE
 stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
                                             uint64_t dataset_id, uint64_t ino,
                                             uint64_t cutoff,
-                                            int64_t  delta);
+                                            int64_t  delta,
+                                            bool *out_torn);
 
 /*
  * P7-12: truncate using caller-provided pre-allocated buffers.
