@@ -78,7 +78,8 @@ extent (offset not a multiple of the recordsize, length ≤ recordsize) is legal
 static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                                           uint64_t ds, uint64_t ino,
                                           struct stm_inode_value *iv,
-                                          uint64_t off, const void *buf, size_t len);
+                                          uint64_t off, const void *buf, size_t len,
+                                          size_t *out_written);
 ```
 
 Dispatch:
@@ -90,13 +91,25 @@ Dispatch:
 - seal mask (`SEAL_WRITE` / `SEAL_FUTURE_WRITE` / `SEAL_GROW`) → `STM_EPERM`.
 - **INLINE** (`si_data_kind == STM_DATA_INLINE`, file ≤ `STM_INODE_INLINE_MAX`
   = 100 B): bytes live in `si_inline_data`; a write past the inline cap triggers
-  the INLINE→EXTENT transition.
+  the INLINE→EXTENT transition. It is dense (one extent from 0 holding the prefix
+  and the write) when the write starts in the first block and ends within a
+  recordsize; otherwise it is the sparse cutover truncate also uses (the prefix
+  alone, in one block, then the write takes the EXTENT path), so a far write
+  costs its own blocks, not the zeros before it, and no offset is refused.
 - **EXTENT**: small writes (`len < STM_FLUSH_DIRECT_THRESHOLD_BYTES` = 1 MiB)
   land in the dirty buffer (coalesced at flush); large writes pre-flush the
   inode then go straight to `fs_write_extent_aligned_locked`.
 
 `si_size` is bumped to `max(si_size, off+len)`; mtime+ctime stamped; the inode
-re-`stm_inode_set`. Buffered bytes are not on-disk until `stm_sync_commit`; the
+re-`stm_inode_set`.
+
+A direct write whose cover exceeds a recordsize lands in pieces (below). When
+a later piece fails, the earlier ones stay, and the write is a short write, as
+write(2)'s is: `si_size` grows over the landed pieces and `*out_written` counts
+the caller's bytes they hold, so no byte past EOF is left for a later grow to
+read back. `stm_fs_pwrite` answers that count with `STM_OK`; `stm_fs_write`,
+which has no count, answers the error; the 9P server replies the count in
+Rwrite. Buffered bytes are not on-disk until `stm_sync_commit`; the
 buffer overlay surfaces them on intervening reads.
 
 ## Implementation
@@ -190,7 +203,9 @@ atomic w.r.t. its drops:
   the candidate boundary; if an extent straddles it, end the piece at that
   extent's start so it goes whole into the next piece). Each piece then fully
   contains the extents it drops → atomic per piece → a failed piece drops
-  nothing and the retry/re-write converges. `cur` always starts at an extent
+  nothing. The pieces before it stay written: the direct write reports them as
+  a short write, and the dirty-buffer drain's retry re-writes the range and
+  converges. `cur` always starts at an extent
   boundary or a hole, so by induction it never lands inside an extent.
 
 ## State machines
@@ -236,6 +251,9 @@ cover = [a_off, a_end)   (block-aligned, fully contains all stuck-out extents)
 | `fs_io_two_extents_in_slot_rewrite_spans_both` | F2 (looped multi-extent RMW read) — an unaligned write spanning two extents in one slot preserves both ends |
 | `fs_io_legacy_crossslot_extent_subwrite_preserves_tail` | F1 — a sub-write into a planted legacy cross-slot extent preserves the far tail, **and** the structural assertion that the cover is one atomic extent (not the recordsize-bisecting split) |
 | `fs_io_multipiece_split_pullback_no_bisect` | F1 (round 3) — a `> recordsize` cover over three legacy extents (the middle one cross-slot) forces a 3-piece split with a pullback at both interior boundaries; asserts data preserved AND the cross-slot extent re-covered whole (not bisected at the slot boundary) |
+| `fs_a_write_that_fails_part_way_keeps_no_bytes_past_eof` | a split direct write whose second piece meets a full pool: `stm_fs_write` answers ENOSPC with the size grown over the landed piece, and a later grow reads zeros past it |
+| `fs_a_short_write_reports_what_landed` | `stm_fs_pwrite` answers the landed count (8 MiB of a 12 MiB write; 100 bytes of an unaligned write whose RMW cover's first piece holds them), and ENOSPC once nothing lands |
+| `fs_a_write_far_past_a_small_file_is_sparse` | an empty or inline file takes a write at 16 MiB or 9 MiB and keeps its prefix, and a 1-byte write at 7 MiB costs its own blocks, not 7 MiB of zeros |
 
 All six are non-vacuous (each fails on its named pre-fix bug; verified by
 reintroducing the bug surgically). The full `test_fs` suite is 218 tests; the
@@ -247,9 +265,11 @@ full ctest suite is 65 binaries.
 - `STM_EPERM` — seal mask refuses the write.
 - `STM_ENOSPC` — reserve fails (the covering write is atomic for cover ≤
   recordsize, so the old extents survive; for cover > recordsize a failed piece
-  drops nothing).
-- `STM_ERANGE` — INLINE→EXTENT grow-truncate past recordsize; or a covering
-  piece `> recordsize` (cannot happen — pieces are capped).
+  drops nothing, and a direct write whose earlier pieces landed answers a short
+  write instead).
+- `STM_ERANGE` — a covering piece `> recordsize` (cannot happen — pieces are
+  capped). No write offset is refused: past a recordsize the INLINE→EXTENT
+  transition cuts over sparsely.
 - `STM_ENOMEM` — RMW scratch / coalescer run-buffer alloc (the coalescer degrades
   to single-range; the RMW returns the error and the buffered run is retried).
 - `STM_EWEDGED` / `STM_EROFS` — from `stm_sync_write_extent`.

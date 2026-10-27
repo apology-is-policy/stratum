@@ -2513,6 +2513,7 @@ static stm_status h_write(stm_9p_server *s,
      * vs concurrent appends (already cross-connection-reachable
      * today) — documented in cf-2-design.md §4.3, unchanged. */
     uint32_t ecode = 0;
+    size_t wrote = 0;
     struct stm_inode_value iv;
     stm_status rc = verify_fresh_snapshot(s->fs, ds, ino, gen, &iv);
     if (rc != STM_OK) {
@@ -2524,8 +2525,8 @@ static stm_status h_write(stm_9p_server *s,
     if (open_flags & STM_9P_O_APPEND)
         offset = stm_load_le64(iv.si_size);
 
-    rc = stm_fs_write_if_gen(s->fs, ds, ino, gen, offset, body + 16,
-                             (size_t)count);
+    rc = stm_fs_pwrite_if_gen(s->fs, ds, ino, gen, offset, body + 16,
+                              (size_t)count, &wrote);
     if (rc != STM_OK)
         ecode = status_to_errno(rc);
 
@@ -2541,7 +2542,8 @@ phase_c:
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RWRITE;
     p9l_p16(wp, tag); wp += 2;
-    p9l_p32(wp, count); wp += 4;
+    /* Short when the pool filled part way; the client writes the rest. */
+    p9l_p32(wp, (uint32_t)wrote); wp += 4;
     resp_finish(resp, resp_len, wp);
     return STM_OK;
 }

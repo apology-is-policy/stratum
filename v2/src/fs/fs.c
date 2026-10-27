@@ -194,7 +194,8 @@ struct stm_fs {
      *     fs->global (fs_txn): inside them a commit makes a half-done
      *     create, link, unlink or rename durable;
      *   - a data op's extent change and the inode update that completes
-     *     it (fallocate's range ops, truncate, reflink; fs_txn): inside
+     *     it (fallocate's range ops, truncate, reflink, a write's sparse
+     *     cutover; fs_txn): inside
      *     them a commit makes shifted, cut or shared extents durable
      *     under the old size or kind.
      * Reclaim WRLOCKs its whole drain->commit sequence. Order:
@@ -1952,7 +1953,9 @@ static stm_status fs_rmw_read_span_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
  * <= recordsize AND its end is pulled back so it never BISECTS an existing
  * extent -- so each piece fully contains every extent it drops and stays
  * atomic; a failed piece drops nothing, and the dirty-buffer retry converges
- * (the not-yet-written extents are still intact in the index). cur always
+ * (the not-yet-written extents are still intact in the index). *out_done is
+ * where the pieces written so far end: a_end on success, the failed piece's
+ * start on a failure. cur always
  * starts at an extent boundary or a hole (a_off is head.off or a gap), so by
  * induction it never lands inside an extent.
  *
@@ -1960,12 +1963,14 @@ static stm_status fs_rmw_read_span_locked(stm_fs *fs, uint64_t ds, uint64_t ino,
 static stm_status fs_write_covering_split_locked(stm_fs *fs, uint64_t ds,
                                                    uint64_t ino, uint64_t a_off,
                                                    const uint8_t *buf,
-                                                   uint64_t a_len)
+                                                   uint64_t a_len,
+                                                   uint64_t *out_done)
 {
     const uint64_t REC = (uint64_t)STM_FS_RECORDSIZE_MAX;
     stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
     uint64_t a_end = a_off + a_len;
     uint64_t cur = a_off;
+    *out_done = cur;
     while (cur < a_end) {
         uint64_t remain    = a_end - cur;
         uint64_t piece_end = (remain <= REC) ? a_end : (cur + REC);
@@ -1996,6 +2001,7 @@ static stm_status fs_write_covering_split_locked(stm_fs *fs, uint64_t ds,
                                                 (size_t)(piece_end - cur));
         if (ws != STM_OK) return ws;
         cur = piece_end;
+        *out_done = cur;
     }
     return STM_OK;
 }
@@ -2007,6 +2013,9 @@ static stm_status fs_write_covering_split_locked(stm_fs *fs, uint64_t ds,
  * Does NOT update si_size or stamp timestamps -- the caller's responsibility
  * (differs for direct writes vs flush-callback writes). Used by both
  * fs_write_regular_locked's direct branch AND the dirty-buffer drain callback.
+ * *out_written counts the caller's bytes, from off, that landed: all of them
+ * on success; on a failure part way through a split cover, the ones the
+ * pieces before it hold.
  *
  * stm_extent_overwrite maintains extent.tla::NoOverlapWithinIno by
  * REPLACING a same-off record and WHOLE-DROPPING any other-off record that
@@ -2044,8 +2053,10 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
                                                        uint64_t ds, uint64_t ino,
                                                        uint64_t off,
                                                        const void *buf,
-                                                       size_t len)
+                                                       size_t len,
+                                                       size_t *out_written)
 {
+    *out_written = 0;
     if (len == 0u) return STM_OK;
     const uint64_t BLK = 4096u;
     uint64_t end_off = off + (uint64_t)len;
@@ -2070,9 +2081,12 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
      * nothing to preserve. */
     if (a_off == off && a_end == end_off
             && (off % BLK == 0u) && ((uint64_t)len % BLK == 0u)) {
-        return fs_write_covering_split_locked(fs, ds, ino, off,
+        uint64_t done = off;
+        stm_status fs_ = fs_write_covering_split_locked(fs, ds, ino, off,
                                                 (const uint8_t *)buf,
-                                                (uint64_t)len);
+                                                (uint64_t)len, &done);
+        *out_written = (size_t)(done - off);
+        return fs_;
     }
 
     uint64_t a_len = a_end - a_off;
@@ -2088,9 +2102,13 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
     stm_status rs = fs_rmw_read_span_locked(fs, ds, ino, a_off, a_end, scratch);
     if (rs != STM_OK) { free(scratch); return rs; }
     memcpy(scratch + (off - a_off), buf, len);
+    uint64_t done = a_off;
     stm_status ws = fs_write_covering_split_locked(fs, ds, ino, a_off,
-                                                     scratch, a_len);
+                                                     scratch, a_len, &done);
     free(scratch);
+    /* The cover's bytes before off are ones the file already had. */
+    if (done > off)
+        *out_written = (size_t)((done < end_off ? done : end_off) - off);
     return ws;
 }
 
@@ -2196,8 +2214,9 @@ static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
                                         const void *data)
 {
     stm_fs *fs = (stm_fs *)user;
+    size_t landed = 0;
     stm_status drc = fs_write_extent_aligned_locked(fs, ds, ino, off, data,
-                                                        (size_t)len);
+                                                        (size_t)len, &landed);
     return drc;
 }
 
@@ -2239,6 +2258,46 @@ static stm_status fs_flush_all_locked(stm_fs *fs)
     return s;
 }
 
+/* The write path's sparse cutover, truncate's: keep only the inline prefix,
+ * in one zero-padded block, and flip the inode to EXTENT; the write then
+ * takes the EXTENT path. The dense transition writes every byte from 0 to
+ * the write's end as one record, which a write ending past a recordsize
+ * cannot fit and a write far from the prefix spends as zeros. The block and
+ * the flip are one span: a commit between them would keep a block that an
+ * INLINE inode does not know, which a later grow reads back. iv changes only
+ * once the flip is stored, so on any failure it is still the stored inode. */
+static stm_status fs_write_cutover_locked(stm_fs *fs, stm_inode_index *iidx,
+                                          uint64_t ds, uint64_t ino,
+                                          struct stm_inode_value *iv)
+{
+    const size_t BLK = 4096u;
+    stm_status s = STM_OK;
+    fs_txn_rd(fs);
+    if (iv->si_data_len > 0u) {
+        uint8_t *prefix = calloc(1, BLK);
+        if (!prefix) {
+            fs_txn_rd_end(fs);
+            return STM_ENOMEM;
+        }
+        memcpy(prefix, iv->si_data.inline_data, iv->si_data_len);
+        s = stm_sync_write_extent(fs->sync, ds, ino, 0u, prefix, BLK);
+        free(prefix);
+        if (s != STM_OK) {
+            fs_txn_rd_end(fs);
+            return s;
+        }
+        fs_step_gap(fs, ds, ino);
+    }
+    struct stm_inode_value cv = *iv;
+    cv.si_data_kind = STM_DATA_EXTENT;
+    cv.si_data_len  = 0;
+    memset(&cv.si_data, 0, sizeof cv.si_data);
+    s = stm_inode_set(iidx, ds, ino, &cv);
+    fs_txn_rd_end(fs);
+    if (s == STM_OK) *iv = cv;
+    return s;
+}
+
 /* Inline-aware write for S_IFREG inode `iv` at (ds, ino). On entry:
  * caller holds fs->lock; iv has already been loaded. On STM_OK
  * return: inode + extent layer are in sync. */
@@ -2246,8 +2305,10 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                                                 uint64_t ds, uint64_t ino,
                                                 struct stm_inode_value *iv,
                                                 uint64_t off,
-                                                const void *buf, size_t len)
+                                                const void *buf, size_t len,
+                                                size_t *out_written)
 {
+    *out_written = 0;
     /* R81 P3-3: zero-length write is a no-op; skip the stamp and the
      * inode_set entirely so spurious mtime/ctime bumps don't fool
      * `make` / build systems that probe via write(fd, buf, 0). The
@@ -2296,6 +2357,15 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         return STM_ECORRUPT;
     }
 
+    /* A write starting past the inline prefix's block, or ending past a
+     * recordsize, cuts the file over sparsely and takes the EXTENT path. */
+    if (kind == STM_DATA_INLINE &&
+        (off >= 4096u || end_off > (uint64_t)STM_FS_RECORDSIZE_MAX)) {
+        stm_status cs = fs_write_cutover_locked(fs, iidx, ds, ino, iv);
+        if (cs != STM_OK) return cs;
+        kind = STM_DATA_EXTENT;
+    }
+
     if (kind == STM_DATA_INLINE) {
         if (end_off <= (uint64_t)STM_INODE_INLINE_MAX) {
             /* Inline fast path. Zero-fill any gap from current
@@ -2316,6 +2386,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * mtime + ctime advance per POSIX. */
             fs_stamp_mtime_ctime_now(iv);
             stm_status isr = stm_inode_set(iidx, ds, ino, iv);
+            if (isr == STM_OK) *out_written = len;
             return isr;
         }
 
@@ -2326,15 +2397,11 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * `off` and `len` to be 4 KiB aligned (sync.h §1042-1046),
          * which sub-block user writes typically aren't.
          *
-         * Constraint: aligned_size must fit in a single
-         * sync_write_extent call (≤ STM_FS_RECORDSIZE_MAX = 8 MiB).
-         * Larger transitions return STM_ERANGE — caller can split
-         * the user write into smaller chunks, the first of which
-         * triggers the transition and subsequent chunks land in the
-         * EXTENT path. */
+         * aligned_size fits one sync_write_extent call (at most
+         * STM_FS_RECORDSIZE_MAX): a write ending past it took the
+         * sparse cutover above. */
         uint64_t cur_size = stm_load_le64(iv->si_size);
         uint64_t new_size = (end_off > cur_size) ? end_off : cur_size;
-        if (new_size > (uint64_t)STM_FS_RECORDSIZE_MAX) return STM_ERANGE;
 
         const uint64_t BLK = 4096u;
         uint64_t aligned_size = (new_size + BLK - 1u) & ~(BLK - 1u);
@@ -2440,6 +2507,8 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * (an orphan extent = space-only). */
             if (trs != STM_OK)
                 stm_dirty_buffer_drop_ino(fs->dirty_buffer, ds, ino);
+            else
+                *out_written = len;
             fs_txn_rd_end(fs);
             return trs;
         }
@@ -2456,6 +2525,8 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * stale buffered range doesn't shadow newer direct data
          * post-overlay. */
         bool wb_txn_held = false;   /* R2-F1: txn RD held into the iset */
+        stm_status part = STM_OK;   /* a direct write that landed a prefix */
+        size_t wrote = len;
         if (len < STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
             /* #40 pool-aware admission (atomic, block-granular): admit the
              * buffered write only if the buffered block FOOTPRINT would stay
@@ -2526,13 +2597,24 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * later grow reads as the file's content. */
             fs_txn_rd(fs);
             wb_txn_held = true;
+            size_t landed = 0;
             stm_status ws = fs_write_extent_aligned_locked(fs, ds, ino,
-                                                                off, buf, len);
-            if (ws != STM_OK) {
+                                                                off, buf, len,
+                                                                &landed);
+            if (ws != STM_OK && landed == 0u) {
                 fs_txn_rd_end(fs);
                 return ws;
             }
             fs_step_gap(fs, ds, ino);
+            /* A split write that failed part way keeps the pieces it
+             * wrote, as write(2) keeps the bytes it counts: the size
+             * covers them, so none is left past EOF for a later grow to
+             * read back, and the caller learns the count. */
+            if (ws != STM_OK) {
+                part = ws;
+                wrote = landed;
+                end_off = off + (uint64_t)landed;
+            }
         }
         /* Size + timestamp update — common to both buffered and direct
          * paths. The buffered write's bytes aren't on-disk yet, but
@@ -2551,7 +2633,9 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
             stm_status isr = stm_inode_set(iidx, ds, ino, iv);
             if (wb_txn_held)
                 fs_txn_rd_end(fs);   /* R2-F1 */
-            return isr;
+            if (isr != STM_OK) return isr;
+            *out_written = wrote;
+            return part;
         }
     }
 
@@ -2779,8 +2863,10 @@ static stm_status fs_refuse_unlock(stm_fs *fs, uint64_t dataset_id,
 
 static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                            const uint64_t *gen,
-                           uint64_t off, const void *buf, size_t len)
+                           uint64_t off, const void *buf, size_t len,
+                           size_t *out_written)
 {
+    *out_written = 0;
     if (!fs) return STM_EINVAL;
 
     /* 9.7-impl-5: write to a snap-view inode is structurally forbidden. */
@@ -2810,20 +2896,29 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                 if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG) {
                     stm_status rs = fs_write_regular_locked(fs, iidx,
                                                                   dataset_id, ino,
-                                                                  &iv, off, buf, len);
+                                                                  &iv, off, buf, len,
+                                                                  out_written);
                     /* CF-4 C: reclaim-on-ENOSPC. A reserve out of space may
                      * be recoverable if an unlink/truncate/overwrite left
-                     * blocks PENDING; sweep them + retry once, reusing iv.
-                     * Safe because every ENOSPC-returning path in
-                     * fs_write_regular_locked leaves iv unmutated: the
-                     * EXTENT + inline->EXTENT paths reserve BEFORE the
-                     * si_size/kind update, and the inline fast path -- which
-                     * DOES mutate iv -- never reserves, so it cannot ENOSPC
-                     * (stm_inode_set on the delta-chain engine cannot ENOSPC
-                     * either). */
-                    if (rs == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
+                     * blocks PENDING; sweep them + retry once, from where
+                     * the write stopped, reusing iv. Safe because every
+                     * path in fs_write_regular_locked that answers ENOSPC
+                     * leaves iv equal to the stored inode: the EXTENT +
+                     * inline->EXTENT paths reserve BEFORE the si_size/kind
+                     * update, a direct write that landed a prefix stores the
+                     * size over it first, the sparse cutover changes iv only
+                     * once its flip is stored, and the inline fast path --
+                     * which DOES mutate iv -- never reserves, so it cannot
+                     * ENOSPC (stm_inode_set on the delta-chain engine cannot
+                     * ENOSPC either). */
+                    if (rs == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs)) {
+                        size_t done = *out_written, more = 0;
                         rs = fs_write_regular_locked(fs, iidx, dataset_id, ino,
-                                                         &iv, off, buf, len);
+                                                         &iv, off + done,
+                                                         (const uint8_t *)buf + done,
+                                                         len - done, &more);
+                        *out_written = done + more;
+                    }
                     stm_inode_unpin(iidx, h);
                     pthread_rwlock_unlock(&fs->global);
                     return rs;
@@ -2853,6 +2948,7 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                             buf, len);
     if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))  /* CF-4 C */
         s = stm_sync_write_extent(fs->sync, dataset_id, ino, off, buf, len);
+    if (s == STM_OK) *out_written = len;
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
@@ -11773,14 +11869,41 @@ stm_status stm_fs_lock_count(stm_fs *fs, size_t *out_count)
 stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                         uint64_t off, const void *buf, size_t len)
 {
-    return fs_write(fs, dataset_id, ino, NULL, off, buf, len);
+    size_t wrote = 0;
+    return fs_write(fs, dataset_id, ino, NULL, off, buf, len, &wrote);
 }
 
 stm_status stm_fs_write_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                uint64_t gen,
                                uint64_t off, const void *buf, size_t len)
 {
-    return fs_write(fs, dataset_id, ino, &gen, off, buf, len);
+    size_t wrote = 0;
+    return fs_write(fs, dataset_id, ino, &gen, off, buf, len, &wrote);
+}
+
+/* An error after some bytes landed is a short write. */
+static stm_status fs_pwrite(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                            const uint64_t *gen, uint64_t off,
+                            const void *buf, size_t len, size_t *out_written)
+{
+    if (!out_written) return STM_EINVAL;
+    stm_status s = fs_write(fs, dataset_id, ino, gen, off, buf, len,
+                            out_written);
+    return *out_written > 0u ? STM_OK : s;
+}
+
+stm_status stm_fs_pwrite(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                         uint64_t off, const void *buf, size_t len,
+                         size_t *out_written)
+{
+    return fs_pwrite(fs, dataset_id, ino, NULL, off, buf, len, out_written);
+}
+
+stm_status stm_fs_pwrite_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                                uint64_t gen, uint64_t off, const void *buf,
+                                size_t len, size_t *out_written)
+{
+    return fs_pwrite(fs, dataset_id, ino, &gen, off, buf, len, out_written);
 }
 
 stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,

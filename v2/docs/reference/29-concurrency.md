@@ -197,7 +197,8 @@ name, which a crash leaves leaked (unreferenced, not corrupt).
 
 The data ops whose extent change and inode update are two steps hold a span
 the same way: fallocate's punch, zero, collapse and insert range, a truncate
-that cuts an extent file or moves an inline file to extents, and a reflink
+that cuts an extent file or moves an inline file to extents, a write that moves
+one sparsely (it starts past the first block or ends past a recordsize), and a reflink
 (which also serves copy_file_range's whole-file path). A write that puts its
 bytes straight into an extent (an inline file's first large write, or any
 write of 1 MiB or more) holds its span from the extent to the size update, as

@@ -12726,12 +12726,12 @@ STM_TEST(fs_a_reclaim_commit_waits_for_a_rename_between_its_steps) {
  * op's own allocation, and the writer's 1 MiB fits only by reclaiming. */
 typedef enum {
     MO_INSERT, MO_COLLAPSE, MO_ZERO_GROW, MO_SHRINK, MO_CUTOVER, MO_REFLINK,
-    MO_TRANSITION, MO_DIRECT
+    MO_TRANSITION, MO_DIRECT, MO_SPARSE
 } mid_op_kind;
 
 static const char *const mid_op_name[] = {
     "insert", "collapse", "zero_grow", "shrink", "cutover", "reflink",
-    "transition", "direct"
+    "transition", "direct", "sparse"
 };
 
 static void mid_op_put(stm_fs *fs, uint64_t ino, uint64_t off, uint64_t len,
@@ -12838,7 +12838,8 @@ static void mid_op_leg(mid_op_kind k)
         mid_op_put(fs, x, 0, 512u * KIB, 0xAB);
         mid_op_put(fs, x, 512u * KIB, 512u * KIB, 0xAB);
         break;
-    case MO_CUTOVER: {             /* inline */
+    case MO_CUTOVER:               /* inline */
+    case MO_SPARSE: {
         STM_ASSERT_OK(stm_fs_write(fs, 1, x, 0, "0123456789", 10));
         STM_ASSERT_OK(stm_fs_commit(fs));
         break;
@@ -12905,6 +12906,9 @@ static void mid_op_leg(mid_op_kind k)
     case MO_DIRECT:
         os = stm_fs_write(fs, 1, x, MIB, big, MIB);
         break;
+    case MO_SPARSE:                /* the cutover, then a buffered byte */
+        os = stm_fs_write(fs, 1, x, MIB, big, 1);
+        break;
     }
     free(big);
     STM_ASSERT_OK(os);
@@ -12963,10 +12967,15 @@ static void mid_op_leg(mid_op_kind k)
         STM_ASSERT_EQ(mid_op_byte(fs, x, 0), 0xAB);
         STM_ASSERT_EQ(mid_op_byte(fs, x, MIB), 0xEE);
         break;
+    case MO_SPARSE:                /* the commit came between the two spans */
+        STM_ASSERT_EQ(mid_op_size(fs, x), 10u);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 0), '0');
+        break;
     }
     /* What a cut and a grow expose must be zeros, not an extent the
      * crash left behind the inode's back. */
-    if (k == MO_CUTOVER || k == MO_TRANSITION || k == MO_DIRECT) {
+    if (k == MO_CUTOVER || k == MO_TRANSITION || k == MO_DIRECT ||
+        k == MO_SPARSE) {
         uint64_t keep = k == MO_DIRECT ? 4096u : 0u;
         uint64_t at = k == MO_DIRECT ? MIB : 0u;
         STM_ASSERT_OK(stm_fs_truncate(fs, 1, x, keep));
@@ -12987,6 +12996,7 @@ STM_TEST(fs_a_reclaim_commit_waits_for_a_data_op_between_its_steps) {
     mid_op_leg(MO_REFLINK);
     mid_op_leg(MO_TRANSITION);
     mid_op_leg(MO_DIRECT);
+    mid_op_leg(MO_SPARSE);
 }
 
 static void mid_op_count_reclaim(bool locked, void *arg)
@@ -13040,6 +13050,211 @@ STM_TEST(fs_a_truncate_that_reclaims_moves_an_inline_file_whole) {
     if (!fs) return;
     STM_ASSERT_EQ(mid_op_size(fs, x), MIB);
     STM_ASSERT_EQ(mid_op_byte(fs, x, 0), '0');
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A pool whose only free room is a spare, freed. Layout 0: x is one 0xAB
+ * block and the spare 9 MiB, so a write's first 8 MiB piece fits and its
+ * next does not. Layout 1: x is 4 MiB of 0xAB then 8 MiB of 0xCD, two
+ * extents, and the spare 4.5 MiB, so a cover's 4 MiB piece fits and its
+ * 8 MiB piece does not, even once a reclaim frees what the first replaced.
+ * Layout 2: x is one 8 MiB extent of 0xAB and the spare 9 MiB. */
+static stm_fs *short_write_pool(const char *name, int layout,
+                                uint64_t *out_x)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 48u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return NULL;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, sp = 0, f = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                     0644u, 0, 0, out_x));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"s", 1,
+                                     0644u, 0, 0, &sp));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    if (layout == 1) {
+        mid_op_put(fs, *out_x, 0, 4u * MIB, 0xAB);
+        mid_op_put(fs, *out_x, 4u * MIB, 8u * MIB, 0xCD);
+        mid_op_put(fs, sp, 0, 9u * MIB / 2u, 0x5A);
+    } else {
+        mid_op_put(fs, *out_x, 0, layout == 2 ? 8u * MIB : 4096u, 0xAB);
+        mid_op_put(fs, sp, 0, 9u * MIB / 2u, 0x5A);
+        mid_op_put(fs, sp, 9u * MIB / 2u, 9u * MIB / 2u, 0x5A);
+    }
+    mid_op_fill(fs, f);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    return fs;
+}
+
+/* A direct write split into pieces, whose second piece finds no room,
+ * keeps the first and grows the size over it: nothing it wrote is left
+ * past EOF for a later grow to read back as the file's content. */
+STM_TEST(fs_a_write_that_fails_part_way_keeps_no_bytes_past_eof) {
+    const uint64_t MIB = 1024u * 1024u;
+    uint64_t x = 0;
+    stm_fs *fs = short_write_pool("short_eof", 0, &x);
+    if (!fs) return;
+    uint8_t *big = malloc(12u * MIB);
+    memset(big, 0xEE, 12u * MIB);
+    stm_status ws = stm_fs_write(fs, 1, x, 4096u, big, 12u * MIB);
+    free(big);
+    STM_ASSERT_ERR(ws, STM_ENOSPC);
+    uint64_t eof = mid_op_size(fs, x);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, x, 16u * MIB));
+    STM_ASSERT_EQ(mid_op_byte(fs, x, eof), 0x00);
+    STM_ASSERT_EQ(eof, 4096u + 8u * MIB);
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 0), 0xAB);
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 4096u), 0xEE);
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 4096u + 8u * MIB - 16u), 0xEE);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A split write whose second piece finds no room, where a reclaim frees
+ * what its first piece replaced, carries on from where it stopped and
+ * completes. */
+STM_TEST(fs_a_split_write_a_reclaim_can_finish_completes) {
+    const uint64_t MIB = 1024u * 1024u;
+    uint64_t x = 0;
+    stm_fs *fs = short_write_pool("short_finish", 2, &x);
+    if (!fs) return;
+    uint8_t *big = malloc(2u * MIB);
+    memset(big, 0xEE, 2u * MIB);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, x, 8u * MIB - 100u, big, 2u * MIB));
+    free(big);
+    STM_ASSERT_EQ(mid_op_size(fs, x), 10u * MIB - 100u);
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 0), 0xAB);
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 8u * MIB - 101u), 0xAB);
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 8u * MIB - 100u), 0xEE);
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 10u * MIB - 116u), 0xEE);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* stm_fs_pwrite answers what landed, as pwrite(2) does: the 8 MiB the
+ * first piece holds, or the 100 bytes of an unaligned write that its
+ * cover's first piece holds when even a reclaim leaves no room for the
+ * rest; and an error once nothing lands. */
+STM_TEST(fs_a_short_write_reports_what_landed) {
+    const uint64_t MIB = 1024u * 1024u;
+    uint8_t *big = malloc(12u * MIB);
+    memset(big, 0xEE, 12u * MIB);
+    uint64_t x = 0;
+    size_t n = 1;
+    stm_fs *fs = short_write_pool("short_count", 0, &x);
+    if (fs) {
+        STM_ASSERT_OK(stm_fs_pwrite(fs, 1, x, 4096u, big, 12u * MIB, &n));
+        STM_ASSERT_EQ(n, 8u * MIB);
+        STM_ASSERT_EQ(mid_op_size(fs, x), 4096u + 8u * MIB);
+        STM_ASSERT_ERR(stm_fs_pwrite(fs, 1, x, 4096u + 8u * MIB, big,
+                                     4u * MIB, &n), STM_ENOSPC);
+        STM_ASSERT_EQ(n, 0u);
+        STM_ASSERT_EQ(mid_op_size(fs, x), 4096u + 8u * MIB);
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        unlink(g_tmp_path);
+        unlink(g_key_path);
+    }
+    /* A write at 4 MiB - 100 covers [0, 12 MiB): the first piece rewrites
+     * [0, 4 MiB) and holds the write's first 100 bytes. */
+    fs = short_write_pool("short_rmw", 1, &x);
+    if (fs) {
+        STM_ASSERT_OK(stm_fs_pwrite(fs, 1, x, 4u * MIB - 100u, big,
+                                    2u * MIB, &n));
+        STM_ASSERT_EQ(n, 100u);
+        STM_ASSERT_EQ(mid_op_size(fs, x), 12u * MIB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 0), 0xAB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 4u * MIB - 100u), 0xEE);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 4u * MIB), 0xCD);
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        unlink(g_tmp_path);
+        unlink(g_key_path);
+    }
+    free(big);
+}
+
+/* A write far past an empty or inline file's bytes moves it to extents
+ * sparsely: it lands at any offset, keeps the prefix, and costs its own
+ * blocks, not a record of zeros from 0. */
+STM_TEST(fs_a_write_far_past_a_small_file_is_sparse) {
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp("far_write");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 64u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, a = 0, b = 0, c = 0, e = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"a", 1,
+                                     0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"b", 1,
+                                     0644u, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1,
+                                     0644u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"e", 1,
+                                     0644u, 0, 0, &e));
+    const uint8_t one = 0x5A;
+    STM_ASSERT_OK(stm_fs_write(fs, 1, a, 16u * MIB, &one, 1));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, b, 0, "hi", 2));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, b, 9u * MIB, &one, 1));
+    uint8_t *big = malloc(2u * MIB);
+    memset(big, 0xEE, 2u * MIB);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, e, 0, "0123456789", 10));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, e, 4096u, big, 2u * MIB));
+    free(big);
+
+    stm_fs_stats st0 = {0}, st1 = {0};
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st0));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, c, 7u * MIB, &one, 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st1));
+    STM_ASSERT_TRUE(st0.data_free_blocks - st1.data_free_blocks < 256u);
+
+    for (int pass = 0; pass < 2; pass++) {
+        STM_ASSERT_EQ(mid_op_size(fs, a), 16u * MIB + 1u);
+        STM_ASSERT_EQ(mid_op_byte(fs, a, 0), 0x00);
+        STM_ASSERT_EQ(mid_op_byte(fs, a, 8u * MIB), 0x00);
+        STM_ASSERT_EQ(mid_op_byte(fs, a, 16u * MIB), 0x5A);
+        STM_ASSERT_EQ(mid_op_size(fs, b), 9u * MIB + 1u);
+        STM_ASSERT_EQ(mid_op_byte(fs, b, 0), 'h');
+        STM_ASSERT_EQ(mid_op_byte(fs, b, 1), 'i');
+        STM_ASSERT_EQ(mid_op_byte(fs, b, 2), 0x00);
+        STM_ASSERT_EQ(mid_op_byte(fs, b, 9u * MIB), 0x5A);
+        STM_ASSERT_EQ(mid_op_size(fs, c), 7u * MIB + 1u);
+        STM_ASSERT_EQ(mid_op_byte(fs, c, 7u * MIB), 0x5A);
+        STM_ASSERT_EQ(mid_op_size(fs, e), 4096u + 2u * MIB);
+        STM_ASSERT_EQ(mid_op_byte(fs, e, 9), '9');
+        STM_ASSERT_EQ(mid_op_byte(fs, e, 10), 0x00);
+        STM_ASSERT_EQ(mid_op_byte(fs, e, 4096u), 0xEE);
+        if (pass == 0) {
+            STM_ASSERT_OK(stm_fs_unmount(fs));
+            fs = NULL;
+            STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+            if (!fs) return;
+        }
+    }
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);

@@ -1797,10 +1797,9 @@ STM_TEST(fs_p5_write_extent_path_bumps_si_size) {
 
 /* R76 P3-4 regression tests. */
 
-STM_TEST(fs_p5_r76_p3_4_transition_oversize_returns_erange) {
-    /* A write that would push new_size > STM_FS_RECORDSIZE_MAX during
-     * the inline → extent transition is rejected with STM_ERANGE.
-     * Caller is expected to split the write. */
+STM_TEST(fs_p5_r76_p3_4_transition_past_recordsize_is_sparse) {
+    /* A first write whose end passes STM_FS_RECORDSIZE_MAX takes the
+     * sparse cutover: it lands, and the file below it is a hole. */
     make_tmp("p5_r76_oversize");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -1820,14 +1819,28 @@ STM_TEST(fs_p5_r76_p3_4_transition_oversize_returns_erange) {
     uint8_t small[200];
     memset(small, 'X', sizeof small);
     uint64_t far_off = (uint64_t)STM_FS_RECORDSIZE_MAX - 50u;
-    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, far_off, small, 200), STM_ERANGE);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, far_off, small, 200));
 
-    /* Inode kind unchanged — the failure is detected before any
-     * state mutation. */
-    struct stm_inode_value iv = {0};
-    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
-    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_INLINE);
-    STM_ASSERT_EQ(iv.si_data_len, (uint8_t)0);
+    for (int pass = 0; pass < 2; pass++) {
+        struct stm_inode_value iv = {0};
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+        STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+        STM_ASSERT_EQ(stm_load_le64(iv.si_size), far_off + 200u);
+        uint8_t got[200];
+        size_t n = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, f, far_off, got, sizeof got, &n));
+        STM_ASSERT_EQ(n, sizeof got);
+        STM_ASSERT_TRUE(memcmp(got, small, sizeof got) == 0);
+        STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, got, sizeof got, &n));
+        STM_ASSERT_EQ(n, sizeof got);
+        for (size_t i = 0; i < sizeof got; i++)
+            STM_ASSERT_EQ(got[i], (uint8_t)0);
+        if (pass == 0) {
+            STM_ASSERT_OK(stm_fs_unmount(fs));
+            fs = NULL;
+            STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        }
+    }
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);

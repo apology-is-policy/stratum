@@ -264,34 +264,41 @@ stm_status stm_fs_commit(stm_fs *fs);
  * with send_recv.h's STM_SEND_CHUNK_PLAIN_MAX. */
 #define STM_FS_RECORDSIZE_MAX   (8u * 1024u * 1024u)
 
-/* P7-4: POSIX-shape extent write/read.
+/* P7-4: POSIX-shape write/read.
  *
- * `stm_fs_write` (encrypts + reserves + writes + extent-overwrite +
- * COW-routing dropped paddrs through the snapshot dead-list /
- * allocator-free path).
+ * `stm_fs_write` writes [off, off+len) of a regular file at any offset and
+ * length and grows the size to cover it. A direct write whose cover (the
+ * write plus the extents it overlaps at either end) exceeds the recordsize
+ * lands as several extents, one after another, so a failure part way
+ * through (STM_ENOSPC on a near-full pool, an I/O error) answers the error
+ * with a prefix of the range written and the size grown over it.
+ * `stm_fs_pwrite` reports that prefix as pwrite(2) does: STM_OK with the
+ * count in *out_written, short when it stopped early, and an error only when
+ * it wrote nothing. An ino the inode index does not hold (the legacy
+ * direct-extent seam) takes the extent layer's rules: off and len 4 KiB
+ * aligned, len at most the recordsize.
  *
  * `stm_fs_read` (extent-lookup + bdev-read + decrypt; holes return
  * zeros).
- *
- * MVP constraints (P7-4; cap lifted at P7-CAS-16):
- *   - len > 0, multiple of 4 KiB, ≤ STM_FS_RECORDSIZE_MAX (8 MiB).
- *   - off must be 4 KiB aligned.
- *   - Single-extent per call: caller iterates for spans > recordsize.
- *   - Encryption key sourced from the pool's metadata_key. Per-
- *     dataset DEKs are deferred to a future chunk.
  *
  * Returns:
  *   - STM_OK on success.
  *   - STM_EWEDGED / STM_EROFS if the FS is wedged or read-only
  *     (write only).
- *   - STM_EINVAL on bad alignment / args.
- *   - STM_ERANGE if len > STM_FS_RECORDSIZE_MAX.
+ *   - STM_EINVAL on bad args.
+ *   - STM_EOVERFLOW if off + len wraps.
+ *   - STM_ENOSPC when the pool has no room.
  *   - STM_ENOMEM on allocation failure.
  *   - STM_EBADTAG on AEAD decrypt failure (read).
  */
 STM_MUST_USE
 stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                           uint64_t off, const void *buf, size_t len);
+
+STM_MUST_USE
+stm_status stm_fs_pwrite(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                         uint64_t off, const void *buf, size_t len,
+                         size_t *out_written);
 
 STM_MUST_USE
 stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
@@ -2564,6 +2571,10 @@ STM_MUST_USE
 stm_status stm_fs_write_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                uint64_t gen,
                                uint64_t off, const void *buf, size_t len);
+STM_MUST_USE
+stm_status stm_fs_pwrite_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                                uint64_t gen, uint64_t off, const void *buf,
+                                size_t len, size_t *out_written);
 STM_MUST_USE
 stm_status stm_fs_truncate_if_gen(stm_fs *fs, uint64_t dataset_id,
                                   uint64_t ino, uint64_t gen,
