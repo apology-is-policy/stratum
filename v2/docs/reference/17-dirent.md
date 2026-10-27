@@ -80,7 +80,8 @@ stm_status stm_dirent_alloc        (idx, ds, dir_ino, name, name_len,
                                        child_ino, child_gen, child_type);
 stm_status stm_dirent_unlink       (idx, ds, dir_ino, name, name_len);
 stm_status stm_dirent_swap_two     (idx, ds,
-                                       dir1, name1, n1, dir2, name2, n2);
+                                       dir1, name1, n1, dir2, name2, n2,
+                                       *out_torn);
 stm_status stm_dirent_whiteout     (idx, ds, dir_ino, name, name_len);
 stm_status stm_dirent_drop_for_dir (idx, ds, dir_ino, *out_dropped);
 ```
@@ -101,7 +102,13 @@ of two live dirents in-place (slots don't move; chain integrity
 preserved by construction). Linux `renameat2(2)` `RENAME_EXCHANGE`
 shape. Same-dir + cross-dir cases are unified; self-swap (same dir
 AND same name) refused with `STM_EINVAL`. Models
-`dirent.tla::Swap`.
+`dirent.tla::Swap`. The two slot writes can fail apart: a failed write
+changes nothing, so when the second fails the first record is put back,
+and the call fails with both names as they were. Only when that put
+fails too is the swap left half done -- one child under both names, the
+other under none -- and `*out_torn` says so; `stm_fs_rename`'s
+EXCHANGE then wedges the fs before releasing its pins, so nothing
+commits it. Models `dirent.tla::SwapFail`.
 
 `stm_dirent_whiteout` converts a live record to a **WHITEOUT** marker
 (distinct from TOMBSTONE): name is PRESERVED so `readdir` emits the
@@ -288,6 +295,7 @@ LookupStopsOnTombstone). Each trips its targeted invariant.
 | `Create` | `stm_dirent_alloc` | `v2/src/dirent/dirent.c` |
 | `Unlink` | `stm_dirent_unlink` | same |
 | `Swap` | `stm_dirent_swap_two` | same |
+| `SwapFail` | `stm_dirent_swap_two`'s failed-put path (`*out_torn`) | same |
 | `Whiteout` | `stm_dirent_whiteout` | same |
 | `LookupWalk` | `stm_dirent_lookup` | same |
 | `ReaddirReset/Step/End` | `stm_dirent_readdir` | same |

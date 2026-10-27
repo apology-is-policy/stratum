@@ -639,8 +639,9 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
  *
  * A step that fails after the rename has changed something is rolled
  * back under the same pins. When the rollback cannot restore what it
- * undid (a replaced file the rename already freed, or a name that will
- * not go back), the fs wedges before the pins are released, so no other
+ * undid (a replaced file the rename already freed, a name that will not
+ * go back, or the first name of an exchange whose second failed), the
+ * fs wedges before the pins are released, so no other
  * op, and no commit, runs on the half-done state; the replaced file's
  * name is never restored to a file that is gone.
  *

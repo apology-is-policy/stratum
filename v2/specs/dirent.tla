@@ -160,7 +160,12 @@ CONSTANTS
     \* through with no semantic change.
     EnableWhiteoutModel,
     BuggyWhiteoutDropsName,
-    BuggyLookupReturnsRecordOnWhiteout
+    BuggyLookupReturnsRecordOnWhiteout,
+
+    \* Gated failed-swap model (SwapFail). When FALSE every existing
+    \* cfg runs as before.
+    EnableSwapFailModel,
+    BuggySwapHalfUnreported
 
 ASSUME /\ Dirs # {}
        /\ Names # {}
@@ -177,6 +182,8 @@ ASSUME /\ Dirs # {}
        /\ EnableWhiteoutModel \in BOOLEAN
        /\ BuggyWhiteoutDropsName \in BOOLEAN
        /\ BuggyLookupReturnsRecordOnWhiteout \in BOOLEAN
+       /\ EnableSwapFailModel \in BOOLEAN
+       /\ BuggySwapHalfUnreported \in BOOLEAN
 
 \* --------------------------------------------------------------------------
 \* Hash function override target.
@@ -275,6 +282,11 @@ IsWhiteout(s) == s.kind = "whiteout"
 \*       in flight. Gates Create/Unlink to model "stable
 \*       iteration" — POSIX-allowed concurrent mutation is then
 \*       a separate concern verified runtime-side by the C tests.
+\*
+\*   torn : BOOLEAN
+\*       TRUE once a failed swap has reported a half swap (the C
+\*       impl's *out_torn). The caller wedges on it, so no further
+\*       action runs and nothing commits the half-swapped slots.
 \* --------------------------------------------------------------------------
 
 VARIABLES
@@ -282,9 +294,10 @@ VARIABLES
     links,
     iter,
     emit_log,
-    iter_active
+    iter_active,
+    torn
 
-vars == <<slots, links, iter, emit_log, iter_active>>
+vars == <<slots, links, iter, emit_log, iter_active, torn>>
 
 \* --------------------------------------------------------------------------
 \* Probe-chain helpers.
@@ -388,6 +401,7 @@ Init ==
     /\ iter        = [d \in Dirs |-> MaxProbe]   \* sentinel: no iter in flight
     /\ emit_log    = [d \in Dirs |-> <<>>]
     /\ iter_active = [d \in Dirs |-> FALSE]
+    /\ torn        = FALSE
 
 \* --------------------------------------------------------------------------
 \* Actions — write side (Create / Unlink).
@@ -461,12 +475,11 @@ Unlink(d, name) ==
 \* readdir is in flight in either dir (P8-POSIX-4 stable-iteration
 \* model — same gating as Create/Unlink).
 \*
-\* No buggy variant for Swap in this iteration. The atomic-swap
-\* shape doesn't violate the chain-integrity invariants the spec
-\* already pins (the slot's hash position + EMPTY/TOMBSTONE/RECORD
-\* status are unchanged); a half-applied swap would desynchronize
-\* slots[d] vs links[d] but TLA+'s atomic-action model doesn't
-\* admit that state.
+\* No buggy variant for Swap itself. The atomic-swap shape doesn't
+\* violate the chain-integrity invariants the spec already pins (the
+\* slot's hash position + EMPTY/TOMBSTONE/RECORD status are
+\* unchanged). A swap whose second slot write fails is SwapFail
+\* below.
 Swap(d1, name1, d2, name2) ==
     /\ ~iter_active[d1]
     /\ ~iter_active[d2]
@@ -502,6 +515,34 @@ Swap(d1, name1, d2, name2) ==
                       ![d2] = (links[d2] \ {old2}) \cup
                                 {<<name2, old1[2], old1[3]>>}]
     /\ UNCHANGED <<iter, emit_log, iter_active>>
+
+\* A swap whose second slot write fails. The C impl puts the first
+\* record back, so the slots are as they were -- unless that put fails
+\* too, which leaves the half swap: name1 already names name2's child,
+\* name2 still names it, and name1's child has no name. That case is
+\* reported (torn), and the caller wedges. links never changes: the
+\* rename failed.
+\*
+\* BuggySwapHalfUnreported: the half swap is left without the report
+\* (no undo, or an undo failure not passed up), so later actions --
+\* and a commit -- run on it. Fires IndexFaithfulUnlessTorn.
+SwapFail(d1, name1, d2, name2) ==
+    /\ EnableSwapFailModel
+    /\ ~iter_active[d1]
+    /\ ~iter_active[d2]
+    /\ ~ (d1 = d2 /\ name1 = name2)
+    /\ \E t \in links[d1] : t[1] = name1
+    /\ \E t \in links[d2] : t[1] = name2
+    /\ LET s1 == LiveRecordSlot(d1, name1, 0)
+           s2 == LiveRecordSlot(d2, name2, 0)
+       IN
+        /\ s1 # -1 /\ s2 # -1
+        /\ LET r2 == slots[d2][s2]
+           IN \/ UNCHANGED <<slots, torn>>
+              \/ /\ slots' = [slots EXCEPT
+                                 ![d1][s1] = DirentRec(name1, r2.ino, r2.gen)]
+                 /\ torn' = ~BuggySwapHalfUnreported
+    /\ UNCHANGED <<links, iter, emit_log, iter_active>>
 
 \* P8-POSIX-9b: Whiteout — convert a live record at `name` in dir `d`
 \* to a WHITEOUT slot. Models renameat2(2) RENAME_WHITEOUT's
@@ -654,7 +695,7 @@ ReaddirEnd(d) ==
 \* Next.
 \* --------------------------------------------------------------------------
 
-Next ==
+IndexNext ==
     \/ \E d \in Dirs, name \in Names, ino \in Inos, g \in 0..MaxGen :
            Create(d, name, ino, g)
     \/ \E d \in Dirs, name \in Names :
@@ -666,6 +707,16 @@ Next ==
     \/ \E d \in Dirs : ReaddirReset(d)
     \/ \E d \in Dirs : ReaddirStep(d)
     \/ \E d \in Dirs : ReaddirEnd(d)
+
+\* A reported half swap wedges the caller: nothing runs after it.
+IndexStep == ~torn /\ IndexNext /\ UNCHANGED torn
+
+SwapFailStep ==
+    /\ ~torn
+    /\ \E d1, d2 \in Dirs, name1, name2 \in Names :
+           SwapFail(d1, name1, d2, name2)
+
+Next == IndexStep \/ SwapFailStep
 
 Spec == Init /\ [][Next]_vars
 
@@ -680,6 +731,7 @@ TypeOK ==
                     SUBSET (Names \X Inos \X (0..MaxGen))]
     /\ iter \in [Dirs -> 0..MaxProbe]
     /\ iter_active \in [Dirs -> BOOLEAN]
+    /\ torn \in BOOLEAN
     /\ emit_log \in [Dirs ->
                        Seq([probe: 0..MaxProbe-1, slot: SlotEntry])]
 
@@ -726,6 +778,11 @@ SlotsAgreeWithLinks ==
             slot_tuples ==
                 {<<r.name, r.ino, r.gen>> : r \in slot_records}
         IN slot_tuples = links[d]
+
+\* The slot table encodes links faithfully except after a reported
+\* half swap, which stops every later action (the caller wedges).
+IndexFaithfulUnlessTorn ==
+    torn \/ (LookupAgreesWithLinks /\ SlotsAgreeWithLinks)
 
 \* --------------------------------------------------------------------------
 \* Invariants — read side (P8-POSIX-4 readdir).
@@ -817,9 +874,8 @@ WhiteoutSlotShape ==
 
 Invariants ==
     /\ TypeOK
-    /\ LookupAgreesWithLinks
+    /\ IndexFaithfulUnlessTorn
     /\ NoDuplicateRecord
-    /\ SlotsAgreeWithLinks
     /\ ReaddirNoTombstoneEmitted
     /\ ReaddirNoDuplicateProbeInLog
     /\ ReaddirCursorMonotonicEmits

@@ -6165,12 +6165,17 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                 return STM_EINVAL;
             }
         }
+        bool torn = false;
         stm_status ws = stm_dirent_swap_two(didx, dataset_id,
                                                  src_parent_ino,
                                                  src_name, src_name_len,
                                                  dst_parent_ino,
-                                                 dst_name, dst_name_len);
+                                                 dst_name, dst_name_len,
+                                                 &torn);
         if (ws != STM_OK) {
+            /* A half swap names one inode twice and the other not at
+             * all: nothing may commit it. */
+            if (torn) fs_mark_wedged_locked(fs);
             FS_RENAME_UNPIN_ALL();
             pthread_rwlock_unlock(&fs->global);
             return ws;

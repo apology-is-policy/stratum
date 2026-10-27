@@ -146,6 +146,10 @@ struct stm_dirent_index {
      * index's lifetime. NULL pre-attach — every op refuses with
      * STM_EINVAL. */
     stm_dataset_index   *ds_idx;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    unsigned             swap_fail_mask;
+    stm_status           swap_fail;
+#endif
 };
 
 static inline pthread_mutex_t *idx_lock(const stm_dirent_index *idx) {
@@ -911,13 +915,28 @@ static stm_status find_live_record(stm_dirent_index *idx,
     return STM_OK;
 }
 
+/* One record put of a swap; `step` names it for an armed test (0 and 1
+ * the two names, 2 the first name's way back). Caller holds idx->lock. */
+static stm_status swap_put(stm_dirent_index *idx, const stm_dirent_record *r,
+                           unsigned fail_mask, unsigned step)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fail_mask & (1u << step)) return idx->swap_fail;
+#else
+    (void)fail_mask; (void)step;
+#endif
+    return di_engine_put(idx, r);
+}
+
 stm_status stm_dirent_swap_two(stm_dirent_index *idx,
                                    uint64_t dataset_id,
                                    uint64_t dir1_ino,
                                    const uint8_t *name1, uint8_t name1_len,
                                    uint64_t dir2_ino,
-                                   const uint8_t *name2, uint8_t name2_len) {
-    if (!idx || !name1 || !name2) return STM_EINVAL;
+                                   const uint8_t *name2, uint8_t name2_len,
+                                   bool *out_torn) {
+    if (out_torn) *out_torn = false;
+    if (!idx || !name1 || !name2 || !out_torn) return STM_EINVAL;
     if (dataset_id == 0u || dir1_ino == 0u || dir2_ino == 0u) return STM_EINVAL;
     if (name1_len == 0u || name1_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
     if (name2_len == 0u || name2_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
@@ -969,13 +988,12 @@ stm_status stm_dirent_swap_two(stm_dirent_index *idx,
      * Slot positions (hash_probe + key) + names + flags + name_len
      * UNCHANGED — chain integrity by construction. Two engine_inserts
      * land in this critical section so no observer can see a
-     * half-swapped state. The engine_insert is failure-atomic: a
-     * mid-swap failure on the second put leaves the first put's
-     * upsert in place (a partial swap). We accept this trade-off:
-     * the partial swap is a self-consistent dirent state (one valid
-     * live record replaces another), and the caller wedges the fs
-     * on any sync error (R154 doctrine), which forces the next mount
-     * to reload from the previous uberblock's pre-swap state. */
+     * half-swapped state. A failed put changes nothing (di_engine_put),
+     * so a failed second put is undone by putting the first record
+     * back as it was; a half swap is left only when that fails too.
+     * It names one child twice and the other not at all, and a commit
+     * would make it durable -- hence *out_torn. */
+    const stm_dirent_record o1 = r1;
     uint64_t c_ino  = r1.child_ino;
     uint64_t c_gen  = r1.child_gen;
     uint8_t  c_type = r1.child_type;
@@ -986,12 +1004,19 @@ stm_status stm_dirent_swap_two(stm_dirent_index *idx,
     r2.child_gen  = c_gen;
     r2.child_type = c_type;
 
-    stm_status p1 = di_engine_put(idx, &r1);
+    unsigned fail_mask = 0u;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    fail_mask = idx->swap_fail_mask;
+    idx->swap_fail_mask = 0u;
+#endif
+    stm_status p1 = swap_put(idx, &r1, fail_mask, 0u);
     if (p1 != STM_OK) {
         must_unlock(idx_lock(idx));
         return p1;
     }
-    stm_status p2 = di_engine_put(idx, &r2);
+    stm_status p2 = swap_put(idx, &r2, fail_mask, 1u);
+    if (p2 != STM_OK && swap_put(idx, &o1, fail_mask, 2u) != STM_OK)
+        *out_torn = true;
     must_unlock(idx_lock(idx));
     return p2;
 }
@@ -1549,6 +1574,16 @@ stm_status stm_dirent_install_at_probe_for_test(
     stm_status ps = di_engine_put(idx, &r);
     must_unlock(idx_lock(idx));
     return ps;
+}
+
+void stm_dirent_fail_next_swap_puts_for_test(stm_dirent_index *idx,
+                                             unsigned mask, stm_status fail)
+{
+    if (!idx) return;
+    must_lock(idx_lock(idx));
+    idx->swap_fail_mask = mask;
+    idx->swap_fail = fail;
+    must_unlock(idx_lock(idx));
 }
 
 uint64_t stm_dirent_fnv1a64_for_test(const uint8_t *name, size_t len) {

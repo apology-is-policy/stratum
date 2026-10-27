@@ -330,10 +330,17 @@ stm_status stm_dirent_unlink(stm_dirent_index *idx,
  *
  * Atomicity: under the dirent-index mutex (the only lock dirent
  * primitives take), the two slot updates land in one critical
- * section — no observer can see a half-swapped state.
+ * section — no observer can see a half-swapped state. When the
+ * second update fails, the first is put back. Only when that fails
+ * too does the call return with the swap half done (dir1/name1
+ * already names the second child, dir2/name2 still names it as
+ * well); it then sets *out_torn, and the caller must stop anything
+ * from committing that state. *out_torn is false on every other
+ * return.
  *
  * Refusals:
- *   - NULL idx OR NULL name1 OR NULL name2 (STM_EINVAL).
+ *   - NULL idx OR NULL name1 OR NULL name2 OR NULL out_torn
+ *     (STM_EINVAL).
  *   - dataset_id == 0 OR either dir_ino == 0 (STM_EINVAL).
  *   - any name_len == 0 OR > STM_DIRENT_NAME_MAX (STM_EINVAL).
  *   - dir1 == dir2 AND name1 == name2 (STM_EINVAL — self-swap).
@@ -345,7 +352,8 @@ stm_status stm_dirent_swap_two(stm_dirent_index *idx,
                                    uint64_t dir1_ino,
                                    const uint8_t *name1, uint8_t name1_len,
                                    uint64_t dir2_ino,
-                                   const uint8_t *name2, uint8_t name2_len);
+                                   const uint8_t *name2, uint8_t name2_len,
+                                   bool *out_torn);
 
 /*
  * P8-POSIX-9b: convert a live record at `(dataset_id, dir_ino, name)`

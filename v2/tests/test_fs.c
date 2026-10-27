@@ -23,6 +23,7 @@
 #include <stratum/dataset.h>
 #include <stratum/dataset_testing.h>
 #include <stratum/dirent.h>
+#include <stratum/dirent_testing.h>
 #include <stratum/ebr.h>
 #include <stratum/extent.h>
 #include <stratum/extent_testing.h>
@@ -12380,6 +12381,60 @@ STM_TEST(fs_a_write_past_its_wedge_check_commits_nothing_after_the_wedge) {
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
+}
+
+/* An exchange whose second dirent put fails puts the first back. When
+ * that fails too the fs wedges, so the half swap -- one inode under both
+ * names, the other under none -- never reaches the disk. */
+static void exchange_fail_leg(unsigned mask, bool want_wedged)
+{
+    uint64_t dir = 0;
+    stm_fs *fs = reuse_fs("exchange_fail", &dir);
+    if (!fs) return;
+    uint64_t a = 0, b = 0, got = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"a", 1,
+                                        0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"b", 1,
+                                        0644u, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_dirent_fail_next_swap_puts_for_test(
+        stm_sync_dirent_index(stm_fs_sync(fs)), mask, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, (const uint8_t *)"a", 1,
+                                 dir, (const uint8_t *)"b", 1,
+                                 STM_FS_RENAME_EXCHANGE),
+                   STM_EIO);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.wedged, want_wedged);
+    if (want_wedged) {
+        STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+        STM_ASSERT_ERR(stm_sync_commit(stm_fs_sync(fs)), STM_EWEDGED);
+    } else {
+        STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"a", 1,
+                                       &got));
+        STM_ASSERT_EQ(got, a);
+        STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"b", 1,
+                                       &got));
+        STM_ASSERT_EQ(got, b);
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"a", 1, &got));
+    STM_ASSERT_EQ(got, a);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"b", 1, &got));
+    STM_ASSERT_EQ(got, b);
+    reuse_fs_done(fs);
+}
+
+STM_TEST(fs_a_failed_exchange_never_leaves_a_half_swap_to_commit) {
+    exchange_fail_leg(1u, false);
+    exchange_fail_leg(2u, false);
+    exchange_fail_leg(2u | 4u, true);
 }
 
 /* The scrub's extent lookup holds no fs->global, so a rollback can retire a

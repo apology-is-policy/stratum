@@ -43,6 +43,15 @@ typedef struct stm_dirent_index stm_dirent_index;
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 /*
+ * Make the record puts of the next stm_dirent_swap_two that reaches
+ * them answer `fail` where `mask` has their bit: bit 0 the first
+ * name's put, bit 1 the second name's, bit 2 the put that gives the
+ * first name back after the second failed. One-shot; 0 disarms.
+ */
+void stm_dirent_fail_next_swap_puts_for_test(stm_dirent_index *idx,
+                                             unsigned mask, stm_status fail);
+
+/*
  * Install (or overwrite) a record at the EXACT (dataset_id,
  * dir_ino, hash_probe) key, bypassing the chain walk that
  * stm_dirent_alloc / _whiteout / _unlink use. Production callers
