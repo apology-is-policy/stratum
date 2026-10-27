@@ -1317,6 +1317,51 @@ STM_TEST(dirent_whiteout_arg_validation) {
     di_test_idx_close(idx);
 }
 
+/* A create that meets a tombstone before its own name's whiteout puts
+ * the name back where the whiteout is. Installing at the tombstone would
+ * leave the directory holding the file and its whiteout at once, and an
+ * unlink would then bring the whiteout back. Forced layout: a tombstone
+ * at baz's first probe, baz's whiteout at the next. */
+static size_t readdir_count(stm_dirent_index *idx, stm_dirent_entry *batch,
+                            size_t cap)
+{
+    uint64_t cursor = 0;
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 100, &cursor, batch, cap, &n));
+    return n;
+}
+
+STM_TEST(dirent_create_reuses_its_own_whiteout_past_a_tombstone) {
+    stm_dirent_index *idx = di_test_idx();
+    STM_ASSERT_TRUE(idx != NULL);
+    uint64_t h = stm_dirent_fnv1a64_for_test((const uint8_t *)"baz", 3);
+    STM_ASSERT_OK(stm_dirent_install_at_probe_for_test(
+            idx, 1, 100, h, NULL, 0, 0, 0, 0, STM_DIRENT_FLAG_TOMBSTONE));
+    STM_ASSERT_OK(stm_dirent_install_at_probe_for_test(
+            idx, 1, 100, h + 1u, (const uint8_t *)"baz", 3, 0, 0,
+            STM_DT_WHITEOUT, STM_DIRENT_FLAG_WHITEOUT));
+    stm_dirent_entry batch[8];
+    STM_ASSERT_EQ(readdir_count(idx, batch, 8), (size_t)1);
+    STM_ASSERT_EQ(batch[0].child_type, (uint8_t)STM_DT_WHITEOUT);
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"baz", 3,
+                                      99, 0, STM_DT_REG));
+    STM_ASSERT_EQ(readdir_count(idx, batch, 8), (size_t)1);
+    STM_ASSERT_EQ(batch[0].child_type, (uint8_t)STM_DT_REG);
+    STM_ASSERT_EQ(batch[0].child_ino, 99u);
+    uint64_t ino = 0, gen = 0; uint8_t typ = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"baz", 3,
+                                       &ino, &gen, &typ));
+    STM_ASSERT_EQ(ino, 99u);
+
+    STM_ASSERT_OK(stm_dirent_unlink(idx, 1, 100, (const uint8_t *)"baz", 3));
+    STM_ASSERT_EQ(readdir_count(idx, batch, 8), (size_t)0);
+    STM_ASSERT_ERR(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"baz", 3,
+                                        &ino, &gen, &typ),
+                   STM_ENOENT);
+    di_test_idx_close(idx);
+}
+
 STM_TEST(dirent_whiteout_preserved_under_hash_collision) {
     /* R88 P2-1 regression: a different-name alloc whose chain
      * walk visits a non-matching whiteout slot MUST NOT overwrite

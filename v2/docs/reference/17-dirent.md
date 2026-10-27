@@ -88,9 +88,14 @@ stm_status stm_dirent_drop_for_dir (idx, ds, dir_ino, *out_dropped);
 
 `stm_dirent_alloc` walks the open-addressing chain from probe 0:
 EMPTY slot (install here) or TOMBSTONE (remember + keep walking to
-verify name not already present further). Existing same-name returns
+verify name not already present further). The name's own WHITEOUT,
+wherever it sits in the chain, is the install slot instead, even past
+an earlier tombstone: installing at the tombstone would leave the
+whiteout beside the new record, so readdir would list the name twice
+and an unlink would bring the whiteout back. A different name's
+whiteout is walked past and kept. Existing same-name returns
 `STM_EEXIST`. Chain exhaustion (`STM_DIRENT_PROBE_MAX = 64`) returns
-`STM_ENOSPC`. Models `dirent.tla::Create`.
+`STM_ENOSPC`. Models `dirent.tla::Create` (`InstallSlot`).
 
 `stm_dirent_unlink` walks for the live match, replaces the slot with
 a **TOMBSTONE** (NOT EMPTY — would break colliding names at higher

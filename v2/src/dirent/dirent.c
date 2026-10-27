@@ -577,10 +577,13 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
 
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
 
-    /* Walk the chain. Track the FIRST install-eligible slot (EMPTY,
-     * TOMBSTONE, or SAME-NAME WHITEOUT) but keep walking to verify
-     * the name isn't already linked further in the chain (would be
-     * EEXIST).
+    /* Walk the chain. Track the FIRST install-eligible slot (EMPTY or
+     * TOMBSTONE) but keep walking to verify the name isn't already
+     * linked further in the chain (would be EEXIST). The name's own
+     * WHITEOUT, wherever it sits, is the install slot instead: an
+     * earlier tombstone would leave the whiteout in the chain beside
+     * the new record, so the directory would list the name twice and
+     * an unlink would bring the whiteout back.
      *
      * P8-POSIX-9b: WHITEOUT slots are install candidates ONLY when
      * the whiteout's name matches the name being installed
@@ -622,17 +625,15 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
             continue;
         }
         if (record_is_whiteout(&r)) {
-            /* SAME-NAME whiteout: install candidate (overlayfs
-             * "promote name" — overwrites the whiteout with a
-             * fresh live record at the same name). DIFFERENT-NAME
-             * whiteout: MUST be preserved to honor RENAME_WHITEOUT's
-             * persistence contract — walk past it as an occupying
-             * slot. (R88 P2-1) */
+            /* SAME-NAME whiteout: the install slot, even past an
+             * earlier tombstone (overlayfs "promote name" — overwrites
+             * the whiteout with a fresh live record at the same name).
+             * DIFFERENT-NAME whiteout: MUST be preserved to honor
+             * RENAME_WHITEOUT's persistence contract — walk past it as
+             * an occupying slot. (R88 P2-1) */
             if (record_name_eq(&r, name, name_len)) {
-                if (!have_install_slot) {
-                    install_probe     = probe;
-                    have_install_slot = true;
-                }
+                install_probe     = probe;
+                have_install_slot = true;
             }
             continue;
         }

@@ -165,7 +165,11 @@ CONSTANTS
     \* Gated failed-swap model (SwapFail). When FALSE every existing
     \* cfg runs as before.
     EnableSwapFailModel,
-    BuggySwapHalfUnreported
+    BuggySwapHalfUnreported,
+
+    \* Create installs at the first EMPTY/TOMBSTONE even when its own
+    \* name's whiteout sits further along the chain.
+    BuggyCreateLeavesOwnWhiteout
 
 ASSUME /\ Dirs # {}
        /\ Names # {}
@@ -184,6 +188,7 @@ ASSUME /\ Dirs # {}
        /\ BuggyLookupReturnsRecordOnWhiteout \in BOOLEAN
        /\ EnableSwapFailModel \in BOOLEAN
        /\ BuggySwapHalfUnreported \in BOOLEAN
+       /\ BuggyCreateLeavesOwnWhiteout \in BOOLEAN
 
 \* --------------------------------------------------------------------------
 \* Hash function override target.
@@ -283,6 +288,11 @@ IsWhiteout(s) == s.kind = "whiteout"
 \*       iteration" — POSIX-allowed concurrent mutation is then
 \*       a separate concern verified runtime-side by the C tests.
 \*
+\*   whited : [Dirs -> SUBSET Names]
+\*       Oracle: the names currently whited out. Whiteout adds the
+\*       name; a Create of the name takes it back out (the record
+\*       replaces its whiteout). The whiteout slots must match it.
+\*
 \*   torn : BOOLEAN
 \*       TRUE once a failed swap has reported a half swap (the C
 \*       impl's *out_torn). The caller wedges on it, so no further
@@ -295,9 +305,10 @@ VARIABLES
     iter,
     emit_log,
     iter_active,
+    whited,
     torn
 
-vars == <<slots, links, iter, emit_log, iter_active, torn>>
+vars == <<slots, links, iter, emit_log, iter_active, whited, torn>>
 
 \* --------------------------------------------------------------------------
 \* Probe-chain helpers.
@@ -350,7 +361,8 @@ LookupWalk(d, name, k) ==
                  THEN <<s.ino, s.gen>>
             ELSE LookupWalk(d, name, k + 1)
 
-\* Locate the first chain slot suitable for installing `name`:
+\* Locate the first chain slot suitable for installing `name`
+\* (Create takes `name`'s own whiteout first -- InstallSlot below):
 \*   - first EMPTY or TOMBSTONE encountered along the chain, OR
 \*   - first SAME-NAME WHITEOUT encountered (P8-POSIX-9b R88 P2-1
 \*     fix: only same-name whiteouts are install candidates —
@@ -378,6 +390,27 @@ FirstInstallSlot(d, name, k) ==
             THEN idx
             ELSE FirstInstallSlot(d, name, k + 1)
 
+\* The chain slot holding `name`'s own whiteout, -1 if the chain ends
+\* first. A name has at most one live-or-whiteout slot.
+RECURSIVE OwnWhiteoutSlot(_, _, _)
+OwnWhiteoutSlot(d, name, k) ==
+    IF k >= MaxProbe THEN -1
+    ELSE LET idx == ChainIdx(name, k)
+             s   == slots[d][idx]
+         IN IF s = EMPTY THEN -1
+            ELSE IF IsWhiteout(s) /\ s.name = name THEN idx
+            ELSE OwnWhiteoutSlot(d, name, k + 1)
+
+\* Where Create installs `name`: its own whiteout wherever it sits, or
+\* else the first EMPTY/TOMBSTONE. Installing at an earlier tombstone
+\* would leave the whiteout beside the new record (the name listed
+\* twice, and back as a whiteout after an unlink) --
+\* BuggyCreateLeavesOwnWhiteout.
+InstallSlot(d, name) ==
+    IF ~BuggyCreateLeavesOwnWhiteout /\ OwnWhiteoutSlot(d, name, 0) # -1
+    THEN OwnWhiteoutSlot(d, name, 0)
+    ELSE FirstInstallSlot(d, name, 0)
+
 \* Locate the first chain slot holding a record with this name.
 \* Used by Unlink to find the record to remove. Honors the chain-
 \* walk semantics — short-circuits on EMPTY (tombstones are
@@ -401,6 +434,7 @@ Init ==
     /\ iter        = [d \in Dirs |-> MaxProbe]   \* sentinel: no iter in flight
     /\ emit_log    = [d \in Dirs |-> <<>>]
     /\ iter_active = [d \in Dirs |-> FALSE]
+    /\ whited      = [d \in Dirs |-> {}]
     /\ torn        = FALSE
 
 \* --------------------------------------------------------------------------
@@ -414,8 +448,8 @@ Init ==
 \* unlink-then-create). AND no readdir is currently in flight in
 \* `d` (P8-POSIX-4: stable-iteration model).
 \*
-\* Healthy: install at FirstInstallSlot — first EMPTY/TOMBSTONE
-\* in the chain.
+\* Healthy: install at InstallSlot — the name's own whiteout, else
+\* the first EMPTY/TOMBSTONE in the chain.
 \*
 \* BuggyCreateOverwritesNoProbe: install at slot Hash[name]
 \* unconditionally, overwriting whatever was there. Models a
@@ -424,15 +458,16 @@ Create(d, name, ino, g) ==
     /\ ~iter_active[d]
     /\ ~\E t \in links[d] : t[1] = name
     /\ \/ /\ ~BuggyCreateOverwritesNoProbe
-          /\ FirstInstallSlot(d, name, 0) # -1
+          /\ InstallSlot(d, name) # -1
           /\ slots' = [slots EXCEPT
-                          ![d][FirstInstallSlot(d, name, 0)] =
+                          ![d][InstallSlot(d, name)] =
                               DirentRec(name, ino, g)]
        \/ /\ BuggyCreateOverwritesNoProbe
           /\ slots' = [slots EXCEPT
                           ![d][Hash[name]] = DirentRec(name, ino, g)]
     /\ links' = [links EXCEPT
                     ![d] = links[d] \cup {<<name, ino, g>>}]
+    /\ whited' = [whited EXCEPT ![d] = @ \ {name}]
     /\ UNCHANGED <<iter, emit_log, iter_active>>
 
 \* Unlink — remove `name` from dir `d`.
@@ -455,7 +490,7 @@ Unlink(d, name) ==
                        ![d][LiveRecordSlot(d, name, 0)] = marker]
     /\ links' = [links EXCEPT
                     ![d] = {t \in links[d] : t[1] # name}]
-    /\ UNCHANGED <<iter, emit_log, iter_active>>
+    /\ UNCHANGED <<iter, emit_log, iter_active, whited>>
 
 \* P8-POSIX-9b: Swap — atomically swap the (ino, gen) values of two
 \* live dirents. Models renameat2(2) RENAME_EXCHANGE.
@@ -514,7 +549,7 @@ Swap(d1, name1, d2, name2) ==
                                 {<<name1, old2[2], old2[3]>>},
                       ![d2] = (links[d2] \ {old2}) \cup
                                 {<<name2, old1[2], old1[3]>>}]
-    /\ UNCHANGED <<iter, emit_log, iter_active>>
+    /\ UNCHANGED <<iter, emit_log, iter_active, whited>>
 
 \* A swap whose second slot write fails. The C impl puts the first
 \* record back, so the slots are as they were -- unless that put fails
@@ -542,7 +577,7 @@ SwapFail(d1, name1, d2, name2) ==
               \/ /\ slots' = [slots EXCEPT
                                  ![d1][s1] = DirentRec(name1, r2.ino, r2.gen)]
                  /\ torn' = ~BuggySwapHalfUnreported
-    /\ UNCHANGED <<links, iter, emit_log, iter_active>>
+    /\ UNCHANGED <<links, iter, emit_log, iter_active, whited>>
 
 \* P8-POSIX-9b: Whiteout — convert a live record at `name` in dir `d`
 \* to a WHITEOUT slot. Models renameat2(2) RENAME_WHITEOUT's
@@ -586,6 +621,7 @@ Whiteout(d, name) ==
                        ![d][LiveRecordSlot(d, name, 0)] = marker]
     /\ links' = [links EXCEPT
                     ![d] = {t \in links[d] : t[1] # name}]
+    /\ whited' = [whited EXCEPT ![d] = @ \cup {name}]
     /\ UNCHANGED <<iter, emit_log, iter_active>>
 
 \* --------------------------------------------------------------------------
@@ -610,7 +646,7 @@ ReaddirReset(d) ==
     /\ iter'        = [iter EXCEPT ![d] = 0]
     /\ emit_log'    = [emit_log EXCEPT ![d] = <<>>]
     /\ iter_active' = [iter_active EXCEPT ![d] = TRUE]
-    /\ UNCHANGED <<slots, links>>
+    /\ UNCHANGED <<slots, links, whited>>
 
 \* Advance the cursor by one slot. Three cases on slots[d][iter[d]]:
 \*
@@ -678,7 +714,7 @@ ReaddirStep(d) ==
                                  ![d] = Append(emit_log[d],
                                                [probe |-> k,
                                                 slot  |-> s])]
-    /\ UNCHANGED <<slots, links, iter_active>>
+    /\ UNCHANGED <<slots, links, iter_active, whited>>
 
 \* Terminate the iteration — only enabled when cursor reached the
 \* end. Clears iter_active so subsequent Create/Unlink can fire.
@@ -689,7 +725,7 @@ ReaddirEnd(d) ==
     /\ iter_active[d]
     /\ iter[d] = MaxProbe
     /\ iter_active' = [iter_active EXCEPT ![d] = FALSE]
-    /\ UNCHANGED <<slots, links, iter, emit_log>>
+    /\ UNCHANGED <<slots, links, iter, emit_log, whited>>
 
 \* --------------------------------------------------------------------------
 \* Next.
@@ -731,6 +767,7 @@ TypeOK ==
                     SUBSET (Names \X Inos \X (0..MaxGen))]
     /\ iter \in [Dirs -> 0..MaxProbe]
     /\ iter_active \in [Dirs -> BOOLEAN]
+    /\ whited \in [Dirs -> SUBSET Names]
     /\ torn \in BOOLEAN
     /\ emit_log \in [Dirs ->
                        Seq([probe: 0..MaxProbe-1, slot: SlotEntry])]
@@ -868,6 +905,15 @@ WhiteoutSlotShape ==
             /\ slots[d][k].gen = 0
             /\ ~\E t \in links[d] : t[1] = slots[d][k].name
 
+\* The whiteout slots name exactly the names the oracle says are whited
+\* out. Fires for BuggyWhiteoutDropsName (a TOMBSTONE where the
+\* whiteout should be) and BuggyCreateLeavesOwnWhiteout (a whiteout
+\* left beside the record that replaced it).
+WhiteoutsAgreeWithOracle ==
+    \A d \in Dirs :
+        {slots[d][k].name : k \in {kk \in 0..MaxProbe-1 :
+                                     IsWhiteout(slots[d][kk])}} = whited[d]
+
 \* --------------------------------------------------------------------------
 \* All invariants bundle.
 \* --------------------------------------------------------------------------
@@ -882,5 +928,6 @@ Invariants ==
     /\ ReaddirCompleteAtEnd
     /\ ReaddirEmitsWhiteoutsAtEnd
     /\ WhiteoutSlotShape
+    /\ WhiteoutsAgreeWithOracle
 
 =============================================================================
