@@ -51,6 +51,7 @@
 
 #include <stratum/send_recv.h>
 
+#include <stratum/fs.h>          /* STM_FS_FILE_MAX */
 #include <stratum/hash.h>
 #include <stratum/sync.h>
 
@@ -242,6 +243,9 @@ static stm_status apply_extent(stm_recv_handle *h,
     /* gen @ +24 advisory; recv re-stamps with its own current_gen */
     if (ino == 0)  return STM_ECORRUPT;
     if (len == 0)  return STM_ECORRUPT;
+    /* No file holds an extent past the largest file size. */
+    if (off > STM_FS_FILE_MAX || len > STM_FS_FILE_MAX - off)
+        return STM_ECORRUPT;
 
     bool is_cold = (flags & STM_SEND_FLAG_COLD) != 0u;
     if (is_cold) {

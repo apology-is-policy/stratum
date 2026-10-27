@@ -13296,6 +13296,11 @@ STM_TEST(fs_an_inline_file_refuses_a_cover_past_the_bound_before_its_cutover) {
  * run each: the drain writes every block once, so on a pool with room for
  * that, and not for each run rewriting the extent the run before it
  * wrote, every acknowledged write commits and survives a remount. */
+static uint8_t drain_once_byte(uint64_t off)
+{
+    return (uint8_t)(1u + off % 251u);
+}
+
 static void drain_once_leg(const char *name, uint64_t spare)
 {
     const uint64_t MIB = 1024u * 1024u;
@@ -13333,7 +13338,8 @@ static void drain_once_leg(const char *name, uint64_t spare)
     unsigned n_acked = 0;
     for (unsigned k = 0; k < 63u; k++) {
         uint8_t b[200];
-        memset(b, (int)(0x40u + k), sizeof b);
+        for (size_t i = 0; i < sizeof b; i++)
+            b[i] = drain_once_byte((uint64_t)k * 4096u + 4000u + i);
         stm_status ws = stm_fs_write(fs, 1, y, (uint64_t)k * 4096u + 4000u,
                                      b, sizeof b);
         acked[k] = ws == STM_OK;
@@ -13352,10 +13358,12 @@ static void drain_once_leg(const char *name, uint64_t spare)
     if (!fs) return;
     for (unsigned k = 0; k < 63u; k++) {
         if (!acked[k]) continue;
-        STM_ASSERT_EQ(mid_op_byte(fs, y, (uint64_t)k * 4096u + 4000u),
-                      (uint8_t)(0x40u + k));
-        STM_ASSERT_EQ(mid_op_byte(fs, y, (uint64_t)k * 4096u + 4184u),
-                      (uint8_t)(0x40u + k));
+        /* the write's first byte, the first past its block boundary, its last */
+        static const uint64_t at[] = { 4000u, 4096u, 4199u };
+        for (size_t i = 0; i < 3u; i++) {
+            uint64_t o = (uint64_t)k * 4096u + at[i];
+            STM_ASSERT_EQ(mid_op_byte(fs, y, o), drain_once_byte(o));
+        }
     }
     STM_ASSERT_EQ(mid_op_byte(fs, y, 4200u), 0x00);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -13551,6 +13559,102 @@ STM_TEST(fs_a_buffered_write_is_admitted_on_the_pool_a_peer_drain_left) {
 
 STM_TEST(fs_a_buffered_write_is_admitted_on_the_extents_a_peer_drain_left) {
     peer_drain_leg("peer_drain_hole", true);
+}
+
+/* A buffered transition (an inline file's write moving it to extents) whose
+ * inode update fails after a peer's drain landed its range as an extent:
+ * the fs wedges, so the image keeps the inline file and no stray block at 0
+ * comes back through a later cutover with no prefix. */
+STM_TEST(fs_a_transition_whose_update_fails_after_a_peer_drain_wedges) {
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp("transition_peer");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 48u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, sp = 0, f = 0, c = 0, z = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1, 0644u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"z", 1, 0644u, 0, 0, &z));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"s", 1, 0644u, 0, 0, &sp));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1, 0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, c, 0, "abc", 3));
+    uint8_t *big = malloc((size_t)(8u * MIB));
+    memset(big, 0x30, (size_t)(8u * MIB));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, z, 0u, big, (size_t)(8u * MIB)));
+    free(big);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    mid_op_put(fs, sp, 0, 4u * MIB, 0x5A);
+    mid_op_fill(fs, f);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* The peer writes inside z's extent: refused on the pool, it flushes
+     * every file, c's buffered [0, 4K) among them. */
+    peer_drain p = { .fs = fs, .z = z, .armed = true, .at = 4u * MIB + 100u };
+    stm_fs_set_step_gap_hook_for_test(fs, peer_drain_hook, &p);
+    stm_fs_fail_next_data_iset_for_test(fs, STM_ENOMEM);
+    uint8_t w[200];
+    memset(w, 0xE0, sizeof w);
+    stm_status r = stm_fs_write(fs, 1, c, 100u, w, sizeof w);
+    stm_fs_set_step_gap_hook_for_test(fs, NULL, NULL);
+    peer_drain_join(&p);
+    /* premise: the peer's flush drained c's range inside the window */
+    STM_ASSERT_TRUE(!p.armed);
+    STM_ASSERT_TRUE(p.free_before > p.free_after);
+    STM_ASSERT_ERR(r, STM_ENOMEM);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.wedged);
+    STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, c, &v));
+    STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)3);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, c, 0));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, c, 8192u));
+    uint8_t rb[4096];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, c, 0, rb, sizeof rb, &n));
+    STM_ASSERT_EQ(n, sizeof rb);
+    size_t nonzero = 0;
+    for (size_t i = 0; i < n; i++) nonzero += rb[i] != 0u;
+    STM_ASSERT_EQ(nonzero, (size_t)0);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* The legacy direct-extent write (an ino with no inode) ends at the largest
+ * file size like every other write. */
+STM_TEST(fs_the_legacy_extent_write_ends_at_the_largest_file_size) {
+    make_tmp("legacy_file_max");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    static uint8_t b[4096];
+    memset(b, 0x6C, sizeof b);
+    const uint64_t ghost = 999999u;
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ghost, STM_FS_FILE_MAX + 1u - 8192u,
+                               b, sizeof b));
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, ghost, STM_FS_FILE_MAX + 1u - 4096u,
+                                b, sizeof b), STM_EOVERFLOW);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
 }
 
 /* A direct write split into pieces, whose second piece finds no room,

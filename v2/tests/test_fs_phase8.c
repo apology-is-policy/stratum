@@ -7820,15 +7820,15 @@ STM_TEST(fs_a_range_shift_that_fails_loses_nothing_durable) {
  * stray extent comes back through a later grow; a growing preallocate
  * changed nothing else and only answers its error. */
 enum { DI_INSERT, DI_PUNCH, DI_TRUNC, DI_WRITE, DI_CUTOVER, DI_TCUT,
-       DI_DENSE, DI_REFLINK, DI_PREALLOC };
+       DI_DENSE, DI_BUFFERED, DI_REFLINK, DI_PREALLOC };
 
 static void p7b_data_iset_fail_leg(const char *name, int op)
 {
     const uint64_t K = 4096u, MIB = 1024u * 1024u;
     const size_t big_n = 2u * 1024u * 1024u;
     bool inline_file = (op == DI_CUTOVER || op == DI_TCUT || op == DI_DENSE ||
-                        op == DI_REFLINK);
-    bool prefix = (op == DI_CUTOVER || op == DI_TCUT);
+                        op == DI_BUFFERED || op == DI_REFLINK);
+    bool prefix = (op == DI_CUTOVER || op == DI_TCUT || op == DI_BUFFERED);
     bool want_wedged = (op != DI_PREALLOC);
     make_tmp(name);
     stm_fs_format_opts fopts = default_format_opts();
@@ -7875,6 +7875,7 @@ static void p7b_data_iset_fail_leg(const char *name, int op)
     case DI_CUTOVER:  r = stm_fs_write(fs, 1, ino, 16u * MIB, "z", 1); break;
     case DI_TCUT:     r = stm_fs_truncate(fs, 1, ino, 16u * K); break;
     case DI_DENSE:    r = stm_fs_write(fs, 1, ino, 0, big, big_n); break;
+    case DI_BUFFERED: r = stm_fs_write(fs, 1, ino, 100u, big, 200u); break;
     case DI_REFLINK:  r = stm_fs_reflink(fs, 1, src, 1, ino); break;
     default:          r = stm_fs_fallocate(fs, 1, ino, 0, 16u * K, 0); break;
     }
@@ -7923,6 +7924,7 @@ STM_TEST(fs_an_extent_change_whose_inode_update_fails_commits_nothing) {
     p7b_data_iset_fail_leg("diset_cutover", DI_CUTOVER);
     p7b_data_iset_fail_leg("diset_tcut", DI_TCUT);
     p7b_data_iset_fail_leg("diset_dense", DI_DENSE);
+    p7b_data_iset_fail_leg("diset_buffered", DI_BUFFERED);
     p7b_data_iset_fail_leg("diset_reflink", DI_REFLINK);
     p7b_data_iset_fail_leg("diset_prealloc", DI_PREALLOC);
 }

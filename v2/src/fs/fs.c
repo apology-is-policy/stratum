@@ -2557,7 +2557,6 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * under an INLINE inode, which a later truncate to 0 and back up
          * reads as the file's content. */
         stm_status fs1 = STM_ENOSPC;
-        bool synced = false;        /* the fallback wrote the extent */
         fs_txn_rd(fs);
         if (aligned_size < (uint64_t)STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
             fs1 = fs_buffer_insert_locked(fs, ds, ino, /*off=*/0u,
@@ -2569,7 +2568,6 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                                             /*off=*/0u,
                                             combined,
                                             (size_t)aligned_size);
-            synced = (fs1 == STM_OK);
         }
         free(combined);
         if (fs1 != STM_OK) {
@@ -2597,15 +2595,17 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         fs_stamp_mtime_ctime_now(iv);
         {
             stm_status trs = fs_data_iset_locked(fs, iidx, ds, ino, iv,
-                                                 synced);
+                                                 true);
             /* C-2-F2-audit F6: if the set fails the inode stays INLINE
              * while the buffer holds [0, aligned) -- and unlink's cleanup
              * drops ranges only for EXTENT inos, so a reused ino would
              * inherit the dead file's bytes through the overlay: a
-             * cross-file leak. Drop the ghost ranges here. An extent the
-             * fallback wrote is no more the INLINE inode's: a truncate to
-             * 0 and a cutover with no prefix would read it back, so the
-             * fs wedged over it. */
+             * cross-file leak. Drop the ghost ranges here. An extent at 0
+             * is no more the INLINE inode's: a truncate to 0 and a cutover
+             * with no prefix would read it back. The fallback writes one,
+             * and so can a peer's drain of the buffered range (a writer of
+             * another inode flushing every inode takes no pin of this one),
+             * so the fs wedges on any failure here. */
             if (trs != STM_OK)
                 stm_dirty_buffer_drop_ino(fs->dirty_buffer, ds, ino);
             else
@@ -3041,6 +3041,10 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     pthread_rwlock_unlock(&fs->global);
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
+    if (off > STM_FS_FILE_MAX || (uint64_t)len > STM_FS_FILE_MAX - off) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_EOVERFLOW;
+    }
     stm_status s = stm_sync_write_extent(fs->sync, dataset_id, ino, off,
                                             buf, len);
     if (s == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))  /* CF-4 C */

@@ -683,7 +683,7 @@ STM_TEST(dbuf_a_drain_drops_what_its_write_took)
     static uint8_t pa[100], pb[100], pc[200], pd[100];
     memset(pa, 0xA1, sizeof pa);
     memset(pb, 0xB2, sizeof pb);
-    memset(pc, 0xC3, sizeof pc);
+    for (size_t i = 0; i < sizeof pc; i++) pc[i] = (uint8_t)(i + 1u);
     memset(pd, 0xD4, sizeof pd);
     /* Charges: a block and a piece each, two blocks for c. */
     STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 100, 100, pa));
@@ -700,8 +700,8 @@ STM_TEST(dbuf_a_drain_drops_what_its_write_took)
     STM_ASSERT_EQ(one.off[0], (uint64_t)100);
     STM_ASSERT_EQ(one.span[0][100], 0xA1);
     STM_ASSERT_EQ(one.span[0][399], 0xB2);
-    STM_ASSERT_EQ(one.span[0][4000], 0xC3);
-    STM_ASSERT_EQ(one.span[0][4095], 0xC3);
+    STM_ASSERT_EQ(one.span[0][4000], 1);
+    STM_ASSERT_EQ(one.span[0][4095], 96);
     STM_ASSERT_EQ(one.span[0][250], 0x00);
     STM_ASSERT_EQ(stm_dirty_buffer_total_bytes(b), (size_t)(104 + 100));
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)5);
@@ -712,8 +712,9 @@ STM_TEST(dbuf_a_drain_drops_what_its_write_took)
     STM_ASSERT_EQ(all.calls, 2);
     STM_ASSERT_EQ(all.off[0], (uint64_t)4096);
     STM_ASSERT_EQ(all.len[0], (uint64_t)104);
-    STM_ASSERT_EQ(all.span[0][0], 0xC3);
-    STM_ASSERT_EQ(all.span[0][103], 0xC3);
+    /* the trimmed range's data moved with its offset */
+    STM_ASSERT_EQ(all.span[0][0], 97);
+    STM_ASSERT_EQ(all.span[0][103], 200);
     STM_ASSERT_EQ(all.span[0][104], 0x00);
     STM_ASSERT_EQ(all.off[1], (uint64_t)9000);
     STM_ASSERT_EQ(all.span[1][9000 - 8192], 0xD4);
