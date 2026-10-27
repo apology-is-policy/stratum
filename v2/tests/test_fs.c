@@ -12010,10 +12010,10 @@ STM_TEST(fs_create_drops_dirent_records_a_reused_ino_still_holds) {
 }
 
 /* A handle names the file its name resolved to. A name record carrying
- * an older incarnation of a reused ino stands for a name read just before
- * its file was freed and the ino reused: the handle must name the old
- * file (and go stale), never the new tenant. Both the lockless reads and
- * the SH path. */
+ * an older incarnation of a reused ino is dead, as is a name read just
+ * before its file was freed and the ino reused: it has no handle, and
+ * above all not the new tenant's. Both the lockless reads and the SH
+ * path. */
 static void handle_gen_leg(bool locked_only)
 {
     uint64_t dir = 0;
@@ -12038,12 +12038,10 @@ static void handle_gen_leg(bool locked_only)
                                       f1, old_gen, STM_DT_REG));
 
     stm_fs_file_handle h = {0};
-    STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, dir, (const uint8_t *)"old",
-                                           3, &h));
-    STM_ASSERT_EQ(stm_load_le64(h.h_ino), f1);
-    STM_ASSERT_EQ(stm_load_le64(h.h_si_gen), old_gen);
-    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &got), STM_ESTALE);
-    STM_ASSERT_EQ(got, 0u);
+    STM_ASSERT_ERR(stm_fs_name_to_handle(fs, 1, dir, (const uint8_t *)"old",
+                                            3, &h),
+                   STM_ENOENT);
+    STM_ASSERT_EQ(stm_load_le64(h.h_ino), 0u);
 
     /* control: the live name gets the live file */
     STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, dir, (const uint8_t *)"f2",
@@ -12831,6 +12829,452 @@ STM_TEST(fs_a_create_whose_new_inode_is_held_lets_go_of_its_parent) {
     fresh_pin_leg(FRESH_SYMLINK);
     fresh_pin_leg(FRESH_ANON);
     fresh_pin_leg(FRESH_PARENT_REPLACED);
+}
+
+/* A dead name: its record names an inode that is gone, or another
+ * incarnation of it -- the state a torn crash or a bug leaves. In the
+ * fixture "f2" is a live file whose ino reused "f1"'s, and "old" is f1's
+ * record, naming that ino with f1's gen. Every op on a dead name keeps
+ * the span order (the violation count does not move). */
+typedef struct dead_fix {
+    stm_fs *fs;
+    stm_dirent_index *didx;
+    uint64_t dir;
+    uint64_t x;           /* f2: the ino's current tenant */
+    uint64_t old_gen;     /* f1's gen, the one "old" carries */
+    unsigned violations;
+} dead_fix;
+
+/* Frees a fresh `name` in `dir` and creates `again`, which must reuse its
+ * ino; *out_gen is the freed incarnation's gen. */
+static uint64_t dead_reuse(stm_fs *fs, uint64_t dir, const char *name,
+                           const char *again, bool as_dir, uint64_t *out_gen)
+{
+    uint64_t a = 0, b = 0;
+    uint8_t nl = (uint8_t)strlen(name), al = (uint8_t)strlen(again);
+    if (as_dir) {
+        STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, (const uint8_t *)name, nl,
+                                   0755u, 0, 0, &a));
+    } else {
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)name,
+                                         nl, 0644u, 0, 0, &a));
+    }
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &v));
+    *out_gen = stm_load_le64(v.si_gen);
+    if (as_dir) {
+        STM_ASSERT_OK(stm_fs_rmdir(fs, 1, dir, (const uint8_t *)name, nl));
+        STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, (const uint8_t *)again, al,
+                                   0755u, 0, 0, &b));
+    } else {
+        STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)name, nl));
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)again,
+                                         al, 0644u, 0, 0, &b));
+    }
+    STM_ASSERT_EQ(b, a);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, b, &v));
+    STM_ASSERT_TRUE(stm_load_le64(v.si_gen) != *out_gen);
+    return b;
+}
+
+static void dead_fill(stm_fs *fs, uint64_t ino, uint8_t byte)
+{
+    uint8_t b[4096];
+    memset(b, byte, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, b, sizeof b));
+}
+
+static bool dead_fix_seed(dead_fix *d)
+{
+    d->didx = stm_sync_dirent_index(stm_fs_sync(d->fs));
+    d->violations = stm_fs_txn_order_violations_for_test();
+    d->x = dead_reuse(d->fs, d->dir, "f1", "f2", false, &d->old_gen);
+    dead_fill(d->fs, d->x, 0x22);
+    STM_ASSERT_OK(stm_dirent_alloc(d->didx, 1, d->dir, TXN_NAME("old"),
+                                   d->x, d->old_gen, STM_DT_REG));
+    return d->x != 0u;
+}
+
+static bool dead_fix_open(dead_fix *d, const char *tag)
+{
+    memset(d, 0, sizeof *d);
+    d->fs = reuse_fs(tag, &d->dir);
+    return d->fs && dead_fix_seed(d);
+}
+
+static void dead_fix_close(dead_fix *d)
+{
+    STM_ASSERT_EQ(stm_fs_txn_order_violations_for_test(), d->violations);
+    reuse_fs_done(d->fs);
+}
+
+/* `name` in `dir` names `ino`, a file of one link holding `byte`. */
+static void dead_tenant_intact(stm_fs *fs, uint64_t dir, const char *name,
+                               uint64_t ino, uint8_t byte)
+{
+    uint64_t got = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)name,
+                                (uint8_t)strlen(name), &got));
+    STM_ASSERT_EQ(got, ino);
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 1u);
+    uint8_t b[4096] = {0};
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, ino, 0, b, sizeof b, &n));
+    STM_ASSERT_EQ(n, sizeof b);
+    STM_ASSERT_EQ(b[0], byte);
+    STM_ASSERT_EQ(b[sizeof b - 1u], byte);
+}
+
+/* Whether readdir lists `name`, and the record it lists. */
+static bool dead_listed(stm_fs *fs, uint64_t dir, const char *name,
+                        uint64_t *out_ino, uint64_t *out_gen)
+{
+    stm_fs_dirent_entry e[16];
+    uint64_t cur = 0;
+    size_t n = 0, len = strlen(name);
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, dir, dir,
+                                 STM_FS_READDIR_FLAG_NO_DOTS, &cur, e, 16,
+                                 &n));
+    for (size_t i = 0; i < n; i++) {
+        if (e[i].name_len != len || memcmp(e[i].name, name, len) != 0)
+            continue;
+        if (out_ino) *out_ino = e[i].child_ino;
+        if (out_gen) *out_gen = e[i].child_gen;
+        return true;
+    }
+    return false;
+}
+
+/* A dead name is absent to every lookup: the lockless one, the one under
+ * fs->global, and a handle request on either path. */
+STM_TEST(fs_a_dead_name_is_absent_to_lookups) {
+    dead_fix d;
+    if (!dead_fix_open(&d, "dead_lookup")) return;
+    struct stm_inode_value pv = {0}, cv = {0};
+    STM_ASSERT_OK(stm_fs_stat(d.fs, 1, d.dir, &pv));
+    uint64_t dgen = stm_load_le64(pv.si_gen), got = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(d.fs, 1, d.dir, TXN_NAME("old"), &got),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_lookup_if_gen(d.fs, 1, d.dir, dgen,
+                                        TXN_NAME("old"), &got, &cv),
+                   STM_ENOENT);
+    for (int locked = 0; locked < 2; locked++) {
+        stm_fs_force_name_to_handle_fallback_for_test(d.fs, locked != 0);
+        stm_fs_file_handle h = {0};
+        STM_ASSERT_ERR(stm_fs_name_to_handle(d.fs, 1, d.dir, TXN_NAME("old"),
+                                             &h),
+                       STM_ENOENT);
+        STM_ASSERT_OK(stm_fs_name_to_handle(d.fs, 1, d.dir, TXN_NAME("f2"),
+                                            &h));
+        STM_ASSERT_EQ(stm_load_le64(h.h_ino), d.x);
+    }
+    stm_fs_force_name_to_handle_fallback_for_test(d.fs, false);
+    /* control, one name away: the live name resolves on both paths */
+    STM_ASSERT_OK(stm_fs_lookup(d.fs, 1, d.dir, TXN_NAME("f2"), &got));
+    STM_ASSERT_EQ(got, d.x);
+    got = 0;
+    STM_ASSERT_OK(stm_fs_lookup_if_gen(d.fs, 1, d.dir, dgen, TXN_NAME("f2"),
+                                       &got, &cv));
+    STM_ASSERT_EQ(got, d.x);
+    /* and the dead one is still an entry, as a dangling symlink is */
+    uint64_t li = 0, lg = 0;
+    STM_ASSERT_TRUE(dead_listed(d.fs, d.dir, "old", &li, &lg));
+    STM_ASSERT_EQ(li, d.x);
+    STM_ASSERT_EQ(lg, d.old_gen);
+    dead_fix_close(&d);
+}
+
+/* A dead name names no file: a link or a rename from it, a rename onto
+ * itself, and an EXCHANGE with it either way answer ENOENT, and the ino's
+ * tenant keeps its one link. */
+STM_TEST(fs_a_dead_name_names_no_file) {
+    dead_fix d;
+    if (!dead_fix_open(&d, "dead_nofile")) return;
+    STM_ASSERT_ERR(stm_fs_link(d.fs, 1, d.dir, TXN_NAME("old"),
+                               d.dir, TXN_NAME("n")),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("old"),
+                                 d.dir, TXN_NAME("n"), 0),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("old"),
+                                 d.dir, TXN_NAME("old"), 0),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("old"),
+                                 d.dir, TXN_NAME("old"),
+                                 STM_FS_RENAME_NOREPLACE),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("f2"),
+                                 d.dir, TXN_NAME("old"),
+                                 STM_FS_RENAME_EXCHANGE),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("old"),
+                                 d.dir, TXN_NAME("f2"),
+                                 STM_FS_RENAME_EXCHANGE),
+                   STM_ENOENT);
+    dead_tenant_intact(d.fs, d.dir, "f2", d.x, 0x22);
+    uint64_t got = 0, li = 0, lg = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(d.fs, 1, d.dir, TXN_NAME("n"), &got),
+                   STM_ENOENT);
+    STM_ASSERT_FALSE(dead_listed(d.fs, d.dir, "n", NULL, NULL));
+    STM_ASSERT_TRUE(dead_listed(d.fs, d.dir, "old", &li, &lg));
+    STM_ASSERT_EQ(lg, d.old_gen);
+    /* control, one name away: the live name links */
+    STM_ASSERT_OK(stm_fs_link(d.fs, 1, d.dir, TXN_NAME("f2"),
+                              d.dir, TXN_NAME("n")));
+    STM_ASSERT_OK(stm_fs_lookup(d.fs, 1, d.dir, TXN_NAME("n"), &got));
+    STM_ASSERT_EQ(got, d.x);
+    dead_fix_close(&d);
+}
+
+/* A dead name is still an entry: a create, mkdir, symlink, link or
+ * NOREPLACE rename onto it finds the name taken, and its record stays. */
+STM_TEST(fs_a_dead_name_is_still_taken) {
+    dead_fix d;
+    if (!dead_fix_open(&d, "dead_taken")) return;
+    uint64_t got = 0;
+    STM_ASSERT_ERR(stm_fs_create_file(d.fs, 1, d.dir, TXN_NAME("old"),
+                                      0644u, 0, 0, &got),
+                   STM_EEXIST);
+    STM_ASSERT_ERR(stm_fs_mkdir(d.fs, 1, d.dir, TXN_NAME("old"),
+                                0755u, 0, 0, &got),
+                   STM_EEXIST);
+    STM_ASSERT_ERR(stm_fs_symlink(d.fs, 1, d.dir, TXN_NAME("old"),
+                                  (const uint8_t *)"t", 1, 0, 0, &got),
+                   STM_EEXIST);
+    STM_ASSERT_ERR(stm_fs_link(d.fs, 1, d.dir, TXN_NAME("f2"),
+                               d.dir, TXN_NAME("old")),
+                   STM_EEXIST);
+    STM_ASSERT_ERR(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("f2"),
+                                 d.dir, TXN_NAME("old"),
+                                 STM_FS_RENAME_NOREPLACE),
+                   STM_EEXIST);
+    uint64_t li = 0, lg = 0;
+    STM_ASSERT_TRUE(dead_listed(d.fs, d.dir, "old", &li, &lg));
+    STM_ASSERT_EQ(li, d.x);
+    STM_ASSERT_EQ(lg, d.old_gen);
+    dead_tenant_intact(d.fs, d.dir, "f2", d.x, 0x22);
+    dead_fix_close(&d);
+}
+
+/* A rename onto a dead name replaces only its record. In the first leg the
+ * record names the renamed file's own ino at an older gen, so an
+ * overwrite that took the link it names would free the file being
+ * renamed; in the second it names a third file's. The result survives a
+ * remount. */
+static void dead_rename_onto_leg(bool own_ino)
+{
+    dead_fix d;
+    if (!dead_fix_open(&d, own_ino ? "dead_onto_own" : "dead_onto_other"))
+        return;
+    const char *dst = "old";
+    uint64_t w = 0, wgen = 0;
+    if (!own_ino) {
+        w = dead_reuse(d.fs, d.dir, "w1", "w2", false, &wgen);
+        dead_fill(d.fs, w, 0x33);
+        STM_ASSERT_OK(stm_dirent_alloc(d.didx, 1, d.dir, TXN_NAME("wold"),
+                                       w, wgen, STM_DT_REG));
+        dst = "wold";
+    }
+    STM_ASSERT_OK(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("f2"), d.dir,
+                                (const uint8_t *)dst, (uint8_t)strlen(dst),
+                                0));
+    for (int pass = 0; pass < 2; pass++) {
+        dead_tenant_intact(d.fs, d.dir, dst, d.x, 0x22);
+        if (!own_ino) dead_tenant_intact(d.fs, d.dir, "w2", w, 0x33);
+        uint64_t got = 0, li = 0, lg = 0;
+        STM_ASSERT_ERR(stm_fs_lookup(d.fs, 1, d.dir, TXN_NAME("f2"), &got),
+                       STM_ENOENT);
+        STM_ASSERT_TRUE(dead_listed(d.fs, d.dir, dst, &li, &lg));
+        STM_ASSERT_EQ(li, d.x);
+        STM_ASSERT_TRUE(lg != d.old_gen);
+        if (pass == 1) break;
+        STM_ASSERT_OK(stm_fs_commit(d.fs));
+        STM_ASSERT_OK(stm_fs_unmount(d.fs));
+        d.fs = NULL;
+        stm_fs_mount_opts mopts = rw_mount_opts();
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &d.fs));
+        if (!d.fs) return;
+    }
+    dead_fix_close(&d);
+}
+
+STM_TEST(fs_a_rename_onto_a_dead_name_replaces_only_its_record) {
+    dead_rename_onto_leg(true);
+    dead_rename_onto_leg(false);
+}
+
+/* unlink and rmdir of a dead name drop only its record, and a rename onto
+ * one replaces only its record. Each takes the name's type from the
+ * record, never from the inode's tenant: "xd" is a directory's record
+ * naming the file x, "dr" a file's record naming the directory D. And a
+ * dead directory holds nothing: "dd" names D, which now has an entry
+ * that neither an rmdir of "dd" nor a directory renamed onto it counts. */
+STM_TEST(fs_a_dead_name_goes_by_its_record) {
+    dead_fix d;
+    if (!dead_fix_open(&d, "dead_remove")) return;
+    uint64_t dgen = 0, c = 0, sub = 0, got = 0;
+    uint64_t dd = dead_reuse(d.fs, d.dir, "d1", "d2", true, &dgen);
+    STM_ASSERT_OK(stm_fs_create_file(d.fs, 1, dd, TXN_NAME("c"), 0644u, 0, 0,
+                                     &c));
+    dead_fill(d.fs, c, 0x44);
+    STM_ASSERT_OK(stm_dirent_alloc(d.didx, 1, d.dir, TXN_NAME("xd"), d.x,
+                                   d.old_gen, STM_DT_DIR));
+    STM_ASSERT_OK(stm_dirent_alloc(d.didx, 1, d.dir, TXN_NAME("dr"), dd, dgen,
+                                   STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(d.didx, 1, d.dir, TXN_NAME("dd"), dd, dgen,
+                                   STM_DT_DIR));
+    STM_ASSERT_OK(stm_fs_mkdir(d.fs, 1, d.dir, TXN_NAME("sub"), 0755u, 0, 0,
+                               &sub));
+    struct stm_inode_value dv = {0};
+    STM_ASSERT_OK(stm_fs_stat(d.fs, 1, dd, &dv));
+    uint32_t dd_nlink = stm_load_le32(dv.si_nlink);
+
+    STM_ASSERT_ERR(stm_fs_unlink(d.fs, 1, d.dir, TXN_NAME("xd")), STM_EISDIR);
+    STM_ASSERT_ERR(stm_fs_rmdir(d.fs, 1, d.dir, TXN_NAME("dr")), STM_ENOTDIR);
+    STM_ASSERT_ERR(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("f2"),
+                                 d.dir, TXN_NAME("xd"), 0),
+                   STM_EISDIR);
+    STM_ASSERT_ERR(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("sub"),
+                                 d.dir, TXN_NAME("dr"), 0),
+                   STM_ENOTDIR);
+    STM_ASSERT_TRUE(dead_listed(d.fs, d.dir, "xd", NULL, NULL));
+    STM_ASSERT_TRUE(dead_listed(d.fs, d.dir, "dr", NULL, NULL));
+
+    STM_ASSERT_OK(stm_fs_rmdir(d.fs, 1, d.dir, TXN_NAME("xd")));
+    STM_ASSERT_OK(stm_fs_unlink(d.fs, 1, d.dir, TXN_NAME("dr")));
+    /* a removal stamps the directory, as for a live name */
+    struct stm_inode_value pv = {0};
+    STM_ASSERT_OK(stm_fs_utimens(d.fs, 1, d.dir, 5u, 0u, 5u, 0u, 0u, 0u));
+    STM_ASSERT_OK(stm_fs_unlink(d.fs, 1, d.dir, TXN_NAME("old")));
+    STM_ASSERT_OK(stm_fs_stat(d.fs, 1, d.dir, &pv));
+    STM_ASSERT_TRUE(stm_load_le64(pv.si_mtime_sec) != 5u);
+    STM_ASSERT_OK(stm_fs_rmdir(d.fs, 1, d.dir, TXN_NAME("dd")));
+    STM_ASSERT_FALSE(dead_listed(d.fs, d.dir, "xd", NULL, NULL));
+    STM_ASSERT_FALSE(dead_listed(d.fs, d.dir, "dr", NULL, NULL));
+    STM_ASSERT_FALSE(dead_listed(d.fs, d.dir, "old", NULL, NULL));
+    STM_ASSERT_FALSE(dead_listed(d.fs, d.dir, "dd", NULL, NULL));
+    dead_tenant_intact(d.fs, d.dir, "f2", d.x, 0x22);
+    dead_tenant_intact(d.fs, dd, "c", c, 0x44);
+    STM_ASSERT_OK(stm_fs_lookup(d.fs, 1, d.dir, TXN_NAME("d2"), &got));
+    STM_ASSERT_EQ(got, dd);
+
+    STM_ASSERT_OK(stm_dirent_alloc(d.didx, 1, d.dir, TXN_NAME("dd"), dd, dgen,
+                                   STM_DT_DIR));
+    STM_ASSERT_OK(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("sub"),
+                                d.dir, TXN_NAME("dd"), 0));
+    STM_ASSERT_OK(stm_fs_lookup(d.fs, 1, d.dir, TXN_NAME("dd"), &got));
+    STM_ASSERT_EQ(got, sub);
+    dead_tenant_intact(d.fs, dd, "c", c, 0x44);
+    STM_ASSERT_OK(stm_fs_lookup(d.fs, 1, d.dir, TXN_NAME("d2"), &got));
+    STM_ASSERT_EQ(got, dd);
+    STM_ASSERT_OK(stm_fs_stat(d.fs, 1, dd, &dv));
+    STM_ASSERT_EQ(stm_load_le32(dv.si_nlink), dd_nlink);
+    /* the names are free again */
+    STM_ASSERT_OK(stm_fs_create_file(d.fs, 1, d.dir, TXN_NAME("old"), 0644u,
+                                     0, 0, &got));
+    STM_ASSERT_TRUE(got != d.x);
+    dead_fix_close(&d);
+}
+
+/* A dead name whose inode is gone (freed, the ino not reused): lookups
+ * answer ENOENT, a link from it ENOENT, and an unlink of it or a rename
+ * onto it still works -- neither may wait on the freed inode, which no
+ * pin can take. */
+STM_TEST(fs_a_dead_name_whose_inode_is_gone_can_still_go) {
+    dead_fix d;
+    if (!dead_fix_open(&d, "dead_gone")) return;
+    uint64_t g = 0;
+    STM_ASSERT_OK(stm_fs_create_file(d.fs, 1, d.dir, TXN_NAME("g"), 0644u, 0,
+                                     0, &g));
+    struct stm_inode_value v = {0}, pv = {0};
+    STM_ASSERT_OK(stm_fs_stat(d.fs, 1, g, &v));
+    uint64_t ggen = stm_load_le64(v.si_gen);
+    STM_ASSERT_OK(stm_fs_unlink(d.fs, 1, d.dir, TXN_NAME("g")));
+    STM_ASSERT_ERR(stm_fs_stat(d.fs, 1, g, &v), STM_ENOENT);  /* premise */
+    STM_ASSERT_OK(stm_dirent_alloc(d.didx, 1, d.dir, TXN_NAME("gone"), g,
+                                   ggen, STM_DT_REG));
+    STM_ASSERT_OK(stm_fs_stat(d.fs, 1, d.dir, &pv));
+    uint64_t dgen = stm_load_le64(pv.si_gen), got = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(d.fs, 1, d.dir, TXN_NAME("gone"), &got),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_lookup_if_gen(d.fs, 1, d.dir, dgen,
+                                        TXN_NAME("gone"), &got, &v),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_link(d.fs, 1, d.dir, TXN_NAME("gone"),
+                               d.dir, TXN_NAME("n")),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_fs_unlink(d.fs, 1, d.dir, TXN_NAME("gone")));
+    STM_ASSERT_FALSE(dead_listed(d.fs, d.dir, "gone", NULL, NULL));
+    STM_ASSERT_OK(stm_dirent_alloc(d.didx, 1, d.dir, TXN_NAME("gone"), g,
+                                   ggen, STM_DT_REG));
+    STM_ASSERT_OK(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("f2"),
+                                d.dir, TXN_NAME("gone"), 0));
+    dead_tenant_intact(d.fs, d.dir, "gone", d.x, 0x22);
+    dead_fix_close(&d);
+}
+
+/* A rename onto a dead name that fails after taking its record puts the
+ * record back, and only the record: the ino's tenant keeps its one link,
+ * the fs stays up, and the rename then goes through. Both rollbacks: the
+ * install's and the src drop's. */
+static void dead_rename_fail_leg(bool at_src_drop)
+{
+    dead_fix d;
+    if (!dead_fix_open(&d, at_src_drop ? "dead_fail_drop"
+                                       : "dead_fail_install"))
+        return;
+    if (at_src_drop)
+        stm_fs_fail_next_rename_src_drop_for_test(d.fs, STM_EIO);
+    else
+        stm_fs_fail_next_rename_install_for_test(d.fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("f2"),
+                                 d.dir, TXN_NAME("old"), 0),
+                   STM_EIO);
+    uint64_t li = 0, lg = 0;
+    STM_ASSERT_TRUE(dead_listed(d.fs, d.dir, "old", &li, &lg));
+    STM_ASSERT_EQ(li, d.x);
+    STM_ASSERT_EQ(lg, d.old_gen);
+    dead_tenant_intact(d.fs, d.dir, "f2", d.x, 0x22);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(d.fs, &st));
+    STM_ASSERT_FALSE(st.wedged);
+    STM_ASSERT_OK(stm_fs_rename(d.fs, 1, d.dir, TXN_NAME("f2"),
+                                d.dir, TXN_NAME("old"), 0));
+    dead_tenant_intact(d.fs, d.dir, "old", d.x, 0x22);
+    dead_fix_close(&d);
+}
+
+STM_TEST(fs_a_failed_rename_onto_a_dead_name_puts_back_only_its_record) {
+    dead_rename_fail_leg(false);
+    dead_rename_fail_leg(true);
+}
+
+/* A dead name a snapshot captured is as absent in the snapshot's view. */
+STM_TEST(fs_a_dead_name_in_a_snapshot_is_absent) {
+    make_tmp("dead_snap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    dead_fix d;
+    memset(&d, 0, sizeof d);
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &d.fs));
+    if (!d.fs) return;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(d.fs, 1, 0755u, 0, 0, &d.dir));
+    STM_ASSERT_EQ(d.dir, 1u);
+    if (!dead_fix_seed(&d)) return;
+    STM_ASSERT_OK(stm_fs_commit(d.fs));
+    uint64_t snap_id = 0, snap_root = 0, got = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(d.fs, 1, "s", 1, &snap_id));
+    STM_ASSERT_OK(stm_fs_lookup(d.fs, 1, TFS_SNAPS_PARENT_INO,
+                                (const uint8_t *)"s", 1, &snap_root));
+    STM_ASSERT_ERR(stm_fs_lookup(d.fs, 1, snap_root, TXN_NAME("old"), &got),
+                   STM_ENOENT);
+    /* control, one name away */
+    STM_ASSERT_OK(stm_fs_lookup(d.fs, 1, snap_root, TXN_NAME("f2"), &got));
+    STM_ASSERT_EQ(got, tfs_synth_encode(snap_id, d.x));
+    dead_fix_close(&d);
 }
 
 /* The scrub's extent lookup holds no fs->global, so a rollback can retire a

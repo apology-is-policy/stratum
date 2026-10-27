@@ -760,16 +760,26 @@ static stm_status fs_snap_view_lookup(stm_fs *fs,
     stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
     if (!didx) return STM_EINVAL;
 
-    uint64_t child_frozen = 0;
+    uint64_t child_frozen = 0, child_gen = 0;
     stm_status ls = stm_dirent_lookup_at_root(didx, dataset_id,
                                                  e.tree_root_paddr, e.root_gen,
                                                  e.root_csum,
                                                  parent_frozen,
                                                  name, name_len,
-                                                 &child_frozen, NULL, NULL);
+                                                 &child_frozen, &child_gen,
+                                                 NULL);
     if (ls != STM_OK) return ls;
-
-    return fs_synth_encode(snap_id, child_frozen, out_synth_child_ino);
+    uint64_t synth = 0;
+    ls = fs_synth_encode(snap_id, child_frozen, &synth);
+    if (ls != STM_OK) return ls;
+    /* A dead name captured in the snapshot is as absent as a live one's
+     * (fs_name_live_locked): the frozen inode is not the record's. */
+    struct stm_inode_value fiv;
+    ls = fs_snap_view_stat(fs, dataset_id, synth, &fiv);
+    if (ls != STM_OK) return ls;
+    if (stm_load_le64(fiv.si_gen) != child_gen) return STM_ENOENT;
+    *out_synth_child_ino = synth;
+    return STM_OK;
 }
 
 /* Readdir of the SNAPS_PARENT dir: list PRESENT snaps of `dataset_id`.
@@ -3113,6 +3123,33 @@ static stm_status fs_load_parent_dir_concurrent(stm_inode_index *iidx,
     return STM_OK;
 }
 
+/* A name is live while the inode its record names exists and is the
+ * incarnation the record was written for (si_gen == the record's
+ * child_gen). Otherwise it is dead -- what a torn state or a bug leaves
+ * behind: a lookup answers it as absent, a remove drops only its record,
+ * a rename onto it replaces only its record, and the inode's current
+ * tenant, if any, is never touched. It is still an entry, as a dangling
+ * symlink is: a create or a NOREPLACE rename onto it finds the name
+ * taken. Under the parent's pin a live verdict holds (the inode is not
+ * freed while the name links it), and so does a dead one whose gen the
+ * inode has passed (no gen comes back); a caller that pinned on a
+ * verdict checks it again under its pins. On a live name *out_iv (when
+ * not NULL) is its inode. */
+static stm_status fs_name_live_locked(stm_inode_index *iidx,
+                                      uint64_t dataset_id, uint64_t ino,
+                                      uint64_t child_gen, bool *out_live,
+                                      struct stm_inode_value *out_iv)
+{
+    struct stm_inode_value iv;
+    *out_live = false;
+    stm_status s = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+    if (s == STM_ENOENT) return STM_OK;
+    if (s != STM_OK) return s;
+    *out_live = (stm_load_le64(iv.si_gen) == child_gen);
+    if (*out_live && out_iv) *out_iv = iv;
+    return STM_OK;
+}
+
 static stm_status fs_lookup(stm_fs *fs, uint64_t dataset_id,
                             uint64_t parent_ino, const uint64_t *gen,
                             const uint8_t *name, uint8_t name_len,
@@ -3228,11 +3265,22 @@ static stm_status fs_lookup(stm_fs *fs, uint64_t dataset_id,
         goto lookup_fallback;
     }
 
-    uint64_t child_ino = 0;
+    uint64_t child_ino = 0, child_gen = 0;
     stm_status ds = stm_dirent_lookup_concurrent(didx, ebr, dataset_id,
                                                      parent_ino,
                                                      name, name_len,
-                                                     &child_ino, NULL, NULL);
+                                                     &child_ino, &child_gen,
+                                                     NULL);
+    if (ds == STM_OK) {
+        /* A dead name is absent (fs_name_live_locked). A free and reuse
+         * between the two reads reads as dead too: the lookup then falls
+         * after the name's removal. */
+        struct stm_inode_value cv;
+        ds = stm_inode_lookup_concurrent(iidx, ebr, dataset_id, child_ino,
+                                         &cv);
+        if (ds == STM_OK && stm_load_le64(cv.si_gen) != child_gen)
+            ds = STM_ENOENT;
+    }
     stm_ebr_exit(ebr);
     if (ds == STM_OK) {
         *out_child_ino = child_ino;
@@ -3244,7 +3292,8 @@ static stm_status fs_lookup(stm_fs *fs, uint64_t dataset_id,
      * lookup's only route. The parent's shared pin holds the name to its
      * child: unlinking, renaming over or removing it takes the parent's
      * exclusive pin, and a child is freed only once no directory names
-     * it, so the child read here is the one the name names. */
+     * it, so a live name's child read here is the one the name names,
+     * and a dead name (fs_name_live_locked) is absent. */
 lookup_fallback:
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_READ(fs);
@@ -3266,11 +3315,17 @@ lookup_fallback:
         uint64_t ci = 0;
         stm_status ds2 = fs_load_parent_dir(iidx, dataset_id, parent_ino,
                                             &pv2);
+        uint64_t cgen = 0;
         if (ds2 == STM_OK)
             ds2 = stm_dirent_lookup(didx, dataset_id, parent_ino,
-                                    name, name_len, &ci, NULL, NULL);
-        if (ds2 == STM_OK && out_child_iv)
-            ds2 = stm_inode_lookup(iidx, dataset_id, ci, out_child_iv);
+                                    name, name_len, &ci, &cgen, NULL);
+        if (ds2 == STM_OK) {
+            bool live = false;
+            struct stm_inode_value cv = {0};
+            ds2 = fs_name_live_locked(iidx, dataset_id, ci, cgen, &live, &cv);
+            if (ds2 == STM_OK && !live) ds2 = STM_ENOENT;
+            if (ds2 == STM_OK && out_child_iv) *out_child_iv = cv;
+        }
         stm_inode_unpin(iidx, h);
         pthread_rwlock_unlock(&fs->global);
         if (ds2 == STM_OK) *out_child_ino = ci;
@@ -4332,6 +4387,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     uint8_t  child_dtype = 0;
     struct stm_inode_value cv = {0};
     struct stm_inode_value pv = {0};    /* the parent, loaded under its pin */
+    bool live = false;                  /* the name's, fs_name_live_locked */
     int attempts = 0;
 
     for (;;) {
@@ -4340,24 +4396,30 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
                                     parent_ino, NULL, STM_EAGAIN);
 
         /* Pre-pin lookup. */
-        uint64_t observed_child = 0;
+        uint64_t observed_child = 0, observed_gen = 0;
         stm_status ds = stm_dirent_lookup(didx, dataset_id, parent_ino,
                                               name, name_len,
-                                              &observed_child, NULL, NULL);
+                                              &observed_child, &observed_gen,
+                                              NULL);
+        if (ds == STM_OK)
+            ds = fs_name_live_locked(iidx, dataset_id, observed_child,
+                                     observed_gen, &live, NULL);
         if (ds != STM_OK)       /* STM_ENOENT if not linked */
             return fs_refuse_unlock(fs, dataset_id, parent_ino, gen,
                                     parent_ino, NULL, ds);
 
-        /* Pin parent + child in ascending (ds, ino) order. */
-        stm_status ps = stm_inode_pin_two(iidx,
-                                              dataset_id, parent_ino,
-                                              dataset_id, observed_child,
-                                              &h_parent, &h_child);
+        /* Pin parent + child in ascending (ds, ino) order. A dead name's
+         * inode is not its own (it may be freed), so only the parent. */
+        stm_status ps = live
+            ? stm_inode_pin_two(iidx, dataset_id, parent_ino,
+                                dataset_id, observed_child,
+                                &h_parent, &h_child)
+            : stm_inode_pin(iidx, dataset_id, parent_ino, &h_parent);
         if (ps != STM_OK)       /* STM_ENOENT if parent or child gone */
             return fs_refuse_unlock(fs, dataset_id, parent_ino, gen,
                                     parent_ino, NULL, ps);
 
-        /* Under both pins: the caller's directory, or none. */
+        /* Under the pins: the caller's directory, or none. */
         stm_status gs = fs_gen_check_locked(fs, dataset_id, parent_ino, gen);
         if (gs != STM_OK) {
             stm_inode_unpin(iidx, h_parent);
@@ -4366,7 +4428,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
             return gs;
         }
 
-        /* Under both pins: re-validate parent is still a dir AND the
+        /* Under the pins: re-validate parent is still a dir AND the
          * dirent still points to observed_child. */
         stm_status pls = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
         if (pls != STM_OK) {
@@ -4381,7 +4443,8 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
                                                 name, name_len,
                                                 &revalidated_child,
                                                 &child_dgen, &child_dtype);
-        if (rds != STM_OK || revalidated_child != observed_child) {
+        if (rds != STM_OK || revalidated_child != observed_child ||
+            child_dgen != observed_gen) {
             /* Dirent changed between pre-pin lookup and pin. Drop pins
              * and retry. Common cause: a racing rename swapped the
              * entry. */
@@ -4397,19 +4460,42 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         }
 
         child_ino = observed_child;
-        /* Load child inode value (for type discrimination + empty-check). */
-        stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
+        /* The verdict again, under the pins; a live name loads cv, the
+         * child (for type discrimination + empty-check). */
+        bool live_now = false;
+        stm_status cs = fs_name_live_locked(iidx, dataset_id, child_ino,
+                                            child_dgen, &live_now, &cv);
         if (cs != STM_OK) {
-            /* Dirent points at a missing inode — corruption. Pin
-             * succeeded earlier, so the inode WAS allocated then —
-             * a freed-between-pin-and-load is impossible under our
-             * own pin. Surface the error. */
             stm_inode_unpin(iidx, h_parent);
             stm_inode_unpin(iidx, h_child);
             fs_txn_unlock_global(fs, &tx);
             return cs;
         }
+        if (live_now != live) {
+            stm_inode_unpin(iidx, h_parent);
+            stm_inode_unpin(iidx, h_child);
+            h_parent = NULL;
+            h_child  = NULL;
+            continue;
+        }
         break;  /* All locks held; cv loaded; proceed below. */
+    }
+    if (!live) {
+        /* A dead name: only its record goes, its type is the record's,
+         * and the inode it names is not touched. */
+        stm_status ts = STM_OK;
+        if (expect_dir && child_dtype != STM_DT_DIR) ts = STM_ENOTDIR;
+        else if (!expect_dir && child_dtype == STM_DT_DIR) ts = STM_EISDIR;
+        if (ts == STM_OK) {
+            fs_txn_begin(fs, &tx);
+            ts = stm_dirent_unlink(didx, dataset_id, parent_ino, name,
+                                   name_len);
+            if (ts == STM_OK)
+                fs_stamp_parent_dir_locked(iidx, dataset_id, parent_ino, &pv);
+        }
+        stm_inode_unpin(iidx, h_parent);
+        fs_txn_unlock_global(fs, &tx);
+        return ts;
     }
     uint32_t cmode = stm_load_le32(cv.si_mode);
     bool child_is_dir = ((cmode & (uint32_t)S_IFMT) == (uint32_t)S_IFDIR);
@@ -4980,6 +5066,17 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
             return dp_chk;
         }
 
+        /* Under the child's pin: a dead source names no file. */
+        bool live = false;
+        stm_status lv = fs_name_live_locked(iidx, dataset_id, observed_child,
+                                            observed_gen, &live, NULL);
+        if (lv == STM_OK && !live) lv = STM_ENOENT;
+        if (lv != STM_OK) {
+            stm_inode_unpin(iidx, h_child);
+            stm_inode_unpin(iidx, h_dst_p);
+            fs_txn_unlock_global(fs, &tx);
+            return lv;
+        }
         child_ino  = observed_child;
         child_gen  = observed_gen;
         child_type = observed_type;
@@ -5832,13 +5929,25 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
         } else if (ds != STM_OK) {
             stm_ebr_exit(ebr);
             return ds;
+        } else {
+            struct stm_inode_value cv;
+            stm_status cs = stm_inode_lookup_concurrent(iidx, ebr, dataset_id,
+                                                        child_ino, &cv);
+            if (cs == STM_ECORRUPT || cs == STM_EBUSY) {
+                need_fallback = true;
+            } else if (cs != STM_OK ||
+                       stm_load_le64(cv.si_gen) != child_gen) {
+                stm_ebr_exit(ebr);
+                return cs != STM_OK ? cs : STM_ENOENT;
+            }
         }
     }
     /* The gen is the one the name's record carries, read with the ino:
-     * the handle names the file the name resolved to. Nothing holds the
-     * child here, so a second read of its inode could find a later
-     * tenant (the file freed and its ino reused in between) and hand out
-     * that file's identity. */
+     * the handle names the file the name resolved to. The child's inode
+     * is read only to tell a dead name (fs_name_live_locked), which has
+     * no handle: nothing holds the child here, so that read can find a
+     * later tenant (the file freed and its ino reused in between), whose
+     * identity the handle must not take. */
     stm_ebr_exit(ebr);
 
     if (need_fallback) {
@@ -5860,6 +5969,12 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
                                               name, name_len,
                                               &child_ino, &child_gen,
                                               &child_type);
+        if (ds2 == STM_OK) {
+            bool live = false;
+            ds2 = fs_name_live_locked(iidx, dataset_id, child_ino, child_gen,
+                                      &live, NULL);
+            if (ds2 == STM_OK && !live) ds2 = STM_ENOENT;
+        }
         pthread_rwlock_unlock(&fs->global);
         if (ds2 != STM_OK) return ds2;
     }
@@ -5976,9 +6091,10 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
 /* P8-POSIX-9: stm_fs_rename.                                                 */
 /* ========================================================================= */
 
-/* Gives an overwriting rename's dst back its name and the link the
- * rename took, under the pins and fs->global SH; false when it cannot,
- * and the caller wedges. A dst the rename freed cannot come back: its
+/* Gives an overwriting rename's dst back its name and, for a live dst,
+ * the link the rename took, under the pins and fs->global SH; false when
+ * it cannot, and the caller wedges. A dead dst gets only its record back
+ * (fs_name_live_locked). A dst the rename freed cannot come back: its
  * records are gone, and a name restored to (dst_ino, dst_gen) would
  * name whatever file reuses the ino next. */
 static bool fs_rename_restore_dst_locked(stm_inode_index *iidx,
@@ -5988,17 +6104,19 @@ static bool fs_rename_restore_dst_locked(stm_inode_index *iidx,
                                          const uint8_t *dst_name,
                                          uint8_t dst_name_len,
                                          uint64_t dst_ino, uint64_t dst_gen,
-                                         uint8_t dst_type, bool dst_freed)
+                                         uint8_t dst_type, bool dst_live,
+                                         bool dst_freed)
 {
     if (dst_freed) return false;
     if (stm_dirent_alloc(didx, dataset_id, dst_parent_ino, dst_name,
                          dst_name_len, dst_ino, dst_gen, dst_type) != STM_OK)
         return false;
-    return stm_inode_link(iidx, dataset_id, dst_ino) == STM_OK;
+    return !dst_live || stm_inode_link(iidx, dataset_id, dst_ino) == STM_OK;
 }
 
-/* rename(d/a, d/a) moves nothing, but the name must exist (Linux:
- * ENOENT) and NOREPLACE finds it in place (Linux: EEXIST, checked
+/* rename(d/a, d/a) moves nothing, but the name must exist and be live
+ * (Linux: ENOENT; a dead name names no file) and NOREPLACE finds it in
+ * place (Linux: EEXIST, checked
  * before the source == target return). The directory's shared pin
  * holds the name. */
 static stm_status fs_rename_onto_itself(stm_fs *fs, uint64_t dataset_id,
@@ -6029,6 +6147,11 @@ static stm_status fs_rename_onto_itself(stm_fs *fs, uint64_t dataset_id,
         uint8_t  type = 0;
         s = stm_dirent_lookup(didx, dataset_id, parent_ino, name, name_len,
                               &ino, &child_gen, &type);
+        bool live = false;
+        if (s == STM_OK)
+            s = fs_name_live_locked(iidx, dataset_id, ino, child_gen, &live,
+                                    NULL);
+        if (s == STM_OK && !live) s = STM_ENOENT;
     }
     if (s == STM_OK && (flags & STM_FS_RENAME_NOREPLACE)) s = STM_EEXIST;
     stm_inode_unpin(iidx, h);
@@ -6143,6 +6266,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
     uint64_t dst_ino = 0, dst_gen = 0;
     uint8_t  dst_type = 0;
     bool dst_exists = false;
+    bool dst_live = false;              /* fs_name_live_locked */
     stm_inode_handle *handles[4] = {0};
     size_t n_handles = 0;
     int attempts = 0;
@@ -6160,6 +6284,12 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                                                 src_name, src_name_len,
                                                 &src_ino_obs, &src_gen_obs,
                                                 &src_type_obs);
+        /* A dead src names no file. */
+        bool src_live_obs = false;
+        if (srs == STM_OK)
+            srs = fs_name_live_locked(iidx, dataset_id, src_ino_obs,
+                                      src_gen_obs, &src_live_obs, NULL);
+        if (srs == STM_OK && !src_live_obs) srs = STM_ENOENT;
         if (srs != STM_OK) {
             return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
                                     dst_parent_ino, gen_dst_dir, srs);
@@ -6177,13 +6307,27 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
                                     dst_parent_ino, gen_dst_dir, drs);
         }
+        /* A dead dst is still an entry (NOREPLACE finds it), but no file
+         * to exchange with, and its inode is not its own: it is not
+         * pinned, and an overwrite replaces only its record. */
+        bool dst_live_obs = false;
+        if (dst_exists_obs) {
+            stm_status dls0 = fs_name_live_locked(iidx, dataset_id,
+                                                  dst_ino_obs, dst_gen_obs,
+                                                  &dst_live_obs, NULL);
+            if (dls0 != STM_OK) {
+                return fs_refuse_unlock(fs, dataset_id, src_parent_ino,
+                                        gen_src_dir, dst_parent_ino,
+                                        gen_dst_dir, dls0);
+            }
+        }
 
         /* Pre-pin flag checks that don't depend on inode state. */
         if (dst_exists_obs && (flags & STM_FS_RENAME_NOREPLACE)) {
             return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
                                     dst_parent_ino, gen_dst_dir, STM_EEXIST);
         }
-        if ((flags & STM_FS_RENAME_EXCHANGE) && !dst_exists_obs) {
+        if ((flags & STM_FS_RENAME_EXCHANGE) && !dst_live_obs) {
             return fs_refuse_unlock(fs, dataset_id, src_parent_ino, gen_src_dir,
                                     dst_parent_ino, gen_dst_dir, STM_ENOENT);
         }
@@ -6216,7 +6360,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                 n_reqs++;
             }
         }
-        if (dst_exists_obs) {
+        if (dst_live_obs) {
             bool seen = false;
             for (size_t i = 0u; i < n_reqs; i++) {
                 if (reqs[i].ino == dst_ino_obs) { seen = true; break; }
@@ -6327,6 +6471,26 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             }
         }
 
+        /* The verdicts again, under the pins; one that changed since
+         * the look sends the rename round again. */
+        bool src_live_chk = false, dst_live_chk = false;
+        stm_status lv = fs_name_live_locked(iidx, dataset_id, src_ino_obs,
+                                            src_gen_obs, &src_live_chk, NULL);
+        if (lv == STM_OK && dst_exists_obs)
+            lv = fs_name_live_locked(iidx, dataset_id, dst_ino_obs,
+                                     dst_gen_obs, &dst_live_chk, NULL);
+        if (lv != STM_OK || src_live_chk != src_live_obs ||
+            dst_live_chk != dst_live_obs) {
+            for (size_t i = 0u; i < n_reqs; i++) {
+                stm_inode_unpin(iidx, new_handles[i]);
+            }
+            if (lv != STM_OK) {
+                fs_txn_unlock_global(fs, &tx);
+                return lv;
+            }
+            continue;
+        }
+
         /* TOCTOU re-verify passed; commit to this set of pins. */
         src_ino    = src_ino_obs;
         src_gen    = src_gen_obs;
@@ -6335,6 +6499,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
         dst_gen    = dst_gen_obs;
         dst_type   = dst_type_obs;
         dst_exists = dst_exists_obs;
+        dst_live   = dst_live_obs;
         for (size_t i = 0u; i < n_reqs; i++) {
             handles[i] = new_handles[i];
         }
@@ -6458,8 +6623,9 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             fs_txn_unlock_global(fs, &tx);
             return STM_EISDIR;
         }
-        if (src_is_dir && dst_is_dir) {
-            /* A count that failed says nothing about emptiness: refuse,
+        if (src_is_dir && dst_is_dir && dst_live) {
+            /* A dead dst holds nothing. A count that failed says nothing
+             * about emptiness: refuse,
              * as rmdir does, rather than replace a directory that may
              * hold entries. */
             size_t n = 0;
@@ -6481,7 +6647,15 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
      * the chain probes deterministically by hash, so subsequent
      * lookups of dst_name will find the new record). */
     bool dst_freed_unused = false;
-    if (dst_exists) {
+    if (dst_exists && !dst_live) {
+        stm_status du = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
+                                          dst_name, dst_name_len);
+        if (du != STM_OK) {
+            FS_RENAME_UNPIN_ALL();
+            fs_txn_unlock_global(fs, &tx);
+            return du;
+        }
+    } else if (dst_exists) {
         /* R128 P1-1: dst's value, read under its pin (pin_many above),
          * for the cleanup that follows its free; a dst that cannot be
          * read refuses before anything changes. */
@@ -6538,7 +6712,8 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
         /* Roll the overwrite back: dst's name and the link it held. */
         if (dst_exists) should_wedge = !fs_rename_restore_dst_locked(
             iidx, didx, dataset_id, dst_parent_ino, dst_name,
-            dst_name_len, dst_ino, dst_gen, dst_type, dst_freed_unused);
+            dst_name_len, dst_ino, dst_gen, dst_type, dst_live,
+            dst_freed_unused);
         if (should_wedge) fs_mark_wedged_locked(fs);
         fs_rename_rollback_ends(fs);
         FS_RENAME_UNPIN_ALL();
@@ -6569,7 +6744,8 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
         if (r0 != STM_OK) should_wedge = true;
         else if (dst_exists) should_wedge = !fs_rename_restore_dst_locked(
             iidx, didx, dataset_id, dst_parent_ino, dst_name,
-            dst_name_len, dst_ino, dst_gen, dst_type, dst_freed_unused);
+            dst_name_len, dst_ino, dst_gen, dst_type, dst_live,
+            dst_freed_unused);
         if (should_wedge) fs_mark_wedged_locked(fs);
         fs_rename_rollback_ends(fs);
         FS_RENAME_UNPIN_ALL();

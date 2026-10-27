@@ -328,6 +328,17 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
  * inode-alloc succeeds, the inode is rolled back via stm_inode_free
  * before returning the failure. So a successful create is always
  * fully linked; a failed create leaves no orphan inode.
+ *
+ * Dead names: a name whose record names an inode that is gone, or
+ * another incarnation of it (the inode's gen is not the record's), is
+ * dead -- what a torn state or a bug leaves behind. It names no file:
+ * lookups (and stm_fs_name_to_handle) answer it STM_ENOENT, as do a
+ * link or a rename from it and an EXCHANGE with it. It is still an
+ * entry, as a dangling symlink is: readdir lists it, and a create, link
+ * or NOREPLACE rename onto it answers STM_EEXIST. Unlink and rmdir drop
+ * only its record, and a rename onto it replaces only its record; both
+ * take its type from the record, and a dead directory holds nothing.
+ * The inode it names is never touched.
  */
 
 /*
@@ -341,7 +352,7 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
  *   - name contains NUL or '/' byte (STM_EINVAL).
  *   - name == "." or ".." (STM_EINVAL — reserved).
  *   - parent inode not found OR not a directory (STM_ENOENT / STM_ENOTDIR).
- *   - name not linked in parent (STM_ENOENT).
+ *   - name not linked in parent, or dead (STM_ENOENT; see above).
  *   - fs wedged (STM_EWEDGED).
  */
 STM_MUST_USE

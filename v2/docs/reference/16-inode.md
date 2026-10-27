@@ -59,7 +59,7 @@ The inode module is the foundational Phase 8 layer:
   `open_by_handle_at` encode `(ds, ino, gen)` and re-resolve through
   this index; mismatched gen returns ESTALE. The gen is the one the
   name's dirent record carries, so a handle names the file the name
-  resolved to. A handle kept across a rollback and a remount can open
+  resolved to; a dead name (17-dirent, "Dead names") has no handle. A handle kept across a rollback and a remount can open
   the file that took its identity (fs.h).
 
 The inode module is the bridge between:

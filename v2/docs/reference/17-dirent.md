@@ -46,7 +46,9 @@ The dirent module is the bridge between:
   attaches the dataset index at mount; per-dataset engines hold the
   records).
 - **Inode allocator** (every `child_ino` references an `inode.tla` slot;
-  `child_gen` mirrors `si_gen` so 9P fid staleness can re-check freshness).
+  `child_gen` mirrors `si_gen` so 9P fid staleness can re-check freshness;
+  a record whose `child_gen` is not its inode's `si_gen` is a dead name,
+  see "Dead names" below).
 - **fs.c** (per-fs lookup / create_file / mkdir / unlink / rmdir / rename /
   link wrappers).
 - **Inode cascade-free** (`stm_dirent_drop_for_dir` collects every
@@ -333,3 +335,61 @@ LookupStopsOnTombstone). Each trips its targeted invariant.
 Audit class: any change to chain walks, tombstone/whiteout semantics,
 or `name_len`/`child_type` bounds MUST be re-audited (R71 P1-1
 doctrine). The trigger lives in CLAUDE.md's "Dirent layer" row.
+
+## Dead names (October 27, rename review follow-up)
+
+A record names a file by `(child_ino, child_gen)`. The name is live while
+the inode at `child_ino` is allocated and its `si_gen` is the record's
+`child_gen`. Otherwise the name is dead: the inode is gone, or the ino now
+holds another incarnation. No op that completes leaves such a record (a
+create or link writes the inode's current gen under its pin, and an inode
+is freed only once its last name is gone), but a commit that caught an op
+half-done, or a bug, can. Before this change the fs layer resolved a dead
+name by its ino alone:
+
+- a lookup handed out the ino's current tenant under the old name;
+- an unlink or rmdir of the old name took a link from the tenant, and freed
+  it when that was its last;
+- a rename onto the old name did the same, so renaming a file onto a dead
+  record of its own ino freed the file being renamed;
+- a dead record naming a freed ino could not be removed at all, because
+  every pin refuses a freed inode.
+
+The fs layer (`fs_name_live_locked`, `src/fs/fs.c`) now treats a dead name
+as an entry that names no file, the way a dangling symlink is a name whose
+target is absent:
+
+- `stm_fs_lookup`, `stm_fs_lookup_if_gen`, a snapshot view's lookup and
+  `stm_fs_name_to_handle` answer `STM_ENOENT`, on the lockless path and
+  under `fs->global` alike.
+- A link or a rename from it, a rename of it onto itself, and an EXCHANGE
+  with it either way answer `STM_ENOENT`.
+- It is still an entry: readdir lists it, and a create, mkdir, symlink,
+  link or NOREPLACE rename onto it answers `STM_EEXIST`.
+- unlink and rmdir drop only its record, and a rename onto it replaces only
+  its record. Both take its type from the record (`STM_EISDIR` and
+  `STM_ENOTDIR` as for a live name) and count nothing under a dead
+  directory. Neither pins the inode the record names, which may be freed or
+  belong to another name, so neither waits on it nor changes it.
+- A rename onto a dead name that fails puts the record back and gives the
+  inode no link.
+
+An op that pins on a verdict reads it before pinning, to know what to pin,
+and again under the pins. A live verdict cannot change under the pins: the
+inode is pinned, and no other name's removal can free it. A dead verdict
+whose gen the inode has passed cannot change either, because a gen never
+comes back. Only a record carrying a gen its inode has not reached could
+turn live, and no op writes one; if it happens, the op goes round again.
+
+The lockless lookup reads the record, then the inode, inside one EBR
+section. A free and reuse between the two reads makes the name read as
+dead, which orders the lookup after the name's removal.
+
+Tests (`tests/test_fs.c`): `fs_a_dead_name_is_absent_to_lookups`,
+`fs_a_dead_name_names_no_file`, `fs_a_dead_name_is_still_taken`,
+`fs_a_rename_onto_a_dead_name_replaces_only_its_record`,
+`fs_a_dead_name_goes_by_its_record`,
+`fs_a_dead_name_whose_inode_is_gone_can_still_go`,
+`fs_a_failed_rename_onto_a_dead_name_puts_back_only_its_record`,
+`fs_a_dead_name_in_a_snapshot_is_absent`, and
+`fs_name_to_handle_names_the_incarnation_the_name_resolved_to`.
