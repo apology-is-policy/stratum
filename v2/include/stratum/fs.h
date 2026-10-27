@@ -296,6 +296,10 @@ stm_status stm_fs_commit(stm_fs *fs);
  *   - STM_EOVERFLOW if the write passes STM_FS_FILE_MAX (pwrite: if it
  *     starts at or past it).
  *   - STM_ENOSPC when the pool has no room.
+ *   - STM_ERANGE (write) when the write is not block-aligned and its
+ *     cover, the blocks it touches plus the extents it partly overlaps,
+ *     passes 4 * STM_FS_RECORDSIZE_MAX; nothing is written. Only an
+ *     in-process caller can ask that much: a 9P count is bounded by msize.
  *   - STM_ENOMEM on allocation failure.
  *   - STM_EBADTAG on AEAD decrypt failure (read).
  */

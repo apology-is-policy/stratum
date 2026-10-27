@@ -94,8 +94,12 @@ verify name not already present further). The name's own WHITEOUT,
 wherever it sits in the chain, is the install slot instead, even past
 an earlier tombstone: installing at the tombstone would leave the
 whiteout beside the new record, so readdir would list the name twice
-and an unlink would bring the whiteout back. A different name's
-whiteout is walked past and kept. Existing same-name returns
+and an unlink would bring the whiteout back. A chain can hold the
+name's whiteout twice (a pool written before the first-whiteout rule
+and a hash collision): the first is the install slot, and the later
+ones become tombstones before the install, so the name keeps one slot
+and a failure part way leaves it whited out as it was. A different
+name's whiteout is walked past and kept. Existing same-name returns
 `STM_EEXIST`. Chain exhaustion (`STM_DIRENT_PROBE_MAX = 64`) returns
 `STM_ENOSPC`. Models `dirent.tla::Create` (`InstallSlot`).
 

@@ -13229,6 +13229,68 @@ STM_TEST(fs_a_file_ends_at_the_largest_file_size) {
     reuse_fs_done(fs);
 }
 
+/* An unaligned write to an inline file whose cover passes four
+ * recordsizes answers ERANGE with the file as it was, kind included; one
+ * whose cover is exactly four recordsizes lands, and so does an aligned
+ * one past the bound (it splits without a cover). */
+STM_TEST(fs_an_inline_file_refuses_a_cover_past_the_bound_before_its_cutover) {
+    const uint64_t MIB = 1024u * 1024u, REC = STM_FS_RECORDSIZE_MAX;
+    make_tmp("inline_cover_bound");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 128u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, f = 0, g = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"g", 1,
+                                     0644u, 0, 0, &g));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, "prefix", 6));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 0, "prefix", 6));
+    uint8_t *big = malloc((size_t)(4u * REC + 4096u));
+    STM_ASSERT_TRUE(big != NULL);
+    if (!big) return;
+    memset(big, 0x9D, (size_t)(4u * REC + 4096u));
+
+    /* [4097, 4097 + 4 REC): its blocks span 4 REC + 4 KiB. */
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 4097u, big, (size_t)(4u * REC)),
+                   STM_ERANGE);
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+    STM_ASSERT_EQ(v.si_data_kind, STM_DATA_INLINE);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)6);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, 0), (uint8_t)'p');
+
+    /* One byte shorter: exactly 4 REC of blocks. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 4097u, big,
+                               (size_t)(4u * REC - 1u)));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+    STM_ASSERT_EQ(v.si_data_kind, STM_DATA_EXTENT);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), 4096u + 4u * REC);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, 0), (uint8_t)'p');
+    STM_ASSERT_EQ(mid_op_byte(fs, f, 4096u), 0x00);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, 4097u), 0x9D);
+    STM_ASSERT_EQ(mid_op_byte(fs, f, 4080u + 4u * REC), 0x9D);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, g, 4096u, big,
+                               (size_t)(4u * REC + 4096u)));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, g, &v));
+    STM_ASSERT_EQ(v.si_data_kind, STM_DATA_EXTENT);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), 8192u + 4u * REC);
+    STM_ASSERT_EQ(mid_op_byte(fs, g, 0), (uint8_t)'p');
+    STM_ASSERT_EQ(mid_op_byte(fs, g, 4096u), 0x9D);
+    free(big);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 /* A direct write split into pieces, whose second piece finds no room,
  * keeps the first and grows the size over it: nothing it wrote is left
  * past EOF for a later grow to read back as the file's content. */
@@ -14076,13 +14138,14 @@ STM_TEST(fs_a_dead_name_in_a_snapshot_is_absent) {
 
 /* A name that dies between an op's first read of it and the op's pins:
  * where nlink undercounts the names (two records, one link), the other
- * record's unlink frees the inode and a create reuses it while the op
- * waits. The verdict read again under the pins sends the op round, and
- * the tenant is never touched. */
+ * record's unlink frees the inode, and a create may reuse it, while the op
+ * waits. A pin that finds the inode gone, or the verdict read again under
+ * the pins, sends the op round, and a tenant is never touched. */
 typedef struct {
     stm_fs *fs;
     uint64_t dir;            /* the other record's, and the tenant's */
     bool armed;
+    bool reuse;              /* a create takes the freed number */
     uint64_t tenant;
 } dying_name;
 
@@ -14090,6 +14153,7 @@ static void *dying_name_kill(void *arg)
 {
     dying_name *k = arg;
     STM_ASSERT_OK(stm_fs_unlink(k->fs, 1, k->dir, TXN_NAME("name1")));
+    if (!k->reuse) return NULL;
     STM_ASSERT_OK(stm_fs_create_file(k->fs, 1, k->dir, TXN_NAME("tenant"),
                                      0644u, 0, 0, &k->tenant));
     dead_fill(k->fs, k->tenant, 0x7E);
@@ -14108,12 +14172,14 @@ static void dying_name_hook(uint64_t dataset_id, void *arg)
     pthread_join(th, NULL);
 }
 
-typedef enum { DYING_UNLINK, DYING_RENAME_ONTO, DYING_RENAME_FROM } dying_op;
+typedef enum { DYING_UNLINK, DYING_RENAME_ONTO, DYING_RENAME_FROM,
+               DYING_UNLINK_FREED } dying_op;
 
 static void dying_name_leg(dying_op op)
 {
     static const char *const tag[] = { "dying_unlink", "dying_onto",
-                                       "dying_from" };
+                                       "dying_from", "dying_freed" };
+    bool reuse = (op != DYING_UNLINK_FREED);
     uint64_t dir = 0, d1 = 0, d2 = 0, c = 0, s2 = 0, got = 0;
     stm_fs *fs = reuse_fs(tag[op], &dir);
     if (!fs) return;
@@ -14130,11 +14196,12 @@ static void dying_name_leg(dying_op op)
                                    d2, TXN_NAME("name2"), c,
                                    stm_load_le64(v.si_gen), STM_DT_REG));
 
-    dying_name k = { .fs = fs, .dir = d1, .armed = true };
+    dying_name k = { .fs = fs, .dir = d1, .armed = true, .reuse = reuse };
     stm_fs_set_name_read_hook_for_test(fs, dying_name_hook, &k);
     stm_status rc = STM_EINVAL;
     switch (op) {
     case DYING_UNLINK:
+    case DYING_UNLINK_FREED:
         rc = stm_fs_unlink(fs, 1, d2, TXN_NAME("name2"));
         break;
     case DYING_RENAME_ONTO:
@@ -14148,12 +14215,13 @@ static void dying_name_leg(dying_op op)
     }
     stm_fs_set_name_read_hook_for_test(fs, NULL, NULL);
     STM_ASSERT_TRUE(!k.armed);
-    STM_ASSERT_EQ(k.tenant, c);              /* the ino came back */
+    if (reuse) STM_ASSERT_EQ(k.tenant, c);   /* the ino came back */
     if (op == DYING_RENAME_FROM) STM_ASSERT_ERR(rc, STM_ENOENT);
     else STM_ASSERT_OK(rc);
-    dead_tenant_intact(fs, d1, "tenant", c, 0x7E);
+    if (reuse) dead_tenant_intact(fs, d1, "tenant", c, 0x7E);
     switch (op) {
     case DYING_UNLINK:
+    case DYING_UNLINK_FREED:
         STM_ASSERT_TRUE(!dead_listed(fs, d2, "name2", NULL, NULL));
         break;
     case DYING_RENAME_ONTO:
@@ -14176,6 +14244,7 @@ STM_TEST(fs_a_name_that_dies_before_its_pins_is_taken_as_dead) {
     dying_name_leg(DYING_UNLINK);
     dying_name_leg(DYING_RENAME_ONTO);
     dying_name_leg(DYING_RENAME_FROM);
+    dying_name_leg(DYING_UNLINK_FREED);
 }
 
 /* A dead source names no file even when its number now belongs to the

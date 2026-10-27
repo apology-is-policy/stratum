@@ -298,7 +298,9 @@ full ctest suite is 65 binaries.
 - `STM_EWEDGED` / `STM_EROFS` — from `stm_sync_write_extent`.
 - `STM_ERANGE` — the RMW scratch span exceeds `4 * recordsize` (F2 defensive cap;
   a legitimate expansion tops out at ~3·recordsize, so this fires only for an
-  absurd non-aligned `len` from a direct caller).
+  absurd non-aligned `len` from a direct caller). An inline file checks the
+  same bound before its cutover, so a refused write leaves the kind
+  unchanged and nothing written.
 - `STM_ECORRUPT` — the split's pullback found an existing extent with
   `len > recordsize` (F3 fail-closed; only reachable on an already-corrupt FS,
   which the AEAD read path catches first).

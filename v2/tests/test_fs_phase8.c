@@ -7746,11 +7746,17 @@ STM_TEST(fs_a_range_shift_moves_every_extent_once) {
 
 /* A range shift whose delete fails puts back what it took out and leaves
  * the file as it was. One whose put fails has lost a record: the fs
- * wedges, and the image keeps the file as it was before the shift. */
-static void p7b_shift_fail_leg(const char *name, unsigned del_n,
-                               unsigned put_n, bool want_wedged)
+ * wedges, and the image keeps the file as it was before the shift.
+ * INSERT at 0 moves the blocks at 0, K, 2K; COLLAPSE of the hole at K
+ * moves the two past it, at 2K and 3K. */
+static void p7b_shift_fail_leg(const char *name, bool collapse,
+                               unsigned del_n, unsigned put_n,
+                               bool want_wedged)
 {
     const uint64_t K = 4096u;
+    static const uint64_t at_insert[3] = { 0, 1, 2 };
+    static const uint64_t at_collapse[3] = { 0, 2, 3 };
+    const uint64_t *at = collapse ? at_collapse : at_insert;
     make_tmp(name);
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -7763,13 +7769,15 @@ static void p7b_shift_fail_leg(const char *name, unsigned del_n,
     STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
                                      0644u, 0, 0, &ino));
     for (unsigned b = 0; b < 3u; b++) {        /* one extent each */
-        p7b_write_block(fs, ino, b * K, (uint8_t)(11u * (b + 1u)));
+        p7b_write_block(fs, ino, at[b] * K, (uint8_t)(11u * (b + 1u)));
         STM_ASSERT_OK(stm_fs_commit(fs));
     }
     stm_extent_fail_next_shift_for_test(
         stm_sync_extent_index(stm_fs_sync(fs)), del_n, put_n, STM_EIO);
-    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, K,
-                                    STM_FS_FALLOC_FL_INSERT_RANGE), STM_EIO);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, collapse ? K : 0u, K,
+                                    collapse ? STM_FS_FALLOC_FL_COLLAPSE_RANGE
+                                             : STM_FS_FALLOC_FL_INSERT_RANGE),
+                   STM_EIO);
     stm_fs_stats st = {0};
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
     STM_ASSERT_EQ(st.wedged, want_wedged);
@@ -7780,11 +7788,12 @@ static void p7b_shift_fail_leg(const char *name, unsigned del_n,
     for (int pass = 0; pass < 2; pass++) {
         if (pass == 1 || !want_wedged) {
             for (unsigned b = 0; b < 3u; b++)
-                STM_ASSERT_TRUE(p7b_block_is(fs, ino, b * K,
+                STM_ASSERT_TRUE(p7b_block_is(fs, ino, at[b] * K,
                                              (int)(11u * (b + 1u))));
+            if (collapse) STM_ASSERT_TRUE(p7b_block_is(fs, ino, K, -1));
             struct stm_inode_value v = {0};
             STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
-            STM_ASSERT_EQ(stm_load_le64(v.si_size), 3u * K);
+            STM_ASSERT_EQ(stm_load_le64(v.si_size), (at[2] + 1u) * K);
         }
         if (pass == 0 && !want_wedged) STM_ASSERT_OK(stm_fs_commit(fs));
         if (pass == 1) break;
@@ -7798,9 +7807,12 @@ static void p7b_shift_fail_leg(const char *name, unsigned del_n,
 }
 
 STM_TEST(fs_a_range_shift_that_fails_loses_nothing_durable) {
-    p7b_shift_fail_leg("shift_del_fail", 2u, 0u, false);
-    p7b_shift_fail_leg("shift_put_fail", 0u, 2u, true);
-    p7b_shift_fail_leg("shift_undo_fail", 2u, 1u, true);
+    p7b_shift_fail_leg("shift_del_fail", false, 2u, 0u, false);
+    p7b_shift_fail_leg("shift_put_fail", false, 0u, 2u, true);
+    p7b_shift_fail_leg("shift_undo_fail", false, 2u, 1u, true);
+    p7b_shift_fail_leg("collapse_del_fail", true, 2u, 0u, false);
+    p7b_shift_fail_leg("collapse_put_fail", true, 0u, 2u, true);
+    p7b_shift_fail_leg("collapse_undo_fail", true, 2u, 1u, true);
 }
 
 /* The inode update that completes a data op fails. After an extent

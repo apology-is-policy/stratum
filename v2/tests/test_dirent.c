@@ -1690,4 +1690,45 @@ STM_TEST(dirent_a_create_takes_the_first_of_its_own_whiteouts) {
     di_test_idx_close(idx);
 }
 
+/* A create over three of the name's own whiteouts leaves the name one
+ * slot: readdir lists it once, and after an unlink nothing of it is
+ * listed. */
+static size_t di_count_named(stm_dirent_index *idx, const char *nm,
+                             uint8_t *out_type)
+{
+    stm_dirent_entry e[16];
+    uint64_t cursor = 0;
+    size_t n = 0, hits = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 100, &cursor, e, 16, &n));
+    for (size_t i = 0; i < n; i++)
+        if (e[i].name_len == strlen(nm) &&
+            memcmp(e[i].name, nm, e[i].name_len) == 0) {
+            hits++;
+            if (out_type) *out_type = e[i].child_type;
+        }
+    return hits;
+}
+
+STM_TEST(dirent_a_create_over_its_own_whiteouts_leaves_one_slot) {
+    stm_dirent_index *idx = di_test_idx();
+    STM_ASSERT_TRUE(idx != NULL);
+    uint64_t h = stm_dirent_fnv1a64_for_test((const uint8_t *)"baz", 3);
+    for (uint64_t k = 0; k < 3u; k++)
+        STM_ASSERT_OK(stm_dirent_install_at_probe_for_test(
+                idx, 1, 100, h + k, (const uint8_t *)"baz", 3, 0, 0,
+                STM_DT_WHITEOUT, STM_DIRENT_FLAG_WHITEOUT));
+    STM_ASSERT_EQ(di_count_named(idx, "baz", NULL), (size_t)3);
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"baz", 3,
+                                   99, 0, STM_DT_REG));
+    uint8_t type = 0;
+    STM_ASSERT_EQ(di_count_named(idx, "baz", &type), (size_t)1);
+    STM_ASSERT_EQ(type, STM_DT_REG);
+    STM_ASSERT_OK(stm_dirent_unlink(idx, 1, 100, (const uint8_t *)"baz", 3));
+    STM_ASSERT_EQ(di_count_named(idx, "baz", NULL), (size_t)0);
+    uint64_t ino = 0;
+    STM_ASSERT_ERR(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"baz", 3,
+                                     &ino, NULL, NULL), STM_ENOENT);
+    di_test_idx_close(idx);
+}
+
 STM_TEST_MAIN("test_dirent")

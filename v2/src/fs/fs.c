@@ -2423,9 +2423,18 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
     }
 
     /* A write starting past the inline prefix's block, or ending past a
-     * recordsize, cuts the file over sparsely and takes the EXTENT path. */
+     * recordsize, cuts the file over sparsely and takes the EXTENT path.
+     * After the cutover the only extent is the prefix block, which an
+     * unaligned write starting in it covers anyway, so the cover is the
+     * write's own blocks: one the covering write would refuse (not block-
+     * aligned, over four recordsizes) is refused here, the kind unchanged. */
     if (kind == STM_DATA_INLINE &&
         (off >= 4096u || end_off > (uint64_t)STM_FS_RECORDSIZE_MAX)) {
+        uint64_t c_lo = off & ~(uint64_t)4095u;
+        uint64_t c_hi = (end_off + 4095u) & ~(uint64_t)4095u;
+        bool aligned = off % 4096u == 0u && (uint64_t)len % 4096u == 0u;
+        if (!aligned && c_hi - c_lo > (uint64_t)STM_FS_RECORDSIZE_MAX * 4u)
+            return STM_ERANGE;
         stm_status cs = fs_write_cutover_locked(fs, iidx, ds, ino, iv);
         if (cs != STM_OK) return cs;
         kind = STM_DATA_EXTENT;
@@ -4663,7 +4672,10 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
                                 dataset_id, observed_child,
                                 &h_parent, &h_child)
             : stm_inode_pin(iidx, dataset_id, parent_ino, &h_parent);
-        if (ps != STM_OK)       /* STM_ENOENT if parent or child gone */
+        /* An inode freed since the read: read the name again; it may now
+         * name no file, or another. */
+        if (ps == STM_ENOENT) continue;
+        if (ps != STM_OK)
             return fs_refuse_unlock(fs, dataset_id, parent_ino, gen,
                                     parent_ino, NULL, ps);
 

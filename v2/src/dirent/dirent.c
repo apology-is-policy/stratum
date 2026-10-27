@@ -598,6 +598,8 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
     bool     have_install_slot = false;
     bool     own_whiteout      = false;
     uint64_t install_probe     = 0;
+    uint64_t later_whiteout[STM_DIRENT_PROBE_MAX];
+    uint32_t n_later           = 0;
 
     for (uint32_t k = 0; k < STM_DIRENT_PROBE_MAX; k++) {
         uint64_t probe = hash_base + (uint64_t)k;
@@ -630,14 +632,20 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
              * earlier tombstone (overlayfs "promote name" — overwrites
              * the whiteout with a fresh live record at the same name).
              * The first one, as dirent.tla's OwnWhiteoutSlot: lookup
-             * stops there, so a record behind it would be hidden.
+             * stops there, so a record behind it would be hidden; a
+             * later one (a pool from before that rule) is remembered to
+             * become a tombstone below.
              * DIFFERENT-NAME whiteout: MUST be preserved to honor
              * RENAME_WHITEOUT's persistence contract — walk past it as
              * an occupying slot. (R88 P2-1) */
-            if (record_name_eq(&r, name, name_len) && !own_whiteout) {
-                install_probe     = probe;
-                have_install_slot = true;
-                own_whiteout      = true;
+            if (record_name_eq(&r, name, name_len)) {
+                if (!own_whiteout) {
+                    install_probe     = probe;
+                    have_install_slot = true;
+                    own_whiteout      = true;
+                } else {
+                    later_whiteout[n_later++] = probe;
+                }
             }
             continue;
         }
@@ -651,6 +659,24 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
     if (!have_install_slot) {
         must_unlock(idx_lock(idx));
         return STM_ENOSPC;
+    }
+
+    /* The installed record must be the name's only slot, or readdir lists
+     * the name twice and an unlink brings a whiteout back. The later
+     * whiteouts go first: a failure part way leaves the name whited out,
+     * as it was. */
+    for (uint32_t i = 0; i < n_later; i++) {
+        stm_dirent_record tomb;
+        memset(&tomb, 0, sizeof tomb);
+        tomb.dataset_id = dataset_id;
+        tomb.dir_ino    = dir_ino;
+        tomb.hash_probe = later_whiteout[i];
+        tomb.flags      = STM_DIRENT_FLAG_TOMBSTONE;
+        stm_status ts = di_engine_put(idx, &tomb);
+        if (ts != STM_OK) {
+            must_unlock(idx_lock(idx));
+            return ts;
+        }
     }
 
     /* engine_insert (upsert) the fresh live record at install_probe.
