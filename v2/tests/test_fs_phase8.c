@@ -7803,6 +7803,118 @@ STM_TEST(fs_a_range_shift_that_fails_loses_nothing_durable) {
     p7b_shift_fail_leg("shift_undo_fail", 2u, 1u, true);
 }
 
+/* The inode update that completes a data op fails. After an extent
+ * change the fs wedges, so the image keeps the file as it was, and no
+ * stray extent comes back through a later grow; a growing preallocate
+ * changed nothing else and only answers its error. */
+enum { DI_INSERT, DI_PUNCH, DI_TRUNC, DI_WRITE, DI_CUTOVER, DI_TCUT,
+       DI_DENSE, DI_REFLINK, DI_PREALLOC };
+
+static void p7b_data_iset_fail_leg(const char *name, int op)
+{
+    const uint64_t K = 4096u, MIB = 1024u * 1024u;
+    const size_t big_n = 2u * 1024u * 1024u;
+    bool inline_file = (op == DI_CUTOVER || op == DI_TCUT || op == DI_DENSE ||
+                        op == DI_REFLINK);
+    bool prefix = (op == DI_CUTOVER || op == DI_TCUT);
+    bool want_wedged = (op != DI_PREALLOC);
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint8_t *big = malloc(big_n);
+    STM_ASSERT_TRUE(big != NULL);
+    if (!big) return;
+    memset(big, 0xA5, big_n);
+    uint64_t root = 0, ino = 0, src = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &ino));
+    if (prefix)
+        STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, "abc", 3));
+    if (!inline_file) {
+        p7b_write_block(fs, ino, 0, 11u);
+        p7b_write_block(fs, ino, K, 22u);
+    }
+    if (op == DI_REFLINK) {
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"s",
+                                         1, 0644u, 0, 0, &src));
+        for (unsigned b = 0; b < 3u; b++)
+            p7b_write_block(fs, src, b * K, (uint8_t)(33u + 11u * b));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    stm_fs_fail_next_data_iset_for_test(fs, STM_ENOMEM);
+    stm_status r = STM_OK;
+    switch (op) {
+    case DI_INSERT:
+        r = stm_fs_fallocate(fs, 1, ino, 0, K, STM_FS_FALLOC_FL_INSERT_RANGE);
+        break;
+    case DI_PUNCH:
+        r = stm_fs_fallocate(fs, 1, ino, 0, 2u * K,
+                             STM_FS_FALLOC_FL_PUNCH_HOLE |
+                             STM_FS_FALLOC_FL_KEEP_SIZE);
+        break;
+    case DI_TRUNC:    r = stm_fs_truncate(fs, 1, ino, K); break;
+    case DI_WRITE:    r = stm_fs_write(fs, 1, ino, 2u * K, big, big_n); break;
+    case DI_CUTOVER:  r = stm_fs_write(fs, 1, ino, 16u * MIB, "z", 1); break;
+    case DI_TCUT:     r = stm_fs_truncate(fs, 1, ino, 16u * K); break;
+    case DI_DENSE:    r = stm_fs_write(fs, 1, ino, 0, big, big_n); break;
+    case DI_REFLINK:  r = stm_fs_reflink(fs, 1, src, 1, ino); break;
+    default:          r = stm_fs_fallocate(fs, 1, ino, 0, 16u * K, 0); break;
+    }
+    STM_ASSERT_ERR(r, STM_ENOMEM);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.wedged, want_wedged);
+    if (want_wedged)
+        STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+    else
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) { free(big); return; }
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    if (inline_file) {
+        STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_INLINE);
+        STM_ASSERT_EQ(stm_load_le64(v.si_size),
+                      (uint64_t)(prefix ? 3u : 0u));
+        /* A cutover with no prefix writes no block: a stray one at 0
+         * would read back here. */
+        STM_ASSERT_OK(stm_fs_truncate(fs, 1, ino, 0));
+        STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 16u * MIB, "z", 1));
+        STM_ASSERT_TRUE(p7b_block_is(fs, ino, 0, -1));
+    } else {
+        STM_ASSERT_EQ(stm_load_le64(v.si_size), 2u * K);
+        STM_ASSERT_TRUE(p7b_block_is(fs, ino, 0, 11));
+        STM_ASSERT_TRUE(p7b_block_is(fs, ino, K, 22));
+        /* A grow reads zeros where the failed write landed. */
+        STM_ASSERT_OK(stm_fs_truncate(fs, 1, ino, 2u * K + big_n));
+        STM_ASSERT_TRUE(p7b_block_is(fs, ino, 2u * K, -1));
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    free(big);
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_an_extent_change_whose_inode_update_fails_commits_nothing) {
+    p7b_data_iset_fail_leg("diset_insert", DI_INSERT);
+    p7b_data_iset_fail_leg("diset_punch", DI_PUNCH);
+    p7b_data_iset_fail_leg("diset_trunc", DI_TRUNC);
+    p7b_data_iset_fail_leg("diset_write", DI_WRITE);
+    p7b_data_iset_fail_leg("diset_cutover", DI_CUTOVER);
+    p7b_data_iset_fail_leg("diset_tcut", DI_TCUT);
+    p7b_data_iset_fail_leg("diset_dense", DI_DENSE);
+    p7b_data_iset_fail_leg("diset_reflink", DI_REFLINK);
+    p7b_data_iset_fail_leg("diset_prealloc", DI_PREALLOC);
+}
+
 STM_TEST(fs_p7b_fallocate_zero_range_drops_extent) {
     /* ZERO_RANGE on a written extent: extent gets dropped; subsequent
      * read returns zeros via sparse-extent semantics. */

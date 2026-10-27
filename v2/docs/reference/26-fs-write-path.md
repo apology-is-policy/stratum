@@ -272,6 +272,13 @@ full ctest suite is 65 binaries.
   transition cuts over sparsely.
 - `STM_ENOMEM` — RMW scratch / coalescer run-buffer alloc (the coalescer degrades
   to single-range; the RMW returns the error and the buffered run is retried).
+- Any failure of the inode update that completes a data op after its extent
+  change (a write's size, an inline file's move to extents by a write or a
+  truncate, a shrinking truncate, fallocate's range ops, a reflink's
+  destination; `fs_data_iset_locked`): the change would sit under the old
+  inode, so the fs wedges inside the op's span and no commit makes it durable
+  (`fs_an_extent_change_whose_inode_update_fails_commits_nothing`). The update
+  can fail only for memory; its checks pass for a value loaded under the pin.
 - `STM_EWEDGED` / `STM_EROFS` — from `stm_sync_write_extent`.
 - `STM_ERANGE` — the RMW scratch span exceeds `4 * recordsize` (F2 defensive cap;
   a legitimate expansion tops out at ~3·recordsize, so this fires only for an

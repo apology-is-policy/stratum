@@ -103,7 +103,7 @@ void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
  * Make the next inode free that unlink, rmdir, rename over an existing
  * name or unlink_anon attempts answer `fail` instead, leaving the inode
  * as it was. One-shot; STM_OK disarms. This, the three above and the
- * eleven below that take an `fs` belong to it and go with it at unmount.
+ * twelve below that take an `fs` belong to it and go with it at unmount.
  */
 void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
 
@@ -199,6 +199,13 @@ void stm_fs_set_reclaim_hook_for_test(stm_fs *fs, stm_fs_reclaim_hook fn,
 typedef void (*stm_fs_fresh_pin_hook)(uint64_t ino, bool busy, void *arg);
 void stm_fs_set_fresh_pin_hook_for_test(stm_fs *fs, stm_fs_fresh_pin_hook fn,
                                         void *arg);
+
+/*
+ * Make the next inode update that completes a data op (the step-gap
+ * hook's list, plus a growing fallocate) answer `fail` instead, leaving
+ * the inode as it was. One-shot; STM_OK disarms.
+ */
+void stm_fs_fail_next_data_iset_for_test(stm_fs *fs, stm_status fail);
 
 /*
  * How many times, process-wide, a thread inside a span of fs->txn took a

@@ -298,6 +298,7 @@ struct stm_fs {
     stm_status free_fail_next;
     stm_status name_back_fail_next;
     stm_status reuse_drop_fail_next;
+    stm_status data_iset_fail_next;
     stm_fs_free_cleanup_hook free_cleanup_hook;
     void *free_cleanup_hook_arg;
     stm_fs_step_gap_hook step_gap_hook;
@@ -531,6 +532,25 @@ static void fs_name_read_gap(stm_fs *fs, uint64_t dataset_id)
 #else
     (void)fs; (void)dataset_id;
 #endif
+}
+
+/* The inode update that completes a data op. After the op changed
+ * extents (extents_changed), a failure leaves them under the old inode, so
+ * the fs wedges before the op's span ends and no commit makes that durable.
+ * The caller holds fs->global and the inode's pin. */
+static stm_status fs_data_iset_locked(stm_fs *fs, stm_inode_index *iidx,
+                                      uint64_t ds, uint64_t ino,
+                                      const struct stm_inode_value *iv,
+                                      bool extents_changed)
+{
+    stm_status s = STM_OK;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    s = fs->data_iset_fail_next;
+    fs->data_iset_fail_next = STM_OK;
+#endif
+    if (s == STM_OK) s = stm_inode_set(iidx, ds, ino, iv);
+    if (s != STM_OK && extents_changed) fs_mark_wedged_locked(fs);
+    return s;
 }
 
 static void fs_fresh_pin_event(stm_fs *fs, uint64_t ino, bool busy)
@@ -2264,7 +2284,8 @@ static stm_status fs_flush_all_locked(stm_fs *fs)
  * the write's end as one record, which a write ending past a recordsize
  * cannot fit and a write far from the prefix spends as zeros. The block and
  * the flip are one span: a commit between them would keep a block that an
- * INLINE inode does not know, which a later grow reads back. iv changes only
+ * INLINE inode does not know, which a later grow reads back; a flip that
+ * fails after the block wedges the fs for the same reason. iv changes only
  * once the flip is stored, so on any failure it is still the stored inode. */
 static stm_status fs_write_cutover_locked(stm_fs *fs, stm_inode_index *iidx,
                                           uint64_t ds, uint64_t ino,
@@ -2292,7 +2313,7 @@ static stm_status fs_write_cutover_locked(stm_fs *fs, stm_inode_index *iidx,
     cv.si_data_kind = STM_DATA_EXTENT;
     cv.si_data_len  = 0;
     memset(&cv.si_data, 0, sizeof cv.si_data);
-    s = stm_inode_set(iidx, ds, ino, &cv);
+    s = fs_data_iset_locked(fs, iidx, ds, ino, &cv, iv->si_data_len > 0u);
     fs_txn_rd_end(fs);
     if (s == STM_OK) *iv = cv;
     return s;
@@ -2448,6 +2469,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * under an INLINE inode, which a later truncate to 0 and back up
          * reads as the file's content. */
         stm_status fs1 = STM_ENOSPC;
+        bool synced = false;        /* the fallback wrote the extent */
         fs_txn_rd(fs);
         if (aligned_size < (uint64_t)STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
             uint64_t tr_freeb = fs->alloc
@@ -2463,6 +2485,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                                             /*off=*/0u,
                                             combined,
                                             (size_t)aligned_size);
+            synced = (fs1 == STM_OK);
         }
         free(combined);
         if (fs1 != STM_OK) {
@@ -2475,17 +2498,10 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * (new_size, not the block-padded aligned_size) so reads past
          * the logical EOF return 0 bytes, matching POSIX semantics.
          *
-         * R76 P3-1 (theoretical-only): `stm_inode_set` cannot fail in
-         * this lock posture. Every `STM_E*` return from set
-         * presupposes a state mutation only the allocator / free path
-         * can perform (gen bump, FREED transition, nlink=0 transition,
-         * data_kind set to unknown). All those paths are mutex-
-         * excluded by fs->lock. The args we pass are derived from a
-         * lookup performed under the same fs->lock with no
-         * intervening release. So the post-extent-write inconsistency
-         * (extent has data, inode still INLINE) is unreachable today.
-         * Future maintainers: if you add an alloc path that doesn't
-         * take fs->lock, this assumption breaks. */
+         * R76 P3-1: `stm_inode_set`'s checks pass here (the value was
+         * loaded under the pin; only the allocator and the free path
+         * change gen, FREED or nlink), but its engine put can still
+         * fail for memory. */
         iv->si_data_kind = STM_DATA_EXTENT;
         iv->si_data_len = 0;
         memset(&iv->si_data, 0, sizeof iv->si_data);
@@ -2496,15 +2512,16 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * stamps mtime + ctime on either alone. */
         fs_stamp_mtime_ctime_now(iv);
         {
-            stm_status trs = stm_inode_set(iidx, ds, ino, iv);
-            /* C-2-F2-audit F6 hardening: the R76-"infallible" set. If it
-             * ever fails (a future alloc path breaking the annotation's
-             * assumption), the inode stays INLINE while the buffer holds
-             * [0, aligned) -- and unlink's cleanup drops ranges only for
-             * EXTENT inos, so a reused ino would inherit the dead file's
-             * bytes through the overlay: a cross-file leak. Drop the
-             * ghost ranges here, restoring the pre-buffering blast radius
-             * (an orphan extent = space-only). */
+            stm_status trs = fs_data_iset_locked(fs, iidx, ds, ino, iv,
+                                                 synced);
+            /* C-2-F2-audit F6: if the set fails the inode stays INLINE
+             * while the buffer holds [0, aligned) -- and unlink's cleanup
+             * drops ranges only for EXTENT inos, so a reused ino would
+             * inherit the dead file's bytes through the overlay: a
+             * cross-file leak. Drop the ghost ranges here. An extent the
+             * fallback wrote is no more the INLINE inode's: a truncate to
+             * 0 and a cutover with no prefix would read it back, so the
+             * fs wedged over it. */
             if (trs != STM_OK)
                 stm_dirty_buffer_drop_ino(fs->dirty_buffer, ds, ino);
             else
@@ -2630,7 +2647,8 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * write — same posture for buffered + direct. */
         fs_stamp_mtime_ctime_now(iv);
         {
-            stm_status isr = stm_inode_set(iidx, ds, ino, iv);
+            stm_status isr = fs_data_iset_locked(fs, iidx, ds, ino, iv,
+                                                 true);
             if (wb_txn_held)
                 fs_txn_rd_end(fs);   /* R2-F1 */
             if (isr != STM_OK) return isr;
@@ -3490,6 +3508,11 @@ void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail)
 void stm_fs_fail_next_name_back_for_test(stm_fs *fs, stm_status fail)
 {
     fs->name_back_fail_next = fail;
+}
+
+void stm_fs_fail_next_data_iset_for_test(stm_fs *fs, stm_status fail)
+{
+    fs->data_iset_fail_next = fail;
 }
 
 void stm_fs_fail_next_reused_ino_drop_for_test(stm_fs *fs, stm_status fail)
@@ -5866,8 +5889,10 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
          * zero-padded block; the rest is a hole. Empty files need no extent.
          * The pin serializes extent readers and mutators; lock-free INLINE
          * readers can still observe the old inode value until inode_set.
-         * The infallible inode update publishes kind + size only after a
-         * successful prefix write. Allocation stays bounded at 4 KiB. */
+         * The inode update publishes kind + size only after a successful
+         * prefix write; if it fails, the block is not the INLINE inode's
+         * and the fs wedges. Allocation stays bounded at 4 KiB. */
+        bool prefixed = (iv.si_data_len > 0u);
         if (iv.si_data_len > 0u) {
             const size_t block_size = 4096u;
             uint8_t *prefix = calloc(1, block_size);
@@ -5895,7 +5920,7 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         memset(&iv.si_data, 0, sizeof iv.si_data);
         iv.si_size      = stm_store_le64(new_size);
         fs_stamp_mtime_ctime_now(&iv);
-        rs = stm_inode_set(iidx, dataset_id, ino, &iv);
+        rs = fs_data_iset_locked(fs, iidx, dataset_id, ino, &iv, prefixed);
         goto out;
     }
 
@@ -5922,7 +5947,8 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
         iv.si_size = stm_store_le64(new_size);
         fs_stamp_mtime_ctime_now(&iv);
-        rs = stm_inode_set(iidx, dataset_id, ino, &iv);
+        rs = fs_data_iset_locked(fs, iidx, dataset_id, ino, &iv,
+                                 new_size < cur_size);
         goto out;
     }
 
@@ -8042,10 +8068,8 @@ static stm_status fs_reflink_locked(stm_fs *fs,
          * fix would query stm_extent_count_for_ino post-success and
          * flip data_kind to EXTENT if non-zero. */
         fs_stamp_mtime_ctime_now(&div);
-        /* R76 P3-1 / R78 P3-1 lock-posture infallibility: only fields
-         * touched are si_size + si_data_kind + si_data + ts; gen /
-         * nlink / seal-bits unchanged. */
-        s = stm_inode_set(iidx, dst_dataset_id, dst_ino, &div);
+        s = fs_data_iset_locked(fs, iidx, dst_dataset_id, dst_ino, &div,
+                                true);
     }
     fs_txn_end(fs, &tx);
     return s;
@@ -11641,7 +11665,7 @@ static stm_status fs_fallocate(stm_fs *fs,
         if (s == STM_OK) {
             fs_step_gap(fs, dataset_id, ino);
             fs_stamp_mtime_ctime_now(&iv);
-            (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
+            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv, true);
         }
     } else if (collapse) {
         /* COLLAPSE_RANGE: range must already be empty + no crossing
@@ -11662,7 +11686,7 @@ static stm_status fs_fallocate(stm_fs *fs,
             uint64_t new_size = cur_size - len;
             iv.si_size = stm_store_le64(new_size);
             fs_stamp_mtime_ctime_now(&iv);
-            (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
+            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv, true);
         }
     } else if (insert) {
         /* INSERT_RANGE: shift extents at off' >= off up by len.
@@ -11684,7 +11708,7 @@ static stm_status fs_fallocate(stm_fs *fs,
             fs_step_gap(fs, dataset_id, ino);
             iv.si_size = stm_store_le64(cur_size + len);
             fs_stamp_mtime_ctime_now(&iv);
-            (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
+            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv, true);
         }
     } else if (zero_r) {
         /* ZERO_RANGE: punch via stm_sync_punch_range (R89 P0-4
@@ -11697,7 +11721,7 @@ static stm_status fs_fallocate(stm_fs *fs,
                 iv.si_size = stm_store_le64(off + len);
             }
             fs_stamp_mtime_ctime_now(&iv);
-            (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
+            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv, true);
         }
     } else if (unshare) {
         /* UNSHARE_RANGE: composes via stm_fs_promote_to_hot —
@@ -11719,14 +11743,15 @@ static stm_status fs_fallocate(stm_fs *fs,
          * MVP: stratum is sparse-by-construction so "preallocate"
          * is a metadata-only op. Bump si_size to off+len if not
          * KEEP_SIZE and extending. */
+        s = STM_OK;
         if (!keep_size) {
             if ((off + len) > cur_size) {
                 iv.si_size = stm_store_le64(off + len);
                 fs_stamp_mtime_ctime_now(&iv);
-                (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
+                s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv,
+                                        false);
             }
         }
-        s = STM_OK;
     }
 
 falloc_out:
