@@ -1670,4 +1670,24 @@ STM_TEST(dirent_cf2d_put_funnel_retries_injected_ebusy) {
     di_test_idx_close(idx);
 }
 
+/* A chain holding two whiteouts of one name (a pool written before a
+ * create took its own whiteout, plus a collision): the create takes the
+ * first, where lookup stops, as dirent.tla's OwnWhiteoutSlot does. */
+STM_TEST(dirent_a_create_takes_the_first_of_its_own_whiteouts) {
+    stm_dirent_index *idx = di_test_idx();
+    STM_ASSERT_TRUE(idx != NULL);
+    uint64_t h = stm_dirent_fnv1a64_for_test((const uint8_t *)"baz", 3);
+    for (uint64_t k = 0; k < 2u; k++)
+        STM_ASSERT_OK(stm_dirent_install_at_probe_for_test(
+                idx, 1, 100, h + k, (const uint8_t *)"baz", 3, 0, 0,
+                STM_DT_WHITEOUT, STM_DIRENT_FLAG_WHITEOUT));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"baz", 3,
+                                   99, 0, STM_DT_REG));
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"baz", 3,
+                                    &ino, NULL, NULL));
+    STM_ASSERT_EQ(ino, 99u);
+    di_test_idx_close(idx);
+}
+
 STM_TEST_MAIN("test_dirent")

@@ -596,6 +596,7 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
      * whiteout treats it as a chain-occupying slot (like a
      * different-named live record) — chain integrity preserved. */
     bool     have_install_slot = false;
+    bool     own_whiteout      = false;
     uint64_t install_probe     = 0;
 
     for (uint32_t k = 0; k < STM_DIRENT_PROBE_MAX; k++) {
@@ -628,12 +629,15 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
             /* SAME-NAME whiteout: the install slot, even past an
              * earlier tombstone (overlayfs "promote name" — overwrites
              * the whiteout with a fresh live record at the same name).
+             * The first one, as dirent.tla's OwnWhiteoutSlot: lookup
+             * stops there, so a record behind it would be hidden.
              * DIFFERENT-NAME whiteout: MUST be preserved to honor
              * RENAME_WHITEOUT's persistence contract — walk past it as
              * an occupying slot. (R88 P2-1) */
-            if (record_name_eq(&r, name, name_len)) {
+            if (record_name_eq(&r, name, name_len) && !own_whiteout) {
                 install_probe     = probe;
                 have_install_slot = true;
+                own_whiteout      = true;
             }
             continue;
         }
@@ -988,8 +992,9 @@ stm_status stm_dirent_swap_two(stm_dirent_index *idx,
     /* Swap (child_ino, child_gen, child_type) in the decoded records.
      * Slot positions (hash_probe + key) + names + flags + name_len
      * UNCHANGED — chain integrity by construction. Two engine_inserts
-     * land in this critical section so no observer can see a
-     * half-swapped state. A failed put changes nothing (di_engine_put),
+     * land in this critical section, so no reader that takes the index
+     * mutex sees a half-swapped state; the lockless readers can. A
+     * failed put changes nothing (di_engine_put),
      * so a failed second put is undone by putting the first record
      * back as it was; a half swap is left only when that fails too.
      * It names one child twice and the other not at all, and a commit

@@ -155,11 +155,14 @@ short-circuit non-matching scans.
   acquire, so it may stack or upgrade over any range it holds.
 - **`DifferentInosNeverInteract`** — a lock on one inode never refuses
   an acquire on another, whatever its owner, type or range.
-- **`DropsAreReleases`** (an action property) — a step removes nothing,
-  or exactly the locks of one Release (every lock of one owner on one
-  range of one inode) or of one ReleaseOwner (every lock of one owner).
-  The invariants cannot see a removal that goes too far, since a removal
-  never makes a conflict.
+- **`DropsAreReleases`** (an action property) — a step removes exactly
+  what the action it took names: every lock of the owner on that range
+  of that inode for a Release, every lock of the owner for a
+  ReleaseOwner, nothing for an Acquire. A history variable, `last`,
+  records each step's action and arguments, so a Release that removes
+  another range, or nothing, is judged rather than read as a stutter.
+  The invariants cannot see a removal at all, since a removal never
+  makes a conflict.
 
 Spec actions (the spec's inode is one incarnation, the impl's `(ds, ino,
 gen)`; it has no datasets and no table argument):
@@ -188,15 +191,18 @@ invariants judge by the healthy `Conflicts`:
   `DifferentInosNeverInteract` (`locks_ino_blind_buggy.cfg`).
   `NoConflictingLocks` cannot see this bug: a refusal adds no record.
 
-Two more change Release, and only `DropsAreReleases` can see them:
+Three more change Release, and only `DropsAreReleases` can see them:
 
 - `BuggyReleaseOwnerBlind` — Release drops the matching range of every
   owner, so one owner's unlock frees another's lock
-  (`locks_release_owner_blind_buggy.cfg`, 4 steps).
+  (`locks_release_owner_blind_buggy.cfg`, 2 steps).
 - `BuggyReleaseInoBlind` — Release drops the owner's matching range on
-  every inode (`locks_release_ino_blind_buggy.cfg`, 5 steps).
+  every inode (`locks_release_ino_blind_buggy.cfg`, 2 steps).
+- `BuggyReleaseDropsNothing` — Release removes nothing, so an unlock
+  leaves the lock held (`locks_release_drops_nothing_buggy.cfg`, 2
+  steps).
 
-Runtime twin of both: `locks_release_drops_only_its_owners_lock_there`.
+Runtime twin of all three: `locks_release_drops_only_its_owners_lock_there`.
 
 ## SPEC-TO-CODE mapping
 

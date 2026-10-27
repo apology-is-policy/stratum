@@ -375,15 +375,25 @@ target is absent:
   inode no link.
 
 An op that pins on a verdict reads it before pinning, to know what to pin,
-and again under the pins. A live verdict cannot change under the pins: the
-inode is pinned, and no other name's removal can free it. A dead verdict
-whose gen the inode has passed cannot change either, because a gen never
-comes back. Only a record carrying a gen its inode has not reached could
-turn live, and no op writes one; if it happens, the op goes round again.
+and again under the pins, and goes round again if it changed. It can
+change between the two: where nlink undercounts the names (two records, one
+link), the other name's removal frees the inode and a create reuses it while
+the op waits for its pins; acting on the first verdict would take the new
+tenant's link (`fs_a_name_that_dies_before_its_pins_is_taken_as_dead`).
+Under the pins a verdict holds: a live name's inode is pinned, so no other
+name's removal can free it, and a dead name's gen never comes back. Only a
+record carrying a gen its inode has not reached could turn live, and no op
+writes one.
 
 The lockless lookup reads the record, then the inode, inside one EBR
 section. A free and reuse between the two reads makes the name read as
-dead, which orders the lookup after the name's removal.
+dead, which orders the lookup after the name's removal. That order exists
+because every removal drops the record before it frees the inode, a
+rename-over included: it drops the destination's record before installing
+the source's, so a lockless reader can find the destination briefly
+absent, and an exchange half done (`stm_dirent_swap_two`); Linux readers
+see neither. Only gen-less in-process callers reach the lockless readers; 9P's walk and readdir pass a gen and take the locked
+paths, which see neither.
 
 Tests (`tests/test_fs.c`): `fs_a_dead_name_is_absent_to_lookups`,
 `fs_a_dead_name_names_no_file`, `fs_a_dead_name_is_still_taken`,

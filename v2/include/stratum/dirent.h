@@ -330,7 +330,9 @@ stm_status stm_dirent_unlink(stm_dirent_index *idx,
  *
  * Atomicity: under the dirent-index mutex (the only lock dirent
  * primitives take), the two slot updates land in one critical
- * section — no observer can see a half-swapped state. When the
+ * section, so no reader that takes the mutex sees a half-swapped
+ * state. The lockless readers (stm_dirent_lookup_concurrent,
+ * stm_dirent_readdir_concurrent) do not take it and can. When the
  * second update fails, the first is put back. Only when that fails
  * too does the call return with the swap half done (dir1/name1
  * already names the second child, dir2/name2 still names it as

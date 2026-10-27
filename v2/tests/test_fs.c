@@ -13730,6 +13730,136 @@ STM_TEST(fs_a_dead_name_in_a_snapshot_is_absent) {
     dead_fix_close(&d);
 }
 
+/* A name that dies between an op's first read of it and the op's pins:
+ * where nlink undercounts the names (two records, one link), the other
+ * record's unlink frees the inode and a create reuses it while the op
+ * waits. The verdict read again under the pins sends the op round, and
+ * the tenant is never touched. */
+typedef struct {
+    stm_fs *fs;
+    uint64_t dir;            /* the other record's, and the tenant's */
+    bool armed;
+    uint64_t tenant;
+} dying_name;
+
+static void *dying_name_kill(void *arg)
+{
+    dying_name *k = arg;
+    STM_ASSERT_OK(stm_fs_unlink(k->fs, 1, k->dir, TXN_NAME("name1")));
+    STM_ASSERT_OK(stm_fs_create_file(k->fs, 1, k->dir, TXN_NAME("tenant"),
+                                     0644u, 0, 0, &k->tenant));
+    dead_fill(k->fs, k->tenant, 0x7E);
+    return NULL;
+}
+
+/* The hook may not call the fs, so a thread does while the op waits. */
+static void dying_name_hook(uint64_t dataset_id, void *arg)
+{
+    (void)dataset_id;
+    dying_name *k = arg;
+    if (!k->armed) return;
+    k->armed = false;
+    pthread_t th;
+    STM_ASSERT_EQ(pthread_create(&th, NULL, dying_name_kill, k), 0);
+    pthread_join(th, NULL);
+}
+
+typedef enum { DYING_UNLINK, DYING_RENAME_ONTO, DYING_RENAME_FROM } dying_op;
+
+static void dying_name_leg(dying_op op)
+{
+    static const char *const tag[] = { "dying_unlink", "dying_onto",
+                                       "dying_from" };
+    uint64_t dir = 0, d1 = 0, d2 = 0, c = 0, s2 = 0, got = 0;
+    stm_fs *fs = reuse_fs(tag[op], &dir);
+    if (!fs) return;
+    unsigned violations = stm_fs_txn_order_violations_for_test();
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, TXN_NAME("d1"), 0755u, 0, 0, &d1));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, TXN_NAME("d2"), 0755u, 0, 0, &d2));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, d2, TXN_NAME("src2"), 0644u, 0, 0,
+                                     &s2));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, d1, TXN_NAME("name1"), 0644u, 0,
+                                     0, &c));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, c, &v));
+    STM_ASSERT_OK(stm_dirent_alloc(stm_sync_dirent_index(stm_fs_sync(fs)), 1,
+                                   d2, TXN_NAME("name2"), c,
+                                   stm_load_le64(v.si_gen), STM_DT_REG));
+
+    dying_name k = { .fs = fs, .dir = d1, .armed = true };
+    stm_fs_set_name_read_hook_for_test(fs, dying_name_hook, &k);
+    stm_status rc = STM_EINVAL;
+    switch (op) {
+    case DYING_UNLINK:
+        rc = stm_fs_unlink(fs, 1, d2, TXN_NAME("name2"));
+        break;
+    case DYING_RENAME_ONTO:
+        rc = stm_fs_rename(fs, 1, d2, TXN_NAME("src2"), d2, TXN_NAME("name2"),
+                           0);
+        break;
+    case DYING_RENAME_FROM:
+        rc = stm_fs_rename(fs, 1, d2, TXN_NAME("name2"), d2, TXN_NAME("moved"),
+                           0);
+        break;
+    }
+    stm_fs_set_name_read_hook_for_test(fs, NULL, NULL);
+    STM_ASSERT_TRUE(!k.armed);
+    STM_ASSERT_EQ(k.tenant, c);              /* the ino came back */
+    if (op == DYING_RENAME_FROM) STM_ASSERT_ERR(rc, STM_ENOENT);
+    else STM_ASSERT_OK(rc);
+    dead_tenant_intact(fs, d1, "tenant", c, 0x7E);
+    switch (op) {
+    case DYING_UNLINK:
+        STM_ASSERT_TRUE(!dead_listed(fs, d2, "name2", NULL, NULL));
+        break;
+    case DYING_RENAME_ONTO:
+        STM_ASSERT_OK(stm_fs_lookup(fs, 1, d2, TXN_NAME("name2"), &got));
+        STM_ASSERT_EQ(got, s2);
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, s2, &v));
+        STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 1u);
+        STM_ASSERT_TRUE(!dead_listed(fs, d2, "src2", NULL, NULL));
+        break;
+    case DYING_RENAME_FROM:
+        STM_ASSERT_TRUE(dead_listed(fs, d2, "name2", NULL, NULL));
+        STM_ASSERT_TRUE(!dead_listed(fs, d2, "moved", NULL, NULL));
+        break;
+    }
+    STM_ASSERT_EQ(stm_fs_txn_order_violations_for_test(), violations);
+    reuse_fs_done(fs);
+}
+
+STM_TEST(fs_a_name_that_dies_before_its_pins_is_taken_as_dead) {
+    dying_name_leg(DYING_UNLINK);
+    dying_name_leg(DYING_RENAME_ONTO);
+    dying_name_leg(DYING_RENAME_FROM);
+}
+
+/* A dead source names no file even when its number now belongs to the
+ * link's destination directory. */
+STM_TEST(fs_a_link_from_a_dead_name_is_absent_whatever_its_ino_became) {
+    uint64_t dir = 0, a = 0, d = 0;
+    stm_fs *fs = reuse_fs("dead_link_dir", &dir);
+    if (!fs) return;
+    unsigned violations = stm_fs_txn_order_violations_for_test();
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, TXN_NAME("f1"), 0644u, 0, 0,
+                                     &a));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &v));
+    uint64_t old_gen = stm_load_le64(v.si_gen);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, TXN_NAME("f1")));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, dir, TXN_NAME("d"), 0755u, 0, 0, &d));
+    STM_ASSERT_EQ(d, a);
+    STM_ASSERT_OK(stm_dirent_alloc(stm_sync_dirent_index(stm_fs_sync(fs)), 1,
+                                   dir, TXN_NAME("old"), a, old_gen,
+                                   STM_DT_REG));
+    STM_ASSERT_ERR(stm_fs_link(fs, 1, dir, TXN_NAME("old"), d,
+                               TXN_NAME("x")),
+                   STM_ENOENT);
+    STM_ASSERT_TRUE(!dead_listed(fs, d, "x", NULL, NULL));
+    STM_ASSERT_EQ(stm_fs_txn_order_violations_for_test(), violations);
+    reuse_fs_done(fs);
+}
+
 /* The scrub's extent lookup holds no fs->global, so a rollback can retire a
  * dataset's engine while the lookup walks it: the walk's EBR pin is what
  * keeps the retired engine alive until the walk leaves. */

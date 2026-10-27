@@ -317,6 +317,8 @@ struct stm_fs {
     void *reclaim_hook_arg;
     stm_fs_fresh_pin_hook fresh_pin_hook;
     void *fresh_pin_hook_arg;
+    stm_fs_name_read_hook name_read_hook;
+    void *name_read_hook_arg;
 #endif
 };
 
@@ -516,6 +518,17 @@ static void fs_step_gap(stm_fs *fs, uint64_t dataset_id, uint64_t ino)
         fs->step_gap_hook(dataset_id, ino, fs->step_gap_hook_arg);
 #else
     (void)fs; (void)dataset_id; (void)ino;
+#endif
+}
+
+/* Between a name op's read of its names and its pins (fs_testing.h). */
+static void fs_name_read_gap(stm_fs *fs, uint64_t dataset_id)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->name_read_hook)
+        fs->name_read_hook(dataset_id, fs->name_read_hook_arg);
+#else
+    (void)fs; (void)dataset_id;
 #endif
 }
 
@@ -3168,11 +3181,12 @@ static stm_status fs_load_parent_dir_concurrent(stm_inode_index *iidx,
  * a rename onto it replaces only its record, and the inode's current
  * tenant, if any, is never touched. It is still an entry, as a dangling
  * symlink is: a create or a NOREPLACE rename onto it finds the name
- * taken. Under the parent's pin a live verdict holds (the inode is not
- * freed while the name links it), and so does a dead one whose gen the
- * inode has passed (no gen comes back); a caller that pinned on a
- * verdict checks it again under its pins. On a live name *out_iv (when
- * not NULL) is its inode. */
+ * taken. A verdict read before the pins can change before they are
+ * taken: where nlink undercounts the names, another name's removal can
+ * free the inode and a create reuse it. So a caller that pinned on a
+ * verdict checks it again under its pins, where it holds (a live name's
+ * inode is pinned; a dead one's gen never comes back). On a live name
+ * *out_iv (when not NULL) is its inode. */
 static stm_status fs_name_live_locked(stm_inode_index *iidx,
                                       uint64_t dataset_id, uint64_t ino,
                                       uint64_t child_gen, bool *out_live,
@@ -3446,6 +3460,13 @@ void stm_fs_set_reclaim_hook_for_test(stm_fs *fs, stm_fs_reclaim_hook fn,
 {
     fs->reclaim_hook = fn;
     fs->reclaim_hook_arg = arg;
+}
+
+void stm_fs_set_name_read_hook_for_test(stm_fs *fs, stm_fs_name_read_hook fn,
+                                        void *arg)
+{
+    fs->name_read_hook = fn;
+    fs->name_read_hook_arg = arg;
 }
 
 void stm_fs_set_fresh_pin_hook_for_test(stm_fs *fs, stm_fs_fresh_pin_hook fn,
@@ -4472,6 +4493,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
             return fs_refuse_unlock(fs, dataset_id, parent_ino, gen,
                                     parent_ino, NULL, ds);
 
+        fs_name_read_gap(fs, dataset_id);
         /* Pin parent + child in ascending (ds, ino) order. A dead name's
          * inode is not its own (it may be freed), so only the parent. */
         stm_status ps = live
@@ -5073,6 +5095,15 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
             fs_txn_unlock_global(fs, &tx);
             return ds;     /* STM_ENOENT if src not linked */
         }
+        /* A dead source names no file, whatever its number now is. */
+        bool live = false;
+        stm_status lv = fs_name_live_locked(iidx, dataset_id, observed_child,
+                                            observed_gen, &live, NULL);
+        if (lv == STM_OK && !live) lv = STM_ENOENT;
+        if (lv != STM_OK) {
+            fs_txn_unlock_global(fs, &tx);
+            return lv;
+        }
         /* Degenerate self-link case (covered by EPERM below since src
          * would have to be a dir for src == dst_parent_ino to hold —
          * S_IFDIR refuses regardless). Refuse early so pin_two doesn't
@@ -5130,10 +5161,9 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
             return dp_chk;
         }
 
-        /* Under the child's pin: a dead source names no file. */
-        bool live = false;
-        stm_status lv = fs_name_live_locked(iidx, dataset_id, observed_child,
-                                            observed_gen, &live, NULL);
+        /* Again under the child's pin: the name may have died since. */
+        lv = fs_name_live_locked(iidx, dataset_id, observed_child,
+                                 observed_gen, &live, NULL);
         if (lv == STM_OK && !live) lv = STM_ENOENT;
         if (lv != STM_OK) {
             stm_inode_unpin(iidx, h_child);
@@ -6451,6 +6481,7 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             }
         }
 
+        fs_name_read_gap(fs, dataset_id);
         stm_inode_handle *new_handles[4] = {0};
         stm_status pp = stm_inode_pin_many(iidx, reqs, n_reqs, new_handles);
         if (pp == STM_ENOENT) {

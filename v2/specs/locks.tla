@@ -15,8 +15,8 @@
 \* OwnLocksNeverRefuse (an owner may stack or upgrade over its own
 \* ranges), DifferentInosNeverInteract (a lock on one inode never
 \* refuses an acquire on another), and the action property
-\* DropsAreReleases (a step removes exactly the locks of one Release
-\* or one ReleaseOwner, and nothing else).
+\* DropsAreReleases (a step removes exactly the locks the Release or
+\* ReleaseOwner it took names, and an Acquire removes none).
 \*
 \* MVP scope:
 \*   - Non-blocking acquire ONLY (Linux F_SETLK shape; F_SETLKW
@@ -60,7 +60,7 @@
 \*       incarnation of the same number). Fires
 \*       DifferentInosNeverInteract after one acquire.
 \*
-\* Two more change Release. No invariant can see them, since a removal
+\* Three more change Release. No invariant can see them, since a removal
 \* never makes a conflict, so the action property DropsAreReleases
 \* judges them:
 \*
@@ -73,6 +73,12 @@
 \*       Release drops the owner's matching range on every inode.
 \*       Fires DropsAreReleases once an owner holds the range on two
 \*       inodes and some other lock besides.
+\*
+\*   BuggyReleaseDropsNothing
+\*       Release leaves every lock in place. Fires DropsAreReleases at
+\*       the first release of a held lock: without `last` that step
+\*       would stutter on `locks`, and no property over `locks` alone
+\*       could judge it.
 
 EXTENDS Integers, FiniteSets, TLC
 
@@ -84,7 +90,8 @@ CONSTANTS
     BuggyShared_Excl_Granted,
     BuggyInoBlind,
     BuggyReleaseOwnerBlind,
-    BuggyReleaseInoBlind
+    BuggyReleaseInoBlind,
+    BuggyReleaseDropsNothing
 
 ASSUME /\ Inos # {}
        /\ Owners # {}
@@ -94,6 +101,7 @@ ASSUME /\ Inos # {}
        /\ BuggyInoBlind \in BOOLEAN
        /\ BuggyReleaseOwnerBlind \in BOOLEAN
        /\ BuggyReleaseInoBlind \in BOOLEAN
+       /\ BuggyReleaseDropsNothing \in BOOLEAN
 
 LockTypes == {"shared", "exclusive"}
 Offsets   == 0..MaxOff
@@ -103,9 +111,13 @@ LockRec ==
     [ino: Inos, owner: Owners, type: LockTypes,
      off: Offsets, len: Lengths]
 
-VARIABLES locks  \* SUBSET LockRec — currently held lock records
+VARIABLES locks,  \* SUBSET LockRec — currently held lock records
+          last    \* the action the last step took, with its arguments
 
-Init == locks = {}
+vars == <<locks, last>>
+
+Init == /\ locks = {}
+        /\ last = <<"init">>
 
 \* Two byte ranges overlap iff their intervals' open intersection
 \* is non-empty.
@@ -149,6 +161,7 @@ Acquire(ino, owner, type, off, len) ==
        IN
         /\ ~ \E other \in locks : AcquireRefuses(cand, other)
         /\ locks' = locks \cup {cand}
+        /\ last' = <<"acquire">>
 
 \* Release — exact-match removal: every lock of the owner on that
 \* range of that ino goes, whatever its type. Callers pass the same
@@ -172,7 +185,9 @@ ReleaseMatches(l, ino, owner, off, len) ==
 Release(ino, owner, off, len) ==
     /\ ino \in Inos /\ owner \in Owners
     /\ off \in Offsets /\ len \in Lengths
-    /\ locks' = { l \in locks : ~ReleaseMatches(l, ino, owner, off, len) }
+    /\ locks' = IF BuggyReleaseDropsNothing THEN locks
+                ELSE { l \in locks : ~ReleaseMatches(l, ino, owner, off, len) }
+    /\ last' = <<"release", ino, owner, off, len>>
 
 \* ReleaseOwner — drop every lock held by the owner. Models the
 \* post-close cleanup pattern (Linux: when an FD owning OFD locks
@@ -180,6 +195,7 @@ Release(ino, owner, off, len) ==
 ReleaseOwner(owner) ==
     /\ owner \in Owners
     /\ locks' = { l \in locks : l.owner /= owner }
+    /\ last' = <<"owner", owner>>
 
 Next ==
     \/ \E ino \in Inos, owner \in Owners, type \in LockTypes,
@@ -190,13 +206,18 @@ Next ==
             Release(ino, owner, off, len)
     \/ \E owner \in Owners : ReleaseOwner(owner)
 
-Spec == Init /\ [][Next]_locks
+Spec == Init /\ [][Next]_vars
 
 \* --------------------------------------------------------------------------
 \* Invariants.
 \* --------------------------------------------------------------------------
 
-TypeOK == locks \subseteq LockRec
+TypeOK ==
+    /\ locks \subseteq LockRec
+    /\ \/ last \in {<<"init">>, <<"acquire">>}
+       \/ \E i \in Inos, o \in Owners, f \in Offsets, n \in Lengths :
+             last = <<"release", i, o, f, n>>
+       \/ \E o \in Owners : last = <<"owner", o>>
 
 \* HEADLINE: no two CONFLICTING locks ever coexist.
 NoConflictingLocks ==
@@ -245,17 +266,20 @@ Invariants ==
 \* Action property.
 \* --------------------------------------------------------------------------
 
-\* A step drops nothing, or exactly the locks of one Release (every lock
-\* of one owner on one range of one ino) or of one ReleaseOwner (every
-\* lock of one owner). The invariants above cannot see a removal that
-\* goes too far; this does.
+\* A step drops exactly what the action it took names: every lock of the
+\* owner on that range of that ino for a Release, every lock of the owner
+\* for a ReleaseOwner, none for an Acquire. `last` names the action, so a
+\* Release that drops another range, or nothing, is a step judged here,
+\* not a stutter. The invariants above cannot see a removal at all.
 DropsAreReleases ==
     [][ LET gone == locks \ locks' IN
-        \/ gone = {}
-        \/ \E o \in Owners :
-              \/ gone = { l \in locks : l.owner = o }
-              \/ \E i \in Inos, f \in Offsets, n \in Lengths :
-                    gone = { l \in locks : /\ l.ino = i /\ l.owner = o
-                                            /\ l.off = f /\ l.len = n } ]_locks
+        CASE last'[1] = "release" ->
+                gone = { l \in locks : /\ l.ino = last'[2]
+                                       /\ l.owner = last'[3]
+                                       /\ l.off = last'[4]
+                                       /\ l.len = last'[5] }
+          [] last'[1] = "owner" ->
+                gone = { l \in locks : l.owner = last'[2] }
+          [] OTHER -> gone = {} ]_vars
 
 =============================================================================
