@@ -12718,6 +12718,333 @@ STM_TEST(fs_a_reclaim_commit_waits_for_a_rename_between_its_steps) {
     unlink(g_key_path);
 }
 
+/* The same for the data ops whose extent change and inode update are two
+ * steps: a writer's ENOSPC reclaim commit, started between them, waits
+ * until the op is done, so a crash right after that commit finds the op
+ * whole, and leaves no extent the inode does not know for a later grow to
+ * read back. Each leg runs on a near-full pool: a spare is freed for the
+ * op's own allocation, and the writer's 1 MiB fits only by reclaiming. */
+typedef enum {
+    MO_INSERT, MO_COLLAPSE, MO_ZERO_GROW, MO_SHRINK, MO_CUTOVER, MO_REFLINK,
+    MO_TRANSITION, MO_DIRECT
+} mid_op_kind;
+
+static const char *const mid_op_name[] = {
+    "insert", "collapse", "zero_grow", "shrink", "cutover", "reflink",
+    "transition", "direct"
+};
+
+static void mid_op_put(stm_fs *fs, uint64_t ino, uint64_t off, uint64_t len,
+                       uint8_t byte)
+{
+    uint8_t *b = malloc((size_t)len);
+    memset(b, byte, (size_t)len);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, off, b, (size_t)len));
+    free(b);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+}
+
+static uint8_t mid_op_byte(stm_fs *fs, uint64_t ino, uint64_t off)
+{
+    uint8_t b[16] = {0};
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, ino, off, b, sizeof b, &n));
+    STM_ASSERT_TRUE(n > 0u);
+    return b[0];
+}
+
+static uint64_t mid_op_size(stm_fs *fs, uint64_t ino)
+{
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    return stm_load_le64(v.si_size);
+}
+
+/* Fill the pool through f until no block is free. */
+static void mid_op_fill(stm_fs *fs, uint64_t f)
+{
+    uint8_t *buf = malloc(LATE_WRITE_BYTES);
+    memset(buf, 0x77, LATE_WRITE_BYTES);
+    uint64_t off = 0;
+    for (size_t chunk = LATE_WRITE_BYTES; chunk >= 4096u; chunk /= 16u) {
+        for (;;) {
+            stm_status ws = stm_fs_write(fs, 1, f, off, buf, chunk);
+            if (ws != STM_OK) { STM_ASSERT_ERR(ws, STM_ENOSPC); break; }
+            off += chunk;
+        }
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+    free(buf);
+}
+
+typedef struct {
+    mid_rename_writer *w;
+    uint64_t ino;           /* the op's; the writer's own write passes too */
+} mid_op_ctx;
+
+/* The premise below asks for the writer's reclaim; the op's own would
+ * answer for it, so none may come first. */
+static void mid_op_gap(uint64_t dataset_id, uint64_t ino, void *arg)
+{
+    mid_op_ctx *m = arg;
+    if (ino != m->ino) return;
+    pthread_mutex_lock(&m->w->mu);
+    bool early = m->w->reclaiming;
+    pthread_mutex_unlock(&m->w->mu);
+    STM_ASSERT_TRUE(!early);
+    mid_rename_start(dataset_id, ino, m->w);
+}
+
+static void mid_op_leg(mid_op_kind k)
+{
+    const uint64_t KIB = 1024u, MIB = 1024u * 1024u;
+    make_tmp(mid_op_name[k]);
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 32u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, x = 0, y = 0, c = 0, d = 0, f = 0, sp = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                     0644u, 0, 0, &x));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"y", 1,
+                                     0644u, 0, 0, &y));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1,
+                                     0644u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"d", 1,
+                                     0644u, 0, 0, &d));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"s", 1,
+                                     0644u, 0, 0, &sp));
+    switch (k) {
+    case MO_INSERT:
+        mid_op_put(fs, x, 0, MIB, 0xAB);
+        break;
+    case MO_COLLAPSE:              /* a 256 KiB hole before the data */
+        mid_op_put(fs, x, 0, 256u * KIB, 0xAB);
+        STM_ASSERT_OK(stm_fs_fallocate(fs, 1, x, 0, 256u * KIB,
+                                       STM_FS_FALLOC_FL_INSERT_RANGE));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        break;
+    case MO_ZERO_GROW:
+    case MO_SHRINK:                /* two extents meeting at 512 KiB */
+        mid_op_put(fs, x, 0, 512u * KIB, 0xAB);
+        mid_op_put(fs, x, 512u * KIB, 512u * KIB, 0xAB);
+        break;
+    case MO_CUTOVER: {             /* inline */
+        STM_ASSERT_OK(stm_fs_write(fs, 1, x, 0, "0123456789", 10));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        break;
+    }
+    case MO_REFLINK:               /* x empty; y the source */
+        mid_op_put(fs, y, 0, MIB, 0xCD);
+        break;
+    case MO_TRANSITION:            /* x empty and inline */
+        break;
+    case MO_DIRECT:                /* one block of extent */
+        mid_op_put(fs, x, 0, 4096u, 0xAB);
+        break;
+    }
+    uint64_t spare = 64u * KIB;
+    if (k == MO_TRANSITION || k == MO_DIRECT) spare += MIB;
+    uint8_t *big = malloc(MIB);
+    memset(big, 0xEE, MIB);
+    mid_op_put(fs, d, 0, MIB, 0x5A);
+    mid_op_put(fs, sp, 0, spare, 0x5A);
+    mid_op_fill(fs, f);
+    /* the spare is free for the op; d's blocks only for a reclaim */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"d", 1));
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.data_pending_blocks > 0u);
+
+    mid_rename_writer w = { .fs = fs, .ino = c, .rc = STM_EINVAL,
+                            .armed = true };
+    pthread_mutex_init(&w.mu, NULL);
+    pthread_cond_init(&w.cv, NULL);
+    stm_fs_set_reclaim_hook_for_test(fs, mid_rename_reclaim, &w);
+    mid_op_ctx m = { .w = &w, .ino = x };
+    stm_fs_set_step_gap_hook_for_test(fs, mid_op_gap, &m);
+    unsigned violations = stm_fs_txn_order_violations_for_test();
+    stm_status os = STM_EINVAL;
+    switch (k) {
+    case MO_INSERT:
+        os = stm_fs_fallocate(fs, 1, x, 0, 4096u,
+                              STM_FS_FALLOC_FL_INSERT_RANGE);
+        break;
+    case MO_COLLAPSE:
+        os = stm_fs_fallocate(fs, 1, x, 0, 256u * KIB,
+                              STM_FS_FALLOC_FL_COLLAPSE_RANGE);
+        break;
+    case MO_ZERO_GROW:
+        os = stm_fs_fallocate(fs, 1, x, 512u * KIB, MIB,
+                              STM_FS_FALLOC_FL_ZERO_RANGE);
+        break;
+    case MO_SHRINK:
+        os = stm_fs_truncate(fs, 1, x, 512u * KIB);
+        break;
+    case MO_CUTOVER:
+        os = stm_fs_truncate(fs, 1, x, MIB);
+        break;
+    case MO_REFLINK:
+        os = stm_fs_reflink(fs, 1, y, 1, x);
+        break;
+    case MO_TRANSITION:
+        os = stm_fs_write(fs, 1, x, 0, big, MIB);
+        break;
+    case MO_DIRECT:
+        os = stm_fs_write(fs, 1, x, MIB, big, MIB);
+        break;
+    }
+    free(big);
+    STM_ASSERT_OK(os);
+    if (w.spawned) pthread_join(w.th, NULL);
+    stm_fs_set_step_gap_hook_for_test(fs, NULL, NULL);
+    stm_fs_set_reclaim_hook_for_test(fs, NULL, NULL);
+    pthread_cond_destroy(&w.cv);
+    pthread_mutex_destroy(&w.mu);
+
+    /* The premise: the writer asked for the commit lock mid-op, and its
+     * reclaim, run after the op, made the room it needed. */
+    STM_ASSERT_TRUE(w.spawned);
+    STM_ASSERT_TRUE(w.reclaiming);
+    STM_ASSERT_TRUE(w.locked);
+    STM_ASSERT_TRUE(!w.committed_mid_rename);
+    STM_ASSERT_OK(w.rc);
+    STM_ASSERT_EQ(stm_fs_txn_order_violations_for_test(), violations);
+
+    /* A crash now: the image is the reclaim's commit, after the op. */
+    stm_fs_mark_wedged(fs);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    switch (k) {
+    case MO_INSERT:
+        STM_ASSERT_EQ(mid_op_size(fs, x), MIB + 4096u);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 0), 0x00);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, MIB), 0xAB);
+        break;
+    case MO_COLLAPSE:
+        STM_ASSERT_EQ(mid_op_size(fs, x), 256u * KIB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 0), 0xAB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 256u * KIB - 16u), 0xAB);
+        break;
+    case MO_ZERO_GROW:
+        STM_ASSERT_EQ(mid_op_size(fs, x), 512u * KIB + MIB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 0), 0xAB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 512u * KIB), 0x00);
+        break;
+    case MO_SHRINK:
+        STM_ASSERT_EQ(mid_op_size(fs, x), 512u * KIB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 0), 0xAB);
+        break;
+    case MO_CUTOVER:
+    case MO_REFLINK:
+        STM_ASSERT_EQ(mid_op_size(fs, x), MIB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 0), k == MO_CUTOVER ? '0' : 0xCD);
+        break;
+    case MO_TRANSITION:
+        STM_ASSERT_EQ(mid_op_size(fs, x), MIB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, MIB - 16u), 0xEE);
+        break;
+    case MO_DIRECT:
+        STM_ASSERT_EQ(mid_op_size(fs, x), 2u * MIB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, 0), 0xAB);
+        STM_ASSERT_EQ(mid_op_byte(fs, x, MIB), 0xEE);
+        break;
+    }
+    /* What a cut and a grow expose must be zeros, not an extent the
+     * crash left behind the inode's back. */
+    if (k == MO_CUTOVER || k == MO_TRANSITION || k == MO_DIRECT) {
+        uint64_t keep = k == MO_DIRECT ? 4096u : 0u;
+        uint64_t at = k == MO_DIRECT ? MIB : 0u;
+        STM_ASSERT_OK(stm_fs_truncate(fs, 1, x, keep));
+        STM_ASSERT_OK(stm_fs_truncate(fs, 1, x, 2u * MIB));
+        STM_ASSERT_EQ(mid_op_byte(fs, x, at), 0x00);
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_a_reclaim_commit_waits_for_a_data_op_between_its_steps) {
+    mid_op_leg(MO_INSERT);
+    mid_op_leg(MO_COLLAPSE);
+    mid_op_leg(MO_ZERO_GROW);
+    mid_op_leg(MO_SHRINK);
+    mid_op_leg(MO_CUTOVER);
+    mid_op_leg(MO_REFLINK);
+    mid_op_leg(MO_TRANSITION);
+    mid_op_leg(MO_DIRECT);
+}
+
+static void mid_op_count_reclaim(bool locked, void *arg)
+{
+    if (locked) ++*(unsigned *)arg;
+}
+
+/* A truncate that must reclaim before it can move an inline file to
+ * extents leaves its span for the reclaim, whose commit waits for every
+ * span, its own included. */
+STM_TEST(fs_a_truncate_that_reclaims_moves_an_inline_file_whole) {
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp("trunc_reclaim");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 32u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, x = 0, d = 0, f = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                     0644u, 0, 0, &x));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"d", 1,
+                                     0644u, 0, 0, &d));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, x, 0, "0123456789", 10));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    mid_op_put(fs, d, 0, MIB, 0x5A);
+    mid_op_fill(fs, f);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"d", 1));
+
+    unsigned reclaims = 0;
+    unsigned violations = stm_fs_txn_order_violations_for_test();
+    stm_fs_set_reclaim_hook_for_test(fs, mid_op_count_reclaim, &reclaims);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, x, MIB));
+    stm_fs_set_reclaim_hook_for_test(fs, NULL, NULL);
+    STM_ASSERT_TRUE(reclaims > 0u);
+    STM_ASSERT_EQ(stm_fs_txn_order_violations_for_test(), violations);
+    STM_ASSERT_EQ(mid_op_size(fs, x), MIB);
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 0), '0');
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_EQ(mid_op_size(fs, x), MIB);
+    STM_ASSERT_EQ(mid_op_byte(fs, x, 0), '0');
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 #define TXN_NAME(lit) (const uint8_t *)(lit), (uint8_t)(sizeof(lit) - 1u)
 
 /* Every namespace op, its refusals included, keeps the order its span

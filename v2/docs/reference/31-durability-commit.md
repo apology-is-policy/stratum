@@ -196,10 +196,11 @@ generation — aligned with every other lazy-durable mutation and with 31.2.1's
 double-commit runs under whatever `fs->global` mode the reserving op holds (SH
 for the per-inode write/truncate/migrate/promote paths, EX for commit). Under
 SH it runs beside other ops, so it first takes `fs->txn` EX, which waits for
-every buffered writer's {insert; iset} span and every namespace op's mutations
-to finish and holds off new ones (29-concurrency.md section 29.6): its commit
-lands between two ops' steps, never inside one, so a rename it races is
-durable whole or not at all. Design: `docs/cf-4c-design.md`. SOTA parallels:
+every writer's {insert or extent; iset} span, every namespace op's mutations
+and every data op's extent change + inode update to finish and holds off new
+ones (29-concurrency.md section 29.6): its commit lands between two ops'
+steps, never inside one, so a rename or an insert range it races is durable
+whole or not at all. Design: `docs/cf-4c-design.md`. SOTA parallels:
 Btrfs pinned-extents + delayed-refs + `flush_space`→`COMMIT_TRANS`; ZFS
 `ms_defer` 2-txg deferral + `async_destroy`; WAFL consistency-point deferral.
 

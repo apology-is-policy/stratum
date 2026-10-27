@@ -126,8 +126,9 @@ fs->global                  (rwlock; EX compound, SH per-inode + reads;
                              extent-read side; glibc slots init
                              PREFER_WRITER_NONRECURSIVE)
    -> fs->txn               (rwlock, writer-preference like fs->global; SH
-                             spans: a buffered writer's {insert; iset} and
-                             a namespace op's mutations; EX: the ENOSPC
+                             spans: a writer's {insert or extent; iset},
+                             a namespace op's mutations and a data op's
+                             extent change + inode update; EX: the ENOSPC
                              reclaim's drain->commit; section 29.6)
    -> subsystem idx->lock   (inode idx->lock -> dataset idx->lock; R175 SA-3)
    -> engine serial_mu      (serial APIs + serial scans + the mini's trylock)
@@ -155,8 +156,8 @@ the one-in-flight `bdev d->lock` (invariant B-2). Deadlock-avoidance rules:
   order, with `stm_inode_pin_try`; on a held lock it leaves its span and
   the parent, pins both in order, re-checks the parent (its gen and that
   it is still a directory) and starts a new span (`fs_txn_pin_fresh`).
-  Hooks builds count every breach, and every namespace mutation made
-  outside a span (`stm_fs_txn_order_violations_for_test`).
+  Hooks builds count every breach, and every namespace or range mutation
+  made outside a span (`stm_fs_txn_order_violations_for_test`).
 - Dirty-buffer drain callbacks run under `buf->mu`; no re-entry.
 - `serial_mu -> commit_mu` (engine_internal.h:631, R170 P3-2); the mini
   realizes it via **trylock** only, so it bails rather than blocks.
@@ -192,7 +193,23 @@ its first mutation to its release of `fs->global`, so that commit lands
 before the op or after it, never between its steps. The one exception is a
 create that must wait for its new inode's pin (section 29.5): it leaves its
 span while it waits, and a commit then finds the new inode allocated with no
-name, which a crash leaves leaked (unreferenced, not corrupt). Since CF-1 chunk 10, the mutators' metadata funnels are
+name, which a crash leaves leaked (unreferenced, not corrupt).
+
+The data ops whose extent change and inode update are two steps hold a span
+the same way: fallocate's punch, zero, collapse and insert range, a truncate
+that cuts an extent file or moves an inline file to extents, and a reflink
+(which also serves copy_file_range's whole-file path). A write that puts its
+bytes straight into an extent (an inline file's first large write, or any
+write of 1 MiB or more) holds its span from the extent to the size update, as
+a buffered write does from its insert. A commit between the steps would leave
+an insert's shifted tail past the old size, a cut file at its old size, or
+an extent under an inode that does not know it, which a later grow reads
+back as the file's content. A truncate whose inline-to-extent move must
+reclaim to write its prefix leaves its span for the reclaim, whose commit
+waits for every span, before it has changed anything
+(`fs_a_reclaim_commit_waits_for_a_data_op_between_its_steps`).
+
+Since CF-1 chunk 10, the mutators' metadata funnels are
 `_concurrent` (CAS-prepend) under those pins, so two mutators on DISTINCT
 inodes no longer serialize on the metadata index either.
 

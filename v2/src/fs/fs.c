@@ -183,15 +183,20 @@ struct stm_fs {
     /* The transaction lock: what the reclaim-on-ENOSPC commit family,
      * the only committer that runs under fs->global SH, waits for
      * (stm_fs_commit / snapshot / unmount hold EX, which excludes every
-     * SH op wholesale). Two kinds of span hold it SHARED, each a run of
+     * SH op wholesale). Three kinds of span hold it SHARED, each a run of
      * steps no commit may land inside:
-     *   - a buffered writer's {dirty-buffer insert; inode iset} two-step
-     *     (C-2-F2-audit R2-F1; both the transition and buffered arms,
-     *     released across the ENOSPC dance): inside it a commit makes
-     *     the kind=EXTENT flip durable WITHOUT its RAM-only bytes;
+     *   - a writer's {dirty-buffer insert or extent write; inode iset}
+     *     two-step (C-2-F2-audit R2-F1; the transition, buffered and
+     *     direct arms, released across the ENOSPC dance): inside it a
+     *     commit makes the kind=EXTENT flip durable WITHOUT its RAM-only
+     *     bytes, or an extent durable that the inode does not know;
      *   - a namespace op's mutations, from its first to the release of
      *     fs->global (fs_txn): inside them a commit makes a half-done
-     *     create, link, unlink or rename durable.
+     *     create, link, unlink or rename durable;
+     *   - a data op's extent change and the inode update that completes
+     *     it (fallocate's range ops, truncate, reflink; fs_txn): inside
+     *     them a commit makes shifted, cut or shared extents durable
+     *     under the old size or kind.
      * Reclaim WRLOCKs its whole drain->commit sequence. Order:
      * fs->global -> per-inode pin -> txn -> dbuf->mu -> sync locks. No
      * span waits for a pin (a pinned writer waits for txn, and the lock
@@ -294,6 +299,8 @@ struct stm_fs {
     stm_status reuse_drop_fail_next;
     stm_fs_free_cleanup_hook free_cleanup_hook;
     void *free_cleanup_hook_arg;
+    stm_fs_step_gap_hook step_gap_hook;
+    void *step_gap_hook_arg;
     stm_fs_xattr_read_gap_hook xattr_read_gap_hook;
     void *xattr_read_gap_hook_arg;
     bool name_to_handle_locked_only;
@@ -382,8 +389,9 @@ static void fs_mark_wedged_locked(stm_fs *fs)
     stm_sync_mark_wedged(fs->sync);
 }
 
-/* A namespace op's span of fs->txn: begun just before its first mutation,
- * after its last blocking pin, and ended where it drops fs->global, so a
+/* A namespace or data op's span of fs->txn: begun just before its first
+ * mutation, after its last blocking pin, and ended where it drops
+ * fs->global (or, for a reflink, where its inode update is done), so a
  * reclaim commit lands before the op's mutations or after them. Every
  * fs->global release in such an op goes through fs_txn_unlock_global,
  * whether or not the span began. */
@@ -394,7 +402,7 @@ typedef struct {
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 /* The order fs->txn rests on, counted where the tests can see it: the
  * spans this thread holds, every blocking pin or span taken inside one,
- * and every namespace mutation made outside one (process-wide). */
+ * and every namespace or range mutation made outside one (process-wide). */
 static _Thread_local unsigned fs_txn_depth_here;
 static atomic_uint fs_txn_order_violations;
 
@@ -428,7 +436,9 @@ unsigned stm_fs_txn_order_violations_for_test(void)
 #define stm_inode_pin_many(...) \
     (fs_txn_note_take(), stm_inode_pin_many(__VA_ARGS__))
 
-/* Every namespace mutation below is counted when no span covers it. */
+/* Every namespace or range mutation below is counted when no span covers
+ * it. stm_sync_write_extent is not: most of its callers, a flush or the
+ * EX write path, need no span. */
 #define stm_dirent_alloc(...) \
     (fs_txn_note_mutation(), stm_dirent_alloc(__VA_ARGS__))
 #define stm_dirent_unlink(...) \
@@ -451,6 +461,14 @@ unsigned stm_fs_txn_order_violations_for_test(void)
     (fs_txn_note_mutation(), stm_inode_unlink(__VA_ARGS__))
 #define stm_inode_materialize(...) \
     (fs_txn_note_mutation(), stm_inode_materialize(__VA_ARGS__))
+#define stm_sync_punch_range(...) \
+    (fs_txn_note_mutation(), stm_sync_punch_range(__VA_ARGS__))
+#define stm_extent_shift_range_keys(...) \
+    (fs_txn_note_mutation(), stm_extent_shift_range_keys(__VA_ARGS__))
+#define stm_sync_truncate(...) \
+    (fs_txn_note_mutation(), stm_sync_truncate(__VA_ARGS__))
+#define stm_sync_reflink(...) \
+    (fs_txn_note_mutation(), stm_sync_reflink(__VA_ARGS__))
 #endif
 
 static void fs_txn_rd(stm_fs *fs)
@@ -487,6 +505,18 @@ static void fs_txn_unlock_global(stm_fs *fs, fs_txn *tx)
 {
     fs_txn_end(fs, tx);
     pthread_rwlock_unlock(&fs->global);
+}
+
+/* Between a data op's first change and the inode update that completes
+ * it (fs_testing.h). */
+static void fs_step_gap(stm_fs *fs, uint64_t dataset_id, uint64_t ino)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->step_gap_hook)
+        fs->step_gap_hook(dataset_id, ino, fs->step_gap_hook_arg);
+#else
+    (void)fs; (void)dataset_id; (void)ino;
+#endif
 }
 
 static void fs_fresh_pin_event(stm_fs *fs, uint64_t ino, bool busy)
@@ -2331,28 +2361,23 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * straight to the extent layer (buffering it whole would eat the
          * per-inode cap + widen the undrained window for no measured need;
          * the 587 measured transitions are all small). */
-        /* R2-F1: the {insert; iset} two-step below must be atomic vs the
-         * reclaim commit family -- RDLOCK txn across it (reclaim
-         * WRLOCKs its drain->commit sequence). The sync-write fallback
-         * needs no lock: extent-before-iset is commit-consistent by
-         * construction (the pre-F2 order). */
+        /* R2-F1: the {insert or extent write; iset} two-step below must be
+         * atomic vs the reclaim commit family -- RDLOCK txn across it
+         * (reclaim WRLOCKs its drain->commit sequence). A commit between
+         * the fallback's extent and the kind flip would leave an extent
+         * under an INLINE inode, which a later truncate to 0 and back up
+         * reads as the file's content. */
         stm_status fs1 = STM_ENOSPC;
-        bool txn_held = false;
+        fs_txn_rd(fs);
         if (aligned_size < (uint64_t)STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
             uint64_t tr_freeb = fs->alloc
                 ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
-            fs_txn_rd(fs);
-            txn_held = true;
             fs1 = stm_dirty_buffer_insert_bounded(fs->dirty_buffer,
                                         ds, ino, /*off=*/0u,
                                         (uint64_t)aligned_size, combined,
                                         tr_freeb);
         }
         if (fs1 != STM_OK) {
-            if (txn_held) {
-                fs_txn_rd_end(fs);
-                txn_held = false;
-            }
             /* Fallback: the pre-F2 synchronous extent write. */
             fs1 = stm_sync_write_extent(fs->sync, ds, ino,
                                             /*off=*/0u,
@@ -2360,7 +2385,11 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                                             (size_t)aligned_size);
         }
         free(combined);
-        if (fs1 != STM_OK) return fs1;
+        if (fs1 != STM_OK) {
+            fs_txn_rd_end(fs);
+            return fs1;
+        }
+        fs_step_gap(fs, ds, ino);
 
         /* Flip kind = EXTENT. The si_size stays at the LOGICAL value
          * (new_size, not the block-padded aligned_size) so reads past
@@ -2398,8 +2427,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * (an orphan extent = space-only). */
             if (trs != STM_OK)
                 stm_dirty_buffer_drop_ino(fs->dirty_buffer, ds, ino);
-            if (txn_held)
-                fs_txn_rd_end(fs);
+            fs_txn_rd_end(fs);
             return trs;
         }
     }
@@ -2480,9 +2508,18 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * the just-written direct extent. */
             stm_status fr = fs_flush_ino_locked(fs, ds, ino);
             if (fr != STM_OK) return fr;
+            /* R2-F1 as above: a commit between the extent and the size
+             * update below would leave bytes past the old EOF, which a
+             * later grow reads as the file's content. */
+            fs_txn_rd(fs);
+            wb_txn_held = true;
             stm_status ws = fs_write_extent_aligned_locked(fs, ds, ino,
                                                                 off, buf, len);
-            if (ws != STM_OK) return ws;
+            if (ws != STM_OK) {
+                fs_txn_rd_end(fs);
+                return ws;
+            }
+            fs_step_gap(fs, ds, ino);
         }
         /* Size + timestamp update — common to both buffered and direct
          * paths. The buffered write's bytes aren't on-disk yet, but
@@ -3348,6 +3385,13 @@ void stm_fs_fail_next_name_back_for_test(stm_fs *fs, stm_status fail)
 void stm_fs_fail_next_reused_ino_drop_for_test(stm_fs *fs, stm_status fail)
 {
     fs->reuse_drop_fail_next = fail;
+}
+
+void stm_fs_set_step_gap_hook_for_test(stm_fs *fs, stm_fs_step_gap_hook fn,
+                                       void *arg)
+{
+    fs->step_gap_hook = fn;
+    fs->step_gap_hook_arg = arg;
 }
 
 void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
@@ -5589,6 +5633,7 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * inode index is required (legacy direct-extent inodes can't be
      * truncated — they have no si_size to update). On STM_ENOENT from
      * pin, surface ENOENT (preserves the pre-impl-5 contract). */
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
@@ -5669,6 +5714,11 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
     uint8_t kind = iv.si_data_kind;
 
+    /* An extent change and the inode update that completes it are one step
+     * for a commit (fs->txn): a peer's ENOSPC reclaim lands before or after
+     * the pair, never between, so a crash never finds a shrunk file at its
+     * old size or an inline file with a stray extent. */
+    fs_txn_begin(fs, &tx);
     if (kind == STM_DATA_INLINE) {
         if (new_size <= (uint64_t)STM_INODE_INLINE_MAX) {
             /* Stays inline. Grow zero-fills; shrink truncates. */
@@ -5699,11 +5749,19 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             memcpy(prefix, iv.si_data.inline_data, iv.si_data_len);
             stm_status ws = stm_sync_write_extent(fs->sync, dataset_id, ino,
                                                   0u, prefix, block_size);
-            if (ws == STM_ENOSPC && fs_reclaim_on_enospc_locked(fs))
-                ws = stm_sync_write_extent(fs->sync, dataset_id, ino,
-                                          0u, prefix, block_size);
+            if (ws == STM_ENOSPC) {
+                /* The reclaim's commit waits for every span, so it runs
+                 * outside ours; nothing has changed yet. */
+                fs_txn_end(fs, &tx);
+                bool freed = fs_reclaim_on_enospc_locked(fs);
+                fs_txn_begin(fs, &tx);
+                if (freed)
+                    ws = stm_sync_write_extent(fs->sync, dataset_id, ino,
+                                              0u, prefix, block_size);
+            }
             free(prefix);
             if (ws != STM_OK) { rs = ws; goto out; }
+            fs_step_gap(fs, dataset_id, ino);
         }
 
         iv.si_data_kind = STM_DATA_EXTENT;
@@ -5730,6 +5788,7 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             stm_status ts = stm_sync_truncate(fs->sync, dataset_id, ino,
                                                  new_size);
             if (ts != STM_OK) { rs = ts; goto out; }
+            fs_step_gap(fs, dataset_id, ino);
         }
         /* Grow case: just update si_size. The extent layer's sparse-
          * read semantics return 0 for offsets in [cur_size, new_size)
@@ -5746,7 +5805,7 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
 out:
     stm_inode_unpin(iidx, h);
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return rs;
 }
 
@@ -7819,10 +7878,19 @@ static stm_status fs_reflink_locked(stm_fs *fs,
         return STM_ENOTSUPPORTED;
     }
 
+    /* The shared extents and dst's inode update are one step for a commit
+     * (fs->txn), so a crash never finds dst's extents under an inode that
+     * does not know them. */
+    fs_txn tx = { false };
+    fs_txn_begin(fs, &tx);
     stm_status s = stm_sync_reflink(fs->sync,
                                        src_dataset_id, src_ino,
                                        dst_dataset_id, dst_ino);
-    if (s != STM_OK) return s;
+    if (s != STM_OK) {
+        fs_txn_end(fs, &tx);
+        return s;
+    }
+    fs_step_gap(fs, dst_dataset_id, dst_ino);
 
     /* R81 P3-8 / P10b: post-success stamping + size/kind sync. */
     if (dst_has_inode) {
@@ -7850,10 +7918,10 @@ static stm_status fs_reflink_locked(stm_fs *fs,
         /* R76 P3-1 / R78 P3-1 lock-posture infallibility: only fields
          * touched are si_size + si_data_kind + si_data + ts; gen /
          * nlink / seal-bits unchanged. */
-        return stm_inode_set(iidx, dst_dataset_id, dst_ino, &div);
+        s = stm_inode_set(iidx, dst_dataset_id, dst_ino, &div);
     }
-
-    return STM_OK;
+    fs_txn_end(fs, &tx);
+    return s;
 }
 
 /* P7-16: stm_fs_reflink. POSIX-shape FICLONE — replaces dst's empty
@@ -11329,6 +11397,7 @@ static stm_status fs_fallocate(stm_fs *fs,
      *
      * UNSHARE_RANGE drops the lock + pin BEFORE chaining into
      * stm_fs_promote_to_hot — see that branch below. */
+    fs_txn tx = { false };
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
@@ -11431,6 +11500,11 @@ static stm_status fs_fallocate(stm_fs *fs,
     stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
     if (!eidx) { s = STM_EINVAL; goto falloc_out; }
 
+    /* A range op's extent change and its inode update are one step for a
+     * commit (fs->txn), so a peer's ENOSPC reclaim lands before or after
+     * the pair, never between: an insert's shifted tail never sits past
+     * an un-grown size. */
+    fs_txn_begin(fs, &tx);
     if (punch) {
         /* PUNCH_HOLE | KEEP_SIZE: route through stm_sync_punch_range
          * which (R89 P0-4 fix) properly drops paddrs through the
@@ -11438,6 +11512,7 @@ static stm_status fs_fallocate(stm_fs *fs,
          * STM_ENOTSUPPORTED on crossing or COLD extents. */
         s = stm_sync_punch_range(fs->sync, dataset_id, ino, off, len);
         if (s == STM_OK) {
+            fs_step_gap(fs, dataset_id, ino);
             fs_stamp_mtime_ctime_now(&iv);
             (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
         }
@@ -11453,6 +11528,7 @@ static stm_status fs_fallocate(stm_fs *fs,
                                              off + len,
                                              -(int64_t)len);
         if (s == STM_OK) {
+            fs_step_gap(fs, dataset_id, ino);
             uint64_t new_size = cur_size - len;
             iv.si_size = stm_store_le64(new_size);
             fs_stamp_mtime_ctime_now(&iv);
@@ -11472,6 +11548,7 @@ static stm_status fs_fallocate(stm_fs *fs,
         s = stm_extent_shift_range_keys(eidx, dataset_id, ino,
                                              off, (int64_t)len);
         if (s == STM_OK) {
+            fs_step_gap(fs, dataset_id, ino);
             iv.si_size = stm_store_le64(cur_size + len);
             fs_stamp_mtime_ctime_now(&iv);
             (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
@@ -11482,6 +11559,7 @@ static stm_status fs_fallocate(stm_fs *fs,
          * si_size. */
         s = stm_sync_punch_range(fs->sync, dataset_id, ino, off, len);
         if (s == STM_OK) {
+            fs_step_gap(fs, dataset_id, ino);
             if (!keep_size && (off + len) > cur_size) {
                 iv.si_size = stm_store_le64(off + len);
             }
@@ -11497,7 +11575,7 @@ static stm_status fs_fallocate(stm_fs *fs,
          * extents between tiers without changing a byte, so it needs no
          * identity: run on a successor, it changes nothing it can see. */
         stm_inode_unpin(iidx_pin, h_falloc);
-        pthread_rwlock_unlock(&fs->global);
+        fs_txn_unlock_global(fs, &tx);
         stm_status ps = stm_fs_promote_to_hot(fs, dataset_id, ino);
         /* STM_ENOENT is "no COLD extents to promote" — already
          * unshared, return OK. */
@@ -11520,7 +11598,7 @@ static stm_status fs_fallocate(stm_fs *fs,
 
 falloc_out:
     stm_inode_unpin(iidx_pin, h_falloc);
-    pthread_rwlock_unlock(&fs->global);
+    fs_txn_unlock_global(fs, &tx);
     return s;
 }
 

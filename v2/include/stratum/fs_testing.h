@@ -103,7 +103,7 @@ void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
  * Make the next inode free that unlink, rmdir, rename over an existing
  * name or unlink_anon attempts answer `fail` instead, leaving the inode
  * as it was. One-shot; STM_OK disarms. This, the three above and the
- * nine below that take an `fs` belong to it and go with it at unmount.
+ * ten below that take an `fs` belong to it and go with it at unmount.
  */
 void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
 
@@ -163,6 +163,19 @@ void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
  * restores it.
  */
 typedef void (*stm_fs_reclaim_hook)(bool locked, void *arg);
+
+/*
+ * Call `fn` with the inode a data op changes, between the op's first
+ * change and the inode update that completes it: fallocate's punch, zero,
+ * collapse and insert range, a shrinking truncate, an inline file's move
+ * to extents (by truncate or by a write), a write's extent, and a
+ * reflink's destination. fs->global SH, the inode's pin and the op's
+ * transaction span are held. `fn` may not call the fs. NULL restores it.
+ */
+typedef void (*stm_fs_step_gap_hook)(uint64_t dataset_id, uint64_t ino,
+                                     void *arg);
+void stm_fs_set_step_gap_hook_for_test(stm_fs *fs, stm_fs_step_gap_hook fn,
+                                       void *arg);
 void stm_fs_set_reclaim_hook_for_test(stm_fs *fs, stm_fs_reclaim_hook fn,
                                       void *arg);
 
