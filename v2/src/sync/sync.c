@@ -3613,6 +3613,14 @@ uint64_t stm_sync_pending_free_blocks(stm_sync *s)
     return total;
 }
 
+void stm_sync_mark_wedged(stm_sync *s)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->wedged = true;
+    pthread_mutex_unlock(&s->lock);
+}
+
 /* ========================================================================= */
 /* P5-durable-cursors: scrub-state durable bytes (push from scrub).           */
 /* ========================================================================= */

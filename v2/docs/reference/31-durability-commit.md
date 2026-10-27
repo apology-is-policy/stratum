@@ -167,7 +167,11 @@ no new data reserve — so need no backstop. `stm_fs_reserve` — the raw
 data-reserve API, test-only, no production caller — is also wrapped for
 uniformity, CF-4 C audit F1.) A failed reclaim commit is crash-equivalent ⇒ it
 wedges in place (`fs_mark_wedged_locked`, a monotone release-store safe under
-either lock mode). NOTE that metadata and data draw from **disjoint** pools
+either lock mode). Every fs wedge also wedges the sync (`stm_sync_mark_wedged`,
+under `s->lock`), and that latch is what stops the reclaim after another op
+wedged: the reclaiming op passed its wedge check before the wedge (it was
+waiting on a pin the wedging rename held), so only `stm_sync_commit`'s own
+refusal keeps it from making the half-undone state durable. NOTE that metadata and data draw from **disjoint** pools
 (B-tree engine nodes + the alloc-tree's own COW nodes come from the bootstrap
 bitmap via `stm_bootstrap_reserve`; only file-data extents come from the data
 `stm_alloc_reserve`), so a data-full pool holding deferred DATA pending can

@@ -103,7 +103,7 @@ void stm_fs_set_free_cleanup_hook_for_test(stm_fs *fs,
  * Make the next inode free that unlink, rmdir, rename over an existing
  * name or unlink_anon attempts answer `fail` instead, leaving the inode
  * as it was. One-shot; STM_OK disarms. This, the three above and the
- * five below belong to `fs` and go with it at unmount.
+ * six below belong to `fs` and go with it at unmount.
  */
 void stm_fs_fail_next_inode_free_for_test(stm_fs *fs, stm_status fail);
 
@@ -138,6 +138,16 @@ typedef void (*stm_fs_rename_rollback_hook)(bool wedged, void *arg);
 void stm_fs_set_rename_rollback_hook_for_test(stm_fs *fs,
                                               stm_fs_rename_rollback_hook fn,
                                               void *arg);
+
+/*
+ * Call `fn` as stm_fs_write passes its wedge check under fs->global SH,
+ * before it pins the inode, with the inode it writes. `fn` may not call
+ * the fs. NULL restores it.
+ */
+typedef void (*stm_fs_write_guard_hook)(uint64_t ino, void *arg);
+void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
+                                          stm_fs_write_guard_hook fn,
+                                          void *arg);
 #endif
 
 #ifdef __cplusplus

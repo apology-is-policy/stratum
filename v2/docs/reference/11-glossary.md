@@ -61,7 +61,7 @@ documents them in depth.
 | **safe removal** | Sync-layer wrappers that probe alloc drain before pool state transition. `stm_sync_remove_device`, `stm_sync_finish_evacuation`. | [08-pool-redundancy](08-pool-redundancy.md) |
 | **verify-callback** | Caller-supplied per-block classification function (P5-5-β). Returns OK / REPAIRED / UNREPAIRABLE; encapsulates the bptr-aware redundancy iteration. Future P6 extent manager plugs the production cb. | [09-scrub](09-scrub.md) |
 | **CallbackSetExclusivity** | Spec invariant (scrub.tla): the four scrub counters split cleanly by mode. α (no cb) keeps `repaired`/`unrepairable` at 0; β (cb installed) keeps `failed` at 0. | [10-specs](10-specs.md) |
-| **wedge** | Runtime state where sync refuses all mutations because an in-flight rollback itself failed. `STM_EWEDGED`. | [07-sb-sync](07-sb-sync.md) |
+| **wedge** | Runtime state where sync refuses all mutations because an in-flight rollback itself failed, or because the fs above it wedged (`stm_sync_mark_wedged`). `STM_EWEDGED`. | [07-sb-sync](07-sb-sync.md) |
 
 ## Device states
 
@@ -92,7 +92,7 @@ documents them in depth.
 | `STM_EBADVERSION` | On-disk format version unsupported. |
 | `STM_ERANGE` | Caller buffer too small / value out of range. |
 | `STM_ENOTSUPPORTED` | Feature reserved but not yet implemented (e.g. RS / LRC, dev 0 removal). |
-| `STM_EWEDGED` | Sync handle wedged (post-rollback-of-rollback failure). |
+| `STM_EWEDGED` | Sync handle or fs wedged (a failed rollback, or a failure the fs could not undo). |
 | `STM_EIO` | Underlying block device I/O error. |
 
 ## Phase numbering

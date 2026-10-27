@@ -35,7 +35,9 @@
  * in-place latch, BEFORE it unlocks: a wedge fired after the unlock
  * leaves a window in which a writer queued on fs->global (a commit
  * among them) runs on the state the wedge was meant to stop, and can
- * make it durable.
+ * make it durable. Both wedge the sync as well: the ENOSPC reclaim
+ * commits under SH, from an op that passed its wedge check before the
+ * wedge, and only the sync's own latch stops that commit.
  *
  * Public stm_fs entries:
  *   - Pre-PARALLEL-3 ops (the residual EX surface): take fs->global EX
@@ -293,6 +295,8 @@ struct stm_fs {
     stm_status rename_src_drop_fail_next;
     stm_fs_rename_rollback_hook rename_rollback_hook;
     void *rename_rollback_hook_arg;
+    stm_fs_write_guard_hook write_guard_hook;
+    void *write_guard_hook_arg;
 #endif
 };
 
@@ -362,6 +366,7 @@ struct stm_fs {
 static void fs_mark_wedged_locked(stm_fs *fs)
 {
     atomic_store_explicit(&fs->wedged, true, memory_order_release);
+    stm_sync_mark_wedged(fs->sync);
 }
 
 /* ========================================================================= */
@@ -2594,6 +2599,10 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
      * through the unbuffered stm_sync_write_extent path verbatim. */
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->write_guard_hook)
+        fs->write_guard_hook(ino, fs->write_guard_hook_arg);
+#endif
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (iidx) {
         stm_inode_handle *h = NULL;
@@ -3183,6 +3192,14 @@ void stm_fs_set_rename_rollback_hook_for_test(stm_fs *fs,
 {
     fs->rename_rollback_hook = fn;
     fs->rename_rollback_hook_arg = arg;
+}
+
+void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
+                                          stm_fs_write_guard_hook fn,
+                                          void *arg)
+{
+    fs->write_guard_hook = fn;
+    fs->write_guard_hook_arg = arg;
 }
 #endif
 
@@ -3990,6 +4007,9 @@ static bool fs_post_inode_free_reclaim_locked(stm_fs *fs)
  * in-memory tree) it wedges in place (fs_mark_wedged_locked) and returns
  * false -- the fs is going down; the caller propagates the STM_ENOSPC (or
  * the reserve's own error) and every subsequent op sees STM_EWEDGED.
+ * Its caller passed its wedge check before the reclaim ran, so a wedge
+ * another op raised since then is not seen here: the sync's latch
+ * (stm_sync_mark_wedged) makes these commits refuse instead.
  *
  * Loop-free: gated on stm_sync_pending_free_blocks > 0 (the second commit
  * sweeps every free_gen < committed_gen block, driving pending toward 0),
@@ -4033,8 +4053,8 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
     stm_status predrain = stm_dirty_buffer_drain_all(fs->dirty_buffer,
                                                         fs_flush_drain_cb, fs);
     if (fs_post_inode_free_reclaim_locked(fs)) {
-        pthread_rwlock_unlock(&fs->dbuf_txn);
         fs_mark_wedged_locked(fs);
+        pthread_rwlock_unlock(&fs->dbuf_txn);
         return false;
     }
     if (predrain != STM_OK) {
@@ -4044,8 +4064,8 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
                             the closing commit below persists whatever DID
                             land, so no NEW tear is added by this call. */
         if (stm_sync_commit(fs->sync) != STM_OK) {
-            pthread_rwlock_unlock(&fs->dbuf_txn);
             fs_mark_wedged_locked(fs);
+            pthread_rwlock_unlock(&fs->dbuf_txn);
             return false;
         }
     }
@@ -11733,7 +11753,7 @@ void stm_fs_mark_wedged(stm_fs *fs)
      * synchronise via acquire-load. EX excludes other writers; the atomic
      * provides the reader-side pairing. */
     pthread_rwlock_wrlock(&fs->global);
-    atomic_store_explicit(&fs->wedged, true, memory_order_release);
+    fs_mark_wedged_locked(fs);
     pthread_rwlock_unlock(&fs->global);
 }
 

@@ -275,6 +275,8 @@ STM_TEST(fs_wedged_blocks_everything) {
     STM_ASSERT_ERR(stm_fs_reserve(fs, 4u, 0, &dummy), STM_EWEDGED);
     STM_ASSERT_ERR(stm_fs_free(fs, p, 0),             STM_EWEDGED);
     STM_ASSERT_ERR(stm_fs_commit(fs),                 STM_EWEDGED);
+    /* ...and so does its sync, for a committer past its fs check. */
+    STM_ASSERT_ERR(stm_sync_commit(stm_fs_sync(fs)),  STM_EWEDGED);
 
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
 
@@ -12229,7 +12231,155 @@ STM_TEST(fs_a_rename_whose_dst_name_cannot_come_back_wedges_in_place) {
     stm_fs_set_rename_rollback_hook_for_test(fs, NULL, NULL);
     STM_ASSERT_EQ(seen.calls, 1);
     STM_ASSERT_TRUE(seen.wedged);
+    STM_ASSERT_ERR(stm_sync_commit(stm_fs_sync(fs)), STM_EWEDGED);
     reuse_fs_done(fs);
+}
+
+/* A write that passed its wedge check before a rename wedged runs only
+ * after the wedge, and its space can only come from a reclaim commit.
+ * Nothing it does may commit: a commit would make the rollback's
+ * half-undone state durable, losing b. */
+typedef struct {
+    stm_fs          *fs;
+    uint64_t         ino;
+    pthread_mutex_t  mu;
+    pthread_cond_t   cv;
+    bool             spawned, passed_guard;
+    atomic_bool      finished;
+    bool             rollback_ended, wedged_at_end, finished_at_end;
+    stm_status       rc;
+    pthread_t        th;
+} late_writer;
+
+#define LATE_WRITE_BYTES (1024u * 1024u)
+
+static void *late_writer_run(void *arg)
+{
+    late_writer *w = arg;
+    uint8_t *buf = malloc(LATE_WRITE_BYTES);
+    memset(buf, 0x5A, LATE_WRITE_BYTES);
+    w->rc = stm_fs_write(w->fs, 1, w->ino, 0, buf, LATE_WRITE_BYTES);
+    free(buf);
+    atomic_store(&w->finished, true);
+    return NULL;
+}
+
+static void late_writer_guard(uint64_t ino, void *arg)
+{
+    late_writer *w = arg;
+    if (ino != w->ino) return;
+    pthread_mutex_lock(&w->mu);
+    w->passed_guard = true;
+    pthread_cond_signal(&w->cv);
+    pthread_mutex_unlock(&w->mu);
+}
+
+/* The rename frees b before its install fails: start the writer here and
+ * hold the rename until the writer is past its wedge check. It then waits
+ * on a's pin, which the rename holds until after it wedges. */
+static void late_writer_start(uint64_t dataset_id, uint64_t ino, void *arg)
+{
+    (void)dataset_id; (void)ino;
+    late_writer *w = arg;
+    if (w->spawned) return;
+    w->spawned = true;
+    STM_ASSERT_EQ(pthread_create(&w->th, NULL, late_writer_run, w), 0);
+    pthread_mutex_lock(&w->mu);
+    while (!w->passed_guard) pthread_cond_wait(&w->cv, &w->mu);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static void late_writer_rollback_end(bool wedged, void *arg)
+{
+    late_writer *w = arg;
+    w->rollback_ended = true;
+    w->wedged_at_end = wedged;
+    w->finished_at_end = atomic_load(&w->finished);
+}
+
+STM_TEST(fs_a_write_past_its_wedge_check_commits_nothing_after_the_wedge) {
+    make_tmp("late_writer");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)16u * 1024u * 1024u;
+    fopts.bootstrap_size_bytes = (uint64_t)8u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, a = 0, b = 0, f = 0, got = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                     &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"a", 1,
+                                        0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"b", 1,
+                                        0644u, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1,
+                                        0644u, 0, 0, &f));
+    uint8_t *buf = malloc(LATE_WRITE_BYTES);
+    memset(buf, 0xB0, LATE_WRITE_BYTES);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, b, 0, buf, LATE_WRITE_BYTES));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* Fill the data area until a write the size of the late one no
+     * longer fits: its only way in is the reclaim of b's blocks. */
+    uint64_t off = 0;
+    for (;;) {
+        stm_status ws = stm_fs_write(fs, 1, f, off, buf, LATE_WRITE_BYTES);
+        if (ws != STM_OK) { STM_ASSERT_ERR(ws, STM_ENOSPC); break; }
+        off += LATE_WRITE_BYTES;
+    }
+    free(buf);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.data_pending_blocks, 0u);
+    uint64_t gen_before = st.current_gen;
+
+    late_writer w = { .fs = fs, .ino = a, .rc = STM_EINVAL };
+    pthread_mutex_init(&w.mu, NULL);
+    pthread_cond_init(&w.cv, NULL);
+    atomic_init(&w.finished, false);
+    stm_fs_set_write_guard_hook_for_test(fs, late_writer_guard, &w);
+    stm_fs_set_free_cleanup_hook_for_test(fs, late_writer_start, &w);
+    stm_fs_set_rename_rollback_hook_for_test(fs, late_writer_rollback_end,
+                                             &w);
+    stm_fs_fail_next_rename_install_for_test(fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, dir, (const uint8_t *)"a", 1,
+                                 dir, (const uint8_t *)"b", 1, 0),
+                   STM_EIO);
+    STM_ASSERT_TRUE(w.spawned);
+    if (w.spawned) pthread_join(w.th, NULL);
+    stm_fs_set_write_guard_hook_for_test(fs, NULL, NULL);
+    stm_fs_set_free_cleanup_hook_for_test(fs, NULL, NULL);
+    stm_fs_set_rename_rollback_hook_for_test(fs, NULL, NULL);
+    pthread_cond_destroy(&w.cv);
+    pthread_mutex_destroy(&w.mu);
+
+    /* The premise: the writer was past its wedge check before the wedge,
+     * and still waiting when the rollback ended with the fs wedged. */
+    STM_ASSERT_TRUE(w.passed_guard);
+    STM_ASSERT_TRUE(w.rollback_ended);
+    STM_ASSERT_TRUE(w.wedged_at_end);
+    STM_ASSERT_TRUE(!w.finished_at_end);
+    /* Past the fs check, the write meets the sync's latch, and no
+     * commit has run since the fill. */
+    STM_ASSERT_ERR(w.rc, STM_EWEDGED);
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.wedged);
+    STM_ASSERT_EQ(st.current_gen, gen_before);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"b", 1, &got));
+    STM_ASSERT_EQ(got, b);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dir, (const uint8_t *)"a", 1, &got));
+    STM_ASSERT_EQ(got, a);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
 }
 
 /* The scrub's extent lookup holds no fs->global, so a rollback can retire a

@@ -289,6 +289,13 @@ stm_status stm_sync_commit(stm_sync *s);
  * Returns 0 for a NULL sync. */
 uint64_t stm_sync_pending_free_blocks(stm_sync *s);
 
+/* Wedge the handle: every later mutating call, stm_sync_commit among
+ * them, answers STM_EWEDGED. One-way. Takes s->lock, so a commit either
+ * finished before the wedge or refuses after it. stm_fs wedges its sync
+ * along with itself, so a committer that checked the fs before the wedge
+ * still cannot commit after it. NULL is a no-op. */
+void stm_sync_mark_wedged(stm_sync *s);
+
 /*
  * Release the handle. Does NOT commit; callers who need durability
  * must call stm_sync_commit first. Does NOT close the underlying

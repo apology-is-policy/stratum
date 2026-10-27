@@ -243,7 +243,10 @@ flush(es) and reverting the in-memory tree(s). The abort cascade
 | post-UB write (any finalize failure)   | (none — commit point passed; fs wedges) |
 
 A failed `stm_sync_commit` is crash-equivalent — fs.c MUST wedge the fs
-(R154 doctrine carry).
+(R154 doctrine carry). Every fs wedge wedges the sync as well
+(`stm_sync_mark_wedged`, under `s->lock`): from then on `stm_sync_commit`
+and the other mutating calls answer `STM_EWEDGED`, so a committer that
+checked the fs before the wedge cannot commit after it.
 
 The explicit `stm_bootstrap_commit` at the end of Phase 2 is the
 durable-bitmap barrier. Every engine's flush set node bits in the
