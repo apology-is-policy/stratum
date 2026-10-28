@@ -601,8 +601,8 @@ STM_TEST(dbuf_footprint_zero_after_full_drain)
 }
 
 /* A range's cover charge stays with it: the remnants an overlapping
- * insert leaves keep the cover's extra, admission counts it, and a drain
- * gives back exactly what was charged. */
+ * insert leaves share the cover's charge, admission counts it once, and a
+ * drain gives back exactly what was charged. */
 STM_TEST(dbuf_a_ranges_cover_charge_stays_with_it)
 {
     stm_dirty_buffer *b = NULL;
@@ -613,23 +613,28 @@ STM_TEST(dbuf_a_ranges_cover_charge_stays_with_it)
     STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, 0, 3u * BLK, pad,
                                                   10, UINT64_MAX));
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)14);
-    /* A byte at BLK splits it: head [0, BLK) 2 + 10, new 2 + 10, tail
-     * [BLK + 1, 3 BLK) 3 + 10; admitted at exactly that, since the range
-     * it splits gives back its whole charge. */
+    /* A byte at BLK splits it: head [0, BLK) and tail [BLK + 1, 3 BLK) a
+     * record each inside the cover (13), the byte 1 + its own cover of
+     * 1 + 10; admitted at exactly that, since the range it splits gives
+     * back its record and its cover stays. */
+    STM_ASSERT_EQ((int)stm_dirty_buffer_insert_bounded(b, 1, 1, BLK, 1, pad,
+                                                       10, 26),
+                  (int)STM_ENOSPC);
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)14);
     STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, BLK, 1, pad,
-                                                  10, 37));
-    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)37);
-    /* A second run of the same inode: 2 + 3. */
+                                                  10, 27));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)27);
+    /* A second run of the same inode: 1 + a cover of 1 + 3. */
     STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 1, 64u * BLK, 1, pad,
                                                   3, UINT64_MAX));
-    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)42);
-    /* Another inode's byte costs 2 + its extra: 5 does not fit in 48. */
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)32);
+    /* Another inode's byte costs 2 + its extra: 5 does not fit in 38. */
     STM_ASSERT_EQ((int)stm_dirty_buffer_insert_bounded(b, 1, 2, 0, 1, pad,
-                                                       5, 48),
+                                                       5, 38),
                   (int)STM_ENOSPC);
-    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)42);
-    STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 2, 0, 1, pad, 4, 48));
-    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)48);
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)32);
+    STM_ASSERT_OK(stm_dirty_buffer_insert_bounded(b, 1, 2, 0, 1, pad, 4, 38));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)38);
     STM_ASSERT_EQ((int)stm_dirty_buffer_insert_bounded(
                       b, 1, 3, 0, 1, pad, (uint64_t)UINT32_MAX + 1u,
                       UINT64_MAX),
@@ -641,6 +646,67 @@ STM_TEST(dbuf_a_ranges_cover_charge_stays_with_it)
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)11);
     drain_recorder all = {0};
     STM_ASSERT_OK(stm_dirty_buffer_drain_all(b, drain_record_cb, &all));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)0);
+    stm_dirty_buffer_destroy(b);
+}
+
+/* What the admit answers: the cover and the extra beyond the range. */
+typedef struct {
+    uint64_t extra, lo, hi;
+} cover_answer;
+
+static stm_status answer_cover(void *user, uint64_t ds, uint64_t ino,
+                               uint64_t off, uint64_t len, uint64_t *extra,
+                               uint64_t *lo, uint64_t *hi)
+{
+    (void)ds; (void)ino; (void)off; (void)len;
+    const cover_answer *a = user;
+    *extra = a->extra;
+    *lo = a->lo;
+    *hi = a->hi;
+    return STM_OK;
+}
+
+/* Ranges inside one cover share its charge; a range whose cover reaches
+ * past it charges its own; the shared charge stays until the last range
+ * inside the cover goes. */
+STM_TEST(dbuf_ranges_inside_one_cover_share_its_charge)
+{
+    enum { BLK = 4096u };
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+    static uint8_t pad[3u * BLK];
+    /* 64 blocks: 63 beyond a 1-block range and 2 for its record. */
+    cover_answer in = { 63u + 2u, 0u, 64u * BLK };
+    /* Its cover 66, and a record. */
+    STM_ASSERT_OK(stm_dirty_buffer_insert_admitted(b, 1, 1, 100, 200, pad,
+                                                   answer_cover, &in));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)67);
+    /* Inside it: a record. */
+    STM_ASSERT_OK(stm_dirty_buffer_insert_admitted(b, 1, 1, 2u * BLK + 100,
+                                                   200, pad, answer_cover,
+                                                   &in));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)68);
+    /* A cover that overlaps it, but reaches past it: 97 + 1, and a record. */
+    cover_answer past = { 95u + 2u, 32u * BLK, 128u * BLK };
+    STM_ASSERT_OK(stm_dirty_buffer_insert_admitted(b, 1, 1, 100u * BLK + 100,
+                                                   200, pad, answer_cover,
+                                                   &past));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)167);
+    /* The first range rewritten with no cover (2): the cover stays for the
+     * second. */
+    cover_answer none = { 0u, 0u, 0u };
+    STM_ASSERT_OK(stm_dirty_buffer_insert_admitted(b, 1, 1, 100, 200, pad,
+                                                   answer_cover, &none));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)168);
+    /* One range over both, inside the cover: it gives back 2 and 1 and
+     * charges 1. */
+    STM_ASSERT_OK(stm_dirty_buffer_insert_admitted(b, 1, 1, 100,
+                                                   2u * BLK + 200, pad,
+                                                   answer_cover, &in));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)166);
+    drain_recorder rec = {0};
+    STM_ASSERT_OK(stm_dirty_buffer_drain_all(b, drain_record_cb, &rec));
     STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)0);
     stm_dirty_buffer_destroy(b);
 }

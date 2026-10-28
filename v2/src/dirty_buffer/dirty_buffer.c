@@ -50,11 +50,27 @@
 
 #define STM_DBUF_BUCKETS 256u
 
+/* The covering write a drain makes for a range that partly overlaps
+ * extents: every range inside it shares this one charge, so writes into
+ * one extent pay for its rewrite once. Its extents stay as they were while
+ * a range inside it is buffered: an op that rewrites extents drains the
+ * inode first, and a drain's covering write takes in every buffered byte
+ * below where it ends. */
+typedef struct stm_dbuf_cover {
+    uint64_t               lo, hi;   /* bytes, block-aligned; lo == hi: not
+                                      * known, so never shared */
+    uint64_t               charge;   /* the whole covering write */
+    uint32_t               refs;     /* buffered ranges inside it */
+    uint32_t               keep;     /* an insert's scratch: refs after it */
+    struct stm_dbuf_cover *next;
+} stm_dbuf_cover;
+
 typedef struct stm_dbuf_range {
     uint64_t                off;
     uint64_t                len;
-    uint64_t                charge;   /* footprint blocks: its span plus
-                                       * its drain's cover beyond it */
+    uint64_t                charge;   /* footprint blocks: its span, or only
+                                       * its records inside a cover */
+    stm_dbuf_cover         *cover;    /* NULL: its drain writes its span */
     uint64_t                cap;      /* data allocation size (>= len; a
                                        * shelf-reused buffer keeps its true
                                        * capacity so re-shelving never
@@ -67,8 +83,9 @@ typedef struct stm_dbuf_inode {
     uint64_t                dataset_id;
     uint64_t                ino;
     size_t                  bytes;   /* sum of all ranges' len */
-    uint64_t                footprint_blocks; /* sum of ranges' charge */
+    uint64_t                footprint_blocks; /* ranges' and covers' charges */
     stm_dbuf_range         *head;    /* sorted by off, ascending */
+    stm_dbuf_cover         *covers;
     struct stm_dbuf_inode  *bucket_next;
 } stm_dbuf_inode;
 
@@ -198,6 +215,28 @@ void stm_dirty_buffer_shelf_stats(stm_dirty_buffer *buf,
     pthread_mutex_unlock(&buf->mu);
 }
 
+static void free_covers(stm_dbuf_inode *e)
+{
+    while (e->covers) {
+        stm_dbuf_cover *c = e->covers;
+        e->covers = c->next;
+        free(c);
+    }
+}
+
+/* Drops a range's hold on its cover; the cover's charge when that was the
+ * last hold, which the caller takes off the footprint. */
+static uint64_t cover_put(stm_dbuf_inode *e, stm_dbuf_cover *c)
+{
+    if (!c || --c->refs > 0u) return 0;
+    stm_dbuf_cover **s = &e->covers;
+    while (*s != c) s = &(*s)->next;
+    *s = c->next;
+    uint64_t charge = c->charge;
+    free(c);
+    return charge;
+}
+
 /* Unlink + free entire inode entry. */
 static void destroy_inode_locked(stm_dirty_buffer *buf, stm_dbuf_inode *e)
 {
@@ -211,6 +250,7 @@ static void destroy_inode_locked(stm_dirty_buffer *buf, stm_dbuf_inode *e)
         free_range(buf, r);
         r = n;
     }
+    free_covers(e);
     buf->total_bytes -= e->bytes;
     buf->total_footprint_blocks -= e->footprint_blocks;
     if (e->footprint_blocks > 0u && buf->release)
@@ -253,7 +293,8 @@ static bool ranges_overlap(uint64_t a, uint64_t la,
  * mirrors STM_FS_RECORDSIZE_MAX (8 MiB) conservatively: a smaller real
  * recordsize would only mean MORE pieces than charged -- so keep the
  * mirror <= the fs constant. A range's charge is set once, at insert, and
- * every removal subtracts that charge, so accounting stays symmetric.
+ * every removal subtracts that charge, so accounting stays symmetric; a
+ * cover's, when the last range inside it goes.
  * A drain that finds no free run long enough for a record writes it in
  * pieces, each with its own tag, so it may spend up to charge_factor
  * blocks per block of data (stm_dirty_buffer_set_charge_factor): the span
@@ -270,12 +311,13 @@ static uint64_t blocks_spanned(const stm_dirty_buffer *buf, uint64_t off,
     return buf->charge_factor * (last - first + 1u) + pieces;
 }
 
-/* The cover blocks a range was charged beyond its own span. A remnant of
- * it lies in the same cover, so it keeps them. */
-static uint64_t dbuf_extra(const stm_dirty_buffer *buf,
-                           const stm_dbuf_range *r)
+/* A range's own charge: its span, or inside a cover, whose charge holds
+ * the span, its records. */
+static uint64_t range_charge(const stm_dirty_buffer *buf, uint64_t off,
+                             uint64_t len, const stm_dbuf_cover *c)
 {
-    return r->charge - blocks_spanned(buf, r->off, r->len);
+    if (!c) return blocks_spanned(buf, off, len);
+    return (len + DBUF_RECPIECE - 1u) / DBUF_RECPIECE;
 }
 
 /* ───────────────────────────── public API ─────────────────────────── */
@@ -315,6 +357,7 @@ void stm_dirty_buffer_destroy(stm_dirty_buffer *buf)
                 free_range(buf, r);
                 r = rn;
             }
+            free_covers(e);
             free(e);
             e = n;
         }
@@ -345,9 +388,10 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     if (len > buf->inode_cap) return STM_ENOSPC;  /* impossibly large */
 
     pthread_mutex_lock(&buf->mu);
+    uint64_t c_lo = 0, c_hi = 0;
     if (admit) {
         stm_status as = admit(admit_user, dataset_id, ino, off, len,
-                              &extra_blocks);
+                              &extra_blocks, &c_lo, &c_hi);
         if (as == STM_OK && extra_blocks > (uint64_t)UINT32_MAX)
             as = STM_EINVAL;
         if (as != STM_OK) {
@@ -368,12 +412,14 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     size_t dropped_bytes = 0;
     uint64_t removed_footprint = 0;   /* #40: block-spans the overlapped ranges vacate */
     if (e) {
+        for (stm_dbuf_cover *c = e->covers; c; c = c->next) c->keep = c->refs;
         for (stm_dbuf_range *r = e->head; r; r = r->next) {
             if (ranges_overlap(r->off, r->len, off, len)) {
                 if (!first_ov) first_ov = r;
                 last_ov = r;
                 dropped_bytes += r->len;
                 removed_footprint += r->charge;
+                if (r->cover) r->cover->keep--;
             }
         }
     }
@@ -384,14 +430,37 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     uint64_t tail_len = (last_ov && last_end > end) ? last_end - end : 0u;
     /* #40: the charges of the head-remnant + new range + tail-remnant.
      * Per-range (each stored separately) so it matches the drain-time
-     * subtraction; conservative vs the contiguous union (see blocks_spanned). */
-    uint64_t new_charge  = blocks_spanned(buf, off, len) + extra_blocks;
+     * subtraction; conservative vs the contiguous union (see blocks_spanned).
+     * A remnant stays inside its range's cover. The new range joins a cover
+     * that holds its own (as the cover stands now), or charges its cover
+     * whole: the extra beyond the range plus the range's blocks. */
+    stm_dbuf_cover *share = NULL;
+    uint64_t cover_charge = 0;
+    if (extra_blocks > 0u) {
+        for (stm_dbuf_cover *c = e ? e->covers : NULL; c && !share;
+             c = c->next)
+            if (c->lo < c->hi && c->lo <= c_lo && c_hi <= c->hi && c_lo < c_hi)
+                share = c;
+        if (!share)
+            cover_charge = extra_blocks
+                         + blocks_spanned(buf, off, len)
+                         - (len + DBUF_RECPIECE - 1u) / DBUF_RECPIECE;
+    }
+    bool covered = extra_blocks > 0u;
+    uint64_t new_charge  = covered
+        ? (len + DBUF_RECPIECE - 1u) / DBUF_RECPIECE
+        : blocks_spanned(buf, off, len);
     uint64_t head_charge = head_len > 0u
-        ? blocks_spanned(buf, first_ov->off, head_len)
-          + dbuf_extra(buf, first_ov) : 0u;
+        ? range_charge(buf, first_ov->off, head_len, first_ov->cover) : 0u;
     uint64_t tail_charge = tail_len > 0u
-        ? blocks_spanned(buf, end, tail_len) + dbuf_extra(buf, last_ov) : 0u;
-    uint64_t added_footprint = new_charge + head_charge + tail_charge;
+        ? range_charge(buf, end, tail_len, last_ov->cover) : 0u;
+    if (head_len > 0u && first_ov->cover) first_ov->cover->keep++;
+    if (tail_len > 0u && last_ov->cover) last_ov->cover->keep++;
+    if (share) share->keep++;
+    for (stm_dbuf_cover *c = e ? e->covers : NULL; c; c = c->next)
+        if (c->keep == 0u) removed_footprint += c->charge;
+    uint64_t added_footprint = new_charge + head_charge + tail_charge
+                             + cover_charge;
 
     /* Per writeback.tla::BufferedWrite cap clauses: after superseding the
      * covered bytes (dropped minus the salvaged remnants) and adding
@@ -442,11 +511,22 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
      * failure leaves the buffer unmodified). The remnant data is copied
      * out of the still-live overlapped ranges before any mutation. */
     stm_dbuf_range *newr = NULL, *headr = NULL, *tailr = NULL;
+    stm_dbuf_cover *newc = NULL;
+    if (covered && !share) {
+        newc = malloc(sizeof *newc);
+        if (!newc) goto oom;
+        newc->lo = c_lo < c_hi ? c_lo : 0u;
+        newc->hi = c_lo < c_hi ? c_hi : 0u;
+        newc->charge = cover_charge;
+        newc->refs = 1u;
+        newc->keep = 1u;
+    }
     newr = malloc(sizeof *newr);
     if (!newr) goto oom;
     newr->off = off;
     newr->len = len;
     newr->charge = new_charge;
+    newr->cover = share ? share : newc;
     newr->cap = 0;
     newr->next = NULL;
     newr->data = shelf_alloc(buf, len, &newr->cap);
@@ -459,6 +539,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
         headr->off = first_ov->off;
         headr->len = head_len;
         headr->charge = head_charge;
+        headr->cover = first_ov->cover;
         headr->cap = 0;
         headr->next = NULL;
         headr->data = shelf_alloc(buf, head_len, &headr->cap);
@@ -471,6 +552,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
         tailr->off = end;
         tailr->len = tail_len;
         tailr->charge = tail_charge;
+        tailr->cover = last_ov->cover;
         tailr->cap = 0;
         tailr->next = NULL;
         tailr->data = shelf_alloc(buf, tail_len, &tailr->cap);
@@ -513,6 +595,17 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     if (tailr) newr->next = tailr;
     if (headr) { headr->next = newr; *slot = headr; }
     else       { *slot = newr; }
+    /* The covers the superseded ranges held: what the insert left them. */
+    for (stm_dbuf_cover **cs = &e->covers; *cs; ) {
+        stm_dbuf_cover *c = *cs;
+        c->refs = c->keep;
+        if (c->refs > 0u) { cs = &c->next; continue; }
+        *cs = c->next;
+        e->footprint_blocks         -= c->charge;
+        buf->total_footprint_blocks -= c->charge;
+        free(c);
+    }
+    if (newc) { newc->next = e->covers; e->covers = newc; }
     size_t added = (size_t)len + (size_t)head_len + (size_t)tail_len;
     e->bytes         += added;
     buf->total_bytes += added;
@@ -525,6 +618,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     return STM_OK;
 
 oom:
+    free(newc);
     if (newr)  { free(newr->data);  free(newr);  }
     if (headr) { free(headr->data); free(headr); }
     if (tailr) { free(tailr->data); free(tailr); }
@@ -808,7 +902,7 @@ static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
             e->head = done->next;
             e->bytes         -= done->len;
             buf->total_bytes -= done->len;
-            uint64_t sp = done->charge;
+            uint64_t sp = done->charge + cover_put(e, done->cover);
             e->footprint_blocks         -= sp;
             buf->total_footprint_blocks -= sp;
             popped += sp;

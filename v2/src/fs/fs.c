@@ -2394,10 +2394,12 @@ static stm_status fs_write_cutover_locked(stm_fs *fs, stm_inode_index *iidx,
  * block of overhead. 0 when the range's blocks are the whole cover. */
 static stm_status fs_cover_extra_blocks(stm_fs *fs, uint64_t ds, uint64_t ino,
                                         uint64_t off, uint64_t len,
-                                        uint64_t *out_extra)
+                                        uint64_t *out_extra, uint64_t *out_lo,
+                                        uint64_t *out_hi)
 {
     const uint64_t BLK = 4096u, REC = (uint64_t)STM_FS_RECORDSIZE_MAX;
     *out_extra = 0;
+    *out_lo = *out_hi = 0;
     stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
     if (!eidx || len == 0u) return STM_OK;
     uint64_t end = off + len, lo = off, hi = end;
@@ -2414,6 +2416,8 @@ static stm_status fs_cover_extra_blocks(stm_fs *fs, uint64_t ds, uint64_t ino,
     uint64_t span = c_hi - c_lo;
     *out_extra = fs->charge_factor * ((span - (r_hi - r_lo)) / BLK)
                + 2u * ((span + REC - 1u) / REC);
+    *out_lo = c_lo;
+    *out_hi = c_hi;
     return STM_OK;
 }
 
@@ -2423,10 +2427,11 @@ static stm_status fs_cover_extra_blocks(stm_fs *fs, uint64_t ds, uint64_t ino,
  * pool's bound is its reservation, taken with the insert. */
 static stm_status fs_buffer_admit(void *user, uint64_t ds, uint64_t ino,
                                   uint64_t off, uint64_t len,
-                                  uint64_t *extra_blocks)
+                                  uint64_t *extra_blocks, uint64_t *cover_lo,
+                                  uint64_t *cover_hi)
 {
     return fs_cover_extra_blocks((stm_fs *)user, ds, ino, off, len,
-                                 extra_blocks);
+                                 extra_blocks, cover_lo, cover_hi);
 }
 
 /* A buffered insert, admitted on everything its drain will reserve. */

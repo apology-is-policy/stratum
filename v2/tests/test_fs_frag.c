@@ -369,4 +369,44 @@ STM_TEST(fs_a_write_its_charge_refuses_is_written_direct) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+/* Small writes into one extent share the charge for its rewrite, as the
+ * drain rewrites it once with every one of them in it. Charged apart,
+ * sixteen would ask about four times what the pool holds. */
+STM_TEST(fs_small_writes_into_one_extent_share_its_cover) {
+    const uint64_t K = 4096u, MIB = 1024u * 1024u, E = 2u * MIB;
+    uint64_t x = 0, y = 0;
+    stm_fs *fs = frag_pool("frag_share", false, &x, &y, NULL);
+    if (!fs) return;
+    stm_alloc *a = stm_sync_alloc(stm_fs_sync(fs), 0);
+    uint8_t *b = malloc((size_t)E);
+    for (uint64_t i = 0; i < E; i++) b[i] = frag_pat(i);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, y, 0, b, (size_t)E));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    const uint64_t free0 = stm_alloc_data_free_blocks(a);
+    for (uint64_t k = 0; k < 16u; k++) {
+        for (uint64_t i = 0; i < 100u; i++) b[i] = frag_pat(E + k * 100u + i);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, y, k * 32u * K + 100u, b, 100u));
+    }
+    /* The extent's 512 blocks twice and 2 for its record, a record each. */
+    STM_ASSERT_EQ(stm_alloc_dirty_reserved(a), (uint64_t)(2u * 512u + 2u + 16u));
+    STM_ASSERT_EQ(stm_alloc_data_free_blocks(a), free0);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_EQ(stm_alloc_dirty_reserved(a), (uint64_t)0);
+    free(b);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    size_t bad = range_bad(fs, y, 0, 100u, 0);
+    for (uint64_t k = 0; k < 16u; k++) {
+        uint64_t at = k * 32u * K + 100u, next = k < 15u ? at + 32u * K : E;
+        bad += range_bad(fs, y, at, 100u, E + k * 100u);
+        bad += range_bad(fs, y, at + 100u, next - at - 100u, at + 100u);
+    }
+    STM_ASSERT_EQ(bad, (size_t)0);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs_frag")

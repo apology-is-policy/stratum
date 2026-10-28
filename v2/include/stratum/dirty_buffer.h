@@ -121,8 +121,8 @@ stm_status stm_dirty_buffer_insert(stm_dirty_buffer *buf,
  * re-reads free, and retries. The per-inode + global RAM caps still apply.
  * extra_blocks is what the drain reserves beyond the range's own blocks (a
  * covering write that rewrites a partly overlapped extent whole): the range
- * is charged it until it drains, and so is each remnant a later insert
- * leaves of it. More than UINT32_MAX is STM_EINVAL.
+ * is charged it until it drains, and the remnants a later insert leaves of
+ * it share that charge. More than UINT32_MAX is STM_EINVAL.
  *
  * Both numbers are as fresh as the caller's reading of them. A drain that
  * runs between that reading and the insert spends blocks the free count
@@ -139,16 +139,20 @@ stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
 
 /*
  * Answers, for a range about to be inserted, its extra_blocks, as
- * stm_dirty_buffer_insert_bounded takes them. Runs under the buffer lock,
- * so it must not call into the buffer. A non-OK answer refuses the insert
- * with that status.
+ * stm_dirty_buffer_insert_bounded takes them, and with extra_blocks the
+ * byte span [*cover_lo, *cover_hi) its drain's covering write rewrites: a
+ * later range of the inode whose cover lies inside it shares its charge.
+ * Runs under the buffer lock, so it must not call into the buffer. A
+ * non-OK answer refuses the insert with that status.
  */
 typedef stm_status (*stm_dirty_buffer_admit_fn)(void     *user,
                                                 uint64_t  dataset_id,
                                                 uint64_t  ino,
                                                 uint64_t  off,
                                                 uint64_t  len,
-                                                uint64_t *extra_blocks);
+                                                uint64_t *extra_blocks,
+                                                uint64_t *cover_lo,
+                                                uint64_t *cover_hi);
 
 /*
  * As stm_dirty_buffer_insert, charging the range the extra_blocks asked of
