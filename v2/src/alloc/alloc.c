@@ -47,6 +47,7 @@
  */
 
 #include <stratum/alloc.h>
+#include <stratum/alloc_testing.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
 #include <stratum/btnode.h>
@@ -108,6 +109,11 @@ struct stm_alloc {
     bool            guarded;
     uint64_t        dirty_reserved;
     uint64_t        drain_inflight;
+
+    /* The 1-block gaps and 1-block ranges the tree held at load: a bound
+     * on the free blocks no allocation can use, since none takes fewer
+     * than 2 and none since leaves such a gap. Kept out of the room. */
+    uint64_t        singletons;
 
     /* Chunk 5d: most-recently-persisted tree root paddr. 0 if no tree
      * has been committed yet. Used to free the previous snapshot's
@@ -676,6 +682,8 @@ typedef struct {
     uint64_t       *count_out;     /* &a->pending_count */
     uint64_t       *blocks_out;    /* &a->pending_blocks */
     uint64_t       *allocated_out; /* &a->allocated_blocks (refcount>=1 sum) */
+    uint64_t        cursor;        /* first block past the previous entry */
+    uint64_t        singletons;    /* 1-block gaps + 1-block entries */
     stm_status      err;
 } alloc_pending_rebuild_ctx;
 
@@ -700,6 +708,10 @@ static int alloc_pending_rebuild_cb(const void *key, size_t key_len,
         ctx->err = STM_ECORRUPT;
         return 1;
     }
+    uint64_t start = decode_key(key);
+    if (start > ctx->cursor && start - ctx->cursor == 1u) ctx->singletons++;
+    if (length_blocks == 1u) ctx->singletons++;
+    ctx->cursor = start + length_blocks;
     if (refcount != 0) {               /* live (allocated) entry */
         *ctx->allocated_out += length_blocks;
         return 0;
@@ -764,6 +776,8 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
             .count_out  = &a->pending_count,
             .blocks_out = &a->pending_blocks,
             .allocated_out = &a->allocated_blocks,
+            .cursor     = a->data_first_block,
+            .singletons = 0,
             .err        = STM_OK,
         };
         stm_status rs = stm_btree_mt_scan(a->tree, NULL, 0, NULL, 0,
@@ -788,6 +802,10 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
             pthread_mutex_unlock(&a->lock);
             return rs;
         }
+        if (rctx.cursor <= a->data_last_block &&
+            a->data_last_block - rctx.cursor == 0u)
+            rctx.singletons++;
+        a->singletons = rctx.singletons;
 
         /* Accel was empty (new handle); rebuild on first query. */
         accel_invalidate_locked(a);
@@ -937,14 +955,67 @@ void stm_alloc_close(stm_alloc *a)
 /* ========================================================================= */
 
 typedef struct {
-    uint64_t nblocks;
+    uint64_t nblocks;       /* exactly; up to, with `upto` */
+    bool     upto;
+    bool     first_fit;     /* the pre-gap-rule placement (testing) */
+    uint64_t room;
     uint64_t cursor;
     uint64_t data_last;     /* inclusive */
     uint64_t hint_start;    /* 0 if none */
     bool     found;
     uint64_t found_start;
+    uint64_t found_len;
+    bool     have_spare;    /* a gap 1 block longer than nblocks */
+    uint64_t spare_start;
     bool     saw_bad_entry; /* R7b P1-3: malformed tree entry observed */
 } reserve_ctx;
+
+/* Whether the free gap [start, start + len) takes the request, and which
+ * part: none leaves a 1-block gap, which no allocation could use. A gap 1
+ * block longer than an exact request is only the fallback (taken whole,
+ * it spends that block), so the first one is remembered. */
+static bool reserve_gap_fits(reserve_ctx *ctx, uint64_t start, uint64_t len)
+{
+    uint64_t n = ctx->nblocks;
+    if (ctx->first_fit) {
+        if (len < n) return false;
+        ctx->found_start = start;
+        ctx->found_len   = n;
+        return true;
+    }
+    if (ctx->upto) {
+        uint64_t k = len < n ? len : n;
+        if (k > ctx->room) k = ctx->room;
+        if (k < 2u) return false;
+        if (len - k == 1u) {
+            if (k == n && k < ctx->room && k < UINT32_MAX) k++;
+            else if (k > 2u) k--;
+            else return false;
+        }
+        ctx->found_start = start;
+        ctx->found_len   = k;
+        return true;
+    }
+    if (ctx->hint_start != 0 && ctx->hint_start >= start &&
+        ctx->hint_start - start < len) {
+        uint64_t h = ctx->hint_start - start;
+        if (h != 1u && len - h >= n && len - h - n != 1u) {
+            ctx->found_start = ctx->hint_start;
+            ctx->found_len   = n;
+            return true;
+        }
+    }
+    if (len == n || (len > n && len - n >= 2u)) {
+        ctx->found_start = start;
+        ctx->found_len   = n;
+        return true;
+    }
+    if (len == n + 1u && !ctx->have_spare && n < UINT32_MAX) {
+        ctx->have_spare  = true;
+        ctx->spare_start = start;
+    }
+    return false;
+}
 
 static int reserve_scan_cb(const void *key, size_t key_len,
                             const void *value, size_t value_len,
@@ -964,24 +1035,9 @@ static int reserve_scan_cb(const void *key, size_t key_len,
     decode_val(value, &length, &refcount);
     (void)refcount;   /* PENDING (refcount=0) entries still occupy space */
 
-    /* If there's a hint and it lies in the gap [cursor, start), and
-     * the gap is big enough, honor it. Overflow-safe form:
-     *   hint_start ∈ [cursor, start)
-     *   start - hint_start >= nblocks  (distinct subtraction — safe
-     *                                    because hint_start < start) */
-    if (ctx->hint_start != 0 &&
-        ctx->hint_start >= ctx->cursor &&
-        ctx->hint_start < start &&
-        start - ctx->hint_start >= ctx->nblocks) {
+    if (start > ctx->cursor &&
+        reserve_gap_fits(ctx, ctx->cursor, start - ctx->cursor)) {
         ctx->found = true;
-        ctx->found_start = ctx->hint_start;
-        return 1;
-    }
-
-    /* Check the gap [cursor, start). */
-    if (start > ctx->cursor && start - ctx->cursor >= ctx->nblocks) {
-        ctx->found = true;
-        ctx->found_start = ctx->cursor;
         return 1;
     }
 
@@ -1013,7 +1069,8 @@ static uint64_t alloc_room_locked(const stm_alloc *a, enum alloc_class cls)
     uint64_t held = a->dirty_reserved > a->drain_inflight
                   ? a->dirty_reserved - a->drain_inflight : 0;
     uint64_t slop = alloc_slop_locked(a);
-    uint64_t keep = held + (cls == ALLOC_NETFREE ? slop / 2u : slop);
+    uint64_t keep = held + a->singletons
+                  + (cls == ALLOC_NETFREE ? slop / 2u : slop);
     return f > keep ? f - keep : 0;
 }
 
@@ -1023,9 +1080,12 @@ static uint64_t alloc_avail_locked(const stm_alloc *a)
     return alloc_room_locked(a, ALLOC_ORDINARY);
 }
 
-static stm_status alloc_reserve(stm_alloc *a, uint64_t nblocks,
-                                uint64_t hint_paddr, uint64_t *out_paddr,
-                                enum alloc_class cls)
+/* Reserve `nblocks` (up to that many, with `upto`) of class `cls`; the
+ * length taken in *out_got. */
+static stm_status alloc_take(stm_alloc *a, uint64_t nblocks, bool upto,
+                             bool first_fit, uint64_t hint_paddr,
+                             uint64_t *out_paddr, uint64_t *out_got,
+                             enum alloc_class cls)
 {
     if (!a || !out_paddr) return STM_EINVAL;
     if (nblocks == 0) return STM_EINVAL;
@@ -1034,9 +1094,11 @@ static stm_status alloc_reserve(stm_alloc *a, uint64_t nblocks,
      * (which don't advance the scan cursor → subsequent reserves
      * overlap). */
     if (nblocks > UINT32_MAX) return STM_ERANGE;
+    if (nblocks < 2u && !first_fit) nblocks = 2u;
 
     pthread_mutex_lock(&a->lock);
-    if (alloc_room_locked(a, cls) < nblocks) {
+    uint64_t room = alloc_room_locked(a, cls);
+    if (room < (upto ? 2u : nblocks)) {
         pthread_mutex_unlock(&a->lock);
         return STM_ENOSPC;
     }
@@ -1051,11 +1113,17 @@ static stm_status alloc_reserve(stm_alloc *a, uint64_t nblocks,
 
     reserve_ctx ctx = {
         .nblocks       = nblocks,
+        .upto          = upto,
+        .first_fit     = first_fit,
+        .room          = room,
         .cursor        = a->data_first_block,
         .data_last     = a->data_last_block,
         .hint_start    = hint_start,
         .found         = false,
         .found_start   = 0,
+        .found_len     = 0,
+        .have_spare    = false,
+        .spare_start   = 0,
         .saw_bad_entry = false,
     };
 
@@ -1070,25 +1138,15 @@ static stm_status alloc_reserve(stm_alloc *a, uint64_t nblocks,
         return STM_ECORRUPT;
     }
 
-    /* If the scan didn't find a gap, check the tail region
-     * [cursor, data_last + 1). Arithmetic is overflow-safe because
-     * cursor ≤ data_last is checked first. */
-    if (!ctx.found) {
-        if (ctx.cursor <= ctx.data_last &&
-            ctx.data_last - ctx.cursor + 1 >= nblocks) {
-            /* Honor hint if it falls in the tail with room for the run.
-             * hint_start ∈ [cursor, data_last - nblocks + 1]. */
-            if (hint_start != 0 &&
-                hint_start >= ctx.cursor &&
-                hint_start <= ctx.data_last &&
-                ctx.data_last - hint_start + 1 >= nblocks) {
-                ctx.found = true;
-                ctx.found_start = hint_start;
-            } else {
-                ctx.found = true;
-                ctx.found_start = ctx.cursor;
-            }
-        }
+    /* The tail region [cursor, data_last + 1) is a gap like the others.
+     * cursor <= data_last is checked first, so the length cannot wrap. */
+    if (!ctx.found && ctx.cursor <= ctx.data_last &&
+        reserve_gap_fits(&ctx, ctx.cursor, ctx.data_last - ctx.cursor + 1u))
+        ctx.found = true;
+    if (!ctx.found && ctx.have_spare && room > nblocks) {
+        ctx.found       = true;
+        ctx.found_start = ctx.spare_start;
+        ctx.found_len   = nblocks + 1u;
     }
 
     if (!ctx.found) {
@@ -1121,15 +1179,15 @@ static stm_status alloc_reserve(stm_alloc *a, uint64_t nblocks,
 
     /* Safe to insert. */
     uint8_t val_buf[8];
-    encode_val((uint32_t)nblocks, 1u, val_buf);
+    encode_val((uint32_t)ctx.found_len, 1u, val_buf);
 
     s = stm_btree_mt_insert(a->tree, key_buf, 8, val_buf, 8);
     if (s != STM_OK) {
         pthread_mutex_unlock(&a->lock);
         return s;
     }
-    a->allocated_blocks += nblocks;   /* new refcount=1 range enters allocated */
-    if (cls == ALLOC_DRAIN) a->drain_inflight += nblocks;
+    a->allocated_blocks += ctx.found_len;   /* new refcount=1 range enters allocated */
+    if (cls == ALLOC_DRAIN) a->drain_inflight += ctx.found_len;
 
     /* P5-3c: stamp this alloc's device_id into the top 16 bits of
      * the returned paddr. Callers that dereference this paddr (bdev
@@ -1138,10 +1196,114 @@ static stm_status alloc_reserve(stm_alloc *a, uint64_t nblocks,
      * low 48 bits (start_block offset) so the existing lookup/free
      * paths are device-id-symmetric. */
     *out_paddr = stm_paddr_make(a->device_id, ctx.found_start);
+    if (out_got) *out_got = ctx.found_len;
     a->tree_dirty = true;
     accel_invalidate_locked(a);    /* new start_block added to the set */
     pthread_mutex_unlock(&a->lock);
     return STM_OK;
+}
+
+static stm_status alloc_reserve(stm_alloc *a, uint64_t nblocks,
+                                uint64_t hint_paddr, uint64_t *out_paddr,
+                                enum alloc_class cls)
+{
+    return alloc_take(a, nblocks, false, false, hint_paddr, out_paddr, NULL,
+                      cls);
+}
+
+static stm_status alloc_reserve_upto(stm_alloc *a, uint64_t max_nblocks,
+                                     uint64_t *out_paddr,
+                                     uint64_t *out_nblocks,
+                                     enum alloc_class cls)
+{
+    if (!out_nblocks) return STM_EINVAL;
+    return alloc_take(a, max_nblocks, true, false, 0, out_paddr, out_nblocks,
+                      cls);
+}
+
+stm_status stm_alloc_reserve_upto(stm_alloc *a, uint64_t max_nblocks,
+                                  uint64_t *out_paddr, uint64_t *out_nblocks)
+{
+    return alloc_reserve_upto(a, max_nblocks, out_paddr, out_nblocks,
+                              ALLOC_ORDINARY);
+}
+
+stm_status stm_alloc_reserve_upto_for_drain(stm_alloc *a, uint64_t max_nblocks,
+                                            uint64_t *out_paddr,
+                                            uint64_t *out_nblocks)
+{
+    return alloc_reserve_upto(a, max_nblocks, out_paddr, out_nblocks,
+                              ALLOC_DRAIN);
+}
+
+stm_status stm_alloc_reserve_upto_netfree(stm_alloc *a, uint64_t max_nblocks,
+                                          uint64_t *out_paddr,
+                                          uint64_t *out_nblocks)
+{
+    return alloc_reserve_upto(a, max_nblocks, out_paddr, out_nblocks,
+                              ALLOC_NETFREE);
+}
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+stm_status stm_alloc_reserve_first_fit_for_test(stm_alloc *a, uint64_t nblocks,
+                                                uint64_t *out_paddr)
+{
+    return alloc_take(a, nblocks, false, true, 0, out_paddr, NULL,
+                      ALLOC_ORDINARY);
+}
+#endif
+
+/* The range at `paddr`, reserved and never written, leaves the tree: the
+ * gap it came from is whole again, with nothing PENDING. */
+static stm_status alloc_unreserve(stm_alloc *a, uint64_t paddr, bool drain)
+{
+    if (!a) return STM_EINVAL;
+    if (stm_paddr_device(paddr) != a->device_id) return STM_EINVAL;
+    uint8_t key_buf[8];
+    uint8_t val_buf[8] = { 0 };
+    size_t  val_len    = 0;
+    encode_key(stm_paddr_offset(paddr), key_buf);
+
+    pthread_mutex_lock(&a->lock);
+    stm_status s = stm_btree_mt_lookup(a->tree, key_buf, 8,
+                                        val_buf, sizeof val_buf, &val_len);
+    if (s != STM_OK) {
+        pthread_mutex_unlock(&a->lock);
+        return s == STM_ERANGE ? STM_ECORRUPT : s;
+    }
+    if (val_len != 8) {
+        pthread_mutex_unlock(&a->lock);
+        return STM_ECORRUPT;
+    }
+    uint32_t length = 0, refcount = 0;
+    decode_val(val_buf, &length, &refcount);
+    if (refcount != 1u) {
+        pthread_mutex_unlock(&a->lock);
+        return STM_EINVAL;
+    }
+    s = stm_btree_mt_delete(a->tree, key_buf, 8);
+    if (s != STM_OK) {
+        pthread_mutex_unlock(&a->lock);
+        return s;
+    }
+    a->allocated_blocks -= length;
+    if (drain)
+        a->drain_inflight = a->drain_inflight > length
+                          ? a->drain_inflight - length : 0;
+    a->tree_dirty = true;
+    accel_invalidate_locked(a);
+    pthread_mutex_unlock(&a->lock);
+    return STM_OK;
+}
+
+stm_status stm_alloc_unreserve(stm_alloc *a, uint64_t paddr)
+{
+    return alloc_unreserve(a, paddr, false);
+}
+
+stm_status stm_alloc_unreserve_for_drain(stm_alloc *a, uint64_t paddr)
+{
+    return alloc_unreserve(a, paddr, true);
 }
 
 stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,

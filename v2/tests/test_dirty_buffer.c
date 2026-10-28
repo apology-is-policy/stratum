@@ -864,4 +864,28 @@ STM_TEST(dbuf_shelf_reuses_drained_buffers)
     stm_dirty_buffer_destroy(b);
 }
 
+/* The charge factor scales every block a range spans, never the block per
+ * record: with 2, a 1-byte write is charged 3 and a 3-block one 7; with 3,
+ * a 1-byte write 4. */
+STM_TEST(dbuf_the_charge_factor_scales_the_span)
+{
+    enum { BLK = 4096u };
+    uint8_t pad[3u * BLK];
+    memset(pad, 0, sizeof pad);
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+    stm_dirty_buffer_set_charge_factor(b, 2u);
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 0, 1, pad));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)3);
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 4u * BLK, 3u * BLK, pad));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)10);
+    stm_dirty_buffer_destroy(b);
+    b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+    stm_dirty_buffer_set_charge_factor(b, 3u);
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 0, 1, pad));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(b), (uint64_t)4);
+    stm_dirty_buffer_destroy(b);
+}
+
 STM_TEST_MAIN("test_dirty_buffer")

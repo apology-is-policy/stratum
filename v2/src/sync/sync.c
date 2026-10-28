@@ -3620,6 +3620,33 @@ static stm_status sync_alloc_reserve_locked(stm_sync *s, stm_alloc *a,
     return stm_alloc_reserve(a, nblocks, hint_paddr, out_paddr);
 }
 
+/* As sync_alloc_reserve_locked (stm_alloc_reserve_netfree when `netfree`),
+ * up to `max` blocks of the first free run of 2 or more; the length taken
+ * in *got. Caller holds s->lock. */
+static stm_status sync_alloc_reserve_upto_locked(stm_sync *s, stm_alloc *a,
+                                                 bool netfree, uint64_t max,
+                                                 uint64_t *out_paddr,
+                                                 uint64_t *got)
+{
+    if (netfree) return stm_alloc_reserve_upto_netfree(a, max, out_paddr, got);
+    if (s->draining && pthread_equal(s->drainer, pthread_self()))
+        return stm_alloc_reserve_upto_for_drain(a, max, out_paddr, got);
+    return stm_alloc_reserve_upto(a, max, out_paddr, got);
+}
+
+/* Give back a reservation of either reserve above that nothing was written
+ * to; one the allocator will not take back goes PENDING, as any freed
+ * range. Caller holds s->lock. */
+static void sync_alloc_unreserve_locked(stm_sync *s, stm_alloc *a,
+                                        bool netfree, uint64_t paddr)
+{
+    stm_status us = !netfree && s->draining &&
+                    pthread_equal(s->drainer, pthread_self())
+                  ? stm_alloc_unreserve_for_drain(a, paddr)
+                  : stm_alloc_unreserve(a, paddr);
+    if (us != STM_OK) (void)stm_alloc_free(a, paddr, s->current_gen);
+}
+
 /* The room that sync_alloc_reserve_locked's reserve (or, `netfree`,
  * stm_alloc_reserve_netfree) is judged by: a refusal of more blocks is
  * for want of room, of fewer for want of a free run. Caller holds
@@ -6155,8 +6182,23 @@ static void sync_write_reserve_rollback(stm_sync *s,
     stm_ct_memzero(res->dek, sizeof res->dek);
 }
 
+/* Give back every run the pieces hold so far: nothing was written to
+ * them. Caller holds s->lock. */
+static void sync_write_unreserve_locked(stm_sync *s, bool netfree,
+                                        sync_write_reservation *res)
+{
+    sync_write_piece *wp = sync_write_pieces(res);
+    for (size_t k = 0; k < res->n_pieces; k++) {
+        for (size_t j = 0; j < wp[k].reserved_count; j++)
+            sync_alloc_unreserve_locked(s, s->allocs[j], netfree,
+                                        wp[k].replicas[j]);
+        wp[k].reserved_count = 0;
+    }
+    sync_write_release(res);
+}
+
 /* Reserve one piece's run on every replica device. On failure none of it
- * is held. */
+ * is held, and none of it is PENDING. */
 static stm_status sync_write_reserve_piece_locked(stm_sync *s, bool netfree,
                                                   size_t n_replicas,
                                                   size_t tag_len,
@@ -6173,8 +6215,8 @@ static stm_status sync_write_reserve_piece_locked(stm_sync *s, bool netfree,
                                         &pc->replicas[i]);
         if (rs != STM_OK) {
             for (size_t j = 0; j < pc->reserved_count; j++)
-                (void)stm_alloc_free(s->allocs[j], pc->replicas[j],
-                                     s->current_gen);
+                sync_alloc_unreserve_locked(s, s->allocs[j], netfree,
+                                            pc->replicas[j]);
             pc->reserved_count = 0;
             return rs;
         }
@@ -6184,9 +6226,7 @@ static stm_status sync_write_reserve_piece_locked(stm_sync *s, bool netfree,
 }
 
 /* Whether every replica device has the room for `len` bytes in one piece.
- * Pieces need at least that much, so without it they cannot fit either,
- * and reserving them would only leave their blocks PENDING until the next
- * commit. */
+ * Pieces need at least that much, so without it they cannot fit either. */
 static bool sync_write_room_admits_locked(stm_sync *s, bool netfree,
                                           size_t n_replicas, size_t tag_len,
                                           size_t len)
@@ -6198,48 +6238,83 @@ static bool sync_write_room_admits_locked(stm_sync *s, bool netfree,
     return true;
 }
 
-/* No free run holds the whole write: cut it into pieces as long as the
- * free runs, halving the piece until one fits, down to one block of
- * data. Each extra piece costs its own tag block; the slop is the margin
- * that pays for them. No piece is cut while the room cannot hold the rest
- * of the write. On failure nothing is held: the pieces already reserved
- * land PENDING, as any rolled-back reservation. */
+/* No free run holds the whole write: write it in pieces, each the whole of
+ * a free run on device 0, or the rest of the write. A piece of d blocks of
+ * data takes d + 1 with its tag, and the last one 1 more where its run is
+ * 1 block longer, so one device spends at most 2 blocks per block of data,
+ * plus 1: the most the dirty buffer charges a drain. Every other replica
+ * takes a run as long as the piece, or 1 longer where that is all it has,
+ * so at most 3 per block on a mirror; one that has none hands every run of
+ * the piece back and the piece shrinks to its first free run. No piece is cut while the room
+ * cannot hold the rest of the write. On failure nothing is held, and
+ * nothing is left PENDING. */
 static stm_status sync_write_reserve_pieces_locked(stm_sync *s, bool netfree,
                                                    uint64_t off, size_t len,
                                                    sync_write_reservation *res)
 {
-    res->many = malloc(((len + STM_UB_SIZE - 1u) / STM_UB_SIZE)
-                       * sizeof *res->many);
+    const size_t UB = STM_UB_SIZE;
+    res->many = malloc(((len + UB - 1u) / UB) * sizeof *res->many);
     if (!res->many) return STM_ENOMEM;
     res->n_pieces = 0;
-    size_t cap = (len / 2u) & ~(size_t)(STM_UB_SIZE - 1u);
-    if (cap < STM_UB_SIZE) cap = STM_UB_SIZE;
     uint64_t at = off;
     size_t left = len;
+    size_t want = (left + UB - 1u) / UB;     /* blocks of data to ask for */
     while (left > 0) {
         if (!sync_write_room_admits_locked(s, netfree, res->n_replicas,
                                            res->tag_len, left)) {
-            sync_write_reserve_rollback(s, res);
+            sync_write_unreserve_locked(s, netfree, res);
             return STM_ENOSPC;
         }
         sync_write_piece *pc = &res->many[res->n_pieces];
         pc->off = at;
-        pc->len = left < cap ? left : cap;
-        stm_status rs = sync_write_reserve_piece_locked(s, netfree,
-                                                        res->n_replicas,
-                                                        res->tag_len, pc);
+        pc->reserved_count = 0;
+        uint64_t got = 0;
+        stm_status rs = sync_alloc_reserve_upto_locked(s, s->allocs[0],
+                                                       netfree, want + 1u,
+                                                       &pc->replicas[0], &got);
+        if (rs != STM_OK) {
+            sync_write_unreserve_locked(s, netfree, res);
+            return rs;
+        }
+        pc->reserved_count = 1;
+        size_t d = (size_t)got - 1u;
+        if (d > want) d = want;
+        pc->len         = d * UB < left ? d * UB : left;
+        pc->total_bytes = pc->len + res->tag_len;
+        pc->nblocks     = (pc->total_bytes + UB - 1u) / UB;
+        size_t i = 1;
+        for (; i < res->n_replicas && rs == STM_OK; i++) {
+            rs = netfree
+                ? stm_alloc_reserve_netfree(s->allocs[i], pc->nblocks, 0,
+                                            &pc->replicas[i])
+                : sync_alloc_reserve_locked(s, s->allocs[i], pc->nblocks, 0,
+                                            &pc->replicas[i]);
+            if (rs == STM_OK) pc->reserved_count++;
+        }
         if (rs == STM_OK) {
             res->n_pieces++;
             at   += pc->len;
             left -= pc->len;
+            want  = (left + UB - 1u) / UB;
             continue;
         }
-        if (rs != STM_ENOSPC || pc->len <= STM_UB_SIZE) {
-            sync_write_reserve_rollback(s, res);
+        /* Device i - 1 has no run as long as the piece: the next try asks
+         * for what its first free run holds, which is shorter. */
+        uint64_t probe = 0, fits = 0;
+        if (rs == STM_ENOSPC &&
+            sync_alloc_reserve_upto_locked(s, s->allocs[i - 1u], netfree,
+                                           pc->nblocks, &probe,
+                                           &fits) == STM_OK)
+            sync_alloc_unreserve_locked(s, s->allocs[i - 1u], netfree, probe);
+        for (size_t j = 0; j < pc->reserved_count; j++)
+            sync_alloc_unreserve_locked(s, s->allocs[j], netfree,
+                                        pc->replicas[j]);
+        pc->reserved_count = 0;
+        if (fits < 2u || fits - 1u >= (pc->len + UB - 1u) / UB) {
+            sync_write_unreserve_locked(s, netfree, res);
             return rs;
         }
-        cap = (pc->len / 2u) & ~(size_t)(STM_UB_SIZE - 1u);
-        if (cap < STM_UB_SIZE) cap = STM_UB_SIZE;
+        want = (size_t)fits - 1u;
     }
     return STM_OK;
 }

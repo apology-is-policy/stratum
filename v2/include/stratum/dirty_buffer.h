@@ -182,6 +182,17 @@ void stm_dirty_buffer_set_reservation(stm_dirty_buffer *buf,
                                       void *user);
 
 /*
+ * The most pool blocks a drain spends per block of data it writes: each
+ * range is charged that many for every block it spans, plus a block per
+ * record. 1, the default, holds for a drain that writes every record in
+ * one run; a drain that cuts a record into pieces as short as the free
+ * runs, each with its own tag, spends up to 2 on one device and 3 on a
+ * mirror (stm_sync). Set before the first insert; 0 is ignored.
+ */
+void stm_dirty_buffer_set_charge_factor(stm_dirty_buffer *buf,
+                                        uint32_t factor);
+
+/*
  * Read-overlay lookup: copies into `out_buf` the LONGEST contiguous
  * prefix of [off, off+len) that is covered by buffered ranges for
  * (dataset_id, ino), and sets *out_covered to the byte count copied.

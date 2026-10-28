@@ -106,6 +106,7 @@ struct stm_dirty_buffer {
     stm_dirty_buffer_reserve_fn reserve;
     stm_dirty_buffer_release_fn release;
     void                       *res_user;
+    uint32_t                    charge_factor; /* pool blocks per block */
 };
 
 /* ───────────────────────────── helpers ────────────────────────────── */
@@ -252,23 +253,29 @@ static bool ranges_overlap(uint64_t a, uint64_t la,
  * mirrors STM_FS_RECORDSIZE_MAX (8 MiB) conservatively: a smaller real
  * recordsize would only mean MORE pieces than charged -- so keep the
  * mirror <= the fs constant. A range's charge is set once, at insert, and
- * every removal subtracts that charge, so accounting stays symmetric. */
+ * every removal subtracts that charge, so accounting stays symmetric.
+ * A drain that finds no free run long enough for a record writes it in
+ * pieces, each with its own tag, so it may spend up to charge_factor
+ * blocks per block of data (stm_dirty_buffer_set_charge_factor): the span
+ * is charged that many times. */
 #define DBUF_RECPIECE (8ull * 1024u * 1024u)
-static uint64_t blocks_spanned(uint64_t off, uint64_t len)
+static uint64_t blocks_spanned(const stm_dirty_buffer *buf, uint64_t off,
+                               uint64_t len)
 {
     if (len == 0) return 0;
     uint64_t blk   = (uint64_t)STM_UB_SIZE;
     uint64_t first = off / blk;
     uint64_t last  = (off + len - 1u) / blk;
     uint64_t pieces = (len + DBUF_RECPIECE - 1u) / DBUF_RECPIECE;
-    return last - first + 1u + pieces;
+    return buf->charge_factor * (last - first + 1u) + pieces;
 }
 
 /* The cover blocks a range was charged beyond its own span. A remnant of
  * it lies in the same cover, so it keeps them. */
-static uint64_t dbuf_extra(const stm_dbuf_range *r)
+static uint64_t dbuf_extra(const stm_dirty_buffer *buf,
+                           const stm_dbuf_range *r)
 {
-    return r->charge - blocks_spanned(r->off, r->len);
+    return r->charge - blocks_spanned(buf, r->off, r->len);
 }
 
 /* ───────────────────────────── public API ─────────────────────────── */
@@ -288,6 +295,7 @@ stm_status stm_dirty_buffer_create(size_t per_inode_cap_bytes,
     }
     buf->inode_cap   = per_inode_cap_bytes;
     buf->global_cap  = global_cap_bytes;
+    buf->charge_factor = 1u;
     buf->total_bytes = 0;
     *out = buf;
     return STM_OK;
@@ -377,11 +385,12 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     /* #40: the charges of the head-remnant + new range + tail-remnant.
      * Per-range (each stored separately) so it matches the drain-time
      * subtraction; conservative vs the contiguous union (see blocks_spanned). */
-    uint64_t new_charge  = blocks_spanned(off, len) + extra_blocks;
+    uint64_t new_charge  = blocks_spanned(buf, off, len) + extra_blocks;
     uint64_t head_charge = head_len > 0u
-        ? blocks_spanned(first_ov->off, head_len) + dbuf_extra(first_ov) : 0u;
+        ? blocks_spanned(buf, first_ov->off, head_len)
+          + dbuf_extra(buf, first_ov) : 0u;
     uint64_t tail_charge = tail_len > 0u
-        ? blocks_spanned(end, tail_len) + dbuf_extra(last_ov) : 0u;
+        ? blocks_spanned(buf, end, tail_len) + dbuf_extra(buf, last_ov) : 0u;
     uint64_t added_footprint = new_charge + head_charge + tail_charge;
 
     /* Per writeback.tla::BufferedWrite cap clauses: after superseding the
@@ -558,6 +567,15 @@ stm_status stm_dirty_buffer_insert_admitted(stm_dirty_buffer *buf,
     if (!admit) return STM_EINVAL;
     return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
                                 0u, UINT64_MAX, admit, admit_user);
+}
+
+void stm_dirty_buffer_set_charge_factor(stm_dirty_buffer *buf,
+                                        uint32_t factor)
+{
+    if (!buf || factor == 0u) return;
+    pthread_mutex_lock(&buf->mu);
+    buf->charge_factor = factor;
+    pthread_mutex_unlock(&buf->mu);
 }
 
 void stm_dirty_buffer_set_reservation(stm_dirty_buffer *buf,

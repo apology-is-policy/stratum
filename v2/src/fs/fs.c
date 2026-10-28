@@ -228,6 +228,7 @@ struct stm_fs {
      * CAP_BYTES global. See dirty_buffer.h for the spec-to-code
      * mapping. */
     stm_dirty_buffer *dirty_buffer;     /* owned */
+    uint32_t          charge_factor;    /* the buffer's, for its covers */
 
     /* P7-13 R45 P2-1: mount-time wrap-key source. Exactly one is
      * non-NULL; both freed at unmount. Retained so
@@ -1435,7 +1436,17 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         free(fs);
         return NULL;
     }
+    fs->charge_factor = 1u;
     if (sync) {
+        /* A drain may write a record in pieces as short as the free runs:
+         * up to 2 blocks per block of data on one device, 3 on a mirror's
+         * other devices (sync_write_reserve_pieces_locked). */
+        stm_redundancy_profile rp;
+        fs->charge_factor = stm_sync_redundancy_get(sync, &rp) == STM_OK &&
+                            rp.kind == STM_RED_MIRROR && rp.mirror_n > 1u
+                          ? 3u : 2u;
+        stm_dirty_buffer_set_charge_factor(fs->dirty_buffer,
+                                           fs->charge_factor);
         stm_sync_set_dirty_guard(sync, true);
         stm_dirty_buffer_set_reservation(fs->dirty_buffer, fs_dirty_reserve,
                                          fs_dirty_release, fs);
@@ -2401,7 +2412,8 @@ static stm_status fs_cover_extra_blocks(stm_fs *fs, uint64_t ds, uint64_t ino,
     uint64_t r_lo = off & ~(BLK - 1u), r_hi = (end + BLK - 1u) & ~(BLK - 1u);
     if (c_lo == r_lo && c_hi == r_hi) return STM_OK;
     uint64_t span = c_hi - c_lo;
-    *out_extra = (span - (r_hi - r_lo)) / BLK + 2u * ((span + REC - 1u) / REC);
+    *out_extra = fs->charge_factor * ((span - (r_hi - r_lo)) / BLK)
+               + 2u * ((span + REC - 1u) / REC);
     return STM_OK;
 }
 
@@ -2659,7 +2671,8 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         bool wb_txn_held = false;   /* R2-F1: txn RD held into the iset */
         stm_status part = STM_OK;   /* a direct write that landed a prefix */
         size_t wrote = len;
-        if (len < STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
+        bool direct = len >= STM_FLUSH_DIRECT_THRESHOLD_BYTES;
+        if (!direct) {
             /* #40 pool-aware admission (atomic, block-granular): the insert
              * takes the buffered block FOOTPRINT in the pool's dirty
              * reservation, which holds it out of every other allocation
@@ -2714,9 +2727,15 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                     fs_txn_rd_end(fs);
                     wb_txn_held = false;
                 }
-                return ic;
+                if (ic != STM_ENOSPC) return ic;
+                /* The buffer charges a write the most its drain could
+                 * spend; a pool too full for that may still hold what the
+                 * write takes, so write it direct (ext4's fallback from
+                 * delayed allocation near full). */
+                direct = true;
             }
-        } else {
+        }
+        if (direct) {
             /* Direct path: pre-flush this inode's buffered ranges so
              * the overlay at read-after-direct-write doesn't shadow
              * the just-written direct extent. */

@@ -22,6 +22,7 @@
  */
 #include "tharness.h"
 #include <stratum/alloc.h>
+#include <stratum/alloc_testing.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
 #include <stratum/super.h>
@@ -1078,6 +1079,271 @@ STM_TEST(alloc_first_allocated_from_below_first_entry) {
 
     stm_alloc_close(a);
     stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Lay out [3][3][3][3][3][3][3][3][the rest], free every second 3, and
+ * sweep: four 3-block gaps. p[] gets the eight starts. */
+static void three_block_gaps(stm_alloc *a, uint64_t p[8])
+{
+    uint64_t rest = 0;
+    for (int i = 0; i < 8; i++)
+        STM_ASSERT_OK(stm_alloc_reserve(a, 3u, 0, &p[i]));
+    STM_ASSERT_OK(stm_alloc_reserve(a, TEST_DATA_TOTAL_BLOCKS - 24u, 0, &rest));
+    for (int i = 1; i < 8; i += 2)
+        STM_ASSERT_OK(stm_alloc_free(a, p[i], 1));
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));
+    STM_ASSERT_EQ(stm_alloc_data_free_blocks(a), (uint64_t)12);
+}
+
+static uint64_t alloc_len(stm_alloc *a, uint64_t paddr)
+{
+    uint64_t len = 0;
+    uint32_t rc = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(a, paddr, &len, &rc));
+    return len;
+}
+
+/* No allocation leaves a 1-block gap, which no extent could use: on 3-block
+ * gaps a 2-block (or 1-block) request takes a whole gap, so every free
+ * block stays usable and a 2-block request fails only once fewer than 2
+ * are free. */
+STM_TEST(alloc_no_request_leaves_a_one_block_gap) {
+    make_tmp("nosingle");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t p[8], q[4];
+    three_block_gaps(a, p);
+    STM_ASSERT_OK(stm_alloc_reserve(a, 2u, 0, &q[0]));
+    STM_ASSERT_EQ(q[0], p[1]);
+    STM_ASSERT_EQ(alloc_len(a, q[0]), (uint64_t)3);
+    STM_ASSERT_OK(stm_alloc_reserve(a, 1u, 0, &q[1]));
+    STM_ASSERT_EQ(alloc_len(a, q[1]), (uint64_t)3);
+    STM_ASSERT_OK(stm_alloc_reserve(a, 2u, 0, &q[2]));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 2u, 0, &q[3]));
+    STM_ASSERT_EQ(stm_alloc_data_free_blocks(a), (uint64_t)0);
+    uint64_t r = 0;
+    STM_ASSERT_ERR(stm_alloc_reserve(a, 2u, 0, &r), STM_ENOSPC);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A gap 1 block longer than the request is only the fallback: a gap of
+ * the request's length, later, comes first. */
+STM_TEST(alloc_an_exact_gap_comes_before_one_a_block_longer) {
+    make_tmp("exactfirst");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t p[5], rest = 0, q = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p[0]));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 3u, 0, &p[1]));   /* gap of 3 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p[2]));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 2u, 0, &p[3]));   /* gap of 2 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, TEST_DATA_TOTAL_BLOCKS - 13u, 0, &rest));
+    STM_ASSERT_OK(stm_alloc_free(a, p[1], 1));
+    STM_ASSERT_OK(stm_alloc_free(a, p[3], 1));
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 2u, 0, &q));
+    STM_ASSERT_EQ(q, p[3]);
+    STM_ASSERT_EQ(alloc_len(a, q), (uint64_t)2);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* The tail is a gap like the others: a request 1 block short of it takes
+ * it all. */
+STM_TEST(alloc_the_tail_keeps_no_single_block) {
+    make_tmp("tail1");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t p = 0, q = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, TEST_DATA_TOTAL_BLOCKS - 1u, 0, &p));
+    STM_ASSERT_EQ(alloc_len(a, p), (uint64_t)TEST_DATA_TOTAL_BLOCKS);
+    STM_ASSERT_EQ(stm_alloc_data_free_blocks(a), (uint64_t)0);
+    STM_ASSERT_ERR(stm_alloc_reserve(a, 1u, 0, &q), STM_ENOSPC);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A hint that would leave a 1-block gap on either side is ignored. */
+STM_TEST(alloc_a_hint_leaving_one_block_is_ignored) {
+    make_tmp("hint1");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    const uint64_t F = TEST_DATA_FIRST_BLOCK;
+    uint64_t p1 = 0, p2 = 0, p3 = 0, q = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 64u, 0, &p2));    /* [F+8, F+72) */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p3));
+    STM_ASSERT_OK(stm_alloc_free(a, p2, 1));
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, stm_paddr_make(0, F + 9u), &q));
+    STM_ASSERT_EQ(stm_paddr_offset(q), (uint64_t)(F + 8u));
+    STM_ASSERT_OK(stm_alloc_unreserve(a, q));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, stm_paddr_make(0, F + 55u), &q));
+    STM_ASSERT_EQ(stm_paddr_offset(q), (uint64_t)(F + 8u));
+    STM_ASSERT_OK(stm_alloc_unreserve(a, q));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, stm_paddr_make(0, F + 54u), &q));
+    STM_ASSERT_EQ(stm_paddr_offset(q), (uint64_t)(F + 54u));
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* reserve_upto takes the first free run of 2 or more: all of it when it
+ * is no longer than asked, what was asked when it is 2 longer or more,
+ * and all of it when it is 1 longer. */
+STM_TEST(alloc_reserve_upto_takes_the_first_run) {
+    make_tmp("upto");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t p[4], rest = 0, q = 0, got = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p[0]));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 5u, 0, &p[1]));   /* gap of 5 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p[2]));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 10u, 0, &p[3]));  /* gap of 10 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, TEST_DATA_TOTAL_BLOCKS - 23u, 0, &rest));
+    STM_ASSERT_OK(stm_alloc_free(a, p[1], 1));
+    STM_ASSERT_OK(stm_alloc_free(a, p[3], 1));
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));
+    STM_ASSERT_OK(stm_alloc_reserve_upto(a, 8u, &q, &got));
+    STM_ASSERT_EQ(q, p[1]);
+    STM_ASSERT_EQ(got, (uint64_t)5);
+    STM_ASSERT_OK(stm_alloc_unreserve(a, q));
+    STM_ASSERT_OK(stm_alloc_reserve_upto(a, 3u, &q, &got));
+    STM_ASSERT_EQ(got, (uint64_t)3);
+    STM_ASSERT_EQ(alloc_len(a, q), (uint64_t)3);
+    STM_ASSERT_OK(stm_alloc_unreserve(a, q));
+    STM_ASSERT_OK(stm_alloc_reserve_upto(a, 4u, &q, &got));
+    STM_ASSERT_EQ(q, p[1]);
+    STM_ASSERT_EQ(got, (uint64_t)5);
+    STM_ASSERT_OK(stm_alloc_unreserve(a, q));
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Where the room is shorter than the first run, reserve_upto takes the
+ * room, or 1 block less where the room would leave a 1-block gap, and
+ * nothing once the room holds fewer than 2. */
+STM_TEST(alloc_reserve_upto_keeps_to_the_room) {
+    make_tmp("upto_room");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t p[3], q = 0, got = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p[0]));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 5u, 0, &p[1]));   /* gap of 5 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p[2]));
+    STM_ASSERT_OK(stm_alloc_free(a, p[1], 1));
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));
+    stm_alloc_set_guarded(a, true);
+    const uint64_t f = stm_alloc_data_free_blocks(a);
+    const uint64_t slop = stm_alloc_slop_blocks(a);
+    STM_ASSERT_OK(stm_alloc_dirty_reserve(a, f - slop - 4u));
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a), (uint64_t)4);
+    STM_ASSERT_OK(stm_alloc_reserve_upto(a, 10u, &q, &got));
+    STM_ASSERT_EQ(q, p[1]);
+    STM_ASSERT_EQ(got, (uint64_t)3);
+    STM_ASSERT_OK(stm_alloc_unreserve(a, q));
+    STM_ASSERT_OK(stm_alloc_dirty_reserve(a, 3u));
+    STM_ASSERT_ERR(stm_alloc_reserve_upto(a, 10u, &q, &got), STM_ENOSPC);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A reservation nothing was written to goes back free at once: the free
+ * count is restored, nothing is PENDING, and the gap is whole again, so
+ * the next reserve gets the same run. Only a range at refcount 1 can go
+ * back that way. */
+STM_TEST(alloc_unreserve_restores_the_gap) {
+    make_tmp("unres");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t p = 0, q = 0, r = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &r));
+    STM_ASSERT_OK(stm_alloc_unreserve(a, p));
+    STM_ASSERT_EQ(stm_alloc_data_free_blocks(a),
+                  (uint64_t)TEST_DATA_TOTAL_BLOCKS - 8u);
+    STM_ASSERT_EQ(stm_alloc_pending_blocks(a), (uint64_t)0);
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &q));
+    STM_ASSERT_EQ(q, p);
+    STM_ASSERT_ERR(stm_alloc_unreserve(a, stm_paddr_make(0, stm_paddr_offset(p) + 1u)),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_alloc_ref(a, q));
+    STM_ASSERT_ERR(stm_alloc_unreserve(a, q), STM_EINVAL);
+    STM_ASSERT_OK(stm_alloc_free(a, r, 1));
+    STM_ASSERT_ERR(stm_alloc_unreserve(a, r), STM_EINVAL);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* The drain gives back its own blocks out of its blocks in flight too:
+ * the room the reservation leaves other allocations is unchanged. */
+STM_TEST(alloc_the_drain_unreserves_its_blocks_in_flight) {
+    make_tmp("unres_drain");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    stm_alloc_set_guarded(a, true);
+    const uint64_t R = 100u;
+    STM_ASSERT_OK(stm_alloc_dirty_reserve(a, R));
+    const uint64_t room = stm_alloc_avail_blocks(a);
+    uint64_t pd = 0;
+    STM_ASSERT_OK(stm_alloc_reserve_for_drain(a, 60u, 0, &pd));
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a), room);
+    STM_ASSERT_OK(stm_alloc_unreserve_for_drain(a, pd));
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a), room);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A tree written before allocations kept every gap at 2 blocks or more
+ * may hold 1-block gaps and 1-block ranges; loaded, each is kept out of
+ * the room, since no allocation can use one. */
+STM_TEST(alloc_a_loaded_tree_keeps_its_single_blocks_out_of_the_room) {
+    make_tmp("singles");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t r1 = 0, r2 = 0, r3 = 0, r4 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve_first_fit_for_test(a, 1u, &r1));
+    STM_ASSERT_OK(stm_alloc_reserve_first_fit_for_test(a, 1u, &r2));
+    STM_ASSERT_OK(stm_alloc_reserve_first_fit_for_test(a, 2u, &r3));
+    STM_ASSERT_OK(stm_alloc_reserve_first_fit_for_test(a, 1u, &r4));
+    STM_ASSERT_OK(stm_alloc_free(a, r2, 1));
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));
+    uint64_t root = 0;
+    uint8_t  root_csum[32] = { 0 };
+    STM_ASSERT_OK(stm_alloc_get_tree_root(a, &root, root_csum));
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d2 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d2));
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open(d2, &a2));
+    uint64_t pool_uuid[2]   = { 0xA1A1A1A1A1A1A1A1ULL, 0xB2B2B2B2B2B2B2B2ULL };
+    uint64_t device_uuid[2] = { 0xC3C3C3C3C3C3C3C3ULL, 0xD4D4D4D4D4D4D4D4ULL };
+    STM_ASSERT_OK(stm_alloc_set_crypt_ctx(a2, TEST_ALLOC_KEY,
+                                             pool_uuid, device_uuid));
+    STM_ASSERT_OK(stm_alloc_load_tree_at(a2, root, /*gen=*/ 2, root_csum));
+    const uint64_t used = 4u;
+    STM_ASSERT_EQ(stm_alloc_data_free_blocks(a2),
+                  (uint64_t)TEST_DATA_TOTAL_BLOCKS - used);
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a2),
+                  (uint64_t)TEST_DATA_TOTAL_BLOCKS - used);
+    stm_alloc_set_guarded(a2, true);
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a2),
+                  (uint64_t)TEST_DATA_TOTAL_BLOCKS - used
+                  - stm_alloc_slop_blocks(a2) - 3u);
+    stm_alloc_close(a2);
+    stm_bdev_close(d2);
     unlink(g_tmp_path);
 }
 

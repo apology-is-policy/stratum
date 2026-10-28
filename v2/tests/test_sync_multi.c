@@ -27,6 +27,7 @@
 #include <stratum/block.h>
 #include <stratum/block_inject.h>
 #include <stratum/crypto.h>
+#include <stratum/extent.h>
 #include <stratum/hash.h>
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
@@ -2056,7 +2057,8 @@ STM_TEST(sync_multi_replace_device_online_happy_path) {
     uint64_t alive_paddr = 0, alive_length = 0;
     STM_ASSERT_OK(stm_alloc_first_allocated(a4, &alive_paddr, &alive_length));
     STM_ASSERT_EQ(stm_paddr_device(alive_paddr), 3u);
-    STM_ASSERT_EQ(alive_length, 1u);
+    /* the 1-block reservation took 2: no allocation leaves a 1-block gap */
+    STM_ASSERT_EQ(alive_length, 2u);
 
     /* Dev 1 UUID can't be re-added (burned). */
     stm_pool_device clash = {
@@ -2785,6 +2787,51 @@ STM_TEST(sync_multi_pool_lock_writer_serializes_with_readers) {
     /* Reader made progress despite the writer churn. */
     STM_ASSERT(atomic_load(&c.commits) > 0);
 
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* On a mirror, a device with no run as long as a piece makes the piece as
+ * short as its first free run: with device 1's free space all 3-block
+ * gaps, 12 blocks of data go in pieces of 2, 3 blocks a piece on each
+ * device, and read back. */
+STM_TEST(sync_multi_a_mirror_piece_fits_the_other_device) {
+    const uint64_t K = 4096u, D = 12u;
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "mirror_pieces", bds, as, &pool, &s);
+    uint64_t runs[1024];
+    size_t nr = 0;
+    while (nr < 1024u && stm_alloc_reserve(as[1], 3u, 0, &runs[nr]) == STM_OK)
+        nr++;
+    STM_ASSERT_TRUE(nr > 16u && nr < 1024u);
+    for (size_t i = 1; i + 1 < nr; i += 2)
+        STM_ASSERT_OK(stm_alloc_free(as[1], runs[i], 1));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    uint64_t pa = 0;
+    STM_ASSERT_ERR(stm_alloc_reserve(as[1], 4u, 0, &pa), STM_ENOSPC);
+    uint8_t buf[12u * 4096u], back[12u * 4096u];
+    for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(i * 7u + 3u);
+    const uint64_t f0 = stm_alloc_data_free_blocks(as[0]);
+    const uint64_t f1 = stm_alloc_data_free_blocks(as[1]);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1, 9u, 0, buf, (size_t)(D * K)));
+    STM_ASSERT_EQ(f0 - stm_alloc_data_free_blocks(as[0]), (uint64_t)(3u * D / 2u));
+    STM_ASSERT_EQ(f1 - stm_alloc_data_free_blocks(as[1]), (uint64_t)(3u * D / 2u));
+    size_t n_rec = 0;
+    STM_ASSERT_OK(stm_extent_count_for_ino(stm_sync_extent_index(s), 1, 9u,
+                                           &n_rec));
+    STM_ASSERT_EQ(n_rec, (size_t)(D / 2u));
+    size_t got = 0;
+    while (got < sizeof back) {
+        size_t n = 0;
+        STM_ASSERT_OK(stm_sync_read_extent(s, 1, 9u, got, back + got,
+                                           sizeof back - got, &n));
+        if (n == 0) break;
+        got += n;
+    }
+    STM_ASSERT_EQ(got, sizeof back);
+    STM_ASSERT_EQ(memcmp(back, buf, sizeof buf), 0);
     teardown_mirror_pool(bds, as, pool, s);
 }
 

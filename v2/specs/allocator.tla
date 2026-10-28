@@ -21,6 +21,12 @@
 \*   - NoDoubleAlloc: no range is ALLOCATED from two independent Allocate
 \*     events without an intervening reclamation cycle.
 \*   - DurableGenMonotonic: the durable commit counter never regresses.
+\*   - NonceNeverReused: no range is written twice at one generation. A
+\*     block's AEAD nonce is its address and the generation that wrote
+\*     it, so a second write there would seal other bytes under the same
+\*     nonce. Unreserve hands a range back FREE at once, bypassing
+\*     PENDING; it is sound only for a range nothing was written to,
+\*     which UnreserveChecksWritten guards (the buggy cfg drops it).
 \*
 \* What this spec does NOT model (deferred to other specs and code):
 \*
@@ -51,12 +57,14 @@ CONSTANTS
     Ranges,       \* abstract set of range identifiers (e.g. {r1, r2, r3})
     Owners,       \* set of refcount holders (main FS tree + snapshots)
     MainOwner,    \* distinguished primary owner; first Allocate goes here
-    MaxGen        \* bound on the commit counter for state-space sizing
+    MaxGen,       \* bound on the commit counter for state-space sizing
+    UnreserveChecksWritten  \* FALSE: Unreserve may hand back a written range
 
 ASSUME /\ Ranges  # {}
        /\ Owners  # {}
        /\ MainOwner \in Owners
        /\ MaxGen \in Nat \ {0}
+       /\ UnreserveChecksWritten \in BOOLEAN
 
 States == {"FREE", "ALLOCATED", "PENDING"}
 
@@ -69,9 +77,13 @@ VARIABLES
     owns,          \* Ranges -> [Owners -> BOOLEAN]
     free_gen,      \* Ranges -> Nat (meaningful when state = PENDING)
     current_gen,   \* live commit counter (volatile)
-    durable_gen    \* last commit whose Final phase has landed
+    durable_gen,   \* last commit whose Final phase has landed
+    written,       \* Ranges -> BOOLEAN: written since its Allocate
+    last_sealed,   \* Ranges -> Nat: the gen of its last write (0: none)
+    reused         \* a write sealed a (range, gen) already sealed
 
-vars == <<state, owns, free_gen, current_gen, durable_gen>>
+vars == <<state, owns, free_gen, current_gen, durable_gen,
+          written, last_sealed, reused>>
 
 \* --------------------------------------------------------------------------
 \* Helpers.
@@ -95,6 +107,9 @@ Init ==
     /\ free_gen    = [r \in Ranges |-> 0]
     /\ current_gen = 1
     /\ durable_gen = 0
+    /\ written     = [r \in Ranges |-> FALSE]
+    /\ last_sealed = [r \in Ranges |-> 0]
+    /\ reused      = FALSE
 
 \* --------------------------------------------------------------------------
 \* Actions.
@@ -109,7 +124,32 @@ Allocate(r) ==
     /\ AllOwnersClear(r)
     /\ state' = [state EXCEPT ![r] = "ALLOCATED"]
     /\ owns'  = [owns  EXCEPT ![r][MainOwner] = TRUE]
-    /\ UNCHANGED <<free_gen, current_gen, durable_gen>>
+    /\ written' = [written EXCEPT ![r] = FALSE]
+    /\ UNCHANGED <<free_gen, current_gen, durable_gen, last_sealed, reused>>
+
+\* Write(r) -- the main owner seals the range's bytes, once per
+\* allocation, under the nonce (r, current_gen).
+Write(r) ==
+    /\ state[r] = "ALLOCATED"
+    /\ owns[r][MainOwner]
+    /\ ~written[r]
+    /\ written'     = [written     EXCEPT ![r] = TRUE]
+    /\ last_sealed' = [last_sealed EXCEPT ![r] = current_gen]
+    /\ reused'      = (reused \/ last_sealed[r] = current_gen)
+    /\ UNCHANGED <<state, owns, free_gen, current_gen, durable_gen>>
+
+\* Unreserve(r) -- a reservation only the main owner holds goes back FREE
+\* at once, with no PENDING stay: nothing durable names it, and, when
+\* nothing was written to it, no nonce was spent on it.
+Unreserve(r) ==
+    /\ state[r] = "ALLOCATED"
+    /\ owns[r][MainOwner]
+    /\ \A o \in Owners \ {MainOwner} : ~owns[r][o]
+    /\ UnreserveChecksWritten => ~written[r]
+    /\ state' = [state EXCEPT ![r] = "FREE"]
+    /\ owns'  = [owns  EXCEPT ![r][MainOwner] = FALSE]
+    /\ UNCHANGED <<free_gen, current_gen, durable_gen, written, last_sealed,
+                   reused>>
 
 \* Ref(r, s) — snapshot s takes an additional reference on an already-
 \* allocated range. Happens during snapshot creation (ARCH §8).
@@ -120,7 +160,8 @@ Ref(r, s) ==
     /\ s # MainOwner
     /\ ~owns[r][s]
     /\ owns' = [owns EXCEPT ![r][s] = TRUE]
-    /\ UNCHANGED <<state, free_gen, current_gen, durable_gen>>
+    /\ UNCHANGED <<state, free_gen, current_gen, durable_gen, written,
+                   last_sealed, reused>>
 
 \* Unref(r, o) — owner o releases its reference. If it was the last
 \* reference, the range transitions ALLOCATED -> PENDING with
@@ -136,7 +177,7 @@ Unref(r, o) ==
                      /\ free_gen' = [free_gen EXCEPT ![r] = current_gen]
                 ELSE /\ UNCHANGED state
                      /\ UNCHANGED free_gen
-    /\ UNCHANGED <<current_gen, durable_gen>>
+    /\ UNCHANGED <<current_gen, durable_gen, written, last_sealed, reused>>
 
 \* Commit — this commit's Final phase lands. durable_gen catches up to
 \* current_gen; current_gen advances. Any PENDING range whose free_gen
@@ -158,7 +199,7 @@ Commit ==
     /\ free_gen'    = [r \in Ranges |->
                          IF state[r] = "PENDING" /\ free_gen[r] < current_gen
                            THEN 0 ELSE free_gen[r]]
-    /\ UNCHANGED owns
+    /\ UNCHANGED <<owns, written, last_sealed, reused>>
 
 \* --------------------------------------------------------------------------
 \* Next / Spec.
@@ -166,6 +207,8 @@ Commit ==
 
 Next ==
     \/ \E r \in Ranges                   : Allocate(r)
+    \/ \E r \in Ranges                   : Write(r)
+    \/ \E r \in Ranges                   : Unreserve(r)
     \/ \E r \in Ranges, s \in Owners     : Ref(r, s)
     \/ \E r \in Ranges, o \in Owners     : Unref(r, o)
     \/ Commit
@@ -213,12 +256,17 @@ FreeGenClearedAfterReclamation ==
 NoDoubleAlloc ==
     \A r \in Ranges : state[r] = "ALLOCATED" => Refcount(r) >= 1
 
+NonceNeverReused == ~reused
+
 TypeOK ==
     /\ state       \in [Ranges -> States]
     /\ owns        \in [Ranges -> [Owners -> BOOLEAN]]
     /\ free_gen    \in [Ranges -> 0..MaxGen+1]
     /\ current_gen \in 1..MaxGen+1
     /\ durable_gen \in 0..MaxGen+1
+    /\ written     \in [Ranges -> BOOLEAN]
+    /\ last_sealed \in [Ranges -> 0..MaxGen+1]
+    /\ reused      \in BOOLEAN
 
 Invariants ==
     /\ TypeOK
@@ -228,5 +276,6 @@ Invariants ==
     /\ FreeGenValid
     /\ FreeGenClearedAfterReclamation
     /\ NoDoubleAlloc
+    /\ NonceNeverReused
 
 =============================================================================

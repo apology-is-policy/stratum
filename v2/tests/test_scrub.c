@@ -354,11 +354,11 @@ STM_TEST(scrub_step_sweeps_allocated_ranges) {
     scrub_fx fx;
     scrub_fx_open(&fx, "sweep");
 
-    /* Reserve three ranges of different lengths: 2, 5, 1 blocks. Total 8. */
+    /* Reserve three ranges of different lengths: 2, 5, 3 blocks. Total 10. */
     uint64_t p1 = 0, p2 = 0, p3 = 0;
     STM_ASSERT_OK(stm_alloc_reserve(fx.a, 2u, 0, &p1));
     STM_ASSERT_OK(stm_alloc_reserve(fx.a, 5u, 0, &p2));
-    STM_ASSERT_OK(stm_alloc_reserve(fx.a, 1u, 0, &p3));
+    STM_ASSERT_OK(stm_alloc_reserve(fx.a, 3u, 0, &p3));
 
     /* Write some content at each paddr so the reads return real bytes
      * (not just zeros past EOF). The content itself is arbitrary — α
@@ -373,8 +373,10 @@ STM_TEST(scrub_step_sweeps_allocated_ranges) {
         STM_ASSERT_OK(stm_bdev_write(fx.bd, (stm_paddr_offset(p2) + b) * STM_UB_SIZE,
                                        blk, sizeof blk));
     }
-    STM_ASSERT_OK(stm_bdev_write(fx.bd, stm_paddr_offset(p3) * STM_UB_SIZE,
-                                   blk, sizeof blk));
+    for (uint64_t b = 0; b < 3; b++) {
+        STM_ASSERT_OK(stm_bdev_write(fx.bd, (stm_paddr_offset(p3) + b) * STM_UB_SIZE,
+                                       blk, sizeof blk));
+    }
 
     STM_ASSERT_OK(stm_scrub_start(fx.sc));
 
@@ -390,7 +392,7 @@ STM_TEST(scrub_step_sweeps_allocated_ranges) {
     STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &st));
     STM_ASSERT_EQ((int)st.state,       (int)STM_SCRUB_STATE_COMPLETED);
     STM_ASSERT_EQ(st.ranges_processed, 3u);
-    STM_ASSERT_EQ(st.blocks_verified,  8u);
+    STM_ASSERT_EQ(st.blocks_verified,  10u);
     STM_ASSERT_EQ(st.blocks_failed,    0u);
 
     scrub_fx_close(&fx);

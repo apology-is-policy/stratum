@@ -13732,7 +13732,7 @@ static void peer_drain_leg(const char *name, bool hole)
     const uint64_t MIB = 1024u * 1024u;
     make_tmp(name);
     stm_fs_format_opts fopts = default_format_opts();
-    fopts.device_size_bytes = (hole ? 64u : 48u) * MIB;
+    fopts.device_size_bytes = 64u * MIB;
     fopts.bootstrap_size_bytes = 8u * MIB;
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
     stm_fs_mount_opts mopts = rw_mount_opts();
@@ -13759,17 +13759,19 @@ static void peer_drain_leg(const char *name, bool hole)
         STM_ASSERT_OK(stm_fs_write(fs, 1, z, 0u, big, (size_t)(8u * MIB)));
         STM_ASSERT_OK(stm_fs_write(fs, 1, z, 8u * MIB, big, (size_t)(8u * MIB)));
     } else {
-        /* y: three 4 MiB, 0x10 0x11 0x12; z: one 4 MiB. */
-        for (unsigned k = 0; k < 4u; k++) {
+        /* y: three 4 MiB, 0x10 0x11 0x12; z: two 8 MiB. */
+        for (unsigned k = 0; k < 3u; k++) {
             memset(big, (int)(0x10u + k), (size_t)(4u * MIB));
-            STM_ASSERT_OK(stm_fs_write(fs, 1, k < 3u ? y : z,
-                                       k < 3u ? (uint64_t)k * 4u * MIB : 0u,
+            STM_ASSERT_OK(stm_fs_write(fs, 1, y, (uint64_t)k * 4u * MIB,
                                        big, (size_t)(4u * MIB)));
         }
+        memset(big, 0x30, (size_t)(8u * MIB));
+        STM_ASSERT_OK(stm_fs_write(fs, 1, z, 0u, big, (size_t)(8u * MIB)));
+        STM_ASSERT_OK(stm_fs_write(fs, 1, z, 8u * MIB, big, (size_t)(8u * MIB)));
     }
     free(big);
     STM_ASSERT_OK(stm_fs_commit(fs));
-    mid_op_put(fs, sp, 0, (hole ? 16u : 10u) * MIB, 0x5A);
+    mid_op_put(fs, sp, 0, hole ? 17u * MIB + MIB / 2u : 20u * MIB, 0x5A);
     mid_op_fill(fs, f);
     STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
     STM_ASSERT_OK(stm_fs_commit(fs));
@@ -13798,7 +13800,7 @@ static void peer_drain_leg(const char *name, bool hole)
         STM_ASSERT_OK(stm_fs_write(fs, 1, y, 4u * MIB - 100u, a, sizeof a));
     }
     peer_drain p = { .fs = fs, .z = z, .armed = true,
-                     .at = hole ? 8u * MIB - 100u : 2u * MIB + 100u };
+                     .at = 8u * MIB - 100u };
     stm_fs_set_buffer_insert_hook_for_test(fs, peer_drain_hook, &p);
     stm_status rb = stm_fs_write(fs, 1, y, 8u * MIB - 100u, b, sizeof b);
     stm_fs_set_buffer_insert_hook_for_test(fs, NULL, NULL);
@@ -13963,8 +13965,9 @@ STM_TEST(fs_a_direct_write_leaves_the_blocks_buffered_writes_hold) {
     stm_fs_stats st = {0};
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
     STM_ASSERT_TRUE(st.data_free_blocks > 600u);
-    /* Each 4 KiB write into a hole is charged its block and a tag block. */
-    const uint64_t n = (st.data_free_blocks - 300u) / 2u;
+    /* Each 4 KiB write into a hole is charged twice its block and a block
+     * for its record. */
+    const uint64_t n = (st.data_free_blocks - 300u) / 3u;
     uint64_t acked = 0;
     uint8_t b[4096];
     for (uint64_t k = 0; k < n; k++) {

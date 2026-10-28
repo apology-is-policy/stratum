@@ -266,6 +266,12 @@ stm_bootstrap *stm_alloc_bootstrap(stm_alloc *a);
  * available gap the allocator prefers it; otherwise it's ignored. 0
  * means "no hint".
  *
+ * No allocation leaves a 1-block gap, which no extent could use (one
+ * block of data takes two with its tag): a request takes at least 2
+ * blocks, prefers a gap of exactly `nblocks` or at least 2 longer, and
+ * takes a gap 1 longer whole only when no other gap fits. A hint that
+ * would leave a 1-block gap on either side is ignored.
+ *
  * `*out_paddr` returns the absolute paddr of the first block.
  *
  * Returns STM_ENOSPC if no gap of the requested size exists.
@@ -302,6 +308,40 @@ STM_MUST_USE
 stm_status stm_alloc_reserve_netfree(stm_alloc *a, uint64_t nblocks,
                                      uint64_t hint_paddr,
                                      uint64_t *out_paddr);
+
+/*
+ * As the three reserves above, but take the first free run of at least 2
+ * blocks, up to `max_nblocks` of it (all of a run 1 block longer, which no
+ * allocation could use alone, or 1 block less where the room is short),
+ * and report the length taken in *out_nblocks. STM_ENOSPC: the room holds
+ * fewer than 2 blocks, or no free run of 2 does. A write too long for any
+ * free run takes its pieces this way.
+ */
+STM_MUST_USE
+stm_status stm_alloc_reserve_upto(stm_alloc *a, uint64_t max_nblocks,
+                                  uint64_t *out_paddr, uint64_t *out_nblocks);
+STM_MUST_USE
+stm_status stm_alloc_reserve_upto_for_drain(stm_alloc *a, uint64_t max_nblocks,
+                                            uint64_t *out_paddr,
+                                            uint64_t *out_nblocks);
+STM_MUST_USE
+stm_status stm_alloc_reserve_upto_netfree(stm_alloc *a, uint64_t max_nblocks,
+                                          uint64_t *out_paddr,
+                                          uint64_t *out_nblocks);
+
+/*
+ * Give back a range reserved here that nothing was written to: it is
+ * free at once, not PENDING, since no committed state names it and no
+ * ciphertext was sealed under its address, and the gap it came from is
+ * whole again. STM_ENOENT: no range starts at `paddr`; STM_EINVAL: the
+ * range is not at refcount 1. The drain gives back its own with the
+ * _for_drain form, which also takes them out of its blocks in flight.
+ */
+STM_MUST_USE
+stm_status stm_alloc_unreserve(stm_alloc *a, uint64_t paddr);
+STM_MUST_USE
+stm_status stm_alloc_unreserve_for_drain(stm_alloc *a, uint64_t paddr);
+
 void stm_alloc_set_guarded(stm_alloc *a, bool guarded);
 STM_MUST_USE
 stm_status stm_alloc_dirty_reserve(stm_alloc *a, uint64_t nblocks);
@@ -315,8 +355,10 @@ void stm_alloc_dirty_set(stm_alloc *a, uint64_t nblocks);
 uint64_t stm_alloc_dirty_reserved(const stm_alloc *a);
 uint64_t stm_alloc_slop_blocks(const stm_alloc *a);
 /* What an allocation outside the drain can still get: free less the
- * reservation (net of the drain's blocks in flight) and the slop; free on
- * an unguarded allocator. */
+ * reservation (net of the drain's blocks in flight), the slop, and every
+ * block the tree held at load that no allocation could use (a 1-block gap,
+ * or a 1-block range, which leaves one when freed); free on an unguarded
+ * allocator. */
 uint64_t stm_alloc_avail_blocks(const stm_alloc *a);
 /* What a net-free allocation (stm_alloc_reserve_netfree) can still get:
  * as stm_alloc_avail_blocks, but it keeps only half the slop. */
