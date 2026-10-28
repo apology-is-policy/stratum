@@ -232,6 +232,94 @@ STM_TEST(alloc_reserve_exhaust_returns_enospc) {
     unlink(g_tmp_path);
 }
 
+/* A guarded allocator keeps the dirty reservation and the slop out of every
+ * allocation but the drain's; an unguarded one only looks for a gap. */
+STM_TEST(alloc_a_guarded_reserve_leaves_the_reservation_and_the_slop) {
+    make_tmp("guarded");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    const uint64_t total = TEST_DATA_TOTAL_BLOCKS;
+    uint64_t slop = stm_alloc_slop_blocks(a);
+    STM_ASSERT_EQ(slop, total / 50u > 4096u ? (uint64_t)4096u : total / 50u);
+    STM_ASSERT_TRUE(slop > 0u);
+    STM_ASSERT_OK(stm_alloc_dirty_reserve(a, 100u));
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a), total);
+    stm_alloc_dirty_release(a, 100u);
+    STM_ASSERT_EQ(stm_alloc_dirty_reserved(a), (uint64_t)0);
+
+    stm_alloc_set_guarded(a, true);
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a), total - slop);
+    STM_ASSERT_ERR(stm_alloc_dirty_reserve(a, total - slop + 1u), STM_ENOSPC);
+    STM_ASSERT_EQ(stm_alloc_dirty_reserved(a), (uint64_t)0);
+    const uint64_t R = 100u;
+    STM_ASSERT_OK(stm_alloc_dirty_reserve(a, R));
+    const uint64_t room = total - R - slop;
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a), room);
+    uint64_t p1 = 0, p2 = 0, p3 = 0;
+    STM_ASSERT_ERR(stm_alloc_reserve(a, room + 1u, 0, &p1), STM_ENOSPC);
+    STM_ASSERT_OK(stm_alloc_reserve(a, room, 0, &p1));
+    STM_ASSERT_ERR(stm_alloc_reserve(a, 1u, 0, &p2), STM_ENOSPC);
+    STM_ASSERT_ERR(stm_alloc_dirty_reserve(a, 1u), STM_ENOSPC);
+    /* the drain spends the reservation, and the slop past it */
+    STM_ASSERT_OK(stm_alloc_reserve_for_drain(a, R + slop, 0, &p3));
+    stm_alloc_dirty_release(a, R);
+    STM_ASSERT_EQ(stm_alloc_dirty_reserved(a), (uint64_t)0);
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a), (uint64_t)0);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* The drain's blocks are inside the reservation until the release settles
+ * them: another allocation sees each block once, in flight or after. */
+STM_TEST(alloc_a_drains_blocks_count_once) {
+    make_tmp("drain_once");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    stm_alloc_set_guarded(a, true);
+    const uint64_t total = TEST_DATA_TOTAL_BLOCKS;
+    const uint64_t slop = stm_alloc_slop_blocks(a), R = 100u;
+    STM_ASSERT_OK(stm_alloc_dirty_reserve(a, R));
+    const uint64_t room = total - R - slop;
+    uint64_t pd = 0, p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve_for_drain(a, 60u, 0, &pd));
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a), room);
+    STM_ASSERT_OK(stm_alloc_reserve(a, room, 0, &p1));
+    STM_ASSERT_ERR(stm_alloc_reserve(a, 1u, 0, &p2), STM_ENOSPC);
+    /* the drain popped ranges holding all of R: the 40 it did not spend
+     * come back */
+    stm_alloc_dirty_release(a, R);
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(a), (uint64_t)40);
+    STM_ASSERT_OK(stm_alloc_reserve(a, 40u, 0, &p2));
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A net-free allocation may spend half the slop, never the reservation. */
+STM_TEST(alloc_a_net_free_reserve_spends_half_the_slop) {
+    make_tmp("netfree");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    stm_alloc_set_guarded(a, true);
+    const uint64_t total = TEST_DATA_TOTAL_BLOCKS;
+    const uint64_t slop = stm_alloc_slop_blocks(a), R = 100u;
+    const uint64_t half = slop - slop / 2u;
+    STM_ASSERT_TRUE(slop >= 4u);
+    STM_ASSERT_OK(stm_alloc_dirty_reserve(a, R));
+    uint64_t p1 = 0, p2 = 0, p3 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, total - R - slop, 0, &p1));
+    STM_ASSERT_ERR(stm_alloc_reserve(a, 1u, 0, &p2), STM_ENOSPC);
+    STM_ASSERT_ERR(stm_alloc_reserve_netfree(a, half + 1u, 0, &p2), STM_ENOSPC);
+    STM_ASSERT_OK(stm_alloc_reserve_netfree(a, half, 0, &p2));
+    STM_ASSERT_ERR(stm_alloc_reserve_netfree(a, 1u, 0, &p3), STM_ENOSPC);
+    /* the reservation and the other half are still there for the drain */
+    STM_ASSERT_OK(stm_alloc_reserve_for_drain(a, R + slop / 2u, 0, &p3));
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(alloc_pending_not_reservable_until_sweep) {
     /* allocator.tla: a PENDING range can't be reallocated until Commit
      * sweeps it. The bitmap bit (here: tree entry) stays set. */

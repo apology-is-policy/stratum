@@ -138,22 +138,23 @@ stm_status stm_dirty_buffer_insert_bounded(stm_dirty_buffer *buf,
                                                uint64_t max_footprint_blocks);
 
 /*
- * Answers, for a range about to be inserted, its extra_blocks and the
- * max_footprint_blocks to admit it against, as stm_dirty_buffer_insert_bounded
- * takes them. Runs under the buffer lock, so it must not call into the
- * buffer. A non-OK answer refuses the insert with that status.
+ * Answers, for a range about to be inserted, its extra_blocks, as
+ * stm_dirty_buffer_insert_bounded takes them. Runs under the buffer lock,
+ * so it must not call into the buffer. A non-OK answer refuses the insert
+ * with that status.
  */
 typedef stm_status (*stm_dirty_buffer_admit_fn)(void     *user,
                                                 uint64_t  dataset_id,
                                                 uint64_t  ino,
                                                 uint64_t  off,
                                                 uint64_t  len,
-                                                uint64_t *extra_blocks,
-                                                uint64_t *max_footprint_blocks);
+                                                uint64_t *extra_blocks);
 
 /*
- * As stm_dirty_buffer_insert_bounded, with the two numbers asked of `admit`
- * under the buffer lock, so no drain lands between them and the insert.
+ * As stm_dirty_buffer_insert, charging the range the extra_blocks asked of
+ * `admit` under the buffer lock, so no drain lands between the answer and
+ * the insert. The pool bound is the reservation
+ * (stm_dirty_buffer_set_reservation).
  */
 stm_status stm_dirty_buffer_insert_admitted(stm_dirty_buffer *buf,
                                             uint64_t dataset_id, uint64_t ino,
@@ -161,6 +162,24 @@ stm_status stm_dirty_buffer_insert_admitted(stm_dirty_buffer *buf,
                                             const void *data,
                                             stm_dirty_buffer_admit_fn admit,
                                             void *admit_user);
+
+/*
+ * The pool's hold on the buffered blocks. Every insert takes the charge it
+ * adds, net of the charges it supersedes, through `reserve` with the insert
+ * itself; STM_ENOSPC from `reserve` refuses the insert and leaves the
+ * buffer unchanged. `release` gives back what a superseding insert, a drain
+ * or a drop removed; a drain calls it after each write, with what the write
+ * took (0 when it failed), so the pool settles the blocks the write spent.
+ * Both run under the buffer lock and must not call into the buffer.
+ * stm_dirty_buffer_destroy calls neither: the owner's pool goes first. Set
+ * before the first insert.
+ */
+typedef stm_status (*stm_dirty_buffer_reserve_fn)(void *user, uint64_t blocks);
+typedef void (*stm_dirty_buffer_release_fn)(void *user, uint64_t blocks);
+void stm_dirty_buffer_set_reservation(stm_dirty_buffer *buf,
+                                      stm_dirty_buffer_reserve_fn reserve,
+                                      stm_dirty_buffer_release_fn release,
+                                      void *user);
 
 /*
  * Read-overlay lookup: copies into `out_buf` the LONGEST contiguous

@@ -141,9 +141,9 @@ the writeback.tla retry dance: flush this inode → retry; flush all → retry.
 (Remnants retain bytes the old drop freed, so a near-cap partial overwrite can
 now ENOSPC where it previously "fit" by losing data — the retry dance covers it.)
 
-Pool admission (#40): a buffered insert is admitted only while the buffer's
-block footprint stays within the pool's free blocks, so an accepted write is
-committable. A range is charged its own blocks, one per started recordsize piece,
+Pool admission (#40): a buffered insert is admitted only while the pool can
+hold the buffer's block footprint, which the pool then holds (below), so an
+accepted write is committable. A range is charged its own blocks, one per started recordsize piece,
 and what its drain's covering write takes beyond it: every extent the range only
 partly overlaps is rewritten whole (`fs_cover_extra_blocks`), and the remnants a
 later insert leaves keep that extra. Uncharged, a 4 KiB write into an 8 MiB
@@ -164,9 +164,9 @@ blocks every commit and the unmount answered `STM_ENOSPC` and 14 of the
 acknowledged writes were gone after a remount
 (`fs_a_drain_writes_each_region_once`, `dbuf_a_drain_drops_what_its_write_took`).
 
-Both numbers the admission rests on, the pool's free blocks and the
-extents the cover takes in, are read under the buffer's lock with the
-insert (`stm_dirty_buffer_insert_admitted`, asking `fs_buffer_admit`).
+The extents the cover takes in are read under the buffer's lock with the
+insert (`stm_dirty_buffer_insert_admitted`, asking `fs_buffer_admit`), and
+the pool's hold is taken there too.
 A drain holds that lock throughout, and a peer runs one without this
 file's pin: a writer of another file, refused on the pool, flushes every
 file. Read before the lock, a write was admitted on blocks that drain had
@@ -174,6 +174,39 @@ already spent and on extents it had since merged into a larger cover;
 it answered OK and every commit after it answered `STM_ENOSPC`
 (`fs_a_buffered_write_is_admitted_on_the_pool_a_peer_drain_left`,
 `fs_a_buffered_write_is_admitted_on_the_extents_a_peer_drain_left`).
+
+The pool holds what it admitted (ext4's dirty-cluster counter, ZFS's
+slop). Each insert takes its net charge in the allocators' dirty
+reservation (`stm_dirty_buffer_set_reservation` -> `stm_sync_dirty_reserve`,
+on every attached device, since a drained extent puts a replica on each of
+the first n), and a superseding insert, a drain or a drop gives back what
+it removed. On a guarded allocator (the fs guards each one it mounts) every
+allocation outside the drain must leave the reservation and the slop free:
+free - reserved - slop >= n, the slop 2% of the data area and at most 4096
+blocks (ext4's reserved clusters). So must an insert. A truncate's kept
+prefix, which replaces the longer extent it is cut from, may spend half the
+slop and never the reservation, so a full pool can still be cut down
+(ZFS's net-free transactions;
+`fs_a_shrinking_truncate_may_spend_half_the_slop`). The drain's own writes
+spend the reservation: the sync layer knows the draining thread
+(`stm_sync_drain_begin`), and its blocks count in flight until the drain
+releases the ranges they held, so no other allocation counts them twice.
+Before, the admission was a reading of the free count, not a hold: a 1 MiB
+direct write to another file took 257 of the 769 blocks that 334
+acknowledged 4 KiB writes were admitted on; every commit and the unmount
+answered `STM_ENOSPC`, and all 334 were gone after a remount
+(`fs_a_direct_write_leaves_the_blocks_buffered_writes_hold`). An inline
+file whose transition the buffer refused wrote its block itself, from the
+same blocks (`fs_a_refused_transition_spends_no_buffered_block`). Statfs
+reports bfree less the reservation and bavail less the slop too.
+
+The reclaim never commits over a failed drain; it wedges. With a
+transitioned inode's bytes still buffered such a commit made the kind flip
+durable without its extent: 308 of 700 committed inline files read back as
+zeros after a remount. With the reservation a drain fails only on free
+blocks that hold no run long enough, a device error or an undercount, and
+the wedge keeps the last good commit
+(`fs_the_reclaim_never_commits_over_a_failed_drain`).
 
 `drain_inode_coalesced_locked` (`src/dirty_buffer/dirty_buffer.c:352`) is the
 **#352 amplification fix**. Without it each ≤ 4 KiB range became its own extent,
@@ -415,6 +448,13 @@ rationale). The existing 69-test suite is itself a
 regime-purity + chain-aware-read regression (a partial port fails it).
 
 ## Known caveats / footguns
+
+- The reservation counts blocks; a drain needs runs, of at least two blocks
+  (a 4 KiB extent and its tag take two), and first fit leaves one-block
+  holes that no extent can use. The slop is the drain's margin for that:
+  without it, 700 small transitions on a near-full pool wedged on two free
+  blocks that were not adjacent. Fragmentation past the slop still wedges
+  the fs rather than commit around it.
 
 - **F4 (v1.x seam)** — an interior hole inside an RMW cover is materialized as a
   zero-filled extent (it joins the covering write rather than staying sparse). A

@@ -102,6 +102,10 @@ struct stm_dirty_buffer {
     uint32_t          shelf_n;
     uint64_t          shelf_hits;    /* shelf_alloc served from the shelf */
     uint64_t          shelf_misses;  /* shelf_alloc fell to malloc */
+    /* The pool's hold on total_footprint_blocks; NULL: none. */
+    stm_dirty_buffer_reserve_fn reserve;
+    stm_dirty_buffer_release_fn release;
+    void                       *res_user;
 };
 
 /* ───────────────────────────── helpers ────────────────────────────── */
@@ -208,6 +212,8 @@ static void destroy_inode_locked(stm_dirty_buffer *buf, stm_dbuf_inode *e)
     }
     buf->total_bytes -= e->bytes;
     buf->total_footprint_blocks -= e->footprint_blocks;
+    if (e->footprint_blocks > 0u && buf->release)
+        buf->release(buf->res_user, e->footprint_blocks);
     free(e);
 }
 
@@ -333,7 +339,7 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     pthread_mutex_lock(&buf->mu);
     if (admit) {
         stm_status as = admit(admit_user, dataset_id, ino, off, len,
-                              &extra_blocks, &max_footprint_blocks);
+                              &extra_blocks);
         if (as == STM_OK && extra_blocks > (uint64_t)UINT32_MAX)
             as = STM_EINVAL;
         if (as != STM_OK) {
@@ -396,7 +402,8 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     }
     /* #40 pool-aware admission: the buffered block footprint (what a flush
      * reserves from the pool) must stay <= max_footprint_blocks (the pool's
-     * free blocks), so an accepted buffered write is always committable.
+     * free blocks, for a caller that passes them; the fs holds the charge in
+     * the pool's reservation instead, below).
      * Checked HERE -- atomically with the insert under buf->mu -- so two
      * concurrent SH writers cannot both pass a stale free-space snapshot and
      * jointly over-admit (the check-then-insert race). The bound itself is
@@ -407,6 +414,19 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
             > max_footprint_blocks) {
         pthread_mutex_unlock(&buf->mu);
         return STM_ENOSPC;
+    }
+    /* The pool holds the net charge with the insert: a refusal leaves the
+     * buffer as it was. */
+    uint64_t taken = added_footprint > removed_footprint
+                   ? added_footprint - removed_footprint : 0u;
+    if (taken > 0u && buf->reserve) {
+        stm_status rs = buf->reserve(buf->res_user, taken);
+        if (rs != STM_OK) {
+            pthread_mutex_unlock(&buf->mu);
+            return rs;
+        }
+    } else {
+        taken = 0u;
     }
 
     /* Allocate the new range AND both remnants up-front (so a malloc
@@ -489,6 +509,8 @@ static stm_status dbuf_insert_bounded(stm_dirty_buffer *buf,
     buf->total_bytes += added;
     e->footprint_blocks         += added_footprint;
     buf->total_footprint_blocks += added_footprint;
+    if (removed_footprint > added_footprint && buf->release)
+        buf->release(buf->res_user, removed_footprint - added_footprint);
 
     pthread_mutex_unlock(&buf->mu);
     return STM_OK;
@@ -497,6 +519,7 @@ oom:
     if (newr)  { free(newr->data);  free(newr);  }
     if (headr) { free(headr->data); free(headr); }
     if (tailr) { free(tailr->data); free(tailr); }
+    if (taken > 0u && buf->release) buf->release(buf->res_user, taken);
     pthread_mutex_unlock(&buf->mu);
     return STM_ENOMEM;
 }
@@ -534,7 +557,20 @@ stm_status stm_dirty_buffer_insert_admitted(stm_dirty_buffer *buf,
 {
     if (!admit) return STM_EINVAL;
     return dbuf_insert_bounded(buf, dataset_id, ino, off, len, data,
-                                0u, 0u, admit, admit_user);
+                                0u, UINT64_MAX, admit, admit_user);
+}
+
+void stm_dirty_buffer_set_reservation(stm_dirty_buffer *buf,
+                                      stm_dirty_buffer_reserve_fn reserve,
+                                      stm_dirty_buffer_release_fn release,
+                                      void *user)
+{
+    if (!buf) return;
+    pthread_mutex_lock(&buf->mu);
+    buf->reserve  = reserve;
+    buf->release  = release;
+    buf->res_user = user;
+    pthread_mutex_unlock(&buf->mu);
 }
 
 stm_status stm_dirty_buffer_lookup(stm_dirty_buffer *buf,
@@ -740,11 +776,15 @@ static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
         stm_status crc = cb(user, ds, ino, run_start, run_len, emit_data,
                             &view, &upto);
         free(coal);
-        if (crc != STM_OK) return crc;
+        if (crc != STM_OK) {
+            if (buf->release) buf->release(buf->res_user, 0u);
+            return crc;
+        }
         if (upto < run_start + run_len) upto = run_start + run_len;
 
         /* Pop what the write took: the run, and every later byte below
          * upto. A range crossing upto keeps its tail. */
+        uint64_t popped = 0;
         while (e->head && e->head->off + e->head->len <= upto) {
             stm_dbuf_range *done = e->head;
             e->head = done->next;
@@ -753,8 +793,10 @@ static stm_status drain_inode_coalesced_locked(stm_dirty_buffer *buf,
             uint64_t sp = done->charge;
             e->footprint_blocks         -= sp;
             buf->total_footprint_blocks -= sp;
+            popped += sp;
             free_range(buf, done);
         }
+        if (buf->release) buf->release(buf->res_user, popped);
         if (e->head && e->head->off < upto)
             trim_range_head(buf, e, e->head, upto - e->head->off);
     }

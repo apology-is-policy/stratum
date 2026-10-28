@@ -676,6 +676,106 @@ static stm_status drain_cover_cb(void *user, uint64_t ds, uint64_t ino,
     return STM_OK;
 }
 
+/* A pool for the reservation hooks: it holds what it is asked to, up to a
+ * limit, and counts releases. */
+typedef struct {
+    uint64_t held, limit;
+    unsigned releases;
+    bool underflow;
+} dbuf_pool;
+
+static stm_status dbuf_pool_reserve(void *user, uint64_t blocks)
+{
+    dbuf_pool *p = user;
+    if (p->held + blocks > p->limit) return STM_ENOSPC;
+    p->held += blocks;
+    return STM_OK;
+}
+
+static void dbuf_pool_release(void *user, uint64_t blocks)
+{
+    dbuf_pool *p = user;
+    if (blocks > p->held) p->underflow = true;
+    p->held -= blocks > p->held ? p->held : blocks;
+    p->releases++;
+}
+
+static stm_status dbuf_pool_drain_ok(void *user, uint64_t ds, uint64_t ino,
+                                     uint64_t off, uint64_t len,
+                                     const void *data,
+                                     const stm_dirty_buffer_drain_view *view,
+                                     uint64_t *out_end)
+{
+    (void)user; (void)ds; (void)ino; (void)off; (void)len; (void)data;
+    (void)view; (void)out_end;
+    return STM_OK;
+}
+
+static stm_status dbuf_pool_drain_fail(void *user, uint64_t ds, uint64_t ino,
+                                       uint64_t off, uint64_t len,
+                                       const void *data,
+                                       const stm_dirty_buffer_drain_view *view,
+                                       uint64_t *out_end)
+{
+    (void)user; (void)ds; (void)ino; (void)off; (void)len; (void)data;
+    (void)view; (void)out_end;
+    return STM_EIO;
+}
+
+/* The pool holds exactly the buffer's footprint through inserts, a
+ * superseding insert, a refused insert, a failed and a good drain and a
+ * drop; destroy gives nothing back (the pool goes first). */
+STM_TEST(dbuf_the_pool_holds_what_the_buffer_charges) {
+    stm_dirty_buffer *buf = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(1u << 20, 4u << 20, &buf));
+    dbuf_pool p = { .limit = 64u };
+    stm_dirty_buffer_set_reservation(buf, dbuf_pool_reserve,
+                                     dbuf_pool_release, &p);
+    static uint8_t b[16384];
+    memset(b, 0x5C, sizeof b);
+    for (uint64_t k = 0; k < 3u; k++)
+        STM_ASSERT_OK(stm_dirty_buffer_insert(buf, 1, 7, k * 4096u, 100u, b));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(buf, 1, 9, 0, 12288u, b));
+    STM_ASSERT_EQ(p.held, stm_dirty_buffer_total_footprint_blocks(buf));
+    STM_ASSERT_TRUE(p.held > 0u);
+    /* one write over ino 7's three ranges, charged fewer blocks than they
+     * were: the difference goes back */
+    uint64_t before = p.held;
+    STM_ASSERT_OK(stm_dirty_buffer_insert(buf, 1, 7, 0, 8292u, b));
+    STM_ASSERT_EQ(p.held, stm_dirty_buffer_total_footprint_blocks(buf));
+    STM_ASSERT_TRUE(p.held < before);
+    /* refused: nothing changes */
+    uint64_t held = p.held;
+    size_t bytes7 = stm_dirty_buffer_inode_bytes(buf, 1, 7);
+    p.limit = held;
+    STM_ASSERT_ERR(stm_dirty_buffer_insert(buf, 1, 7, 65536u, 4096u, b),
+                   STM_ENOSPC);
+    STM_ASSERT_EQ(p.held, held);
+    STM_ASSERT_EQ(stm_dirty_buffer_inode_bytes(buf, 1, 7), bytes7);
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(buf), held);
+    p.limit = 64u;
+    /* a failed drain keeps the ranges and their hold, and still settles */
+    unsigned rel = p.releases;
+    STM_ASSERT_ERR(stm_dirty_buffer_drain_ino(buf, 1, 7, dbuf_pool_drain_fail,
+                                              NULL), STM_EIO);
+    STM_ASSERT_EQ(p.held, held);
+    STM_ASSERT_TRUE(p.releases > rel);
+    STM_ASSERT_OK(stm_dirty_buffer_drain_ino(buf, 1, 7, dbuf_pool_drain_ok,
+                                             NULL));
+    STM_ASSERT_EQ(stm_dirty_buffer_inode_bytes(buf, 1, 7), (size_t)0);
+    STM_ASSERT_EQ(p.held, stm_dirty_buffer_total_footprint_blocks(buf));
+    stm_dirty_buffer_drop_ino(buf, 1, 9);
+    STM_ASSERT_EQ(p.held, (uint64_t)0);
+    STM_ASSERT_EQ(stm_dirty_buffer_total_footprint_blocks(buf), (uint64_t)0);
+    STM_ASSERT_OK(stm_dirty_buffer_insert(buf, 1, 11, 0, 4096u, b));
+    held = p.held;
+    rel = p.releases;
+    stm_dirty_buffer_destroy(buf);
+    STM_ASSERT_EQ(p.held, held);
+    STM_ASSERT_EQ(p.releases, rel);
+    STM_ASSERT_TRUE(!p.underflow);
+}
+
 STM_TEST(dbuf_a_drain_drops_what_its_write_took)
 {
     stm_dirty_buffer *b = NULL;

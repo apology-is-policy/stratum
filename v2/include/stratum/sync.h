@@ -289,6 +289,24 @@ stm_status stm_sync_commit(stm_sync *s);
  * Returns 0 for a NULL sync. */
 uint64_t stm_sync_pending_free_blocks(stm_sync *s);
 
+/* The dirty reservation across the pool (stm_alloc_dirty_reserve): every
+ * attached allocator carries it, since a drained extent takes a replica on
+ * each of the first n devices. stm_sync_set_dirty_guard guards every
+ * attached allocator and every later attach; an attach carries the
+ * reservation over. stm_sync_dirty_reserve takes nblocks on every attached
+ * allocator or on none (STM_ENOSPC); stm_sync_dirty_release gives them
+ * back and settles the drain's blocks in flight. Between
+ * stm_sync_drain_begin and stm_sync_drain_end the calling thread's data
+ * allocations spend the reservation (stm_alloc_reserve_for_drain); the
+ * caller runs one drain at a time. Each takes s->lock, then a->lock. */
+void stm_sync_set_dirty_guard(stm_sync *s, bool guarded);
+STM_MUST_USE
+stm_status stm_sync_dirty_reserve(stm_sync *s, uint64_t nblocks);
+void stm_sync_dirty_release(stm_sync *s, uint64_t nblocks);
+uint64_t stm_sync_dirty_reserved(stm_sync *s);
+void stm_sync_drain_begin(stm_sync *s);
+void stm_sync_drain_end(stm_sync *s);
+
 /* Wedge the handle: every later mutating call, stm_sync_commit among
  * them, answers STM_EWEDGED. One-way. Takes s->lock, so a commit either
  * finished before the wedge or refuses after it. stm_fs wedges its sync

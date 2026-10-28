@@ -3627,8 +3627,12 @@ static stm_status h_statfs(stm_9p_server *s,
     p9l_p32(wp, STM_9P_FS_MAGIC); wp += 4;
     p9l_p32(wp, 4096u); wp += 4;                          /* bsize */
     p9l_p64(wp, stats.data_total_blocks); wp += 8;
-    p9l_p64(wp, stats.data_free_blocks);  wp += 8;        /* bfree */
-    p9l_p64(wp, stats.data_free_blocks);  wp += 8;        /* bavail */
+    /* bfree leaves out what buffered writes hold; bavail the slop too. */
+    uint64_t bfree = stats.data_free_blocks > stats.data_dirty_reserved_blocks
+                   ? stats.data_free_blocks - stats.data_dirty_reserved_blocks
+                   : 0u;
+    p9l_p64(wp, bfree);  wp += 8;                         /* bfree */
+    p9l_p64(wp, stats.data_avail_blocks);  wp += 8;       /* bavail */
     p9l_p64(wp, files); wp += 8;
     p9l_p64(wp, ffree); wp += 8;
     p9l_p64(wp, fsid);  wp += 8;

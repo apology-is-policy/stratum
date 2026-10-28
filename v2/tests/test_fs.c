@@ -13657,6 +13657,291 @@ STM_TEST(fs_the_legacy_extent_write_ends_at_the_largest_file_size) {
     unlink(g_key_path);
 }
 
+/* Buffered writes hold the blocks they were admitted on: a direct write to
+ * another file finds room only beyond them, so the commit drains every
+ * acknowledged one. 300 blocks are left past the writes' charges, fewer
+ * than the 2 MiB write's 513, so it lands only on blocks they hold. */
+STM_TEST(fs_a_direct_write_leaves_the_blocks_buffered_writes_hold) {
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp("direct_vs_buffered");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 48u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, x = 0, y = 0, f = 0, sp = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1, 0644u, 0, 0, &x));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"y", 1, 0644u, 0, 0, &y));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1, 0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"s", 1, 0644u, 0, 0, &sp));
+    mid_op_put(fs, sp, 0, 3u * MIB, 0x5A);
+    mid_op_fill(fs, f);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.data_free_blocks > 600u);
+    /* Each 4 KiB write into a hole is charged its block and a tag block. */
+    const uint64_t n = (st.data_free_blocks - 300u) / 2u;
+    uint64_t acked = 0;
+    uint8_t b[4096];
+    for (uint64_t k = 0; k < n; k++) {
+        memset(b, (int)(0x10u + k % 200u), sizeof b);
+        if (stm_fs_write(fs, 1, x, k * 8192u, b, sizeof b) == STM_OK) acked++;
+    }
+    /* premise: every write was buffered, none drained */
+    STM_ASSERT_EQ(acked, n);
+    stm_fs_stats sb = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &sb));
+    STM_ASSERT_EQ(sb.data_free_blocks, st.data_free_blocks);
+    uint8_t *big = malloc((size_t)(2u * MIB));
+    memset(big, 0x99, (size_t)(2u * MIB));
+    stm_status rd = stm_fs_write(fs, 1, y, 0, big, (size_t)(2u * MIB));
+    free(big);
+    STM_ASSERT_TRUE(rd == STM_OK || rd == STM_ENOSPC);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t lost = 0;
+    for (uint64_t k = 0; k < n; k++)
+        lost += mid_op_byte(fs, x, k * 8192u) != (uint8_t)(0x10u + k % 200u);
+    STM_ASSERT_EQ(lost, (uint64_t)0);
+    if (rd == STM_OK) {
+        STM_ASSERT_EQ(mid_op_byte(fs, y, 0), 0x99);
+        STM_ASSERT_EQ(mid_op_byte(fs, y, 2u * MIB - 1u), 0x99);
+    } else {
+        STM_ASSERT_EQ(mid_op_size(fs, y), (uint64_t)0);
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Inline files moving to extents on a near-full pool: a transition the
+ * buffer cannot hold writes its block itself, and that block comes from
+ * beyond what the buffered ones hold, so every committed prefix and every
+ * acknowledged append survives the commit. */
+STM_TEST(fs_a_refused_transition_spends_no_buffered_block) {
+    enum { M = 700 };
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp("refused_transition");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 48u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, f = 0, sp = 0, z = 0;
+    static uint64_t c[M];
+    static bool acked[M];
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1, 0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"s", 1, 0644u, 0, 0, &sp));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"z", 1, 0644u, 0, 0, &z));
+    for (unsigned i = 0; i < M; i++) {
+        char nm[16];
+        int nl = snprintf(nm, sizeof nm, "c%u", i);
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)nm,
+                                         (uint8_t)nl, 0644u, 0, 0, &c[i]));
+        uint8_t hello[50];
+        memset(hello, (int)(0x30u + i % 64u), sizeof hello);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, c[i], 0, hello, sizeof hello));
+    }
+    mid_op_put(fs, z, 0, 64u * 1024u, 0x6B);
+    mid_op_put(fs, sp, 0, 3u * MIB, 0x5A);
+    mid_op_fill(fs, f);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* z's blocks go PENDING, so a refusal can reach the reclaim. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"z", 1));
+    unsigned refused = 0;
+    for (unsigned i = 0; i < M; i++) {
+        uint8_t nb[200];
+        memset(nb, 0xE0, sizeof nb);
+        stm_status ws = stm_fs_write(fs, 1, c[i], 100u, nb, sizeof nb);
+        acked[i] = ws == STM_OK;
+        if (!acked[i]) { STM_ASSERT_ERR(ws, STM_ENOSPC); refused++; }
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    unsigned destroyed = 0, lost = 0;
+    for (unsigned i = 0; i < M; i++) {
+        destroyed += mid_op_byte(fs, c[i], 0) != (uint8_t)(0x30u + i % 64u);
+        if (acked[i]) lost += mid_op_byte(fs, c[i], 100u) != 0xE0;
+    }
+    STM_ASSERT_EQ(destroyed, 0u);
+    STM_ASSERT_EQ(lost, 0u);
+    /* the pool ran out: some transitions were refused */
+    STM_ASSERT_TRUE(refused > 0u);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A drain that fails leaves bytes in the buffer, so the reclaim must not
+ * commit after it: a transitioned file's kind flip would go durable without
+ * its extent, its committed inline bytes read back as zeros. The fs wedges
+ * and the image keeps the last good commit. */
+STM_TEST(fs_the_reclaim_never_commits_over_a_failed_drain) {
+    make_tmp("reclaim_failed_drain");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, c = 0, pf = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1, 0644u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"p", 1, 0644u, 0, 0, &pf));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, c, 0, "abc", 3));
+    mid_op_put(fs, pf, 0, 8192u, 0x44);
+    /* p's blocks go PENDING, so the commit's failed drain reaches the
+     * reclaim. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"p", 1));
+    STM_ASSERT_TRUE(stm_sync_pending_free_blocks(stm_fs_sync(fs)) > 0u);
+    uint8_t w[200];
+    memset(w, 0xE0, sizeof w);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, c, 100u, w, sizeof w));
+    /* premise: the transition's flip is in the index, its bytes buffered */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, c, &v));
+    STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+    stm_fs_fail_drains_for_test(fs, STM_ENOSPC);
+    STM_ASSERT_ERR(stm_fs_commit(fs), STM_ENOSPC);
+    stm_fs_fail_drains_for_test(fs, STM_OK);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.wedged);
+    /* a crash here: the image is what the commits left */
+    stm_fs_mark_wedged(fs);
+    (void)stm_fs_unmount(fs);
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, c, &v));
+    STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)3);
+    uint8_t r[3] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, c, 0, r, sizeof r, &got));
+    STM_ASSERT_EQ(got, sizeof r);
+    STM_ASSERT_EQ(memcmp(r, "abc", 3), 0);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* The pool holds what the buffer charges: buffered writes take it, an
+ * unlink and a commit give it back, and what a write can get is free less
+ * the hold and the slop. */
+STM_TEST(fs_the_dirty_reservation_follows_the_buffer) {
+    make_tmp("dirty_reservation");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, a = 0, b = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"a", 1, 0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"b", 1, 0644u, 0, 0, &b));
+    mid_op_put(fs, a, 0, 8192u, 0x11);
+    mid_op_put(fs, b, 0, 8192u, 0x22);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.data_dirty_reserved_blocks, (uint64_t)0);
+    STM_ASSERT_TRUE(st.data_avail_blocks < st.data_free_blocks);
+    const uint64_t slop = st.data_free_blocks - st.data_avail_blocks;
+    uint8_t w[4096];
+    memset(w, 0x33, sizeof w);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, a, 1u << 20, w, sizeof w));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    const uint64_t held_a = st.data_dirty_reserved_blocks;
+    STM_ASSERT_TRUE(held_a > 0u);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, b, (2u << 20) + 100u, w, 200u));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.data_dirty_reserved_blocks > held_a);
+    STM_ASSERT_EQ(st.data_avail_blocks,
+                  st.data_free_blocks - st.data_dirty_reserved_blocks - slop);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"b", 1));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.data_dirty_reserved_blocks, held_a);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.data_dirty_reserved_blocks, (uint64_t)0);
+    STM_ASSERT_EQ(st.data_avail_blocks, st.data_free_blocks - slop);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A truncate's kept prefix replaces the longer extent it is cut from, so it
+ * may spend half the slop: a pool filled to the slop refuses a write but
+ * can still be cut down. */
+STM_TEST(fs_a_shrinking_truncate_may_spend_half_the_slop) {
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp("netfree_truncate");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 48u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, c = 0, f = 0, g = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1, 0644u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1, 0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"g", 1, 0644u, 0, 0, &g));
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    const uint64_t slop = st.data_free_blocks - st.data_avail_blocks;
+    STM_ASSERT_TRUE(slop >= 8u);
+    mid_op_put(fs, c, 0, 65536u, 0x3C);
+    mid_op_fill(fs, f);
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    /* premise: the fill ended inside the slop, with room in its half */
+    STM_ASSERT_EQ(st.data_dirty_reserved_blocks, (uint64_t)0);
+    STM_ASSERT_TRUE(st.data_avail_blocks < 2u);
+    STM_ASSERT_TRUE(st.data_free_blocks >= slop / 2u + 2u);
+    uint8_t w[4096];
+    memset(w, 0x44, sizeof w);
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, g, 0, w, sizeof w), STM_ENOSPC);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, c, 4096u));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_EQ(mid_op_size(fs, c), (uint64_t)4096);
+    STM_ASSERT_EQ(mid_op_byte(fs, c, 0), 0x3C);
+    STM_ASSERT_EQ(mid_op_byte(fs, c, 4080u), 0x3C);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 /* A direct write split into pieces, whose second piece finds no room,
  * keeps the first and grows the size over it: nothing it wrote is left
  * past EOF for a later grow to read back as the file's content. */

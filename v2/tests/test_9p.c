@@ -2040,6 +2040,49 @@ STM_TEST(p9_statfs_returns_stratum_magic) {
     unlink(g_key_path);
 }
 
+/* Statfs leaves out what buffered writes hold: bfree is free less the
+ * reservation, bavail less the slop too. */
+STM_TEST(p9_statfs_leaves_out_the_dirty_reservation) {
+    make_tmp("9p_statfs_res");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &f));
+    static uint8_t blk[8192];
+    memset(blk, 0x42, sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, sizeof blk));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 1u << 20, blk, 4096u));
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.data_dirty_reserved_blocks > 0u);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tstatfs(req, 2, 100);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RSTATFS);
+    /* type[4] bsize[4] blocks[8] bfree[8] bavail[8], from offset 7 */
+    STM_ASSERT_EQ(load_u64(resp + 23),
+                  st.data_free_blocks - st.data_dirty_reserved_blocks);
+    STM_ASSERT_EQ(load_u64(resp + 31), st.data_avail_blocks);
+    STM_ASSERT_TRUE(st.data_avail_blocks <
+                    st.data_free_blocks - st.data_dirty_reserved_blocks);
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(p9_fsync_returns_rfsync) {
     make_tmp("9p_fsync");
     stm_fs_format_opts fopts = default_format_opts();

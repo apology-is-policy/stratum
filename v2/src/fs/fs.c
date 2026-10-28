@@ -323,6 +323,7 @@ struct stm_fs {
     void *name_read_hook_arg;
     stm_fs_buffer_insert_hook buffer_insert_hook;
     void *buffer_insert_hook_arg;
+    stm_status fail_drains;
 #endif
 };
 
@@ -1299,6 +1300,18 @@ static bool fs_post_inode_free_reclaim_locked(stm_fs *fs);
  * the reserve-bearing paths (write, the flush helpers, commit). */
 static bool fs_reclaim_on_enospc_locked(stm_fs *fs);
 
+/* The dirty buffer's hold on the pool: every attached device keeps the
+ * buffered blocks out of every allocation but the drain's. */
+static stm_status fs_dirty_reserve(void *user, uint64_t blocks)
+{
+    return stm_sync_dirty_reserve(((stm_fs *)user)->sync, blocks);
+}
+
+static void fs_dirty_release(void *user, uint64_t blocks)
+{
+    stm_sync_dirty_release(((stm_fs *)user)->sync, blocks);
+}
+
 static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
                        stm_alloc *a, stm_sync *sync, bool ro,
                        const char *keyfile_path,
@@ -1411,6 +1424,11 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         pthread_rwlock_destroy(&fs->global);
         free(fs);
         return NULL;
+    }
+    if (sync) {
+        stm_sync_set_dirty_guard(sync, true);
+        stm_dirty_buffer_set_reservation(fs->dirty_buffer, fs_dirty_reserve,
+                                         fs_dirty_release, fs);
     }
     /* 9.8-LF-3: atomic init at fs allocation (single-threaded — no race
      * with the wait-free readers, which never see fs until fs_new returns). */
@@ -2257,9 +2275,15 @@ static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
 {
     stm_fs *fs = (stm_fs *)user;
     size_t landed = 0;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->fail_drains != STM_OK) return fs->fail_drains;
+#endif
+    /* The write spends the blocks its ranges hold in the reservation. */
+    stm_sync_drain_begin(fs->sync);
     stm_status drc = fs_write_extent_aligned_locked(fs, ds, ino, off, data,
                                                         (size_t)len, &landed,
                                                         view, out_end);
+    stm_sync_drain_end(fs->sync);
     return drc;
 }
 
@@ -2370,20 +2394,16 @@ static stm_status fs_cover_extra_blocks(stm_fs *fs, uint64_t ds, uint64_t ino,
     return STM_OK;
 }
 
-/* The buffer asks this under its lock, so the pool's free blocks and the
- * extents the cover takes in are read after any drain: a peer's drain (a
- * writer of another inode flushing every inode, which needs no pin of this
- * one) spends blocks and can merge those extents. NULL alloc (test seam):
- * unbounded by footprint. */
+/* The buffer asks this under its lock, so the extents the cover takes in
+ * are read after any drain: a peer's drain (a writer of another inode
+ * flushing every inode, which needs no pin of this one) can merge them. The
+ * pool's bound is its reservation, taken with the insert. */
 static stm_status fs_buffer_admit(void *user, uint64_t ds, uint64_t ino,
                                   uint64_t off, uint64_t len,
-                                  uint64_t *extra_blocks,
-                                  uint64_t *max_footprint_blocks)
+                                  uint64_t *extra_blocks)
 {
-    stm_fs *fs = (stm_fs *)user;
-    *max_footprint_blocks = fs->alloc
-        ? stm_alloc_data_free_blocks(fs->alloc) : UINT64_MAX;
-    return fs_cover_extra_blocks(fs, ds, ino, off, len, extra_blocks);
+    return fs_cover_extra_blocks((stm_fs *)user, ds, ino, off, len,
+                                 extra_blocks);
 }
 
 /* A buffered insert, admitted on everything its drain will reserve. */
@@ -2629,19 +2649,21 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         stm_status part = STM_OK;   /* a direct write that landed a prefix */
         size_t wrote = len;
         if (len < STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
-            /* #40 pool-aware admission (atomic, block-granular): admit the
-             * buffered write only if the buffered block FOOTPRINT would stay
-             * within the pool's free blocks -- so an accepted buffered write
-             * is always committable (no false write-success the commit then
-             * can't flush). The footprint counts the drain's whole covering
-             * write, not just the range (fs_buffer_insert_locked). The free
-             * count, the cover and the check are read under buf->mu WITH the
-             * insert (fs_buffer_admit), so neither a concurrent SH writer nor
-             * a peer's drain of every inode leaves them stale. On STM_ENOSPC (RAM cap OR pool-footprint
-             * breach) run the writeback.tla::BufferBoundedSize dance -- flush
-             * this inode, re-read free, retry; still full -> flush every inode,
-             * re-read, retry -- then a true ENOSPC only if the write alone
-             * won't fit the drained pool. NULL alloc (test seam) -> unbounded
+            /* #40 pool-aware admission (atomic, block-granular): the insert
+             * takes the buffered block FOOTPRINT in the pool's dirty
+             * reservation, which holds it out of every other allocation
+             * until the drain spends it -- so an accepted buffered write is
+             * committable (no false write-success the commit then can't
+             * flush) unless the free blocks hold no run long enough. The
+             * footprint counts the drain's whole covering write, not just
+             * the range (fs_buffer_insert_locked). The cover and the take
+             * run under buf->mu WITH the insert (fs_buffer_admit), so
+             * neither a concurrent SH writer nor a peer's drain of every
+             * inode leaves them stale. On STM_ENOSPC (RAM cap OR the
+             * reservation refused) run the writeback.tla::BufferBoundedSize
+             * dance -- flush this inode, retry; still full -> flush every
+             * inode, retry -- then a true ENOSPC only if the write alone
+             * won't fit the drained pool. No sync (test seam) -> unbounded
              * by footprint, RAM caps still apply. */
             /* R2-F1: RDLOCK txn across each {insert; ...; iset} span
              * (the successful insert HOLDS through the epilogue iset below;
@@ -3679,6 +3701,11 @@ void stm_fs_set_buffer_insert_hook_for_test(stm_fs *fs,
     fs->buffer_insert_hook_arg = arg;
 }
 
+void stm_fs_fail_drains_for_test(stm_fs *fs, stm_status fail)
+{
+    fs->fail_drains = fail;
+}
+
 void stm_fs_set_fresh_pin_hook_for_test(stm_fs *fs, stm_fs_fresh_pin_hook fn,
                                         void *arg)
 {
@@ -4557,11 +4584,12 @@ static bool fs_post_inode_free_reclaim_locked(stm_fs *fs)
  * sweep that returns them to FREE runs at commit. Sweep them via the
  * double-commit, then tell the caller to retry its reserve ONCE.
  *
- * Returns true iff the caller should RETRY. On a failed reclaim commit
- * (crash-equivalent per R154: the engine three-phase abort drops the
- * in-memory tree) it wedges in place (fs_mark_wedged_locked) and returns
- * false -- the fs is going down; the caller propagates the STM_ENOSPC (or
- * the reserve's own error) and every subsequent op sees STM_EWEDGED.
+ * Returns true iff the caller should RETRY. On a failed drain, or a failed
+ * reclaim commit (crash-equivalent per R154: the engine three-phase abort
+ * drops the in-memory tree), it wedges in place (fs_mark_wedged_locked)
+ * and returns false -- the fs is going down; the caller propagates the
+ * STM_ENOSPC (or the reserve's own error) and every subsequent op sees
+ * STM_EWEDGED.
  * Its caller passed its wedge check before the reclaim ran, so a wedge
  * another op raised since then is not seen here: the sync's latch
  * (stm_sync_mark_wedged) makes these commits refuse instead.
@@ -4589,14 +4617,12 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
      * commit pair so the committed image is consistent. The RAW drain
      * (not fs_flush_*_locked) cannot re-enter reclaim -- its cb's ENOSPC
      * just propagates, keeping undrained ranges buffered (pop-on-success).
-     * If the pre-drain falls short (the deep-pressure corner: the drain
-     * itself needs the space only the sweep can free), run the pair, then
-     * re-drain, then ONE closing commit to persist the re-drained extents
-     * -- so the only residual torn window is (deep corner) x (crash before
-     * the closing commit / a later drain+commit; unmount drains-first and
-     * closes it). The #40 admission makes the transition's own drain fit
-     * by construction (hole-landing, exactly charged); the corner needs
-     * out-of-band free-space consumption between admission and drain. */
+     * A drain that falls short leaves such bytes buffered, so no commit
+     * may follow it: the fs wedges. The pool's reservation holds every
+     * buffered block out of every other allocation, so the drain fits
+     * unless the free blocks hold no run long enough, a device fails or
+     * the charges undercount; committing over it was how 308 of 700
+     * committed inline files read back as zeros. */
     /* R2-F1: the whole drain->commit sequence runs under txn WRLOCK,
      * excluding every writer's {insert; iset} two-step and every namespace
      * op's mutations (they RDLOCK it) -- else a PEER writer's transition
@@ -4617,22 +4643,10 @@ static bool fs_reclaim_on_enospc_locked(stm_fs *fs)
 #endif
     stm_status predrain = stm_dirty_buffer_drain_all(fs->dirty_buffer,
                                                         fs_flush_drain_cb, fs);
-    if (fs_post_inode_free_reclaim_locked(fs)) {
+    if (predrain != STM_OK || fs_post_inode_free_reclaim_locked(fs)) {
         fs_mark_wedged_locked(fs);
         pthread_rwlock_unlock(&fs->txn);
         return false;
-    }
-    if (predrain != STM_OK) {
-        stm_status redrain = stm_dirty_buffer_drain_all(fs->dirty_buffer,
-                                                           fs_flush_drain_cb, fs);
-        (void)redrain;   /* a still-failing re-drain leaves bytes buffered;
-                            the closing commit below persists whatever DID
-                            land, so no NEW tear is added by this call. */
-        if (stm_sync_commit(fs->sync) != STM_OK) {
-            fs_mark_wedged_locked(fs);
-            pthread_rwlock_unlock(&fs->txn);
-            return false;
-        }
     }
     pthread_rwlock_unlock(&fs->txn);
     return true;
@@ -12522,6 +12536,8 @@ stm_status stm_fs_stats_get(const stm_fs *fs, stm_fs_stats *out)
     out->data_pending_blocks   = astats.data_pending_blocks;
     out->data_free_blocks      = astats.data_free_blocks;
     out->n_allocated_ranges    = astats.n_allocated_ranges;
+    out->data_dirty_reserved_blocks = stm_alloc_dirty_reserved(fs->alloc);
+    out->data_avail_blocks          = stm_alloc_avail_blocks(fs->alloc);
 
     out->current_gen       = sinfo.current_gen;
     out->alloc_root_paddr  = sinfo.alloc_root_paddr;

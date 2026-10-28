@@ -974,6 +974,57 @@ static void teardown_mirror_pool(stm_bdev *bds[NDEV],
     unlink_paths();
 }
 
+/* The dirty reservation holds on every attached device: a reserve one
+ * device cannot hold takes nothing on any, and a device attached later
+ * carries what is held. */
+STM_TEST(sync_multi_the_dirty_reservation_holds_on_every_device) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "dirty_res", bds, as, &pool, &s);
+    stm_sync_set_dirty_guard(s, true);
+    uint64_t avail1 = stm_alloc_avail_blocks(as[1]), p = 0;
+    STM_ASSERT_TRUE(avail1 > 10u);
+    STM_ASSERT_OK(stm_alloc_reserve(as[1], avail1 - 10u, 0, &p));
+    STM_ASSERT_ERR(stm_sync_dirty_reserve(s, 11u), STM_ENOSPC);
+    for (size_t i = 0; i < NDEV; i++)
+        STM_ASSERT_EQ(stm_alloc_dirty_reserved(as[i]), (uint64_t)0);
+    STM_ASSERT_EQ(stm_sync_dirty_reserved(s), (uint64_t)0);
+    STM_ASSERT_OK(stm_sync_dirty_reserve(s, 10u));
+    for (size_t i = 0; i < NDEV; i++)
+        STM_ASSERT_EQ(stm_alloc_dirty_reserved(as[i]), (uint64_t)10);
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(as[1]), (uint64_t)0);
+    stm_sync_dirty_release(s, 4u);
+    for (size_t i = 0; i < NDEV; i++)
+        STM_ASSERT_EQ(stm_alloc_dirty_reserved(as[i]), (uint64_t)6);
+    STM_ASSERT_EQ(stm_sync_dirty_reserved(s), (uint64_t)6);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+STM_TEST(sync_multi_an_attached_device_carries_the_dirty_reservation) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    make_paths("dirty_attach");
+    open_multi_allocs(bds, as);
+    stm_pool *pool = make_multi_pool(bds);
+    stm_redundancy_profile prof = { .kind = STM_RED_MIRROR, .mirror_n = 2 };
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, as[0], make_wk(), &prof, &s));
+    stm_sync_set_dirty_guard(s, true);
+    STM_ASSERT_OK(stm_sync_dirty_reserve(s, 7u));
+    uint64_t free1 = stm_alloc_data_free_blocks(as[1]);
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 1u, as[1]));
+    STM_ASSERT_EQ(stm_alloc_dirty_reserved(as[1]), (uint64_t)7);
+    STM_ASSERT_EQ(stm_alloc_avail_blocks(as[1]),
+                  free1 - 7u - stm_alloc_slop_blocks(as[1]));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 2u, as[2]));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_dirty_release(s, 7u);
+    for (size_t i = 0; i < NDEV; i++)
+        STM_ASSERT_EQ(stm_alloc_dirty_reserved(as[i]), (uint64_t)0);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
 /* Happy path: mirror(2) on a 3-device pool. Reserve 1 block mirror →
  * 2 paddrs on 2 distinct devices. Write same content to both. Read
  * from either paddr verifies. */

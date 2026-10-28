@@ -101,6 +101,14 @@ struct stm_alloc {
      * scan. Maintained at reserve (+), unref-to-0 (-), recovery-rebuild, init. */
     uint64_t        allocated_blocks;
 
+    /* The dirty reservation (stm_alloc_dirty_reserve): blocks the dirty
+     * buffer's drains will spend, held out of every other allocation once
+     * guarded. drain_inflight counts what the drain allocated since the
+     * last release: still inside dirty_reserved, already out of free. */
+    bool            guarded;
+    uint64_t        dirty_reserved;
+    uint64_t        drain_inflight;
+
     /* Chunk 5d: most-recently-persisted tree root paddr. 0 if no tree
      * has been committed yet. Used to free the previous snapshot's
      * nodes on the next commit. */
@@ -981,9 +989,43 @@ static int reserve_scan_cb(const void *key, size_t key_len,
     return 0;
 }
 
-stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
-                              uint64_t hint_paddr,
-                              uint64_t *out_paddr)
+static uint64_t alloc_free_locked(const stm_alloc *a)
+{
+    uint64_t used = a->allocated_blocks + a->pending_blocks;
+    return used <= a->data_total_blocks ? a->data_total_blocks - used : 0;
+}
+
+static uint64_t alloc_slop_locked(const stm_alloc *a)
+{
+    uint64_t slop = a->data_total_blocks / 50u;
+    return slop > 4096u ? 4096u : slop;
+}
+
+enum alloc_class { ALLOC_ORDINARY, ALLOC_NETFREE, ALLOC_DRAIN };
+
+/* Free blocks an allocation of class `cls` may take: the drain all of
+ * them, a net-free one all but the reservation and half the slop, any
+ * other all but the reservation and the slop. */
+static uint64_t alloc_room_locked(const stm_alloc *a, enum alloc_class cls)
+{
+    uint64_t f = alloc_free_locked(a);
+    if (!a->guarded || cls == ALLOC_DRAIN) return f;
+    uint64_t held = a->dirty_reserved > a->drain_inflight
+                  ? a->dirty_reserved - a->drain_inflight : 0;
+    uint64_t slop = alloc_slop_locked(a);
+    uint64_t keep = held + (cls == ALLOC_NETFREE ? slop / 2u : slop);
+    return f > keep ? f - keep : 0;
+}
+
+/* Free blocks an allocation outside the drain may take. */
+static uint64_t alloc_avail_locked(const stm_alloc *a)
+{
+    return alloc_room_locked(a, ALLOC_ORDINARY);
+}
+
+static stm_status alloc_reserve(stm_alloc *a, uint64_t nblocks,
+                                uint64_t hint_paddr, uint64_t *out_paddr,
+                                enum alloc_class cls)
 {
     if (!a || !out_paddr) return STM_EINVAL;
     if (nblocks == 0) return STM_EINVAL;
@@ -994,6 +1036,10 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
     if (nblocks > UINT32_MAX) return STM_ERANGE;
 
     pthread_mutex_lock(&a->lock);
+    if (alloc_room_locked(a, cls) < nblocks) {
+        pthread_mutex_unlock(&a->lock);
+        return STM_ENOSPC;
+    }
 
     uint64_t hint_start = 0;
     if (hint_paddr != 0 && stm_paddr_device(hint_paddr) == a->device_id) {
@@ -1083,6 +1129,7 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
         return s;
     }
     a->allocated_blocks += nblocks;   /* new refcount=1 range enters allocated */
+    if (cls == ALLOC_DRAIN) a->drain_inflight += nblocks;
 
     /* P5-3c: stamp this alloc's device_id into the top 16 bits of
      * the returned paddr. Callers that dereference this paddr (bdev
@@ -1095,6 +1142,95 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
     accel_invalidate_locked(a);    /* new start_block added to the set */
     pthread_mutex_unlock(&a->lock);
     return STM_OK;
+}
+
+stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
+                              uint64_t hint_paddr,
+                              uint64_t *out_paddr)
+{
+    return alloc_reserve(a, nblocks, hint_paddr, out_paddr, ALLOC_ORDINARY);
+}
+
+stm_status stm_alloc_reserve_for_drain(stm_alloc *a, uint64_t nblocks,
+                                       uint64_t hint_paddr,
+                                       uint64_t *out_paddr)
+{
+    return alloc_reserve(a, nblocks, hint_paddr, out_paddr, ALLOC_DRAIN);
+}
+
+stm_status stm_alloc_reserve_netfree(stm_alloc *a, uint64_t nblocks,
+                                     uint64_t hint_paddr,
+                                     uint64_t *out_paddr)
+{
+    return alloc_reserve(a, nblocks, hint_paddr, out_paddr, ALLOC_NETFREE);
+}
+
+void stm_alloc_set_guarded(stm_alloc *a, bool guarded)
+{
+    if (!a) return;
+    pthread_mutex_lock(&a->lock);
+    a->guarded = guarded;
+    pthread_mutex_unlock(&a->lock);
+}
+
+stm_status stm_alloc_dirty_reserve(stm_alloc *a, uint64_t nblocks)
+{
+    if (!a) return STM_EINVAL;
+    pthread_mutex_lock(&a->lock);
+    stm_status s = STM_OK;
+    if (a->guarded && alloc_avail_locked(a) < nblocks) s = STM_ENOSPC;
+    else a->dirty_reserved += nblocks;
+    pthread_mutex_unlock(&a->lock);
+    return s;
+}
+
+void stm_alloc_dirty_release(stm_alloc *a, uint64_t nblocks)
+{
+    if (!a) return;
+    pthread_mutex_lock(&a->lock);
+    a->dirty_reserved = nblocks < a->dirty_reserved
+                      ? a->dirty_reserved - nblocks : 0;
+    a->drain_inflight = 0;
+    pthread_mutex_unlock(&a->lock);
+}
+
+void stm_alloc_dirty_set(stm_alloc *a, uint64_t nblocks)
+{
+    if (!a) return;
+    pthread_mutex_lock(&a->lock);
+    a->dirty_reserved = nblocks;
+    a->drain_inflight = 0;
+    pthread_mutex_unlock(&a->lock);
+}
+
+uint64_t stm_alloc_dirty_reserved(const stm_alloc *a)
+{
+    if (!a) return 0;
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    uint64_t n = ma->dirty_reserved;
+    pthread_mutex_unlock(&ma->lock);
+    return n;
+}
+
+uint64_t stm_alloc_slop_blocks(const stm_alloc *a)
+{
+    if (!a) return 0;
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    uint64_t n = alloc_slop_locked(ma);
+    pthread_mutex_unlock(&ma->lock);
+    return n;
+}
+
+uint64_t stm_alloc_avail_blocks(const stm_alloc *a)
+{
+    if (!a) return 0;
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    uint64_t n = alloc_avail_locked(ma);
+    pthread_mutex_unlock(&ma->lock);
+    return n;
 }
 
 /* ========================================================================= */

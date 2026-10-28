@@ -304,6 +304,14 @@ struct stm_sync {
     stm_alloc *allocs[STM_POOL_DEVICES_MAX];
     size_t     n_attached;   /* count of non-NULL entries in allocs[] */
 
+    /* The dirty reservation every attached alloc carries, whether new
+     * attaches are guarded, and the thread draining the dirty buffer
+     * (stm_sync_drain_begin), whose allocations spend the reservation. */
+    uint64_t   dirty_reserved;
+    bool       dirty_guard;
+    bool       draining;
+    pthread_t  drainer;
+
     /* Cached from pool at open/create time. pool_uuid is pool-wide;
      * device_uuid is device 0's uuid (used by stm_alloc_set_crypt_ctx
      * since alloc remains single-device in P5-2). */
@@ -3594,6 +3602,86 @@ stm_alloc *stm_sync_alloc(const stm_sync *s, uint16_t device_id)
     return a;
 }
 
+/* A data allocation: the drain's own spends the dirty reservation. Caller
+ * holds s->lock. */
+static stm_status sync_alloc_reserve_locked(stm_sync *s, stm_alloc *a,
+                                            uint64_t nblocks,
+                                            uint64_t hint_paddr,
+                                            uint64_t *out_paddr)
+{
+    if (s->draining && pthread_equal(s->drainer, pthread_self()))
+        return stm_alloc_reserve_for_drain(a, nblocks, hint_paddr, out_paddr);
+    return stm_alloc_reserve(a, nblocks, hint_paddr, out_paddr);
+}
+
+void stm_sync_set_dirty_guard(stm_sync *s, bool guarded)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->dirty_guard = guarded;
+    for (size_t i = 0; i < STM_POOL_DEVICES_MAX; i++)
+        if (s->allocs[i]) stm_alloc_set_guarded(s->allocs[i], guarded);
+    pthread_mutex_unlock(&s->lock);
+}
+
+stm_status stm_sync_dirty_reserve(stm_sync *s, uint64_t nblocks)
+{
+    if (!s) return STM_EINVAL;
+    pthread_mutex_lock(&s->lock);
+    stm_status rs = STM_OK;
+    size_t i = 0;
+    for (; i < STM_POOL_DEVICES_MAX; i++) {
+        if (!s->allocs[i]) continue;
+        rs = stm_alloc_dirty_reserve(s->allocs[i], nblocks);
+        if (rs != STM_OK) break;
+    }
+    if (rs != STM_OK) {
+        for (size_t j = 0; j < i; j++)
+            if (s->allocs[j]) stm_alloc_dirty_release(s->allocs[j], nblocks);
+    } else {
+        s->dirty_reserved += nblocks;
+    }
+    pthread_mutex_unlock(&s->lock);
+    return rs;
+}
+
+void stm_sync_dirty_release(stm_sync *s, uint64_t nblocks)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    for (size_t i = 0; i < STM_POOL_DEVICES_MAX; i++)
+        if (s->allocs[i]) stm_alloc_dirty_release(s->allocs[i], nblocks);
+    s->dirty_reserved = nblocks < s->dirty_reserved
+                      ? s->dirty_reserved - nblocks : 0;
+    pthread_mutex_unlock(&s->lock);
+}
+
+uint64_t stm_sync_dirty_reserved(stm_sync *s)
+{
+    if (!s) return 0;
+    pthread_mutex_lock(&s->lock);
+    uint64_t n = s->dirty_reserved;
+    pthread_mutex_unlock(&s->lock);
+    return n;
+}
+
+void stm_sync_drain_begin(stm_sync *s)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->drainer = pthread_self();
+    s->draining = true;
+    pthread_mutex_unlock(&s->lock);
+}
+
+void stm_sync_drain_end(stm_sync *s)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->draining = false;
+    pthread_mutex_unlock(&s->lock);
+}
+
 uint64_t stm_sync_pending_free_blocks(stm_sync *s)
 {
     if (!s) return 0;
@@ -3762,6 +3850,8 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
         }
     }
 
+    stm_alloc_set_guarded(alloc, s->dirty_guard);
+    stm_alloc_dirty_set(alloc, s->dirty_reserved);
     pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
     return STM_OK;
 }
@@ -3830,8 +3920,8 @@ stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
     stm_status last_err = STM_OK;
     for (size_t i = 0; i < n_replicas; i++) {
         uint64_t pi = 0;
-        stm_status rs = stm_alloc_reserve(s->allocs[targets[i]],
-                                            nblocks, 0, &pi);
+        stm_status rs = sync_alloc_reserve_locked(s, s->allocs[targets[i]],
+                                                  nblocks, 0, &pi);
         if (rs != STM_OK) { last_err = rs; break; }
         out_paddrs[i] = pi;
         reserved++;
@@ -4116,7 +4206,8 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
     /* 2) Reserve length_blocks on survivor. */
     stm_alloc *surv_alloc = s->allocs[survivor];
     uint64_t new_paddr = 0;
-    stm_status res = stm_alloc_reserve(surv_alloc, length_blocks, 0, &new_paddr);
+    stm_status res = sync_alloc_reserve_locked(s, surv_alloc, length_blocks,
+                                               0, &new_paddr);
     if (res != STM_OK) { free(buf); pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return res; }
 
     /* 3) Write to survivor + fsync. We do NOT fan out to all survivors
@@ -5990,9 +6081,10 @@ static void sync_write_reserve_rollback(stm_sync *s,
  * args are caller-validated. On failure nothing is held (partial
  * reserves freed, DEK scrubbed). On success the caller MUST reach
  * sync_write_encrypt_store, then either the index commit or the
- * rollback. */
+ * rollback. A `netfree` write replaces a longer extent it cuts, so it may
+ * spend half the slop. */
 static stm_status sync_write_reserve_locked(stm_sync *s, uint64_t dataset_id,
-                                               size_t len,
+                                               size_t len, bool netfree,
                                                sync_write_reservation *res)
 {
     memset(res, 0, sizeof *res);
@@ -6032,8 +6124,11 @@ static stm_status sync_write_reserve_locked(stm_sync *s, uint64_t dataset_id,
             sync_write_reserve_rollback(s, res);
             return STM_EINVAL;
         }
-        stm_status rs = stm_alloc_reserve(s->allocs[i], res->nblocks, 0,
-                                             &res->replicas[i]);
+        stm_status rs = netfree
+            ? stm_alloc_reserve_netfree(s->allocs[i], res->nblocks, 0,
+                                        &res->replicas[i])
+            : sync_alloc_reserve_locked(s, s->allocs[i], res->nblocks, 0,
+                                        &res->replicas[i]);
         if (rs != STM_OK) {
             sync_write_reserve_rollback(s, res);
             return rs;
@@ -6318,9 +6413,10 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
 static stm_status stm_sync_write_extent_locked(stm_sync *s,
                                                   uint64_t dataset_id, uint64_t ino,
                                                   uint64_t off, const void *buf,
-                                                  size_t len) {
+                                                  size_t len, bool netfree) {
     sync_write_reservation res;
-    stm_status rs = sync_write_reserve_locked(s, dataset_id, len, &res);
+    stm_status rs = sync_write_reserve_locked(s, dataset_id, len, netfree,
+                                              &res);
     if (rs != STM_OK) return rs;
 
     stm_status es = sync_write_encrypt_store(s, dataset_id, ino, off,
@@ -6400,7 +6496,8 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         pthread_mutex_lock(&s->lock);
         if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
         if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
-        stm_status rs = sync_write_reserve_locked(s, dataset_id, len, &res);
+        stm_status rs = sync_write_reserve_locked(s, dataset_id, len, false,
+                                                  &res);
         pthread_mutex_unlock(&s->lock);
         if (rs != STM_OK) return rs;
 
@@ -6450,7 +6547,7 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
     stm_status rc = stm_sync_write_extent_locked(s, dataset_id, ino,
-                                                    off, buf, len);
+                                                    off, buf, len, false);
     pthread_mutex_unlock(&s->lock);
     return rc;
 }
@@ -7928,9 +8025,10 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             return STM_EIO;
         }
         size_t prefix_len = (size_t)(new_size - rec.off);
+        /* The prefix replaces the longer extent it is cut from. */
         stm_status ws = stm_sync_write_extent_locked(s, dataset_id, ino,
                                                         rec.off, plain,
-                                                        prefix_len);
+                                                        prefix_len, true);
         stm_ct_memzero(plain, rec.len);
         free(plain);
         if (ws != STM_OK) {
@@ -8660,7 +8758,8 @@ static stm_status cas_chunk_intern_locked(
                 (void)stm_alloc_free(s->allocs[j], paddrs[j], s->current_gen);
             return STM_EINVAL;
         }
-        stm_status as = stm_alloc_reserve(s->allocs[i], nblocks, 0, &paddrs[i]);
+        stm_status as = sync_alloc_reserve_locked(s, s->allocs[i], nblocks, 0,
+                                                  &paddrs[i]);
         if (as != STM_OK) {
             for (size_t j = 0; j < n_reserved; j++)
                 (void)stm_alloc_free(s->allocs[j], paddrs[j], s->current_gen);
@@ -9699,7 +9798,8 @@ static stm_status promote_one_extent_locked(stm_sync *s,
             free(plain);
             return STM_EINVAL;
         }
-        stm_status as = stm_alloc_reserve(s->allocs[i], nblocks, 0, &replicas[i]);
+        stm_status as = sync_alloc_reserve_locked(s, s->allocs[i], nblocks, 0,
+                                                  &replicas[i]);
         if (as != STM_OK) {
             for (size_t j = 0; j < reserved; j++)
                 (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);

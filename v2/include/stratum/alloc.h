@@ -276,6 +276,50 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
                               uint64_t *out_paddr);
 
 /*
+ * The dirty reservation: the blocks the dirty buffer's drains will spend
+ * (ext4's dirty-cluster counter). On a guarded allocator (the fs guards
+ * every allocator it mounts) stm_alloc_reserve and stm_alloc_dirty_reserve
+ * refuse with STM_ENOSPC unless the reservation and the slop stay free
+ * after them: free - reserved - slop >= nblocks, free counting allocated
+ * and PENDING blocks as used. The slop (stm_alloc_slop_blocks) is 2% of the
+ * data area, at most 4096 blocks (ext4's reserved clusters): the drain's
+ * margin, half of which an allocation that frees more than it takes may
+ * spend. An unguarded allocator checks only for a gap, as before.
+ *
+ * stm_alloc_reserve_for_drain is the drain's own allocation: it spends the
+ * reservation, so it checks only for a gap, and its blocks count in flight
+ * (still inside `reserved`, already out of `free`, so no other allocation
+ * counts them twice) until stm_alloc_dirty_release settles them.
+ */
+STM_MUST_USE
+stm_status stm_alloc_reserve_for_drain(stm_alloc *a, uint64_t nblocks,
+                                       uint64_t hint_paddr,
+                                       uint64_t *out_paddr);
+/* An allocation replacing a longer extent it cuts (a truncate's kept
+ * prefix) may spend half the slop, never the reservation, so a full pool
+ * can still be cut down: ZFS's net-free transactions. */
+STM_MUST_USE
+stm_status stm_alloc_reserve_netfree(stm_alloc *a, uint64_t nblocks,
+                                     uint64_t hint_paddr,
+                                     uint64_t *out_paddr);
+void stm_alloc_set_guarded(stm_alloc *a, bool guarded);
+STM_MUST_USE
+stm_status stm_alloc_dirty_reserve(stm_alloc *a, uint64_t nblocks);
+/* Gives back `nblocks` of the reservation and settles the drain's blocks
+ * in flight: what it allocated is allocated, and what it popped is no
+ * longer reserved. Called with no drain write running. */
+void stm_alloc_dirty_release(stm_alloc *a, uint64_t nblocks);
+/* Sets the reservation outright, for a device attached while writes are
+ * buffered: it carries the pool's whole reservation. */
+void stm_alloc_dirty_set(stm_alloc *a, uint64_t nblocks);
+uint64_t stm_alloc_dirty_reserved(const stm_alloc *a);
+uint64_t stm_alloc_slop_blocks(const stm_alloc *a);
+/* What an allocation outside the drain can still get: free less the
+ * reservation (net of the drain's blocks in flight) and the slop; free on
+ * an unguarded allocator. */
+uint64_t stm_alloc_avail_blocks(const stm_alloc *a);
+
+/*
  * Free a previously-reserved range (matched by its starting paddr).
  * Models `allocator.tla`'s `Unref` with the main owner:
  *

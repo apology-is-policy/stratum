@@ -70,6 +70,10 @@ typedef struct {
     uint64_t data_pending_blocks;
     uint64_t data_free_blocks;
     uint64_t n_allocated_ranges;
+    /* Held for the dirty buffer's drains (stm_alloc_dirty_reserve), and
+     * what a write can still get: free less that and the slop. */
+    uint64_t data_dirty_reserved_blocks;
+    uint64_t data_avail_blocks;
 
     /* Sync-side state. */
     uint64_t current_gen;
