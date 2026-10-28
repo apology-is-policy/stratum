@@ -13663,7 +13663,8 @@ typedef struct {
     uint64_t z;              /* the peer's file */
     uint64_t at;             /* the peer's write, inside z's extents */
     bool armed;
-    uint64_t free_before, free_after;
+    stm_status rc;           /* the peer's write */
+    uint64_t free_before, free_after, dirty_before, avail_after;
     pthread_t th;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -13676,12 +13677,13 @@ static void *peer_drain_write(void *arg)
     stm_fs_stats st = {0};
     STM_ASSERT_OK(stm_fs_stats_get(p->fs, &st));
     p->free_before = st.data_free_blocks;
+    p->dirty_before = st.data_dirty_reserved_blocks;
     uint8_t b[200];
     memset(b, 0xC3, sizeof b);
-    STM_ASSERT_ERR(stm_fs_write(p->fs, 1, p->z, p->at, b, sizeof b),
-                   STM_ENOSPC);
+    p->rc = stm_fs_write(p->fs, 1, p->z, p->at, b, sizeof b);
     STM_ASSERT_OK(stm_fs_stats_get(p->fs, &st));
     p->free_after = st.data_free_blocks;
+    p->avail_after = st.data_avail_blocks;
     pthread_mutex_lock(&p->mu);
     p->done = true;
     pthread_cond_signal(&p->cv);
@@ -13724,9 +13726,11 @@ static void peer_drain_join(peer_drain *p)
 /* y gets an earlier range A whose drain rewrites [0, 8M) as one extent, and
  * B straddling 8M; on the extents B looks up first its cover is smaller than
  * after the peer's drain of A. hole: A is a run filling the hole between two
- * one-block extents (its drain spends blocks no reclaim gives back, so a
- * stale cover alone overcommits); else A straddles 4M between 4 MiB
- * extents. */
+ * one-block extents, so B's cover grows from 257 blocks to 2304, which no
+ * reclaim gives back; the peer, refused, writes the first record of its
+ * cover direct and leaves room for B's charge on the old cover (517 blocks)
+ * but not for B's drain (2306), so a stale cover alone overcommits. Else A
+ * straddles 4M between 4 MiB extents. */
 static void peer_drain_leg(const char *name, bool hole)
 {
     const uint64_t MIB = 1024u * 1024u;
@@ -13748,11 +13752,11 @@ static void peer_drain_leg(const char *name, bool hole)
     STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1, 0644u, 0, 0, &f));
     uint8_t *big = malloc((size_t)(8u * MIB));
     if (hole) {
-        /* y: [0, 4K) 0x20, [8M-4K, 8M) 0x21, [8M, 12M) 0x22; z: two 8 MiB. */
+        /* y: [0, 4K) 0x20, [8M-4K, 8M) 0x21, [8M, 9M) 0x22; z: two 8 MiB. */
         memset(big, 0x20, 4096u);
         STM_ASSERT_OK(stm_fs_write(fs, 1, y, 0u, big, 4096u));
-        memset(big, 0x22, (size_t)(4u * MIB));
-        STM_ASSERT_OK(stm_fs_write(fs, 1, y, 8u * MIB, big, (size_t)(4u * MIB)));
+        memset(big, 0x22, (size_t)MIB);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, y, 8u * MIB, big, (size_t)MIB));
         memset(big, 0x21, 4096u);
         STM_ASSERT_OK(stm_fs_write(fs, 1, y, 8u * MIB - 4096u, big, 4096u));
         memset(big, 0x30, (size_t)(8u * MIB));
@@ -13771,7 +13775,7 @@ static void peer_drain_leg(const char *name, bool hole)
     }
     free(big);
     STM_ASSERT_OK(stm_fs_commit(fs));
-    mid_op_put(fs, sp, 0, hole ? 17u * MIB + MIB / 2u : 20u * MIB, 0x5A);
+    mid_op_put(fs, sp, 0, hole ? 21u * MIB : 20u * MIB, 0x5A);
     mid_op_fill(fs, f);
     STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
     STM_ASSERT_OK(stm_fs_commit(fs));
@@ -13805,9 +13809,15 @@ static void peer_drain_leg(const char *name, bool hole)
     stm_status rb = stm_fs_write(fs, 1, y, 8u * MIB - 100u, b, sizeof b);
     stm_fs_set_buffer_insert_hook_for_test(fs, NULL, NULL);
     peer_drain_join(&p);
-    /* premise: the peer's flush drained A inside the window */
+    /* premise: the peer, refused, flushed and drained A inside the window */
     STM_ASSERT_TRUE(!p.armed);
+    STM_ASSERT_ERR(p.rc, STM_ENOSPC);
+    STM_ASSERT_TRUE(p.dirty_before > 0u);
     STM_ASSERT_TRUE(p.free_before - p.free_after >= 2048u);
+    if (hole) {
+        STM_ASSERT_TRUE(p.avail_after >= 517u);
+        STM_ASSERT_TRUE(p.free_after < 2306u);
+    }
     stm_fs_stats ps = {0};
     STM_ASSERT_OK(stm_fs_stats_get(fs, &ps));
     STM_ASSERT_EQ(ps.data_pending_blocks, (uint64_t)0);
