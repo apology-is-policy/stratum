@@ -225,7 +225,7 @@ Runtime twin of all three: `locks_release_drops_only_its_owners_lock_there`.
   different-owner overlapping with-exclusive, other incarnation
   `locks_other_incarnation_never_conflicts`, and what a release leaves
   `locks_release_drops_only_its_owners_lock_there`).
-- `tests/test_fs.c` — `fs_lock_on_a_rolled_back_file_never_refuses_its_successor`,
+- `tests/test_fs_identity.c` -- `fs_lock_on_a_rolled_back_file_never_refuses_its_successor`,
   `fs_if_gen_ops_act_only_on_their_incarnation`.
 - `tests/test_fs.c` — composes with fs.c wrappers
   (`stm_fs_lock_acquire` / `_release` / `_test`) and validates that the

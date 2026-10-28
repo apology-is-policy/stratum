@@ -399,7 +399,7 @@ absent, and an exchange half done (`stm_dirent_swap_two`); Linux readers
 see neither. Only gen-less in-process callers reach the lockless readers; 9P's walk and readdir pass a gen and take the locked
 paths, which see neither.
 
-Tests (`tests/test_fs.c`): `fs_a_dead_name_is_absent_to_lookups`,
+Tests (`tests/test_fs_identity.c`): `fs_a_dead_name_is_absent_to_lookups`,
 `fs_a_dead_name_names_no_file`, `fs_a_dead_name_is_still_taken`,
 `fs_a_rename_onto_a_dead_name_replaces_only_its_record`,
 `fs_a_dead_name_goes_by_its_record`,

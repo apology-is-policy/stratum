@@ -311,10 +311,34 @@ concurrent insert/delete.
 
 Operations:
 
-- **Reserve**: linear gap scan through tree entries, find first gap
-  of ≥ `nblocks`. Insert `(start, length, refcount=1)`. Prefer
-  `hint_paddr` if it falls in a usable gap. Returns the paddr with
-  device_id stamped in top 16 bits (P5-3c).
+- **Reserve**: linear gap scan through tree entries. Every allocation
+  takes at least 2 blocks, and none leaves a 1-block gap: a gap of
+  exactly `nblocks`, or of at least `nblocks + 2`, is taken first, and
+  the first gap of `nblocks + 1` is taken whole only when nothing else
+  fits and the room admits the extra block. `hint_paddr` is preferred
+  when it falls in a usable gap and leaves no single block on either
+  side. Insert `(start, length, refcount=1)`. Returns the paddr with
+  device_id stamped in top 16 bits (P5-3c). The rule bounds a drain that
+  finds no run long enough and writes pieces, each with its own tag
+  (`07-sb-sync.md`): at most 2 blocks per block of data plus 1 on one
+  device (only the last piece can absorb a single block), at most 3 per
+  block on a mirror. The dirty buffer charges exactly that
+  (`26-fs-write-path.md`).
+- **Reserve up to** (`stm_alloc_reserve_upto`, with drain and net-free
+  forms): the first free run of at least 2 blocks, taking up to `max`
+  of it and absorbing a remainder of 1 block; `*got` says how many.
+- **Unreserve** (`stm_alloc_unreserve`, `stm_alloc_unreserve_for_drain`):
+  a reservation nothing was written to goes back free at once, not
+  PENDING. Nothing was encrypted under its (paddr, write_gen) nonce, so
+  reusing the paddr in the same generation reuses no nonce. It needs
+  refcount 1, deletes the entry and gives back what the drain had in
+  flight. A reservation that was written to is freed with
+  `stm_alloc_free` and stays PENDING until a later commit
+  (`allocator.tla`: `Unreserve`, guarded by `UnreserveChecksWritten`).
+- **Load**: a tree written before these rules may hold 1-block gaps and
+  1-block ranges. The open counts them (an upper bound, never
+  decremented) and keeps that many blocks out of the room of every
+  allocation outside the drain.
 - **Free**: lookup `(start)`, decrement refcount. On refcount→0,
   mark PENDING (set value's refcount to 0; keep tree entry).
 - **Ref**: lookup, increment refcount.

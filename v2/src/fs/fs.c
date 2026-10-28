@@ -1439,8 +1439,8 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
     fs->charge_factor = 1u;
     if (sync) {
         /* A drain may write a record in pieces as short as the free runs:
-         * up to 2 blocks per block of data on one device, 3 on a mirror's
-         * other devices (sync_write_reserve_pieces_locked). */
+         * up to 2 blocks per block of data on one device, 3 on any device
+         * of a mirror (sync_write_reserve_pieces_locked). */
         stm_redundancy_profile rp;
         fs->charge_factor = stm_sync_redundancy_get(sync, &rp) == STM_OK &&
                             rp.kind == STM_RED_MIRROR && rp.mirror_n > 1u

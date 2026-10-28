@@ -273,6 +273,29 @@ unit-test isolation); the remaining `btree_store`-backed indices
 internally, so the explicit call is redundant-but-cheap for them —
 harmless since the call is idempotent at the same gen.
 
+### A data write in pieces
+
+`stm_sync_write_extent` reserves every replica's blocks before it
+encrypts. It first asks each device for one run holding the whole
+record (data plus tag). Only when none has one is the record written in
+pieces, each its own record with its own tag on every replica
+(`sync_write_reserve_pieces_locked`): device 0 gives its first free run
+of at least 2 blocks, up to the blocks left plus one
+(`stm_alloc_reserve_upto`), the piece carries one block fewer of data,
+and every other replica reserves the piece's blocks, or a run 1 block
+longer where that is all it has. A replica with no run that long is
+probed for its first free run, which sets the next try's length, and
+device 0 may then take a run 1 block longer than the piece; a piece holds
+at least 1 block of data, so a mirror spends at most 3 blocks per block
+of data on any device. When the probe finds no run of 2 blocks, or none
+shorter than the piece it refused, the write fails. The room is checked
+before every piece, so a write refused for want of room, not of a run,
+takes no piece. A piece reserved but not yet written goes back free at
+once (`stm_alloc_unreserve`); once encrypted, a rollback frees it to
+PENDING. The pieces replace the old records in one index step
+(`stm_extent_overwrite_pieces`, `14-extent.md`); a failure after the
+first record went answers `STM_EWEDGED` and the sync wedges.
+
 ### Mount flow
 
 ```

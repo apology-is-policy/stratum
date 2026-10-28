@@ -114,7 +114,11 @@ write(2)'s is: `si_size` grows over the landed pieces and `*out_written` counts
 the caller's bytes they hold, so no byte past EOF is left for a later grow to
 read back. `stm_fs_pwrite` answers that count with `STM_OK`; `stm_fs_write`,
 which has no count, answers the error; the 9P server replies the count in
-Rwrite. Buffered bytes are not on-disk until `stm_sync_commit`; the
+Rwrite. A piece whose failure wedged the fs (an index change that failed part
+way, or an inode update that failed after the extents changed) leaves nothing
+a commit can take, so then `stm_fs_pwrite` answers the error with a count of
+0, and the 9P server replies Rlerror
+(`fs_a_short_write_over_a_wedge_counts_nothing`). Buffered bytes are not on-disk until `stm_sync_commit`; the
 buffer overlay surfaces them on intervening reads.
 
 ## Implementation
@@ -143,14 +147,34 @@ now ENOSPC where it previously "fit" by losing data — the retry dance covers i
 
 Pool admission (#40): a buffered insert is admitted only while the pool can
 hold the buffer's block footprint, which the pool then holds (below), so an
-accepted write is committable. A range is charged its own blocks, one per started recordsize piece,
-and what its drain's covering write takes beyond it: every extent the range only
-partly overlaps is rewritten whole (`fs_cover_extra_blocks`), and the remnants a
-later insert leaves keep that extra. Uncharged, a 4 KiB write into an 8 MiB
-extent on a near-full pool was admitted on 2 blocks while its drain needed 2,049,
-and since every commit drains first, every later commit answered `STM_ENOSPC`
+accepted write is committable. The charge is the most the drain can
+spend, as ext4 and XFS reserve for a delayed allocation: a drain that finds
+no free run long enough writes pieces, each with its own tag
+(`07-sb-sync.md`), so a block of data can cost 2 blocks on one device and 3
+on a mirror (the factor `stm_dirty_buffer_set_charge_factor` takes, which
+the fs sets at mount from the redundancy profile). A range is charged that
+many blocks per block of its span, plus one per started recordsize piece.
+A range that only partly overlaps extents is also charged its drain's
+covering write: every extent it partly overlaps is rewritten whole
+(`fs_cover_extra_blocks`), so the cover is charged whole, at the same
+factor plus 2 blocks per record. The buffer keeps the covers an inode's
+ranges were charged; a range whose cover lies inside one already held
+shares it and is charged only its records, and so are the remnants a later
+insert leaves of a range. A cover's charge goes when the last range inside
+it does. Sharing rests on a cover's extents staying as they were while a
+range inside it is buffered: every op that rewrites extents flushes the
+inode first. Uncharged, a 4 KiB write into an 8 MiB extent on a near-full
+pool was admitted on 2 blocks while its drain needed 2,049, and since every
+commit drains first, every later commit answered `STM_ENOSPC`
 (`fs_a_buffered_write_is_admitted_on_the_extent_its_drain_rewrites`,
-`dbuf_a_ranges_cover_charge_stays_with_it`).
+`fs_every_acknowledged_buffered_write_commits`,
+`fs_a_buffered_write_is_charged_its_worst_case`,
+`dbuf_a_ranges_cover_charge_stays_with_it`,
+`dbuf_ranges_inside_one_cover_share_its_charge`,
+`fs_small_writes_into_one_extent_share_its_cover`). A buffered write the
+charge refuses after the flush dance is written direct when the pool still
+holds what the write itself takes, ext4's fallback from delayed allocation
+near full (`fs_a_write_its_charge_refuses_is_written_direct`).
 
 The charge holds because the drain writes each region once. A run's
 covering write is one new extent over its whole cover; it takes in every
@@ -313,7 +337,7 @@ cover = [a_off, a_end)   (block-aligned, fully contains all stuck-out extents)
   the fs layer (every covering write is a whole-contain replace, never a partial
   overlap).
 
-## Tests (`tests/test_fs.c`)
+## Tests (`tests/test_fs.c`; from `fs_a_write_that_fails_part_way_keeps_no_bytes_past_eof` on, `tests/test_fs_write_path.c`)
 
 | Test | Covers |
 |---|---|
@@ -325,11 +349,12 @@ cover = [a_off, a_end)   (block-aligned, fully contains all stuck-out extents)
 | `fs_io_multipiece_split_pullback_no_bisect` | F1 (round 3) — a `> recordsize` cover over three legacy extents (the middle one cross-slot) forces a 3-piece split with a pullback at both interior boundaries; asserts data preserved AND the cross-slot extent re-covered whole (not bisected at the slot boundary) |
 | `fs_a_write_that_fails_part_way_keeps_no_bytes_past_eof` | a split direct write whose second piece meets a full pool: `stm_fs_write` answers ENOSPC with the size grown over the landed piece, and a later grow reads zeros past it |
 | `fs_a_short_write_reports_what_landed` | `stm_fs_pwrite` answers the landed count (8 MiB of a 12 MiB write; 100 bytes of an unaligned write whose RMW cover's first piece holds them), and ENOSPC once nothing lands |
+| `fs_a_short_write_over_a_wedge_counts_nothing` | a split direct write whose second piece wedges the fs (a record it overlaps fails to go out), and one whose reclaim retry's inode update then fails: `stm_fs_pwrite` answers the error with a count of 0, and the first file reads back as it was after a remount |
 | `fs_a_write_far_past_a_small_file_is_sparse` | an empty or inline file takes a write at 16 MiB or 9 MiB and keeps its prefix, and a 1-byte write at 7 MiB costs its own blocks, not 7 MiB of zeros |
 
-All six are non-vacuous (each fails on its named pre-fix bug; verified by
-reintroducing the bug surgically). The full `test_fs` suite is 218 tests; the
-full ctest suite is 65 binaries.
+Each is non-vacuous (each fails on its named pre-fix bug; verified by
+reintroducing the bug surgically). `test_fs` holds 234 tests and
+`test_fs_write_path` 28; the full ctest suite is 78 binaries.
 
 ## Error paths
 
@@ -356,6 +381,13 @@ full ctest suite is 65 binaries.
   extent-less source) only answers the error: the truncate, punch, reflink
   and shift report whether they changed the index
   (`fs_a_data_op_that_changed_no_extent_is_not_wedged_by_its_inode_update`).
+  A first write to an inline file that only the dirty buffer took changed no
+  extent either: its failure drops the buffered ranges and answers the error,
+  unless a peer's drain had landed them as an extent first (a writer of
+  another inode flushing every inode takes no pin of this one). The inode's
+  extent count, taken once the drop has waited out a drain in flight, shows
+  it, and then the fs wedges
+  (`fs_a_transition_whose_update_fails_after_a_peer_drain_wedges`).
 - `STM_EWEDGED` / `STM_EROFS` — from `stm_sync_write_extent`.
 - `STM_ERANGE` — the RMW scratch span exceeds `4 * recordsize` (F2 defensive cap;
   a legitimate expansion tops out at ~3·recordsize, so this fires only for an
