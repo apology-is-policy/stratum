@@ -319,7 +319,7 @@ buffer:
   `stm_sync_truncate` never fails for want of a buffer. Each record's
   delete can still fail in the engine; after the first record went that
   answers `STM_EWEDGED`.
-- `stm_extent_shift_range_keys(idx, ds, ino, cutoff, delta, &torn)` — re-keys
+- `stm_extent_shift_range_keys(idx, ds, ino, cutoff, delta, &torn, &moved)` -- re-keys
   every extent at or above `cutoff` by `delta` without touching its
   blocks (fallocate's COLLAPSE_RANGE and INSERT_RANGE). It deletes
   every moving record before putting any back: a put is an upsert, so a
@@ -331,7 +331,10 @@ buffer:
   (`fs_a_range_shift_moves_every_extent_once`). A failed put leaves its
   record out of the index and sets `*out_torn`; fallocate then wedges
   the fs inside its span, so no commit makes the loss durable
-  (`fs_a_range_shift_that_fails_loses_nothing_durable`).
+  (`fs_a_range_shift_that_fails_loses_nothing_durable`). `*moved` says
+  whether any record moved: a shift with nothing at or above `cutoff`
+  changes nothing, and fallocate's inode update failing after it does
+  not wedge.
 
 ### Read paths
 

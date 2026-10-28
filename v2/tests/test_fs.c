@@ -2586,7 +2586,7 @@ STM_TEST(fs_truncate_inside_extent_shrinks_prefix) {
 
     stm_sync *s = stm_fs_sync_for_test(fs);
     STM_ASSERT_TRUE(s != NULL);
-    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 4096));
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 4096, NULL));
 
     /* Read [0, 4 KiB) — kept prefix. */
     uint8_t out[4096] = {0};
@@ -2621,7 +2621,7 @@ STM_TEST(fs_truncate_at_extent_boundary_is_noop_for_extent) {
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
 
     stm_sync *s = stm_fs_sync_for_test(fs);
-    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 4096));
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 4096, NULL));
 
     uint8_t out[4096] = {0};
     size_t got = 0;
@@ -2651,7 +2651,7 @@ STM_TEST(fs_truncate_to_zero_drops_all_extents) {
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 8192, plain, sizeof plain));
 
     stm_sync *s = stm_fs_sync_for_test(fs);
-    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 0));
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 0, NULL));
 
     uint8_t out[4096];
     memset(out, 0xFF, sizeof out);
@@ -2686,7 +2686,7 @@ STM_TEST(fs_truncate_past_eof_is_noop) {
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
 
     stm_sync *s = stm_fs_sync_for_test(fs);
-    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 16u * 1024u));
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 16u * 1024u, NULL));
 
     uint8_t out[4096] = {0};
     size_t got = 0;
@@ -2732,7 +2732,7 @@ STM_TEST(fs_truncate_with_snapshot_routes_old_paddrs_to_dead_list) {
     STM_ASSERT_OK(stm_snapshot_dead_list_count(snap, snap_id, &pre));
     STM_ASSERT_EQ(pre, (size_t)0);
 
-    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 4096));
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 4096, NULL));
 
     /* Post-truncate: the original 8 KiB extent's paddrs are in the
      * snap's dead-list. The shrunk prefix wrote to FRESH paddrs
@@ -2764,11 +2764,11 @@ STM_TEST(fs_truncate_args_validated) {
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
     stm_sync *s = stm_fs_sync_for_test(fs);
-    STM_ASSERT_ERR(stm_sync_truncate(NULL, 1, 1, 0), STM_EINVAL);
-    STM_ASSERT_ERR(stm_sync_truncate(s, 0, 1, 0),    STM_EINVAL);
-    STM_ASSERT_ERR(stm_sync_truncate(s, 1, 0, 0),    STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_truncate(NULL, 1, 1, 0, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_truncate(s, 0, 1, 0, NULL),    STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_truncate(s, 1, 0, 0, NULL),    STM_EINVAL);
     /* Unaligned new_size. */
-    STM_ASSERT_ERR(stm_sync_truncate(s, 1, 1, 1234), STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_truncate(s, 1, 1, 1234, NULL), STM_EINVAL);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -3869,7 +3869,7 @@ STM_TEST(fs_rollback_reclaims_diverged_cold_extents) {
         STM_ASSERT_OK(stm_fs_write(fs, 1, 10 + k, 0, distinct, sizeof distinct));
         STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 10 + k));
     }
-    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 2, 0));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 2, 0, NULL));
     STM_ASSERT_OK(stm_fs_commit(fs));
 
     STM_ASSERT_OK(stm_cas_count(cas, &cas_n));
@@ -3997,7 +3997,7 @@ STM_TEST(fs_rollback_reclaims_cleared_dead_list_cold_garbage) {
      *     dead_S(H20) += 1, dead_S(H21) += 1. refcount(H20)=1,
      *     refcount(H21)=1 each via the dead-list. 4c-iii: dead-snap_
      *     unique = 1-0 = 1 deref each. refcount drops to 0 → auto-GC. */
-    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 0));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 0, NULL));
 
     uint8_t c20[4096], c21[4096];
     memset(c20, 0xAA, sizeof c20);
@@ -4006,8 +4006,8 @@ STM_TEST(fs_rollback_reclaims_cleared_dead_list_cold_garbage) {
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 20));
     STM_ASSERT_OK(stm_fs_write(fs, 1, 21, 0, c21, sizeof c21));
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 21));
-    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 20, 0));
-    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 21, 0));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 20, 0, NULL));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 21, 0, NULL));
     STM_ASSERT_OK(stm_fs_commit(fs));
 
     /* Pre-rollback: H1 (refcount 1 via dead_S), H20 + H21 (refcount 1
@@ -4381,7 +4381,7 @@ STM_TEST(fs_migrate_to_cold_truncate_drops_cold_extent) {
     STM_ASSERT_EQ(n, (size_t)1);
 
     /* Truncate to 0 → past-extents drop loop dereffs the COLD entry. */
-    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 0));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 0, NULL));
 
     /* Pre-commit the refcount=0 entry is still in the shadow. */
     STM_ASSERT_OK(stm_cas_count(cas, &n));
@@ -4724,7 +4724,7 @@ STM_TEST(fs_truncate_crossing_cold_extent_basic) {
 
     /* Truncate to 4096 — cold extent at (off=0, len=8192) crosses
      * the boundary. */
-    STM_ASSERT_OK(stm_sync_truncate(sync, 1, 1, 4096));
+    STM_ASSERT_OK(stm_sync_truncate(sync, 1, 1, 4096, NULL));
 
     /* Read back: first 4 KiB matches the original prefix. */
     uint8_t out[4096] = {0};
@@ -4760,7 +4760,7 @@ STM_TEST(fs_truncate_crossing_cold_extent_persists_across_mount) {
     for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 3) & 0xFF);
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
-    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 4096));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 4096, NULL));
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_unmount(fs));
 
@@ -4803,7 +4803,7 @@ STM_TEST(fs_truncate_crossing_cold_dedup_partial_release) {
 
     /* Truncate (1, 1) across the boundary → file 1 rehydrates
      * prefix as HOT; CAS refcount on the shared hash drops to 1. */
-    STM_ASSERT_OK(stm_sync_truncate(sync, 1, 1, 4096));
+    STM_ASSERT_OK(stm_sync_truncate(sync, 1, 1, 4096, NULL));
     STM_ASSERT_OK(stm_fs_commit(fs));
     cap.got = false;
     STM_ASSERT_OK(stm_cas_iter(cas, mtc_capture_first_cb, &cap));
@@ -5823,7 +5823,7 @@ STM_TEST(fs_p7cas4_truncate_crossing_cold_with_full_snap_returns_enospc) {
     STM_ASSERT_OK(stm_cas_count(cas, &cas_pre));
 
     /* Truncate to 0 — would drop the cold extent. Pre-check refuses. */
-    STM_ASSERT_ERR(stm_sync_truncate(sync, 1, 1, /*new_size=*/0),
+    STM_ASSERT_ERR(stm_sync_truncate(sync, 1, 1, /*new_size=*/0, NULL),
                        STM_ENOSPC);
 
     /* extent_idx unchanged: live read still returns the original plain. */
@@ -6027,7 +6027,7 @@ STM_TEST(fs_p7cas4_r55_truncate_crossing_cold_with_near_full_snap) {
 
     /* Truncate to 4096 — crossing-cold extent_a [0, 8192) + past-
      * cold extent_b [16384, 20480). Combined need 2; free 1. */
-    STM_ASSERT_ERR(stm_sync_truncate(sync, 1, 1, /*new_size=*/4096),
+    STM_ASSERT_ERR(stm_sync_truncate(sync, 1, 1, /*new_size=*/4096, NULL),
                        STM_ENOSPC);
 
     /* extent_idx unchanged: live read of off=0 returns plain_a (full
@@ -8745,7 +8745,7 @@ STM_TEST(fs_p7cas16_intermediate_sizes_accepted) {
         /* Drop ino i's extents to free the data area for the next size.
          * stm_fs_truncate(0) drops every extent. */
         STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1,
-                                        (uint64_t)(i + 1), 0));
+                                        (uint64_t)(i + 1), 0, NULL));
         STM_ASSERT_OK(stm_fs_commit(fs));
         /* A second commit drains the PENDING-from-truncate paddrs so the
          * next iteration's reserve can pick them up. */
@@ -9734,7 +9734,7 @@ STM_TEST(fs_rollback_4d_cold_dedup_correct) {
     memset(c30, 0xDE, sizeof c30);
     STM_ASSERT_OK(stm_fs_write(fs, 1, 30, 0, c30, sizeof c30));
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 30));
-    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 30, 0));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 30, 0, NULL));
     STM_ASSERT_OK(stm_fs_commit(fs));
 
     /* Pre-rollback CAS count = 2: H1 (live via inode 1) + H30 (in s2's
@@ -9810,7 +9810,7 @@ STM_TEST(fs_rollback_4d_cold_cross_snap_dedup) {
 
     /* Truncate ino 30: drops (30, 0)=H. Snap-aware deref defers to
      * MOST-RECENT = s_a. s_a.cold_dead += H. Refcount(H) still 2. */
-    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 30, 0));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 30, 0, NULL));
 
     /* Newer snap s_b: captures (31, 0)=H. Refcount(H) still 2. */
     uint64_t s_b = 0;
@@ -9818,7 +9818,7 @@ STM_TEST(fs_rollback_4d_cold_cross_snap_dedup) {
 
     /* Truncate ino 31: drops (31, 0)=H. Snap-aware deref defers to
      * MOST-RECENT = s_b. s_b.cold_dead += H. Refcount(H) still 2. */
-    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 31, 0));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 31, 0, NULL));
     STM_ASSERT_OK(stm_fs_commit(fs));
 
     /* Pre-rollback: CAS has H at refcount 2; the H deref is split

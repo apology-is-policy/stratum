@@ -351,6 +351,11 @@ full ctest suite is 65 binaries.
   inode, so the fs wedges inside the op's span and no commit makes it durable
   (`fs_an_extent_change_whose_inode_update_fails_commits_nothing`). The update
   can fail only for memory; its checks pass for a value loaded under the pin.
+  An op that changed no extent (a punch or zero over a hole, a shrink with
+  nothing past the new size, a shift with nothing to move, a reflink of an
+  extent-less source) only answers the error: the truncate, punch, reflink
+  and shift report whether they changed the index
+  (`fs_a_data_op_that_changed_no_extent_is_not_wedged_by_its_inode_update`).
 - `STM_EWEDGED` / `STM_EROFS` — from `stm_sync_write_extent`.
 - `STM_ERANGE` — the RMW scratch span exceeds `4 * recordsize` (F2 defensive cap;
   a legitimate expansion tops out at ~3·recordsize, so this fires only for an

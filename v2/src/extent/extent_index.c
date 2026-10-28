@@ -1441,7 +1441,9 @@ stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
                                             uint64_t dataset_id, uint64_t ino,
                                             uint64_t cutoff,
                                             int64_t  delta,
-                                            bool *out_torn) {
+                                            bool *out_torn,
+                                            bool *out_moved) {
+    if (out_moved) *out_moved = false;
     if (!idx || !out_torn) return STM_EINVAL;
     *out_torn = false;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
@@ -1552,6 +1554,7 @@ stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
             if (last_status == STM_OK) last_status = ps;
         }
     }
+    if (out_moved) *out_moved = (last_status == STM_OK && n_out > 0u);
     free(moving);
     ex_collect_free(&c);
     must_unlock(&idx->lock);

@@ -7929,6 +7929,123 @@ STM_TEST(fs_an_extent_change_whose_inode_update_fails_commits_nothing) {
     p7b_data_iset_fail_leg("diset_prealloc", DI_PREALLOC);
 }
 
+/* A data op that changed no extent: its inode update failing leaves the
+ * file as it was, so the fs is not wedged. The same op over data wedges;
+ * a COLD record past the cut has no blocks of its own. */
+enum { NC_PUNCH, NC_ZERO, NC_TRUNC, NC_TRUNC_COLD, NC_COLLAPSE, NC_INSERT,
+       NC_REFLINK };
+
+static void p7b_noop_iset_fail_leg(const char *name, int op, bool changes)
+{
+    const uint64_t K = 4096u;
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0, ino = 0, src = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                     0644u, 0, 0, &ino));
+    if (op == NC_REFLINK) {
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"s",
+                                         1, 0644u, 0, 0, &src));
+        if (changes) p7b_write_block(fs, src, 0, 44u);
+    } else {
+        /* Three extents with holes between them, and a hole past them. */
+        p7b_write_block(fs, ino, 0, 11u);
+        p7b_write_block(fs, ino, 2u * K, 22u);
+        p7b_write_block(fs, ino, 4u * K, 33u);
+        STM_ASSERT_OK(stm_fs_truncate(fs, 1, ino, 8u * K));
+    }
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    if (op == NC_TRUNC_COLD) {
+        STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, ino));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        stm_extent_record rec;
+        STM_ASSERT_OK(stm_extent_lookup_at(
+            stm_sync_extent_index(stm_fs_sync_for_test(fs)), 1, ino, 4u * K,
+            &rec));
+        STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+    }
+
+    /* Over an extent, or over a hole. */
+    uint64_t at = changes ? 2u * K : K;
+    stm_fs_fail_next_data_iset_for_test(fs, STM_ENOMEM);
+    stm_status r = STM_OK;
+    switch (op) {
+    case NC_PUNCH:
+        r = stm_fs_fallocate(fs, 1, ino, at, K, STM_FS_FALLOC_FL_PUNCH_HOLE |
+                             STM_FS_FALLOC_FL_KEEP_SIZE);
+        break;
+    case NC_ZERO:
+        r = stm_fs_fallocate(fs, 1, ino, at, K, STM_FS_FALLOC_FL_ZERO_RANGE |
+                             STM_FS_FALLOC_FL_KEEP_SIZE);
+        break;
+    case NC_TRUNC:
+    case NC_TRUNC_COLD:
+        r = stm_fs_truncate(fs, 1, ino, changes ? 3u * K : 6u * K);
+        break;
+    case NC_COLLAPSE:
+        r = stm_fs_fallocate(fs, 1, ino, changes ? K : 6u * K, K,
+                             STM_FS_FALLOC_FL_COLLAPSE_RANGE);
+        break;
+    case NC_INSERT:
+        r = stm_fs_fallocate(fs, 1, ino, changes ? K : 6u * K, K,
+                             STM_FS_FALLOC_FL_INSERT_RANGE);
+        break;
+    default:
+        r = stm_fs_reflink(fs, 1, src, 1, ino);
+        break;
+    }
+    STM_ASSERT_ERR(r, STM_ENOMEM);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.wedged, changes);
+    if (changes)
+        STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+    else
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    if (op == NC_REFLINK) {
+        STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)0);
+    } else {
+        STM_ASSERT_EQ(stm_load_le64(v.si_size), 8u * K);
+        STM_ASSERT_TRUE(p7b_block_is(fs, ino, 0, 11));
+        STM_ASSERT_TRUE(p7b_block_is(fs, ino, K, -1));
+        STM_ASSERT_TRUE(p7b_block_is(fs, ino, 2u * K, 22));
+        STM_ASSERT_TRUE(p7b_block_is(fs, ino, 4u * K, 33));
+        STM_ASSERT_TRUE(p7b_block_is(fs, ino, 6u * K, -1));
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_a_data_op_that_changed_no_extent_is_not_wedged_by_its_inode_update) {
+    p7b_noop_iset_fail_leg("nc_punch_hole", NC_PUNCH, false);
+    p7b_noop_iset_fail_leg("nc_punch_data", NC_PUNCH, true);
+    p7b_noop_iset_fail_leg("nc_zero_hole", NC_ZERO, false);
+    p7b_noop_iset_fail_leg("nc_zero_data", NC_ZERO, true);
+    p7b_noop_iset_fail_leg("nc_trunc_hole", NC_TRUNC, false);
+    p7b_noop_iset_fail_leg("nc_trunc_data", NC_TRUNC, true);
+    p7b_noop_iset_fail_leg("nc_trunc_cold_hole", NC_TRUNC_COLD, false);
+    p7b_noop_iset_fail_leg("nc_trunc_cold_data", NC_TRUNC_COLD, true);
+    p7b_noop_iset_fail_leg("nc_collapse_hole", NC_COLLAPSE, false);
+    p7b_noop_iset_fail_leg("nc_collapse_data", NC_COLLAPSE, true);
+    p7b_noop_iset_fail_leg("nc_insert_hole", NC_INSERT, false);
+    p7b_noop_iset_fail_leg("nc_insert_data", NC_INSERT, true);
+    p7b_noop_iset_fail_leg("nc_reflink_empty", NC_REFLINK, false);
+    p7b_noop_iset_fail_leg("nc_reflink_data", NC_REFLINK, true);
+}
+
 STM_TEST(fs_p7b_fallocate_zero_range_drops_extent) {
     /* ZERO_RANGE on a written extent: extent gets dropped; subsequent
      * read returns zeros via sparse-extent semantics. */

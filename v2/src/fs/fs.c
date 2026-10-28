@@ -3852,7 +3852,7 @@ static stm_status fs_clean_reused_ino_locked(stm_fs *fs, uint64_t dataset_id,
     if (s != STM_OK || left == 0u) return s;
     /* A truncate can report a failed per-paddr drop after removing every
      * record (a leak, not a leftover), so the recount decides. */
-    stm_status ts = stm_sync_truncate(fs->sync, dataset_id, ino, 0u);
+    stm_status ts = stm_sync_truncate(fs->sync, dataset_id, ino, 0u, NULL);
     s = stm_extent_count_for_ino(eidx, dataset_id, ino, &left);
     if (s != STM_OK) return s;
     if (left == 0u) return STM_OK;
@@ -4551,7 +4551,8 @@ static bool fs_freed_inode_cleanup_locked(stm_fs *fs,
     bool is_extent = (cv->si_data_kind == STM_DATA_EXTENT);
     if (is_reg && is_extent) {
         stm_dirty_buffer_drop_ino(fs->dirty_buffer, dataset_id, ino);
-        (void)stm_sync_truncate(fs->sync, dataset_id, ino, /*new_size=*/0u);
+        (void)stm_sync_truncate(fs->sync, dataset_id, ino, /*new_size=*/0u,
+                                NULL);
         return true;
     }
     return false;
@@ -6055,9 +6056,10 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             rs = STM_EINVAL; goto out;
         }
 
+        bool cut = false;
         if (new_size < cur_size) {
             stm_status ts = stm_sync_truncate(fs->sync, dataset_id, ino,
-                                                 new_size);
+                                                 new_size, &cut);
             if (ts != STM_OK) { rs = ts; goto out; }
             fs_step_gap(fs, dataset_id, ino);
         }
@@ -6067,8 +6069,7 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
         iv.si_size = stm_store_le64(new_size);
         fs_stamp_mtime_ctime_now(&iv);
-        rs = fs_data_iset_locked(fs, iidx, dataset_id, ino, &iv,
-                                 new_size < cur_size);
+        rs = fs_data_iset_locked(fs, iidx, dataset_id, ino, &iv, cut);
         goto out;
     }
 
@@ -8156,9 +8157,10 @@ static stm_status fs_reflink_locked(stm_fs *fs,
      * does not know them. */
     fs_txn tx = { false };
     fs_txn_begin(fs, &tx);
+    bool linked = false;
     stm_status s = stm_sync_reflink(fs->sync,
                                        src_dataset_id, src_ino,
-                                       dst_dataset_id, dst_ino);
+                                       dst_dataset_id, dst_ino, &linked);
     if (s != STM_OK) {
         fs_txn_end(fs, &tx);
         return s;
@@ -8189,7 +8191,7 @@ static stm_status fs_reflink_locked(stm_fs *fs,
          * flip data_kind to EXTENT if non-zero. */
         fs_stamp_mtime_ctime_now(&div);
         s = fs_data_iset_locked(fs, iidx, dst_dataset_id, dst_ino, &div,
-                                true);
+                                linked);
     }
     fs_txn_end(fs, &tx);
     return s;
@@ -11782,11 +11784,14 @@ static stm_status fs_fallocate(stm_fs *fs,
          * which (R89 P0-4 fix) properly drops paddrs through the
          * snapshot dead-list + alloc free pool. Refuses
          * STM_ENOTSUPPORTED on crossing or COLD extents. */
-        s = stm_sync_punch_range(fs->sync, dataset_id, ino, off, len);
+        bool punched = false;
+        s = stm_sync_punch_range(fs->sync, dataset_id, ino, off, len,
+                                 &punched);
         if (s == STM_OK) {
             fs_step_gap(fs, dataset_id, ino);
             fs_stamp_mtime_ctime_now(&iv);
-            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv, true);
+            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv,
+                                    punched);
         }
     } else if (collapse) {
         /* COLLAPSE_RANGE: range must already be empty + no crossing
@@ -11796,10 +11801,10 @@ static stm_status fs_fallocate(stm_fs *fs,
          * R89 P2-1: Linux fallocate(2) refuses with EINVAL when
          * `off + len >= cur_size` (collapse beyond EOF is undefined). */
         if (off + len > cur_size) { s = STM_EINVAL; goto falloc_out; }
-        bool torn = false;
+        bool torn = false, moved = false;
         s = stm_extent_shift_range_keys(eidx, dataset_id, ino,
                                              off + len,
-                                             -(int64_t)len, &torn);
+                                             -(int64_t)len, &torn, &moved);
         /* A shift that lost a record: nothing may commit it. */
         if (torn) fs_mark_wedged_locked(fs);
         if (s == STM_OK) {
@@ -11807,7 +11812,8 @@ static stm_status fs_fallocate(stm_fs *fs,
             uint64_t new_size = cur_size - len;
             iv.si_size = stm_store_le64(new_size);
             fs_stamp_mtime_ctime_now(&iv);
-            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv, true);
+            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv,
+                                    moved);
         }
     } else if (insert) {
         /* INSERT_RANGE: shift extents at off' >= off up by len.
@@ -11820,29 +11826,34 @@ static stm_status fs_fallocate(stm_fs *fs,
         if (cur_size > STM_FS_FILE_MAX || len > STM_FS_FILE_MAX - cur_size) {
             s = STM_EOVERFLOW; goto falloc_out;
         }
-        bool torn = false;
+        bool torn = false, moved = false;
         s = stm_extent_shift_range_keys(eidx, dataset_id, ino,
-                                             off, (int64_t)len, &torn);
+                                             off, (int64_t)len, &torn,
+                                             &moved);
         /* A shift that lost a record: nothing may commit it. */
         if (torn) fs_mark_wedged_locked(fs);
         if (s == STM_OK) {
             fs_step_gap(fs, dataset_id, ino);
             iv.si_size = stm_store_le64(cur_size + len);
             fs_stamp_mtime_ctime_now(&iv);
-            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv, true);
+            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv,
+                                    moved);
         }
     } else if (zero_r) {
         /* ZERO_RANGE: punch via stm_sync_punch_range (R89 P0-4
          * paddr-routing fix) + (if !keep_size and would_grow) bump
          * si_size. */
-        s = stm_sync_punch_range(fs->sync, dataset_id, ino, off, len);
+        bool punched = false;
+        s = stm_sync_punch_range(fs->sync, dataset_id, ino, off, len,
+                                 &punched);
         if (s == STM_OK) {
             fs_step_gap(fs, dataset_id, ino);
             if (!keep_size && (off + len) > cur_size) {
                 iv.si_size = stm_store_le64(off + len);
             }
             fs_stamp_mtime_ctime_now(&iv);
-            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv, true);
+            s = fs_data_iset_locked(fs, iidx_pin, dataset_id, ino, &iv,
+                                    punched);
         }
     } else if (unshare) {
         /* UNSHARE_RANGE: composes via stm_fs_promote_to_hot —

@@ -483,6 +483,8 @@ stm_status stm_extent_punch_range(stm_extent_index *idx,
  * back where they were and answers its error. A failed put leaves its
  * record out of the index and sets *out_torn: the caller must stop
  * that state from committing. *out_torn is false otherwise.
+ * *out_moved (NULL allowed) is true when a record moved, false when none
+ * lay at or above cutoff and on any failure.
  *
  * Refusals (more in addition to the preconditions above):
  *   - NULL idx OR NULL out_torn (STM_EINVAL).
@@ -496,7 +498,8 @@ stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
                                             uint64_t dataset_id, uint64_t ino,
                                             uint64_t cutoff,
                                             int64_t  delta,
-                                            bool *out_torn);
+                                            bool *out_torn,
+                                            bool *out_moved);
 
 /*
  * P7-12: truncate using caller-provided pre-allocated buffers.

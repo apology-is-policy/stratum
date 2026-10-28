@@ -7874,8 +7874,9 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  * sustained truncate workloads slow scrub-step throughput.
  */
 stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
-                                uint64_t new_size)
+                                uint64_t new_size, bool *out_changed)
 {
+    if (out_changed) *out_changed = false;
     if (!s) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if ((new_size % STM_UB_SIZE) != 0) return STM_EINVAL;
@@ -8174,6 +8175,9 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (drop_err != STM_OK) {
         sync_wedge_locked(s);
         drop_err = STM_EWEDGED;
+    } else if (out_changed) {
+        /* A COLD record has no blocks: count records, not blocks. */
+        *out_changed = has_crossing || past_n_extents > 0u;
     }
     pthread_mutex_unlock(&s->lock);
     return drop_err;
@@ -8190,6 +8194,7 @@ typedef struct {
     uint64_t target_end;     /* off + len */
     bool     saw_cold_in_range;
     bool     saw_crossing;
+    size_t   n_inside;       /* records wholly inside: the punch drops them */
 } punch_scan_ctx;
 
 static bool punch_scan_cb(const stm_extent_record *e, void *ctx_) {
@@ -8200,14 +8205,17 @@ static bool punch_scan_cb(const stm_extent_record *e, void *ctx_) {
     if (!overlaps) return true;
     bool fully_in = (e->off >= c->target_off && e_end <= c->target_end);
     if (!fully_in) c->saw_crossing = true;
+    else c->n_inside++;
     if (e->kind == STM_EXTENT_KIND_COLD) c->saw_cold_in_range = true;
     return true;     /* keep iterating to surface every issue */
 }
 
 stm_status stm_sync_punch_range(stm_sync *s,
                                       uint64_t dataset_id, uint64_t ino,
-                                      uint64_t off, uint64_t len)
+                                      uint64_t off, uint64_t len,
+                                      bool *out_changed)
 {
+    if (out_changed) *out_changed = false;
     if (!s) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u || len == 0u) return STM_EINVAL;
     if (off > UINT64_MAX - len) return STM_EOVERFLOW;
@@ -8270,6 +8278,8 @@ stm_status stm_sync_punch_range(stm_sync *s,
     if (drop_err != STM_OK) {
         sync_wedge_locked(s);
         drop_err = STM_EWEDGED;
+    } else if (out_changed) {
+        *out_changed = scan.n_inside > 0u;
     }
     pthread_mutex_unlock(&s->lock);
     return drop_err;
@@ -8317,7 +8327,9 @@ static bool reflink_collect_cb(const stm_extent_record *e, void *cx) {
 
 stm_status stm_sync_reflink(stm_sync *s,
                               uint64_t src_dataset_id, uint64_t src_ino,
-                              uint64_t dst_dataset_id, uint64_t dst_ino) {
+                              uint64_t dst_dataset_id, uint64_t dst_ino,
+                              bool *out_changed) {
+    if (out_changed) *out_changed = false;
     if (!s) return STM_EINVAL;
     if (src_dataset_id == 0 || src_ino == 0) return STM_EINVAL;
     if (dst_dataset_id == 0 || dst_ino == 0) return STM_EINVAL;
@@ -8548,6 +8560,7 @@ stm_status stm_sync_reflink(stm_sync *s,
         }
     }
 
+    if (apply_rc == STM_OK && out_changed) *out_changed = cx.n > 0u;
     free(cx.records);
     pthread_mutex_unlock(&s->lock);
     return apply_rc;

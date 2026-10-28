@@ -1386,6 +1386,11 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  *     would commit a half-truncated file. A leaked paddr is not a
  *     corruption hazard (it's still allocated in the bitmap).
  *
+ * *out_changed (NULL allowed) is true when the call changed the extent
+ * index and false when it changed nothing; it is false on any failure,
+ * since one after a change answers STM_EWEDGED. A caller whose own update
+ * fails after a call that changed nothing has nothing to undo.
+ *
  * Returns:
  *   STM_OK             — truncate complete.
  *   STM_EINVAL         — bad args (NULL s; ds/ino == 0; new_size
@@ -1399,7 +1404,7 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  */
 STM_MUST_USE
 stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
-                                uint64_t new_size);
+                                uint64_t new_size, bool *out_changed);
 
 /*
  * P8-POSIX-7b: punch a hole [off, off+len) in (ds, ino). Drops every
@@ -1424,11 +1429,17 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  * An index change that fails part way (some records deleted and one
  * not, or a dropped block's drop failing) wedges the handle and
  * answers STM_EWEDGED.
+ *
+ * *out_changed (NULL allowed) is true when the call changed the extent
+ * index and false when it changed nothing; it is false on any failure,
+ * since one after a change answers STM_EWEDGED. A caller whose own update
+ * fails after a call that changed nothing has nothing to undo.
  */
 STM_MUST_USE
 stm_status stm_sync_punch_range(stm_sync *s,
                                       uint64_t dataset_id, uint64_t ino,
-                                      uint64_t off, uint64_t len);
+                                      uint64_t off, uint64_t len,
+                                      bool *out_changed);
 
 /*
  * P7-16: stm_sync_reflink — POSIX-shape FICLONE at the sync layer.
@@ -1469,11 +1480,17 @@ stm_status stm_sync_punch_range(stm_sync *s,
  * src_ino) extent; lock-graph: sync.lock OUTER → extent_idx.lock +
  * per-device alloc.lock INNER. fs->lock is the outermost layer when
  * called via stm_fs_reflink (P7-16's public surface).
+ *
+ * *out_changed (NULL allowed) is true when the call changed the extent
+ * index and false when it changed nothing; it is false on any failure,
+ * since one after a change answers STM_EWEDGED. A caller whose own update
+ * fails after a call that changed nothing has nothing to undo.
  */
 STM_MUST_USE
 stm_status stm_sync_reflink(stm_sync *s,
                               uint64_t src_dataset_id, uint64_t src_ino,
-                              uint64_t dst_dataset_id, uint64_t dst_ino);
+                              uint64_t dst_dataset_id, uint64_t dst_ino,
+                              bool *out_changed);
 
 /*
  * P7-CAS-2: stm_sync_migrate_to_cold — POSIX-shape "make this file
