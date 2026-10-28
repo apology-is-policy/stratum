@@ -13291,6 +13291,47 @@ STM_TEST(fs_a_cold_migration_whose_index_change_fails_part_way_commits_nothing) 
     }
 }
 
+/* A file whose two contiguous extents were committed in different
+ * transactions (so their gens differ) migrates to cold, each extent in
+ * chunks, and reads back after a remount. */
+STM_TEST(fs_a_file_written_across_commits_migrates_to_cold) {
+    const uint64_t MIB = 1024u * 1024u;
+    uint64_t x = 0;
+    stm_fs *fs = partial_index_pool("cold_two_txgs", 0u, &x);
+    if (!fs) return;
+    STM_ASSERT_OK(mtc4b_install_test_params(fs));
+    uint8_t *b = malloc((size_t)MIB);
+    for (int k = 0; k < 2; k++) {
+        uint64_t base = k ? MIB : 0u;
+        for (uint64_t i = 0; i < MIB; i++) b[i] = cold_pat(base + i);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, x, base, b, (size_t)MIB));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+    free(b);
+    stm_extent_index *eidx = stm_sync_extent_index(stm_fs_sync(fs));
+    stm_extent_record e0, e1;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, x, 0, &e0));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, x, MIB, &e1));
+    STM_ASSERT_TRUE(e0.gen != e1.gen);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, x));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, x, 0, &e0));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, x, MIB, &e1));
+    STM_ASSERT_EQ((unsigned)e0.kind, (unsigned)STM_EXTENT_KIND_COLD);
+    STM_ASSERT_EQ((unsigned)e1.kind, (unsigned)STM_EXTENT_KIND_COLD);
+    STM_ASSERT_TRUE(e0.len < MIB);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (fs) {
+        cold_check_bytes(fs, x, MIB);
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 /* A pool whose only free room is a spare, freed. Layout 0: x is one 0xAB
  * block and the spare 9 MiB, so a write's first 8 MiB piece fits and its
  * next does not. Layout 1: x is 4 MiB of 0xAB then 8 MiB of 0xCD, two

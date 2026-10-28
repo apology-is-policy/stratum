@@ -904,7 +904,10 @@ stm_status stm_extent_migrate_to_cold_chunked(
  *   - Scan records[] for all extents at (ds, ino). Refuse with STM_ENOTSUPPORTED
  *     if ANY COLD extent exists at (ds, ino) (caller must fall back to
  *     per-extent migrate for partially-migrated files; this API requires
- *     all-HOT input). Refuse with STM_ENOENT if no extents found.
+ *     all-HOT input), or if the extents differ in gen, key_id or origin
+ *     (written in different transactions, under different keys, or
+ *     reflinked from different files). Refuse with STM_ENOENT if no
+ *     extents found.
  *   - Validate the HOT extents tile [first.off, first.off + total_len)
  *     contiguously (no gaps; sparse files refused with STM_ENOTSUPPORTED —
  *     concatenating non-contiguous plaintext would chunk synthetic zero

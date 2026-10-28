@@ -1975,12 +1975,17 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
+    /* Records of different transactions, keys or origins are legitimate:
+     * the caller migrates them one by one instead. */
     for (size_t i = 0; i < c.n; i++) {
         const stm_extent_record *r = &c.records[i];
-        if (r->gen != src_gen) { ex_collect_free(&c); must_unlock(&idx->lock); return STM_ECORRUPT; }
-        if (r->key_id != src_key_id) { ex_collect_free(&c); must_unlock(&idx->lock); return STM_ECORRUPT; }
-        if (r->origin_dataset_id != src_origin_ds) { ex_collect_free(&c); must_unlock(&idx->lock); return STM_ECORRUPT; }
-        if (r->origin_ino != src_origin_ino) { ex_collect_free(&c); must_unlock(&idx->lock); return STM_ECORRUPT; }
+        if (r->gen != src_gen || r->key_id != src_key_id ||
+            r->origin_dataset_id != src_origin_ds ||
+            r->origin_ino != src_origin_ino) {
+            ex_collect_free(&c);
+            must_unlock(&idx->lock);
+            return STM_ENOTSUPPORTED;
+        }
     }
 
     /* Insertion-sort by off. */

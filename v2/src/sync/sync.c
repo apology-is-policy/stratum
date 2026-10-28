@@ -9165,10 +9165,18 @@ static stm_status migrate_whole_ino_locked(stm_sync *s,
      * mixed keys are a non-pathological state that per-extent migrate
      * handles natively (each per-extent call inherits the source's
      * key_id). Misclassifying as ECORRUPT could let an aggressive
-     * caller wedge the volume on a benign post-rotation pattern. */
+     * caller wedge the volume on a benign post-rotation pattern.
+     *
+     * Records written in different transactions, or reflinked from
+     * different files, differ in gen or origin just as legitimately;
+     * whole-file chunks would have to pick one, so these fall back too. */
     uint64_t canonical_key_id = records[0].key_id;
     for (size_t i = 1; i < n_records; i++) {
-        if (records[i].key_id != canonical_key_id) return STM_ENOTSUPPORTED;
+        if (records[i].key_id != canonical_key_id ||
+            records[i].gen != records[0].gen ||
+            records[i].origin_dataset_id != records[0].origin_dataset_id ||
+            records[i].origin_ino != records[0].origin_ino)
+            return STM_ENOTSUPPORTED;
     }
 
     /* Step 1: allocate concat buffer. */
