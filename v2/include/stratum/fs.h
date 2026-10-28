@@ -29,10 +29,13 @@
  *   `read_only`: set via mount_opts. Any mutating API entry returns
  *                STM_EROFS.
  *   `wedged`:    set when an operation left state no commit may take:
- *                an index change or a rollback that failed part way (the
+ *                an index change or a rollback that failed part way, or a
+ *                reflink that met an extent record of unknown kind (the
  *                sync wedges, and its hook wedges the fs), an inode
  *                update that failed after the op changed extents, a
- *                failed commit or reclaim, a namespace rollback that
+ *                first write's transition that could not count its
+ *                inode's extents, a failed commit or reclaim, a namespace
+ *                op that failed after its name went in or whose rollback
  *                could not put a name back, an exchange or shift torn
  *                part way, or a failed step on the snapshot dead-list
  *                path. Callers can also set it via stm_fs_mark_wedged.

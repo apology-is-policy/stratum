@@ -114,9 +114,10 @@ write(2)'s is: `si_size` grows over the landed pieces and `*out_written` counts
 the caller's bytes they hold, so no byte past EOF is left for a later grow to
 read back. `stm_fs_pwrite` answers that count with `STM_OK`; `stm_fs_write`,
 which has no count, answers the error; the 9P server replies the count in
-Rwrite. Once a piece's failure has wedged the fs (an index change that failed
-part way, or an inode update that failed after the extents changed), the fs
-takes no further op, so `stm_fs_pwrite` answers the error with a count of 0
+Rwrite. Once the fs is wedged after a short write (by a piece's failure, an
+index change that failed part way or an inode update that failed after the
+extents changed, by the reclaim's own failure, or by a peer), the fs takes no
+further op, so `stm_fs_pwrite` answers the error with a count of 0
 and the 9P server replies Rlerror. The prefix may be durable all the same: a
 reclaim's commit before the wedge takes what landed, and a remount reads it
 (`fs_a_short_write_over_a_wedge_counts_nothing`). Buffered bytes are not on-disk until `stm_sync_commit`; the
@@ -378,8 +379,9 @@ reintroducing the bug surgically). `test_fs` holds 234 tests and
   truncate, a shrinking truncate, fallocate's range ops, a reflink's
   destination; `fs_data_iset_locked`): the change would sit under the old
   inode, so the fs wedges inside the op's span and no commit makes it durable
-  (`fs_an_extent_change_whose_inode_update_fails_commits_nothing`). The update
-  can fail only for memory; its checks pass for a value loaded under the pin.
+  (`fs_an_extent_change_whose_inode_update_fails_commits_nothing`). The update's
+  checks pass for a value loaded under the pin, but its engine can still fail
+  (memory, a busy retry bound, I/O, corruption).
   An op that changed no extent (a punch or zero over a hole, a shrink with
   nothing past the new size, a shift with nothing to move, a reflink of an
   extent-less source) only answers the error: the truncate, punch, reflink

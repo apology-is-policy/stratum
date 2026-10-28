@@ -764,8 +764,9 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
  * pool.wrlock + sync.lock CS (R23 P1-1), so a concurrent
  * `stm_sync_remove_device(new_slot)` cannot land between detection
  * and claim-set.  The claim persists across failed-call → retry
- * windows (idempotent same-slot reclaim on retry); released only
- * on full success of step 9.
+ * windows (idempotent same-slot reclaim on retry); released on full
+ * success of step 9, or by the rollback of a failed step 2a/2b (which
+ * wedges the sync when it cannot remove the new slot).
  *
  * **Alloc ownership after OK**: the OLD device's alloc (attached via
  * `stm_sync_attach_alloc` before this call) is detached on success
@@ -1474,11 +1475,14 @@ stm_status stm_sync_punch_range(stm_sync *s,
  *     we just refuse).
  *   - Any allocator refcount-bump fails (its error; should never happen
  *     for live extents; rolls back any prior bumps).
+ *   - An extent record of unknown kind (STM_ECORRUPT; the sync wedges, so
+ *     no commit persists beside the corrupt record).
  *   - Wedged or read-only (standard guards).
  *
  * Atomicity: holds sync->lock across all extent-tree mutations and
  * refcount bumps. On partial failure, every successful refcount bump
- * is rolled back via stm_alloc_free + every successful extent-tree
+ * is rolled back (stm_alloc_free for a hot replica, stm_cas_deref for a
+ * cold record) + every successful extent-tree
  * insert is removed via stm_extent_delete_file (delete_file is the
  * cheapest "drop everything for this dst_ino" given dst_ino was
  * required to be empty at entry). When that delete or an undo of a bump

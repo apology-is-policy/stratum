@@ -300,6 +300,7 @@ struct stm_fs {
     stm_status name_back_fail_next;
     stm_status reuse_drop_fail_next;
     stm_status data_iset_fail_next;
+    atomic_uint data_iset_failures;
     stm_fs_free_cleanup_hook free_cleanup_hook;
     void *free_cleanup_hook_arg;
     stm_fs_step_gap_hook step_gap_hook;
@@ -563,6 +564,9 @@ static stm_status fs_data_iset_locked(stm_fs *fs, stm_inode_index *iidx,
 #ifdef STRATUM_BUILD_TESTING_HOOKS
     s = fs->data_iset_fail_next;
     fs->data_iset_fail_next = STM_OK;
+    if (s != STM_OK)
+        atomic_fetch_add_explicit(&fs->data_iset_failures, 1u,
+                                  memory_order_release);
 #endif
     if (s == STM_OK) s = stm_inode_set(iidx, ds, ino, iv);
     if (s != STM_OK && extents_changed) fs_mark_wedged_locked(fs);
@@ -2632,11 +2636,11 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          *
          * R76 P3-1: `stm_inode_set`'s checks pass here (the value was
          * loaded under the pin; only the allocator and the free path
-         * change gen, FREED or nlink), but its engine put can still
-         * fail for memory. The flip is built in a copy that reaches *iv
-         * only once stored: after a failure that does not wedge, the
-         * stored inode is still INLINE, and fs_write's reclaim retry
-         * reuses iv. */
+         * change gen, FREED or nlink), but its engine can still fail
+         * (memory, a busy retry bound, I/O, corruption). The flip is
+         * built in a copy that reaches *iv only once stored: after a
+         * failure that does not wedge, the stored inode is still
+         * INLINE, and fs_write's reclaim retry reuses iv. */
         struct stm_inode_value tv = *iv;
         tv.si_data_kind = STM_DATA_EXTENT;
         tv.si_data_len = 0;
@@ -3671,6 +3675,12 @@ void stm_fs_fail_next_name_back_for_test(stm_fs *fs, stm_status fail)
 void stm_fs_fail_next_data_iset_for_test(stm_fs *fs, stm_status fail)
 {
     fs->data_iset_fail_next = fail;
+}
+
+unsigned stm_fs_data_iset_failures_for_test(stm_fs *fs)
+{
+    return atomic_load_explicit(&fs->data_iset_failures,
+                                memory_order_acquire);
 }
 
 void stm_fs_fail_next_reused_ino_drop_for_test(stm_fs *fs, stm_status fail)

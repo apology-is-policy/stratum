@@ -773,6 +773,10 @@ static void reflink_undo_leg(const char *name, bool at_insert)
     stm_extent_fail_next_put_for_test(eidx, 0u, STM_OK);
     stm_alloc_fail_next_ref_for_test(a, 0u, STM_OK);
     stm_alloc_fail_next_free_for_test(a, 0u, STM_OK);
+    /* premise: it was the undo's free that failed, leaving x's first block
+     * with the extra reference and the next back at one */
+    STM_ASSERT_EQ(pi_refcount(fs, x, 0), 2u);
+    STM_ASSERT_EQ(pi_refcount(fs, x, 1024u * 1024u), 1u);
     partial_index_check(fs, rs, x, 3u);
 }
 
@@ -1585,10 +1589,10 @@ static void *drain_hold_write(void *arg)
 }
 
 /* The peer's first sync write is its flush's drain of c's range: it is held
- * between the encrypt and the index commit until the transition has gone
- * on. Its update then fails at once (the knob makes no engine call); the
- * 200 ms after is for a count taken before the drop, which waits on
- * nothing this drain holds and would find no extent yet. */
+ * between the encrypt and the index commit until the transition's update
+ * has failed, however long the writer takes to get there. The 200 ms after
+ * is for a count taken before the drop, which waits on nothing this drain
+ * holds and would find no extent yet. */
 static void drain_hold_phase2(void *ctx)
 {
     drain_hold *p = ctx;
@@ -1607,6 +1611,15 @@ static void drain_hold_phase2(void *ctx)
         if (pthread_cond_timedwait(&p->cv, &p->mu, &dl) == ETIMEDOUT)
             p->timed_out = true;
     pthread_mutex_unlock(&p->mu);
+    for (int i = 0; i < 30000; i++) {
+        if (stm_fs_data_iset_failures_for_test(p->fs) != 0u) break;
+        usleep(1000);
+    }
+    if (stm_fs_data_iset_failures_for_test(p->fs) == 0u) {
+        pthread_mutex_lock(&p->mu);
+        p->timed_out = true;
+        pthread_mutex_unlock(&p->mu);
+    }
     usleep(200 * 1000);
 }
 
@@ -1681,9 +1694,11 @@ STM_TEST(fs_a_transition_whose_update_fails_during_a_peer_drain_wedges) {
     stm_sync_set_write_phase2_hook_for_test(stm_fs_sync(fs), NULL, NULL);
     pthread_cond_destroy(&p.cv);
     pthread_mutex_destroy(&p.mu);
-    /* premise: the peer was held inside a drain that landed c's range */
+    /* premise: the peer was held inside a drain that landed c's range,
+     * until the update had failed */
     STM_ASSERT_TRUE(p.in_phase2);
     STM_ASSERT_TRUE(!p.timed_out);
+    STM_ASSERT_EQ(stm_fs_data_iset_failures_for_test(fs), 1u);
     size_t recs = 0;
     STM_ASSERT_OK(stm_extent_count_for_ino(
         stm_sync_extent_index(stm_fs_sync(fs)), 1, c, &recs));

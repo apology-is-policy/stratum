@@ -208,6 +208,12 @@ void stm_fs_set_fresh_pin_hook_for_test(stm_fs *fs, stm_fs_fresh_pin_hook fn,
 void stm_fs_fail_next_data_iset_for_test(stm_fs *fs, stm_status fail);
 
 /*
+ * How many inode updates the knob above has failed on this fs. Any thread
+ * may read it.
+ */
+unsigned stm_fs_data_iset_failures_for_test(stm_fs *fs);
+
+/*
  * Call `fn` in a buffered write just before its insert into the dirty
  * buffer, with fs->global SH, the inode's pin and the write's transaction
  * span held. `fn` may not call the fs. NULL restores it.

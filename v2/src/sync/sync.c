@@ -4448,25 +4448,17 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
  * P5-8: rollback runs atomically with claim-clear under one
  * pool.wrlock — `_locked` variants bypass the claim check (which
  * would otherwise refuse remove of the slot we're trying to roll back).
- * On `claim_held = false` (resume-path failures where we never
- * acquired a claim), the function clears the claim anyway (no-op if
- * unheld) but does NOT call remove (the slot was never freshly added
- * by THIS call). */
+ * Its callers hold the claim on a slot this call added. */
 static bool replace_rollback_or_wedge(stm_sync *s, uint16_t new_slot,
-                                         size_t redundancy_floor,
-                                         bool claim_held)
+                                         size_t redundancy_floor)
 {
     stm_pool_lock_exclusive(s->pool);
-    stm_status rs = STM_OK;
-    if (claim_held) {
-        rs = stm_pool_remove_device_locked(s->pool, new_slot,
-                                              redundancy_floor);
-        /* Authorized clear: only releases OUR claim on new_slot.
-         * If the claim was on a different slot (impossible in the
-         * current path but defense-in-depth), we'd get STM_EBUSY
-         * and leave it alone. */
-        (void)stm_pool_clear_replace_claim_locked(s->pool, new_slot);
-    }
+    stm_status rs = stm_pool_remove_device_locked(s->pool, new_slot,
+                                                  redundancy_floor);
+    /* Authorized clear: only releases OUR claim on new_slot. If the
+     * claim was on a different slot (impossible in the current path
+     * but defense-in-depth), we'd get STM_EBUSY and leave it alone. */
+    (void)stm_pool_clear_replace_claim_locked(s->pool, new_slot);
     stm_pool_unlock_exclusive(s->pool);
     if (rs == STM_OK) return false;
     pthread_mutex_lock(&s->lock);
@@ -4713,8 +4705,7 @@ stm_status stm_sync_replace_device_online(
      * post-add under concurrent callers). */
     stm_status sds = stm_alloc_set_device_id(new_alloc, new_slot);
     if (sds != STM_OK) {
-        if (replace_rollback_or_wedge(s, new_slot, redundancy_floor,
-                                      /*claim_held=*/true))
+        if (replace_rollback_or_wedge(s, new_slot, redundancy_floor))
             return STM_EWEDGED;
         return sds;
     }
@@ -4727,8 +4718,7 @@ stm_status stm_sync_replace_device_online(
          * fails (floor too tight / concurrent EVACUATING), wedge
          * rather than silently leave an inconsistent slot. P5-8: same
          * helper now also clears the claim atomically. */
-        if (replace_rollback_or_wedge(s, new_slot, redundancy_floor,
-                                      /*claim_held=*/true))
+        if (replace_rollback_or_wedge(s, new_slot, redundancy_floor))
             return STM_EWEDGED;
         return ats;
     }
