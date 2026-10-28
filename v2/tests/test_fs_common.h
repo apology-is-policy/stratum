@@ -41,4 +41,28 @@ void make_tmp(const char *tag);
 stm_fs_format_opts default_format_opts(void);
 stm_fs_mount_opts  rw_mount_opts(void);
 
+/*
+ * reuse_fs / reuse_fs_done: a freshly formatted and mounted pool with an
+ * unnamed directory inode in dataset 1, and its unmount.
+ */
+stm_fs *reuse_fs(const char *name, uint64_t *out_dir);
+void    reuse_fs_done(stm_fs *fs);
+
+/* Test-only CDC params override: avg=8 KiB / min=2 KiB / max=32 KiB.
+ * stm_cdc_make_params clamps min to avg/4. After round_chunk_boundaries
+ * the per-chunk minimum is STM_UB_SIZE (4 KiB). 64 KiB / max=32 KiB
+ * forces at least 2 chunks via the loose-region cutoff. */
+stm_status mtc4b_install_test_params(stm_fs *fs);
+
+/* Synth-ino encoding constants -- keep in sync with fs.c FS_SYNTH_* macros.
+ * Used by the fs tests; not exported from fs.h. */
+#define TFS_SYNTH_TAG          (1ULL << 63)
+#define TFS_SNAPS_PARENT_INO   TFS_SYNTH_TAG
+
+static inline uint64_t tfs_synth_encode(uint64_t snap_id, uint64_t frozen_ino) {
+    return TFS_SYNTH_TAG | (snap_id << 32) | (frozen_ino & 0xFFFFFFFFu);
+}
+
+#define LATE_WRITE_BYTES (1024u * 1024u)
+
 #endif /* STRATUM_V2_TEST_FS_COMMON_H */

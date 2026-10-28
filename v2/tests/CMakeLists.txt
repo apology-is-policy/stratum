@@ -59,6 +59,9 @@ stm_add_test(test_fs         test_fs.c       test_fs_common.c)
 stm_add_test(test_fs_phase8  test_fs_phase8.c test_fs_common.c)
 stm_add_test(test_fs_clone   test_fs_clone.c  test_fs_common.c)
 stm_add_test(test_fs_frag    test_fs_frag.c   test_fs_common.c)
+stm_add_test(test_fs_windows test_fs_windows.c test_fs_common.c)
+stm_add_test(test_fs_identity test_fs_identity.c test_fs_common.c)
+stm_add_test(test_fs_write_path test_fs_write_path.c test_fs_common.c)
 stm_add_test(test_sdarray    test_sdarray.c)
 stm_add_test(test_xor_filter test_xor_filter.c)
 stm_add_test(test_crash_inject test_crash_inject.c)
@@ -208,13 +211,16 @@ set_tests_properties(test_slate_socket PROPERTIES TIMEOUT 120)
 # regressed in correctness, just runtime under instrumentation.
 set_tests_properties(test_crash_inject PROPERTIES TIMEOUT 300)
 
-# test_fs + test_fs_phase8 each format/mount/unmount per test
-# (~150ms wall under -j2 with ASan/TSan). Pre-split, the combined
-# 322-test test_fs took ~80s. Post-split: ~150-test test_fs (Phase
-# 1-7) ~40s; ~170-test test_fs_phase8 ~50s. Bump both to 180s
-# (1.5x headroom for parallel pressure / sanitizer slowdown).
-set_tests_properties(test_fs        PROPERTIES TIMEOUT 180)
-set_tests_properties(test_fs_phase8 PROPERTIES TIMEOUT 180)
+# The fs suites format, mount and unmount per test. They are split by area
+# so each binary stays well inside its budget under the sanitizers;
+# measured in a Debug build, serial ctest: test_fs (234 tests) 39 s,
+# test_fs_phase8 (247) 59 s, test_fs_write_path (25) 19 s,
+# test_fs_identity (39) 10 s, test_fs_windows (5) 3 s.
+set_tests_properties(test_fs            PROPERTIES TIMEOUT 180)
+set_tests_properties(test_fs_phase8     PROPERTIES TIMEOUT 180)
+set_tests_properties(test_fs_write_path PROPERTIES TIMEOUT 180)
+set_tests_properties(test_fs_identity   PROPERTIES TIMEOUT 180)
+set_tests_properties(test_fs_windows    PROPERTIES TIMEOUT 180)
 # test_fs_frag fills and punches a 24 MiB pool per test (~18 s each
 # in a Debug build); 180 s leaves room for the sanitizers.
 set_tests_properties(test_fs_frag   PROPERTIES TIMEOUT 180)

@@ -6,7 +6,12 @@
 #include "test_fs_common.h"
 #include "tharness.h"
 
+#include <stratum/cdc.h>
+#include <stratum/fs_testing.h>
+#include <stratum/inode.h>
 #include <stratum/keyfile.h>
+#include <stratum/sync.h>
+#include <stratum/sync_testing.h>
 
 #include <dirent.h>
 #include <pthread.h>
@@ -107,4 +112,35 @@ stm_fs_mount_opts rw_mount_opts(void)
         .read_only    = false,
         .keyfile_path = g_key_path,
     };
+}
+
+stm_fs *reuse_fs(const char *name, uint64_t *out_dir)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return NULL;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u,
+                                     0, 0, out_dir));
+    return fs;
+}
+
+void reuse_fs_done(stm_fs *fs)
+{
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+stm_status mtc4b_install_test_params(stm_fs *fs) {
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    if (!s) return STM_EINVAL;
+    stm_cdc_params p;
+    stm_status mp = stm_cdc_make_params(8u * 1024u, &p);
+    if (mp != STM_OK) return mp;
+    return stm_sync_set_cdc_params_for_test(s, &p);
 }
