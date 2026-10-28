@@ -36,6 +36,7 @@ endfunction()
 # ---------------------------------------------------------------------------
 
 stm_add_test(test_types      test_types.c)
+stm_add_test(test_tharness   test_tharness.c)
 stm_add_test(test_hash       test_hash.c)
 stm_add_test(test_crypto     test_crypto.c)
 stm_add_test(test_hybrid     test_hybrid.c)

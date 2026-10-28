@@ -3,13 +3,15 @@
 
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 static stm_test_entry *g_head;
-_Thread_local int stm_test_current_failed;
+/* Process-wide, so a failure on a test's helper thread fails the test. */
+static atomic_uint g_failures;
 
 void stm_test_register(stm_test_entry *e)
 {
@@ -22,7 +24,7 @@ void stm_test_register(stm_test_entry *e)
 __attribute__((format(printf, 3, 4)))
 void stm_test_fail(const char *file, int line, const char *fmt, ...)
 {
-    stm_test_current_failed = 1;
+    atomic_fetch_add(&g_failures, 1u);
     fprintf(stderr, "  FAIL %s:%d: ", file, line);
     va_list ap; va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -38,6 +40,24 @@ void stm_test_info(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+}
+
+int stm_test_run_one(const stm_test_entry *e)
+{
+    unsigned before = atomic_load(&g_failures);
+    fprintf(stderr, "RUN   %s\n", e->t_label);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    e->t_func();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0
+              + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (atomic_load(&g_failures) != before) {
+        fprintf(stderr, "FAIL  %s (%.1f ms)\n", e->t_label, ms);
+        return 1;
+    }
+    fprintf(stderr, "ok    %s (%.1f ms)\n", e->t_label, ms);
+    return 0;
 }
 
 int stm_test_run_all(const char *suite_name)
@@ -58,21 +78,8 @@ int stm_test_run_all(const char *suite_name)
     int npass = 0, nfail = 0;
     fprintf(stderr, "== %s ==\n", suite_name);
     for (stm_test_entry *e = list; e; e = e->t_next) {
-        stm_test_current_failed = 0;
-        fprintf(stderr, "RUN   %s\n", e->t_label);
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        e->t_func();
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0
-                  + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
-        if (stm_test_current_failed) {
-            fprintf(stderr, "FAIL  %s (%.1f ms)\n", e->t_label, ms);
-            nfail++;
-        } else {
-            fprintf(stderr, "ok    %s (%.1f ms)\n", e->t_label, ms);
-            npass++;
-        }
+        if (stm_test_run_one(e)) nfail++;
+        else npass++;
     }
     fprintf(stderr, "-- %d passed, %d failed\n", npass, nfail);
     return nfail == 0 ? 0 : 1;

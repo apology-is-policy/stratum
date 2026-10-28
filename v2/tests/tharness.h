@@ -11,7 +11,8 @@
  *
  * Conventions:
  *   - Each STM_TEST(name) registers a test function.
- *   - STM_ASSERT_* macros log and mark current test as failed.
+ *   - STM_ASSERT_* macros log and mark current test as failed, from any
+ *     thread: a helper thread's failure fails the test it runs in.
  *   - Test continues after assert failures (soft-assert) so that a single
  *     run surfaces as many broken invariants as possible.
  *   - Exit status: 0 if all pass, 1 otherwise.
@@ -48,8 +49,8 @@ void stm_test_fail  (const char *file, int line, const char *fmt, ...);
 void stm_test_info  (const char *fmt, ...);
 int  stm_test_run_all(const char *suite_name);
 
-/* Current-test failure signal (checked in the harness). */
-extern _Thread_local int stm_test_current_failed;
+/* Run one test and report it; 1 if it failed. */
+int  stm_test_run_one(const stm_test_entry *e);
 
 #define STM_TEST(name_)                                                          \
     static void stm_test_##name_(void);                                          \
