@@ -2553,6 +2553,62 @@ STM_TEST(sync_multi_replace_refuses_same_uuid_different_alloc) {
     teardown_mirror_pool(bds, as, pool, s);
 }
 
+/* A replace whose new device fails its setup rolls the add back. When the
+ * floor lets the rollback remove the new slot, the replace answers the
+ * setup's error and the sync goes on; when the floor keeps the slot, the
+ * sync wedges and the replace answers the wedge. */
+static void replace_rollback_leg(const char *tag, size_t floor,
+                                 stm_status want)
+{
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, tag, bds, as, &pool, &s);
+    char path4[256];
+    snprintf(path4, sizeof path4, "/tmp/stm_v2_sync_multi_%s_%d_3.bin", tag,
+             (int)getpid());
+    unlink(path4);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *bd4 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(path4, &bo, &bd4));
+    STM_ASSERT_OK(stm_bdev_resize(bd4, TEST_DEVICE_BYTES));
+    uint64_t uuid4[2] = { 0xbac4ULL, DEV_UUID_HI };
+    stm_alloc *a4 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd4, POOL_UUID, uuid4,
+                                   TEST_BOOTSTRAP_BYTES, &a4));
+    /* a reserve fixes the alloc's device id, so the replace cannot stamp
+     * the new slot's */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a4, 1u, 0, &p));
+    stm_pool_device new_dev = {
+        .uuid   = { uuid4[0], uuid4[1] },
+        .role   = STM_DEV_ROLE_DATA,
+        .class_ = STM_DEV_CLASS_SSD,
+        .state  = STM_DEV_STATE_ONLINE,
+        .bdev   = bd4,
+    };
+    uint16_t slot = UINT16_MAX;
+    STM_ASSERT_ERR(stm_sync_replace_device_online(s, /*old=*/1, &new_dev, a4,
+                                                  floor, &slot), want);
+    if (want == STM_EWEDGED) {
+        /* premise: the rollback's remove refused, so the new slot is live */
+        STM_ASSERT_EQ(stm_pool_live_device_count(pool), 4u);
+        STM_ASSERT_ERR(stm_sync_commit(s), STM_EWEDGED);
+    } else {
+        STM_ASSERT_EQ(stm_pool_live_device_count(pool), 3u);
+        STM_ASSERT_OK(stm_sync_commit(s));
+    }
+    teardown_mirror_pool(bds, as, pool, s);
+    stm_alloc_close(a4);
+    stm_bdev_close(bd4);
+    unlink(path4);
+}
+
+STM_TEST(sync_multi_replace_whose_rollback_fails_answers_the_wedge) {
+    replace_rollback_leg("replace_back_ok", 2u, STM_EBUSY);
+    replace_rollback_leg("replace_back_wedge", 4u, STM_EWEDGED);
+}
+
 /* R21 (P5-6 P1) regression: sync_commit must succeed with one FAULTED
  * device on a 3-device mirror(2). Before the fix, the commit's per-alloc
  * loop and write_ub_to_all_devices would try to write through the

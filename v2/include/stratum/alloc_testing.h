@@ -25,6 +25,20 @@ extern "C" {
 STM_MUST_USE
 stm_status stm_alloc_reserve_first_fit_for_test(stm_alloc *a, uint64_t nblocks,
                                                 uint64_t *out_paddr);
+
+/*
+ * Make the n-th stm_alloc_free from now on (1-based; 0 for none) answer
+ * `fail`, changing nothing. One-shot.
+ */
+void stm_alloc_fail_next_free_for_test(stm_alloc *a, unsigned n,
+                                       stm_status fail);
+
+/*
+ * Make the n-th stm_alloc_ref from now on (1-based; 0 for none) answer
+ * `fail`, changing nothing. One-shot.
+ */
+void stm_alloc_fail_next_ref_for_test(stm_alloc *a, unsigned n,
+                                      stm_status fail);
 #endif
 
 #ifdef __cplusplus

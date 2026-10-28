@@ -2633,18 +2633,22 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * R76 P3-1: `stm_inode_set`'s checks pass here (the value was
          * loaded under the pin; only the allocator and the free path
          * change gen, FREED or nlink), but its engine put can still
-         * fail for memory. */
-        iv->si_data_kind = STM_DATA_EXTENT;
-        iv->si_data_len = 0;
-        memset(&iv->si_data, 0, sizeof iv->si_data);
-        iv->si_size = stm_store_le64(new_size);
+         * fail for memory. The flip is built in a copy that reaches *iv
+         * only once stored: after a failure that does not wedge, the
+         * stored inode is still INLINE, and fs_write's reclaim retry
+         * reuses iv. */
+        struct stm_inode_value tv = *iv;
+        tv.si_data_kind = STM_DATA_EXTENT;
+        tv.si_data_len = 0;
+        memset(&tv.si_data, 0, sizeof tv.si_data);
+        tv.si_size = stm_store_le64(new_size);
         /* P8-POSIX-7a: stamp mtime + ctime on the transitioned inode.
          * The transition is both a content change (data moved into
          * extent) AND a kind transition (INLINE → EXTENT) — POSIX
          * stamps mtime + ctime on either alone. */
-        fs_stamp_mtime_ctime_now(iv);
+        fs_stamp_mtime_ctime_now(&tv);
         {
-            stm_status trs = fs_data_iset_locked(fs, iidx, ds, ino, iv,
+            stm_status trs = fs_data_iset_locked(fs, iidx, ds, ino, &tv,
                                                  !buffered);
             /* C-2-F2-audit F6: if the set fails the inode stays INLINE
              * while the buffer holds [0, aligned) -- and unlink's cleanup
@@ -2668,6 +2672,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                     if (cs != STM_OK || n > 0u) fs_mark_wedged_locked(fs);
                 }
             } else {
+                *iv = tv;
                 *out_written = len;
             }
             fs_txn_rd_end(fs);
@@ -3069,11 +3074,12 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                      * blocks PENDING; sweep them + retry once, from where
                      * the write stopped, reusing iv. Safe because every
                      * path in fs_write_regular_locked that answers ENOSPC
-                     * leaves iv equal to the stored inode: the EXTENT +
-                     * inline->EXTENT paths reserve BEFORE the si_size/kind
-                     * update, a direct write that landed a prefix stores the
-                     * size over it first, the sparse cutover changes iv only
-                     * once its flip is stored, and the inline fast path --
+                     * leaves iv equal to the stored inode: the EXTENT path
+                     * reserves BEFORE the si_size update, a direct write that
+                     * landed a prefix stores the size over it first, the
+                     * inline->EXTENT transition and the sparse cutover change
+                     * iv only once their flip is stored, and the inline fast
+                     * path --
                      * which DOES mutate iv -- never reserves, so it cannot
                      * ENOSPC (stm_inode_set on the delta-chain engine cannot
                      * ENOSPC either). */
@@ -12076,8 +12082,8 @@ stm_status stm_fs_write_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
 /* An error after some bytes landed is a short write, and so is a write
  * that passes the largest file size: it writes the part below it. Once the
- * fs is wedged no commit can take what landed, so the error stands and no
- * count is reported. */
+ * fs is wedged it takes no further op, so the error stands and no count is
+ * reported, even where a reclaim's commit took the prefix first. */
 static stm_status fs_pwrite(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                             const uint64_t *gen, uint64_t off,
                             const void *buf, size_t len, size_t *out_written)

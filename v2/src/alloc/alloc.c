@@ -174,6 +174,12 @@ struct stm_alloc {
     uint32_t       *accel_lengths;
     size_t          accel_count;
     bool            accel_dirty;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    unsigned        free_fail_n;
+    stm_status      free_fail;
+    unsigned        ref_fail_n;
+    stm_status      ref_fail;
+#endif
 };
 
 /* ========================================================================= */
@@ -1251,6 +1257,26 @@ stm_status stm_alloc_reserve_first_fit_for_test(stm_alloc *a, uint64_t nblocks,
     return alloc_take(a, nblocks, false, true, 0, out_paddr, NULL,
                       ALLOC_ORDINARY);
 }
+
+void stm_alloc_fail_next_free_for_test(stm_alloc *a, unsigned n,
+                                       stm_status fail)
+{
+    if (!a) return;
+    pthread_mutex_lock(&a->lock);
+    a->free_fail_n = n;
+    a->free_fail = fail;
+    pthread_mutex_unlock(&a->lock);
+}
+
+void stm_alloc_fail_next_ref_for_test(stm_alloc *a, unsigned n,
+                                      stm_status fail)
+{
+    if (!a) return;
+    pthread_mutex_lock(&a->lock);
+    a->ref_fail_n = n;
+    a->ref_fail = fail;
+    pthread_mutex_unlock(&a->lock);
+}
 #endif
 
 /* The range at `paddr`, reserved and never written, leaves the tree: the
@@ -1418,6 +1444,13 @@ stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint64_t free_gen)
     uint64_t start_block = stm_paddr_offset(paddr);
 
     pthread_mutex_lock(&a->lock);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (a->free_fail_n != 0u && --a->free_fail_n == 0u) {
+        stm_status f = a->free_fail;
+        pthread_mutex_unlock(&a->lock);
+        return f;
+    }
+#endif
 
     uint8_t key_buf[8];
     uint8_t val_buf[8] = { 0 };
@@ -1492,6 +1525,13 @@ stm_status stm_alloc_ref(stm_alloc *a, uint64_t paddr)
     uint64_t start_block = stm_paddr_offset(paddr);
 
     pthread_mutex_lock(&a->lock);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (a->ref_fail_n != 0u && --a->ref_fail_n == 0u) {
+        stm_status f = a->ref_fail;
+        pthread_mutex_unlock(&a->lock);
+        return f;
+    }
+#endif
 
     uint8_t key_buf[8];
     uint8_t val_buf[8] = { 0 };

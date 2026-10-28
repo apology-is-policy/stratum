@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 
 #include <stratum/alloc.h>
+#include <stratum/alloc_testing.h>
 #include <stratum/block_inject.h>
 #include <stratum/bootstrap.h>
 #include <stratum/btree_engine_testing.h>
@@ -695,6 +696,89 @@ STM_TEST(fs_a_reflink_whose_rollback_fails_answers_the_wedge) {
     STM_ASSERT_OK(stm_extent_count_for_ino(eidx, 1, y, &recs));
     STM_ASSERT_EQ(recs, (size_t)1);
     partial_index_check(fs, rs, x, 3u);
+}
+
+/* The references on the block under x's record at off. */
+static uint32_t pi_refcount(stm_fs *fs, uint64_t x, uint64_t off)
+{
+    stm_sync *sy = stm_fs_sync(fs);
+    stm_extent_record r;
+    memset(&r, 0, sizeof r);
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(sy), 1, x, off,
+                                       &r));
+    uint32_t rc = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(stm_sync_alloc(sy, 0), r.paddrs[0], NULL,
+                                   &rc));
+    return rc;
+}
+
+/* A reflink whose second record fails to go in, and whose rollback works,
+ * answers the failure and leaves the fs healthy: y holds no record, x's
+ * blocks are back at one reference, and a reflink after it shares them. */
+STM_TEST(fs_a_reflink_whose_rollback_works_answers_its_cause) {
+    const uint64_t MIB = 1024u * 1024u;
+    uint64_t x = 0, y = 0, dir = 0;
+    stm_fs *fs = partial_index_pool("pi_reflink_undone", 3u, &x);
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"y", 1,
+                                     0644u, 0, 0, &y));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_extent_index *eidx = stm_sync_extent_index(stm_fs_sync(fs));
+    stm_extent_fail_next_put_for_test(eidx, 2u, STM_ENOMEM);
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, x, 1, y), STM_ENOMEM);
+    stm_extent_fail_next_put_for_test(eidx, 0u, STM_OK);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(!st.wedged);
+    size_t recs = 1;
+    STM_ASSERT_OK(stm_extent_count_for_ino(eidx, 1, y, &recs));
+    STM_ASSERT_EQ(recs, (size_t)0);
+    for (unsigned k = 0; k < 3u; k++)
+        STM_ASSERT_EQ(pi_refcount(fs, x, k * MIB), 1u);
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, x, 1, y));
+    for (unsigned k = 0; k < 3u; k++)
+        STM_ASSERT_EQ(pi_refcount(fs, x, k * MIB), 2u);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A reflink whose rollback cannot take back a reference it added -- after
+ * a record that failed to go in, or after a reference that failed to be
+ * added -- wedges the fs and answers the wedge: the extra reference would
+ * persist, a leak once x goes. After a remount x is as it was. */
+static void reflink_undo_leg(const char *name, bool at_insert)
+{
+    uint64_t x = 0, y = 0, dir = 0;
+    stm_fs *fs = partial_index_pool(name, 3u, &x);
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"y", 1,
+                                     0644u, 0, 0, &y));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_extent_index *eidx = stm_sync_extent_index(stm_fs_sync(fs));
+    stm_alloc *a = stm_sync_alloc(stm_fs_sync(fs), 0);
+    if (at_insert)
+        stm_extent_fail_next_put_for_test(eidx, 2u, STM_ENOMEM);
+    else
+        stm_alloc_fail_next_ref_for_test(a, 2u, STM_ENOMEM);
+    stm_alloc_fail_next_free_for_test(a, 1u, STM_ENOMEM);
+    stm_status rs = stm_fs_reflink(fs, 1, x, 1, y);
+    stm_extent_fail_next_put_for_test(eidx, 0u, STM_OK);
+    stm_alloc_fail_next_ref_for_test(a, 0u, STM_OK);
+    stm_alloc_fail_next_free_for_test(a, 0u, STM_OK);
+    partial_index_check(fs, rs, x, 3u);
+}
+
+STM_TEST(fs_a_reflink_whose_reference_undo_fails_answers_the_wedge) {
+    reflink_undo_leg("pi_reflink_undo_put", true);
+    reflink_undo_leg("pi_reflink_undo_ref", false);
 }
 
 /* Byte i of a cold-migration pool's file: varied, so the chunker cuts. */
@@ -1475,6 +1559,223 @@ STM_TEST(fs_a_transition_whose_update_fails_after_a_peer_drain_wedges) {
     unlink(g_key_path);
 }
 
+typedef struct {
+    stm_fs *fs;
+    uint64_t z;              /* the peer's file */
+    uint64_t at;             /* the peer's write, inside z's extent */
+    bool armed;
+    stm_status rc;           /* the peer's write */
+    pthread_t th, peer;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool started, peer_set, in_phase2, resumed, timed_out;
+} drain_hold;
+
+static void *drain_hold_write(void *arg)
+{
+    drain_hold *p = arg;
+    pthread_mutex_lock(&p->mu);
+    p->peer = pthread_self();
+    p->peer_set = true;
+    pthread_mutex_unlock(&p->mu);
+    uint8_t b[200];
+    memset(b, 0xC3, sizeof b);
+    p->rc = stm_fs_write(p->fs, 1, p->z, p->at, b, sizeof b);
+    return NULL;
+}
+
+/* The peer's first sync write is its flush's drain of c's range: it is held
+ * between the encrypt and the index commit until the transition has gone
+ * on. Its update then fails at once (the knob makes no engine call); the
+ * 200 ms after is for a count taken before the drop, which waits on
+ * nothing this drain holds and would find no extent yet. */
+static void drain_hold_phase2(void *ctx)
+{
+    drain_hold *p = ctx;
+    pthread_mutex_lock(&p->mu);
+    if (!p->peer_set || !pthread_equal(pthread_self(), p->peer) ||
+        p->in_phase2) {
+        pthread_mutex_unlock(&p->mu);
+        return;
+    }
+    p->in_phase2 = true;
+    pthread_cond_broadcast(&p->cv);
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 30;
+    while (!p->resumed && !p->timed_out)
+        if (pthread_cond_timedwait(&p->cv, &p->mu, &dl) == ETIMEDOUT)
+            p->timed_out = true;
+    pthread_mutex_unlock(&p->mu);
+    usleep(200 * 1000);
+}
+
+static void drain_hold_gap(uint64_t dataset_id, uint64_t ino, void *arg)
+{
+    (void)dataset_id; (void)ino;
+    drain_hold *p = arg;
+    if (!p->armed) return;
+    p->armed = false;
+    STM_ASSERT_EQ(pthread_create(&p->th, NULL, drain_hold_write, p), 0);
+    p->started = true;
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 30;
+    pthread_mutex_lock(&p->mu);
+    while (!p->in_phase2 && !p->timed_out)
+        if (pthread_cond_timedwait(&p->cv, &p->mu, &dl) == ETIMEDOUT)
+            p->timed_out = true;
+    p->resumed = true;
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+}
+
+/* A buffered transition whose inode update fails while a peer's drain of
+ * its range is in flight: the drop waits the drain out, so the extent count
+ * after it sees the extent the drain lands, and the fs wedges; the image
+ * keeps the inline file and no stray block comes back through a grow. */
+STM_TEST(fs_a_transition_whose_update_fails_during_a_peer_drain_wedges) {
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp("transition_inflight");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 48u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, sp = 0, f = 0, c = 0, z = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1, 0644u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"z", 1, 0644u, 0, 0, &z));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"s", 1, 0644u, 0, 0, &sp));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1, 0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, c, 0, "abc", 3));
+    uint8_t *big = malloc((size_t)(8u * MIB));
+    memset(big, 0x30, (size_t)(8u * MIB));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, z, 0u, big, (size_t)(8u * MIB)));
+    free(big);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    mid_op_put(fs, sp, 0, 4u * MIB, 0x5A);
+    mid_op_fill(fs, f);
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    drain_hold p;
+    memset(&p, 0, sizeof p);
+    p.fs = fs; p.z = z; p.at = 4u * MIB + 100u; p.armed = true;
+    pthread_mutex_init(&p.mu, NULL);
+    pthread_cond_init(&p.cv, NULL);
+    stm_sync_set_write_phase2_hook_for_test(stm_fs_sync(fs), drain_hold_phase2,
+                                            &p);
+    stm_fs_set_step_gap_hook_for_test(fs, drain_hold_gap, &p);
+    stm_fs_fail_next_data_iset_for_test(fs, STM_ENOMEM);
+    uint8_t w[200];
+    memset(w, 0xE0, sizeof w);
+    stm_status r = stm_fs_write(fs, 1, c, 100u, w, sizeof w);
+    stm_fs_set_step_gap_hook_for_test(fs, NULL, NULL);
+    if (p.started) pthread_join(p.th, NULL);
+    stm_sync_set_write_phase2_hook_for_test(stm_fs_sync(fs), NULL, NULL);
+    pthread_cond_destroy(&p.cv);
+    pthread_mutex_destroy(&p.mu);
+    /* premise: the peer was held inside a drain that landed c's range */
+    STM_ASSERT_TRUE(p.in_phase2);
+    STM_ASSERT_TRUE(!p.timed_out);
+    size_t recs = 0;
+    STM_ASSERT_OK(stm_extent_count_for_ino(
+        stm_sync_extent_index(stm_fs_sync(fs)), 1, c, &recs));
+    STM_ASSERT_EQ(recs, (size_t)1);
+    STM_ASSERT_ERR(r, STM_ENOMEM);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.wedged);
+    STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, c, &v));
+    STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)3);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, c, 0));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, c, 8192u));
+    uint8_t rb[4096];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, c, 0, rb, sizeof rb, &n));
+    STM_ASSERT_EQ(n, sizeof rb);
+    size_t nonzero = 0;
+    for (size_t i = 0; i < n; i++) nonzero += rb[i] != 0u;
+    STM_ASSERT_EQ(nonzero, (size_t)0);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A buffered transition whose inode update fails and whose extent count
+ * then fails cannot tell whether a drain landed its range, so the fs
+ * wedges; with the count answering, the same failure only answers its
+ * error. Either way the image keeps the inline file. */
+static void count_fail_leg(const char *name, bool count_fails)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, c = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1,
+                                     0644u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, c, 0, "abc", 3));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_extent_index *eidx = stm_sync_extent_index(stm_fs_sync(fs));
+    stm_fs_fail_next_data_iset_for_test(fs, STM_ENOMEM);
+    if (count_fails) stm_extent_fail_next_count_for_test(eidx, STM_EIO);
+    uint8_t w[200];
+    memset(w, 0xE0, sizeof w);
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, c, 100u, w, sizeof w), STM_ENOMEM);
+    stm_extent_fail_next_count_for_test(eidx, STM_OK);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.wedged == count_fails);
+    if (count_fails) {
+        STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+        (void)stm_fs_unmount(fs);
+    } else {
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (fs) {
+        struct stm_inode_value v = {0};
+        STM_ASSERT_OK(stm_fs_stat(fs, 1, c, &v));
+        STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_INLINE);
+        STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)3);
+        uint8_t rb[3] = {0};
+        size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, c, 0, rb, sizeof rb, &got));
+        STM_ASSERT_EQ(got, sizeof rb);
+        STM_ASSERT_EQ(memcmp(rb, "abc", 3), 0);
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_a_transition_whose_extent_count_fails_wedges) {
+    count_fail_leg("transition_count_ok", false);
+    count_fail_leg("transition_count_fails", true);
+}
+
 /* The legacy direct-extent write (an ino with no inode) ends at the largest
  * file size like every other write. */
 STM_TEST(fs_the_legacy_extent_write_ends_at_the_largest_file_size) {
@@ -1916,8 +2217,9 @@ static void arm_retry_iset(bool locked, void *arg)
  * go out after the piece's own went in. A split write whose second piece
  * finds no room until a reclaim lands the rest and then fails its inode
  * update, which wedges the fs with the error it answers. Either way pwrite
- * answers the error and counts nothing; the first leaves the file as it
- * was after a remount. */
+ * answers the error and counts nothing. The first leaves the file as it
+ * was after a remount; the second's prefix, which the reclaim's commit took
+ * before the wedge, is durable. */
 STM_TEST(fs_a_short_write_over_a_wedge_counts_nothing) {
     const uint64_t MIB = 1024u * 1024u;
     uint8_t *big = malloc(4u * MIB);
@@ -1967,10 +2269,76 @@ STM_TEST(fs_a_short_write_over_a_wedge_counts_nothing) {
         STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
         STM_ASSERT_TRUE(st.wedged);
         (void)stm_fs_unmount(fs);
+        stm_fs_mount_opts mopts = rw_mount_opts();
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (fs) {
+            STM_ASSERT_EQ(mid_op_size(fs, x), 8u * MIB);
+            STM_ASSERT_EQ(mid_op_byte(fs, x, 8u * MIB - 101u), 0xAB);
+            STM_ASSERT_EQ(mid_op_byte(fs, x, 8u * MIB - 100u), 0x33);
+            STM_ASSERT_OK(stm_fs_unmount(fs));
+        }
         unlink(g_tmp_path);
         unlink(g_key_path);
     }
     free(big);
+}
+
+/* A first write to an inline file that only the buffer took, whose inode
+ * update answers STM_ENOSPC: the stored inode is still inline, so the
+ * reclaim's retry moves it to extents again from its inline bytes, which
+ * are the file's first bytes after a remount. */
+STM_TEST(fs_a_transition_retried_after_a_reclaim_keeps_the_inline_bytes) {
+    make_tmp("transition_retry");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, c = 0, s = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1,
+                                     0644u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"s", 1,
+                                     0644u, 0, 0, &s));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, c, 0, "abc", 3));
+    uint8_t blk[65536];
+    memset(blk, 0x5A, sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, s, 0, blk, sizeof blk));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* s's blocks go PENDING, so the reclaim has something to sweep */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, dir, (const uint8_t *)"s", 1));
+    STM_ASSERT_TRUE(stm_sync_pending_free_blocks(stm_fs_sync(fs)) > 0u);
+    unsigned reclaims = 0;
+    stm_fs_set_reclaim_hook_for_test(fs, mid_op_count_reclaim, &reclaims);
+    stm_fs_fail_next_data_iset_for_test(fs, STM_ENOSPC);
+    uint8_t w[200];
+    memset(w, 0xE0, sizeof w);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_pwrite(fs, 1, c, 100u, w, sizeof w, &n));
+    stm_fs_set_reclaim_hook_for_test(fs, NULL, NULL);
+    STM_ASSERT_EQ(reclaims, 1u);
+    STM_ASSERT_EQ(n, sizeof w);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint8_t rb[300];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, c, 0, rb, sizeof rb, &got));
+    STM_ASSERT_EQ(got, sizeof rb);
+    STM_ASSERT_EQ(memcmp(rb, "abc", 3), 0);
+    size_t bad = 0;
+    for (size_t i = 3; i < 100u; i++) bad += rb[i] != 0u;
+    for (size_t i = 100u; i < sizeof rb; i++) bad += rb[i] != 0xE0u;
+    STM_ASSERT_EQ(bad, (size_t)0);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
 }
 
 /* A write far past an empty or inline file's bytes moves it to extents

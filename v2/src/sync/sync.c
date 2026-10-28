@@ -4442,7 +4442,8 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
  * consults the pool slot's state but also checks allocs[X]; an
  * unattached slot is uncommitable data-wise). We wedge the sync handle
  * so the next call surfaces the inconsistency loudly rather than
- * compounding the bug.
+ * compounding the bug, and answer true, so this call answers
+ * STM_EWEDGED.
  *
  * P5-8: rollback runs atomically with claim-clear under one
  * pool.wrlock — `_locked` variants bypass the claim check (which
@@ -4451,7 +4452,7 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
  * acquired a claim), the function clears the claim anyway (no-op if
  * unheld) but does NOT call remove (the slot was never freshly added
  * by THIS call). */
-static void replace_rollback_or_wedge(stm_sync *s, uint16_t new_slot,
+static bool replace_rollback_or_wedge(stm_sync *s, uint16_t new_slot,
                                          size_t redundancy_floor,
                                          bool claim_held)
 {
@@ -4467,11 +4468,11 @@ static void replace_rollback_or_wedge(stm_sync *s, uint16_t new_slot,
         (void)stm_pool_clear_replace_claim_locked(s->pool, new_slot);
     }
     stm_pool_unlock_exclusive(s->pool);
-    if (rs != STM_OK) {
-        pthread_mutex_lock(&s->lock);
-        sync_wedge_locked(s);
-        pthread_mutex_unlock(&s->lock);
-    }
+    if (rs == STM_OK) return false;
+    pthread_mutex_lock(&s->lock);
+    sync_wedge_locked(s);
+    pthread_mutex_unlock(&s->lock);
+    return true;
 }
 
 
@@ -4712,8 +4713,9 @@ stm_status stm_sync_replace_device_online(
      * post-add under concurrent callers). */
     stm_status sds = stm_alloc_set_device_id(new_alloc, new_slot);
     if (sds != STM_OK) {
-        replace_rollback_or_wedge(s, new_slot, redundancy_floor,
-                                     /*claim_held=*/true);
+        if (replace_rollback_or_wedge(s, new_slot, redundancy_floor,
+                                      /*claim_held=*/true))
+            return STM_EWEDGED;
         return sds;
     }
 
@@ -4725,8 +4727,9 @@ stm_status stm_sync_replace_device_online(
          * fails (floor too tight / concurrent EVACUATING), wedge
          * rather than silently leave an inconsistent slot. P5-8: same
          * helper now also clears the claim atomically. */
-        replace_rollback_or_wedge(s, new_slot, redundancy_floor,
-                                     /*claim_held=*/true);
+        if (replace_rollback_or_wedge(s, new_slot, redundancy_floor,
+                                      /*claim_held=*/true))
+            return STM_EWEDGED;
         return ats;
     }
 
@@ -8728,10 +8731,13 @@ stm_status stm_sync_reflink(stm_sync *s,
                  * hot_bumped, AND COLD CAS refcounts (via
                  * stm_cas_deref) capped at cold_bumped. Then a
                  * second pass uses stm_extent_delete_file to drop
-                 * the inserted records [0..i) from extent_idx; if
-                 * delete_file fails we wedge and answer STM_EWEDGED. */
+                 * the inserted records [0..i) from extent_idx; if an
+                 * undo or delete_file fails we wedge and answer
+                 * STM_EWEDGED (a refcount left over would persist, a
+                 * leak once src goes). */
                 size_t hot_undone  = 0;
                 size_t cold_undone = 0;
+                bool   undo_failed = false;
                 for (size_t j = 0; j < cx.n; j++) {
                     const stm_extent_record *ee = &cx.records[j];
                     if (ee->kind == STM_EXTENT_KIND_HOT) {
@@ -8739,11 +8745,10 @@ stm_status stm_sync_reflink(stm_sync *s,
                              r < ee->n_replicas && hot_undone < hot_bumped;
                              r++) {
                             uint16_t dev = stm_paddr_device(ee->paddrs[r]);
-                            if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
-                                (void)stm_alloc_free(s->allocs[dev],
-                                                        ee->paddrs[r],
-                                                        s->current_gen);
-                            }
+                            if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev] &&
+                                stm_alloc_free(s->allocs[dev], ee->paddrs[r],
+                                               s->current_gen) != STM_OK)
+                                undo_failed = true;
                             hot_undone++;
                         }
                     } else if (ee->kind == STM_EXTENT_KIND_COLD
@@ -8764,10 +8769,11 @@ stm_status stm_sync_reflink(stm_sync *s,
                                                                dst_dataset_id, dst_ino,
                                                                &dropped, &n_drop);
                     free(dropped);
-                    if (del != STM_OK) {
-                        sync_wedge_locked(s);
-                        apply_rc = STM_EWEDGED;
-                    }
+                    if (del != STM_OK) undo_failed = true;
+                }
+                if (undo_failed) {
+                    sync_wedge_locked(s);
+                    apply_rc = STM_EWEDGED;
                 }
                 break;
             }
@@ -8776,9 +8782,11 @@ stm_status stm_sync_reflink(stm_sync *s,
         /* Phase 2 partial-fail: we bumped hot_bumped HOT paddrs and
          * cold_bumped COLD records before the failure. Walk the
          * collect snapshot in the SAME order we bumped, undoing
-         * the first hot_bumped + cold_bumped refs. */
+         * the first hot_bumped + cold_bumped refs. An undo that fails
+         * wedges, as above. */
         size_t hot_undone  = 0;
         size_t cold_undone = 0;
+        bool   undo_failed = false;
         for (size_t i = 0; i < cx.n; i++) {
             const stm_extent_record *e = &cx.records[i];
             if (e->kind == STM_EXTENT_KIND_HOT) {
@@ -8786,10 +8794,10 @@ stm_status stm_sync_reflink(stm_sync *s,
                      r < e->n_replicas && hot_undone < hot_bumped;
                      r++) {
                     uint16_t dev = stm_paddr_device(e->paddrs[r]);
-                    if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
-                        (void)stm_alloc_free(s->allocs[dev], e->paddrs[r],
-                                                s->current_gen);
-                    }
+                    if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev] &&
+                        stm_alloc_free(s->allocs[dev], e->paddrs[r],
+                                       s->current_gen) != STM_OK)
+                        undo_failed = true;
                     hot_undone++;
                 }
             } else if (e->kind == STM_EXTENT_KIND_COLD
@@ -8799,6 +8807,10 @@ stm_status stm_sync_reflink(stm_sync *s,
                 }
                 cold_undone++;
             }
+        }
+        if (undo_failed) {
+            sync_wedge_locked(s);
+            apply_rc = STM_EWEDGED;
         }
     }
 

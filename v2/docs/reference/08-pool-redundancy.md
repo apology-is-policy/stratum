@@ -314,7 +314,9 @@ Caveats:
   EVACUATING state (crash between step 5 and 8), wrapper detects
   and resumes from step 6.
 - **Rollback-or-wedge** (R19 P2-2): if any step's rollback itself
-  fails, sync handle wedges rather than silently inconsistent.
+  fails, the sync handle wedges rather than stay silently inconsistent,
+  and the call answers `STM_EWEDGED`
+  (`sync_multi_replace_whose_rollback_fails_answers_the_wedge`).
 - **Drain cap** (R19 P2-5): drain loop capped at `STM_REPLACE_DRAIN_MAX_STEPS = 100M`;
   exceeded → `STM_ECORRUPT`.
 
@@ -362,7 +364,7 @@ EVACUATING / REMOVED transitions are implemented.
 | Suite | Count | Coverage |
 |---|---|---|
 | `test_pool` | 47 | open validation (zero count / duplicate UUID / malformed); roster encode/decode + hash determinism + identity-change sensitivity; fs format/mount roundtrip; v4/v5 version refusals; pool-mismatch refused; add_device; remove floor + burned-UUID; begin/finish evacuation guards; device-0 refusals across all mutators; fail/rejoin cycle + mirror_read FAULTED skip; RO pool refuses every mutator; replace-in-flight claim mechanics (set/clear/idempotent same-slot/refuse different-slot/expected_slot authorization/_locked-bypass; **R23 P3-2: add_device collision-only**, succeeds at non-claimed tail). |
-| `test_sync_multi` | 42 | (See [07-sb-sync.md](07-sb-sync.md).) Multi-device quorum commit, mirror reservation, replace_device_online happy path + unsupported-paths, evacuation step happy path + non-evacuating-refused, safe-removal drain check, concurrent-reader/writer TSan stress, replace-resume-from-ADDED-ONLINE, replace-claim-blocks-concurrent-mutators, replace-multi-retry-converges, sync-wrapper-bypass closed. |
+| `test_sync_multi` | 46 | (See [07-sb-sync.md](07-sb-sync.md).) Multi-device quorum commit, mirror reservation, replace_device_online happy path + unsupported-paths, evacuation step happy path + non-evacuating-refused, safe-removal drain check, concurrent-reader/writer TSan stress, replace-resume-from-ADDED-ONLINE, replace-claim-blocks-concurrent-mutators, replace-multi-retry-converges, sync-wrapper-bypass closed. |
 
 ## Status
 

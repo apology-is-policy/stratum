@@ -54,6 +54,13 @@ void stm_extent_fail_next_delete_for_test(stm_extent_index *idx,
  */
 void stm_extent_fail_next_put_for_test(stm_extent_index *idx,
                                        unsigned put_n, stm_status fail);
+
+/*
+ * Make the next stm_extent_count_for_ino answer `fail` in place of its
+ * count. One-shot; STM_OK disarms.
+ */
+void stm_extent_fail_next_count_for_test(stm_extent_index *idx,
+                                         stm_status fail);
 #endif
 
 #ifdef __cplusplus

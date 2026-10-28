@@ -164,6 +164,7 @@ struct stm_extent_index {
     stm_status            del_fail;
     unsigned              put_fail_n;
     stm_status            put_fail;
+    stm_status            count_fail;
 #endif
 };
 
@@ -2491,6 +2492,15 @@ void stm_extent_fail_next_put_for_test(stm_extent_index *idx,
     idx->put_fail = fail;
     must_unlock(&idx->lock);
 }
+
+void stm_extent_fail_next_count_for_test(stm_extent_index *idx,
+                                         stm_status fail)
+{
+    if (!idx) return;
+    must_lock(&idx->lock);
+    idx->count_fail = fail;
+    must_unlock(&idx->lock);
+}
 #endif
 
 static int ex_paddr_lookup_cb(uint64_t ds, uint64_t ino, uint64_t off,
@@ -2697,6 +2707,14 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
         must_unlock(lock);
         return STM_EINVAL;
     }
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (m->count_fail != STM_OK) {
+        stm_status f = m->count_fail;
+        m->count_fail = STM_OK;
+        must_unlock(lock);
+        return f;
+    }
+#endif
 
     ex_collect_ctx c;
     stm_status cs = ex_collect_in_ino_locked(m, dataset_id, ino, &c);

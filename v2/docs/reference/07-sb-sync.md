@@ -277,8 +277,8 @@ harmless since the call is idempotent at the same gen.
 
 `stm_sync_write_extent` reserves every replica's blocks before it
 encrypts. It first asks each device for one run holding the whole
-record (data plus tag). Only when none has one is the record written in
-pieces, each its own record with its own tag on every replica
+record (data plus tag). When any device has none, the record is written
+in pieces, each its own record with its own tag on every replica
 (`sync_write_reserve_pieces_locked`): device 0 gives its first free run
 of at least 2 blocks, up to the blocks left plus one
 (`stm_alloc_reserve_upto`), the piece carries one block fewer of data,
@@ -448,7 +448,7 @@ atomically so add / attach / commit / detach composes in one step.
 |---|---|---|
 | `test_sb` | 18 | Encode / decode roundtrip; csum tamper rejected; magic tamper → STM_ENOENT; version tamper → STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid. |
 | `test_sync` | 19 | Single-device commit + remount; MountGenBump; alloc-root tree encoded under correct key; version boundary refusals. |
-| `test_sync_multi` | 42 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; impl rejects all non-`STM_UB_VERSION` uniformly); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4). |
+| `test_sync_multi` | 46 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; impl rejects all non-`STM_UB_VERSION` uniformly); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4).; a replace whose rollback cannot remove the new slot wedges and answers the wedge |
 
 ## Status
 

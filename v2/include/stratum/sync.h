@@ -1472,8 +1472,8 @@ stm_status stm_sync_punch_range(stm_sync *s,
  *   - dst_ino has any extent (STM_EEXIST — caller MUST clear dst first;
  *     truncate to 0 plus re-create is the typical pattern but in MVP
  *     we just refuse).
- *   - Any allocator refcount-bump fails (STM_ECORRUPT — should never
- *     happen for live extents; rolls back any prior bumps).
+ *   - Any allocator refcount-bump fails (its error; should never happen
+ *     for live extents; rolls back any prior bumps).
  *   - Wedged or read-only (standard guards).
  *
  * Atomicity: holds sync->lock across all extent-tree mutations and
@@ -1481,8 +1481,9 @@ stm_status stm_sync_punch_range(stm_sync *s,
  * is rolled back via stm_alloc_free + every successful extent-tree
  * insert is removed via stm_extent_delete_file (delete_file is the
  * cheapest "drop everything for this dst_ino" given dst_ino was
- * required to be empty at entry). When that delete fails, the sync
- * wedges and the call answers STM_EWEDGED.
+ * required to be empty at entry). When that delete or an undo of a bump
+ * fails, the sync wedges and the call answers STM_EWEDGED: a refcount left
+ * over would persist, a leak once src goes.
  *
  * Models extent.tla::Reflink iterated over every (src_dataset_id,
  * src_ino) extent; lock-graph: sync.lock OUTER → extent_idx.lock +

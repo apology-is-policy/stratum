@@ -214,7 +214,7 @@ set_tests_properties(test_crash_inject PROPERTIES TIMEOUT 300)
 # The fs suites format, mount and unmount per test. They are split by area
 # so each binary stays well inside its budget under the sanitizers;
 # measured in a Debug build, serial ctest: test_fs (234 tests) 39 s,
-# test_fs_phase8 (247) 59 s, test_fs_write_path (25) 19 s,
+# test_fs_phase8 (247) 59 s, test_fs_write_path (33) 22 s,
 # test_fs_identity (39) 10 s, test_fs_windows (5) 3 s.
 set_tests_properties(test_fs            PROPERTIES TIMEOUT 180)
 set_tests_properties(test_fs_phase8     PROPERTIES TIMEOUT 180)

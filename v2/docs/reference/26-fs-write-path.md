@@ -114,10 +114,11 @@ write(2)'s is: `si_size` grows over the landed pieces and `*out_written` counts
 the caller's bytes they hold, so no byte past EOF is left for a later grow to
 read back. `stm_fs_pwrite` answers that count with `STM_OK`; `stm_fs_write`,
 which has no count, answers the error; the 9P server replies the count in
-Rwrite. A piece whose failure wedged the fs (an index change that failed part
-way, or an inode update that failed after the extents changed) leaves nothing
-a commit can take, so then `stm_fs_pwrite` answers the error with a count of
-0, and the 9P server replies Rlerror
+Rwrite. Once a piece's failure has wedged the fs (an index change that failed
+part way, or an inode update that failed after the extents changed), the fs
+takes no further op, so `stm_fs_pwrite` answers the error with a count of 0
+and the 9P server replies Rlerror. The prefix may be durable all the same: a
+reclaim's commit before the wedge takes what landed, and a remount reads it
 (`fs_a_short_write_over_a_wedge_counts_nothing`). Buffered bytes are not on-disk until `stm_sync_commit`; the
 buffer overlay surfaces them on intervening reads.
 
@@ -349,12 +350,15 @@ cover = [a_off, a_end)   (block-aligned, fully contains all stuck-out extents)
 | `fs_io_multipiece_split_pullback_no_bisect` | F1 (round 3) — a `> recordsize` cover over three legacy extents (the middle one cross-slot) forces a 3-piece split with a pullback at both interior boundaries; asserts data preserved AND the cross-slot extent re-covered whole (not bisected at the slot boundary) |
 | `fs_a_write_that_fails_part_way_keeps_no_bytes_past_eof` | a split direct write whose second piece meets a full pool: `stm_fs_write` answers ENOSPC with the size grown over the landed piece, and a later grow reads zeros past it |
 | `fs_a_short_write_reports_what_landed` | `stm_fs_pwrite` answers the landed count (8 MiB of a 12 MiB write; 100 bytes of an unaligned write whose RMW cover's first piece holds them), and ENOSPC once nothing lands |
-| `fs_a_short_write_over_a_wedge_counts_nothing` | a split direct write whose second piece wedges the fs (a record it overlaps fails to go out), and one whose reclaim retry's inode update then fails: `stm_fs_pwrite` answers the error with a count of 0, and the first file reads back as it was after a remount |
+| `fs_a_short_write_over_a_wedge_counts_nothing` | a split direct write whose second piece wedges the fs (a record it overlaps fails to go out), and one whose reclaim retry's inode update then fails: `stm_fs_pwrite` answers the error with a count of 0; after a remount the first file reads back as it was, and the second holds the prefix the reclaim's commit took |
+| `fs_a_transition_retried_after_a_reclaim_keeps_the_inline_bytes` | a first write to an inline file whose inode update answers ENOSPC: the reclaim's retry starts from the stored inline value, and the file's first bytes survive a commit and a remount |
+| `fs_a_transition_whose_update_fails_during_a_peer_drain_wedges` | the update fails while a peer's drain of the range is held between its encrypt and its index commit: the drop waits the drain out, the count sees its extent, and the fs wedges |
+| `fs_a_transition_whose_extent_count_fails_wedges` | the update fails and then the extent count fails: the fs wedges; with the count answering, the same failure only answers its error |
 | `fs_a_write_far_past_a_small_file_is_sparse` | an empty or inline file takes a write at 16 MiB or 9 MiB and keeps its prefix, and a 1-byte write at 7 MiB costs its own blocks, not 7 MiB of zeros |
 
 Each is non-vacuous (each fails on its named pre-fix bug; verified by
 reintroducing the bug surgically). `test_fs` holds 234 tests and
-`test_fs_write_path` 28; the full ctest suite is 78 binaries.
+`test_fs_write_path` 33; the full ctest suite is 78 binaries.
 
 ## Error paths
 
@@ -387,7 +391,14 @@ reintroducing the bug surgically). `test_fs` holds 234 tests and
   another inode flushing every inode takes no pin of this one). The inode's
   extent count, taken once the drop has waited out a drain in flight, shows
   it, and then the fs wedges
-  (`fs_a_transition_whose_update_fails_after_a_peer_drain_wedges`).
+  (`fs_a_transition_whose_update_fails_after_a_peer_drain_wedges`,
+  `fs_a_transition_whose_update_fails_during_a_peer_drain_wedges`); so does
+  a count that fails (`fs_a_transition_whose_extent_count_fails_wedges`).
+  The transition builds the extent kind in a copy of the inode value, which
+  the caller's takes only once stored, so after a failure that does not
+  wedge the caller's value is the stored inline one, which the reclaim's
+  retry moves to extents again
+  (`fs_a_transition_retried_after_a_reclaim_keeps_the_inline_bytes`).
 - `STM_EWEDGED` / `STM_EROFS` — from `stm_sync_write_extent`.
 - `STM_ERANGE` — the RMW scratch span exceeds `4 * recordsize` (F2 defensive cap;
   a legitimate expansion tops out at ~3·recordsize, so this fires only for an

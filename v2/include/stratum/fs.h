@@ -29,11 +29,15 @@
  *   `read_only`: set via mount_opts. Any mutating API entry returns
  *                STM_EROFS.
  *   `wedged`:    set when an operation left state no commit may take:
- *                an index change that failed part way (the sync wedges,
- *                and its hook wedges the fs), or an inode update that
- *                failed after the op changed extents. Callers can also
- *                set it via stm_fs_mark_wedged. Reads, writes and
- *                stm_fs_commit then return STM_EWEDGED.
+ *                an index change or a rollback that failed part way (the
+ *                sync wedges, and its hook wedges the fs), an inode
+ *                update that failed after the op changed extents, a
+ *                failed commit or reclaim, a namespace rollback that
+ *                could not put a name back, an exchange or shift torn
+ *                part way, or a failed step on the snapshot dead-list
+ *                path. Callers can also set it via stm_fs_mark_wedged.
+ *                Reads, writes and stm_fs_commit then return
+ *                STM_EWEDGED.
  *
  * Thread safety: an internal mutex serializes mutating ops. The same
  * mutex protects stat / lookup reads against concurrent mutation
@@ -287,8 +291,9 @@ stm_status stm_fs_commit(stm_fs *fs);
  * with a prefix of the range written and the size grown over it.
  * `stm_fs_pwrite` reports that prefix as pwrite(2) does: STM_OK with the
  * count in *out_written, short when it stopped early, and an error when it
- * wrote nothing or when the fs is wedged after it (no commit can take the
- * prefix then, so *out_written is 0). A file ends at or below STM_FS_FILE_MAX: `stm_fs_write`
+ * wrote nothing or when the fs is wedged after it (*out_written is then 0:
+ * a wedged fs takes no further op, though a reclaim's commit before the
+ * wedge may already have made the prefix durable). A file ends at or below STM_FS_FILE_MAX: `stm_fs_write`
  * refuses a write that passes it, and `stm_fs_pwrite` writes the part below
  * it, as write(2) does. An ino the inode index does not hold (the legacy
  * direct-extent seam) takes the extent layer's rules: off and len 4 KiB
