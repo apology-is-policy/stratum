@@ -3620,6 +3620,19 @@ static stm_status sync_alloc_reserve_locked(stm_sync *s, stm_alloc *a,
     return stm_alloc_reserve(a, nblocks, hint_paddr, out_paddr);
 }
 
+/* The room that sync_alloc_reserve_locked's reserve (or, `netfree`,
+ * stm_alloc_reserve_netfree) is judged by: a refusal of more blocks is
+ * for want of room, of fewer for want of a free run. Caller holds
+ * s->lock. */
+static uint64_t sync_alloc_room_locked(stm_sync *s, stm_alloc *a,
+                                       bool netfree)
+{
+    if (netfree) return stm_alloc_avail_netfree_blocks(a);
+    if (s->draining && pthread_equal(s->drainer, pthread_self()))
+        return stm_alloc_data_free_blocks(a);
+    return stm_alloc_avail_blocks(a);
+}
+
 void stm_sync_set_dirty_guard(stm_sync *s, bool guarded)
 {
     if (!s) return;
@@ -6077,22 +6090,46 @@ static bool cold_overlap_cb(const stm_extent_record *e, void *cx) {
  * older stamp also passes its gate.
  * ------------------------------------------------------------------ */
 
+/* One piece of a write: [off, off+len) of the file on its own run of
+ * nblocks on every replica device. A write is one piece unless no free
+ * run holds it (sync_write_reserve_pieces_locked). */
+typedef struct {
+    uint64_t      off;
+    size_t        len;
+    size_t        total_bytes;   /* len + tag_len */
+    uint64_t      nblocks;
+    uint64_t      replicas[STM_EXTENT_MAX_REPLICAS];
+    size_t        reserved_count;
+} sync_write_piece;
+
 /* Per-op write reservation, carried across the three phases. The DEK
  * copy is live from reserve until encrypt_store consumes it;
  * encrypt_store scrubs it on EVERY exit (rollback re-scrubs,
  * harmlessly). */
 typedef struct {
-    uint64_t      enc_key_id;
-    uint8_t       dek[32];
-    stm_aead_mode mode;
-    size_t        tag_len;
-    size_t        total_bytes;   /* len + tag_len */
-    uint64_t      nblocks;
-    size_t        n_replicas;
-    uint64_t      replicas[STM_EXTENT_MAX_REPLICAS];
-    size_t        reserved_count;
-    uint64_t      write_gen;     /* captured under the Phase-1 lock */
+    uint64_t          enc_key_id;
+    uint8_t           dek[32];
+    stm_aead_mode     mode;
+    size_t            tag_len;
+    size_t            n_replicas;
+    sync_write_piece  one;       /* a write in one piece allocates nothing */
+    sync_write_piece *many;      /* else n_pieces of them, malloc'd */
+    size_t            n_pieces;
+    uint64_t          write_gen; /* captured under the Phase-1 lock */
 } sync_write_reservation;
+
+static sync_write_piece *sync_write_pieces(sync_write_reservation *res)
+{
+    return res->many ? res->many : &res->one;
+}
+
+/* Forget the pieces; their blocks stay with whoever holds them now. */
+static void sync_write_release(sync_write_reservation *res)
+{
+    free(res->many);
+    res->many = NULL;
+    res->n_pieces = 0;
+}
 
 /* Free every reserved replica and scrub the DEK copy. Callable with
  * or without s->lock: stm_alloc_free self-locks (a->lock is a leaf),
@@ -6107,10 +6144,104 @@ typedef struct {
 static void sync_write_reserve_rollback(stm_sync *s,
                                            sync_write_reservation *res)
 {
-    for (size_t j = 0; j < res->reserved_count; j++)
-        (void)stm_alloc_free(s->allocs[j], res->replicas[j], s->current_gen);
-    res->reserved_count = 0;
+    sync_write_piece *wp = sync_write_pieces(res);
+    for (size_t k = 0; k < res->n_pieces; k++) {
+        for (size_t j = 0; j < wp[k].reserved_count; j++)
+            (void)stm_alloc_free(s->allocs[j], wp[k].replicas[j],
+                                 s->current_gen);
+        wp[k].reserved_count = 0;
+    }
+    sync_write_release(res);
     stm_ct_memzero(res->dek, sizeof res->dek);
+}
+
+/* Reserve one piece's run on every replica device. On failure none of it
+ * is held. */
+static stm_status sync_write_reserve_piece_locked(stm_sync *s, bool netfree,
+                                                  size_t n_replicas,
+                                                  size_t tag_len,
+                                                  sync_write_piece *pc)
+{
+    pc->total_bytes    = pc->len + tag_len;
+    pc->nblocks        = (pc->total_bytes + STM_UB_SIZE - 1u) / STM_UB_SIZE;
+    pc->reserved_count = 0;
+    for (size_t i = 0; i < n_replicas; i++) {
+        stm_status rs = netfree
+            ? stm_alloc_reserve_netfree(s->allocs[i], pc->nblocks, 0,
+                                        &pc->replicas[i])
+            : sync_alloc_reserve_locked(s, s->allocs[i], pc->nblocks, 0,
+                                        &pc->replicas[i]);
+        if (rs != STM_OK) {
+            for (size_t j = 0; j < pc->reserved_count; j++)
+                (void)stm_alloc_free(s->allocs[j], pc->replicas[j],
+                                     s->current_gen);
+            pc->reserved_count = 0;
+            return rs;
+        }
+        pc->reserved_count++;
+    }
+    return STM_OK;
+}
+
+/* Whether every replica device has the room for `len` bytes in one piece.
+ * Pieces need at least that much, so without it they cannot fit either,
+ * and reserving them would only leave their blocks PENDING until the next
+ * commit. */
+static bool sync_write_room_admits_locked(stm_sync *s, bool netfree,
+                                          size_t n_replicas, size_t tag_len,
+                                          size_t len)
+{
+    uint64_t need = (len + tag_len + STM_UB_SIZE - 1u) / STM_UB_SIZE;
+    for (size_t i = 0; i < n_replicas; i++)
+        if (sync_alloc_room_locked(s, s->allocs[i], netfree) < need)
+            return false;
+    return true;
+}
+
+/* No free run holds the whole write: cut it into pieces as long as the
+ * free runs, halving the piece until one fits, down to one block of
+ * data. Each extra piece costs its own tag block; the slop is the margin
+ * that pays for them. No piece is cut while the room cannot hold the rest
+ * of the write. On failure nothing is held: the pieces already reserved
+ * land PENDING, as any rolled-back reservation. */
+static stm_status sync_write_reserve_pieces_locked(stm_sync *s, bool netfree,
+                                                   uint64_t off, size_t len,
+                                                   sync_write_reservation *res)
+{
+    res->many = malloc(((len + STM_UB_SIZE - 1u) / STM_UB_SIZE)
+                       * sizeof *res->many);
+    if (!res->many) return STM_ENOMEM;
+    res->n_pieces = 0;
+    size_t cap = (len / 2u) & ~(size_t)(STM_UB_SIZE - 1u);
+    if (cap < STM_UB_SIZE) cap = STM_UB_SIZE;
+    uint64_t at = off;
+    size_t left = len;
+    while (left > 0) {
+        if (!sync_write_room_admits_locked(s, netfree, res->n_replicas,
+                                           res->tag_len, left)) {
+            sync_write_reserve_rollback(s, res);
+            return STM_ENOSPC;
+        }
+        sync_write_piece *pc = &res->many[res->n_pieces];
+        pc->off = at;
+        pc->len = left < cap ? left : cap;
+        stm_status rs = sync_write_reserve_piece_locked(s, netfree,
+                                                        res->n_replicas,
+                                                        res->tag_len, pc);
+        if (rs == STM_OK) {
+            res->n_pieces++;
+            at   += pc->len;
+            left -= pc->len;
+            continue;
+        }
+        if (rs != STM_ENOSPC || pc->len <= STM_UB_SIZE) {
+            sync_write_reserve_rollback(s, res);
+            return rs;
+        }
+        cap = (pc->len / 2u) & ~(size_t)(STM_UB_SIZE - 1u);
+        if (cap < STM_UB_SIZE) cap = STM_UB_SIZE;
+    }
+    return STM_OK;
 }
 
 /* Phase 1: DEK resolve + size math + replica reservation + gen
@@ -6121,7 +6252,8 @@ static void sync_write_reserve_rollback(stm_sync *s,
  * rollback. A `netfree` write replaces a longer extent it cuts, so it may
  * spend half the slop. */
 static stm_status sync_write_reserve_locked(stm_sync *s, uint64_t dataset_id,
-                                               size_t len, bool netfree,
+                                               uint64_t off, size_t len,
+                                               bool netfree,
                                                sync_write_reservation *res)
 {
     memset(res, 0, sizeof *res);
@@ -6144,8 +6276,6 @@ static stm_status sync_write_reserve_locked(stm_sync *s, uint64_t dataset_id,
         stm_ct_memzero(res->dek, sizeof res->dek);
         return STM_EINVAL;
     }
-    res->total_bytes = len + res->tag_len;
-    res->nblocks     = (res->total_bytes + STM_UB_SIZE - 1u) / STM_UB_SIZE;
 
     /* P7-6: reserve N replica paddrs across N distinct devices. */
     res->n_replicas = sync_desired_replica_count_locked(s);
@@ -6158,51 +6288,37 @@ static stm_status sync_write_reserve_locked(stm_sync *s, uint64_t dataset_id,
             /* Not enough attached allocs — should not happen because
              * sync_desired_replica_count_locked caps at n_attached.
              * Defensive abort. */
-            sync_write_reserve_rollback(s, res);
+            stm_ct_memzero(res->dek, sizeof res->dek);
             return STM_EINVAL;
         }
-        stm_status rs = netfree
-            ? stm_alloc_reserve_netfree(s->allocs[i], res->nblocks, 0,
-                                        &res->replicas[i])
-            : sync_alloc_reserve_locked(s, s->allocs[i], res->nblocks, 0,
-                                        &res->replicas[i]);
-        if (rs != STM_OK) {
-            sync_write_reserve_rollback(s, res);
-            return rs;
-        }
-        res->reserved_count++;
+    }
+    res->one.off = off;
+    res->one.len = len;
+    stm_status rs = sync_write_reserve_piece_locked(s, netfree,
+                                                    res->n_replicas,
+                                                    res->tag_len, &res->one);
+    if (rs == STM_OK)
+        res->n_pieces = 1;
+    else if (rs == STM_ENOSPC && len > STM_UB_SIZE)
+        rs = sync_write_reserve_pieces_locked(s, netfree, off, len, res);
+    if (rs != STM_OK) {
+        stm_ct_memzero(res->dek, sizeof res->dek);
+        return rs;
     }
 
     res->write_gen = s->current_gen;
     return STM_OK;
 }
 
-/* Phase 2: AEAD encrypt + write every replica. NO s->lock
- * requirement — the work is thread-local (cbuf) plus self-locked
- * leaves: stm_bdev_write serializes on the bdev's own lock, and
- * stm_pool_device_bdev reads the pool's device table exactly as the
- * RC-2 unlocked read fetch already does (slots are write-once per
- * attach; the slots consumed here are pinned by the live
- * reservation). Scrubs res->dek on EVERY exit. Frees nothing — the
- * caller owns the reservation (rollback on failure). */
-static stm_status sync_write_encrypt_store(stm_sync *s,
-                                              uint64_t dataset_id, uint64_t ino,
-                                              uint64_t off, const void *buf,
-                                              size_t len,
-                                              sync_write_reservation *res)
+/* Encrypt one piece and write it to every replica; `buf` is the piece's
+ * plaintext and `cbuf` holds at least its total_bytes. */
+static stm_status sync_write_encrypt_store_piece(stm_sync *s,
+                                                 uint64_t dataset_id,
+                                                 uint64_t ino, const void *buf,
+                                                 const sync_write_reservation *res,
+                                                 const sync_write_piece *pc,
+                                                 void *cbuf)
 {
-    /* Encrypt ONCE under the canonical replica's nonce (replicas[0],
-     * write_gen). The same ciphertext+tag is written to every
-     * replica's paddr — bptr.tla's per-replica csum gate works
-     * because each replica's stored bytes are independently subject
-     * to bit-rot, but the AEAD MAC is computed against the canonical
-     * nonce. */
-    void *cbuf = malloc(res->total_bytes);
-    if (!cbuf) {
-        stm_ct_memzero(res->dek, sizeof res->dek);
-        return STM_ENOMEM;
-    }
-
     stm_ad_extent ad;
     memset(&ad, 0, sizeof ad);
     ad.magic        = STM_AD_MAGIC_EXTENT;
@@ -6211,7 +6327,7 @@ static stm_status sync_write_encrypt_store(stm_sync *s,
     ad.pool_uuid[1] = s->pool_uuid[1];
     ad.dataset_id   = dataset_id;
     ad.ino          = ino;
-    ad.offset       = off;
+    ad.offset       = pc->off;
     ad.content_kind = 0;  /* file data */
 
     size_t out_len = 0;
@@ -6222,37 +6338,62 @@ static stm_status sync_write_encrypt_store(stm_sync *s,
      * CURRENT advances to a new key_id but already-written extents
      * stay decryptable under their original RETIRED key_id. */
     stm_status es = stm_extent_encrypt(res->mode, res->dek,
-                                          res->replicas[0], res->write_gen,
-                                          &ad, buf, len,
-                                          cbuf, res->total_bytes, &out_len);
-    if (es != STM_OK) {
-        free(cbuf);
-        stm_ct_memzero(res->dek, sizeof res->dek);
-        return es;
-    }
+                                          pc->replicas[0], res->write_gen,
+                                          &ad, buf, pc->len,
+                                          cbuf, pc->total_bytes, &out_len);
+    if (es != STM_OK) return es;
 
     /* Write the same ciphertext+tag to each replica's paddr. */
     for (size_t i = 0; i < res->n_replicas; i++) {
-        uint16_t dev = stm_paddr_device(res->replicas[i]);
-        uint64_t byte_off = stm_paddr_offset(res->replicas[i])
+        uint16_t dev = stm_paddr_device(pc->replicas[i]);
+        uint64_t byte_off = stm_paddr_offset(pc->replicas[i])
                             * (uint64_t)STM_UB_SIZE;
         stm_bdev *target_bdev = stm_pool_device_bdev(s->pool, dev);
-        if (!target_bdev) {
-            free(cbuf);
-            stm_ct_memzero(res->dek, sizeof res->dek);
-            return STM_EINVAL;
-        }
+        if (!target_bdev) return STM_EINVAL;
         stm_status ws = stm_bdev_write(target_bdev, byte_off, cbuf,
-                                          res->total_bytes);
-        if (ws != STM_OK) {
-            free(cbuf);
-            stm_ct_memzero(res->dek, sizeof res->dek);
-            return ws;
-        }
+                                          pc->total_bytes);
+        if (ws != STM_OK) return ws;
     }
+    return STM_OK;
+}
+
+/* Phase 2: AEAD encrypt + write every replica of every piece. NO s->lock
+ * requirement -- the work is thread-local (cbuf) plus self-locked
+ * leaves: stm_bdev_write serializes on the bdev's own lock, and
+ * stm_pool_device_bdev reads the pool's device table exactly as the
+ * RC-2 unlocked read fetch already does (slots are write-once per
+ * attach; the slots consumed here are pinned by the live
+ * reservation). Scrubs res->dek on EVERY exit. Frees nothing -- the
+ * caller owns the reservation (rollback on failure).
+ *
+ * Each piece is encrypted ONCE under its canonical replica's nonce
+ * (replicas[0], write_gen) and its own offset in the AD. The same
+ * ciphertext+tag is written to every replica's paddr -- bptr.tla's
+ * per-replica csum gate works because each replica's stored bytes are
+ * independently subject to bit-rot, but the AEAD MAC is computed
+ * against the canonical nonce. */
+static stm_status sync_write_encrypt_store(stm_sync *s,
+                                              uint64_t dataset_id, uint64_t ino,
+                                              uint64_t off, const void *buf,
+                                              sync_write_reservation *res)
+{
+    sync_write_piece *wp = sync_write_pieces(res);
+    size_t cap = 0;
+    for (size_t k = 0; k < res->n_pieces; k++)
+        if (wp[k].total_bytes > cap) cap = wp[k].total_bytes;
+    void *cbuf = malloc(cap);
+    if (!cbuf) {
+        stm_ct_memzero(res->dek, sizeof res->dek);
+        return STM_ENOMEM;
+    }
+    stm_status es = STM_OK;
+    for (size_t k = 0; k < res->n_pieces && es == STM_OK; k++)
+        es = sync_write_encrypt_store_piece(
+                s, dataset_id, ino, (const uint8_t *)buf + (wp[k].off - off),
+                res, &wp[k], cbuf);
     free(cbuf);
     stm_ct_memzero(res->dek, sizeof res->dek);
-    return STM_OK;
+    return es;
 }
 
 /* Phase 3: publish the written extent — cold-overlap bookend +
@@ -6278,9 +6419,6 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
                                                     const void *buf, size_t len,
                                                     sync_write_reservation *res)
 {
-    const uint64_t *replicas       = res->replicas;
-    size_t          n_replicas     = res->n_replicas;
-    size_t          reserved_count = res->reserved_count;
     uint64_t        enc_key_id     = res->enc_key_id;
 
     /* P7-CAS-2: pre-scan for COLD extents overlapping the write
@@ -6297,8 +6435,7 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
                                             cold_overlap_cb, &cox);
         if (its != STM_OK || cox.err != STM_OK) {
             free(cox.hashes);
-            for (size_t j = 0; j < reserved_count; j++)
-                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            sync_write_reserve_rollback(s, res);
             return cox.err != STM_OK ? cox.err : its;
         }
     }
@@ -6317,8 +6454,7 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
                 s->snap_idx, dataset_id, cox.n_hashes, &can_accept);
         if (rs != STM_OK || !can_accept) {
             free(cox.hashes);
-            for (size_t j = 0; j < reserved_count; j++)
-                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            sync_write_reserve_rollback(s, res);
             return rs != STM_OK ? rs : STM_ENOSPC;
         }
     }
@@ -6328,23 +6464,40 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
      * Each dropped paddr routes through snapshot dead-list / free. */
     uint64_t *dropped = NULL;
     size_t    n_dropped = 0;
-    stm_status os = stm_extent_overwrite(s->extent_idx, dataset_id, ino, off,
-                                            len, replicas, n_replicas,
-                                            res->write_gen, enc_key_id,
-                                            &dropped, &n_dropped);
+    sync_write_piece *wp = sync_write_pieces(res);
+    stm_extent_piece one, *xp = &one;
+    if (res->n_pieces > 1u) {
+        xp = malloc(res->n_pieces * sizeof *xp);
+        if (!xp) {
+            free(cox.hashes);
+            sync_write_reserve_rollback(s, res);
+            return STM_ENOMEM;
+        }
+    }
+    for (size_t k = 0; k < res->n_pieces; k++) {
+        xp[k].off      = wp[k].off;
+        xp[k].len      = wp[k].len;
+        xp[k].paddrs   = wp[k].replicas;
+        xp[k].n_paddrs = res->n_replicas;
+    }
+    stm_status os = stm_extent_overwrite_pieces(s->extent_idx, dataset_id,
+                                                ino, xp, res->n_pieces,
+                                                res->write_gen, enc_key_id,
+                                                &dropped, &n_dropped);
+    if (xp != &one) free(xp);
     if (os == STM_EWEDGED) {
-        /* The new record is in and an overlapped one is not out: the
+        /* A new record is in and an overlapped one is not out: the
          * index names these replicas, so they stay, and no commit may
          * take the index. */
         free(dropped);
         free(cox.hashes);
+        sync_write_release(res);
         sync_wedge_locked(s);
         return STM_EWEDGED;
     }
     if (os != STM_OK) {
         free(cox.hashes);
-        for (size_t j = 0; j < reserved_count; j++)
-            (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+        sync_write_reserve_rollback(s, res);
         return os;
     }
 
@@ -6360,8 +6513,6 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
      * advances) already guarantee (paddr0, gen) is never reused for
      * different bytes. */
     {
-        uint8_t wkey[STM_CAS_HASH_LEN];
-        dcache_key_hot(wkey, replicas[0], res->write_gen);
         /* Populate-vs-evict gate (RC-3): on the concurrent path,
          * stm_sync_evict_dek (slot remove -> dcache_drain, one s->lock
          * hold) can run during the unlocked Phase 2; this epilogue
@@ -6378,10 +6529,17 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
          * WHOLE evict (slot remove -> drain, one s->lock hold), so
          * this pre-gate is atomic with the insert -- the provisional
          * dance is the unlocked fetch path's tool. */
-        if (sync_dek_find(s, dataset_id, res->enc_key_id) != NULL)
-            dcache_insert(s, wkey, STM_EXTENT_KIND_HOT, buf, len,
-                          /*visible_at_birth=*/true);
+        if (sync_dek_find(s, dataset_id, res->enc_key_id) != NULL) {
+            for (size_t k = 0; k < res->n_pieces; k++) {
+                uint8_t wkey[STM_CAS_HASH_LEN];
+                dcache_key_hot(wkey, wp[k].replicas[0], res->write_gen);
+                dcache_insert(s, wkey, STM_EXTENT_KIND_HOT,
+                              (const uint8_t *)buf + (wp[k].off - off),
+                              wp[k].len, /*visible_at_birth=*/true);
+            }
+        }
     }
+    sync_write_release(res);
 
     /* R36 P1-1 + P2-1: best-effort drain. */
     stm_status drop_err = STM_OK;
@@ -6468,12 +6626,12 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
                                                   uint64_t off, const void *buf,
                                                   size_t len, bool netfree) {
     sync_write_reservation res;
-    stm_status rs = sync_write_reserve_locked(s, dataset_id, len, netfree,
+    stm_status rs = sync_write_reserve_locked(s, dataset_id, off, len, netfree,
                                               &res);
     if (rs != STM_OK) return rs;
 
     stm_status es = sync_write_encrypt_store(s, dataset_id, ino, off,
-                                                buf, len, &res);
+                                                buf, &res);
     if (es != STM_OK) {
         sync_write_reserve_rollback(s, &res);
         return es;
@@ -6549,13 +6707,13 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         pthread_mutex_lock(&s->lock);
         if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
         if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
-        stm_status rs = sync_write_reserve_locked(s, dataset_id, len, false,
+        stm_status rs = sync_write_reserve_locked(s, dataset_id, off, len, false,
                                                   &res);
         pthread_mutex_unlock(&s->lock);
         if (rs != STM_OK) return rs;
 
         stm_status es = sync_write_encrypt_store(s, dataset_id, ino, off,
-                                                    buf, len, &res);
+                                                    buf, &res);
         if (es != STM_OK) {
             sync_write_reserve_rollback(s, &res);
             return es;

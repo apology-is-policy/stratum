@@ -244,6 +244,7 @@ STM_TEST(alloc_a_guarded_reserve_leaves_the_reservation_and_the_slop) {
     STM_ASSERT_TRUE(slop > 0u);
     STM_ASSERT_OK(stm_alloc_dirty_reserve(a, 100u));
     STM_ASSERT_EQ(stm_alloc_avail_blocks(a), total);
+    STM_ASSERT_EQ(stm_alloc_avail_netfree_blocks(a), total);
     stm_alloc_dirty_release(a, 100u);
     STM_ASSERT_EQ(stm_alloc_dirty_reserved(a), (uint64_t)0);
 
@@ -255,6 +256,8 @@ STM_TEST(alloc_a_guarded_reserve_leaves_the_reservation_and_the_slop) {
     STM_ASSERT_OK(stm_alloc_dirty_reserve(a, R));
     const uint64_t room = total - R - slop;
     STM_ASSERT_EQ(stm_alloc_avail_blocks(a), room);
+    /* a net-free allocation keeps only half the slop */
+    STM_ASSERT_EQ(stm_alloc_avail_netfree_blocks(a), room + slop - slop / 2u);
     uint64_t p1 = 0, p2 = 0, p3 = 0;
     STM_ASSERT_ERR(stm_alloc_reserve(a, room + 1u, 0, &p1), STM_ENOSPC);
     STM_ASSERT_OK(stm_alloc_reserve(a, room, 0, &p1));

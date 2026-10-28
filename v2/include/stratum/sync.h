@@ -1267,6 +1267,13 @@ stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
  * not deleted, or a replaced block's drop failing) wedges the handle
  * and answers STM_EWEDGED; the blocks the index names stay allocated.
  *
+ * A write that no free run can hold is written in pieces, each on its
+ * own run (the longest that fits, halving down to one 4 KiB block of
+ * data), which replace the old records in one index step
+ * (stm_extent_overwrite_pieces): a fragmented pool with the blocks free
+ * answers STM_ENOSPC only when the pieces do not fit either. Each extra
+ * piece costs its own tag block.
+ *
  * Thread safety: serialized by sync's internal mutex. Composes with
  * sync_commit's idempotent persistence — every commit captures all
  * writes since the prior commit.

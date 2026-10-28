@@ -980,24 +980,84 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
                                   uint64_t write_gen, uint64_t key_id,
                                   uint64_t **out_dropped_paddrs,
                                   size_t *out_n_dropped) {
+    stm_extent_piece one = { .off = off, .len = len, .paddrs = new_paddrs,
+                             .n_paddrs = n_new_paddrs };
+    return stm_extent_overwrite_pieces(idx, dataset_id, ino, &one, 1u,
+                                       write_gen, key_id,
+                                       out_dropped_paddrs, out_n_dropped);
+}
+
+static int ex_u64_cmp(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The piece starting at `off`, or n if none does (pieces ascend). */
+static size_t ex_piece_at(const stm_extent_piece *pieces, size_t n,
+                          uint64_t off) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2u;
+        if (pieces[mid].off < off) lo = mid + 1u;
+        else hi = mid;
+    }
+    return (lo < n && pieces[lo].off == off) ? lo : n;
+}
+
+stm_status stm_extent_overwrite_pieces(stm_extent_index *idx,
+                                         uint64_t dataset_id, uint64_t ino,
+                                         const stm_extent_piece *pieces,
+                                         size_t n,
+                                         uint64_t write_gen, uint64_t key_id,
+                                         uint64_t **out_dropped_paddrs,
+                                         size_t *out_n_dropped) {
     if (!out_dropped_paddrs || !out_n_dropped) return STM_EINVAL;
     *out_dropped_paddrs = NULL;
     *out_n_dropped      = 0;
-    if (!idx) return STM_EINVAL;
+    if (!idx || !pieces || n == 0) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
-    if (len == 0) return STM_EINVAL;
-    if (!new_paddrs) return STM_EINVAL;
-    if (!replica_set_is_valid(new_paddrs, n_new_paddrs)) return STM_EINVAL;
-    if (off > UINT64_MAX - len) return STM_EOVERFLOW;
+    size_t total_new = 0;
+    for (size_t k = 0; k < n; k++) {
+        const stm_extent_piece *pc = &pieces[k];
+        if (pc->len == 0) return STM_EINVAL;
+        if (!pc->paddrs) return STM_EINVAL;
+        if (!replica_set_is_valid(pc->paddrs, pc->n_paddrs)) return STM_EINVAL;
+        if (pc->off > UINT64_MAX - pc->len) return STM_EOVERFLOW;
+        if (k > 0 && pc->off != pieces[k - 1].off + pieces[k - 1].len)
+            return STM_EINVAL;
+        total_new += pc->n_paddrs;
+    }
+    const uint64_t off = pieces[0].off;
+    const uint64_t len = pieces[n - 1].off + pieces[n - 1].len - off;
+
+    /* Every new block, flattened: checked against itself (no block in two
+     * pieces) and against every other record in the pool. */
+    uint64_t *new_paddrs = malloc(total_new * sizeof *new_paddrs);
+    if (!new_paddrs) return STM_ENOMEM;
+    size_t ni = 0;
+    for (size_t k = 0; k < n; k++)
+        for (size_t r = 0; r < pieces[k].n_paddrs; r++)
+            new_paddrs[ni++] = pieces[k].paddrs[r];
+    if (n > 1u) {
+        qsort(new_paddrs, total_new, sizeof *new_paddrs, ex_u64_cmp);
+        for (size_t i = 1; i < total_new; i++) {
+            if (new_paddrs[i] == new_paddrs[i - 1]) {
+                free(new_paddrs);
+                return STM_EINVAL;
+            }
+        }
+    }
 
     must_lock(&idx->lock);
     if (idx->ds_idx == NULL) {
         must_unlock(&idx->lock);
+        free(new_paddrs);
         return STM_EINVAL;
     }
 
     if (write_gen > idx->current_txg) {
         must_unlock(&idx->lock);
+        free(new_paddrs);
         return STM_EINVAL;
     }
 
@@ -1005,6 +1065,7 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
     stm_status cs = ex_collect_in_ino_locked(idx, dataset_id, ino, &c);
     if (cs != STM_OK) {
         must_unlock(&idx->lock);
+        free(new_paddrs);
         return cs;
     }
 
@@ -1013,11 +1074,12 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
     for (size_t i = 0; i < c.n; i++) {
         const stm_extent_record *e = &c.records[i];
         if (!ranges_overlap(e->off, e->len, off, len)) continue;
-        for (size_t k = 0; k < n_new_paddrs; k++) {
+        for (size_t k = 0; k < total_new; k++) {
             for (uint8_t r = 0; r < e->n_replicas; r++) {
                 if (e->paddrs[r] == new_paddrs[k]) {
                     ex_collect_free(&c);
                     must_unlock(&idx->lock);
+                    free(new_paddrs);
                     return STM_EINVAL;
                 }
             }
@@ -1039,6 +1101,7 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         if (!skip_keys) {
             ex_collect_free(&c);
             must_unlock(&idx->lock);
+            free(new_paddrs);
             return STM_ENOMEM;
         }
         size_t ski = 0;
@@ -1055,17 +1118,17 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
     /* Cross-pool paddr-uniqueness scan with skip set. */
     bool collision = false;
     stm_status ps = any_paddr_in_use_global_locked(idx, new_paddrs,
-                                                    n_new_paddrs,
+                                                    total_new,
                                                     skip_keys, n_drops,
                                                     &collision);
+    free(skip_keys);
+    free(new_paddrs);
     if (ps != STM_OK || collision) {
-        free(skip_keys);
         ex_collect_free(&c);
         must_unlock(&idx->lock);
         if (ps != STM_OK) return ps;
         return STM_EEXIST;
     }
-    free(skip_keys);
 
     uint64_t *out_buf = NULL;
     if (total_drops > 0) {
@@ -1095,22 +1158,31 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         drop_offs_idx[drop_cursor++] = i;
     }
 
-    stm_extent_record rec = {
-        .dataset_id = dataset_id, .ino = ino,
-        .off = off, .len = len,
-        .kind       = STM_EXTENT_KIND_HOT,
-        .n_replicas = (uint8_t)n_new_paddrs,
-        .gen = write_gen,
-        .key_id = key_id,
-        .origin_dataset_id = dataset_id,
-        .origin_ino        = ino,
-        .origin_off        = off,
-        .link_gen          = write_gen,
-    };
-    for (size_t i = 0; i < n_new_paddrs; i++) rec.paddrs[i] = new_paddrs[i];
-
-    stm_status pr = ex_engine_put(idx, &rec);
-    if (pr != STM_OK) {
+    /* The puts go first, each replacing the record at its offset if any;
+     * then the other overlapped records are deleted. After the first put
+     * the index has changed: a later failure answers STM_EWEDGED with the
+     * blocks of the records that did go. */
+    size_t n_put = 0;
+    stm_status pr = STM_OK;
+    for (; n_put < n; n_put++) {
+        const stm_extent_piece *pc = &pieces[n_put];
+        stm_extent_record rec = {
+            .dataset_id = dataset_id, .ino = ino,
+            .off = pc->off, .len = pc->len,
+            .kind       = STM_EXTENT_KIND_HOT,
+            .n_replicas = (uint8_t)pc->n_paddrs,
+            .gen = write_gen,
+            .key_id = key_id,
+            .origin_dataset_id = dataset_id,
+            .origin_ino        = ino,
+            .origin_off        = pc->off,
+            .link_gen          = write_gen,
+        };
+        for (size_t i = 0; i < pc->n_paddrs; i++) rec.paddrs[i] = pc->paddrs[i];
+        pr = ex_engine_put(idx, &rec);
+        if (pr != STM_OK) break;
+    }
+    if (pr != STM_OK && n_put == 0) {
         free(out_buf);
         free(drop_offs_idx);
         ex_collect_free(&c);
@@ -1118,14 +1190,15 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         return pr;
     }
 
-    /* The put replaced the record at `off`, if any; delete the others. A
-     * delete that fails leaves its record overlapping the new one: the
-     * index has changed and is not whole, so answer STM_EWEDGED with the
-     * blocks of the records that did go. */
-    stm_status last_ds = STM_OK;
+    stm_status last_ds = pr;
     for (size_t i = 0; i < n_drops; i++) {
         const stm_extent_record *e = &c.records[drop_offs_idx[i]];
-        if (e->off != off) {
+        size_t at = ex_piece_at(pieces, n, e->off);
+        if (at < n_put) {
+            /* replaced by a put */
+        } else if (pr != STM_OK) {
+            continue;     /* the puts stopped: delete nothing more */
+        } else {
             stm_status ds = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
             if (ds != STM_OK) { last_ds = ds; continue; }
         }

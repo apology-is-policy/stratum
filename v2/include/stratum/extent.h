@@ -388,6 +388,36 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
                                   uint64_t **out_dropped_paddrs,
                                   size_t *out_n_dropped);
 
+/* One record of a pieced overwrite: [off, off+len) on `paddrs`. */
+typedef struct {
+    uint64_t        off;
+    uint64_t        len;
+    const uint64_t *paddrs;
+    size_t          n_paddrs;
+} stm_extent_piece;
+
+/*
+ * stm_extent_overwrite with the new data in `n` records: pieces[0..n)
+ * lie end to end in ascending order, and together they replace every
+ * live extent of (ds, ino) overlapping their union, in one hold of the
+ * index lock. The checks of stm_extent_overwrite apply to every piece,
+ * and no block may appear in two. As stm_extent_overwrite: the out-args
+ * hold the blocks of every record that went; a failure before the first
+ * record went answers its cause with the index unchanged, one after
+ * answers STM_EWEDGED.
+ *
+ * Models extent.tla::Overwrite once per piece: the pieces are disjoint,
+ * so the end state is the same.
+ */
+STM_MUST_USE
+stm_status stm_extent_overwrite_pieces(stm_extent_index *idx,
+                                         uint64_t dataset_id, uint64_t ino,
+                                         const stm_extent_piece *pieces,
+                                         size_t n,
+                                         uint64_t write_gen, uint64_t key_id,
+                                         uint64_t **out_dropped_paddrs,
+                                         size_t *out_n_dropped);
+
 /*
  * Truncate (ds, ino) to `new_size` bytes: drop every live extent
  * whose off ≥ new_size. Partial-extent shrinking (an extent crossing

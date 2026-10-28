@@ -34,6 +34,7 @@
 #include <stratum/dataset.h>
 #include <stratum/ebr.h>
 #include <stratum/extent.h>
+#include <stratum/extent_testing.h>
 #include <stratum/types.h>
 
 #include <pthread.h>
@@ -1669,6 +1670,117 @@ STM_TEST(ex_cf2d_put_funnel_retries_injected_ebusy) {
     STM_ASSERT_EQ(cnt, (size_t)1);
 
     ex_test_idx_close(idx);
+}
+
+/* A pieced overwrite replaces every record its union overlaps, one put
+ * per piece; a piece at an old record's offset replaces it in place. */
+STM_TEST(ex_overwrite_pieces_replaces_the_union_in_one_step) {
+    const uint64_t K = 4096u;
+    stm_extent_index *idx = ex_test_idx(0);
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 2u * K, 0xA0, 0));
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 2u * K, 2u * K, 0xB0, 0));
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 4u * K, 2u * K, 0xC0, 0));
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 8u * K, K, 0xD0, 0));
+    uint64_t p0[] = { 0x100 }, p1[] = { 0x101 }, p2[] = { 0x102 };
+    stm_extent_piece pc[] = { { 0, K, p0, 1 }, { K, 2u * K, p1, 1 },
+                              { 3u * K, 3u * K, p2, 1 } };
+    uint64_t *dropped = NULL;
+    size_t n_dropped = 0;
+    STM_ASSERT_OK(stm_extent_overwrite_pieces(idx, 1, 1, pc, 3, 0, 0,
+                                              &dropped, &n_dropped));
+    STM_ASSERT_EQ(n_dropped, (size_t)3);
+    bool a = false, b = false, c = false;
+    for (size_t i = 0; i < n_dropped; i++) {
+        a = a || dropped[i] == 0xA0;
+        b = b || dropped[i] == 0xB0;
+        c = c || dropped[i] == 0xC0;
+    }
+    STM_ASSERT(a && b && c);
+    free(dropped);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &n));
+    STM_ASSERT_EQ(n, (size_t)4);
+    stm_extent_record e;
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 0, &e));
+    STM_ASSERT_EQ(e.len, K);
+    STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0x100);
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 2u * K, &e));
+    STM_ASSERT_EQ(e.off, K);
+    STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0x101);
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 5u * K, &e));
+    STM_ASSERT_EQ(e.off, 3u * K);
+    STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0x102);
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 8u * K, &e));
+    STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xD0);
+    ex_test_idx_close(idx);
+}
+
+/* Pieces with a gap between them, or a block in two of them, are refused
+ * with the index unchanged. */
+STM_TEST(ex_overwrite_pieces_refuses_a_gap_or_a_shared_block) {
+    const uint64_t K = 4096u;
+    stm_extent_index *idx = ex_test_idx(0);
+    STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 2u * K, 0xA0, 0));
+    uint64_t p0[] = { 0x100 }, p1[] = { 0x101 };
+    stm_extent_piece gap[] = { { 0, K, p0, 1 }, { 2u * K, K, p1, 1 } };
+    stm_extent_piece shared[] = { { 0, K, p0, 1 }, { K, K, p0, 1 } };
+    uint64_t *dropped = NULL;
+    size_t n_dropped = 0;
+    STM_ASSERT_ERR(stm_extent_overwrite_pieces(idx, 1, 1, gap, 2, 0, 0,
+                                               &dropped, &n_dropped),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_extent_overwrite_pieces(idx, 1, 1, shared, 2, 0, 0,
+                                               &dropped, &n_dropped),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(n_dropped, (size_t)0);
+    stm_extent_record e;
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, K, &e));
+    STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xA0);
+    STM_ASSERT_EQ(e.len, 2u * K);
+    ex_test_idx_close(idx);
+}
+
+/* A pieced overwrite failing part way: its first put failing changes
+ * nothing; a later put or a delete failing answers STM_EWEDGED with the
+ * blocks of the records that went. */
+STM_TEST(ex_overwrite_pieces_failing_part_way_answers_ewedged) {
+    const uint64_t K = 4096u;
+    for (int leg = 0; leg < 3; leg++) {
+        stm_extent_index *idx = ex_test_idx(0);
+        STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 0, 2u * K, 0xA0, 0));
+        STM_ASSERT_OK(EX_WRITE1(idx, 1, 1, 2u * K, 2u * K, 0xB0, 0));
+        uint64_t p0[] = { 0x100 }, p1[] = { 0x101 };
+        stm_extent_piece pc[] = { { 0, K, p0, 1 }, { K, 3u * K, p1, 1 } };
+        if (leg == 0) stm_extent_fail_next_put_for_test(idx, 1u, STM_ENOMEM);
+        if (leg == 1) stm_extent_fail_next_put_for_test(idx, 2u, STM_ENOMEM);
+        if (leg == 2)
+            stm_extent_fail_next_delete_for_test(idx, 1u, STM_ENOMEM);
+        uint64_t *dropped = NULL;
+        size_t n_dropped = 0;
+        stm_status rc = stm_extent_overwrite_pieces(idx, 1, 1, pc, 2, 0, 0,
+                                                    &dropped, &n_dropped);
+        stm_extent_record e;
+        if (leg == 0) {
+            STM_ASSERT_ERR(rc, STM_ENOMEM);
+            STM_ASSERT_EQ(n_dropped, (size_t)0);
+            STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 0, &e));
+            STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xA0);
+        } else {
+            /* The first piece replaced A in place; B did not go. */
+            STM_ASSERT_ERR(rc, STM_EWEDGED);
+            STM_ASSERT_EQ(n_dropped, (size_t)1);
+            if (n_dropped == 1u)
+                STM_ASSERT_EQ(dropped[0], (uint64_t)0xA0);
+            STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 0, &e));
+            STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0x100);
+        }
+        if (leg != 2) {
+            STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 3u * K, &e));
+            STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0xB0);
+        }
+        free(dropped);
+        ex_test_idx_close(idx);
+    }
 }
 
 STM_TEST_MAIN("test_extent_index")

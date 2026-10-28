@@ -1233,6 +1233,16 @@ uint64_t stm_alloc_avail_blocks(const stm_alloc *a)
     return n;
 }
 
+uint64_t stm_alloc_avail_netfree_blocks(const stm_alloc *a)
+{
+    if (!a) return 0;
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    uint64_t n = alloc_room_locked(ma, ALLOC_NETFREE);
+    pthread_mutex_unlock(&ma->lock);
+    return n;
+}
+
 /* ========================================================================= */
 /* Free / ref / commit.                                                       */
 /* ========================================================================= */

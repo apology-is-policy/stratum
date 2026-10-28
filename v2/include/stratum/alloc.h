@@ -318,6 +318,9 @@ uint64_t stm_alloc_slop_blocks(const stm_alloc *a);
  * reservation (net of the drain's blocks in flight) and the slop; free on
  * an unguarded allocator. */
 uint64_t stm_alloc_avail_blocks(const stm_alloc *a);
+/* What a net-free allocation (stm_alloc_reserve_netfree) can still get:
+ * as stm_alloc_avail_blocks, but it keeps only half the slop. */
+uint64_t stm_alloc_avail_netfree_blocks(const stm_alloc *a);
 
 /*
  * Free a previously-reserved range (matched by its starting paddr).

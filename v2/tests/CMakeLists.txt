@@ -57,6 +57,7 @@ stm_add_test(test_sync       test_sync.c)
 stm_add_test(test_fs         test_fs.c       test_fs_common.c)
 stm_add_test(test_fs_phase8  test_fs_phase8.c test_fs_common.c)
 stm_add_test(test_fs_clone   test_fs_clone.c  test_fs_common.c)
+stm_add_test(test_fs_frag    test_fs_frag.c   test_fs_common.c)
 stm_add_test(test_sdarray    test_sdarray.c)
 stm_add_test(test_xor_filter test_xor_filter.c)
 stm_add_test(test_crash_inject test_crash_inject.c)
@@ -213,3 +214,6 @@ set_tests_properties(test_crash_inject PROPERTIES TIMEOUT 300)
 # (1.5x headroom for parallel pressure / sanitizer slowdown).
 set_tests_properties(test_fs        PROPERTIES TIMEOUT 180)
 set_tests_properties(test_fs_phase8 PROPERTIES TIMEOUT 180)
+# test_fs_frag fills and punches a 24 MiB pool per test (~18 s each
+# in a Debug build); 180 s leaves room for the sanitizers.
+set_tests_properties(test_fs_frag   PROPERTIES TIMEOUT 180)
