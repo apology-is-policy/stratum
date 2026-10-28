@@ -2605,10 +2605,12 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
          * under an INLINE inode, which a later truncate to 0 and back up
          * reads as the file's content. */
         stm_status fs1 = STM_ENOSPC;
+        bool buffered = false;
         fs_txn_rd(fs);
         if (aligned_size < (uint64_t)STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
             fs1 = fs_buffer_insert_locked(fs, ds, ino, /*off=*/0u,
                                         (uint64_t)aligned_size, combined);
+            buffered = fs1 == STM_OK;
         }
         if (fs1 != STM_OK) {
             /* Fallback: the pre-F2 synchronous extent write. */
@@ -2643,7 +2645,7 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         fs_stamp_mtime_ctime_now(iv);
         {
             stm_status trs = fs_data_iset_locked(fs, iidx, ds, ino, iv,
-                                                 true);
+                                                 !buffered);
             /* C-2-F2-audit F6: if the set fails the inode stays INLINE
              * while the buffer holds [0, aligned) -- and unlink's cleanup
              * drops ranges only for EXTENT inos, so a reused ino would
@@ -2651,13 +2653,23 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
              * cross-file leak. Drop the ghost ranges here. An extent at 0
              * is no more the INLINE inode's: a truncate to 0 and a cutover
              * with no prefix would read it back. The fallback writes one,
-             * and so can a peer's drain of the buffered range (a writer of
-             * another inode flushing every inode takes no pin of this one),
-             * so the fs wedges on any failure here. */
-            if (trs != STM_OK)
+             * so the set above wedged the fs; a peer's drain of the
+             * buffered range can write one too (a writer of another inode
+             * flushing every inode takes no pin of this one). The drop
+             * waits out a drain in flight, so an extent the index holds
+             * after it is one, and the fs wedges on it; with none the
+             * file is as it was. */
+            if (trs != STM_OK) {
                 stm_dirty_buffer_drop_ino(fs->dirty_buffer, ds, ino);
-            else
+                if (buffered) {
+                    size_t n = 0;
+                    stm_status cs = stm_extent_count_for_ino(
+                        stm_sync_extent_index(fs->sync), ds, ino, &n);
+                    if (cs != STM_OK || n > 0u) fs_mark_wedged_locked(fs);
+                }
+            } else {
                 *out_written = len;
+            }
             fs_txn_rd_end(fs);
             return trs;
         }
@@ -12063,7 +12075,9 @@ stm_status stm_fs_write_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 }
 
 /* An error after some bytes landed is a short write, and so is a write
- * that passes the largest file size: it writes the part below it. */
+ * that passes the largest file size: it writes the part below it. Once the
+ * fs is wedged no commit can take what landed, so the error stands and no
+ * count is reported. */
 static stm_status fs_pwrite(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                             const uint64_t *gen, uint64_t off,
                             const void *buf, size_t len, size_t *out_written)
@@ -12073,7 +12087,12 @@ static stm_status fs_pwrite(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         len = (size_t)(STM_FS_FILE_MAX - off);
     stm_status s = fs_write(fs, dataset_id, ino, gen, off, buf, len,
                             out_written);
-    return *out_written > 0u ? STM_OK : s;
+    if (s == STM_OK || *out_written == 0u) return s;
+    if (atomic_load_explicit(&fs->wedged, memory_order_acquire)) {
+        *out_written = 0;
+        return s;
+    }
+    return STM_OK;
 }
 
 stm_status stm_fs_pwrite(stm_fs *fs, uint64_t dataset_id, uint64_t ino,

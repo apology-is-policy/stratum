@@ -28,10 +28,12 @@
  *
  *   `read_only`: set via mount_opts. Any mutating API entry returns
  *                STM_EROFS.
- *   `wedged`:    set when a catastrophic error has occurred that may
- *                have left on-disk state inconsistent. Any API entry
- *                returns STM_EWEDGED. Callers set this explicitly via
- *                stm_fs_mark_wedged; chunk 7 does not auto-wedge.
+ *   `wedged`:    set when an operation left state no commit may take:
+ *                an index change that failed part way (the sync wedges,
+ *                and its hook wedges the fs), or an inode update that
+ *                failed after the op changed extents. Callers can also
+ *                set it via stm_fs_mark_wedged. Reads, writes and
+ *                stm_fs_commit then return STM_EWEDGED.
  *
  * Thread safety: an internal mutex serializes mutating ops. The same
  * mutex protects stat / lookup reads against concurrent mutation
@@ -231,7 +233,9 @@ stm_status stm_fs_mount(const char *path,
  * chain and frees the handle.
  *
  * Returns the status of the final commit (STM_OK on a RO or wedged
- * unmount since no commit happens).
+ * unmount since no commit happens). A wedged handle's changes since its
+ * last commit are lost; the op that wedged it answered the error, and so
+ * did every read, write and commit after it.
  */
 stm_status stm_fs_unmount(stm_fs *fs);
 
@@ -282,8 +286,9 @@ stm_status stm_fs_commit(stm_fs *fs);
  * through (STM_ENOSPC on a near-full pool, an I/O error) answers the error
  * with a prefix of the range written and the size grown over it.
  * `stm_fs_pwrite` reports that prefix as pwrite(2) does: STM_OK with the
- * count in *out_written, short when it stopped early, and an error only when
- * it wrote nothing. A file ends at or below STM_FS_FILE_MAX: `stm_fs_write`
+ * count in *out_written, short when it stopped early, and an error when it
+ * wrote nothing or when the fs is wedged after it (no commit can take the
+ * prefix then, so *out_written is 0). A file ends at or below STM_FS_FILE_MAX: `stm_fs_write`
  * refuses a write that passes it, and `stm_fs_pwrite` writes the part below
  * it, as write(2) does. An ino the inode index does not hold (the legacy
  * direct-extent seam) takes the extent layer's rules: off and len 4 KiB

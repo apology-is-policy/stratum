@@ -7817,8 +7817,9 @@ STM_TEST(fs_a_range_shift_that_fails_loses_nothing_durable) {
 
 /* The inode update that completes a data op fails. After an extent
  * change the fs wedges, so the image keeps the file as it was, and no
- * stray extent comes back through a later grow; a growing preallocate
- * changed nothing else and only answers its error. */
+ * stray extent comes back through a later grow. A growing preallocate
+ * changed nothing else, nor did a first write to an inline file that only
+ * the buffer took (the failure drops it); each only answers its error. */
 enum { DI_INSERT, DI_PUNCH, DI_TRUNC, DI_WRITE, DI_CUTOVER, DI_TCUT,
        DI_DENSE, DI_BUFFERED, DI_REFLINK, DI_PREALLOC };
 
@@ -7829,7 +7830,7 @@ static void p7b_data_iset_fail_leg(const char *name, int op)
     bool inline_file = (op == DI_CUTOVER || op == DI_TCUT || op == DI_DENSE ||
                         op == DI_BUFFERED || op == DI_REFLINK);
     bool prefix = (op == DI_CUTOVER || op == DI_TCUT || op == DI_BUFFERED);
-    bool want_wedged = (op != DI_PREALLOC);
+    bool want_wedged = (op != DI_PREALLOC && op != DI_BUFFERED);
     make_tmp(name);
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));

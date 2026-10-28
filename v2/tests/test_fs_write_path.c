@@ -671,6 +671,32 @@ STM_TEST(fs_a_punch_whose_drop_fails_part_way_commits_nothing) {
     }
 }
 
+/* A reflink whose second record fails to go in, and whose rollback then
+ * cannot take the first back out, answers the wedge: the fs is wedged, its
+ * commit refused, and after a remount the source is what it was. */
+STM_TEST(fs_a_reflink_whose_rollback_fails_answers_the_wedge) {
+    uint64_t x = 0, y = 0, dir = 0;
+    stm_fs *fs = partial_index_pool("pi_reflink_back", 3u, &x);
+    if (!fs) return;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"y", 1,
+                                     0644u, 0, 0, &y));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_extent_index *eidx = stm_sync_extent_index(stm_fs_sync(fs));
+    stm_extent_fail_next_put_for_test(eidx, 2u, STM_ENOMEM);
+    stm_extent_fail_next_delete_for_test(eidx, 1u, STM_ENOMEM);
+    stm_status rs = stm_fs_reflink(fs, 1, x, 1, y);
+    stm_extent_fail_next_put_for_test(eidx, 0u, STM_OK);
+    stm_extent_fail_next_delete_for_test(eidx, 0u, STM_OK);
+    /* premise: the first record went in and stayed */
+    size_t recs = 0;
+    STM_ASSERT_OK(stm_extent_count_for_ino(eidx, 1, y, &recs));
+    STM_ASSERT_EQ(recs, (size_t)1);
+    partial_index_check(fs, rs, x, 3u);
+}
+
 /* Byte i of a cold-migration pool's file: varied, so the chunker cuts. */
 static uint8_t cold_pat(uint64_t i)
 {
@@ -777,6 +803,44 @@ STM_TEST(fs_a_cold_migration_whose_index_change_fails_part_way_commits_nothing) 
         unlink(g_tmp_path);
         unlink(g_key_path);
     }
+}
+
+/* A truncate that cuts a cold chunk, with cold chunks past the cut, and
+ * whose kept prefix fails to go in answers the error and changes nothing:
+ * the fs is not wedged, and after a remount the file reads back whole. */
+STM_TEST(fs_a_truncate_whose_cut_prefix_fails_keeps_the_file) {
+    const uint64_t MIB = 1024u * 1024u;
+    uint64_t x = 0;
+    stm_fs *fs = cold_pool("cold_cut_fail", MIB, &x);
+    if (!fs) return;
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, x));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_extent_index *eidx = stm_sync_extent_index(stm_fs_sync(fs));
+    const uint64_t cut = MIB / 2u + 4096u;
+    stm_extent_record e;
+    /* premise: the cut lands inside a cold chunk, with cold chunks past it */
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, x, cut, &e));
+    STM_ASSERT_EQ((unsigned)e.kind, (unsigned)STM_EXTENT_KIND_COLD);
+    STM_ASSERT_TRUE(e.off < cut && cut < e.off + e.len);
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, x, 2u * MIB - 4096u, &e));
+    STM_ASSERT_EQ((unsigned)e.kind, (unsigned)STM_EXTENT_KIND_COLD);
+    stm_extent_fail_next_put_for_test(eidx, 1u, STM_ENOMEM);
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, x, cut), STM_ENOMEM);
+    stm_extent_fail_next_put_for_test(eidx, 0u, STM_OK);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(!st.wedged);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (fs) {
+        cold_check_bytes(fs, x, MIB);
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+    unlink(g_tmp_path);
+    unlink(g_key_path);
 }
 
 /* A file whose two contiguous extents were committed in different
@@ -1801,6 +1865,108 @@ STM_TEST(fs_a_short_write_reports_what_landed) {
         STM_ASSERT_EQ(mid_op_byte(fs, x, 4u * MIB - 100u), 0xEE);
         STM_ASSERT_EQ(mid_op_byte(fs, x, 4u * MIB), 0xCD);
         STM_ASSERT_OK(stm_fs_unmount(fs));
+        unlink(g_tmp_path);
+        unlink(g_key_path);
+    }
+    free(big);
+}
+
+/* A pool whose file x is an 8 MiB record of 0x11 at 0, then 2 MiB of 0x22
+ * at 8 MiB and 2 MiB of 0x23 at 10 MiB, committed. */
+static stm_fs *wedge_split_pool(const char *name, uint64_t *out_x)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 128u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return NULL;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                     0644u, 0, 0, out_x));
+    mid_op_put(fs, *out_x, 0, 8u * MIB, 0x11);
+    mid_op_put(fs, *out_x, 8u * MIB, 2u * MIB, 0x22);
+    mid_op_put(fs, *out_x, 10u * MIB, 2u * MIB, 0x23);
+    return fs;
+}
+
+typedef struct {
+    stm_fs *fs;
+    int      reclaims;
+} retry_iset_arm;
+
+static void arm_retry_iset(bool locked, void *arg)
+{
+    retry_iset_arm *a = arg;
+    if (!locked) return;
+    a->reclaims++;
+    stm_fs_fail_next_data_iset_for_test(a->fs, STM_ENOMEM);
+}
+
+/* A short write's prefix stands only while a commit can take it. A direct
+ * write at 7 MiB covers [0, 12 MiB) and splits at 8 MiB: its first piece
+ * lands, and its second wedges the fs when the record at 10 MiB fails to
+ * go out after the piece's own went in. A split write whose second piece
+ * finds no room until a reclaim lands the rest and then fails its inode
+ * update, which wedges the fs with the error it answers. Either way pwrite
+ * answers the error and counts nothing; the first leaves the file as it
+ * was after a remount. */
+STM_TEST(fs_a_short_write_over_a_wedge_counts_nothing) {
+    const uint64_t MIB = 1024u * 1024u;
+    uint8_t *big = malloc(4u * MIB);
+    memset(big, 0x33, 4u * MIB);
+    uint64_t x = 0;
+    size_t n = 1;
+    stm_fs *fs = wedge_split_pool("short_wedge", &x);
+    if (fs) {
+        stm_extent_index *eidx = stm_sync_extent_index(stm_fs_sync(fs));
+        size_t recs = 0;
+        STM_ASSERT_OK(stm_extent_count_for_ino(eidx, 1, x, &recs));
+        STM_ASSERT_EQ(recs, (size_t)3);
+        stm_extent_fail_next_delete_for_test(eidx, 1u, STM_ENOMEM);
+        STM_ASSERT_ERR(stm_fs_pwrite(fs, 1, x, 7u * MIB, big, 4u * MIB, &n),
+                       STM_EWEDGED);
+        stm_extent_fail_next_delete_for_test(eidx, 0u, STM_OK);
+        STM_ASSERT_EQ(n, (size_t)0);
+        stm_fs_stats st = {0};
+        STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+        STM_ASSERT_TRUE(st.wedged);
+        STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+        (void)stm_fs_unmount(fs);
+        stm_fs_mount_opts mopts = rw_mount_opts();
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (fs) {
+            STM_ASSERT_EQ(mid_op_size(fs, x), 12u * MIB);
+            STM_ASSERT_EQ(mid_op_byte(fs, x, 7u * MIB), 0x11);
+            STM_ASSERT_EQ(mid_op_byte(fs, x, 9u * MIB), 0x22);
+            STM_ASSERT_EQ(mid_op_byte(fs, x, 11u * MIB), 0x23);
+            STM_ASSERT_OK(stm_fs_unmount(fs));
+        }
+        unlink(g_tmp_path);
+        unlink(g_key_path);
+    }
+    fs = short_write_pool("short_wedge_retry", 2, &x);
+    if (fs) {
+        retry_iset_arm arm = { fs, 0 };
+        stm_fs_set_reclaim_hook_for_test(fs, arm_retry_iset, &arm);
+        n = 1;
+        STM_ASSERT_ERR(stm_fs_pwrite(fs, 1, x, 8u * MIB - 100u, big, 2u * MIB,
+                                     &n), STM_ENOMEM);
+        stm_fs_set_reclaim_hook_for_test(fs, NULL, NULL);
+        STM_ASSERT_EQ(arm.reclaims, 1);
+        STM_ASSERT_EQ(n, (size_t)0);
+        stm_fs_stats st = {0};
+        STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+        STM_ASSERT_TRUE(st.wedged);
+        (void)stm_fs_unmount(fs);
         unlink(g_tmp_path);
         unlink(g_key_path);
     }

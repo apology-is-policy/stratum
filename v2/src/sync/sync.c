@@ -6239,15 +6239,18 @@ static bool sync_write_room_admits_locked(stm_sync *s, bool netfree,
 }
 
 /* No free run holds the whole write: write it in pieces, each the whole of
- * a free run on device 0, or the rest of the write. A piece of d blocks of
- * data takes d + 1 with its tag, and the last one 1 more where its run is
- * 1 block longer, so one device spends at most 2 blocks per block of data,
- * plus 1: the most the dirty buffer charges a drain. Every other replica
- * takes a run as long as the piece, or 1 longer where that is all it has,
- * so at most 3 per block on a mirror; one that has none hands every run of
- * the piece back and the piece shrinks to its first free run. No piece is cut while the room
- * cannot hold the rest of the write. On failure nothing is held, and
- * nothing is left PENDING. */
+ * a free run on device 0, or the rest of the write. On one device a piece
+ * of d blocks of data takes d + 1 with its tag, and the last one 1 more
+ * where its run is 1 block longer, so the device spends at most 2 blocks
+ * per block of data, plus 1: the most the dirty buffer charges a drain.
+ * Every other replica takes a run as long as the piece, or 1 longer where
+ * that is all it has; one that has none hands every run of the piece back
+ * and the piece shrinks to that replica's first free run, after which
+ * device 0 too may take a run 1 longer than any piece. A piece holds at
+ * least 1 block of data, so on a mirror every device spends at most 3
+ * blocks per block of data. No piece is cut while the room cannot hold
+ * the rest of the write. On failure nothing is held, and nothing is left
+ * PENDING. */
 static stm_status sync_write_reserve_pieces_locked(stm_sync *s, bool netfree,
                                                    uint64_t off, size_t len,
                                                    sync_write_reservation *res)
@@ -8280,6 +8283,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
          * format-break drift) could feed an attacker-controlled
          * malloc size. Mirrors the scrub cb's defensive check. */
         if (rec.len == 0 || rec.len > STM_FS_RECORDSIZE_MAX) {
+            free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
@@ -8287,6 +8291,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         }
         void *plain = malloc(rec.len);
         if (!plain) {
+            free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
@@ -8305,6 +8310,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         if (rs != STM_OK) {
             stm_ct_memzero(plain, rec.len);
             free(plain);
+            free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
@@ -8313,6 +8319,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         if (got != rec.len) {
             stm_ct_memzero(plain, rec.len);
             free(plain);
+            free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
@@ -8326,6 +8333,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         stm_ct_memzero(plain, rec.len);
         free(plain);
         if (ws != STM_OK) {
+            free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
@@ -8721,7 +8729,7 @@ stm_status stm_sync_reflink(stm_sync *s,
                  * stm_cas_deref) capped at cold_bumped. Then a
                  * second pass uses stm_extent_delete_file to drop
                  * the inserted records [0..i) from extent_idx; if
-                 * delete_file fails we wedge. */
+                 * delete_file fails we wedge and answer STM_EWEDGED. */
                 size_t hot_undone  = 0;
                 size_t cold_undone = 0;
                 for (size_t j = 0; j < cx.n; j++) {
@@ -8758,6 +8766,7 @@ stm_status stm_sync_reflink(stm_sync *s,
                     free(dropped);
                     if (del != STM_OK) {
                         sync_wedge_locked(s);
+                        apply_rc = STM_EWEDGED;
                     }
                 }
                 break;

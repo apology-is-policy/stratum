@@ -1481,7 +1481,8 @@ stm_status stm_sync_punch_range(stm_sync *s,
  * is rolled back via stm_alloc_free + every successful extent-tree
  * insert is removed via stm_extent_delete_file (delete_file is the
  * cheapest "drop everything for this dst_ino" given dst_ino was
- * required to be empty at entry).
+ * required to be empty at entry). When that delete fails, the sync
+ * wedges and the call answers STM_EWEDGED.
  *
  * Models extent.tla::Reflink iterated over every (src_dataset_id,
  * src_ino) extent; lock-graph: sync.lock OUTER → extent_idx.lock +

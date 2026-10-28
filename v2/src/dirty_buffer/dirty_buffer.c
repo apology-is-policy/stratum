@@ -286,8 +286,9 @@ static bool ranges_overlap(uint64_t a, uint64_t la,
  * transition-into-buffer change shifted the margin and exposed it.
  * A drain landing on PARTIALLY OVERLAPPED existing extents also rewrites
  * them whole (fs.c fs_write_extent_aligned_locked's covering write). The
- * caller charges those blocks as the insert's extra_blocks; the range
- * carries them, and so does each remnant of it. Left uncharged, a write
+ * caller charges those blocks as the insert's extra_blocks; the inode's
+ * cover entry carries them, for every range inside it and the remnants
+ * of a split. Left uncharged, a write
  * admitted on a near-full pool could never drain, and every commit after
  * it failed. DBUF_RECPIECE
  * mirrors STM_FS_RECORDSIZE_MAX (8 MiB) conservatively: a smaller real
