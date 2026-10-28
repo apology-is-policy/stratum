@@ -160,6 +160,10 @@ struct stm_extent_index {
     unsigned              shift_fail_del;
     unsigned              shift_fail_put;
     stm_status            shift_fail;
+    unsigned              del_fail_n;
+    stm_status            del_fail;
+    unsigned              put_fail_n;
+    stm_status            put_fail;
 #endif
 };
 
@@ -278,6 +282,10 @@ static stm_status ex_engine_get(stm_extent_index *idx,
  * atomic — a failed put never loses the prior value at this key. */
 static stm_status ex_engine_put(stm_extent_index *idx,
                                 const stm_extent_record *r) {
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (idx->put_fail_n != 0u && --idx->put_fail_n == 0u)
+        return idx->put_fail;
+#endif
     stm_btree_engine *eng = NULL;
     stm_status es = ex_get_engine_locked(idx, r->dataset_id, &eng);
     if (es != STM_OK) return es;
@@ -318,6 +326,10 @@ static stm_status ex_engine_put(stm_extent_index *idx,
  * mount as a live extent → data corruption). */
 static stm_status ex_engine_del(stm_extent_index *idx,
                                 uint64_t ds, uint64_t ino, uint64_t off) {
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (idx->del_fail_n != 0u && --idx->del_fail_n == 0u)
+        return idx->del_fail;
+#endif
     stm_btree_engine *eng = NULL;
     stm_status es = ex_get_engine_locked(idx, ds, &eng);
     if (es != STM_OK) return es;
@@ -1081,9 +1093,6 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         const stm_extent_record *e = &c.records[i];
         if (!ranges_overlap(e->off, e->len, off, len)) continue;
         drop_offs_idx[drop_cursor++] = i;
-        for (uint8_t r = 0; r < e->n_replicas; r++) {
-            out_buf[out_idx++] = e->paddrs[r];
-        }
     }
 
     stm_extent_record rec = {
@@ -1109,27 +1118,27 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         return pr;
     }
 
-    /* Delete drops whose key.off differs from the new record's off. */
+    /* The put replaced the record at `off`, if any; delete the others. A
+     * delete that fails leaves its record overlapping the new one: the
+     * index has changed and is not whole, so answer STM_EWEDGED with the
+     * blocks of the records that did go. */
     stm_status last_ds = STM_OK;
     for (size_t i = 0; i < n_drops; i++) {
         const stm_extent_record *e = &c.records[drop_offs_idx[i]];
-        if (e->off == off) continue;
-        stm_status ds = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
-        if (ds != STM_OK) last_ds = ds;
+        if (e->off != off) {
+            stm_status ds = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
+            if (ds != STM_OK) { last_ds = ds; continue; }
+        }
+        for (uint8_t r = 0; r < e->n_replicas; r++)
+            out_buf[out_idx++] = e->paddrs[r];
     }
     free(drop_offs_idx);
     ex_collect_free(&c);
 
-    /* R156 P2-1 carry: out-args contract "NULL on failure". */
-    if (last_ds != STM_OK) {
-        free(out_buf);
-        must_unlock(&idx->lock);
-        return last_ds;
-    }
     *out_dropped_paddrs = out_buf;
     *out_n_dropped      = out_idx;
     must_unlock(&idx->lock);
-    return STM_OK;
+    return last_ds != STM_OK ? STM_EWEDGED : STM_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1188,27 +1197,30 @@ static stm_status drop_by_predicate_locked(stm_extent_index *idx,
         }
     }
 
-    size_t pidx = 0;
+    size_t pidx = 0, gone = 0;
     stm_status last_ds = STM_OK;
     for (size_t i = 0; i < c.n; i++) {
         const stm_extent_record *e = &c.records[i];
         if (!ex_drop_pred_matches(pred, e)) continue;
+        stm_status ds_ = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
+        if (ds_ != STM_OK) { last_ds = ds_; continue; }
+        gone++;
         for (uint8_t r = 0; r < e->n_replicas; r++) {
             paddrs[pidx++] = e->paddrs[r];
         }
-        stm_status ds_ = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
-        if (ds_ != STM_OK) last_ds = ds_;
     }
     ex_collect_free(&c);
 
-    /* R156 P2-1 carry: out-args contract "NULL on failure". */
-    if (last_ds != STM_OK) {
+    /* No record gone: the index is unchanged, and the out-args stay NULL.
+     * Some gone and one not: the drop is half done, so STM_EWEDGED with
+     * the blocks of those that went. */
+    if (last_ds != STM_OK && gone == 0) {
         free(paddrs);
         return last_ds;
     }
     *out_paddrs = paddrs;
     *out_n      = pidx;
-    return STM_OK;
+    return last_ds != STM_OK ? STM_EWEDGED : STM_OK;
 }
 
 static stm_status drop_by_predicate_into_locked(stm_extent_index *idx,
@@ -1242,19 +1254,22 @@ static stm_status drop_by_predicate_into_locked(stm_extent_index *idx,
         return STM_OK;
     }
 
-    size_t pidx = 0;
+    size_t pidx = 0, gone = 0;
     stm_status last_ds = STM_OK;
     for (size_t i = 0; i < n_drops; i++) {
         const stm_extent_record *e = &c.records[drop_idx_buf[i]];
+        stm_status ds_ = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
+        if (ds_ != STM_OK) { last_ds = ds_; continue; }
+        gone++;
         for (uint8_t r = 0; r < e->n_replicas; r++) {
             paddrs_buf[pidx++] = e->paddrs[r];
         }
-        stm_status ds_ = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
-        if (ds_ != STM_OK) last_ds = ds_;
     }
     ex_collect_free(&c);
+    /* As drop_by_predicate_locked: a half-done drop answers STM_EWEDGED. */
     *out_n_dropped = pidx;
-    return last_ds;
+    if (last_ds != STM_OK) return gone == 0 ? last_ds : STM_EWEDGED;
+    return STM_OK;
 }
 
 stm_status stm_extent_truncate(stm_extent_index *idx,
@@ -1859,8 +1874,10 @@ stm_status stm_extent_migrate_to_cold_chunked(
         memcpy(ci.content_hash, chunks[i].content_hash, STM_EXTENT_HASH_LEN);
         stm_status ps = ex_engine_put(idx, &ci);
         if (ps != STM_OK) {
+            /* The first put replaced the HOT record: after it the index
+             * is half migrated. */
             must_unlock(&idx->lock);
-            return ps;
+            return i == 0 ? ps : STM_EWEDGED;
         }
     }
     #undef BUILD_COLD
@@ -2017,24 +2034,22 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
         must_unlock(&idx->lock);
         return STM_ENOMEM;
     }
-    {
-        size_t pi = 0;
-        for (size_t i = 0; i < c.n; i++) {
-            const stm_extent_record *r = &c.records[i];
-            for (uint8_t k = 0; k < r->n_replicas; k++) {
-                dropped[pi++] = r->paddrs[k];
-            }
-        }
-    }
-
+    /* Delete every HOT record, then put the chunks. A failure before any
+     * record went leaves the index unchanged; after, it is half migrated:
+     * STM_EWEDGED, with the blocks of the records that went. */
     stm_status last_status = STM_OK;
+    size_t pi = 0, gone = 0;
     for (size_t i = 0; i < c.n; i++) {
         const stm_extent_record *r = &c.records[i];
         stm_status ds_ = ex_engine_del(idx, r->dataset_id, r->ino, r->off);
-        if (ds_ != STM_OK) last_status = ds_;
+        if (ds_ != STM_OK) { last_status = ds_; continue; }
+        gone++;
+        for (uint8_t k = 0; k < r->n_replicas; k++) {
+            dropped[pi++] = r->paddrs[k];
+        }
     }
 
-    for (size_t i = 0; i < n_chunks; i++) {
+    for (size_t i = 0; i < n_chunks && last_status == STM_OK; i++) {
         stm_extent_record cold_rec;
         memset(&cold_rec, 0, sizeof cold_rec);
         cold_rec.dataset_id        = dataset_id;
@@ -2059,9 +2074,13 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
     ex_collect_free(&c);
     must_unlock(&idx->lock);
 
+    if (last_status != STM_OK && gone == 0) {
+        free(dropped);
+        return last_status;
+    }
     *out_dropped_paddrs   = dropped;
-    *out_n_dropped_paddrs = paddrs_n;
-    return last_status;
+    *out_n_dropped_paddrs = pi;
+    return last_status != STM_OK ? STM_EWEDGED : STM_OK;
 }
 
 stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
@@ -2369,6 +2388,26 @@ void stm_extent_fail_next_shift_for_test(stm_extent_index *idx,
     idx->shift_fail_del = del_n;
     idx->shift_fail_put = put_n;
     idx->shift_fail = fail;
+    must_unlock(&idx->lock);
+}
+
+void stm_extent_fail_next_delete_for_test(stm_extent_index *idx,
+                                          unsigned del_n, stm_status fail)
+{
+    if (!idx) return;
+    must_lock(&idx->lock);
+    idx->del_fail_n = del_n;
+    idx->del_fail = fail;
+    must_unlock(&idx->lock);
+}
+
+void stm_extent_fail_next_put_for_test(stm_extent_index *idx,
+                                       unsigned put_n, stm_status fail)
+{
+    if (!idx) return;
+    must_lock(&idx->lock);
+    idx->put_fail_n = put_n;
+    idx->put_fail = fail;
     must_unlock(&idx->lock);
 }
 #endif

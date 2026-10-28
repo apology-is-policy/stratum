@@ -40,6 +40,20 @@ void stm_extent_set_paddr_walk_hook_for_test(stm_extent_paddr_walk_hook fn,
 void stm_extent_fail_next_shift_for_test(stm_extent_index *idx,
                                          unsigned del_n, unsigned put_n,
                                          stm_status fail);
+
+/*
+ * Make the del_n-th extent-record delete from now on (1-based; 0 for none)
+ * answer `fail` in place of the engine call. One-shot.
+ */
+void stm_extent_fail_next_delete_for_test(stm_extent_index *idx,
+                                          unsigned del_n, stm_status fail);
+
+/*
+ * Make the put_n-th extent-record put from now on (1-based; 0 for none)
+ * answer `fail` in place of the engine call. One-shot.
+ */
+void stm_extent_fail_next_put_for_test(stm_extent_index *idx,
+                                       unsigned put_n, stm_status fail);
 #endif
 
 #ifdef __cplusplus

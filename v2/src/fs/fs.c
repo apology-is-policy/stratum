@@ -1312,6 +1312,16 @@ static void fs_dirty_release(void *user, uint64_t blocks)
     stm_sync_dirty_release(((stm_fs *)user)->sync, blocks);
 }
 
+/* The sync wedged itself (a commit, or a data op whose index change failed
+ * part way): the fs refuses from then on too, so no later write is
+ * acknowledged into a pool that can no longer commit. Runs under the
+ * sync's lock. */
+static void fs_sync_wedged(void *user)
+{
+    atomic_store_explicit(&((stm_fs *)user)->wedged, true,
+                          memory_order_release);
+}
+
 static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
                        stm_alloc *a, stm_sync *sync, bool ro,
                        const char *keyfile_path,
@@ -1434,6 +1444,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
      * with the wait-free readers, which never see fs until fs_new returns). */
     atomic_init(&fs->read_only, ro);
     atomic_init(&fs->wedged, false);
+    if (sync) stm_sync_set_wedge_hook(sync, fs_sync_wedged, fs);
     return fs;
 }
 

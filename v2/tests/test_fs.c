@@ -13056,6 +13056,241 @@ STM_TEST(fs_a_truncate_that_reclaims_moves_an_inline_file_whole) {
     unlink(g_key_path);
 }
 
+/* A pool whose file x holds n 1 MiB extents, the k-th of byte 0x10 + k,
+ * committed. */
+static stm_fs *partial_index_pool(const char *name, unsigned n,
+                                  uint64_t *out_x)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return NULL;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0,
+                                  &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"x", 1,
+                                     0644u, 0, 0, out_x));
+    for (unsigned k = 0; k < n; k++)
+        mid_op_put(fs, *out_x, k * MIB, MIB, (uint8_t)(0x10u + k));
+    return fs;
+}
+
+/* The op answered STM_EWEDGED and none of it commits: the fs is wedged,
+ * its commit refused, and after a remount x is what it was. */
+static void partial_index_check(stm_fs *fs, stm_status op, uint64_t x,
+                                unsigned n)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    STM_ASSERT_ERR(op, STM_EWEDGED);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.wedged);
+    STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+    (void)stm_fs_unmount(fs);
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_EQ(mid_op_size(fs, x), (uint64_t)n * MIB);
+    for (unsigned k = 0; k < n; k++) {
+        STM_ASSERT_EQ(mid_op_byte(fs, x, k * MIB), (uint8_t)(0x10u + k));
+        STM_ASSERT_EQ(mid_op_byte(fs, x, (k + 1u) * MIB - 16u),
+                      (uint8_t)(0x10u + k));
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A write whose index update fails part way -- a record it overlaps left
+ * in, or a block it replaced failing its drop -- commits nothing, and the
+ * blocks the index names stay allocated. */
+STM_TEST(fs_a_write_whose_index_update_fails_part_way_commits_nothing) {
+    const uint64_t MIB = 1024u * 1024u;
+    uint8_t *big = malloc((size_t)(2u * MIB));
+    memset(big, 0x99, (size_t)(2u * MIB));
+    for (int leg = 0; leg < 2; leg++) {
+        uint64_t x = 0;
+        stm_fs *fs = partial_index_pool(leg ? "pi_write_drop" : "pi_write_del",
+                                        2u, &x);
+        if (!fs) break;
+        stm_sync *s = stm_fs_sync(fs);
+        stm_extent_index *eidx = stm_sync_extent_index(s);
+        /* [0, 2 MiB) replaces the record at 0 and deletes the one at 1 MiB */
+        if (leg == 0) stm_extent_fail_next_delete_for_test(eidx, 1u, STM_ENOMEM);
+        else          stm_sync_fail_next_drop_for_test(s, 1u, STM_ENOMEM);
+        stm_status ws = stm_fs_write(fs, 1, x, 0, big, (size_t)(2u * MIB));
+        stm_extent_record e;
+        STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, x, 0, &e));
+        uint64_t length = 0;
+        uint32_t refs = 0;
+        STM_ASSERT_OK(stm_alloc_lookup(stm_sync_alloc(s, stm_paddr_device(e.paddrs[0])),
+                                       e.paddrs[0], &length, &refs));
+        STM_ASSERT_TRUE(refs > 0u);
+        partial_index_check(fs, ws, x, 2u);
+    }
+    free(big);
+}
+
+/* A truncate whose drop fails part way -- the second record's delete, the
+ * first block's drop, or the first delete after the cut extent's prefix was
+ * written -- commits nothing. */
+STM_TEST(fs_a_truncate_whose_drop_fails_part_way_commits_nothing) {
+    const uint64_t MIB = 1024u * 1024u;
+    static const char *const names[3] = {
+        "pi_trunc_del", "pi_trunc_drop", "pi_trunc_cut"
+    };
+    for (int leg = 0; leg < 3; leg++) {
+        uint64_t x = 0;
+        stm_fs *fs = partial_index_pool(names[leg], 3u, &x);
+        if (!fs) break;
+        stm_sync *s = stm_fs_sync(fs);
+        stm_extent_index *eidx = stm_sync_extent_index(s);
+        /* to 1 MiB the records at 1 and 2 MiB go; to 1.5 MiB the one at
+         * 1 MiB is cut to its prefix, a put with no delete, first */
+        if (leg == 0)      stm_extent_fail_next_delete_for_test(eidx, 2u, STM_ENOMEM);
+        else if (leg == 1) stm_sync_fail_next_drop_for_test(s, 1u, STM_ENOMEM);
+        else               stm_extent_fail_next_delete_for_test(eidx, 1u, STM_ENOMEM);
+        uint64_t to = leg == 2 ? 3u * MIB / 2u : MIB;
+        partial_index_check(fs, stm_fs_truncate(fs, 1, x, to), x, 3u);
+    }
+}
+
+/* A hole punched over whole extents whose drop fails part way commits
+ * nothing. */
+STM_TEST(fs_a_punch_whose_drop_fails_part_way_commits_nothing) {
+    const uint64_t MIB = 1024u * 1024u;
+    for (int leg = 0; leg < 2; leg++) {
+        uint64_t x = 0;
+        stm_fs *fs = partial_index_pool(leg ? "pi_punch_drop" : "pi_punch_del",
+                                        3u, &x);
+        if (!fs) break;
+        stm_sync *s = stm_fs_sync(fs);
+        if (leg == 0)
+            stm_extent_fail_next_delete_for_test(stm_sync_extent_index(s), 2u,
+                                                 STM_ENOMEM);
+        else
+            stm_sync_fail_next_drop_for_test(s, 1u, STM_ENOMEM);
+        stm_status ps = stm_fs_fallocate(fs, 1, x, MIB, 2u * MIB,
+                                         STM_FS_FALLOC_FL_PUNCH_HOLE |
+                                         STM_FS_FALLOC_FL_KEEP_SIZE);
+        partial_index_check(fs, ps, x, 3u);
+    }
+}
+
+/* Byte i of a cold-migration pool's file: varied, so the chunker cuts. */
+static uint8_t cold_pat(uint64_t i)
+{
+    uint32_t v = (uint32_t)i * 2654435761u + 0x9e3779b9u;
+    v ^= v >> 15;
+    v *= 2246822519u;
+    v ^= v >> 13;
+    return (uint8_t)(v >> 24);
+}
+
+/* A pool whose file x holds two 1 MiB extents of cold_pat bytes, at 0 and
+ * at `second`, written in one transaction, migrating in 8 KiB chunks. */
+static stm_fs *cold_pool(const char *name, uint64_t second, uint64_t *out_x)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    stm_fs *fs = partial_index_pool(name, 0u, out_x);
+    if (!fs) return NULL;
+    STM_ASSERT_OK(mtc4b_install_test_params(fs));
+    uint8_t *b = malloc((size_t)MIB);
+    for (int k = 0; k < 2; k++) {
+        uint64_t base = k ? second : 0u;
+        for (uint64_t i = 0; i < MIB; i++) b[i] = cold_pat(base + i);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, *out_x, base, b, (size_t)MIB));
+    }
+    free(b);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    return fs;
+}
+
+/* Every byte cold_pool wrote reads back (a read may stop at a chunk). */
+static void cold_check_bytes(stm_fs *fs, uint64_t x, uint64_t second)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    STM_ASSERT_EQ(mid_op_size(fs, x), second + MIB);
+    uint8_t *b = malloc((size_t)MIB);
+    for (int k = 0; k < 2; k++) {
+        uint64_t base = k ? second : 0u;
+        size_t got = 0, bad = 0;
+        while (got < MIB) {
+            size_t n = 0;
+            STM_ASSERT_OK(stm_fs_read(fs, 1, x, base + got, b + got,
+                                      (size_t)MIB - got, &n));
+            if (n == 0) break;
+            got += n;
+        }
+        STM_ASSERT_EQ(got, (size_t)MIB);
+        for (size_t i = 0; i < got; i++) bad += b[i] != cold_pat(base + i);
+        STM_ASSERT_EQ(bad, (size_t)0);
+    }
+    free(b);
+}
+
+/* A cold migration whose index change fails part way commits nothing: the
+ * whole-file path's second delete, first or tenth chunk put, or first
+ * block drop; the per-extent path's second chunk put or first block drop.
+ * Two controls migrate the same files with no fault, in chunks. */
+STM_TEST(fs_a_cold_migration_whose_index_change_fails_part_way_commits_nothing) {
+    const uint64_t MIB = 1024u * 1024u;
+    static const char *const names[8] = {
+        "pi_cold_ok", "pi_cold_del", "pi_cold_put", "pi_cold_put10",
+        "pi_cold_drop", "pi_cold_x_ok", "pi_cold_x_put", "pi_cold_x_drop"
+    };
+    for (int leg = 0; leg < 8; leg++) {
+        /* contiguous extents take the whole-file path; with a hole between
+         * them each extent goes its own way */
+        uint64_t second = leg >= 5 ? 2u * MIB : MIB;
+        uint64_t x = 0;
+        stm_fs *fs = cold_pool(names[leg], second, &x);
+        if (!fs) break;
+        stm_sync *s = stm_fs_sync(fs);
+        stm_extent_index *eidx = stm_sync_extent_index(s);
+        switch (leg) {
+        case 1: stm_extent_fail_next_delete_for_test(eidx, 2u, STM_ENOMEM); break;
+        case 2: stm_extent_fail_next_put_for_test(eidx, 1u, STM_ENOMEM); break;
+        case 3: stm_extent_fail_next_put_for_test(eidx, 10u, STM_ENOMEM); break;
+        case 6: stm_extent_fail_next_put_for_test(eidx, 2u, STM_ENOMEM); break;
+        case 4: case 7: stm_sync_fail_next_drop_for_test(s, 1u, STM_ENOMEM); break;
+        default: break;
+        }
+        stm_status ms = stm_fs_migrate_to_cold(fs, 1, x);
+        stm_fs_mount_opts mopts = rw_mount_opts();
+        if (leg != 0 && leg != 5) {
+            STM_ASSERT_ERR(ms, STM_EWEDGED);
+            stm_fs_stats st = {0};
+            STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+            STM_ASSERT_TRUE(st.wedged);
+            STM_ASSERT_ERR(stm_fs_commit(fs), STM_EWEDGED);
+            (void)stm_fs_unmount(fs);
+        } else {
+            STM_ASSERT_OK(ms);
+            stm_extent_record e;
+            STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, x, 0, &e));
+            STM_ASSERT_EQ((unsigned)e.kind, (unsigned)STM_EXTENT_KIND_COLD);
+            STM_ASSERT_TRUE(e.len < MIB);
+            STM_ASSERT_OK(stm_fs_commit(fs));
+            STM_ASSERT_OK(stm_fs_unmount(fs));
+        }
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (fs) {
+            cold_check_bytes(fs, x, second);
+            STM_ASSERT_OK(stm_fs_unmount(fs));
+        }
+        unlink(g_tmp_path);
+        unlink(g_key_path);
+    }
+}
+
 /* A pool whose only free room is a spare, freed. Layout 0: x is one 0xAB
  * block and the spare 9 MiB, so a write's first 8 MiB piece fits and its
  * next does not. Layout 1: x is 4 MiB of 0xAB then 8 MiB of 0xCD, two

@@ -370,7 +370,11 @@ stm_status stm_extent_write(stm_extent_index *idx,
  *     *out_dropped_paddrs is NULL and *out_n_dropped is 0.
  *
  * On failure, *out_dropped_paddrs is NULL and *out_n_dropped is 0;
- * the index is unchanged.
+ * the index is unchanged -- except STM_EWEDGED: the new record is in and
+ * an overlapped one could not be deleted (a delete prepends a delta in the
+ * engine, which can fail), so the index overlaps. The out-args then hold
+ * the blocks of the records that did go, and the caller must keep the
+ * index from committing.
  *
  * Models extent.tla::Overwrite.
  */
@@ -399,6 +403,8 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
  *
  * Refusals:
  *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - STM_EWEDGED: some records deleted and one not, as
+ *     stm_extent_punch_range.
  */
 STM_MUST_USE
 stm_status stm_extent_truncate(stm_extent_index *idx,
@@ -446,6 +452,8 @@ stm_status stm_extent_truncate_peek(const stm_extent_index *idx,
  *   - len == 0 (STM_EINVAL).
  *   - Crossing extent at boundary (STM_ENOTSUPPORTED).
  *   - STM_ENOMEM if the dropped-paddrs buffer can't grow.
+ *   - STM_EWEDGED: some records deleted and one not; the out-args hold the
+ *     blocks of those that went (as stm_extent_overwrite).
  */
 STM_MUST_USE
 stm_status stm_extent_punch_range(stm_extent_index *idx,
@@ -504,12 +512,11 @@ stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
  * out_n_replicas_total`. Bigger is fine. Smaller surfaces as
  * STM_ERANGE — atomic, the index is unchanged.
  *
- * Atomicity property (R41 P3-1 case (b) closure): if peek-then-
- * allocate-then-into is invoked sequentially under one outer lock
- * (stm_sync_truncate's pattern post-P7-11 single-lock-span),
- * `_into` is fault-free for the cap match: it cannot return
- * STM_ENOMEM because it never allocates. The whole truncate becomes
- * commit-atomic w.r.t. the in-RAM extent_idx.
+ * Peek-then-allocate-then-into under one outer lock (stm_sync_truncate's
+ * pattern) cannot fail for want of a buffer. Each record's delete still
+ * prepends a delta in the engine, which can fail (STM_ENOMEM, or
+ * STM_EBUSY past the retry bound): before any record went the index is
+ * unchanged; after, the call answers STM_EWEDGED.
  *
  * Returns:
  *   STM_OK         — drops committed; *out_n_dropped populated;
@@ -517,6 +524,10 @@ stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
  *                     paddrs in record-then-replica order.
  *   STM_ERANGE     — drop_idx_cap or paddrs_cap insufficient;
  *                     index unchanged; *out_n_dropped = 0.
+ *   STM_EWEDGED    -- some records deleted and one not: the index is half
+ *                     truncated; paddrs_buf[0..*out_n_dropped) holds the
+ *                     blocks of those that went, and the caller must keep
+ *                     the index from committing.
  *   STM_EINVAL     — bad args (NULL idx/buffers/out, zero ds/ino).
  */
 STM_MUST_USE
@@ -820,10 +831,11 @@ typedef struct {
  * Behavior:
  *   - Find the matching HOT extent at (ds, ino, src_off). Verify
  *     existence, kind=HOT, len=src_len. Capture the dropped paddrs.
- *   - Pre-grow records[] capacity to fit n_chunks-1 additional records.
- *     If realloc fails, return STM_ENOMEM (no state change).
- *   - In-place overwrite the src slot with chunks[0] as a COLD record;
- *     append chunks[1..n_chunks-1] as additional COLD records.
+ *   - Put chunks[0] as a COLD record over the src record (the same key),
+ *     then chunks[1..n_chunks-1]. Each put can fail in the engine: the
+ *     first leaves the index unchanged and answers its cause; a later
+ *     one leaves it half migrated and answers STM_EWEDGED, and the
+ *     caller must keep the index from committing.
  *   - Each chunk's record fields:
  *       (ds, ino, off, len) — from chunks[i].
  *       kind = COLD; n_replicas = 0; paddrs = zeros.
@@ -900,10 +912,12 @@ stm_status stm_extent_migrate_to_cold_chunked(
  *   - Validate `chunks[]` tile the same range exactly. Refuse with
  *     STM_EINVAL on tile failure, zero-len chunks, or zero-hash chunks.
  *   - Capture all dropped HOT paddrs into a heap-allocated array.
- *   - Pre-grow records[] if `n_chunks > n_drops` so realloc-failure leaves
- *     the index unchanged. STM_ENOMEM on alloc failure.
- *   - Atomic mutation under idx->lock: remove all matching HOT extents
- *     (swap-erase from records[]), append all new COLD records.
+ *   - Under idx->lock, delete every matching HOT extent, then put every
+ *     new COLD record. A delete or put can fail in the engine: before
+ *     any record went the index is unchanged and the call answers the
+ *     cause (out-args NULL); after, it is half migrated and the call
+ *     answers STM_EWEDGED with the blocks of the HOT records that went,
+ *     and the caller must keep the index from committing.
  *
  * Stamp values for new COLD records:
  *   (ds, ino, off, len) — from chunks[i].

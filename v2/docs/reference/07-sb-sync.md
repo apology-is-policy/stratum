@@ -248,6 +248,16 @@ A failed `stm_sync_commit` is crash-equivalent — fs.c MUST wedge the fs
 and the other mutating calls answer `STM_EWEDGED`, so a committer that
 checked the fs before the wedge cannot commit after it.
 
+The other way round, the sync wedges itself when a data op's index change
+fails part way -- a write, truncate, punch or cold migration that changed
+some records and not another, or released some blocks it no longer names
+and not another -- and answers `STM_EWEDGED`. Before, it answered the cause (`STM_ENOMEM`),
+the fs took that as nothing done, and the next commit took a half change:
+a truncate the caller was told had failed read back as zeros. Every wedge
+calls the hook `stm_sync_set_wedge_hook` sets, from which `stm_fs` sets its
+own flag, so a write after the wedge is refused rather than acknowledged
+into a pool that can no longer commit.
+
 The explicit `stm_bootstrap_commit` at the end of Phase 2 is the
 durable-bitmap barrier. Every engine's flush set node bits in the
 bootstrap bitmap in RAM; that bitmap MUST be made durable strictly

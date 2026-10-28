@@ -264,7 +264,12 @@ overlapping `[off, off+len)`, then inserts the fresh extent. Dropped
 paddrs are returned via `**out_dropped_paddrs` (caller-owned malloc'd
 array; `free()` after routing each through
 `stm_snapshot_index_overwrite_block`). On failure the index is
-unchanged and the out-args are zeroed (`*paddrs = NULL`, `*n = 0`).
+unchanged and the out-args are zeroed (`*paddrs = NULL`, `*n = 0`),
+except `STM_EWEDGED`: a delete prepends a delta in the engine, which can
+fail, and a failure after the new record went in (or, for a truncate or
+punch, after another record went) leaves the index half changed. The
+out-args then hold the blocks of the records that did go, and the sync
+wedges: no commit may take the index.
 
 `Truncate` drops every extent of `(ds, ino)` with `off ≥ new_size`.
 Partial-extent shrinking (an extent CROSSING the boundary) is
@@ -300,7 +305,8 @@ inheritance) — passing dst's live identity instead is the buggy
 "rotates origin" pattern that the spec's
 `BuggyReflinkRotatesOrigin` variant + cfg models.
 
-**P7-12** adds two paired APIs for fault-free truncate composition:
+**P7-12** adds two paired APIs so a truncate never fails for want of a
+buffer:
 
 - `stm_extent_truncate_peek(idx, ds, ino, new_size, *out_n_extents,
   *out_n_replicas_total)` — pure read; counts past-extents + total
@@ -308,10 +314,11 @@ inheritance) — passing dst's live identity instead is the buggy
   subsequent `_into` call needs.
 - `stm_extent_truncate_into(idx, ds, ino, new_size, drop_idx_buf,
   drop_idx_cap, paddrs_buf, paddrs_cap, *out_n_dropped)` — truncate
-  using caller-provided pre-allocated buffers. Never allocates
-  internally. Returns `STM_ERANGE` atomically (no index mutation) if
-  either cap is insufficient. Used by `stm_sync_truncate` to make
-  Phase 3 fault-free, closing R41 P3-1 case (b).
+  using caller-provided pre-allocated buffers. Returns `STM_ERANGE`
+  atomically (no index mutation) if either cap is insufficient, so
+  `stm_sync_truncate` never fails for want of a buffer. Each record's
+  delete can still fail in the engine; after the first record went that
+  answers `STM_EWEDGED`.
 - `stm_extent_shift_range_keys(idx, ds, ino, cutoff, delta, &torn)` — re-keys
   every extent at or above `cutoff` by `delta` without touching its
   blocks (fallocate's COLLAPSE_RANGE and INSERT_RANGE). It deletes
@@ -540,10 +547,14 @@ layout changes.
   recycle paddrs cross-gen without the extent module spuriously
   refusing. Both shapes preserve the load-bearing safety property
   (no two LIVE extents share a paddr).
-- **Atomic Overwrite**: capacity is reserved BEFORE compacting so the
-  post-drop append cannot fail. Without this, a transient out-of-
-  memory between drop and insert would leave the extents removed
-  without the new one in place — atomicity violation.
+- **Overwrite order**: the new record is put first (replacing one at the
+  same offset), then the other overlapped records are deleted, so a
+  failed put changes nothing. A failed delete after the put leaves the
+  new record overlapping the one not deleted; the overwrite answers
+  `STM_EWEDGED` and the sync wedges, keeping the blocks the index names
+  (`fs_a_write_whose_index_update_fails_part_way_commits_nothing`; before,
+  the write freed them, the commit took the index and the pool no longer
+  mounted).
 - **Off-ascending iter**: collect matching record indices, insertion-
   sort by off, dispatch cb. `NoOverlapWithinIno` guarantees off is a
   total order on matching records.
@@ -630,15 +641,16 @@ unrelated to the index API and stays separate.
       COLD records. New `stm_extent_write_cold` inserts a COLD record;
       new `stm_extent_migrate_to_cold` atomically swaps a HOT extent
       for ONE COLD extent at the same coordinates;
-      `stm_extent_migrate_to_cold_chunked` (P7-CAS-4b) atomically
-      swaps a HOT extent for N >= 2 COLD chunks tiling the source
-      range — pre-grows records[] capacity, in-place overwrites the
-      src slot with chunks[0], appends chunks[1..K-1]; `stm_extent_
-      migrate_whole_ino_to_cold` (P7-CAS-17) atomically replaces
-      ALL HOT extents at (ds, ino) with K' COLD chunks tiling the
+      `stm_extent_migrate_to_cold_chunked` (P7-CAS-4b) swaps a HOT
+      extent for N >= 2 COLD chunks tiling the source range -- puts
+      chunks[0] over the src record, then chunks[1..K-1]; `stm_extent_
+      migrate_whole_ino_to_cold` (P7-CAS-17) replaces ALL HOT extents
+      at (ds, ino) with K' COLD chunks tiling the
       union of the source HOT range — refuses STM_ENOTSUPPORTED for
       mixed HOT+COLD inputs (caller falls back to per-extent migrate)
-      or sparse files (non-contiguous HOT extents). Per-chunk
+      or sparse files (non-contiguous HOT extents). Each changes the
+      index one record at a time: a failure after the first change
+      answers `STM_EWEDGED`, and the sync wedges. Per-chunk
       descriptor `stm_extent_cold_chunk { off, len, content_hash[32] }`
       pre-validated to tile [src_off, src_off+src_len) (chunked) or
       [first_off, first_off+total_len) (whole-ino). See

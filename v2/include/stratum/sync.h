@@ -314,6 +314,13 @@ void stm_sync_drain_end(stm_sync *s);
  * still cannot commit after it. NULL is a no-op. */
 void stm_sync_mark_wedged(stm_sync *s);
 
+/* Called, with s->lock held, whenever the handle wedges: by
+ * stm_sync_mark_wedged, or by an op of its own (a commit, or a data op
+ * whose index change failed part way). It may take no lock. stm_fs sets
+ * its own wedged flag from it. NULL clears it. */
+typedef void (*stm_sync_wedge_fn)(void *user);
+void stm_sync_set_wedge_hook(stm_sync *s, stm_sync_wedge_fn fn, void *user);
+
 /*
  * Release the handle. Does NOT commit; callers who need durability
  * must call stm_sync_commit first. Does NOT close the underlying
@@ -1256,6 +1263,10 @@ stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
  * stm_sync_add_dataset_key on a non-root dataset) get STM_ENOENT
  * from write_extent.
  *
+ * An index change that fails part way (a record the extent overlaps
+ * not deleted, or a replaced block's drop failing) wedges the handle
+ * and answers STM_EWEDGED; the blocks the index names stay allocated.
+ *
  * Thread safety: serialized by sync's internal mutex. Composes with
  * sync_commit's idempotent persistence — every commit captures all
  * writes since the prior commit.
@@ -1350,8 +1361,8 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  *     Phase 3) and **R41 P3-2** (same gap, scrub-flavored).
  *   - **P7-12**: pre-allocates Phase 3's working buffers (drop_idx
  *     + paddrs) BEFORE Phase 2's overwrite, via `stm_extent_truncate_
- *     peek`. Phase 3 then calls `stm_extent_truncate_into` which
- *     never allocates, so it cannot fail with STM_ENOMEM. Closes
+ *     peek`. Phase 3 then calls `stm_extent_truncate_into`, which
+ *     needs no buffer of its own. Closes
  *     **R41 P3-1 case (b)** (Phase 3 alloc failure leaves Phase 2's
  *     prefix-shrink committable): on pre-alloc ENOMEM, Phase 2 has
  *     not yet run and the index is unchanged.
@@ -1366,20 +1377,23 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  *     boundary) remains the caller's responsibility — Stratum's sync
  *     layer doesn't model the FS-layer file-handle locks that POSIX
  *     specifies.
- *   - Per-paddr drop-route on Phase 3 is best-effort (R36 P1-1 /
- *     P2-1): a failed `sync_drop_paddr_locked` for a single paddr
- *     surfaces as the function's return value but doesn't abort the
- *     overall truncate — other paddrs continue to drop-route. A
- *     leaked paddr is not a corruption hazard (it's still allocated
- *     in the bitmap; future fsck reconciles).
+ *   - Phase 3's index drop and per-paddr drop-route (R36 P1-1 /
+ *     P2-1) run to the end: a record's delete or a paddr's drop that
+ *     fails doesn't stop the others. With no record gone and no
+ *     prefix written the index is unchanged and that status is
+ *     returned; otherwise the handle wedges and the call answers
+ *     STM_EWEDGED, since a caller reading the failure as nothing done
+ *     would commit a half-truncated file. A leaked paddr is not a
+ *     corruption hazard (it's still allocated in the bitmap).
  *
  * Returns:
  *   STM_OK             — truncate complete.
  *   STM_EINVAL         — bad args (NULL s; ds/ino == 0; new_size
  *                         not block-aligned).
- *   STM_EWEDGED        — sync wedged.
- *   STM_EROFS          — read-only.
- *   STM_ENOMEM / STM_EIO / STM_EBADTAG / ... — bubbled from the
+ *   STM_EWEDGED        -- sync wedged, before or by this call (an
+ *                         index change that failed part way).
+ *   STM_EROFS          -- read-only.
+ *   STM_ENOMEM / STM_EIO / STM_EBADTAG / ... -- bubbled from the
  *                         underlying read+write of the crossing extent
  *                         or the alloc/bdev layer.
  */
@@ -1406,6 +1420,10 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *   - off + len overflows uint64_t (STM_EOVERFLOW).
  *   - Wedged (STM_EWEDGED), read-only (STM_EROFS).
  *   - Any crossing-boundary OR COLD extent (STM_ENOTSUPPORTED).
+ *
+ * An index change that fails part way (some records deleted and one
+ * not, or a dropped block's drop failing) wedges the handle and
+ * answers STM_EWEDGED.
  */
 STM_MUST_USE
 stm_status stm_sync_punch_range(stm_sync *s,

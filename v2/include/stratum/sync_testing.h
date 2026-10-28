@@ -170,6 +170,14 @@ stm_status stm_sync_keyschema_insert_for_test(stm_sync *s,
                                                 size_t wrapped_len,
                                                 const char *corvus_dataset_path,
                                                 size_t corvus_dataset_path_len);
+
+/*
+ * Make the drop_n-th block a data op drops from now on (1-based; 0 for
+ * none) answer `fail` in place of its refcount, dead-list or free step.
+ * One-shot.
+ */
+void stm_sync_fail_next_drop_for_test(stm_sync *s, unsigned drop_n,
+                                      stm_status fail);
 #endif /* STRATUM_BUILD_TESTING_HOOKS */
 
 #ifdef __cplusplus

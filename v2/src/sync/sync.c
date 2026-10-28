@@ -312,6 +312,10 @@ struct stm_sync {
     bool       draining;
     pthread_t  drainer;
 
+    /* Told whenever the handle wedges (stm_sync_set_wedge_hook). */
+    stm_sync_wedge_fn wedge_fn;
+    void             *wedge_user;
+
     /* Cached from pool at open/create time. pool_uuid is pool-wide;
      * device_uuid is device 0's uuid (used by stm_alloc_set_crypt_ctx
      * since alloc remains single-device in P5-2). */
@@ -574,6 +578,8 @@ struct stm_sync {
     void             *read_prepopulate_test_ctx;
     void            (*read_postinsert_test_hook)(void *ctx);
     void             *read_postinsert_test_ctx;
+    unsigned          drop_fail_n;
+    stm_status        drop_fail;
 #endif
 
     /* Durable mirror of ub_main_root / ub_snap_root state, last-
@@ -3701,11 +3707,27 @@ uint64_t stm_sync_pending_free_blocks(stm_sync *s)
     return total;
 }
 
+/* Wedge the handle and tell the hook. Caller holds s->lock. */
+static void sync_wedge_locked(stm_sync *s)
+{
+    s->wedged = true;
+    if (s->wedge_fn) s->wedge_fn(s->wedge_user);
+}
+
+void stm_sync_set_wedge_hook(stm_sync *s, stm_sync_wedge_fn fn, void *user)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->wedge_fn = fn;
+    s->wedge_user = user;
+    pthread_mutex_unlock(&s->lock);
+}
+
 void stm_sync_mark_wedged(stm_sync *s)
 {
     if (!s) return;
     pthread_mutex_lock(&s->lock);
-    s->wedged = true;
+    sync_wedge_locked(s);
     pthread_mutex_unlock(&s->lock);
 }
 
@@ -4407,7 +4429,7 @@ static void replace_rollback_or_wedge(stm_sync *s, uint16_t new_slot,
     stm_pool_unlock_exclusive(s->pool);
     if (rs != STM_OK) {
         pthread_mutex_lock(&s->lock);
-        s->wedged = true;
+        sync_wedge_locked(s);
         pthread_mutex_unlock(&s->lock);
     }
 }
@@ -4635,7 +4657,7 @@ stm_status stm_sync_replace_device_online(
             /* Rollback failed.  Wedge so the next public-API call
              * surfaces the inconsistency instead of compounding. */
             pthread_mutex_lock(&s->lock);
-            s->wedged = true;
+            sync_wedge_locked(s);
             pthread_mutex_unlock(&s->lock);
             return STM_EWEDGED;
         }
@@ -5806,6 +5828,18 @@ static uint64_t sync_dataset_origin_snap_id_locked(const stm_sync *s,
     return entry.origin_snap_id;
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+void stm_sync_fail_next_drop_for_test(stm_sync *s, unsigned drop_n,
+                                      stm_status fail)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->drop_fail_n = drop_n;
+    s->drop_fail = fail;
+    pthread_mutex_unlock(&s->lock);
+}
+#endif
+
 static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t paddr) {
     /* Composes extent.tla::Overwrite-drop with dead_list.tla::OverwriteBlock
      * AND P7-16 reflink refcount semantics:
@@ -5828,6 +5862,9 @@ static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t padd
      * R48 P1-1 documents the C-side relaxation as a forward note that
      * dead_list.tla SHOULD be extended with multi-ref blocks for
      * full coverage of the cohabit world. */
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (s->drop_fail_n != 0u && --s->drop_fail_n == 0u) return s->drop_fail;
+#endif
     uint16_t dev_id = stm_paddr_device(paddr);
     if (dev_id >= STM_POOL_DEVICES_MAX || s->allocs[dev_id] == NULL)
         return STM_EINVAL;
@@ -6295,6 +6332,15 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
                                             len, replicas, n_replicas,
                                             res->write_gen, enc_key_id,
                                             &dropped, &n_dropped);
+    if (os == STM_EWEDGED) {
+        /* The new record is in and an overlapped one is not out: the
+         * index names these replicas, so they stay, and no commit may
+         * take the index. */
+        free(dropped);
+        free(cox.hashes);
+        sync_wedge_locked(s);
+        return STM_EWEDGED;
+    }
     if (os != STM_OK) {
         free(cox.hashes);
         for (size_t j = 0; j < reserved_count; j++)
@@ -6389,7 +6435,14 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
     }
     free(cox.hashes);
 
-    return drop_err;
+    /* The index changed. A block it no longer names whose release,
+     * dead-listing or deref failed is out of step with it, and a caller
+     * that read the failure as nothing done would commit around it. */
+    if (drop_err != STM_OK) {
+        sync_wedge_locked(s);
+        return STM_EWEDGED;
+    }
+    return STM_OK;
 }
 
 /* P7-11: write_extent core, lock-held variant.
@@ -7789,14 +7842,21 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  *   - **R41 P3-1 case (b) — CLOSED (P7-12)**: Phase 4's working
  *     buffers (drop_idx[] + paddrs[]) are now pre-allocated by
  *     stm_sync_truncate via stm_extent_truncate_peek BEFORE Phase 3
- *     runs. Phase 4 calls stm_extent_truncate_into which never
- *     allocates — any ENOMEM surfaces during pre-alloc, before
- *     Phase 3 has touched the extent_idx, leaving the index
- *     unchanged. The peek's count remains accurate at Phase 4 time
+ *     runs. Phase 4 calls stm_extent_truncate_into, which needs no
+ *     buffer of its own: a failure to allocate one surfaces during
+ *     pre-alloc, before Phase 3 has touched the extent_idx, leaving
+ *     the index unchanged. The peek's count remains accurate at Phase 4 time
  *     because Phase 3's stm_sync_write_extent_locked only touches
  *     the crossing extent's range [crossing.off, crossing.off +
  *     crossing.len) ⊂ [0, new_size); past-extents at off ≥ new_size
  *     are untouched.
+ *
+ *   - **Engine deletes**: each record's delete in Phase 4 still
+ *     prepends a delta in the engine, which can fail. With no record
+ *     gone and no prefix written the index is unchanged and that
+ *     status is returned; otherwise the handle wedges and the
+ *     truncate answers STM_EWEDGED. So does a failed drop-route of a
+ *     block the index no longer names.
  *
  *   - **R41 P3-2 — CLOSED (P7-11)**: same single-lock-hold reason
  *     as case (a).
@@ -7879,9 +7939,9 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
      * stm_extent_truncate could fail with STM_ENOMEM after Phase 2
      * had already mutated the extent_idx, leaving a partial in-RAM
      * state committable by the next sync_commit. With pre-alloc,
-     * Phase 3 uses stm_extent_truncate_into which never allocates;
-     * any failure surfaces here BEFORE Phase 2 runs, leaving the
-     * index unchanged.
+     * Phase 3 uses stm_extent_truncate_into, which needs no buffer
+     * of its own; a failure to allocate one surfaces here BEFORE
+     * Phase 2 runs, leaving the index unchanged.
      *
      * Phase 2's stm_sync_write_extent_locked only touches the
      * crossing extent's range (off in [crossing.off, crossing.off+
@@ -8039,13 +8099,11 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         }
     }
 
-    /* Phase 3 (P7-12 fault-free): drop past-extents into the
-     * pre-allocated buffers. By construction this cannot return
-     * STM_ENOMEM — _into never allocates. STM_ERANGE is also
-     * impossible because peek's count is consistent with the
-     * current state (Phase 2's overwrite touched only the crossing
-     * extent's range, leaving past-extents untouched). Any other
-     * status is a programming error. */
+    /* Phase 3: drop past-extents into the pre-allocated buffers.
+     * STM_ERANGE is impossible because peek's count is consistent
+     * with the current state (Phase 2's overwrite touched only the
+     * crossing extent's range, leaving past-extents untouched). A
+     * record's delete in the engine can still fail. */
     size_t n_dropped = 0;
     stm_status ts = stm_extent_truncate_into(s->extent_idx, dataset_id, ino,
                                                 new_size,
@@ -8053,26 +8111,23 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                                 paddrs_buf, past_n_replicas,
                                                 &n_dropped);
     if (ts != STM_OK) {
-        /* R44 P3-2: should not happen post-peek (peek's count is
-         * consistent with current state per the comment block above;
-         * STM_ENOMEM is impossible because _into never allocates;
-         * STM_ERANGE is impossible because the caps came from peek;
-         * STM_EINVAL is impossible because args came from this
-         * function's already-validated locals). If we somehow get
-         * here, propagate the underlying status verbatim — preserves
-         * diagnostic detail rather than translating to STM_ECORRUPT
-         * which would erase context. The atomicity claim above
-         * assumes this branch is unreachable. */
         free(tcox.hashes);
         free(drop_idx_buf);
         free(paddrs_buf);
+        /* A delete in the engine can fail. With no record gone and no
+         * prefix written the index is as it was; otherwise it is half
+         * truncated, and no commit may take it. */
+        if (ts == STM_EWEDGED || has_crossing) {
+            sync_wedge_locked(s);
+            ts = STM_EWEDGED;
+        }
         pthread_mutex_unlock(&s->lock);
         return ts;
     }
 
-    /* Drop-route every past-extent's paddrs. Best-effort: a failed
-     * sync_drop_paddr_locked for one paddr surfaces in the return
-     * value but doesn't abort the loop (R36 P1-1 / P2-1). */
+    /* Drop-route every past-extent's paddrs. A failed
+     * sync_drop_paddr_locked for one paddr doesn't abort the loop
+     * (R36 P1-1 / P2-1); it wedges below. */
     stm_status drop_err = STM_OK;
     for (size_t i = 0; i < n_dropped; i++) {
         stm_status drs = sync_drop_paddr_locked(s, dataset_id, paddrs_buf[i]);
@@ -8114,6 +8169,12 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     }
     free(tcox.hashes);
 
+    /* As the write's index commit: a failed drop after the index changed
+     * wedges. */
+    if (drop_err != STM_OK) {
+        sync_wedge_locked(s);
+        drop_err = STM_EWEDGED;
+    }
     pthread_mutex_unlock(&s->lock);
     return drop_err;
 }
@@ -8187,6 +8248,13 @@ stm_status stm_sync_punch_range(stm_sync *s,
     stm_status ps = stm_extent_punch_range(eidx, dataset_id, ino,
                                                  off, len,
                                                  &dropped, &n_dropped);
+    if (ps == STM_EWEDGED) {
+        /* Some records went and one did not: no commit may take it. */
+        free(dropped);
+        sync_wedge_locked(s);
+        pthread_mutex_unlock(&s->lock);
+        return STM_EWEDGED;
+    }
     if (ps != STM_OK) {
         pthread_mutex_unlock(&s->lock);
         return ps;
@@ -8199,6 +8267,10 @@ stm_status stm_sync_punch_range(stm_sync *s,
     }
     free(dropped);
 
+    if (drop_err != STM_OK) {
+        sync_wedge_locked(s);
+        drop_err = STM_EWEDGED;
+    }
     pthread_mutex_unlock(&s->lock);
     return drop_err;
 }
@@ -8346,7 +8418,7 @@ stm_status stm_sync_reflink(stm_sync *s,
              * Wedge the fs to prevent subsequent commits from
              * persisting alongside this stale extent. */
             apply_rc = STM_ECORRUPT;
-            s->wedged = true;
+            sync_wedge_locked(s);
             break;
         }
     }
@@ -8440,7 +8512,7 @@ stm_status stm_sync_reflink(stm_sync *s,
                                                                &dropped, &n_drop);
                     free(dropped);
                     if (del != STM_OK) {
-                        s->wedged = true;
+                        sync_wedge_locked(s);
                     }
                 }
                 break;
@@ -8998,6 +9070,15 @@ static stm_status migrate_one_extent_locked(stm_sync *s,
         free(chunks_arr);
     }
 
+    if (ms == STM_EWEDGED) {
+        /* The index names some chunks and no longer the HOT record:
+         * keep the chunks' refs and the record's blocks, and let no
+         * commit take the index. */
+        free(st);
+        free(boundaries);
+        sync_wedge_locked(s);
+        return STM_EWEDGED;
+    }
     if (ms != STM_OK) {
         for (size_t i = 0; i < n_chunks; i++) {
             if (st[i].cas_inserted || st[i].cas_bumped) {
@@ -9020,7 +9101,13 @@ static stm_status migrate_one_extent_locked(stm_sync *s,
                                                    dropped_paddrs[i]);
         if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
     }
-    return drop_err;
+    /* As the write's index commit: a failed drop after the index changed
+     * wedges. */
+    if (drop_err != STM_OK) {
+        sync_wedge_locked(s);
+        return STM_EWEDGED;
+    }
+    return STM_OK;
 }
 
 /* P7-CAS-17 helper: migrate ALL HOT extents at (ds, ino) atomically with
@@ -9240,6 +9327,14 @@ static stm_status migrate_whole_ino_locked(stm_sync *s,
                                                             &n_dropped);
     free(chunks_arr);
 
+    if (ms == STM_EWEDGED) {
+        /* As the per-extent path: keep the refs and the blocks. */
+        free(dropped_paddrs);
+        free(st);
+        free(boundaries);
+        sync_wedge_locked(s);
+        return STM_EWEDGED;
+    }
     if (ms != STM_OK) {
         for (size_t i = 0; i < n_chunks; i++) {
             if (st[i].cas_inserted || st[i].cas_bumped)
@@ -9261,7 +9356,11 @@ static stm_status migrate_whole_ino_locked(stm_sync *s,
         if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
     }
     free(dropped_paddrs);
-    return drop_err;
+    if (drop_err != STM_OK) {
+        sync_wedge_locked(s);
+        return STM_EWEDGED;
+    }
+    return STM_OK;
 }
 
 stm_status stm_sync_migrate_to_cold(stm_sync *s,
