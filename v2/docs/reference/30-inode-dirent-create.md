@@ -183,6 +183,28 @@ full reserve reuses them early once no reader can reach them
 create nothing measurable. Commit-every-1000 is faster than at `5227790`
 because CF-4 B stages one bootstrap COW per commit.
 
+**Re-taken 2026-10-28** at `4678391`, the tip this series lands at: the same
+build flags and knobs, three rounds of it alternating with three of `647f74a`
+in one session, us/file as min-max:
+
+```
+  build                        create       unlink      recreate
+single commit
+  647f74a                    17.4-17.7    17.7-18.5    19.4-19.8
+  4678391                    17.6-18.7    18.9-19.6    20.8-21.2
+commit every 1000 files
+  647f74a                    37.2-38.7    17.8-18.3    33.4-35.4
+  4678391                    37.2-38.0    19.0-19.5    36.0-37.5
+```
+
+`647f74a` reads within about half a microsecond of its ranges above. At the
+tip a create on a fresh number costs the same; the unlink and the recreate
+cost about 6% more, with their ranges apart. That was not bisected. On those
+two paths the series adds the cleanup of a freed inode's records: the free
+drops them, and a create that reuses a number first clears any xattrs,
+directory entries and extents still keyed to it (`fs_clean_reused_ino_locked`),
+which a fresh number skips.
+
 **S-2 — per-commit metadata amplification (NOT the S-1 fix; tracked seam).**
 Committing *frequently* re-COWs the growing metadata tree each commit:
 commit-every-2000 runs ~125 µs/file vs ~52 µs/file single-commit (20k files), and
