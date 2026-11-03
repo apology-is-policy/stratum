@@ -239,6 +239,7 @@ static const char *status_explain(stm_status rc)
     case STM_ENODATA:          return "ENODATA: xattr name not present";
     case STM_EPERM:            return "EPERM: operation not permitted";
     case STM_ESTALE:           return "ESTALE: stale handle (file was unlinked or replaced)";
+    case STM_ENOLCK:           return "ENOLCK: the lock table is full";
     case STM_ECORRUPT:         return "ECORRUPT: on-disk integrity check failed";
     case STM_EBADTAG:          return "EBADTAG: AEAD tag verification failed "
                                        "(wrong key or corruption)";

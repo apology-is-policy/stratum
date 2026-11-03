@@ -140,6 +140,12 @@ typedef enum {
      * can route the cache-invalidate-and-retry branch separately
      * from the give-up branch. */
     STM_ESTALE          = -116,   /* stale handle (inode freed or reused)  */
+
+    /* No lock record can be made: the lock table is at its bound
+     * (STM_LOCK_MAX_PER_OWNER / _PER_CLIENT / _RECORDS). POSIX's ENOLCK,
+     * which fcntl(F_SETLK) and F_UNLCK both answer when a record cannot
+     * be allocated. */
+    STM_ENOLCK          =  -37,
 } stm_status;
 
 const char *stm_strerror(stm_status s);

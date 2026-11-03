@@ -426,6 +426,26 @@ static uint32_t build_tlock(uint8_t *req, uint16_t tag, uint32_t fid,
     return sz;
 }
 
+static uint32_t build_tgetlock(uint8_t *req, uint16_t tag, uint32_t fid,
+                               uint8_t type, uint64_t start, uint64_t length,
+                               uint32_t proc_id, const char *cid)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid);     p += 4;
+    *p++ = type;
+    pack_u64(p, start);   p += 8;
+    pack_u64(p, length);  p += 8;
+    pack_u32(p, proc_id); p += 4;
+    uint16_t cl = cid ? (uint16_t)strlen(cid) : 0;
+    pack_u16(p, cl); p += 2;
+    if (cl) { memcpy(p, cid, cl); p += cl; }
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TGETLOCK;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
 static uint32_t build_tbind(uint8_t *req, uint16_t tag,
                              uint32_t sfid, const char *name, uint8_t mode)
 {
@@ -812,6 +832,48 @@ STM_TEST(p9_walk_nonexistent_returns_lerror_enoent) {
     STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
     /* Rlerror: ecode[4] — should be ENOENT (2). */
     STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)ENOENT);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+static void wedge_on_fresh(uint64_t ds, uint64_t ino, void *arg)
+{
+    (void)ds; (void)ino;
+    stm_fs_mark_wedged(arg);
+}
+
+/* A lookup that failed is no missing name: a client caches a missing name. */
+STM_TEST(p9_walk_failed_lookup_answers_its_status) {
+    make_tmp("9p_walk_failed_lookup");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    const char *path[] = { "missing" };
+    uint32_t sz = build_twalk(req, 2, 100, 101, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)ENOENT);
+
+    /* The walk's start verifies, and the fs fails under its first lookup. */
+    stm_9p_server_set_fresh_hook(wedge_on_fresh, fs);
+    sz = build_twalk(req, 3, 100, 101, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    stm_9p_server_set_fresh_hook(NULL, NULL);
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)EIO);
 
     free(req); free(resp);
     stm_9p_server_destroy(s);
@@ -2149,6 +2211,166 @@ STM_TEST(p9_lock_acquire_and_release) {
     unlink(g_key_path);
 }
 
+/* A client_id claiming more than the frame holds is a malformed frame. It takes
+ * no lock: read as empty, it would count against no share. */
+STM_TEST(p9_lock_truncated_client_id_refused) {
+    make_tmp("9p_lock_trunc");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlock(req, 2, 101, STM_9P_LOCK_TYPE_WRLCK, 0, 0, 1, 1, "abc");
+    pack_u16(req + 36, 40);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EPROTO);
+
+    /* The control: the same frame, intact. */
+    sz = build_tlock(req, 3, 101, STM_9P_LOCK_TYPE_WRLCK, 0, 0, 1, 1, "abc");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A string claiming more than its frame holds is malformed, whichever message
+ * carries it, and an empty one is not. Each frame's intact twin is the control. */
+STM_TEST(p9_truncated_strings_refused) {
+    make_tmp("9p_trunc_str");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    uint32_t sz = build_tattach(req, 2, 200);   /* uname at 15, aname at 17 */
+    pack_u16(req + 15, 4000);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EPROTO);
+    sz = build_tattach(req, 3, 200);
+    pack_u16(req + 17, 4000);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EPROTO);
+    sz = build_tattach(req, 4, 200);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RATTACH);
+
+    sz = build_tgetlock(req, 5, 101, STM_9P_LOCK_TYPE_WRLCK, 0, 0, 1, "abc");
+    pack_u16(req + 32, 40);                     /* client_id */
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EPROTO);
+    sz = build_tgetlock(req, 6, 101, STM_9P_LOCK_TYPE_WRLCK, 0, 0, 1, "abc");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETLOCK);
+
+    sz = build_txattrwalk(req, 7, 101, 102, "user.x");
+    pack_u16(req + 15, 400);                    /* name */
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EPROTO);
+    sz = build_txattrwalk(req, 8, 101, 102, "user.x");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT(!(resp[4] == STM_9P_RLERROR && load_u32(resp + 7) == STM_9P_ECODE_EPROTO));
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Tlock's client_id decides whose share of the lock table its records count
+ * against: one id's records stop at STM_LOCK_MAX_PER_CLIENT, across fids, and
+ * neither another id nor an empty one is held up by that. */
+STM_TEST(p9_lock_client_id_bound) {
+    make_tmp("9p_lock_client");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    const uint32_t fids = STM_LOCK_MAX_PER_CLIENT / STM_LOCK_MAX_PER_OWNER;
+    for (uint32_t f = 0; f <= fids; f++) walk_to(s, 100, 200 + f, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz;
+    for (uint32_t f = 0; f < fids; f++) {
+        for (uint32_t i = 0; i < STM_LOCK_MAX_PER_OWNER; i++) {
+            sz = build_tlock(req, 2, 200 + f, STM_9P_LOCK_TYPE_RDLCK, 0,
+                             2u * i, 1, 1, "7");
+            STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+            STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+            STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+        }
+    }
+
+    /* A fresh fid, inside its own bound: the identity's share is the limit. */
+    sz = build_tlock(req, 3, 200 + fids, STM_9P_LOCK_TYPE_RDLCK, 0, 0, 1, 1, "7");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOLCK);
+
+    /* The same fid under another id, then under none. */
+    sz = build_tlock(req, 3, 200 + fids, STM_9P_LOCK_TYPE_RDLCK, 0, 0, 1, 1, "8");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+    sz = build_tlock(req, 3, 200 + fids, STM_9P_LOCK_TYPE_RDLCK, 0, 2, 1, 1, "");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    /* An unlock names no one and gives back what it drops. */
+    sz = build_tlock(req, 4, 200, STM_9P_LOCK_TYPE_UNLCK, 0, 0, 1, 1, "");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    sz = build_tlock(req, 5, 200 + fids, STM_9P_LOCK_TYPE_RDLCK, 0, 4, 1, 1, "7");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(p9_lock_blocked_on_conflict) {
     make_tmp("9p_lock_conflict");
     stm_fs_format_opts fopts = default_format_opts();
@@ -2182,6 +2404,153 @@ STM_TEST(p9_lock_blocked_on_conflict) {
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
     STM_ASSERT_EQ(resp[7], STM_9P_LOCK_BLOCKED);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Through the wire: a downgrade admits another fid's read lock, a
+ * two-byte unlock frees two one-byte locks, and Rgetlock answers with
+ * the conflicting lock's own type and range (not the query's). */
+STM_TEST(p9_lock_posix_ranges_and_getlock_reports_the_conflict) {
+    make_tmp("9p_lock_ranges");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+    walk_to(s, 100, 102, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz;
+#define LOCK(fid, ty, st, ln, want) do {                                     \
+        sz = build_tlock(req, 2, (fid), (ty), 0, (st), (ln), 1, "c");         \
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));  \
+        STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);                                \
+        STM_ASSERT_EQ(resp[7], (want));                                      \
+    } while (0)
+    LOCK(101, STM_9P_LOCK_TYPE_WRLCK, 0, 100, STM_9P_LOCK_SUCCESS);
+    LOCK(102, STM_9P_LOCK_TYPE_RDLCK, 0, 100, STM_9P_LOCK_BLOCKED);
+    /* the downgrade replaces fid 101's write lock */
+    LOCK(101, STM_9P_LOCK_TYPE_RDLCK, 0, 100, STM_9P_LOCK_SUCCESS);
+    LOCK(102, STM_9P_LOCK_TYPE_RDLCK, 0, 100, STM_9P_LOCK_SUCCESS);
+    LOCK(102, STM_9P_LOCK_TYPE_UNLCK, 0, 0, STM_9P_LOCK_SUCCESS);
+    /* two one-byte write locks, one two-byte unlock */
+    LOCK(101, STM_9P_LOCK_TYPE_WRLCK, 200, 1, STM_9P_LOCK_SUCCESS);
+    LOCK(101, STM_9P_LOCK_TYPE_WRLCK, 201, 1, STM_9P_LOCK_SUCCESS);
+    LOCK(101, STM_9P_LOCK_TYPE_UNLCK, 200, 2, STM_9P_LOCK_SUCCESS);
+    LOCK(102, STM_9P_LOCK_TYPE_WRLCK, 200, 2, STM_9P_LOCK_SUCCESS);
+#undef LOCK
+    /* fid 101 holds a read lock on [0,100); a write query over [50,150)
+     * from fid 102 reports it as it is */
+    sz = build_tgetlock(req, 3, 102, STM_9P_LOCK_TYPE_WRLCK, 50, 100, 7, "q");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_TYPE_RDLCK);
+    STM_ASSERT_EQ(load_u64(resp + 8), 0u);
+    STM_ASSERT_EQ(load_u64(resp + 16), 100u);
+    /* F_GETLK with F_UNLCK is EINVAL */
+    sz = build_tgetlock(req, 4, 102, STM_9P_LOCK_TYPE_UNLCK, 0, 0, 7, "q");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* An open fid admits exactly one walk: a zero-name clone into a new
+ * fid. The clone is unopened and is a second lock owner on the file;
+ * clunking it drops only its own locks. A named walk from an open fid
+ * and an in-place clone of one stay EINVAL. */
+STM_TEST(p9_open_fid_clones_into_a_second_lock_owner) {
+    make_tmp("9p_open_clone");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz;
+    const char *fname[] = { "f" };
+    sz = build_tlopen(req, 2, 101, STM_9P_O_RDWR);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+
+    /* an in-place clone of the open fid is refused */
+    sz = build_twalk(req, 3, 101, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    /* a named walk from an open directory is refused; the same walk from
+     * the unopened root binds (the control one variable away) */
+    sz = build_twalk(req, 4, 100, 110, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    sz = build_tlopen(req, 5, 110, STM_9P_O_RDONLY);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    sz = build_twalk(req, 6, 110, 111, 1, fname);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+    sz = build_twalk(req, 7, 100, 111, 1, fname);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    STM_ASSERT_EQ(load_u16(resp + 7), 1u);
+
+    /* the clone of the open file binds, unopened */
+    sz = build_twalk(req, 8, 101, 102, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    STM_ASSERT_EQ(load_u16(resp + 7), 0u);
+    sz = build_tread(req, 9, 102, 0, 16);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    sz = build_tread(req, 10, 101, 0, 16);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+
+#define LOCK(fid, ty, st, ln, want) do {                                     \
+        sz = build_tlock(req, 11, (fid), (ty), 0, (st), (ln), 1, "c");        \
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));  \
+        STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);                                \
+        STM_ASSERT_EQ(resp[7], (want));                                      \
+    } while (0)
+    /* the open fid and its clone are two owners */
+    LOCK(101, STM_9P_LOCK_TYPE_WRLCK, 0, 10, STM_9P_LOCK_SUCCESS);
+    LOCK(102, STM_9P_LOCK_TYPE_WRLCK, 0, 10, STM_9P_LOCK_BLOCKED);
+    LOCK(102, STM_9P_LOCK_TYPE_WRLCK, 20, 10, STM_9P_LOCK_SUCCESS);
+    LOCK(101, STM_9P_LOCK_TYPE_RDLCK, 20, 10, STM_9P_LOCK_BLOCKED);
+    /* clunking the clone drops its locks and none of the open fid's */
+    sz = build_tclunk(req, 12, 102);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RCLUNK);
+    LOCK(101, STM_9P_LOCK_TYPE_RDLCK, 20, 10, STM_9P_LOCK_SUCCESS);
+    LOCK(111, STM_9P_LOCK_TYPE_RDLCK, 0, 10, STM_9P_LOCK_BLOCKED);
+#undef LOCK
 
     free(req); free(resp);
     stm_9p_server_destroy(s);
@@ -4751,6 +5120,86 @@ static void wga_make_a_f(stm_9p_server *s)
     free(req); free(resp);
 }
 
+/* A walk stops short only when a name reaches nothing. Any other failure past
+ * the first name answers as itself: a client reads a short reply as a missing
+ * name. The fs fails after the first step, so `second` meets the failure; the
+ * same walk on a healthy fs first shows that it reaches both names. */
+static void walk_fails_past_the_first_name(const char *tmp, bool getattr,
+                                           const char *second, bool bind)
+{
+    make_tmp(tmp);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)root;
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    wga_make_a_f(s);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0, sz;
+    if (bind) {
+        sz = build_tmkdir(req, 70, 100, "b", 0755u, 0u);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RMKDIR);
+        walk_to(s, 100, 101, "b");
+        do_bind(s, 101, "/a/alias");
+    }
+    const char *path[] = { "a", second };
+    sz = getattr
+        ? build_twalkgetattr(req, 2, 100, 102, STM_9P_GETATTR_ALL, 2, path)
+        : build_twalk(req, 2, 100, 102, 2, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], getattr ? STM_9P_RWALKGETATTR : STM_9P_RWALK);
+    STM_ASSERT_EQ(load_u16(resp + 7), 2u);
+    sz = build_tclunk(req, 3, 102);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RCLUNK);
+
+    stm_9p_server_set_step_hook(wedge_on_fresh, fs);
+    sz = getattr
+        ? build_twalkgetattr(req, 4, 100, 102, STM_9P_GETATTR_ALL, 2, path)
+        : build_twalk(req, 4, 100, 102, 2, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    stm_9p_server_set_step_hook(NULL, NULL);
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)EIO);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_walk_lookup_failure_past_the_first_name) {
+    walk_fails_past_the_first_name("9p_walk_fail_name", false, "f", false);
+}
+
+STM_TEST(p9_walk_dot_failure_past_the_first_name) {
+    walk_fails_past_the_first_name("9p_walk_fail_dot", false, ".", false);
+}
+
+STM_TEST(p9_walk_dotdot_failure_past_the_first_name) {
+    walk_fails_past_the_first_name("9p_walk_fail_dotdot", false, "..", false);
+}
+
+STM_TEST(p9_walk_binding_failure_past_the_first_name) {
+    walk_fails_past_the_first_name("9p_walk_fail_bind", false, "alias", true);
+}
+
+STM_TEST(p9_walkgetattr_lookup_failure_past_the_first_name) {
+    walk_fails_past_the_first_name("9p_wga_fail_name", true, "f", false);
+}
+
+STM_TEST(p9_walkgetattr_binding_failure_past_the_first_name) {
+    walk_fails_past_the_first_name("9p_wga_fail_bind", true, "alias", true);
+}
+
 STM_TEST(p9_walkgetattr_parity_and_bind) {
     make_tmp("9p_wga_parity");
     stm_fs_format_opts fopts = default_format_opts();
@@ -4936,7 +5385,7 @@ STM_TEST(p9_walkgetattr_gates) {
     pack_u16(req + 5, 2u);
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
-    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)EPROTO);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EPROTO);
 
     /* An OPEN source fid is rejected EINVAL (h_walk parity). */
     const char *pa[] = { "a" };

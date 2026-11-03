@@ -2032,11 +2032,11 @@ STM_TEST(fs_freed_inode_takes_its_locks_with_it) {
                                         0644u, 0, 0, &y));
     STM_ASSERT_EQ(y, x);
     bool grant = false;
-    uint64_t who = 99;
+    stm_lock_conflict who = { .owner_id = 99 };
     STM_ASSERT_OK(stm_fs_lock_test(fs, 1, y, 202u, STM_FS_LOCK_EXCLUSIVE,
                                       0, 0, &grant, &who));
     STM_ASSERT_TRUE(grant);
-    STM_ASSERT_EQ(who, (uint64_t)0);
+    STM_ASSERT_EQ(who.owner_id, (uint64_t)0);
     STM_ASSERT_OK(stm_fs_lock(fs, 1, y, 202u, STM_FS_LOCK_EXCLUSIVE, 0, 0));
     STM_ASSERT_OK(stm_fs_release_lock_owner(fs, 202u));
     reuse_fs_done(fs);
@@ -2136,7 +2136,7 @@ STM_TEST(fs_if_gen_ops_act_only_on_their_incarnation) {
     uint64_t g = if_gen_gen(fs, x), w = g + 1u;
     const uint8_t *k = (const uint8_t *)"user.k";
     bool grant = false;
-    uint64_t who = 0;
+    stm_lock_conflict who = { 0 };
 
     STM_ASSERT_ERR(stm_fs_write_if_gen(fs, 1, x, w, 0, "XXXX", 4), STM_ESTALE);
     STM_ASSERT_ERR(stm_fs_truncate_if_gen(fs, 1, x, w, 0), STM_ESTALE);
@@ -2149,7 +2149,7 @@ STM_TEST(fs_if_gen_ops_act_only_on_their_incarnation) {
                    STM_ESTALE);
     STM_ASSERT_ERR(stm_fs_fallocate_if_gen(fs, 1, x, w, 0, 64, 0),
                    STM_ESTALE);
-    STM_ASSERT_ERR(stm_fs_lock_if_gen(fs, 1, x, w, 1, STM_FS_LOCK_EXCLUSIVE,
+    STM_ASSERT_ERR(stm_fs_lock_if_gen(fs, 1, x, w, 1, 0u, STM_FS_LOCK_EXCLUSIVE,
                                       0, 0), STM_ESTALE);
     STM_ASSERT_ERR(stm_fs_lock_test_if_gen(fs, 1, x, w, 1,
                                            STM_FS_LOCK_EXCLUSIVE, 0, 0,
@@ -2181,13 +2181,13 @@ STM_TEST(fs_if_gen_ops_act_only_on_their_incarnation) {
     STM_ASSERT_OK(stm_fs_fallocate_if_gen(fs, 1, x, g, 0, 64, 0));
     STM_ASSERT_OK(stm_fs_truncate_if_gen(fs, 1, x, g, 2));
     STM_ASSERT_OK(stm_fs_utimens_if_gen(fs, 1, x, g, 5, 0, 5, 0, 0, 0));
-    STM_ASSERT_OK(stm_fs_lock_if_gen(fs, 1, x, g, 1, STM_FS_LOCK_EXCLUSIVE,
+    STM_ASSERT_OK(stm_fs_lock_if_gen(fs, 1, x, g, 1, 0u, STM_FS_LOCK_EXCLUSIVE,
                                      0, 0));
     STM_ASSERT_OK(stm_fs_lock_test_if_gen(fs, 1, x, g, 2,
                                           STM_FS_LOCK_EXCLUSIVE, 0, 0,
                                           &grant, &who));
     STM_ASSERT_TRUE(!grant);
-    STM_ASSERT_EQ(who, 1u);
+    STM_ASSERT_EQ(who.owner_id, 1u);
     STM_ASSERT_OK(stm_fs_stat(fs, 1, x, &iv));
     STM_ASSERT_EQ(stm_load_le64(iv.si_size), 2u);
     STM_ASSERT_EQ(stm_load_le32(iv.si_mode) & 07777u, 0600u);
@@ -2211,7 +2211,7 @@ STM_TEST(fs_if_gen_ops_act_only_on_their_incarnation) {
     STM_ASSERT_ERR(stm_fs_setxattr_if_gen(fs, 1, x, g, k, 6,
                                           (const uint8_t *)"v", 1, 0, NULL),
                    STM_ESTALE);
-    STM_ASSERT_ERR(stm_fs_lock_if_gen(fs, 1, x, g, 1, STM_FS_LOCK_SHARED, 0, 0),
+    STM_ASSERT_ERR(stm_fs_lock_if_gen(fs, 1, x, g, 1, 0u, STM_FS_LOCK_SHARED, 0, 0),
                    STM_ESTALE);
     STM_ASSERT_ERR(stm_fs_lock_test_if_gen(fs, 1, x, g, 1, STM_FS_LOCK_SHARED,
                                            0, 0, &grant, &who), STM_ESTALE);
@@ -2255,7 +2255,7 @@ STM_TEST(fs_lock_on_a_rolled_back_file_never_refuses_its_successor) {
                                      0644u, 0, 0, &c));
     STM_ASSERT_EQ(c, b);
     bool grant = false;
-    uint64_t who = 0;
+    stm_lock_conflict who = { 0 };
     STM_ASSERT_OK(stm_fs_lock_test(fs, 1, c, 2, STM_FS_LOCK_EXCLUSIVE, 0, 0,
                                    &grant, &who));
     STM_ASSERT_TRUE(grant);
@@ -2928,7 +2928,7 @@ static void rollback_unseeded_leg(bool seed_first)
     STM_ASSERT_ERR(stm_fs_write_if_gen(fs, 1, xi, gx, 0, "STALE!", 6),
                    STM_ESTALE);
     bool grant = false;
-    uint64_t who = 99;
+    stm_lock_conflict who = { .owner_id = 99 };
     STM_ASSERT_OK(stm_fs_lock_test(fs, 1, y, 202u, STM_FS_LOCK_EXCLUSIVE,
                                       0, 0, &grant, &who));
     STM_ASSERT_TRUE(grant);

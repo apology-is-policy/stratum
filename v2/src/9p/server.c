@@ -388,6 +388,7 @@ static uint32_t status_to_errno(stm_status s)
     case STM_ENODATA:          return STM_9P_ECODE_ENODATA;
     case STM_EPERM:            return STM_9P_ECODE_EPERM;
     case STM_ESTALE:           return STM_9P_ECODE_ESTALE;
+    case STM_ENOLCK:           return STM_9P_ECODE_ENOLCK;
     /* Stratum-specific codes fold into POSIX shapes. */
     case STM_ECORRUPT:         return STM_9P_ECODE_EIO;
     case STM_EBADTAG:          return STM_9P_ECODE_EIO;
@@ -1140,14 +1141,14 @@ static stm_status h_version(stm_9p_server *s,
                               uint32_t *resp_len)
 {
     if (body_len < 4)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
 
     uint32_t client_msize = p9l_g32(body);
     const uint8_t *bp = body + 4;
     uint16_t vlen;
     const char *ver = p9l_gstr(&bp, body + body_len, &vlen);
     if (!ver)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
 
     /* We only speak 9P2000.L. If the client requested anything else,
      * reply "unknown" per 9P spec — client should disconnect. */
@@ -1196,7 +1197,7 @@ static stm_status h_attach(stm_9p_server *s,
                              uint32_t *resp_len)
 {
     if (body_len < 8)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
 
     uint32_t fid  = p9l_g32(body);
     /* afid (body+4) ignored — Stratum uses Unix-socket SO_PEERCRED for
@@ -1205,12 +1206,12 @@ static stm_status h_attach(stm_9p_server *s,
     const uint8_t *end = body + body_len;
     uint16_t ulen;
     const char *uname __attribute__((unused)) = p9l_gstr(&bp, end, &ulen);
-    if (!uname && ulen != 0)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+    if (!uname)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
     uint16_t alen;
     const char *aname __attribute__((unused)) = p9l_gstr(&bp, end, &alen);
-    if (!aname && alen != 0)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+    if (!aname)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
 
     /* aname-based namespace composition per ARCH §8.8.1 (P9-9P-2b):
      *   - "" or "/"           → default: root fid points at root
@@ -1496,10 +1497,20 @@ struct walk_cursor {
     size_t   path_len;
 };
 
+/* A name that does not reach anything stops a walk short, 9P's partial walk. Any
+ * other lookup failure says nothing about the name, and answers as itself: a
+ * client caches a missing name. */
+static bool walk_stops_short(stm_status rc)
+{
+    return rc == STM_ENOENT || rc == STM_ENOTDIR || rc == STM_ESTALE ||
+           rc == STM_EINVAL || rc == STM_ENAMETOOLONG;
+}
+
 /* Resolve up to nwname components, advancing *cur and emitting one qid
  * per resolved component into qids (caller-sized for STM_9P_MAX_WALK).
- * Component failures stop the loop (partial walk — *out_nwqid < nwname);
- * a malformed wire string returns STM_EPROTOCOL. consult_bindings
+ * A name that reaches nothing stops the loop (partial walk -- *out_nwqid <
+ * nwname); any other lookup failure, and a malformed wire string
+ * (STM_EPROTOCOL), returns its status. consult_bindings
  * requires s->lock held; the fast path passes false and runs unlocked
  * (it reads only s->fs, which is immutable). ivs_out (optional, NULL
  * from Twalk): the per-step stm_fs_stat value already fetched for the
@@ -1514,6 +1525,7 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
                                      struct stm_inode_value *ivs_out)
 {
     uint16_t nwqid = 0;
+    stm_status rc = STM_OK;
 
     for (uint16_t i = 0; i < nwname; i++) {
         uint16_t slen;
@@ -1528,8 +1540,8 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
         /* Compose the new ns_path. */
         char   new_path[STM_9P_NS_PATH_MAX + 1u];
         size_t new_path_len = 0;
-        stm_status rc = ns_join(cur->path, cur->path_len, name, slen,
-                                  new_path, sizeof new_path, &new_path_len);
+        rc = ns_join(cur->path, cur->path_len, name, slen,
+                     new_path, sizeof new_path, &new_path_len);
         if (rc != STM_OK) break;
 
         uint64_t next_ds  = cur->ds;
@@ -1587,6 +1599,7 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
                                           &next_ino, &next_iv);
             if (rc != STM_OK) {
                 if (rc == STM_ESTALE && nwqid == 0) goto stale;
+                if (!walk_stops_short(rc)) goto failed;
                 break;
             }
             next_ds = croot->ds;
@@ -1601,6 +1614,7 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
                                       &next_ino, &next_iv);
             if (rc != STM_OK) {
                 if (rc == STM_ESTALE && nwqid == 0) goto stale;
+                if (!walk_stops_short(rc)) goto failed;
                 break;
             }
             have_iv = true;
@@ -1615,6 +1629,7 @@ static stm_status walk_components(stm_9p_server *s, bool consult_bindings,
             if (rc == STM_ENOENT && bound) rc = STM_ESTALE;
             if (rc != STM_OK) {
                 if (rc == STM_ESTALE && nwqid == 0) goto stale;
+                if (!walk_stops_short(rc)) goto failed;
                 break;
             }
         }
@@ -1650,12 +1665,16 @@ stale:
     /* The walk's source is no longer the file its fid names. */
     *out_nwqid = 0;
     return STM_ESTALE;
+
+failed:
+    *out_nwqid = 0;
+    return rc;
 }
 
 /* A walk_components failure as an Rlerror ecode. */
 static uint32_t walk_ecode(stm_status wrc)
 {
-    return wrc == STM_ESTALE ? status_to_errno(wrc) : EPROTO;
+    return wrc == STM_EPROTOCOL ? EPROTO : status_to_errno(wrc);
 }
 
 /* One Rgetattr body: valid[8] qid[13] mode[4] uid[4] gid[4] nlink[8]
@@ -1839,7 +1858,7 @@ static stm_status h_walk(stm_9p_server *s,
                            uint32_t *resp_len)
 {
     if (body_len < 10)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
     uint32_t fid    = p9l_g32(body);
     uint32_t newfid = p9l_g32(body + 4);
     uint16_t nwname = p9l_g16(body + 8);
@@ -1864,7 +1883,13 @@ static stm_status h_walk(stm_9p_server *s,
      *       no other handler should mutate them. */
     if (f->kind != P9_FID_NODE)
         return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
-    if (f->is_open)
+    /* An open fid walks nowhere and is never rewound in place. A
+     * zero-name clone into a DISTINCT newfid is admitted: newfid is a
+     * fresh, unopened binding of the same node (fid_alloc), and the
+     * source's open state is only read. It gives a client that has the
+     * file open a second lock owner on it (a process-owned POSIX lock
+     * over this per-fid lock table) without re-resolving a name. */
+    if (f->is_open && (nwname != 0 || newfid == fid))
         return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
 
     /* (a) snapshot the source fid into the walk cursor. The source's
@@ -2013,7 +2038,7 @@ static stm_status h_walkgetattr(stm_9p_server *s,
                                   uint32_t *resp_len)
 {
     if (body_len < 18)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
     uint32_t fid          = p9l_g32(body);
     uint32_t newfid       = p9l_g32(body + 4);
     uint64_t request_mask = p9l_g64(body + 8);
@@ -2120,7 +2145,7 @@ static stm_status h_getattr(stm_9p_server *s,
                               uint32_t *resp_len)
 {
     if (body_len < 12)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
     uint32_t fid          = p9l_g32(body);
     uint64_t request_mask = p9l_g64(body + 4);
 
@@ -3701,11 +3726,25 @@ static stm_status h_fsync(stm_9p_server *s,
 /* type ∈ {RDLCK=0, WRLCK=1, UNLCK=2}.                                     */
 /* For UNLCK: stm_fs_unlock. For RDLCK/WRLCK: stm_fs_lock (non-blocking).  */
 /* If BLOCK flag is set + the acquire fails with EAGAIN, return BLOCKED    */
-/* status (the client retries). client_id passed through advisory; the    */
+/* status (the client retries). client_id names whose share of the lock   */
+/* table the records count against, nothing more; the                     */
 /* server's lock-owner is per-fid (lock_owner_base + fid) — matches OFD-  */
 /* lock semantics (Linux F_OFD_SETLK). v2.1+ may map client_id+proc_id   */
 /* into the owner_id for traditional fcntl semantics (forward-note).      */
 /* ────────────────────────────────────────────────────────────────────── */
+
+/* Tlock's client_id as the key a client's records count under: 0 for none. A
+ * short string the client composes, not a secret, so FNV-1a will do. */
+static uint64_t lock_client_key(const char *cid, uint16_t len)
+{
+    if (!cid || len == 0u) return 0u;
+    uint64_t h = 14695981039346656037ull;
+    for (uint16_t i = 0; i < len; i++) {
+        h ^= (uint8_t)cid[i];
+        h *= 1099511628211ull;
+    }
+    return h ? h : 1u;
+}
 
 static stm_status h_lock(stm_9p_server *s,
                            const uint8_t *body, uint32_t body_len,
@@ -3724,8 +3763,11 @@ static stm_status h_lock(stm_9p_server *s,
     const uint8_t *bp = body + 29;
     const uint8_t *end = body + body_len;
     uint16_t cid_len;
-    const char *cid __attribute__((unused)) = p9l_gstr(&bp, end, &cid_len);
-    /* cid_len == 0 is fine (some clients send empty client_id). */
+    const char *cid = p9l_gstr(&bp, end, &cid_len);
+    if (!cid)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    /* cid_len == 0 is fine (some clients send empty client_id): it counts
+     * against no client's share of the table. */
 
     p9_fid *f = fid_get(s, fid);
     if (!f)
@@ -3752,8 +3794,9 @@ static stm_status h_lock(stm_9p_server *s,
                               ? STM_LOCK_EXCLUSIVE
                               : STM_LOCK_SHARED;
         stm_status rc = stm_fs_lock_if_gen(s->fs, f->dataset_id, f->ino,
-                                           f->cached_gen,
-                                           owner_id, lock_type, start, length);
+                                              f->cached_gen, owner_id,
+                                              lock_client_key(cid, cid_len),
+                                              lock_type, start, length);
         if (rc == STM_EAGAIN) {
             /* Conflict. Per .L: BLOCK flag → return BLOCKED status,
              * client retries. Without BLOCK flag → return BLOCKED too
@@ -3783,8 +3826,9 @@ static stm_status h_lock(stm_9p_server *s,
 /* Tgetlock:  fid[4] type[1] start[8] length[8] proc_id[4] client_id[s]    */
 /* Rgetlock:  type[1] start[8] length[8] proc_id[4] client_id[s]           */
 /*                                                                         */
-/* If a conflicting lock exists, return its details (type ∈ {RD,WR}LCK,    */
-/* the conflicting owner). Otherwise return type=UNLCK with the request's */
+/* If a conflicting lock exists, return its details: its type (RDLCK or   */
+/* WRLCK), its own start and length (0 = to EOF), and the low 32 bits of  */
+/* its owner as proc_id. Otherwise return type=UNLCK with the request's   */
 /* own start/length/proc_id/client_id echoed back.                         */
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -3805,7 +3849,7 @@ static stm_status h_getlock(stm_9p_server *s,
     const uint8_t *end = body + body_len;
     uint16_t cid_len;
     const char *cid = p9l_gstr(&bp, end, &cid_len);
-    if (!cid && cid_len != 0)
+    if (!cid)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
 
     p9_fid *f = fid_get(s, fid);
@@ -3817,32 +3861,39 @@ static stm_status h_getlock(stm_9p_server *s,
     if (vrc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
 
+    /* F_GETLK asks about a read or a write lock; F_UNLCK there is
+     * Linux's EINVAL. */
+    if (type != STM_9P_LOCK_TYPE_RDLCK && type != STM_9P_LOCK_TYPE_WRLCK)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     uint64_t owner_id = fid_owner_id(s, f->fid);
     uint8_t lock_type = (type == STM_9P_LOCK_TYPE_WRLCK)
                           ? STM_LOCK_EXCLUSIVE
                           : STM_LOCK_SHARED;
     bool would_grant = false;
-    uint64_t conflict_owner = 0;
+    stm_lock_conflict conflict;
     stm_status rc = stm_fs_lock_test_if_gen(s->fs, f->dataset_id, f->ino,
                                             f->cached_gen,
                                             owner_id, lock_type, start, length,
-                                            &would_grant, &conflict_owner);
+                                            &would_grant, &conflict);
     if (rc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
 
-    /* If would_grant: type=UNLCK, echo request's start/length/proc_id/cid.
-     * Otherwise: type=RDLCK/WRLCK (we don't track which); use the lock's
-     * own values. We don't track the conflicting lock's start/length —
-     * v2.0 reports the request's range; the conflict_owner is folded
-     * into proc_id for diagnosis. */
+    /* would_grant: type=UNLCK, echo the request's start/length/proc_id/cid.
+     * Otherwise the conflicting lock itself, as F_GETLK reports it; its
+     * owner's low 32 bits (the fid) ride in proc_id for diagnosis. */
     uint8_t out_type = STM_9P_LOCK_TYPE_UNLCK;
     uint64_t out_start = start;
     uint64_t out_length = length;
     uint32_t out_proc_id = proc_id;
     uint16_t out_cid_len = cid_len;
     if (!would_grant) {
-        out_type = STM_9P_LOCK_TYPE_WRLCK;   /* conservative */
-        out_proc_id = (uint32_t)conflict_owner;
+        out_type = (conflict.type == STM_LOCK_EXCLUSIVE)
+                       ? STM_9P_LOCK_TYPE_WRLCK
+                       : STM_9P_LOCK_TYPE_RDLCK;
+        out_start = conflict.off;
+        out_length = (conflict.end == UINT64_MAX) ? 0u
+                                                  : conflict.end - conflict.off;
+        out_proc_id = (uint32_t)conflict.owner_id;
     }
 
     uint32_t need = STM_9P_HDR_SIZE + 1u + 8u + 8u + 4u + 2u + out_cid_len;
@@ -3886,7 +3937,7 @@ static stm_status h_xattrwalk(stm_9p_server *s,
     const uint8_t *end = body + body_len;
     uint16_t nlen;
     const char *name = p9l_gstr(&bp, end, &nlen);
-    if (!name && nlen != 0)
+    if (!name)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
 
     p9_fid *f = fid_get(s, fid);

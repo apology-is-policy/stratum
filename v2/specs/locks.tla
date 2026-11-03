@@ -12,11 +12,16 @@
 \*
 \* Around it: ExclusiveExcludesDifferentOwner (an EXCLUSIVE lock
 \* excludes every other owner's lock at overlapping ranges),
-\* OwnLocksNeverRefuse (an owner may stack or upgrade over its own
+\* OwnLocksNeverRefuse (an owner may upgrade or downgrade over its own
 \* ranges), DifferentInosNeverInteract (a lock on one inode never
-\* refuses an acquire on another), and the action property
-\* DropsAreReleases (a step removes exactly the locks the Release or
-\* ReleaseOwner it took names, and an Acquire removes none).
+\* refuses an acquire on another), OwnRecordsDisjoint (an owner's
+\* records on one inode never overlap), and the action property
+\* HeldBytesExact: after an Acquire the owner holds exactly the asked
+\* type on every byte of the range, after a Release nothing there, after
+\* a ReleaseOwner nothing anywhere, and every other (ino, owner, byte)
+\* holds what it held. That is POSIX's byte-range semantics: a
+\* request replaces what its owner held over its range, splitting a
+\* record it cuts, and a release trims and splits.
 \*
 \* MVP scope:
 \*   - Non-blocking acquire ONLY (Linux F_SETLK shape; F_SETLKW
@@ -24,13 +29,11 @@
 \*     introduces the wait-graph + deadlock-freedom invariant).
 \*   - Each Acquire is atomic — caller checks return code; on
 \*     STM_EAGAIN they may retry or give up.
-\*   - Owner-owned re-lock: the spec allows a single owner to
-\*     hold multiple locks on overlapping ranges (no
-\*     in-table merge / split semantic). The C impl mirrors
-\*     this — keeps each lock as a discrete record. POSIX's
-\*     lock-merge-on-same-owner semantic (replace + split) is a
-\*     forward-note for the eventual blocking + lock-merge
-\*     refinement chunk.
+\*   - Owner-owned re-lock: replace + split, as POSIX. The C impl
+\*     also merges abutting records of one type; merging changes
+\*     only how bytes are grouped into records, which no property
+\*     here reads, so the spec leaves it out (test_locks.c's
+\*     byte-model run checks it).
 \*
 \* An inode here is one incarnation of it: the impl keys records by
 \* (dataset_id, ino, si_gen), so a lock on a freed file and a lock on
@@ -44,7 +47,7 @@
 \*   BuggyOwnerCheckMissing
 \*       Acquire's check ignores the owner: an owner's own
 \*       overlapping exclusive lock refuses its next acquire, so it
-\*       cannot stack or upgrade (POSIX allows both for OFD locks).
+\*       cannot upgrade or downgrade (POSIX allows both).
 \*       Fires OwnLocksNeverRefuse once an owner holds an exclusive
 \*       lock.
 \*
@@ -60,25 +63,37 @@
 \*       incarnation of the same number). Fires
 \*       DifferentInosNeverInteract after one acquire.
 \*
-\* Three more change Release. No invariant can see them, since a removal
-\* never makes a conflict, so the action property DropsAreReleases
+\*   BuggyAcquireStacks
+\*       Acquire adds its record beside the owner's overlapping ones
+\*       instead of replacing them (the earlier table). A downgrade
+\*       then leaves the exclusive record standing. Fires
+\*       OwnRecordsDisjoint at the first overlapping re-lock, and
+\*       HeldBytesExact.
+\*
+\* Four more change Release. No invariant can see them, since a removal
+\* never makes a conflict, so the action property HeldBytesExact
 \* judges them:
 \*
 \*   BuggyReleaseOwnerBlind
 \*       Release drops the matching range of every owner, so one
-\*       owner's unlock frees another's lock. Fires DropsAreReleases
+\*       owner's unlock frees another's lock. Fires HeldBytesExact
 \*       once two owners share a range and one of them releases it.
 \*
 \*   BuggyReleaseInoBlind
 \*       Release drops the owner's matching range on every inode.
-\*       Fires DropsAreReleases once an owner holds the range on two
-\*       inodes and some other lock besides.
+\*       Fires HeldBytesExact once an owner holds the range on two
+\*       inodes.
 \*
 \*   BuggyReleaseDropsNothing
-\*       Release leaves every lock in place. Fires DropsAreReleases at
+\*       Release leaves every lock in place. Fires HeldBytesExact at
 \*       the first release of a held lock: without `last` that step
 \*       would stutter on `locks`, and no property over `locks` alone
 \*       could judge it.
+\*
+\*   BuggyReleaseExactOnly
+\*       Release drops only a record with exactly its range (the earlier
+\*       table), so an unlock of part of a lock, or of two locks
+\*       at once, leaves bytes held. Fires HeldBytesExact.
 
 EXTENDS Integers, FiniteSets, TLC
 
@@ -89,9 +104,11 @@ CONSTANTS
     BuggyOwnerCheckMissing,
     BuggyShared_Excl_Granted,
     BuggyInoBlind,
+    BuggyAcquireStacks,
     BuggyReleaseOwnerBlind,
     BuggyReleaseInoBlind,
-    BuggyReleaseDropsNothing
+    BuggyReleaseDropsNothing,
+    BuggyReleaseExactOnly
 
 ASSUME /\ Inos # {}
        /\ Owners # {}
@@ -99,9 +116,11 @@ ASSUME /\ Inos # {}
        /\ BuggyOwnerCheckMissing  \in BOOLEAN
        /\ BuggyShared_Excl_Granted \in BOOLEAN
        /\ BuggyInoBlind \in BOOLEAN
+       /\ BuggyAcquireStacks \in BOOLEAN
        /\ BuggyReleaseOwnerBlind \in BOOLEAN
        /\ BuggyReleaseInoBlind \in BOOLEAN
        /\ BuggyReleaseDropsNothing \in BOOLEAN
+       /\ BuggyReleaseExactOnly \in BOOLEAN
 
 LockTypes == {"shared", "exclusive"}
 Offsets   == 0..MaxOff
@@ -111,7 +130,7 @@ LockRec ==
     [ino: Inos, owner: Owners, type: LockTypes,
      off: Offsets, len: Lengths]
 
-VARIABLES locks,  \* SUBSET LockRec — currently held lock records
+VARIABLES locks,  \* SUBSET LockRec -- currently held lock records
           last    \* the action the last step took, with its arguments
 
 vars == <<locks, last>>
@@ -150,28 +169,43 @@ AcquireRefuses(cand, other) ==
          ELSE \/ cand.type = "exclusive"
               \/ other.type = "exclusive"
 
-\* Acquire — non-blocking. Adds the candidate iff no existing lock
-\* conflicts with it.
+\* The parts of record r outside [off, off+len): a left piece if r
+\* starts before the range, a right piece if it ends after it.
+Pieces(r, off, len) ==
+    (IF r.off < off
+       THEN {[r EXCEPT !.len = off - r.off]} ELSE {})
+    \cup
+    (IF r.off + r.len > off + len
+       THEN {[r EXCEPT !.off = off + len,
+                       !.len = (r.off + r.len) - (off + len)]} ELSE {})
+
+\* Remove `cut` from locks, keeping each cut record's pieces outside
+\* [off, off+len).
+CutOut(cut, off, len) ==
+    (locks \ cut) \cup UNION { Pieces(r, off, len) : r \in cut }
+
+\* Acquire -- non-blocking. Refused iff another owner's lock conflicts;
+\* otherwise the candidate replaces what its owner held over its range.
 Acquire(ino, owner, type, off, len) ==
     /\ ino \in Inos /\ owner \in Owners /\ type \in LockTypes
     /\ off \in Offsets /\ len \in Lengths
     /\ off + len <= MaxOff + 1
     /\ LET cand == [ino |-> ino, owner |-> owner, type |-> type,
                      off |-> off, len |-> len]
+           mine == { r \in locks : r.owner = owner /\ Overlaps(r, cand) }
        IN
         /\ ~ \E other \in locks : AcquireRefuses(cand, other)
-        /\ locks' = locks \cup {cand}
-        /\ last' = <<"acquire">>
+        /\ locks' = IF BuggyAcquireStacks THEN locks \cup {cand}
+                    ELSE CutOut(mine, off, len) \cup {cand}
+        /\ last' = <<"acquire", ino, owner, type, off, len>>
 
-\* Release — exact-match removal: every lock of the owner on that
-\* range of that ino goes, whatever its type. Callers pass the same
-\* (ino, owner, off, len) as Acquire; range-merge / range-split
-\* semantics are deferred (forward-noted to the future blocking-wait
-\* extension that adds POSIX byte-range merge logic).
+\* Release -- what the owner holds on that range of that ino goes; a
+\* record crossing the range's edge keeps its outside piece.
 \*
-\* The C match (stm_lock_release) omits the gen: it also drops the
-\* owner's identical lock on another incarnation of the number. Nothing
-\* can observe that. A free drops its incarnation's locks, so only an
+\* The C match (stm_lock_release) omits the gen: it also trims the
+\* owner's lock on another incarnation of the number. Only the table's
+\* bounds, which this spec does not model, can observe that. A free drops
+\* its incarnation's locks, so only an
 \* incarnation a rollback discarded can still hold one; its locks refuse
 \* nothing here (another Ino), and its gen never comes back (16-inode's
 \* rollback floors), so no acquire or test ever meets them again.
@@ -180,16 +214,21 @@ ReleaseMatches(l, ino, owner, off, len) ==
        \/ l.ino = ino
     /\ \/ BuggyReleaseOwnerBlind
        \/ l.owner = owner
-    /\ l.off = off /\ l.len = len
+    /\ IF BuggyReleaseExactOnly
+         THEN l.off = off /\ l.len = len
+         ELSE RangesOverlap(l, [off |-> off, len |-> len])
 
 Release(ino, owner, off, len) ==
     /\ ino \in Inos /\ owner \in Owners
     /\ off \in Offsets /\ len \in Lengths
+    /\ off + len <= MaxOff + 1
     /\ locks' = IF BuggyReleaseDropsNothing THEN locks
-                ELSE { l \in locks : ~ReleaseMatches(l, ino, owner, off, len) }
+                ELSE CutOut({ l \in locks :
+                                ReleaseMatches(l, ino, owner, off, len) },
+                            off, len)
     /\ last' = <<"release", ino, owner, off, len>>
 
-\* ReleaseOwner — drop every lock held by the owner. Models the
+\* ReleaseOwner -- drop every lock held by the owner. Models the
 \* post-close cleanup pattern (Linux: when an FD owning OFD locks
 \* is closed, the kernel releases them).
 ReleaseOwner(owner) ==
@@ -214,7 +253,10 @@ Spec == Init /\ [][Next]_vars
 
 TypeOK ==
     /\ locks \subseteq LockRec
-    /\ \/ last \in {<<"init">>, <<"acquire">>}
+    /\ \/ last = <<"init">>
+       \/ \E i \in Inos, o \in Owners, t \in LockTypes,
+             f \in Offsets, n \in Lengths :
+             last = <<"acquire", i, o, t, f, n>>
        \/ \E i \in Inos, o \in Owners, f \in Offsets, n \in Lengths :
              last = <<"release", i, o, f, n>>
        \/ \E o \in Owners : last = <<"owner", o>>
@@ -224,15 +266,9 @@ NoConflictingLocks ==
     \A l1, l2 \in locks :
         l1 # l2 => ~Conflicts(l1, l2)
 
-\* An EXCLUSIVE lock excludes every other lock (across ANY owner)
-\* at overlapping ranges. Stricter than NoConflictingLocks because
-\* the latter allows same-owner overlap; this one fires whenever
-\* an exclusive coexists with anything else overlapping. The C
-\* impl's same-owner-allowed posture means this invariant DOES NOT
-\* hold in healthy mode if we admit same-owner stacking; we either
-\* tighten the spec or strengthen the impl. We adopt the relaxed
-\* stance: same-owner overlap is permitted (POSIX shape) so this
-\* invariant is bundled but conditioned on different-owner.
+\* An EXCLUSIVE lock excludes every other owner's lock at overlapping
+\* ranges. Same-owner overlap is out of scope here (OwnRecordsDisjoint
+\* says it never happens).
 ExclusiveExcludesDifferentOwner ==
     \A excl \in locks :
         excl.type = "exclusive" =>
@@ -241,8 +277,8 @@ ExclusiveExcludesDifferentOwner ==
                        /\ other.owner # excl.owner) =>
             FALSE
 
-\* An owner's own locks never refuse its acquire: it may stack or
-\* upgrade over any range it holds (POSIX OFD locks).
+\* An owner's own locks never refuse its acquire: it may upgrade or
+\* downgrade over any range it holds.
 OwnLocksNeverRefuse ==
     \A l \in locks, t \in LockTypes :
         ~ \E other \in locks :
@@ -255,31 +291,45 @@ DifferentInosNeverInteract ==
     \A l \in locks, c \in LockRec :
         c.ino # l.ino => ~AcquireRefuses(c, l)
 
+\* An owner's records on one ino never overlap: each byte it holds is
+\* held once, with one type.
+OwnRecordsDisjoint ==
+    \A l1, l2 \in locks :
+        (l1 # l2 /\ l1.owner = l2.owner) => ~Overlaps(l1, l2)
+
 Invariants ==
     /\ TypeOK
     /\ NoConflictingLocks
     /\ ExclusiveExcludesDifferentOwner
     /\ OwnLocksNeverRefuse
     /\ DifferentInosNeverInteract
+    /\ OwnRecordsDisjoint
 
 \* --------------------------------------------------------------------------
 \* Action property.
 \* --------------------------------------------------------------------------
 
-\* A step drops exactly what the action it took names: every lock of the
-\* owner on that range of that ino for a Release, every lock of the owner
-\* for a ReleaseOwner, none for an Acquire. `last` names the action, so a
-\* Release that drops another range, or nothing, is a step judged here,
-\* not a stutter. The invariants above cannot see a removal at all.
-DropsAreReleases ==
-    [][ LET gone == locks \ locks' IN
-        CASE last'[1] = "release" ->
-                gone = { l \in locks : /\ l.ino = last'[2]
-                                       /\ l.owner = last'[3]
-                                       /\ l.off = last'[4]
-                                       /\ l.len = last'[5] }
-          [] last'[1] = "owner" ->
-                gone = { l \in locks : l.owner = last'[2] }
-          [] OTHER -> gone = {} ]_vars
+\* The types owner o holds on byte b of ino i: one at most, or none.
+Held(L, i, o, b) ==
+    { r.type : r \in { x \in L : /\ x.ino = i /\ x.owner = o
+                                 /\ x.off <= b /\ b < x.off + x.len } }
+
+InRange(b, off, len) == off <= b /\ b < off + len
+
+\* A step changes exactly the bytes the action it took names, to what
+\* it names: the asked type on the range for an Acquire, nothing on the
+\* range for a Release, nothing at all for a ReleaseOwner -- and leaves
+\* every other (ino, owner, byte) as it was. `last` names the action, so
+\* a Release that drops another range, or nothing, is a step judged
+\* here, not a stutter. The invariants above cannot see a removal.
+HeldBytesExact ==
+    [][ \A i \in Inos, o \in Owners, b \in Offsets :
+          Held(locks', i, o, b) =
+            CASE last'[1] = "acquire" /\ i = last'[2] /\ o = last'[3]
+                   /\ InRange(b, last'[5], last'[6]) -> {last'[4]}
+              [] last'[1] = "release" /\ i = last'[2] /\ o = last'[3]
+                   /\ InRange(b, last'[4], last'[5]) -> {}
+              [] last'[1] = "owner" /\ o = last'[2] -> {}
+              [] OTHER -> Held(locks, i, o, b) ]_vars
 
 =============================================================================

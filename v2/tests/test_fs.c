@@ -11003,7 +11003,7 @@ STM_TEST(snap_view_read_side_ops_refuse_explicitly) {
                        STM_EROFS);
     STM_ASSERT_ERR(stm_fs_unlock(fs, 1, snap_f, 1, 0, 0), STM_EROFS);
     bool would = false;
-    uint64_t owner = 0;
+    stm_lock_conflict owner = { 0 };
     STM_ASSERT_ERR(stm_fs_lock_test(fs, 1, snap_f, 1, 0u/*STM_LOCK_SHARED*/, 0, 0,
                                           &would, &owner),
                        STM_EROFS);

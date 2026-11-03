@@ -45,6 +45,7 @@ const char *stm_strerror(stm_status s)
     case STM_ENODATA:        return "no such xattr";
     case STM_EPERM:          return "operation not permitted";
     case STM_ESTALE:         return "stale file handle";
+    case STM_ENOLCK:         return "no lock record available";
     }
     return "unknown error";
 }

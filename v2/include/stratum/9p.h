@@ -355,6 +355,7 @@ enum {
 #define STM_9P_ECODE_EROFS           30u
 #define STM_9P_ECODE_ERANGE          34u
 #define STM_9P_ECODE_ENAMETOOLONG    36u
+#define STM_9P_ECODE_ENOLCK          37u
 #define STM_9P_ECODE_ENOSYS          38u
 #define STM_9P_ECODE_ENOTEMPTY       39u
 #define STM_9P_ECODE_ENODATA         61u

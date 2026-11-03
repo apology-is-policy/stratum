@@ -88,6 +88,9 @@ stm_add_test(test_inode      test_inode.c)
 stm_add_test(test_dirent     test_dirent.c)
 stm_add_test(test_xattr      test_xattr.c)
 stm_add_test(test_locks      test_locks.c)
+# locks_table_bound fills the table one acquire at a time, about 6.4e9 record visits
+# in all, and a sanitizer pays for each of them.
+set_tests_properties(test_locks PROPERTIES TIMEOUT 900)
 stm_add_test(test_dirty_buffer test_dirty_buffer.c)
 target_link_libraries(test_dirty_buffer PRIVATE stm_dirty_buffer)
 stm_add_test(test_9p         test_9p.c       test_fs_common.c)
@@ -221,6 +224,12 @@ set_tests_properties(test_fs_phase8     PROPERTIES TIMEOUT 180)
 set_tests_properties(test_fs_write_path PROPERTIES TIMEOUT 180)
 set_tests_properties(test_fs_identity   PROPERTIES TIMEOUT 180)
 set_tests_properties(test_fs_windows    PROPERTIES TIMEOUT 180)
+# test_9p forms a pool per leg: 155 legs, 22 s alone in a Debug build, past
+# 60 s beside the rest of the suite at ctest -j8, every leg passing. The two
+# below it read 43 s and 45 s there, on the same 60 s.
+set_tests_properties(test_9p         PROPERTIES TIMEOUT 180)
+set_tests_properties(test_9p_client  PROPERTIES TIMEOUT 180)
+set_tests_properties(test_ctl        PROPERTIES TIMEOUT 180)
 # test_fs_frag fills and punches a 24 MiB pool per test (~18 s each
 # in a Debug build); 180 s leaves room for the sanitizers.
 set_tests_properties(test_fs_frag   PROPERTIES TIMEOUT 180)

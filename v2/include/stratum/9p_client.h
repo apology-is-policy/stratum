@@ -568,13 +568,11 @@ typedef struct {
  * type:
  *   - STM_9P_LOCK_TYPE_UNLCK ⇒ no conflict; an Acquire of the requested
  *     range would succeed.
- *   - STM_9P_LOCK_TYPE_RDLCK / WRLCK ⇒ a conflicting lock is present;
- *     server v2.0 reports WRLCK conservatively (does not track whether
- *     the conflict is shared vs. exclusive — Rgetlock's conflict-type
- *     field is advisory).
+ *   - STM_9P_LOCK_TYPE_RDLCK / WRLCK -> a conflicting lock is present,
+ *     and this is its type.
  *
- * start / length echo the request's range (server v2.0 does not track
- * the conflicting lock's range; it reports the caller's query range).
+ * start / length: on conflict, the conflicting lock's own range
+ * (length 0 = to EOF); otherwise the request's, echoed.
  *
  * proc_id on conflict carries the SERVER-side conflicting owner_id
  * truncated to 32 bits (fid number). Useful for diagnostics; callers

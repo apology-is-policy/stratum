@@ -50,6 +50,7 @@
 #define STRATUM_V2_FS_H
 
 #include <stratum/types.h>
+#include <stratum/locks.h>     /* stm_lock_conflict */
 #include <stratum/dataset.h>     /* stm_property (P7-CAS-13) */
 #include <stratum/alloc.h>       /* stm_alloc_stats (P9-CTL-1d-debug) */
 #include <stratum/dirent.h>      /* STM_DIRENT_NAME_MAX, STM_DT_* (P8-POSIX-4) */
@@ -2526,9 +2527,9 @@ stm_status stm_fs_promote_policy_pass_all(
  * UINT64_MAX - off so range arithmetic is uniform. Linux fcntl(2)
  * treats len=0 the same way.
  *
- * Same-owner re-lock: ALWAYS admitted (POSIX permits an owner to
- * upgrade/downgrade/stack its own locks; this MVP doesn't merge
- * or split records — each Acquire adds a discrete record).
+ * Same-owner re-lock: never a conflict; the request replaces what the
+ * owner held over the range (POSIX upgrade, downgrade, split), see
+ * stm_lock_acquire.
  *
  * Refusals:
  *   - NULL fs (STM_EINVAL).
@@ -2538,7 +2539,7 @@ stm_status stm_fs_promote_policy_pass_all(
  *   - off + len overflows uint64_t when len != 0 (STM_EOVERFLOW).
  *   - Wedged FS (STM_EWEDGED).
  *   - Conflicting lock present → STM_EAGAIN.
- *   - STM_ENOMEM if the lock table can't grow.
+ *   - STM_ENOMEM if the lock table can't grow; STM_ENOLCK at its bound.
  *
  *   - No live inode at (dataset_id, ino) (STM_ENOENT).
  *
@@ -2553,9 +2554,8 @@ stm_status stm_fs_lock(stm_fs *fs,
                               uint64_t owner_id, uint8_t type,
                               uint64_t off, uint64_t len);
 
-/* Release locks held by `owner_id` at (dataset_id, ino) matching
- * EXACTLY (off, len). Idempotent. MVP: exact-match only — caller
- * passes the same range it acquired. */
+/* Release what `owner_id` holds at (dataset_id, ino) within (off, len):
+ * trimmed and split as POSIX F_UNLCK, see stm_lock_release. Idempotent. */
 STM_MUST_USE
 stm_status stm_fs_unlock(stm_fs *fs,
                                 uint64_t dataset_id, uint64_t ino,
@@ -2564,8 +2564,8 @@ stm_status stm_fs_unlock(stm_fs *fs,
 
 /* F_GETLK shape — does NOT acquire. On STM_OK,
  * `*out_would_grant=true` means an acquire would succeed; `false`
- * means a conflict. `out_conflicting_owner` (optional) gets one
- * of the conflicting owners' id on `out_would_grant=false`. Answers
+ * means a conflict. `out_conflict` (optional) gets the
+ * first conflicting lock (owner, type, range) on `out_would_grant=false`. Answers
  * for the live incarnation; STM_ENOENT when there is none. */
 STM_MUST_USE
 stm_status stm_fs_lock_test(stm_fs *fs,
@@ -2573,7 +2573,7 @@ stm_status stm_fs_lock_test(stm_fs *fs,
                                    uint64_t owner_id, uint8_t type,
                                    uint64_t off, uint64_t len,
                                    bool *out_would_grant,
-                                   uint64_t *out_conflicting_owner);
+                                   stm_lock_conflict *out_conflict);
 
 /* Release every lock held by `owner_id` across all inodes — the
  * post-close cleanup pattern. Bindings call this on fd-close. */
@@ -2631,9 +2631,12 @@ STM_MUST_USE
 stm_status stm_fs_fallocate_if_gen(stm_fs *fs, uint64_t dataset_id,
                                    uint64_t ino, uint64_t gen,
                                    uint64_t off, uint64_t len, uint32_t flags);
+/* The take's records count against `client`'s share of the table
+ * (STM_LOCK_MAX_PER_CLIENT; 0 names no client). */
 STM_MUST_USE
 stm_status stm_fs_lock_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
-                              uint64_t gen, uint64_t owner_id, uint8_t type,
+                              uint64_t gen, uint64_t owner_id,
+                              uint64_t client, uint8_t type,
                               uint64_t off, uint64_t len);
 STM_MUST_USE
 stm_status stm_fs_lock_test_if_gen(stm_fs *fs, uint64_t dataset_id,
@@ -2641,7 +2644,7 @@ stm_status stm_fs_lock_test_if_gen(stm_fs *fs, uint64_t dataset_id,
                                    uint64_t owner_id, uint8_t type,
                                    uint64_t off, uint64_t len,
                                    bool *out_would_grant,
-                                   uint64_t *out_conflicting_owner);
+                                   stm_lock_conflict *out_conflict);
 
 /*
  * The reads below take no lockless leg when given a gen: each reads under

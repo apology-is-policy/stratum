@@ -7156,11 +7156,11 @@ STM_TEST(fs_p7d_lock_test_reports_conflict) {
     STM_ASSERT_OK(stm_fs_lock(fs, 1, a, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
 
     bool would_grant = true;
-    uint64_t conflicting = 0;
+    stm_lock_conflict conflicting = { 0 };
     STM_ASSERT_OK(stm_fs_lock_test(fs, 1, a, 2, STM_FS_LOCK_SHARED,
                                           0, 100, &would_grant, &conflicting));
     STM_ASSERT_TRUE(!would_grant);
-    STM_ASSERT_EQ(conflicting, (uint64_t)1);
+    STM_ASSERT_EQ(conflicting.owner_id, (uint64_t)1);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);

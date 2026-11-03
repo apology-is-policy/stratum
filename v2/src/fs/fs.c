@@ -11970,7 +11970,7 @@ _Static_assert(STM_FS_LOCK_EXCLUSIVE == STM_LOCK_EXCLUSIVE,
 static stm_status fs_lock(stm_fs *fs,
                           uint64_t dataset_id, uint64_t ino,
                           const uint64_t *gen,
-                          uint64_t owner_id, uint8_t type,
+                          uint64_t owner_id, uint64_t client, uint8_t type,
                           uint64_t off, uint64_t len)
 {
     if (!fs) return STM_EINVAL;
@@ -11987,8 +11987,8 @@ static stm_status fs_lock(stm_fs *fs,
     uint64_t live_gen = 0;
     stm_status s = fs_live_gen_locked(fs, dataset_id, ino, gen, &live_gen);
     if (s == STM_OK)
-        s = stm_lock_acquire(fs->locks, dataset_id, ino, live_gen,
-                             owner_id, type, off, len);
+        s = stm_lock_acquire_as(fs->locks, dataset_id, ino, live_gen,
+                                owner_id, client, type, off, len);
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
@@ -12016,11 +12016,11 @@ static stm_status fs_lock_test(stm_fs *fs,
                                uint64_t owner_id, uint8_t type,
                                uint64_t off, uint64_t len,
                                bool *out_would_grant,
-                               uint64_t *out_conflicting_owner)
+                               stm_lock_conflict *out_conflict)
 {
     /* Uniform out-param zero-init contract. */
     if (out_would_grant) *out_would_grant = false;
-    if (out_conflicting_owner) *out_conflicting_owner = 0;
+    if (out_conflict) memset(out_conflict, 0, sizeof *out_conflict);
     if (!fs || !out_would_grant) return STM_EINVAL;
     /* 9.7-impl-5 R166 P2-2: synth ino lock-test is meaningless. The
      * RO probe semantically is "would acquire succeed?" — and acquire
@@ -12039,8 +12039,7 @@ static stm_status fs_lock_test(stm_fs *fs,
     if (!fs_gen_matches(&iv, gen)) return STM_ESTALE;
     return stm_lock_test(fs->locks, dataset_id, ino, stm_load_le64(iv.si_gen),
                             owner_id, type, off, len,
-                            out_would_grant,
-                            out_conflicting_owner);
+                            out_would_grant, out_conflict);
 }
 
 stm_status stm_fs_release_lock_owner(stm_fs *fs, uint64_t owner_id)
@@ -12217,24 +12216,25 @@ stm_status stm_fs_lock(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                        uint64_t owner_id, uint8_t type,
                        uint64_t off, uint64_t len)
 {
-    return fs_lock(fs, dataset_id, ino, NULL, owner_id, type, off, len);
+    return fs_lock(fs, dataset_id, ino, NULL, owner_id, 0u, type, off, len);
 }
 
 stm_status stm_fs_lock_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
-                              uint64_t gen, uint64_t owner_id, uint8_t type,
+                              uint64_t gen, uint64_t owner_id,
+                              uint64_t client, uint8_t type,
                               uint64_t off, uint64_t len)
 {
-    return fs_lock(fs, dataset_id, ino, &gen, owner_id, type, off, len);
+    return fs_lock(fs, dataset_id, ino, &gen, owner_id, client, type, off, len);
 }
 
 stm_status stm_fs_lock_test(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                             uint64_t owner_id, uint8_t type,
                             uint64_t off, uint64_t len,
                             bool *out_would_grant,
-                            uint64_t *out_conflicting_owner)
+                            stm_lock_conflict *out_conflict)
 {
     return fs_lock_test(fs, dataset_id, ino, NULL, owner_id, type, off, len,
-                        out_would_grant, out_conflicting_owner);
+                        out_would_grant, out_conflict);
 }
 
 stm_status stm_fs_lock_test_if_gen(stm_fs *fs, uint64_t dataset_id,
@@ -12242,10 +12242,10 @@ stm_status stm_fs_lock_test_if_gen(stm_fs *fs, uint64_t dataset_id,
                                    uint64_t owner_id, uint8_t type,
                                    uint64_t off, uint64_t len,
                                    bool *out_would_grant,
-                                   uint64_t *out_conflicting_owner)
+                                   stm_lock_conflict *out_conflict)
 {
     return fs_lock_test(fs, dataset_id, ino, &gen, owner_id, type, off, len,
-                        out_would_grant, out_conflicting_owner);
+                        out_would_grant, out_conflict);
 }
 
 stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
