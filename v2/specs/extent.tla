@@ -324,6 +324,9 @@ Overwrite(ds, ino, off, len, new_replicas, key_id) ==
 
 (***************************************************************************)
 (* Truncate — shrink (ds, ino) to `new_size` blocks.                          *)
+(* A size inside a block is new_size rounded up. The same-length rewrite   *)
+(* that zeroes the tail of an extent ending there composes as Overwrite     *)
+(* then this action, under one lock hold.                                  *)
 (*                                                                           *)
 (* Drops every extent whose `off ≥ new_size` (fully past truncation).        *)
 (* If exactly one extent crosses the boundary (`e.off < new_size <           *)

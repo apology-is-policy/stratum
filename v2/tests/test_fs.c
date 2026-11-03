@@ -2767,8 +2767,8 @@ STM_TEST(fs_truncate_args_validated) {
     STM_ASSERT_ERR(stm_sync_truncate(NULL, 1, 1, 0, NULL), STM_EINVAL);
     STM_ASSERT_ERR(stm_sync_truncate(s, 0, 1, 0, NULL),    STM_EINVAL);
     STM_ASSERT_ERR(stm_sync_truncate(s, 1, 0, 0, NULL),    STM_EINVAL);
-    /* Unaligned new_size. */
-    STM_ASSERT_ERR(stm_sync_truncate(s, 1, 1, 1234, NULL), STM_EINVAL);
+    /* A size no block boundary can hold. */
+    STM_ASSERT_ERR(stm_sync_truncate(s, 1, 1, UINT64_MAX, NULL), STM_EINVAL);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -4744,6 +4744,67 @@ STM_TEST(fs_truncate_crossing_cold_extent_basic) {
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
+}
+
+/* A size inside a block of a cold extent: the kept block is rewritten HOT with
+ * zeros past the size, and the CAS reference goes as for a block boundary. The
+ * read covers `check` bytes, before and after a remount. */
+static void truncate_cold_leg(const char *name, uint64_t size, size_t check)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[12288];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i | 1u);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    /* premise: one cold chunk holds the whole file */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    stm_extent_record e;
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(sync), 1, 1, size, &e));
+    STM_ASSERT_EQ((unsigned)e.kind, (unsigned)STM_EXTENT_KIND_COLD);
+    STM_ASSERT_EQ((uint64_t)e.len, (uint64_t)sizeof plain);
+    bool changed = false;
+    STM_ASSERT_OK(stm_sync_truncate(sync, 1, 1, size, &changed));
+    STM_ASSERT_TRUE(changed);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    n = 99;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    for (int round = 0; round < 2; round++) {
+        uint8_t out[12288];
+        size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, check, &got));
+        STM_ASSERT_EQ(got, check);
+        STM_ASSERT_MEM_EQ(plain, out, (size_t)size);
+        for (size_t i = (size_t)size; i < check; i++) STM_ASSERT_EQ(out[i], 0u);
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (!fs) return;
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_truncate_inside_a_block_of_a_cold_extent) {
+    /* The cut keeps less than the extent held. */
+    truncate_cold_leg("mtc_trunc_sub", 5000u, 8192u);
+    /* The size is in the extent's last block, so the rewrite keeps its length. */
+    truncate_cold_leg("mtc_trunc_same", 12288u - 100u, 12288u);
 }
 
 STM_TEST(fs_truncate_crossing_cold_extent_persists_across_mount) {

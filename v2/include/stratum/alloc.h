@@ -289,8 +289,8 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
  * after them: free - reserved - slop >= nblocks, free counting allocated
  * and PENDING blocks as used. The slop (stm_alloc_slop_blocks) is 2% of the
  * data area, at most 4096 blocks (ext4's reserved clusters): the drain's
- * margin, half of which an allocation that frees more than it takes may
- * spend. An unguarded allocator checks only for a gap, as before.
+ * margin, half of which an allocation made to free space may spend. An
+ * unguarded allocator checks only for a gap, as before.
  *
  * stm_alloc_reserve_for_drain is the drain's own allocation: it spends the
  * reservation, so it checks only for a gap, and its blocks count in flight
@@ -301,9 +301,10 @@ STM_MUST_USE
 stm_status stm_alloc_reserve_for_drain(stm_alloc *a, uint64_t nblocks,
                                        uint64_t hint_paddr,
                                        uint64_t *out_paddr);
-/* An allocation replacing a longer extent it cuts (a truncate's kept
- * prefix) may spend half the slop, never the reservation, so a full pool
- * can still be cut down: ZFS's net-free transactions. */
+/* An allocation made to free space (the block a truncate rewrites) may spend
+ * half the slop, never the reservation, so a full pool can still be cut down:
+ * ZFS's net-free transactions. It is an allowance, not a proof: an extent that
+ * is shared or held by a snapshot frees nothing when it goes. */
 STM_MUST_USE
 stm_status stm_alloc_reserve_netfree(stm_alloc *a, uint64_t nblocks,
                                      uint64_t hint_paddr,

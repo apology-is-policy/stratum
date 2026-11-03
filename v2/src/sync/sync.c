@@ -6320,8 +6320,8 @@ static stm_status sync_write_reserve_pieces_locked(stm_sync *s, bool netfree,
  * args are caller-validated. On failure nothing is held (partial
  * reserves freed, DEK scrubbed). On success the caller MUST reach
  * sync_write_encrypt_store, then either the index commit or the
- * rollback. A `netfree` write replaces a longer extent it cuts, so it may
- * spend half the slop. */
+ * rollback. A `netfree` write is a truncate's rewrite, which may spend half
+ * the slop. */
 static stm_status sync_write_reserve_locked(stm_sync *s, uint64_t dataset_id,
                                                uint64_t off, size_t len,
                                                bool netfree,
@@ -8103,12 +8103,18 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  * sustained truncate workloads slow scrub-step throughput.
  */
 stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
-                                uint64_t new_size, bool *out_changed)
+                                uint64_t size, bool *out_changed)
 {
     if (out_changed) *out_changed = false;
     if (!s) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
-    if ((new_size % STM_UB_SIZE) != 0) return STM_EINVAL;
+    if (size > UINT64_MAX - (STM_UB_SIZE - 1u)) return STM_EINVAL;
+    /* A record holds whole blocks, so a size inside a block keeps that block,
+     * with the bytes past `size` zeroed in the rewrite below. Those bytes stay
+     * on disk past EOF, and a later grow or append must read them as zeros.
+     * new_size is where the extents end. */
+    const uint64_t new_size =
+        (size + (STM_UB_SIZE - 1u)) / STM_UB_SIZE * STM_UB_SIZE;
 
     pthread_mutex_lock(&s->lock);
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
@@ -8121,11 +8127,13 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         stm_status ls = stm_extent_lookup_at(s->extent_idx, dataset_id, ino,
                                                 new_size - 1u, &rec);
         if (ls == STM_OK) {
-            if (rec.off < new_size && rec.off + rec.len > new_size) {
+            if (rec.off < new_size &&
+                (rec.off + rec.len > new_size || size != new_size)) {
                 has_crossing = true;
             }
-            /* Else: extent ends exactly at new_size (rec.off + rec.len ==
-             * new_size). It's neither crossing nor past — leave it. */
+            /* Else: extent ends exactly at an aligned new_size. It's
+             * neither crossing nor past: leave it. An unaligned size
+             * rewrites even an extent that ends there, for the zeros. */
         } else if (ls != STM_ENOENT) {
             pthread_mutex_unlock(&s->lock);
             return ls;
@@ -8275,7 +8283,8 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
          * write time; a corrupted on-disk record (or a future
          * format-break drift) could feed an attacker-controlled
          * malloc size. Mirrors the scrub cb's defensive check. */
-        if (rec.len == 0 || rec.len > STM_FS_RECORDSIZE_MAX) {
+        if (rec.len == 0 || rec.len > STM_FS_RECORDSIZE_MAX ||
+            (rec.off % STM_UB_SIZE) != 0) {
             free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
@@ -8319,10 +8328,16 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             return STM_EIO;
         }
         size_t prefix_len = (size_t)(new_size - rec.off);
-        /* The prefix replaces the longer extent it is cut from. */
+        memset((uint8_t *)plain + (size - rec.off), 0,
+               (size_t)(new_size - size));
+        /* A prefix replaces the longer extent it is cut from, and extents past
+         * it go with it, so either may spend the slop. A rewrite of the same
+         * length with nothing past it frees nothing it does not also take. */
         stm_status ws = stm_sync_write_extent_locked(s, dataset_id, ino,
                                                         rec.off, plain,
-                                                        prefix_len, true);
+                                                        prefix_len,
+                                                        prefix_len < rec.len ||
+                                                        past_n_extents > 0u);
         stm_ct_memzero(plain, rec.len);
         free(plain);
         if (ws != STM_OK) {

@@ -5940,6 +5940,20 @@ static stm_status fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 /* P8-POSIX-10: stm_fs_truncate.                                              */
 /* ========================================================================= */
 
+/* A write inside fs_truncate's span answered ENOSPC with nothing changed. Peers'
+ * buffered ranges hold room against their drains, and the last commit's frees
+ * are pending: release both for one retry. The reclaim waits out every span, so
+ * this runs outside ours; the pin keeps this inode as it was. A flush that
+ * failed left its range buffered for a later commit to report, and the reclaim
+ * would repeat that drain and wedge the fs, so it does not run after one. */
+static void fs_truncate_make_room_locked(stm_fs *fs, fs_txn *tx)
+{
+    fs_txn_end(fs, tx);
+    if (fs_flush_all_locked(fs) == STM_OK)
+        (void)fs_reclaim_on_enospc_locked(fs);
+    fs_txn_begin(fs, tx);
+}
+
 static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                               const uint64_t *gen, uint64_t new_size)
 {
@@ -6074,14 +6088,9 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             stm_status ws = stm_sync_write_extent(fs->sync, dataset_id, ino,
                                                   0u, prefix, block_size);
             if (ws == STM_ENOSPC) {
-                /* The reclaim's commit waits for every span, so it runs
-                 * outside ours; nothing has changed yet. */
-                fs_txn_end(fs, &tx);
-                bool freed = fs_reclaim_on_enospc_locked(fs);
-                fs_txn_begin(fs, &tx);
-                if (freed)
-                    ws = stm_sync_write_extent(fs->sync, dataset_id, ino,
-                                              0u, prefix, block_size);
+                fs_truncate_make_room_locked(fs, &tx);
+                ws = stm_sync_write_extent(fs->sync, dataset_id, ino,
+                                           0u, prefix, block_size);
             }
             free(prefix);
             if (ws != STM_OK) { rs = ws; goto out; }
@@ -6100,18 +6109,15 @@ static stm_status fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (kind == STM_DATA_EXTENT) {
         /* EXTENT mode. Per ARCH §11.3.3 / inode.tla::OneWayInlineToExtent:
          * once EXTENT, stays EXTENT — even when new_size ≤ inline cap. */
-        const uint64_t BLK = 4096u;
-        if (new_size < cur_size && (new_size & (BLK - 1u)) != 0u) {
-            /* Sub-block shrink not supported. POSIX truncate(2) accepts
-             * arbitrary new_size; sync_truncate's MVP requires 4 KiB
-             * alignment. */
-            rs = STM_EINVAL; goto out;
-        }
-
         bool cut = false;
         if (new_size < cur_size) {
             stm_status ts = stm_sync_truncate(fs->sync, dataset_id, ino,
                                                  new_size, &cut);
+            if (ts == STM_ENOSPC) {
+                fs_truncate_make_room_locked(fs, &tx);
+                ts = stm_sync_truncate(fs->sync, dataset_id, ino,
+                                       new_size, &cut);
+            }
             if (ts != STM_OK) { rs = ts; goto out; }
             fs_step_gap(fs, dataset_id, ino);
         }

@@ -2051,12 +2051,13 @@ STM_TEST(fs_the_dirty_reservation_follows_the_buffer) {
     unlink(g_key_path);
 }
 
-/* A truncate's kept prefix replaces the longer extent it is cut from, so it
- * may spend half the slop: a pool filled to the slop refuses a write but
- * can still be cut down. */
-STM_TEST(fs_a_shrinking_truncate_may_spend_half_the_slop) {
+/* A pool filled into its slop, with room left in the slop's half: c is 64 KiB of
+ * 0x3C in one hot extent, and with `past` another 64 KiB of 0x5A after it; a
+ * 4 KiB write to g has been refused. */
+static stm_fs *slop_pool(const char *name, bool past, uint64_t *out_c)
+{
     const uint64_t MIB = 1024u * 1024u;
-    make_tmp("netfree_truncate");
+    make_tmp(name);
     stm_fs_format_opts fopts = default_format_opts();
     fopts.device_size_bytes = 48u * MIB;
     fopts.bootstrap_size_bytes = 8u * MIB;
@@ -2064,7 +2065,7 @@ STM_TEST(fs_a_shrinking_truncate_may_spend_half_the_slop) {
     stm_fs_mount_opts mopts = rw_mount_opts();
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
-    if (!fs) return;
+    if (!fs) return NULL;
     stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
     uint64_t dir = 0, c = 0, f = 0, g = 0;
     STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
@@ -2076,6 +2077,7 @@ STM_TEST(fs_a_shrinking_truncate_may_spend_half_the_slop) {
     const uint64_t slop = st.data_free_blocks - st.data_avail_blocks;
     STM_ASSERT_TRUE(slop >= 8u);
     mid_op_put(fs, c, 0, 65536u, 0x3C);
+    if (past) mid_op_put(fs, c, 65536u, 65536u, 0x5A);
     mid_op_fill(fs, f);
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
     /* premise: the fill ended inside the slop, with room in its half */
@@ -2085,10 +2087,22 @@ STM_TEST(fs_a_shrinking_truncate_may_spend_half_the_slop) {
     uint8_t w[4096];
     memset(w, 0x44, sizeof w);
     STM_ASSERT_ERR(stm_fs_write(fs, 1, g, 0, w, sizeof w), STM_ENOSPC);
+    *out_c = c;
+    return fs;
+}
+
+/* A truncate's kept prefix replaces the longer extent it is cut from, so it
+ * may spend half the slop: a pool filled to the slop refuses a write but
+ * can still be cut down. */
+STM_TEST(fs_a_shrinking_truncate_may_spend_half_the_slop) {
+    uint64_t c = 0;
+    stm_fs *fs = slop_pool("netfree_truncate", false, &c);
+    if (!fs) return;
     STM_ASSERT_OK(stm_fs_truncate(fs, 1, c, 4096u));
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_unmount(fs));
     fs = NULL;
+    stm_fs_mount_opts mopts = rw_mount_opts();
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
     if (!fs) return;
     STM_ASSERT_EQ(mid_op_size(fs, c), (uint64_t)4096);
@@ -2097,6 +2111,150 @@ STM_TEST(fs_a_shrinking_truncate_may_spend_half_the_slop) {
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
+}
+
+/* A size inside the last block of an extent rewrites that extent at its own
+ * length, which frees nothing it does not also take, so the slop is not its to
+ * spend: the same pool refuses it and changes nothing, and still takes a cut
+ * one block shorter. */
+STM_TEST(fs_a_truncate_freeing_nothing_may_not_spend_the_slop) {
+    uint64_t c = 0;
+    stm_fs *fs = slop_pool("netfree_same_length", false, &c);
+    if (!fs) return;
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, c, 65536u - 100u), STM_ENOSPC);
+    STM_ASSERT_EQ(mid_op_size(fs, c), (uint64_t)65536);
+    STM_ASSERT_EQ(mid_op_byte(fs, c, 65536u - 16u), 0x3C);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, c, 65536u - 4096u - 100u));
+    STM_ASSERT_EQ(mid_op_size(fs, c), (uint64_t)(65536u - 4096u - 100u));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* The same cut with an extent past it: the rewrite still takes its own length,
+ * but the truncate frees what is past it, so a full pool must let it through. */
+STM_TEST(fs_a_truncate_dropping_an_extent_past_may_spend_the_slop) {
+    uint64_t c = 0;
+    stm_fs *fs = slop_pool("netfree_past", true, &c);
+    if (!fs) return;
+    const uint64_t size = 65536u - 100u;
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, c, size));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    STM_ASSERT_EQ(mid_op_size(fs, c), size);
+    STM_ASSERT_EQ(mid_op_byte(fs, c, size - 16u), 0x3C);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, c, 2u * 65536u));
+    STM_ASSERT_EQ(mid_op_byte(fs, c, size), 0x00);
+    STM_ASSERT_EQ(mid_op_byte(fs, c, 65536u), 0x00);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A peer's buffered ranges hold the room their drain might spend. A truncate's
+ * rewrite that finds none makes them give it back, as a write does. */
+typedef struct {
+    stm_fs  *fs;
+    uint64_t dir, c, g, goff;
+} peer_charge;
+
+/* A full pool, c's 16 blocks whole, p committed and free to unlink, and only a
+ * peer's buffered charge keeping a rewrite of c's 16 blocks out. */
+static bool peer_charge_pool(const char *name, peer_charge *out)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = 48u * MIB;
+    fopts.bootstrap_size_bytes = 8u * MIB;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return false;
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync(fs));
+    uint64_t dir = 0, c = 0, f = 0, g = 0, pf = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, (uint32_t)S_IFDIR | 0755u, 0, 0, &dir));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"c", 1, 0644u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"f", 1, 0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"g", 1, 0644u, 0, 0, &g));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, dir, (const uint8_t *)"p", 1, 0644u, 0, 0, &pf));
+    mid_op_put(fs, c, 0, 65536u, 0x3C);
+    mid_op_put(fs, pf, 0, 8192u, 0x11);
+    stm_fs_stats st = {0};
+    uint64_t off = 0;
+    for (;;) {
+        STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+        if (st.data_avail_blocks < 512u) break;
+        uint64_t len = st.data_avail_blocks >= 2048u ? MIB : 65536u;
+        mid_op_put(fs, f, off, len, 0x77);
+        off += len;
+    }
+    uint8_t w[4096];
+    memset(w, 0x44, sizeof w);
+    uint64_t goff = 0;
+    while (st.data_avail_blocks >= 16u) {
+        stm_status ws = stm_fs_write(fs, 1, g, goff, w, sizeof w);
+        STM_ASSERT_OK(ws);
+        if (ws != STM_OK) break;
+        goff += MIB;
+        STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    }
+    /* premise: only the peer's charge keeps the rewrite's 16 blocks out */
+    STM_ASSERT_TRUE(st.data_dirty_reserved_blocks >= 16u);
+    STM_ASSERT_TRUE(st.data_avail_blocks < 16u);
+    *out = (peer_charge){ .fs = fs, .dir = dir, .c = c, .g = g, .goff = goff };
+    return true;
+}
+
+static void peer_charge_cut_and_check(peer_charge *p)
+{
+    const uint64_t MIB = 1024u * 1024u;
+    const uint64_t size = 65536u - 100u;
+    STM_ASSERT_OK(stm_fs_truncate(p->fs, 1, p->c, size));
+    STM_ASSERT_EQ(mid_op_size(p->fs, p->c), size);
+    STM_ASSERT_OK(stm_fs_commit(p->fs));
+    STM_ASSERT_OK(stm_fs_unmount(p->fs));
+    p->fs = NULL;
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &p->fs));
+    if (!p->fs) return;
+    STM_ASSERT_EQ(mid_op_size(p->fs, p->c), size);
+    STM_ASSERT_EQ(mid_op_byte(p->fs, p->c, size - 16u), 0x3C);
+    STM_ASSERT_EQ(mid_op_byte(p->fs, p->g, 0), 0x44);
+    STM_ASSERT_EQ(mid_op_byte(p->fs, p->g, p->goff - MIB), 0x44);
+    STM_ASSERT_OK(stm_fs_unmount(p->fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Beside a buffered peer the rewrite finds room by draining it. */
+STM_TEST(fs_a_truncate_drains_a_peer_for_its_rewrite) {
+    peer_charge p;
+    if (!peer_charge_pool("trunc_peer_charge", &p)) return;
+    peer_charge_cut_and_check(&p);
+}
+
+/* A peer's drain that fails hard costs this truncate its room, and no more: as
+ * under a commit, the range stays buffered and nothing wedges, though frees are
+ * pending for a reclaim that would repeat the drain. */
+STM_TEST(fs_a_truncate_beside_a_failing_drain_refuses_and_wedges_nothing) {
+    peer_charge p;
+    if (!peer_charge_pool("trunc_peer_fail", &p)) return;
+    STM_ASSERT_OK(stm_fs_unlink(p.fs, 1, p.dir, (const uint8_t *)"p", 1));
+    STM_ASSERT_TRUE(stm_sync_pending_free_blocks(stm_fs_sync(p.fs)) > 0u);
+    stm_fs_fail_drains_for_test(p.fs, STM_EIO);
+    STM_ASSERT_ERR(stm_fs_truncate(p.fs, 1, p.c, 65536u - 100u), STM_ENOSPC);
+    stm_fs_fail_drains_for_test(p.fs, STM_OK);
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(p.fs, &st));
+    STM_ASSERT_FALSE(st.wedged);
+    STM_ASSERT_EQ(mid_op_size(p.fs, p.c), (uint64_t)65536u);
+    peer_charge_cut_and_check(&p);
 }
 
 /* A direct write split into pieces, whose second piece finds no room,

@@ -723,7 +723,7 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
  *               new_size become unreachable (POSIX-correct).
  *       EXTENT: stm_sync_truncate drops past-EOF extents + drop-routes
  *               their paddrs through the snapshot dead-list (P7-11 +
- *               P7-12); requires `new_size` 4 KiB-aligned; update
+ *               P7-12); the block a size falls in stays, zeroed past it; update
  *               si_size. Per ARCH §11.3.3, kind STAYS EXTENT even when
  *               new_size ≤ STM_INODE_INLINE_MAX (one-way invariant
  *               from inode.tla::OneWayInlineToExtent).
@@ -754,10 +754,9 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
  *     EISDIR for directory operands.
  *   - inode is not S_IFREG (STM_EINVAL — symlink / device truncate
  *     not supported in MVP).
- *   - EXTENT-mode shrink with non-4 KiB-aligned `new_size`
- *     (STM_EINVAL — sub-block truncate would require read-modify-
- *     write at the bdev; deferred).
  *   - new_size past STM_FS_FILE_MAX (STM_EOVERFLOW).
+ *   - a block the shrink rewrites, or an inline file's move to an extent, finds
+ *     no room after one reclaim (STM_ENOSPC; nothing changed, retryable).
  *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
  */
 STM_MUST_USE

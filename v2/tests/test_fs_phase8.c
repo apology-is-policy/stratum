@@ -46,6 +46,7 @@
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
 #include <stratum/inode.h>
+#include <stratum/snapshot.h>
 #include <stratum/sync.h>
 #include <stratum/types.h>
 #include <stratum/xattr.h>
@@ -2491,6 +2492,342 @@ STM_TEST(fs_p10_truncate_extent_shrink) {
     unlink(g_key_path);
 }
 
+/* A read stops at an extent or hole boundary, so a range takes as many as it
+ * takes. A failure ends the loop: a test's assert returns. */
+static void p10_read_all(stm_fs *fs, uint64_t f, uint8_t *out, size_t len)
+{
+    size_t got = 0;
+    while (got < len) {
+        size_t n = 0;
+        stm_status rs = stm_fs_read(fs, 1, f, got, out + got, len - got, &n);
+        STM_ASSERT_OK(rs);
+        STM_ASSERT_TRUE(n > 0);
+        if (rs != STM_OK || n == 0) return;
+        got += n;
+    }
+}
+
+/* POSIX truncate(2) takes any length. Shrink an EXTENT file to `size`, grow it
+ * back to `grown`, and read: the bytes kept are the file's, and every byte past
+ * `size` reads zero, before and after a remount. */
+static void p10_subblock_leg(const char *name, const uint8_t *data, size_t data_n,
+                             uint64_t size, uint64_t grown)
+{
+    make_tmp(name);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, data, data_n));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, size));
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), size);
+    uint8_t *out = malloc((size_t)grown + 4096u);
+    STM_ASSERT_TRUE(out != NULL);
+    size_t n = 999;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, size, out, 4096, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, grown));
+    for (int round = 0; round < 2; round++) {
+        memset(out, 0xa5, (size_t)grown);
+        p10_read_all(fs, f, out, (size_t)grown);
+        STM_ASSERT_MEM_EQ(data, out, (size_t)size);
+        for (uint64_t i = size; i < grown; i++) STM_ASSERT_EQ(out[i], 0u);
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (!fs) { free(out); return; }
+    }
+    free(out);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p10_truncate_extent_inside_a_block) {
+    static uint8_t data[64u * 1024u];
+    for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i * 7u + 1u);
+    /* Inside a long extent, whose tail goes too. */
+    p10_subblock_leg("p10_sub_cross", data, sizeof data, 3000u, 8192u);
+    /* In the extent's last block, so the extent keeps its end. */
+    p10_subblock_leg("p10_sub_last", data, 8192u, 5000u, 8192u);
+    /* One byte past a block boundary, and one byte short of the next. */
+    p10_subblock_leg("p10_sub_one", data, sizeof data, 4097u, 12288u);
+    p10_subblock_leg("p10_sub_short", data, sizeof data, 8191u, 12288u);
+    /* The smallest size that is not zero. */
+    p10_subblock_leg("p10_sub_byte", data, sizeof data, 1u, 4096u);
+}
+
+STM_TEST(fs_p10_truncate_inside_a_block_reclaims_on_a_full_pool) {
+    /* The rewrite of a block that keeps its length frees nothing it does not
+     * also take, so on a full pool its room can only come from a reclaim. */
+    make_tmp("p10_sub_full");
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.device_size_bytes = (uint64_t)16u * 1024u * 1024u;
+    fopts.bootstrap_size_bytes = (uint64_t)8u * 1024u * 1024u;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0, f = 0, b = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+    uint8_t blk[4096];
+    memset(blk, 'B', sizeof blk);
+    for (uint64_t i = 0; i < 64u; i++)
+        STM_ASSERT_OK(stm_fs_write(fs, 1, b, i * sizeof blk, blk, sizeof blk));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    memset(blk, 'F', sizeof blk);
+    uint64_t off = 0;
+    for (;;) {
+        stm_status ws = stm_fs_write(fs, 1, f, off, blk, sizeof blk);
+        if (ws != STM_OK) { STM_ASSERT_ERR(ws, STM_ENOSPC); break; }
+        off += sizeof blk;
+    }
+    STM_ASSERT_TRUE(off >= 2u * sizeof blk);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"b", 1));
+
+    /* premise: only the reclaim of b's blocks can make the rewrite's room */
+    stm_fs_stats st = {0};
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_TRUE(st.data_avail_blocks < 2u);
+
+    uint64_t size = off - sizeof blk + 100u;
+    unsigned violations = stm_fs_txn_order_violations_for_test();
+    stm_status ts = stm_fs_truncate(fs, 1, f, size);
+    STM_ASSERT_OK(ts);
+    /* the retry ran inside a span of its own */
+    STM_ASSERT_EQ(stm_fs_txn_order_violations_for_test(), violations);
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), size);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, off));
+    for (int round = 0; round < 2; round++) {
+        uint8_t out[4096];
+        memset(out, 0xa5, sizeof out);
+        p10_read_all(fs, f, out, 16u);
+        STM_ASSERT_EQ(out[0], (uint8_t)'F');
+        size_t n = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, f, off - sizeof blk, out, sizeof out, &n));
+        STM_ASSERT_EQ(n, sizeof out);
+        for (size_t i = 0; i < 100u; i++) STM_ASSERT_EQ(out[i], (uint8_t)'F');
+        for (size_t i = 100u; i < sizeof out; i++) STM_ASSERT_EQ(out[i], 0u);
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (!fs) return;
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A shared block is the sharer's to keep: each side's cut leaves the other's
+ * bytes as they were, before and after a remount. */
+STM_TEST(fs_p10_truncate_inside_a_block_leaves_a_reflink_alone) {
+    static uint8_t data[64u * 1024u];
+    for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i * 3u + 1u);
+    make_tmp("p10_sub_reflink");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0, src = 0, dst = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"s", 1,
+                                          0644u, 0, 0, &src));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"d", 1,
+                                          0644u, 0, 0, &dst));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, data, sizeof data));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, src, 1, dst));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, src, 5000u));
+    static uint8_t out[64u * 1024u];
+    for (int round = 0; round < 2; round++) {
+        memset(out, 0xa5, sizeof out);
+        p10_read_all(fs, dst, out, sizeof data);
+        STM_ASSERT_MEM_EQ(data, out, sizeof data);
+        memset(out, 0xa5, sizeof out);
+        p10_read_all(fs, src, out, 5000u);
+        STM_ASSERT_MEM_EQ(data, out, 5000u);
+        size_t n = 999;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, src, 5000u, out, 4096u, &n));
+        STM_ASSERT_EQ(n, (size_t)0);
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (!fs) return;
+    }
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, dst, 3000u));
+    for (int round = 0; round < 2; round++) {
+        memset(out, 0xa5, sizeof out);
+        p10_read_all(fs, src, out, 5000u);
+        STM_ASSERT_MEM_EQ(data, out, 5000u);
+        memset(out, 0xa5, sizeof out);
+        p10_read_all(fs, dst, out, 3000u);
+        STM_ASSERT_MEM_EQ(data, out, 3000u);
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (!fs) return;
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* A snapshot keeps the extent the cut replaced: a rollback has the whole file. */
+STM_TEST(fs_p10_truncate_inside_a_block_leaves_a_snapshot_alone) {
+    static uint8_t data[64u * 1024u];
+    for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i * 5u + 1u);
+    make_tmp("p10_sub_snap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0, f = 0, snap = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, data, sizeof data));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &snap));
+    /* The extent goes to the snapshot's list, not the allocator: a read of its
+     * ciphertext could not tell, since nothing has written over it yet. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    size_t dead = 0;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(stm_sync_snapshot_index(sync),
+                                               snap, &dead));
+    STM_ASSERT_EQ(dead, (size_t)0);
+    uint64_t pending = stm_sync_pending_free_blocks(sync);
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 5000u));
+    STM_ASSERT_EQ(stm_sync_pending_free_blocks(sync), pending);
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(stm_sync_snapshot_index(sync),
+                                               snap, &dead));
+    STM_ASSERT_TRUE(dead >= 1u);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    static uint8_t out[64u * 1024u];
+    memset(out, 0xa5, sizeof out);
+    p10_read_all(fs, f, out, 5000u);
+    STM_ASSERT_MEM_EQ(data, out, 5000u);
+    STM_ASSERT_OK(stm_fs_rollback_snapshot(fs, 1, snap, false));
+    memset(out, 0xa5, sizeof out);
+    p10_read_all(fs, f, out, sizeof data);
+    STM_ASSERT_MEM_EQ(data, out, sizeof data);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* An append lands at the new EOF: its bytes, then zeros to the block's end. */
+STM_TEST(fs_p10_truncate_inside_a_block_then_append) {
+    static uint8_t data[64u * 1024u];
+    for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i * 11u + 1u);
+    make_tmp("p10_sub_append");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    if (!fs) return;
+    uint64_t root = 0, f = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, data, sizeof data));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 5000u));
+    const uint8_t tail[8] = { 'a', 'p', 'p', 'e', 'n', 'd', 'e', 'd' };
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 5000u, tail, sizeof tail));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 8192u));
+    static uint8_t out[8192];
+    for (int round = 0; round < 2; round++) {
+        memset(out, 0xa5, sizeof out);
+        p10_read_all(fs, f, out, sizeof out);
+        STM_ASSERT_MEM_EQ(data, out, 5000u);
+        STM_ASSERT_MEM_EQ(tail, out + 5000u, sizeof tail);
+        for (size_t i = 5000u + sizeof tail; i < sizeof out; i++)
+            STM_ASSERT_EQ(out[i], 0u);
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (!fs) return;
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p10_truncate_inside_a_block_of_a_hole) {
+    /* A size in a hole has no block to rewrite. Past-hole extents still go. */
+    make_tmp("p10_sub_hole");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    uint8_t blk[4096];
+    memset(blk, 'H', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, sizeof blk));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 256u * 1024u, blk, sizeof blk));
+
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 10000u));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 300u * 1024u));
+    for (int round = 0; round < 2; round++) {
+        uint8_t out[4096];
+        size_t n = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, out, sizeof out, &n));
+        STM_ASSERT_MEM_EQ(blk, out, sizeof out);
+        memset(out, 0xa5, sizeof out);
+        STM_ASSERT_OK(stm_fs_read(fs, 1, f, 8192u, out, sizeof out, &n));
+        STM_ASSERT_EQ(n, sizeof out);
+        for (size_t i = 0; i < sizeof out; i++) STM_ASSERT_EQ(out[i], 0u);
+        memset(out, 0xa5, sizeof out);
+        STM_ASSERT_OK(stm_fs_read(fs, 1, f, 256u * 1024u, out, sizeof out, &n));
+        STM_ASSERT_EQ(n, sizeof out);
+        for (size_t i = 0; i < sizeof out; i++) STM_ASSERT_EQ(out[i], 0u);
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+        fs = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        if (!fs) return;
+    }
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_p10_truncate_extent_to_zero_stays_extent) {
     /* ARCH §11.3.3 one-way: truncate to 0 from EXTENT does NOT
      * revert to INLINE. Kind stays EXTENT. */
@@ -2588,12 +2925,6 @@ STM_TEST(fs_p10_truncate_arg_validation) {
     STM_ASSERT_OK(stm_fs_symlink(fs, 1, root, (const uint8_t *)"l", 1,
                                        (const uint8_t *)"x", 1, 0, 0, &lnk));
     STM_ASSERT_ERR(stm_fs_truncate(fs, 1, lnk, 0), STM_EINVAL);
-
-    /* EXTENT-mode sub-block truncate → EINVAL. Force EXTENT first. */
-    uint8_t blk[4096];
-    memset(blk, 'X', sizeof blk);
-    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, 4096));
-    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, 100), STM_EINVAL);   /* not aligned */
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -7820,7 +8151,7 @@ STM_TEST(fs_a_range_shift_that_fails_loses_nothing_durable) {
  * stray extent comes back through a later grow. A growing preallocate
  * changed nothing else, nor did a first write to an inline file that only
  * the buffer took (the failure drops it); each only answers its error. */
-enum { DI_INSERT, DI_PUNCH, DI_TRUNC, DI_WRITE, DI_CUTOVER, DI_TCUT,
+enum { DI_INSERT, DI_PUNCH, DI_TRUNC, DI_TRUNCSUB, DI_WRITE, DI_CUTOVER, DI_TCUT,
        DI_DENSE, DI_BUFFERED, DI_REFLINK, DI_PREALLOC };
 
 static void p7b_data_iset_fail_leg(const char *name, int op)
@@ -7872,6 +8203,7 @@ static void p7b_data_iset_fail_leg(const char *name, int op)
                              STM_FS_FALLOC_FL_KEEP_SIZE);
         break;
     case DI_TRUNC:    r = stm_fs_truncate(fs, 1, ino, K); break;
+    case DI_TRUNCSUB: r = stm_fs_truncate(fs, 1, ino, K + 100u); break;
     case DI_WRITE:    r = stm_fs_write(fs, 1, ino, 2u * K, big, big_n); break;
     case DI_CUTOVER:  r = stm_fs_write(fs, 1, ino, 16u * MIB, "z", 1); break;
     case DI_TCUT:     r = stm_fs_truncate(fs, 1, ino, 16u * K); break;
@@ -7921,6 +8253,7 @@ STM_TEST(fs_an_extent_change_whose_inode_update_fails_commits_nothing) {
     p7b_data_iset_fail_leg("diset_insert", DI_INSERT);
     p7b_data_iset_fail_leg("diset_punch", DI_PUNCH);
     p7b_data_iset_fail_leg("diset_trunc", DI_TRUNC);
+    p7b_data_iset_fail_leg("diset_trunc_sub", DI_TRUNCSUB);
     p7b_data_iset_fail_leg("diset_write", DI_WRITE);
     p7b_data_iset_fail_leg("diset_cutover", DI_CUTOVER);
     p7b_data_iset_fail_leg("diset_tcut", DI_TCUT);

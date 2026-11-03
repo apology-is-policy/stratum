@@ -1346,8 +1346,9 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  * P7-9: POSIX-shape truncate. Shrinks (dataset_id, ino) to `new_size`
  * bytes.
  *
- * Drops every live extent whose `off >= new_size`. If exactly one
- * extent crosses the boundary (`off < new_size < off+len`), it is
+ * new_size here is `size` rounded up to a block. Drops every live extent
+ * whose `off >= new_size`. If exactly one extent crosses the boundary
+ * (`off < new_size < off+len`), or `size` falls in an extent's last block, it is
  * SHRUNK to `[off, new_size)` by reading + decrypting its full
  * plaintext, slicing to the kept prefix, and re-encrypting the
  * prefix under a FRESH (paddr_0, current_gen) AEAD nonce — the
@@ -1358,9 +1359,9 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  * Spec: `extent.tla::Truncate`.
  *
  * MVP constraints:
- *   - `new_size` must be a multiple of `STM_UB_SIZE` (4 KiB blocks).
- *     Non-aligned truncate would require partial-block read+modify+
- *     write at the underlying bdev, deferred.
+ *   - A size inside a block keeps that block, rewritten with zeros past
+ *     the size. Those bytes stay on disk past EOF, so a later grow or append
+ *     reads them as zeros.
  *   - **P7-11**: holds the sync handle's internal lock across all
  *     three phases (lookup → read+re-encrypt → past-extent drop +
  *     drop-route). This makes truncate atomic w.r.t. concurrent
@@ -1401,8 +1402,11 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  *
  * Returns:
  *   STM_OK             — truncate complete.
- *   STM_EINVAL         — bad args (NULL s; ds/ino == 0; new_size
- *                         not block-aligned).
+ *   STM_EINVAL         -- bad args (NULL s; ds/ino == 0; a size past the
+ *                         last block boundary).
+ *   STM_ENOSPC         -- nothing changed: the rewrite found no room, or a
+ *                         snapshot's cold dead list is full. A caller may make
+ *                         room and call again.
  *   STM_EWEDGED        -- sync wedged, before or by this call (an
  *                         index change that failed part way).
  *   STM_EROFS          -- read-only.
@@ -1412,7 +1416,7 @@ stm_status stm_sync_read_extent_at_snap(stm_sync *s, uint64_t dataset_id,
  */
 STM_MUST_USE
 stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
-                                uint64_t new_size, bool *out_changed);
+                                uint64_t size, bool *out_changed);
 
 /*
  * P8-POSIX-7b: punch a hole [off, off+len) in (ds, ino). Drops every

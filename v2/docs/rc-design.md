@@ -326,7 +326,8 @@ restructure on the same pattern:
   crossing-extent re-encrypt stays inside the compound span its
   R41 P3-1/P3-2 + R55 P2-2 atomicity closures (peek-into accuracy,
   commit interleaving) depend on; its weight in the build workload is
-  zero (truncate(0)/aligned shrinks have no crossing extent). The
+  zero (truncate(0) has no crossing extent), though a shrink ending inside
+  a record rewrites it, up to 8 MiB, under s->lock. The
   fine-grained-truncate extension remains the recorded sync.c seam.
   Same-ino compound stability vs the new concurrent writers is the
   fs-layer EX pin (write/truncate/punch/migrate all pin EX; reflink +
