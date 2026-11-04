@@ -102,8 +102,8 @@ struct stm_send_handle {
     uint64_t           from_snap_id;
     uint64_t           to_snap_id;
     uint64_t           to_txg;        /* upper-bound txg for the send */
-    uint64_t           gen_min_excl;  /* extents with gen > this */
-    uint64_t           gen_max_incl;  /* and gen ≤ this */
+    uint64_t           gen_min_excl;  /* extents with link_gen > this */
+    uint64_t           gen_max_incl;  /* and link_gen <= this */
 
     send_extent_meta  *extents;       /* sorted by (ino, off) */
     size_t             n_extents;
@@ -172,10 +172,9 @@ static bool send_collect_cb(const stm_extent_record *e, void *ctx_) {
     /* R48 P0-1: filter by link_gen (the gen at which this record was
      * inserted into the live index), NOT the AEAD gen. Reflinked
      * records inherit AEAD gen from src but stamp link_gen at
-     * reflink-time, so the (S_from, S_to] window catches them. For
-     * non-reflinked extents link_gen == gen so the semantics match
-     * pre-P7-16 (full + incremental still align with `extent.gen`-
-     * sourced bracketing). */
+     * reflink-time, so the window catches them: from S_from's capture up
+     * to S_to's, a record stamped with a capture's own value being after
+     * it. For non-reflinked extents link_gen == gen. */
     if (e->link_gen <= h->gen_min_excl) return true;
     if (e->link_gen > h->gen_max_incl)  return true;
     /* P7-CAS-9: extent kind validates differently for HOT vs COLD.
@@ -262,33 +261,40 @@ stm_status stm_send_init(stm_sync *sync,
      * snap-create. This is the SAME counter space as `extent.gen`, so
      * the filter `gen_min_excl < extent.gen <= gen_max_incl` is now
      * authoritative (was best-effort pre-P7-8 when we used
-     * `created_txg`, the snap-index counter). */
+     * `created_txg`, the snap-index counter). A capture's own gen is
+     * after it: the view is strictly below extent_txg, and the first
+     * write after the capture lands on it. */
+    uint64_t from_txg = 0, to_txg = 0;
+    stm_snapshot_entry to_entry;
+    memset(&to_entry, 0, sizeof to_entry);
     if (from_snap_id != 0) {
         stm_snapshot_entry from_entry;
         stm_status ls = stm_snapshot_lookup(snap_idx, from_snap_id, &from_entry);
         if (ls != STM_OK) return STM_ENOENT;
         if (from_entry.dataset_id != dataset_id) return STM_EINVAL;
-        gen_min_excl = from_entry.extent_txg;
+        from_txg = from_entry.extent_txg;
+        gen_min_excl = from_txg != 0 ? from_txg - 1u : 0u;
     }
     if (to_snap_id != 0) {
-        stm_snapshot_entry to_entry;
         stm_status ls = stm_snapshot_lookup(snap_idx, to_snap_id, &to_entry);
         if (ls != STM_OK) return STM_ENOENT;
         if (to_entry.dataset_id != dataset_id) return STM_EINVAL;
-        gen_max_incl = to_entry.extent_txg;
+        to_txg = to_entry.extent_txg;
+        gen_max_incl = to_txg != 0 ? to_txg - 1u : 0u;
     } else {
         /* Full or open-ended: cap at the index's current_txg. */
         stm_extent_index *eidx = stm_sync_extent_index(sync);
         if (!eidx) return STM_EINVAL;
         stm_status ts = stm_extent_index_current_txg(eidx, &gen_max_incl);
         if (ts != STM_OK) return ts;
+        to_txg = gen_max_incl;
     }
     /* From > To is nonsense — incremental send across snaps must have
      * the older snap (from) captured at a strictly LOWER extent_txg
      * than the newer (to). Equal extent_txg means no Write happened
      * between the two — empty diff, but still rejected here as a
      * caller bug rather than silently producing zero EXTENT records. */
-    if (from_snap_id != 0 && to_snap_id != 0 && gen_min_excl >= gen_max_incl)
+    if (from_snap_id != 0 && to_snap_id != 0 && from_txg >= to_txg)
         return STM_EINVAL;
 
     stm_send_handle *h = calloc(1, sizeof(*h));
@@ -297,7 +303,7 @@ stm_status stm_send_init(stm_sync *sync,
     h->dataset_id   = dataset_id;
     h->from_snap_id = from_snap_id;
     h->to_snap_id   = to_snap_id;
-    h->to_txg       = gen_max_incl;
+    h->to_txg       = to_txg;
     h->gen_min_excl = gen_min_excl;
     h->gen_max_incl = gen_max_incl;
 
@@ -311,8 +317,15 @@ stm_status stm_send_init(stm_sync *sync,
         free(h);
         return STM_EINVAL;
     }
+    /* A snapshot's stream comes from its own tree: a record overwritten since is in
+     * no live tree, and its blocks stay while the snapshot does. A zero root is an
+     * empty capture, where the window above leaves nothing of the live tree. */
     send_collect_ctx cc = { .h = h, .err = STM_OK };
-    stm_status is = stm_extent_iter_ds(eidx, dataset_id, send_collect_cb, &cc);
+    stm_status is = (to_snap_id != 0 && to_entry.tree_root_paddr != 0)
+        ? stm_extent_iter_ds_at(eidx, dataset_id, to_entry.tree_root_paddr,
+                                to_entry.root_gen, to_entry.root_csum,
+                                send_collect_cb, &cc)
+        : stm_extent_iter_ds(eidx, dataset_id, send_collect_cb, &cc);
     if (is != STM_OK || cc.err != STM_OK) {
         free(h->extents);
         stm_blake3_free(h->hasher);

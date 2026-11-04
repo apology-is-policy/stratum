@@ -85,6 +85,8 @@ struct stm_snapshot_index {
     size_t          slots_len;
     size_t          slots_cap;
     uint64_t        next_id;       /* monotonic; starts at 1 */
+    uint64_t        retained_blocks;  /* past a dead list; RAM only */
+    uint64_t        retained_nodes;
     uint64_t        current_txg;
 
     /* ----- Persistence (P6-persist), mirrors stm_dataset_index. ----- */
@@ -98,6 +100,7 @@ struct stm_snapshot_index {
     uint64_t        root_gen;
     uint8_t         root_csum[32];
     bool            dirty;
+    bool            boot_lists_unverified;
 
     /* ----- Clone-dependency hook (P6-clone). ----- */
     stm_snapshot_clone_check_cb clone_check_cb;
@@ -434,16 +437,111 @@ stm_status stm_snapshot_create_for_test(stm_snapshot_index *idx,
                                     extent_txg,
                                     /*skip_chain_check=*/true, out_id);
 }
+
+stm_status stm_snapshot_set_prev_for_test(stm_snapshot_index *idx,
+                                          uint64_t snapshot_id,
+                                          uint64_t prev_snap_id) {
+    if (!idx) return STM_EINVAL;
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, snapshot_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    idx->slots[s].e.prev_snap_id = prev_snap_id;
+    idx->dirty = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
 #endif /* STRATUM_BUILD_TESTING_HOOKS */
 
-stm_status stm_snapshot_delete(stm_snapshot_index *idx,
-                                 uint64_t snapshot_id,
-                                 uint64_t **out_freed_paddrs,
-                                 size_t *out_freed_count,
-                                 uint8_t **out_freed_cold_hashes,
-                                 size_t *out_freed_cold_count,
-                                 uint64_t **out_freed_boot_paddrs,
-                                 size_t *out_freed_boot_count) {
+/* The nearest older PRESENT snapshot of slot `s`'s dataset, or (size_t)-1. */
+static size_t older_neighbour_locked(const stm_snapshot_index *idx, size_t s)
+{
+    size_t best = (size_t)-1;
+    const snapshot_slot *me = &idx->slots[s];
+    for (size_t k = 0; k < idx->slots_len; k++) {
+        const snapshot_slot *c = &idx->slots[k];
+        if (k == s || !c->present) continue;
+        if (c->e.dataset_id != me->e.dataset_id) continue;
+        if (c->e.snapshot_id >= me->e.snapshot_id) continue;
+        if (best == (size_t)-1 ||
+            c->e.snapshot_id > idx->slots[best].e.snapshot_id) best = k;
+    }
+    return best;
+}
+
+/* Grow *list so it holds `want` elements of `elem` bytes, up to `max`. On a failed
+ * grow the list keeps what it has and *cap is unchanged, and the caller retains. */
+static void list_grow_locked(void **list, size_t *cap, size_t want, size_t max,
+                             size_t elem)
+{
+    if (want > max) want = max;
+    if (want <= *cap) return;
+    void *grown = realloc(*list, want * elem);
+    if (!grown) return;
+    *list = grown;
+    *cap  = want;
+}
+
+/* Move slot `from`'s lists onto slot `to`, which may not have room: past its caps
+ * or out of memory an entry stays allocated with no list naming it, counted, as a
+ * drop past a list does. A cold hash past the cap is a deref never made. */
+static void merge_dead_lists_locked(stm_snapshot_index *idx, size_t from,
+                                    size_t to)
+{
+    snapshot_slot *f = &idx->slots[from];
+    snapshot_slot *t = &idx->slots[to];
+
+    list_grow_locked((void **)&t->dead_list, &t->dead_capacity,
+                     t->dead_count + f->dead_count, STM_SNAP_DEAD_LIST_MAX,
+                     sizeof(uint64_t));
+    for (size_t i = 0; i < f->dead_count; i++) {
+        if (t->dead_count < t->dead_capacity) {
+            t->dead_list[t->dead_count++] = f->dead_list[i];
+        } else {
+            idx->retained_blocks++;
+        }
+    }
+    f->dead_count = 0;
+
+    list_grow_locked((void **)&t->boot_dead_list, &t->boot_dead_capacity,
+                     t->boot_dead_count + f->boot_dead_count,
+                     STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX, sizeof(uint64_t));
+    for (size_t i = 0; i < f->boot_dead_count; i++) {
+        if (t->boot_dead_count < t->boot_dead_capacity) {
+            t->boot_dead_list[t->boot_dead_count++] = f->boot_dead_list[i];
+        } else {
+            idx->retained_nodes++;
+        }
+    }
+    f->boot_dead_count = 0;
+
+    list_grow_locked((void **)&t->cold_dead_list, &t->cold_dead_capacity,
+                     t->cold_dead_count + f->cold_dead_count,
+                     STM_SNAP_COLD_DEAD_LIST_MAX, STM_SNAP_HASH_LEN);
+    for (size_t i = 0; i < f->cold_dead_count; i++) {
+        if (t->cold_dead_count < t->cold_dead_capacity) {
+            memcpy(t->cold_dead_list + t->cold_dead_count * STM_SNAP_HASH_LEN,
+                   f->cold_dead_list + i * STM_SNAP_HASH_LEN, STM_SNAP_HASH_LEN);
+            t->cold_dead_count++;
+        } else {
+            idx->retained_blocks++;
+        }
+    }
+    f->cold_dead_count = 0;
+    idx->dirty = true;
+}
+
+static stm_status snapshot_delete_common(stm_snapshot_index *idx,
+                                         uint64_t snapshot_id,
+                                         bool move_down,
+                                         uint64_t **out_freed_paddrs,
+                                         size_t *out_freed_count,
+                                         uint8_t **out_freed_cold_hashes,
+                                         size_t *out_freed_cold_count,
+                                         uint64_t **out_freed_boot_paddrs,
+                                         size_t *out_freed_boot_count) {
     if (!idx || !out_freed_paddrs || !out_freed_count
         || !out_freed_cold_hashes || !out_freed_cold_count) return STM_EINVAL;
     /* R158 P3-5: zero the existing pair outputs BEFORE the mismatched-
@@ -485,12 +583,20 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
         must_unlock(&idx->lock);
         return STM_EBUSY;
     }
+    /* An older snapshot of the dataset may name anything on these lists: a block
+     * in both views goes on the newer's list when it is overwritten. The lists
+     * carry no birth to tell, so with an older PRESENT neighbour they all move to
+     * it and nothing is freed; the oldest snapshot's delete frees what is left
+     * (dead_list.tla::SnapDelete). A block only the deleted one held costs space
+     * until then. */
+    if (move_down) {
+        size_t older = older_neighbour_locked(idx, s);
+        if (older != (size_t)-1) merge_dead_lists_locked(idx, s, older);
+    }
     /* P6-deadlist + P7-CAS-4c + 9.7-impl-2-routing: transfer ALL THREE
-     * dead-lists to caller. In dead_list.tla's single-ownership model,
-     * all entries are unique-and-freed; the predecessor-merge step is
-     * empty so we just hand off the full lists for caller-side reclaim
-     * (stm_alloc_free for the paddr-tier, stm_cas_deref for cold, and
-     * stm_bootstrap_free for the engine NODE bootstrap-tier).
+     * dead-lists to caller for reclaim (stm_alloc_free for the paddr-tier,
+     * stm_cas_deref for cold, and stm_bootstrap_free for the engine NODE
+     * bootstrap-tier): empty when they moved to an older neighbour.
      *
      * If the caller passes NULL out_freed_boot_paddrs (back-compat
      * surface for tests that don't wire engine NODE retention), the
@@ -530,10 +636,45 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
     slot->boot_dead_count    = 0;
     slot->boot_dead_capacity = 0;
 
+    /* Absent slots are not encoded: the next snapshot's link goes past this one. */
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        snapshot_slot *next = &idx->slots[i];
+        if (next->present && next->e.prev_snap_id == snapshot_id)
+            next->e.prev_snap_id = slot->e.prev_snap_id;
+    }
+
     slot->present = false;
     idx->dirty    = true;
     must_unlock(&idx->lock);
     return STM_OK;
+}
+
+stm_status stm_snapshot_delete(stm_snapshot_index *idx,
+                                 uint64_t snapshot_id,
+                                 uint64_t **out_freed_paddrs,
+                                 size_t *out_freed_count,
+                                 uint8_t **out_freed_cold_hashes,
+                                 size_t *out_freed_cold_count,
+                                 uint64_t **out_freed_boot_paddrs,
+                                 size_t *out_freed_boot_count) {
+    return snapshot_delete_common(idx, snapshot_id, true,
+                                  out_freed_paddrs, out_freed_count,
+                                  out_freed_cold_hashes, out_freed_cold_count,
+                                  out_freed_boot_paddrs, out_freed_boot_count);
+}
+
+stm_status stm_snapshot_delete_past_rollback(stm_snapshot_index *idx,
+                                             uint64_t snapshot_id,
+                                             uint64_t **out_freed_paddrs,
+                                             size_t *out_freed_count,
+                                             uint8_t **out_freed_cold_hashes,
+                                             size_t *out_freed_cold_count,
+                                             uint64_t **out_freed_boot_paddrs,
+                                             size_t *out_freed_boot_count) {
+    return snapshot_delete_common(idx, snapshot_id, false,
+                                  out_freed_paddrs, out_freed_count,
+                                  out_freed_cold_hashes, out_freed_cold_count,
+                                  out_freed_boot_paddrs, out_freed_boot_count);
 }
 
 /* 9.7-impl-4 (rollback): free + zero all three of a PRESENT snapshot's
@@ -577,6 +718,62 @@ stm_status stm_snapshot_clear_dead_lists(stm_snapshot_index *idx,
     if (had_any) idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
+}
+
+/* Caller holds the lock. `s` names a PRESENT slot or is (size_t)-1. The capture
+ * reads current_gen after its own commit, so the view is strictly below it and
+ * the first write after the capture lands on it. */
+static bool born_after_slot_locked(const stm_snapshot_index *idx, size_t s,
+                                   uint64_t birth_gen)
+{
+    if (s == (size_t)-1 || !idx->slots[s].present) return false;
+    const uint64_t txg = idx->slots[s].e.extent_txg;
+    return birth_gen != 0 && txg != 0 && birth_gen >= txg;
+}
+
+bool stm_snapshot_index_outside_view(const stm_snapshot_index *idx,
+                                     uint64_t snapshot_id, uint64_t birth_gen)
+{
+    if (!idx) return false;
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+    bool out = born_after_slot_locked(idx, find_slot_locked(idx, snapshot_id), birth_gen);
+    must_unlock(lock);
+    return out;
+}
+
+bool stm_snapshot_index_born_after_most_recent(const stm_snapshot_index *idx,
+                                               uint64_t dataset_id,
+                                               uint64_t birth_gen)
+{
+    if (!idx || dataset_id == 0) return false;
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+    uint64_t mr = most_recent_locked(idx, dataset_id);
+    bool after = mr != STM_SNAP_NO_PREV &&
+                 born_after_slot_locked(idx, find_slot_locked(idx, mr), birth_gen);
+    must_unlock(lock);
+    return after;
+}
+
+void stm_snapshot_index_note_retained(stm_snapshot_index *idx, bool node)
+{
+    if (!idx) return;
+    must_lock(&idx->lock);
+    if (node) idx->retained_nodes++;
+    else      idx->retained_blocks++;
+    must_unlock(&idx->lock);
+}
+
+void stm_snapshot_index_retained(const stm_snapshot_index *idx,
+                                 uint64_t *out_blocks, uint64_t *out_nodes)
+{
+    if (!idx) return;
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+    if (out_blocks) *out_blocks = idx->retained_blocks;
+    if (out_nodes)  *out_nodes  = idx->retained_nodes;
+    must_unlock(lock);
 }
 
 stm_status stm_snapshot_index_overwrite_block(stm_snapshot_index *idx,
@@ -928,198 +1125,6 @@ stm_status stm_snapshot_index_overwrite_cold_block(stm_snapshot_index *idx,
     return STM_OK;
 }
 
-/* ========================================================================= */
-/* 9.7-impl-6b: clone routing variants — append to a SPECIFIC snap_id's        */
-/* dead-list (paddr / boot / cold tiers). Used by the clone path's            */
-/* engine_store_free + sync.c overwrite dispatch when the engine's            */
-/* origin_snap_id is set (see phase-9.7-design.md §9.1).                      */
-/*                                                                            */
-/* These are siblings of the existing _overwrite_*_block family but route to  */
-/* a caller-supplied snap_id directly, skipping the                           */
-/* `most_recent_locked(dataset_id)` step that's wrong for clones (a clone's   */
-/* drop of a paddr in origin snap S's view must land in S's dead-list, NOT    */
-/* in the most-recent snap of the clone's own dataset). The single-ownership  */
-/* scan + caps + realloc-doubling growth logic is identical to the parent     */
-/* APIs — only the slot lookup changes.                                       */
-/* ========================================================================= */
-
-stm_status stm_snapshot_index_add_to_snap_dead_list(stm_snapshot_index *idx,
-                                                       uint64_t snap_id,
-                                                       uint64_t paddr) {
-    if (!idx) return STM_EINVAL;
-    if (snap_id == 0) return STM_EINVAL;
-    if (paddr == 0) return STM_EINVAL;  /* paddr=0 reserved sentinel */
-
-    must_lock(&idx->lock);
-
-    size_t s = find_slot_locked(idx, snap_id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
-        must_unlock(&idx->lock);
-        return STM_ENOENT;
-    }
-
-    snapshot_slot *slot = &idx->slots[s];
-
-    /* R33 P2 single-ownership defense (paddr tier) — identical scan to
-     * _overwrite_block: a paddr in ONE PRESENT snap's dead_list cannot
-     * appear in another's. The clone path doesn't introduce a new tier
-     * — it routes to the same dead_list[] storage — so the scan covers
-     * both producer paths uniformly. */
-    for (size_t k = 0; k < idx->slots_len; k++) {
-        const snapshot_slot *sk = &idx->slots[k];
-        if (!sk->present) continue;
-        for (size_t j = 0; j < sk->dead_count; j++) {
-            if (sk->dead_list[j] == paddr) {
-                must_unlock(&idx->lock);
-                return STM_EINVAL;
-            }
-        }
-    }
-
-    if (slot->dead_count >= STM_SNAP_DEAD_LIST_MAX) {
-        must_unlock(&idx->lock);
-        return STM_ENOSPC;
-    }
-
-    if (slot->dead_count == slot->dead_capacity) {
-        size_t new_cap = slot->dead_capacity == 0 ? 8u : slot->dead_capacity * 2u;
-        if (new_cap > STM_SNAP_DEAD_LIST_MAX) new_cap = STM_SNAP_DEAD_LIST_MAX;
-        uint64_t *new_buf = realloc(slot->dead_list,
-                                       new_cap * sizeof(uint64_t));
-        if (!new_buf) {
-            must_unlock(&idx->lock);
-            return STM_ENOMEM;
-        }
-        slot->dead_list     = new_buf;
-        slot->dead_capacity = new_cap;
-    }
-
-    slot->dead_list[slot->dead_count++] = paddr;
-    idx->dirty = true;
-    must_unlock(&idx->lock);
-    return STM_OK;
-}
-
-stm_status stm_snapshot_index_add_to_snap_bootstrap_dead_list(
-    stm_snapshot_index *idx,
-    uint64_t snap_id,
-    uint64_t paddr) {
-    if (!idx) return STM_EINVAL;
-    if (snap_id == 0) return STM_EINVAL;
-    if (paddr == 0) return STM_EINVAL;
-
-    must_lock(&idx->lock);
-
-    size_t s = find_slot_locked(idx, snap_id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
-        must_unlock(&idx->lock);
-        return STM_ENOENT;
-    }
-
-    snapshot_slot *slot = &idx->slots[s];
-
-    /* R33 P2 single-ownership defense (boot tier) — scoped to the boot
-     * tier; alloc-tier paddr-bit-pattern collisions are intentionally
-     * permitted. Mirrors _overwrite_bootstrap_block. */
-    for (size_t k = 0; k < idx->slots_len; k++) {
-        const snapshot_slot *sk = &idx->slots[k];
-        if (!sk->present) continue;
-        for (size_t j = 0; j < sk->boot_dead_count; j++) {
-            if (sk->boot_dead_list[j] == paddr) {
-                must_unlock(&idx->lock);
-                return STM_EINVAL;
-            }
-        }
-    }
-
-    if (slot->boot_dead_count >= STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX) {
-        must_unlock(&idx->lock);
-        return STM_ENOSPC;
-    }
-
-    if (slot->boot_dead_count == slot->boot_dead_capacity) {
-        size_t new_cap = slot->boot_dead_capacity == 0
-                            ? 8u
-                            : slot->boot_dead_capacity * 2u;
-        if (new_cap > STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX) {
-            new_cap = STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX;
-        }
-        uint64_t *new_buf = realloc(slot->boot_dead_list,
-                                       new_cap * sizeof(uint64_t));
-        if (!new_buf) {
-            must_unlock(&idx->lock);
-            return STM_ENOMEM;
-        }
-        slot->boot_dead_list     = new_buf;
-        slot->boot_dead_capacity = new_cap;
-    }
-
-    slot->boot_dead_list[slot->boot_dead_count++] = paddr;
-    idx->dirty = true;
-    must_unlock(&idx->lock);
-    return STM_OK;
-}
-
-stm_status stm_snapshot_index_add_to_snap_cold_dead_list(
-    stm_snapshot_index *idx,
-    uint64_t snap_id,
-    const uint8_t content_hash[STM_SNAP_HASH_LEN]) {
-    if (!idx) return STM_EINVAL;
-    if (snap_id == 0) return STM_EINVAL;
-    if (!content_hash) return STM_EINVAL;
-    /* Reject all-zero hash (CAS sentinel). */
-    bool any_nonzero = false;
-    for (size_t k = 0; k < STM_SNAP_HASH_LEN; k++) {
-        if (content_hash[k] != 0) { any_nonzero = true; break; }
-    }
-    if (!any_nonzero) return STM_EINVAL;
-
-    must_lock(&idx->lock);
-
-    size_t s = find_slot_locked(idx, snap_id);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
-        must_unlock(&idx->lock);
-        return STM_ENOENT;
-    }
-
-    snapshot_slot *slot = &idx->slots[s];
-
-    /* R54 P1-1: NO within-snap dedup-defense scan for cold hashes.
-     * The cold_dead_list is a MULTISET — distinct cold records may
-     * legitimately share a hash via content-defined dedup. See
-     * _overwrite_cold_block's R54 P1-1 doctrine note for the full
-     * rationale (the clone path inherits it verbatim — same multiset
-     * semantics, same per-entry deref obligation). */
-
-    if (slot->cold_dead_count >= STM_SNAP_COLD_DEAD_LIST_MAX) {
-        must_unlock(&idx->lock);
-        return STM_ENOSPC;
-    }
-
-    if (slot->cold_dead_count == slot->cold_dead_capacity) {
-        size_t new_cap = slot->cold_dead_capacity == 0
-                            ? 8u : slot->cold_dead_capacity * 2u;
-        if (new_cap > STM_SNAP_COLD_DEAD_LIST_MAX) {
-            new_cap = STM_SNAP_COLD_DEAD_LIST_MAX;
-        }
-        uint8_t *new_buf = realloc(slot->cold_dead_list,
-                                      new_cap * STM_SNAP_HASH_LEN);
-        if (!new_buf) {
-            must_unlock(&idx->lock);
-            return STM_ENOMEM;
-        }
-        slot->cold_dead_list     = new_buf;
-        slot->cold_dead_capacity = new_cap;
-    }
-
-    memcpy(slot->cold_dead_list + slot->cold_dead_count * STM_SNAP_HASH_LEN,
-            content_hash, STM_SNAP_HASH_LEN);
-    slot->cold_dead_count++;
-    idx->dirty = true;
-    must_unlock(&idx->lock);
-    return STM_OK;
-}
-
 stm_status stm_snapshot_cold_dead_list_count(const stm_snapshot_index *idx,
                                                  uint64_t snapshot_id,
                                                  size_t *out_count) {
@@ -1173,51 +1178,6 @@ stm_status stm_snapshot_cold_dead_list_get(stm_snapshot_index *idx,
     *out_hashes = buf;
     *out_count  = n;
     must_unlock(&idx->lock);
-    return STM_OK;
-}
-
-/* P7-CAS-4 R54 P3-2: pre-check capacity for n_to_append entries against
- * the most-recent PRESENT snap. See snapshot.h for semantics. */
-stm_status stm_snapshot_index_cold_dead_list_reserve(
-        const stm_snapshot_index *idx,
-        uint64_t dataset_id,
-        size_t n_to_append,
-        bool *out_can_accept) {
-    if (!idx || !out_can_accept) return STM_EINVAL;
-    if (dataset_id == 0) return STM_EINVAL;
-
-    pthread_mutex_t *lock = snap_lock(idx);
-    must_lock(lock);
-
-    uint64_t mr = most_recent_locked(idx, dataset_id);
-    if (mr == STM_SNAP_NO_PREV) {
-        /* No most-recent PRESENT snap → bookend will direct-deref;
-         * no cold-dead-list slot consumed. */
-        *out_can_accept = true;
-        must_unlock(lock);
-        return STM_OK;
-    }
-
-    size_t s = find_slot_locked(idx, mr);
-    if (s == (size_t)-1 || !idx->slots[s].present) {
-        must_unlock(lock);
-        return STM_ECORRUPT;
-    }
-
-    size_t current = idx->slots[s].cold_dead_count;
-    /* Saturating-sum guard: reject SIZE_MAX-shaped n_to_append before it
-     * wraps into a misleading "fits" answer. Realistic n_to_append values
-     * are bounded by the per-write cold-overlap count (a few hundred
-     * worst-case under FastCDC + recordsize), but defensive math is
-     * cheap. */
-    if (n_to_append > STM_SNAP_COLD_DEAD_LIST_MAX) {
-        *out_can_accept = false;
-    } else if (current > STM_SNAP_COLD_DEAD_LIST_MAX - n_to_append) {
-        *out_can_accept = false;
-    } else {
-        *out_can_accept = true;
-    }
-    must_unlock(lock);
     return STM_OK;
 }
 
@@ -1857,12 +1817,19 @@ stm_status stm_snapshot_index_get_gen(const stm_snapshot_index *idx,
  * is NULL (a read-only walk never frees). An all-zero captured root (empty
  * snapshot) has no engine nodes and is skipped. */
 struct sp_recon_relay { stm_reconcile_mark_fn fn; void *ctx; uint32_t nblocks; };
+static int sp_recon_newer_first(const void *a, const void *b) {
+    const snapshot_slot *x = *(snapshot_slot *const *)a;
+    const snapshot_slot *y = *(snapshot_slot *const *)b;
+    if (x->e.snapshot_id == y->e.snapshot_id) return 0;
+    return x->e.snapshot_id < y->e.snapshot_id ? 1 : -1;
+}
 static int sp_recon_cb(uint64_t paddr, void *p) {
     struct sp_recon_relay *r = p;
     r->fn(r->ctx, paddr, r->nblocks);
     return 0;
 }
 stm_status stm_snapshot_index_reconcile_mark(stm_snapshot_index *idx,
+                                                stm_bootstrap *boot,
                                                 stm_reconcile_mark_fn fn,
                                                 void *ctx) {
     if (!idx || !fn) return STM_EINVAL;
@@ -1878,6 +1845,8 @@ stm_status stm_snapshot_index_reconcile_mark(stm_snapshot_index *idx,
                                           sp_recon_cb, &relay);
     }
 
+    if (s == STM_OK) s = stm_bootstrap_reconcile_split(boot);
+
     /* engine cx == index cx today: a single pool-wide metadata_key + uuids,
      * and tree_id is NOT AEAD-bound (plaintext n_tree_id only), so opening the
      * captured engine with the snapshot index's key decrypts correctly.
@@ -1886,9 +1855,35 @@ stm_status stm_snapshot_index_reconcile_mark(stm_snapshot_index *idx,
      * every captured-engine walk returns STM_EBADTAG -> abort -> no snapshot-
      * tier reclaim (the #791 leak silently returns for pools with snapshots). */
     stm_btree_crypt_ctx ecx = sp_make_crypt_ctx(idx);
-    for (size_t i = 0; s == STM_OK && i < idx->slots_len; i++) {
-        snapshot_slot *sl = &idx->slots[i];
-        if (!sl->present) continue;
+    snapshot_slot **order = NULL;
+    size_t n_order = 0;
+    if (s == STM_OK && idx->slots_len != 0) {
+        order = malloc(idx->slots_len * sizeof *order);
+        if (!order) s = STM_ENOMEM;
+    }
+    if (s == STM_OK) {
+        for (size_t i = 0; i < idx->slots_len; i++)
+            if (idx->slots[i].present) order[n_order++] = &idx->slots[i];
+        if (n_order > 1) qsort(order, n_order, sizeof *order, sp_recon_newer_first);
+    }
+    /* Newest first, so what is marked when a slot's turn comes is what strictly newer
+     * views name. A list entry is never in one: it sits on the newest view naming its
+     * node, and an entry moved down names no view above where it landed; only a clone
+     * shares a node across datasets, and a clone has no snapshots. A node there was swept
+     * by an older mount and reissued, so the entry holds nothing. Freed by the snapshot's
+     * delete, it would go from under that view. */
+    for (size_t k = 0; s == STM_OK && k < n_order; k++) {
+        snapshot_slot *sl = order[k];
+        size_t kept_entries = 0;
+        for (size_t j = 0; j < sl->boot_dead_count; j++) {
+            uint64_t paddr = sl->boot_dead_list[j];
+            if (stm_bootstrap_reconcile_view_holds(boot, paddr)) {
+                idx->dirty = true;
+                continue;
+            }
+            sl->boot_dead_list[kept_entries++] = paddr;
+        }
+        sl->boot_dead_count = kept_entries;
         if (sl->e.tree_root_paddr == 0) continue;       /* no captured engine root */
         stm_engine_store_ctx ectx = {
             .boot = idx->boot, .bdev = idx->bdev, .snap_idx = NULL,
@@ -1904,9 +1899,45 @@ stm_status stm_snapshot_index_reconcile_mark(stm_snapshot_index *idx,
         s = stm_btree_engine_walk_paddrs(eng, sp_recon_cb, &relay);
         stm_btree_engine_destroy(eng);
     }
+    free(order);
+
+    /* A node on a list stays allocated until its snapshot lets go, in a view or
+     * not: a delete moves entries to an older neighbour whose view may not name
+     * them. Swept here, it would be reissued to a live tree and that delete would
+     * free it from under the tree. A pool's older mounts did sweep them, so an entry
+     * may name a node gone free or a live tree's by now: it holds nothing, and goes. */
+    for (size_t i = 0; s == STM_OK && i < idx->slots_len; i++) {
+        snapshot_slot *sl = &idx->slots[i];
+        if (!sl->present) continue;
+        size_t kept = 0;
+        for (size_t j = 0; j < sl->boot_dead_count; j++) {
+            uint64_t paddr = sl->boot_dead_list[j];
+            if (stm_bootstrap_reconcile_entry_stale(boot, paddr)) {
+                idx->dirty = true;
+                continue;
+            }
+            fn(ctx, paddr, STM_BOOTSTRAP_NODE_BLOCKS);
+            sl->boot_dead_list[kept++] = paddr;
+        }
+        sl->boot_dead_count = kept;
+    }
 
     must_unlock(&idx->lock);
     return s;
+}
+
+void stm_snapshot_index_set_boot_lists_unverified(stm_snapshot_index *idx, bool unverified) {
+    must_lock(&idx->lock);
+    idx->boot_lists_unverified = unverified;
+    must_unlock(&idx->lock);
+}
+
+bool stm_snapshot_index_boot_lists_unverified(const stm_snapshot_index *idx) {
+    stm_snapshot_index *m = (stm_snapshot_index *)idx;
+    must_lock(&m->lock);
+    bool out = m->boot_lists_unverified;
+    must_unlock(&m->lock);
+    return out;
 }
 
 stm_status stm_snapshot_index_get_next_id(const stm_snapshot_index *idx,
@@ -2141,11 +2172,10 @@ static stm_status sp_validate_shadow(const sp_load_ctx *lc) {
             /* prev must point backward (< own id) by SnapIdMonotonic
              * + ChainTxgOrdered. Forward links indicate corruption. */
             if (si->e.prev_snap_id >= si->e.snapshot_id) return STM_ECORRUPT;
-            /* prev must reference a PRESENT slot of the SAME dataset.
-             * (Spec allows prev to reach an ABSENT link, but we don't
-             * encode ABSENT slots so a present prev_snap_id MUST resolve
-             * within the shadow.) */
-            bool found = false;
+            /* A prev that resolves must be a PRESENT slot of the SAME dataset.
+             * One that does not is an ABSENT link, as the spec allows: a delete
+             * did not always re-point its successor, and absent slots are not
+             * encoded, so a pool written then has such links for good. */
             for (size_t j = 0; j < lc->shadow_len; j++) {
                 const snapshot_slot *sj = &lc->shadow_slots[j];
                 if (sj->e.snapshot_id != si->e.prev_snap_id) continue;
@@ -2159,10 +2189,8 @@ static stm_status sp_validate_shadow(const sp_load_ctx *lc) {
                  * rather than serve a chain that silently breaks the
                  * incremental-send filter's monotonicity assumption. */
                 if (si->e.extent_txg < sj->e.extent_txg) return STM_ECORRUPT;
-                found = true;
                 break;
             }
-            if (!found) return STM_ECORRUPT;
         }
     }
 

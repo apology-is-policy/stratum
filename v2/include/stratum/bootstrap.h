@@ -170,6 +170,8 @@ typedef struct {
                                          before their sweep (monotone)         */
     uint64_t early_forced_nodes;      /* of those, taken while a pinned reader
                                          still held them back (monotone)       */
+    uint64_t restored_nodes;          /* free nodes a mount found a tree naming
+                                         and took back (monotone)              */
 } stm_bootstrap_stats;
 
 /* ========================================================================= */
@@ -401,6 +403,19 @@ stm_status stm_bootstrap_reconcile_begin(stm_bootstrap *a);
 STM_MUST_USE
 stm_status stm_bootstrap_reconcile_mark(stm_bootstrap *a, uint64_t paddr,
                                         uint32_t nblocks);
+/* The marks so far are the live trees'; the marks from here on are the snapshots'. A
+ * node either set marks stays, as ever. */
+STM_MUST_USE
+stm_status stm_bootstrap_reconcile_split(stm_bootstrap *a);
+
+/* Past the split: a snapshot's list entry for this node names nothing it may free, since
+ * the node is free already, or a live tree holds it and no view does. A clone's live tree
+ * reaches what its snapshot names, so being live alone says nothing. */
+bool stm_bootstrap_reconcile_entry_stale(const stm_bootstrap *a, uint64_t paddr);
+
+/* Past the split: whether a snapshot's walk has marked this node. */
+bool stm_bootstrap_reconcile_view_holds(const stm_bootstrap *a, uint64_t paddr);
+
 STM_MUST_USE
 stm_status stm_bootstrap_reconcile_end(stm_bootstrap *a, uint64_t *out_freed_nodes);
 

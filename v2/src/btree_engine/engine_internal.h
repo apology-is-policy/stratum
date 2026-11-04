@@ -525,6 +525,7 @@ stm_status eng_cache_put(eng_cache *c, uint64_t paddr, eng_node *node);
  */
 typedef struct {
     uint64_t *v;
+    uint64_t *born;     /* parallel to v: each node's birth gen, 0 unknown */
     uint32_t  n;
     uint32_t  cap;
 } paddr_vec;
@@ -535,7 +536,7 @@ typedef struct {
  * that records the result cannot fail); `push` appends, growing on
  * demand. */
 STM_MUST_USE stm_status paddr_vec_reserve(paddr_vec *v, uint32_t additional);
-STM_MUST_USE stm_status paddr_vec_push(paddr_vec *v, uint64_t p);
+STM_MUST_USE stm_status paddr_vec_push(paddr_vec *v, uint64_t p, uint64_t born);
 void                    paddr_vec_free(paddr_vec *v);
 
 /*

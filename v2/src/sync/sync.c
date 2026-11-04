@@ -2027,9 +2027,9 @@ static uint64_t compute_auth_gen(const sync_scan *scans, size_t n, size_t quorum
 /*                                                                            */
 /* It is BEST-EFFORT and never fails the mount: a mark error or a missing     */
 /* handle ABORTS the pass without sweeping (an incomplete mark must never free */
-/* a live node -- abort leaves the bitmap as found, reclaiming nothing). On a  */
-/* cleanly-unmounted pool every allocated node is reachable, so freed == 0;    */
-/* freed > 0 is exactly the reclaimed crash-orphans.                          */
+/* a live node -- abort leaves the bitmap as found, reclaiming nothing). freed  */
+/* > 0 is no sign of a crash: a pending free is not rebuilt on open, so the    */
+/* last commit's own frees are swept here after a clean unmount too.           */
 /*                                                                            */
 /* COMPLETENESS is the obligation here -- a bootstrap-backed tree left unwalked */
 /* has its live nodes swept -> corruption. The full set: alloc (data-area     */
@@ -2069,7 +2069,7 @@ static void sync_reconcile_bootstrap(stm_sync *s) {
     SYNC_RECON_MARK(stm_repair_log_index_reconcile_mark(s->repair_log, sync_recon_mark, &route));
     SYNC_RECON_MARK(stm_cas_index_reconcile_mark(s->cas_idx, sync_recon_mark, &route));
     SYNC_RECON_MARK(stm_dataset_index_reconcile_mark(s->dataset_idx, sync_recon_mark, &route));
-    SYNC_RECON_MARK(stm_snapshot_index_reconcile_mark(s->snap_idx, sync_recon_mark, &route));
+    SYNC_RECON_MARK(stm_snapshot_index_reconcile_mark(s->snap_idx, boot, sync_recon_mark, &route));
     #undef SYNC_RECON_MARK
 
     /* Abort (no sweep) on either a walk-level error OR a leaf-mark rejection:
@@ -2079,8 +2079,10 @@ static void sync_reconcile_bootstrap(stm_sync *s) {
         return;
     }
     uint64_t freed = 0;
-    if (stm_bootstrap_reconcile_end(boot, &freed) == STM_OK)
+    if (stm_bootstrap_reconcile_end(boot, &freed) == STM_OK) {
         s->reconcile_freed_nodes = freed;
+        stm_snapshot_index_set_boot_lists_unverified(s->snap_idx, false);
+    }
 }
 
 stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
@@ -2798,6 +2800,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
      * are reusable this mount (durable on the next commit). Best-effort; never
      * fails the mount. Skipped on a read-only pool (no commit will persist the
      * swept bitmap, and a RO pool issues no reserves to brick on). */
+    if (s2->snap_idx) stm_snapshot_index_set_boot_lists_unverified(s2->snap_idx, true);
     if (!s2->read_only) sync_reconcile_bootstrap(s2);
 
     *out_sync = s2;
@@ -5556,8 +5559,8 @@ stm_status stm_sync_evict_dek(stm_sync *s, uint64_t dataset_id)
  * pattern. `sync_dataset_origin_snap_id_locked` (the data + cold
  * tier clone dispatch helper) is called under `s->lock` and briefly
  * takes + releases `dataset_idx->lock` (via stm_dataset_lookup);
- * the caller then calls `stm_snapshot_index_add_to_snap_*_dead_list`
- * which briefly takes + releases `snap_idx->lock`. The dataset
+ * the caller then calls `stm_snapshot_index_outside_view`, which briefly
+ * takes + releases `snap_idx->lock`. The dataset
  * lock is released BEFORE the snap lock is acquired — the two
  * locks never overlap — so no NEW nested edge is introduced. The
  * pattern enumeration post-impl-6d is:
@@ -5873,7 +5876,32 @@ void stm_sync_fail_next_drop_for_test(stm_sync *s, unsigned drop_n,
 }
 #endif
 
-static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t paddr) {
+/* A snapshot's list refused a block it should hold: at its cap, or out of memory
+ * to grow. The live index has already let go of the block and the snapshot's view
+ * still names it, so it stays allocated with no list entry. Freeing it would lose
+ * the snapshot, and a buffered write's drain cannot be refused: its write() has
+ * answered. The cost is space, once a snapshot is deleted that retained blocks. */
+static stm_status sync_retain_past_dead_list(stm_sync *s, stm_status os)
+{
+    if (os != STM_ENOSPC && os != STM_ENOMEM) return os;
+    stm_snapshot_index_note_retained(s->snap_idx, false);
+    return STM_OK;
+}
+
+/* A clone's record of a block older than its snapshot holds no count, reflink or no:
+ * the snapshot holds the block while the clone stands, and a count here would be one
+ * the origin's drop spends instead of listing the block. With one lineage on each
+ * block's count, the origin's last drop lists it on the newest view naming it, which
+ * nothing on the clone's side could know. */
+static bool sync_record_holds_count(const stm_sync *s, uint64_t ds, uint64_t gen)
+{
+    uint64_t origin_snap_id = sync_dataset_origin_snap_id_locked(s, ds);
+    return origin_snap_id == 0 ||
+           stm_snapshot_index_outside_view(s->snap_idx, origin_snap_id, gen);
+}
+
+static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t paddr,
+                                         uint64_t birth_gen) {
     /* Composes extent.tla::Overwrite-drop with dead_list.tla::OverwriteBlock
      * AND P7-16 reflink refcount semantics:
      *
@@ -5911,43 +5939,55 @@ static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t padd
          * from the live extent index. Surface as STM_ECORRUPT. */
         return STM_ECORRUPT;
     }
+    if (!sync_record_holds_count(s, ds, birth_gen)) return STM_OK;
     if (refcount > 1) {
-        /* Reflink-shared. Just DecRef; the sibling keeps the paddr
-         * alive at the allocator level. snap_idx is NOT consulted —
-         * we don't add a dead_list entry for a paddr that's still
-         * live elsewhere. */
+        /* Reflink-shared: the sibling keeps the block, so it needs no list entry. */
         return stm_alloc_free(s->allocs[dev_id], paddr, s->current_gen);
     }
-    /* refcount == 1: last live reference. Original routing applies.
-     *
-     * 9.7-impl-6d: clone-path dispatch. If the dataset is a clone
-     * (origin_snap_id != 0), drops route to the SPECIFIC origin snap
-     * via the per-snap append API (6b). Non-clone datasets continue
-     * through the legacy most-recent-of-dataset path. Spec mapping:
-     * dead_list.tla::OverwriteBlock with allocator class threaded
-     * through; the clone branch realises §9.1.2 per-snap routing for
-     * clone.tla::CloneCreate's share-root semantics on the data
-     * tier. Mirrors engine_store_free's boot-tier dispatch (impl-6c). */
-    uint64_t origin_snap_id = sync_dataset_origin_snap_id_locked(s, ds);
-    if (origin_snap_id != 0) {
-        /* Clone path — route to the specific origin snap. STM_OK ⇒
-         * snap captured the paddr; allocator MUST NOT see it. No
-         * should_free signal — the explicit snap_id IS the capture.
-         * Any other status surfaces as the drop's rc (caller treats
-         * it best-effort the same way it would a legacy-path error). */
-        stm_status os = stm_snapshot_index_add_to_snap_dead_list(
-            s->snap_idx, origin_snap_id, paddr);
-        return os;
-    }
+    /* A clone's own block is in no view: it never reaches a list. */
+    if (sync_dataset_origin_snap_id_locked(s, ds) != 0)
+        return stm_alloc_free(s->allocs[dev_id], paddr, s->current_gen);
+    /* Born after the most recent snapshot: in no view, so it spends no entry
+     * (ARCH 8.5.5). */
+    if (stm_snapshot_index_born_after_most_recent(s->snap_idx, ds, birth_gen))
+        return stm_alloc_free(s->allocs[dev_id], paddr, s->current_gen);
     /* Non-clone path — original routing. */
     bool should_free = false;
     stm_status os = stm_snapshot_index_overwrite_block(s->snap_idx, ds, paddr,
                                                           &should_free);
-    if (os != STM_OK) return os;
+    if (os != STM_OK) return sync_retain_past_dead_list(s, os);
     if (should_free) {
         return stm_alloc_free(s->allocs[dev_id], paddr, s->current_gen);
     }
     return STM_OK;
+}
+
+/* A cold record's reference to a CAS chunk: as sync_drop_paddr_locked, with a deref
+ * for a free. Every cold record took a reference of its own, so what routes the drop
+ * is when: a reference taken after a view cannot be the one the view reads through,
+ * however old the bytes, as with a record migrated or reflinked since. A view's own
+ * reference stays held past the list. */
+static uint64_t sync_reference_taken(const stm_extent_record *e)
+{
+    return e->link_gen > e->gen ? e->link_gen : e->gen;
+}
+
+static stm_status sync_drop_cold_locked(stm_sync *s, uint64_t ds,
+                                        const uint8_t *hash, uint64_t taken)
+{
+    uint64_t origin_snap_id = sync_dataset_origin_snap_id_locked(s, ds);
+    if (origin_snap_id != 0) {
+        if (stm_snapshot_index_outside_view(s->snap_idx, origin_snap_id, taken))
+            return stm_cas_deref(s->cas_idx, hash);
+        return STM_OK;
+    }
+    if (stm_snapshot_index_born_after_most_recent(s->snap_idx, ds, taken))
+        return stm_cas_deref(s->cas_idx, hash);
+    bool should_deref = false;
+    stm_status os = stm_snapshot_index_overwrite_cold_block(s->snap_idx, ds, hash,
+                                                            &should_deref);
+    if (os != STM_OK) return sync_retain_past_dead_list(s, os);
+    return should_deref ? stm_cas_deref(s->cas_idx, hash) : STM_OK;
 }
 
 /* P7-10: resolve the dataset's CURRENT (key_id, DEK) under sync->lock.
@@ -6030,6 +6070,11 @@ static size_t sync_desired_replica_count_locked(const stm_sync *s) {
  * between this scan and the subsequent extent_overwrite — no race.
  */
 typedef struct {
+    uint8_t  hash[STM_CAS_HASH_LEN];
+    uint64_t taken;    /* routes the drop: sync_reference_taken */
+} cold_drop;
+
+typedef struct {
     uint64_t   ds;
     uint64_t   ino;
     uint64_t   range_off;
@@ -6041,7 +6086,7 @@ typedef struct {
      * deref obligation is handled by the subsequent prefix write's
      * own cox bookend — avoiding double-deref. */
     bool       past_only;
-    uint8_t   *hashes;          /* flat buffer: n_hashes * STM_CAS_HASH_LEN */
+    cold_drop *hashes;
     size_t     n_hashes;
     size_t     cap_hashes;
     stm_status err;
@@ -6061,13 +6106,13 @@ static bool cold_overlap_cb(const stm_extent_record *e, void *cx) {
 
     if (ctx->n_hashes == ctx->cap_hashes) {
         size_t new_cap = ctx->cap_hashes == 0 ? 8u : ctx->cap_hashes * 2u;
-        uint8_t *grown = realloc(ctx->hashes, new_cap * STM_CAS_HASH_LEN);
+        cold_drop *grown = realloc(ctx->hashes, new_cap * sizeof *grown);
         if (!grown) { ctx->err = STM_ENOMEM; return false; }
         ctx->hashes     = grown;
         ctx->cap_hashes = new_cap;
     }
-    memcpy(ctx->hashes + ctx->n_hashes * STM_CAS_HASH_LEN,
-           e->content_hash, STM_CAS_HASH_LEN);
+    memcpy(ctx->hashes[ctx->n_hashes].hash, e->content_hash, STM_CAS_HASH_LEN);
+    ctx->hashes[ctx->n_hashes].taken = sync_reference_taken(e);
     ctx->n_hashes++;
     return true;
 }
@@ -6511,29 +6556,10 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
         }
     }
 
-    /* P7-CAS-4 R54 P3-2: pre-check that the most-recent PRESENT snap's
-     * cold-dead-list can absorb cox.n_hashes more entries BEFORE we
-     * mutate extent_idx. If the cap (STM_SNAP_COLD_DEAD_LIST_MAX) would
-     * overflow, refuse the write with STM_ENOSPC up front — the
-     * post-overwrite bookend cannot roll back individual cold-record
-     * drops, so a mid-bookend STM_ENOSPC would silently leak the
-     * unrouted hash's deref obligation (CAS chunk's refcount stuck
-     * at 1 → permanent leak). */
-    if (s->cas_idx && cox.n_hashes > 0) {
-        bool can_accept = true;
-        stm_status rs = stm_snapshot_index_cold_dead_list_reserve(
-                s->snap_idx, dataset_id, cox.n_hashes, &can_accept);
-        if (rs != STM_OK || !can_accept) {
-            free(cox.hashes);
-            sync_write_reserve_rollback(s, res);
-            return rs != STM_OK ? rs : STM_ENOSPC;
-        }
-    }
-
     /* Update the extent index with the new replica set; collect any
      * dropped paddrs (flat across each dropped extent's replicas).
      * Each dropped paddr routes through snapshot dead-list / free. */
-    uint64_t *dropped = NULL;
+    uint64_t *dropped = NULL, *dropped_gens = NULL;
     size_t    n_dropped = 0;
     sync_write_piece *wp = sync_write_pieces(res);
     stm_extent_piece one, *xp = &one;
@@ -6554,13 +6580,15 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
     stm_status os = stm_extent_overwrite_pieces(s->extent_idx, dataset_id,
                                                 ino, xp, res->n_pieces,
                                                 res->write_gen, enc_key_id,
-                                                &dropped, &n_dropped);
+                                                &dropped, &n_dropped,
+                                                &dropped_gens);
     if (xp != &one) free(xp);
     if (os == STM_EWEDGED) {
         /* A new record is in and an overlapped one is not out: the
          * index names these replicas, so they stay, and no commit may
          * take the index. */
         free(dropped);
+        free(dropped_gens);
         free(cox.hashes);
         sync_write_release(res);
         sync_wedge_locked(s);
@@ -6615,51 +6643,20 @@ static stm_status sync_write_index_commit_locked(stm_sync *s,
     /* R36 P1-1 + P2-1: best-effort drain. */
     stm_status drop_err = STM_OK;
     for (size_t i = 0; i < n_dropped; i++) {
-        stm_status drs = sync_drop_paddr_locked(s, dataset_id, dropped[i]);
+        stm_status drs = sync_drop_paddr_locked(s, dataset_id, dropped[i],
+                                                dropped_gens[i]);
         if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
     }
     free(dropped);
+    free(dropped_gens);
 
-    /* P7-CAS-2 + P7-CAS-4c: route every captured COLD-extent hash
-     * through the snap-aware deref path. If a most-recent snap exists
-     * for this dataset, the deref obligation is held by the snap's
-     * cold-dead-list (deferred to snap-delete); otherwise we deref
-     * the CAS index directly. Best-effort drain mirroring the paddr-
-     * drop loop above. STM_ENOENT on cas_deref indicates a torn
-     * cas_idx vs extent_idx — surface as the first non-OK status the
-     * same way drop_err does.
-     *
-     * P7-CAS-4 R54 P3-1: s->snap_idx is unconditionally created at
-     * sync_create / sync_open, so the dead `else { should_deref =
-     * true; }` fallback is removed. The capacity pre-check above
-     * already guarantees overwrite_cold_block will not return
-     * STM_ENOSPC mid-bookend. */
-    /* 9.7-impl-6d: clone-path dispatch on cold-tier hashes. Clone
-     * datasets route each dropped content_hash to the SPECIFIC origin
-     * snap's cold_dead_list via the per-snap append API (6b); non-
-     * clone datasets stay on the legacy most-recent-of-dataset path.
-     * The origin snap's cold_dead_list holds the deref obligation
-     * across the snap's lifetime — no direct cas_deref on the clone
-     * path. */
-    if (s->cas_idx && cox.n_hashes > 0) {
-        uint64_t origin_snap_id = sync_dataset_origin_snap_id_locked(s, dataset_id);
+    /* Every captured COLD record's reference. STM_ENOENT on the deref means a torn
+     * cas_idx vs extent_idx, surfaced as drop_err is. */
+    if (s->cas_idx) {
         for (size_t i = 0; i < cox.n_hashes; i++) {
-            const uint8_t *h = cox.hashes + i * STM_CAS_HASH_LEN;
-            if (origin_snap_id != 0) {
-                stm_status srs = stm_snapshot_index_add_to_snap_cold_dead_list(
-                        s->snap_idx, origin_snap_id, h);
-                if (srs != STM_OK && drop_err == STM_OK) drop_err = srs;
-            } else {
-                bool should_deref = false;
-                stm_status srs = stm_snapshot_index_overwrite_cold_block(
-                        s->snap_idx, dataset_id, h, &should_deref);
-                if (srs == STM_OK && should_deref) {
-                    stm_status crs = stm_cas_deref(s->cas_idx, h);
-                    if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
-                } else if (srs != STM_OK && drop_err == STM_OK) {
-                    drop_err = srs;
-                }
-            }
+            stm_status crs = sync_drop_cold_locked(s, dataset_id, cox.hashes[i].hash,
+                                                   cox.hashes[i].taken);
+            if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
         }
     }
     free(cox.hashes);
@@ -8198,7 +8195,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         }
     }
     size_t   *drop_idx_buf = NULL;
-    uint64_t *paddrs_buf   = NULL;
+    uint64_t *paddrs_buf   = NULL, *gens_buf = NULL;
     if (past_n_extents > 0) {
         drop_idx_buf = malloc(past_n_extents * sizeof(size_t));
         if (!drop_idx_buf) {
@@ -8207,7 +8204,10 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         }
         if (past_n_replicas > 0) {
             paddrs_buf = malloc(past_n_replicas * sizeof(uint64_t));
-            if (!paddrs_buf) {
+            gens_buf   = malloc(past_n_replicas * sizeof(uint64_t));
+            if (!paddrs_buf || !gens_buf) {
+                free(paddrs_buf);
+                free(gens_buf);
                 free(drop_idx_buf);
                 pthread_mutex_unlock(&s->lock);
                 return STM_ENOMEM;
@@ -8215,29 +8215,10 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         }
     }
 
-    /* P7-CAS-4 R55 P2-2: pre-scan past-cold-extents AND combined-
-     * capacity check BEFORE Phase 2's prefix write. Without this
-     * reordering, the prefix write would consume one cold-dead-list
-     * slot (when the crossing extent is COLD), and the truncate-body
-     * tcox reserve below could then fire STM_ENOSPC after extent_idx
-     * had already been mutated by the prefix write — producing a
-     * user-visible "truncate failed" with a partial mutation
-     * persistent in the index.
-     *
-     * Combined need = (1 if has_crossing AND rec.kind == COLD)
-     *                + tcox.n_hashes (past-cold-record count).
-     *
-     * The prefix write's own internal reserve check (inside
-     * stm_sync_write_extent_locked) will then succeed because the
-     * combined capacity has been verified upfront.
-     *
-     * Note: the tcox pre-scan walks the extent index BEFORE the
-     * prefix write mutates it. Phase 2's overwrite drops the
-     * crossing extent (rec) and inserts a new HOT prefix at
-     * [rec.off, new_size), which is fully BELOW new_size — past-
-     * extents at off >= new_size are untouched, so tcox's hash set
-     * remains accurate when we route them through the truncate-
-     * body bookend below. */
+    /* The past extents' cold records, scanned before Phase 2's prefix write: that
+     * write's own bookend drops the crossing record (past_only keeps it out of
+     * this set), and it leaves extents at off >= new_size untouched, so the set
+     * holds for the truncate-body bookend below. */
     cold_overlap_ctx tcox = { .ds = dataset_id, .ino = ino,
                                 .range_off = new_size,
                                 .range_len = UINT64_MAX - new_size,
@@ -8250,26 +8231,9 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
+            free(gens_buf);
             pthread_mutex_unlock(&s->lock);
             return tcox.err != STM_OK ? tcox.err : its;
-        }
-    }
-
-    if (s->cas_idx) {
-        size_t prefix_cold_consume =
-            (has_crossing && rec.kind == STM_EXTENT_KIND_COLD) ? 1u : 0u;
-        size_t combined_n = tcox.n_hashes + prefix_cold_consume;
-        if (combined_n > 0) {
-            bool can_accept = true;
-            stm_status rs = stm_snapshot_index_cold_dead_list_reserve(
-                    s->snap_idx, dataset_id, combined_n, &can_accept);
-            if (rs != STM_OK || !can_accept) {
-                free(tcox.hashes);
-                free(drop_idx_buf);
-                free(paddrs_buf);
-                pthread_mutex_unlock(&s->lock);
-                return rs != STM_OK ? rs : STM_ENOSPC;
-            }
         }
     }
 
@@ -8288,6 +8252,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
+            free(gens_buf);
             pthread_mutex_unlock(&s->lock);
             return STM_ECORRUPT;
         }
@@ -8296,6 +8261,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
+            free(gens_buf);
             pthread_mutex_unlock(&s->lock);
             return STM_ENOMEM;
         }
@@ -8315,6 +8281,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
+            free(gens_buf);
             pthread_mutex_unlock(&s->lock);
             return rs;
         }
@@ -8324,6 +8291,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
+            free(gens_buf);
             pthread_mutex_unlock(&s->lock);
             return STM_EIO;
         }
@@ -8344,6 +8312,7 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             free(tcox.hashes);
             free(drop_idx_buf);
             free(paddrs_buf);
+            free(gens_buf);
             pthread_mutex_unlock(&s->lock);
             return ws;
         }
@@ -8359,11 +8328,12 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                                 new_size,
                                                 drop_idx_buf, past_n_extents,
                                                 paddrs_buf, past_n_replicas,
-                                                &n_dropped);
+                                                &n_dropped, gens_buf);
     if (ts != STM_OK) {
         free(tcox.hashes);
         free(drop_idx_buf);
         free(paddrs_buf);
+        free(gens_buf);
         /* A delete in the engine can fail. With no record gone and no
          * prefix written the index is as it was; otherwise it is half
          * truncated, and no commit may take it. */
@@ -8380,41 +8350,20 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
      * (R36 P1-1 / P2-1); it wedges below. */
     stm_status drop_err = STM_OK;
     for (size_t i = 0; i < n_dropped; i++) {
-        stm_status drs = sync_drop_paddr_locked(s, dataset_id, paddrs_buf[i]);
+        stm_status drs = sync_drop_paddr_locked(s, dataset_id, paddrs_buf[i],
+                                                gens_buf[i]);
         if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
     }
     free(drop_idx_buf);
     free(paddrs_buf);
+    free(gens_buf);
 
-    /* P7-CAS-2 + P7-CAS-4c: route every captured COLD-extent hash
-     * through the snap-aware deref path. Mirror of write_extent_
-     * locked's bookend — see that function for the contract.
-     * P7-CAS-4 R54 P3-1: dead else-fallback removed; s->snap_idx is
-     * unconditionally created. */
-    /* 9.7-impl-6d: same clone-path dispatch as the write-extent
-     * bookend — clone datasets route through the per-snap cold-tier
-     * append API to the SPECIFIC origin snap; non-clone datasets stay
-     * on the legacy most-recent-of-dataset path. See write-extent
-     * site for the full rationale. */
-    if (s->cas_idx && tcox.n_hashes > 0) {
-        uint64_t origin_snap_id = sync_dataset_origin_snap_id_locked(s, dataset_id);
+    /* As the write's index commit: every captured COLD record's reference. */
+    if (s->cas_idx) {
         for (size_t i = 0; i < tcox.n_hashes; i++) {
-            const uint8_t *h = tcox.hashes + i * STM_CAS_HASH_LEN;
-            if (origin_snap_id != 0) {
-                stm_status srs = stm_snapshot_index_add_to_snap_cold_dead_list(
-                        s->snap_idx, origin_snap_id, h);
-                if (srs != STM_OK && drop_err == STM_OK) drop_err = srs;
-            } else {
-                bool should_deref = false;
-                stm_status srs = stm_snapshot_index_overwrite_cold_block(
-                        s->snap_idx, dataset_id, h, &should_deref);
-                if (srs == STM_OK && should_deref) {
-                    stm_status crs = stm_cas_deref(s->cas_idx, h);
-                    if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
-                } else if (srs != STM_OK && drop_err == STM_OK) {
-                    drop_err = srs;
-                }
-            }
+            stm_status crs = sync_drop_cold_locked(s, dataset_id, tcox.hashes[i].hash,
+                                                   tcox.hashes[i].taken);
+            if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
         }
     }
     free(tcox.hashes);
@@ -8502,12 +8451,15 @@ stm_status stm_sync_punch_range(stm_sync *s,
      * dead-list + alloc free. */
     uint64_t *dropped = NULL;
     size_t   n_dropped = 0;
+    uint64_t *dropped_gens = NULL;
     stm_status ps = stm_extent_punch_range(eidx, dataset_id, ino,
                                                  off, len,
-                                                 &dropped, &n_dropped);
+                                                 &dropped, &n_dropped,
+                                                 &dropped_gens);
     if (ps == STM_EWEDGED) {
         /* Some records went and one did not: no commit may take it. */
         free(dropped);
+        free(dropped_gens);
         sync_wedge_locked(s);
         pthread_mutex_unlock(&s->lock);
         return STM_EWEDGED;
@@ -8519,10 +8471,12 @@ stm_status stm_sync_punch_range(stm_sync *s,
 
     stm_status drop_err = STM_OK;
     for (size_t i = 0; i < n_dropped; i++) {
-        stm_status drs = sync_drop_paddr_locked(s, dataset_id, dropped[i]);
+        stm_status drs = sync_drop_paddr_locked(s, dataset_id, dropped[i],
+                                                dropped_gens[i]);
         if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
     }
     free(dropped);
+    free(dropped_gens);
 
     if (drop_err != STM_OK) {
         sync_wedge_locked(s);
@@ -8642,6 +8596,7 @@ stm_status stm_sync_reflink(stm_sync *s,
     for (size_t i = 0; i < cx.n && apply_rc == STM_OK; i++) {
         const stm_extent_record *e = &cx.records[i];
         if (e->kind == STM_EXTENT_KIND_HOT) {
+            if (!sync_record_holds_count(s, dst_dataset_id, e->gen)) continue;
             for (uint8_t r = 0; r < e->n_replicas; r++) {
                 uint16_t dev = stm_paddr_device(e->paddrs[r]);
                 if (dev >= STM_POOL_DEVICES_MAX || s->allocs[dev] == NULL) {
@@ -8746,6 +8701,8 @@ stm_status stm_sync_reflink(stm_sync *s,
                 for (size_t j = 0; j < cx.n; j++) {
                     const stm_extent_record *ee = &cx.records[j];
                     if (ee->kind == STM_EXTENT_KIND_HOT) {
+                        if (!sync_record_holds_count(s, dst_dataset_id, ee->gen))
+                            continue;
                         for (uint8_t r = 0;
                              r < ee->n_replicas && hot_undone < hot_bumped;
                              r++) {
@@ -8795,6 +8752,8 @@ stm_status stm_sync_reflink(stm_sync *s,
         for (size_t i = 0; i < cx.n; i++) {
             const stm_extent_record *e = &cx.records[i];
             if (e->kind == STM_EXTENT_KIND_HOT) {
+                if (!sync_record_holds_count(s, dst_dataset_id, e->gen))
+                    continue;
                 for (uint8_t r = 0;
                      r < e->n_replicas && hot_undone < hot_bumped;
                      r++) {
@@ -9370,7 +9329,7 @@ static stm_status migrate_one_extent_locked(stm_sync *s,
     stm_status drop_err = STM_OK;
     for (uint8_t i = 0; i < n_dropped; i++) {
         stm_status drs = sync_drop_paddr_locked(s, E->dataset_id,
-                                                   dropped_paddrs[i]);
+                                                   dropped_paddrs[i], E->gen);
         if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
     }
     /* As the write's index commit: a failed drop after the index changed
@@ -9597,6 +9556,7 @@ static stm_status migrate_whole_ino_locked(stm_sync *s,
 
     /* Step 6: atomic N-drop + K-insert via the new extent-index API. */
     uint64_t *dropped_paddrs = NULL;
+    uint64_t *dropped_gens = NULL;
     size_t   n_dropped = 0;
     stm_status ms = stm_extent_migrate_whole_ino_to_cold(s->extent_idx,
                                                             dataset_id, ino,
@@ -9604,12 +9564,14 @@ static stm_status migrate_whole_ino_locked(stm_sync *s,
                                                             canonical_key_id,
                                                             s->current_gen,
                                                             &dropped_paddrs,
-                                                            &n_dropped);
+                                                            &n_dropped,
+                                                            &dropped_gens);
     free(chunks_arr);
 
     if (ms == STM_EWEDGED) {
         /* As the per-extent path: keep the refs and the blocks. */
         free(dropped_paddrs);
+        free(dropped_gens);
         free(st);
         free(boundaries);
         sync_wedge_locked(s);
@@ -9632,10 +9594,12 @@ static stm_status migrate_whole_ino_locked(stm_sync *s,
     stm_status drop_err = STM_OK;
     for (size_t i = 0; i < n_dropped; i++) {
         stm_status drs = sync_drop_paddr_locked(s, dataset_id,
-                                                   dropped_paddrs[i]);
+                                                   dropped_paddrs[i],
+                                                   dropped_gens[i]);
         if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
     }
     free(dropped_paddrs);
+    free(dropped_gens);
     if (drop_err != STM_OK) {
         sync_wedge_locked(s);
         return STM_EWEDGED;
@@ -10062,11 +10026,11 @@ stm_status stm_sync_recv_cold_chunk_release(stm_sync *s,
  *   4. bdev_write the ciphertext+tag to every fresh replica.
  *   5. Atomic swap via stm_extent_promote_swap_to_hot (drops cold
  *      record, inserts hot at same coords; returns dropped hash).
- *   6. stm_cas_deref the dropped hash.
+ *   6. Route the dropped hash as any cold drop (sync_drop_cold_locked).
  *
  * Rollback on each failure: any reserved paddrs freed via stm_alloc_free.
  * Step 5+ failures don't trigger rollback (state mutated). On STM_OK
- * the cold record is gone, hot record is live, CAS refcount decremented.
+ * the cold record is gone and the hot record is live.
  */
 static stm_status promote_one_extent_locked(stm_sync *s,
                                               const stm_extent_record *C)
@@ -10286,12 +10250,11 @@ static stm_status promote_one_extent_locked(stm_sync *s,
         return ms;
     }
 
-    /* Step 6: deref the dropped hash. Failure here is best-effort
-     * (cas_idx in unexpected state); the new HOT record stays live
-     * either way. STM_ENOENT means the entry was concurrently
-     * reclaimed (harmless); other errors propagate to the caller
-     * for diagnostics. */
-    (void)stm_cas_deref(s->cas_idx, dropped_hash);
+    /* Step 6: the dropped record's reference, which a snapshot naming the record
+     * still needs. Failure here is best-effort (cas_idx in unexpected state); the
+     * new HOT record stays live either way. STM_ENOENT means the entry was
+     * concurrently reclaimed (harmless). */
+    (void)sync_drop_cold_locked(s, C->dataset_id, dropped_hash, sync_reference_taken(C));
     return STM_OK;
 }
 

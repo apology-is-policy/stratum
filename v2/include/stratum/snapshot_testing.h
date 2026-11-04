@@ -73,6 +73,15 @@ stm_status stm_snapshot_create_for_test(stm_snapshot_index *idx,
                                           const uint8_t root_csum[32],
                                           uint64_t extent_txg,
                                           uint64_t *out_id);
+
+/*
+ * Rewrites a snapshot's prev link, to reach the shape a delete used to leave on
+ * disk: a link naming an absent snapshot.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_set_prev_for_test(stm_snapshot_index *idx,
+                                          uint64_t snapshot_id,
+                                          uint64_t prev_snap_id);
 #endif /* STRATUM_BUILD_TESTING_HOOKS */
 
 #ifdef __cplusplus

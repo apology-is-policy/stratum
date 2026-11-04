@@ -169,7 +169,7 @@ stm_status eng_spill_chain_write(stm_btree_engine *eng,
         uint64_t p = 0;
         s = eng->vt->reserve(eng->vt_ctx, &p);
         if (s != STM_OK) { free(blocks); return s; }
-        (void)paddr_vec_push(fresh, p);             /* reserved above */
+        (void)paddr_vec_push(fresh, p, gen);        /* reserved above */
         blocks[i] = p;
 
         uint64_t off       = (uint64_t)i * ENG_SPILL_CHUNK_CAP;
@@ -325,6 +325,14 @@ stm_status eng_spill_chain_verify(stm_btree_engine *eng,
 /* Write.                                                                      */
 /* ========================================================================= */
 
+/* A reserved node that never reached the disk: as new as the gen it was for, so no
+ * snapshot or clone view can name it. */
+static void eng_node_free_unwritten(stm_btree_engine *eng, uint64_t paddr, uint64_t gen)
+{
+    if (eng->vt->free_born) (void)eng->vt->free_born(eng->vt_ctx, paddr, gen, gen);
+    else if (eng->vt->free) (void)eng->vt->free(eng->vt_ctx, paddr, gen);
+}
+
 stm_status eng_node_write(stm_btree_engine *eng, eng_node *n, uint64_t gen)
 {
     uint8_t *buf = malloc(STM_BTREE_ENGINE_NODE_SIZE);
@@ -474,7 +482,7 @@ stm_status eng_node_write(stm_btree_engine *eng, eng_node *n, uint64_t gen)
     s = stm_btree_node_encrypt(&eng->cx, paddr, gen, buf,
                                STM_BTREE_ENGINE_NODE_SIZE);
     if (s != STM_OK) {
-        if (eng->vt->free) (void)eng->vt->free(eng->vt_ctx, paddr, gen);
+        eng_node_free_unwritten(eng, paddr, gen);
         free(buf);
         return s;
     }
@@ -485,7 +493,7 @@ stm_status eng_node_write(stm_btree_engine *eng, eng_node *n, uint64_t gen)
     s = eng->vt->write(eng->vt_ctx, paddr, buf, STM_BTREE_ENGINE_NODE_SIZE);
     free(buf);
     if (s != STM_OK) {
-        if (eng->vt->free) (void)eng->vt->free(eng->vt_ctx, paddr, gen);
+        eng_node_free_unwritten(eng, paddr, gen);
         return s;
     }
 

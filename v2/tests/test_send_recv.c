@@ -2070,4 +2070,126 @@ STM_TEST(p7val3_roundtrip_preserves_cross_ino_cold_dedup) {
     testpool_teardown(&tgt);
 }
 
+/* The stream of two snapshots the fs took, into `tgt`. */
+static void send_ds_window_to(testpool *src, uint64_t ds, testpool *tgt, uint64_t from,
+                              uint64_t to)
+{
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(stm_fs_sync_for_test(src->fs), ds, from, to, &sh));
+    if (!sh) return;
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(stm_fs_sync_for_test(tgt->fs), 1, &rh));
+    STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+    stm_send_close(sh);
+    stm_recv_close(rh);
+    stm_sync_dcache_drain_for_test(stm_fs_sync_for_test(tgt->fs));
+}
+
+static void send_window_to(testpool *src, testpool *tgt, uint64_t from, uint64_t to)
+{
+    send_ds_window_to(src, 1, tgt, from, to);
+}
+
+static void send_expect(testpool *tgt, uint64_t ino, const uint8_t *want, const char *what)
+{
+    static const uint8_t zeros[4096];
+    uint8_t out[4096];
+    size_t got = 0;
+    memset(out, 0xCC, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(tgt->fs, 1, ino, 0, out, sizeof out, &got));
+    fprintf(stderr, "send expect %s: ino %llu got=%zu first=%02x\n", what,
+            (unsigned long long)ino, got, out[0]);
+    STM_ASSERT_EQ(got, sizeof out);
+    STM_ASSERT_MEM_EQ(want ? want : zeros, out, sizeof out);
+}
+
+/* stm_fs_create_snapshot commits and reads current_gen, and takes no commit after:
+ * the first write after it lands on its captured gen, inside the next window, and a
+ * write after `to` on to's gen, outside this one. */
+STM_TEST(incremental_send_of_fs_snapshots_has_the_first_gen_after_each) {
+    testpool src; testpool_setup(&src, "fsw_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "fsw_tgt", POOL_UUID_TGT);
+    uint8_t a[4096], b[4096], c[4096];
+    memset(a, 0xA1, sizeof a);
+    memset(b, 0xB2, sizeof b);
+    memset(c, 0xC3, sizeof c);
+    uint64_t from = 0, to = 0;
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "from", 4, &from));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "to", 2, &to));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 3, 0, c, sizeof c));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+
+    send_window_to(&src, &tgt, from, to);
+    send_expect(&tgt, 2, b, "in the window");
+    send_expect(&tgt, 1, NULL, "before it");
+    send_expect(&tgt, 3, NULL, "after it");
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* A stream to a snapshot sends what that snapshot holds. The live tree has moved on;
+ * the record it names is in no live tree, and its block stays while the snapshot does. */
+STM_TEST(send_to_a_snapshot_has_what_was_overwritten_since) {
+    testpool src; testpool_setup(&src, "ovs_src", POOL_UUID_SRC);
+    testpool inc; testpool_setup(&inc, "ovs_inc", POOL_UUID_TGT);
+    testpool ful; testpool_setup(&ful, "ovs_ful", POOL_UUID_TGT);
+    uint8_t a[4096], b[4096], c[4096];
+    memset(a, 0xA4, sizeof a);
+    memset(b, 0xB5, sizeof b);
+    memset(c, 0xC6, sizeof c);
+    uint64_t from = 0, to = 0;
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "from", 4, &from));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "to", 2, &to));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, c, sizeof c));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, c, sizeof c));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+
+    send_window_to(&src, &inc, from, to);
+    send_expect(&inc, 2, b, "incremental");
+    send_expect(&inc, 1, NULL, "before the window");
+    send_window_to(&src, &ful, 0, to);
+    send_expect(&ful, 1, a, "full, older record");
+    send_expect(&ful, 2, b, "full, newer record");
+    testpool_teardown(&src);
+    testpool_teardown(&inc);
+    testpool_teardown(&ful);
+}
+
+/* A dataset whose tree never opened captures a zero root. Such a capture reads the live
+ * tree, so only the window's upper bound keeps out the first write after it. The next
+ * window has that write: the stream can carry it. */
+STM_TEST(send_to_an_empty_capture_has_nothing_written_since) {
+    testpool src; testpool_setup(&src, "emc_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "emc_tgt", POOL_UUID_TGT);
+    testpool nxt; testpool_setup(&nxt, "emc_nxt", POOL_UUID_TGT);
+    uint8_t a[4096];
+    memset(a, 0xD7, sizeof a);
+    uint64_t ds = 0, to = 0, after = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(src.fs, 1u, "emc", &ds));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, ds, "to", 2, &to));
+    stm_snapshot_entry e;
+    STM_ASSERT_OK(stm_snapshot_lookup(stm_sync_snapshot_index(stm_fs_sync_for_test(src.fs)),
+                                      to, &e));
+    STM_ASSERT_EQ(e.tree_root_paddr, (uint64_t)0);
+    STM_ASSERT_OK(stm_fs_write(src.fs, ds, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, ds, "after", 5, &after));
+
+    send_ds_window_to(&src, ds, &tgt, 0, to);
+    send_expect(&tgt, 1, NULL, "written after the capture");
+    send_ds_window_to(&src, ds, &nxt, to, after);
+    send_expect(&nxt, 1, a, "in the next window");
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+    testpool_teardown(&nxt);
+}
+
 STM_TEST_MAIN("send_recv")

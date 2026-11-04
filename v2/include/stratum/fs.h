@@ -92,6 +92,7 @@ typedef struct {
     /* Runtime flags. */
     bool     read_only;
     bool     wedged;
+    bool     lists_unverified;  /* the mount's pass did not finish: see 13-snapshot */
 } stm_fs_stats;
 
 /* ========================================================================= */
@@ -1872,9 +1873,10 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
  * leaked from tracking" — operator-visible at the next mount's
  * scrub.
  *
- * `*out_freed_count` (optional) returns the count of paddrs the
- * snapshot owned (the snap's dead-list size). Useful for telemetry
- * but does not reflect reclamation success.
+ * `*out_freed_count` (optional) returns how many blocks and nodes this
+ * delete set out to free: not what moved to an older neighbour, nor a node
+ * off a list the mount could not check. Telemetry: it does not reflect
+ * reclamation success.
  */
 STM_MUST_USE
 stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
@@ -2000,26 +2002,22 @@ stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id);
  * TLY-A5-impl-2 / 9.7-impl-4: roll the dataset back to a snapshot.
  *
  * Mechanism (9.7-impl-4, validate-then-swap): VALIDATE the snapshot's
- * captured per-dataset btree_engine root triple (di_tree_root,
- * di_root_gen, di_root_csum) — a throwaway engine opened at the triple
- * + stm_btree_engine_verify; a bad triple refuses STM_ECORRUPT with the
- * fs NOT wedged, a true no-op — then drain every dirty buffer → swap the
- * dataset entry's triple to the snapshot's → clear the target
- * snapshot's dead-lists → stm_sync_commit. The validation runs BEFORE
- * the destructive drain (R160 P1-1) so a corrupt / unverifiable
- * snapshot leaves the caller's un-committed writes intact. The commit's
- * gen advance keeps the AEAD nonce fresh for post-rollback writes. After
- * return the dataset reads the snapshot's frozen view; the
- * post-snapshot writes are discarded.
+ * captured per-dataset btree_engine root triple and read the view's data
+ * blocks. A bad triple refuses with its verify's status (STM_ECORRUPT or
+ * STM_EBADTAG), a view naming a free block with STM_ECORRUPT, in both cases
+ * with the fs NOT wedged, a true no-op that leaves the caller's un-committed
+ * writes intact. Then drain every dirty buffer and commit: from here what was
+ * written is durable, and a refusal or crash before the swap's commit leaves
+ * the dataset as if the caller had committed. Then swap the dataset entry's
+ * triple to the snapshot's, set each view block's count, reclaim what only
+ * the old tree and the lists held, clear the target's lists, delete every
+ * newer snapshot of the dataset, and commit. After return the dataset reads
+ * the snapshot's frozen view and the post-snapshot writes are gone. A failed
+ * commit, or a count that cannot be set, wedges: crash-equivalent, and a
+ * remount can ask again.
  *
- * v1.0 LIMITATION — a rollback is refused with STM_ENOTSUPPORTED when
- * a newer snapshot of the dataset exists. ZFS semantics destroy every
- * newer snapshot; doing that correctly needs the diverged-block walk
- * that 9.7-impl-4b introduces. Until impl-4b, delete newer snapshots
- * explicitly (stm_fs_delete_snapshot reclaims them correctly) and then
- * roll back to what is now the most-recent snapshot. impl-4b also adds
- * reclamation of the post-snapshot diverged blocks (which impl-4 leaks
- * — a space cost, never a corruption).
+ * A newer snapshot that is held, or that a clone depends on, refuses STM_EBUSY
+ * before anything is drained.
  *
  * The CONSULTATION GATE is load-bearing — it composes against
  * `v2/specs/snapshot.tla::RollbackBlockedIffCompromised`:
@@ -2036,11 +2034,11 @@ stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id);
  * dataset boundary the verb was addressed to (R146 P2-2).
  *
  * Refusals: STM_EINVAL (NULL fs / dataset_id == 0 / snapshot_id == 0),
- * STM_ECORRUPT (snapshot index unavailable, or the snapshot's captured
- * triple fails to verify), STM_ENOENT (snapshot unknown / belongs to a
- * different dataset), STM_ECOMPROMISED (marked + not forced),
- * STM_ENOTSUPPORTED (a newer snapshot of the dataset exists — the v1.0
- * limitation), STM_EWEDGED, STM_EROFS. A post-swap commit failure is
+ * STM_ECORRUPT (snapshot index unavailable, a captured triple that fails to
+ * verify, a view naming a free block), STM_EBADTAG (the triple's verify),
+ * STM_ENOENT (snapshot unknown / belongs to a different dataset),
+ * STM_ECOMPROMISED (marked + not forced), STM_EBUSY (a newer snapshot this
+ * rollback would destroy is held or cloned), STM_EWEDGED, STM_EROFS. A post-swap commit failure is
  * crash-equivalent and wedges the fs (R154 Q2).
  */
 STM_MUST_USE

@@ -138,6 +138,10 @@ stm_status stm_btree_node_decrypt(const stm_btree_crypt_ctx *cx,
 typedef struct {
     stm_status (*reserve)(void *ctx, uint64_t *out_paddr);
     stm_status (*free)   (void *ctx, uint64_t paddr, uint64_t free_gen);
+    /* As free, with the node's birth gen (0 unknown). NULL: the store routes
+     * nothing by birth, and free is called. */
+    stm_status (*free_born)(void *ctx, uint64_t paddr, uint64_t free_gen,
+                            uint64_t birth_gen);
     stm_status (*write)  (void *ctx, uint64_t paddr,
                           const void *buf, size_t len);
     stm_status (*read)   (void *ctx, uint64_t paddr,

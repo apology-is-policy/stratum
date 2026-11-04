@@ -2380,7 +2380,9 @@ static stm_status grow_root_absorb(stm_btree_engine *eng, eng_node **rootp,
 void paddr_vec_free(paddr_vec *v)
 {
     free(v->v);
+    free(v->born);
     v->v = NULL;
+    v->born = NULL;
     v->n = 0;
     v->cap = 0;
 }
@@ -2402,16 +2404,20 @@ stm_status paddr_vec_reserve(paddr_vec *v, uint32_t additional)
     uint64_t *nv = realloc(v->v, (size_t)nc * sizeof *nv);
     if (!nv) return STM_ENOMEM;
     v->v   = nv;
-    v->cap = nc;
+    uint64_t *nb = realloc(v->born, (size_t)nc * sizeof *nb);
+    if (!nb) return STM_ENOMEM;
+    v->born = nb;
+    v->cap  = nc;
     return STM_OK;
 }
 
 /* Append `p`. Grows on demand — fallible. */
 STM_MUST_USE
-stm_status paddr_vec_push(paddr_vec *v, uint64_t p)
+stm_status paddr_vec_push(paddr_vec *v, uint64_t p, uint64_t born)
 {
     stm_status s = paddr_vec_reserve(v, 1u);
     if (s != STM_OK) return s;
+    v->born[v->n] = born;
     v->v[v->n++] = p;
     return STM_OK;
 }
@@ -2434,6 +2440,11 @@ static void pending_reset(eng_pending *p)
 static void pending_free_paddrs(stm_btree_engine *eng,
                                  const paddr_vec *v, uint64_t free_gen)
 {
+    if (eng->vt->free_born) {
+        for (uint32_t i = 0; i < v->n; i++)
+            (void)eng->vt->free_born(eng->vt_ctx, v->v[i], free_gen, v->born[i]);
+        return;
+    }
     if (!eng->vt->free) return;
     for (uint32_t i = 0; i < v->n; i++)
         (void)eng->vt->free(eng->vt_ctx, v->v[i], free_gen);
@@ -2553,7 +2564,7 @@ static stm_status leaf_sync_spill(stm_btree_engine *eng, eng_node *leaf,
             if (s != STM_OK) return s;
             for (uint32_t j = 0; j < e->spill->n_blocks; j++)
                 (void)paddr_vec_push(&eng->pending.superseded,
-                                     e->spill->blocks[j]);
+                                     e->spill->blocks[j], e->spill->head_gen);
             free(e->spill->blocks);
             free(e->spill);
             e->spill = NULL;
@@ -2575,7 +2586,7 @@ static stm_status leaf_sync_spill(stm_btree_engine *eng, eng_node *leaf,
         if (s != STM_OK) return s;
         for (uint32_t j = 0; j < e->spill->n_blocks; j++)
             (void)paddr_vec_push(&eng->pending.superseded,
-                                 e->spill->blocks[j]);
+                                 e->spill->blocks[j], e->spill->head_gen);
         free(e->spill->blocks);
         e->spill->blocks   = NULL;
         e->spill->n_blocks = 0;
@@ -2647,6 +2658,7 @@ static stm_status commit_node(stm_btree_engine *eng, eng_node *node,
      * one fresh paddr always, one superseded iff this node had a prior
      * on-disk location — so the post-write pushes cannot fail. */
     uint64_t old_paddr = node->paddr;          /* 0 for a RAM-fresh node */
+    uint64_t old_gen   = node->gen;
     stm_status s = paddr_vec_reserve(&eng->pending.fresh, 1u);
     if (s != STM_OK) return s;
     if (old_paddr != 0) {
@@ -2657,9 +2669,9 @@ static stm_status commit_node(stm_btree_engine *eng, eng_node *node,
     s = eng_node_write(eng, node, gen);        /* assigns a fresh paddr */
     if (s != STM_OK) return s;
 
-    (void)paddr_vec_push(&eng->pending.fresh, node->paddr);   /* reserved */
+    (void)paddr_vec_push(&eng->pending.fresh, node->paddr, gen);  /* reserved */
     if (old_paddr != 0)
-        (void)paddr_vec_push(&eng->pending.superseded, old_paddr); /* reserved */
+        (void)paddr_vec_push(&eng->pending.superseded, old_paddr, old_gen); /* reserved */
 
     *out_paddr = node->paddr;
     memcpy(out_csum, node->csum, STM_BTNODE_CSUM_SIZE);
@@ -2843,7 +2855,8 @@ static stm_status commit_flush_clone(stm_btree_engine *eng, uint64_t gen,
     s = paddr_vec_reserve(&p->superseded, eng->orphaned_spill_blocks.n);
     if (s != STM_OK) goto fail_pending;
     for (uint32_t i = 0; i < eng->orphaned_spill_blocks.n; i++)
-        (void)paddr_vec_push(&p->superseded, eng->orphaned_spill_blocks.v[i]);
+        (void)paddr_vec_push(&p->superseded, eng->orphaned_spill_blocks.v[i],
+                             eng->orphaned_spill_blocks.born[i]);
 
     uint64_t rp = 0;
     uint8_t  rc[STM_BTNODE_CSUM_SIZE];
@@ -2990,7 +3003,8 @@ static stm_status commit_flush_locked(stm_btree_engine *eng, uint64_t gen,
         return s;
     }
     for (uint32_t i = 0; i < eng->orphaned_spill_blocks.n; i++)
-        (void)paddr_vec_push(&p->superseded, eng->orphaned_spill_blocks.v[i]);
+        (void)paddr_vec_push(&p->superseded, eng->orphaned_spill_blocks.v[i],
+                             eng->orphaned_spill_blocks.born[i]);
     eng->orphaned_spill_blocks.n = 0u;
 
     uint64_t rp = 0;

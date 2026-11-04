@@ -134,7 +134,8 @@ CONSTANTS
     BuggyChainOutOfOrder,
     BuggyExtentTxgUnbounded,
     BuggyRollbackSkipsConsult,
-    BuggyRollbackSkipsGenBump
+    BuggyRollbackSkipsGenBump,
+    BuggyDeleteLeavesLink
 
 ASSUME MaxSnaps \in (Nat \ {0})
 ASSUME MaxTxg \in (Nat \ {0})
@@ -144,6 +145,7 @@ ASSUME BuggyChainOutOfOrder \in BOOLEAN
 ASSUME BuggyExtentTxgUnbounded \in BOOLEAN
 ASSUME BuggyRollbackSkipsConsult \in BOOLEAN
 ASSUME BuggyRollbackSkipsGenBump \in BOOLEAN
+ASSUME BuggyDeleteLeavesLink \in BOOLEAN
 
 SnapIds == 1..MaxSnaps
 NoSnap  == 0
@@ -271,22 +273,32 @@ SnapshotCreate ==
 (* is a state transition only. The block-level "what becomes free" model  *)
 (* lives in a separate spec.                                                *)
 (*                                                                           *)
-(* Note: If we delete the most_recent_snap, we don't update                *)
-(* most_recent_snap to point at snap_prev[s]. The pointer is left          *)
-(* dangling at an ABSENT snap. This matches the impl: most_recent_snap    *)
-(* persists past delete; subsequent SnapshotCreate uses it as snap_prev   *)
-(* of the new snap, which is a "skip ABSENT" link. The Chain* invariants  *)
-(* tolerate ABSENT links because they walk only PRESENT snaps explicitly. *)
+(* The next snapshot's link goes past this one, and most_recent_snap falls   *)
+(* to the newest PRESENT snap below it, which is what the impl computes.     *)
+(* ABSENT slots are not encoded, so a link left on one names nothing on the  *)
+(* next load. A pool written before the re-pointing still has such links,    *)
+(* so the load accepts them and the Chain* invariants walk only PRESENT      *)
+(* snaps.                                                                    *)
 (***************************************************************************)
+NewestPresentBelow(s) ==
+    LET below == { t \in SnapIds : t < s /\ Present(t) }
+    IN  IF below = {} THEN NoSnap
+        ELSE CHOOSE t \in below : \A u \in below : t >= u
+
 SnapshotDelete(s) ==
     /\ s \in SnapIds
     /\ Present(s)
     /\ \/ BuggyDeleteWithHold
        \/ ~snap_held[s]
     /\ snap_state' = [snap_state EXCEPT ![s] = "ABSENT"]
+    /\ snap_prev' = IF BuggyDeleteLeavesLink THEN snap_prev
+                    ELSE [t \in SnapIds |->
+                             IF snap_prev[t] = s THEN snap_prev[s] ELSE snap_prev[t]]
+    /\ most_recent_snap' = IF most_recent_snap = s THEN NewestPresentBelow(s)
+                           ELSE most_recent_snap
     /\ UNCHANGED <<live_tree_root, snap_tree_root, snap_created_txg,
-                   snap_extent_txg, snap_prev, snap_held, snap_compromised,
-                   next_snap_id, current_txg, sync_gen, most_recent_snap,
+                   snap_extent_txg, snap_held, snap_compromised,
+                   next_snap_id, current_txg, sync_gen,
                    did_unsafe_rollback, did_unbumped_rollback>>
 
 (***************************************************************************)
@@ -509,6 +521,11 @@ ChainAcyclicFromN(s, target, fuel) ==
 ChainAcyclic ==
     \A s \in SnapIds:
         s \in SnapIds => ChainAcyclicFromN(s, s, MaxSnaps + 1)
+
+(* A PRESENT snapshot's link names nothing or a PRESENT snapshot. *)
+PrevResolves ==
+    \A s \in SnapIds:
+        Present(s) => snap_prev[s] = NoSnap \/ Present(snap_prev[s])
 
 (* most_recent_snap is either NoSnap (no snaps yet) or refers to an id    *)
 (* that has been allocated (i.e., id < next_snap_id).                    *)

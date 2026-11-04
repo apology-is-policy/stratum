@@ -18,21 +18,18 @@
 (*     - Each PRESENT snapshot S carries a "dead-list" snap_dead[s] —        *)
 (*       blocks COW'd away from the live dataset since S was created.       *)
 (*                                                                           *)
-(*     - On `OverwriteBlock(b)`, b is removed from `live_blocks`. If the   *)
-(*       most-recent snapshot exists, b is APPENDED to that snap's          *)
-(*       snap_dead. If no snap exists yet, b is freed immediately (no      *)
-(*       snap holds it).                                                     *)
+(*     - On `OverwriteBlock(b)`, b is removed from `live_blocks`. If b is  *)
+(*       in the most-recent snapshot's view it goes on that snap's          *)
+(*       snap_dead, or past the list's cap it stays allocated on `retained`.*)
+(*       Otherwise no view names it and it is freed (ARCH 8.5.5). A block  *)
+(*       in an older snapshot's view was live when the most-recent was     *)
+(*       taken, so it is in the most-recent's view too.                    *)
 (*                                                                           *)
-(*     - On `SnapDelete(s)`, blocks in S's dead-list are partitioned:      *)
-(*         unique  = snap_dead[s] − successor.snap_dead   → freed          *)
-(*         shared  = snap_dead[s] ∩ successor.snap_dead   → still held     *)
-(*       Surviving entries (= snap_dead[s], including unique-and-freed AND *)
-(*       shared) are merged into predecessor.snap_dead so the predecessor *)
-(*       takes responsibility for them on its eventual delete. (Merging   *)
-(*       all of snap_dead[s], not just shared, is the impl's behavior:    *)
-(*       freed blocks in unique re-appearing in predecessor are filtered  *)
-(*       by predecessor's own delete-time check against ITS successor —    *)
-(*       which is what we're modeling.)                                    *)
+(*     - On `SnapDelete(s)`, the lists move to the nearest older PRESENT   *)
+(*       snapshot if there is one, since it may name anything on them, and *)
+(*       past its cap an entry goes to `retained`. With no older snapshot  *)
+(*       they are freed: an entry was dropped before any newer snapshot    *)
+(*       was taken, so no newer view names it.                             *)
 (*                                                                           *)
 (* Intentionally OUT OF SCOPE for this spec:                                *)
 (*                                                                           *)
@@ -48,15 +45,16 @@
 (*   - The btree storage of dead-lists. Persistent dead-list bytes are    *)
 (*     a follow-on engineering chunk; the spec models in-RAM sets.         *)
 (*                                                                           *)
-(*   - Block-level COW divergence within a clone (clone-write COWs from   *)
-(*     the snap's tree, dead-list of the SOURCE snap doesn't grow because *)
-(*     the clone is a separate dataset). This spec models a single        *)
-(*     dataset's COW pattern.                                               *)
+(*   - Block-level COW divergence within a clone. A clone's drop of a     *)
+(*     block in its origin's view adds no entry: the origin's lineage      *)
+(*     lists it at its own drop, and the origin snap cannot go while the   *)
+(*     clone stands. This spec models a single dataset's COW pattern.      *)
 (*                                                                           *)
 (* CONSTANTS:                                                                *)
 (*                                                                           *)
 (*   - MaxBlocks ≥ 1 — bound on block ids (1..MaxBlocks).                  *)
 (*   - MaxSnaps ≥ 1 — bound on snapshot ids (1..MaxSnaps).                 *)
+(*   - DeadCap >= 1 -- a list's cap (STM_SNAP_DEAD_LIST_MAX and its siblings).*)
 (*                                                                           *)
 (*   Buggy variants (FALSE in fixed config; TRUE in buggy demos). Each is *)
 (*   designed to fire in the bounded MaxBlocks=4, MaxSnaps=3 model:        *)
@@ -65,23 +63,27 @@
 (*     but neither frees it nor appends it to most_recent_snap.dead. The *)
 (*     block evaporates → `BlocksTrackedSomewhere` fires.                 *)
 (*                                                                           *)
-(*   - BuggyDeleteForgetsFree — SnapDelete clears snap_dead[s] without    *)
-(*     adding `unique` to `freed`. Blocks unique to S vanish from         *)
+(*   - BuggyDeleteForgetsFree -- the oldest snapshot's SnapDelete clears   *)
+(*     snap_dead[s] without adding it to `freed`. The blocks vanish from  *)
 (*     tracking → `BlocksTrackedSomewhere` fires.                         *)
 (*                                                                           *)
-(*   - BuggyMergeIncludesFreed — SnapDelete's merge step carries ALL of  *)
-(*     S's dead-list (including blocks just freed) into predecessor      *)
-(*     instead of only `surviving`. Block ends up in both `freed` and    *)
-(*     `snap_dead[pred]` → `NoDoubleFree` (via NoDeadListContainsFreed)  *)
-(*     fires.                                                               *)
+(*   - BuggyMergeIncludesFreed -- SnapDelete with an older neighbour both *)
+(*     frees S's dead-list and moves it there. Block ends up in both      *)
+(*     `freed` and `snap_dead[pred]` -> `NoDoubleFree` (via                *)
+(*     NoDeadListContainsFreed) fires.                                     *)
 (*                                                                           *)
-(*   Two earlier variants (`BuggyForgetMerge`, `BuggyAlwaysFreeAll`)     *)
-(*   were considered but don't fire in a bounded single-dead-list-       *)
-(*   ownership model: each COW puts a block in exactly one snap's        *)
-(*   dead-list, so `surviving = S.dead ∩ successor.dead` is always       *)
-(*   empty in the model and merge / always-free-all become equivalent   *)
-(*   to the fixed algorithm. They WOULD fire in a richer model with     *)
-(*   multi-snap-holding (deferred future spec extension).                *)
+(*   - BuggyDeleteFreesPreds -- SnapDelete frees S's dead-list with an older *)
+(*     neighbour present, which may name those blocks. The older view     *)
+(*     names a freed block -> `SnapViewConsistent` fires.                  *)
+(*                                                                           *)
+(*   - BuggyOverwriteFreesViewBlock -- OverwriteBlock frees whatever it     *)
+(*     drops, whichever view names it -> `SnapViewConsistent` fires.       *)
+(*                                                                           *)
+(*   - BuggyPastCapFrees -- past the list's cap the drop frees the block   *)
+(*     (the old node tier) -> `SnapViewConsistent` fires.                  *)
+(*                                                                           *)
+(*   - BuggyPastCapForgets -- past the cap the block goes on no list and   *)
+(*     is not counted -> `BlocksTrackedSomewhere` fires.                   *)
 (*                                                                           *)
 (* P7-CAS-4c extension — cold-tier dead-list:                               *)
 (*                                                                           *)
@@ -109,12 +111,12 @@
 (*       Each cold extent is uniquely tracked by id; sharing is at the      *)
 (*       hash level, not the extent-record level.                           *)
 (*                                                                           *)
-(*     - Snap-delete moves cold-dead entries to `cold_dereffed` (no         *)
-(*       successor-filter). Each entry stands alone — no "shared" partition *)
-(*       analogous to paddr dead-list. The composition with cas.tla's      *)
-(*       RefcountConsistent is at the C-impl boundary: cas refcount =       *)
-(*       (count of live cold extents at h) + (count of snap-cold-dead       *)
-(*       entries at h across all snaps).                                    *)
+(*     - Snap-delete moves cold-dead entries as the paddr tier does: to the *)
+(*       nearest older PRESENT snap, or with none to `cold_dereffed`. The   *)
+(*       composition with cas.tla's RefcountConsistent is at the C-impl     *)
+(*       boundary: cas refcount = (count of live cold extents at h) +       *)
+(*       (count of snap-cold-dead entries at h across all snaps) + (count   *)
+(*       of retained cold extents at h).                                    *)
 (*                                                                           *)
 (*   Cold-tier buggy variants:                                              *)
 (*                                                                           *)
@@ -126,6 +128,10 @@
 (*     snap_cold_dead[s] without adding to cold_dereffed. Cold extents     *)
 (*     unique to S vanish from tracking → `ColdExtentsTrackedSomewhere`    *)
 (*     fires.                                                                *)
+(*                                                                           *)
+(*   - BuggyOverwriteColdDerefsView -- OverwriteCold derefs what it drops,  *)
+(*     whichever view names it (the old promote) -> `ColdViewConsistent`    *)
+(*     fires.                                                                *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets, Sequences
@@ -135,6 +141,12 @@ CONSTANTS
     MaxSnaps,
     MaxColdExtents,
     MaxHashIds,
+    DeadCap,
+    BuggyDeleteFreesPreds,
+    BuggyOverwriteFreesViewBlock,
+    BuggyPastCapFrees,
+    BuggyPastCapForgets,
+    BuggyOverwriteColdDerefsView,
     BuggyOverwriteForgetsDead,
     BuggyDeleteForgetsFree,
     BuggyMergeIncludesFreed,
@@ -142,12 +154,19 @@ CONSTANTS
     BuggyDeleteColdForgetsDeref,
     \* 9.7-spec rollback buggy variants (see §"9.7-spec extension" below).
     BuggyRollbackForgetsToFree,
-    BuggyRollbackKeepsNewerSnaps
+    BuggyRollbackKeepsNewerSnaps,
+    BuggyMountSweepsLists
 
 ASSUME MaxBlocks \in (Nat \ {0})
 ASSUME MaxSnaps \in (Nat \ {0})
 ASSUME MaxColdExtents \in (Nat \ {0})
 ASSUME MaxHashIds \in (Nat \ {0})
+ASSUME DeadCap \in (Nat \ {0})
+ASSUME BuggyDeleteFreesPreds \in BOOLEAN
+ASSUME BuggyOverwriteFreesViewBlock \in BOOLEAN
+ASSUME BuggyPastCapFrees \in BOOLEAN
+ASSUME BuggyPastCapForgets \in BOOLEAN
+ASSUME BuggyOverwriteColdDerefsView \in BOOLEAN
 ASSUME BuggyOverwriteForgetsDead \in BOOLEAN
 ASSUME BuggyDeleteForgetsFree \in BOOLEAN
 ASSUME BuggyMergeIncludesFreed \in BOOLEAN
@@ -155,6 +174,7 @@ ASSUME BuggyOverwriteColdForgetsDead \in BOOLEAN
 ASSUME BuggyDeleteColdForgetsDeref \in BOOLEAN
 ASSUME BuggyRollbackForgetsToFree \in BOOLEAN
 ASSUME BuggyRollbackKeepsNewerSnaps \in BOOLEAN
+ASSUME BuggyMountSweepsLists \in BOOLEAN
 
 Blocks         == 1..MaxBlocks
 SnapIds        == 1..MaxSnaps
@@ -187,13 +207,18 @@ VARIABLES
     \* 9.7-spec: per-snapshot frozen view of live_blocks at create time.
     \* SnapCreate captures live_blocks; the value is then frozen for the
     \* snap's lifetime. Rollback(s) restores live_blocks ← snap_view_blocks[s].
-    snap_view_blocks    \* [SnapIds → SUBSET Blocks].
+    snap_view_blocks,   \* [SnapIds -> SUBSET Blocks].
+    snap_view_cold,     \* [SnapIds -> SUBSET ColdExtentIds], its cold analog.
+    retained,           \* SUBSET Blocks: allocated, on no list, past a cap. A
+                         \* space cost, never a loss.
+    cold_retained       \* SUBSET ColdExtentIds: its cold analog; the reference
+                         \* stays held, so the chunk stays.
 
 vars == <<live_blocks, snap_state, snap_dead, freed, used,
           next_snap_id, most_recent_snap,
           live_cold_extents, extent_hash, snap_cold_dead,
           cold_dereffed, used_cold_extents,
-          snap_view_blocks>>
+          snap_view_blocks, snap_view_cold, retained, cold_retained>>
 
 (***************************************************************************)
 (* Init: empty live set, no snaps, nothing freed.                          *)
@@ -212,6 +237,9 @@ Init ==
     /\ cold_dereffed     = {}
     /\ used_cold_extents = {}
     /\ snap_view_blocks  = [s \in SnapIds |-> {}]
+    /\ snap_view_cold    = [s \in SnapIds |-> {}]
+    /\ retained          = {}
+    /\ cold_retained     = {}
 
 (***************************************************************************)
 (* Helpers.                                                                  *)
@@ -243,29 +271,43 @@ WriteBlock(b) ==
     /\ UNCHANGED <<snap_state, snap_dead, freed,
                    next_snap_id, most_recent_snap,
                    live_cold_extents, extent_hash, snap_cold_dead,
-                   cold_dereffed, used_cold_extents, snap_view_blocks>>
+                   cold_dereffed, used_cold_extents, snap_view_blocks,
+                   snap_view_cold, retained, cold_retained>>
 
 (***************************************************************************)
-(* OverwriteBlock(b) — COW: b is removed from live. If a most-recent snap  *)
-(* exists, b is appended to its dead-list. Otherwise, b is freed           *)
-(* immediately (no snap holds it).                                         *)
+(* OverwriteBlock(b) -- COW: b is removed from live. In the most-recent     *)
+(* snap's view it goes on that snap's list, or past the cap it is retained. *)
+(* In no view it is freed: the birth test against the snap's capture, since *)
+(* a block in an older view is in the most-recent's too.                   *)
 (***************************************************************************)
 OverwriteBlock(b) ==
     /\ b \in Blocks
     /\ b \in live_blocks
     /\ live_blocks' = live_blocks \ {b}
     /\ IF BuggyOverwriteForgetsDead
-       THEN /\ UNCHANGED <<snap_dead, freed>>
+       THEN /\ UNCHANGED <<snap_dead, freed, retained>>
        ELSE
             IF most_recent_snap = 0
+               \/ b \notin snap_view_blocks[most_recent_snap]
+               \/ BuggyOverwriteFreesViewBlock
             THEN /\ freed' = freed \union {b}
-                 /\ UNCHANGED snap_dead
-            ELSE /\ snap_dead' = [snap_dead EXCEPT
+                 /\ UNCHANGED <<snap_dead, retained>>
+            ELSE IF Cardinality(snap_dead[most_recent_snap]) < DeadCap
+            THEN /\ snap_dead' = [snap_dead EXCEPT
                                      ![most_recent_snap] = @ \union {b}]
-                 /\ UNCHANGED freed
+                 /\ UNCHANGED <<freed, retained>>
+            ELSE /\ UNCHANGED snap_dead
+                 /\ IF BuggyPastCapFrees
+                    THEN /\ freed' = freed \union {b}
+                         /\ UNCHANGED retained
+                    ELSE IF BuggyPastCapForgets
+                    THEN UNCHANGED <<freed, retained>>
+                    ELSE /\ retained' = retained \union {b}
+                         /\ UNCHANGED freed
     /\ UNCHANGED <<snap_state, used, next_snap_id, most_recent_snap,
                    live_cold_extents, extent_hash, snap_cold_dead,
-                   cold_dereffed, used_cold_extents, snap_view_blocks>>
+                   cold_dereffed, used_cold_extents, snap_view_blocks,
+                   snap_view_cold, cold_retained>>
 
 (***************************************************************************)
 (* SnapCreate — bump next_snap_id; mark new snap PRESENT; new snap becomes *)
@@ -280,56 +322,50 @@ SnapCreate ==
     \* view never changes during the snap's lifetime — Rollback(s) reads it
     \* to determine which blocks survive vs which diverged.
     /\ snap_view_blocks' = [snap_view_blocks EXCEPT ![next_snap_id] = live_blocks]
+    /\ snap_view_cold' = [snap_view_cold EXCEPT ![next_snap_id] = live_cold_extents]
     /\ UNCHANGED <<live_blocks, snap_dead, freed, used,
                    live_cold_extents, extent_hash, snap_cold_dead,
-                   cold_dereffed, used_cold_extents>>
+                   cold_dereffed, used_cold_extents, retained, cold_retained>>
 
 (***************************************************************************)
-(* SnapDelete(s) — incremental dead-list algorithm.                         *)
-(*                                                                           *)
-(* Fixed:                                                                    *)
-(*   unique = snap_dead[s] − successor.snap_dead    (blocks only s holds)  *)
-(*   freed' = freed ∪ unique                                                *)
-(*   pred.snap_dead' = pred.snap_dead ∪ snap_dead[s]                        *)
-(*   s.snap_dead' = ∅                                                       *)
-(*   s.state' = ABSENT                                                       *)
-(*                                                                           *)
-(* If S is most-recent (no successor), unique = snap_dead[s] (everything   *)
-(* in S's dead is unique to S). All freed.                                  *)
-(* If S has no predecessor (S is oldest), the merge step has nowhere to   *)
-(* go — we simply discard the survivors (they're still in successor's     *)
-(* dead, so successor handles them on its eventual delete).                *)
-(*                                                                           *)
-(* Buggy variants:                                                           *)
-(*   BuggyForgetMerge   — skip the predecessor merge.                      *)
-(*   BuggyAlwaysFreeAll — free ALL of snap_dead[s] (no successor filter). *)
+(* SnapDelete(s). With an older PRESENT neighbour the lists move there,     *)
+(* since it may name anything on them, and past its cap an entry goes to    *)
+(* retained. With none they are freed: every entry was dropped before any   *)
+(* newer snapshot was taken, so no remaining view names it.                 *)
 (***************************************************************************)
 SnapDelete(s) ==
     /\ s \in SnapIds
     /\ SnapPresent(s)
-    /\ LET succ == SuccessorOf(s)
-           pred == PredecessorOf(s)
-           succ_dead == IF succ = 0 THEN {} ELSE snap_dead[succ]
-           unique == snap_dead[s] \ succ_dead
-           \* Surviving = blocks held by both S and successor; migrate
-           \* to predecessor under the fixed algorithm, or include
-           \* freed blocks under BuggyMergeIncludesFreed.
-           surviving == snap_dead[s] \ unique
-           merge_payload == IF BuggyMergeIncludesFreed
-                            THEN snap_dead[s]
-                            ELSE surviving
-       IN  /\ \* Free unique unless BuggyDeleteForgetsFree (skips the free).
-              freed' = IF BuggyDeleteForgetsFree
-                       THEN freed
-                       ELSE freed \union unique
+    /\ LET pred == PredecessorOf(s)
+           room == IF pred = 0 THEN 0
+                   ELSE DeadCap - Cardinality(snap_dead[pred])
+           takes == IF pred = 0 THEN {}
+                    ELSE IF Cardinality(snap_dead[s]) <= room THEN snap_dead[s]
+                    ELSE CHOOSE t \in SUBSET snap_dead[s] : Cardinality(t) = room
+           room_cold == IF pred = 0 THEN 0
+                        ELSE DeadCap - Cardinality(snap_cold_dead[pred])
+           takes_cold == IF pred = 0 THEN {}
+                         ELSE IF Cardinality(snap_cold_dead[s]) <= room_cold
+                              THEN snap_cold_dead[s]
+                              ELSE CHOOSE t \in SUBSET snap_cold_dead[s] :
+                                       Cardinality(t) = room_cold
+       IN  /\ freed' = IF pred = 0
+                       THEN IF BuggyDeleteForgetsFree
+                            THEN freed
+                            ELSE freed \union snap_dead[s]
+                       ELSE IF BuggyMergeIncludesFreed \/ BuggyDeleteFreesPreds
+                            THEN freed \union snap_dead[s]
+                            ELSE freed
            /\ snap_state' = [snap_state EXCEPT ![s] = "ABSENT"]
-           /\ \* Always: clear s.snap_dead.
-              \* If pred exists, merge merge_payload into pred.
-              snap_dead' =
-                  IF pred = 0
+           /\ snap_dead' =
+                  IF pred = 0 \/ BuggyDeleteFreesPreds
                   THEN [snap_dead EXCEPT ![s] = {}]
                   ELSE [snap_dead EXCEPT ![s] = {},
-                                          ![pred] = @ \union merge_payload]
+                                          ![pred] = @ \union takes]
+           /\ retained' =
+                  IF pred = 0 \/ BuggyDeleteFreesPreds \/ BuggyMergeIncludesFreed
+                  THEN retained
+                  ELSE retained \union (snap_dead[s] \ takes)
            /\ \* If we deleted the most-recent snap, recompute most_recent.
               most_recent_snap' =
                   IF most_recent_snap = s
@@ -339,16 +375,20 @@ SnapDelete(s) ==
                           ELSE CHOOSE t \in remaining :
                                   \A u \in remaining : t >= u
                   ELSE most_recent_snap
-           /\ \* P7-CAS-4c: cold-dead-list contents move to cold_dereffed
-              \* (no successor-filter — each cold extent stands alone).
-              cold_dereffed' =
-                  IF BuggyDeleteColdForgetsDeref
-                  THEN cold_dereffed
-                  ELSE cold_dereffed \union snap_cold_dead[s]
-           /\ snap_cold_dead' = [snap_cold_dead EXCEPT ![s] = {}]
+           /\ cold_dereffed' =
+                  IF pred = 0 /\ ~BuggyDeleteColdForgetsDeref
+                  THEN cold_dereffed \union snap_cold_dead[s]
+                  ELSE cold_dereffed
+           /\ snap_cold_dead' =
+                  IF pred = 0
+                  THEN [snap_cold_dead EXCEPT ![s] = {}]
+                  ELSE [snap_cold_dead EXCEPT ![s] = {},
+                                               ![pred] = @ \union takes_cold]
+           /\ cold_retained' = cold_retained \union
+                  (IF pred = 0 THEN {} ELSE snap_cold_dead[s] \ takes_cold)
     /\ UNCHANGED <<live_blocks, used, next_snap_id,
                    live_cold_extents, extent_hash, used_cold_extents,
-                   snap_view_blocks>>
+                   snap_view_blocks, snap_view_cold>>
 
 (***************************************************************************)
 (* P7-CAS-4c: WriteCold(c, h) — register a fresh cold extent c with hash h.*)
@@ -366,13 +406,14 @@ WriteCold(c, h) ==
     /\ extent_hash' = [extent_hash EXCEPT ![c] = h]
     /\ UNCHANGED <<live_blocks, snap_state, snap_dead, freed, used,
                    next_snap_id, most_recent_snap,
-                   snap_cold_dead, cold_dereffed, snap_view_blocks>>
+                   snap_cold_dead, cold_dereffed, snap_view_blocks,
+                   snap_view_cold, retained, cold_retained>>
 
 (***************************************************************************)
-(* P7-CAS-4c: OverwriteCold(c) — drop a cold extent from live. If a most- *)
-(* recent snap exists, route c into snap's cold-dead-list (deferring the *)
-(* CAS-deref to snap-delete time). Otherwise mark c as immediately        *)
-(* dereffed.                                                                *)
+(* P7-CAS-4c: OverwriteCold(c) -- drop a cold extent from live, by an         *)
+(* overwrite, a cut or a promote. As OverwriteBlock: in the most-recent     *)
+(* snap's view it goes on the list or, past the cap, is retained; in no     *)
+(* view its reference is dropped.                                           *)
 (*                                                                           *)
 (* Buggy: BuggyOverwriteColdForgetsDead drops c from live without routing *)
 (* anywhere → ColdExtentsTrackedSomewhere fires.                           *)
@@ -382,17 +423,23 @@ OverwriteCold(c) ==
     /\ c \in live_cold_extents
     /\ live_cold_extents' = live_cold_extents \ {c}
     /\ IF BuggyOverwriteColdForgetsDead
-       THEN /\ UNCHANGED <<snap_cold_dead, cold_dereffed>>
+       THEN /\ UNCHANGED <<snap_cold_dead, cold_dereffed, cold_retained>>
        ELSE
             IF most_recent_snap = 0
+               \/ c \notin snap_view_cold[most_recent_snap]
+               \/ BuggyOverwriteColdDerefsView
             THEN /\ cold_dereffed' = cold_dereffed \union {c}
-                 /\ UNCHANGED snap_cold_dead
-            ELSE /\ snap_cold_dead' = [snap_cold_dead EXCEPT
+                 /\ UNCHANGED <<snap_cold_dead, cold_retained>>
+            ELSE IF Cardinality(snap_cold_dead[most_recent_snap]) < DeadCap
+            THEN /\ snap_cold_dead' = [snap_cold_dead EXCEPT
                                           ![most_recent_snap] = @ \union {c}]
-                 /\ UNCHANGED cold_dereffed
+                 /\ UNCHANGED <<cold_dereffed, cold_retained>>
+            ELSE /\ cold_retained' = cold_retained \union {c}
+                 /\ UNCHANGED <<snap_cold_dead, cold_dereffed>>
     /\ UNCHANGED <<live_blocks, snap_state, snap_dead, freed, used,
                    next_snap_id, most_recent_snap,
-                   extent_hash, used_cold_extents, snap_view_blocks>>
+                   extent_hash, used_cold_extents, snap_view_blocks,
+                   snap_view_cold, retained>>
 
 (***************************************************************************)
 (* 9.7-spec — Action: Rollback(s) — restore live to snap s's frozen view.   *)
@@ -414,23 +461,22 @@ OverwriteCold(c) ==
 (*     fires.                                                               *)
 (*                                                                           *)
 (* The older-snap dead-list cleanup is defensive code: `snap_dead'[older]  *)
-(* = snap_dead[older] \ s_view`. Under this spec's MVP dead-list semantics *)
-(* (no birth-txg tracking; surviving = snap_dead[s] ∩ succ.dead is always  *)
-(* empty), older.dead never contains blocks in s_view, so the cleanup is   *)
-(* observably equivalent to no-op. We keep it for forward-compat with a    *)
-(* birth-txg-tracking dead_list extension but DON'T enumerate it as a      *)
-(* buggy variant — there's no reachable failure to model.                  *)
+(* = snap_dead[older] \ s_view`. An older snap's list holds blocks dropped  *)
+(* before s was taken, its own or moved to it from a snap it outlived, so   *)
+(* none is in s_view and the cleanup is observably a no-op.                 *)
+(*                                                                           *)
+(* A retained block in s_view is back in live. One in no view stays         *)
+(* retained: nothing names it, and only the walk of a later chunk could     *)
+(* tell. That is the leak the retained set is, in space.                    *)
+(*                                                                           *)
+(* This states what a rollback must free, by identity. The cold tier's       *)
+(* lists hold hashes, so the code gets there by count, and cold_rollback.tla *)
+(* checks that mechanism. Reflinks and clones are clone_refs.tla's, the prev *)
+(* chain snapshot.tla's.                                                     *)
 (***************************************************************************)
 Rollback(s) ==
     /\ s \in SnapIds
     /\ SnapPresent(s)
-    \* Well-formedness precondition: the target snap's view must not contain
-    \* any freed blocks. Models a real-system invariant: a snap whose tree
-    \* references a reclaimed block can't be rolled back to — the on-disk
-    \* state is corrupted. In dead_list.tla's MVP semantics (no birth-txg
-    \* tracking), SnapDelete-with-WriteBlock-before-snap can violate this
-    \* pre-rollback; we don't model rollback in those cases.
-    /\ snap_view_blocks[s] \cap freed = {}
     /\ LET newer_snaps == { s2 \in SnapIds : s2 > s /\ SnapPresent(s2) }
            newer_dead  == UNION { snap_dead[s2] : s2 \in newer_snaps }
            s_view      == snap_view_blocks[s]
@@ -445,9 +491,8 @@ Rollback(s) ==
         /\ \/ ~BuggyRollbackForgetsToFree /\ freed' = freed \union to_free
            \/ BuggyRollbackForgetsToFree  /\ freed' = freed
         \* Clear s's dead-list + newer-snaps' dead-lists; older snaps
-        \* drop blocks now back to live (defensive — under this spec's
-        \* MVP semantics older.dead ∩ s_view is always empty; the cleanup
-        \* is forward-compat for a birth-txg-tracking extension).
+        \* drop blocks now back to live (defensive: older.dead \cap s_view is
+        \* always empty).
         /\ snap_dead' = [s2 \in SnapIds |->
                           IF s2 = s \/ s2 \in newer_snaps
                           THEN {}
@@ -463,22 +508,47 @@ Rollback(s) ==
               /\ snap_state' = snap_state
         \* most_recent_snap rolls back to s (any newer snap is gone).
         /\ most_recent_snap' = s
-        \* P7-CAS-4c: cold-tier rollback semantics — symmetric to paddr but
-        \* MVP: clear s's and newer-snaps' cold-dead-lists; their cold
-        \* extents flow to cold_dereffed (the deref obligation is taken).
-        \* A future spec extension may model snap_view_cold_extents
-        \* analogous to snap_view_blocks; for now the cold-tier rollback
-        \* is a straight clear-and-deref (no view restoration).
-        /\ cold_dereffed' = cold_dereffed
-                            \union snap_cold_dead[s]
-                            \union UNION { snap_cold_dead[s2] : s2 \in newer_snaps }
-        /\ snap_cold_dead' = [s2 \in SnapIds |->
-                               IF s2 = s \/ s2 \in newer_snaps
-                               THEN {}
-                               ELSE snap_cold_dead[s2]]
+        /\ retained' = retained \ s_view
+        \* The cold tier, symmetric to the paddr tier.
+        /\ LET c_view == snap_view_cold[s]
+           IN
+            /\ live_cold_extents' = c_view
+            /\ cold_dereffed' = cold_dereffed
+                                \union (live_cold_extents \ c_view)
+                                \union (snap_cold_dead[s] \ c_view)
+                                \union (UNION { snap_cold_dead[s2] : s2 \in newer_snaps }
+                                        \ c_view)
+            /\ snap_cold_dead' = [s2 \in SnapIds |->
+                                   IF s2 = s \/ s2 \in newer_snaps
+                                   THEN {}
+                                   ELSE snap_cold_dead[s2] \ c_view]
+            /\ cold_retained' = cold_retained \ c_view
     /\ UNCHANGED <<used, next_snap_id,
-                   live_cold_extents, extent_hash, used_cold_extents,
-                   snap_view_blocks>>
+                   extent_hash, used_cold_extents,
+                   snap_view_blocks, snap_view_cold>>
+
+(***************************************************************************)
+(* Mount's reconcile, the node tier's sweep: an allocated block nothing      *)
+(* marks is freed. Live, every present view and every present list mark.     *)
+(* Only a retained block can be left, and sweeping one heals the leak. A     *)
+(* list entry need not be in any view: a delete moves its list to an older   *)
+(* neighbour that never named them. Swept, it is reissued, and the           *)
+(* neighbour's delete frees it from under whoever holds it then.            *)
+(***************************************************************************)
+Mount ==
+    /\ LET lists == IF BuggyMountSweepsLists THEN {}
+                    ELSE UNION { snap_dead[s] : s \in PresentSnaps }
+           marked == live_blocks \union lists
+                     \union UNION { snap_view_blocks[s] : s \in PresentSnaps }
+           swept == used \ (marked \union freed)
+       IN /\ swept # {}
+          /\ freed' = freed \union swept
+          /\ retained' = retained \ swept
+    /\ UNCHANGED <<live_blocks, snap_state, snap_dead, used,
+                   next_snap_id, most_recent_snap,
+                   live_cold_extents, extent_hash, snap_cold_dead,
+                   cold_dereffed, used_cold_extents, snap_view_blocks,
+                   snap_view_cold, cold_retained>>
 
 (***************************************************************************)
 (* Top-level Next.                                                           *)
@@ -491,6 +561,7 @@ Next ==
     \/ \E s \in SnapIds : Rollback(s)
     \/ \E c \in ColdExtentIds, h \in HashIds : WriteCold(c, h)
     \/ \E c \in ColdExtentIds : OverwriteCold(c)
+    \/ Mount
 
 Spec == Init /\ [][Next]_vars
 
@@ -512,6 +583,9 @@ TypeOK ==
     /\ cold_dereffed  \in SUBSET ColdExtentIds
     /\ used_cold_extents \in SUBSET ColdExtentIds
     /\ snap_view_blocks \in [SnapIds -> SUBSET Blocks]
+    /\ snap_view_cold \in [SnapIds -> SUBSET ColdExtentIds]
+    /\ retained \in SUBSET Blocks
+    /\ cold_retained \in SUBSET ColdExtentIds
 
 (* Every block that has been written to live_blocks but is no longer there *)
 (* must be tracked SOMEWHERE — either freed, or in some PRESENT snap's    *)
@@ -526,6 +600,7 @@ BlocksTrackedSomewhere ==
     \A b \in used :
         \/ b \in live_blocks
         \/ b \in freed
+        \/ b \in retained
         \/ \E s \in SnapIds : SnapPresent(s) /\ b \in snap_dead[s]
 
 (* No double-free: a block in `freed` is never re-freed by a subsequent   *)
@@ -586,6 +661,7 @@ ColdExtentsTrackedSomewhere ==
     \A c \in used_cold_extents :
         \/ c \in live_cold_extents
         \/ c \in cold_dereffed
+        \/ c \in cold_retained
         \/ \E s \in SnapIds : SnapPresent(s) /\ c \in snap_cold_dead[s]
 
 (* P7-CAS-4c: live cold extents aren't in any snap's cold-dead-list (a   *)
@@ -620,18 +696,28 @@ ColdSingleOwnership ==
 (* BuggyRollbackKeepsNewerSnaps trips this by leaving newer snaps PRESENT*)
 (* after rollback while their view blocks end up in `freed`.             *)
 (*                                                                           *)
-(* CHECKED ONLY IN ROLLBACK BUGGY CONFIGS — not in the base Invariants    *)
-(* because dead_list.tla's pre-9.7 SnapDelete-with-WriteBlock-before-snap *)
-(* trace can independently trip this (the spec doesn't track birth-txg;  *)
-(* OverwriteBlock routes to most_recent_snap regardless of when b was    *)
-(* born, so an older snap's view can contain a block that SnapDelete of  *)
-(* a younger snap frees). That's a pre-9.7 modeling simplification we    *)
-(* don't fix in this chunk; the 9.7 buggy configs use SnapViewConsistent *)
-(* directly as their named INVARIANT, which detects the rollback bug     *)
-(* class without claiming the property holds globally.                   *)
 SnapViewConsistent ==
     \A s \in SnapIds :
         SnapPresent(s) => snap_view_blocks[s] \cap freed = {}
+
+(* Its cold analog: a view's cold record keeps its chunk. *)
+ColdViewConsistent ==
+    \A s \in SnapIds :
+        SnapPresent(s) => snap_view_cold[s] \cap cold_dereffed = {}
+
+(* A retained block is on no list, not live and not freed. *)
+RetainedDisjoint ==
+    /\ retained \cap (live_blocks \union freed) = {}
+    /\ cold_retained \cap (live_cold_extents \union cold_dereffed) = {}
+    /\ \A s \in SnapIds :
+        /\ retained \cap snap_dead[s] = {}
+        /\ cold_retained \cap snap_cold_dead[s] = {}
+
+(* No list runs past its cap. *)
+ListsAtMostCap ==
+    \A s \in SnapIds :
+        /\ Cardinality(snap_dead[s]) <= DeadCap
+        /\ Cardinality(snap_cold_dead[s]) <= DeadCap
 
 Invariants ==
     /\ TypeOK
@@ -646,5 +732,9 @@ Invariants ==
     /\ LiveColdDisjointFromDereffed
     /\ DereffedColdDisjointFromDead
     /\ ColdSingleOwnership
+    /\ SnapViewConsistent
+    /\ ColdViewConsistent
+    /\ RetainedDisjoint
+    /\ ListsAtMostCap
 
 ================================================================================

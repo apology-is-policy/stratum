@@ -66,11 +66,10 @@ struct stm_snapshot_index;   typedef struct stm_snapshot_index stm_snapshot_inde
  * snaps at v1.0). Routing through `most_recent_locked(clone_dataset_id)`
  * yields NO_PREV and the paddr would return to the allocator while S
  * still references it → AEAD `(paddr, write_gen)` nonce mismatch →
- * STM_ECORRUPT on subsequent S reads. When `origin_snap_id != 0` the
- * `free` path dispatches through `stm_snapshot_index_add_to_snap_bootstrap_dead_list`
- * against that SPECIFIC snap_id instead, regardless of any most-recent
- * snap of any dataset. Non-clone engines leave the field 0 (sentinel
- * `STM_DATASET_NO_ORIGIN`); their free dispatch follows the original
+ * STM_ECORRUPT on subsequent S reads. When `origin_snap_id != 0` the `free`
+ * path frees only what the clone wrote after S's capture and leaves the rest to
+ * the origin's lineage, which lists it at its own drop. Non-clone engines leave the
+ * field 0 (sentinel `STM_DATASET_NO_ORIGIN`); their free dispatch follows the
  * dataset-id / most-recent path.
  *
  *   - boot / bdev:      stable through engine lifetime.

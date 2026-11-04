@@ -1205,6 +1205,7 @@ static stm_status materialize_state(stm_ctl *c, ctl_session *s)
         "mounted: yes\n"
         "read-only: %d\n"
         "wedged: %d\n"
+        "lists-unverified: %d\n"
         "current-gen: %llu\n"
         "alloc-root-paddr: 0x%llx\n"
         "data-total-blocks: %llu\n"
@@ -1214,6 +1215,7 @@ static stm_status materialize_state(stm_ctl *c, ctl_session *s)
         "n-allocated-ranges: %llu\n",
         (int)stats.read_only,
         (int)stats.wedged,
+        (int)stats.lists_unverified,
         (unsigned long long)stats.current_gen,
         (unsigned long long)stats.alloc_root_paddr,
         (unsigned long long)stats.data_total_blocks,
@@ -2020,6 +2022,10 @@ static stm_status materialize_pool_metrics_prometheus(stm_ctl *c,
           "# TYPE stratum_pool_wedged gauge\n"
           "stratum_pool_wedged{pool=\"%s\"} %d\n",
           pool_uuid_s, (int)fs_stats.wedged);
+        P("# HELP stratum_pool_lists_unverified 1 if this mount's pass did not finish, so no delete or rollback frees a node off a list.\n"
+          "# TYPE stratum_pool_lists_unverified gauge\n"
+          "stratum_pool_lists_unverified{pool=\"%s\"} %d\n",
+          pool_uuid_s, (int)fs_stats.lists_unverified);
         P("# HELP stratum_pool_datasets_total Number of registered datasets.\n"
           "# TYPE stratum_pool_datasets_total gauge\n"
           "stratum_pool_datasets_total{pool=\"%s\"} %llu\n",
@@ -4127,9 +4133,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             (unsigned long long)snap_id, force ? 1 : 0,
             rc == STM_OK ? "" : "err:", status_short_name(rc));
         if (rc != STM_OK) return rc;
-        /* v1.0: stm_fs_rollback_snapshot never returns STM_OK — the
-         * mechanism is a Phase 9.7 stub. When 9.7 lands, a successful
-         * rollback will need a synchronous commit here. */
+        /* The rollback commits its own swap. */
         *out_written = len;
         return STM_OK;
     }

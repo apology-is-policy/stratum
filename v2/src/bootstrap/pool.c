@@ -130,6 +130,7 @@ struct stm_bootstrap {
      * by stm_bootstrap_reconcile_begin and freed by _end. NULL outside a
      * reconcile pass. See the reconcile section below. */
     uint8_t   *reconcile_marked;
+    uint8_t   *reconcile_live;     /* the marks made before the split */
 
     /* Chunk 5d: opaque user-data region stored in the header. Persisted
      * atomically with the bootstrap commit. */
@@ -163,6 +164,7 @@ struct stm_bootstrap {
     uint64_t   reuse_below_gen;
     uint64_t   early_reclaimed_nodes;   /* monotone; stats */
     uint64_t   early_forced_nodes;      /* monotone; stats */
+    uint64_t   restored_nodes;          /* monotone; stats */
 };
 
 /* ========================================================================= */
@@ -693,6 +695,7 @@ void stm_bootstrap_close(stm_bootstrap *a)
         e = next;
     }
     free(a->reconcile_marked);   /* #791: defensive -- frees an abandoned pass */
+    free(a->reconcile_live);
     free(a->staged_region);      /* CF-4 B: defensive -- an abandoned window */
     free(a->bitmap);
     free(a);
@@ -1289,21 +1292,56 @@ stm_status stm_bootstrap_reconcile_mark(stm_bootstrap *a, uint64_t paddr,
     return STM_OK;
 }
 
+stm_status stm_bootstrap_reconcile_split(stm_bootstrap *a)
+{
+    if (!a || !a->reconcile_marked || a->reconcile_live) return STM_EINVAL;
+    uint8_t *after = calloc(1, a->bitmap_bytes);
+    if (!after) return STM_ENOMEM;
+    a->reconcile_live = a->reconcile_marked;
+    a->reconcile_marked = after;
+    return STM_OK;
+}
+
+bool stm_bootstrap_reconcile_view_holds(const stm_bootstrap *a, uint64_t paddr)
+{
+    uint64_t node = 0;
+    if (!a || !a->reconcile_live || !paddr_to_node(a, paddr, &node)) return false;
+    return bit_is_set(a->reconcile_marked, node);
+}
+
+bool stm_bootstrap_reconcile_entry_stale(const stm_bootstrap *a, uint64_t paddr)
+{
+    uint64_t node = 0;
+    if (!a || !a->reconcile_live || !paddr_to_node(a, paddr, &node)) return false;
+    if (!bit_is_set(a->bitmap, node)) return true;
+    return bit_is_set(a->reconcile_live, node) && !bit_is_set(a->reconcile_marked, node);
+}
+
 stm_status stm_bootstrap_reconcile_end(stm_bootstrap *a, uint64_t *out_freed_nodes)
 {
     if (!a || !a->reconcile_marked) return STM_EINVAL;
-    uint64_t freed = 0;
+    uint64_t freed = 0, restored = 0;
     for (uint64_t node = 0; node < a->total_nodes; node++) {
-        if (bit_is_set(a->bitmap, node) &&
-            !bit_is_set(a->reconcile_marked, node)) {
+        bool named = bit_is_set(a->reconcile_marked, node) ||
+                     (a->reconcile_live && bit_is_set(a->reconcile_live, node));
+        if (bit_is_set(a->bitmap, node) && !named) {
             bit_clear(a->bitmap, node);   /* orphan -> free; durable on next commit */
             freed++;
+        } else if (!bit_is_set(a->bitmap, node) && named) {
+            /* A durable tree never names a free node on this code. An older mount's sweep
+             * and an older delete could leave one, its bytes whole until the allocator
+             * comes round. A wrong guess here costs a node until the next pass. */
+            bit_set(a->bitmap, node);
+            restored++;
         }
     }
-    if (freed > 0)
+    a->restored_nodes += restored;
+    if (freed > 0 || restored > 0)
         atomic_store_explicit(&a->dirty, true, memory_order_relaxed);
     free(a->reconcile_marked);
     a->reconcile_marked = NULL;
+    free(a->reconcile_live);
+    a->reconcile_live = NULL;
     if (out_freed_nodes) *out_freed_nodes = freed;
     return STM_OK;
 }
@@ -1318,6 +1356,8 @@ void stm_bootstrap_reconcile_abort(stm_bootstrap *a)
      * reconcile is a best-effort reclaimer, never a corruptor. */
     free(a->reconcile_marked);
     a->reconcile_marked = NULL;
+    free(a->reconcile_live);
+    a->reconcile_live = NULL;
 }
 
 /* ========================================================================= */
@@ -1344,6 +1384,7 @@ stm_status stm_bootstrap_stats_get(const stm_bootstrap *a, stm_bootstrap_stats *
     out->bitmap_gen            = a->bitmap_gen;
     out->early_reclaimed_nodes = a->early_reclaimed_nodes;
     out->early_forced_nodes    = a->early_forced_nodes;
+    out->restored_nodes        = a->restored_nodes;
     return STM_OK;
 }
 

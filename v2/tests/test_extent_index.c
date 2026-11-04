@@ -1236,7 +1236,7 @@ STM_TEST(ex_truncate_into_uses_pre_allocated_buffers) {
     STM_ASSERT_OK(stm_extent_truncate_into(idx, 1, 1, 4096,
                                               drop_idx, n_ext,
                                               paddrs,   n_repl,
-                                              &n_dropped));
+                                              &n_dropped, NULL));
     STM_ASSERT_EQ(n_dropped, (size_t)5);
 
     /* All 5 dropped paddrs must be from r2 + r3 (in some order). */
@@ -1279,7 +1279,7 @@ STM_TEST(ex_truncate_into_refuses_undersized_buffer_and_keeps_state) {
     STM_ASSERT_ERR(stm_extent_truncate_into(idx, 1, 1, 4096,
                                                drop_idx_too_small, 0,
                                                paddrs, 8,
-                                               &n_dropped),
+                                               &n_dropped, NULL),
                        STM_ERANGE);
     STM_ASSERT_EQ(n_dropped, (size_t)0);
 
@@ -1295,7 +1295,7 @@ STM_TEST(ex_truncate_into_refuses_undersized_buffer_and_keeps_state) {
     STM_ASSERT_ERR(stm_extent_truncate_into(idx, 1, 1, 4096,
                                                drop_idx, 4,
                                                paddrs_too_small, 1,
-                                               &n_dropped),
+                                               &n_dropped, NULL),
                        STM_ERANGE);
     STM_ASSERT_EQ(n_dropped, (size_t)0);
 
@@ -1318,7 +1318,7 @@ STM_TEST(ex_truncate_into_zero_drops_accepts_null_buffers) {
     STM_ASSERT_OK(stm_extent_truncate_into(idx, 1, 1, 4096,
                                               /*drop_idx=*/NULL, 0,
                                               /*paddrs=*/NULL,   0,
-                                              &n_dropped));
+                                              &n_dropped, NULL));
     STM_ASSERT_EQ(n_dropped, (size_t)0);
 
     size_t cnt = 0;
@@ -1687,7 +1687,7 @@ STM_TEST(ex_overwrite_pieces_replaces_the_union_in_one_step) {
     uint64_t *dropped = NULL;
     size_t n_dropped = 0;
     STM_ASSERT_OK(stm_extent_overwrite_pieces(idx, 1, 1, pc, 3, 0, 0,
-                                              &dropped, &n_dropped));
+                                              &dropped, &n_dropped, NULL));
     STM_ASSERT_EQ(n_dropped, (size_t)3);
     bool a = false, b = false, c = false;
     for (size_t i = 0; i < n_dropped; i++) {
@@ -1727,10 +1727,10 @@ STM_TEST(ex_overwrite_pieces_refuses_a_gap_or_a_shared_block) {
     uint64_t *dropped = NULL;
     size_t n_dropped = 0;
     STM_ASSERT_ERR(stm_extent_overwrite_pieces(idx, 1, 1, gap, 2, 0, 0,
-                                               &dropped, &n_dropped),
+                                               &dropped, &n_dropped, NULL),
                    STM_EINVAL);
     STM_ASSERT_ERR(stm_extent_overwrite_pieces(idx, 1, 1, shared, 2, 0, 0,
-                                               &dropped, &n_dropped),
+                                               &dropped, &n_dropped, NULL),
                    STM_EINVAL);
     STM_ASSERT_EQ(n_dropped, (size_t)0);
     stm_extent_record e;
@@ -1758,7 +1758,7 @@ STM_TEST(ex_overwrite_pieces_failing_part_way_answers_ewedged) {
         uint64_t *dropped = NULL;
         size_t n_dropped = 0;
         stm_status rc = stm_extent_overwrite_pieces(idx, 1, 1, pc, 2, 0, 0,
-                                                    &dropped, &n_dropped);
+                                                    &dropped, &n_dropped, NULL);
         stm_extent_record e;
         if (leg == 0) {
             STM_ASSERT_ERR(rc, STM_ENOMEM);

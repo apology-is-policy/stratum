@@ -985,7 +985,7 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
                              .n_paddrs = n_new_paddrs };
     return stm_extent_overwrite_pieces(idx, dataset_id, ino, &one, 1u,
                                        write_gen, key_id,
-                                       out_dropped_paddrs, out_n_dropped);
+                                       out_dropped_paddrs, out_n_dropped, NULL);
 }
 
 static int ex_u64_cmp(const void *a, const void *b) {
@@ -1011,10 +1011,12 @@ stm_status stm_extent_overwrite_pieces(stm_extent_index *idx,
                                          size_t n,
                                          uint64_t write_gen, uint64_t key_id,
                                          uint64_t **out_dropped_paddrs,
-                                         size_t *out_n_dropped) {
+                                         size_t *out_n_dropped,
+                                         uint64_t **out_dropped_gens) {
     if (!out_dropped_paddrs || !out_n_dropped) return STM_EINVAL;
     *out_dropped_paddrs = NULL;
     *out_n_dropped      = 0;
+    if (out_dropped_gens) *out_dropped_gens = NULL;
     if (!idx || !pieces || n == 0) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     size_t total_new = 0;
@@ -1131,10 +1133,13 @@ stm_status stm_extent_overwrite_pieces(stm_extent_index *idx,
         return STM_EEXIST;
     }
 
-    uint64_t *out_buf = NULL;
+    uint64_t *out_buf = NULL, *gen_buf = NULL;
     if (total_drops > 0) {
         out_buf = calloc(total_drops, sizeof(uint64_t));
-        if (!out_buf) {
+        if (out_dropped_gens) gen_buf = calloc(total_drops, sizeof(uint64_t));
+        if (!out_buf || (out_dropped_gens && !gen_buf)) {
+            free(out_buf);
+            free(gen_buf);
             ex_collect_free(&c);
             must_unlock(&idx->lock);
             return STM_ENOMEM;
@@ -1147,6 +1152,7 @@ stm_status stm_extent_overwrite_pieces(stm_extent_index *idx,
         drop_offs_idx = malloc(n_drops * sizeof *drop_offs_idx);
         if (!drop_offs_idx) {
             free(out_buf);
+            free(gen_buf);
             ex_collect_free(&c);
             must_unlock(&idx->lock);
             return STM_ENOMEM;
@@ -1185,6 +1191,7 @@ stm_status stm_extent_overwrite_pieces(stm_extent_index *idx,
     }
     if (pr != STM_OK && n_put == 0) {
         free(out_buf);
+        free(gen_buf);
         free(drop_offs_idx);
         ex_collect_free(&c);
         must_unlock(&idx->lock);
@@ -1203,14 +1210,17 @@ stm_status stm_extent_overwrite_pieces(stm_extent_index *idx,
             stm_status ds = ex_engine_del(idx, e->dataset_id, e->ino, e->off);
             if (ds != STM_OK) { last_ds = ds; continue; }
         }
-        for (uint8_t r = 0; r < e->n_replicas; r++)
+        for (uint8_t r = 0; r < e->n_replicas; r++) {
+            if (gen_buf) gen_buf[out_idx] = e->gen;
             out_buf[out_idx++] = e->paddrs[r];
+        }
     }
     free(drop_offs_idx);
     ex_collect_free(&c);
 
     *out_dropped_paddrs = out_buf;
     *out_n_dropped      = out_idx;
+    if (out_dropped_gens) *out_dropped_gens = gen_buf;
     must_unlock(&idx->lock);
     return last_ds != STM_OK ? STM_EWEDGED : STM_OK;
 }
@@ -1242,9 +1252,11 @@ static stm_status drop_by_predicate_locked(stm_extent_index *idx,
                                               uint64_t ds, uint64_t ino,
                                               const ex_drop_pred *pred,
                                               uint64_t **out_paddrs,
-                                              size_t *out_n) {
+                                              size_t *out_n,
+                                              uint64_t **out_gens) {
     *out_paddrs = NULL;
     *out_n      = 0;
+    if (out_gens) *out_gens = NULL;
 
     ex_collect_ctx c;
     stm_status cs = ex_collect_in_ino_locked(idx, ds, ino, &c);
@@ -1262,10 +1274,13 @@ static stm_status drop_by_predicate_locked(stm_extent_index *idx,
         return STM_OK;
     }
 
-    uint64_t *paddrs = NULL;
+    uint64_t *paddrs = NULL, *gens = NULL;
     if (total_replicas > 0) {
         paddrs = calloc(total_replicas, sizeof(uint64_t));
-        if (!paddrs) {
+        if (out_gens) gens = calloc(total_replicas, sizeof(uint64_t));
+        if (!paddrs || (out_gens && !gens)) {
+            free(paddrs);
+            free(gens);
             ex_collect_free(&c);
             return STM_ENOMEM;
         }
@@ -1280,6 +1295,7 @@ static stm_status drop_by_predicate_locked(stm_extent_index *idx,
         if (ds_ != STM_OK) { last_ds = ds_; continue; }
         gone++;
         for (uint8_t r = 0; r < e->n_replicas; r++) {
+            if (gens) gens[pidx] = e->gen;
             paddrs[pidx++] = e->paddrs[r];
         }
     }
@@ -1290,10 +1306,12 @@ static stm_status drop_by_predicate_locked(stm_extent_index *idx,
      * the blocks of those that went. */
     if (last_ds != STM_OK && gone == 0) {
         free(paddrs);
+        free(gens);
         return last_ds;
     }
     *out_paddrs = paddrs;
     *out_n      = pidx;
+    if (out_gens) *out_gens = gens;
     return last_ds != STM_OK ? STM_EWEDGED : STM_OK;
 }
 
@@ -1304,7 +1322,8 @@ static stm_status drop_by_predicate_into_locked(stm_extent_index *idx,
                                                   size_t drop_idx_cap,
                                                   uint64_t *paddrs_buf,
                                                   size_t paddrs_cap,
-                                                  size_t *out_n_dropped) {
+                                                  size_t *out_n_dropped,
+                                                  uint64_t *gens_buf) {
     *out_n_dropped = 0;
 
     ex_collect_ctx c;
@@ -1336,6 +1355,7 @@ static stm_status drop_by_predicate_into_locked(stm_extent_index *idx,
         if (ds_ != STM_OK) { last_ds = ds_; continue; }
         gone++;
         for (uint8_t r = 0; r < e->n_replicas; r++) {
+            if (gens_buf) gens_buf[pidx] = e->gen;
             paddrs_buf[pidx++] = e->paddrs[r];
         }
     }
@@ -1367,7 +1387,7 @@ stm_status stm_extent_truncate(stm_extent_index *idx,
                             .punch_off = 0, .punch_end = 0 };
     stm_status rs = drop_by_predicate_locked(idx, dataset_id, ino, &pred,
                                                 out_dropped_paddrs,
-                                                out_n_dropped);
+                                                out_n_dropped, NULL);
     must_unlock(&idx->lock);
     return rs;
 }
@@ -1412,7 +1432,8 @@ stm_status stm_extent_truncate_into(stm_extent_index *idx,
                                        uint64_t new_size,
                                        size_t *drop_idx_buf, size_t drop_idx_cap,
                                        uint64_t *paddrs_buf, size_t paddrs_cap,
-                                       size_t *out_n_dropped) {
+                                       size_t *out_n_dropped,
+                                       uint64_t *gens_buf) {
     if (!out_n_dropped) return STM_EINVAL;
     *out_n_dropped = 0;
     if (!idx) return STM_EINVAL;
@@ -1431,7 +1452,7 @@ stm_status stm_extent_truncate_into(stm_extent_index *idx,
     stm_status rs = drop_by_predicate_into_locked(idx, dataset_id, ino, &pred,
                                                      drop_idx_buf, drop_idx_cap,
                                                      paddrs_buf, paddrs_cap,
-                                                     out_n_dropped);
+                                                     out_n_dropped, gens_buf);
     must_unlock(&idx->lock);
     return rs;
 }
@@ -1456,7 +1477,7 @@ stm_status stm_extent_delete_file(stm_extent_index *idx,
                             .punch_off = 0, .punch_end = 0 };
     stm_status rs = drop_by_predicate_locked(idx, dataset_id, ino, &pred,
                                                 out_dropped_paddrs,
-                                                out_n_dropped);
+                                                out_n_dropped, NULL);
     must_unlock(&idx->lock);
     return rs;
 }
@@ -1465,9 +1486,11 @@ stm_status stm_extent_punch_range(stm_extent_index *idx,
                                        uint64_t dataset_id, uint64_t ino,
                                        uint64_t off, uint64_t len,
                                        uint64_t **out_dropped_paddrs,
-                                       size_t *out_n_dropped_paddrs) {
+                                       size_t *out_n_dropped_paddrs,
+                                       uint64_t **out_dropped_gens) {
     if (out_dropped_paddrs) *out_dropped_paddrs = NULL;
     if (out_n_dropped_paddrs) *out_n_dropped_paddrs = 0;
+    if (out_dropped_gens) *out_dropped_gens = NULL;
     if (!idx || !out_dropped_paddrs || !out_n_dropped_paddrs)
         return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
@@ -1506,7 +1529,8 @@ stm_status stm_extent_punch_range(stm_extent_index *idx,
                             .punch_off = off, .punch_end = r_end };
     stm_status rs = drop_by_predicate_locked(idx, dataset_id, ino, &pred,
                                                 out_dropped_paddrs,
-                                                out_n_dropped_paddrs);
+                                                out_n_dropped_paddrs,
+                                                out_dropped_gens);
     must_unlock(&idx->lock);
     return rs;
 }
@@ -1970,9 +1994,11 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
         uint64_t key_id,
         uint64_t link_gen,
         uint64_t **out_dropped_paddrs,
-        size_t *out_n_dropped_paddrs) {
+        size_t *out_n_dropped_paddrs,
+        uint64_t **out_dropped_gens) {
     if (out_dropped_paddrs)   *out_dropped_paddrs = NULL;
     if (out_n_dropped_paddrs) *out_n_dropped_paddrs = 0;
+    if (out_dropped_gens)     *out_dropped_gens = NULL;
 
     if (!idx || !chunks || !out_dropped_paddrs || !out_n_dropped_paddrs)
         return STM_EINVAL;
@@ -2111,7 +2137,10 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
     size_t paddrs_n = 0;
     for (size_t i = 0; i < c.n; i++) paddrs_n += c.records[i].n_replicas;
     uint64_t *dropped = malloc(paddrs_n * sizeof(uint64_t));
-    if (!dropped) {
+    uint64_t *dgens = out_dropped_gens ? malloc(paddrs_n * sizeof(uint64_t)) : NULL;
+    if (!dropped || (out_dropped_gens && !dgens)) {
+        free(dropped);
+        free(dgens);
         ex_collect_free(&c);
         must_unlock(&idx->lock);
         return STM_ENOMEM;
@@ -2127,6 +2156,7 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
         if (ds_ != STM_OK) { last_status = ds_; continue; }
         gone++;
         for (uint8_t k = 0; k < r->n_replicas; k++) {
+            if (dgens) dgens[pi] = r->gen;
             dropped[pi++] = r->paddrs[k];
         }
     }
@@ -2158,10 +2188,12 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
 
     if (last_status != STM_OK && gone == 0) {
         free(dropped);
+        free(dgens);
         return last_status;
     }
     *out_dropped_paddrs   = dropped;
     *out_n_dropped_paddrs = pi;
+    if (out_dropped_gens) *out_dropped_gens = dgens;
     return last_status != STM_OK ? STM_EWEDGED : STM_OK;
 }
 
@@ -2587,6 +2619,27 @@ stm_status stm_extent_iter(const stm_extent_index *idx,
     return STM_OK;
 }
 
+/* Hands the collected records to `cb` in (ino, off) order, and frees them. */
+static void ex_iter_emit_sorted(ex_collect_ctx *c, stm_extent_iter_cb cb, void *ctx) {
+    for (size_t i = 1; i < c->n; i++) {
+        stm_extent_record key = c->records[i];
+        size_t j = i;
+        while (j > 0) {
+            bool greater = (c->records[j - 1].ino > key.ino) ||
+                            (c->records[j - 1].ino == key.ino && c->records[j - 1].off > key.off);
+            if (!greater) break;
+            c->records[j] = c->records[j - 1];
+            j--;
+        }
+        c->records[j] = key;
+    }
+    for (size_t i = 0; i < c->n; i++) {
+        if (!cb(&c->records[i], ctx)) break;
+    }
+    free(c->records);
+    free(c->offs);
+}
+
 stm_status stm_extent_iter_ds(const stm_extent_index *idx,
                                   uint64_t dataset_id,
                                   stm_extent_iter_cb cb, void *ctx) {
@@ -2637,24 +2690,47 @@ stm_status stm_extent_iter_ds(const stm_extent_index *idx,
         return ss != STM_OK ? ss : c.err;
     }
 
-    /* Sort by (ino, off). */
-    for (size_t i = 1; i < c.n; i++) {
-        stm_extent_record key = c.records[i];
-        size_t j = i;
-        while (j > 0) {
-            bool greater = (c.records[j - 1].ino > key.ino) ||
-                            (c.records[j - 1].ino == key.ino && c.records[j - 1].off > key.off);
-            if (!greater) break;
-            c.records[j] = c.records[j - 1];
-            j--;
-        }
-        c.records[j] = key;
+    ex_iter_emit_sorted(&c, cb, ctx);
+    must_unlock(lock);
+    return STM_OK;
+}
+
+stm_status stm_extent_iter_ds_at(stm_extent_index *idx, uint64_t dataset_id,
+                                 uint64_t root_paddr, uint64_t root_gen,
+                                 const uint8_t root_csum[32],
+                                 stm_extent_iter_cb cb, void *ctx) {
+    if (!idx || !cb) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    if (idx->ds_idx == NULL) {
+        must_unlock(lock);
+        return STM_EINVAL;
     }
-    for (size_t i = 0; i < c.n; i++) {
-        if (!cb(&c.records[i], ctx)) break;
+
+    uint8_t lo[EX_KEY_LEN], hi[EX_KEY_LEN];
+    stm_status k1 = ex_encode_key(0u,         0u,         lo);
+    stm_status k2 = ex_encode_key(UINT64_MAX, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK) {
+        must_unlock(lock);
+        return k1 != STM_OK ? k1 : k2;
     }
-    free(c.records);
-    free(c.offs);
+
+    ex_collect_ctx c;
+    memset(&c, 0, sizeof c);
+    c.ds = dataset_id;
+    stm_status ss = stm_dataset_index_scan_engine_range_at(
+            idx->ds_idx, dataset_id, root_paddr, root_gen, root_csum,
+            lo, EX_KEY_LEN, hi, EX_KEY_LEN, ex_collect_cb, &c);
+    if (ss != STM_OK || c.err != STM_OK) {
+        free(c.records);
+        free(c.offs);
+        must_unlock(lock);
+        return ss != STM_OK ? ss : c.err;
+    }
+
+    ex_iter_emit_sorted(&c, cb, ctx);
     must_unlock(lock);
     return STM_OK;
 }

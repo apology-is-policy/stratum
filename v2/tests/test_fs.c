@@ -2158,6 +2158,7 @@ STM_TEST(fs_io_cow_with_snapshot_routes_to_dead_list) {
     STM_ASSERT_TRUE(snap != NULL);
 
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap, /*ds=*/1, "snap_a",
                                           /*tree_root_paddr=*/0xCAFE,
                                           0, NULL,
@@ -2721,6 +2722,7 @@ STM_TEST(fs_truncate_with_snapshot_routes_old_paddrs_to_dead_list) {
     STM_ASSERT_TRUE(snap != NULL);
 
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap, /*ds=*/1, "snap_pre_truncate",
                                           /*tree_root_paddr=*/0xCAFE,
                                           0, NULL,
@@ -3604,6 +3606,7 @@ STM_TEST(fs_reflink_snap_dual_overwrite_no_wedge) {
     stm_sync *sync = stm_fs_sync_for_test(fs);
     stm_snapshot_index *snap = stm_sync_snapshot_index(sync);
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap, /*ds=*/1, "S",
                                           /*tree_root_paddr=*/0xCAFE,
                                           0, NULL,
@@ -3992,9 +3995,10 @@ STM_TEST(fs_rollback_reclaims_cleared_dead_list_cold_garbage) {
      *     routes to dead_S(H1) (deref deferred). refcount(H1) stays at
      *     1 (live → 0, dead → 1, total 1). 4c-iii: dead(H1)=1 -
      *     snap_unique(H1)=1 = 0 derefs.
-     *   - case-(b) — write+migrate inodes 20+21 (TWO fresh cold
-     *     records H20, H21 never in snap_view) then truncate each →
-     *     dead_S(H20) += 1, dead_S(H21) += 1. refcount(H20)=1,
+     *   - case-(b): write+migrate inodes 20+21 (TWO fresh cold records
+     *     H20, H21 never in snap_view), which a newer snapshot N captures,
+     *     so each truncate leaves an entry on N's list; N's delete moves
+     *     them down: dead_S(H20) += 1, dead_S(H21) += 1. refcount(H20)=1,
      *     refcount(H21)=1 each via the dead-list. 4c-iii: dead-snap_
      *     unique = 1-0 = 1 deref each. refcount drops to 0 → auto-GC. */
     STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 0, NULL));
@@ -4006,8 +4010,12 @@ STM_TEST(fs_rollback_reclaims_cleared_dead_list_cold_garbage) {
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 20));
     STM_ASSERT_OK(stm_fs_write(fs, 1, 21, 0, c21, sizeof c21));
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 21));
+    uint64_t newer_id = 0;
+    size_t newer_freed = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "N", 1, &newer_id));
     STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 20, 0, NULL));
     STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 21, 0, NULL));
+    STM_ASSERT_OK(stm_fs_delete_snapshot(fs, newer_id, &newer_freed));
     STM_ASSERT_OK(stm_fs_commit(fs));
 
     /* Pre-rollback: H1 (refcount 1 via dead_S), H20 + H21 (refcount 1
@@ -5256,6 +5264,7 @@ STM_TEST(fs_snap_holds_cold_extent_after_overwrite) {
 
     /* Snap created with the live cold extent in its tree. */
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, /*ds=*/1, "p4c_a",
                                           /*tree_root=*/0xC4FE,
                                           0, NULL,
@@ -5317,6 +5326,7 @@ STM_TEST(fs_snap_delete_releases_cold_dead) {
     stm_cas_index *cas = stm_sync_cas_index(sync);
 
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4c_b", 0xD00D,
                                           0, NULL,
                                           stm_sync_current_gen(sync),
@@ -5414,6 +5424,7 @@ STM_TEST(fs_snap_cold_dead_list_persists_across_mount) {
     stm_sync *sync = stm_fs_sync_for_test(fs);
     stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4c_c", 0x9999,
                                           0, NULL,
                                           stm_sync_current_gen(sync),
@@ -5501,6 +5512,7 @@ STM_TEST(fs_snap_intra_cow_shared_hash_no_leak) {
 
     /* Snap captures the cold extents. */
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4c_idd", 0xBEEF,
                                           0, NULL,
                                           stm_sync_current_gen(sync),
@@ -5589,46 +5601,10 @@ STM_TEST(fs_snap_overwrite_cold_block_arg_validation) {
     unlink(g_key_path);
 }
 
-STM_TEST(fs_p7cas4_cold_dead_list_reserve_no_snap) {
-    /* P7-CAS-4 R54 P3-2: pre-check capacity API. With no most-recent
-     * PRESENT snap for ds=1, reserve always returns can_accept=true
-     * regardless of n_to_append (the bookend would direct-deref;
-     * cold-dead-list is not consumed). */
-    make_tmp("p4_reserve_nosnap");
-    stm_fs_format_opts fopts = default_format_opts();
-    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
-    stm_fs_mount_opts mopts = rw_mount_opts();
-    stm_fs *fs = NULL;
-    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
-    stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
-
-    bool can = false;
-    STM_ASSERT_OK(stm_snapshot_index_cold_dead_list_reserve(snap_idx, 1, 0, &can));
-    STM_ASSERT_TRUE(can == true);
-    can = false;
-    STM_ASSERT_OK(stm_snapshot_index_cold_dead_list_reserve(snap_idx, 1, 1, &can));
-    STM_ASSERT_TRUE(can == true);
-    can = false;
-    STM_ASSERT_OK(stm_snapshot_index_cold_dead_list_reserve(
-            snap_idx, 1, STM_SNAP_COLD_DEAD_LIST_MAX, &can));
-    STM_ASSERT_TRUE(can == true);
-    /* Beyond cap → still true (no snap), since direct-deref doesn't fill list. */
-    can = false;
-    STM_ASSERT_OK(stm_snapshot_index_cold_dead_list_reserve(
-            snap_idx, 1, STM_SNAP_COLD_DEAD_LIST_MAX + 1u, &can));
-    STM_ASSERT_TRUE(can == true);
-
-    STM_ASSERT_OK(stm_fs_unmount(fs));
-    unlink(g_tmp_path);
-    unlink(g_key_path);
-}
-
-STM_TEST(fs_p7cas4_cold_dead_list_reserve_arg_validation) {
-    /* P7-CAS-4 R54 P3-2/P3-3: NULL idx / NULL out / dataset_id == 0
-     * → STM_EINVAL. snapshot_id == 0 in cold_dead_list_count → STM_EINVAL
+STM_TEST(fs_p7cas4_cold_dead_list_count_refuses_id_zero) {
+    /* P7-CAS-4 R54 P3-3: snapshot_id == 0 in cold_dead_list_count -> STM_EINVAL
      * (consistency with rest of snapshot API). */
-    make_tmp("p4_reserve_argval");
+    make_tmp("p4_count_argval");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
     stm_fs_mount_opts mopts = rw_mount_opts();
@@ -5636,14 +5612,6 @@ STM_TEST(fs_p7cas4_cold_dead_list_reserve_arg_validation) {
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
     stm_sync *sync = stm_fs_sync_for_test(fs);
     stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
-
-    bool can = false;
-    STM_ASSERT_ERR(stm_snapshot_index_cold_dead_list_reserve(NULL, 1, 1, &can),
-                       STM_EINVAL);
-    STM_ASSERT_ERR(stm_snapshot_index_cold_dead_list_reserve(snap_idx, 1, 1, NULL),
-                       STM_EINVAL);
-    STM_ASSERT_ERR(stm_snapshot_index_cold_dead_list_reserve(snap_idx, 0, 1, &can),
-                       STM_EINVAL);
 
     size_t out = 0;
     STM_ASSERT_ERR(stm_snapshot_cold_dead_list_count(snap_idx, 0, &out),
@@ -5654,13 +5622,11 @@ STM_TEST(fs_p7cas4_cold_dead_list_reserve_arg_validation) {
     unlink(g_key_path);
 }
 
-STM_TEST(fs_p7cas4_cold_dead_list_reserve_with_snap) {
-    /* With a most-recent PRESENT snap, reserve compares cold_dead_count +
-     * n_to_append against STM_SNAP_COLD_DEAD_LIST_MAX. After driving
-     * the list to (cap - 2) entries, reserve(2) succeeds, reserve(3)
-     * fails. Drives the list directly via the public API to avoid
-     * needing 254 cold-record-drops in the test. */
-    make_tmp("p4_reserve_full");
+STM_TEST(fs_p7cas4_cold_dead_list_stops_at_its_cap) {
+    /* The list takes STM_SNAP_COLD_DEAD_LIST_MAX entries and answers the next
+     * STM_ENOSPC. Drives the list directly via the public API to avoid needing
+     * 256 cold-record-drops in the test. */
+    make_tmp("p4_list_cap");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
     stm_fs_mount_opts mopts = rw_mount_opts();
@@ -5671,6 +5637,7 @@ STM_TEST(fs_p7cas4_cold_dead_list_reserve_with_snap) {
 
     /* Create a snap so it can be the most-recent. */
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, /*ds=*/1, "p4_resv",
                                           /*tree_root=*/0xCAFE,
                                           0, NULL,
@@ -5695,24 +5662,7 @@ STM_TEST(fs_p7cas4_cold_dead_list_reserve_with_snap) {
     STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(snap_idx, snap_id, &cdc));
     STM_ASSERT_EQ(cdc, TARGET);
 
-    bool can = false;
-    /* Reserve 0 → trivially true. */
-    STM_ASSERT_OK(stm_snapshot_index_cold_dead_list_reserve(snap_idx, 1, 0, &can));
-    STM_ASSERT_TRUE(can == true);
-    /* Reserve up to remaining (= 2) → true. */
-    can = false;
-    STM_ASSERT_OK(stm_snapshot_index_cold_dead_list_reserve(snap_idx, 1, 2, &can));
-    STM_ASSERT_TRUE(can == true);
-    /* Reserve one beyond remaining → false. */
-    can = true;
-    STM_ASSERT_OK(stm_snapshot_index_cold_dead_list_reserve(snap_idx, 1, 3, &can));
-    STM_ASSERT_TRUE(can == false);
-    /* Reserve massive value → false (saturating-sum guard). */
-    can = true;
-    STM_ASSERT_OK(stm_snapshot_index_cold_dead_list_reserve(snap_idx, 1, SIZE_MAX, &can));
-    STM_ASSERT_TRUE(can == false);
-
-    /* Append 2 more → cap-exact; reserve(1) now refuses. */
+    /* Append 2 more, to the cap. */
     for (size_t i = 0; i < 2; i++) {
         uint8_t h[STM_SNAP_HASH_LEN] = {0};
         h[0] = 0xBB;
@@ -5725,13 +5675,7 @@ STM_TEST(fs_p7cas4_cold_dead_list_reserve_with_snap) {
     STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(snap_idx, snap_id, &cdc));
     STM_ASSERT_EQ(cdc, (size_t)STM_SNAP_COLD_DEAD_LIST_MAX);
 
-    can = true;
-    STM_ASSERT_OK(stm_snapshot_index_cold_dead_list_reserve(snap_idx, 1, 1, &can));
-    STM_ASSERT_TRUE(can == false);
-
-    /* The 257th overwrite_cold_block call still surfaces STM_ENOSPC
-     * (sanity that the per-call cap is intact independent of the
-     * pre-check API). */
+    /* The 257th. */
     {
         uint8_t h[STM_SNAP_HASH_LEN] = {0};
         h[0] = 0xCC;
@@ -5745,15 +5689,11 @@ STM_TEST(fs_p7cas4_cold_dead_list_reserve_with_snap) {
     unlink(g_key_path);
 }
 
-STM_TEST(fs_p7cas4_overwrite_with_full_snap_returns_enospc) {
-    /* P7-CAS-4 R54 P3-2 regression: with a snap holding a cold-dead-
-     * list at exactly capacity, an integration-level write that would
-     * drop a cold record must refuse with STM_ENOSPC BEFORE mutating
-     * the data plane (extent_idx + on-disk ciphertext). Pre-fix:
-     * extent_overwrite mutated extent_idx, then the bookend's per-
-     * call STM_ENOSPC silently lost the deref, leaving the CAS chunk
-     * leaked. Post-fix: the pre-check refuses the write up front,
-     * extent_idx unchanged, CAS unchanged. */
+STM_TEST(fs_p7cas4_overwrite_past_a_full_cold_list_keeps_the_chunk) {
+    /* An overwrite that drops a cold record past a full list is answered: it may
+     * be a buffered write's drain, whose write() has already answered, and a
+     * refusal there wedges the fs. The record goes, and the snapshot's chunk stays
+     * referenced with no list entry, counted. */
     make_tmp("p4_overwrite_full");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -5775,6 +5715,7 @@ STM_TEST(fs_p7cas4_overwrite_with_full_snap_returns_enospc) {
 
     /* Snapshot capturing the live cold extent. */
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4_full",
                                           /*tree_root=*/0xC4FE,
                                           0, NULL,
@@ -5804,34 +5745,34 @@ STM_TEST(fs_p7cas4_overwrite_with_full_snap_returns_enospc) {
     STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
     STM_ASSERT_MEM_EQ(plain, out, sizeof out);
 
-    /* Overwrite — would drop the cold record. Pre-check rejects. */
+    /* Overwrite: drops the cold record, past the list. */
     uint8_t plain2[4096];
     for (size_t i = 0; i < sizeof plain2; i++) plain2[i] = 0x55;
-    STM_ASSERT_ERR(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2),
-                       STM_ENOSPC);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+    STM_ASSERT_OK(stm_fs_commit(fs));
 
-    /* extent_idx unchanged: live read still returns plain, not plain2. */
     memset(out, 0, sizeof out);
     STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
-    STM_ASSERT_MEM_EQ(plain, out, sizeof out);
+    STM_ASSERT_MEM_EQ(plain2, out, sizeof out);
 
-    /* CAS unchanged. */
+    /* The chunk stays, and the list is where it was. */
     size_t cas_post = 0;
     STM_ASSERT_OK(stm_cas_count(cas, &cas_post));
     STM_ASSERT_EQ(cas_post, cas_pre);
-
-    /* Snap's cold-dead-list still at cap. */
     size_t cdc = 0;
     STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(snap_idx, snap_id, &cdc));
     STM_ASSERT_EQ(cdc, (size_t)STM_SNAP_COLD_DEAD_LIST_MAX);
+    uint64_t retained = 0;
+    stm_snapshot_index_retained(snap_idx, &retained, NULL);
+    STM_ASSERT_EQ(retained, (uint64_t)1);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
 }
 
-STM_TEST(fs_p7cas4_truncate_crossing_cold_with_full_snap_returns_enospc) {
-    /* Mirror of the write_extent test for the truncate bookend. */
+STM_TEST(fs_p7cas4_truncate_past_a_full_cold_list_keeps_the_chunk) {
+    /* As the overwrite: a cut past the list is answered, and the chunk stays. */
     make_tmp("p4_trunc_full");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -5850,6 +5791,7 @@ STM_TEST(fs_p7cas4_truncate_crossing_cold_with_full_snap_returns_enospc) {
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
 
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4_trunc",
                                           /*tree_root=*/0xC0FE,
                                           0, NULL,
@@ -5870,19 +5812,15 @@ STM_TEST(fs_p7cas4_truncate_crossing_cold_with_full_snap_returns_enospc) {
     size_t cas_pre = 0;
     STM_ASSERT_OK(stm_cas_count(cas, &cas_pre));
 
-    /* Truncate to 0 — would drop the cold extent. Pre-check refuses. */
-    STM_ASSERT_ERR(stm_sync_truncate(sync, 1, 1, /*new_size=*/0, NULL),
-                       STM_ENOSPC);
-
-    /* extent_idx unchanged: live read still returns the original plain. */
-    uint8_t out[4096] = {0};
-    size_t got = 0;
-    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
-    STM_ASSERT_MEM_EQ(plain, out, sizeof out);
+    /* Truncate to 0: drops the cold extent, past the list. */
+    STM_ASSERT_OK(stm_sync_truncate(sync, 1, 1, /*new_size=*/0, NULL));
 
     size_t cas_post = 0;
     STM_ASSERT_OK(stm_cas_count(cas, &cas_post));
     STM_ASSERT_EQ(cas_post, cas_pre);
+    uint64_t retained = 0;
+    stm_snapshot_index_retained(snap_idx, &retained, NULL);
+    STM_ASSERT_EQ(retained, (uint64_t)1);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -5998,28 +5936,10 @@ STM_TEST(fs_p7cas4_gc_reorder_refbumped_entry_keeps_paddrs_alloc) {
 }
 
 STM_TEST(fs_p7cas4_r55_truncate_crossing_cold_with_near_full_snap) {
-    /* R55 P2-2 regression: truncate-with-crossing-cold-extent reserves
-     * 1 cold-dead-list slot for the prefix-write's overwrite_cold_block
-     * (since the crossing-cold extent's hash gets dropped by the prefix
-     * write's bookend) PLUS tcox.n_hashes slots for the truncate-body's
-     * past-extent drops. Pre-R55-P2-2 fix the truncate body checked only
-     * tcox.n_hashes — so when the prefix write's slot consumed brought
-     * the snap to cap, the body's reserve(N>=1) failed STM_ENOSPC AFTER
-     * extent_idx had been mutated by the prefix write.
-     *
-     * Repro setup: cold extent_a at [0, 8192) (crossing-cold under
-     * truncate(4096)) + cold extent_b at [8192, 12288) (past-cold).
-     * Snap created after migration captures both. Drive the snap's
-     * cold-dead-list to (cap - 1). Truncate to 4096 — combined need
-     * 2 (1 for prefix dropping crossing extent_a; 1 for body
-     * dropping extent_b); free slots = 1.
-     *
-     * Pre-fix: prefix write succeeds (consumes 1 → at cap), past-
-     * extent reserve(1) fails STM_ENOSPC, extent_idx half-mutated
-     * (prefix landed; past-extents not yet truncated).
-     *
-     * Post-fix: combined-need pre-check refuses with STM_ENOSPC up
-     * front; no extent_idx mutation. */
+    /* R55 P2-2's shape: a cut crossing cold extent_a [0, 8192) with cold extent_b
+     * past it, and one list slot free. The prefix write's drop of extent_a takes
+     * the slot, and the body's drop of extent_b finds none. Both are answered and
+     * neither chunk goes: extent_b's reference stays held, counted. */
     make_tmp("p4_r55_trunc_combined_cap");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -6050,6 +5970,7 @@ STM_TEST(fs_p7cas4_r55_truncate_crossing_cold_with_near_full_snap) {
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
 
     uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4r55",
                                           /*tree_root=*/0xC0DE,
                                           0, NULL,
@@ -6073,33 +5994,24 @@ STM_TEST(fs_p7cas4_r55_truncate_crossing_cold_with_near_full_snap) {
     STM_ASSERT_OK(stm_cas_count(cas, &cas_pre));
     STM_ASSERT_EQ(cas_pre, (size_t)2);
 
-    /* Truncate to 4096 — crossing-cold extent_a [0, 8192) + past-
-     * cold extent_b [16384, 20480). Combined need 2; free 1. */
-    STM_ASSERT_ERR(stm_sync_truncate(sync, 1, 1, /*new_size=*/4096, NULL),
-                       STM_ENOSPC);
+    STM_ASSERT_OK(stm_sync_truncate(sync, 1, 1, /*new_size=*/4096, NULL));
 
-    /* extent_idx unchanged: live read of off=0 returns plain_a (full
-     * 8192 bytes; the file is single-extent at this offset). */
-    uint8_t out_a[8192] = {0};
+    /* The kept prefix reads. */
+    uint8_t out_a[4096] = {0};
     size_t got_a = 0;
     STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out_a, sizeof out_a, &got_a));
     STM_ASSERT_MEM_EQ(plain_a, out_a, sizeof out_a);
 
-    /* Live read of off=16384 also unchanged. */
-    uint8_t out_b[4096] = {0};
-    size_t got_b = 0;
-    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 16384, out_b, sizeof out_b, &got_b));
-    STM_ASSERT_MEM_EQ(plain_b, out_b, sizeof out_b);
-
-    /* CAS unchanged. */
+    /* Both chunks stay; the list is at its cap, and one reference is past it. */
     size_t cas_post = 0;
     STM_ASSERT_OK(stm_cas_count(cas, &cas_post));
     STM_ASSERT_EQ(cas_post, cas_pre);
-
-    /* Snap's cold-dead-list still at cap - 1. */
     size_t cdc = 0;
     STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(snap_idx, snap_id, &cdc));
-    STM_ASSERT_EQ(cdc, TARGET);
+    STM_ASSERT_EQ(cdc, (size_t)STM_SNAP_COLD_DEAD_LIST_MAX);
+    uint64_t retained = 0;
+    stm_snapshot_index_retained(snap_idx, &retained, NULL);
+    STM_ASSERT_EQ(retained, (uint64_t)1);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -9589,20 +9501,19 @@ STM_TEST(fs_rollback_4d_frees_newer_snap_case_b_data_garbage) {
     uint64_t s = 0;
     STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &s));
 
-    /* Newer snap s2: capture an empty post-s state (s2.view is empty
-     * too — both ino 20 and ino 21 are written AFTER s2). */
-    uint64_t s2 = 0;
-    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
-
-    /* Post-s2: write inode 20 — pure case-(b) (neither s.view nor
-     * s2.view has it; allocated post-s2). */
+    /* Post-s: write inode 20, a record s.view does not name. */
     uint8_t pat[4096];
     memset(pat, 0xCC, sizeof pat);
     STM_ASSERT_OK(stm_fs_write(fs, 1, 20, 0, pat, sizeof pat));
+    STM_ASSERT_OK(stm_fs_commit(fs));
 
-    /* COW it: drop the just-written extent → its paddr goes to
-     * most-recent snap = s2's data dead-list. The replacement-extent
-     * is in OLD-live, will get reclaimed by 4c (live-divergence). */
+    /* Newer snap s2 captures it. */
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
+
+    /* COW it: the dropped extent's paddr goes to s2's data dead-list,
+     * pure case-(b) for s. The replacement-extent is in OLD-live, will
+     * get reclaimed by 4c (live-divergence). */
     STM_ASSERT_OK(stm_fs_write(fs, 1, 20, 0, pat, sizeof pat));
     STM_ASSERT_OK(stm_fs_commit(fs));
 
@@ -9771,17 +9682,17 @@ STM_TEST(fs_rollback_4d_cold_dedup_correct) {
     uint64_t s = 0;
     STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s", 1, &s));
 
-    /* Newer snap s2 — captures the same H1 record. */
-    uint64_t s2 = 0;
-    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
-
-    /* Post-s2: write+migrate inode 30 with FRESH bytes (hash H30; pure
-     * case-(b) for s2). Then truncate it to drop the cold record →
-     * snap-aware deref defers to s2.cold_dead. */
+    /* Post-s: write+migrate inode 30 with FRESH bytes (hash H30; pure
+     * case-(b) for s). */
     uint8_t c30[4096];
     memset(c30, 0xDE, sizeof c30);
     STM_ASSERT_OK(stm_fs_write(fs, 1, 30, 0, c30, sizeof c30));
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 30));
+
+    /* Newer snap s2 captures the same H1 record, and H30. Truncating
+     * inode 30 then defers the deref to s2.cold_dead. */
+    uint64_t s2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "s2", 2, &s2));
     STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 30, 0, NULL));
     STM_ASSERT_OK(stm_fs_commit(fs));
 

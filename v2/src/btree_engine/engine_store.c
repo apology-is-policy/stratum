@@ -57,98 +57,73 @@ static stm_status engine_store_reserve(void *ctx_, uint64_t *out_paddr)
  *      the one that last covered it, so the routing is well-defined.
  *
  *   2. CLONE (origin_snap_id != 0, 9.7-impl-6c):
- *      Use the per-snap append API —
- *      `stm_snapshot_index_add_to_snap_bootstrap_dead_list(snap_idx,
- *      ctx->origin_snap_id, paddr)`. The clone's `di_tree_root`
- *      initialises to an origin snap S's captured root, so its first
- *      COW drops paddrs that are in S.view (NOT in the clone's own
- *      snap chain — the clone has no snaps at v1.0). Routing through
- *      `most_recent_locked(clone_dataset_id)` would yield NO_PREV and
- *      the paddr would return to the allocator while S still
- *      references it (phase-9.7-design.md §9.1.1). The explicit
- *      snap_id target routes drops to S regardless of any
- *      most-recent-snap shenanigans.
+ *      The clone's `di_tree_root` initialises to an origin snap S's captured
+ *      root, so its first COW drops paddrs in S.view, which the origin's lineage
+ *      also holds. That lineage lists each one at its own drop, on a snapshot at or
+ *      after S, so the clone's drop adds nothing; freeing would break S
+ *      (phase-9.7-design.md section 9.1.1), and an entry could free what the
+ *      origin's live tree still reads. Only what the clone itself wrote is freed.
  *
- * Routing dispatch (uniform across both modes):
- *   - ctx->snap_idx == NULL OR ctx->dataset_id == 0 ⇒ skip the snap
- *     path (degenerate / pre-wire); fall through to bootstrap_free.
- *   - sr == STM_OK ⇒ snap captured; the paddr is now owned by the
- *     snap's bootstrap_dead_list. Return STM_OK without touching the
- *     bootstrap allocator. (For the non-clone path,
- *     overwrite_bootstrap_block also signals `should_free=true` when
- *     NO PRESENT snap of the dataset holds the paddr — that case
- *     falls through to bootstrap_free below.)
- *   - sr == STM_EINVAL ⇒ R158 P2-1 single-ownership defense scan
- *     fired: the paddr is ALREADY tracked by some PRESENT snap's
- *     boot_dead_list. Falling through to stm_bootstrap_free would
- *     double-free (bitmap bit stamped PENDING at free_gen here, then
- *     the other snap's delete fires stm_bootstrap_free again). The
- *     safe posture is "do nothing" — the paddr is already retained.
- *     Return STM_OK without touching the allocator.
- *   - Any other status (STM_ENOMEM / STM_ENOSPC / STM_ENOENT /
- *     STM_ECORRUPT) is a best-effort fall-through per
- *     engine.c::pending_free_paddrs' "vt->free is best-effort, must
- *     not fail commit_finalize" contract. The side-effect of the
- *     rare STM_ENOSPC class is that the snap's view of the superseded
- *     subtree fails STM_ECORRUPT at read time (the (paddr, gen) AEAD
- *     nonce mismatch prevents reading the new bytes). impl-2.x adds
- *     pre-flush dead-list reservation to refuse the COW at the
- *     higher-level write boundary.
+ * Routing, uniform across both modes:
+ *   - ctx->snap_idx == NULL OR ctx->dataset_id == 0: skip the snapshot path
+ *     (degenerate / pre-wire), free directly.
+ *   - A clone, ctx->origin_snap_id set: born at or after the origin's capture
+ *     (stm_snapshot_index_outside_view) it is the clone's own and is freed; born
+ *     before, the origin's lineage still names it or has listed it, and its own
+ *     drop is the one that counts. Nothing to do. (The origin cannot go while the
+ *     clone stands: clone.tla::SnapWithClonesUndeletable.)
+ *   - Born after the most recent snapshot's capture: in no view, so it spends no
+ *     entry and is freed. Without this every commit spends entries on nodes the
+ *     snapshot never saw.
+ *   - sr == STM_OK: captured; the allocator must not see it. (The non-clone path
+ *     also answers should_free when NO PRESENT snap of the dataset holds it: free.)
+ *   - sr == STM_EINVAL: R158 P2-1, the paddr is ALREADY tracked by some PRESENT
+ *     snap's list; freeing would double-free. Do nothing.
+ *   - Anything else (STM_ENOSPC at the list's cap, STM_ENOMEM, STM_ECORRUPT): the
+ *     snapshot may still name this node, so it stays allocated with no entry and
+ *     is counted. Freeing it would hand the snapshot's tree to the next commit and
+ *     the snapshot would fail its integrity check at read time; a commit past
+ *     finalize cannot refuse. Space, never the snapshot.
  *
- *     STM_ENOENT is reachable only on the clone path: the origin snap
- *     was deleted while a clone engine still held a reference. This
- *     SHOULD NOT happen — `stm_fs_create_clone` calls
- *     `stm_snapshot_hold(origin_snap_id)` so the snap stays PRESENT
- *     for the clone's lifetime (clone_check_cb refuses delete while
- *     hold_count > 0 — clone.tla::SnapWithClonesUndeletable). If it
- *     does fire, best-effort fall-through to bootstrap_free is the
- *     least-bad option (the snap that needed the paddr is gone).
- *
- * Spec mapping: dead_list.tla::OverwriteBlock with allocator class
- * threaded through (the class is a side parameter; the spec's invariants
- * compose verbatim). The clone branch realises the §9.1.2 per-snap
- * routing for `clone.tla::CloneCreate`'s share-root semantics.
+ * Spec mapping: dead_list.tla::OverwriteBlock with allocator class threaded
+ * through (the class is a side parameter; the spec's invariants compose verbatim).
+ * The clone branch realises the section 9.1.2 per-snap routing for
+ * clone.tla::CloneCreate's share-root semantics.
  */
-static stm_status engine_store_free(void *ctx_, uint64_t paddr,
-                                       uint64_t free_gen)
+static stm_status engine_store_free_born(void *ctx_, uint64_t paddr,
+                                         uint64_t free_gen, uint64_t birth_gen)
 {
     stm_engine_store_ctx *ctx = ctx_;
     if (ctx->snap_idx != NULL && ctx->dataset_id != 0) {
         stm_status sr;
-        bool snap_captured;
+        bool frees = false;
         if (ctx->origin_snap_id != 0) {
-            /* Clone path — route to the specific origin snap (§9.1.2). */
-            sr = stm_snapshot_index_add_to_snap_bootstrap_dead_list(
-                ctx->snap_idx, ctx->origin_snap_id, paddr);
-            /* STM_OK ⇒ the origin snap captured the paddr; no fall-through
-             * to bootstrap_free. The per-snap API has no should_free
-             * signal — the explicit snap_id target IS the capture. */
-            snap_captured = (sr == STM_OK);
+            /* Clone path: its own node, or shared with the origin's lineage, which
+             * lists it at its own drop. */
+            frees = stm_snapshot_index_outside_view(ctx->snap_idx,
+                                                    ctx->origin_snap_id, birth_gen);
+            sr = STM_OK;
+        } else if (stm_snapshot_index_born_after_most_recent(
+                       ctx->snap_idx, ctx->dataset_id, birth_gen)) {
+            frees = true;
+            sr = STM_OK;
         } else {
-            /* Non-clone path — route via most-recent-of-dataset (impl-2). */
-            bool should_free = true;
             sr = stm_snapshot_index_overwrite_bootstrap_block(
-                ctx->snap_idx, ctx->dataset_id, paddr, &should_free);
-            /* STM_OK + !should_free ⇒ snap captured; STM_OK + should_free
-             * ⇒ no PRESENT snap of the dataset; fall through. */
-            snap_captured = (sr == STM_OK && !should_free);
+                ctx->snap_idx, ctx->dataset_id, paddr, &frees);
         }
-        if (snap_captured) {
-            /* Snap captured the paddr; allocator MUST NOT see it. */
+        if (!frees) {
+            if (sr != STM_OK && sr != STM_EINVAL)
+                stm_snapshot_index_note_retained(ctx->snap_idx, true);
             return STM_OK;
         }
-        if (sr == STM_EINVAL) {
-            /* R158 P2-1: the paddr is ALREADY tracked by some other
-             * PRESENT snap's boot_dead_list. Safe posture is "do
-             * nothing" — see the docstring above for the rationale. */
-            return STM_OK;
-        }
-        /* sr is "no PRESENT snap" (non-clone path) OR a resource-
-         * exhaustion code (either path): fall through to the bootstrap
-         * allocator. */
     }
     return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_NODE_BLOCKS,
                                 free_gen);
+}
+
+static stm_status engine_store_free(void *ctx_, uint64_t paddr, uint64_t free_gen)
+{
+    return engine_store_free_born(ctx_, paddr, free_gen, 0u);
 }
 
 /*
@@ -178,6 +153,7 @@ static stm_status engine_store_read(void *ctx_, uint64_t paddr,
 const stm_btree_store_vtable STM_ENGINE_STORE_VT = {
     .reserve = engine_store_reserve,
     .free    = engine_store_free,
+    .free_born = engine_store_free_born,
     .write   = engine_store_write,
     .read    = engine_store_read,
 };

@@ -76,8 +76,10 @@ dataset" snapshot.
 `extent_txg` (P7-8) is a caller-supplied value that the impl
 captures verbatim into the entry. Production callers (sync-aware)
 pass `stm_sync_current_gen(s)`; this is the value the next extent
-write will stamp into `extent.gen`. Send/recv's incremental gen
-filter then sits in the same counter space as `extent.gen`. Test/
+write will stamp into `extent.gen`, so a view holds what is strictly
+below it and a gen equal to it is after the capture. Send/recv's
+incremental gen filter then sits in the same counter space as
+`extent.gen`. Test/
 bench callers without a sync handle may pass `0` — that disables
 snap-bounded send for those snaps but leaves all other lifecycle
 behavior unchanged. See `snapshot.tla::ExtentTxgBoundedBySync`
@@ -85,8 +87,10 @@ and `ChainExtentTxgOrdered` for the spec-level invariants.
 
 `Delete` refuses with `STM_EBUSY` if `hold_count > 0` or if a
 registered clone-check cb returns true (`clone.tla::SnapWith-
-ClonesUndeletable`). On success BOTH dead-lists transfer to the
-caller:
+ClonesUndeletable`). With an older PRESENT snapshot of the dataset,
+the lists move to it and nothing comes back: that snapshot may name
+anything on them. A snapshot with none older hands them to the caller:
+
 
 - `*out_freed_paddrs` + `*out_freed_count` — the paddr-tier dead-
   list. Caller owns the malloc'd array (`free()` it) and MUST
@@ -144,17 +148,28 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
   triple via `stm_dataset_index_verify_engine_at` — a throwaway engine
   opened at the triple + `stm_btree_engine_verify`; a bad triple
   refuses `STM_ECORRUPT` (a true no-op, fs not wedged), an all-zero
-  "empty dataset" triple verifies trivially; (3) drain every dirty
+  "empty dataset" triple verifies trivially; read the view's data
+  blocks, whose counts the rollback sets, refusing if the walk fails or
+  a view names a free block; (3) drain every dirty
   buffer (`fs_flush_all_locked`) — the FIRST destructive step, so
   every refusal above is a true no-op (R160 P1-1: validating *after*
   the drain would silently destroy the caller's un-committed writes);
-  (4) swap the dataset entry's triple to the snapshot's captured
-  triple via `stm_dataset_index_set_engine_root` (which drops the live
-  in-RAM engine, so the M-cascade skips the closed slot and the
-  stamped triple persists); (5) `stm_snapshot_clear_dead_lists` on the
-  target — post-rollback the live tree IS the snapshot's tree, so its
-  dead-listed paddrs are live again and must not stay dead-listed;
-  (6) `stm_sync_commit` (R154 Q2 — wedge on failure).
+  (4) `stm_sync_commit`, and read the old tree's triple after it: the
+  walks below read that tree as what is still held, so it has to be the
+  tree after every drop, and read from the last committed root a record
+  dropped since is still there. What was written is durable from here,
+  as if the caller had committed, and a refusal below (the floors)
+  leaves only that. With unwritten changes on a pool out of node space
+  this commit can fail and wedge, where nothing wrote them before: a
+  remount drops them and the rollback can be asked for again; (5) swap
+  the dataset
+  entry's triple to the snapshot's captured triple via
+  `stm_dataset_index_set_engine_root` (which drops the live in-RAM
+  engine, so the M-cascade skips the closed slot and the stamped triple
+  persists); (6) `stm_snapshot_clear_dead_lists` on the target --
+  post-rollback the live tree IS the snapshot's tree, so its dead-listed
+  paddrs are live again and must not stay dead-listed; (7)
+  `stm_sync_commit`. Either commit failing wedges (R154 Q2).
   The commit's gen advance is the AEAD-nonce bump: every
   post-rollback write lands at a strictly-higher gen, so reused
   snapshot paddrs never collide on `(paddr, write_gen)`. v2's rollback
@@ -179,28 +194,36 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
   both trees (`stm_extent_index_collect_engine_data_paddrs_at` →
   `stm_dataset_index_scan_engine_range_at` → `stm_btree_engine_scan_range`,
   decoding each value to its HOT replica paddrs), set-differences the
-  data-paddr sets, and `stm_alloc_free`s `old \ snap` — the data-tier
+  data-paddr sets, and takes every count off `old \ snap` -- the data-tier
   projection of the same live-divergence term. A paddr a HOT extent
-  reflink-shares across the snapshot boundary lands in the snapshot
-  set and is excluded; sorting `old` dedups a paddr two reflink-
-  siblings of the OLD tree share. Same best-effort + walk-must-complete
-  posture as the node reclaim.
+  reflink-shares across the snapshot boundary lands in the snapshot set
+  and is excluded. Same best-effort + walk-must-complete posture as the
+  node reclaim.
+- **The view's counts** -- after the swap a block's only holders are the
+  view's records (a clone's hold no count, and a clone has no snapshot of
+  its own), so a block the view names gets a count of how many name it,
+  whatever the old tree and the lists held. A reflink pair both dropped
+  before the rollback would otherwise come back on one count, and the
+  first sibling's next drop would free the block under the second. This
+  is not best-effort: the view's data blocks are read before the drain, a
+  failure there refuses, and a count that cannot be set wedges.
 - **Cold-extent reclamation (9.7-impl-4c-ii)** — the CAS-tier sibling,
   run in the same pre-commit window: `fs_rollback_reclaim_diverged_cold`
   walks the EXTENT keyspace of both trees
-  (`stm_extent_index_collect_engine_cold_records_at`), merges the COLD
-  record sets by `(ino, off)`, and `stm_cas_deref`s each old-tree COLD
-  record that is NOT the same logical record as a snapshot-tree record
-  at the same key. A **per-key structural merge, not a per-hash count
+  (`stm_extent_index_collect_engine_cold_records_at`), and
+  `stm_cas_deref`s each old-tree COLD record with no partner in the
+  snapshot tree, as multisets of record identity: `(content_hash, gen,
+  link_gen)`, and never the key, since COLLAPSE and INSERT move a record
+  and keep its reference. A **per-record merge, not a per-hash count
   subtraction** — content-defined dedup lets distinct records share a
   hash, so a count subtraction would cancel a diverged record against
   an unrelated snapshot record and leak its refcount. `link_gen` (the
-  gen at which a record entered the live extent index) is the
-  load-bearing record-identity discriminator. The derefs feed the
-  rollback commit's CAS auto-GC sweep. Same best-effort +
-  walk-must-complete posture; this reclaim NEVER over-derefs (a shared
-  record always matches its snapshot counterpart, so it is never
-  mis-classified as diverged).
+  gen at which a record entered the live extent index) separates the
+  eras: every record of a view is below the capture. Two records of one
+  identity may pair either way, since each holds a reference of its own.
+  The derefs feed the rollback commit's CAS auto-GC sweep. Same
+  best-effort + walk-must-complete posture; this reclaim NEVER
+  over-derefs (a shared record always has its partner).
 - **Cleared dead-list garbage reclamation (9.7-impl-4c-iii)** — the
   final reclaim tier, run AFTER 4b/4c/4c-ii and BEFORE `clear_dead_lists`:
   `fs_rollback_reclaim_cleared_dead_list_garbage` reads S's three
@@ -211,20 +234,20 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
   - Boot + data tiers: set-difference on paddrs against the snapshot
     tree's node / data-paddr walks. Survivors → `stm_bootstrap_free` /
     `stm_alloc_free` at the sync's current gen.
-  - Cold tier: per-key structural merge of OLD vs SNAP COLD records
-    (same walks 4c-ii uses) to compute `snap_unique[hash]` (multiset of
-    hashes whose snap-tree record at `(ino, off)` is NOT shared with the
-    old tree). For each unique hash `H` on the cold dead-list, deref
-    count = `dead_S(H) − snap_unique(H)` (clamped at 0). The counted
-    subtraction is safe HERE — distinct from 4c-ii's live-divergence
-    case — because every `snap_unique` record has a corresponding
-    dead-list entry (its drop fired the snap-aware deref routing while
-    S was most-recent), so `snap_unique(H) ≤ dead_S(H)` always holds
-    per hash. NEVER over-derefs; under-derefs (clamp at 0) become a
-    leak, consistent with the best-effort posture.
-  - The case-(b) garbage on the dead-list — paddrs / records impl-2's
-    COW routing dumped onto S's dead-list under "most-recent snap" but
-    which S's tree NEVER referenced — is dispositioned here; the
+  - Cold tier: the same identity merge of SNAP minus OLD COLD records
+    (same walks 4c-ii uses) gives `snap_unique[hash]` (multiset of hashes
+    of the view's records the old tree no longer holds). For each unique
+    hash `H` on the cold dead-list, deref count = `dead_S(H) -
+    snap_unique(H)` (clamped at 0). The counted subtraction is safe HERE
+    -- distinct from 4c-ii's live-divergence case -- because the commit
+    made the old tree the tree after every drop: a `snap_unique` record
+    was dropped, and its drop made an entry on S's list, on a newer list
+    (the cascade's count), or none past the cap, where the clamp takes
+    the difference as a leak and no more. NEVER over-derefs; under-derefs
+    (clamp at 0) become a leak, consistent with the best-effort posture.
+  - The case-(b) garbage on the dead-list -- paddrs / records a newer
+    neighbour's delete moved here, in that neighbour's view and not S's
+    -- is dispositioned here; the
     case-(a) resurrection entries are KEPT (their paddrs / hashes are
     live in the post-swap tree) and discarded by `clear_dead_lists`
     below without deref. With this tier the rollback realises the
@@ -243,10 +266,10 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
     no-op.
   - Walks s.view's bootstrap paddrs + data paddrs + cold records +
     OLD-live's cold records ONCE (same APIs the 4b/4c/4c-ii reclaims
-    use); computes `snap_unique` (records in s.view whose `(ino, off)`
-    has a different identity in OLD-live; identical algorithm to
-    4c-iii).
-  - Per newer snap: `stm_snapshot_delete` → for each of the three
+    use); computes `snap_unique` (records in s.view with no partner of
+    their identity in OLD-live; identical algorithm to 4c-iii).
+  - Per newer snap: `stm_snapshot_delete_past_rollback`, whose lists come
+    here and do not move to an older neighbour -> for each of the three
     dead-list buffers, filter by `\ s_view` (boot/data: set-difference
     on paddrs; cold: accumulated into a single aggregation buffer
     deferred to post-loop).
@@ -276,9 +299,10 @@ The fs-level surface is `stm_fs_{mark,unmark}_snapshot_compromised`
   - With this tier, `dead_list.tla::Rollback`'s
     `to_free = (live ∖ s_view) ∪ (snap_dead[s] ∖ s_view) ∪ (newer_dead ∖ s_view)`
     is realised IN FULL. The v1.0 limitation forward-note retires.
-  - Flow within the rollback: drain → swap → 4b → 4c → 4c-ii → 4c-iii
-    on target → clear_dead_lists on target → **4d cascade** → commit.
-    Every freed paddr / dereffed cold record rides the SAME commit,
+  - Flow within the rollback: view's data blocks -> drain -> commit ->
+    floors -> swap -> view's counts -> 4b -> 4c -> 4c-ii -> 4c-iii on target ->
+    clear_dead_lists on target -> **4d cascade** -> commit.
+    Every freed paddr / dereffed cold record rides the second commit,
     deferred via R50 P2-1's strict `free_gen < committed_gen` predicate
     so AEAD-nonce (paddr, write_gen) uniqueness holds.
 
@@ -295,10 +319,6 @@ stm_status stm_snapshot_index_overwrite_cold_block  (idx, dataset_id,
                                                      content_hash[32],
                                                      *out_should_deref);
 stm_status stm_snapshot_cold_dead_list_count        (idx, snapshot_id, *out_count);
-
-/* Cold-tier capacity pre-check (P7-CAS-4 R54 P3-2). */
-stm_status stm_snapshot_index_cold_dead_list_reserve(idx, dataset_id,
-                                                     n_to_append, *out_can_accept);
 
 /* Bootstrap-tier (9.7-impl-2-routing). */
 stm_status stm_snapshot_index_overwrite_bootstrap_block(idx, dataset_id, paddr,
@@ -387,12 +407,11 @@ Refusal codes for `overwrite_cold_block`:
   state (signals in-RAM index corruption — same shape as the
   paddr-tier API).
 - `STM_ENOSPC` at the in-line cap `STM_SNAP_COLD_DEAD_LIST_MAX
-  = 256`. Per P7-CAS-4 R54 P3-2 callers MUST pre-check capacity
-  via `stm_snapshot_index_cold_dead_list_reserve` BEFORE mutating
-  extent_idx; the COW caller (sync.c bookends) does so. Without
-  the pre-check, a per-call STM_ENOSPC mid-bookend would silently
-  lose the deref obligation and leak the CAS chunk (refcount
-  stuck at 1).
+  = 256`. The record has already gone from the extent index, so the
+  caller keeps the reference and counts it
+  (`stm_snapshot_index_note_retained`): the chunk stays, which costs
+  space and never the snapshot's read. A refusal here would wedge at
+  a buffered write's drain, whose write() has already answered.
 - `STM_ENOMEM` on realloc failure (existing cold-dead-list
   preserved).
 
@@ -401,23 +420,16 @@ number of cold-extent hashes tracked in `snapshot_id`'s cold-dead-
 list. Per R54 P3-3, `snapshot_id == 0` (pool sentinel) is rejected
 with STM_EINVAL.
 
-`cold_dead_list_reserve` is the P7-CAS-4 R54 P3-2 pre-check used by
-the sync.c COW bookends. Returns `*out_can_accept = true` if the
-most-recent PRESENT snap of `dataset_id` can absorb `n_to_append`
-more entries without overflowing `STM_SNAP_COLD_DEAD_LIST_MAX`, OR
-if there is no most-recent PRESENT snap (in which case the bookend
-direct-derefs without consuming a list slot). The pre-check uses
-saturating-sum arithmetic for defense-in-depth against
-SIZE_MAX-shaped `n_to_append`.
+Production callers go through `sync_drop_cold_locked`, which routes by
+when the dropped record took its reference, the later of its gen and its
+link_gen: after the most recent snapshot's capture it is in no view and is
+derefed; otherwise it goes on the list, or past the cap is retained. A
+clone's drop derefs a reference the clone took and leaves the rest to the
+origin's lineage.
 
-Production callers wired in P7-CAS-4c + P7-CAS-4:
-
-- `stm_sync_write_extent_locked` — pre-check via
-  `cold_dead_list_reserve`(cox.n_hashes) BEFORE
-  `stm_extent_overwrite`; bookend per-hash via
-  `overwrite_cold_block`.
-- `stm_sync_truncate` past-extent + crossing-extent cold-deref —
-  same shape via `tcox.n_hashes`.
+- `stm_sync_write_extent_locked`: per-hash, after `stm_extent_overwrite`.
+- `stm_sync_truncate`: past-extent and crossing-extent, the same.
+- `promote_one_extent_locked`: the record the swap to hot dropped.
 
 Reflink + migrate rollback paths keep direct `stm_cas_deref`
 calls — those records were JUST inserted by the failing
@@ -595,6 +607,25 @@ tree uses `STM_BPTR_KIND_DATASET = 9` (added in P6-clone).
 | `dead_list.tla` | `BlocksTrackedSomewhere` — every block ever written is in the live set, freed, or in some PRESENT snap's dead-list (the load-bearing "blocks aren't lost"). `NoDoubleFree` — a freed block never re-appears in any dead-list. `LiveDisjointFromDead/Freed`, `FreedDisjointFromDead`, `SnapIdMonotonic`. `OverwriteBlock` — COW into most_recent_snap.dead, or free directly if no snap exists. `SnapDelete` with `unique = S.dead − succ.dead → freed`; `surviving = S.dead ∩ succ.dead → migrate to pred.dead` (empty in single-ownership). |
 
 ## Implementation notes
+
+**What a mount does with a list entry.** A node on a list stays allocated until its
+snapshot lets go, in a view or not, since a delete moves entries to an older neighbour
+whose view may not name them. A pool's older mounts did sweep such nodes, and the
+allocator may have reissued them, so the mount drops an entry that holds nothing: its node
+is free, or a strictly newer view names it, or a live tree holds it and no view does. It
+walks the views newest first to tell the second case, which leans on a clone having no
+snapshots: only a clone shares a node across datasets. Dropping an entry only ever leaks.
+
+A pass that does not finish, a damaged view for one, leaves the bitmap as found. An entry
+it had already dropped because a finished walk of a newer view names its node stays
+dropped, durable at the next commit. For that mount nothing frees a node off a list: a
+delete with an older neighbour moves the entries as ever, and the oldest's delete and a
+rollback let go of them, and the next good mount sweeps what nothing holds. The status file
+and the metrics report the state as lists-unverified.
+
+A pass that finishes also takes back a free node a tree or a view names. This code leaves
+none, an older mount's sweep and an older delete could, and until the allocator comes round
+its bytes are whole. The count is in the bootstrap stats as restored_nodes.
 
 - **prev_snap_id at Create**: walks slots[] for the most-recent
   PRESENT slot with matching `dataset_id`, captures its id. If

@@ -110,15 +110,13 @@ struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
 
 /*
  * P7-CAS-4c: per-snapshot cold-dead-list cap. Mirrors STM_SNAP_DEAD_LIST_MAX
- * for the COLD tier — when a live cold extent is dropped via COW, the
- * caller routes the dropped extent's content_hash[32] through
- * `stm_snapshot_index_overwrite_cold_block` which appends to the most-
- * recent snapshot's cold-dead-list (or signals direct-deref if no snap
- * exists). On snap-delete, the cold-dead-list contents flow back to the
- * caller for `stm_cas_deref` routing. The cap is per-snap; STM_ENOSPC
- * is propagated to callers so the higher-level COW can refuse rather
- * than silently violating the per-snap reachability invariant
- * (dead_list.tla::ColdExtentsTrackedSomewhere).
+ * for the COLD tier: when a live cold extent is dropped via COW, the caller
+ * routes its content_hash[32] through `stm_snapshot_index_overwrite_cold_block`,
+ * which appends to the most-recent snapshot's cold-dead-list (or signals
+ * direct-deref if no snap exists). On snap-delete the list flows back to the
+ * caller for `stm_cas_deref`. Past the cap the caller keeps the reference and
+ * counts it (stm_snapshot_index_note_retained), which costs space and never the
+ * snapshot's chunk (dead_list.tla::ColdExtentsTrackedSomewhere).
  */
 #define STM_SNAP_COLD_DEAD_LIST_MAX  256u
 
@@ -252,9 +250,14 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
  *
  * Models snapshot.tla::SnapshotDelete + dead_list.tla::SnapDelete.
  * The snap's slot is marked ABSENT; the id is NOT recycled
- * (next_snap_id only grows). Other snaps in the chain may still
- * reference this snap's id via prev_snap_id — the chain walk in
- * invariant checks filters out ABSENT links per snapshot.tla.
+ * (next_snap_id only grows). A snap whose prev_snap_id named this one
+ * takes this one's prev_snap_id. A pool written before that re-pointing
+ * may still hold a link to an ABSENT snap, which the load accepts and
+ * the chain walk in invariant checks filters per snapshot.tla.
+ *
+ * With an older PRESENT neighbour all three lists move to it and
+ * nothing is freed: its view may name anything on them. The buffers
+ * come back empty, which may be non-NULL with a count of 0.
  *
  * P6-deadlist: on success, the snap's dead-list is transferred to
  * the caller via *out_freed_paddrs and *out_freed_count. The caller
@@ -265,19 +268,12 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
  * `stm_paddr_device(paddr)` to route each freed paddr to the
  * correct device's allocator (R33 P3-3).
  *
- * In dead_list.tla's bounded single-ownership model `surviving =
- * S.dead ∩ successor.dead = ∅`, so all of S's dead-list is
- * `unique` and gets freed; the predecessor-merge step is a no-op.
- * The C impl realizes that simplification: emit the entire
- * dead-list as freed and clear it in place.
- *
  * On failure the dead-list stays attached to the snap. *out_freed_*
  * are zero/NULL.
  *
  * `*out_freed_paddrs` may be returned as NULL with `*out_freed_count
- * == 0` when the snap had no dead-list (clean delete) — both forms
- * are valid; callers MUST handle the NULL case by skipping the
- * free + free()-of-array steps.
+ * == 0`, or non-NULL with a count of 0 -- callers MUST go by the count
+ * and free() the array either way.
  */
 /*
  * P7-CAS-4c: snap-delete also returns the cold-dead-list contents
@@ -331,6 +327,22 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
                                  size_t *out_freed_boot_count);
 
 /*
+ * As stm_snapshot_delete, for a snapshot a rollback is passing: the lists always
+ * come back to the caller. The older neighbour they would move to is the rollback's
+ * target or older, and what they name is decided against the target's view: a block
+ * the view holds is live again, and on a list it would go at that list's delete.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_delete_past_rollback(stm_snapshot_index *idx,
+                                             uint64_t snapshot_id,
+                                             uint64_t **out_freed_paddrs,
+                                             size_t *out_freed_count,
+                                             uint8_t **out_freed_cold_hashes,
+                                             size_t *out_freed_cold_count,
+                                             uint64_t **out_freed_boot_paddrs,
+                                             size_t *out_freed_boot_count);
+
+/*
  * P6-deadlist: append `paddr` to the dead-list of the dataset's
  * most-recent PRESENT snapshot.
  *
@@ -350,14 +362,35 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
  *   - realloc fails growing the dead_list (STM_ENOMEM — prior
  *     dead_list contents preserved, R33 P3-1).
  *   - the dataset's most-recent snap is at STM_SNAP_DEAD_LIST_MAX
- *     entries (STM_ENOSPC). Production-grade chunked dead-list is
- *     a future enhancement; the cap is generous for any small/
- *     medium snapshot but real datasets need chunking. Callers
- *     SHOULD propagate STM_ENOSPC up to the higher-level write
- *     and refuse the COW (the alternative — direct-free + drop the
- *     snap's claim on the paddr — would silently violate the
- *     per-snap reachability invariant). R33 P3-5.
+ *     entries (STM_ENOSPC). The caller must keep the block allocated
+ *     and count it (stm_snapshot_index_note_retained): freeing it
+ *     would lose the snapshot, and the drop of a buffered write cannot
+ *     be refused, its write() has answered.
  */
+/*
+ * A block or node born at `birth_gen` is outside a snapshot's view when it was
+ * written after the capture. A snapshot's extent_txg is the gen captured after its
+ * own commit, so everything in its view has birth_gen < extent_txg and a birth equal
+ * to it is the first write after the capture. A reflink keeps its source's gen, so
+ * every record naming a block carries the block's own birth. Both answer false when
+ * they cannot say: an unknown birth (0), a snapshot with no captured gen, no PRESENT
+ * snapshot. A direct stm_snapshot_create must commit first to hold to this.
+ */
+bool stm_snapshot_index_outside_view(const stm_snapshot_index *idx,
+                                     uint64_t snapshot_id, uint64_t birth_gen);
+bool stm_snapshot_index_born_after_most_recent(const stm_snapshot_index *idx,
+                                               uint64_t dataset_id,
+                                               uint64_t birth_gen);
+
+/*
+ * Count a block (`node` false) or engine node (true) kept allocated because a
+ * snapshot's list could not take it. RAM only, since boot, and only ever raised: a
+ * rollback that brings a kept block back does not lower it.
+ */
+void stm_snapshot_index_note_retained(stm_snapshot_index *idx, bool node);
+void stm_snapshot_index_retained(const stm_snapshot_index *idx,
+                                 uint64_t *out_blocks, uint64_t *out_nodes);
+
 STM_MUST_USE
 stm_status stm_snapshot_index_overwrite_block(stm_snapshot_index *idx,
                                                  uint64_t dataset_id,
@@ -555,65 +588,15 @@ stm_status stm_snapshot_clear_dead_lists(stm_snapshot_index *idx,
  *     case that signals in-RAM index corruption — same shape as the
  *     paddr-tier API).
  *   - STM_ENOSPC if the most-recent snap's cold-dead-list is at the
- *     STM_SNAP_COLD_DEAD_LIST_MAX cap. Callers SHOULD pre-check via
- *     `stm_snapshot_index_cold_dead_list_reserve` BEFORE mutating the
- *     extent index; absent the pre-check, the cold-record-drop has
- *     already mutated extent_idx and the caller cannot easily roll
- *     back, so the deref is lost and the chunk leaks. Pre-check is
- *     the supported pattern (P7-CAS-4 R54 P3-2 fix).
+ *     STM_SNAP_COLD_DEAD_LIST_MAX cap. The record has already gone from the
+ *     extent index, so the caller keeps the reference and counts it
+ *     (stm_snapshot_index_note_retained).
  */
 STM_MUST_USE
 stm_status stm_snapshot_index_overwrite_cold_block(stm_snapshot_index *idx,
                                                       uint64_t dataset_id,
                                                       const uint8_t content_hash[STM_SNAP_HASH_LEN],
                                                       bool *out_should_deref);
-
-/*
- * P7-CAS-4 R54 P3-2: pre-check cold-dead-list capacity for `n_to_append`
- * additional entries against the most-recent PRESENT snap of `dataset_
- * id`. Used by the COW caller (sync.c bookends) BEFORE mutating
- * extent_idx, to avoid silent CAS leaks when the per-call STM_ENOSPC
- * fires mid-batch — at that point extent_idx has dropped the cold
- * record but the snap can't capture the deref obligation, leading to
- * a permanent CAS-refcount-stuck-at-1 leak.
- *
- * Semantics:
- *   - No most-recent PRESENT snap for dataset_id → *out_can_accept = true
- *     (caller's bookend will fall through to direct deref; no list
- *     mutation needed).
- *   - Most-recent PRESENT snap exists →
- *     *out_can_accept = (current cold_dead_count + n_to_append) <=
- *                       STM_SNAP_COLD_DEAD_LIST_MAX.
- *
- * **Caller's lock contract (R55 P2-1)**: the value of
- * `*out_can_accept` is only valid for the subsequent
- * `stm_snapshot_index_overwrite_cold_block` calls IF the caller holds
- * a lock that excludes concurrent `stm_snapshot_create` /
- * `stm_snapshot_delete` for `dataset_id` over the entire reserve+
- * append sequence. Without that exclusion, a concurrent snap_delete
- * could shift the dataset's "most-recent PRESENT snap" to an older
- * snap with a near-cap cold-dead-list between the reserve check and
- * the per-hash overwrite_cold_block calls — silently triggering the
- * STM_ENOSPC the reserve was meant to prevent.
- *
- * The current production caller (`sync.c` bookends in
- * `stm_sync_write_extent_locked` + `stm_sync_truncate`) holds
- * `sync->lock` continuously across the reserve + the bookend's
- * per-hash overwrite_cold_block loop, AND every snap_create /
- * snap_delete entry point in `fs.c` also acquires `sync->lock` —
- * giving the necessary exclusion by construction. Future callers
- * MUST satisfy the same exclusion contract OR this API's guarantee
- * is racy.
- *
- * STM_EINVAL on NULL idx / NULL out / dataset_id == 0.
- * STM_ECORRUPT on stale-slot signal from most_recent_locked.
- */
-STM_MUST_USE
-stm_status stm_snapshot_index_cold_dead_list_reserve(
-    const stm_snapshot_index *idx,
-    uint64_t dataset_id,
-    size_t n_to_append,
-    bool *out_can_accept);
 
 /*
  * P7-CAS-4c: count of cold-hash entries in `snapshot_id`'s in-RAM
@@ -664,94 +647,6 @@ stm_status stm_snapshot_cold_dead_list_get(stm_snapshot_index *idx,
                                               uint64_t snapshot_id,
                                               uint8_t **out_hashes,
                                               size_t *out_count);
-
-/* ========================================================================= */
-/* 9.7-impl-6b: clone routing variants of the _overwrite_*_block family.       */
-/* ========================================================================= */
-
-/*
- * 9.7-impl-6b: append `paddr` to the SPECIFIC snapshot `snap_id`'s
- * paddr-tier (stm_alloc class) dead-list.
- *
- * Sibling of `stm_snapshot_index_overwrite_block`, but routes to a
- * caller-supplied snap_id instead of looking up
- * `most_recent_locked(dataset_id)`. The clone path uses this: when a
- * clone's engine drops a paddr in origin snap S's view, the drop MUST
- * land in S's dead-list specifically (NOT the most-recent snap of the
- * clone OR the origin) so a future `stm_snapshot_delete(S)` (deferred
- * until the clone is gone) reclaims the paddr correctly. See
- * `phase-9.7-design.md` §9.1 for the snap-routing-gap analysis the
- * clone mechanism closes.
- *
- * Single-ownership defense-in-depth (R33 P2): same as
- * `_overwrite_block` — refuses STM_EINVAL if `paddr` already appears
- * in any PRESENT snap's paddr-tier dead-list.
- *
- * Refused with:
- *   - STM_EINVAL on NULL idx / snap_id == 0 / paddr == 0.
- *   - STM_EINVAL if paddr is already tracked by some PRESENT snap's
- *     paddr-tier dead_list (single-ownership defense, R33 P2).
- *   - STM_ENOENT if snap_id is not PRESENT.
- *   - STM_ENOMEM on realloc failure (prior dead_list preserved).
- *   - STM_ENOSPC at STM_SNAP_DEAD_LIST_MAX cap.
- *
- * On STM_OK the paddr is owned by `snap_id`'s dead-list until either
- * `stm_snapshot_delete(snap_id)` reclaims it or
- * `stm_snapshot_clear_dead_lists(snap_id)` (post-rollback) discards it.
- */
-STM_MUST_USE
-stm_status stm_snapshot_index_add_to_snap_dead_list(stm_snapshot_index *idx,
-                                                       uint64_t snap_id,
-                                                       uint64_t paddr);
-
-/*
- * 9.7-impl-6b: append `paddr` to the SPECIFIC snapshot `snap_id`'s
- * bootstrap-tier (engine NODE / stm_bootstrap class) dead-list.
- *
- * Sibling of `stm_snapshot_index_overwrite_bootstrap_block` for the
- * clone path. Same posture as `_add_to_snap_dead_list` above but for
- * the boot tier — single-ownership scan in `boot_dead_list`, append
- * to `slot->boot_dead_list`, cap at STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX.
- *
- * Refused with:
- *   - STM_EINVAL on NULL idx / snap_id == 0 / paddr == 0.
- *   - STM_EINVAL if paddr is already tracked by some PRESENT snap's
- *     bootstrap-tier dead_list (single-ownership defense, R33 P2).
- *   - STM_ENOENT if snap_id is not PRESENT.
- *   - STM_ENOMEM on realloc failure (prior dead_list preserved).
- *   - STM_ENOSPC at STM_SNAP_BOOTSTRAP_DEAD_LIST_MAX cap.
- */
-STM_MUST_USE
-stm_status stm_snapshot_index_add_to_snap_bootstrap_dead_list(
-    stm_snapshot_index *idx,
-    uint64_t snap_id,
-    uint64_t paddr);
-
-/*
- * 9.7-impl-6b: append `content_hash` to the SPECIFIC snapshot
- * `snap_id`'s cold-tier (CAS class) dead-list.
- *
- * Sibling of `stm_snapshot_index_overwrite_cold_block` for the clone
- * path. Same multiset semantics — a single hash MAY appear multiple
- * times (one entry per deferred deref obligation; see
- * `_overwrite_cold_block`'s R54 P1-1 note for the rationale).
- *
- * NO single-ownership scan (the cold tier doesn't have one — distinct
- * cold records legitimately share a content_hash via content-defined
- * dedup).
- *
- * Refused with:
- *   - STM_EINVAL on NULL idx / snap_id == 0 / NULL hash.
- *   - STM_EINVAL if hash is all-zero (CAS sentinel, never live).
- *   - STM_ENOENT if snap_id is not PRESENT.
- *   - STM_ENOMEM on realloc failure (prior dead_list preserved).
- *   - STM_ENOSPC at STM_SNAP_COLD_DEAD_LIST_MAX cap.
- */
-STM_MUST_USE
-stm_status stm_snapshot_index_add_to_snap_cold_dead_list(
-    stm_snapshot_index *idx,
-    uint64_t snap_id,
-    const uint8_t content_hash[STM_SNAP_HASH_LEN]);
 
 /*
  * Increment snapshot's hold count. STM_ENOENT if not PRESENT.
@@ -964,11 +859,21 @@ stm_status stm_snapshot_index_get_gen(const stm_snapshot_index *idx,
 /* #791 mount reconcile: report every live bootstrap node the snapshot subsystem
  * occupies via `fn` -- the index btree_store tree (UNIT_BLOCKS) plus every
  * snapshot's captured content engine root (NODE_BLOCKS, the pinned older
- * dataset root). See the reconcile API in stratum/bootstrap.h. */
+ * dataset root), and what the lists hold. Runs last of the trees: everything marked
+ * before it is live, which is how it tells a list entry an older mount swept, and lets
+ * go of it. See the reconcile API in stratum/bootstrap.h. */
 STM_MUST_USE
 stm_status stm_snapshot_index_reconcile_mark(stm_snapshot_index *idx,
+                                                stm_bootstrap *boot,
                                                 stm_reconcile_mark_fn fn,
                                                 void *ctx);
+
+/* A mount whose pass did not finish, or never ran, told no stale list entry from a real
+ * one, so a node on a list may be something else's by now. While this is set nothing frees a node off a
+ * list: a delete or a rollback lets go of the entry, and the next good mount sweeps a node
+ * nothing holds. In RAM only: each mount answers for itself. */
+void stm_snapshot_index_set_boot_lists_unverified(stm_snapshot_index *idx, bool unverified);
+bool stm_snapshot_index_boot_lists_unverified(const stm_snapshot_index *idx);
 
 STM_MUST_USE
 stm_status stm_snapshot_index_verify(const stm_snapshot_index *idx);

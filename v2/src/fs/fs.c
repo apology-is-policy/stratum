@@ -315,6 +315,8 @@ struct stm_fs {
     stm_status rename_src_drop_fail_next;
     stm_fs_rename_rollback_hook rename_rollback_hook;
     void *rename_rollback_hook_arg;
+    stm_fs_rollback_committed_hook rollback_committed_hook;
+    void *rollback_committed_hook_arg;
     stm_fs_write_guard_hook write_guard_hook;
     void *write_guard_hook_arg;
     stm_fs_reclaim_hook reclaim_hook;
@@ -3732,6 +3734,14 @@ void stm_fs_set_rename_rollback_hook_for_test(stm_fs *fs,
 {
     fs->rename_rollback_hook = fn;
     fs->rename_rollback_hook_arg = arg;
+}
+
+void stm_fs_set_rollback_committed_hook_for_test(stm_fs *fs,
+                                                 stm_fs_rollback_committed_hook fn,
+                                                 void *arg)
+{
+    fs->rollback_committed_hook = fn;
+    fs->rollback_committed_hook_arg = arg;
 }
 
 void stm_fs_set_write_guard_hook_for_test(stm_fs *fs,
@@ -9871,6 +9881,8 @@ stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
         return del;
     }
 
+    if (stm_snapshot_index_boot_lists_unverified(stm_sync_snapshot_index(fs->sync)))
+        freed_boot_n = 0;
     if (out_freed_count) *out_freed_count = freed_n + freed_boot_n;
 
     /* First-failure status — propagated after the cleanup loop runs
@@ -10153,13 +10165,11 @@ static int fs_rb_paddr_cmp(const void *a, const void *b)
  * corrupt the rolled-back dataset. If either walk fails or is truncated
  * (ENOMEM / STM_ECORRUPT / device error) NOTHING is freed.
  *
- * Correct ONLY because the caller already refused the rollback when a
- * newer snapshot of the dataset exists: with `s` the most-recent
- * snapshot, every block reachable-from-old-live-but-not-from-`s` was
- * allocated AFTER `s` (incremental COW only ever writes fresh paddrs),
- * so no older snapshot can reference it. Lifting the newer-snapshot
- * refusal (9.7-impl-4d) needs the `\ newer_dead` filter
- * dead_list.tla::Rollback also carries.
+ * Every block reachable-from-old-live-but-not-from-`s` was allocated
+ * AFTER `s` (incremental COW only ever writes fresh paddrs), so no older
+ * snapshot can reference it. A newer snapshot can, and the caller deletes
+ * every newer snapshot in this same rollback: a cloned or held one
+ * refuses it before the first destructive step.
  *
  * BEST-EFFORT: any walk / collect / per-paddr free failure leaves the
  * unreclaimed remainder LEAKED — a space cost, never a corruption (a
@@ -10197,9 +10207,6 @@ static void fs_rollback_reclaim_diverged_nodes(
             fs_rb_paddr_collect_cb, &old_set);
     if (w != STM_OK || old_set.oom) goto done;
 
-    /* old \ snap via a sorted merge — sorting old_set too dedups it
-     * (defence against a corrupt tree presenting one paddr twice,
-     * which would otherwise double-free). */
     /* Skip the sort for an empty / single-element set — already sorted,
      * and it keeps a NULL base out of qsort (strict-C-clean; R163 P3-2). */
     if (snap_set.n > 1)
@@ -10232,6 +10239,74 @@ done:
 }
 
 /*
+ * The view's data blocks, one name per record, sorted. A rollback sets their counts
+ * from this, and a block left a count short is freed under a record at its sibling's
+ * next drop. So unlike what the reclaims read this cannot be best-effort: it is read
+ * with the other refusals, before the first destructive step. A view naming a free
+ * block is one no rollback can bring back: it refuses here too.
+ */
+static stm_status fs_rollback_collect_view_data(
+        stm_fs *fs, stm_extent_index *eidx, uint64_t dataset_id,
+        uint64_t snap_paddr, uint64_t snap_gen, const uint8_t snap_csum[32],
+        fs_rb_paddr_set *view)
+{
+    stm_status w = stm_extent_index_collect_engine_data_paddrs_at(
+            eidx, dataset_id, snap_paddr, snap_gen, snap_csum,
+            fs_rb_paddr_collect_cb, view);
+    if (w == STM_OK && view->oom) w = STM_ENOMEM;
+    if (w != STM_OK) {
+        free(view->v);
+        view->v = NULL;
+        view->n = 0;
+        return w;
+    }
+    if (view->n > 1)
+        qsort(view->v, view->n, sizeof *view->v, fs_rb_paddr_cmp);
+    for (size_t i = 0; i < view->n; i++) {
+        uint64_t p = view->v[i];
+        if (i > 0 && p == view->v[i - 1]) continue;
+        stm_alloc *a = stm_sync_alloc(fs->sync, stm_paddr_device(p));
+        uint64_t len = 0;
+        uint32_t rc = 0;
+        if (a && (stm_alloc_lookup(a, p, &len, &rc) != STM_OK || rc == 0)) {
+            free(view->v);
+            view->v = NULL;
+            view->n = 0;
+            return STM_ECORRUPT;
+        }
+    }
+    return STM_OK;
+}
+
+/*
+ * After the swap a block's only holders are the view's records: a clone's hold no count,
+ * and a clone has no snapshot of its own to roll back to. So a block the view names gets
+ * a count of how many name it, whatever the old tree and the lists held. Left as it was,
+ * a reflink pair both dropped before the rollback comes back on one count: the first
+ * sibling's next drop frees the block under the second. A failure here is the caller's
+ * wedge: the counts moved so far belong to a swap that is not durable.
+ */
+static stm_status fs_rollback_set_view_counts(stm_fs *fs, const fs_rb_paddr_set *view)
+{
+    uint64_t free_gen = stm_sync_current_gen(fs->sync);
+    for (size_t i = 0, m; i < view->n; i += m) {
+        uint64_t p = view->v[i];
+        for (m = 1; i + m < view->n && view->v[i + m] == p; m++) {}
+        stm_alloc *a = stm_sync_alloc(fs->sync, stm_paddr_device(p));
+        uint64_t len = 0;
+        uint32_t rc = 0;
+        if (!a) continue;
+        if (stm_alloc_lookup(a, p, &len, &rc) != STM_OK || rc == 0) return STM_ECORRUPT;
+        for (; rc < m; rc++) {
+            stm_status rs = stm_alloc_ref(a, p);
+            if (rs != STM_OK) return rs;
+        }
+        for (; rc > m; rc--) (void)stm_alloc_free(a, p, free_gen);
+    }
+    return STM_OK;
+}
+
+/*
  * 9.7-impl-4c: reclaim the pre-rollback live tree's DATA-extent
  * divergence — every HOT-extent replica block (stm_alloc class)
  * referenced by the OLD live tree's EXTENT keyspace but NOT by the
@@ -10248,17 +10323,14 @@ done:
  *       snapshot's cleared dead-list garbage — 9.7-impl-4c-iii.
  *
  * SAFETY (load-bearing): a paddr is freed ONLY when it is in old_set
- * AND NOT in snap_set AND BOTH walks completed in full — identical to
- * fs_rollback_reclaim_diverged_nodes. A paddr a HOT extent reflink-
- * SHARES across the snapshot boundary is referenced by a snapshot-tree
- * extent, so it lands in snap_set and is excluded — the set-difference
- * handles cohabitation. Sorting old_set dedups it, so a paddr two
- * reflink-siblings in the OLD tree share is freed at most once (a
- * double stm_alloc_free would corrupt the allocator). If either walk
- * fails or is truncated NOTHING is freed.
+ * AND NOT in `view`, which the caller read in full before the swap. A
+ * paddr a HOT extent reflink-SHARES across the snapshot boundary is
+ * referenced by a snapshot-tree extent, so it lands in `view` and is
+ * excluded. If the old tree's walk fails or is truncated NOTHING is freed.
+ * A diverged block loses every count it had: fs_rollback_set_view_counts
+ * has the counts of the rest.
  *
- * Correct ONLY because the caller already refused the rollback when a
- * newer snapshot of the dataset exists — see the matching note on
+ * Older and newer snapshots: see the matching note on
  * fs_rollback_reclaim_diverged_nodes.
  *
  * BEST-EFFORT: any walk / collect / per-paddr free failure leaves the
@@ -10278,63 +10350,43 @@ done:
 static void fs_rollback_reclaim_diverged_extents(
         stm_fs *fs, stm_extent_index *eidx, uint64_t dataset_id,
         uint64_t old_paddr, uint64_t old_gen, const uint8_t old_csum[32],
-        uint64_t snap_paddr, uint64_t snap_gen, const uint8_t snap_csum[32])
+        const fs_rb_paddr_set *view)
 {
-    fs_rb_paddr_set old_set  = {0};
-    fs_rb_paddr_set snap_set = {0};
+    fs_rb_paddr_set old_set = {0};
 
-    /* Snapshot tree first: an incomplete snap_set must abort the whole
-     * reclaim — a missing snap paddr would mis-classify a shared data
-     * block as diverged and free live storage. */
     stm_status w = stm_extent_index_collect_engine_data_paddrs_at(
-            eidx, dataset_id, snap_paddr, snap_gen, snap_csum,
-            fs_rb_paddr_collect_cb, &snap_set);
-    if (w != STM_OK || snap_set.oom) goto done;
-
-    w = stm_extent_index_collect_engine_data_paddrs_at(
             eidx, dataset_id, old_paddr, old_gen, old_csum,
             fs_rb_paddr_collect_cb, &old_set);
     if (w != STM_OK || old_set.oom) goto done;
 
-    /* old \ snap via a sorted merge — sorting old_set too dedups it
-     * (a paddr two reflink-siblings in the old tree share, or a corrupt
-     * tree presenting one paddr twice, would otherwise double-free).
-     * R162 P3-1: the dedup trades a refcount-exact free for double-free
-     * safety. stm_alloc_free is refcount-aware (one call = one decrement);
-     * a paddr N reflink-siblings WITHIN the old tree share carries
-     * allocator refcount N, and the single dedup'd free leaves it at
-     * N-1 — an under-free. That is a phantom-refcount LEAK, never a
-     * corruption (the block stays allocated, so never reissued, so the
-     * AEAD nonce stays unique), and it is covered by this function's
-     * BEST-EFFORT posture. A refcount-exact reclaim would need the same
-     * counted-multiset machinery the cold-extent tier needs — forward-
-     * noted to 9.7-impl-4c-ii alongside the CAS-refcount work. */
-    /* Skip the sort for an empty / single-element set — already sorted,
+    /* old \ view via a sorted merge. Sorting old_set dedups it: siblings in
+     * the old tree share one paddr, whose whole count goes at once.
+     * Skip the sort for an empty / single-element set -- already sorted,
      * and it keeps a NULL base out of qsort (strict-C-clean; R163 P3-2). */
-    if (snap_set.n > 1)
-        qsort(snap_set.v, snap_set.n, sizeof *snap_set.v, fs_rb_paddr_cmp);
     if (old_set.n > 1)
         qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_paddr_cmp);
 
     uint64_t free_gen = stm_sync_current_gen(fs->sync);
-    size_t   j = 0;
+    size_t j = 0;
     for (size_t i = 0; i < old_set.n; i++) {
         uint64_t p = old_set.v[i];
-        if (i > 0 && p == old_set.v[i - 1]) continue;       /* dedup */
-        while (j < snap_set.n && snap_set.v[j] < p) j++;
-        if (j < snap_set.n && snap_set.v[j] == p) continue; /* shared — KEEP */
+        if (i > 0 && p == old_set.v[i - 1]) continue;       /* its count is one walk */
+        while (j < view->n && view->v[j] < p) j++;
+        if (j < view->n && view->v[j] == p) continue;       /* the view's */
 
         /* p is diverged: data-area, per-device routed. A free failure
          * (device gone) leaks p — best-effort, continue. */
         uint16_t did = stm_paddr_device(p);
         stm_alloc *a = stm_sync_alloc(fs->sync, did);
         if (!a) continue;
-        (void)stm_alloc_free(a, p, free_gen);
+        uint64_t len = 0;
+        uint32_t rc = 0;
+        if (stm_alloc_lookup(a, p, &len, &rc) != STM_OK) continue;
+        for (; rc > 0; rc--) (void)stm_alloc_free(a, p, free_gen);
     }
 
 done:
     free(old_set.v);
-    free(snap_set.v);
 }
 
 /* A growable COLD-extent-record set — the collector sink for one
@@ -10366,12 +10418,44 @@ static int fs_rb_cold_collect_cb(const stm_extent_cold_ref *rec, void *ctx)
     return 0;
 }
 
-/* qsort comparator — order cold refs by (ino, off) ascending. */
+/* qsort comparator -- a cold record's identity, hash first. Its key is no part of it:
+ * COLLAPSE and INSERT move a record and keep the rest. link_gen separates the eras:
+ * every record of a view is below the capture and every record made since is not.
+ * Each record holds a reference of its own, so which of two equal records pairs with
+ * which does not matter. */
 static int fs_rb_cold_cmp(const void *a, const void *b)
 {
     const stm_extent_cold_ref *x = a, *y = b;
-    if (x->ino != y->ino) return (x->ino > y->ino) - (x->ino < y->ino);
-    return (x->off > y->off) - (x->off < y->off);
+    int h = memcmp(x->content_hash, y->content_hash, STM_EXTENT_HASH_LEN);
+    if (h != 0) return h;
+    if (x->gen != y->gen) return (x->gen > y->gen) - (x->gen < y->gen);
+    return (x->link_gen > y->link_gen) - (x->link_gen < y->link_gen);
+}
+
+/* `a` minus `b` as multisets of identity, both sorted by fs_rb_cold_cmp: the hashes
+ * of a's records with no partner in b, in hash order. False on ENOMEM. */
+static bool fs_rb_cold_minus(const fs_rb_cold_set *a, const fs_rb_cold_set *b,
+                             uint8_t **out_hashes, size_t *out_n)
+{
+    *out_hashes = NULL;
+    *out_n = 0;
+    if (a->n == 0) return true;
+    uint8_t *v = malloc(a->n * STM_EXTENT_HASH_LEN);
+    if (!v) return false;
+    size_t n = 0, j = 0;
+    for (size_t i = 0; i < a->n; i++) {
+        int c = 1;
+        while (j < b->n && (c = fs_rb_cold_cmp(&b->v[j], &a->v[i])) < 0) j++;
+        if (j < b->n && c == 0) {
+            j++;
+            continue;
+        }
+        memcpy(&v[n * STM_EXTENT_HASH_LEN], a->v[i].content_hash, STM_EXTENT_HASH_LEN);
+        n++;
+    }
+    *out_hashes = v;
+    *out_n = n;
+    return true;
 }
 
 /*
@@ -10392,7 +10476,7 @@ static int fs_rb_cold_cmp(const void *a, const void *b)
  *       whole live-divergence; the snapshot's own cleared dead-list
  *       garbage stays forward-noted to 9.7-impl-4c-iii.
  *
- * WHY A PER-KEY STRUCTURAL MERGE, NOT A HASH-COUNT DIFFERENCE.
+ * WHY RECORD IDENTITY, NOT A HASH-COUNT DIFFERENCE.
  * Content-defined dedup lets DISTINCT cold records share a content
  * hash. A reclaim that merely subtracted per-hash occurrence counts
  * ("deref H, max(0, count_old(H) - count_snap(H)) times") is WRONG: a
@@ -10400,28 +10484,17 @@ static int fs_rb_cold_cmp(const void *a, const void *b)
  * happen to share hash H cancel each other in the subtraction, leaving
  * the diverged record's refcount un-released — a CAS-refcount leak
  * that compounds across every rollback. The correct unit is the
- * RECORD: walk both trees' EXTENT keyspaces and, for each key, decide
- * shared-vs-diverged structurally.
+ * RECORD, by the identity fs_rb_cold_cmp orders.
  *
- * SAFETY (load-bearing): a cold record's hash is dereffed ONLY when
- * the record is in old_set, is NOT the same logical record as a
- * snapshot-tree record at the same (ino, off), AND BOTH walks
- * completed in full. Two COLD records at the same key are the SAME
- * logical record iff their (content_hash, gen, link_gen) identity is
- * byte-identical. link_gen — the gen at which a record entered the
- * live extent index — is the load-bearing separator: snapshot creation
- * forces a commit, so every cold record in the snapshot carries
- * link_gen <= the snapshot's gen, while any post-snapshot (diverged)
- * record entered the index at a strictly higher gen. A shared record
- * therefore ALWAYS matches its snapshot counterpart and is never
- * mis-classified as diverged — this reclaim NEVER over-derefs (which
- * would prematurely GC live cold storage). The only residual failure
- * mode is an under-deref (a leak), consistent with the best-effort
- * posture. If either walk fails or is truncated NOTHING is dereffed.
+ * SAFETY (load-bearing): a cold record's hash is dereffed ONLY when the
+ * record is in old_set, has no partner of its identity in the view, AND
+ * BOTH walks completed in full. A record the view holds always has its
+ * partner, wherever COLLAPSE or INSERT moved it, so this reclaim NEVER
+ * over-derefs (which would prematurely GC live cold storage). If either
+ * walk fails or is truncated NOTHING is dereffed.
  *
- * Correct ONLY because the caller already refused the rollback when a
- * newer snapshot of the dataset exists — see the matching note on
- * fs_rollback_reclaim_diverged_nodes.
+ * Newer snapshots of the dataset are the cascade's: each newer view's
+ * records were either in the old tree here or dropped onto a list.
  *
  * BEST-EFFORT: any walk / collect / per-record deref failure leaves
  * the unreleased remainder as a CAS-refcount leak — a space cost (the
@@ -10467,47 +10540,26 @@ static void fs_rollback_reclaim_diverged_cold(
     if (old_set.n > 1)
         qsort(old_set.v,  old_set.n,  sizeof *old_set.v,  fs_rb_cold_cmp);
 
-    size_t j = 0;
-    for (size_t i = 0; i < old_set.n; i++) {
-        const stm_extent_cold_ref *o = &old_set.v[i];
-
-        /* Defensive dedup: the extent index holds at most one record
-         * per (ino, off), so adjacent-equal keys can only appear in a
-         * corrupt tree. Skipping the duplicate errs toward an
-         * under-deref (a leak) — never a double-deref (a corruption). */
-        if (i > 0 && o->ino == old_set.v[i - 1].ino
-                  && o->off == old_set.v[i - 1].off) continue;
-
-        /* Advance the snapshot cursor to o's key. */
-        while (j < snap_set.n &&
-               (snap_set.v[j].ino < o->ino ||
-                (snap_set.v[j].ino == o->ino &&
-                 snap_set.v[j].off < o->off))) j++;
-
-        bool shared = false;
-        if (j < snap_set.n &&
-            snap_set.v[j].ino == o->ino && snap_set.v[j].off == o->off) {
-            const stm_extent_cold_ref *sref = &snap_set.v[j];
-            /* SAME logical record iff its identity is byte-identical.
-             * link_gen is the load-bearing separator (see the function
-             * comment); gen + content_hash are compared too so the
-             * decision needs no reasoning beyond "identical record". */
-            shared = (sref->link_gen == o->link_gen &&
-                      sref->gen      == o->gen      &&
-                      memcmp(sref->content_hash, o->content_hash,
-                             STM_EXTENT_HASH_LEN) == 0);
-        }
-        if (shared) continue;   /* o survives the rollback — keep */
-
-        /* o is a post-snapshot (diverged) cold record: release the one
-         * CAS refcount it took at creation. A deref failure leaks the
-         * refcount — best-effort, continue. */
-        (void)stm_cas_deref(cidx, o->content_hash);
-    }
+    /* What the old tree holds that the view does not: each is a post-snapshot
+     * cold record, and gives back the one CAS refcount it took at creation. A
+     * deref failure leaks the refcount -- best-effort, continue. */
+    uint8_t *diverged = NULL;
+    size_t   n_diverged = 0;
+    if (!fs_rb_cold_minus(&old_set, &snap_set, &diverged, &n_diverged)) goto done;
+    for (size_t i = 0; i < n_diverged; i++)
+        (void)stm_cas_deref(cidx, &diverged[i * STM_EXTENT_HASH_LEN]);
+    free(diverged);
 
 done:
     free(old_set.v);
     free(snap_set.v);
+}
+
+/* In a sorted set. An empty one has a NULL base, which bsearch may not be given. */
+static bool fs_rb_paddr_has(const fs_rb_paddr_set *set, uint64_t p)
+{
+    return set->n > 0 &&
+           bsearch(&p, set->v, set->n, sizeof p, fs_rb_paddr_cmp) != NULL;
 }
 
 /* qsort comparator — raw 32-byte hash bytes (memcmp order). */
@@ -10529,40 +10581,34 @@ static int fs_rb_hash_cmp_raw(const void *a, const void *b)
  * survivors.
  *
  * WHY THE DEAD-LIST HOLDS NON-S_VIEW GARBAGE.
- * impl-2's snap-aware COW free routes every freed paddr/record through
- * `stm_snapshot_index_overwrite_{block,bootstrap_block,cold_block}`,
- * which always sends to the MOST-RECENT PRESENT snap regardless of
- * whether THAT snap actually references the freed block. With S = the
- * most-recent at rollback time (under impl-4's newer-snapshot refusal),
- * S's dead-list collects EVERY post-S COW free, including both:
+ * A drop born after the most recent snapshot frees with no entry, so a
+ * list takes only what the most recent view names. S's list still holds
+ * both of:
  *   (a) blocks/records IN S's view (RESURRECT on rollback — must NOT
  *       be freed/dereffed), and
- *   (b) blocks/records created post-S and freed post-S (intermediate
- *       COW garbage — SHOULD be freed/dereffed).
+ *   (b) blocks/records a newer neighbour's delete moved here, in that
+ *       neighbour's view and not S's (SHOULD be freed/dereffed).
  *
  * Boot + Data tiers — simple set-difference on paddrs (paddrs are
  * unique IDs; no dedup at this level). For each paddr P on dead_S:
  *   - P ∈ snap_paddr_set  ⇒ case-(a), KEEP (P resurrects in live).
  *   - P ∉ snap_paddr_set  ⇒ case-(b), FREE.
  *
- * Cold tier — per-key structural merge to compute snap_unique[hash]
- * (the multiset of hashes whose snap-tree record at (ino, off) is NOT
- * the same logical record as the old tree's record at the same key —
- * these are the case-(a) entries on the cold dead-list). Then for each
- * unique hash H run the COUNTED subtraction:
+ * Cold tier -- snap_unique[hash], the multiset of the view's records the
+ * old tree no longer holds (these are the case-(a) entries on the cold
+ * dead-list). Then for each unique hash H run the COUNTED subtraction:
  *
  *     deref_count(H) = dead_S_cold(H) − snap_unique(H)       [≥ 0]
  *
  * Why a counted subtraction is SAFE for the cold dead-list (distinct
- * from 4c-ii's live-divergence case): every snap_unique record has a
- * corresponding dead-list entry — its drop fired the snap-aware deref
- * routing while S was most-recent — so `snap_unique(H) ≤ dead_S(H)`
- * always holds per hash. The 4c-ii live-divergence case had no such
+ * from 4c-ii's live-divergence case): the caller's commit makes the old
+ * tree the tree after every drop, so a snap_unique record was dropped,
+ * and its drop made an entry on S's list, on a newer list (the cascade's
+ * count), or none past the cap, where the clamp takes the difference
+ * as a leak and no more. The 4c-ii live-divergence case had no such
  * pairing — an old-tree diverged record and an unrelated snap-tree
  * record could coincide on hash H via content-defined dedup, breaking
- * the counted subtraction; 4c-ii had to use a per-key structural
- * merge for the deref decision itself. HERE the per-key merge is
- * used only to count snap_unique; the deref decision uses the count.
+ * the counted subtraction; 4c-ii decides record by record.
  *
  * SAFETY (load-bearing): a paddr is freed / hash dereffed ONLY when
  *   - boot/data: the dead-list paddr is NOT in the snapshot's
@@ -10603,7 +10649,7 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
     size_t    n_dead_boot = 0;
     (void)stm_snapshot_bootstrap_dead_list_get(sidx, snapshot_id,
                                                  &dead_boot, &n_dead_boot);
-    if (n_dead_boot > 0) {
+    if (n_dead_boot > 0 && !stm_snapshot_index_boot_lists_unverified(sidx)) {
         fs_rb_paddr_set snap_nodes = {0};
         stm_status w = stm_dataset_index_collect_engine_paddrs_at(
                 didx, dataset_id, snap_paddr, snap_gen, snap_csum,
@@ -10616,8 +10662,7 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
         if (ok) {
             for (size_t i = 0; i < n_dead_boot; i++) {
                 uint64_t p = dead_boot[i];
-                if (bsearch(&p, snap_nodes.v, snap_nodes.n,
-                            sizeof p, fs_rb_paddr_cmp) != NULL)
+                if (fs_rb_paddr_has(&snap_nodes, p))
                     continue;   /* case-(a): resurrects */
                 uint16_t did = stm_paddr_device(p);
                 stm_alloc *a = stm_sync_alloc(fs->sync, did);
@@ -10650,8 +10695,7 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
         if (ok) {
             for (size_t i = 0; i < n_dead_data; i++) {
                 uint64_t p = dead_data[i];
-                if (bsearch(&p, snap_data.v, snap_data.n,
-                            sizeof p, fs_rb_paddr_cmp) != NULL)
+                if (fs_rb_paddr_has(&snap_data, p))
                     continue;   /* case-(a): resurrects */
                 uint16_t did = stm_paddr_device(p);
                 stm_alloc *a = stm_sync_alloc(fs->sync, did);
@@ -10688,55 +10732,11 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
                 qsort(old_cold.v, old_cold.n,
                       sizeof *old_cold.v, fs_rb_cold_cmp);
 
-            /* Compute snap_unique[]: walk SNAP cold records in (ino,off)
-             * order; for each, see whether OLD has the SAME LOGICAL
-             * record at the same key. Same-logical = byte-identical
-             * (content_hash, gen, link_gen) — the 4c-ii record-identity
-             * discriminator. If not the same logical record, the snap
-             * record's hash is "unique to snap"; collect into a flat
-             * multiset buffer. */
+            /* snap_unique[]: the view's records the old tree no longer holds,
+             * as a flat multiset of hashes in hash order. */
             uint8_t *snap_unique = NULL;
             size_t   n_snap_unique = 0;
-            if (snap_cold.n > 0) {
-                snap_unique = malloc(snap_cold.n * STM_EXTENT_HASH_LEN);
-            }
-            if (snap_cold.n == 0 || snap_unique != NULL) {
-                size_t oi = 0;
-                for (size_t si = 0; si < snap_cold.n; si++) {
-                    const stm_extent_cold_ref *sr = &snap_cold.v[si];
-                    /* Advance oi past old records with key < sr's. */
-                    while (oi < old_cold.n) {
-                        const stm_extent_cold_ref *ro = &old_cold.v[oi];
-                        if (ro->ino < sr->ino
-                            || (ro->ino == sr->ino && ro->off < sr->off)) {
-                            oi++;
-                        } else {
-                            break;
-                        }
-                    }
-                    bool same_logical = false;
-                    if (oi < old_cold.n) {
-                        const stm_extent_cold_ref *ro = &old_cold.v[oi];
-                        if (ro->ino == sr->ino && ro->off == sr->off
-                            && ro->link_gen == sr->link_gen
-                            && ro->gen      == sr->gen
-                            && memcmp(ro->content_hash, sr->content_hash,
-                                       STM_EXTENT_HASH_LEN) == 0) {
-                            same_logical = true;
-                        }
-                    }
-                    if (!same_logical) {
-                        memcpy(&snap_unique[n_snap_unique * STM_EXTENT_HASH_LEN],
-                                sr->content_hash, STM_EXTENT_HASH_LEN);
-                        n_snap_unique++;
-                    }
-                }
-
-                /* Sort both flat hash arrays for the merge-walk by hash. */
-                if (n_snap_unique > 1) {
-                    qsort(snap_unique, n_snap_unique,
-                          STM_EXTENT_HASH_LEN, fs_rb_hash_cmp_raw);
-                }
+            if (fs_rb_cold_minus(&snap_cold, &old_cold, &snap_unique, &n_snap_unique)) {
                 if (n_dead_cold > 1) {
                     qsort(dead_cold, n_dead_cold,
                           STM_EXTENT_HASH_LEN, fs_rb_hash_cmp_raw);
@@ -10746,14 +10746,11 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
                  * dead-list, count the matching run in snap_unique[],
                  * and deref `dead_count − unique_count` (clamped at 0).
                  *
-                 * Defense-in-depth clamp at 0: by the snap_unique →
-                 * dead_S correspondence proof, unique_count ≤ dead_count
-                 * always. A deviation would mean a snap-tree record has
-                 * no matching dead-list entry — i.e. an upstream COW
-                 * path missed the snap-aware routing. Clamping to 0
-                 * preserves the safety (NEVER over-deref) at the cost
-                 * of an under-deref (a CAS-refcount leak), consistent
-                 * with the best-effort posture. */
+                 * The clamp is load-bearing: a snap_unique record dropped
+                 * past a full list has no entry here, or its entry sits on
+                 * a newer list. Clamping to 0 preserves the safety (NEVER
+                 * over-deref) at the cost of an under-deref (a CAS-refcount
+                 * leak), consistent with the best-effort posture. */
                 size_t ui = 0, dj = 0;
                 while (dj < n_dead_cold) {
                     const uint8_t *H = &dead_cold[dj * STM_EXTENT_HASH_LEN];
@@ -10804,13 +10801,11 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
  *
  * WHY NEWER SNAPS' DEAD-LISTS HOLD CASE-(a) ENTRIES (not just garbage)
  * — same shape as 4c-iii's target-side argument lifted one chain link:
- * impl-2's snap-aware COW free routes EVERY freed paddr/record to the
- * MOST-RECENT PRESENT snap regardless of whether THAT snap actually
- * references it. So when live (post-s-creation but pre-rollback) COW'd
- * a (ino, off) record whose old value is IN s.view, the freed
- * paddr/record landed in WHATEVER newer snap was most-recent at COW
- * time. After rollback, s.view ⇒ live again — the freed value is
- * resurrected. Its dead-list entry MUST NOT be reclaimed.
+ * a drop goes to the MOST-RECENT PRESENT snap that names it. So when
+ * live (post-s-creation but pre-rollback) COW'd a record whose old
+ * value is IN s.view and in a newer view too, the freed paddr/record
+ * landed on that newer snap. After rollback, s.view => live again -- the
+ * freed value is resurrected. Its dead-list entry MUST NOT be reclaimed.
  *
  * MECHANISM by tier:
  *
@@ -10826,12 +10821,12 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
  *   paddr NOT in s.view's set. Identical to 4c-iii's data-tier filter.
  *
  *   Cold tier — per-hash COUNTED subtraction `agg_cold(H) − snap_unique(H)`,
- *   clamped at 0. Why counted (NOT structural-merge): newer-snap
- *   cold dead-lists are streams of HASHES with no (ino, off) attached;
+ *   clamped at 0. Why counted (NOT record by record): newer-snap
+ *   cold dead-lists are streams of HASHES with nothing else attached;
  *   we can only filter at the hash level. The snap_unique(H) count
- *   ("records in s.view whose (ino, off) has different identity in
- *   OLD-live") is identical to 4c-iii's because the OLD-live tree is
- *   the same; the divergence shape is unchanged by the cascade.
+ *   ("records in s.view with no partner of their identity in OLD-live")
+ *   is identical to 4c-iii's because the OLD-live tree is the same; the
+ *   divergence shape is unchanged by the cascade.
  *
  * SAFETY of the cold-tier counted subtraction (R165 P3-1 — refined):
  * snap_unique[H] is the multiset of hashes whose drop fired the
@@ -10873,20 +10868,11 @@ static void fs_rollback_reclaim_cleared_dead_list_garbage(
  * REUSABLE → any later read of s_a's frozen tree decrypts with a stale
  * `(paddr, write_gen)` pair → AEAD verify fails → STM_ECORRUPT on
  * any access to s_a. No nonce REUSE (each (paddr, write_gen) is
- * still unique), but s_a is silently CORRUPTED. **Currently unreachable
- * in production at v2.0** — the only `stm_snapshot_delete` failure
- * modes are STM_EBUSY-on-hold (we pre-validate under fs->global EX, so
- * the hold can't appear between validate and delete) and
- * STM_EBUSY-on-clone (clones don't exist yet). Both gates are tight
- * enough that the failure path is unreachable for v2.0 callers.
- * **Forward-compat hazard** — when 9.7-impl-6 (clones) lands OR a new
- * `stm_snapshot_delete` failure mode is introduced, this window opens.
- * Proper fix at that point: either (a) extend the pre-validate to
- * enumerate every refusable precondition, OR (b) reorder so the
- * cascade-delete happens BEFORE 4b/4c/4c-ii (the spec-faithful order —
- * spec marks newer ABSENT first, then computes to_free against the
- * post-state). (b) is the architectural fix; (a) is the minimum gate.
- * Forward-noted to the impl-6 (clones) chunk.
+ * still unique), but s_a is silently CORRUPTED. Unreachable today: the
+ * only delete failures are STM_EBUSY on a hold or a clone, and the
+ * caller pre-validates both under fs->global EX. A new delete failure
+ * mode has to extend that pre-validate, or move the cascade before
+ * 4b/4c/4c-ii (the spec's order).
  *
  * AGGREGATION (cold tier only): newer snaps' cold dead-lists are
  * accumulated into a single agg_cold buffer (one realloc-growth pass),
@@ -10975,54 +10961,12 @@ static void fs_rollback_reclaim_newer_snap_cascade(
         }
     }
 
-    /* Compute snap_unique (multiset of hashes): walk SNAP cold in
-     * (ino, off) order, compare to OLD at same key by identity tuple
-     * (content_hash, gen, link_gen). Append hash to snap_unique iff
-     * NOT same logical record. Sort snap_unique by hash for the
-     * subtraction merge-walk below. Same algorithm as 4c-iii. */
+    /* snap_unique (multiset of hashes): the view's records the old tree no longer
+     * holds, as in 4c-iii. On ENOMEM drop the cold tier wholesale (best-effort). */
     uint8_t *snap_unique = NULL;
     size_t   n_snap_unique = 0;
-    if (cold_ok && snap_cold.n > 0) {
-        snap_unique = malloc(snap_cold.n * STM_EXTENT_HASH_LEN);
-    }
-    if (cold_ok && (snap_cold.n == 0 || snap_unique != NULL)) {
-        size_t oi = 0;
-        for (size_t si = 0; si < snap_cold.n; si++) {
-            const stm_extent_cold_ref *sr = &snap_cold.v[si];
-            while (oi < old_cold.n) {
-                const stm_extent_cold_ref *ro = &old_cold.v[oi];
-                if (ro->ino < sr->ino
-                    || (ro->ino == sr->ino && ro->off < sr->off)) {
-                    oi++;
-                } else {
-                    break;
-                }
-            }
-            bool same_logical = false;
-            if (oi < old_cold.n) {
-                const stm_extent_cold_ref *ro = &old_cold.v[oi];
-                if (ro->ino == sr->ino && ro->off == sr->off
-                    && ro->link_gen == sr->link_gen
-                    && ro->gen      == sr->gen
-                    && memcmp(ro->content_hash, sr->content_hash,
-                               STM_EXTENT_HASH_LEN) == 0) {
-                    same_logical = true;
-                }
-            }
-            if (!same_logical) {
-                memcpy(&snap_unique[n_snap_unique * STM_EXTENT_HASH_LEN],
-                        sr->content_hash, STM_EXTENT_HASH_LEN);
-                n_snap_unique++;
-            }
-        }
-        if (n_snap_unique > 1) {
-            qsort(snap_unique, n_snap_unique,
-                  STM_EXTENT_HASH_LEN, fs_rb_hash_cmp_raw);
-        }
-    } else if (cold_ok && snap_unique == NULL && snap_cold.n > 0) {
-        /* malloc failure — drop the cold tier wholesale (best-effort). */
+    if (cold_ok && !fs_rb_cold_minus(&snap_cold, &old_cold, &snap_unique, &n_snap_unique))
         cold_ok = false;
-    }
 
     /* ---------- Aggregate cold-dead across the cascade ---------------- */
     /* Grows via realloc-doubling; the per-snap reclaim still copies each
@@ -11046,7 +10990,7 @@ static void fs_rollback_reclaim_newer_snap_cascade(
         uint64_t *freed_boot   = NULL;
         size_t    freed_boot_n = 0;
 
-        stm_status del = stm_snapshot_delete(sidx, sid,
+        stm_status del = stm_snapshot_delete_past_rollback(sidx, sid,
                                                 &freed_paddrs, &freed_n,
                                                 &cold_hashes, &cold_n,
                                                 &freed_boot, &freed_boot_n);
@@ -11063,11 +11007,10 @@ static void fs_rollback_reclaim_newer_snap_cascade(
 
         /* Boot tier (engine NODE paddrs / stm_bootstrap_free): filter
          * vs s.view's bootstrap paddr set. */
-        if (boot_ok) {
+        if (boot_ok && !stm_snapshot_index_boot_lists_unverified(sidx)) {
             for (size_t j = 0; j < freed_boot_n; j++) {
                 uint64_t p = freed_boot[j];
-                if (bsearch(&p, snap_nodes.v, snap_nodes.n,
-                            sizeof p, fs_rb_paddr_cmp) != NULL)
+                if (fs_rb_paddr_has(&snap_nodes, p))
                     continue;   /* case-(a): paddr is in s.view; resurrects */
                 uint16_t did = stm_paddr_device(p);
                 stm_alloc *a = stm_sync_alloc(fs->sync, did);
@@ -11078,16 +11021,15 @@ static void fs_rollback_reclaim_newer_snap_cascade(
                         STM_BOOTSTRAP_NODE_BLOCKS, free_gen);
             }
         }
-        /* Else: walk failed; can't filter safely → leak the entire
-         * snap's boot dead-list. Space cost, not corruption. */
+        /* Else: walk failed, or the mount could not check its lists: leak
+         * the entire snap's boot dead-list. Space cost, not corruption. */
 
         /* Data tier (HOT-extent replicas / stm_alloc_free): filter vs
          * s.view's data paddr set. */
         if (data_ok) {
             for (size_t j = 0; j < freed_n; j++) {
                 uint64_t p = freed_paddrs[j];
-                if (bsearch(&p, snap_data.v, snap_data.n,
-                            sizeof p, fs_rb_paddr_cmp) != NULL)
+                if (fs_rb_paddr_has(&snap_data, p))
                     continue;   /* case-(a): paddr in s.view; resurrects */
                 uint16_t did = stm_paddr_device(p);
                 stm_alloc *a = stm_sync_alloc(fs->sync, did);
@@ -11162,12 +11104,9 @@ static void fs_rollback_reclaim_newer_snap_cascade(
             qsort(agg_cold, n_agg_cold,
                   STM_EXTENT_HASH_LEN, fs_rb_hash_cmp_raw);
         }
-        /* Merge-walk by hash run — identical algorithm to 4c-iii.
-         * Defense-in-depth clamp at 0 — counted subtraction is safe HERE
-         * (every snap_unique record has at least one matching agg_cold
-         * entry from its drop event, so `unique_count ≤ dead_count`
-         * always holds per hash). The clamp guards against a future
-         * upstream bug that would otherwise over-deref. */
+        /* Merge-walk by hash run -- identical algorithm to 4c-iii. The
+         * clamp at 0 is load-bearing: a snap_unique record dropped past a
+         * full list has no entry, or its entry sat on the target's list. */
         size_t ui = 0, dj = 0;
         while (dj < n_agg_cold) {
             const uint8_t *H = &agg_cold[dj * STM_EXTENT_HASH_LEN];
@@ -11262,11 +11201,12 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * post-snapshot live tree is discarded.
      *
      * Step order is LOAD-BEARING (R160 P1-1): every refusal — the
-     * newer-snapshot gate and the snapshot-triple VALIDATION — runs
-     * BEFORE the destructive dirty-buffer drain. A refused rollback is
+     * newer-snapshot gate, the snapshot-triple VALIDATION and the view's
+     * data blocks -- runs BEFORE the destructive dirty-buffer drain. A
+     * refused rollback is
      * therefore a true no-op: no buffered write is touched. Only after
-     * validation passes does drain → swap → commit run; a failure past
-     * the drain is crash-equivalent and wedges (R154 Q2). Validating
+     * validation passes does drain -> commit -> swap -> commit run; a failed
+     * commit is crash-equivalent and wedges (R154 Q2). Validating
      * after the drain would be silent data loss disguised as a clean
      * refusal — the drain pops buffered writes into the engine in-memory
      * tree, which the swap then destroys.
@@ -11363,16 +11303,6 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
-    /* 9.7-impl-4b: capture the pre-rollback live root triple BEFORE the
-     * swap below overwrites the dataset slot — it is the source tree of
-     * the metadata-node divergence walk. A lookup miss here only
-     * disables reclamation (the leak is nonce-safe — see
-     * fs_rollback_reclaim_diverged_nodes); the authoritative dataset-
-     * presence refusal is set_engine_root's, below. */
-    stm_dataset_entry de_old;
-    bool have_old_root =
-        (stm_dataset_lookup(didx, dataset_id, &de_old) == STM_OK);
-
     /* VALIDATE the snapshot's captured triple — BEFORE any destructive
      * step (R160 P1-1). impl-3 stores the triple OPAQUELY (faithful-
      * transport posture); this is the first chunk that interprets it.
@@ -11395,6 +11325,19 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         return s;
     }
 
+    fs_rb_paddr_set view_data = {0};
+    stm_extent_index *eidx_view = stm_sync_extent_index(fs->sync);
+    if (eidx_view) {
+        s = fs_rollback_collect_view_data(fs, eidx_view, dataset_id,
+                                          entry.tree_root_paddr, entry.root_gen,
+                                          entry.root_csum, &view_data);
+        if (s != STM_OK) {
+            free(newer_ids);
+            pthread_rwlock_unlock(&fs->global);
+            return s;
+        }
+    }
+
     /* R128 P2-3 carry: drain every dirty buffer before touching the
      * metadata tree. The post-snapshot buffered writes are exactly what
      * the rollback discards; draining empties the buffer so no stale
@@ -11405,21 +11348,54 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     {
         stm_status fr = fs_flush_all_locked(fs);
         if (fr != STM_OK) {
+            free(view_data.v);
             free(newer_ids);
             pthread_rwlock_unlock(&fs->global);
             return fr;
         }
     }
 
+    /* Every drop so far is paid for: on a list, or freed. The walks below read the
+     * old tree as "what is still held", so it has to be the tree after those drops,
+     * and only a commit makes it one: read from the last committed root, a record
+     * dropped since is still there, and the walks pay for it again, or count the
+     * view's own record as the one that lived. R154 Q2: a failed commit is
+     * crash-equivalent, wedge. A refusal below leaves only this: what was written
+     * is durable, as if the caller had committed. */
+    {
+        stm_status cr = stm_sync_commit(fs->sync);
+        if (cr != STM_OK) {
+            free(view_data.v);
+            free(newer_ids);
+            fs_mark_wedged_locked(fs);
+            pthread_rwlock_unlock(&fs->global);
+            return cr;
+        }
+    }
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->rollback_committed_hook)
+        fs->rollback_committed_hook(fs->rollback_committed_hook_arg);
+#endif
+
+    /* 9.7-impl-4b: capture the pre-rollback live root triple BEFORE the
+     * swap below overwrites the dataset slot -- it is the source tree of
+     * the metadata-node divergence walk. A lookup miss here only
+     * disables reclamation (the leak is nonce-safe -- see
+     * fs_rollback_reclaim_diverged_nodes); the authoritative dataset-
+     * presence refusal is set_engine_root's, below. */
+    stm_dataset_entry de_old;
+    bool have_old_root =
+        (stm_dataset_lookup(didx, dataset_id, &de_old) == STM_OK);
+
     /* The tree the swap below discards issued every si_gen and si_cvers a
      * live fid or Larder entry may still hold, and the rolled-back tree
      * knows none of them: raise the dataset's floors past them while the
      * tree is still here, so no reuse or content bump after the rollback
-     * issues one again. A refusal here is no more destructive than
-     * set_engine_root's below (the drain is non-durable). */
+     * issues one again. */
     s = stm_inode_dsstate_raise_floors(stm_sync_inode_index(fs->sync),
                                        dataset_id);
     if (s != STM_OK) {
+        free(view_data.v);
         free(newer_ids);
         pthread_rwlock_unlock(&fs->global);
         return s;
@@ -11439,9 +11415,8 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     if (s != STM_OK) {
         /* set_engine_root fails here only with STM_ENOENT (the dataset
          * is not PRESENT) — and it refuses as a clean no-op (it bails
-         * before mutating the slot). The drain above is non-durable
-         * (buffered writes sit in engine in-memory trees, recoverable by
-         * the next commit), so this is not crash-equivalent — no wedge. */
+         * before mutating the slot). No wedge: the tree is as committed. */
+        free(view_data.v);
         free(newer_ids);
         pthread_rwlock_unlock(&fs->global);
         return s;
@@ -11452,6 +11427,15 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * rolled-back tree (9.8-BE chunk 9b; the Area-S F1 closure). Runs
      * under fs->global EX, so no alloc races the invalidation. */
     stm_inode_dsstate_invalidate(stm_sync_inode_index(fs->sync), dataset_id);
+
+    s = fs_rollback_set_view_counts(fs, &view_data);
+    if (s != STM_OK) {
+        free(view_data.v);
+        free(newer_ids);
+        fs_mark_wedged_locked(fs);
+        pthread_rwlock_unlock(&fs->global);
+        return s;
+    }
 
     /* Reclaim the post-snapshot divergence — blocks reachable from the
      * pre-rollback live tree but not from the snapshot's frozen tree.
@@ -11495,7 +11479,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
         if (eidx) {
             fs_rollback_reclaim_diverged_extents(fs, eidx, dataset_id,
                 de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
-                entry.tree_root_paddr, entry.root_gen, entry.root_csum);
+                &view_data);
 
             /* 9.7-impl-4c-ii: the COLD-extent (CAS) tier — release the
              * CAS refcount of every cold record reachable from the old
@@ -11523,6 +11507,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
                 de_old.di_tree_root, de_old.di_root_gen, de_old.di_root_csum,
                 entry.tree_root_paddr, entry.root_gen, entry.root_csum);
     }
+    free(view_data.v);
 
     /* Clear the target snapshot's dead-lists. MOVED here from
      * pre-reclaim (impl-4 original position) at 9.7-impl-4c-iii: the
@@ -11557,8 +11542,9 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
     /* 9.7-impl-4d: newer-snapshot CASCADE. With the target's tier 4b/4c/
      * 4c-ii/4c-iii reclaim + clear_dead_lists already done, iterate the
      * newer-than-target PRESENT snapshots collected earlier. Each is
-     * deleted via stm_snapshot_delete; its three dead-lists are filtered
-     * by `\ s_view` (boot/data set-difference; cold per-hash counted
+     * deleted via stm_snapshot_delete_past_rollback, whose lists come here
+     * and do not move to the older neighbour; its three dead-lists are
+     * filtered by `\ s_view` (boot/data set-difference; cold per-hash counted
      * subtraction against snap_unique) and survivors reclaimed. Best-
      * effort per snap — a fail on one snap leaves the others reclaimed.
      * Runs BEFORE the commit so every per-snap delete + every reclaim
@@ -11587,7 +11573,7 @@ stm_status stm_fs_rollback_snapshot(stm_fs *fs, uint64_t dataset_id,
      * (paddr, write_gen) pair stays fresh even though the snapshot's
      * older paddrs are live again. (The v1 R9-1 "bump fs->gen before the
      * allocator swap" doctrine: v2's rollback does NOT roll back the
-     * allocator — diverged blocks leak rather than free — so there is no
+     * allocator, it frees the divergence block by block, so there is no
      * allocator swap to bump before; the commit's gen advance subsumes
      * it.)
      *
@@ -12633,6 +12619,8 @@ stm_status stm_fs_stats_get(const stm_fs *fs, stm_fs_stats *out)
      * in stm_fs_mark_wedged + the EX-held flips in unmount paths. */
     out->read_only = atomic_load_explicit(&fs->read_only, memory_order_acquire);
     out->wedged    = atomic_load_explicit(&fs->wedged, memory_order_acquire);
+    stm_snapshot_index *lists_idx = stm_sync_snapshot_index(fs->sync);
+    out->lists_unverified = lists_idx && stm_snapshot_index_boot_lists_unverified(lists_idx);
 
     return STM_OK;
 }

@@ -129,24 +129,19 @@
  * `snapshot.extent_txg`, the value of `sync.current_gen` captured at
  * SnapshotCreate. Since `extent.gen` is also stamped from
  * `sync.current_gen` at write time, the filter
- * `from.extent_txg < extent.gen <= to.extent_txg` is authoritative —
+ * `from.extent_txg <= extent.link_gen < to.extent_txg` is authoritative --
  * it sits in the same counter space as the values it filters.
  * The earlier `created_txg`-based filter was best-effort (different
  * counter space); P7-8 closed that gap (format break v13 → v14;
  * `snapshot.tla::ExtentTxgBoundedBySync`).
  *
- * Operational requirement: for the filter to be EXACT (no extents at
- * gen == snap.extent_txg falling on the wrong side of the boundary),
- * the caller MUST `stm_sync_commit` immediately after every
- * `stm_snapshot_create` so that subsequent extent writes happen at
- * `sync.current_gen` strictly greater than the snap's captured
- * `extent_txg`. Without this, multiple writes can share a sync_gen
- * with a snap-create — the filter then conservatively classifies
- * such ambiguous extents as pre-snap. ZFS's TXG model handles this
- * via implicit commit-on-snap; we track it as a documented protocol
- * obligation rather than an internal commit (avoids surprise I/O
- * inside `stm_snapshot_create`). Tests in `test_send_recv.c` exhibit
- * the bracketed pattern: `commit → snap_create → commit`.
+ * stm_fs_create_snapshot commits and then reads current_gen, so its
+ * view is strictly below extent_txg and the first write after it lands
+ * on extent_txg, inside the next stream. A direct `stm_snapshot_create`
+ * must commit first to hold to this.
+ *
+ * With a to_snap_id the stream comes from that snapshot's captured
+ * tree, not the live one, so what was overwritten since is still sent.
  *
  * MVP caveat — stale-paddr during long sends (R39 P3-1): send_init
  * snapshots `paddrs[0..n_replicas-1]` at the time of the call. If
@@ -310,13 +305,13 @@ typedef struct stm_send_handle stm_send_handle;
  *   - dataset_id: the source dataset to send.
  *   - from_snap_id: 0 means "full send" (every extent in the dataset's
  *                    current state). Non-zero means "incremental from
- *                    that snapshot": only extents with gen >
+ *                    that snapshot": only extents with link_gen >=
  *                    from_snap.extent_txg are included (P7-8;
  *                    `extent_txg` is in the same counter space as
  *                    `extent.gen`, unlike the prior `created_txg`).
  *   - to_snap_id: 0 means "current state" (no upper bound). Non-zero
- *                  means "up to this snapshot": only extents with
- *                  gen ≤ to_snap.extent_txg are included.
+ *                  means "up to this snapshot": the extents of its
+ *                  captured tree, link_gen < to_snap.extent_txg.
  *
  * Returns:
  *   STM_OK on success; *out_handle is the opaque handle.

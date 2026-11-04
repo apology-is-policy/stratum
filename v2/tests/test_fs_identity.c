@@ -1755,6 +1755,25 @@ static void *scrub_walk_rollback(void *a_)
     return NULL;
 }
 
+/* A rollback takes the extent lock to read the view and to commit, so a walk it can
+ * retire an engine under is one that starts after its first commit. */
+typedef struct {
+    scrub_walk_gate *g;
+    scrub_walk_arg  *wa;
+    pthread_t        wt;
+    bool             started;
+} scrub_walk_late;
+
+static void scrub_walk_start_late(void *arg)
+{
+    scrub_walk_late *l = arg;
+    if (pthread_create(&l->wt, NULL, scrub_walk_lookup, l->wa) != 0) return;
+    l->started = true;
+    pthread_mutex_lock(&l->g->mu);
+    while (!l->g->paused) pthread_cond_wait(&l->g->cv, &l->g->mu);
+    pthread_mutex_unlock(&l->g->mu);
+}
+
 STM_TEST(fs_scrub_extent_walk_keeps_a_retired_engine_alive) {
     uint64_t dir = 0;
     stm_fs *fs = reuse_fs("scrub_walk_retire", &dir);
@@ -1787,11 +1806,8 @@ STM_TEST(fs_scrub_extent_walk_keeps_a_retired_engine_alive) {
     stm_extent_set_paddr_walk_hook_for_test(scrub_walk_park, &g);
 
     scrub_walk_arg wa = { .fs = fs, .rc = STM_EINVAL };
-    pthread_t wt;
-    STM_ASSERT_EQ(pthread_create(&wt, NULL, scrub_walk_lookup, &wa), 0);
-    pthread_mutex_lock(&g.mu);
-    while (!g.paused) pthread_cond_wait(&g.cv, &g.mu);
-    pthread_mutex_unlock(&g.mu);
+    scrub_walk_late late = { .g = &g, .wa = &wa, .started = false };
+    stm_fs_set_rollback_committed_hook_for_test(fs, scrub_walk_start_late, &late);
 
     scrub_walk_arg ra = { .fs = fs, .snap = snap, .rc = STM_EINVAL };
     pthread_t rt;
@@ -1800,6 +1816,7 @@ STM_TEST(fs_scrub_extent_walk_keeps_a_retired_engine_alive) {
      * the walk is inside. */
     for (int i = 0; i < 10000 && !atomic_load(&g.retired); i++) usleep(1000);
     STM_ASSERT_TRUE(atomic_load(&g.retired));
+    STM_ASSERT_TRUE(late.started);
     /* Readers' dcache inserts advance EBR; stand in for them. */
     for (int i = 0; i < 200; i++) {
         (void)stm_ebr_try_advance();
@@ -1816,8 +1833,9 @@ STM_TEST(fs_scrub_extent_walk_keeps_a_retired_engine_alive) {
     g.resume = true;
     pthread_cond_broadcast(&g.cv);
     pthread_mutex_unlock(&g.mu);
-    pthread_join(wt, NULL);
+    pthread_join(late.wt, NULL);
     pthread_join(rt, NULL);
+    stm_fs_set_rollback_committed_hook_for_test(fs, NULL, NULL);
     stm_extent_set_paddr_walk_hook_for_test(NULL, NULL);
     STM_ASSERT_ERR(wa.rc, STM_ENOENT);
     STM_ASSERT_OK(ra.rc);

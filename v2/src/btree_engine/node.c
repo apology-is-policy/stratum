@@ -740,7 +740,7 @@ stm_status eng_leaf_remove(eng_node *n, uint32_t idx, paddr_vec *orphan_sink)
     /* Infallible from here. */
     if (has_chain) {
         for (uint32_t j = 0; j < sp->n_blocks; j++)
-            (void)paddr_vec_push(orphan_sink, sp->blocks[j]);   /* reserved */
+            (void)paddr_vec_push(orphan_sink, sp->blocks[j], sp->head_gen);   /* reserved */
     }
     free(e->key);
     free(e->val);

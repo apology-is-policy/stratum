@@ -359,6 +359,9 @@ stm_status stm_extent_write(stm_extent_index *idx,
  *     STM_EINVAL.
  *
  * On success:
+ *   - *out_dropped_gens, where a variant takes it and it is not NULL, receives
+ *     a malloc'd array parallel to the paddrs: each block's birth gen, which a
+ *     snapshot's routing needs (stm_snapshot_index_born_after).
  *   - *out_dropped_paddrs receives a malloc'd array of every paddr
  *     in every dropped extent's replica set, flattened (caller owns;
  *     MUST `free()`). Caller MUST route each via
@@ -416,7 +419,8 @@ stm_status stm_extent_overwrite_pieces(stm_extent_index *idx,
                                          size_t n,
                                          uint64_t write_gen, uint64_t key_id,
                                          uint64_t **out_dropped_paddrs,
-                                         size_t *out_n_dropped);
+                                         size_t *out_n_dropped,
+                                         uint64_t **out_dropped_gens);
 
 /*
  * Truncate (ds, ino) to `new_size` bytes: drop every live extent
@@ -490,7 +494,8 @@ stm_status stm_extent_punch_range(stm_extent_index *idx,
                                        uint64_t dataset_id, uint64_t ino,
                                        uint64_t off, uint64_t len,
                                        uint64_t **out_dropped_paddrs,
-                                       size_t *out_n_dropped_paddrs);
+                                       size_t *out_n_dropped_paddrs,
+                                       uint64_t **out_dropped_gens);
 
 /*
  * P8-POSIX-7b: shift every extent at (ds, ino) whose off >= cutoff
@@ -569,7 +574,8 @@ stm_status stm_extent_truncate_into(stm_extent_index *idx,
                                        uint64_t new_size,
                                        size_t *drop_idx_buf, size_t drop_idx_cap,
                                        uint64_t *paddrs_buf, size_t paddrs_cap,
-                                       size_t *out_n_dropped);
+                                       size_t *out_n_dropped,
+                                       uint64_t *gens_buf);
 
 /*
  * Drop every live extent for (ds, ino). Used on file unlink.
@@ -987,7 +993,8 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
         uint64_t key_id,
         uint64_t link_gen,
         uint64_t **out_dropped_paddrs,
-        size_t *out_n_dropped_paddrs);
+        size_t *out_n_dropped_paddrs,
+        uint64_t **out_dropped_gens);
 
 /*
  * Look up the live extent of (ds, ino) covering byte offset `off`.
@@ -1099,6 +1106,16 @@ stm_status stm_extent_iter(const stm_extent_index *idx,
 STM_MUST_USE
 stm_status stm_extent_iter_ds(const stm_extent_index *idx,
                                  uint64_t dataset_id,
+                                 stm_extent_iter_cb cb, void *ctx);
+
+/*
+ * The same over a captured tree: what a snapshot's view holds, however the live
+ * tree has moved on since. The triple is opened on a throwaway engine.
+ */
+STM_MUST_USE
+stm_status stm_extent_iter_ds_at(stm_extent_index *idx, uint64_t dataset_id,
+                                 uint64_t root_paddr, uint64_t root_gen,
+                                 const uint8_t root_csum[32],
                                  stm_extent_iter_cb cb, void *ctx);
 
 /*

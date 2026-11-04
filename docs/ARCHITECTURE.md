@@ -2611,6 +2611,16 @@ This is ZFS's dead-list algorithm. O(blocks freed during S's lifetime) to delete
 
 Incremental maintenance cost: small per-COW-event. Dead-list entries are compact (paddr + length + birth_txg).
 
+**As built (v2).** List entries carry a paddr and no birth, and each list is capped at 256 entries per tier. Three things follow.
+
+- A drop compares the record's birth gen against the most recent snapshot's capture. A block born after it is in no view: it is freed and spends no entry. This is the rule above.
+- Past a cap, what a snapshot may still name stays allocated with no entry, counted in RAM. It is never refused, since a buffered write's drain has already answered its write(), and never freed, which would lose the snapshot.
+- A delete cannot apply the rule above without a birth on each entry. With an older PRESENT snapshot, S's lists all move to it and nothing is freed; the oldest snapshot's delete frees what it holds.
+
+A rollback commits after its drain and before anything else: its walks read the old tree as what is still held, which only the tree after every drop can answer. After the swap a block's count is how many of the view's records name it. An incremental send's window is `from.extent_txg <= link_gen < to.extent_txg`, since a gen equal to a capture is after it, and a stream to a snapshot reads that snapshot's tree.
+
+What a deleted snapshot retained past a cap stays allocated with nothing naming it: a space leak, until a reclaim for it exists. A clone's drop of a block its origin's lineage owns makes no entry and takes no count, since the clone inherited the record and no count of its block (`phase-9.7-design.md` section 9.1.2).
+
 #### 8.5.6 Snapshot holds
 
 Users or operations can "hold" a snapshot to prevent accidental deletion:
