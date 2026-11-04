@@ -52,6 +52,9 @@ set_property(CACHE STM_AEAD_DEFAULT PROPERTY STRINGS aegis256 xchacha20-siv auto
 # ---------------------------------------------------------------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(STM_PLATFORM_LINUX TRUE)
+    # These archives name each other, and GNU ld reads each archive once.
+    set(CMAKE_C_LINK_EXECUTABLE
+        "<CMAKE_C_COMPILER> <FLAGS> <CMAKE_C_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> -Wl,--start-group <LINK_LIBRARIES> -Wl,--end-group")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(STM_PLATFORM_DARWIN TRUE)
 elseif(CMAKE_C_COMPILER_TARGET STREQUAL "aarch64-thylacine")

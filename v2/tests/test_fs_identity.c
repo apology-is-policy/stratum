@@ -44,6 +44,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#undef si_uid   /* glibc defines it as a siginfo member path; here it names an inode field */
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
