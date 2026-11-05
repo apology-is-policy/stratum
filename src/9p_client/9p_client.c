@@ -780,6 +780,7 @@ stm_status stm_9p_write(stm_9p_client *c, uint32_t fid, uint64_t offset,
      * keep the caller's request as-is so the server can apply
      * its tail-pad logic (the only legitimate sub-block write
      * is the file's logical end). */
+    uint32_t asked = count;
     bool caller_aligned = (count != 0u) && ((count % BLK) == 0u);
     if (caller_aligned) {
         if (count > aligned_max) count = aligned_max;
@@ -788,6 +789,9 @@ stm_status stm_9p_write(stm_9p_client *c, uint32_t fid, uint64_t offset,
     }
     /* (else: caller passed an unaligned count that fits — pass
      * through; the server pads + records logical len.) */
+    /* At the smallest message size no whole block fits, and a piece of one
+     * would land unaligned in the middle of a file. */
+    if (asked != 0u && count == 0u) return STM_ERANGE;
 
     uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 8u + 4u + count;
     if (msg_size > c->buf_cap) return STM_ERANGE;

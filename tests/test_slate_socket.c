@@ -1882,6 +1882,42 @@ static uint32_t editor_content_now(stm_9p_client *c, uint8_t *buf, uint32_t cap)
     return got;
 }
 
+/* At the smallest message this client accepts, no whole block fits. Writing one is refused here, not sent with
+ * a count of zero, and what does fit still goes. */
+STM_TEST(slate_socket_no_block_fits_the_smallest_message)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_small");
+    slate_fixture f;
+    setup_fixture(&f, "fg_small");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    opts.msize = STM_9P_MSIZE_MIN;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+    STM_ASSERT_EQ(stm_9p_msize(c), STM_9P_MSIZE_MIN);
+
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+
+    static uint8_t block[8192];
+    uint32_t written = 99u;
+    STM_ASSERT_ERR(stm_9p_write(c, 101u, 0u, block, sizeof block, &written), STM_ERANGE);
+    uint32_t len = (uint32_t)strlen(be.sock_path);
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path, len, &written));
+    STM_ASSERT_EQ(written, len);
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
 /* Asked for what iounit offers, a client must still send a frame the server takes. iounit is sized for
  * Tread, and the slate's messages are smaller than this client's buffer. Over the limit, the server
  * drops the connection, and in the manager that ended the session and lost the edit. */
