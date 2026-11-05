@@ -185,11 +185,11 @@ def main():
 
         # A client that asks and never reads: its replies fill both sockets, and the daemon's
         # write blocks with a request in hand. --idle-timeout 0 is how the manager runs it.
-        for workers in (1, 4):
-            what = '9P client not reading, %d worker%s' % (workers, '' if workers == 1 else 's')
+        for workers, (name, attr) in ((w, l) for w in (1, 4) for l in (('9P', 'fs_sock'), ('/ctl/', 'ctl_sock'))):
+            what = '%s client not reading, %d worker%s' % (name, workers, '' if workers == 1 else 's')
             daemon = Daemon(binary, work, workers, ('--idle-timeout', '0'))
             sock = socket.socket(socket.AF_UNIX)
-            sock.connect(daemon.fs_sock)
+            sock.connect(getattr(daemon, attr))
             sock.setblocking(False)
             frames = tversion() * 4096
             off, stalls = 0, 0
@@ -209,11 +209,12 @@ def main():
                 sock.close()
                 daemon.kill()
                 continue
+            alive = daemon.proc.poll() is None
             rc, took = daemon.stop_timed()
-            if rc == 0:
+            if rc == 0 and alive:
                 ok('%s: stopped in %.2f s' % (what, took))
             else:
-                no('%s: rc=%s after %.2f s' % (what, rc, took))
+                no('%s: rc=%s after %.2f s, running before the stop: %s' % (what, rc, took, alive))
             daemon.kill()
             sock.close()
 

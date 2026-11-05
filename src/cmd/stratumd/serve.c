@@ -565,10 +565,11 @@ typedef struct {
  * BEFORE spawning (so the count is never transiently under), the
  * worker decrements + broadcasts at exit, and stm_stratumd_run waits
  * for zero after the accept loop exits, BEFORE ctl/scrub/fs teardown.
- * The wait has no deadline of its own: stratumd_conns_stop_reading runs
- * first, so each worker ends at its next read, after answering the
- * request in hand. Only a request that is itself slow can lengthen the
- * wait, since a stop finishes in-flight work rather than corrupting it.
+ * stratumd_conns_stop_reading runs first, so each worker ends at its
+ * next read, after answering the request in hand. A reply blocked on a
+ * client that is not reading would hold the wait for ever, so after
+ * STRATUMD_STOP_GRACE_MS the writing side ends too and that reply is cut
+ * off; a stop still finishes in-flight work rather than corrupting it.
  * /ctl/ workers get the same count, because stm_ctl's own count starts
  * only once a worker is running, which leaves a connection accepted just
  * before a stop to reach an stm_ctl already freed. Module-static (one
@@ -681,12 +682,13 @@ static void stratumd_conns_stop_reading(void)
 }
 
 /* Past the grace the writing side ends too, which wakes a write blocked on a client
- * that is not reading. */
+ * that is not reading. SHUT_WR, not SHUT_RDWR: the reading side is already shut,
+ * and macOS answers a second shutdown naming it with ENOTCONN and wakes nothing. */
 static void stratumd_conns_end(void)
 {
     pthread_mutex_lock(&g_conns_mu);
     for (stratumd_conn *c = g_conns; c; c = c->next)
-        (void)shutdown(c->dup_fd, SHUT_RDWR);
+        (void)shutdown(c->dup_fd, SHUT_WR);
     pthread_mutex_unlock(&g_conns_mu);
 }
 
@@ -1324,6 +1326,8 @@ static void stratumd_stop_ctl(int ctl_fd, pthread_t ctl_tid)
     (void)shutdown(ctl_fd, SHUT_RDWR);
     (void)pthread_join(ctl_tid, NULL);
     stratumd_conns_stop_reading();
+    if (!inflight_drain_within(&g_ctl_inflight, STRATUMD_STOP_GRACE_MS))
+        stratumd_conns_end();
     inflight_drain(&g_ctl_inflight);
 }
 
