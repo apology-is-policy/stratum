@@ -523,7 +523,7 @@ than `Tfadvise`.
 
 **How encryption and dedup coexist.** This is a real difference from peers: ZFS allows dedup only within a dataset, its snapshots and its clones, and its dedup tables are
 plaintext; bcachefs and APFS have no dedup. Stratum dedups across datasets with the hashes hidden from a disk reader. **The price is that migrating a dataset to cold removes
-the DEK from reads**, so a holder of the pool key can read it. *By reading*, whether a locked dataset's cold extents remain readable has not been established.
+the DEK from reads**, so a holder of the pool key can read it. *By reading*, a locked dataset's cold extents remain readable, since they decrypt under the pool key with no check of the lock.
 
 **Recorded ratios:** see section 17.
 
@@ -540,6 +540,8 @@ Reflink shares hot extents through the allocator's refcount and cold ones throug
 | atime | Effectively `noatime`; set at create and by `utimens` |
 | `st_blocks` | Synthetic, `(size + 511) / 512`, so `du` reports logical size |
 | Sparse files | Supported; no `SEEK_HOLE` or `SEEK_DATA` |
+| `O_APPEND` | *By reading*, **not atomic**: the server reads the size and then writes there, so two appenders overwrite each other |
+| Unlink while open | **I/O on the fid fails with `ENOENT`**, by design in `fid.tla`. POSIX keeps the file until the last close. Seen on a Thylacine guest |
 | mmap | None at this layer; a client maps through its own cache |
 | Read-only flags | `IMMUTABLE`, `APPEND`, `NODUMP` are defined and unused |
 
@@ -671,6 +673,10 @@ the metadata fragmentation of section 7, the commit's whole-allocator rewrite, a
 All are tracked. Those marked *by reading* have not been reproduced yet.
 
 - CI red, as in section 15.
+- *By reading:* on Linux, the io_uring completion queue is drained by every waiting thread with no lock.
+- *By reading:* a full metadata pool wedges at commit, since nothing on the write path counts node space.
+- *By reading:* snapshot create answers OK before the snapshot is durable.
+- `O_APPEND` and unlink while open, as in section 12.
 - *By reading:* rename of a directory into its own subtree detaches it into an unreachable cycle.
 - *By reading:* a scrub started on a running daemon reports RUNNING and verifies nothing, since nothing steps it. When driven, it verifies hot extents only and counts everything else as verified.
 - *By reading:* a device replace moves bytes without rewriting extent addresses (library only).

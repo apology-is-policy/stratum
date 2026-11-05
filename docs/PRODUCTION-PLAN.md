@@ -51,11 +51,13 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 
 | # | Item | Evidence | Status |
 |---|---|---|---|
-| T0.3 | Dataset 105 or so: create succeeds, then every later commit fails, because the key schema is one leaf | Read | Goes with T2.1 |
+| T0.3 | Dataset 105 or so: create succeeds, and the next commit fails and wedges the pool, because the key schema is one leaf | Read | Goes with T2.1 |
 | T0.4 | 9.39M allocator ranges on a device: commit fails and the pool wedges | Read | Goes with T2.1 |
 | T0.5 | A write's reclaim follows a failed flush into a wedge, where a commit on the same state answers the error and stays up | Read | Open |
 | T0.6 | Any failed commit wedges until remount, including failures that are only lack of room | Read | Open; see T3.11 |
 | T0.7 | Free metadata space fragments, and writers stop with a quarter of it free. So far a Python model only | Analysis; real-pool run queued | Goes with T2.1 |
+| T0.25 | A full metadata pool wedges at commit. Nothing on the write path counts node space, so it admits writes that no commit can store | Read | Open; T3.11 for the refusal, T2.4 for the room |
+| T0.26 | Snapshot create answers OK before the snapshot is durable: its slot is made after the commit and no commit follows, so a crash loses a snapshot reported as made | Read | Open |
 
 ### Things that do not do what they say
 
@@ -75,13 +77,16 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 | T0.19 | Silent 9P qid collision past 2^32 inodes | Read | Open |
 | T0.20 | Device replace moves bytes without rewriting extent addresses (library only) | Read | Open |
 | T0.21 | `/events` drops past 8 MiB without saying so | Read | Open |
+| T0.27 | **`O_APPEND` is not atomic.** The 9P server reads the size and then writes there, so two appenders overwrite each other. The code's own comment says so | Read | Open |
+| T0.28 | **Deleting an open file loses it.** I/O on an unlinked fid answers ENOENT, by design in `fid.tla`. POSIX keeps the file until the last close, and real software relies on that, including scratch files in SQLite and Python. Seen on a Thylacine guest, where `tmpfile()` has a workaround | Seen | Needs a decision. Recommended: keep the inode until the last clunk, on the orphan state anonymous inodes already have, and free it at mount after a crash |
+| T0.29 | **Linux: the io_uring completion queue is drained by every waiting thread with no lock,** and `AUTO` picks io_uring wherever it is built. A completion can be taken twice or dispatched to the wrong thread. It may explain some of the Linux reds in T1.1, which is a hypothesis | Read | Open |
 
 ### Security to establish, then decide
 
 | # | Item | Evidence | Status |
 |---|---|---|---|
-| T0.22 | Whether a locked dataset's cold extents can still be read | Read, unresolved | Open |
-| T0.23 | The 9P server appears not to check mode bits against the client | Read, unresolved | Open: confirm, then enforce or state the model |
+| T0.22 | A locked dataset's cold extents can still be read: they decrypt under the pool key, with no check of the dataset's lock. Library only today, because nothing else reaches the cold tier | Read | Open |
+| T0.23 | The 9P server does not check mode or owner against the client, and a create is owned by the connection's uid whatever the client asked | Read | Open: enforce, or state the model |
 | T0.24 | Two copies of one volume, both written, reuse nonces. Copying a file is ordinary, and a restored backup does it too. Warn now in the manager and docs; the cure is T2.8 | Analysis | Open |
 
 ---
@@ -92,8 +97,8 @@ Build these before the big changes, since they are what will catch the big chang
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| T1.1 | Green CI: gcc break at `leaf.c:113`, Linux fault counters, `test_rc3_concurrent`, `test_slate_socket` | Red since April. Nothing else is believable until it is green | M |
-| T1.2 | Manager in CI on Linux too; sanitizers on a schedule | The spec claims Linux, and CI only runs macOS | S |
+| T1.1 | Green CI: gcc break at `leaf.c:113`, Linux fault counters, `test_rc3_concurrent`, `test_slate_socket` (use-after-free under ASan, SEGV under TSan), `test_fs_frag`, `test_corvus_mount`, 11 TSan families in `test_compound_ops_concurrent`. None of these sanitizer results has been triaged, so real or test-only is unknown | Red since April. Nothing else is believable until it is green | L |
+| T1.2 | Manager in CI on Linux too; sanitizers on a schedule, including legs that have no sanitizer result yet because a budget cut them off | The spec claims Linux, and CI only runs macOS | S |
 | T1.3 | `stratum check`: read-only full walk and cross-checks: allocator against references, nlink, dirent against inode, reachability and cycles, dead lists, the bootstrap bitmap | No fsck exists. Peers have `zdb`, `btrfs check` and `fsck.bcachefs` | L |
 | T1.4 | Crash harness: record writes and barriers, replay every barrier prefix, drop and reorder inside each barrier, mount, check, assert every acknowledged `fsync` | The strongest test a filesystem can have. Fault injection exists; this does not | L |
 | T1.5 | Fuzz targets for uberblock, node, extent, dirent, keyfile, 9P and send decoding. `STM_BUILD_FUZZERS` builds nothing today | A filesystem that opens a stranger's container parses hostile input | M |
@@ -154,6 +159,10 @@ Measure each one with T1.10 first and again afterwards.
 | T3.12 | **TRIM.** `stm_bdev_discard` exists and nothing calls it. It also lets a volume file shrink and reduces leftover ciphertext | fstrim, autotrim | M |
 | T3.13 | Engine: rightmost split for ascending inserts; flush the heaviest child, not the whole buffer | | S |
 | T3.14 | Data that cannot find contiguous space gets split instead of refused; evacuation above 4 MiB | Gang blocks, copygc | M |
+| T3.18 | A directory scan holds the whole dirent index mutex, so one large directory can stall every namespace writer for seconds | | M |
+| T3.19 | An overwrite on the direct path costs O(allocator records), because a reserve invalidates the accelerators and a lookup rebuilds them. Fix before database workloads | | M |
+| T3.20 | Freeing N metadata nodes costs O(N squared) at the bootstrap pool | | S |
+| T3.21 | Full-pool and failure paths, with T3.11: partial truncate on a full pool answers ENOSPC, a failed drain write's spend has no reclaim path, a truncate freeing only cold records waits for an outside commit, 22 rollbacks ignore a failed allocator free | | M |
 
 ### Tier 3b: complexity that has not paid
 
@@ -171,19 +180,20 @@ The project's rule is that complexity must earn its place. After T1.10, keep eac
 
 | # | Item | Size |
 |---|---|---|
-| T4.1 | **Real scrub:** metadata, data and cold; runs in the daemon; repairs from replicas once they exist; can be scheduled | L |
+| T4.1 | **Real scrub:** metadata, data and cold; runs in the daemon; repairs from replicas once they exist; can be scheduled. **First fix two defects in its repair:** it rewrites a replica with no re-check, so it can overwrite a block since reissued to another file, and it treats a transient error as unrepairable. They are harmless only because nothing steps scrub today | L |
 | T4.2 | **Compression,** zstd and lz4, with the length leak stated. The format reserves a byte | M |
 | T4.3 | **Multi-device made Available:** mirror, replace, reconstruction, metadata beyond device 0, a `/ctl` path | XL |
-| T4.4 | **Send and receive made real:** names, metadata, deletes, raw encrypted streams, a front end | L |
+| T4.4 | **Send and receive made real:** names, metadata, deletes, raw encrypted streams, a front end. Also: a record moved by collapse or insert is left out of an incremental, and a send holds no snapshot, so it can lose its source | L |
 | T4.5 | **Clones made real:** destroy, promote, snapshot of a clone, a front end | M |
 | T4.6 | Key management: wrap-key and pool-key rotation, re-encryption, DEK rotation front end, hardware tokens | L |
 | T4.7 | Range reflink: partial, non-empty destination, `copy_file_range` | M |
-| T4.8 | Blocking locks with deadlock detection; persistent holds through a crash | M |
+| T4.8 | Blocking locks with deadlock detection; persistent holds through a crash; a lock poll scans every record under the global lock; one raw session can use up the lock table | M |
 | T4.9 | `SEEK_HOLE` and `SEEK_DATA`, whole-range `fallocate` punch, relatime | S |
 | T4.10 | Enforced quotas (T0.17) | M |
 | T4.11 | ACLs; device nodes, FIFOs and sockets | M |
 | T4.12 | 9P reach for what is library only: seals, file handles, `O_TMPFILE`, `EXCHANGE`, `WHITEOUT` | S |
 | T4.13 | `/ctl` verbs for datasets, properties, devices and tiering | M |
+| T4.14 | Small semantics: a failed create can leave the name linked, timestamps can skip under contention, a gid of -1 is stored as given | S |
 
 ---
 
@@ -238,7 +248,7 @@ Recommended against for now, so nobody spends a pause on them. Each can be reope
 
 1. **Finish the tidy:** T0.8-T0.13, then T1.1 and T1.2, and land it.
 2. **Design tier 2 together,** settling which change gets which bytes, before the first of them lands.
-3. **Trust before change:** T1.3, then T1.4, T1.5, T1.6, T1.10. Cheap wins alongside: T3.1, T0.24's warning, T0.15, T5.7.
+3. **Trust before change:** T1.3, then T1.4, T1.5, T1.6, T1.10. Cheap wins alongside: T3.1, T0.24's warning, T0.15, T0.26, T0.27, T0.29, T5.7, and T0.28 once decided.
 4. **The format:** T2.1 and T2.2 first, then the rest of tier 2 one at a time. T0.1, T0.3, T0.4 and T0.7 go with the first two.
 5. **Then by measurement:** tier 3 in whatever order T1.10 shows matters most, starting with T3.2, T3.5 and T3.7.
 6. **Then tiers 4 and 5,** interleaved by use, and **tier 6** last.
