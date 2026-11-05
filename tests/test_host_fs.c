@@ -9,6 +9,7 @@
 #include <stratum/lp9.h>
 #include <stratum/types.h>
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -197,6 +198,64 @@ STM_TEST(host_fs_a_name_that_leads_elsewhere_is_refused)
 
     gone(&f, "log");
     gone(&f, "log.1");
+    stm_host_fs_destroy(f.h);
+    (void)rmdir(f.root);
+}
+
+typedef struct {
+    int count;
+    char names[8][STM_LP9_NAME_MAX + 1];
+} names_seen;
+
+static stm_status gather(const stm_lp9_dirent *e, void *ctx)
+{
+    names_seen *n = ctx;
+    if (n->count < 8) memcpy(n->names[n->count++], e->name, (size_t)e->name_len + 1u);
+    return STM_OK;
+}
+
+STM_TEST(host_fs_a_name_too_long_for_9p_is_no_siblings_name)
+{
+    fixture f;
+    STM_ASSERT_TRUE(fixture_open(&f));
+    if (!f.h) return;
+    /* 100 euro signs (300 bytes; APFS takes it) and, beside it, its 255-byte cut. */
+    char longname[301], cut[256], p[512];
+    for (int i = 0; i < 100; i++) memcpy(longname + 3 * i, "\xE2\x82\xAC", 3);
+    longname[300] = '\0';
+    memcpy(cut, longname, 255);
+    cut[255] = '\0';
+    snprintf(p, sizeof p, "%s/%s", f.root, longname);
+    int fd = open(p, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        stm_test_info("no 300-byte name on this filesystem (%s): nothing to list", strerror(errno));
+    } else {
+        (void)close(fd);
+        snprintf(p, sizeof p, "%s/%s", f.root, cut);
+        fd = open(p, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        STM_ASSERT_TRUE(fd >= 0);
+        if (fd >= 0) (void)close(fd);
+        names_seen seen;
+        memset(&seen, 0, sizeof seen);
+        uint64_t root = stm_host_fs_root(f.h), q = 0;
+        STM_ASSERT_OK(f.v->readdir(f.h, root, 0, gather, &seen));
+        STM_ASSERT_EQ(seen.count, 2);
+        int cuts = 0, stand_ins = 0;
+        for (int i = 0; i < seen.count; i++) {
+            size_t n = strlen(seen.names[i]);
+            if (strcmp(seen.names[i], cut) == 0) cuts++;
+            if (n >= 3 && memcmp(seen.names[i] + n - 3, "\xEF\xBF\xBD", 3) == 0) {
+                stand_ins++;
+                STM_ASSERT_ERR(walk(&f, root, seen.names[i], &q), STM_ENOENT);
+            }
+        }
+        /* Only the real sibling is listed under the cut name. */
+        STM_ASSERT_EQ(cuts, 1);
+        STM_ASSERT_EQ(stand_ins, 1);
+        (void)unlink(p);
+        snprintf(p, sizeof p, "%s/%s", f.root, longname);
+        (void)unlink(p);
+    }
     stm_host_fs_destroy(f.h);
     (void)rmdir(f.root);
 }

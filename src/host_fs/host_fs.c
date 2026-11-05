@@ -588,7 +588,6 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (fstatat(dirfd(d), ent->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0) continue;
         uint64_t cqid = qid_path_from_stat(&st);
 
-        if (name_len > STM_LP9_NAME_MAX) name_len = STM_LP9_NAME_MAX;
         stm_lp9_dirent dent;
         memset(&dent, 0, sizeof dent);
         dent.qid.qtype = qid_type_from_mode(st.st_mode);
@@ -596,8 +595,20 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         dent.qid.path = cqid;
         dent.cookie = cookie;
         dent.dt_type = ent->d_type;
+        if (name_len > STM_LP9_NAME_MAX) {
+            /* APFS holds 255 characters, up to 765 bytes. A bare cut can be a
+             * sibling's whole name, so the cut ends on a character boundary
+             * with U+FFFD after it, which names nothing and the manager
+             * refuses. */
+            size_t keep = STM_LP9_NAME_MAX - 3u;
+            while (keep > 0 && ((unsigned char)ent->d_name[keep] & 0xC0u) == 0x80u) keep--;
+            memcpy(dent.name, ent->d_name, keep);
+            memcpy(dent.name + keep, "\xEF\xBF\xBD", 3);
+            name_len = keep + 3u;
+        } else {
+            memcpy(dent.name, ent->d_name, name_len);
+        }
         dent.name_len = (uint16_t)name_len;
-        memcpy(dent.name, ent->d_name, name_len);
         dent.name[name_len] = '\0';
         stm_status crc = cb(&dent, cb_ctx);
         if (crc != STM_OK) {
