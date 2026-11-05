@@ -4526,6 +4526,7 @@ stm_status stm_sync_replace_device_online(
      * device_id already set to an attached slot. We validate and
      * drive the drain to completion. This supports retry without
      * duplicating the add. */
+    uint16_t new_slot = UINT16_MAX;
     if (old_state == STM_DEV_STATE_EVACUATING) {
         uint16_t alloc_dev = 0;
         stm_status gs = stm_alloc_get_device_id(new_alloc, &alloc_dev);
@@ -4556,7 +4557,8 @@ stm_status stm_sync_replace_device_online(
         stm_pool_unlock_exclusive(s->pool);
         if (cls != STM_OK) return cls;
 
-        if (out_new_device_id) *out_new_device_id = alloc_dev;
+        new_slot = alloc_dev;
+        if (out_new_device_id) *out_new_device_id = new_slot;
         /* Resume: drain + finish + commit. Skip steps 1-5. */
         goto drain_loop;
     }
@@ -4645,7 +4647,6 @@ stm_status stm_sync_replace_device_online(
 
     if (resume_err != STM_OK) return resume_err;
 
-    uint16_t new_slot = UINT16_MAX;
     if (resume_path) {
         new_slot = resume_slot;
         if (out_new_device_id) *out_new_device_id = new_slot;
