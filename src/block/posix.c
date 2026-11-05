@@ -14,7 +14,6 @@
  *   - Threads exit on stop_requested + empty queue.
  */
 #include "bdev_internal.h"
-#include <stratum/block_inject.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -79,28 +78,6 @@ typedef struct {
     uint32_t                nthreads;
     atomic_bool             stop;
 
-    /* Chunk 8: fault-injection hook. When inject_countdown is > 0,
-     * each state-changing sync op (write / fsync / fdatasync)
-     * decrements it; the transition 1 → 0 causes that op to return
-     * STM_EIO WITHOUT performing the I/O (and without recording
-     * partial data). Subsequent ops after the fire run normally.
-     *
-     * Intended for the crash-injection fuzzer (tests/test_crash_-
-     * inject.c) to synthesize power-loss-style partial-commit
-     * scenarios deterministically. Not a public API — exposed via
-     * <stratum/block_inject.h> and guarded from production use by
-     * the fact that it's a no-op on any backend other than POSIX. */
-    atomic_int_fast64_t     inject_countdown;  /* 0/negative = disabled */
-    atomic_uint_fast32_t    inject_fired;      /* running counter       */
-
-    /* Area G bench instrumentation: per-op I/O accounting. Relaxed
-     * counters, incremented once a state-changing op clears the inject
-     * guard -- no behavior change. Read via stm_bdev_io_stats, zeroed via
-     * stm_bdev_io_stats_reset. Used by bench_commit to measure per-commit
-     * device writes + write-amplification (bytes-to-device per user byte). */
-    atomic_uint_fast64_t    io_writes;
-    atomic_uint_fast64_t    io_write_bytes;
-    atomic_uint_fast64_t    io_fsyncs;
 } posix_bdev;
 
 /* ------------------------------------------------------------------------- */
@@ -165,30 +142,6 @@ static stm_status posix_pwrite_full(int fd, const void *buf, size_t len, off_t o
 /* Sync ops.                                                                  */
 /* ------------------------------------------------------------------------- */
 
-/* Chunk 8 fault-injection check. Returns true iff the caller should
- * SKIP the real I/O and return STM_EIO. Fires exactly once per arming
- * — at the transition from countdown=1 to 0. After firing, countdown
- * stays non-positive and subsequent ops proceed normally. */
-static inline bool posix_inject_should_fail(posix_bdev *d)
-{
-    /* Fast path: compare without decrement so enabled==0 case costs
-     * one relaxed load. */
-    int_fast64_t v = atomic_load_explicit(&d->inject_countdown,
-                                            memory_order_relaxed);
-    if (v <= 0) return false;
-    /* Armed — decrement atomically. If we're the thread that hits
-     * zero, we win the race to fire. Other concurrent decrementers
-     * see a positive prev and don't fire. */
-    int_fast64_t prev = atomic_fetch_sub_explicit(&d->inject_countdown,
-                                                    1, memory_order_relaxed);
-    if (prev == 1) {
-        atomic_fetch_add_explicit(&d->inject_fired, 1,
-                                    memory_order_relaxed);
-        return true;
-    }
-    return false;
-}
-
 static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
 {
     posix_bdev *d = (posix_bdev *)base;
@@ -198,18 +151,12 @@ static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
 static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t len)
 {
     posix_bdev *d = (posix_bdev *)base;
-    if (posix_inject_should_fail(d)) return STM_EIO;
-    atomic_fetch_add_explicit(&d->io_writes, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&d->io_write_bytes, (uint_fast64_t)len,
-                              memory_order_relaxed);
     return posix_pwrite_full(d->fd, buf, len, (off_t)off);
 }
 
 static stm_status op_fsync(stm_bdev *base)
 {
     posix_bdev *d = (posix_bdev *)base;
-    if (posix_inject_should_fail(d)) return STM_EIO;
-    atomic_fetch_add_explicit(&d->io_fsyncs, 1, memory_order_relaxed);
 #if defined(__APPLE__)
     /* On macOS, fsync() does not flush the disk cache. F_FULLFSYNC does. */
     if (fcntl(d->fd, F_FULLFSYNC) == -1) return errno_to_status(errno);
@@ -223,8 +170,6 @@ static stm_status op_fsync(stm_bdev *base)
 static stm_status op_fdatasync(stm_bdev *base)
 {
     posix_bdev *d = (posix_bdev *)base;
-    if (posix_inject_should_fail(d)) return STM_EIO;
-    atomic_fetch_add_explicit(&d->io_fsyncs, 1, memory_order_relaxed);
 #if defined(__APPLE__)
     /* macOS has no fdatasync; F_BARRIERFSYNC (10.14+) is closest. */
     if (fcntl(d->fd, F_BARRIERFSYNC) == -1) {
@@ -679,52 +624,4 @@ stm_status stm_bdev_open_posix(const char *path,
 
     *out = &d->base;
     return STM_OK;
-}
-
-/* ------------------------------------------------------------------------- */
-/* Chunk 8 fault-injection — public test surface.                            */
-/* ------------------------------------------------------------------------- */
-
-void stm_bdev_inject_fail_after(stm_bdev *base, int64_t n_ops)
-{
-    if (!base) return;
-    if (base->caps.backend != STM_BDEV_BACKEND_POSIX) return;
-    posix_bdev *d = (posix_bdev *)base;
-    int_fast64_t v = (n_ops > 0) ? (int_fast64_t)n_ops : 0;
-    atomic_store_explicit(&d->inject_countdown, v, memory_order_relaxed);
-}
-
-uint32_t stm_bdev_inject_fired_count(const stm_bdev *base)
-{
-    if (!base) return 0;
-    if (base->caps.backend != STM_BDEV_BACKEND_POSIX) return 0;
-    const posix_bdev *d = (const posix_bdev *)base;
-    return (uint32_t)atomic_load_explicit(&d->inject_fired,
-                                            memory_order_relaxed);
-}
-
-void stm_bdev_io_stats(const stm_bdev *base, uint64_t *writes,
-                       uint64_t *write_bytes, uint64_t *fsyncs)
-{
-    uint64_t w = 0, wb = 0, f = 0;
-    if (base && base->caps.backend == STM_BDEV_BACKEND_POSIX) {
-        const posix_bdev *d = (const posix_bdev *)base;
-        w  = (uint64_t)atomic_load_explicit(&d->io_writes, memory_order_relaxed);
-        wb = (uint64_t)atomic_load_explicit(&d->io_write_bytes,
-                                            memory_order_relaxed);
-        f  = (uint64_t)atomic_load_explicit(&d->io_fsyncs, memory_order_relaxed);
-    }
-    if (writes)      *writes      = w;
-    if (write_bytes) *write_bytes = wb;
-    if (fsyncs)      *fsyncs      = f;
-}
-
-void stm_bdev_io_stats_reset(stm_bdev *base)
-{
-    if (!base) return;
-    if (base->caps.backend != STM_BDEV_BACKEND_POSIX) return;
-    posix_bdev *d = (posix_bdev *)base;
-    atomic_store_explicit(&d->io_writes, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->io_write_bytes, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->io_fsyncs, 0, memory_order_relaxed);
 }

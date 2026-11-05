@@ -44,6 +44,18 @@ struct stm_bdev {
      * only under stm_sync_commit's lock envelope; atomics for visibility. */
     atomic_bool                barrier_defer;
     atomic_bool                barrier_pending;
+
+    /* Fault injection (block_inject.h). Armed, each state-changing sync op
+     * decrements the countdown, and the one that takes it from 1 to 0 answers
+     * STM_EIO without doing the I/O. Here and not in a backend, so a crash test
+     * exercises the backend a deployment really uses. */
+    atomic_int_fast64_t        inject_countdown;
+    atomic_uint_fast32_t       inject_fired;
+
+    /* Per-op accounting, relaxed, read by bench_commit and the tests. */
+    atomic_uint_fast64_t       io_writes;
+    atomic_uint_fast64_t       io_write_bytes;
+    atomic_uint_fast64_t       io_fsyncs;
 };
 
 /* Backend constructors. */

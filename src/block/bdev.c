@@ -5,6 +5,8 @@
  */
 #include "bdev_internal.h"
 
+#include <stratum/block_inject.h>
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -80,11 +82,35 @@ stm_status stm_bdev_read(stm_bdev *d, uint64_t offset, void *buf, size_t len)
     return d->ops->read(d, offset, buf, len);
 }
 
+/* True when the caller should skip the I/O and answer STM_EIO. Fires once per
+ * arming, on the thread that takes the countdown from 1 to 0. */
+static inline bool inject_should_fail(stm_bdev *d)
+{
+    if (atomic_load_explicit(&d->inject_countdown, memory_order_relaxed) <= 0)
+        return false;
+    if (atomic_fetch_sub_explicit(&d->inject_countdown, 1,
+                                  memory_order_relaxed) != 1)
+        return false;
+    atomic_fetch_add_explicit(&d->inject_fired, 1, memory_order_relaxed);
+    return true;
+}
+
+static stm_status do_fsync(stm_bdev *d)
+{
+    if (inject_should_fail(d)) return STM_EIO;
+    atomic_fetch_add_explicit(&d->io_fsyncs, 1, memory_order_relaxed);
+    return d->ops->fsync(d);
+}
+
 stm_status stm_bdev_write(stm_bdev *d, uint64_t offset, const void *buf, size_t len)
 {
     if (!d || !buf) return STM_EINVAL;
     if (len == 0) return STM_OK;
     if (d->read_only) return STM_EROFS;
+    if (inject_should_fail(d)) return STM_EIO;
+    atomic_fetch_add_explicit(&d->io_writes, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&d->io_write_bytes, (uint_fast64_t)len,
+                              memory_order_relaxed);
     return d->ops->write(d, offset, buf, len);
 }
 
@@ -96,7 +122,7 @@ stm_status stm_bdev_fsync(stm_bdev *d)
         atomic_store_explicit(&d->barrier_pending, true, memory_order_relaxed);
         return STM_OK;
     }
-    return d->ops->fsync(d);
+    return do_fsync(d);
 }
 
 stm_status stm_bdev_fdatasync(stm_bdev *d)
@@ -107,6 +133,8 @@ stm_status stm_bdev_fdatasync(stm_bdev *d)
         atomic_store_explicit(&d->barrier_pending, true, memory_order_relaxed);
         return STM_OK;
     }
+    if (inject_should_fail(d)) return STM_EIO;
+    atomic_fetch_add_explicit(&d->io_fsyncs, 1, memory_order_relaxed);
     return d->ops->fdatasync(d);
 }
 
@@ -127,7 +155,7 @@ stm_status stm_bdev_barrier_defer_end(stm_bdev *d)
     bool pending = atomic_exchange_explicit(&d->barrier_pending, false,
                                               memory_order_relaxed);
     if (!pending || d->read_only) return STM_OK;
-    return d->ops->fsync(d);
+    return do_fsync(d);
 }
 
 void stm_bdev_barrier_defer_cancel(stm_bdev *d)
@@ -140,6 +168,41 @@ void stm_bdev_barrier_defer_cancel(stm_bdev *d)
 bool stm_bdev_barrier_defer_armed(const stm_bdev *d)
 {
     return d && atomic_load_explicit(&d->barrier_defer, memory_order_relaxed);
+}
+
+void stm_bdev_inject_fail_after(stm_bdev *d, int64_t n_ops)
+{
+    if (!d) return;
+    int_fast64_t v = (n_ops > 0) ? (int_fast64_t)n_ops : 0;
+    atomic_store_explicit(&d->inject_countdown, v, memory_order_relaxed);
+}
+
+uint32_t stm_bdev_inject_fired_count(const stm_bdev *d)
+{
+    if (!d) return 0;
+    return (uint32_t)atomic_load_explicit(&d->inject_fired, memory_order_relaxed);
+}
+
+void stm_bdev_io_stats(const stm_bdev *d, uint64_t *writes,
+                       uint64_t *write_bytes, uint64_t *fsyncs)
+{
+    if (writes)
+        *writes = d ? (uint64_t)atomic_load_explicit(&d->io_writes,
+                                                     memory_order_relaxed) : 0;
+    if (write_bytes)
+        *write_bytes = d ? (uint64_t)atomic_load_explicit(&d->io_write_bytes,
+                                                          memory_order_relaxed) : 0;
+    if (fsyncs)
+        *fsyncs = d ? (uint64_t)atomic_load_explicit(&d->io_fsyncs,
+                                                     memory_order_relaxed) : 0;
+}
+
+void stm_bdev_io_stats_reset(stm_bdev *d)
+{
+    if (!d) return;
+    atomic_store_explicit(&d->io_writes, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->io_write_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->io_fsyncs, 0, memory_order_relaxed);
 }
 
 stm_status stm_bdev_discard(stm_bdev *d, uint64_t offset, uint64_t len)
