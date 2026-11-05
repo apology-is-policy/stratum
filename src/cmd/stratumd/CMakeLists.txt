@@ -25,6 +25,10 @@ target_link_libraries(stm_stratumd
 find_package(Threads REQUIRED)
 target_link_libraries(stm_stratumd PUBLIC Threads::Threads)
 
+if(STRATUM_BUILD_TESTING_HOOKS)
+    target_compile_definitions(stm_stratumd PUBLIC STRATUM_BUILD_TESTING_HOOKS)
+endif()
+
 # Run-main lib: argv-driven CLI lifecycle. Factored out of main.c so the
 # swiss-army `stratum` Rust binary can FFI-dispatch into it.
 add_library(stm_cmd_stratumd STATIC

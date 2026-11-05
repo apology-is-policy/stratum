@@ -499,6 +499,12 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
  *
  * Returns STM_OK on stop-flag exit, non-OK on accept() error.
  */
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+/* Test only: dup() of a connection answers ENOSYS, as Thylacine's pouch does for
+ * a socket. */
+extern bool stm_stratumd_test_dup_unsupported;
+#endif
+
 STM_MUST_USE
 stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
                                       uint32_t msize_max,

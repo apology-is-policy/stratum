@@ -283,6 +283,50 @@ STM_TEST(p9_socket_listen_then_handshake) {
     unlink(g_key_path);
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+STM_TEST(p9_socket_a_connection_that_cannot_be_duplicated_is_served) {
+    /* Thylacine's pouch answers ENOSYS to dup() of a socket, and the daemon dups
+     * each connection so that a stop can reach it. Refusing every connection
+     * there would leave the volume unreachable. */
+    make_tmp("9p_sock_nodup");
+    build_sock_path("nodup");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, /*ds=*/1u, /*mode=*/0755u,
+                                              /*uid=*/0, /*gid=*/0,
+                                              &root_ino));
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(listen_fd >= 0);
+
+    accept_ctx ctx = { .listen_fd = listen_fd, .fs = fs,
+                        .run_status = STM_EBACKEND };
+    atomic_init(&ctx.stop_flag, false);
+    stm_stratumd_test_dup_unsupported = true;
+    pthread_t worker;
+    STM_ASSERT_EQ(pthread_create(&worker, NULL, accept_loop_thread, &ctx), 0);
+
+    int cfd = connect_client(g_sock_path);
+    STM_ASSERT_TRUE(cfd >= 0);
+    STM_ASSERT_EQ(do_handshake(cfd, /*fid=*/100), 0);
+    STM_ASSERT_EQ(do_clunk(cfd, /*tag=*/2, /*fid=*/100), 0);
+    if (cfd >= 0) close(cfd);
+
+    wake_and_join(&ctx, worker);
+    stm_stratumd_test_dup_unsupported = false;
+    STM_ASSERT_EQ(ctx.run_status, STM_OK);
+
+    close(listen_fd);
+    (void)unlink(g_sock_path);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+#endif
+
 STM_TEST(p9_socket_two_sequential_clients) {
     /* Verify the serial accept loop accepts a SECOND client after
      * the first disconnects. Both attach with different fid numbers

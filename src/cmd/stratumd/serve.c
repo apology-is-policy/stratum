@@ -610,6 +610,15 @@ static void inflight_drain(stratumd_inflight *f)
  * that is not reading would hold that reply's write for ever. */
 enum { STRATUMD_STOP_GRACE_MS = 2000 };
 
+/* A wait for descriptors to free. Not poll() over no descriptors, which
+ * Thylacine's pouch answers at once, and the wait would be a spin. A signal ends
+ * it early, so the loop sees a stop as soon as before. */
+static void pause_for_descriptors(void)
+{
+    struct timespec ts = { 0, 100L * 1000000L };
+    (void)nanosleep(&ts, NULL);
+}
+
 static bool inflight_drain_within(stratumd_inflight *f, unsigned ms)
 {
     struct timespec until;
@@ -642,16 +651,34 @@ typedef struct stratumd_conn {
 static pthread_mutex_t g_conns_mu = PTHREAD_MUTEX_INITIALIZER;
 static stratumd_conn  *g_conns    = NULL;
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+bool stm_stratumd_test_dup_unsupported = false;
+#endif
+
+static int conn_dup(int fd)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (stm_stratumd_test_dup_unsupported) {
+        errno = ENOSYS;
+        return -1;
+    }
+#endif
+    return dup(fd);
+}
+
 static stratumd_conn *stratumd_conn_track(int client_fd)
 {
     stratumd_conn *c = malloc(sizeof *c);
     if (!c) return NULL;
-    c->dup_fd = dup(client_fd);
-    if (c->dup_fd < 0) {
+    c->dup_fd = conn_dup(client_fd);
+    if (c->dup_fd < 0 && errno != ENOSYS) {
         free(c);
         return NULL;
     }
-    (void)fcntl(c->dup_fd, F_SETFD, FD_CLOEXEC);
+    /* Thylacine's pouch cannot duplicate a socket (ENOSYS). Such a connection is
+     * served with nothing a stop can reach, so a stop waits for it to end, which
+     * is all a stop gets there anyway: shutdown on a /srv stream does nothing. */
+    if (c->dup_fd >= 0) (void)fcntl(c->dup_fd, F_SETFD, FD_CLOEXEC);
     pthread_mutex_lock(&g_conns_mu);
     c->next = g_conns;
     g_conns = c;
@@ -669,7 +696,7 @@ static void stratumd_conn_untrack(stratumd_conn *c)
         }
     }
     pthread_mutex_unlock(&g_conns_mu);
-    close(c->dup_fd);
+    if (c->dup_fd >= 0) close(c->dup_fd);
     free(c);
 }
 
@@ -677,7 +704,7 @@ static void stratumd_conns_stop_reading(void)
 {
     pthread_mutex_lock(&g_conns_mu);
     for (stratumd_conn *c = g_conns; c; c = c->next)
-        (void)shutdown(c->dup_fd, SHUT_RD);
+        if (c->dup_fd >= 0) (void)shutdown(c->dup_fd, SHUT_RD);
     pthread_mutex_unlock(&g_conns_mu);
 }
 
@@ -688,7 +715,7 @@ static void stratumd_conns_end(void)
 {
     pthread_mutex_lock(&g_conns_mu);
     for (stratumd_conn *c = g_conns; c; c = c->next)
-        (void)shutdown(c->dup_fd, SHUT_WR);
+        if (c->dup_fd >= 0) (void)shutdown(c->dup_fd, SHUT_WR);
     pthread_mutex_unlock(&g_conns_mu);
 }
 
@@ -763,7 +790,7 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
             /* Out of descriptors is a moment, not a reason to unmount. The listen
              * socket stays readable meanwhile, so wait rather than spin. */
             if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
-                (void)poll(NULL, 0, 100);
+                pause_for_descriptors();
                 continue;
             }
             if (stop_flag && atomic_load_explicit(stop_flag,
@@ -970,7 +997,7 @@ static stm_status stratumd_accept_proxy_loop(int listen_fd,
             /* Out of descriptors is a moment, not a reason to unmount. The listen
              * socket stays readable meanwhile, so wait rather than spin. */
             if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
-                (void)poll(NULL, 0, 100);
+                pause_for_descriptors();
                 continue;
             }
             if (stop_flag && atomic_load_explicit(stop_flag,
@@ -1237,7 +1264,7 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
             /* Out of descriptors is a moment, not a reason to unmount. The listen
              * socket stays readable meanwhile, so wait rather than spin. */
             if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
-                (void)poll(NULL, 0, 100);
+                pause_for_descriptors();
                 continue;
             }
             if (stop_flag && atomic_load_explicit(stop_flag,
