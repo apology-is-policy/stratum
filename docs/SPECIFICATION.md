@@ -51,7 +51,8 @@ in the code, not measurements.
 
 **What it is not yet:**
 
-- Not a production filesystem. The format is not frozen, and there is no filesystem checker.
+- Not a production filesystem. The format is not frozen: until it is, a new version refuses older pools, with no
+  upgrade path. There is no filesystem checker.
 - Its own CI is not green. See section 15.
 - Single device in every shipped path. No redundancy for metadata, no compression, no intent log.
 - Metadata is capped at about 7 GiB per pool, and the size is fixed at format time.
@@ -499,7 +500,7 @@ and nothing reports it.
 
 **In progress, not on the main branch:** unbounded dead lists, using one copy-on-write tree per pool keyed by death generation, with deletes done in durable steps. Its
 safety rule is modelled in `specs/dead_tree.tla` on that branch, and it has been through four audit rounds, the last of which found serious accounting faults. It lands with the move of
-the trees to the engine (section 16), as format 34.
+the trees to the engine (section 16).
 
 **Rollback** destroys newer snapshots. **Holds** block deletion. A file handle does not survive a rollback and remount.
 
@@ -660,7 +661,7 @@ result.
 ### 16.2 Decided next
 
 **All trees on the engine.** The allocator, allocator roots, dataset, snapshot and CAS indexes, key schema and repair log move off the whole-tree store. Nothing then needs adjacent nodes, which removes
-the metadata fragmentation of section 7, the commit's whole-allocator rewrite, and the caps on allocator ranges and datasets. This is a format change with an upgrade at mount. In the same model as section
+the metadata fragmentation of section 7, the commit's whole-allocator rewrite, and the caps on allocator ranges and datasets. This is a format change, with no upgrade path (section 1). In the same model as section
 7 it reaches 1220, 773, 586, 453 commits per cycle and stops near 0% free, with the caveat that the model assumes trees shrink as records go, and the engine has no merge yet, so that must be built too.
 
 **Unbounded dead lists** arrive with it (section 10).

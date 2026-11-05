@@ -8,7 +8,8 @@ It runs in user space and serves POSIX-shaped files over 9P2000.L. A single Rust
 packages the daemons with a dual-pane file manager, so a volume can also be used as an encrypted
 container file.
 
-**It is not production-ready.** The on-disk format is not frozen, there is no filesystem checker, and
+**It is not production-ready.** The on-disk format is not frozen, so a new version can refuse your pool with no upgrade path. There is
+no filesystem checker, and
 several features exist only as library calls. **Read [docs/SPECIFICATION.md](docs/SPECIFICATION.md)**:
 it covers the design, the trade-offs against ZFS, btrfs and bcachefs, what is and is not built, the
 hard limits, and the known defects.

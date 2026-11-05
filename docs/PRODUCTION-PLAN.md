@@ -28,7 +28,7 @@ A list without an end never finishes, so this is the end. Stratum is production 
 | Evidence | **Seen**: reproduced or measured. **Read**: read in the code, never run. **Analysis**: reasoned from the design, unchecked. **Written**: a fix exists, not yet built |
 | Size | S, M, L, XL: relative work, not a duration |
 
-Every item that changes the on-disk format is in tier 2, because each format break needs a decision and they should ship together.
+Every item that changes the on-disk format is in tier 2.
 
 ---
 
@@ -106,33 +106,31 @@ Build these before the big changes, since they are what will catch the big chang
 
 ---
 
-## Tier 2: the format review
+## Tier 2: changes to the format
 
-**Decide these together, before format 34 is cut.** Each break costs an upgrade path and a decision, so one break should carry everything it can. The last column is a recommendation, and every row still needs a decision.
+**The format is not frozen and no pool has to survive.** So until the freeze (T6.1) a format change has no upgrade path: a mount refuses any other version, by name, and the remedy is a new pool. That lets these land one at a time, which is easier to audit and to bisect than one large break. They still need designing together, because several want the same bytes: T2.5 and T2.8 in the block pointer, T2.6 and T2.7 in the extent record.
 
-| # | Change | What it brings | Size | Recommend |
+| # | Change | What it brings | Size | Call |
 |---|---|---|---|---|
-| T2.1 | All trees on the engine, with real node merge | Removes fragmentation, the whole-allocator rewrite and the caps. **Decided** | XL | In 34 |
-| T2.2 | Unbounded dead lists | **Decided**, on branch, with findings from its last audit round still open | L | In 34 |
-| T2.3 | Parent stored in a directory inode | Cycle check O(depth), not O(subtree) | S | In 34 |
-| T2.4 | **Metadata space that grows.** 7 GiB at most, fixed at format, and 256 MiB by default gives under 1M files. Peers allocate metadata from the same space as data | Removes the hard wall in the bar's item 7 | L | In 34 |
-| T2.5 | **Second copy of every metadata node.** One bad node is unrepairable today, whereas ZFS and btrfs keep two copies by default. The block pointer has 8 spare bytes | The bar's item 7. T2.8 may want the same bytes | L | In 34 |
-| T2.6 | **Tag in the extent record, not after the ciphertext.** A 4 KiB write takes two blocks today. ZFS keeps its MAC in the block pointer | One block per 4 KiB, half the small-file space, and the Merkle chain reaches data content | M | In 34 |
-| T2.7 | **Smaller sealing units.** A whole extent up to 8 MiB is verified on every read, so a 4 KiB random read can cost 8 MiB. ZFS's default record is 128 KiB | Random read speed, read amplification | M | In 34 |
-| T2.8 | **Nonces that survive a forked image** (T0.24): a per-history value in the nonce or the key derivation | Closes the most realistic attack for a container file. AEGIS is not misuse-resistant | M | In 34 |
-| T2.9 | **Key schema and uberblock authenticated** under a pool-derived key, checked just after unlock; key state in the associated data | Stops reinstating a retired key and rewriting keyless structures | M | In 34 |
-| T2.10 | Authenticated wrap | Today, holding the public wrap key is enough to forge a pool | M | In 34 |
-| T2.11 | **Key slots inside the volume,** as LUKS has: several unlock methods, a passphrase alone can open, change and revoke without touching data, header backup | The container's biggest usability gap (T5.1, T5.2) | M | In 34 |
-| T2.12 | **Keyed directory hash.** FNV-1a is unkeyed and the probe chain is 64, so by analysis, unchecked, names chosen to collide can make a create answer ENOSPC | Removes a denial of service by crafted names | S | In 34 |
-| T2.13 | Long symlinks: 100 bytes breaks real software, where peers take about 4 KiB | POSIX | S | In 34 |
-| T2.14 | Inodes and dirents that return their space: a stored generation for reuse, tombstones removed. Today `rm -rf` returns only extent nodes, so the inode ceiling is a high-water mark | Needed for T2.1's merge to pay fully | M | In 34 if it fits |
-| T2.15 | Per-inode allocated blocks, per-snapshot used and referenced | True `st_blocks`, `du` and snapshot accounting | M | In 34 |
-| T2.16 | Room for an intent log: a root and an uberblock field, with no behaviour yet | Lets T3.3 land without another break | S | In 34 |
-| T2.17 | Seal or drop the uberblock's plaintext counters, and retire dead fields (`si_xattr_count`, `ub_flags_*`, the mirror slot) | Less for a disk reader to learn, less to carry | S | In 34 |
-| T2.18 | Per-dataset metadata keys. Names and sizes sit under the pool key today, where ZFS uses the dataset's | Real separation between datasets, at the cost of cross-dataset dedup's simplicity | L | Decide; later is fine if the format leaves room |
+| T2.1 | All trees on the engine, with real node merge | Removes fragmentation, the whole-allocator rewrite and the caps. **Decided** | XL | Do |
+| T2.2 | Unbounded dead lists | **Decided**, on branch, with findings from its last audit round still open | L | Do |
+| T2.3 | Parent stored in a directory inode | Cycle check O(depth), not O(subtree) | S | Do |
+| T2.4 | **Metadata space that grows.** 7 GiB at most, fixed at format, and 256 MiB by default gives under 1M files. Peers allocate metadata from the same space as data | Removes the hard wall in the bar's item 7 | L | Do |
+| T2.5 | **Second copy of every metadata node.** One bad node is unrepairable today, whereas ZFS and btrfs keep two copies by default. The block pointer has 8 spare bytes | The bar's item 7. T2.8 may want the same bytes | L | Do |
+| T2.6 | **Tag in the extent record, not after the ciphertext.** A 4 KiB write takes two blocks today. ZFS keeps its MAC in the block pointer | One block per 4 KiB, half the small-file space, and the Merkle chain reaches data content | M | Do |
+| T2.7 | **Smaller sealing units.** A whole extent up to 8 MiB is verified on every read, so a 4 KiB random read can cost 8 MiB. ZFS's default record is 128 KiB | Random read speed, read amplification | M | Do |
+| T2.8 | **Nonces that survive a forked image** (T0.24): a per-history value in the nonce or the key derivation | Closes the most realistic attack for a container file. AEGIS is not misuse-resistant | M | Do |
+| T2.9 | **Key schema and uberblock authenticated** under a pool-derived key, checked just after unlock; key state in the associated data | Stops reinstating a retired key and rewriting keyless structures | M | Do |
+| T2.10 | Authenticated wrap | Today, holding the public wrap key is enough to forge a pool | M | Do |
+| T2.11 | **Key slots inside the volume,** as LUKS has: several unlock methods, a passphrase alone can open, change and revoke without touching data, header backup | The container's biggest usability gap (T5.1, T5.2) | M | Do |
+| T2.12 | **Keyed directory hash.** FNV-1a is unkeyed and the probe chain is 64, so by analysis, unchecked, names chosen to collide can make a create answer ENOSPC | Removes a denial of service by crafted names | S | Do |
+| T2.13 | Long symlinks: 100 bytes breaks real software, where peers take about 4 KiB | POSIX | S | Do |
+| T2.14 | Inodes and dirents that return their space: a stored generation for reuse, tombstones removed. Today `rm -rf` returns only extent nodes, so the inode ceiling is a high-water mark | Needed for T2.1's merge to pay fully | M | Do, after T2.1 |
+| T2.15 | Per-inode allocated blocks, per-snapshot used and referenced | True `st_blocks`, `du` and snapshot accounting | M | Do |
+| T2.16 | The intent log's root and uberblock field | Part of T3.3 | S | With T3.3 |
+| T2.17 | Seal or drop the uberblock's plaintext counters, and retire dead fields (`si_xattr_count`, `ub_flags_*`, the mirror slot) | Less for a disk reader to learn, less to carry | S | Do |
+| T2.18 | Per-dataset metadata keys. Names and sizes sit under the pool key today, where ZFS uses the dataset's | Real separation between datasets, at the cost of cross-dataset dedup's simplicity | L | Later, before the freeze |
 | T2.19 | Hide that a container is one: no magic, nothing in the clear | VeraCrypt's property. It conflicts with plaintext uberblocks and a pre-unlock key schema | XL | No |
-
-**Worth asking first: does anyone hold a format 33 pool whose data must survive?** The format is not frozen, and Thylacine images are rebuilt. If nobody does, the upgrade path, the legacy reader and their tests can go, removing a whole chunk of risk from the move. The upgrade was accepted as part of the decision to move the trees, so dropping it needs a decision too.
 
 ---
 
@@ -212,7 +210,7 @@ Stratum as a modern alternative to VeraCrypt: a file-based volume and a manager 
 
 | # | Item |
 |---|---|
-| T6.1 | Format freeze, a version policy, feature flags for later additions, upgrade tested on stored old images |
+| T6.1 | Format freeze, a version policy, feature flags for later additions, and from then on an upgrade path, tested on stored old images |
 | T6.2 | External review of the cryptography, on a written design, with the threat model's remaining items accepted or fixed |
 | T6.3 | Published benchmarks, with T1.10's method |
 | T6.4 | Release process: versions, signed builds, a security policy and a way to report |
@@ -239,16 +237,16 @@ Recommended against for now, so nobody spends a pause on them. Each can be reope
 ## The order
 
 1. **Finish the tidy:** T0.8-T0.13, then T1.1 and T1.2, and land it.
-2. **The format review** (tier 2), decided before format 34's design is signed. This is the next thing needing a decision.
+2. **Design tier 2 together,** settling which change gets which bytes, before the first of them lands.
 3. **Trust before change:** T1.3, then T1.4, T1.5, T1.6, T1.10. Cheap wins alongside: T3.1, T0.24's warning, T0.15, T5.7.
-4. **Format 34:** T2.1 and T2.2 with whatever the review adds. T0.1, T0.3, T0.4 and T0.7 go with them.
+4. **The format:** T2.1 and T2.2 first, then the rest of tier 2 one at a time. T0.1, T0.3, T0.4 and T0.7 go with the first two.
 5. **Then by measurement:** tier 3 in whatever order T1.10 shows matters most, starting with T3.2, T3.5 and T3.7.
 6. **Then tiers 4 and 5,** interleaved by use, and **tier 6** last.
 
 ## Rules for working the list
 
 - One item at a time, and only one that is ready: dependencies done, no open decision.
-- **A format change never starts without its decision** in tier 2.
+- A format change bumps the version in the same commit, and `SPECIFICATION.md` says what changed.
 - See it fail first. A test that fails without the fix lands with the fix.
 - Audit anything on an audit-trigger surface before it lands, per `CLAUDE.md`.
 - Update `SPECIFICATION.md` and this file in the same commit: mark the item done with its commit, or move it.
