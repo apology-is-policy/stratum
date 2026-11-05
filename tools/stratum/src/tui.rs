@@ -2187,6 +2187,10 @@ fn handle_mkvol_key(
                 mk.passphrase.pop();
                 return Ok(Action::Refresh);
             }
+            MkVolField::Confirm => {
+                mk.confirm.pop();
+                return Ok(Action::Refresh);
+            }
             _ => {}
         },
         _ => {}
@@ -2209,6 +2213,12 @@ fn handle_mkvol_key(
                 MkVolField::Passphrase => {
                     if mk.passphrase.len() < 256 {
                         mk.passphrase.push(c);
+                        return Ok(Action::Refresh);
+                    }
+                }
+                MkVolField::Confirm => {
+                    if mk.confirm.len() < 256 {
+                        mk.confirm.push(c);
                         return Ok(Action::Refresh);
                     }
                 }
@@ -2274,6 +2284,26 @@ fn submit_mkvol(
         return Ok(Action::Refresh);
     }
 
+    // An empty field must not quietly become a plaintext keyfile, and a typo here loses the volume.
+    let passphrase_error = if !mk.encrypt {
+        None
+    } else if mk.passphrase.is_empty() {
+        Some("Enter a passphrase, or turn off \"Use passphrase\".")
+    } else if mk.passphrase != mk.confirm {
+        Some("The two passphrases differ.")
+    } else {
+        None
+    };
+    if let Some(err) = passphrase_error {
+        let mut new_mk = mk.clone();
+        new_mk.error = Some(err.into());
+        *local_dialog = Some(LocalDialog {
+            kind: LocalDialogKind::MkVol(new_mk),
+            ..dialog
+        });
+        return Ok(Action::Refresh);
+    }
+
     // Resolve the on-disk directory the volume should land in.
     let panel_idx = mk.panel_idx;
     let host_root = match sp.panel_meta(panel_idx) {
@@ -2327,7 +2357,7 @@ fn submit_mkvol(
     use std::process::{Command, Stdio};
     let me = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("stratum"));
 
-    let want_passphrase = mk.encrypt && !mk.passphrase.is_empty();
+    let want_passphrase = mk.encrypt;
     let mkfs_status = (|| -> std::io::Result<std::process::Output> {
         let mut cmd = Command::new(&me);
         cmd.arg("mkfs")

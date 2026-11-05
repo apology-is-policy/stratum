@@ -290,6 +290,7 @@ pub struct MkVolState {
     pub encrypt: bool,
     /// Forward-noted as SWISS-4c1.
     pub passphrase: String,
+    pub confirm: String,
     /// Forward-noted as SWISS-4c1 (mkfs --compress flag).
     pub compress: MkVolCompress,
     /// Last error message, displayed in red.
@@ -302,6 +303,7 @@ pub enum MkVolField {
     Size,
     Encrypt,
     Passphrase,
+    Confirm,
     Compress,
     Ok,
     Cancel,
@@ -323,6 +325,7 @@ impl MkVolState {
             size: "64M".to_string(),
             encrypt: true,
             passphrase: String::new(),
+            confirm: String::new(),
             compress: MkVolCompress::Lz4,
             error: None,
         }
@@ -337,7 +340,8 @@ impl MkVolState {
             MkVolField::Encrypt => {
                 if self.encrypt { MkVolField::Passphrase } else { MkVolField::Ok }
             }
-            MkVolField::Passphrase => MkVolField::Ok,
+            MkVolField::Passphrase => MkVolField::Confirm,
+            MkVolField::Confirm => MkVolField::Ok,
             MkVolField::Compress => MkVolField::Ok,    // unreachable but tidy
             MkVolField::Ok => MkVolField::Cancel,
             MkVolField::Cancel => MkVolField::Name,
@@ -350,9 +354,10 @@ impl MkVolState {
             MkVolField::Size => MkVolField::Name,
             MkVolField::Encrypt => MkVolField::Size,
             MkVolField::Passphrase => MkVolField::Encrypt,
+            MkVolField::Confirm => MkVolField::Passphrase,
             MkVolField::Compress => MkVolField::Encrypt,
             MkVolField::Ok => {
-                if self.encrypt { MkVolField::Passphrase } else { MkVolField::Encrypt }
+                if self.encrypt { MkVolField::Confirm } else { MkVolField::Encrypt }
             }
             MkVolField::Cancel => MkVolField::Ok,
         };
@@ -1805,7 +1810,7 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
             Constraint::Length(1),   // spacer
             Constraint::Length(1),   // Use passphrase
             Constraint::Length(1),   // Passphrase (when on)
-            Constraint::Length(1),   // spacer
+            Constraint::Length(1),   // Confirm (when on)
             Constraint::Length(1),   // Error / tip
             Constraint::Min(0),      // filler
             Constraint::Length(1),   // buttons
@@ -1846,6 +1851,8 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
     if mk.encrypt {
         render_mkvol_field(frame, rows[4], "Passphrase:", &mk.passphrase,
                            mk.field == MkVolField::Passphrase, true);
+        render_mkvol_field(frame, rows[5], "Again:", &mk.confirm,
+                           mk.field == MkVolField::Confirm, true);
     } else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
