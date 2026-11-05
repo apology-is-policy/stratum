@@ -108,6 +108,8 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 | T0.55 | A bind mount inside the destination is invisible to `canonicalize`, so a merge can still be led over its own source through one. Making one needs privilege | Read | Open |
 | T0.56 | A copy into a volume writes a new name in place, so a kill mid-copy leaves a short file under the final name, and temporaries behind. The cure is a rename that refuses to replace, which the 9P server does not offer: a wire change, so it waits for a decision | Read | Open |
 | T0.57 | A second manager on the same volume re-keys the slate's listing, so the first one's marks can name entries it never saw. A listing token on selection writes is a slate format change | Analysis | Open |
+| T0.59 | **On Thylacine, a daemon from this series would have refused every client.** It dups each connection so a stop can reach it, and Thylacine's libc answers ENOSYS to `dup` of a socket. Its wait for free descriptors was `poll` over none, which that libc answers at once, so the wait would spin. A connection that cannot be duplicated is now served, and the wait sleeps | Read in Thylacine's libc; leg written | **Fixed** `96cd7ff` |
+| T0.60 | On Thylacine a stop wakes no client: `shutdown` on a `/srv` stream does nothing there, so T0.36 and T0.50 do not reach it, and a stop waits for each client to leave. The cure is a half-close for `/srv` streams in Thylacine, or a stop the server's read loop polls for beside the client | Read | Open |
 
 ### Security to establish, then decide
 
@@ -283,7 +285,7 @@ Recommended against for now, so nobody spends a pause on them. Each can be reope
 
 ## The order
 
-1. **Finish the tidy:** T0.8-T0.13, T0.29-T0.38 and T0.40-T0.53, then T1.1 and T1.2, and land it.
+1. **Finish the tidy:** T0.8-T0.13, T0.29-T0.38, T0.40-T0.53 and T0.59, then T1.1 and T1.2, and land it.
 2. **Design tier 2 together,** settling which change gets which bytes, before the first of them lands.
 3. **Trust before change:** T1.3, then T1.4, T1.5, T1.6, T1.10. Cheap wins alongside: T3.1, T0.24's warning, T0.15, T0.26, T0.28, T5.7.
 4. **The format:** T2.1 and T2.2 first, then the rest of tier 2 one at a time. T0.1, T0.3, T0.4 and T0.7 go with the first two.
