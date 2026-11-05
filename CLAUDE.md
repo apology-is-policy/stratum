@@ -14,7 +14,7 @@ Stratum is aiming to be a first-class peer of ZFS and btrfs — not a demo, not 
 6. **Tiered storage with learned migration.** Beyond heuristic hot/cold tiering — access-pattern models for policy decisions.
 7. **io_uring-native, zero-copy write path.** Designed for 2026+ NVMe workloads, not retrofitted from POSIX block I/O.
 
-These are long-horizon commitments, not a description of today. `docs/SPECIFICATION.md` says what is built, what is not, and where the code stops short of this list.
+These are long-horizon commitments, not a description of today. `docs/SPECIFICATION.md` says what is built, what is not, and where the code stops short of this list. `docs/PRODUCTION-PLAN.md` is the ordered list of what stands between Stratum and production use: take work from it, and keep it current in the same commit as the fix.
 
 ## Design-first policy
 

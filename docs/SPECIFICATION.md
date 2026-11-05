@@ -681,6 +681,8 @@ Compression. Reed-Solomon and LRC. Metadata replicas: **all metadata is on devic
 per-file fsync, and an intent log. fsck. Encryption-preserving (raw) send. Send of inodes, names, xattrs and deletes. Metadata scrub. Wrap-key and passphrase change. Per-dataset metadata keys. Hardware key backends.
 Long symlinks. Blocking locks. ACLs. Quotas. Per-snapshot space accounting. FUSE and language bindings. Node merge, node eviction, and bootstrap growth. Format freeze.
 
+`PRODUCTION-PLAN.md` orders all of this into a plan, with a definition of production quality.
+
 ---
 
 ## 17. Performance
