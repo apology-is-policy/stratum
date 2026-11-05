@@ -748,6 +748,15 @@ def spit(path, data):
         f.write(data)
 
 
+def mode_of(path):
+    return os.stat(path).st_mode & 0o777
+
+
+def stm_mode(vol, sock, p9):
+    m = re.search(rb'^mode:\s+([0-7]+)$', vol.fs(sock, 'stat', p9).stdout, re.M)
+    return int(m[1], 8) if m else None
+
+
 def rows_in_panel(term, names, right):
     rows, start, end = {}, *((COLS // 2, COLS) if right else (0, COLS // 2))
     for r, line in enumerate(term.screen.text().split('\n')):
@@ -873,10 +882,13 @@ def host_copy_legs(stratum, root):
 
         # The control for everything below: the same keys, with nothing in the way.
         pick(term, 'xfile.txt', names)
+        os.chmod(f'{w}/xfile.txt', 0o640)
         term.send(F5)
         copied, skipped, failed, _ = copy_summary(term, 'F5 into an empty directory')
         record((copied, skipped, failed) == (1, 0, 0) and slurp(f'{sub}/xfile.txt') == b'source\n',
                'F5 copies a file', f'F5 of a file: {copied} copied, {skipped} skipped, {failed} failed')
+        record(mode_of(f'{sub}/xfile.txt') == 0o640, 'a copy keeps who may read the file',
+               f'a copy of a 0640 file came out {mode_of(f"{sub}/xfile.txt"):o}')
 
         if root_user:
             print('note: running as root, so an unreadable source cannot be made here', flush=True)
@@ -907,6 +919,7 @@ def host_copy_legs(stratum, root):
         # A directory in the way, with a file of its own in it.
         os.makedirs(f'{sub}/dirone')
         spit(f'{sub}/dirone/old.txt', b'old\n')
+        os.chmod(f'{w}/dirone/inner', 0o700)
         pick(term, 'dirone', names)
         term.send(F5)
         answer_conflict(term, KEEP_BOTH)
@@ -914,6 +927,8 @@ def host_copy_legs(stratum, root):
         record(os.path.exists(f'{sub}/dirone-2/inner/b.txt') and not os.path.exists(f'{sub}/dirone/a.txt'),
                "a directory kept under a new name takes its contents along",
                "a directory's contents did not follow its new name")
+        record(mode_of(f'{sub}/dirone-2/inner') == 0o700, 'a new directory keeps who may look in it',
+               f'a 0700 directory came out {mode_of(f"{sub}/dirone-2/inner"):o}')
 
         term.send(F5)
         answer_conflict(term, SKIP)
@@ -960,6 +975,10 @@ def volume_copy_legs(stratum, root):
     os.makedirs(host)
     spit(f'{host}/keptfile.txt', b'new\n')
     spit(f'{host}/overfile.txt', b'new\n')
+    spit(f'{host}/secretfile.txt', b'secret\n')
+    os.chmod(f'{host}/secretfile.txt', 0o600)
+    os.makedirs(f'{host}/privdir')
+    os.chmod(f'{host}/privdir', 0o700)
     vol = Volume(stratum, base)
     vol.mkfs()
     vol.serve()
@@ -967,7 +986,9 @@ def volume_copy_legs(stratum, root):
     hostile = '/hostile/innocent\n- escaped'
     for args, data in ((('write', '/keptfile.txt'), b'old\n'), (('write', '/overfile.txt'), b'old\n'),
                        (('mkdir', '/hostile'), None), (('write', '/hostile/plain.txt'), b'plain\n'),
-                       (('write', hostile), b'bad\n')):
+                       (('write', hostile), b'bad\n'),
+                       (('write', '/shutfile.txt'), b'shut\n'), (('chmod', '640', '/shutfile.txt'), None),
+                       (('mkdir', '/shutdir'), None), (('chmod', '700', '/shutdir'), None)):
         r = vol.fs(vol.sock, *args, data=data)
         if r.returncode != 0:
             raise Failure(f'seeding {args}: {r.stderr[:200]}')
@@ -975,8 +996,9 @@ def volume_copy_legs(stratum, root):
         raise Failure('ls -0 printed no NUL')
     vol.stop()
 
-    host_names = ['keptfile.txt', 'overfile.txt']
-    vol_names = ['keptfile.txt', 'overfile.txt', 'keptfile-2.txt', 'hostile', '.snaps']
+    host_names = ['keptfile.txt', 'overfile.txt', 'secretfile.txt', 'privdir']
+    vol_names = ['keptfile.txt', 'overfile.txt', 'keptfile-2.txt', 'hostile', '.snaps',
+                 'shutfile.txt', 'shutdir', 'secretfile.txt', 'privdir']
     env_file = f'{base}/env'
     term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file])
     try:
@@ -1016,8 +1038,32 @@ def volume_copy_legs(stratum, root):
         record(b'.stratum-copy-' not in vol.fs(sock, 'ls', '/').stdout, 'no copy left a temporary file in the volume',
                'a temporary file was left in the volume')
 
+        # Whichever way a file crosses, the same people may read it. 0640 is neither
+        # what a volume gives a new file nor what a copy gives a file with no mode to go by.
+        pick(term, 'secretfile.txt', host_names, right=True)
+        term.send(F5)
+        copy_summary(term, 'a private file into a volume')
+        got = stm_mode(vol, sock, '/secretfile.txt')
+        record(got == 0o600, 'a private file stays private in a volume', f'a 0600 file in a volume reads {got!r}')
+        pick(term, 'privdir', host_names, right=True)
+        term.send(F5)
+        copy_summary(term, 'a private directory into a volume')
+        got = stm_mode(vol, sock, '/privdir')
+        record(got == 0o700, 'a private directory stays private in a volume', f'a 0700 directory in a volume reads {got!r}')
+
         term.send(TAB)
         term.pump(0.3)
+        pick(term, 'shutfile.txt', vol_names)
+        term.send(F5)
+        copy_summary(term, 'a 0640 file out of a volume')
+        record(mode_of(f'{host}/shutfile.txt') == 0o640, 'a file out of a volume keeps who may read it',
+               f'a 0640 file out of a volume came out {mode_of(f"{host}/shutfile.txt"):o}')
+        pick(term, 'shutdir', vol_names)
+        term.send(F5)
+        copy_summary(term, 'a 0700 directory out of a volume')
+        record(mode_of(f'{host}/shutdir') == 0o700, 'a directory out of a volume keeps who may look in it',
+               f'a 0700 directory out of a volume came out {mode_of(f"{host}/shutdir"):o}')
+
         pick(term, 'hostile', vol_names)
         term.send(F5)
         _, _, failed, _ = copy_summary(term, 'a name that reads as two lines')

@@ -22,6 +22,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc};
@@ -3554,14 +3555,49 @@ fn io_other(e: anyhow::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
 }
 
+/// What `stratum fs write` and `mkdir` give what they make. Each change of mode is a
+/// commit, so only a difference from these pays for one.
+const STM_WRITE_MODE: u32 = 0o644;
+const STM_MKDIR_MODE: u32 = 0o755;
+
+/// Who may read a file is part of it. The bits that grant more than that stay behind.
+fn host_mode(path: &Path) -> Option<u32> {
+    std::fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777)
+}
+
+fn stm_mode(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str) -> Option<u32> {
+    let out = sp.run_stratum_fs_capture(sock, &["stat", p9]).ok()?;
+    String::from_utf8_lossy(&out)
+        .lines()
+        .find_map(|l| u32::from_str_radix(l.trim().strip_prefix("mode:")?.trim(), 8).ok())
+        .map(|m| m & 0o777)
+}
+
+/// Nobody reads the bytes before the source's mode says they may, and a name planted
+/// ahead of the copy fails it rather than receiving it.
+fn open_host_temp(temp: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(temp)
+}
+
+/// A directory already there is the merge an Overwrite asks for, and keeps its mode. A
+/// new one has to take its contents whatever its source says, and a source that cannot
+/// say leaves it private.
+fn make_host_dir(dst: &Path, mode: Option<u32>) -> std::io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(mode.unwrap_or(0o700) | 0o700)
+        .create(dst)
+}
+
 /// A copy reaches a host destination whole or not at all: it is written beside it and
 /// renamed over, and an old file is safe until then. A directory in the way stays, since
-/// rename will not put a file over one.
+/// rename will not put a file over one. No mode to give leaves it as the temp was made.
 fn finish_host_copy(
     written: std::io::Result<()>,
     temp: &Path,
     dst: &Path,
     replacing: bool,
+    mode: Option<u32>,
 ) -> std::io::Result<()> {
     let done = written
         .and_then(|_| {
@@ -3570,6 +3606,10 @@ fn finish_host_copy(
             } else {
                 Ok(())
             }
+        })
+        .and_then(|_| match mode {
+            Some(m) => std::fs::set_permissions(temp, std::fs::Permissions::from_mode(m)),
+            None => Ok(()),
         })
         .and_then(|_| std::fs::rename(temp, dst));
     if done.is_err() {
@@ -3580,14 +3620,16 @@ fn finish_host_copy(
 
 /// A directory the destination already has is the merge an Overwrite asks for. Anything
 /// else in the way is the failure.
-fn ensure_stm_dir(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str) -> Result<()> {
+fn ensure_stm_dir(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str, mode: Option<u32>) -> Result<()> {
     let made = sp.run_stratum_fs(
         sock,
         &["mkdir", p9],
         std::process::Stdio::null(),
         std::process::Stdio::null(),
     );
-    let Err(e) = made else { return Ok(()) };
+    let Err(e) = made else {
+        return set_stm_mode(sp, sock, p9, mode.unwrap_or(0o700) | 0o700, STM_MKDIR_MODE);
+    };
     match sp.run_stratum_fs_capture(sock, &["stat", p9]) {
         Ok(out)
             if String::from_utf8_lossy(&out)
@@ -3600,19 +3642,35 @@ fn ensure_stm_dir(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str) -> Result<()> {
     }
 }
 
+fn set_stm_mode(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str, mode: u32, given: u32) -> Result<()> {
+    if mode == given {
+        return Ok(());
+    }
+    sp.run_stratum_fs(
+        sock,
+        &["chmod", &format!("{mode:o}"), p9],
+        std::process::Stdio::null(),
+        std::process::Stdio::null(),
+    )
+}
+
 /// A new name is written in place, and removed if the write fails. An existing file keeps
 /// its bytes until the new ones are whole: they go beside it and are moved over. The move
-/// is what commits; a plain write there would truncate the old file first.
+/// is what commits; a plain write there would truncate the old file first. A mode that
+/// cannot be given fails the copy, which would otherwise hand the file to more readers.
 fn write_stm_file(
     sp: &Arc<SpawnCtx>,
     sock: &Path,
     dst: &str,
     temp: &str,
     replacing: bool,
+    mode: Option<u32>,
     write: impl Fn(&str) -> Result<()>,
 ) -> Result<()> {
     let target = if replacing { temp } else { dst };
-    let done = write(target).and_then(|_| {
+    let done = write(target)
+        .and_then(|_| set_stm_mode(sp, sock, target, mode.unwrap_or(0o600), STM_WRITE_MODE))
+        .and_then(|_| {
         if replacing {
             sp.run_stratum_fs(
                 sock,
@@ -3671,9 +3729,10 @@ fn perform_copy_one(
             if is_dir {
                 // SWISS-4n2: directory items are expanded at start_f5, so a
                 // directory here is mkdir only, and an existing one merges.
-                std::fs::create_dir_all(dst)?;
+                make_host_dir(dst, host_mode(src))?;
             } else {
-                finish_host_copy(std::fs::copy(src, temp).map(|_| ()), temp, dst, replacing)?;
+                let written = open_host_temp(temp).and_then(|_| std::fs::copy(src, temp)).map(|_| ());
+                finish_host_copy(written, temp, dst, replacing, host_mode(src))?;
             }
             Ok(CopyOutcome::Copied)
         }
@@ -3682,10 +3741,10 @@ fn perform_copy_one(
                 io::Error::new(io::ErrorKind::Other, "dst sock missing"))?;
             let p9 = path_to_p9(dst, dst_meta);
             if is_dir {
-                ensure_stm_dir(sp, sock, &p9).map_err(io_other)?;
+                ensure_stm_dir(sp, sock, &p9, host_mode(src)).map_err(io_other)?;
             } else {
                 let sz = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-                write_stm_file(sp, sock, &p9, &path_to_p9(temp, dst_meta), replacing,
+                write_stm_file(sp, sock, &p9, &path_to_p9(temp, dst_meta), replacing, host_mode(src),
                                |to: &str| -> Result<()> {
                     let f = std::fs::File::open(src)?;
                     sp.run_stratum_fs(sock, &["write", to],
@@ -3699,22 +3758,18 @@ fn perform_copy_one(
         (BackendMeta::Stratumd { .. }, BackendMeta::HostFs { .. }) => {
             let sock = src_sock.ok_or_else(||
                 io::Error::new(io::ErrorKind::Other, "src sock missing"))?;
+            let p9 = path_to_p9(src, src_meta);
             if is_dir {
-                std::fs::create_dir_all(dst)?;
+                make_host_dir(dst, stm_mode(sp, sock, &p9))?;
             } else {
-                let p9 = path_to_p9(src, src_meta);
-                let written = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(temp)
-                    .and_then(|f| {
-                        sp.run_stratum_fs(sock, &["read", &p9],
-                                           std::process::Stdio::null(),
-                                           std::process::Stdio::from(f))
-                            .map_err(io_other)
-                    });
+                let written = open_host_temp(temp).and_then(|f| {
+                    sp.run_stratum_fs(sock, &["read", &p9],
+                                       std::process::Stdio::null(),
+                                       std::process::Stdio::from(f))
+                        .map_err(io_other)
+                });
                 /* host-fs dst → main loop handles bytes accounting. */
-                finish_host_copy(written, temp, dst, replacing)?;
+                finish_host_copy(written, temp, dst, replacing, stm_mode(sp, sock, &p9))?;
             }
             Ok(CopyOutcome::Copied)
         }
@@ -3724,11 +3779,12 @@ fn perform_copy_one(
             let d_sock = dst_sock.ok_or_else(||
                 io::Error::new(io::ErrorKind::Other, "dst sock missing"))?;
             let d_p9 = path_to_p9(dst, dst_meta);
+            let s_p9 = path_to_p9(src, src_meta);
             if is_dir {
-                ensure_stm_dir(sp, d_sock, &d_p9).map_err(io_other)?;
+                ensure_stm_dir(sp, d_sock, &d_p9, stm_mode(sp, s_sock, &s_p9)).map_err(io_other)?;
             } else {
-                let s_p9 = path_to_p9(src, src_meta);
                 write_stm_file(sp, d_sock, &d_p9, &path_to_p9(temp, dst_meta), replacing,
+                               stm_mode(sp, s_sock, &s_p9),
                                |to: &str| sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, to))
                     .map_err(io_other)?;
                 // Stat the destination for throughput accounting.
