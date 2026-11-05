@@ -1,1 +1,0 @@
-#include "stratum/cow.h"
