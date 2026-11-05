@@ -39,8 +39,8 @@ in the code, not measurements.
   32-byte authentication tag. Names, sizes, owners, the shape of the trees and the extent maps are
   not visible to someone holding only the disk.
 - **Integrity and encryption compose.** Parent pointers carry a BLAKE3 hash of the child's
-  ciphertext, forming a Merkle tree over metadata. Dedup-friendly plaintext hashing, deferred frees
-  and per-node generations are all designed around nonce uniqueness.
+  ciphertext, forming a Merkle tree over metadata. Deferred frees and per-node generations exist so
+  that an AEAD nonce does not repeat within one history.
 - **Hybrid post-quantum key wrap.** X25519 and ML-KEM-768 through HKDF-SHA256, when built with liboqs.
 - **A metadata engine that mixes three ideas.** A copy-on-write B+tree on disk, B-epsilon messages in
   internal nodes, and a CAS-prepended delta chain on the root in memory, reclaimed by epochs.
@@ -127,9 +127,8 @@ index, the key schema and the repair log. Per-dataset tree roots live in the dat
 
 ### 3.3 Addresses
 
-A physical address is 64 bits: 16 bits of device id and 48 bits of block offset. That allows 64 KiB
-device ids in the format, with 64 devices per pool enforced by the roster, and 1 EiB per device
-(*derived*).
+A physical address is 64 bits: 16 bits of device id and 48 bits of block offset. The format has room
+for 65,536 device ids, the roster enforces 64 per pool, and a device can be 1 EiB (*derived*).
 
 A block pointer (`stm_bptr`) is 64 bytes: address, kind, flags, a 32-byte checksum, and 16 further
 bytes of which the engine uses 8 for the child's birth generation. The birth generation is an input to
@@ -415,6 +414,9 @@ over ciphertext in a filesystem with no plaintext metadata trees, rather than th
 | Passphrase | Argon2id | t=2, 64 MiB, p=1, the only preset used |
 | Hashes | BLAKE3-256 | Vendored, unkeyed |
 
+**No cipher choice.** An XChaCha20-SIV primitive exists in `src/crypto`, and a passphrase-sealed keyfile's header may name it. No data or
+metadata path uses it, and the build option `STM_AEAD_DEFAULT` only prints a status line.
+
 **The nonce** is `paddr || gen || pool_uuid`, derived rather than stored. Per-extent associated data binds the pool, origin dataset,
 inode and offset. So ciphertext cannot be moved to another address, generation, file, dataset or pool. Node associated data binds the
 pool and device only.
@@ -496,7 +498,7 @@ stays allocated with no list entry, permanently: overwriting more than 256 exten
 and nothing reports it.
 
 **In progress, not on the main branch:** unbounded dead lists, using one copy-on-write tree per pool keyed by death generation, with deletes done in durable steps. Its
-safety rule is modelled in `specs/dead_tree.tla` and it has been through four audit rounds, the last of which found serious accounting faults. It lands with the move of
+safety rule is modelled in `specs/dead_tree.tla` on that branch, and it has been through four audit rounds, the last of which found serious accounting faults. It lands with the move of
 the trees to the engine (section 16), as format 34.
 
 **Rollback** destroys newer snapshots. **Holds** block deletion. A file handle does not survive a rollback and remount.
@@ -569,6 +571,8 @@ stratum fs -s SOCKET put ./dir /dir                    script it
 
 **What works, from the code:** recursive copy (`F5`) with progress and conflict handling, delete (`F8`), mkdir (`F7`), a modal editor (`F3`, `F4`), the create-volume wizard
 (`Shift+F7`), snapshot list, create, delete and rollback (`F9`, dataset 1 only), a pool map and snapshot graph (`F2`), and pressing Enter on a `.stm` file to mount it in the other pane.
+
+**Durability.** A manager copy runs one `stratum fs` command per item, and each mutating command ends with a whole-pool commit before it reports success. What the manager reports copied is therefore durable, and a copy of `N` items costs `N` commits.
 
 **Known gaps:**
 

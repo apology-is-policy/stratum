@@ -5,7 +5,7 @@
  * Implementation notes per ARCHITECTURE §7:
  *
  *   - AEGIS-256            (§7.5.1) — default AEAD on AES-accelerated hardware.
- *                                      32-byte key, 32-byte nonce, 16-byte tag.
+ *                                      32-byte key, 32-byte nonce, 32-byte tag.
  *   - XChaCha20-SIV        (§7.5.2) — fallback AEAD, nonce-misuse resistant.
  *                                      64-byte key (two subkeys via SIV
  *                                      construction), 24-byte nonce, 16-byte tag.
