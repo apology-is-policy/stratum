@@ -1,0 +1,798 @@
+# Stratum: Technical Specification
+
+Stratum is a copy-on-write filesystem written in C17, with encryption and integrity built into its
+format. It runs in user space and serves POSIX-shaped files over 9P2000.L. A single Rust binary,
+`stratum`, packages it with a dual-pane file manager, so a Stratum volume can also be used as an
+encrypted container file.
+
+This document is for a technical reader who wants to know what Stratum does, how, what it costs,
+and how it compares with established copy-on-write filesystems. It describes the code as it stands
+and says plainly where the code stops short.
+
+**Tree described:** on-disk format version 33. The filesystem code is the code of commit `471a339`.
+Facts were taken from the source, not from older design prose. The older documents in this
+repository (`ARCHITECTURE.md`, `ROADMAP.md`, parts of `reference/`) contain intentions and stale
+statements; where they disagree with this document, this document was checked against the code.
+
+**How to read a status.** Stratum has a large library layer and a smaller operator surface, so
+"implemented" alone would mislead. This document uses four words:
+
+| Status | Meaning |
+|---|---|
+| **Available** | Implemented and tested, and reachable by an operator through `stratumd`, 9P, `/ctl` or the `stratum` binary |
+| **Library** | Implemented and tested as a C API, with no operator path yet |
+| **Partial** | Works with the limits stated beside it |
+| **Absent** | Not implemented. A design may exist in the older documents |
+
+**How to read a claim.** Limits and behaviour marked *by reading* were established by reading the
+code and were not demonstrated by running it. Numbers marked *derived* are arithmetic from constants
+in the code, not measurements.
+
+---
+
+## 1. Summary
+
+**What is unusual about Stratum:**
+
+- **Encryption is the format, not an option.** There is no unencrypted mode. Every data extent and
+  every metadata tree node except two small plaintext structures is sealed with AEGIS-256, using a
+  32-byte authentication tag. Names, sizes, owners, the shape of the trees and the extent maps are
+  not visible to someone holding only the disk.
+- **Integrity and encryption compose.** Parent pointers carry a BLAKE3 hash of the child's
+  ciphertext, forming a Merkle tree over metadata. Dedup-friendly plaintext hashing, deferred frees
+  and per-node generations are all designed around nonce uniqueness.
+- **Hybrid post-quantum key wrap.** X25519 and ML-KEM-768 through HKDF-SHA256, when built with liboqs.
+- **A metadata engine that mixes three ideas.** A copy-on-write B+tree on disk, B-epsilon messages in
+  internal nodes, and a CAS-prepended delta chain on the root in memory, reclaimed by epochs.
+- **Formal modelling.** 43 TLA+ specifications with 135 deliberately broken configurations that must
+  fail. Each records a bug class the model can catch.
+- **Adversarial audit history.** Audit rounds numbered to R177, then per-chunk rounds, with 145 commits
+  closing an audit.
+
+**What it is not yet:**
+
+- Not a production filesystem. The format is not frozen, and there is no filesystem checker.
+- Its own CI is not green. See section 15.
+- Single device in every shipped path. No redundancy for metadata, no compression, no intent log.
+- Metadata is capped at about 7 GiB per pool, and the size is fixed at format time.
+- Several features exist only as library calls: clones, send and receive, cold tiering and dedup,
+  multi-device pools, and key rotation. A background scrub does not actually run. See section 16.
+
+---
+
+## 2. Status at a glance
+
+| Feature | Status | Limits |
+|---|---|---|
+| Copy-on-write with atomic commit | Available | Whole-pool commit; two device barriers per commit |
+| AEAD encryption of data and metadata | Available | AEGIS-256 fixed; no cipher choice |
+| Merkle-chained metadata | Available | Stops at the extent record; root is unkeyed (section 8) |
+| Snapshots, readable through `.snaps` | Available | A dead list holds 256 entries, past which space leaks (section 10) |
+| Rollback | Available | Destroys newer snapshots, as ZFS does |
+| Snapshot holds | Available | Holds are lost on a crash if not yet committed |
+| Reflink | Available | Whole file, same dataset, empty destination |
+| Hard links, xattrs | Available | Xattr value at most 64 KiB |
+| Symlinks | Partial | Target at most 100 bytes |
+| Advisory locks | Partial | Non-blocking only, in RAM, no deadlock detection |
+| fallocate | Partial | Reserves no space; punches whole extents only |
+| 9P2000.L server with extensions | Available | Unix sockets only |
+| `/ctl` administrative tree, Prometheus metrics | Available | |
+| File manager and encrypted containers (`stratum`) | Partial | See section 14 |
+| Clones | Library | Depth 1; cannot be destroyed; promote is a stub |
+| Send and receive | Library | Plaintext stream; extents only, no names or metadata |
+| Cold tier, content-defined chunking, dedup | Library | Offline only, never on hot writes |
+| Multi-device, mirror, device replace | Library | Metadata on device 0 only |
+| Dataset key rotation | Library | Pool key and wrap key cannot rotate |
+| File seals, file handles, `O_TMPFILE`, `EXCHANGE`, `WHITEOUT` | Library | No 9P operation reaches them |
+| Scrub | Partial | State machine and verbs exist; nothing drives it in a running daemon |
+| Compression | Absent | Format reserves a byte; decoder refuses non-zero |
+| ACLs, quotas, device nodes, FIFOs, sockets | Absent | Quota is a stored property that nothing enforces |
+| Reed-Solomon, LRC | Absent | Refused at create |
+| FUSE, kernel module, TCP listener | Absent | Linux can mount over v9fs; no test drives that here |
+| fsck | Absent | |
+
+---
+
+## 3. On-disk layout
+
+### 3.1 Device layout
+
+```
++---------+---------+--------+----------------+-------------------------+---------+---------+
+| Label 0 | Label 1 | margin | bootstrap pool |        data area        | Label 2 | Label 3 |
+| 256 KiB | 256 KiB | 512 KiB| at 1 MiB       |                         | 256 KiB | 256 KiB |
++---------+---------+--------+----------------+-------------------------+---------+---------+
+```
+
+The minimum device is 8 MiB. The block size is fixed at 4 KiB.
+
+### 3.2 Uberblocks
+
+There is no separate superblock. The root of the filesystem is a 4 KiB **uberblock**, little-endian,
+with magic `STRATUM2` and a BLAKE3-256 self-checksum.
+
+- Each label holds 63 ring slots. Generation `g` goes to label `g % 4`, slot `g % 63`, which gives 252
+  positions. A commit spends two generations, so a device retains about 126 commits of history
+  (*derived*).
+- One uberblock goes to one slot per device per generation. Redundancy comes from history and from
+  other devices, not from writing one generation to all four labels.
+- Mount scans every slot and takes the highest valid generation per device. Across devices, the
+  authoritative generation is the quorum-th highest, with quorum `floor(live / 2) + 1` and a check that
+  a quorum of devices at that generation hold identical content.
+- A read-write mount writes a claim uberblock at `auth + 1`, so generations used by orphaned writes
+  are never reused.
+
+The uberblock carries the roots of the dataset index, the allocator roots, the snapshot index, the CAS
+index, the key schema and the repair log. Per-dataset tree roots live in the dataset index.
+
+### 3.3 Addresses
+
+A physical address is 64 bits: 16 bits of device id and 48 bits of block offset. That allows 64 KiB
+device ids in the format, with 64 devices per pool enforced by the roster, and 1 EiB per device
+(*derived*).
+
+A block pointer (`stm_bptr`) is 64 bytes: address, kind, flags, a 32-byte checksum, and 16 further
+bytes of which the engine uses 8 for the child's birth generation. The birth generation is an input to
+the child's AEAD nonce, which is why the parent must hold it.
+
+### 3.4 The bootstrap pool
+
+All metadata lives in a dedicated region of device 0, the **bootstrap pool**, allocated in 16 KiB
+nodes. File data lives in the data area, which has its own allocator.
+
+- A bitmap of 14 blocks gives 458,752 bits, one per node, so the pool holds **7 GiB of metadata at
+  most**. Past that, format returns `STM_ENOTSUPPORTED`.
+- Header and bitmap exist in two slots, A and B, written alternately and selected by a checksummed
+  generation.
+- The size is **fixed at format and cannot grow**. `stratum mkfs` picks device/16, clamped to 8-256 MiB,
+  and `--bootstrap` overrides it. The library default is `max(64 MiB, device/1024)`; with it, a device
+  of about 7 TiB or more fails at format unless a size is passed (*derived*).
+
+### 3.5 Trees
+
+| Tree | Root held in | Store | Key | Value |
+|---|---|---|---|---|
+| Per-dataset metadata | Dataset entry | Engine | Tag byte + body | Inode, dirent, xattr or extent |
+| Per-snapshot metadata | Snapshot entry | Engine (the captured root) | Same | Same |
+| Dataset index | Uberblock | Whole-tree | 8-byte id | Entry with name, properties, root triple |
+| Snapshot index | Uberblock | Whole-tree | 8-byte id | Record with name and inline dead lists |
+| Allocator, per device | Allocator roots | Whole-tree | Big-endian start block | Length, refcount; refcount 0 is pending free |
+| Allocator roots | Uberblock | Whole-tree | Device id | Root, hash, generation |
+| CAS index | Uberblock | Whole-tree | 32-byte BLAKE3 | Replicas, refcount, length, generation |
+| Key schema | Uberblock | Single plaintext leaf | Dataset id, key id | State, wrapper, wrapped key |
+| Repair log | Uberblock | Single plaintext leaf | Sequence id | 32-byte repair record |
+
+There are two stores, and the difference is the most important structural fact about Stratum today:
+
+- **The engine** (`src/btree_engine`) writes 16 KiB nodes, copies only dirty paths, and has no size limit
+  of its own. It holds everything that scales with file count: inodes, dirents, xattrs and extents, all in
+  one tree per dataset, separated by a tag byte in the key.
+- **The whole-tree store** (`src/btree_store`) is an older design. It writes 128 KiB nodes, at most two
+  levels deep, and rewrites the whole tree on every commit where that tree is dirty. It still holds the
+  allocator, which grows with the number of extents.
+
+Moving the remaining trees onto the engine has been decided and is the next structural change. See
+section 16.
+
+### 3.6 Key records
+
+**Inode, 256 bytes:** id, dataset, generation, mode, uid, gid, nlink, four timestamps with nanoseconds,
+size, kind, flags, change version, and 100 bytes of inline storage used for small files and symlink
+targets. `(ino, gen)` is unique over time: a freed inode number is reused with a bumped generation.
+
+**Dirent:** key `tag, dir_ino, hash_probe`, where the hash is 64-bit FNV-1a plus an open-addressing probe
+of at most 64. Value: child inode, generation, type, name of at most 255 bytes. A removal leaves a
+tombstone so probe chains stay intact.
+
+**Extent, 108 bytes:** kind (hot or cold), up to 4 replica addresses or a content hash, write generation,
+length, key id, the origin dataset, inode and offset used as AEAD associated data, and link generation.
+
+**Spill:** an engine value above the inline bound (5,408 bytes per entry) moves to a chain of 16 KiB
+blocks, at most 1 MiB per value.
+
+---
+
+## 4. The metadata engine
+
+### 4.1 What it is
+
+On disk the engine is a **copy-on-write B+tree** whose internal nodes may carry **B-epsilon messages**. In
+memory it adds one **CAS-prepended delta chain, on the root only**. A mutation travels from the root's
+chain into the root's message buffer, down one level per size-triggered flush, and finally into a leaf.
+
+- **Node:** 16 KiB. A 128-byte header, a 16,224-byte payload, and a trailing 32-byte AEAD tag.
+- **Fanout:** about 143 to 158 children per internal node (*derived*). Epsilon is 1/4: pivots and children
+  may use 3/4 of the payload, and the buffer 1/4.
+- **Leaves:** about 59 inodes or 120 extents.
+- **Consolidation:** a writer that leaves the chain 8 deltas deep tries, inline and only if the locks are free,
+  to fold it into a fresh root.
+- **Splits:** byte-balanced. There is no rightmost optimisation, so ascending inserts leave leaves half full.
+- **Delete:** without merge. Nodes are never merged or removed, so a tree's node count and height never fall.
+  Dirents, xattrs and inodes use tombstones and flags above the engine; only extents delete keys structurally.
+- **No node eviction.** A tree's resident nodes stay in memory until its engine closes.
+
+### 4.2 Trade-offs against the peers (analysis)
+
+| Design | What Stratum gains | What Stratum pays |
+|---|---|---|
+| btrfs: path-COW B-trees, 16 KiB nodes, fsync log tree, extent tree | A small commit can dirty only the root rather than a whole path. No reader tree locks in the engine. Every node AEAD-sealed with a Merkle parent link | No log tree, so fsync is a pool commit. Allocator rewritten whole rather than an incremental extent tree. No merge |
+| ZFS: indirect block trees, transaction groups, ZIL, space maps, ARC | One keyed, uniformly encrypted tree; nothing is left in plaintext for dedup tables or file sizes | No ZIL. No metaslabs: reserve is a first-fit scan. No ARC, so memory grows with touched metadata. Mount is a walk of all metadata. No cross-device metadata copies |
+| bcachefs: log-structured 128-256 KiB nodes, one ordered journal, six-locks | Nothing to replay; one commit point; no reader tree locks | No cheap durable log path; whole nodes are rewritten at commit |
+| Bw-tree: mapping table, per-page chains | Far less machinery, no log-structured store, ordinary COW on disk | One chain means one contention point. A seal briefly blocks writers, so it is not lock-free in the formal sense |
+| B-epsilon trees: BetrFS, TokuDB | Buffered inserts with ordinary COW | Epsilon of 1/4 in 16 KiB nodes batches shallowly. A flush delivers the whole buffer rather than the heaviest child. Measured benefit is 1.0-2.0x node writes, far below the literature's order of magnitude and below this project's own 20-50x target |
+
+The fair summary: Stratum's payoff is one atomic commit step, nothing to replay, and integrity by
+construction. Its bill is commit latency and memory that scale beyond the dirty set.
+
+---
+
+## 5. Concurrency
+
+### 5.1 What is genuinely lockless
+
+At the engine API, these claims hold:
+
+- **Lookup** (`stm_btree_engine_lookup_concurrent`) on a published, resident, unsealed tree takes no mutex and
+  performs no CAS. Its loops are bounded by tree depth and by chain and buffer length. This is the wait-free
+  fast path. An operation can leave it: a sealed chain restarts, a cold child reads the device, and a Merkle
+  failure after a publish restarts, because a pinned reader can see a reused address and the hash catches it.
+- **Insert and delete** (`stm_btree_engine_insert_concurrent`) are a CAS prepend. Among writers this is lock-free
+  while the root is not sealed. A seal is lock-like: prependers wait for the sealer, up to a bound, then get
+  `STM_EBUSY`.
+- **Memory reclamation** is epoch-based. Entering and leaving an epoch is wait-free. Retiring is lock-free apart
+  from `malloc`.
+- **A published tree is immutable** except for its chain head and cold child links. A commit swaps in a private
+  shadow copy and retires the old tree through the epochs.
+
+### 5.2 What is not, at the filesystem level
+
+These are the costs an honest reader must weigh against the section above. They were established by reading the
+code. The size of each stall has not been measured.
+
+- **Reads take a mutex.** Every metadata read resolves its engine through the per-pool dataset index mutex, three
+  times per lookup, and a commit holds that mutex through each dataset's flush, including its device writes. So
+  metadata reads wait during that phase of a commit. "Wait-free metadata reads" would be false as a filesystem claim.
+- **Writers serialize.** A buffered write holds a shared global lock, a per-inode lock, the inode index mutex, the
+  dataset index mutex and a global dirty-buffer mutex. Writers on different inodes contend on those mutexes.
+- **All prepends hit one word**, the root's chain head. There are no per-subtree chains.
+- **A commit excludes writers and extent data reads.** It takes `fs->global` exclusively across the dirty-buffer
+  drain and the commit. Lockless metadata reads continue until they meet the dataset mutex.
+- **One stalled reader stops all reclamation.** Epoch state is process-wide, and a cold descent holds its pin
+  across device I/O.
+- **Isolation is memory safety, not transactions.** Readers see the newest acknowledged state, including uncommitted
+  deltas. A scan can straddle roots. Point-in-time views are snapshots, a separate mechanism.
+
+An accurate one-line description: *metadata readers take no filesystem-wide lock and no engine lock on the common
+path; they pin an epoch and take a brief per-pool mutex to resolve the tree. Writers prepend to the tree with a CAS
+under per-inode and per-index locks. A commit excludes writers.*
+
+### 5.3 Modelled and not modelled
+
+The delta chain and epochs (`concurrency`), root publish and retire (`concurrency_mvcc`), the message buffer
+(`bepsilon`) and the engine's commit (`btree`) have TLA+ models. These have **none**, and rest on audits, tests and
+prose: seal and tombstone sentinels, cold CAS links, mini-consolidation, engine splits, spill chains, and the
+dataset mutex read path.
+
+---
+
+## 6. Commit and crash consistency
+
+### 6.1 The commit
+
+A commit proceeds in this order:
+
+1. Arm barrier deferral on each device, so `fsync` inside the commit only sets a flag.
+2. Commit the key schema, sweep the CAS, and commit each device's allocator and the allocator roots.
+3. Flush every dataset engine: deep-clone the resident tree, fold the chain, write dirty nodes bottom-up.
+4. Commit the dataset index, snapshot index, repair log and CAS index.
+5. Compute the pool Merkle root and build the final uberblock. If it is content-identical to the last durable one,
+   finish without writing anything.
+6. Write the **reservation uberblock**, which holds the old roots at a new generation.
+7. Stage one copy-on-write of the bootstrap bitmap and header.
+8. **First barrier:** one real flush per device.
+9. Write the **final uberblock** with a real fsync, to a quorum. **This is the commit point.**
+10. Finalize engines: publish the new tree, and defer-free superseded nodes.
+
+That is two durability barriers per device per non-clean commit.
+
+### 6.2 Crash states
+
+| Crash | Result at mount |
+|---|---|
+| Before the first barrier | New nodes are unreferenced; a torn bootstrap slot fails its checksum and the other is used. Prior state |
+| Between the barriers | The reservation uberblock may be newest; it holds the old roots. Prior state |
+| Torn final uberblock | Its checksum fails and the scan skips it. Prior state |
+| After the final uberblock | New state. Superseded nodes leak until the mount's sweep |
+
+**There is no journal or intent log.** Everything since the last commit is lost in a crash: chains, buffers and the
+dirty buffer.
+
+Any failed commit wedges the filesystem, one way, until remount. A commit that fails cannot be retried in place.
+
+### 6.3 Mount
+
+Mount loads the allocator into RAM, writes its claim uberblock, and then runs a **mark-sweep across all metadata**:
+every tree of every dataset and every snapshot is read, Merkle-checked and decrypted, to reclaim nodes orphaned by a
+crash. This is what makes crash recovery simple, and it makes mount **O(all metadata nodes)**. Shared subtrees are
+read again per snapshot; there is no deduplication of the walk.
+
+### 6.4 When data becomes durable
+
+- `fsync` is a **whole-pool commit**. `datasync` is ignored, and there is no per-file path.
+- `O_SYNC` and `O_DSYNC` are defined and not consulted.
+- Writes below 1 MiB go to a dirty buffer in RAM (8 MiB per inode, 256 MiB overall); larger writes go to the device
+  directly. Neither is durable until a commit.
+- *By reading*, **there is no periodic commit.** Commits happen on `fsync`, `Tsync`, snapshot, rollback, unmount and
+  space pressure. Data written with no later `fsync` is lost in a crash however old it is. ZFS and btrfs commit every few
+  seconds by default.
+
+### 6.5 Cost of a commit
+
+| Work | Scale |
+|---|---|
+| Engine node writes, spill rewrites | O(dirty) |
+| Deep clone of every open engine's resident tree | O(resident), in RAM, every commit, even clean |
+| Allocator, allocator roots, dataset index, snapshot index, CAS index | O(all records in that tree), when dirty |
+| Key schema, repair log | One 128 KiB leaf, when dirty |
+| Allocator statistics | O(allocator entries), in RAM, at least twice per commit |
+
+A minimal metadata commit writes about 212 KiB (*derived*): two uberblocks, the bootstrap copy, the dataset index and
+one engine node. A data write adds at least 256 KiB for the allocator and its roots.
+
+---
+
+## 7. Space allocation
+
+**Data area.** The truth is an in-memory tree under one reader-writer lock, keyed by start block. Reserve is a **first-fit
+scan from the start of the device**, with a minimum of 2 blocks to avoid unusable gaps. There is no equivalent of ZFS
+metaslabs or btrfs block groups.
+
+**Elias-Fano and xor filters** sit over the allocator's start blocks: a compressed sorted set and an xor8 filter with
+about 0.4% false positives. They are worth noting because they are unusual, and they are narrower than they sound: they
+accelerate **lookup and containment queries only**, never free-space search. They are rebuilt lazily after any reserve.
+
+**Deferred frees.** A free keeps its entry at refcount 0, and a later commit deletes it. Generations step by 2, so a block
+freed at generation `T` can be reused at `T + 2`. This is what keeps `(address, generation)`, and so the AEAD nonce, unique
+within one history.
+
+**Bootstrap pool.** A bitmap with a roving cursor. Frees go on a pending list held in RAM, returned at a commit's stage, or
+early when a reserve finds nothing else, gated by the epochs and forced after 50 ms. A reader that meets a rewritten node
+heals through the Merkle gate.
+
+**A known weakness: free metadata space fragments.** Whole-tree stores need 8 adjacent 16 KiB nodes, while engine nodes take
+one at a time, and a snapshot delete returns scattered singles. In a Python model of a 256 GiB pool, writers therefore stop
+again soon after a delete with about a quarter of metadata space free but unusable: 1117, 733, 163 and 99 commits per cycle,
+stopping at 6, 6, 23 and 25% free. That model has not been confirmed on the real code. Moving the trees to the engine
+removes the cause, because nothing will need adjacent nodes (section 16).
+
+---
+
+## 8. Integrity
+
+### 8.1 Coverage
+
+| Object | Checked by |
+|---|---|
+| Uberblock | BLAKE3-256 self-checksum |
+| Bootstrap header and bitmap | BLAKE3 self-checksums |
+| Encrypted metadata node | BLAKE3-256 of the ciphertext, held in the parent; AEAD tag in the node |
+| Key schema, repair log | BLAKE3 self-checksum, recorded in the uberblock |
+| Data extent | AEAD tag only |
+
+The **pool Merkle root** is BLAKE3-256 over the csums of the six live root trees, four retired zero slots and a public salt,
+stored in the uberblock.
+
+The chain runs from the uberblock through the dataset index, each dataset's root triple, and every engine node and spill
+chain. Snapshots hold their own root triples under the snapshot index. **It stops at the extent record.** The record
+authenticates the addresses, generation, key id and origin; the content is covered by the AEAD tag, not by a hash in the
+chain.
+
+### 8.2 When it is checked
+
+The uberblock at decode, the root at mount, each node on device read, and each extent on read. A mismatch returns
+`STM_ECORRUPT` or `STM_EBADTAG`, which reach a 9P client as `EIO`. Nothing rewrites on read.
+
+### 8.3 What the Merkle root does and does not give
+
+The uberblock checksum and the Merkle root are **unkeyed** and the salt is public. They detect corruption and partial tampering.
+They do not authenticate: someone able to write the disk can recompute them. **Real authentication comes from the AEAD keys** on
+encrypted trees and data.
+
+The contrast with peers is real but specific: btrfs's parent pointers hold a generation and no child checksum, so its node graph
+is not a Merkle tree; ZFS and bcachefs do store child checksums in the parent. Stratum's distinctive part is that this chain runs
+over ciphertext in a filesystem with no plaintext metadata trees, rather than the chain itself.
+
+---
+
+## 9. Encryption
+
+### 9.1 Primitives
+
+| Purpose | Primitive | Parameters |
+|---|---|---|
+| Metadata nodes, data extents, CAS chunks | AEGIS-256 (libsodium 1.0.19 or later) | 32-byte key, 32-byte nonce, 32-byte tag |
+| Key wrap | X25519 + ML-KEM-768, HKDF-SHA256, XChaCha20-Poly1305 | 1,192-byte blob per 32-byte key |
+| Passphrase | Argon2id | t=2, 64 MiB, p=1, the only preset used |
+| Hashes | BLAKE3-256 | Vendored, unkeyed |
+
+**The nonce** is `paddr || gen || pool_uuid`, derived rather than stored. Per-extent associated data binds the pool, origin dataset,
+inode and offset. So ciphertext cannot be moved to another address, generation, file, dataset or pool. Node associated data binds the
+pool and device only.
+
+**Granularity.** Per extent, up to 8 MiB, and per node. The whole extent is verified on each read. The tag is stored after the
+ciphertext and rounded up to blocks, so **a 4 KiB write occupies two blocks**. Files of 100 bytes or fewer live inline in the inode.
+
+**Post-quantum protection depends on the build.** With liboqs the wrap is hybrid. Without it, CMake falls back with a warning to
+X25519 alone, and writes 1,088 zero bytes in the ML-KEM slot. The macOS CI build and the Thylacine OS build of Stratum both run
+without it. Data and metadata use symmetric 256-bit keys in every build.
+
+### 9.2 Key hierarchy
+
+```
+wrap keypair (X25519 + ML-KEM-768), held in a keyfile or by an agent
+   wraps -> pool metadata key: random, one per pool, for the pool's lifetime
+   wraps -> per-dataset DEK: random
+```
+
+- The **pool metadata key** seals every metadata node of every tree and all CAS chunks.
+- A **DEK** seals only that dataset's hot file extents.
+- So **per-dataset trees use the pool key**: names, sizes, owners, xattrs, extent maps, symlink targets and inline data up to 100 bytes
+  are protected by the pool key rather than the DEK. Per-dataset keys separate file contents, not metadata.
+
+**Agents.** `janus` is a Plan-9-style key agent (file and passphrase backends) over 9P on a Unix socket, and it returns plaintext DEKs
+to the filesystem. `corvus`, part of the Thylacine OS, seals per-user dataset keys; a dataset with no key installed reads as locked
+(`STM_ELOCKED`).
+
+### 9.3 Plaintext on disk
+
+- **Uberblocks,** up to 252 historical copies: UUIDs, generation, device count, capacity, free space, inode, dataset and snapshot counters,
+  root addresses and checksums, scrub state.
+- **Bootstrap:** the node allocation bitmap.
+- **Key schema:** dataset ids, key ids, states, wrapper tags, corvus dataset paths (which can name users), wrapped keys.
+- **Repair log:** timestamps, addresses, results.
+
+### 9.4 Threat model
+
+These attacks were **read from the code and not demonstrated**.
+
+**An offline reader with the raw file and no keys learns** that it is a Stratum pool, everything listed in 9.3, which blocks are in use, and
+extent lengths to 4 KiB. With two images, which blocks changed. They do **not** learn file names, exact sizes, which extent belongs to which
+file, owners, contents or CAS hashes.
+
+**Someone able to tamper with the file, with no keys, cannot** forge or edit an encrypted node or extent, get a modified block accepted on read,
+or move ciphertext or a wrapped key elsewhere.
+
+**They can:**
+
+1. **Roll back.** Replace the image with an older one, or destroy the newest slots. Nothing anchors freshness outside the disk.
+2. **Reinstate a retired key.** Key state is plaintext and outside the wrap's associated data, so new writes can be made to use an old DEK.
+3. **Forge a whole pool, given the public wrap key.** The wrap is unauthenticated public-key encryption. Disk authenticity therefore depends on
+   keeping that public key secret.
+4. **Force nonce reuse.** Fork one image, by rollback or a plain file copy, and let both histories write: `(paddr, gen)` can repeat with different
+   plaintext under the same key. AEGIS is not misuse-resistant. For this reason, **do not copy a Stratum volume, write to both copies and keep using
+   both.** The pool metadata key cannot be rotated.
+5. **Rewrite anything keyless,** including the repair log, and deny service by corruption.
+
+**Out of scope:** a compromised live host, keys in RAM (most are not `mlock`ed, though they are wiped on close), plausible deniability, secure deletion
+(there is no TRIM, so superseded ciphertext remains), dishonest `fsync`, and side channels.
+
+### 9.5 Key management gaps
+
+No passphrase or wrap-key change. No multiple unlock slots: one wrap keypair per pool, and losing it loses the pool. No TPM, PKCS#11 or hardware token.
+Dataset DEK rotation exists in the library with no front end, and does not re-encrypt. The pool metadata key never rotates.
+
+---
+
+## 10. Snapshots and clones
+
+**Create** is O(1) apart from its commit: it captures the dataset's root triple. Ids are pool-wide and never recycled. Snapshots are readable under a synthetic
+`.snaps` directory and refuse writes.
+
+**The reclaim rule** uses block birth generations, as ZFS does. A block that dies with a birth after the newest snapshot is freed; otherwise it goes on the newest
+snapshot's dead list. Deleting a snapshot moves its lists to the older neighbour, or frees them if there is none.
+
+**The limit today is severe.** Dead lists are stored inline in the snapshot's record, capped at **256 entries per tier** (data, node, cold). Past the cap the block
+stays allocated with no list entry, permanently: overwriting more than 256 extents under a snapshot leaks space when that snapshot is later deleted. Writers get no error,
+and nothing reports it.
+
+**In progress, not on the main branch:** unbounded dead lists, using one copy-on-write tree per pool keyed by death generation, with deletes done in durable steps. Its
+safety rule is modelled in `specs/dead_tree.tla` and it has been through four audit rounds, the last of which found serious accounting faults. It lands with the move of
+the trees to the engine (section 16), as format 34.
+
+**Rollback** destroys newer snapshots. **Holds** block deletion. A file handle does not survive a rollback and remount.
+
+**Clones** (Library) share an origin snapshot's frozen tree. Depth 1 only: a clone cannot be snapshotted. Promote always returns `STM_ENOTSUPPORTED`. No path destroys a
+clone, so its origin snapshot can never be deleted.
+
+No per-snapshot used or referenced space accounting exists.
+
+---
+
+## 11. Dedup and tiering
+
+Dedup is **offline**: hot writes are never deduplicated. It happens only when data migrates to the cold tier, or on receive, and the cold tier has no operator path other
+than `Tfadvise`.
+
+- **Chunking:** FastCDC with normalized chunking over a Gear hash, default average 8 MiB, minimum 2, maximum 32. Boundaries round to 4 KiB. Since an extent is at most 8 MiB,
+  per-extent chunking at these defaults yields few chunks.
+- **CAS:** keyed by unkeyed BLAKE3 of the plaintext, with a refcount. Chunks are sealed under the **pool** key so they can be shared between datasets, and the hash is stored
+  only inside encrypted nodes.
+
+**How encryption and dedup coexist.** This is a real difference from peers: ZFS allows dedup only within a dataset, its snapshots and its clones, and its dedup tables are
+plaintext; bcachefs and APFS have no dedup. Stratum dedups across datasets with the hashes hidden from a disk reader. **The price is that migrating a dataset to cold removes
+the DEK from reads**, so a holder of the pool key can read it. *By reading*, whether a locked dataset's cold extents remain readable has not been established.
+
+**Recorded ratios:** see section 17.
+
+Reflink shares hot extents through the allocator's refcount and cold ones through the CAS. It is whole-file, same-dataset, with an empty destination. A range clone does not exist.
+
+---
+
+## 12. POSIX surface
+
+| Area | Behaviour |
+|---|---|
+| Permissions | *By reading*, **the 9P server does not check mode bits against the client.** Authorization is `SO_PEERCRED` at attach plus `stratumd` dataset policies. Do not assume POSIX access control is enforced server-side |
+| Rename | Over 9P: plain rename only. *By reading*, moving a directory into its own subtree is not refused at this layer. See section 16 |
+| atime | Effectively `noatime`; set at create and by `utimens` |
+| `st_blocks` | Synthetic, `(size + 511) / 512`, so `du` reports logical size |
+| Sparse files | Supported; no `SEEK_HOLE` or `SEEK_DATA` |
+| mmap | None at this layer; a client maps through its own cache |
+| Read-only flags | `IMMUTABLE`, `APPEND`, `NODUMP` are defined and unused |
+
+---
+
+## 13. Interfaces
+
+**9P2000.L server** (`stratumd`). Default msize 128 KiB, at most 8 MiB. Stratum extensions: `Tbind`, `Tunbind` (replace only), `Tsync`, `Treflink`, `Tfallocate`, `Tfadvise`,
+and `Twalkgetattr`, a fused walk and getattr. `Tpin` and `Tunpin` are reserved and return `ENOSYS`. Transport is Unix sockets; there is no TCP listener.
+
+**`/ctl`.** A synthetic administrative tree on a second socket. Status, datasets and snapshots to read. Verbs for snapshot create, delete, hold, release, rollback, compromise
+marking, DEK install and evict, and scrub control. Prometheus text at `/pools/<uuid>/metrics/prometheus`. No verbs for clones, send, receive, tiering, devices, setting
+properties or destroying datasets. `/events` is RAM-only, capped at 8 MiB, and silently drops past that.
+
+**Other.** `libstratum-9p`, the stable C client ABI. `stratum-slate`, TUI state served as a 9P tree. A read-only host directory server. Platforms: Linux, macOS, and
+aarch64 Thylacine with a virtio-blk backend; io_uring on Linux, POSIX elsewhere.
+
+---
+
+## 14. The volume manager
+
+`stratum` is one binary that re-executes itself as `serve`, `mkfs`, `fs`, `slate` and `host-fs`, plus a FAR Commander-style dual-pane terminal manager. It makes Stratum usable
+as an encrypted container: a volume is a file, and the manager copies files between it and the host.
+
+```
+stratum mkfs vault.stm --size 4G --passphrase-stdin    create a volume
+stratum tui --vol vault.stm                            open it
+stratum fs -s SOCKET put ./dir /dir                    script it
+```
+
+**What works, from the code:** recursive copy (`F5`) with progress and conflict handling, delete (`F8`), mkdir (`F7`), a modal editor (`F3`, `F4`), the create-volume wizard
+(`Shift+F7`), snapshot list, create, delete and rollback (`F9`, dataset 1 only), a pool map and snapshot graph (`F2`), and pressing Enter on a `.stm` file to mount it in the other pane.
+
+**Known gaps:**
+
+- The no-argument landing screen can only open volumes; its "New" prints "not implemented". Use the wizard or `stratum mkfs`.
+- No move or rename in the manager (`stratum fs mv` exists). Three of six admin panes say "Coming soon". Copies carry no mode or mtime across backends and skip symlinks.
+- "Static" is partial: libsodium links dynamically.
+
+**How keys work, and how this differs from VeraCrypt.** A volume always needs a **keyfile**, by default `<volume>.key` beside it. A passphrase does not derive the volume key; it seals the
+keyfile with Argon2id. **Without `--passphrase-stdin`, the keyfile is plaintext, so anyone holding it holds the volume.** Losing it loses the volume, and there is no way to change a passphrase.
+
+| | VeraCrypt | Stratum |
+|---|---|---|
+| Container looks random | Yes; no signature | No; magic `STRATUM2` and plaintext uberblocks |
+| Hidden volumes, deniability | Yes | No |
+| Mounts as an OS drive | Yes | No; through the manager, `stratum fs`, or v9fs on Linux |
+| Passphrase alone opens it | Yes | No; a keyfile is always required |
+| Change password, backup headers | Yes | No |
+| Ciphers | Choice and cascades, XTS | AEGIS-256 only, authenticated |
+| Detects tampering of data | No, by its own security model | Yes |
+| Hides which sectors changed | No | No |
+| Snapshots, rollback | Inside a guest filesystem, if any | Yes |
+| Post-quantum key wrap | No | When built with liboqs |
+| GUI, Windows | Yes | Terminal only; macOS and Linux |
+
+Stratum is the opposite trade to VeraCrypt: it does not hide that it exists, but it authenticates everything it stores.
+
+---
+
+## 15. Evidence of correctness
+
+**Tests.** 80 suites and 2,489 test legs, in C. The manager has 35 Rust integration tests and 97 unit tests.
+
+**TLA+.** 43 specifications with 191 configurations, of which 135 are deliberately broken and must fail. Coverage includes commit and quorum, allocator and deferred free, nonce uniqueness,
+Merkle links, COW commit, delta chains and epochs, the namespace layer, compound operations, dead lists, clones, CAS, and the key schema. CI runs 12 of these configurations. The rest are run by
+hand. Two cautions. `sync.tla`'s `NonceUnique` cannot fail as written, so nonce uniqueness rests on `allocator.tla` and `metadata_nonce.tla`. And `merkle.tla` assumes the attacker does not touch the
+uberblock.
+
+**Audits.** Adversarial review rounds numbered R0 to R177, the first 15 on an earlier prototype, then per-chunk rounds; 145 commits close an audit. A count of rounds is evidence of process, not a
+result.
+
+**Sanitizers.** ASan, UBSan, TSan and MSan build options.
+
+**What the evidence does not cover:**
+
+- **CI is red.** At `471a339`, 8 of 9 build jobs fail, and the last fully green run was 2026-04-20. A gcc build breaks on `-Werror=misleading-indentation`. Linux/clang fails 6 of 80 suites and
+  ASan 10 of 80; many of those assertions read fault-injection counters at 0, which may be a difference between the io_uring and POSIX backends (a hypothesis). macOS/clang without sanitizers passes, and
+  so do the 12 TLC configurations.
+- **Zero fuzz targets.** `STM_BUILD_FUZZERS` exists and builds nothing.
+- No xfstests run, no soak run, no kernel 9P mount in CI.
+- The manager is not built or tested by CI.
+
+---
+
+## 16. Limits and unbuilt work
+
+### 16.1 Hard limits
+
+| Limit | Value | Kind | Past it |
+|---|---|---|---|
+| File size | 2^63 - 1 bytes | Implementation | `EFBIG` |
+| Device size | 1 EiB, *derived* | Format | Not representable |
+| Devices per pool | 64 | Format | Refused |
+| Filename | 255 bytes | Format | `EINVAL` |
+| Directory probe chain | 64 | Implementation | `ENOSPC` at create |
+| Symlink target | 100 bytes | Format | `ENAMETOOLONG` |
+| Xattr name, value | 255 bytes, 64 KiB | Format, implementation | Error |
+| Hard links | 2^32 - 1 | Format | `EOVERFLOW` |
+| Extent | 8 MiB | Implementation | Split |
+| Replicas per extent | 4 | Format | |
+| Metadata per pool | 7 GiB; 256 MiB unless `--bootstrap` is passed | Format | `ENOSPC` |
+| Inodes, upper bound | About 27M at 7 GiB; 966K at 256 MiB; 241K at 64 MiB, *derived*, with internal nodes ignored | Metadata space | `ENOSPC` |
+| Datasets plus clones | About 104, *derived*: the key schema is one 128 KiB leaf | Implementation | *By reading*, create succeeds and every later commit fails |
+| Allocator ranges | 9,391,788 per device, *derived* | Implementation | Commit fails and the filesystem wedges |
+| CAS chunks | 1,646,722, *derived* | Implementation | |
+| Dead list | 256 entries per tier per snapshot | Implementation | Space leaks silently |
+| Clone depth | 1 | Implementation | Refused |
+| Repair log | 2,048 entries | Implementation | Entry lost, repair still lands |
+| Engine tree depth | 32 | Implementation | |
+| Engine value | 1 MiB | Implementation | |
+| Fids per 9P connection | 4,096 | Implementation | `EBADF` |
+| Walk components | 16 per message | Implementation | Client walks in hops |
+| Locks | 256 per owner, 4,096 per client, 65,536 total | Implementation | `ENOLCK` |
+| 9P qid uniqueness | Low 32 bits of the inode number | Implementation | *By reading*, silent collision past 2^32 inodes |
+
+### 16.2 Decided next
+
+**All trees on the engine.** The allocator, allocator roots, dataset, snapshot and CAS indexes, key schema and repair log move off the whole-tree store. Nothing then needs adjacent nodes, which removes
+the metadata fragmentation of section 7, the commit's whole-allocator rewrite, and the caps on allocator ranges and datasets. This is a format change with an upgrade at mount. In the same model as section
+7 it reaches 1220, 773, 586, 453 commits per cycle and stops near 0% free, with the caveat that the model assumes trees shrink as records go, and the engine has no merge yet, so that must be built too.
+
+**Unbounded dead lists** arrive with it (section 10).
+
+### 16.3 Known defects
+
+All are tracked. Those marked *by reading* have not been reproduced yet.
+
+- CI red, as in section 15.
+- *By reading:* rename of a directory into its own subtree detaches it into an unreachable cycle.
+- *By reading:* a scrub started on a running daemon reports RUNNING and verifies nothing, since nothing steps it. When driven, it verifies hot extents only and counts everything else as verified.
+- *By reading:* a device replace moves bytes without rewriting extent addresses (library only).
+- *By reading:* in the manager, the wizard makes a plaintext keyfile if "Use passphrase" is ticked and the field is left empty, and the editor says "Saved." before writing and discards the result.
+
+### 16.4 Unbuilt
+
+Compression. Reed-Solomon and LRC. Metadata replicas: **all metadata is on device 0, and a corrupt metadata node is unrepairable.** Reconstruction of a failed device. Evacuating a range above 4 MiB. Periodic commit,
+per-file fsync, and an intent log. fsck. Encryption-preserving (raw) send. Send of inodes, names, xattrs and deletes. Metadata scrub. Wrap-key and passphrase change. Per-dataset metadata keys. Hardware key backends.
+Long symlinks. Blocking locks. ACLs. Quotas. Per-snapshot space accounting. FUSE and language bindings. Node merge, node eviction, and bootstrap growth. Format freeze.
+
+---
+
+## 17. Performance
+
+**No benchmark against ext4, btrfs or ZFS has been run, so no comparison claim is made.** Stratum is expected to be slower at synchronous workloads because of whole-pool commits and the absence of an intent log, and this has not been quantified.
+
+The figures below are recorded in this repository. None states its build type, and all predate later work, so treat them as indicative. They are not results for the current tree.
+
+| Measure | Result | Provenance |
+|---|---|---|
+| AEGIS-256, 1 MiB | 8,835 MiB/s encrypt, 7,897 decrypt | Apple M2; no date or commit. A primitive ceiling, not filesystem throughput |
+| BLAKE3, NEON | 1,898 MiB/s | Same |
+| Commit, empty | 13.6 us | macOS with `F_FULLFSYNC`, 256 MiB pool; no date or commit. The clean-commit skip |
+| Commit, metadata | 19.5 ms | Same |
+| Commit, 4 KiB data | 27.7 ms, 118x write amplification | Same |
+| Commit, 64 KiB data | 27.3 ms, 8.3x write amplification | Same |
+| fsbench, in a Thylacine guest over 9P | 9.2 MiB/s sequential write, 27-29 MiB/s cold read, 78-103 MiB/s reread, about 1,300-1,560 creates/s | 2026-07-07, HVF, 4 CPUs. A guest figure, not a device figure |
+| B-epsilon node write reduction | 1.83-2.04x at fsync per operation, 1.00x at batch cadence | Design note; target of 20-50x not met |
+| Reflink | 2,062 to 15,141 ns per extent, N=1 to 1024 | 2026-04-30, macOS, commit `d444ca2` plus an uncommitted bench |
+| Dedup ratio | 3.21 to 4.47 on a synthetic VM-image corpus (64 KiB chunks) | 2026-04-30, GCP e2-standard-4, commit `3ff8f77`. Not reachable from the shipped binary |
+
+**Structural expectations (analysis):** a large commit is dominated by rewriting the allocator (about 14 MiB at 113 allocator units, *derived*), and a small one by barriers. A read is fast once resident, since tree nodes stay in memory, though unbounded memory
+growth is the other side of that. A mount slows with total metadata.
+
+---
+
+## 18. Comparison
+
+Sourced from each project's documentation or source on 2026-11-05. "Not found" means looked and not found, not absent. "Library" for Stratum means no operator path yet. Tags refer to section 19.
+
+### 18.1 Structure and durability
+
+| | Stratum | OpenZFS | btrfs | bcachefs | APFS |
+|---|---|---|---|---|---|
+| Metadata | COW B+tree with messages, 16 KiB; older trees rewritten whole | Block pointer tree, 128-byte bp [Z-spa] | COW B-trees, 16 KiB default [B-mkfs] | Log-structured b+tree nodes, 256 KiB default [BC-pdf] | B-trees, 4 KiB [A-ref] |
+| fsync | Whole-pool commit | ZIL, optional SLOG [Z-zil] | Log tree [B-btrees] | Ordered journal [BC-pop] | Not found |
+| Periodic commit | None, *by reading* | 5 s default [Z-mod] | 30 s default [B-man5] | Journal flush 1 s default [BC-pop] | Not found |
+| Merkle parent links | Yes, over ciphertext | Yes (derived) [Z-spa] | No; generation only (derived) [L-btrtree] | Yes, "chain of trust" [BC-enc] | Fletcher in each object [A-ref]; hash tree only on signed system volumes [A-ssv] |
+| Default checksum | BLAKE3 for nodes; AEAD for data | fletcher4 [Z-props] | crc32c [B-csum] | crc32c [BC-pop] | Fletcher 64 [A-ref] |
+| Redundancy | Mirror, Library; metadata none | Mirror, raidz, dRAID, copies [Z-pool] | RAID profiles; RAID5/6 not for production [B-man5] | Replicas, erasure coding [BC-pop] | Not in the filesystem layer [A-faq] |
+| Compression | None | lz4, zstd, gzip and more [Z-props] | zlib, lzo, zstd [B-comp] | gzip, lz4, zstd [BC-pop] | Not found |
+
+### 18.2 Encryption and dedup
+
+| | Stratum | OpenZFS | btrfs | bcachefs | APFS |
+|---|---|---|---|---|---|
+| Native encryption | Always on | Optional, per dataset [Z-props] | None in documents read; fscrypt series posted, merge not confirmed [B-status][B-lwnfs] | Whole filesystem, at format [BC-pop] | Optional [A-feat] |
+| Cipher | AEGIS-256 | AES-CCM, AES-GCM [Z-props] | | ChaCha20-Poly1305 [BC-pop] | AES-XTS or CBC [A-feat] |
+| Authenticated data | Yes, 256-bit tag | Yes | | Yes, 80-bit MAC default [BC-enc] | Not by XTS (analysis) |
+| Names and sizes visible on disk | No | Dataset names and file sizes visible [Z-key] | | Superblock and node headers only [BC-enc] | Not found |
+| Dedup | Offline, Library, across datasets | Inline; within a dataset and its family when encrypted [Z-key] | Out-of-band tools [B-dedup] | None [BC-faq] | None; clones [A-faq] |
+| Post-quantum wrap | When built with liboqs | Not found | | Not found | Not found |
+
+### 18.3 Snapshots and space
+
+| | Stratum | OpenZFS | btrfs | bcachefs |
+|---|---|---|---|---|
+| Reclaim model | Birth generation, dead lists capped at 256 | Birth time, deadlists merged on destroy [Z-dsl][Z-destroy] | Refcounts in the extent tree [B-design] | Keys versioned by snapshot id [BC-snap] |
+| Delete cost | Moves lists, frees at the end | Background `async_destroy` [Z-feat] | Background cleaning [B-subvol] | Proportional to the snapshot's data [BC-pdf] |
+| Near-full | Refuses at commit; fragments today | 3.2% slop [Z-misc] | Global reserve, 512 MiB cap; can return ENOSPC with df showing free [L-rsv][B-man5] | Copygc, 8% reserve [BC-pop] |
+| When no contiguous space | Refused | Gang blocks [Z-zio] | Metadata chunks [B-design] | Copygc [BC-pop] |
+
+### 18.4 Limits
+
+| | Stratum | OpenZFS | btrfs | APFS | ReFS |
+|---|---|---|---|---|---|
+| File size | 2^63 - 1 | 2^64 [Z-dnode] | 2^63 by VFS [B-man5] | 2^63 [A-comp] | 35 PB [R-over] |
+| Filename | 255 | 255; 1023 with longname [Z-hdr] | 255 [B-man5] | 10-bit length field [A-ref] | 255 [R-over] |
+| Files | Metadata-bound, 27M at the 7 GiB cap | 2^48 per objset [Z-dnode] | 2^64 per subvolume [B-man5] | 64-bit ids [A-comp] | 2^64 per directory (2012) [R-blog] |
+
+bcachefs was removed from mainline Linux at 6.18 and ships as a DKMS module [L-618][BC-home]. HAMMER2 and WAFL are not tabled because too few comparable facts were found; WAFL's activemap and snapmap bitmaps are worth reading as a contrasting design [W-f17].
+
+---
+
+## 19. References
+
+Z-spa https://raw.githubusercontent.com/openzfs/zfs/master/include/sys/spa.h
+Z-zil https://raw.githubusercontent.com/openzfs/zfs/master/module/zfs/zil.c
+Z-mod https://openzfs.github.io/openzfs-docs/man/master/4/zfs.4.html
+Z-props https://openzfs.github.io/openzfs-docs/man/master/7/zfsprops.7.html
+Z-pool https://openzfs.github.io/openzfs-docs/man/master/7/zpoolconcepts.7.html
+Z-key https://openzfs.github.io/openzfs-docs/man/master/8/zfs-load-key.8.html
+Z-feat https://openzfs.github.io/openzfs-docs/man/master/7/zpool-features.7.html
+Z-dsl https://raw.githubusercontent.com/openzfs/zfs/master/module/zfs/dsl_dataset.c
+Z-destroy https://raw.githubusercontent.com/openzfs/zfs/master/module/zfs/dsl_destroy.c
+Z-misc https://raw.githubusercontent.com/openzfs/zfs/master/module/zfs/spa_misc.c
+Z-zio https://raw.githubusercontent.com/openzfs/zfs/master/module/zfs/zio.c
+Z-dnode https://raw.githubusercontent.com/openzfs/zfs/master/include/sys/dnode.h
+Z-hdr https://raw.githubusercontent.com/openzfs/zfs/master/include/sys/fs/zfs.h
+L-btrtree https://raw.githubusercontent.com/torvalds/linux/master/include/uapi/linux/btrfs_tree.h
+L-rsv https://raw.githubusercontent.com/torvalds/linux/master/fs/btrfs/block-rsv.c
+L-618 https://raw.githubusercontent.com/torvalds/linux/v6.18/fs/bcachefs/Kconfig
+B-mkfs https://btrfs.readthedocs.io/en/latest/mkfs.btrfs.html
+B-btrees https://btrfs.readthedocs.io/en/latest/dev/dev-btrees.html
+B-man5 https://btrfs.readthedocs.io/en/latest/btrfs-man5.html
+B-csum https://btrfs.readthedocs.io/en/latest/Checksumming.html
+B-comp https://btrfs.readthedocs.io/en/latest/Compression.html
+B-status https://btrfs.readthedocs.io/en/latest/Status.html
+B-lwnfs https://lwn.net/Articles/1072623/
+B-dedup https://btrfs.readthedocs.io/en/latest/Deduplication.html
+B-design https://btrfs.readthedocs.io/en/latest/dev/dev-btrfs-design.html
+B-subvol https://btrfs.readthedocs.io/en/latest/Subvolumes.html
+BC-home https://bcachefs.org/
+BC-faq https://bcachefs.org/FAQ/
+BC-enc https://bcachefs.org/Encryption/
+BC-snap https://bcachefs.org/Snapshots/
+BC-pop https://raw.githubusercontent.com/koverstreet/bcachefs-tools/master/doc/bcachefs-principles-of-operation.tex
+BC-pdf https://bcachefs.org/bcachefs-principles-of-operation.pdf
+A-ref https://developer.apple.com/support/downloads/Apple-File-System-Reference.pdf
+A-faq https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/FAQ/FAQ.html
+A-feat https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/Features/Features.html
+A-comp https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/VolumeFormatComparison/VolumeFormatComparison.html
+A-ssv https://support.apple.com/guide/security/signed-system-volume-security-secd698747c9/web
+R-over https://learn.microsoft.com/en-us/windows-server/storage/refs/refs-overview
+R-blog https://learn.microsoft.com/en-us/archive/blogs/b8/building-the-next-generation-file-system-for-windows-refs
+W-f17 https://www.usenix.org/system/files/conference/fast17/fast17-kesavan.pdf
+V-spec https://veracrypt.io/en/VeraCrypt%20Volume%20Format%20Specification.html
+V-hid https://veracrypt.io/en/Hidden%20Volume.html
+V-sec https://veracrypt.io/en/Security%20Model.html
