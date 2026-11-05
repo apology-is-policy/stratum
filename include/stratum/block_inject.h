@@ -4,13 +4,12 @@
  *
  * Chunk 8 (Phase 3 exit): the crash-injection fuzzer needs to synthesize
  * power-loss-style partial-commit scenarios without physical hardware.
- * The POSIX backend carries an opt-in countdown that fires STM_EIO on a
- * targeted state-changing op (write / fsync / fdatasync) without
- * performing the I/O, simulating a sudden hardware death immediately
- * before that op committed.
+ * The device carries an opt-in countdown, above its backend, that fires
+ * STM_EIO on a targeted state-changing op (write / fsync / fdatasync)
+ * without performing the I/O, simulating a sudden hardware death
+ * immediately before that op committed.
  *
- * This is a testing-only surface. It is a no-op on any non-POSIX
- * backend (iouring, DAX, etc.). Not stable — callers outside the
+ * This is a testing-only surface. Not stable: callers outside the
  * fuzzer should not rely on it.
  *
  * Semantics:
@@ -28,7 +27,7 @@
  *       actually reached" (injected_fired_count went up) vs "the
  *       workload never got that far" (still 0).
  *
- * Both functions are safe on NULL / non-POSIX handles (no-op / return 0).
+ * Both functions are safe on NULL handles (no-op / return 0).
  */
 #ifndef STRATUM_V2_BLOCK_INJECT_H
 #define STRATUM_V2_BLOCK_INJECT_H
@@ -54,6 +53,13 @@ uint32_t stm_bdev_inject_fired_count(const struct stm_bdev *d);
 void stm_bdev_io_stats(const struct stm_bdev *d, uint64_t *writes,
                        uint64_t *write_bytes, uint64_t *fsyncs);
 void stm_bdev_io_stats_reset(struct stm_bdev *d);
+
+/*
+ * io_uring only, a no-op elsewhere: the next `count` kernel entries fail with
+ * `errnum` and leave their op queued in the ring, as a real failed entry does.
+ */
+void stm_bdev_iouring_fail_submit_for_test(struct stm_bdev *d, int errnum,
+                                           unsigned count);
 
 #ifdef __cplusplus
 }

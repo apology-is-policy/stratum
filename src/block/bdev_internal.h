@@ -65,6 +65,7 @@ stm_status stm_bdev_open_posix  (const char *path, const stm_bdev_open_opts *opt
 #if STM_HAVE_IOURING
 stm_status stm_bdev_open_iouring(const char *path, const stm_bdev_open_opts *opts,
                                  stm_bdev **out);
+void stm_iouring_fail_submit(stm_bdev *d, int errnum, unsigned count);
 #endif
 
 #if defined(__thylacine__)

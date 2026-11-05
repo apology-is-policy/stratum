@@ -183,6 +183,17 @@ uint32_t stm_bdev_inject_fired_count(const stm_bdev *d)
     return (uint32_t)atomic_load_explicit(&d->inject_fired, memory_order_relaxed);
 }
 
+void stm_bdev_iouring_fail_submit_for_test(stm_bdev *d, int errnum, unsigned count)
+{
+#if STM_HAVE_IOURING
+    if (d && d->caps.backend == STM_BDEV_BACKEND_IOURING) {
+        stm_iouring_fail_submit(d, errnum, count);
+    }
+#else
+    (void)d; (void)errnum; (void)count;
+#endif
+}
+
 void stm_bdev_io_stats(const stm_bdev *d, uint64_t *writes,
                        uint64_t *write_bytes, uint64_t *fsyncs)
 {

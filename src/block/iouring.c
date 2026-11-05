@@ -16,6 +16,11 @@
  *   - A reaper dispatches whatever it finds, including other threads' sync
  *     ops, and wakes the waiters when its batch is done. Reaping passes on
  *     when the reaper's own op has finished.
+ *   - So a completion callback must not make a sync call on its own device:
+ *     it would wait for the seat it is sitting in.
+ *   - d->lock is held from taking an SQE until the kernel has consumed it, so
+ *     at most one SQE is ever unconsumed and an entry's result is about that
+ *     one op.
  */
 #include "bdev_internal.h"
 
@@ -26,11 +31,13 @@
 #include <linux/fs.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct pending {
@@ -47,7 +54,8 @@ typedef struct {
     int               fd;
 
     struct io_uring   ring;
-    pthread_mutex_t   lock;       /* SQ + pending table */
+    pthread_mutex_t   lock;       /* SQ + pending table + ring_dead */
+    bool              ring_dead;
 
     pending          *ptable;     /* queue_depth entries */
     pending          *free_list;
@@ -60,7 +68,13 @@ typedef struct {
     atomic_int        inflight;
 
     bool              has_sqpoll;
+
+    int               fail_submit_errno;   /* under lock; tests only */
+    unsigned          fail_submit_count;
 } iouring_bdev;
+
+/* How long a kernel short of memory for requests is waited out. */
+enum { SUBMIT_RETRY_MS = 30000 };
 
 static stm_status errno_to_status_ur(int e)
 {
@@ -148,17 +162,70 @@ static int drain_cqes(iouring_bdev *d, int max_events, bool blocking)
     return delivered;
 }
 
-/* Internal submit helper. Caller must hold d->lock. */
+static int enter_locked(iouring_bdev *d)
+{
+    if (d->fail_submit_count > 0) {
+        d->fail_submit_count--;
+        return -d->fail_submit_errno;
+    }
+    return io_uring_submit(&d->ring);
+}
+
+/*
+ * Internal submit helper. Caller must hold d->lock.
+ *
+ * Nothing takes an SQE back: after a failed entry it is still in the ring and
+ * the next entry starts it, so reporting the op as failed would let the caller
+ * reuse a buffer the kernel is about to touch, and let this slot go to another
+ * op that the old completion then lands on. So a failure that can pass is
+ * waited out, and one that cannot ends the ring: nothing enters it again, so
+ * what is queued in it never runs and the op really did not happen.
+ *
+ * A full CQ cannot be the cause: the slots bound what is in flight below the
+ * CQ's size. EBUSY is treated as the end, not retried, because the reaper needs
+ * this lock to free the slot it has just finished with.
+ */
 static stm_status submit_locked(iouring_bdev *d, pending *p,
                                 struct io_uring_sqe *sqe)
 {
     io_uring_sqe_set_data(sqe, p);
-    int r = io_uring_submit(&d->ring);
-    if (r < 0) {
-        pending_release(d, p);
-        return errno_to_status_ur(-r);
+    for (int waited_ms = 0; waited_ms < SUBMIT_RETRY_MS; ) {
+        int r = enter_locked(d);
+        if (r >= 0 && io_uring_sq_ready(&d->ring) == 0) {
+            atomic_fetch_add(&d->inflight, 1);
+            return STM_OK;
+        }
+        if (r < 0 && r != -EAGAIN && r != -EINTR) break;
+        if (r != -EINTR) {
+            const struct timespec ms = { .tv_sec = 0, .tv_nsec = 1000000 };
+            nanosleep(&ms, NULL);
+            waited_ms++;
+        }
     }
-    atomic_fetch_add(&d->inflight, 1);
+    d->ring_dead = true;
+    pending_release(d, p);
+    return STM_EIO;
+}
+
+/* Take a slot and an SQE for one op. On success the caller holds d->lock and
+ * must call submit_locked, which leaves it held. */
+static stm_status op_begin(iouring_bdev *d, stm_op_kind kind,
+                           stm_bdev_completion_cb cb, void *user, size_t len,
+                           pending **out_p, struct io_uring_sqe **out_sqe)
+{
+    pthread_mutex_lock(&d->lock);
+    if (d->ring_dead) { pthread_mutex_unlock(&d->lock); return STM_EIO; }
+    pending *p = pending_alloc(d);
+    if (!p) { pthread_mutex_unlock(&d->lock); return STM_EAGAIN; }
+    p->kind = kind;
+    p->cb   = cb;
+    p->user = user;
+    p->len  = len;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&d->ring);
+    if (!sqe) { pending_release(d, p); pthread_mutex_unlock(&d->lock); return STM_EAGAIN; }
+    *out_p = p;
+    *out_sqe = sqe;
     return STM_OK;
 }
 
@@ -206,6 +273,27 @@ static void reap_end(iouring_bdev *d)
     pthread_cond_broadcast(&d->cq_cond);
 }
 
+/*
+ * Every slot is taken, by other threads or by async ops nobody has reaped. A
+ * sync caller cannot act on EAGAIN, which everywhere above this layer means a
+ * lock conflict, so make room. Holding the seat, inflight above zero means a
+ * completion is coming, since no other thread can have taken it.
+ */
+static stm_status wait_for_slot(iouring_bdev *d)
+{
+    pthread_mutex_lock(&d->cq_lock);
+    if (!reap_begin_locked(d)) {
+        pthread_cond_wait(&d->cq_cond, &d->cq_lock);
+        pthread_mutex_unlock(&d->cq_lock);
+        return STM_OK;
+    }
+    pthread_mutex_unlock(&d->cq_lock);
+    int n = atomic_load(&d->inflight) > 0 ? drain_cqes(d, 16, true) : 0;
+    reap_end(d);
+    pthread_mutex_unlock(&d->cq_lock);
+    return n < 0 ? (stm_status)n : STM_OK;
+}
+
 /* Submit one op and wait for completion. One-shot — caller handles looping
  * for short transfers. */
 static stm_status sync_one(iouring_bdev *d,
@@ -219,19 +307,24 @@ static stm_status sync_one(iouring_bdev *d,
 
     /* Submit via the appropriate async entry point. */
     stm_status s;
-    switch (kind) {
-    case STM_OP_READ:
-        s = op_submit_read (&d->base, off, buf, len, sync_cb, &w);
-        break;
-    case STM_OP_WRITE:
-        s = op_submit_write(&d->base, off, buf, len, sync_cb, &w);
-        break;
-    case STM_OP_FSYNC:
-        s = op_submit_fsync(&d->base, sync_cb, &w);
-        break;
-    default:
-        s = STM_EINVAL;
-        break;
+    for (;;) {
+        switch (kind) {
+        case STM_OP_READ:
+            s = op_submit_read (&d->base, off, buf, len, sync_cb, &w);
+            break;
+        case STM_OP_WRITE:
+            s = op_submit_write(&d->base, off, buf, len, sync_cb, &w);
+            break;
+        case STM_OP_FSYNC:
+            s = op_submit_fsync(&d->base, sync_cb, &w);
+            break;
+        default:
+            s = STM_EINVAL;
+            break;
+        }
+        if (s != STM_EAGAIN) break;
+        s = wait_for_slot(d);
+        if (s != STM_OK) return s;
     }
     if (s != STM_OK) return s;
 
@@ -249,8 +342,13 @@ static stm_status sync_one(iouring_bdev *d,
         int n = drain_cqes(d, 16, true);
         reap_end(d);
         if (n < 0) {
-            pthread_mutex_unlock(&d->cq_lock);
-            return (stm_status)n;
+            /* Our op is still in flight, so the kernel may yet write the
+             * caller's buffer and its completion would land on this frame.
+             * There is no return from that. A crash leaves the pool at its
+             * last commit. */
+            fprintf(stderr, "stratum: io_uring wait failed with %d ops in flight: %s\n",
+                    atomic_load(&d->inflight), stm_strerror((stm_status)n));
+            abort();
         }
     }
     pthread_mutex_unlock(&d->cq_lock);
@@ -386,19 +484,13 @@ static stm_status op_submit_read(stm_bdev *base, uint64_t off, void *buf,
     iouring_bdev *d = (iouring_bdev *)base;
     if (!len_fits_io_uring(len)) return STM_ERANGE;
 
-    pthread_mutex_lock(&d->lock);
-    pending *p = pending_alloc(d);
-    if (!p) { pthread_mutex_unlock(&d->lock); return STM_EAGAIN; }
-    p->kind = STM_OP_READ;
-    p->cb   = cb;
-    p->user = user;
-    p->len  = len;
-
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&d->ring);
-    if (!sqe) { pending_release(d, p); pthread_mutex_unlock(&d->lock); return STM_EAGAIN; }
+    pending *p;
+    struct io_uring_sqe *sqe;
+    stm_status s = op_begin(d, STM_OP_READ, cb, user, len, &p, &sqe);
+    if (s != STM_OK) return s;
     io_uring_prep_read(sqe, d->fd, buf, (unsigned int)len, off);
 
-    stm_status s = submit_locked(d, p, sqe);
+    s = submit_locked(d, p, sqe);
     pthread_mutex_unlock(&d->lock);
     return s;
 }
@@ -410,19 +502,13 @@ static stm_status op_submit_write(stm_bdev *base, uint64_t off, const void *buf,
     iouring_bdev *d = (iouring_bdev *)base;
     if (!len_fits_io_uring(len)) return STM_ERANGE;
 
-    pthread_mutex_lock(&d->lock);
-    pending *p = pending_alloc(d);
-    if (!p) { pthread_mutex_unlock(&d->lock); return STM_EAGAIN; }
-    p->kind = STM_OP_WRITE;
-    p->cb   = cb;
-    p->user = user;
-    p->len  = len;
-
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&d->ring);
-    if (!sqe) { pending_release(d, p); pthread_mutex_unlock(&d->lock); return STM_EAGAIN; }
+    pending *p;
+    struct io_uring_sqe *sqe;
+    stm_status s = op_begin(d, STM_OP_WRITE, cb, user, len, &p, &sqe);
+    if (s != STM_OK) return s;
     io_uring_prep_write(sqe, d->fd, buf, (unsigned int)len, off);
 
-    stm_status s = submit_locked(d, p, sqe);
+    s = submit_locked(d, p, sqe);
     pthread_mutex_unlock(&d->lock);
     return s;
 }
@@ -432,19 +518,13 @@ static stm_status op_submit_fsync(stm_bdev *base,
 {
     iouring_bdev *d = (iouring_bdev *)base;
 
-    pthread_mutex_lock(&d->lock);
-    pending *p = pending_alloc(d);
-    if (!p) { pthread_mutex_unlock(&d->lock); return STM_EAGAIN; }
-    p->kind = STM_OP_FSYNC;
-    p->cb   = cb;
-    p->user = user;
-    p->len  = 0;
-
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&d->ring);
-    if (!sqe) { pending_release(d, p); pthread_mutex_unlock(&d->lock); return STM_EAGAIN; }
+    pending *p;
+    struct io_uring_sqe *sqe;
+    stm_status s = op_begin(d, STM_OP_FSYNC, cb, user, 0, &p, &sqe);
+    if (s != STM_OK) return s;
     io_uring_prep_fsync(sqe, d->fd, 0);
 
-    stm_status s = submit_locked(d, p, sqe);
+    s = submit_locked(d, p, sqe);
     pthread_mutex_unlock(&d->lock);
     return s;
 }
@@ -479,6 +559,15 @@ static int op_wait(stm_bdev *base, int max_events)
     reap_end(d);
     pthread_mutex_unlock(&d->cq_lock);
     return n;
+}
+
+void stm_iouring_fail_submit(stm_bdev *base, int errnum, unsigned count)
+{
+    iouring_bdev *d = (iouring_bdev *)base;
+    pthread_mutex_lock(&d->lock);
+    d->fail_submit_errno = errnum;
+    d->fail_submit_count = count;
+    pthread_mutex_unlock(&d->lock);
 }
 
 static stm_status op_register_buffers(stm_bdev *base, void **bufs,
