@@ -1526,7 +1526,7 @@ static stm_status image_lock(const char *path, int *out_fd)
 {
     stm_status s = stm_bdev_claim_image(path, false, out_fd);
     if (s == STM_EBUSY) {
-        fprintf(stderr, "stratumd: %s is already open in another stratumd\n", path);
+        fprintf(stderr, "stratumd: already open in another stratumd: %s\n", path);
         return s;
     }
     if (s != STM_OK && s != STM_ENOENT) { /* the mount reports a missing image */

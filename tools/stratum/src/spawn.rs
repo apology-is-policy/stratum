@@ -63,10 +63,12 @@ pub fn wait_for_daemon(child: &mut Child, sock: &Path) -> Result<()> {
 
 /// What a daemon's log says about why it did not start, for the person who asked.
 pub fn start_failure(log: &str) -> String {
+    // Its last line is only the wrapper's "run failed (rc=N)": the reason is above it.
     let said = log
         .lines()
-        .filter(|l| !l.contains("serving "))
+        .filter(|l| !l.contains("serving ") && !l.contains("run failed (rc="))
         .next_back()
+        .or_else(|| log.lines().next_back())
         .unwrap_or("it said nothing");
     let wrong_pass = ["status=-201", "EBADTAG", "status=-202", "EBADVERSION"]
         .iter()

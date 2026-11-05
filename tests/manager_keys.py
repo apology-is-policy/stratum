@@ -450,9 +450,7 @@ def editor_legs(stratum, vol, host, env_file):
         term.expect(r'read-only')
         term.show('a file that is not text')
         term.send(b':w' + ENTER)
-        term.pump(0.5)
-        term.send(ESC)
-        term.pump(0.3)
+        term.expect(r'Read-only mode')
         term.send(b':q!' + ENTER)
         term.expect(IN_PANEL, timeout=15)
         got = vol.fs(sock, 'read', '/not_text.bin').stdout

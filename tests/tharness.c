@@ -75,13 +75,20 @@ int stm_test_run_all(const char *suite_name)
         e = next;
     }
 
+    /* One test by name. A name that matches nothing fails, so a typo cannot pass. */
+    const char *only = getenv("STM_TEST_ONLY");
     int npass = 0, nfail = 0;
     fprintf(stderr, "== %s ==\n", suite_name);
     for (stm_test_entry *e = list; e; e = e->t_next) {
+        if (only && strcmp(only, e->t_label) != 0) continue;
         if (stm_test_run_one(e)) nfail++;
         else npass++;
     }
     fprintf(stderr, "-- %d passed, %d failed\n", npass, nfail);
+    if (only && npass + nfail == 0) {
+        fprintf(stderr, "no test in %s is named %s\n", suite_name, only);
+        return 1;
+    }
     return nfail == 0 ? 0 : 1;
 }
 

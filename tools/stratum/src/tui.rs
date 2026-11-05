@@ -326,12 +326,17 @@ pub fn stop_on_signals() {
 /// Once its terminal has gone, crossterm's read loop never returns: it answers a
 /// read error by reading again, at full CPU, so the input loop cannot notice this
 /// or anything else. Ending the process is the way out, and the daemons follow it
-/// on their lifeline.
+/// on their lifeline. Linux fails tcgetattr on a terminal that has gone; macOS still
+/// answers it, and fails an empty write instead. Neither sends anything to a live one.
 fn exit_when_terminal_goes(tty: i32, session_dir: Option<PathBuf>) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(200));
         let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(tty, &mut attrs) } != 0 {
+        let no_attrs = unsafe { libc::tcgetattr(tty, &mut attrs) } != 0;
+        let nothing = 0u8;
+        let no_write = unsafe { libc::write(tty, (&nothing as *const u8).cast(), 0) } < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO);
+        if no_attrs || no_write {
             if let Some(dir) = &session_dir {
                 let _ = std::fs::remove_dir_all(dir);
             }
@@ -2709,7 +2714,11 @@ fn submit_dialog(
                         kind: LocalDialogKind::PassphraseFor {
                             volume: volume.clone(),
                         },
-                        prompt: format!("Mount {}: {}", volume.display(), e),
+                        prompt: format!(
+                            "Mount {}: {}",
+                            volume.file_name().unwrap_or_default().to_string_lossy(),
+                            e
+                        ),
                         value: String::new(),
                         is_password: true,
                         is_error: false,
