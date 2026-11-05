@@ -1430,36 +1430,56 @@ def files_left(path):
 
 
 def delete_batch_legs(stratum, root):
-    """A delete runs one item at a time: Ctrl-Q waits like F10, and Esc stops after the item in hand."""
+    """A delete runs one item at a time. A quit key mid-batch asks, and holds the batch while
+    it asks: Esc stops it after the item in hand, Go on lets it finish. A bare Esc stops it."""
     w = f'{root}/delbatch'
     many = 20000
     dirs = ['bulkone', 'bulktwo']
-    for d in ['bulkzero'] + dirs:
+    held = ['heldone', 'heldtwo']
+    names = ['bulkzero'] + dirs + held
+    for d in names:
         os.makedirs(f'{w}/{d}')
         for i in range(many):
             open(f'{w}/{d}/f{i:05d}', 'wb').close()
+    asked = r'held while this shows'
 
-    term = Term([stratum, 'tui', '--host', w])
-    try:
-        term.expect(r'bulkzero', timeout=30)
+    def start_delete(term, chosen):
+        term.expect(re.escape(chosen[0]), timeout=30)
         term.pump(0.5)
-        pick(term, 'bulkzero', ['bulkzero'] + dirs)
-        term.send(b' ')
-        term.pump(0.3)
+        for d in chosen:
+            pick(term, d, names)
+            term.send(b' ')
+            term.pump(0.3)
         term.send(F8)
-        term.expect(r'Delete 1 items')
+        term.expect(rf'Delete {len(chosen)} items')
         term.send(LEFT)
         term.pump(0.1)
         term.send(ENTER)
+        # Once an item is under way: before that, Esc stops a batch with nothing running.
         end = time.monotonic() + 30
-        while time.monotonic() < end and files_left(f'{w}/bulkzero') == many:
+        while time.monotonic() < end and all(files_left(f'{w}/{d}') == many for d in chosen):
             time.sleep(0.01)
+
+    def asks(term):
+        """True when the question came; False when the item ended before the key was read."""
+        term.expect(asked + r'|Delete: \d+ deleted', timeout=10)
+        if re.search(asked, term.screen.text()):
+            return True
+        print('note: the batch ended before the key was read, so this leg proves nothing', flush=True)
+        return False
+
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        start_delete(term, ['bulkzero'])
         term.send(b'\x11')
-        term.expect(r'A copy or delete is running', timeout=10)
-        record(not term.exited(1), 'Ctrl-Q mid-delete waits, as F10 does', 'Ctrl-Q quit in the middle of a delete')
-        end = time.monotonic() + 120
-        while time.monotonic() < end and files_left(f'{w}/bulkzero') != -1:
-            time.sleep(0.1)
+        if asks(term):
+            record(not term.exited(1), 'Ctrl-Q mid-delete asks, and does not quit', 'Ctrl-Q quit in the middle of a delete')
+            term.send(RIGHT)   # a quit key starts on Stop; Go on is next
+            term.pump(0.1)
+            term.send(ENTER)
+            term.expect(r'Delete: \d+ deleted', timeout=120)
+            left = files_left(f'{w}/bulkzero')
+            record(left == -1, 'Go on lets the delete finish', f'after Go on, bulkzero holds {left} files')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -1468,21 +1488,7 @@ def delete_batch_legs(stratum, root):
 
     term = Term([stratum, 'tui', '--host', w])
     try:
-        term.expect(r'bulkone', timeout=30)
-        term.pump(0.5)
-        for d in dirs:
-            pick(term, d, dirs)
-            term.send(b' ')
-            term.pump(0.3)
-        term.send(F8)
-        term.expect(r'Delete 2 items')
-        term.send(LEFT)
-        term.pump(0.1)
-        term.send(ENTER)
-        # Once an item is under way: before that, Esc stops a batch with nothing running.
-        end = time.monotonic() + 30
-        while time.monotonic() < end and all(files_left(f'{w}/{d}') == many for d in dirs):
-            time.sleep(0.01)
+        start_delete(term, dirs)
         term.send(ESC)
         term.expect(r'Delete: \d+ deleted', timeout=120)
         term.show('after Esc mid-delete')
@@ -1492,6 +1498,25 @@ def delete_batch_legs(stratum, root):
                f'after Esc mid-delete, the intact directories are {intact}')
         record(m is not None and m[1] == '1', 'the item in hand when Esc came is counted',
                f'the summary after Esc reads {m and m[0]!r}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    # The question says Esc stops the batch, so one Esc must: closing it alone let the
+    # batch run on and delete the rest.
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        start_delete(term, held)
+        term.send(b'\x03')
+        if asks(term):
+            term.send(ESC)
+            term.expect(r'Delete: \d+ deleted', timeout=120)
+            term.show('after Ctrl-C and one Esc mid-delete')
+            intact = [d for d in held if files_left(f'{w}/{d}') == many]
+            record(len(intact) == 1, 'one Esc on the question Ctrl-C asks stops the delete after the item in hand',
+                   f'after Ctrl-C and one Esc, the intact directories are {intact}')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise

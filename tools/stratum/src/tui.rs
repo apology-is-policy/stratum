@@ -899,9 +899,7 @@ fn handle_key(
         // Quitting mid-item would leave a partial file under a temporary name, or a short
         // one under its own in a volume.
         if copy_batch.is_some() || delete_batch.is_some() {
-            *local_dialog = Some(error_dialog(
-                "A copy or delete is running. Esc stops it after the item in hand; then F10.",
-            ));
+            *local_dialog = Some(stop_batch_dialog(copy_batch.is_some(), true));
             return Ok(Action::Refresh);
         }
         return Ok(Action::Quit);
@@ -960,18 +958,8 @@ fn handle_key(
     // editor). Marks remaining items as skipped via the conflict
     // resolution channel; the batch's next tick observes Done.
     if matches!(key.code, KeyCode::Esc) {
-        if copy_batch.is_some() {
-            CONFLICT_RESP.with(|c| {
-                *c.borrow_mut() = Some(ConflictResp {
-                    policy: None,
-                    sticky: false,
-                    cancel: true,
-                });
-            });
-            return Ok(Action::Refresh);
-        }
-        if delete_batch.is_some() {
-            DELETE_CANCEL.with(|c| c.set(true));
+        if copy_batch.is_some() || delete_batch.is_some() {
+            post_batch_cancel(copy_batch.is_some());
             return Ok(Action::Refresh);
         }
         // SWISS-4n: Esc with no batch and a non-empty search buffer
@@ -1151,9 +1139,7 @@ fn handle_key(
             if !key.modifiers.contains(KeyModifiers::SHIFT)
                 && (copy_batch.is_some() || delete_batch.is_some()) =>
         {
-            *local_dialog = Some(error_dialog(
-                "A copy or delete is running; wait for it, or Esc to stop it.",
-            ));
+            *local_dialog = Some(stop_batch_dialog(copy_batch.is_some(), false));
             return Ok(Action::Refresh);
         }
         KeyCode::F(5) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1668,6 +1654,11 @@ fn handle_confirm_key(
     let Some(d) = local_dialog.as_mut() else {
         return Ok(Action::Ignore);
     };
+    if let (KeyCode::Esc, LocalDialogKind::Confirm { on_pick: ConfirmAction::StopBatch { copy }, .. }) =
+        (key.code, &d.kind)
+    {
+        post_batch_cancel(*copy);
+    }
     let LocalDialogKind::Confirm { options, selected, .. } = &mut d.kind else {
         return Ok(Action::Ignore);
     };
@@ -2159,6 +2150,46 @@ fn submit_confirm(
             )));
             Ok(Action::Refresh)
         }
+        ConfirmAction::StopBatch { copy } => {
+            if label == "Stop" {
+                post_batch_cancel(copy);
+            }
+            Ok(Action::Refresh)
+        }
+    }
+}
+
+/// Ends the running batch after the item in hand; its next tick reads this.
+fn post_batch_cancel(copy: bool) {
+    if copy {
+        CONFLICT_RESP.with(|c| {
+            *c.borrow_mut() = Some(ConflictResp { policy: None, sticky: false, cancel: true });
+        });
+    } else {
+        DELETE_CANCEL.with(|c| c.set(true));
+    }
+}
+
+/// The question a quit key, or F5/F7/F8, gets while a batch runs. The
+/// batch is held while it shows, so it never asks the user to wait.
+fn stop_batch_dialog(copy: bool, quitting: bool) -> LocalDialog {
+    let what = if copy { "A copy" } else { "A delete" };
+    let then = if quitting { "\nOnce it has stopped, F10 quits." } else { "" };
+    LocalDialog {
+        kind: LocalDialogKind::Confirm {
+            options: vec!["Stop".to_string(), "Go on".to_string()],
+            selected: if quitting { 0 } else { 1 },
+            on_pick: ConfirmAction::StopBatch { copy },
+        },
+        // The confirm box cuts a line at its width rather than wrapping it.
+        prompt: format!(
+            "{what} is under way, held while this shows.\n\
+             Stop, or Esc: it stops after the item in hand.\n\
+             Go on: it carries on.{then}"
+        ),
+        value: Default::default(),
+        is_password: false,
+        is_error: false,
     }
 }
 

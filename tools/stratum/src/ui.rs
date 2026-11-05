@@ -269,6 +269,10 @@ pub enum ConfirmAction {
         snap_id: u64,
         name: String,
     },
+    /// A quit key, or one that would start another batch, while a copy
+    /// or delete is under way. The batch is held while the question
+    /// shows; Stop, or Esc, ends it after the item in hand.
+    StopBatch { copy: bool },
 }
 
 /// SWISS-4c: state for the mkfs wizard. v1.0 collects only Name +
