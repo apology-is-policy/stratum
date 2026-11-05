@@ -118,6 +118,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     ];
     let mut host_fs_child = Command::new(&me)
         .args(&host_fs_args)
+        .envs(crate::lifeline::env())
         .stdout(Stdio::null())
         .stderr(open_log("host-fs")?)
         .process_group(0)
@@ -220,6 +221,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         };
         let mut child = Command::new(&me)
             .args(&stratumd_args)
+            .envs(crate::lifeline::env())
             .stdin(stdin_setup)
             .stdout(Stdio::null())
             .stderr(open_log("stratumd")?)
@@ -312,6 +314,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     ];
     let mut slate_child = match Command::new(&me)
         .args(&slate_args)
+        .envs(crate::lifeline::env())
         .stdout(Stdio::null())
         .stderr(open_log("slate")?)
         .process_group(0)

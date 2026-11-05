@@ -10,14 +10,12 @@ use std::sync::OnceLock;
 
 const ENV: &str = "STRATUM_LIFELINE_FD";
 
-static HELD: OnceLock<()> = OnceLock::new();
+static READ_END: OnceLock<i32> = OnceLock::new();
 
-/// In the manager, before it spawns anything and while it has one thread. The
-/// write end is close-on-exec and never closed, so only this process ending
-/// closes it. Daemons inherit the read end and find its number in the
-/// environment.
+/// In the manager, before it spawns anything. The write end is close-on-exec
+/// and never closed, so only this process ending closes it.
 pub fn hold() -> Result<()> {
-    if HELD.get().is_some() {
+    if READ_END.get().is_some() {
         return Ok(());
     }
     let mut fds = [0i32; 2];
@@ -27,9 +25,15 @@ pub fn hold() -> Result<()> {
     if unsafe { libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
         bail!("lifeline pipe: {}", std::io::Error::last_os_error());
     }
-    std::env::set_var(ENV, fds[0].to_string());
-    let _ = HELD.set(());
+    let _ = READ_END.set(fds[0]);
     Ok(())
+}
+
+/// For each daemon's Command, and only those: a program the manager starts for
+/// any other reason has no use for the number, and passing it on could give it
+/// to a daemon that was never the manager's.
+pub fn env() -> Option<(&'static str, String)> {
+    READ_END.get().map(|fd| (ENV, fd.to_string()))
 }
 
 /// In a daemon, before it starts serving. Ends this process through its own
@@ -39,6 +43,15 @@ pub fn follow() {
     let Some(fd) = std::env::var(ENV).ok().and_then(|v| v.parse::<i32>().ok()) else {
         return;
     };
+    std::env::remove_var(ENV);
+    // A number that names something else must not be read from, and failing to
+    // read it does not mean the manager has gone.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let is_pipe = unsafe { libc::fstat(fd, &mut st) } == 0 && st.st_mode & libc::S_IFMT == libc::S_IFIFO;
+    if !is_pipe {
+        eprintln!("stratum: {ENV}={fd} is not a pipe; this daemon will not stop with its manager");
+        return;
+    }
     std::thread::spawn(move || {
         let mut byte = 0u8;
         loop {

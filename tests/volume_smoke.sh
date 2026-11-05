@@ -70,6 +70,14 @@ rc=$?
 mv "$V.key.aside" "$V.key"
 if [ "$rc" != 0 ] && LC_ALL=C grep -q -e '--keyfile' "$D/nokey.log"; then ok "serve with no key says what is missing"; else no "serve with no key: rc=$rc: $(tail -1 "$D/nokey.log")"; fi
 
+# A lifeline number naming nothing must not be taken to mean the manager has gone.
+if STRATUM_LIFELINE_FD=99 serve "$PASS" && sleep 1 && F ls / > /dev/null 2>&1 && kill -0 "$SP" 2>/dev/null; then
+    ok "a daemon does not stop for a lifeline number that names nothing"
+else
+    no "a lifeline number that names nothing ended the daemon: $(tail -1 "$D/serve.log")"
+fi
+stop
+
 serve "$PASS" || { no "serve again: $(tail -1 "$D/serve.log")"; exit 1; }
 F mkdir /in || no "mkdir"
 F put "$D/host" /in/host > "$D/put.log" 2>&1 || no "put: $(tail -1 "$D/put.log")"

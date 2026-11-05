@@ -252,6 +252,7 @@ impl SpawnCtx {
         };
         let mut child = Command::new(&self.me)
             .args(&args)
+            .envs(crate::lifeline::env())
             .stdin(stdin_setup)
             .stdout(Stdio::null())
             .stderr(stderr_target)
@@ -500,6 +501,7 @@ impl SpawnCtx {
             .unwrap_or_else(|_| Stdio::null());
         Command::new(&self.me)
             .args(args)
+            .envs(crate::lifeline::env())
             .stdout(Stdio::null())
             .stderr(stderr_target)
             .process_group(0)
