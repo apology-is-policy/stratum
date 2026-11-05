@@ -134,6 +134,10 @@ class Term:
         self.rc = None
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
+            # What a login terminal gives a program. A harness started with `&` or nohup
+            # ignores INT, QUIT and HUP, and the manager keeps an ignore it inherits.
+            for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGHUP):
+                signal.signal(sig, signal.SIG_DFL)
             os.environ['TERM'] = 'xterm-256color'
             os.execv(argv[0], argv)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS, 0, 0))
@@ -201,9 +205,14 @@ class Term:
             print(f'--- {label}\n{self.screen.text()}\n---', flush=True)
 
 
+def shows(segment, name):
+    """name as a whole cell, after a directory's '/': vol.stm is not vol.stm.key."""
+    return re.search(r'(?:^|\s)/?' + re.escape(name) + r'(?:\s|$)', segment) is not None
+
+
 def row_in_left_panel(term, name):
     for r, line in enumerate(term.screen.text().split('\n')):
-        if name in line[:COLS // 2]:
+        if shows(line[:COLS // 2], name):
             return r
     raise Failure(f'{name} is not in the left panel')
 
@@ -650,7 +659,8 @@ def mid_session_legs(stratum, root):
     term = Term([stratum, 'tui', '--host', w])
     try:
         term.pump(3)
-        # vol.stm sorts first, and the cursor starts there.
+        # A panel lists in the filesystem's order, which ext4 does not keep by name.
+        pick(term, 'vol.stm', ['vol.stm', 'vol.stm.key', 'check.sock'])
         term.send(ENTER)
         term.expect(r'Passphrase for')
         term.send(PASS.encode() + ENTER)
@@ -767,7 +777,7 @@ def rows_in_panel(term, names, right):
     rows, start, end = {}, *((COLS // 2, COLS) if right else (0, COLS // 2))
     for r, line in enumerate(term.screen.text().split('\n')):
         for name in names:
-            if name not in rows and name in line[start:end]:
+            if name not in rows and shows(line[start:end], name):
                 rows[name] = r
     return rows
 
@@ -984,7 +994,7 @@ def host_copy_legs(stratum, root):
 
 def copy_engine_legs(stratum, root):
     """Where a copy writes, and what a link or a planted name can make of that."""
-    # Names pick() can find: it matches a row's text, and a one-letter name matches the header.
+    # Names unlike the header's words, so a row is never taken for the header.
     w = f'{root}/engine'
     for d in ('src/linkdir/sub', 'src/skiptree/sub', 'dst/linkdir', 'dst/skiptree/sub', 'elsewhere'):
         os.makedirs(f'{w}/{d}')
