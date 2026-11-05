@@ -78,7 +78,7 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 | T0.20 | Device replace moves bytes without rewriting extent addresses (library only) | Read | Open |
 | T0.21 | `/events` drops past 8 MiB without saying so | Read | Open |
 | T0.27 | **`O_APPEND` is not atomic.** The 9P server reads the size and then writes there, so two appenders overwrite each other. The code's own comment says so | Read | Open |
-| T0.28 | **Deleting an open file loses it.** I/O on an unlinked fid answers ENOENT, by design in `fid.tla`. POSIX keeps the file until the last close, and real software relies on that, including scratch files in SQLite and Python. Seen on a Thylacine guest, where `tmpfile()` has a workaround | Seen | Needs a decision. Recommended: keep the inode until the last clunk, on the orphan state anonymous inodes already have, and free it at mount after a crash |
+| T0.28 | **Deleting an open file loses it.** I/O on an unlinked fid answers ENOENT, by design in `fid.tla`. POSIX keeps the file until the last close, and real software relies on that, including scratch files in SQLite and Python. Seen on a Thylacine guest, where `tmpfile()` has a workaround | Seen | **Decided:** keep the inode until the last clunk, on the orphan state anonymous inodes already have, and free it at mount after a crash. A file replaced by rename gets the same. `fid.tla` changes first |
 | T0.29 | **Linux: the io_uring completion queue is drained by every waiting thread with no lock,** and `AUTO` picks io_uring wherever it is built. A completion can be taken twice or dispatched to the wrong thread. It may explain some of the Linux reds in T1.1, which is a hypothesis | Read | Open |
 
 ### Security to establish, then decide
@@ -248,7 +248,7 @@ Recommended against for now, so nobody spends a pause on them. Each can be reope
 
 1. **Finish the tidy:** T0.8-T0.13, then T1.1 and T1.2, and land it.
 2. **Design tier 2 together,** settling which change gets which bytes, before the first of them lands.
-3. **Trust before change:** T1.3, then T1.4, T1.5, T1.6, T1.10. Cheap wins alongside: T3.1, T0.24's warning, T0.15, T0.26, T0.27, T0.29, T5.7, and T0.28 once decided.
+3. **Trust before change:** T1.3, then T1.4, T1.5, T1.6, T1.10. Cheap wins alongside: T3.1, T0.24's warning, T0.15, T0.26, T0.27, T0.29, T0.28, T5.7.
 4. **The format:** T2.1 and T2.2 first, then the rest of tier 2 one at a time. T0.1, T0.3, T0.4 and T0.7 go with the first two.
 5. **Then by measurement:** tier 3 in whatever order T1.10 shows matters most, starting with T3.2, T3.5 and T3.7.
 6. **Then tiers 4 and 5,** interleaved by use, and **tier 6** last.
