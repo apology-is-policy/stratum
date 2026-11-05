@@ -55,6 +55,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -7386,6 +7387,226 @@ STM_TEST(fs_p11_r86_p2_1_rename_exchange_immediate_cycle_refused) {
                                        a, (const uint8_t *)"sub", 3,
                                        STM_FS_RENAME_EXCHANGE),
                    STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* One rename on a thread of its own, and the hook that starts it while the first rename holds its turn. */
+struct fs_mv {
+    stm_fs *fs;
+    uint64_t from, to;
+    const char *from_name, *to_name;
+    stm_status rc;
+    atomic_bool done;
+};
+
+static void *fs_mv_thread(void *arg)
+{
+    struct fs_mv *m = arg;
+    m->rc = stm_fs_rename(m->fs, 1, m->from, (const uint8_t *)m->from_name, (uint8_t)strlen(m->from_name),
+                          m->to, (const uint8_t *)m->to_name, (uint8_t)strlen(m->to_name), 0);
+    atomic_store(&m->done, true);
+    return NULL;
+}
+
+struct fs_mv_gap {
+    stm_fs_rename_walk_point at;
+    struct fs_mv *other;
+    pthread_t th;
+    bool fired;
+    bool other_done_in_gap;
+};
+
+static void fs_mv_gap_hook(stm_fs_rename_walk_point at, void *arg)
+{
+    struct fs_mv_gap *g = arg;
+    if (at != g->at || g->fired) return;
+    g->fired = true;
+    if (pthread_create(&g->th, NULL, fs_mv_thread, g->other) != 0) abort();
+    struct timespec nap = { .tv_sec = 0, .tv_nsec = 10000000 };
+    for (int i = 0; i < 30 && !atomic_load(&g->other->done); i++) nanosleep(&nap, NULL);
+    g->other_done_in_gap = atomic_load(&g->other->done);
+}
+
+/* a goes under d, and c under b. Each is fine alone, no pin is shared, and together they make a ring that
+ * nothing can reach. */
+STM_TEST(fs_two_directory_moves_cannot_close_a_ring) {
+    make_tmp("rename_ring");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0, p = 0, q = 0, a = 0, b = 0, c = 0, d = 0, got = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"p", 1, 0755u, 0, 0, &p));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"q", 1, 0755u, 0, 0, &q));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, p, (const uint8_t *)"a", 1, 0755u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, a, (const uint8_t *)"b", 1, 0755u, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, q, (const uint8_t *)"c", 1, 0755u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, c, (const uint8_t *)"d", 1, 0755u, 0, 0, &d));
+
+    struct fs_mv second = { .fs = fs, .from = q, .to = b, .from_name = "c", .to_name = "c", .rc = STM_OK };
+    atomic_init(&second.done, false);
+    struct fs_mv_gap g = { .at = STM_FS_RENAME_WALK_CHECKED, .other = &second };
+    stm_fs_set_rename_walk_hook_for_test(fs, fs_mv_gap_hook, &g);
+    stm_status first = stm_fs_rename(fs, 1, p, (const uint8_t *)"a", 1, d, (const uint8_t *)"a", 1, 0);
+    stm_fs_set_rename_walk_hook_for_test(fs, NULL, NULL);
+    STM_ASSERT_TRUE(g.fired);
+    STM_ASSERT_EQ(pthread_join(g.th, NULL), 0);
+
+    STM_ASSERT_OK(first);
+    STM_ASSERT_TRUE(!g.other_done_in_gap);
+    STM_ASSERT_EQ(second.rc, STM_EINVAL);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"q", 1, &got));
+    STM_ASSERT_EQ(got, q);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, q, (const uint8_t *)"c", 1, &got));
+    STM_ASSERT_EQ(got, c);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, c, (const uint8_t *)"d", 1, &got));
+    STM_ASSERT_EQ(got, d);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, d, (const uint8_t *)"a", 1, &got));
+    STM_ASSERT_EQ(got, a);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, a, (const uint8_t *)"b", 1, &got));
+    STM_ASSERT_EQ(got, b);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* x moves under its own x/w/y/z. The walk reads w in batches, and between two of them y is renamed from a
+ * name still ahead of the cursor to one behind it. Unless that rename waits, the walk never sees y. */
+STM_TEST(fs_a_name_moved_during_the_walk_cannot_hide_a_subtree) {
+    enum { FILLER = 1200, READ = 64 };
+    make_tmp("rename_hide");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0, x = 0, w = 0, y = 0, z = 0, got = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"x", 1, 0755u, 0, 0, &x));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, x, (const uint8_t *)"w", 1, 0755u, 0, 0, &w));
+    for (int i = 0; i < FILLER; i++) {
+        char nm[8];
+        int l = snprintf(nm, sizeof nm, "f%04d", i);
+        uint64_t ino = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, w, (const uint8_t *)nm, (uint8_t)l, 0644u, 0, 0, &ino));
+    }
+
+    /* Names in the order the directory reads, so one is early and one is late whatever the hash does. */
+    char (*order)[8] = calloc(FILLER, sizeof *order);
+    stm_fs_dirent_entry *page = calloc(READ, sizeof *page);
+    STM_ASSERT_TRUE(order != NULL && page != NULL);
+    uint64_t cursor = 0;
+    size_t seen = 0;
+    for (;;) {
+        size_t n = 0;
+        STM_ASSERT_OK(stm_fs_readdir(fs, 1, w, x, STM_FS_READDIR_FLAG_NO_DOTS, &cursor, page, READ, &n));
+        if (n == 0u) break;
+        for (size_t i = 0; i < n; i++) {
+            STM_ASSERT_TRUE(seen < (size_t)FILLER);
+            STM_ASSERT_EQ(page[i].name_len, 5u);
+            memcpy(order[seen++], page[i].name, 5u);
+        }
+    }
+    STM_ASSERT_EQ(seen, (size_t)FILLER);
+    const char *early = order[10];
+    const char *late = order[FILLER - 10];
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, w, (const uint8_t *)early, 5));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, w, (const uint8_t *)late, 5));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, w, (const uint8_t *)late, 5, 0755u, 0, 0, &y));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, y, (const uint8_t *)"z", 1, 0755u, 0, 0, &z));
+
+    struct fs_mv second = { .fs = fs, .from = w, .to = w, .from_name = late, .to_name = early, .rc = STM_EIO };
+    atomic_init(&second.done, false);
+    struct fs_mv_gap g = { .at = STM_FS_RENAME_WALK_BATCH, .other = &second };
+    stm_fs_set_rename_walk_hook_for_test(fs, fs_mv_gap_hook, &g);
+    stm_status first = stm_fs_rename(fs, 1, root, (const uint8_t *)"x", 1, z, (const uint8_t *)"x", 1, 0);
+    stm_fs_set_rename_walk_hook_for_test(fs, NULL, NULL);
+    STM_ASSERT_TRUE(g.fired);
+    STM_ASSERT_EQ(pthread_join(g.th, NULL), 0);
+
+    STM_ASSERT_EQ(first, STM_EINVAL);
+    STM_ASSERT_TRUE(!g.other_done_in_gap);
+    STM_ASSERT_OK(second.rc);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"x", 1, &got));
+    STM_ASSERT_EQ(got, x);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, w, (const uint8_t *)early, 5, &got));
+    STM_ASSERT_EQ(got, y);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, y, (const uint8_t *)"z", 1, &got));
+    STM_ASSERT_EQ(got, z);
+
+    free(page);
+    free(order);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* A directory with two names is damage already: the walk says so and does not go round. */
+STM_TEST(fs_a_walk_that_meets_a_directory_twice_reports_damage) {
+    make_tmp("rename_twice");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0, x = 0, u = 0, v = 0, k = 0, e = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"x", 1, 0755u, 0, 0, &x));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, x, (const uint8_t *)"u", 1, 0755u, 0, 0, &u));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, x, (const uint8_t *)"v", 1, 0755u, 0, 0, &v));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, u, (const uint8_t *)"k", 1, 0755u, 0, 0, &k));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"e", 1, 0755u, 0, 0, &e));
+    struct stm_inode_value kv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, k, &kv));
+    stm_dirent_index *didx = stm_sync_dirent_index(stm_fs_sync_for_test(fs));
+    STM_ASSERT_OK(stm_dirent_alloc(didx, 1, v, (const uint8_t *)"k", 1, k, stm_load_le64(kv.si_gen), STM_DT_DIR));
+
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, root, (const uint8_t *)"x", 1, e, (const uint8_t *)"x", 1, 0), STM_ECORRUPT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* A directory cannot move under itself: nothing could reach it again, and the walks that follow a
+ * tree would not end. A child, a grandchild, over an empty directory there, and by exchange. */
+STM_TEST(fs_a_rename_into_its_own_subtree_is_refused) {
+    make_tmp("rename_own_subtree");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0, a = 0, b = 0, c = 0, d = 0, e = 0, got = 0;
+    p2b_alloc_root_dir(fs, &root);
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"a", 1, 0755u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, a, (const uint8_t *)"b", 1, 0755u, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, b, (const uint8_t *)"c", 1, 0755u, 0, 0, &c));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, c, (const uint8_t *)"d", 1, 0755u, 0, 0, &d));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"e", 1, 0755u, 0, 0, &e));
+
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, root, (const uint8_t *)"a", 1, a, (const uint8_t *)"x", 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, root, (const uint8_t *)"a", 1, b, (const uint8_t *)"x", 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, root, (const uint8_t *)"a", 1, c, (const uint8_t *)"x", 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, b, (const uint8_t *)"c", 1, c, (const uint8_t *)"x", 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, root, (const uint8_t *)"a", 1, c, (const uint8_t *)"d", 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1, root, (const uint8_t *)"a", 1, c, (const uint8_t *)"d", 1, STM_FS_RENAME_EXCHANGE), STM_EINVAL);
+
+    /* nothing moved */
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"a", 1, &got));
+    STM_ASSERT_EQ(got, a);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, c, (const uint8_t *)"d", 1, &got));
+    STM_ASSERT_EQ(got, d);
+
+    /* a move anywhere else goes: the check is not a refusal of every move */
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, root, (const uint8_t *)"a", 1, e, (const uint8_t *)"a", 1, 0));
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, e, (const uint8_t *)"a", 1, &got));
+    STM_ASSERT_EQ(got, a);
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, b, (const uint8_t *)"c", 1, e, (const uint8_t *)"c", 1, 0));
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, e, (const uint8_t *)"c", 1, &got));
+    STM_ASSERT_EQ(got, c);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);

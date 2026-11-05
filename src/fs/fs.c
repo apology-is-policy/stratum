@@ -206,6 +206,12 @@ struct stm_fs {
      * nested RDLOCK waits behind that reclaim the same way); the drain
      * cbs + commits take no pins. */
     pthread_rwlock_t txn;
+    /* Held across any rename of a directory, from the check that the target is not under it to the
+     * dirent update. Two moves that each pass alone can together make a cycle, so they take turns,
+     * as Linux's s_vfs_rename_mutex does. A rename within one parent takes its turn too, unlike
+     * Linux's, because the check walks down in batches, and a name moved behind the walk's cursor
+     * would hide a subtree. Taken under the rename's pins, and its holder waits for no pin. */
+    pthread_mutex_t dir_move_mu;
 
     stm_bdev  *bdev;         /* owned — closed at unmount */
     stm_pool  *pool;         /* owned — P5-1 N=1 wrapper over bdev */
@@ -315,6 +321,8 @@ struct stm_fs {
     stm_status rename_src_drop_fail_next;
     stm_fs_rename_rollback_hook rename_rollback_hook;
     void *rename_rollback_hook_arg;
+    stm_fs_rename_walk_hook rename_walk_hook;
+    void *rename_walk_hook_arg;
     stm_fs_rollback_committed_hook rollback_committed_hook;
     void *rollback_committed_hook_arg;
     stm_fs_write_guard_hook write_guard_hook;
@@ -1335,6 +1343,10 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
                        const char *janus_socket)
 {
     stm_fs *fs = calloc(1, sizeof *fs);
+    if (fs && pthread_mutex_init(&fs->dir_move_mu, NULL) != 0) {
+        free(fs);
+        return NULL;
+    }
     if (!fs) return NULL;
     /* R133 P1-1: glibc default rwlock attribute is reader-preference;
      * a continuous stream of SH-takers (the new PARALLEL-3 ported ops)
@@ -1839,6 +1851,7 @@ stm_status stm_fs_unmount(stm_fs *fs)
     pthread_rwlock_unlock(&fs->global);
     pthread_rwlock_destroy(&fs->txn);
     pthread_rwlock_destroy(&fs->global);
+    pthread_mutex_destroy(&fs->dir_move_mu);
     free(fs->keyfile_path);
     free(fs->janus_socket);
     /* SWISS-4m1: wipe + munlock + free the cached hybrid keys on
@@ -3728,6 +3741,14 @@ void stm_fs_fail_next_rename_src_drop_for_test(stm_fs *fs, stm_status fail)
     fs->rename_src_drop_fail_next = fail;
 }
 
+void stm_fs_set_rename_walk_hook_for_test(stm_fs *fs,
+                                          stm_fs_rename_walk_hook fn,
+                                          void *arg)
+{
+    fs->rename_walk_hook = fn;
+    fs->rename_walk_hook_arg = arg;
+}
+
 void stm_fs_set_rename_rollback_hook_for_test(stm_fs *fs,
                                               stm_fs_rename_rollback_hook fn,
                                               void *arg)
@@ -3865,6 +3886,16 @@ static void fs_rename_rollback_ends(stm_fs *fs)
             fs->rename_rollback_hook_arg);
 #else
     (void)fs;
+#endif
+}
+
+static void fs_rename_walk_gap(stm_fs *fs, stm_fs_rename_walk_point at)
+{
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (fs->rename_walk_hook) fs->rename_walk_hook(at, fs->rename_walk_hook_arg);
+#else
+    (void)fs;
+    (void)at;
 #endif
 }
 
@@ -6579,6 +6610,111 @@ static stm_status fs_rename_onto_itself(stm_fs *fs, uint64_t dataset_id,
     return s;
 }
 
+/* A set of inode numbers: open addressing, 0 for an empty slot, since no inode is number 0. */
+typedef struct {
+    uint64_t *slots;
+    size_t    cap;
+    size_t    n;
+} fs_ino_set;
+
+static void fs_ino_set_slot(uint64_t *slots, size_t cap, uint64_t ino, size_t *out)
+{
+    size_t i = (size_t)((ino * 0x9E3779B97F4A7C15ULL) >> 20) & (cap - 1u);
+    while (slots[i] != 0u && slots[i] != ino) i = (i + 1u) & (cap - 1u);
+    *out = i;
+}
+
+/* Adds ino. *out_new says whether it was absent. */
+static stm_status fs_ino_set_add(fs_ino_set *set, uint64_t ino, bool *out_new)
+{
+    if ((set->n + 1u) * 2u > set->cap) {
+        size_t cap = set->cap ? set->cap * 2u : 64u;
+        uint64_t *grown = calloc(cap, sizeof *grown);
+        if (!grown) return STM_ENOMEM;
+        for (size_t i = 0; i < set->cap; i++) {
+            if (set->slots[i] == 0u) continue;
+            size_t at = 0;
+            fs_ino_set_slot(grown, cap, set->slots[i], &at);
+            grown[at] = set->slots[i];
+        }
+        free(set->slots);
+        set->slots = grown;
+        set->cap   = cap;
+    }
+    size_t at = 0;
+    fs_ino_set_slot(set->slots, set->cap, ino, &at);
+    *out_new = set->slots[at] == 0u;
+    if (*out_new) {
+        set->slots[at] = ino;
+        set->n++;
+    }
+    return STM_OK;
+}
+
+/* Whether `target` is `top` or a directory under it. No inode records its parent, so this walks down,
+ * and costs the entries of every directory in the subtree. A directory met twice means the namespace is
+ * already damaged: the walk reports that instead of going round. */
+static stm_status fs_dir_holds(stm_fs *fs, stm_inode_index *iidx, stm_dirent_index *didx,
+                               uint64_t dataset_id, uint64_t top, uint64_t target,
+                               bool *out_holds)
+{
+    /* Each read of a directory scans all of it, so a small batch costs a large directory n squared. */
+    enum { BATCH = 1024 };
+    *out_holds = (top == target);
+    if (*out_holds) return STM_OK;
+
+    fs_ino_set seen = { 0 };
+    size_t todo_cap = 64u, todo_n = 0u;
+    uint64_t *todo = malloc(todo_cap * sizeof *todo);
+    stm_dirent_entry *batch = malloc(BATCH * sizeof *batch);
+    bool added = false;
+    stm_status s = (todo && batch) ? fs_ino_set_add(&seen, top, &added) : STM_ENOMEM;
+    if (s == STM_OK) todo[todo_n++] = top;
+
+    while (s == STM_OK && todo_n > 0u && !*out_holds) {
+        uint64_t dir = todo[--todo_n];
+        uint64_t cursor = 0;
+        for (;;) {
+            size_t got = 0;
+            s = stm_dirent_readdir(didx, dataset_id, dir, &cursor, batch, BATCH, &got);
+            if (s != STM_OK || got == 0u) break;
+            for (size_t i = 0; s == STM_OK && i < got; i++) {
+                if (batch[i].child_type != STM_DT_DIR) continue;
+                bool live = false;
+                s = fs_name_live_locked(iidx, dataset_id, batch[i].child_ino,
+                                        batch[i].child_gen, &live, NULL);
+                if (s != STM_OK || !live) continue;
+                if (batch[i].child_ino == target) {
+                    *out_holds = true;
+                    break;
+                }
+                s = fs_ino_set_add(&seen, batch[i].child_ino, &added);
+                if (s != STM_OK) break;
+                if (!added) {
+                    s = STM_ECORRUPT;
+                    break;
+                }
+                if (todo_n == todo_cap) {
+                    uint64_t *grown = realloc(todo, todo_cap * 2u * sizeof *todo);
+                    if (!grown) {
+                        s = STM_ENOMEM;
+                        break;
+                    }
+                    todo = grown;
+                    todo_cap *= 2u;
+                }
+                todo[todo_n++] = batch[i].child_ino;
+            }
+            if (s != STM_OK || *out_holds || cursor == UINT64_MAX) break;
+            if (got == BATCH) fs_rename_walk_gap(fs, STM_FS_RENAME_WALK_BATCH);
+        }
+    }
+    free(batch);
+    free(todo);
+    free(seen.slots);
+    return s;
+}
+
 static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
                             uint64_t src_parent_ino,
                             const uint64_t *gen_src_dir,
@@ -6931,8 +7067,13 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
     /* Helper macro: unpin every successfully-acquired handle in
      * handles[0..n_handles). Defensive against duplicates: pin_many
      * refused them upfront, so each slot is unique. */
+    bool dir_move_held = false;
     #define FS_RENAME_UNPIN_ALL()                              \
         do {                                                    \
+            if (dir_move_held) {                                \
+                pthread_mutex_unlock(&fs->dir_move_mu);         \
+                dir_move_held = false;                          \
+            }                                                   \
             for (size_t _i = 0u; _i < n_handles; _i++) {        \
                 stm_inode_unpin(iidx, handles[_i]);             \
                 handles[_i] = NULL;                             \
@@ -6951,24 +7092,38 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
         return STM_OK;
     }
 
+    /* A directory cannot land under itself: nothing could reach it again, and every walk of the
+     * tree would stop finding its end. An exchange moves both, so each is asked. Linux and POSIX
+     * answer EINVAL. */
+    bool moves_src = src_type == STM_DT_DIR;
+    bool moves_dst = (flags & STM_FS_RENAME_EXCHANGE) && dst_type == STM_DT_DIR;
+    if (moves_src || moves_dst) {
+        pthread_mutex_lock(&fs->dir_move_mu);
+        dir_move_held = true;
+        if (src_parent_ino != dst_parent_ino) {
+            bool under = false;
+            stm_status hs = STM_OK;
+            if (moves_src)
+                hs = fs_dir_holds(fs, iidx, didx, dataset_id, src_ino, dst_parent_ino, &under);
+            if (hs == STM_OK && !under && moves_dst)
+                hs = fs_dir_holds(fs, iidx, didx, dataset_id, dst_ino, src_parent_ino, &under);
+            if (hs != STM_OK || under) {
+                FS_RENAME_UNPIN_ALL();
+                fs_txn_unlock_global(fs, &tx);
+                return hs != STM_OK ? hs : STM_EINVAL;
+            }
+            fs_rename_walk_gap(fs, STM_FS_RENAME_WALK_CHECKED);
+        }
+    }
+
     fs_txn_begin(fs, &tx);
     /* P8-POSIX-9b: RENAME_EXCHANGE — both src + dst MUST exist.
      * Atomically swap their (ino, gen, type) at the dirent layer
      * via stm_dirent_swap_two. NO inode is created or freed; nlink
      * unchanged on both sides. Composes over dirent.tla::Swap. */
     if (flags & STM_FS_RENAME_EXCHANGE) {
-        /* R86 P2-1 (P11 close): immediate-parent directory-cycle
-         * detection. EXCHANGE of two directories where one is the
-         * IMMEDIATE parent of the other creates a cycle: post-
-         * exchange, the parent's slot points to the (former) child
-         * dir, while the child's slot points to the (former) parent
-         * — which now contains itself transitively. Refuse with
-         * STM_EINVAL.
-         *
-         * Forward-note: deeper-ancestor cycle detection requires
-         * O(depth) ancestor-walk via dirent traversal; not yet
-         * implemented. The immediate-parent check catches the most
-         * common abuse case. */
+        /* R86 P2-1: the same parent never reaches the check above, and
+         * still must not exchange a directory with its own parent. */
         bool src_is_dir = (src_type == STM_DT_DIR);
         bool dst_is_dir = (dst_type == STM_DT_DIR);
         if (src_is_dir && dst_is_dir) {
