@@ -384,6 +384,43 @@ STM_TEST(host_fs_a_long_name_is_cut_where_a_character_starts)
     (void)rmdir(f.root);
 }
 
+/* A walk binds the file a link-free path names: links inside the root, as a leaf
+ * or between the root and the leaf, still walk. */
+STM_TEST(host_fs_walks_links_that_stay_inside)
+{
+    fixture f;
+    STM_ASSERT_TRUE(fixture_open(&f));
+    if (!f.h) return;
+    char a[256], b[256];
+    STM_ASSERT_TRUE(sub(&f, "d") && put(&f, "d/x", "x"));
+    at(&f, "sd", a, sizeof a);
+    STM_ASSERT_EQ(symlink("d", a), 0);
+    at(&f, "d/lx", b, sizeof b);
+    STM_ASSERT_EQ(symlink("x", b), 0);
+    uint64_t root = stm_host_fs_root(f.h), sd = 0, d = 0, x = 0, lx = 0, q = 0;
+    stm_lp9_attr attr;
+    STM_ASSERT_OK(walk(&f, root, "d", &d));
+    STM_ASSERT_OK(walk(&f, d, "x", &x));
+    /* Through the link sd: the same directory and file. */
+    STM_ASSERT_OK(walk(&f, root, "sd", &sd));
+    STM_ASSERT_OK(walk(&f, sd, "x", &q));
+    STM_ASSERT_EQ(q, x);
+    STM_ASSERT_OK(f.v->getattr(f.h, q, 0, &attr));
+    /* A link leaf, reached directly and through sd. */
+    STM_ASSERT_OK(walk(&f, d, "lx", &lx));
+    STM_ASSERT_TRUE(lx != x);
+    STM_ASSERT_OK(f.v->getattr(f.h, lx, 0, &attr));
+    STM_ASSERT_OK(walk(&f, sd, "lx", &q));
+    STM_ASSERT_EQ(q, lx);
+
+    (void)unlink(b);
+    (void)unlink(a);
+    gone(&f, "d/x");
+    gone(&f, "d");
+    stm_host_fs_destroy(f.h);
+    (void)rmdir(f.root);
+}
+
 STM_TEST(host_fs_opens_no_fifo)
 {
     fixture f;

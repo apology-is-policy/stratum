@@ -5,7 +5,8 @@ set -e
 PROJ="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Building the C libraries..."
-cmake -B "$PROJ/build" -S "$PROJ" -DCMAKE_BUILD_TYPE=Release -DSTM_BUILD_TESTS=OFF
+# The test hooks are on by default; a binary that ships carries none of them.
+cmake -B "$PROJ/build" -S "$PROJ" -DCMAKE_BUILD_TYPE=Release -DSTM_BUILD_TESTS=OFF -DSTRATUM_BUILD_TESTING_HOOKS=OFF
 cmake --build "$PROJ/build"
 
 echo "Building the stratum binary..."

@@ -132,13 +132,19 @@ STM_TEST(keyfile_generate_refuses_a_link_at_its_name)
     STM_ASSERT(lstat(target, &st) != 0);
     STM_ASSERT(lstat(link_path, &st) == 0 && S_ISLNK(st.st_mode));
     unlink(link_path);
-    /* Nor is a key written into a FIFO. A reader waits on it, so a write that went
-     * through would fail this test rather than block it. */
+    /* Nor is a key written into a FIFO. The reader lets a writer's open go through
+     * rather than block, and must then find no byte in the pipe. */
     STM_ASSERT_EQ(mkfifo(link_path, 0600), 0);
     int reader = open(link_path, O_RDONLY | O_NONBLOCK);
     STM_ASSERT(reader >= 0);
     STM_ASSERT_EQ(stm_keyfile_generate(link_path), STM_EBACKEND);
-    if (reader >= 0) close(reader);
+    if (reader >= 0) {
+        char got[64];
+        ssize_t n = read(reader, got, sizeof got);
+        if (n > 0) stm_test_info("the FIFO held %zd bytes of a key", n);
+        STM_ASSERT(n <= 0);
+        close(reader);
+    }
     unlink(link_path);
 }
 

@@ -231,8 +231,11 @@ def first_entry_row(term, names):
     return min(rows)
 
 
-# Every checking daemon, since a leg can fail while one is running and it has no lifeline.
+# Every checking daemon, since a leg can fail while one is running. Each also holds
+# the read end of this pipe, as the manager's daemons hold the manager's, so none
+# outlives a harness killed before its finally runs, by a timeout's alarm say.
 SERVED = []
+LIFELINE_R, LIFELINE_W = os.pipe()
 
 
 class Volume:
@@ -248,7 +251,8 @@ class Volume:
             os.unlink(self.sock)
         self.proc = subprocess.Popen([self.b, 'serve', self.v, '--listen', self.sock, '--keyfile', self.v + '.key', '--passphrase-stdin'],
                                      stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     text=True)
+                                     text=True, pass_fds=(LIFELINE_R,),
+                                     env=dict(os.environ, STRATUM_LIFELINE_FD=str(LIFELINE_R)))
         SERVED.append(self.proc)
         self.proc.stdin.write(PASS + '\n')
         self.proc.stdin.close()

@@ -83,6 +83,9 @@ class Client:
         self.sock.close()
 
 
+LIFELINE_R, LIFELINE_W = os.pipe()
+
+
 class Daemon:
     def __init__(self, binary, work, workers, extra=()):
         self.fs_sock = os.path.join(work, 'f.sock')
@@ -93,7 +96,9 @@ class Daemon:
         self.log = open(os.path.join(work, 'serve.log'), 'wb')
         argv = [binary, 'serve', os.path.join(work, 'vol.stm'), '--listen', self.fs_sock,
                 '--ctl-listen', self.ctl_sock, '--fs-workers', str(workers)] + list(extra)
-        self.proc = subprocess.Popen(argv, stdout=self.log, stderr=subprocess.STDOUT)
+        # The lifeline, as the manager gives its daemons: none outlives a killed harness.
+        self.proc = subprocess.Popen(argv, stdout=self.log, stderr=subprocess.STDOUT, pass_fds=(LIFELINE_R,),
+                                     env=dict(os.environ, STRATUM_LIFELINE_FD=str(LIFELINE_R)))
         deadline = time.monotonic() + 60
         while not (os.path.exists(self.fs_sock) and os.path.exists(self.ctl_sock)):
             if self.proc.poll() is not None or time.monotonic() > deadline:

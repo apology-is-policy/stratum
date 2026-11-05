@@ -521,19 +521,27 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     /* The lstat and the realpath each resolve the parent's components
      * afresh, so a symlink among them flipped between the two could pass
      * the containment check with an inside path while st describes a file
-     * outside. A leaf that is no link must be the very file the checked
-     * path names. A link leaf is bound as the link, which lopen never
-     * follows. */
-    if (!S_ISLNK(st.st_mode)) {
-        struct stat rst;
-        if (lstat(resolved, &rst) < 0
-            || !same_file(&rst, (uint64_t)st.st_dev, (uint64_t)st.st_ino)) {
-            free(resolved);
-            free(child);
-            return STM_EACCES;
-        }
+     * outside. The leaf must be the very file a checked path with no link
+     * in it names: for a leaf that is no link, its own realpath; for a
+     * link, which is bound as the link and never followed, its parent's
+     * realpath and its name. */
+    char *named = resolved;
+    char *rparent = NULL;
+    if (S_ISLNK(st.st_mode)) {
+        rparent = realpath(parent_copy, NULL);
+        named = (rparent && path_within_root(h, rparent))
+                ? child_path(rparent, name, name_len) : NULL;
     }
+    struct stat rst;
+    bool same = named && lstat(named, &rst) == 0
+                && same_file(&rst, (uint64_t)st.st_dev, (uint64_t)st.st_ino);
+    if (named != resolved) free(named);
+    free(rparent);
     free(resolved);
+    if (!same) {
+        free(child);
+        return STM_EACCES;
+    }
 
     uint64_t cqid = qid_path_from_stat(&st);
     pthread_mutex_lock(&h->mu);

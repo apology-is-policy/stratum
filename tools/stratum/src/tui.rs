@@ -195,6 +195,10 @@ struct CtlJob {
     success_msg: String,
     /// Background thread handle. Not joined — process exit reclaims.
     _join: Option<std::thread::JoinHandle<()>>,
+    /// The "Working" notice it put up, which its result may replace.
+    notice: String,
+    /// Its result, once in, until it can be shown.
+    result: Option<LocalDialog>,
 }
 
 #[derive(Debug)]
@@ -488,9 +492,12 @@ fn run_ui(
     // SWISS-8g: in-progress /ctl/ admin job (snapshot create/delete /
     // scrub trigger). Runs on a background thread so the UI stays
     // responsive while stratumd processes the write. The main loop
-    // polls completion via advance_ctl_job; while in flight the
+    // polls completion via tick_ctl_job; while in flight the
     // user sees an info_dialog "Working…" message.
     let mut ctl_job: Option<CtlJob> = None;
+    // A notice no key asked for, kept while a batch runs: shown over the batch's
+    // progress it would take the Esc that cancels the batch.
+    let mut held_notice: Option<LocalDialog> = None;
     // SWISS-4n: type-to-jump prefix-search state (see SearchState
     // doc for behavior). Lives across handle_key calls so a user
     // can type "ph" then "o" and have the cursor land on "photo.jpg".
@@ -542,7 +549,13 @@ fn run_ui(
             // SWISS-8g: tick the in-progress /ctl/ admin job (if any)
             // FIRST so completion swaps in a success/error dialog
             // BEFORE the rest of the loop runs.
-            tick_ctl_job(&mut local_dialog, &mut ctl_job);
+            let batch_running = copy_batch.is_some() || delete_batch.is_some();
+            tick_ctl_job(&mut local_dialog, &mut ctl_job, batch_running);
+            if local_dialog.is_none() && !batch_running {
+                if let Some(notice) = held_notice.take() {
+                    local_dialog = Some(notice);
+                }
+            }
             // SWISS-4h: advance batch ops one step per iteration when
             // no dialog is up. Conflict (CopyBatch) opens a dialog
             // that pauses the loop until user picks; the next
@@ -648,9 +661,14 @@ fn run_ui(
                     Err(e) => {
                         // An empty buffer here would replace the file on the next :w.
                         let _ = client.write_path("/event", b"editor close\n");
-                        show_unasked(&mut local_dialog, error_dialog(&format!(
+                        let notice = error_dialog(&format!(
                             "Cannot open {}: {e}", snapshot.editor_filename
-                        )));
+                        ));
+                        if copy_batch.is_some() || delete_batch.is_some() {
+                            held_notice = Some(notice);
+                        } else {
+                            show_unasked(&mut local_dialog, notice);
+                        }
                     }
                 }
             }
@@ -849,7 +867,7 @@ fn run_ui(
                 // in F2View so the pollers' VolumeMapState /
                 // SnapshotGraphState changes redraw within ≤ 100 ms.
                 if copy_batch.is_some() || delete_batch.is_some()
-                    || ctl_job.is_some()
+                    || ctl_job.as_ref().is_some_and(|j| j.result.is_none())
                     || view_mode == ui::ViewMode::F2View
                 {
                     break;
@@ -1859,7 +1877,7 @@ fn handle_snap_list_key(
 /// SWISS-8g: spawn an async /ctl/ admin write on a background thread.
 ///
 /// Returns a CtlJob the caller stashes into `run_ui`'s state; the
-/// main loop polls `advance_ctl_job` each iteration. While the job
+/// main loop polls `tick_ctl_job` each iteration. While the job
 /// runs, `local_dialog` should display an info_dialog "Working…"
 /// message so the user understands the UI is intentionally paused
 /// on this one screen.
@@ -1927,23 +1945,84 @@ fn spawn_ctl_job(
         rx,
         success_msg,
         _join: Some(join),
+        notice: String::new(),
+        result: None,
     }
 }
 
-/// SWISS-8g: drive an in-progress CtlJob from the main loop. Polls
-/// the channel; on completion, replaces `local_dialog` with the
-/// success / error message + clears the job. Returns `Some(())`
-/// when the job completed this tick (caller should clear its own
-/// reference) or `None` if still running.
-/// A finished job's result takes the place of a notice, its own "Working" one
-/// included, but never of a question or a field being typed in: it waits until
-/// that has been answered.
-fn tick_ctl_job(local_dialog: &mut Option<LocalDialog>, ctl_job: &mut Option<CtlJob>) {
-    let only_a_notice = local_dialog
-        .as_ref()
-        .is_none_or(|d| matches!(d.kind, LocalDialogKind::Error));
-    if ctl_job.is_some() && only_a_notice {
-        advance_ctl_job(local_dialog, ctl_job);
+/// Starts a /ctl job behind its own notice. One job at a time: a second would
+/// drop the first one's result, so while one runs, or its result waits to be
+/// shown, the new one is not started and the user is told why.
+fn start_ctl_job(
+    local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
+    ctl_sock: PathBuf,
+    p9_path: String,
+    body: Vec<u8>,
+    success_msg: String,
+    working: String,
+) {
+    if let Some(job) = ctl_job.as_mut() {
+        match job.result.take() {
+            Some(mut waiting) => {
+                *ctl_job = None;
+                waiting.prompt.push_str(
+                    "\n\nThis came in first, so the action just chosen was not\nstarted. Choose it again.",
+                );
+                *local_dialog = Some(waiting);
+            }
+            None => {
+                *local_dialog = Some(error_dialog(
+                    "A snapshot or scrub request is still running.\nTry again once its result shows.",
+                ));
+            }
+        }
+        return;
+    }
+    let mut job = spawn_ctl_job(ctl_sock, p9_path, body, success_msg);
+    job.notice = working.clone();
+    *ctl_job = Some(job);
+    *local_dialog = Some(info_dialog(&working));
+}
+
+/// SWISS-8g: drive an in-progress CtlJob from the main loop: take its result
+/// once it is in, and show it when that loses nothing. It replaces the job's own
+/// "Working" notice, or the snapshot list, or shows on a bare screen once no
+/// batch runs. Over a question, a field being typed in, another notice such as a
+/// batch's summary, or a running batch's progress, whose Esc it would take, it
+/// waits, and the job holds it until then.
+fn tick_ctl_job(
+    local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
+    batch_running: bool,
+) {
+    let Some(job) = ctl_job.as_mut() else { return };
+    if job.result.is_none() {
+        job.result = match job.rx.try_recv() {
+            Ok(CtlJobResult::Ok) => Some(info_dialog(&job.success_msg)),
+            Ok(CtlJobResult::Err(detail)) => Some(error_dialog(&detail)),
+            Ok(CtlJobResult::SpawnErr(detail)) => Some(error_dialog(&format!("ctl-job: {detail}"))),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(error_dialog(
+                "ctl-job: background thread disconnected without sending result",
+            )),
+        };
+    }
+    if job.result.is_none() {
+        return;
+    }
+    let shows_now = match local_dialog.as_ref() {
+        None => !batch_running,
+        Some(d) => {
+            matches!(d.kind, LocalDialogKind::SnapshotList { .. })
+                || (matches!(d.kind, LocalDialogKind::Error) && !d.is_error && d.prompt == job.notice)
+        }
+    };
+    if shows_now {
+        if let Some(shown) = job.result.take() {
+            show_unasked(local_dialog, shown);
+        }
+        *ctl_job = None;
     }
 }
 
@@ -1960,24 +2039,6 @@ fn show_unasked(local_dialog: &mut Option<LocalDialog>, d: LocalDialog) {
     *local_dialog = Some(d);
 }
 
-fn advance_ctl_job(
-    local_dialog: &mut Option<LocalDialog>,
-    ctl_job: &mut Option<CtlJob>,
-) -> Option<()> {
-    let job = ctl_job.as_ref()?;
-    let shown = match job.rx.try_recv() {
-        Ok(CtlJobResult::Ok) => info_dialog(&job.success_msg),
-        Ok(CtlJobResult::Err(detail)) => error_dialog(&detail),
-        Ok(CtlJobResult::SpawnErr(detail)) => error_dialog(&format!("ctl-job: {detail}")),
-        Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => error_dialog(
-            "ctl-job: background thread disconnected without sending result",
-        ),
-    };
-    show_unasked(local_dialog, shown);
-    *ctl_job = None;
-    Some(())
-}
 
 fn submit_confirm(
     local_dialog: &mut Option<LocalDialog>,
@@ -2093,19 +2154,21 @@ fn submit_confirm(
             };
             // SWISS-8g: dispatch as async ctl_job.
             let p9_path = format!("/datasets/{dataset_id}/delete-snapshot");
-            *ctl_job = Some(spawn_ctl_job(
+            start_ctl_job(
+                local_dialog,
+                ctl_job,
                 ctl_sock,
                 p9_path,
                 format!("{snap_id}").into_bytes(),
                 format!("Snapshot deleted: {name} (#{snap_id})"),
-            ));
-            *local_dialog = Some(info_dialog(&format!(
+                format!(
                 "Deleting snapshot \"{name}\" (#{snap_id})…\n\
                  \n\
                  stratumd is updating the snapshot chain + freeing\n\
                  unreferenced extents. This usually takes < 1 s but\n\
                  can be longer on a heavily-snapshotted volume."
-            )));
+                ),
+            );
             Ok(Action::Refresh)
         }
         ConfirmAction::ScrubTrigger { pool_uuid, verb } => {
@@ -2132,15 +2195,17 @@ fn submit_confirm(
                 }
             };
             let p9_path = format!("/pools/{pool_uuid}/scrub-trigger");
-            *ctl_job = Some(spawn_ctl_job(
+            start_ctl_job(
+                local_dialog,
+                ctl_job,
                 ctl_sock,
                 p9_path,
                 verb.as_bytes().to_vec(),
                 format!("Scrub {verb}: queued. Watch the Integrity pane for progress."),
-            ));
-            *local_dialog = Some(info_dialog(&format!(
+                format!(
                 "Sending scrub {verb} request…"
-            )));
+                ),
+            );
             Ok(Action::Refresh)
         }
         ConfirmAction::RollbackSnapshot { dataset_id, snap_id, name } => {
@@ -2173,15 +2238,17 @@ fn submit_confirm(
                 }
             };
             let p9_path = format!("/datasets/{dataset_id}/rollback-snapshot");
-            *ctl_job = Some(spawn_ctl_job(
+            start_ctl_job(
+                local_dialog,
+                ctl_job,
                 ctl_sock,
                 p9_path,
                 format!("{snap_id}").into_bytes(),
                 format!("Rolled back to snapshot {name} (#{snap_id})."),
-            ));
-            *local_dialog = Some(info_dialog(&format!(
+                format!(
                 "Rolling back to snapshot \"{name}\" (#{snap_id})…"
-            )));
+                ),
+            );
             Ok(Action::Refresh)
         }
         ConfirmAction::StopBatch { copy } => {
@@ -2215,7 +2282,8 @@ fn stop_batch_dialog(copy: bool, quitting: bool) -> LocalDialog {
             selected: if quitting { 0 } else { 1 },
             on_pick: ConfirmAction::StopBatch { copy },
         },
-        // The confirm box cuts a line at its width rather than wrapping it.
+        // The confirm box grows to the prompt's wrapped height, so a narrow
+        // terminal costs rows, not the buttons.
         prompt: format!(
             "{what} is under way. The item in hand goes on; the rest\n\
              wait while this shows.\n\
@@ -2723,19 +2791,21 @@ fn submit_dialog(
             // freezing the UI when stratumd took >1 s (snapshot
             // create flushes the dirty buffer, which can be slow).
             let p9_path = format!("/datasets/{dataset_id}/create-snapshot");
-            *ctl_job = Some(spawn_ctl_job(
+            start_ctl_job(
+                local_dialog,
+                ctl_job,
                 ctl_sock,
                 p9_path,
                 name.as_bytes().to_vec(),
                 format!("Snapshot created: {name}"),
-            ));
-            *local_dialog = Some(info_dialog(&format!(
+                format!(
                 "Creating snapshot \"{name}\"…\n\
                  \n\
                  stratumd is flushing the dirty buffer + writing the\n\
                  snapshot record. This usually takes < 1 s but can be\n\
                  longer on a busy volume."
-            )));
+                ),
+            );
             Ok(Action::Refresh)
         }
         LocalDialogKind::PassphraseFor { volume } => {
@@ -4799,7 +4869,17 @@ mod tests {
     fn finished_job(msg: &str) -> Option<CtlJob> {
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(CtlJobResult::Ok).unwrap();
-        Some(CtlJob { rx, success_msg: msg.to_string(), _join: None })
+        Some(CtlJob {
+            rx,
+            success_msg: msg.to_string(),
+            _join: None,
+            notice: "Creating snapshot...".to_string(),
+            result: None,
+        })
+    }
+
+    fn shows(d: &Option<LocalDialog>, prompt: &str) -> bool {
+        d.as_ref().is_some_and(|d| d.prompt == prompt)
     }
 
     fn holds_the_batch(d: &Option<LocalDialog>) -> bool {
@@ -4815,23 +4895,107 @@ mod tests {
         DELETE_CANCEL.with(|c| c.set(false));
         let mut dialog = Some(stop_batch_dialog(false, true));
         let mut job = finished_job("Snapshot created.");
-        tick_ctl_job(&mut dialog, &mut job);
+        tick_ctl_job(&mut dialog, &mut job, true);
         assert!(holds_the_batch(&dialog));
         assert!(job.is_some());
         assert!(!DELETE_CANCEL.with(|c| c.get()));
         dialog = None;
-        tick_ctl_job(&mut dialog, &mut job);
+        tick_ctl_job(&mut dialog, &mut job, false);
         assert!(job.is_none());
-        assert!(dialog.is_some_and(|d| d.prompt == "Snapshot created."));
+        assert!(shows(&dialog, "Snapshot created."));
     }
 
     #[test]
     fn a_finished_job_replaces_its_own_notice() {
         let mut dialog = Some(info_dialog("Creating snapshot..."));
         let mut job = finished_job("Snapshot created.");
-        tick_ctl_job(&mut dialog, &mut job);
+        tick_ctl_job(&mut dialog, &mut job, false);
         assert!(job.is_none());
-        assert!(dialog.is_some_and(|d| d.prompt == "Snapshot created."));
+        assert!(shows(&dialog, "Snapshot created."));
+    }
+
+    // A batch's summary may be the only word of the items that failed.
+    #[test]
+    fn a_finished_job_waits_behind_another_notice() {
+        let summary = "Copy: 1 copied, 2 failed";
+        let mut dialog = Some(error_dialog(summary));
+        let mut job = finished_job("Snapshot created.");
+        tick_ctl_job(&mut dialog, &mut job, false);
+        assert!(shows(&dialog, summary));
+        assert!(job.as_ref().is_some_and(|j| j.result.is_some()));
+        // Nor does a notice that only reads like the job's own, but is an error.
+        let mut dialog = Some(error_dialog("Creating snapshot..."));
+        tick_ctl_job(&mut dialog, &mut job, false);
+        assert!(shows(&dialog, "Creating snapshot..."));
+        dialog = None;
+        tick_ctl_job(&mut dialog, &mut job, false);
+        assert!(job.is_none());
+        assert!(shows(&dialog, "Snapshot created."));
+    }
+
+    // Shown over a running batch's progress, it would take the Esc that cancels the batch.
+    #[test]
+    fn a_finished_job_waits_while_a_batch_runs_bare() {
+        let mut dialog: Option<LocalDialog> = None;
+        let mut job = finished_job("Snapshot created.");
+        tick_ctl_job(&mut dialog, &mut job, true);
+        assert!(dialog.is_none());
+        assert!(job.is_some());
+        tick_ctl_job(&mut dialog, &mut job, false);
+        assert!(shows(&dialog, "Snapshot created."));
+    }
+
+    // The snapshot list holds no answer and no typed text: the result may take its place.
+    #[test]
+    fn a_finished_job_replaces_the_snapshot_list() {
+        let mut dialog = Some(LocalDialog {
+            kind: LocalDialogKind::SnapshotList { snaps: Vec::new(), cursor: 0, dataset_id: 1 },
+            prompt: String::new(),
+            value: Default::default(),
+            is_password: false,
+            is_error: false,
+        });
+        let mut job = finished_job("Snapshot created.");
+        tick_ctl_job(&mut dialog, &mut job, false);
+        assert!(job.is_none());
+        assert!(shows(&dialog, "Snapshot created."));
+    }
+
+    // A second job would drop the first one's result: it is not started.
+    #[test]
+    fn no_second_job_starts_while_one_is_out() {
+        let sock = PathBuf::from("/nonexistent/ctl.sock");
+        let start = |dialog: &mut Option<LocalDialog>, job: &mut Option<CtlJob>| {
+            start_ctl_job(dialog, job, sock.clone(), "/x".into(), Vec::new(), "second done".into(), "second...".into());
+        };
+        // Still running: the user is told, and the first job is kept.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut job = Some(CtlJob {
+            rx,
+            success_msg: "first done".into(),
+            _join: None,
+            notice: "first...".into(),
+            result: None,
+        });
+        let mut dialog = None;
+        start(&mut dialog, &mut job);
+        assert!(dialog.as_ref().is_some_and(|d| d.prompt.contains("still running")));
+        assert!(job.as_ref().is_some_and(|j| j.success_msg == "first done"));
+        // Its result waiting under a field: that result is shown, the new job is not started.
+        let mut job = finished_job("Snapshot created.");
+        let mut dialog = Some(LocalDialog {
+            kind: LocalDialogKind::SnapInput { panel_idx: 0, dataset_id: 1 },
+            prompt: String::new(),
+            value: Default::default(),
+            is_password: false,
+            is_error: false,
+        });
+        tick_ctl_job(&mut dialog, &mut job, false);
+        assert!(job.as_ref().is_some_and(|j| j.result.is_some()));
+        start(&mut dialog, &mut job);
+        assert!(job.is_none());
+        assert!(dialog.as_ref().is_some_and(|d| d.prompt.starts_with("Snapshot created.")
+            && d.prompt.contains("not\nstarted")));
     }
 
     // Whatever else takes the question's place counts as Stop.

@@ -589,7 +589,7 @@ stratum fs -s SOCKET put ./dir /dir                    script it
 - **Not kept:** modification time, owner, extended attributes, holes in sparse files, and hard links, which become separate files (T5.4).
 - **A batch is not one transaction.** Stopped or killed part way, it leaves the items done so far. A kill during a volume item can leave a short file under a new name, and temporaries named `.stratum-copy-<pid>-<n>` (T0.56).
 
-**How a delete behaves.** `F8` asks "Delete N items?" with No selected, and nothing is touched unless the answer is Yes. Items go one at a time, a directory with everything in it. Esc stops the batch after the item in hand. A quit key, `F5`, `F7` or `F8` during a batch asks Stop or Go on, and the batch waits while it asks. The manager quits only once no batch runs.
+**How a delete behaves.** `F8` asks "Delete N items?" with No selected, and nothing is touched unless the answer is Yes. Items go one at a time, a directory with everything in it. Esc stops the batch after the item in hand. A quit key, `F5`, `F7` or `F8` during a batch asks Stop or Go on. No new item starts while it asks, though the item in hand runs on. A quit key quits only once no batch runs; a signal, or the terminal closing, ends the manager at once, in the middle of the item in hand if there is one. A result or notice that arrives while a batch runs waits until the batch has ended, so it never takes the Esc meant for the batch.
 
 **Names.** A name the manager cannot show exactly, one that is not UTF-8, holds a control character, or is longer than 9P's 255 bytes on the host, is listed with U+FFFD standing in, and no action accepts it: it is not entered, copied or deleted from the manager. The host panel checks on every use that a name still leads to the file it was walked to, so a file renamed away is not served as the file now at its name. It knows a file by device and inode, so a new file that reuses a freed inode number can take over the name of a fid still held on the old one (T0.62); the manager re-walks on every redraw and holds no such fid.
 
@@ -624,7 +624,7 @@ Stratum is the opposite trade to VeraCrypt: it does not hide that it exists, but
 
 ## 15. Evidence of correctness
 
-**Tests.** 81 suites and 2,523 test legs, in C. The manager has 35 Rust integration tests and 109 unit tests, and three drivers run the real binary: `volume_smoke.sh`, `stop_with_clients.py`, and `manager_keys.py`, which plays the manager's keys in a terminal and reads the screen.
+**Tests.** 81 suites and 2,524 test legs, in C. The manager has 35 Rust integration tests and 114 unit tests, and three drivers run the real binary: `volume_smoke.sh`, `stop_with_clients.py`, and `manager_keys.py`, which plays the manager's keys in a terminal and reads the screen.
 
 **TLA+.** 43 specifications with 191 configurations, of which 135 are deliberately broken and must fail. Coverage includes commit and quorum, allocator and deferred free, nonce uniqueness,
 Merkle links, COW commit, delta chains and epochs, the namespace layer, compound operations, dead lists, clones, CAS, and the key schema. CI runs 12 of these configurations. The rest are run by
