@@ -29,6 +29,7 @@ mod editor;
 mod embed;
 mod ffi;
 mod landing;
+mod lifeline;
 mod passphrase;
 mod slate;
 mod snapgraph;
@@ -59,11 +60,20 @@ fn dispatch(args: Vec<String>) -> Result<i32> {
             Ok(0)
         }
         "tui" => tui_dispatch(&args[2..]),
-        "serve" => ffi_dispatch("stratumd", &args[2..], ffi::stm_cmd_stratumd_main),
-        "slate" => ffi_dispatch("stratum-slate", &args[2..], ffi::stm_cmd_slate_main),
+        "serve" => {
+            lifeline::follow();
+            ffi_dispatch("stratumd", &args[2..], ffi::stm_cmd_stratumd_main)
+        }
+        "slate" => {
+            lifeline::follow();
+            ffi_dispatch("stratum-slate", &args[2..], ffi::stm_cmd_slate_main)
+        }
         "mkfs" => ffi_dispatch("stratum-mkfs", &args[2..], ffi::stm_cmd_mkfs_main),
         "fs" => ffi_dispatch("stratum-fs", &args[2..], ffi::stm_cmd_fs_main),
-        "host-fs" => ffi_dispatch("stratum-host-fs", &args[2..], ffi::stm_cmd_host_fs_main),
+        "host-fs" => {
+            lifeline::follow();
+            ffi_dispatch("stratum-host-fs", &args[2..], ffi::stm_cmd_host_fs_main)
+        }
         other => {
             bail!("stratum: unknown subcommand: {other}\n(see `stratum --help`)");
         }

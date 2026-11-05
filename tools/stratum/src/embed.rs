@@ -78,6 +78,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // R126 P2-2: mask SIGINT/SIGTERM on the parent thread BEFORE
     // spawning children.
     let prev_mask = block_term_signals();
+    crate::lifeline::hold()?;
     let session_dir = make_session_dir()?;
     let slate_sock = session_dir.join("slate.sock");
     let host_fs_sock = session_dir.join("host-fs.sock");
