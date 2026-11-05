@@ -3,6 +3,7 @@
 # Jobs:
 #   build-linux   — gcc/clang × off/asan/tsan sanitizer matrix; runs ctest.
 #   build-macos   — clang × off/asan/tsan; POSIX backend only.
+#   manager       -- dist/stratum, the manager's tests, a volume end to end.
 #   tlc-specs     -- TLC on all specs/*.tla with matching .cfg.
 #
 name: ci
@@ -107,6 +108,30 @@ jobs:
 
       - name: test
         run: ctest --test-dir build --output-on-failure
+
+  manager:
+    name: Manager / macOS
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install deps
+        run: |
+          brew update
+          brew install cmake pkg-config libsodium
+          # liboqs is optional on macOS, as in build-macos.
+
+      - name: build dist/stratum
+        run: ./dist.sh
+
+      - name: test the manager
+        working-directory: tools/stratum
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build
+        run: cargo test --release
+
+      - name: a file-based volume end to end
+        run: tests/volume_smoke.sh dist/stratum
 
   tlc-specs:
     name: TLC / ${{ matrix.cfg }}
