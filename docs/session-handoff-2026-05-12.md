@@ -41,13 +41,13 @@ and the kernel-9P mount path needs concurrent-accept on stratumd.
   no e2e surface change this session).
 
 - **Working tree clean** on tracked code. Untracked: `loc.sh`
-  (statusline helper), `v2/.audit_r128_findings.md`,
-  `v2/.audit_r129_findings.md` (audit artifacts), `v2/build_asan/`
+  (statusline helper), `.audit_r128_findings.md`,
+  `.audit_r129_findings.md` (audit artifacts), `build_asan/`
   (sanitizer build dir).
 
 - **Binary deployed** to both
   `/Users/northkillpd/projects/dist/stratum` (codesigned) **and**
-  `/Users/northkillpd/projects/stratum/v2/tools/stratum/target/release/stratum`
+  `/Users/northkillpd/projects/stratum/tools/stratum/target/release/stratum`
   (which the user runs directly).
 
 ## The SWISS-8 story (what actually happened)
@@ -90,7 +90,7 @@ Then user retested → "F2 still shows Awaiting first refresh, F9
 
 - **8k** — the actual root cause. **stratumd's /ctl/ worker is
   serial-per-socket** (`accept → serve → close → accept → …`, per
-  `v2/src/cmd/stratumd/serve.c` + CLAUDE.md stratumd row). Both
+  `src/cmd/stratumd/serve.c` + CLAUDE.md stratumd row). Both
   `VolumeMapPoller` and `SnapshotGraphPoller` held long-lived
   `CtlClient` connections across ticks. Whichever poller's
   `thread::spawn` won the start-order race grabbed the /ctl/ slot
@@ -202,19 +202,19 @@ cd /Users/northkillpd/projects/stratum
 git log --oneline -10                                  # tip 166056b
 
 # C-side:
-cmake --build v2/build && ctest --test-dir v2/build -j4
+cmake --build build && ctest --test-dir build -j4
 # Expected: 51/51 in ~138s
 
 # Rust-side:
-(cd v2/tools/stratum && cargo build --release)
-(cd v2/tools/stratum && cargo test --release --bin stratum)
+(cd tools/stratum && cargo build --release)
+(cd tools/stratum && cargo test --release --bin stratum)
 # Expected: 97/97
-(cd v2/tools/stratum && cargo test --release --test e2e_crud)
+(cd tools/stratum && cargo test --release --test e2e_crud)
 # Expected: 33/33
 
 # Manual smoke (after restart — the running TUI's mapped binary
 # pages keep the OLD code even after the file is overwritten):
-~/projects/stratum/v2/tools/stratum/target/release/stratum tui
+~/projects/stratum/tools/stratum/target/release/stratum tui
 # In the file panel: navigate to a .stm and press Enter.
 # Within ~1s, F2 should show live Map + Integrity panes.
 # F9 in the file panel: snapshot list dialog; N → create input.
@@ -238,7 +238,7 @@ Identical to prior handoffs, plus the SWISS-8 additions:
   (SWISS-8k): stratumd /ctl/ is serial-per-socket. Two pollers
   holding connections deadlock against each other on accept.
   This discipline goes away **only after P9.5-PARALLEL-1** lands.
-  Documented as load-bearing in `v2/tools/stratum/src/volmap.rs`
+  Documented as load-bearing in `tools/stratum/src/volmap.rs`
   + `snapgraph.rs`.
 - **F4 context-dependent binding** (carry from prior): in Files
   mode F4 = editor; (in pre-SWISS-8a F2View it was Snapshot Graph
@@ -280,16 +280,16 @@ Identical to prior handoffs, plus the SWISS-8 additions:
 
 ```
 + M CLAUDE.md                                        (ViewMode-row clauses 7a/7b/8/8i/8j + new SWISS-8d/e/f/g/h posture)
-+ M v2/src/lp9/server.c                              (SWISS-8j Tfsync no-op handler)
-+ M v2/tools/stratum/src/spawn.rs                    (SWISS-8d Arc<RwLock> + --ctl-listen)
-+ M v2/tools/stratum/src/volmap.rs                   (SWISS-8d/f/k poller upgrades)
-+ M v2/tools/stratum/src/snapgraph.rs                (SWISS-8d/f/k poller upgrades)
-+ M v2/tools/stratum/src/swiss5_view.rs              (SWISS-8e footer drop + 8f friendly message)
-+ M v2/tools/stratum/src/swiss6_view.rs              (SWISS-8e footer drop + 8f friendly message)
-+ M v2/tools/stratum/src/swiss7_view.rs              (SWISS-8e footer drop + 8f friendly message)
-+ M v2/tools/stratum/src/ui.rs                       (SWISS-8a F2State/F2Pane/F2Focus + SWISS-8c SnapshotList + 8h ScrubTrigger)
-+ M v2/tools/stratum/src/tui.rs                      (SWISS-8a F2View dispatch + 8b Shift+F<n> + 8c F9 + 8g CtlJob + 8h scrub + 8i redraw)
-+ ?? v2/docs/session-handoff-2026-05-12.md            (this file — uncommitted at write time)
++ M src/lp9/server.c                              (SWISS-8j Tfsync no-op handler)
++ M tools/stratum/src/spawn.rs                    (SWISS-8d Arc<RwLock> + --ctl-listen)
++ M tools/stratum/src/volmap.rs                   (SWISS-8d/f/k poller upgrades)
++ M tools/stratum/src/snapgraph.rs                (SWISS-8d/f/k poller upgrades)
++ M tools/stratum/src/swiss5_view.rs              (SWISS-8e footer drop + 8f friendly message)
++ M tools/stratum/src/swiss6_view.rs              (SWISS-8e footer drop + 8f friendly message)
++ M tools/stratum/src/swiss7_view.rs              (SWISS-8e footer drop + 8f friendly message)
++ M tools/stratum/src/ui.rs                       (SWISS-8a F2State/F2Pane/F2Focus + SWISS-8c SnapshotList + 8h ScrubTrigger)
++ M tools/stratum/src/tui.rs                      (SWISS-8a F2View dispatch + 8b Shift+F<n> + 8c F9 + 8g CtlJob + 8h scrub + 8i redraw)
++ ?? docs/session-handoff-2026-05-12.md            (this file -- uncommitted at write time)
 ```
 
 All prior SWISS-8 files committed in `768ab47..166056b`.
@@ -298,10 +298,10 @@ All prior SWISS-8 files committed in `768ab47..166056b`.
 
 ```
 M loc.sh                                         (statusline helper; user can commit at leisure)
-?? v2/.audit_r128_findings.md                    (R128 audit artifact — content also in prior handoff doc)
-?? v2/.audit_r129_findings.md                    (R129 audit artifact — content also in prior handoff doc)
-?? v2/build_asan/                                (sanitizer build dir; `git clean -fdX` safe)
-?? v2/docs/session-handoff-2026-05-12.md         (this file)
+?? .audit_r128_findings.md                    (R128 audit artifact -- content also in prior handoff doc)
+?? .audit_r129_findings.md                    (R129 audit artifact -- content also in prior handoff doc)
+?? build_asan/                                (sanitizer build dir; `git clean -fdX` safe)
+?? docs/session-handoff-2026-05-12.md         (this file)
 ```
 
 ## Tasks (in-conversation list) — close-out

@@ -3,8 +3,8 @@
  * Key-schema sub-tree (Phase 4 chunk P4-4a).
  *
  *   see ARCHITECTURE §7.3 / §7.7.3 for the full design.
- *   see v2/docs/phase4-status.md §P4-4 for implementation plan.
- *   see v2/specs/key_schema.tla for the formal model.
+ *   see docs/phase4-status.md section P4-4 for implementation plan.
+ *   see specs/key_schema.tla for the formal model.
  *
  * What this module does:
  *
@@ -73,7 +73,7 @@ typedef enum {
 /* TLY-A3-keyslot: how a slot's wrapped-DEK blob is sealed — the
  * `wrapper_identity` byte carved from the entry-value reserved space
  * (STM_UB_VERSION 26 -> 27). The mount path routes a slot to the
- * right unwrapper by this tag (see v2/docs/thylacine-keyslot-design.md
+ * right unwrapper by this tag (see docs/thylacine-keyslot-design.md
  * §3). On-disk encoding is a little-endian 1 byte at value offset 2.
  *
  * LEGACY (0) is the back-compat default: a pre-TLY-A3 slot wrote

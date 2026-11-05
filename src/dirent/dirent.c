@@ -3,7 +3,7 @@
  * Stratum v2 — dirent index implementation
  * (P8-POSIX-2 + 9.6-impl-4c + 9.7-impl-1c-iii).
  *
- * Spec: v2/specs/dirent.tla. Models open-addressing chain integrity
+ * Spec: specs/dirent.tla. Models open-addressing chain integrity
  * for directory entries keyed by `(dataset_id, dir_ino, hash_probe)`
  * where `hash_probe = fnv1a64(name) + probe_offset`. Per ARCH §11.4.
  *

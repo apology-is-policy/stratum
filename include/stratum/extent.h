@@ -110,9 +110,9 @@ stm_status stm_extent_decrypt(stm_aead_mode mode,
 /* =========================================================================
  * Extent INDEX (P7-2 in-RAM MVP).
  *
- *   see v2/specs/extent.tla — formal model.
+ *   see specs/extent.tla -- formal model.
  *   see docs/ARCHITECTURE.md §11.6 — extent record + extent tree key.
- *   see docs/ROADMAP-V2.md §10 — Phase 7 (cold tier + features).
+ *   see docs/ROADMAP.md section 10 -- Phase 7 (cold tier + features).
  *
  * The extent index tracks the LOGICAL data layer between datasets and
  * stored bytes — for every (dataset_id, ino) pair, an ordered set of

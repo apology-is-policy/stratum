@@ -2,7 +2,7 @@
 /*
  * Stratum v2 — filesystem-side 9P2000.L server (P9-9P-1).
  *
- * Spec: v2/specs/fid.tla — every fid binding (Tattach / Twalk
+ * Spec: specs/fid.tla -- every fid binding (Tattach / Twalk
  * success) maps to fid.tla::Walk; every IO success (Tread / Twrite
  * / Tgetattr / Tsetattr / Tlock / ...) maps to fid.tla::IOSuccess
  * (gated on cached_gen == current ino gen + alive); every IO that
@@ -169,7 +169,7 @@ typedef struct p9_fid {
      *   fid_release_locked. Empty string is invalid; "/" is the
      *   canonical root path.
      *
-     * P9-9P-2 — composes against `v2/specs/namespace.tla`. Set at
+     * P9-9P-2 -- composes against `specs/namespace.tla`. Set at
      * Tattach (= "/"), updated at Twalk on every full or partial
      * walk, set at Tlcreate to the new file's logical path. */
     char       *ns_path;
@@ -566,7 +566,7 @@ static void phase_b_enter(stm_9p_server *s, uint8_t type, uint16_t tag)
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Namespace path canonicalization + bindings table (P9-9P-2).            */
-/* Composes against `v2/specs/namespace.tla`.                              */
+/* Composes against `specs/namespace.tla`.                              */
 /* ────────────────────────────────────────────────────────────────────── */
 
 /* Canonicalize a path string in-place into `out`. Rules:

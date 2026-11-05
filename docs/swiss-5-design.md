@@ -36,7 +36,7 @@ Volume map data lives on the stratumd side (the /ctl/ synfs). The TUI dials stra
 
 ### Architectural finding: Prometheus endpoint as one-stop-shop
 
-Inspection of `materialize_pool_metrics_prometheus` (`v2/src/ctl/synfs.c:1411-1490+`) confirms that `/pools/<uuid>/metrics/prometheus` already aggregates `c->pool` + `c->fs` + `c->scrub` into a single ASCII body with graceful degradation when subsystems aren't attached. This means the bulk of SWISS-5's data can be sourced from **a single fetch per refresh tick** — saving ~5 round trips per tick at 1 Hz.
+Inspection of `materialize_pool_metrics_prometheus` (`src/ctl/synfs.c:1411-1490+`) confirms that `/pools/<uuid>/metrics/prometheus` already aggregates `c->pool` + `c->fs` + `c->scrub` into a single ASCII body with graceful degradation when subsystems aren't attached. This means the bulk of SWISS-5's data can be sourced from **a single fetch per refresh tick** -- saving ~5 round trips per tick at 1 Hz.
 
 Practical consequence: the renderer's data layer is ~80% prometheus-format parsing. The remaining 20% is per-dataset usage + snapshot list, which need their own /ctl/ paths because they're per-dataset (not pool-level) and don't currently live in the Prometheus exposition.
 
@@ -57,8 +57,8 @@ Three small chunks need to land BEFORE the Rust renderer can read its full data 
 Today's stratumd serve.c creates stm_ctl but never calls `stm_ctl_attach_pool` / `stm_ctl_attach_scrub` (forward-noted in `stratumd.h:43`). Reason: stm_fs holds pool + scrub internally, and there's no public getter.
 
 Implementation:
-- Add `stm_fs_pool(stm_fs *)` + `stm_fs_scrub(stm_fs *)` getters to `v2/include/stratum/fs.h` + `v2/src/fs/fs.c`. Pure read-only accessors returning the internal pointers; thread-safe at the public-API level (read of a pointer set at mount time, never reassigned without unmount).
-- In `v2/src/cmd/stratumd/serve.c`, AFTER `stm_ctl_create` and BEFORE `stm_ctl_set_admin_uid`, call:
+- Add `stm_fs_pool(stm_fs *)` + `stm_fs_scrub(stm_fs *)` getters to `include/stratum/fs.h` + `src/fs/fs.c`. Pure read-only accessors returning the internal pointers; thread-safe at the public-API level (read of a pointer set at mount time, never reassigned without unmount).
+- In `src/cmd/stratumd/serve.c`, AFTER `stm_ctl_create` and BEFORE `stm_ctl_set_admin_uid`, call:
   ```c
   stm_ctl_attach_pool(ctl, stm_fs_pool(fs));
   stm_ctl_attach_scrub(ctl, stm_fs_scrub(fs));
@@ -75,7 +75,7 @@ Audit triggers: fs.h public API change (small surface — pure getters); stratum
 Today /datasets/<id>/ exposes name + create-snapshot + delete-snapshot + hold-snapshot but no aggregate usage. SWISS-5 needs per-dataset used bytes for the donut split.
 
 Implementation:
-- New kind `STM_CTL_KIND_DATASET_USAGE` in `v2/src/ctl/synfs.c`'s KIND_META table.
+- New kind `STM_CTL_KIND_DATASET_USAGE` in `src/ctl/synfs.c`'s KIND_META table.
 - Materializer reads `stm_fs_dataset_used_bytes(fs, dataset_id)` — needs to be added to fs.h. Internal impl walks the dataset's inode tree and sums `si_size`. Today's `stm_fs_stats_get` returns aggregate; per-dataset needs a new accessor.
 - Output: single decimal line, bytes. (Prometheus-aligned, even though this isn't a metrics endpoint.)
 - World-readable mode 0444 (matches /datasets/<id>/name).
@@ -104,7 +104,7 @@ Audit triggers: new /ctl/ kind (R107 doctrine); reads from snapshot.c (already i
 
 The TUI gains a third view mode in `tui.rs` (already supports Files and Editor). New variant `ViewMode::VolumeMap`. F2 keypress switches to it; F3 switches back to files. Tab stays focus-toggle within the active view.
 
-### New module: `v2/tools/stratum/src/volmap.rs`
+### New module: `tools/stratum/src/volmap.rs`
 
 Three responsibilities:
 
@@ -176,11 +176,11 @@ S5-PRE-{A,B,C} and S5-IMPL-3 are gated on R128 close. S5-IMPL-{1,2} can land in 
 
 While the R128 audit runs in the background, the non-conflicting prep landed:
 
-- ✅ **`v2/tools/stratum/src/ffi.rs` extended** — added `stm_9p_readdir` declaration + `stm_9p_dirent_cb` typedef. Required for `discover_pool_uuid` (readdir `/pools/`).
-- ✅ **`v2/tools/stratum/src/ctl.rs` written** (~310 LOC). Parallel to `slate.rs`: `CtlClient::dial`, `walk_to`, `lopen`, `read_path`, `read_until_eof`, `readdir` with a `dirent_collect_cb` extern "C" trampoline. Per-instance unique fid base (defense-in-depth even though /ctl/ doesn't have slate's session-table bug). `READ_CAP = 4 MiB`. `discover_pool_uuid` helper reads `/pools/` and returns the singleton UUID. Drop impl closes the client.
-- ✅ **`v2/tools/stratum/src/volmap.rs` written** (~410 LOC). `parse_prometheus(body)` handles label-quoted exposition; `PromMetrics::single` + `all` lookups; `VolumeMapState` typed model with `FsGauges`, `RosterGauges`, `ScrubGauges`, `Vec<DeviceInfo>`; `ingest(&PromMetrics)` reduces samples into typed state; `VolumeMapPoller::start` spawns a background thread that dials /ctl/ every 1s and updates an `Arc<RwLock<VolumeMapState>>`. Sleep is broken into 100ms chunks so a stop signal is observed promptly.
+- ok **`tools/stratum/src/ffi.rs` extended** -- added `stm_9p_readdir` declaration + `stm_9p_dirent_cb` typedef. Required for `discover_pool_uuid` (readdir `/pools/`).
+- ok **`tools/stratum/src/ctl.rs` written** (~310 LOC). Parallel to `slate.rs`: `CtlClient::dial`, `walk_to`, `lopen`, `read_path`, `read_until_eof`, `readdir` with a `dirent_collect_cb` extern "C" trampoline. Per-instance unique fid base (defense-in-depth even though /ctl/ doesn't have slate's session-table bug). `READ_CAP = 4 MiB`. `discover_pool_uuid` helper reads `/pools/` and returns the singleton UUID. Drop impl closes the client.
+- ok **`tools/stratum/src/volmap.rs` written** (~410 LOC). `parse_prometheus(body)` handles label-quoted exposition; `PromMetrics::single` + `all` lookups; `VolumeMapState` typed model with `FsGauges`, `RosterGauges`, `ScrubGauges`, `Vec<DeviceInfo>`; `ingest(&PromMetrics)` reduces samples into typed state; `VolumeMapPoller::start` spawns a background thread that dials /ctl/ every 1s and updates an `Arc<RwLock<VolumeMapState>>`. Sleep is broken into 100ms chunks so a stop signal is observed promptly.
 - ✅ **4 unit tests pass** — `parse_prometheus_basic`, `ingest_into_state` (full coverage of fs+roster+scrub+device ingest), `malformed_lines_surface_as_error`, `missing_gauges_remain_default`. Run: `cargo test --bin stratum volmap`.
-- ✅ **`v2/tools/stratum/src/main.rs`** — added `mod ctl; mod volmap;` (also kept `mod ffi;` reachable for cross-module use). Build clean: `cargo check` passes with one pre-existing dead-code warning in `ui.rs` unrelated to SWISS-5.
+- ok **`tools/stratum/src/main.rs`** -- added `mod ctl; mod volmap;` (also kept `mod ffi;` reachable for cross-module use). Build clean: `cargo check` passes with one pre-existing dead-code warning in `ui.rs` unrelated to SWISS-5.
 
 The data layer is ready to integrate. Once R128 closes, three follow-on chunks complete SWISS-5:
 
@@ -195,13 +195,13 @@ Estimate: ~3-4 hours of focused work post-R128 to ship Stage A + B in a single b
 Files added this session (not yet committed; pending R128 close):
 
 ```
-v2/docs/swiss-5-design.md                          (this doc)
-v2/docs/claude_md_updates_pending_r128.md          (draft CLAUDE.md updates)
-v2/tools/stratum/src/ctl.rs                        (NEW; ~310 LOC)
-v2/tools/stratum/src/volmap.rs                     (NEW; ~410 LOC + 13 tests)
-v2/tools/stratum/src/swiss5_view.rs                (NEW; ~290 LOC + 3 tests)
-v2/tools/stratum/src/ffi.rs                        (extended: stm_9p_readdir + cb type)
-v2/tools/stratum/src/main.rs                       (extended: 3 new mod declarations)
+docs/swiss-5-design.md                          (this doc)
+docs/claude_md_updates_pending_r128.md          (draft CLAUDE.md updates)
+tools/stratum/src/ctl.rs                        (NEW; ~310 LOC)
+tools/stratum/src/volmap.rs                     (NEW; ~410 LOC + 13 tests)
+tools/stratum/src/swiss5_view.rs                (NEW; ~290 LOC + 3 tests)
+tools/stratum/src/ffi.rs                        (extended: stm_9p_readdir + cb type)
+tools/stratum/src/main.rs                       (extended: 3 new mod declarations)
 ```
 
 **All tests passing**: 29/29 (13 volmap + 3 swiss5_view + 13 existing). Release build clean. No conflicts with R128 audit scope.

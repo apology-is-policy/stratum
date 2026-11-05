@@ -2,12 +2,12 @@
 /*
  * RC-2 concurrent read path tests — s->lock retired from reads.
  *
- *   see v2/docs/rc-design.md "RC-2"   — the design this validates.
- *   see v2/specs/dek_guard.tla        — the DEK-map model; the rotate/
+ *   see docs/rc-design.md "RC-2"   -- the design this validates.
+ *   see specs/dek_guard.tla        -- the DEK-map model; the rotate/
  *                                        sweep hammer is its runtime
  *                                        witness (Install/Evict churn
  *                                        under pinned readers).
- *   see v2/specs/dcache_ebr.tla       — the RC-1 model the read path
+ *   see specs/dcache_ebr.tla       -- the RC-1 model the read path
  *                                        composes with.
  *
  * Coverage:

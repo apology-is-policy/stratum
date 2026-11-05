@@ -3,7 +3,7 @@
 \* lock-free metadata path (Phase 9.8).
 \*
 \* ARCHITECTURE §3.3 / §3.6; design at
-\* `v2/docs/phase-9.8-design.md` §3 + §4.3.
+\* `docs/phase-9.8-design.md` section 3 + section 4.3.
 \*
 \* Companion to concurrency.tla and bepsilon.tla.
 \*

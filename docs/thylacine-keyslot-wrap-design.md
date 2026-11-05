@@ -212,7 +212,7 @@ production seal path on top.
 into 5a sync-provision (`c0fc8ff`) + 5b fs-wrapper + stratumd one-shot
 `--provision-corvus-dataset` CLI (`bfc3a4d`); 6 audit → **R148**
 (0 P0/P1, 2 P2 fixed inline + 4 P3, close commit follows; findings in
-`v2/.audit_r148_findings.md`). The corvus WRAP-path bilateral gap is
+`.audit_r148_findings.md`). The corvus WRAP-path bilateral gap is
 closed on the Stratum side; corvus's 3→4-byte decoder change + the
 real-corvus WRAP-socket question remain Thylacine-side (§10).
 

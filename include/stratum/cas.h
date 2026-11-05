@@ -2,14 +2,14 @@
 /*
  * Content-addressed cold-tier index (P7-CAS, v18).
  *
- *   see v2/specs/cas.tla — formal model.
+ *   see specs/cas.tla -- formal model.
  *   see docs/ARCHITECTURE.md §6.9 — CAS cold tier allocator (index design,
  *     write path, GC, chunk sizing).
  *   see docs/ARCHITECTURE.md §7.6.3 — CAS-entry AEAD AD (binds ciphertext
  *     to content_hash).
  *   see docs/ARCHITECTURE.md §12.10 — Hot ↔ Cold tier migration paths.
  *   see docs/NOVEL.md §3.3 — Venti-style CAS with content-defined chunking.
- *   see docs/ROADMAP-V2.md §10 — Phase 7 (cold tier + features).
+ *   see docs/ROADMAP.md section 10 -- Phase 7 (cold tier + features).
  *
  * The CAS index tracks the COLD tier's content-addressable store: a
  * Bε-tree keyed by `BLAKE3-256(content)` whose values are

@@ -79,7 +79,7 @@ C-side `stm_fs_rollback_to_snapshot(fs, dataset_id, snap_id)` API.
 
 **Scope discovered during prep — too big for a single autonomous
 chunk**: no v2 rollback API exists yet
-(`grep -n "rollback" v2/include/stratum/snapshot.h` returns design-
+(`grep -n "rollback" include/stratum/snapshot.h` returns design-
 doc references only — the public API has `create` / `delete` /
 `hold` / `release` / `lookup` / `iter` / `count` but NOT `rollback`).
 
@@ -88,7 +88,7 @@ Building rollback requires:
 1. **Spec-first** (per CLAUDE.md policy — rollback touches commit
    ordering, snapshot graph mutation, extent-tree reset, and
    indirectly nonce uniqueness because `extent_txg` moves). Extend
-   `v2/specs/snapshot.tla` with a `Rollback` action + invariants
+   `specs/snapshot.tla` with a `Rollback` action + invariants
    that survive arbitrary write reordering.
 2. **Semantic design decisions** (need user input):
    - Discard all snaps newer than target? (ZFS semantics)
@@ -101,7 +101,7 @@ Building rollback requires:
    - Per-dataset rollback only, OR per-pool?
 3. **C-side API**: `stm_fs_rollback_to_snapshot(fs, dataset_id,
    snap_id, flags)` — flags would carry "force-close open inodes"
-   etc. Goes into `v2/include/stratum/fs.h` + impl in `v2/src/fs/fs.c`.
+   etc. Goes into `include/stratum/fs.h` + impl in `src/fs/fs.c`.
 4. **/ctl/ writable kind**: new admin-only kind under
    `/datasets/<id>/rollback`. Trust boundaries per the existing
    /ctl/ writable-kind discipline (admin gate at lopen + defense-in-
@@ -130,7 +130,7 @@ git log --oneline -5
 git status --short
 # loc.sh + audit findings + build_asan only — no tracked-code changes
 
-cd v2/tools/stratum
+cd tools/stratum
 cargo test --release --bin stratum                  # 69/69
 cargo test --release --test e2e_crud                # 33/33
 
@@ -197,19 +197,19 @@ Identical to the prior handoffs' lists; v1.1a/b added these:
 
 ```
 + M CLAUDE.md                                       (clauses 7a + 7b)
-+ M v2/tools/stratum/src/snapgraph.rs               (helpers + 16 new tests)
-+ M v2/tools/stratum/src/swiss6_view.rs             (filter + marks)
-+ M v2/tools/stratum/src/tui.rs                     (F3 + Spc + F5)
-+ M v2/tools/stratum/src/ui.rs                      (render signature)
-+ A v2/docs/session-handoff-2026-05-11-swiss6.md    (folded into 8077885)
-+ A v2/docs/session-handoff-2026-05-11-swiss6-v1-1.md (this file; uncommitted)
++ M tools/stratum/src/snapgraph.rs               (helpers + 16 new tests)
++ M tools/stratum/src/swiss6_view.rs             (filter + marks)
++ M tools/stratum/src/tui.rs                     (F3 + Spc + F5)
++ M tools/stratum/src/ui.rs                      (render signature)
++ A docs/session-handoff-2026-05-11-swiss6.md    (folded into 8077885)
++ A docs/session-handoff-2026-05-11-swiss6-v1-1.md (this file; uncommitted)
 ```
 
 ## Working-tree leftovers (intentional, not committed)
 
 ```
 M loc.sh                                         (user's personal helper)
-?? v2/.audit_r128_findings.md                    (audit artifact)
-?? v2/.audit_r129_findings.md                    (audit artifact)
-?? v2/build_asan/                                (sanitizer build dir)
+?? .audit_r128_findings.md                    (audit artifact)
+?? .audit_r129_findings.md                    (audit artifact)
+?? build_asan/                                (sanitizer build dir)
 ```

@@ -2,7 +2,7 @@
 /*
  * test_dirent.c — P8-POSIX-2 + 9.7-impl-1c-iii.
  *
- * Exercises the dirent index per `v2/specs/dirent.tla`:
+ * Exercises the dirent index per `specs/dirent.tla`:
  *
  *   - Lifecycle (create / close / attach).
  *   - Alloc / lookup / unlink / count_for_dir basic paths.

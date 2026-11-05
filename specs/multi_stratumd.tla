@@ -18,12 +18,12 @@
 \* via fid aliasing) OR a single-process failure mode (one client crash
 \* wedges all the others).
 \*
-\*   v2/docs/thylacine-multi-stratumd-design.md   — the design doctrine
-\*   v2/docs/STRATUM-API-V1.md §4                 — the bilateral ask
-\*   v2/docs/THYLACINE-V1-PLAN.md §4              — the chunking plan
-\*   v2/specs/namespace.tla                       — composed contract:
+\*   docs/thylacine-multi-stratumd-design.md   -- the design doctrine
+\*   docs/STRATUM-API-V1.md section 4                 -- the bilateral ask
+\*   docs/THYLACINE-V1-PLAN.md section 4              -- the chunking plan
+\*   specs/namespace.tla                       -- composed contract:
 \*                                                  ConstrainedToAttachedSubtree
-\*   v2/specs/fid.tla                             — composed contract:
+\*   specs/fid.tla                             -- composed contract:
 \*                                                  per-conn fid namespaces
 \*
 \* Scope. The spec models multi-process composition discipline ONLY:

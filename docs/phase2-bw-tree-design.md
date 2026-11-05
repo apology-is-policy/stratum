@@ -1,7 +1,7 @@
 # Phase 2 — Lock-free Bw-tree design notes
 
 **Status**: design intent for the next implementation chunk. Writes the plan
-before the code, per ROADMAP-V2 §3.1 principle.
+before the code, per ROADMAP section 3.1 principle.
 
 **Starting state**: commits through `7e8c499`. Single-threaded `stm_btree` and
 rwlock-wrapped `stm_btree_mt` both land green; concurrency.tla is TLC-verified;
@@ -196,7 +196,7 @@ node must stay readable until every observer has moved past its epoch (EBR).
 - **Single-threaded core**: `build_consolidated_base` reuses
   `stm_bt_node` layout, applying deltas to a copy of the old base. The
   flush-message-to-leaf helpers in `src/btree/btree.c` translate directly.
-- **Concurrency spec**: the current `v2/specs/concurrency.tla` models the
+- **Concurrency spec**: the current `specs/concurrency.tla` models the
   delta-chain + consolidate + EBR interaction. Before shipping, extend the
   spec with split/merge delta semantics (or add a sibling `structural.tla`)
   and re-verify.
@@ -266,17 +266,17 @@ Before shipping:
 ## File layout for next session
 
 ```
-v2/src/btree/
+src/btree/
     btree.c          (single-threaded; unchanged)
     btree_mt.c       (rwlock fallback; unchanged)
     btree_lf.c       (NEW — lock-free Bw-tree)
     node.c, node.h   (shared node layout)
     page_table.c     (NEW — logical ID → physical pointer table)
 
-v2/include/stratum/
+include/stratum/
     btree.h          (add stm_btree_lf_* API, parallel to _mt)
 
-v2/tests/
+tests/
     test_btree_lf.c  (NEW — concurrent correctness + stress)
 ```
 
@@ -284,8 +284,8 @@ v2/tests/
 
 Once the lock-free path is green under TSAN stress for 10s+, spawn an R1
 audit per CLAUDE.md:
-- Scope: `v2/src/btree/btree_lf.c`, `v2/src/btree/page_table.c`, any changes
-  to `v2/src/ebr/*`.
+- Scope: `src/btree/btree_lf.c`, `src/btree/page_table.c`, any changes
+  to `src/ebr/*`.
 - Preamble: `memory/audit_v2_r0_closed_list.md` (R0 findings — do not
   re-report).
 - Focus: CAS ordering, ABA vulnerabilities, consolidation races, structural

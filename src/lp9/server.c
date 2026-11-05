@@ -2,10 +2,10 @@
 /*
  * lp9 — generic 9P2000.L server, vops-extensible.
  *
- * Sibling to v2/src/p9/server.c (which speaks 9P2000) but on the .L
+ * Sibling to src/p9/server.c (which speaks 9P2000) but on the .L
  * wire. Architecturally a port of stm_p9_server's vops pattern onto
  * the .L message set; trust-boundary discipline lifted from
- * v2/src/9p/server.c (the FS-bound .L server) — every Txx parser
+ * src/9p/server.c (the FS-bound .L server) -- every Txx parser
  * bounds-checks body_len, every Rxx writer bounds-checks resp_cap.
  *
  * v1.0 scope (this file):

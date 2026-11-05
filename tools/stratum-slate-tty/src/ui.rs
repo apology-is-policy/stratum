@@ -1,10 +1,10 @@
 //! ratatui frame builder — slate-tty.
 //!
-//! Visual aesthetic mirrors `v2/tui/src/ui.rs` (FAR Commander):
+//! Visual aesthetic mirrors `tui/src/ui.rs` (FAR Commander):
 //! double-line panel borders, blue/dark-gray active/inactive scheme,
 //! header row + horizontal rule, F-key bar at the bottom.
 //!
-//! What slate-tty does differently from v2/tui:
+//! What slate-tty does differently from tui:
 //!   - panels are sourced from /panels/X/entries (already pre-formatted
 //!     server-side), parsed into structured `Entry` rows for display.
 //!   - editor + dialogs are display-only at v1.0 (interactive driving
@@ -21,7 +21,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
-// ── color palette (lifted from v2/tui/src/ui.rs) ──────────────────────
+// -- color palette (lifted from tui/src/ui.rs) ----------------------
 
 const CLR_BG: Color = Color::Black;
 
@@ -345,7 +345,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 }
 
 fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
-    // FAR Commander F-key layout, identical to v2/tui's labels. Slate
+    // FAR Commander F-key layout, identical to tui's labels. Slate
     // v1.0 doesn't yet wire most of these (the verbs return
     // STM_ENOTSUPPORTED server-side), but the visual cohesion matters
     // and the renderer will route every press as `key F<N>` to
@@ -387,7 +387,7 @@ fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
 // ── editor overlay ────────────────────────────────────────────────────
 
 fn draw_editor_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    // Full-screen editor (matches v2/tui's editor layout).
+    // Full-screen editor (matches tui's editor layout).
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(Style::default().bg(CLR_BG)), area);
 
@@ -431,7 +431,7 @@ fn draw_editor_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         .collect();
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 
-    // Status bar (mirrors v2/tui's editor status bar shape).
+    // Status bar (mirrors tui's editor status bar shape).
     let mode_lbl = if state.editor_modified { " EDIT*" } else { " VIEW " };
     let mode_clr = if state.editor_modified { Color::Yellow } else { Color::DarkGray };
     let spans = vec![

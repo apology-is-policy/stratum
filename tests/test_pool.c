@@ -2,8 +2,8 @@
 /*
  * Pool layer tests (Phase 5 chunk P5-1).
  *
- *   see v2/include/stratum/pool.h  — surface tested here.
- *   see v2/docs/phase5-status.md   — P5-1 scope.
+ *   see include/stratum/pool.h  -- surface tested here.
+ *   see docs/phase5-status.md   -- P5-1 scope.
  *
  * What this file covers:
  *   - pool open/close + opts validation (duplicate uuid, zero count,
@@ -1529,7 +1529,7 @@ STM_TEST(pool_begin_finish_evacuation_marks_states) {
 
 /* RedundancyPreservedDuringEvacuation: begin refuses when (live-1) <
  * floor. Symmetric with remove_device's guard (spec:
- * v2/specs/evac.tla RedundancyPreservedDuringEvacuation). Dev 0 can't
+ * specs/evac.tla RedundancyPreservedDuringEvacuation). Dev 0 can't
  * be evacuated (R17 P1-1 device-0 guard), so this test uses dev 1. */
 STM_TEST(pool_begin_evacuation_enforces_redundancy_floor) {
     make_tmp("evac_floor");

@@ -69,7 +69,7 @@ A single field in the superblock + a CLI arg + a comparison gate at mount.
 
 ### Stratum-side design decisions
 
-- **Storage**: carve `ub_pool_serial[16]` from the head of `ub_reserved` (currently 560 bytes at offset 3504 per `v2/include/stratum/super.h:707`). This follows the established convention (every PHA8 / R-series field addition has carved from `ub_reserved` without bumping `STM_UB_VERSION`). Net effect: `ub_reserved` shrinks 560 → 544 bytes. **No UB version bump required.**
+- **Storage**: carve `ub_pool_serial[16]` from the head of `ub_reserved` (currently 560 bytes at offset 3504 per `include/stratum/super.h:707`). This follows the established convention (every PHA8 / R-series field addition has carved from `ub_reserved` without bumping `STM_UB_VERSION`). Net effect: `ub_reserved` shrinks 560 -> 544 bytes. **No UB version bump required.**
 - **Feature flag**: not needed. Pre-existing pools have `ub_pool_serial = {0}` because the entire `ub_reserved` block is zeroed at format time. The all-zero-as-unbound semantic the spec requests works for free.
 - **Persistence + integrity**: `ub_pool_serial` is covered by the existing `ub_csum` xxHash3 over the superblock. Tamper-detection on the field is inherited. **No new audit surface for tamper.**
 - **`stm_pool_create`** writes 16 CSPRNG bytes at format time (or accepts caller-supplied via the public API).
@@ -101,14 +101,14 @@ A new long-running consumer thread inside stratumd that subscribes to corvus's `
 
 ### Stratum-side design decisions
 
-- **Implemented in stratumd** (`v2/src/cmd/stratumd/`), not in the libstratum-9p client. The notify channel is daemon-internal; userland tools don't need it.
+- **Implemented in stratumd** (`src/cmd/stratumd/`), not in the libstratum-9p client. The notify channel is daemon-internal; userland tools don't need it.
 - **Threading**: one dedicated `pthread_t` per-stratumd-instance with signal mask blocking SIGINT/SIGTERM/SIGHUP/SIGQUIT (R113 P1-1 doctrine). Daemon shutdown signals the thread via the existing stop-flag + a `pthread_cond_signal` on a new `notify_cv`.
 - **Frame parser**: bounded byte-counts, length validation, integer overflow checks. Same trust-boundary discipline as the lp9/9P codec.
 - **Eviction discipline**: on `SESSION_CLOSED { user="michael" }`:
   1. Locate all currently-mounted datasets whose dataset_id resolves to a path matching `users/michael` OR `users/michael/**`.
   2. For each: drain in-flight writes (`stm_fs_commit` synchronously); `explicit_bzero` the DEK cache slot; mark dataset RO; unmount.
   3. If this stratumd's `--datasets-allowed` matches ONLY michael's namespace → exit with status 0 after eviction completes.
-- **DEK cache**: a new `stm_dek_cache` module under `v2/src/dek_cache/` (forward-noted; doesn't exist yet — at v2.0 DEKs are derived per-mount and held in `stm_sync`'s private state). The cache becomes load-bearing once corvus UNWRAP lands (§5); A4 ships the eviction discipline ahead of the cache to keep the cleanup-window shut.
+- **DEK cache**: a new `stm_dek_cache` module under `src/dek_cache/` (forward-noted; doesn't exist yet -- at v2.0 DEKs are derived per-mount and held in `stm_sync`'s private state). The cache becomes load-bearing once corvus UNWRAP lands (section 5); A4 ships the eviction discipline ahead of the cache to keep the cleanup-window shut.
 - **Tolerant mode (Q12)**: configurable timeout. If the notify socket EOFs (corvus down), stratumd waits up to `--corvus-notify-timeout` (default 30s) for a re-subscribe; if it times out → strict-mode behaviour (evict + unmount + exit).
 - **New error**: `STM_ECORVUSGONE` (notify socket closed, no recovery within timeout). Logged to `/ctl/events`.
 - **CLI args**:
@@ -194,7 +194,7 @@ Internal — not user-facing. We can use libstratum-9p as the wire (9P2000.L fro
 
 | Chunk | Deliverable |
 |---|---|
-| **TLY-A2-design** | Design doc at `v2/docs/thylacine-multi-stratumd-design.md`. Locks in Option A vs B, the coordinator wire, the spec scope. |
+| **TLY-A2-design** | Design doc at `docs/thylacine-multi-stratumd-design.md`. Locks in Option A vs B, the coordinator wire, the spec scope. |
 | **TLY-A2-spec** | New `specs/multi_stratumd.tla` modelling: per-user stratumd → coordinator RPC; allocator coordination; crash recovery across processes. ≥3 buggy configs. |
 | **TLY-A2-tlc** | TLC verify (tooling-gated; carry the same caveat as #973). |
 | **TLY-A2-impl-1** | `stratumd --coordinator` mode (boots the coordinator; no clients yet). |
@@ -224,7 +224,7 @@ A new key-agent client library that speaks the corvus binary wire format. Wires 
 
 ### Stratum-side design decisions
 
-- **New module**: `v2/src/corvus_client/` + `v2/include/stratum/corvus_client.h`. Pure C, no Rust dependencies. Sibling to (NOT replacing) the existing janus client.
+- **New module**: `src/corvus_client/` + `include/stratum/corvus_client.h`. Pure C, no Rust dependencies. Sibling to (NOT replacing) the existing janus client.
 - **Wire**: per ask §5.2 with the `protocol_version u8 = 1` byte added (Q11 carry).
 - **Frame encoder + decoder** with strict bound-checks. Same trust-boundary discipline as the lp9 codec (R111 doctrine carry — caller-cap on every server-supplied count).
 - **Token handling**: read 33 bytes from `--corvus-session-token-file`, `mlock`+`MADV_DONTDUMP` the buffer, `explicit_bzero` on shutdown. Never log.
@@ -268,7 +268,7 @@ Not needed for the codec itself. The DEK lifecycle invariant (cached → evicted
 > accounting for *delete* but root no recoverable past tree. Real
 > per-dataset rollback needs per-dataset metadata trees, which is a
 > foundational re-architecture — see the post-TLY phase in
-> `docs/ROADMAP-V2.md`. **A5 therefore ships marker-first with a
+> `docs/ROADMAP.md`. **A5 therefore ships marker-first with a
 > stubbed rollback verb** (decision 2026-05-15).
 
 ### Scope (marker-first)
@@ -338,9 +338,9 @@ Each ask adds a new audit-trigger surface. To be added to CLAUDE.md trigger list
 | Surface | Trigger row to add |
 |---|---|
 | Pool serial binding | After "Superblock layout / validation" — `--bind-pool-serial`, `STM_ESERIAL`, `/ctl/pools/<uuid>/serial-info` |
-| corvus client | New row — `v2/src/corvus_client/`, `v2/include/stratum/corvus_client.h` |
+| corvus client | New row -- `src/corvus_client/`, `include/stratum/corvus_client.h` |
 | Notify consumer | New row — stratumd's notify-consumer thread |
-| Multi-stratumd coordinator | New row — `v2/src/cmd/stratumd-coord/` (or whatever the coord path becomes) |
+| Multi-stratumd coordinator | New row -- `src/cmd/stratumd-coord/` (or whatever the coord path becomes) |
 | Snapshot compromise marker | After "Snapshot index" — marker field + admin verbs |
 
 ### Memory file additions
@@ -354,7 +354,7 @@ Per the ask §9.4:
 - `OS-INTEGRATION.md` updates per chunk (already enumerated above).
 - New `reference/24-corvus-client.md` (new module reference doc).
 - New `reference/25-multi-stratumd.md` if A2 is implemented.
-- Mirror copy of STRATUM-API-V1.md into `v2/docs/` for tree-local discoverability. (Pull from Thylacine's tree; keep up to date as the contract evolves.)
+- Mirror copy of STRATUM-API-V1.md into `docs/` for tree-local discoverability. (Pull from Thylacine's tree; keep up to date as the contract evolves.)
 
 ### Audit posture
 
@@ -366,10 +366,10 @@ Every chunk gets a closing audit round (R137..R145+). Adversarial categories per
 
 In strict order — start TODAY:
 
-1. **Mirror STRATUM-API-V1.md into `v2/docs/STRATUM-API-V1.md`** (tree-local copy; one-way sync from Thylacine's tree).
+1. **Mirror STRATUM-API-V1.md into `docs/STRATUM-API-V1.md`** (tree-local copy; one-way sync from Thylacine's tree).
 2. **Send §0 negotiated-answers + §4 A2-decision-needed back to Thylacine** for sign-off. **This blocks the A2 chunking** — without Thylacine's verdict on Option A vs deferring A2 to v1.1, we don't commit to the 4-week scope.
 3. **Start TLY-A1-impl** in parallel with the negotiation — A1 is uncontroversial and unblocks Thylacine's P5-stratumd-bringup regardless of the A2 outcome. Concrete first commit:
-   - Add `ub_pool_serial[16]` to `v2/include/stratum/super.h` carved from `ub_reserved`.
+   - Add `ub_pool_serial[16]` to `include/stratum/super.h` carved from `ub_reserved`.
    - `stm_pool_create` writes CSPRNG bytes.
    - `stm_fs_mount` reads + accepts `expected_pool_serial` pointer in mount opts (NULL = no check).
    - `stratumd --bind-pool-serial <hex>` arg parsing.
@@ -420,8 +420,8 @@ After Thylacine signs off on §0 negotiated answers:
 - `CORVUS-DESIGN.md` (Thylacine tree) — wire format, invariants, lifecycle.
 - Stratum `OS-INTEGRATION.md` — Stratum-side OS-author manual; updated per chunk.
 - Stratum `CLAUDE.md` — audit-trigger list (gets new rows per chunk).
-- Stratum `v2/docs/REFERENCE.md` + `reference/*.md` — as-built per-subsystem references.
-- Stratum `v2/specs/*.tla` — formal specs (extensions per A2, A4, A5).
+- Stratum `docs/REFERENCE.md` + `reference/*.md` -- as-built per-subsystem references.
+- Stratum `specs/*.tla` -- formal specs (extensions per A2, A4, A5).
 
 ---
 

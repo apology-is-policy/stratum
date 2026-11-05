@@ -2,7 +2,7 @@
 /*
  * stratumd — Unix-socket transport for the Stratum 9P2000.L server.
  *
- * Architecture (ARCH §10.4 / ROADMAP-V2 §12 / Phase 9 P9-9P-4 +
+ * Architecture (ARCH section 10.4 / ROADMAP section 12 / Phase 9 P9-9P-4 +
  *                P9-CTL-2c + P9.5-PARALLEL-1):
  *   - One stratumd process owns one mounted `stm_fs *`.
  *   - Listens on UP TO TWO Unix sockets (P9-CTL-2c):
@@ -20,7 +20,7 @@
  *     swap: pre-P9.5 the /ctl/ loop served one client at a time;
  *     P9.5-PARALLEL-1 retired that. Workers run independently
  *     against shared `stm_fs *` / `stm_ctl *`; state-isolation
- *     invariants from `v2/specs/ctl_conn.tla` (CallerScopedPerConn
+ *     invariants from `specs/ctl_conn.tla` (CallerScopedPerConn
  *     + NoClunkSpillover + LifecycleNoUAF) hold across workers.
  *   - Per-connection FS: spawn a fresh stm_9p_server — one fid
  *     namespace per connection (9p.h doctrine).
@@ -72,7 +72,7 @@
  *      loop pthread joined after shutdown(2) on the listen fd.
  *   2. stm_ctl_destroy — blocks on worker_cv until every live
  *      stm_ctl_conn destroys (LifecycleNoUAF in
- *      `v2/specs/ctl_conn.tla`). Detached workers each fire
+ *      `specs/ctl_conn.tla`). Detached workers each fire
  *      stm_lp9_server_destroy → stm_ctl_conn_destroy on natural
  *      client-disconnect, decrementing the count.
  *   3. stm_scrub_close.
@@ -81,9 +81,9 @@
  * (R26 P3-4 + ctl.h Lifetime contract).
  *
  * Spec composition: every per-connection stm_9p_server composes
- * against `v2/specs/fid.tla` + `v2/specs/namespace.tla`. The
+ * against `specs/fid.tla` + `specs/namespace.tla`. The
  * /ctl/ side additionally composes against
- * `v2/specs/ctl_conn.tla`. Workers run concurrently within and
+ * `specs/ctl_conn.tla`. Workers run concurrently within and
  * across sockets; the spec invariants hold by the per-conn
  * state-isolation discipline + the worker_count refcount.
  *
@@ -209,7 +209,7 @@ typedef struct stm_stratumd_opts {
      * NULL OR empty table = back-compat: no per-uid enforcement
      * (today's single-process stratumd posture, no Thylacine multi-
      * stratumd context). Composes against
-     * `v2/specs/multi_stratumd.tla::TattachPatternEnforced`. */
+     * `specs/multi_stratumd.tla::TattachPatternEnforced`. */
     const struct stm_ds_policy_table *user_policy;
 
     /* TLY-A2 (impl-2): client mode — raw 9P-frame proxy to a
@@ -221,7 +221,7 @@ typedef struct stm_stratumd_opts {
      *   - `coordinator_socket_path` is required — the upstream
      *     coordinator's FS socket; dialed once per accepted upstream
      *     connection (per-conn fid namespace contract per
-     *     `v2/docs/thylacine-multi-stratumd-design.md §3`).
+     *     `docs/thylacine-multi-stratumd-design.md section 3`).
      *   - `datasets_allowed` / `n_datasets_allowed` are a borrowed
      *     array of NUL-terminated pattern strings (operator-supplied,
      *     glob `*`/`**` semantics per `dataset_pattern.h`). NULL/0 =
@@ -231,7 +231,7 @@ typedef struct stm_stratumd_opts {
      *     coord-side construct.
      *
      * Composes against
-     * `v2/specs/multi_stratumd.tla::{ClientAdmitsDataset,
+     * `specs/multi_stratumd.tla::{ClientAdmitsDataset,
      * CrossClientIsolation}`. */
     bool        client_mode;
     const char *coordinator_socket_path;
@@ -247,7 +247,7 @@ typedef struct stm_stratumd_opts {
      * uids, where a malicious local user could pre-bind a fake
      * socket at the configured path before the real coord starts.
      * Composes against
-     * `v2/specs/multi_stratumd.tla::ClientCrashIsolation` (the
+     * `specs/multi_stratumd.tla::ClientCrashIsolation` (the
      * downstream peer's identity is part of the per-client state). */
     bool        coordinator_uid_check_enabled;
     uid_t       coordinator_uid;
@@ -262,7 +262,7 @@ typedef struct stm_stratumd_opts {
      * login reaps it. The default (single_session == false) is the long-running
      * loop-accept relay (the boot coordinator + test proxies). Does NOT alter
      * the per-client isolation invariants -- it only bounds the proxy lifetime
-     * to one upstream session (v2/specs/multi_stratumd.tla unaffected). */
+     * to one upstream session (specs/multi_stratumd.tla unaffected). */
     bool        single_session;
 
     /* A-3 (Thylacine host-bake). When `bake_owner_enabled` is true
@@ -296,7 +296,7 @@ typedef struct stm_stratumd_opts {
      * watches for SESSION_CLOSED frames whose user field equals
      * `corvus_user`. On match, the consumer sets the daemon's
      * stop_flag → clean shutdown → unmount → DEK zero (per
-     * STRATUM-API-V1.md §6 + `v2/specs/eviction.tla`).
+     * STRATUM-API-V1.md section 6 + `specs/eviction.tla`).
      *
      * `corvus_notify_socket` may be NULL — defaults to
      * "/srv/corvus/notify" inside the consumer.

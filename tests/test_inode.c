@@ -3,7 +3,7 @@
  * Tests for the inode allocator + value store (P8-POSIX-1 +
  * P8-POSIX-1b + 9.6-impl-4b-ii + 9.7-impl-1c-ii).
  *
- * Spec: v2/specs/inode.tla.
+ * Spec: specs/inode.tla.
  *
  * 9.7-impl-1c-ii: the inode module no longer owns its own engine —
  * records live in each dataset's per-dataset btree_engine, resolved

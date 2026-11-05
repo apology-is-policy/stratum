@@ -368,9 +368,9 @@ From Phase 3's load-bearing invariants + new P4-specific ones:
 
 ## References
 
-1. `v2/docs/phase4-status.md` — this file.
-2. `v2/docs/phase3-status.md` — persistence / exit context.
+1. `docs/phase4-status.md` -- this file.
+2. `docs/phase3-status.md` -- persistence / exit context.
 3. `docs/ARCHITECTURE.md §7` — full integrity+crypto design.
-4. `docs/ROADMAP-V2.md §7` — phase deliverables + exit criteria.
+4. `docs/ROADMAP.md section 7` -- phase deliverables + exit criteria.
 5. `memory/audit_v2_r0_closed_list.md` — what NOT to re-report.
-6. `v2/specs/` — TLA+ specs; `merkle.tla` arrives with P4-6.
+6. `specs/` -- TLA+ specs; `merkle.tla` arrives with P4-6.

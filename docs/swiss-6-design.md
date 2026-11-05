@@ -103,7 +103,7 @@ In SnapshotGraph mode:
 - F10 / Ctrl-Q / Ctrl-C: quit
 - All other keys: dropped (R129 P2-2 doctrine carry)
 
-### New module: `v2/tools/stratum/src/snapgraph.rs`
+### New module: `tools/stratum/src/snapgraph.rs`
 
 Mirrors `volmap.rs` shape:
 
@@ -146,7 +146,7 @@ client per poller (one-op-at-a-time-per-connection doctrine).
 Per-instance unique fid base via `AtomicU32` counter (R125
 doctrine carry; slate-doctrine clause 24).
 
-### New module: `v2/tools/stratum/src/swiss6_view.rs`
+### New module: `tools/stratum/src/swiss6_view.rs`
 
 Ratatui renderer. Layout:
 

@@ -3,7 +3,7 @@
 \* metadata path (Phase 9.8).
 \*
 \* ARCHITECTURE §3 (write pipeline + buffer-batching); design at
-\* `v2/docs/phase-9.8-design.md` §5.
+\* `docs/phase-9.8-design.md` section 5.
 \*
 \* Companion to concurrency_mvcc.tla. This module is focused
 \* exclusively on the *correctness of the message buffer + flush

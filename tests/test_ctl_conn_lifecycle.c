@@ -3,7 +3,7 @@
  * test_ctl_conn_lifecycle — exercises stm_ctl_destroy's worker-count
  * refcount + cv wait (P9.5-PARALLEL-1f / task #961).
  *
- * The LifecycleNoUAF invariant from `v2/specs/ctl_conn.tla` says:
+ * The LifecycleNoUAF invariant from `specs/ctl_conn.tla` says:
  * stm_ctl_destroy MUST NOT free the shared ctl while any
  * stm_ctl_conn that holds it back-pointed is alive. Implementation:
  *

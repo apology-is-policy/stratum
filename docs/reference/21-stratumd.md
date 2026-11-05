@@ -17,11 +17,11 @@ serving it — the PARALLEL-1 regime where neither socket serialises
 accepts (TUI pollers, Prometheus scrapers, future kernel-9P mounts
 don't block each other).
 
-Header: `v2/include/stratum/stratumd.h` (317 lines).
-Impl: `v2/src/cmd/stratumd/serve.c` (979 lines) +
-      `v2/src/cmd/stratumd/run.c` (311 lines, the `stm_stratumd_run` body
+Header: `include/stratum/stratumd.h` (317 lines).
+Impl: `src/cmd/stratumd/serve.c` (979 lines) +
+      `src/cmd/stratumd/run.c` (311 lines, the `stm_stratumd_run` body
       called from both the standalone binary and `stratum serve` in the
-      swiss-army monolith) + `v2/src/cmd/stratumd/main.c` (13 lines wrapper).
+      swiss-army monolith) + `src/cmd/stratumd/main.c` (13 lines wrapper).
 
 ## Defaults
 
@@ -291,16 +291,16 @@ close(fd)
 stratumd itself has no dedicated TLA+ spec — it's the transport
 glue, not a state machine. The spec composition is by reference:
 
-- The FS server it hosts composes against `v2/specs/fid.tla` +
-  `v2/specs/namespace.tla` + `v2/specs/locks.tla` per connection.
+- The FS server it hosts composes against `specs/fid.tla` +
+  `specs/namespace.tla` + `specs/locks.tla` per connection.
 - The /ctl/ server it hosts composes against
-  `v2/specs/ctl_conn.tla` per connection.
+  `specs/ctl_conn.tla` per connection.
 - The client-mode proxy (TLY-A2-impl-2) composes against
-  `v2/specs/multi_stratumd.tla::{ClientAdmitsDataset,
+  `specs/multi_stratumd.tla::{ClientAdmitsDataset,
   CrossClientIsolation}`. The proxy is a transparent forwarder;
   the spec abstracts it as a per-client admit predicate.
 - The corvus notify consumer (TLY-A4) composes against
-  `v2/specs/eviction.tla` (4 invariants on data-sealed-on-exit
+  `specs/eviction.tla` (4 invariants on data-sealed-on-exit
   + stop-before-unmount + in-flight-drain + consumer-escalates).
 - Workers run concurrently within and across sockets; the spec
   invariants hold by the per-conn state-isolation discipline +
@@ -404,7 +404,7 @@ session token is loaded into an mlock'd buffer for the WRAP and
   concurrent regime tests against `stm_ctl` + `stm_ctl_conn`.
 - `tests/test_ctl_conn_lifecycle.c` — refcount + destroy-blocks-
   on-cv tests.
-- `v2/tools/stratum/tests/concurrent_ctl.rs` — end-to-end Rust
+- `tools/stratum/tests/concurrent_ctl.rs` -- end-to-end Rust
   test driving N libstratum-9p clients in parallel against the
   /ctl/ socket; asserts wall-time bound for the concurrent-accept
   payoff.
@@ -431,14 +431,14 @@ session token is loaded into an mlock'd buffer for the WRAP and
 | TLY-A2-impl-3: bilateral SO_PEERCRED (accept-time + `--coordinator-uid`) | LIVE | `0c16d91` + R141 audit |
 | TLY-A2-impl-4: crash recovery sweep tests | LIVE | `test_multi_stratumd_crash.c` (3 scenarios) + R142 audit |
 | TLY-A2-impl-5: 72-hour stress | DEFERRED | GCP-gated; 4 clients concurrent for long-form sweep |
-| TLY-A3-impl-1: corvus UNWRAP codec + token loader | LIVE | `v2/src/corvus_client/` — pure codec (`1eb7480`) |
+| TLY-A3-impl-1: corvus UNWRAP codec + token loader | LIVE | `src/corvus_client/` -- pure codec (`1eb7480`) |
 | TLY-A3-impl-2: corvus UNWRAP transport + retry | LIVE | `stm_corvus_unwrap_once` + `stm_corvus_unwrap` (Q9 backoff); raw AF_UNIX (`58a7253`) |
 | TLY-A3-keyslot-impl-3b: mount-time UNWRAP wiring + CLI | LIVE | `--corvus-socket` + `--corvus-session-token-file` → `stm_fs_mount_opts` → `stm_sync_open`'s `stm_corvus_mount_cfg`; `sync_unwrap_cb` routes `STM_KS_WRAPPER_CORVUS` slots |
 | TLY-A5-impl-1c: corvus-principal gate `--corvus-admin-uid` | LIVE | CLI → `stm_stratumd_opts.corvus_admin_uid` → `stm_ctl_set_corvus_admin_uid`; the `/ctl/` `mark-snapshot-compromised` verb admits that uid alongside admin (`unmark` stays strict-admin). Requires `--ctl-listen` |
 | CF-2a: per-connection FS worker pool (`--fs-workers`, default auto=4) | LIVE | `fs_pool.{c,h}`; reader-demux + N workers + writer mutex; real Tflush; Tversion barrier; N=1 = the serial loop byte-unchanged. Design `docs/cf-2-design.md`; audit folds into the CF-2 close (R176) |
 | TLY-A3-keyslot-wrap: one-shot `--provision-corvus-dataset` mode | LIVE | `stratumd_run_provision` → `stm_fs_create_dataset_corvus` (corvus WRAP) + `stm_fs_init_dataset_root`; non-serving; `test_corvus_provision.c` |
 
-The corvus UNWRAP client (`v2/src/corvus_client/`) is a standalone
+The corvus UNWRAP client (`src/corvus_client/`) is a standalone
 library, NOT part of stratumd's transport, but is listed here because
 it is consumed by stratumd at mount time (TLY-A3-impl-3). Its
 audit-trigger surface is the "corvus UNWRAP client (v2)" row in

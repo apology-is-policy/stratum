@@ -97,7 +97,7 @@ fn print_root_usage() {
            fs CMD ARGS...   9P client CLI.\n\
            host-fs PATH...  Export host directory as 9P read-only.\n\n\
          For per-subcommand help: `stratum <subcommand> -h`.\n\n\
-         See v2/docs/SLATE-DESIGN.md §12 for the design rationale.\n"
+         See docs/SLATE-DESIGN.md section 12 for the design rationale.\n"
     );
 }
 

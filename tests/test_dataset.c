@@ -2,9 +2,9 @@
 /*
  * Dataset hierarchy tests.
  *
- *   see v2/include/stratum/dataset.h — public API.
- *   see v2/src/dataset/dataset.c — implementation.
- *   see v2/specs/dataset.tla — formal model.
+ *   see include/stratum/dataset.h -- public API.
+ *   see src/dataset/dataset.c -- implementation.
+ *   see specs/dataset.tla -- formal model.
  *
  * Each test corresponds to an action / invariant in dataset.tla.
  * The 12 dataset.tla invariants in plain English:

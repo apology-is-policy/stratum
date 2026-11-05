@@ -2,14 +2,14 @@
 /*
  * libstratum-9p — synchronous 9P2000.L client.
  *
- * Talks to stratumd's Unix-socket transport (`v2/src/cmd/stratumd/`).
+ * Talks to stratumd's Unix-socket transport (`src/cmd/stratumd/`).
  * One client = one socket = one fid namespace; not thread-safe across
  * concurrent calls. See `<stratum/9p_client.h>` for the public API
  * shape and trust-boundary doctrine.
  *
  * Wire framing: 4-byte LE size header (covers itself + body), 1-byte
  * type, 2-byte tag, body. Mirrors stratumd's `read_msg` /
- * `write_msg` exactly — see `v2/src/cmd/stratumd/serve.c`.
+ * `write_msg` exactly -- see `src/cmd/stratumd/serve.c`.
  *
  * Tag allocation: monotonic counter starting at 1 (NOTAG = 0xFFFF
  * reserved by spec for Tversion). Wraps detected at 0xFFFF and
@@ -1330,7 +1330,7 @@ stm_status stm_9p_fsync(stm_9p_client *c, uint32_t fid, uint32_t datasync)
 /* ────────────────────────────────────────────────────────────────────── */
 /* Tlock / Tgetlock — advisory byte-range locking (P9.5-POLISH-1).         */
 /*                                                                         */
-/* Server-side handlers in v2/src/9p/server.c (h_lock / h_getlock); both   */
+/* Server-side handlers in src/9p/server.c (h_lock / h_getlock); both   */
 /* derive owner_id from the request's fid via lock_owner_base | fid.       */
 /*                                                                         */
 /* Trust posture (R111 doctrine):                                          */

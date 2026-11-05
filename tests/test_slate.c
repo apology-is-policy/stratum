@@ -3,7 +3,7 @@
  * test_slate — unit tests for stm_slate's state machine
  * (P9-SLATE-1).
  *
- * Composes against v2/specs/slate.tla:
+ * Composes against specs/slate.tla:
  *   VersionMonotonic — every event/status mutation bumps version.
  *   EventFIFO        — dispatched order matches submission order
  *                      (verified via /log/tail readback).

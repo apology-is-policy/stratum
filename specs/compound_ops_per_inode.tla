@@ -44,10 +44,10 @@
 \*     A safety formulation of "no 2-cycle deadlock" — sufficient for the
 \*     minimal counterexample at 2 inodes × 2 writers.
 \*
-\*   v2/docs/p9.5-parallel-3-design.md §4 — spec composition reference
-\*   v2/specs/compound_ops.tla — the baseline this refines
+\*   docs/p9.5-parallel-3-design.md section 4 -- spec composition reference
+\*   specs/compound_ops.tla -- the baseline this refines
 \*   ARCHITECTURE §14.3 — /ctl/ as the operator state surface
-\*   ROADMAP-V2 §13 — Phase 9.5 PARALLEL trio (PARALLEL-3 is the third)
+\*   ROADMAP section 13 -- Phase 9.5 PARALLEL trio (PARALLEL-3 is the third)
 \*   sync.tla — three-phase commit (unchanged by this refinement)
 \*   writeback.tla — drain discipline (R128 pre-flush; per-inode locked now)
 \*   inode.tla — (ino, gen) tuple-uniqueness (unchanged)

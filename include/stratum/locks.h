@@ -8,7 +8,7 @@
  * fcntl + flock locks are released by close, and a fresh mount
  * has no fds).
  *
- * Spec: v2/specs/locks.tla. The HEADLINE invariant is
+ * Spec: specs/locks.tla. The HEADLINE invariant is
  * `NoConflictingLocks` — two locks conflict iff (a) overlapping
  * byte ranges in the same inode, AND (b) different owners, AND
  * (c) at least one is EXCLUSIVE. The lock-acquire path enforces

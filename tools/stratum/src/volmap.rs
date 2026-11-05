@@ -5,7 +5,7 @@
 //! `ui.rs` post-R128) consumes a snapshot of the state under a
 //! `RwLock` and never dials /ctl/ directly.
 //!
-//! Design rationale: see `v2/docs/swiss-5-design.md`. The endpoint
+//! Design rationale: see `docs/swiss-5-design.md`. The endpoint
 //! `/pools/<uuid>/metrics/prometheus` is a one-stop-shop covering 90%
 //! of the F2 view's data; the renderer parses Prometheus exposition
 //! format into typed gauges.

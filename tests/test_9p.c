@@ -2970,7 +2970,7 @@ STM_TEST(p9_r92_p2_1_xattrcreate_releases_locks_on_clunk) {
 
 /* ── P9-9P-2: per-connection namespace composition (Tbind / Tunbind) ─── */
 /*                                                                         */
-/* Composes against `v2/specs/namespace.tla`. Each test enumerates one     */
+/* Composes against `specs/namespace.tla`. Each test enumerates one     */
 /* observable consequence of the spec's invariants. The four buggy        */
 /* variants in namespace.tla (BuggyGlobalBindings / BuggyDetachLeaks /    */
 /* BuggyUnbindCrosstalk / BuggyLookupCrosstalk) describe the canonical    */

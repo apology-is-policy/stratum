@@ -1,6 +1,6 @@
 # Spec-to-code mapping
 
-The TLA+ specs in `v2/specs/` are the source of truth for protocol-level
+The TLA+ specs in `specs/` are the source of truth for protocol-level
 invariants. Each spec variable and constant maps onto one or more structures
 in the implementation. When the code changes, this mapping is updated in the
 same PR; when the mapping is updated, the spec may need to follow.

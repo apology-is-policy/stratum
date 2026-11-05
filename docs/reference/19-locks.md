@@ -13,14 +13,14 @@ The locks module is the bridge between:
 
 - **fs.c** (`stm_fs_*` byte-range lock wrappers — public API).
 - **9P2000.L server** (`Tlock` / `Tgetlock` op handlers in
-  `v2/src/9p/server.c`).
+  `src/9p/server.c`).
 - **Per-fd cleanup** at fid clunk / connection detach (the
   `stm_fs_release_lock_owner` path, which composes against the
   `ReleaseOwner` action in `locks.tla`).
 
-Header: `v2/include/stratum/locks.h`.
-Impl: `v2/src/locks/locks.c`.
-Spec: `v2/specs/locks.tla`.
+Header: `include/stratum/locks.h`.
+Impl: `src/locks/locks.c`.
+Spec: `specs/locks.tla`.
 
 ## Public API
 
@@ -170,7 +170,7 @@ record would double it.
 
 ## Spec cross-reference
 
-`v2/specs/locks.tla` pins the load-bearing invariant:
+`specs/locks.tla` pins the load-bearing invariant:
 
 - **`NoConflictingLocks`** — at every reachable state, no two locks
   satisfy the conflict predicate. Acquire, Release and ReleaseOwner
@@ -244,7 +244,7 @@ Runtime twins: `locks_release_drops_only_its_owners_lock_there` and
 
 | Spec action | Impl function | File |
 |---|---|---|
-| `Acquire` | `stm_lock_acquire_as` (`stm_lock_acquire` names no client) | `v2/src/locks/locks.c` |
+| `Acquire` | `stm_lock_acquire_as` (`stm_lock_acquire` names no client) | `src/locks/locks.c` |
 | `Release` | `stm_lock_release` | same |
 | `ReleaseOwner` | `stm_lock_release_owner` | same |
 | `Test` (no spec action; `AcquireRefuses`) | `stm_lock_test` | same |

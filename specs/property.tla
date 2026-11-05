@@ -3,7 +3,7 @@
 (* property — per-dataset property inheritance.                             *)
 (*                                                                           *)
 (*   see docs/ARCHITECTURE.md §8.4 — property inheritance.                  *)
-(*   see docs/ROADMAP-V2.md §9.1 — Phase 6 property-system deliverable.    *)
+(*   see docs/ROADMAP.md section 9.1 -- Phase 6 property-system deliverable.    *)
 (*                                                                           *)
 (* Scope of this spec:                                                      *)
 (*                                                                           *)

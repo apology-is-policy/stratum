@@ -2,7 +2,7 @@
 \* Stratum v2 — RC-6 (#35): the provisional dcache insert (the exact-denial
 \* close of the RC-3 audit-F1 residual).
 \*
-\* RC arc scripture: `v2/docs/rc-design.md` "RC-6". Companion to
+\* RC arc scripture: `docs/rc-design.md` "RC-6". Companion to
 \* dcache_ebr.tla (RC-1's reclamation lifecycle — THAT module protects the
 \* memory under a lock-free reader; THIS one protects the POLICY of when a
 \* fetch-populated entry may be served at all).

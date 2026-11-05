@@ -3,7 +3,7 @@
 (* Evacuation of allocated data when a device is being removed (P5-4b-ii). *)
 (*                                                                           *)
 (*   see docs/ARCHITECTURE.md §4.7.2 — remove is "evacuate then detach".    *)
-(*   see v2/specs/device_lifecycle.tla — membership state machine.          *)
+(*   see specs/device_lifecycle.tla -- membership state machine.          *)
 (*                                                                           *)
 (* Sister spec to device_lifecycle.tla. device_lifecycle models membership  *)
 (* transitions (ABSENT / ONLINE / FAULTED / REMOVED); evac models the       *)

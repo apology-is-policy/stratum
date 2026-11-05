@@ -1,10 +1,10 @@
 //! ratatui frame builder — slate-tty.
 //!
-//! Visual aesthetic mirrors `v2/tui/src/ui.rs` (FAR Commander):
+//! Visual aesthetic mirrors `tui/src/ui.rs` (FAR Commander):
 //! double-line panel borders, blue/dark-gray active/inactive scheme,
 //! header row + horizontal rule, F-key bar at the bottom.
 //!
-//! What slate-tty does differently from v2/tui:
+//! What slate-tty does differently from tui:
 //!   - panels are sourced from /panels/X/entries (already pre-formatted
 //!     server-side), parsed into structured `Entry` rows for display.
 //!   - editor + dialogs are display-only at v1.0 (interactive driving
@@ -26,7 +26,7 @@ use crate::swiss5_view;
 use crate::snapgraph::SnapshotGraphState;
 use crate::volmap::VolumeMapState;
 
-// ── color palette (lifted from v2/tui/src/ui.rs) ──────────────────────
+// -- color palette (lifted from tui/src/ui.rs) ----------------------
 
 const CLR_BG: Color = Color::Black;
 
@@ -58,7 +58,7 @@ const CLR_FKEY_LABEL_BG: Color = Color::Cyan;
 
 // Shift+F-key row uses a more subdued palette so the eye prefers the
 // regular row but the modifier layer is legible at a glance — same
-// posture as v2/tui/src/ui.rs.
+// posture as tui/src/ui.rs.
 const CLR_SHIFT_FKEY_NUM: Color = Color::DarkGray;
 const CLR_SHIFT_FKEY_LABEL_FG: Color = Color::Yellow;
 const CLR_SHIFT_FKEY_LABEL_BG: Color = Color::DarkGray;
@@ -1051,7 +1051,7 @@ fn draw_f2_footer(frame: &mut Frame<'_>, area: Rect, _f2: F2State) {
 }
 
 fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
-    // FAR Commander F-key layout, mirrors v2/tui's labels exactly.
+    // FAR Commander F-key layout, mirrors tui's labels exactly.
     // Most verbs return STM_ENOTSUPPORTED at SWISS-1 (slate doesn't
     // yet handle them); the renderer routes every press as
     // `key F<N>` to /panels/X/action so future slate verbs light

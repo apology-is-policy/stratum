@@ -2,9 +2,9 @@
 /*
  * Extent index tests (P7-2 + 9.7-impl-1c-v).
  *
- *   see v2/include/stratum/extent.h — public API.
- *   see v2/src/extent/extent_index.c — implementation.
- *   see v2/specs/extent.tla — formal model.
+ *   see include/stratum/extent.h -- public API.
+ *   see src/extent/extent_index.c -- implementation.
+ *   see specs/extent.tla -- formal model.
  *
  * Coverage corresponds 1:1 to extent.tla's invariants and actions:
  *   - NoOverlapWithinIno (load-bearing).

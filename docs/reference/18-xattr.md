@@ -48,9 +48,9 @@ Storage evolution:
   by 9.6-impl-3's spill mechanism transparently within the
   per-dataset engine.
 
-Header: `v2/include/stratum/xattr.h`.
-Impl: `v2/src/xattr/xattr.c`.
-Spec: `v2/specs/xattr.tla`.
+Header: `include/stratum/xattr.h`.
+Impl: `src/xattr/xattr.c`.
+Spec: `specs/xattr.tla`.
 
 ## Public API
 
@@ -278,7 +278,7 @@ concern, not a chain-integrity invariant.
 
 ## Spec cross-reference
 
-`v2/specs/xattr.tla` pins the chain-integrity invariants:
+`specs/xattr.tla` pins the chain-integrity invariants:
 
 - **`Reachable`** — every live name is reachable via probe-from-0.
 - **`NoColliderShadowing`** — TOMBSTONE preserves reachability of
@@ -298,7 +298,7 @@ LookupStopsOnTombstone) — each trips its targeted invariant within
 
 | Spec action | Impl function | File |
 |---|---|---|
-| `Set` | `stm_xattr_set` | `v2/src/xattr/xattr.c` |
+| `Set` | `stm_xattr_set` | `src/xattr/xattr.c` |
 | `Remove` | `stm_xattr_remove` | same |
 | `LookupWalk` | `stm_xattr_get` | same |
 | `DropForIno` | `stm_xattr_drop_for_ino` | same |

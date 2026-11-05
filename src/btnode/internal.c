@@ -3,7 +3,7 @@
  * stm_btnode — internal (branch) node encode/decode (Phase 3 chunk 5b;
  * message buffer 9.8-BE-format).
  *
- *   see v2/include/stratum/btnode.h for the format spec.
+ *   see include/stratum/btnode.h for the format spec.
  *
  * Internal-node payload layout (packed):
  *

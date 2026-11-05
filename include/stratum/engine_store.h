@@ -2,8 +2,8 @@
 /*
  * Metadata Tree Engine — production storage vtable (Phase 9.6-impl-4b).
  *
- *   see v2/docs/phase-9.6-impl-4b-sync-wiring-design.md §2,
- *       v2/docs/reference/24-btree-engine.md.
+ *   see docs/phase-9.6-impl-4b-sync-wiring-design.md section 2,
+ *       docs/reference/24-btree-engine.md.
  *
  * The btree_engine talks to storage only through a stm_btree_store_vtable
  * (reserve / free / write / read over node-sized regions — btree_store.h).

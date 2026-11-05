@@ -339,12 +339,12 @@ new fixture. The fixture builds enough datasets for each test's needs.
 
 ## 12 — Reference / doc upkeep
 
-- `v2/docs/reference/16-inode.md` — update for new posture: module
+- `docs/reference/16-inode.md` -- update for new posture: module
   is RAM-only metadata + lock pool; persistence lives in per-dataset
   engines + the M-cascade in sync.c.
-- `v2/docs/reference/12-dataset.md` — add the engine commit-cascade
+- `docs/reference/12-dataset.md` -- add the engine commit-cascade
   driving API + the M-cascade integration note.
-- `v2/docs/REFERENCE.md` — refresh tip section + Pre-tip-1.
+- `docs/REFERENCE.md` -- refresh tip section + Pre-tip-1.
 - `CLAUDE.md` — update the "Inode allocator" row to mention
   per-dataset routing + the attach pattern + the M-cascade.
 
@@ -352,16 +352,16 @@ new fixture. The fixture builds enough datasets for each test's needs.
 
 | File | Change | Approx LOC |
 |---|---|---|
-| `v2/include/stratum/inode.h` | shed persistence APIs; add attach | -50 +30 |
-| `v2/src/inode/inode.c` | rewrite engine glue (metakey + ds_idx) | -200 +200 |
-| `v2/src/inode/CMakeLists.txt` | add stm_metakey + stm_dataset deps | +3 |
-| `v2/include/stratum/dataset.h` | add 3 engine-commit APIs | +60 |
-| `v2/src/dataset/dataset.c` | impl + pending_flush tracking | +200 |
-| `v2/src/sync/sync.c` | drop inode flush/finalize; add M-cascade | -50 +80 |
-| `v2/tests/test_inode.c` | fixture rebuild; drop 8 persist tests | -200 +100 |
-| `v2/docs/reference/16-inode.md` | update for new posture | +40 |
-| `v2/docs/reference/12-dataset.md` | add M-cascade section | +30 |
-| `v2/docs/REFERENCE.md` | refresh tip | +5 |
+| `include/stratum/inode.h` | shed persistence APIs; add attach | -50 +30 |
+| `src/inode/inode.c` | rewrite engine glue (metakey + ds_idx) | -200 +200 |
+| `src/inode/CMakeLists.txt` | add stm_metakey + stm_dataset deps | +3 |
+| `include/stratum/dataset.h` | add 3 engine-commit APIs | +60 |
+| `src/dataset/dataset.c` | impl + pending_flush tracking | +200 |
+| `src/sync/sync.c` | drop inode flush/finalize; add M-cascade | -50 +80 |
+| `tests/test_inode.c` | fixture rebuild; drop 8 persist tests | -200 +100 |
+| `docs/reference/16-inode.md` | update for new posture | +40 |
+| `docs/reference/12-dataset.md` | add M-cascade section | +30 |
+| `docs/REFERENCE.md` | refresh tip | +5 |
 | `CLAUDE.md` | inode allocator row | +5 |
 | Memory files | tip + next-session.md | +20 |
 

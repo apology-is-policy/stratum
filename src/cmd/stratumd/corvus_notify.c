@@ -5,7 +5,7 @@
  * See `corvus_notify.h` for the architecture summary, trust boundaries,
  * and the bilateral contract reference (STRATUM-API-V1.md §6).
  *
- * Spec: composes against `v2/specs/eviction.tla` (the notify-arrive →
+ * Spec: composes against `specs/eviction.tla` (the notify-arrive ->
  * stop-flag-set → unmount-drain sequence).
  */
 
@@ -434,7 +434,7 @@ static stm_status read_one_frame(stm_corvus_notify_consumer *c, int fd)
  * The daemon's main thread observes stop_flag, drains accept loops,
  * tears down /ctl/, scrub, fs (in that order — fs_unmount last,
  * which fires the per-dataset DEK zero). This composes against
- * `v2/specs/eviction.tla`. */
+ * `specs/eviction.tla`. */
 static stm_status consumer_loop(stm_corvus_notify_consumer *c)
 {
     /* Initial connect. Strict mode: refuse-after-first-fail (R138 P2-2

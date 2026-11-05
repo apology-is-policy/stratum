@@ -77,7 +77,7 @@ Concretely this means:
 - **Propose scope amendments to the roadmap** when they're the right
   call (as happened with Phase 2's node serialization → Phase 3
   move). Keep amendments surgical and write the rationale inline in
-  `docs/ROADMAP-V2.md`.
+  `docs/ROADMAP.md`.
 - **Update `phase3-status.md`** and the memory pointer files as
   chunks land.
 
@@ -175,7 +175,7 @@ Phase 3 is officially closed. Phase 4 populates:
 - Per-dataset keys + PQ-hybrid wrap via stm_hybrid (Phase 1
   primitive).
 
-See `docs/ARCHITECTURE.md §7` and `docs/ROADMAP-V2.md §7` for
+See `docs/ARCHITECTURE.md section 7` and `docs/ROADMAP.md section 7` for
 Phase 4 scope.
 
 ### Chunk 4c: In-RAM succinct bitmap (SDArray).
@@ -266,17 +266,17 @@ hazards. A few that survive into Phase 3:
 
 ## References in order of likely usefulness
 
-1. `v2/docs/phase3-status.md` — this file.
-2. `v2/docs/phase2-status.md` — Bw-tree trip hazards that survive.
+1. `docs/phase3-status.md` -- this file.
+2. `docs/phase2-status.md` -- Bw-tree trip hazards that survive.
 3. `docs/ARCHITECTURE.md` §5 (uberblock / quorum), §6 (allocator),
    §3.7 (commit protocol), §7.4 (nonces).
-4. `docs/ROADMAP-V2.md` §6 — Phase 3 deliverables and exit criteria.
+4. `docs/ROADMAP.md` section 6 -- Phase 3 deliverables and exit criteria.
 5. `memory/audit_v2_r0_closed_list.md` — what NOT to re-report in
    R7.
-6. `v2/specs/sync.tla` — abstract commit protocol with NonceUnique,
+6. `specs/sync.tla` -- abstract commit protocol with NonceUnique,
    MountGenBump, UBMonotonic, CommitAtomic invariants.
-7. `v2/specs/allocator.tla` — refcount + deferred-free.
-8. `v2/include/stratum/super.h` — uberblock + label layout + bptr.
+7. `specs/allocator.tla` -- refcount + deferred-free.
+8. `include/stratum/super.h` -- uberblock + label layout + bptr.
 9. `CLAUDE.md` — audit-triggering-changes policy and general
    operating notes.
 

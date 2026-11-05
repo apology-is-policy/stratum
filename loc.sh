@@ -1,9 +1,6 @@
 #!/bin/sh
-# What Stratum v2 is made of. One cloc pass, bucketed, no cache.
-#
-# SCOPE IS v2 ONLY -- v1 at the repo root is the superseded prototype and is
-# deliberately not counted. That was the old script's intent too; it is stated
-# here rather than left implicit in a bare `cloc v2`.
+# What Stratum is made of. One cloc pass, bucketed, no cache. Vendored code under
+# third_party/ is not ours and is not counted.
 #
 # WHY BUCKETS AND NOT ONE NUMBER: the previous version printed a single
 # unlabelled figure counting only C/headers/Rust/asm/TLA+ -- omitting ~48k
@@ -28,17 +25,17 @@ set -u
 # build-asan / build-tsan / build-ubsan / build-werror / build-bench. Those are
 # sanitizer and benchmark build trees whose generated sources were counted as
 # ours, and whose contents vary with whatever was last configured.
-EXCLUDE_DIRS='build,build-asan,build-tsan,build-ubsan,build-werror,build-bench,cmake-build-debug,cmake-build-release,CMakeFiles,.cache,node_modules'
+EXCLUDE_DIRS='third_party,target,dist,build,build-asan,build-tsan,build-ubsan,build-werror,build-bench,cmake-build-debug,cmake-build-release,CMakeFiles,.cache,node_modules'
 
 command -v cloc >/dev/null 2>&1 || { echo "loc.sh: cloc not installed" >&2; exit 1; }
 
-# Count the REPO's v2, not the current directory, so the answer does not depend
-# on where you were standing when you asked.
+# Count the repo, not the current directory, so the answer does not depend on
+# where you were standing when you asked.
 root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
 [ -n "$root" ] && cd "$root"
-[ -d v2 ] || { echo "loc.sh: no v2/ here (run inside the stratum repo)" >&2; exit 1; }
+[ -f src/fs/fs.c ] || { echo "loc.sh: run inside the stratum repo" >&2; exit 1; }
 
-raw=$(cloc v2 \
+raw=$(cloc . \
     --exclude-dir="$EXCLUDE_DIRS" \
     --not-match-d='(^|/)\.(git|idea|vscode)$' \
     --csv --quiet 2>/dev/null)
@@ -75,7 +72,7 @@ END {
     total = code_t + spec_t + docs_t + patch_t + tool_t + other_t
     if (mode == "-n") { print total; exit }
 
-    printf "  stratum v2  authored %s lines\n\n", commas(total)
+    printf "  stratum  authored %s lines\n\n", commas(total)
     if (code_t)  printf "    code    %10s   C, headers, C++, Rust, asm\n", commas(code_t)
     if (docs_t)  printf "    docs    %10s   Markdown\n", commas(docs_t)
     if (spec_t)  printf "    specs   %10s   TLA+\n", commas(spec_t)

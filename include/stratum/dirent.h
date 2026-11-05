@@ -9,7 +9,7 @@
  * collisions via open-addressing per ARCH §11.4.2.
  *
  * Spec-to-code: this file realizes the dirent state machine modeled
- * in `v2/specs/dirent.tla`. Each new public action below maps to a
+ * in `specs/dirent.tla`. Each new public action below maps to a
  * TLA+ action of the same name. The three buggy variants in the
  * spec enumerate the canonical chain-integrity failure modes the
  * reviewer must rule out — `BuggyUnlinkUsesEmpty` (silent loss of

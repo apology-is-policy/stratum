@@ -3,7 +3,7 @@
  * Main allocator (Phase 3 chunk 4b).
  *
  *   see ARCHITECTURE §6 (Allocator model)
- *   see v2/specs/allocator.tla (refcount + deferred-free)
+ *   see specs/allocator.tla (refcount + deferred-free)
  *
  * Layer diagram:
  *

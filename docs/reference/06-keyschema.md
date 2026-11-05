@@ -103,7 +103,7 @@ treats exactly like `PASSPHRASE`. `decode_val` refuses any byte
 outside {0,1,2,3} as `STM_ECORRUPT`. At STM_UB_VERSION 26 → 27 the
 layout was byte-identical (`KS_VAL_HDR_LEN` stayed 8); the bump gated
 the *semantic* break (a pre-TLY-A3 binary would misroute a `CORVUS`
-slot). See `v2/docs/thylacine-keyslot-design.md`.
+slot). See `docs/thylacine-keyslot-design.md`.
 
 ### corvus dataset-path binding (TLY-A3-keyslot-wrap, STM_UB_VERSION 27 → 28)
 
@@ -139,7 +139,7 @@ resulting `CORVUS` slot is `stm_sync_add_dataset_key_corvus`
 is the fs-layer wrapper, and the one-shot
 `stratumd --provision-corvus-dataset` CLI is the operator surface
 (see [21-stratumd.md](21-stratumd.md)).
-See `v2/docs/thylacine-keyslot-wrap-design.md`.
+See `docs/thylacine-keyslot-wrap-design.md`.
 
 ### Mount-time unwrap routing (TLY-A3-keyslot-impl-3b)
 
@@ -159,7 +159,7 @@ exactly like a local-unwrap failure. corvus config reaches
 (the 33-byte session token is loaded into an mlock'd buffer for the
 duration of the mount and then `stm_ct_memzero`'d). The corvus
 dataset-name binding is v1.0 provisional — see
-`v2/docs/thylacine-keyslot-design.md` §10.
+`docs/thylacine-keyslot-design.md` section 10.
 
 **TLY-A5b deferred-unwrap (per-user encrypted home).** The mount-time
 fail-fast on a CURRENT corvus slot is *scoped*. When NO session token is

@@ -5,8 +5,8 @@
  *   see docs/ARCHITECTURE.md §8 — namespace model.
  *   see docs/ARCHITECTURE.md §8.3 — dataset hierarchy + index tree.
  *   see docs/ARCHITECTURE.md §8.9 — rename / move semantics.
- *   see v2/specs/dataset.tla — formal model of structural invariants.
- *   see docs/ROADMAP-V2.md §9.1 — Phase 6 dataset-layer deliverable.
+ *   see specs/dataset.tla -- formal model of structural invariants.
+ *   see docs/ROADMAP.md section 9.1 -- Phase 6 dataset-layer deliverable.
  *
  * Datasets form a tree rooted at id 1 ("the root dataset", typically the
  * pool name e.g. "tank"). Each dataset has a u64 id, a parent_id (0 for
@@ -16,7 +16,7 @@
  *
  * This module provides the ATOMIC operations on the dataset index:
  * Create, Destroy, Rename, Move. The spec for these operations is
- * `v2/specs/dataset.tla`; load-bearing invariants:
+ * `specs/dataset.tla`; load-bearing invariants:
  *
  *   - ForestStructure: every PRESENT dataset's chain of PRESENT
  *     parents reaches RootId by bounded depth. No cycles, no orphan
@@ -35,7 +35,7 @@
  * per ARCH §8.3.2) is wired in a follow-on chunk.
  *
  * Out of scope for this chunk:
- *   - Property inheritance (separate chunk; see v2/specs/property.tla).
+ *   - Property inheritance (separate chunk; see specs/property.tla).
  *   - Snapshots and clones (separate chunks; see snapshot.tla).
  *   - Persistent storage (this chunk is in-RAM only; persistence comes
  *     when ub_main_root is wired up).
@@ -158,7 +158,7 @@ stm_property_kind stm_property_kind_of(stm_property p);
  * `open` accepts it as a degenerate empty tree (the first sync
  * commits an actual paddr).
  *
- * See `v2/docs/phase-9.7-design.md` §3.1 for the dataset-entry
+ * See `docs/phase-9.7-design.md` section 3.1 for the dataset-entry
  * shape rationale.
  */
 typedef struct {

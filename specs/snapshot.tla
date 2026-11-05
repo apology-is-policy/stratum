@@ -6,7 +6,7 @@
 (*   see docs/ARCHITECTURE.md §8.5.1 — birth-txg tracking.                  *)
 (*   see docs/ARCHITECTURE.md §8.5.3 — snapshot create (O(1)).              *)
 (*   see docs/ARCHITECTURE.md §8.5.6 — snapshot holds.                      *)
-(*   see docs/ROADMAP-V2.md §9.1 — Phase 6 snapshot deliverable.            *)
+(*   see docs/ROADMAP.md section 9.1 -- Phase 6 snapshot deliverable.            *)
 (*                                                                           *)
 (* Scope of this spec:                                                      *)
 (*                                                                           *)

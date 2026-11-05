@@ -522,7 +522,7 @@ extern "C" {
  * STM_EBADVERSION. An all-zero triple is the "empty dataset"
  * snapshot (mirrors the dataset entry's empty sentinel).
  *
- * See `v2/docs/phase-9.7-design.md` §3.1 / §3.3 + §4 + §5 for the
+ * See `docs/phase-9.7-design.md` section 3.1 / section 3.3 + section 4 + section 5 for the
  * staging. */
 #define STM_UB_VERSION        33u
 
@@ -593,7 +593,7 @@ typedef enum {
      * (its alloc tree is non-empty until evacuation completes) but is
      * excluded from new mirror reservations and from sync_commit's
      * fan-out. Transitions: ONLINE -> EVACUATING -> REMOVED.
-     * See v2/specs/evac.tla (EvacuationAtomic, AtMostOneEvacuating). */
+     * See specs/evac.tla (EvacuationAtomic, AtMostOneEvacuating). */
     STM_DEV_STATE_EVACUATING = 6,
 } stm_device_state;
 
@@ -910,7 +910,7 @@ _Static_assert(offsetof(stm_uberblock, ub_csum) == 4064,
 /* The unpacked view of `stm_uberblock.ub_scrub_state[64]`. Use
  * stm_ub_scrub_state_pack / _unpack to convert between this and the
  * on-disk byte form. Layout is little-endian; matches the spec
- * variables in v2/specs/scrub.tla under the γ extension. */
+ * variables in specs/scrub.tla under the gamma extension. */
 typedef struct {
     uint8_t  scrub_state;            /* stm_scrub_state enum value */
     uint16_t cursor_device_id;

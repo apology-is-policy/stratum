@@ -3,7 +3,7 @@
  * Four-phase commit (Phase 3 chunk 6).
  *
  *   see include/stratum/sync.h for the surface + phase diagram.
- *   see v2/specs/sync.tla          for the formal spec.
+ *   see specs/sync.tla          for the formal spec.
  *
  * What this module does:
  *   - owns uberblock ring rotation (label + slot selection per commit).

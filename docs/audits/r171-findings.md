@@ -5,7 +5,7 @@ Scope: c06e47a (LF-3a) + 8362ac0 (LF-3b/c) + 3d6bbca (LF-3b cont / LF-3c cont) +
 The LF-3 series ports 21 fs.c public-read entry points from the
 `fs->global` SH rdlock to a wait-free path that uses only an atomic
 wedge check + EBR pin. The wait-free reader holds NO `fs->global` lock
-at any point. The LF-2 engine docstring at `v2/src/btree_engine/engine.c`
+at any point. The LF-2 engine docstring at `src/btree_engine/engine.c`
 lines 199-211 explicitly claims that the LF-2 substrate is correct
 under the assumption that "serial and concurrent paths are mutually
 excluded by `fs->global`'s EX-vs-SH" — LF-3 LIFTS half of that
@@ -38,7 +38,7 @@ classes of problem:
 
 The wait-free reader's lookup path:
 
-  `v2/src/btree_engine/engine.c:613-617`
+  `src/btree_engine/engine.c:613-617`
 
   ```c
   uint32_t vl = node->entries[i].val_len;
@@ -52,7 +52,7 @@ The wait-free reader's lookup path:
 
 The concurrent writer's upsert path:
 
-  `v2/src/btree_engine/node.c:303-324`
+  `src/btree_engine/node.c:303-324`
 
   ```c
   if (found) {
@@ -74,7 +74,7 @@ the allocator unmapped the slab). The window is microseconds but real.
 
 The race is fired by every LF-3d test that pairs a writer with a
 same-engine reader. The `lf3d_read_inline_vs_chmod_same_inode` test
-(`v2/tests/test_compound_ops_concurrent.c:1917`) explicitly racy: chmod
+(`tests/test_compound_ops_concurrent.c:1917`) explicitly racy: chmod
 writer calls `stm_inode_set` → `stm_btree_engine_insert` → `eng_leaf_put`
 upsert → free+new on the 256-byte inode-value buffer; INLINE-mode
 reader calls `stm_fs_read` → `stm_inode_lookup_concurrent` →
@@ -125,15 +125,15 @@ or equivalent). The reader will fault on the first race iteration.
    BE-prepend lands". This stops a future reader of the docstring
    from believing the substrate is sound under LF-3.
 
-Cite: `v2/src/btree_engine/engine.c:613-617`, `v2/src/btree_engine/node.c:303-324`,
-`v2/src/btree_engine/engine.c:199-211` (stale claim), `v2/tests/test_compound_ops_concurrent.c:1917`.
+Cite: `src/btree_engine/engine.c:613-617`, `src/btree_engine/node.c:303-324`,
+`src/btree_engine/engine.c:199-211` (stale claim), `tests/test_compound_ops_concurrent.c:1917`.
 
 ### P0-2: Engine handle UAF on rollback + dataset_destroy + close_engine racing with wait-free reader
 
 `stm_dataset_index_get_engine` releases `idx->lock` BEFORE the caller
 uses the returned engine pointer:
 
-  `v2/src/dataset/dataset.c:1491-1512`
+  `src/dataset/dataset.c:1491-1512`
 
   ```c
   must_lock(&idx->lock);
@@ -146,11 +146,11 @@ uses the returned engine pointer:
 Three call sites then synchronously destroy the engine:
 
   - `stm_dataset_destroy` (rollback path on dataset-create failure) —
-    `v2/src/dataset/dataset.c:531-566` (line 561).
+    `src/dataset/dataset.c:531-566` (line 561).
   - `stm_dataset_index_close_engine` (manual close API; no production
-    callers today, but the API is public) — `v2/src/dataset/dataset.c:1514-1528`.
+    callers today, but the API is public) -- `src/dataset/dataset.c:1514-1528`.
   - `stm_dataset_index_set_engine_root` (the rollback hot path,
-    called from `stm_fs_rollback_snapshot`) — `v2/src/dataset/dataset.c:1532-1583`
+    called from `stm_fs_rollback_snapshot`) -- `src/dataset/dataset.c:1532-1583`
     (line 1562, after `pending_flush` refusal).
 
 Each calls `dataset_engine_close_locked` →
@@ -163,10 +163,10 @@ A wait-free reader that obtained the engine pointer via
 `stm_dataset_index_get_engine` BEFORE this destroy can dereference a
 freed engine struct in `stm_btree_engine_lookup_concurrent` —
 specifically the `atomic_load_explicit(&eng->mvcc_root, ...)` at
-`v2/src/btree_engine/engine.c:549`. UAF on the atomic itself.
+`src/btree_engine/engine.c:549`. UAF on the atomic itself.
 
 `stm_fs_rollback_snapshot` holds `fs->global` wrlock
-(`v2/src/fs/fs.c:8499`), but LF-3 wait-free readers DO NOT TAKE
+(`src/fs/fs.c:8499`), but LF-3 wait-free readers DO NOT TAKE
 `fs->global` AT ALL. The wrlock-vs-wrlock exclusion that historically
 guarded `dataset_engine_close_locked` is bypassed by the wait-free
 read path.
@@ -210,16 +210,16 @@ same dataset. The LF-3d tests don't cover rollback paths at all.
    reader-rollback UAF that BE-prepend or a separate engine-retirement
    chunk must close.
 
-Cite: `v2/src/dataset/dataset.c:1491-1512` (get_engine), `v2/src/dataset/dataset.c:1483-1487`
-(close_locked), `v2/src/dataset/dataset.c:1532-1583` (set_engine_root), `v2/src/fs/fs.c:8499`
-(rollback wrlock), `v2/src/btree_engine/engine.c:170-187` (engine destroy).
+Cite: `src/dataset/dataset.c:1491-1512` (get_engine), `src/dataset/dataset.c:1483-1487`
+(close_locked), `src/dataset/dataset.c:1532-1583` (set_engine_root), `src/fs/fs.c:8499`
+(rollback wrlock), `src/btree_engine/engine.c:170-187` (engine destroy).
 
 ### P0-3: `stm_fs_unmount` UAF on subsystem indices + engine + fs struct against wait-free readers
 
 `stm_fs_unmount` tears the fs down WITHOUT any wedge transition or
 reader-drain:
 
-  `v2/src/fs/fs.c:1371-1432`
+  `src/fs/fs.c:1371-1432`
 
   ```c
   stm_status stm_fs_unmount(stm_fs *fs)
@@ -255,7 +255,7 @@ of these paths:
 
 The atomic wedge check provides ZERO protection against unmount,
 because unmount NEVER sets `fs->wedged = true`. The only wedge-set
-site is `stm_fs_mark_wedged` at `v2/src/fs/fs.c:9411`, and unmount
+site is `stm_fs_mark_wedged` at `src/fs/fs.c:9411`, and unmount
 does not call it.
 
 In practice, applications quiesce all in-flight stm_fs_* calls before
@@ -290,17 +290,17 @@ reader will UAF on `fs->sync` or downstream pointers.
    not synchronize against unmount." This is the minimum that should
    accompany a release-candidate LF-3.
 
-Cite: `v2/src/fs/fs.c:1371-1432` (unmount), `v2/src/sync/sync.c:2263-2305`
-(sync_close frees indices + sync struct), `v2/src/inode/inode.c:553-576`
-(inode_index_close), `v2/src/dirent/dirent.c:462+`
-(dirent_index_close), `v2/src/fs/fs.c:9411-9422` (mark_wedged DOES NOT
+Cite: `src/fs/fs.c:1371-1432` (unmount), `src/sync/sync.c:2263-2305`
+(sync_close frees indices + sync struct), `src/inode/inode.c:553-576`
+(inode_index_close), `src/dirent/dirent.c:462+`
+(dirent_index_close), `src/fs/fs.c:9411-9422` (mark_wedged DOES NOT
 fire from unmount).
 
 ### P0-4: `invalidate_memtree` UAF against pinned wait-free reader (LF-2 limitation, now reachable at LF-3)
 
 The engine's `invalidate_memtree` self-documents a UAF:
 
-  `v2/src/btree_engine/engine.c:780-806`
+  `src/btree_engine/engine.c:780-806`
 
   ```c
   /* LF-2 LIMITATION (closes at LF-BE-prepend with EBR retire): a
@@ -353,7 +353,7 @@ internal-node descent.
 eng_node_free_recursive)`. Until BE-prepend lands, LF-3 cannot be
 considered safe against commit failures.
 
-Cite: `v2/src/btree_engine/engine.c:780-806`, `engine.c:1018+1054+1150`.
+Cite: `src/btree_engine/engine.c:780-806`, `engine.c:1018+1054+1150`.
 
 ## P1 (severe)
 
@@ -365,21 +365,21 @@ wait-free → SH-fallback. Under same-engine concurrent writer they
 propagate transient STM_ECORRUPT.").
 
 `stm_fs_read`'s INLINE branch falls through to the SH-rdlock path on
-`ls != STM_OK` (`v2/src/fs/fs.c:2076-2102`) so a transient race
+`ls != STM_OK` (`src/fs/fs.c:2076-2102`) so a transient race
 manifests as a (slow) retry under the serial idx-mutex.
 
 The other ports return the wait-free path's status DIRECTLY to the
 caller:
 
-  - `stm_fs_stat` (`v2/src/fs/fs.c:3206-3239`) — no fallback.
-  - `stm_fs_lookup` (`v2/src/fs/fs.c:2187-2230`) — no fallback.
-  - `stm_fs_readlink` (`v2/src/fs/fs.c:3897+`) — no fallback.
-  - `stm_fs_get_seals` (`v2/src/fs/fs.c:4212-4226`) — no fallback.
-  - `stm_fs_name_to_handle` (`v2/src/fs/fs.c:4249+`) — no fallback.
-  - `stm_fs_open_by_handle` (`v2/src/fs/fs.c:4347+`) — no fallback.
-  - `stm_fs_getxattr` (`v2/src/fs/fs.c:5327+`) — no fallback.
-  - `stm_fs_listxattr` (`v2/src/fs/fs.c:5376+`) — no fallback.
-  - `stm_fs_readdir` (`v2/src/fs/fs.c:5009+`) — no fallback.
+  - `stm_fs_stat` (`src/fs/fs.c:3206-3239`) -- no fallback.
+  - `stm_fs_lookup` (`src/fs/fs.c:2187-2230`) -- no fallback.
+  - `stm_fs_readlink` (`src/fs/fs.c:3897+`) -- no fallback.
+  - `stm_fs_get_seals` (`src/fs/fs.c:4212-4226`) -- no fallback.
+  - `stm_fs_name_to_handle` (`src/fs/fs.c:4249+`) -- no fallback.
+  - `stm_fs_open_by_handle` (`src/fs/fs.c:4347+`) -- no fallback.
+  - `stm_fs_getxattr` (`src/fs/fs.c:5327+`) -- no fallback.
+  - `stm_fs_listxattr` (`src/fs/fs.c:5376+`) -- no fallback.
+  - `stm_fs_readdir` (`src/fs/fs.c:5009+`) -- no fallback.
 
 A concurrent writer that causes a transient torn read surfaces
 STM_ECORRUPT directly to the caller. Callers (9P server, the
@@ -418,12 +418,12 @@ The LF-3d commit message defers this to R171's call. My
 recommendation: ship the fallback uniformly across all wait-free read
 entries. The cost is one branch per call; the gain is API stability.
 
-Cite: see line numbers above; `v2/src/fs/fs.c:2076-2102` (stm_fs_read
+Cite: see line numbers above; `src/fs/fs.c:2076-2102` (stm_fs_read
 fallback to compare).
 
 ### P1-2: Wait-free `stm_fs_listxattr`'s two-pass count→materialize is TOCTOU-fragile under same-engine writer
 
-  `v2/src/fs/fs.c:5415-5445`
+  `src/fs/fs.c:5415-5445`
 
 The listxattr port runs two passes through `stm_xattr_list_concurrent`:
 first pass with `max_entries=0` to compute the count, second pass with
@@ -444,7 +444,7 @@ attempt and the SH-rdlock retry uses the single-pass `stm_xattr_list`).
 **Fix sketch**: same as P1-1. The 2-pass shape is correct only when
 the index is stable across calls.
 
-Cite: `v2/src/fs/fs.c:5415-5445`.
+Cite: `src/fs/fs.c:5415-5445`.
 
 ### P1-3: LF-3 widens the public stm_fs_* contract without documenting the new caller obligation
 
@@ -459,12 +459,12 @@ thread) now have to add explicit reader-quiesce logic. Stratumd is
 fine because its accept-loop shutdown drains workers before unmount.
 But this is a non-obvious caller obligation that should be documented.
 
-**Fix sketch**: extend `v2/include/stratum/fs.h`'s stm_fs_unmount
+**Fix sketch**: extend `include/stratum/fs.h`'s stm_fs_unmount
 docstring AND the `stm_fs` global lock-hierarchy comment in fs.c (the
 big block at fs.c:35-66) to enumerate the LF-3 contract. Likewise
 update the CLAUDE.md scripture trust-list FS-trigger row.
 
-The current fs.c comment at `v2/src/fs/fs.c:51-57` reads:
+The current fs.c comment at `src/fs/fs.c:51-57` reads:
 
   "PARALLEL-3 impl-6 pure-read ops (stm_fs_read / stat / lookup / ...):
    take fs->global SH (rdlock) and NO ..."
@@ -473,7 +473,7 @@ This is OUT OF DATE. Post-LF-3 these ops take `fs->global` SH **OR**
 the wait-free path with FS_GUARD_READ_LOCKLESS + EBR; the comment
 should be updated.
 
-Cite: `v2/src/fs/fs.c:35-66` (lock-hierarchy comment), `v2/include/stratum/fs.h`
+Cite: `src/fs/fs.c:35-66` (lock-hierarchy comment), `include/stratum/fs.h`
 (public docstrings).
 
 ### P1-4: `stm_fs_create_dataset` / `stm_fs_create_clone` race-window UAF on engine if dataset is destroyed mid-creation by another writer
@@ -495,15 +495,15 @@ But the architectural issue is real: ANY path that destroys a dataset
 or invalidates an engine assumes no wait-free reader is mid-call,
 which LF-3 doesn't enforce.
 
-Cite: `v2/src/fs/fs.c:6544`, `v2/src/fs/fs.c:6615`, `v2/src/fs/fs.c:6721`,
-`v2/src/fs/fs.c:6742`, `v2/src/fs/fs.c:6759` (5 stm_dataset_destroy
+Cite: `src/fs/fs.c:6544`, `src/fs/fs.c:6615`, `src/fs/fs.c:6721`,
+`src/fs/fs.c:6742`, `src/fs/fs.c:6759` (5 stm_dataset_destroy
 sites in rollback paths).
 
 ## P2 (substantive)
 
 ### P2-1: `pthread_key_create` failure in `fs_ebr_key_init` is silently ignored
 
-  `v2/src/fs/fs.c:300-308`
+  `src/fs/fs.c:300-308`
 
   ```c
   static void fs_ebr_key_init(void)
@@ -529,11 +529,11 @@ through to `stm_fs_mount` so the daemon refuses to start. The
 graceful-degradation posture is harmful here — it converts a
 catastrophic configuration failure into a silent perf-regression.
 
-Cite: `v2/src/fs/fs.c:300-308`.
+Cite: `src/fs/fs.c:300-308`.
 
 ### P2-2: EBR `stm_ebr_shutdown` docstring claims panic-on-alive-threads but the impl frees them silently
 
-  `v2/include/stratum/ebr.h:139-144`
+  `include/stratum/ebr.h:139-144`
 
   ```
   Teardown. Forces reclamation of all pending retires regardless of
@@ -541,7 +541,7 @@ Cite: `v2/src/fs/fs.c:300-308`.
   still registered.
   ```
 
-  `v2/src/ebr/ebr.c:331-356`
+  `src/ebr/ebr.c:331-356`
 
 The implementation does NOT panic — it walks the threads list and
 frees every entry (line 344-348). The docstring is wrong.
@@ -556,12 +556,12 @@ documented panic would not be protected.
 alive thread is found) OR update the docstring to reflect the actual
 "forces free of all threads regardless of state" behavior.
 
-Cite: `v2/include/stratum/ebr.h:139-144` (docstring), `v2/src/ebr/ebr.c:331-356`
+Cite: `include/stratum/ebr.h:139-144` (docstring), `src/ebr/ebr.c:331-356`
 (impl).
 
 ### P2-3: `stm_fs_dataset_iter` callback runs under dataset_index's mutex; subsequent callback-internal lock could deadlock
 
-  `v2/src/fs/fs.c:6880-6892`
+  `src/fs/fs.c:6880-6892`
 
 The wait-free port keeps the contract — "callback MUST NOT call back
 into any stm_fs_* API" — but the lock now held during the callback
@@ -579,11 +579,11 @@ general terms. Tighten to mention that the lock is the dataset_idx's
 internal mutex specifically and enumerate the APIs that would
 deadlock.
 
-Cite: `v2/src/fs/fs.c:6837-6842` (docstring), `v2/src/dataset/dataset.c::stm_dataset_iter`.
+Cite: `src/fs/fs.c:6837-6842` (docstring), `src/dataset/dataset.c::stm_dataset_iter`.
 
 ### P2-4: `idx->ds_idx` read is not atomic; technically UB under the C11 memory model
 
-  `v2/src/inode/inode.c:902-906` (and similarly dirent.c, xattr.c, extent_index.c)
+  `src/inode/inode.c:902-906` (and similarly dirent.c, xattr.c, extent_index.c)
 
   ```c
   stm_inode_index *midx = (stm_inode_index *)idx;
@@ -594,7 +594,7 @@ Cite: `v2/src/fs/fs.c:6837-6842` (docstring), `v2/src/dataset/dataset.c::stm_dat
 
 The `ds_idx` field is plain (non-atomic). It's set ONCE inside
 `stm_inode_index_attach_dataset_index` under `idx->lock`
-(`v2/src/inode/inode.c:581-588`). A wait-free reader's plain load
+(`src/inode/inode.c:581-588`). A wait-free reader's plain load
 WITHOUT a happens-before edge to that store is technically UB under
 the C11 memory model. In practice on x86_64 with an aligned 8-byte
 pointer this load is benign, but TSan will flag it and a non-TSO
@@ -607,12 +607,12 @@ thread is created provides synchronization. So this is more of a
 "clean it up" finding than a real bug — but it's an easy win to wrap
 ds_idx in `_Atomic`.
 
-Cite: `v2/src/inode/inode.c:902-906`, `v2/src/dirent/dirent.c:721-722`,
-`v2/src/xattr/xattr.c:787-788`, `v2/src/extent/extent_index.c:2120-2121`.
+Cite: `src/inode/inode.c:902-906`, `src/dirent/dirent.c:721-722`,
+`src/xattr/xattr.c:787-788`, `src/extent/extent_index.c:2120-2121`.
 
 ### P2-5: LF-3 ports of admin-path read getters bypass the wedge gate entirely (stm_fs_verify, stm_fs_dataset_iter, stm_fs_dataset_count, stm_fs_dataset_lookup)
 
-  `v2/src/fs/fs.c:6873-6884` (stm_fs_dataset_lookup), `:6886-6897`
+  `src/fs/fs.c:6873-6884` (stm_fs_dataset_lookup), `:6886-6897`
   (stm_fs_dataset_count), `:6899-6906` (stm_fs_dataset_iter),
   `:9402-9410` (stm_fs_verify)
 
@@ -637,7 +637,7 @@ Cite: as above.
 
 ### P2-6: `stm_fs_read`'s INLINE-branch torn-state check at `iv.si_data_len > STM_INODE_INLINE_MAX` returns STM_ECORRUPT without falling back
 
-  `v2/src/fs/fs.c:2081-2084`
+  `src/fs/fs.c:2081-2084`
 
 The commit message claims "the wait-free path returns STM_ECORRUPT
 under race; the fallback re-reads through the serial idx-mutex path
@@ -653,13 +653,13 @@ the same fallback discipline.
 with `goto fallback;` and a `fallback:` label that jumps to the
 SH-rdlock path at line 2107.
 
-Cite: `v2/src/fs/fs.c:2076-2103`.
+Cite: `src/fs/fs.c:2076-2103`.
 
 ## P3 (light)
 
 ### P3-1: Docstring typo — "stm_fs_ebr_thread_current" vs actual name `fs_ebr_thread_current`
 
-  `v2/src/fs/fs.c:280`
+  `src/fs/fs.c:280`
 
 The comment at line 280 says "stm_fs_ebr_thread_current()" but the
 function is `fs_ebr_thread_current` (no `stm_` prefix because it's
@@ -667,7 +667,7 @@ static). Minor.
 
 ### P3-2: `fs_ebr_destructor` lacks a NULL-check on `handle` (defense-in-depth)
 
-  `v2/src/fs/fs.c:295-298`
+  `src/fs/fs.c:295-298`
 
 POSIX guarantees the key destructor is only called with non-NULL
 values, so the existing `if (handle)` check is sufficient. But the
@@ -689,7 +689,7 @@ is misleading.
 **Fix sketch**: rewrite to acknowledge that unmount doesn't transition
 the flags; mark_wedged does.
 
-Cite: `v2/src/fs/fs.c:193-214`, `v2/src/fs/fs.c:1378-1394` (unmount reads).
+Cite: `src/fs/fs.c:193-214`, `src/fs/fs.c:1378-1394` (unmount reads).
 
 ### P3-4: Forward-note in `stm_fs_alloc_stats_get` (fs.c:6917-6920) says "future concurrent-attach-mutation paths MUST EITHER add per-call refcounting on stm_alloc OR extend this wrapper to take the attach-table mutex" but the path is unguarded today
 
@@ -702,11 +702,11 @@ the present-day implementation already has the gap. The comment
 should be updated to say "if unmount can race with this caller, UAF
 follows; v1.0 trusts the caller to quiesce."
 
-Cite: `v2/src/fs/fs.c:6913-6925`.
+Cite: `src/fs/fs.c:6913-6925`.
 
 ### P3-5: LF-3d test `lf3d_inline_read_thread` silently passes if the writer hasn't yet run an iteration
 
-  `v2/tests/test_compound_ops_concurrent.c:1887-1915`
+  `tests/test_compound_ops_concurrent.c:1887-1915`
 
 The test starts the chmod writer and the inline-read reader on
 separate threads with no synchronization barrier. If the reader
@@ -744,11 +744,11 @@ on the same engine; the race is bounded by the
 [[flake-per-inode-cfr-concurrent]] symptom class until BE-prepend
 lands.
 
-Cite: `v2/src/btree_engine/engine.c:199-211`.
+Cite: `src/btree_engine/engine.c:199-211`.
 
 ### P3-7: The wait-free `stm_fs_read` INLINE branch reads `iv.si_data_kind` from a stack-local copy but the comment claims it "serves from inode-value bytes directly (wait-free)"
 
-  `v2/src/fs/fs.c:2060-2102`
+  `src/fs/fs.c:2060-2102`
 
 The wording is slightly imprecise: the inode value is COPIED out of
 the engine's leaf via `memcpy(&v, vbuf, IN_VAL_LEN)` in
@@ -762,7 +762,7 @@ This is more documentation hygiene than soundness.
 
 ### P3-8: Two `LF3D_INLINE_LEN` vs `STM_INODE_INLINE_MAX` documentation inconsistency
 
-  `v2/tests/test_compound_ops_concurrent.c:1565`
+  `tests/test_compound_ops_concurrent.c:1565`
 
   ```c
   #define LF3D_INLINE_LEN         64u   /* < STM_INODE_INLINE_MAX (100) */

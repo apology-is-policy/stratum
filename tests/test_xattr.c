@@ -2,7 +2,7 @@
 /*
  * test_xattr.c — P8-POSIX-6 + 9.7-impl-1c-iv.
  *
- * Exercises the xattr index per `v2/specs/xattr.tla`:
+ * Exercises the xattr index per `specs/xattr.tla`:
  *
  *   - Lifecycle (create / close / attach).
  *   - Set / get / remove / list basic paths.

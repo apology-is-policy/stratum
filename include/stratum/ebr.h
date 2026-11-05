@@ -3,7 +3,7 @@
  * Epoch-Based Reclamation (EBR) — safe lock-free memory reclamation for
  * the Bw-tree delta chains and tree-version handoff.
  *
- * See ARCHITECTURE §3.6. Modeled in v2/specs/concurrency.tla with the
+ * See ARCHITECTURE section 3.6. Modeled in specs/concurrency.tla with the
  * invariants proved at small scope.
  *
  * Usage model:

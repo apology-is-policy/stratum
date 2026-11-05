@@ -1149,7 +1149,7 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
          * /ctl/ clients (TUI pollers, Prometheus scrapers, future
          * kernel-9P mounts) previously starved each other on the
          * single serial accept slot — see
-         * v2/docs/p9.5-parallel-1-design.md §1. */
+         * docs/p9.5-parallel-1-design.md section 1. */
         stratumd_ctl_worker_ctx *wctx = malloc(sizeof *wctx);
         if (!wctx) {
             close(client_fd);

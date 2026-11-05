@@ -2,7 +2,7 @@
 \* Stratum v2 — RC-2: the DEK map read guard (the one genuinely NEW
 \* synchronization the RC arc introduces).
 \*
-\* RC arc scripture: `v2/docs/rc-design.md` §4 (RC-2, "The DEK guard")
+\* RC arc scripture: `docs/rc-design.md` section 4 (RC-2, "The DEK guard")
 \* + §5 race #7 + §6 (this module). Companion to dcache_ebr.tla (RC-1)
 \* and concurrency_mvcc.tla (whose atomic-snapshot-publication shape
 \* this module instantiates for the DEK map).

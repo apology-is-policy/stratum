@@ -2020,7 +2020,7 @@ stm_status stm_fs_evict_dek(stm_fs *fs, uint64_t dataset_id);
  * before anything is drained.
  *
  * The CONSULTATION GATE is load-bearing — it composes against
- * `v2/specs/snapshot.tla::RollbackBlockedIffCompromised`:
+ * `specs/snapshot.tla::RollbackBlockedIffCompromised`:
  *
  *   If the target snapshot carries STM_SNAP_FLAG_ROLLBACK_COMPROMISED
  *   (corvus flagged its wrap chain as possibly compromised — the F13

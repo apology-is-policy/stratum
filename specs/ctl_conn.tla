@@ -10,10 +10,10 @@
 \* clobbered the singleton caller_uid) and silent cross-client data reads
 \* (sessions[] keyed by fid alone — fid=1 from two conns collides).
 \*
-\*   v2/docs/p9.5-parallel-1-design.md §2.1–§2.3 — concrete failure modes
+\*   docs/p9.5-parallel-1-design.md section 2.1-section 2.3 -- concrete failure modes
 \*   ARCHITECTURE §10.4 — /ctl/ as the stratumd second listener
 \*   ARCHITECTURE §14.3 — /ctl/ synfs and its admin-gate semantics
-\*   ROADMAP-V2 §13   — Phase 9.5 PARALLEL trio (gates Thylacine kernel-9P)
+\*   ROADMAP section 13   -- Phase 9.5 PARALLEL trio (gates Thylacine kernel-9P)
 \*   slate.tla        — ConnectionAtomic / PanelPathConsistent doctrine carry
 \*   fid.tla          — per-connection fid table doctrine carry
 \*

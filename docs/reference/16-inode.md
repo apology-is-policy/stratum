@@ -86,9 +86,9 @@ version bump until 9.6-impl-4d (the on-disk format is in-flight on the
 Only the per-dataset `next_ino` high-water mark stays in RAM
 (`stm_inode_dsstate`), mount-reconstructed from a one-time engine scan.
 
-Header: `v2/include/stratum/inode.h` (753 lines).
-Impl: `v2/src/inode/inode.c` (1505 lines).
-Spec: `v2/specs/inode.tla`.
+Header: `include/stratum/inode.h` (753 lines).
+Impl: `src/inode/inode.c` (1505 lines).
+Spec: `specs/inode.tla`.
 
 ## On-disk inode value
 
@@ -563,7 +563,7 @@ tuples, each NEVER re-issued.
 
 ## Spec cross-reference
 
-`v2/specs/inode.tla` pins the load-bearing invariants:
+`specs/inode.tla` pins the load-bearing invariants:
 
 - **`TupleUniqueAllTime`** — `(ino, gen)` never reissued (the headline
   property; ARCH §11.3.2).
@@ -586,7 +586,7 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 
 | Spec action | Impl function | File |
 |---|---|---|
-| `AllocFresh` / `AllocReused` | `stm_inode_alloc` | `v2/src/inode/inode.c` |
+| `AllocFresh` / `AllocReused` | `stm_inode_alloc` | `src/inode/inode.c` |
 | `AllocAnon` | `stm_inode_alloc_anon` | same |
 | `Link` | `stm_inode_link` | same |
 | `Unlink` | `stm_inode_unlink` | same |

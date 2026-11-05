@@ -14,7 +14,7 @@ happened, so the reader either sees the retired memory entirely
 (safe) or never sees it (also safe — reads pinned by a later epoch).
 
 Three-epoch Treiber-ring-of-retires design per ARCHITECTURE §3.6,
-modeled in `v2/specs/concurrency.tla`.
+modeled in `specs/concurrency.tla`.
 
 ## Public API
 

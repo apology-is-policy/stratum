@@ -5,8 +5,8 @@
  *   see docs/ARCHITECTURE.md §7.14 (state machine + scope + priority)
  *                            §7.15 (repair from redundancy)
  *                            §12.7 (I/O path obligations)
- *   see docs/ROADMAP-V2.md §8    (Phase 5 scope)
- *   see v2/specs/scrub.tla        (formal state-machine spec)
+ *   see docs/ROADMAP.md section 8    (Phase 5 scope)
+ *   see specs/scrub.tla        (formal state-machine spec)
  *
  * The scrub module performs a background walk over a pool's allocated
  * data, reading every allocated block and counting read failures. Two

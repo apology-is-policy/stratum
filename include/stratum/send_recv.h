@@ -3,7 +3,7 @@
  * Send / receive — point-in-time dataset replication (Phase 7 P7-7).
  *
  *   see docs/ARCHITECTURE.md §8.7 — send/recv protocol intent.
- *   see docs/ROADMAP-V2.md §10.3 — Phase 7 deliverable.
+ *   see docs/ROADMAP.md section 10.3 -- Phase 7 deliverable.
  *
  * Send produces a wire-format byte stream representing the contents of
  * a dataset at a snapshot point (full send) or the delta between two

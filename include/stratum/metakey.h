@@ -29,7 +29,7 @@
  * design intent is that this lib never grows past O(100) lines —
  * complexity that wants to live here belongs in the calling module's
  * per-kind body codec instead (e.g., inode value encode/decode stays
- * in v2/src/inode/, not here).
+ * in src/inode/, not here).
  *
  * Spec composition: the type-tag is part of the key the engine sees.
  * btree.tla treats the key as opaque bytes; the lex-order invariant

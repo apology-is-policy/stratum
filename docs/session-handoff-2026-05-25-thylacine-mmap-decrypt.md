@@ -63,7 +63,7 @@ hands over.
 ## Files changed
 
 ```
-v2/src/btree_store/crypt.c (27 lines added, 1 deleted)
+src/btree_store/crypt.c (27 lines added, 1 deleted)
 ```
 
 ## Forward-merging guidance

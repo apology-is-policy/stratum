@@ -4,7 +4,7 @@
  * (ARCHITECTURE §7.14, §7.15, §12.7).
  *
  *   see include/stratum/scrub.h — surface + state machine diagram.
- *   see v2/specs/scrub.tla       — formal spec. Every state transition
+ *   see specs/scrub.tla       -- formal spec. Every state transition
  *                                    in this file has a corresponding
  *                                    spec action (Start / Pause / Resume
  *                                    / StepClean / StepCorrupt /

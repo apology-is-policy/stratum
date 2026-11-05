@@ -16,7 +16,7 @@ this file + `~/.claude/projects/.../memory/project_v2_next_session.md`.
 ### R128 audit close (correctness)
 2 P1 + 3 P2 fixes against the writeback + TUI worker series.
 
-**Files**: `v2/src/fs/fs.c`, `v2/tools/stratum/tests/e2e_crud.rs`.
+**Files**: `src/fs/fs.c`, `tools/stratum/tests/e2e_crud.rs`.
 
 - `fs_pre_inode_free_cleanup_locked` helper extracted (returns bool —
   see R130 below). Drops dirty_buffer entry + truncates extents
@@ -49,12 +49,12 @@ freed/fs_free==OK signal.
 
 **Result**: ctest -j4 back to 212s, 51/51 GREEN.
 
-Files: `v2/src/fs/fs.c` only.
+Files: `src/fs/fs.c` only.
 
 ### SWISS-5 — Volume Map F2 view
 Full Stage A + B; partial Stage C.
 
-**C-side** (`v2/src/`):
+**C-side** (`src/`):
 - `fs/fs.c`: `stm_fs_pool()` + `stm_fs_sync()` public getters
 - `fs.h`: forward decls + public-API documentation for the getters
 - `cmd/stratumd/serve.c`: scrub create + 3 attach calls + lifecycle
@@ -68,7 +68,7 @@ Full Stage A + B; partial Stage C.
   dataset_id; materializer surfaces (id, dataset, name, txg,
   extent_txg, prev_snap_id, hold_count, flags).
 
-**Rust-side** (`v2/tools/stratum/src/`):
+**Rust-side** (`tools/stratum/src/`):
 - NEW `ctl.rs` (~370 LOC) — `CtlClient::dial`, walk/lopen/read/readdir,
   per-instance unique fid base, `discover_pool_uuid` helper.
 - NEW `volmap.rs` (~520 LOC, 13 unit tests) — Prometheus parser,
@@ -92,7 +92,7 @@ Full Stage A + B; partial Stage C.
 - `ctl_snapshots_subtree_lists_and_materializes` (S5-PRE-C)
 - `ctl_snapshots_walk_refuses_unknown_id` (S5-PRE-C)
 
-**Design doc**: `v2/docs/swiss-5-design.md` (~300 lines).
+**Design doc**: `docs/swiss-5-design.md` (~300 lines).
 
 ### R129 audit close
 0 P0/P1. 2 P2 (Rust TUI F2 keyboard-capture bugs) — both fixed inline:
@@ -107,7 +107,7 @@ depth).
 
 4 P3 forward-notes; acceptable at SWISS-5 close.
 
-**Audit artifact**: `v2/.audit_r129_findings.md` (gitignored after
+**Audit artifact**: `.audit_r129_findings.md` (gitignored after
 commit).
 
 ## Commit plan
@@ -115,7 +115,7 @@ commit).
 Suggested 3-commit split:
 
 ### Commit 1 — R128 close (correctness)
-**Files**: `v2/src/fs/fs.c`, `v2/tools/stratum/tests/e2e_crud.rs`
+**Files**: `src/fs/fs.c`, `tools/stratum/tests/e2e_crud.rs`
 (only the rename_overwrite regression test from this commit's scope).
 
 **Message hook**: "R128: extract inode-free helpers + 5 pre-flush
@@ -126,31 +126,31 @@ shape, would be cleaner together than as 2 separate commits).
 
 ### Commit 2 — SWISS-5 close (volume map + R129 close)
 **Files**:
-- `v2/include/stratum/fs.h` (getter declarations)
-- `v2/include/stratum/stratumd.h` (comment update)
-- `v2/src/cmd/stratumd/serve.c` (scrub create + attach + lifecycle)
-- `v2/src/ctl/synfs.c` (S5-PRE-C snapshot subtree)
-- `v2/tools/stratum/src/ffi.rs` (readdir FFI)
-- `v2/tools/stratum/src/main.rs` (mod declarations)
-- `v2/tools/stratum/src/tui.rs` (F2 + view_mode + poller)
-- `v2/tools/stratum/src/ui.rs` (ViewMode + render branch)
-- `v2/tools/stratum/src/ctl.rs` (NEW)
-- `v2/tools/stratum/src/volmap.rs` (NEW)
-- `v2/tools/stratum/src/swiss5_view.rs` (NEW)
-- `v2/tools/stratum/tests/e2e_crud.rs` (4 new SWISS-5 tests)
-- `v2/docs/swiss-5-design.md` (NEW)
-- `docs/ROADMAP-V2.md` (Phase 9.5 queued — done in prior session;
+- `include/stratum/fs.h` (getter declarations)
+- `include/stratum/stratumd.h` (comment update)
+- `src/cmd/stratumd/serve.c` (scrub create + attach + lifecycle)
+- `src/ctl/synfs.c` (S5-PRE-C snapshot subtree)
+- `tools/stratum/src/ffi.rs` (readdir FFI)
+- `tools/stratum/src/main.rs` (mod declarations)
+- `tools/stratum/src/tui.rs` (F2 + view_mode + poller)
+- `tools/stratum/src/ui.rs` (ViewMode + render branch)
+- `tools/stratum/src/ctl.rs` (NEW)
+- `tools/stratum/src/volmap.rs` (NEW)
+- `tools/stratum/src/swiss5_view.rs` (NEW)
+- `tools/stratum/tests/e2e_crud.rs` (4 new SWISS-5 tests)
+- `docs/swiss-5-design.md` (NEW)
+- `docs/ROADMAP.md` (Phase 9.5 queued -- done in prior session;
   may already be in the diff)
 
 **Message hook**: "SWISS-5: Volume Map F2 view + S5-PRE-A/C + R129 close"
 
 ### Commit 3 — Docs cleanup
 **Files**:
-- `v2/docs/claude_md_updates_pending_r128.md` (DELETE after applying
+- `docs/claude_md_updates_pending_r128.md` (DELETE after applying
   to CLAUDE.md)
-- `v2/.audit_r128_findings.md` (DELETE — keep in git history if
+- `.audit_r128_findings.md` (DELETE -- keep in git history if
   desired via `git mv` to docs/ or just remove)
-- `v2/.audit_r129_findings.md` (DELETE)
+- `.audit_r129_findings.md` (DELETE)
 - `CLAUDE.md` (apply pending trigger-row updates — see "CLAUDE.md
   updates pending" section below)
 
@@ -158,7 +158,7 @@ shape, would be cleaner together than as 2 separate commits).
 
 ## CLAUDE.md trigger-row updates pending
 
-Draft in `v2/docs/claude_md_updates_pending_r128.md`. Apply these
+Draft in `docs/claude_md_updates_pending_r128.md`. Apply these
 verbatim BEFORE deleting the draft:
 
 1. NEW ROW: Writeback aggregation (dirty_buffer + fs.c writeback paths)
@@ -273,28 +273,28 @@ ls -la /Users/northkillpd/projects/dist/stratum
 ## Files modified this session
 
 ```
-M docs/ROADMAP-V2.md                                (prior session;
+M docs/ROADMAP.md                                (prior session;
                                                      Phase 9.5 queued)
 M loc.sh                                            (incidental)
-M v2/include/stratum/fs.h                           (S5-PRE-A getters)
-M v2/include/stratum/stratumd.h                     (forward-note resolved)
-M v2/src/cmd/stratumd/serve.c                       (S5-PRE-A attach)
-M v2/src/ctl/synfs.c                                (S5-PRE-C kinds)
-M v2/src/fs/fs.c                                    (R128 + R130)
-M v2/tools/stratum/src/ffi.rs                       (stm_9p_readdir)
-M v2/tools/stratum/src/main.rs                      (mod decls)
-M v2/tools/stratum/src/tui.rs                       (F2 + view_mode)
-M v2/tools/stratum/src/ui.rs                        (ViewMode + render)
-M v2/tools/stratum/tests/e2e_crud.rs                (5 new tests)
-?? v2/.audit_r128_findings.md                       (audit artifact)
-?? v2/.audit_r129_findings.md                       (audit artifact)
-?? v2/build_asan/                                   (build artifact)
-?? v2/docs/claude_md_updates_pending_r128.md        (apply to CLAUDE.md)
-?? v2/docs/session-handoff-2026-05-11.md            (this file)
-?? v2/docs/swiss-5-design.md                        (design doc)
-?? v2/tools/stratum/src/ctl.rs                      (CtlClient lib)
-?? v2/tools/stratum/src/swiss5_view.rs              (F2 renderer)
-?? v2/tools/stratum/src/volmap.rs                   (data layer)
+M include/stratum/fs.h                           (S5-PRE-A getters)
+M include/stratum/stratumd.h                     (forward-note resolved)
+M src/cmd/stratumd/serve.c                       (S5-PRE-A attach)
+M src/ctl/synfs.c                                (S5-PRE-C kinds)
+M src/fs/fs.c                                    (R128 + R130)
+M tools/stratum/src/ffi.rs                       (stm_9p_readdir)
+M tools/stratum/src/main.rs                      (mod decls)
+M tools/stratum/src/tui.rs                       (F2 + view_mode)
+M tools/stratum/src/ui.rs                        (ViewMode + render)
+M tools/stratum/tests/e2e_crud.rs                (5 new tests)
+?? .audit_r128_findings.md                       (audit artifact)
+?? .audit_r129_findings.md                       (audit artifact)
+?? build_asan/                                   (build artifact)
+?? docs/claude_md_updates_pending_r128.md        (apply to CLAUDE.md)
+?? docs/session-handoff-2026-05-11.md            (this file)
+?? docs/swiss-5-design.md                        (design doc)
+?? tools/stratum/src/ctl.rs                      (CtlClient lib)
+?? tools/stratum/src/swiss5_view.rs              (F2 renderer)
+?? tools/stratum/src/volmap.rs                   (data layer)
 ```
 
 ## Tasks (in-conversation list)

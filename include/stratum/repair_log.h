@@ -7,7 +7,7 @@
  *   corruption type, redundancy source, verification result) so
  *   admins can review repair activity and infer imminent hardware
  *   failure.
- *   see v2/specs/bptr.tla `LogIntegrity` invariant for the formal
+ *   see specs/bptr.tla `LogIntegrity` invariant for the formal
  *   shape: "every emitted log entry corresponds to a rewrite that
  *   actually landed and carries the picked source's index."
  *

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: ISC */
 /*
  * test_dirty_buffer — unit tests for the dirty buffer module
- * (SWISS-4q-flush). Verifies the C impl matches v2/specs/writeback.tla.
+ * (SWISS-4q-flush). Verifies the C impl matches specs/writeback.tla.
  *
  * Coverage:
  *   - lifecycle (create / destroy)

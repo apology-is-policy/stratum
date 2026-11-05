@@ -3,7 +3,7 @@
  * Per-dataset snapshot index.
  *
  *   see include/stratum/snapshot.h — public API + invariants.
- *   see v2/specs/snapshot.tla — formal model.
+ *   see specs/snapshot.tla -- formal model.
  *
  * In-RAM linear-array implementation analogous to src/dataset/dataset.c.
  * Slots are append-only — Delete marks ABSENT, the slot stays.

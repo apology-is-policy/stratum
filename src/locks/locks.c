@@ -2,7 +2,7 @@
 /*
  * Stratum v2 — advisory lock table (P8-POSIX-7d).
  *
- * Spec: v2/specs/locks.tla. NON-BLOCKING acquire only —
+ * Spec: specs/locks.tla. NON-BLOCKING acquire only --
  * `stm_lock_acquire` returns STM_EAGAIN on conflict; callers
  * loop or give up. Blocking F_SETLKW + deadlock detection are
  * deferred to a future sub-chunk.

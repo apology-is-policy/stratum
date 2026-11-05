@@ -47,3 +47,7 @@ bench/reflink_results_*.csv
 # Rust crate build output (tui/)
 tools/stratum-slate-tty/target/
 tools/stratum/target/
+
+# Rust builds and the packaged binary
+target/
+dist/

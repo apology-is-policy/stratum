@@ -3,7 +3,7 @@
 // linker (macOS ld is smart; Linux ld gets --start-group/--end-group).
 //
 // The set of libs is the same set the cmake `stratum` INTERFACE
-// library aggregates (v2/CMakeLists.txt :211), plus the four cmd
+// library aggregates (CMakeLists.txt :211), plus the four cmd
 // run-main libs (libstm_cmd_<name>.a) the SWISS-1 chunk introduced.
 
 use std::env;
@@ -27,12 +27,12 @@ fn main() {
         .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
         .unwrap_or_else(|| {
             panic!(
-                "could not find v2/build/ — set STM_BUILD_DIR or run \
-                 `cmake --build build` from the v2 root"
+                "could not find build/ -- set STM_BUILD_DIR or run \
+                 `cmake --build build` from the repository root"
             )
         });
 
-    // Walk v2/build/src/** + v2/build/third_party/ for libstm_*.a / libblake3.a / libxxhash.a.
+    // Walk build/src/** + build/third_party/ for libstm_*.a / libblake3.a / libxxhash.a.
     // Each unique parent dir gets a search path; each lib gets a -l directive.
     let mut search_dirs: Vec<PathBuf> = Vec::new();
     let mut lib_names: Vec<String> = Vec::new();
@@ -113,8 +113,8 @@ fn main() {
 /// looks like a static library we should link.
 ///
 /// R126 P3-7 — policy: any test-only static lib MUST live under
-/// `v2/build/tests/` (which build.rs deliberately does NOT walk).
-/// Anything that ends up under `v2/build/src/**` is production. The
+/// `build/tests/` (which build.rs deliberately does NOT walk).
+/// Anything that ends up under `build/src/**` is production. The
 /// `stm_testlib` skip is belt-and-braces for the one case where
 /// historical CMakeLists may have placed a test artifact under src/.
 /// If a future chunk introduces a new test-only static lib, place it

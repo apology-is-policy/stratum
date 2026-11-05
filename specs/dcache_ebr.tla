@@ -1,7 +1,7 @@
 ---------------------------- MODULE dcache_ebr ----------------------------
 \* Stratum v2 — RC-1: the EBR-pinned decrypted-extent cache (dcache).
 \*
-\* RC arc scripture: `v2/docs/rc-design.md` §4 (RC-1) + §5 race #1 +
+\* RC arc scripture: `docs/rc-design.md` section 4 (RC-1) + section 5 race #1 +
 \* §6 (this module). Companion to concurrency.tla / concurrency_mvcc.tla
 \* (the engine's EBR discipline, which RC-1 instantiates for the dcache)
 \* and to the as-built dcache doc `32-decrypted-extent-cache.md` (whose

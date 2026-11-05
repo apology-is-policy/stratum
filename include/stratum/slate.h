@@ -3,7 +3,7 @@
  * stm_slate — slate daemon's per-process UI state.
  *
  * Slate is the v2 TUI architected as a Plan 9-style synthetic filesystem
- * (see v2/docs/SLATE-DESIGN.md). The daemon owns all UI state; clients
+ * (see docs/SLATE-DESIGN.md). The daemon owns all UI state; clients
  * (terminal renderer, scripts, AI agents, future Halcyon panes) interact
  * with it purely by reading and writing files in a 9P tree.
  *
@@ -95,7 +95,7 @@
  *                                 or the backend op fails.
  *       "editor close"          — clear editor state (NO save).
  *
- * State-machine spec: v2/specs/slate.tla. Invariants:
+ * State-machine spec: specs/slate.tla. Invariants:
  *   VersionMonotonic    — version only ever advances.
  *   EventFIFO           — dispatched order = write order, no gaps.
  *   ReadConsistent      — V0=V1 retry pattern is sound (version changes

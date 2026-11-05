@@ -4,7 +4,7 @@
 
 ## 1. Purpose
 
-ROADMAP-V2.md translates Phase 0's design into a staged implementation plan. It answers:
+ROADMAP.md translates Phase 0's design into a staged implementation plan. It answers:
 
 - **What do we build, in what order, and why?**
 - **What is each phase's scope, exit criteria, and deliverables?**
@@ -23,7 +23,7 @@ Phase 0 ─ Design (DONE)
           ├─ COMPARISON.md
           ├─ NOVEL.md
           ├─ ARCHITECTURE.md  (15 sections, ~5050 lines)
-          └─ ROADMAP-V2.md    (this document)
+          `- ROADMAP.md    (this document)
 
 Phase 1 ─ Foundations                          (~3 months)
           Block device + crypto primitives + TLA+ environment
@@ -92,11 +92,11 @@ Post-v2.0 (v2.1, v2.2+)                        (ongoing)
 
 Total Phase 1 → Phase 11: **~30 months** from design-freeze to v2.0. Aggressive but bounded. Some phases can overlap (notes per-phase). Phase 8 (POSIX surface) was inserted post-Phase-7 in 2026-04-30 once the gap was surfaced — the prior 10-phase plan implicitly assumed POSIX semantics existed but had no chunk for them; APIs (now Phase 9) are necessarily downstream. Phase 9.5 (Concurrent 9P API) was inserted post-SLATE in 2026-05-11 once the kernel-9P-mount target became near-term — Phase 9 shipped the protocol; 9.5 makes it scale across clients by lifting `fs->lock` granularity to expose the Phase-2 lock-free Bε-tree end-to-end.
 
-**Amendment 2026-05-15 — Phase 9.7 (Snapshot completion) inserted.** During Thylacine integration (TLY-A5, the snapshot-rollback compromise marker) it was surfaced that **Phase 6's "snapshots" shipped only the snapshot *index*** — a pool-wide btree of accounting entries (`stm_snapshot_entry`: `dataset_id`, `extent_txg`, `prev_snap_id`, hold-count, flags) sufficient for create / delete / hold / birth-txg dead-list accounting. It did **not** ship the per-dataset metadata trees that `ARCHITECTURE.md` §8.5/§8.6/§12.6 assume: v2 metadata lives in *pool-global* trees keyed by `(dataset_id, …)` (`ub_inode_root`, `ub_dirent_root`, `ub_xattr_root`, `ub_extent_root`), and the dataset descriptor has no `di_tree_root`. Consequence: a v2 snapshot records a generation number but roots no recoverable tree (`tree_root_paddr == 0`), so **snapshot rollback, snapshot-as-readable-tree (`.snaps/` browsing), and clone-as-shared-root all cannot be built** on the current substrate. Phase 9.7 is the foundational re-architecture to per-dataset metadata trees that closes this — a COW filesystem without working rollback is not a COW filesystem. It is scheduled *after* Thylacine v1.0 integration (so Thylacine is unblocked) and *before* Phase 10 hardening (so v2.0 ships with real snapshots). TLY-A5 itself ships marker-first with a stubbed `stm_fs_rollback_snapshot` (`STM_ENOTSUPPORTED`); Phase 9.7 replaces only the stub body — the `/ctl/` rollback verb surface, admin gate, and marker-consultation gate are already in place. See `v2/docs/THYLACINE-V1-PLAN.md` §6.
+**Amendment 2026-05-15 -- Phase 9.7 (Snapshot completion) inserted.** During Thylacine integration (TLY-A5, the snapshot-rollback compromise marker) it was surfaced that **Phase 6's "snapshots" shipped only the snapshot *index*** -- a pool-wide btree of accounting entries (`stm_snapshot_entry`: `dataset_id`, `extent_txg`, `prev_snap_id`, hold-count, flags) sufficient for create / delete / hold / birth-txg dead-list accounting. It did **not** ship the per-dataset metadata trees that `ARCHITECTURE.md` section 8.5/section 8.6/section 12.6 assume: v2 metadata lives in *pool-global* trees keyed by `(dataset_id, ...)` (`ub_inode_root`, `ub_dirent_root`, `ub_xattr_root`, `ub_extent_root`), and the dataset descriptor has no `di_tree_root`. Consequence: a v2 snapshot records a generation number but roots no recoverable tree (`tree_root_paddr == 0`), so **snapshot rollback, snapshot-as-readable-tree (`.snaps/` browsing), and clone-as-shared-root all cannot be built** on the current substrate. Phase 9.7 is the foundational re-architecture to per-dataset metadata trees that closes this -- a COW filesystem without working rollback is not a COW filesystem. It is scheduled *after* Thylacine v1.0 integration (so Thylacine is unblocked) and *before* Phase 10 hardening (so v2.0 ships with real snapshots). TLY-A5 itself ships marker-first with a stubbed `stm_fs_rollback_snapshot` (`STM_ENOTSUPPORTED`); Phase 9.7 replaces only the stub body -- the `/ctl/` rollback verb surface, admin gate, and marker-consultation gate are already in place. See `docs/THYLACINE-V1-PLAN.md` section 6.
 
-**Amendment 2026-05-17 — Phase 9.7 split into 9.6 + 9.7 + 9.8.** Designing Phase 9.7 surfaced that its prerequisite runs deeper than per-dataset trees: v2 has **no incremental copy-on-write for metadata at all**. The persistence layer (`v2/src/btree_store/`) is a documented Phase-3 *"chunk 5c MVP"* — every `sync_commit` rebuilds the entire metadata tree from a flat in-RAM array, and the on-disk tree is hard-capped at two levels (`STM_ENOTSUPPORTED` past ~700K inodes). That is a v2.0 release blocker independent of snapshots, so the substrate becomes its own phase. Revised arc: **Phase 9.6 — Metadata Tree Engine** builds the real incremental-COW, multi-level B+tree — a plain copy-on-write B+tree, the btrfs / ZFS-objset structural model (`v2/docs/phase-9.6-metadata-tree-engine-design.md`); **Phase 9.7 — Snapshot Completion** layers per-dataset trees + rollback + clones on it; **Phase 9.8 — Write-Optimised Lock-Free Metadata** finishes and plugs into the live path the two unfinished *pioneering* layers — the Bε write-optimisation message buffer (coded in `stm_btree` but never persisted) and the Bw-tree lock-free layer (`stm_btree_lf` is a single-node experiment, task #172 deferred; production uses an `stm_btree_mt` rwlock). Mission item 4 lands at 9.8, deliberately, against a working COW engine. The combined 9.6 + 9.7 + 9.8 scope supersedes the 2026-05-15 *"~2-3 months"* Phase 9.7 estimate.
+**Amendment 2026-05-17 -- Phase 9.7 split into 9.6 + 9.7 + 9.8.** Designing Phase 9.7 surfaced that its prerequisite runs deeper than per-dataset trees: v2 has **no incremental copy-on-write for metadata at all**. The persistence layer (`src/btree_store/`) is a documented Phase-3 *"chunk 5c MVP"* -- every `sync_commit` rebuilds the entire metadata tree from a flat in-RAM array, and the on-disk tree is hard-capped at two levels (`STM_ENOTSUPPORTED` past ~700K inodes). That is a v2.0 release blocker independent of snapshots, so the substrate becomes its own phase. Revised arc: **Phase 9.6 -- Metadata Tree Engine** builds the real incremental-COW, multi-level B+tree -- a plain copy-on-write B+tree, the btrfs / ZFS-objset structural model (`docs/phase-9.6-metadata-tree-engine-design.md`); **Phase 9.7 -- Snapshot Completion** layers per-dataset trees + rollback + clones on it; **Phase 9.8 -- Write-Optimised Lock-Free Metadata** finishes and plugs into the live path the two unfinished *pioneering* layers -- the Bepsilon write-optimisation message buffer (coded in `stm_btree` but never persisted) and the Bw-tree lock-free layer (`stm_btree_lf` is a single-node experiment, task #172 deferred; production uses an `stm_btree_mt` rwlock). Mission item 4 lands at 9.8, deliberately, against a working COW engine. The combined 9.6 + 9.7 + 9.8 scope supersedes the 2026-05-15 *"~2-3 months"* Phase 9.7 estimate.
 
-**Amendment 2026-05-24 — Phase 9.9 (Reliability for Thylacine) inserted.** With Phase 9.7 closed (snapshots, rollback, clones, snap-view-mount end-to-end + R0–R168 audited) the COW substrate is complete; Thylacine's port of Stratum-as-OS-FS is on the near-term horizon (Thylacine is currently building MUSL + Linux compat layer). The existing Phase 10 (Hardening) is positioned as v2.0-release polish with a *statistical-absence-of-bugs* exit criterion ("1,000+ fuzzer-hours, zero new P0/P1/P2"). What Thylacine needs is a different gate: **workload-realism**. Random-op fuzzers + crash-injection (already in place via test_crash_inject) find one class of bug; running `git clone linux.git && make -j16` for a week finds another. Phase 9.9 lands the workload-realism gate so Thylacine can bet the OS on Stratum BEFORE the lock-free rearchitecture re-opens the soundness surface. Three sub-chunks: **9.9-WORKLOAD** (kernel-9P-mount + real workloads — git checkout, kernel build, rsync, mailbench, xfstests against a real v9fs mount), **9.9-STRESS** (structured random-op fuzzer with invariant checks after every op — allocator balance, Merkle chain decryptable, no leaked paddrs, sync gens monotonic, no AEAD-decrypt-fail — plus targeted allocator-fragmentation scenarios), **9.9-LONGEVITY** (24h / 7d / 30d soak on GCP — looks for slow leaks, gradual degradation, "weird congested states"). Phase 9.9 is positioned AFTER Phase 9.8 deliberately — doing 9.8 first means we only have to certify the reliability surface ONCE, against the final lock-free shape, rather than twice. Phase 9.9 then feeds into Phase 10's broader pre-v2.0 polish. **GCP-first execution default**: Phase 9.9 by design runs on Google Cloud (`wired-epsilon-337013` / "Project Cora", europe-west4, see `memory/reference_gcp_compute.md`) rather than the macOS dev box for any test that needs more than a few GB of disk OR more than ~10 minutes of wall-clock — local disk space is constrained, GCP is provisioned, spot pricing is ~$0.04/hour for e2-standard-4, and Phase 9.9 workloads (Linux kernel checkout = 4-6 GB, sustained stress soaks = unbounded disk) blow past the local box's headroom. Cheap-test rule: anything that fits in a normal ctest run stays local; anything that doesn't, goes to GCP via the established spot-VM + pd-balanced workflow. The full Phase 9.9 design will live at `v2/docs/phase-9.9-design.md` when the phase is entered; this amendment is the queue-it-and-route-to-cloud commitment.
+**Amendment 2026-05-24 -- Phase 9.9 (Reliability for Thylacine) inserted.** With Phase 9.7 closed (snapshots, rollback, clones, snap-view-mount end-to-end + R0-R168 audited) the COW substrate is complete; Thylacine's port of Stratum-as-OS-FS is on the near-term horizon (Thylacine is currently building MUSL + Linux compat layer). The existing Phase 10 (Hardening) is positioned as v2.0-release polish with a *statistical-absence-of-bugs* exit criterion ("1,000+ fuzzer-hours, zero new P0/P1/P2"). What Thylacine needs is a different gate: **workload-realism**. Random-op fuzzers + crash-injection (already in place via test_crash_inject) find one class of bug; running `git clone linux.git && make -j16` for a week finds another. Phase 9.9 lands the workload-realism gate so Thylacine can bet the OS on Stratum BEFORE the lock-free rearchitecture re-opens the soundness surface. Three sub-chunks: **9.9-WORKLOAD** (kernel-9P-mount + real workloads -- git checkout, kernel build, rsync, mailbench, xfstests against a real v9fs mount), **9.9-STRESS** (structured random-op fuzzer with invariant checks after every op -- allocator balance, Merkle chain decryptable, no leaked paddrs, sync gens monotonic, no AEAD-decrypt-fail -- plus targeted allocator-fragmentation scenarios), **9.9-LONGEVITY** (24h / 7d / 30d soak on GCP -- looks for slow leaks, gradual degradation, "weird congested states"). Phase 9.9 is positioned AFTER Phase 9.8 deliberately -- doing 9.8 first means we only have to certify the reliability surface ONCE, against the final lock-free shape, rather than twice. Phase 9.9 then feeds into Phase 10's broader pre-v2.0 polish. **GCP-first execution default**: Phase 9.9 by design runs on Google Cloud (`wired-epsilon-337013` / "Project Cora", europe-west4, see `memory/reference_gcp_compute.md`) rather than the macOS dev box for any test that needs more than a few GB of disk OR more than ~10 minutes of wall-clock -- local disk space is constrained, GCP is provisioned, spot pricing is ~$0.04/hour for e2-standard-4, and Phase 9.9 workloads (Linux kernel checkout = 4-6 GB, sustained stress soaks = unbounded disk) blow past the local box's headroom. Cheap-test rule: anything that fits in a normal ctest run stays local; anything that doesn't, goes to GCP via the established spot-VM + pd-balanced workflow. The full Phase 9.9 design will live at `docs/phase-9.9-design.md` when the phase is entered; this amendment is the queue-it-and-route-to-cloud commitment.
 
 ## 3. Principles that apply throughout
 
@@ -473,7 +473,7 @@ Status as of 2026-04-25 (post-R26 close, tip `a6249eb`).
 - [ ] **LRC vs RS performance**: LRC repair is 2-3× faster than RS for single-failure scenarios (per the LRC lead position). **Deferred** to post-v2.0 per §8.3 risk mitigation + §8.6 + §14.2 (LRC requires RS stable first).
 - [x] **Scrub detect + repair**: Scrub detects + repairs injected corruption. **Met** at P5-5-α (verify-only sweep) + P5-5-β (4-counter classification via caller-supplied verify-callback; CallbackSetExclusivity invariant) + P5-durable-cursors (state persists across mount via γ). Test stubs demonstrate detect + repair end-to-end. **Production-default cb** (bptr-aware, walks the replica list, rewrites the bad device, emits repair log) is the only remaining sub-aspect, deferred to P6 (§8.6 + §9.6) as documented carry-over.
 - [x] **Rebalance progress persistence**: Rebalance progress persists across restart. **Met** by P5-durable-cursors (γ for scrub) + the existing roster + alloc-tree format that already implicitly persists evacuation state (per `evac.tla` annotation: `device_state[d]` ↔ `ub_roster[d].state`; `replicas[b]` ↔ per-device alloc trees; both persisted on every commit).
-- [x] **quorum.tla**: `quorum.tla` proves commit-under-partial-failure semantics. **Met** at P5-0 (`v2/specs/quorum.tla`, 36839 distinct states at depth 35; `quorum_buggy.cfg` with `IdempotentRetry=FALSE, MaxRetries≥2` reproduces the R14 P1 content-divergence at the spec level).
+- [x] **quorum.tla**: `quorum.tla` proves commit-under-partial-failure semantics. **Met** at P5-0 (`specs/quorum.tla`, 36839 distinct states at depth 35; `quorum_buggy.cfg` with `IdempotentRetry=FALSE, MaxRetries>=2` reproduces the R14 P1 content-divergence at the spec level).
 
 ### 8.3 Risks
 
@@ -565,7 +565,7 @@ First-chunk recommendation is the P5 §9.6 carry-over
 "production-default scrub verify-callback (bptr-aware)" —
 establishes the bptr layer that all P6 work rests on while
 closing the last piece of P5 exit criterion #3. See
-`v2/docs/phase6-status.md` for the entry-point pickup guide.
+`docs/phase6-status.md` for the entry-point pickup guide.
 
 **Scope**: dataset hierarchy, properties + inheritance, snapshots via birth-txg (O(1)), clones, dead-list maintenance.
 
@@ -642,7 +642,7 @@ Phase 6 — no later phase has the ingredients to do so:
   covers reads via majority-quorum but the device isn't
   proactively brought current.
 
-These are tracked in `v2/docs/phase5-status.md`'s deferral
+These are tracked in `docs/phase5-status.md`'s deferral
 section and in `memory/project_v2_active.md`'s carry-over notes.
 
 ---
@@ -700,7 +700,7 @@ section and in `memory/project_v2_active.md`'s carry-over notes.
   impact at the chunking layer. Can be built in parallel with
   Phase 6 namespace work as P7 pre-work. The CAS tier's
   integration of the chunked output happens later, properly in
-  Phase 7. Tracked in `v2/docs/phase7-status.md`.
+  Phase 7. Tracked in `docs/phase7-status.md`.
 
 ---
 
@@ -942,7 +942,7 @@ This is a gating chunk for using Stratum as a **production backing store for a P
 
 - **P9.5-PARALLEL-2: Compound-op race-class audit + fixes** (R94 P2-1 doctrine carry):
   - CLAUDE.md stratumd row already calls this out: *"concurrent serving against one `stm_fs *` is the regime under which R94 P2-1 (h_reflink stat-after-mutation) and the same-shape patterns at h_lcreate / h_mkdir / h_renameat become observable. Reviewer of any concurrent-accept upgrade MUST address that whole stat-after-mutation class."*
-  - Audit every 9P handler in `v2/src/9p/server.c` (h_lcreate, h_mkdir, h_renameat, h_reflink, h_lcreate-style at /ctl/'s synfs, ...) for the shape `stm_fs_X() THEN stm_fs_getattr()` — the inter-call window is racy under concurrent accept.
+  - Audit every 9P handler in `src/9p/server.c` (h_lcreate, h_mkdir, h_renameat, h_reflink, h_lcreate-style at /ctl/'s synfs, ...) for the shape `stm_fs_X() THEN stm_fs_getattr()` -- the inter-call window is racy under concurrent accept.
   - Three remediation patterns:
     1. **Hoist into stm_fs**: add `stm_fs_X_with_stat(...)` that returns the post-mutation stat atomically under the same internal lock. Preferred where the API surface stays clean.
     2. **Local handler lock**: take the inode's per-inode lock (lands as part of P9.5-PARALLEL-3) across the compound at the 9P-handler layer.
@@ -1219,7 +1219,7 @@ Our 28-month target assumes: we're starting from a solid v1 foundation + formal 
 
 Stratum v2 is an 11-phase implementation journey from "design complete" to "v2.0 released":
 
-1. **Phase 0 (DONE)**: design documents — VISION, COMPARISON, NOVEL, ARCHITECTURE, ROADMAP-V2.
+1. **Phase 0 (DONE)**: design documents -- VISION, COMPARISON, NOVEL, ARCHITECTURE, ROADMAP.
 2. **Phases 1-11**: ~28 months to v2.0 release.
 3. **Post-v2.0**: kernel driver, learned tiering, zero-copy, Windows, more.
 
@@ -1245,6 +1245,6 @@ This document — along with VISION.md, COMPARISON.md, NOVEL.md, and ARCHITECTUR
 - [x] COMPARISON.md — feature matrix vs ZFS, btrfs, bcachefs, ext4, XFS.
 - [x] NOVEL.md — 10 lead positions with scope, done definition, dependencies, complexity, risk.
 - [x] ARCHITECTURE.md — 15 committed sections covering every subsystem.
-- [x] ROADMAP-V2.md — this document; phased implementation plan.
+- [x] ROADMAP.md -- this document; phased implementation plan.
 
 **Phase 0 is complete.** The design is done. Implementation begins when the team is ready.

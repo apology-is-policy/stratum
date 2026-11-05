@@ -4,7 +4,7 @@
  *
  * These are the same functions that each tool's standalone `main()`
  * delegates to. Exposing them as public symbols lets the swiss-army
- * `stratum` Rust binary (v2/tools/stratum/) dispatch subcommands
+ * `stratum` Rust binary (tools/stratum/) dispatch subcommands
  * by FFI-calling the right entry point — same code path, no fork/exec.
  *
  * Each function:

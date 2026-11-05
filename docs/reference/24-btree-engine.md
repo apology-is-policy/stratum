@@ -201,7 +201,7 @@ args or no durable root.
 
 ## Implementation
 
-`v2/src/btree_engine/` — five files:
+`src/btree_engine/` -- five files:
 
 | File | Holds |
 |---|---|

@@ -3,7 +3,7 @@
  * Bootstrap pool allocator (Phase 3 chunk 4a).
  *
  *   see ARCHITECTURE §6.5 (Bootstrap pool: no recursion)
- *   see v2/specs/allocator.tla (refcount + deferred-free spec)
+ *   see specs/allocator.tla (refcount + deferred-free spec)
  *
  *   Revised 9.6-impl-1a (2026-05-17): the bitmap quantum dropped from a
  *   128-KiB unit to a 16-KiB NODE (STM_BOOTSTRAP_NODE_BLOCKS), and the

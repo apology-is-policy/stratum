@@ -2,7 +2,7 @@
 /*
  * stm_btnode — leaf node encode/decode (Phase 3 chunk 5a).
  *
- *   see v2/include/stratum/btnode.h for the format spec.
+ *   see include/stratum/btnode.h for the format spec.
  *
  * The node is a `buf_size`-byte block (the node size; 9.6-impl-1b made
  * it a per-call parameter) with three regions:

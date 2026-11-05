@@ -129,7 +129,7 @@ Two friction points the shim absorbs:
 
 ## Build + integration
 
-`v2/tui/` is a standalone cargo crate. Its `build.rs` discovers the
+`tui/` is a standalone cargo crate. Its `build.rs` discovers the
 cmake build directory (via `STM_BUILD_DIR` env var or `../build` /
 `../../build` fallbacks) and emits `cargo:rustc-link-search` +
 `cargo:rustc-link-lib=static=stm_9p_client`.

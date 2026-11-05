@@ -187,7 +187,7 @@ stm_status stm_btree_mt_scan(stm_btree_mt *t,
 
 /*
  * Lock-free variant of the Bε-tree per ARCHITECTURE §3.4 and the design
- * notes in v2/docs/phase2-bw-tree-design.md. Reads and writes proceed
+ * notes in docs/phase2-bw-tree-design.md. Reads and writes proceed
  * without mutual exclusion: readers walk a CAS-built delta chain pinned
  * by an EBR epoch; writers CAS-prepend a delta record; any writer whose
  * prepend pushes the chain past a consolidation threshold attempts to

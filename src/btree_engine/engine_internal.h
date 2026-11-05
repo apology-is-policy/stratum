@@ -2,7 +2,7 @@
 /*
  * Private structures shared inside the btree_engine module — see
  * include/stratum/btree_engine.h for the public surface and
- * v2/docs/reference/24-btree-engine.md for the as-built reference.
+ * docs/reference/24-btree-engine.md for the as-built reference.
  *
  * Not exposed outside the module.
  */
@@ -41,7 +41,7 @@
  * value tag, 8 + key_len + 1 + value_len > ENG_MAX_ITEM_BYTES — is
  * stored out-of-line in a chain of spill blocks; the leaf entry holds a
  * fixed indirection record in place of the value. See
- * v2/docs/phase-9.6-impl-3-spill-design.md.
+ * docs/phase-9.6-impl-3-spill-design.md.
  *
  * Every engine leaf value is stored on disk as [tag : 1][payload]:
  *   ENG_VAL_INLINE  — payload is the value bytes verbatim.
@@ -108,7 +108,7 @@ typedef struct eng_node eng_node;
  * to the existing single-threaded descent.
  *
  * Spec composition: realizes the message-resolution side of
- * v2/specs/bepsilon.tla::PerKeyNewestWins (the reader sees the newest
+ * specs/bepsilon.tla::PerKeyNewestWins (the reader sees the newest
  * applicable message); `next` pointers stable for the EBR epoch
  * duration realizes concurrency_mvcc.tla::ReaderObservesCoherentTree.
  *
@@ -557,7 +557,7 @@ void                    paddr_vec_free(paddr_vec *v);
  * every superseded spill-chain block; `fresh` collects every paddr the
  * flush wrote — nodes and fresh spill-chain blocks alike.
  *
- * Models the in-flight `commit` record of v2/specs/btree.tla.
+ * Models the in-flight `commit` record of specs/btree.tla.
  */
 typedef struct {
     bool      active;          /* a flushed-but-unfinalized commit exists  */

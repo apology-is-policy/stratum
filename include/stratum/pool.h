@@ -4,7 +4,7 @@
  *
  *   see docs/ARCHITECTURE.md §4.3   — pool composition + device roster.
  *   see docs/ARCHITECTURE.md §5.13  — compact roster in uberblock.
- *   see v2/specs/quorum.tla         — multi-device commit model (P5-0).
+ *   see specs/quorum.tla         -- multi-device commit model (P5-0).
  *
  * `stm_pool` is the top-level handle for a Stratum pool. It aggregates
  * up to STM_POOL_DEVICES_MAX block devices plus pool-wide identity
@@ -251,7 +251,7 @@ void stm_pool_unlock_exclusive(stm_pool *p);
 /* Device lifecycle (Phase 5 chunk P5-4).                                     */
 /*                                                                             */
 /* See docs/ARCHITECTURE.md §4.7.1 (add), §4.7.2 (remove), §4.7.3 (replace). */
-/* Formal model: v2/specs/device_lifecycle.tla + evac.tla.                    */
+/* Formal model: specs/device_lifecycle.tla + evac.tla.                    */
 /*                                                                             */
 /* Serialization (P5-4b-ii-β, R16 F4 discharge): the per-pool rwlock above   */
 /* serializes mutators against concurrent sync_commit / reserve_mirror /    */
@@ -336,7 +336,7 @@ stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device);
  * block replicated on it is silently stripped from the pool's
  * replica set — violating evac.tla's NoTargetReplicasAfterComplete
  * and reproducing the bug demonstrated by
- * `v2/specs/evac_remove_no_drain_buggy.cfg`.
+ * `specs/evac_remove_no_drain_buggy.cfg`.
  *
  * Callers with an attached `stm_sync` MUST use
  * `stm_sync_remove_device` instead. That wrapper probes
@@ -386,7 +386,7 @@ stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
 /*
  * Begin evacuation of `device_id` (P5-4b-ii-α). Transitions the slot
  * from ONLINE/FAULTED to EVACUATING, clamped by two invariants from
- * v2/specs/evac.tla:
+ * specs/evac.tla:
  *
  *   * AtMostOneEvacuating — at most one slot is EVACUATING at a time.
  *     A second call while another slot is draining returns STM_EBUSY.

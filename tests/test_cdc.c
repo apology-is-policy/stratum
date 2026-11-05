@@ -2,8 +2,8 @@
 /*
  * FastCDC content-defined chunking tests.
  *
- *   see v2/include/stratum/cdc.h — public API.
- *   see v2/src/cdc/cdc.c — implementation.
+ *   see include/stratum/cdc.h -- public API.
+ *   see src/cdc/cdc.c -- implementation.
  *   see docs/NOVEL.md §3.3 — design intent.
  *
  * Coverage:

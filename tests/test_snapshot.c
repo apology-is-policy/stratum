@@ -2,9 +2,9 @@
 /*
  * Snapshot index tests.
  *
- *   see v2/include/stratum/snapshot.h — public API.
- *   see v2/src/snapshot/snapshot.c — implementation.
- *   see v2/specs/snapshot.tla — formal model.
+ *   see include/stratum/snapshot.h -- public API.
+ *   see src/snapshot/snapshot.c -- implementation.
+ *   see specs/snapshot.tla -- formal model.
  *
  * Coverage corresponds 1:1 to snapshot.tla's invariants and actions:
  *   - SnapIdMonotonic, BirthTxgMonotonic, ChainTxgOrdered, ChainAcyclic.

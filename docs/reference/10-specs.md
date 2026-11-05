@@ -204,7 +204,7 @@ Schema state machine (P4-4):
 - `RotationAtomic` — rotation never leaves a dataset with zero
   CURRENTs.
 
-TLY-A3-keyslot extension (`v2/docs/thylacine-keyslot-design.md` §8):
+TLY-A3-keyslot extension (`docs/thylacine-keyslot-design.md` section 8):
 - `WrapperConsistent` — a slot has a `wrapper_identity`
   (PASSPHRASE / JANUS / CORVUS) iff it is live. The non-perturbation
   result: adding the field + the mount state machine leaves the
@@ -729,7 +729,7 @@ every `UnmarkCompromised`/`Rollback` interleaving is the
 unmark-races-rollback proof. The marker is inert w.r.t. every pre-A5
 invariant (non-perturbation — `Mark`/`Unmark`/`Rollback` UNCHANGED
 every variable those invariants constrain). See
-`v2/docs/thylacine-a5-design.md` §10.
+`docs/thylacine-a5-design.md` section 10.
 
 Spec-to-code (forward reference): the C implementation of the
 snapshot index tree is **not yet in this commit**. Lands in a
@@ -1380,7 +1380,7 @@ Buggy variants (all fire as designed at fixed-config bounds):
   fires at the first observation that returns the wrong value.
 
 Spec-to-code: implementation lands at P9-9P-2 (per-connection
-namespace composition) — `v2/src/9p/server.c` adds:
+namespace composition) -- `src/9p/server.c` adds:
 
 - `struct stm_9p_server::bindings` — the per-connection bindings
   table (heap-grown linear array up to `STM_9P_MAX_BINDINGS = 128`).
@@ -1696,7 +1696,7 @@ Buggy variants:
 
 Spec-to-code mapping:
 
-- `consumer_loop` (`v2/src/cmd/stratumd/corvus_notify.c`) realises
+- `consumer_loop` (`src/cmd/stratumd/corvus_notify.c`) realises
   `ConsumerConnect` / `ConsumerSessionClosedMatch` / `NotifySocketEOF`
   / `ConsumerStrictEofEscalate` / `TolerantTimeoutElapse` /
   `ConsumerTolerantEscalate`.
@@ -1710,7 +1710,7 @@ Spec-to-code mapping:
 State-space estimate: small (under 10K reachable states); TLC check
 completes in seconds.
 
-Per the bilateral plan in `v2/docs/THYLACINE-V1-PLAN.md §3`, this is
+Per the bilateral plan in `docs/THYLACINE-V1-PLAN.md section 3`, this is
 a "soft spec-first" chunk — the spec landed alongside the impl
 rather than gating it. R138 audit verified the C impl honours the
 invariants by construction; the formal TLC verification is
@@ -1759,7 +1759,7 @@ Buggy variants:
 
 Spec-to-code mapping (impl phase — TLY-A2-impl-1..5):
 
-- `stratumd_check_tattach` (`v2/src/cmd/stratumd/serve.c`) realises
+- `stratumd_check_tattach` (`src/cmd/stratumd/serve.c`) realises
   `AttachGood`'s coord-side check (TLY-A2-impl-1, shipped at
   `ad55173`). `stm_ds_policy_admits` (`dataset_pattern.c`) realises
   `CoordAdmitsDataset(c, ds)`.
@@ -1780,7 +1780,7 @@ configs fire within tens. TLC verify tooling-gated (folds into
 ### `btree.tla` — incremental copy-on-write B+tree engine (Phase 9.6 entry)
 
 Spec-first scaffold for the Phase 9.6 metadata tree engine
-(`v2/docs/phase-9.6-metadata-tree-engine-design.md`). Models the
+(`docs/phase-9.6-metadata-tree-engine-design.md`). Models the
 incremental copy-on-write commit of the on-disk B+tree: a mutation COWs
 only the dirty root-to-leaf path, unchanged subtrees are shared, the
 new root is published atomically at the final phase, the replaced
@@ -1840,7 +1840,7 @@ again.
 
 ```bash
 export PATH="/opt/homebrew/opt/openjdk/bin:$PATH"     # macOS brew path
-cd v2/specs
+cd specs
 
 # Single spec:
 java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
@@ -1904,8 +1904,8 @@ for cfg in inode_reuse_no_gen_bump_buggy inode_double_allocate_buggy; do
 done
 ```
 
-CI runs TLC per spec on every PR touching `v2/specs/` or `v2/src/`.
-See `v2/ci/github-actions.yml`.
+CI runs TLC per spec on every PR touching `specs/` or `src/`.
+See `ci/github-actions.yml`.
 
 ## Adding a new spec
 

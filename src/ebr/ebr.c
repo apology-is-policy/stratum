@@ -2,7 +2,7 @@
 /*
  * Epoch-based reclamation.
  *
- * Design (from ARCHITECTURE §3.6, refined by v2/specs/concurrency.tla):
+ * Design (from ARCHITECTURE section 3.6, refined by specs/concurrency.tla):
  *
  *   global.current_epoch        atomic uint64, starts at 1
  *   global.threads              atomic head of thread_state linked list
@@ -18,7 +18,7 @@
  *   retired_object.next         next in the Treiber stack.
  *
  * Invariants (exercised by tests/test_ebr.c; proved at small scope by
- * v2/specs/concurrency.tla):
+ * specs/concurrency.tla):
  *
  *   (A) A thread inside its enter/exit window has local_epoch >= some past
  *       global_epoch. It observes a state no older than its snapshot.

@@ -3,7 +3,7 @@
  * Stratum v2 — inode index implementation
  * (9.7-impl-1c-ii: per-dataset metadata-tree engines).
  *
- * Spec: v2/specs/inode.tla.
+ * Spec: specs/inode.tla.
  *
  * 9.7-impl-1c-ii — the inode cutover. The module no longer owns its own
  * btree_engine. Each dataset's inode records live in that dataset's

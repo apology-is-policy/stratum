@@ -2,7 +2,7 @@
 \* Stratum v2 — RC-3: write-path key liveness across the unlocked window
 \* (the one genuinely NEW synchronization obligation RC-3 introduces).
 \*
-\* RC arc scripture: `v2/docs/rc-design.md` "RC-3". Companion to
+\* RC arc scripture: `docs/rc-design.md` "RC-3". Companion to
 \* dek_guard.tla (RC-2's map-snapshot guard — a different hazard: THAT
 \* module protects the reader's view of the in-RAM DEK map; THIS one
 \* protects the writer's claim on the DURABLE keyschema entry).

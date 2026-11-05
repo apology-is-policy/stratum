@@ -274,8 +274,8 @@ P9-SLATE-8   no-arg invocation mode (spawn child + run tty +
 ```
 
 P9-TUI-2a (the lifted v1 monolith) stays in tree as
-`v2/tui/` until slate reaches feature parity, then archived as
-`v2/tui-monolith/` for reference.
+`tui/` until slate reaches feature parity, then archived as
+`tui-monolith/` for reference.
 
 ## 9. Forward-notes for Halcyon
 
@@ -307,7 +307,7 @@ their medium.
 
 ## 11. SPEC-TO-CODE mapping
 
-When P9-SLATE-1 lands, `v2/specs/slate.tla` will model the version-
+When P9-SLATE-1 lands, `specs/slate.tla` will model the version-
 bump invariant, the dialog stack, and the event-FIFO ordering.
 v1.0 of the spec is small (~100 lines TLA+) but pins the invariants
 that matter:
@@ -525,23 +525,23 @@ Three deployment modes the same binary supports:
 1. Refactor each cmd binary's `main()` into a public C entry point
    `stm_<name>_run_main(int argc, char **argv)` with the existing
    `main()` as a thin wrapper. Touched files:
-   `v2/src/cmd/stratumd/main.c`, `v2/src/cmd/stratum-slate/main.c`,
-   `v2/src/cmd/stratum-mkfs/main.c`, `v2/src/cmd/stratum-fs/main.c`.
-2. Expose the entry points in a new header `v2/include/stratum/cmds.h`.
-3. New Rust crate `v2/tools/stratum/`. `build.rs` enumerates every
-   `.a` file under `v2/build/src/**/lib*.a` and emits link directives.
+   `src/cmd/stratumd/main.c`, `src/cmd/stratum-slate/main.c`,
+   `src/cmd/stratum-mkfs/main.c`, `src/cmd/stratum-fs/main.c`.
+2. Expose the entry points in a new header `include/stratum/cmds.h`.
+3. New Rust crate `tools/stratum/`. `build.rs` enumerates every
+   `.a` file under `build/src/**/lib*.a` and emits link directives.
 4. `src/main.rs` dispatches subcommands. For `serve` / `slate` / `mkfs` /
    `fs`, FFI-call the C entry points. For `tui`, run the renderer
    in pure Rust.
 5. `src/embed.rs` — auto-spawn mode: pthread-spawn stratumd + slate,
    wait for sockets, dial, attach, run TUI; clean teardown on exit.
 6. `src/landing.rs` — Veracrypt-shaped no-arg landing screen.
-7. Lift the FAR-Commander chrome from `v2/tools/stratum-slate-tty/`.
+7. Lift the FAR-Commander chrome from `tools/stratum-slate-tty/`.
 8. Verify end-to-end on Mac (Linux deferred to chunk N if it
    regresses on the platform-specific bits — but no portability
    concerns are anticipated).
 
-`v2/tools/stratum-slate-tty/` becomes redundant once `stratum tui`
+`tools/stratum-slate-tty/` becomes redundant once `stratum tui`
 ships with the same chrome; keep it in tree until SWISS-1 is GREEN,
 then archive or delete.
 
@@ -623,11 +623,11 @@ Per user clarification 2026-05-07:
 
 Estimated 800-1500 LOC of TUI input dialog + spawn lifecycle +
 TUI's per-panel-backend-kind tracking + audit (R129). Lifts
-v1's `draw_input_dialog` from `v2/tui/src/ui.rs:371`.
+v1's `draw_input_dialog` from `tui/src/ui.rs:371`.
 
 **SWISS-4c — Mkfs wizard (Shift+F7 = MkVol).**
 
-Lifts v1's `draw_mkvol_dialog` from `v2/tui/src/ui.rs:705`. A
+Lifts v1's `draw_mkvol_dialog` from `tui/src/ui.rs:705`. A
 multi-field dialog (Name, Size with K/M/G, Encryption on/off,
 Passphrase, Compression algo lz4/zstd/none) + OK/Cancel buttons.
 On OK, TUI spawns `stratum mkfs PATH --size SIZE [--keyfile ...]`
@@ -645,7 +645,7 @@ extension + audit (R130).
 **SWISS-4d — Copy operation (F5).**
 
 The headline feature. Lifts v1's `draw_copy_dialog` from
-`v2/tui/src/ui.rs:405` (filename + progress bar + throughput
+`tui/src/ui.rs:405` (filename + progress bar + throughput
 sparkline + ETA — the visual that sells the "watch your bytes
 move" experience).
 
@@ -655,7 +655,7 @@ all. Otherwise copies just the cursor entry.
 
 Conflict resolution: if any destination file already exists,
 shows v1's `draw_conflict_dialog` (Skip / Overwrite / KeepBoth +
-Apply-to-all-remaining) — lift from `v2/tui/src/ui.rs:865`.
+Apply-to-all-remaining) -- lift from `tui/src/ui.rs:865`.
 
 Routes:
 - **host → stm**: Tread from host-fs (active panel's backend) +
@@ -668,7 +668,7 @@ Routes:
 
 Each in-flight chunk reports throughput to the dialog
 (samples ringbuffer); chart renders last 60 samples as the
-v2/tui sparkline. ESC cancels (best-effort SIGTERM the
+tui sparkline. ESC cancels (best-effort SIGTERM the
 in-flight Twrite + leave partials in place; same as v1).
 
 Estimated 1500-2500 LOC of TUI + audit (R131). The biggest
@@ -716,7 +716,7 @@ Rust visualization + e2e test + audit. Per user policy
 
 The single binary is `stratum`. The umbrella library that already
 aggregates everything (`add_library(stratum INTERFACE)` in
-`v2/CMakeLists.txt`) gives the binary its name. The user-facing
+`CMakeLists.txt`) gives the binary its name. The user-facing
 brand: "Stratum is the filesystem you can see — every COW, every
 snapshot, every byte of ciphertext, every Merkle root, made
 legible." The visualizations (§12.5) are the proof.

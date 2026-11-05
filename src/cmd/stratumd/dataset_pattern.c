@@ -4,7 +4,7 @@
  * semantics + trust boundaries.
  *
  * TLY-A2 — Thylacine multi-stratumd-per-pool. Composes against
- * `v2/specs/multi_stratumd.tla`'s `ClientAdmitsDataset` /
+ * `specs/multi_stratumd.tla`'s `ClientAdmitsDataset` /
  * `CoordAdmitsDataset` actions.
  */
 

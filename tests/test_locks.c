@@ -2,7 +2,7 @@
 /*
  * test_locks.c — P8-POSIX-7d advisory lock table.
  *
- * Exercises the per-inode advisory lock table per `v2/specs/locks.tla`.
+ * Exercises the per-inode advisory lock table per `specs/locks.tla`.
  *
  *   - Lifecycle (create / close).
  *   - Acquire / Release / Test / ReleaseOwner basic paths.

@@ -4,7 +4,7 @@
  * cross-subsystem race surface under the P9.5-PARALLEL-1 concurrent
  * /ctl/ regime (P9.5-PARALLEL-2 / task #968).
  *
- * Composes against v2/specs/compound_ops.tla. The spec captures:
+ * Composes against specs/compound_ops.tla. The spec captures:
  *   - per-subsystem reads are linearizable;
  *   - compound ops are atomic with respect to other writers (big-fs-lock);
  *   - counters never go negative under valid step ordering;
@@ -1730,7 +1730,7 @@ STM_TEST(impl6_read_write_same_inode_buffered) {
  * tests assert: no deadlock; no STM_ECORRUPT from the reader; no torn
  * decode; writer completes its iteration count cleanly.
  *
- * Composes against v2/specs/concurrency_mvcc.tla:
+ * Composes against specs/concurrency_mvcc.tla:
  *   - ReaderObservesCoherentTree: any mvcc_root the reader picks up
  *     yields a consistent decode of every node it traverses.
  *   - RootAlwaysReachable: writer's commit-time atomic publish never

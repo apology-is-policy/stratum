@@ -3,7 +3,7 @@
  * Block allocator — public API (chunk 4b).
  *
  *   see ARCHITECTURE §6 (Allocator model)
- *   see v2/specs/allocator.tla (refcount + deferred-free)
+ *   see specs/allocator.tla (refcount + deferred-free)
  *
  * The allocator has two storage regions on each device:
  *

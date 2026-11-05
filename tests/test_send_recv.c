@@ -2,7 +2,7 @@
 /*
  * Send / receive tests (Phase 7 P7-7).
  *
- *   see v2/include/stratum/send_recv.h — surface tested here.
+ *   see include/stratum/send_recv.h -- surface tested here.
  *
  * Coverage:
  *   - send_init/close arg validation.

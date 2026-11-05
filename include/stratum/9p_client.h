@@ -34,7 +34,7 @@
  *
  * Deferred to subsequent chunks:
  *   - Tlink (hard link). Server-side h_link is not yet wired in
- *     v2/src/9p/server.c (dispatcher returns ENOSYS); the client
+ *     src/9p/server.c (dispatcher returns ENOSYS); the client
  *     primitive will land alongside the server handler in a follow-on
  *     chunk (P9-LIB-1e or whichever ships first).
  *   - Async API (P9-LIB-2): pipelined Txx with reply matching by tag,
@@ -50,14 +50,14 @@
  *     <stratum/9p.h>; this header re-uses them rather than redefining.
  *   - The wire framing (4-byte LE size header + body) matches
  *     stratumd's `stm_stratumd_serve_client` exactly — see
- *     `v2/src/cmd/stratumd/serve.c`.
+ *     `src/cmd/stratumd/serve.c`.
  *
  * Concurrency:
  *   - One stm_9p_client = one connection = one fid namespace. Not
  *     thread-safe across concurrent calls on the same client.
  *     Callers wanting concurrent ops open multiple clients.
  *
- * Trust boundaries (audit posture for `v2/src/9p_client/`):
+ * Trust boundaries (audit posture for `src/9p_client/`):
  *   1. Wire framing: every Rread reply must be bound-checked against
  *      the negotiated msize before parsing; out-of-range size
  *      disconnects (Rerror at the lib boundary, not silent corruption).

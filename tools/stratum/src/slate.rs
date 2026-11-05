@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::ffi;
 
 /// Slate's per-instance session table is keyed by fid alone (see
-/// v2/src/slate/slate.c::session_get_locked). When two concurrent
+/// src/slate/slate.c::session_get_locked). When two concurrent
 /// connections both use fid 101, slate's session_get_locked returns
 /// the first match — usually the wrong session for the asking
 /// connection. To dodge the collision, every `SlateClient` gets a

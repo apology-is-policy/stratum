@@ -46,7 +46,7 @@
  *      ctl_destroy → scrub_close → fs_unmount). The unmount flushes
  *      in-flight writes (R128 P1-1 + R130 wiring); fs_unmount's
  *      stm_sync_close zeroes DEKs. This composes against the soft
- *      spec at `v2/specs/eviction.tla`.
+ *      spec at `specs/eviction.tla`.
  *   5. Strict-vs-tolerant mode. Strict: any notify-socket EOF →
  *      immediate stop_flag set + STM_ECORVUSGONE-flagged exit.
  *      Tolerant: EOF starts a `notify_timeout_ms` window; if a fresh

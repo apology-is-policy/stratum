@@ -2,9 +2,9 @@
 /*
  * Scrub tests (Phase 5 chunks P5-5-α + P5-5-β).
  *
- *   see v2/include/stratum/scrub.h — surface tested here.
- *   see v2/specs/scrub.tla         — state-machine invariants.
- *   see v2/docs/phase5-status.md   — P5-5 scope.
+ *   see include/stratum/scrub.h -- surface tested here.
+ *   see specs/scrub.tla         -- state-machine invariants.
+ *   see docs/phase5-status.md   -- P5-5 scope.
  *
  * Coverage:
  *   - Initial state is IDLE with zero counters.

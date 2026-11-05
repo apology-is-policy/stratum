@@ -1,9 +1,9 @@
 //! FFI bindings — libstratum-9p client + cmd run-main entry points.
 //!
 //! Two extern blocks:
-//!   1. The 9P2000.L client surface (mirrors v2/include/stratum/9p_client.h).
+//!   1. The 9P2000.L client surface (mirrors include/stratum/9p_client.h).
 //!      Used by src/slate.rs to dial slate / stratumd over Unix sockets.
-//!   2. The cmd run-main entry points (declared in v2/include/stratum/cmds.h).
+//!   2. The cmd run-main entry points (declared in include/stratum/cmds.h).
 //!      Used by src/main.rs to dispatch subcommands to the same code
 //!      paths the standalone C binaries use.
 
@@ -116,7 +116,7 @@ extern "C" {
 /// Treaddir per-entry callback. Return STM_OK to continue, anything
 /// else to stop iteration (status propagates as readdir's return value).
 /// `name` is NUL-terminated and lives only for the cb's duration —
-/// copy out before returning. See `v2/include/stratum/9p_client.h:507`.
+/// copy out before returning. See `include/stratum/9p_client.h:507`.
 pub type stm_9p_dirent_cb = unsafe extern "C" fn(
     qid: *const stm_9p_qid,
     cookie: u64,
@@ -126,7 +126,7 @@ pub type stm_9p_dirent_cb = unsafe extern "C" fn(
     ctx: *mut c_void,
 ) -> stm_status;
 
-// ── cmd run-main entry points (from v2/include/stratum/cmds.h) ────────
+// -- cmd run-main entry points (from include/stratum/cmds.h) --------
 
 extern "C" {
     pub fn stm_cmd_stratumd_main(argc: c_int, argv: *const *const c_char) -> c_int;

@@ -3,7 +3,7 @@
  * Stratum v2 — xattr index implementation
  * (P8-POSIX-6 + 9.6-impl-4c + 9.7-impl-1c-iv).
  *
- * Spec: v2/specs/xattr.tla. Models open-addressing chain integrity
+ * Spec: specs/xattr.tla. Models open-addressing chain integrity
  * for extended attributes keyed by `(dataset_id, ino, hash_probe)`
  * where `hash_probe = fnv1a64(name) + probe_offset`. Per ARCH §11.5.
  *

@@ -60,9 +60,9 @@ the store. The dirent module is now a lightweight chain walker over
 the resolved engine; it keeps only a borrowed `ds_idx` pointer + the
 serialization mutex.
 
-Header: `v2/include/stratum/dirent.h`.
-Impl: `v2/src/dirent/dirent.c`.
-Spec: `v2/specs/dirent.tla`.
+Header: `include/stratum/dirent.h`.
+Impl: `src/dirent/dirent.c`.
+Spec: `specs/dirent.tla`.
 
 ## Public API
 
@@ -283,7 +283,7 @@ takes its own lock only.
 
 ## Spec cross-reference
 
-`v2/specs/dirent.tla` pins the chain-integrity invariants:
+`specs/dirent.tla` pins the chain-integrity invariants:
 
 - **`Reachable`** — every live name is reachable via probe-from-0.
 - **`NoColliderShadowing`** — TOMBSTONE preserves reachability of
@@ -303,7 +303,7 @@ LookupStopsOnTombstone). Each trips its targeted invariant.
 
 | Spec action | Impl function | File |
 |---|---|---|
-| `Create` | `stm_dirent_alloc` | `v2/src/dirent/dirent.c` |
+| `Create` | `stm_dirent_alloc` | `src/dirent/dirent.c` |
 | `Unlink` | `stm_dirent_unlink` | same |
 | `Swap` | `stm_dirent_swap_two` | same |
 | `SwapFail` | `stm_dirent_swap_two`'s failed-put path (`*out_torn`) | same |

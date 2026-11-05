@@ -2,8 +2,8 @@
 /*
  * Multi-device commit + quorum tests (Phase 5 chunk P5-2).
  *
- *   see v2/specs/quorum.tla             — formal spec.
- *   see v2/docs/ARCHITECTURE.md §5.5-§5.8 — quorum semantics.
+ *   see specs/quorum.tla             -- formal spec.
+ *   see docs/ARCHITECTURE.md section 5.5-section 5.8 -- quorum semantics.
  *
  * Each test constructs an N=3 pool (three tmp files backing three
  * stm_bdevs), drives the sync-layer 2-phase commit protocol across
@@ -1764,7 +1764,7 @@ STM_TEST(sync_multi_add_device_mid_session_survives_remount) {
  * detaches the alloc handle. The pool continues as a 2-live-device
  * mirror(2) with data readable via (dev_0, dev_2).
  *
- * Exercises EvacuateAtomic from v2/specs/evac.tla: each step is an
+ * Exercises EvacuateAtomic from specs/evac.tla: each step is an
  * atomic remove-d + add-s transition on replicas[b]. Dev 0 is the
  * metadata primary and can't be evacuated per R17 P1-1 (device-0
  * guard in pool.c) — this test picks dev 1 as target, dev 2 as

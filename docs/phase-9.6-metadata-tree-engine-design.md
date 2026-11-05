@@ -15,7 +15,7 @@ layer — are **deferred to Phase 9.8** (§5): finished and plugged into
 the live path, deliberately, against a working COW engine. This phase
 delivers the foundation they layer onto.
 
-Companion: `docs/ROADMAP-V2.md` (Phase 9.7 amendment), the Phase 9.7
+Companion: `docs/ROADMAP.md` (Phase 9.7 amendment), the Phase 9.7
 design doc (to follow). Investigation of record: two background agent
 sweeps + direct reads of `btree.h`, `btnode.h`, `btree.c`,
 `btree_store.h`, `serialize.c`, `inode.c`.
@@ -27,7 +27,7 @@ sweeps + direct reads of `btree.h`, `btnode.h`, `btree.c`,
 ### 1.1 The finding
 
 Scoping Phase 9.7 surfaced that v2 has **no incremental copy-on-write
-for metadata.** The persistence layer (`v2/src/btree_store/`) is — in
+for metadata.** The persistence layer (`src/btree_store/`) is -- in
 its own header's words — a *"chunk 5c MVP"* from Phase 3. Confirmed in
 source:
 
@@ -322,7 +322,7 @@ applies. Phase 9.6's spec chunk writes `btree.tla` modelling:
 - The Merkle chain over a partially-shared tree (some subtrees COWed,
   some carried forward).
 
-As built (`v2/specs/btree.tla`, TLC-verified green 2026-05-17): three
+As built (`specs/btree.tla`, TLC-verified green 2026-05-17): three
 invariants — `DurableTreeWellFormed` (the durable tree is structurally
 complete; subsumes the original `MultiLevelLookupSound` plus
 crash-revert correctness), `CommittedTreeMerkleConsistent`,

@@ -5,7 +5,7 @@ Spec-first chunk; the implementation is gated on a small extension of
 `key_schema.tla` (TLY-A3-keyslot-spec).
 
 Bilateral context: `STRATUM-API-V1.md §5` (the corvus UNWRAP ask).
-The codec + transport are already LIVE — `v2/src/corvus_client/`,
+The codec + transport are already LIVE -- `src/corvus_client/`,
 TLY-A3-impl-1 (`1eb7480`) + impl-2 (`58a7253`) + R144 close
 (`b948cf8`). This chunk wires the UNWRAP into the mount path.
 
@@ -27,8 +27,8 @@ resolves.
 
 ## 2. Decision: reuse the existing pool-global `keyschema` module
 
-The `keyschema` module (`v2/include/stratum/keyschema.h`,
-`v2/specs/key_schema.tla`, Phase 4 chunk P4-4a) is **already** the
+The `keyschema` module (`include/stratum/keyschema.h`,
+`specs/key_schema.tla`, Phase 4 chunk P4-4a) is **already** the
 keyslot table this ask needs:
 
 | Need (from the corvus ask) | keyschema today |

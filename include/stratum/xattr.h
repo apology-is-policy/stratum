@@ -9,7 +9,7 @@
  * via open-addressing per ARCH §11.5.1.
  *
  * Spec-to-code: this file realizes the xattr state machine modeled in
- * `v2/specs/xattr.tla` (which is structurally isomorphic to dirent.tla's
+ * `specs/xattr.tla` (which is structurally isomorphic to dirent.tla's
  * write-side — only the keyed-on entity differs: ino instead of
  * dir_ino). Each new public action below maps to a TLA+ action of the
  * same name. The three buggy variants in the spec enumerate the

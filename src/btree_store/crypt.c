@@ -3,7 +3,7 @@
  * Metadata-node AEAD wrapper (Phase 4 chunk P4-3b).
  *
  *   see include/stratum/btree_store.h for the public surface.
- *   see v2/docs/phase4-status.md §"P4-3b" for the design doc.
+ *   see docs/phase4-status.md section "P4-3b" for the design doc.
  *
  * What this module does:
  *   - Encrypts every btnode image in place under AEGIS-256 using a

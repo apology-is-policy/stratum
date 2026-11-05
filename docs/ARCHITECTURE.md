@@ -31,7 +31,7 @@ Source-of-truth design document for Stratum v2. Translates the properties in `VI
 - **COMPARISON.md** — positioning vs ZFS, btrfs, bcachefs.
 - **NOVEL.md** — per-angle scope and sequencing for the 10 lead positions.
 - **ARCHITECTURE.md** (this document) — concrete design decisions.
-- **ROADMAP-V2.md** (after architecture) — phased implementation plan.
+- **ROADMAP.md** (after architecture) -- phased implementation plan.
 
 ### 1.3 Change management
 

@@ -2,11 +2,11 @@
 /*
  * Lock-free Bw-tree — Phase 2, tasks #171, #172, #176.
  *
- * See ARCHITECTURE §3.4, v2/docs/phase2-bw-tree-design.md, and
- * v2/docs/phase2-status.md for the model. This TU implements the
+ * See ARCHITECTURE section 3.4, docs/phase2-bw-tree-design.md, and
+ * docs/phase2-status.md for the model. This TU implements the
  * internal-routing variant: a balanced B+tree where the root is a
  * BASE_INTERNAL delta holding a pivot array routing to leaf children.
- * Task #176 (this extension) is spec-led by v2/specs/balanced.tla,
+ * Task #176 (this extension) is spec-led by specs/balanced.tla,
  * which proves LookupCorrectness across the three-step leaf-split
  * protocol (InstallSibling + PostSplit + UpdateParent).
  *
@@ -171,7 +171,7 @@ typedef enum {
      * reabsorbed into forward_id. Readers arriving here follow the
      * forward; writers retraverse from root. Once installed, the SEAL
      * head is never replaced — the slot becomes permanently forwarded.
-     * Spec: v2/specs/merge.tla. */
+     * Spec: specs/merge.tla. */
     STM_BT_LF_DELTA_SEALED        = 6,
 } stm_bt_lf_delta_kind;
 

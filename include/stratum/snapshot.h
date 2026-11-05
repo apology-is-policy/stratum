@@ -5,8 +5,8 @@
  *   see docs/ARCHITECTURE.md §8.5 — snapshot mechanics.
  *   see docs/ARCHITECTURE.md §8.5.2 — snapshot index entry layout.
  *   see docs/ARCHITECTURE.md §8.5.6 — snapshot holds.
- *   see v2/specs/snapshot.tla — formal model of lifecycle invariants.
- *   see docs/ROADMAP-V2.md §9.1 — Phase 6 snapshot deliverable.
+ *   see specs/snapshot.tla -- formal model of lifecycle invariants.
+ *   see docs/ROADMAP.md section 9.1 -- Phase 6 snapshot deliverable.
  *
  * Snapshots are frozen-in-time references to a dataset's tree root.
  * Each snapshot has a unique (dataset_id, snapshot_id) pair, a name,

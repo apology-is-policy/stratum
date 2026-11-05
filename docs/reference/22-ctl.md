@@ -20,9 +20,9 @@ Architecture: `stm_ctl` is a **backend for the generic
 libstratum-9p (.L-only) can dial /ctl/ end-to-end without a dialect
 bridge.
 
-Header: `v2/include/stratum/ctl.h` (366 lines).
-Impl: `v2/src/ctl/synfs.c` (3661 lines).
-Spec: `v2/specs/ctl_conn.tla`.
+Header: `include/stratum/ctl.h` (366 lines).
+Impl: `src/ctl/synfs.c` (3661 lines).
+Spec: `specs/ctl_conn.tla`.
 
 ## Kind table
 
@@ -453,7 +453,7 @@ the saturation guard is the unique source of `event_gen` mutation.
 
 ## Spec cross-reference
 
-`v2/specs/ctl_conn.tla` pins the PARALLEL-1 isolation contract:
+`specs/ctl_conn.tla` pins the PARALLEL-1 isolation contract:
 
 - **`CallerScopedPerConn`** — every admin check reads the conn's
   immutable `caller_uid`, NEVER a shared field. A buggy variant that
@@ -474,7 +474,7 @@ Three buggy configs (`ctl_conn_shared_caller_buggy.cfg`,
 
 | Spec action | Impl function | File |
 |---|---|---|
-| `ConnCreate` | `stm_ctl_conn_create` | `v2/src/ctl/synfs.c` |
+| `ConnCreate` | `stm_ctl_conn_create` | `src/ctl/synfs.c` |
 | `ConnDestroy` | `stm_ctl_conn_destroy` | same |
 | `Lopen` (admin gate at fid open) | `vops_lopen` | same |
 | `Read` (snapshot capture for /events) | `vops_read` | same |
@@ -502,7 +502,7 @@ Three buggy configs (`ctl_conn_shared_caller_buggy.cfg`,
   `provision_via_ctl` (TLY-A5b #826c: SYSTEM provisions a user's
   encrypted home -- create + corvus WRAP + root-init 0700 + commit;
   non-SYSTEM EACCES; truncated payload EINVAL; idempotent EEXIST->OK).
-- `v2/tools/stratum/tests/concurrent_ctl.rs` — e2e Rust harness
+- `tools/stratum/tests/concurrent_ctl.rs` -- e2e Rust harness
   driving 2-way + 3-way concurrent libstratum-9p clients;
   wall-time-bounds the concurrent-accept payoff.
 

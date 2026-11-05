@@ -4,7 +4,7 @@
  * pattern matcher.
  *
  * Covers the glob semantics from
- * v2/docs/thylacine-multi-stratumd-design.md §7 + the policy-table
+ * docs/thylacine-multi-stratumd-design.md section 7 + the policy-table
  * parsing surface from `dataset_pattern.h`.
  */
 

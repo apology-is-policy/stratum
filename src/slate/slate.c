@@ -5,7 +5,7 @@
  * P9-SLATE-1 scope: /version /status /event /redraw /log/{tail,append}.
  * P9-SLATE-2 scope: + /connection/{socket,connected,attach}
  *                   + /panels/{left,right}/{path,entries} (read-only).
- * Compose against v2/specs/slate.tla (VersionMonotonic + EventFIFO +
+ * Compose against specs/slate.tla (VersionMonotonic + EventFIFO +
  * ReadConsistent + DispatchProgress + ConnectionAtomic +
  * PanelPathConsistent).
  *

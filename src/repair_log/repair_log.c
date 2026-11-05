@@ -4,7 +4,7 @@
  *
  *   see include/stratum/repair_log.h for the public surface.
  *   see ARCHITECTURE §7.15.4 for the design intent.
- *   see v2/specs/bptr.tla `LogIntegrity` for the formal invariant.
+ *   see specs/bptr.tla `LogIntegrity` for the formal invariant.
  *
  * Single-leaf MVP modeled on stm_keyschema:
  *   - Plaintext + Merkle-covered btnode (the trailing 32 bytes

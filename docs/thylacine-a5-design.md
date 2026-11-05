@@ -19,7 +19,7 @@ trees keyed by `(dataset_id, …)`; the dataset descriptor has no
 `di_tree_root`; a v2 snapshot records `extent_txg` (a generation
 number) with `tree_root_paddr = 0` and roots no recoverable tree. Real
 per-dataset rollback needs a foundational re-architecture — **Phase
-9.7** (`docs/ROADMAP-V2.md`, amendment 2026-05-15), scheduled
+9.7** (`docs/ROADMAP.md`, amendment 2026-05-15), scheduled
 post-Thylacine.
 
 **A5 therefore ships marker-first** (user decision 2026-05-15): the

@@ -36,15 +36,15 @@ into the CAS tier (which DOES need P6) is a separate concern.
   per NOVEL #3, average chunk size ≈ target, min/max bounded).
   A cdc.tla spec could pin the shift-resistant property if
   desired; lower priority than other P6 specs.
-- **Impl**: `v2/src/cdc/cdc.{h,c}` — FastCDC implementation per
+- **Impl**: `src/cdc/cdc.{h,c}` -- FastCDC implementation per
   the canonical Yu/Yi/Zhang algorithm with Gear hashing. Configurable
   avg / min / max chunk size. NOVEL #3 mentions 8 MiB average as
   the default target.
-- **Tests**: `v2/tests/test_cdc.c` — determinism (same input →
+- **Tests**: `tests/test_cdc.c` -- determinism (same input ->
   same boundaries); shift-resistance (insert N bytes at start,
   verify > (1 - small_fraction) of post-shift chunk boundaries
   match the original); chunk-size distribution within bounds.
-- **Reference doc**: new `v2/docs/reference/12-cdc.md` (numbering
+- **Reference doc**: new `docs/reference/12-cdc.md` (numbering
   TBD depending on what Phase 6 adds first).
 
 ### NOT in scope for pre-work
@@ -57,7 +57,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-VAL-4 migration-policy heuristic bench + empirical
-      validation** — landed `v2/bench/bench_migrate_policy.c` (and
+      validation** -- landed `bench/bench_migrate_policy.c` (and
       matching CMake target with the standard Linux ld static-library
       cycle gating) for the ROADMAP §10.2 exit criterion 2
       ("Migration policy heuristic produces reasonable hot/cold
@@ -101,7 +101,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
       R-round needed. test_send_recv 37 → 40.
 
 - [x] **P7-VAL-2 reflink complexity benchmark + empirical validation**
-      — landed `v2/bench/bench_reflink_complexity.c` (and matching
+      -- landed `bench/bench_reflink_complexity.c` (and matching
       CMake target with the standard Linux ld static-library cycle
       gating) for the ROADMAP §10.2 exit criterion 4 ("Reflink is
       O(extent count) not O(data size)"). Two-axis sweep:
@@ -123,8 +123,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
       following up — flagged in the P7-VAL-2 artifact + memory.
 
 - [x] **P7-VAL-1 dedup ratio benchmark + sweep harness +
-      empirical validation** — landed `v2/bench/bench_dedup.c` +
-      `v2/bench/run_dedup.sh` for the ROADMAP §10.2 exit criterion
+      empirical validation** -- landed `bench/bench_dedup.c` +
+      `bench/run_dedup.sh` for the ROADMAP section 10.2 exit criterion
       1 ("Cold-tier dedup achieves target 3-5× on VM-image test
       set"). Generates a deterministic synthetic VM-image corpus
       (shared `base` byte stream + N files each derived by

@@ -4,8 +4,8 @@ A practical guide for OS authors adopting Stratum as the first-class root filesy
 
 This document is the integration manual. It assumes you've read:
 
-- [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) — design intent, including unimplemented work.
-- [`docs/ROADMAP-V2.md`](../../docs/ROADMAP-V2.md) — phased plan; what's shipped vs queued.
+- [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) -- design intent, including unimplemented work.
+- [`docs/ROADMAP.md`](ROADMAP.md) -- phased plan; what's shipped vs queued.
 - [`REFERENCE.md`](REFERENCE.md) — as-built per-subsystem reference with `file:line` citations.
 
 If you're skim-reading: start at §3 "Choosing an integration mode," then §4 "Boot lifecycle," then §17 "Common pitfalls." Everything else is depth-on-demand.
@@ -51,7 +51,7 @@ The 9P transport is `stratumd`: one process per pool, bound to a Unix socket. It
 | **Linux v9fs kernel mount over Unix socket** | Production root-fs on Linux today | Mature; one syscall round-trip per VFS op |
 | **FUSE userland mount via libstratum-9p** | Prototype OS; need to debug 9P traffic | Two syscall trips per op; fine for bring-up, not for prod |
 | **Direct libstratum-9p in your shell/tools** | Tools, file managers, AI agents talking to Stratum directly | One IPC trip; bypasses VFS entirely |
-| **Kernel-native stratum module** | Long-term first-class integration | A serious port — 30-50% of `v2/src/` (sync, alloc, crypto) needs kernel adaptation; ~10-20 KLOC effort |
+| **Kernel-native stratum module** | Long-term first-class integration | A serious port -- 30-50% of `src/` (sync, alloc, crypto) needs kernel adaptation; ~10-20 KLOC effort |
 | **`/ctl/`-only — keep your existing FS** | Your OS uses ZFS/btrfs but wants Stratum's admin surface and observability story | Negligible — link libstratum-9p and dial the `/ctl/` socket |
 
 Most distributions starting fresh today should land in the **Linux v9fs kernel mount over Unix socket** row. It gets you to a working `mount /` against Stratum in a week, not a year. The kernel-native port can come later when you're ready to commit a serious filesystems team.
@@ -587,7 +587,7 @@ Stratum ships [`slate`](SLATE-DESIGN.md), a Plan-9-shaped TUI daemon. Slate is i
 - **Programmable**: a system agent (or a user agent — an LLM assistant, an autorun script) can dial slate's `/connection/attach`, navigate via `/panels/X/cursor` + `/panels/X/action`, read the current pane state, and trigger admin verbs. This is the substrate for AI-driven system administration.
 - **Multi-pane editor**: slate's `/editor` subtree is RW (mode 0644) and supports save/quit/revert verbs. Your OS's text-editing surface can be built on slate without a custom editor toolkit.
 
-See [`SLATE-DESIGN.md`](SLATE-DESIGN.md) for the schema contract. The renderer (`stratum tui`) is in `v2/tools/stratum/`; slate itself is in `v2/src/slate/`.
+See [`SLATE-DESIGN.md`](SLATE-DESIGN.md) for the schema contract. The renderer (`stratum tui`) is in `tools/stratum/`; slate itself is in `src/slate/`.
 
 ---
 
@@ -604,7 +604,7 @@ In rough order of how often they bite OS integrators:
 7. **Writing snapshot names with embedded newlines.** Refused server-side; refuse client-side too with a clear error.
 8. **Forgetting `mlock(2)` on the unwrapped key.** Hibernation file leaks the key. Always `mlock` + `MADV_DONTDUMP`.
 9. **Bumping `msize` without bumping `iounit` accounting.** The protocol allows up to msize-headers; if your client lib doesn't chunk correctly, you'll get truncated writes.
-10. **Skipping the audit cycle on filesystem-invariant changes.** The R-series (R0..R136 closed, growing) catches regressions that the test suite misses. If you contribute to Stratum upstream, the [CLAUDE.md trigger list](../../CLAUDE.md) tells you which surfaces need an audit.
+10. **Skipping the audit cycle on filesystem-invariant changes.** The R-series (R0..R136 closed, growing) catches regressions that the test suite misses. If you contribute to Stratum upstream, the [CLAUDE.md trigger list](../CLAUDE.md) tells you which surfaces need an audit.
 
 ---
 
@@ -612,11 +612,11 @@ In rough order of how often they bite OS integrators:
 
 ### What ships
 
-- **C suite**: 54 ctest binaries covering every subsystem. Run via `ctest --test-dir v2/build -j4`. Baseline: 54/54 GREEN.
-- **Rust e2e**: 33-case CRUD harness against a live stratumd over the wire. Run via `cargo test --release` in `v2/tools/stratum-fs-e2e/`.
-- **Slate socket smoke**: e2e against a live slate daemon over `--allow-unauth`. Run via `cargo test --release` in `v2/tools/stratum-slate-tty/`.
-- **Concurrent /ctl/**: 2-case Rust harness verifying concurrent-accept wall-time bounds. `v2/tools/stratum/tests/concurrent_ctl.rs`.
-- **Compound-op race class**: 9-case pthread harness in `v2/tests/test_compound_ops_concurrent.c`. Each case proves a specific lock-order or atomicity invariant.
+- **C suite**: 54 ctest binaries covering every subsystem. Run via `ctest --test-dir build -j4`. Baseline: 54/54 GREEN.
+- **Rust e2e**: 33-case CRUD harness against a live stratumd over the wire. Run via `cargo test --release` in `tools/stratum-fs-e2e/`.
+- **Slate socket smoke**: e2e against a live slate daemon over `--allow-unauth`. Run via `cargo test --release` in `tools/stratum-slate-tty/`.
+- **Concurrent /ctl/**: 2-case Rust harness verifying concurrent-accept wall-time bounds. `tools/stratum/tests/concurrent_ctl.rs`.
+- **Compound-op race class**: 9-case pthread harness in `tests/test_compound_ops_concurrent.c`. Each case proves a specific lock-order or atomicity invariant.
 
 ### For your OS
 
@@ -647,23 +647,23 @@ Roadmap chunks that an OS author should plan around:
 - **Force-replay-from-snapshot recovery verb** — v2.x late.
 - **TLC formal-spec verification in CI** — three specs pending TLC verification (tooling-gated); the specs themselves are written.
 
-The roadmap is honest: nothing here is hidden behind a "coming soon" page. The `docs/ROADMAP-V2.md` document tracks priorities; the GitHub-style task list in CLAUDE.md memory tracks the actual chunk-by-chunk plan.
+The roadmap is honest: nothing here is hidden behind a "coming soon" page. The `docs/ROADMAP.md` document tracks priorities; the GitHub-style task list in CLAUDE.md memory tracks the actual chunk-by-chunk plan.
 
 ---
 
 ## 21. Where to ask questions and contribute
 
 - **Code**: this repository. Read CLAUDE.md for the project's discipline (spec-first, audit-triggering changes, design-decision docs).
-- **Specs**: `v2/specs/*.tla` — the formal model. If you're proposing a feature that touches concurrency, commit ordering, nonce uniqueness, quorum, redundancy, crypto key derivation, cache coherence, or torn-write recovery, the spec gets written FIRST.
+- **Specs**: `specs/*.tla` -- the formal model. If you're proposing a feature that touches concurrency, commit ordering, nonce uniqueness, quorum, redundancy, crypto key derivation, cache coherence, or torn-write recovery, the spec gets written FIRST.
 - **Audits**: when you contribute a change to an audit-triggering surface (see CLAUDE.md's trigger list), spawn the audit round and address P0/P1 findings before merge. The closed-list in `memory/audit_v2_r0_closed_list.md` is the do-not-re-report preamble.
 
 If you're building a distribution on Stratum and run into something the docs don't cover, the answer is usually in one of:
 
 - [`REFERENCE.md`](REFERENCE.md) for "what is the as-built behavior of X?"
-- [`ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for "why does Stratum do X this way?"
-- [`ROADMAP-V2.md`](../../docs/ROADMAP-V2.md) for "is X planned?"
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) for "why does Stratum do X this way?"
+- [`ROADMAP.md`](ROADMAP.md) for "is X planned?"
 - The relevant `specs/*.tla` for "is X formally specified?"
-- [CLAUDE.md](../../CLAUDE.md) for "what's the audit posture around X?"
+- [CLAUDE.md](../CLAUDE.md) for "what's the audit posture around X?"
 
 When in doubt: read the spec, then the reference, then the code. The spec is the source of truth.
 

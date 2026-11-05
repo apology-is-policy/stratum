@@ -5,7 +5,7 @@
 (*   see docs/ARCHITECTURE.md §8 — namespace model.                          *)
 (*   see docs/ARCHITECTURE.md §8.3 — dataset hierarchy + index tree.        *)
 (*   see docs/ARCHITECTURE.md §8.9 — rename / move semantics.               *)
-(*   see docs/ROADMAP-V2.md §9.1 — Phase 6 dataset-layer deliverable.      *)
+(*   see docs/ROADMAP.md section 9.1 -- Phase 6 dataset-layer deliverable.      *)
 (*                                                                           *)
 (* Scope of this spec:                                                      *)
 (*                                                                           *)

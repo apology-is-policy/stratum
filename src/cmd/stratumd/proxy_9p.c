@@ -4,7 +4,7 @@
  * architecture summary + trust-boundary list.
  *
  * TLY-A2-impl-2 — Thylacine multi-stratumd-per-pool. Composes against
- * `v2/specs/multi_stratumd.tla` (ClientAdmitsDataset action +
+ * `specs/multi_stratumd.tla` (ClientAdmitsDataset action +
  * CrossClientIsolation invariant).
  */
 

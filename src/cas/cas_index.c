@@ -3,7 +3,7 @@
  * Content-addressed cold-tier index (P7-CAS, v18).
  *
  *   see include/stratum/cas.h — public API + invariants.
- *   see v2/specs/cas.tla — formal model.
+ *   see specs/cas.tla -- formal model.
  *
  * Mirrors src/extent/extent_index.c — linear-array in-RAM map +
  * btree_store-backed persistence on device 0 under STM_BPTR_KIND_CAS.

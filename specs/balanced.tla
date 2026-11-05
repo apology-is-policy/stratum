@@ -28,7 +28,7 @@
 \*                          buffer-driven splits compose with).
 \*
 \* The 9.8 buffer-driven-internal-split scenario the design doc
-\* (`v2/docs/phase-9.8-design.md` §6.2) names "balanced.tla
+\* (`docs/phase-9.8-design.md` section 6.2) names "balanced.tla
 \* extension" is realized by composition: balanced.tla covers the
 \* structural 3-step split (unchanged); bepsilon.tla covers the
 \* message-preservation under flush; together they prove the

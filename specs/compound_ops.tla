@@ -13,7 +13,7 @@
 \* The C invariants the implementation upholds:
 \*   1. Each compound op holds fs->lock from entry to final unlock. No
 \*      release-and-reacquire mid-op (audit verified — fs.c lines, see
-\*      v2/docs/p9.5-parallel-2-design.md §2.1).
+\*      docs/p9.5-parallel-2-design.md section 2.1).
 \*   2. Each subsystem operation is atomic under that subsystem's own
 \*      internal lock (snapshot index mutex, allocator mutex, etc.).
 \*   3. Per-subsystem internal mutexes serialize the writer's mutation
@@ -32,9 +32,9 @@
 \*     concurrently"; the contract is eventual-consistency across
 \*     subsystems.
 \*
-\*   v2/docs/p9.5-parallel-2-design.md §3 — spec composition reference
+\*   docs/p9.5-parallel-2-design.md section 3 -- spec composition reference
 \*   ARCHITECTURE §14.3 — /ctl/ as the operator state surface
-\*   ROADMAP-V2 §13   — Phase 9.5 PARALLEL trio
+\*   ROADMAP section 13   -- Phase 9.5 PARALLEL trio
 \*   sync.tla         — three-phase commit; the per-subsystem atomic step
 \*   writeback.tla    — drain discipline (R128 pre-flush)
 \*   snapshot.tla     — ChainExtentTxgOrdered + OrphansNotAuthoritative
@@ -60,7 +60,7 @@
 \*     spec with a finer-grained writer model; the same invariants must
 \*     still hold under that refinement.
 \*   - send / recv composition. Operates at sync-layer, not at fs->lock.
-\*     Already specified in v2/include/stratum/send_recv.h §R39/R60.
+\*     Already specified in include/stratum/send_recv.h section R39/R60.
 \*   - Crash recovery; orthogonal to runtime races.
 \*
 \* Invariants:

@@ -96,7 +96,7 @@ static void decode_child_bptr(const uint8_t in[STM_BTNODE_CHILD_BPTR_SIZE],
 
 /* ========================================================================= */
 /* Spill blocks — out-of-line storage for large leaf values (9.6-impl-3).      */
-/* see v2/docs/phase-9.6-impl-3-spill-design.md §4.                            */
+/* see docs/phase-9.6-impl-3-spill-design.md section 4.                            */
 /* ========================================================================= */
 
 /* Lay out, AEAD-encrypt, and write one spill block at the already-

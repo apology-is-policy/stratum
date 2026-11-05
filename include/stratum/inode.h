@@ -9,7 +9,7 @@
  * the (ino, si_gen) tuple-uniqueness invariant pinned by inode.tla.
  *
  * Spec-to-code: this file realizes the allocator state machine modeled
- * in `v2/specs/inode.tla`. Each new public action below maps to a TLA+
+ * in `specs/inode.tla`. Each new public action below maps to a TLA+
  * action of the same name. The two buggy configs in the spec
  * enumerate the canonical allocator failure modes the reviewer must
  * rule out — `BuggyReuseNoGenBump` (silent (ino, gen) aliasing) and
@@ -524,7 +524,7 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
 /* the refcount to zero.                                                      */
 /*                                                                            */
 /* Spec composition: realizes the `inode_lock_holder[i] = w` action of        */
-/* `v2/specs/compound_ops_per_inode.tla` — the writer acquires the per-inode  */
+/* `specs/compound_ops_per_inode.tla` -- the writer acquires the per-inode  */
 /* lock and HOLDS it for the full body of the compound op.                   */
 /*                                                                            */
 /* Lock-order discipline (caller's responsibility): for multi-inode ops the   */

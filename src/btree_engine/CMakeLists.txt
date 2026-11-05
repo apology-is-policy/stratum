@@ -22,7 +22,7 @@ endif()
 # stm_bootstrap + stm_bdev. A separate library so stm_btree_engine itself
 # stays allocator-agnostic (the engine + its test exercise an in-RAM
 # vtable); only the cutover modules — inode / dirent / xattr / extent —
-# link this. See v2/docs/phase-9.6-impl-4b-sync-wiring-design.md §2.
+# link this. See docs/phase-9.6-impl-4b-sync-wiring-design.md section 2.
 add_library(stm_engine_store STATIC
     engine_store.c)
 

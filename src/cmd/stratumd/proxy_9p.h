@@ -2,7 +2,7 @@
 /*
  * 9P2000.L raw-frame proxy (TLY-A2-impl-2 — Thylacine multi-stratumd).
  *
- * Architecture (`v2/docs/thylacine-multi-stratumd-design.md §3 + §5`):
+ * Architecture (`docs/thylacine-multi-stratumd-design.md section 3 + section 5`):
  *
  *   Per-user stratumd runs in client mode (`--role client`). For every
  *   accepted upstream connection (kernel's 9P mount, etc.) the daemon

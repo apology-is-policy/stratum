@@ -30,7 +30,7 @@ that are explicitly deferred.)
 
 ### P1-1: `stm_fs_listxattr` returns STM_ERANGE to the caller on a NORMAL writer-adds-xattr race; the SH-fallback strategy does not catch this case
 
-`v2/src/fs/fs.c:5722-5734` (the wait-free listxattr's materialize
+`src/fs/fs.c:5722-5734` (the wait-free listxattr's materialize
 pass):
 
   ```c
@@ -55,7 +55,7 @@ fallback when wait-free returns STM_ECORRUPT". This is INCOMPLETE.
 
 `stm_xattr_list_concurrent` returns STM_ERANGE (not STM_ECORRUPT and
 not STM_OK with got != n_total) when `c.n_total > max_entries`. See
-`v2/src/xattr/xattr.c:1077`:
+`src/xattr/xattr.c:1077`:
 
   ```c
   *out_total = c.n_total;
@@ -110,8 +110,8 @@ n_total). The wait-free path's two-pass shape is the cause; the SH
 fallback's two-pass is excluded by SH-vs-EX (writers take EX), so the
 fallback path correctly sees `got == n_total` always.
 
-Cite: `v2/src/fs/fs.c:5722-5734`, `v2/src/xattr/xattr.c:1067-1078`,
-`v2/src/xattr/xattr.c:944-963`.
+Cite: `src/fs/fs.c:5722-5734`, `src/xattr/xattr.c:1067-1078`,
+`src/xattr/xattr.c:944-963`.
 
 ### P1-2: SH-fallback strategy catches only the STM_ECORRUPT subclass of torn-reads; torn-reads that pass validation but produce spurious non-ECORRUPT errors are NOT caught
 
@@ -221,18 +221,18 @@ even though the serial path can't see the torn). On violation:
 fall through to SH-rdlock path (treat as torn-state and let the
 serial re-read decide).
 
-Cite: `v2/src/fs/fs.c:2099-2128` (stm_fs_read INLINE wait-free
-branch — missing si_size <= INLINE_MAX check), `v2/src/fs/fs.c:2299`
-(lookup parent-dir check), `v2/src/fs/fs.c:4404` (name_to_handle
-parent-dir check), `v2/src/inode/inode.c:229-266` (in_validate_value
-— doesn't check si_size <= si_data_len for INLINE), `v2/src/inode/
+Cite: `src/fs/fs.c:2099-2128` (stm_fs_read INLINE wait-free
+branch -- missing si_size <= INLINE_MAX check), `src/fs/fs.c:2299`
+(lookup parent-dir check), `src/fs/fs.c:4404` (name_to_handle
+parent-dir check), `src/inode/inode.c:229-266` (in_validate_value
+-- doesn't check si_size <= si_data_len for INLINE), `src/inode/
 inode.c:938` (FREED filter).
 
 ## P2 (substantive)
 
 ### P2-1: `stm_fs_open_by_handle` post-fallback `stm_inode_next_ino` runs OUTSIDE both EBR and SH; uses post-SH-unlock `iidx` value
 
-`v2/src/fs/fs.c:4554-4575`:
+`src/fs/fs.c:4554-4575`:
 
   ```c
   stm_ebr_enter(ebr);
@@ -272,12 +272,12 @@ existing posture.
 **Fix sketch**: defer to P0-3 closure (forward-noted to a dedicated
 chunk).
 
-Cite: `v2/src/fs/fs.c:4554-4575`, `v2/src/fs/fs.c:4569` (the
+Cite: `src/fs/fs.c:4554-4575`, `src/fs/fs.c:4569` (the
 "safe without fs->global" comment that elides the lifetime issue).
 
 ### P2-2: `stm_fs_listxattr` SH-fallback's "treat count-mismatch as STM_ECORRUPT" residual check is structurally unreachable under SH-vs-EX
 
-`v2/src/fs/fs.c:5773-5778` (fallback block):
+`src/fs/fs.c:5773-5778` (fallback block):
 
   ```c
   ls2 = stm_xattr_list(xidx, dataset_id, ino, batch, n_total, &got);
@@ -317,8 +317,8 @@ PARALLEL-3 impl-N or future ports lift xattr-writers to SH, the
 fallback must be revisited (e.g., wrap both passes in a per-inode
 pin, or use a single-pass primitive).
 
-Cite: `v2/src/fs/fs.c:5724` (comment), `v2/src/fs/fs.c:5775`
-(defensive check), `v2/src/fs/fs.c:5514,5825` (xattr writers hold
+Cite: `src/fs/fs.c:5724` (comment), `src/fs/fs.c:5775`
+(defensive check), `src/fs/fs.c:5514,5825` (xattr writers hold
 wrlock — confirmed at the time of audit).
 
 ### P2-3: Per-fallback re-resolution of `iidx` / `xidx` / `didx` is defensive-only; same pointer values, same lifetime gap
@@ -348,13 +348,13 @@ But the explicit form is more readable for an audit. Minor P2.
 
 **Fix sketch**: leave as-is until the duplication grows.
 
-Cite: `v2/src/fs/fs.c:3315`, `:4019`, `:4334`, `:4451-4452`,
+Cite: `src/fs/fs.c:3315`, `:4019`, `:4334`, `:4451-4452`,
 `:4560`, `:5641-5642`, `:5742-5743`, `:5368-5369`, `:2328-2329`,
 `:3315`.
 
 ### P2-4: Reader-stale-data semantics for non-ECORRUPT torn reads not documented in the public API contract
 
-`v2/include/stratum/fs.h` docstrings for `stm_fs_stat`, `_lookup`,
+`include/stratum/fs.h` docstrings for `stm_fs_stat`, `_lookup`,
 `_readlink`, etc. don't mention the LF-3 wait-free torn-read
 semantic. The R171 close commit added a block to `fs.c:35-66`'s
 lock-hierarchy comment about the LF-3 regime, but the header file's
@@ -380,11 +380,11 @@ transient and now invisible to callers (thanks to the fallback).
 `fs.h` documenting the wait-free + SH-fallback semantic. Forward-
 noted; not urgent.
 
-Cite: `v2/include/stratum/fs.h`.
+Cite: `include/stratum/fs.h`.
 
 ### P2-5: `stm_fs_read` INLINE wait-free branch silently falls through to SH on torn `si_data_len > MAX`, but the FALLBACK SH path may have writer's coherent post-mutation state — possible "double-decode" of the same data via two different read paths
 
-`v2/src/fs/fs.c:2102-2133` (wait-free INLINE):
+`src/fs/fs.c:2102-2133` (wait-free INLINE):
 
   ```c
   if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG
@@ -418,11 +418,11 @@ handled — but only the former is caught.
 memcpy on `cur_size <= STM_INODE_INLINE_MAX`. If `cur_size > MAX`,
 fall through to SH.
 
-Cite: `v2/src/fs/fs.c:2102-2128`.
+Cite: `src/fs/fs.c:2102-2128`.
 
 ### P2-6: `engine.c` docstring update at lines 199-202 is internally inconsistent with the R171 update at lines 206-228
 
-`v2/src/btree_engine/engine.c:199-202`:
+`src/btree_engine/engine.c:199-202`:
 
   ```
    *   - Serial-path callers (lookup / insert / delete / scan /
@@ -433,7 +433,7 @@ Cite: `v2/src/fs/fs.c:2102-2128`.
 
 This is the OLD claim that serial-path callers (writers) hold EX.
 
-`v2/src/btree_engine/engine.c:206-208`:
+`src/btree_engine/engine.c:206-208`:
 
   ```
    * R171 update post-LF-3: serial-path writers (commit_flush, insert,
@@ -449,14 +449,14 @@ contributor) would be confused.
 PARALLEL-3 impl-5/6 reality ("serial-path writers hold `fs->global`
 SH"), or delete it and merge with the R171 update.
 
-Cite: `v2/src/btree_engine/engine.c:199-208`.
+Cite: `src/btree_engine/engine.c:199-208`.
 
 ## P3 (light)
 
 ### P3-1: Multiple wait-free read paths skip the parent-mode validation on STM_ECORRUPT but propagate STM_ENOTDIR on torn-mode-bits
 
-`v2/src/fs/fs.c:2298-2302` (stm_fs_lookup):
-`v2/src/fs/fs.c:4403-4407` (stm_fs_name_to_handle):
+`src/fs/fs.c:2298-2302` (stm_fs_lookup):
+`src/fs/fs.c:4403-4407` (stm_fs_name_to_handle):
 
   ```c
   if (ps == STM_OK) {
@@ -499,7 +499,7 @@ this R172 audit's P1-2 + P2-5. A more accurate framing:
 
 **Fix sketch**: tighten the docstring at the next docstring update.
 
-Cite: `v2/src/btree_engine/engine.c:213-217`.
+Cite: `src/btree_engine/engine.c:213-217`.
 
 ### P3-3: The R171 close commit's CLAUDE.md / scripture row update isn't included in this commit
 
@@ -519,7 +519,7 @@ Cite: `CLAUDE.md` (not modified in 3264887).
 
 ### P3-4: `stm_fs_listxattr` fallback never zeroes `n_total` between wait-free + fallback passes
 
-`v2/src/fs/fs.c:5691` declares `size_t n_total = 0;`. The wait-free
+`src/fs/fs.c:5691` declares `size_t n_total = 0;`. The wait-free
 path's `stm_xattr_list_concurrent(NULL, 0, &n_total)` writes
 n_total. If the wait-free path got past this call but later set
 need_fallback, n_total retains the wait-free value.
@@ -540,7 +540,7 @@ makes the fallback path correct.
 
 ### P3-5: `stm_fs_open_by_handle`'s post-fallback `stm_inode_next_ino` documentation could mention the LF-3 caller-quiesce obligation
 
-`v2/src/fs/fs.c:4569`:
+`src/fs/fs.c:4569`:
 
   ```
   /* stm_inode_next_ino takes its own subsystem-internal mutex;
@@ -558,11 +558,11 @@ caller-quiesce obligation.
 
 **Fix sketch**: extend the comment.
 
-Cite: `v2/src/fs/fs.c:4569`.
+Cite: `src/fs/fs.c:4569`.
 
 ### P3-6: `stm_fs_lookup`'s `lookup_fallback:` label is C99-safe but stylistically jarring
 
-`v2/src/fs/fs.c:2309-2348`. The goto-with-label pattern is unique
+`src/fs/fs.c:2309-2348`. The goto-with-label pattern is unique
 within fs.c (most other ports use `need_fallback` flags). The C99
 rule allows the goto since `pv2` is declared after the label inside
 braces (not jumping past a VLA initialization). Stylistically
@@ -570,11 +570,11 @@ inconsistent with the rest of the SH-fallback ports.
 
 **Fix sketch**: refactor to use `need_fallback` flag for consistency.
 
-Cite: `v2/src/fs/fs.c:2293-2348`.
+Cite: `src/fs/fs.c:2293-2348`.
 
 ### P3-7: `stm_fs_getxattr`'s initial `stm_status s = STM_ECORRUPT;` sentinel pattern requires careful reading
 
-`v2/src/fs/fs.c:5620-5628`:
+`src/fs/fs.c:5620-5628`:
 
   ```c
   stm_status s = STM_ECORRUPT;
@@ -606,11 +606,11 @@ moment of analysis. A comment would help:
 
 **Fix sketch**: add the comment.
 
-Cite: `v2/src/fs/fs.c:5620-5628`.
+Cite: `src/fs/fs.c:5620-5628`.
 
 ### P3-8: `stm_fs_listxattr` fallback's redundant `*out_size = 0` overlaps with serial path's entry zero-init
 
-`v2/src/fs/fs.c:5645`:
+`src/fs/fs.c:5645`:
 
   ```c
   if (out_size) *out_size = 0;     /* redundant with serial's entry zero-init */
@@ -623,7 +623,7 @@ fs.c-level zero at line 5645 is redundant. Harmless but unnecessary.
 
 **Fix sketch**: drop the redundant zero.
 
-Cite: `v2/src/fs/fs.c:5645`, `v2/src/xattr/xattr.c:686`.
+Cite: `src/fs/fs.c:5645`, `src/xattr/xattr.c:686`.
 
 ### P3-9: The R171 close commit's verification claim "ctest 64/64 GREEN excluding the flake-prone test_compound_ops_concurrent" omits a coverage statement
 

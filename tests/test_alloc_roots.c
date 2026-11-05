@@ -3,7 +3,7 @@
  * Unit tests for the allocator-roots object (Phase 5 chunk P5-3b).
  *
  *   see include/stratum/alloc_roots.h for the surface.
- *   see v2/docs/ARCHITECTURE.md §6.1 for the design rationale.
+ *   see docs/ARCHITECTURE.md section 6.1 for the design rationale.
  *
  * Coverage:
  *   - create + set + get + count + iter in-RAM.

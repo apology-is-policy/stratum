@@ -5,7 +5,7 @@
 //! state. The renderer (`swiss6_view.rs`) consumes a snapshot of the
 //! state under a `RwLock` and never dials /ctl/ directly.
 //!
-//! Design rationale: see `v2/docs/swiss-6-design.md`. The S5-PRE-C
+//! Design rationale: see `docs/swiss-6-design.md`. The S5-PRE-C
 //! materializer already surfaces every field the renderer needs;
 //! v1.0 is pure Rust work with NO C-side surface changes.
 
@@ -142,7 +142,7 @@ impl SnapshotGraphState {
 }
 
 /// Parse the line-oriented snapshot body produced by
-/// materialize_dataset_snapshot_info (`v2/src/ctl/synfs.c`).
+/// materialize_dataset_snapshot_info (`src/ctl/synfs.c`).
 ///
 /// Format (each on its own line, in this order — though parsing
 /// accepts any order):

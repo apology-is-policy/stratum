@@ -3,8 +3,8 @@
  * Commit protocol — single-device (sync.tla) + multi-device quorum
  * (quorum.tla).
  *
- *   see v2/specs/sync.tla         — single-device four-phase spec.
- *   see v2/specs/quorum.tla       — multi-device quorum spec (P5-0).
+ *   see specs/sync.tla         -- single-device four-phase spec.
+ *   see specs/quorum.tla       -- multi-device quorum spec (P5-0).
  *   see ARCHITECTURE §3.7, §5.6   — commit + uberblock ring.
  *   see ARCHITECTURE §7.4         — nonce uniqueness + MountGenBump.
  *
@@ -566,7 +566,7 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
  *
  * The entire step runs under sync's lock so the read / reserve /
  * write / free sequence is atomic w.r.t. other sync callers. At the
- * spec level (v2/specs/evac.tla), this corresponds to EvacuateAtomic:
+ * spec level (specs/evac.tla), this corresponds to EvacuateAtomic:
  * replicas[b] = (replicas[b] \ {target}) ∪ {survivor} in one step.
  *
  * The caller owns survivor selection because at this layer we cannot

@@ -1,29 +1,16 @@
-# Stratum v2 CI workflow.
+# Stratum CI workflow.
 #
 # Jobs:
 #   build-linux   — gcc/clang × off/asan/tsan sanitizer matrix; runs ctest.
 #   build-macos   — clang × off/asan/tsan; POSIX backend only.
-#   tlc-specs     — TLC on all v2/specs/*.tla with matching .cfg.
+#   tlc-specs     -- TLC on all specs/*.tla with matching .cfg.
 #
-# Installed at .github/workflows/v2-ci.yml. This copy is the source of truth
-# — changes here need to be synced to the workflows/ path to become active.
-
-name: v2-ci
+name: ci
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'v2/**'
-      - '.github/workflows/v2-ci.yml'
   pull_request:
-    paths:
-      - 'v2/**'
-      - '.github/workflows/v2-ci.yml'
-
-defaults:
-  run:
-    working-directory: v2
 
 jobs:
   build-linux:

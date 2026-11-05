@@ -2,7 +2,7 @@
 /*
  * RC-3 concurrent write path tests — s->lock retired from writes.
  *
- *   see v2/docs/rc-design.md "RC-3"  — the design this validates: the
+ *   see docs/rc-design.md "RC-3"  -- the design this validates: the
  *     public stm_sync_write_extent runs reserve (locked) → encrypt +
  *     device write (UNLOCKED) → index commit (locked), so writers to
  *     distinct extents overlap in the expensive middle.

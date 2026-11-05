@@ -5,7 +5,7 @@
  * The eng_node structure and the leaf / internal mutation primitives:
  * lower-bound search, child routing, insert / upsert, and the 2-way
  * node splits. See engine_internal.h for the structures and
- * v2/docs/reference/24-btree-engine.md §Split for the split correctness
+ * docs/reference/24-btree-engine.md section Split for the split correctness
  * argument (why a 2-way split under ENG_MAX_ITEM_BYTES always yields
  * two well-formed nodes).
  *

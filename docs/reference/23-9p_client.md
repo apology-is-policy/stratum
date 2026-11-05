@@ -29,8 +29,8 @@ Scope at v2.0 (cumulative through P9.5-POLISH-1 batch):
   Txattrcreate (in-place fid repurpose for atomic VALUE-write at
   Tclunk).
 
-Header: `v2/include/stratum/9p_client.h` (836 lines).
-Impl: `v2/src/9p_client/9p_client.c` (2066 lines).
+Header: `include/stratum/9p_client.h` (836 lines).
+Impl: `src/9p_client/9p_client.c` (2066 lines).
 No dedicated TLA+ spec — composes against the server's `fid.tla` +
 `namespace.tla` per connection.
 
@@ -323,7 +323,7 @@ client = one connection = one fid namespace. Callers wanting
 concurrent ops open multiple clients.
 
 For workloads that need parallel access (Slate panel pollers, TUI's
-volmap + snapgraph pollers in `v2/tools/stratum/src/{volmap,snapgraph}.rs`,
+volmap + snapgraph pollers in `tools/stratum/src/{volmap,snapgraph}.rs`,
 slate's per-connection workers), each driver opens its own
 `stm_9p_client` to the same socket.
 
@@ -373,7 +373,7 @@ the SERVER's correctness viewed through the wire:
 
 | Server-side spec action | Client primitive | File |
 |---|---|---|
-| `Walk` (fid.tla) | `stm_9p_walk` | `v2/src/9p_client/9p_client.c` |
+| `Walk` (fid.tla) | `stm_9p_walk` | `src/9p_client/9p_client.c` |
 | `Lopen` | `stm_9p_lopen` | same |
 | `Read` / `Write` | `stm_9p_read` / `stm_9p_write` | same |
 | `Clunk` (ClunkClearsBinding) | `stm_9p_clunk` | same |
@@ -385,7 +385,7 @@ the SERVER's correctness viewed through the wire:
 | `Fsync` | `stm_9p_fsync` | same |
 | `AcquireLock` / `ReleaseLock` (locks.tla) | `stm_9p_lock` | same |
 | `GetLock` (locks.tla) | `stm_9p_getlock` | same |
-| `ReleaseOwner` on Tclunk | (automatic — server-side) | `v2/src/9p/server.c::fid_release_locked` |
+| `ReleaseOwner` on Tclunk | (automatic -- server-side) | `src/9p/server.c::fid_release_locked` |
 | `Statfs` | `stm_9p_statfs` | same |
 | `Sync` / `Reflink` / `Fallocate` / `Fadvise` (Stratum extensions, server-side P9-9P-3) | `stm_9p_sync` / `stm_9p_reflink` / `stm_9p_fallocate` / `stm_9p_fadvise` | same |
 
@@ -397,10 +397,10 @@ the SERVER's correctness viewed through the wire:
   for each op.
 - `tests/test_9p_socket.c` — bigger e2e harness that exercises
   9P-server + stratumd + libstratum-9p across two processes.
-- `v2/tools/stratum/tests/concurrent_ctl.rs` — Rust-side e2e
+- `tools/stratum/tests/concurrent_ctl.rs` -- Rust-side e2e
   driving multiple libstratum-9p clients in parallel.
 - The lib is the foundation under every Rust integration test in
-  `v2/tools/stratum/tests/*.rs` and every C-side test that uses a
+  `tools/stratum/tests/*.rs` and every C-side test that uses a
   real socket (test_stratumd_ctl.c, test_slate_socket.c, ...).
 
 ## Status

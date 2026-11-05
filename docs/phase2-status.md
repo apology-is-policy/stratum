@@ -2,7 +2,7 @@
 
 This file is the authoritative pickup guide for continuing Phase 2
 work on the lock-free Bw-tree. Last update 2026-04-20 (after MERGE
-landed in `83f4710`). The `v2/docs/phase2-bw-tree-design.md` alongside
+landed in `83f4710`). The `docs/phase2-bw-tree-design.md` alongside
 is the historical pre-implementation design note — left intact as a
 record of the reasoning that led to the current code.
 
@@ -18,7 +18,7 @@ locks, with a tree-wide structural lock serializing only
 commit_split / commit_merge; scan iterates parent's pivot array
 left-to-right under an EBR-pinned snapshot. All six audit rounds
 R0-R6 are closed. 26/26 tests green on default/ASan/TSan. Benchmark
-harness in `v2/bench/` produces single-writer throughput + multi-
+harness in `bench/` produces single-writer throughput + multi-
 reader scaling numbers. A 30-second sustained TSan run via
 `btree_lf_long_stress` (env-parameterized) passes. Phase 2 is
 complete; node serialization is deferred to Phase 3 per roadmap
@@ -91,7 +91,7 @@ be BASE_LEAF with nentries == 0 AND no preserved SPLIT deltas above.
 R must not be the leftmost child of its parent (leftmost-merges would
 require a different forward direction and aren't modeled by the spec).
 
-**Spec**: `v2/specs/merge.tla`. 65,536 distinct states, depth 18.
+**Spec**: `specs/merge.tla`. 65,536 distinct states, depth 18.
 Invariants: TypeOK, LookupCorrectness, ReaderResultsCorrect,
 ProtocolStateValid, BaseInvariant. Step 0 (PurgeSplitOnL) is
 documented as a precondition; its own correctness argument is a
@@ -121,7 +121,7 @@ chains (possibly with SPLIT deltas above the base). Two-level tree:
 one internal root + up to 65535 leaves. Internal-node splits (making
 the tree 3-level+) remain future work.
 
-Spec: `v2/specs/balanced.tla` verifies the three-CAS protocol
+Spec: `specs/balanced.tla` verifies the three-CAS protocol
 (InstallSibling + PostSplit + UpdateParent) under all reader
 interleavings. 65536 distinct states, depth 18, 4 invariants hold.
 
@@ -341,7 +341,7 @@ already-settled decisions:
 ## Key files
 
 ```
-v2/
+
 ├── include/stratum/
 │   ├── btree.h          # public API (stm_btree_lf_*)
 │   └── ebr.h            # EBR interface

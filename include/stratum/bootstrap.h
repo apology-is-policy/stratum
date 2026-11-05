@@ -3,7 +3,7 @@
  * Block allocator — public API.
  *
  *   see ARCHITECTURE §6 (Allocator model)
- *   see v2/specs/allocator.tla (refcount + deferred-free spec)
+ *   see specs/allocator.tla (refcount + deferred-free spec)
  *
  * This header is the allocator's external surface. Phase 3 chunk 4a lands
  * the bootstrap-pool-only path: a per-device bitmap-managed region that
@@ -40,7 +40,7 @@
  * keyschema / repair_log is STM_BOOTSTRAP_UNIT_BLOCKS = 8 nodes — still a
  * valid reservation multiple, no longer the bitmap granularity.
  *
- * Deferred-free semantics mirror `v2/specs/allocator.tla` exactly:
+ * Deferred-free semantics mirror `specs/allocator.tla` exactly:
  *
  *    - stm_bootstrap_free(paddr, nblocks, free_gen) stamps a PENDING entry.
  *      Bitmap bit stays set (the range is reserved against any concurrent

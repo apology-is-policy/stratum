@@ -4,7 +4,7 @@
  *
  * Per-inode plaintext write buffer that sits between stm_fs_write and
  * stm_sync_write_extent. Realizes the BufferedWrite + Flush actions
- * modeled in `v2/specs/writeback.tla`. The buffer absorbs many small
+ * modeled in `specs/writeback.tla`. The buffer absorbs many small
  * writes per inode and emits them at flush time as fewer/larger extents
  * (coalesced contiguous ranges), cutting allocator + AEAD overhead for
  * many-small-writes workloads (tarball unpack, code build, browser
@@ -311,7 +311,7 @@ typedef stm_status (*stm_dirty_buffer_drain_cb)(
  *
  * writeback.tla v1 still pins the old all-or-nothing model; a v2
  * extension capturing pop-on-success is forward-noted (see
- * v2/src/dirty_buffer/dirty_buffer.c's drain_ino comment block).
+ * src/dirty_buffer/dirty_buffer.c's drain_ino comment block).
  *
  * Concurrency: takes buf->mu for the duration of the drain. Callback
  * runs UNDER buf->mu; the callback MUST NOT call back into the buffer

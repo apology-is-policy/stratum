@@ -206,7 +206,7 @@ on mount uses `ub.ub_cas_index_root.bp_csum` directly.
 
 ## Spec cross-reference
 
-`v2/specs/cas.tla` models the index lifecycle. Six actions
+`specs/cas.tla` models the index lifecycle. Six actions
 (WriteHot / MigrateToCold / RehydrateOnWrite / DeleteFile / GC /
 AdvanceTxg) and nine invariants (TypeOK, CASIndexUnique,
 NoOverlapWithinIno, LengthPositive, BirthTxgBound, PaddrFreshness,
@@ -1335,7 +1335,7 @@ it correctly:
 
 ### Spec coverage
 
-`v2/specs/cas.tla` extends with `ChunkedMigrateToColdK2(E, len1, h1,
+`specs/cas.tla` extends with `ChunkedMigrateToColdK2(E, len1, h1,
 h2, r1, r2)` — atomic 1-hot-to-2-cold migrate. Captures K=2
 explicitly; K=1 is the existing `MigrateToCold`; K>=3 composes by
 induction (each chunk's invariants compose; the atomic-batch shape is
@@ -1357,11 +1357,11 @@ precondition broadens the state space modestly).
 
 ## Tests
 
-- `v2/tests/test_cas_index.c` — 20 unit tests covering lifecycle,
+- `tests/test_cas_index.c` -- 20 unit tests covering lifecycle,
   insert (basic + invalid args + duplicate-hash refusal +
   paddr-collision refusal), ref / deref / gc, lookup, iter (sorted +
   empty), and a multi-step dedup composition exercise.
-- `v2/tests/test_fs.c` — 19 integration tests:
+- `tests/test_fs.c` -- 19 integration tests:
   - `fs_cas_index_present_at_format`: format-time CAS index reachable
     via `stm_sync_cas_index`; empty.
   - `fs_cas_index_persists_across_mount`: insert + ref → commit →

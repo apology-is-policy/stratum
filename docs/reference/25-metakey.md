@@ -32,7 +32,7 @@ The lib is a pure byte-shuffling library — no allocation, no crypto,
 no I/O. It owns nothing beyond the wire-format of the tag byte. By
 design, complexity that wants to live here belongs in the calling
 module's per-kind body codec instead (e.g., inode value
-encode/decode stays in `v2/src/inode/`, not here).
+encode/decode stays in `src/inode/`, not here).
 
 ## Public API
 
@@ -201,7 +201,7 @@ is verified by the consumer modules' tests at 9.7-impl-1c.
 
 ## Tests
 
-`v2/tests/test_metakey.c` — 16 test cases. Roundtrip across every
+`tests/test_metakey.c` -- 16 test cases. Roundtrip across every
 kind; refusal sweep across every invalid input class; lex-order
 property assertion.
 

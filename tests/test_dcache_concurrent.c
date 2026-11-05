@@ -2,8 +2,8 @@
 /*
  * RC-1 decrypted-extent cache (dcache) tests — the EBR-pinned rework.
  *
- *   see v2/docs/rc-design.md §4 (RC-1)  — the design this validates.
- *   see v2/specs/dcache_ebr.tla         — the model; these tests are its
+ *   see docs/rc-design.md section 4 (RC-1)  -- the design this validates.
+ *   see specs/dcache_ebr.tla         -- the model; these tests are its
  *                                          runtime witnesses.
  *   see <stratum/sync_testing.h>        — the pass-through hooks driven
  *                                          here (the dcache functions are

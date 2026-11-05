@@ -2,7 +2,7 @@
 
 This tree is the v2 implementation of Stratum, built against the Phase 0 design
 documents at the repository root (`docs/VISION.md`, `docs/COMPARISON.md`,
-`docs/NOVEL.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP-V2.md`).
+`docs/NOVEL.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`).
 
 v1 lives as-is under `../src/`, `../include/`, `../tests/`, `../tui/`. v2 does
 not share code with v1 — anything salvaged is ported through an explicit review
@@ -12,7 +12,7 @@ documents and nothing else.
 ## Layout
 
 ```
-v2/
+
 ├── CMakeLists.txt            # top-level build, sanitizer variants, CI hooks
 ├── cmake/                    # cmake modules (FindLibsodium, FindLiboqs, …)
 ├── include/stratum/          # public headers for each subsystem
@@ -71,4 +71,4 @@ ctest --test-dir build --output-on-failure
 
 ## Status
 
-**Phase 1 — Foundations.** See `../docs/ROADMAP-V2.md` §4.
+**Phase 1 -- Foundations.** See `../docs/ROADMAP.md` section 4.

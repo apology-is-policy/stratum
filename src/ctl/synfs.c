@@ -4464,7 +4464,7 @@ void stm_ctl_destroy(stm_ctl *c)
      * the refcount on worker_count + the cv broadcast in
      * stm_ctl_conn_destroy let us block until every in-flight worker
      * unwinds. This is the LifecycleNoUAF invariant from
-     * v2/specs/ctl_conn.tla, enforced at the C boundary. */
+     * specs/ctl_conn.tla, enforced at the C boundary. */
     pthread_mutex_lock(&c->worker_mu);
     while (c->worker_count > 0)
         pthread_cond_wait(&c->worker_cv, &c->worker_mu);

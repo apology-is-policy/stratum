@@ -21,7 +21,7 @@
  * problem (spawn a server per accept()).
  *
  * Spec composition: every handler that returns or rejects a
- * fid composes against `v2/specs/fid.tla`. Every per-handler
+ * fid composes against `specs/fid.tla`. Every per-handler
  * stale-fid detection maps to fid.tla's IOSuccess /
  * IOReject gate; every Twalk / Tattach binding maps to fid.tla's
  * Walk / Attach action. Per-connection namespace composition
@@ -252,7 +252,7 @@ enum {
 /* ────────────────────────────────────────────────────────────────────── */
 /* Per-connection namespace composition (P9-9P-2).                        */
 /*                                                                         */
-/* Composes against `v2/specs/namespace.tla`:                              */
+/* Composes against `specs/namespace.tla`:                              */
 /*   - Bind / Unbind actions map to h_bind / h_unbind.                    */
 /*   - server_create allocates the per-connection bindings table          */
 /*     (namespace.tla::Attach effectively materializes at the C level     */

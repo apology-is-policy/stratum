@@ -62,11 +62,11 @@ out-of-path waiting for their moment:
 
 | Module | What exists | Status |
 |---|---|---|
-| `v2/src/ebr/` (`stm_ebr_*`) | EBR primitive: register/enter/exit/retire/heartbeat/advance | Production-used by `btree_lf`. The `concurrency.tla` proof (4 invariants) is the spec witness. |
-| `v2/src/btree/btree_lf.c` | Multi-level Bw-tree (internal routing, leaf SPLIT, EBR-backed memory reclamation, 3-step split protocol from `balanced.tla`) | 2244 lines, currently used by NOTHING in the production path. Bw caching shape is the design; it gets reframed for the engine cache layer in §3 below. |
-| `v2/specs/concurrency.tla` | EBR safety, snapshot pinning, epoch monotonicity, retire-bucket bookkeeping | TLC-green at small bounds; 4 invariants. |
-| `v2/specs/balanced.tla` | 3-step leaf-split-with-parent-update protocol; `LookupCorrectness` invariant | TLC-green; the structural-shape invariant for multi-level Bw. |
-| `v2/specs/structural.tla` | Single-node SPLIT-delta atomic visibility | TLC-green; the per-node correctness layer. |
+| `src/ebr/` (`stm_ebr_*`) | EBR primitive: register/enter/exit/retire/heartbeat/advance | Production-used by `btree_lf`. The `concurrency.tla` proof (4 invariants) is the spec witness. |
+| `src/btree/btree_lf.c` | Multi-level Bw-tree (internal routing, leaf SPLIT, EBR-backed memory reclamation, 3-step split protocol from `balanced.tla`) | 2244 lines, currently used by NOTHING in the production path. Bw caching shape is the design; it gets reframed for the engine cache layer in section 3 below. |
+| `specs/concurrency.tla` | EBR safety, snapshot pinning, epoch monotonicity, retire-bucket bookkeeping | TLC-green at small bounds; 4 invariants. |
+| `specs/balanced.tla` | 3-step leaf-split-with-parent-update protocol; `LookupCorrectness` invariant | TLC-green; the structural-shape invariant for multi-level Bw. |
+| `specs/structural.tla` | Single-node SPLIT-delta atomic visibility | TLC-green; the per-node correctness layer. |
 | `btnode.h::n_buffer_used` | 4-byte field reserved in the internal-node header for message-buffer bytes | Stays zero today; Phase 9.8-BE writes into it. |
 | `btree_engine` | COW B+tree engine: 16 KiB nodes, multi-level, three-phase commit, large-value spill, delete + range-scan | Phase 9.6 substrate; all four metadata modules (inode/dirent/xattr/extent) and per-dataset trees route through it. |
 
@@ -315,7 +315,7 @@ The delta chain is the in-memory message buffer (Bε in motion);
 the sorted on-disk buffer (§3.1) is what the chain consolidates
 to at commit time. A read walks the chain head-first; the
 shape and protocol exactly mirror `btree_lf`'s LEAF chain
-(§ `v2/src/btree/btree_lf.c`'s INSERT/DELETE/SPLIT delta vocab —
+(section  `src/btree/btree_lf.c`'s INSERT/DELETE/SPLIT delta vocab --
 internalised here as a single per-node delta chain on EVERY
 non-leaf node, not just leaves).
 
@@ -1066,7 +1066,7 @@ established discipline (memory `reference_tlc_tooling.md`). The
 configs:
 
 ```
-cd v2/specs
+cd specs
 "$(brew --prefix openjdk)/bin/java" -cp ~/tla2tools.jar tlc2.TLC \
     -config concurrency.cfg concurrency.tla
 "$(brew --prefix openjdk)/bin/java" -cp ~/tla2tools.jar tlc2.TLC \
@@ -1337,11 +1337,11 @@ fs.c port chunks after the engine support is in place.
 | 10 | 9.8-BE-fs.c | port write fs.c ops to per-inode-pin + EBR | R175 |
 | 11 | 9.8-BE-bench | sequential-write benchmark vs 9.7 baseline. **BUILT** — counters + `bench_write_amp` + the R174-#2 clone-arm write-fault sweep; measured 1.0–2.0× (§9.2 as-measured) | (folded into R175 close) |
 | 12 | 9.8-ARC | ARC-style node cache eviction (replaces 1024-bucket fixed cache) | R176 |
-| 13 | 9.8-cleanup | retire `v2/src/btree/btree.c` + `btree_lf.c` + `btree_mt.c` (NO — keep btree_mt: still used by alloc; only retire the Bε-buffer code in btree.c that 9.8 obsoletes); audit close umbrella | R177 |
+| 13 | 9.8-cleanup | retire `src/btree/btree.c` + `btree_lf.c` + `btree_mt.c` (NO -- keep btree_mt: still used by alloc; only retire the Bepsilon-buffer code in btree.c that 9.8 obsoletes); audit close umbrella | R177 |
 
 Each chunk follows the standing discipline: pre-flush at write
 sites, ctest green at the close, R-audit verdict before the
-next chunk starts. Reference doc (`v2/docs/reference/24-btree-engine.md`)
+next chunk starts. Reference doc (`docs/reference/24-btree-engine.md`)
 updated in the same commit.
 
 The **crown-jewel checkpoint is chunk 5** (9.8-LF-3 close):
@@ -1576,7 +1576,7 @@ relaxation (§7.3) folds into the same pass.
 | Phase 9.8 design (this doc) | ⏳ draft | (current chunk) |
 | Phase 9.8 spec extension | ⏳ next | (gates impl) |
 | Phase 9.8 impl (13 chunks) | ⏳ queued | (mission item #4 deliverable) |
-| Phase 9.9 Reliability for Thylacine | ⏳ queued (`docs/ROADMAP-V2.md` amendment 2026-05-24) | (depends on 9.8 — the lock-free shape is what gets stress-tested) |
+| Phase 9.9 Reliability for Thylacine | (queued) queued (`docs/ROADMAP.md` amendment 2026-05-24) | (depends on 9.8 -- the lock-free shape is what gets stress-tested) |
 | Phase 10 Hardening | ⏳ queued | (depends on 9.9 numbers) |
 | Phase 11 v2.0 release | ⏳ queued | (depends on 10) |
 
@@ -1652,23 +1652,23 @@ chunk-10 revert leaves a wait-free-read + locked-write tree).
 
 ## 15 — References
 
-- `v2/docs/reference/24-btree-engine.md` — engine API + commit
+- `docs/reference/24-btree-engine.md` -- engine API + commit
   + spill + delete + range-scan (9.6 substrate)
-- `v2/docs/phase-9.6-metadata-tree-engine-design.md` §5 — Phase
+- `docs/phase-9.6-metadata-tree-engine-design.md` section 5 -- Phase
   9.8 forward-note
-- `v2/docs/phase-9.7-design.md` §10.2 — Bε + Bw forward-note
-- `v2/specs/concurrency.tla` — EBR safety + snapshot pinning +
+- `docs/phase-9.7-design.md` section 10.2 -- Bepsilon + Bw forward-note
+- `specs/concurrency.tla` -- EBR safety + snapshot pinning +
   epoch monotonicity + retire-bucket bookkeeping
-- `v2/specs/balanced.tla` — 3-step Bw split protocol +
+- `specs/balanced.tla` -- 3-step Bw split protocol +
   `LookupCorrectness`
-- `v2/specs/structural.tla` — single-node SPLIT-delta atomic
+- `specs/structural.tla` -- single-node SPLIT-delta atomic
   visibility
-- `v2/src/ebr/ebr.c` — EBR primitive impl
-- `v2/src/btree/btree_lf.c` — multi-level Bw-tree reference impl
+- `src/ebr/ebr.c` -- EBR primitive impl
+- `src/btree/btree_lf.c` -- multi-level Bw-tree reference impl
   (2244 lines; the architectural prior art)
-- `v2/include/stratum/btnode.h::n_buffer_used` — the reserved
+- `include/stratum/btnode.h::n_buffer_used` -- the reserved
   field 9.8-BE-format makes load-bearing
-- `docs/ROADMAP-V2.md` Phase 9.8 entry — pipeline ordering
+- `docs/ROADMAP.md` Phase 9.8 entry -- pipeline ordering
 - `project_snapshot_substrate_gap.md` (memory) — the
   9.6/9.7/9.8 phase arc that named this phase
 - CLAUDE.md mission #4 — the lock-free metadata claim

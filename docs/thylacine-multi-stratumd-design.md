@@ -242,7 +242,7 @@ checked one-by-one, first-match-wins.
 **Refused at Tattach time, NOT at runtime**. Once the kernel has attached
 successfully, subsequent Twalks under that root are constrained by the
 attached fid's binding (the existing 9P server discipline at
-`v2/specs/namespace.tla`). New Tattaches (mounting a different dataset
+`specs/namespace.tla`). New Tattaches (mounting a different dataset
 from the same client connection) re-trigger the pattern check.
 
 **Cross-dataset ops (Q5)**: deferred to v1.x. v1.0 enforces single-dataset-
@@ -280,7 +280,7 @@ STM_EWEDGED on subsequent ops and surface to their kernel clients.
 
 ## 9. Spec scope (TLY-A2-spec)
 
-New spec at `v2/specs/multi_stratumd.tla` modelling:
+New spec at `specs/multi_stratumd.tla` modelling:
 
 - N per-user stratumds (clients) connected to one coordinator.
 - Each client has a pattern-set (`--datasets-allowed`).
@@ -327,10 +327,10 @@ New spec at `v2/specs/multi_stratumd.tla` modelling:
 
 | Chunk | Deliverable | Audit |
 |---|---|---|
-| **TLY-A2-spec** | `v2/specs/multi_stratumd.tla` + 3 buggy cfgs + spec rationale section in this design doc | (no audit — spec only) |
+| **TLY-A2-spec** | `specs/multi_stratumd.tla` + 3 buggy cfgs + spec rationale section in this design doc | (no audit -- spec only) |
 | **TLY-A2-tlc** | TLC verify green (tooling-gated; folds into #958/#966/#973 forward-noted list) | (no audit — tooling) |
 | **TLY-A2-impl-1** | Coordinator mode: `--role coord` flag (back-compat default), `--user-policy` parsing, coordinator-side Tattach pattern enforcement wrapper around `stm_9p_server_handle`. NO client mode yet — coord works standalone as today's stratumd does. | R139 |
-| **TLY-A2-impl-2** ✓ | Client mode: `--role client --coordinator-socket <path>`, raw-frame proxy module (`v2/src/cmd/stratumd/proxy_9p.{h,c}`), Tattach interception (Tversion forwards verbatim), `--datasets-allowed` reuses impl-1's `dataset_pattern.{h,c}` matcher. Tests: `tests/test_proxy_9p.c` — 7 parser unit + 3 e2e bilateral. | R140 |
+| **TLY-A2-impl-2** ok | Client mode: `--role client --coordinator-socket <path>`, raw-frame proxy module (`src/cmd/stratumd/proxy_9p.{h,c}`), Tattach interception (Tversion forwards verbatim), `--datasets-allowed` reuses impl-1's `dataset_pattern.{h,c}` matcher. Tests: `tests/test_proxy_9p.c` -- 7 parser unit + 3 e2e bilateral. | R140 |
 | **TLY-A2-impl-3** ✓ | Authentication bilateral: (a) coord refuses unknown-uid at accept (early refusal, not just per-Tattach); (b) per-user stratumd `--coordinator-uid <N>` opt-in for downstream-side SO_PEERCRED check (defense against socket-bind impersonation). 3 new tests (unknown-uid accept refusal + coord-uid match admits + coord-uid mismatch refused). | R141 |
 | **TLY-A2-impl-4** ✓ | Crash recovery: fork+exec test harness exercises kill -9 patterns on coord/client + multi-client crash isolation. Verifies existing per-conn cleanup invariants hold under abrupt termination (no impl changes needed). Tests: `tests/test_multi_stratumd_crash.c` (3 scenarios). | R142 |
 | **TLY-A2-impl-5** | Per-pool stress (folds STRATUM-API-V1.md §4.6 "72-hour stress"): 4 clients concurrent writes for short duration in CI + an opt-in long-form sweep gated on GCP compute. | R143 |
@@ -408,6 +408,6 @@ clauses:
 
 ---
 
-**Next action**: TLY-A2-spec (`v2/specs/multi_stratumd.tla`). Expected ~half a
-day of TLA+ work. Document state at `v2/docs/THYLACINE-V1-PLAN.md` updated
+**Next action**: TLY-A2-spec (`specs/multi_stratumd.tla`). Expected ~half a
+day of TLA+ work. Document state at `docs/THYLACINE-V1-PLAN.md` updated
 post-spec.

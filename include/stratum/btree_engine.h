@@ -2,9 +2,9 @@
 /*
  * Metadata Tree Engine — copy-on-write multi-level B+tree (Phase 9.6).
  *
- *   see v2/docs/phase-9.6-metadata-tree-engine-design.md (the design),
- *       v2/specs/btree.tla (the COW-commit spec),
- *       v2/docs/reference/24-btree-engine.md (as-built reference).
+ *   see docs/phase-9.6-metadata-tree-engine-design.md (the design),
+ *       specs/btree.tla (the COW-commit spec),
+ *       docs/reference/24-btree-engine.md (as-built reference).
  *
  * This is the on-disk metadata tree engine that replaces the
  * whole-tree-rebuild `btree_store` MVP. A tree is a paddr-addressed

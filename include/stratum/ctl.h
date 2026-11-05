@@ -44,7 +44,7 @@
  *     server's destroy AND after the last `stm_ctl_conn_destroy`;
  *     if any conn is still alive when destroy fires, destroy blocks
  *     on `worker_cv` until the count drops to zero (LifecycleNoUAF
- *     in `v2/specs/ctl_conn.tla`).
+ *     in `specs/ctl_conn.tla`).
  *   - Reads of attached subsystem state (stm_fs *, stm_pool *,
  *     stm_scrub *) call into those subsystems' own thread-safe
  *     accessors. The attach setters (`stm_ctl_attach_pool` /
@@ -55,7 +55,7 @@
  *     adapted to the concurrent-accept regime).
  *
  * Design rationale + state-isolation invariants:
- *   `v2/specs/ctl_conn.tla` + `v2/docs/p9.5-parallel-1-design.md`.
+ *   `specs/ctl_conn.tla` + `docs/p9.5-parallel-1-design.md`.
  *
  * Phase 9 P9-CTL-1 scope (this header):
  *   /                   directory
@@ -275,7 +275,7 @@ uid_t stm_ctl_conn_caller_uid(const stm_ctl_conn *cn);
  * Why the pre-P9.5 shape was a hazard: the admin gate read
  * `c->caller_uid` from the shared stm_ctl, which under concurrent
  * accept was a confused-deputy hole (last-writer-wins across
- * connections — see `v2/docs/p9.5-parallel-1-design.md` §2.1).
+ * connections -- see `docs/p9.5-parallel-1-design.md` section 2.1).
  *
  * Current behavior: this entry point is RETAINED solely for the
  * single-threaded test harness migration window. It stashes
@@ -397,7 +397,7 @@ stm_status stm_ctl_set_corvus_socket(stm_ctl *c, const char *socket,
  * pre-P9.5 implementation walked the shared sessions[] and freed
  * every active slot — under concurrent accept this would free
  * sibling-connection state and trip UAF on the next vops dispatch
- * (see `v2/docs/p9.5-parallel-1-design.md` §2.3).
+ * (see `docs/p9.5-parallel-1-design.md` section 2.3).
  *
  * Safe on NULL c.
  */

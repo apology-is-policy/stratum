@@ -3,7 +3,7 @@
  * stm_dirty_buffer — per-inode plaintext write buffer (SWISS-4q-flush).
  *
  *   see include/stratum/dirty_buffer.h for the public API.
- *   see v2/specs/writeback.tla for the spec this realizes.
+ *   see specs/writeback.tla for the spec this realizes.
  *
  * Internal data structure:
  *

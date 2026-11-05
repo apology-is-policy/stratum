@@ -4,7 +4,7 @@
  * lookup, commit, scan, verify.
  *
  * See include/stratum/btree_engine.h for the contract and
- * v2/docs/reference/24-btree-engine.md for the as-built reference.
+ * docs/reference/24-btree-engine.md for the as-built reference.
  *
  * The B+tree mechanics:
  *  - descent routes a key through internal pivots to its leaf;
@@ -22,7 +22,7 @@
  * a finalize publishes the new root and deferred-frees the superseded
  * paddrs; an abort discards the flush, deferred-frees the fresh
  * paddrs, and reverts to the previous durable root — the crash-revert
- * path. The model is v2/specs/btree.tla (WriteNode / FinalCommit /
+ * path. The model is specs/btree.tla (WriteNode / FinalCommit /
  * Crash + DurableTreeWellFormed / CommittedTreeMerkleConsistent /
  * FreedNodesNotReachable).
  */

@@ -3,7 +3,7 @@
  * Dataset pattern matcher (TLY-A2 — Thylacine multi-stratumd-per-pool).
  *
  * Implements the glob semantics negotiated at THYLACINE-V1-PLAN.md §0
- * Q4 + spelled out in `v2/docs/thylacine-multi-stratumd-design.md §7`:
+ * Q4 + spelled out in `docs/thylacine-multi-stratumd-design.md section 7`:
  *
  *   Components are split on `/`.
  *   `*`  matches any single non-`/` component.

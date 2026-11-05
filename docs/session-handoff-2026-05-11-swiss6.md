@@ -20,9 +20,9 @@ and SWISS-6 v1.0 shipped on top.
 - All tests GREEN: ctest 51/51 (verified at SWISS-5 close;
   C-side untouched since), Rust unit 67/67, Rust e2e 33/33.
 - Working tree clean on tracked code. Untracked: `loc.sh`
-  (statusline helper — incidental), `v2/.audit_r128_findings.md`,
-  `v2/.audit_r129_findings.md` (working-tree audit artifacts),
-  `v2/build_asan/` (build dir).
+  (statusline helper -- incidental), `.audit_r128_findings.md`,
+  `.audit_r129_findings.md` (working-tree audit artifacts),
+  `build_asan/` (build dir).
 - **No pending commits.** Everything in tree is committed.
 
 ## What landed in this session (post-prior-handoff)
@@ -38,7 +38,7 @@ The plan was clean and executed verbatim. Notes:
   working tree, which the sandbox blocked. The patch-to-index
   trick let me split the file across two commits without
   touching the working tree.
-- **drafts cleaned up**: `v2/docs/claude_md_updates_pending_r128.md`
+- **drafts cleaned up**: `docs/claude_md_updates_pending_r128.md`
   deleted in commit 3 (after applying to CLAUDE.md). Audit
   findings files (`.audit_r128_findings.md`, `.audit_r129_findings.md`)
   left as untracked working artifacts.
@@ -59,24 +59,24 @@ extent-txg / prev-snap-id / hold-count / flags). NO new C-side
 surface — pure Rust work.
 
 **Files added/modified**:
-- NEW `v2/docs/swiss-6-design.md` (~325 lines)
-- NEW `v2/tools/stratum/src/snapgraph.rs` (~513 LOC + 12 unit
+- NEW `docs/swiss-6-design.md` (~325 lines)
+- NEW `tools/stratum/src/snapgraph.rs` (~513 LOC + 12 unit
   tests). Data layer: `SnapshotInfo`, `SnapshotGraphState`,
   `parse_snap_body`, `lineage_depth` (capped at
   `MAX_LINEAGE_DEPTH = 1000`), `SnapshotGraphPoller` (1 Hz
   background thread; parallels VolumeMapPoller),
   `sanitize_name` (R115 P1-1 doctrine carry).
-- NEW `v2/tools/stratum/src/swiss6_view.rs` (~398 LOC + 4 unit
+- NEW `tools/stratum/src/swiss6_view.rs` (~398 LOC + 4 unit
   tests). Ratatui renderer: tree-glyph lineage indent + ⓗ held
   marker; cursor highlight; per-snap detail pane; F-key footer.
-- `v2/tools/stratum/src/ui.rs`: `ViewMode::SnapshotGraph` variant;
+- `tools/stratum/src/ui.rs`: `ViewMode::SnapshotGraph` variant;
   new render branch with dialog overlay defense-in-depth.
-- `v2/tools/stratum/src/tui.rs`: `SnapshotGraphPoller` lifecycle;
+- `tools/stratum/src/tui.rs`: `SnapshotGraphPoller` lifecycle;
   `snapgraph_cursor: u32` local state; F4-from-VolumeMap dispatch
   + in-SnapshotGraph key gate (Up/Down/PgUp/PgDn/Home/End + F2/Esc
   back; all other keys drop per R129 P2-2 doctrine).
-- `v2/tools/stratum/src/main.rs`: 2 mod decls.
-- `v2/tools/stratum/tests/e2e_crud.rs`: NEW
+- `tools/stratum/src/main.rs`: 2 mod decls.
+- `tools/stratum/tests/e2e_crud.rs`: NEW
   `ctl_snapshots_lineage_chain_coherent` — creates 3 snaps and
   verifies the /ctl/ prev-snap-id chain is coherent.
 - `CLAUDE.md`: ViewMode row extended to "Files / VolumeMap /
@@ -126,10 +126,10 @@ cmake --build build && ctest --test-dir build -j4
 # Expected: 51/51 in ~212s
 
 # Rust-side build + tests:
-(cd v2/tools/stratum && cargo build --release)
-(cd v2/tools/stratum && cargo test --release --bin stratum)
+(cd tools/stratum && cargo build --release)
+(cd tools/stratum && cargo test --release --bin stratum)
 # Expected: 67 passed (12 snapgraph + 4 swiss6_view + 51 prior)
-(cd v2/tools/stratum && cargo test --release --test e2e_crud)
+(cd tools/stratum && cargo test --release --test e2e_crud)
 # Expected: 33 passed (1 new SWISS-6 lineage test)
 
 # Manual smoke (post-deploy):
@@ -223,27 +223,27 @@ Identical to the prior handoff's discipline list, plus:
 ## Files modified this session (in tree, committed)
 
 ```
-+ M v2/src/fs/fs.c                              (R128 + R130)
-+ M v2/tools/stratum/tests/e2e_crud.rs          (5 new tests: 4 SWISS-5 + 1 SWISS-6)
-+ M v2/include/stratum/fs.h                     (S5-PRE-A getters)
-+ M v2/include/stratum/stratumd.h               (S5-PRE-A scope resolved)
-+ M v2/src/cmd/stratumd/serve.c                 (S5-PRE-A attach)
-+ M v2/src/ctl/synfs.c                          (S5-PRE-C kinds)
-+ M v2/tools/stratum/src/ffi.rs                 (stm_9p_readdir)
-+ M v2/tools/stratum/src/main.rs                (5 mod decls)
-+ M v2/tools/stratum/src/tui.rs                 (F2 + F4 + view_mode + 2 pollers)
-+ M v2/tools/stratum/src/ui.rs                  (ViewMode 3 variants + 2 render branches)
-+ M docs/ROADMAP-V2.md                          (Phase 9.5 queued)
++ M src/fs/fs.c                              (R128 + R130)
++ M tools/stratum/tests/e2e_crud.rs          (5 new tests: 4 SWISS-5 + 1 SWISS-6)
++ M include/stratum/fs.h                     (S5-PRE-A getters)
++ M include/stratum/stratumd.h               (S5-PRE-A scope resolved)
++ M src/cmd/stratumd/serve.c                 (S5-PRE-A attach)
++ M src/ctl/synfs.c                          (S5-PRE-C kinds)
++ M tools/stratum/src/ffi.rs                 (stm_9p_readdir)
++ M tools/stratum/src/main.rs                (5 mod decls)
++ M tools/stratum/src/tui.rs                 (F2 + F4 + view_mode + 2 pollers)
++ M tools/stratum/src/ui.rs                  (ViewMode 3 variants + 2 render branches)
++ M docs/ROADMAP.md                          (Phase 9.5 queued)
 + M CLAUDE.md                                   (8 ViewMode-row + 5 row extensions + 3 new rows)
-+ ?? v2/docs/session-handoff-2026-05-11.md      (SWISS-5 handoff; committed in b3f234b)
-+ ?? v2/docs/session-handoff-2026-05-11-swiss6.md (this file)
-+ ?? v2/docs/swiss-5-design.md                  (SWISS-5 design)
-+ ?? v2/docs/swiss-6-design.md                  (SWISS-6 design)
-+ ?? v2/tools/stratum/src/ctl.rs                (CtlClient)
-+ ?? v2/tools/stratum/src/volmap.rs             (Volume Map data layer)
-+ ?? v2/tools/stratum/src/swiss5_view.rs        (Volume Map renderer)
-+ ?? v2/tools/stratum/src/snapgraph.rs          (Snapshot Graph data layer)
-+ ?? v2/tools/stratum/src/swiss6_view.rs        (Snapshot Graph renderer)
++ ?? docs/session-handoff-2026-05-11.md      (SWISS-5 handoff; committed in b3f234b)
++ ?? docs/session-handoff-2026-05-11-swiss6.md (this file)
++ ?? docs/swiss-5-design.md                  (SWISS-5 design)
++ ?? docs/swiss-6-design.md                  (SWISS-6 design)
++ ?? tools/stratum/src/ctl.rs                (CtlClient)
++ ?? tools/stratum/src/volmap.rs             (Volume Map data layer)
++ ?? tools/stratum/src/swiss5_view.rs        (Volume Map renderer)
++ ?? tools/stratum/src/snapgraph.rs          (Snapshot Graph data layer)
++ ?? tools/stratum/src/swiss6_view.rs        (Snapshot Graph renderer)
 ```
 
 All committed in `48e6c4c` + `b3f234b` + `9dad0ea` + `99c4c72`.
@@ -252,15 +252,15 @@ All committed in `48e6c4c` + `b3f234b` + `9dad0ea` + `99c4c72`.
 
 ```
 M loc.sh                                         (statusline helper; incidental)
-?? v2/.audit_r128_findings.md                    (audit artifact)
-?? v2/.audit_r129_findings.md                    (audit artifact)
-?? v2/build_asan/                                (sanitizer build dir)
+?? .audit_r128_findings.md                    (audit artifact)
+?? .audit_r129_findings.md                    (audit artifact)
+?? build_asan/                                (sanitizer build dir)
 ```
 
 `loc.sh` is a personal statusline tool; the user can commit it
 when they want. The audit findings files are working-tree records
 of the P3 forward-notes — they reproduce content that's also in
-the prior handoff doc; safe to delete or `git mv` to `v2/docs/`
+the prior handoff doc; safe to delete or `git mv` to `docs/`
 at the user's preference. `build_asan/` is generated; safe to
 `git clean -fdX`.
 

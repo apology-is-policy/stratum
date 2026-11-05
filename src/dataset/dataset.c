@@ -3,7 +3,7 @@
  * Pool-wide dataset hierarchy + index.
  *
  *   see include/stratum/dataset.h — public API + invariants.
- *   see v2/specs/dataset.tla — formal model.
+ *   see specs/dataset.tla -- formal model.
  *
  * In-RAM linear-array implementation: each dataset gets a slot in a
  * dynamic array. Slots are append-only — Destroy marks ABSENT, the slot

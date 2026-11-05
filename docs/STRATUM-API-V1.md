@@ -280,7 +280,7 @@ Adversarial categories: cross-stratumd race (one process commits while another i
 
 Per `CORVUS-DESIGN.md §6.4` (binary frame wire format) + §13.2: per-user stratumd needs to request DEK unwrap from corvus. The request flows from `stratumd-michael` to corvus over a Spoor; corvus verifies `session.user == owner_of(dataset)` (invariant **C-7**) and returns the DEK.
 
-Stratum's existing janus integration (in `stratum/v2/src/janus/`) speaks janus's binary format. Corvus speaks a **different** wire — Thylacine-native binary frames with state-file magic `CRVS` (distinct from janus's `JPAS`). Stratum needs a "key agent client" library that can speak corvus's wire when stratumd runs under Thylacine.
+Stratum's existing janus integration (in `stratum/src/janus/`) speaks janus's binary format. Corvus speaks a **different** wire -- Thylacine-native binary frames with state-file magic `CRVS` (distinct from janus's `JPAS`). Stratum needs a "key agent client" library that can speak corvus's wire when stratumd runs under Thylacine.
 
 The wire is fully specified in `CORVUS-DESIGN.md §6.4`. This section restates the parts Stratum implements.
 
@@ -597,7 +597,7 @@ Per ask, the test matrices are spelled out. Cross-cutting integration tests:
 Stratum-side documentation each ask warrants:
 - `OS-INTEGRATION.md` updates for v1.0 multi-stratumd + bind-pool-serial.
 - A new `docs/reference/` entry per significant ask.
-- Updates to `stratum/v2/docs/REFERENCE.md` Tip line per chunk.
+- Updates to `stratum/docs/REFERENCE.md` Tip line per chunk.
 - (Optional) A `STRATUM-API-V1.md` mirror in Stratum's tree referencing this doc.
 
 ---
@@ -679,11 +679,11 @@ Thylacine:
 - `ARCHITECTURE.md §15` — capabilities (CAP_HOSTOWNER + console-attachment).
 
 Stratum:
-- `stratum/v2/docs/OS-INTEGRATION.md` — Stratum's existing OS integration manual. This doc adds the Thylacine-specific items.
-- `stratum/v2/docs/REFERENCE.md` — Stratum's as-built reference.
-- `stratum/v2/docs/reference/20-9p.md` — 9P wire semantics.
-- `stratum/v2/docs/reference/22-ctl.md` — `/ctl/` admin surface trust boundary.
-- `stratum/v2/src/janus/backend_passphrase.c` — design influence (not consumed by corvus).
+- `stratum/docs/OS-INTEGRATION.md` -- Stratum's existing OS integration manual. This doc adds the Thylacine-specific items.
+- `stratum/docs/REFERENCE.md` -- Stratum's as-built reference.
+- `stratum/docs/reference/20-9p.md` -- 9P wire semantics.
+- `stratum/docs/reference/22-ctl.md` -- `/ctl/` admin surface trust boundary.
+- `stratum/src/janus/backend_passphrase.c` -- design influence (not consumed by corvus).
 
 External:
 - Plan 9 `factotum(4)` — historical reference for the key-agent shape.

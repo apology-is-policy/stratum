@@ -546,7 +546,7 @@ STM_TEST(btree_lf_scan_after_delete) {
 /* MERGE: after a split, delete all keys on the upper (freshly created)
  * sibling. force_consolidate should absorb the upper sibling back into
  * its left neighbor — leaf_count drops from 2 to 1 and the upper
- * pivot is gone. Spec: v2/specs/merge.tla. */
+ * pivot is gone. Spec: specs/merge.tla. */
 STM_TEST(btree_lf_merge_rightmost_after_split) {
     stm_btree_lf *t = make_tree(4);
     stm_ebr_thread *ebr = stm_ebr_register();

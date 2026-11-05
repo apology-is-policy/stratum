@@ -258,7 +258,7 @@ language bindings, future kernel module) is a 9P consumer.
             action-trigger uid gating.
             13 tests in `tests/test_ctl.c` (10 baseline +
             3 R96 regressions); ctest 42 → 43.
-            CLAUDE.md trigger list extended with `v2/src/ctl/`.
+            CLAUDE.md trigger list extended with `src/ctl/`.
       - [x] **P9-CTL-1b /pools/ subtree + kind-table refactor**
             — substantive complete (`aac3e10`); R97 audit closed
             YELLOW (0 P0 + 0 P1 + 2 P2 + 8 P3, all addressed
@@ -719,7 +719,7 @@ language bindings, future kernel module) is a 9P consumer.
             test_ctl 138 → 140 (+2 R110 tests). 43/43 ctest green.
 
 - [~] **P9-CLI-1 stratum CLI** — partial. **P9-CLI-1 FS-only**
-      shipped: `stratum-fs` binary at `v2/src/cmd/stratum-fs/`,
+      shipped: `stratum-fs` binary at `src/cmd/stratum-fs/`,
       Plan-9-shaped subcommand interface wrapping libstratum-9p
       for the common POSIX file ops (ls / stat / read / write /
       mkdir / create / rm / rmdir / chmod / mv / ln / lns /
@@ -740,7 +740,7 @@ language bindings, future kernel module) is a 9P consumer.
       ROADMAP §11.3 medium-risk note.
 
 - [~] **P9-TUI-2a stratum-tui v2 wholesale lift** — partial.
-      Cargo crate at `v2/tui/`. v1's ratatui chrome (ui.rs /
+      Cargo crate at `tui/`. v1's ratatui chrome (ui.rs /
       panel.rs / app.rs / editor.rs / hostfs.rs / config.rs) lifted
       verbatim; new `p9.rs` is a libstratum-9p (.L) FFI shim
       preserving v1's `P9Client` API surface. Two friction points
@@ -759,7 +759,7 @@ language bindings, future kernel module) is a 9P consumer.
       dataset, scrub, /events) blocked on -2b after P9-CTL-2.
 
 - [ ] **P9-CTL-2 /ctl/-on-stratumd over .L** — pending; gates
-      P9-TUI-2b admin surfaces. Two pieces: (1) migrate `v2/src/ctl/`
+      P9-TUI-2b admin surfaces. Two pieces: (1) migrate `src/ctl/`
       codec from 9P2000 (current) to 9P2000.L; (2) wire `/ctl/` as a
       second listener in `stratumd` (or aname-routed on the same
       socket, TBD). Architectural decision per ARCH §10.2 ".L
@@ -776,9 +776,9 @@ language bindings, future kernel module) is a 9P consumer.
       v2.0 sync read-side primitives shipped: dial+Tversion+Tattach
       handshake, Twalk, TLopen, Tread, Tclunk, Tgetattr, Treaddir.
       Targets 9P2000.L only (matches stratumd's wire). Header at
-      `v2/include/stratum/9p_client.h`, impl at
-      `v2/src/9p_client/9p_client.c`. Tests at
-      `v2/tests/test_9p_client.c` against the in-process stratumd
+      `include/stratum/9p_client.h`, impl at
+      `src/9p_client/9p_client.c`. Tests at
+      `tests/test_9p_client.c` against the in-process stratumd
       accept loop (mirrors test_9p_socket harness pattern).
       Foundation for P9-CLI-1, P9-FUSE-1, P9-BIND-1/2/3.
       Public API:
@@ -908,7 +908,7 @@ language bindings, future kernel module) is a 9P consumer.
       Three pieces: (1) new public fs API stm_fs_link_by_ino (POSIX
       link(2) by source inode; mirrors stm_fs_link's R74/R81 audit
       posture); (2) new server-side h_link handler in
-      v2/src/9p/server.c (Tlink dispatcher case wired); (3) new
+      src/9p/server.c (Tlink dispatcher case wired); (3) new
       client primitive stm_9p_link inheriting R111 doctrine
       (op_entry_check, name validation, strict body-len equality
       on 0-byte Rlink, poison flag). Wire shape per .L spec:
@@ -951,7 +951,7 @@ language bindings, future kernel module) is a 9P consumer.
       cap EINVAL, readlink-on-non-symlink → server EINVAL, fsync
       round-trip with datasync ∈ {0, 1}. **Tlink (hard link)
       scoped OUT** — server-side h_link is not yet wired in
-      v2/src/9p/server.c (dispatcher returns ENOSYS); the client
+      src/9p/server.c (dispatcher returns ENOSYS); the client
       primitive will land alongside the server handler in a
       follow-on chunk. Other remaining ops (Txattrwalk,
       Txattrcreate, Tlock, Tgetlock, Tstatfs) deferred to keep this
@@ -1014,7 +1014,7 @@ Status as of 2026-04-30: **0/5 met**, **1/5 spec-scaffolded**.
   Twalk, Tbind/Tunbind), end-to-end FUSE mount tests (Linux CI
   only; macOS CI uses POSIX backend without FUSE).
 
-- CI matrix: `tlc-specs` job in `.github/workflows/v2-ci.yml`
+- CI matrix: `tlc-specs` job in `.github/workflows/ci.yml`
   updated at P8-NS-1 to include `namespace`. Future spec
   additions (none currently planned for Phase 9 beyond
   `namespace.tla`) extend the same matrix.

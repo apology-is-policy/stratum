@@ -82,7 +82,7 @@ the pool-global keys carry; the dataset_id drops because the tree
 itself names the dataset).
 
 A shared helper `stm_metakey_compose` / `stm_metakey_parse` in
-`v2/src/metakey/` (NEW small lib) is the single chokepoint for the
+`src/metakey/` (NEW small lib) is the single chokepoint for the
 encoding. Every module calls through it; no module reaches for the
 tag byte directly. The tag values are an enum (`stm_metakey_kind`)
 that the helper bounds-checks on parse — a foreign byte at the tag
@@ -609,7 +609,7 @@ Two new buggy configs:
 Both extensions get TLC-verified locally before 9.7-impl-1 starts. TLC tooling is available locally (memory `reference_tlc_tooling.md`):
 
 ```
-cd v2/specs
+cd specs
 "$(brew --prefix openjdk)/bin/java" -cp ~/tla2tools.jar tlc2.TLC \
     -config snapshot.cfg snapshot.tla
 "$(brew --prefix openjdk)/bin/java" -cp ~/tla2tools.jar tlc2.TLC \
@@ -889,7 +889,7 @@ The writeback dirty buffer (SWISS-4q-flush) is per-inode + per-dataset. A snapsh
 | 9.7-impl-6b..f | clones impl (snapshot APIs, engine routing, fs API, tests) | R168 |
 | 9.7-impl-6 | clones | R162 |
 
-Each impl chunk follows the standing discipline: pre-flush, ctest green at the close, R-audit verdict before the next chunk starts. Reference doc (`v2/docs/reference/13-snapshot.md`) updated in the same commit per the Phase 9 reference-doc upkeep policy.
+Each impl chunk follows the standing discipline: pre-flush, ctest green at the close, R-audit verdict before the next chunk starts. Reference doc (`docs/reference/13-snapshot.md`) updated in the same commit per the Phase 9 reference-doc upkeep policy.
 
 ## 12 — Spec-to-code mapping
 
@@ -916,10 +916,10 @@ Every impl call site gets a `/* SPEC: <module>.<action> */` comment matching the
 
 ## 14 — References
 
-- `v2/docs/reference/24-btree-engine.md` — engine API + per-node n_gen
-- `v2/docs/reference/13-snapshot.md` — existing snapshot module
-- `v2/specs/snapshot.tla` — lifecycle + TLY-A5 admission gate
-- `v2/specs/dead_list.tla` — block reclamation on snap-delete
-- `v2/specs/clone.tla` — clone-as-shared-root invariants
+- `docs/reference/24-btree-engine.md` -- engine API + per-node n_gen
+- `docs/reference/13-snapshot.md` -- existing snapshot module
+- `specs/snapshot.tla` -- lifecycle + TLY-A5 admission gate
+- `specs/dead_list.tla` -- block reclamation on snap-delete
+- `specs/clone.tla` -- clone-as-shared-root invariants
 - `docs/STRATUM.md` §7 (v1) — R9-1 rollback-bump doctrine
 - `project_snapshot_substrate_gap.md` (memory) — the gap that named this phase

@@ -13,7 +13,7 @@
 (* with a shared sibling leaf exercises COW-path completeness, subtree      *)
 (* sharing, the crash revert, and the free-only-unreachable rule.          *)
 (* Arbitrary depth is a B+tree-structure property covered by the design    *)
-(* doc (v2/docs/phase-9.6-metadata-tree-engine-design.md, sec 3.2).        *)
+(* doc (docs/phase-9.6-metadata-tree-engine-design.md, sec 3.2).        *)
 (*                                                                         *)
 (* Composition -- (paddr, gen) AEAD-nonce uniqueness is NOT modelled here. *)
 (* The allocator hands out fresh paddrs (allocator.tla) and sync advances  *)

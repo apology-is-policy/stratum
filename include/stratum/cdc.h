@@ -4,9 +4,9 @@
  *
  *   see docs/NOVEL.md §3.3 — CAS cold tier with content-defined chunking.
  *   see docs/ARCHITECTURE.md §6.9.4 — CAS chunk sizing parameters.
- *   see docs/ROADMAP-V2.md §10.1 — Phase 7 FastCDC deliverable.
- *   see docs/ROADMAP-V2.md §10.5 — P6-independent parallel scheduling.
- *   see v2/docs/phase7-status.md — pre-work scope.
+ *   see docs/ROADMAP.md section 10.1 -- Phase 7 FastCDC deliverable.
+ *   see docs/ROADMAP.md section 10.5 -- P6-independent parallel scheduling.
+ *   see docs/phase7-status.md -- pre-work scope.
  *
  * FastCDC (Xia et al. 2016) is a content-defined chunking algorithm: chunk
  * boundaries are determined by the data's content (via a rolling hash),

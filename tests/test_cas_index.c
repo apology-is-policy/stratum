@@ -2,9 +2,9 @@
 /*
  * CAS-tier index tests (P7-CAS, v18).
  *
- *   see v2/include/stratum/cas.h — public API.
- *   see v2/src/cas/cas_index.c — implementation.
- *   see v2/specs/cas.tla — formal model.
+ *   see include/stratum/cas.h -- public API.
+ *   see src/cas/cas_index.c -- implementation.
+ *   see specs/cas.tla -- formal model.
  *
  * Coverage corresponds 1:1 to cas.tla's invariants + actions:
  *   - CASIndexUnique (one entry per hash; insert refuses dup).

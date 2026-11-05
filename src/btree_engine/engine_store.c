@@ -5,7 +5,7 @@
  * The one stm_btree_store_vtable that binds the allocator-agnostic
  * btree_engine to the real stm_bootstrap allocator + stm_bdev block
  * device. See include/stratum/engine_store.h and
- * v2/docs/phase-9.6-impl-4b-sync-wiring-design.md §2.
+ * docs/phase-9.6-impl-4b-sync-wiring-design.md section 2.
  *
  * A separate translation unit + library (stm_engine_store) so the engine
  * proper (stm_btree_engine) stays allocator-agnostic — the engine and its

@@ -1,4 +1,4 @@
-# v2/tests INDEX
+# tests INDEX
 
 Quick reference for which test file covers which feature. Optimized
 for context efficiency: when you need to read tests for a feature,

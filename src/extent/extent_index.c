@@ -4,8 +4,8 @@
  * stm_dataset_index (P7-2 → 9.6-impl-4d → 9.7-impl-1c-v).
  *
  *   see include/stratum/extent.h — public API + invariants.
- *   see v2/specs/extent.tla — formal model.
- *   see v2/docs/phase-9.7-design.md §2 — per-dataset metadata trees.
+ *   see specs/extent.tla -- formal model.
+ *   see docs/phase-9.7-design.md section 2 -- per-dataset metadata trees.
  *
  * 9.7-impl-1c-v — the extent cutover. The module no longer owns its
  * own btree_engine. Each dataset's extent records live in that

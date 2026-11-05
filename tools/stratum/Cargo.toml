@@ -18,7 +18,7 @@ publish = false
 #   stratum mkfs IMAGE       → mkfs code path (FFI)
 #   stratum fs CMD ARGS      → 9P CLI code path (FFI)
 #
-# See v2/docs/SLATE-DESIGN.md §12 for the design rationale.
+# See docs/SLATE-DESIGN.md section 12 for the design rationale.
 
 [dependencies]
 ratatui      = "0.29"

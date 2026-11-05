@@ -4,7 +4,7 @@ This document is the **as-built** reference for Stratum v2. It
 describes what exists in the v2 tree today, where the relevant code
 lives, which invariants the TLA+ specs pin, and how the subsystems
 compose. It is not a roadmap and not a design document — see
-`docs/ARCHITECTURE.md` for design intent and `docs/ROADMAP-V2.md`
+`docs/ARCHITECTURE.md` for design intent and `docs/ROADMAP.md`
 for phased scope.
 
 ## How to read this
@@ -381,7 +381,7 @@ checkpoint records below remain historical.
   this commit). Three `*_ub_version_is_v29` tests renamed `_is_v30`.
   Encoder/decoder extended; persistence roundtrip verified.
 
-- **Pre-tip-6**: Phase 9.7-impl-1a — `v2/src/metakey/` lib lands.
+- **Pre-tip-6**: Phase 9.7-impl-1a -- `src/metakey/` lib lands.
   Small chokepoint for the 1-byte type-tag prefix that
   discriminates per-record-kind subspaces inside a single
   per-dataset `btree_engine`. No callers yet (1c-ii..1c-v wire
@@ -751,7 +751,7 @@ checkpoint records below remain historical.
   P3-8): per-subsystem `reference/NN-*.md` catalog for the Phase
   9 9P-server + transport + /ctl/ + client modules. With this
   commit, the catalog is complete through index 23.
-  - New: `v2/docs/reference/20-9p.md` / `21-stratumd.md` /
+  - New: `docs/reference/20-9p.md` / `21-stratumd.md` /
     `22-ctl.md` / `23-9p_client.md`. Each follows the existing
     template: Purpose, Public API, Implementation, Spec
     cross-reference, SPEC-TO-CODE mapping, Tests, Status table.
@@ -770,7 +770,7 @@ checkpoint records below remain historical.
   `fs->lock` granularity refinement (SPEC ONLY, no impl yet). Lays
   down the formal model + design doc the multi-commit impl phase
   (future sessions) will reference.
-  - `v2/docs/p9.5-parallel-3-design.md` enumerates three-tier
+  - `docs/p9.5-parallel-3-design.md` enumerates three-tier
     locking (fs->global SH/EX → per-dataset (future) → per-inode
     mutex), ascending `(dataset_id, ino)` lock acquisition order,
     classification of every public `stm_fs_*` mutating function
@@ -779,7 +779,7 @@ checkpoint records below remain historical.
     consistent) is PRESERVED; what changes is
     `WriterCompoundOpAtomicVsWriter` (one big-fs-lock) refines to
     `WriterAtomicPerInode` (one writer per inode lock).
-  - `v2/specs/compound_ops_per_inode.tla` extends `compound_ops.tla`
+  - `specs/compound_ops_per_inode.tla` extends `compound_ops.tla`
     with `Inodes` constant + `inode_lock_holder` map + per-writer
     `op_targets`/`held` sets. 6 invariants: TypeOK,
     WriterAtomicPerInode, LockOrderPreserved, NoCircularWait,
@@ -794,8 +794,8 @@ checkpoint records below remain historical.
   documents the contract that emerges under post-PARALLEL-1
   concurrent /ctl/: **per-subsystem linearizable + cross-subsystem
   eventually-consistent** reads.
-  - `v2/docs/p9.5-parallel-2-design.md` enumerates every compound
-    op in `v2/src/fs/fs.c` (~40 public APIs, audited via Explore
+  - `docs/p9.5-parallel-2-design.md` enumerates every compound
+    op in `src/fs/fs.c` (~40 public APIs, audited via Explore
     agent). Headline finding: NO public stm_fs_* function releases
     fs->lock mid-body — every multi-subsystem sub-step runs under
     one continuous fs->lock hold. R128/R130 pre-flush wiring is in
@@ -804,7 +804,7 @@ checkpoint records below remain historical.
     `stm_fs_unlink_anon`, `stm_fs_truncate`, `stm_fs_rename`
     overwrite, `stm_fs_create_snapshot`, `stm_fs_copy_file_range`,
     `stm_fs_migrate_to_cold`, `stm_fs_promote_to_hot`).
-  - `v2/specs/compound_ops.tla` + 3 cfgs: main healthy +
+  - `specs/compound_ops.tla` + 3 cfgs: main healthy +
     `compound_ops_writer_releases_lock_mid_buggy` (trips
     WriterCompoundOpAtomicVsWriter) +
     `compound_ops_negative_counter_buggy` (trips NoNegativeCounters).
@@ -816,7 +816,7 @@ checkpoint records below remain historical.
     NoNegativeCounters (compound-op step ordering preserves
     non-neg), MultiSubReadIsBracketed (the eventual-consistency
     contract in formal shape — the weakest possible).
-  - `v2/tests/test_compound_ops_concurrent.c` — pthread harness
+  - `tests/test_compound_ops_concurrent.c` -- pthread harness
     exercising stm_fs_create_snapshot + stm_fs_delete_snapshot
     (writer) racing stm_fs_stats_get + stm_fs_dataset_count +
     stm_snapshot_iter (reader) for 200 iterations / thread. Asserts
@@ -837,16 +837,16 @@ checkpoint records below remain historical.
 
 - **Pre-tip-24**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
   accept + R131 audit close + #961 dedicated concurrent regression
-  tests. `v2/include/stratum/ctl.h` declares the new
+  tests. `include/stratum/ctl.h` declares the new
   per-connection wrapper API (`stm_ctl_conn_create` / `_destroy` /
-  `_caller_uid`); `v2/src/ctl/synfs.c` splits `stm_ctl` into a
+  `_caller_uid`); `src/ctl/synfs.c` splits `stm_ctl` into a
   shared core (immutable subsystem pointers + event_buf+event_gen
   under event_mu + worker-count refcount under worker_mu/worker_cv)
   and a per-connection `stm_ctl_conn` (immutable caller_uid +
   per-conn sessions[] under per-conn mu). Every vops_* now takes
   ctx as `stm_ctl_conn *`. `stm_ctl_destroy` blocks on worker_cv
   until every live conn has destroyed (LifecycleNoUAF from
-  `v2/specs/ctl_conn.tla`). stratumd's `serve_ctl_client` calls
+  `specs/ctl_conn.tla`). stratumd's `serve_ctl_client` calls
   `stm_ctl_conn_create(ctl, peer_uid, peer_gid, &cn)` per accept,
   passes `cn` as vops ctx; `stm_stratumd_accept_ctl_loop` spawns
   a DETACHED pthread per accept (SWISS-4g pattern extended from
@@ -860,10 +860,10 @@ checkpoint records below remain historical.
   + cross-conn event_gen invalidation + 4-way no-collision +
   create-input validation), `tests/test_ctl_conn_lifecycle.c` (6
   tests — destroy-blocks-on-cv + many short conns + NULL safety
-  + caller_uid accessor), `v2/tools/stratum/tests/concurrent_ctl.rs`
+  + caller_uid accessor), `tools/stratum/tests/concurrent_ctl.rs`
   e2e (2 tests for two-client + three-client wall-time bounds).
   SWISS-8k disconnect-between-ticks workaround retired in
-  `v2/tools/stratum/src/{volmap,snapgraph}.rs` — TUI pollers
+  `tools/stratum/src/{volmap,snapgraph}.rs` -- TUI pollers
   hold long-lived /ctl/ connections again. R131 audit found 0
   P0/P1; 3 P2 doc-drift items closed inline (ctl.h Concurrency
   docstring rewritten to describe stm_ctl_conn split,
@@ -877,7 +877,7 @@ checkpoint records below remain historical.
   verify ctl_conn.tla, tooling-gated).
 
 - **Pre-tip-25**: P9-CTL-2b /ctl/ codec migration to lp9.
-  `v2/src/ctl/synfs.c` + `v2/include/stratum/ctl.h` + `v2/tests/test_ctl.c`
+  `src/ctl/synfs.c` + `include/stratum/ctl.h` + `tests/test_ctl.c`
   all re-keyed from `stm_p9_server` (9P2000 vops) to `stm_lp9_server`
   (.L vops). The `KIND_META[]` table, `qid_path` encoding, materializer
   functions, admin gate, session lifecycle, and audit-log doctrine
@@ -901,17 +901,17 @@ checkpoint records below remain historical.
   migration; the lp9 trigger row notes /ctl/ as the first consumer.
   46/46 ctest green; 140/140 test_ctl pass.
 
-- **Pre-tip-7**: P9-CTL-2a stm_lp9_server. New library `v2/src/lp9/`
+- **Pre-tip-7**: P9-CTL-2a stm_lp9_server. New library `src/lp9/`
   — generic vops-based 9P2000.L server, sibling to `stm_p9_server`
   (9P2000 vops) but on the .L wire. v1.0 wire-handles Tversion/
   Tattach/Twalk/Tlopen/Tread/Twrite/Tclunk/Tflush/Tgetattr/Treaddir;
   optional ops return Rlerror(ENOSYS) when their vops slot is NULL.
-  Trust-boundary discipline lifted verbatim from `v2/src/9p/server.c`
+  Trust-boundary discipline lifted verbatim from `src/9p/server.c`
   (the FS-bound .L server). 5 unit tests in `test_lp9.c`. CLAUDE.md
   trigger row added.
 
 - **Pre-tip-8**: stratum-mkfs CLI. New artifact: `stratum-mkfs`
-  binary at `v2/src/cmd/stratum-mkfs/`. Wraps `stm_fs_format` +
+  binary at `src/cmd/stratum-mkfs/`. Wraps `stm_fs_format` +
   initial dataset-root setup so users can `stratum-mkfs vol.stm` and
   immediately point stratumd at the resulting image. Defaults: 64 MiB
   device, 16 MiB bootstrap pool, auto-generated PQ-hybrid keyfile at
@@ -926,7 +926,7 @@ checkpoint records below remain historical.
 
 - **Pre-tip-7**: P9-TUI-2a stratum-tui v2 wholesale lift. 45
   ctest suites green (TUI is Rust crate; not in ctest). New artifact:
-  `stratum-tui` binary at `v2/tui/`. ratatui chrome (FAR
+  `stratum-tui` binary at `tui/`. ratatui chrome (FAR
   Commander-style dual-pane file manager + inline editor) lifted
   verbatim from v1's TUI; the 9P client (which spoke 9P2000) replaced
   by a libstratum-9p (.L) FFI shim that preserves v1's `P9Client`
@@ -945,7 +945,7 @@ checkpoint records below remain historical.
   (no `stratum mkfs` CLI yet); snapshot ops lifted but error pending
   P9-CTL-2 (`/ctl/-on-stratumd`); `cli` subcommand replaced by a
   redirect to `stratum-fs`. Build: standalone cargo crate at
-  `v2/tui/` with `build.rs` discovering the cmake build dir
+  `tui/` with `build.rs` discovering the cmake build dir
   (`STM_BUILD_DIR` env or `../build` fallback). Design captured at
   `docs/TUI-DESIGN.md`. Phased plan: this is -2a (lift + shim +
   file-side ops); P9-CTL-2 migrates `/ctl/` to .L + wires it on
@@ -955,7 +955,7 @@ checkpoint records below remain historical.
 - **Pre-tip-7**: P9-CLI-1 FS-only stratum-fs CLI. 45 ctest
   suites green (was 44; +test_stratum_fs). test_stratum_fs 0 → 15
   integration tests. New artifact: `stratum-fs` binary at
-  `v2/src/cmd/stratum-fs/`. Plan-9-shaped subcommand dispatcher
+  `src/cmd/stratum-fs/`. Plan-9-shaped subcommand dispatcher
   wrapping libstratum-9p for the common POSIX file ops: ls / stat /
   read / write / mkdir / create / rm / rmdir / chmod / mv / ln /
   lns / readlink / sync. Socket selection: `-s SOCKET`,
@@ -988,7 +988,7 @@ checkpoint records below remain historical.
   STM_EPERM-on-dir, R81 P3-1 ctime-stamp-after-success, R74 P3-3
   rollback infallibility). Type check covers S_IFREG (REG), S_IFLNK
   (LNK); refuses S_IFDIR + every unsupported type with EPERM. (2)
-  new server-side handler h_link in v2/src/9p/server.c. Wire shape:
+  new server-side handler h_link in src/9p/server.c. Wire shape:
   dfid[4] fid[4] name[s]; reply: header only. Verifies both fids are
   fresh NODE fids in the same dataset (cross-dataset → EXDEV),
   validate_name on the new name, then delegates to
@@ -1036,7 +1036,7 @@ checkpoint records below remain historical.
   STM_ERANGE with out_len reporting required size, readlink-NULL/
   zero-cap EINVAL, readlink-on-non-symlink → server EINVAL,
   fsync round-trip with datasync ∈ {0, 1}. **Tlink (hard link)
-  scoped OUT** — server-side h_link is not yet wired in v2/src/9p/
+  scoped OUT** -- server-side h_link is not yet wired in src/9p/
   server.c (dispatcher returns ENOSYS); the client primitive will
   land alongside the server handler in a follow-on chunk. Other
   remaining write-side ops (Txattrwalk, Txattrcreate, Tlock,
@@ -1156,9 +1156,9 @@ checkpoint records below remain historical.
   (TVERSION + TATTACH), Twalk, TLopen, Tread, Tclunk, Tgetattr,
   Treaddir, with monotonic tag allocation + Linux-ecode → stm_status
   mapping closed under err_map. Targets 9P2000.L only (matches
-  stratumd's wire). Header at v2/include/stratum/9p_client.h
-  (~210 lines); impl at v2/src/9p_client/9p_client.c (~620 lines);
-  tests at v2/tests/test_9p_client.c (12 tests, ~540 lines)
+  stratumd's wire). Header at include/stratum/9p_client.h
+  (~210 lines); impl at src/9p_client/9p_client.c (~620 lines);
+  tests at tests/test_9p_client.c (12 tests, ~540 lines)
   against the in-process stratumd accept loop. Trust boundaries:
   wire framing bounded by msize, Rlerror parsing closed under
   err_map(), tag mismatch → STM_EBACKEND (connection-poisoned
@@ -1578,7 +1578,7 @@ checkpoint records below remain historical.
   Every node read-only at v2.0 (Twrite returns EACCES);
   action-trigger files are sub-chunk scope. 10 tests in
   `tests/test_ctl.c`; ctest 42 → 43. CLAUDE.md trigger list
-  extended with `v2/src/ctl/`. Subsequent sub-chunks: -1b
+  extended with `src/ctl/`. Subsequent sub-chunks: -1b
   /pools/, -1c /datasets/, -1d /tracing/+/debug/+/events,
   -1e /metrics/.
 
@@ -1587,7 +1587,7 @@ checkpoint records below remain historical.
   surface) and Phase 9 (9P-server stack) shipped without
   Snapshot updates; the catalog of `reference/NN-*.md` files
   also has no entries for the new modules
-  (`v2/src/{inode,dirent,xattr,locks,9p,ctl,cmd/stratumd}/`).
+  (`src/{inode,dirent,xattr,locks,9p,ctl,cmd/stratumd}/`).
   Backfilling those is a chunk-of-its-own and not in scope
   here. The phase status docs (`phase8-status.md`,
   `phase9-status.md`) carry the per-chunk detail in the
@@ -2810,7 +2810,7 @@ checkpoint records below remain historical.
   `extent_index.c` alongside the Phase 4 `extent.c` AEAD wrapper)
   + 28 public headers.
 
-For phase-level status see `v2/docs/phase{2,3,4,5}-status.md`. The
+For phase-level status see `docs/phase{2,3,4,5}-status.md`. The
 reference below covers the as-built layers in bottom-up order.
 
 ## Contents

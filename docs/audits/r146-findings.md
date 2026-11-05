@@ -36,7 +36,7 @@ The marker-bypass surface was prosecuted hard:
 ## P2
 
 ### P2-1 — failed `mark`/`unmark` verb still persists the flag on the next commit
-`v2/src/ctl/synfs.c` ~3540-3555 (mark/unmark write handler).
+`src/ctl/synfs.c` ~3540-3555 (mark/unmark write handler).
 
 `stm_fs_mark_snapshot_compromised` mutates the in-RAM index (`e.flags |= …`,
 `idx->dirty = true`) and returns STM_OK. The handler then calls
@@ -62,7 +62,7 @@ returns OK") is the load-bearing claim; the unmark side has no such guarantee
 and should not be presented symmetrically.
 
 ### P2-2 — snapshot id is never bound to the dataset in the qid path
-`v2/src/ctl/synfs.c` mark/unmark/rollback handlers; `v2/src/fs/fs.c`
+`src/ctl/synfs.c` mark/unmark/rollback handlers; `src/fs/fs.c`
 `stm_fs_rollback_snapshot`, `stm_fs_mark_snapshot_compromised`.
 
 `/ctl/datasets/<dsid>/rollback-snapshot` (and mark/unmark) parse `snap_id`
@@ -98,7 +98,7 @@ whole snapshot-verb family.
 ## P3
 
 ### P3-1 — design-spec'd `mark` reason text was dropped from the impl
-`v2/docs/thylacine-a5-design.md` §6 specs the `mark-snapshot-compromised`
+`docs/thylacine-a5-design.md` section 6 specs the `mark-snapshot-compromised`
 body as `<sid>` **or** `<sid> <reason>`, with a "`mark` reason validation
 (R99 P2-1 line-injection doctrine)" paragraph requiring length-bound +
 control-byte refusal, the reason flowing into `/ctl/events`. The impl's mark
@@ -110,7 +110,7 @@ reason, or the design doc + §3 should be amended to record that the reason
 text was deliberately dropped from A5.
 
 ### P3-2 — `STM_ECOMPROMISED` → EACCES wire mapping is lossy but acceptable
-`v2/src/lp9/server.c:117`. A compromised-refused rollback and a genuine
+`src/lp9/server.c:117`. A compromised-refused rollback and a genuine
 permission denial both surface to a 9P client as `Rlerror(EACCES)`. The
 `/ctl/events` line distinguishes them (`result=err:ecompromised` vs
 `err:eaccess`) and `stm_strerror` is correct, so an operator reading logs is

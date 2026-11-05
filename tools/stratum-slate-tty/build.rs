@@ -1,6 +1,6 @@
 // Locate cmake-built libstm_9p_client + emit cargo:rustc-link-* directives.
-// Mirrors v2/tui/build.rs but the candidate paths are adjusted for the
-// extra directory level (we're at v2/tools/stratum-slate-tty/).
+// Mirrors tui/build.rs but the candidate paths are adjusted for the
+// extra directory level (we're at tools/stratum-slate-tty/).
 use std::env;
 use std::path::PathBuf;
 
