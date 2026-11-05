@@ -11,12 +11,13 @@
  * type, 2-byte tag, body. Mirrors stratumd's `read_msg` /
  * `write_msg` exactly -- see `src/cmd/stratumd/serve.c`.
  *
- * Tag allocation: monotonic counter starting at 1 (NOTAG = 0xFFFF
- * reserved by spec for Tversion). Wraps detected at 0xFFFF and
- * surfaced as STM_EOVERFLOW; sync client doesn't disambiguate
- * across-wrap collisions cheaply, so the policy is "reconnect or
- * fail". v2.0 budget of 64K ops per client is plenty for CLI
- * workflows.
+ * Tag allocation: a counter over [1, NOTAG-1] (NOTAG = 0xFFFF is
+ * reserved by spec for Tversion) that starts again at 1. A tag need
+ * only differ from those outstanding, and this client has one request
+ * outstanding and reads its reply before sending the next; a reply
+ * under any other tag poisons the connection. So a tag can come round
+ * again, and a connection that lives as long as a manager session, or
+ * slate's to its backends, is not ended at its 65534th request.
  *
  * Rlerror handling: 9P2000.L always returns Rlerror (type 7) with
  * a 4-byte Linux ecode. Mapped to stm_status via err_map(). Unknown
@@ -136,7 +137,7 @@ struct stm_9p_client {
     int       fd;
     uint32_t  msize;          /* negotiated; 0 before Tversion */
     uint32_t  iounit;         /* msize - hdr - 4 */
-    uint16_t  next_tag;       /* monotonic counter; 0 reserved by spec */
+    uint16_t  next_tag;       /* cycles over 1..NOTAG-1; 0 unused */
     int       last_errno;
     /* P9-LIB-1 cleanup R111 F-11: connection-poisoned flag. Set by
      * check_reply on any tag-mismatch reply (the lib can no longer
@@ -240,12 +241,11 @@ static stm_status op_entry_check(stm_9p_client *c)
 /* Tag allocation.                                                        */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* Returns a fresh tag in [1, NOTAG-1]. STM_EOVERFLOW once exhausted —
- * caller must reconnect. */
+/* The next tag in [1, NOTAG-1], starting again at 1 after NOTAG-1. */
 static stm_status alloc_tag(stm_9p_client *c, uint16_t *out_tag)
 {
-    if (c->next_tag == STM_9P_NOTAG) return STM_EOVERFLOW;
-    *out_tag = c->next_tag++;
+    *out_tag = c->next_tag;
+    c->next_tag = (uint16_t)(c->next_tag >= STM_9P_NOTAG - 1u ? 1u : c->next_tag + 1u);
     return STM_OK;
 }
 

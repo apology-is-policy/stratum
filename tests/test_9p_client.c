@@ -256,6 +256,28 @@ STM_TEST(p9_client_walk_zero_steps_clones_fid)
     destroy_client_fixture(&f);
 }
 
+/* One request outstanding, so a tag may come round again: a connection that lives as
+ * long as a manager session passes 65534 requests. */
+STM_TEST(p9_client_outlives_its_tag_space)
+{
+    client_fixture f;
+    make_client_fixture("tag_wrap", &f);
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_qid qids[STM_9P_MAX_WALK];
+    uint16_t nwalked = 0;
+    for (int i = 0; i < 34000; i++) {
+        STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, qids, &nwalked));
+        STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    }
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
 STM_TEST(p9_client_walk_n_too_large_einval)
 {
     client_fixture f;
