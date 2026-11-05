@@ -575,13 +575,29 @@ stratum fs -s SOCKET put ./dir /dir                    script it
 **What works, from the code:** recursive copy (`F5`) with progress and conflict handling, delete (`F8`), mkdir (`F7`), a modal editor (`F3`, `F4`), the create-volume wizard
 (`Shift+F7`), snapshot list, create, delete and rollback (`F9`, dataset 1 only), a pool map and snapshot graph (`F2`), and pressing Enter on a `.stm` file to mount it in the other pane.
 
-**How the daemons stop.** The manager's daemons hold a lifeline to it and stop when it does, however it ends. On a stop, a daemon ends the reading side of every connection, finishes the request in hand, and unmounts, so a client that keeps talking cannot keep a volume mounted. One image has one daemon, enforced with `flock`, and `mkfs` refuses a file holding data, a key in the way, and a volume in use.
+**How the daemons stop.** The manager's daemons hold a lifeline to it and stop when it does, however it ends. On a stop, a daemon ends the reading side of every connection, finishes the request in hand, gives a reply blocked on a client that is not reading 2 s, then shuts that connection's writing side, and unmounts. So no client, talking or silent, can keep a volume mounted. One image has one daemon, enforced with `flock`, and `mkfs` refuses a file holding data, a key in the way, and a volume in use.
 
-**Durability.** A manager copy runs one `stratum fs` command per item, and each mutating command ends with a whole-pool commit before it reports success. What the manager reports copied is therefore durable, and a copy of `N` items costs `N` commits.
+**How a copy behaves.** `F5` copies the selection, or the entry under the cursor, into the other panel's directory, as one batch with progress.
+
+- **What goes.** Regular files and directories. Symlinks and special files are left out and counted as skipped, and the summary says so. A name the manager cannot hold exactly, one that is not UTF-8 or holds a control character, is refused and counted as failed.
+- **Refused whole.** Before anything moves, the batch is refused if any item's destination is the item itself, lies inside it, or contains it: by canonical path from host to host, by path within one volume. A bind mount hides from this check (T0.55).
+- **Directories** are walked in name order and made before their contents, with the source's permission bits plus the owner's, so that the copy can fill them. One already there is merged into and keeps its mode. A symlink standing where a directory goes is refused. When a directory cannot be made, nothing under it is tried, and all of it counts as failed.
+- **When the name is taken,** by a dangling symlink too, the manager asks: Skip, Overwrite or Keep both, each also for the rest of the batch, or Cancel. Skip on a directory skips everything under it. Overwrite on a directory merges into it. Keep both takes the first free name of the form `name-2.ext`, and a directory's contents go with it. Cancel ends the batch, and what is left counts as skipped. A Skip for the rest of the batch that was answered for a file merges into a directory already there, and meets each file inside with Skip.
+- **A file is never half replaced.** New bytes for an existing name go to a temporary name beside it and are moved over the old file only once they are whole, so the old file stays readable until then. A new name on the host also goes through a temporary, then a link to the name, so a name that appeared meanwhile is refused, not replaced. A new name on a volume is written in place by `stratum fs write -n`, which refuses a name that is there. A failed item removes only what it made.
+- **Checked, not trusted.** The bytes that arrived are counted against the source's size. A host source is opened once, without following a link, and must be a regular file, so its size and mode come from the file whose bytes are read. A volume source is read by a process of its own, so it is asked again before the copy commits, and a changed inode, mode or size fails the item.
+- **Who may read it.** A copy is created with its source's permission bits, without setuid, setgid and sticky, so nobody the source keeps out can read it while it fills. Host temporaries are made at 0600.
+- **Not kept:** modification time, owner, extended attributes, holes in sparse files, and hard links, which become separate files (T5.4).
+- **A batch is not one transaction.** Stopped or killed part way, it leaves the items done so far. A kill during a volume item can leave a short file under a new name, and temporaries named `.stratum-copy-<pid>-<n>` (T0.56).
+
+**How a delete behaves.** `F8` asks "Delete N items?" with No selected, and nothing is touched unless the answer is Yes. Items go one at a time, a directory with everything in it. Esc stops the batch after the item in hand. A quit key, `F5`, `F7` or `F8` during a batch asks Stop or Go on, and the batch waits while it asks. The manager quits only once no batch runs.
+
+**Names.** A name the manager cannot show exactly, one that is not UTF-8, holds a control character, or is longer than 9P's 255 bytes on the host, is listed with U+FFFD standing in, and no action accepts it: it is not entered, copied or deleted from the manager. The host panel checks on every use that a name still leads to the file it was walked to, so a renamed or replaced file is not served under its old name.
+
+**Durability.** A manager copy runs one `stratum fs` command per item, and each mutating command ends with a whole-pool commit before it reports success. What the manager reports copied into a volume is therefore durable, and a copy of `N` items costs `N` commits. On the host, a file that replaces another is synced before it is moved into place; a new file is left to the host's own write-back.
 
 **Known gaps:**
 
-- No move or rename in the manager (`stratum fs mv` exists). Three of six admin panes say "Coming soon". Copies carry no mode or mtime across backends and skip symlinks.
+- No move or rename in the manager (`stratum fs mv` exists). Three of six admin panes say "Coming soon". Copies keep no modification time and skip symlinks.
 - "Static" is partial: libsodium links dynamically.
 
 **How keys work, and how this differs from VeraCrypt.** A volume always needs a **keyfile**, by default `<volume>.key` beside it. A passphrase does not derive the volume key; it seals the
@@ -607,7 +623,7 @@ Stratum is the opposite trade to VeraCrypt: it does not hide that it exists, but
 
 ## 15. Evidence of correctness
 
-**Tests.** 80 suites and 2,489 test legs, in C. The manager has 35 Rust integration tests and 97 unit tests.
+**Tests.** 81 suites and 2,516 test legs, in C. The manager has 35 Rust integration tests and 106 unit tests, and three drivers run the real binary: `volume_smoke.sh`, `stop_with_clients.py`, and `manager_keys.py`, which plays the manager's keys in a terminal and reads the screen.
 
 **TLA+.** 43 specifications with 191 configurations, of which 135 are deliberately broken and must fail. Coverage includes commit and quorum, allocator and deferred free, nonce uniqueness,
 Merkle links, COW commit, delta chains and epochs, the namespace layer, compound operations, dead lists, clones, CAS, and the key schema. CI runs 12 of these configurations. The rest are run by
@@ -677,6 +693,8 @@ All are tracked. Those marked *by reading* have not been reproduced yet.
 - Unlink while open, as in section 12.
 - *By reading:* a scrub started on a running daemon reports RUNNING and verifies nothing, since nothing steps it. When driven, it verifies hot extents only and counts everything else as verified.
 - *By reading:* a device replace moves bytes without rewriting extent addresses (library only).
+- *By reading:* a manager Overwrite can replace a volume image a daemon has open, or its key.
+- *By reading:* a kill during a manager copy into a volume can leave a short file under a new name.
 
 ### 16.4 Unbuilt
 
