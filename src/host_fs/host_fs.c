@@ -12,12 +12,15 @@
  *   OR > 4G dev numbers — neither realistic on macOS / Linux today,
  *   but worth a forward-note.
  *
- *   We maintain a `paths` map (qid_path → strdup'd absolute host
- *   path) that is populated on every vops.walk return. The map
- *   grows monotonically over the host_fs instance's lifetime,
- *   bounded by HOST_FS_MAX_PATHS (4096); on overflow we refuse the
- *   walk with STM_ENOMEM. v1.1 forward-note: LRU eviction or weak
- *   reference via fid count.
+ *   We maintain a `paths` map (qid_path -> the absolute host path a
+ *   walk last reached the file by, with the file's dev and ino). A
+ *   walk replaces the entry: the client is naming the file now. Every
+ *   use checks that the name still leads to that dev and ino, and
+ *   answers ENOENT when it does not, so a rename or a reused inode is
+ *   refused, never served as another file. The map is a cache of at
+ *   most HOST_FS_MAX_PATHS names: when full, names unused for a while
+ *   are dropped (never the root's, nor one behind an open fid), and a
+ *   fid left without a name answers ENOENT the same way.
  *
  *   Per-fid open state (fd / DIR*) is tracked in `fids` keyed by
  *   fid. Cleared on clunk.
@@ -47,6 +50,8 @@
 
 typedef struct host_fs_path {
     uint64_t qid_path;
+    uint64_t dev, ino;      /* the file abs_path led to when it was walked */
+    uint64_t used;          /* h->clock at the last store or lookup */
     char *abs_path;
     struct host_fs_path *next;
 } host_fs_path;
@@ -66,6 +71,7 @@ struct stm_host_fs {
     pthread_mutex_t mu;
     host_fs_path *paths[HOST_FS_PATH_BUCKETS];
     uint32_t paths_count;
+    uint64_t clock;         /* one tick per path store or lookup */
     host_fs_fid *fids[HOST_FS_FID_BUCKETS];
 };
 
@@ -100,38 +106,117 @@ static uint32_t path_hash(uint64_t qid)
     return (uint32_t)((qid * 0x9E3779B97F4A7C15ull) >> 32) % HOST_FS_PATH_BUCKETS;
 }
 
+static bool same_file(const struct stat *st, uint64_t dev, uint64_t ino)
+{
+    return (uint64_t)st->st_dev == dev && (uint64_t)st->st_ino == ino;
+}
+
 /* Caller holds h->mu. Returns NULL if not found. */
-static const char *path_lookup_locked(stm_host_fs *h, uint64_t qid)
+static host_fs_path *path_lookup_locked(stm_host_fs *h, uint64_t qid)
 {
     uint32_t b = path_hash(qid);
     for (host_fs_path *p = h->paths[b]; p; p = p->next) {
-        if (p->qid_path == qid) return p->abs_path;
+        if (p->qid_path == qid) {
+            p->used = ++h->clock;
+            return p;
+        }
     }
     return NULL;
 }
 
-/* Caller holds h->mu. Stores `abs_path` (we strdup); returns STM_OK,
- * STM_ENOMEM, or STM_OK if already present (collision-tolerant). */
-static stm_status path_store_locked(stm_host_fs *h, uint64_t qid, const char *abs_path)
+/* Caller holds h->mu. */
+static bool qid_has_open_fid_locked(const stm_host_fs *h, uint64_t qid)
 {
-    uint32_t b = path_hash(qid);
-    for (host_fs_path *p = h->paths[b]; p; p = p->next) {
-        if (p->qid_path == qid) return STM_OK; /* already stored */
+    for (uint32_t i = 0; i < HOST_FS_FID_BUCKETS; i++) {
+        for (const host_fs_fid *f = h->fids[i]; f; f = f->next) {
+            if (f->qid_path == qid) return true;
+        }
     }
-    if (h->paths_count >= HOST_FS_MAX_PATHS) {
-        return STM_ENOMEM;
+    return false;
+}
+
+/* Caller holds h->mu. Drops every name not stored or looked up in the last
+ * HOST_FS_MAX_PATHS/2 ticks. A tick touches one name, so at most that many
+ * survive besides the root and names behind an open fid, and the next drop is
+ * at least as many stores away. */
+static void paths_evict_locked(stm_host_fs *h)
+{
+    const uint64_t window = HOST_FS_MAX_PATHS / 2u;
+    uint64_t keep_from = h->clock > window ? h->clock - window : 0;
+    for (uint32_t i = 0; i < HOST_FS_PATH_BUCKETS; i++) {
+        host_fs_path **link = &h->paths[i];
+        while (*link) {
+            host_fs_path *p = *link;
+            if (p->used < keep_from && p->qid_path != h->root_qid_path
+                && !qid_has_open_fid_locked(h, p->qid_path)) {
+                *link = p->next;
+                free(p->abs_path);
+                free(p);
+                h->paths_count--;
+            } else {
+                link = &p->next;
+            }
+        }
     }
-    host_fs_path *p = calloc(1, sizeof *p);
-    if (!p) return STM_ENOMEM;
-    p->qid_path = qid;
-    p->abs_path = strdup(abs_path);
-    if (!p->abs_path) {
-        free(p);
-        return STM_ENOMEM;
+}
+
+/* Caller holds h->mu. Records that `abs_path` leads to the file `st`
+ * describes, replacing whatever name the qid had. The root keeps its name. */
+static stm_status path_store_locked(stm_host_fs *h, uint64_t qid,
+                                    const struct stat *st, const char *abs_path)
+{
+    host_fs_path *p = path_lookup_locked(h, qid);
+    if (p && qid == h->root_qid_path && p->abs_path) {
+        /* Another file whose number folds onto the root's cannot be served. */
+        return same_file(st, p->dev, p->ino) ? STM_OK : STM_EIO;
     }
-    p->next = h->paths[b];
-    h->paths[b] = p;
-    h->paths_count++;
+    char *copy = strdup(abs_path);
+    if (!copy) return STM_ENOMEM;
+    if (!p) {
+        if (h->paths_count >= HOST_FS_MAX_PATHS) paths_evict_locked(h);
+        if (h->paths_count >= HOST_FS_MAX_PATHS) {
+            free(copy);
+            return STM_ENOMEM;
+        }
+        p = calloc(1, sizeof *p);
+        if (!p) {
+            free(copy);
+            return STM_ENOMEM;
+        }
+        uint32_t b = path_hash(qid);
+        p->qid_path = qid;
+        p->used = ++h->clock;
+        p->next = h->paths[b];
+        h->paths[b] = p;
+        h->paths_count++;
+    }
+    free(p->abs_path);
+    p->abs_path = copy;
+    p->dev = (uint64_t)st->st_dev;
+    p->ino = (uint64_t)st->st_ino;
+    return STM_OK;
+}
+
+/* Copies the name stored for `qid` into `out`, with the file it led to. */
+static stm_status path_snapshot(stm_host_fs *h, uint64_t qid,
+                                char out[HOST_FS_PATH_MAX + 1],
+                                uint64_t *dev, uint64_t *ino)
+{
+    pthread_mutex_lock(&h->mu);
+    const host_fs_path *p = path_lookup_locked(h, qid);
+    if (!p) {
+        pthread_mutex_unlock(&h->mu);
+        return STM_ENOENT;
+    }
+    size_t plen = strlen(p->abs_path);
+    if (plen > HOST_FS_PATH_MAX) {
+        pthread_mutex_unlock(&h->mu);
+        return STM_EINVAL;
+    }
+    memcpy(out, p->abs_path, plen + 1);
+    *dev = p->dev;
+    *ino = p->ino;
+    pthread_mutex_unlock(&h->mu);
     return STM_OK;
 }
 
@@ -259,7 +344,7 @@ stm_status stm_host_fs_create(const char *root_path, stm_host_fs **out)
 
     /* Pre-populate the path map with the root. */
     pthread_mutex_lock(&h->mu);
-    stm_status rc = path_store_locked(h, h->root_qid_path, resolved);
+    stm_status rc = path_store_locked(h, h->root_qid_path, &st, resolved);
     pthread_mutex_unlock(&h->mu);
     if (rc != STM_OK) {
         pthread_mutex_destroy(&h->mu);
@@ -378,24 +463,14 @@ static stm_status vops_getattr(void *ctx, uint64_t qid_path,
 {
     (void)request_mask;
     stm_host_fs *h = ctx;
-    pthread_mutex_lock(&h->mu);
-    const char *p = path_lookup_locked(h, qid_path);
-    if (!p) {
-        pthread_mutex_unlock(&h->mu);
-        return STM_ENOENT;
-    }
     char copy[HOST_FS_PATH_MAX + 1];
-    size_t plen = strlen(p);
-    if (plen > HOST_FS_PATH_MAX) {
-        pthread_mutex_unlock(&h->mu);
-        return STM_EINVAL;
-    }
-    memcpy(copy, p, plen + 1);
-    pthread_mutex_unlock(&h->mu);
+    uint64_t dev, ino;
+    stm_status rc = path_snapshot(h, qid_path, copy, &dev, &ino);
+    if (rc != STM_OK) return rc;
 
     struct stat st;
-    if (lstat(copy, &st) < 0) return STM_ENOENT;
-    fill_attr(out, &st, qid_path_from_stat(&st));
+    if (lstat(copy, &st) < 0 || !same_file(&st, dev, ino)) return STM_ENOENT;
+    fill_attr(out, &st, qid_path);
     return STM_OK;
 }
 
@@ -405,21 +480,12 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
 {
     stm_host_fs *h = ctx;
 
-    pthread_mutex_lock(&h->mu);
-    const char *parent = path_lookup_locked(h, dir_qid_path);
-    if (!parent) {
-        pthread_mutex_unlock(&h->mu);
-        return STM_ENOENT;
-    }
-    /* Snapshot parent into local buffer; we'll release the mutex before lstat. */
     char parent_copy[HOST_FS_PATH_MAX + 1];
-    size_t plen = strlen(parent);
-    if (plen > HOST_FS_PATH_MAX) {
-        pthread_mutex_unlock(&h->mu);
-        return STM_EINVAL;
-    }
-    memcpy(parent_copy, parent, plen + 1);
-    pthread_mutex_unlock(&h->mu);
+    uint64_t pdev, pino;
+    stm_status prc = path_snapshot(h, dir_qid_path, parent_copy, &pdev, &pino);
+    if (prc != STM_OK) return prc;
+    struct stat pst;
+    if (lstat(parent_copy, &pst) < 0 || !same_file(&pst, pdev, pino)) return STM_ENOENT;
 
     char *child = child_path(parent_copy, name, name_len);
     if (!child) return STM_EINVAL;
@@ -452,7 +518,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
 
     uint64_t cqid = qid_path_from_stat(&st);
     pthread_mutex_lock(&h->mu);
-    stm_status rc = path_store_locked(h, cqid, child);
+    stm_status rc = path_store_locked(h, cqid, &st, child);
     pthread_mutex_unlock(&h->mu);
     free(child);
     if (rc != STM_OK) return rc;
@@ -469,30 +535,33 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
 {
     stm_host_fs *h = ctx;
 
-    pthread_mutex_lock(&h->mu);
-    const char *p = path_lookup_locked(h, dir_qid_path);
-    if (!p) {
-        pthread_mutex_unlock(&h->mu);
+    char copy[HOST_FS_PATH_MAX + 1];
+    uint64_t dev, ino;
+    stm_status src = path_snapshot(h, dir_qid_path, copy, &dev, &ino);
+    if (src != STM_OK) return src;
+
+    /* lp9 reads only an lopen'd fid, and lopen refuses a symlink, so the
+     * directory is opened without following one; fstat says it is still
+     * the directory the fid was walked to. */
+    int dfd = open(copy, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dfd < 0) return STM_ENOENT;
+    struct stat dst;
+    if (fstat(dfd, &dst) < 0 || !same_file(&dst, dev, ino)) {
+        close(dfd);
         return STM_ENOENT;
     }
-    char copy[HOST_FS_PATH_MAX + 1];
-    size_t plen = strlen(p);
-    if (plen > HOST_FS_PATH_MAX) {
-        pthread_mutex_unlock(&h->mu);
-        return STM_EINVAL;
+    DIR *d = fdopendir(dfd);
+    if (!d) {
+        close(dfd);
+        return STM_EIO;
     }
-    memcpy(copy, p, plen + 1);
-    pthread_mutex_unlock(&h->mu);
-
-    DIR *d = opendir(copy);
-    if (!d) return STM_ENOENT;
 
     /* R125 doctrine on stable resume: telldir/seekdir cookies are
      * NOT portable across DIR* reopens (the lp9 server may call
      * vops_readdir multiple times to satisfy one Treaddir; we
      * opendir fresh each time). Use 1-based entry index as the
-     * cookie — stable across reopens, simple to compute, and the
-     * cap of HOST_FS_MAX_PATHS bounds the worst-case skip cost.
+     * cookie -- stable across reopens and simple to compute; a resume
+     * reads past the entries before the cookie again.
      * Skip "." and ".." server-side; 9P clients (and the slate-tty
      * renderer) don't expect them. */
     int rc = STM_OK;
@@ -514,17 +583,10 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         uint64_t cookie = idx;
         size_t name_len = strlen(ent->d_name);
 
+        /* No name is stored here: a walk finds a child from its parent's. */
         struct stat st;
-        char child_buf[HOST_FS_PATH_MAX + 1];
-        int n = snprintf(child_buf, sizeof child_buf, "%s/%s", copy, ent->d_name);
-        if (n < 0 || (size_t)n >= sizeof child_buf) continue;
-        if (lstat(child_buf, &st) < 0) continue;
-
+        if (fstatat(dirfd(d), ent->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0) continue;
         uint64_t cqid = qid_path_from_stat(&st);
-        /* Cache child path so subsequent walks resolve it. */
-        pthread_mutex_lock(&h->mu);
-        (void)path_store_locked(h, cqid, child_buf);
-        pthread_mutex_unlock(&h->mu);
 
         if (name_len > STM_LP9_NAME_MAX) name_len = STM_LP9_NAME_MAX;
         stm_lp9_dirent dent;
@@ -559,59 +621,57 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
         return STM_EROFS;
     }
 
-    pthread_mutex_lock(&h->mu);
-    const char *p = path_lookup_locked(h, qid_path);
-    if (!p) {
-        pthread_mutex_unlock(&h->mu);
-        return STM_ENOENT;
-    }
     char copy[HOST_FS_PATH_MAX + 1];
-    size_t plen = strlen(p);
-    if (plen > HOST_FS_PATH_MAX) {
-        pthread_mutex_unlock(&h->mu);
-        return STM_EINVAL;
-    }
-    memcpy(copy, p, plen + 1);
+    uint64_t dev, ino;
+    stm_status rc = path_snapshot(h, qid_path, copy, &dev, &ino);
+    if (rc != STM_OK) return rc;
 
-    host_fs_fid *f = fid_alloc_locked(h, fid, qid_path);
-    if (!f) {
-        pthread_mutex_unlock(&h->mu);
-        return STM_ENOMEM;
-    }
-    pthread_mutex_unlock(&h->mu);
-
+    /* Only a regular file or a directory is opened: opening a FIFO blocks
+     * the server, and opening a device can act on it. */
     struct stat st;
-    if (lstat(copy, &st) < 0) {
-        return STM_ENOENT;
-    }
+    if (lstat(copy, &st) < 0 || !same_file(&st, dev, ino)) return STM_ENOENT;
+    if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) return STM_EINVAL;
 
     /* R127 P1-1: open WITHOUT following symlinks at the leaf. The
      * walk-time containment check validated the resolved path, but
      * a TOCTOU between walk and lopen could have replaced the file
-     * with a symlink-to-outside; or a broken-symlink walk-bind (now
-     * refused at walk time per P2-2) could have flipped to real.
-     * O_NOFOLLOW on open(2) returns ELOOP if the leaf is a symlink.
-     * For dirs, fdopendir(O_NOFOLLOW|O_DIRECTORY) gives the same
-     * protection. */
-    if (S_ISDIR(st.st_mode)) {
-        int dfd = open(copy, O_RDONLY | O_NOFOLLOW | O_DIRECTORY);
-        if (dfd < 0) return STM_EIO;
-        DIR *d = fdopendir(dfd);
+     * with a symlink-to-outside. O_NOFOLLOW returns ELOOP if the leaf
+     * is a symlink; O_NONBLOCK keeps a FIFO swapped in since the lstat
+     * from blocking, and fstat says the file opened is the one walked. */
+    int fd = open(copy, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? STM_ENOENT : STM_EIO;
+    struct stat ost;
+    if (fstat(fd, &ost) < 0 || !same_file(&ost, dev, ino)
+        || (ost.st_mode & S_IFMT) != (st.st_mode & S_IFMT)) {
+        close(fd);
+        return STM_ENOENT;
+    }
+    DIR *d = NULL;
+    if (S_ISDIR(ost.st_mode)) {
+        d = fdopendir(fd);
         if (!d) {
-            close(dfd);
+            close(fd);
             return STM_EIO;
         }
-        pthread_mutex_lock(&h->mu);
-        f->dir = d;
-        pthread_mutex_unlock(&h->mu);
-    } else {
-        int fd = open(copy, O_RDONLY | O_NOFOLLOW);
-        if (fd < 0) return STM_EIO;
-        pthread_mutex_lock(&h->mu);
-        f->fd = fd;
-        pthread_mutex_unlock(&h->mu);
     }
-    return STM_OK;
+
+    pthread_mutex_lock(&h->mu);
+    host_fs_fid *f = NULL;
+    if (fid_get_locked(h, fid)) {
+        rc = STM_EINVAL;              /* already open; lp9 refuses this first */
+    } else if (!(f = fid_alloc_locked(h, fid, qid_path))) {
+        rc = STM_ENOMEM;
+    } else if (d) {
+        f->dir = d;
+    } else {
+        f->fd = fd;
+    }
+    pthread_mutex_unlock(&h->mu);
+    if (rc != STM_OK) {
+        if (d) closedir(d);
+        else close(fd);
+    }
+    return rc;
 }
 
 static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
@@ -643,20 +703,12 @@ static stm_status vops_readlink(void *ctx, uint64_t qid_path,
                                   char *buf, size_t *inout_len)
 {
     stm_host_fs *h = ctx;
-    pthread_mutex_lock(&h->mu);
-    const char *p = path_lookup_locked(h, qid_path);
-    if (!p) {
-        pthread_mutex_unlock(&h->mu);
-        return STM_ENOENT;
-    }
     char copy[HOST_FS_PATH_MAX + 1];
-    size_t plen = strlen(p);
-    if (plen > HOST_FS_PATH_MAX) {
-        pthread_mutex_unlock(&h->mu);
-        return STM_EINVAL;
-    }
-    memcpy(copy, p, plen + 1);
-    pthread_mutex_unlock(&h->mu);
+    uint64_t dev, ino;
+    stm_status rc = path_snapshot(h, qid_path, copy, &dev, &ino);
+    if (rc != STM_OK) return rc;
+    struct stat st;
+    if (lstat(copy, &st) < 0 || !same_file(&st, dev, ino)) return STM_ENOENT;
 
     /* readlink does NOT NUL-terminate; we report length back. R125
      * caller-cap-bound: pass exactly *inout_len bytes. */

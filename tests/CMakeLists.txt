@@ -161,6 +161,8 @@ target_link_libraries(bench_crypto PRIVATE stratum
 stm_add_test(repro_342 repro_342.c test_fs_common.c)
 stm_add_test(test_lp9        test_lp9.c)
 target_link_libraries(test_lp9 PRIVATE stm_lp9)
+stm_add_test(test_host_fs    test_host_fs.c)
+target_link_libraries(test_host_fs PRIVATE stm_host_fs)
 stm_add_test(test_stratum_fs test_stratum_fs.c test_fs_common.c)
 target_link_libraries(test_stratum_fs PRIVATE stm_stratumd)
 target_link_libraries(test_fs PRIVATE stm_cmd_stratumd) # TLY-A1 R137 P2-1
