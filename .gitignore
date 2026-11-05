@@ -27,3 +27,23 @@ dist/
 /tmp/stratum_test_*
 *.stm
 .claude/
+build-*/
+
+# TLC model-checker artifacts
+specs/states/
+specs/*_TTrace_*.tla
+specs/*_TTrace_*.bin
+specs/*.toolbox/
+
+# Vendored git checkouts (tracked separately as git submodules would be nicer
+# long-term; for now we .gitignore the .git directory inside each)
+third_party/BLAKE3_src/.git/
+third_party/xxHash_src/.git/
+
+# Benchmark output CSVs from bench/run_dedup.sh / bench/run_reflink.sh
+bench/dedup_results_*.csv
+bench/reflink_results_*.csv
+
+# Rust crate build output (tui/)
+tools/stratum-slate-tty/target/
+tools/stratum/target/
