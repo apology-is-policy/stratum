@@ -2474,8 +2474,8 @@ phase_c:
 /* Twrite:  fid[4] offset[8] count[4] data[count]                          */
 /* Rwrite:  count[4]                                                        */
 /*                                                                         */
-/* Files only. Write-mode gate enforced. O_APPEND overrides offset to      */
-/* the file's current size at write time.                                  */
+/* Files only. Write-mode gate enforced. O_APPEND ignores the offset and   */
+/* writes at the file's end, read under the write's own exclusive pin.     */
 /* ────────────────────────────────────────────────────────────────────── */
 
 static stm_status h_write(stm_9p_server *s,
@@ -2540,10 +2540,7 @@ static stm_status h_write(stm_9p_server *s,
     fid_pin_locked(f);
     phase_b_enter(s, STM_9P_TWRITE, tag);
 
-    /* (b) unlocked: fid.tla IOReject gate + fetch current size for
-     * O_APPEND. The offset = stat-then-write is a pre-existing TOCTOU
-     * vs concurrent appends (already cross-connection-reachable
-     * today) — documented in cf-2-design.md §4.3, unchanged. */
+    /* (b) unlocked: fid.tla IOReject gate. */
     uint32_t ecode = 0;
     size_t wrote = 0;
     struct stm_inode_value iv;
@@ -2553,12 +2550,12 @@ static stm_status h_write(stm_9p_server *s,
         goto phase_c;
     }
 
-    /* O_APPEND: ignore the client's offset; write at current size. */
     if (open_flags & STM_9P_O_APPEND)
-        offset = stm_load_le64(iv.si_size);
-
-    rc = stm_fs_pwrite_if_gen(s->fs, ds, ino, gen, offset, body + 16,
-                              (size_t)count, &wrote);
+        rc = stm_fs_append_if_gen(s->fs, ds, ino, gen, body + 16,
+                                  (size_t)count, &wrote);
+    else
+        rc = stm_fs_pwrite_if_gen(s->fs, ds, ino, gen, offset, body + 16,
+                                  (size_t)count, &wrote);
     if (rc != STM_OK)
         ecode = size_status_to_errno(rc);
 

@@ -2602,6 +2602,12 @@ STM_MUST_USE
 stm_status stm_fs_pwrite_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                 uint64_t gen, uint64_t off, const void *buf,
                                 size_t len, size_t *out_written);
+/* As pwrite, at the file's end, taken where no other writer of the file can
+ * move it: two appenders never overwrite each other. */
+STM_MUST_USE
+stm_status stm_fs_append_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                                uint64_t gen, const void *buf, size_t len,
+                                size_t *out_written);
 STM_MUST_USE
 stm_status stm_fs_truncate_if_gen(stm_fs *fs, uint64_t dataset_id,
                                   uint64_t ino, uint64_t gen,

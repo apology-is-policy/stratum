@@ -3053,7 +3053,7 @@ static stm_status fs_refuse_unlock(stm_fs *fs, uint64_t dataset_id,
 }
 
 static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
-                           const uint64_t *gen,
+                           const uint64_t *gen, bool append,
                            uint64_t off, const void *buf, size_t len,
                            size_t *out_written)
 {
@@ -3085,6 +3085,13 @@ static stm_status fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             if (ls == STM_OK) {
                 uint32_t mode = stm_load_le32(iv.si_mode);
                 if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG) {
+                    if (append) {
+                        /* Read under the exclusive pin, so no other writer
+                         * can move the end between this and the write. */
+                        off = stm_load_le64(iv.si_size);
+                        if (off < STM_FS_FILE_MAX && (uint64_t)len > STM_FS_FILE_MAX - off)
+                            len = (size_t)(STM_FS_FILE_MAX - off);
+                    }
                     stm_status rs = fs_write_regular_locked(fs, iidx,
                                                                   dataset_id, ino,
                                                                   &iv, off, buf, len,
@@ -12227,7 +12234,7 @@ stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                         uint64_t off, const void *buf, size_t len)
 {
     size_t wrote = 0;
-    return fs_write(fs, dataset_id, ino, NULL, off, buf, len, &wrote);
+    return fs_write(fs, dataset_id, ino, NULL, false, off, buf, len, &wrote);
 }
 
 stm_status stm_fs_write_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
@@ -12235,7 +12242,7 @@ stm_status stm_fs_write_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                uint64_t off, const void *buf, size_t len)
 {
     size_t wrote = 0;
-    return fs_write(fs, dataset_id, ino, &gen, off, buf, len, &wrote);
+    return fs_write(fs, dataset_id, ino, &gen, false, off, buf, len, &wrote);
 }
 
 /* An error after some bytes landed is a short write, and so is a write
@@ -12243,13 +12250,13 @@ stm_status stm_fs_write_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
  * fs is wedged it takes no further op, so the error stands and no count is
  * reported, even where a reclaim's commit took the prefix first. */
 static stm_status fs_pwrite(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
-                            const uint64_t *gen, uint64_t off,
+                            const uint64_t *gen, bool append, uint64_t off,
                             const void *buf, size_t len, size_t *out_written)
 {
     if (!out_written) return STM_EINVAL;
     if (off < STM_FS_FILE_MAX && (uint64_t)len > STM_FS_FILE_MAX - off)
         len = (size_t)(STM_FS_FILE_MAX - off);
-    stm_status s = fs_write(fs, dataset_id, ino, gen, off, buf, len,
+    stm_status s = fs_write(fs, dataset_id, ino, gen, append, off, buf, len,
                             out_written);
     if (s == STM_OK || *out_written == 0u) return s;
     if (atomic_load_explicit(&fs->wedged, memory_order_acquire)) {
@@ -12263,14 +12270,21 @@ stm_status stm_fs_pwrite(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                          uint64_t off, const void *buf, size_t len,
                          size_t *out_written)
 {
-    return fs_pwrite(fs, dataset_id, ino, NULL, off, buf, len, out_written);
+    return fs_pwrite(fs, dataset_id, ino, NULL, false, off, buf, len, out_written);
 }
 
 stm_status stm_fs_pwrite_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                 uint64_t gen, uint64_t off, const void *buf,
                                 size_t len, size_t *out_written)
 {
-    return fs_pwrite(fs, dataset_id, ino, &gen, off, buf, len, out_written);
+    return fs_pwrite(fs, dataset_id, ino, &gen, false, off, buf, len, out_written);
+}
+
+stm_status stm_fs_append_if_gen(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                                uint64_t gen, const void *buf, size_t len,
+                                size_t *out_written)
+{
+    return fs_pwrite(fs, dataset_id, ino, &gen, true, 0u, buf, len, out_written);
 }
 
 stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,

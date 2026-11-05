@@ -20,6 +20,7 @@
 
 #include <stratum/9p.h>
 #include <stratum/fs.h>
+#include <stratum/fs_testing.h>
 #include <stratum/inode.h>
 #include <stratum/types.h>
 
@@ -1418,6 +1419,181 @@ STM_TEST(p9_write_o_append_overrides_offset) {
 
     free(req); free(resp);
     stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* The hook runs inside the first appender's write, past anything the 9P server
+ * read beforehand, so a size read there is stale by exactly the second's bytes. */
+typedef struct {
+    stm_9p_server *second;
+    uint32_t       fid;
+    bool           fired;
+    stm_status     rc;
+    uint8_t        rtype;
+} append_rival;
+
+static void append_rival_guard(uint64_t ino, void *arg)
+{
+    (void)ino;
+    append_rival *r = arg;
+    if (r->fired) return;
+    r->fired = true;
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 20, r->fid, 0, "CCC", 3);
+    r->rc = stm_9p_server_handle(r->second, req, sz, resp, RBUF, &rlen);
+    r->rtype = resp[4];
+    free(req);
+    free(resp);
+}
+
+STM_TEST(p9_a_rival_append_cannot_be_overwritten) {
+    make_tmp("9p_append_rival");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *a = make_server(fs), *b = make_server(fs);
+    do_version_attach(a, 100);
+    do_version_attach(b, 200);
+    walk_to(a, 100, 101, "f");
+    walk_to(a, 100, 102, "f");
+    walk_to(b, 200, 201, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlopen(req, 2, 101, STM_9P_O_RDWR);
+    STM_ASSERT_OK(stm_9p_server_handle(a, req, sz, resp, RBUF, &rlen));
+    sz = build_twrite(req, 3, 101, 0, "AAAAA", 5);
+    STM_ASSERT_OK(stm_9p_server_handle(a, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    sz = build_tlopen(req, 4, 102, STM_9P_O_WRONLY | STM_9P_O_APPEND);
+    STM_ASSERT_OK(stm_9p_server_handle(a, req, sz, resp, RBUF, &rlen));
+    sz = build_tlopen(req, 5, 201, STM_9P_O_WRONLY | STM_9P_O_APPEND);
+    STM_ASSERT_OK(stm_9p_server_handle(b, req, sz, resp, RBUF, &rlen));
+
+    append_rival rival = { .second = b, .fid = 201, .rc = STM_EINVAL };
+    stm_fs_set_write_guard_hook_for_test(fs, append_rival_guard, &rival);
+    sz = build_twrite(req, 6, 102, 0, "BBB", 3);
+    STM_ASSERT_OK(stm_9p_server_handle(a, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    STM_ASSERT_EQ(load_u32(resp + 7), 3u);
+    stm_fs_set_write_guard_hook_for_test(fs, NULL, NULL);
+    STM_ASSERT_TRUE(rival.fired);
+    STM_ASSERT_OK(rival.rc);
+    STM_ASSERT_EQ(rival.rtype, STM_9P_RWRITE);
+
+    sz = build_tread(req, 7, 101, 0, 64);
+    STM_ASSERT_OK(stm_9p_server_handle(a, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 11u);
+    STM_ASSERT_MEM_EQ(resp + 11, "AAAAACCCBBB", 11);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(a);
+    stm_9p_server_destroy(b);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+#define APPENDERS        4u
+#define APPENDS_EACH   300u
+#define APPEND_RECORD   32u
+
+typedef struct {
+    stm_9p_server *s;
+    uint32_t       fid;
+    uint32_t       who;
+    stm_status     rc;
+    uint32_t       bad_replies;
+} appender;
+
+/* STM_ASSERT stays on the main thread: a thread only records what it saw. */
+static void *appender_thread(void *arg)
+{
+    appender *w = arg;
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    for (uint32_t i = 0; i < APPENDS_EACH; i++) {
+        char rec[APPEND_RECORD + 1];
+        (void)snprintf(rec, sizeof rec, "%c%05u%*s\n", (char)('a' + w->who), i,
+                       (int)(APPEND_RECORD - 7u), "");
+        uint32_t rlen = 0;
+        uint32_t sz = build_twrite(req, (uint16_t)(10u + w->who), w->fid, 0, rec, APPEND_RECORD);
+        stm_status rc = stm_9p_server_handle(w->s, req, sz, resp, RBUF, &rlen);
+        if (rc != STM_OK) { w->rc = rc; break; }
+        if (resp[4] != STM_9P_RWRITE || load_u32(resp + 7) != APPEND_RECORD) w->bad_replies++;
+    }
+    free(req);
+    free(resp);
+    return NULL;
+}
+
+STM_TEST(p9_appenders_on_many_threads_lose_nothing) {
+    make_tmp("9p_append_many");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t ino = mk_file(fs, root, "log");
+
+    appender w[APPENDERS];
+    pthread_t th[APPENDERS];
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    for (uint32_t i = 0; i < APPENDERS; i++) {
+        w[i] = (appender){ .s = make_server(fs), .fid = 101u, .who = i, .rc = STM_OK };
+        do_version_attach(w[i].s, 100);
+        walk_to(w[i].s, 100, 101, "log");
+        uint32_t rlen = 0;
+        uint32_t sz = build_tlopen(req, 2, 101, STM_9P_O_WRONLY | STM_9P_O_APPEND);
+        STM_ASSERT_OK(stm_9p_server_handle(w[i].s, req, sz, resp, RBUF, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    }
+    for (uint32_t i = 0; i < APPENDERS; i++)
+        STM_ASSERT_EQ(pthread_create(&th[i], NULL, appender_thread, &w[i]), 0);
+    for (uint32_t i = 0; i < APPENDERS; i++) {
+        pthread_join(th[i], NULL);
+        STM_ASSERT_OK(w[i].rc);
+        STM_ASSERT_EQ(w[i].bad_replies, 0u);
+    }
+
+    size_t total = (size_t)APPENDERS * APPENDS_EACH * APPEND_RECORD;
+    char *got = malloc(total + 1u);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1u, ino, 0, got, total + 1u, &n));
+    STM_ASSERT_EQ(n, total);
+    /* Each writer's records, whole and in that writer's order. */
+    uint32_t next[APPENDERS] = {0};
+    uint32_t damaged = 0;
+    for (size_t at = 0; at + APPEND_RECORD <= n; at += APPEND_RECORD) {
+        const char *r = got + at;
+        uint32_t who = (uint32_t)(r[0] - 'a');
+        unsigned seq = 0;
+        if (who >= APPENDERS || r[APPEND_RECORD - 1u] != '\n' || sscanf(r + 1, "%5u", &seq) != 1
+            || seq != next[who]) {
+            damaged++;
+            continue;
+        }
+        next[who]++;
+    }
+    STM_ASSERT_EQ(damaged, 0u);
+    for (uint32_t i = 0; i < APPENDERS; i++)
+        STM_ASSERT_EQ(next[i], APPENDS_EACH);
+
+    free(got);
+    free(req); free(resp);
+    for (uint32_t i = 0; i < APPENDERS; i++)
+        stm_9p_server_destroy(w[i].s);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
