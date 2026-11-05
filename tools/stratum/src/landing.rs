@@ -1,9 +1,8 @@
 //! Veracrypt-shaped landing screen (no-arg `stratum` invocation).
 //!
-//! Three large buttons: Open, New, Browse host. Recent volumes list.
-//! On selection, dispatches to `stratum tui --vol PATH` (Open, then-
-//! recent), `stratum mkfs` interactively (New), or a host-FS browse
-//! mode (forward-noted to SWISS-N).
+//! Open, New, Browse host and a list of recent volumes. On selection it
+//! opens the volume in the manager, makes one with `stratum mkfs` and
+//! opens that, or opens the manager on the host with no volume.
 //!
 //! v1.0 of the landing is a STUB: it just prints the Veracrypt-shaped
 //! ASCII chooser and reads a single key from stdin to decide. No
@@ -14,38 +13,35 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::embed;
+use crate::passphrase::prompt_passphrase;
 
 pub fn run() -> Result<()> {
     let recents = recent_volumes();
     println!();
-    println!("              ╔═══════════════════════════════════════════╗");
-    println!("              ║              Stratum v2.0                 ║");
-    println!("              ║   PQ-encrypted COW filesystem, portable   ║");
-    println!("              ╠═══════════════════════════════════════════╣");
-    println!("              ║                                           ║");
+    println!("              +-------------------------------------------+");
+    println!("              |                 Stratum                   |");
+    println!("              |        Encrypted COW filesystem           |");
+    println!("              +-------------------------------------------+");
+    println!("              |                                           |");
     println!("              ║  [O] Open volume...                       ║");
-    println!("              ║  [N] New volume...                        ║");
-    println!("              ║  [H] Browse host filesystem (TBD)         ║");
-    println!("              ║  [Q] Quit                                 ║");
-    println!("              ║                                           ║");
+    println!("              |  [N] New volume...                        |");
+    println!("              |  [H] Browse host filesystem               |");
+    println!("              |  [Q] Quit                                 |");
+    println!("              |                                           |");
     if recents.is_empty() {
-        println!("              ║  Recent volumes: (none)                   ║");
+        println!("              |  Recent volumes: (none)                   |");
     } else {
-        println!("              ║  Recent volumes:                          ║");
+        println!("              |  Recent volumes:                          |");
         for (i, vol) in recents.iter().enumerate().take(5) {
-            let mut line = format!("    [{}] {}", i + 1, vol.display());
-            if line.chars().count() > 41 {
-                line.truncate(38);
-                line.push_str("…");
-            }
-            println!("              ║{:<43}║", line);
+            println!("              |{:<43}|", recent_line(i, vol));
         }
     }
-    println!("              ║                                           ║");
-    println!("              ╚═══════════════════════════════════════════╝");
+    println!("              |                                           |");
+    println!("              +-------------------------------------------+");
     println!();
     print!("              Choose [O/N/H/Q or 1-{}]: ", recents.len().min(5));
     io::stdout().flush().ok();
@@ -58,10 +54,13 @@ pub fn run() -> Result<()> {
         "" | "Q" | "q" => Ok(()),
         "O" | "o" => prompt_open(&recents),
         "N" | "n" => prompt_new(),
-        "H" | "h" => {
-            eprintln!("stratum: host-fs browse not yet implemented (forward-noted to SWISS-N)");
-            Ok(())
-        }
+        "H" | "h" => embed::run(embed::EmbedOpts {
+            volume: None,
+            keyfile: None,
+            host: None,
+            print_env_to: None,
+            headless: false,
+        }),
         s if s.parse::<usize>().is_ok() => {
             let idx: usize = s.parse().unwrap();
             if idx == 0 || idx > recents.len() {
@@ -75,6 +74,16 @@ pub fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// One recent volume as a row of the chooser, cut by characters because a path need not be ASCII.
+fn recent_line(i: usize, vol: &Path) -> String {
+    let line = format!("    [{}] {}", i + 1, vol.display());
+    if line.chars().count() <= 41 {
+        return line;
+    }
+    let head: String = line.chars().take(38).collect();
+    format!("{head}...")
 }
 
 fn prompt_open(recents: &[PathBuf]) -> Result<()> {
@@ -118,12 +127,61 @@ fn prompt_new() -> Result<()> {
         eprintln!("stratum: {} already exists; refusing to overwrite", path.display());
         return Ok(());
     }
-    eprintln!("stratum: would mkfs {} (NOT IMPLEMENTED in landing v1.0)", path.display());
-    eprintln!("stratum: run `stratum mkfs {}` then re-run `stratum`", path.display());
-    Ok(())
+
+    print!("              Size [4G]: ");
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).context("read stdin")?;
+    let size = match input.trim() {
+        "" => "4G".to_string(),
+        s => s.to_string(),
+    };
+
+    let pass = prompt_passphrase("              Passphrase: ")?;
+    if pass.is_empty() {
+        eprintln!("stratum: a volume made here needs a passphrase");
+        eprintln!("stratum: `stratum mkfs` makes one with a plaintext keyfile");
+        return Ok(());
+    }
+    let again = prompt_passphrase("              Passphrase again: ")?;
+    if pass.as_bytes() != again.as_bytes() {
+        eprintln!("stratum: the two passphrases differ; nothing was created");
+        return Ok(());
+    }
+
+    let me = std::env::current_exe().context("find this program")?;
+    let mut child = Command::new(me)
+        .arg("mkfs")
+        .arg(&path)
+        .arg("--size")
+        .arg(&size)
+        .arg("--passphrase-stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("run mkfs")?;
+    if let Some(mut sin) = child.stdin.take() {
+        let mut buf = Vec::with_capacity(pass.len() + 1);
+        buf.extend_from_slice(pass.as_bytes());
+        buf.push(b'\n');
+        let wrote = sin.write_all(&buf);
+        for b in buf.iter_mut() {
+            unsafe { std::ptr::write_volatile(b as *mut u8, 0); }
+        }
+        drop(sin);
+        wrote.context("give mkfs the passphrase")?;
+    }
+    let out = child.wait_with_output().context("wait for mkfs")?;
+    if !out.status.success() {
+        eprintln!("stratum: mkfs failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        return Ok(());
+    }
+    println!("              Created {}. Keep {}.key beside it.", path.display(), path.display());
+    open_volume(&path)
 }
 
-fn open_volume(path: &std::path::Path) -> Result<()> {
+fn open_volume(path: &Path) -> Result<()> {
     add_to_recents(path);
     embed::run(embed::EmbedOpts {
         volume: Some(path.to_path_buf()),
@@ -153,7 +211,7 @@ fn recent_volumes() -> Vec<PathBuf> {
         .collect()
 }
 
-fn add_to_recents(path: &std::path::Path) {
+fn add_to_recents(path: &Path) {
     let Some(d) = config_dir() else { return; };
     let _ = fs::create_dir_all(&d);
     let recents_path = d.join("recents");
