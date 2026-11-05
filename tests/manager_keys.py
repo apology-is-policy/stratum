@@ -206,8 +206,9 @@ class Term:
 
 
 def shows(segment, name):
-    """name as a whole cell, after a directory's '/': vol.stm is not vol.stm.key."""
-    return re.search(r'(?:^|\s)/?' + re.escape(name) + r'(?:\s|$)', segment) is not None
+    """name as a whole cell, after its kind icon (ui.rs: '/' a directory, '@' a link):
+    vol.stm is not vol.stm.key."""
+    return re.search(r'(?:^|\s)[/@]?' + re.escape(name) + r'(?:\s|$)', segment) is not None
 
 
 def row_in_left_panel(term, name):
