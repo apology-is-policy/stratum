@@ -12,7 +12,9 @@ echo "Building the stratum binary..."
 (cd "$PROJ/tools/stratum" && STM_BUILD_DIR="$PROJ/build" cargo build --release)
 
 mkdir -p "$PROJ/dist"
-cp "$PROJ/tools/stratum/target/release/stratum" "$PROJ/dist/stratum"
+# Beside it and then over it: a daemon still running the old binary keeps a plain cp from writing.
+cp "$PROJ/tools/stratum/target/release/stratum" "$PROJ/dist/stratum.new"
+mv -f "$PROJ/dist/stratum.new" "$PROJ/dist/stratum"
 
 echo "Done."
 ls -lh "$PROJ/dist/"

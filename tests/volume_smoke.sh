@@ -79,6 +79,20 @@ fi
 stop
 
 serve "$PASS" || { no "serve again: $(tail -1 "$D/serve.log")"; exit 1; }
+# Two daemons on one image would each write commits the other knows nothing of.
+printf '%s\n' "$PASS" | "$B" serve "$V" --listen "$D/second.sock" --keyfile "$V.key" --passphrase-stdin > "$D/second.log" 2>&1 &
+SECOND=$!
+for _ in $(seq 1 100); do kill -0 "$SECOND" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$SECOND" 2>/dev/null; then
+    no "a second daemon opened a volume already in use"
+    kill -KILL "$SECOND" 2>/dev/null
+elif LC_ALL=C grep -q 'already open' "$D/second.log"; then
+    ok "a second daemon on one volume is refused, and says why"
+else
+    no "the second daemon stopped without saying why: $(tail -1 "$D/second.log")"
+fi
+wait "$SECOND" 2>/dev/null
+F ls / > /dev/null || no "the refusal disturbed the first daemon"
 F mkdir /in || no "mkdir"
 F put "$D/host" /in/host > "$D/put.log" 2>&1 || no "put: $(tail -1 "$D/put.log")"
 # A mutating command commits before it reports success, so a kill now must lose nothing.

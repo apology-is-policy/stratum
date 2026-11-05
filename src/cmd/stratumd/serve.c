@@ -39,6 +39,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(__thylacine__)
+#  include <sys/file.h>
+#endif
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1516,10 +1519,55 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts)
     return STM_OK;
 }
 
+/*
+ * Two daemons on one image each write commits the other knows nothing of, and
+ * the pool is lost. A volume is a file, so opening it twice takes only two
+ * windows. The kernel drops this lock however the process ends, so nothing
+ * stale can lock a volume out. Thylacine's pool is a device only its one
+ * stratumd opens.
+ */
+static stm_status image_lock(const char *path, int *out_fd)
+{
+    *out_fd = -1;
+#if !defined(__thylacine__)
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return STM_OK; /* the mount reports a missing image */
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int e = errno;
+        close(fd);
+        if (e == EWOULDBLOCK) {
+            fprintf(stderr, "stratumd: %s is already open in another stratumd\n", path);
+            return STM_EBUSY;
+        }
+        fprintf(stderr, "stratumd: warning: cannot lock %s (%s), so nothing "
+                        "stops a second daemon opening it\n", path, strerror(e));
+        return STM_OK;
+    }
+    *out_fd = fd;
+#else
+    (void)path;
+#endif
+    return STM_OK;
+}
+
+static stm_status stratumd_run_locked(const stm_stratumd_opts *opts);
+
 stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
 {
     if (!opts || !opts->socket_path)
         return STM_EINVAL;
+    int lock_fd = -1;
+    if (opts->fs_path) {
+        stm_status s = image_lock(opts->fs_path, &lock_fd);
+        if (s != STM_OK) return s;
+    }
+    stm_status rc = stratumd_run_locked(opts);
+    if (lock_fd >= 0) close(lock_fd);
+    return rc;
+}
+
+static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
+{
 
     /* A-3: publish the host-bake owner override before any worker spawns
      * (one-shot publication; workers only read). Disabled by default --
