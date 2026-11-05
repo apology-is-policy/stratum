@@ -452,10 +452,13 @@ int stm_cmd_mkfs_main(int argc, char **argv)
 
     fprintf(stderr,
         "ok: %s ready (dataset 1 root ino=%llu)\n"
-        "    next: stratumd %s --listen unix:/tmp/stm.sock\n",
+        "    next: stratum tui --vol %s\n"
+        "      or: stratum serve %s --listen /tmp/stm.sock --keyfile %s%s\n",
         image_path,
         (unsigned long long)root_ino,
-        image_path);
+        image_path,
+        image_path, keyfile_path,
+        passphrase_stdin ? " --passphrase-stdin" : "");
 
 cleanup:
     /* SWISS-4m: wipe + munlock the passphrase buffer regardless of

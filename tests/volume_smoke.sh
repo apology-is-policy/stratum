@@ -56,6 +56,21 @@ printf '%s\n' "$PASS" | "$B" mkfs "$V" --size 256M --passphrase-stdin > "$D/mkfs
     && ok "mkfs" || { no "mkfs: $(tail -1 "$D/mkfs.log")"; exit 1; }
 
 serve "$PASS" && ok "served" || { no "serve: $(tail -1 "$D/serve.log")"; exit 1; }
+stop
+
+# With no key source named, serve finds the key mkfs left beside the image, and says so when it is not there.
+printf '%s\n' "$PASS" | "$B" serve "$V" --listen "$S" --passphrase-stdin > "$D/serve.log" 2>&1 &
+SP=$!
+for _ in $(seq 1 100); do [ -S "$S" ] && break; kill -0 "$SP" 2>/dev/null || break; sleep 0.1; done
+[ -S "$S" ] && ok "serve found the key beside the image" || no "serve with no key named: $(tail -1 "$D/serve.log")"
+stop
+mv "$V.key" "$V.key.aside"
+"$B" serve "$V" --listen "$S" > "$D/nokey.log" 2>&1
+rc=$?
+mv "$V.key.aside" "$V.key"
+if [ "$rc" != 0 ] && LC_ALL=C grep -q -e '--keyfile' "$D/nokey.log"; then ok "serve with no key says what is missing"; else no "serve with no key: rc=$rc: $(tail -1 "$D/nokey.log")"; fi
+
+serve "$PASS" || { no "serve again: $(tail -1 "$D/serve.log")"; exit 1; }
 F mkdir /in || no "mkdir"
 F put "$D/host" /in/host > "$D/put.log" 2>&1 || no "put: $(tail -1 "$D/put.log")"
 # A mutating command commits before it reports success, so a kill now must lose nothing.

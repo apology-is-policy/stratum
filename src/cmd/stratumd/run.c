@@ -44,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 _Static_assert(ATOMIC_BOOL_LOCK_FREE == 2,
                 "stratumd's signal-driven stop_flag requires "
@@ -833,6 +834,23 @@ int stm_cmd_stratumd_main(int argc, char **argv)
     if (n_datasets_allowed > 0u) {
         opts.datasets_allowed   = datasets_allowed;
         opts.n_datasets_allowed = n_datasets_allowed;
+    }
+
+    /* mkfs writes the key beside the image, so look there before refusing. */
+    char default_keyfile[4096];
+    if (opts.fs_path && !opts.keyfile_path && !opts.janus_socket) {
+        int n = snprintf(default_keyfile, sizeof default_keyfile, "%s.key",
+                         opts.fs_path);
+        if (n < 0 || (size_t)n >= sizeof default_keyfile
+                || access(default_keyfile, R_OK) != 0) {
+            fprintf(stderr,
+                "stratumd: no key for %s: pass --keyfile or --janus-socket, "
+                "or keep the key at %s.key\n",
+                opts.fs_path, opts.fs_path);
+            stm_ds_policy_table_close(&user_policy_table);
+            return 1;
+        }
+        opts.keyfile_path = default_keyfile;
     }
 
     install_signal_handlers();
