@@ -2829,12 +2829,26 @@ retry:
          * sequences (≥ 0x80) pass through unchanged. The ORIGINAL
          * name is used for the per-entry Twalk above so we still
          * resolve the real backend file. */
-        char safe_name[STM_LP9_NAME_MAX + 1];
-        size_t safe_len = de->name_len;
-        if (safe_len > STM_LP9_NAME_MAX) safe_len = STM_LP9_NAME_MAX;
-        for (size_t ni = 0; ni < safe_len; ni++) {
+        /* The first such byte is shown as U+FFFD, which the manager refuses to act on,
+         * so "a?b" standing for "a\nb" is never taken for a real "a?b". The rest stay
+         * '?', which keeps the line inside STM_SLATE_ENTRY_LINE_MAX. */
+        char safe_name[STM_LP9_NAME_MAX + 3];
+        size_t in_len = de->name_len;
+        if (in_len > STM_LP9_NAME_MAX) in_len = STM_LP9_NAME_MAX;
+        size_t safe_len = 0;
+        bool stood_in = false;
+        for (size_t ni = 0; ni < in_len; ni++) {
             unsigned char c = (unsigned char)de->name[ni];
-            safe_name[ni] = (c < 0x20u || c == 0x7Fu) ? '?' : (char)c;
+            if (c >= 0x20u && c != 0x7Fu) {
+                safe_name[safe_len++] = (char)c;
+            } else if (!stood_in) {
+                safe_name[safe_len++] = (char)0xEFu;
+                safe_name[safe_len++] = (char)0xBFu;
+                safe_name[safe_len++] = (char)0xBDu;
+                stood_in = true;
+            } else {
+                safe_name[safe_len++] = '?';
+            }
         }
         safe_name[safe_len] = '\0';
 
@@ -3048,6 +3062,45 @@ static stm_status action_dispatch_verb(stm_slate *s, int panel_idx,
  * reset to 0). On failure (cursor out of range, entry not a dir,
  * disconnected mid-op) returns the appropriate error and leaves
  * panel state untouched. */
+/* RFC 3629: no overlong forms, no surrogates, nothing past U+10FFFF. What Rust's
+ * String::from_utf8 takes, which is how the manager reads a panel's path. */
+static bool utf8_well_formed(const unsigned char *s, size_t n)
+{
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = s[i];
+        size_t len;
+        uint32_t cp;
+        if (c < 0x80u) {
+            i++;
+            continue;
+        }
+        if (c >= 0xC2u && c <= 0xDFu) {
+            len = 2;
+            cp = c & 0x1Fu;
+        } else if (c >= 0xE0u && c <= 0xEFu) {
+            len = 3;
+            cp = c & 0x0Fu;
+        } else if (c >= 0xF0u && c <= 0xF4u) {
+            len = 4;
+            cp = c & 0x07u;
+        } else {
+            return false;
+        }
+        if (n - i < len) return false;
+        for (size_t k = 1; k < len; k++) {
+            unsigned char cc = s[i + k];
+            if ((cc & 0xC0u) != 0x80u) return false;
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if ((len == 3 && cp < 0x800u) || (len == 4 && (cp < 0x10000u || cp > 0x10FFFFu)) ||
+            (cp >= 0xD800u && cp <= 0xDFFFu))
+            return false;
+        i += len;
+    }
+    return true;
+}
+
 typedef struct {
     uint32_t target_idx;
     uint32_t emitted;
@@ -3087,8 +3140,8 @@ static stm_status descend_find_cb(const stm_9p_qid *qid, uint64_t cookie,
          * KEY for subsequent backend ops (panel_entries_render's
          * walk_to_cwd(path)) — sanitizing on storage would diverge
          * from the real backend name and break the entries-listing.
-         * Instead: REFUSE descent into such entries. UTF-8 multi-byte
-         * sequences (≥ 0x80) pass through unchanged. */
+         * Instead: REFUSE descent into such entries. Bytes from 0x80 up
+         * pass this loop; the check after it refuses ill-formed UTF-8. */
         for (uint16_t i = 0; i < fc->name_len; i++) {
             unsigned char c = (unsigned char)fc->name[i];
             if (c < 0x20u || c == 0x7Fu) {
@@ -3096,6 +3149,10 @@ static stm_status descend_find_cb(const stm_9p_qid *qid, uint64_t cookie,
                 break;
             }
         }
+        /* The manager reads panel.path as UTF-8, and a location it cannot read is one
+         * it cannot act in. */
+        if (!utf8_well_formed((const unsigned char *)fc->name, fc->name_len))
+            fc->bad_name = true;
         /* Stop iteration via R111 P2 F-3 sentinel. */
         return STM_ENOTSUPPORTED;
     }
