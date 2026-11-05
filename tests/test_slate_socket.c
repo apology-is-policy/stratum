@@ -1954,7 +1954,11 @@ STM_TEST(slate_socket_editor_content_arrives_in_pieces)
     STM_ASSERT_EQ(memcmp(back, "abc", 3u), 0);
 
     /* With no editor open there is no buffer to clear or fill. */
-    STM_ASSERT_OK(stm_9p_write(c, 104u, 0u, "close\n", 6u, &written));
+    const char *close_line = "editor close";
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 105u, 1u, enames, eqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 105u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 105u, 0u, close_line, (uint32_t)strlen(close_line), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 105u));
     STM_ASSERT_EQ(stm_9p_write(c, 104u, 0u, "clear\n", 6u, &written), STM_ENOENT);
     STM_ASSERT_EQ(stm_9p_write(c, 103u, 0u, "abc", 3u, &written), STM_ENOENT);
 

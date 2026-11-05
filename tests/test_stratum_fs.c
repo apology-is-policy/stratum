@@ -88,23 +88,24 @@ typedef struct {
     uint64_t   root_ino;
 } fixture;
 
-static fixture make_fixture(const char *tag)
+/* Filled in place: the accept thread keeps a pointer into *f, so it must not be a local copied out on return. */
+static void make_fixture(const char *tag, fixture *f)
 {
-    fixture f = {0};
+    memset(f, 0, sizeof *f);
     make_tmp(tag);
     build_sock_path(tag);
 
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
     stm_fs_mount_opts mopts = rw_mount_opts();
-    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &f.fs));
-    STM_ASSERT_OK(stm_fs_init_dataset_root(f.fs, /*ds=*/1u,
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &f->fs));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(f->fs, /*ds=*/1u,
                                               /*mode=*/0755u,
                                               /*uid=*/0, /*gid=*/0,
-                                              &f.root_ino));
+                                              &f->root_ino));
 
-    f.listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
-    STM_ASSERT_TRUE(f.listen_fd >= 0);
+    f->listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(f->listen_fd >= 0);
     /* Set FD_CLOEXEC so the listen_fd does NOT propagate into our
      * fork+exec'd stratum-fs children. Without this, the child's
      * inherited reference keeps the listen socket alive across the
@@ -112,16 +113,16 @@ static fixture make_fixture(const char *tag)
      * parent then doesn't unblock because the kernel sees other
      * processes still hold the socket. macOS specifically. */
     {
-        int fl = fcntl(f.listen_fd, F_GETFD);
-        if (fl >= 0) fcntl(f.listen_fd, F_SETFD, fl | FD_CLOEXEC);
+        int fl = fcntl(f->listen_fd, F_GETFD);
+        if (fl >= 0) fcntl(f->listen_fd, F_SETFD, fl | FD_CLOEXEC);
     }
 
-    f.ctx.listen_fd  = f.listen_fd;
-    f.ctx.fs         = f.fs;
-    f.ctx.run_status = STM_EBACKEND;
-    atomic_init(&f.ctx.stop_flag, false);
-    STM_ASSERT_EQ(pthread_create(&f.worker, NULL,
-                                    accept_loop_thread, &f.ctx), 0);
+    f->ctx.listen_fd  = f->listen_fd;
+    f->ctx.fs         = f->fs;
+    f->ctx.run_status = STM_EBACKEND;
+    atomic_init(&f->ctx.stop_flag, false);
+    STM_ASSERT_EQ(pthread_create(&f->worker, NULL,
+                                    accept_loop_thread, &f->ctx), 0);
     /* Tiny scheduler hint for the worker to call accept(). The
      * stratum-fs binary will retry-loop on connect-refused via its
      * own logic (added for this test scaffold). 10ms is plenty in
@@ -129,7 +130,6 @@ static fixture make_fixture(const char *tag)
      * the cost of a few retry-with-backoff attempts. */
     struct timespec ts = { 0, 10 * 1000 * 1000 };
     nanosleep(&ts, NULL);
-    return f;
 }
 
 static void destroy_fixture(fixture *f)
@@ -244,7 +244,8 @@ STM_TEST(stratum_fs_help_exits_ok)
 /* `mkdir` + `ls` round-trip. */
 STM_TEST(stratum_fs_mkdir_then_ls_lists_entry)
 {
-    fixture f = make_fixture("mkls");
+    fixture f;
+    make_fixture("mkls", &f);
     const char *bin = get_binary_path();
 
     /* mkdir /sub */
@@ -268,7 +269,8 @@ STM_TEST(stratum_fs_mkdir_then_ls_lists_entry)
 /* `create` + `ls` shows the file. */
 STM_TEST(stratum_fs_create_then_ls)
 {
-    fixture f = make_fixture("create_ls");
+    fixture f;
+    make_fixture("create_ls", &f);
     const char *bin = get_binary_path();
 
     {
@@ -291,7 +293,8 @@ STM_TEST(stratum_fs_create_then_ls)
 /* `write` + `read` round-trip. */
 STM_TEST(stratum_fs_write_read_round_trip)
 {
-    fixture f = make_fixture("write_read");
+    fixture f;
+    make_fixture("write_read", &f);
     const char *bin = get_binary_path();
     const char *content = "stratum-fs round trip\n";
 
@@ -316,7 +319,8 @@ STM_TEST(stratum_fs_write_read_round_trip)
 /* `stat` reports correct mode + size for a written file. */
 STM_TEST(stratum_fs_stat_reports_size_and_mode)
 {
-    fixture f = make_fixture("stat");
+    fixture f;
+    make_fixture("stat", &f);
     const char *bin = get_binary_path();
     const char *content = "abcdefghij";
 
@@ -345,7 +349,8 @@ STM_TEST(stratum_fs_stat_reports_size_and_mode)
 /* `rm` on missing file → exit code 3 (NOT_FOUND). */
 STM_TEST(stratum_fs_rm_missing_file_exits_3)
 {
-    fixture f = make_fixture("rm_missing");
+    fixture f;
+    make_fixture("rm_missing", &f);
     const char *bin = get_binary_path();
     const char *argv[] = { bin, "-s", g_sock_path, "rm", "/nope", NULL };
     char out[256]; size_t n = 0;
@@ -357,7 +362,8 @@ STM_TEST(stratum_fs_rm_missing_file_exits_3)
 /* `mkdir` then `mkdir` again → exit code 2 (EEXIST). */
 STM_TEST(stratum_fs_mkdir_eexist_exits_2)
 {
-    fixture f = make_fixture("mkdir_dup");
+    fixture f;
+    make_fixture("mkdir_dup", &f);
     const char *bin = get_binary_path();
 
     {
@@ -378,7 +384,8 @@ STM_TEST(stratum_fs_mkdir_eexist_exits_2)
 /* `mv` rename: create /a, mv /a /b, ls / shows b but not a. */
 STM_TEST(stratum_fs_mv_rename)
 {
-    fixture f = make_fixture("mv");
+    fixture f;
+    make_fixture("mv", &f);
     const char *bin = get_binary_path();
     /* create /a */
     {
@@ -409,7 +416,8 @@ STM_TEST(stratum_fs_mv_rename)
 /* `lns` + `readlink` round-trip. */
 STM_TEST(stratum_fs_lns_readlink)
 {
-    fixture f = make_fixture("lns");
+    fixture f;
+    make_fixture("lns", &f);
     const char *bin = get_binary_path();
     const char *target = "/etc/passwd-target";
 
@@ -433,7 +441,8 @@ STM_TEST(stratum_fs_lns_readlink)
 /* `ln` (hard link): create + ln → both names visible in ls. */
 STM_TEST(stratum_fs_ln_hard_link)
 {
-    fixture f = make_fixture("ln");
+    fixture f;
+    make_fixture("ln", &f);
     const char *bin = get_binary_path();
 
     {
@@ -460,7 +469,8 @@ STM_TEST(stratum_fs_ln_hard_link)
 /* `chmod` round-trip: chmod 0600 /f, stat shows 0600. */
 STM_TEST(stratum_fs_chmod_round_trip)
 {
-    fixture f = make_fixture("chmod");
+    fixture f;
+    make_fixture("chmod", &f);
     const char *bin = get_binary_path();
 
     {
@@ -486,7 +496,8 @@ STM_TEST(stratum_fs_chmod_round_trip)
 /* `rm` then `rmdir` clean up — the typical workflow. */
 STM_TEST(stratum_fs_rm_rmdir_cleanup)
 {
-    fixture f = make_fixture("rmdir");
+    fixture f;
+    make_fixture("rmdir", &f);
     const char *bin = get_binary_path();
 
     /* mkdir + create child + rm child + rmdir parent */
@@ -523,7 +534,8 @@ STM_TEST(stratum_fs_rm_rmdir_cleanup)
 /* Bad path — relative path → exit code 1 (USAGE). */
 STM_TEST(stratum_fs_bad_path_relative_exits_1)
 {
-    fixture f = make_fixture("bad_path");
+    fixture f;
+    make_fixture("bad_path", &f);
     const char *bin = get_binary_path();
     const char *argv[] = { bin, "-s", g_sock_path, "ls", "relative", NULL };
     char out[256]; size_t n = 0;
@@ -535,7 +547,8 @@ STM_TEST(stratum_fs_bad_path_relative_exits_1)
 /* `..` component refused → exit code 1. */
 STM_TEST(stratum_fs_dotdot_path_refused)
 {
-    fixture f = make_fixture("dotdot");
+    fixture f;
+    make_fixture("dotdot", &f);
     const char *bin = get_binary_path();
     const char *argv[] = { bin, "-s", g_sock_path, "ls", "/foo/../bar", NULL };
     char out[256]; size_t n = 0;
@@ -547,7 +560,8 @@ STM_TEST(stratum_fs_dotdot_path_refused)
 /* `sync` succeeds. */
 STM_TEST(stratum_fs_sync_succeeds)
 {
-    fixture f = make_fixture("sync");
+    fixture f;
+    make_fixture("sync", &f);
     const char *bin = get_binary_path();
     const char *argv[] = { bin, "-s", g_sock_path, "sync", NULL };
     char out[256]; size_t n = 0;

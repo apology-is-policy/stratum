@@ -96,30 +96,30 @@ typedef struct {
     uint64_t   root_ino;
 } client_fixture;
 
-static client_fixture make_client_fixture(const char *tag)
+/* Filled in place: the accept thread keeps a pointer into *f, so it must not be a local copied out on return. */
+static void make_client_fixture(const char *tag, client_fixture *f)
 {
-    client_fixture f = {0};
+    memset(f, 0, sizeof *f);
     make_tmp(tag);
     build_sock_path(tag);
 
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
     stm_fs_mount_opts mopts = rw_mount_opts();
-    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &f.fs));
-    STM_ASSERT_OK(stm_fs_init_dataset_root(f.fs, /*ds=*/1u, /*mode=*/0755u,
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &f->fs));
+    STM_ASSERT_OK(stm_fs_init_dataset_root(f->fs, /*ds=*/1u, /*mode=*/0755u,
                                               /*uid=*/0, /*gid=*/0,
-                                              &f.root_ino));
+                                              &f->root_ino));
 
-    f.listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
-    STM_ASSERT_TRUE(f.listen_fd >= 0);
+    f->listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(f->listen_fd >= 0);
 
-    f.ctx.listen_fd = f.listen_fd;
-    f.ctx.fs        = f.fs;
-    f.ctx.run_status = STM_EBACKEND;
-    atomic_init(&f.ctx.stop_flag, false);
-    STM_ASSERT_EQ(pthread_create(&f.worker, NULL,
-                                    accept_loop_thread, &f.ctx), 0);
-    return f;
+    f->ctx.listen_fd = f->listen_fd;
+    f->ctx.fs        = f->fs;
+    f->ctx.run_status = STM_EBACKEND;
+    atomic_init(&f->ctx.stop_flag, false);
+    STM_ASSERT_EQ(pthread_create(&f->worker, NULL,
+                                    accept_loop_thread, &f->ctx), 0);
 }
 
 static void destroy_client_fixture(client_fixture *f)
@@ -213,7 +213,8 @@ STM_TEST(p9_client_dial_no_listener_eio)
 
 STM_TEST(p9_client_dial_handshake_succeeds)
 {
-    client_fixture f = make_client_fixture("dial_ok");
+    client_fixture f;
+    make_client_fixture("dial_ok", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -236,7 +237,8 @@ STM_TEST(p9_client_close_on_null_is_noop)
 
 STM_TEST(p9_client_walk_zero_steps_clones_fid)
 {
-    client_fixture f = make_client_fixture("walk_zero");
+    client_fixture f;
+    make_client_fixture("walk_zero", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -256,7 +258,8 @@ STM_TEST(p9_client_walk_zero_steps_clones_fid)
 
 STM_TEST(p9_client_walk_n_too_large_einval)
 {
-    client_fixture f = make_client_fixture("walk_oor");
+    client_fixture f;
+    make_client_fixture("walk_oor", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -280,7 +283,8 @@ STM_TEST(p9_client_walk_n_too_large_einval)
  * with walked=0 (zero components resolved). */
 STM_TEST(p9_client_walk_missing_returns_enoent)
 {
-    client_fixture f = make_client_fixture("walk_miss");
+    client_fixture f;
+    make_client_fixture("walk_miss", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -306,7 +310,8 @@ STM_TEST(p9_client_walk_missing_returns_enoent)
  * verifier. */
 STM_TEST(p9_client_open_read_clunk_round_trip)
 {
-    client_fixture f = make_client_fixture("read_rt");
+    client_fixture f;
+    make_client_fixture("read_rt", &f);
 
     /* Create a file under the dataset root. */
     static const uint8_t NAME[] = "hello.txt";
@@ -357,7 +362,8 @@ STM_TEST(p9_client_open_read_clunk_round_trip)
 
 STM_TEST(p9_client_getattr_basic_reports_mode_size)
 {
-    client_fixture f = make_client_fixture("getattr_basic");
+    client_fixture f;
+    make_client_fixture("getattr_basic", &f);
 
     static const uint8_t NAME[] = "data";
     static const uint8_t DATA[] = "0123456789";
@@ -422,7 +428,8 @@ static stm_status dirent_collect_cb(const stm_9p_qid *qid,
 
 STM_TEST(p9_client_readdir_root_lists_created_file)
 {
-    client_fixture f = make_client_fixture("readdir_root");
+    client_fixture f;
+    make_client_fixture("readdir_root", &f);
 
     /* Create three files in the dataset root. */
     uint64_t inos[3];
@@ -489,7 +496,8 @@ STM_TEST(p9_client_readdir_root_lists_created_file)
  * extent MVP), so EXTENT-mode files would refuse the second Tread. */
 STM_TEST(p9_client_read_offset_resumption)
 {
-    client_fixture f = make_client_fixture("read_offset");
+    client_fixture f;
+    make_client_fixture("read_offset", &f);
 
     /* 80-byte payload — fits comfortably in INLINE (cap = 100 bytes
      * per `STM_INODE_INLINE_MAX`). INLINE reads support arbitrary
@@ -725,7 +733,8 @@ STM_TEST(p9_client_walk_malicious_nwqid_refused_no_oob)
  * NULL buf with count == 0 stays valid ("test the fid" shape). */
 STM_TEST(p9_client_read_null_buf_with_count_einval)
 {
-    client_fixture f = make_client_fixture("read_null_buf");
+    client_fixture f;
+    make_client_fixture("read_null_buf", &f);
 
     static const uint8_t NAME[] = "f";
     static const uint8_t DATA[] = "hi";
@@ -881,7 +890,8 @@ STM_TEST(p9_client_tag_mismatch_poisons_subsequent_ops_refused)
  * content matches. */
 STM_TEST(p9_client_write_round_trip)
 {
-    client_fixture f = make_client_fixture("write_rt");
+    client_fixture f;
+    make_client_fixture("write_rt", &f);
 
     static const uint8_t NAME[] = "out.txt";
     uint64_t file_ino = 0;
@@ -927,7 +937,8 @@ STM_TEST(p9_client_write_round_trip)
  * may fsync or just ack; the lib passes through). */
 STM_TEST(p9_client_write_null_buf_with_count_einval)
 {
-    client_fixture f = make_client_fixture("write_null");
+    client_fixture f;
+    make_client_fixture("write_null", &f);
 
     static const uint8_t NAME[] = "x.txt";
     uint64_t file_ino = 0;
@@ -968,7 +979,8 @@ STM_TEST(p9_client_write_null_buf_with_count_einval)
  * accmode == RDONLY refusal. */
 STM_TEST(p9_client_write_to_rdonly_fid_eacces)
 {
-    client_fixture f = make_client_fixture("write_ro");
+    client_fixture f;
+    make_client_fixture("write_ro", &f);
 
     static const uint8_t NAME[] = "ro.txt";
     static const uint8_t SEED[] = "seed";
@@ -1009,7 +1021,8 @@ STM_TEST(p9_client_write_to_rdonly_fid_eacces)
  * EXTENT mode (single-extent MVP). */
 STM_TEST(p9_client_write_sequential_offsets)
 {
-    client_fixture f = make_client_fixture("write_seq");
+    client_fixture f;
+    make_client_fixture("write_seq", &f);
 
     static const uint8_t NAME[] = "seq.txt";
     uint64_t file_ino = 0;
@@ -1066,7 +1079,8 @@ STM_TEST(p9_client_write_sequential_offsets)
  * root_fid (we cloned first). */
 STM_TEST(p9_client_lcreate_round_trip)
 {
-    client_fixture f = make_client_fixture("lcreate_rt");
+    client_fixture f;
+    make_client_fixture("lcreate_rt", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1106,7 +1120,8 @@ STM_TEST(p9_client_lcreate_round_trip)
 /* Tlcreate with a name that already exists → STM_EEXIST. */
 STM_TEST(p9_client_lcreate_eexist_when_name_exists)
 {
-    client_fixture f = make_client_fixture("lcreate_eexist");
+    client_fixture f;
+    make_client_fixture("lcreate_eexist", &f);
 
     /* Pre-create the file via fs API. */
     static const uint8_t NAME[] = "dup.txt";
@@ -1140,7 +1155,8 @@ STM_TEST(p9_client_lcreate_eexist_when_name_exists)
  * STM_EINVAL (lib-side validation, no round-trip). */
 STM_TEST(p9_client_lcreate_invalid_names_einval)
 {
-    client_fixture f = make_client_fixture("lcreate_inv");
+    client_fixture f;
+    make_client_fixture("lcreate_inv", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1177,7 +1193,8 @@ STM_TEST(p9_client_lcreate_invalid_names_einval)
  * read-back. Exercises the dir-create + dir-walk + file-create chain. */
 STM_TEST(p9_client_mkdir_then_walk_into_and_lcreate)
 {
-    client_fixture f = make_client_fixture("mkdir_walk");
+    client_fixture f;
+    make_client_fixture("mkdir_walk", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1218,7 +1235,8 @@ STM_TEST(p9_client_mkdir_then_walk_into_and_lcreate)
 /* Tmkdir with name that already exists → STM_EEXIST. */
 STM_TEST(p9_client_mkdir_eexist_when_name_exists)
 {
-    client_fixture f = make_client_fixture("mkdir_dup");
+    client_fixture f;
+    make_client_fixture("mkdir_dup", &f);
 
     /* Pre-create the dir via fs API. */
     static const uint8_t NAME[] = "existing";
@@ -1245,7 +1263,8 @@ STM_TEST(p9_client_mkdir_eexist_when_name_exists)
  * to it returns ENOENT. */
 STM_TEST(p9_client_unlinkat_removes_file)
 {
-    client_fixture f = make_client_fixture("unlink_file");
+    client_fixture f;
+    make_client_fixture("unlink_file", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1279,7 +1298,8 @@ STM_TEST(p9_client_unlinkat_removes_file)
  * server-policy; assert non-OK. */
 STM_TEST(p9_client_unlinkat_dir_without_removedir_flag_refused)
 {
-    client_fixture f = make_client_fixture("unlink_dir_noflag");
+    client_fixture f;
+    make_client_fixture("unlink_dir_noflag", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1307,7 +1327,8 @@ STM_TEST(p9_client_unlinkat_dir_without_removedir_flag_refused)
  * from "device busy". The test now asserts the faithful mapping. */
 STM_TEST(p9_client_unlinkat_removedir_nonempty_enotempty)
 {
-    client_fixture f = make_client_fixture("unlink_nonempty");
+    client_fixture f;
+    make_client_fixture("unlink_nonempty", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1344,7 +1365,8 @@ STM_TEST(p9_client_unlinkat_removedir_nonempty_enotempty)
 /* Tsetattr — apply MODE only and verify via Tgetattr. */
 STM_TEST(p9_client_setattr_mode_round_trip)
 {
-    client_fixture f = make_client_fixture("setattr_mode");
+    client_fixture f;
+    make_client_fixture("setattr_mode", &f);
 
     /* Pre-create a regular file via fs API so we have a known fid to
      * setattr against. */
@@ -1393,7 +1415,8 @@ STM_TEST(p9_client_setattr_mode_round_trip)
  * truncate (server-side gen bump). */
 STM_TEST(p9_client_setattr_size_truncate)
 {
-    client_fixture f = make_client_fixture("setattr_size");
+    client_fixture f;
+    make_client_fixture("setattr_size", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1433,7 +1456,8 @@ STM_TEST(p9_client_setattr_size_truncate)
 /* Tsetattr — NULL `in` → STM_EINVAL (lib-side, no round-trip). */
 STM_TEST(p9_client_setattr_null_in_einval)
 {
-    client_fixture f = make_client_fixture("setattr_null");
+    client_fixture f;
+    make_client_fixture("setattr_null", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1449,7 +1473,8 @@ STM_TEST(p9_client_setattr_null_in_einval)
 /* Trenameat — rename a file in the same directory (oldfid == newfid). */
 STM_TEST(p9_client_renameat_same_dir)
 {
-    client_fixture f = make_client_fixture("rename_same");
+    client_fixture f;
+    make_client_fixture("rename_same", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1486,7 +1511,8 @@ STM_TEST(p9_client_renameat_same_dir)
 /* Trenameat — rename across directories. */
 STM_TEST(p9_client_renameat_cross_dir)
 {
-    client_fixture f = make_client_fixture("rename_cross");
+    client_fixture f;
+    make_client_fixture("rename_cross", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1537,7 +1563,8 @@ STM_TEST(p9_client_renameat_cross_dir)
 /* Trenameat — invalid names → STM_EINVAL (lib-side). */
 STM_TEST(p9_client_renameat_invalid_names_einval)
 {
-    client_fixture f = make_client_fixture("rename_inv");
+    client_fixture f;
+    make_client_fixture("rename_inv", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1561,7 +1588,8 @@ STM_TEST(p9_client_renameat_invalid_names_einval)
  * at "/etc/passwd"-shape target; readlink-back returns same string. */
 STM_TEST(p9_client_symlink_readlink_round_trip)
 {
-    client_fixture f = make_client_fixture("symlink_rt");
+    client_fixture f;
+    make_client_fixture("symlink_rt", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1594,7 +1622,8 @@ STM_TEST(p9_client_symlink_readlink_round_trip)
 /* Tsymlink — invalid `name` and `target` paths → STM_EINVAL. */
 STM_TEST(p9_client_symlink_invalid_args_einval)
 {
-    client_fixture f = make_client_fixture("symlink_inv");
+    client_fixture f;
+    make_client_fixture("symlink_inv", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1619,7 +1648,8 @@ STM_TEST(p9_client_symlink_invalid_args_einval)
  * required size so the caller can resize and retry. */
 STM_TEST(p9_client_readlink_buf_too_small_erange)
 {
-    client_fixture f = make_client_fixture("readlink_small");
+    client_fixture f;
+    make_client_fixture("readlink_small", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1655,7 +1685,8 @@ STM_TEST(p9_client_readlink_buf_too_small_erange)
 /* Treadlink — NULL buf or buf_cap=0 → STM_EINVAL. */
 STM_TEST(p9_client_readlink_invalid_args_einval)
 {
-    client_fixture f = make_client_fixture("readlink_inv");
+    client_fixture f;
+    make_client_fixture("readlink_inv", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1676,7 +1707,8 @@ STM_TEST(p9_client_readlink_invalid_args_einval)
  * mapped to STM_EINVAL by the lib. */
 STM_TEST(p9_client_readlink_on_non_symlink_einval)
 {
-    client_fixture f = make_client_fixture("readlink_notsym");
+    client_fixture f;
+    make_client_fixture("readlink_notsym", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1707,7 +1739,8 @@ STM_TEST(p9_client_readlink_on_non_symlink_einval)
  * inode (verified by getattr returning identical qid.path). */
 STM_TEST(p9_client_link_round_trip)
 {
-    client_fixture f = make_client_fixture("link_rt");
+    client_fixture f;
+    make_client_fixture("link_rt", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1752,7 +1785,8 @@ STM_TEST(p9_client_link_round_trip)
 /* Tlink on a directory → STM_EPERM (POSIX forbids hardlinks-on-dirs). */
 STM_TEST(p9_client_link_on_directory_eperm)
 {
-    client_fixture f = make_client_fixture("link_dir");
+    client_fixture f;
+    make_client_fixture("link_dir", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1784,7 +1818,8 @@ STM_TEST(p9_client_link_on_directory_eperm)
 /* Tlink with name that already exists → STM_EEXIST. */
 STM_TEST(p9_client_link_eexist_when_target_exists)
 {
-    client_fixture f = make_client_fixture("link_exists");
+    client_fixture f;
+    make_client_fixture("link_exists", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1823,7 +1858,8 @@ STM_TEST(p9_client_link_eexist_when_target_exists)
 /* Tlink with invalid names → STM_EINVAL (lib-side, no round-trip). */
 STM_TEST(p9_client_link_invalid_name_einval)
 {
-    client_fixture f = make_client_fixture("link_inv");
+    client_fixture f;
+    make_client_fixture("link_inv", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1844,7 +1880,8 @@ STM_TEST(p9_client_link_invalid_name_einval)
  * routes through stm_fs_commit. */
 STM_TEST(p9_client_fsync_round_trip)
 {
-    client_fixture f = make_client_fixture("fsync");
+    client_fixture f;
+    make_client_fixture("fsync", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1898,7 +1935,8 @@ static uint32_t lock_test_make_file(stm_9p_client *c, const char *name,
 /* Acquire WRLCK then UNLCK on the same fid, same range. Both succeed. */
 STM_TEST(p9_client_lock_acquire_release_round_trip)
 {
-    client_fixture f = make_client_fixture("lock_rt");
+    client_fixture f;
+    make_client_fixture("lock_rt", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1930,7 +1968,8 @@ STM_TEST(p9_client_lock_acquire_release_round_trip)
  * owner re-lock semantics). */
 STM_TEST(p9_client_lock_same_owner_relock_ok)
 {
-    client_fixture f = make_client_fixture("lock_same");
+    client_fixture f;
+    make_client_fixture("lock_same", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -1960,7 +1999,8 @@ STM_TEST(p9_client_lock_same_owner_relock_ok)
  * returns STM_EAGAIN. */
 STM_TEST(p9_client_lock_conflict_returns_eagain)
 {
-    client_fixture f = make_client_fixture("lock_conflict");
+    client_fixture f;
+    make_client_fixture("lock_conflict", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2005,7 +2045,8 @@ STM_TEST(p9_client_lock_conflict_returns_eagain)
  * can re-acquire. */
 STM_TEST(p9_client_lock_clunk_auto_releases)
 {
-    client_fixture f = make_client_fixture("lock_clunk");
+    client_fixture f;
+    make_client_fixture("lock_clunk", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2043,7 +2084,8 @@ STM_TEST(p9_client_lock_clunk_auto_releases)
 /* Tgetlock on a clean range returns UNLCK (would-grant). */
 STM_TEST(p9_client_getlock_no_conflict_returns_unlck)
 {
-    client_fixture f = make_client_fixture("getlock_clean");
+    client_fixture f;
+    make_client_fixture("getlock_clean", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2074,7 +2116,8 @@ STM_TEST(p9_client_getlock_no_conflict_returns_unlck)
  * (type != UNLCK). */
 STM_TEST(p9_client_getlock_conflict_returns_non_unlck)
 {
-    client_fixture f = make_client_fixture("getlock_conflict");
+    client_fixture f;
+    make_client_fixture("getlock_conflict", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2129,7 +2172,8 @@ STM_TEST(p9_client_getlock_conflict_returns_non_unlck)
 /* Lib-side validation: NULL args, NULL c, bogus type → STM_EINVAL. */
 STM_TEST(p9_client_lock_invalid_args_einval)
 {
-    client_fixture f = make_client_fixture("lock_inv");
+    client_fixture f;
+    make_client_fixture("lock_inv", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2160,7 +2204,8 @@ STM_TEST(p9_client_lock_invalid_args_einval)
 /* Lib-side validation: oversize client_id → STM_EINVAL. */
 STM_TEST(p9_client_lock_oversize_client_id_einval)
 {
-    client_fixture f = make_client_fixture("lock_oversz");
+    client_fixture f;
+    make_client_fixture("lock_oversz", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2190,7 +2235,8 @@ STM_TEST(p9_client_lock_oversize_client_id_einval)
 /* Tstatfs against the root fid returns a populated stat block. */
 STM_TEST(p9_client_statfs_round_trip)
 {
-    client_fixture f = make_client_fixture("statfs_rt");
+    client_fixture f;
+    make_client_fixture("statfs_rt", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2214,7 +2260,8 @@ STM_TEST(p9_client_statfs_round_trip)
 /* Tstatfs NULL out → STM_EINVAL (lib boundary). */
 STM_TEST(p9_client_statfs_null_out_einval)
 {
-    client_fixture f = make_client_fixture("statfs_inv");
+    client_fixture f;
+    make_client_fixture("statfs_inv", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2230,7 +2277,8 @@ STM_TEST(p9_client_statfs_null_out_einval)
 /* Tsync — empty-body request, empty-body reply. */
 STM_TEST(p9_client_sync_round_trip)
 {
-    client_fixture f = make_client_fixture("sync_rt");
+    client_fixture f;
+    make_client_fixture("sync_rt", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2261,7 +2309,8 @@ STM_TEST(p9_client_sync_round_trip)
  * src and its qid is returned. */
 STM_TEST(p9_client_reflink_round_trip)
 {
-    client_fixture f = make_client_fixture("reflink_rt");
+    client_fixture f;
+    make_client_fixture("reflink_rt", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2319,7 +2368,8 @@ STM_TEST(p9_client_reflink_round_trip)
  * remain 0 (per FALLOC_FL_KEEP_SIZE semantics). */
 STM_TEST(p9_client_fallocate_keep_size)
 {
-    client_fixture f = make_client_fixture("fallocate_rt");
+    client_fixture f;
+    make_client_fixture("fallocate_rt", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2352,7 +2402,8 @@ STM_TEST(p9_client_fallocate_keep_size)
  * Write 200 bytes to force the INLINE→EXTENT transition. */
 STM_TEST(p9_client_fallocate_grows_size)
 {
-    client_fixture f = make_client_fixture("fallocate_grow");
+    client_fixture f;
+    make_client_fixture("fallocate_grow", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2386,7 +2437,8 @@ STM_TEST(p9_client_fallocate_grows_size)
 /* Tfadvise: WILLNEED is accepted as a no-op hint at v2.0. */
 STM_TEST(p9_client_fadvise_willneed_ok)
 {
-    client_fixture f = make_client_fixture("fadvise_rt");
+    client_fixture f;
+    make_client_fixture("fadvise_rt", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2419,7 +2471,8 @@ STM_TEST(p9_client_fadvise_willneed_ok)
  * Txattrwalk + Tread. End-to-end round trip. */
 STM_TEST(p9_client_xattrcreate_then_xattrwalk_round_trip)
 {
-    client_fixture f = make_client_fixture("xattr_rt");
+    client_fixture f;
+    make_client_fixture("xattr_rt", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2476,7 +2529,8 @@ STM_TEST(p9_client_xattrcreate_then_xattrwalk_round_trip)
  * returned buffer is the NUL-separated names list. */
 STM_TEST(p9_client_xattrwalk_list_mode)
 {
-    client_fixture f = make_client_fixture("xattr_list");
+    client_fixture f;
+    make_client_fixture("xattr_list", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2534,7 +2588,8 @@ STM_TEST(p9_client_xattrwalk_list_mode)
 /* Txattrwalk on a non-existent xattr → STM_ENODATA. */
 STM_TEST(p9_client_xattrwalk_missing_xattr_enodata)
 {
-    client_fixture f = make_client_fixture("xattr_miss");
+    client_fixture f;
+    make_client_fixture("xattr_miss", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
@@ -2566,7 +2621,8 @@ STM_TEST(p9_client_xattrwalk_missing_xattr_enodata)
  * oversize name refused. */
 STM_TEST(p9_client_xattrwalk_invalid_args_einval)
 {
-    client_fixture f = make_client_fixture("xattr_inv");
+    client_fixture f;
+    make_client_fixture("xattr_inv", &f);
 
     stm_9p_dial_opts o = default_dial_opts(100);
     stm_9p_client *c = NULL;
