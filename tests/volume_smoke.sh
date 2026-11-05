@@ -135,6 +135,21 @@ if [ -w /dev/full ]; then
 else
     echo "note: no /dev/full here, so a read into a full disk is not tried"
 fi
+# The same anywhere: with no room for a byte and SIGXFSZ ignored, every write fails.
+if ( trap '' XFSZ; ulimit -f 0; F read /keepme.txt > "$D/capped" ) 2> "$D/rc.log"; then
+    no "a read whose output cannot be written answered success"
+else
+    ok "a read whose output cannot be written is refused"
+fi
+# A new file and a new directory are born with the mode given, and a file whose mode
+# leaves out its owner's write still takes its bytes.
+printf 'ro\n' | F write -n -m 400 /born400.txt > "$D/wm.log" 2>&1 \
+    && [ "$(F read /born400.txt)" = ro ] && F stat /born400.txt | LC_ALL=C grep -q '^mode: *0400$' \
+    && ok "write -m gives a new file its mode, and still writes it" \
+    || no "write -m 400: $(tail -1 "$D/wm.log"); $(F stat /born400.txt 2>&1 | LC_ALL=C grep '^mode')"
+F mkdir -m 700 /born700 > "$D/mm.log" 2>&1 && F stat /born700 | LC_ALL=C grep -q '^mode: *0700$' \
+    && ok "mkdir -m gives a new directory its mode" \
+    || no "mkdir -m 700: $(tail -1 "$D/mm.log"); $(F stat /born700 2>&1 | LC_ALL=C grep '^mode')"
 # Two daemons on one image would each write commits the other knows nothing of.
 printf '%s\n' "$PASS" | "$B" serve "$V" --listen "$D/second.sock" --keyfile "$V.key" --passphrase-stdin > "$D/second.log" 2>&1 &
 SECOND=$!
@@ -216,7 +231,7 @@ else
 fi
 perl -e 'alarm 30; exec @ARGV' "$B" mkfs /dev/zero --size 64M --keyfile "$D/zero.key" > "$D/zero2.log" 2>&1
 rc=$?
-if [ "$rc" != 0 ] && [ "$rc" != 142 ]; then
+if [ "$rc" != 0 ] && [ "$rc" != 142 ] && LC_ALL=C grep -q 'neither a file nor a disk' "$D/zero2.log"; then
     ok "that refusal does not wait on a scan first"
 else
     no "mkfs on /dev/zero without --force, rc=$rc: $(tail -1 "$D/zero2.log")"
@@ -261,6 +276,15 @@ if "$B" mkfs "$D/linked.stm" --size 64M --keyfile "$D/linked.key" > "$D/lk.log" 
     ok "a key named through a link lands where it points, and the link stays"
 else
     no "a key named through a link: $(tail -1 "$D/lk.log"); the link there: $([ -L "$D/linked.key" ] && echo yes || echo no)"
+fi
+# A relative link is read from the link's own directory, wherever mkfs runs.
+mkdir -p "$D/keys2"
+ln -s keys2/rel.key "$D/rel.key"
+if (cd / && "$B" mkfs "$D/rel.stm" --size 64M --keyfile "$D/rel.key") > "$D/rk.log" 2>&1 \
+    && [ -L "$D/rel.key" ] && [ -s "$D/keys2/rel.key" ]; then
+    ok "a key named through a relative link lands where it points"
+else
+    no "a key named through a relative link: $(tail -1 "$D/rk.log")"
 fi
 # A file already at the temporary key's name, perhaps a killed run's only key, is left as it was.
 # exec keeps the shell's pid, which is the one the name is made from.

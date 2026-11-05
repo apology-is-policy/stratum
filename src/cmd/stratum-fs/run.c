@@ -25,6 +25,7 @@
  *   1  usage error (argv parsing / bad path)
  *   2  I/O or server error
  *   3  not found (ENOENT)
+ *   4  write -n: the name is already there
  *
  * /ctl/-using subcommands (pool / dataset / snapshot / scrub /
  * key) are deferred until /ctl/-on-stratumd integration lands.
@@ -496,19 +497,64 @@ static void unmake(stm_9p_client *c, const path_t *parent, const char *name)
     (void)stm_9p_clunk(c, UNMAKE_FID);
 }
 
+/* Set by a command that made its own work durable, so the dispatcher's sync is not
+ * repeated. */
+static bool g_synced;
+
+static int parse_mode(const char *s, uint32_t *mode)
+{
+    if (s[0] < '0' || s[0] > '7') return -1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long m = strtoul(s, &end, 8);
+    if (errno != 0 || *end != '\0' || m > 07777u) return -1;
+    *mode = (uint32_t)m;
+    return 0;
+}
+
+/* SWISS-4q P0-3: 8 MiB heap buffer matching MSIZE_MAX so each fread is one Twrite. */
+enum { CMD_WRITE_BUF = 8u << 20 };
+
+static int write_into(stm_9p_client *c, char **argv, bool only_new, uint32_t mode,
+                      uint8_t *buf);
+
 static int cmd_write(stm_9p_client *c, int argc, char **argv)
 {
     /* -n: a new file only. A name that is there is refused, and what this made is
-     * removed if the write fails, so a copy never truncates or removes another's file. */
-    bool only_new = argc == 2 && strcmp(argv[0], "-n") == 0;
-    if (only_new) {
-        argc--;
-        argv++;
+     * removed if the write or its commit fails, so a copy never truncates or removes
+     * another's file. -m: the mode a new file is born with. */
+    bool only_new = false;
+    uint32_t mode = 0644u;
+    while (argc > 1 && argv[0][0] == '-') {
+        if (strcmp(argv[0], "-n") == 0) {
+            only_new = true;
+            argc--;
+            argv++;
+        } else if (strcmp(argv[0], "-m") == 0 && argc > 2 && parse_mode(argv[1], &mode) == 0) {
+            argc -= 2;
+            argv += 2;
+        } else {
+            break;
+        }
     }
     if (argc != 1) {
-        fprintf(stderr, "usage: stratum-fs write [-n] PATH < input\n");
+        fprintf(stderr, "usage: stratum-fs write [-n] [-m MODE] PATH < input\n");
         return EXIT_USAGE;
     }
+    /* Before anything is made, so its failure leaves nothing behind. */
+    uint8_t *buf = (uint8_t *)malloc(CMD_WRITE_BUF);
+    if (!buf) {
+        fprintf(stderr, "stratum-fs: write: alloc buffer failed\n");
+        return EXIT_IO;
+    }
+    int ret = write_into(c, argv, only_new, mode, buf);
+    free(buf);
+    return ret;
+}
+
+static int write_into(stm_9p_client *c, char **argv, bool only_new, uint32_t mode,
+                      uint8_t *buf)
+{
     path_t parent;
     const char *name = NULL;
     if (split_parent_name(argv[0], &parent, &name) < 0) return EXIT_USAGE;
@@ -529,7 +575,7 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
     stm_9p_qid q;
     rc = stm_9p_lcreate(c, WORK_FID, name,
                             STM_9P_O_WRONLY | STM_9P_O_TRUNC,
-                            0644u, (uint32_t)getgid(), &q, NULL);
+                            mode, (uint32_t)getgid(), &q, NULL);
     bool made = rc == STM_OK;
     if (only_new && !made) {
         if (rc == STM_EEXIST) fprintf(stderr, "stratum-fs: %s exists\n", argv[0]);
@@ -619,13 +665,6 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
      * the 4 KiB-aligned client clamp, every Twrite produces ONE
      * server-side extent of up to ~8 MiB. 2 GB sequential write
      * → ~256 extents (vs 16384 at the prior 1 MiB cap). */
-    enum { CMD_WRITE_BUF = 8u << 20 };  /* 8 MiB */
-    uint8_t *buf = (uint8_t *)malloc(CMD_WRITE_BUF);
-    if (!buf) {
-        fprintf(stderr, "stratum-fs: write: alloc buffer failed\n");
-        (void)stm_9p_clunk(c, WORK_FID);
-        return EXIT_IO;
-    }
     uint64_t offset = 0;
     int ret = 0;
     while (ret == 0) {
@@ -657,8 +696,17 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
         }
         offset += got;
     }
-    free(buf);
     (void)stm_9p_clunk(c, WORK_FID);
+    if (ret == 0 && only_new) {
+        /* The dispatcher's sync, done here where a failed one can still take the file
+         * away: what this made is committed, or removed. */
+        stm_status srv = stm_9p_fsync(c, ROOT_FID, /*datasync=*/0);
+        g_synced = true;
+        if (srv != STM_OK) {
+            fprintf(stderr, "stratum-fs: post-op sync failed: status=%d\n", (int)srv);
+            ret = EXIT_IO;
+        }
+    }
     if (ret != 0 && made && only_new) unmake(c, &parent, name);
     return ret;
 }
@@ -669,8 +717,13 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
 
 static int cmd_mkdir(stm_9p_client *c, int argc, char **argv)
 {
+    uint32_t mode = 0755u;
+    if (argc == 3 && strcmp(argv[0], "-m") == 0 && parse_mode(argv[1], &mode) == 0) {
+        argc -= 2;
+        argv += 2;
+    }
     if (argc != 1) {
-        fprintf(stderr, "usage: stratum-fs mkdir PATH\n");
+        fprintf(stderr, "usage: stratum-fs mkdir [-m MODE] PATH\n");
         return EXIT_USAGE;
     }
     path_t parent;
@@ -684,7 +737,7 @@ static int cmd_mkdir(stm_9p_client *c, int argc, char **argv)
     if (rc != STM_OK) { perr("walk parent", rc); return status_to_exit(rc); }
 
     stm_9p_qid q;
-    rc = stm_9p_mkdir(c, WORK_FID, name, 0755u, (uint32_t)getgid(), &q);
+    rc = stm_9p_mkdir(c, WORK_FID, name, mode, (uint32_t)getgid(), &q);
     (void)stm_9p_clunk(c, WORK_FID);
     if (rc != STM_OK) { perr("mkdir", rc); return status_to_exit(rc); }
     return 0;
@@ -1507,7 +1560,7 @@ int stm_cmd_fs_main(int argc, char **argv)
      *
      * Skipped on rc != 0 — the mutation didn't complete, no point
      * forcing a sync. */
-    if (rc == 0 && entry->mutates) {
+    if (rc == 0 && entry->mutates && !g_synced) {
         stm_status srv = stm_9p_fsync(c, ROOT_FID, /*datasync=*/0);
         if (srv != STM_OK) {
             fprintf(stderr,
