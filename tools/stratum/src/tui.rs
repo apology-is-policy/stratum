@@ -4143,10 +4143,23 @@ fn handle_editor_key(
     if ed.save_requested {
         ed.save_requested = false;
         let body = ed.content();
-        if !body.is_empty() {
-            let _ = client.write_path("/editor/content", body.as_bytes());
+        let staged = if body.is_empty() {
+            client.write_path("/editor/action", b"clear\n")
+        } else {
+            client.write_path("/editor/content", body.as_bytes())
+        };
+        match staged.and_then(|_| client.write_path("/editor/action", b"save\n")) {
+            Ok(()) => {
+                ed.modified = false;
+                ed.status_msg = Some("Saved.".into());
+            }
+            // The buffer may now be the only copy, so a failed :wq stays open.
+            Err(e) => {
+                ed.modified = true;
+                ed.quit_requested = false;
+                ed.status_msg = Some(format!("Save failed: {e}"));
+            }
         }
-        let _ = client.write_path("/editor/action", b"save\n");
     }
     if ed.quit_requested {
         // Push current cursor before quitting so external observers

@@ -281,9 +281,7 @@ impl EditorState {
                 match cmd.as_str() {
                     "w" if !self.readonly => {
                         self.save_requested = true;
-                        self.modified = false;
                         self.set_mode(EditorMode::Normal);
-                        self.status_msg = Some("Saved.".into());
                     }
                     "w" => {
                         self.status_msg = Some("Read-only mode".into());
@@ -300,7 +298,6 @@ impl EditorState {
                     "wq" if !self.readonly => {
                         self.save_requested = true;
                         self.quit_requested = true;
-                        self.modified = false;
                     }
                     "wq" => {
                         self.status_msg = Some("Read-only mode".into());
