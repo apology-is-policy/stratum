@@ -9,6 +9,7 @@ and the volume must mount again afterwards.
     tests/stop_with_clients.py path/to/stratum
 """
 import os
+import select
 import shutil
 import signal
 import socket
@@ -83,7 +84,7 @@ class Client:
 
 
 class Daemon:
-    def __init__(self, binary, work, workers):
+    def __init__(self, binary, work, workers, extra=()):
         self.fs_sock = os.path.join(work, 'f.sock')
         self.ctl_sock = os.path.join(work, 'c.sock')
         for path in (self.fs_sock, self.ctl_sock):
@@ -91,7 +92,7 @@ class Daemon:
                 os.unlink(path)
         self.log = open(os.path.join(work, 'serve.log'), 'wb')
         argv = [binary, 'serve', os.path.join(work, 'vol.stm'), '--listen', self.fs_sock,
-                '--ctl-listen', self.ctl_sock, '--fs-workers', str(workers)]
+                '--ctl-listen', self.ctl_sock, '--fs-workers', str(workers)] + list(extra)
         self.proc = subprocess.Popen(argv, stdout=self.log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 60
         while not (os.path.exists(self.fs_sock) and os.path.exists(self.ctl_sock)):
@@ -182,6 +183,40 @@ def main():
                         no('%s: the client saw: %s' % (what, client.end))
                     client.close()
 
+        # A client that asks and never reads: its replies fill both sockets, and the daemon's
+        # write blocks with a request in hand. --idle-timeout 0 is how the manager runs it.
+        for workers in (1, 4):
+            what = '9P client not reading, %d worker%s' % (workers, '' if workers == 1 else 's')
+            daemon = Daemon(binary, work, workers, ('--idle-timeout', '0'))
+            sock = socket.socket(socket.AF_UNIX)
+            sock.connect(daemon.fs_sock)
+            sock.setblocking(False)
+            frames = tversion() * 4096
+            off, stalls = 0, 0
+            deadline = time.monotonic() + 20
+            while stalls < 50 and time.monotonic() < deadline:
+                if off == len(frames):
+                    off = 0
+                try:
+                    off += sock.send(frames[off:off + 65536])
+                    stalls = 0
+                except BlockingIOError:
+                    stalls += 1
+                    time.sleep(0.02)
+            served = bool(select.select([sock], [], [], 0)[0])
+            if stalls < 50 or not served:
+                no('%s: never filled the socket (stalls %d, replies waiting %s)' % (what, stalls, served))
+                sock.close()
+                daemon.kill()
+                continue
+            rc, took = daemon.stop_timed()
+            if rc == 0:
+                ok('%s: stopped in %.2f s' % (what, took))
+            else:
+                no('%s: rc=%s after %.2f s' % (what, rc, took))
+            daemon.kill()
+            sock.close()
+
         # One client leaving ends nothing: the leg above would pass for a daemon that stops at any hangup.
         daemon = Daemon(binary, work, 1)
         client = Client(daemon.fs_sock, False)
@@ -198,8 +233,9 @@ def main():
         with open(source, 'wb') as out:
             out.write(os.urandom(8 << 20))
         # The control: the same command with no stop works, so a failure below is about the stop.
-        first = subprocess.run([binary, 'fs', '-s', daemon.fs_sock, 'put', source, '/first.bin'],
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        with open(source, 'rb') as src:
+            first = subprocess.run([binary, 'fs', '-s', daemon.fs_sock, 'write', '/first.bin'],
+                                   stdin=src, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         back = subprocess.run([binary, 'fs', '-s', daemon.fs_sock, 'read', '/first.bin'],
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         with open(source, 'rb') as src:
@@ -208,8 +244,8 @@ def main():
             ok('the same write with no stop comes back whole')
         else:
             no('the same write with no stop: rc=%d, %d bytes back: %s' % (first.returncode, len(back.stdout), first.stdout[-120:]))
-        put = subprocess.Popen([binary, 'fs', '-s', daemon.fs_sock, 'put', source, '/big.bin'],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        put = subprocess.Popen([binary, 'fs', '-s', daemon.fs_sock, 'write', '/big.bin'],
+                               stdin=open(source, 'rb'), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.05)
         rc, took = daemon.stop_timed()
         if rc == 0:

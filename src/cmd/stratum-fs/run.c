@@ -53,6 +53,7 @@
 #define EXIT_USAGE     1
 #define EXIT_IO        2
 #define EXIT_NOTFOUND  3
+#define EXIT_EXISTS    4
 
 /* Default Unix socket path. */
 #define DEFAULT_SOCKET "/var/run/stratum.sock"
@@ -325,6 +326,7 @@ static int cmd_ls(stm_9p_client *c, int argc, char **argv)
      * generous safety cap. Mirrors test_9p_client's pattern — the
      * server may report stable cookies that don't advance under
      * synth-only directories or pagination edge cases. */
+    bool complete = false;
     for (int iter = 0; iter < 1024; iter++) {
         uint32_t entries = 0;
         uint64_t next_offset = 0;
@@ -336,11 +338,19 @@ static int cmd_ls(stm_9p_client *c, int argc, char **argv)
             (void)stm_9p_clunk(c, WORK_FID);
             return status_to_exit(rc);
         }
-        if (entries == 0) break;
+        if (entries == 0) {
+            complete = true;
+            break;
+        }
         if (next_offset == prev) break;     /* defensive */
         offset = next_offset;
     }
     (void)stm_9p_clunk(c, WORK_FID);
+    if (!complete) {
+        /* A listing a program reads must not pass for the whole directory. */
+        fprintf(stderr, "stratum-fs: ls: the listing stopped before its end\n");
+        if (nul_ended) return EXIT_IO;
+    }
     return 0;
 }
 
@@ -455,6 +465,14 @@ static int cmd_read(stm_9p_client *c, int argc, char **argv)
         }
         offset += got;
     }
+    /* Mostly stdout is a file, and its last bytes are written here or at exit, where a
+     * failure would go unseen. */
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+        fprintf(stderr, "stratum-fs: writing the output failed: %s\n", strerror(errno));
+        free(rbuf);
+        (void)stm_9p_clunk(c, WORK_FID);
+        return EXIT_IO;
+    }
     free(rbuf);
     (void)stm_9p_clunk(c, WORK_FID);
     return 0;
@@ -464,10 +482,31 @@ static int cmd_read(stm_9p_client *c, int argc, char **argv)
 /* Subcommand: write (cat-stdin-into-file).                              */
 /* ────────────────────────────────────────────────────────────────────── */
 
+#define UNMAKE_FID 198u
+
+/* What write -n made and could not finish goes again. */
+static void unmake(stm_9p_client *c, const path_t *parent, const char *name)
+{
+    stm_9p_qid qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    if (stm_9p_walk(c, ROOT_FID, UNMAKE_FID, parent->count, parent->names,
+                    qids, &walked) != STM_OK)
+        return;
+    (void)stm_9p_unlinkat(c, UNMAKE_FID, name, 0);
+    (void)stm_9p_clunk(c, UNMAKE_FID);
+}
+
 static int cmd_write(stm_9p_client *c, int argc, char **argv)
 {
+    /* -n: a new file only. A name that is there is refused, and what this made is
+     * removed if the write fails, so a copy never truncates or removes another's file. */
+    bool only_new = argc == 2 && strcmp(argv[0], "-n") == 0;
+    if (only_new) {
+        argc--;
+        argv++;
+    }
     if (argc != 1) {
-        fprintf(stderr, "usage: stratum-fs write PATH < input\n");
+        fprintf(stderr, "usage: stratum-fs write [-n] PATH < input\n");
         return EXIT_USAGE;
     }
     path_t parent;
@@ -491,6 +530,13 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
     rc = stm_9p_lcreate(c, WORK_FID, name,
                             STM_9P_O_WRONLY | STM_9P_O_TRUNC,
                             0644u, (uint32_t)getgid(), &q, NULL);
+    bool made = rc == STM_OK;
+    if (only_new && !made) {
+        if (rc == STM_EEXIST) fprintf(stderr, "stratum-fs: %s exists\n", argv[0]);
+        else perr("lcreate", rc);
+        (void)stm_9p_clunk(c, WORK_FID);
+        return rc == STM_EEXIST ? EXIT_EXISTS : status_to_exit(rc);
+    }
     /* SWISS-4a: synthetic-FS servers (slate, /ctl/) don't implement
      * Tlcreate at all — they expose pre-existing virtual files only.
      * Falling back to walk-then-lopen on ENOTSUPPORTED treats them
@@ -581,9 +627,17 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
         return EXIT_IO;
     }
     uint64_t offset = 0;
-    while (1) {
+    int ret = 0;
+    while (ret == 0) {
         size_t got = fread(buf, 1, CMD_WRITE_BUF, stdin);
-        if (got == 0) break;
+        if (got == 0) {
+            /* An input that failed to read ends the loop the way its end does. */
+            if (ferror(stdin)) {
+                fprintf(stderr, "stratum-fs: reading the input failed: %s\n", strerror(errno));
+                ret = EXIT_IO;
+            }
+            break;
+        }
         uint32_t pos = 0;
         while (pos < (uint32_t)got) {
             uint32_t written = 0;
@@ -591,15 +645,13 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
                                   buf + pos, (uint32_t)got - pos, &written);
             if (rc != STM_OK) {
                 perr("write", rc);
-                free(buf);
-                (void)stm_9p_clunk(c, WORK_FID);
-                return status_to_exit(rc);
+                ret = status_to_exit(rc);
+                break;
             }
             if (written == 0) {
                 fprintf(stderr, "stratum-fs: server returned written=0\n");
-                free(buf);
-                (void)stm_9p_clunk(c, WORK_FID);
-                return EXIT_IO;
+                ret = EXIT_IO;
+                break;
             }
             pos += written;
         }
@@ -607,7 +659,8 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
     }
     free(buf);
     (void)stm_9p_clunk(c, WORK_FID);
-    return 0;
+    if (ret != 0 && made && only_new) unmake(c, &parent, name);
+    return ret;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */

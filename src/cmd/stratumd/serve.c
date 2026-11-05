@@ -37,6 +37,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -604,6 +605,29 @@ static void inflight_drain(stratumd_inflight *f)
     pthread_mutex_unlock(&f->mu);
 }
 
+/* How long a stop lets each request in hand finish and its reply go out. A client
+ * that is not reading would hold that reply's write for ever. */
+enum { STRATUMD_STOP_GRACE_MS = 2000 };
+
+static bool inflight_drain_within(stratumd_inflight *f, unsigned ms)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec  += (time_t)(ms / 1000u);
+    until.tv_nsec += (long)(ms % 1000u) * 1000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec++;
+        until.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&f->mu);
+    while (f->n > 0u) {
+        if (pthread_cond_timedwait(&f->cv, &f->mu, &until) == ETIMEDOUT) break;
+    }
+    bool drained = f->n == 0u;
+    pthread_mutex_unlock(&f->mu);
+    return drained;
+}
+
 /* Every live connection, so that a stop can end the reading side of each
  * and a client that keeps talking cannot hold the daemon up. The request in
  * hand still finishes and its reply still goes out. Each entry owns a dup,
@@ -653,6 +677,16 @@ static void stratumd_conns_stop_reading(void)
     pthread_mutex_lock(&g_conns_mu);
     for (stratumd_conn *c = g_conns; c; c = c->next)
         (void)shutdown(c->dup_fd, SHUT_RD);
+    pthread_mutex_unlock(&g_conns_mu);
+}
+
+/* Past the grace the writing side ends too, which wakes a write blocked on a client
+ * that is not reading. */
+static void stratumd_conns_end(void)
+{
+    pthread_mutex_lock(&g_conns_mu);
+    for (stratumd_conn *c = g_conns; c; c = c->next)
+        (void)shutdown(c->dup_fd, SHUT_RDWR);
     pthread_mutex_unlock(&g_conns_mu);
 }
 
@@ -724,6 +758,12 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
         if (client_fd < 0) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            /* Out of descriptors is a moment, not a reason to unmount. The listen
+             * socket stays readable meanwhile, so wait rather than spin. */
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                (void)poll(NULL, 0, 100);
+                continue;
+            }
             if (stop_flag && atomic_load_explicit(stop_flag,
                                                       memory_order_acquire))
                 break;
@@ -925,6 +965,12 @@ static stm_status stratumd_accept_proxy_loop(int listen_fd,
         if (client_fd < 0) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            /* Out of descriptors is a moment, not a reason to unmount. The listen
+             * socket stays readable meanwhile, so wait rather than spin. */
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                (void)poll(NULL, 0, 100);
+                continue;
+            }
             if (stop_flag && atomic_load_explicit(stop_flag,
                                                       memory_order_acquire))
                 break;
@@ -1186,6 +1232,12 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
         if (client_fd < 0) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            /* Out of descriptors is a moment, not a reason to unmount. The listen
+             * socket stays readable meanwhile, so wait rather than spin. */
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                (void)poll(NULL, 0, 100);
+                continue;
+            }
             if (stop_flag && atomic_load_explicit(stop_flag,
                                                       memory_order_acquire))
                 break;
@@ -2079,6 +2131,8 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
      * every index the RC read path walks lock-free); unmounting under
      * a live worker is a use-after-free. */
     stratumd_conns_stop_reading();
+    if (!inflight_drain_within(&g_fs_inflight, STRATUMD_STOP_GRACE_MS))
+        stratumd_conns_end();
     inflight_drain(&g_fs_inflight);
 
     /* TLY-A4: stop the corvus notify consumer FIRST so its log lines

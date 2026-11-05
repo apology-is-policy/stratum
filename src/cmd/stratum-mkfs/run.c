@@ -318,6 +318,48 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
     return key_in_the_way(keyfile_path, replaces_key, force) ? 1 : 0;
 }
 
+/* Without --force the name is taken only if it is still free: a link refuses one that
+ * appeared during the format, where a rename would replace it. A filesystem with no
+ * links has only the rename. */
+static int take_key_name(const char *from, const char *to, bool force)
+{
+    if (force) return rename(from, to);
+    if (link(from, to) == 0) {
+        (void)unlink(from);
+        return 0;
+    }
+    bool no_links = errno == EPERM || errno == ENOTSUP || errno == EXDEV || errno == EMLINK;
+#if defined(EOPNOTSUPP) && EOPNOTSUPP != ENOTSUP
+    no_links = no_links || errno == EOPNOTSUPP;
+#endif
+    return no_links ? rename(from, to) : -1;
+}
+
+/* A key named through a symlink belongs where the link points: replacing the link
+ * would leave it beside the volume instead. NULL for a loop or a path too long. */
+static const char *key_destination(const char *path, char *buf, size_t n)
+{
+    char here[4096];
+    if (snprintf(here, sizeof here, "%s", path) >= (int)sizeof here) return NULL;
+    for (int hops = 0; hops < 8; hops++) {
+        char target[4096];
+        ssize_t len = readlink(here, target, sizeof target - 1);
+        if (len < 0) {
+            if (snprintf(buf, n, "%s", here) >= (int)n) return NULL;
+            return buf;
+        }
+        target[len] = '\0';
+        const char *slash = strrchr(here, '/');
+        char next[4096];
+        int w = (target[0] == '/' || !slash)
+            ? snprintf(next, sizeof next, "%s", target)
+            : snprintf(next, sizeof next, "%.*s/%s", (int)(slash - here), here, target);
+        if (w < 0 || w >= (int)sizeof next) return NULL;
+        memcpy(here, next, (size_t)w + 1);
+    }
+    return NULL;
+}
+
 /* The rename is not durable until the directory holding it is. */
 static void sync_dir_of(const char *path)
 {
@@ -490,8 +532,11 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     bool created = false;
     /* Above every jump to the cleanup, which reads them. */
     char new_key_path[4096] = "";
+    char key_target_buf[4096] = "";
+    const char *key_target = keyfile_path;
     const char *format_key = keyfile_path;
     bool key_is_new = false;
+    bool temp_key_made = false;
     if (mkfs_claim(image_path, keyfile_path, have_pass, force, device_bytes, &created) != 0) {
         exit_code = 1;
         goto cleanup;
@@ -512,14 +557,35 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         key_is_new = true;
     }
     if (key_is_new) {
+        key_target = key_destination(keyfile_path, key_target_buf, sizeof key_target_buf);
+        if (!key_target) {
+            fprintf(stderr, "stratum-mkfs: %s is a loop of links, or names a path too long\n",
+                    keyfile_path);
+            key_is_new = false;
+            exit_code = 1;
+            goto cleanup;
+        }
         int n = snprintf(new_key_path, sizeof new_key_path, "%s.new.%ld",
-                         keyfile_path, (long)getpid());
+                         key_target, (long)getpid());
         if (n < 0 || (size_t)n >= sizeof new_key_path) {
             fprintf(stderr, "stratum-mkfs: keyfile path too long: %s\n", keyfile_path);
             key_is_new = false;
             exit_code = 1;
             goto cleanup;
         }
+        /* Made here, O_EXCL, so a file already at that name (a killed run's only key,
+         * perhaps) is neither truncated nor removed: cleanup removes what this run made. */
+        int tfd = open(new_key_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (tfd < 0) {
+            fprintf(stderr, "stratum-mkfs: cannot make %s: %s\n", new_key_path, strerror(errno));
+            key_is_new = false;
+            exit_code = 1;
+            goto cleanup;
+        }
+        close(tfd);
+        temp_key_made = true;
+        fprintf(stderr, "stratum-mkfs: the new key is at %s until the format is done\n",
+                new_key_path);
         stm_status ks = have_pass
             ? stm_keyfile_generate_passphrase(new_key_path, passbuf, plen)
             : stm_keyfile_generate(new_key_path);
@@ -611,8 +677,9 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     if (key_is_new) {
         /* From here the only key to this volume is the new file: it is never removed. */
         key_is_new = false;
+        temp_key_made = false;
         created = false;
-        if (rename(new_key_path, keyfile_path) != 0) {
+        if (take_key_name(new_key_path, key_target, force) != 0) {
             fprintf(stderr,
                 "stratum-mkfs: %s is formatted, but its key could not take the name %s (%s); "
                 "the key is at %s, keep it\n",
@@ -620,7 +687,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             exit_code = 2;
             goto cleanup;
         }
-        sync_dir_of(keyfile_path);
+        sync_dir_of(key_target);
         fprintf(stderr, "generated %skeyfile: %s\n", have_pass ? "encrypted " : "", keyfile_path);
     }
 
@@ -637,7 +704,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
 cleanup:
     /* What this run made and failed to finish, and nothing it found. */
     if (exit_code != 0) {
-        if (key_is_new) unlink(new_key_path);
+        if (temp_key_made) unlink(new_key_path);
         if (created) unlink(image_path);
     }
     /* SWISS-4m: wipe + munlock the passphrase buffer regardless of
