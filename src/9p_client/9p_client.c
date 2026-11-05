@@ -766,7 +766,11 @@ stm_status stm_9p_write(stm_9p_client *c, uint32_t fid, uint64_t offset,
      * an empty 3 GB drive triggers this bug" → manifests now as
      * EINVAL on first 1 MB write before this fix. */
     const uint32_t BLK = 4096u;
-    uint32_t max_write_count = c->buf_cap - STM_9P_HDR_SIZE - 16u;
+    /* The negotiated size is the limit, not this client's buffer: a server
+     * that negotiated less drops the connection on a frame over it. */
+    uint32_t frame_cap = (c->msize != 0u && c->msize < c->buf_cap)
+                             ? c->msize : c->buf_cap;
+    uint32_t max_write_count = frame_cap - STM_9P_HDR_SIZE - 16u;
     /* Round down to 4 KiB so any sub-msize-cap chunk sent in
      * sequential mode lands on the server as an aligned write. */
     uint32_t aligned_max = (max_write_count / BLK) * BLK;

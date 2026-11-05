@@ -1882,6 +1882,85 @@ static uint32_t editor_content_now(stm_9p_client *c, uint8_t *buf, uint32_t cap)
     return got;
 }
 
+/* Asked for what iounit offers, a client must still send a frame the server takes. iounit is sized for
+ * Tread, and the slate's messages are smaller than this client's buffer. Over the limit, the server
+ * drops the connection, and in the manager that ended the session and lost the edit. */
+STM_TEST(slate_socket_a_write_of_a_whole_iounit_keeps_the_connection)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_iounit");
+    slate_fixture f;
+    setup_fixture(&f, "fg_iounit");
+
+    /* Offering more than the slate takes, as the manager does. */
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    opts.msize = STM_9P_MSIZE_DEFAULT;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+    STM_ASSERT(stm_9p_msize(c) < STM_9P_MSIZE_DEFAULT);
+
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path, (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    const char *enames[] = { "event" };
+    stm_9p_qid eqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 1u, enames, eqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    const char *open_line = "editor open /version";
+    STM_ASSERT_OK(stm_9p_write(c, 102u, 0u, open_line, (uint32_t)strlen(open_line), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    const char *cnames[] = { "editor", "content" };
+    stm_9p_qid cqids[2];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 2u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT(iounit > 0u);
+
+    enum { LONG_BUFFER = 200 * 1024 };
+    static uint8_t want[LONG_BUFFER], back[LONG_BUFFER];
+    for (size_t i = 0; i < sizeof want; i++) want[i] = (uint8_t)(i * 31u + (i >> 8));
+
+    uint32_t done = 0u;
+    unsigned pieces = 0u;
+    while (done < LONG_BUFFER) {
+        uint32_t ask = LONG_BUFFER - done < iounit ? LONG_BUFFER - done : iounit;
+        STM_ASSERT_OK(stm_9p_write(c, 103u, done, want + done, ask, &written));
+        if (written == 0u) break;
+        done += written;
+        pieces++;
+    }
+    STM_ASSERT_EQ(done, (uint32_t)LONG_BUFFER);
+    STM_ASSERT(pieces > 1u);
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    const char *rnames[] = { "editor", "content" };
+    stm_9p_qid rqids[2];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 110u, 2u, rnames, rqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 110u, 0u, &oqid, &iounit));
+    uint32_t have = 0u;
+    while (have < LONG_BUFFER) {
+        uint32_t got = 0u;
+        STM_ASSERT_OK(stm_9p_read(c, 110u, have, back + have, LONG_BUFFER - have, &got));
+        if (got == 0u) break;
+        have += got;
+    }
+    STM_ASSERT_OK(stm_9p_clunk(c, 110u));
+    STM_ASSERT_EQ(have, (uint32_t)LONG_BUFFER);
+    STM_ASSERT_EQ(memcmp(back, want, LONG_BUFFER), 0);
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
 /* A buffer longer than one message comes in pieces, and every piece has to land. */
 STM_TEST(slate_socket_editor_content_arrives_in_pieces)
 {
