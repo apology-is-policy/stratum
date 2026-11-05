@@ -2,15 +2,18 @@
 /*
  * Crash-injection fuzzer (Phase 3 chunk 8).
  *
- * Exercises the recovery property: for any possible "power cut" during
- * a commit cycle, a subsequent mount must produce a pool that is
- * EITHER
+ * Exercises the recovery property: for a device op failing at each point
+ * in a commit cycle, a subsequent mount must produce a pool that is EITHER
  *
  *   1. mountable with consistent state (last durable commit),
  *   2. OR detectably-broken (STM_ENOENT / STM_ECORRUPT from mount).
  *
  * It must NEVER hang, return STM_OK with silently wrong state, or
  * leave a wedge that blocks further commits once re-mounted.
+ *
+ * This is less than a power cut: one op fails whole and later ones proceed,
+ * so there is no torn write, and the remount reads the same file in the same
+ * process, so no flush is lost. docs/PRODUCTION-PLAN.md T1.4 owns the rest.
  *
  * Method: iterate `n` from 1 to N_INJECT_MAX. For each n:
  *

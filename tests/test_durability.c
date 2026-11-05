@@ -17,11 +17,13 @@
  *      and fails the test loudly with a byte-level diff.
  *
  * Crash model + its boundary: stm_bdev_inject_fail_after(n) makes device
- * op >= n fail before its pwrite executes, so ops 1..n-1 land + ops n..
- * never do -- modeling a power cut after op n-1 for the WRITE-ORDERING
- * axis. It does NOT model fsync-barrier loss: the POSIX backend writes to
- * the process page cache and the remount reopens the same file in the same
- * process, so an issued-but-unfsync'd write stays visible. So this harness
+ * op n fail whole, before its I/O, and later ops proceed. Every path here
+ * aborts the commit on that error, so for the WRITE-ORDERING axis it stands
+ * in for a power cut after op n-1. It produces no torn write, and it does
+ * NOT model fsync-barrier loss: the POSIX backend writes to the process page
+ * cache and the remount reopens the same file in the same process, so an
+ * issued-but-unfsync'd write stays visible. docs/PRODUCTION-PLAN.md T1.4
+ * owns what this cannot see. So this harness
  * verifies commit ORDERING + COW rollback atomicity (it catches a
  * UB-before-data reorder instantly -- proven non-vacuous by injection,
  * Area-G audit), NOT that fsyncs are real device barriers -- that is the

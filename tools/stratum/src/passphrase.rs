@@ -63,6 +63,31 @@ pub fn push_secret(s: &mut String, c: char) {
     s.push(c);
 }
 
+/// What a dialog's field holds, which may be a passphrase: wiped when it goes, each
+/// copy included, and when it outgrows its buffer. What the terminal library buffered
+/// on the way in is out of reach.
+#[derive(Clone, Default)]
+pub struct SecretText(String);
+impl SecretText {
+    pub fn push(&mut self, c: char) { push_secret(&mut self.0, c); }
+    pub fn pop(&mut self) -> Option<char> { self.0.pop() }
+}
+impl From<String> for SecretText {
+    fn from(s: String) -> Self { Self(s) }
+}
+impl std::ops::Deref for SecretText {
+    type Target = str;
+    fn deref(&self) -> &str { &self.0 }
+}
+impl Drop for SecretText {
+    fn drop(&mut self) { wipe_string(&mut self.0); }
+}
+impl std::fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretText(..)")
+    }
+}
+
 /// `Zeroizing<Vec<u8>>` — a Vec wrapper that wipes its backing buffer
 /// on drop. Equivalent to the `zeroize` crate's `Zeroizing` but rolled
 /// here to avoid adding a dep.
@@ -76,9 +101,11 @@ impl Zeroizing {
 }
 impl Drop for Zeroizing {
     fn drop(&mut self) {
-        // Volatile write so the optimizer can't elide the wipe.
-        for b in self.0.iter_mut() {
-            unsafe { std::ptr::write_volatile(b as *mut u8, 0); }
+        // The whole buffer, since a backspace leaves its byte past the length. Volatile
+        // so the optimizer can't elide the wipe.
+        let (p, cap) = (self.0.as_mut_ptr(), self.0.capacity());
+        for i in 0..cap {
+            unsafe { std::ptr::write_volatile(p.add(i), 0); }
         }
     }
 }
@@ -120,7 +147,8 @@ pub fn prompt_passphrase(label: &str) -> Result<Zeroizing> {
     }
 
     // Read a line.
-    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    // Never grows, as the refusal comes at 1024, and every way out of here wipes it.
+    let mut buf = Zeroizing::new(Vec::with_capacity(1025));
     let mut byte = [0u8; 1];
     let mut reader = &tty;
     loop {
@@ -130,7 +158,7 @@ pub fn prompt_passphrase(label: &str) -> Result<Zeroizing> {
                 if byte[0] == b'\n' { break; }
                 if byte[0] == 0x7f || byte[0] == 0x08 {
                     // Backspace / DEL — pop one byte if any.
-                    buf.pop();
+                    buf.0.pop();
                     continue;
                 }
                 if buf.len() >= 1024 {
@@ -138,7 +166,7 @@ pub fn prompt_passphrase(label: &str) -> Result<Zeroizing> {
                     let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
                     bail!("passphrase exceeds 1024 bytes");
                 }
-                buf.push(byte[0]);
+                buf.0.push(byte[0]);
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -160,7 +188,7 @@ pub fn prompt_passphrase(label: &str) -> Result<Zeroizing> {
     if buf.is_empty() {
         bail!("empty passphrase refused");
     }
-    Ok(Zeroizing::new(buf))
+    Ok(buf)
 }
 
 #[cfg(test)]

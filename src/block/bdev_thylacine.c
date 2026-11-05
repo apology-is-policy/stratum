@@ -515,7 +515,11 @@ static void init_descriptors(uint64_t ring_va, uint64_t ring_pa, uint64_t data_p
  * unrecoverable device). Caller holds d->lock. */
 static bool reinit_device_locked(thyla_bdev *d)
 {
-    if (!init_device(d->slot_va, d->ring_pa, &d->flush_supported)) return false;
+    /* An fsync reads flush_supported without the lock. init_device starts from
+     * false, and a barrier skipped on that would be reported durable. */
+    bool flush = false;
+    if (!init_device(d->slot_va, d->ring_pa, &flush)) return false;
+    if (flush != d->flush_supported) d->flush_supported = flush;
     init_descriptors(THYLA_RING_USER_VA, d->ring_pa, d->data_pa);
     d->avail_idx = 0;
     d->reinit_count++;

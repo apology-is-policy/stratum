@@ -337,15 +337,20 @@ pub fn stop_on_signals() {
 /// or anything else. Ending the process is the way out, and the daemons follow it
 /// on their lifeline. Linux fails tcgetattr on a terminal that has gone; macOS still
 /// answers it, and fails an empty write instead. Neither sends anything to a live one.
-fn exit_when_terminal_goes(tty: i32, session_dir: Option<PathBuf>) {
+fn exit_when_terminal_goes(ttys: Vec<i32>, session_dir: Option<PathBuf>) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(200));
-        let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
-        let no_attrs = unsafe { libc::tcgetattr(tty, &mut attrs) } != 0;
-        let nothing = 0u8;
-        let no_write = unsafe { libc::write(tty, (&nothing as *const u8).cast(), 0) } < 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO);
-        if no_attrs || no_write {
+        // Every one of them: a read-only descriptor answers the write with EBADF, which
+        // says nothing, so on macOS it could not see the terminal go.
+        let gone = ttys.iter().any(|&tty| {
+            let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
+            let no_attrs = unsafe { libc::tcgetattr(tty, &mut attrs) } != 0;
+            let nothing = 0u8;
+            let no_write = unsafe { libc::write(tty, (&nothing as *const u8).cast(), 0) } < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO);
+            no_attrs || no_write
+        });
+        if gone {
             if let Some(dir) = &session_dir {
                 let _ = std::fs::remove_dir_all(dir);
             }
@@ -425,8 +430,12 @@ fn run_ui(
     spawn: Option<Arc<SpawnCtx>>,
 ) -> Result<()> {
     stop_on_signals();
-    if let Some(tty) = [0, 1, 2].into_iter().find(|&fd| unsafe { libc::isatty(fd) } == 1) {
-        exit_when_terminal_goes(tty, spawn.as_ref().map(|s| s.session_dir.clone()));
+    let ttys: Vec<i32> = [0, 1, 2]
+        .into_iter()
+        .filter(|&fd| unsafe { libc::isatty(fd) } == 1)
+        .collect();
+    if !ttys.is_empty() {
+        exit_when_terminal_goes(ttys, spawn.as_ref().map(|s| s.session_dir.clone()));
     }
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
@@ -1127,7 +1136,7 @@ fn handle_key(
             *local_dialog = Some(LocalDialog {
                 kind: LocalDialogKind::MkDirInput { panel_idx: *focus },
                 prompt: "New directory name:".into(),
-                value: String::new(),
+                value: Default::default(),
                 is_password: false,
                 is_error: false,
             });
@@ -1164,7 +1173,7 @@ fn handle_key(
                     dataset_id,
                 },
                 prompt: String::new(),
-                value: String::new(),
+                value: Default::default(),
                 is_password: false,
                 is_error: false,
             });
@@ -1176,7 +1185,7 @@ fn handle_key(
                 *local_dialog = Some(LocalDialog {
                     kind: LocalDialogKind::HostMountInput { panel_idx: *focus },
                     prompt: "Host directory to mount in this panel:".into(),
-                    value: default_host_path(),
+                    value: default_host_path().into(),
                     is_password: false,
                     is_error: false,
                 });
@@ -1196,7 +1205,7 @@ fn handle_key(
                 *local_dialog = Some(LocalDialog {
                     kind: LocalDialogKind::MkVol(MkVolState::new(*focus)),
                     prompt: String::new(),
-                    value: String::new(),
+                    value: Default::default(),
                     is_password: false,
                     is_error: false,
                 });
@@ -1424,7 +1433,7 @@ fn handle_integrity_content_key(
                  can take minutes to hours on large pools; progress\n\
                  is visible here in the Integrity pane."
                 .to_string(),
-            value: String::new(),
+            value: Default::default(),
             is_password: false,
             is_error: false,
         });
@@ -1720,7 +1729,7 @@ fn handle_snap_list_key(
                     dataset_id: dsid,
                 },
                 prompt: "Snapshot name (date-time auto-suggested):".into(),
-                value: default_snap_name(),
+                value: default_snap_name().into(),
                 is_password: false,
                 is_error: false,
             });
@@ -1751,7 +1760,7 @@ fn handle_snap_list_key(
                     },
                 },
                 prompt,
-                value: String::new(),
+                value: Default::default(),
                 is_password: false,
                 is_error: false,
             });
@@ -1787,7 +1796,7 @@ fn handle_snap_list_key(
                     },
                 },
                 prompt,
-                value: String::new(),
+                value: Default::default(),
                 is_password: false,
                 is_error: false,
             });
@@ -2622,12 +2631,10 @@ fn submit_dialog(
             Ok(Action::Refresh)
         }
         LocalDialogKind::PassphraseFor { volume } => {
-            // SWISS-4o: spawn stratumd with --passphrase-stdin and
-            // pipe the dialog's value to it. Wipe the dialog buffer
-            // immediately after pipe close — the wizard string lives
-            // on the local_dialog Drop, but we want defense-in-depth
-            // (the duplicate write buffer in spawn_stratumd_with_*
-            // is wiped via volatile-write inside that helper).
+            // SWISS-4o: spawn stratumd with --passphrase-stdin and pipe the
+            // dialog's value to it. The field wipes itself when it goes (the
+            // duplicate write buffer in spawn_stratumd_with_* is wiped inside
+            // that helper).
             let sp = match spawn {
                 Some(s) => s,
                 None => {
@@ -2640,27 +2647,9 @@ fn submit_dialog(
             // Derive default keyfile path = <volume>.key.
             let target_panel = 1 - snap.focus;     // mount goes to OTHER side
             // dialog.value is the passphrase the user typed.
-            let passphrase = dialog.value.clone();
             let result = sp.spawn_stratumd_with_passphrase(
-                &volume, None, passphrase.as_bytes(),
+                &volume, None, dialog.value.as_bytes(),
             );
-            // Best-effort wipe of the local dialog buffer before drop.
-            // Note: dialog itself was moved-out via the take() in
-            // handle_dialog_key, so this is the LAST live ref.
-            // (The original String's heap allocation will be dropped
-            // when this scope ends; volatile-write here is belt-and-
-            // suspenders for the "string was reallocated" race.)
-            let mut wipe = passphrase.into_bytes();
-            for b in wipe.iter_mut() {
-                unsafe { std::ptr::write_volatile(b as *mut u8, 0); }
-            }
-            drop(wipe);
-            // Likewise wipe the dialog.value field that handle_dialog_key
-            // may have left lingering — it was moved here, but if the
-            // String was reallocated mid-typing, the prior allocation
-            // could still hold readable bytes. zero-fill the current.
-            // (No public way to reach the prior alloc; trust libc's
-            // realloc-and-free hygiene + mlock would be the upgrade.)
             match result {
                 Ok(sock) => {
                     let meta = BackendMeta::Stratumd {
@@ -2683,7 +2672,7 @@ fn submit_dialog(
                             volume.file_name().unwrap_or_default().to_string_lossy(),
                             e
                         ),
-                        value: String::new(),
+                        value: Default::default(),
                         is_password: true,
                         is_error: false,
                     });
@@ -2716,7 +2705,7 @@ fn error_dialog(msg: &str) -> LocalDialog {
     LocalDialog {
         kind: LocalDialogKind::Error,
         prompt: msg.to_string(),
-        value: String::new(),
+        value: Default::default(),
         is_password: false,
         is_error: true,
     }
@@ -2730,7 +2719,7 @@ fn info_dialog(msg: &str) -> LocalDialog {
     LocalDialog {
         kind: LocalDialogKind::Error,    // shape only — see is_error
         prompt: msg.to_string(),
-        value: String::new(),
+        value: Default::default(),
         is_password: false,
         is_error: false,
     }
@@ -2846,7 +2835,7 @@ fn mount_stm_volume(
                 "Passphrase for {}:",
                 stm_path.file_name().unwrap_or_default().to_string_lossy()
             ),
-            value: String::new(),
+            value: Default::default(),
             is_password: true,
             is_error: false,
         });
@@ -3191,7 +3180,7 @@ fn start_f8(
             on_pick: ConfirmAction::DeleteBatch,
         },
         prompt,
-        value: String::new(),
+        value: Default::default(),
         is_password: false,
         is_error: false,
     });
@@ -3262,7 +3251,7 @@ fn run_delete(
                     on_pick: ConfirmAction::Delete { host_path: path.clone(), is_dir },
                 },
                 prompt: format!("Delete this {label}?\n  {}", path.display()),
-                value: String::new(),
+                value: Default::default(),
                 is_password: false,
                 is_error: false,
             });
@@ -3300,7 +3289,7 @@ fn run_delete(
                     },
                 },
                 prompt: format!("Delete this {label}?\n  {p9_path}"),
-                value: String::new(),
+                value: Default::default(),
                 is_password: false,
                 is_error: false,
             });
@@ -3452,7 +3441,7 @@ fn advance_copy_batch(
                 },
             },
             prompt,
-            value: String::new(),
+            value: Default::default(),
             is_password: false,
             is_error: false,
         });

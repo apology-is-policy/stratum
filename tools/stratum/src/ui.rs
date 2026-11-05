@@ -367,7 +367,7 @@ impl MkVolState {
 pub struct LocalDialog {
     pub kind: LocalDialogKind,
     pub prompt: String,
-    pub value: String,
+    pub value: crate::passphrase::SecretText,
     pub is_password: bool,
     pub is_error: bool,
 }

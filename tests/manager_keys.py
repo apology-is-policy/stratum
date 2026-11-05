@@ -219,6 +219,10 @@ def first_entry_row(term, names):
     return min(rows)
 
 
+# Every checking daemon, since a leg can fail while one is running and it has no lifeline.
+SERVED = []
+
+
 class Volume:
     def __init__(self, stratum, root):
         self.b, self.v, self.sock, self.proc = stratum, f'{root}/vol.stm', f'{root}/check.sock', None
@@ -233,6 +237,7 @@ class Volume:
         self.proc = subprocess.Popen([self.b, 'serve', self.v, '--listen', self.sock, '--keyfile', self.v + '.key', '--passphrase-stdin'],
                                      stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                      text=True)
+        SERVED.append(self.proc)
         self.proc.stdin.write(PASS + '\n')
         self.proc.stdin.close()
         end = time.monotonic() + 30
@@ -637,6 +642,9 @@ def mid_session_legs(stratum, root):
     vol = Volume(stratum, w)
     vol.mkfs()
     vol.serve()
+    r = vol.fs(vol.sock, 'write', '/seen_in_volume.txt', data=b'seen\n')
+    if r.returncode != 0:
+        raise Failure(f'seeding the volume failed: {r.stderr[:200]}')
     term = Term([stratum, 'tui', '--host', w])
     try:
         term.pump(3)
@@ -654,13 +662,20 @@ def mid_session_legs(stratum, root):
         term.show('the wrong passphrase mid-session')
         print('ok: mid-session, the wrong passphrase says so', flush=True)
 
+        # One attempt's reason must not be blamed on the next one.
+        vol.serve()
         term.send(PASS.encode() + ENTER)
-        limit = time.monotonic() + 70
-        while not daemons_of(vol.v) and time.monotonic() < limit:
-            term.pump(0.2)
-        if not daemons_of(vol.v):
-            raise Failure('the right passphrase started no daemon for the volume')
+        term.expect(r'already open', timeout=70)
+        record('wrong passphrase' not in term.screen.text(),
+               'mid-session, a failure after a wrong passphrase is called what it is',
+               'mid-session, a wrong passphrase was blamed on a later attempt')
+        vol.stop()
+
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'seen_in_volume', timeout=70)
         term.pump(1.5)
+        if not daemons_of(vol.v):
+            raise Failure('the volume showed, and then no daemon was serving it')
         term.show('the volume open mid-session')
         print('ok: mid-session, the right passphrase opens it', flush=True)
 
@@ -694,6 +709,24 @@ def wrong_passphrase_leg(stratum, vol, host):
         if term.rc == 0:
             raise Failure('the manager exited 0 on the wrong passphrase')
         print(f'ok: the wrong passphrase refused, exit {term.rc}', flush=True)
+        record(re.search(r'(?i)wrong passphrase', term.screen.text()), 'and it says that was the reason',
+               'the manager stopped without saying the passphrase was wrong')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    # The control, one variable away: the keys are right, so a refusal above was about the passphrase.
+    term = Term([stratum, 'tui', '--vol', vol.v, '--host', host])
+    try:
+        term.expect(r'Passphrase for')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'from_vol\.txt', timeout=60)
+        print('ok: the same command with the right passphrase opens it', flush=True)
+        term.send(F10)
+        if not term.exited(60):
+            raise Failure('F10 did not quit after the right passphrase')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -1203,6 +1236,13 @@ def main():
         print(f'FAIL: {e}')
         return 1
     finally:
+        for proc in SERVED:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
         shutil.rmtree(root, ignore_errors=True)
     if FAILED:
         print(f'FAIL: {len(FAILED)} leg(s) above')

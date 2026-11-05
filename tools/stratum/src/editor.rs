@@ -49,6 +49,8 @@ pub struct EditorState {
     /// Tracks whether the original content ended with a trailing
     /// newline so save can preserve POSIX text-file convention.
     pub trailing_newline: bool,
+    /// An empty file gets the newline once it holds something, but not for being saved.
+    was_empty: bool,
 }
 
 impl EditorState {
@@ -79,6 +81,7 @@ impl EditorState {
             quit_requested: false,
             status_msg: None,
             trailing_newline,
+            was_empty: content.is_empty(),
         };
         ed.update_cursor_style();
         ed
@@ -89,7 +92,8 @@ impl EditorState {
     /// (POSIX convention).
     pub fn content(&self) -> String {
         let mut out = self.textarea.lines().join("\n");
-        if self.trailing_newline && !out.ends_with('\n') {
+        // Not on ends_with: new() took one newline off, and "a\n\n" must get it back.
+        if self.trailing_newline && !(self.was_empty && out.is_empty()) {
             out.push('\n');
         }
         out
@@ -352,3 +356,16 @@ fn clipboard_get() -> Option<String> { None }
 
 #[cfg(not(target_os = "macos"))]
 fn clipboard_set(_text: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::EditorState;
+
+    #[test]
+    fn a_file_saved_unchanged_comes_back_the_same() {
+        for body in ["", "\n", "\n\n", "a", "a\n", "a\n\n", "a\nb", "a\nb\n", "a\n\nb\n\n"] {
+            let ed = EditorState::new("f".into(), body, false);
+            assert_eq!(ed.content(), body, "{body:?}");
+        }
+    }
+}
