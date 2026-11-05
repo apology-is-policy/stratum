@@ -6680,18 +6680,22 @@ static stm_status fs_dir_holds(stm_fs *fs, stm_inode_index *iidx, stm_dirent_ind
 
     fs_dir_set seen = { 0 };
     size_t todo_cap = 64u, todo_n = 0u;
-    uint64_t *todo = malloc(todo_cap * sizeof *todo);
+    fs_dir_id *todo = malloc(todo_cap * sizeof *todo);
     bool added = false;
     stm_status s = todo ? fs_dir_set_add(&seen, (fs_dir_id){ .ino = top, .gen = top_gen }, &added)
                         : STM_ENOMEM;
-    if (s == STM_OK) todo[todo_n++] = top;
+    if (s == STM_OK) todo[todo_n++] = (fs_dir_id){ .ino = top, .gen = top_gen };
 
     while (s == STM_OK && todo_n > 0u && !*out_holds) {
-        uint64_t dir = todo[--todo_n];
+        fs_dir_id dir = todo[--todo_n];
         stm_dirent_child *kids = NULL;
         size_t n = 0;
-        s = stm_dirent_child_dirs(didx, dataset_id, dir, &kids, &n);
-        for (size_t i = 0; s == STM_OK && i < n; i++) {
+        s = stm_dirent_child_dirs(didx, dataset_id, dir.ino, &kids, &n);
+        /* Asked after the read: a directory queued earlier may be gone, its number already another
+         * directory's. A generation never returns, so one still live now was that directory throughout. */
+        bool dir_live = false;
+        if (s == STM_OK) s = fs_name_live_locked(iidx, dataset_id, dir.ino, dir.gen, &dir_live, NULL);
+        for (size_t i = 0; s == STM_OK && dir_live && i < n; i++) {
             bool live = false;
             s = fs_name_live_locked(iidx, dataset_id, kids[i].ino, kids[i].gen, &live, NULL);
             if (s != STM_OK || !live) continue;
@@ -6706,7 +6710,7 @@ static stm_status fs_dir_holds(stm_fs *fs, stm_inode_index *iidx, stm_dirent_ind
                 break;
             }
             if (todo_n == todo_cap) {
-                uint64_t *grown = realloc(todo, todo_cap * 2u * sizeof *todo);
+                fs_dir_id *grown = realloc(todo, todo_cap * 2u * sizeof *todo);
                 if (!grown) {
                     s = STM_ENOMEM;
                     break;
@@ -6714,7 +6718,7 @@ static stm_status fs_dir_holds(stm_fs *fs, stm_inode_index *iidx, stm_dirent_ind
                 todo = grown;
                 todo_cap *= 2u;
             }
-            todo[todo_n++] = kids[i].ino;
+            todo[todo_n++] = (fs_dir_id){ .ino = kids[i].ino, .gen = kids[i].gen };
         }
         free(kids);
         if (s == STM_OK && !*out_holds) fs_rename_walk_gap(fs, STM_FS_RENAME_WALK_DIR);

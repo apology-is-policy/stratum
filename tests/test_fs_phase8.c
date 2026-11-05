@@ -7515,9 +7515,9 @@ STM_TEST(fs_a_directory_rename_waits_for_the_walk) {
 
 struct fs_reuse {
     stm_fs *fs;
-    uint64_t q, w, n;
+    uint64_t q, w, n, c;
     int gaps;
-    stm_status rm, mk;
+    stm_status rm, mk, mk2;
 };
 
 static void *fs_reuse_thread(void *arg)
@@ -7525,6 +7525,7 @@ static void *fs_reuse_thread(void *arg)
     struct fs_reuse *r = arg;
     r->rm = stm_fs_rmdir(r->fs, 1, r->q, (const uint8_t *)"a", 1);
     r->mk = stm_fs_mkdir(r->fs, 1, r->w, (const uint8_t *)"n", 1, 0755u, 0, 0, &r->n);
+    r->mk2 = stm_fs_mkdir(r->fs, 1, r->n, (const uint8_t *)"c", 1, 0755u, 0, 0, &r->c);
     return NULL;
 }
 
@@ -7539,7 +7540,8 @@ static void fs_reuse_hook(stm_fs_rename_walk_point at, void *arg)
 }
 
 /* The walk meets q/a, then a goes and its number comes back as q/w/n, one generation on. That is an ordinary
- * rm and mkdir under a busy tree, not damage, and the rename must not call it corruption. */
+ * rm and mkdir under a busy tree, not damage, and the rename must not call it corruption. n has a child, so a
+ * walk that took a's queued number for n would read n twice and meet c twice. */
 STM_TEST(fs_a_walk_takes_a_reused_number_for_a_new_directory) {
     make_tmp("rename_reuse");
     stm_fs_format_opts fopts = default_format_opts();
@@ -7555,7 +7557,7 @@ STM_TEST(fs_a_walk_takes_a_reused_number_for_a_new_directory) {
     STM_ASSERT_OK(stm_fs_mkdir(fs, 1, q, (const uint8_t *)"a", 1, 0755u, 0, 0, &a));
     STM_ASSERT_OK(stm_fs_mkdir(fs, 1, q, (const uint8_t *)"w", 1, 0755u, 0, 0, &w));
 
-    struct fs_reuse r = { .fs = fs, .q = q, .w = w, .rm = STM_EIO, .mk = STM_EIO };
+    struct fs_reuse r = { .fs = fs, .q = q, .w = w, .rm = STM_EIO, .mk = STM_EIO, .mk2 = STM_EIO };
     stm_fs_set_rename_walk_hook_for_test(fs, fs_reuse_hook, &r);
     stm_status first = stm_fs_rename(fs, 1, root, (const uint8_t *)"x", 1, e, (const uint8_t *)"x", 1, 0);
     stm_fs_set_rename_walk_hook_for_test(fs, NULL, NULL);
@@ -7564,6 +7566,7 @@ STM_TEST(fs_a_walk_takes_a_reused_number_for_a_new_directory) {
     STM_ASSERT(r.gaps >= 2);
     STM_ASSERT_OK(r.rm);
     STM_ASSERT_OK(r.mk);
+    STM_ASSERT_OK(r.mk2);
     STM_ASSERT_EQ(r.n, a);
 
     STM_ASSERT_OK(first);
