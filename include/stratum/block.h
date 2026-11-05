@@ -173,11 +173,13 @@ stm_status stm_bdev_resize(stm_bdev *d, uint64_t new_size);
 
 /*
  * Claim an image for one process. STM_EBUSY: another process holds it.
- * STM_ENOENT: there is no such file and `create` was false. Any other failure
- * leaves errno set and claims nothing. The kernel drops the claim however the
- * process ends, so nothing stale can lock a volume out. On success *out_fd is
- * the descriptor to close to give it up, or -1 where the platform has no such
- * lock.
+ * STM_ENOENT: there is no such file and `create` was false; with `create` the
+ * file must not exist yet. STM_ENOLCK: the file is there (and with `create`,
+ * was made) but this filesystem cannot lock it, so nothing shows who else has
+ * it. Any other failure leaves errno set and claims nothing, as does either of
+ * those. The kernel drops the claim however the process ends, so nothing stale
+ * can lock a volume out. On success *out_fd is the descriptor to close to give
+ * it up, or -1 where the platform has no such lock.
  */
 stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd);
 

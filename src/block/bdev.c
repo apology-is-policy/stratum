@@ -180,13 +180,18 @@ stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd)
 {
     *out_fd = -1;
 #if !defined(__thylacine__)
-    int fd = open(path, O_RDONLY | O_CLOEXEC | (create ? O_CREAT : 0), 0600);
+    /* Read-write where it can be: over NFS, flock is a byte-range lock, and an
+     * exclusive one needs the file open for writing. */
+    int flags = O_CLOEXEC | (create ? O_CREAT | O_EXCL : 0);
+    int fd = open(path, O_RDWR | flags, 0600);
+    if (fd < 0 && (errno == EACCES || errno == EROFS))
+        fd = open(path, O_RDONLY | flags, 0600);
     if (fd < 0) return errno == ENOENT ? STM_ENOENT : STM_EIO;
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         int e = errno;
         close(fd);
         errno = e;
-        return e == EWOULDBLOCK ? STM_EBUSY : STM_EIO;
+        return e == EWOULDBLOCK ? STM_EBUSY : STM_ENOLCK;
     }
     *out_fd = fd;
 #else

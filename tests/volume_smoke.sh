@@ -111,6 +111,10 @@ else
 fi
 if printf '%s\n' "$PASS" | "$B" mkfs "$V" --size 256M --force --passphrase-stdin > "$D/again.log" 2>&1; then
     no "--force reached past a daemon using the volume"
+elif LC_ALL=C grep -q 'running stratumd' "$D/again.log"; then
+    ok "--force does not reach past a daemon, and says why"
+else
+    no "--force past a daemon stopped without saying why: $(tail -1 "$D/again.log")"
 fi
 [ "$(cksum < "$V.key")" = "$kh" ] && ok "the key is untouched by a refused mkfs" || no "a refused mkfs replaced the key"
 F ls / > /dev/null || no "the refused mkfs disturbed the daemon"
@@ -140,6 +144,52 @@ else
     no "the refusal over a key did not say why: $(tail -1 "$D/again.log")"
 fi
 [ "$(cksum < "$V.key")" = "$kh" ] && ok "another volume's key survives" || no "another volume's key was replaced"
+[ ! -e "$D/new.stm" ] && ok "that refusal left no empty image" || no "that refusal left an image behind"
+
+# A format cannot shrink a file. Asking for it must fail before any key is touched.
+if printf '%s\n' other | "$B" mkfs "$V" --size 64M --force --passphrase-stdin > "$D/again.log" 2>&1; then
+    no "a format smaller than the file answered success"
+elif LC_ALL=C grep -q 'cannot shrink' "$D/again.log"; then
+    ok "a format smaller than the file is refused, and says why"
+else
+    no "a format smaller than the file stopped without saying why: $(tail -1 "$D/again.log")"
+fi
+[ "$(cksum < "$V.key")" = "$kh" ] && ok "that refusal kept the key" || no "a format that could not run replaced the key"
+[ "$(cksum < "$V")" = "$vh" ] && ok "that refusal kept the volume" || no "a format that could not run changed the volume"
+
+# A format that fails late leaves what it found, and nothing it made, so a retry just works.
+printf 'not a key' > "$D/late.stm.key"
+if "$B" mkfs "$D/late.stm" --size 64M > "$D/late.log" 2>&1; then
+    no "a garbage key formatted a volume"
+else
+    [ ! -e "$D/late.stm" ] && ok "a failed format over a bad key leaves no image" || no "a failed format left an image"
+    [ "$(cat "$D/late.stm.key")" = 'not a key' ] && ok "a failed format leaves a key it found" || no "a failed format changed a key it found"
+fi
+rm -f "$D/late.stm.key"
+if printf '%s\n' other | "$B" mkfs "$D/late.stm" --size 9000000000G --passphrase-stdin > "$D/late.log" 2>&1; then
+    no "an impossible size formatted a volume"
+else
+    left=$(ls "$D" | LC_ALL=C grep -c '^late\.stm')
+    [ "$left" = 0 ] && ok "a failed format leaves neither image nor new key" || no "a failed format left $left files: $(ls "$D" | LC_ALL=C grep '^late\.stm' | head -3)"
+fi
+printf '%s\n' other | "$B" mkfs "$D/late.stm" --size 64M --passphrase-stdin > "$D/late.log" 2>&1 \
+    && [ -s "$D/late.stm.key" ] && ok "the same command with a size that fits formats, and leaves its key" \
+    || no "the retry after a failed format: $(tail -1 "$D/late.log")"
+[ -z "$(ls "$D" | LC_ALL=C grep -F '.key.new.')" ] && ok "no temporary key is left behind" || no "a temporary key was left behind"
+
+# A byte anywhere is data, not just in the first MiB.
+for at in 2097152 67108863; do
+    rm -f "$D/z.stm"
+    dd if=/dev/zero of="$D/z.stm" bs=1 count=0 seek=67108864 2>/dev/null
+    printf 'X' | dd of="$D/z.stm" bs=1 seek="$at" conv=notrunc 2>/dev/null
+    if "$B" mkfs "$D/z.stm" --size 64M > "$D/z.log" 2>&1; then
+        no "mkfs formatted over a file with a byte at $at"
+    elif LC_ALL=C grep -q 'already holds data' "$D/z.log"; then
+        ok "a byte at $at is data"
+    else
+        no "mkfs stopped at a byte at $at without saying why: $(tail -1 "$D/z.log")"
+    fi
+done
 # The control: --force, and a fresh sparse file, each do format, so a refusal above was about the data.
 "$B" mkfs "$D/force.stm" --size 64M > "$D/f1.log" 2>&1 || no "the control's first mkfs: $(tail -1 "$D/f1.log")"
 fh=$(cksum < "$D/force.stm")
@@ -149,6 +199,16 @@ fh=$(cksum < "$D/force.stm")
 "$B" mkfs "$D/empty.stm" --size 64M > "$D/f3.log" 2>&1 && ok "mkfs takes an empty file" || no "mkfs refused an empty file: $(tail -1 "$D/f3.log")"
 dd if=/dev/zero of="$D/sparse.stm" bs=1 count=0 seek=67108864 2>/dev/null
 "$B" mkfs "$D/sparse.stm" --size 64M > "$D/f4.log" 2>&1 && ok "mkfs takes a sparse file" || no "mkfs refused a sparse file: $(tail -1 "$D/f4.log")"
+# --force with a passphrase over a volume with no daemon: the new key is the one that opens it.
+fk=$(cksum < "$D/force.stm.key")
+if printf '%s\n' second | "$B" mkfs "$D/force.stm" --size 64M --force --passphrase-stdin > "$D/f5.log" 2>&1; then
+    [ "$(cksum < "$D/force.stm.key")" != "$fk" ] && ok "--force with a passphrase replaces the key" || no "--force with a passphrase kept the old key"
+    OV=$V; V=$D/force.stm
+    if serve second; then ok "the replaced key opens the volume"; stop; else no "the replaced key does not open it: $(tail -1 "$D/serve.log")"; fi
+    V=$OV
+else
+    no "--force with a passphrase: $(tail -1 "$D/f5.log")"
+fi
 
 # The control is one variable away: the same search over a file that does hold the marker.
 in_image=$(LC_ALL=C grep -c "$MARK" "$V")

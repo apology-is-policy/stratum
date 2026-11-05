@@ -2470,7 +2470,7 @@ fn submit_mkvol(
             new_mk.error = Some(format!(
                 "mkfs failed (exit {}): {}",
                 out.status.code().unwrap_or(-1),
-                stderr.lines().next().unwrap_or("(no detail)").trim()
+                stderr.lines().next_back().unwrap_or("(no detail)").trim()
             ));
             *local_dialog = Some(LocalDialog {
                 kind: LocalDialogKind::MkVol(new_mk),

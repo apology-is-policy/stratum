@@ -99,7 +99,8 @@ static void usage(void)
 "  --size SIZE      Image size with K/M/G suffix. Default: 64M.\n"
 "  --force          Format over what is already at IMAGE, and with\n"
 "                   --passphrase-stdin replace an existing keyfile. Whatever\n"
-"                   they held is gone. Never overrides a daemon using IMAGE.\n"
+"                   they held is gone. Never overrides a daemon using IMAGE,\n"
+"                   and a format cannot shrink a file: --size must reach it.\n"
 "  --keyfile PATH   Path to read/write the PQ-hybrid keyfile.\n"
 "                   If file exists, it's used as-is, or with\n"
 "                   --passphrase-stdin refused without --force. If missing,\n"
@@ -165,11 +166,12 @@ static uint64_t parse_size(const char *s)
     unsigned long long v = strtoull(s, &end, 10);
     if (!end || end == s || v == 0) return 0;
     /* Allow trailing K/M/G (case-insensitive). */
-    if (*end == 'K' || *end == 'k') { v *= 1024ULL;                end++; }
-    else if (*end == 'M' || *end == 'm') { v *= 1024ULL * 1024ULL; end++; }
-    else if (*end == 'G' || *end == 'g') { v *= 1024ULL * 1024ULL * 1024ULL; end++; }
-    if (*end != '\0') return 0;
-    return (uint64_t)v;
+    unsigned long long unit = 1ULL;
+    if (*end == 'K' || *end == 'k') { unit = 1024ULL;                end++; }
+    else if (*end == 'M' || *end == 'm') { unit = 1024ULL * 1024ULL; end++; }
+    else if (*end == 'G' || *end == 'g') { unit = 1024ULL * 1024ULL * 1024ULL; end++; }
+    if (*end != '\0' || v > UINT64_MAX / unit) return 0;
+    return (uint64_t)(v * unit);
 }
 
 /* Derive a 128-bit UUID-shape value from current time + pid (or from
@@ -202,13 +204,19 @@ static void derive_uuid(uint64_t out[2], uint64_t salt)
     out[1] = lo ^ ~salt;
 }
 
-/* Nothing but zeros in the first MiB: a fresh or sparse file, safe to format. */
+/* Nothing but zeros anywhere: a fresh or sparse file, safe to format. A volume's
+ * first MiB can be blank, and a file need not be a volume. Holes cost nothing to pass. */
 static bool image_holds_data(int fd, bool *out)
 {
     static unsigned char buf[65536];
     off_t off = 0;
     *out = false;
-    while (off < 1024 * 1024) {
+    for (;;) {
+#ifdef SEEK_DATA
+        off_t data = lseek(fd, off, SEEK_DATA);
+        if (data < 0 && errno == ENXIO) return true; /* a hole to the end */
+        if (data >= 0) off = data;                   /* no such call here: read through */
+#endif
         ssize_t n = pread(fd, buf, sizeof buf, off);
         if (n < 0) return false;
         if (n == 0) return true;
@@ -217,7 +225,6 @@ static bool image_holds_data(int fd, bool *out)
         }
         off += n;
     }
-    return true;
 }
 
 /*
@@ -237,24 +244,32 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
 }
 
 static int mkfs_claim(const char *image_path, const char *keyfile_path,
-                      bool replaces_key, bool force)
+                      bool replaces_key, bool force, uint64_t device_bytes,
+                      bool *created)
 {
     int fd = -1;
+    *created = false;
     stm_status s = stm_bdev_claim_image(image_path, false, &fd);
     if (s == STM_ENOENT) {
         /* Asked now, so that a refusal leaves no empty image behind. */
         if (key_in_the_way(keyfile_path, replaces_key, force)) return 1;
         s = stm_bdev_claim_image(image_path, true, &fd);
+        *created = s == STM_OK || s == STM_ENOLCK;
     }
     if (s == STM_EBUSY) {
         fprintf(stderr, "stratum-mkfs: %s is open in a running stratumd\n", image_path);
         return 1;
     }
-    if (s != STM_OK) {
+    if (s == STM_ENOLCK && !force) {
+        fprintf(stderr,
+            "stratum-mkfs: cannot lock %s (%s), so nothing shows whether a daemon has it; "
+            "pass --force to format it anyway\n", image_path, strerror(errno));
+        return 1;
+    }
+    if (s != STM_OK && s != STM_ENOLCK) {
         fprintf(stderr, "stratum-mkfs: cannot open %s: %s\n", image_path, strerror(errno));
         return 1;
     }
-    if (force) return 0;
 
     /* Where the platform has no lock there is no descriptor to look through. */
     int look = fd >= 0 ? fd : open(image_path, O_RDONLY | O_CLOEXEC);
@@ -264,8 +279,11 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
     }
     if (look >= 0) {
         bool holds = false;
-        bool read_ok = image_holds_data(look, &holds);
+        bool read_ok = force || image_holds_data(look, &holds);
         int e = errno;
+        struct stat st;
+        bool too_big = fstat(look, &st) == 0 && S_ISREG(st.st_mode) &&
+                       (uint64_t)st.st_size > device_bytes;
         if (look != fd) close(look);
         if (!read_ok) {
             fprintf(stderr, "stratum-mkfs: cannot read %s: %s\n", image_path, strerror(e));
@@ -277,8 +295,35 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
                 image_path);
             return 1;
         }
+        if (too_big) {
+            fprintf(stderr,
+                "stratum-mkfs: %s is %llu bytes and the size asked for is %llu; a format "
+                "cannot shrink a file, so name a size of at least %llu or remove it\n",
+                image_path, (unsigned long long)st.st_size,
+                (unsigned long long)device_bytes, (unsigned long long)st.st_size);
+            return 1;
+        }
     }
     return key_in_the_way(keyfile_path, replaces_key, force) ? 1 : 0;
+}
+
+/* The rename is not durable until the directory holding it is. */
+static void sync_dir_of(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    char dir[4096] = ".";
+    if (slash) {
+        size_t n = slash == path ? 1u : (size_t)(slash - path);
+        if (n >= sizeof dir) return;
+        memcpy(dir, path, n);
+        dir[n] = '\0';
+    }
+    int fd = open(dir, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || fsync(fd) != 0) {
+        fprintf(stderr, "stratum-mkfs: warning: cannot sync %s (%s), so a power cut "
+                        "could still lose the key's new name\n", dir, strerror(errno));
+    }
+    if (fd >= 0) close(fd);
 }
 
 int stm_cmd_mkfs_main(int argc, char **argv)
@@ -430,42 +475,50 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         have_pass = true;
     }
 
-    if (mkfs_claim(image_path, keyfile_path, have_pass, force) != 0) {
-        if (have_pass) {
-            stm_ct_memzero(passbuf, sizeof passbuf);
-            stm_cli_passphrase_unlock(passbuf, sizeof passbuf);
-        }
-        return 1;
+    int  exit_code = 0;
+    bool created = false;
+    /* Above every jump to the cleanup, which reads them. */
+    char new_key_path[4096] = "";
+    const char *format_key = keyfile_path;
+    bool key_is_new = false;
+    if (mkfs_claim(image_path, keyfile_path, have_pass, force, device_bytes, &created) != 0) {
+        exit_code = 1;
+        goto cleanup;
     }
 
-    /* Generate keyfile if missing. With --passphrase-stdin a fresh KFP1 file,
+    /* A new key takes its name only once the volume it opens exists, so a format
+     * that fails has replaced nothing. With --passphrase-stdin it is always new,
      * mkfs_claim having refused one that exists unless forced. */
+    key_is_new = have_pass;
     struct stat st;
-    if (have_pass) {
-        stm_status rc = stm_keyfile_generate_passphrase(keyfile_path,
-                                                              passbuf, plen);
-        if (rc != STM_OK) {
-            stm_ct_memzero(passbuf, sizeof passbuf);
-            stm_cli_passphrase_unlock(passbuf, sizeof passbuf);
-            fprintf(stderr,
-                "stratum-mkfs: stm_keyfile_generate_passphrase(%s) failed: "
-                "status=%d\n", keyfile_path, (int)rc);
-            return 2;
-        }
-        fprintf(stderr, "generated encrypted keyfile: %s\n", keyfile_path);
-    } else if (stat(keyfile_path, &st) != 0) {
+    if (!have_pass && stat(keyfile_path, &st) != 0) {
         if (errno != ENOENT) {
             fprintf(stderr, "stratum-mkfs: cannot stat keyfile %s: %s\n",
                     keyfile_path, strerror(errno));
-            return 1;
+            exit_code = 1;
+            goto cleanup;
         }
-        stm_status rc = stm_keyfile_generate(keyfile_path);
-        if (rc != STM_OK) {
-            fprintf(stderr, "stratum-mkfs: stm_keyfile_generate(%s) failed: status=%d\n",
-                    keyfile_path, (int)rc);
-            return 2;
+        key_is_new = true;
+    }
+    if (key_is_new) {
+        int n = snprintf(new_key_path, sizeof new_key_path, "%s.new.%ld",
+                         keyfile_path, (long)getpid());
+        if (n < 0 || (size_t)n >= sizeof new_key_path) {
+            fprintf(stderr, "stratum-mkfs: keyfile path too long: %s\n", keyfile_path);
+            key_is_new = false;
+            exit_code = 1;
+            goto cleanup;
         }
-        fprintf(stderr, "generated keyfile: %s\n", keyfile_path);
+        stm_status ks = have_pass
+            ? stm_keyfile_generate_passphrase(new_key_path, passbuf, plen)
+            : stm_keyfile_generate(new_key_path);
+        if (ks != STM_OK) {
+            fprintf(stderr, "stratum-mkfs: cannot write a new key at %s: status=%d\n",
+                    new_key_path, (int)ks);
+            exit_code = 2;
+            goto cleanup;
+        }
+        format_key = new_key_path;
     } else {
         fprintf(stderr, "using existing keyfile: %s\n", keyfile_path);
     }
@@ -489,13 +542,12 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         .bootstrap_size_bytes     = bootstrap_bytes,
         .pool_uuid                = { pool_uuid[0],   pool_uuid[1]   },
         .device_uuid              = { device_uuid[0], device_uuid[1] },
-        .keyfile_path             = keyfile_path,
+        .keyfile_path             = format_key,
         .keyfile_passphrase       = have_pass ? passbuf : NULL,
         .keyfile_passphrase_len   = have_pass ? plen    : 0,
     };
 
     /* Phase 1: format. */
-    int exit_code = 0;
     fprintf(stderr, "formatting %s (%llu bytes)...\n",
             image_path, (unsigned long long)device_bytes);
     stm_status rc = stm_fs_format(image_path, &fopts);
@@ -508,7 +560,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     /* Phase 2: mount, init dataset root id=1, unmount. */
     stm_fs_mount_opts mopts = {
         .read_only                = false,
-        .keyfile_path             = keyfile_path,
+        .keyfile_path             = format_key,
         .keyfile_passphrase       = have_pass ? passbuf : NULL,
         .keyfile_passphrase_len   = have_pass ? plen    : 0,
     };
@@ -545,6 +597,22 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         goto cleanup;
     }
 
+    if (key_is_new) {
+        /* From here the only key to this volume is the new file: it is never removed. */
+        key_is_new = false;
+        created = false;
+        if (rename(new_key_path, keyfile_path) != 0) {
+            fprintf(stderr,
+                "stratum-mkfs: %s is formatted, but its key could not take the name %s (%s); "
+                "the key is at %s, keep it\n",
+                image_path, keyfile_path, strerror(errno), new_key_path);
+            exit_code = 2;
+            goto cleanup;
+        }
+        sync_dir_of(keyfile_path);
+        fprintf(stderr, "generated %skeyfile: %s\n", have_pass ? "encrypted " : "", keyfile_path);
+    }
+
     fprintf(stderr,
         "ok: %s ready (dataset 1 root ino=%llu)\n"
         "    next: stratum tui --vol %s\n"
@@ -556,6 +624,11 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         passphrase_stdin ? " --passphrase-stdin" : "");
 
 cleanup:
+    /* What this run made and failed to finish, and nothing it found. */
+    if (exit_code != 0) {
+        if (key_is_new) unlink(new_key_path);
+        if (created) unlink(image_path);
+    }
     /* SWISS-4m: wipe + munlock the passphrase buffer regardless of
      * exit path. Stack-allocated, so munlock + memzero is enough —
      * the storage is freed when this stack frame unwinds. */
