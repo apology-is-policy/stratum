@@ -7,8 +7,14 @@
 
 #include <stratum/block_inject.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#if !defined(__thylacine__)
+#  include <sys/file.h>
+#endif
 
 stm_bdev_open_opts stm_bdev_open_opts_default(void)
 {
@@ -168,6 +174,26 @@ void stm_bdev_barrier_defer_cancel(stm_bdev *d)
 bool stm_bdev_barrier_defer_armed(const stm_bdev *d)
 {
     return d && atomic_load_explicit(&d->barrier_defer, memory_order_relaxed);
+}
+
+stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd)
+{
+    *out_fd = -1;
+#if !defined(__thylacine__)
+    int fd = open(path, O_RDONLY | O_CLOEXEC | (create ? O_CREAT : 0), 0600);
+    if (fd < 0) return errno == ENOENT ? STM_ENOENT : STM_EIO;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return e == EWOULDBLOCK ? STM_EBUSY : STM_EIO;
+    }
+    *out_fd = fd;
+#else
+    /* Thylacine's pool is a device only its one stratumd opens. */
+    (void)path; (void)create;
+#endif
+    return STM_OK;
 }
 
 void stm_bdev_inject_fail_after(stm_bdev *d, int64_t n_ops)

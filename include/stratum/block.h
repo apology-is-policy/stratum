@@ -171,6 +171,16 @@ bool       stm_bdev_barrier_defer_armed (const stm_bdev *d);
 STM_MUST_USE
 stm_status stm_bdev_resize(stm_bdev *d, uint64_t new_size);
 
+/*
+ * Claim an image for one process. STM_EBUSY: another process holds it.
+ * STM_ENOENT: there is no such file and `create` was false. Any other failure
+ * leaves errno set and claims nothing. The kernel drops the claim however the
+ * process ends, so nothing stale can lock a volume out. On success *out_fd is
+ * the descriptor to close to give it up, or -1 where the platform has no such
+ * lock.
+ */
+stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd);
+
 /* ========================================================================= */
 /* Asynchronous ops                                                           */
 /* ========================================================================= */
@@ -218,7 +228,10 @@ int stm_bdev_poll_completions(stm_bdev *d, int max_events);
 
 /*
  * Wait until at least one completion is available, then poll it. Returns the
- * count delivered (≥ 1 on success, or a negative stm_status on failure).
+ * count delivered, or a negative stm_status on failure. The count can be 0 on
+ * io_uring: another thread was reaping and may have delivered this caller's
+ * completions itself, or nothing was in flight. So check what you are waiting
+ * for, then call again.
  */
 STM_MUST_USE
 int stm_bdev_wait_completion(stm_bdev *d, int max_events);

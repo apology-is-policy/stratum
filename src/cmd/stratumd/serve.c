@@ -11,6 +11,7 @@
  *                                 + accept loop + unmount).
  */
 
+#include <stratum/block.h>
 #include <stratum/stratumd.h>
 
 #include "corvus_notify.h"
@@ -39,9 +40,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if !defined(__thylacine__)
-#  include <sys/file.h>
-#endif
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1522,31 +1520,19 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts)
 /*
  * Two daemons on one image each write commits the other knows nothing of, and
  * the pool is lost. A volume is a file, so opening it twice takes only two
- * windows. The kernel drops this lock however the process ends, so nothing
- * stale can lock a volume out. Thylacine's pool is a device only its one
- * stratumd opens.
+ * windows.
  */
 static stm_status image_lock(const char *path, int *out_fd)
 {
-    *out_fd = -1;
-#if !defined(__thylacine__)
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return STM_OK; /* the mount reports a missing image */
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        int e = errno;
-        close(fd);
-        if (e == EWOULDBLOCK) {
-            fprintf(stderr, "stratumd: %s is already open in another stratumd\n", path);
-            return STM_EBUSY;
-        }
-        fprintf(stderr, "stratumd: warning: cannot lock %s (%s), so nothing "
-                        "stops a second daemon opening it\n", path, strerror(e));
-        return STM_OK;
+    stm_status s = stm_bdev_claim_image(path, false, out_fd);
+    if (s == STM_EBUSY) {
+        fprintf(stderr, "stratumd: %s is already open in another stratumd\n", path);
+        return s;
     }
-    *out_fd = fd;
-#else
-    (void)path;
-#endif
+    if (s != STM_OK && s != STM_ENOENT) { /* the mount reports a missing image */
+        fprintf(stderr, "stratumd: warning: cannot lock %s (%s), so nothing "
+                        "stops a second daemon opening it\n", path, strerror(errno));
+    }
     return STM_OK;
 }
 

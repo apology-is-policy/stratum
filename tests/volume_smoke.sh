@@ -65,7 +65,14 @@ for _ in $(seq 1 100); do [ -S "$S" ] && break; kill -0 "$SP" 2>/dev/null || bre
 [ -S "$S" ] && ok "serve found the key beside the image" || no "serve with no key named: $(tail -1 "$D/serve.log")"
 stop
 mv "$V.key" "$V.key.aside"
-"$B" serve "$V" --listen "$S" > "$D/nokey.log" 2>&1
+"$B" serve "$V" --listen "$S" > "$D/nokey.log" 2>&1 &
+NK=$!
+for _ in $(seq 1 100); do kill -0 "$NK" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$NK" 2>/dev/null; then
+    kill -KILL "$NK" 2>/dev/null
+    no "serve with no key kept running"
+fi
+wait "$NK"
 rc=$?
 mv "$V.key.aside" "$V.key"
 if [ "$rc" != 0 ] && LC_ALL=C grep -q -e '--keyfile' "$D/nokey.log"; then ok "serve with no key says what is missing"; else no "serve with no key: rc=$rc: $(tail -1 "$D/nokey.log")"; fi
@@ -93,6 +100,20 @@ else
 fi
 wait "$SECOND" 2>/dev/null
 F ls / > /dev/null || no "the refusal disturbed the first daemon"
+# Naming a volume to mkfs again must not lose it, least of all under its daemon.
+kh=$(cksum < "$V.key")
+if "$B" mkfs "$V" --size 256M > "$D/again.log" 2>&1; then
+    no "mkfs over a volume in use answered success"
+elif LC_ALL=C grep -q 'running stratumd' "$D/again.log"; then
+    ok "mkfs over a volume in use is refused, and says why"
+else
+    no "mkfs over a volume in use stopped without saying why: $(tail -1 "$D/again.log")"
+fi
+if printf '%s\n' "$PASS" | "$B" mkfs "$V" --size 256M --force --passphrase-stdin > "$D/again.log" 2>&1; then
+    no "--force reached past a daemon using the volume"
+fi
+[ "$(cksum < "$V.key")" = "$kh" ] && ok "the key is untouched by a refused mkfs" || no "a refused mkfs replaced the key"
+F ls / > /dev/null || no "the refused mkfs disturbed the daemon"
 F mkdir /in || no "mkdir"
 F put "$D/host" /in/host > "$D/put.log" 2>&1 || no "put: $(tail -1 "$D/put.log")"
 # A mutating command commits before it reports success, so a kill now must lose nothing.
@@ -100,6 +121,34 @@ kill -KILL "$SP" 2>/dev/null
 wait "$SP" 2>/dev/null
 SP=
 rm -f "$S"
+
+# With no daemon, a pool at the path and a key that opens something are still not to be lost by accident.
+vh=$(cksum < "$V"); kh=$(cksum < "$V.key")
+if "$B" mkfs "$V" --size 256M > "$D/again.log" 2>&1; then
+    no "mkfs over an existing volume answered success"
+elif LC_ALL=C grep -q 'already holds data' "$D/again.log"; then
+    ok "mkfs over an existing volume is refused, and says why"
+else
+    no "mkfs over an existing volume stopped without saying why: $(tail -1 "$D/again.log")"
+fi
+[ "$(cksum < "$V")" = "$vh" ] && ok "the refused mkfs left the volume's bytes alone" || no "a refused mkfs changed the volume"
+if printf '%s\n' other | "$B" mkfs "$D/new.stm" --size 64M --keyfile "$V.key" --passphrase-stdin > "$D/again.log" 2>&1; then
+    no "a new volume replaced another volume's key"
+elif LC_ALL=C grep -q 'already exists' "$D/again.log"; then
+    ok "a new volume naming an existing key with a passphrase is refused, and says why"
+else
+    no "the refusal over a key did not say why: $(tail -1 "$D/again.log")"
+fi
+[ "$(cksum < "$V.key")" = "$kh" ] && ok "another volume's key survives" || no "another volume's key was replaced"
+# The control: --force, and a fresh sparse file, each do format, so a refusal above was about the data.
+"$B" mkfs "$D/force.stm" --size 64M > "$D/f1.log" 2>&1 || no "the control's first mkfs: $(tail -1 "$D/f1.log")"
+fh=$(cksum < "$D/force.stm")
+"$B" mkfs "$D/force.stm" --size 64M --force > "$D/f2.log" 2>&1 && [ "$(cksum < "$D/force.stm")" != "$fh" ] \
+    && ok "--force formats over a volume" || no "--force did not format: $(tail -1 "$D/f2.log")"
+: > "$D/empty.stm"
+"$B" mkfs "$D/empty.stm" --size 64M > "$D/f3.log" 2>&1 && ok "mkfs takes an empty file" || no "mkfs refused an empty file: $(tail -1 "$D/f3.log")"
+dd if=/dev/zero of="$D/sparse.stm" bs=1 count=0 seek=67108864 2>/dev/null
+"$B" mkfs "$D/sparse.stm" --size 64M > "$D/f4.log" 2>&1 && ok "mkfs takes a sparse file" || no "mkfs refused a sparse file: $(tail -1 "$D/f4.log")"
 
 # The control is one variable away: the same search over a file that does hold the marker.
 in_image=$(LC_ALL=C grep -c "$MARK" "$V")

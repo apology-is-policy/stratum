@@ -31,6 +31,7 @@
  *   1  usage error
  *   2  format failed
  */
+#include <stratum/block.h>
 #include <stratum/cmds.h>
 #include <stratum/fs.h>
 #include <stratum/keyfile.h>
@@ -39,6 +40,7 @@
 #include "../cli_passphrase.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,9 +97,13 @@ static void usage(void)
 "\n"
 "Options:\n"
 "  --size SIZE      Image size with K/M/G suffix. Default: 64M.\n"
+"  --force          Format over what is already at IMAGE, and with\n"
+"                   --passphrase-stdin replace an existing keyfile. Whatever\n"
+"                   they held is gone. Never overrides a daemon using IMAGE.\n"
 "  --keyfile PATH   Path to read/write the PQ-hybrid keyfile.\n"
-"                   If file exists, it's used as-is. If missing, one is\n"
-"                   generated. Default: IMAGE.key.\n"
+"                   If file exists, it's used as-is, or with\n"
+"                   --passphrase-stdin refused without --force. If missing,\n"
+"                   one is generated. Default: IMAGE.key.\n"
 "  --passphrase-stdin  Read a passphrase line from stdin and use it to\n"
 "                   wrap the keyfile (KFP1 format). The passphrase is\n"
 "                   required at every stratumd open after this. Mutually\n"
@@ -196,6 +202,85 @@ static void derive_uuid(uint64_t out[2], uint64_t salt)
     out[1] = lo ^ ~salt;
 }
 
+/* Nothing but zeros in the first MiB: a fresh or sparse file, safe to format. */
+static bool image_holds_data(int fd, bool *out)
+{
+    static unsigned char buf[65536];
+    off_t off = 0;
+    *out = false;
+    while (off < 1024 * 1024) {
+        ssize_t n = pread(fd, buf, sizeof buf, off);
+        if (n < 0) return false;
+        if (n == 0) return true;
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] != 0) { *out = true; return true; }
+        }
+        off += n;
+    }
+    return true;
+}
+
+/*
+ * Formatting over a pool loses it, and over a pool's key loses it just as
+ * surely, so neither happens by naming the wrong path. The claim is held until
+ * the process ends: a daemon cannot start on the image between the look and the
+ * format, and --force does not reach past a daemon already on it.
+ */
+static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool force)
+{
+    struct stat st;
+    if (force || !replaces_key || stat(keyfile_path, &st) != 0) return false;
+    fprintf(stderr,
+        "stratum-mkfs: keyfile %s already exists, and replacing it loses any "
+        "volume it opens; pass --force to replace it\n", keyfile_path);
+    return true;
+}
+
+static int mkfs_claim(const char *image_path, const char *keyfile_path,
+                      bool replaces_key, bool force)
+{
+    int fd = -1;
+    stm_status s = stm_bdev_claim_image(image_path, false, &fd);
+    if (s == STM_ENOENT) {
+        /* Asked now, so that a refusal leaves no empty image behind. */
+        if (key_in_the_way(keyfile_path, replaces_key, force)) return 1;
+        s = stm_bdev_claim_image(image_path, true, &fd);
+    }
+    if (s == STM_EBUSY) {
+        fprintf(stderr, "stratum-mkfs: %s is open in a running stratumd\n", image_path);
+        return 1;
+    }
+    if (s != STM_OK) {
+        fprintf(stderr, "stratum-mkfs: cannot open %s: %s\n", image_path, strerror(errno));
+        return 1;
+    }
+    if (force) return 0;
+
+    /* Where the platform has no lock there is no descriptor to look through. */
+    int look = fd >= 0 ? fd : open(image_path, O_RDONLY | O_CLOEXEC);
+    if (look < 0 && errno != ENOENT) {
+        fprintf(stderr, "stratum-mkfs: cannot read %s: %s\n", image_path, strerror(errno));
+        return 1;
+    }
+    if (look >= 0) {
+        bool holds = false;
+        bool read_ok = image_holds_data(look, &holds);
+        int e = errno;
+        if (look != fd) close(look);
+        if (!read_ok) {
+            fprintf(stderr, "stratum-mkfs: cannot read %s: %s\n", image_path, strerror(e));
+            return 1;
+        }
+        if (holds) {
+            fprintf(stderr,
+                "stratum-mkfs: %s already holds data; pass --force to format over it\n",
+                image_path);
+            return 1;
+        }
+    }
+    return key_in_the_way(keyfile_path, replaces_key, force) ? 1 : 0;
+}
+
 int stm_cmd_mkfs_main(int argc, char **argv)
 {
     if (argc < 2) { usage(); return 1; }
@@ -209,6 +294,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     uint64_t   bootstrap_bytes   = 0;   /* 0 = auto from device_bytes */
     const char *keyfile_path     = NULL;
     bool       passphrase_stdin  = false;
+    bool       force             = false;
     /* Dataset-root owner. Default 0/0 (historical behavior). Thylacine's
      * A-3 host-bake passes --root-uid/--root-gid = PRINCIPAL_SYSTEM so the
      * root is owned by the boot chain once the OS enforces 9P-mount rwx --
@@ -241,6 +327,8 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             if (i + 1 >= argc) { fputs("--keyfile requires an argument\n", stderr); return 1; }
             keyfile_path = argv[i + 1];
             i++;
+        } else if (strcmp(argv[i], "--force") == 0) {
+            force = true;
         } else if (strcmp(argv[i], "--passphrase-stdin") == 0) {
             passphrase_stdin = true;
         } else if (strcmp(argv[i], "--seed") == 0) {
@@ -342,9 +430,16 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         have_pass = true;
     }
 
-    /* Generate keyfile if missing. With --passphrase-stdin, we ALWAYS
-     * generate a fresh KFP1-encrypted file (refusing to overwrite
-     * pre-existing would surprise the user). */
+    if (mkfs_claim(image_path, keyfile_path, have_pass, force) != 0) {
+        if (have_pass) {
+            stm_ct_memzero(passbuf, sizeof passbuf);
+            stm_cli_passphrase_unlock(passbuf, sizeof passbuf);
+        }
+        return 1;
+    }
+
+    /* Generate keyfile if missing. With --passphrase-stdin a fresh KFP1 file,
+     * mkfs_claim having refused one that exists unless forced. */
     struct stat st;
     if (have_pass) {
         stm_status rc = stm_keyfile_generate_passphrase(keyfile_path,
