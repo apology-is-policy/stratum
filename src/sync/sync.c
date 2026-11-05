@@ -4645,7 +4645,7 @@ stm_status stm_sync_replace_device_online(
 
     if (resume_err != STM_OK) return resume_err;
 
-    uint16_t new_slot;
+    uint16_t new_slot = UINT16_MAX;
     if (resume_path) {
         new_slot = resume_slot;
         if (out_new_device_id) *out_new_device_id = new_slot;

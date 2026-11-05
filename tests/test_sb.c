@@ -137,7 +137,7 @@ STM_TEST(sb_decode_rejects_zero_gen) {
 }
 
 STM_TEST(sb_decode_rejects_wrong_size) {
-    uint8_t small[1024];
+    uint8_t small[1024] = {0};
     stm_uberblock dst;
     STM_ASSERT_ERR(stm_ub_decode(small, sizeof small, &dst), STM_ERANGE);
 }

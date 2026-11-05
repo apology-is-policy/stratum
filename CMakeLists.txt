@@ -116,6 +116,13 @@ if(NOT STM_PLATFORM_DARWIN AND NOT STM_PLATFORM_THYLACINE AND STM_SANITIZE STREQ
     # noise and keep the cross-compile flag set minimal.
     target_compile_options(stm_warnings INTERFACE -D_FORTIFY_SOURCE=2)
 endif()
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    # gcc warns on a (void) cast of a must-use result, which is how this tree
+    # says an error is dropped on purpose. clang honours the cast and still
+    # catches a call that drops one silently, so the check stays in CI.
+    # A bound check on a narrow type stays right when the type or bound moves.
+    target_compile_options(stm_warnings INTERFACE -Wno-unused-result -Wno-type-limits)
+endif()
 if(STM_WERROR)
     target_compile_options(stm_warnings INTERFACE -Werror)
 endif()

@@ -110,8 +110,10 @@ stm_status stm_btnode_leaf_encode(const stm_btnode_entry *entries,
         le32 vl = stm_store_le32((uint32_t)e->value_len);
         memcpy(p, kl.v, 4); p += 4;
         memcpy(p, vl.v, 4); p += 4;
-        if (e->key_len)   memcpy(p, e->key,   e->key_len);   p += e->key_len;
-        if (e->value_len) memcpy(p, e->value, e->value_len); p += e->value_len;
+        if (e->key_len) memcpy(p, e->key, e->key_len);
+        p += e->key_len;
+        if (e->value_len) memcpy(p, e->value, e->value_len);
+        p += e->value_len;
     }
 
     /* Trailing csum. */

@@ -1218,10 +1218,10 @@ STM_TEST(p9_a_short_write_answers_what_landed) {
     STM_ASSERT_OK(stm_fs_commit(fs));
 
     stm_9p_server *s = NULL;
-    STM_ASSERT_OK(stm_9p_server_create(fs, 1u, 0, 0, 4u * MIB, &s));
+    STM_ASSERT_OK(stm_9p_server_create(fs, 1u, 0, 0, (uint32_t)(4u * MIB), &s));
     uint8_t *req = malloc(4u * MIB), *resp = malloc(RBUF);
     uint32_t rlen = 0;
-    uint32_t sz = build_tversion(req, 4u * MIB, "9P2000.L");
+    uint32_t sz = build_tversion(req, (uint32_t)(4u * MIB), "9P2000.L");
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RVERSION);
     sz = build_tattach(req, 1, 100);
@@ -1232,7 +1232,7 @@ STM_TEST(p9_a_short_write_answers_what_landed) {
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
     memset(big, 0xEE, 2u * MIB);
-    sz = build_twrite(req, 3, 101, 4u * MIB - 100u, big, 2u * MIB);
+    sz = build_twrite(req, 3, 101, 4u * MIB - 100u, big, (uint32_t)(2u * MIB));
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
     STM_ASSERT_EQ(load_u32(resp + 7), 100u);
