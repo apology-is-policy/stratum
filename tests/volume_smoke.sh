@@ -170,6 +170,11 @@ else
 fi
 [ "$(cksum < "$V.key")" = "$kh" ] && ok "that refusal kept the key" || no "a format that could not run replaced the key"
 [ "$(cksum < "$V")" = "$vh" ] && ok "that refusal kept the volume" || no "a format that could not run changed the volume"
+# Past the size check a format can still fail, and the key it would have replaced has to be there afterwards.
+if printf '%s\n' other | "$B" mkfs "$V" --size 9000000000G --force --passphrase-stdin > "$D/again.log" 2>&1; then
+    no "an impossible size over a volume answered success"
+fi
+[ "$(cksum < "$V.key")" = "$kh" ] && ok "a format that failed late kept the key it would have replaced" || no "a format that failed late replaced the key"
 
 # A format that fails late leaves what it found, and nothing it made, so a retry just works.
 printf 'not a key' > "$D/late.stm.key"
