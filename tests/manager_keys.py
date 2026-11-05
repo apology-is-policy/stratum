@@ -777,7 +777,8 @@ def pick(term, name, names, right=False):
         term.pump(0.05)
     term.send(UP)
     term.pump(0.2)
-    rows = rows_in_panel(term, names, right)
+    # Inside a directory the first row is '..', above every name.
+    rows = rows_in_panel(term, list(names) + ['/..'], right)
     if name not in rows:
         raise Failure(f'{name} is not in the panel, which shows {sorted(rows)}')
     for _ in range(rows[name] - min(rows.values())):
@@ -981,20 +982,21 @@ def host_copy_legs(stratum, root):
 
 def copy_engine_legs(stratum, root):
     """Where a copy writes, and what a link or a planted name can make of that."""
+    # Names pick() can find: it matches a row's text, and a one-letter name matches the header.
     w = f'{root}/engine'
-    for d in ('src/d/sub', 'src/t/sub', 'dst/d', 'dst/t/sub', 'elsewhere'):
+    for d in ('src/linkdir/sub', 'src/skiptree/sub', 'dst/linkdir', 'dst/skiptree/sub', 'elsewhere'):
         os.makedirs(f'{w}/{d}')
     spit(f'{w}/src/plain.txt', b'plain\n')
     spit(f'{w}/elsewhere/victim.txt', b'victim\n')
     # A merge into a destination whose subdirectory is a link back into the source.
-    spit(f'{w}/src/d/f', b'F')
-    spit(f'{w}/src/d/sub/f', b'S')
-    os.symlink(f'{w}/src/d', f'{w}/dst/d/sub')
+    spit(f'{w}/src/linkdir/f', b'F')
+    spit(f'{w}/src/linkdir/sub/f', b'S')
+    os.symlink(f'{w}/src/linkdir', f'{w}/dst/linkdir/sub')
     # SkipAll answered at a file, then a directory that is there, holding something new.
-    spit(f'{w}/src/t/a.txt', b'new\n')
-    spit(f'{w}/src/t/sub/new.txt', b'new\n')
-    spit(f'{w}/dst/t/a.txt', b'old\n')
-    top, src_names = ['src', 'dst', 'elsewhere'], ['plain.txt', 'd', 't']
+    spit(f'{w}/src/skiptree/a.txt', b'new\n')
+    spit(f'{w}/src/skiptree/sub/new.txt', b'new\n')
+    spit(f'{w}/dst/skiptree/a.txt', b'old\n')
+    top, src_names = ['src', 'dst', 'elsewhere'], ['plain.txt', 'linkdir', 'skiptree']
     term = Term([stratum, 'tui', '--host', w])
     try:
         term.expect(r'elsewhere', timeout=30)
@@ -1025,23 +1027,23 @@ def copy_engine_legs(stratum, root):
             if os.path.islink(p):
                 os.unlink(p)
 
-        pick(term, 'd', src_names)
+        pick(term, 'linkdir', src_names)
         term.send(F5)
         answer_conflict(term, OVERWRITE_ALL, nth=1)
         _, _, failed, _ = copy_summary(term, 'a link in the destination back into the source')
-        record(slurp(f'{w}/src/d/f') == b'F' and slurp(f'{w}/src/d/sub/f') == b'S',
+        record(slurp(f'{w}/src/linkdir/f') == b'F' and slurp(f'{w}/src/linkdir/sub/f') == b'S',
                'a link in the destination does not lead a copy over its source',
-               f'the source now reads {slurp(f"{w}/src/d/f")!r} and {slurp(f"{w}/src/d/sub/f")!r}')
+               f'the source now reads {slurp(f"{w}/src/linkdir/f")!r} and {slurp(f"{w}/src/linkdir/sub/f")!r}')
         record(failed >= 1, 'the directory behind that link is counted as failed', f'behind that link: {failed} failed')
 
-        pick(term, 't', src_names)
+        pick(term, 'skiptree', src_names)
         term.send(F5)
         answer_conflict(term, OVERWRITE, nth=1)
         answer_conflict(term, SKIP_ALL, nth=2)
         copy_summary(term, 'SkipAll at a file, then a directory that is there')
-        record(slurp(f'{w}/dst/t/sub/new.txt') == b'new\n' and slurp(f'{w}/dst/t/a.txt') == b'old\n',
+        record(slurp(f'{w}/dst/skiptree/sub/new.txt') == b'new\n' and slurp(f'{w}/dst/skiptree/a.txt') == b'old\n',
                'a SkipAll answered at a file still merges into a directory that is there',
-               f'after SkipAll at a file: new.txt {slurp(f"{w}/dst/t/sub/new.txt")!r}, a.txt {slurp(f"{w}/dst/t/a.txt")!r}')
+               f'after SkipAll at a file: new.txt {slurp(f"{w}/dst/skiptree/sub/new.txt")!r}, a.txt {slurp(f"{w}/dst/skiptree/a.txt")!r}')
 
         # A pipe is no file: its open would wait for a writer that never comes.
         os.mkfifo(f'{w}/src/pipe')
