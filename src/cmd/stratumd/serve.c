@@ -550,6 +550,7 @@ typedef struct {
     uint32_t  idle_timeout_ms;
     /* TLY-A2-impl-1: borrowed policy table — caller (run.c) owns. */
     const struct stm_ds_policy_table *user_policy;
+    struct stratumd_conn *conn;
 } stratumd_fs_worker_ctx;
 
 /* RC-2 P0-3 (#1232) close: the FS-worker drain. The per-connection FS
@@ -562,41 +563,96 @@ typedef struct {
  * BEFORE spawning (so the count is never transiently under), the
  * worker decrements + broadcasts at exit, and stm_stratumd_run waits
  * for zero after the accept loop exits, BEFORE ctl/scrub/fs teardown.
- * The wait has NO hard deadline (RC-2 audit F3 — the deliberate
- * graceful-shutdown posture, the /ctl worker_count precedent): a
- * worker blocked on a live-but-idle client exits within the
- * per-connection idle timeout (STM_STRATUMD_DEFAULT_IDLE_MS default),
- * but a worker actively serving a request stream runs until its
- * client stops — shutdown finishes in-flight work rather than
- * corrupting it. A bounded force-quiesce (timedwait + force-close
- * survivors) is the recorded seam if operational need arises.
- * Module-static (one daemon per process — the g_fs_workers
- * precedent). */
-static pthread_mutex_t g_fs_inflight_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_fs_inflight_cv = PTHREAD_COND_INITIALIZER;
-static uint32_t        g_fs_inflight    = 0u;
+ * The wait has no deadline of its own: stratumd_conns_stop_reading runs
+ * first, so each worker ends at its next read, after answering the
+ * request in hand. Only a request that is itself slow can lengthen the
+ * wait, since a stop finishes in-flight work rather than corrupting it.
+ * /ctl/ workers get the same count, because stm_ctl's own count starts
+ * only once a worker is running, which leaves a connection accepted just
+ * before a stop to reach an stm_ctl already freed. Module-static (one
+ * daemon per process, the g_fs_workers precedent). */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    uint32_t        n;
+} stratumd_inflight;
 
-static void fs_inflight_bump(void)
+static stratumd_inflight g_fs_inflight  = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0u };
+static stratumd_inflight g_ctl_inflight = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0u };
+
+static void inflight_bump(stratumd_inflight *f)
 {
-    pthread_mutex_lock(&g_fs_inflight_mu);
-    g_fs_inflight++;
-    pthread_mutex_unlock(&g_fs_inflight_mu);
+    pthread_mutex_lock(&f->mu);
+    f->n++;
+    pthread_mutex_unlock(&f->mu);
 }
 
-static void fs_inflight_drop(void)
+static void inflight_drop(stratumd_inflight *f)
 {
-    pthread_mutex_lock(&g_fs_inflight_mu);
-    if (g_fs_inflight > 0u) g_fs_inflight--;
-    if (g_fs_inflight == 0u) pthread_cond_broadcast(&g_fs_inflight_cv);
-    pthread_mutex_unlock(&g_fs_inflight_mu);
+    pthread_mutex_lock(&f->mu);
+    if (f->n > 0u) f->n--;
+    if (f->n == 0u) pthread_cond_broadcast(&f->cv);
+    pthread_mutex_unlock(&f->mu);
 }
 
-static void stratumd_fs_workers_drain(void)
+static void inflight_drain(stratumd_inflight *f)
 {
-    pthread_mutex_lock(&g_fs_inflight_mu);
-    while (g_fs_inflight > 0u)
-        pthread_cond_wait(&g_fs_inflight_cv, &g_fs_inflight_mu);
-    pthread_mutex_unlock(&g_fs_inflight_mu);
+    pthread_mutex_lock(&f->mu);
+    while (f->n > 0u)
+        pthread_cond_wait(&f->cv, &f->mu);
+    pthread_mutex_unlock(&f->mu);
+}
+
+/* Every live connection, so that a stop can end the reading side of each
+ * and a client that keeps talking cannot hold the daemon up. The request in
+ * hand still finishes and its reply still goes out. Each entry owns a dup,
+ * so a stop cannot reach a number its worker has closed and accept has since
+ * reused. */
+typedef struct stratumd_conn {
+    int                   dup_fd;
+    struct stratumd_conn *next;
+} stratumd_conn;
+
+static pthread_mutex_t g_conns_mu = PTHREAD_MUTEX_INITIALIZER;
+static stratumd_conn  *g_conns    = NULL;
+
+static stratumd_conn *stratumd_conn_track(int client_fd)
+{
+    stratumd_conn *c = malloc(sizeof *c);
+    if (!c) return NULL;
+    c->dup_fd = dup(client_fd);
+    if (c->dup_fd < 0) {
+        free(c);
+        return NULL;
+    }
+    (void)fcntl(c->dup_fd, F_SETFD, FD_CLOEXEC);
+    pthread_mutex_lock(&g_conns_mu);
+    c->next = g_conns;
+    g_conns = c;
+    pthread_mutex_unlock(&g_conns_mu);
+    return c;
+}
+
+static void stratumd_conn_untrack(stratumd_conn *c)
+{
+    pthread_mutex_lock(&g_conns_mu);
+    for (stratumd_conn **pp = &g_conns; *pp; pp = &(*pp)->next) {
+        if (*pp == c) {
+            *pp = c->next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_conns_mu);
+    close(c->dup_fd);
+    free(c);
+}
+
+static void stratumd_conns_stop_reading(void)
+{
+    pthread_mutex_lock(&g_conns_mu);
+    for (stratumd_conn *c = g_conns; c; c = c->next)
+        (void)shutdown(c->dup_fd, SHUT_RD);
+    pthread_mutex_unlock(&g_conns_mu);
 }
 
 static void *stratumd_fs_worker(void *arg)
@@ -621,8 +677,9 @@ static void *stratumd_fs_worker(void *arg)
                                         ctx->msize_max, ctx->root_dataset,
                                         ctx->idle_timeout_ms,
                                         ctx->user_policy);
+    stratumd_conn_untrack(ctx->conn);
     free(ctx);
-    fs_inflight_drop();
+    inflight_drop(&g_fs_inflight);
     return NULL;
 }
 
@@ -747,16 +804,25 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
         ctx->root_dataset    = root_dataset;
         ctx->idle_timeout_ms = idle_timeout_ms;
         ctx->user_policy     = user_policy;
+        ctx->conn            = stratumd_conn_track(client_fd);
+        if (!ctx->conn) {
+            fprintf(stderr, "stratumd: refusing connection: "
+                            "no room to track it (errno=%d)\n", errno);
+            close(client_fd);
+            free(ctx);
+            continue;
+        }
 
         /* Bump BEFORE create so the in-flight count is never under
          * (the worker's first act cannot precede its accounting). */
-        fs_inflight_bump();
+        inflight_bump(&g_fs_inflight);
         pthread_t tid;
         int wprc = pthread_create(&tid, NULL, stratumd_fs_worker, ctx);
         if (wprc != 0) {
             fprintf(stderr,
                 "stratumd: pthread_create failed (rc=%d)\n", wprc);
-            fs_inflight_drop();
+            inflight_drop(&g_fs_inflight);
+            stratumd_conn_untrack(ctx->conn);
             close(client_fd);
             free(ctx);
             continue;
@@ -1053,6 +1119,7 @@ typedef struct {
     gid_t     peer_gid;
     uint32_t  msize_max;
     uint32_t  idle_timeout_ms;
+    stratumd_conn *conn;
 } stratumd_ctl_worker_ctx;
 
 static void *stratumd_ctl_worker(void *arg)
@@ -1074,7 +1141,9 @@ static void *stratumd_ctl_worker(void *arg)
                                             ctx->peer_uid, ctx->peer_gid,
                                             ctx->msize_max,
                                             ctx->idle_timeout_ms);
+    stratumd_conn_untrack(ctx->conn);
     free(ctx);
+    inflight_drop(&g_ctl_inflight);
     return NULL;
 }
 
@@ -1162,13 +1231,24 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
         wctx->peer_gid        = peer_gid;
         wctx->msize_max       = msize_max;
         wctx->idle_timeout_ms = idle_timeout_ms;
+        wctx->conn            = stratumd_conn_track(client_fd);
+        if (!wctx->conn) {
+            fprintf(stderr, "stratumd: refusing /ctl/ connection: "
+                            "no room to track it (errno=%d)\n", errno);
+            close(client_fd);
+            free(wctx);
+            continue;
+        }
 
+        inflight_bump(&g_ctl_inflight);
         pthread_t tid;
         int wprc = pthread_create(&tid, NULL, stratumd_ctl_worker, wctx);
         if (wprc != 0) {
             fprintf(stderr,
                 "stratumd: pthread_create for /ctl/ worker failed (rc=%d)\n",
                 wprc);
+            inflight_drop(&g_ctl_inflight);
+            stratumd_conn_untrack(wctx->conn);
             close(client_fd);
             free(wctx);
             continue;
@@ -1183,6 +1263,16 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
 /* ────────────────────────────────────────────────────────────────────── */
 /* stm_stratumd_run — full daemon lifecycle.                              */
 /* ────────────────────────────────────────────────────────────────────── */
+
+/* Ends the /ctl/ accept loop, then every /ctl/ connection. The join is what
+ * makes the second step final, since nothing accepts after it. */
+static void stratumd_stop_ctl(int ctl_fd, pthread_t ctl_tid)
+{
+    (void)shutdown(ctl_fd, SHUT_RDWR);
+    (void)pthread_join(ctl_tid, NULL);
+    stratumd_conns_stop_reading();
+    inflight_drain(&g_ctl_inflight);
+}
 
 /* Worker-thread context for the /ctl/ accept loop. The FS accept
  * loop runs on the calling thread of stm_stratumd_run; when /ctl/
@@ -1860,10 +1950,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
             "stratumd: --corvus-user set but no stop_flag provided; "
             "the SESSION_CLOSED consumer cannot signal shutdown "
             "(invariant C-5 / STRATUM-API-V1.md §6) — refusing to start\n");
-        if (ctl_started) {
-            (void)shutdown(ctl_fd, SHUT_RDWR);
-            (void)pthread_join(ctl_tid, NULL);
-        }
+        if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid);
         close(listen_fd);
         (void)unlink(opts->socket_path);
         if (ctl_fd >= 0) {
@@ -1895,10 +1982,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
                 (int)crc);
             /* Fatal: a Thylacine-bound stratumd MUST run the consumer.
              * Tear everything down. */
-            if (ctl_started) {
-                (void)shutdown(ctl_fd, SHUT_RDWR);
-                (void)pthread_join(ctl_tid, NULL);
-            }
+            if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid);
             close(listen_fd);
             (void)unlink(opts->socket_path);
             if (ctl_fd >= 0) {
@@ -1938,9 +2022,9 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
     /* RC-2 P0-3 (#1232) close: drain the in-flight FS workers BEFORE
      * any teardown below — they borrow `fs` (and transitively sync +
      * every index the RC read path walks lock-free); unmounting under
-     * a live worker is a use-after-free. Bounded in practice by the
-     * per-connection idle timeout. */
-    stratumd_fs_workers_drain();
+     * a live worker is a use-after-free. */
+    stratumd_conns_stop_reading();
+    inflight_drain(&g_fs_inflight);
 
     /* TLY-A4: stop the corvus notify consumer FIRST so its log lines
      * (consumer-exiting) land in /ctl/events BEFORE stm_ctl_destroy
@@ -1955,11 +2039,10 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
 
     /* /ctl/ worker shutdown: signal stop via shutdown(2) on the
      * /ctl/ listen fd to unblock its accept(), then join the worker.
-     * The worker observes EBADF/EINVAL on accept after shutdown +
-     * checks stop_flag → returns STM_OK. */
+     * The worker observes EBADF/EINVAL on accept after shutdown and
+     * checks stop_flag, then returns STM_OK. */
     if (ctl_started) {
-        (void)shutdown(ctl_fd, SHUT_RDWR);
-        (void)pthread_join(ctl_tid, NULL);
+        stratumd_stop_ctl(ctl_fd, ctl_tid);
         if (rc == STM_OK && wctx.rc != STM_OK) rc = wctx.rc;
     }
 

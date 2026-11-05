@@ -133,6 +133,9 @@ jobs:
       - name: a file-based volume end to end
         run: tests/volume_smoke.sh dist/stratum
 
+      - name: a daemon's stop with clients still connected
+        run: python3 tests/stop_with_clients.py dist/stratum
+
   tlc-specs:
     name: TLC / ${{ matrix.cfg }}
     runs-on: ubuntu-24.04

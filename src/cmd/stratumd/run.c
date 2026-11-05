@@ -693,9 +693,9 @@ int stm_cmd_stratumd_main(int argc, char **argv)
             continue;
         }
         if (!strcmp(a, "--fs-workers") && i + 1 < argc) {
-            /* CF-2a: per-connection FS worker-pool size. 0 = auto (4);
-             * 1 = the serial loop (byte-identical pre-CF-2 behavior,
-             * the bisect lever); values above the pool max clamp. */
+            /* CF-2a: per-connection FS worker-pool size. 0 and 1 = the serial
+             * loop (byte-identical pre-CF-2 behavior, the bisect lever); values
+             * above the pool max clamp. */
             char *end = NULL;
             long v = strtol(argv[++i], &end, 10);
             if (!end || *end != '\0' || v < 0 || v > 1024) {
