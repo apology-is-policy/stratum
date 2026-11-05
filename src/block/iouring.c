@@ -7,11 +7,15 @@
  * SQPOLL / per-CPU rings are deferred to later phases — hooks are in place.
  *
  * Thread model:
- *   - A single mutex protects io_uring_get_sqe/submit — the SQ is not
+ *   - A single mutex protects io_uring_get_sqe/submit. The SQ is not
  *     thread-safe in liburing's default build.
- *   - Completions are dispatched either by explicit poll() from a caller or
- *     by wait() which blocks until CQEs arrive.
- *   - Synchronous ops use async submit + wait-for-own-completion.
+ *   - The CQ is not either, so one thread at a time reaps it. Every other
+ *     thread that wants a completion waits on cq_cond, not in the kernel: a
+ *     thread blocked in io_uring_wait_cqe for a CQE that another thread has
+ *     already taken would never wake.
+ *   - A reaper dispatches whatever it finds, including other threads' sync
+ *     ops, and wakes the waiters when its batch is done. Reaping passes on
+ *     when the reaper's own op has finished.
  */
 #include "bdev_internal.h"
 
@@ -48,6 +52,11 @@ typedef struct {
     pending          *ptable;     /* queue_depth entries */
     pending          *free_list;
     uint32_t          queue_depth;
+
+    pthread_mutex_t   cq_lock;    /* reaping */
+    pthread_cond_t    cq_cond;
+    bool              reaping;
+
     atomic_int        inflight;
 
     bool              has_sqpoll;
@@ -91,7 +100,7 @@ static void pending_release(iouring_bdev *d, pending *p)
 }
 
 /* Dispatch CQEs to their registered callbacks. Returns count delivered.
- * Caller must NOT hold d->lock. */
+ * Caller must be the reaper, and must NOT hold d->lock. */
 static int drain_cqes(iouring_bdev *d, int max_events, bool blocking)
 {
     int delivered = 0;
@@ -168,20 +177,33 @@ static stm_status op_submit_fsync(stm_bdev *d,
                                   stm_bdev_completion_cb cb, void *user);
 
 typedef struct {
-    pthread_mutex_t m;
-    pthread_cond_t  c;
     stm_op_result   res;
-    atomic_bool     done;       /* atomic — read without lock is safe */
+    atomic_bool     done;
 } sync_wait;
 
+/* The waiter may return as soon as done is set, taking w with it, so this must
+ * not touch w afterwards. The reaper wakes it when its batch ends. */
 static void sync_cb(const stm_op_result *r)
 {
     sync_wait *w = (sync_wait *)r->user;
-    pthread_mutex_lock(&w->m);
     w->res = *r;
     atomic_store_explicit(&w->done, true, memory_order_release);
-    pthread_cond_signal(&w->c);
-    pthread_mutex_unlock(&w->m);
+}
+
+/* Take the reaper's seat if it is free. Caller holds cq_lock. */
+static bool reap_begin_locked(iouring_bdev *d)
+{
+    if (d->reaping) return false;
+    d->reaping = true;
+    return true;
+}
+
+/* Called with cq_lock dropped by the caller; returns with it held, seat free. */
+static void reap_end(iouring_bdev *d)
+{
+    pthread_mutex_lock(&d->cq_lock);
+    d->reaping = false;
+    pthread_cond_broadcast(&d->cq_cond);
 }
 
 /* Submit one op and wait for completion. One-shot — caller handles looping
@@ -194,8 +216,6 @@ static stm_status sync_one(iouring_bdev *d,
     sync_wait w;
     w.res = (stm_op_result){ 0 };
     atomic_init(&w.done, false);
-    pthread_mutex_init(&w.m, NULL);
-    pthread_cond_init (&w.c, NULL);
 
     /* Submit via the appropriate async entry point. */
     stm_status s;
@@ -213,29 +233,30 @@ static stm_status sync_one(iouring_bdev *d,
         s = STM_EINVAL;
         break;
     }
-    if (s != STM_OK) {
-        pthread_mutex_destroy(&w.m);
-        pthread_cond_destroy (&w.c);
-        return s;
-    }
+    if (s != STM_OK) return s;
 
-    /* Drive completions from this thread until ours fires. Using acquire
-     * load pairs with the release in sync_cb — no data race, and the
-     * compiler cannot hoist the load out of the loop. */
+    /* Our op is in flight until done is set, so while done is clear a reaper
+     * blocked in the kernel has a CQE coming. A reaper sets done before it
+     * gives up its seat, so seeing the seat free with done clear means our CQE
+     * has not been taken. */
+    pthread_mutex_lock(&d->cq_lock);
     while (!atomic_load_explicit(&w.done, memory_order_acquire)) {
+        if (!reap_begin_locked(d)) {
+            pthread_cond_wait(&d->cq_cond, &d->cq_lock);
+            continue;
+        }
+        pthread_mutex_unlock(&d->cq_lock);
         int n = drain_cqes(d, 16, true);
+        reap_end(d);
         if (n < 0) {
-            pthread_mutex_destroy(&w.m);
-            pthread_cond_destroy (&w.c);
+            pthread_mutex_unlock(&d->cq_lock);
             return (stm_status)n;
         }
     }
+    pthread_mutex_unlock(&d->cq_lock);
 
     if (out) *out = w.res;
-    s = w.res.status;
-    pthread_mutex_destroy(&w.m);
-    pthread_cond_destroy (&w.c);
-    return s;
+    return w.res.status;
 }
 
 /*
@@ -428,14 +449,36 @@ static stm_status op_submit_fsync(stm_bdev *base,
     return s;
 }
 
+/* A poll that finds the seat taken delivers nothing: the reaper delivers them. */
 static int op_poll(stm_bdev *base, int max_events)
 {
-    return drain_cqes((iouring_bdev *)base, max_events, false);
+    iouring_bdev *d = (iouring_bdev *)base;
+    pthread_mutex_lock(&d->cq_lock);
+    bool seat = reap_begin_locked(d);
+    pthread_mutex_unlock(&d->cq_lock);
+    if (!seat) return 0;
+    int n = drain_cqes(d, max_events, false);
+    reap_end(d);
+    pthread_mutex_unlock(&d->cq_lock);
+    return n;
 }
 
+/* A wait that finds the seat taken returns 0 once that reaper's batch is done,
+ * since its callback may be among them and only the caller can tell. */
 static int op_wait(stm_bdev *base, int max_events)
 {
-    return drain_cqes((iouring_bdev *)base, max_events, true);
+    iouring_bdev *d = (iouring_bdev *)base;
+    pthread_mutex_lock(&d->cq_lock);
+    if (!reap_begin_locked(d)) {
+        pthread_cond_wait(&d->cq_cond, &d->cq_lock);
+        pthread_mutex_unlock(&d->cq_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&d->cq_lock);
+    int n = drain_cqes(d, max_events, true);
+    reap_end(d);
+    pthread_mutex_unlock(&d->cq_lock);
+    return n;
 }
 
 static stm_status op_register_buffers(stm_bdev *base, void **bufs,
@@ -500,6 +543,8 @@ static void op_close(stm_bdev *base)
     io_uring_queue_exit(&d->ring);
     if (d->fd >= 0) close(d->fd);
     pthread_mutex_destroy(&d->lock);
+    pthread_mutex_destroy(&d->cq_lock);
+    pthread_cond_destroy(&d->cq_cond);
     free(d->ptable);
     free(d->base.path);
     free(d);
@@ -586,11 +631,15 @@ stm_status stm_bdev_open_iouring(const char *path,
     }
 
     pthread_mutex_init(&d->lock, NULL);
+    pthread_mutex_init(&d->cq_lock, NULL);
+    pthread_cond_init(&d->cq_cond, NULL);
 
     d->ptable = calloc(qd, sizeof *d->ptable);
     if (!d->ptable) {
         io_uring_queue_exit(&d->ring);
         pthread_mutex_destroy(&d->lock);
+        pthread_mutex_destroy(&d->cq_lock);
+        pthread_cond_destroy(&d->cq_cond);
         free(d->base.path);
         close(fd);
         free(d);
