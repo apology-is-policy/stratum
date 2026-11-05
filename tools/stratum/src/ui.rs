@@ -297,6 +297,13 @@ pub struct MkVolState {
     pub error: Option<String>,
 }
 
+impl Drop for MkVolState {
+    fn drop(&mut self) {
+        crate::passphrase::wipe_string(&mut self.passphrase);
+        crate::passphrase::wipe_string(&mut self.confirm);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MkVolField {
     Name,

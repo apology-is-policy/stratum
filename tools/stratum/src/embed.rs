@@ -259,7 +259,11 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         drop(passphrase);
 
         stratumd_child = Some(child);
-        if let Err(e) = wait_for_sock(&stratumd_sock, Duration::from_secs(5)) {
+        let waited = match stratumd_child.as_mut() {
+            Some(c) => crate::spawn::wait_for_daemon(c, &stratumd_sock),
+            None => Ok(()),
+        };
+        if let Err(e) = waited {
             // SWISS-4q P1: surface stratumd's actual error instead of
             // the generic "socket never appeared" message. The most
             // common cause is a wrong passphrase — stratumd's stderr
@@ -421,6 +425,8 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     let result = if opts.headless {
         run_headless(&slate_sock, &left_plan.sock, &prev_mask)
     } else {
+        // First: lifting the mask delivers whatever arrived while it was up.
+        tui::stop_on_signals();
         restore_signal_mask(&prev_mask);
         tui::run(tui::Opts {
             slate_sock: slate_sock.clone(),
@@ -429,8 +435,10 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         })
     };
 
-    spawn_ctx.teardown();
+    // A daemon's worker stays until its client leaves, and the slate is the client
+    // of every panel's daemon, so it goes first.
     crate::spawn::stop_child(&mut slate_child, "slate");
+    spawn_ctx.teardown();
     if let Some(mut c) = stratumd_child {
         crate::spawn::stop_child(&mut c, "stratumd");
     }
@@ -485,6 +493,15 @@ fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigse
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGINT);
         libc::sigaddset(&mut set, libc::SIGTERM);
+        // The default action would leave the session directory. A HUP someone has
+        // chosen to ignore stays ignored.
+        let mut hup: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut hup) == 0
+            && hup.sa_sigaction != libc::SIG_IGN
+        {
+            libc::sigaddset(&mut set, libc::SIGHUP);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        }
     }
     let mut sig: i32 = 0;
     unsafe {

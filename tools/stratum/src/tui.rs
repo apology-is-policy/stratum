@@ -309,14 +309,16 @@ extern "C" fn ask_to_stop(_: libc::c_int) {
 }
 
 /// Ending by the default action would leave the terminal raw, the session
-/// directory behind and the daemons to find out for themselves. A HUP someone
-/// has chosen to ignore stays ignored.
-fn stop_on_term_and_hup() {
+/// directory behind and the daemons to find out for themselves. A HUP or INT
+/// someone has chosen to ignore, as nohup and a shell's `&` do, stays ignored.
+pub fn stop_on_signals() {
     let handler = ask_to_stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
     unsafe {
         libc::signal(libc::SIGTERM, handler);
-        if libc::signal(libc::SIGHUP, handler) == libc::SIG_IGN {
-            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        for sig in [libc::SIGHUP, libc::SIGINT] {
+            if libc::signal(sig, handler) == libc::SIG_IGN {
+                libc::signal(sig, libc::SIG_IGN);
+            }
         }
     }
 }
@@ -408,7 +410,7 @@ fn run_ui(
     redraw_rx: &Receiver<u64>,
     spawn: Option<Arc<SpawnCtx>>,
 ) -> Result<()> {
-    stop_on_term_and_hup();
+    stop_on_signals();
     if let Some(tty) = [0, 1, 2].into_iter().find(|&fd| unsafe { libc::isatty(fd) } == 1) {
         exit_when_terminal_goes(tty, spawn.as_ref().map(|s| s.session_dir.clone()));
     }
@@ -572,14 +574,30 @@ fn run_ui(
             // THIS tui or another client) and we don't yet have a
             // local buffer — fetch /editor/content and initialise.
             if snapshot.editor_active && editor.is_none() {
-                let content =
-                    crate::slate::read_text(client, "/editor/content").unwrap_or_default();
                 let readonly = take_view_intent();
-                editor = Some(EditorState::new(
-                    snapshot.editor_filename.clone(),
-                    &content,
-                    readonly,
-                ));
+                match client.read_path("/editor/content") {
+                    Ok(bytes) => {
+                        // A lossy decode saved back would change every byte it replaced.
+                        let content = String::from_utf8_lossy(&bytes).into_owned();
+                        let not_text = content.as_bytes() != bytes.as_slice();
+                        let mut opened = EditorState::new(
+                            snapshot.editor_filename.clone(),
+                            &content,
+                            readonly || not_text,
+                        );
+                        if not_text {
+                            opened.status_msg = Some("Not UTF-8 text: opened read-only.".into());
+                        }
+                        editor = Some(opened);
+                    }
+                    Err(e) => {
+                        // An empty buffer here would replace the file on the next :w.
+                        let _ = client.write_path("/event", b"editor close\n");
+                        local_dialog = Some(error_dialog(&format!(
+                            "Cannot open {}: {e}", snapshot.editor_filename
+                        )));
+                    }
+                }
             }
             // SWISS-4e: external close — slate dropped the editor, e.g.
             // another client wrote /editor/action close. Drop our buffer.
@@ -2255,13 +2273,13 @@ fn handle_mkvol_key(
                 }
                 MkVolField::Passphrase => {
                     if mk.passphrase.len() < 256 {
-                        mk.passphrase.push(c);
+                        crate::passphrase::push_secret(&mut mk.passphrase, c);
                         return Ok(Action::Refresh);
                     }
                 }
                 MkVolField::Confirm => {
                     if mk.confirm.len() < 256 {
-                        mk.confirm.push(c);
+                        crate::passphrase::push_secret(&mut mk.confirm, c);
                         return Ok(Action::Refresh);
                     }
                 }
@@ -2394,8 +2412,7 @@ fn submit_mkvol(
     // SWISS-4n1: when the user enabled "Use passphrase", append
     // --passphrase-stdin and pipe the passphrase via child stdin.
     // The duplicate write buffer is wiped immediately after pipe
-    // close; the wizard's own MkVolState.passphrase dies with the
-    // dialog when this function returns.
+    // close; the wizard's own MkVolState wipes its copies when dropped.
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let me = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("stratum"));
@@ -2687,18 +2704,12 @@ fn submit_dialog(
                     Ok(Action::Refresh)
                 }
                 Err(e) => {
-                    // Most likely: wrong passphrase. stratumd's
-                    // exit-on-EBADTAG won't bind the socket, so
-                    // wait_for_sock times out + the spawn returns Err.
-                    // Re-show the prompt with the error.
+                    // The error says what the daemon said. Re-show the prompt.
                     *local_dialog = Some(LocalDialog {
                         kind: LocalDialogKind::PassphraseFor {
                             volume: volume.clone(),
                         },
-                        prompt: format!(
-                            "Mount {}: {} (wrong passphrase?)",
-                            volume.display(), e
-                        ),
+                        prompt: format!("Mount {}: {}", volume.display(), e),
                         value: String::new(),
                         is_password: true,
                         is_error: false,

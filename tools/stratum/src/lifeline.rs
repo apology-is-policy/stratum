@@ -56,8 +56,13 @@ pub fn follow() {
         let mut byte = 0u8;
         loop {
             let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
-            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                eprintln!("stratum: reading {ENV} failed ({e}); this daemon will not stop with its manager");
+                return;
             }
             break;
         }

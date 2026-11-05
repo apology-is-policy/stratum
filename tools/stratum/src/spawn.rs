@@ -41,6 +41,43 @@ pub enum BackendMeta {
     None,
 }
 
+/// A sealed volume's key derivation and a large pool's first walk both come before
+/// the socket does, and from here they look like a hang.
+const DAEMON_START: Duration = Duration::from_secs(60);
+
+/// Waits for a daemon to bind its socket. One that refuses says why in its log and
+/// exits, so that ends the wait.
+pub fn wait_for_daemon(child: &mut Child, sock: &Path) -> Result<()> {
+    let started = Instant::now();
+    while !sock.exists() {
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!("stratumd stopped ({status})");
+        }
+        if started.elapsed() >= DAEMON_START {
+            bail!("timed out waiting for {}", sock.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// What a daemon's log says about why it did not start, for the person who asked.
+pub fn start_failure(log: &str) -> String {
+    let said = log
+        .lines()
+        .filter(|l| !l.contains("serving "))
+        .next_back()
+        .unwrap_or("it said nothing");
+    let wrong_pass = ["status=-201", "EBADTAG", "status=-202", "EBADVERSION"]
+        .iter()
+        .any(|m| log.contains(m));
+    if wrong_pass {
+        format!("wrong passphrase ({said})")
+    } else {
+        said.to_string()
+    }
+}
+
 /// TERM, then KILL only after a daemon has had time to unmount: its last commit
 /// happens on the way out, so a kill there loses what that commit would have
 /// made durable.
@@ -301,14 +338,11 @@ impl SpawnCtx {
             }
         }
 
-        if let Err(e) = wait_for_sock(&sock, Duration::from_secs(5)) {
+        if let Err(e) = wait_for_daemon(&mut child, &sock) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(e.context(format!(
-                "stratumd socket never appeared at {} \
-                 (wrong passphrase? check session log)",
-                sock.display()
-            )));
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            return Err(e.context(start_failure(&log)));
         }
         // SWISS-8d: also wait briefly for the /ctl/ socket so the F2
         // pollers see a connectable endpoint on their first tick.

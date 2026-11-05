@@ -40,6 +40,29 @@ pub fn is_keyfile_encrypted(path: &Path) -> Result<bool> {
     }
 }
 
+/// Wipes a secret typed into a String, including what was backspaced over.
+pub fn wipe_string(s: &mut String) {
+    let v = unsafe { s.as_mut_vec() };
+    let cap = v.capacity();
+    v.resize(cap, 0);
+    for b in v.iter_mut() {
+        unsafe { std::ptr::write_volatile(b as *mut u8, 0); }
+    }
+    v.clear();
+}
+
+/// Appends to a secret, wiping the old buffer rather than leaving it to the
+/// allocator when the secret outgrows it.
+pub fn push_secret(s: &mut String, c: char) {
+    if s.capacity() - s.len() < c.len_utf8() {
+        let mut grown = String::with_capacity((s.len() + c.len_utf8()).max(64) * 2);
+        grown.push_str(s);
+        wipe_string(s);
+        *s = grown;
+    }
+    s.push(c);
+}
+
 /// `Zeroizing<Vec<u8>>` — a Vec wrapper that wipes its backing buffer
 /// on drop. Equivalent to the `zeroize` crate's `Zeroizing` but rolled
 /// here to avoid adding a dep.
@@ -138,4 +161,31 @@ pub fn prompt_passphrase(label: &str) -> Result<Zeroizing> {
         bail!("empty passphrase refused");
     }
     Ok(Zeroizing::new(buf))
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn a_secret_keeps_every_character_as_it_grows() {
+        let mut s = String::new();
+        let want: String = "pass\u{e9}phrase".repeat(20);
+        for c in want.chars() {
+            push_secret(&mut s, c);
+        }
+        assert_eq!(s, want);
+    }
+
+    #[test]
+    fn a_wipe_leaves_the_whole_buffer_zero() {
+        let mut s = String::from("secret");
+        s.pop();
+        let cap = s.capacity();
+        wipe_string(&mut s);
+        assert!(s.is_empty());
+        // Within the capacity, and the wipe wrote every byte of it.
+        let raw = unsafe { std::slice::from_raw_parts(s.as_ptr(), cap) };
+        assert!(raw.iter().all(|&b| b == 0));
+    }
 }
