@@ -518,6 +518,7 @@ impl SpawnCtx {
         src_path: &str,
         dst_socket: &Path,
         dst_path: &str,
+        dst_mode: &str,
     ) -> Result<()> {
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
@@ -532,7 +533,7 @@ impl SpawnCtx {
             .spawn()?;
         let reader_stdout = reader.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let writer = Command::new(&self.me)
-            .args(&["fs", "-s", dst_sock_str, "write", "-n", dst_path])
+            .args(&["fs", "-s", dst_sock_str, "write", "-n", "-m", dst_mode, dst_path])
             .stdin(Stdio::from(reader_stdout))
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -540,19 +541,8 @@ impl SpawnCtx {
             .spawn()?;
         let reader_status = reader.wait()?;
         let writer_out = writer.wait_with_output()?;
-        if !reader_status.success() {
-            // The writer took the reader's end for the end of the file and kept what had
-            // come; write -n made that file, so it goes.
-            if writer_out.status.success() {
-                let _ = Command::new(&self.me)
-                    .args(["fs", "-s", dst_sock_str, "rm", dst_path])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
-            bail!("stratum fs read failed (exit {})", reader_status.code().unwrap_or(-1));
-        }
+        // A writer that stopped first leaves the reader a closed pipe; the writer's line
+        // is the cause.
         if !writer_out.status.success() {
             let stderr = String::from_utf8_lossy(&writer_out.stderr);
             bail!(
@@ -560,6 +550,17 @@ impl SpawnCtx {
                 writer_out.status.code().unwrap_or(-1),
                 stderr.lines().next().unwrap_or("(no detail)").trim()
             );
+        }
+        if !reader_status.success() {
+            // The writer took the reader's end for the end of the file and kept what had
+            // come; write -n made that file, so it goes.
+            let _ = Command::new(&self.me)
+                .args(["fs", "-s", dst_sock_str, "rm", dst_path])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            bail!("stratum fs read failed (exit {})", reader_status.code().unwrap_or(-1));
         }
         Ok(())
     }

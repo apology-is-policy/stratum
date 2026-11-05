@@ -114,6 +114,9 @@ fn sanitize_for_display(s: &str) -> String {
 
 pub struct PanelView {
     pub path: String,
+    /// False when the location could not be read: `path` is then empty, and nothing may
+    /// build a path from it.
+    pub path_ok: bool,
     pub raw_entries: Vec<String>,
     pub cursor: u32,
     pub connected: bool,
@@ -122,6 +125,14 @@ pub struct PanelView {
     /// /panels/X/selection. Used to highlight rows and to drive
     /// batch F5 / F8 operations.
     pub selection: Vec<u32>,
+}
+
+impl PanelView {
+    /// The location under the backend's root without its leading '/', or None when it
+    /// could not be read.
+    pub fn cwd(&self) -> Option<&str> {
+        self.path_ok.then(|| self.path.trim_start_matches('/'))
+    }
 }
 
 pub struct UiState {
@@ -674,10 +685,12 @@ fn draw_panel(frame: &mut Frame<'_>, panel: &PanelView, area: Rect, focused: boo
     let title_clr = if focused { CLR_TITLE_ACTIVE } else { CLR_TITLE_INACTIVE };
     let cursor_bg = if focused { CLR_CURSOR_ACTIVE_BG } else { CLR_CURSOR_INACTIVE_BG };
 
-    let title_str = if panel.path.is_empty() {
-        if panel.connected { "/".to_string() } else { "(disconnected)".to_string() }
-    } else {
+    let title_str = if panel.path_ok {
         panel.path.clone()
+    } else if panel.connected {
+        "(location cannot be read)".to_string()
+    } else {
+        "(disconnected)".to_string()
     };
 
     let block = Block::default()

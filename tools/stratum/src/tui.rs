@@ -279,6 +279,8 @@ struct DeleteBatch {
     worker: Option<DeleteWorker>,
     /// Set by a Yes on its question, and by nothing else.
     confirmed: bool,
+    /// An Esc, kept until the item in hand ends: nothing after it starts.
+    cancel: bool,
     /// SWISS-4q-worker: clock origin for the progress dialog's
     /// spinner phase + elapsed time display.
     start_time: Instant,
@@ -890,12 +892,10 @@ fn handle_key(
     // search context if it exceeds 1s.
     search.maybe_reset();
 
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && (matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c')))
-    {
-        return Ok(Action::Quit);
-    }
-    if matches!(key.code, KeyCode::F(10)) {
+    let quit_key = matches!(key.code, KeyCode::F(10))
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c')));
+    if quit_key {
         // Quitting mid-item would leave a partial file under a temporary name, or a short
         // one under its own in a volume.
         if copy_batch.is_some() || delete_batch.is_some() {
@@ -1031,6 +1031,18 @@ fn handle_key(
     // returns early on searchable Char + on Backspace-with-buffer;
     // anything else reaching here clears the buffer.
     search.clear();
+    let unread = |i: usize| snap.panels[i].connected && !snap.panels[i].path_ok;
+    let unshifted = !key.modifiers.contains(KeyModifiers::SHIFT);
+    let builds_here = match key.code {
+        KeyCode::F(3) | KeyCode::F(4) | KeyCode::F(5) | KeyCode::F(8) => unshifted,
+        KeyCode::F(7) => true,
+        _ => false,
+    };
+    let builds_there = matches!(key.code, KeyCode::F(5)) && unshifted;
+    if (builds_here && unread(*focus)) || (builds_there && unread(1 - *focus)) {
+        *local_dialog = Some(error_dialog(LOCATION_UNREAD));
+        return Ok(Action::Refresh);
+    }
     match key.code {
         KeyCode::Tab => {
             *focus ^= 1;
@@ -2384,8 +2396,10 @@ fn submit_mkvol(
             return Ok(Action::Refresh);
         }
     };
-    let panel = &snap.panels[panel_idx];
-    let cwd = panel.path.trim_start_matches('/');
+    let Some(cwd) = snap.panels[panel_idx].cwd() else {
+        *local_dialog = Some(error_dialog(LOCATION_UNREAD));
+        return Ok(Action::Refresh);
+    };
     let mut volume_path = host_root.clone();
     if !cwd.is_empty() {
         volume_path.push(cwd);
@@ -2554,7 +2568,10 @@ fn submit_dialog(
                 ));
                 return Ok(Action::Refresh);
             }
-            let cwd = snap.panels[panel_idx].path.trim_start_matches('/');
+            let Some(cwd) = snap.panels[panel_idx].cwd() else {
+                *local_dialog = Some(error_dialog(LOCATION_UNREAD));
+                return Ok(Action::Refresh);
+            };
             // SWISS-4g: dispatch on backend.
             match sp.panel_meta(panel_idx) {
                 BackendMeta::HostFs { root } => {
@@ -2771,7 +2788,7 @@ fn detect_regular_file_at_cursor(snap: &UiState, panel_idx: usize) -> Option<Str
     let _ = parts.next();
     let _ = parts.next();
     let name = parts.next()?;
-    if kind != "-" || name == ".." || name.is_empty() {
+    if kind != "-" || !name_is_safe(name) {
         return None;
     }
     if name.ends_with(".stm") {
@@ -2779,11 +2796,11 @@ fn detect_regular_file_at_cursor(snap: &UiState, panel_idx: usize) -> Option<Str
         return None;
     }
     // Construct panel-relative 9P path.
-    let cwd = panel.path.trim_end_matches('/');
-    if cwd.is_empty() || cwd == "/" {
+    let cwd = panel.cwd()?.trim_end_matches('/');
+    if cwd.is_empty() {
         Some(format!("/{name}"))
     } else {
-        Some(format!("{cwd}/{name}"))
+        Some(format!("/{cwd}/{name}"))
     }
 }
 
@@ -2805,7 +2822,7 @@ fn detect_stm_at_cursor(
     let _size = parts.next();
     let _mtime = parts.next();
     let name = parts.next()?;
-    if kind != "-" || !name.ends_with(".stm") || name == ".." {
+    if kind != "-" || !name.ends_with(".stm") || !name_is_safe(name) {
         return None;
     }
     let sp = spawn?;
@@ -2817,8 +2834,8 @@ fn detect_stm_at_cursor(
     // 9P-style: panel.path is "/" or "/foo/bar"; entry name is the
     // leaf. OS path = host_root + panel.path + "/" + name (with
     // double-slash-collapsed).
+    let cwd = panel.cwd()?;
     let mut p = host_root.clone();
-    let cwd = panel.path.trim_start_matches('/');
     if !cwd.is_empty() {
         p.push(cwd);
     }
@@ -3004,8 +3021,10 @@ fn start_f5(
         _ => None,
     };
 
-    let src_cwd = panel.path.trim_start_matches('/');
-    let dst_cwd = dst_panel.path.trim_start_matches('/');
+    let (Some(src_cwd), Some(dst_cwd)) = (panel.cwd(), dst_panel.cwd()) else {
+        *local_dialog = Some(error_dialog(LOCATION_UNREAD));
+        return Ok(Action::Refresh);
+    };
     let mut items: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
     let mut refused = 0usize;
     let mut refused_error = None;
@@ -3153,7 +3172,10 @@ fn start_f8(
             return Ok(Action::Refresh);
         }
     };
-    let cwd = panel.path.trim_start_matches('/');
+    let Some(cwd) = panel.cwd() else {
+        *local_dialog = Some(error_dialog(LOCATION_UNREAD));
+        return Ok(Action::Refresh);
+    };
     let meta = sp.panel_meta(active);
     let sock = match &meta {
         BackendMeta::Stratumd { .. } => panel_socket_for(snap, sp, active),
@@ -3226,6 +3248,7 @@ fn start_f8(
         src_focus: active,
         worker: None,
         confirmed: false,
+        cancel: false,
         start_time: Instant::now(),
     });
     *local_dialog = Some(LocalDialog {
@@ -3281,7 +3304,14 @@ fn run_delete(
     let _ = parts.next();
     let _ = parts.next();
     let name = match parts.next() {
-        Some(n) if !n.is_empty() && n != ".." => n,
+        Some(n) if name_is_safe(n) => n,
+        Some(n) if !n.is_empty() && n != ".." => {
+            *local_dialog = Some(error_dialog(
+                "This name is shown with characters standing in for ones that cannot be \
+                 shown, so it is not deleted from here.",
+            ));
+            return Ok(Action::Refresh);
+        }
         _ => {
             *local_dialog = Some(error_dialog("Cannot delete '..' or empty entry."));
             return Ok(Action::Refresh);
@@ -3289,7 +3319,10 @@ fn run_delete(
     };
 
     let is_dir = kind == "d";
-    let cwd = panel.path.trim_start_matches('/');
+    let Some(cwd) = panel.cwd() else {
+        *local_dialog = Some(error_dialog(LOCATION_UNREAD));
+        return Ok(Action::Refresh);
+    };
 
     match sp.panel_meta(active) {
         BackendMeta::HostFs { root } => {
@@ -3627,17 +3660,14 @@ fn io_other(e: anyhow::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
 }
 
-/// What `stratum fs write` and `mkdir` give what they make. Each change of mode is a
-/// commit, so only a difference from these pays for one.
-const STM_WRITE_MODE: u32 = 0o644;
-const STM_MKDIR_MODE: u32 = 0o755;
-
 /// Who may read a file is part of it. The bits that grant more than that stay behind.
 fn host_mode(path: &Path) -> Option<u32> {
     std::fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777)
 }
 
 const LEFT_OUT_NOTE: &str = "Symlinks and special files are not copied.";
+
+const LOCATION_UNREAD: &str = "This panel's location cannot be read, so nothing is done in it.";
 
 #[derive(Clone, Copy)]
 struct StmStat {
@@ -3648,8 +3678,11 @@ struct StmStat {
 fn stm_stat(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str) -> Option<StmStat> {
     let out = sp.run_stratum_fs_capture(sock, &["stat", p9]).ok()?;
     let text = String::from_utf8_lossy(&out);
+    // The path is printed first and can hold a newline; the fields after it are the
+    // server's.
     let field = |key: &str| {
         text.lines()
+            .rev()
             .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
     };
     let mode = u32::from_str_radix(&field("mode:")?, 8).ok()? & 0o777;
@@ -3681,7 +3714,7 @@ fn take_new_name(temp: &Path, dst: &Path) -> std::io::Result<()> {
         Err(e) => {
             let c = e.raw_os_error().unwrap_or(0);
             if c == libc::EPERM || c == libc::ENOTSUP || c == libc::EOPNOTSUPP
-                || c == libc::EXDEV || c == libc::EMLINK
+                || c == libc::EXDEV || c == libc::EMLINK || c == libc::ENOSYS
             {
                 std::fs::rename(temp, dst)
             } else {
@@ -3744,14 +3777,16 @@ fn host_copy_via_temp(
 /// A directory the destination already has is the merge an Overwrite asks for. Anything
 /// else in the way is the failure.
 fn ensure_stm_dir(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str, mode: Option<u32>) -> Result<()> {
+    // Born with its mode: there is no moment when more may look into it than its
+    // source allows.
     let made = sp.run_stratum_fs(
         sock,
-        &["mkdir", p9],
+        &["mkdir", "-m", &format!("{:o}", mode.unwrap_or(0o700) | 0o700), p9],
         std::process::Stdio::null(),
         std::process::Stdio::null(),
     );
     let Err(e) = made else {
-        return set_stm_mode(sp, sock, p9, mode.unwrap_or(0o700) | 0o700, STM_MKDIR_MODE);
+        return Ok(());
     };
     match sp.run_stratum_fs_capture(sock, &["stat", p9]) {
         Ok(out)
@@ -3765,24 +3800,12 @@ fn ensure_stm_dir(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str, mode: Option<u32>) 
     }
 }
 
-fn set_stm_mode(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str, mode: u32, given: u32) -> Result<()> {
-    if mode == given {
-        return Ok(());
-    }
-    sp.run_stratum_fs(
-        sock,
-        &["chmod", &format!("{mode:o}"), p9],
-        std::process::Stdio::null(),
-        std::process::Stdio::null(),
-    )
-}
-
 /// A new name is written in place, and an existing file keeps its bytes until the new
 /// ones are whole: they go beside it and are moved over, the move being what commits.
 /// `write -n` refuses a name that is there and removes what it made if it fails, so a
 /// copy never truncates or removes a file it did not make. What arrived is checked
-/// against `want`, and a mode that cannot be given fails the copy, which would otherwise
-/// hand the file to more readers.
+/// against `want`. `write` makes the file with the source's mode, so nobody the source
+/// keeps out can read it while it fills.
 #[allow(clippy::too_many_arguments)]
 fn write_stm_file(
     sp: &Arc<SpawnCtx>,
@@ -3792,16 +3815,15 @@ fn write_stm_file(
     replacing: bool,
     mode: u32,
     want: u64,
-    write: impl Fn(&str) -> Result<()>,
+    write: impl Fn(&str, &str) -> Result<()>,
 ) -> Result<()> {
     let target = if replacing { temp } else { dst };
-    write(target)?;
+    write(target, &format!("{mode:o}"))?;
     let done = match stm_stat(sp, sock, target) {
         Some(st) if st.size == want => Ok(()),
         Some(st) => Err(anyhow::anyhow!("{dst}: {} of {want} bytes arrived", st.size)),
         None => Err(anyhow::anyhow!("{dst}: what was written cannot be read back")),
     }
-    .and_then(|_| set_stm_mode(sp, sock, target, mode, STM_WRITE_MODE))
     .and_then(|_| {
         if replacing {
             sp.run_stratum_fs(
@@ -3884,8 +3906,8 @@ fn perform_copy_one(
                 let meta = from.metadata()?;
                 let (want, mode) = (meta.len(), meta.permissions().mode() & 0o777);
                 write_stm_file(sp, sock, &p9, &path_to_p9(temp, dst_meta), replacing, mode, want,
-                               |to: &str| -> Result<()> {
-                    sp.run_stratum_fs(sock, &["write", "-n", to],
+                               |to: &str, mode: &str| -> Result<()> {
+                    sp.run_stratum_fs(sock, &["write", "-n", "-m", mode, to],
                                        std::process::Stdio::from(from.try_clone()?),
                                        std::process::Stdio::null())
                 }).map_err(io_other)?;
@@ -3927,7 +3949,7 @@ fn perform_copy_one(
                 let st = st.ok_or_else(|| io::Error::other(format!("{s_p9}: cannot read its size and mode")))?;
                 write_stm_file(sp, d_sock, &d_p9, &path_to_p9(temp, dst_meta), replacing,
                                st.mode, st.size,
-                               |to: &str| sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, to))
+                               |to: &str, mode: &str| sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, to, mode))
                     .map_err(io_other)?;
                 bump_bytes(st.size);
             }
@@ -4081,9 +4103,10 @@ fn walk_host_subtree(src: &Path, dst: &Path, to_volume: bool, out: &mut Expansio
         };
         let name = entry.file_name();
         let sub_src = src.join(&name);
-        // A volume's paths are strings on this side: a lossy name would land as another file.
-        if to_volume && name.to_str().is_none() {
-            out.fail(&sub_src, "the name is not UTF-8");
+        // A volume's paths are strings on this side: a lossy name would land as another
+        // file, and one the panels cannot show could not be acted on there again.
+        if to_volume && !name.to_str().is_some_and(name_is_safe) {
+            out.fail(&sub_src, "the name is not UTF-8, or holds a control character");
             continue;
         }
         let sub_dst = dst.join(&name);
@@ -4204,21 +4227,21 @@ fn advance_delete_batch(
             return Ok(Some(BatchTick::Done));
         }
     }
-    /* Cancellation flag from the F8 No-pick. Checked before any
-     * worker spawn so we don't waste a thread. */
-    if DELETE_CANCEL.with(|c| {
-        let v = c.get();
-        c.set(false);
-        v
-    }) {
-        /* Wait for any in-flight worker to finish (we can't cancel
-         * mid-subprocess). After that, mark the rest as skipped. */
+    if DELETE_CANCEL.with(|c| c.replace(false)) {
+        batch.cancel = true;
+    }
+    if batch.cancel {
+        // A subprocess cannot be stopped halfway: the item in hand runs out and is
+        // counted, and the rest are left.
         if let Some(w) = batch.worker.as_ref() {
             if !w.handle.is_finished() {
                 return Ok(Some(BatchTick::More));
             }
             let w = batch.worker.take().unwrap();
-            let _ = w.handle.join();
+            match w.handle.join() {
+                Ok(Ok(())) => batch.deleted += 1,
+                _ => batch.failed += 1,
+            }
         }
         batch.idx = batch.items.len();
         return Ok(Some(BatchTick::Done));
@@ -4408,9 +4431,12 @@ fn toggle_selection(
     if !panel.connected {
         return Ok(Action::Ignore);
     }
+    if !panel.path_ok {
+        return Ok(Action::Ignore);
+    }
     let cursor = panel.cursor;
     // Refuse to toggle synthetic ".." at index 0 when path != "/".
-    let has_dotdot = !panel.path.is_empty() && panel.path != "/";
+    let has_dotdot = panel.path != "/";
     if has_dotdot && cursor == 0 {
         return Ok(Action::Ignore);
     }
@@ -4595,7 +4621,11 @@ fn read_panel(
     base: &str,
     connected: bool,
 ) -> Result<PanelView> {
-    let path = read_text_trim(client, &format!("{base}/path")).unwrap_or_default();
+    // A location that cannot be read is not the root: actions refuse in it instead.
+    let (path, path_ok) = match read_text_trim(client, &format!("{base}/path")) {
+        Ok(p) if p.starts_with('/') => (p, true),
+        _ => (String::new(), false),
+    };
     let raw_entries = read_lines(client, &format!("{base}/entries")).unwrap_or_default();
     let cursor: u32 = read_text_trim(client, &format!("{base}/cursor"))
         .ok()
@@ -4628,7 +4658,7 @@ fn read_panel(
     } else {
         cursor
     };
-    Ok(PanelView { path, raw_entries, cursor, connected, selection })
+    Ok(PanelView { path, path_ok, raw_entries, cursor, connected, selection })
 }
 
 #[cfg(test)]

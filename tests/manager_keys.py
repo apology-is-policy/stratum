@@ -8,6 +8,7 @@ the same bytes after a remount.
     tests/manager_keys.py path/to/stratum [--show]
 
 --show prints the screen after each step. On a failure the screen is printed regardless.
+KEYS_ONLY=leg,leg runs only those legs, each of which takes (stratum, root).
 """
 import codecs
 import fcntl
@@ -18,6 +19,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -1074,6 +1076,11 @@ def volume_copy_legs(stratum, root):
     os.makedirs(f'{host}/privdir')
     os.chmod(f'{host}/privdir', 0o700)
     os.symlink(f'{host}/privdir', f'{host}/linkedname')
+    # Names the panels cannot show as they are: a tab at the top, a newline further down.
+    spit(f'{host}/tab\tname', b'tab\n')
+    os.makedirs(f'{host}/nldir')
+    spit(f'{host}/nldir/plain.txt', b'plain\n')
+    spit(f'{host}/nldir/bad\nname', b'bad\n')
     vol = Volume(stratum, base)
     vol.mkfs()
     vol.serve()
@@ -1092,7 +1099,8 @@ def volume_copy_legs(stratum, root):
         raise Failure('ls -0 printed no NUL')
     vol.stop()
 
-    host_names = ['keptfile.txt', 'overfile.txt', 'secretfile.txt', 'privdir', 'linkedname']
+    host_names = ['keptfile.txt', 'overfile.txt', 'secretfile.txt', 'privdir', 'linkedname',
+                  'tab\ufffdname', 'nldir']
     vol_names = ['keptfile.txt', 'overfile.txt', 'keptfile-2.txt', 'hostile', '.snaps',
                  'shutfile.txt', 'shutdir', 'secretfile.txt', 'privdir', 'linkedname']
     env_file = f'{base}/env'
@@ -1152,14 +1160,35 @@ def volume_copy_legs(stratum, root):
         pick(term, 'linkedname', host_names, right=True)
         term.send(F5)
         term.expect(r'Nothing valid in selection|Destination exists')
-        if 'Destination exists' in term.screen.text():
-            answer_conflict(term, OVERWRITE)
-            copy_summary(term, 'a link to a directory over a volume file')
-        else:
+        # The refusal itself: past it, four later checks each keep the volume file too.
+        refused = 'Nothing valid in selection' in term.screen.text()
+        if refused:
             term.send(ENTER)
             term.pump(0.3)
-        record(on_vol('/linkedname') == b'keep\n', 'a link to a directory is not copied over a volume file',
-               f'the volume file now reads {on_vol("/linkedname")!r}')
+        else:
+            answer_conflict(term, OVERWRITE)
+            copy_summary(term, 'a link to a directory over a volume file')
+        record(refused and on_vol('/linkedname') == b'keep\n',
+               'a link to a directory is left out of a copy into a volume, and the volume file stays',
+               f'a link to a directory: refused={refused}, the volume file reads {on_vol("/linkedname")!r}')
+
+        # Shown with a stand-in, a name would be acted on as the stand-in: another file,
+        # or none.
+        pick(term, 'tab\ufffdname', host_names, right=True)
+        term.send(F5)
+        term.expect(r'Nothing valid in selection|Copy: \d+ copied|Destination exists')
+        refused = 'Nothing valid in selection' in term.screen.text()
+        term.send(ENTER)
+        term.pump(0.5)
+        record(refused, 'a name with a control character is refused, not copied under its stand-in',
+               'a name with a control character was acted on under its stand-in')
+        pick(term, 'nldir', host_names, right=True)
+        term.send(F5)
+        _, _, failed, _ = copy_summary(term, 'a directory holding a name with a newline')
+        inside = vol.fs(sock, 'ls', '-0', '/nldir').stdout
+        record(failed == 1 and b'plain.txt' in inside and b'bad' not in inside,
+               'a name with a newline is not copied into a volume, and is counted failed',
+               f'a name with a newline: {failed} failed, the volume directory lists {inside!r}')
 
         term.send(TAB)
         term.pump(0.3)
@@ -1282,6 +1311,183 @@ def selection_legs(stratum, root):
         term.kill()
 
 
+def p9_mkdir(sock, parents, name):
+    """A raw Tmkdir: `stratum fs` takes its paths as text, and these names are not."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(30)
+    s.connect(sock)
+
+    def recv(n):
+        b = b''
+        while len(b) < n:
+            got = s.recv(n - len(b))
+            if not got:
+                raise Failure('the daemon closed the 9P connection')
+            b += got
+        return b
+
+    def rpc(mtype, body, tag=1):
+        s.sendall(struct.pack('<IBH', 7 + len(body), mtype, tag) + body)
+        size, rtype = struct.unpack('<IB', recv(5))
+        rest = recv(size - 5)
+        if rtype == 7:
+            raise Failure(f'9P message {mtype} refused: errno {struct.unpack("<I", rest[2:6])[0]}')
+        if rtype != mtype + 1:
+            raise Failure(f'9P message {mtype} answered with type {rtype}')
+        return rest[2:]
+
+    def s9(b):
+        return struct.pack('<H', len(b)) + b
+
+    try:
+        rpc(100, struct.pack('<I', 65536) + s9(b'9P2000.L'), tag=0xFFFF)
+        rpc(104, struct.pack('<II', 0, 0xFFFFFFFF) + s9(b'') + s9(b'') + struct.pack('<I', 0xFFFFFFFF))
+        rpc(110, struct.pack('<IIH', 0, 1, len(parents)) + b''.join(s9(p) for p in parents))
+        rpc(72, struct.pack('<I', 1) + s9(name) + struct.pack('<II', 0o755, os.getgid()))
+        rpc(120, struct.pack('<I', 1))
+        rpc(50, struct.pack('<II', 0, 0))
+    finally:
+        s.close()
+
+
+def unreadable_name_legs(stratum, root):
+    """A name that is not UTF-8 is not somewhere the manager goes, and from inside one nothing lands at the root."""
+    base = f'{root}/badname'
+    os.makedirs(base)
+    vol = Volume(stratum, base)
+    vol.mkfs()
+    vol.serve()
+    for args, data in ((('mkdir', '/victim'), None), (('write', '/victim/keepme'), b'keep\n')):
+        r = vol.fs(vol.sock, *args, data=data)
+        if r.returncode != 0:
+            raise Failure(f'seeding {args}: {r.stderr[:200]}')
+    p9_mkdir(vol.sock, [], b'caf\xe9')
+    p9_mkdir(vol.sock, [b'caf\xe9'], b'victim')
+    vol.stop()
+
+    shown = 'caf\ufffd'
+    term = Term([stratum, 'tui', '--vol', vol.v, '--host', base])
+    try:
+        term.expect(r'Passphrase for')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'victim', timeout=60)
+        term.pump(0.5)
+        pick(term, shown, [shown, 'victim', '.snaps'])
+        term.send(ENTER)
+        term.pump(1.5)
+        term.show('Enter on a name that is not UTF-8')
+        if shown in rows_in_panel(term, [shown], False):
+            print('ok: the manager does not go into a directory whose name is not UTF-8', flush=True)
+        else:
+            # Two defences: in here, the actions must refuse rather than build from the root.
+            print('note: it went in, so its actions must refuse', flush=True)
+            pick(term, 'victim', ['victim'])
+            term.send(b' ')
+            term.pump(0.5)
+            term.send(F8)
+            term.expect(r'location cannot be read|Delete')
+            term.show('F8 inside it')
+            if 'location cannot be read' in term.screen.text():
+                print('ok: inside it, F8 refuses for want of a location', flush=True)
+                term.send(ENTER)
+            else:
+                term.send(LEFT)
+                term.pump(0.1)
+                term.send(ENTER)
+                term.pump(3.0)
+        term.pump(0.5)
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+    vol.serve()
+    try:
+        kept = vol.fs(vol.sock, 'read', '/victim/keepme').stdout
+    finally:
+        vol.stop()
+    record(kept == b'keep\n', "the root's own victim directory is untouched",
+           f'the root\'s /victim/keepme now reads {kept!r}')
+
+
+def files_left(path):
+    """-1 once the directory is gone, so a poll never ends the run."""
+    try:
+        return len(os.listdir(path))
+    except FileNotFoundError:
+        return -1
+
+
+def delete_batch_legs(stratum, root):
+    """A delete runs one item at a time: Ctrl-Q waits like F10, and Esc stops after the item in hand."""
+    w = f'{root}/delbatch'
+    many = 20000
+    dirs = ['bulkone', 'bulktwo']
+    for d in ['bulkzero'] + dirs:
+        os.makedirs(f'{w}/{d}')
+        for i in range(many):
+            open(f'{w}/{d}/f{i:05d}', 'wb').close()
+
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        term.expect(r'bulkzero', timeout=30)
+        term.pump(0.5)
+        pick(term, 'bulkzero', ['bulkzero'] + dirs)
+        term.send(b' ')
+        term.pump(0.3)
+        term.send(F8)
+        term.expect(r'Delete 1 items')
+        term.send(LEFT)
+        term.pump(0.1)
+        term.send(ENTER)
+        end = time.monotonic() + 30
+        while time.monotonic() < end and files_left(f'{w}/bulkzero') == many:
+            time.sleep(0.01)
+        term.send(b'\x11')
+        term.expect(r'A copy or delete is running', timeout=10)
+        record(not term.exited(1), 'Ctrl-Q mid-delete waits, as F10 does', 'Ctrl-Q quit in the middle of a delete')
+        end = time.monotonic() + 120
+        while time.monotonic() < end and files_left(f'{w}/bulkzero') != -1:
+            time.sleep(0.1)
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        term.expect(r'bulkone', timeout=30)
+        term.pump(0.5)
+        for d in dirs:
+            pick(term, d, dirs)
+            term.send(b' ')
+            term.pump(0.3)
+        term.send(F8)
+        term.expect(r'Delete 2 items')
+        term.send(LEFT)
+        term.pump(0.1)
+        term.send(ENTER)
+        # Once an item is under way: before that, Esc stops a batch with nothing running.
+        end = time.monotonic() + 30
+        while time.monotonic() < end and all(files_left(f'{w}/{d}') == many for d in dirs):
+            time.sleep(0.01)
+        term.send(ESC)
+        term.expect(r'Delete: \d+ deleted', timeout=120)
+        term.show('after Esc mid-delete')
+        m = re.search(r'Delete: (\d+) deleted', term.screen.text())
+        intact = [d for d in dirs if files_left(f'{w}/{d}') == many]
+        record(len(intact) == 1, 'Esc mid-delete stops the batch after the item in hand',
+               f'after Esc mid-delete, the intact directories are {intact}')
+        record(m is not None and m[1] == '1', 'the item in hand when Esc came is counted',
+               f'the summary after Esc reads {m and m[0]!r}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+
 def run(stratum, root):
     host = f'{root}/host'
     tree = f'{host}/tree'
@@ -1394,6 +1600,8 @@ def run(stratum, root):
                       (host_copy_legs, (stratum, root)),
                       (copy_engine_legs, (stratum, root)),
                       (volume_copy_legs, (stratum, root)),
+                      (unreadable_name_legs, (stratum, root)),
+                      (delete_batch_legs, (stratum, root)),
                       (death_legs, (stratum, vol, host, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
                       (wrong_passphrase_leg, (stratum, vol, host)),
@@ -1413,11 +1621,22 @@ def main():
     if len(args) != 1:
         sys.exit(__doc__)
     stratum = os.path.abspath(args[0])
+    # A private directory is 0700 whatever the umask; under 077 a mode never given would
+    # read 0700 too, and the mode legs would see nothing.
+    os.umask(0o022)
     root = tempfile.mkdtemp(prefix='stratum-keys.')
     # The landing screen keeps its recent volumes under HOME, which must not be the operator's.
     os.environ['HOME'] = root
     try:
-        run(stratum, root)
+        only = os.environ.get('KEYS_ONLY')
+        if only:
+            for name in only.split(','):
+                try:
+                    globals()[name](stratum, root)
+                except (Failure, OSError) as e:
+                    record(False, '', f'{name}: {e}')
+        else:
+            run(stratum, root)
     except (Failure, subprocess.SubprocessError, OSError) as e:
         print(f'FAIL: {e}')
         return 1
