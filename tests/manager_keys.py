@@ -1089,6 +1089,7 @@ def volume_copy_legs(stratum, root):
     os.symlink(f'{host}/privdir', f'{host}/linkedname')
     # Names the panels cannot show as they are: a tab at the top, a newline further down.
     spit(f'{host}/tab\tname', b'tab\n')
+    spit(f'{host}/tabmate.txt', b'mate\n')
     os.makedirs(f'{host}/nldir')
     spit(f'{host}/nldir/plain.txt', b'plain\n')
     spit(f'{host}/nldir/bad\nname', b'bad\n')
@@ -1111,9 +1112,9 @@ def volume_copy_legs(stratum, root):
     vol.stop()
 
     host_names = ['keptfile.txt', 'overfile.txt', 'secretfile.txt', 'privdir', 'linkedname',
-                  'tab\ufffdname', 'nldir']
+                  'tab\ufffdname', 'tabmate.txt', 'nldir']
     vol_names = ['keptfile.txt', 'overfile.txt', 'keptfile-2.txt', 'hostile', '.snaps',
-                 'shutfile.txt', 'shutdir', 'secretfile.txt', 'privdir', 'linkedname']
+                 'shutfile.txt', 'shutdir', 'secretfile.txt', 'privdir', 'linkedname', 'tabmate.txt']
     env_file = f'{base}/env'
     term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file])
     try:
@@ -1184,15 +1185,18 @@ def volume_copy_legs(stratum, root):
                f'a link to a directory: refused={refused}, the volume file reads {on_vol("/linkedname")!r}')
 
         # Shown with a stand-in, a name would be acted on as the stand-in: another file,
-        # or none.
-        pick(term, 'tab\ufffdname', host_names, right=True)
+        # or none. Beside a plain file the batch runs, and its summary says which refusal
+        # it was: a stand-in left to fail as a missing file would read "No such file".
+        for n in ('tab\ufffdname', 'tabmate.txt'):
+            pick(term, n, host_names, right=True)
+            term.send(b' ')
+            term.pump(0.3)
         term.send(F5)
-        term.expect(r'Nothing valid in selection|Copy: \d+ copied|Destination exists')
-        refused = 'Nothing valid in selection' in term.screen.text()
-        term.send(ENTER)
-        term.pump(0.5)
-        record(refused, 'a name with a control character is refused, not copied under its stand-in',
-               'a name with a control character was acted on under its stand-in')
+        copied, _, failed, text = copy_summary(term, 'a stand-in name beside a plain file')
+        why = 'will not copy' in text
+        record(copied == 1 and failed == 1 and why and on_vol('/tabmate.txt') == b'mate\n',
+               'a name with a control character is refused, not copied under its stand-in',
+               f'a stand-in beside a plain file: {copied} copied, {failed} failed, reason named: {why}')
         pick(term, 'nldir', host_names, right=True)
         term.send(F5)
         _, _, failed, _ = copy_summary(term, 'a directory holding a name with a newline')
@@ -1387,19 +1391,20 @@ def unreadable_name_legs(stratum, root):
         term.send(ENTER)
         term.pump(1.5)
         term.show('Enter on a name that is not UTF-8')
-        if shown in rows_in_panel(term, [shown], False):
-            print('ok: the manager does not go into a directory whose name is not UTF-8', flush=True)
-        else:
+        stayed = shown in rows_in_panel(term, [shown], False)
+        record(stayed, 'the manager does not go into a directory whose name is not UTF-8',
+               'Enter went into a directory whose name is not UTF-8')
+        if not stayed:
             # Two defences: in here, the actions must refuse rather than build from the root.
-            print('note: it went in, so its actions must refuse', flush=True)
             pick(term, 'victim', ['victim'])
             term.send(b' ')
             term.pump(0.5)
             term.send(F8)
             term.expect(r'location cannot be read|Delete')
             term.show('F8 inside it')
-            if 'location cannot be read' in term.screen.text():
-                print('ok: inside it, F8 refuses for want of a location', flush=True)
+            unread = 'location cannot be read' in term.screen.text()
+            record(unread, 'inside it, F8 refuses for want of a location', 'inside it, F8 offered to delete')
+            if unread:
                 term.send(ENTER)
             else:
                 term.send(LEFT)
@@ -1442,6 +1447,14 @@ def delete_batch_legs(stratum, root):
         for i in range(many):
             open(f'{w}/{d}/f{i:05d}', 'wb').close()
     asked = r'held while this shows'
+    # The bare Esc leg needs an item to outlast a key's trip through the loop.
+    os.makedirs(f'{w}/calib')
+    for i in range(many):
+        open(f'{w}/calib/f{i:05d}', 'wb').close()
+    t0 = time.monotonic()
+    shutil.rmtree(f'{w}/calib')
+    item_s = time.monotonic() - t0
+    print(f'note: deleting {many} files takes {item_s:.2f} s here', flush=True)
 
     def start_delete(term, chosen):
         term.expect(re.escape(chosen[0]), timeout=30)
@@ -1494,10 +1507,13 @@ def delete_batch_legs(stratum, root):
         term.show('after Esc mid-delete')
         m = re.search(r'Delete: (\d+) deleted', term.screen.text())
         intact = [d for d in dirs if files_left(f'{w}/{d}') == many]
-        record(len(intact) == 1, 'Esc mid-delete stops the batch after the item in hand',
-               f'after Esc mid-delete, the intact directories are {intact}')
-        record(m is not None and m[1] == '1', 'the item in hand when Esc came is counted',
-               f'the summary after Esc reads {m and m[0]!r}')
+        if item_s < 1.0:
+            print(f'note: an item here may end before Esc is read; intact {intact}, proves nothing', flush=True)
+        else:
+            record(len(intact) == 1, 'Esc mid-delete stops the batch after the item in hand',
+                   f'after Esc mid-delete, the intact directories are {intact}')
+            record(m is not None and m[1] == '1', 'the item in hand when Esc came is counted',
+                   f'the summary after Esc reads {m and m[0]!r}')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise

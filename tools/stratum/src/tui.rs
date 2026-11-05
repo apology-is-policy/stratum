@@ -4717,6 +4717,25 @@ mod tests {
         assert!(s.is_empty());
     }
 
+    // Every action that builds a path asks cwd(); an unread location must give none,
+    // or the action builds from the panel's root.
+    #[test]
+    fn cwd_is_none_when_the_location_was_not_read() {
+        let mut p = PanelView {
+            path: String::new(),
+            path_ok: false,
+            raw_entries: Vec::new(),
+            cursor: 0,
+            connected: true,
+            selection: Vec::new(),
+        };
+        assert_eq!(p.cwd(), None);
+        p.path = "/a/b".to_string();
+        assert_eq!(p.cwd(), None);
+        p.path_ok = true;
+        assert_eq!(p.cwd(), Some("a/b"));
+    }
+
     fn make_entries(names: &[(&str, &str)]) -> Vec<String> {
         // "kind mode size mtime name"
         names.iter()
