@@ -1,6 +1,6 @@
 // build.rs — discover every static lib produced by the cmake build and
-// emit cargo link directives. Order is auto-resolved by the host
-// linker (macOS ld is smart; Linux ld gets --start-group/--end-group).
+// emit cargo link directives. macOS's ld resolves any order; GNU ld reads
+// an archive once, and these name each other, so Linux puts them in a group.
 //
 // The set of libs is the same set the cmake `stratum` INTERFACE
 // library aggregates (CMakeLists.txt :211), plus the four cmd
@@ -73,33 +73,39 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
 
-    // On Linux, wrap the lib list in --start-group/--end-group so the
-    // linker can resolve circular deps between libstm_* libs. macOS
-    // ld auto-resolves; no need for the wrapping there.
+    // rustc places its own -l flags before every link-arg, so a group can only
+    // hold libraries given as link-args, and what they need must follow it.
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let needs_group = matches!(target_os.as_str(), "linux" | "android" | "freebsd");
     if needs_group {
         println!("cargo:rustc-link-arg=-Wl,--start-group");
-    }
-    for lib in &lib_names {
-        println!("cargo:rustc-link-lib=static={lib}");
-    }
-    if needs_group {
+        for lib in &lib_names {
+            println!("cargo:rustc-link-arg=-l:lib{lib}.a");
+        }
         println!("cargo:rustc-link-arg=-Wl,--end-group");
+    } else {
+        for lib in &lib_names {
+            println!("cargo:rustc-link-lib=static={lib}");
+        }
     }
 
-    // System deps mirror what the cmake `stratum` aggregate pulls in.
+    // What the cmake `stratum` aggregate pulls in, in the configuration it was built with.
+    let cache = fs::read_to_string(build_dir.join("CMakeCache.txt")).unwrap_or_default();
+    pkgconfig_link("libsodium", needs_group).expect("libsodium not found via pkg-config");
+    if target_os == "linux" && cache.contains("STM_ENABLE_IOURING:BOOL=ON") {
+        pkgconfig_link("liburing", needs_group).expect("liburing not found via pkg-config");
+    }
+    if cache.contains("LIBOQS_FOUND:INTERNAL=1") {
+        pkgconfig_link("liboqs", needs_group).expect("liboqs not found via pkg-config");
+    }
     if target_os == "linux" {
-        println!("cargo:rustc-link-lib=dylib=pthread");
-        println!("cargo:rustc-link-lib=dylib=dl");
-        println!("cargo:rustc-link-lib=dylib=m");
+        // libc again: on aarch64 the stack protector's guard is in ld.so, which
+        // libc's linker script names only as needed, after what asks for it. libgcc
+        // for gcc's outlined atomics, since rustc links with -nodefaultlibs.
+        for lib in ["pthread", "dl", "m", "c", "gcc"] {
+            println!("cargo:rustc-link-arg=-l{lib}");
+        }
     }
-    // libsodium is required by libstm_crypto. The cmake build uses
-    // pkg-config; we mirror that so cargo can find it on macOS
-    // (Homebrew default) + Linux (system / pkg-config).
-    pkgconfig_link("libsodium").expect("libsodium not found via pkg-config");
-
-    // Re-run if any .a changes.
 
     // Re-run if any .a changes.
     for dir in &search_dirs {
@@ -129,7 +135,7 @@ fn parse_static_lib_name(f: &str) -> Option<String> {
 
 /// Invoke `pkg-config --cflags --libs <name>` and emit cargo link
 /// directives. Returns Ok(()) on success.
-fn pkgconfig_link(name: &str) -> Result<(), String> {
+fn pkgconfig_link(name: &str, after_group: bool) -> Result<(), String> {
     use std::process::Command;
     let out = Command::new("pkg-config")
         .args(["--libs", name])
@@ -146,7 +152,11 @@ fn pkgconfig_link(name: &str) -> Result<(), String> {
         if let Some(rest) = tok.strip_prefix("-L") {
             println!("cargo:rustc-link-search=native={rest}");
         } else if let Some(rest) = tok.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib=dylib={rest}");
+            if after_group {
+                println!("cargo:rustc-link-arg=-l{rest}");
+            } else {
+                println!("cargo:rustc-link-lib=dylib={rest}");
+            }
         }
     }
     Ok(())
