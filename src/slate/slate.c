@@ -392,6 +392,9 @@ typedef struct {
      * (parity with cursor cap; selection over invisible entries
      * makes no sense). */
     uint8_t  selection[SLATE_SELECTION_BYTES];
+    /* The names in the last listing rendered, in order, as one number: what
+     * those indices mean. listing_names_hash. */
+    uint64_t listing_hash;
     /* SLATE-4a entries-count cache: latest count of rendered
      * entries from panel_entries_render, INCLUDING the synthesized
      * ".." entry (which sits at index 0 when path != "/"). The
@@ -2580,6 +2583,28 @@ static stm_status walk_to_cwd(stm_9p_client *bc, const char *cwd,
  * out_count receives the rendered entries count (including the
  * synthetic "..") and is cached into panel.entries_count by the
  * caller for cursor-clamp defense-in-depth. */
+/* FNV-1a over a rendered listing's names, in order. Sizes and times are left out:
+ * a file growing does not change what an index means. A line is
+ * "type mode size mtime name\n", and a rendered name has no newline. */
+static uint64_t listing_names_hash(const uint8_t *body, uint32_t len)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    uint32_t i = 0u;
+    while (i < len) {
+        for (int spaces = 0; i < len && spaces < 4; i++) {
+            if (body[i] == ' ') spaces++;
+        }
+        for (; i < len; i++) {
+            h = (h ^ body[i]) * 0x100000001b3ULL;
+            if (body[i] == '\n') {
+                i++;
+                break;
+            }
+        }
+    }
+    return h;
+}
+
 static stm_status panel_entries_render(stm_slate *s, int panel_idx,
                                             const char *cwd,
                                             uint8_t **out_buf, uint32_t *out_len,
@@ -3326,6 +3351,15 @@ static stm_status lopen_panel_entries(stm_slate *s, uint32_t fid,
      * == 0 (empty dir) so a fresh-disconnect → fresh-attach sequence
      * forgets stale counts from before. */
     s->panel[panel_idx].entries_count = entries_count;
+    /* A selection is indices into a listing, and listing order is whatever the
+     * backend yields, so once the names change they mean other files, and F8
+     * would delete those. A change made elsewhere loses the marks, which is the
+     * safe way round. */
+    uint64_t names = listing_names_hash(body, body_len);
+    if (names != s->panel[panel_idx].listing_hash) {
+        memset(s->panel[panel_idx].selection, 0, sizeof s->panel[panel_idx].selection);
+        s->panel[panel_idx].listing_hash = names;
+    }
     pthread_mutex_unlock(&s->mu);
     return STM_OK;
 }

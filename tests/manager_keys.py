@@ -1005,6 +1005,65 @@ def volume_copy_legs(stratum, root):
         os.chmod(f'{host}/overfile.txt', 0o644)
 
 
+def selection_legs(stratum, root):
+    """A selection is indices, so a listing that changes under it must not leave them pointing at other files."""
+    w = f'{root}/sel'
+    os.makedirs(w)
+    files = ['onefile.txt', 'twofile.txt', 'threefile.txt']
+    for name in files:
+        spit(f'{w}/{name}', name.encode())
+    names = files + ['madedir']
+
+    # The control, one variable away: with the listing unchanged the mark stays and F8 acts on it.
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        term.expect(r'onefile\.txt', timeout=30)
+        term.pump(0.5)
+        pick(term, 'twofile.txt', names)
+        term.send(b' ')
+        term.pump(1.0)
+        term.send(F8)
+        term.expect(r'Delete 1 items')
+        term.show('F8 with a mark and the same listing')
+        print('ok: a mark survives while the listing stays the same', flush=True)
+        term.send(ENTER)
+        term.pump(0.3)
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        term.expect(r'onefile\.txt', timeout=30)
+        term.pump(0.5)
+        pick(term, 'twofile.txt', names)
+        term.send(b' ')
+        term.pump(0.5)
+        term.send(F7)
+        term.expect(r'New directory name')
+        term.send(b'madedir' + ENTER)
+        term.expect(r'madedir', timeout=30)
+        term.pump(1.0)
+        term.send(F8)
+        term.expect(r'Delete')
+        term.show('F8 after the listing changed under a mark')
+        text = term.screen.text()
+        record('Delete this' in text and 'items' not in text,
+               'a mark does not outlive the listing it was made in',
+               'F8 still acted on a mark made in an older listing')
+        term.send(ENTER)
+        term.pump(0.3)
+        left = sorted(n for n in os.listdir(w))
+        record(left == sorted(names), 'answering No deleted nothing', f'after No the directory holds {left}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+
 def run(stratum, root):
     host = f'{root}/host'
     tree = f'{host}/tree'
@@ -1112,7 +1171,8 @@ def run(stratum, root):
         vol.stop()
 
     # One leg's failure must not hide what the rest would have shown.
-    for leg, args in ((host_copy_refusals, (stratum, root)),
+    for leg, args in ((selection_legs, (stratum, root)),
+                      (host_copy_refusals, (stratum, root)),
                       (host_copy_legs, (stratum, root)),
                       (volume_copy_legs, (stratum, root)),
                       (death_legs, (stratum, vol, host, root)),
