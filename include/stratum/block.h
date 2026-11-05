@@ -183,6 +183,9 @@ stm_status stm_bdev_resize(stm_bdev *d, uint64_t new_size);
  */
 stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd);
 
+/* The size a disk reports for itself, or 0 where fd is not one. */
+uint64_t stm_bdev_device_bytes(int fd);
+
 /* ========================================================================= */
 /* Asynchronous ops                                                           */
 /* ========================================================================= */

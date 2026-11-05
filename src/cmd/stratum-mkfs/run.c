@@ -278,12 +278,23 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
         return 1;
     }
     if (look >= 0) {
+        struct stat st;
+        bool is_file = fstat(look, &st) == 0 && S_ISREG(st.st_mode);
+#if !defined(__thylacine__)
+        /* Nothing ends /dev/zero for the scan, and a format could not size it. */
+        if (!is_file && stm_bdev_device_bytes(look) == 0) {
+            fprintf(stderr, "stratum-mkfs: %s is neither a file nor a disk\n", image_path);
+            return 1;
+        }
+#endif
+        if (!is_file && !force) {
+            fprintf(stderr, "stratum-mkfs: reading %s to see that it is empty; "
+                            "--force skips this\n", image_path);
+        }
         bool holds = false;
         bool read_ok = force || image_holds_data(look, &holds);
         int e = errno;
-        struct stat st;
-        bool too_big = fstat(look, &st) == 0 && S_ISREG(st.st_mode) &&
-                       (uint64_t)st.st_size > device_bytes;
+        bool too_big = is_file && (uint64_t)st.st_size > device_bytes;
         if (look != fd) close(look);
         if (!read_ok) {
             fprintf(stderr, "stratum-mkfs: cannot read %s: %s\n", image_path, strerror(e));

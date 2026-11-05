@@ -14,6 +14,12 @@
 #include <unistd.h>
 #if !defined(__thylacine__)
 #  include <sys/file.h>
+#  include <sys/ioctl.h>
+#  if defined(__APPLE__)
+#    include <sys/disk.h>
+#  elif defined(__linux__)
+#    include <linux/fs.h>
+#  endif
 #endif
 
 stm_bdev_open_opts stm_bdev_open_opts_default(void)
@@ -175,6 +181,24 @@ bool stm_bdev_barrier_defer_armed(const stm_bdev *d)
 {
     return d && atomic_load_explicit(&d->barrier_defer, memory_order_relaxed);
 }
+
+#if !defined(__thylacine__)
+uint64_t stm_bdev_device_bytes(int fd)
+{
+#if defined(__APPLE__)
+    uint32_t blk = 0;
+    uint64_t cnt = 0;
+    if (ioctl(fd, DKIOCGETBLOCKSIZE, &blk) == 0 && ioctl(fd, DKIOCGETBLOCKCOUNT, &cnt) == 0)
+        return (uint64_t)blk * cnt;
+#elif defined(__linux__)
+    uint64_t bytes = 0;
+    if (ioctl(fd, BLKGETSIZE64, &bytes) == 0) return bytes;
+#else
+    (void)fd;
+#endif
+    return 0;
+}
+#endif
 
 stm_status stm_bdev_claim_image(const char *path, bool create, int *out_fd)
 {

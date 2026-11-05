@@ -170,6 +170,23 @@ else
 fi
 [ "$(cksum < "$V.key")" = "$kh" ] && ok "that refusal kept the key" || no "a format that could not run replaced the key"
 [ "$(cksum < "$V")" = "$vh" ] && ok "that refusal kept the volume" || no "a format that could not run changed the volume"
+
+# Nothing ends /dev/zero, so a scan would read it for ever, and a format could not size it.
+perl -e 'alarm 30; exec @ARGV' "$B" mkfs /dev/zero --size 64M --force --keyfile "$D/zero.key" > "$D/zero.log" 2>&1
+rc=$?
+if LC_ALL=C grep -q 'neither a file nor a disk' "$D/zero.log" && [ "$rc" != 0 ]; then
+    ok "a device nothing can size is refused, and says why"
+else
+    no "mkfs on /dev/zero, rc=$rc: $(tail -1 "$D/zero.log")"
+fi
+perl -e 'alarm 30; exec @ARGV' "$B" mkfs /dev/zero --size 64M --keyfile "$D/zero.key" > "$D/zero2.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ] && [ "$rc" != 142 ]; then
+    ok "that refusal does not wait on a scan first"
+else
+    no "mkfs on /dev/zero without --force, rc=$rc: $(tail -1 "$D/zero2.log")"
+fi
+[ ! -e "$D/zero.key" ] && ok "those refusals made no key" || no "a refused format on /dev/zero made a key"
 # Past the size check a format can still fail, and the key it would have replaced has to be there afterwards.
 if printf '%s\n' other | "$B" mkfs "$V" --size 9000000000G --force --passphrase-stdin > "$D/again.log" 2>&1; then
     no "an impossible size over a volume answered success"

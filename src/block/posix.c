@@ -502,18 +502,7 @@ static const struct stm_bdev_ops g_posix_ops = {
 static uint64_t query_size(int fd, const struct stat *st)
 {
     if ((st->st_mode & S_IFMT) == S_IFREG) return (uint64_t)st->st_size;
-
-#if defined(__APPLE__)
-    uint64_t blk = 0, cnt = 0;
-    if (ioctl(fd, DKIOCGETBLOCKSIZE, &blk) == 0 &&
-        ioctl(fd, DKIOCGETBLOCKCOUNT, &cnt) == 0)
-        return blk * cnt;
-#elif defined(__linux__)
-    uint64_t bytes = 0;
-    if (ioctl(fd, BLKGETSIZE64, &bytes) == 0) return bytes;
-#endif
-    (void)fd;
-    return 0;
+    return stm_bdev_device_bytes(fd);
 }
 
 static uint32_t query_block_size(int fd, const struct stat *st)
