@@ -1442,19 +1442,28 @@ def delete_batch_legs(stratum, root):
     dirs = ['bulkone', 'bulktwo']
     held = ['heldone', 'heldtwo']
     names = ['bulkzero'] + dirs + held
-    for d in names:
+
+    def fill(d, n):
         os.makedirs(f'{w}/{d}')
-        for i in range(many):
-            open(f'{w}/{d}/f{i:05d}', 'wb').close()
+        for i in range(n):
+            open(f'{w}/{d}/f{i:06d}', 'wb').close()
+
+    # The bare Esc leg needs an item to outlast a key's trip through the loop: grow its
+    # items until deleting one is measured to take that long here.
+    bare = many
+    while True:
+        fill('calib', bare)
+        t0 = time.monotonic()
+        shutil.rmtree(f'{w}/calib')
+        item_s = time.monotonic() - t0
+        if item_s >= 1.5 or bare >= 16 * many:
+            break
+        bare *= 2
+    print(f'note: deleting {bare} files takes {item_s:.2f} s here', flush=True)
+    count = {d: bare if d in dirs else many for d in names}
+    for d in names:
+        fill(d, count[d])
     asked = r'held while this shows'
-    # The bare Esc leg needs an item to outlast a key's trip through the loop.
-    os.makedirs(f'{w}/calib')
-    for i in range(many):
-        open(f'{w}/calib/f{i:05d}', 'wb').close()
-    t0 = time.monotonic()
-    shutil.rmtree(f'{w}/calib')
-    item_s = time.monotonic() - t0
-    print(f'note: deleting {many} files takes {item_s:.2f} s here', flush=True)
 
     def start_delete(term, chosen):
         term.expect(re.escape(chosen[0]), timeout=30)
@@ -1470,7 +1479,7 @@ def delete_batch_legs(stratum, root):
         term.send(ENTER)
         # Once an item is under way: before that, Esc stops a batch with nothing running.
         end = time.monotonic() + 30
-        while time.monotonic() < end and all(files_left(f'{w}/{d}') == many for d in chosen):
+        while time.monotonic() < end and all(files_left(f'{w}/{d}') == count[d] for d in chosen):
             time.sleep(0.01)
 
     def asks(term):
@@ -1506,7 +1515,7 @@ def delete_batch_legs(stratum, root):
         term.expect(r'Delete: \d+ deleted', timeout=120)
         term.show('after Esc mid-delete')
         m = re.search(r'Delete: (\d+) deleted', term.screen.text())
-        intact = [d for d in dirs if files_left(f'{w}/{d}') == many]
+        intact = [d for d in dirs if files_left(f'{w}/{d}') == count[d]]
         if item_s < 1.0:
             print(f'note: an item here may end before Esc is read; intact {intact}, proves nothing', flush=True)
         else:
@@ -1530,7 +1539,7 @@ def delete_batch_legs(stratum, root):
             term.send(ESC)
             term.expect(r'Delete: \d+ deleted', timeout=120)
             term.show('after Ctrl-C and one Esc mid-delete')
-            intact = [d for d in held if files_left(f'{w}/{d}') == many]
+            intact = [d for d in held if files_left(f'{w}/{d}') == count[d]]
             record(len(intact) == 1, 'one Esc on the question Ctrl-C asks stops the delete after the item in hand',
                    f'after Ctrl-C and one Esc, the intact directories are {intact}')
     except Failure:

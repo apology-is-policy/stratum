@@ -102,7 +102,9 @@ STM_TEST(host_fs_walks_more_files_than_its_names_fit)
     char rel[64];
     for (int i = 0; i < FILES; i++) {
         snprintf(rel, sizeof rel, "many/f%d", i);
-        if (!put(&f, rel, "")) { STM_ASSERT_TRUE(!"put"); break; }
+        bool made = put(&f, rel, "");
+        STM_ASSERT_TRUE(made);
+        if (!made) break;
     }
     uint64_t root = stm_host_fs_root(f.h), many = 0, q = 0;
     STM_ASSERT_OK(walk(&f, root, "many", &many));
