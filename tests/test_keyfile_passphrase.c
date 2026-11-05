@@ -117,4 +117,57 @@ STM_TEST(kfp1_tampered_ciphertext_returns_ebadtag)
     unlink(TMP);
 }
 
+/* A link at a key's name would hand the key to whoever planted it. */
+STM_TEST(keyfile_generate_refuses_a_link_at_its_name)
+{
+    char link_path[256], target[256];
+    snprintf(link_path, sizeof link_path, "%s.link", TMP);
+    snprintf(target, sizeof target, "%s.target", TMP);
+    unlink(link_path);
+    unlink(target);
+    STM_ASSERT_EQ(symlink(target, link_path), 0);
+    STM_ASSERT_EQ(stm_keyfile_generate(link_path), STM_EBACKEND);
+    STM_ASSERT_EQ(stm_keyfile_generate_passphrase(link_path, "pw", 2), STM_EBACKEND);
+    struct stat st;
+    STM_ASSERT(lstat(target, &st) != 0);
+    unlink(link_path);
+}
+
+/* A file found at the name is made private: open's mode reaches only a file it creates. */
+STM_TEST(keyfile_generate_over_a_readable_file_makes_it_private)
+{
+    unlink(TMP);
+    int fd = open(TMP, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    STM_ASSERT(fd >= 0);
+    STM_ASSERT_EQ(write(fd, "an older and longer file than a key", 35), 35);
+    STM_ASSERT_EQ(fchmod(fd, 0644), 0);
+    close(fd);
+    STM_ASSERT_OK(stm_keyfile_generate(TMP));
+    struct stat st;
+    STM_ASSERT_EQ(stat(TMP, &st), 0);
+    STM_ASSERT_EQ(st.st_mode & 0777, 0600);
+    stm_hybrid_keys k = {0};
+    STM_ASSERT_OK(stm_keyfile_load(TMP, &k));
+    unlink(TMP);
+}
+
+/* What the caller made exclusively is what receives the key, in either form. */
+STM_TEST(keyfile_generate_fd_writes_a_loadable_key)
+{
+    unlink(TMP);
+    int fd = open(TMP, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    STM_ASSERT(fd >= 0);
+    STM_ASSERT_OK(stm_keyfile_generate_fd(fd));
+    close(fd);
+    stm_hybrid_keys k = {0};
+    STM_ASSERT_OK(stm_keyfile_load(TMP, &k));
+    unlink(TMP);
+    fd = open(TMP, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    STM_ASSERT(fd >= 0);
+    STM_ASSERT_OK(stm_keyfile_generate_passphrase_fd(fd, "pw", 2));
+    close(fd);
+    STM_ASSERT_OK(stm_keyfile_load_passphrase(TMP, "pw", 2, &k));
+    unlink(TMP);
+}
+
 STM_TEST_MAIN("keyfile_passphrase")

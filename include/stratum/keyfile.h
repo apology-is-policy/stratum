@@ -88,6 +88,15 @@ STM_MUST_USE
 stm_status stm_keyfile_generate(const char *path);
 
 /*
+ * As stm_keyfile_generate, into `fd`: an open, writable file that the caller made and
+ * closes. A file made O_EXCL and written through its own descriptor cannot be swapped
+ * for another between the making and the writing. The path form refuses a symlink at
+ * `path`; both make the file 0600.
+ */
+STM_MUST_USE
+stm_status stm_keyfile_generate_fd(int fd);
+
+/*
  * Load an UNENCRYPTED keyfile from `path` into `out`.
  *
  * Returns STM_EBADVERSION on magic/version mismatch (including v2
@@ -115,6 +124,12 @@ STM_MUST_USE
 stm_status stm_keyfile_generate_passphrase(const char *path,
                                               const char *passphrase,
                                               size_t      pass_len);
+
+/* As stm_keyfile_generate_passphrase, into `fd`; see stm_keyfile_generate_fd. */
+STM_MUST_USE
+stm_status stm_keyfile_generate_passphrase_fd(int         fd,
+                                                 const char *passphrase,
+                                                 size_t      pass_len);
 
 /*
  * Load a passphrase-encrypted keyfile (KFP1 magic) from `path`,

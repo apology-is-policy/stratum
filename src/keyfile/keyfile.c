@@ -41,9 +41,37 @@ static uint32_t load_u32_le(const uint8_t in[4])
          | ((uint32_t)in[3] << 24);
 }
 
+/* By name, a key file is opened only where a file can be: a link at the name is
+ * refused rather than followed. */
+static int open_key_for_writing(const char *path)
+{
+    return open(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR);
+}
+
+/* The key replaces what the file held, and a file found at the name is made private
+ * first: open's mode reaches only a file it creates. */
+static int put_key(int fd, const uint8_t *buf, size_t len)
+{
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0 || ftruncate(fd, 0) != 0 ||
+        lseek(fd, 0, SEEK_SET) != 0)
+        return -1;
+    if (write_full(fd, buf, len) < 0 || fsync(fd) < 0) return -1;
+    return 0;
+}
+
 stm_status stm_keyfile_generate(const char *path)
 {
     if (!path) return STM_EINVAL;
+    int fd = open_key_for_writing(path);
+    if (fd < 0) return STM_EBACKEND;
+    stm_status s = stm_keyfile_generate_fd(fd);
+    close(fd);
+    return s;
+}
+
+stm_status stm_keyfile_generate_fd(int fd)
+{
+    if (fd < 0) return STM_EINVAL;
     stm_status s = stm_crypto_init();
     if (s != STM_OK) return s;
 
@@ -61,37 +89,10 @@ stm_status stm_keyfile_generate(const char *path)
     memcpy(buf + 8,                              kp.pk, STM_HYBRID_PK_LEN);
     memcpy(buf + 8 + STM_HYBRID_PK_LEN,          kp.sk, STM_HYBRID_SK_LEN);
 
-    /* Create the file mode 0600 — never group- or world-readable. */
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-    if (fd < 0) {
-        stm_ct_memzero(buf, sizeof buf);
-        stm_hybrid_keys_wipe(&kp);
-        return STM_EBACKEND;
-    }
-
-    size_t written = 0;
-    while (written < sizeof buf) {
-        ssize_t n = write(fd, buf + written, sizeof buf - written);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            close(fd);
-            stm_ct_memzero(buf, sizeof buf);
-            stm_hybrid_keys_wipe(&kp);
-            return STM_EBACKEND;
-        }
-        written += (size_t)n;
-    }
-    if (fsync(fd) < 0) {
-        close(fd);
-        stm_ct_memzero(buf, sizeof buf);
-        stm_hybrid_keys_wipe(&kp);
-        return STM_EBACKEND;
-    }
-    close(fd);
-
+    s = put_key(fd, buf, sizeof buf) == 0 ? STM_OK : STM_EBACKEND;
     stm_ct_memzero(buf, sizeof buf);
     stm_hybrid_keys_wipe(&kp);
-    return STM_OK;
+    return s;
 }
 
 stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out)
@@ -217,6 +218,18 @@ stm_status stm_keyfile_generate_passphrase(const char *path,
                                               size_t      pass_len)
 {
     if (!path || !passphrase || pass_len == 0) return STM_EINVAL;
+    int fd = open_key_for_writing(path);
+    if (fd < 0) return STM_EBACKEND;
+    stm_status s = stm_keyfile_generate_passphrase_fd(fd, passphrase, pass_len);
+    close(fd);
+    return s;
+}
+
+stm_status stm_keyfile_generate_passphrase_fd(int         fd,
+                                                 const char *passphrase,
+                                                 size_t      pass_len)
+{
+    if (fd < 0 || !passphrase || pass_len == 0) return STM_EINVAL;
 
     stm_status s = stm_crypto_init();
     if (s != STM_OK) return s;
@@ -303,25 +316,11 @@ stm_status stm_keyfile_generate_passphrase(const char *path,
     stm_ct_memzero(ct, ct_len_max);
     free(ct);
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-    if (fd < 0) {
-        stm_ct_memzero(buf, total);
-        free(buf);
-        stm_hybrid_keys_wipe(&kp);
-        return STM_EBACKEND;
-    }
-    if (write_full(fd, buf, total) < 0 || fsync(fd) < 0) {
-        close(fd);
-        stm_ct_memzero(buf, total);
-        free(buf);
-        stm_hybrid_keys_wipe(&kp);
-        return STM_EBACKEND;
-    }
-    close(fd);
+    s = put_key(fd, buf, total) == 0 ? STM_OK : STM_EBACKEND;
     stm_ct_memzero(buf, total);
     free(buf);
     stm_hybrid_keys_wipe(&kp);
-    return STM_OK;
+    return s;
 }
 
 stm_status stm_keyfile_load_passphrase(const char *path,

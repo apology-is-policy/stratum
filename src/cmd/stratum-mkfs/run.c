@@ -328,7 +328,8 @@ static int take_key_name(const char *from, const char *to, bool force)
         (void)unlink(from);
         return 0;
     }
-    bool no_links = errno == EPERM || errno == ENOTSUP || errno == EXDEV || errno == EMLINK;
+    bool no_links = errno == EPERM || errno == ENOTSUP || errno == EXDEV || errno == EMLINK ||
+                    errno == ENOSYS;
 #if defined(EOPNOTSUPP) && EOPNOTSUPP != ENOTSUP
     no_links = no_links || errno == EOPNOTSUPP;
 #endif
@@ -582,13 +583,15 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             exit_code = 1;
             goto cleanup;
         }
-        close(tfd);
         temp_key_made = true;
         fprintf(stderr, "stratum-mkfs: the new key is at %s until the format is done\n",
                 new_key_path);
+        /* Through the descriptor that made the file: a name swapped since then does not
+         * receive the key. */
         stm_status ks = have_pass
-            ? stm_keyfile_generate_passphrase(new_key_path, passbuf, plen)
-            : stm_keyfile_generate(new_key_path);
+            ? stm_keyfile_generate_passphrase_fd(tfd, passbuf, plen)
+            : stm_keyfile_generate_fd(tfd);
+        close(tfd);
         if (ks != STM_OK) {
             fprintf(stderr, "stratum-mkfs: cannot write a new key at %s: status=%d\n",
                     new_key_path, (int)ks);
