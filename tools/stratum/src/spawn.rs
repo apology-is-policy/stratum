@@ -41,6 +41,26 @@ pub enum BackendMeta {
     None,
 }
 
+/// TERM, then KILL only after a daemon has had time to unmount: its last commit
+/// happens on the way out, so a kill there loses what that commit would have
+/// made durable.
+pub fn stop_child(child: &mut Child, name: &str) {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    eprintln!("stratum: {name} didn't exit on SIGTERM; SIGKILL");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 pub struct SpawnCtx {
     /// Session directory under which all sockets live.
     pub session_dir: PathBuf,
@@ -332,11 +352,7 @@ impl SpawnCtx {
     pub fn teardown(&self) {
         let mut children = self.children.lock().unwrap();
         for c in children.iter_mut() {
-            let _ = c.kill();
-        }
-        // Reap.
-        for c in children.iter_mut() {
-            let _ = c.wait();
+            stop_child(c, "daemon");
         }
         children.clear();
     }

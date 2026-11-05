@@ -430,11 +430,11 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     };
 
     spawn_ctx.teardown();
-    teardown_child(&mut slate_child, "slate");
+    crate::spawn::stop_child(&mut slate_child, "slate");
     if let Some(mut c) = stratumd_child {
-        teardown_child(&mut c, "stratumd");
+        crate::spawn::stop_child(&mut c, "stratumd");
     }
-    teardown_child(&mut host_fs_child, "host-fs");
+    crate::spawn::stop_child(&mut host_fs_child, "host-fs");
     let _ = cleanup_session_dir(&session_dir);
 
     result
@@ -604,21 +604,3 @@ fn wait_for_sock(path: &Path, timeout: Duration) -> Result<()> {
     bail!("timeout waiting for {}", path.display())
 }
 
-fn teardown_child(child: &mut Child, name: &str) {
-    // SIGTERM first, give it 1s, then SIGKILL.
-    let pid = child.id() as i32;
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(_) => break,
-        }
-    }
-    eprintln!("stratum: {name} didn't exit on SIGTERM; SIGKILL");
-    let _ = child.kill();
-    let _ = child.wait();
-}

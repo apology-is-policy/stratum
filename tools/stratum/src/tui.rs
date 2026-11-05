@@ -321,15 +321,21 @@ fn stop_on_term_and_hup() {
     }
 }
 
-/// With the terminal gone, a poll answers at once and finds no key, so without
-/// this a manager whose HUP is ignored spins for ever, holding its daemons up.
-fn should_stop(tty: Option<i32>) -> bool {
-    if ASKED_TO_STOP.load(Ordering::Relaxed) {
-        return true;
-    }
-    let Some(fd) = tty else { return false };
-    let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
-    unsafe { libc::tcgetattr(fd, &mut attrs) != 0 }
+/// Once its terminal has gone, crossterm's read loop never returns: it answers a
+/// read error by reading again, at full CPU, so the input loop cannot notice this
+/// or anything else. Ending the process is the way out, and the daemons follow it
+/// on their lifeline.
+fn exit_when_terminal_goes(tty: i32, session_dir: Option<PathBuf>) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(200));
+        let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(tty, &mut attrs) } != 0 {
+            if let Some(dir) = &session_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            std::process::exit(129);
+        }
+    });
 }
 
 pub fn run(opts: Opts) -> Result<()> {
@@ -403,7 +409,9 @@ fn run_ui(
     spawn: Option<Arc<SpawnCtx>>,
 ) -> Result<()> {
     stop_on_term_and_hup();
-    let tty = [0, 1, 2].into_iter().find(|&fd| unsafe { libc::isatty(fd) } == 1);
+    if let Some(tty) = [0, 1, 2].into_iter().find(|&fd| unsafe { libc::isatty(fd) } == 1) {
+        exit_when_terminal_goes(tty, spawn.as_ref().map(|s| s.session_dir.clone()));
+    }
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
@@ -753,7 +761,7 @@ fn run_ui(
                         _ => {}
                     }
                 }
-                if should_stop(tty) {
+                if ASKED_TO_STOP.load(Ordering::Relaxed) {
                     return Ok(());
                 }
                 // SWISS-4h: tick the main loop so a batch in progress
