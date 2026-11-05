@@ -27,7 +27,7 @@ no() { echo "FAIL: $*"; BAD=1; }
 
 serve() {
     rm -f "$S"
-    printf '%s\n' "$1" | "$B" serve "$V" --listen "$S" --passphrase-stdin > "$D/serve.log" 2>&1 &
+    printf '%s\n' "$1" | "$B" serve "$V" --listen "$S" --keyfile "$V.key" --passphrase-stdin > "$D/serve.log" 2>&1 &
     SP=$!
     for _ in $(seq 1 100); do
         [ -S "$S" ] && return 0

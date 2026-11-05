@@ -80,6 +80,7 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 | T0.27 | **`O_APPEND` is not atomic.** The 9P server reads the size and then writes there, so two appenders overwrite each other. The code's own comment says so | Read | Open |
 | T0.28 | **Deleting an open file loses it.** I/O on an unlinked fid answers ENOENT, by design in `fid.tla`. POSIX keeps the file until the last close, and real software relies on that, including scratch files in SQLite and Python. Seen on a Thylacine guest, where `tmpfile()` has a workaround | Seen | **Decided:** keep the inode until the last clunk, on the orphan state anonymous inodes already have, and free it at mount after a crash. A file replaced by rename gets the same. `fid.tla` changes first |
 | T0.29 | **Linux: the io_uring completion queue is drained by every waiting thread with no lock,** and `AUTO` picks io_uring wherever it is built. A completion can be taken twice or dispatched to the wrong thread. It may explain some of the Linux reds in T1.1, which is a hypothesis | Read | Open |
+| T0.30 | **The manager's admin commands are refused.** Since `320d250` the `/ctl` admin must be named with `--admin-uid`, and the manager never names it, so snapshot create answers EACCES, and by reading so does every other admin verb behind `F9`. Two of the manager's own tests are red for this, and CI does not run them | Seen | Open |
 
 ### Security to establish, then decide
 
@@ -213,6 +214,7 @@ Stratum as a modern alternative to VeraCrypt: a file-based volume and a manager 
 | T5.8 | Warn on rollback: remember the highest generation beside the keyfile or in the recents, and say so when a volume comes back older | S |
 | T5.9 | A fully static binary (libsodium links dynamically today) and a post-quantum build as the default package | S |
 | T5.10 | Remove `tui/`, `tools/stratum-slate-tty` and `run.sh`'s use of them, if the decision goes that way | S |
+| T5.11 | `stratum serve` with no key source answers only `run failed (rc=-22)`, and should find `<volume>.key` or say what is missing. The hint `stratum mkfs` prints has the wrong command and option form | S |
 
 ---
 

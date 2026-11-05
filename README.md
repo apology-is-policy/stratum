@@ -27,7 +27,7 @@ In the manager, `F5` copies between the host and the volume, `F7` makes a direct
 `F9` handles snapshots. To script the same thing, serve the volume and talk to its socket:
 
 ```
-dist/stratum serve vault.stm --listen /tmp/vault.sock --passphrase-stdin
+dist/stratum serve vault.stm --listen /tmp/vault.sock --keyfile vault.stm.key --passphrase-stdin
 dist/stratum fs -s /tmp/vault.sock put ./photos /photos
 dist/stratum fs -s /tmp/vault.sock ls /photos
 ```
