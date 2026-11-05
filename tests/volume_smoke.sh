@@ -46,6 +46,20 @@ stop() {
     [ "$rc" = 0 ] || no "the daemon exited $rc on TERM"
 }
 F() { "$B" fs -s "$S" "$@"; }
+# A daemon that has to stop by itself. Its log is $1, the passphrase on its stdin $2. A hang is a finding, not a wait.
+refused() {
+    log=$1; pass=$2; shift 2
+    printf '%s\n' "$pass" | "$B" serve "$@" > "$log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 300); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        return 1
+    fi
+    wait "$pid"
+    [ $? != 0 ]
+}
 
 mkdir -p "$D/host/deep/er"
 printf '%s one\n' "$MARK" > "$D/host/a.txt"
@@ -223,7 +237,40 @@ else
     ok "wrong passphrase refused"
     wait "$SP" 2>/dev/null
     SP=
+    LC_ALL=C grep -q 'stratumd: wrong passphrase for ' "$D/serve.log" && ok "the wrong passphrase is called that" \
+        || no "the wrong passphrase was not called that: $(tail -2 "$D/serve.log" | head -1)"
 fi
+
+# The control for that line: the right passphrase for a key that opens some other volume is not a wrong passphrase.
+if refused "$D/wrongkey.log" other "$V" --listen "$S" --keyfile "$D/late.stm.key" --passphrase-stdin; then
+    if LC_ALL=C grep -q 'wrong passphrase' "$D/wrongkey.log"; then
+        no "another volume's key was called a wrong passphrase"
+    elif LC_ALL=C grep -q 'integrity check' "$D/wrongkey.log"; then
+        ok "another volume's key is not called a wrong passphrase"
+    else
+        no "another volume's key: $(tail -1 "$D/wrongkey.log")"
+    fi
+else
+    no "another volume's key opened it, or the daemon hung: $(tail -1 "$D/wrongkey.log")"
+fi
+
+# A key that is not one at all, and a name that is not there.
+if refused "$D/nokey2.log" x "$V" --listen "$S" --keyfile "$D/host/a.txt" --passphrase-stdin; then
+    LC_ALL=C grep -q 'cannot read' "$D/nokey2.log" && ok "a file that is no key is called that" || no "a file that is no key: $(tail -1 "$D/nokey2.log")"
+else
+    no "a file that is no key opened it, or the daemon hung: $(tail -1 "$D/nokey2.log")"
+fi
+if refused "$D/nokey3.log" x "$V" --listen "$S" --keyfile "$D/not-there" --passphrase-stdin; then
+    LC_ALL=C grep -q 'no such keyfile' "$D/nokey3.log" && ok "a missing key is called that" || no "a missing key: $(tail -1 "$D/nokey3.log")"
+else
+    no "a missing key opened it, or the daemon hung: $(tail -1 "$D/nokey3.log")"
+fi
+if refused "$D/typo.log" x "$D/typo.stm" --listen "$S" --keyfile "$V.key"; then
+    LC_ALL=C grep -q 'no such image' "$D/typo.log" && ok "a mistyped image is called that" || no "a mistyped image: $(tail -1 "$D/typo.log")"
+else
+    no "a mistyped image served, or the daemon hung: $(tail -1 "$D/typo.log")"
+fi
+[ ! -e "$D/typo.stm" ] && ok "a mistyped image leaves no file" || no "a mistyped image made a file"
 
 serve "$PASS" || { no "remount: $(tail -1 "$D/serve.log")"; exit 1; }
 for f in a.txt deep/er/b.txt big.bin; do

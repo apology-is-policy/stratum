@@ -25,6 +25,7 @@
 #include <stratum/crypto.h>
 #include <stratum/ctl.h>
 #include <stratum/fs.h>
+#include <stratum/keyfile.h>
 #include <stratum/lp9.h>
 #include <stratum/scrub.h>
 #include <stratum/sync.h>
@@ -1428,6 +1429,8 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
  * control-byte-free; --corvus-session-token-file required (a WRAP
  * needs a token); --read-only refused (provisioning writes);
  * --ctl-listen refused (one-shot, nothing to serve). */
+static stm_status image_must_exist(const char *path);
+
 static stm_status stratumd_run_provision(const stm_stratumd_opts *opts)
 {
     if (!opts->provision_dataset_name || !*opts->provision_dataset_name) {
@@ -1508,7 +1511,9 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts)
         .corvus_session_token_file = opts->corvus_session_token_file,
     };
     stm_fs *fs = NULL;
-    stm_status rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
+    stm_status rc = image_must_exist(opts->fs_path);
+    if (rc != STM_OK) return rc;
+    rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
     if (rc != STM_OK) {
         fprintf(stderr,
             "stratumd: provisioning: mount of %s failed (rc=%d)\n",
@@ -1619,11 +1624,58 @@ static stm_status image_lock(const char *path, int *out_fd)
         fprintf(stderr, "stratumd: already open in another stratumd: %s\n", path);
         return s;
     }
-    if (s != STM_OK && s != STM_ENOENT) { /* the mount reports a missing image */
+    if (s != STM_OK && s != STM_ENOENT) { /* a missing image: image_must_exist, once the options pass */
         fprintf(stderr, "stratumd: warning: cannot lock %s (%s), so nothing "
                         "stops a second daemon opening it\n", path, strerror(errno));
     }
     return STM_OK;
+}
+
+/* The block layer creates what it is asked to open, and an empty file at a mistyped name helps nobody. */
+static stm_status image_must_exist(const char *path)
+{
+#if !defined(__thylacine__)
+    struct stat st;
+    if (stat(path, &st) != 0 && errno == ENOENT) {
+        fprintf(stderr, "stratumd: no such image: %s\n", path);
+        return STM_ENOENT;
+    }
+#else
+    (void)path;
+#endif
+    return STM_OK;
+}
+
+/*
+ * A failed mount hands back one number, and the person at the other end needs to know
+ * whether to retype something. The key is loaded again only on the way out, so the
+ * second derivation costs nothing when the mount works.
+ */
+static void say_why_mount_failed(const stm_stratumd_opts *opts, stm_status rc)
+{
+    if (rc == STM_ENOENT && opts->keyfile_path && access(opts->keyfile_path, F_OK) != 0) {
+        fprintf(stderr, "stratumd: no such keyfile: %s\n", opts->keyfile_path);
+        return;
+    }
+    if (rc == STM_EBADVERSION || rc == STM_ERANGE) {
+        fprintf(stderr, "stratumd: cannot read %s or its keyfile: an unknown format, or a "
+                        "passphrase given for a key without one, or the reverse\n", opts->fs_path);
+        return;
+    }
+    if (rc != STM_EBADTAG) return;
+    if (opts->keyfile_path && opts->keyfile_passphrase) {
+        stm_hybrid_keys keys;
+        memset(&keys, 0, sizeof keys);
+        stm_status ks = stm_keyfile_load_passphrase(opts->keyfile_path, opts->keyfile_passphrase,
+                                                    opts->keyfile_passphrase_len, &keys);
+        stm_hybrid_keys_wipe(&keys);
+        if (ks == STM_EBADTAG) {
+            fprintf(stderr, "stratumd: wrong passphrase for %s\n", opts->keyfile_path);
+            return;
+        }
+    }
+    fprintf(stderr, "stratumd: %s failed its integrity check: the key does not open it, "
+                    "or it is damaged\n", opts->fs_path);
 }
 
 static stm_status stratumd_run_locked(const stm_stratumd_opts *opts);
@@ -1685,8 +1737,11 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
     };
 
     stm_fs *fs = NULL;
-    stm_status rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
+    stm_status rc = image_must_exist(opts->fs_path);
+    if (rc != STM_OK) return rc;
+    rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
     if (rc != STM_OK) {
+        say_why_mount_failed(opts, rc);
         if (rc == STM_ESERIAL && opts->bind_pool_serial) {
             /* TLY-A1: log the truncated observed serial + truncated
              * expected serial. Full values stay out of the public

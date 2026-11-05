@@ -291,12 +291,11 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             let _ = host_fs_child.kill();
             let _ = cleanup_session_dir(&session_dir);
             // Friendly message for the wrong-passphrase case.
-            let hint = if log_tail.contains("status=-201")
-                || log_tail.contains("EBADTAG")
-                || log_tail.contains("status=-202")
-                || log_tail.contains("EBADVERSION")
+            let hint = if log_tail
+                .lines()
+                .any(|l| l.trim_start().starts_with("stratumd: wrong passphrase for "))
             {
-                "  (most likely cause: WRONG PASSPHRASE for this volume)\n"
+                "  (WRONG PASSPHRASE for this volume)\n"
             } else {
                 ""
             };

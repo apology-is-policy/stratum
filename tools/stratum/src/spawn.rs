@@ -22,7 +22,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,9 @@ pub fn wait_for_daemon(child: &mut Child, sock: &Path) -> Result<()> {
         if let Ok(Some(status)) = child.try_wait() {
             bail!("stratumd stopped ({status})");
         }
+        if crate::tui::stop_requested() {
+            bail!("asked to stop");
+        }
         if started.elapsed() >= DAEMON_START {
             bail!("timed out waiting for {}", sock.display());
         }
@@ -62,22 +65,32 @@ pub fn wait_for_daemon(child: &mut Child, sock: &Path) -> Result<()> {
 }
 
 /// What a daemon's log says about why it did not start, for the person who asked.
-pub fn start_failure(log: &str) -> String {
-    // Its last line is only the wrapper's "run failed (rc=N)": the reason is above it.
-    let said = log
+/// Lines are told apart by how they begin, since a path in one could say anything.
+pub fn start_failure(log: &str) -> Option<String> {
+    const STARTING: [&str; 3] = [
+        "stratumd: serving ",
+        "stratumd: /ctl/ on ",
+        "stratumd: bound and ready",
+    ];
+    // Only the wrapper's number: the reason, when there is one, is above it.
+    const WRAPPER: &str = "stratumd: run failed (rc=";
+    let lines: Vec<&str> = log
         .lines()
-        .filter(|l| !l.contains("serving ") && !l.contains("run failed (rc="))
-        .next_back()
-        .or_else(|| log.lines().next_back())
-        .unwrap_or("it said nothing");
-    let wrong_pass = ["status=-201", "EBADTAG", "status=-202", "EBADVERSION"]
+        .filter(|l| !STARTING.iter().any(|p| l.starts_with(p)))
+        .collect();
+    let said = lines
         .iter()
-        .any(|m| log.contains(m));
-    if wrong_pass {
-        format!("wrong passphrase ({said})")
-    } else {
-        said.to_string()
-    }
+        .rev()
+        .find(|l| !l.starts_with(WRAPPER))
+        .or_else(|| lines.last())?;
+    Some(said.strip_prefix("stratumd: ").unwrap_or(said).to_string())
+}
+
+/// One log per attempt. A failed attempt's name would otherwise come round again, and
+/// the next attempt would be blamed for its reason.
+fn next_log_name() -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!("spawn-{}.log", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// TERM, then KILL only after a daemon has had time to unmount: its last commit
@@ -299,7 +312,7 @@ impl SpawnCtx {
         // discipline; replicated here because we need a custom stdin).
         let log_path = self
             .session_dir
-            .join(format!("spawn-{}.log", self.children.lock().unwrap().len()));
+            .join(next_log_name());
         let stderr_target = std::fs::OpenOptions::new()
             .create(true).append(true).open(&log_path)
             .map(Stdio::from)
@@ -344,7 +357,10 @@ impl SpawnCtx {
             let _ = child.kill();
             let _ = child.wait();
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-            return Err(e.context(start_failure(&log)));
+            return Err(match start_failure(&log) {
+                Some(reason) => anyhow!("{reason} ({e})"),
+                None => e,
+            });
         }
         // SWISS-8d: also wait briefly for the /ctl/ socket so the F2
         // pollers see a connectable endpoint on their first tick.
@@ -544,7 +560,7 @@ impl SpawnCtx {
         // log file open fails.
         let log_path = self
             .session_dir
-            .join(format!("spawn-{}.log", self.children.lock().unwrap().len()));
+            .join(next_log_name());
         let stderr_target = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -571,4 +587,37 @@ fn wait_for_sock(path: &Path, timeout: Duration) -> Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     Err(anyhow!("timed out waiting for {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::start_failure;
+
+    #[test]
+    fn a_reason_is_found_under_the_startup_lines() {
+        let log = "stratumd: serving /v on /s (backlog=1)\nstratumd: /ctl/ on /c\n\
+                   stratumd: wrong passphrase for /k\nstratumd: run failed (rc=-201)\n";
+        assert_eq!(start_failure(log).as_deref(), Some("wrong passphrase for /k"));
+    }
+
+    #[test]
+    fn a_path_cannot_turn_a_reason_into_a_startup_line() {
+        let log = "stratumd: no such image: /serving /ctl/ on x\nstratumd: run failed (rc=-2)\n";
+        assert_eq!(
+            start_failure(log).as_deref(),
+            Some("no such image: /serving /ctl/ on x")
+        );
+    }
+
+    #[test]
+    fn with_no_reason_the_number_is_still_said() {
+        let log = "stratumd: serving /v on /s\nstratumd: run failed (rc=-5)\n";
+        assert_eq!(start_failure(log).as_deref(), Some("run failed (rc=-5)"));
+    }
+
+    #[test]
+    fn a_log_with_nothing_to_say_says_nothing() {
+        assert_eq!(start_failure(""), None);
+        assert_eq!(start_failure("stratumd: serving /v on /s\n"), None);
+    }
 }

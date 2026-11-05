@@ -308,6 +308,11 @@ extern "C" fn ask_to_stop(_: libc::c_int) {
     ASKED_TO_STOP.store(true, Ordering::Relaxed);
 }
 
+/// For a wait on the UI thread, where the input loop cannot notice a signal.
+pub fn stop_requested() -> bool {
+    ASKED_TO_STOP.load(Ordering::Relaxed)
+}
+
 /// Ending by the default action would leave the terminal raw, the session
 /// directory behind and the daemons to find out for themselves. A HUP or INT
 /// someone has chosen to ignore, as nohup and a shell's `&` do, stays ignored.
