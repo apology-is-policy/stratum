@@ -1866,6 +1866,105 @@ STM_TEST(slate_socket_5a_editor_sequential_opens_replace_buffer)
 }
 
 /* /event refuses zero-byte writes (parity with stm_slate_submit_event). */
+/* What /editor/content holds now, through a fresh fid. */
+static uint32_t editor_content_now(stm_9p_client *c, uint8_t *buf, uint32_t cap)
+{
+    const char *names[] = { "editor", "content" };
+    stm_9p_qid qids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 110u, 2u, names, qids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 110u, 0u, &oqid, &iounit));
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 110u, 0u, buf, cap, &got));
+    STM_ASSERT_OK(stm_9p_clunk(c, 110u));
+    return got;
+}
+
+/* A buffer longer than one message comes in pieces, and every piece has to land. */
+STM_TEST(slate_socket_editor_content_arrives_in_pieces)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_pieces");
+    slate_fixture f;
+    setup_fixture(&f, "fg_pieces");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path, (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    const char *enames[] = { "event" };
+    stm_9p_qid eqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 1u, enames, eqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    const char *open_line = "editor open /version";
+    STM_ASSERT_OK(stm_9p_write(c, 102u, 0u, open_line, (uint32_t)strlen(open_line), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    const char *cnames[] = { "editor", "content" };
+    stm_9p_qid cqids[2];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 2u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    const char *xnames[] = { "editor", "action" };
+    stm_9p_qid xqids[2];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 104u, 2u, xnames, xqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 104u, STM_LP9_O_WRONLY, &oqid, &iounit));
+
+    uint8_t want[200], back[512];
+    for (size_t i = 0; i < sizeof want; i++) want[i] = (uint8_t)('a' + i % 26u);
+
+    /* Two pieces make one buffer. */
+    STM_ASSERT_OK(stm_9p_write(c, 103u, 0u, want, 100u, &written));
+    STM_ASSERT_EQ(written, 100u);
+    STM_ASSERT_OK(stm_9p_write(c, 103u, 100u, want + 100, 100u, &written));
+    STM_ASSERT_EQ(written, 100u);
+    STM_ASSERT_EQ(editor_content_now(c, back, sizeof back), 200u);
+    STM_ASSERT_EQ(memcmp(back, want, 200u), 0);
+
+    /* A hole or an overlap is a client's error, and leaves the buffer alone. */
+    STM_ASSERT_EQ(stm_9p_write(c, 103u, 150u, "zz", 2u, &written), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_write(c, 103u, 300u, "zz", 2u, &written), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_write(c, 103u, 0u, "", 0u, &written), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_write(c, 103u, STM_SLATE_EDITOR_CONTENT_MAX, "z", 1u, &written), STM_ERANGE);
+    STM_ASSERT_EQ(editor_content_now(c, back, sizeof back), 200u);
+    STM_ASSERT_EQ(memcmp(back, want, 200u), 0);
+
+    /* Offset 0 starts over. */
+    STM_ASSERT_OK(stm_9p_write(c, 103u, 0u, "seven b", 7u, &written));
+    STM_ASSERT_EQ(editor_content_now(c, back, sizeof back), 7u);
+    STM_ASSERT_EQ(memcmp(back, "seven b", 7u), 0);
+
+    /* Clear says empty, and a buffer can fill again from there. */
+    STM_ASSERT_OK(stm_9p_write(c, 104u, 0u, "clear\n", 6u, &written));
+    STM_ASSERT_EQ(editor_content_now(c, back, sizeof back), 0u);
+    STM_ASSERT_OK(stm_9p_write(c, 103u, 0u, "abc", 3u, &written));
+    STM_ASSERT_EQ(editor_content_now(c, back, sizeof back), 3u);
+    STM_ASSERT_EQ(memcmp(back, "abc", 3u), 0);
+
+    /* With no editor open there is no buffer to clear or fill. */
+    STM_ASSERT_OK(stm_9p_write(c, 104u, 0u, "close\n", 6u, &written));
+    STM_ASSERT_EQ(stm_9p_write(c, 104u, 0u, "clear\n", 6u, &written), STM_ENOENT);
+    STM_ASSERT_EQ(stm_9p_write(c, 103u, 0u, "abc", 3u, &written), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+    STM_ASSERT_OK(stm_9p_clunk(c, 104u));
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
 STM_TEST(slate_socket_event_zero_byte_einval)
 {
     slate_fixture f;

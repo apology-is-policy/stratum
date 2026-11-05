@@ -208,10 +208,9 @@ impl SlateClient {
             std::cmp::min(iounit as usize, 64 * 1024)
         };
         let mut written: usize = 0;
-        // Slate is offset-ignored on every writable kind (CLAUDE.md
-        // slate row clause 19). We still pass `written` as the offset
-        // for the standard 9P protocol — slate ignores it but the
-        // wire format requires a value.
+        // /editor/content needs `written` as the offset, so a long buffer
+        // arrives whole. Every other writable kind ignores the offset
+        // (CLAUDE.md slate row clause 19).
         while written < data.len() {
             let take = std::cmp::min(chunk_cap, data.len() - written);
             let mut got: u32 = 0;

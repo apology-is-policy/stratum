@@ -1806,6 +1806,25 @@ stm_status stm_slate_editor_save(stm_slate *s)
     return STM_OK;
 }
 
+/* The buffer becomes empty and stays open. A zero-byte write to
+ * /editor/content cannot say this, because it is refused. */
+static stm_status editor_empty_buffer(stm_slate *s)
+{
+    pthread_mutex_lock(&s->mu);
+    if (!s->editor_active) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_ENOENT;
+    }
+    free(s->editor_content);
+    s->editor_content = NULL;
+    s->editor_content_len = 0u;
+    editor_recompute_modified_locked(s);
+    s->version++;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+    return STM_OK;
+}
+
 /* SLATE-5b: re-read the backend file into the editor buffer,
  * dropping any unsaved edits. Effectively delegates to
  * editor_open(filename) but preserves the cursor by clamping
@@ -4005,7 +4024,6 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
                                uint32_t len, uint32_t *out_written)
 {
     stm_slate *s = ctx;
-    (void)offset;
     *out_written = 0;
     slate_kind k = qid_kind(qid_path);
     if (k == SLATE_KIND_MAX) return STM_ENOENT;
@@ -4241,37 +4259,46 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         return STM_OK;
     }
     if (k == SLATE_KIND_EDITOR_CONTENT) {
-        /* SLATE-5b: write replaces the editor buffer entirely
-         * (clause 19 offset-ignored Twrite posture — every write
-         * is a complete payload). Bound at MAX. R101 P2-2 carry:
-         * zero-byte refused (clearing the buffer requires explicit
-         * "1\n" or other body — write of an empty file is via the
-         * caller's own choice; if they want empty, they should
-         * close + re-open or use action="revert" instead). */
+        /* A write at offset 0 starts a new payload and a write at the
+         * current end extends it, so a buffer longer than one message
+         * arrives whole over several writes. Any other offset is a
+         * client error, never a silent replace. A zero-byte write
+         * stays refused (R101 P2-2): the "clear" verb on /editor/action
+         * says empty explicitly. */
         if (len == 0u) return STM_EINVAL;
-        if (len > STM_SLATE_EDITOR_CONTENT_MAX) return STM_ERANGE;
-        /* No control-byte filter — files contain arbitrary bytes;
-         * the editor IS a text-editing UI. Sanitization happens
-         * at the renderer (CLAUDE.md slate row clause 23(g)). */
-        uint8_t *new_buf = malloc(len);
-        if (!new_buf) return STM_ENOMEM;
-        memcpy(new_buf, buf, len);
+        if (offset > STM_SLATE_EDITOR_CONTENT_MAX ||
+            len > STM_SLATE_EDITOR_CONTENT_MAX - offset) {
+            return STM_ERANGE;
+        }
+        /* No control-byte filter: files contain arbitrary bytes, and
+         * sanitization happens at the renderer (CLAUDE.md slate row
+         * clause 23(g)). */
         pthread_mutex_lock(&s->mu);
         if (!s->editor_active) {
             pthread_mutex_unlock(&s->mu);
-            free(new_buf);
             return STM_ENOENT;
         }
+        if (offset != 0u && offset != s->editor_content_len) {
+            pthread_mutex_unlock(&s->mu);
+            return STM_EINVAL;
+        }
+        size_t new_len = (size_t)offset + len;
+        uint8_t *new_buf = malloc(new_len);
+        if (!new_buf) {
+            pthread_mutex_unlock(&s->mu);
+            return STM_ENOMEM;
+        }
+        if (offset > 0u) memcpy(new_buf, s->editor_content, (size_t)offset);
+        memcpy(new_buf + offset, buf, len);
         /* R116 P3-2: bump version only on real change. The whole-
          * payload-replace model means "new content == current
          * content" is the no-change case. */
-        bool changed = (len != s->editor_content_len) ||
-                       (len > 0u && memcmp(new_buf, s->editor_content,
-                                              len) != 0);
+        bool changed = (new_len != s->editor_content_len) ||
+                       memcmp(new_buf, s->editor_content, new_len) != 0;
         if (changed) {
             free(s->editor_content);
             s->editor_content = new_buf;
-            s->editor_content_len = len;
+            s->editor_content_len = new_len;
             editor_recompute_modified_locked(s);
             s->version++;
             pthread_cond_broadcast(&s->cv);
@@ -4369,6 +4396,8 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             arc = stm_slate_editor_close(s);
         } else if (l == 6u && memcmp(p, "revert", 6u) == 0) {
             arc = stm_slate_editor_revert(s);
+        } else if (l == 5u && memcmp(p, "clear", 5u) == 0) {
+            arc = editor_empty_buffer(s);
         } else if (l == 13u && memcmp(p, "save-and-quit", 13u) == 0) {
             arc = stm_slate_editor_save(s);
             if (arc == STM_OK) arc = stm_slate_editor_close(s);
