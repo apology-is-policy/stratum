@@ -903,6 +903,108 @@ STM_TEST(p9_client_tag_mismatch_poisons_subsequent_ops_refused)
     (void)unlink(g_sock_path);
 }
 
+/* A mock that answers every Tclunk and records the tags it saw. */
+typedef struct {
+    int       listen_fd;
+    int       run_status;
+    uint32_t  requests, notags, zeros, repeats, wraps;
+} mock_tags_ctx;
+
+static void *mock_tags_thread(void *arg)
+{
+    mock_tags_ctx *ctx = (mock_tags_ctx *)arg;
+    int cfd = accept(ctx->listen_fd, NULL, NULL);
+    if (cfd < 0) { ctx->run_status = -1; return NULL; }
+
+    uint8_t buf[8192];
+    uint32_t size = 0;
+    if (mock_recv_msg(cfd, buf, sizeof buf, &size) != 0) goto fail;
+    if (buf[4] != STM_9P_TVERSION) goto fail;
+    uint32_t cmsize = (uint32_t)buf[7] | ((uint32_t)buf[8] << 8)
+                    | ((uint32_t)buf[9] << 16) | ((uint32_t)buf[10] << 24);
+    uint8_t  resp[64];
+    uint32_t rsz = 7u + 4u + 2u + 8u;
+    mock_pack_u32(resp, rsz);
+    resp[4] = STM_9P_RVERSION;
+    mock_pack_u16(resp + 5, STM_9P_NOTAG);
+    mock_pack_u32(resp + 7, cmsize);
+    mock_pack_u16(resp + 11, 8);
+    memcpy(resp + 13, "9P2000.L", 8);
+    if (mock_send_msg(cfd, resp, rsz) != 0) goto fail;
+
+    if (mock_recv_msg(cfd, buf, sizeof buf, &size) != 0) goto fail;
+    if (buf[4] != STM_9P_TATTACH) goto fail;
+    uint16_t prev = (uint16_t)((uint16_t)buf[5] | ((uint16_t)buf[6] << 8));
+    rsz = 7u + 13u;
+    mock_pack_u32(resp, rsz);
+    resp[4] = STM_9P_RATTACH;
+    mock_pack_u16(resp + 5, prev);
+    memset(resp + 7, 0, 13);
+    if (mock_send_msg(cfd, resp, rsz) != 0) goto fail;
+
+    /* Until the client hangs up. */
+    while (mock_recv_msg(cfd, buf, sizeof buf, &size) == 0) {
+        if (buf[4] != STM_9P_TCLUNK) goto fail;
+        uint16_t tag = (uint16_t)((uint16_t)buf[5] | ((uint16_t)buf[6] << 8));
+        ctx->requests++;
+        if (tag == STM_9P_NOTAG) ctx->notags++;
+        if (tag == 0) ctx->zeros++;
+        if (tag == prev) ctx->repeats++;
+        if (tag < prev) ctx->wraps++;
+        prev = tag;
+        rsz = 7u;
+        mock_pack_u32(resp, rsz);
+        resp[4] = STM_9P_RCLUNK;
+        mock_pack_u16(resp + 5, tag);
+        if (mock_send_msg(cfd, resp, rsz) != 0) goto fail;
+    }
+    ctx->run_status = 0;
+    close(cfd);
+    return NULL;
+fail:
+    ctx->run_status = -1;
+    close(cfd);
+    return NULL;
+}
+
+/* Across more requests than there are tags, no request carries NOTAG, which is
+ * Tversion's alone, nor 0, and no two in a row share a tag. */
+STM_TEST(p9_client_tags_cycle_without_notag)
+{
+    build_sock_path("tags");
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(listen_fd >= 0);
+
+    mock_tags_ctx ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.listen_fd = listen_fd;
+    ctx.run_status = -1;
+    pthread_t worker;
+    STM_ASSERT_EQ(pthread_create(&worker, NULL, mock_tags_thread, &ctx), 0);
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    enum { REQUESTS = 70000 };
+    int done = 0;
+    stm_status last = STM_OK;
+    while (done < REQUESTS && (last = stm_9p_clunk(c, 100)) == STM_OK) done++;
+    STM_ASSERT_OK(last);
+    STM_ASSERT_EQ(done, REQUESTS);
+
+    stm_9p_close(c);
+    pthread_join(worker, NULL);
+    close(listen_fd);
+    (void)unlink(g_sock_path);
+    STM_ASSERT_EQ(ctx.run_status, 0);
+    STM_ASSERT_EQ(ctx.requests, (uint32_t)REQUESTS);
+    STM_ASSERT_EQ(ctx.notags, 0u);
+    STM_ASSERT_EQ(ctx.zeros, 0u);
+    STM_ASSERT_EQ(ctx.repeats, 0u);
+    STM_ASSERT_EQ(ctx.wraps, 1u);
+}
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* P9-LIB-1b: stm_9p_write tests.                                         */
 /* ────────────────────────────────────────────────────────────────────── */

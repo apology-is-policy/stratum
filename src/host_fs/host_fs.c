@@ -16,8 +16,12 @@
  *   walk last reached the file by, with the file's dev and ino). A
  *   walk replaces the entry: the client is naming the file now. Every
  *   use checks that the name still leads to that dev and ino, and
- *   answers ENOENT when it does not, so a rename or a reused inode is
- *   refused, never served as another file. The map is a cache of at
+ *   answers ENOENT when it does not, so a file renamed away is
+ *   refused, never served as the file now at its name. Identity is
+ *   dev and ino only: a freed inode number reused by a file a later
+ *   walk reaches, or two numbers that fold onto one qid, rebinds the
+ *   qid, and a fid still held on the old file is served the new one.
+ *   The map is a cache of at
  *   most HOST_FS_MAX_PATHS names: when full, names unused for a while
  *   are dropped (never the root's, nor one behind an open fid), and a
  *   fid left without a name answers ENOENT the same way.
@@ -514,6 +518,21 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         free(child);
         return STM_EACCES;
     }
+    /* The lstat and the realpath each resolve the parent's components
+     * afresh, so a symlink among them flipped between the two could pass
+     * the containment check with an inside path while st describes a file
+     * outside. A leaf that is no link must be the very file the checked
+     * path names. A link leaf is bound as the link, which lopen never
+     * follows. */
+    if (!S_ISLNK(st.st_mode)) {
+        struct stat rst;
+        if (lstat(resolved, &rst) < 0
+            || !same_file(&rst, (uint64_t)st.st_dev, (uint64_t)st.st_ino)) {
+            free(resolved);
+            free(child);
+            return STM_EACCES;
+        }
+    }
     free(resolved);
 
     uint64_t cqid = qid_path_from_stat(&st);
@@ -649,7 +668,7 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
      * with a symlink-to-outside. O_NOFOLLOW returns ELOOP if the leaf
      * is a symlink; O_NONBLOCK keeps a FIFO swapped in since the lstat
      * from blocking, and fstat says the file opened is the one walked. */
-    int fd = open(copy, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    int fd = open(copy, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
     if (fd < 0) return errno == ENOENT ? STM_ENOENT : STM_EIO;
     struct stat ost;
     if (fstat(fd, &ost) < 0 || !same_file(&ost, dev, ino)

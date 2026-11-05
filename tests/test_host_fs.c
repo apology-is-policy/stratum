@@ -171,6 +171,95 @@ STM_TEST(host_fs_a_renamed_directory_lists_by_its_new_name)
     (void)rmdir(f.root);
 }
 
+/* A directory's name gone stale lists nothing, though nothing walked it since. */
+STM_TEST(host_fs_a_stale_directory_name_lists_nothing)
+{
+    fixture f;
+    STM_ASSERT_TRUE(fixture_open(&f));
+    if (!f.h) return;
+    uint64_t root = stm_host_fs_root(f.h), x = 0;
+    STM_ASSERT_TRUE(sub(&f, "x") && put(&f, "x/a", "a"));
+    STM_ASSERT_OK(walk(&f, root, "x", &x));
+    listing l;
+    memset(&l, 0, sizeof l);
+    STM_ASSERT_OK(f.v->readdir(f.h, x, 0, collect, &l));
+    STM_ASSERT_TRUE(strcmp(l.names, "a") == 0);
+
+    STM_ASSERT_TRUE(move(&f, "x", "y"));
+    STM_ASSERT_TRUE(sub(&f, "x") && put(&f, "x/b", "b"));
+    memset(&l, 0, sizeof l);
+    STM_ASSERT_ERR(f.v->readdir(f.h, x, 0, collect, &l), STM_ENOENT);
+    if (l.names[0]) stm_test_info("x lists \"%s\"", l.names);
+    STM_ASSERT_TRUE(l.names[0] == '\0');
+
+    gone(&f, "y/a");
+    gone(&f, "x/b");
+    gone(&f, "y");
+    gone(&f, "x");
+    stm_host_fs_destroy(f.h);
+    (void)rmdir(f.root);
+}
+
+/* When the names fill, old ones go: never one used lately, nor one behind an
+ * open fid. "recent" is touched every EVERY walks and must keep its name; f0,
+ * walked once at the start, must lose its own, or nothing was dropped. */
+STM_TEST(host_fs_drops_only_names_unused_lately_and_unopened)
+{
+    fixture f;
+    STM_ASSERT_TRUE(fixture_open(&f));
+    if (!f.h) return;
+    enum { FILES = 5000, EVERY = 50 };
+    STM_ASSERT_TRUE(sub(&f, "held") && put(&f, "held/a", "a"));
+    STM_ASSERT_TRUE(put(&f, "recent", "r"));
+    STM_ASSERT_TRUE(sub(&f, "many"));
+    char rel[64];
+    bool made = true;
+    for (int i = 0; made && i < FILES; i++) {
+        snprintf(rel, sizeof rel, "many/f%d", i);
+        made = put(&f, rel, "");
+    }
+    STM_ASSERT_TRUE(made);
+    uint64_t root = stm_host_fs_root(f.h), held = 0, many = 0, recent = 0, first = 0, q = 0;
+    STM_ASSERT_OK(walk(&f, root, "held", &held));
+    STM_ASSERT_OK(f.v->lopen(f.h, 3, held, 0));
+    STM_ASSERT_OK(walk(&f, root, "recent", &recent));
+    STM_ASSERT_OK(walk(&f, root, "many", &many));
+    STM_ASSERT_OK(walk(&f, many, "f0", &first));
+    stm_lp9_attr attr;
+    int walked = 1, lost_at = -1;
+    stm_status last = STM_OK;
+    for (int i = 1; made && i < FILES; i++) {
+        snprintf(rel, sizeof rel, "f%d", i);
+        last = walk(&f, many, rel, &q);
+        if (last != STM_OK) break;
+        walked++;
+        if (i % EVERY == 0 && f.v->getattr(f.h, recent, 0, &attr) != STM_OK) {
+            lost_at = i;
+            break;
+        }
+    }
+    STM_ASSERT_OK(last);
+    STM_ASSERT_EQ(lost_at, -1);
+    STM_ASSERT_EQ(walked, FILES);
+    STM_ASSERT_ERR(f.v->getattr(f.h, first, 0, &attr), STM_ENOENT);
+    listing l;
+    memset(&l, 0, sizeof l);
+    STM_ASSERT_OK(f.v->readdir(f.h, held, 0, collect, &l));
+    STM_ASSERT_TRUE(strcmp(l.names, "a") == 0);
+    f.v->clunk(f.h, 3, held);
+
+    for (int i = 0; i < FILES; i++) {
+        snprintf(rel, sizeof rel, "many/f%d", i);
+        gone(&f, rel);
+    }
+    gone(&f, "many");
+    gone(&f, "held/a");
+    gone(&f, "held");
+    gone(&f, "recent");
+    stm_host_fs_destroy(f.h);
+    (void)rmdir(f.root);
+}
+
 STM_TEST(host_fs_a_name_that_leads_elsewhere_is_refused)
 {
     fixture f;
@@ -256,6 +345,39 @@ STM_TEST(host_fs_a_name_too_long_for_9p_is_no_siblings_name)
         STM_ASSERT_EQ(stand_ins, 1);
         (void)unlink(p);
         snprintf(p, sizeof p, "%s/%s", f.root, longname);
+        (void)unlink(p);
+    }
+    stm_host_fs_destroy(f.h);
+    (void)rmdir(f.root);
+}
+
+/* The cut steps back to a character's first byte. Byte 252 of "a" and 100 euro
+ * signs falls inside a character, which it never does in euro signs alone. */
+STM_TEST(host_fs_a_long_name_is_cut_where_a_character_starts)
+{
+    fixture f;
+    STM_ASSERT_TRUE(fixture_open(&f));
+    if (!f.h) return;
+    char longname[302], p[512];
+    longname[0] = 'a';
+    for (int i = 0; i < 100; i++) memcpy(longname + 1 + 3 * i, "\xE2\x82\xAC", 3);
+    longname[301] = '\0';
+    snprintf(p, sizeof p, "%s/%s", f.root, longname);
+    int fd = open(p, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        stm_test_info("no 301-byte name on this filesystem (%s): nothing to cut", strerror(errno));
+    } else {
+        (void)close(fd);
+        names_seen seen;
+        memset(&seen, 0, sizeof seen);
+        STM_ASSERT_OK(f.v->readdir(f.h, stm_host_fs_root(f.h), 0, gather, &seen));
+        STM_ASSERT_EQ(seen.count, 1);
+        const char *got = seen.names[0];
+        size_t n = strlen(got);
+        /* "a", 83 whole euro signs, then U+FFFD. */
+        STM_ASSERT_EQ(n, (size_t)(1 + 3 * 83 + 3));
+        STM_ASSERT_TRUE(n >= 3 && memcmp(got, longname, n - 3) == 0);
+        STM_ASSERT_TRUE(n >= 3 && memcmp(got + n - 3, "\xEF\xBF\xBD", 3) == 0);
         (void)unlink(p);
     }
     stm_host_fs_destroy(f.h);

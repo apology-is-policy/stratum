@@ -591,7 +591,7 @@ stratum fs -s SOCKET put ./dir /dir                    script it
 
 **How a delete behaves.** `F8` asks "Delete N items?" with No selected, and nothing is touched unless the answer is Yes. Items go one at a time, a directory with everything in it. Esc stops the batch after the item in hand. A quit key, `F5`, `F7` or `F8` during a batch asks Stop or Go on, and the batch waits while it asks. The manager quits only once no batch runs.
 
-**Names.** A name the manager cannot show exactly, one that is not UTF-8, holds a control character, or is longer than 9P's 255 bytes on the host, is listed with U+FFFD standing in, and no action accepts it: it is not entered, copied or deleted from the manager. The host panel checks on every use that a name still leads to the file it was walked to, so a renamed or replaced file is not served under its old name.
+**Names.** A name the manager cannot show exactly, one that is not UTF-8, holds a control character, or is longer than 9P's 255 bytes on the host, is listed with U+FFFD standing in, and no action accepts it: it is not entered, copied or deleted from the manager. The host panel checks on every use that a name still leads to the file it was walked to, so a file renamed away is not served as the file now at its name. It knows a file by device and inode, so a new file that reuses a freed inode number can take over the name of a fid still held on the old one (T0.62); the manager re-walks on every redraw and holds no such fid.
 
 **Durability.** A manager copy runs one `stratum fs` command per item, and each mutating command ends with a whole-pool commit before it reports success. What the manager reports copied into a volume is therefore durable, and a copy of `N` items costs `N` commits. On the host, a file that replaces another is synced before it is moved into place; a new file is left to the host's own write-back.
 
@@ -599,6 +599,7 @@ stratum fs -s SOCKET put ./dir /dir                    script it
 
 - No move or rename in the manager (`stratum fs mv` exists). Three of six admin panes say "Coming soon". Copies keep no modification time and skip symlinks.
 - "Static" is partial: libsodium links dynamically.
+- The host panel serves 9P clients other than the manager less well than 9P asks: a fid walked and never opened loses its name after about 2,048 newer lookups (T0.63), and a walk resolves each name from the root, so a symlink flipped among a name's components inside one walk can still be followed (T0.61).
 
 **How keys work, and how this differs from VeraCrypt.** A volume always needs a **keyfile**, by default `<volume>.key` beside it. A passphrase does not derive the volume key; it seals the
 keyfile with Argon2id. **Without `--passphrase-stdin`, the keyfile is plaintext, so anyone holding it holds the volume.** Losing it loses the volume, and there is no way to change a passphrase.
@@ -623,7 +624,7 @@ Stratum is the opposite trade to VeraCrypt: it does not hide that it exists, but
 
 ## 15. Evidence of correctness
 
-**Tests.** 81 suites and 2,516 test legs, in C. The manager has 35 Rust integration tests and 106 unit tests, and three drivers run the real binary: `volume_smoke.sh`, `stop_with_clients.py`, and `manager_keys.py`, which plays the manager's keys in a terminal and reads the screen.
+**Tests.** 81 suites and 2,523 test legs, in C. The manager has 35 Rust integration tests and 109 unit tests, and three drivers run the real binary: `volume_smoke.sh`, `stop_with_clients.py`, and `manager_keys.py`, which plays the manager's keys in a terminal and reads the screen.
 
 **TLA+.** 43 specifications with 191 configurations, of which 135 are deliberately broken and must fail. Coverage includes commit and quorum, allocator and deferred free, nonce uniqueness,
 Merkle links, COW commit, delta chains and epochs, the namespace layer, compound operations, dead lists, clones, CAS, and the key schema. CI runs 12 of these configurations. The rest are run by

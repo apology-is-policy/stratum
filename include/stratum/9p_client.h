@@ -65,11 +65,12 @@
  *      mapped to stm_status via `errno_to_stm_status`. Unknown
  *      errnos collapse to STM_EBACKEND so lib callers see a
  *      well-defined status set.
- *   3. Tag allocation: v2.0 wraps when the counter hits
- *      STM_9P_NOTAG; the lib refuses subsequent ops with
- *      STM_EOVERFLOW since synchronous send/recv can't disambiguate
- *      a wrap-collision from a stale reply. Callers wanting more
- *      than 64K ops per client must reconnect.
+ *   3. Tag allocation: tags cycle over 1..STM_9P_NOTAG-1; NOTAG is
+ *      Tversion's alone and 0 is never issued. A client has one
+ *      request outstanding at a time (each op sends, then receives
+ *      its reply before returning), so a tag coming round again
+ *      cannot meet a reply still owed to its last use. Consecutive
+ *      tags always differ, so a stale reply is caught by item 5.
  *   4. Caller-cap bound: every server-supplied count field used as
  *      a write target into a caller buffer is bounded against the
  *      caller-supplied cap BEFORE the write. R111 P0 F-1 lesson:
