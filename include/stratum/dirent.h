@@ -433,6 +433,20 @@ typedef struct stm_dirent_entry {
     uint8_t  name[STM_DIRENT_NAME_MAX];
 } stm_dirent_entry;
 
+typedef struct stm_dirent_child {
+    uint64_t ino;
+    uint64_t gen;
+} stm_dirent_child;
+
+/*
+ * The directories named directly under dir_ino, in no order, read in one pass
+ * under the index's lock. *out is malloc'd and the caller frees it; NULL when
+ * there are none.
+ */
+stm_status stm_dirent_child_dirs(const stm_dirent_index *idx,
+                                 uint64_t dataset_id, uint64_t dir_ino,
+                                 stm_dirent_child **out, size_t *out_n);
+
 /*
  * Iterate live records under (dataset_id, dir_ino) in hash_probe
  * ascending order. Models dirent.tla's `ReaddirReset(d) ; ReaddirStep(d)*

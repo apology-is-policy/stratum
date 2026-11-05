@@ -1246,6 +1246,82 @@ static int di_readdir_cb(const void *k, size_t klen,
     return 0;
 }
 
+typedef struct {
+    stm_dirent_child *arr;
+    size_t            n;
+    size_t            cap;
+    stm_status        err;
+} di_child_dirs_ctx;
+
+static int di_child_dirs_cb(const void *k, size_t klen,
+                            const void *v, size_t vlen, void *ctx_) {
+    (void)k; (void)klen;
+    di_child_dirs_ctx *c = ctx_;
+    stm_dirent_record r;
+    memset(&r, 0, sizeof r);
+    stm_status vs = di_decode_value(v, vlen, &r);
+    if (vs != STM_OK) { c->err = vs; return 1; }
+    if (record_is_tombstone(&r) || r.child_type != STM_DT_DIR) return 0;
+    if (c->n == c->cap) {
+        if (c->cap > (SIZE_MAX / sizeof *c->arr) / 2u) {
+            c->err = STM_ENOMEM;
+            return 1;
+        }
+        size_t new_cap = c->cap == 0 ? 16u : c->cap * 2u;
+        stm_dirent_child *na = realloc(c->arr, new_cap * sizeof *na);
+        if (!na) { c->err = STM_ENOMEM; return 1; }
+        c->arr = na;
+        c->cap = new_cap;
+    }
+    c->arr[c->n].ino = r.child_ino;
+    c->arr[c->n].gen = r.child_gen;
+    c->n++;
+    return 0;
+}
+
+stm_status stm_dirent_child_dirs(const stm_dirent_index *idx,
+                                 uint64_t dataset_id, uint64_t dir_ino,
+                                 stm_dirent_child **out, size_t *out_n)
+{
+    if (out) *out = NULL;
+    if (out_n) *out_n = 0;
+    if (!idx || !out || !out_n) return STM_EINVAL;
+    if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
+
+    stm_dirent_index *m = (stm_dirent_index *)idx;
+    pthread_mutex_t *lk = idx_lock(idx);
+    must_lock(lk);
+    if (m->ds_idx == NULL) {
+        must_unlock(lk);
+        return STM_EINVAL;
+    }
+    stm_btree_engine *eng = NULL;
+    stm_status es = di_get_engine_locked(m, dataset_id, &eng);
+    if (es != STM_OK) {
+        must_unlock(lk);
+        return es == STM_ENOENT ? STM_OK : es;
+    }
+    uint8_t lo[DI_KEY_LEN], hi[DI_KEY_LEN];
+    stm_status k1 = di_encode_key(dir_ino, 0u,         lo);
+    stm_status k2 = di_encode_key(dir_ino, UINT64_MAX, hi);
+    if (k1 != STM_OK || k2 != STM_OK) {
+        must_unlock(lk);
+        return k1 != STM_OK ? k1 : k2;
+    }
+    di_child_dirs_ctx c = { .arr = NULL, .n = 0, .cap = 0, .err = STM_OK };
+    stm_status ss = stm_btree_engine_scan_range(eng, lo, DI_KEY_LEN,
+                                                hi, DI_KEY_LEN,
+                                                di_child_dirs_cb, &c);
+    must_unlock(lk);
+    if (ss != STM_OK || c.err != STM_OK) {
+        free(c.arr);
+        return ss != STM_OK ? ss : c.err;
+    }
+    *out = c.arr;
+    *out_n = c.n;
+    return STM_OK;
+}
+
 stm_status stm_dirent_readdir(const stm_dirent_index *idx,
                                   uint64_t dataset_id, uint64_t dir_ino,
                                   uint64_t *cursor,

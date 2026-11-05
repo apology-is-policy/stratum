@@ -144,12 +144,12 @@ void stm_fs_fail_next_rename_src_drop_for_test(stm_fs *fs, stm_status fail);
 typedef void (*stm_fs_rename_rollback_hook)(bool wedged, void *arg);
 
 /*
- * Call `fn` where a rename of a directory holds its turn: after a full batch of its walk down the
+ * Call `fn` where a rename of a directory holds its turn: after each directory of its walk down the
  * subtree, and once the walk has found the target is not under it. `fn` may start another rename and
  * wait a bounded time for it. NULL restores it.
  */
 typedef enum {
-    STM_FS_RENAME_WALK_BATCH,
+    STM_FS_RENAME_WALK_DIR,
     STM_FS_RENAME_WALK_CHECKED
 } stm_fs_rename_walk_point;
 typedef void (*stm_fs_rename_walk_hook)(stm_fs_rename_walk_point at, void *arg);

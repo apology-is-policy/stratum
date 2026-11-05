@@ -209,8 +209,9 @@ struct stm_fs {
     /* Held across any rename of a directory, from the check that the target is not under it to the
      * dirent update. Two moves that each pass alone can together make a cycle, so they take turns,
      * as Linux's s_vfs_rename_mutex does. A rename within one parent takes its turn too, unlike
-     * Linux's, because the check walks down in batches, and a name moved behind the walk's cursor
-     * would hide a subtree. Taken under the rename's pins, and its holder waits for no pin. */
+     * Linux's, because a rename adds the new name before it drops the old, and a walk reading the
+     * directory between the two would meet the child twice and report damage. Taken under the
+     * rename's pins, and its holder waits for no pin. */
     pthread_mutex_t dir_move_mu;
 
     stm_bdev  *bdev;         /* owned — closed at unmount */
@@ -6610,31 +6611,39 @@ static stm_status fs_rename_onto_itself(stm_fs *fs, uint64_t dataset_id,
     return s;
 }
 
-/* A set of inode numbers: open addressing, 0 for an empty slot, since no inode is number 0. */
+/* One directory, as long as its name is live: a number is reused one generation on. */
 typedef struct {
-    uint64_t *slots;
-    size_t    cap;
-    size_t    n;
-} fs_ino_set;
+    uint64_t ino;
+    uint64_t gen;
+} fs_dir_id;
 
-static void fs_ino_set_slot(uint64_t *slots, size_t cap, uint64_t ino, size_t *out)
+/* A set of those: open addressing, ino 0 for an empty slot, since no inode is number 0. */
+typedef struct {
+    fs_dir_id *slots;
+    size_t     cap;
+    size_t     n;
+} fs_dir_set;
+
+static void fs_dir_set_slot(const fs_dir_id *slots, size_t cap, fs_dir_id id, size_t *out)
 {
-    size_t i = (size_t)((ino * 0x9E3779B97F4A7C15ULL) >> 20) & (cap - 1u);
-    while (slots[i] != 0u && slots[i] != ino) i = (i + 1u) & (cap - 1u);
+    uint64_t h = (id.ino ^ (id.gen * 0xC2B2AE3D27D4EB4FULL)) * 0x9E3779B97F4A7C15ULL;
+    size_t i = (size_t)(h >> 20) & (cap - 1u);
+    while (slots[i].ino != 0u && (slots[i].ino != id.ino || slots[i].gen != id.gen))
+        i = (i + 1u) & (cap - 1u);
     *out = i;
 }
 
-/* Adds ino. *out_new says whether it was absent. */
-static stm_status fs_ino_set_add(fs_ino_set *set, uint64_t ino, bool *out_new)
+/* Adds id. *out_new says whether it was absent. */
+static stm_status fs_dir_set_add(fs_dir_set *set, fs_dir_id id, bool *out_new)
 {
     if ((set->n + 1u) * 2u > set->cap) {
         size_t cap = set->cap ? set->cap * 2u : 64u;
-        uint64_t *grown = calloc(cap, sizeof *grown);
+        fs_dir_id *grown = calloc(cap, sizeof *grown);
         if (!grown) return STM_ENOMEM;
         for (size_t i = 0; i < set->cap; i++) {
-            if (set->slots[i] == 0u) continue;
+            if (set->slots[i].ino == 0u) continue;
             size_t at = 0;
-            fs_ino_set_slot(grown, cap, set->slots[i], &at);
+            fs_dir_set_slot(grown, cap, set->slots[i], &at);
             grown[at] = set->slots[i];
         }
         free(set->slots);
@@ -6642,74 +6651,67 @@ static stm_status fs_ino_set_add(fs_ino_set *set, uint64_t ino, bool *out_new)
         set->cap   = cap;
     }
     size_t at = 0;
-    fs_ino_set_slot(set->slots, set->cap, ino, &at);
-    *out_new = set->slots[at] == 0u;
+    fs_dir_set_slot(set->slots, set->cap, id, &at);
+    *out_new = set->slots[at].ino == 0u;
     if (*out_new) {
-        set->slots[at] = ino;
+        set->slots[at] = id;
         set->n++;
     }
     return STM_OK;
 }
 
-/* Whether `target` is `top` or a directory under it. No inode records its parent, so this walks down,
- * and costs the entries of every directory in the subtree. A directory met twice means the namespace is
- * already damaged: the walk reports that instead of going round. */
+/* Whether `target` is `top` or a directory under it. No inode records its parent, so this walks down, and
+ * reads every directory in the subtree once, which costs the entries they hold. A directory met twice means the
+ * namespace is already damaged: the walk reports that instead of going round. Directories can appear and
+ * go while it runs, but none can move, since moves wait for dir_move_mu. */
 static stm_status fs_dir_holds(stm_fs *fs, stm_inode_index *iidx, stm_dirent_index *didx,
-                               uint64_t dataset_id, uint64_t top, uint64_t target,
+                               uint64_t dataset_id, uint64_t top, uint64_t top_gen, uint64_t target,
                                bool *out_holds)
 {
-    /* Each read of a directory scans all of it, so a small batch costs a large directory n squared. */
-    enum { BATCH = 1024 };
     *out_holds = (top == target);
     if (*out_holds) return STM_OK;
 
-    fs_ino_set seen = { 0 };
+    fs_dir_set seen = { 0 };
     size_t todo_cap = 64u, todo_n = 0u;
     uint64_t *todo = malloc(todo_cap * sizeof *todo);
-    stm_dirent_entry *batch = malloc(BATCH * sizeof *batch);
     bool added = false;
-    stm_status s = (todo && batch) ? fs_ino_set_add(&seen, top, &added) : STM_ENOMEM;
+    stm_status s = todo ? fs_dir_set_add(&seen, (fs_dir_id){ .ino = top, .gen = top_gen }, &added)
+                        : STM_ENOMEM;
     if (s == STM_OK) todo[todo_n++] = top;
 
     while (s == STM_OK && todo_n > 0u && !*out_holds) {
         uint64_t dir = todo[--todo_n];
-        uint64_t cursor = 0;
-        for (;;) {
-            size_t got = 0;
-            s = stm_dirent_readdir(didx, dataset_id, dir, &cursor, batch, BATCH, &got);
-            if (s != STM_OK || got == 0u) break;
-            for (size_t i = 0; s == STM_OK && i < got; i++) {
-                if (batch[i].child_type != STM_DT_DIR) continue;
-                bool live = false;
-                s = fs_name_live_locked(iidx, dataset_id, batch[i].child_ino,
-                                        batch[i].child_gen, &live, NULL);
-                if (s != STM_OK || !live) continue;
-                if (batch[i].child_ino == target) {
-                    *out_holds = true;
-                    break;
-                }
-                s = fs_ino_set_add(&seen, batch[i].child_ino, &added);
-                if (s != STM_OK) break;
-                if (!added) {
-                    s = STM_ECORRUPT;
-                    break;
-                }
-                if (todo_n == todo_cap) {
-                    uint64_t *grown = realloc(todo, todo_cap * 2u * sizeof *todo);
-                    if (!grown) {
-                        s = STM_ENOMEM;
-                        break;
-                    }
-                    todo = grown;
-                    todo_cap *= 2u;
-                }
-                todo[todo_n++] = batch[i].child_ino;
+        stm_dirent_child *kids = NULL;
+        size_t n = 0;
+        s = stm_dirent_child_dirs(didx, dataset_id, dir, &kids, &n);
+        for (size_t i = 0; s == STM_OK && i < n; i++) {
+            bool live = false;
+            s = fs_name_live_locked(iidx, dataset_id, kids[i].ino, kids[i].gen, &live, NULL);
+            if (s != STM_OK || !live) continue;
+            if (kids[i].ino == target) {
+                *out_holds = true;
+                break;
             }
-            if (s != STM_OK || *out_holds || cursor == UINT64_MAX) break;
-            if (got == BATCH) fs_rename_walk_gap(fs, STM_FS_RENAME_WALK_BATCH);
+            s = fs_dir_set_add(&seen, (fs_dir_id){ .ino = kids[i].ino, .gen = kids[i].gen }, &added);
+            if (s != STM_OK) break;
+            if (!added) {
+                s = STM_ECORRUPT;
+                break;
+            }
+            if (todo_n == todo_cap) {
+                uint64_t *grown = realloc(todo, todo_cap * 2u * sizeof *todo);
+                if (!grown) {
+                    s = STM_ENOMEM;
+                    break;
+                }
+                todo = grown;
+                todo_cap *= 2u;
+            }
+            todo[todo_n++] = kids[i].ino;
         }
+        free(kids);
+        if (s == STM_OK && !*out_holds) fs_rename_walk_gap(fs, STM_FS_RENAME_WALK_DIR);
     }
-    free(batch);
     free(todo);
     free(seen.slots);
     return s;
@@ -7104,9 +7106,9 @@ static stm_status fs_rename(stm_fs *fs, uint64_t dataset_id,
             bool under = false;
             stm_status hs = STM_OK;
             if (moves_src)
-                hs = fs_dir_holds(fs, iidx, didx, dataset_id, src_ino, dst_parent_ino, &under);
+                hs = fs_dir_holds(fs, iidx, didx, dataset_id, src_ino, src_gen, dst_parent_ino, &under);
             if (hs == STM_OK && !under && moves_dst)
-                hs = fs_dir_holds(fs, iidx, didx, dataset_id, dst_ino, src_parent_ino, &under);
+                hs = fs_dir_holds(fs, iidx, didx, dataset_id, dst_ino, dst_gen, src_parent_ino, &under);
             if (hs != STM_OK || under) {
                 FS_RENAME_UNPIN_ALL();
                 fs_txn_unlock_global(fs, &tx);
