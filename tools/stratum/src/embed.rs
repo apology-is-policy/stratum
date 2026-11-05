@@ -280,7 +280,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
                     } else {
                         let mut rev: Vec<&str> = lines.into_iter().rev().collect();
                         // Drop the noisy "serving X on Y" startup banner.
-                        rev.retain(|l| !l.contains("serving "));
+                        rev.retain(|l| !l.trim_start().starts_with("stratumd: serving "));
                         Some(rev.join("\n  "))
                     }
                 })

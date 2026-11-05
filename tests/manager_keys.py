@@ -29,7 +29,7 @@ COLS, ROWS = 140, 44
 F4, F5, F7, F10 = b'\x1bOS', b'\x1b[15~', b'\x1b[18~', b'\x1b[21~'
 F8, F9 = b'\x1b[19~', b'\x1b[20~'
 SHIFT_F5, SHIFT_F7 = b'\x1b[15;2~', b'\x1b[18;2~'
-RIGHT = b'\x1b[C'
+RIGHT, LEFT = b'\x1b[C', b'\x1b[D'
 TAB, DOWN, UP, ENTER, ESC = b'\t', b'\x1b[B', b'\x1b[A', b'\r', b'\x1b'
 PASS = 'correct horse battery staple'
 CSI = re.compile(r'\x1b\[([?0-9;<=>]*)[ -/]*([@-~])')
@@ -735,12 +735,16 @@ def wrong_passphrase_leg(stratum, vol, host):
 
 
 # The conflict dialog's options, counted from the left.
-SKIP, OVERWRITE, KEEP_BOTH = 0, 2, 4
+SKIP, SKIP_ALL, OVERWRITE, OVERWRITE_ALL, KEEP_BOTH = 0, 1, 2, 3, 4
 
 
 def slurp(path):
-    with open(path, 'rb') as f:
-        return f.read()
+    """None for a file that is not there, so a leg says so rather than ending the run."""
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
 
 
 def spit(path, data):
@@ -782,8 +786,9 @@ def pick(term, name, names, right=False):
     term.pump(0.2)
 
 
-def answer_conflict(term, option):
-    term.expect(r'Destination exists')
+def answer_conflict(term, option, nth=None):
+    """nth names the item the question is about, so a dialog still on screen is not answered twice."""
+    term.expect(r'Destination exists' + (rf' \({nth}/' if nth else ''))
     for _ in range(option):
         term.send(RIGHT)
         term.pump(0.05)
@@ -793,9 +798,15 @@ def answer_conflict(term, option):
 def copy_summary(term, what):
     """(copied, skipped, failed, the screen). Dismisses the dialog, so the next one is seen fresh."""
     term.expect(r'Copy: \d+ copied', timeout=120)
+    # The match can come mid-repaint, half the summary drawn over the progress dialog.
+    m = None
+    for _ in range(20):
+        term.pump(0.15)
+        text = term.screen.text()
+        m = re.search(r'Copy: (\d+) copied . (\d+) skipped . (\d+) failed', text)
+        if m and 'cancel batch' not in text:
+            break
     term.show(what)
-    text = term.screen.text()
-    m = re.search(r'Copy: (\d+) copied . (\d+) skipped . (\d+) failed', text)
     if not m:
         raise Failure(f'{what}: the summary did not read as one')
     term.send(ENTER)
@@ -968,6 +979,76 @@ def host_copy_legs(stratum, root):
         os.chmod(f'{w}/treeone/shut', 0o755)
 
 
+def copy_engine_legs(stratum, root):
+    """Where a copy writes, and what a link or a planted name can make of that."""
+    w = f'{root}/engine'
+    for d in ('src/d/sub', 'src/t/sub', 'dst/d', 'dst/t/sub', 'elsewhere'):
+        os.makedirs(f'{w}/{d}')
+    spit(f'{w}/src/plain.txt', b'plain\n')
+    spit(f'{w}/elsewhere/victim.txt', b'victim\n')
+    # A merge into a destination whose subdirectory is a link back into the source.
+    spit(f'{w}/src/d/f', b'F')
+    spit(f'{w}/src/d/sub/f', b'S')
+    os.symlink(f'{w}/src/d', f'{w}/dst/d/sub')
+    # SkipAll answered at a file, then a directory that is there, holding something new.
+    spit(f'{w}/src/t/a.txt', b'new\n')
+    spit(f'{w}/src/t/sub/new.txt', b'new\n')
+    spit(f'{w}/dst/t/a.txt', b'old\n')
+    top, src_names = ['src', 'dst', 'elsewhere'], ['plain.txt', 'd', 't']
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        term.expect(r'elsewhere', timeout=30)
+        term.pump(0.5)
+        pick(term, 'src', top)
+        term.send(ENTER)
+        term.pump(0.6)
+        term.send(TAB)
+        term.pump(0.3)
+        pick(term, 'dst', top, right=True)
+        term.send(ENTER)
+        term.pump(0.6)
+        term.send(TAB)
+        term.pump(0.3)
+
+        # The temp's name is this process's id and a count from 0.
+        planted = [f'{w}/dst/.stratum-copy-{term.pid}-{n}' for n in range(64)]
+        for p in planted:
+            os.symlink(f'{w}/elsewhere/victim.txt', p)
+        pick(term, 'plain.txt', src_names)
+        term.send(F5)
+        _, _, failed, _ = copy_summary(term, 'a temp name planted ahead of the copy')
+        record(slurp(f'{w}/elsewhere/victim.txt') == b'victim\n', 'a planted temp name does not steer a copy into another file',
+               f'a planted temp name let the copy write elsewhere: {slurp(f"{w}/elsewhere/victim.txt")!r}')
+        record(failed == 1 and os.path.islink(planted[0]), 'that copy fails, and leaves the planted name alone',
+               f'that copy: {failed} failed, the planted name there: {os.path.islink(planted[0])}')
+        for p in planted:
+            if os.path.islink(p):
+                os.unlink(p)
+
+        pick(term, 'd', src_names)
+        term.send(F5)
+        answer_conflict(term, OVERWRITE_ALL, nth=1)
+        _, _, failed, _ = copy_summary(term, 'a link in the destination back into the source')
+        record(slurp(f'{w}/src/d/f') == b'F' and slurp(f'{w}/src/d/sub/f') == b'S',
+               'a link in the destination does not lead a copy over its source',
+               f'the source now reads {slurp(f"{w}/src/d/f")!r} and {slurp(f"{w}/src/d/sub/f")!r}')
+        record(failed >= 1, 'the directory behind that link is counted as failed', f'behind that link: {failed} failed')
+
+        pick(term, 't', src_names)
+        term.send(F5)
+        answer_conflict(term, OVERWRITE, nth=1)
+        answer_conflict(term, SKIP_ALL, nth=2)
+        copy_summary(term, 'SkipAll at a file, then a directory that is there')
+        record(slurp(f'{w}/dst/t/sub/new.txt') == b'new\n' and slurp(f'{w}/dst/t/a.txt') == b'old\n',
+               'a SkipAll answered at a file still merges into a directory that is there',
+               f'after SkipAll at a file: new.txt {slurp(f"{w}/dst/t/sub/new.txt")!r}, a.txt {slurp(f"{w}/dst/t/a.txt")!r}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+
 def volume_copy_legs(stratum, root):
     """The same promises on a volume, and a name in it that must not steer a copy."""
     base = f'{root}/copyvol'
@@ -979,6 +1060,7 @@ def volume_copy_legs(stratum, root):
     os.chmod(f'{host}/secretfile.txt', 0o600)
     os.makedirs(f'{host}/privdir')
     os.chmod(f'{host}/privdir', 0o700)
+    os.symlink(f'{host}/privdir', f'{host}/linkedname')
     vol = Volume(stratum, base)
     vol.mkfs()
     vol.serve()
@@ -988,7 +1070,8 @@ def volume_copy_legs(stratum, root):
                        (('mkdir', '/hostile'), None), (('write', '/hostile/plain.txt'), b'plain\n'),
                        (('write', hostile), b'bad\n'),
                        (('write', '/shutfile.txt'), b'shut\n'), (('chmod', '640', '/shutfile.txt'), None),
-                       (('mkdir', '/shutdir'), None), (('chmod', '700', '/shutdir'), None)):
+                       (('mkdir', '/shutdir'), None), (('chmod', '700', '/shutdir'), None),
+                       (('write', '/linkedname'), b'keep\n')):
         r = vol.fs(vol.sock, *args, data=data)
         if r.returncode != 0:
             raise Failure(f'seeding {args}: {r.stderr[:200]}')
@@ -996,9 +1079,9 @@ def volume_copy_legs(stratum, root):
         raise Failure('ls -0 printed no NUL')
     vol.stop()
 
-    host_names = ['keptfile.txt', 'overfile.txt', 'secretfile.txt', 'privdir']
+    host_names = ['keptfile.txt', 'overfile.txt', 'secretfile.txt', 'privdir', 'linkedname']
     vol_names = ['keptfile.txt', 'overfile.txt', 'keptfile-2.txt', 'hostile', '.snaps',
-                 'shutfile.txt', 'shutdir', 'secretfile.txt', 'privdir']
+                 'shutfile.txt', 'shutdir', 'secretfile.txt', 'privdir', 'linkedname']
     env_file = f'{base}/env'
     term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file])
     try:
@@ -1051,6 +1134,20 @@ def volume_copy_legs(stratum, root):
         got = stm_mode(vol, sock, '/privdir')
         record(got == 0o700, 'a private directory stays private in a volume', f'a 0700 directory in a volume reads {got!r}')
 
+        # Read as a file, a link to a directory gave the write a directory to read: an
+        # empty file, reported copied, in place of the volume's.
+        pick(term, 'linkedname', host_names, right=True)
+        term.send(F5)
+        term.expect(r'Nothing valid in selection|Destination exists')
+        if 'Destination exists' in term.screen.text():
+            answer_conflict(term, OVERWRITE)
+            copy_summary(term, 'a link to a directory over a volume file')
+        else:
+            term.send(ENTER)
+            term.pump(0.3)
+        record(on_vol('/linkedname') == b'keep\n', 'a link to a directory is not copied over a volume file',
+               f'the volume file now reads {on_vol("/linkedname")!r}')
+
         term.send(TAB)
         term.pump(0.3)
         pick(term, 'shutfile.txt', vol_names)
@@ -1067,7 +1164,8 @@ def volume_copy_legs(stratum, root):
         pick(term, 'hostile', vol_names)
         term.send(F5)
         _, _, failed, _ = copy_summary(term, 'a name that reads as two lines')
-        record(failed >= 1, 'a name with a newline in it is counted as failed', 'a name with a newline went uncounted')
+        record(failed == 1, 'a name with a newline in it is counted once, as failed',
+               f'a name with a newline in it: {failed} failed')
         out = f'{host}/hostile'
         record(os.path.exists(f'{out}/plain.txt'), 'the names around it are copied', 'the name beside it was not copied')
         listed = sorted(os.listdir(out)) if os.path.isdir(out) else []
@@ -1088,7 +1186,7 @@ def selection_legs(stratum, root):
     """A selection is indices, so a listing that changes under it must not leave them pointing at other files."""
     w = f'{root}/sel'
     os.makedirs(w)
-    files = ['onefile.txt', 'twofile.txt', 'threefile.txt']
+    files = ['onefile.txt', 'twofile.txt', 'threefile.txt', 'gonefile.txt']
     for name in files:
         spit(f'{w}/{name}', name.encode())
     names = files + ['madedir']
@@ -1105,8 +1203,11 @@ def selection_legs(stratum, root):
         term.expect(r'Delete 1 items')
         term.show('F8 with a mark and the same listing')
         print('ok: a mark survives while the listing stays the same', flush=True)
-        term.send(ENTER)
-        term.pump(0.3)
+        # Esc is a No: the question's own footer calls it cancel.
+        term.send(ESC)
+        term.pump(2.0)
+        record(os.path.exists(f'{w}/twofile.txt'), 'Esc at the delete question deletes nothing',
+               'Esc at the delete question deleted the marked file')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -1126,7 +1227,7 @@ def selection_legs(stratum, root):
         term.expect(r'madedir', timeout=30)
         term.pump(1.0)
         term.send(F8)
-        term.expect(r'Delete')
+        term.expect(r'Delete this|Delete \d+ items')
         term.show('F8 after the listing changed under a mark')
         text = term.screen.text()
         record('Delete this' in text and 'items' not in text,
@@ -1136,6 +1237,31 @@ def selection_legs(stratum, root):
         term.pump(0.3)
         left = sorted(n for n in os.listdir(w))
         record(left == sorted(names), 'answering No deleted nothing', f'after No the directory holds {left}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    # Yes, the one answer that deletes, so the Esc above is not a delete that never works.
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        term.expect(r'onefile\.txt', timeout=30)
+        term.pump(0.5)
+        pick(term, 'gonefile.txt', names)
+        term.send(b' ')
+        term.pump(0.5)
+        term.send(F8)
+        term.expect(r'Delete 1 items')
+        term.send(LEFT)
+        term.pump(0.2)
+        term.send(ENTER)
+        for _ in range(50):
+            term.pump(0.2)
+            if not os.path.exists(f'{w}/gonefile.txt'):
+                break
+        record(not os.path.exists(f'{w}/gonefile.txt'), 'Yes at the delete question deletes',
+               'Yes at the delete question left the file')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -1253,6 +1379,7 @@ def run(stratum, root):
     for leg, args in ((selection_legs, (stratum, root)),
                       (host_copy_refusals, (stratum, root)),
                       (host_copy_legs, (stratum, root)),
+                      (copy_engine_legs, (stratum, root)),
                       (volume_copy_legs, (stratum, root)),
                       (death_legs, (stratum, vol, host, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
@@ -1262,7 +1389,7 @@ def run(stratum, root):
                       (landing_legs, (stratum, root))):
         try:
             leg(*args)
-        except Failure as e:
+        except (Failure, OSError) as e:
             record(False, '', f'{leg.__name__}: {e}')
 
 

@@ -301,7 +301,8 @@ pub fn read_text_trim(client: &mut SlateClient, path: &str) -> Result<String> {
 /// Read a path and split on '\n' into lines (drops a single trailing empty line).
 pub fn read_lines(client: &mut SlateClient, path: &str) -> Result<Vec<String>> {
     let bytes = client.read_path(path)?;
-    let s = String::from_utf8(bytes).map_err(|_| anyhow!("{path}: not utf-8"))?;
+    // One name that is not UTF-8 would otherwise empty the whole listing.
+    let s = String::from_utf8_lossy(&bytes);
     let mut lines: Vec<String> = s.split('\n').map(|s| s.to_string()).collect();
     if let Some(last) = lines.last() {
         if last.is_empty() {

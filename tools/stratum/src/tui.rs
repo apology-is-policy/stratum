@@ -138,6 +138,7 @@ thread_local! {
     static CONFLICT_RESP: std::cell::RefCell<Option<ConflictResp>>
         = std::cell::RefCell::new(None);
     static DELETE_CANCEL: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static DELETE_CONFIRMED: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
 /// SWISS-4h: sticky conflict resolution policy carried across a
@@ -276,6 +277,8 @@ struct DeleteBatch {
     /// SWISS-4q-worker: in-flight worker thread for the CURRENT item.
     /// Same lifecycle as CopyBatch::worker.
     worker: Option<DeleteWorker>,
+    /// Set by a Yes on its question, and by nothing else.
+    confirmed: bool,
     /// SWISS-4q-worker: clock origin for the progress dialog's
     /// spinner phase + elapsed time display.
     start_time: Instant,
@@ -893,6 +896,14 @@ fn handle_key(
         return Ok(Action::Quit);
     }
     if matches!(key.code, KeyCode::F(10)) {
+        // Quitting mid-item would leave a partial file under a temporary name, or a short
+        // one under its own in a volume.
+        if copy_batch.is_some() || delete_batch.is_some() {
+            *local_dialog = Some(error_dialog(
+                "A copy or delete is running. Esc stops it after the item in hand; then F10.",
+            ));
+            return Ok(Action::Refresh);
+        }
         return Ok(Action::Quit);
     }
 
@@ -1122,6 +1133,17 @@ fn handle_key(
         }
         // SWISS-4d: F5 = copy active-panel cursor entry (or
         // selection set, SWISS-4h) to inactive panel's CWD.
+        // A second batch would replace the first mid-item, and a delete would take the
+        // sources a copy has still to read.
+        KeyCode::F(5) | KeyCode::F(7) | KeyCode::F(8)
+            if !key.modifiers.contains(KeyModifiers::SHIFT)
+                && (copy_batch.is_some() || delete_batch.is_some()) =>
+        {
+            *local_dialog = Some(error_dialog(
+                "A copy or delete is running; wait for it, or Esc to stop it.",
+            ));
+            return Ok(Action::Refresh);
+        }
         KeyCode::F(5) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             return start_f5(local_dialog, copy_batch, spawn, snap, *focus);
         }
@@ -2001,7 +2023,9 @@ fn submit_confirm(
         ConfirmAction::DeleteBatch => {
             // SWISS-4h: F8 batch confirm. On No, signal cancel; on
             // Yes, the DeleteBatch (already populated) advances.
-            if label != "Yes" {
+            if label == "Yes" {
+                DELETE_CONFIRMED.with(|c| c.set(true));
+            } else {
                 DELETE_CANCEL.with(|c| c.set(true));
             }
             Ok(Action::Refresh)
@@ -2876,6 +2900,8 @@ fn name_is_safe(name: &str) -> bool {
         && name != "."
         && name != ".."
         && !name.bytes().any(|b| b == b'/' || b < 0x20 || b == 0x7f)
+        // What a name that is not UTF-8 is shown as, which no file is called.
+        && !name.contains('\u{FFFD}')
 }
 
 /// A copy must not be able to write over its own source. On the host the paths are
@@ -2983,6 +3009,7 @@ fn start_f5(
     let mut items: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
     let mut refused = 0usize;
     let mut refused_error = None;
+    let mut left_out = 0usize;
     for &idx in effective_selection {
         let raw = match panel.raw_entries.get(idx as usize) {
             Some(r) => r,
@@ -3002,7 +3029,6 @@ fn start_f5(
                 continue;
             }
         };
-        let is_dir = kind == "d";
         let src = match &src_meta {
             BackendMeta::HostFs { root } => {
                 let mut p = root.clone();
@@ -3019,6 +3045,32 @@ fn start_f5(
                 PathBuf::from(s)
             }
             _ => continue,
+        };
+        // The file is asked what it is, since a listing says "link" or does not know:
+        // a link to a directory taken for a file gave the copy a directory to read, and a
+        // pipe gave it an open that never returns. Only files and directories go.
+        let is_dir = match &src_meta {
+            BackendMeta::HostFs { .. } => match std::fs::symlink_metadata(&src) {
+                Ok(m) if m.is_dir() => true,
+                Ok(m) if m.is_file() => false,
+                Ok(_) => {
+                    left_out += 1;
+                    continue;
+                }
+                Err(e) => {
+                    refused += 1;
+                    refused_error = Some(format!("{}: {e}", src.display()));
+                    continue;
+                }
+            },
+            _ => match kind {
+                "d" => true,
+                "-" => false,
+                _ => {
+                    left_out += 1;
+                    continue;
+                }
+            },
         };
         let dst = match &dst_meta {
             BackendMeta::HostFs { root } => {
@@ -3064,10 +3116,10 @@ fn start_f5(
         items: expansion.items, idx: 0,
         src_meta, dst_meta, src_sock, dst_sock,
         src_focus: active,
-        sticky: None, copied: 0, skipped: expansion.skipped,
+        sticky: None, copied: 0, skipped: expansion.skipped + left_out,
         failed: expansion.failed + refused,
         last_error: expansion.last_error.or(refused_error),
-        note: expansion.note,
+        note: expansion.note.or_else(|| (left_out > 0).then(|| LEFT_OUT_NOTE.to_string())),
         start_time: now,
         samples: Vec::with_capacity(crate::ui::SAMPLE_WINDOW),
         last_sample_bytes: 0,
@@ -3168,10 +3220,12 @@ fn start_f8(
     } else {
         format!("Delete {n} items?\n  {preview}, ... +{}", n - 5)
     };
+    DELETE_CONFIRMED.with(|c| c.set(false));
     *delete_batch = Some(DeleteBatch {
         items, idx: 0, deleted: 0, failed: refused,
         src_focus: active,
         worker: None,
+        confirmed: false,
         start_time: Instant::now(),
     });
     *local_dialog = Some(LocalDialog {
@@ -3354,6 +3408,18 @@ fn advance_copy_batch(
             Err(e) => {
                 batch.failed += 1;
                 batch.last_error = Some(format!("{}: {e}", w.dst_name));
+                // The copies under a directory that could not be made would fail one by
+                // one, or go wherever a link standing in its place points.
+                let (_, dst, is_dir) = batch.items[batch.idx].clone();
+                if is_dir {
+                    let next = batch.idx + 1;
+                    let under = batch.items[next..]
+                        .iter()
+                        .take_while(|it| it.1.starts_with(&dst))
+                        .count();
+                    batch.items.drain(next..next + under);
+                    batch.failed += under;
+                }
             }
         }
         batch.idx += 1;
@@ -3399,7 +3465,7 @@ fn advance_copy_batch(
             return Ok(Some(BatchTick::More));
         }
     };
-    let (_src, dst, _is_dir) = batch.items[batch.idx].clone();
+    let (_src, dst, is_dir) = batch.items[batch.idx].clone();
 
     /* Step 4: conflict probe — synchronous (see fn doc).
      *
@@ -3450,7 +3516,13 @@ fn advance_copy_batch(
     }
 
     /* Step 5: no conflict (or sticky policy applies) — spawn worker. */
-    let policy = if dst_exists { batch.sticky } else { None };
+    // A sticky Skip was answered for a file, so a directory that is there is merged
+    // into, its files meeting the Skip one by one; a directory's own Skip is asked there.
+    let policy = match (dst_exists, batch.sticky) {
+        (true, Some(ConflictPolicy::Skip)) if is_dir => None,
+        (true, sticky) => sticky,
+        (false, _) => None,
+    };
     spawn_copy_worker(batch, sp, policy);
     Ok(Some(BatchTick::More))
 }
@@ -3565,24 +3637,71 @@ fn host_mode(path: &Path) -> Option<u32> {
     std::fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777)
 }
 
-fn stm_mode(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str) -> Option<u32> {
-    let out = sp.run_stratum_fs_capture(sock, &["stat", p9]).ok()?;
-    String::from_utf8_lossy(&out)
-        .lines()
-        .find_map(|l| u32::from_str_radix(l.trim().strip_prefix("mode:")?.trim(), 8).ok())
-        .map(|m| m & 0o777)
+const LEFT_OUT_NOTE: &str = "Symlinks and special files are not copied.";
+
+#[derive(Clone, Copy)]
+struct StmStat {
+    mode: u32,
+    size: u64,
 }
 
-/// Nobody reads the bytes before the source's mode says they may, and a name planted
-/// ahead of the copy fails it rather than receiving it.
-fn open_host_temp(temp: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(temp)
+fn stm_stat(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str) -> Option<StmStat> {
+    let out = sp.run_stratum_fs_capture(sock, &["stat", p9]).ok()?;
+    let text = String::from_utf8_lossy(&out);
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
+    };
+    let mode = u32::from_str_radix(&field("mode:")?, 8).ok()? & 0o777;
+    let size = field("size:")?.parse().ok()?;
+    Some(StmStat { mode, size })
+}
+
+/// A host source is opened as what it was found to be, a file: a pipe would hold the
+/// open, and a name swapped for a link since is not followed.
+fn open_host_source(src: &Path) -> std::io::Result<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(src)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(f)
+}
+
+/// A link refuses a name that is there by now. A filesystem with no links has only the
+/// rename.
+fn take_new_name(temp: &Path, dst: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(temp, dst) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(temp);
+            Ok(())
+        }
+        Err(e) => {
+            let c = e.raw_os_error().unwrap_or(0);
+            if c == libc::EPERM || c == libc::ENOTSUP || c == libc::EOPNOTSUPP
+                || c == libc::EXDEV || c == libc::EMLINK
+            {
+                std::fs::rename(temp, dst)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// A directory already there is the merge an Overwrite asks for, and keeps its mode. A
 /// new one has to take its contents whatever its source says, and a source that cannot
 /// say leaves it private.
 fn make_host_dir(dst: &Path, mode: Option<u32>) -> std::io::Result<()> {
+    // A link standing where the directory goes would take the copies under it wherever
+    // it points, the source included.
+    if std::fs::symlink_metadata(dst).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other(
+            "a symbolic link stands where this directory goes, and a copy does not follow one",
+        ));
+    }
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(mode.unwrap_or(0o700) | 0o700)
@@ -3590,28 +3709,32 @@ fn make_host_dir(dst: &Path, mode: Option<u32>) -> std::io::Result<()> {
 }
 
 /// A copy reaches a host destination whole or not at all: it is written beside it and
-/// renamed over, and an old file is safe until then. A directory in the way stays, since
-/// rename will not put a file over one. No mode to give leaves it as the temp was made.
-fn finish_host_copy(
-    written: std::io::Result<()>,
+/// moved over, and an old file is safe until then. The temp is made here, O_EXCL at
+/// 0600: nobody reads the bytes before the source's mode says they may, a name planted
+/// ahead fails the copy rather than receiving it, and only what this made is removed.
+/// `fill` writes it and says how many bytes there should be, which is checked rather
+/// than trusted to an exit status. A directory in the way stays, since rename will not
+/// put a file over one.
+fn host_copy_via_temp(
     temp: &Path,
     dst: &Path,
     replacing: bool,
-    mode: Option<u32>,
+    mode: u32,
+    fill: impl FnOnce(&std::fs::File) -> std::io::Result<u64>,
 ) -> std::io::Result<()> {
-    let done = written
-        .and_then(|_| {
-            if replacing {
-                std::fs::File::open(temp)?.sync_all()
-            } else {
+    let f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(temp)?;
+    let done = fill(&f)
+        .and_then(|want| {
+            let got = f.metadata()?.len();
+            if got == want {
                 Ok(())
+            } else {
+                Err(std::io::Error::other(format!("{got} of {want} bytes arrived")))
             }
         })
-        .and_then(|_| match mode {
-            Some(m) => std::fs::set_permissions(temp, std::fs::Permissions::from_mode(m)),
-            None => Ok(()),
-        })
-        .and_then(|_| std::fs::rename(temp, dst));
+        .and_then(|_| if replacing { f.sync_all() } else { Ok(()) })
+        .and_then(|_| f.set_permissions(std::fs::Permissions::from_mode(mode)))
+        .and_then(|_| if replacing { std::fs::rename(temp, dst) } else { take_new_name(temp, dst) });
     if done.is_err() {
         let _ = std::fs::remove_file(temp);
     }
@@ -3654,23 +3777,32 @@ fn set_stm_mode(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str, mode: u32, given: u32
     )
 }
 
-/// A new name is written in place, and removed if the write fails. An existing file keeps
-/// its bytes until the new ones are whole: they go beside it and are moved over. The move
-/// is what commits; a plain write there would truncate the old file first. A mode that
-/// cannot be given fails the copy, which would otherwise hand the file to more readers.
+/// A new name is written in place, and an existing file keeps its bytes until the new
+/// ones are whole: they go beside it and are moved over, the move being what commits.
+/// `write -n` refuses a name that is there and removes what it made if it fails, so a
+/// copy never truncates or removes a file it did not make. What arrived is checked
+/// against `want`, and a mode that cannot be given fails the copy, which would otherwise
+/// hand the file to more readers.
+#[allow(clippy::too_many_arguments)]
 fn write_stm_file(
     sp: &Arc<SpawnCtx>,
     sock: &Path,
     dst: &str,
     temp: &str,
     replacing: bool,
-    mode: Option<u32>,
+    mode: u32,
+    want: u64,
     write: impl Fn(&str) -> Result<()>,
 ) -> Result<()> {
     let target = if replacing { temp } else { dst };
-    let done = write(target)
-        .and_then(|_| set_stm_mode(sp, sock, target, mode.unwrap_or(0o600), STM_WRITE_MODE))
-        .and_then(|_| {
+    write(target)?;
+    let done = match stm_stat(sp, sock, target) {
+        Some(st) if st.size == want => Ok(()),
+        Some(st) => Err(anyhow::anyhow!("{dst}: {} of {want} bytes arrived", st.size)),
+        None => Err(anyhow::anyhow!("{dst}: what was written cannot be read back")),
+    }
+    .and_then(|_| set_stm_mode(sp, sock, target, mode, STM_WRITE_MODE))
+    .and_then(|_| {
         if replacing {
             sp.run_stratum_fs(
                 sock,
@@ -3731,8 +3863,13 @@ fn perform_copy_one(
                 // directory here is mkdir only, and an existing one merges.
                 make_host_dir(dst, host_mode(src))?;
             } else {
-                let written = open_host_temp(temp).and_then(|_| std::fs::copy(src, temp)).map(|_| ());
-                finish_host_copy(written, temp, dst, replacing, host_mode(src))?;
+                let mut from = open_host_source(src)?;
+                let meta = from.metadata()?;
+                let (want, mode) = (meta.len(), meta.permissions().mode() & 0o777);
+                host_copy_via_temp(temp, dst, replacing, mode, |mut to| {
+                    io::copy(&mut io::BufReader::with_capacity(1 << 20, &mut from), &mut to)?;
+                    Ok(want)
+                })?;
             }
             Ok(CopyOutcome::Copied)
         }
@@ -3743,15 +3880,16 @@ fn perform_copy_one(
             if is_dir {
                 ensure_stm_dir(sp, sock, &p9, host_mode(src)).map_err(io_other)?;
             } else {
-                let sz = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-                write_stm_file(sp, sock, &p9, &path_to_p9(temp, dst_meta), replacing, host_mode(src),
+                let from = open_host_source(src)?;
+                let meta = from.metadata()?;
+                let (want, mode) = (meta.len(), meta.permissions().mode() & 0o777);
+                write_stm_file(sp, sock, &p9, &path_to_p9(temp, dst_meta), replacing, mode, want,
                                |to: &str| -> Result<()> {
-                    let f = std::fs::File::open(src)?;
-                    sp.run_stratum_fs(sock, &["write", to],
-                                       std::process::Stdio::from(f),
+                    sp.run_stratum_fs(sock, &["write", "-n", to],
+                                       std::process::Stdio::from(from.try_clone()?),
                                        std::process::Stdio::null())
                 }).map_err(io_other)?;
-                bump_bytes(sz);     /* stratum-fs dst → worker bumps. */
+                bump_bytes(want);     /* stratum-fs dst: the worker bumps. */
             }
             Ok(CopyOutcome::Copied)
         }
@@ -3759,17 +3897,19 @@ fn perform_copy_one(
             let sock = src_sock.ok_or_else(||
                 io::Error::new(io::ErrorKind::Other, "src sock missing"))?;
             let p9 = path_to_p9(src, src_meta);
+            let st = stm_stat(sp, sock, &p9);
             if is_dir {
-                make_host_dir(dst, stm_mode(sp, sock, &p9))?;
+                make_host_dir(dst, st.map(|s| s.mode))?;
             } else {
-                let written = open_host_temp(temp).and_then(|f| {
+                let st = st.ok_or_else(|| io::Error::other(format!("{p9}: cannot read its size and mode")))?;
+                host_copy_via_temp(temp, dst, replacing, st.mode, |to| {
                     sp.run_stratum_fs(sock, &["read", &p9],
                                        std::process::Stdio::null(),
-                                       std::process::Stdio::from(f))
-                        .map_err(io_other)
-                });
-                /* host-fs dst → main loop handles bytes accounting. */
-                finish_host_copy(written, temp, dst, replacing, stm_mode(sp, sock, &p9))?;
+                                       std::process::Stdio::from(to.try_clone()?))
+                        .map_err(io_other)?;
+                    Ok(st.size)
+                })?;
+                /* host-fs dst: the main loop does the bytes accounting. */
             }
             Ok(CopyOutcome::Copied)
         }
@@ -3780,18 +3920,16 @@ fn perform_copy_one(
                 io::Error::new(io::ErrorKind::Other, "dst sock missing"))?;
             let d_p9 = path_to_p9(dst, dst_meta);
             let s_p9 = path_to_p9(src, src_meta);
+            let st = stm_stat(sp, s_sock, &s_p9);
             if is_dir {
-                ensure_stm_dir(sp, d_sock, &d_p9, stm_mode(sp, s_sock, &s_p9)).map_err(io_other)?;
+                ensure_stm_dir(sp, d_sock, &d_p9, st.map(|s| s.mode)).map_err(io_other)?;
             } else {
+                let st = st.ok_or_else(|| io::Error::other(format!("{s_p9}: cannot read its size and mode")))?;
                 write_stm_file(sp, d_sock, &d_p9, &path_to_p9(temp, dst_meta), replacing,
-                               stm_mode(sp, s_sock, &s_p9),
+                               st.mode, st.size,
                                |to: &str| sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, to))
                     .map_err(io_other)?;
-                // Stat the destination for throughput accounting.
-                if let Ok(out) = sp.run_stratum_fs_capture(
-                    d_sock, &["stat", &d_p9]) {
-                    bump_bytes(parse_stratum_stat_size(&out));
-                }
+                bump_bytes(st.size);
             }
             Ok(CopyOutcome::Copied)
         }
@@ -3864,18 +4002,6 @@ fn parse_stratum_ls(stdout: &[u8]) -> Vec<(u8, &[u8])> {
         .collect()
 }
 
-/// Parse `stratum fs stat` output for the size field.
-fn parse_stratum_stat_size(stdout: &[u8]) -> u64 {
-    let s = String::from_utf8_lossy(stdout);
-    for line in s.lines() {
-        if let Some(rest) = line.trim().strip_prefix("size:") {
-            if let Ok(v) = rest.trim().parse::<u64>() {
-                return v;
-            }
-        }
-    }
-    0
-}
 
 /// What expanding a selection found: the items to copy, and what could not be walked or
 /// is not copied, which the summary has to count, or "0 failed" would be untrue.
@@ -3896,7 +4022,7 @@ impl Expansion {
 
     fn leave_out(&mut self) {
         self.skipped += 1;
-        self.note = Some("Symlinks and special files are not copied.".to_string());
+        self.note = Some(LEFT_OUT_NOTE.to_string());
     }
 }
 
@@ -3942,7 +4068,10 @@ fn walk_host_subtree(src: &Path, dst: &Path, to_volume: bool, out: &mut Expansio
         Ok(rd) => rd,
         Err(e) => return out.fail(src, e),
     };
-    for entry in read_dir {
+    // In name order, so a batch meets its items, and its questions, the same way each time.
+    let mut entries: Vec<_> = read_dir.collect();
+    entries.sort_by_key(|e| e.as_ref().ok().map(|e| e.file_name()));
+    for entry in entries {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -3991,7 +4120,9 @@ fn walk_stm_subtree(
         Ok(b) => b,
         Err(e) => return out.fail(src, e),
     };
-    for (kind, raw) in parse_stratum_ls(&listing) {
+    let mut entries = parse_stratum_ls(&listing);
+    entries.sort_by(|a, b| a.1.cmp(b.1));
+    for (kind, raw) in entries {
         let name = match std::str::from_utf8(raw) {
             Ok(n) if name_is_safe(n) => n,
             _ => {
@@ -4062,6 +4193,17 @@ fn advance_delete_batch(
     spawn: Option<&Arc<SpawnCtx>>,
     batch: &mut DeleteBatch,
 ) -> Result<Option<BatchTick>> {
+    // Only a Yes starts a delete. The question gone any other way, by Esc or under a
+    // dialog drawn over it, is a No.
+    if !batch.confirmed {
+        if DELETE_CONFIRMED.with(|c| c.replace(false)) {
+            batch.confirmed = true;
+        } else {
+            DELETE_CANCEL.with(|c| c.set(false));
+            batch.idx = batch.items.len();
+            return Ok(Some(BatchTick::Done));
+        }
+    }
     /* Cancellation flag from the F8 No-pick. Checked before any
      * worker spawn so we don't waste a thread. */
     if DELETE_CANCEL.with(|c| {

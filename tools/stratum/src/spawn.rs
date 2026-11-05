@@ -74,6 +74,8 @@ pub fn start_failure(log: &str) -> Option<String> {
     ];
     // Only the wrapper's number: the reason, when there is one, is above it.
     const WRAPPER: &str = "stratumd: run failed (rc=";
+    // Said on the way to a refusal, and not why.
+    const WARNING: &str = "stratumd: warning: ";
     let lines: Vec<&str> = log
         .lines()
         .filter(|l| !STARTING.iter().any(|p| l.starts_with(p)))
@@ -81,7 +83,7 @@ pub fn start_failure(log: &str) -> Option<String> {
     let said = lines
         .iter()
         .rev()
-        .find(|l| !l.starts_with(WRAPPER))
+        .find(|l| !l.starts_with(WRAPPER) && !l.starts_with(WARNING))
         .or_else(|| lines.last())?;
     Some(said.strip_prefix("stratumd: ").unwrap_or(said).to_string())
 }
@@ -530,7 +532,7 @@ impl SpawnCtx {
             .spawn()?;
         let reader_stdout = reader.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let writer = Command::new(&self.me)
-            .args(&["fs", "-s", dst_sock_str, "write", dst_path])
+            .args(&["fs", "-s", dst_sock_str, "write", "-n", dst_path])
             .stdin(Stdio::from(reader_stdout))
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -539,6 +541,16 @@ impl SpawnCtx {
         let reader_status = reader.wait()?;
         let writer_out = writer.wait_with_output()?;
         if !reader_status.success() {
+            // The writer took the reader's end for the end of the file and kept what had
+            // come; write -n made that file, so it goes.
+            if writer_out.status.success() {
+                let _ = Command::new(&self.me)
+                    .args(["fs", "-s", dst_sock_str, "rm", dst_path])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
             bail!("stratum fs read failed (exit {})", reader_status.code().unwrap_or(-1));
         }
         if !writer_out.status.success() {
@@ -592,6 +604,13 @@ fn wait_for_sock(path: &Path, timeout: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::start_failure;
+
+    #[test]
+    fn a_warning_is_not_the_reason() {
+        let log = "stratumd: warning: cannot lock /v (x); running without the lock\n\
+                   stratumd: run failed (rc=-5)\n";
+        assert_eq!(start_failure(log).as_deref(), Some("run failed (rc=-5)"));
+    }
 
     #[test]
     fn a_reason_is_found_under_the_startup_lines() {
