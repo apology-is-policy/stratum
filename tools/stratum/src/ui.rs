@@ -218,14 +218,6 @@ pub enum ConfirmAction {
         p9_path: String,
         is_dir: bool,
     },
-    /// F5 conflict resolution (single-file path; F5 with no selection).
-    /// User picks Skip/Overwrite/KeepBoth, runs the copy with the
-    /// resolution applied.
-    CopyConflict {
-        src: std::path::PathBuf,
-        dst: std::path::PathBuf,
-        is_dir: bool,
-    },
     /// SWISS-4h: F5 batch conflict. The advancing CopyBatch hit a
     /// conflict. User picks one of 7 options (Skip/SkipAll/Overwrite/
     /// OverwriteAll/KeepBoth/KeepBothAll/Cancel). The dispatcher in

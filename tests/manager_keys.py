@@ -701,6 +701,310 @@ def wrong_passphrase_leg(stratum, vol, host):
         term.kill()
 
 
+# The conflict dialog's options, counted from the left.
+SKIP, OVERWRITE, KEEP_BOTH = 0, 2, 4
+
+
+def slurp(path):
+    with open(path, 'rb') as f:
+        return f.read()
+
+
+def spit(path, data):
+    with open(path, 'wb') as f:
+        f.write(data)
+
+
+def rows_in_panel(term, names, right):
+    rows, start, end = {}, *((COLS // 2, COLS) if right else (0, COLS // 2))
+    for r, line in enumerate(term.screen.text().split('\n')):
+        for name in names:
+            if name not in rows and name in line[start:end]:
+                rows[name] = r
+    return rows
+
+
+def pick(term, name, names, right=False):
+    """Put the focused panel's cursor on name. names is everything that panel lists."""
+    for _ in names:
+        term.send(UP)
+        term.pump(0.05)
+    term.send(UP)
+    term.pump(0.2)
+    rows = rows_in_panel(term, names, right)
+    if name not in rows:
+        raise Failure(f'{name} is not in the panel, which shows {sorted(rows)}')
+    for _ in range(rows[name] - min(rows.values())):
+        term.send(DOWN)
+        term.pump(0.05)
+    term.pump(0.2)
+
+
+def answer_conflict(term, option):
+    term.expect(r'Destination exists')
+    for _ in range(option):
+        term.send(RIGHT)
+        term.pump(0.05)
+    term.send(ENTER)
+
+
+def copy_summary(term, what):
+    """(copied, skipped, failed, the screen). Dismisses the dialog, so the next one is seen fresh."""
+    term.expect(r'Copy: \d+ copied', timeout=120)
+    term.show(what)
+    text = term.screen.text()
+    m = re.search(r'Copy: (\d+) copied . (\d+) skipped . (\d+) failed', text)
+    if not m:
+        raise Failure(f'{what}: the summary did not read as one')
+    term.send(ENTER)
+    term.pump(0.4)
+    return int(m[1]), int(m[2]), int(m[3]), text
+
+
+def host_copy_refusals(stratum, root):
+    """Both panels start in one directory, which is how F5 Overwrite came to delete the source."""
+    w = f'{root}/same'
+    os.makedirs(f'{w}/dirone/inner')
+    spit(f'{w}/xfile.txt', b'source\n')
+    spit(f'{w}/dirone/a.txt', b'a\n')
+    names = ['xfile.txt', 'dirone']
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        term.expect(r'xfile\.txt', timeout=30)
+        term.pump(0.5)
+        pick(term, 'xfile.txt', names)
+        term.send(F5)
+        term.expect(r'Source and destination are the same')
+        term.show('F5 over itself')
+        term.send(ENTER)
+        term.pump(0.3)
+        record(slurp(f'{w}/xfile.txt') == b'source\n', 'F5 of a file over itself says so and keeps it',
+               'F5 of a file over itself changed it')
+
+        pick(term, 'dirone', names)
+        term.send(F5)
+        term.expect(r'Source and destination are the same')
+        term.send(ENTER)
+        term.pump(0.3)
+        record(slurp(f'{w}/dirone/a.txt') == b'a\n', 'F5 of a directory over itself says so and keeps it',
+               'F5 of a directory over itself changed it')
+
+        # The other panel inside the directory: the copy would land in itself.
+        term.send(TAB)
+        term.pump(0.3)
+        pick(term, 'dirone', names, right=True)
+        term.send(ENTER)
+        term.pump(0.6)
+        term.send(TAB)
+        term.pump(0.3)
+        pick(term, 'dirone', names)
+        term.send(F5)
+        term.expect(r'cannot be copied into itself')
+        term.show('a directory into itself')
+        term.send(ENTER)
+        term.pump(0.3)
+        record(not os.path.exists(f'{w}/dirone/dirone'), 'a directory is not copied into itself',
+               'a directory was copied into itself')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+
+def host_copy_legs(stratum, root):
+    """F5 between host directories. Whatever is asked for, what was there is not lost by failing."""
+    w = f'{root}/copy'
+    sub = f'{w}/subdest'
+    os.makedirs(sub)
+    os.makedirs(f'{w}/dirone/inner')
+    os.makedirs(f'{w}/treeone/shut')
+    spit(f'{w}/xfile.txt', b'source\n')
+    spit(f'{w}/dirone/a.txt', b'a\n')
+    spit(f'{w}/dirone/inner/b.txt', b'b\n')
+    spit(f'{w}/treeone/ok.txt', b'ok\n')
+    os.symlink('ok.txt', f'{w}/treeone/lnk')
+    names = ['xfile.txt', 'subdest', 'dirone', 'treeone']
+    root_user = os.geteuid() == 0
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        term.expect(r'xfile\.txt', timeout=30)
+        term.pump(0.5)
+        term.send(TAB)
+        term.pump(0.3)
+        pick(term, 'subdest', names, right=True)
+        term.send(ENTER)
+        term.pump(0.6)
+        term.send(TAB)
+        term.pump(0.3)
+
+        # The control for everything below: the same keys, with nothing in the way.
+        pick(term, 'xfile.txt', names)
+        term.send(F5)
+        copied, skipped, failed, _ = copy_summary(term, 'F5 into an empty directory')
+        record((copied, skipped, failed) == (1, 0, 0) and slurp(f'{sub}/xfile.txt') == b'source\n',
+               'F5 copies a file', f'F5 of a file: {copied} copied, {skipped} skipped, {failed} failed')
+
+        if root_user:
+            print('note: running as root, so an unreadable source cannot be made here', flush=True)
+        else:
+            spit(f'{sub}/xfile.txt', b'old\n')
+            os.chmod(f'{w}/xfile.txt', 0)
+            term.send(F5)
+            answer_conflict(term, OVERWRITE)
+            _, _, failed, _ = copy_summary(term, 'Overwrite with an unreadable source')
+            os.chmod(f'{w}/xfile.txt', 0o644)
+            record(failed == 1 and slurp(f'{sub}/xfile.txt') == b'old\n',
+                   'an Overwrite that cannot read its source keeps the old destination',
+                   f'an Overwrite with an unreadable source: {failed} failed, destination {slurp(f"{sub}/xfile.txt")!r}')
+
+        term.send(F5)
+        answer_conflict(term, OVERWRITE)
+        copied, _, failed, _ = copy_summary(term, 'Overwrite')
+        record((copied, failed) == (1, 0) and slurp(f'{sub}/xfile.txt') == b'source\n',
+               'Overwrite replaces the file', f'Overwrite: {copied} copied, {failed} failed')
+
+        spit(f'{sub}/xfile.txt', b'old\n')
+        term.send(F5)
+        answer_conflict(term, KEEP_BOTH)
+        copy_summary(term, 'KeepBoth')
+        record(slurp(f'{sub}/xfile.txt') == b'old\n' and slurp(f'{sub}/xfile-2.txt') == b'source\n',
+               'KeepBoth keeps both', 'KeepBoth did not keep both')
+
+        # A directory in the way, with a file of its own in it.
+        os.makedirs(f'{sub}/dirone')
+        spit(f'{sub}/dirone/old.txt', b'old\n')
+        pick(term, 'dirone', names)
+        term.send(F5)
+        answer_conflict(term, KEEP_BOTH)
+        copy_summary(term, 'KeepBoth on a directory')
+        record(os.path.exists(f'{sub}/dirone-2/inner/b.txt') and not os.path.exists(f'{sub}/dirone/a.txt'),
+               "a directory kept under a new name takes its contents along",
+               "a directory's contents did not follow its new name")
+
+        term.send(F5)
+        answer_conflict(term, SKIP)
+        _, skipped, _, _ = copy_summary(term, 'Skip on a directory')
+        record(skipped == 4 and not os.path.exists(f'{sub}/dirone/a.txt'),
+               'Skip on a directory skips what is under it', f'Skip on a directory: {skipped} skipped')
+
+        term.send(F5)
+        answer_conflict(term, OVERWRITE)
+        _, _, failed, _ = copy_summary(term, 'Overwrite on a directory')
+        record(failed == 0 and os.path.exists(f'{sub}/dirone/old.txt') and os.path.exists(f'{sub}/dirone/inner/b.txt'),
+               'Overwrite on a directory merges, and deletes nothing',
+               f'Overwrite on a directory: {failed} failed, old.txt there: {os.path.exists(f"{sub}/dirone/old.txt")}')
+
+        # What a walk cannot copy has to show in the count.
+        if not root_user:
+            os.chmod(f'{w}/treeone/shut', 0)
+        pick(term, 'treeone', names)
+        term.send(F5)
+        _, skipped, failed, text = copy_summary(term, 'a tree with a symlink and a shut directory')
+        record(skipped >= 1 and 'not copied' in text, 'a symlink in a tree is counted and explained',
+               f'a symlink in a tree: {skipped} skipped, explained: {"not copied" in text}')
+        if not root_user:
+            record(failed >= 1, 'a directory the walk cannot read is counted as failed',
+                   'a directory the walk could not read went uncounted')
+        record(slurp(f'{sub}/treeone/ok.txt') == b'ok\n', 'the rest of that tree is copied', 'the rest of that tree is not there')
+
+        left = [n for _, _, fs in os.walk(w) for n in fs if n.startswith('.stratum-copy-')]
+        record(not left, 'no copy left a temporary file', f'temporary files left: {left}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+        if os.path.exists(f'{w}/xfile.txt'):
+            os.chmod(f'{w}/xfile.txt', 0o644)
+        os.chmod(f'{w}/treeone/shut', 0o755)
+
+
+def volume_copy_legs(stratum, root):
+    """The same promises on a volume, and a name in it that must not steer a copy."""
+    base = f'{root}/copyvol'
+    host = f'{base}/host'
+    os.makedirs(host)
+    spit(f'{host}/keptfile.txt', b'new\n')
+    spit(f'{host}/overfile.txt', b'new\n')
+    vol = Volume(stratum, base)
+    vol.mkfs()
+    vol.serve()
+    # It reads as two lines, and so as two entries, to a reader that splits on them.
+    hostile = '/hostile/innocent\n- escaped'
+    for args, data in ((('write', '/keptfile.txt'), b'old\n'), (('write', '/overfile.txt'), b'old\n'),
+                       (('mkdir', '/hostile'), None), (('write', '/hostile/plain.txt'), b'plain\n'),
+                       (('write', hostile), b'bad\n')):
+        r = vol.fs(vol.sock, *args, data=data)
+        if r.returncode != 0:
+            raise Failure(f'seeding {args}: {r.stderr[:200]}')
+    if b'\0' not in vol.fs(vol.sock, 'ls', '-0', '/hostile').stdout:
+        raise Failure('ls -0 printed no NUL')
+    vol.stop()
+
+    host_names = ['keptfile.txt', 'overfile.txt']
+    vol_names = ['keptfile.txt', 'overfile.txt', 'keptfile-2.txt', 'hostile', '.snaps']
+    env_file = f'{base}/env'
+    term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file])
+    try:
+        term.expect(r'Passphrase for')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'hostile', timeout=60)
+        term.pump(0.5)
+        sock = read_env(env_file)['STRATUMD_SOCK']
+        def on_vol(p9):
+            return vol.fs(sock, 'read', p9).stdout
+
+        term.send(TAB)
+        term.pump(0.3)
+        pick(term, 'keptfile.txt', host_names, right=True)
+        term.send(F5)
+        answer_conflict(term, KEEP_BOTH)
+        copy_summary(term, 'KeepBoth on a volume')
+        record(on_vol('/keptfile.txt') == b'old\n' and on_vol('/keptfile-2.txt') == b'new\n',
+               'KeepBoth on a volume keeps both', 'KeepBoth on a volume did not keep both')
+
+        pick(term, 'overfile.txt', host_names, right=True)
+        if os.geteuid() != 0:
+            os.chmod(f'{host}/overfile.txt', 0)
+            term.send(F5)
+            answer_conflict(term, OVERWRITE)
+            _, _, failed, _ = copy_summary(term, 'Overwrite on a volume, unreadable source')
+            os.chmod(f'{host}/overfile.txt', 0o644)
+            record(failed == 1 and on_vol('/overfile.txt') == b'old\n',
+                   'an Overwrite on a volume that cannot read its source keeps the old file',
+                   f'an Overwrite on a volume: {failed} failed, file {on_vol("/overfile.txt")!r}')
+
+        term.send(F5)
+        answer_conflict(term, OVERWRITE)
+        copied, _, failed, _ = copy_summary(term, 'Overwrite on a volume')
+        record((copied, failed) == (1, 0) and on_vol('/overfile.txt') == b'new\n',
+               'Overwrite on a volume replaces the file', f'Overwrite on a volume: {copied} copied, {failed} failed')
+        record(b'.stratum-copy-' not in vol.fs(sock, 'ls', '/').stdout, 'no copy left a temporary file in the volume',
+               'a temporary file was left in the volume')
+
+        term.send(TAB)
+        term.pump(0.3)
+        pick(term, 'hostile', vol_names)
+        term.send(F5)
+        _, _, failed, _ = copy_summary(term, 'a name that reads as two lines')
+        record(failed >= 1, 'a name with a newline in it is counted as failed', 'a name with a newline went uncounted')
+        out = f'{host}/hostile'
+        record(os.path.exists(f'{out}/plain.txt'), 'the names around it are copied', 'the name beside it was not copied')
+        listed = sorted(os.listdir(out)) if os.path.isdir(out) else []
+        record(listed == ['plain.txt'], 'nothing else came out of that directory', f'that directory also made: {listed}')
+
+        term.send(F10)
+        if not term.exited(60):
+            raise Failure('F10 did not quit')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+        os.chmod(f'{host}/overfile.txt', 0o644)
+
+
 def run(stratum, root):
     host = f'{root}/host'
     tree = f'{host}/tree'
@@ -808,7 +1112,10 @@ def run(stratum, root):
         vol.stop()
 
     # One leg's failure must not hide what the rest would have shown.
-    for leg, args in ((death_legs, (stratum, vol, host, root)),
+    for leg, args in ((host_copy_refusals, (stratum, root)),
+                      (host_copy_legs, (stratum, root)),
+                      (volume_copy_legs, (stratum, root)),
+                      (death_legs, (stratum, vol, host, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
                       (wrong_passphrase_leg, (stratum, vol, host)),
                       (wizard_legs, (stratum, vol, root)),

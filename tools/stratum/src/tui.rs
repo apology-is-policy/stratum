@@ -158,15 +158,17 @@ enum ConflictPolicy {
 /// `dst_name` is kept on the handle so the progress dialog can show
 /// "Copying X..." even before the worker has bumped bytes_done.
 ///
-/// `dst_poll_path` is Some(host_path) when the dst is on the host
-/// filesystem — the main loop stats it every tick to surface intra-
-/// file progress (host stat is ~10μs; polling cost is negligible).
-/// None for stratum-fs dst (stat-via-subprocess is too expensive
-/// for the hot path); those copies fall back to the spinner.
+/// `dst_poll_path` is the file being written when the dst is on the
+/// host filesystem, which the main loop stats every tick to surface
+/// intra-file progress (a host stat costs next to nothing). None for
+/// a stratum-fs dst, where a stat is a subprocess; those copies fall
+/// back to the spinner. `dst_final` is the name it ends up with, which
+/// gives the true size once the worker is done.
 struct CopyWorker {
     handle: thread::JoinHandle<std::io::Result<CopyOutcome>>,
     dst_name: String,
     dst_poll_path: Option<PathBuf>,
+    dst_final: PathBuf,
 }
 
 /// SWISS-4q-worker: in-flight delete of a single batch item. Same
@@ -245,6 +247,8 @@ struct CopyBatch {
     /// see WHY a copy failed (was: silent swallow → "1 failed" with
     /// no detail → user reported "no dialog shown" with status -12).
     last_error: Option<String>,
+    /// What the summary must say even when nothing failed.
+    note: Option<String>,
     /// SWISS-4n2: clock origin for throughput display.
     start_time: Instant,
     /// SWISS-4r-3: rolling per-tick throughput samples for the
@@ -533,6 +537,9 @@ fn run_ui(
                                     summary.push_str(&format!("\n\n{e}"));
                                 }
                             }
+                            if let Some(n) = batch.note.as_deref() {
+                                summary.push_str(&format!("\n\n{n}"));
+                            }
                             let dlg = if batch.failed == 0 {
                                 info_dialog(&summary)
                             } else {
@@ -632,10 +639,10 @@ fn run_ui(
             if let Some(b) = copy_batch.as_ref() {
                 if let Some(w) = b.worker.as_ref() {
                     if let Some(path) = w.dst_poll_path.as_deref() {
-                        let sz = std::fs::metadata(path)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        set_intra_file_bytes(sz);
+                        // Gone once it has its final name, and the last figure stands until then.
+                        if let Ok(m) = std::fs::metadata(path) {
+                            set_intra_file_bytes(m.len());
+                        }
                     }
                 }
             }
@@ -2106,60 +2113,12 @@ fn submit_confirm(
             )));
             Ok(Action::Refresh)
         }
-        ConfirmAction::CopyConflict { src, dst, is_dir } => {
-            match label.as_str() {
-                "Skip" => Ok(Action::Refresh),
-                "Overwrite" => {
-                    // Remove dst then re-run the copy.
-                    let rm = if is_dir {
-                        std::fs::remove_dir_all(&dst)
-                    } else {
-                        std::fs::remove_file(&dst)
-                    };
-                    if let Err(e) = rm {
-                        *local_dialog = Some(error_dialog(&format!(
-                            "overwrite failed (could not remove dst): {e}"
-                        )));
-                        return Ok(Action::Refresh);
-                    }
-                    let res = if is_dir {
-                        copy_dir_recursive(&src, &dst)
-                    } else {
-                        std::fs::copy(&src, &dst).map(|_| ())
-                    };
-                    if let Err(e) = res {
-                        *local_dialog = Some(error_dialog(&format!(
-                            "copy failed: {e}"
-                        )));
-                    }
-                    Ok(Action::Refresh)
-                }
-                "KeepBoth" => {
-                    let new_dst = derive_unique_path(&dst);
-                    let res = if is_dir {
-                        copy_dir_recursive(&src, &new_dst)
-                    } else {
-                        std::fs::copy(&src, &new_dst).map(|_| ())
-                    };
-                    if let Err(e) = res {
-                        *local_dialog = Some(error_dialog(&format!(
-                            "copy failed: {e}\n  → {}",
-                            new_dst.display()
-                        )));
-                    }
-                    Ok(Action::Refresh)
-                }
-                _ => Ok(Action::Refresh),
-            }
-        }
     }
 }
 
-/// Append "-2", "-3", ... to the stem until the path doesn't exist.
-/// Lift of v1's KeepBoth idiom (v1 used " (copy)" → " (copy 2)" → ...
-/// but we use the simpler hyphen-counter form which is friendlier
-/// for shell completion).
-fn derive_unique_path(p: &Path) -> PathBuf {
+/// Append "-2", "-3", ... to the stem until the name is free, as `taken` sees it.
+/// The hyphen-counter form, which is friendlier for shell completion than " (copy)".
+fn derive_unique_with(p: &Path, taken: impl Fn(&Path) -> bool) -> PathBuf {
     let parent = p.parent().unwrap_or_else(|| Path::new("."));
     let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = p.extension().map(|s| s.to_string_lossy().into_owned());
@@ -2169,7 +2128,7 @@ fn derive_unique_path(p: &Path) -> PathBuf {
             None => format!("{stem}-{n}"),
         };
         let cand = parent.join(candidate_name);
-        if !cand.exists() {
+        if !taken(&cand) {
             return cand;
         }
     }
@@ -2919,9 +2878,61 @@ fn mount_stm_volume(
     }
 }
 
-/// SWISS-4h: F5 entry point. If the active panel has a selection,
-/// build a CopyBatch and let the main loop advance it. Otherwise
-/// fall through to the single-cursor copy path (run_copy).
+/// A name from a listing, before it goes into a path. A volume can hold nearly any
+/// name, and a volume can come from anyone, so this is what keeps a listing from
+/// pointing a copy outside its destination.
+fn name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.bytes().any(|b| b == b'/' || b < 0x20 || b == 0x7f)
+}
+
+/// A copy must not be able to write over its own source. On the host the paths are
+/// compared by where they really lead, since two panels can reach one directory by
+/// different routes; inside a volume a path has one spelling.
+fn copy_overlap(
+    src: &Path,
+    dst: &Path,
+    src_meta: &BackendMeta,
+    dst_meta: &BackendMeta,
+    src_sock: Option<&Path>,
+    dst_sock: Option<&Path>,
+) -> Option<String> {
+    let (s, d) = match (src_meta, dst_meta) {
+        (BackendMeta::HostFs { .. }, BackendMeta::HostFs { .. }) => {
+            let s = std::fs::canonicalize(src).ok()?;
+            let d = std::fs::canonicalize(dst).ok().or_else(|| {
+                let parent = std::fs::canonicalize(dst.parent()?).ok()?;
+                Some(parent.join(dst.file_name()?))
+            })?;
+            (s, d)
+        }
+        (BackendMeta::Stratumd { .. }, BackendMeta::Stratumd { .. })
+            if src_sock.is_some() && src_sock == dst_sock =>
+        {
+            (src.to_path_buf(), dst.to_path_buf())
+        }
+        _ => return None,
+    };
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| src.display().to_string());
+    if d == s {
+        Some(format!("Source and destination are the same: {name}"))
+    } else if d.starts_with(&s) {
+        Some(format!("{name} cannot be copied into itself"))
+    } else if s.starts_with(&d) {
+        Some(format!("{name} is inside the destination it would replace"))
+    } else {
+        None
+    }
+}
+
+/// SWISS-4h: F5 entry point. Always a batch, whether the active panel has a selection
+/// or only a cursor, so the user sees progress during a long copy and a directory
+/// recurses on every route. The main loop advances it.
 fn start_f5(
     local_dialog: &mut Option<LocalDialog>,
     copy_batch: &mut Option<CopyBatch>,
@@ -2934,29 +2945,6 @@ fn start_f5(
         *local_dialog = Some(error_dialog("Active panel is not connected."));
         return Ok(Action::Refresh);
     }
-    // SWISS-4q P1: ALWAYS route through the batch path so the user
-    // sees the progress dialog during long copies. Pre-fix, no-
-    // selection F5 went through run_copy which is synchronous —
-    // a 1.8 GB copy froze the UI for 5+ seconds with no visible
-    // feedback. The batch path's per-tick advance lets the dialog
-    // render, and the throughput chart picks up samples. Per-byte
-    // progress for a single big file is forward-noted (needs
-    // either chunked subprocess or worker thread; see SWISS-4q-
-    // bytes).
-    //
-    // SWISS-4r-8: cursor-on-directory cross-backend copy.
-    // No selection AND cursor on a dir AND src/dst are different
-    // backends → use the batch path (which goes through
-    // expand_dirs_in_items and recursively copies). Without this
-    // shortcut, run_copy refused with "Cross-backend directory copy
-    // not yet supported (SWISS-4d2)" — the workaround was Space
-    // then F5, which is unintuitive and surprised the user.
-    //
-    // Synthesize the selection vec inline so the loop below treats
-    // the cursor as if the user had spacebar-selected it. We DON'T
-    // mutate `snap.panels[active].selection` (UiState isn't Clone);
-    // instead we shadow `panel.selection` via an owned Vec when the
-    // condition fires.
     let synthetic_selection: Vec<u32>;
     let effective_selection: &Vec<u32> = if panel.selection.is_empty() {
         // SWISS-4q P1: any cursor-on-entry F5 routes through batch.
@@ -2968,7 +2956,8 @@ fn start_f5(
             .map(|r| r.splitn(5, ' ').nth(4) == Some(".."))
             .unwrap_or(false);
         if raw.is_none() || name_is_dotdot {
-            return run_copy(local_dialog, spawn, snap, active);
+            *local_dialog = Some(error_dialog("Cannot copy '..' or empty entry."));
+            return Ok(Action::Refresh);
         }
         synthetic_selection = vec![panel.cursor];
         &synthetic_selection
@@ -3002,6 +2991,8 @@ fn start_f5(
     let src_cwd = panel.path.trim_start_matches('/');
     let dst_cwd = dst_panel.path.trim_start_matches('/');
     let mut items: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+    let mut refused = 0usize;
+    let mut refused_error = None;
     for &idx in effective_selection {
         let raw = match panel.raw_entries.get(idx as usize) {
             Some(r) => r,
@@ -3013,8 +3004,13 @@ fn start_f5(
         let _ = parts.next();
         let _ = parts.next();
         let name = match parts.next() {
-            Some(n) if !n.is_empty() && n != ".." => n.to_string(),
-            _ => continue,
+            None | Some("..") => continue,
+            Some(n) if name_is_safe(n) => n.to_string(),
+            Some(n) => {
+                refused += 1;
+                refused_error = Some(format!("A name this manager will not copy: {}", n.escape_debug()));
+                continue;
+            }
         };
         let is_dir = kind == "d";
         let src = match &src_meta {
@@ -3058,21 +3054,30 @@ fn start_f5(
         *local_dialog = Some(error_dialog("Nothing valid in selection."));
         return Ok(Action::Refresh);
     }
+    // Refused whole, before anything moves.
+    for (src, dst, _) in &items {
+        if let Some(why) = copy_overlap(src, dst, &src_meta, &dst_meta,
+                                        src_sock.as_deref(), dst_sock.as_deref()) {
+            *local_dialog = Some(error_dialog(&why));
+            return Ok(Action::Refresh);
+        }
+    }
     // SWISS-4n2: expand directory items into a flat list of leaves +
     // intermediate dirs (top-down). Preserves the existing per-item
     // conflict-resolution flow — sticky policy continues to apply
     // across all items, including expanded children.
-    let expanded = expand_dirs_in_items(&sp, &src_meta, src_sock.as_deref(),
-                                            &dst_meta, items);
+    let expansion = expand_dirs_in_items(sp, &src_meta, src_sock.as_deref(), &dst_meta, items);
     // SWISS-4n2: reset bytes-done counter for the new batch.
     reset_bytes_done();
     let now = Instant::now();
     *copy_batch = Some(CopyBatch {
-        items: expanded, idx: 0,
+        items: expansion.items, idx: 0,
         src_meta, dst_meta, src_sock, dst_sock,
         src_focus: active,
-        sticky: None, copied: 0, skipped: 0, failed: 0,
-        last_error: None,
+        sticky: None, copied: 0, skipped: expansion.skipped,
+        failed: expansion.failed + refused,
+        last_error: expansion.last_error.or(refused_error),
+        note: expansion.note,
         start_time: now,
         samples: Vec::with_capacity(crate::ui::SAMPLE_WINDOW),
         last_sample_bytes: 0,
@@ -3115,6 +3120,7 @@ fn start_f8(
 
     let mut items: Vec<DeleteItem> = Vec::new();
     let mut display_names: Vec<String> = Vec::new();
+    let mut refused = 0usize;
     for &idx in &panel.selection {
         let raw = match panel.raw_entries.get(idx as usize) {
             Some(r) => r,
@@ -3126,8 +3132,12 @@ fn start_f8(
         let _ = parts.next();
         let _ = parts.next();
         let name = match parts.next() {
-            Some(n) if !n.is_empty() && n != ".." => n.to_string(),
-            _ => continue,
+            None | Some("..") => continue,
+            Some(n) if name_is_safe(n) => n.to_string(),
+            Some(_) => {
+                refused += 1;
+                continue;
+            }
         };
         let is_dir = kind == "d";
         match &meta {
@@ -3169,7 +3179,7 @@ fn start_f8(
         format!("Delete {n} items?\n  {preview}, ... +{}", n - 5)
     };
     *delete_batch = Some(DeleteBatch {
-        items, idx: 0, deleted: 0, failed: 0,
+        items, idx: 0, deleted: 0, failed: refused,
         src_focus: active,
         worker: None,
         start_time: Instant::now(),
@@ -3179,240 +3189,6 @@ fn start_f8(
             options: vec!["Yes".into(), "No".into()],
             selected: 1,
             on_pick: ConfirmAction::DeleteBatch,
-        },
-        prompt,
-        value: String::new(),
-        is_password: false,
-        is_error: false,
-    });
-    Ok(Action::Refresh)
-}
-
-/// SWISS-4d v1.0: copy active-panel cursor entry to inactive panel's
-/// CWD. Synchronous — blocks the TUI for the duration. Progress
-/// dialog + multi-select forward-noted.
-fn run_copy(
-    local_dialog: &mut Option<LocalDialog>,
-    spawn: Option<&Arc<SpawnCtx>>,
-    snap: &UiState,
-    active: usize,
-) -> Result<Action> {
-    let sp = match spawn {
-        Some(s) => s,
-        None => {
-            *local_dialog = Some(error_dialog(
-                "Copy unavailable: spawn helper not present.",
-            ));
-            return Ok(Action::Refresh);
-        }
-    };
-
-    let inactive = 1 - active;
-    let src_meta = sp.panel_meta(active);
-    let dst_meta = sp.panel_meta(inactive);
-
-    // Resolve source entry from active panel cursor.
-    let panel = &snap.panels[active];
-    if !panel.connected {
-        *local_dialog = Some(error_dialog("Active panel is not connected."));
-        return Ok(Action::Refresh);
-    }
-    let cursor = panel.cursor as usize;
-    let raw = match panel.raw_entries.get(cursor) {
-        Some(r) => r,
-        None => {
-            *local_dialog = Some(error_dialog("No entry at cursor."));
-            return Ok(Action::Refresh);
-        }
-    };
-    let mut parts = raw.splitn(5, ' ');
-    let kind = parts.next().unwrap_or("?");
-    let _ = parts.next();
-    let _ = parts.next();
-    let _ = parts.next();
-    let name = match parts.next() {
-        Some(n) if !n.is_empty() && n != ".." => n,
-        _ => {
-            *local_dialog = Some(error_dialog("Cannot copy '..' or empty entry."));
-            return Ok(Action::Refresh);
-        }
-    };
-
-    let is_dir = kind == "d";
-    let src_cwd = panel.path.trim_start_matches('/');
-    let dst_panel = &snap.panels[inactive];
-    let dst_cwd = dst_panel.path.trim_start_matches('/');
-
-    // SWISS-4g: dispatch on (src, dst) backend pair. Directory
-    // copies across backends are forward-noted (SWISS-4d2 — needs
-    // recursive 9P walks); v1.0 of SWISS-4g supports single files
-    // across all four backend pairs + host→host directories via
-    // std::fs.
-    match (&src_meta, &dst_meta) {
-        (BackendMeta::HostFs { root: s_root }, BackendMeta::HostFs { root: d_root }) => {
-            let mut src = s_root.clone();
-            if !src_cwd.is_empty() { src.push(src_cwd); }
-            src.push(name);
-            let mut dst = d_root.clone();
-            if !dst_cwd.is_empty() { dst.push(dst_cwd); }
-            dst.push(name);
-            if dst.exists() {
-                return open_copy_conflict(local_dialog, src, dst, is_dir);
-            }
-            let res = if is_dir {
-                copy_dir_recursive(&src, &dst)
-            } else {
-                std::fs::copy(&src, &dst).map(|_| ())
-            };
-            match res {
-                Ok(()) => *local_dialog = Some(info_dialog(&format!(
-                    "Copied:\n  {} → {}",
-                    src.display(), dst.display()
-                ))),
-                Err(e) => *local_dialog = Some(error_dialog(&format!("copy: {e}"))),
-            }
-            Ok(Action::Refresh)
-        }
-        (BackendMeta::HostFs { root: s_root }, BackendMeta::Stratumd { .. }) => {
-            if is_dir {
-                *local_dialog = Some(error_dialog(
-                    "Cross-backend directory copy not yet supported (SWISS-4d2).",
-                ));
-                return Ok(Action::Refresh);
-            }
-            let mut src = s_root.clone();
-            if !src_cwd.is_empty() { src.push(src_cwd); }
-            src.push(name);
-            let dst_p9 = if dst_cwd.is_empty() {
-                format!("/{name}")
-            } else {
-                format!("/{dst_cwd}/{name}")
-            };
-            let dst_sock = match panel_socket_for(snap, sp, inactive) {
-                Some(s) => s,
-                None => {
-                    *local_dialog = Some(error_dialog("dst panel: no socket"));
-                    return Ok(Action::Refresh);
-                }
-            };
-            let f = match std::fs::File::open(&src) {
-                Ok(f) => f,
-                Err(e) => {
-                    *local_dialog = Some(error_dialog(&format!("open src: {e}")));
-                    return Ok(Action::Refresh);
-                }
-            };
-            if let Err(e) = sp.run_stratum_fs(
-                &dst_sock,
-                &["write", &dst_p9],
-                std::process::Stdio::from(f),
-                std::process::Stdio::null(),
-            ) {
-                *local_dialog = Some(error_dialog(&format!("copy host→stm: {e}")));
-            }
-            Ok(Action::Refresh)
-        }
-        (BackendMeta::Stratumd { .. }, BackendMeta::HostFs { root: d_root }) => {
-            if is_dir {
-                *local_dialog = Some(error_dialog(
-                    "Cross-backend directory copy not yet supported (SWISS-4d2).",
-                ));
-                return Ok(Action::Refresh);
-            }
-            let src_sock = match panel_socket_for(snap, sp, active) {
-                Some(s) => s,
-                None => {
-                    *local_dialog = Some(error_dialog("src panel: no socket"));
-                    return Ok(Action::Refresh);
-                }
-            };
-            let src_p9 = if src_cwd.is_empty() {
-                format!("/{name}")
-            } else {
-                format!("/{src_cwd}/{name}")
-            };
-            let mut dst = d_root.clone();
-            if !dst_cwd.is_empty() { dst.push(dst_cwd); }
-            dst.push(name);
-            if dst.exists() {
-                *local_dialog = Some(error_dialog(&format!(
-                    "Destination exists; conflict resolution forward-noted for stm→host:\n  {}",
-                    dst.display()
-                )));
-                return Ok(Action::Refresh);
-            }
-            let f = match std::fs::File::create(&dst) {
-                Ok(f) => f,
-                Err(e) => {
-                    *local_dialog = Some(error_dialog(&format!("create dst: {e}")));
-                    return Ok(Action::Refresh);
-                }
-            };
-            if let Err(e) = sp.run_stratum_fs(
-                &src_sock,
-                &["read", &src_p9],
-                std::process::Stdio::null(),
-                std::process::Stdio::from(f),
-            ) {
-                *local_dialog = Some(error_dialog(&format!("copy stm→host: {e}")));
-            }
-            Ok(Action::Refresh)
-        }
-        (BackendMeta::Stratumd { .. }, BackendMeta::Stratumd { .. }) => {
-            if is_dir {
-                *local_dialog = Some(error_dialog(
-                    "Cross-backend directory copy not yet supported (SWISS-4d2).",
-                ));
-                return Ok(Action::Refresh);
-            }
-            let src_sock = match panel_socket_for(snap, sp, active) {
-                Some(s) => s,
-                None => {
-                    *local_dialog = Some(error_dialog("src panel: no socket"));
-                    return Ok(Action::Refresh);
-                }
-            };
-            let dst_sock = match panel_socket_for(snap, sp, inactive) {
-                Some(s) => s,
-                None => {
-                    *local_dialog = Some(error_dialog("dst panel: no socket"));
-                    return Ok(Action::Refresh);
-                }
-            };
-            let src_p9 = if src_cwd.is_empty() {
-                format!("/{name}")
-            } else {
-                format!("/{src_cwd}/{name}")
-            };
-            let dst_p9 = if dst_cwd.is_empty() {
-                format!("/{name}")
-            } else {
-                format!("/{dst_cwd}/{name}")
-            };
-            if let Err(e) = sp.pipe_stratum_fs(&src_sock, &src_p9, &dst_sock, &dst_p9) {
-                *local_dialog = Some(error_dialog(&format!("copy stm→stm: {e}")));
-            }
-            Ok(Action::Refresh)
-        }
-        _ => {
-            *local_dialog = Some(error_dialog("One or both panels are not connected."));
-            Ok(Action::Refresh)
-        }
-    }
-}
-
-fn open_copy_conflict(
-    local_dialog: &mut Option<LocalDialog>,
-    src: PathBuf,
-    dst: PathBuf,
-    is_dir: bool,
-) -> Result<Action> {
-    let prompt = format!("Destination exists:\n  {}\n\nResolution?", dst.display());
-    *local_dialog = Some(LocalDialog {
-        kind: LocalDialogKind::Confirm {
-            options: vec!["Skip".into(), "Overwrite".into(), "KeepBoth".into()],
-            selected: 0,
-            on_pick: ConfirmAction::CopyConflict { src, dst, is_dir },
         },
         prompt,
         value: String::new(),
@@ -3566,16 +3342,11 @@ fn advance_copy_batch(
         }
         /* Worker done. Bytes accounting:
          *   - host-fs dst (dst_poll_path set): the worker did NOT
-         *     bump COPY_BYTES_DONE; promote INTRA_FILE_BYTES (the
-         *     last polled file size, ≈ final size) into
-         *     COPY_BYTES_DONE in one shot, then clear intra.
-         *   - stratum-fs dst: the worker already bumped at completion.
-         *     Just clear intra (it was always 0 since no polling). */
-        if let Some(w) = batch.worker.as_ref() {
-            if w.dst_poll_path.is_some() {
-                bump_bytes(read_intra_file_bytes());
-            }
-        }
+         *     bump COPY_BYTES_DONE; the finished file's size goes in
+         *     here, since a file that finishes between two polls left
+         *     no figure at all.
+         *   - stratum-fs dst: the worker already bumped at completion. */
+        let last_polled = read_intra_file_bytes();
         set_intra_file_bytes(0);
         let w = batch.worker.take().unwrap();
         let res = w.handle.join().unwrap_or_else(|_| {
@@ -3583,7 +3354,12 @@ fn advance_copy_batch(
                                           "copy worker panicked"))
         });
         match res {
-            Ok(CopyOutcome::Copied) => batch.copied += 1,
+            Ok(CopyOutcome::Copied) => {
+                batch.copied += 1;
+                if w.dst_poll_path.is_some() {
+                    bump_bytes(std::fs::metadata(&w.dst_final).map(|m| m.len()).unwrap_or(last_polled));
+                }
+            }
             Ok(CopyOutcome::Skipped) => batch.skipped += 1,
             Err(e) => {
                 batch.failed += 1;
@@ -3642,7 +3418,8 @@ fn advance_copy_batch(
      * per item to the batch — acceptable until SWISS-4d2 swaps for
      * an in-process Twalk + Tgetattr. */
     let dst_exists = match (&batch.dst_meta, &batch.dst_sock) {
-        (BackendMeta::HostFs { .. }, _) => dst.exists(),
+        // Not exists(): a dangling symlink is still something the copy would replace.
+        (BackendMeta::HostFs { .. }, _) => std::fs::symlink_metadata(&dst).is_ok(),
         (BackendMeta::Stratumd { .. }, Some(sock)) => {
             let p9 = path_to_p9(&dst, &batch.dst_meta);
             stratum_path_exists(sp, sock, &p9)
@@ -3688,6 +3465,50 @@ fn advance_copy_batch(
     Ok(Some(BatchTick::More))
 }
 
+/// What a conflict's answer means for the items after it, settled before the worker
+/// starts, since those items are still only paths. Everything under a skipped directory
+/// is skipped with it. A directory kept under a new name takes its contents along.
+fn settle_policy(
+    batch: &mut CopyBatch,
+    sp: &Arc<SpawnCtx>,
+    policy: Option<ConflictPolicy>,
+) -> Option<ConflictPolicy> {
+    let (_, dst, is_dir) = batch.items[batch.idx].clone();
+    match policy {
+        Some(ConflictPolicy::Skip) if is_dir => {
+            let next = batch.idx + 1;
+            let under = batch.items[next..]
+                .iter()
+                .take_while(|it| it.1.starts_with(&dst))
+                .count();
+            batch.items.drain(next..next + under);
+            batch.skipped += under;
+            policy
+        }
+        Some(ConflictPolicy::KeepBoth) => {
+            let free = match (&batch.dst_meta, &batch.dst_sock) {
+                (BackendMeta::Stratumd { .. }, Some(sock)) => derive_unique_with(&dst, |c| {
+                    stratum_path_exists(sp, sock, &path_to_p9(c, &batch.dst_meta))
+                }),
+                _ => derive_unique_with(&dst, |c| std::fs::symlink_metadata(c).is_ok()),
+            };
+            for it in batch.items[batch.idx..].iter_mut() {
+                let moved = match it.1.strip_prefix(&dst) {
+                    // join("") would add a trailing slash.
+                    Ok(rest) if rest.as_os_str().is_empty() => Some(free.clone()),
+                    Ok(rest) => Some(free.join(rest)),
+                    Err(_) => None,
+                };
+                if let Some(m) = moved {
+                    it.1 = m;
+                }
+            }
+            None
+        }
+        other => other,
+    }
+}
+
 /// SWISS-4q-worker: spawn the per-item copy thread. Caller already
 /// resolved any conflict policy. Clones all needed state into the
 /// worker. Stores the handle on batch.worker; the main loop polls
@@ -3697,6 +3518,8 @@ fn spawn_copy_worker(
     sp: &Arc<SpawnCtx>,
     policy: Option<ConflictPolicy>,
 ) {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let policy = settle_policy(batch, sp, policy);
     let sp = Arc::clone(sp);
     let (src, dst, is_dir) = batch.items[batch.idx].clone();
     let src_meta = batch.src_meta.clone();
@@ -3707,14 +3530,19 @@ fn spawn_copy_worker(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| dst.display().to_string());
-    /* SWISS-4q-worker-bytes: capture the host-fs dst path for cheap
-     * mid-copy stat polling. Only set when dst is on host-fs AND
-     * the item is a file (directory copies don't have a meaningful
-     * file size; mkdir is instant anyway). */
+    let temp = dst.with_file_name(format!(
+        ".stratum-copy-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    /* SWISS-4q-worker-bytes: only on a host-fs dst AND for a file:
+     * directory copies don't have a meaningful file size, and mkdir
+     * is instant anyway. */
     let dst_poll_path = match (&dst_meta, is_dir) {
-        (BackendMeta::HostFs { .. }, false) => Some(dst.clone()),
+        (BackendMeta::HostFs { .. }, false) => Some(temp.clone()),
         _ => None,
     };
+    let dst_final = dst.clone();
     /* Reset intra counter at every spawn so a previous file's
      * trailing read doesn't bleed into this file's progress. */
     set_intra_file_bytes(0);
@@ -3723,15 +3551,100 @@ fn spawn_copy_worker(
         .spawn(move || {
             perform_copy_one(
                 &sp, &src_meta, src_sock.as_deref(), &src,
-                &dst_meta, dst_sock.as_deref(), &dst, is_dir, policy,
+                &dst_meta, dst_sock.as_deref(), &dst, &temp, is_dir, policy,
             )
         })
         .expect("spawn copy worker");
-    batch.worker = Some(CopyWorker { handle, dst_name, dst_poll_path });
+    batch.worker = Some(CopyWorker { handle, dst_name, dst_poll_path, dst_final });
 }
 
 #[derive(Debug)]
 enum CopyOutcome { Copied, Skipped }
+
+fn io_other(e: anyhow::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+}
+
+/// A copy reaches a host destination whole or not at all: it is written beside it and
+/// renamed over, and an old file is safe until then. A directory in the way stays, since
+/// rename will not put a file over one.
+fn finish_host_copy(
+    written: std::io::Result<()>,
+    temp: &Path,
+    dst: &Path,
+    replacing: bool,
+) -> std::io::Result<()> {
+    let done = written
+        .and_then(|_| {
+            if replacing {
+                std::fs::File::open(temp)?.sync_all()
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|_| std::fs::rename(temp, dst));
+    if done.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    done
+}
+
+/// A directory the destination already has is the merge an Overwrite asks for. Anything
+/// else in the way is the failure.
+fn ensure_stm_dir(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str) -> Result<()> {
+    let made = sp.run_stratum_fs(
+        sock,
+        &["mkdir", p9],
+        std::process::Stdio::null(),
+        std::process::Stdio::null(),
+    );
+    let Err(e) = made else { return Ok(()) };
+    match sp.run_stratum_fs_capture(sock, &["stat", p9]) {
+        Ok(out)
+            if String::from_utf8_lossy(&out)
+                .lines()
+                .any(|l| l.split_whitespace().eq(["type:", "dir"])) =>
+        {
+            Ok(())
+        }
+        _ => Err(e),
+    }
+}
+
+/// A new name is written in place, and removed if the write fails. An existing file keeps
+/// its bytes until the new ones are whole: they go beside it and are moved over. The move
+/// is what commits; a plain write there would truncate the old file first.
+fn write_stm_file(
+    sp: &Arc<SpawnCtx>,
+    sock: &Path,
+    dst: &str,
+    temp: &str,
+    replacing: bool,
+    write: impl Fn(&str) -> Result<()>,
+) -> Result<()> {
+    let target = if replacing { temp } else { dst };
+    let done = write(target).and_then(|_| {
+        if replacing {
+            sp.run_stratum_fs(
+                sock,
+                &["mv", temp, dst],
+                std::process::Stdio::null(),
+                std::process::Stdio::null(),
+            )
+        } else {
+            Ok(())
+        }
+    });
+    if done.is_err() {
+        let _ = sp.run_stratum_fs(
+            sock,
+            &["rm", target],
+            std::process::Stdio::null(),
+            std::process::Stdio::null(),
+        );
+    }
+    done
+}
 
 fn perform_copy_one(
     sp: &Arc<SpawnCtx>,
@@ -3741,33 +3654,16 @@ fn perform_copy_one(
     dst_meta: &BackendMeta,
     dst_sock: Option<&Path>,
     dst: &Path,
+    temp: &Path,
     is_dir: bool,
     policy: Option<ConflictPolicy>,
 ) -> std::io::Result<CopyOutcome> {
     use std::io;
-    // Resolve actual dst path (may be derived for KeepBoth on host).
-    let dst_path = match policy {
+    let replacing = match policy {
         Some(ConflictPolicy::Skip) => return Ok(CopyOutcome::Skipped),
-        Some(ConflictPolicy::Overwrite) => {
-            if let BackendMeta::HostFs { .. } = dst_meta {
-                if dst.exists() {
-                    if is_dir { let _ = std::fs::remove_dir_all(dst); }
-                    else { let _ = std::fs::remove_file(dst); }
-                }
-            }
-            dst.to_path_buf()
-        }
-        Some(ConflictPolicy::KeepBoth) => {
-            if let BackendMeta::HostFs { .. } = dst_meta {
-                derive_unique_path(dst)
-            } else {
-                // stratum-side KeepBoth not yet wired (subprocess
-                // would need an exists-probe). Use plain dst — let
-                // the write fail on EEXIST and count as failed.
-                dst.to_path_buf()
-            }
-        }
-        None => dst.to_path_buf(),
+        Some(ConflictPolicy::Overwrite) => true,
+        // settle_policy has already found a KeepBoth its free name.
+        Some(ConflictPolicy::KeepBoth) | None => false,
     };
 
     /* SWISS-4q-worker-bytes accounting rule:
@@ -3775,44 +3671,38 @@ fn perform_copy_one(
      *     completion, because the main loop CANNOT cheaply poll dst
      *     size mid-copy (stat-via-subprocess is too expensive).
      *   - Host-fs dst: the worker does NOT bump here. The main loop
-     *     polls the dst path every tick → INTRA_FILE_BYTES tracks
-     *     the live size. When the worker completes the main loop
-     *     consumes intra into COPY_BYTES_DONE in one shot. This
-     *     avoids the brief "bytes_done + intra = 2× size" blip that
-     *     would happen if both the worker AND the main-loop poll
+     *     polls the file being written every tick, so INTRA_FILE_BYTES
+     *     tracks the live size, and when the worker completes it adds
+     *     the finished file's size to COPY_BYTES_DONE in one shot.
+     *     This avoids the brief "bytes_done + intra = twice the size" blip
+     *     that would happen if both the worker AND the main-loop poll
      *     contributed at the moment the worker returned. */
     match (src_meta, dst_meta) {
         (BackendMeta::HostFs { .. }, BackendMeta::HostFs { .. }) => {
             if is_dir {
-                // SWISS-4n2: directory items are now expanded at
-                // start_f5; per-item dir = mkdir only. Children
-                // arrive as separate items.
-                std::fs::create_dir_all(&dst_path)?;
+                // SWISS-4n2: directory items are expanded at start_f5, so a
+                // directory here is mkdir only, and an existing one merges.
+                std::fs::create_dir_all(dst)?;
             } else {
-                std::fs::copy(src, &dst_path)?;
-                /* host-fs dst → main loop handles bytes accounting. */
+                finish_host_copy(std::fs::copy(src, temp).map(|_| ()), temp, dst, replacing)?;
             }
             Ok(CopyOutcome::Copied)
         }
         (BackendMeta::HostFs { .. }, BackendMeta::Stratumd { .. }) => {
             let sock = dst_sock.ok_or_else(||
                 io::Error::new(io::ErrorKind::Other, "dst sock missing"))?;
+            let p9 = path_to_p9(dst, dst_meta);
             if is_dir {
-                let p9 = path_to_p9(&dst_path, dst_meta);
-                // mkdir is idempotent enough for our usage — ignore
-                // STM_EEXIST silently when the dir already exists
-                // (Overwrite policy = "merge into existing dir").
-                let _ = sp.run_stratum_fs(sock, &["mkdir", &p9],
-                    std::process::Stdio::null(),
-                    std::process::Stdio::null());
+                ensure_stm_dir(sp, sock, &p9).map_err(io_other)?;
             } else {
                 let sz = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-                let f = std::fs::File::open(src)?;
-                let p9 = path_to_p9(&dst_path, dst_meta);
-                sp.run_stratum_fs(sock, &["write", &p9],
-                                   std::process::Stdio::from(f),
-                                   std::process::Stdio::null())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                write_stm_file(sp, sock, &p9, &path_to_p9(temp, dst_meta), replacing,
+                               |to: &str| -> Result<()> {
+                    let f = std::fs::File::open(src)?;
+                    sp.run_stratum_fs(sock, &["write", to],
+                                       std::process::Stdio::from(f),
+                                       std::process::Stdio::null())
+                }).map_err(io_other)?;
                 bump_bytes(sz);     /* stratum-fs dst → worker bumps. */
             }
             Ok(CopyOutcome::Copied)
@@ -3821,15 +3711,21 @@ fn perform_copy_one(
             let sock = src_sock.ok_or_else(||
                 io::Error::new(io::ErrorKind::Other, "src sock missing"))?;
             if is_dir {
-                std::fs::create_dir_all(&dst_path)?;
+                std::fs::create_dir_all(dst)?;
             } else {
                 let p9 = path_to_p9(src, src_meta);
-                let f = std::fs::File::create(&dst_path)?;
-                sp.run_stratum_fs(sock, &["read", &p9],
-                                   std::process::Stdio::null(),
-                                   std::process::Stdio::from(f))
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                let written = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(temp)
+                    .and_then(|f| {
+                        sp.run_stratum_fs(sock, &["read", &p9],
+                                           std::process::Stdio::null(),
+                                           std::process::Stdio::from(f))
+                            .map_err(io_other)
+                    });
                 /* host-fs dst → main loop handles bytes accounting. */
+                finish_host_copy(written, temp, dst, replacing)?;
             }
             Ok(CopyOutcome::Copied)
         }
@@ -3838,17 +3734,14 @@ fn perform_copy_one(
                 io::Error::new(io::ErrorKind::Other, "src sock missing"))?;
             let d_sock = dst_sock.ok_or_else(||
                 io::Error::new(io::ErrorKind::Other, "dst sock missing"))?;
+            let d_p9 = path_to_p9(dst, dst_meta);
             if is_dir {
-                let p9 = path_to_p9(&dst_path, dst_meta);
-                let _ = sp.run_stratum_fs(d_sock, &["mkdir", &p9],
-                    std::process::Stdio::null(),
-                    std::process::Stdio::null());
-                let _ = s_sock; // unused for the mkdir path
+                ensure_stm_dir(sp, d_sock, &d_p9).map_err(io_other)?;
             } else {
                 let s_p9 = path_to_p9(src, src_meta);
-                let d_p9 = path_to_p9(&dst_path, dst_meta);
-                sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, &d_p9)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                write_stm_file(sp, d_sock, &d_p9, &path_to_p9(temp, dst_meta), replacing,
+                               |to: &str| sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, to))
+                    .map_err(io_other)?;
                 // Stat the destination for throughput accounting.
                 if let Ok(out) = sp.run_stratum_fs_capture(
                     d_sock, &["stat", &d_p9]) {
@@ -3912,25 +3805,18 @@ fn reset_bytes_done() {
     INTRA_FILE_BYTES.store(0, Ordering::Relaxed);
 }
 
-/// Parse `stratum fs ls` output ("kind name\n" per entry). Skips
-/// "." / "..".
-fn parse_stratum_ls(stdout: &[u8]) -> Vec<(char, String)> {
-    let s = String::from_utf8_lossy(stdout);
-    let mut out = Vec::new();
-    for line in s.lines() {
-        let mut parts = line.splitn(2, ' ');
-        let kind = match parts.next() {
-            Some(k) => k.chars().next().unwrap_or('?'),
-            None => continue,
-        };
-        let name = match parts.next() {
-            Some(n) if !n.is_empty() => n,
-            _ => continue,
-        };
-        if name == "." || name == ".." { continue; }
-        out.push((kind, name.to_string()));
-    }
-    out
+/// Parse `stratum fs ls -0` output ("kind name\0" per entry), each name as the volume
+/// holds it, which is why it cannot be a line. Skips "." / "..".
+fn parse_stratum_ls(stdout: &[u8]) -> Vec<(u8, &[u8])> {
+    stdout
+        .split(|&b| b == 0)
+        .filter_map(|rec| {
+            let (&kind, rest) = rec.split_first()?;
+            let (&space, name) = rest.split_first()?;
+            let dots = name == &b"."[..] || name == &b".."[..];
+            (space == b' ' && !name.is_empty() && !dots).then_some((kind, name))
+        })
+        .collect()
 }
 
 /// Parse `stratum fs stat` output for the size field.
@@ -3946,113 +3832,139 @@ fn parse_stratum_stat_size(stdout: &[u8]) -> u64 {
     0
 }
 
+/// What expanding a selection found: the items to copy, and what could not be walked or
+/// is not copied, which the summary has to count, or "0 failed" would be untrue.
+#[derive(Default)]
+struct Expansion {
+    items: Vec<(PathBuf, PathBuf, bool)>,
+    failed: usize,
+    skipped: usize,
+    last_error: Option<String>,
+    note: Option<String>,
+}
+
+impl Expansion {
+    fn fail(&mut self, what: &Path, why: impl std::fmt::Display) {
+        self.failed += 1;
+        self.last_error = Some(format!("{}: {why}", what.display()));
+    }
+
+    fn leave_out(&mut self) {
+        self.skipped += 1;
+        self.note = Some("Symlinks and special files are not copied.".to_string());
+    }
+}
+
 /// SWISS-4n2: expand any directory items in `items` into a flat list
-/// of (intermediate_dirs + leaf_files) tuples. Non-directory items
-/// pass through unchanged. The caller's expanded list is suitable
-/// for direct use as CopyBatch.items — the batch loop's per-item
-/// conflict + sticky machinery handles each entry uniformly.
+/// of (intermediate_dirs + leaf_files) tuples, top-down. Non-directory
+/// items pass through unchanged. The list is suitable for direct use as
+/// CopyBatch.items, whose per-item conflict + sticky machinery handles
+/// each entry uniformly.
 fn expand_dirs_in_items(
     sp: &Arc<SpawnCtx>,
     src_meta: &BackendMeta,
     src_sock: Option<&Path>,
     dst_meta: &BackendMeta,
     items: Vec<(PathBuf, PathBuf, bool)>,
-) -> Vec<(PathBuf, PathBuf, bool)> {
-    let mut out = Vec::with_capacity(items.len());
+) -> Expansion {
+    let mut out = Expansion::default();
+    let to_volume = matches!(dst_meta, BackendMeta::Stratumd { .. });
     for (src, dst, is_dir) in items {
         if !is_dir {
-            out.push((src, dst, false));
+            out.items.push((src, dst, false));
             continue;
         }
         // Push the dir itself first (top-down ordering).
-        out.push((src.clone(), dst.clone(), true));
+        out.items.push((src.clone(), dst.clone(), true));
         // Then walk children.
         match src_meta {
-            BackendMeta::HostFs { .. } => {
-                walk_host_subtree(&src, &dst, &mut out);
-            }
-            BackendMeta::Stratumd { .. } => {
-                if let Some(sock) = src_sock {
-                    walk_stm_subtree(sp, sock, src_meta, &src,
-                                       dst_meta, &dst, &mut out);
-                }
-                // Without a src sock, we can't enumerate — drop
-                // the children. The dir itself was already pushed,
-                // so the user gets at least the empty dir created.
-            }
+            BackendMeta::HostFs { .. } => walk_host_subtree(&src, &dst, to_volume, &mut out),
+            BackendMeta::Stratumd { .. } => match src_sock {
+                Some(sock) => walk_stm_subtree(sp, sock, src_meta, &src, &dst, &mut out),
+                None => out.fail(&src, "no socket to list it through"),
+            },
             BackendMeta::None => {}
         }
     }
     out
 }
 
-/// Walk a host-fs subtree top-down; append (src_path, dst_path,
-/// is_dir) tuples to `out`. The `dst_path` is interpreted by the
-/// destination backend at copy time (host PathBuf or stm-style
-/// 9P-string-as-PathBuf).
-fn walk_host_subtree(
-    src: &Path,
-    dst: &Path,
-    out: &mut Vec<(PathBuf, PathBuf, bool)>,
-) {
+/// Walk a host-fs subtree top-down. Each `dst_path` is interpreted by the destination
+/// backend at copy time, a host path or a 9P string in a PathBuf, and joining the entry's
+/// name is right for both.
+fn walk_host_subtree(src: &Path, dst: &Path, to_volume: bool, out: &mut Expansion) {
     let read_dir = match std::fs::read_dir(src) {
         Ok(rd) => rd,
-        Err(_) => return,
+        Err(e) => return out.fail(src, e),
     };
-    for entry in read_dir.flatten() {
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                out.fail(src, e);
+                continue;
+            }
+        };
         let name = entry.file_name();
-        let mut sub_src = src.to_path_buf(); sub_src.push(&name);
-        // dst is either a host PathBuf or a 9P-shape string-in-PathBuf.
-        // Either way Path::join with the entry name DTRTs (forward
-        // slash on Unix).
-        let mut sub_dst = dst.to_path_buf(); sub_dst.push(&name);
+        let sub_src = src.join(&name);
+        // A volume's paths are strings on this side: a lossy name would land as another file.
+        if to_volume && name.to_str().is_none() {
+            out.fail(&sub_src, "the name is not UTF-8");
+            continue;
+        }
+        let sub_dst = dst.join(&name);
         let meta = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                out.fail(&sub_src, e);
+                continue;
+            }
         };
         if meta.is_dir() {
-            out.push((sub_src.clone(), sub_dst.clone(), true));
-            walk_host_subtree(&sub_src, &sub_dst, out);
+            out.items.push((sub_src.clone(), sub_dst.clone(), true));
+            walk_host_subtree(&sub_src, &sub_dst, to_volume, out);
         } else if meta.is_file() {
-            out.push((sub_src, sub_dst, false));
+            out.items.push((sub_src, sub_dst, false));
+        } else {
+            out.leave_out();
         }
-        // symlinks / sockets / fifos skipped — cross-backend
-        // semantics undefined at v1.0.
     }
 }
 
-/// Walk a stratumd subtree top-down via subprocess `stratum fs ls`.
-/// Same output shape as walk_host_subtree; the src PathBuf is the
-/// 9P path string round-tripped through PathBuf for uniformity with
-/// the rest of the batch flow.
+/// Walk a stratumd subtree top-down through `stratum fs ls -0`. The src PathBuf is the 9P
+/// path string round-tripped through PathBuf, for uniformity with the rest of the batch.
 fn walk_stm_subtree(
     sp: &Arc<SpawnCtx>,
     sock: &Path,
     src_meta: &BackendMeta,
     src: &Path,
-    dst_meta: &BackendMeta,
     dst: &Path,
-    out: &mut Vec<(PathBuf, PathBuf, bool)>,
+    out: &mut Expansion,
 ) {
     let p9_root = path_to_p9(src, src_meta);
-    let listing = match sp.run_stratum_fs_capture(sock, &["ls", &p9_root]) {
+    let listing = match sp.run_stratum_fs_capture(sock, &["ls", "-0", &p9_root]) {
         Ok(b) => b,
-        Err(_) => return,
+        Err(e) => return out.fail(src, e),
     };
-    for (kind, name) in parse_stratum_ls(&listing) {
+    for (kind, raw) in parse_stratum_ls(&listing) {
+        let name = match std::str::from_utf8(raw) {
+            Ok(n) if name_is_safe(n) => n,
+            _ => {
+                let shown = String::from_utf8_lossy(raw);
+                out.fail(src, format!("a name this manager will not copy: {}", shown.escape_debug()));
+                continue;
+            }
+        };
         let sub_p9 = format!("{}/{}", p9_root.trim_end_matches('/'), name);
         let sub_src = PathBuf::from(&sub_p9);
-        let mut sub_dst = dst.to_path_buf(); sub_dst.push(&name);
+        let sub_dst = dst.join(name);
         match kind {
-            'd' => {
-                out.push((sub_src.clone(), sub_dst.clone(), true));
-                walk_stm_subtree(sp, sock, src_meta, &sub_src,
-                                   dst_meta, &sub_dst, out);
+            b'd' => {
+                out.items.push((sub_src.clone(), sub_dst.clone(), true));
+                walk_stm_subtree(sp, sock, src_meta, &sub_src, &sub_dst, out);
             }
-            '-' | 'l' | 'f' => {
-                out.push((sub_src, sub_dst, false));
-            }
-            _ => {}
+            b'-' => out.items.push((sub_src, sub_dst, false)),
+            _ => out.leave_out(),
         }
     }
 }
@@ -4196,26 +4108,6 @@ fn advance_delete_batch(
         .expect("spawn delete worker");
     batch.worker = Some(DeleteWorker { handle, item_name });
     Ok(Some(BatchTick::More))
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ftype = entry.file_type()?;
-        let s = entry.path();
-        let d = dst.join(entry.file_name());
-        if ftype.is_dir() {
-            copy_dir_recursive(&s, &d)?;
-        } else if ftype.is_symlink() {
-            // Read symlink target; recreate at dst. Don't follow.
-            let target = std::fs::read_link(&s)?;
-            std::os::unix::fs::symlink(target, &d)?;
-        } else {
-            std::fs::copy(&s, &d)?;
-        }
-    }
-    Ok(())
 }
 
 /// SWISS-4e v1.1: dispatch keystrokes through the modal editor.

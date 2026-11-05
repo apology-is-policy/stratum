@@ -269,7 +269,8 @@ static stm_status ls_cb(const stm_9p_qid *qid, uint64_t cookie,
                             uint8_t type, const char *name, size_t name_len,
                             void *ctx)
 {
-    (void)cookie; (void)ctx; (void)name_len;
+    (void)cookie; (void)name_len;
+    const bool *nul_ended = ctx;
     char tag = '?';
     switch (type) {
     case 4:  tag = 'd'; break;   /* DT_DIR */
@@ -279,14 +280,21 @@ static stm_status ls_cb(const stm_9p_qid *qid, uint64_t cookie,
     }
     if (qid->type & STM_9P_QTDIR)      tag = 'd';
     else if (qid->type & STM_9P_QTSYMLINK) tag = 'l';
-    printf("%c %s\n", tag, name);
+    /* A name can hold a newline, and a program reading lines would take it for two entries. */
+    if (*nul_ended) printf("%c %s%c", tag, name, '\0');
+    else printf("%c %s\n", tag, name);
     return STM_OK;
 }
 
 static int cmd_ls(stm_9p_client *c, int argc, char **argv)
 {
+    bool nul_ended = argc == 2 && strcmp(argv[0], "-0") == 0;
+    if (nul_ended) {
+        argc--;
+        argv++;
+    }
     if (argc != 1) {
-        fprintf(stderr, "usage: stratum-fs ls PATH\n");
+        fprintf(stderr, "usage: stratum-fs ls [-0] PATH\n");
         return EXIT_USAGE;
     }
     path_t p;
@@ -322,7 +330,7 @@ static int cmd_ls(stm_9p_client *c, int argc, char **argv)
         uint64_t next_offset = 0;
         uint64_t prev = offset;
         rc = stm_9p_readdir(c, WORK_FID, offset, /*count=*/0,
-                                ls_cb, NULL, &entries, &next_offset);
+                                ls_cb, &nul_ended, &entries, &next_offset);
         if (rc != STM_OK) {
             perr("readdir", rc);
             (void)stm_9p_clunk(c, WORK_FID);
