@@ -398,6 +398,25 @@ pub fn run(opts: Opts) -> Result<()> {
     result
 }
 
+fn put_terminal_back() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+}
+
+/// A panic on the UI thread prints over the raw alternate screen, and leaves the
+/// terminal so, unless it is put back first. A worker's panic is joined as a failed
+/// item and the UI goes on, so only the UI thread's puts it back.
+fn put_terminal_back_on_panic() {
+    let ui = thread::current().id();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if thread::current().id() == ui {
+            put_terminal_back();
+        }
+        prev(info);
+    }));
+}
+
 fn redraw_loop(slate_sock: PathBuf, tx: Sender<u64>, stop: Arc<AtomicBool>) {
     let mut client = match SlateClient::dial(&slate_sock) {
         Ok(c) => c,
@@ -443,12 +462,20 @@ fn run_ui(
     if !ttys.is_empty() {
         exit_when_terminal_goes(ttys, spawn.as_ref().map(|s| s.session_dir.clone()));
     }
+    put_terminal_back_on_panic();
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("create terminal")?;
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        put_terminal_back();
+        return Err(anyhow::Error::new(e).context("enter alternate screen"));
+    }
+    let mut terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(t) => t,
+        Err(e) => {
+            put_terminal_back();
+            return Err(anyhow::Error::new(e).context("create terminal"));
+        }
+    };
 
     let mut focus: usize = 0;
     let mut local_dialog: Option<LocalDialog> = None;
