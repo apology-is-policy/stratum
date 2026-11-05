@@ -640,7 +640,7 @@ result.
 - **CI is red at the last published commit.** At `471a339`, 8 of 9 build jobs fail, and the last fully green run was 2026-04-20. On machines rather than in CI, at `71e6a41`: all 80 suites pass on Linux (arm64, gcc 14, io_uring on, warnings as errors) and on macOS. The sanitizer legs have not been triaged.
 - **Zero fuzz targets.** `STM_BUILD_FUZZERS` exists and builds nothing.
 - No xfstests run, no soak run, no kernel 9P mount in CI.
-- CI builds and tests the manager on macOS only.
+- The manager's CI job covers Linux and macOS since `f8f99b2`, and has not run in CI yet.
 
 ---
 
