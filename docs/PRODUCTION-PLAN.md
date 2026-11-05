@@ -63,7 +63,7 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 
 | # | Item | Evidence | Status |
 |---|---|---|---|
-| T0.8 | Rename of a directory into its own subtree made an unreachable cycle | Seen: leg red; each part of the fix removed in turn turns its own leg red | **Fixed** `f401da2`, `cb81147`. Every directory rename takes one mutex, since a rename adds the new entry before it drops the old and a walk between them would meet the child twice. A move across parents walks the moved subtree, so it costs the subtree's entries until T2.3 |
+| T0.8 | Rename of a directory into its own subtree made an unreachable cycle | Seen: leg red; each part of the fix removed in turn turns its own leg red | **Fixed** `f401da2`, `cb81147`. Every directory rename takes one mutex, since a rename adds the new entry before it drops the old and a walk between them would meet the child twice. A move across parents walks the moved subtree, so it costs the subtree's entries until T2.3. The walk reads each directory once since `2a590b9`: 1,142 ms before, 2.4 ms after, on the measuring leg's tree on a Mac |
 | T0.9 | Manager editor: saving a file over 64 KiB killed the manager and lost the edit. The 9P client sent a message over the negotiated size and the slate dropped the connection. This list used to say only the last chunk was kept, which was a misreading: a trace shows the file was never reached | Seen | **Fixed** `3052d46`, `f584787` |
 | T0.10 | Manager editor: said Saved before writing, discarded the result, and `:wq` quit on a failed save | Read; leg green | **Fixed** `dc426bf` |
 | T0.11 | Manager editor: emptying a file and saving kept the old bytes | Read; leg green | **Fixed** `3052d46` |
@@ -90,6 +90,24 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 | T0.37 | A device replace retried after the old device reached EVACUATING jumped past `new_slot`'s initializer, so a success left the claim held and every later change to that slot refused until the next mount. gcc found it at `-O2`, and the route had no test | Seen by the compiler; red owed | **Fixed** `e64fd0d` |
 | T0.38 | The 9P client sent a zero-length write when no whole block fit the negotiated size, which reads as success with nothing written. It is now refused. Possible only at msize 4096 to 4118 | Read | **Fixed** `3bf389b` |
 | T0.39 | `/ctl`'s Rlopen gives an iounit sized for a Tread, not a Twrite. Changing it is a wire change, so it waits for a decision | Read | Open |
+| T0.40 | **Esc on the manager's "Delete N items?" deleted the selection.** The batch was built before the question, so Esc, or any dialog drawn over the question, started it. A batch now starts only on Yes | Seen: leg red | **Fixed** `bc7b15d` |
+| T0.41 | **A delete could not be stopped once it had started.** Esc during a batch was lost while a worker held an item. From `d1c5df5` the quit keys showed a notice instead, and its Esc closed the notice and let the batch run on through the rest of the selection. The quit keys now ask Stop or Go on, the batch is held while the question shows, and Esc or Stop ends it after the item in hand | Written | **Fixed** `d1c5df5`, `7cf7854` |
+| T0.42 | **`stratum fs write` and `fs read` answered 0 after failed I/O.** A failed read of the input, or a full disk under the output, left a short file under the final name and reported success. Both now check, the size is checked on every route, and `write -n` refuses a name already there and removes only what it made | Seen: leg red | **Fixed** `e7a0d99`, `bc7b15d`, `18b5b09` |
+| T0.43 | **Manager copies lost data.** Overwrite onto the same path, or into the source's own subtree, deleted the source. Overwrite removed the old destination before the new one existed. A recursive copy dropped subtrees, symlinks and failed directories and reported 0 failed. Keep both on a volume truncated the existing file. A replacement is now written beside and renamed into place, every failure is counted, and a destination inside the source is refused | Read; legs green | **Fixed** `73735f0`, `bc7b15d` |
+| T0.44 | **A copy could be led to write somewhere else.** A symlink inside the destination tree let a merge write over its source, a host temporary followed a symlink planted at its name, and a failed probe read as absent, so a copy truncated or removed someone else's file. A link where a directory goes is refused, temporaries are made with `O_EXCL` and written through their own handle, and a name found in the way is refused, never replaced | Read; legs green | **Fixed** `eb7495b`, `bc7b15d` |
+| T0.45 | **Names the manager could not hold acted on other files.** A control byte was listed as `?`, so `x` and a newline read as `x?` and an action reached a real sibling of that name. Enter into a directory whose name is not UTF-8 made every action target the panel's root. Names holding a newline or a tab broke `stratum fs ls`'s parsing. A host name over 255 bytes was cut to its first 255, which can be a sibling's name. Each is now listed with a stand-in, U+FFFD, that no action accepts | Read; legs green; the long-name test seen red | **Fixed** `73735f0`, `98661ea`, `d1c5df5`, `d3de156` |
+| T0.46 | **The 9P client's tag counter never wrapped,** so a connection died after 65,534 requests: a long copy, or a large directory redrawn often enough, ended the manager with `Error: walk` or emptied a panel | Seen; green under the same run owed | **Fixed** `7fc5a68` |
+| T0.47 | **The host panel served the wrong files.** Its path table kept the first path each file was walked by, never checked it again, and was full at 4,096 entries. Past about 4,096 files listed in a session the host panel stopped working, a renamed directory listed whatever then sat at its old name, and opening a moved file served the file now at its old name. Opening a FIFO stopped the server. Each use now checks that the stored path still leads to the same file, the newest walk replaces the name, old entries are evicted, and only regular files and directories open | Seen: tests red on the old code | **Fixed** `fe54c65` |
+| T0.48 | **Copies lost or widened modes.** A copy set the mode after the create, or not at all, so a 0600 file was readable for a while or for good. The mode now goes with the create, in `Tlcreate` and `Tmkdir`, and host temporaries are made 0600 | Read; legs green | **Fixed** `eb7495b`, `18b5b09` |
+| T0.49 | **Keys could be left readable or half written.** A key generated over an existing 0644 file stayed 0644, and the path forms wrote into the existing file, so a reader holding it open saw the new key or a mix. A key is now written to a temporary file beside it, at 0600, synced and renamed into place, and a link or other non-regular file at the name is refused | Seen: each defence removed turns its own test red | **Fixed** `c9febbd`, `38fb485` |
+| T0.50 | **A stop could wait for ever on a client that was not reading** (follows T0.36). The send timeout was the idle timeout, 0, which means none, and `/ctl` had no grace at all. A stop now gives writes 2 s and then shuts the connection's writing side. On macOS `shutdown(SHUT_RDWR)` after `SHUT_RD` answers ENOTCONN and wakes nothing, by measurement, so the wake is `SHUT_WR` | Seen: leg red | **Fixed** `e7a0d99`, `c05029e` |
+| T0.51 | `mkfs`'s last rename replaced a name made while it ran, and followed a symlink at its path; its temporary key was not exclusive; and a device with no size, such as `/dev/zero`, was read for ever | Seen: leg red | **Fixed** `e7a0d99`, `9b4e8f8` |
+| T0.52 | **Delete acted on the wrong entries.** A selection was kept as positions, so after the listing changed `F8` deleted whatever then sat at the marked rows | Read; leg green | **Fixed** `dd94ed2` |
+| T0.53 | A panic in the manager left the terminal raw, with no echo, until `reset`. A panic on the UI thread now puts the terminal back before the message prints | Written | **Fixed** `da5add6` |
+| T0.54 | Overwrite can replace a volume image a daemon has open, or its key: nothing checks the destination's lock | Read | Open |
+| T0.55 | A bind mount inside the destination is invisible to `canonicalize`, so a merge can still be led over its own source through one. Making one needs privilege | Read | Open |
+| T0.56 | A copy into a volume writes a new name in place, so a kill mid-copy leaves a short file under the final name, and temporaries behind. The cure is a rename that refuses to replace, which the 9P server does not offer: a wire change, so it waits for a decision | Read | Open |
+| T0.57 | A second manager on the same volume re-keys the slate's listing, so the first one's marks can name entries it never saw. A listing token on selection writes is a slate format change | Analysis | Open |
 
 ### Security to establish, then decide
 
@@ -98,6 +116,7 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 | T0.22 | A locked dataset's cold extents can still be read: they decrypt under the pool key, with no check of the dataset's lock. Library only today, because nothing else reaches the cold tier | Read | Open |
 | T0.23 | The 9P server does not check mode or owner against the client, and a create is owned by the connection's uid whatever the client asked | Read | Open: enforce, or state the model |
 | T0.24 | Two copies of one volume, both written, reuse nonces. Copying a file is ordinary, and a restored backup does it too. Warn now in the manager and docs; the cure is T2.8 | Analysis | Open |
+| T0.58 | `mkfs` writes a new key through its own descriptor, but the format then reads the key back by name, so whoever can rename in the key's directory can swap it between the two | Read | Open |
 
 ---
 
@@ -217,7 +236,7 @@ Stratum as a modern alternative to VeraCrypt: a file-based volume and a manager 
 | T5.1 | A passphrase alone opens a volume, one file with no keyfile beside it. A keyfile stays as an optional second factor. Needs T2.11 | M |
 | T5.2 | Change passphrase, several slots, header backup and restore. Needs T2.11 | M |
 | T5.3 | Move and rename in the manager; the three "Coming soon" panes built or removed | M |
-| T5.4 | Copies keep mode, mtime and symlinks | S |
+| T5.4 | Copies keep mtime, symlinks and extended attributes. The mode is kept since `eb7495b` and `18b5b09` | S |
 | T5.5 | A large copy makes one commit per batch, not one per item, still durable when it reports success | S |
 | T5.6 | Mount as a drive: FUSE on Linux and macOS, or a loopback NFS server. Decide which | L |
 | T5.7 | Key hygiene in the `stratum` binary: all key material in locked memory, core dumps off. Today the daemon's mounts lock on a best-effort basis, and only `janusd` turns off core dumps | S |
@@ -226,6 +245,11 @@ Stratum as a modern alternative to VeraCrypt: a file-based volume and a manager 
 | T5.10 | Remove `tui/`, `tools/stratum-slate-tty` and `run.sh`'s use of them, if the decision goes that way | S |
 | T5.11 | `stratum serve` with no key source answered only `run failed (rc=-22)`. It now finds `<volume>.key` or says what is missing | **Fixed** `5b1d083` |
 | T5.12 | The daemons outlived the manager, so a killed manager left the volume unlocked. They now stop when it does, however it ends: `4460db3`, `f440879`. **Fixed.** A `SIGKILL` of the manager still leaves its session directory behind | S |
+| T5.13 | Panels list in the backend's order, which on ext4 is hash order. Sort by name | S |
+| T5.14 | Say when marks are dropped. A changed listing clears them without a word today; the delete question names the one entry left and defaults to No | S |
+| T5.15 | A failed probe of a destination name reads as absent. The create that follows refuses, so nothing is lost, but the reason given is wrong. Probe with three outcomes | S |
+| T5.16 | The manager starts a daemon on the UI thread, which can wait up to 60 s with `TERM` masked. Start it on a worker and show progress | S |
+| T5.17 | A daemon waiting out EMFILE logs nothing, so the wait looks like a hang | S |
 
 ---
 
@@ -259,7 +283,7 @@ Recommended against for now, so nobody spends a pause on them. Each can be reope
 
 ## The order
 
-1. **Finish the tidy:** T0.8-T0.13 and T0.29-T0.38, then T1.1 and T1.2, and land it.
+1. **Finish the tidy:** T0.8-T0.13, T0.29-T0.38 and T0.40-T0.53, then T1.1 and T1.2, and land it.
 2. **Design tier 2 together,** settling which change gets which bytes, before the first of them lands.
 3. **Trust before change:** T1.3, then T1.4, T1.5, T1.6, T1.10. Cheap wins alongside: T3.1, T0.24's warning, T0.15, T0.26, T0.28, T5.7.
 4. **The format:** T2.1 and T2.2 first, then the rest of tier 2 one at a time. T0.1, T0.3, T0.4 and T0.7 go with the first two.
