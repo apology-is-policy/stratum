@@ -536,11 +536,11 @@ Reflink shares hot extents through the allocator's refcount and cold ones throug
 | Area | Behaviour |
 |---|---|
 | Permissions | *By reading*, **the 9P server does not check mode bits against the client.** Authorization is `SO_PEERCRED` at attach plus `stratumd` dataset policies. Do not assume POSIX access control is enforced server-side |
-| Rename | Over 9P: plain rename only. *By reading*, moving a directory into its own subtree is not refused at this layer. See section 16 |
+| Rename | Over 9P: plain rename only. Moving a directory into its own subtree is refused. A directory rename across parents walks the moved subtree under one mutex, so it costs the subtree's entries |
 | atime | Effectively `noatime`; set at create and by `utimens` |
 | `st_blocks` | Synthetic, `(size + 511) / 512`, so `du` reports logical size |
 | Sparse files | Supported; no `SEEK_HOLE` or `SEEK_DATA` |
-| `O_APPEND` | *By reading*, **not atomic**: the server reads the size and then writes there, so two appenders overwrite each other |
+| `O_APPEND` | Atomic: the end of file is read under the write's exclusive pin on the inode |
 | Unlink while open | **I/O on the fid fails with `ENOENT`**, by design in `fid.tla`. POSIX keeps the file until the last close. Seen on a Thylacine guest |
 | mmap | None at this layer; a client maps through its own cache |
 | Read-only flags | `IMMUTABLE`, `APPEND`, `NODUMP` are defined and unused |
@@ -575,11 +575,12 @@ stratum fs -s SOCKET put ./dir /dir                    script it
 **What works, from the code:** recursive copy (`F5`) with progress and conflict handling, delete (`F8`), mkdir (`F7`), a modal editor (`F3`, `F4`), the create-volume wizard
 (`Shift+F7`), snapshot list, create, delete and rollback (`F9`, dataset 1 only), a pool map and snapshot graph (`F2`), and pressing Enter on a `.stm` file to mount it in the other pane.
 
+**How the daemons stop.** The manager's daemons hold a lifeline to it and stop when it does, however it ends. On a stop, a daemon ends the reading side of every connection, finishes the request in hand, and unmounts, so a client that keeps talking cannot keep a volume mounted. One image has one daemon, enforced with `flock`, and `mkfs` refuses a file holding data, a key in the way, and a volume in use.
+
 **Durability.** A manager copy runs one `stratum fs` command per item, and each mutating command ends with a whole-pool commit before it reports success. What the manager reports copied is therefore durable, and a copy of `N` items costs `N` commits.
 
 **Known gaps:**
 
-- The no-argument landing screen can only open volumes; its "New" prints "not implemented". Use the wizard or `stratum mkfs`.
 - No move or rename in the manager (`stratum fs mv` exists). Three of six admin panes say "Coming soon". Copies carry no mode or mtime across backends and skip symlinks.
 - "Static" is partial: libsodium links dynamically.
 
@@ -620,12 +621,10 @@ result.
 
 **What the evidence does not cover:**
 
-- **CI is red.** At `471a339`, 8 of 9 build jobs fail, and the last fully green run was 2026-04-20. A gcc build breaks on `-Werror=misleading-indentation`. Linux/clang fails 6 of 80 suites and
-  ASan 10 of 80; many of those assertions read fault-injection counters at 0, which may be a difference between the io_uring and POSIX backends (a hypothesis). macOS/clang without sanitizers passes, and
-  so do the 12 TLC configurations.
+- **CI is red at the last published commit.** At `471a339`, 8 of 9 build jobs fail, and the last fully green run was 2026-04-20. On machines rather than in CI, at `71e6a41`: all 80 suites pass on Linux (arm64, gcc 14, io_uring on, warnings as errors) and on macOS. The sanitizer legs have not been triaged.
 - **Zero fuzz targets.** `STM_BUILD_FUZZERS` exists and builds nothing.
 - No xfstests run, no soak run, no kernel 9P mount in CI.
-- The manager is not built or tested by CI.
+- CI builds and tests the manager on macOS only.
 
 ---
 
@@ -673,14 +672,11 @@ the metadata fragmentation of section 7, the commit's whole-allocator rewrite, a
 All are tracked. Those marked *by reading* have not been reproduced yet.
 
 - CI red, as in section 15.
-- *By reading:* on Linux, the io_uring completion queue is drained by every waiting thread with no lock.
 - *By reading:* a full metadata pool wedges at commit, since nothing on the write path counts node space.
 - *By reading:* snapshot create answers OK before the snapshot is durable.
-- `O_APPEND` and unlink while open, as in section 12.
-- *By reading:* rename of a directory into its own subtree detaches it into an unreachable cycle.
+- Unlink while open, as in section 12.
 - *By reading:* a scrub started on a running daemon reports RUNNING and verifies nothing, since nothing steps it. When driven, it verifies hot extents only and counts everything else as verified.
 - *By reading:* a device replace moves bytes without rewriting extent addresses (library only).
-- *By reading:* in the manager, the wizard makes a plaintext keyfile if "Use passphrase" is ticked and the field is left empty, and the editor says "Saved." before writing and discards the result.
 
 ### 16.4 Unbuilt
 

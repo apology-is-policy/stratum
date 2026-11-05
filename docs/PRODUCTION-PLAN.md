@@ -25,7 +25,7 @@ A list without an end never finishes, so this is the end. Stratum is production 
 
 | Column | Values |
 |---|---|
-| Evidence | **Seen**: reproduced or measured. **Read**: read in the code, never run. **Analysis**: reasoned from the design, unchecked. **Written**: a fix exists, not yet built |
+| Evidence | **Seen**: reproduced or measured. **Read**: read in the code, never run. **Analysis**: reasoned from the design, unchecked. **Written**: a fix exists, not yet built or not yet seen to fail without it |
 | Size | S, M, L, XL: relative work, not a duration |
 
 Every item that changes the on-disk format is in tier 2.
@@ -55,7 +55,7 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 | T0.4 | 9.39M allocator ranges on a device: commit fails and the pool wedges | Read | Goes with T2.1 |
 | T0.5 | A write's reclaim follows a failed flush into a wedge, where a commit on the same state answers the error and stays up | Read | Open |
 | T0.6 | Any failed commit wedges until remount, including failures that are only lack of room | Read | Open; see T3.11 |
-| T0.7 | Free metadata space fragments, and writers stop with a quarter of it free. So far a Python model only | Analysis; real-pool run queued | Goes with T2.1 |
+| T0.7 | Free metadata space fragments. A Python model says writers stop with a quarter of it free. The real pool has **not** shown that: on a Pi a valid run reached 10,000 commits at 26% free with no stop, and later stops came at 1 to 3% free. A clean run of the real pool is owed | Analysis, and a partial run against it | Goes with T2.1 |
 | T0.25 | A full metadata pool wedges at commit. Nothing on the write path counts node space, so it admits writes that no commit can store | Read | Open; T3.11 for the refusal, T2.4 for the room |
 | T0.26 | Snapshot create answers OK before the snapshot is durable: its slot is made after the commit and no commit follows, so a crash loses a snapshot reported as made | Read | Open |
 
@@ -63,12 +63,12 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 
 | # | Item | Evidence | Status |
 |---|---|---|---|
-| T0.8 | Rename of a directory into its own subtree makes an unreachable cycle | Read; leg written | Fix written |
-| T0.9 | Manager editor: saving a file over 64 KiB keeps only the last chunk | Read; leg written | Fix written |
-| T0.10 | Manager editor: says Saved before writing, discards the result, and `:wq` quits on a failed save | Read; leg written | Fix written |
-| T0.11 | Manager editor: emptying a file and saving keeps the old bytes | Read; leg written | Fix written |
-| T0.12 | Manager wizard: Use passphrase with an empty field makes a plaintext keyfile | Read; leg written | Fix written |
-| T0.13 | Manager landing: panic on a non-ASCII recent path, New and Host do nothing, banner claims post-quantum in every build | Read; leg written | Fix written |
+| T0.8 | Rename of a directory into its own subtree made an unreachable cycle | Seen: leg red; each part of the fix removed in turn turns its own leg red | **Fixed** `f401da2`, `cb81147`. Every directory rename takes one mutex, since a rename adds the new entry before it drops the old and a walk between them would meet the child twice. A move across parents walks the moved subtree, so it costs the subtree's entries until T2.3 |
+| T0.9 | Manager editor: saving a file over 64 KiB killed the manager and lost the edit. The 9P client sent a message over the negotiated size and the slate dropped the connection. This list used to say only the last chunk was kept, which was a misreading: a trace shows the file was never reached | Seen | **Fixed** `3052d46`, `f584787` |
+| T0.10 | Manager editor: said Saved before writing, discarded the result, and `:wq` quit on a failed save | Read; leg green | **Fixed** `dc426bf` |
+| T0.11 | Manager editor: emptying a file and saving kept the old bytes | Read; leg green | **Fixed** `3052d46` |
+| T0.12 | Manager wizard: Use passphrase with an empty field made a plaintext keyfile | Read; leg green | **Fixed** `30588ba`; it also asks twice |
+| T0.13 | Manager landing: panic on a non-ASCII recent path, New and Host did nothing, banner claimed post-quantum in every build | Read; leg green | **Fixed** `bb24ebc` |
 | T0.14 | Scrub reports RUNNING and verifies nothing, since nothing steps it. When driven it checks hot extents and counts the rest as verified. The manager's prompt promises repair | Read | Open |
 | T0.15 | `O_SYNC` and `O_DSYNC` are not consulted, and `datasync` is ignored | Read | Open |
 | T0.16 | `fallocate` reserves no space, so a later write can answer ENOSPC | Read | Open |
@@ -77,10 +77,19 @@ Host sanitizers and a Linux build were not run on that commit. What remains:
 | T0.19 | Silent 9P qid collision past 2^32 inodes | Read | Open |
 | T0.20 | Device replace moves bytes without rewriting extent addresses (library only) | Read | Open |
 | T0.21 | `/events` drops past 8 MiB without saying so | Read | Open |
-| T0.27 | **`O_APPEND` is not atomic.** The 9P server reads the size and then writes there, so two appenders overwrite each other. The code's own comment says so | Read | Open |
+| T0.27 | **`O_APPEND` was not atomic.** The 9P server read the size and then wrote there, so two appenders overwrote each other. The end of file is now read under the write's own exclusive pin | Written | **Fixed** `021c41a`; red owed |
 | T0.28 | **Deleting an open file loses it.** I/O on an unlinked fid answers ENOENT, by design in `fid.tla`. POSIX keeps the file until the last close, and real software relies on that, including scratch files in SQLite and Python. Seen on a Thylacine guest, where `tmpfile()` has a workaround | Seen | **Decided:** keep the inode until the last clunk, on the orphan state anonymous inodes already have, and free it at mount after a crash. A file replaced by rename gets the same. `fid.tla` changes first |
-| T0.29 | **Linux: the io_uring completion queue is drained by every waiting thread with no lock,** and `AUTO` picks io_uring wherever it is built. A completion can be taken twice or dispatched to the wrong thread. It may explain some of the Linux reds in T1.1, which is a hypothesis | Read | Open |
-| T0.30 | **The manager's admin commands are refused.** Since `320d250` the `/ctl` admin must be named with `--admin-uid`, and the manager never names it, so snapshot create answers EACCES, and by reading so does every other admin verb behind `F9`. Two of the manager's own tests are red for this, and CI does not run them | Seen | Open |
+| T0.29 | **Linux: every waiting thread drained the io_uring completion queue with no lock,** and `AUTO` picks io_uring wherever it is built. One thread now holds the reaper's seat and the rest wait for it. Also a failed submit reported failed an op the kernel could still run, and short memory ended the ring silently. Three suites crashed before these fixes and all are green since; that the old reaper caused the crashes is still a hypothesis until it is put back and seen to crash | Seen, cause not yet | **Fixed** `75f2df4`, `ca55069`, `b0cccd6` |
+| T0.30 | **The manager's admin commands were refused for six weeks.** Since `320d250` the `/ctl` admin must be named with `--admin-uid`, and the manager never named it, so every admin verb behind `F9` answered EACCES. Two of the manager's own tests were red, and CI did not run them | Seen | **Fixed** `99e6b80` |
+| T0.31 | Two daemons could open one volume, each writing commits the other knew nothing of | Seen: leg red | **Fixed** `d13a1c3`: one image, one daemon, by `flock` |
+| T0.32 | `mkfs` destroyed whatever was at its path, under a running daemon too, and replaced the key first. It now refuses a file holding data and a key in the way, says why, and `--force` passes the first two and never a running daemon | Read; red owed | **Fixed** `2a590b9` |
+| T0.33 | A manager whose terminal closed kept running with the volume unlocked. Its input loop never returns on a dead terminal, and on macOS `tcgetattr` still answers, so a watchdog must test a write | Seen on macOS | **Fixed** `7d3a5d3`, `047ead9`, `e3f2e07`; green owed on macOS |
+| T0.34 | Manager editor: a failed read opened an empty buffer that a save would write back, and bytes that are not UTF-8 were decoded lossily and could be saved. It now refuses the first and opens the second read-only | Read; leg owed green | **Fixed** `71e6a41` |
+| T0.35 | A daemon that refused to start read as a wrong passphrase, after a fixed 5 s | Seen | **Fixed** `71e6a41`, `e3f2e07`: it says the daemon's own reason |
+| T0.36 | A daemon told to stop waited for each client: an idle one up to the idle timeout, a talking one for ever. A stop now ends every connection's reading side, and the request in hand still finishes. A slow request can still lengthen a stop | Read; red owed | **Fixed** `cfcf51f` |
+| T0.37 | A device replace retried after the old device reached EVACUATING jumped past `new_slot`'s initializer, so a success left the claim held and every later change to that slot refused until the next mount. gcc found it at `-O2`, and the route had no test | Seen by the compiler; red owed | **Fixed** `e64fd0d` |
+| T0.38 | The 9P client sent a zero-length write when no whole block fit the negotiated size, which reads as success with nothing written. It is now refused. Possible only at msize 4096 to 4118 | Read | **Fixed** `3bf389b` |
+| T0.39 | `/ctl`'s Rlopen gives an iounit sized for a Tread, not a Twrite. Changing it is a wire change, so it waits for a decision | Read | Open |
 
 ### Security to establish, then decide
 
@@ -98,8 +107,8 @@ Build these before the big changes, since they are what will catch the big chang
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| T1.1 | Green CI: gcc break at `leaf.c:113`, Linux fault counters, `test_rc3_concurrent`, `test_slate_socket` (use-after-free under ASan, SEGV under TSan), `test_fs_frag`, `test_corvus_mount`, 11 TSan families in `test_compound_ops_concurrent`. None of these sanitizer results has been triaged, so real or test-only is unknown | Red since April. Nothing else is believable until it is green | L |
-| T1.2 | Manager in CI on Linux too; sanitizers on a schedule, including legs that have no sanitizer result yet because a budget cut them off | The spec claims Linux, and CI only runs macOS | S |
+| T1.1 | Green CI. Done on a machine, not yet in CI since the branch has not been pushed: `-Werror` under gcc `594e2fe`; 80 of 80 suites on Linux, arm64, gcc 14, io_uring on, at `71e6a41`; the five fault suites read injection through the facade `93dd9c3`; the two hanging client suites were a test's own bug `b969b52`. Owed: the sanitizer legs, none of which has been triaged: `test_rc3_concurrent`, `test_slate_socket` (use-after-free under ASan, SEGV under TSan), `test_fs_frag`, `test_corvus_mount`, 11 TSan families in `test_compound_ops_concurrent` | Red since April. Nothing else is believable until it is green | L |
+| T1.2 | Manager in CI on Linux too, building `dist.sh`, whose optimized gcc build is what caught T0.37. It never linked on Linux before `1f06b6c`. Sanitizers on a schedule, including legs that have no sanitizer result yet because a budget cut them off | The spec claims Linux, and CI only runs macOS | S |
 | T1.3 | `stratum check`: read-only full walk and cross-checks: allocator against references, nlink, dirent against inode, reachability and cycles, dead lists, the bootstrap bitmap | No fsck exists. Peers have `zdb`, `btrfs check` and `fsck.bcachefs` | L |
 | T1.4 | Crash harness: record writes and barriers, replay every barrier prefix, drop and reorder inside each barrier, mount, check, assert every acknowledged `fsync` | The strongest test a filesystem can have. Fault injection exists; this does not | L |
 | T1.5 | Fuzz targets for uberblock, node, extent, dirent, keyfile, 9P and send decoding. `STM_BUILD_FUZZERS` builds nothing today | A filesystem that opens a stranger's container parses hostile input | M |
@@ -109,6 +118,7 @@ Build these before the big changes, since they are what will catch the big chang
 | T1.9 | Model what has none: seal and tombstone sentinels, cold CAS links, mini-consolidation, engine splits, spill chains, the dataset mutex read path | These are the hardest code in the tree, and rest on prose | L |
 | T1.10 | Benchmarks against ext4, btrfs and ZFS on one Linux machine: fio profiles with latency percentiles, small files, mount time, memory | Every SOTA claim here is unmeasured, and tier 3 needs the numbers | M |
 | T1.11 | Refresh or delete stale documents: `ARCHITECTURE.md`, `ROADMAP.md`, `reference/` | They contradict the code in places | M |
+| T1.12 | Read the 260 `(void)` casts over results gcc would warn about, which the build silences with `-Wno-unused-result` | Each one drops an error on purpose or by accident, and nobody has looked | M |
 
 ---
 
@@ -214,7 +224,8 @@ Stratum as a modern alternative to VeraCrypt: a file-based volume and a manager 
 | T5.8 | Warn on rollback: remember the highest generation beside the keyfile or in the recents, and say so when a volume comes back older | S |
 | T5.9 | A fully static binary (libsodium links dynamically today) and a post-quantum build as the default package | S |
 | T5.10 | Remove `tui/`, `tools/stratum-slate-tty` and `run.sh`'s use of them, if the decision goes that way | S |
-| T5.11 | `stratum serve` with no key source answers only `run failed (rc=-22)`, and should find `<volume>.key` or say what is missing. The hint `stratum mkfs` prints has the wrong command and option form | S |
+| T5.11 | `stratum serve` with no key source answered only `run failed (rc=-22)`. It now finds `<volume>.key` or says what is missing | **Fixed** `5b1d083` |
+| T5.12 | The daemons outlived the manager, so a killed manager left the volume unlocked. They now stop when it does, however it ends: `4460db3`, `f440879`. **Fixed.** A `SIGKILL` of the manager still leaves its session directory behind | S |
 
 ---
 
@@ -248,9 +259,9 @@ Recommended against for now, so nobody spends a pause on them. Each can be reope
 
 ## The order
 
-1. **Finish the tidy:** T0.8-T0.13, then T1.1 and T1.2, and land it.
+1. **Finish the tidy:** T0.8-T0.13 and T0.29-T0.38, then T1.1 and T1.2, and land it.
 2. **Design tier 2 together,** settling which change gets which bytes, before the first of them lands.
-3. **Trust before change:** T1.3, then T1.4, T1.5, T1.6, T1.10. Cheap wins alongside: T3.1, T0.24's warning, T0.15, T0.26, T0.27, T0.29, T0.28, T5.7.
+3. **Trust before change:** T1.3, then T1.4, T1.5, T1.6, T1.10. Cheap wins alongside: T3.1, T0.24's warning, T0.15, T0.26, T0.28, T5.7.
 4. **The format:** T2.1 and T2.2 first, then the rest of tier 2 one at a time. T0.1, T0.3, T0.4 and T0.7 go with the first two.
 5. **Then by measurement:** tier 3 in whatever order T1.10 shows matters most, starting with T3.2, T3.5 and T3.7.
 6. **Then tiers 4 and 5,** interleaved by use, and **tier 6** last.
