@@ -3,7 +3,8 @@
 # Jobs:
 #   build-linux   — gcc/clang × off/asan/tsan sanitizer matrix; runs ctest.
 #   build-macos   — clang × off/asan/tsan; POSIX backend only.
-#   manager       -- dist/stratum, the manager's tests, a volume end to end.
+#   manager       -- dist/stratum, the manager's tests, a volume end to end,
+#                    the manager's keys in a terminal; Linux and macOS.
 #   tlc-specs     -- TLC on all specs/*.tla with matching .cfg.
 #
 name: ci
@@ -110,12 +111,33 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   manager:
-    name: Manager / macOS
-    runs-on: macos-14
+    name: Manager / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux too: its optimized gcc build is what found T0.37, and ext4 lists
+        # a directory in hash order, which the key legs must not assume away.
+        os: [ubuntu-24.04, macos-14]
     steps:
       - uses: actions/checkout@v4
 
-      - name: install deps
+      - name: install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config cmake liburing-dev
+          # As in build-linux: apt's libsodium lacks AEGIS-256.
+          wget -q -O /tmp/libsodium.tar.gz \
+              https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz
+          tar xzf /tmp/libsodium.tar.gz -C /tmp
+          (cd /tmp/libsodium-1.0.20 && ./configure --prefix=/usr/local --disable-debug \
+              && make -j"$(nproc)" && sudo make install)
+          sudo ldconfig
+
+      - name: install deps (macOS)
+        if: runner.os == 'macOS'
         run: |
           brew update
           brew install cmake pkg-config libsodium
@@ -127,6 +149,7 @@ jobs:
       - name: test the manager
         working-directory: tools/stratum
         env:
+          STM_BIN: ${{ github.workspace }}/dist/stratum
           STM_BUILD_DIR: ${{ github.workspace }}/build
         run: cargo test --release
 
@@ -135,6 +158,9 @@ jobs:
 
       - name: a daemon's stop with clients still connected
         run: python3 tests/stop_with_clients.py dist/stratum
+
+      - name: the manager's keys in a terminal
+        run: python3 tests/manager_keys.py dist/stratum
 
   tlc-specs:
     name: TLC / ${{ matrix.cfg }}
