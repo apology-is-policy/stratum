@@ -1042,6 +1042,17 @@ def copy_engine_legs(stratum, root):
         record(slurp(f'{w}/dst/t/sub/new.txt') == b'new\n' and slurp(f'{w}/dst/t/a.txt') == b'old\n',
                'a SkipAll answered at a file still merges into a directory that is there',
                f'after SkipAll at a file: new.txt {slurp(f"{w}/dst/t/sub/new.txt")!r}, a.txt {slurp(f"{w}/dst/t/a.txt")!r}')
+
+        # A pipe is no file: its open would wait for a writer that never comes.
+        os.mkfifo(f'{w}/src/pipe')
+        term.pump(1.5)
+        pick(term, 'pipe', src_names + ['pipe'])
+        term.send(F5)
+        term.expect(r'Nothing valid in selection|Copy: \d+ copied', timeout=30)
+        record('Nothing valid' in term.screen.text(), 'a pipe is left out of a copy, not read',
+               'a pipe was taken for a file')
+        term.send(ENTER)
+        term.pump(0.3)
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
