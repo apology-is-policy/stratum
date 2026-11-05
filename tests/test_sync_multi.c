@@ -2273,73 +2273,93 @@ STM_TEST(sync_multi_replace_resumes_after_step3_commit_failure) {
  * drain, and must still release the claim it took at the end. Moving the
  * failure later one write at a time finds that state without knowing how many
  * writes each earlier step makes. */
-STM_TEST(sync_multi_replace_resumed_at_its_drain_releases_its_claim) {
-    stm_bdev *bds[NDEV] = {0};
-    stm_alloc *as[NDEV] = {0};
-    stm_pool *pool = NULL; stm_sync *s = NULL;
-    setup_mirror_pool(2, "replace_resume_drain", bds, as, &pool, &s);
-
+/* A mirror pool holding one committed write, and a fresh device to replace device 1. */
+static void replace_resume_setup(stm_bdev **bds, stm_alloc **as, stm_pool **pool,
+                                 stm_sync **s, const char *path4,
+                                 stm_bdev **bd4, stm_alloc **a4)
+{
+    setup_mirror_pool(2, "replace_resume_drain", bds, as, pool, s);
     uint64_t paddrs[2] = {0};
-    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    STM_ASSERT_OK(stm_sync_reserve_mirror(*s, 1u, 2u, paddrs));
     uint8_t payload[STM_UB_SIZE];
     for (size_t i = 0; i < sizeof payload; i++)
         payload[i] = (uint8_t)((i ^ 0x3c) & 0xff);
     size_t n_conf = 0;
-    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u, payload,
+    STM_ASSERT_OK(stm_sync_mirror_write(*s, paddrs, 2u, payload,
                                            sizeof payload, &n_conf));
-    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_commit(*s));
+    unlink(path4);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(path4, &bo, bd4));
+    STM_ASSERT_OK(stm_bdev_resize(*bd4, TEST_DEVICE_BYTES));
+    uint64_t uuid4[2] = { 0x7e57eeULL, DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(*bd4, POOL_UUID, uuid4,
+                                      TEST_BOOTSTRAP_BYTES, a4));
+}
 
+STM_TEST(sync_multi_replace_resumed_at_its_drain_releases_its_claim) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    stm_bdev *bd4 = NULL; stm_alloc *a4 = NULL;
     char path4[256];
     snprintf(path4, sizeof path4,
              "/tmp/stm_v2_sync_multi_replace_resume_drain_%d_3.bin",
              (int)getpid());
-    unlink(path4);
-    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
-    stm_bdev *bd4 = NULL;
-    STM_ASSERT_OK(stm_bdev_open(path4, &bo, &bd4));
-    STM_ASSERT_OK(stm_bdev_resize(bd4, TEST_DEVICE_BYTES));
-    uint64_t uuid4[2] = { 0x7e57eeULL, DEV_UUID_HI };
-    stm_alloc *a4 = NULL;
-    STM_ASSERT_OK(stm_alloc_create(bd4, POOL_UUID, uuid4,
-                                      TEST_BOOTSTRAP_BYTES, &a4));
     stm_pool_device new_dev = {
-        .uuid   = { uuid4[0], uuid4[1] },
+        .uuid   = { 0x7e57eeULL, DEV_UUID_HI },
         .role   = STM_DEV_ROLE_DATA,
         .class_ = STM_DEV_CLASS_SSD,
         .state  = STM_DEV_STATE_ONLINE,
-        .bdev   = bd4,
     };
 
+    /* One failure on the new device, on a fresh pool, at each place in turn, until one
+     * leaves the old device EVACUATING with the claim held: the drain's write. A failure
+     * the quorum carries (an uberblock write) lets the replace finish, which shows
+     * nothing either way, so that place is passed over. */
     uint16_t slot = UINT16_MAX;
     bool evacuating = false;
-    for (int64_t after = 1; after < 4096 && !evacuating; after++) {
+    for (int64_t after = 1; after < 512 && !evacuating; after++) {
+        if (s) {
+            stm_alloc_close(a4);
+            stm_bdev_close(bd4);
+            unlink(path4);
+            teardown_mirror_pool(bds, as, pool, s);
+            for (int i = 0; i < NDEV; i++) { bds[i] = NULL; as[i] = NULL; }
+            pool = NULL; s = NULL; bd4 = NULL; a4 = NULL;
+        }
+        replace_resume_setup(bds, as, &pool, &s, path4, &bd4, &a4);
+        if (!s || !bd4 || !a4) break;
+        new_dev.bdev = bd4;
         stm_bdev_inject_fail_after(bd4, after);
         stm_status r = stm_sync_replace_device_online(
             s, /*old=*/1, &new_dev, a4, /*floor=*/2, &slot);
-        STM_ASSERT_NE((int)r, (int)STM_OK);
-        if (r == STM_OK) break;
+        if (r == STM_OK) continue;
         const stm_pool_device *old = stm_pool_device_info(pool, 1);
-        STM_ASSERT(old != NULL);
         evacuating = old && old->state == STM_DEV_STATE_EVACUATING;
     }
     STM_ASSERT(evacuating);
-    STM_ASSERT_EQ((int)stm_pool_replace_claim(pool), 3);
-    stm_bdev_inject_fail_after(bd4, 0);
+    if (evacuating) {
+        STM_ASSERT_EQ((int)stm_pool_replace_claim(pool), 3);
+        stm_bdev_inject_fail_after(bd4, 0);
 
-    slot = UINT16_MAX;
-    STM_ASSERT_OK(stm_sync_replace_device_online(
-        s, /*old=*/1, &new_dev, a4, /*floor=*/2, &slot));
-    STM_ASSERT_EQ(slot, 3u);
-    STM_ASSERT_EQ((int)stm_pool_replace_claim(pool),
-                   (int)STM_POOL_REPLACE_CLAIM_NONE);
-    const stm_pool_device *probe = stm_pool_device_info(pool, 1);
-    STM_ASSERT(probe != NULL);
-    STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_REMOVED);
+        slot = UINT16_MAX;
+        STM_ASSERT_OK(stm_sync_replace_device_online(
+            s, /*old=*/1, &new_dev, a4, /*floor=*/2, &slot));
+        STM_ASSERT_EQ(slot, 3u);
+        STM_ASSERT_EQ((int)stm_pool_replace_claim(pool),
+                       (int)STM_POOL_REPLACE_CLAIM_NONE);
+        const stm_pool_device *probe = stm_pool_device_info(pool, 1);
+        STM_ASSERT(probe != NULL);
+        if (probe) STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_REMOVED);
+    }
 
-    stm_alloc_close(a4);
-    stm_bdev_close(bd4);
-    unlink(path4);
-    teardown_mirror_pool(bds, as, pool, s);
+    if (s) {
+        stm_alloc_close(a4);
+        stm_bdev_close(bd4);
+        unlink(path4);
+        teardown_mirror_pool(bds, as, pool, s);
+    }
 }
 
 /* P5-8 regression: while a replace is in flight (stuck after step-3
