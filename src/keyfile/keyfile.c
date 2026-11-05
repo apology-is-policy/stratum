@@ -41,13 +41,6 @@ static uint32_t load_u32_le(const uint8_t in[4])
          | ((uint32_t)in[3] << 24);
 }
 
-/* By name, a key file is opened only where a file can be: a link at the name is
- * refused rather than followed. */
-static int open_key_for_writing(const char *path)
-{
-    return open(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR);
-}
-
 /* The key replaces what the file held, and a file found at the name is made private
  * first: open's mode reaches only a file it creates. */
 static int put_key(int fd, const uint8_t *buf, size_t len)
@@ -59,14 +52,59 @@ static int put_key(int fd, const uint8_t *buf, size_t len)
     return 0;
 }
 
+static void sync_parent_of(const char *path)
+{
+    char dir[4096];
+    const char *slash = strrchr(path, '/');
+    size_t n = slash ? (size_t)(slash - path) : 0;
+    if (!slash) {
+        dir[0] = '.';
+        n = 1;
+    } else if (n == 0) {
+        dir[0] = '/';
+        n = 1;
+    } else if (n < sizeof dir) {
+        memcpy(dir, path, n);
+    } else {
+        return;
+    }
+    dir[n] = '\0';
+    int dfd = open(dir, O_RDONLY | O_CLOEXEC);
+    if (dfd < 0) return;
+    (void)fsync(dfd);
+    (void)close(dfd);
+}
+
+/* By name, the key goes into a new file made beside the name (O_EXCL, 0600) and
+ * renamed over it, so no descriptor, owner or link of a file already there reaches
+ * the key, and the old key stays whole until the new one is. A link, or anything but
+ * a regular file, at the name is refused rather than replaced. */
+static stm_status generate_by_name(const char *path, const char *passphrase, size_t pass_len)
+{
+    struct stat st;
+    if (lstat(path, &st) == 0 && !S_ISREG(st.st_mode)) return STM_EBACKEND;
+    char tmp[4096];
+    int n = snprintf(tmp, sizeof tmp, "%s.XXXXXX", path);
+    if (n < 0 || (size_t)n >= sizeof tmp) return STM_EINVAL;
+    int fd = mkstemp(tmp);
+    if (fd < 0) return STM_EBACKEND;
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    stm_status s = passphrase ? stm_keyfile_generate_passphrase_fd(fd, passphrase, pass_len)
+                              : stm_keyfile_generate_fd(fd);
+    if (close(fd) != 0 && s == STM_OK) s = STM_EBACKEND;
+    if (s == STM_OK && rename(tmp, path) != 0) s = STM_EBACKEND;
+    if (s != STM_OK) {
+        (void)unlink(tmp);
+        return s;
+    }
+    sync_parent_of(path);
+    return STM_OK;
+}
+
 stm_status stm_keyfile_generate(const char *path)
 {
     if (!path) return STM_EINVAL;
-    int fd = open_key_for_writing(path);
-    if (fd < 0) return STM_EBACKEND;
-    stm_status s = stm_keyfile_generate_fd(fd);
-    close(fd);
-    return s;
+    return generate_by_name(path, NULL, 0);
 }
 
 stm_status stm_keyfile_generate_fd(int fd)
@@ -218,11 +256,7 @@ stm_status stm_keyfile_generate_passphrase(const char *path,
                                               size_t      pass_len)
 {
     if (!path || !passphrase || pass_len == 0) return STM_EINVAL;
-    int fd = open_key_for_writing(path);
-    if (fd < 0) return STM_EBACKEND;
-    stm_status s = stm_keyfile_generate_passphrase_fd(fd, passphrase, pass_len);
-    close(fd);
-    return s;
+    return generate_by_name(path, passphrase, pass_len);
 }
 
 stm_status stm_keyfile_generate_passphrase_fd(int         fd,

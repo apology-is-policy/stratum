@@ -130,24 +130,62 @@ STM_TEST(keyfile_generate_refuses_a_link_at_its_name)
     STM_ASSERT_EQ(stm_keyfile_generate_passphrase(link_path, "pw", 2), STM_EBACKEND);
     struct stat st;
     STM_ASSERT(lstat(target, &st) != 0);
+    STM_ASSERT(lstat(link_path, &st) == 0 && S_ISLNK(st.st_mode));
+    unlink(link_path);
+    /* Nor is a FIFO opened, which with no reader would block. */
+    STM_ASSERT_EQ(mkfifo(link_path, 0600), 0);
+    STM_ASSERT_EQ(stm_keyfile_generate(link_path), STM_EBACKEND);
     unlink(link_path);
 }
 
-/* A file found at the name is made private: open's mode reaches only a file it creates. */
-STM_TEST(keyfile_generate_over_a_readable_file_makes_it_private)
+/* A readable file at the name is replaced, not written into: a descriptor opened on
+ * it before still reads the old bytes, never the key. */
+STM_TEST(keyfile_generate_over_a_readable_file_reaches_no_old_reader)
 {
     unlink(TMP);
     int fd = open(TMP, O_WRONLY | O_CREAT | O_EXCL, 0644);
     STM_ASSERT(fd >= 0);
-    STM_ASSERT_EQ(write(fd, "an older and longer file than a key", 35), 35);
+    STM_ASSERT_EQ(write(fd, "old!", 4), 4);
     STM_ASSERT_EQ(fchmod(fd, 0644), 0);
     close(fd);
+    int reader = open(TMP, O_RDONLY);
+    STM_ASSERT(reader >= 0);
     STM_ASSERT_OK(stm_keyfile_generate(TMP));
     struct stat st;
     STM_ASSERT_EQ(stat(TMP, &st), 0);
     STM_ASSERT_EQ(st.st_mode & 0777, 0600);
     stm_hybrid_keys k = {0};
     STM_ASSERT_OK(stm_keyfile_load(TMP, &k));
+    char got[16] = {0};
+    STM_ASSERT_EQ(pread(reader, got, sizeof got, 0), 4);
+    STM_ASSERT(memcmp(got, "old!", 4) == 0);
+    close(reader);
+    unlink(TMP);
+}
+
+/* The fd forms truncate and write from 0: a file longer than a key, its offset
+ * moved, still ends holding exactly the key. */
+STM_TEST(keyfile_generate_fd_replaces_what_the_file_held)
+{
+    static uint8_t junk[8192];
+    memset(junk, 'j', sizeof junk);
+    for (int form = 0; form < 2; form++) {
+        unlink(TMP);
+        int fd = open(TMP, O_RDWR | O_CREAT | O_EXCL, 0644);
+        STM_ASSERT(fd >= 0);
+        if (fd < 0) return;
+        STM_ASSERT_EQ(write(fd, junk, sizeof junk), (ssize_t)sizeof junk);
+        STM_ASSERT_EQ(lseek(fd, 100, SEEK_SET), 100);
+        if (form == 0) STM_ASSERT_OK(stm_keyfile_generate_fd(fd));
+        else STM_ASSERT_OK(stm_keyfile_generate_passphrase_fd(fd, "pw", 2));
+        close(fd);
+        struct stat st;
+        STM_ASSERT_EQ(stat(TMP, &st), 0);
+        STM_ASSERT_EQ(st.st_mode & 0777, 0600);
+        stm_hybrid_keys k = {0};
+        if (form == 0) STM_ASSERT_OK(stm_keyfile_load(TMP, &k));
+        else STM_ASSERT_OK(stm_keyfile_load_passphrase(TMP, "pw", 2, &k));
+    }
     unlink(TMP);
 }
 

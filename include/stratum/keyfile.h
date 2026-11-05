@@ -78,8 +78,11 @@ typedef struct stm_hybrid_keys {
 
 /*
  * Generate a fresh hybrid key pair via stm_hybrid_keygen and write
- * it to `path` UNENCRYPTED. File is created with mode 0600; existing
- * file at `path` is overwritten.
+ * it to `path` UNENCRYPTED. The key is written to a new file beside
+ * `path` (O_EXCL, 0600) and renamed over it: a regular file already at
+ * `path` is replaced whole, and nothing that had it open, or owned it,
+ * reaches the key. A link, or anything but a regular file, at `path`
+ * is refused (STM_EBACKEND).
  *
  * Returns STM_EBACKEND on I/O failure, STM_ENOMEM on allocation
  * failure, STM_EINVAL for NULL args.
@@ -90,8 +93,8 @@ stm_status stm_keyfile_generate(const char *path);
 /*
  * As stm_keyfile_generate, into `fd`: an open, writable file that the caller made and
  * closes. A file made O_EXCL and written through its own descriptor cannot be swapped
- * for another between the making and the writing. The path form refuses a symlink at
- * `path`; both make the file 0600.
+ * for another between the making and the writing. The file is made 0600, truncated,
+ * and written from offset 0.
  */
 STM_MUST_USE
 stm_status stm_keyfile_generate_fd(int fd);
@@ -110,7 +113,8 @@ stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out);
 /*
  * Generate a fresh hybrid key pair, encrypt PK||SK under a KEK
  * derived from `passphrase` via Argon2id (interactive params), and
- * write the encrypted keyfile to `path`. File mode 0600. Caller's
+ * write the encrypted keyfile to `path`, as stm_keyfile_generate
+ * writes its key: a new 0600 file renamed over the name. Caller's
  * `passphrase` buffer is NOT wiped — caller is responsible for
  * `stm_ct_memzero`-ing it after this call returns.
  *
