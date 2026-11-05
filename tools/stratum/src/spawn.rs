@@ -227,6 +227,10 @@ impl SpawnCtx {
             key.to_string_lossy().into_owned(),
             "--ctl-listen".into(),
             ctl_sock.to_string_lossy().into_owned(),
+            // The daemon denies /ctl admin unless the principal is named.
+            // The socket is in the 0700 session directory.
+            "--admin-uid".into(),
+            unsafe { libc::geteuid() }.to_string(),
         ];
         if passphrase.is_some() {
             args.push("--passphrase-stdin".into());

@@ -187,11 +187,13 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             // SWISS-4i (F9): expose /ctl/ on a sibling Unix socket
             // so the TUI can drive admin verbs (snapshot create,
             // scrub trigger) via `stratum fs -s CTL_SOCK ...`.
-            // Auto-admin: stratumd stamps admin_uid = geteuid()
-            // at startup; our SO_PEERCRED is the same uid, so the
-            // admin gate fires-true.
+            // The daemon denies admin unless the principal is named.
+            // The socket is in the 0700 session directory, so no other
+            // user reaches it.
             "--ctl-listen".into(),
             session_dir.join("stratumd-ctl.sock").to_string_lossy().into_owned(),
+            "--admin-uid".into(),
+            unsafe { libc::geteuid() }.to_string(),
             // SWISS-4q P1: disable per-connection idle timeout. Slate
             // holds a long-lived 9P connection to stratumd that idles
             // when the TUI is in the background. The default 30 s

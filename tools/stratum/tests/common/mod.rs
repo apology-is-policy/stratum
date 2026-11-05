@@ -191,6 +191,8 @@ impl SessionBuilder {
             stm_keyfile.to_string_lossy().into_owned(),
             "--ctl-listen".into(),
             stratumd_ctl_sock.to_string_lossy().into_owned(),
+            "--admin-uid".into(),
+            unsafe { libc::geteuid() }.to_string(),
         ];
         if self.passphrase.is_some() {
             stratumd_args.push("--passphrase-stdin".into());
