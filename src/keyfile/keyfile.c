@@ -52,43 +52,68 @@ static int put_key(int fd, const uint8_t *buf, size_t len)
     return 0;
 }
 
-static void sync_parent_of(const char *path)
+/* The directory part of `path`, "." when it has none. False when it does not fit. */
+static bool parent_of(const char *path, char *dir, size_t cap)
 {
-    char dir[4096];
     const char *slash = strrchr(path, '/');
     size_t n = slash ? (size_t)(slash - path) : 0;
     if (!slash) {
+        if (cap < 2) return false;
         dir[0] = '.';
         n = 1;
     } else if (n == 0) {
+        if (cap < 2) return false;
         dir[0] = '/';
         n = 1;
-    } else if (n < sizeof dir) {
+    } else if (n < cap) {
         memcpy(dir, path, n);
     } else {
-        return;
+        return false;
     }
     dir[n] = '\0';
+    return true;
+}
+
+static void sync_parent_of(const char *path)
+{
+    char dir[4096];
+    if (!parent_of(path, dir, sizeof dir)) return;
     int dfd = open(dir, O_RDONLY | O_CLOEXEC);
     if (dfd < 0) return;
     (void)fsync(dfd);
     (void)close(dfd);
 }
 
+/* A new file beside `path` under a short random name, so that any legal name of a key
+ * leaves room for it; created exclusive, private and close-on-exec in one call. */
+static int make_temp_beside(const char *path, char *tmp, size_t cap)
+{
+    char dir[4096];
+    if (!parent_of(path, dir, sizeof dir)) return -1;
+    for (int tries = 0; tries < 8; tries++) {
+        uint8_t r[8];
+        stm_random_bytes(r, sizeof r);
+        int n = snprintf(tmp, cap, "%s/.stratum-key-%02x%02x%02x%02x%02x%02x%02x%02x", dir,
+                         r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+        if (n < 0 || (size_t)n >= cap) return -1;
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR);
+        if (fd >= 0 || errno != EEXIST) return fd;
+    }
+    return -1;
+}
+
 /* By name, the key goes into a new file made beside the name (O_EXCL, 0600) and
  * renamed over it, so no descriptor, owner or link of a file already there reaches
  * the key, and the old key stays whole until the new one is. A link, or anything but
- * a regular file, at the name is refused rather than replaced. */
+ * a regular file, at the name is refused; one planted after that check is replaced by
+ * the rename, never written through. */
 static stm_status generate_by_name(const char *path, const char *passphrase, size_t pass_len)
 {
     struct stat st;
     if (lstat(path, &st) == 0 && !S_ISREG(st.st_mode)) return STM_EBACKEND;
     char tmp[4096];
-    int n = snprintf(tmp, sizeof tmp, "%s.XXXXXX", path);
-    if (n < 0 || (size_t)n >= sizeof tmp) return STM_EINVAL;
-    int fd = mkstemp(tmp);
+    int fd = make_temp_beside(path, tmp, sizeof tmp);
     if (fd < 0) return STM_EBACKEND;
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
     stm_status s = passphrase ? stm_keyfile_generate_passphrase_fd(fd, passphrase, pass_len)
                               : stm_keyfile_generate_fd(fd);
     if (close(fd) != 0 && s == STM_OK) s = STM_EBACKEND;

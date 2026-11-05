@@ -132,10 +132,31 @@ STM_TEST(keyfile_generate_refuses_a_link_at_its_name)
     STM_ASSERT(lstat(target, &st) != 0);
     STM_ASSERT(lstat(link_path, &st) == 0 && S_ISLNK(st.st_mode));
     unlink(link_path);
-    /* Nor is a FIFO opened, which with no reader would block. */
+    /* Nor is a key written into a FIFO. A reader waits on it, so a write that went
+     * through would fail this test rather than block it. */
     STM_ASSERT_EQ(mkfifo(link_path, 0600), 0);
+    int reader = open(link_path, O_RDONLY | O_NONBLOCK);
+    STM_ASSERT(reader >= 0);
     STM_ASSERT_EQ(stm_keyfile_generate(link_path), STM_EBACKEND);
+    if (reader >= 0) close(reader);
     unlink(link_path);
+}
+
+/* A key's name may be as long as any name: a temporary named after it would not be. */
+STM_TEST(keyfile_generate_takes_a_name_of_255_bytes)
+{
+    char dir[64], path[64 + 1 + 256];
+    snprintf(dir, sizeof dir, "/tmp/stm-keyname-XXXXXX");
+    STM_ASSERT(mkdtemp(dir) != NULL);
+    char name[256];
+    memset(name, 'k', 255);
+    name[255] = '\0';
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    STM_ASSERT_OK(stm_keyfile_generate(path));
+    stm_hybrid_keys k = {0};
+    STM_ASSERT_OK(stm_keyfile_load(path, &k));
+    unlink(path);
+    STM_ASSERT_EQ(rmdir(dir), 0);
 }
 
 /* A readable file at the name is replaced, not written into: a descriptor opened on

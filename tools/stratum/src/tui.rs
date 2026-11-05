@@ -541,12 +541,8 @@ fn run_ui(
         loop {
             // SWISS-8g: tick the in-progress /ctl/ admin job (if any)
             // FIRST so completion swaps in a success/error dialog
-            // BEFORE the rest of the loop runs. Ticked even when a
-            // local_dialog is up — the "Working…" dialog IS the dialog
-            // we want to replace.
-            if ctl_job.is_some() {
-                advance_ctl_job(&mut local_dialog, &mut ctl_job);
-            }
+            // BEFORE the rest of the loop runs.
+            tick_ctl_job(&mut local_dialog, &mut ctl_job);
             // SWISS-4h: advance batch ops one step per iteration when
             // no dialog is up. Conflict (CopyBatch) opens a dialog
             // that pauses the loop until user picks; the next
@@ -652,7 +648,7 @@ fn run_ui(
                     Err(e) => {
                         // An empty buffer here would replace the file on the next :w.
                         let _ = client.write_path("/event", b"editor close\n");
-                        local_dialog = Some(error_dialog(&format!(
+                        show_unasked(&mut local_dialog, error_dialog(&format!(
                             "Cannot open {}: {e}", snapshot.editor_filename
                         )));
                     }
@@ -1939,37 +1935,48 @@ fn spawn_ctl_job(
 /// success / error message + clears the job. Returns `Some(())`
 /// when the job completed this tick (caller should clear its own
 /// reference) or `None` if still running.
+/// A finished job's result takes the place of a notice, its own "Working" one
+/// included, but never of a question or a field being typed in: it waits until
+/// that has been answered.
+fn tick_ctl_job(local_dialog: &mut Option<LocalDialog>, ctl_job: &mut Option<CtlJob>) {
+    let only_a_notice = local_dialog
+        .as_ref()
+        .is_none_or(|d| matches!(d.kind, LocalDialogKind::Error));
+    if ctl_job.is_some() && only_a_notice {
+        advance_ctl_job(local_dialog, ctl_job);
+    }
+}
+
+/// Puts up a dialog no key asked for. A question holding a batch is not left
+/// unanswered beneath it: that counts as Stop, the answer that loses nothing.
+fn show_unasked(local_dialog: &mut Option<LocalDialog>, d: LocalDialog) {
+    if let Some(LocalDialog {
+        kind: LocalDialogKind::Confirm { on_pick: ConfirmAction::StopBatch { copy }, .. },
+        ..
+    }) = local_dialog.as_ref()
+    {
+        post_batch_cancel(*copy);
+    }
+    *local_dialog = Some(d);
+}
+
 fn advance_ctl_job(
     local_dialog: &mut Option<LocalDialog>,
     ctl_job: &mut Option<CtlJob>,
 ) -> Option<()> {
     let job = ctl_job.as_ref()?;
-    match job.rx.try_recv() {
-        Ok(CtlJobResult::Ok) => {
-            let msg = job.success_msg.clone();
-            *local_dialog = Some(info_dialog(&msg));
-            *ctl_job = None;
-            Some(())
-        }
-        Ok(CtlJobResult::Err(detail)) => {
-            *local_dialog = Some(error_dialog(&detail));
-            *ctl_job = None;
-            Some(())
-        }
-        Ok(CtlJobResult::SpawnErr(detail)) => {
-            *local_dialog = Some(error_dialog(&format!("ctl-job: {detail}")));
-            *ctl_job = None;
-            Some(())
-        }
-        Err(std::sync::mpsc::TryRecvError::Empty) => None,
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            *local_dialog = Some(error_dialog(
-                "ctl-job: background thread disconnected without sending result",
-            ));
-            *ctl_job = None;
-            Some(())
-        }
-    }
+    let shown = match job.rx.try_recv() {
+        Ok(CtlJobResult::Ok) => info_dialog(&job.success_msg),
+        Ok(CtlJobResult::Err(detail)) => error_dialog(&detail),
+        Ok(CtlJobResult::SpawnErr(detail)) => error_dialog(&format!("ctl-job: {detail}")),
+        Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => error_dialog(
+            "ctl-job: background thread disconnected without sending result",
+        ),
+    };
+    show_unasked(local_dialog, shown);
+    *ctl_job = None;
+    Some(())
 }
 
 fn submit_confirm(
@@ -2197,11 +2204,11 @@ fn post_batch_cancel(copy: bool) {
     }
 }
 
-/// The question a quit key, or F5/F7/F8, gets while a batch runs. The
-/// batch is held while it shows, so it never asks the user to wait.
+/// The question a quit key, or F5/F7/F8, gets while a batch runs. No new item
+/// starts while it shows; the one in hand runs on, on its own thread.
 fn stop_batch_dialog(copy: bool, quitting: bool) -> LocalDialog {
     let what = if copy { "A copy" } else { "A delete" };
-    let then = if quitting { "\nOnce it has stopped, F10 quits." } else { "" };
+    let then = if quitting { "\nOnce it has stopped and its summary is closed, F10 quits." } else { "" };
     LocalDialog {
         kind: LocalDialogKind::Confirm {
             options: vec!["Stop".to_string(), "Go on".to_string()],
@@ -2210,9 +2217,10 @@ fn stop_batch_dialog(copy: bool, quitting: bool) -> LocalDialog {
         },
         // The confirm box cuts a line at its width rather than wrapping it.
         prompt: format!(
-            "{what} is under way, held while this shows.\n\
+            "{what} is under way. The item in hand goes on; the rest\n\
+             wait while this shows.\n\
              Stop, or Esc: it stops after the item in hand.\n\
-             Go on: it carries on.{then}"
+             Go on: it carries on, unless a stop was asked for already.{then}"
         ),
         value: Default::default(),
         is_password: false,
@@ -3880,8 +3888,11 @@ fn ensure_stm_dir(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str, mode: Option<u32>) 
 /// `write -n` refuses a name that is there and removes what it made if it fails, so a
 /// copy never truncates or removes a file it did not make. What arrived is checked
 /// against `want`, and `same_source` says the source is still what gave `mode` and
-/// `want`. `write` makes the file with the source's mode, so nobody the source keeps out
-/// can read it while it fills.
+/// `want`. A replacement is checked before the move that commits it. A new name is
+/// committed by `write -n` itself, so a check that fails removes it afterwards, and a
+/// crash between the two keeps it; closing that needs a rename that refuses to replace.
+/// `write` makes the file with the source's mode, so nobody the source keeps out can
+/// read it while it fills.
 #[allow(clippy::too_many_arguments)]
 fn write_stm_file(
     sp: &Arc<SpawnCtx>,
@@ -4783,6 +4794,62 @@ mod tests {
         assert_eq!(p.cwd(), None);
         p.path_ok = true;
         assert_eq!(p.cwd(), Some("a/b"));
+    }
+
+    fn finished_job(msg: &str) -> Option<CtlJob> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(CtlJobResult::Ok).unwrap();
+        Some(CtlJob { rx, success_msg: msg.to_string(), _join: None })
+    }
+
+    fn holds_the_batch(d: &Option<LocalDialog>) -> bool {
+        matches!(d, Some(LocalDialog {
+            kind: LocalDialogKind::Confirm { on_pick: ConfirmAction::StopBatch { .. }, .. }, ..
+        }))
+    }
+
+    // A job finishing under the question that holds a batch replaced it, and the Esc
+    // the question asked for then closed the replacement and let the batch run on.
+    #[test]
+    fn a_finished_job_waits_for_the_question_that_holds_a_batch() {
+        DELETE_CANCEL.with(|c| c.set(false));
+        let mut dialog = Some(stop_batch_dialog(false, true));
+        let mut job = finished_job("Snapshot created.");
+        tick_ctl_job(&mut dialog, &mut job);
+        assert!(holds_the_batch(&dialog));
+        assert!(job.is_some());
+        assert!(!DELETE_CANCEL.with(|c| c.get()));
+        dialog = None;
+        tick_ctl_job(&mut dialog, &mut job);
+        assert!(job.is_none());
+        assert!(dialog.is_some_and(|d| d.prompt == "Snapshot created."));
+    }
+
+    #[test]
+    fn a_finished_job_replaces_its_own_notice() {
+        let mut dialog = Some(info_dialog("Creating snapshot..."));
+        let mut job = finished_job("Snapshot created.");
+        tick_ctl_job(&mut dialog, &mut job);
+        assert!(job.is_none());
+        assert!(dialog.is_some_and(|d| d.prompt == "Snapshot created."));
+    }
+
+    // Whatever else takes the question's place counts as Stop.
+    #[test]
+    fn a_dialog_put_over_the_question_stops_the_batch() {
+        DELETE_CANCEL.with(|c| c.set(false));
+        let mut dialog = Some(stop_batch_dialog(false, false));
+        show_unasked(&mut dialog, error_dialog("Cannot open x"));
+        assert!(DELETE_CANCEL.with(|c| c.replace(false)));
+        CONFLICT_RESP.with(|c| *c.borrow_mut() = None);
+        let mut dialog = Some(stop_batch_dialog(true, false));
+        show_unasked(&mut dialog, error_dialog("Cannot open x"));
+        assert!(CONFLICT_RESP.with(|c| c.borrow_mut().take()).is_some_and(|r| r.cancel));
+        // Over anything else, nothing is posted.
+        let mut dialog = Some(info_dialog("Copy: 1 copied"));
+        show_unasked(&mut dialog, error_dialog("Cannot open x"));
+        assert!(!DELETE_CANCEL.with(|c| c.get()));
+        assert!(CONFLICT_RESP.with(|c| c.borrow().is_none()));
     }
 
     fn make_entries(names: &[(&str, &str)]) -> Vec<String> {

@@ -82,10 +82,11 @@ typedef struct stm_hybrid_keys {
  * `path` (O_EXCL, 0600) and renamed over it: a regular file already at
  * `path` is replaced whole, and nothing that had it open, or owned it,
  * reaches the key. A link, or anything but a regular file, at `path`
- * is refused (STM_EBACKEND).
+ * is refused (STM_EBACKEND); one planted there after that check is
+ * replaced by the rename, never written through.
  *
- * Returns STM_EBACKEND on I/O failure, STM_ENOMEM on allocation
- * failure, STM_EINVAL for NULL args.
+ * Returns STM_EBACKEND on I/O failure or a path too long to hold,
+ * STM_ENOMEM on allocation failure, STM_EINVAL for NULL args.
  */
 STM_MUST_USE
 stm_status stm_keyfile_generate(const char *path);

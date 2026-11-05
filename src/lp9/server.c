@@ -376,6 +376,10 @@ static stm_status h_walk(stm_lp9_server *s,
     if (!f) return reply_rlerror(resp, resp_cap, resp_len, tag, STM_LP9_ECODE_EBADF);
     if (newfid != fid && fid_get(s, newfid))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_LP9_ECODE_EINVAL);
+    /* 9P does not walk an opened fid: walked in place it would name one file and
+     * hold the open of another, which a backend reads by its own record. */
+    if (newfid == fid && nname > 0 && f->is_open)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_LP9_ECODE_EBUSY);
 
     /* Resolve names. */
     const uint8_t *bp = body + 10;

@@ -1435,13 +1435,16 @@ def files_left(path):
 
 
 def delete_batch_legs(stratum, root):
-    """A delete runs one item at a time. A quit key mid-batch asks, and holds the batch while
-    it asks: Esc stops it after the item in hand, Go on lets it finish. A bare Esc stops it."""
+    """A delete runs one item at a time. A quit key mid-batch asks, and no new item starts
+    while it asks: Stop (its first answer) or Esc stops the batch after the item in hand, Go on
+    lets it finish. A bare Esc stops it. A copy's question stops a copy the same way."""
     w = f'{root}/delbatch'
     many = 20000
     dirs = ['bulkone', 'bulktwo']
     held = ['heldone', 'heldtwo']
-    names = ['bulkzero'] + dirs + held
+    goon = ['goonone', 'goontwo']
+    stop = ['stopone', 'stoptwo']
+    names = goon + stop + dirs + held
 
     def fill(d, n):
         os.makedirs(f'{w}/{d}')
@@ -1463,7 +1466,7 @@ def delete_batch_legs(stratum, root):
     count = {d: bare if d in dirs else many for d in names}
     for d in names:
         fill(d, count[d])
-    asked = r'held while this shows'
+    asked = r'wait while this shows'
 
     def start_delete(term, chosen):
         term.expect(re.escape(chosen[0]), timeout=30)
@@ -1490,9 +1493,10 @@ def delete_batch_legs(stratum, root):
         print('note: the batch ended before the key was read, so this leg proves nothing', flush=True)
         return False
 
+    # Two items each, so that Stop and Go on end differently.
     term = Term([stratum, 'tui', '--host', w])
     try:
-        start_delete(term, ['bulkzero'])
+        start_delete(term, goon)
         term.send(b'\x11')
         if asks(term):
             record(not term.exited(1), 'Ctrl-Q mid-delete asks, and does not quit', 'Ctrl-Q quit in the middle of a delete')
@@ -1500,8 +1504,27 @@ def delete_batch_legs(stratum, root):
             term.pump(0.1)
             term.send(ENTER)
             term.expect(r'Delete: \d+ deleted', timeout=120)
-            left = files_left(f'{w}/bulkzero')
-            record(left == -1, 'Go on lets the delete finish', f'after Go on, bulkzero holds {left} files')
+            left = {d: files_left(f'{w}/{d}') for d in goon}
+            record(all(n == -1 for n in left.values()), 'Go on lets the delete finish',
+                   f'after Go on, the directories hold {left} files')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    # Enter takes the question's first answer for a quit key, which must be Stop.
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        start_delete(term, stop)
+        term.send(b'\x03')
+        if asks(term):
+            term.pump(0.1)
+            term.send(ENTER)
+            term.expect(r'Delete: \d+ deleted', timeout=120)
+            intact = [d for d in stop if files_left(f'{w}/{d}') == count[d]]
+            record(len(intact) == 1, 'Enter on the question a quit key asks stops the delete after the item in hand',
+                   f'after Ctrl-C and Enter, the intact directories are {intact}')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -1542,6 +1565,55 @@ def delete_batch_legs(stratum, root):
             intact = [d for d in held if files_left(f'{w}/{d}') == count[d]]
             record(len(intact) == 1, 'one Esc on the question Ctrl-C asks stops the delete after the item in hand',
                    f'after Ctrl-C and one Esc, the intact directories are {intact}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    # The same question over a copy: one Esc stops it after the item in hand, so the
+    # second directory never arrives whole.
+    c = f'{root}/copybatch'
+    small = 300
+    parts = ['cone', 'ctwo']
+    for d in parts:
+        os.makedirs(f'{c}/csrc/{d}')
+        for i in range(small):
+            spit(f'{c}/csrc/{d}/f{i:03d}', b'x' * 4096)
+    os.makedirs(f'{c}/cdst')
+    top = ['cdst', 'csrc']
+    term = Term([stratum, 'tui', '--host', c])
+    try:
+        term.expect(r'csrc', timeout=30)
+        term.pump(0.5)
+        pick(term, 'csrc', top)
+        term.send(ENTER)
+        term.pump(0.6)
+        term.send(TAB)
+        term.pump(0.3)
+        pick(term, 'cdst', top, right=True)
+        term.send(ENTER)
+        term.pump(0.6)
+        term.send(TAB)
+        term.pump(0.3)
+        for d in parts:
+            pick(term, d, parts)
+            term.send(b' ')
+            term.pump(0.3)
+        term.send(F5)
+        end = time.monotonic() + 30
+        while time.monotonic() < end and files_left(f'{c}/cdst/cone') <= 0:
+            time.sleep(0.01)
+        term.send(b'\x03')
+        term.expect(asked + r'|Copy: \d+ copied', timeout=10)
+        if not re.search(asked, term.screen.text()):
+            print('note: the copy ended before the key was read, so this leg proves nothing', flush=True)
+        else:
+            term.send(ESC)
+            copied, _, _, _ = copy_summary(term, 'after Ctrl-C and one Esc mid-copy')
+            got = max(files_left(f'{c}/cdst/ctwo'), 0)
+            record(got < small, 'one Esc on the question a copy asks stops it after the item in hand',
+                   f'after Ctrl-C and one Esc, ctwo holds {got} of {small} files; {copied} copied in all')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise

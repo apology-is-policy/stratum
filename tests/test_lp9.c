@@ -432,6 +432,41 @@ STM_TEST(lp9_readdir_emits_two_entries)
     stm_lp9_server_destroy(s);
 }
 
+STM_TEST(lp9_an_opened_fid_is_not_walked_in_place)
+{
+    /* Walked in place, an opened fid named one file while the backend's open was
+     * another's, and a read served the old file's bytes for the new name. */
+    stm_lp9_server *s = NULL;
+    STM_ASSERT_OK(stm_lp9_server_create(&TEST_VOPS, NULL, QP_ROOT, 8192, &s));
+    uint8_t req[BUF], resp[BUF];
+    uint32_t rl = 0;
+
+    uint32_t sz = build_tversion(req, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, BUF, &rl));
+    sz = build_tattach(req, 1, 100);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, BUF, &rl));
+    sz = build_twalk(req, 2, 100, 101, NULL);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, BUF, &rl));
+    sz = build_tlopen(req, 3, 101, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, BUF, &rl));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
+
+    sz = build_twalk(req, 4, 101, 101, "version");
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, BUF, &rl));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
+    STM_ASSERT_EQ(g_u32(resp + 7), (uint32_t)STM_LP9_ECODE_EBUSY);
+
+    /* A clone of it is a new fid, not opened, and is still allowed. */
+    sz = build_twalk(req, 5, 101, 102, NULL);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, BUF, &rl));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
+    sz = build_twalk(req, 6, 102, 102, "version");
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, BUF, &rl));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
+
+    stm_lp9_server_destroy(s);
+}
+
 STM_TEST(lp9_unimplemented_op_returns_enosys)
 {
     stm_lp9_server *s = NULL;
