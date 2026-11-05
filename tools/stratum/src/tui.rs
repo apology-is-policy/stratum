@@ -302,6 +302,36 @@ pub struct Opts {
     pub spawn: Option<Arc<SpawnCtx>>,
 }
 
+static ASKED_TO_STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn ask_to_stop(_: libc::c_int) {
+    ASKED_TO_STOP.store(true, Ordering::Relaxed);
+}
+
+/// Ending by the default action would leave the terminal raw, the session
+/// directory behind and the daemons to find out for themselves. A HUP someone
+/// has chosen to ignore stays ignored.
+fn stop_on_term_and_hup() {
+    let handler = ask_to_stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        if libc::signal(libc::SIGHUP, handler) == libc::SIG_IGN {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        }
+    }
+}
+
+/// With the terminal gone, a poll answers at once and finds no key, so without
+/// this a manager whose HUP is ignored spins for ever, holding its daemons up.
+fn should_stop(tty: Option<i32>) -> bool {
+    if ASKED_TO_STOP.load(Ordering::Relaxed) {
+        return true;
+    }
+    let Some(fd) = tty else { return false };
+    let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
+    unsafe { libc::tcgetattr(fd, &mut attrs) != 0 }
+}
+
 pub fn run(opts: Opts) -> Result<()> {
     let mut main_client = SlateClient::dial(&opts.slate_sock)
         .with_context(|| format!("dial slate at {}", opts.slate_sock.display()))?;
@@ -372,6 +402,8 @@ fn run_ui(
     redraw_rx: &Receiver<u64>,
     spawn: Option<Arc<SpawnCtx>>,
 ) -> Result<()> {
+    stop_on_term_and_hup();
+    let tty = [0, 1, 2].into_iter().find(|&fd| unsafe { libc::isatty(fd) } == 1);
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
@@ -720,6 +752,9 @@ fn run_ui(
                         Event::Resize(_, _) => break,
                         _ => {}
                     }
+                }
+                if should_stop(tty) {
+                    return Ok(());
                 }
                 // SWISS-4h: tick the main loop so a batch in progress
                 // can advance even without keyboard activity.
