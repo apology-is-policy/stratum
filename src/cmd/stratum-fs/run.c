@@ -493,8 +493,11 @@ static void unmake(stm_9p_client *c, const path_t *parent, const char *name)
     if (stm_9p_walk(c, ROOT_FID, UNMAKE_FID, parent->count, parent->names,
                     qids, &walked) != STM_OK)
         return;
-    (void)stm_9p_unlinkat(c, UNMAKE_FID, name, 0);
+    stm_status rc = stm_9p_unlinkat(c, UNMAKE_FID, name, 0);
     (void)stm_9p_clunk(c, UNMAKE_FID);
+    /* Another client's commit may already hold the file: the removal is committed too,
+     * or a crash brings the partial file back. */
+    if (rc == STM_OK) (void)stm_9p_fsync(c, ROOT_FID, /*datasync=*/0);
 }
 
 /* Set by a command that made its own work durable, so the dispatcher's sync is not

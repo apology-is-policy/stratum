@@ -3702,6 +3702,7 @@ const LOCATION_UNREAD: &str = "This panel's location cannot be read, so nothing 
 
 #[derive(Clone, Copy)]
 struct StmStat {
+    ino: u64,
     mode: u32,
     size: u64,
 }
@@ -3716,9 +3717,21 @@ fn stm_stat(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str) -> Option<StmStat> {
             .rev()
             .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
     };
+    let ino = field("ino:")?.parse().ok()?;
     let mode = u32::from_str_radix(&field("mode:")?, 8).ok()? & 0o777;
     let size = field("size:")?.parse().ok()?;
-    Some(StmStat { mode, size })
+    Some(StmStat { ino, mode, size })
+}
+
+/// A volume's bytes are read by name, in a process of their own, after the stat that
+/// gave their mode and size: the name must still lead to that file, or another file's
+/// bytes would be kept under this one's mode.
+fn stm_source_unchanged(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str, before: &StmStat) -> Result<()> {
+    match stm_stat(sp, sock, p9) {
+        Some(now) if now.ino == before.ino && now.mode == before.mode && now.size == before.size => Ok(()),
+        Some(_) => Err(anyhow::anyhow!("{p9}: changed while it was copied")),
+        None => Err(anyhow::anyhow!("{p9}: gone while it was copied")),
+    }
 }
 
 /// A host source is opened as what it was found to be, a file: a pipe would hold the
@@ -3819,11 +3832,15 @@ fn ensure_stm_dir(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str, mode: Option<u32>) 
     let Err(e) = made else {
         return Ok(());
     };
+    // As stm_stat reads it: the path printed first can hold a line of its own, so the
+    // server's line is the last.
     match sp.run_stratum_fs_capture(sock, &["stat", p9]) {
         Ok(out)
             if String::from_utf8_lossy(&out)
                 .lines()
-                .any(|l| l.split_whitespace().eq(["type:", "dir"])) =>
+                .rev()
+                .find(|l| l.trim_start().starts_with("type:"))
+                .is_some_and(|l| l.split_whitespace().eq(["type:", "dir"])) =>
         {
             Ok(())
         }
@@ -3835,8 +3852,9 @@ fn ensure_stm_dir(sp: &Arc<SpawnCtx>, sock: &Path, p9: &str, mode: Option<u32>) 
 /// ones are whole: they go beside it and are moved over, the move being what commits.
 /// `write -n` refuses a name that is there and removes what it made if it fails, so a
 /// copy never truncates or removes a file it did not make. What arrived is checked
-/// against `want`. `write` makes the file with the source's mode, so nobody the source
-/// keeps out can read it while it fills.
+/// against `want`, and `same_source` says the source is still what gave `mode` and
+/// `want`. `write` makes the file with the source's mode, so nobody the source keeps out
+/// can read it while it fills.
 #[allow(clippy::too_many_arguments)]
 fn write_stm_file(
     sp: &Arc<SpawnCtx>,
@@ -3847,6 +3865,7 @@ fn write_stm_file(
     mode: u32,
     want: u64,
     write: impl Fn(&str, &str) -> Result<()>,
+    same_source: impl Fn() -> Result<()>,
 ) -> Result<()> {
     let target = if replacing { temp } else { dst };
     write(target, &format!("{mode:o}"))?;
@@ -3855,6 +3874,7 @@ fn write_stm_file(
         Some(st) => Err(anyhow::anyhow!("{dst}: {} of {want} bytes arrived", st.size)),
         None => Err(anyhow::anyhow!("{dst}: what was written cannot be read back")),
     }
+    .and_then(|_| same_source())
     .and_then(|_| {
         if replacing {
             sp.run_stratum_fs(
@@ -3941,7 +3961,7 @@ fn perform_copy_one(
                     sp.run_stratum_fs(sock, &["write", "-n", "-m", mode, to],
                                        std::process::Stdio::from(from.try_clone()?),
                                        std::process::Stdio::null())
-                }).map_err(io_other)?;
+                }, || Ok(())).map_err(io_other)?;
                 bump_bytes(want);     /* stratum-fs dst: the worker bumps. */
             }
             Ok(CopyOutcome::Copied)
@@ -3960,6 +3980,7 @@ fn perform_copy_one(
                                        std::process::Stdio::null(),
                                        std::process::Stdio::from(to.try_clone()?))
                         .map_err(io_other)?;
+                    stm_source_unchanged(sp, sock, &p9, &st).map_err(io_other)?;
                     Ok(st.size)
                 })?;
                 /* host-fs dst: the main loop does the bytes accounting. */
@@ -3980,7 +4001,8 @@ fn perform_copy_one(
                 let st = st.ok_or_else(|| io::Error::other(format!("{s_p9}: cannot read its size and mode")))?;
                 write_stm_file(sp, d_sock, &d_p9, &path_to_p9(temp, dst_meta), replacing,
                                st.mode, st.size,
-                               |to: &str, mode: &str| sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, to, mode))
+                               |to: &str, mode: &str| sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, to, mode),
+                               || stm_source_unchanged(sp, s_sock, &s_p9, &st))
                     .map_err(io_other)?;
                 bump_bytes(st.size);
             }
