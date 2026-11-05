@@ -260,6 +260,12 @@ STM_TEST(bdev_iouring_a_failed_entry_that_can_pass_is_waited_out) {
     STM_ASSERT_OK(stm_bdev_fsync(d));
     STM_ASSERT_OK(stm_bdev_read(d, 0, r, sizeof r));
     STM_ASSERT_EQ(memcmp(w, r, sizeof w), 0);
+
+    /* A thread's first entry allocates kernel state, and memory can come back. */
+    stm_bdev_iouring_fail_submit_for_test(d, ENOMEM, 3);
+    STM_ASSERT_OK(stm_bdev_write(d, 4096, w, sizeof w));
+    STM_ASSERT_OK(stm_bdev_read(d, 4096, r, sizeof r));
+    STM_ASSERT_EQ(memcmp(w, r, sizeof w), 0);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

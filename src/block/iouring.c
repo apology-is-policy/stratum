@@ -181,27 +181,33 @@ static int enter_locked(iouring_bdev *d)
  * waited out, and one that cannot ends the ring: nothing enters it again, so
  * what is queued in it never runs and the op really did not happen.
  *
- * A full CQ cannot be the cause: the slots bound what is in flight below the
- * CQ's size. EBUSY is treated as the end, not retried, because the reaper needs
- * this lock to free the slot it has just finished with.
+ * A thread's first entry allocates its kernel context before it takes any SQE,
+ * so ENOMEM can pass as EAGAIN can. A full CQ cannot be the cause: the slots
+ * bound what is in flight below the CQ's size. EBUSY is treated as the end, not
+ * retried, because the reaper needs this lock to free the slot it has just
+ * finished with.
  */
 static stm_status submit_locked(iouring_bdev *d, pending *p,
                                 struct io_uring_sqe *sqe)
 {
     io_uring_sqe_set_data(sqe, p);
+    int r = 0;
     for (int waited_ms = 0; waited_ms < SUBMIT_RETRY_MS; ) {
-        int r = enter_locked(d);
+        r = enter_locked(d);
         if (r >= 0 && io_uring_sq_ready(&d->ring) == 0) {
             atomic_fetch_add(&d->inflight, 1);
             return STM_OK;
         }
-        if (r < 0 && r != -EAGAIN && r != -EINTR) break;
+        if (r < 0 && r != -EAGAIN && r != -EINTR && r != -ENOMEM) break;
         if (r != -EINTR) {
             const struct timespec ms = { .tv_sec = 0, .tv_nsec = 1000000 };
             nanosleep(&ms, NULL);
             waited_ms++;
         }
     }
+    /* Every op from here on answers EIO, and nothing else will say why. */
+    fprintf(stderr, "stratum: io_uring stopped taking ops on %s (its last entry answered %d); "
+                    "every op on it now fails\n", d->base.path ? d->base.path : "a device", r);
     d->ring_dead = true;
     pending_release(d, p);
     return STM_EIO;
@@ -555,7 +561,9 @@ static int op_wait(stm_bdev *base, int max_events)
         return 0;
     }
     pthread_mutex_unlock(&d->cq_lock);
-    int n = drain_cqes(d, max_events, true);
+    /* Another reaper may have delivered the caller's completion just before it
+     * called. With nothing in flight no CQE is coming, and this seat is taken. */
+    int n = atomic_load(&d->inflight) > 0 ? drain_cqes(d, max_events, true) : 0;
     reap_end(d);
     pthread_mutex_unlock(&d->cq_lock);
     return n;
@@ -614,6 +622,7 @@ static void op_close(stm_bdev *base)
     while (atomic_load(&d->inflight) > 0) {
         struct io_uring_cqe *cqe = NULL;
         int r = io_uring_wait_cqe(&d->ring, &cqe);
+        if (r == -EINTR) continue;
         if (r < 0) {
             /* Unexpected — but if the ring itself is broken we still need to
              * tear down. Break the loop; below we exit the ring anyway, and

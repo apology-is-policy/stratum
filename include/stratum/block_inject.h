@@ -40,6 +40,8 @@ extern "C" {
 
 struct stm_bdev;
 
+/* Synchronous writes and flushes only. The submit_* ops have no production
+ * caller, and are neither injected nor counted. */
 void     stm_bdev_inject_fail_after(struct stm_bdev *d, int64_t n_ops);
 uint32_t stm_bdev_inject_fired_count(const struct stm_bdev *d);
 
