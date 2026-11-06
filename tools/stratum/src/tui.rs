@@ -146,11 +146,24 @@ thread_local! {
 /// the conflict dialog; consumed for every subsequent conflict in
 /// the same batch (no further dialog).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConflictPolicy {
+pub(crate) enum ConflictPolicy {
     Skip,
     Overwrite,
     KeepBoth,
 }
+
+/// The answers to a copy's "Destination exists" question, in the order offered,
+/// each with what it does: its policy (none for Cancel) and whether it holds for
+/// the rest of the batch. A pick is read back by its place here.
+pub(crate) const CONFLICT_ANSWERS: [(&str, Option<ConflictPolicy>, bool); 7] = [
+    ("Skip", Some(ConflictPolicy::Skip), false),
+    ("SkipAll", Some(ConflictPolicy::Skip), true),
+    ("Overwrite", Some(ConflictPolicy::Overwrite), false),
+    ("OverwriteAll", Some(ConflictPolicy::Overwrite), true),
+    ("KeepBoth", Some(ConflictPolicy::KeepBoth), false),
+    ("KeepBothAll", Some(ConflictPolicy::KeepBoth), true),
+    ("Cancel", None, false),
+];
 
 /// SWISS-4q-worker: in-flight copy of a single batch item. The thread
 /// runs perform_copy_one synchronously; the main loop polls
@@ -631,51 +644,11 @@ fn run_ui(
             search.maybe_reset();
             let mut snapshot = fetch_snapshot(client, focus, &local_dialog, &editor)?;
             snapshot.search_buffer = search.buffer.clone();
-            // SWISS-4e: editor open transition. Slate flipped
-            // editor_active=true (via /event "editor open" issued by
-            // THIS tui or another client) and we don't yet have a
-            // local buffer — fetch /editor/content and initialise.
-            if editor_may_open(snapshot.editor_active, editor.is_some(), local_dialog.is_some()) {
-                let readonly = take_view_intent();
-                match client.read_path("/editor/content") {
-                    Ok(bytes) => {
-                        // A lossy decode saved back would change every byte it replaced.
-                        let content = String::from_utf8_lossy(&bytes).into_owned();
-                        let not_text = content.as_bytes() != bytes.as_slice();
-                        let mut opened = EditorState::new(
-                            snapshot.editor_filename.clone(),
-                            &content,
-                            readonly || not_text,
-                        );
-                        if not_text {
-                            opened.status_msg = Some("Not UTF-8 text: opened read-only.".into());
-                        }
-                        editor = Some(opened);
-                    }
-                    Err(e) => {
-                        // An empty buffer here would replace the file on the next :w.
-                        let _ = client.write_path("/event", b"editor close\n");
-                        let notice = error_dialog(&format!(
-                            "Cannot open {}: {e}", snapshot.editor_filename
-                        ));
-                        if copy_batch.is_some() || delete_batch.is_some() {
-                            held_notice = Some(notice);
-                        } else {
-                            show_unasked(&mut local_dialog, notice);
-                        }
-                    }
-                }
-            }
-            // SWISS-4e: external close — slate dropped the editor, e.g.
-            // another client wrote /editor/action close. Drop our buffer.
-            if !snapshot.editor_active && editor.is_some() {
-                editor_closed_elsewhere(&mut editor, &mut local_dialog, &mut ctl_job,
-                                        &mut held_notice,
-                                        copy_batch.is_some() || delete_batch.is_some());
-            }
-            // The frame copied the dialog before the editor's steps above could
-            // raise one; it must draw the dialog the keys will go to.
-            snapshot.local_dialog = local_dialog.clone();
+            // SWISS-4e: the editor slate opened, or another client closed.
+            let filename = snapshot.editor_filename.clone();
+            settle_editor(snapshot.editor_active, &mut editor, &mut local_dialog, &mut ctl_job,
+                          &mut held_notice, copy_batch.is_some() || delete_batch.is_some(),
+                          &mut snapshot.local_dialog, || open_editor(client, &filename));
             // SWISS-4j: build a CopyProgress snapshot when a batch
             // is in flight so the renderer can overlay file-level
             // progress.
@@ -937,7 +910,7 @@ fn handle_key(
             && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c')));
     if quit_key {
         let batch = if copy_batch.is_some() { Some(true) } else if delete_batch.is_some() { Some(false) } else { None };
-        if let Some(asked) = quit_key_question(batch, ctl_job.is_some()) {
+        if let Some(asked) = quit_key_question(batch, ctl_job) {
             *local_dialog = Some(asked);
             return Ok(Action::Refresh);
         }
@@ -1669,8 +1642,8 @@ fn handle_dialog_key(
             d.value.pop();
             return Ok(Action::Refresh);
         }
-        KeyCode::Char(c) => {
-            if (c as u32) >= 0x20 && c as u32 != 0x7F {
+        KeyCode::Char(_) => {
+            if let Some(c) = typed_char(&key) {
                 d.value.push(c);
                 return Ok(Action::Refresh);
             }
@@ -2087,6 +2060,64 @@ fn editor_closed_elsewhere(
     deliver_waiting(local_dialog, ctl_job, held_notice, batch_running, false);
 }
 
+/// The editor's part of an iteration, after the frame's snapshot. The editor
+/// slate opened is read in by `open`, unless a dialog is up; one another client
+/// closed is dropped, showing what waited for it. Then the frame is given the
+/// dialog the keys will go to: it copied the dialog before these steps could
+/// raise or deliver one.
+#[allow(clippy::too_many_arguments)]
+fn settle_editor(
+    editor_active: bool,
+    editor: &mut Option<EditorState>,
+    local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
+    held_notice: &mut Option<LocalDialog>,
+    batch_running: bool,
+    frame_dialog: &mut Option<LocalDialog>,
+    open: impl FnOnce() -> Result<EditorState, String>,
+) {
+    if editor_may_open(editor_active, editor.is_some(), local_dialog.is_some()) {
+        match open() {
+            Ok(opened) => *editor = Some(opened),
+            Err(why) => {
+                let notice = error_dialog(&why);
+                if batch_running {
+                    *held_notice = Some(notice);
+                } else {
+                    show_unasked(local_dialog, notice);
+                }
+            }
+        }
+    }
+    if !editor_active && editor.is_some() {
+        editor_closed_elsewhere(editor, local_dialog, ctl_job, held_notice, batch_running);
+    }
+    *frame_dialog = local_dialog.clone();
+}
+
+/// Reads the file slate opened into an editor buffer. A failed read closes
+/// slate's editor, since an empty buffer would replace the file on the next :w,
+/// and gives the notice's text.
+fn open_editor(client: &mut SlateClient, filename: &str) -> Result<EditorState, String> {
+    let readonly = take_view_intent();
+    match client.read_path("/editor/content") {
+        Ok(bytes) => {
+            // A lossy decode saved back would change every byte it replaced.
+            let content = String::from_utf8_lossy(&bytes).into_owned();
+            let not_text = content.as_bytes() != bytes.as_slice();
+            let mut opened = EditorState::new(filename.to_string(), &content, readonly || not_text);
+            if not_text {
+                opened.status_msg = Some("Not UTF-8 text: opened read-only.".into());
+            }
+            Ok(opened)
+        }
+        Err(e) => {
+            let _ = client.write_path("/event", b"editor close\n");
+            Err(format!("Cannot open {filename}: {e}"))
+        }
+    }
+}
+
 
 fn submit_confirm(
     local_dialog: &mut Option<LocalDialog>,
@@ -2153,14 +2184,11 @@ fn submit_confirm(
         ConfirmAction::CopyConflictBatch { src: _, dst: _, is_dir: _ } => {
             // SWISS-4h: stash the resolution; advance_copy_batch
             // consumes it on the next loop tick.
-            let policy = match label.as_str() {
-                "Skip" | "SkipAll" => Some(ConflictPolicy::Skip),
-                "Overwrite" | "OverwriteAll" => Some(ConflictPolicy::Overwrite),
-                "KeepBoth" | "KeepBothAll" => Some(ConflictPolicy::KeepBoth),
-                "Cancel" | _ => None,
+            let (policy, sticky) = match CONFLICT_ANSWERS.get(picked_idx) {
+                Some(&(_, policy, sticky)) => (policy, sticky),
+                None => (None, false),
             };
-            let sticky = label.ends_with("All");
-            let cancel = label == "Cancel";
+            let cancel = policy.is_none();
             CONFLICT_RESP.with(|c| {
                 *c.borrow_mut() = Some(ConflictResp { policy, sticky, cancel });
             });
@@ -2316,11 +2344,11 @@ fn submit_confirm(
 /// under its own in a volume. A /ctl request still out is asked about: quitting
 /// stops the volume under it, and its result would never be shown. `batch` is
 /// Some(true) for a copy, Some(false) for a delete.
-fn quit_key_question(batch: Option<bool>, request_out: bool) -> Option<LocalDialog> {
+fn quit_key_question(batch: Option<bool>, ctl_job: &Option<CtlJob>) -> Option<LocalDialog> {
     if let Some(copy) = batch {
         return Some(stop_batch_dialog(copy, true));
     }
-    if !request_out {
+    if ctl_job.is_none() {
         return None;
     }
     Some(LocalDialog {
@@ -2340,6 +2368,14 @@ fn quit_key_question(batch: Option<bool>, request_out: bool) -> Option<LocalDial
     })
 }
 
+/// The character a key types into a field: printable, pressed without Ctrl or
+/// Alt, so a quit key in a field neither quits nor types its letter.
+fn typed_char(key: &crossterm::event::KeyEvent) -> Option<char> {
+    let KeyCode::Char(c) = key.code else { return None };
+    let combo = key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    (!combo && (c as u32) >= 0x20 && c as u32 != 0x7F).then_some(c)
+}
+
 /// Ends the running batch after the item in hand; its next tick reads this.
 fn post_batch_cancel(copy: bool) {
     if copy {
@@ -2353,9 +2389,14 @@ fn post_batch_cancel(copy: bool) {
 
 /// The question a quit key, or F5/F7/F8, gets while a batch runs. No new item
 /// starts while it shows; the one in hand runs on, on its own thread.
-fn stop_batch_dialog(copy: bool, quitting: bool) -> LocalDialog {
+pub(crate) fn stop_batch_dialog(copy: bool, quitting: bool) -> LocalDialog {
     let what = if copy { "A copy" } else { "A delete" };
-    let then = if quitting { "\nOnce it has stopped and every notice is closed, F10 quits." } else { "" };
+    let then = if quitting {
+        "\nOnce it has stopped and every notice is closed, F10 quits, or first\n\
+         asks if a snapshot or scrub request is still out."
+    } else {
+        ""
+    };
     LocalDialog {
         kind: LocalDialogKind::Confirm {
             options: vec!["Stop".to_string(), "Go on".to_string()],
@@ -2485,35 +2526,33 @@ fn handle_mkvol_key(
         },
         _ => {}
     }
-    if let KeyCode::Char(c) = key.code {
-        if (c as u32) >= 0x20 && c as u32 != 0x7F {
-            match mk.field {
-                MkVolField::Name => {
-                    if mk.name.len() < 256 {
-                        mk.name.push(c);
-                        return Ok(Action::Refresh);
-                    }
+    if let Some(c) = typed_char(&key) {
+        match mk.field {
+            MkVolField::Name => {
+                if mk.name.len() < 256 {
+                    mk.name.push(c);
+                    return Ok(Action::Refresh);
                 }
-                MkVolField::Size => {
-                    if mk.size.len() < 32 {
-                        mk.size.push(c);
-                        return Ok(Action::Refresh);
-                    }
-                }
-                MkVolField::Passphrase => {
-                    if mk.passphrase.len() < 256 {
-                        crate::passphrase::push_secret(&mut mk.passphrase, c);
-                        return Ok(Action::Refresh);
-                    }
-                }
-                MkVolField::Confirm => {
-                    if mk.confirm.len() < 256 {
-                        crate::passphrase::push_secret(&mut mk.confirm, c);
-                        return Ok(Action::Refresh);
-                    }
-                }
-                _ => {}
             }
+            MkVolField::Size => {
+                if mk.size.len() < 32 {
+                    mk.size.push(c);
+                    return Ok(Action::Refresh);
+                }
+            }
+            MkVolField::Passphrase => {
+                if mk.passphrase.len() < 256 {
+                    crate::passphrase::push_secret(&mut mk.passphrase, c);
+                    return Ok(Action::Refresh);
+                }
+            }
+            MkVolField::Confirm => {
+                if mk.confirm.len() < 256 {
+                    crate::passphrase::push_secret(&mut mk.confirm, c);
+                    return Ok(Action::Refresh);
+                }
+            }
+            _ => {}
         }
     }
     Ok(Action::Ignore)
@@ -3738,7 +3777,7 @@ fn advance_copy_batch(
             batch.items[batch.idx].clone();
         *local_dialog = Some(LocalDialog {
             kind: LocalDialogKind::Confirm {
-                options: ui::CONFLICT_ANSWERS.iter().map(|s| s.to_string()).collect(),
+                options: CONFLICT_ANSWERS.iter().map(|a| a.0.to_string()).collect(),
                 selected: 0,
                 on_pick: ConfirmAction::CopyConflictBatch {
                     src: src_for_dialog,
@@ -5108,6 +5147,11 @@ mod tests {
             assert!(dialog.is_none());
             assert!(held.is_some());
         }
+        // Nor over a batch's summary, which may be the only word of the items that failed.
+        let mut summary = Some(error_dialog("Copy: 1 copied, 2 failed"));
+        deliver_waiting(&mut summary, &mut job, &mut held, false, false);
+        assert!(shows(&summary, "Copy: 1 copied, 2 failed"));
+        assert!(held.is_some());
         deliver_waiting(&mut dialog, &mut job, &mut held, false, false);
         assert!(shows(&dialog, "Cannot open x"));
         assert!(held.is_none());
@@ -5140,15 +5184,112 @@ mod tests {
     // quit key asks first, Wait by default; a batch is asked to stop before that.
     #[test]
     fn a_quit_key_asks_while_a_request_is_out() {
-        assert!(quit_key_question(None, false).is_none());
-        assert!(holds_the_batch(&quit_key_question(Some(false), true)));
-        let asked = quit_key_question(None, true).expect("a question");
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let out = Some(CtlJob { rx, success_msg: "done".into(), _join: None, notice: "working...".into(), result: None });
+        assert!(quit_key_question(None, &None).is_none());
+        assert!(holds_the_batch(&quit_key_question(Some(false), &out)));
+        let asked = quit_key_question(None, &out).expect("a question");
         assert!(matches!(&asked.kind, LocalDialogKind::Confirm {
             on_pick: ConfirmAction::QuitWithRequestOut, selected: 0, ..
         }));
         let (mut dialog, mut job) = (None, None);
         assert!(matches!(submit_confirm(&mut dialog, &mut job, None, asked.clone(), 0).unwrap(), Action::Refresh));
         assert!(matches!(submit_confirm(&mut dialog, &mut job, None, asked, 1).unwrap(), Action::Quit));
+    }
+
+    // What the frame draws after the editor's steps is the dialog the keys go to.
+    #[test]
+    fn a_failed_editor_open_is_what_the_frame_draws() {
+        let (mut editor, mut dialog, mut job, mut held) = (None, None, None, None);
+        let mut frame = None;
+        settle_editor(true, &mut editor, &mut dialog, &mut job, &mut held, false, &mut frame,
+                      || Err("Cannot open f.txt: gone".to_string()));
+        assert!(editor.is_none());
+        assert!(shows(&frame, "Cannot open f.txt: gone"));
+        assert!(shows(&dialog, "Cannot open f.txt: gone"));
+        // During a batch the notice is held, and nothing new is drawn.
+        let (mut dialog, mut frame) = (None, None);
+        settle_editor(true, &mut editor, &mut dialog, &mut job, &mut held, true, &mut frame,
+                      || Err("Cannot open g.txt: gone".to_string()));
+        assert!(frame.is_none() && dialog.is_none());
+        assert!(shows(&held, "Cannot open g.txt: gone"));
+    }
+
+    #[test]
+    fn a_result_held_for_the_editor_is_drawn_when_another_client_closes_it() {
+        let mut editor = Some(EditorState::new("f.txt".to_string(), "x", false));
+        let (mut dialog, mut held) = (None, None);
+        let mut job = finished_job("Snapshot created.");
+        deliver_waiting(&mut dialog, &mut job, &mut held, false, true);
+        let mut frame = dialog.clone();
+        settle_editor(false, &mut editor, &mut dialog, &mut job, &mut held, false, &mut frame,
+                      || panic!("nothing to open"));
+        assert!(editor.is_none() && job.is_none());
+        assert!(shows(&frame, "Snapshot created."));
+        // Over a running batch it still waits: it would take the batch's Esc.
+        let mut editor = Some(EditorState::new("f.txt".to_string(), "x", false));
+        let (mut dialog, mut frame) = (None, None);
+        let mut job = finished_job("Snapshot created.");
+        settle_editor(false, &mut editor, &mut dialog, &mut job, &mut held, true, &mut frame,
+                      || panic!("nothing to open"));
+        assert!(editor.is_none() && frame.is_none());
+        assert!(job.as_ref().is_some_and(|j| j.result.is_some()));
+    }
+
+    #[test]
+    fn the_editor_stays_shut_under_a_dialog() {
+        let (mut editor, mut job, mut held) = (None, None, None);
+        let mut dialog = Some(info_dialog("Copy: 3 copied"));
+        let mut frame = None;
+        settle_editor(true, &mut editor, &mut dialog, &mut job, &mut held, false, &mut frame,
+                      || panic!("the editor opened over a dialog"));
+        assert!(editor.is_none());
+        assert!(shows(&frame, "Copy: 3 copied"));
+    }
+
+    // Each answer to the copy's question does what it says, read back by its place.
+    #[test]
+    fn each_conflict_answer_does_what_it_says() {
+        use ConflictPolicy::*;
+        let expect = [
+            ("Skip", Some(Skip), false, false),
+            ("SkipAll", Some(Skip), true, false),
+            ("Overwrite", Some(Overwrite), false, false),
+            ("OverwriteAll", Some(Overwrite), true, false),
+            ("KeepBoth", Some(KeepBoth), false, false),
+            ("KeepBothAll", Some(KeepBoth), true, false),
+            ("Cancel", None, false, true),
+        ];
+        for (i, &(label, policy, sticky, cancel)) in expect.iter().enumerate() {
+            assert_eq!(CONFLICT_ANSWERS[i].0, label);
+            let q = LocalDialog {
+                kind: LocalDialogKind::Confirm {
+                    options: CONFLICT_ANSWERS.iter().map(|a| a.0.to_string()).collect(),
+                    selected: i,
+                    on_pick: ConfirmAction::CopyConflictBatch { src: "a".into(), dst: "b".into(), is_dir: false },
+                },
+                prompt: String::new(),
+                value: Default::default(),
+                is_password: false,
+                is_error: false,
+            };
+            CONFLICT_RESP.with(|c| *c.borrow_mut() = None);
+            submit_confirm(&mut None, &mut None, None, q, i).unwrap();
+            let r = CONFLICT_RESP.with(|c| c.borrow_mut().take()).expect("a response");
+            assert_eq!((r.policy, r.sticky, r.cancel), (policy, sticky, cancel), "{label}");
+        }
+    }
+
+    // A quit key in a field neither quits nor types its letter.
+    #[test]
+    fn a_field_takes_no_ctrl_or_alt_letter() {
+        use crossterm::event::KeyEvent;
+        assert_eq!(typed_char(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)), Some('c'));
+        assert_eq!(typed_char(&KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)), Some('C'));
+        assert_eq!(typed_char(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), None);
+        assert_eq!(typed_char(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)), None);
+        assert_eq!(typed_char(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)), None);
+        assert_eq!(typed_char(&KeyEvent::new(KeyCode::Char('\u{7f}'), KeyModifiers::NONE)), None);
     }
 
     // Whatever else takes the question's place counts as Stop.

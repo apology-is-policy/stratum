@@ -279,11 +279,6 @@ pub enum ConfirmAction {
     QuitWithRequestOut,
 }
 
-/// The answers to a copy's "Destination exists" question, as offered and as
-/// read back when one is picked.
-pub const CONFLICT_ANSWERS: [&str; 7] =
-    ["Skip", "SkipAll", "Overwrite", "OverwriteAll", "KeepBoth", "KeepBothAll", "Cancel"];
-
 /// The "Destination exists" question for item `n` of `total`.
 pub fn conflict_prompt(n: usize, total: usize, dst: &str) -> String {
     format!("Destination exists ({n}/{total}):\n  {dst}\n\nResolution?")
@@ -1849,19 +1844,24 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
     let foot_h = inner.height.min(2);
     let fields = Rect::new(inner.x, inner.y, inner.width, inner.height - foot_h);
     let foot = Rect::new(inner.x, inner.y + fields.height, inner.width, foot_h);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),        // Name
-            Constraint::Length(1),        // Size
-            Constraint::Length(1),        // spacer
-            Constraint::Length(1),        // Use passphrase
-            Constraint::Length(1),        // Passphrase (when on)
-            Constraint::Length(1),        // Confirm (when on)
-            Constraint::Length(err_rows), // Error / tip
-            Constraint::Min(0),           // filler
-        ])
-        .split(fields);
+    let focused = match mk.field {
+        MkVolField::Name => Some(0),
+        MkVolField::Size => Some(1),
+        MkVolField::Encrypt => Some(3),
+        MkVolField::Passphrase => Some(4),
+        MkVolField::Confirm => Some(5),
+        _ => None,
+    };
+    let heights = wizard_rows(fields.height, focused, if err.is_some() { err_rows } else { 0 });
+    let mut top = fields.y;
+    let rows: Vec<Rect> = heights
+        .iter()
+        .map(|&h| {
+            let r = Rect::new(fields.x, top, fields.width, h);
+            top += h;
+            r
+        })
+        .collect();
     let foot_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)]) // buttons, hint
@@ -1945,6 +1945,37 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
         ))),
         foot_rows[1],
     );
+}
+
+/// The rows each wizard line gets, top to bottom: Name, Size, the spacer, Use
+/// passphrase, Passphrase, Again, the error. A box too short for all of them
+/// keeps the focused field, then the error's first row, then the other fields,
+/// then the rest of the error, and the spacer last. A layout solver would split
+/// the shortfall evenly and hide every other line, the focused one too.
+fn wizard_rows(avail: u16, focused: Option<usize>, err_rows: u16) -> [u16; 7] {
+    let mut rows = [0u16; 7];
+    let mut left = avail;
+    let mut give = |rows: &mut [u16; 7], i: usize, n: u16| {
+        let t = n.min(left);
+        rows[i] += t;
+        left -= t;
+    };
+    if let Some(i) = focused {
+        give(&mut rows, i, 1);
+    }
+    if err_rows > 0 {
+        give(&mut rows, 6, 1);
+    }
+    for i in [0, 1, 3, 4, 5] {
+        if Some(i) != focused {
+            give(&mut rows, i, 1);
+        }
+    }
+    if err_rows > 1 {
+        give(&mut rows, 6, err_rows - 1);
+    }
+    give(&mut rows, 2, 1);
+    rows
 }
 
 fn render_mkvol_field(
@@ -2114,29 +2145,38 @@ mod tests {
         rows.iter().position(|r| r.contains(needle))
     }
 
+    // The row of the box's bottom border.
+    fn bottom_border(rows: &[String]) -> usize {
+        rows.iter().rposition(|r| r.contains('\u{255a}')).expect("a bottom border")
+    }
+
+    // Blank between the box's two side borders.
+    fn blank_inside(row: &str) -> bool {
+        row.chars().all(|c| c == ' ' || c == '\u{2551}')
+    }
+
     // Whatever wraps above them, and however short the box, the answers stay in it,
-    // below the text, and a box with room shows the text whole.
+    // below the text, and a box with room shows the text whole with a blank row under
+    // the answers.
     #[test]
     fn a_confirm_keeps_its_buttons() {
-        let stop = "A delete is under way. The item in hand goes on; the rest\n\
-                    wait while this shows.\n\
-                    Stop, or Esc: it stops after the item in hand.\n\
-                    Go on: it carries on, unless a stop was asked for already.\n\
-                    Once it has stopped and every notice is closed, F10 quits.";
+        let stop = crate::tui::stop_batch_dialog(false, true).prompt;
         let two = vec!["Stop".to_string(), "Keep going".to_string()];
         for (cols, rows) in [(40u16, 30u16), (50, 30), (62, 30), (80, 30), (80, 10), (40, 12)] {
-            let s = screen_rows(cols, rows, |f, a| draw_confirm_dialog(f, a, stop, &two, 0));
+            let s = screen_rows(cols, rows, |f, a| draw_confirm_dialog(f, a, &stop, &two, 0));
             let dump = s.join("\n");
             let buttons = row_of(&s, "Keep going").unwrap_or_else(|| panic!("no buttons at {cols}x{rows}:\n{dump}"));
             let first = row_of(&s, "A delete").unwrap_or_else(|| panic!("no text at {cols}x{rows}:\n{dump}"));
-            assert!(buttons > first, "buttons above the text at {cols}x{rows}:\n{dump}");
+            let border = bottom_border(&s);
+            assert!(buttons > first && buttons < border, "buttons out of place at {cols}x{rows}:\n{dump}");
             if rows == 30 {
-                let last = row_of(&s, "quits.").unwrap_or_else(|| panic!("text cut at {cols}x{rows}:\n{dump}"));
+                let last = row_of(&s, "out.").unwrap_or_else(|| panic!("text cut at {cols}x{rows}:\n{dump}"));
                 assert!(buttons > last, "buttons above the text's end at {cols}x{rows}:\n{dump}");
+                assert!(border == buttons + 2 && blank_inside(&s[buttons + 1]), "no blank row under the buttons at {cols}x{rows}:\n{dump}");
             }
         }
         // The conflict question as the copy puts it: a path indented two spaces, seven answers that wrap.
-        let seven: Vec<String> = CONFLICT_ANSWERS.iter().map(|s| s.to_string()).collect();
+        let seven: Vec<String> = crate::tui::CONFLICT_ANSWERS.iter().map(|a| a.0.to_string()).collect();
         for len in [66usize, 67, 68, 135, 136] {
             let prompt = conflict_prompt(1, 1, &"p".repeat(len));
             for (cols, rows) in [(80u16, 50u16), (56, 50), (40, 50)] {
@@ -2145,8 +2185,9 @@ mod tests {
                 let question = row_of(&s, "Resolution?")
                     .unwrap_or_else(|| panic!("question cut at {cols}x{rows}, path {len}:\n{dump}"));
                 let answers = row_of(&s, "Skip").unwrap_or_else(|| panic!("no answers at {cols}x{rows}, path {len}:\n{dump}"));
+                let cancel = row_of(&s, "Cancel").unwrap_or_else(|| panic!("no Cancel at {cols}x{rows}, path {len}:\n{dump}"));
                 assert!(answers > question, "answers above the question at {cols}x{rows}, path {len}:\n{dump}");
-                assert!(row_of(&s, "Cancel").is_some(), "no Cancel at {cols}x{rows}, path {len}:\n{dump}");
+                assert!(bottom_border(&s) == cancel + 2, "answers not inside, above a blank row, at {cols}x{rows}, path {len}:\n{dump}");
             }
         }
     }
@@ -2166,10 +2207,11 @@ mod tests {
             let dump = s.join("\n");
             let field = row_of(&s, "typed_").unwrap_or_else(|| panic!("no field at {cols}x{rows}:\n{dump}"));
             let first = row_of(&s, "Mount").unwrap_or_else(|| panic!("no prompt at {cols}x{rows}:\n{dump}"));
-            assert!(field > first, "field above the prompt at {cols}x{rows}:\n{dump}");
+            assert!(field > first && field < bottom_border(&s), "field out of place at {cols}x{rows}:\n{dump}");
             if rows == 24 {
                 let last = row_of(&s, "ZZEND").unwrap_or_else(|| panic!("prompt cut at {cols}x{rows}:\n{dump}"));
                 assert!(field > last, "field above the prompt's end at {cols}x{rows}:\n{dump}");
+                assert!(bottom_border(&s) == field + 2, "no blank row under the field at {cols}x{rows}:\n{dump}");
             }
         }
     }
@@ -2208,21 +2250,47 @@ mod tests {
     }
 
     // The wizard's error is the only word of why no volume was made: all of it shows, and
-    // the buttons keep their row however short the box.
+    // the buttons keep their row however short the box. Each error is picked so that a
+    // measure at the box's outer width counts a row too few.
     #[test]
     fn the_wizard_shows_its_whole_error() {
-        let mut mk = MkVolState::new(0);
-        mk.error = Some("mkfs failed (exit 1): stratum-mkfs: the key cannot be written \
-                         beside the volume, so nothing was made LASTWORD".to_string());
+        let measure = |e: &str, width: u16| Paragraph::new(Line::from(format!(" {e}")))
+            .wrap(Wrap { trim: false }).line_count(width);
         for (cols, rows) in [(80u16, 30u16), (64, 30)] {
+            let inner = 64u16.min(cols - 4) - 2;
+            let error = (1..400)
+                .map(|n| format!("mkfs failed: {}LASTWORD", "word ".repeat(n)))
+                .find(|e| measure(e, inner) > measure(e, inner + 2))
+                .expect("an error the border's width changes");
+            let mut mk = MkVolState::new(0);
+            mk.error = Some(error);
             let s = screen_rows(cols, rows, |f, a| draw_mkvol_dialog(f, a, &mk));
             let dump = s.join("\n");
             let end = row_of(&s, "LASTWORD").unwrap_or_else(|| panic!("error cut at {cols}x{rows}:\n{dump}"));
             let buttons = row_of(&s, "Cancel").unwrap_or_else(|| panic!("no buttons at {cols}x{rows}:\n{dump}"));
             assert!(buttons > end, "buttons above the error at {cols}x{rows}:\n{dump}");
         }
-        let s = screen_rows(80, 12, |f, a| draw_mkvol_dialog(f, a, &mk));
-        assert!(row_of(&s, "Cancel").is_some(), "no buttons at 80x12:\n{}", s.join("\n"));
+    }
+
+    // A box too short for every line keeps the field being typed in and the error's
+    // first row, and the buttons.
+    #[test]
+    fn a_short_wizard_keeps_the_focused_field_and_the_error() {
+        for (rows, field, label) in [
+            (11u16, MkVolField::Name, "Name:"),
+            (12, MkVolField::Size, "Size:"),
+            (13, MkVolField::Confirm, "Again:"),
+            (14, MkVolField::Encrypt, "Use passphrase:"),
+        ] {
+            let mut mk = MkVolState::new(0);
+            mk.field = field;
+            mk.error = Some("mkfs failed: no room".to_string());
+            let s = screen_rows(80, rows, |f, a| draw_mkvol_dialog(f, a, &mk));
+            let dump = s.join("\n");
+            assert!(row_of(&s, label).is_some(), "focused {label} hidden at 80x{rows}:\n{dump}");
+            assert!(row_of(&s, "mkfs failed").is_some(), "error hidden at 80x{rows}:\n{dump}");
+            assert!(row_of(&s, "Cancel").is_some(), "no buttons at 80x{rows}:\n{dump}");
+        }
     }
 
     // SWISS-8c: F9 snapshot dialog port from v1.
