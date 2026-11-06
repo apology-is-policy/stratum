@@ -274,6 +274,19 @@ pub enum ConfirmAction {
     /// shows, though the one in hand runs on; Stop, or Esc, ends the
     /// batch after that item.
     StopBatch { copy: bool },
+    /// A quit key while a snapshot or scrub request is still out. Wait,
+    /// or Esc, keeps the manager up until its result shows; Quit quits.
+    QuitWithRequestOut,
+}
+
+/// The answers to a copy's "Destination exists" question, as offered and as
+/// read back when one is picked.
+pub const CONFLICT_ANSWERS: [&str; 7] =
+    ["Skip", "SkipAll", "Overwrite", "OverwriteAll", "KeepBoth", "KeepBothAll", "Cancel"];
+
+/// The "Destination exists" question for item `n` of `total`.
+pub fn conflict_prompt(n: usize, total: usize, dst: &str) -> String {
+    format!("Destination exists ({n}/{total}):\n  {dst}\n\nResolution?")
 }
 
 /// SWISS-4c: state for the mkfs wizard. v1.0 collects only Name +
@@ -579,11 +592,7 @@ pub fn render(
     // and volume-map views — opening the editor switches focus
     // independently of view_mode.
     if let Some(ed) = editor {
-        draw_editor(frame, area, ed);
-        // A dialog takes every key while it is up, so it is never hidden.
-        if let Some(d) = state.local_dialog.as_ref() {
-            draw_any_local_dialog(frame, area, d);
-        }
+        draw_editor_screen(frame, area, ed, state.local_dialog.as_ref());
         return;
     }
 
@@ -1270,6 +1279,15 @@ fn draw_dialog_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 // for password prompts, yellow input cursor) — gives the user the
 // same affordance they had in v1.
 
+/// The editor takes the whole screen. A dialog takes every key while it is up,
+/// so it is drawn over the editor, never hidden by it.
+fn draw_editor_screen(frame: &mut Frame<'_>, area: Rect, ed: &EditorState, dialog: Option<&LocalDialog>) {
+    draw_editor(frame, area, ed);
+    if let Some(d) = dialog {
+        draw_any_local_dialog(frame, area, d);
+    }
+}
+
 fn draw_any_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
     match &d.kind {
         LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
@@ -1334,21 +1352,15 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
         } else {
             sanitize_for_display(&d.value)
         };
-        vec![
-            Line::from(Span::styled(
-                format!("> {display}_"),
-                Style::default().fg(Color::Yellow).bold(),
-            )),
-            Line::from(""),
-        ]
+        vec![Line::from(Span::styled(
+            format!("> {display}_"),
+            Style::default().fg(Color::Yellow).bold(),
+        ))]
     } else {
-        vec![
-            Line::from(Span::styled(
-                "[Enter] / [Esc] dismiss",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-        ]
+        vec![Line::from(Span::styled(
+            "[Enter] / [Esc] dismiss",
+            Style::default().fg(Color::DarkGray),
+        ))]
     };
     draw_boxed(frame, area, block, body, tail);
 }
@@ -1754,13 +1766,15 @@ fn draw_confirm_dialog(
         spans.push(Span::styled(format!("  {opt}  "), style));
         spans.push(Span::raw("  "));
     }
-    draw_boxed(frame, area, block, body, vec![Line::from(spans), Line::from("")]);
+    draw_boxed(frame, area, block, body, vec![Line::from(spans)]);
 }
 
 /// A centred box: `body` wraps from the top and is what a box too short for
 /// everything clips; `tail`, a field or the buttons, keeps its rows at the
-/// bottom. Both are measured as the wrap lays them out, so no answer the box
-/// offers is ever cut off by the text above it.
+/// bottom, above one blank row when there is room for it. Both are measured as
+/// the wrap lays them out, so no answer the box offers is ever cut off by the
+/// text above it. A tail taller than the box shows its end, where a field's
+/// last characters and cursor are.
 fn draw_boxed(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1776,7 +1790,7 @@ fn draw_boxed(
     let (body_rows, tail_rows) = (rows(&body), rows(&tail));
     let h = body_rows
         .saturating_add(tail_rows)
-        .saturating_add(2)
+        .saturating_add(3)
         .min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
@@ -1785,7 +1799,8 @@ fn draw_boxed(
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let tail_h = tail_rows.min(inner.height);
-    let body_h = inner.height - tail_h;
+    let body_h = (inner.height - tail_h).min(body_rows);
+    let tail = tail.scroll((tail_rows - tail_h, 0));
     frame.render_widget(body, Rect::new(inner.x, inner.y, inner.width, body_h));
     frame.render_widget(tail, Rect::new(inner.x, inner.y + body_h, inner.width, tail_h));
 }
@@ -1800,7 +1815,19 @@ fn draw_boxed(
 
 fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
     let w = 64u16.min(area.width.saturating_sub(4));
-    let h = 18u16.min(area.height.saturating_sub(4));
+    // The error is the only word of why no volume was made: it wraps whole, and
+    // the box grows by the rows it takes.
+    let err = mk.error.as_deref().map(|e| {
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {e}"),
+            Style::default().fg(Color::Red).bold(),
+        )))
+        .wrap(Wrap { trim: false })
+    });
+    let err_rows = err.as_ref().map_or(1, |p| {
+        u16::try_from(p.line_count(w.saturating_sub(2))).unwrap_or(u16::MAX).max(1)
+    });
+    let h = 17u16.saturating_add(err_rows).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -1818,21 +1845,27 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
+    // The buttons and the hint keep the last two rows however short the box.
+    let foot_h = inner.height.min(2);
+    let fields = Rect::new(inner.x, inner.y, inner.width, inner.height - foot_h);
+    let foot = Rect::new(inner.x, inner.y + fields.height, inner.width, foot_h);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),   // Name
-            Constraint::Length(1),   // Size
-            Constraint::Length(1),   // spacer
-            Constraint::Length(1),   // Use passphrase
-            Constraint::Length(1),   // Passphrase (when on)
-            Constraint::Length(1),   // Confirm (when on)
-            Constraint::Length(1),   // Error / tip
-            Constraint::Min(0),      // filler
-            Constraint::Length(1),   // buttons
-            Constraint::Length(1),   // hint
+            Constraint::Length(1),        // Name
+            Constraint::Length(1),        // Size
+            Constraint::Length(1),        // spacer
+            Constraint::Length(1),        // Use passphrase
+            Constraint::Length(1),        // Passphrase (when on)
+            Constraint::Length(1),        // Confirm (when on)
+            Constraint::Length(err_rows), // Error / tip
+            Constraint::Min(0),           // filler
         ])
-        .split(inner);
+        .split(fields);
+    let foot_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)]) // buttons, hint
+        .split(foot);
 
     render_mkvol_field(frame, rows[0], "Name:", &mk.name,
                        mk.field == MkVolField::Name, false);
@@ -1883,14 +1916,8 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
     // can change compression after mount via dataset properties; the
     // wizard offering algos that mkfs ignored was misleading.
 
-    if let Some(err) = mk.error.as_deref() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {err}"),
-                Style::default().fg(Color::Red).bold(),
-            ))),
-            rows[6],
-        );
+    if let Some(err) = err {
+        frame.render_widget(err, rows[6]);
     }
 
     // Buttons.
@@ -1908,7 +1935,7 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
             Span::raw("    "),
             Span::styled("  Cancel  ", btn(cancel_focused)),
         ];
-        frame.render_widget(Paragraph::new(Line::from(spans)), rows[8]);
+        frame.render_widget(Paragraph::new(Line::from(spans)), foot_rows[0]);
     }
 
     frame.render_widget(
@@ -1916,7 +1943,7 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
             " Tab/Shift-Tab: next/prev field   Space: toggle   Esc: cancel",
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[9],
+        foot_rows[1],
     );
 }
 
@@ -2073,7 +2100,22 @@ mod tests {
         format!("{:?}", terminal.backend().buffer())
     }
 
-    // Whatever wraps above them, and however short the box, the answers stay in it.
+    // Each row of the drawn screen, as text.
+    fn screen_rows(cols: u16, rows: u16, draw: impl FnOnce(&mut Frame<'_>, Rect)) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        terminal.draw(|f| { let area = f.area(); draw(f, area); }).unwrap();
+        let buf = terminal.backend().buffer();
+        buf.content.chunks(usize::from(cols)).map(|r| r.iter().map(|c| c.symbol()).collect()).collect()
+    }
+
+    fn row_of(rows: &[String], needle: &str) -> Option<usize> {
+        rows.iter().position(|r| r.contains(needle))
+    }
+
+    // Whatever wraps above them, and however short the box, the answers stay in it,
+    // below the text, and a box with room shows the text whole.
     #[test]
     fn a_confirm_keeps_its_buttons() {
         let stop = "A delete is under way. The item in hand goes on; the rest\n\
@@ -2083,35 +2125,104 @@ mod tests {
                     Once it has stopped and every notice is closed, F10 quits.";
         let two = vec!["Stop".to_string(), "Keep going".to_string()];
         for (cols, rows) in [(40u16, 30u16), (50, 30), (62, 30), (80, 30), (80, 10), (40, 12)] {
-            let dump = screen(cols, rows, |f, a| draw_confirm_dialog(f, a, stop, &two, 0));
-            assert!(dump.contains("Keep going"), "no buttons at {cols}x{rows}:\n{dump}");
+            let s = screen_rows(cols, rows, |f, a| draw_confirm_dialog(f, a, stop, &two, 0));
+            let dump = s.join("\n");
+            let buttons = row_of(&s, "Keep going").unwrap_or_else(|| panic!("no buttons at {cols}x{rows}:\n{dump}"));
+            let first = row_of(&s, "A delete").unwrap_or_else(|| panic!("no text at {cols}x{rows}:\n{dump}"));
+            assert!(buttons > first, "buttons above the text at {cols}x{rows}:\n{dump}");
+            if rows == 30 {
+                let last = row_of(&s, "quits.").unwrap_or_else(|| panic!("text cut at {cols}x{rows}:\n{dump}"));
+                assert!(buttons > last, "buttons above the text's end at {cols}x{rows}:\n{dump}");
+            }
         }
-        // The conflict question: a path indented two spaces, seven answers that wrap.
-        let seven: Vec<String> = ["Skip", "Skip all", "Overwrite", "Overwrite all", "Keep both",
-                                  "Keep both all", "Cancel"].iter().map(|s| s.to_string()).collect();
+        // The conflict question as the copy puts it: a path indented two spaces, seven answers that wrap.
+        let seven: Vec<String> = CONFLICT_ANSWERS.iter().map(|s| s.to_string()).collect();
         for len in [66usize, 67, 68, 135, 136] {
-            let prompt = format!("Destination exists (1/1):\n  {}\n\nResolution?", "p".repeat(len));
+            let prompt = conflict_prompt(1, 1, &"p".repeat(len));
             for (cols, rows) in [(80u16, 50u16), (56, 50), (40, 50)] {
-                let dump = screen(cols, rows, |f, a| draw_confirm_dialog(f, a, &prompt, &seven, 0));
-                assert!(dump.contains("Cancel"), "no Cancel at {cols}x{rows}, path {len}:\n{dump}");
+                let s = screen_rows(cols, rows, |f, a| draw_confirm_dialog(f, a, &prompt, &seven, 0));
+                let dump = s.join("\n");
+                let question = row_of(&s, "Resolution?")
+                    .unwrap_or_else(|| panic!("question cut at {cols}x{rows}, path {len}:\n{dump}"));
+                let answers = row_of(&s, "Skip").unwrap_or_else(|| panic!("no answers at {cols}x{rows}, path {len}:\n{dump}"));
+                assert!(answers > question, "answers above the question at {cols}x{rows}, path {len}:\n{dump}");
+                assert!(row_of(&s, "Cancel").is_some(), "no Cancel at {cols}x{rows}, path {len}:\n{dump}");
             }
         }
     }
 
-    // A field's prompt that wraps does not push the field out of its box.
+    // A field's prompt that wraps does not push the field out of its box, or above the prompt.
     #[test]
     fn a_field_stays_below_a_wrapped_prompt() {
         let d = LocalDialog {
             kind: LocalDialogKind::PassphraseFor { volume: std::path::PathBuf::from("/v.stm") },
-            prompt: format!("Mount /v.stm: {}", "the daemon said something long ".repeat(8)),
+            prompt: format!("Mount /v.stm: {}ZZEND", "the daemon said something long ".repeat(8)),
             value: String::from("typed").into(),
             is_password: false,
             is_error: false,
         };
         for (cols, rows) in [(80u16, 24u16), (40, 24), (80, 8)] {
-            let dump = screen(cols, rows, |f, a| draw_local_dialog(f, a, &d));
-            assert!(dump.contains("typed_"), "no field at {cols}x{rows}:\n{dump}");
+            let s = screen_rows(cols, rows, |f, a| draw_local_dialog(f, a, &d));
+            let dump = s.join("\n");
+            let field = row_of(&s, "typed_").unwrap_or_else(|| panic!("no field at {cols}x{rows}:\n{dump}"));
+            let first = row_of(&s, "Mount").unwrap_or_else(|| panic!("no prompt at {cols}x{rows}:\n{dump}"));
+            assert!(field > first, "field above the prompt at {cols}x{rows}:\n{dump}");
+            if rows == 24 {
+                let last = row_of(&s, "ZZEND").unwrap_or_else(|| panic!("prompt cut at {cols}x{rows}:\n{dump}"));
+                assert!(field > last, "field above the prompt's end at {cols}x{rows}:\n{dump}");
+            }
         }
+    }
+
+    // A field longer than its box shows where the typing is: its end and the cursor.
+    #[test]
+    fn a_long_field_shows_its_end() {
+        let d = LocalDialog {
+            kind: LocalDialogKind::HostMountInput { panel_idx: 0 },
+            prompt: "Host directory to mount:".to_string(),
+            value: format!("{}END", "x".repeat(3000)).into(),
+            is_password: false,
+            is_error: false,
+        };
+        for (cols, rows) in [(80u16, 24u16), (40, 12)] {
+            let s = screen_rows(cols, rows, |f, a| draw_local_dialog(f, a, &d));
+            assert!(row_of(&s, "END_").is_some(), "the field's end is cut at {cols}x{rows}:\n{}", s.join("\n"));
+        }
+    }
+
+    // A dialog over the editor takes the editor's keys, so it must be what is seen.
+    #[test]
+    fn a_dialog_is_drawn_over_the_editor() {
+        let ed = EditorState::new("notes.txt".to_string(), "editor body text\n", false);
+        let d = LocalDialog {
+            kind: LocalDialogKind::Error,
+            prompt: "Snapshot created.".to_string(),
+            value: Default::default(),
+            is_password: false,
+            is_error: false,
+        };
+        let dump = screen(80, 24, |f, a| draw_editor_screen(f, a, &ed, Some(&d)));
+        assert!(dump.contains("Snapshot created."), "no dialog over the editor:\n{dump}");
+        let dump = screen(80, 24, |f, a| draw_editor_screen(f, a, &ed, None));
+        assert!(dump.contains("editor body text"), "no editor:\n{dump}");
+    }
+
+    // The wizard's error is the only word of why no volume was made: all of it shows, and
+    // the buttons keep their row however short the box.
+    #[test]
+    fn the_wizard_shows_its_whole_error() {
+        let mut mk = MkVolState::new(0);
+        mk.error = Some("mkfs failed (exit 1): stratum-mkfs: the key cannot be written \
+                         beside the volume, so nothing was made LASTWORD".to_string());
+        for (cols, rows) in [(80u16, 30u16), (64, 30)] {
+            let s = screen_rows(cols, rows, |f, a| draw_mkvol_dialog(f, a, &mk));
+            let dump = s.join("\n");
+            let end = row_of(&s, "LASTWORD").unwrap_or_else(|| panic!("error cut at {cols}x{rows}:\n{dump}"));
+            let buttons = row_of(&s, "Cancel").unwrap_or_else(|| panic!("no buttons at {cols}x{rows}:\n{dump}"));
+            assert!(buttons > end, "buttons above the error at {cols}x{rows}:\n{dump}");
+        }
+        let s = screen_rows(80, 12, |f, a| draw_mkvol_dialog(f, a, &mk));
+        assert!(row_of(&s, "Cancel").is_some(), "no buttons at 80x12:\n{}", s.join("\n"));
     }
 
     // SWISS-8c: F9 snapshot dialog port from v1.

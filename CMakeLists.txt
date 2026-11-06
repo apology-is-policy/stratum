@@ -295,6 +295,12 @@ target_include_directories(stratum INTERFACE
 # Tests.
 # ---------------------------------------------------------------------------
 if(STM_BUILD_TESTS)
+    # The suites call the test hooks; without them they do not compile.
+    if(NOT STRATUM_BUILD_TESTING_HOOKS)
+        message(FATAL_ERROR "STM_BUILD_TESTS=ON needs STRATUM_BUILD_TESTING_HOOKS=ON; "
+                            "a build without the hooks is a build without the tests "
+                            "(-DSTM_BUILD_TESTS=OFF, as dist.sh does)")
+    endif()
     enable_testing()
     add_subdirectory(tests)
 endif()

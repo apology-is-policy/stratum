@@ -548,14 +548,8 @@ fn run_ui(
             // SWISS-8g: tick the in-progress /ctl/ admin job (if any)
             // FIRST so completion swaps in a success/error dialog
             // BEFORE the rest of the loop runs.
-            let batch_running = copy_batch.is_some() || delete_batch.is_some();
-            let screen_busy = batch_running || editor.is_some();
-            tick_ctl_job(&mut local_dialog, &mut ctl_job, screen_busy);
-            if local_dialog.is_none() && !screen_busy {
-                if let Some(notice) = held_notice.take() {
-                    local_dialog = Some(notice);
-                }
-            }
+            deliver_waiting(&mut local_dialog, &mut ctl_job, &mut held_notice,
+                            copy_batch.is_some() || delete_batch.is_some(), editor.is_some());
             // SWISS-4h: advance batch ops one step per iteration when
             // no dialog is up. Conflict (CopyBatch) opens a dialog
             // that pauses the loop until user picks; the next
@@ -641,9 +635,7 @@ fn run_ui(
             // editor_active=true (via /event "editor open" issued by
             // THIS tui or another client) and we don't yet have a
             // local buffer — fetch /editor/content and initialise.
-            // Not under a dialog: the editor covers the screen, and the dialog
-            // would take its keys. It opens once the dialog is answered.
-            if snapshot.editor_active && editor.is_none() && local_dialog.is_none() {
+            if editor_may_open(snapshot.editor_active, editor.is_some(), local_dialog.is_some()) {
                 let readonly = take_view_intent();
                 match client.read_path("/editor/content") {
                     Ok(bytes) => {
@@ -677,8 +669,13 @@ fn run_ui(
             // SWISS-4e: external close — slate dropped the editor, e.g.
             // another client wrote /editor/action close. Drop our buffer.
             if !snapshot.editor_active && editor.is_some() {
-                editor = None;
+                editor_closed_elsewhere(&mut editor, &mut local_dialog, &mut ctl_job,
+                                        &mut held_notice,
+                                        copy_batch.is_some() || delete_batch.is_some());
             }
+            // The frame copied the dialog before the editor's steps above could
+            // raise one; it must draw the dialog the keys will go to.
+            snapshot.local_dialog = local_dialog.clone();
             // SWISS-4j: build a CopyProgress snapshot when a batch
             // is in flight so the renderer can overlay file-level
             // progress.
@@ -939,10 +936,9 @@ fn handle_key(
         || (key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c')));
     if quit_key {
-        // Quitting mid-item would leave a partial file under a temporary name, or a short
-        // one under its own in a volume.
-        if copy_batch.is_some() || delete_batch.is_some() {
-            *local_dialog = Some(stop_batch_dialog(copy_batch.is_some(), true));
+        let batch = if copy_batch.is_some() { Some(true) } else if delete_batch.is_some() { Some(false) } else { None };
+        if let Some(asked) = quit_key_question(batch, ctl_job.is_some()) {
+            *local_dialog = Some(asked);
             return Ok(Action::Refresh);
         }
         return Ok(Action::Quit);
@@ -2053,6 +2049,44 @@ fn show_unasked(local_dialog: &mut Option<LocalDialog>, d: LocalDialog) {
     *local_dialog = Some(d);
 }
 
+/// Shows what waits for the screen: a /ctl job's result first, then a notice
+/// held back. Neither shows while a batch runs, whose Esc it would take, or
+/// while the editor is open, whose keys it would take unseen.
+fn deliver_waiting(
+    local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
+    held_notice: &mut Option<LocalDialog>,
+    batch_running: bool,
+    editor_open: bool,
+) {
+    let busy = batch_running || editor_open;
+    tick_ctl_job(local_dialog, ctl_job, busy);
+    if local_dialog.is_none() && !busy {
+        if let Some(notice) = held_notice.take() {
+            *local_dialog = Some(notice);
+        }
+    }
+}
+
+/// The editor covers the screen, so it does not open over a dialog, which
+/// would take its keys unseen. It opens once the dialog is answered.
+fn editor_may_open(editor_active: bool, editor_open: bool, dialog_up: bool) -> bool {
+    editor_active && !editor_open && !dialog_up
+}
+
+/// Another client closed the editor. What waited for it shows now: no key and
+/// no running job may come to wake the loop again.
+fn editor_closed_elsewhere(
+    editor: &mut Option<EditorState>,
+    local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
+    held_notice: &mut Option<LocalDialog>,
+    batch_running: bool,
+) {
+    *editor = None;
+    deliver_waiting(local_dialog, ctl_job, held_notice, batch_running, false);
+}
+
 
 fn submit_confirm(
     local_dialog: &mut Option<LocalDialog>,
@@ -2271,7 +2305,39 @@ fn submit_confirm(
             }
             Ok(Action::Refresh)
         }
+        ConfirmAction::QuitWithRequestOut => {
+            Ok(if label == "Quit" { Action::Quit } else { Action::Refresh })
+        }
     }
+}
+
+/// What a quit key asks first, if anything. A batch is asked to stop: quitting
+/// mid-item would leave a partial file under a temporary name, or a short one
+/// under its own in a volume. A /ctl request still out is asked about: quitting
+/// stops the volume under it, and its result would never be shown. `batch` is
+/// Some(true) for a copy, Some(false) for a delete.
+fn quit_key_question(batch: Option<bool>, request_out: bool) -> Option<LocalDialog> {
+    if let Some(copy) = batch {
+        return Some(stop_batch_dialog(copy, true));
+    }
+    if !request_out {
+        return None;
+    }
+    Some(LocalDialog {
+        kind: LocalDialogKind::Confirm {
+            options: vec!["Wait".to_string(), "Quit".to_string()],
+            selected: 0,
+            on_pick: ConfirmAction::QuitWithRequestOut,
+        },
+        prompt: "A snapshot or scrub request is still out. Quitting now\n\
+                 stops the volume under it, and its result is never shown.\n\
+                 Wait, or Esc: its result shows when it comes.\n\
+                 Quit: quit now."
+            .to_string(),
+        value: Default::default(),
+        is_password: false,
+        is_error: false,
+    })
 }
 
 /// Ends the running batch after the item in hand; its next tick reads this.
@@ -3667,22 +3733,12 @@ fn advance_copy_batch(
     };
 
     if dst_exists && batch.sticky.is_none() {
-        let prompt = format!(
-            "Destination exists ({}/{}):\n  {}\n\nResolution?",
-            batch.idx + 1,
-            batch.items.len(),
-            dst.display()
-        );
+        let prompt = ui::conflict_prompt(batch.idx + 1, batch.items.len(), &dst.display().to_string());
         let (src_for_dialog, dst_for_dialog, is_dir_for_dialog) =
             batch.items[batch.idx].clone();
         *local_dialog = Some(LocalDialog {
             kind: LocalDialogKind::Confirm {
-                options: vec![
-                    "Skip".into(), "SkipAll".into(),
-                    "Overwrite".into(), "OverwriteAll".into(),
-                    "KeepBoth".into(), "KeepBothAll".into(),
-                    "Cancel".into(),
-                ],
+                options: ui::CONFLICT_ANSWERS.iter().map(|s| s.to_string()).collect(),
                 selected: 0,
                 on_pick: ConfirmAction::CopyConflictBatch {
                     src: src_for_dialog,
@@ -5027,6 +5083,72 @@ mod tests {
         assert!(job.is_none());
         assert!(dialog.as_ref().is_some_and(|d| d.prompt.starts_with("Snapshot created.")
             && d.prompt.contains("not\nstarted")));
+    }
+
+    // Over the open editor a result would take its keys unseen: it waits until the editor closes.
+    #[test]
+    fn a_result_waits_while_the_editor_is_open() {
+        let (mut dialog, mut held) = (None, None);
+        let mut job = finished_job("Snapshot created.");
+        deliver_waiting(&mut dialog, &mut job, &mut held, false, true);
+        assert!(dialog.is_none());
+        assert!(job.as_ref().is_some_and(|j| j.result.is_some()));
+        deliver_waiting(&mut dialog, &mut job, &mut held, false, false);
+        assert!(job.is_none());
+        assert!(shows(&dialog, "Snapshot created."));
+    }
+
+    // A notice held back waits for the editor and for a batch alike.
+    #[test]
+    fn a_held_notice_waits_for_the_editor_and_the_batch() {
+        let (mut dialog, mut job) = (None, None);
+        let mut held = Some(error_dialog("Cannot open x"));
+        for (batch_running, editor_open) in [(false, true), (true, false)] {
+            deliver_waiting(&mut dialog, &mut job, &mut held, batch_running, editor_open);
+            assert!(dialog.is_none());
+            assert!(held.is_some());
+        }
+        deliver_waiting(&mut dialog, &mut job, &mut held, false, false);
+        assert!(shows(&dialog, "Cannot open x"));
+        assert!(held.is_none());
+    }
+
+    #[test]
+    fn the_editor_does_not_open_over_a_dialog() {
+        assert!(editor_may_open(true, false, false));
+        assert!(!editor_may_open(true, false, true));
+        assert!(!editor_may_open(true, true, false));
+        assert!(!editor_may_open(false, false, false));
+    }
+
+    // Another client closing the editor is what a held result waited for, and nothing
+    // else would wake the loop to show it.
+    #[test]
+    fn a_result_held_for_the_editor_shows_when_another_client_closes_it() {
+        let mut editor = Some(EditorState::new("f.txt".to_string(), "x", false));
+        let (mut dialog, mut held) = (None, None);
+        let mut job = finished_job("Snapshot created.");
+        deliver_waiting(&mut dialog, &mut job, &mut held, false, editor.is_some());
+        assert!(dialog.is_none());
+        editor_closed_elsewhere(&mut editor, &mut dialog, &mut job, &mut held, false);
+        assert!(editor.is_none());
+        assert!(job.is_none());
+        assert!(shows(&dialog, "Snapshot created."));
+    }
+
+    // Quitting with a request out stops the volume under it and loses its result: the
+    // quit key asks first, Wait by default; a batch is asked to stop before that.
+    #[test]
+    fn a_quit_key_asks_while_a_request_is_out() {
+        assert!(quit_key_question(None, false).is_none());
+        assert!(holds_the_batch(&quit_key_question(Some(false), true)));
+        let asked = quit_key_question(None, true).expect("a question");
+        assert!(matches!(&asked.kind, LocalDialogKind::Confirm {
+            on_pick: ConfirmAction::QuitWithRequestOut, selected: 0, ..
+        }));
+        let (mut dialog, mut job) = (None, None);
+        assert!(matches!(submit_confirm(&mut dialog, &mut job, None, asked.clone(), 0).unwrap(), Action::Refresh));
+        assert!(matches!(submit_confirm(&mut dialog, &mut job, None, asked, 1).unwrap(), Action::Quit));
     }
 
     // Whatever else takes the question's place counts as Stop.

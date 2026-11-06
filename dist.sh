@@ -7,6 +7,9 @@ PROJ="$(cd "$(dirname "$0")" && pwd)"
 echo "Building the C libraries..."
 # In a directory of its own: a binary that ships carries no tests and none of the
 # test hooks, which are on by default, and build/ keeps whatever a test build set.
+# From nothing, every time: a kept cache would keep options this script does not
+# pass, and the manager links every archive it finds there, a stale one too.
+rm -rf "${PROJ:?}/build-dist"
 cmake -B "$PROJ/build-dist" -S "$PROJ" -DCMAKE_BUILD_TYPE=Release -DSTM_BUILD_TESTS=OFF -DSTRATUM_BUILD_TESTING_HOOKS=OFF
 cmake --build "$PROJ/build-dist"
 
