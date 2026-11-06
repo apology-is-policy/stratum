@@ -64,6 +64,13 @@ struct stm_sync *stm_fs_sync_for_test(struct stm_fs *fs);
  */
 stm_status stm_fs_test_clear_pool_serial(const char *path);
 
+/* Where a directory rename's walk pauses for a test. Outside the guard: fs.c
+ * names these points in every build, hooks or none. */
+typedef enum {
+    STM_FS_RENAME_WALK_DIR,
+    STM_FS_RENAME_WALK_CHECKED
+} stm_fs_rename_walk_point;
+
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 /*
  * Make stm_fs_listxattr take its SH fallback whatever its lockless legs
@@ -148,10 +155,6 @@ typedef void (*stm_fs_rename_rollback_hook)(bool wedged, void *arg);
  * subtree, and once the walk has found the target is not under it. `fn` may start another rename and
  * wait a bounded time for it. NULL restores it.
  */
-typedef enum {
-    STM_FS_RENAME_WALK_DIR,
-    STM_FS_RENAME_WALK_CHECKED
-} stm_fs_rename_walk_point;
 typedef void (*stm_fs_rename_walk_hook)(stm_fs_rename_walk_point at, void *arg);
 void stm_fs_set_rename_walk_hook_for_test(stm_fs *fs,
                                           stm_fs_rename_walk_hook fn,
