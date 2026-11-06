@@ -225,10 +225,10 @@ class Term:
         # A manager that strands its daemons fails its own leg. Here it must not also fail the next
         # leg, which needs the volume these still hold.
         session = f'stratum-{self.pid}/'
-        for pid in daemons_of(session):
+        for pid in session_daemons(session):
             os.kill(int(pid), signal.SIGTERM)
         end = time.monotonic() + 30
-        while daemons_of(session) and time.monotonic() < end:
+        while session_daemons(session) and time.monotonic() < end:
             time.sleep(0.2)
 
     def show(self, label):
@@ -382,9 +382,13 @@ def admin_legs(term, vol, sock):
     term.pump(0.5)
 
 
-def daemons_of(session):
+def daemons_of(pattern):
+    return subprocess.run(['pgrep', '-f', pattern], capture_output=True, text=True).stdout.split()
+
+
+def session_daemons(session):
     # With its slash, stratum-1234 does not also match stratum-12345.
-    return subprocess.run(['pgrep', '-f', session.rstrip('/') + '/'], capture_output=True, text=True).stdout.split()
+    return daemons_of(session.rstrip('/') + '/')
 
 
 def session_dir_of(pid):
@@ -409,7 +413,7 @@ def death_legs(stratum, vol, host, root):
             term.expect(r'from_vol\.txt', timeout=60)
             session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
             # The control: the same search finds them while the manager lives.
-            before = daemons_of(session)
+            before = session_daemons(session)
             if len(before) < 3:
                 raise Failure(f'the search finds {before} before {how}: it proves nothing')
             end(term)
@@ -418,7 +422,7 @@ def death_legs(stratum, vol, host, root):
             left = before
             while left and time.monotonic() < limit:
                 time.sleep(0.2)
-                left = daemons_of(session)
+                left = session_daemons(session)
             record(not left, f'{how}: the daemons stopped and the volume locked',
                    f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
             if how in ('SIGTERM', 'SIGINT'):
@@ -441,7 +445,7 @@ def death_legs(stratum, vol, host, root):
             for pid in left:
                 os.kill(int(pid), signal.SIGTERM)
             limit = time.monotonic() + 30
-            while daemons_of(session) and time.monotonic() < limit:
+            while session_daemons(session) and time.monotonic() < limit:
                 time.sleep(0.2)
             vol.serve()
             vol.stop()
@@ -464,7 +468,7 @@ def output_gone_leg(stratum, vol, host, root):
         term.send(PASS.encode() + ENTER)
         term.expect(r'from_vol\.txt', timeout=60)
         session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
-        before = daemons_of(session)
+        before = session_daemons(session)
         if len(before) < 3:
             raise Failure(f'the search finds {before} before {how}: it proves nothing')
         term.cut_output()
@@ -476,10 +480,10 @@ def output_gone_leg(stratum, vol, host, root):
         record(ended and term.rc == 1, f'{how}: the manager ended on the failed draw, rc 1',
                f'{how}: the manager ended={ended} rc={term.rc}')
         limit = time.monotonic() + 30
-        left = daemons_of(session)
+        left = session_daemons(session)
         while left and time.monotonic() < limit:
             time.sleep(0.2)
-            left = daemons_of(session)
+            left = session_daemons(session)
         record(not left, f'{how}: the daemons stopped and the volume locked',
                f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
         record(not os.path.exists(session), f'{how}: the session directory is gone',
@@ -487,7 +491,7 @@ def output_gone_leg(stratum, vol, host, root):
         for pid in left:
             os.kill(int(pid), signal.SIGTERM)
         limit = time.monotonic() + 30
-        while daemons_of(session) and time.monotonic() < limit:
+        while session_daemons(session) and time.monotonic() < limit:
             time.sleep(0.2)
         vol.serve()
         vol.stop()
@@ -509,7 +513,7 @@ def stuck_daemon_leg(stratum, vol, host, root):
         term.send(PASS.encode() + ENTER)
         term.expect(r'from_vol\.txt', timeout=60)
         session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
-        before = daemons_of(session)
+        before = session_daemons(session)
         host_fs = [p for p in before
                    if ' host-fs ' in subprocess.run(['ps', '-o', 'command=', '-p', p],
                                                     capture_output=True, text=True).stdout]
@@ -528,14 +532,14 @@ def stuck_daemon_leg(stratum, vol, host, root):
         # Only the 30 s deadline in stop_child ends a stop of a stopped process.
         record(30 <= took < 90, f'{how}: the manager waited out its 30 s first ({took:.1f} s)',
                f'{how}: the manager ended {took:.1f} s after the SIGTERM, not after the 30 s deadline')
-        left = daemons_of(session)
+        left = session_daemons(session)
         record(not left, f'{how}: no daemon is left', f'{how}: daemons {left} still run, with no manager')
         record(not os.path.exists(session), f'{how}: the session directory is gone',
                f'{how}: the session directory stayed')
         for pid in left:
             os.kill(int(pid), signal.SIGKILL)
         limit = time.monotonic() + 30
-        while daemons_of(session) and time.monotonic() < limit:
+        while session_daemons(session) and time.monotonic() < limit:
             time.sleep(0.2)
         vol.serve()
         vol.stop()
@@ -561,7 +565,7 @@ def headless_output_gone_leg(stratum, vol, host, root):
         term.send(PASS.encode() + ENTER)
         term.expect(r'send SIGTERM', timeout=60)
         session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
-        before = daemons_of(session)
+        before = session_daemons(session)
         if len(before) < 3:
             raise Failure(f'the search finds {before} before {how}: it proves nothing')
         term.cut_output()
@@ -570,10 +574,10 @@ def headless_output_gone_leg(stratum, vol, host, root):
         record(ended and term.rc == 0, f'{how}: the manager ended cleanly',
                f'{how}: the manager ended={ended} rc={term.rc}')
         limit = time.monotonic() + 30
-        left = daemons_of(session)
+        left = session_daemons(session)
         while left and time.monotonic() < limit:
             time.sleep(0.2)
-            left = daemons_of(session)
+            left = session_daemons(session)
         record(not left, f'{how}: the daemons stopped and the volume locked',
                f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
         record(not os.path.exists(session), f'{how}: the session directory is gone',
@@ -581,7 +585,7 @@ def headless_output_gone_leg(stratum, vol, host, root):
         for pid in left:
             os.kill(int(pid), signal.SIGTERM)
         limit = time.monotonic() + 30
-        while daemons_of(session) and time.monotonic() < limit:
+        while session_daemons(session) and time.monotonic() < limit:
             time.sleep(0.2)
         vol.serve()
         vol.stop()
@@ -611,7 +615,7 @@ def prompt_end_legs(stratum, vol, host, root):
         try:
             term.expect(r'Passphrase for')
             session = session_dir_of(term.pid)
-            before = daemons_of(session)
+            before = session_daemons(session)
             if not os.path.isdir(session) or not before:
                 raise Failure(f'{how}: {session} is a directory={os.path.isdir(session)}, daemons {before}, '
                               'before the end: it proves nothing')
@@ -639,10 +643,10 @@ def prompt_end_legs(stratum, vol, host, root):
                 record(said, f'{how}: it stopped at the prompt, before stratumd',
                        f'{how}: it did not say it stopped at the prompt')
             limit = time.monotonic() + 30
-            left = daemons_of(session)
+            left = session_daemons(session)
             while left and time.monotonic() < limit:
                 time.sleep(0.2)
-                left = daemons_of(session)
+                left = session_daemons(session)
             record(not left, f'{how}: host-fs stopped', f'{how}: daemons {left} still run, with no manager')
             record(not os.path.exists(session), f'{how}: the session directory is gone',
                    f'{how}: the session directory stayed')
@@ -670,7 +674,7 @@ def missing_binary_leg(stratum, vol, host, root):
     try:
         term.expect(r'Passphrase for')
         session = session_dir_of(term.pid)
-        before = daemons_of(session)
+        before = session_daemons(session)
         if not os.path.isdir(session) or not before:
             raise Failure(f'{how}: {session} is a directory={os.path.isdir(session)}, daemons {before}, '
                           'before the end: it proves nothing')
@@ -682,10 +686,10 @@ def missing_binary_leg(stratum, vol, host, root):
         record(ended and term.rc == 1 and said, f'{how}: the manager ended on the failed spawn',
                f'{how}: the manager ended={ended} rc={term.rc}, said spawn stratumd={said}')
         limit = time.monotonic() + 30
-        left = daemons_of(session)
+        left = session_daemons(session)
         while left and time.monotonic() < limit:
             time.sleep(0.2)
-            left = daemons_of(session)
+            left = session_daemons(session)
         record(not left, f'{how}: host-fs stopped', f'{how}: daemons {left} still run, with no manager')
         record(not os.path.exists(session), f'{how}: the session directory is gone',
                f'{how}: the session directory stayed')
@@ -2009,7 +2013,7 @@ def run(stratum, root):
         print('ok: F10 quit cleanly', flush=True)
         # Now, because term.kill stops strays, and the lifeline would stop them soon after.
         session = os.path.dirname(env['STRATUMD_SOCK'])
-        left, session_left = daemons_of(session), os.path.exists(session)
+        left, session_left = session_daemons(session), os.path.exists(session)
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
