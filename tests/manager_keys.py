@@ -615,7 +615,7 @@ def landing_legs(stratum, root):
     config = f'{os.environ["HOME"]}/.config/stratum'
     os.makedirs(config)
     with open(f'{config}/recents', 'w', encoding='utf-8') as f:
-        f.write('/volumes/' + 'é' * 30 + '/v.stm\n')
+        f.write('/volumes/' + '\u00e9' * 30 + '/v.stm\n')
 
     term = Term([stratum])
     try:
