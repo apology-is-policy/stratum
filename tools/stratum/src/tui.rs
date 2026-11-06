@@ -340,13 +340,14 @@ pub fn stop_requested() -> bool {
 }
 
 /// Ending by the default action would leave the terminal raw, the session
-/// directory behind and the daemons to find out for themselves. A HUP or INT
-/// someone has chosen to ignore, as nohup and a shell's `&` do, stays ignored.
+/// directory behind and the daemons to find out for themselves; QUIT's would also
+/// dump core. A HUP, INT or QUIT someone has chosen to ignore, as nohup and a
+/// shell's `&` do, stays ignored.
 pub fn stop_on_signals() {
     let handler = ask_to_stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
     unsafe {
         libc::signal(libc::SIGTERM, handler);
-        for sig in [libc::SIGHUP, libc::SIGINT] {
+        for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
             if libc::signal(sig, handler) == libc::SIG_IGN {
                 libc::signal(sig, libc::SIG_IGN);
             }

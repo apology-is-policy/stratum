@@ -12,6 +12,7 @@ KEYS_ONLY=leg,leg runs only those legs, each of which takes (stratum, root).
 """
 import codecs
 import fcntl
+import inspect
 import os
 import pty
 import re
@@ -382,7 +383,14 @@ def admin_legs(term, vol, sock):
 
 
 def daemons_of(session):
-    return subprocess.run(['pgrep', '-f', session], capture_output=True, text=True).stdout.split()
+    # With its slash, stratum-1234 does not also match stratum-12345.
+    return subprocess.run(['pgrep', '-f', session.rstrip('/') + '/'], capture_output=True, text=True).stdout.split()
+
+
+def session_dir_of(pid):
+    """Where the manager makes its session directory, as embed.rs's make_session_dir does."""
+    base = os.environ.get('XDG_RUNTIME_DIR') or os.environ.get('TMPDIR') or '/tmp'
+    return f"{base.rstrip('/')}/stratum-{pid}"
 
 
 def death_legs(stratum, vol, host, root):
@@ -460,11 +468,12 @@ def output_gone_leg(stratum, vol, host, root):
         if len(before) < 3:
             raise Failure(f'the search finds {before} before {how}: it proves nothing')
         term.cut_output()
-        # A key that moves the cursor makes the manager draw, into the closed pipe.
-        term.send(DOWN)
+        # Tab moves the focus, which always draws, into the closed pipe. Down on a
+        # panel's last entry does nothing, and the leg would wait on a chance redraw.
+        term.send(TAB)
         ended = term.exited(30)
-        # 101 is a Rust panic's exit status.
-        record(ended and term.rc not in (None, 101), f'{how}: the manager ended with rc {term.rc}, not a panic',
+        # Its draw fails, and that error is its end: rc 1. A panic would be 101.
+        record(ended and term.rc == 1, f'{how}: the manager ended on the failed draw, rc 1',
                f'{how}: the manager ended={ended} rc={term.rc}')
         limit = time.monotonic() + 30
         left = daemons_of(session)
@@ -511,9 +520,14 @@ def stuck_daemon_leg(stratum, vol, host, root):
         os.kill(stuck, signal.SIGSTOP)
         term.cut_output()
         os.kill(term.pid, signal.SIGTERM)
+        began = time.monotonic()
         ended = term.exited(100)
+        took = time.monotonic() - began
         record(ended and term.rc == 0, f'{how}: the manager killed it and ended cleanly',
                f'{how}: the manager ended={ended} rc={term.rc}')
+        # Only the 30 s deadline in stop_child ends a stop of a stopped process.
+        record(30 <= took < 90, f'{how}: the manager waited out its 30 s first ({took:.1f} s)',
+               f'{how}: the manager ended {took:.1f} s after the SIGTERM, not after the 30 s deadline')
         left = daemons_of(session)
         record(not left, f'{how}: no daemon is left', f'{how}: daemons {left} still run, with no manager')
         record(not os.path.exists(session), f'{how}: the session directory is gone',
@@ -534,6 +548,153 @@ def stuck_daemon_leg(stratum, vol, host, root):
                 pass
         term.kill()
 
+
+def headless_output_gone_leg(stratum, vol, host, root):
+    """Headless, the manager prints a line when the signal that ends it comes. After a HUP its
+    stderr may have gone with the terminal, and that line must not panic it before the stop."""
+    how = 'headless, the output gone'
+    env_file = f'{root}/env-headless'
+    term = Term([stratum, 'tui', '--headless', '--vol', vol.v, '--host', host,
+                 '--print-env-to', env_file], output_to_pipe=True)
+    try:
+        term.expect(r'Passphrase for')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'send SIGTERM', timeout=60)
+        session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
+        before = daemons_of(session)
+        if len(before) < 3:
+            raise Failure(f'the search finds {before} before {how}: it proves nothing')
+        term.cut_output()
+        os.kill(term.pid, signal.SIGTERM)
+        ended = term.exited(60)
+        record(ended and term.rc == 0, f'{how}: the manager ended cleanly',
+               f'{how}: the manager ended={ended} rc={term.rc}')
+        limit = time.monotonic() + 30
+        left = daemons_of(session)
+        while left and time.monotonic() < limit:
+            time.sleep(0.2)
+            left = daemons_of(session)
+        record(not left, f'{how}: the daemons stopped and the volume locked',
+               f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
+        record(not os.path.exists(session), f'{how}: the session directory is gone',
+               f'{how}: the session directory stayed')
+        for pid in left:
+            os.kill(int(pid), signal.SIGTERM)
+        limit = time.monotonic() + 30
+        while daemons_of(session) and time.monotonic() < limit:
+            time.sleep(0.2)
+        vol.serve()
+        vol.stop()
+        print(f'ok: after {how} the volume mounts and unmounts cleanly', flush=True)
+    finally:
+        term.kill()
+
+
+def prompt_end_legs(stratum, vol, host, root):
+    """At the passphrase prompt the session directory and host-fs already exist. Ended
+    there, by its terminal closing or by Ctrl-\\, the manager must not leave them."""
+    def close(term):
+        os.close(term.fd)
+
+    def quit_key(term):
+        # QUIT does not end the read; the passphrase and Enter do.
+        term.send(b'\x1c')
+        time.sleep(0.5)
+        try:
+            term.send(PASS.encode() + ENTER)
+        except OSError:
+            pass  # QUIT's default action has ended the manager, and the terminal's other side with it
+
+    for how, end in (('its terminal closing at the prompt', close), ('Ctrl-\\ at the prompt', quit_key)):
+        term = Term([stratum, 'tui', '--vol', vol.v, '--host', host])
+        closed = False
+        try:
+            term.expect(r'Passphrase for')
+            session = session_dir_of(term.pid)
+            before = daemons_of(session)
+            if not os.path.isdir(session) or not before:
+                raise Failure(f'{how}: {session} is a directory={os.path.isdir(session)}, daemons {before}, '
+                              'before the end: it proves nothing')
+            end(term)
+            closed = end is close
+            if closed:
+                limit = time.monotonic() + 30
+                while term.rc is None and time.monotonic() < limit:
+                    pid, status = os.waitpid(term.pid, os.WNOHANG)
+                    if pid:
+                        term.rc = os.waitstatus_to_exitcode(status)
+                    else:
+                        time.sleep(0.1)
+            else:
+                # It reads the terminal as it waits: on macOS an exit waits for the
+                # terminal's output to be read.
+                term.exited(30)
+            rc = term.rc
+            # An error return is rc 1; HUP's or QUIT's default action would be -1 or -3.
+            record(rc == 1, f'{how}: the manager ended with an error, rc 1', f'{how}: the manager ended with rc {rc}')
+            if not closed:
+                # Ended at the prompt, not by stratumd's start wait a moment later: the
+                # volume was never unlocked with a passphrase typed only to get out.
+                said = 'asked to stop at the passphrase prompt' in term.screen.text()
+                record(said, f'{how}: it stopped at the prompt, before stratumd',
+                       f'{how}: it did not say it stopped at the prompt')
+            limit = time.monotonic() + 30
+            left = daemons_of(session)
+            while left and time.monotonic() < limit:
+                time.sleep(0.2)
+                left = daemons_of(session)
+            record(not left, f'{how}: host-fs stopped', f'{how}: daemons {left} still run, with no manager')
+            record(not os.path.exists(session), f'{how}: the session directory is gone',
+                   f'{how}: the session directory stayed')
+            for pid in left:
+                os.kill(int(pid), signal.SIGTERM)
+        finally:
+            if closed and term.rc is None:
+                try:
+                    os.kill(term.pid, signal.SIGKILL)
+                    os.waitpid(term.pid, 0)
+                except (OSError, ChildProcessError):
+                    pass
+                term.rc = -9
+            if not closed:
+                term.kill()
+
+
+def missing_binary_leg(stratum, vol, host, root):
+    """The manager starts each daemon from its own binary. If that has gone by the time
+    stratumd starts, the start fails, and host-fs and the directory must not stay."""
+    how = 'its binary gone before stratumd starts'
+    copy = f'{root}/stratum-copy'
+    shutil.copy2(stratum, copy)
+    term = Term([copy, 'tui', '--vol', vol.v, '--host', host])
+    try:
+        term.expect(r'Passphrase for')
+        session = session_dir_of(term.pid)
+        before = daemons_of(session)
+        if not os.path.isdir(session) or not before:
+            raise Failure(f'{how}: {session} is a directory={os.path.isdir(session)}, daemons {before}, '
+                          'before the end: it proves nothing')
+        os.unlink(copy)
+        term.send(PASS.encode() + ENTER)
+        ended = term.exited(30)
+        # Which failure: the spawn, not some other one.
+        said = 'spawn stratumd' in term.screen.text()
+        record(ended and term.rc == 1 and said, f'{how}: the manager ended on the failed spawn',
+               f'{how}: the manager ended={ended} rc={term.rc}, said spawn stratumd={said}')
+        limit = time.monotonic() + 30
+        left = daemons_of(session)
+        while left and time.monotonic() < limit:
+            time.sleep(0.2)
+            left = daemons_of(session)
+        record(not left, f'{how}: host-fs stopped', f'{how}: daemons {left} still run, with no manager')
+        record(not os.path.exists(session), f'{how}: the session directory is gone',
+               f'{how}: the session directory stayed')
+        for pid in left:
+            os.kill(int(pid), signal.SIGTERM)
+    finally:
+        term.kill()
+        if os.path.exists(copy):
+            os.unlink(copy)
 
 def save_in_editor(term, vol, sock, path, want, what):
     """Save and quit, then read the file outside the manager. A refused save quits without it, so the next leg runs."""
@@ -1747,6 +1908,22 @@ def delete_batch_legs(stratum, root):
         term.kill()
 
 
+def sealed_volume(stratum, root):
+    """For a leg run alone: a sealed volume holding from_vol.txt, and a host tree."""
+    host = f'{root}/host'
+    os.makedirs(f'{host}/tree/deep', exist_ok=True)
+    with open(f'{host}/tree/a.txt', 'w') as f:
+        f.write('one\n')
+    vol = Volume(stratum, root)
+    vol.mkfs()
+    vol.serve()
+    r = vol.fs(vol.sock, 'write', '/from_vol.txt', data=b'came from the volume\n')
+    if r.returncode != 0:
+        raise Failure(f'seeding the volume failed: {r.stderr[:200]}')
+    vol.stop()
+    return vol, host
+
+
 def run(stratum, root):
     host = f'{root}/host'
     tree = f'{host}/tree'
@@ -1864,6 +2041,9 @@ def run(stratum, root):
                       (death_legs, (stratum, vol, host, root)),
                       (output_gone_leg, (stratum, vol, host, root)),
                       (stuck_daemon_leg, (stratum, vol, host, root)),
+                      (headless_output_gone_leg, (stratum, vol, host, root)),
+                      (prompt_end_legs, (stratum, vol, host, root)),
+                      (missing_binary_leg, (stratum, vol, host, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
                       (wrong_passphrase_leg, (stratum, vol, host)),
                       (wizard_legs, (stratum, vol, root)),
@@ -1891,9 +2071,14 @@ def main():
     try:
         only = os.environ.get('KEYS_ONLY')
         if only:
+            given = {'stratum': stratum, 'root': root, 'env_file': f'{root}/env2'}
             for name in only.split(','):
                 try:
-                    globals()[name](stratum, root)
+                    leg = globals()[name]
+                    wants = list(inspect.signature(leg).parameters)
+                    if ('vol' in wants or 'host' in wants) and 'vol' not in given:
+                        given['vol'], given['host'] = sealed_volume(stratum, root)
+                    leg(*[given[w] for w in wants])
                 except (Failure, OSError) as e:
                     record(False, '', f'{name}: {e}')
         else:

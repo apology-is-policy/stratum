@@ -110,11 +110,16 @@ pub fn stop_child(child: &mut Child, name: &str) {
             Err(_) => break,
         }
     }
-    use std::io::Write as _;
-    // Not eprintln!: with the terminal gone it would panic, and leave the rest unstopped.
-    let _ = writeln!(std::io::stderr(), "stratum: {name} didn't exit on SIGTERM; SIGKILL");
+    tell(format_args!("stratum: {name} didn't exit on SIGTERM; SIGKILL"));
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// A line on stderr that cannot panic, as eprintln! does once the terminal or the
+/// pipe it wrote to has gone: the panic would skip the rest of the stop.
+pub(crate) fn tell(line: std::fmt::Arguments) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 pub struct SpawnCtx {

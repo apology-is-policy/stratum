@@ -12,8 +12,8 @@
 //!     descriptors + atomic globals are isolated. The Rust parent's
 //!     SIGINT/SIGTERM only affects the parent (which then SIGTERMs
 //!     children on TUI exit).
-//!   - Sockets live in $XDG_RUNTIME_DIR/stratum/<pid>/ on Linux, in
-//!     $TMPDIR/stratum-<pid>/ on macOS. Removed at shutdown.
+//!   - Sockets live in $XDG_RUNTIME_DIR/stratum-<pid>/, or under the
+//!     temporary directory without it. Removed at shutdown.
 //!   - `--print-env-to FILE` writes STRATUM_SLATE_SOCK + STRATUMD_SOCK
 //!     in shell-source-able format, so external tools (Claude included)
 //!     can drive slate / stratumd in parallel via `stratum fs -s …`.
@@ -78,6 +78,9 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // R126 P2-2: mask SIGINT/SIGTERM on the parent thread BEFORE
     // spawning children.
     let prev_mask = block_term_signals();
+    // Before the directory exists: a HUP or QUIT taking its default action, at the
+    // passphrase prompt or in a start wait, would leave it.
+    tui::stop_on_signals();
     crate::lifeline::hold()?;
     let session = SessionDir(make_session_dir()?);
     let session_dir = session.0.clone();
@@ -176,6 +179,11 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         } else {
             None
         };
+        // A HUP ends the prompt with the read; a QUIT waits for Enter.
+        if tui::stop_requested() {
+            let _ = host_fs_child.kill();
+            bail!("asked to stop at the passphrase prompt");
+        }
 
         let mut stratumd_args: Vec<String> = vec![
             "serve".into(),
@@ -217,15 +225,28 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         } else {
             Stdio::null()
         };
-        let mut child = Command::new(&me)
+        let stratumd_log = match open_log("stratumd") {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = host_fs_child.kill();
+                return Err(e);
+            }
+        };
+        let mut child = match Command::new(&me)
             .args(&stratumd_args)
             .envs(crate::lifeline::env())
             .stdin(stdin_setup)
             .stdout(Stdio::null())
-            .stderr(open_log("stratumd")?)
+            .stderr(stratumd_log)
             .process_group(0)
             .spawn()
-            .with_context(|| format!("spawn stratumd via {}", me.display()))?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = host_fs_child.kill();
+                return Err(anyhow!(e).context(format!("spawn stratumd via {}", me.display())));
+            }
+        };
 
         // Pipe passphrase to stratumd's stdin then close. Stratumd's
         // run.c reads ONE line so we append '\n'. The Rust-side
@@ -311,11 +332,21 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         slate_sock.to_string_lossy().into_owned(),
         "--allow-unauth".into(),
     ];
+    let slate_log = match open_log("slate") {
+        Ok(l) => l,
+        Err(e) => {
+            if let Some(c) = stratumd_child.as_mut() {
+                let _ = c.kill();
+            }
+            let _ = host_fs_child.kill();
+            return Err(e);
+        }
+    };
     let mut slate_child = match Command::new(&me)
         .args(&slate_args)
         .envs(crate::lifeline::env())
         .stdout(Stdio::null())
-        .stderr(open_log("slate")?)
+        .stderr(slate_log)
         .process_group(0)
         .spawn()
     {
@@ -372,10 +403,10 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             ));
         }
         if let Err(e) = write_env_file_safely(env_path, &body) {
-            eprintln!(
+            crate::spawn::tell(format_args!(
                 "stratum: warning: --print-env-to {} failed: {e}",
                 env_path.display()
-            );
+            ));
         }
     }
 
@@ -387,12 +418,12 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // forward note), so this doesn't deadlock.
     if let Err(e) = attach_panel_with_retry(&slate_sock, "/connection/left/attach", &left_plan.sock)
     {
-        eprintln!("stratum: warning: left-panel pre-attach failed: {e}");
+        crate::spawn::tell(format_args!("stratum: warning: left-panel pre-attach failed: {e}"));
     }
     if let Err(e) =
         attach_panel_with_retry(&slate_sock, "/connection/right/attach", &right_plan.sock)
     {
-        eprintln!("stratum: warning: right-panel pre-attach failed: {e}");
+        crate::spawn::tell(format_args!("stratum: warning: right-panel pre-attach failed: {e}"));
     }
 
     // SWISS-4b: build the SpawnCtx so the TUI can spawn additional
@@ -418,8 +449,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     let result = if opts.headless {
         run_headless(&slate_sock, &left_plan.sock, &prev_mask)
     } else {
-        // First: lifting the mask delivers whatever arrived while it was up.
-        tui::stop_on_signals();
+        // Lifting the mask delivers whatever arrived while it was up.
         restore_signal_mask(&prev_mask);
         tui::run(tui::Opts {
             slate_sock: slate_sock.clone(),
@@ -475,31 +505,41 @@ fn attach_panel_with_retry(slate_sock: &Path, attach_path: &str, target_sock: &P
 /// a tty. SIGINT/SIGTERM are already blocked at process startup
 /// (R126 P2-2 fix); we sigwait on them here.
 fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigset_t) -> Result<()> {
-    eprintln!("stratum: headless mode — daemons running.");
-    eprintln!("        slate    socket: {}", slate_sock.display());
-    eprintln!("        backend  socket: {}", backend_sock.display());
-    eprintln!("        send SIGTERM (Ctrl-C) to shut down.");
+    use crate::spawn::tell;
+    tell(format_args!("stratum: headless mode -- daemons running."));
+    tell(format_args!("        slate    socket: {}", slate_sock.display()));
+    tell(format_args!("        backend  socket: {}", backend_sock.display()));
+    tell(format_args!("        send SIGTERM (Ctrl-C) to shut down."));
 
     let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGINT);
         libc::sigaddset(&mut set, libc::SIGTERM);
-        // The default action would leave the session directory. A HUP someone has
-        // chosen to ignore stays ignored.
-        let mut hup: libc::sigaction = std::mem::zeroed();
-        if libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut hup) == 0
-            && hup.sa_sigaction != libc::SIG_IGN
-        {
-            libc::sigaddset(&mut set, libc::SIGHUP);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        // The default action would leave the session directory. A HUP or QUIT
+        // someone has chosen to ignore stays ignored.
+        for sig in [libc::SIGHUP, libc::SIGQUIT] {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &mut act) == 0
+                && act.sa_sigaction != libc::SIG_IGN
+            {
+                libc::sigaddset(&mut set, sig);
+            }
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+    // One that came before the block went to the handler, and sigwait would never see it.
+    let mut sig: i32 = 0;
+    if !tui::stop_requested() {
+        unsafe {
+            libc::sigwait(&set, &mut sig);
         }
     }
-    let mut sig: i32 = 0;
-    unsafe {
-        libc::sigwait(&set, &mut sig);
+    if sig != 0 {
+        tell(format_args!("stratum: caught signal {sig}, shutting down."));
+    } else {
+        tell(format_args!("stratum: asked to stop, shutting down."));
     }
-    eprintln!("stratum: caught signal {sig}, shutting down.");
     Ok(())
 }
 
@@ -562,8 +602,8 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
-/// Allocate a per-pid session dir under $XDG_RUNTIME_DIR (Linux) or
-/// $TMPDIR (macOS / fallback). Caller is responsible for cleanup.
+/// Allocate a per-pid session dir under $XDG_RUNTIME_DIR, or the temporary
+/// directory without it. run() removes it through a SessionDir.
 ///
 /// R126 P1-2 + P3-2: refuse-if-exists posture. PIDs collide on long-
 /// running systems, and the dir name is predictable enough that an
@@ -608,8 +648,31 @@ fn wait_for_sock(path: &Path, timeout: Duration) -> Result<()> {
         if path.exists() {
             return Ok(());
         }
+        if tui::stop_requested() {
+            bail!("asked to stop");
+        }
         thread::sleep(Duration::from_millis(20));
     }
     bail!("timeout waiting for {}", path.display())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::SessionDir;
+
+    #[test]
+    fn a_panic_still_removes_the_session_directory() {
+        let dir = std::env::temp_dir().join(format!("stratum-guard-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("slate.log"), b"a daemon's log\n").unwrap();
+        assert!(dir.join("slate.log").exists());
+        let held = dir.clone();
+        let unwound = std::panic::catch_unwind(move || {
+            let _session = SessionDir(held);
+            panic!("a panic in the session");
+        });
+        assert!(unwound.is_err());
+        assert!(!dir.exists());
+    }
+}
