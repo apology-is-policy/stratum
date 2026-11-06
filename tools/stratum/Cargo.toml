@@ -21,7 +21,7 @@ publish = false
 # See docs/SLATE-DESIGN.md section 12 for the design rationale.
 
 [dependencies]
-ratatui      = "0.29"
+ratatui      = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm    = "0.28"
 anyhow       = "1"
 libc         = "0.2"

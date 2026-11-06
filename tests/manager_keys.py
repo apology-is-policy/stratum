@@ -139,7 +139,11 @@ class Term:
             for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGHUP):
                 signal.signal(sig, signal.SIG_DFL)
             os.environ['TERM'] = 'xterm-256color'
-            os.execv(argv[0], argv)
+            # A failed exec must not leave a second harness running the legs.
+            try:
+                os.execv(argv[0], argv)
+            finally:
+                os._exit(127)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS, 0, 0))
 
     def pump(self, seconds):

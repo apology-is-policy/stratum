@@ -5,12 +5,13 @@ set -e
 PROJ="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Building the C libraries..."
-# The test hooks are on by default; a binary that ships carries none of them.
-cmake -B "$PROJ/build" -S "$PROJ" -DCMAKE_BUILD_TYPE=Release -DSTM_BUILD_TESTS=OFF -DSTRATUM_BUILD_TESTING_HOOKS=OFF
-cmake --build "$PROJ/build"
+# In a directory of its own: a binary that ships carries no tests and none of the
+# test hooks, which are on by default, and build/ keeps whatever a test build set.
+cmake -B "$PROJ/build-dist" -S "$PROJ" -DCMAKE_BUILD_TYPE=Release -DSTM_BUILD_TESTS=OFF -DSTRATUM_BUILD_TESTING_HOOKS=OFF
+cmake --build "$PROJ/build-dist"
 
 echo "Building the stratum binary..."
-(cd "$PROJ/tools/stratum" && STM_BUILD_DIR="$PROJ/build" cargo build --release)
+(cd "$PROJ/tools/stratum" && STM_BUILD_DIR="$PROJ/build-dist" cargo build --release)
 
 mkdir -p "$PROJ/dist"
 # Beside it and then over it: a daemon still running the old binary keeps a plain cp from writing.

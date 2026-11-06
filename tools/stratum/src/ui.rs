@@ -580,6 +580,10 @@ pub fn render(
     // independently of view_mode.
     if let Some(ed) = editor {
         draw_editor(frame, area, ed);
+        // A dialog takes every key while it is up, so it is never hidden.
+        if let Some(d) = state.local_dialog.as_ref() {
+            draw_any_local_dialog(frame, area, d);
+        }
         return;
     }
 
@@ -610,16 +614,7 @@ pub fn render(
             draw_dialog_overlay(frame, area, state);
         }
         if let Some(d) = state.local_dialog.as_ref() {
-            match &d.kind {
-                LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
-                LocalDialogKind::Confirm { options, selected, .. } => {
-                    draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
-                }
-                LocalDialogKind::SnapshotList { snaps, cursor, .. } => {
-                    draw_snap_dialog(frame, area, snaps, *cursor);
-                }
-                _ => draw_local_dialog(frame, area, d),
-            }
+            draw_any_local_dialog(frame, area, d);
         } else if let Some(cp) = copy_progress {
             draw_copy_progress(frame, area, cp);
         }
@@ -653,16 +648,7 @@ pub fn render(
     }
     // SWISS-4b: local modal dialog renders OVER any other surface.
     if let Some(d) = state.local_dialog.as_ref() {
-        match &d.kind {
-            LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
-            LocalDialogKind::Confirm { options, selected, .. } => {
-                draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
-            }
-            LocalDialogKind::SnapshotList { snaps, cursor, .. } => {
-                draw_snap_dialog(frame, area, snaps, *cursor);
-            }
-            _ => draw_local_dialog(frame, area, d),
-        }
+        draw_any_local_dialog(frame, area, d);
     } else if let Some(cp) = copy_progress {
         // SWISS-4j: copy progress overlay. Only when no dialog is up
         // (a conflict dialog supersedes the progress display).
@@ -1284,14 +1270,20 @@ fn draw_dialog_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 // for password prompts, yellow input cursor) — gives the user the
 // same affordance they had in v1.
 
-fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
-    let body_lines = d.prompt.lines().count() as u16;
-    let h = (5 + body_lines).min(area.height.saturating_sub(2));
-    let w = 70.min(area.width.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect::new(x, y, w, h);
+fn draw_any_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
+    match &d.kind {
+        LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
+        LocalDialogKind::Confirm { options, selected, .. } => {
+            draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
+        }
+        LocalDialogKind::SnapshotList { snaps, cursor, .. } => {
+            draw_snap_dialog(frame, area, snaps, *cursor);
+        }
+        _ => draw_local_dialog(frame, area, d),
+    }
+}
 
+fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
     let title = match (&d.kind, d.is_error) {
         (_, true) => " Error ",
         (LocalDialogKind::HostMountInput { .. }, _) => " Mount host directory ",
@@ -1309,7 +1301,6 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
     let border_clr = if d.is_error { Color::Red } else { Color::Cyan };
     let prompt_clr = if d.is_password { Color::Red } else { Color::White };
 
-    frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(dbl_border())
@@ -1319,8 +1310,6 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
             Style::default().fg(border_clr).bold(),
         )))
         .style(Style::default().bg(CLR_POPUP_BG));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
 
     // SWISS-4n3: input field is gated on the DIALOG KIND, not on
     // is_error. Earlier code keyed on is_error, but info_dialog (also
@@ -1328,7 +1317,7 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
     // getting an input field — so the post-mkfs "Created X" toast
     // showed an unwanted text-input prompt instead of just acknowledge.
     let wants_input = !matches!(d.kind, LocalDialogKind::Error);
-    let mut lines: Vec<Line> = d
+    let mut body: Vec<Line> = d
         .prompt
         .lines()
         .map(|s| {
@@ -1338,33 +1327,30 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
             ))
         })
         .collect();
-    if wants_input {
-        lines.push(Line::from(""));
+    body.push(Line::from(""));
+    let tail = if wants_input {
         let display = if d.is_password {
             "*".repeat(d.value.chars().count())
         } else {
             sanitize_for_display(&d.value)
         };
-        lines.push(Line::from(Span::styled(
-            format!("> {display}_"),
-            Style::default().fg(Color::Yellow).bold(),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "[Enter] submit · [Esc] cancel",
-            Style::default().fg(Color::DarkGray),
-        )));
+        vec![
+            Line::from(Span::styled(
+                format!("> {display}_"),
+                Style::default().fg(Color::Yellow).bold(),
+            )),
+            Line::from(""),
+        ]
     } else {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "[Enter] / [Esc] dismiss",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        inner,
-    );
+        vec![
+            Line::from(Span::styled(
+                "[Enter] / [Esc] dismiss",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+        ]
+    };
+    draw_boxed(frame, area, block, body, tail);
 }
 
 // ── SWISS-8c: F9 snapshot list dialog (port of v1) ────────────────────
@@ -1736,19 +1722,6 @@ fn draw_confirm_dialog(
     options: &[String],
     selected: usize,
 ) {
-    let w = 70.min(area.width.saturating_sub(4));
-    // The prompt wraps below, so the box is as tall as the wrapped prompt: sized
-    // by its line count, a narrow terminal pushed the buttons out of it.
-    let body_lines: u16 = prompt
-        .lines()
-        .map(|l| wrapped_rows(&sanitize_for_display(l), w.saturating_sub(2)))
-        .sum();
-    let h = (5 + body_lines).min(area.height.saturating_sub(2));
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect::new(x, y, w, h);
-
-    frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(dbl_border())
@@ -1758,10 +1731,8 @@ fn draw_confirm_dialog(
             Style::default().fg(Color::Cyan).bold(),
         )))
         .style(Style::default().bg(CLR_POPUP_BG));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
 
-    let mut lines: Vec<Line> = prompt
+    let mut body: Vec<Line> = prompt
         .lines()
         .map(|s| {
             Line::from(Span::styled(
@@ -1770,7 +1741,7 @@ fn draw_confirm_dialog(
             ))
         })
         .collect();
-    lines.push(Line::from(""));
+    body.push(Line::from(""));
 
     // Buttons row, focused option inverted (cyan bg + black fg).
     let mut spans: Vec<Span> = vec![Span::raw("  ")];
@@ -1783,44 +1754,40 @@ fn draw_confirm_dialog(
         spans.push(Span::styled(format!("  {opt}  "), style));
         spans.push(Span::raw("  "));
     }
-    lines.push(Line::from(spans));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "[←/→/Tab] cycle · [Enter] confirm · [Esc] cancel",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        inner,
-    );
+    draw_boxed(frame, area, block, body, vec![Line::from(spans), Line::from("")]);
 }
 
-/// Rows `text` takes when word-wrapped into `width` columns: never fewer than
-/// the Paragraph uses. A row after a break is counted as if it began with the
-/// space it broke at, and a word longer than a row breaks across rows.
-fn wrapped_rows(text: &str, width: u16) -> u16 {
-    let width = usize::from(width.max(1));
-    let mut rows = 1usize;
-    let mut col = 0usize;
-    for word in text.split(' ') {
-        let w = Span::raw(word).width();
-        let need = if col == 0 { w } else { col + 1 + w };
-        if need <= width {
-            col = need;
-            continue;
-        }
-        let mut len = if col == 0 { w } else { 1 + w };
-        if col > 0 {
-            rows += 1;
-        }
-        while len > width {
-            rows += 1;
-            len -= width;
-        }
-        col = len;
-    }
-    u16::try_from(rows).unwrap_or(u16::MAX)
+/// A centred box: `body` wraps from the top and is what a box too short for
+/// everything clips; `tail`, a field or the buttons, keeps its rows at the
+/// bottom. Both are measured as the wrap lays them out, so no answer the box
+/// offers is ever cut off by the text above it.
+fn draw_boxed(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    block: Block<'_>,
+    body: Vec<Line<'_>>,
+    tail: Vec<Line<'_>>,
+) {
+    let w = 70.min(area.width.saturating_sub(4));
+    let inner_w = w.saturating_sub(2);
+    let body = Paragraph::new(body).wrap(Wrap { trim: false });
+    let tail = Paragraph::new(tail).wrap(Wrap { trim: false });
+    let rows = |p: &Paragraph<'_>| u16::try_from(p.line_count(inner_w)).unwrap_or(u16::MAX);
+    let (body_rows, tail_rows) = (rows(&body), rows(&tail));
+    let h = body_rows
+        .saturating_add(tail_rows)
+        .saturating_add(2)
+        .min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let tail_h = tail_rows.min(inner.height);
+    let body_h = inner.height - tail_h;
+    frame.render_widget(body, Rect::new(inner.x, inner.y, inner.width, body_h));
+    frame.render_widget(tail, Rect::new(inner.x, inner.y + body_h, inner.width, tail_h));
 }
 
 // ── SWISS-4c: mkfs wizard ─────────────────────────────────────────────
@@ -2098,32 +2065,53 @@ fn is_leap(y: i32) -> bool {
 mod tests {
     use super::*;
 
-    // A prompt that wraps in a narrow terminal still leaves the buttons in the box.
-    #[test]
-    fn a_wrapped_confirm_keeps_its_buttons() {
+    fn screen(cols: u16, rows: u16, draw: impl FnOnce(&mut Frame<'_>, Rect)) -> String {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-        let prompt = "A delete is under way. The item in hand goes on; the rest\n\
-                      wait while this shows.\n\
-                      Stop, or Esc: it stops after the item in hand.\n\
-                      Go on: it carries on, unless a stop was asked for already.\n\
-                      Once it has stopped and its summary is closed, F10 quits.";
-        let options = vec!["Stop".to_string(), "Keep going".to_string()];
-        for cols in [40u16, 50, 62, 80] {
-            let mut terminal = Terminal::new(TestBackend::new(cols, 30)).unwrap();
-            terminal
-                .draw(|f| {
-                    let area = f.area();
-                    draw_confirm_dialog(f, area, prompt, &options, 0);
-                })
-                .unwrap();
-            let dump = format!("{:?}", terminal.backend().buffer());
-            assert!(dump.contains("Keep going"), "no buttons at {cols} columns:\n{dump}");
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        terminal.draw(|f| { let area = f.area(); draw(f, area); }).unwrap();
+        format!("{:?}", terminal.backend().buffer())
+    }
+
+    // Whatever wraps above them, and however short the box, the answers stay in it.
+    #[test]
+    fn a_confirm_keeps_its_buttons() {
+        let stop = "A delete is under way. The item in hand goes on; the rest\n\
+                    wait while this shows.\n\
+                    Stop, or Esc: it stops after the item in hand.\n\
+                    Go on: it carries on, unless a stop was asked for already.\n\
+                    Once it has stopped and every notice is closed, F10 quits.";
+        let two = vec!["Stop".to_string(), "Keep going".to_string()];
+        for (cols, rows) in [(40u16, 30u16), (50, 30), (62, 30), (80, 30), (80, 10), (40, 12)] {
+            let dump = screen(cols, rows, |f, a| draw_confirm_dialog(f, a, stop, &two, 0));
+            assert!(dump.contains("Keep going"), "no buttons at {cols}x{rows}:\n{dump}");
         }
-        assert_eq!(wrapped_rows("", 10), 1);
-        assert_eq!(wrapped_rows("abc def", 7), 1);
-        assert_eq!(wrapped_rows("abc def", 6), 2);
-        assert_eq!(wrapped_rows("abcdefghij", 4), 3);
+        // The conflict question: a path indented two spaces, seven answers that wrap.
+        let seven: Vec<String> = ["Skip", "Skip all", "Overwrite", "Overwrite all", "Keep both",
+                                  "Keep both all", "Cancel"].iter().map(|s| s.to_string()).collect();
+        for len in [66usize, 67, 68, 135, 136] {
+            let prompt = format!("Destination exists (1/1):\n  {}\n\nResolution?", "p".repeat(len));
+            for (cols, rows) in [(80u16, 50u16), (56, 50), (40, 50)] {
+                let dump = screen(cols, rows, |f, a| draw_confirm_dialog(f, a, &prompt, &seven, 0));
+                assert!(dump.contains("Cancel"), "no Cancel at {cols}x{rows}, path {len}:\n{dump}");
+            }
+        }
+    }
+
+    // A field's prompt that wraps does not push the field out of its box.
+    #[test]
+    fn a_field_stays_below_a_wrapped_prompt() {
+        let d = LocalDialog {
+            kind: LocalDialogKind::PassphraseFor { volume: std::path::PathBuf::from("/v.stm") },
+            prompt: format!("Mount /v.stm: {}", "the daemon said something long ".repeat(8)),
+            value: String::from("typed").into(),
+            is_password: false,
+            is_error: false,
+        };
+        for (cols, rows) in [(80u16, 24u16), (40, 24), (80, 8)] {
+            let dump = screen(cols, rows, |f, a| draw_local_dialog(f, a, &d));
+            assert!(dump.contains("typed_"), "no field at {cols}x{rows}:\n{dump}");
+        }
     }
 
     // SWISS-8c: F9 snapshot dialog port from v1.

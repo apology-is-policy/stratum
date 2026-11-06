@@ -150,7 +150,7 @@ jobs:
         working-directory: tools/stratum
         env:
           STM_BIN: ${{ github.workspace }}/dist/stratum
-          STM_BUILD_DIR: ${{ github.workspace }}/build
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
         run: cargo test --release
 
       - name: a file-based volume end to end

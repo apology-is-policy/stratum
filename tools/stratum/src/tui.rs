@@ -185,11 +185,10 @@ struct DeleteWorker {
 /// background thread so the UI stays responsive while stratumd
 /// processes a slow write (snapshot create can flush dirty buffers
 /// → seconds-long pause). The main loop polls `rx` for completion;
-/// while in flight, `local_dialog` shows an info_dialog with the
-/// `working_msg`.
+/// while in flight, `local_dialog` shows the info_dialog named by
+/// `notice`.
 struct CtlJob {
-    /// Channel receiving the (exit_status, stderr) tuple from the
-    /// background thread.
+    /// Receives the job's outcome from the background thread.
     rx: std::sync::mpsc::Receiver<CtlJobResult>,
     /// Dialog message shown on success (info_dialog).
     success_msg: String,
@@ -550,8 +549,9 @@ fn run_ui(
             // FIRST so completion swaps in a success/error dialog
             // BEFORE the rest of the loop runs.
             let batch_running = copy_batch.is_some() || delete_batch.is_some();
-            tick_ctl_job(&mut local_dialog, &mut ctl_job, batch_running);
-            if local_dialog.is_none() && !batch_running {
+            let screen_busy = batch_running || editor.is_some();
+            tick_ctl_job(&mut local_dialog, &mut ctl_job, screen_busy);
+            if local_dialog.is_none() && !screen_busy {
                 if let Some(notice) = held_notice.take() {
                     local_dialog = Some(notice);
                 }
@@ -641,7 +641,9 @@ fn run_ui(
             // editor_active=true (via /event "editor open" issued by
             // THIS tui or another client) and we don't yet have a
             // local buffer — fetch /editor/content and initialise.
-            if snapshot.editor_active && editor.is_none() {
+            // Not under a dialog: the editor covers the screen, and the dialog
+            // would take its keys. It opens once the dialog is answered.
+            if snapshot.editor_active && editor.is_none() && local_dialog.is_none() {
                 let readonly = take_view_intent();
                 match client.read_path("/editor/content") {
                     Ok(bytes) => {
@@ -1962,6 +1964,17 @@ fn start_ctl_job(
     success_msg: String,
     working: String,
 ) {
+    start_ctl_job_with(local_dialog, ctl_job, working, || {
+        spawn_ctl_job(ctl_sock, p9_path, body, success_msg)
+    });
+}
+
+fn start_ctl_job_with(
+    local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
+    working: String,
+    spawn: impl FnOnce() -> CtlJob,
+) {
     if let Some(job) = ctl_job.as_mut() {
         match job.result.take() {
             Some(mut waiting) => {
@@ -1979,7 +1992,7 @@ fn start_ctl_job(
         }
         return;
     }
-    let mut job = spawn_ctl_job(ctl_sock, p9_path, body, success_msg);
+    let mut job = spawn();
     job.notice = working.clone();
     *ctl_job = Some(job);
     *local_dialog = Some(info_dialog(&working));
@@ -1987,14 +2000,15 @@ fn start_ctl_job(
 
 /// SWISS-8g: drive an in-progress CtlJob from the main loop: take its result
 /// once it is in, and show it when that loses nothing. It replaces the job's own
-/// "Working" notice, or the snapshot list, or shows on a bare screen once no
-/// batch runs. Over a question, a field being typed in, another notice such as a
-/// batch's summary, or a running batch's progress, whose Esc it would take, it
-/// waits, and the job holds it until then.
+/// "Working" notice, or the snapshot list, or shows when no dialog is up and the
+/// screen is not `busy` (a batch running, whose Esc it would take, or the
+/// editor, whose keys it would take). Over a question, a field being typed in,
+/// or another notice such as a batch's summary, it waits too, and the job holds
+/// it until then.
 fn tick_ctl_job(
     local_dialog: &mut Option<LocalDialog>,
     ctl_job: &mut Option<CtlJob>,
-    batch_running: bool,
+    busy: bool,
 ) {
     let Some(job) = ctl_job.as_mut() else { return };
     if job.result.is_none() {
@@ -2012,7 +2026,7 @@ fn tick_ctl_job(
         return;
     }
     let shows_now = match local_dialog.as_ref() {
-        None => !batch_running,
+        None => !busy,
         Some(d) => {
             matches!(d.kind, LocalDialogKind::SnapshotList { .. })
                 || (matches!(d.kind, LocalDialogKind::Error) && !d.is_error && d.prompt == job.notice)
@@ -2275,15 +2289,15 @@ fn post_batch_cancel(copy: bool) {
 /// starts while it shows; the one in hand runs on, on its own thread.
 fn stop_batch_dialog(copy: bool, quitting: bool) -> LocalDialog {
     let what = if copy { "A copy" } else { "A delete" };
-    let then = if quitting { "\nOnce it has stopped and its summary is closed, F10 quits." } else { "" };
+    let then = if quitting { "\nOnce it has stopped and every notice is closed, F10 quits." } else { "" };
     LocalDialog {
         kind: LocalDialogKind::Confirm {
             options: vec!["Stop".to_string(), "Go on".to_string()],
             selected: if quitting { 0 } else { 1 },
             on_pick: ConfirmAction::StopBatch { copy },
         },
-        // The confirm box grows to the prompt's wrapped height, so a narrow
-        // terminal costs rows, not the buttons.
+        // The confirm box wraps a long line and keeps the buttons' rows; a box
+        // too short for everything clips this text, never the buttons.
         prompt: format!(
             "{what} is under way. The item in hand goes on; the rest\n\
              wait while this shows.\n\
@@ -4914,23 +4928,41 @@ mod tests {
         assert!(shows(&dialog, "Snapshot created."));
     }
 
-    // A batch's summary may be the only word of the items that failed.
+    // A batch's summary may be the only word of the items that failed, or carry a note.
     #[test]
     fn a_finished_job_waits_behind_another_notice() {
-        let summary = "Copy: 1 copied, 2 failed";
-        let mut dialog = Some(error_dialog(summary));
         let mut job = finished_job("Snapshot created.");
-        tick_ctl_job(&mut dialog, &mut job, false);
-        assert!(shows(&dialog, summary));
-        assert!(job.as_ref().is_some_and(|j| j.result.is_some()));
-        // Nor does a notice that only reads like the job's own, but is an error.
-        let mut dialog = Some(error_dialog("Creating snapshot..."));
-        tick_ctl_job(&mut dialog, &mut job, false);
-        assert!(shows(&dialog, "Creating snapshot..."));
-        dialog = None;
+        for (summary, other) in [
+            ("Copy: 1 copied, 2 failed", error_dialog("Copy: 1 copied, 2 failed")),
+            ("Copy: 3 copied\n\nskipped a link", info_dialog("Copy: 3 copied\n\nskipped a link")),
+            // Its own words, but an error: not the notice the job put up.
+            ("Creating snapshot...", error_dialog("Creating snapshot...")),
+        ] {
+            let mut dialog = Some(other);
+            tick_ctl_job(&mut dialog, &mut job, false);
+            assert!(shows(&dialog, summary));
+            assert!(job.as_ref().is_some_and(|j| j.result.is_some()));
+        }
+        let mut dialog = None;
         tick_ctl_job(&mut dialog, &mut job, false);
         assert!(job.is_none());
         assert!(shows(&dialog, "Snapshot created."));
+    }
+
+    // The notice a started job puts up is the one its result replaces.
+    #[test]
+    fn a_started_job_s_result_replaces_its_notice() {
+        let mut dialog = None;
+        let mut job = None;
+        start_ctl_job_with(&mut dialog, &mut job, "Deleting snapshot \"a\"...".into(), || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(CtlJobResult::Ok).unwrap();
+            CtlJob { rx, success_msg: "Snapshot deleted: a".into(), _join: None, notice: String::new(), result: None }
+        });
+        assert!(shows(&dialog, "Deleting snapshot \"a\"..."));
+        tick_ctl_job(&mut dialog, &mut job, false);
+        assert!(job.is_none());
+        assert!(shows(&dialog, "Snapshot deleted: a"));
     }
 
     // Shown over a running batch's progress, it would take the Esc that cancels the batch.
@@ -4964,9 +4996,8 @@ mod tests {
     // A second job would drop the first one's result: it is not started.
     #[test]
     fn no_second_job_starts_while_one_is_out() {
-        let sock = PathBuf::from("/nonexistent/ctl.sock");
         let start = |dialog: &mut Option<LocalDialog>, job: &mut Option<CtlJob>| {
-            start_ctl_job(dialog, job, sock.clone(), "/x".into(), Vec::new(), "second done".into(), "second...".into());
+            start_ctl_job_with(dialog, job, "second...".into(), || panic!("a second job was spawned"));
         };
         // Still running: the user is told, and the first job is kept.
         let (_tx, rx) = std::sync::mpsc::channel();
