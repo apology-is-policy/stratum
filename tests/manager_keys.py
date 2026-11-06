@@ -129,9 +129,14 @@ class Screen:
 
 
 class Term:
-    def __init__(self, argv):
+    def __init__(self, argv, output_to_pipe=False):
         self.screen = Screen()
         self.rc = None
+        # The manager's stdout and stderr on a pipe the test can close, with the terminal
+        # left as it is: its output can then go while the terminal stays.
+        self.out = None
+        if output_to_pipe:
+            r, w = os.pipe()
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             # What a login terminal gives a program. A harness started with `&` or nohup
@@ -141,9 +146,17 @@ class Term:
             os.environ['TERM'] = 'xterm-256color'
             # A failed exec must not leave a second harness running the legs.
             try:
+                if output_to_pipe:
+                    os.dup2(w, 1)
+                    os.dup2(w, 2)
+                    os.close(r)
+                    os.close(w)
                 os.execv(argv[0], argv)
             finally:
                 os._exit(127)
+        if output_to_pipe:
+            os.close(w)
+            self.out = r
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS, 0, 0))
 
     def pump(self, seconds):
@@ -152,8 +165,15 @@ class Term:
             left = end - time.monotonic()
             if left <= 0:
                 return
-            ready, _, _ = select.select([self.fd], [], [], min(left, 0.1))
-            if ready:
+            fds = [self.fd] + ([self.out] if self.out is not None else [])
+            ready, _, _ = select.select(fds, [], [], min(left, 0.1))
+            if self.out is not None and self.out in ready:
+                data = os.read(self.out, 65536)
+                if data:
+                    self.screen.feed(data)
+                else:
+                    self.cut_output()
+            if self.fd in ready:
                 try:
                     data = os.read(self.fd, 65536)
                 except OSError:
@@ -161,6 +181,12 @@ class Term:
                 if not data:
                     return
                 self.screen.feed(data)
+
+    def cut_output(self):
+        """From here on, each write to the manager's stdout or stderr fails with EPIPE."""
+        if self.out is not None:
+            os.close(self.out)
+            self.out = None
 
     def send(self, keys):
         os.write(self.fd, keys)
@@ -415,6 +441,98 @@ def death_legs(stratum, vol, host, root):
         finally:
             if not closed:
                 term.kill()
+
+
+def output_gone_leg(stratum, vol, host, root):
+    """Its output going, as it does when its terminal closes, but with no watcher to race:
+    the terminal stays, so only the UI thread can see it. Whatever the manager's last
+    write fails on, it must not panic past the code that puts the session away."""
+    how = 'its output going'
+    env_file = f'{root}/env-output-gone'
+    term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file],
+                output_to_pipe=True)
+    try:
+        term.expect(r'Passphrase for')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'from_vol\.txt', timeout=60)
+        session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
+        before = daemons_of(session)
+        if len(before) < 3:
+            raise Failure(f'the search finds {before} before {how}: it proves nothing')
+        term.cut_output()
+        # A key that moves the cursor makes the manager draw, into the closed pipe.
+        term.send(DOWN)
+        ended = term.exited(30)
+        # 101 is a Rust panic's exit status.
+        record(ended and term.rc not in (None, 101), f'{how}: the manager ended with rc {term.rc}, not a panic',
+               f'{how}: the manager ended={ended} rc={term.rc}')
+        limit = time.monotonic() + 30
+        left = daemons_of(session)
+        while left and time.monotonic() < limit:
+            time.sleep(0.2)
+            left = daemons_of(session)
+        record(not left, f'{how}: the daemons stopped and the volume locked',
+               f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
+        record(not os.path.exists(session), f'{how}: the session directory is gone',
+               f'{how}: the session directory stayed')
+        for pid in left:
+            os.kill(int(pid), signal.SIGTERM)
+        limit = time.monotonic() + 30
+        while daemons_of(session) and time.monotonic() < limit:
+            time.sleep(0.2)
+        vol.serve()
+        vol.stop()
+        print(f'ok: after {how} the volume mounts and unmounts cleanly', flush=True)
+    finally:
+        term.kill()
+
+
+def stuck_daemon_leg(stratum, vol, host, root):
+    """A daemon that does not stop on SIGTERM is killed after 30 s. The manager says so on its
+    stderr, and with its output gone that must not panic it before it has put the rest away."""
+    how = 'a daemon stuck, the output gone'
+    env_file = f'{root}/env-stuck'
+    term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file],
+                output_to_pipe=True)
+    stuck = None
+    try:
+        term.expect(r'Passphrase for')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'from_vol\.txt', timeout=60)
+        session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
+        before = daemons_of(session)
+        host_fs = [p for p in before
+                   if ' host-fs ' in subprocess.run(['ps', '-o', 'command=', '-p', p],
+                                                    capture_output=True, text=True).stdout]
+        if len(before) < 3 or len(host_fs) != 1:
+            raise Failure(f'the search finds {before}, host-fs {host_fs}, before {how}: it proves nothing')
+        # host-fs is stopped last, so slate and stratumd have stopped before the message.
+        stuck = int(host_fs[0])
+        os.kill(stuck, signal.SIGSTOP)
+        term.cut_output()
+        os.kill(term.pid, signal.SIGTERM)
+        ended = term.exited(100)
+        record(ended and term.rc == 0, f'{how}: the manager killed it and ended cleanly',
+               f'{how}: the manager ended={ended} rc={term.rc}')
+        left = daemons_of(session)
+        record(not left, f'{how}: no daemon is left', f'{how}: daemons {left} still run, with no manager')
+        record(not os.path.exists(session), f'{how}: the session directory is gone',
+               f'{how}: the session directory stayed')
+        for pid in left:
+            os.kill(int(pid), signal.SIGKILL)
+        limit = time.monotonic() + 30
+        while daemons_of(session) and time.monotonic() < limit:
+            time.sleep(0.2)
+        vol.serve()
+        vol.stop()
+        print(f'ok: after {how} the volume mounts and unmounts cleanly', flush=True)
+    finally:
+        if stuck is not None:
+            try:
+                os.kill(stuck, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        term.kill()
 
 
 def save_in_editor(term, vol, sock, path, want, what):
@@ -1744,6 +1862,8 @@ def run(stratum, root):
                       (unreadable_name_legs, (stratum, root)),
                       (delete_batch_legs, (stratum, root)),
                       (death_legs, (stratum, vol, host, root)),
+                      (output_gone_leg, (stratum, vol, host, root)),
+                      (stuck_daemon_leg, (stratum, vol, host, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
                       (wrong_passphrase_leg, (stratum, vol, host)),
                       (wizard_legs, (stratum, vol, root)),

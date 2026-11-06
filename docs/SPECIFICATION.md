@@ -575,7 +575,7 @@ stratum fs -s SOCKET put ./dir /dir                    script it
 **What works, from the code:** recursive copy (`F5`) with progress and conflict handling, delete (`F8`), mkdir (`F7`), a modal editor (`F3`, `F4`), the create-volume wizard
 (`Shift+F7`), snapshot list, create, delete and rollback (`F9`, dataset 1 only), a pool map and snapshot graph (`F2`), and pressing Enter on a `.stm` file to mount it in the other pane.
 
-**How the daemons stop.** The manager's daemons hold a lifeline to it and stop when it does, however it ends. On a stop, a daemon ends the reading side of every connection, finishes the request in hand, gives a reply blocked on a client that is not reading 2 s, then shuts that connection's writing side, and unmounts. So no client, talking or silent, can keep a volume mounted. One image has one daemon, enforced with `flock`, and `mkfs` refuses a file holding data, a key in the way, and a volume in use.
+**How the daemons stop.** The manager's daemons hold a lifeline to it and stop when it does, however it ends. Its session directory, which holds their sockets and logs, goes when it ends, a panic included; only a kill it cannot catch leaves it. On a stop, a daemon ends the reading side of every connection, finishes the request in hand, gives a reply blocked on a client that is not reading 2 s, then shuts that connection's writing side, and unmounts. So no client, talking or silent, can keep a volume mounted. One image has one daemon, enforced with `flock`, and `mkfs` refuses a file holding data, a key in the way, and a volume in use.
 
 **How a copy behaves.** `F5` copies the selection, or the entry under the cursor, into the other panel's directory, as one batch with progress.
 

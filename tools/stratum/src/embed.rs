@@ -79,7 +79,8 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // spawning children.
     let prev_mask = block_term_signals();
     crate::lifeline::hold()?;
-    let session_dir = make_session_dir()?;
+    let session = SessionDir(make_session_dir()?);
+    let session_dir = session.0.clone();
     let slate_sock = session_dir.join("slate.sock");
     let host_fs_sock = session_dir.join("host-fs.sock");
     let stratumd_sock = session_dir.join("stratumd.sock");
@@ -126,7 +127,6 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         .with_context(|| format!("spawn host-fs via {}", me.display()))?;
     if let Err(e) = wait_for_sock(&host_fs_sock, Duration::from_secs(5)) {
         let _ = host_fs_child.kill();
-        let _ = cleanup_session_dir(&session_dir);
         return Err(e.context(format!(
             "host-fs socket never appeared at {}",
             host_fs_sock.display()
@@ -156,7 +156,6 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             Ok(b) => b,
             Err(e) => {
                 let _ = host_fs_child.kill();
-                let _ = cleanup_session_dir(&session_dir);
                 return Err(e.context(format!(
                     "inspect keyfile {}", keyfile.display()
                 )));
@@ -171,7 +170,6 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
                 Ok(p) => Some(p),
                 Err(e) => {
                     let _ = host_fs_child.kill();
-                    let _ = cleanup_session_dir(&session_dir);
                     return Err(e.context("read passphrase"));
                 }
             }
@@ -250,7 +248,6 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
                 if let Err(e) = wr {
                     let _ = child.kill();
                     let _ = host_fs_child.kill();
-                    let _ = cleanup_session_dir(&session_dir);
                     return Err(anyhow!(e).context("pipe passphrase to stratumd"));
                 }
             }
@@ -289,7 +286,6 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
                 let _ = c.kill();
             }
             let _ = host_fs_child.kill();
-            let _ = cleanup_session_dir(&session_dir);
             // Friendly message for the wrong-passphrase case.
             let hint = if log_tail
                 .lines()
@@ -329,7 +325,6 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
                 let _ = c.kill();
             }
             let _ = host_fs_child.kill();
-            let _ = cleanup_session_dir(&session_dir);
             return Err(anyhow!(e).context("spawn slate"));
         }
     };
@@ -339,7 +334,6 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             let _ = c.kill();
         }
         let _ = host_fs_child.kill();
-        let _ = cleanup_session_dir(&session_dir);
         return Err(e.context(format!(
             "slate socket never appeared at {}",
             slate_sock.display()
@@ -442,7 +436,6 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         crate::spawn::stop_child(&mut c, "stratumd");
     }
     crate::spawn::stop_child(&mut host_fs_child, "host-fs");
-    let _ = cleanup_session_dir(&session_dir);
 
     result
 }
@@ -599,14 +592,14 @@ fn make_session_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn cleanup_session_dir(dir: &Path) -> Result<()> {
-    // Best-effort: remove sockets + dir. Sockets are auto-cleaned by
-    // the daemons on graceful shutdown, but if they crashed we want to
-    // remove them too.
-    if dir.exists() {
-        let _ = fs::remove_dir_all(dir);
+/// Removed however run() ends, a panic included. The daemons remove their own sockets
+/// as they stop; the logs, and whatever a daemon that crashed left, go with it.
+struct SessionDir(PathBuf);
+
+impl Drop for SessionDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
-    Ok(())
 }
 
 fn wait_for_sock(path: &Path, timeout: Duration) -> Result<()> {

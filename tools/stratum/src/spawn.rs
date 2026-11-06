@@ -110,7 +110,9 @@ pub fn stop_child(child: &mut Child, name: &str) {
             Err(_) => break,
         }
     }
-    eprintln!("stratum: {name} didn't exit on SIGTERM; SIGKILL");
+    use std::io::Write as _;
+    // Not eprintln!: with the terminal gone it would panic, and leave the rest unstopped.
+    let _ = writeln!(std::io::stderr(), "stratum: {name} didn't exit on SIGTERM; SIGKILL");
     let _ = child.kill();
     let _ = child.wait();
 }

@@ -485,8 +485,11 @@ fn run_ui(
         put_terminal_back();
         return Err(anyhow::Error::new(e).context("enter alternate screen"));
     }
+    // ratatui's Drop answers a cursor it cannot show with eprintln!, and once the terminal
+    // has gone that print fails and panics, past the code that stops the daemons. So the
+    // terminal is dropped only below, once its cursor shows.
     let mut terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
-        Ok(t) => t,
+        Ok(t) => std::mem::ManuallyDrop::new(t),
         Err(e) => {
             put_terminal_back();
             return Err(anyhow::Error::new(e).context("create terminal"));
@@ -857,7 +860,9 @@ fn run_ui(
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
-    terminal.show_cursor().ok();
+    if terminal.show_cursor().is_ok() {
+        drop(std::mem::ManuallyDrop::into_inner(terminal));
+    }
     result
 }
 
