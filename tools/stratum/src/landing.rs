@@ -27,7 +27,7 @@ pub fn run() -> Result<()> {
     println!("              |        Encrypted COW filesystem           |");
     println!("              +-------------------------------------------+");
     println!("              |                                           |");
-    println!("              ║  [O] Open volume...                       ║");
+    println!("              |  [O] Open volume...                       |");
     println!("              |  [N] New volume...                        |");
     println!("              |  [H] Browse host filesystem               |");
     println!("              |  [Q] Quit                                 |");
