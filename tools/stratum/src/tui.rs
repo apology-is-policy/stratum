@@ -1613,6 +1613,7 @@ fn handle_dialog_key(
     snap: &UiState,
     key: crossterm::event::KeyEvent,
 ) -> Result<Action> {
+    let key = ctrl_h_is_backspace(key);
     // SWISS-4c: MkVol dispatch BEFORE the simple-input branch — it
     // owns its own keyboard model.
     if matches!(
@@ -2382,6 +2383,16 @@ fn quit_key_question(batch: Option<bool>, ctl_job: &Option<CtlJob>) -> Option<Lo
     })
 }
 
+/// Ctrl-H is the Backspace of a terminal that sends ^H for it, and it erases at the
+/// terminal's passphrase prompt: so here too.
+fn ctrl_h_is_backspace(key: crossterm::event::KeyEvent) -> crossterm::event::KeyEvent {
+    if key.code == KeyCode::Char('h') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        crossterm::event::KeyEvent::new(KeyCode::Backspace, key.modifiers.difference(KeyModifiers::CONTROL))
+    } else {
+        key
+    }
+}
+
 /// The character a key types into a field: printable, pressed without Ctrl or
 /// Alt, so a quit key in a field neither quits nor types its letter.
 fn typed_char(key: &crossterm::event::KeyEvent) -> Option<char> {
@@ -2543,7 +2554,8 @@ fn handle_mkvol_key(
         _ => {}
     }
     if let Some(c) = typed_char(&key) {
-        let fits = |s: &String| s.len() + c.len_utf8() <= crate::passphrase::PASSPHRASE_MAX;
+        // Past the limit is refused when submitted, not cut short where nobody sees it.
+        let fits = |s: &String| s.len() + c.len_utf8() <= 4 * crate::passphrase::PASSPHRASE_MAX;
         match mk.field {
             MkVolField::Name => {
                 if mk.name.len() < 256 {
@@ -2588,14 +2600,6 @@ fn submit_mkvol(
         return Ok(Action::Ignore);
     };
 
-    let sp = match spawn {
-        Some(s) => s,
-        None => {
-            *local_dialog = Some(error_dialog("Spawn helper unavailable."));
-            return Ok(Action::Refresh);
-        }
-    };
-
     // Validation.
     let name = mk.name.trim();
     if name.is_empty() {
@@ -2634,21 +2638,31 @@ fn submit_mkvol(
     let passphrase_error = if !mk.encrypt {
         None
     } else if mk.passphrase.is_empty() {
-        Some("Enter a passphrase, or turn off \"Use passphrase\".")
+        Some("Enter a passphrase, or turn off \"Use passphrase\".".to_string())
+    } else if mk.passphrase.len() > crate::passphrase::PASSPHRASE_MAX {
+        Some(format!("A passphrase is at most {} bytes.", crate::passphrase::PASSPHRASE_MAX))
     } else if mk.passphrase != mk.confirm {
-        Some("The two passphrases differ.")
+        Some("The two passphrases differ.".to_string())
     } else {
         None
     };
     if let Some(err) = passphrase_error {
         let mut new_mk = mk.clone();
-        new_mk.error = Some(err.into());
+        new_mk.error = Some(err);
         *local_dialog = Some(LocalDialog {
             kind: LocalDialogKind::MkVol(new_mk),
             ..dialog
         });
         return Ok(Action::Refresh);
     }
+
+    let sp = match spawn {
+        Some(s) => s,
+        None => {
+            *local_dialog = Some(error_dialog("Spawn helper unavailable."));
+            return Ok(Action::Refresh);
+        }
+    };
 
     // Resolve the on-disk directory the volume should land in.
     let panel_idx = mk.panel_idx;
@@ -2949,6 +2963,20 @@ fn submit_dialog(
             // dialog's value to it. The field wipes itself when it goes (the
             // duplicate write buffer in spawn_stratumd_with_* is wiped inside
             // that helper).
+            if dialog.value.len() > crate::passphrase::PASSPHRASE_MAX {
+                *local_dialog = Some(LocalDialog {
+                    kind: LocalDialogKind::PassphraseFor { volume: volume.clone() },
+                    prompt: format!(
+                        "Mount {}: a passphrase is at most {} bytes",
+                        volume.file_name().unwrap_or_default().to_string_lossy(),
+                        crate::passphrase::PASSPHRASE_MAX
+                    ),
+                    value: Default::default(),
+                    is_password: true,
+                    is_error: false,
+                });
+                return Ok(Action::Refresh);
+            }
             let sp = match spawn {
                 Some(s) => s,
                 None => {
@@ -4979,12 +5007,15 @@ mod tests {
 
     // A passphrase made at one entry point must open at the others: the terminal's prompt
     // (the landing screen's new volume, and a sealed volume opened with --vol), the
-    // wizard, and the passphrase dialog.
+    // wizard, and the passphrase dialog. Each row is a key as the terminal sends it and
+    // as crossterm 0.28's parser (event/sys/unix/parse.rs) decodes those bytes.
     #[test]
     fn the_same_keys_make_the_same_passphrase_everywhere() {
         use crossterm::event::{KeyCode as K, KeyEvent, KeyModifiers as M};
         let ch = |c: char| KeyEvent::new(K::Char(c), M::NONE);
         let keys: Vec<(&[u8], KeyEvent)> = vec![
+            (b"q", ch('q')),
+            (b"\x1b\x15", KeyEvent::new(K::Char('u'), M::CONTROL | M::ALT)),
             (b"w", ch('w')),
             (b"\x15", KeyEvent::new(K::Char('u'), M::CONTROL)),
             (b"c", ch('c')),
@@ -4997,6 +5028,12 @@ mod tests {
             (b"\x1bx", KeyEvent::new(K::Char('x'), M::ALT)),
             (b"\x17", KeyEvent::new(K::Char('w'), M::CONTROL)),
             (b"\x1a", KeyEvent::new(K::Char('z'), M::CONTROL)),
+            (b"x", ch('x')),
+            (b"\x08", KeyEvent::new(K::Char('h'), M::CONTROL)),
+            (b"y", ch('y')),
+            (b"\x1b\x08", KeyEvent::new(K::Char('h'), M::CONTROL | M::ALT)),
+            (b"z", ch('z')),
+            (b"\x1b\x7f", KeyEvent::new(K::Backspace, M::ALT)),
         ];
         let mut typed: Vec<u8> = keys.iter().flat_map(|(b, _)| b.iter().copied()).collect();
         typed.push(b'\n');
@@ -5037,16 +5074,18 @@ mod tests {
         assert_eq!(mk.passphrase.as_bytes(), prompt.as_bytes(), "the wizard");
     }
 
-    // The wizard takes no more than --passphrase-stdin does, counting a character's bytes.
+    // Past the limit a passphrase is refused where it is submitted, and says so: never cut
+    // short to a prefix that both of the wizard's fields would agree on.
     #[test]
-    fn the_wizard_passphrase_stops_at_the_limit_in_bytes() {
+    fn a_passphrase_past_the_limit_is_refused_when_submitted() {
         use crossterm::event::{KeyCode as K, KeyEvent, KeyModifiers as M};
         let snap = blank_snap();
         let mut job = None;
+        let long = crate::passphrase::PASSPHRASE_MAX + 1;
         let mut mk = MkVolState::new(0);
+        mk.name = "v.stm".into();
+        mk.size = "64M".into();
         mk.encrypt = true;
-        mk.field = MkVolField::Passphrase;
-        mk.passphrase = "a".repeat(crate::passphrase::PASSPHRASE_MAX - 1);
         let mut dialog = Some(LocalDialog {
             kind: LocalDialogKind::MkVol(mk),
             prompt: String::new(),
@@ -5054,14 +5093,36 @@ mod tests {
             is_password: false,
             is_error: false,
         });
-        for c in ['\u{e9}', 'b', 'c'] {
-            handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Char(c), M::NONE)).expect("a key");
+        for field in [MkVolField::Passphrase, MkVolField::Confirm] {
+            if let Some(LocalDialog { kind: LocalDialogKind::MkVol(mk), .. }) = dialog.as_mut() {
+                mk.field = field;
+            }
+            for _ in 0..long {
+                handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Char('a'), M::NONE)).expect("a key");
+            }
         }
-        let Some(LocalDialog { kind: LocalDialogKind::MkVol(mk), .. }) = dialog.as_ref() else {
+        let Some(LocalDialog { kind: LocalDialogKind::MkVol(mk), .. }) = dialog.as_mut() else {
             panic!("the wizard closed");
         };
-        assert_eq!(mk.passphrase.len(), crate::passphrase::PASSPHRASE_MAX);
-        assert!(mk.passphrase.ends_with('b'), "a two-byte character past the limit went in");
+        assert_eq!(mk.passphrase.len(), long, "keys past the limit were dropped");
+        mk.field = MkVolField::Ok;
+        handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Enter, M::NONE)).expect("Enter");
+        let error = match dialog.as_ref() {
+            Some(LocalDialog { kind: LocalDialogKind::MkVol(mk), .. }) => mk.error.clone(),
+            other => panic!("the wizard went on to {:?}", other.map(|d| &d.prompt)),
+        };
+        assert!(error.as_deref().is_some_and(|e| e.contains("at most")), "the wizard said {error:?}");
+
+        let mut dialog = Some(LocalDialog {
+            kind: LocalDialogKind::PassphraseFor { volume: std::path::PathBuf::from("/v.stm") },
+            prompt: String::new(),
+            value: "a".repeat(long).into(),
+            is_password: true,
+            is_error: false,
+        });
+        handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Enter, M::NONE)).expect("Enter");
+        assert!(dialog.as_ref().is_some_and(|d| matches!(d.kind, LocalDialogKind::PassphraseFor { .. })
+            && d.prompt.contains("at most")), "the dialog said {:?}", dialog.as_ref().map(|d| &d.prompt));
     }
 
     #[test]

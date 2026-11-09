@@ -118,13 +118,30 @@ impl Drop for Zeroizing {
 /// Reads from /dev/tty directly so this works even when stdin/stdout
 /// have been redirected (e.g., when the TUI parent's stdout is a
 /// pipe). On error (no controlling tty) returns Err.
-pub fn prompt_passphrase(label: &str) -> Result<Zeroizing> {
+pub fn prompt_passphrase(label: &str) -> Result<(Zeroizing, EchoHeld)> {
     let tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")
         .context("open /dev/tty (no controlling terminal?)")?;
-    prompt_on(&tty, label)
+    prompt_on(tty, label)
+}
+
+/// Echo held off after a passphrase was read, until this goes: a key typed while the key
+/// is derived, the passphrase again say, is not shown. Then the terminal is given back as
+/// it was, and what was typed meanwhile is dropped.
+pub struct EchoHeld {
+    tty: File,
+    orig: libc::termios,
+}
+
+impl Drop for EchoHeld {
+    fn drop(&mut self) {
+        let fd = self.tty.as_raw_fd();
+        while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } != 0
+            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+        {}
+    }
 }
 
 /// The most a passphrase may be: what `--passphrase-stdin` takes (STM_CLI_PASSPHRASE_MAX).
@@ -133,7 +150,7 @@ pub const PASSPHRASE_MAX: usize = 255;
 /// The terminal set for a passphrase: no echo, no canonical mode and no signal keys, so
 /// that read_line, not the line discipline, decides what every key means. Set before
 /// the label, and given back on every way out once set.
-fn prompt_on(tty: &File, label: &str) -> Result<Zeroizing> {
+fn prompt_on(tty: File, label: &str) -> Result<(Zeroizing, EchoHeld)> {
     let fd = tty.as_raw_fd();
     let mut orig: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
@@ -153,23 +170,29 @@ fn prompt_on(tty: &File, label: &str) -> Result<Zeroizing> {
     };
 
     // To /dev/tty, not stdout, which may be a pipe.
-    let mut writer = tty;
+    let mut writer = &tty;
     let line = match writer.write_all(label.as_bytes()) {
         Ok(()) => {
-            let mut reader = tty;
+            let mut reader = &tty;
             read_line(&mut reader)
         }
         Err(e) => Err(anyhow!(e).context("write prompt")),
     };
 
-    // TCSAFLUSH: what was typed past the end is not left for the shell or the screen.
-    while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &orig) } != 0
+    // Cooked again, so the signal keys work while the key is derived, but with echo held
+    // off until the caller lets go. TCSAFLUSH: what was typed past the end is not left
+    // for the shell or the screen.
+    let mut after = orig;
+    if line.is_ok() {
+        after.c_lflag &= !(libc::ECHO | libc::ECHONL);
+    }
+    while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &after) } != 0
         && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
     {}
     // So the next line is not glued to the hidden input.
     let _ = writer.write_all(b"\n");
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &held, std::ptr::null_mut()) };
-    line
+    line.map(|line| (line, EchoHeld { tty, orig }))
 }
 
 /// Sets `quiet` and holds job control off until the terminal is given back, returning
@@ -212,12 +235,16 @@ fn hold_terminal(fd: std::os::unix::io::RawFd, quiet: &libc::termios) -> Result<
 /// passphrase at either: Enter (CR or LF) submits; Backspace or Delete erases a
 /// character; Ctrl-U erases them all; Ctrl-D, Ctrl-C and Ctrl-\ give up; Esc and the
 /// sequence it starts (an arrow key, Alt with a key) and every other control key type
-/// nothing. End-of-file, which only a hangup gives, submits nothing.
+/// nothing. Past the limit nothing more is kept, and Enter refuses the line: refused at
+/// once, the rest of it would be read, and shown, by whatever reads next. End-of-file,
+/// which only a hangup gives, submits nothing.
 pub(crate) fn read_line(src: &mut impl Read) -> Result<Zeroizing> {
     // Never grows, as the refusal comes at the limit, and every way out of here wipes it.
     let mut buf = Zeroizing::new(Vec::with_capacity(PASSPHRASE_MAX + 1));
     let mut byte = [0u8; 1];
     let mut esc = Esc::None;
+    // Characters typed past the limit, and whether the bytes now coming finish one.
+    let (mut past, mut finishing_past) = (0usize, false);
     let ended = loop {
         let b = match src.read(&mut byte) {
             Ok(0) => break Err(anyhow!("the terminal closed at the passphrase prompt")),
@@ -230,19 +257,29 @@ pub(crate) fn read_line(src: &mut impl Read) -> Result<Zeroizing> {
         if !typed {
             continue;
         }
+        let continuation = (0x80..=0xbf).contains(&b);
+        if !continuation {
+            finishing_past = false;
+        }
         match b {
+            b'\n' | b'\r' if past > 0 => break Err(anyhow!("passphrase exceeds {PASSPHRASE_MAX} bytes")),
             b'\n' | b'\r' => break Ok(()),
+            0x7f | 0x08 if past > 0 => past -= 1,
             0x7f | 0x08 => erase_char(&mut buf.0),
-            0x15 => buf.0.clear(),
+            0x15 => {
+                buf.0.clear();
+                past = 0;
+            }
             0x03 | 0x04 | 0x1c => break Err(anyhow!("the passphrase prompt was given up")),
             0x1b => esc = Esc::Start,
             0x00..=0x1f => {}
-            b => {
-                if buf.len() >= PASSPHRASE_MAX {
-                    break Err(anyhow!("passphrase exceeds {PASSPHRASE_MAX} bytes"));
-                }
-                buf.0.push(b);
+            _ if continuation && finishing_past => {}
+            // A character goes in whole or not at all: never a lead byte without the rest.
+            b if past > 0 || buf.len() + utf8_len(b) > PASSPHRASE_MAX => {
+                past += 1;
+                finishing_past = !continuation;
             }
+            b => buf.0.push(b),
         }
     };
     unsafe { std::ptr::write_volatile(&mut byte[0], 0) };
@@ -295,6 +332,16 @@ impl Esc {
                 _ => Esc::None.step(b),
             },
         }
+    }
+}
+
+/// The bytes of the UTF-8 character `lead` starts; 1 for any other byte.
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
     }
 }
 
@@ -379,6 +426,29 @@ mod prompt_tests {
         assert!(matches!(line(&long), Err(e) if e.to_string().contains("exceeds")));
     }
 
+    #[test]
+    fn past_the_limit_the_line_is_read_to_enter_then_refused() {
+        let over = vec![b'a'; PASSPHRASE_MAX + 45];
+        // Not refused at the limit: the rest is read, so the hangup is what ends it.
+        assert!(matches!(line(&over), Err(e) if e.to_string().contains("closed")), "refused before the end");
+        // What was erased past the limit goes first.
+        let mut keys = over.clone();
+        keys.extend_from_slice(&[0x7f; 45]);
+        keys.push(b'\n');
+        assert_eq!(line(&keys).expect("back at the limit").len(), PASSPHRASE_MAX);
+        // Ctrl-U starts again.
+        let mut keys = over.clone();
+        keys.extend_from_slice(b"\x15ok\n");
+        assert_eq!(line(&keys).expect("after Ctrl-U"), b"ok");
+        // A character that does not fit whole is not kept in part.
+        let mut keys = vec![b'a'; PASSPHRASE_MAX - 1];
+        keys.extend_from_slice("\u{e9}\n".as_bytes());
+        assert!(matches!(line(&keys), Err(e) if e.to_string().contains("exceeds")), "a lead byte alone was kept");
+        let mut keys = vec![b'a'; PASSPHRASE_MAX - 1];
+        keys.extend_from_slice("\u{e9}\x7f\n".as_bytes());
+        assert_eq!(line(&keys).expect("the character erased").len(), PASSPHRASE_MAX - 1);
+    }
+
     /// A pty whose fds no spawned child inherits, and whose output a thread reads: on
     /// macOS a TCSAFLUSH waits for the output to be read.
     struct Pty {
@@ -429,11 +499,11 @@ mod prompt_tests {
         }
 
         /// Starts the prompt and waits for its mode.
-        fn prompt(&mut self) -> std::sync::mpsc::Receiver<Result<Vec<u8>>> {
+        fn prompt(&mut self) -> std::sync::mpsc::Receiver<Result<(Vec<u8>, EchoHeld)>> {
             let slave = self.slave.take().expect("one prompt per pty");
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(prompt_on(&slave, "P: ").map(|z| z.as_bytes().to_vec()));
+                let _ = tx.send(prompt_on(slave, "P: ").map(|(z, held)| (z.as_bytes().to_vec(), held)));
             });
             let end = Instant::now() + Duration::from_secs(5);
             while self.lflag() & libc::ICANON != 0 {
@@ -477,7 +547,7 @@ mod prompt_tests {
         pty.master.write_all(b"half\x03").expect("type");
         let got = rx.recv_timeout(Duration::from_secs(5)).expect("Ctrl-C never reached the prompt");
         assert!(matches!(&got, Err(e) if e.to_string().contains("given up")), "Ctrl-C gave {:?}",
-                got.map(|v| v.len()));
+                got.map(|(v, _)| v.len()));
         // The settings it changed; the kernel's own state bits (PENDIN on macOS) may differ.
         let set = libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN;
         assert_eq!(pty.lflag() & set, before & set, "the terminal was not given back as it was");
@@ -493,7 +563,7 @@ mod prompt_tests {
         let rx = pty.prompt();
         pty.master.write_all(b"right\n").expect("type");
         let got = rx.recv_timeout(Duration::from_secs(5)).expect("the prompt never returned");
-        assert_eq!(got.expect("a passphrase"), b"right", "the type-ahead became part of it");
+        assert_eq!(got.expect("a passphrase").0, b"right", "the type-ahead became part of it");
     }
 
     /// What came after Enter is not left for the next reader of the terminal.
@@ -503,9 +573,49 @@ mod prompt_tests {
         let rx = pty.prompt();
         pty.master.write_all(b"right\ntail\n").expect("type");
         let got = rx.recv_timeout(Duration::from_secs(5)).expect("the prompt never returned");
-        assert_eq!(got.expect("a passphrase"), b"right");
+        let (pass, held) = got.expect("a passphrase");
+        assert_eq!(pass, b"right");
         let left = pty.left_unread();
         assert!(left.is_empty(), "{:?} was left for the next reader", String::from_utf8_lossy(&left));
+        drop(held);
+    }
+
+    /// After Enter, while the key is derived: cooked, so the signal keys work, but nothing
+    /// typed is shown, and it is dropped when the terminal is let go, given back whole.
+    #[test]
+    fn echo_stays_off_until_the_terminal_is_let_go() {
+        let mut pty = Pty::new();
+        let before = pty.lflag();
+        let rx = pty.prompt();
+        pty.master.write_all(b"right\n").expect("type");
+        let got = rx.recv_timeout(Duration::from_secs(5)).expect("the prompt never returned");
+        let (_, held) = got.expect("a passphrase");
+        let now = pty.lflag();
+        assert_eq!(now & libc::ECHO, 0, "keys typed while the key is derived would be shown");
+        assert_ne!(now & libc::ICANON, 0, "not cooked again");
+        assert_ne!(now & libc::ISIG, 0, "the signal keys are off while the key is derived");
+        pty.master.write_all(b"during\n").expect("type");
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut n: libc::c_int = 0;
+            assert_eq!(unsafe { libc::ioctl(pty.probe, libc::FIONREAD, &mut n) }, 0);
+            if n > 0 {
+                break;
+            }
+            assert!(Instant::now() < end, "the line typed during the wait never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let shown = String::from_utf8_lossy(&pty.shown.lock().unwrap()).into_owned();
+        assert!(!shown.contains("during"), "shown while the key was derived: {shown:?}");
+        drop(held);
+        let set = libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN;
+        assert_eq!(pty.lflag() & set, before & set, "the terminal was not given back as it was");
+        let left = pty.left_unread();
+        assert!(left.is_empty(), "{:?} outlived the wait", String::from_utf8_lossy(&left));
+        // The control: with echo back, a key is shown.
+        pty.master.write_all(b"after").expect("type");
+        pty.wait_shown(b"after");
     }
 }
 

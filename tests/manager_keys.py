@@ -453,6 +453,41 @@ def session_dir_guesses(pid):
     return {f"{b.rstrip('/')}/stratum-{pid}" for b in bases if os.path.isdir(f"{b.rstrip('/')}/stratum-{pid}")}
 
 
+def resize_leg(stratum, vol, host, root):
+    """A resize is drawn at once, whatever mask the manager's parent left: with WINCH blocked
+    the screen would keep its old size until the next key."""
+    narrow = COLS - 20
+    for how, blocked in (('a resize', ()), ('a resize, WINCH blocked by its parent', (signal.SIGWINCH,))):
+        term = Term([stratum, 'tui', '--vol', vol.v, '--host', host], blocked=blocked)
+        try:
+            term.expect(r'Passphrase for')
+            term.send(PASS.encode() + ENTER)
+            term.expect(r'from_vol\.txt', timeout=60)
+            # Quiet first: the last of the start's own draws would read the new size anyway.
+            quiet_by = time.monotonic() + 15
+            shown = term.screen.text()
+            while time.monotonic() < quiet_by:
+                term.pump(1.5)
+                if term.screen.text() == shown:
+                    break
+                shown = term.screen.text()
+            else:
+                raise Failure(f'{how}: the screen never went quiet: it proves nothing')
+            if not any(row[narrow:].strip() for row in term.screen.text().split('\n')):
+                raise Failure(f'{how}: nothing drawn past column {narrow} before the resize: it proves nothing')
+            fcntl.ioctl(term.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, narrow, 0, 0))
+            end = time.monotonic() + 5
+            drawn = False
+            while not drawn and time.monotonic() < end:
+                term.pump(0.2)
+                rows = term.screen.text().split('\n')
+                drawn = any(r.strip() for r in rows) and not any(r[narrow:].strip() for r in rows)
+            record(drawn, f'{how}: the screen was drawn again at its new width',
+                   f'{how}: the screen kept its old width')
+        finally:
+            term.kill()
+
+
 def death_legs(stratum, vol, host, root):
     """However the manager ends, the volume must not stay unlocked behind it."""
     term_ = lambda t: os.kill(t.pid, signal.SIGTERM)
@@ -578,7 +613,7 @@ def stuck_daemon_leg(stratum, vol, host, root):
         session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
         before = session_daemons(session)
         host_fs = [p for p in before
-                   if ' host-fs ' in subprocess.run(['ps', '-o', 'command=', '-p', p],
+                   if ' host-fs ' in subprocess.run(['ps', '-ww', '-o', 'command=', '-p', p],
                                                     capture_output=True, text=True).stdout]
         if len(before) < 3 or len(host_fs) != 1:
             raise Failure(f'the search finds {before}, host-fs {host_fs}, before {how}: it proves nothing')
@@ -712,14 +747,16 @@ def prompt_end_legs(stratum, vol, host, root):
         time.sleep(0.5)
         os.close(term.fd)
 
-    cases = (('its terminal closing at the prompt', close, ()),
-             ('Ctrl-\\ at the prompt', quit_key, ()),
-             ('a QUIT sent at the prompt', quit_sent, ()),
-             ('its terminal closing before Enter, HUP ignored', typed_then_close, (signal.SIGHUP,)))
-    for i, (how, end, ignored) in enumerate(cases):
+    cases = (('its terminal closing at the prompt', close, (), ()),
+             ('Ctrl-\\ at the prompt', quit_key, (), ()),
+             ('a QUIT sent at the prompt', quit_sent, (), ()),
+             # Blocked, it would wait for the screen, after the volume was unlocked.
+             ('a QUIT sent at the prompt, blocked by its parent', quit_sent, (), (signal.SIGQUIT,)),
+             ('its terminal closing before Enter, HUP ignored', typed_then_close, (signal.SIGHUP,), ()))
+    for i, (how, end, ignored, blocked) in enumerate(cases):
         env_file = f'{root}/env-prompt{i}'
         term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file],
-                    ignored=ignored)
+                    ignored=ignored, blocked=blocked)
         closed = False
         try:
             term.expect(r'Passphrase for')
@@ -760,8 +797,8 @@ def prompt_end_legs(stratum, vol, host, root):
             record(not left, f'{how}: host-fs stopped', f'{how}: daemons {left} still run, with no manager')
             record(not os.path.exists(session), f'{how}: the session directory is gone',
                    f'{how}: the session directory stayed')
-            # Written once slate is up, after the unlock: its absence says the session ended
-            # before slate, and with a passphrase, before the volume was opened with it.
+            # Written once slate is up: its absence says the session ended before that. That it
+            # ended at the prompt, before stratumd, is the rc and the message's to say.
             record(not os.path.exists(env_file), f'{how}: the session ended before slate',
                    f'{how}: the session reached slate, so the volume was unlocked')
             for pid in left:
@@ -830,13 +867,26 @@ def start_wait_stop_leg(stratum, vol, host, root):
         limit = time.monotonic() + 10
         held = daemons_of(sock)
         while not held and time.monotonic() < limit:
-            time.sleep(0.005)
+            # Read as a terminal does: a terminal given back with TCSAFLUSH waits for its output
+            # to be read.
+            term.pump(0.005)
             held = daemons_of(sock)
         for pid in held:
             os.kill(int(pid), signal.SIGSTOP)
         if not held or os.path.exists(sock):
             raise Failure(f'{how}: stratumd held={held}, its socket made={os.path.exists(sock)} '
                           'before the stop: it proves nothing')
+        # The passphrase taken, the key being derived: cooked, so Ctrl-\ works, but a key typed
+        # now, the passphrase again say, is not shown.
+        lflag = termios.tcgetattr(term.fd)[3]
+        modes = {m: bool(lflag & getattr(termios, m)) for m in ('ECHO', 'ICANON', 'ISIG')}
+        record(modes == {'ECHO': False, 'ICANON': True, 'ISIG': True},
+               f'{how}: echo held off, the terminal cooked, while stratumd starts',
+               f'{how}: the terminal while stratumd starts: {modes}')
+        term.send(b'again')
+        term.pump(0.3)
+        record(not term.showing(re.compile('again')), f'{how}: a key typed then is not shown',
+               f'{how}: a key typed while stratumd started was shown')
         term.send(b'\x1c')
         asked = time.monotonic()
         # Past the 60 s start timeout: a wait that does not end on the stop ends there instead,
@@ -2281,6 +2331,7 @@ def run(stratum, root):
                       (stuck_daemon_leg, (stratum, vol, host, root)),
                       (headless_output_gone_leg, (stratum, vol, host, root)),
                       (headless_int_ignored_leg, (stratum, vol, host, root)),
+                      (resize_leg, (stratum, vol, host, root)),
                       (prompt_end_legs, (stratum, vol, host, root)),
                       (missing_binary_leg, (stratum, vol, host, root)),
                       (start_wait_stop_leg, (stratum, vol, host, root)),

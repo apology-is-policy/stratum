@@ -142,6 +142,8 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // SWISS-4a: spawn stratumd ONLY when --vol is set. The left panel
     // attaches to stratumd; right panel always attaches to host-fs.
     let mut stratumd_child: Option<Child> = None;
+    // Echo off from the passphrase's Enter until the screen or headless mode takes over.
+    let mut echo_held = None;
     if let Some(vol) = opts.volume.as_ref() {
         let keyfile = opts.keyfile.clone().unwrap_or_else(|| {
             let mut p = vol.clone();
@@ -173,7 +175,10 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
                 vol.file_name().unwrap_or_default().to_string_lossy()
             );
             match crate::passphrase::prompt_passphrase(&label) {
-                Ok(p) => Some(p),
+                Ok((p, held)) => {
+                    echo_held = Some(held);
+                    Some(p)
+                }
                 Err(e) => {
                     kill_and_reap(&mut host_fs_child);
                     return Err(e.context("read passphrase"));
@@ -463,6 +468,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         initial_meta,
     ));
 
+    drop(echo_held);
     let result = if opts.headless {
         run_headless(&slate_sock, &left_plan.sock, &prev_mask)
     } else {
@@ -564,26 +570,34 @@ fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigse
 /// the previous mask. Children spawned after this inherit the mask
 /// but can replace it via `sigprocmask` in their own startup
 /// (which stratumd / slate do via their `install_signal_handlers`).
+/// HUP and QUIT are unblocked, whatever the parent left: their handlers end the
+/// prompt and the start waits.
 fn block_term_signals() -> libc::sigset_t {
     let mut new_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
     let mut prev_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut early: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::sigemptyset(&mut new_mask);
         libc::sigaddset(&mut new_mask, libc::SIGINT);
         libc::sigaddset(&mut new_mask, libc::SIGTERM);
         libc::pthread_sigmask(libc::SIG_BLOCK, &new_mask, &mut prev_mask);
+        libc::sigemptyset(&mut early);
+        libc::sigaddset(&mut early, libc::SIGHUP);
+        libc::sigaddset(&mut early, libc::SIGQUIT);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &early, std::ptr::null_mut());
     }
     prev_mask
 }
 
 /// The mask the manager started with, less the signals the screen handles: one its
 /// parent blocked would never reach the handlers, as the daemons' own start guards.
+/// WINCH among them, or a resize would wait for the next key to be drawn.
 fn restore_signal_mask(prev: &libc::sigset_t) {
     let mut handled: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::pthread_sigmask(libc::SIG_SETMASK, prev, std::ptr::null_mut());
         libc::sigemptyset(&mut handled);
-        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGWINCH] {
             libc::sigaddset(&mut handled, sig);
         }
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &handled, std::ptr::null_mut());

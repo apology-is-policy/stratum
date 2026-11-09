@@ -138,8 +138,10 @@ fn prompt_new() -> Result<()> {
     };
 
     // An empty one is refused there: a volume made here is sealed.
-    let pass = prompt_passphrase("              Passphrase: ")?;
-    let again = prompt_passphrase("              Passphrase again: ")?;
+    let (pass, first) = prompt_passphrase("              Passphrase: ")?;
+    drop(first);
+    // Echo stays off through the key derivation, until mkfs has ended.
+    let (again, held) = prompt_passphrase("              Passphrase again: ")?;
     if pass.as_bytes() != again.as_bytes() {
         eprintln!("stratum: the two passphrases differ; nothing was created");
         return Ok(());
@@ -169,6 +171,7 @@ fn prompt_new() -> Result<()> {
         wrote.context("give mkfs the passphrase")?;
     }
     let out = child.wait_with_output().context("wait for mkfs")?;
+    drop(held);
     if !out.status.success() {
         eprintln!("stratum: mkfs failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         return Ok(());
