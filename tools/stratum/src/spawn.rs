@@ -59,6 +59,7 @@ pub fn wait_for_daemon(child: &mut Child, sock: &Path) -> Result<()> {
         if started.elapsed() >= DAEMON_START {
             bail!("timed out waiting for {}", sock.display());
         }
+        crate::passphrase::hold_if_in_front();
         std::thread::sleep(Duration::from_millis(20));
     }
     Ok(())

@@ -139,6 +139,8 @@ class Screen:
 class Term:
     def __init__(self, argv, output_to_pipe=False, ignored=(), blocked=(), pending=()):
         self.screen = Screen()
+        # Everything sent to the terminal: the emulator's private modes are not on the screen.
+        self.raw = bytearray()
         # The pipe is not the terminal, and no reader sees the two interleaved: on one shared
         # screen a line from one moves the other's text, and can split it across the wrap.
         self.piped = Screen(onlcr=True) if output_to_pipe else None
@@ -198,6 +200,7 @@ class Term:
                     data = b''
                 if not data:
                     return
+                self.raw += data
                 self.screen.feed(data)
 
     def cut_output(self):
@@ -965,13 +968,15 @@ def pending_hup_leg(stratum, vol, host, root):
 # back and continues the job, as `fg`. Only a parent in the same session lets a job stop on
 # SIGTTOU: the harness's own child is a session leader, whose group is orphaned. --tostop sets
 # `stty tostop` first; --editor, as bash with readline does, puts back the mode it saved at the
-# start with echo and canonical mode off each time it takes the terminal, where a shell such
-# as dash leaves the mode as it finds it.
+# start with echo and canonical mode off each time it takes the terminal, and that mode whole
+# when it gives the terminal at `fg`, where a shell such as dash leaves the mode as it finds
+# it. As bash and zsh do, `fg` continues the job only if it is stopped. --behind starts the job
+# behind, as `&` does.
 # --report=PATH appends each stop of the job, with its signal, and each continue to PATH: on
 # the screen each would overwrite the last. A continue the job stops again just after may be
 # reported as the stop alone.
 JOB_SHELL = r"""
-import os, signal, sys, termios
+import os, signal, subprocess, sys, termios
 flags = set()
 while sys.argv[1].startswith('--'):
     flags.add(sys.argv.pop(1))
@@ -983,6 +988,7 @@ if '--tostop' in flags:
     a = termios.tcgetattr(0)
     a[3] |= termios.TOSTOP
     termios.tcsetattr(0, termios.TCSANOW, a)
+sane = termios.tcgetattr(0)
 editor = termios.tcgetattr(0)
 editor[3] &= ~(termios.ECHO | termios.ICANON)
 signal.signal(signal.SIGTTOU, signal.SIG_IGN)
@@ -999,7 +1005,11 @@ try:
     os.setpgid(pid, pid)
 except OSError:
     pass
-os.tcsetpgrp(0, pid)
+if '--behind' in flags:
+    if '--editor' in flags:
+        termios.tcsetattr(0, termios.TCSANOW, editor)
+else:
+    os.tcsetpgrp(0, pid)
 os.write(w, b'x')
 os.close(w)
 def behind(*_):
@@ -1008,8 +1018,12 @@ def behind(*_):
         termios.tcsetattr(0, termios.TCSANOW, editor)
     os.write(1, b'[behind %d]\r\n' % (os.tcgetpgrp(0) == os.getpgrp()))
 def front(*_):
+    if '--editor' in flags:
+        termios.tcsetattr(0, termios.TCSANOW, sane)
     os.tcsetpgrp(0, pid)
-    os.killpg(pid, signal.SIGCONT)
+    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout
+    if 'T' in state:
+        os.killpg(pid, signal.SIGCONT)
 def forward(sig, _):
     os.kill(pid, sig)
 signal.signal(signal.SIGUSR1, behind)
@@ -1089,6 +1103,17 @@ def wait_until(term, what, timeout):
 
 
 HELD_MODES = {'ECHO': False, 'ICANON': True, 'ISIG': True}
+# The emulator's private modes as the shell needs them: the main screen, no mouse reports, the
+# cursor shown.
+SHELL_PRIVATE = {'1049': 'l', '1000': 'l', '25': 'h'}
+
+
+def private_modes(term):
+    """The last set of each private mode the screen uses, as sent to the terminal."""
+    last = {}
+    for m in re.finditer(rb'\x1b\[\?(1049|1000|25)([hl])', bytes(term.raw)):
+        last[m.group(1).decode()] = m.group(2).decode()
+    return last
 RAW_MODES = {'ECHO': False, 'ICANON': False, 'ISIG': False}
 
 
@@ -1247,8 +1272,7 @@ def screen_behind_leg(stratum, vol, host, root):
     """The screen, moved behind while stratumd derives the key. It needs the terminal, so it stops
     behind until `fg` and gives the mode back before the screen saves the one it finds: the
     screen's end then leaves the terminal as it was, echo on. Without that, the screen's own mode
-    set is what stops behind: on macOS it then fails with EINTR, which the screen library does not
-    retry; where it is restarted instead, the screen saves the held mode the job shell left in
+    set is what stops behind, and once in front it saves the held mode the job shell left in
     place, and puts that back at its end. A stop asked while it waits behind, a shell's `kill %1`
     or `kill -HUP %1` (each sent with a continue, as a shell sends them to a stopped job), ends it
     there with the terminal left to the shell."""
@@ -1332,8 +1356,10 @@ def screen_job_control_leg(stratum, vol, host, root):
         term.send(F10)
         ended = term.exited(60)
         modes = tty_modes(term)
-        record(ended and term.rc == 0 and all(modes.values()), f'{how}: F10 then gave the terminal back as it was',
-               f'{how}: ended={ended} rc={term.rc}, the terminal was left {modes}')
+        private = private_modes(term)
+        record(ended and term.rc == 0 and all(modes.values()) and private == SHELL_PRIVATE,
+               f'{how}: F10 then gave the terminal back as it was',
+               f'{how}: ended={ended} rc={term.rc}, the terminal was left {modes}, its private modes {private}')
 
     report = os.path.join(root, 'job-report')
 
@@ -1366,6 +1392,11 @@ def screen_job_control_leg(stratum, vol, host, root):
         modes = tty_modes(term)
         record(modes == EDITOR_MODES, f'{how}: the shell\'s mode was left as the shell set it',
                f'{how}: the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
+        # The mode is the shell's; the alternate screen, the mouse reports and the hidden
+        # cursor are the screen's, and only the screen takes them back.
+        private = private_modes(term)
+        record(private == SHELL_PRIVATE, f'{how}: it left the main screen, mouse reports off, the cursor shown',
+               f'{how}: its private modes were left {private}, not {SHELL_PRIVATE}')
 
     cases = (('the screen, a TSTP from outside, then fg', (), tstp_then_fg),
              ('the screen, a STOP, bg, then kill -HUP', ('--editor', f'--report={report}'), stop_bg_hup))
@@ -1388,6 +1419,101 @@ def screen_job_control_leg(stratum, vol, host, root):
             raise
         finally:
             job_cleanup(term, [], session)
+
+
+def screen_started_behind_leg(stratum, root):
+    """The screen started behind, as `&` starts it: its first mode set stops until `fg`, as any
+    program's does, and it then comes up (on macOS that set fails with EINTR after the stop,
+    which the screen library does not retry). A `kill %1` while it waits ends it there, with the
+    terminal left to the shell."""
+    w = f'{root}/behind'
+    os.makedirs(w, exist_ok=True)
+
+    def fg_then_quit(term, how, manager):
+        os.kill(term.pid, signal.SIGUSR2)
+        term.expect(r'MkDir', timeout=60)
+        term.send(F10)
+        ended = term.exited(60)
+        modes = tty_modes(term)
+        record(ended and term.rc == 0 and all(modes.values()), f'{how}: after fg it came up, and F10 gave the terminal back',
+               f'{how}: ended={ended} rc={term.rc}, the terminal was left {modes}')
+
+    def kill_while_waiting(term, how, manager):
+        os.kill(manager, signal.SIGTERM)
+        os.killpg(os.getpgid(manager), signal.SIGCONT)
+        ended = term.exited(30)
+        said = 'asked to stop before the screen' in term.screen.text()
+        state = '' if ended else state_of(manager)
+        record(ended and term.rc == 1 and said, f'{how}: it ended there, rc 1, and said so',
+               f'{how}: ended={ended} rc={term.rc}, said so={said}, its state {state!r}')
+        modes = tty_modes(term)
+        record(modes == EDITOR_MODES, f'{how}: the shell\'s mode was left as the shell set it',
+               f'{how}: the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
+
+    cases = (('the screen started behind, then fg', fg_then_quit),
+             ('the screen started behind, sent a TERM while it waits', kill_while_waiting))
+    for how, then in cases:
+        term = Term([sys.executable, '-I', '-c', JOB_SHELL, '--behind', '--editor', stratum, 'tui', '--host', w])
+        manager = None
+        try:
+            limit = time.monotonic() + 10
+            while manager is None and time.monotonic() < limit:
+                term.pump(0.05)
+                manager = child_running(term.pid, 'tui')
+            if manager is None:
+                raise Failure(f'{how}: no manager under the job shell: it proves nothing')
+            state = wait_state(term, manager, 'T', 30)
+            if 'T' not in state or 'MkDir' in term.screen.text() or tty_modes(term) != EDITOR_MODES:
+                raise Failure(f'{how}: its state {state!r}, the terminal {tty_modes(term)}: not stopped behind before '
+                              'the screen, it proves nothing')
+            then(term, how, manager)
+        except Failure:
+            print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+            raise
+        finally:
+            job_cleanup(term, [], None)
+
+
+# Runs a program in a session of its own, its descriptors still on the terminal, as `setsid`
+# and `su -c` do: the terminal is not its controlling one.
+SETSID = r"""
+import os, sys
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    os.execv(sys.argv[1], sys.argv[1:])
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status) & 0xff)
+"""
+
+
+def setsid_screen_leg(stratum, root):
+    """The screen on a terminal that is not its controlling one: no shell job-controls it, so the
+    screen owns it and gives it back at its end, the mode and the private modes."""
+    how = 'the screen on a terminal not its controlling one'
+    w = f'{root}/setsid'
+    os.makedirs(w, exist_ok=True)
+    term = Term([sys.executable, '-I', '-c', SETSID, stratum, 'tui', '--host', w])
+    manager = None
+    try:
+        term.expect(r'MkDir', timeout=60)
+        manager = child_running(term.pid, 'tui')
+        if tty_modes(term) != RAW_MODES or manager is None:
+            raise Failure(f'{how}: the screen is up, the terminal {tty_modes(term)}, manager {manager}: it proves nothing')
+        term.send(F10)
+        ended = term.exited(60)
+        modes = tty_modes(term)
+        private = private_modes(term)
+        record(ended and term.rc == 0 and all(modes.values()) and private == SHELL_PRIVATE,
+               f'{how}: F10 gave it back as it was',
+               f'{how}: ended={ended} rc={term.rc}, the terminal was left {modes}, its private modes {private}')
+    finally:
+        if manager is not None and term.rc is None:
+            try:
+                os.kill(manager, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        term.kill()
 
 
 # Runs a program with core dumps allowed up to the hard limit, as a shell's `ulimit -c
@@ -1416,22 +1542,32 @@ def core_dumps_off_leg(stratum, vol, host, root):
             return next(line.split()[4:6] for line in f if line.startswith('Max core file size'))
 
     def dumpable(pid):
-        # A process that is not dumpable has its /proc entries owned by root.
-        return os.stat(f'/proc/{pid}').st_uid == os.getuid()
+        # Linux gives the entries in /proc/<pid> of a process that is not dumpable to root;
+        # the directory itself keeps the owner's uid either way.
+        return os.stat(f'/proc/{pid}/status').st_uid == os.getuid()
 
-    # The control, one variable away: the same start, a program that keeps the limit.
-    control = subprocess.Popen([sys.executable, '-I', '-c', CORE_ALLOWED, '/bin/sleep', '30'])
+    hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+    allowed = ['unlimited'] * 2 if hard == resource.RLIM_INFINITY else [str(hard)] * 2
+    # The controls, one variable away each: the same start, a program that keeps the limit and
+    # stays dumpable, and one that turns its own dumpable flag off.
+    undumpable = 'import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); print(flush=True); time.sleep(30)'
+    controls = [subprocess.Popen([sys.executable, '-I', '-c', CORE_ALLOWED, '/bin/sleep', '30']),
+                subprocess.Popen([sys.executable, '-I', '-c', CORE_ALLOWED, sys.executable, '-I', '-c', undumpable],
+                                 stdout=subprocess.PIPE)]
     try:
+        controls[1].stdout.readline()
         limit = time.monotonic() + 10
-        while not os.path.exists(f'/proc/{control.pid}/limits') or core_limit(control.pid) == ['0', '0']:
+        while not os.path.exists(f'/proc/{controls[0].pid}/limits') or core_limit(controls[0].pid) != allowed:
             if time.monotonic() > limit:
-                raise Failure(f'{how}: the control kept no core limit: it proves nothing')
+                raise Failure(f'{how}: the control never ran with the core limit at {allowed}: it proves nothing')
             time.sleep(0.05)
-        if not dumpable(control.pid):
-            raise Failure(f'{how}: the control reads as not dumpable: it proves nothing')
+        if not dumpable(controls[0].pid) or dumpable(controls[1].pid):
+            raise Failure(f'{how}: dumpable={dumpable(controls[0].pid)} for the control that is, '
+                          f'{dumpable(controls[1].pid)} for the one that is not: it proves nothing')
     finally:
-        control.kill()
-        control.wait()
+        for c in controls:
+            c.kill()
+            c.wait()
     env_file = f'{root}/env-core'
     term = Term([sys.executable, '-I', '-c', CORE_ALLOWED, stratum, 'tui', '--headless', '--vol', vol.v,
                  '--host', host, '--print-env-to', env_file])
@@ -2839,7 +2975,7 @@ def screen_checks():
     """The terminal and the pipe through Term.pump as a leg's run feeds them, from fds that
     share no line discipline: neither may move or split what the other shows."""
     term = Term.__new__(Term)
-    term.screen, term.piped = Screen(), Screen(onlcr=True)
+    term.screen, term.piped, term.raw = Screen(), Screen(onlcr=True), bytearray()
     pty_r, pty_w = os.pipe()
     out_r, out_w = os.pipe()
     term.fd, term.out = pty_r, out_r
@@ -3007,6 +3143,8 @@ def run(stratum, root):
                       (screen_behind_leg, (stratum, vol, host, root)),
                       (screen_job_control_leg, (stratum, vol, host, root)),
                       (core_dumps_off_leg, (stratum, vol, host, root)),
+                      (screen_started_behind_leg, (stratum, root)),
+                      (setsid_screen_leg, (stratum, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
                       (wrong_passphrase_leg, (stratum, vol, host)),
                       (wizard_legs, (stratum, vol, root)),

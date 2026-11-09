@@ -531,6 +531,7 @@ fn attach_panel_with_retry(slate_sock: &Path, attach_path: &str, target_sock: &P
             Err(e) => {
                 last_err = Some(e);
                 if attempt < 49 {
+                    crate::passphrase::hold_if_in_front();
                     thread::sleep(Duration::from_millis(20));
                 }
             }
@@ -736,6 +737,7 @@ fn wait_for_sock(path: &Path, timeout: Duration) -> Result<()> {
         if tui::stop_requested() {
             bail!("asked to stop");
         }
+        crate::passphrase::hold_if_in_front();
         thread::sleep(Duration::from_millis(20));
     }
     bail!("timeout waiting for {}", path.display())

@@ -193,25 +193,16 @@ impl EchoHeld {
         }
         let prev = block(&quiet);
         self.let_go();
-        let ttou = take_over(libc::SIGTTOU, &action(stop_and_interrupt, 0));
-        let mut given = false;
-        loop {
-            if !in_front(fd) && stop_asked() {
-                break;
-            }
-            if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } == 0 {
-                given = true;
-                break;
-            }
-            // EINTR after each stop behind, so a stop asked meanwhile is seen; EIO, a
-            // terminal gone or a group orphaned, ends it.
-            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                break;
-            }
-        }
-        if let Some(old) = ttou {
-            unsafe { libc::sigaction(libc::SIGTTOU, &old, std::ptr::null_mut()) };
-        }
+        let orig = self.orig;
+        let given = set_when_in_front(
+            || in_front(fd),
+            stop_asked,
+            || match unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &orig) } {
+                0 => Ok(()),
+                _ => Err(io::Error::last_os_error()),
+            },
+        )
+        .unwrap_or(false);
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()) };
         self.given = true;
         given
@@ -237,7 +228,7 @@ impl Drop for EchoHeld {
         // No stop or continue comes between the check and the restore, nor before the
         // handlers go.
         let prev = block(&release_set());
-        if unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() } {
+        if in_front(fd) {
             while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } != 0
                 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
             {}
@@ -289,8 +280,55 @@ fn block(set: &libc::sigset_t) -> libc::sigset_t {
     prev
 }
 
-fn in_front(fd: RawFd) -> bool {
-    unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() }
+/// In front of `fd`, or with no job control there to be behind: on a terminal that is not
+/// the controlling one (setsid, `su -c`) no shell has it, and tcgetpgrp fails.
+pub(crate) fn in_front(fd: RawFd) -> bool {
+    let pg = unsafe { libc::tcgetpgrp(fd) };
+    pg < 0 || pg == unsafe { libc::getpgrp() }
+}
+
+/// Runs `set`, a terminal set, until done: behind, each try stops on SIGTTOU until `fg`, and
+/// a stop asked meanwhile, as `stop_asked` tells, ends the wait. Returns whether it was done;
+/// an error other than EINTR (EIO: the terminal gone, or the group orphaned) ends it too.
+pub(crate) fn set_when_in_front(
+    front: impl Fn() -> bool,
+    stop_asked: impl Fn() -> bool,
+    mut set: impl FnMut() -> io::Result<()>,
+) -> io::Result<bool> {
+    let ttou = take_over(libc::SIGTTOU, &action(stop_and_interrupt, 0));
+    let done = loop {
+        if !front() && stop_asked() {
+            break Ok(false);
+        }
+        match set() {
+            Ok(()) => break Ok(true),
+            // After each stop behind, so a stop asked meanwhile is seen.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => break Err(e),
+        }
+    };
+    if let Some(old) = ttou {
+        unsafe { libc::sigaction(libc::SIGTTOU, &old, std::ptr::null_mut()) };
+    }
+    done
+}
+
+/// Echo held off again if the job is back in front with it on. An `fg` sends no SIGCONT to a
+/// job still running after `bg` (bash before 5.3, zsh), so no handler is told; the holder's
+/// waits call this on each tick.
+pub fn hold_if_in_front() {
+    if HOLD.fd.load(Ordering::Acquire) < 0 {
+        return;
+    }
+    let prev = block(&release_set());
+    let fd = HOLD.fd.load(Ordering::Acquire);
+    if fd >= 0 && in_front(fd) {
+        let mut now: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut now) } == 0 && now.c_lflag & libc::ECHO != 0 {
+            unsafe { hold_again(fd) };
+        }
+    }
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()) };
 }
 
 fn action(handler: extern "C" fn(libc::c_int), flags: libc::c_int) -> libc::sigaction {
@@ -399,8 +437,9 @@ unsafe fn hold_again(fd: RawFd) {
     }
 }
 
-/// While give_back waits behind: stops as SIGTTOU would, and returns without SA_RESTART,
-/// so the set it interrupted fails with EINTR on each continue.
+/// While a set waits behind: stops as SIGTTOU would, and returns without SA_RESTART, so the
+/// set it interrupted fails with EINTR on each continue (Linux would restart it; macOS fails
+/// it either way).
 extern "C" fn stop_and_interrupt(sig: libc::c_int) {
     unsafe {
         let errno = *errno_location();
@@ -881,6 +920,75 @@ mod prompt_tests {
         // The control: with echo back, a key is shown.
         pty.master.write_all(b"after").expect("type");
         pty.wait_shown(b"after");
+    }
+
+    /// A terminal that is not the controlling one has no job control to be behind in: the
+    /// screen and the hold own it, and give it back at their end.
+    #[test]
+    fn a_terminal_not_the_controlling_one_is_in_front() {
+        let pty = Pty::new();
+        let slave = pty.slave.as_ref().expect("the slave").as_raw_fd();
+        assert_eq!(unsafe { libc::tcgetpgrp(slave) }, -1, "the pty is this process's controlling terminal: it proves nothing");
+        assert!(in_front(slave), "read as behind");
+    }
+
+    /// Back in front with echo on, after `bg` then an `fg` that sends no SIGCONT: the
+    /// holder's next tick holds echo off again.
+    #[test]
+    fn a_tick_in_front_holds_echo_off_again() {
+        let pty = Pty::new();
+        let slave = pty.slave.as_ref().expect("the slave").as_raw_fd();
+        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut orig) }, 0);
+        assert_ne!(orig.c_lflag & libc::ECHO, 0, "a fresh pty starts with echo: it proves nothing");
+        let mut held = orig;
+        held.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        let end = Instant::now() + Duration::from_secs(10);
+        let caught = loop {
+            let caught = catch_stops(slave, &orig, &held);
+            if !caught.is_empty() {
+                break caught;
+            }
+            assert!(Instant::now() < end, "no hold took the handlers: another kept them, or a stop is not at its default");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        hold_if_in_front();
+        let echo = pty.lflag() & libc::ECHO;
+        for (sig, old) in caught {
+            unsafe { libc::sigaction(sig, &old, std::ptr::null_mut()) };
+        }
+        HOLD.fd.store(FREE, Ordering::Release);
+        assert_eq!(echo, 0, "echo was left on in front");
+    }
+
+    /// A continue in front with echo on, as after a SIGSTOP and an `fg` from a shell that
+    /// gives its own mode back: the continue holds echo off again at once, before any tick.
+    #[test]
+    fn a_continue_in_front_holds_echo_off_again() {
+        let pty = Pty::new();
+        let slave = pty.slave.as_ref().expect("the slave").as_raw_fd();
+        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut orig) }, 0);
+        assert_ne!(orig.c_lflag & libc::ECHO, 0, "a fresh pty starts with echo: it proves nothing");
+        let mut held = orig;
+        held.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        let end = Instant::now() + Duration::from_secs(10);
+        let caught = loop {
+            let caught = catch_stops(slave, &orig, &held);
+            if !caught.is_empty() {
+                break caught;
+            }
+            assert!(Instant::now() < end, "no hold took the handlers: another kept them, or a stop is not at its default");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // To this thread, so its handler has run when raise returns.
+        unsafe { libc::raise(libc::SIGCONT) };
+        let echo = pty.lflag() & libc::ECHO;
+        for (sig, old) in caught {
+            unsafe { libc::sigaction(sig, &old, std::ptr::null_mut()) };
+        }
+        HOLD.fd.store(FREE, Ordering::Release);
+        assert_eq!(echo, 0, "echo was left on in front after a continue");
     }
 
     /// Two holds at once, as the tests here make: the second takes none of the handlers,

@@ -295,8 +295,9 @@ pub struct MkVolState {
     pub panel_idx: usize,
     /// Current focused field.
     pub field: MkVolField,
-    pub name: String,
-    pub size: String,
+    /// Bounded as the dialogs' fields are: a paste past the limit is counted, never cut.
+    pub name: crate::passphrase::SecretText,
+    pub size: crate::passphrase::SecretText,
     /// Seal the keyfile with a passphrase (mkfs --passphrase-stdin).
     pub encrypt: bool,
     pub passphrase: crate::passphrase::SecretText,
@@ -334,8 +335,8 @@ impl MkVolState {
         Self {
             panel_idx,
             field: MkVolField::Name,
-            name: String::new(),
-            size: "64M".to_string(),
+            name: Default::default(),
+            size: "64M".into(),
             encrypt: true,
             passphrase: Default::default(),
             confirm: Default::default(),

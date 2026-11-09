@@ -159,6 +159,8 @@ fn prompt_new() -> Result<()> {
     }
     drop(again);
 
+    // mkfs refuses a key already there, so one there after a signal is the one it made.
+    let key_before = Path::new(&format!("{}.key", path.display())).exists();
     let me = std::env::current_exe().context("find this program")?;
     let mut child = Command::new(me)
         .arg("mkfs")
@@ -185,31 +187,13 @@ fn prompt_new() -> Result<()> {
     // Wiped now, not when the session it opens has ended.
     drop(pass);
     let mkfs_pid = child.id();
-    let out = child.wait_with_output().context("wait for mkfs")?;
-    let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let (status, said) = wait_for_mkfs(&mut child)?;
+    let said = String::from_utf8_lossy(&said).trim().to_string();
     if crate::tui::stop_requested() {
         drop(held);
-        if out.status.success() {
-            bail!("asked to stop while mkfs ran: {} was made, and was not opened", path.display());
-        }
-        let Some(sig) = out.status.signal() else {
-            // It failed on its own, and cleaned up after itself.
-            bail!("asked to stop while mkfs ran, and mkfs failed: {said}");
-        };
-        // Ended by a signal, its own cleanup never ran: what it claimed stays, the file and
-        // the key it was sealing, and only their names say what they are.
-        let left: Vec<String> = [path.display().to_string(), format!("{}.key.new.{mkfs_pid}", path.display())]
-            .into_iter()
-            .filter(|f| Path::new(f).exists())
-            .collect();
-        let left = match left.len() {
-            0 => String::new(),
-            1 => format!("; it left {}: remove it before trying again", left[0]),
-            _ => format!("; it left {}: remove them before trying again", left.join(" and ")),
-        };
-        bail!("asked to stop while mkfs ran: signal {sig} ended mkfs before it finished, so {} is not a volume{left}", path.display());
+        bail!("{}", mkfs_stop_message(&path, status, &said, mkfs_pid, key_before));
     }
-    if !out.status.success() {
+    if !status.success() {
         drop(held);
         eprintln!("stratum: mkfs failed: {said}");
         return Ok(());
@@ -270,4 +254,99 @@ fn add_to_recents(path: &Path) {
         .collect::<Vec<_>>()
         .join("\n");
     let _ = fs::write(&recents_path, body);
+}
+
+/// mkfs's end and what it said. Echo is held off again on each tick if the job came back in
+/// front with it on, as an `fg` after `bg` continues nothing; its stderr is drained as it
+/// goes, so that a full pipe never stops it.
+fn wait_for_mkfs(child: &mut std::process::Child) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    let mut err = child.stderr.take().context("mkfs's stderr")?;
+    unsafe {
+        let fd = err.as_raw_fd();
+        libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK);
+    }
+    let mut said = Vec::new();
+    let mut drain = |said: &mut Vec<u8>| {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match err.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => said.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
+        }
+    };
+    loop {
+        drain(&mut said);
+        if let Some(status) = child.try_wait().context("wait for mkfs")? {
+            drain(&mut said);
+            return Ok((status, said));
+        }
+        crate::passphrase::hold_if_in_front();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// What a stop asked while mkfs ran says, by how mkfs ended and what it left.
+fn mkfs_stop_message(path: &Path, status: std::process::ExitStatus, said: &str, mkfs_pid: u32, key_before: bool) -> String {
+    let vol = path.display();
+    if status.success() {
+        return format!("asked to stop while mkfs ran: {vol} was made, and was not opened");
+    }
+    let Some(sig) = status.signal() else {
+        // It failed on its own, and cleaned up after itself.
+        return format!("asked to stop while mkfs ran, and mkfs failed: {said}");
+    };
+    // The key is named last, once the volume is whole: past that only a sync and a line were left.
+    let key = format!("{vol}.key");
+    if !key_before && Path::new(&key).exists() {
+        return format!("asked to stop while mkfs ran: signal {sig} ended mkfs after it had made {vol} and its key {key}; it was not opened");
+    }
+    // Ended by a signal, its own cleanup never ran: what it claimed stays, the file and the
+    // key it was sealing, and only their names say what they are.
+    let left: Vec<String> = [vol.to_string(), format!("{vol}.key.new.{mkfs_pid}")]
+        .into_iter()
+        .filter(|f| Path::new(f).exists())
+        .collect();
+    let left = match left.len() {
+        0 => String::new(),
+        1 => format!("; it left {}: remove it before trying again", left[0]),
+        _ => format!("; it left {}: remove them before trying again", left.join(" and ")),
+    };
+    format!("asked to stop while mkfs ran: signal {sig} ended mkfs before it finished, so {vol} is not a volume{left}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    /// A signal before the key was named leaves no volume; after, a whole one and its key.
+    #[test]
+    fn a_stop_during_mkfs_says_what_it_left() {
+        let dir = std::env::temp_dir().join(format!("stratum-landing-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("a directory");
+        let vol = dir.join("v.stm");
+        let pid = 4242;
+        let key = format!("{}.key", vol.display());
+        let temp = format!("{}.key.new.{pid}", vol.display());
+        let int = ExitStatus::from_raw(libc::SIGINT);
+        fs::write(&vol, b"").expect("the volume");
+        fs::write(&temp, b"").expect("the temporary key");
+        let before = mkfs_stop_message(&vol, int, "", pid, false);
+        fs::remove_file(&temp).expect("rename, as mkfs does");
+        fs::write(&key, b"").expect("the key");
+        let after = mkfs_stop_message(&vol, int, "", pid, false);
+        let made = mkfs_stop_message(&vol, ExitStatus::from_raw(0), "", pid, false);
+        let failed = mkfs_stop_message(&vol, ExitStatus::from_raw(1 << 8), "no room", pid, false);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(before.contains("is not a volume") && before.contains(&temp), "{before}");
+        assert!(after.contains("after it had made") && after.contains(&key) && !after.contains("not a volume"), "{after}");
+        assert!(made.contains("was made, and was not opened"), "{made}");
+        assert!(failed.contains("mkfs failed: no room"), "{failed}");
+    }
 }
