@@ -81,6 +81,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // Before the directory exists: a HUP or QUIT taking its default action, at the
     // passphrase prompt or in a start wait, would leave it.
     tui::stop_on_signals();
+    unblock_hup_and_quit();
     crate::lifeline::hold()?;
     let session = SessionDir(make_session_dir()?);
     let session_dir = session.0.clone();
@@ -468,6 +469,12 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         initial_meta,
     ));
 
+    // Headless mode never uses the terminal again, so it must not stop for it behind.
+    if opts.headless {
+        if let Some(held) = echo_held.take() {
+            held.release_unless_behind();
+        }
+    }
     drop(echo_held);
     let result = if opts.headless {
         run_headless(&slate_sock, &left_plan.sock, &prev_mask)
@@ -570,23 +577,29 @@ fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigse
 /// the previous mask. Children spawned after this inherit the mask
 /// but can replace it via `sigprocmask` in their own startup
 /// (which stratumd / slate do via their `install_signal_handlers`).
-/// HUP and QUIT are unblocked, whatever the parent left: their handlers end the
-/// prompt and the start waits.
 fn block_term_signals() -> libc::sigset_t {
     let mut new_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
     let mut prev_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-    let mut early: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::sigemptyset(&mut new_mask);
         libc::sigaddset(&mut new_mask, libc::SIGINT);
         libc::sigaddset(&mut new_mask, libc::SIGTERM);
         libc::pthread_sigmask(libc::SIG_BLOCK, &new_mask, &mut prev_mask);
+    }
+    prev_mask
+}
+
+/// HUP and QUIT unblocked, whatever the parent left, so a stop asked at the prompt takes
+/// effect at Enter and one in a start wait ends it. Only once their handlers are in: one
+/// pending since exec then asks to stop, rather than taking its default action.
+fn unblock_hup_and_quit() {
+    let mut early: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
         libc::sigemptyset(&mut early);
         libc::sigaddset(&mut early, libc::SIGHUP);
         libc::sigaddset(&mut early, libc::SIGQUIT);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &early, std::ptr::null_mut());
     }
-    prev_mask
 }
 
 /// The mask the manager started with, less the signals the screen handles: one its

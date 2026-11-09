@@ -6,10 +6,10 @@
 //!      encrypted format). Used by the TUI to decide whether to
 //!      prompt before spawning stratumd.
 //!   2. `prompt_passphrase(label)` reads a line from the controlling
-//!      terminal, /dev/tty, with echo and canonical mode off. Returned
-//!      as `Vec<u8>` (NOT NUL-
-//!      terminated). Caller is responsible for `drop` (which clears
-//!      via the `Zeroizing` wrapper) when no longer needed.
+//!      terminal, /dev/tty, with echo and canonical mode off. The bytes
+//!      (NOT NUL-terminated) come back in a `Zeroizing`, wiped when it
+//!      goes, with an `EchoHeld`: echo stays off until the caller lets
+//!      that go.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs::File;
@@ -133,10 +133,24 @@ pub fn prompt_passphrase(label: &str) -> Result<(Zeroizing, EchoHeld)> {
 pub struct EchoHeld {
     tty: File,
     orig: libc::termios,
+    behind: bool,
+}
+
+impl EchoHeld {
+    /// Lets go without touching the terminal if this job is behind, for a caller that will
+    /// not use it again: a job moved behind would otherwise stop on SIGTTOU here, where
+    /// nothing but `fg` ends it. Its shell put its own mode back when it stopped the job.
+    pub fn release_unless_behind(mut self) {
+        let fd = self.tty.as_raw_fd();
+        self.behind = unsafe { libc::tcgetpgrp(fd) != libc::getpgrp() };
+    }
 }
 
 impl Drop for EchoHeld {
     fn drop(&mut self) {
+        if self.behind {
+            return;
+        }
         let fd = self.tty.as_raw_fd();
         while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } != 0
             && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
@@ -149,7 +163,8 @@ pub const PASSPHRASE_MAX: usize = 255;
 
 /// The terminal set for a passphrase: no echo, no canonical mode and no signal keys, so
 /// that read_line, not the line discipline, decides what every key means. Set before
-/// the label, and given back on every way out once set.
+/// the label, and given back at once on every way out but success, where it stays held
+/// without echo until the EchoHeld returned goes.
 fn prompt_on(tty: File, label: &str) -> Result<(Zeroizing, EchoHeld)> {
     let fd = tty.as_raw_fd();
     let mut orig: libc::termios = unsafe { std::mem::zeroed() };
@@ -192,7 +207,7 @@ fn prompt_on(tty: File, label: &str) -> Result<(Zeroizing, EchoHeld)> {
     // So the next line is not glued to the hidden input.
     let _ = writer.write_all(b"\n");
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &held, std::ptr::null_mut()) };
-    line.map(|line| (line, EchoHeld { tty, orig }))
+    line.map(|line| (line, EchoHeld { tty, orig, behind: false }))
 }
 
 /// Sets `quiet` and holds job control off until the terminal is given back, returning
@@ -239,7 +254,7 @@ fn hold_terminal(fd: std::os::unix::io::RawFd, quiet: &libc::termios) -> Result<
 /// once, the rest of it would be read, and shown, by whatever reads next. End-of-file,
 /// which only a hangup gives, submits nothing.
 pub(crate) fn read_line(src: &mut impl Read) -> Result<Zeroizing> {
-    // Never grows, as the refusal comes at the limit, and every way out of here wipes it.
+    // Never grows, as what goes past the limit is not kept, and every way out of here wipes it.
     let mut buf = Zeroizing::new(Vec::with_capacity(PASSPHRASE_MAX + 1));
     let mut byte = [0u8; 1];
     let mut esc = Esc::None;

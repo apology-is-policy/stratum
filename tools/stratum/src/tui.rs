@@ -2554,8 +2554,6 @@ fn handle_mkvol_key(
         _ => {}
     }
     if let Some(c) = typed_char(&key) {
-        // Past the limit is refused when submitted, not cut short where nobody sees it.
-        let fits = |s: &String| s.len() + c.len_utf8() <= 4 * crate::passphrase::PASSPHRASE_MAX;
         match mk.field {
             MkVolField::Name => {
                 if mk.name.len() < 256 {
@@ -2569,17 +2567,16 @@ fn handle_mkvol_key(
                     return Ok(Action::Refresh);
                 }
             }
+            // Unbounded, as in the passphrase dialog: past the limit is refused when
+            // submitted, and a key dropped here would make another passphrase than the same
+            // keys do there or at the terminal's prompt.
             MkVolField::Passphrase => {
-                if fits(&mk.passphrase) {
-                    crate::passphrase::push_secret(&mut mk.passphrase, c);
-                    return Ok(Action::Refresh);
-                }
+                crate::passphrase::push_secret(&mut mk.passphrase, c);
+                return Ok(Action::Refresh);
             }
             MkVolField::Confirm => {
-                if fits(&mk.confirm) {
-                    crate::passphrase::push_secret(&mut mk.confirm, c);
-                    return Ok(Action::Refresh);
-                }
+                crate::passphrase::push_secret(&mut mk.confirm, c);
+                return Ok(Action::Refresh);
             }
             _ => {}
         }
@@ -5035,10 +5032,16 @@ mod tests {
             (b"z", ch('z')),
             (b"\x1b\x7f", KeyEvent::new(K::Backspace, M::ALT)),
         ];
+        same_passphrase_everywhere(&keys, b"cafe");
+    }
+
+    /// The keys, as bytes at the terminal's prompt and as crossterm decodes them in the
+    /// passphrase dialog and the wizard, make `want` at all three.
+    fn same_passphrase_everywhere(keys: &[(&[u8], crossterm::event::KeyEvent)], want: &[u8]) {
         let mut typed: Vec<u8> = keys.iter().flat_map(|(b, _)| b.iter().copied()).collect();
         typed.push(b'\n');
         let prompt = crate::passphrase::read_line(&mut &typed[..]).expect("a passphrase");
-        assert_eq!(prompt.as_bytes(), b"cafe");
+        assert_eq!(prompt.as_bytes(), want, "the terminal's prompt");
 
         let snap = blank_snap();
         let mut job = None;
@@ -5049,7 +5052,7 @@ mod tests {
             is_password: true,
             is_error: false,
         });
-        for (_, key) in &keys {
+        for (_, key) in keys {
             handle_dialog_key(&mut dialog, &mut job, None, &snap, *key).expect("a key");
         }
         let d = dialog.as_ref().expect("the dialog stays open");
@@ -5065,13 +5068,66 @@ mod tests {
             is_password: false,
             is_error: false,
         });
-        for (_, key) in &keys {
+        for (_, key) in keys {
             handle_dialog_key(&mut dialog, &mut job, None, &snap, *key).expect("a key");
         }
         let Some(LocalDialog { kind: LocalDialogKind::MkVol(mk), .. }) = dialog.as_ref() else {
             panic!("the wizard closed");
         };
         assert_eq!(mk.passphrase.as_bytes(), prompt.as_bytes(), "the wizard");
+    }
+
+    // Far past the limit, then erased back under it: nothing typed was dropped anywhere, so
+    // the same keys still make the same passphrase.
+    #[test]
+    fn a_long_paste_then_erasing_makes_the_same_passphrase_everywhere() {
+        use crossterm::event::{KeyCode as K, KeyEvent, KeyModifiers as M};
+        let mut keys: Vec<(&[u8], KeyEvent)> = vec![(b"a", KeyEvent::new(K::Char('a'), M::NONE)); 1100];
+        keys.extend(vec![(&b"\x7f"[..], KeyEvent::new(K::Backspace, M::NONE)); 900]);
+        same_passphrase_everywhere(&keys, &[b'a'; 200]);
+    }
+
+    // At the limit exactly, a passphrase gets past the length check in the wizard and the
+    // dialog, as it does at the prompt and on --passphrase-stdin. With no spawn helper,
+    // saying so is the proof.
+    #[test]
+    fn a_passphrase_at_the_limit_is_taken_when_submitted() {
+        use crossterm::event::{KeyCode as K, KeyEvent, KeyModifiers as M};
+        let snap = blank_snap();
+        let mut job = None;
+        let at = "a".repeat(crate::passphrase::PASSPHRASE_MAX);
+        let mut mk = MkVolState::new(0);
+        mk.name = "v.stm".into();
+        mk.size = "64M".into();
+        mk.encrypt = true;
+        mk.passphrase = at.clone();
+        mk.confirm = at.clone();
+        mk.field = MkVolField::Ok;
+        let mut dialog = Some(LocalDialog {
+            kind: LocalDialogKind::MkVol(mk),
+            prompt: String::new(),
+            value: Default::default(),
+            is_password: false,
+            is_error: false,
+        });
+        handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Enter, M::NONE)).expect("Enter");
+        let said = match dialog.as_ref() {
+            Some(LocalDialog { kind: LocalDialogKind::MkVol(mk), .. }) => format!("{:?}", mk.error),
+            Some(d) => d.prompt.clone(),
+            None => String::new(),
+        };
+        assert_eq!(said, "Spawn helper unavailable.", "the wizard");
+
+        let mut dialog = Some(LocalDialog {
+            kind: LocalDialogKind::PassphraseFor { volume: std::path::PathBuf::from("/v.stm") },
+            prompt: String::new(),
+            value: at.into(),
+            is_password: true,
+            is_error: false,
+        });
+        handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Enter, M::NONE)).expect("Enter");
+        let said = dialog.as_ref().map(|d| d.prompt.clone()).unwrap_or_default();
+        assert_eq!(said, "Cannot mount: spawn helper unavailable.", "the passphrase dialog");
     }
 
     // Past the limit a passphrase is refused where it is submitted, and says so: never cut

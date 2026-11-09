@@ -10,7 +10,7 @@
 //! The user types O / N / H / Q (or Enter on a recent volume number).
 //! v1.1 will lift this into a ratatui screen with proper navigation.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -137,15 +137,26 @@ fn prompt_new() -> Result<()> {
         s => s.to_string(),
     };
 
+    // From the first prompt until mkfs has ended the terminal is not as it was, and an end
+    // by a signal's default action would leave it so. mkfs starts with the default actions,
+    // so Ctrl-C still ends it, and then this.
+    crate::tui::stop_on_signals();
     // An empty one is refused there: a volume made here is sealed.
     let (pass, first) = prompt_passphrase("              Passphrase: ")?;
     drop(first);
+    if crate::tui::stop_requested() {
+        bail!("asked to stop at the passphrase prompt");
+    }
     // Echo stays off through the key derivation, until mkfs has ended.
     let (again, held) = prompt_passphrase("              Passphrase again: ")?;
+    if crate::tui::stop_requested() {
+        bail!("asked to stop at the passphrase prompt");
+    }
     if pass.as_bytes() != again.as_bytes() {
         eprintln!("stratum: the two passphrases differ; nothing was created");
         return Ok(());
     }
+    drop(again);
 
     let me = std::env::current_exe().context("find this program")?;
     let mut child = Command::new(me)
@@ -170,8 +181,13 @@ fn prompt_new() -> Result<()> {
         drop(sin);
         wrote.context("give mkfs the passphrase")?;
     }
+    // Wiped now, not when the session it opens has ended.
+    drop(pass);
     let out = child.wait_with_output().context("wait for mkfs")?;
     drop(held);
+    if crate::tui::stop_requested() {
+        bail!("asked to stop while mkfs ran; {} may be incomplete", path.display());
+    }
     if !out.status.success() {
         eprintln!("stratum: mkfs failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         return Ok(());
