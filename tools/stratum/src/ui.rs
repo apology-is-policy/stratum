@@ -287,7 +287,7 @@ pub fn conflict_prompt(n: usize, total: usize, dst: &str) -> String {
 /// State for the new-volume wizard: a name, a size, and whether the
 /// keyfile (<volume>.key beside the volume file) is sealed with a
 /// passphrase. The format has no compression, so the wizard offers none.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MkVolState {
     /// Active panel at the time of Shift+F7 — the new volume is
     /// created in this panel's CWD (resolved against the panel's
@@ -309,6 +309,19 @@ impl Drop for MkVolState {
     fn drop(&mut self) {
         crate::passphrase::wipe_string(&mut self.passphrase);
         crate::passphrase::wipe_string(&mut self.confirm);
+    }
+}
+
+impl std::fmt::Debug for MkVolState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MkVolState")
+            .field("panel_idx", &self.panel_idx)
+            .field("field", &self.field)
+            .field("name", &self.name)
+            .field("size", &self.size)
+            .field("encrypt", &self.encrypt)
+            .field("error", &self.error)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2241,6 +2254,17 @@ mod tests {
             let buttons = row_of(&s, "Cancel").unwrap_or_else(|| panic!("no buttons at {cols}x{rows}:\n{dump}"));
             assert!(buttons > end, "buttons above the error at {cols}x{rows}:\n{dump}");
         }
+    }
+
+    // A panic or a log line that prints the wizard must not print what was typed in it.
+    #[test]
+    fn the_wizard_in_debug_output_shows_no_passphrase() {
+        let mut mk = MkVolState::new(0);
+        mk.passphrase = "hunter2-typed".into();
+        mk.confirm = "hunter2-again".into();
+        let shown = format!("{mk:?}");
+        assert!(shown.starts_with("MkVolState"), "{shown}");
+        assert!(!shown.contains("hunter2"), "{shown}");
     }
 
     // A box too short for every line keeps the field being typed in and the error's

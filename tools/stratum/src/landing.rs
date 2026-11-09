@@ -137,12 +137,8 @@ fn prompt_new() -> Result<()> {
         s => s.to_string(),
     };
 
+    // An empty one is refused there: a volume made here is sealed.
     let pass = prompt_passphrase("              Passphrase: ")?;
-    if pass.is_empty() {
-        eprintln!("stratum: a volume made here needs a passphrase");
-        eprintln!("stratum: `stratum mkfs` makes one with a plaintext keyfile");
-        return Ok(());
-    }
     let again = prompt_passphrase("              Passphrase again: ")?;
     if pass.as_bytes() != again.as_bytes() {
         eprintln!("stratum: the two passphrases differ; nothing was created");

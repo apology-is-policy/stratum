@@ -182,8 +182,8 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         } else {
             None
         };
-        // The terminal closing ends the prompt; a HUP or QUIT sent by kill takes effect
-        // once Enter is pressed, as the handlers restart the read.
+        // The terminal closing, Ctrl-C, Ctrl-D or Ctrl-\ ends the prompt; a HUP or QUIT
+        // sent by kill takes effect once Enter is pressed, as the handlers restart the read.
         if tui::stop_requested() {
             kill_and_reap(&mut host_fs_child);
             if needs_passphrase {
@@ -523,18 +523,13 @@ fn attach_panel_with_retry(slate_sock: &Path, attach_path: &str, target_sock: &P
 /// (R126 P2-2 fix); we sigwait on them here.
 fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigset_t) -> Result<()> {
     use crate::spawn::tell;
-    tell(format_args!("stratum: headless mode -- daemons running."));
-    tell(format_args!("        slate    socket: {}", slate_sock.display()));
-    tell(format_args!("        backend  socket: {}", backend_sock.display()));
-    tell(format_args!("        send SIGTERM (Ctrl-C) to shut down."));
-
     let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGTERM);
         // The default action would leave the session directory. A HUP, INT or QUIT
-        // someone has chosen to ignore, as nohup and a shell's `&` do, stays ignored:
-        // a blocked signal in the set would reach sigwait whatever its disposition.
+        // someone has chosen to ignore, as nohup and a shell's `&` do, stays ignored: on
+        // Linux a blocked signal in the set would reach sigwait whatever its disposition.
         for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
             let mut act: libc::sigaction = std::mem::zeroed();
             if libc::sigaction(sig, std::ptr::null(), &mut act) == 0
@@ -543,8 +538,13 @@ fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigse
                 libc::sigaddset(&mut set, sig);
             }
         }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
+    let ctrl_c = unsafe { libc::sigismember(&set, libc::SIGINT) } == 1;
+    tell(format_args!("stratum: headless mode -- daemons running."));
+    tell(format_args!("        slate    socket: {}", slate_sock.display()));
+    tell(format_args!("        backend  socket: {}", backend_sock.display()));
+    tell(format_args!("        send SIGTERM{} to shut down.", if ctrl_c { ", or press Ctrl-C," } else { "" }));
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
     // One that came before the block went to the handler, and sigwait would never see it.
     let mut sig: i32 = 0;
     if !tui::stop_requested() {
@@ -576,9 +576,17 @@ fn block_term_signals() -> libc::sigset_t {
     prev_mask
 }
 
+/// The mask the manager started with, less the signals the screen handles: one its
+/// parent blocked would never reach the handlers, as the daemons' own start guards.
 fn restore_signal_mask(prev: &libc::sigset_t) {
+    let mut handled: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::pthread_sigmask(libc::SIG_SETMASK, prev, std::ptr::null_mut());
+        libc::sigemptyset(&mut handled);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            libc::sigaddset(&mut handled, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &handled, std::ptr::null_mut());
     }
 }
 

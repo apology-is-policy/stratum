@@ -136,7 +136,7 @@ class Screen:
 
 
 class Term:
-    def __init__(self, argv, output_to_pipe=False, ignored=()):
+    def __init__(self, argv, output_to_pipe=False, ignored=(), blocked=()):
         self.screen = Screen()
         # The pipe is not the terminal, and no reader sees the two interleaved: on one shared
         # screen a line from one moves the other's text, and can split it across the wrap.
@@ -155,6 +155,8 @@ class Term:
                 signal.signal(sig, signal.SIG_DFL)
             for sig in ignored:
                 signal.signal(sig, signal.SIG_IGN)
+            # exec keeps the mask, and a supervisor that waits on signals blocks some.
+            signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
             os.environ['TERM'] = 'xterm-256color'
             # A failed exec must not leave a second harness running the legs.
             try:
@@ -232,7 +234,7 @@ class Term:
             try:
                 os.kill(self.pid, signal.SIGTERM)
                 if not self.exited(15):
-                    session = session_dir_of(self.pid, wait=0)
+                    session = session_dir_of(self.pid, wait=0) or SESSION_DIRS.get(self.pid)
                     os.close(self.fd)
                     end = time.monotonic() + 15
                     while os.waitpid(self.pid, os.WNOHANG)[0] == 0:
@@ -418,16 +420,22 @@ def session_daemons(session):
     return daemons_of(session.rstrip('/') + '/')
 
 
+# Each manager's session directory as session_dir_of last found it, for when its host-fs has gone.
+SESSION_DIRS = {}
+
+
 def session_dir_of(pid, wait=10):
     """The manager's session directory, read off its host-fs's --listen: worked out from the
     environment instead, it would differ from std's on macOS with TMPDIR unset."""
     end = time.monotonic() + wait
     while True:
-        r = subprocess.run(['ps', '-A', '-o', 'ppid=,command='], capture_output=True, text=True)
+        # -ww: the --listen comes last, and an exported COLUMNS would cut the line before it.
+        r = subprocess.run(['ps', '-ww', '-A', '-o', 'ppid=,command='], capture_output=True, text=True)
         for line in r.stdout.splitlines():
             ppid, _, command = line.strip().partition(' ')
             m = re.search(r' host-fs .* --listen (.+)/host-fs\.sock', f' {command.strip()}')
             if ppid == str(pid) and m:
+                SESSION_DIRS[pid] = m.group(1)
                 return m.group(1)
         if time.monotonic() >= end:
             return None
@@ -435,20 +443,29 @@ def session_dir_of(pid, wait=10):
 
 
 def session_dir_guesses(pid):
-    """Where the directory would be, from the environment alone: for one whose host-fs has gone."""
-    bases = {os.environ.get('XDG_RUNTIME_DIR'), os.environ.get('TMPDIR'), tempfile.gettempdir()} - {None, ''}
+    """Where the directory would be, from the environment alone: for one whose host-fs has gone.
+    std's temporary directory on macOS with TMPDIR unset is the user's own, not Python's /tmp."""
+    bases = {os.environ.get('XDG_RUNTIME_DIR'), os.environ.get('TMPDIR'), tempfile.gettempdir()}
+    if sys.platform == 'darwin':
+        r = subprocess.run(['getconf', 'DARWIN_USER_TEMP_DIR'], capture_output=True, text=True)
+        bases.add(r.stdout.strip() if r.returncode == 0 else None)
+    bases -= {None, ''}
     return {f"{b.rstrip('/')}/stratum-{pid}" for b in bases if os.path.isdir(f"{b.rstrip('/')}/stratum-{pid}")}
 
 
 def death_legs(stratum, vol, host, root):
     """However the manager ends, the volume must not stay unlocked behind it."""
-    ends = (('SIGTERM', lambda t: os.kill(t.pid, signal.SIGTERM)),
-            ('SIGINT', lambda t: os.kill(t.pid, signal.SIGINT)),
-            ('SIGKILL', lambda t: os.kill(t.pid, signal.SIGKILL)),
-            ('its terminal closing', lambda t: os.close(t.fd)))
-    for i, (how, end) in enumerate(ends):
+    term_ = lambda t: os.kill(t.pid, signal.SIGTERM)
+    ends = (('SIGTERM', term_, ()),
+            ('SIGINT', lambda t: os.kill(t.pid, signal.SIGINT), ()),
+            ('SIGKILL', lambda t: os.kill(t.pid, signal.SIGKILL), ()),
+            ('its terminal closing', lambda t: os.close(t.fd), ()),
+            # The screen must not take on the mask its parent left: TERM would never come.
+            ('SIGTERM, blocked by its parent', term_, (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT)))
+    for i, (how, end, blocked) in enumerate(ends):
         env_file = f'{root}/env-death{i}'
-        term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file])
+        term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file],
+                    blocked=blocked)
         closed = False
         try:
             term.expect(r'Passphrase for')
@@ -468,7 +485,7 @@ def death_legs(stratum, vol, host, root):
                 left = session_daemons(session)
             record(not left, f'{how}: the daemons stopped and the volume locked',
                    f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
-            if how in ('SIGTERM', 'SIGINT'):
+            if how.startswith(('SIGTERM', 'SIGINT')):
                 ended = term.exited(15)
                 record(ended and term.rc == 0, f'{how}: the manager ended cleanly', f'{how}: the manager ended={ended} rc={term.rc}')
                 cooked = termios.tcgetattr(term.fd)[3] & termios.ICANON
@@ -670,13 +687,18 @@ def headless_int_ignored_leg(stratum, vol, host, root):
 
 def prompt_end_legs(stratum, vol, host, root):
     """At the passphrase prompt the session directory and host-fs already exist. Ended
-    there, by its terminal closing or by Ctrl-\\, the manager must not leave them."""
+    there, by its terminal closing, by Ctrl-\\ or by a QUIT, the manager must not leave them."""
     def close(term):
         os.close(term.fd)
 
     def quit_key(term):
-        # QUIT does not end the read; the passphrase and Enter do.
+        # A key at the prompt, as in the screen's passphrase dialog, not a signal: it gives up
+        # at once, with no Enter.
         term.send(b'\x1c')
+
+    def quit_sent(term):
+        # A QUIT sent by kill does not end the read; the passphrase and Enter do.
+        os.kill(term.pid, signal.SIGQUIT)
         time.sleep(0.5)
         try:
             term.send(PASS.encode() + ENTER)
@@ -692,6 +714,7 @@ def prompt_end_legs(stratum, vol, host, root):
 
     cases = (('its terminal closing at the prompt', close, ()),
              ('Ctrl-\\ at the prompt', quit_key, ()),
+             ('a QUIT sent at the prompt', quit_sent, ()),
              ('its terminal closing before Enter, HUP ignored', typed_then_close, (signal.SIGHUP,)))
     for i, (how, end, ignored) in enumerate(cases):
         env_file = f'{root}/env-prompt{i}'
@@ -706,7 +729,7 @@ def prompt_end_legs(stratum, vol, host, root):
                 raise Failure(f'{how}: session directory {session}, daemons {before}, '
                               'before the end: it proves nothing')
             end(term)
-            closed = end is not quit_key
+            closed = end in (close, typed_then_close)
             if closed:
                 limit = time.monotonic() + 30
                 while term.rc is None and time.monotonic() < limit:
@@ -725,9 +748,10 @@ def prompt_end_legs(stratum, vol, host, root):
             if not closed:
                 # Ended at the prompt, not by stratumd's start wait a moment later: the
                 # volume was never unlocked with a passphrase typed only to get out.
-                said = 'asked to stop at the passphrase prompt' in term.screen.text()
+                want = 'prompt was given up' if end is quit_key else 'asked to stop at the passphrase prompt'
+                said = want in term.screen.text()
                 record(said, f'{how}: it stopped at the prompt, before stratumd',
-                       f'{how}: it did not say it stopped at the prompt')
+                       f'{how}: it did not say {want!r}')
             limit = time.monotonic() + 30
             left = session_daemons(session)
             while left and time.monotonic() < limit:
@@ -736,9 +760,10 @@ def prompt_end_legs(stratum, vol, host, root):
             record(not left, f'{how}: host-fs stopped', f'{how}: daemons {left} still run, with no manager')
             record(not os.path.exists(session), f'{how}: the session directory is gone',
                    f'{how}: the session directory stayed')
-            # Written once slate is up, so stratumd was started if it exists.
-            record(not os.path.exists(env_file), f'{how}: stratumd never started',
-                   f'{how}: stratumd started and the volume was unlocked')
+            # Written once slate is up, after the unlock: its absence says the session ended
+            # before slate, and with a passphrase, before the volume was opened with it.
+            record(not os.path.exists(env_file), f'{how}: the session ended before slate',
+                   f'{how}: the session reached slate, so the volume was unlocked')
             for pid in left:
                 os.kill(int(pid), signal.SIGTERM)
         finally:
@@ -2053,6 +2078,46 @@ def delete_batch_legs(stratum, root):
         term.kill()
 
 
+def helper_checks():
+    """The helpers that find a manager's session directory, on what they are given rather than
+    on a manager: a miss in either strands a directory outside the run's root."""
+    # The --listen ends a host-fs line, and procps cuts a line at an exported COLUMNS.
+    listen = '/' + 'd' * 150
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)',
+                              'host-fs', 'h' * 100, '--listen', f'{listen}/host-fs.sock'])
+    columns = os.environ.get('COLUMNS')
+    os.environ['COLUMNS'] = '80'
+    try:
+        found = session_dir_of(os.getpid(), wait=5)
+    finally:
+        child.kill()
+        child.wait()
+        if columns is None:
+            os.environ.pop('COLUMNS')
+        else:
+            os.environ['COLUMNS'] = columns
+        SESSION_DIRS.pop(os.getpid(), None)
+    if found != listen:
+        raise Failure(f'session_dir_of read {found!r} off a ps line ending in {listen}/host-fs.sock')
+    if sys.platform == 'darwin':
+        # With TMPDIR unset std uses the user's temporary directory, and Python /tmp.
+        user = subprocess.run(['getconf', 'DARWIN_USER_TEMP_DIR'], capture_output=True, text=True).stdout.strip()
+        fake = 4_000_000 + os.getpid()
+        made = f"{user.rstrip('/')}/stratum-{fake}"
+        os.mkdir(made)
+        saved = {k: os.environ.pop(k) for k in ('TMPDIR', 'XDG_RUNTIME_DIR') if k in os.environ}
+        tempfile.tempdir = None
+        try:
+            got = session_dir_guesses(fake)
+        finally:
+            os.environ.update(saved)
+            tempfile.tempdir = None
+            os.rmdir(made)
+        if made not in got:
+            raise Failure(f'with TMPDIR unset the guesses {got} miss {made}')
+    print('ok: the session directory helpers find it off a long ps line and with TMPDIR unset', flush=True)
+
+
 def screen_checks():
     """The terminal and the pipe through Term.pump as a leg's run feeds them, from fds that
     share no line discipline: neither may move or split what the other shows."""
@@ -2245,6 +2310,7 @@ def main():
     os.environ['HOME'] = root
     try:
         screen_checks()
+        helper_checks()
         only = os.environ.get('KEYS_ONLY')
         if only:
             given = {'stratum': stratum, 'root': root, 'env_file': f'{root}/env2'}

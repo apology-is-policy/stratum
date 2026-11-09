@@ -92,7 +92,6 @@ impl Drop for DaemonGuard {
 
 /// One full test session: tempdir + stratumd + slate + host-fs.
 pub struct Session {
-    pub _tmp: tempfile::TempDir,
     pub bin: PathBuf,
     pub host_root: PathBuf,
     pub stm_path: PathBuf,
@@ -104,6 +103,8 @@ pub struct Session {
     pub _stratumd: DaemonGuard,
     pub _slate: DaemonGuard,
     pub _host_fs: DaemonGuard,
+    /// Last, as fields drop in order: the daemons are killed before their directory goes.
+    pub _tmp: tempfile::TempDir,
 }
 
 pub struct SessionBuilder {

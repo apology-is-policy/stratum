@@ -95,14 +95,17 @@ fn next_log_name() -> String {
     format!("spawn-{}.log", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// How long a daemon asked to stop has to unmount before it is killed.
+const STOP_GRACE: Duration = Duration::from_secs(30);
+
 /// TERM, then KILL only after a daemon has had time to unmount: its last commit
-/// happens on the way out, so a kill there loses what that commit would have
-/// made durable.
+/// happens on the way out, and there is no periodic commit, so a kill there loses
+/// every write since the commit before it.
 pub fn stop_child(child: &mut Child, name: &str) {
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
     }
-    let deadline = Instant::now() + crate::lifeline::STOP_DEADLINE;
+    let deadline = Instant::now() + STOP_GRACE;
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return,
@@ -222,6 +225,7 @@ impl SpawnCtx {
             .with_context(|| format!("spawn host-fs at {}", root.display()))?;
         if let Err(e) = wait_for_sock(&sock, Duration::from_secs(5)) {
             let _ = child.kill();
+            let _ = child.wait();
             return Err(e.context(format!(
                 "host-fs socket never appeared at {}",
                 sock.display()
