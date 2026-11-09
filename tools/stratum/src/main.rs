@@ -42,9 +42,24 @@ mod ui;
 mod volmap;
 
 fn main() -> Result<()> {
+    no_core_dumps();
     let args: Vec<String> = std::env::args().collect();
     let exit_code = dispatch(args)?;
     std::process::exit(exit_code);
+}
+
+/// A core holds whatever passphrase or key the process has in memory, and a signal's default
+/// action writes one: Ctrl-\ during the landing screen's mkfs is one key. None is ever
+/// written. Every child keeps the limit across exec, and each subcommand, this same binary,
+/// clears its own dumpable flag again, which exec sets.
+fn no_core_dumps() {
+    let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) };
+    // A core_pattern that pipes to a helper does not go by the limit.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0)
+    };
 }
 
 fn dispatch(args: Vec<String>) -> Result<i32> {
@@ -215,4 +230,41 @@ fn tui_dispatch(args: &[String]) -> Result<i32> {
         spawn: None,
     })?;
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    /// In a child, which starts with dumps allowed up to its hard limit, so the test process
+    /// keeps its own.
+    #[test]
+    fn core_dumps_are_off() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut lim) };
+            if lim.rlim_max == 0 {
+                unsafe { libc::_exit(2) };
+            }
+            lim.rlim_cur = lim.rlim_max;
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &lim) };
+            super::no_core_dumps();
+            let mut now = libc::rlimit { rlim_cur: 1, rlim_max: 1 };
+            #[allow(unused_mut)]
+            let mut off = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut now) } == 0
+                && now.rlim_cur == 0
+                && now.rlim_max == 0;
+            #[cfg(target_os = "linux")]
+            {
+                off = off && unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } == 0;
+            }
+            unsafe { libc::_exit(if off { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "the child did not exit: {status:#x}");
+        let code = libc::WEXITSTATUS(status);
+        assert_ne!(code, 2, "the hard core limit was 0 to start: it proves nothing");
+        assert_eq!(code, 0, "a core limit or, on Linux, the dumpable flag was left on");
+    }
 }

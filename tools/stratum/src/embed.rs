@@ -472,13 +472,22 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     ));
 
     // The screen saves the mode it finds and gives that back at its end, so it must find
-    // this one; headless mode only lets go.
+    // this one; headless mode only lets go. A stop asked first draws no screen, and one
+    // asked while it waited behind leaves the terminal to the shell.
+    let mut stop_first = false;
     if let Some(held) = echo_held.take() {
-        if !opts.headless {
-            held.give_back();
+        if opts.headless {
+            drop(held);
+        } else {
+            if !held.give_back(tui::stop_asked) {
+                never_stop_for_the_terminal();
+            }
+            stop_first = tui::stop_asked();
         }
     }
-    let result = if opts.headless {
+    let result = if stop_first {
+        Err(anyhow!("asked to stop before the screen"))
+    } else if opts.headless {
         run_headless(&slate_sock, &left_plan.sock, &prev_mask)
     } else {
         // Lifting the mask delivers whatever arrived while it was up.
@@ -594,7 +603,7 @@ fn spawn_daemon(cmd: &mut Command) -> std::io::Result<std::process::Child> {
 /// Headless mode past its prompt never needs to stop for the terminal: with SIGTTOU
 /// blocked, a write from behind goes through even under `stty tostop`, where it would
 /// stop the job, and a TERM, blocked until sigwait, could not end it until `fg`.
-fn never_stop_for_the_terminal() {
+pub(crate) fn never_stop_for_the_terminal() {
     let mut ttou: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::sigemptyset(&mut ttou);

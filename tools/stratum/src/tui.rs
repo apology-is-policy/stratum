@@ -339,6 +339,26 @@ pub fn stop_requested() -> bool {
     ASKED_TO_STOP.load(Ordering::Relaxed)
 }
 
+/// A stop asked, or one waiting while blocked, as TERM and INT wait until the screen: a
+/// shell's `kill %1` to a stopped job. One ignored is not a stop, though Linux keeps it
+/// pending while it is blocked.
+pub fn stop_asked() -> bool {
+    if stop_requested() {
+        return true;
+    }
+    let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigpending(&mut pending) } != 0 {
+        return false;
+    }
+    [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT].into_iter().any(|sig| {
+        let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+        let waiting = unsafe { libc::sigismember(&pending, sig) } == 1;
+        waiting
+            && unsafe { libc::sigaction(sig, std::ptr::null(), &mut act) } == 0
+            && act.sa_sigaction != libc::SIG_IGN
+    })
+}
+
 /// Ending by the default action would leave the terminal raw, the session
 /// directory behind and the daemons to find out for themselves; QUIT's would also
 /// dump core. A HUP, INT or QUIT someone has chosen to ignore, as nohup and a
@@ -427,8 +447,98 @@ pub fn run(opts: Opts) -> Result<()> {
 }
 
 fn put_terminal_back() {
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+    let tty = [0, 1, 2].into_iter().find(|&fd| unsafe { libc::isatty(fd) } == 1);
+    if job_in_front(tty) {
+        leave_screen(&mut io::stdout());
+    }
+}
+
+/// Cooked, the main screen, no mouse reports, the cursor shown. A set stopped behind and
+/// continued fails with EINTR on macOS, and crossterm keeps its saved mode then, so it is
+/// tried again.
+fn leave_screen(out: &mut impl io::Write) {
+    while disable_raw_mode().is_err_and(|e| e.kind() == io::ErrorKind::Interrupted) {}
+    let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+}
+
+/// Raw, the alternate screen, mouse reports. The shell may have put its own mode back at
+/// a stop while crossterm still counts the terminal raw, so its count is reset first.
+fn enter_screen(out: &mut impl io::Write) {
+    while disable_raw_mode().is_err_and(|e| e.kind() == io::ErrorKind::Interrupted) {}
+    while enable_raw_mode().is_err_and(|e| e.kind() == io::ErrorKind::Interrupted) {}
+    let _ = execute!(out, EnterAlternateScreen, EnableMouseCapture);
+}
+
+/// In front of its terminal, or with none to be behind.
+fn job_in_front(tty: Option<i32>) -> bool {
+    tty.is_none_or(|fd| unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() })
+}
+
+static SUSPEND_ASKED: AtomicBool = AtomicBool::new(false);
+static CONTINUED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn ask_to_suspend(_: libc::c_int) {
+    SUSPEND_ASKED.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn note_continue(_: libc::c_int) {
+    CONTINUED.store(true, Ordering::Relaxed);
+}
+
+/// The screen's job control, as vim's: SIGTSTP and SIGCONT noted for the loop, each only
+/// where its action is the default. Returns the actions to put back.
+fn catch_job_control() -> Vec<(libc::c_int, libc::sigaction)> {
+    let mut caught = Vec::new();
+    for (sig, handler) in [(libc::SIGTSTP, ask_to_suspend as extern "C" fn(libc::c_int)), (libc::SIGCONT, note_continue)] {
+        let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+        act.sa_sigaction = handler as libc::sighandler_t;
+        act.sa_flags = libc::SA_RESTART;
+        unsafe { libc::sigemptyset(&mut act.sa_mask) };
+        if let Some(old) = crate::passphrase::take_over(sig, &act) {
+            caught.push((sig, old));
+        }
+    }
+    caught
+}
+
+/// A SIGTSTP from outside (raw mode reads Ctrl-Z as a key): the terminal put back if in
+/// front, then the stop. Continued, the screen takes the terminal again once in front, and
+/// behind waits stopped until `fg`, as a set from behind does; a stop asked meanwhile ends
+/// the wait with the terminal left to the shell. Returns whether the screen is back.
+fn job_control(out: &mut impl io::Write, tty: Option<i32>) -> bool {
+    if SUSPEND_ASKED.swap(false, Ordering::Relaxed) {
+        if job_in_front(tty) {
+            leave_screen(out);
+        }
+        unsafe { crate::passphrase::stop_by(libc::SIGTSTP) };
+        let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+        act.sa_sigaction = ask_to_suspend as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        act.sa_flags = libc::SA_RESTART;
+        unsafe { libc::sigaction(libc::SIGTSTP, &act, std::ptr::null_mut()) };
+    }
+    CONTINUED.store(false, Ordering::Relaxed);
+    loop {
+        if ASKED_TO_STOP.load(Ordering::Relaxed) {
+            return false;
+        }
+        if job_in_front(tty) {
+            enter_screen(out);
+            return true;
+        }
+        // A SIGTTOU stops it only at its default action, and only while not blocked; and
+        // an orphaned group is never stopped. Each look then waits a moment.
+        let mut ttou: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let stops = unsafe {
+            libc::sigaction(libc::SIGTTOU, std::ptr::null(), &mut ttou) == 0
+                && libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) == 0
+                && libc::sigismember(&mask, libc::SIGTTOU) == 0
+        } && ttou.sa_sigaction == libc::SIG_DFL;
+        if stops {
+            unsafe { libc::kill(libc::getpid(), libc::SIGTTOU) };
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// A panic on the UI thread prints over the raw alternate screen, and leaves the
@@ -487,6 +597,7 @@ fn run_ui(
         .into_iter()
         .filter(|&fd| unsafe { libc::isatty(fd) } == 1)
         .collect();
+    let tty = ttys.first().copied();
     if !ttys.is_empty() {
         exit_when_terminal_goes(ttys, spawn.as_ref().map(|s| s.session_dir.clone()));
     }
@@ -507,6 +618,7 @@ fn run_ui(
             return Err(anyhow::Error::new(e).context("create terminal"));
         }
     };
+    let job_control_caught = catch_job_control();
 
     let mut focus: usize = 0;
     let mut local_dialog: Option<LocalDialog> = None;
@@ -842,6 +954,14 @@ fn run_ui(
                 if ASKED_TO_STOP.load(Ordering::Relaxed) {
                     return Ok(());
                 }
+                if SUSPEND_ASKED.load(Ordering::Relaxed) || CONTINUED.load(Ordering::Relaxed) {
+                    if !job_control(terminal.backend_mut(), tty) {
+                        return Ok(());
+                    }
+                    // What the shell drew meanwhile is not in ratatui's last frame.
+                    let _ = terminal.clear();
+                    break;
+                }
                 // SWISS-4h: tick the main loop so a batch in progress
                 // can advance even without keyboard activity.
                 // SWISS-8g: same for in-progress /ctl/ admin jobs —
@@ -870,9 +990,26 @@ fn run_ui(
         }
     })();
 
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
-    if terminal.show_cursor().is_ok() {
+    // Put back only in front: behind, the shell has the terminal, and a set from there
+    // would stop until `fg`. A stop that comes meanwhile lands once the handlers have gone.
+    let mut jobs: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut jobs);
+        for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU, libc::SIGCONT] {
+            libc::sigaddset(&mut jobs, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &jobs, &mut prev);
+    }
+    let front = job_in_front(tty);
+    if front {
+        leave_screen(terminal.backend_mut());
+    }
+    for (sig, old) in job_control_caught {
+        unsafe { libc::sigaction(sig, &old, std::ptr::null_mut()) };
+    }
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()) };
+    if front && terminal.show_cursor().is_ok() {
         drop(std::mem::ManuallyDrop::into_inner(terminal));
     }
     result
@@ -1667,11 +1804,11 @@ fn handle_dialog_key(
         }
         KeyCode::Char(_) => {
             if let Some(c) = typed_char(&key) {
-                if d.is_password {
-                    d.value.type_secret(c);
-                } else {
-                    d.value.push(c);
+                // An error or a notice takes no text: its value is never drawn.
+                if d.is_error || matches!(d.kind, LocalDialogKind::Error) {
+                    return Ok(Action::Ignore);
                 }
+                d.value.type_within(c, text_max(d));
                 return Ok(Action::Refresh);
             }
         }
@@ -1679,6 +1816,21 @@ fn handle_dialog_key(
     }
     Ok(Action::Ignore)
 }
+
+/// The most a dialog's field takes, in bytes: what is typed past it is counted, so a paste
+/// neither grows the field nor is cut short, and the submit refuses it.
+fn text_max(d: &LocalDialog) -> usize {
+    if d.is_password {
+        return crate::passphrase::PASSPHRASE_MAX;
+    }
+    match d.kind {
+        LocalDialogKind::MkDirInput { .. } | LocalDialogKind::SnapInput { .. } => NAME_MAX,
+        _ => libc::PATH_MAX as usize,
+    }
+}
+
+/// A name, of a directory or a snapshot: one path component.
+const NAME_MAX: usize = 255;
 
 /// SWISS-4f: dispatch keystrokes when a Confirm dialog is active.
 /// Left/Right/Tab cycle through options; Enter picks the highlighted
@@ -2803,6 +2955,10 @@ fn submit_dialog(
 ) -> Result<Action> {
     if dialog.is_error {
         // Error dialogs are dismiss-only.
+        return Ok(Action::Refresh);
+    }
+    if dialog.value.past_limit() && !dialog.is_password {
+        *local_dialog = Some(error_dialog(&format!("Too long: at most {} bytes.", text_max(&dialog))));
         return Ok(Action::Refresh);
     }
     match dialog.kind {
@@ -5135,6 +5291,113 @@ mod tests {
             handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Backspace, M::NONE)).expect("a key");
             assert_eq!(field(&dialog), (max - 1, max - 1, false), "{where_}: one more erased");
         }
+    }
+
+    // A character that would cross the limit is counted whole, never kept in part, in both
+    // screen fields, and the prompt refuses the same keys; erased and replaced by one that
+    // fits, the same 255 bytes are made at all three.
+    #[test]
+    fn a_character_crossing_the_limit_is_counted_whole() {
+        use crossterm::event::{KeyCode as K, KeyEvent, KeyModifiers as M};
+        let max = crate::passphrase::PASSPHRASE_MAX;
+        let mut keys: Vec<(&[u8], KeyEvent)> = vec![(b"a", KeyEvent::new(K::Char('a'), M::NONE)); max - 1];
+        keys.push(("\u{e9}".as_bytes(), KeyEvent::new(K::Char('\u{e9}'), M::NONE)));
+        let snap = blank_snap();
+        let mut job = None;
+        let mut mk = MkVolState::new(0);
+        mk.encrypt = true;
+        mk.field = MkVolField::Passphrase;
+        for (where_, kind) in [
+            ("the passphrase dialog", LocalDialogKind::PassphraseFor { volume: "/v.stm".into() }),
+            ("the wizard", LocalDialogKind::MkVol(mk)),
+        ] {
+            let is_password = matches!(kind, LocalDialogKind::PassphraseFor { .. });
+            let mut dialog =
+                Some(LocalDialog { kind, prompt: String::new(), value: Default::default(), is_password, is_error: false });
+            for (_, key) in &keys {
+                handle_dialog_key(&mut dialog, &mut job, None, &snap, *key).expect("a key");
+            }
+            let s = match dialog.as_ref().expect("the dialog stays open") {
+                LocalDialog { kind: LocalDialogKind::MkVol(mk), .. } => &mk.passphrase,
+                d => &d.value,
+            };
+            assert_eq!((s.len(), s.typed(), s.past_limit()), (max - 1, max, true), "{where_}");
+        }
+        let mut typed: Vec<u8> = keys.iter().flat_map(|(b, _)| b.iter().copied()).collect();
+        typed.push(b'\n');
+        assert!(crate::passphrase::read_line(&mut &typed[..]).is_err(), "the prompt took it");
+        keys.push((b"\x7f", KeyEvent::new(K::Backspace, M::NONE)));
+        keys.push((b"b", KeyEvent::new(K::Char('b'), M::NONE)));
+        let mut want = vec![b'a'; max - 1];
+        want.push(b'b');
+        same_passphrase_everywhere(&keys, &want);
+    }
+
+    // Again past the limit, the passphrase at it: the two differ, though the bytes kept agree.
+    #[test]
+    fn a_confirm_past_the_limit_differs() {
+        use crossterm::event::{KeyCode as K, KeyEvent, KeyModifiers as M};
+        let max = crate::passphrase::PASSPHRASE_MAX;
+        let snap = blank_snap();
+        let mut job = None;
+        let mut mk = MkVolState::new(0);
+        mk.name = "v.stm".into();
+        mk.size = "64M".into();
+        mk.encrypt = true;
+        let mut dialog = Some(LocalDialog {
+            kind: LocalDialogKind::MkVol(mk),
+            prompt: String::new(),
+            value: Default::default(),
+            is_password: false,
+            is_error: false,
+        });
+        for (field, n) in [(MkVolField::Passphrase, max), (MkVolField::Confirm, max + 1)] {
+            if let Some(LocalDialog { kind: LocalDialogKind::MkVol(mk), .. }) = dialog.as_mut() {
+                mk.field = field;
+            }
+            for _ in 0..n {
+                handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Char('a'), M::NONE)).expect("a key");
+            }
+        }
+        let Some(LocalDialog { kind: LocalDialogKind::MkVol(mk), .. }) = dialog.as_mut() else {
+            panic!("the wizard closed");
+        };
+        assert!(*mk.passphrase == *mk.confirm && mk.confirm.past_limit(), "not the case under test");
+        mk.field = MkVolField::Ok;
+        handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Enter, M::NONE)).expect("Enter");
+        let error = match dialog.as_ref() {
+            Some(LocalDialog { kind: LocalDialogKind::MkVol(mk), .. }) => mk.error.clone(),
+            other => panic!("the wizard went on to {:?}", other.map(|d| &d.prompt)),
+        };
+        assert_eq!(error.as_deref(), Some("The two passphrases differ."));
+    }
+
+    // The other text fields are bounded too: a name at 255 bytes, a path at PATH_MAX, the rest
+    // counted and refused on submit; an error dialog takes no text at all.
+    #[test]
+    fn the_text_fields_are_bounded() {
+        use crossterm::event::{KeyCode as K, KeyEvent, KeyModifiers as M};
+        let snap = blank_snap();
+        let mut job = None;
+        for (kind, max) in [
+            (LocalDialogKind::MkDirInput { panel_idx: 0 }, NAME_MAX),
+            (LocalDialogKind::SnapInput { panel_idx: 0, dataset_id: 1 }, NAME_MAX),
+            (LocalDialogKind::HostMountInput { panel_idx: 0 }, libc::PATH_MAX as usize),
+        ] {
+            let mut dialog =
+                Some(LocalDialog { kind, prompt: String::new(), value: Default::default(), is_password: false, is_error: false });
+            for _ in 0..max + 10 {
+                handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Char('a'), M::NONE)).expect("a key");
+            }
+            let v = &dialog.as_ref().expect("the dialog stays open").value;
+            assert_eq!((v.len(), v.typed(), v.past_limit()), (max, max + 10, true));
+            handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Enter, M::NONE)).expect("Enter");
+            let said = dialog.as_ref().map(|d| d.prompt.clone()).unwrap_or_default();
+            assert_eq!(said, format!("Too long: at most {max} bytes."));
+        }
+        let mut dialog = Some(error_dialog("Something failed."));
+        handle_dialog_key(&mut dialog, &mut job, None, &snap, KeyEvent::new(K::Char('a'), M::NONE)).expect("a key");
+        assert_eq!(dialog.as_ref().map(|d| d.value.typed()), Some(0), "the error dialog took text");
     }
 
     // At the limit exactly, a passphrase gets past the length check in the wizard and the

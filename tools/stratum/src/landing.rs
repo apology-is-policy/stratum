@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 
 use crate::embed;
@@ -183,6 +184,7 @@ fn prompt_new() -> Result<()> {
     }
     // Wiped now, not when the session it opens has ended.
     drop(pass);
+    let mkfs_pid = child.id();
     let out = child.wait_with_output().context("wait for mkfs")?;
     let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if crate::tui::stop_requested() {
@@ -190,10 +192,22 @@ fn prompt_new() -> Result<()> {
         if out.status.success() {
             bail!("asked to stop while mkfs ran: {} was made, and was not opened", path.display());
         }
-        // What a mkfs ended by a signal leaves, its own cleanup never having run, is the file
-        // it claimed and the key it says it was sealing; no one else knows their names.
-        let mkfs_said = if said.is_empty() { String::new() } else { format!("; mkfs said: {said}") };
-        bail!("asked to stop while mkfs ran: it did not finish, so {} is not a volume{mkfs_said}", path.display());
+        let Some(sig) = out.status.signal() else {
+            // It failed on its own, and cleaned up after itself.
+            bail!("asked to stop while mkfs ran, and mkfs failed: {said}");
+        };
+        // Ended by a signal, its own cleanup never ran: what it claimed stays, the file and
+        // the key it was sealing, and only their names say what they are.
+        let left: Vec<String> = [path.display().to_string(), format!("{}.key.new.{mkfs_pid}", path.display())]
+            .into_iter()
+            .filter(|f| Path::new(f).exists())
+            .collect();
+        let left = match left.len() {
+            0 => String::new(),
+            1 => format!("; it left {}: remove it before trying again", left[0]),
+            _ => format!("; it left {}: remove them before trying again", left.join(" and ")),
+        };
+        bail!("asked to stop while mkfs ran: signal {sig} ended mkfs before it finished, so {} is not a volume{left}", path.display());
     }
     if !out.status.success() {
         drop(held);
@@ -201,7 +215,12 @@ fn prompt_new() -> Result<()> {
         return Ok(());
     }
     // The manager's own prompt reads the mode next, and must find it as it was.
-    held.give_back();
+    if !held.give_back(crate::tui::stop_asked) {
+        crate::embed::never_stop_for_the_terminal();
+    }
+    if crate::tui::stop_asked() {
+        bail!("asked to stop: {} was made, and was not opened", path.display());
+    }
     println!("              Created {}. Keep {}.key beside it.", path.display(), path.display());
     open_volume(&path)
 }

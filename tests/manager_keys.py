@@ -17,6 +17,7 @@ import inspect
 import os
 import pty
 import re
+import resource
 import select
 import shlex
 import shutil
@@ -963,17 +964,27 @@ def pending_hup_leg(stratum, vol, host, root):
 # to start; SIGUSR1 takes the terminal back, as Ctrl-Z then `bg` leave it; SIGUSR2 gives it
 # back and continues the job, as `fg`. Only a parent in the same session lets a job stop on
 # SIGTTOU: the harness's own child is a session leader, whose group is orphaned. --tostop sets
-# `stty tostop` first; --editor, as a line editor does, turns echo and canonical mode off each
-# time it takes the terminal, where a shell such as dash leaves the mode as it finds it.
+# `stty tostop` first; --editor, as bash with readline does, puts back the mode it saved at the
+# start with echo and canonical mode off each time it takes the terminal, where a shell such
+# as dash leaves the mode as it finds it.
+# --report=PATH appends each stop of the job, with its signal, and each continue to PATH: on
+# the screen each would overwrite the last. A continue the job stops again just after may be
+# reported as the stop alone.
 JOB_SHELL = r"""
 import os, signal, sys, termios
 flags = set()
 while sys.argv[1].startswith('--'):
     flags.add(sys.argv.pop(1))
+report = None
+for f in flags:
+    if f.startswith('--report='):
+        report = os.open(f[len('--report='):], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 if '--tostop' in flags:
     a = termios.tcgetattr(0)
     a[3] |= termios.TOSTOP
     termios.tcsetattr(0, termios.TCSANOW, a)
+editor = termios.tcgetattr(0)
+editor[3] &= ~(termios.ECHO | termios.ICANON)
 signal.signal(signal.SIGTTOU, signal.SIG_IGN)
 r, w = os.pipe()
 pid = os.fork()
@@ -994,9 +1005,7 @@ os.close(w)
 def behind(*_):
     os.tcsetpgrp(0, os.getpgrp())
     if '--editor' in flags:
-        a = termios.tcgetattr(0)
-        a[3] &= ~(termios.ECHO | termios.ICANON)
-        termios.tcsetattr(0, termios.TCSANOW, a)
+        termios.tcsetattr(0, termios.TCSANOW, editor)
     os.write(1, b'[behind %d]\r\n' % (os.tcgetpgrp(0) == os.getpgrp()))
 def front(*_):
     os.tcsetpgrp(0, pid)
@@ -1007,7 +1016,14 @@ signal.signal(signal.SIGUSR1, behind)
 signal.signal(signal.SIGUSR2, front)
 for sig in (signal.SIGTERM, signal.SIGHUP):
     signal.signal(sig, forward)
-_, status = os.waitpid(pid, 0)
+while True:
+    _, status = os.waitpid(pid, 0 if report is None else os.WUNTRACED | os.WCONTINUED)
+    if os.WIFSTOPPED(status):
+        os.write(report, b'stopped %d\n' % os.WSTOPSIG(status))
+    elif os.WIFCONTINUED(status):
+        os.write(report, b'continued\n')
+    else:
+        break
 sys.exit(os.waitstatus_to_exitcode(status) & 0xff)
 """
 
@@ -1061,32 +1077,100 @@ def job_behind(term, how):
         raise Failure(f'{how}: the job shell did not take the terminal: it proves nothing')
 
 
+def wait_until(term, what, timeout):
+    """`what()` once true, or when the time is up. The terminal is read meanwhile: one set
+    with TCSAFLUSH waits for its output to be read."""
+    limit = time.monotonic() + timeout
+    got = what()
+    while not got and time.monotonic() < limit:
+        term.pump(0.05)
+        got = what()
+    return got
+
+
+HELD_MODES = {'ECHO': False, 'ICANON': True, 'ISIG': True}
+RAW_MODES = {'ECHO': False, 'ICANON': False, 'ISIG': False}
+
+
+def ctrl_z(term, how, manager):
+    """Ctrl-Z while echo is held: the job stops with the terminal given back, echo on (echo held
+    off before it is the control, in hold_stratumd)."""
+    term.send(b'\x1a')
+    state = wait_state(term, manager, 'T', 10)
+    if 'T' not in state:
+        raise Failure(f'{how}: Ctrl-Z did not stop it, its state {state!r}: it proves nothing')
+    modes = tty_modes(term)
+    record(all(modes.values()), f'{how}: the terminal was given back at the stop, echo on',
+           f'{how}: the terminal at the stop: {modes}')
+
+
+def continued(term, how, manager):
+    if not wait_until(term, lambda: 'T' not in state_of(manager), 10):
+        raise Failure(f'{how}: it was not continued: it proves nothing')
+
+
+def held_again(term, how):
+    held = wait_until(term, lambda: tty_modes(term) == HELD_MODES, 5)
+    record(held, f'{how}: continued in front, echo is held off again',
+           f'{how}: continued in front, the terminal is {tty_modes(term)}')
+
+
 def headless_behind_leg(stratum, vol, host, root):
-    """Headless, moved behind while stratumd derives the key. It is done with the terminal, so
-    however the unlock ends it must neither stop on SIGTTOU to give the terminal back nor set the
-    mode under the shell, which has its own by then; and a TERM, a shell's `kill %1`, must end it."""
+    """Headless, under job control while stratumd derives the key. However the unlock ends, it
+    must neither stop on SIGTTOU to give the terminal back nor set the mode under the shell,
+    which has its own by then; continued in front, echo is held off again; a TERM, a shell's
+    `kill %1`, must end it."""
     def moved(term, how, manager):
         job_behind(term, how)
+        return False
 
     def ctrl_z_then_bg(term, how, manager):
         # A shell that keeps no mode of its own, dash say, leaves the one the job had at its stop.
-        term.send(b'\x1a')
-        state = wait_state(term, manager, 'T', 10)
-        if 'T' not in state:
-            raise Failure(f'{how}: Ctrl-Z did not stop it, its state {state!r}: it proves nothing')
-        modes = tty_modes(term)
-        record(all(modes.values()), f'{how}: the terminal was given back at the stop, echo on',
-               f'{how}: the terminal at the stop: {modes}')
+        ctrl_z(term, how, manager)
         job_behind(term, how)
         os.killpg(os.getpgid(manager), signal.SIGCONT)
+        return False
+
+    def ctrl_z_then_fg(term, how, manager):
+        ctrl_z(term, how, manager)
+        os.kill(term.pid, signal.SIGUSR2)
+        continued(term, how, manager)
+        held_again(term, how)
+        return True
+
+    def ctrl_z_bg_then_fg(term, how, manager):
+        # The continue alone: nothing stops it on the way back to the front.
+        ctrl_z_then_bg(term, how, manager)
+        continued(term, how, manager)
+        os.kill(term.pid, signal.SIGUSR2)
+        held_again(term, how)
+        return True
+
+    def tstp_behind(term, how, manager):
+        # A stop sent to it behind, as `kill -TSTP %1`: the shell has the terminal, and it is
+        # not set under it.
+        ctrl_z_then_bg(term, how, manager)
+        continued(term, how, manager)
+        os.kill(manager, signal.SIGTSTP)
+        state = wait_state(term, manager, 'T', 10)
+        if 'T' not in state:
+            raise Failure(f'{how}: the TSTP did not stop it, its state {state!r}: it proves nothing')
+        modes = tty_modes(term)
+        record(modes == EDITOR_MODES, f'{how}: stopped behind, the shell\'s mode was left alone',
+               f'{how}: stopped behind, the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
+        os.killpg(os.getpgid(manager), signal.SIGCONT)
+        return False
 
     # Under `stty tostop` a write from behind stops the job: neither its daemons, each in a group
     # of its own and so never in front, nor the manager behind may write that way.
     cases = (('headless, in front, tostop set', ('--tostop',), PASS, None),
              ('headless, moved behind during the unlock, tostop set', ('--tostop',), PASS, moved),
              ('headless, Ctrl-Z during the unlock, then bg', (), PASS, ctrl_z_then_bg),
+             ('headless, Ctrl-Z during the unlock, then fg', (), PASS, ctrl_z_then_fg),
+             ('headless, Ctrl-Z during the unlock, bg, then fg', (), PASS, ctrl_z_bg_then_fg),
+             ('headless, a TSTP sent behind during the unlock', (), PASS, tstp_behind),
              ('headless, moved behind during the unlock, the passphrase wrong', (), 'not the passphrase', moved))
-    for how, flags, passphrase, behind in cases:
+    for how, flags, passphrase, job in cases:
         term = Term([sys.executable, '-I', '-c', JOB_SHELL, '--editor', *flags, stratum, 'tui', '--headless',
                      '--vol', vol.v, '--host', host])
         manager, held, session = None, [], None
@@ -1098,27 +1182,22 @@ def headless_behind_leg(stratum, vol, host, root):
                 raise Failure(f'{how}: manager {manager}, session {session}: it proves nothing')
             term.send(passphrase.encode() + ENTER)
             held = hold_stratumd(term, how, f'{session}/stratumd.sock')
-            if behind:
-                behind(term, how, manager)
+            front = job(term, how, manager) if job else True
             for pid in held:
                 os.kill(int(pid), signal.SIGCONT)
             if passphrase == PASS:
-                limit = time.monotonic() + 60
-                up = False
-                while not up and time.monotonic() < limit:
-                    term.pump(0.2)
-                    up = 'daemons running' in term.screen.text()
+                up = wait_until(term, lambda: 'daemons running' in term.screen.text(), 60)
                 state = state_of(manager)
                 daemons = {pid: state_of(int(pid)) for pid in session_daemons(session)}
                 record(up and 'T' not in state, f'{how}: it came up, not stopped for the terminal',
                        f'{how}: up={up}, its state {state!r}, its daemons {daemons}')
                 modes = tty_modes(term)
-                if behind:
-                    record(modes == EDITOR_MODES, f'{how}: the shell\'s mode was left as the shell set it',
-                           f'{how}: the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
-                else:
+                if front:
                     record(all(modes.values()), f'{how}: once up, the terminal was given back as it was',
                            f'{how}: once up, the terminal is {modes}')
+                else:
+                    record(modes == EDITOR_MODES, f'{how}: the shell\'s mode was left as the shell set it',
+                           f'{how}: the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
                 os.kill(manager, signal.SIGTERM)
                 ended = term.exited(30)
                 record(ended, f'{how}: a TERM ended it', f'{how}: a TERM did not end it')
@@ -1142,22 +1221,26 @@ def headless_behind_leg(stratum, vol, host, root):
             print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
             raise
         finally:
-            for pid in held:
-                try:
-                    os.kill(int(pid), signal.SIGCONT)
-                except ProcessLookupError:
-                    pass
-            if term.rc is None:
-                # As `fg`: a manager stopped behind gives the terminal back, then a TERM ends it.
-                try:
-                    os.kill(term.pid, signal.SIGUSR2)
-                except ProcessLookupError:
-                    pass
-                term.pump(1)
-            term.kill()
-            if session:
-                for pid in session_daemons(session):
-                    os.kill(int(pid), signal.SIGTERM)
+            job_cleanup(term, held, session)
+
+
+def job_cleanup(term, held, session):
+    for pid in held:
+        try:
+            os.kill(int(pid), signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+    if term.rc is None:
+        # As `fg`: a manager stopped behind gives the terminal back, then a TERM ends it.
+        try:
+            os.kill(term.pid, signal.SIGUSR2)
+        except ProcessLookupError:
+            pass
+        term.pump(1)
+    term.kill()
+    if session:
+        for pid in session_daemons(session):
+            os.kill(int(pid), signal.SIGTERM)
 
 
 def screen_behind_leg(stratum, vol, host, root):
@@ -1166,24 +1249,10 @@ def screen_behind_leg(stratum, vol, host, root):
     screen's end then leaves the terminal as it was, echo on. Without that, the screen's own mode
     set is what stops behind: on macOS it then fails with EINTR, which the screen library does not
     retry; where it is restarted instead, the screen saves the held mode the job shell left in
-    place, and puts that back at its end."""
-    how = 'the screen, moved behind during the unlock'
-    term = Term([sys.executable, '-I', '-c', JOB_SHELL, stratum, 'tui', '--vol', vol.v, '--host', host])
-    manager, held, session = None, [], None
-    try:
-        term.expect(r'Passphrase for')
-        manager = child_running(term.pid, 'tui')
-        session = session_dir_of(manager) if manager else None
-        if not session:
-            raise Failure(f'{how}: manager {manager}, session {session}: it proves nothing')
-        term.send(PASS.encode() + ENTER)
-        held = hold_stratumd(term, how, f'{session}/stratumd.sock')
-        job_behind(term, how)
-        for pid in held:
-            os.kill(int(pid), signal.SIGCONT)
-        state = wait_state(term, manager, 'T', 60)
-        if 'T' not in state:
-            raise Failure(f'{how}: it never stopped behind, its state {state!r}: it proves nothing')
+    place, and puts that back at its end. A stop asked while it waits behind, a shell's `kill %1`
+    or `kill -HUP %1` (each sent with a continue, as a shell sends them to a stopped job), ends it
+    there with the terminal left to the shell."""
+    def fg_then_quit(term, how, manager):
         os.kill(term.pid, signal.SIGUSR2)
         term.expect(r'MkDir', timeout=60)
         term.send(F10)
@@ -1192,25 +1261,194 @@ def screen_behind_leg(stratum, vol, host, root):
         record(ended and term.rc == 0 and all(modes.values()),
                f'{how}: after fg and F10 the terminal was given back as it was',
                f'{how}: ended={ended} rc={term.rc}, the terminal was left {modes}')
-    except Failure:
-        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
-        raise
-    finally:
-        for pid in held:
-            try:
+
+    def asked_to_stop(sig):
+        def stop(term, how, manager):
+            os.kill(manager, sig)
+            os.killpg(os.getpgid(manager), signal.SIGCONT)
+            ended = term.exited(30)
+            said = 'asked to stop before the screen' in term.screen.text()
+            state = '' if ended else state_of(manager)
+            record(ended and term.rc == 1 and said, f'{how}: it ended there, rc 1, and said so',
+                   f'{how}: ended={ended} rc={term.rc}, said so={said}, its state {state!r}')
+            modes = tty_modes(term)
+            record(modes == EDITOR_MODES, f'{how}: the shell\'s mode was left as the shell set it',
+                   f'{how}: the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
+        return stop
+
+    cases = (('the screen, moved behind during the unlock', (), fg_then_quit),
+             ('the screen, waiting behind for fg, sent a TERM', ('--editor',), asked_to_stop(signal.SIGTERM)),
+             ('the screen, waiting behind for fg, sent a HUP', ('--editor',), asked_to_stop(signal.SIGHUP)))
+    for how, flags, then in cases:
+        term = Term([sys.executable, '-I', '-c', JOB_SHELL, *flags, stratum, 'tui', '--vol', vol.v, '--host', host])
+        manager, held, session = None, [], None
+        try:
+            term.expect(r'Passphrase for')
+            manager = child_running(term.pid, 'tui')
+            session = session_dir_of(manager) if manager else None
+            if not session:
+                raise Failure(f'{how}: manager {manager}, session {session}: it proves nothing')
+            term.send(PASS.encode() + ENTER)
+            held = hold_stratumd(term, how, f'{session}/stratumd.sock')
+            job_behind(term, how)
+            for pid in held:
                 os.kill(int(pid), signal.SIGCONT)
-            except ProcessLookupError:
-                pass
-        if term.rc is None:
-            try:
-                os.kill(term.pid, signal.SIGUSR2)
-            except ProcessLookupError:
-                pass
-            term.pump(1)
+            state = wait_state(term, manager, 'T', 60)
+            if 'T' not in state:
+                raise Failure(f'{how}: it never stopped behind, its state {state!r}: it proves nothing')
+            then(term, how, manager)
+            if session:
+                limit = time.monotonic() + 30
+                while session_daemons(session) and time.monotonic() < limit:
+                    time.sleep(0.2)
+                record(not session_daemons(session) and not os.path.exists(session),
+                       f'{how}: the daemons stopped, the session directory went',
+                       f'{how}: daemons {session_daemons(session)}, session directory stayed={os.path.exists(session)}')
+        except Failure:
+            print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+            raise
+        finally:
+            job_cleanup(term, held, session)
+
+
+def screen_job_control_leg(stratum, vol, host, root):
+    """The screen under job control, as vim is. A TSTP from outside (raw mode reads Ctrl-Z as a
+    key) puts the terminal back before it stops, and `fg` takes it raw again. Stopped by a STOP,
+    which nothing can catch, then continued behind by `bg`, it stops again rather than draw from
+    behind; a `kill -HUP %1` there ends it with the terminal left to the shell, not stopped for
+    it and not set under it."""
+    def tstp_then_fg(term, how, manager):
+        os.kill(manager, signal.SIGTSTP)
+        state = wait_state(term, manager, 'T', 10)
+        if 'T' not in state:
+            raise Failure(f'{how}: the TSTP did not stop it, its state {state!r}: it proves nothing')
+        modes = tty_modes(term)
+        record(all(modes.values()), f'{how}: stopped, the terminal was put back first',
+               f'{how}: stopped, the terminal is {modes}')
+        os.kill(term.pid, signal.SIGUSR2)
+        raw = wait_until(term, lambda: tty_modes(term) == RAW_MODES, 10)
+        record(raw, f'{how}: after fg the screen took the terminal again',
+               f'{how}: after fg the terminal is {tty_modes(term)}')
+        term.send(F10)
+        ended = term.exited(60)
+        modes = tty_modes(term)
+        record(ended and term.rc == 0 and all(modes.values()), f'{how}: F10 then gave the terminal back as it was',
+               f'{how}: ended={ended} rc={term.rc}, the terminal was left {modes}')
+
+    report = os.path.join(root, 'job-report')
+
+    def reports():
+        try:
+            with open(report) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def stop_bg_hup(term, how, manager):
+        os.kill(manager, signal.SIGSTOP)
+        stop = f'stopped {int(signal.SIGSTOP)}'
+        if not wait_until(term, lambda: reports() == [stop], 10):
+            raise Failure(f'{how}: the shell saw {reports()}, not {[stop]}: it proves nothing')
+        job_behind(term, how)
+        os.killpg(os.getpgid(manager), signal.SIGCONT)
+        # It stops again within a tick of the continue, too soon for a poll of its state to see
+        # it running. A second stop can only follow a continue, and SIGTTOU is the stop a job
+        # behind takes for the terminal.
+        ttou = f'stopped {int(signal.SIGTTOU)}'
+        again = wait_until(term, lambda: ttou in reports()[1:], 10)
+        record(again, f'{how}: continued behind, it stopped again on SIGTTOU rather than draw from behind',
+               f'{how}: continued behind, the shell saw {reports()[1:]}, no {ttou!r}; its state {state_of(manager)!r}')
+        os.kill(manager, signal.SIGHUP)
+        os.killpg(os.getpgid(manager), signal.SIGCONT)
+        ended = term.exited(30)
+        state = '' if ended else state_of(manager)
+        record(ended, f'{how}: a HUP ended it behind', f'{how}: a HUP did not end it, its state {state!r}')
+        modes = tty_modes(term)
+        record(modes == EDITOR_MODES, f'{how}: the shell\'s mode was left as the shell set it',
+               f'{how}: the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
+
+    cases = (('the screen, a TSTP from outside, then fg', (), tstp_then_fg),
+             ('the screen, a STOP, bg, then kill -HUP', ('--editor', f'--report={report}'), stop_bg_hup))
+    for how, flags, then in cases:
+        if os.path.exists(report):
+            os.unlink(report)
+        term = Term([sys.executable, '-I', '-c', JOB_SHELL, *flags, stratum, 'tui', '--vol', vol.v, '--host', host])
+        manager, session = None, None
+        try:
+            term.expect(r'Passphrase for')
+            manager = child_running(term.pid, 'tui')
+            session = session_dir_of(manager) if manager else None
+            term.send(PASS.encode() + ENTER)
+            term.expect(r'MkDir', timeout=60)
+            if tty_modes(term) != RAW_MODES:
+                raise Failure(f'{how}: the screen is up but the terminal is {tty_modes(term)}: it proves nothing')
+            then(term, how, manager)
+        except Failure:
+            print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+            raise
+        finally:
+            job_cleanup(term, [], session)
+
+
+# Runs a program with core dumps allowed up to the hard limit, as a shell's `ulimit -c
+# unlimited` leaves it.
+CORE_ALLOWED = r"""
+import os, resource, sys
+hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+resource.setrlimit(resource.RLIMIT_CORE, (hard, hard))
+os.execv(sys.argv[1], sys.argv[1:])
+"""
+
+
+def core_dumps_off_leg(stratum, vol, host, root):
+    """No stratum process dumps core, a passphrase or a key in it: started with dumps allowed,
+    the manager and each daemon it starts run with the core limit at 0 and not dumpable. Only
+    Linux shows another process's, in /proc; elsewhere the unit test covers the function."""
+    how = 'started with core dumps allowed'
+    if not os.path.exists('/proc/self/limits'):
+        print(f'note: {how}: no /proc to read another process\'s limits from, leg skipped', flush=True)
+        return
+    if resource.getrlimit(resource.RLIMIT_CORE)[1] == 0 or os.getuid() == 0:
+        raise Failure(f'{how}: the hard core limit is 0, or the harness runs as root: it proves nothing')
+
+    def core_limit(pid):
+        with open(f'/proc/{pid}/limits') as f:
+            return next(line.split()[4:6] for line in f if line.startswith('Max core file size'))
+
+    def dumpable(pid):
+        # A process that is not dumpable has its /proc entries owned by root.
+        return os.stat(f'/proc/{pid}').st_uid == os.getuid()
+
+    # The control, one variable away: the same start, a program that keeps the limit.
+    control = subprocess.Popen([sys.executable, '-I', '-c', CORE_ALLOWED, '/bin/sleep', '30'])
+    try:
+        limit = time.monotonic() + 10
+        while not os.path.exists(f'/proc/{control.pid}/limits') or core_limit(control.pid) == ['0', '0']:
+            if time.monotonic() > limit:
+                raise Failure(f'{how}: the control kept no core limit: it proves nothing')
+            time.sleep(0.05)
+        if not dumpable(control.pid):
+            raise Failure(f'{how}: the control reads as not dumpable: it proves nothing')
+    finally:
+        control.kill()
+        control.wait()
+    env_file = f'{root}/env-core'
+    term = Term([sys.executable, '-I', '-c', CORE_ALLOWED, stratum, 'tui', '--headless', '--vol', vol.v,
+                 '--host', host, '--print-env-to', env_file])
+    try:
+        term.expect(r'Passphrase for')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'send SIGTERM', timeout=60)
+        session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
+        pids = [str(term.pid)] + session_daemons(session)
+        if len(pids) < 4:
+            raise Failure(f'{how}: the search finds {pids}: it proves nothing')
+        seen = {pid: (core_limit(pid), dumpable(pid)) for pid in pids}
+        record(all(lim == ['0', '0'] and not dump for lim, dump in seen.values()),
+               f'{how}: the manager and its daemons run with the core limit at 0, not dumpable',
+               f'{how}: (core limit, dumpable) by pid: {seen}')
+    finally:
         term.kill()
-        if session:
-            for pid in session_daemons(session):
-                os.kill(int(pid), signal.SIGTERM)
 
 
 def save_in_editor(term, vol, sock, path, want, what):
@@ -1481,10 +1719,10 @@ def landing_stop_legs(stratum, root):
                 term.send(PASS.encode() + ENTER)
             except OSError:
                 pass  # the default action has ended the manager, and the terminal's other side with it
-            return 'asked to stop at the passphrase prompt', None, False
+            return ['asked to stop at the passphrase prompt'], None, (False, False, False)
         return at
 
-    def to_mkfs(term):
+    def to_mkfs(term, path):
         term.send(PASS.encode() + ENTER)
         term.expect(r'Passphrase again')
         term.send(PASS.encode() + ENTER)
@@ -1497,6 +1735,10 @@ def landing_stop_legs(stratum, root):
             mkfs = child_running(term.pid, 'mkfs')
         if mkfs is None:
             raise Failure('mkfs was not seen running: it proves nothing')
+        # Held where it has made both files and derives the key, the slow part: its own
+        # cleanup would remove them, and a signal's default action never runs it.
+        if not wait_until(term, lambda: os.path.exists(f'{path}.key.new.{mkfs}'), 10):
+            raise Failure(f'mkfs never made {path}.key.new.{mkfs}: it proves nothing')
         os.kill(mkfs, signal.SIGSTOP)
         modes = tty_modes(term)
         record(modes == {'ECHO': False, 'ICANON': True, 'ISIG': True},
@@ -1505,7 +1747,7 @@ def landing_stop_legs(stratum, root):
         return mkfs
 
     def ctrl_c_in_mkfs(term, path):
-        mkfs = to_mkfs(term)
+        mkfs = to_mkfs(term, path)
         term.send(b'\x03')
         term.pump(0.5)
         # Linux keeps the Ctrl-C pending on the stopped mkfs until it continues, and it ends it
@@ -1514,15 +1756,15 @@ def landing_stop_legs(stratum, root):
             os.kill(mkfs, signal.SIGCONT)
         except ProcessLookupError:
             pass
-        return 'it did not finish, so', mkfs, None
+        return ['ended mkfs before it finished, so', f'it left {path} and {path}.key.new.{mkfs}'], mkfs, (True, False, True)
 
     def term_in_mkfs(term, path):
         # To the manager alone: mkfs goes on, and makes the volume.
-        mkfs = to_mkfs(term)
+        mkfs = to_mkfs(term, path)
         os.kill(term.pid, signal.SIGTERM)
         term.pump(0.5)
         os.kill(mkfs, signal.SIGCONT)
-        return 'was made, and was not opened', mkfs, True
+        return ['was made, and was not opened'], mkfs, (True, True, False)
 
     cases = (('SIGTERM at the landing screen\'s passphrase prompt', sent_at(signal.SIGTERM, 'Passphrase:'), ()),
              ('a HUP at the landing screen\'s passphrase prompt, blocked by its parent',
@@ -1544,22 +1786,23 @@ def landing_stop_legs(stratum, root):
             term.send(b'64M' + ENTER)
             term.expect(r'Passphrase:')
             try:
-                said, mkfs, made = case(term, path)
+                said, mkfs, left = case(term, path)
             except Failure as e:
                 raise Failure(f'{how}: {e}') from None
             ended = term.exited(30)
             # Wrapped at the screen's edge, a long path moves the words across rows.
-            named = re.sub(r'\s', '', said) in re.sub(r'\s', '', term.screen.text())
+            shown = re.sub(r'\s', '', term.screen.text())
+            named = all(re.sub(r'\s', '', s) in shown for s in said)
             record(ended and term.rc == 1 and named, f'{how}: the manager stopped, rc 1, and said so',
                    f'{how}: the manager ended={ended} rc={term.rc}, said {said!r}={named}')
             if ended:
                 modes = tty_modes(term)
                 record(all(modes.values()), f'{how}: the terminal was given back as it was',
                        f'{how}: the terminal was left {modes}')
-            if made is not None:
-                there = [os.path.exists(f) for f in (path, f'{path}.key')]
-                record(there == [made, made], f'{how}: the volume and its key are {"there" if made else "not there"}',
-                       f'{how}: the volume, its key there: {there}')
+            there = (os.path.exists(path), os.path.exists(f'{path}.key'),
+                     mkfs is not None and os.path.exists(f'{path}.key.new.{mkfs}'))
+            record(there == left, f'{how}: the volume, its key and a new key there: {left}, as said',
+                   f'{how}: the volume, its key and a new key there: {there}, not {left}')
         except Failure:
             print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
             raise
@@ -1573,7 +1816,7 @@ def landing_stop_legs(stratum, root):
                     except ProcessLookupError:
                         pass
             term.kill()
-            for f in (path, f'{path}.key'):
+            for f in (path, f'{path}.key', *([f'{path}.key.new.{mkfs}'] if mkfs else [])):
                 if os.path.exists(f):
                     os.remove(f)
 
@@ -2762,6 +3005,8 @@ def run(stratum, root):
                       (pending_hup_leg, (stratum, vol, host, root)),
                       (headless_behind_leg, (stratum, vol, host, root)),
                       (screen_behind_leg, (stratum, vol, host, root)),
+                      (screen_job_control_leg, (stratum, vol, host, root)),
+                      (core_dumps_off_leg, (stratum, vol, host, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
                       (wrong_passphrase_leg, (stratum, vol, host)),
                       (wizard_legs, (stratum, vol, root)),

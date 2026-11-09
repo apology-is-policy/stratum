@@ -77,9 +77,12 @@ pub struct SecretText {
     over: usize,
 }
 impl SecretText {
-    pub fn push(&mut self, c: char) { push_secret(&mut self.text, c); }
     pub fn type_secret(&mut self, c: char) {
-        if self.over > 0 || self.text.len() + c.len_utf8() > PASSPHRASE_MAX {
+        self.type_within(c, PASSPHRASE_MAX);
+    }
+    /// The same rule for a field of at most `max` bytes.
+    pub fn type_within(&mut self, c: char, max: usize) {
+        if self.over > 0 || self.text.len() + c.len_utf8() > max {
             self.over += 1;
         } else {
             push_secret(&mut self.text, c);
@@ -160,38 +163,68 @@ pub fn prompt_passphrase(label: &str) -> Result<(Zeroizing, EchoHeld)> {
 }
 
 /// Echo held off after a passphrase was read, until this goes: a key typed while the key
-/// is derived, the passphrase again say, is not shown. A stop from the keyboard gives the
-/// terminal back first, as vi and readpassphrase do, so the shell gets it as it was
-/// whatever it keeps; continued in front, echo is held off again. When this goes the
-/// terminal is given back, and what was typed meanwhile dropped, if the job is in front;
-/// behind, the shell has it, given back at the stop. `give_back` is for a caller that
-/// uses the terminal next.
+/// is derived, the passphrase again say, is not shown. A job-control stop meanwhile, a
+/// SIGTSTP, SIGTTIN or SIGTTOU, gives the terminal back first if the job is in front, as
+/// vi and readpassphrase do, so the shell gets it as it was whatever it keeps; each
+/// continue in front holds echo off again. A SIGSTOP cannot be caught. Dropping it is the
+/// release: the terminal is given back, what was typed meanwhile dropped, only if the job
+/// is in front, and it never stops for it. `give_back` is for a caller that uses the
+/// terminal next. Like the prompt, it is sound only while its holder is the one thread.
 pub struct EchoHeld {
     tty: File,
     orig: libc::termios,
-    caught: Option<libc::sigaction>,
+    caught: Vec<(libc::c_int, libc::sigaction)>,
     given: bool,
 }
 
 impl EchoHeld {
-    /// Gives the terminal back as it was, waiting stopped by SIGTTOU until the job is in
-    /// front, so that what reads the mode next reads this one and not its shell's.
-    pub fn give_back(mut self) {
-        // Let go first: a stop now takes the default action, and the restore below runs
-        // once the job is continued in front.
-        self.let_go();
+    /// Gives the terminal back as it was, so that what reads the mode next finds this one and
+    /// not the shell's: behind, it waits stopped until `fg`, as any set from behind does. A
+    /// stop asked meanwhile, as `stop_asked` tells, ends the wait and leaves the terminal to
+    /// the shell, as a drop does. Returns whether the terminal was given back.
+    pub fn give_back(mut self, stop_asked: impl Fn() -> bool) -> bool {
         let fd = self.tty.as_raw_fd();
-        while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } != 0
-            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-        {}
+        // A stop or a continue from here on lands once this is done, with the default actions.
+        let mut quiet: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut quiet);
+            libc::sigaddset(&mut quiet, libc::SIGTSTP);
+            libc::sigaddset(&mut quiet, libc::SIGCONT);
+        }
+        let prev = block(&quiet);
+        self.let_go();
+        let ttou = take_over(libc::SIGTTOU, &action(stop_and_interrupt, 0));
+        let mut given = false;
+        loop {
+            if !in_front(fd) && stop_asked() {
+                break;
+            }
+            if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } == 0 {
+                given = true;
+                break;
+            }
+            // EINTR after each stop behind, so a stop asked meanwhile is seen; EIO, a
+            // terminal gone or a group orphaned, ends it.
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        if let Some(old) = ttou {
+            unsafe { libc::sigaction(libc::SIGTTOU, &old, std::ptr::null_mut()) };
+        }
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()) };
         self.given = true;
+        given
     }
 
     fn let_go(&mut self) {
-        if let Some(old) = self.caught.take() {
-            unsafe { libc::sigaction(libc::SIGTSTP, &old, std::ptr::null_mut()) };
-            HOLD.fd.store(-1, Ordering::Release);
+        if self.caught.is_empty() {
+            return;
         }
+        for (sig, old) in self.caught.drain(..) {
+            unsafe { libc::sigaction(sig, &old, std::ptr::null_mut()) };
+        }
+        HOLD.fd.store(FREE, Ordering::Release);
     }
 }
 
@@ -201,8 +234,9 @@ impl Drop for EchoHeld {
             return;
         }
         let fd = self.tty.as_raw_fd();
-        // A stop waits until the check and the restore are both done.
-        let prev = block_job_control();
+        // No stop or continue comes between the check and the restore, nor before the
+        // handlers go.
+        let prev = block(&release_set());
         if unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() } {
             while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } != 0
                 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
@@ -213,16 +247,20 @@ impl Drop for EchoHeld {
     }
 }
 
-/// What the SIGTSTP handler gives back and holds again: set only while it is not caught.
+/// What the handlers give back and hold again. One hold at a time owns it.
 struct Hold {
     fd: AtomicI32,
     orig: UnsafeCell<MaybeUninit<libc::termios>>,
     held: UnsafeCell<MaybeUninit<libc::termios>>,
 }
-// Written only while the handler is not installed, and read only by it.
+// The copies are written only by the hold that claimed it (FREE -> CLAIMING), before it
+// publishes the terminal in `fd` and installs the handlers, which read them only after
+// loading `fd`; it is FREE again only once the handlers are gone.
 unsafe impl Sync for Hold {}
+const FREE: i32 = -1;
+const CLAIMING: i32 = -2;
 static HOLD: Hold = Hold {
-    fd: AtomicI32::new(-1),
+    fd: AtomicI32::new(FREE),
     orig: UnsafeCell::new(MaybeUninit::uninit()),
     held: UnsafeCell::new(MaybeUninit::uninit()),
 };
@@ -238,38 +276,67 @@ fn job_control_set() -> libc::sigset_t {
     jobs
 }
 
-fn block_job_control() -> libc::sigset_t {
-    let jobs = job_control_set();
+/// The stops and the continue: what the handlers take while echo is held.
+fn release_set() -> libc::sigset_t {
+    let mut set = job_control_set();
+    unsafe { libc::sigaddset(&mut set, libc::SIGCONT) };
+    set
+}
+
+fn block(set: &libc::sigset_t) -> libc::sigset_t {
     let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };
-    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &jobs, &mut prev) };
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, set, &mut prev) };
     prev
 }
 
-fn stop_action() -> libc::sigaction {
+fn in_front(fd: RawFd) -> bool {
+    unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() }
+}
+
+fn action(handler: extern "C" fn(libc::c_int), flags: libc::c_int) -> libc::sigaction {
     let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
-    act.sa_sigaction = stop_given_back as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    act.sa_flags = libc::SA_RESTART;
-    unsafe { libc::sigemptyset(&mut act.sa_mask) };
+    act.sa_sigaction = handler as libc::sighandler_t;
+    act.sa_flags = flags;
+    // One at a time: a continue's handler runs once a stop's has returned.
+    act.sa_mask = release_set();
     act
 }
 
-/// Catches SIGTSTP while echo is held, unless something else already has it, and returns
-/// the action to put back.
-fn catch_stops(fd: RawFd, orig: &libc::termios, held: &libc::termios) -> Option<libc::sigaction> {
+/// Installs `act` for `sig` unless something else has it, a handler or an ignore, and
+/// returns the action to put back.
+pub(crate) fn take_over(sig: libc::c_int, act: &libc::sigaction) -> Option<libc::sigaction> {
     let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-    if unsafe { libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut old) } != 0
-        || old.sa_sigaction != libc::SIG_DFL
-    {
+    if unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) } != 0 || old.sa_sigaction != libc::SIG_DFL {
         return None;
+    }
+    unsafe { libc::sigaction(sig, act, std::ptr::null_mut()) };
+    Some(old)
+}
+
+/// Catches the stops and the continue while echo is held, each unless something else has
+/// it, and returns the actions to put back: none if another hold owns the handlers.
+fn catch_stops(fd: RawFd, orig: &libc::termios, held: &libc::termios) -> Vec<(libc::c_int, libc::sigaction)> {
+    let mut caught = Vec::new();
+    if HOLD.fd.compare_exchange(FREE, CLAIMING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return caught;
     }
     unsafe {
         (*HOLD.orig.get()).write(*orig);
         (*HOLD.held.get()).write(*held);
     }
     HOLD.fd.store(fd, Ordering::Release);
-    let act = stop_action();
-    unsafe { libc::sigaction(libc::SIGTSTP, &act, std::ptr::null_mut()) };
-    Some(old)
+    for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+        if let Some(old) = take_over(sig, &action(stop_given_back, libc::SA_RESTART)) {
+            caught.push((sig, old));
+        }
+    }
+    if let Some(old) = take_over(libc::SIGCONT, &action(held_again, libc::SA_RESTART)) {
+        caught.push((libc::SIGCONT, old));
+    }
+    if caught.is_empty() {
+        HOLD.fd.store(FREE, Ordering::Release);
+    }
+    caught
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
@@ -281,30 +348,64 @@ fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__errno_location() }
 }
 
-/// Gives the terminal back, stops as SIGTSTP would have, and once continued holds echo off
-/// again if the job is in front; behind, the shell has the terminal as it was.
-extern "C" fn stop_given_back(_: libc::c_int) {
+/// Stops by `sig`'s default action, set for the moment, and returns once continued.
+pub(crate) unsafe fn stop_by(sig: libc::c_int) {
+    let mut dfl: libc::sigaction = std::mem::zeroed();
+    dfl.sa_sigaction = libc::SIG_DFL;
+    libc::sigaction(sig, &dfl, std::ptr::null_mut());
+    let mut one: libc::sigset_t = std::mem::zeroed();
+    libc::sigemptyset(&mut one);
+    libc::sigaddset(&mut one, sig);
+    libc::pthread_sigmask(libc::SIG_UNBLOCK, &one, std::ptr::null_mut());
+    libc::kill(libc::getpid(), sig);
+}
+
+/// In front, the terminal given back; then the stop `sig` asked for; then, continued in
+/// front, echo held off again. Behind, the shell has the terminal, and it is not set
+/// under it.
+extern "C" fn stop_given_back(sig: libc::c_int) {
     let fd = HOLD.fd.load(Ordering::Acquire);
     if fd < 0 {
         return;
     }
     unsafe {
         let errno = *errno_location();
-        libc::tcsetattr(fd, libc::TCSAFLUSH, (*HOLD.orig.get()).as_ptr());
-        let mut dfl: libc::sigaction = std::mem::zeroed();
-        dfl.sa_sigaction = libc::SIG_DFL;
-        libc::sigaction(libc::SIGTSTP, &dfl, std::ptr::null_mut());
-        let mut tstp: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut tstp);
-        libc::sigaddset(&mut tstp, libc::SIGTSTP);
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &tstp, std::ptr::null_mut());
-        libc::kill(libc::getpid(), libc::SIGTSTP);
-        // Continued.
-        let act = stop_action();
-        libc::sigaction(libc::SIGTSTP, &act, std::ptr::null_mut());
-        if libc::tcgetpgrp(fd) == libc::getpgrp() {
-            libc::tcsetattr(fd, libc::TCSAFLUSH, (*HOLD.held.get()).as_ptr());
+        if in_front(fd) {
+            libc::tcsetattr(fd, libc::TCSAFLUSH, (*HOLD.orig.get()).as_ptr());
         }
+        stop_by(sig);
+        libc::sigaction(sig, &action(stop_given_back, libc::SA_RESTART), std::ptr::null_mut());
+        hold_again(fd);
+        *errno_location() = errno;
+    }
+}
+
+/// A continue, after `bg` then `fg` say: in front, echo held off again.
+extern "C" fn held_again(_: libc::c_int) {
+    let fd = HOLD.fd.load(Ordering::Acquire);
+    if fd < 0 {
+        return;
+    }
+    unsafe {
+        let errno = *errno_location();
+        hold_again(fd);
+        *errno_location() = errno;
+    }
+}
+
+unsafe fn hold_again(fd: RawFd) {
+    if in_front(fd) {
+        libc::tcsetattr(fd, libc::TCSAFLUSH, (*HOLD.held.get()).as_ptr());
+    }
+}
+
+/// While give_back waits behind: stops as SIGTTOU would, and returns without SA_RESTART,
+/// so the set it interrupted fails with EINTR on each continue.
+extern "C" fn stop_and_interrupt(sig: libc::c_int) {
+    unsafe {
+        let errno = *errno_location();
+        stop_by(sig);
+        libc::sigaction(sig, &action(stop_and_interrupt, 0), std::ptr::null_mut());
         *errno_location() = errno;
     }
 }
@@ -358,7 +459,7 @@ fn prompt_on(tty: File, label: &str) -> Result<(Zeroizing, EchoHeld)> {
     // So the next line is not glued to the hidden input.
     let _ = writer.write_all(b"\n");
     // Caught before the mask goes back, so a stop that came meanwhile finds the handler.
-    let caught = if line.is_ok() { catch_stops(fd, &orig, &after) } else { None };
+    let caught = if line.is_ok() { catch_stops(fd, &orig, &after) } else { Vec::new() };
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &held, std::ptr::null_mut()) };
     line.map(|line| (line, EchoHeld { tty, orig, caught, given: false }))
 }
@@ -772,7 +873,7 @@ mod prompt_tests {
         assert!(!shown.contains("during"), "shown while the key was derived: {shown:?}");
         // Not this process's controlling terminal, so no job is in front of it: dropped, the
         // hold would leave it alone; given back, it restores it.
-        held.give_back();
+        held.give_back(|| false);
         let set = libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN;
         assert_eq!(pty.lflag() & set, before & set, "the terminal was not given back as it was");
         let left = pty.left_unread();
@@ -780,6 +881,32 @@ mod prompt_tests {
         // The control: with echo back, a key is shown.
         pty.master.write_all(b"after").expect("type");
         pty.wait_shown(b"after");
+    }
+
+    /// Two holds at once, as the tests here make: the second takes none of the handlers,
+    /// and they keep the first's terminal.
+    #[test]
+    fn a_second_hold_does_not_take_hold() {
+        let t: libc::termios = unsafe { std::mem::zeroed() };
+        // Never opened: the handlers would set them only on a stop or a continue, in front.
+        let (one, two) = (1000, 1001);
+        let end = Instant::now() + Duration::from_secs(10);
+        let first = loop {
+            let caught = catch_stops(one, &t, &t);
+            if !caught.is_empty() {
+                break caught;
+            }
+            assert!(Instant::now() < end, "no hold took the handlers: another kept them, or a stop is not at its default");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let second = catch_stops(two, &t, &t);
+        let fd = HOLD.fd.load(Ordering::Acquire);
+        for (sig, old) in first {
+            unsafe { libc::sigaction(sig, &old, std::ptr::null_mut()) };
+        }
+        HOLD.fd.store(FREE, Ordering::Release);
+        assert!(second.is_empty(), "a second hold took {} handlers", second.len());
+        assert_eq!(fd, one, "a second hold pointed the handlers at its terminal");
     }
 }
 
