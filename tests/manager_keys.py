@@ -790,8 +790,9 @@ def missing_binary_leg(stratum, vol, host, root):
             os.unlink(copy)
 
 def start_wait_stop_leg(stratum, vol, host, root):
-    """Ctrl-\\ while stratumd derives the key, a wait of up to 60 s: the stop ends the session
-    there, and is named as a stop, not as a daemon that failed to start."""
+    """Ctrl-\\ in stratumd's start, a wait of up to 60 s: the stop ends the session there, and is
+    named as a stop, not as a daemon that failed to start. stratumd is held stopped from the
+    moment it appears, so no socket can end the wait first, however fast the key comes."""
     how = 'Ctrl-\\ in the stratumd start'
     term = Term([stratum, 'tui', '--vol', vol.v, '--host', host])
     try:
@@ -802,19 +803,30 @@ def start_wait_stop_leg(stratum, vol, host, root):
         sock = f'{session}/stratumd.sock'
         term.send(PASS.encode() + ENTER)
         limit = time.monotonic() + 10
-        while not daemons_of(sock) and time.monotonic() < limit:
-            time.sleep(0.01)
-        began = time.monotonic()
-        if not daemons_of(sock) or os.path.exists(sock):
-            raise Failure(f'{how}: stratumd running={bool(daemons_of(sock))}, its socket made='
-                          f'{os.path.exists(sock)} before the key: it proves nothing')
+        held = daemons_of(sock)
+        while not held and time.monotonic() < limit:
+            time.sleep(0.005)
+            held = daemons_of(sock)
+        for pid in held:
+            os.kill(int(pid), signal.SIGSTOP)
+        if not held or os.path.exists(sock):
+            raise Failure(f'{how}: stratumd held={held}, its socket made={os.path.exists(sock)} '
+                          'before the stop: it proves nothing')
         term.send(b'\x1c')
-        ended = term.exited(60)
+        asked = time.monotonic()
+        # Past the 60 s start timeout: a wait that does not end on the stop ends there instead,
+        # and the stop, seen afterwards, would still be named.
+        ended = term.exited(90)
+        took = time.monotonic() - asked
         said = 'asked to stop while stratumd started' in term.screen.text()
-        record(ended and term.rc == 1 and said, f'{how}: the manager stopped in the wait, rc 1',
-               f'{how}: the manager ended={ended} rc={term.rc}, named the stop={said}')
-        print(f'note: {how}: the key was still being derived {time.monotonic() - began:.2f} s after '
-              'stratumd appeared', flush=True)
+        record(ended and term.rc == 1 and said and took < 30,
+               f'{how}: the manager stopped in the wait, rc 1, in {took:.1f} s',
+               f'{how}: the manager ended={ended} rc={term.rc} after {took:.1f} s, named the stop={said}')
+        for pid in held:
+            try:
+                os.kill(int(pid), signal.SIGCONT)
+            except ProcessLookupError:
+                pass
         limit = time.monotonic() + 30
         left = session_daemons(session)
         while left and time.monotonic() < limit:

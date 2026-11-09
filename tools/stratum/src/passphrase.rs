@@ -126,9 +126,9 @@ pub fn prompt_passphrase(label: &str) -> Result<Zeroizing> {
     prompt_on(&tty, label)
 }
 
-/// With canonical mode off the line discipline edits nothing, so the keys a cooked
-/// terminal would act on are acted on here: DEL and BS erase a byte, Ctrl-U the line,
-/// Ctrl-D gives up. Only Enter submits.
+/// The terminal set for a passphrase: no echo, and no canonical mode, so that
+/// read_line, not the line discipline, decides what the keys mean. Restored on every
+/// way out once set.
 fn prompt_on(tty: &File, label: &str) -> Result<Zeroizing> {
     let fd = tty.as_raw_fd();
 
@@ -153,38 +153,8 @@ fn prompt_on(tty: &File, label: &str) -> Result<Zeroizing> {
             "tcsetattr disable-echo failed: {}", io::Error::last_os_error()));
     }
 
-    // Read a line.
-    // Never grows, as the refusal comes at 1024, and every way out of here wipes it.
-    let mut buf = Zeroizing::new(Vec::with_capacity(1025));
-    let mut byte = [0u8; 1];
     let mut reader = tty;
-    let given_up = loop {
-        match reader.read(&mut byte) {
-            // Only a hangup ends a read here: what was typed was never submitted.
-            Ok(0) => break Some("the terminal closed at the passphrase prompt"),
-            Ok(_) => match byte[0] {
-                b'\n' => break None,
-                0x7f | 0x08 => {
-                    buf.0.pop();
-                }
-                0x15 => buf.0.clear(),
-                0x04 => break Some("the passphrase prompt was given up (Ctrl-D)"),
-                b => {
-                    if buf.len() >= 1024 {
-                        break Some("passphrase exceeds 1024 bytes");
-                    }
-                    buf.0.push(b);
-                }
-            },
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                unsafe { std::ptr::write_volatile(&mut byte[0], 0) };
-                let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
-                return Err(anyhow!("read tty: {e}"));
-            }
-        }
-    };
-    unsafe { std::ptr::write_volatile(&mut byte[0], 0) };
+    let line = read_line(&mut reader);
 
     // Restore termios.
     let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
@@ -194,10 +164,40 @@ fn prompt_on(tty: &File, label: &str) -> Result<Zeroizing> {
         let mut writer = tty;
         let _ = writer.write_all(b"\n");
     }
+    line
+}
 
-    if let Some(why) = given_up {
-        bail!("{why}");
-    }
+/// One passphrase as Enter submits it. With canonical mode off the line discipline
+/// edits nothing, so the keys a cooked terminal acts on are acted on here: DEL and BS
+/// erase a byte, Ctrl-U the line, Ctrl-D gives up. End-of-file, which only a hangup
+/// gives, submits nothing.
+fn read_line(src: &mut impl Read) -> Result<Zeroizing> {
+    // Never grows, as the refusal comes at 1024, and every way out of here wipes it.
+    let mut buf = Zeroizing::new(Vec::with_capacity(1025));
+    let mut byte = [0u8; 1];
+    let ended = loop {
+        match src.read(&mut byte) {
+            Ok(0) => break Err(anyhow!("the terminal closed at the passphrase prompt")),
+            Ok(_) => match byte[0] {
+                b'\n' => break Ok(()),
+                0x7f | 0x08 => {
+                    buf.0.pop();
+                }
+                0x15 => buf.0.clear(),
+                0x04 => break Err(anyhow!("the passphrase prompt was given up (Ctrl-D)")),
+                b => {
+                    if buf.len() >= 1024 {
+                        break Err(anyhow!("passphrase exceeds 1024 bytes"));
+                    }
+                    buf.0.push(b);
+                }
+            },
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => break Err(anyhow!("read tty: {e}")),
+        }
+    };
+    unsafe { std::ptr::write_volatile(&mut byte[0], 0) };
+    ended?;
     if buf.is_empty() {
         bail!("empty passphrase refused");
     }
@@ -210,61 +210,81 @@ mod prompt_tests {
     use std::os::unix::io::FromRawFd;
     use std::time::{Duration, Instant};
 
-    /// The prompt on a pty's slave, typed to through its master once canonical mode
-    /// is off (before that the line discipline would act on the keys itself), the
-    /// master then closed or kept open.
-    fn typed(keys: &[u8], then_close: bool) -> Result<Vec<u8>> {
+    fn line(keys: &[u8]) -> Result<Vec<u8>> {
+        read_line(&mut &keys[..]).map(|z| z.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn end_of_file_before_enter_submits_nothing() {
+        let got = line(b"correct horse");
+        assert!(matches!(&got, Err(e) if e.to_string().contains("closed")), "a hangup before Enter gave {:?}",
+                got.map(|v| String::from_utf8_lossy(&v).into_owned()));
+    }
+
+    #[test]
+    fn ctrl_u_clears_what_was_typed() {
+        assert_eq!(line(b"wrong\x15right\n").expect("a passphrase"), b"right");
+    }
+
+    #[test]
+    fn ctrl_d_gives_up_and_submits_nothing() {
+        let got = line(b"half\x04");
+        assert!(matches!(&got, Err(e) if e.to_string().contains("given up")), "Ctrl-D gave {:?}", got.map(|v| v.len()));
+    }
+
+    #[test]
+    fn delete_erases_one_byte() {
+        assert_eq!(line(b"rigxht\x7f\x7f\x7fht\n").expect("a passphrase"), b"right");
+    }
+
+    #[test]
+    fn an_empty_line_and_a_runaway_one_are_refused() {
+        assert!(line(b"\n").is_err());
+        let mut long = vec![b'a'; 1024];
+        long.push(b'\n');
+        assert_eq!(line(&long).expect("1024 bytes fit").len(), 1024);
+        long.insert(0, b'a');
+        assert!(matches!(line(&long), Err(e) if e.to_string().contains("exceeds")));
+    }
+
+    /// On a pty: keys sent only once canonical mode is off reach read_line as typed, and
+    /// the terminal is given back as it was.
+    #[test]
+    fn on_a_terminal_the_mode_is_set_for_the_keys_and_restored_after() {
         let (mut m, mut s) = (0, 0);
         let rc = unsafe {
             libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
         };
         assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());
         let probe = unsafe { libc::dup(s) };
+        let lflag = || {
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(probe, &mut t) }, 0);
+            t.c_lflag
+        };
+        let before = lflag();
+        assert_ne!(before & libc::ICANON, 0, "a fresh pty starts canonical");
         let (mut master, slave) = unsafe { (File::from_raw_fd(m), File::from_raw_fd(s)) };
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(prompt_on(&slave, "P: ").map(|z| z.as_bytes().to_vec()));
         });
         let end = Instant::now() + Duration::from_secs(5);
-        loop {
-            let mut t: libc::termios = unsafe { std::mem::zeroed() };
-            if unsafe { libc::tcgetattr(probe, &mut t) } == 0 && t.c_lflag & libc::ICANON == 0 {
-                break;
-            }
+        while lflag() & libc::ICANON != 0 {
             assert!(Instant::now() < end, "the prompt never turned canonical mode off");
             std::thread::sleep(Duration::from_millis(5));
         }
-        unsafe { libc::close(probe) };
-        master.write_all(keys).expect("type");
-        if then_close {
-            drop(master);
-            return rx.recv_timeout(Duration::from_secs(5)).expect("the prompt never returned");
-        }
+        assert_eq!(lflag() & libc::ECHO, 0, "the passphrase would be echoed");
+        // Ctrl-D in canonical mode would end a read with "half" and no newline; here it
+        // must reach read_line and give up.
+        master.write_all(b"half\x04").expect("type");
         let got = rx.recv_timeout(Duration::from_secs(5)).expect("the prompt never returned");
+        assert!(got.is_err(), "Ctrl-D gave {:?}", got.map(|v| v.len()));
+        // The settings it changed; the kernel's own state bits (PENDIN on macOS) may differ.
+        let set = libc::ICANON | libc::ECHO;
+        assert_eq!(lflag() & set, before & set, "the terminal was not given back as it was");
+        unsafe { libc::close(probe) };
         drop(master);
-        got
-    }
-
-    #[test]
-    fn the_terminal_closing_before_enter_submits_nothing() {
-        let got = typed(b"correct horse", true);
-        assert!(got.is_err(), "a hangup before Enter gave {:?}", got.map(|v| String::from_utf8_lossy(&v).into_owned()));
-    }
-
-    #[test]
-    fn ctrl_u_clears_what_was_typed() {
-        assert_eq!(typed(b"wrong\x15right\n", false).expect("a passphrase"), b"right");
-    }
-
-    #[test]
-    fn ctrl_d_gives_up_and_submits_nothing() {
-        let got = typed(b"half\x04", false);
-        assert!(matches!(&got, Err(e) if e.to_string().contains("given up")), "Ctrl-D gave {:?}", got.map(|v| v.len()));
-    }
-
-    #[test]
-    fn delete_erases_one_byte() {
-        assert_eq!(typed(b"rigxht\x7f\x7f\x7fht\n", false).expect("a passphrase"), b"right");
     }
 }
 
