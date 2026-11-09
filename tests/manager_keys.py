@@ -1399,7 +1399,9 @@ def screen_job_control_leg(stratum, vol, host, root):
                f'{how}: its private modes were left {private}, not {SHELL_PRIVATE}')
 
     cases = (('the screen, a TSTP from outside, then fg', (), tstp_then_fg),
-             ('the screen, a STOP, bg, then kill -HUP', ('--editor', f'--report={report}'), stop_bg_hup))
+             ('the screen, a STOP, bg, then kill -HUP', ('--editor', f'--report={report}'), stop_bg_hup),
+             ('the screen, tostop set, a STOP, bg, then kill -HUP', ('--editor', '--tostop', f'--report={report}'),
+              stop_bg_hup))
     for how, flags, then in cases:
         if os.path.exists(report):
             os.unlink(report)
@@ -1450,10 +1452,13 @@ def screen_started_behind_leg(stratum, root):
         record(modes == EDITOR_MODES, f'{how}: the shell\'s mode was left as the shell set it',
                f'{how}: the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
 
-    cases = (('the screen started behind, then fg', fg_then_quit),
-             ('the screen started behind, sent a TERM while it waits', kill_while_waiting))
-    for how, then in cases:
-        term = Term([sys.executable, '-I', '-c', JOB_SHELL, '--behind', '--editor', stratum, 'tui', '--host', w])
+    # Under tostop the end behind must stop for nothing either: not the last word, not the
+    # watcher's probe of the terminal.
+    cases = (('the screen started behind, then fg', (), fg_then_quit),
+             ('the screen started behind, sent a TERM while it waits', (), kill_while_waiting),
+             ('the screen started behind, tostop set, sent a TERM while it waits', ('--tostop',), kill_while_waiting))
+    for how, flags, then in cases:
+        term = Term([sys.executable, '-I', '-c', JOB_SHELL, '--behind', '--editor', *flags, stratum, 'tui', '--host', w])
         manager = None
         try:
             limit = time.monotonic() + 10
@@ -1827,6 +1832,51 @@ def landing_legs(stratum, root):
         term.kill()
 
 
+# Runs a program with SIGCHLD ignored, which exec keeps: as a parent that ignored it leaves it.
+CHLD_IGNORED = r"""
+import os, signal, sys
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+os.execv(sys.argv[1], sys.argv[1:])
+"""
+
+
+def children_waited_for_leg(stratum, root):
+    """Started with SIGCHLD ignored, which would have the kernel reap each child unseen and every
+    wait fail: the landing screen's New still waits for mkfs, and opens the volume it made. Linux
+    keeps the ignore across exec and reaps; macOS reaps for an ignore set in the process itself
+    (the unit test), but not once exec has run, so only Linux tells the two apart here."""
+    how = 'started with SIGCHLD ignored'
+    path = f'{root}/chld.stm'
+    term = Term([sys.executable, '-I', '-c', CHLD_IGNORED, stratum])
+    try:
+        term.pump(1)
+        term.send(b'n' + ENTER)
+        term.expect(r'New volume path')
+        term.send(path.encode() + ENTER)
+        term.expect(r'Size')
+        term.send(b'64M' + ENTER)
+        term.expect(r'Passphrase:')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'Passphrase again')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'Passphrase for|No child processes', timeout=60)
+        waited = 'Passphrase for' in term.screen.text()
+        record(waited, f'{how}: the landing screen waited for mkfs and went on to open the volume',
+               f'{how}: the wait for mkfs failed: {term.screen.text()[-300:]!r}')
+        if not waited:
+            return
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'MkDir', timeout=60)
+        term.send(F10)
+        record(term.exited(60) and term.rc == 0, f'{how}: F10 ended it, rc 0',
+               f'{how}: F10 did not end it: rc={term.rc}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+
 def child_running(pid, word):
     """The pid of a child of `pid` whose command line holds `word` as a word, or None."""
     r = subprocess.run(['ps', '-ww', '-A', '-o', 'pid=,ppid=,command='], capture_output=True, text=True)
@@ -1902,13 +1952,22 @@ def landing_stop_legs(stratum, root):
         os.kill(mkfs, signal.SIGCONT)
         return ['was made, and was not opened'], mkfs, (True, True, False)
 
+    def mkfs_killed_alone(term, path):
+        # No stop asked: mkfs ended by a signal of its own, its cleanup never run. The manager
+        # names what it left, and goes no further.
+        mkfs = to_mkfs(term, path)
+        os.kill(mkfs, signal.SIGKILL)
+        return ([f'signal {int(signal.SIGKILL)} ended mkfs before it finished, so', f'it left {path} and {path}.key.new.{mkfs}'],
+                mkfs, (True, False, True), 0)
+
     cases = (('SIGTERM at the landing screen\'s passphrase prompt', sent_at(signal.SIGTERM, 'Passphrase:'), ()),
              ('a HUP at the landing screen\'s passphrase prompt, blocked by its parent',
               sent_at(signal.SIGHUP, 'Passphrase:'), (signal.SIGHUP,)),
              ('SIGTERM at the landing screen\'s second passphrase prompt',
               sent_at(signal.SIGTERM, 'Passphrase again'), ()),
              ('Ctrl-C while the landing screen\'s mkfs runs', ctrl_c_in_mkfs, ()),
-             ('SIGTERM to the manager alone while the landing screen\'s mkfs runs', term_in_mkfs, ()))
+             ('SIGTERM to the manager alone while the landing screen\'s mkfs runs', term_in_mkfs, ()),
+             ('mkfs killed alone while the landing screen waits for it', mkfs_killed_alone, ()))
     for i, (how, case, blocked) in enumerate(cases):
         path = f'{root}/landing-stop{i}.stm'
         term = Term([stratum], blocked=blocked)
@@ -1922,14 +1981,16 @@ def landing_stop_legs(stratum, root):
             term.send(b'64M' + ENTER)
             term.expect(r'Passphrase:')
             try:
-                said, mkfs, left = case(term, path)
+                said, mkfs, left, *rc = case(term, path)
             except Failure as e:
                 raise Failure(f'{how}: {e}') from None
+            # A stop asked ends it with 1; mkfs's own end is told, and is not the manager's error.
+            want = rc[0] if rc else 1
             ended = term.exited(30)
             # Wrapped at the screen's edge, a long path moves the words across rows.
             shown = re.sub(r'\s', '', term.screen.text())
             named = all(re.sub(r'\s', '', s) in shown for s in said)
-            record(ended and term.rc == 1 and named, f'{how}: the manager stopped, rc 1, and said so',
+            record(ended and term.rc == want and named, f'{how}: the manager ended, rc {want}, and said so',
                    f'{how}: the manager ended={ended} rc={term.rc}, said {said!r}={named}')
             if ended:
                 modes = tty_modes(term)
@@ -3150,6 +3211,7 @@ def run(stratum, root):
                       (wizard_legs, (stratum, vol, root)),
                       (mid_session_legs, (stratum, root)),
                       (landing_legs, (stratum, root)),
+                      (children_waited_for_leg, (stratum, root)),
                       (landing_stop_legs, (stratum, root))):
         try:
             leg(*args)

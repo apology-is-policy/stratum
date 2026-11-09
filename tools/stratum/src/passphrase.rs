@@ -102,6 +102,8 @@ impl SecretText {
     }
     /// Typed past the limit, which a submit refuses.
     pub fn past_limit(&self) -> bool { self.over > 0 }
+    /// Characters typed past the limit and counted, not kept.
+    pub fn over(&self) -> usize { self.over }
     /// Characters typed, kept or counted.
     pub fn typed(&self) -> usize { self.text.chars().count() + self.over }
 }
@@ -278,6 +280,45 @@ fn block(set: &libc::sigset_t) -> libc::sigset_t {
     let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, set, &mut prev) };
     prev
+}
+
+/// What the main thread waits on: a stop asked (TERM, INT, HUP, QUIT), the job-control stops
+/// and the continue.
+fn asked_set() -> libc::sigset_t {
+    let mut set = release_set();
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+        unsafe { libc::sigaddset(&mut set, sig) };
+    }
+    set
+}
+
+/// A helper thread that takes none of what the main thread waits on: it starts with those
+/// signals blocked, as a thread starts with its spawner's mask. Each is then the main
+/// thread's, seen by the wait that asks for it, and the helper's own write to a terminal
+/// never stops the job for SIGTTOU under tostop.
+pub(crate) fn spawn_helper<F, T>(name: &str, f: F) -> io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let prev = block(&asked_set());
+    let spawned = std::thread::Builder::new().name(name.to_string()).spawn(f);
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()) };
+    spawned
+}
+
+/// A child keeps its spawner's mask across exec: one started from a helper gets back the
+/// signals the helper blocked, as any program expects them.
+pub(crate) fn as_its_own_program(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let set = asked_set();
+    // Between fork and exec: sigprocmask is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            Ok(())
+        })
+    }
 }
 
 /// In front of `fd`, or with no job control there to be behind: on a terminal that is not
@@ -989,6 +1030,58 @@ mod prompt_tests {
         }
         HOLD.fd.store(FREE, Ordering::Release);
         assert_eq!(echo, 0, "echo was left on in front after a continue");
+    }
+
+    fn this_threads_mask() -> libc::sigset_t {
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) };
+        mask
+    }
+
+    const ASKED: [libc::c_int; 8] = [
+        libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT,
+        libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU, libc::SIGCONT,
+    ];
+
+    fn blocked(mask: &libc::sigset_t) -> [bool; 8] {
+        ASKED.map(|sig| unsafe { libc::sigismember(mask, sig) } == 1)
+    }
+
+    /// A helper starts with none of what the main thread waits on; a plain thread from the
+    /// same spawner, one variable away, starts with all of it, and the spawner keeps its own.
+    #[test]
+    fn a_helper_takes_none_of_the_asked_signals() {
+        let plain = std::thread::spawn(this_threads_mask).join().expect("its mask");
+        let helper = spawn_helper("test-helper", this_threads_mask).expect("a helper").join().expect("its mask");
+        assert_eq!(blocked(&plain), [false; 8], "a plain thread starts with some blocked: it proves nothing");
+        assert_eq!(blocked(&helper), [true; 8], "the helper can take some of them");
+        assert_eq!(blocked(&this_threads_mask()), [false; 8], "the spawner kept them blocked");
+    }
+
+    /// A program started from a helper gets each signal back: a shell sending itself one
+    /// ends by it. One started plainly there, one variable away, keeps TERM blocked and goes
+    /// on, as std hands a child its spawner's mask.
+    #[test]
+    fn a_program_started_from_a_helper_has_the_signals_back() {
+        let ends = spawn_helper("test-spawner", || {
+            let run = |sig: &str, own: bool| {
+                let mut sh = std::process::Command::new("/bin/sh");
+                sh.args(["-c", &format!("kill -{sig} $$; echo alive")]);
+                if own {
+                    as_its_own_program(&mut sh);
+                }
+                let out = sh.output().expect("a shell");
+                (std::os::unix::process::ExitStatusExt::signal(&out.status), out.stdout)
+            };
+            [run("TERM", false), run("TERM", true), run("INT", true), run("HUP", true)]
+        })
+        .expect("a helper")
+        .join()
+        .expect("what each said");
+        assert_eq!(ends[0], (None, b"alive\n".to_vec()), "a plain child of a helper took TERM: it proves nothing");
+        assert_eq!(ends[1].0, Some(libc::SIGTERM), "TERM stayed blocked");
+        assert_eq!(ends[2].0, Some(libc::SIGINT), "INT stayed blocked");
+        assert_eq!(ends[3].0, Some(libc::SIGHUP), "HUP stayed blocked");
     }
 
     /// Two holds at once, as the tests here make: the second takes none of the handlers,

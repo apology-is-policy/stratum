@@ -392,7 +392,7 @@ pub fn stop_on_signals() {
 /// on their lifeline. Linux fails tcgetattr on a terminal that has gone; macOS still
 /// answers it, and fails an empty write instead. Neither sends anything to a live one.
 fn exit_when_terminal_goes(ttys: Vec<i32>, session_dir: Option<PathBuf>) {
-    thread::spawn(move || loop {
+    let watch = crate::passphrase::spawn_helper("stratum-watch", move || loop {
         thread::sleep(Duration::from_millis(200));
         // Every one of them: a read-only descriptor answers the write with EBADF, which
         // says nothing, so on macOS it could not see the terminal go.
@@ -411,6 +411,7 @@ fn exit_when_terminal_goes(ttys: Vec<i32>, session_dir: Option<PathBuf>) {
             std::process::exit(129);
         }
     });
+    watch.expect("spawn the terminal watcher");
 }
 
 pub fn run(opts: Opts) -> Result<()> {
@@ -434,9 +435,7 @@ pub fn run(opts: Opts) -> Result<()> {
     let _redraw_handle = {
         let stop = Arc::clone(&stop_flag);
         let sock = opts.slate_sock.clone();
-        thread::Builder::new()
-            .name("stratum-redraw".into())
-            .spawn(move || redraw_loop(sock, redraw_tx, stop))?
+        crate::passphrase::spawn_helper("stratum-redraw", move || redraw_loop(sock, redraw_tx, stop))?
     };
 
     let result = run_ui(&mut main_client, &redraw_rx, opts.spawn.clone());
@@ -639,6 +638,8 @@ fn run_ui(
         Ok(true) => {}
         Ok(false) => {
             put_back(job_control_caught);
+            // Ending behind: the teardown and the last word go out under tostop too.
+            crate::embed::never_stop_for_the_terminal();
             return Err(anyhow::anyhow!("asked to stop before the screen"));
         }
         Err(e) => {
@@ -1056,6 +1057,10 @@ fn run_ui(
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()) };
     if front && terminal.show_cursor().is_ok() {
         drop(std::mem::ManuallyDrop::into_inner(terminal));
+    }
+    if !front {
+        // As above: the job ends behind, and stops for nothing on its way out.
+        crate::embed::never_stop_for_the_terminal();
     }
     result
 }
@@ -1880,6 +1885,10 @@ const NAME_MAX: usize = 255;
 /// A volume's size as typed, 64M say.
 const SIZE_MAX: usize = 32;
 
+/// A volume's file name, .stm included: mkfs makes its key at "<name>.key.new.<pid>" first,
+/// and that name must fit in one component too (a pid has at most 10 digits).
+const VOLUME_LEAF_MAX: usize = NAME_MAX - ".key.new.".len() - 10;
+
 /// SWISS-4f: dispatch keystrokes when a Confirm dialog is active.
 /// Left/Right/Tab cycle through options; Enter picks the highlighted
 /// one (calls into submit_confirm); Esc cancels.
@@ -2095,11 +2104,11 @@ fn spawn_ctl_job(
     let (tx, rx) = mpsc::channel();
     let me = std::env::current_exe()
         .unwrap_or_else(|_| std::path::PathBuf::from("stratum"));
-    let join = std::thread::spawn(move || {
+    let join = crate::passphrase::spawn_helper("stratum-ctl", move || {
         use std::io::Write;
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
-        let mut child = match Command::new(&me)
+        let mut child = match crate::passphrase::as_its_own_program(&mut Command::new(&me))
             .args(&[
                 "fs", "-s",
                 ctl_sock.to_string_lossy().as_ref(),
@@ -2138,7 +2147,8 @@ fn spawn_ctl_job(
                 let _ = tx.send(CtlJobResult::SpawnErr(format!("wait: {e}")));
             }
         }
-    });
+    })
+    .expect("spawn the control write");
     CtlJob {
         rx,
         success_msg,
@@ -2853,6 +2863,23 @@ fn submit_mkvol(
         });
         return Ok(Action::Refresh);
     }
+    // Append .stm if missing.
+    let leaf = if name.ends_with(".stm") {
+        name.to_string()
+    } else {
+        format!("{name}.stm")
+    };
+    if leaf.len() > VOLUME_LEAF_MAX {
+        let mut new_mk = mk.clone();
+        new_mk.error = Some(format!(
+            "Name too long: at most {VOLUME_LEAF_MAX} bytes with .stm, so that mkfs can name its key."
+        ));
+        *local_dialog = Some(LocalDialog {
+            kind: LocalDialogKind::MkVol(new_mk),
+            ..dialog
+        });
+        return Ok(Action::Refresh);
+    }
 
     // An empty field must not quietly become a plaintext keyfile, and a typo here loses the volume.
     let passphrase_error = if !mk.encrypt {
@@ -2908,12 +2935,6 @@ fn submit_mkvol(
     if !cwd.is_empty() {
         volume_path.push(cwd);
     }
-    // Append .stm if missing.
-    let leaf = if name.ends_with(".stm") {
-        name.to_string()
-    } else {
-        format!("{name}.stm")
-    };
     volume_path.push(&leaf);
 
     if volume_path.exists() {
@@ -4155,9 +4176,7 @@ fn spawn_copy_worker(
     /* Reset intra counter at every spawn so a previous file's
      * trailing read doesn't bleed into this file's progress. */
     set_intra_file_bytes(0);
-    let handle = thread::Builder::new()
-        .name("stratum-copy".into())
-        .spawn(move || {
+    let handle = crate::passphrase::spawn_helper("stratum-copy", move || {
             perform_copy_one(
                 &sp, &src_meta, src_sock.as_deref(), &src,
                 &dst_meta, dst_sock.as_deref(), &dst, &temp, is_dir, policy,
@@ -4823,9 +4842,7 @@ fn advance_delete_batch(
             .to_string(),
     };
     let sp_for_thread = spawn.cloned();
-    let handle = thread::Builder::new()
-        .name("stratum-delete".into())
-        .spawn(move || -> std::io::Result<()> {
+    let handle = crate::passphrase::spawn_helper("stratum-delete", move || -> std::io::Result<()> {
             match item {
                 DeleteItem::Host { path, is_dir } => {
                     if is_dir {
@@ -5492,6 +5509,53 @@ mod tests {
             };
             assert_eq!(error, Some(format!("{said} too long: at most {max} bytes.")));
         }
+    }
+
+    // A volume's name leaves room for the name mkfs gives its key first, on a real file
+    // system: the longest one the wizard takes is made there, one byte more is not, and the
+    // wizard refuses that one before mkfs runs.
+    #[test]
+    fn a_volume_name_leaves_room_for_its_key() {
+        use crossterm::event::{KeyCode as K, KeyEvent, KeyModifiers as M};
+        let dir = std::env::temp_dir().join(format!("stratum-leaf-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a directory");
+        let key_of = |leaf: &str| dir.join(format!("{leaf}.key.new.{}", u32::MAX));
+        let fits = std::fs::write(key_of(&"a".repeat(VOLUME_LEAF_MAX)), b"");
+        let over = std::fs::write(key_of(&"a".repeat(VOLUME_LEAF_MAX + 1)), b"");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(fits.is_ok(), "the longest key name for the longest volume name was refused: {fits:?}");
+        assert_eq!(over.map_err(|e| e.raw_os_error()), Err(Some(libc::ENAMETOOLONG)), "one byte more was a name");
+
+        let snap = blank_snap();
+        let mut job = None;
+        let said_for = |name: String, job: &mut Option<_>| {
+            let mut mk = MkVolState::new(0);
+            mk.name = name.into();
+            mk.size = "64M".into();
+            mk.encrypt = true;
+            mk.passphrase = "a passphrase".into();
+            mk.confirm = "a passphrase".into();
+            mk.field = MkVolField::Ok;
+            let mut dialog = Some(LocalDialog {
+                kind: LocalDialogKind::MkVol(mk),
+                prompt: String::new(),
+                value: Default::default(),
+                is_password: false,
+                is_error: false,
+            });
+            handle_dialog_key(&mut dialog, job, None, &snap, KeyEvent::new(K::Enter, M::NONE)).expect("Enter");
+            match dialog.as_ref() {
+                Some(LocalDialog { kind: LocalDialogKind::MkVol(mk), .. }) => format!("{:?}", mk.error),
+                Some(d) => d.prompt.clone(),
+                None => String::new(),
+            }
+        };
+        let refused = format!("Some(\"Name too long: at most {VOLUME_LEAF_MAX} bytes with .stm, so that mkfs can name its key.\")");
+        // With no spawn helper, getting as far as saying so is the proof a name was taken.
+        assert_eq!(said_for("a".repeat(VOLUME_LEAF_MAX - 4), &mut job), "Spawn helper unavailable.");
+        assert_eq!(said_for(format!("{}.stm", "a".repeat(VOLUME_LEAF_MAX - 4)), &mut job), "Spawn helper unavailable.");
+        assert_eq!(said_for("a".repeat(VOLUME_LEAF_MAX - 3), &mut job), refused);
+        assert_eq!(said_for(format!("{}.stm", "a".repeat(VOLUME_LEAF_MAX - 3)), &mut job), refused);
     }
 
     // At the limit exactly, a passphrase gets past the length check in the wizard and the

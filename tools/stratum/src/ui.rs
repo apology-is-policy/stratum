@@ -1331,7 +1331,7 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
         let display = if d.is_password {
             stars(d.value.typed())
         } else {
-            sanitize_for_display(&d.value)
+            shown_text(&d.value)
         };
         vec![Line::from(Span::styled(
             format!("> {display}_"),
@@ -1850,9 +1850,9 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
         .constraints([Constraint::Length(1), Constraint::Length(1)]) // buttons, hint
         .split(foot);
 
-    render_mkvol_field(frame, rows[0], "Name:", &mk.name,
+    render_mkvol_field(frame, rows[0], "Name:", &shown_text(&mk.name),
                        mk.field == MkVolField::Name, None);
-    render_mkvol_field(frame, rows[1], "Size:", &mk.size,
+    render_mkvol_field(frame, rows[1], "Size:", &shown_text(&mk.size),
                        mk.field == MkVolField::Size, None);
 
     // SWISS-4n1: rename "Encryption" → "Use passphrase". Volumes are
@@ -1960,6 +1960,16 @@ fn wizard_rows(avail: u16, focused: Option<usize>, err_rows: u16) -> [u16; 7] {
 /// paste costs no more than drawing a long passphrase.
 fn stars(typed: usize) -> String {
     "*".repeat(typed.min(crate::passphrase::PASSPHRASE_MAX + 1))
+}
+
+/// A field's text as drawn, and what was typed past its limit as a count: the submit
+/// refuses it, and the first Backspaces take it back, so it must not be out of sight.
+fn shown_text(t: &crate::passphrase::SecretText) -> String {
+    let shown = sanitize_for_display(t);
+    match t.over() {
+        0 => shown,
+        n => format!("{shown} (+{n} over)"),
+    }
 }
 
 fn render_mkvol_field(
@@ -2498,5 +2508,30 @@ mod tests {
         assert_eq!(stars(3), "***");
         assert_eq!(stars(max), "*".repeat(max));
         assert_eq!(stars(100_000).len(), max + 1);
+    }
+
+    // Past a field's limit, what was typed and not kept shows as a count beside the text, in
+    // the wizard and in a dialog: the submit refuses it, and the first Backspaces take it back.
+    #[test]
+    fn what_is_typed_past_the_limit_is_shown() {
+        let mut t = crate::passphrase::SecretText::default();
+        for c in "abc".chars() {
+            t.type_within(c, 2);
+        }
+        let mut mk = MkVolState::new(0);
+        mk.name = t.clone();
+        let wizard = screen_rows(80, 30, |f, a| draw_mkvol_dialog(f, a, &mk));
+        assert!(row_of(&wizard, "ab (+1 over)").is_some(), "the wizard:\n{}", wizard.join("\n"));
+        let d = LocalDialog {
+            kind: LocalDialogKind::MkDirInput { panel_idx: 0 },
+            prompt: "Name:".into(),
+            value: t.clone(),
+            is_password: false,
+            is_error: false,
+        };
+        let dialog = screen_rows(80, 30, |f, a| draw_local_dialog(f, a, &d));
+        assert!(row_of(&dialog, "ab (+1 over)").is_some(), "the dialog:\n{}", dialog.join("\n"));
+        t.erase();
+        assert_eq!(shown_text(&t), "ab");
     }
 }

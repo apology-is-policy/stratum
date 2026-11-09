@@ -159,7 +159,9 @@ fn prompt_new() -> Result<()> {
     }
     drop(again);
 
-    // mkfs refuses a key already there, so one there after a signal is the one it made.
+    // mkfs refuses a key already there, so one there after a signal is the one it made, as
+    // long as nothing else writes into the directory meanwhile: what could do that as this
+    // user could as well replace the volume.
     let key_before = Path::new(&format!("{}.key", path.display())).exists();
     let me = std::env::current_exe().context("find this program")?;
     let mut child = Command::new(me)
@@ -191,11 +193,11 @@ fn prompt_new() -> Result<()> {
     let said = String::from_utf8_lossy(&said).trim().to_string();
     if crate::tui::stop_requested() {
         drop(held);
-        bail!("{}", mkfs_stop_message(&path, status, &said, mkfs_pid, key_before));
+        bail!("{}", mkfs_end_message(&path, status, &said, mkfs_pid, key_before, true));
     }
     if !status.success() {
         drop(held);
-        eprintln!("stratum: mkfs failed: {said}");
+        eprintln!("stratum: {}", mkfs_end_message(&path, status, &said, mkfs_pid, key_before, false));
         return Ok(());
     }
     // The manager's own prompt reads the mode next, and must find it as it was.
@@ -290,33 +292,74 @@ fn wait_for_mkfs(child: &mut std::process::Child) -> Result<(std::process::ExitS
     }
 }
 
-/// What a stop asked while mkfs ran says, by how mkfs ended and what it left.
-fn mkfs_stop_message(path: &Path, status: std::process::ExitStatus, said: &str, mkfs_pid: u32, key_before: bool) -> String {
+/// What mkfs's end says when it did not finish, or when a stop was asked while it ran: by
+/// how it ended, and the files it left.
+fn mkfs_end_message(
+    path: &Path,
+    status: std::process::ExitStatus,
+    said: &str,
+    mkfs_pid: u32,
+    key_before: bool,
+    asked: bool,
+) -> String {
     let vol = path.display();
+    let lead = if asked { "asked to stop while mkfs ran: " } else { "" };
     if status.success() {
-        return format!("asked to stop while mkfs ran: {vol} was made, and was not opened");
+        return format!("{lead}{vol} was made, and was not opened");
     }
     let Some(sig) = status.signal() else {
         // It failed on its own, and cleaned up after itself.
-        return format!("asked to stop while mkfs ran, and mkfs failed: {said}");
+        return if asked {
+            format!("asked to stop while mkfs ran, and mkfs failed: {said}")
+        } else {
+            format!("mkfs failed: {said}")
+        };
     };
-    // The key is named last, once the volume is whole: past that only a sync and a line were left.
     let key = format!("{vol}.key");
+    let mut temp = key_destination(Path::new(&key)).into_os_string();
+    temp.push(format!(".new.{mkfs_pid}"));
+    let temp = PathBuf::from(temp);
+    // The key is named last, once the volume is whole: past that only a sync and a line were
+    // left, and the temporary name, should the signal have come between the link and the
+    // unlink.
     if !key_before && Path::new(&key).exists() {
-        return format!("asked to stop while mkfs ran: signal {sig} ended mkfs after it had made {vol} and its key {key}; it was not opened");
+        let also = if temp.exists() {
+            format!("; {} is a second name for the key, and can go", temp.display())
+        } else {
+            String::new()
+        };
+        return format!("{lead}signal {sig} ended mkfs after it had made {vol} and its key {key}; it was not opened{also}");
     }
     // Ended by a signal, its own cleanup never ran: what it claimed stays, the file and the
     // key it was sealing, and only their names say what they are.
-    let left: Vec<String> = [vol.to_string(), format!("{vol}.key.new.{mkfs_pid}")]
+    let left: Vec<String> = [path.to_path_buf(), temp]
         .into_iter()
-        .filter(|f| Path::new(f).exists())
+        .filter(|f| f.exists())
+        .map(|f| f.display().to_string())
         .collect();
     let left = match left.len() {
         0 => String::new(),
         1 => format!("; it left {}: remove it before trying again", left[0]),
         _ => format!("; it left {}: remove them before trying again", left.join(" and ")),
     };
-    format!("asked to stop while mkfs ran: signal {sig} ended mkfs before it finished, so {vol} is not a volume{left}")
+    format!("{lead}signal {sig} ended mkfs before it finished, so {vol} is not a volume{left}")
+}
+
+/// Where mkfs makes the key it names `key`, as its key_destination finds it: through up to
+/// eight symlinks, a relative target read beside its link.
+fn key_destination(key: &Path) -> PathBuf {
+    let mut here = key.to_path_buf();
+    for _ in 0..8 {
+        let Ok(target) = fs::read_link(&here) else {
+            return here;
+        };
+        here = match here.parent() {
+            Some(dir) if !target.is_absolute() => dir.join(target),
+            _ => target,
+        };
+    }
+    // A loop: mkfs makes no key, and nothing is there by that name.
+    key.to_path_buf()
 }
 
 #[cfg(test)]
@@ -326,6 +369,7 @@ mod tests {
     use std::process::ExitStatus;
 
     /// A signal before the key was named leaves no volume; after, a whole one and its key.
+    /// Asked or not, the files it left are named, the temporary key where mkfs made it.
     #[test]
     fn a_stop_during_mkfs_says_what_it_left() {
         let dir = std::env::temp_dir().join(format!("stratum-landing-test-{}", std::process::id()));
@@ -335,18 +379,36 @@ mod tests {
         let key = format!("{}.key", vol.display());
         let temp = format!("{}.key.new.{pid}", vol.display());
         let int = ExitStatus::from_raw(libc::SIGINT);
+        let kill = ExitStatus::from_raw(libc::SIGKILL);
         fs::write(&vol, b"").expect("the volume");
         fs::write(&temp, b"").expect("the temporary key");
-        let before = mkfs_stop_message(&vol, int, "", pid, false);
-        fs::remove_file(&temp).expect("rename, as mkfs does");
+        let before = mkfs_end_message(&vol, int, "", pid, false, true);
+        let killed = mkfs_end_message(&vol, kill, "", pid, false, false);
+        // Linked, and the signal before the unlink: two names for one key.
         fs::write(&key, b"").expect("the key");
-        let after = mkfs_stop_message(&vol, int, "", pid, false);
-        let made = mkfs_stop_message(&vol, ExitStatus::from_raw(0), "", pid, false);
-        let failed = mkfs_stop_message(&vol, ExitStatus::from_raw(1 << 8), "no room", pid, false);
+        let both = mkfs_end_message(&vol, int, "", pid, false, true);
+        fs::remove_file(&temp).expect("unlinked, as mkfs does");
+        let after = mkfs_end_message(&vol, int, "", pid, false, true);
+        let made = mkfs_end_message(&vol, ExitStatus::from_raw(0), "", pid, false, true);
+        let failed = mkfs_end_message(&vol, ExitStatus::from_raw(1 << 8), "no room", pid, false, true);
+        let failed_alone = mkfs_end_message(&vol, ExitStatus::from_raw(1 << 8), "no room", pid, false, false);
+        // A key name that is a dangling symlink: mkfs makes the key where it points.
+        fs::remove_file(&key).expect("no key");
+        let far = dir.join("far");
+        std::os::unix::fs::symlink("far", &key).expect("the link");
+        let far_temp = format!("{}.new.{pid}", far.display());
+        fs::write(&far_temp, b"").expect("the temporary key, where the link points");
+        let linked = mkfs_end_message(&vol, int, "", pid, false, true);
         let _ = fs::remove_dir_all(&dir);
         assert!(before.contains("is not a volume") && before.contains(&temp), "{before}");
-        assert!(after.contains("after it had made") && after.contains(&key) && !after.contains("not a volume"), "{after}");
+        assert!(killed.contains("signal 9 ended mkfs before it finished") && killed.contains(&temp)
+            && !killed.contains("asked to stop"), "{killed}");
+        assert!(both.contains("after it had made") && both.contains(&format!("{temp} is a second name")), "{both}");
+        assert!(after.contains("after it had made") && after.contains(&key) && !after.contains("not a volume")
+            && !after.contains("second name"), "{after}");
         assert!(made.contains("was made, and was not opened"), "{made}");
-        assert!(failed.contains("mkfs failed: no room"), "{failed}");
+        assert!(failed.contains("asked to stop while mkfs ran, and mkfs failed: no room"), "{failed}");
+        assert_eq!(failed_alone, "mkfs failed: no room");
+        assert!(linked.contains(&far_temp) && !linked.contains(&temp), "{linked}");
     }
 }

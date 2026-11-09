@@ -43,6 +43,7 @@ mod volmap;
 
 fn main() -> Result<()> {
     no_core_dumps();
+    children_waited_for();
     let args: Vec<String> = std::env::args().collect();
     let exit_code = dispatch(args)?;
     std::process::exit(exit_code);
@@ -60,6 +61,15 @@ fn no_core_dumps() {
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0)
     };
+}
+
+/// A SIGCHLD left ignored by whatever started this program would have each child reaped as it
+/// ends, unseen: every wait then fails with ECHILD, a finished mkfs reads as an error, and a
+/// stop sends SIGKILL to a pid that may name another process by then.
+fn children_waited_for() {
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    act.sa_sigaction = libc::SIG_DFL;
+    unsafe { libc::sigaction(libc::SIGCHLD, &act, std::ptr::null_mut()) };
 }
 
 fn dispatch(args: Vec<String>) -> Result<i32> {
@@ -266,5 +276,37 @@ mod tests {
         let code = libc::WEXITSTATUS(status);
         assert_ne!(code, 2, "the hard core limit was 0 to start: it proves nothing");
         assert_eq!(code, 0, "a core limit or, on Linux, the dumpable flag was left on");
+    }
+
+    /// Started with SIGCHLD ignored, the process waits for its children again; without the
+    /// reset, one variable away, the wait fails with ECHILD. Only async-signal-safe calls
+    /// after the fork: the test binary has other threads.
+    #[test]
+    fn children_are_waited_for() {
+        let waits = |reset: bool| {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+                if reset {
+                    super::children_waited_for();
+                }
+                let grandchild = unsafe { libc::fork() };
+                if grandchild == 0 {
+                    unsafe { libc::_exit(7) };
+                }
+                let mut status = 0;
+                let waited = unsafe { libc::waitpid(grandchild, &mut status, 0) } == grandchild
+                    && libc::WIFEXITED(status)
+                    && libc::WEXITSTATUS(status) == 7;
+                unsafe { libc::_exit(if waited { 0 } else { 1 }) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status), "the child did not exit: {status:#x}");
+            libc::WEXITSTATUS(status) == 0
+        };
+        assert!(!waits(false), "with SIGCHLD ignored a child was still waited for: it proves nothing");
+        assert!(waits(true), "the child was reaped unseen: SIGCHLD was left ignored");
     }
 }

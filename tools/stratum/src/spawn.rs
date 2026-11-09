@@ -111,7 +111,8 @@ pub fn stop_child(child: &mut Child, name: &str) {
         match child.try_wait() {
             Ok(Some(_)) => return,
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => break,
+            // Not this process's to wait for, so not its pid to kill either.
+            Err(_) => return,
         }
     }
     tell(format_args!("stratum: {name} didn't exit on SIGTERM; SIGKILL"));
@@ -454,7 +455,7 @@ impl SpawnCtx {
             .ok_or_else(|| anyhow!("socket path is not utf-8"))?;
         let mut full = vec!["fs", "-s", sock_str];
         full.extend_from_slice(args);
-        let out = Command::new(&self.me)
+        let out = crate::passphrase::as_its_own_program(&mut Command::new(&self.me))
             .args(&full)
             .stdin(stdin)
             .stdout(stdout)
@@ -498,7 +499,7 @@ impl SpawnCtx {
             .ok_or_else(|| anyhow!("socket path is not utf-8"))?;
         let mut full = vec!["fs", "-s", sock_str];
         full.extend_from_slice(args);
-        let out = Command::new(&self.me)
+        let out = crate::passphrase::as_its_own_program(&mut Command::new(&self.me))
             .args(&full)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -536,7 +537,7 @@ impl SpawnCtx {
         use std::process::Stdio;
         let src_sock_str = src_socket.to_str().ok_or_else(|| anyhow!("src sock not utf-8"))?;
         let dst_sock_str = dst_socket.to_str().ok_or_else(|| anyhow!("dst sock not utf-8"))?;
-        let mut reader = Command::new(&self.me)
+        let mut reader = crate::passphrase::as_its_own_program(&mut Command::new(&self.me))
             .args(&["fs", "-s", src_sock_str, "read", src_path])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -544,7 +545,7 @@ impl SpawnCtx {
             .process_group(0)
             .spawn()?;
         let reader_stdout = reader.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-        let writer = Command::new(&self.me)
+        let writer = crate::passphrase::as_its_own_program(&mut Command::new(&self.me))
             .args(&["fs", "-s", dst_sock_str, "write", "-n", "-m", dst_mode, dst_path])
             .stdin(Stdio::from(reader_stdout))
             .stdout(Stdio::null())
@@ -566,7 +567,7 @@ impl SpawnCtx {
         if !reader_status.success() {
             // The writer took the reader's end for the end of the file and kept what had
             // come; write -n made that file, so it goes.
-            let _ = Command::new(&self.me)
+            let _ = crate::passphrase::as_its_own_program(&mut Command::new(&self.me))
                 .args(["fs", "-s", dst_sock_str, "rm", dst_path])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

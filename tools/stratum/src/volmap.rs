@@ -338,9 +338,10 @@ impl VolumeMapPoller {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let state_for_thread = state.clone();
         let stop_for_thread = stop.clone();
-        let join = thread::spawn(move || {
+        let join = crate::passphrase::spawn_helper("stratum-volmap", move || {
             poll_loop(socket_path, state_for_thread, stop_for_thread);
-        });
+        })
+        .expect("spawn the volume map poller");
         VolumeMapPoller { state, stop, _join: Some(join) }
     }
 

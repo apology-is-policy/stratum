@@ -397,9 +397,10 @@ impl SnapshotGraphPoller {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let state_for_thread = state.clone();
         let stop_for_thread = stop.clone();
-        let join = thread::spawn(move || {
+        let join = crate::passphrase::spawn_helper("stratum-snapgraph", move || {
             poll_loop(socket_path, state_for_thread, stop_for_thread);
-        });
+        })
+        .expect("spawn the snapshot graph poller");
         SnapshotGraphPoller { state, stop, _join: Some(join) }
     }
 
