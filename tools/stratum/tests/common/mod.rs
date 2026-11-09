@@ -77,6 +77,12 @@ impl DaemonGuard {
             None => String::new(),
         }
     }
+    /// A daemon that never comes up has said why in its log.
+    pub fn wait_ready(&self, sock: &Path, timeout: Duration) -> Result<()> {
+        wait_for_sock(sock, timeout).map_err(|e| {
+            anyhow!("{}: {e:#}; its log:\n{}", self.label, self.dump_log())
+        })
+    }
 }
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
@@ -88,17 +94,16 @@ impl Drop for DaemonGuard {
 pub struct Session {
     pub _tmp: tempfile::TempDir,
     pub bin: PathBuf,
-    pub root: PathBuf,
     pub host_root: PathBuf,
     pub stm_path: PathBuf,
     pub stm_keyfile: PathBuf,
     pub stratumd_sock: PathBuf,
     pub stratumd_ctl_sock: PathBuf,
     pub slate_sock: PathBuf,
-    pub host_fs_sock: PathBuf,
-    pub stratumd: DaemonGuard,
-    pub slate: DaemonGuard,
-    pub host_fs: DaemonGuard,
+    /// Held for their Drop, which kills each daemon.
+    pub _stratumd: DaemonGuard,
+    pub _slate: DaemonGuard,
+    pub _host_fs: DaemonGuard,
 }
 
 pub struct SessionBuilder {
@@ -177,8 +182,7 @@ impl SessionBuilder {
             label: "host-fs",
             log_path: Some(host_log),
         };
-        wait_for_sock(&host_fs_sock, Duration::from_secs(5))
-            .context("host-fs socket appear")?;
+        host_fs.wait_ready(&host_fs_sock, Duration::from_secs(5))?;
 
         // Spawn stratumd.
         let stratumd_log = root.join("stratumd.log");
@@ -222,8 +226,7 @@ impl SessionBuilder {
             label: "stratumd",
             log_path: Some(stratumd_log),
         };
-        wait_for_sock(&stratumd_sock, Duration::from_secs(8))
-            .context("stratumd socket appear")?;
+        stratumd.wait_ready(&stratumd_sock, Duration::from_secs(8))?;
 
         // Spawn slate.
         let slate_log = root.join("slate.log");
@@ -244,23 +247,20 @@ impl SessionBuilder {
             label: "slate",
             log_path: Some(slate_log),
         };
-        wait_for_sock(&slate_sock, Duration::from_secs(5))
-            .context("slate socket appear")?;
+        slate.wait_ready(&slate_sock, Duration::from_secs(5))?;
 
         Ok(Session {
             _tmp: tmp,
             bin,
-            root,
             host_root,
             stm_path,
             stm_keyfile,
             stratumd_sock,
             stratumd_ctl_sock,
             slate_sock,
-            host_fs_sock,
-            stratumd,
-            slate,
-            host_fs,
+            _stratumd: stratumd,
+            _slate: slate,
+            _host_fs: host_fs,
         })
     }
 }

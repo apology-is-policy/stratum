@@ -22,6 +22,8 @@
 //!      (stm_ctl_destroy's worker_cv wait correctly drains both
 //!      detached workers).
 
+// This crate uses a part of the shared helpers; e2e_crud uses the rest.
+#[allow(dead_code)]
 mod common;
 
 use common::SessionBuilder;
@@ -157,17 +159,23 @@ fn ctl_third_client_dials_while_two_busy() {
 
     let stop = Arc::new(AtomicBool::new(false));
 
+    // Each counts its good reads: siblings that never read would let the
+    // foreground pass with no contention at all.
     let bg = |label: &'static str, bin: std::path::PathBuf, sock: std::path::PathBuf, stop: Arc<AtomicBool>| {
         thread::spawn(move || {
             let mut iters = 0u64;
+            let mut good = 0u64;
             while !stop.load(Ordering::SeqCst) {
-                let _ = ctl_read(&bin, &sock, "/version");
+                if matches!(ctl_read(&bin, &sock, "/version"), Ok((0, _))) {
+                    good += 1;
+                }
                 iters += 1;
                 if iters > 200 {
                     break;
                 }
                 thread::sleep(Duration::from_millis(5));
             }
+            (label, good)
         })
     };
 
@@ -187,8 +195,10 @@ fn ctl_third_client_dials_while_two_busy() {
         assert!(String::from_utf8_lossy(&body).contains("stratum-version:"));
     }
     stop.store(true, Ordering::SeqCst);
-    let _ = a.join();
-    let _ = b.join();
+    for worker in [a, b] {
+        let (label, good) = worker.join().expect("background client panicked");
+        assert!(good > 0, "background client {label} never read /version: the foreground had no siblings");
+    }
 
     // Same loose cap as the two-client test; 1 s would already imply
     // multi-second tail latency. Concurrent regime keeps this well

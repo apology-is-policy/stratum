@@ -6,8 +6,8 @@
 //!      encrypted format). Used by the TUI to decide whether to
 //!      prompt before spawning stratumd.
 //!   2. `prompt_passphrase(label)` reads a line from the controlling
-//!      terminal with echo OFF (raw `read(STDIN, 1)` after termios
-//!      ICANON+ECHO masked). Returned as `Vec<u8>` (NOT NUL-
+//!      terminal, /dev/tty, with echo and canonical mode off. Returned
+//!      as `Vec<u8>` (NOT NUL-
 //!      terminated). Caller is responsible for `drop` (which clears
 //!      via the `Zeroizing` wrapper) when no longer needed.
 
@@ -123,11 +123,18 @@ pub fn prompt_passphrase(label: &str) -> Result<Zeroizing> {
         .write(true)
         .open("/dev/tty")
         .context("open /dev/tty (no controlling terminal?)")?;
+    prompt_on(&tty, label)
+}
+
+/// With canonical mode off the line discipline edits nothing, so the keys a cooked
+/// terminal would act on are acted on here: DEL and BS erase a byte, Ctrl-U the line,
+/// Ctrl-D gives up. Only Enter submits.
+fn prompt_on(tty: &File, label: &str) -> Result<Zeroizing> {
     let fd = tty.as_raw_fd();
 
     // Print label to /dev/tty (NOT stdout — stdout might be piped).
     {
-        let mut writer = &tty;
+        let mut writer = tty;
         writer.write_all(label.as_bytes()).context("write prompt")?;
         writer.flush().ok();
     }
@@ -150,45 +157,115 @@ pub fn prompt_passphrase(label: &str) -> Result<Zeroizing> {
     // Never grows, as the refusal comes at 1024, and every way out of here wipes it.
     let mut buf = Zeroizing::new(Vec::with_capacity(1025));
     let mut byte = [0u8; 1];
-    let mut reader = &tty;
-    loop {
+    let mut reader = tty;
+    let given_up = loop {
         match reader.read(&mut byte) {
-            Ok(0) => break,         // EOF
-            Ok(_) => {
-                if byte[0] == b'\n' { break; }
-                if byte[0] == 0x7f || byte[0] == 0x08 {
-                    // Backspace / DEL — pop one byte if any.
+            // Only a hangup ends a read here: what was typed was never submitted.
+            Ok(0) => break Some("the terminal closed at the passphrase prompt"),
+            Ok(_) => match byte[0] {
+                b'\n' => break None,
+                0x7f | 0x08 => {
                     buf.0.pop();
-                    continue;
                 }
-                if buf.len() >= 1024 {
-                    // Refuse runaway input.
-                    let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
-                    bail!("passphrase exceeds 1024 bytes");
+                0x15 => buf.0.clear(),
+                0x04 => break Some("the passphrase prompt was given up (Ctrl-D)"),
+                b => {
+                    if buf.len() >= 1024 {
+                        break Some("passphrase exceeds 1024 bytes");
+                    }
+                    buf.0.push(b);
                 }
-                buf.0.push(byte[0]);
-            }
+            },
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
+                unsafe { std::ptr::write_volatile(&mut byte[0], 0) };
                 let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
                 return Err(anyhow!("read tty: {e}"));
             }
         }
-    }
+    };
+    unsafe { std::ptr::write_volatile(&mut byte[0], 0) };
 
     // Restore termios.
     let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
     // Print a trailing newline so the next line of the prompt isn't
     // glued to the user's hidden input.
     {
-        let mut writer = &tty;
+        let mut writer = tty;
         let _ = writer.write_all(b"\n");
     }
 
+    if let Some(why) = given_up {
+        bail!("{why}");
+    }
     if buf.is_empty() {
         bail!("empty passphrase refused");
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+    use std::os::unix::io::FromRawFd;
+    use std::time::{Duration, Instant};
+
+    /// The prompt on a pty's slave, typed to through its master once canonical mode
+    /// is off (before that the line discipline would act on the keys itself), the
+    /// master then closed or kept open.
+    fn typed(keys: &[u8], then_close: bool) -> Result<Vec<u8>> {
+        let (mut m, mut s) = (0, 0);
+        let rc = unsafe {
+            libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());
+        let probe = unsafe { libc::dup(s) };
+        let (mut master, slave) = unsafe { (File::from_raw_fd(m), File::from_raw_fd(s)) };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(prompt_on(&slave, "P: ").map(|z| z.as_bytes().to_vec()));
+        });
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(probe, &mut t) } == 0 && t.c_lflag & libc::ICANON == 0 {
+                break;
+            }
+            assert!(Instant::now() < end, "the prompt never turned canonical mode off");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        unsafe { libc::close(probe) };
+        master.write_all(keys).expect("type");
+        if then_close {
+            drop(master);
+            return rx.recv_timeout(Duration::from_secs(5)).expect("the prompt never returned");
+        }
+        let got = rx.recv_timeout(Duration::from_secs(5)).expect("the prompt never returned");
+        drop(master);
+        got
+    }
+
+    #[test]
+    fn the_terminal_closing_before_enter_submits_nothing() {
+        let got = typed(b"correct horse", true);
+        assert!(got.is_err(), "a hangup before Enter gave {:?}", got.map(|v| String::from_utf8_lossy(&v).into_owned()));
+    }
+
+    #[test]
+    fn ctrl_u_clears_what_was_typed() {
+        assert_eq!(typed(b"wrong\x15right\n", false).expect("a passphrase"), b"right");
+    }
+
+    #[test]
+    fn ctrl_d_gives_up_and_submits_nothing() {
+        let got = typed(b"half\x04", false);
+        assert!(matches!(&got, Err(e) if e.to_string().contains("given up")), "Ctrl-D gave {:?}", got.map(|v| v.len()));
+    }
+
+    #[test]
+    fn delete_erases_one_byte() {
+        assert_eq!(typed(b"rigxht\x7f\x7f\x7fht\n", false).expect("a passphrase"), b"right");
+    }
 }
 
 #[cfg(test)]

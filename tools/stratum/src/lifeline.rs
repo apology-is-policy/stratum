@@ -7,8 +7,14 @@
 
 use anyhow::{bail, Result};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 const ENV: &str = "STRATUM_LIFELINE_FD";
+
+/// How long a daemon asked to stop has to unmount before it is killed: its last
+/// commit happens on the way out, and a stop that never ends would leave the
+/// volume served and unlocked with nobody in front of it.
+pub const STOP_DEADLINE: Duration = Duration::from_secs(30);
 
 static READ_END: OnceLock<i32> = OnceLock::new();
 
@@ -52,6 +58,12 @@ pub fn follow() {
         eprintln!("stratum: {ENV}={fd} is not a pipe; this daemon will not stop with its manager");
         return;
     }
+    watch(fd, STOP_DEADLINE);
+}
+
+/// Once the manager has gone, nobody is left to give the SIGKILL that stop_child
+/// gives a daemon whose stop does not end, so the daemon gives it to itself.
+fn watch(fd: i32, deadline: Duration) {
     std::thread::spawn(move || {
         let mut byte = 0u8;
         loop {
@@ -67,5 +79,59 @@ pub fn follow() {
             break;
         }
         unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        std::thread::sleep(deadline);
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const CHILD: &str = "STRATUM_LIFELINE_TEST_CHILD";
+
+    /// Run only as the child below: a daemon whose SIGTERM never ends it, and
+    /// whose manager goes.
+    #[test]
+    fn lifeline_child_role() {
+        if std::env::var_os(CHILD).is_none() {
+            return;
+        }
+        unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        super::watch(fds[0], Duration::from_millis(300));
+        unsafe { libc::close(fds[1]) };
+        std::thread::sleep(Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_daemon_whose_stop_never_ends_is_killed_once_its_manager_has_gone() {
+        let me = std::env::current_exe().expect("the test binary");
+        let mut child = Command::new(me)
+            .args(["lifeline::tests::lifeline_child_role", "--exact", "--test-threads=1"])
+            .env(CHILD, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the child role");
+        let end = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(s) = child.try_wait().expect("wait for the child role") {
+                break Some(s);
+            }
+            if Instant::now() > end {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(status.and_then(|s| s.signal()), Some(libc::SIGKILL),
+                   "a daemon that ignored its SIGTERM outlived its manager: {status:?}");
+    }
 }

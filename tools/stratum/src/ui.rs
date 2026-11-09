@@ -284,14 +284,9 @@ pub fn conflict_prompt(n: usize, total: usize, dst: &str) -> String {
     format!("Destination exists ({n}/{total}):\n  {dst}\n\nResolution?")
 }
 
-/// SWISS-4c: state for the mkfs wizard. v1.0 collects only Name +
-/// Size (the fields mkfs CLI currently accepts). Encryption is
-/// always-on at v2.0 (the keyfile defaults to <volume>.key beside
-/// the volume file); compression flags are forward-noted to a
-/// future mkfs CLI extension. The Encrypt + Compression fields
-/// from v1's wizard remain in this struct as documentation +
-/// forward-note placeholders so SWISS-4c1 can wire them without
-/// reshaping the dialog.
+/// State for the new-volume wizard: a name, a size, and whether the
+/// keyfile (<volume>.key beside the volume file) is sealed with a
+/// passphrase. The format has no compression, so the wizard offers none.
 #[derive(Clone, Debug)]
 pub struct MkVolState {
     /// Active panel at the time of Shift+F7 — the new volume is
@@ -302,13 +297,10 @@ pub struct MkVolState {
     pub field: MkVolField,
     pub name: String,
     pub size: String,
-    /// Forward-noted as SWISS-4c1 (mkfs --encrypt flag).
+    /// Seal the keyfile with a passphrase (mkfs --passphrase-stdin).
     pub encrypt: bool,
-    /// Forward-noted as SWISS-4c1.
     pub passphrase: String,
     pub confirm: String,
-    /// Forward-noted as SWISS-4c1 (mkfs --compress flag).
-    pub compress: MkVolCompress,
     /// Last error message, displayed in red.
     pub error: Option<String>,
 }
@@ -327,16 +319,8 @@ pub enum MkVolField {
     Encrypt,
     Passphrase,
     Confirm,
-    Compress,
     Ok,
     Cancel,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MkVolCompress {
-    Lz4,
-    Zstd,
-    None,
 }
 
 impl MkVolState {
@@ -349,14 +333,11 @@ impl MkVolState {
             encrypt: true,
             passphrase: String::new(),
             confirm: String::new(),
-            compress: MkVolCompress::Lz4,
             error: None,
         }
     }
 
     pub fn next_field(&mut self) {
-        // SWISS-4n1: Compress field is hidden until mkfs accepts a
-        // compression flag — skip it in the cycle.
         self.field = match self.field {
             MkVolField::Name => MkVolField::Size,
             MkVolField::Size => MkVolField::Encrypt,
@@ -365,7 +346,6 @@ impl MkVolState {
             }
             MkVolField::Passphrase => MkVolField::Confirm,
             MkVolField::Confirm => MkVolField::Ok,
-            MkVolField::Compress => MkVolField::Ok,    // unreachable but tidy
             MkVolField::Ok => MkVolField::Cancel,
             MkVolField::Cancel => MkVolField::Name,
         };
@@ -378,7 +358,6 @@ impl MkVolState {
             MkVolField::Encrypt => MkVolField::Size,
             MkVolField::Passphrase => MkVolField::Encrypt,
             MkVolField::Confirm => MkVolField::Passphrase,
-            MkVolField::Compress => MkVolField::Encrypt,
             MkVolField::Ok => {
                 if self.encrypt { MkVolField::Confirm } else { MkVolField::Encrypt }
             }
@@ -1802,11 +1781,8 @@ fn draw_boxed(
 
 // ── SWISS-4c: mkfs wizard ─────────────────────────────────────────────
 //
-// Visual idiom + state machine lifted from v1's draw_mkvol_dialog.
-// v1.0 of SWISS-4c collects Name + Size (the fields the v2 mkfs CLI
-// accepts); Encrypt + Passphrase + Compress are forward-noted as
-// SWISS-4c1 placeholder fields with a "always on (v2)" hint so the
-// reviewer sees the future shape.
+// Visual idiom + state machine lifted from v1's draw_mkvol_dialog:
+// Name, Size, and a passphrase for the keyfile unless Encrypt is off.
 
 fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
     let w = 64u16.min(area.width.saturating_sub(4));
@@ -1911,11 +1887,6 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
             rows[4],
         );
     }
-    // SWISS-4n1 forward-note: compression selector hidden until mkfs
-    // can set per-dataset compression at format time. Today the user
-    // can change compression after mount via dataset properties; the
-    // wizard offering algos that mkfs ignored was misleading.
-
     if let Some(err) = err {
         frame.render_widget(err, rows[6]);
     }

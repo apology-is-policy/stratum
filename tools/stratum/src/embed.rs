@@ -129,7 +129,10 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         .spawn()
         .with_context(|| format!("spawn host-fs via {}", me.display()))?;
     if let Err(e) = wait_for_sock(&host_fs_sock, Duration::from_secs(5)) {
-        let _ = host_fs_child.kill();
+        kill_and_reap(&mut host_fs_child);
+        if tui::stop_requested() {
+            bail!("asked to stop while host-fs started");
+        }
         return Err(e.context(format!(
             "host-fs socket never appeared at {}",
             host_fs_sock.display()
@@ -158,7 +161,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         let needs_passphrase = match crate::passphrase::is_keyfile_encrypted(&keyfile) {
             Ok(b) => b,
             Err(e) => {
-                let _ = host_fs_child.kill();
+                kill_and_reap(&mut host_fs_child);
                 return Err(e.context(format!(
                     "inspect keyfile {}", keyfile.display()
                 )));
@@ -172,17 +175,21 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             match crate::passphrase::prompt_passphrase(&label) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    let _ = host_fs_child.kill();
+                    kill_and_reap(&mut host_fs_child);
                     return Err(e.context("read passphrase"));
                 }
             }
         } else {
             None
         };
-        // A HUP ends the prompt with the read; a QUIT waits for Enter.
+        // The terminal closing ends the prompt; a HUP or QUIT sent by kill takes effect
+        // once Enter is pressed, as the handlers restart the read.
         if tui::stop_requested() {
-            let _ = host_fs_child.kill();
-            bail!("asked to stop at the passphrase prompt");
+            kill_and_reap(&mut host_fs_child);
+            if needs_passphrase {
+                bail!("asked to stop at the passphrase prompt");
+            }
+            bail!("asked to stop before stratumd started");
         }
 
         let mut stratumd_args: Vec<String> = vec![
@@ -228,7 +235,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         let stratumd_log = match open_log("stratumd") {
             Ok(l) => l,
             Err(e) => {
-                let _ = host_fs_child.kill();
+                kill_and_reap(&mut host_fs_child);
                 return Err(e);
             }
         };
@@ -243,7 +250,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         {
             Ok(c) => c,
             Err(e) => {
-                let _ = host_fs_child.kill();
+                kill_and_reap(&mut host_fs_child);
                 return Err(anyhow!(e).context(format!("spawn stratumd via {}", me.display())));
             }
         };
@@ -267,8 +274,8 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
                 }
                 drop(sin);
                 if let Err(e) = wr {
-                    let _ = child.kill();
-                    let _ = host_fs_child.kill();
+                    kill_and_reap(&mut child);
+                    kill_and_reap(&mut host_fs_child);
                     return Err(anyhow!(e).context("pipe passphrase to stratumd"));
                 }
             }
@@ -282,6 +289,13 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             None => Ok(()),
         };
         if let Err(e) = waited {
+            if tui::stop_requested() {
+                if let Some(c) = stratumd_child.as_mut() {
+                    kill_and_reap(c);
+                }
+                kill_and_reap(&mut host_fs_child);
+                bail!("asked to stop while stratumd started");
+            }
             // SWISS-4q P1: surface stratumd's actual error instead of
             // the generic "socket never appeared" message. The most
             // common cause is a wrong passphrase — stratumd's stderr
@@ -304,9 +318,9 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
                 })
                 .unwrap_or_default();
             if let Some(c) = stratumd_child.as_mut() {
-                let _ = c.kill();
+                kill_and_reap(c);
             }
-            let _ = host_fs_child.kill();
+            kill_and_reap(&mut host_fs_child);
             // Friendly message for the wrong-passphrase case.
             let hint = if log_tail
                 .lines()
@@ -336,9 +350,9 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         Ok(l) => l,
         Err(e) => {
             if let Some(c) = stratumd_child.as_mut() {
-                let _ = c.kill();
+                kill_and_reap(c);
             }
-            let _ = host_fs_child.kill();
+            kill_and_reap(&mut host_fs_child);
             return Err(e);
         }
     };
@@ -353,18 +367,21 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         Ok(c) => c,
         Err(e) => {
             if let Some(c) = stratumd_child.as_mut() {
-                let _ = c.kill();
+                kill_and_reap(c);
             }
-            let _ = host_fs_child.kill();
+            kill_and_reap(&mut host_fs_child);
             return Err(anyhow!(e).context("spawn slate"));
         }
     };
     if let Err(e) = wait_for_sock(&slate_sock, Duration::from_secs(5)) {
-        let _ = slate_child.kill();
+        kill_and_reap(&mut slate_child);
         if let Some(c) = stratumd_child.as_mut() {
-            let _ = c.kill();
+            kill_and_reap(c);
         }
-        let _ = host_fs_child.kill();
+        kill_and_reap(&mut host_fs_child);
+        if tui::stop_requested() {
+            bail!("asked to stop while slate started");
+        }
         return Err(e.context(format!(
             "slate socket never appeared at {}",
             slate_sock.display()
@@ -514,11 +531,11 @@ fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigse
     let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGINT);
         libc::sigaddset(&mut set, libc::SIGTERM);
-        // The default action would leave the session directory. A HUP or QUIT
-        // someone has chosen to ignore stays ignored.
-        for sig in [libc::SIGHUP, libc::SIGQUIT] {
+        // The default action would leave the session directory. A HUP, INT or QUIT
+        // someone has chosen to ignore, as nohup and a shell's `&` do, stays ignored:
+        // a blocked signal in the set would reach sigwait whatever its disposition.
+        for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
             let mut act: libc::sigaction = std::mem::zeroed();
             if libc::sigaction(sig, std::ptr::null(), &mut act) == 0
                 && act.sa_sigaction != libc::SIG_IGN
@@ -630,6 +647,13 @@ fn make_session_dir() -> Result<PathBuf> {
     db.create(&dir)
         .with_context(|| format!("mkdir(O_EXCL) {}", dir.display()))?;
     Ok(dir)
+}
+
+/// SIGKILL and reap: a daemon still binding its socket is gone before the session
+/// directory's removal reads the directory, and cannot add an entry after it.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Removed however run() ends, a panic included. The daemons remove their own sockets

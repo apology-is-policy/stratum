@@ -102,7 +102,7 @@ pub fn stop_child(child: &mut Child, name: &str) {
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + crate::lifeline::STOP_DEADLINE;
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return,

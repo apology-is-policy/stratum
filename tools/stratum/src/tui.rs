@@ -312,7 +312,7 @@ use crate::editor::EditorState;
 use crate::slate::{read_lines, read_text_trim, SlateClient};
 use crate::spawn::{BackendMeta, SpawnCtx};
 use crate::ui::{self, BatchKind, ConfirmAction, CopyProgress, LocalDialog,
-                LocalDialogKind, MkVolCompress, MkVolField, MkVolState,
+                LocalDialogKind, MkVolField, MkVolState,
                 PanelView, UiState, ViewMode};
 use crate::snapgraph::{SnapshotGraphPoller, SnapshotGraphState};
 use crate::volmap::VolumeMapPoller;
@@ -348,9 +348,12 @@ pub fn stop_on_signals() {
     unsafe {
         libc::signal(libc::SIGTERM, handler);
         for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
-            if libc::signal(sig, handler) == libc::SIG_IGN {
-                libc::signal(sig, libc::SIG_IGN);
+            // Asked first, so an ignore is never replaced, not even for an instant.
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN {
+                continue;
             }
+            libc::signal(sig, handler);
         }
     }
 }
@@ -2450,7 +2453,7 @@ fn derive_unique_with(p: &Path, taken: impl Fn(&Path) -> bool) -> PathBuf {
 }
 
 /// SWISS-4c: keyboard handler for MkVol wizard. Tab/Shift-Tab cycles
-/// fields; Space toggles Encrypt + cycles Compress; printable +
+/// fields; Space toggles Encrypt; printable +
 /// Backspace mutate the focused text field. Enter on Ok runs the
 /// mkfs spawn; Esc or Cancel dismisses.
 fn handle_mkvol_key(
@@ -2482,14 +2485,6 @@ fn handle_mkvol_key(
             match mk.field {
                 MkVolField::Encrypt => {
                     mk.encrypt = !mk.encrypt;
-                    return Ok(Action::Refresh);
-                }
-                MkVolField::Compress => {
-                    mk.compress = match mk.compress {
-                        MkVolCompress::Lz4 => MkVolCompress::Zstd,
-                        MkVolCompress::Zstd => MkVolCompress::None,
-                        MkVolCompress::None => MkVolCompress::Lz4,
-                    };
                     return Ok(Action::Refresh);
                 }
                 _ => {} // fall through to text-insert
