@@ -49,9 +49,12 @@ class Failure(Exception):
 class Screen:
     """Just enough of a terminal for ratatui: moves, clears and text. Attributes are dropped."""
 
-    def __init__(self):
+    def __init__(self, onlcr=False):
         self.cells = [[' '] * COLS for _ in range(ROWS)]
         self.r = self.c = 0
+        # Bytes off a pipe never met a terminal's output processing: shown as a terminal
+        # would show them, each line starts at the left edge, not where the last one ended.
+        self.onlcr = onlcr
         self.pending = ''
         self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
 
@@ -119,6 +122,8 @@ class Screen:
                 self.c = 0
             elif ch == '\n':
                 self.r = min(self.r + 1, ROWS - 1)
+                if self.onlcr:
+                    self.c = 0
             elif ch == '\b':
                 self.c = max(self.c - 1, 0)
             elif ch >= ' ':
@@ -132,6 +137,9 @@ class Screen:
 class Term:
     def __init__(self, argv, output_to_pipe=False):
         self.screen = Screen()
+        # The pipe is not the terminal, and no reader sees the two interleaved: on one shared
+        # screen a line from one moves the other's text, and can split it across the wrap.
+        self.piped = Screen(onlcr=True) if output_to_pipe else None
         self.rc = None
         # The manager's stdout and stderr on a pipe the test can close, with the terminal
         # left as it is: its output can then go while the terminal stays.
@@ -171,7 +179,7 @@ class Term:
             if self.out is not None and self.out in ready:
                 data = os.read(self.out, 65536)
                 if data:
-                    self.screen.feed(data)
+                    self.piped.feed(data)
                 else:
                     self.cut_output()
             if self.fd in ready:
@@ -197,9 +205,12 @@ class Term:
         rx = re.compile(pattern)
         while time.monotonic() < end:
             self.pump(0.1)
-            if rx.search(self.screen.text()):
+            if self.showing(rx):
                 return
         raise Failure(f'the screen never showed {pattern!r} in {timeout} s')
+
+    def showing(self, rx):
+        return any(rx.search(s.text()) for s in (self.screen, self.piped) if s is not None)
 
     def exited(self, timeout):
         end = time.monotonic() + timeout
@@ -234,6 +245,8 @@ class Term:
     def show(self, label):
         if SHOW:
             print(f'--- {label}\n{self.screen.text()}\n---', flush=True)
+            if self.piped is not None:
+                print(f'--- {label}, the pipe\n{self.piped.text()}\n---', flush=True)
 
 
 def shows(segment, name):
@@ -1912,6 +1925,34 @@ def delete_batch_legs(stratum, root):
         term.kill()
 
 
+def screen_checks():
+    """The terminal and the pipe through Term.pump as a leg's run feeds them: in either order,
+    from fds that share no line discipline, neither may move or split what the other shows."""
+    term = Term.__new__(Term)
+    term.screen, term.piped = Screen(), Screen(onlcr=True)
+    pty_r, pty_w = os.pipe()
+    out_r, out_w = os.pipe()
+    term.fd, term.out = pty_r, out_r
+    try:
+        # A line ending at column 127, as host-fs's serving line can with a long session path,
+        # then the prompt.
+        os.write(out_w, b'x' * 127 + b'\n')
+        os.write(pty_w, b'Passphrase for vol.stm: ')
+        term.pump(0.3)
+        # Lines on the pipe whose lengths, each starting where the last ended, would carry
+        # the next one's start to column 130.
+        os.write(out_w, b'y' * 70 + b'\n' + b'z' * 73 + b'\n' + b'        send SIGTERM (Ctrl-C) to shut down.\n')
+        term.pump(0.3)
+        for pattern in (r'Passphrase for', r'send SIGTERM'):
+            if not term.showing(re.compile(pattern)):
+                raise Failure(f'the screens lost {pattern!r}:\n{term.screen.text().strip()}\n'
+                              f'--- the pipe\n{term.piped.text().strip()}')
+    finally:
+        for fd in (pty_r, pty_w, out_r, out_w):
+            os.close(fd)
+    print('ok: the terminal and the pipe each keep their own text whole', flush=True)
+
+
 def sealed_volume(stratum, root):
     """For a leg run alone: a sealed volume holding from_vol.txt, and a host tree."""
     host = f'{root}/host'
@@ -2073,6 +2114,7 @@ def main():
     # The landing screen keeps its recent volumes under HOME, which must not be the operator's.
     os.environ['HOME'] = root
     try:
+        screen_checks()
         only = os.environ.get('KEYS_ONLY')
         if only:
             given = {'stratum': stratum, 'root': root, 'env_file': f'{root}/env2'}
