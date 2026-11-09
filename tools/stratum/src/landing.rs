@@ -139,7 +139,7 @@ fn prompt_new() -> Result<()> {
 
     // From the first prompt until mkfs has ended the terminal is not as it was, and an end
     // by a signal's default action would leave it so. mkfs starts with the default actions,
-    // so Ctrl-C still ends it, and then this.
+    // so Ctrl-C still ends it, and then this; a stop sent to this alone lets mkfs finish.
     crate::tui::stop_on_signals();
     // An empty one is refused there: a volume made here is sealed.
     let (pass, first) = prompt_passphrase("              Passphrase: ")?;
@@ -184,14 +184,24 @@ fn prompt_new() -> Result<()> {
     // Wiped now, not when the session it opens has ended.
     drop(pass);
     let out = child.wait_with_output().context("wait for mkfs")?;
-    drop(held);
+    let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if crate::tui::stop_requested() {
-        bail!("asked to stop while mkfs ran; {} may be incomplete", path.display());
+        drop(held);
+        if out.status.success() {
+            bail!("asked to stop while mkfs ran: {} was made, and was not opened", path.display());
+        }
+        // What a mkfs ended by a signal leaves, its own cleanup never having run, is the file
+        // it claimed and the key it says it was sealing; no one else knows their names.
+        let mkfs_said = if said.is_empty() { String::new() } else { format!("; mkfs said: {said}") };
+        bail!("asked to stop while mkfs ran: it did not finish, so {} is not a volume{mkfs_said}", path.display());
     }
     if !out.status.success() {
-        eprintln!("stratum: mkfs failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        drop(held);
+        eprintln!("stratum: mkfs failed: {said}");
         return Ok(());
     }
+    // The manager's own prompt reads the mode next, and must find it as it was.
+    held.give_back();
     println!("              Created {}. Keep {}.key beside it.", path.display(), path.display());
     open_volume(&path)
 }

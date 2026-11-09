@@ -12,10 +12,13 @@
 //!      that go.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
+use std::mem::MaybeUninit;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 const KFIL_MAGIC: u32 = 0x4C49464B;     // 'KFIL' — plaintext v1
 const KFP1_MAGIC: u32 = 0x31504650;     // 'KFP1' — passphrase-encrypted
@@ -65,23 +68,52 @@ pub fn push_secret(s: &mut String, c: char) {
 
 /// What a dialog's field holds, which may be a passphrase: wiped when it goes, each
 /// copy included, and when it outgrows its buffer. What the terminal library buffered
-/// on the way in is out of reach.
+/// on the way in is out of reach. Typed as a passphrase it keeps what read_line keeps,
+/// so the same keys make the same passphrase: at most PASSPHRASE_MAX bytes, a character
+/// whole or not at all, and past that a count, which no paste can grow into memory.
 #[derive(Clone, Default)]
-pub struct SecretText(String);
+pub struct SecretText {
+    text: String,
+    over: usize,
+}
 impl SecretText {
-    pub fn push(&mut self, c: char) { push_secret(&mut self.0, c); }
-    pub fn pop(&mut self) -> Option<char> { self.0.pop() }
-    pub fn clear(&mut self) { wipe_string(&mut self.0); }
+    pub fn push(&mut self, c: char) { push_secret(&mut self.text, c); }
+    pub fn type_secret(&mut self, c: char) {
+        if self.over > 0 || self.text.len() + c.len_utf8() > PASSPHRASE_MAX {
+            self.over += 1;
+        } else {
+            push_secret(&mut self.text, c);
+        }
+    }
+    /// Erases the last character typed: one counted past the limit first.
+    pub fn erase(&mut self) {
+        if self.over > 0 {
+            self.over -= 1;
+        } else {
+            self.text.pop();
+        }
+    }
+    pub fn clear(&mut self) {
+        wipe_string(&mut self.text);
+        self.over = 0;
+    }
+    /// Typed past the limit, which a submit refuses.
+    pub fn past_limit(&self) -> bool { self.over > 0 }
+    /// Characters typed, kept or counted.
+    pub fn typed(&self) -> usize { self.text.chars().count() + self.over }
 }
 impl From<String> for SecretText {
-    fn from(s: String) -> Self { Self(s) }
+    fn from(text: String) -> Self { Self { text, over: 0 } }
+}
+impl From<&str> for SecretText {
+    fn from(text: &str) -> Self { Self { text: text.to_string(), over: 0 } }
 }
 impl std::ops::Deref for SecretText {
     type Target = str;
-    fn deref(&self) -> &str { &self.0 }
+    fn deref(&self) -> &str { &self.text }
 }
 impl Drop for SecretText {
-    fn drop(&mut self) { wipe_string(&mut self.0); }
+    fn drop(&mut self) { wipe_string(&mut self.text); }
 }
 impl std::fmt::Debug for SecretText {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -128,33 +160,152 @@ pub fn prompt_passphrase(label: &str) -> Result<(Zeroizing, EchoHeld)> {
 }
 
 /// Echo held off after a passphrase was read, until this goes: a key typed while the key
-/// is derived, the passphrase again say, is not shown. Then the terminal is given back as
-/// it was, and what was typed meanwhile is dropped.
+/// is derived, the passphrase again say, is not shown. A stop from the keyboard gives the
+/// terminal back first, as vi and readpassphrase do, so the shell gets it as it was
+/// whatever it keeps; continued in front, echo is held off again. When this goes the
+/// terminal is given back, and what was typed meanwhile dropped, if the job is in front;
+/// behind, the shell has it, given back at the stop. `give_back` is for a caller that
+/// uses the terminal next.
 pub struct EchoHeld {
     tty: File,
     orig: libc::termios,
-    behind: bool,
+    caught: Option<libc::sigaction>,
+    given: bool,
 }
 
 impl EchoHeld {
-    /// Lets go without touching the terminal if this job is behind, for a caller that will
-    /// not use it again: a job moved behind would otherwise stop on SIGTTOU here, where
-    /// nothing but `fg` ends it. Its shell put its own mode back when it stopped the job.
-    pub fn release_unless_behind(mut self) {
+    /// Gives the terminal back as it was, waiting stopped by SIGTTOU until the job is in
+    /// front, so that what reads the mode next reads this one and not its shell's.
+    pub fn give_back(mut self) {
+        // Let go first: a stop now takes the default action, and the restore below runs
+        // once the job is continued in front.
+        self.let_go();
         let fd = self.tty.as_raw_fd();
-        self.behind = unsafe { libc::tcgetpgrp(fd) != libc::getpgrp() };
+        while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } != 0
+            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+        {}
+        self.given = true;
+    }
+
+    fn let_go(&mut self) {
+        if let Some(old) = self.caught.take() {
+            unsafe { libc::sigaction(libc::SIGTSTP, &old, std::ptr::null_mut()) };
+            HOLD.fd.store(-1, Ordering::Release);
+        }
     }
 }
 
 impl Drop for EchoHeld {
     fn drop(&mut self) {
-        if self.behind {
+        if self.given {
             return;
         }
         let fd = self.tty.as_raw_fd();
-        while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } != 0
-            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-        {}
+        // A stop waits until the check and the restore are both done.
+        let prev = block_job_control();
+        if unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() } {
+            while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } != 0
+                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+            {}
+        }
+        self.let_go();
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()) };
+    }
+}
+
+/// What the SIGTSTP handler gives back and holds again: set only while it is not caught.
+struct Hold {
+    fd: AtomicI32,
+    orig: UnsafeCell<MaybeUninit<libc::termios>>,
+    held: UnsafeCell<MaybeUninit<libc::termios>>,
+}
+// Written only while the handler is not installed, and read only by it.
+unsafe impl Sync for Hold {}
+static HOLD: Hold = Hold {
+    fd: AtomicI32::new(-1),
+    orig: UnsafeCell::new(MaybeUninit::uninit()),
+    held: UnsafeCell::new(MaybeUninit::uninit()),
+};
+
+fn job_control_set() -> libc::sigset_t {
+    let mut jobs: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut jobs);
+        for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+            libc::sigaddset(&mut jobs, sig);
+        }
+    }
+    jobs
+}
+
+fn block_job_control() -> libc::sigset_t {
+    let jobs = job_control_set();
+    let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &jobs, &mut prev) };
+    prev
+}
+
+fn stop_action() -> libc::sigaction {
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    act.sa_sigaction = stop_given_back as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    act.sa_flags = libc::SA_RESTART;
+    unsafe { libc::sigemptyset(&mut act.sa_mask) };
+    act
+}
+
+/// Catches SIGTSTP while echo is held, unless something else already has it, and returns
+/// the action to put back.
+fn catch_stops(fd: RawFd, orig: &libc::termios, held: &libc::termios) -> Option<libc::sigaction> {
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut old) } != 0
+        || old.sa_sigaction != libc::SIG_DFL
+    {
+        return None;
+    }
+    unsafe {
+        (*HOLD.orig.get()).write(*orig);
+        (*HOLD.held.get()).write(*held);
+    }
+    HOLD.fd.store(fd, Ordering::Release);
+    let act = stop_action();
+    unsafe { libc::sigaction(libc::SIGTSTP, &act, std::ptr::null_mut()) };
+    Some(old)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+/// Gives the terminal back, stops as SIGTSTP would have, and once continued holds echo off
+/// again if the job is in front; behind, the shell has the terminal as it was.
+extern "C" fn stop_given_back(_: libc::c_int) {
+    let fd = HOLD.fd.load(Ordering::Acquire);
+    if fd < 0 {
+        return;
+    }
+    unsafe {
+        let errno = *errno_location();
+        libc::tcsetattr(fd, libc::TCSAFLUSH, (*HOLD.orig.get()).as_ptr());
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(libc::SIGTSTP, &dfl, std::ptr::null_mut());
+        let mut tstp: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut tstp);
+        libc::sigaddset(&mut tstp, libc::SIGTSTP);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &tstp, std::ptr::null_mut());
+        libc::kill(libc::getpid(), libc::SIGTSTP);
+        // Continued.
+        let act = stop_action();
+        libc::sigaction(libc::SIGTSTP, &act, std::ptr::null_mut());
+        if libc::tcgetpgrp(fd) == libc::getpgrp() {
+            libc::tcsetattr(fd, libc::TCSAFLUSH, (*HOLD.held.get()).as_ptr());
+        }
+        *errno_location() = errno;
     }
 }
 
@@ -206,8 +357,10 @@ fn prompt_on(tty: File, label: &str) -> Result<(Zeroizing, EchoHeld)> {
     {}
     // So the next line is not glued to the hidden input.
     let _ = writer.write_all(b"\n");
+    // Caught before the mask goes back, so a stop that came meanwhile finds the handler.
+    let caught = if line.is_ok() { catch_stops(fd, &orig, &after) } else { None };
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &held, std::ptr::null_mut()) };
-    line.map(|line| (line, EchoHeld { tty, orig, behind: false }))
+    line.map(|line| (line, EchoHeld { tty, orig, caught, given: false }))
 }
 
 /// Sets `quiet` and holds job control off until the terminal is given back, returning
@@ -216,14 +369,8 @@ fn prompt_on(tty: File, label: &str) -> Result<(Zeroizing, EchoHeld)> {
 /// TCSAFLUSH drops what was typed ahead, which the cooked terminal showed in clear. The
 /// mode goes in before the block, so a caller in the background stops on SIGTTOU there,
 /// as any program does, rather than set a terminal it is not in front of.
-fn hold_terminal(fd: std::os::unix::io::RawFd, quiet: &libc::termios) -> Result<libc::sigset_t> {
-    let mut jobs: libc::sigset_t = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::sigemptyset(&mut jobs);
-        for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
-            libc::sigaddset(&mut jobs, sig);
-        }
-    }
+fn hold_terminal(fd: RawFd, quiet: &libc::termios) -> Result<libc::sigset_t> {
+    let jobs = job_control_set();
     let off = libc::ECHO | libc::ICANON | libc::ISIG;
     for _ in 0..8 {
         if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, quiet) } != 0 {
@@ -623,7 +770,9 @@ mod prompt_tests {
         std::thread::sleep(Duration::from_millis(100));
         let shown = String::from_utf8_lossy(&pty.shown.lock().unwrap()).into_owned();
         assert!(!shown.contains("during"), "shown while the key was derived: {shown:?}");
-        drop(held);
+        // Not this process's controlling terminal, so no job is in front of it: dropped, the
+        // hold would leave it alone; given back, it restores it.
+        held.give_back();
         let set = libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN;
         assert_eq!(pty.lflag() & set, before & set, "the terminal was not given back as it was");
         let left = pty.left_unread();

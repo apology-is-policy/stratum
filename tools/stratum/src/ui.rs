@@ -299,17 +299,10 @@ pub struct MkVolState {
     pub size: String,
     /// Seal the keyfile with a passphrase (mkfs --passphrase-stdin).
     pub encrypt: bool,
-    pub passphrase: String,
-    pub confirm: String,
+    pub passphrase: crate::passphrase::SecretText,
+    pub confirm: crate::passphrase::SecretText,
     /// Last error message, displayed in red.
     pub error: Option<String>,
-}
-
-impl Drop for MkVolState {
-    fn drop(&mut self) {
-        crate::passphrase::wipe_string(&mut self.passphrase);
-        crate::passphrase::wipe_string(&mut self.confirm);
-    }
 }
 
 impl std::fmt::Debug for MkVolState {
@@ -344,8 +337,8 @@ impl MkVolState {
             name: String::new(),
             size: "64M".to_string(),
             encrypt: true,
-            passphrase: String::new(),
-            confirm: String::new(),
+            passphrase: Default::default(),
+            confirm: Default::default(),
             error: None,
         }
     }
@@ -1335,7 +1328,7 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
     body.push(Line::from(""));
     let tail = if wants_input {
         let display = if d.is_password {
-            "*".repeat(d.value.chars().count())
+            stars(d.value.typed())
         } else {
             sanitize_for_display(&d.value)
         };
@@ -1857,9 +1850,9 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
         .split(foot);
 
     render_mkvol_field(frame, rows[0], "Name:", &mk.name,
-                       mk.field == MkVolField::Name, false);
+                       mk.field == MkVolField::Name, None);
     render_mkvol_field(frame, rows[1], "Size:", &mk.size,
-                       mk.field == MkVolField::Size, false);
+                       mk.field == MkVolField::Size, None);
 
     // SWISS-4n1: rename "Encryption" → "Use passphrase". Volumes are
     // always encrypted at the AEAD layer; the user's only choice is
@@ -1887,10 +1880,10 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
 
     // Passphrase row — visible only when "Use passphrase" is on.
     if mk.encrypt {
-        render_mkvol_field(frame, rows[4], "Passphrase:", &mk.passphrase,
-                           mk.field == MkVolField::Passphrase, true);
-        render_mkvol_field(frame, rows[5], "Again:", &mk.confirm,
-                           mk.field == MkVolField::Confirm, true);
+        render_mkvol_field(frame, rows[4], "Passphrase:", "",
+                           mk.field == MkVolField::Passphrase, Some(mk.passphrase.typed()));
+        render_mkvol_field(frame, rows[5], "Again:", "",
+                           mk.field == MkVolField::Confirm, Some(mk.confirm.typed()));
     } else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1962,19 +1955,24 @@ fn wizard_rows(avail: u16, focused: Option<usize>, err_rows: u16) -> [u16; 7] {
     rows
 }
 
+/// A masked passphrase: a star a character, up to one past the limit, so drawing a long
+/// paste costs no more than drawing a long passphrase.
+fn stars(typed: usize) -> String {
+    "*".repeat(typed.min(crate::passphrase::PASSPHRASE_MAX + 1))
+}
+
 fn render_mkvol_field(
     frame: &mut Frame<'_>,
     row: Rect,
     label: &str,
     value: &str,
     focused: bool,
-    masked: bool,
+    masked: Option<usize>,
 ) {
     let label_w = 14usize;
-    let display = if masked {
-        "*".repeat(value.chars().count())
-    } else {
-        sanitize_for_display(value)
+    let display = match masked {
+        Some(typed) => stars(typed),
+        None => sanitize_for_display(value),
     };
     let cursor = if focused { "_" } else { "" };
     let value_line = format!("{display}{cursor}");
@@ -2490,5 +2488,14 @@ mod tests {
     fn sanitize_passes_printable_ascii() {
         let s = "abcXYZ012!@#$%^&*()_+-=[]{}|;:'\",.<>?/`~";
         assert_eq!(sanitize_for_display(s), s);
+    }
+
+    // The masked draw is one star past the limit at most, however much was typed.
+    #[test]
+    fn the_masked_draw_is_bounded() {
+        let max = crate::passphrase::PASSPHRASE_MAX;
+        assert_eq!(stars(3), "***");
+        assert_eq!(stars(max), "*".repeat(max));
+        assert_eq!(stars(100_000).len(), max + 1);
     }
 }

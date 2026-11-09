@@ -81,7 +81,6 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // Before the directory exists: a HUP or QUIT taking its default action, at the
     // passphrase prompt or in a start wait, would leave it.
     tui::stop_on_signals();
-    unblock_hup_and_quit();
     crate::lifeline::hold()?;
     let session = SessionDir(make_session_dir()?);
     let session_dir = session.0.clone();
@@ -121,13 +120,12 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         host_fs_sock.to_string_lossy().into_owned(),
         "--allow-unauth".into(),
     ];
-    let mut host_fs_child = Command::new(&me)
+    let mut host_fs_child = spawn_daemon(Command::new(&me)
         .args(&host_fs_args)
         .envs(crate::lifeline::env())
         .stdout(Stdio::null())
         .stderr(open_log("host-fs")?)
-        .process_group(0)
-        .spawn()
+        .process_group(0))
         .with_context(|| format!("spawn host-fs via {}", me.display()))?;
     if let Err(e) = wait_for_sock(&host_fs_sock, Duration::from_secs(5)) {
         kill_and_reap(&mut host_fs_child);
@@ -197,6 +195,9 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             }
             bail!("asked to stop before stratumd started");
         }
+        if opts.headless {
+            never_stop_for_the_terminal();
+        }
 
         let mut stratumd_args: Vec<String> = vec![
             "serve".into(),
@@ -245,14 +246,13 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
                 return Err(e);
             }
         };
-        let mut child = match Command::new(&me)
+        let mut child = match spawn_daemon(Command::new(&me)
             .args(&stratumd_args)
             .envs(crate::lifeline::env())
             .stdin(stdin_setup)
             .stdout(Stdio::null())
             .stderr(stratumd_log)
-            .process_group(0)
-            .spawn()
+            .process_group(0))
         {
             Ok(c) => c,
             Err(e) => {
@@ -343,6 +343,9 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             )));
         }
     }
+    if opts.headless {
+        never_stop_for_the_terminal();
+    }
 
     // Spawn slate.
     let slate_args: Vec<String> = vec![
@@ -362,13 +365,12 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             return Err(e);
         }
     };
-    let mut slate_child = match Command::new(&me)
+    let mut slate_child = match spawn_daemon(Command::new(&me)
         .args(&slate_args)
         .envs(crate::lifeline::env())
         .stdout(Stdio::null())
         .stderr(slate_log)
-        .process_group(0)
-        .spawn()
+        .process_group(0))
     {
         Ok(c) => c,
         Err(e) => {
@@ -469,13 +471,13 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         initial_meta,
     ));
 
-    // Headless mode never uses the terminal again, so it must not stop for it behind.
-    if opts.headless {
-        if let Some(held) = echo_held.take() {
-            held.release_unless_behind();
+    // The screen saves the mode it finds and gives that back at its end, so it must find
+    // this one; headless mode only lets go.
+    if let Some(held) = echo_held.take() {
+        if !opts.headless {
+            held.give_back();
         }
     }
-    drop(echo_held);
     let result = if opts.headless {
         run_headless(&slate_sock, &left_plan.sock, &prev_mask)
     } else {
@@ -573,6 +575,34 @@ fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigse
     Ok(())
 }
 
+/// Starts a daemon with SIGTTOU blocked, which it keeps across exec. In a process group of
+/// its own it is never in front, and in headless mode its stderr is the terminal: under
+/// `stty tostop` its first write there would stop it for good, and the session with it.
+fn spawn_daemon(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut ttou: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut ttou);
+        libc::sigaddset(&mut ttou, libc::SIGTTOU);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &ttou, &mut prev);
+    }
+    let child = cmd.spawn();
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()) };
+    child
+}
+
+/// Headless mode past its prompt never needs to stop for the terminal: with SIGTTOU
+/// blocked, a write from behind goes through even under `stty tostop`, where it would
+/// stop the job, and a TERM, blocked until sigwait, could not end it until `fg`.
+fn never_stop_for_the_terminal() {
+    let mut ttou: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut ttou);
+        libc::sigaddset(&mut ttou, libc::SIGTTOU);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &ttou, std::ptr::null_mut());
+    }
+}
+
 /// R126 P2-2: block SIGINT/SIGTERM on the calling thread + return
 /// the previous mask. Children spawned after this inherit the mask
 /// but can replace it via `sigprocmask` in their own startup
@@ -587,19 +617,6 @@ fn block_term_signals() -> libc::sigset_t {
         libc::pthread_sigmask(libc::SIG_BLOCK, &new_mask, &mut prev_mask);
     }
     prev_mask
-}
-
-/// HUP and QUIT unblocked, whatever the parent left, so a stop asked at the prompt takes
-/// effect at Enter and one in a start wait ends it. Only once their handlers are in: one
-/// pending since exec then asks to stop, rather than taking its default action.
-fn unblock_hup_and_quit() {
-    let mut early: libc::sigset_t = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::sigemptyset(&mut early);
-        libc::sigaddset(&mut early, libc::SIGHUP);
-        libc::sigaddset(&mut early, libc::SIGQUIT);
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &early, std::ptr::null_mut());
-    }
 }
 
 /// The mask the manager started with, less the signals the screen handles: one its
