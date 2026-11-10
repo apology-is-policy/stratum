@@ -154,6 +154,10 @@ jobs:
         run: cargo test --release
 
       - name: a file-based volume end to end
+        # The runner has sudo without a password, which the checks of another user's
+        # key and key link need; asked for and not to be had, the run fails.
+        env:
+          STRATUM_TEST_SUDO: 1
         run: tests/volume_smoke.sh dist/stratum
 
       - name: a daemon's stop with clients still connected

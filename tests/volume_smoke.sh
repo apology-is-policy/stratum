@@ -23,6 +23,10 @@ cleanup() {
 trap cleanup EXIT
 
 ok() { echo "ok: $*"; }
+# A group of checks this run could not make: said where it is skipped and again at the end, so a
+# run that skipped is not read as one that checked.
+SKIPPED=0
+skipped() { echo "note: $*"; SKIPPED=$((SKIPPED + 1)); }
 no() { echo "FAIL: $*"; BAD=1; }
 
 serve() {
@@ -214,7 +218,7 @@ fi
 chmod 644 "$D/raw.stm.key"
 if "$B" mkfs "$D/shared.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$D/shared.log" 2>&1; then
     no "a key others can read was used"
-elif LC_ALL=C grep -q 'others can read or write it' "$D/shared.log" && [ ! -e "$D/shared.stm" ]; then
+elif LC_ALL=C grep -q '^stratum-mkfs: keyfile .* can be read or written by others' "$D/shared.log" && [ ! -e "$D/shared.stm" ]; then
     ok "a key others can read is refused before anything is made, and says why"
 else
     no "the refusal of a key others can read: $(tail -1 "$D/shared.log"); image left: $([ -e "$D/shared.stm" ] && echo yes || echo no)"
@@ -232,6 +236,26 @@ if "$B" mkfs "$D/own.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$
 else
     no "the user's own key: $(tail -1 "$D/own.log")"
 fi
+# Over an image that is there the key is asked about before the image is read, which on an empty
+# disk is all of it: own.stm holds data now, and the key's refusal still comes first.
+chmod 644 "$D/raw.stm.key"
+"$B" mkfs "$D/own.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$D/own.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ] && LC_ALL=C grep -q '^stratum-mkfs: keyfile .* can be read or written by others' "$D/own.log"; then
+    ok "over an image that is there, a key others can read is refused before the image is read"
+else
+    no "a key others can read, over an image that is there: rc=$rc: $(tail -1 "$D/own.log")"
+fi
+chmod 600 "$D/raw.stm.key"
+# What is at the key's name and is no regular file is no key to use.
+mkdir -m 700 "$D/dir.key"
+"$B" mkfs "$D/dirkey.stm" --size 64M --keyfile "$D/dir.key" < /dev/null > "$D/dirkey.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ] && LC_ALL=C grep -q '^stratum-mkfs: keyfile .* is not a regular file' "$D/dirkey.log" && [ ! -e "$D/dirkey.stm" ]; then
+    ok "a directory at the key's name is refused before anything is made, and says why"
+else
+    no "a directory at the key's name: rc=$rc: $(tail -1 "$D/dirkey.log"); image left: $([ -e "$D/dirkey.stm" ] && echo yes || echo no)"
+fi
 
 # A link another user owns does not decide where the key goes: in a shared sticky directory whoever left
 # it would hold the key, which the kernel's protected_symlinks keeps from a path it follows itself, and
@@ -240,11 +264,39 @@ fi
 # sudo is tried only when STRATUM_TEST_SUDO=1 asks for it: where the user is not in sudoers even a try
 # is logged as an incident.
 if [ "$(id -u)" = 0 ]; then as=""
-elif [ "${STRATUM_TEST_SUDO:-0}" = 1 ] && sudo -n true 2>/dev/null; then as="sudo -n"
-else as=none; fi
-if [ "$as" = none ]; then
-    echo "note: a key name that is another user's link: making one needs root, or STRATUM_TEST_SUDO=1 and sudo without a password"
+elif [ "${STRATUM_TEST_SUDO:-0}" != 1 ]; then as=none
+elif sudo -n true 2>/dev/null; then as="sudo -n"
 else
+    # Asked for and not to be had is a failure, not a skip: a gate that sets it means these to run.
+    no "STRATUM_TEST_SUDO=1 asks for sudo without a password, and there is none"
+    as=none
+fi
+if [ "$as" = none ]; then
+    skipped "another user's key link and another user's key: making one needs root, or STRATUM_TEST_SUDO=1 and sudo without a password"
+else
+    # A key another user owns is theirs, whatever its mode: with no passphrase it is not used.
+    # Read by no one else, only its owner tells it from the user's own. As root the same is seen
+    # from the other side below: a key that is not root's.
+    cp "$D/raw.stm.key" "$D/theirs.key"
+    chmod 600 "$D/theirs.key"
+    $as chown nobody "$D/theirs.key"
+    "$B" mkfs "$D/owned.stm" --size 64M --keyfile "$D/theirs.key" < /dev/null > "$D/owned.log" 2>&1
+    rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^stratum-mkfs: keyfile .* belongs to another user' "$D/owned.log" && [ ! -e "$D/owned.stm" ]; then
+        ok "a key another user owns is refused before anything is made, and says why"
+    else
+        no "a key another user owns: rc=$rc: $(tail -1 "$D/owned.log"); image left: $([ -e "$D/owned.stm" ] && echo yes || echo no)"
+    fi
+    if [ -n "$as" ]; then
+        # Root can read any key, so there the owner is the only thing between it and the volume.
+        $as "$B" mkfs "$D/rooted.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$D/rooted.log" 2>&1
+        rc=$?
+        if [ "$rc" != 0 ] && LC_ALL=C grep -q '^stratum-mkfs: keyfile .* belongs to another user' "$D/rooted.log" && [ ! -e "$D/rooted.stm" ]; then
+            ok "as root, a key the user owns is refused before anything is made, and says why"
+        else
+            no "as root, a key the user owns: rc=$rc: $(tail -1 "$D/rooted.log"); image left: $([ -e "$D/rooted.stm" ] && echo yes || echo no)"
+        fi
+    fi
     mkdir "$D/theirs"
     ln -s "$D/theirs/k" "$D/planted.stm.key"
     $as chown -h nobody "$D/planted.stm.key"
@@ -258,7 +310,7 @@ else
             "$B" mkfs "$D/planted.stm" --size 64M < /dev/null > "$D/planted.log" 2>&1
         fi
         rc=$?
-        if [ "$rc" != 0 ] && LC_ALL=C grep -q 'another user owns' "$D/planted.log"; then
+        if [ "$rc" != 0 ] && LC_ALL=C grep -q 'reached through a symlink another user owns' "$D/planted.log"; then
             ok "a key name that is another user's link is refused $how, and says why"
         else
             no "a key name that is another user's link $how: rc=$rc: $(tail -1 "$D/planted.log")"
@@ -283,7 +335,7 @@ else
             "$B" mkfs "$D/reuse.stm" --size 64M < /dev/null > "$D/reuse.log" 2>&1
         fi
         rc=$?
-        if [ "$rc" != 0 ] && LC_ALL=C grep -q 'another user owns' "$D/reuse.log" && [ ! -e "$D/reuse.stm" ]; then
+        if [ "$rc" != 0 ] && LC_ALL=C grep -q 'reached through a symlink another user owns' "$D/reuse.log" && [ ! -e "$D/reuse.stm" ]; then
             ok "another user's link to an existing key is refused $how, before anything is made"
         else
             no "another user's link to an existing key $how: rc=$rc: $(tail -1 "$D/reuse.log"); image: $(ls "$D/reuse.stm" 2>/dev/null)"
@@ -334,6 +386,9 @@ chmod 600 "$D/late.stm.key"
 if "$B" mkfs "$D/late.stm" --size 64M > "$D/late.log" 2>&1; then
     no "a garbage key formatted a volume"
 else
+    # Only the format's own failure is the late one: a refusal at the claim leaves the same behind.
+    LC_ALL=C grep -q 'stm_fs_format failed' "$D/late.log" \
+        || no "the bad key was not refused by the format: $(tail -1 "$D/late.log")"
     [ ! -e "$D/late.stm" ] && ok "a failed format over a bad key leaves no image" || no "a failed format left an image"
     [ "$(cat "$D/late.stm.key")" = 'not a key' ] && ok "a failed format leaves a key it found" || no "a failed format changed a key it found"
 fi
@@ -481,4 +536,5 @@ cmp -s "$D/out" "$D/host/a.txt" && ok "a move held past a remount" || no "the mo
 if F read /in/host/deep/er/b.txt > "$D/out" 2>/dev/null; then no "a removed file came back"; else ok "a removal held past a remount"; fi
 stop
 
+[ "$SKIPPED" = 0 ] || echo "skipped: $SKIPPED group(s) of checks this run could not make (the notes above say which)"
 exit $BAD

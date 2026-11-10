@@ -34,7 +34,7 @@ import time
 COLS, ROWS = 140, 44
 F4, F5, F7, F10 = b'\x1bOS', b'\x1b[15~', b'\x1b[18~', b'\x1b[21~'
 F8, F9 = b'\x1b[19~', b'\x1b[20~'
-SHIFT_F5, SHIFT_F7 = b'\x1b[15;2~', b'\x1b[18;2~'
+SHIFT_F2, SHIFT_F5, SHIFT_F7 = b'\x1b[1;2Q', b'\x1b[15;2~', b'\x1b[18;2~'
 RIGHT, LEFT = b'\x1b[C', b'\x1b[D'
 TAB, DOWN, UP, ENTER, ESC = b'\t', b'\x1b[B', b'\x1b[A', b'\r', b'\x1b'
 PASS = 'correct horse battery staple'
@@ -1918,6 +1918,95 @@ def escape_prefix_leg(stratum, root):
         term.kill()
 
 
+def dashed_host_leg(stratum, root):
+    """A host directory or a volume whose name a daemon would read as an option is served as
+    what it is: given to --host and to --vol, typed at Shift+F2, and opened from a panel."""
+    here = f'{root}/dashed-host'
+    for name in ('-h', '--help'):
+        os.makedirs(f'{here}/{name}')
+        with open(f'{here}/{name}/inside{name}.txt', 'w') as f:
+            f.write('x\n')
+    vol = Volume(stratum, f'{here}/-h')
+    vol.mkfs()
+    vol.serve()
+    r = vol.fs(vol.sock, 'write', '/seen_in_dashed.txt', data=b'seen\n')
+    if r.returncode != 0:
+        raise Failure(f'seeding the volume failed: {r.stderr[:200]}')
+    vol.stop()
+
+    def started(where, *args):
+        # Each name is a relative one, so the manager starts where they are.
+        return Term(['/bin/sh', '-c', 'cd "$1" && shift && exec "$@"', 'sh', where, stratum, 'tui', *args])
+
+    def tail(term):
+        return term.screen.text().strip()[-300:]
+
+    def leave(term):
+        term.send(F10)
+        term.exited(60)
+
+    how = 'a host directory named -h, given to --host'
+    term = started(here, '--host', '-h')
+    try:
+        served = wait_until(term, lambda: 'inside-h.txt' in term.screen.text(), 30)
+        record(served, f'{how}: served', f'{how}: not served: {tail(term)!r}')
+        if served:
+            how = 'a volume under a host directory named -h, opened from the panel'
+            wait_quiet(term, how)
+            pick(term, 'vol.stm', ['inside-h.txt', 'vol.stm', 'vol.stm.key', 'check.sock'])
+            term.send(ENTER)
+            term.expect(r'Passphrase for')
+            term.send(PASS.encode() + ENTER)
+            opened = wait_until(term, lambda: 'seen_in_dashed' in term.screen.text(), 70)
+            record(opened, f'{how}: opened', f'{how}: not opened: {tail(term)!r}')
+            if opened:
+                leave(term)
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    how = 'a host directory named --help, typed at Shift+F2'
+    term = started(here, '--host', '.')
+    try:
+        term.expect(r'--help', timeout=30)
+        wait_quiet(term, how)
+        term.send(SHIFT_F2)
+        term.expect(r'Host directory to mount', timeout=10)
+        # The field comes filled with where the manager started; Ctrl-U empties it.
+        term.send(b'\x15')
+        if not wait_until(term, lambda: 'dashed-host' not in term.screen.text(), 10):
+            raise Failure(f'{how}: Ctrl-U did not empty the field: it proves nothing')
+        term.send(b'--help' + ENTER)
+        served = wait_until(term, lambda: 'inside--help.txt' in term.screen.text(), 30)
+        record(served, f'{how}: served', f'{how}: not served: {tail(term)!r}')
+        if served:
+            leave(term)
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    how = 'a volume named -v.stm, given to --vol'
+    os.link(vol.v, f'{here}/-h/-v.stm')
+    os.link(vol.v + '.key', f'{here}/-h/-v.stm.key')
+    term = started(f'{here}/-h', '--vol', '-v.stm')
+    try:
+        term.expect(r'Passphrase for')
+        term.send(PASS.encode() + ENTER)
+        opened = wait_until(term, lambda: 'seen_in_dashed' in term.screen.text(), 70)
+        record(opened, f'{how}: opened', f'{how}: not opened: {tail(term)!r}')
+        if opened:
+            leave(term)
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+
 def editor_escape_leg(stratum, root):
     """A file's text shown in the editor sends no control character to the terminal: the OSC in
     it that would set the window title arrives as '?' and plain text, the BEL that ends it too."""
@@ -2387,8 +2476,10 @@ def wizard_legs(stratum, vol, root):
         # whatever key someone left: the wizard takes no name whose key name is taken on that route too.
         # A real key, so that taking it would make a volume whoever left it can open.
         donor = os.path.join(root, 'wizard-donor.stm')
-        subprocess.run([stratum, 'mkfs', donor, '--size', '64M'], stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        gave = subprocess.run([stratum, 'mkfs', donor, '--size', '64M'], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if gave.returncode != 0:
+            raise Failure(f'the donor key was not made: {gave.stderr.decode(errors="replace").strip()[-200:]}')
         os.rename(f'{donor}.key', f'{w}/plain.stm.key')
         os.chmod(f'{w}/plain.stm.key', 0o600)
         os.unlink(donor)
@@ -2541,6 +2632,36 @@ def landing_legs(stratum, root):
                "the landing screen's New refused a key already there before the passphrase",
                f"the landing screen's New over a key already there: refused before the passphrase={early}, "
                f"key kept={kept}, volume made={os.path.exists(taken)}")
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    # A name mkfs would read as an option: -h is its usage, which ends well and makes nothing.
+    # The volume is made under that name, and "Created" is said only of a volume that is there.
+    dashed = f'{root}/landing-dashed'
+    os.makedirs(dashed)
+    term = Term(['/bin/sh', '-c', 'cd "$1" && exec "$0"', stratum, dashed])
+    try:
+        term.pump(1)
+        term.send(b'n' + ENTER)
+        term.expect(r'New volume path')
+        term.send(b'-h' + ENTER)
+        term.expect(r'Size')
+        term.send(b'64M' + ENTER)
+        term.expect(r'Passphrase:')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'Passphrase again')
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'Passphrase for|does not exist|made no volume', timeout=60)
+        term.show('landing, New named -h')
+        said = b'Created -h' in bytes(term.raw)
+        made = os.path.exists(f'{dashed}/-h') and os.path.exists(f'{dashed}/-h.key')
+        record(made, "the landing screen's New made a volume named -h and its key",
+               "the landing screen's New named -h made no volume and key")
+        record(said == made, "the landing screen's New named -h said Created only of a volume that is there",
+               f"the landing screen's New named -h: said Created={said}, volume and key there={made}")
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -3943,6 +4064,7 @@ def run(stratum, root):
                       (leftover_input_leg, (stratum, root)),
                       (escape_prefix_leg, (stratum, root)),
                       (editor_escape_leg, (stratum, root)),
+                      (dashed_host_leg, (stratum, root)),
                       (unprintable_volume_leg, (stratum, vol, host, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
                       (wrong_passphrase_leg, (stratum, vol, host)),
@@ -3953,7 +4075,7 @@ def run(stratum, root):
                       (landing_stop_legs, (stratum, root))):
         try:
             leg(*args)
-        except (Failure, OSError) as e:
+        except (Failure, subprocess.SubprocessError, OSError) as e:
             record(False, '', f'{leg.__name__}: {e}')
 
 
@@ -3983,7 +4105,7 @@ def main():
                     if ('vol' in wants or 'host' in wants) and 'vol' not in given:
                         given['vol'], given['host'] = sealed_volume(stratum, root)
                     leg(*[given[w] for w in wants])
-                except (Failure, OSError) as e:
+                except (Failure, subprocess.SubprocessError, OSError) as e:
                     record(False, '', f'{name}: {e}')
         else:
             run(stratum, root)

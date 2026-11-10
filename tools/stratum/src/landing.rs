@@ -180,7 +180,7 @@ fn prompt_new() -> Result<()> {
     let me = std::env::current_exe().context("find this program")?;
     let mut child = Command::new(me)
         .arg("mkfs")
-        .arg(&path)
+        .arg(crate::spawn::operand(&path))
         .arg("--size")
         .arg(&size)
         .arg("--passphrase-stdin")
@@ -213,6 +213,12 @@ fn prompt_new() -> Result<()> {
         drop(held);
         // mkfs's words name what a link points at, which the check on the path typed never saw.
         crate::spawn::tell(format_args!("stratum: {}", mkfs_end_message(&path, status, &said, mkfs_pid, key_before, false)));
+        return Ok(());
+    }
+    // "Created" is said of a volume that is there, not of mkfs's exit status alone.
+    if !path.exists() {
+        drop(held);
+        crate::spawn::tell(format_args!("stratum: mkfs ended well and made no volume at {}", path.display()));
         return Ok(());
     }
     // The manager's own prompt reads the mode next, and must find it as it was.

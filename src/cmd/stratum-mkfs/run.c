@@ -6,7 +6,8 @@
  * `stratum-mkfs vol.stm` and immediately point stratumd at it.
  *
  * Default behaviour:
- *   - 64 MiB device size, 16 MiB bootstrap pool.
+ *   - 64 MiB device size, and a bootstrap pool of a sixteenth of it,
+ *     no less than 8 MiB and no more than 256 MiB.
  *   - Generates a fresh PQ-hybrid keyfile at <image>.key (override
  *     via --keyfile PATH).
  *   - Initialises dataset id=1 with a single root inode (mode 0755,
@@ -22,13 +23,13 @@
  *
  *   --size SIZE     Image size; suffix K/M/G accepted.
  *                   Default: 64M.
- *   --keyfile PATH  Path to write the PQ-hybrid keyfile (or use an
- *                   existing one if PATH already exists). Default:
- *                   <IMAGE>.key.
+ *   --keyfile PATH  Path to write the PQ-hybrid keyfile (or, with no
+ *                   passphrase, use one already there that is the
+ *                   user's alone). Default: <IMAGE>.key.
  *
  * Exit codes:
  *   0  success
- *   1  usage error
+ *   1  a usage error, or a refusal that made nothing
  *   2  format failed
  */
 #include <stratum/block.h>
@@ -59,8 +60,8 @@
  * allocator + extent + inode metadata btrees. A hardcoded 16 MiB
  * default exhausted on any non-trivial write because it didn't scale
  * with volume size. Auto-scale instead: floor of 8 MiB, ceiling of
- * 256 MiB, target = device/64. For 3 GB → 48 MiB, for 64 GiB →
- * 256 MiB capped, for tiny test volumes (16-64 MiB) → 8 MiB floor.
+ * 256 MiB, target = device/16. For 3 GiB, 192 MiB; for 64 GiB,
+ * 256 MiB capped; for tiny test volumes (16-64 MiB), the 8 MiB floor.
  *
  * The `--bootstrap` flag still allows manual override for users
  * who want to tune for very-many-small-files workloads. */
@@ -85,6 +86,13 @@ static uint64_t default_bootstrap_for(uint64_t device_bytes)
     return target;
 }
 
+/* Thylacine has no root: uid 0 is its invalid principal. */
+#if defined(__thylacine__)
+#define LINK_OWNERS "the user"
+#else
+#define LINK_OWNERS "the user or root"
+#endif
+
 static void usage(void)
 {
     fputs(
@@ -104,17 +112,18 @@ static void usage(void)
 "                   Never overrides a daemon using IMAGE, and a format\n"
 "                   cannot shrink a file: --size must reach it.\n"
 "  --keyfile PATH   Path to read/write the PQ-hybrid keyfile.\n"
-"                   If file exists, it's used as-is when it is a file the\n"
-"                   user owns that no one else can read or write, or with\n"
-"                   --passphrase-stdin refused, unless --force. If missing,\n"
-"                   one is generated where its links point, if the user or\n"
-"                   root owns each. Default: IMAGE.key.\n"
+"                   If file exists, it's used as-is when it is a regular\n"
+"                   file the user owns whose mode gives no one else access\n"
+"                   (chmod go-rwx), or with --passphrase-stdin refused,\n"
+"                   unless --force. If missing, one is generated where its\n"
+"                   links point, if " LINK_OWNERS " owns each.\n"
+"                   Default: IMAGE.key.\n"
 "  --passphrase-stdin  Read a passphrase line from stdin and use it to\n"
 "                   wrap the keyfile (KFP1 format). The passphrase is\n"
 "                   required at every stratumd open after this. Mutually\n"
 "                   exclusive with the unencrypted-keyfile path.\n"
-"  --bootstrap SIZE Bootstrap pool size. Default: 16M (auto-scaled to\n"
-"                   max(64MiB, device/1024) by libfs if 0).\n"
+"  --bootstrap SIZE Bootstrap pool size. Default: a sixteenth of --size,\n"
+"                   no less than 8M and no more than 256M.\n"
 "  --root-uid N     Owner uid for the dataset root inode (default 0).\n"
 "  --root-gid N     Owner gid for the dataset root inode (default 0).\n"
 "                   N <= 4294967294. Used by Thylacine's host-bake to own\n"
@@ -235,12 +244,19 @@ static const char *key_destination(const char *path, char *buf, size_t n, bool f
                                    bool *refused);
 
 /* A key used as it is decides who can open the volume: one another user owns, or that
- * others can read or write, is theirs as much as the user's. The corvus token is held
- * to the same. */
-static bool key_is_the_users(const struct stat *st)
+ * its mode lets others read or write, is theirs as much as the user's. The corvus token
+ * is held to the same. NULL when the key is the user's alone, else what is wrong with it
+ * and what mends that. */
+static const char *key_not_the_users(const struct stat *st)
 {
-    return S_ISREG(st->st_mode) && st->st_uid == geteuid() &&
-           (st->st_mode & (S_IRWXG | S_IRWXO)) == 0;
+    if (!S_ISREG(st->st_mode)) return "is not a regular file, so no key to use";
+    if (st->st_uid != geteuid())
+        return "belongs to another user, who could open any volume made with it: run as "
+               "its owner or make it the user's own, or pass --force to use it as it is";
+    if ((st->st_mode & (S_IRWXG | S_IRWXO)) != 0)
+        return "can be read or written by others, going by its mode, and the volume "
+               "would be theirs to open: chmod go-rwx it, or pass --force to use it as it is";
+    return NULL;
 }
 
 /* Where another user's link would decide where the key goes. */
@@ -268,11 +284,9 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
     }
     if (force || stat(keyfile_path, &st) != 0) return false;
     if (!replaces_key) {
-        if (key_is_the_users(&st)) return false;
-        fprintf(stderr,
-            "stratum-mkfs: keyfile %s is not the user's alone: another user owns it, or "
-            "others can read or write it, and the volume would be theirs to open; pass "
-            "--force to use it\n", keyfile_path);
+        const char *why = key_not_the_users(&st);
+        if (!why) return false;
+        fprintf(stderr, "stratum-mkfs: keyfile %s %s\n", keyfile_path, why);
         return true;
     }
     fprintf(stderr,
@@ -308,6 +322,9 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
         fprintf(stderr, "stratum-mkfs: cannot open %s: %s\n", image_path, strerror(errno));
         return 1;
     }
+
+    /* Asked before the look as well, which reads all of an empty disk. */
+    if (!*created && key_in_the_way(keyfile_path, replaces_key, force)) return 1;
 
     /* Where the platform has no lock there is no descriptor to look through. */
     int look = fd >= 0 ? fd : open(image_path, O_RDONLY | O_CLOEXEC);
@@ -544,8 +561,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     /* SWISS-4n3: derive bootstrap-pool size from --size when the user
      * didn't specify --bootstrap explicitly. The libfs heuristic
      * (max(64 MiB, dev/1024)) is too generous for tiny test volumes
-     * (would refuse 16-MiB images); ours scales floor → 8 MiB,
-     * ceiling → 256 MiB, target → device/64. */
+     * (would refuse 16-MiB images); ours is default_bootstrap_for's. */
     if (bootstrap_bytes == 0) {
         bootstrap_bytes = default_bootstrap_for(device_bytes);
     }
@@ -617,10 +633,10 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             goto cleanup;
         }
         key_is_new = true;
-    } else if (!have_pass && !force && !key_is_the_users(&st)) {
-        /* Made there since the claim. */
-        fprintf(stderr, "stratum-mkfs: keyfile %s is not the user's alone; pass --force to use it\n",
-                keyfile_path);
+    } else if (!have_pass && !force && key_not_the_users(&st)) {
+        /* Made there, or changed, since the claim. */
+        fprintf(stderr, "stratum-mkfs: since the volume was claimed, keyfile %s %s\n",
+                keyfile_path, key_not_the_users(&st));
         exit_code = 1;
         goto cleanup;
     }

@@ -120,6 +120,17 @@ pub fn stop_child(child: &mut Child, name: &str) {
     let _ = child.wait();
 }
 
+/// A path handed to a child as an operand. One that begins with '-' would be read as an
+/// option, and mkfs answers `-h` with its usage and success, so it goes as `./-h`.
+pub(crate) fn operand(path: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+    if path.as_os_str().as_bytes().first() == Some(&b'-') {
+        Path::new(".").join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// A line on stderr that cannot panic, as eprintln! does once the terminal or the
 /// pipe it wrote to has gone: the panic would skip the rest of the stop.
 pub(crate) fn tell(line: std::fmt::Arguments) {
@@ -226,7 +237,7 @@ impl SpawnCtx {
         let sock = self.session_dir.join(format!("host-fs-{}.sock", n + 100));
         let args: Vec<String> = vec![
             "host-fs".into(),
-            root.to_string_lossy().into_owned(),
+            operand(root).to_string_lossy().into_owned(),
             "--listen".into(),
             sock.to_string_lossy().into_owned(),
             "--allow-unauth".into(),
@@ -316,7 +327,7 @@ impl SpawnCtx {
             .join(format!("stratumd-ctl-{}.sock", n + 100));
         let mut args: Vec<String> = vec![
             "serve".into(),
-            volume.to_string_lossy().into_owned(),
+            operand(volume).to_string_lossy().into_owned(),
             "--listen".into(),
             sock.to_string_lossy().into_owned(),
             "--keyfile".into(),
@@ -627,6 +638,17 @@ fn wait_for_sock(path: &Path, timeout: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::start_failure;
+    use std::path::Path;
+
+    /// Only a path a child would read as an option is changed, and it still names the same file.
+    #[test]
+    fn a_path_that_begins_with_a_dash_is_no_option() {
+        assert_eq!(super::operand(Path::new("-h")), Path::new("./-h"));
+        assert_eq!(super::operand(Path::new("--help.stm")), Path::new("./--help.stm"));
+        for as_it_is in ["v.stm", "/tmp/-h", "./-h", "dir/-h"] {
+            assert_eq!(super::operand(Path::new(as_it_is)), Path::new(as_it_is));
+        }
+    }
 
     #[test]
     fn a_warning_is_not_the_reason() {

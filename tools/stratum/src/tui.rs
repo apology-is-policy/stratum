@@ -3119,7 +3119,7 @@ fn submit_mkvol(
     let mkfs_status = (|| -> std::io::Result<std::process::Output> {
         let mut cmd = Command::new(&me);
         cmd.arg("mkfs")
-            .arg(volume_path.to_string_lossy().as_ref())
+            .arg(crate::spawn::operand(&volume_path))
             .arg("--size").arg(size)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

@@ -120,7 +120,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // the right panel — and the left panel too when --vol is unset).
     let host_fs_args: Vec<String> = vec![
         "host-fs".into(),
-        host_root.to_string_lossy().into_owned(),
+        crate::spawn::operand(&host_root).to_string_lossy().into_owned(),
         "--listen".into(),
         host_fs_sock.to_string_lossy().into_owned(),
         "--allow-unauth".into(),
@@ -207,7 +207,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
 
         let mut stratumd_args: Vec<String> = vec![
             "serve".into(),
-            vol.to_string_lossy().into_owned(),
+            crate::spawn::operand(vol).to_string_lossy().into_owned(),
             "--listen".into(),
             stratumd_sock.to_string_lossy().into_owned(),
             "--keyfile".into(),
