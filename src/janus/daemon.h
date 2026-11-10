@@ -21,7 +21,8 @@
 /*
  * Create + bind + listen on a Unix socket at `path`. If the path
  * already exists, it is unlinked. Socket is created with mode 0600
- * unless `mode` overrides it. Returns the listening fd (>= 0) on
+ * unless `mode` overrides it. The socket takes `path` only once it
+ * listens (stm_unix_listen_at). Returns the listening fd (>= 0) on
  * success or STM_EIO as a negative.
  */
 int janus_listen_unix(const char *path, mode_t mode);

@@ -547,6 +547,62 @@ STM_TEST(janus_listen_unix_enforces_0600)
     free(dir);
 }
 
+/* A name that can be seen can be dialed: janus's socket too takes its name
+ * only once it listens. One thread makes the listener while this one dials the
+ * moment the name is there. */
+typedef struct {
+    const char *path;
+    int         fd;
+    atomic_bool done;
+} janus_listen_race;
+
+static void *janus_listen_race_thread(void *p)
+{
+    janus_listen_race *r = p;
+    r->fd = janus_listen_unix(r->path, 0600);
+    atomic_store(&r->done, true);
+    return NULL;
+}
+
+STM_TEST(janus_listen_unix_name_is_there_only_once_it_listens)
+{
+    char *dir = tmp_dir();
+    STM_ASSERT(dir);
+    char sock[1024];
+    snprintf(sock, sizeof sock, "%s/sock", dir);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    STM_ASSERT(strlen(sock) < sizeof addr.sun_path);
+    memcpy(addr.sun_path, sock, strlen(sock) + 1);
+
+    int dialed = 0, refused = 0, other = 0;
+    for (int i = 0; i < 400; i++) {
+        janus_listen_race r = { .path = sock, .fd = -1 };
+        atomic_init(&r.done, false);
+        pthread_t t;
+        STM_ASSERT_EQ(pthread_create(&t, NULL, janus_listen_race_thread, &r), 0);
+        struct stat st;
+        while (lstat(sock, &st) != 0 && !atomic_load(&r.done)) { }
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        STM_ASSERT(c >= 0);
+        if (connect(c, (struct sockaddr *)&addr, sizeof addr) == 0) dialed++;
+        else if (errno == ECONNREFUSED) refused++;
+        else other++;
+        close(c);
+        pthread_join(t, NULL);
+        STM_ASSERT(r.fd >= 0);
+        close(r.fd);
+        unlink(sock);
+    }
+    STM_ASSERT_EQ(refused, 0);
+    STM_ASSERT_EQ(other, 0);
+    STM_ASSERT_EQ(dialed, 400);
+
+    tmp_rm(dir);
+    free(dir);
+}
+
 /* R11 P1-2 smoke: peer-cred check accepts same-UID peer. A rejection
  * test would require cross-UID privileges that unit tests can't
  * assume; the happy path is exercised here transitively by every

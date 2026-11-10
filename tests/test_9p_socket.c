@@ -15,6 +15,7 @@
 
 #include <stratum/9p.h>
 #include <stratum/fs.h>
+#include <stratum/listen.h>
 #include <stratum/stratumd.h>
 #include <stratum/types.h>
 
@@ -474,6 +475,132 @@ STM_TEST(p9_socket_r95_p3_1_non_socket_refused) {
     STM_ASSERT_TRUE(S_ISREG(st.st_mode));
 
     (void)unlink(g_sock_path);
+}
+
+/* A name that can be seen can be dialed. One thread makes the listener while
+ * this one looks for the name with no sleep between the looks and dials the
+ * moment it is there: a name there from bind() is dialed before listen(), and
+ * that dial is refused. */
+typedef struct {
+    const char *path;
+    int         fd;
+    atomic_bool done;
+} listen_race;
+
+static void *listen_race_thread(void *p)
+{
+    listen_race *r = p;
+    r->fd = stm_stratumd_listen_unix(r->path, 4, 0600, 0);
+    atomic_store(&r->done, true);
+    return NULL;
+}
+
+STM_TEST(p9_socket_name_is_there_only_once_it_listens) {
+    build_sock_path("ready");
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, g_sock_path, sizeof addr.sun_path - 1);
+    char staged[sizeof g_sock_path + 32];
+    snprintf(staged, sizeof staged, "%s.%ld", g_sock_path, (long)getpid());
+
+    int dialed = 0, refused = 0, other = 0, left = 0;
+    for (int i = 0; i < 400; i++) {
+        listen_race r = { .path = g_sock_path, .fd = -1 };
+        atomic_init(&r.done, false);
+        pthread_t t;
+        STM_ASSERT_EQ(pthread_create(&t, NULL, listen_race_thread, &r), 0);
+        struct stat st;
+        while (lstat(g_sock_path, &st) != 0 && !atomic_load(&r.done)) { }
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        STM_ASSERT_TRUE(c >= 0);
+        if (connect(c, (struct sockaddr *)&addr, sizeof addr) == 0) dialed++;
+        else if (errno == ECONNREFUSED) refused++;
+        else other++;
+        close(c);
+        pthread_join(t, NULL);
+        STM_ASSERT_TRUE(r.fd >= 0);
+        if (lstat(staged, &st) == 0) left++;
+        close(r.fd);
+        (void)unlink(g_sock_path);
+    }
+    STM_ASSERT_EQ(refused, 0);
+    STM_ASSERT_EQ(other, 0);
+    STM_ASSERT_EQ(dialed, 400);
+    /* Nothing stays at the name the socket was bound under. */
+    STM_ASSERT_EQ(left, 0);
+}
+
+/* The socket is given its name by a link, which refuses a name that is taken:
+ * what is there is left as it is, and nothing stays at the other name. */
+STM_TEST(p9_socket_listen_at_refuses_a_name_that_is_taken) {
+    build_sock_path("taken");
+    int rfd = open(g_sock_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    STM_ASSERT_TRUE(rfd >= 0);
+    close(rfd);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT_TRUE(fd >= 0);
+    STM_ASSERT_EQ(stm_unix_listen_at(fd, g_sock_path, 0600, 4), -EEXIST);
+    close(fd);
+
+    struct stat st;
+    STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
+    STM_ASSERT_TRUE(S_ISREG(st.st_mode));
+    char staged[sizeof g_sock_path + 32];
+    snprintf(staged, sizeof staged, "%s.%ld", g_sock_path, (long)getpid());
+    STM_ASSERT_TRUE(lstat(staged, &st) != 0 && errno == ENOENT);
+
+    (void)unlink(g_sock_path);
+}
+
+/* A socket left at the name the listener binds under first is a killed
+ * process's, and is cleared; a file there is somebody's, and is left. */
+STM_TEST(p9_socket_listen_clears_only_a_socket_from_its_staged_name) {
+    build_sock_path("staged");
+    char staged[sizeof g_sock_path + 32];
+    snprintf(staged, sizeof staged, "%s.%ld", g_sock_path, (long)getpid());
+    (void)unlink(staged);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    STM_ASSERT_TRUE(strlen(staged) < sizeof addr.sun_path);
+    memcpy(addr.sun_path, staged, strlen(staged) + 1);
+    int left = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT_TRUE(left >= 0);
+    STM_ASSERT_EQ(bind(left, (struct sockaddr *)&addr, sizeof addr), 0);
+    close(left);
+    int fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(fd >= 0);
+    struct stat st;
+    STM_ASSERT_TRUE(lstat(staged, &st) != 0 && errno == ENOENT);
+    close(fd);
+    (void)unlink(g_sock_path);
+
+    int rfd = open(staged, O_CREAT | O_WRONLY | O_EXCL, 0644);
+    STM_ASSERT_TRUE(rfd >= 0);
+    close(rfd);
+    STM_ASSERT_EQ(stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0), -EEXIST);
+    STM_ASSERT_EQ(lstat(staged, &st), 0);
+    STM_ASSERT_TRUE(S_ISREG(st.st_mode));
+    STM_ASSERT_TRUE(lstat(g_sock_path, &st) != 0 && errno == ENOENT);
+    (void)unlink(staged);
+}
+
+/* A path that fits sun_path alone and leaves no room for a dot and the pid is
+ * refused, with nothing made at it. */
+STM_TEST(p9_socket_listen_path_with_no_room_to_stage_rejected) {
+    char path[sizeof ((struct sockaddr_un *)0)->sun_path];
+    int n = snprintf(path, sizeof path, "/tmp/stm_socktest_%d_", (int)getpid());
+    STM_ASSERT_TRUE(n > 0 && (size_t)n < sizeof path - 1);
+    memset(path + n, 'a', sizeof path - 1 - (size_t)n);
+    path[sizeof path - 1] = '\0';
+
+    int fd = stm_stratumd_listen_unix(path, 4, 0600, 0);
+    STM_ASSERT_EQ(fd, -ENAMETOOLONG);
+    struct stat st;
+    STM_ASSERT_TRUE(lstat(path, &st) != 0 && errno == ENOENT);
 }
 
 /* R95 P2-1: a slow-loris client (connects but never sends) must NOT

@@ -866,6 +866,66 @@ mod slate_state {
     }
 }
 
+// -- A daemon's socket can be dialed as soon as it can be seen --------
+
+/// Whoever waits for a daemon waits for its socket's name, the manager among them, and a daemon
+/// binds its socket before it makes it listen: were the name there from the bind, a dial between
+/// the two would be refused. Each daemon is started and dialed the moment its name appears, with
+/// no sleep between the looks.
+#[test]
+fn a_socket_that_can_be_seen_can_be_dialed() {
+    use std::os::unix::net::UnixStream;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let bin = common::locate_stratum_bin();
+    let tmp = tempfile::Builder::new().prefix("seen-").tempdir().expect("tempdir");
+    let host = tmp.path().join("host");
+    std::fs::create_dir(&host).unwrap();
+    let mut refused = Vec::new();
+    for start in 0..60 {
+        for daemon in ["slate", "host-fs"] {
+            let sock = tmp.path().join(format!("{daemon}-{start}.sock"));
+            let mut cmd = Command::new(&bin);
+            if daemon == "slate" {
+                cmd.args(["slate", "serve"]);
+            } else {
+                cmd.arg("host-fs").arg(&host);
+            }
+            let mut child = cmd
+                .arg("--listen")
+                .arg(&sock)
+                .arg("--allow-unauth")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn the daemon");
+            let began = Instant::now();
+            let mut looks = 0u32;
+            while !sock.exists() {
+                looks += 1;
+                if looks % 4096 == 0 {
+                    assert!(child.try_wait().unwrap().is_none(), "{daemon} ended before its socket appeared");
+                    assert!(began.elapsed() < Duration::from_secs(20), "{daemon} socket never appeared");
+                }
+                std::hint::spin_loop();
+            }
+            let dial = UnixStream::connect(&sock);
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Err(e) = dial {
+                refused.push(format!("{daemon}, start {start}: {e}"));
+            }
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "{} of 120 dials made the moment the socket appeared failed: {:?}",
+        refused.len(),
+        &refused[..refused.len().min(3)]
+    );
+}
+
 // ── S5-PRE-A: /ctl/ pool subtree visible after attach ────────────────
 
 /// SWISS-5 S5-PRE-A regression: after stratumd attaches the fs's

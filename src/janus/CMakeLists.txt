@@ -11,7 +11,7 @@ target_include_directories(stm_janus
 
 target_link_libraries(stm_janus
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  stm_p9 stm_crypto stm_keyfile)
+    PUBLIC  stm_util stm_p9 stm_crypto stm_keyfile)
 
 add_executable(janus janusd.c)
 target_include_directories(janus PRIVATE ${CMAKE_CURRENT_LIST_DIR})

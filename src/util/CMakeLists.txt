@@ -1,5 +1,6 @@
 add_library(stm_util STATIC
-    status.c)
+    status.c
+    listen.c)
 
 target_include_directories(stm_util PUBLIC
     ${CMAKE_SOURCE_DIR}/include)

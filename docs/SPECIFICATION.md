@@ -550,7 +550,7 @@ Reflink shares hot extents through the allocator's refcount and cold ones throug
 ## 13. Interfaces
 
 **9P2000.L server** (`stratumd`). Default msize 128 KiB, at most 8 MiB. Stratum extensions: `Tbind`, `Tunbind` (replace only), `Tsync`, `Treflink`, `Tfallocate`, `Tfadvise`,
-and `Twalkgetattr`, a fused walk and getattr. `Tpin` and `Tunpin` are reserved and return `ENOSYS`. Transport is Unix sockets; there is no TCP listener.
+and `Twalkgetattr`, a fused walk and getattr. `Tpin` and `Tunpin` are reserved and return `ENOSYS`. Transport is Unix sockets; there is no TCP listener. A daemon's socket takes its path only once it listens, so a path that exists can be dialed; until then it is bound as the path, a dot and the pid, and the path must leave room for that in the socket address.
 
 **`/ctl`.** A synthetic administrative tree on a second socket. Status, datasets and snapshots to read. Verbs for snapshot create, delete, hold, release, rollback, compromise
 marking, DEK install and evict, and scrub control. Prometheus text at `/pools/<uuid>/metrics/prometheus`. No verbs for clones, send, receive, tiering, devices, setting

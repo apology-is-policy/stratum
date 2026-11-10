@@ -444,6 +444,10 @@ int stm_stratumd_parse_pool_serial_hex(const char *hex, uint8_t out[16]);
  * `backlog` is clamped to [1, SOMAXCONN]. `mode` of 0 substitutes
  * STM_STRATUMD_DEFAULT_SOCKET_MODE (0600).
  *
+ * The socket takes `path` only once it listens (stm_unix_listen_at), so
+ * `path` must leave room in sun_path for a dot and the pid: -ENAMETOOLONG
+ * otherwise.
+ *
  * `sockbuf` of 0 keeps the platform-default socket buffers. A non-zero
  * value is set as SO_SNDBUF + SO_RCVBUF on the listener BEFORE bind(),
  * best-effort (a refusal is ignored). On a POSIX host this is the usual

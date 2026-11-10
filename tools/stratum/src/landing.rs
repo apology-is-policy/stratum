@@ -395,7 +395,7 @@ fn key_destination(key: &Path) -> PathBuf {
             _ => target,
         };
     }
-    // A loop: mkfs makes no key, and nothing is there by that name.
+    // A loop, or more links than mkfs follows: mkfs makes no key.
     key.to_path_buf()
 }
 

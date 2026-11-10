@@ -16,6 +16,7 @@
 #include "daemon.h"
 #include "synfs.h"
 
+#include <stratum/listen.h>
 #include <stratum/p9.h>
 #include <stratum/types.h>
 
@@ -39,50 +40,15 @@
 int janus_listen_unix(const char *path, mode_t mode)
 {
     if (!path) return STM_EINVAL;
-    struct sockaddr_un sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sun_family = AF_UNIX;
-    size_t plen = strlen(path);
-    if (plen >= sizeof sa.sun_path) return STM_EINVAL;
-    memcpy(sa.sun_path, path, plen + 1);
+    if (strlen(path) >= sizeof ((struct sockaddr_un *)0)->sun_path) return STM_EINVAL;
 
-    /* Unlink any stale socket (EEXIST would make bind fail). Use
-     * ENOENT tolerance — the usual case is first-run. */
+    /* A socket left by a run before this one. */
     if (unlink(path) != 0 && errno != ENOENT) return STM_EIO;
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return STM_EIO;
-
-    /* R11 P1-1: clamp the socket file's mode before `bind()` creates
-     * it. The previous approach used a tight umask around bind then a
-     * follow-up `chmod(path, …)` — that left two windows: (a) between
-     * bind and chmod a connector could slip in at whatever mode the
-     * filesystem chose (Linux <3.17 AF_UNIX ignores umask entirely),
-     * and (b) chmod failure was silently ignored, so a filesystem
-     * that couldn't carry Unix perms (overlay, some network shares,
-     * SELinux label conflicts) would silently leave the socket
-     * world-accessible. Now: umask + immediate fchmod before bind
-     * close window (a); a chmod failure is fatal, closing window (b).
-     *
-     * `fchmod` on a yet-unlinked AF_UNIX socket fd doesn't affect the
-     * filesystem entry (it's per-inode and there's no inode yet), so
-     * we still need the post-bind `chmod(path, …)`. The combination
-     * of narrow umask + post-bind chmod + fatal-on-fail closes the
-     * whole class. */
-    mode_t prev_umask = umask(0777 & ~mode);
-    int bind_rc = bind(fd, (struct sockaddr *)&sa, sizeof sa);
-    umask(prev_umask);
-    if (bind_rc != 0) { close(fd); return STM_EIO; }
-
-    if (chmod(path, mode) != 0) {
+    if (stm_unix_listen_at(fd, path, mode, 8) != 0) {
         close(fd);
-        unlink(path);
-        return STM_EIO;
-    }
-
-    if (listen(fd, 8) != 0) {
-        close(fd);
-        unlink(path);
         return STM_EIO;
     }
     return fd;

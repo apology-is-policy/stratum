@@ -26,6 +26,7 @@
 #include <stratum/ctl.h>
 #include <stratum/fs.h>
 #include <stratum/keyfile.h>
+#include <stratum/listen.h>
 #include <stratum/lp9.h>
 #include <stratum/scrub.h>
 #include <stratum/sync.h>
@@ -333,40 +334,10 @@ int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode,
                          &sockbuf, sizeof sockbuf);
     }
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    /* sun_path size already verified above; strncpy is bounded
-     * by the field width for defense-in-depth. */
-    strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
-
-    /* R95 P1-1 — clamp the socket file's mode BEFORE bind() creates
-     * it via umask, then explicit chmod() AFTER bind to close the
-     * window where a connector could slip in at the kernel-default
-     * mode (Linux <3.17 ignores umask for AF_UNIX entirely; some
-     * filesystems can't carry full Unix perms). chmod failure is
-     * FATAL — close + unlink + return -errno — matching janus's
-     * R11 P1-1 fix. */
-    mode_t prev_umask = umask(0777 & ~mode);
-    int    bind_rc    = bind(fd, (struct sockaddr *)&addr, sizeof addr);
-    int    bind_errno = errno;
-    umask(prev_umask);
-    if (bind_rc < 0) {
+    int rc = stm_unix_listen_at(fd, path, mode, backlog);
+    if (rc != 0) {
         close(fd);
-        return -bind_errno;
-    }
-    if (chmod(path, mode) < 0) {
-        int e = errno;
-        close(fd);
-        (void)unlink(path);
-        return -e;
-    }
-
-    if (listen(fd, backlog) < 0) {
-        int e = errno;
-        close(fd);
-        (void)unlink(path);
-        return -e;
+        return rc;
     }
 
     /* Set CLOEXEC defensively — accept()-ed children don't fork+exec
