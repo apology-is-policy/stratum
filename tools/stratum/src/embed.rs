@@ -272,12 +272,11 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         // buffer's Zeroizing wrapper wipes when the binding goes
         // out of scope at the end of the `if let Some(vol)` block.
         if let Some(pass) = passphrase.as_ref() {
-            use std::io::Write as _;
             if let Some(mut sin) = child.stdin.take() {
                 let mut to_write = Vec::with_capacity(pass.len() + 1);
                 to_write.extend_from_slice(pass.as_bytes());
                 to_write.push(b'\n');
-                let wr = sin.write_all(&to_write);
+                let wr = crate::passphrase::hand_over(&mut sin, &to_write);
                 // Wipe the local copy NOW (the original Zeroizing
                 // wrapper still wipes on drop, but the duplicate
                 // would otherwise linger past pipe-close).

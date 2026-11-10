@@ -208,13 +208,42 @@ else
     no "the refusal over a key did not say why: $(tail -1 "$D/again.log")"
 fi
 [ "$(cksum < "$V.key")" = "$kh" ] && ok "another volume's key survives" || no "another volume's key was replaced"
+# A key used as it is decides who can open the volume: one others can read or write is refused before
+# anything is made, and with --force used; the user's own, read by no one else, is used (the control).
+"$B" mkfs "$D/raw.stm" --size 64M < /dev/null > "$D/raw.log" 2>&1 || no "a volume with no passphrase: $(tail -1 "$D/raw.log")"
+chmod 644 "$D/raw.stm.key"
+if "$B" mkfs "$D/shared.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$D/shared.log" 2>&1; then
+    no "a key others can read was used"
+elif LC_ALL=C grep -q 'others can read or write it' "$D/shared.log" && [ ! -e "$D/shared.stm" ]; then
+    ok "a key others can read is refused before anything is made, and says why"
+else
+    no "the refusal of a key others can read: $(tail -1 "$D/shared.log"); image left: $([ -e "$D/shared.stm" ] && echo yes || echo no)"
+fi
+if "$B" mkfs "$D/shared.stm" --size 64M --force --keyfile "$D/raw.stm.key" < /dev/null > "$D/shared.log" 2>&1 \
+        && LC_ALL=C grep -q 'using existing keyfile' "$D/shared.log"; then
+    ok "with --force a key others can read is used"
+else
+    no "--force over a key others can read: $(tail -1 "$D/shared.log")"
+fi
+chmod 600 "$D/raw.stm.key"
+if "$B" mkfs "$D/own.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$D/own.log" 2>&1 \
+        && LC_ALL=C grep -q 'using existing keyfile' "$D/own.log"; then
+    ok "the user's own key, read by no one else, is used as it is"
+else
+    no "the user's own key: $(tail -1 "$D/own.log")"
+fi
+
 # A link another user owns does not decide where the key goes: in a shared sticky directory whoever left
 # it would hold the key, which the kernel's protected_symlinks keeps from a path it follows itself, and
 # mkfs reads the links itself. Refused with a passphrase and without; --force, the control, follows it,
-# as a link of the user's own is followed (below). Only root or sudo can give a link another owner.
-if [ "$(id -u)" = 0 ]; then as=""; elif sudo -n true 2>/dev/null; then as="sudo -n"; else as=none; fi
+# as a link of the user's own is followed (below). Only root or sudo can give a link another owner, and
+# sudo is tried only when STRATUM_TEST_SUDO=1 asks for it: where the user is not in sudoers even a try
+# is logged as an incident.
+if [ "$(id -u)" = 0 ]; then as=""
+elif [ "${STRATUM_TEST_SUDO:-0}" = 1 ] && sudo -n true 2>/dev/null; then as="sudo -n"
+else as=none; fi
 if [ "$as" = none ]; then
-    echo "note: a key name that is another user's link: making one needs root or sudo without a password"
+    echo "note: a key name that is another user's link: making one needs root, or STRATUM_TEST_SUDO=1 and sudo without a password"
 else
     mkdir "$D/theirs"
     ln -s "$D/theirs/k" "$D/planted.stm.key"
@@ -243,6 +272,23 @@ else
     else
         no "--force over another user's key link: $(tail -1 "$D/planted.log")"
     fi
+    # The same link to a key of the user's own, which is used as it is: refused when the volume is
+    # claimed, before the key would be read, with a passphrase and without.
+    ln -s "$D/raw.stm.key" "$D/reuse.stm.key"
+    $as chown -h nobody "$D/reuse.stm.key"
+    for how in "with a passphrase" "without one"; do
+        if [ "$how" = "with a passphrase" ]; then
+            printf '%s\n' other | "$B" mkfs "$D/reuse.stm" --size 64M --passphrase-stdin > "$D/reuse.log" 2>&1
+        else
+            "$B" mkfs "$D/reuse.stm" --size 64M < /dev/null > "$D/reuse.log" 2>&1
+        fi
+        rc=$?
+        if [ "$rc" != 0 ] && LC_ALL=C grep -q 'another user owns' "$D/reuse.log" && [ ! -e "$D/reuse.stm" ]; then
+            ok "another user's link to an existing key is refused $how, before anything is made"
+        else
+            no "another user's link to an existing key $how: rc=$rc: $(tail -1 "$D/reuse.log"); image: $(ls "$D/reuse.stm" 2>/dev/null)"
+        fi
+    done
 fi
 [ ! -e "$D/new.stm" ] && ok "that refusal left no empty image" || no "that refusal left an image behind"
 
@@ -284,6 +330,7 @@ LC_ALL=C grep -q 'the new key is at' "$D/again.log" \
 
 # A format that fails late leaves what it found, and nothing it made, so a retry just works.
 printf 'not a key' > "$D/late.stm.key"
+chmod 600 "$D/late.stm.key"
 if "$B" mkfs "$D/late.stm" --size 64M > "$D/late.log" 2>&1; then
     no "a garbage key formatted a volume"
 else

@@ -2013,7 +2013,8 @@ def unprintable_volume_leg(stratum, vol, host, root):
         term.send(b'o' + ENTER)
         term.expect(r'Volume path')
         relisted = clean(term)
-        term.send(f'{d}/typed\x1b]2;PWNED\x07.stm'.encode() + ENTER)
+        # A name that leads to a volume, so whatever reached the recent list would be kept there.
+        term.send(hostile.encode() + ENTER)
         refused = wait_until(term, lambda: b'holds a control character' in bytes(term.raw), 10)
         with open(recents, encoding='utf-8') as f:
             kept = f.read() == '/v/x\x1b]2;PWNED\x07.stm\n'
@@ -2370,13 +2371,62 @@ def wizard_legs(stratum, vol, root):
         with open(f'{w}/stale.stm.key', 'wb') as f:
             f.write(stale)
         fill_wizard(term, b'stale', PASS.encode(), PASS.encode())
-        term.expect(r'mkfs failed', timeout=30)
+        # Refused before mkfs, as a volume already there is: mkfs's own refusal reads "mkfs failed".
+        term.expect(r'File exists|mkfs failed', timeout=30)
         term.show('the wizard over a key already there')
+        early = 'File exists' in term.screen.text()
         with open(f'{w}/stale.stm.key', 'rb') as f:
             kept = f.read() == stale
-        record(kept and not os.path.exists(f'{w}/stale.stm'), 'the wizard refused to replace a key already there',
-               f'the wizard over a key already there: key kept={kept}, volume made={os.path.exists(f"{w}/stale.stm")}')
+        record(early and kept and not os.path.exists(f'{w}/stale.stm'), 'the wizard refused to replace a key already there',
+               f'the wizard over a key already there: refused before mkfs={early}, key kept={kept}, '
+               f'volume made={os.path.exists(f"{w}/stale.stm")}')
         term.send(ESC)
+        term.pump(0.5)
+
+        # Without a passphrase mkfs uses a key already there as it is, so the volume would open with
+        # whatever key someone left: the wizard takes no name whose key name is taken on that route too.
+        # A real key, so that taking it would make a volume whoever left it can open.
+        donor = os.path.join(root, 'wizard-donor.stm')
+        subprocess.run([stratum, 'mkfs', donor, '--size', '64M'], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        os.rename(f'{donor}.key', f'{w}/plain.stm.key')
+        os.chmod(f'{w}/plain.stm.key', 0o600)
+        os.unlink(donor)
+        with open(f'{w}/plain.stm.key', 'rb') as f:
+            plain = f.read()
+        term.send(SHIFT_F7)
+        term.expect(r'Create Stratum Volume')
+        term.send(b'plain' + ENTER + ENTER)
+        term.pump(0.3)
+        term.send(b' ')
+        term.pump(0.3)
+        press_enter_until(term, r'File exists|Created |mkfs failed')
+        term.show('the wizard without a passphrase over a key already there')
+        said = term.screen.text()
+        with open(f'{w}/plain.stm.key', 'rb') as f:
+            kept = f.read() == plain
+        made = os.path.exists(f'{w}/plain.stm')
+        record('File exists' in said and kept and not made,
+               'the wizard without a passphrase refused a key already there',
+               f'the wizard without a passphrase over a key already there: refused={"File exists" in said}, '
+               f'key kept={kept}, volume made={made}')
+        term.send(ENTER if made else ESC)
+        term.pump(0.5)
+
+        # A key name the user has linked to where the key is to go is not taken: mkfs makes the
+        # key there, as it does from the landing screen and the command line.
+        wkeys = os.path.join(root, 'wizard-keys')
+        os.makedirs(wkeys)
+        os.symlink(f'{wkeys}/linked.stm.key', f'{w}/linked.stm.key')
+        fill_wizard(term, b'linked', PASS.encode(), PASS.encode())
+        term.expect(r'Created |File exists|mkfs failed', timeout=60)
+        term.show('the wizard over a key link of the user\'s own')
+        created = 'Created ' in term.screen.text()
+        there = os.path.exists(f'{wkeys}/linked.stm.key') and os.path.getsize(f'{wkeys}/linked.stm.key') > 0
+        record(created and there and os.path.exists(f'{w}/linked.stm'),
+               'the wizard over a key link of the user\'s own made the key where it points',
+               f'the wizard over a key link of the user\'s own: created={created}, key made there={there}')
+        term.send(ENTER if created else ESC)
         term.pump(0.5)
 
         term.send(SHIFT_F7)
@@ -2465,6 +2515,32 @@ def landing_legs(stratum, root):
         record(term.exited(60) and term.rc == 0 and os.path.exists(path),
                'the landing screen made a volume and opened it',
                f'New on the landing screen did not finish: rc={term.rc}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    # A key already at the new volume's key name: refused before the passphrase, as a volume there is.
+    taken = f'{root}/landing-taken.stm'
+    with open(taken + '.key', 'wb') as f:
+        f.write(b'a key left there')
+    term = Term([stratum])
+    try:
+        term.pump(1)
+        term.send(b'n' + ENTER)
+        term.expect(r'New volume path')
+        term.send(taken.encode() + ENTER)
+        term.expect(r'already exists|Size')
+        term.pump(0.3)
+        term.show('landing, New over a key already there')
+        early = b'landing-taken.stm.key already exists' in bytes(term.raw) and 'Size' not in term.screen.text()
+        with open(taken + '.key', 'rb') as f:
+            kept = f.read() == b'a key left there'
+        record(early and kept and not os.path.exists(taken),
+               "the landing screen's New refused a key already there before the passphrase",
+               f"the landing screen's New over a key already there: refused before the passphrase={early}, "
+               f"key kept={kept}, volume made={os.path.exists(taken)}")
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise

@@ -49,7 +49,7 @@ pub fn follow() {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let is_pipe = unsafe { libc::fstat(fd, &mut st) } == 0 && st.st_mode & libc::S_IFMT == libc::S_IFIFO;
     if !is_pipe {
-        eprintln!("stratum: {ENV}={fd} is not a pipe; this daemon will not stop with its manager");
+        crate::spawn::tell(format_args!("stratum: {ENV}={fd} is not a pipe; this daemon will not stop with its manager"));
         return;
     }
     std::thread::spawn(move || {
@@ -61,7 +61,7 @@ pub fn follow() {
                 if e.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                eprintln!("stratum: reading {ENV} failed ({e}); this daemon will not stop with its manager");
+                crate::spawn::tell(format_args!("stratum: reading {ENV} failed ({e}); this daemon will not stop with its manager"));
                 return;
             }
             break;

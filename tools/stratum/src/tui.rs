@@ -3080,9 +3080,22 @@ fn submit_mkvol(
     }
     volume_path.push(&leaf);
 
-    if volume_path.exists() {
+    // A key already at the volume's key name would be used as it is, or refused by mkfs only
+    // after the passphrase, so a new volume takes neither name. A key name that links to nothing
+    // is mkfs's to judge: a link of the user's own decides where the key goes.
+    let mut key_path = volume_path.clone().into_os_string();
+    key_path.push(".key");
+    let key_path = PathBuf::from(key_path);
+    let taken = if volume_path.symlink_metadata().is_ok() {
+        Some(&volume_path)
+    } else if key_path.exists() {
+        Some(&key_path)
+    } else {
+        None
+    };
+    if let Some(taken) = taken {
         let mut new_mk = mk.clone();
-        new_mk.error = Some(format!("File exists: {}", volume_path.display()));
+        new_mk.error = Some(format!("File exists: {}", taken.display()));
         *local_dialog = Some(LocalDialog {
             kind: LocalDialogKind::MkVol(new_mk),
             ..dialog
@@ -3118,12 +3131,11 @@ fn submit_mkvol(
         }
         let mut child = cmd.spawn()?;
         if want_passphrase {
-            use std::io::Write as _;
             if let Some(mut sin) = child.stdin.take() {
                 let mut buf = Vec::with_capacity(mk.passphrase.len() + 1);
                 buf.extend_from_slice(mk.passphrase.as_bytes());
                 buf.push(b'\n');
-                let wr = sin.write_all(&buf);
+                let wr = crate::passphrase::hand_over(&mut sin, &buf);
                 for b in buf.iter_mut() {
                     unsafe { std::ptr::write_volatile(b as *mut u8, 0); }
                 }

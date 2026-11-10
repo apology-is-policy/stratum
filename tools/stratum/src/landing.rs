@@ -128,8 +128,18 @@ fn prompt_new() -> Result<()> {
         crate::spawn::tell(format_args!("stratum: {e}"));
         return Ok(());
     }
-    if path.exists() {
-        crate::spawn::tell(format_args!("stratum: {} already exists; refusing to overwrite", path.display()));
+    // A key already at its key name would be refused by mkfs only after the passphrase, typed
+    // twice; one that links to nothing is mkfs's to judge, as the user's own decides where it goes.
+    let key = PathBuf::from(format!("{}.key", path.display()));
+    let taken = if path.symlink_metadata().is_ok() {
+        Some(&path)
+    } else if key.exists() {
+        Some(&key)
+    } else {
+        None
+    };
+    if let Some(taken) = taken {
+        crate::spawn::tell(format_args!("stratum: {} already exists; refusing to overwrite", taken.display()));
         return Ok(());
     }
 
@@ -183,7 +193,7 @@ fn prompt_new() -> Result<()> {
         let mut buf = Vec::with_capacity(pass.len() + 1);
         buf.extend_from_slice(pass.as_bytes());
         buf.push(b'\n');
-        let wrote = sin.write_all(&buf);
+        let wrote = crate::passphrase::hand_over(&mut sin, &buf);
         for b in buf.iter_mut() {
             unsafe { std::ptr::write_volatile(b as *mut u8, 0); }
         }
@@ -265,8 +275,8 @@ fn add_to_recents(path: &Path) {
     // names the volume from anywhere, and otherwise none.
     let canonical = match path.canonicalize() {
         Ok(c) if crate::embed::refuse_unprintable("volume", &c).is_ok() => c,
-        Ok(_) if !path.is_absolute() => return,
-        _ => path.to_path_buf(),
+        Ok(_) if path.is_absolute() => path.to_path_buf(),
+        _ => return,
     };
     existing.retain(|p| p != &canonical);
     existing.insert(0, canonical);

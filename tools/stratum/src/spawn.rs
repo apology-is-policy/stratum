@@ -357,12 +357,11 @@ impl SpawnCtx {
             .with_context(|| format!("spawn stratumd for {}", volume.display()))?;
 
         if let Some(pw) = passphrase {
-            use std::io::Write as _;
             if let Some(mut sin) = child.stdin.take() {
                 let mut buf = Vec::with_capacity(pw.len() + 1);
                 buf.extend_from_slice(pw);
                 buf.push(b'\n');
-                let wr = sin.write_all(&buf);
+                let wr = crate::passphrase::hand_over(&mut sin, &buf);
                 // Wipe the duplicate write buffer immediately —
                 // matches embed.rs's posture for pre-TUI prompt.
                 for b in buf.iter_mut() {

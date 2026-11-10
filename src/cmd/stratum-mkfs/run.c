@@ -99,12 +99,16 @@ static void usage(void)
 "  --size SIZE      Image size with K/M/G suffix. Default: 64M.\n"
 "  --force          Format over what is already at IMAGE, and with\n"
 "                   --passphrase-stdin replace an existing keyfile. Whatever\n"
-"                   they held is gone. Never overrides a daemon using IMAGE,\n"
-"                   and a format cannot shrink a file: --size must reach it.\n"
+"                   they held is gone. Also follows a key link another user\n"
+"                   owns, and uses a keyfile that is not the user's alone.\n"
+"                   Never overrides a daemon using IMAGE, and a format\n"
+"                   cannot shrink a file: --size must reach it.\n"
 "  --keyfile PATH   Path to read/write the PQ-hybrid keyfile.\n"
-"                   If file exists, it's used as-is, or with\n"
-"                   --passphrase-stdin refused without --force. If missing,\n"
-"                   one is generated. Default: IMAGE.key.\n"
+"                   If file exists, it's used as-is when it is a file the\n"
+"                   user owns that no one else can read or write, or with\n"
+"                   --passphrase-stdin refused, unless --force. If missing,\n"
+"                   one is generated where its links point, if the user or\n"
+"                   root owns each. Default: IMAGE.key.\n"
 "  --passphrase-stdin  Read a passphrase line from stdin and use it to\n"
 "                   wrap the keyfile (KFP1 format). The passphrase is\n"
 "                   required at every stratumd open after this. Mutually\n"
@@ -230,6 +234,15 @@ static bool image_holds_data(int fd, bool *out)
 static const char *key_destination(const char *path, char *buf, size_t n, bool force,
                                    bool *refused);
 
+/* A key used as it is decides who can open the volume: one another user owns, or that
+ * others can read or write, is theirs as much as the user's. The corvus token is held
+ * to the same. */
+static bool key_is_the_users(const struct stat *st)
+{
+    return S_ISREG(st->st_mode) && st->st_uid == geteuid() &&
+           (st->st_mode & (S_IRWXG | S_IRWXO)) == 0;
+}
+
 /* Where another user's link would decide where the key goes. */
 static void say_link_refused(const char *keyfile_path)
 {
@@ -253,7 +266,15 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
         say_link_refused(keyfile_path);
         return true;
     }
-    if (force || !replaces_key || stat(keyfile_path, &st) != 0) return false;
+    if (force || stat(keyfile_path, &st) != 0) return false;
+    if (!replaces_key) {
+        if (key_is_the_users(&st)) return false;
+        fprintf(stderr,
+            "stratum-mkfs: keyfile %s is not the user's alone: another user owns it, or "
+            "others can read or write it, and the volume would be theirs to open; pass "
+            "--force to use it\n", keyfile_path);
+        return true;
+    }
     fprintf(stderr,
         "stratum-mkfs: keyfile %s already exists, and replacing it loses any "
         "volume it opens; pass --force to replace it\n", keyfile_path);
@@ -360,7 +381,13 @@ static int take_key_name(const char *from, const char *to, bool force)
 static bool link_is_trusted(const char *link)
 {
     struct stat st;
-    return lstat(link, &st) == 0 && (st.st_uid == geteuid() || st.st_uid == 0);
+    if (lstat(link, &st) != 0) return false;
+    if (st.st_uid == geteuid()) return true;
+#if !defined(__thylacine__)
+    /* Thylacine has no root: uid 0 is its invalid principal. */
+    if (st.st_uid == 0) return true;
+#endif
+    return false;
 }
 
 /* A key named through a symlink belongs where the link points: replacing the link
@@ -590,13 +617,19 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             goto cleanup;
         }
         key_is_new = true;
+    } else if (!have_pass && !force && !key_is_the_users(&st)) {
+        /* Made there since the claim. */
+        fprintf(stderr, "stratum-mkfs: keyfile %s is not the user's alone; pass --force to use it\n",
+                keyfile_path);
+        exit_code = 1;
+        goto cleanup;
     }
     if (key_is_new) {
         bool refused = false;
         key_target = key_destination(keyfile_path, key_target_buf, sizeof key_target_buf, force,
                                      &refused);
         if (!key_target && refused) {
-            /* Left there while the format ran. */
+            /* Left there since the claim. */
             say_link_refused(keyfile_path);
             key_is_new = false;
             exit_code = 1;

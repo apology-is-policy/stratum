@@ -43,6 +43,15 @@ pub fn is_keyfile_encrypted(path: &Path) -> Result<bool> {
     }
 }
 
+/// A passphrase line written to a child. One that has already exited, as mkfs does on a bad
+/// argument before it reads, is no error here: what it said says why.
+pub(crate) fn hand_over(to: &mut impl io::Write, line: &[u8]) -> io::Result<()> {
+    match to.write_all(line) {
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        wrote => wrote,
+    }
+}
+
 /// Wipes a secret typed into a String, including what was backspaced over.
 pub fn wipe_string(s: &mut String) {
     let v = unsafe { s.as_mut_vec() };
@@ -697,6 +706,20 @@ fn erase_char(buf: &mut Vec<u8>) {
         _ => buf.len().saturating_sub(1),
     };
     buf.truncate(keep);
+}
+
+#[cfg(test)]
+mod hand_over_tests {
+    /// A child that has gone takes no line, and that is left to what it said; one variable away,
+    /// a plain write to the same pipe is the error.
+    #[test]
+    fn a_child_gone_before_its_passphrase_is_no_error() {
+        let (r, mut w) = std::io::pipe().expect("pipe");
+        drop(r);
+        let plain = std::io::Write::write_all(&mut w, b"x\n");
+        assert_eq!(plain.map_err(|e| e.kind()), Err(std::io::ErrorKind::BrokenPipe), "it proves nothing");
+        assert!(super::hand_over(&mut w, b"x\n").is_ok());
+    }
 }
 
 #[cfg(test)]
