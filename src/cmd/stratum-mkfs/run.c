@@ -116,7 +116,8 @@ static void usage(void)
 "                   file the user owns whose mode gives no one else access\n"
 "                   (chmod go-rwx), or with --passphrase-stdin refused,\n"
 "                   unless --force. If missing, one is generated where its\n"
-"                   links point, if " LINK_OWNERS " owns each.\n"
+"                   links point, seven at most, if " LINK_OWNERS " owns\n"
+"                   each.\n"
 "                   Default: IMAGE.key.\n"
 "  --passphrase-stdin  Read a passphrase line from stdin and use it to\n"
 "                   wrap the keyfile (KFP1 format). The passphrase is\n"
@@ -252,7 +253,8 @@ static const char *key_not_the_users(const struct stat *st)
     if (!S_ISREG(st->st_mode)) return "is not a regular file, so no key to use";
     if (st->st_uid != geteuid())
         return "belongs to another user, who could open any volume made with it: run as "
-               "its owner or make it the user's own, or pass --force to use it as it is";
+               "its owner or make it the user's own, or, if it can be read, pass --force to "
+               "use it as it is";
     if ((st->st_mode & (S_IRWXG | S_IRWXO)) != 0)
         return "can be read or written by others, going by its mode, and the volume "
                "would be theirs to open: chmod go-rwx it, or pass --force to use it as it is";
@@ -267,6 +269,14 @@ static void say_link_refused(const char *keyfile_path)
         "decide where the key goes; pass --force to follow it\n", keyfile_path);
 }
 
+/* Where the links at the key's name are more than are followed here. */
+static void say_links_too_many(const char *keyfile_path)
+{
+    fprintf(stderr,
+        "stratum-mkfs: keyfile %s is reached through more than seven links, or names a path "
+        "too long: name the key where they lead\n", keyfile_path);
+}
+
 /*
  * Formatting over a pool loses it, and over a pool's key loses it just as
  * surely, so neither happens by naming the wrong path. The claim is held until
@@ -278,8 +288,14 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
     struct stat st;
     char dest[4096];
     bool refused = false;
-    if (!key_destination(keyfile_path, dest, sizeof dest, force, &refused) && refused) {
+    const char *leads_to = key_destination(keyfile_path, dest, sizeof dest, force, &refused);
+    if (!leads_to && refused) {
         say_link_refused(keyfile_path);
+        return true;
+    }
+    /* Past where that gives up, the stat below would follow links nobody asked about. */
+    if (!leads_to && !force) {
+        say_links_too_many(keyfile_path);
         return true;
     }
     if (force || stat(keyfile_path, &st) != 0) return false;
@@ -408,8 +424,8 @@ static bool link_is_trusted(const char *link)
 }
 
 /* A key named through a symlink belongs where the link points: replacing the link
- * would leave it beside the volume instead. NULL for a loop or a path too long, and,
- * with *refused set, for a link another user owns, unless forced. */
+ * would leave it beside the volume instead. NULL past seven links or for a path too
+ * long, and, with *refused set, for a link another user owns, unless forced. */
 static const char *key_destination(const char *path, char *buf, size_t n, bool force,
                                    bool *refused)
 {
@@ -652,8 +668,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             goto cleanup;
         }
         if (!key_target) {
-            fprintf(stderr, "stratum-mkfs: %s is a loop of links, or names a path too long\n",
-                    keyfile_path);
+            say_links_too_many(keyfile_path);
             key_is_new = false;
             exit_code = 1;
             goto cleanup;

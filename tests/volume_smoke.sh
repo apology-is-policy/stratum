@@ -23,10 +23,10 @@ cleanup() {
 trap cleanup EXIT
 
 ok() { echo "ok: $*"; }
-# A group of checks this run could not make: said where it is skipped and again at the end, so a
-# run that skipped is not read as one that checked.
+# A group of checks this run could not make: said where it is skipped and counted at the end, so a
+# run that skipped is not read as one that checked. A note that is not a skip does not say "skipped".
 SKIPPED=0
-skipped() { echo "note: $*"; SKIPPED=$((SKIPPED + 1)); }
+skipped() { echo "note: skipped: $*"; SKIPPED=$((SKIPPED + 1)); }
 no() { echo "FAIL: $*"; BAD=1; }
 
 serve() {
@@ -137,7 +137,7 @@ if [ -w /dev/full ]; then
         ok "a read whose output fails is refused"
     fi
 else
-    echo "note: no /dev/full here, so a read into a full disk is not tried"
+    echo "note: no /dev/full here: the size limit below tries the same"
 fi
 # The same anywhere: with no room for a byte and SIGXFSZ ignored, every write fails.
 if ( trap '' XFSZ; ulimit -f 0; F read /keepme.txt > "$D/capped" ) 2> "$D/rc.log"; then
@@ -238,6 +238,7 @@ else
 fi
 # Over an image that is there the key is asked about before the image is read, which on an empty
 # disk is all of it: own.stm holds data now, and the key's refusal still comes first.
+[ -s "$D/own.stm" ] || no "own.stm is not there: the order proves nothing"
 chmod 644 "$D/raw.stm.key"
 "$B" mkfs "$D/own.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$D/own.log" 2>&1
 rc=$?
@@ -257,6 +258,23 @@ else
     no "a directory at the key's name: rc=$rc: $(tail -1 "$D/dirkey.log"); image left: $([ -e "$D/dirkey.stm" ] && echo yes || echo no)"
 fi
 
+# The links at the key's name are asked about one by one, seven at most. More than that are refused, not
+# left for a stat to follow unasked: eight of the user's own, to a key of the user's own, and seven, the
+# control, which are followed.
+ln -s "$D/raw.stm.key" "$D/hop8"
+for i in 7 6 5 4 3 2 1; do ln -s "$D/hop$((i + 1))" "$D/hop$i"; done
+"$B" mkfs "$D/chained.stm" --size 64M --keyfile "$D/hop1" < /dev/null > "$D/chained.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ] && LC_ALL=C grep -q '^stratum-mkfs: keyfile .* is reached through more than seven links' "$D/chained.log" && [ ! -e "$D/chained.stm" ]; then
+    ok "a key behind eight links is refused before anything is made, and says why"
+else
+    no "a key behind eight links: rc=$rc: $(tail -1 "$D/chained.log"); image left: $([ -e "$D/chained.stm" ] && echo yes || echo no)"
+fi
+if "$B" mkfs "$D/chained7.stm" --size 64M --keyfile "$D/hop2" < /dev/null > "$D/chained7.log" 2>&1 && [ -s "$D/chained7.stm" ]; then
+    ok "a key behind seven links of the user's own is used"
+else
+    no "a key behind seven links of the user's own: $(tail -1 "$D/chained7.log")"
+fi
 # A link another user owns does not decide where the key goes: in a shared sticky directory whoever left
 # it would hold the key, which the kernel's protected_symlinks keeps from a path it follows itself, and
 # mkfs reads the links itself. Refused with a passphrase and without; --force, the control, follows it,
@@ -280,6 +298,9 @@ else
     cp "$D/raw.stm.key" "$D/theirs.key"
     chmod 600 "$D/theirs.key"
     $as chown nobody "$D/theirs.key"
+    if [ "$(stat -c %u "$D/theirs.key" 2>/dev/null || stat -f %u "$D/theirs.key")" = "$(id -u)" ]; then
+        no "theirs.key is still the user's: it proves nothing"
+    fi
     "$B" mkfs "$D/owned.stm" --size 64M --keyfile "$D/theirs.key" < /dev/null > "$D/owned.log" 2>&1
     rc=$?
     if [ "$rc" != 0 ] && LC_ALL=C grep -q '^stratum-mkfs: keyfile .* belongs to another user' "$D/owned.log" && [ ! -e "$D/owned.stm" ]; then
@@ -536,5 +557,5 @@ cmp -s "$D/out" "$D/host/a.txt" && ok "a move held past a remount" || no "the mo
 if F read /in/host/deep/er/b.txt > "$D/out" 2>/dev/null; then no "a removed file came back"; else ok "a removal held past a remount"; fi
 stop
 
-[ "$SKIPPED" = 0 ] || echo "skipped: $SKIPPED group(s) of checks this run could not make (the notes above say which)"
+[ "$SKIPPED" = 0 ] || echo "skipped: $SKIPPED group(s) of checks this run could not make (each a \"note: skipped:\" line above)"
 exit $BAD

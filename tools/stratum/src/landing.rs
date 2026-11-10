@@ -383,7 +383,7 @@ fn mkfs_end_message(
 }
 
 /// Where mkfs makes the key it names `key`, as its key_destination finds it: through up to
-/// eight symlinks, a relative target read beside its link.
+/// seven symlinks, a relative target read beside its link.
 fn key_destination(key: &Path) -> PathBuf {
     let mut here = key.to_path_buf();
     for _ in 0..8 {
