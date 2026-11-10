@@ -462,9 +462,9 @@ static SCREEN_ON: AtomicBool = AtomicBool::new(false);
 /// continued fails with EINTR on macOS, and crossterm keeps its saved mode then, so it is
 /// tried again.
 fn leave_screen(out: &mut impl io::Write) {
-    // What crossterm was never told of would be the shell's next input: the rest of a paste
-    // run as commands.
-    if INPUT_STUCK.swap(false, Ordering::Relaxed) {
+    // What still waits was typed to the screen, and would be the shell's next input: the rest
+    // of a paste run as commands. Before the screen was on, nothing had read for it.
+    if SCREEN_ON.load(Ordering::Relaxed) {
         unsafe { libc::tcflush(0, libc::TCIFLUSH) };
     }
     while disable_raw_mode().is_err_and(|e| e.kind() == io::ErrorKind::Interrupted) {}
@@ -541,10 +541,7 @@ fn input_waiting(input: Option<RawFd>, tty: Option<i32>, timeout: Duration) -> i
     let start = Instant::now();
     let mut ready = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
     match unsafe { libc::poll(&mut ready, 1, poll_ms(timeout)) } {
-        0 => {
-            INPUT_STUCK.store(false, Ordering::Relaxed);
-            return Ok(false);
-        }
+        0 => return Ok(false),
         n if n < 0 => {
             let e = io::Error::last_os_error();
             return if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) };
@@ -564,7 +561,6 @@ fn input_waiting(input: Option<RawFd>, tty: Option<i32>, timeout: Duration) -> i
     // again only when more come; on macOS a key typed while the terminal was canonical is moved
     // by the mode change without a wakeup. This poll answers at once for as long as they wait,
     // so the rest of the tick is waited out rather than spin; a signal still ends it.
-    INPUT_STUCK.store(true, Ordering::Relaxed);
     let left = timeout.saturating_sub(start.elapsed());
     if !left.is_zero() {
         unsafe { libc::poll(std::ptr::null_mut(), 0, poll_ms(left)) };
@@ -590,13 +586,11 @@ impl OwnInput {
     fn take() -> Option<OwnInput> {
         use std::os::fd::FromRawFd;
         let mut name = [0 as libc::c_char; 1024];
-        let path: &std::ffi::CStr = if unsafe { libc::isatty(0) } == 1 {
-            if unsafe { libc::ttyname_r(0, name.as_mut_ptr(), name.len()) } != 0 {
-                return None;
-            }
-            unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        let path: Option<&std::ffi::CStr> = if unsafe { libc::isatty(0) } == 1 {
+            (unsafe { libc::ttyname_r(0, name.as_mut_ptr(), name.len()) } == 0)
+                .then(|| unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) })
         } else {
-            c"/dev/tty"
+            Some(c"/dev/tty")
         };
         // Without a copy to put back, standard input stays as it is.
         let saved = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
@@ -606,10 +600,11 @@ impl OwnInput {
         let saved = unsafe { std::os::fd::OwnedFd::from_raw_fd(saved) };
         let flags = libc::O_RDWR | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
         #[allow(unused_mut)]
-        let mut fd = unsafe { libc::open(path.as_ptr(), flags) };
-        // The terminal's node is not ours to open after su to another user; /dev/tty is the
-        // same terminal when standard input's is the controlling one. kqueue cannot watch
-        // /dev/tty, so on macOS standard input stays as it is then (T0.78).
+        let mut fd = path.map_or(-1, |p| unsafe { libc::open(p.as_ptr(), flags) });
+        // The terminal's node is not ours to open after su to another user, and has no name
+        // where devpts is another mount's; /dev/tty is the same terminal when standard input's
+        // is the controlling one. kqueue cannot watch /dev/tty, so on macOS standard input
+        // stays as it is then (T0.78).
         #[cfg(target_os = "linux")]
         if fd < 0 && unsafe { libc::isatty(0) == 1 && libc::tcgetsid(0) == libc::getsid(0) } {
             fd = unsafe { libc::open(c"/dev/tty".as_ptr(), flags) };
@@ -631,8 +626,6 @@ impl Drop for OwnInput {
 }
 
 static SUSPEND_ASKED: AtomicBool = AtomicBool::new(false);
-/// Input waits on the terminal that crossterm has not been told of (T5.19).
-static INPUT_STUCK: AtomicBool = AtomicBool::new(false);
 static CONTINUED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn ask_to_suspend(_: libc::c_int) {

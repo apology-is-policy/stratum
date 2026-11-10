@@ -592,9 +592,6 @@ fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigse
     Ok(())
 }
 
-/// Starts a daemon with SIGTTOU blocked, which it keeps across exec. In a process group of
-/// its own it is never in front, and in headless mode its stderr is the terminal: under
-/// `stty tostop` its first write there would stop it for good, and the session with it.
 /// A path holding a control character, or not UTF-8, is opened nowhere, as the panels act on no
 /// such name: the daemons write the paths they are given to the terminal as they are.
 pub(crate) fn refuse_unprintable(what: &str, p: &Path) -> Result<()> {
@@ -607,6 +604,9 @@ pub(crate) fn refuse_unprintable(what: &str, p: &Path) -> Result<()> {
     }
 }
 
+/// Starts a daemon with SIGTTOU blocked, which it keeps across exec. In a process group of
+/// its own it is never in front, and in headless mode its stderr is the terminal: under
+/// `stty tostop` its first write there would stop it for good, and the session with it.
 fn spawn_daemon(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     let mut ttou: libc::sigset_t = unsafe { std::mem::zeroed() };
     let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };

@@ -65,13 +65,13 @@ pub fn run() -> Result<()> {
         s if s.parse::<usize>().is_ok() => {
             let idx: usize = s.parse().unwrap();
             if idx == 0 || idx > recents.len() {
-                eprintln!("stratum: out-of-range recent index: {s}");
+                crate::spawn::tell(format_args!("stratum: out-of-range recent index: {s}"));
                 return Ok(());
             }
             open_volume(&recents[idx - 1])
         }
         other => {
-            eprintln!("stratum: unrecognized choice: {}", crate::ui::sanitize_for_display(other));
+            crate::spawn::tell(format_args!("stratum: unrecognized choice: {other}"));
             Ok(())
         }
     }
@@ -104,7 +104,7 @@ fn prompt_open(recents: &[PathBuf]) -> Result<()> {
     }
     let path = if let Ok(idx) = trimmed.parse::<usize>() {
         if idx == 0 || idx > recents.len() {
-            eprintln!("stratum: out-of-range recent index: {trimmed}");
+            crate::spawn::tell(format_args!("stratum: out-of-range recent index: {trimmed}"));
             return Ok(());
         }
         recents[idx - 1].clone()
@@ -125,11 +125,11 @@ fn prompt_new() -> Result<()> {
     }
     let path = PathBuf::from(trimmed);
     if let Err(e) = crate::embed::refuse_unprintable("volume", &path) {
-        eprintln!("stratum: {e}");
+        crate::spawn::tell(format_args!("stratum: {e}"));
         return Ok(());
     }
     if path.exists() {
-        eprintln!("stratum: {} already exists; refusing to overwrite", path.display());
+        crate::spawn::tell(format_args!("stratum: {} already exists; refusing to overwrite", path.display()));
         return Ok(());
     }
 
@@ -158,7 +158,7 @@ fn prompt_new() -> Result<()> {
         bail!("asked to stop at the passphrase prompt");
     }
     if pass.as_bytes() != again.as_bytes() {
-        eprintln!("stratum: the two passphrases differ; nothing was created");
+        crate::spawn::tell(format_args!("stratum: the two passphrases differ; nothing was created"));
         return Ok(());
     }
     drop(again);
@@ -201,7 +201,8 @@ fn prompt_new() -> Result<()> {
     }
     if !status.success() {
         drop(held);
-        eprintln!("stratum: {}", mkfs_end_message(&path, status, &said, mkfs_pid, key_before, false));
+        // mkfs's words name what a link points at, which the check on the path typed never saw.
+        crate::spawn::tell(format_args!("stratum: {}", mkfs_end_message(&path, status, &said, mkfs_pid, key_before, false)));
         return Ok(());
     }
     // The manager's own prompt reads the mode next, and must find it as it was.
@@ -211,7 +212,16 @@ fn prompt_new() -> Result<()> {
     if crate::tui::stop_asked() {
         bail!("asked to stop: {} was made, and was not opened", path.display());
     }
-    println!("              Created {}. Keep {}.key beside it.", path.display(), path.display());
+    let shown = crate::ui::sanitize_for_display(&path.display().to_string());
+    let key = PathBuf::from(format!("{}.key", path.display()));
+    let dest = key_destination(&key);
+    if dest == key {
+        println!("              Created {shown}. Keep {shown}.key beside it.");
+    } else {
+        // What sits beside the volume is the link; the key is where it points.
+        let dest = crate::ui::sanitize_for_display(&dest.display().to_string());
+        println!("              Created {shown}. Its key is {dest}, where {shown}.key points: keep both.");
+    }
     open_volume(&path)
 }
 
@@ -251,7 +261,13 @@ fn add_to_recents(path: &Path) {
     let _ = fs::create_dir_all(&d);
     let recents_path = d.join("recents");
     let mut existing = recent_volumes();
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Where a link or a directory on the way holds a control character, the path as given if it
+    // names the volume from anywhere, and otherwise none.
+    let canonical = match path.canonicalize() {
+        Ok(c) if crate::embed::refuse_unprintable("volume", &c).is_ok() => c,
+        Ok(_) if !path.is_absolute() => return,
+        _ => path.to_path_buf(),
+    };
     existing.retain(|p| p != &canonical);
     existing.insert(0, canonical);
     existing.truncate(10);

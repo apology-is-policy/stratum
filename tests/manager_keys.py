@@ -1764,27 +1764,31 @@ def leftover_input_leg(stratum, root):
     """Input crossterm was never told of (T5.19) must not become the shell's when the screen
     ends, where the rest of a paste would run as commands: a TERM ends the screen with input
     stuck, and the job shell then reads what the terminal still holds. The two ways to stuck
-    input of input_spin_leg; each first shows its input stuck, or notes it cannot be here."""
+    input of input_spin_leg; each first shows its input stuck, or notes it cannot be here.
+    Then a paste whose first read holds the quit key: the screen ends while crossterm still has
+    events of that read, before its wait could find anything stuck."""
     w = f'{root}/leftover-host'
     os.makedirs(w, exist_ok=True)
     with open(f'{w}/onefile.txt', 'w') as f:
         f.write('one\n')
 
-    def start(how):
+    def start(how, dialog=True):
         term = Term([sys.executable, '-I', '-c', JOB_SHELL, '--read-after', stratum, 'tui', '--host', w])
         term.expect(r'onefile\.txt', timeout=30)
-        term.send(F7)
-        term.expect(r'New directory name')
+        if dialog:
+            term.send(F7)
+            term.expect(r'New directory name')
         wait_quiet(term, how)
         manager = child_running(term.pid, 'tui')
         if manager is None:
             raise Failure(f'{how}: no manager under the job shell: it proves nothing')
         return term, manager
 
-    def left_at_the_end(term, how, manager):
-        # A tick or more for the screen's wait to find it stuck.
-        term.pump(0.5)
-        os.kill(manager, signal.SIGTERM)
+    def left_at_the_end(term, how, manager, ended_by=signal.SIGTERM):
+        if ended_by:
+            # A tick or more for the screen's wait to find it stuck.
+            term.pump(0.5)
+            os.kill(manager, ended_by)
         if not wait_until(term, lambda: re.search(rb'\[left \d+\]', bytes(term.raw)), 15):
             raise Failure(f'{how}: the job shell never said what was left: it proves nothing')
         left = int(re.search(rb'\[left (\d+)\]', bytes(term.raw)).group(1))
@@ -1823,6 +1827,21 @@ def leftover_input_leg(stratum, root):
             if field_count(term) >= taken:
                 raise Failure(f'{how}: the field holds all {taken} bytes, so nothing is stuck: it proves nothing')
             left_at_the_end(term, how, manager)
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    how = 'Ctrl-Q and 2999 bytes at once in the panels'
+    term, manager = start(how, dialog=False)
+    try:
+        taken = paste(term, b'\x11' + b'a' * 2999)
+        if taken <= 1024:
+            print(f'note: {how}: the terminal took {taken} bytes, one read for crossterm, so nothing is stuck', flush=True)
+        else:
+            # The quit key ends the screen itself; the shell's report shows that it did.
+            left_at_the_end(term, how, manager, ended_by=None)
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -1872,6 +1891,9 @@ def escape_prefix_leg(stratum, root):
     how = 'ESC O, then TERM, the terminal node shut'
     if not sys.platform.startswith('linux'):
         print(f'note: {how}: Linux only, where /dev/tty stands in for the node', flush=True)
+        return
+    if os.geteuid() == 0:
+        print(f'note: {how}: root opens any node, so the fallback is never reached', flush=True)
         return
     term = Term(['/bin/sh', '-c', 't=$(tty); chmod 000 "$t"; [ -r "$t" ] || echo node-shut; exec "$0" tui --host "$1"',
                  stratum, w])
@@ -1929,7 +1951,9 @@ def unprintable_volume_leg(stratum, vol, host, root):
     """A volume whose name holds a control character is opened nowhere, and nothing said about
     it sends that character to the terminal: not the passphrase prompt, not an error. The same
     volume under a plain name prompts, one variable away. The landing screen's New refuses such
-    a path too."""
+    a path too, and shows mkfs's own words filtered; main's report of an error is filtered; a
+    name that is not UTF-8 is refused, not a panic; and the recent list keeps a path as given
+    where its canonical form holds a control character."""
     d = f'{root}/unprintable'
     os.makedirs(d, exist_ok=True)
     plain, hostile = f'{d}/plain.stm', f'{d}/x\x1b]2;PWNED\x07.stm'
@@ -2026,6 +2050,111 @@ def unprintable_volume_leg(stratum, vol, host, root):
         refused = wait_until(term, lambda: b'holds a control character' in bytes(term.raw), 10)
         record(refused and clean(term), f'{how}: refused, and the terminal got none of its controls',
                f'{how}: refused={refused}, controls kept from the terminal={clean(term)}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    # New with a plain path, where mkfs's own words carry the controls: a size it refuses, which
+    # it repeats, and a key name that is a link to nothing, whose target mkfs would name.
+    os.symlink(f'{d}/missing\x1b]2;PWNED\x07/k', f'{d}/linked.stm.key')
+    for how, name, size, says in (
+            ("the landing screen's New, a size with an OSC", 'sized.stm', b'1\x1b]2;PWNED\x07', b'bad --size'),
+            ("the landing screen's New, a key name linked to a path with an OSC", 'linked.stm', b'64M',
+             b'cannot make')):
+        term = Term([stratum])
+        try:
+            term.expect(r'Choose \[')
+            term.send(b'n' + ENTER)
+            term.expect(r'New volume path')
+            term.send(f'{d}/{name}'.encode() + ENTER)
+            term.expect(r'Size')
+            term.send(size + ENTER)
+            term.expect(r'Passphrase:')
+            term.send(PASS.encode() + ENTER)
+            term.expect(r'Passphrase again')
+            term.send(PASS.encode() + ENTER)
+            failed = wait_until(term, lambda: b'mkfs failed' in bytes(term.raw), 60)
+            said = says in bytes(term.raw)
+            left = os.path.lexists(f'{d}/{name}')
+            record(failed and said and not left and clean(term),
+                   f'{how}: mkfs failed, made nothing, and the terminal got none of its controls',
+                   f'{how}: mkfs failed={failed}, said {says!r}={said}, left the image={left}, '
+                   f'controls kept from the terminal={clean(term)}')
+        except Failure:
+            print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+            raise
+        finally:
+            term.kill()
+
+    # main's own report of an error, where no refusal has escaped the text first.
+    how = 'an unknown argument with an OSC'
+    term = Term([stratum, 'tui', '\x1b]2;PWNED\x07'])
+    try:
+        ended = term.exited(30)
+        said = b'unknown argument' in bytes(term.raw)
+        record(ended and said and clean(term), f'{how}: refused, and the terminal got none of its controls',
+               f'{how}: ended={ended} said so={said}, controls kept from the terminal={clean(term)}')
+    finally:
+        term.kill()
+
+    # A name that is not UTF-8 reaches the refusal, rather than a panic in reading the arguments.
+    how = 'a volume named in Latin-1'
+    term = Term([stratum, 'tui', '--vol', os.fsdecode(b'caf\xe9.stm'), '--host', host])
+    try:
+        ended = term.exited(30)
+        sent = bytes(term.raw)
+        refused = b'not UTF-8' in sent and b'panicked' not in sent
+        record(ended and term.rc == 1 and refused, f'{how}: refused as not UTF-8, without a panic',
+               f'{how}: ended={ended} rc={term.rc}, refused without a panic={refused}')
+    finally:
+        term.kill()
+
+    # The recent list keeps the path as given where its canonical form holds a control character:
+    # a plain link to a file in a directory named with an OSC, opened through the landing screen.
+    how = 'the landing screen, a plain link into a directory named with an OSC'
+    via = f'{d}/via\x1b]2;PWNED\x07'
+    os.makedirs(via, exist_ok=True)
+    try:
+        os.link(vol.v, f'{via}/v.stm')
+    except OSError:
+        shutil.copyfile(vol.v, f'{via}/v.stm')
+    os.symlink(f'{via}/v.stm', f'{d}/viadir.stm')
+    os.symlink(vol.v + '.key', f'{d}/viadir.stm.key')
+    with open(recents, 'w', encoding='utf-8') as f:
+        f.write('')
+    term = Term([stratum])
+    try:
+        term.expect(r'Choose \[')
+        term.send(b'o' + ENTER)
+        term.expect(r'Volume path')
+        term.send(f'{d}/viadir.stm'.encode() + ENTER)
+        term.expect(r'Passphrase for viadir\.stm', timeout=30)
+        with open(recents, encoding='utf-8') as f:
+            kept = f.read()
+        record('viadir.stm' in kept and '\x1b' not in kept, f'{how}: kept as given, with no control character',
+               f'{how}: the recent list holds {kept!r}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+    # Typed relative inside that directory: every form that names it from elsewhere holds the OSC.
+    how = 'the landing screen, a relative name in a directory named with an OSC'
+    os.symlink(vol.v + '.key', f'{via}/v.stm.key')
+    with open(recents, 'w', encoding='utf-8') as f:
+        f.write('')
+    term = Term(['/bin/sh', '-c', 'cd "$1" && exec "$0"', stratum, via])
+    try:
+        term.expect(r'Choose \[')
+        term.send(b'o' + ENTER)
+        term.expect(r'Volume path')
+        term.send(b'v.stm' + ENTER)
+        term.expect(r'Passphrase for v\.stm', timeout=30)
+        with open(recents, encoding='utf-8') as f:
+            kept = f.read()
+        record(kept == '', f'{how}: kept nowhere', f'{how}: the recent list holds {kept!r}')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -2288,7 +2417,8 @@ def wizard_legs(stratum, vol, root):
 
 
 def landing_legs(stratum, root):
-    """`stratum` with no arguments, with a recent path whose 38th byte falls inside a character."""
+    """`stratum` with no arguments, with a recent path whose 38th byte falls inside a character;
+    New over a key name linked by the user elsewhere says where the key went."""
     config = f'{os.environ["HOME"]}/.config/stratum'
     os.makedirs(config, exist_ok=True)
     with open(f'{config}/recents', 'w', encoding='utf-8') as f:
@@ -2304,6 +2434,10 @@ def landing_legs(stratum, root):
         if not drew:
             return
         path = f'{root}/landing.stm'
+        # The key named through a link of the user's own: made where it points, and said so.
+        keys = f'{root}/landing-keys'
+        os.makedirs(keys, exist_ok=True)
+        os.symlink(f'{keys}/landing.stm.key', path + '.key')
         term.send(b'n' + ENTER)
         term.expect(r'New volume path')
         term.send(path.encode() + ENTER)
@@ -2318,6 +2452,10 @@ def landing_legs(stratum, root):
         term.expect(r'Passphrase again')
         term.send(PASS.encode() + ENTER)
         term.expect(r'Passphrase for', timeout=60)
+        said = b'Its key is ' + keys.encode() in bytes(term.raw)
+        made = os.path.islink(path + '.key') and os.path.getsize(f'{keys}/landing.stm.key') > 0
+        record(said and made, "the landing screen's New over a key link made the key where it points, and said so",
+               f"the landing screen's New over a key link: said where={said}, key made there={made}")
         term.send(PASS.encode() + ENTER)
         # The screen's key row: a key sent before the screen has the terminal is dropped with
         # what was typed while the key was derived.

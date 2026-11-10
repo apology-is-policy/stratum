@@ -227,6 +227,17 @@ static bool image_holds_data(int fd, bool *out)
     }
 }
 
+static const char *key_destination(const char *path, char *buf, size_t n, bool force,
+                                   bool *refused);
+
+/* Where another user's link would decide where the key goes. */
+static void say_link_refused(const char *keyfile_path)
+{
+    fprintf(stderr,
+        "stratum-mkfs: keyfile %s is reached through a symlink another user owns, who would "
+        "decide where the key goes; pass --force to follow it\n", keyfile_path);
+}
+
 /*
  * Formatting over a pool loses it, and over a pool's key loses it just as
  * surely, so neither happens by naming the wrong path. The claim is held until
@@ -236,6 +247,12 @@ static bool image_holds_data(int fd, bool *out)
 static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool force)
 {
     struct stat st;
+    char dest[4096];
+    bool refused = false;
+    if (!key_destination(keyfile_path, dest, sizeof dest, force, &refused) && refused) {
+        say_link_refused(keyfile_path);
+        return true;
+    }
     if (force || !replaces_key || stat(keyfile_path, &st) != 0) return false;
     fprintf(stderr,
         "stratum-mkfs: keyfile %s already exists, and replacing it loses any "
@@ -336,11 +353,24 @@ static int take_key_name(const char *from, const char *to, bool force)
     return no_links ? rename(from, to) : -1;
 }
 
+/* Whether a link is one only its owner, the user, or root controls. The links on the
+ * key's way are read here, so the kernel's protected_symlinks, which refuses to
+ * follow another user's link in a shared sticky directory, never asks: there whoever
+ * left the link would hold the key, and the volume is lost with it. */
+static bool link_is_trusted(const char *link)
+{
+    struct stat st;
+    return lstat(link, &st) == 0 && (st.st_uid == geteuid() || st.st_uid == 0);
+}
+
 /* A key named through a symlink belongs where the link points: replacing the link
- * would leave it beside the volume instead. NULL for a loop or a path too long. */
-static const char *key_destination(const char *path, char *buf, size_t n)
+ * would leave it beside the volume instead. NULL for a loop or a path too long, and,
+ * with *refused set, for a link another user owns, unless forced. */
+static const char *key_destination(const char *path, char *buf, size_t n, bool force,
+                                   bool *refused)
 {
     char here[4096];
+    *refused = false;
     if (snprintf(here, sizeof here, "%s", path) >= (int)sizeof here) return NULL;
     for (int hops = 0; hops < 8; hops++) {
         char target[4096];
@@ -348,6 +378,10 @@ static const char *key_destination(const char *path, char *buf, size_t n)
         if (len < 0) {
             if (snprintf(buf, n, "%s", here) >= (int)n) return NULL;
             return buf;
+        }
+        if (!force && !link_is_trusted(here)) {
+            *refused = true;
+            return NULL;
         }
         target[len] = '\0';
         const char *slash = strrchr(here, '/');
@@ -558,7 +592,16 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         key_is_new = true;
     }
     if (key_is_new) {
-        key_target = key_destination(keyfile_path, key_target_buf, sizeof key_target_buf);
+        bool refused = false;
+        key_target = key_destination(keyfile_path, key_target_buf, sizeof key_target_buf, force,
+                                     &refused);
+        if (!key_target && refused) {
+            /* Left there while the format ran. */
+            say_link_refused(keyfile_path);
+            key_is_new = false;
+            exit_code = 1;
+            goto cleanup;
+        }
         if (!key_target) {
             fprintf(stderr, "stratum-mkfs: %s is a loop of links, or names a path too long\n",
                     keyfile_path);

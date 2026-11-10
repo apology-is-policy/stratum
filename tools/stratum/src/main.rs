@@ -20,7 +20,8 @@
 //! of truth for their flags; rebranding would diverge the docs.
 
 use anyhow::{bail, Context, Result};
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 
@@ -44,20 +45,16 @@ mod volmap;
 fn main() {
     no_core_dumps();
     children_waited_for();
-    let args: Vec<String> = std::env::args().collect();
+    // A path need not be UTF-8, and std::env::args panics on one that is not.
+    let args: Vec<OsString> = std::env::args_os().collect();
     match dispatch(args) {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(e) => {
-            spawn::tell(format_args!("{}", error_report(&e)));
+            // What std prints for an error main returns; tell stands in for its controls.
+            spawn::tell(format_args!("Error: {e:?}"));
             std::process::exit(1);
         }
     }
-}
-
-/// What std prints for an error main returns, with control characters stood in for: a path in
-/// the chain, or a daemon's log line, can be anyone's text.
-fn error_report(e: &anyhow::Error) -> String {
-    ui::sanitize_for_display(&format!("Error: {e:?}"))
 }
 
 /// A core holds whatever passphrase or key the process has in memory, and a signal's default
@@ -83,14 +80,13 @@ fn children_waited_for() {
     unsafe { libc::sigaction(libc::SIGCHLD, &act, std::ptr::null_mut()) };
 }
 
-fn dispatch(args: Vec<String>) -> Result<i32> {
+fn dispatch(args: Vec<OsString>) -> Result<i32> {
     if args.len() < 2 {
         landing::run()?;
         return Ok(0);
     }
 
-    let sub = args[1].as_str();
-    match sub {
+    match args[1].to_str().unwrap_or_default() {
         "-h" | "--help" | "help" => {
             print_root_usage();
             Ok(0)
@@ -110,8 +106,8 @@ fn dispatch(args: Vec<String>) -> Result<i32> {
             lifeline::follow();
             ffi_dispatch("stratum-host-fs", &args[2..], ffi::stm_cmd_host_fs_main)
         }
-        other => {
-            bail!("stratum: unknown subcommand: {other}\n(see `stratum --help`)");
+        _ => {
+            bail!("stratum: unknown subcommand: {}\n(see `stratum --help`)", args[1].to_string_lossy());
         }
     }
 }
@@ -157,15 +153,10 @@ type CmdMain = unsafe extern "C" fn(c_int, *const *const c_char) -> c_int;
 /// across the FFI boundary (which is UB on stable Rust).
 /// R126 P3-5: argv.len() bound-checked against c_int range before
 /// the cast — prevents silent wrap on pathological argc.
-fn ffi_dispatch(argv0: &str, args: &[String], cmd_main: CmdMain) -> Result<i32> {
-    let mut full = Vec::with_capacity(args.len() + 1);
-    full.push(argv0.to_string());
-    for a in args {
-        full.push(a.clone());
-    }
-    let cstrs: Vec<CString> = full
-        .iter()
-        .map(|s| CString::new(s.clone()).map_err(|_| anyhow::anyhow!("argv contains NUL")))
+fn ffi_dispatch(argv0: &str, args: &[OsString], cmd_main: CmdMain) -> Result<i32> {
+    let cstrs: Vec<CString> = std::iter::once(argv0.as_bytes())
+        .chain(args.iter().map(|a| a.as_bytes()))
+        .map(|s| CString::new(s).map_err(|_| anyhow::anyhow!("argv contains NUL")))
         .collect::<Result<_>>()?;
     let argv: Vec<*const c_char> = cstrs.iter().map(|s| s.as_ptr()).collect();
     if argv.len() > c_int::MAX as usize {
@@ -174,7 +165,7 @@ fn ffi_dispatch(argv0: &str, args: &[String], cmd_main: CmdMain) -> Result<i32> 
     Ok(unsafe { cmd_main(argv.len() as c_int, argv.as_ptr()) })
 }
 
-fn tui_dispatch(args: &[String]) -> Result<i32> {
+fn tui_dispatch(args: &[OsString]) -> Result<i32> {
     let mut slate_sock: Option<PathBuf> = None;
     let mut attach: Option<PathBuf> = None;
     let mut vol: Option<PathBuf> = None;
@@ -185,8 +176,7 @@ fn tui_dispatch(args: &[String]) -> Result<i32> {
 
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
-        match a {
+        match args[i].to_str().unwrap_or_default() {
             "-h" | "--help" => {
                 print_root_usage();
                 return Ok(0);
@@ -218,7 +208,7 @@ fn tui_dispatch(args: &[String]) -> Result<i32> {
             "--headless" => {
                 headless = true;
             }
-            other => bail!("stratum tui: unknown argument: {other}"),
+            _ => bail!("stratum tui: unknown argument: {}", args[i].to_string_lossy()),
         }
         i += 1;
     }
@@ -327,7 +317,7 @@ mod tests {
     fn an_error_reaches_the_terminal_without_its_control_characters() {
         let e = anyhow::anyhow!("stratumd: wrong passphrase for x\u{1b}]2;t\u{7}.key")
             .context("stratumd failed to start\nstratumd log:\n  a\u{9b}2J");
-        let said = super::error_report(&e);
+        let said = crate::spawn::told(format_args!("Error: {e:?}"));
         assert!(!said.chars().any(|c| c.is_control() && c != '\n'), "{said:?}");
         assert!(said.starts_with("Error: ") && said.contains("x?]2;t?.key") && said.contains("a?2J"), "{said:?}");
     }

@@ -124,7 +124,16 @@ pub fn stop_child(child: &mut Child, name: &str) {
 /// pipe it wrote to has gone: the panic would skip the rest of the stop.
 pub(crate) fn tell(line: std::fmt::Arguments) {
     use std::io::Write as _;
-    let _ = writeln!(std::io::stderr(), "{line}");
+    let _ = writeln!(std::io::stderr(), "{}", told(line));
+}
+
+/// What `tell` writes: a path, a child's words or a daemon's log line can be anyone's text,
+/// so its control characters are stood in for, as on the screen.
+pub(crate) fn told(line: std::fmt::Arguments) -> String {
+    use std::fmt::Write as _;
+    let mut said = String::new();
+    let _ = said.write_fmt(line);
+    crate::ui::sanitize_for_display(&said)
 }
 
 pub struct SpawnCtx {

@@ -208,6 +208,42 @@ else
     no "the refusal over a key did not say why: $(tail -1 "$D/again.log")"
 fi
 [ "$(cksum < "$V.key")" = "$kh" ] && ok "another volume's key survives" || no "another volume's key was replaced"
+# A link another user owns does not decide where the key goes: in a shared sticky directory whoever left
+# it would hold the key, which the kernel's protected_symlinks keeps from a path it follows itself, and
+# mkfs reads the links itself. Refused with a passphrase and without; --force, the control, follows it,
+# as a link of the user's own is followed (below). Only root or sudo can give a link another owner.
+if [ "$(id -u)" = 0 ]; then as=""; elif sudo -n true 2>/dev/null; then as="sudo -n"; else as=none; fi
+if [ "$as" = none ]; then
+    echo "note: a key name that is another user's link: making one needs root or sudo without a password"
+else
+    mkdir "$D/theirs"
+    ln -s "$D/theirs/k" "$D/planted.stm.key"
+    $as chown -h nobody "$D/planted.stm.key"
+    if [ "$(stat -c %u "$D/planted.stm.key" 2>/dev/null || stat -f %u "$D/planted.stm.key")" = "$(id -u)" ]; then
+        no "the planted link is still the user's: it proves nothing"
+    fi
+    for how in "with a passphrase" "without one"; do
+        if [ "$how" = "with a passphrase" ]; then
+            printf '%s\n' other | "$B" mkfs "$D/planted.stm" --size 64M --passphrase-stdin > "$D/planted.log" 2>&1
+        else
+            "$B" mkfs "$D/planted.stm" --size 64M < /dev/null > "$D/planted.log" 2>&1
+        fi
+        rc=$?
+        if [ "$rc" != 0 ] && LC_ALL=C grep -q 'another user owns' "$D/planted.log"; then
+            ok "a key name that is another user's link is refused $how, and says why"
+        else
+            no "a key name that is another user's link $how: rc=$rc: $(tail -1 "$D/planted.log")"
+        fi
+        [ -z "$(ls -A "$D/theirs")" ] && [ ! -e "$D/planted.stm" ] && ok "that refusal $how made no key and no image" \
+            || no "a refused key link $how left: $(ls -A "$D/theirs" | tr '\n' ' ')$(ls "$D/planted.stm" 2>/dev/null)"
+    done
+    if printf '%s\n' other | "$B" mkfs "$D/planted.stm" --size 64M --force --passphrase-stdin > "$D/planted.log" 2>&1 \
+            && [ -s "$D/theirs/k" ]; then
+        ok "with --force the key is made where another user's link points"
+    else
+        no "--force over another user's key link: $(tail -1 "$D/planted.log")"
+    fi
+fi
 [ ! -e "$D/new.stm" ] && ok "that refusal left no empty image" || no "that refusal left an image behind"
 
 # A format cannot shrink a file. Asking for it must fail before any key is touched.
