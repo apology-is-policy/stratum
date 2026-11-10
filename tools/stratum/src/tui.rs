@@ -533,9 +533,9 @@ fn input_waiting(input: Option<RawFd>, tty: Option<i32>, timeout: Duration) -> i
     let Some(fd) = input else {
         return event::poll(timeout);
     };
+    let start = Instant::now();
     let mut ready = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-    let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
-    match unsafe { libc::poll(&mut ready, 1, ms) } {
+    match unsafe { libc::poll(&mut ready, 1, poll_ms(timeout)) } {
         0 => return Ok(false),
         n if n < 0 => {
             let e = io::Error::last_os_error();
@@ -545,7 +545,72 @@ fn input_waiting(input: Option<RawFd>, tty: Option<i32>, timeout: Duration) -> i
         _ if ready.revents & libc::POLLNVAL != 0 => return Err(io::Error::from_raw_os_error(libc::EBADF)),
         _ => {}
     }
-    Ok(may_touch_terminal(tty) && event::poll(Duration::ZERO)?)
+    if !may_touch_terminal(tty) {
+        return Ok(false);
+    }
+    if event::poll(Duration::ZERO)? {
+        return Ok(true);
+    }
+    // Input, or a hangup, that crossterm has nothing for. Its poll is edge-triggered and it reads
+    // 1024 bytes at most before handing back an event, so bytes past that read are reported to it
+    // again only when more come; on macOS a key typed while the terminal was canonical is moved
+    // by the mode change without a wakeup. This poll answers at once for as long as they wait,
+    // so the rest of the tick is waited out rather than spin; a signal still ends it.
+    let left = timeout.saturating_sub(start.elapsed());
+    if !left.is_zero() {
+        unsafe { libc::poll(std::ptr::null_mut(), 0, poll_ms(left)) };
+    }
+    Ok(false)
+}
+
+fn poll_ms(wait: Duration) -> libc::c_int {
+    libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX)
+}
+
+/// Standard input, for the screen's life, a descriptor of the terminal's own that does not
+/// block, the saved one put back after. crossterm reads standard input when it is a terminal,
+/// and after a sequence it cannot finish (ESC O, an Alt+O on many terminals) it reads again
+/// until one parses: on a blocking descriptor that read waits for more keys, and a stop asked
+/// waits behind it. A fresh open is a description of its own, so the shell's keeps its mode.
+struct OwnInput {
+    saved: std::os::fd::OwnedFd,
+}
+
+impl OwnInput {
+    /// The terminal standard input is, or else the controlling one, which crossterm would open.
+    fn take() -> Option<OwnInput> {
+        use std::os::fd::FromRawFd;
+        let mut name = [0 as libc::c_char; 1024];
+        let path: &std::ffi::CStr = if unsafe { libc::isatty(0) } == 1 {
+            if unsafe { libc::ttyname_r(0, name.as_mut_ptr(), name.len()) } != 0 {
+                return None;
+            }
+            unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        } else {
+            c"/dev/tty"
+        };
+        // Without a copy to put back, standard input stays as it is.
+        let saved = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+        if saved < 0 {
+            return None;
+        }
+        let saved = unsafe { std::os::fd::OwnedFd::from_raw_fd(saved) };
+        let flags = libc::O_RDWR | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        let fd = unsafe { libc::open(path.as_ptr(), flags) };
+        if fd < 0 {
+            return None;
+        }
+        // dup2 clears close-on-exec on fd 0, as standard input has it.
+        let moved = unsafe { libc::dup2(fd, 0) };
+        unsafe { libc::close(fd) };
+        (moved == 0).then_some(OwnInput { saved })
+    }
+}
+
+impl Drop for OwnInput {
+    fn drop(&mut self) {
+        unsafe { libc::dup2(self.saved.as_raw_fd(), 0) };
+    }
 }
 
 static SUSPEND_ASKED: AtomicBool = AtomicBool::new(false);
@@ -672,10 +737,10 @@ fn run_ui(
         .filter(|&fd| unsafe { libc::isatty(fd) } == 1)
         .collect();
     let tty = ttys.first().copied();
-    // The terminal crossterm reads: standard input when that is one, else /dev/tty.
-    let stdin_tty = unsafe { libc::isatty(0) } == 1;
-    let dev_tty = if stdin_tty { None } else { std::fs::File::open("/dev/tty").ok() };
-    let input = if stdin_tty { Some(0) } else { dev_tty.as_ref().map(|f| f.as_raw_fd()) };
+    // Before any thread looks at standard input, and before crossterm first does: its poll
+    // watches the descriptor it finds there.
+    let own_input = OwnInput::take();
+    let input = (own_input.is_some() || unsafe { libc::isatty(0) } == 1).then_some(0);
     if !ttys.is_empty() {
         exit_when_terminal_goes(ttys, spawn.as_ref().map(|s| s.session_dir.clone()));
     }
@@ -2918,9 +2983,9 @@ fn submit_mkvol(
     // Refuse control bytes / shell metacharacters in name (R129
     // prep — name flows into a path argument, so we want no '/'
     // either to keep the volume in the active panel's CWD).
-    if name.chars().any(|c| (c as u32) < 0x20 || c == '\u{7F}' || c == '/' || c == '\\') {
+    if name_refused(name) || name.contains('\\') {
         let mut new_mk = mk.clone();
-        new_mk.error = Some("Name must not contain '/' or control bytes".into());
+        new_mk.error = Some("Name must not contain '/' or control characters".into());
         *local_dialog = Some(LocalDialog {
             kind: LocalDialogKind::MkVol(new_mk),
             ..dialog
@@ -3155,9 +3220,9 @@ fn submit_dialog(
                 *local_dialog = Some(error_dialog("Name is required."));
                 return Ok(Action::Refresh);
             }
-            if name.chars().any(|c| (c as u32) < 0x20 || c == '\u{7F}' || c == '/') {
+            if name_refused(&name) {
                 *local_dialog = Some(error_dialog(
-                    "Name must not contain '/' or control bytes.",
+                    "Name must not contain '/' or control characters.",
                 ));
                 return Ok(Action::Refresh);
             }
@@ -3518,6 +3583,12 @@ fn mount_stm_volume(
     }
 }
 
+/// A name typed for something new, which the panels must then be able to act on: one holding
+/// a control character, C1 too, they list with U+FFFD standing in and act on nowhere.
+fn name_refused(name: &str) -> bool {
+    name.chars().any(|c| c.is_control() || c == '/')
+}
+
 /// A name from a listing, before it goes into a path. A volume can hold nearly any
 /// name, and a volume can come from anyone, so this is what keeps a listing from
 /// pointing a copy outside its destination.
@@ -3525,7 +3596,8 @@ fn name_is_safe(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
-        && !name.bytes().any(|b| b == b'/' || b < 0x20 || b == 0x7f)
+        // C1 too: the screen cannot show one, and U+009B is CSI to some terminals.
+        && !name.chars().any(|c| c == '/' || c.is_control())
         // What a name that is not UTF-8 is shown as, which no file is called.
         && !name.contains('\u{FFFD}')
 }
@@ -5397,6 +5469,25 @@ mod tests {
 
     // A paste far past the limit is counted, not kept, in the dialog and the wizard alike,
     // and erasing takes the count back first.
+    // A name holding a control character is acted on nowhere, a C1 one too; other characters
+    // past ASCII are names like any.
+    #[test]
+    fn a_name_with_a_control_character_is_not_safe() {
+        for bad in ["n\u{85}l", "a\u{9b}2J", "a\u{1b}b", "a\u{7f}", "a/b", "caf\u{fffd}", "..", ""] {
+            assert!(!name_is_safe(bad), "{bad:?} taken as safe");
+        }
+        for good in ["caf\u{e9}", "n\u{a0}l", "\u{4e16}\u{754c}", "a b"] {
+            assert!(name_is_safe(good), "{good:?} refused");
+        }
+        // A name typed for something new is refused for the same characters.
+        for bad in ["n\u{85}l", "a\u{9b}2J", "a\u{1b}b", "a\u{7f}", "a/b"] {
+            assert!(name_refused(bad), "{bad:?} taken for a new name");
+        }
+        for good in ["caf\u{e9}", "n\u{a0}l", "a b"] {
+            assert!(!name_refused(good), "{good:?} refused for a new name");
+        }
+    }
+
     #[test]
     fn a_huge_paste_is_counted_not_kept() {
         use crossterm::event::{KeyCode as K, KeyEvent, KeyModifiers as M};

@@ -1038,13 +1038,18 @@ mod prompt_tests {
         mask
     }
 
-    const ASKED: [libc::c_int; 8] = [
-        libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT,
-        libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU, libc::SIGCONT,
-    ];
+    /// The signals asked_set holds, read off it: one added there is checked here too.
+    fn asked() -> Vec<libc::c_int> {
+        let set = asked_set();
+        let asked: Vec<libc::c_int> = (1..65).filter(|&sig| unsafe { libc::sigismember(&set, sig) } == 1).collect();
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT] {
+            assert!(asked.contains(&sig), "asked_set lacks signal {sig}");
+        }
+        asked
+    }
 
-    fn blocked(mask: &libc::sigset_t) -> [bool; 8] {
-        ASKED.map(|sig| unsafe { libc::sigismember(mask, sig) } == 1)
+    fn blocked(mask: &libc::sigset_t) -> Vec<bool> {
+        asked().into_iter().map(|sig| unsafe { libc::sigismember(mask, sig) } == 1).collect()
     }
 
     /// A helper starts with none of what the main thread waits on; a plain thread from the
@@ -1053,13 +1058,14 @@ mod prompt_tests {
     fn a_helper_takes_none_of_the_asked_signals() {
         let plain = std::thread::spawn(this_threads_mask).join().expect("its mask");
         let helper = spawn_helper("test-helper", this_threads_mask).expect("a helper").join().expect("its mask");
-        assert_eq!(blocked(&plain), [false; 8], "a plain thread starts with some blocked: it proves nothing");
-        assert_eq!(blocked(&helper), [true; 8], "the helper can take some of them");
-        assert_eq!(blocked(&this_threads_mask()), [false; 8], "the spawner kept them blocked");
+        let n = asked().len();
+        assert_eq!(blocked(&plain), vec![false; n], "a plain thread starts with some blocked: it proves nothing");
+        assert_eq!(blocked(&helper), vec![true; n], "the helper can take some of them");
+        assert_eq!(blocked(&this_threads_mask()), vec![false; n], "the spawner kept them blocked");
     }
 
     /// A program started from a helper gets each signal back: a shell sending itself one
-    /// ends by it, and its exec finds none of the eight blocked. One started plainly there,
+    /// ends by it, and its exec finds none of asked_set blocked. One started plainly there,
     /// one variable away, keeps them blocked, as std hands a child its spawner's mask.
     #[test]
     fn a_program_started_from_a_helper_has_the_signals_back() {
@@ -1086,20 +1092,23 @@ mod prompt_tests {
                 let out = shell(&format!("kill -{sig} $$; echo alive"), own).output().expect("a shell");
                 (std::os::unix::process::ExitStatusExt::signal(&out.status), out.stdout)
             };
-            // The mask as the exec finds it, after as_its_own_program's own step.
+            // The mask as the exec finds it, after as_its_own_program's own step: EDOM from
+            // the pre_exec when one of the asked signals is blocked there.
+            let asked = asked();
             let unblocked = |own: bool| {
                 let mut sh = shell("exit 0", own);
+                let asked = asked.clone();
                 unsafe {
-                    sh.pre_exec(|| {
+                    sh.pre_exec(move || {
                         let mut mask: libc::sigset_t = std::mem::zeroed();
                         libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask);
-                        if ASKED.iter().any(|&sig| libc::sigismember(&mask, sig) == 1) {
+                        if asked.iter().any(|&sig| libc::sigismember(&mask, sig) == 1) {
                             return Err(io::Error::from_raw_os_error(libc::EDOM));
                         }
                         Ok(())
                     });
                 }
-                sh.status().is_ok()
+                sh.status().map(|_| ()).map_err(|e| e.raw_os_error())
             };
             (
                 [run("TERM", false), run("TERM", true), run("INT", true), run("HUP", true)],
@@ -1113,8 +1122,8 @@ mod prompt_tests {
         assert_eq!(ends[1].0, Some(libc::SIGTERM), "TERM stayed blocked");
         assert_eq!(ends[2].0, Some(libc::SIGINT), "INT stayed blocked");
         assert_eq!(ends[3].0, Some(libc::SIGHUP), "HUP stayed blocked");
-        assert!(!unblocked[0], "a plain child of a helper had none of the eight blocked: it proves nothing");
-        assert!(unblocked[1], "one of the eight stayed blocked at the exec");
+        assert_eq!(unblocked[0], Err(Some(libc::EDOM)), "a plain child of a helper had none of them blocked: it proves nothing");
+        assert_eq!(unblocked[1], Ok(()), "one of them stayed blocked at the exec");
     }
 
     /// Two holds at once, as the tests here make: the second takes none of the handlers,

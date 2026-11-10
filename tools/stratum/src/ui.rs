@@ -82,12 +82,12 @@ const CLR_POPUP_BG: Color = Color::Black;
 // ("Slate's responsibility is to faithfully transport the bytes").
 // slate-tty IS the renderer-layer where the sanitization MUST happen.
 //
-// Policy (mirrors slate's R115 P1-1 panel-entries posture):
-//   - bytes < 0x20 (control chars) become '?', EXCEPT '\n' and '\t'
-//     which the renderer handles natively (line breaks + tabs).
-//   - byte 0x7F (DEL) becomes '?'.
-//   - bytes ≥ 0x80 (UTF-8 multi-byte continuation + lead) pass through
-//     unchanged.
+// Policy: every control character becomes '?', EXCEPT '\n' and '\t',
+// which the renderer handles natively (line breaks + tabs). That is
+// C0, DEL and C1 (U+0080..U+009F): to a terminal that takes 8-bit
+// controls U+009B is CSI, and ratatui's Paragraph writes a cell's
+// symbol as given, where set_stringn would drop it. Other non-ASCII
+// characters pass through unchanged.
 //
 // Allowing '\n' lets the editor preview render multi-line content
 // correctly. Allowing '\t' is important — text files routinely
@@ -95,19 +95,9 @@ const CLR_POPUP_BG: Color = Color::Black;
 // printable ASCII, but printable ASCII can't escape the rendered
 // cell.
 fn sanitize_for_display(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let cp = ch as u32;
-        if (cp < 0x20 && ch != '\n' && ch != '\t') || cp == 0x7F {
-            out.push('?');
-        } else {
-            // Non-ASCII Unicode (cp ≥ 0x80) and printable ASCII pass
-            // through unchanged. Iterating by char (not byte) ensures
-            // UTF-8 multi-byte sequences emit one char each.
-            out.push(ch);
-        }
-    }
-    out
+    s.chars()
+        .map(|ch| if ch.is_control() && ch != '\n' && ch != '\t' { '?' } else { ch })
+        .collect()
 }
 
 // ── types the renderer reads ──────────────────────────────────────────
@@ -551,7 +541,40 @@ impl F2State {
 
 // ── main draw ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn render(
+    frame: &mut Frame<'_>,
+    state: &UiState,
+    editor: Option<&EditorState>,
+    copy_progress: Option<&CopyProgress>,
+    view_mode: ViewMode,
+    f2_state: F2State,
+    volmap: Option<&VolumeMapState>,
+    snapgraph: Option<&SnapshotGraphState>,
+    snapgraph_cursor: u32,
+    snapgraph_filter: Option<u64>,
+    snapgraph_marks: &[u64],
+) {
+    render_views(frame, state, editor, copy_progress, view_mode, f2_state, volmap, snapgraph,
+                 snapgraph_cursor, snapgraph_filter, snapgraph_marks);
+    scrub_controls(frame.buffer_mut());
+}
+
+/// No cell carries a control character to the terminal, whatever drew it: crossterm writes a
+/// cell's symbol as it is, and ratatui's Paragraph, under the dialogs and the editor's text,
+/// puts one there as given, so a file's ESC or BEL would reach the terminal. A tab shows as a
+/// space, any other control as '?'; the editor's buffer keeps the bytes.
+fn scrub_controls(buf: &mut ratatui::buffer::Buffer) {
+    for cell in buf.content.iter_mut() {
+        if cell.symbol().contains(char::is_control) {
+            let stand_in = if cell.symbol() == "\t" { " " } else { "?" };
+            cell.set_symbol(stand_in);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_views(
     frame: &mut Frame<'_>,
     state: &UiState,
     editor: Option<&EditorState>,
@@ -1973,14 +1996,18 @@ fn shown_text(t: &crate::passphrase::SecretText) -> String {
 }
 
 /// `text` as it fits in `room` columns: whole, or an ellipsis and as much of its end as fits.
+/// Measured as ratatui draws it, a grapheme at a time: an emoji with its variation selector is
+/// two columns, the two characters apart one.
 fn tail_within(text: &str, room: usize) -> String {
-    if Span::raw(text).width() <= room {
+    use unicode_segmentation::UnicodeSegmentation;
+    let drawn = |s: &str| s.graphemes(true).map(|g| Span::raw(g).width()).sum::<usize>();
+    if drawn(text) <= room {
         return text.to_string();
     }
     let mut start = text.len();
     let mut used = 1;
-    for (i, ch) in text.char_indices().rev() {
-        let w = Span::raw(&text[i..i + ch.len_utf8()]).width();
+    for (i, g) in text.grapheme_indices(true).rev() {
+        let w = Span::raw(g).width();
         if used + w > room {
             break;
         }
@@ -2516,6 +2543,77 @@ mod tests {
         assert_eq!(sanitize_for_display(&input), expected);
     }
 
+    fn frame_with(editor: Option<&EditorState>, dialog: Option<LocalDialog>) -> Vec<String> {
+        let panel = || PanelView {
+            path: "/".into(), path_ok: true, raw_entries: vec![], cursor: 0, connected: true, selection: vec![],
+        };
+        let state = UiState {
+            version: 1, status: String::new(), connected: true, backend_socket: String::new(), focus: 0,
+            panels: [panel(), panel()], dialog_stack: String::new(), editor_active: editor.is_some(),
+            editor_filename: String::new(), editor_modified: false, local_dialog: dialog, search_buffer: String::new(),
+        };
+        screen_rows(80, 24, |f, _| {
+            render(f, &state, editor, None, ViewMode::Files, F2State::default(), None, None, 0, None, &[])
+        })
+    }
+
+    fn controls_in(rows: &[String]) -> Vec<String> {
+        rows.iter().flat_map(|r| r.chars().filter(|c| c.is_control()).map(|c| format!("U+{:04X}", c as u32))).collect()
+    }
+
+    // A file's text in the editor is drawn through ratatui's Paragraph, which writes each cell's
+    // symbol as given: its ESC, C1 and BEL must not reach the terminal, and its bytes stay.
+    #[test]
+    fn a_file_in_the_editor_sends_no_control_to_the_terminal() {
+        let text = "a\u{1b}[2Jb\u{9b}31mc\u{7}d\te\n";
+        let ed = EditorState::new("f.txt".to_string(), text, false);
+        let rows = frame_with(Some(&ed), None);
+        assert_eq!(controls_in(&rows), Vec::<String>::new(), "the frame:\n{}", rows.join("\n"));
+        assert!(row_of(&rows, "a?[2Jb?31mc?d").is_some(), "the text is not shown:\n{}", rows.join("\n"));
+        assert_eq!(ed.content(), text, "the buffer lost the file's bytes");
+    }
+
+    // A tab in a dialog's text is a cell of its own, which the terminal would take as a move.
+    #[test]
+    fn a_tab_in_a_dialog_shows_as_a_space() {
+        let d = LocalDialog {
+            kind: LocalDialogKind::Error,
+            prompt: String::from("left\tright"),
+            value: String::new().into(),
+            is_password: false,
+            is_error: true,
+        };
+        let rows = frame_with(None, Some(d));
+        assert_eq!(controls_in(&rows), Vec::<String>::new(), "the frame:\n{}", rows.join("\n"));
+        assert!(row_of(&rows, "left right").is_some(), "the text is not shown:\n{}", rows.join("\n"));
+    }
+
+    // C1 too: U+009B is CSI to a terminal that takes 8-bit controls; U+00A0 is not a control.
+    #[test]
+    fn sanitize_strips_c1_controls() {
+        assert_eq!(sanitize_for_display("a\u{9b}2Jb\u{85}c\u{9f}d\u{a0}\u{e9}"), "a?2Jb?c?d\u{a0}\u{e9}");
+        for cp in 0x80u32..=0x9F {
+            let c = char::from_u32(cp).unwrap();
+            assert_eq!(sanitize_for_display(&c.to_string()), "?", "U+{cp:04X}");
+        }
+    }
+
+    // A dialog, a Paragraph, writes each cell's symbol as given: a host file name in it must
+    // not carry a C1 control to the terminal.
+    #[test]
+    fn a_dialog_draws_no_c1_control() {
+        let d = LocalDialog {
+            kind: LocalDialogKind::Error,
+            prompt: String::from("Cannot copy na\u{9b}2Jme.txt"),
+            value: String::new().into(),
+            is_password: false,
+            is_error: true,
+        };
+        let s = screen_rows(80, 24, |f, a| draw_local_dialog(f, a, &d));
+        assert!(row_of(&s, "Cannot copy").is_some(), "no prompt:\n{}", s.join("\n"));
+        assert!(!s.iter().any(|r| r.chars().any(|c| c.is_control())), "a control drawn:\n{:?}", s);
+    }
+
     #[test]
     fn sanitize_passes_printable_ascii() {
         let s = "abcXYZ012!@#$%^&*()_+-=[]{}|;:'\",.<>?/`~";
@@ -2568,5 +2666,19 @@ mod tests {
         let wizard = screen_rows(80, 30, |f, a| draw_mkvol_dialog(f, a, &mk));
         let row = row_of(&wizard, "Name:").map(|r| wizard[r].clone()).expect("the Name row");
         assert!(row.contains("\u{2026}a") && row.contains("WXYZ (+45 over)_"), "the wizard:\n{}", wizard.join("\n"));
+    }
+
+    // An emoji with its variation selector draws two columns: measured as one, the end would
+    // push the count and the cursor out of the field.
+    #[test]
+    fn an_emoji_name_keeps_its_count_and_cursor_in_sight() {
+        let mut mk = MkVolState::new(0);
+        let typed = "a".repeat(150) + &"\u{2764}\u{fe0f}".repeat(30);
+        for c in typed.chars() {
+            mk.name.type_within(c, crate::tui::NAME_MAX);
+        }
+        let wizard = screen_rows(80, 30, |f, a| draw_mkvol_dialog(f, a, &mk));
+        let row = row_of(&wizard, "Name:").map(|r| wizard[r].clone()).expect("the Name row");
+        assert!(row.contains("\u{2026}") && row.contains(" over)_"), "the wizard:\n{}", wizard.join("\n"));
     }
 }

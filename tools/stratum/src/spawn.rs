@@ -596,6 +596,7 @@ impl SpawnCtx {
         Command::new(&self.me)
             .args(args)
             .envs(crate::lifeline::env())
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr_target)
             .process_group(0)

@@ -1242,6 +1242,15 @@ size_t stm_slate_socket(stm_slate *s, char *buf, size_t buf_cap)
     return stm_slate_panel_socket(s, SLATE_PANEL_LEFT, buf, buf_cap);
 }
 
+/* The length of the C1 control (U+0080..U+009F, C2 80..C2 9F in UTF-8)
+ * starting at s[i], or 0. A terminal that takes 8-bit controls reads
+ * U+009B as CSI, and the manager cannot show one: a name holding one
+ * is treated as one holding a control byte below 0x20. */
+static size_t slate_c1_at(const unsigned char *s, size_t len, size_t i)
+{
+    return (s[i] == 0xC2u && i + 1 < len && s[i + 1] >= 0x80u && s[i + 1] <= 0x9Fu) ? 2u : 0u;
+}
+
 /* SLATE-4-confirm: validate that a string contains no control bytes
  * (R115 P1-1 / R117 P1-1 doctrine carry). For dialog title and
  * options, NO control bytes including '\n'. For body, '\n' is
@@ -2825,8 +2834,9 @@ retry:
          * line-by-line renderer treats as real files. R99 P2-1
          * doctrine class — sanitize at the display surface since
          * stm_fs cannot tighten its filter without breaking POSIX.
-         * Bytes < 0x20 OR == 0x7F replaced with '?'; UTF-8 multi-byte
-         * sequences (≥ 0x80) pass through unchanged. The ORIGINAL
+         * Control characters replaced: bytes < 0x20, 0x7F, and the C1
+         * controls U+0080..U+009F (C2 80..C2 9F); other UTF-8 multi-byte
+         * sequences pass through unchanged. The ORIGINAL
          * name is used for the per-entry Twalk above so we still
          * resolve the real backend file. */
         /* The first such byte is shown as U+FFFD, which the manager refuses to act on,
@@ -2839,7 +2849,11 @@ retry:
         bool stood_in = false;
         for (size_t ni = 0; ni < in_len; ni++) {
             unsigned char c = (unsigned char)de->name[ni];
-            if (c >= 0x20u && c != 0x7Fu) {
+            size_t c1 = slate_c1_at((const unsigned char *)de->name, in_len, ni);
+            if (c1) {
+                ni += c1 - 1;
+            }
+            if (!c1 && c >= 0x20u && c != 0x7Fu) {
                 safe_name[safe_len++] = (char)c;
             } else if (!stood_in) {
                 safe_name[safe_len++] = (char)0xEFu;
@@ -3140,11 +3154,13 @@ static stm_status descend_find_cb(const stm_9p_qid *qid, uint64_t cookie,
          * KEY for subsequent backend ops (panel_entries_render's
          * walk_to_cwd(path)) — sanitizing on storage would diverge
          * from the real backend name and break the entries-listing.
-         * Instead: REFUSE descent into such entries. Bytes from 0x80 up
-         * pass this loop; the check after it refuses ill-formed UTF-8. */
+         * Instead: REFUSE descent into such entries, a C1 control
+         * (C2 80..C2 9F) among them; other bytes from 0x80 up pass this
+         * loop, and the check after it refuses ill-formed UTF-8. */
         for (uint16_t i = 0; i < fc->name_len; i++) {
             unsigned char c = (unsigned char)fc->name[i];
-            if (c < 0x20u || c == 0x7Fu) {
+            if (c < 0x20u || c == 0x7Fu ||
+                slate_c1_at((const unsigned char *)fc->name, fc->name_len, i)) {
                 fc->bad_name = true;
                 break;
             }

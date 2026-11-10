@@ -555,6 +555,7 @@ dependencies = [
  "ratatui",
  "tempfile",
  "tui-textarea",
+ "unicode-segmentation",
 ]
 
 [[package]]

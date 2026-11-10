@@ -139,6 +139,8 @@ class Screen:
 
 class Term:
     def __init__(self, argv, output_to_pipe=False, ignored=(), blocked=(), pending=()):
+        # Before the fork: a session directory of this manager's is no older.
+        self.started = time.time()
         self.screen = Screen()
         # Everything sent to the terminal: the emulator's private modes are not on the screen.
         self.raw = bytearray()
@@ -250,7 +252,7 @@ class Term:
                             os.kill(self.pid, signal.SIGKILL)
                             os.waitpid(self.pid, 0)
                             # A KILL leaves the directory, outside the run's temporary root.
-                            for d in {session, *session_dir_guesses(self.pid)} - {None}:
+                            for d in {session, *session_dir_guesses(self.pid, self.started)} - {None}:
                                 shutil.rmtree(d, ignore_errors=True)
                             break
                         time.sleep(0.1)
@@ -451,15 +453,18 @@ def session_dir_of(pid, wait=10):
         time.sleep(0.1)
 
 
-def session_dir_guesses(pid):
+def session_dir_guesses(pid, since):
     """Where the directory would be, from the environment alone: for one whose host-fs has gone.
-    std's temporary directory on macOS with TMPDIR unset is the user's own, not Python's /tmp."""
+    std's temporary directory on macOS with TMPDIR unset is the user's own, not Python's /tmp.
+    Only one made since `since`: a manager ended by SIGKILL leaves its own, and pids come round."""
     bases = {os.environ.get('XDG_RUNTIME_DIR'), os.environ.get('TMPDIR'), tempfile.gettempdir()}
     if sys.platform == 'darwin':
         r = subprocess.run(['getconf', 'DARWIN_USER_TEMP_DIR'], capture_output=True, text=True)
         bases.add(r.stdout.strip() if r.returncode == 0 else None)
     bases -= {None, ''}
-    return {d for b in bases for d in glob.glob(f"{b.rstrip('/')}/stratum-{pid}-*") if os.path.isdir(d)}
+    found = {d for b in bases for d in glob.glob(f"{b.rstrip('/')}/stratum-{pid}-*") if os.path.isdir(d)}
+    # The change time, which no one sets by hand; a second's slack for a coarse file clock.
+    return {d for d in found if os.stat(d).st_ctime >= since - 1}
 
 
 def resize_leg(stratum, vol, host, root):
@@ -959,7 +964,7 @@ def pending_hup_leg(stratum, vol, host, root):
         said = 'asked to stop' in term.screen.text()
         record(ended and term.rc == 1 and said, f'{how}: the manager asked to stop, rc 1',
                f'{how}: the manager ended={ended} rc={term.rc}, said "asked to stop"={said}')
-        left = [d for d in session_dir_guesses(term.pid)]
+        left = sorted(session_dir_guesses(term.pid, term.started))
         record(not left, f'{how}: no session directory stayed', f'{how}: {left} stayed')
     finally:
         term.kill()
@@ -1056,6 +1061,23 @@ def tty_modes(term):
 
 def state_of(pid):
     return subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+
+
+def cpu_seconds(pid):
+    """The user and system time `pid` has had, every thread's."""
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            fields = f.read().rpartition(')')[2].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK')
+    except FileNotFoundError:
+        pass
+    # [[dd-]hh:]mm:ss.cc
+    spent = subprocess.run(['ps', '-o', 'time=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+    days, _, clock = spent.rpartition('-')
+    seconds = 0.0
+    for part in clock.split(':'):
+        seconds = seconds * 60 + float(part)
+    return seconds + (int(days) * 86400 if days else 0)
 
 
 def wait_state(term, pid, want, timeout):
@@ -1437,6 +1459,8 @@ def screen_job_control_leg(stratum, vol, host, root):
         slate = child_running(manager, 'slate')
         if slate is None:
             raise Failure(f'{how}: no slate under the manager: it proves nothing')
+        # Quiet first: a start-up draw read after the resize would look like the resize's.
+        wait_quiet(term, how)
         held.append(slate)
         os.kill(slate, signal.SIGSTOP)
         if 'T' not in wait_state(term, slate, 'T', 10):
@@ -1614,6 +1638,143 @@ hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
 resource.setrlimit(resource.RLIMIT_CORE, (hard, hard))
 os.execv(sys.argv[1], sys.argv[1:])
 """
+
+
+def input_spin_leg(stratum, root):
+    """Input the screen's own wait sees and crossterm does not report must not spin the screen:
+    it waits out the rest of each tick. Two ways there. On macOS a key typed while the terminal
+    was canonical, which the screen's mode change at `fg` moves without a wakeup. On Linux input
+    past crossterm's read of 1024 bytes, which its edge-triggered poll does not report again."""
+    w = f'{root}/spin-host'
+    os.makedirs(w, exist_ok=True)
+    with open(f'{w}/onefile.txt', 'w') as f:
+        f.write('one\n')
+
+    def idle(term, how, manager):
+        wait_quiet(term, how)
+        before = cpu_seconds(manager)
+        term.pump(2)
+        used = cpu_seconds(manager) - before
+        record(used < 0.25, f'{how}: idle after it, {used:.2f} s of CPU in 2 s',
+               f'{how}: it spun, {used:.2f} s of CPU in 2 s')
+
+    def dialog(term, how):
+        # Keys typed into a field do nothing else.
+        term.expect(r'onefile\.txt', timeout=30)
+        term.send(F7)
+        term.expect(r'New directory name')
+        wait_quiet(term, how)
+
+    how = 'a key typed while stopped, then fg'
+    term = Term([sys.executable, '-I', '-c', JOB_SHELL, stratum, 'tui', '--host', w])
+    try:
+        dialog(term, how)
+        manager = child_running(term.pid, 'tui')
+        if manager is None:
+            raise Failure(f'{how}: no manager under the job shell: it proves nothing')
+        os.kill(manager, signal.SIGTSTP)
+        if 'T' not in wait_state(term, manager, 'T', 10):
+            raise Failure(f'{how}: the TSTP did not stop it: it proves nothing')
+        if not tty_modes(term)['ICANON']:
+            raise Failure(f'{how}: stopped, the terminal is {tty_modes(term)}, not canonical: it proves nothing')
+        term.send(b'x')
+        os.kill(term.pid, signal.SIGUSR2)
+        if not wait_until(term, lambda: tty_modes(term) == RAW_MODES, 10):
+            raise Failure(f'{how}: after fg the terminal is {tty_modes(term)}: it proves nothing')
+        idle(term, how, manager)
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    how = '3000 bytes at once'
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        dialog(term, how)
+        flags = fcntl.fcntl(term.fd, fcntl.F_GETFL)
+        fcntl.fcntl(term.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        try:
+            taken = os.write(term.fd, b'a' * 3000)
+        except BlockingIOError:
+            taken = 0
+        finally:
+            fcntl.fcntl(term.fd, fcntl.F_SETFL, flags)
+        # macOS holds about 1 KB of input for a pty, so only Linux tells here.
+        print(f'note: {how}: the terminal took {taken} bytes', flush=True)
+        idle(term, how, term.pid)
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+
+def escape_prefix_leg(stratum, root):
+    """A sequence crossterm cannot finish, ESC O as many terminals send Alt+O, must not hold the
+    screen in a read: a TERM then ends it, with no key after. One that a later read finishes
+    still counts: ESC [, then 18~, is F7."""
+    w = f'{root}/escape-host'
+    os.makedirs(w, exist_ok=True)
+    with open(f'{w}/onefile.txt', 'w') as f:
+        f.write('one\n')
+    how = 'ESC O, then TERM'
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        term.expect(r'onefile\.txt', timeout=30)
+        wait_quiet(term, how)
+        term.send(b'\x1b[')
+        term.pump(0.5)
+        term.send(b'18~')
+        term.expect(r'New directory name', timeout=10)
+        print(f'ok: {how}: ESC [ and then 18~ in a later read made F7', flush=True)
+        term.send(ESC)
+        if not wait_until(term, lambda: 'New directory name' not in term.screen.text(), 10):
+            raise Failure(f'{how}: Esc did not close the dialog: it proves nothing')
+        wait_quiet(term, how)
+        term.send(b'\x1bO')
+        term.pump(1)
+        if os.waitpid(term.pid, os.WNOHANG)[0]:
+            raise Failure(f'{how}: ESC O ended it: it proves nothing')
+        os.kill(term.pid, signal.SIGTERM)
+        ended = term.exited(5)
+        state = '' if ended else state_of(term.pid)
+        record(ended, f'{how}: the TERM ended it with no key after',
+               f'{how}: the TERM did not end it in 5 s, its state {state!r}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+
+def editor_escape_leg(stratum, root):
+    """A file's text shown in the editor sends no control character to the terminal: the OSC in
+    it that would set the window title arrives as '?' and plain text, the BEL that ends it too."""
+    w = f'{root}/hostile-host'
+    os.makedirs(w, exist_ok=True)
+    with open(f'{w}/hostile.txt', 'wb') as f:
+        f.write(b'before\x1b]2;PWNED\x07after\n')
+    how = 'F3 on a file holding an OSC'
+    term = Term([stratum, 'tui', '--host', w])
+    try:
+        term.expect(r'hostile\.txt', timeout=30)
+        pick(term, 'hostile.txt', ['hostile.txt'])
+        start = len(term.raw)
+        term.send(b'\x1bOR')
+        term.expect(r'after', timeout=10)
+        term.pump(0.5)
+        sent = bytes(term.raw[start:])
+        osc, bel = b'\x1b]2;' in sent, b'\x07' in sent
+        shown = 'before?]2;PWNED?after' in term.screen.text()
+        record(not osc and not bel and shown,
+               f'{how}: the terminal got no control from it, and it shows as text',
+               f'{how}: OSC sent={osc}, BEL sent={bel}, shown as text={shown}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
 
 
 def core_dumps_off_leg(stratum, vol, host, root):
@@ -2834,16 +2995,25 @@ def unreadable_name_legs(stratum, root):
             raise Failure(f'seeding {args}: {r.stderr[:200]}')
     p9_mkdir(vol.sock, [], b'caf\xe9')
     p9_mkdir(vol.sock, [b'caf\xe9'], b'victim')
+    # U+0085, a C1 control: shown with U+FFFD standing in, as one below U+0020 is.
+    p9_mkdir(vol.sock, [], b'n\xc2\x85l')
     vol.stop()
 
     shown = 'caf\ufffd'
+    c1 = 'n\ufffdl'
+    listed = [shown, c1, 'victim', '.snaps']
     term = Term([stratum, 'tui', '--vol', vol.v, '--host', base])
     try:
         term.expect(r'Passphrase for')
         term.send(PASS.encode() + ENTER)
         term.expect(r'victim', timeout=60)
         term.pump(0.5)
-        pick(term, shown, [shown, 'victim', '.snaps'])
+        pick(term, c1, listed)
+        term.send(ENTER)
+        term.pump(1.5)
+        record(c1 in rows_in_panel(term, [c1], False), 'the manager does not go into a directory whose name holds a C1 control',
+               'Enter went into a directory whose name holds a C1 control')
+        pick(term, shown, listed)
         term.send(ENTER)
         term.pump(1.5)
         term.show('Enter on a name that is not UTF-8')
@@ -3103,18 +3273,23 @@ def helper_checks():
         user = subprocess.run(['getconf', 'DARWIN_USER_TEMP_DIR'], capture_output=True, text=True).stdout.strip()
         fake = 4_000_000 + os.getpid()
         made = f"{user.rstrip('/')}/stratum-{fake}-aB3xYz"
+        since = time.time()
         os.mkdir(made)
         saved = {k: os.environ.pop(k) for k in ('TMPDIR', 'XDG_RUNTIME_DIR') if k in os.environ}
         tempfile.tempdir = None
         try:
-            got = session_dir_guesses(fake)
+            got = session_dir_guesses(fake, since)
+            # One variable away: the same directory, older than the manager asked about.
+            older = session_dir_guesses(fake, since + 5)
         finally:
             os.environ.update(saved)
             tempfile.tempdir = None
             os.rmdir(made)
         if made not in got:
             raise Failure(f'with TMPDIR unset the guesses {got} miss {made}')
-    print('ok: the session directory helpers find it off a long ps line and with TMPDIR unset', flush=True)
+        if older:
+            raise Failure(f'the guesses {older} take a directory made before the manager started')
+    print('ok: the session directory helpers find it off a long ps line and with TMPDIR unset, and not one older', flush=True)
 
 
 def screen_checks():
@@ -3291,6 +3466,9 @@ def run(stratum, root):
                       (core_dumps_off_leg, (stratum, vol, host, root)),
                       (screen_started_behind_leg, (stratum, root)),
                       (setsid_screen_leg, (stratum, root)),
+                      (input_spin_leg, (stratum, root)),
+                      (escape_prefix_leg, (stratum, root)),
+                      (editor_escape_leg, (stratum, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
                       (wrong_passphrase_leg, (stratum, vol, host)),
                       (wizard_legs, (stratum, vol, root)),

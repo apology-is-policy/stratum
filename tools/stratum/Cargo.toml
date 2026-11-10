@@ -29,6 +29,8 @@ libc         = "0.2"
 # (Helix-style Normal/Insert/Visual/Command modes). v2 lifts the same
 # crate so visuals + behaviour match.
 tui-textarea = "0.7"
+# Already under ratatui: measuring a line as ratatui draws it, a grapheme at a time.
+unicode-segmentation = "1"
 
 [dev-dependencies]
 tempfile = "3"
