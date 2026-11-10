@@ -1972,6 +1972,24 @@ fn shown_text(t: &crate::passphrase::SecretText) -> String {
     }
 }
 
+/// `text` as it fits in `room` columns: whole, or an ellipsis and as much of its end as fits.
+fn tail_within(text: &str, room: usize) -> String {
+    if Span::raw(text).width() <= room {
+        return text.to_string();
+    }
+    let mut start = text.len();
+    let mut used = 1;
+    for (i, ch) in text.char_indices().rev() {
+        let w = Span::raw(&text[i..i + ch.len_utf8()]).width();
+        if used + w > room {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    format!("\u{2026}{}", &text[start..])
+}
+
 fn render_mkvol_field(
     frame: &mut Frame<'_>,
     row: Rect,
@@ -1986,7 +2004,10 @@ fn render_mkvol_field(
         None => sanitize_for_display(value),
     };
     let cursor = if focused { "_" } else { "" };
-    let value_line = format!("{display}{cursor}");
+    // The field is one line: past its width, its end stays in sight, where typing goes and the
+    // count of what went past the limit shows.
+    let room = usize::from(row.width).saturating_sub(label_w + 2 + cursor.len());
+    let value_line = format!("{}{cursor}", tail_within(&display, room));
     let lstyle = if focused {
         Style::default().fg(Color::Yellow).bold()
     } else {
@@ -2533,5 +2554,19 @@ mod tests {
         assert!(row_of(&dialog, "ab (+1 over)").is_some(), "the dialog:\n{}", dialog.join("\n"));
         t.erase();
         assert_eq!(shown_text(&t), "ab");
+    }
+
+    // A name typed past its limit, at a real size: its end and the count stay in the field's
+    // one line, with the cursor, the start given up to an ellipsis.
+    #[test]
+    fn a_long_name_keeps_its_end_and_count_in_sight() {
+        let mut mk = MkVolState::new(0);
+        let typed = "a".repeat(crate::tui::NAME_MAX - 4) + "WXYZ" + &"b".repeat(45);
+        for c in typed.chars() {
+            mk.name.type_within(c, crate::tui::NAME_MAX);
+        }
+        let wizard = screen_rows(80, 30, |f, a| draw_mkvol_dialog(f, a, &mk));
+        let row = row_of(&wizard, "Name:").map(|r| wizard[r].clone()).expect("the Name row");
+        assert!(row.contains("\u{2026}a") && row.contains("WXYZ (+45 over)_"), "the wizard:\n{}", wizard.join("\n"));
     }
 }

@@ -22,6 +22,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -473,6 +474,14 @@ fn leave_screen_behind(out: &mut impl io::Write) {
     if !SCREEN_ON.swap(false, Ordering::Relaxed) {
         return;
     }
+    let_through(|| {
+        let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+    });
+}
+
+/// Runs `write` with SIGTTOU blocked on this thread: under tostop a write from behind then goes
+/// through, rather than stopping the job inside it, where a stop asked could not end it.
+fn let_through<T>(write: impl FnOnce() -> T) -> T {
     let mut ttou: libc::sigset_t = unsafe { std::mem::zeroed() };
     let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
@@ -480,8 +489,9 @@ fn leave_screen_behind(out: &mut impl io::Write) {
         libc::sigaddset(&mut ttou, libc::SIGTTOU);
         libc::pthread_sigmask(libc::SIG_BLOCK, &ttou, &mut prev);
     }
-    let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+    let written = write();
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()) };
+    written
 }
 
 /// Raw, the alternate screen, mouse reports. The shell may have put its own mode back at
@@ -496,6 +506,46 @@ fn enter_screen(out: &mut impl io::Write) {
 /// In front of its terminal, or with no job control there to be behind.
 fn job_in_front(tty: Option<i32>) -> bool {
     tty.is_none_or(crate::passphrase::in_front)
+}
+
+/// Whether the screen may read or write its terminal now: in front, with nothing for the loop
+/// to see to first. From behind, the kernel stops the job inside the read or the write, and a
+/// stop asked cannot end it there: the handlers restart the call, as crossterm's read loop
+/// does, and the call stops it again.
+fn may_touch_terminal(tty: Option<i32>) -> bool {
+    !ASKED_TO_STOP.load(Ordering::Relaxed)
+        && !SUSPEND_ASKED.load(Ordering::Relaxed)
+        && !CONTINUED.load(Ordering::Relaxed)
+        && job_in_front(tty)
+}
+
+/// Whether an event waits, within `timeout`. crossterm reads the terminal as soon as its own
+/// poll sees input, from behind too, so the wait is the screen's own poll of `input`, and
+/// crossterm is asked only in front. A signal ends the wait early, for the loop to see to.
+fn input_waiting(input: Option<RawFd>, tty: Option<i32>, timeout: Duration) -> io::Result<bool> {
+    if !may_touch_terminal(tty) {
+        return Ok(false);
+    }
+    // What crossterm has read already, and a resize, which only its poll sees.
+    if event::poll(Duration::ZERO)? {
+        return Ok(true);
+    }
+    let Some(fd) = input else {
+        return event::poll(timeout);
+    };
+    let mut ready = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    match unsafe { libc::poll(&mut ready, 1, ms) } {
+        0 => return Ok(false),
+        n if n < 0 => {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) };
+        }
+        // Answered at once on every call, it would spin the loop.
+        _ if ready.revents & libc::POLLNVAL != 0 => return Err(io::Error::from_raw_os_error(libc::EBADF)),
+        _ => {}
+    }
+    Ok(may_touch_terminal(tty) && event::poll(Duration::ZERO)?)
 }
 
 static SUSPEND_ASKED: AtomicBool = AtomicBool::new(false);
@@ -622,6 +672,10 @@ fn run_ui(
         .filter(|&fd| unsafe { libc::isatty(fd) } == 1)
         .collect();
     let tty = ttys.first().copied();
+    // The terminal crossterm reads: standard input when that is one, else /dev/tty.
+    let stdin_tty = unsafe { libc::isatty(0) } == 1;
+    let dev_tty = if stdin_tty { None } else { std::fs::File::open("/dev/tty").ok() };
+    let input = if stdin_tty { Some(0) } else { dev_tty.as_ref().map(|f| f.as_raw_fd()) };
     if !ttys.is_empty() {
         exit_when_terminal_goes(ttys, spawn.as_ref().map(|s| s.session_dir.clone()));
     }
@@ -932,7 +986,16 @@ fn run_ui(
             } else {
                 None
             };
-            terminal.draw(|frame| {
+            // Never drawn from behind: a continue or a stop that came during the pass is seen to
+            // first. A stop that lands inside the draw lets it finish, under tostop too.
+            if !may_touch_terminal(tty) {
+                if ASKED_TO_STOP.load(Ordering::Relaxed) || !job_control(terminal.backend_mut(), tty) {
+                    return Ok(());
+                }
+                // What the shell drew meanwhile is not in ratatui's last frame.
+                let _ = terminal.clear();
+            }
+            let_through(|| terminal.draw(|frame| {
                 let volmap_snap = volmap_poller.as_ref().map(|p| p.snapshot());
                 let snapgraph_snap = snapgraph_poller.as_ref().map(|p| p.snapshot());
                 // Clamp cursor against the filtered visible count — state
@@ -966,9 +1029,9 @@ fn run_ui(
                     snapgraph_filter,
                     &snapgraph_marks,
                 )
-            })?;
+            }))?;
             loop {
-                if event::poll(Duration::from_millis(100))? {
+                if input_waiting(input, tty, Duration::from_millis(100))? {
                     match event::read()? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             let snapgraph_snap_for_key =
@@ -1000,7 +1063,8 @@ fn run_ui(
                 if ASKED_TO_STOP.load(Ordering::Relaxed) {
                     return Ok(());
                 }
-                if SUSPEND_ASKED.load(Ordering::Relaxed) || CONTINUED.load(Ordering::Relaxed) {
+                // A suspend, a continue, or the job behind.
+                if !may_touch_terminal(tty) {
                     if !job_control(terminal.backend_mut(), tty) {
                         return Ok(());
                     }
@@ -1016,7 +1080,7 @@ fn run_ui(
                 // SWISS-8i: F2View pollers update state continuously
                 // in the background; if we sleep waiting for keys,
                 // the renderer doesn't pick them up. Break the inner
-                // wait on each 100 ms event::poll tick while we're
+                // wait on each 100 ms tick of the input wait while we're
                 // in F2View so the pollers' VolumeMapState /
                 // SnapshotGraphState changes redraw within ≤ 100 ms.
                 if copy_batch.is_some() || delete_batch.is_some()
@@ -1880,7 +1944,7 @@ fn text_max(d: &LocalDialog) -> usize {
 }
 
 /// A name, of a directory, a snapshot or a volume: one path component.
-const NAME_MAX: usize = 255;
+pub(crate) const NAME_MAX: usize = 255;
 
 /// A volume's size as typed, 64M say.
 const SIZE_MAX: usize = 32;

@@ -13,6 +13,7 @@ tree for vol and host).
 """
 import codecs
 import fcntl
+import glob
 import inspect
 import os
 import pty
@@ -258,7 +259,8 @@ class Term:
             self.rc = -9
         # A manager that strands its daemons fails its own leg. Here it must not also fail the next
         # leg, which needs the volume these still hold.
-        session = f'stratum-{self.pid}/'
+        # mkdtemp's six characters follow the pid.
+        session = f'stratum-{self.pid}-[^/]*/'
         for pid in session_daemons(session):
             os.kill(int(pid), signal.SIGTERM)
         end = time.monotonic() + 30
@@ -457,7 +459,7 @@ def session_dir_guesses(pid):
         r = subprocess.run(['getconf', 'DARWIN_USER_TEMP_DIR'], capture_output=True, text=True)
         bases.add(r.stdout.strip() if r.returncode == 0 else None)
     bases -= {None, ''}
-    return {f"{b.rstrip('/')}/stratum-{pid}" for b in bases if os.path.isdir(f"{b.rstrip('/')}/stratum-{pid}")}
+    return {d for b in bases for d in glob.glob(f"{b.rstrip('/')}/stratum-{pid}-*") if os.path.isdir(d)}
 
 
 def resize_leg(stratum, vol, host, root):
@@ -1091,6 +1093,18 @@ def job_behind(term, how):
         raise Failure(f'{how}: the job shell did not take the terminal: it proves nothing')
 
 
+def wait_quiet(term, how, quiet=1.0, limit=15):
+    """Once the screen has written nothing for `quiet` seconds: its start's own draws are over."""
+    end = time.monotonic() + limit
+    seen = len(term.raw)
+    while time.monotonic() < end:
+        term.pump(quiet)
+        if len(term.raw) == seen:
+            return
+        seen = len(term.raw)
+    raise Failure(f'{how}: the screen never went quiet: it proves nothing')
+
+
 def wait_until(term, what, timeout):
     """`what()` once true, or when the time is up. The terminal is read meanwhile: one set
     with TCSAFLUSH waits for its output to be read."""
@@ -1106,6 +1120,10 @@ HELD_MODES = {'ECHO': False, 'ICANON': True, 'ISIG': True}
 # The emulator's private modes as the shell needs them: the main screen, no mouse reports, the
 # cursor shown.
 SHELL_PRIVATE = {'1049': 'l', '1000': 'l', '25': 'h'}
+
+
+# A cell placed: how the screen draws, and nothing a shell or the screen's way out writes.
+DRAWN = re.compile(rb'\x1b\[\d+;\d+H')
 
 
 def private_modes(term):
@@ -1340,7 +1358,9 @@ def screen_job_control_leg(stratum, vol, host, root):
     key) puts the terminal back before it stops, and `fg` takes it raw again. Stopped by a STOP,
     which nothing can catch, then continued behind by `bg`, it stops again rather than draw from
     behind; a `kill -HUP %1` there ends it with the terminal left to the shell, not stopped for
-    it and not set under it."""
+    it and not set under it. It never reads or draws from behind, where the kernel would stop it
+    inside the call and a HUP could not end it: not with a key waiting at the continue, not with
+    the terminal taken from under it running, not with a pass under way at the stop."""
     def tstp_then_fg(term, how, manager):
         os.kill(manager, signal.SIGTSTP)
         state = wait_state(term, manager, 'T', 10)
@@ -1370,20 +1390,77 @@ def screen_job_control_leg(stratum, vol, host, root):
         except FileNotFoundError:
             return []
 
-    def stop_bg_hup(term, how, manager):
+    ttin, ttou = f'stopped {int(signal.SIGTTIN)}', f'stopped {int(signal.SIGTTOU)}'
+
+    def stopped_by_hand(term, how, manager):
         os.kill(manager, signal.SIGSTOP)
         stop = f'stopped {int(signal.SIGSTOP)}'
         if not wait_until(term, lambda: reports() == [stop], 10):
             raise Failure(f'{how}: the shell saw {reports()}, not {[stop]}: it proves nothing')
+
+    def stop_bg_hup(term, how, manager, key=False):
+        stopped_by_hand(term, how, manager)
         job_behind(term, how)
+        if key:
+            # Input for the shell: the screen must not read it from behind.
+            term.send(b'x')
         os.killpg(os.getpgid(manager), signal.SIGCONT)
         # It stops again within a tick of the continue, too soon for a poll of its state to see
         # it running. A second stop can only follow a continue, and SIGTTOU is the stop a job
         # behind takes for the terminal.
-        ttou = f'stopped {int(signal.SIGTTOU)}'
         again = wait_until(term, lambda: ttou in reports()[1:], 10)
-        record(again, f'{how}: continued behind, it stopped again on SIGTTOU rather than draw from behind',
-               f'{how}: continued behind, the shell saw {reports()[1:]}, no {ttou!r}; its state {state_of(manager)!r}')
+        record(again and ttin not in reports(), f'{how}: continued behind, it stopped again on SIGTTOU rather than draw from behind',
+               f'{how}: continued behind, the shell saw {reports()[1:]}, no {ttou!r} alone; its state {state_of(manager)!r}')
+        hup_ends_it(term, how, manager)
+
+    def behind_running_hup(term, how, manager):
+        # The shell takes the terminal from under the screen, running, and input follows at once,
+        # inside the screen's wait. Quiet first: a redraw after it would reach the draw's own look.
+        wait_quiet(term, how)
+        os.kill(term.pid, signal.SIGUSR1)
+        limit = time.monotonic() + 10
+        while os.tcgetpgrp(term.fd) != term.pid and time.monotonic() < limit:
+            pass
+        term.send(b'x')
+        term.expect(r'\[behind \d\]')
+        if '[behind 1]' not in term.screen.text():
+            raise Failure(f'{how}: the job shell did not take the terminal: it proves nothing')
+        stopped = wait_until(term, lambda: ttou in reports(), 10)
+        record(stopped and ttin not in reports(), f'{how}: it stopped on SIGTTOU rather than read from behind',
+               f'{how}: the shell saw {reports()}, no {ttou!r} alone; its state {state_of(manager)!r}')
+        hup_ends_it(term, how, manager)
+
+    def mid_pass_bg_hup(term, how, manager):
+        # slate held stopped: a resize starts a pass that waits on it, before its draw. Stopped
+        # there and continued behind, then slate let go, the pass must not draw from behind; under
+        # tostop such a draw would stop it inside the write.
+        slate = child_running(manager, 'slate')
+        if slate is None:
+            raise Failure(f'{how}: no slate under the manager: it proves nothing')
+        held.append(slate)
+        os.kill(slate, signal.SIGSTOP)
+        if 'T' not in wait_state(term, slate, 'T', 10):
+            raise Failure(f'{how}: slate did not stop: it proves nothing')
+        resized = len(term.raw)
+        fcntl.ioctl(term.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS - 20, 0, 0))
+        term.pump(1)
+        if DRAWN.search(bytes(term.raw[resized:])):
+            raise Failure(f'{how}: the resize was drawn with slate stopped, so no pass waits on it: it proves nothing')
+        stopped_by_hand(term, how, manager)
+        job_behind(term, how)
+        behind = len(term.raw)
+        os.killpg(os.getpgid(manager), signal.SIGCONT)
+        # macOS reports no continue to the shell: its state says it.
+        if not wait_until(term, lambda: 'T' not in state_of(manager), 10):
+            raise Failure(f'{how}: not continued, its state {state_of(manager)!r}: it proves nothing')
+        os.kill(slate, signal.SIGCONT)
+        again = wait_until(term, lambda: ttou in reports()[1:], 10)
+        drawn = DRAWN.search(bytes(term.raw[behind:]))
+        record(again and not drawn, f'{how}: the pass drew nothing from behind, and it stopped on SIGTTOU',
+               f'{how}: drawn from behind={bool(drawn)}, the shell saw {reports()}; its state {state_of(manager)!r}')
+        hup_ends_it(term, how, manager)
+
+    def hup_ends_it(term, how, manager):
         os.kill(manager, signal.SIGHUP)
         os.killpg(os.getpgid(manager), signal.SIGCONT)
         ended = term.exited(30)
@@ -1398,13 +1475,21 @@ def screen_job_control_leg(stratum, vol, host, root):
         record(private == SHELL_PRIVATE, f'{how}: it left the main screen, mouse reports off, the cursor shown',
                f'{how}: its private modes were left {private}, not {SHELL_PRIVATE}')
 
+    held = []
     cases = (('the screen, a TSTP from outside, then fg', (), tstp_then_fg),
              ('the screen, a STOP, bg, then kill -HUP', ('--editor', f'--report={report}'), stop_bg_hup),
              ('the screen, tostop set, a STOP, bg, then kill -HUP', ('--editor', '--tostop', f'--report={report}'),
-              stop_bg_hup))
+              stop_bg_hup),
+             ('the screen, a STOP, bg with a key waiting, then kill -HUP', ('--editor', f'--report={report}'),
+              lambda term, how, manager: stop_bg_hup(term, how, manager, key=True)),
+             ('the screen, put behind running with a key waiting, then kill -HUP', ('--editor', f'--report={report}'),
+              behind_running_hup),
+             ('the screen, tostop set, a STOP mid-pass, bg, then kill -HUP', ('--editor', '--tostop', f'--report={report}'),
+              mid_pass_bg_hup))
     for how, flags, then in cases:
         if os.path.exists(report):
             os.unlink(report)
+        held.clear()
         term = Term([sys.executable, '-I', '-c', JOB_SHELL, *flags, stratum, 'tui', '--vol', vol.v, '--host', host])
         manager, session = None, None
         try:
@@ -1420,7 +1505,7 @@ def screen_job_control_leg(stratum, vol, host, root):
             print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
             raise
         finally:
-            job_cleanup(term, [], session)
+            job_cleanup(term, held, session)
 
 
 def screen_started_behind_leg(stratum, root):
@@ -3017,7 +3102,7 @@ def helper_checks():
         # With TMPDIR unset std uses the user's temporary directory, and Python /tmp.
         user = subprocess.run(['getconf', 'DARWIN_USER_TEMP_DIR'], capture_output=True, text=True).stdout.strip()
         fake = 4_000_000 + os.getpid()
-        made = f"{user.rstrip('/')}/stratum-{fake}"
+        made = f"{user.rstrip('/')}/stratum-{fake}-aB3xYz"
         os.mkdir(made)
         saved = {k: os.environ.pop(k) for k in ('TMPDIR', 'XDG_RUNTIME_DIR') if k in os.environ}
         tempfile.tempdir = None

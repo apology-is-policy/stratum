@@ -1059,21 +1059,52 @@ mod prompt_tests {
     }
 
     /// A program started from a helper gets each signal back: a shell sending itself one
-    /// ends by it. One started plainly there, one variable away, keeps TERM blocked and goes
-    /// on, as std hands a child its spawner's mask.
+    /// ends by it, and its exec finds none of the eight blocked. One started plainly there,
+    /// one variable away, keeps them blocked, as std hands a child its spawner's mask.
     #[test]
     fn a_program_started_from_a_helper_has_the_signals_back() {
-        let ends = spawn_helper("test-spawner", || {
-            let run = |sig: &str, own: bool| {
+        use std::os::unix::process::CommandExt;
+        let (ends, unblocked) = spawn_helper("test-spawner", || {
+            let shell = |line: &str, own: bool| {
                 let mut sh = std::process::Command::new("/bin/sh");
-                sh.args(["-c", &format!("kill -{sig} $$; echo alive")]);
+                sh.args(["-c", line]);
+                // Whatever this test's own parent ignores, as nohup does: only the mask is asked.
+                unsafe {
+                    sh.pre_exec(|| {
+                        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                            libc::signal(sig, libc::SIG_DFL);
+                        }
+                        Ok(())
+                    });
+                }
                 if own {
                     as_its_own_program(&mut sh);
                 }
-                let out = sh.output().expect("a shell");
+                sh
+            };
+            let run = |sig: &str, own: bool| {
+                let out = shell(&format!("kill -{sig} $$; echo alive"), own).output().expect("a shell");
                 (std::os::unix::process::ExitStatusExt::signal(&out.status), out.stdout)
             };
-            [run("TERM", false), run("TERM", true), run("INT", true), run("HUP", true)]
+            // The mask as the exec finds it, after as_its_own_program's own step.
+            let unblocked = |own: bool| {
+                let mut sh = shell("exit 0", own);
+                unsafe {
+                    sh.pre_exec(|| {
+                        let mut mask: libc::sigset_t = std::mem::zeroed();
+                        libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask);
+                        if ASKED.iter().any(|&sig| libc::sigismember(&mask, sig) == 1) {
+                            return Err(io::Error::from_raw_os_error(libc::EDOM));
+                        }
+                        Ok(())
+                    });
+                }
+                sh.status().is_ok()
+            };
+            (
+                [run("TERM", false), run("TERM", true), run("INT", true), run("HUP", true)],
+                [unblocked(false), unblocked(true)],
+            )
         })
         .expect("a helper")
         .join()
@@ -1082,6 +1113,8 @@ mod prompt_tests {
         assert_eq!(ends[1].0, Some(libc::SIGTERM), "TERM stayed blocked");
         assert_eq!(ends[2].0, Some(libc::SIGINT), "INT stayed blocked");
         assert_eq!(ends[3].0, Some(libc::SIGHUP), "HUP stayed blocked");
+        assert!(!unblocked[0], "a plain child of a helper had none of the eight blocked: it proves nothing");
+        assert!(unblocked[1], "one of the eight stayed blocked at the exec");
     }
 
     /// Two holds at once, as the tests here make: the second takes none of the handlers,

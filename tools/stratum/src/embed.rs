@@ -12,8 +12,8 @@
 //!     descriptors + atomic globals are isolated. The Rust parent's
 //!     SIGINT/SIGTERM only affects the parent (which then SIGTERMs
 //!     children on TUI exit).
-//!   - Sockets live in $XDG_RUNTIME_DIR/stratum-<pid>/, or under the
-//!     temporary directory without it. Removed at shutdown.
+//!   - Sockets live in $XDG_RUNTIME_DIR/stratum-<pid>-XXXXXX/ (mkdtemp), or
+//!     under the temporary directory without it. Removed at shutdown.
 //!   - `--print-env-to FILE` writes STRATUM_SLATE_SOCK + STRATUMD_SOCK
 //!     in shell-source-able format, so external tools (Claude included)
 //!     can drive slate / stratumd in parallel via `stratum fs -s …`.
@@ -681,34 +681,36 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
-/// Allocate a per-pid session dir under $XDG_RUNTIME_DIR, or the temporary
-/// directory without it. run() removes it through a SessionDir.
-///
-/// R126 P1-2 + P3-2: refuse-if-exists posture. PIDs collide on long-
-/// running systems, and the dir name is predictable enough that an
-/// attacker on the same host can pre-create a symlink to a victim
-/// directory. We use mkdir(O_EXCL semantics) — `fs::DirBuilder` with
-/// no `recursive(true)` returns Err if the path exists OR is a
-/// symlink to anything. Mode 0700 so only the calling user can see
-/// the sockets.
+/// The session dir, under $XDG_RUNTIME_DIR, or the temporary directory without it. run()
+/// removes it through a SessionDir.
 fn make_session_dir() -> Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-    let pid = std::process::id();
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    // Ensure the BASE dir exists (XDG_RUNTIME_DIR is usually pre-
-    // created by systemd-logind; $TMPDIR always does). We only mkdir
-    // the per-pid LEAF with O_EXCL semantics.
+    // XDG_RUNTIME_DIR is usually made by systemd-logind, and $TMPDIR always is: only the
+    // session's own directory is made here.
     if !base.exists() {
         bail!("session dir parent {} does not exist", base.display());
     }
-    let dir = base.join(format!("stratum-{pid}"));
-    let mut db = fs::DirBuilder::new();
-    db.mode(0o700);
-    db.create(&dir)
-        .with_context(|| format!("mkdir(O_EXCL) {}", dir.display()))?;
-    Ok(dir)
+    make_session_dir_in(&base)
+}
+
+/// A directory of the session's own in `base`, made as mkdtemp makes one: 0700, never one
+/// already there, under a name no one knows ahead. A name from the pid alone could be taken
+/// already, by a directory a manager killed with SIGKILL left behind with a pid now reused,
+/// or by another user in a shared /tmp, and the manager could not start. The pid leads the
+/// name, for whoever looks.
+fn make_session_dir_in(base: &Path) -> Result<PathBuf> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let template = base.join(format!("stratum-{}-XXXXXX", std::process::id()));
+    let mut name = template.as_os_str().as_bytes().to_vec();
+    name.push(0);
+    if unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("mkdtemp {}", template.display()));
+    }
+    name.pop();
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(name)))
 }
 
 /// SIGKILL and reap: a daemon still binding its socket is gone before the session
@@ -746,7 +748,30 @@ fn wait_for_sock(path: &Path, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionDir;
+    use super::{make_session_dir_in, SessionDir};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A directory at the name the pid alone would give, as a manager killed with SIGKILL
+    /// leaves behind, does not stop the next one; each gets a 0700 directory of its own.
+    #[test]
+    fn a_session_directory_left_behind_is_no_obstacle() {
+        let base = std::env::temp_dir().join(format!("stratum-base-test-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        let left = base.join(format!("stratum-{}", std::process::id()));
+        std::fs::create_dir(&left).unwrap();
+        let made = (make_session_dir_in(&base), make_session_dir_in(&base));
+        let modes: Vec<u32> = [&made.0, &made.1]
+            .iter()
+            .filter_map(|m| m.as_ref().ok())
+            .map(|d| std::fs::metadata(d).map_or(0, |m| m.permissions().mode() & 0o777))
+            .collect();
+        let _ = std::fs::remove_dir_all(&base);
+        let (one, two) = (made.0.expect("a session directory"), made.1.expect("a second one"));
+        assert_ne!(one, two, "two sessions shared a directory");
+        assert_eq!(modes, [0o700, 0o700]);
+        let lead = format!("stratum-{}-", std::process::id());
+        assert!(one.file_name().unwrap().to_str().unwrap().starts_with(&lead), "{}", one.display());
+    }
 
     #[test]
     fn a_panic_still_removes_the_session_directory() {
