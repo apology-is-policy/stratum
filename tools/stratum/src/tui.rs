@@ -462,6 +462,11 @@ static SCREEN_ON: AtomicBool = AtomicBool::new(false);
 /// continued fails with EINTR on macOS, and crossterm keeps its saved mode then, so it is
 /// tried again.
 fn leave_screen(out: &mut impl io::Write) {
+    // What crossterm was never told of would be the shell's next input: the rest of a paste
+    // run as commands.
+    if INPUT_STUCK.swap(false, Ordering::Relaxed) {
+        unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+    }
     while disable_raw_mode().is_err_and(|e| e.kind() == io::ErrorKind::Interrupted) {}
     let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
     SCREEN_ON.store(false, Ordering::Relaxed);
@@ -536,7 +541,10 @@ fn input_waiting(input: Option<RawFd>, tty: Option<i32>, timeout: Duration) -> i
     let start = Instant::now();
     let mut ready = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
     match unsafe { libc::poll(&mut ready, 1, poll_ms(timeout)) } {
-        0 => return Ok(false),
+        0 => {
+            INPUT_STUCK.store(false, Ordering::Relaxed);
+            return Ok(false);
+        }
         n if n < 0 => {
             let e = io::Error::last_os_error();
             return if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) };
@@ -556,6 +564,7 @@ fn input_waiting(input: Option<RawFd>, tty: Option<i32>, timeout: Duration) -> i
     // again only when more come; on macOS a key typed while the terminal was canonical is moved
     // by the mode change without a wakeup. This poll answers at once for as long as they wait,
     // so the rest of the tick is waited out rather than spin; a signal still ends it.
+    INPUT_STUCK.store(true, Ordering::Relaxed);
     let left = timeout.saturating_sub(start.elapsed());
     if !left.is_zero() {
         unsafe { libc::poll(std::ptr::null_mut(), 0, poll_ms(left)) };
@@ -596,7 +605,15 @@ impl OwnInput {
         }
         let saved = unsafe { std::os::fd::OwnedFd::from_raw_fd(saved) };
         let flags = libc::O_RDWR | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
-        let fd = unsafe { libc::open(path.as_ptr(), flags) };
+        #[allow(unused_mut)]
+        let mut fd = unsafe { libc::open(path.as_ptr(), flags) };
+        // The terminal's node is not ours to open after su to another user; /dev/tty is the
+        // same terminal when standard input's is the controlling one. kqueue cannot watch
+        // /dev/tty, so on macOS standard input stays as it is then (T0.78).
+        #[cfg(target_os = "linux")]
+        if fd < 0 && unsafe { libc::isatty(0) == 1 && libc::tcgetsid(0) == libc::getsid(0) } {
+            fd = unsafe { libc::open(c"/dev/tty".as_ptr(), flags) };
+        }
         if fd < 0 {
             return None;
         }
@@ -614,6 +631,8 @@ impl Drop for OwnInput {
 }
 
 static SUSPEND_ASKED: AtomicBool = AtomicBool::new(false);
+/// Input waits on the terminal that crossterm has not been told of (T5.19).
+static INPUT_STUCK: AtomicBool = AtomicBool::new(false);
 static CONTINUED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn ask_to_suspend(_: libc::c_int) {
@@ -664,6 +683,8 @@ fn job_control(out: &mut impl io::Write, tty: Option<i32>) -> bool {
             enter_screen(out);
             return true;
         }
+        // Left on behind, the mouse reports reach the shell as keys.
+        leave_screen_behind(out);
         // A SIGTTOU stops it only at its default action, and only while not blocked; and
         // an orphaned group is never stopped. Each look then waits a moment.
         let mut ttou: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -2985,7 +3006,7 @@ fn submit_mkvol(
     // either to keep the volume in the active panel's CWD).
     if name_refused(name) || name.contains('\\') {
         let mut new_mk = mk.clone();
-        new_mk.error = Some("Name must not contain '/' or control characters".into());
+        new_mk.error = Some("Name must not contain '/', control characters or U+FFFD".into());
         *local_dialog = Some(LocalDialog {
             kind: LocalDialogKind::MkVol(new_mk),
             ..dialog
@@ -3222,7 +3243,7 @@ fn submit_dialog(
             }
             if name_refused(&name) {
                 *local_dialog = Some(error_dialog(
-                    "Name must not contain '/' or control characters.",
+                    "Name must not contain '/', control characters or U+FFFD.",
                 ));
                 return Ok(Action::Refresh);
             }
@@ -3584,9 +3605,10 @@ fn mount_stm_volume(
 }
 
 /// A name typed for something new, which the panels must then be able to act on: one holding
-/// a control character, C1 too, they list with U+FFFD standing in and act on nowhere.
+/// a control character, C1 too, they list with U+FFFD standing in and act on nowhere, and one
+/// holding U+FFFD itself they take for such a stand-in.
 fn name_refused(name: &str) -> bool {
-    name.chars().any(|c| c.is_control() || c == '/')
+    name.chars().any(|c| c.is_control() || c == '/' || c == '\u{FFFD}')
 }
 
 /// A name from a listing, before it goes into a path. A volume can hold nearly any
@@ -5480,7 +5502,7 @@ mod tests {
             assert!(name_is_safe(good), "{good:?} refused");
         }
         // A name typed for something new is refused for the same characters.
-        for bad in ["n\u{85}l", "a\u{9b}2J", "a\u{1b}b", "a\u{7f}", "a/b"] {
+        for bad in ["n\u{85}l", "a\u{9b}2J", "a\u{1b}b", "a\u{7f}", "a/b", "caf\u{fffd}"] {
             assert!(name_refused(bad), "{bad:?} taken for a new name");
         }
         for good in ["caf\u{e9}", "n\u{a0}l", "a b"] {

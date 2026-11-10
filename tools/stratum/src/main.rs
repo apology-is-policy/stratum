@@ -41,12 +41,23 @@ mod tui;
 mod ui;
 mod volmap;
 
-fn main() -> Result<()> {
+fn main() {
     no_core_dumps();
     children_waited_for();
     let args: Vec<String> = std::env::args().collect();
-    let exit_code = dispatch(args)?;
-    std::process::exit(exit_code);
+    match dispatch(args) {
+        Ok(exit_code) => std::process::exit(exit_code),
+        Err(e) => {
+            spawn::tell(format_args!("{}", error_report(&e)));
+            std::process::exit(1);
+        }
+    }
+}
+
+/// What std prints for an error main returns, with control characters stood in for: a path in
+/// the chain, or a daemon's log line, can be anyone's text.
+fn error_report(e: &anyhow::Error) -> String {
+    ui::sanitize_for_display(&format!("Error: {e:?}"))
 }
 
 /// A core holds whatever passphrase or key the process has in memory, and a signal's default
@@ -308,5 +319,16 @@ mod tests {
         };
         assert!(!waits(false), "with SIGCHLD ignored a child was still waited for: it proves nothing");
         assert!(waits(true), "the child was reaped unseen: SIGCHLD was left ignored");
+    }
+
+    /// A volume's name, or a daemon's log line, in an error goes to the terminal without its
+    /// control characters.
+    #[test]
+    fn an_error_reaches_the_terminal_without_its_control_characters() {
+        let e = anyhow::anyhow!("stratumd: wrong passphrase for x\u{1b}]2;t\u{7}.key")
+            .context("stratumd failed to start\nstratumd log:\n  a\u{9b}2J");
+        let said = super::error_report(&e);
+        assert!(!said.chars().any(|c| c.is_control() && c != '\n'), "{said:?}");
+        assert!(said.starts_with("Error: ") && said.contains("x?]2;t?.key") && said.contains("a?2J"), "{said:?}");
     }
 }

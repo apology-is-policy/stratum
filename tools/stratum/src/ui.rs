@@ -94,7 +94,7 @@ const CLR_POPUP_BG: Color = Color::Black;
 // contain tabs. The trade-off: a malicious file CAN still embed
 // printable ASCII, but printable ASCII can't escape the rendered
 // cell.
-fn sanitize_for_display(s: &str) -> String {
+pub(crate) fn sanitize_for_display(s: &str) -> String {
     s.chars()
         .map(|ch| if ch.is_control() && ch != '\n' && ch != '\t' { '?' } else { ch })
         .collect()

@@ -53,6 +53,11 @@ struct PanelPlan {
 }
 
 pub fn run(opts: EmbedOpts) -> Result<()> {
+    for (what, path) in [("volume", &opts.volume), ("keyfile", &opts.keyfile), ("--host", &opts.host)] {
+        if let Some(p) = path {
+            refuse_unprintable(what, p)?;
+        }
+    }
     if let Some(v) = opts.volume.as_ref() {
         if !v.exists() {
             bail!("volume {} does not exist; run `stratum mkfs` first", v.display());
@@ -172,7 +177,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         let passphrase = if needs_passphrase {
             let label = format!(
                 "Passphrase for {}: ",
-                vol.file_name().unwrap_or_default().to_string_lossy()
+                crate::ui::sanitize_for_display(&vol.file_name().unwrap_or_default().to_string_lossy())
             );
             match crate::passphrase::prompt_passphrase(&label) {
                 Ok((p, held)) => {
@@ -590,6 +595,18 @@ fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigse
 /// Starts a daemon with SIGTTOU blocked, which it keeps across exec. In a process group of
 /// its own it is never in front, and in headless mode its stderr is the terminal: under
 /// `stty tostop` its first write there would stop it for good, and the session with it.
+/// A path holding a control character, or not UTF-8, is opened nowhere, as the panels act on no
+/// such name: the daemons write the paths they are given to the terminal as they are.
+pub(crate) fn refuse_unprintable(what: &str, p: &Path) -> Result<()> {
+    match p.to_str() {
+        Some(s) if !s.contains(char::is_control) => Ok(()),
+        _ => bail!(
+            "{what} {:?} holds a control character or is not UTF-8: rename it to open it",
+            p.to_string_lossy()
+        ),
+    }
+}
+
 fn spawn_daemon(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     let mut ttou: libc::sigset_t = unsafe { std::mem::zeroed() };
     let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -788,5 +805,21 @@ mod tests {
         });
         assert!(unwound.is_err());
         assert!(!dir.exists());
+    }
+
+    /// A path whose name holds a control character, C1 too, or is not UTF-8, is opened nowhere,
+    /// and the refusal shows it escaped.
+    #[test]
+    fn a_path_with_a_control_character_is_opened_nowhere() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+        let not_utf8 = std::ffi::OsStr::from_bytes(b"caf\xe9.stm");
+        for bad in [Path::new("x\u{1b}]2;t\u{7}.stm"), Path::new("n\u{85}l.stm"), Path::new(not_utf8)] {
+            let said = super::refuse_unprintable("volume", bad).expect_err("taken").to_string();
+            assert!(!said.chars().any(char::is_control), "{said:?}");
+        }
+        for good in ["plain.stm", "caf\u{e9}.stm", "/tmp/a b/v.stm"] {
+            assert!(super::refuse_unprintable("volume", Path::new(good)).is_ok(), "{good:?} refused");
+        }
     }
 }

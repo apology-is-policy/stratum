@@ -71,7 +71,7 @@ pub fn run() -> Result<()> {
             open_volume(&recents[idx - 1])
         }
         other => {
-            eprintln!("stratum: unrecognized choice: {other}");
+            eprintln!("stratum: unrecognized choice: {}", crate::ui::sanitize_for_display(other));
             Ok(())
         }
     }
@@ -79,7 +79,7 @@ pub fn run() -> Result<()> {
 
 /// One recent volume as a row of the chooser, cut by characters because a path need not be ASCII.
 fn recent_line(i: usize, vol: &Path) -> String {
-    let line = format!("    [{}] {}", i + 1, vol.display());
+    let line = format!("    [{}] {}", i + 1, crate::ui::sanitize_for_display(&vol.display().to_string()));
     if line.chars().count() <= 41 {
         return line;
     }
@@ -91,7 +91,7 @@ fn prompt_open(recents: &[PathBuf]) -> Result<()> {
     if !recents.is_empty() {
         println!("              Recent volumes:");
         for (i, vol) in recents.iter().enumerate().take(5) {
-            println!("                [{}] {}", i + 1, vol.display());
+            println!("                [{}] {}", i + 1, crate::ui::sanitize_for_display(&vol.display().to_string()));
         }
     }
     print!("              Volume path (or 1-{} for recent): ", recents.len().min(5));
@@ -124,6 +124,10 @@ fn prompt_new() -> Result<()> {
         return Ok(());
     }
     let path = PathBuf::from(trimmed);
+    if let Err(e) = crate::embed::refuse_unprintable("volume", &path) {
+        eprintln!("stratum: {e}");
+        return Ok(());
+    }
     if path.exists() {
         eprintln!("stratum: {} already exists; refusing to overwrite", path.display());
         return Ok(());
@@ -212,6 +216,7 @@ fn prompt_new() -> Result<()> {
 }
 
 fn open_volume(path: &Path) -> Result<()> {
+    crate::embed::refuse_unprintable("volume", path)?;
     add_to_recents(path);
     embed::run(embed::EmbedOpts {
         volume: Some(path.to_path_buf()),

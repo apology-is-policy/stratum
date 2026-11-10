@@ -1045,6 +1045,19 @@ while True:
         os.write(report, b'continued\n')
     else:
         break
+if '--read-after' in flags:
+    import time
+    os.tcsetpgrp(0, os.getpgrp())
+    a = termios.tcgetattr(0)
+    a[3] &= ~termios.ICANON
+    a[6][termios.VMIN], a[6][termios.VTIME] = 0, 0
+    termios.tcsetattr(0, termios.TCSANOW, a)
+    time.sleep(0.3)
+    try:
+        left = os.read(0, 65536)
+    except OSError:
+        left = b''
+    os.write(1, b'[left %d]\r\n' % len(left))
 sys.exit(os.waitstatus_to_exitcode(status) & 0xff)
 """
 
@@ -1433,6 +1446,12 @@ def screen_job_control_leg(stratum, vol, host, root):
         again = wait_until(term, lambda: ttou in reports()[1:], 10)
         record(again and ttin not in reports(), f'{how}: continued behind, it stopped again on SIGTTOU rather than draw from behind',
                f'{how}: continued behind, the shell saw {reports()[1:]}, no {ttou!r} alone; its state {state_of(manager)!r}')
+        # Left on, the mouse reports would reach the shell as keys while it waits there.
+        term.pump(0.3)
+        private = private_modes(term)
+        record(again and private == SHELL_PRIVATE,
+               f'{how}: stopped behind, it had first given back the alternate screen, the mouse and the cursor',
+               f'{how}: stopped behind with its private modes {private}, not {SHELL_PRIVATE}')
         hup_ends_it(term, how, manager)
 
     def behind_running_hup(term, how, manager):
@@ -1644,7 +1663,9 @@ def input_spin_leg(stratum, root):
     """Input the screen's own wait sees and crossterm does not report must not spin the screen:
     it waits out the rest of each tick. Two ways there. On macOS a key typed while the terminal
     was canonical, which the screen's mode change at `fg` moves without a wakeup. On Linux input
-    past crossterm's read of 1024 bytes, which its edge-triggered poll does not report again."""
+    past crossterm's read of 1024 bytes, which its edge-triggered poll does not report again.
+    Each case first shows its input stuck, or notes that this system cannot make it so; and after
+    the measure, that a key still gets an answer: a wait that hung would burn no CPU either."""
     w = f'{root}/spin-host'
     os.makedirs(w, exist_ok=True)
     with open(f'{w}/onefile.txt', 'w') as f:
@@ -1677,11 +1698,19 @@ def input_spin_leg(stratum, root):
             raise Failure(f'{how}: the TSTP did not stop it: it proves nothing')
         if not tty_modes(term)['ICANON']:
             raise Failure(f'{how}: stopped, the terminal is {tty_modes(term)}, not canonical: it proves nothing')
-        term.send(b'x')
+        term.send(b'zq')
         os.kill(term.pid, signal.SIGUSR2)
         if not wait_until(term, lambda: tty_modes(term) == RAW_MODES, 10):
             raise Failure(f'{how}: after fg the terminal is {tty_modes(term)}: it proves nothing')
-        idle(term, how, manager)
+        wait_quiet(term, how)
+        if 'zq' in term.screen.text():
+            print(f'note: {how}: the screen read the key at fg here, so nothing is stuck to measure', flush=True)
+        else:
+            idle(term, how, manager)
+            term.send(b'jx')
+            answered = wait_until(term, lambda: 'zqjx' in term.screen.text(), 2)
+            record(answered, f'{how}: and a key after it reached the field, the stuck one first',
+                   f'{how}: a key after it got no answer in 2 s')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -1692,17 +1721,108 @@ def input_spin_leg(stratum, root):
     term = Term([stratum, 'tui', '--host', w])
     try:
         dialog(term, how)
-        flags = fcntl.fcntl(term.fd, fcntl.F_GETFL)
-        fcntl.fcntl(term.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-        try:
-            taken = os.write(term.fd, b'a' * 3000)
-        except BlockingIOError:
-            taken = 0
-        finally:
-            fcntl.fcntl(term.fd, fcntl.F_SETFL, flags)
-        # macOS holds about 1 KB of input for a pty, so only Linux tells here.
-        print(f'note: {how}: the terminal took {taken} bytes', flush=True)
-        idle(term, how, term.pid)
+        taken = paste(term, b'a' * 3000)
+        if taken <= 1024:
+            # macOS holds about 1 KB of input for a pty: crossterm reads it all at once.
+            print(f'note: {how}: the terminal took {taken} bytes, one read for crossterm, so nothing is stuck to measure', flush=True)
+        else:
+            wait_quiet(term, how)
+            read = field_count(term)
+            if read >= taken:
+                raise Failure(f'{how}: the field holds all {taken} bytes, so nothing is stuck: it proves nothing')
+            idle(term, how, term.pid)
+            term.send(b'b')
+            more = wait_until(term, lambda: field_count(term) > read, 2)
+            record(more, f'{how}: and a key after it let more of them through ({read} then {field_count(term)})',
+                   f'{how}: a key after it got no answer in 2 s ({read} read of {taken})')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+
+def paste(term, data):
+    """Writes `data` to the terminal at once, as a paste comes; returns how much it took."""
+    flags = fcntl.fcntl(term.fd, fcntl.F_GETFL)
+    fcntl.fcntl(term.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        return os.write(term.fd, data)
+    except BlockingIOError:
+        return 0
+    finally:
+        fcntl.fcntl(term.fd, fcntl.F_SETFL, flags)
+
+
+def field_count(term):
+    """How many characters the F7 field has been given: its kept 255 and its count over them."""
+    m = re.search(r'\(\+(\d+) over\)', term.screen.text())
+    return 255 + int(m.group(1)) if m else 0
+
+
+def leftover_input_leg(stratum, root):
+    """Input crossterm was never told of (T5.19) must not become the shell's when the screen
+    ends, where the rest of a paste would run as commands: a TERM ends the screen with input
+    stuck, and the job shell then reads what the terminal still holds. The two ways to stuck
+    input of input_spin_leg; each first shows its input stuck, or notes it cannot be here."""
+    w = f'{root}/leftover-host'
+    os.makedirs(w, exist_ok=True)
+    with open(f'{w}/onefile.txt', 'w') as f:
+        f.write('one\n')
+
+    def start(how):
+        term = Term([sys.executable, '-I', '-c', JOB_SHELL, '--read-after', stratum, 'tui', '--host', w])
+        term.expect(r'onefile\.txt', timeout=30)
+        term.send(F7)
+        term.expect(r'New directory name')
+        wait_quiet(term, how)
+        manager = child_running(term.pid, 'tui')
+        if manager is None:
+            raise Failure(f'{how}: no manager under the job shell: it proves nothing')
+        return term, manager
+
+    def left_at_the_end(term, how, manager):
+        # A tick or more for the screen's wait to find it stuck.
+        term.pump(0.5)
+        os.kill(manager, signal.SIGTERM)
+        if not wait_until(term, lambda: re.search(rb'\[left \d+\]', bytes(term.raw)), 15):
+            raise Failure(f'{how}: the job shell never said what was left: it proves nothing')
+        left = int(re.search(rb'\[left (\d+)\]', bytes(term.raw)).group(1))
+        record(left == 0, f'{how}: the shell found nothing of it left',
+               f'{how}: the shell found {left} bytes of it left, as typed input')
+
+    how = 'a key typed while stopped, then fg, then TERM'
+    term, manager = start(how)
+    try:
+        os.kill(manager, signal.SIGTSTP)
+        if 'T' not in wait_state(term, manager, 'T', 10):
+            raise Failure(f'{how}: the TSTP did not stop it: it proves nothing')
+        term.send(b'zq')
+        os.kill(term.pid, signal.SIGUSR2)
+        if not wait_until(term, lambda: tty_modes(term) == RAW_MODES, 10):
+            raise Failure(f'{how}: after fg the terminal is {tty_modes(term)}: it proves nothing')
+        wait_quiet(term, how)
+        if 'zq' in term.screen.text():
+            print(f'note: {how}: the screen read the key at fg here, so nothing is stuck', flush=True)
+        else:
+            left_at_the_end(term, how, manager)
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    how = '3000 bytes at once, then TERM'
+    term, manager = start(how)
+    try:
+        taken = paste(term, b'a' * 3000)
+        if taken <= 1024:
+            print(f'note: {how}: the terminal took {taken} bytes, one read for crossterm, so nothing is stuck', flush=True)
+        else:
+            wait_quiet(term, how)
+            if field_count(term) >= taken:
+                raise Failure(f'{how}: the field holds all {taken} bytes, so nothing is stuck: it proves nothing')
+            left_at_the_end(term, how, manager)
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -1747,6 +1867,34 @@ def escape_prefix_leg(stratum, root):
     finally:
         term.kill()
 
+    # The terminal's node shut to its user, as after su to another one: on Linux /dev/tty is
+    # the same terminal. macOS cannot watch /dev/tty, and there the freeze stays (T0.78).
+    how = 'ESC O, then TERM, the terminal node shut'
+    if not sys.platform.startswith('linux'):
+        print(f'note: {how}: Linux only, where /dev/tty stands in for the node', flush=True)
+        return
+    term = Term(['/bin/sh', '-c', 't=$(tty); chmod 000 "$t"; [ -r "$t" ] || echo node-shut; exec "$0" tui --host "$1"',
+                 stratum, w])
+    try:
+        term.expect(r'onefile\.txt', timeout=30)
+        if b'node-shut' not in term.raw:
+            raise Failure(f'{how}: the node stayed open to its user: it proves nothing')
+        wait_quiet(term, how)
+        term.send(b'\x1bO')
+        term.pump(1)
+        if os.waitpid(term.pid, os.WNOHANG)[0]:
+            raise Failure(f'{how}: ESC O ended it: it proves nothing')
+        os.kill(term.pid, signal.SIGTERM)
+        ended = term.exited(5)
+        state = '' if ended else state_of(term.pid)
+        record(ended, f'{how}: the TERM ended it with no key after',
+               f'{how}: the TERM did not end it in 5 s, its state {state!r}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
 
 def editor_escape_leg(stratum, root):
     """A file's text shown in the editor sends no control character to the terminal: the OSC in
@@ -1770,6 +1918,114 @@ def editor_escape_leg(stratum, root):
         record(not osc and not bel and shown,
                f'{how}: the terminal got no control from it, and it shows as text',
                f'{how}: OSC sent={osc}, BEL sent={bel}, shown as text={shown}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+
+def unprintable_volume_leg(stratum, vol, host, root):
+    """A volume whose name holds a control character is opened nowhere, and nothing said about
+    it sends that character to the terminal: not the passphrase prompt, not an error. The same
+    volume under a plain name prompts, one variable away. The landing screen's New refuses such
+    a path too."""
+    d = f'{root}/unprintable'
+    os.makedirs(d, exist_ok=True)
+    plain, hostile = f'{d}/plain.stm', f'{d}/x\x1b]2;PWNED\x07.stm'
+    for name in (plain, hostile):
+        os.symlink(vol.v, name)
+        os.symlink(vol.v + '.key', name + '.key')
+
+    def clean(term):
+        sent = bytes(term.raw)
+        return b'\x1b]2;' not in sent and b'\x07' not in sent
+
+    how = 'a volume named with an OSC'
+    term = Term([stratum, 'tui', '--vol', plain, '--host', host])
+    try:
+        term.expect(r'Passphrase for plain\.stm', timeout=30)
+        print(f'ok: {how}: the same volume under a plain name asks for its passphrase', flush=True)
+    finally:
+        term.kill()
+    term = Term([stratum, 'tui', '--vol', hostile, '--host', host])
+    try:
+        ended = term.exited(30)
+        refused = b'holds a control character' in bytes(term.raw)
+        record(ended and refused and clean(term), f'{how}: refused, and the terminal got none of its controls',
+               f'{how}: ended={ended} refused={refused}, controls kept from the terminal={clean(term)}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    for how, argv in (('a keyfile named with an OSC', ['--vol', plain, '--keyfile', hostile + '.key']),
+                      ('a --host named with an OSC', ['--host', f'{d}/h\x1b]2;PWNED\x07'])):
+        if 'host' in how:
+            os.makedirs(argv[1], exist_ok=True)
+        else:
+            argv += ['--host', host]
+        term = Term([stratum, 'tui', *argv])
+        try:
+            ended = term.exited(30)
+            refused = b'holds a control character' in bytes(term.raw)
+            record(ended and refused and clean(term), f'{how}: refused, and the terminal got none of its controls',
+                   f'{how}: ended={ended} refused={refused}, controls kept from the terminal={clean(term)}')
+        finally:
+            term.kill()
+
+    # The landing screen: a recent volume kept from before, a choice typed, a path typed.
+    config = f'{os.environ["HOME"]}/.config/stratum'
+    os.makedirs(config, exist_ok=True)
+    recents = f'{config}/recents'
+    with open(recents, 'w', encoding='utf-8') as f:
+        f.write('/v/x\x1b]2;PWNED\x07.stm\n')
+    how = 'the landing screen, a recent volume named with an OSC'
+    term = Term([stratum])
+    try:
+        term.expect(r'Choose \[')
+        listed = clean(term)
+        term.send(b'o' + ENTER)
+        term.expect(r'Volume path')
+        relisted = clean(term)
+        term.send(f'{d}/typed\x1b]2;PWNED\x07.stm'.encode() + ENTER)
+        refused = wait_until(term, lambda: b'holds a control character' in bytes(term.raw), 10)
+        with open(recents, encoding='utf-8') as f:
+            kept = f.read() == '/v/x\x1b]2;PWNED\x07.stm\n'
+        record(listed and relisted and refused and clean(term) and kept,
+               f'{how}: listed twice and a typed one refused, none of their controls sent, the typed one not kept',
+               f'{how}: clean in the chooser={listed}, in Open={relisted}; refused={refused}, '
+               f'clean at the end={clean(term)}, recents unchanged={kept}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+    how = 'the landing screen, a choice typed with an OSC'
+    term = Term([stratum])
+    try:
+        term.expect(r'Choose \[')
+        term.send(b'\x1b]2;PWNED\x07' + ENTER)
+        said = wait_until(term, lambda: b'unrecognized choice' in bytes(term.raw), 10)
+        record(said and clean(term), f'{how}: refused, and none of its controls sent back',
+               f'{how}: said so={said}, controls kept from the terminal={clean(term)}')
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        term.kill()
+
+    how = "the landing screen's New, a path with an OSC"
+    term = Term([stratum])
+    try:
+        term.expect(r'Choose \[')
+        term.send(b'n' + ENTER)
+        term.expect(r'New volume path')
+        term.send(f'{d}/new\x1b]2;PWNED\x07.stm'.encode() + ENTER)
+        refused = wait_until(term, lambda: b'holds a control character' in bytes(term.raw), 10)
+        record(refused and clean(term), f'{how}: refused, and the terminal got none of its controls',
+               f'{how}: refused={refused}, controls kept from the terminal={clean(term)}')
     except Failure:
         print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
         raise
@@ -2034,7 +2290,7 @@ def wizard_legs(stratum, vol, root):
 def landing_legs(stratum, root):
     """`stratum` with no arguments, with a recent path whose 38th byte falls inside a character."""
     config = f'{os.environ["HOME"]}/.config/stratum'
-    os.makedirs(config)
+    os.makedirs(config, exist_ok=True)
     with open(f'{config}/recents', 'w', encoding='utf-8') as f:
         f.write('/volumes/' + '\u00e9' * 30 + '/v.stm\n')
 
@@ -3268,27 +3524,30 @@ def helper_checks():
         SESSION_DIRS.pop(os.getpid(), None)
     if found != listen:
         raise Failure(f'session_dir_of read {found!r} off a ps line ending in {listen}/host-fs.sock')
+    # With TMPDIR unset std uses the user's temporary directory on macOS, and Python /tmp; on Linux
+    # both use /tmp.
     if sys.platform == 'darwin':
-        # With TMPDIR unset std uses the user's temporary directory, and Python /tmp.
         user = subprocess.run(['getconf', 'DARWIN_USER_TEMP_DIR'], capture_output=True, text=True).stdout.strip()
-        fake = 4_000_000 + os.getpid()
-        made = f"{user.rstrip('/')}/stratum-{fake}-aB3xYz"
-        since = time.time()
-        os.mkdir(made)
-        saved = {k: os.environ.pop(k) for k in ('TMPDIR', 'XDG_RUNTIME_DIR') if k in os.environ}
+    else:
+        user = '/tmp'
+    fake = 4_000_000 + os.getpid()
+    made = f"{user.rstrip('/')}/stratum-{fake}-aB3xYz"
+    since = time.time()
+    os.mkdir(made)
+    saved = {k: os.environ.pop(k) for k in ('TMPDIR', 'XDG_RUNTIME_DIR') if k in os.environ}
+    tempfile.tempdir = None
+    try:
+        got = session_dir_guesses(fake, since)
+        # One variable away: the same directory, older than the manager asked about.
+        older = session_dir_guesses(fake, since + 5)
+    finally:
+        os.environ.update(saved)
         tempfile.tempdir = None
-        try:
-            got = session_dir_guesses(fake, since)
-            # One variable away: the same directory, older than the manager asked about.
-            older = session_dir_guesses(fake, since + 5)
-        finally:
-            os.environ.update(saved)
-            tempfile.tempdir = None
-            os.rmdir(made)
-        if made not in got:
-            raise Failure(f'with TMPDIR unset the guesses {got} miss {made}')
-        if older:
-            raise Failure(f'the guesses {older} take a directory made before the manager started')
+        os.rmdir(made)
+    if made not in got:
+        raise Failure(f'with TMPDIR unset the guesses {got} miss {made}')
+    if older:
+        raise Failure(f'the guesses {older} take a directory made before the manager started')
     print('ok: the session directory helpers find it off a long ps line and with TMPDIR unset, and not one older', flush=True)
 
 
@@ -3467,8 +3726,10 @@ def run(stratum, root):
                       (screen_started_behind_leg, (stratum, root)),
                       (setsid_screen_leg, (stratum, root)),
                       (input_spin_leg, (stratum, root)),
+                      (leftover_input_leg, (stratum, root)),
                       (escape_prefix_leg, (stratum, root)),
                       (editor_escape_leg, (stratum, root)),
+                      (unprintable_volume_leg, (stratum, vol, host, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
                       (wrong_passphrase_leg, (stratum, vol, host)),
                       (wizard_legs, (stratum, vol, root)),
