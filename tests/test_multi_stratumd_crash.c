@@ -27,6 +27,7 @@
  */
 
 #include "tharness.h"
+#include "tsock.h"
 #include "test_fs_common.h"
 
 #include <stratum/9p.h>
@@ -97,9 +98,7 @@ static bool wait_for_socket(const char *path, pid_t pid, int timeout_ms)
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) return false;
         struct sockaddr_un addr;
-        memset(&addr, 0, sizeof addr);
-        addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
+        tsock_addr(&addr, path);
         if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
             close(fd);
             return true;
@@ -150,9 +149,7 @@ static int dial_unix(const char *path)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
+    tsock_addr(&addr, path);
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
         close(fd);
         return -1;

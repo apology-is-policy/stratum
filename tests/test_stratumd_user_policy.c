@@ -20,6 +20,7 @@
  */
 
 #include "tharness.h"
+#include "tsock.h"
 #include "test_fs_common.h"
 
 #include "../src/cmd/stratumd/dataset_pattern.h"
@@ -126,9 +127,7 @@ static int dial_and_version(uint32_t msize)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, g_sock_path, sizeof addr.sun_path - 1);
+    tsock_addr(&addr, g_sock_path);
     /* Retry connect a few times — accept thread may not be ready. */
     for (int i = 0; i < 50; i++) {
         if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) break;

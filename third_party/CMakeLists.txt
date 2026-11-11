@@ -49,10 +49,12 @@ add_library(xxhash STATIC
 target_include_directories(xxhash PUBLIC
     ${CMAKE_CURRENT_LIST_DIR}/xxHash_src)
 
-target_compile_definitions(xxhash PUBLIC
+# For its users alone: xxhash.c defines the macro itself, and gcc has no flag to
+# pass over a second definition.
+target_compile_definitions(xxhash INTERFACE
     XXH_STATIC_LINKING_ONLY)
 
 target_compile_options(xxhash PRIVATE
-    -Wno-unused-function -Wno-unused-parameter -Wno-macro-redefined)
+    -Wno-unused-function -Wno-unused-parameter)
 
 set_target_properties(xxhash PROPERTIES POSITION_INDEPENDENT_CODE ON)

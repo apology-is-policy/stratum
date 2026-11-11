@@ -61,6 +61,17 @@ static uint32_t load_u32(const uint8_t *p)
     return (uint32_t)p[0]        | ((uint32_t)p[1] << 8)
          | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
+/* The `count` data bytes of the Rread or Rreaddir in `resp`, as a string in `body`:
+ * its length. One that does not fit there with its NUL is a failure, and is cut to
+ * what does. */
+static uint32_t take_body(char *body, size_t cap, const uint8_t *resp, uint32_t count)
+{
+    STM_ASSERT(count < cap);
+    if (count >= cap) count = (uint32_t)cap - 1;
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    return count;
+}
 static __attribute__((unused)) uint64_t load_u64(const uint8_t *p)
 {
     return (uint64_t)load_u32(p) | ((uint64_t)load_u32(p + 4) << 32);
@@ -925,9 +936,7 @@ STM_TEST(ctl_b1_pool_status_reports_uuid_and_counts)
     STM_ASSERT(count > 0);
 
     char body[1024];
-    STM_ASSERT(count < sizeof body);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
 
     char want[128];
     snprintf(want, sizeof want, "pool-uuid: %s", CTL_TEST_POOL_UUID_HEX);
@@ -1288,9 +1297,7 @@ STM_TEST(ctl_b1p_device_status_reports_class_role_state)
     STM_ASSERT(count > 0);
 
     char body[1024];
-    STM_ASSERT(count < sizeof body);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
 
     STM_ASSERT(strstr(body, "device-id: 0\n")  != NULL);
     /* R98 P3-2: pin the exact device-uuid hex string so a future
@@ -1552,9 +1559,7 @@ STM_TEST(ctl_c1_dataset_properties_reports_root_metadata)
     STM_ASSERT(count > 0);
 
     char body[1024];
-    STM_ASSERT(count < sizeof body);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
 
     STM_ASSERT(strstr(body, "dataset-id: 1\n")              != NULL);
     STM_ASSERT(strstr(body, "name: ")                        != NULL);
@@ -1822,9 +1827,7 @@ STM_TEST(ctl_d1_admin_peer_admin_succeeds)
     STM_ASSERT(count > 0);
 
     char body[1024];
-    STM_ASSERT(count < sizeof body);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
 
     STM_ASSERT(strstr(body, "caller-uid: 0\n")  != NULL);
     STM_ASSERT(strstr(body, "caller-gid: 0\n")  != NULL);
@@ -1863,8 +1866,7 @@ STM_TEST(ctl_d1_admin_peer_nonroot_admin_via_admin_uid)
     STM_ASSERT(count > 0);
 
     char body[1024];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
 
     STM_ASSERT(strstr(body, "caller-uid: 1000\n")  != NULL);
     STM_ASSERT(strstr(body, "admin-uid: 1000\n")   != NULL);
@@ -2020,8 +2022,7 @@ STM_TEST(ctl_r100_p3_1_unset_admin_uid_renders_unset)
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
 
     STM_ASSERT(strstr(body, "admin-uid: (unset)\n") != NULL);
     STM_ASSERT(strstr(body, "is-admin: yes\n")      != NULL);  /* root */
@@ -2061,8 +2062,7 @@ STM_TEST(ctl_r100_p3_2_root_beats_admin_uid)
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
     STM_ASSERT(strstr(body, "is-admin: yes\n")    != NULL);
     STM_ASSERT(strstr(body, "admin-uid: 1000\n")  != NULL);
 
@@ -2170,9 +2170,7 @@ STM_TEST(ctl_d2_log_event_then_read_back)
     STM_ASSERT(count > 0);
 
     char body[8192];
-    STM_ASSERT(count < sizeof body);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
 
     /* Verify both lines appear, with timestamp prefix + content. */
     STM_ASSERT(strstr(body, "first event id=42\n") != NULL);
@@ -2225,8 +2223,7 @@ STM_TEST(ctl_d2_clear_events_admin_succeeds)
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
     STM_ASSERT(strstr(body, "before clear") == NULL);
     STM_ASSERT(strstr(body, "events log cleared by uid=0") != NULL);
 
@@ -2266,8 +2263,7 @@ STM_TEST(ctl_d2_clear_events_nonadmin_eacces)
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
     STM_ASSERT(strstr(body, "should survive non-admin attempt") != NULL);
 
     stm_lp9_server_destroy(s);
@@ -2305,8 +2301,7 @@ STM_TEST(ctl_d2_events_snapshot_at_topen)
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
     STM_ASSERT(strstr(body, "before topen") != NULL);
     STM_ASSERT(strstr(body, "after topen")  == NULL);
 
@@ -2346,8 +2341,7 @@ STM_TEST(ctl_d2_log_event_truncation_keeps_newline)
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[8192];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
 
     /* Truncated AAA line ends in newline; "next line" follows
      * cleanly on its own line, not merged. */
@@ -2453,8 +2447,7 @@ STM_TEST(ctl_r101_p1_1_drop_all_sessions_releases_slots)
     STM_ASSERT_OK(stm_lp9_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
     STM_ASSERT(strstr(body, "first event")  != NULL);
     STM_ASSERT(strstr(body, "second event") != NULL);
 
@@ -2556,8 +2549,7 @@ STM_TEST(ctl_r101_p2_2_zero_byte_clear_refused)
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
     STM_ASSERT(strstr(body, "this must survive a 0-byte clear attempt")
                 != NULL);
 
@@ -2698,9 +2690,7 @@ STM_TEST(ctl_d3_debug_alloc_admin_reads_stats)
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
     char body[1024];
-    STM_ASSERT(count < sizeof body);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
 
     /* All 13 documented fields appear; values are non-deterministic
      * (depends on format geometry) so we just assert the labels. */
@@ -3164,9 +3154,7 @@ STM_TEST(ctl_d4_scrub_listed_and_reads_idle)
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
     char body[1024];
-    STM_ASSERT(count < sizeof body);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
 
     STM_ASSERT(strstr(body, "state: idle\n")             != NULL);
     STM_ASSERT(strstr(body, "cursor-device-id: 0\n")     != NULL);
@@ -3267,8 +3255,7 @@ STM_TEST(ctl_d4_scrub_state_running_after_start)
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
     STM_ASSERT(strstr(body, "state: running\n") != NULL);
 
     /* Pause + re-read → state="paused"; on a re-Topen the snapshot
@@ -3284,8 +3271,7 @@ STM_TEST(ctl_d4_scrub_state_running_after_start)
     sz = build_tread(req, 8, 12, 0, 4096);
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     count = load_u32(resp + 7);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
     STM_ASSERT(strstr(body, "state: paused\n") != NULL);
 
     stm_lp9_server_destroy(s);
@@ -3673,9 +3659,7 @@ static uint32_t read_scrub_state(scrub_trigger_fixture *f, uint16_t tag,
     STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
-    STM_ASSERT(count < cap);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, cap, resp, count);
     /* Clunk the read fid so we can reuse the slot. */
     sz = build_tclunk(req, (uint16_t)(tag + 3), fid);
     STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
@@ -3710,9 +3694,7 @@ STM_TEST(ctl_d5_scrub_trigger_start_drives_running)
     STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char ebody[8192];
-    STM_ASSERT(count < sizeof ebody);
-    memcpy(ebody, resp + 11, count);
-    ebody[count] = '\0';
+    count = take_body(ebody, sizeof ebody, resp, count);
     STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=start result=ok") != NULL);
 
     destroy_scrub_trigger_fixture(f);
@@ -3780,8 +3762,7 @@ STM_TEST(ctl_d5_scrub_trigger_reset_before_complete_fails)
     STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char ebody[8192];
-    memcpy(ebody, resp + 11, count);
-    ebody[count] = '\0';
+    count = take_body(ebody, sizeof ebody, resp, count);
     STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=reset result=err") != NULL);
 
     destroy_scrub_trigger_fixture(f);
@@ -3809,8 +3790,7 @@ STM_TEST(ctl_d5_scrub_trigger_bogus_verb_einval)
     STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char ebody[8192];
-    memcpy(ebody, resp + 11, count);
-    ebody[count] = '\0';
+    count = take_body(ebody, sizeof ebody, resp, count);
     STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=<unknown>") != NULL);
 
     destroy_scrub_trigger_fixture(f);
@@ -3964,9 +3944,7 @@ static uint32_t read_events_log(scrub_trigger_fixture *f, uint16_t tag,
     sz = build_tread(req, (uint16_t)(tag + 2), fid, 0, (uint32_t)(cap - 1));
     STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
-    STM_ASSERT(count < cap);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, cap, resp, count);
     sz = build_tclunk(req, (uint16_t)(tag + 3), fid);
     STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
     return count;
@@ -4662,8 +4640,7 @@ STM_TEST(ctl_r107_clear_events_zero_byte_logs)
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[8192];
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    count = take_body(body, sizeof body, resp, count);
     STM_ASSERT(strstr(body, "events log clear refused (zero-byte) by uid=0") != NULL);
     STM_ASSERT(strstr(body, "pre-attempt sentinel") != NULL);   /* not cleared */
 
@@ -5175,10 +5152,8 @@ STM_TEST(ctl_e1_metrics_dir_in_pool_listing)
      * byte stream — every other dirent name (status, devices) is
      * substringwise distinct. */
     uint32_t count = load_u32(resp + 7);
-    char body[4096];
-    STM_ASSERT(count < sizeof body);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    char body[4096 + 1];
+    count = take_body(body, sizeof body, resp, count);
     bool found = false;
     /* Loop bound `i + 7 <= count` includes the case where the
      * substring is at the very end (.L dirent records end with the
@@ -5211,10 +5186,8 @@ STM_TEST(ctl_e1_metrics_dir_listing_has_prometheus)
     STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_LP9_RREADDIR);
     uint32_t count = load_u32(resp + 7);
-    char body[4096];
-    STM_ASSERT(count < sizeof body);
-    memcpy(body, resp + 11, count);
-    body[count] = '\0';
+    char body[4096 + 1];
+    count = take_body(body, sizeof body, resp, count);
     bool found = false;
     for (uint32_t i = 0; i + 10 <= count; i++) {
         if (memcmp(body + i, "prometheus", 10) == 0) { found = true; break; }

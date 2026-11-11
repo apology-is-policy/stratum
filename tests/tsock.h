@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * tsock — accept() for the tests' in-process fake servers.
+ * tsock -- accept() for the tests' in-process fake servers, and a path as
+ * a socket address.
  *
  * Another thread closing or shutting down a listening socket does not
  * reliably wake a thread blocked in accept(). On macOS shutdown()
@@ -18,7 +19,9 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 #define TSOCK_POLL_MS 50
 
@@ -40,6 +43,17 @@ static inline int tsock_accept(int listen_fd, atomic_bool *stop)
         if (fd >= 0) return fd;
         if (errno != EINTR && errno != ECONNABORTED) return -1;
     }
+}
+
+/* `path` as a socket address. One too long for it is cut short, and a dial of
+ * it then finds nothing. */
+static inline void tsock_addr(struct sockaddr_un *addr, const char *path)
+{
+    memset(addr, 0, sizeof *addr);
+    addr->sun_family = AF_UNIX;
+    size_t n = strlen(path);
+    if (n >= sizeof addr->sun_path) n = sizeof addr->sun_path - 1;
+    memcpy(addr->sun_path, path, n);
 }
 
 #endif /* STRATUM_V2_TESTS_TSOCK_H */

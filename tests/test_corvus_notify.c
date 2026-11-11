@@ -20,6 +20,7 @@
  */
 
 #include "tharness.h"
+#include "tsock.h"
 
 #include "../src/cmd/stratumd/corvus_notify.h"
 
@@ -82,9 +83,7 @@ static int fake_corvus_start(fake_corvus *fc, const char *tag)
     fc->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fc->listen_fd < 0) return -1;
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, fc->sock_path, sizeof addr.sun_path - 1);
+    tsock_addr(&addr, fc->sock_path);
     if (bind(fc->listen_fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
         close(fc->listen_fd);
         return -1;

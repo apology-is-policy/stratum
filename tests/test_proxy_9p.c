@@ -18,6 +18,7 @@
  */
 
 #include "tharness.h"
+#include "tsock.h"
 #include "test_fs_common.h"
 
 #include "../src/cmd/stratumd/proxy_9p.h"
@@ -361,9 +362,7 @@ static int dial_proxy_version(void)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, g_proxy_sock, sizeof addr.sun_path - 1);
+    tsock_addr(&addr, g_proxy_sock);
     for (int i = 0; i < 100; i++) {
         if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) break;
         usleep(10 * 1000);

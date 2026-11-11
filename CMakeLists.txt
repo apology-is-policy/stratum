@@ -134,6 +134,12 @@ if(STM_SANITIZE STREQUAL "asan")
 elseif(STM_SANITIZE STREQUAL "tsan")
     target_compile_options(stm_sanitize INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
     target_link_options   (stm_sanitize INTERFACE -fsanitize=thread)
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        # gcc says of each atomic_thread_fence that its ThreadSanitizer does not model
+        # one, which -Werror makes the end of the build. The fences stay (ebr.c,
+        # btree_engine/engine.c); a report that rests on one is to be read knowing it.
+        target_compile_options(stm_sanitize INTERFACE -Wno-tsan)
+    endif()
 elseif(STM_SANITIZE STREQUAL "msan")
     target_compile_options(stm_sanitize INTERFACE -fsanitize=memory -fno-omit-frame-pointer -fno-optimize-sibling-calls)
     target_link_options   (stm_sanitize INTERFACE -fsanitize=memory)

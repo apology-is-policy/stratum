@@ -131,9 +131,7 @@ static void fake_corvus_start(fake_corvus *fc, const char *tag,
     fc->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     STM_ASSERT(fc->listen_fd >= 0);
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, fc->sock_path, sizeof addr.sun_path - 1);
+    tsock_addr(&addr, fc->sock_path);
     STM_ASSERT(bind(fc->listen_fd, (struct sockaddr *)&addr,
                        sizeof addr) == 0);
     STM_ASSERT(listen(fc->listen_fd, 8) == 0);
