@@ -4,9 +4,6 @@
 
 #include <stddef.h>
 #include <sys/types.h>
-#ifdef STRATUM_BUILD_TESTING_HOOKS
-#  include <stdatomic.h>
-#endif
 
 /* Room for the name a socket is bound under before it has its path. */
 #define STM_UNIX_STAGED_MAX 128
@@ -59,7 +56,10 @@ int stm_unix_listen_at(int fd, const char *path, mode_t mode, int backlog);
  * which then takes the path, and a removal after that would take the new
  * daemon's name. It removes the path only while the file there is the one `fd`
  * was given the path as: a path somebody removed under the listener, and
- * another daemon then took, is that daemon's. The file is remembered by `fd`,
+ * another daemon then took, is that daemon's. The file is told by its device
+ * and number, which no other file has while the socket is open on a filesystem
+ * local to this kernel (on a network one the number can be given again, and the
+ * look at start misjudges another machine's daemon there). It is remembered by `fd`,
  * for sixty-four listeners of a process at a time; the end of one past that, or
  * of one that was given no path, removes nothing, and the socket it leaves is a
  * dead daemon's to the next start. On Thylacine, where the path is the posted
@@ -72,8 +72,8 @@ void stm_unix_listen_closed(const char *path);
 /* Test only: called on a host between the look that finds a dead daemon's socket
  * and its removal. */
 extern void (*stm_unix_listen_test_before_removal)(void);
-/* Test only: the turns asked for on a host, whether had or not. */
-extern atomic_uint stm_unix_listen_test_turns_asked;
+/* Test only: called on a host when a turn is asked for, before it is had or not. */
+extern void (*stm_unix_listen_test_turn_asked)(void);
 #endif
 
 /* For a daemon's help, after its options: what a socket path must leave room for. */

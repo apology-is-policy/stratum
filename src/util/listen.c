@@ -4,7 +4,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,7 +19,7 @@
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 void (*stm_unix_listen_test_before_removal)(void) = NULL;
-atomic_uint stm_unix_listen_test_turns_asked = 0;
+void (*stm_unix_listen_test_turn_asked)(void) = NULL;
 #endif
 
 enum { TURN_NOT_ASKED = -2, TURN_NONE = -1 };
@@ -38,7 +37,7 @@ enum { TURN_WAIT_MS = 100 };
 static int take_turn(const char *path)
 {
 #  ifdef STRATUM_BUILD_TESTING_HOOKS
-    stm_unix_listen_test_turns_asked++;
+    if (stm_unix_listen_test_turn_asked) stm_unix_listen_test_turn_asked();
 #  endif
     char dir[sizeof ((struct sockaddr_un *)0)->sun_path];
     const char *slash = strrchr(path, '/');
@@ -241,8 +240,9 @@ void stm_unix_listen_retire(int fd, const char *path)
     (void)fd;
     (void)path;
 #else
-    /* While the listener is open its file's number is no other file's, so what is at
-     * the path is this listener's exactly when it is that file. */
+    /* While the listener is open its file's number is no other file's, on a
+     * filesystem local to this kernel, so what is at the path is this listener's
+     * exactly when it is that file. */
     dev_t dev;
     ino_t ino;
     struct stat st;

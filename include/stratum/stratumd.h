@@ -439,8 +439,10 @@ int stm_stratumd_parse_pool_serial_hex(const char *hex, uint8_t out[16]);
  * clamped to `mode` via umask-then-chmod; chmod failure is fatal,
  * matching janus's R11 P1-1 pattern (R95 P1-1 fix).
  *
- * Returns the listen fd on success (caller close()s after
- * stm_stratumd_accept_loop returns), or -errno on failure.
+ * Returns the listen fd on success, or -errno on failure. The caller
+ * gives the path up around the listener's end: stm_unix_listen_retire(fd,
+ * path) once stm_stratumd_accept_loop has returned and before the
+ * close(), stm_unix_listen_closed(path) after it (listen.h).
  *
  * `backlog` is clamped to [1, SOMAXCONN]. `mode` of 0 substitutes
  * STM_STRATUMD_DEFAULT_SOCKET_MODE (0600).

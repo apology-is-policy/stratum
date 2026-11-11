@@ -7,8 +7,9 @@
  * verifies serial-accept multi-client behavior.
  *
  * The accept loop's stop-flag exit path is tested by setting the
- * flag and shutdown()ing the listen fd from the main thread to
- * unblock accept(), then joining the worker.
+ * flag from the main thread, which the loop sees at its next poll,
+ * then joining the worker; the shutdown() of the listen fd beside it
+ * wakes the loop sooner on Linux only.
  */
 #include "tharness.h"
 #include "tsock.h"
@@ -81,8 +82,8 @@ static void *accept_loop_thread(void *arg)
     return NULL;
 }
 
-/* Wake up an accept() call by setting stop_flag and shutting down
- * the listen fd. Robust on Linux + macOS. */
+/* End an accept loop by its stop flag, which it sees within one poll.
+ * The shutdown() of the listen fd wakes it sooner on Linux only. */
 static void wake_and_join(accept_ctx *ctx, pthread_t worker)
 {
     atomic_store_explicit(&ctx->stop_flag, true, memory_order_release);
@@ -757,6 +758,9 @@ STM_TEST(p9_socket_a_descriptor_used_again_has_no_path_of_the_one_before) {
  * no socket asks for no turn. One that finds one asks, waits for a turn another
  * holds, and not for good; and it gives its own turn up, whether it comes to
  * listen or is refused. */
+static unsigned g_turns_asked;
+static void count_turn(void) { g_turns_asked++; }
+
 STM_TEST(p9_socket_listen_takes_its_turn_at_a_socket_alone_and_gives_it_up) {
     char dir[] = "/tmp/stm_socktest_turn_XXXXXX";
     STM_ASSERT_TRUE(mkdtemp(dir) != NULL);
@@ -767,16 +771,17 @@ STM_TEST(p9_socket_listen_takes_its_turn_at_a_socket_alone_and_gives_it_up) {
 
     /* Nothing at the path: no turn asked for, whoever keeps the lock. */
     STM_ASSERT_EQ(flock(held, LOCK_EX | LOCK_NB), 0);
-    unsigned asked = stm_unix_listen_test_turns_asked;
+    stm_unix_listen_test_turn_asked = count_turn;
+    unsigned asked = g_turns_asked;
     int fd = stm_stratumd_listen_unix(path, 4, 0600, 0);
     STM_ASSERT_TRUE(fd >= 0);
-    STM_ASSERT_EQ(stm_unix_listen_test_turns_asked - asked, 0);
+    STM_ASSERT_EQ(g_turns_asked - asked, 0);
     STM_ASSERT_EQ(flock(held, LOCK_UN), 0);
 
     /* A running daemon's socket there: asked for, and given up by the one refused. */
-    asked = stm_unix_listen_test_turns_asked;
+    asked = g_turns_asked;
     STM_ASSERT_EQ(stm_stratumd_listen_unix(path, 4, 0600, 0), -EADDRINUSE);
-    STM_ASSERT_EQ(stm_unix_listen_test_turns_asked - asked, 1);
+    STM_ASSERT_EQ(g_turns_asked - asked, 1);
     STM_ASSERT_EQ(flock(held, LOCK_EX | LOCK_NB), 0);
     STM_ASSERT_EQ(flock(held, LOCK_UN), 0);
     stm_unix_listen_retire(fd, path);
@@ -784,10 +789,10 @@ STM_TEST(p9_socket_listen_takes_its_turn_at_a_socket_alone_and_gives_it_up) {
 
     /* A dead daemon's: asked for, and given up by the one that comes to listen. */
     leave_dead_socket(path);
-    asked = stm_unix_listen_test_turns_asked;
+    asked = g_turns_asked;
     fd = stm_stratumd_listen_unix(path, 4, 0600, 0);
     STM_ASSERT_TRUE(fd >= 0);
-    STM_ASSERT_EQ(stm_unix_listen_test_turns_asked - asked, 1);
+    STM_ASSERT_EQ(g_turns_asked - asked, 1);
     STM_ASSERT_EQ(flock(held, LOCK_EX | LOCK_NB), 0);
     stm_unix_listen_retire(fd, path);
     close(fd);
@@ -803,10 +808,37 @@ STM_TEST(p9_socket_listen_takes_its_turn_at_a_socket_alone_and_gives_it_up) {
                      (ended.tv_nsec - began.tv_nsec) / 1000000;
     STM_ASSERT_TRUE(waited_ms >= 50);
 
+    stm_unix_listen_test_turn_asked = NULL;
     close(held);
     stm_unix_listen_retire(fd, path);
     close(fd);
     STM_ASSERT_EQ(rmdir(dir), 0);
+}
+
+/* A turn can be waited for, so what is at the name is looked at again once one is
+ * asked for: a file put there meanwhile is somebody's, left and refused as a file.
+ * (On Linux a file answers the look as a dead socket does, and would be removed.) */
+static const char *g_swap_path;
+static void swap_socket_for_file(void)
+{
+    (void)unlink(g_swap_path);
+    int fd = open(g_swap_path, O_CREAT | O_WRONLY | O_EXCL, 0644);
+    if (fd >= 0) close(fd);
+}
+
+STM_TEST(p9_socket_listen_looks_again_once_it_has_asked_for_its_turn) {
+    build_sock_path("relook");
+    leave_dead_socket(g_sock_path);
+    g_swap_path = g_sock_path;
+    stm_unix_listen_test_turn_asked = swap_socket_for_file;
+    int fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    stm_unix_listen_test_turn_asked = NULL;
+    STM_ASSERT_EQ(fd, -EEXIST);
+    struct stat st;
+    STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
+    STM_ASSERT_TRUE(S_ISREG(st.st_mode));
+    if (fd >= 0) close(fd);
+    (void)unlink(g_sock_path);
 }
 
 /* The turn is kept from the look to the removal: between the two, over a dead

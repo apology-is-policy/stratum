@@ -728,13 +728,12 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
                                                   memory_order_acquire))
             break;
 
-        /* SWISS-4g: poll-then-accept. macOS's `shutdown(unix-listen-
-         * sock, SHUT_RDWR)` does not reliably unblock a long-blocked
-         * accept() (the kernel doesn't propagate the shutdown event
-         * through the AF_UNIX listen path on Darwin). We poll with a
-         * 200ms timeout and re-check stop_flag between iterations.
-         * shutdown still works via the POLLERR/POLLHUP path on the
-         * pollfd. Discovered while debugging test_9p_socket hangs
+        /* SWISS-4g: poll-then-accept. On macOS a shutdown() of a listening
+         * AF_UNIX socket says ENOTCONN and wakes nothing, neither a blocked
+         * accept() nor this poll, and on Thylacine it does nothing; on Linux
+         * it shows here as POLLHUP. So the flag is what ends this loop: we
+         * poll with a 200ms timeout and re-check stop_flag between
+         * iterations. Discovered while debugging test_9p_socket hangs
          * after adding concurrent-accept (user 2026-05-08). */
         struct pollfd pfd = { listen_fd, POLLIN, 0 };
         int prc = poll(&pfd, 1, /*timeout_ms=*/200);
@@ -1212,7 +1211,8 @@ static stm_status accept_ctl_loop(int listen_fd, stm_ctl *ctl,
 
         /* SWISS-4g: poll-then-accept. On macOS a shutdown() of a listening
          * AF_UNIX socket says ENOTCONN and wakes nothing, neither a blocked
-         * accept() nor this poll; on Linux it shows here as POLLHUP. So the
+         * accept() nor this poll, and on Thylacine it does nothing; on Linux
+         * it shows here as POLLHUP. So the
          * flags are what ends this loop: we poll with a 200ms timeout and
          * re-check them between iterations. Discovered while debugging
          * test_9p_socket hangs after adding concurrent-accept (user

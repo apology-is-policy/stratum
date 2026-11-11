@@ -10,7 +10,7 @@
 # Usage:
 #   ./run.sh                  # full launch
 #   ./run.sh fs               # FS-only: stratumd + drop you at a stratum-fs prompt-style shell
-#   ./run.sh wipe             # remove image + keyfile + socket
+#   ./run.sh wipe             # remove image + keyfile
 #
 # On exit (TUI quits or Ctrl-C) stratumd is killed. The image + keyfile
 # persist across runs; pass `wipe` first if you want a clean slate.
@@ -47,11 +47,15 @@ cleanup() {
     [[ -n "${LOG:-}" ]] && rm -f "$LOG"
     return 0
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ── subcommand: wipe ───────────────────────────────────────────────────
 if [[ "${1:-}" == "wipe" ]]; then
-    rm -fv "$IMG" "$KEY" "$SOCK"
+    # Not the socket: a dead daemon's is cleared by the next start, and a running
+    # daemon's is not this script's to take.
+    rm -fv "$IMG" "$KEY"
     exit 0
 fi
 
@@ -87,13 +91,13 @@ STRATUMD_PID=$!
 # Wait for stratumd's own word that it serves (or for it to die): a socket at the
 # path says nothing, it may be another daemon's.
 for _ in $(seq 1 50); do
-    grep -q 'bound and ready' "$LOG" && break
+    grep -qs 'bound and ready' "$LOG" && break
     if ! kill -0 "$STRATUMD_PID" 2>/dev/null; then
         die "stratumd exited before it was ready (see output above)"
     fi
     sleep 0.1
 done
-grep -q 'bound and ready' "$LOG" || die "stratumd was not ready after 5 s"
+grep -qs 'bound and ready' "$LOG" || die "stratumd was not ready after 5 s"
 say "stratumd ready (pid $STRATUMD_PID)"
 
 # ── subcommand: fs (drop into a sub-shell with stratum-fs in PATH) ─────

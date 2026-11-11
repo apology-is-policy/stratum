@@ -322,10 +322,7 @@ static uint32_t read_root_file(stm_lp9_server *s, uint32_t root_fid,
     STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
-    STM_ASSERT(count < out_cap);
-    memcpy(out, resp + 11, count);
-    out[count] = '\0';
-    return count;
+    return take_body(out, out_cap, resp, count);
 }
 
 /* ── tests ──────────────────────────────────────────────────────────── */
