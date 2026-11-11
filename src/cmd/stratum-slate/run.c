@@ -462,7 +462,7 @@ static int run_serve(const char *socket_path, uint32_t msize_max,
      * The order matters: stm_slate_stop BEFORE drain so blocked
      * cond_wait readers exit their critical section first; drain
      * BEFORE destroy so no worker holds s->mu when mu is destroyed. */
-    stm_unix_listen_retire(socket_path);
+    stm_unix_listen_retire(listen_fd, socket_path);
     close(listen_fd);
     stm_unix_listen_closed(socket_path);
     stm_slate_stop(slate);

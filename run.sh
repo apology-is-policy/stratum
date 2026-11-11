@@ -42,7 +42,10 @@ cleanup() {
         done
         kill -KILL "$STRATUMD_PID" 2>/dev/null || true
     fi
-    rm -f "$SOCK" 2>/dev/null || true
+    # The socket is stratumd's to remove, and it does at its end: one still at the
+    # path now may be another daemon's.
+    [[ -n "${LOG:-}" ]] && rm -f "$LOG"
+    return 0
 }
 trap cleanup EXIT INT TERM
 
@@ -64,11 +67,6 @@ if ! have "$MKFS" || ! have "$DAEMON"; then
     cmake --build "$BUILD" --target stratum-mkfs stratumd stratum-fs
 fi
 
-if ! have "$TUI"; then
-    say "building TUI (cargo)..."
-    ( cd "$ROOT/tui" && cargo build --release )
-fi
-
 # ── mkfs (if needed) ───────────────────────────────────────────────────
 
 if [[ ! -f "$IMG" ]]; then
@@ -80,20 +78,22 @@ fi
 
 # ── stratumd (bg) ──────────────────────────────────────────────────────
 
-rm -f "$SOCK"
+# No rm of the socket: stratumd clears a dead daemon's and refuses a running one's.
 say "starting stratumd on $SOCK..."
-"$DAEMON" "$IMG" --listen "$SOCK" --keyfile "$KEY" &
+LOG="$(mktemp "${TMPDIR:-/tmp}/stratum-dev-log.XXXXXX")"
+"$DAEMON" "$IMG" --listen "$SOCK" --keyfile "$KEY" 2> >(tee "$LOG" >&2) &
 STRATUMD_PID=$!
 
-# Wait for the socket to appear (or stratumd to die).
+# Wait for stratumd's own word that it serves (or for it to die): a socket at the
+# path says nothing, it may be another daemon's.
 for _ in $(seq 1 50); do
-    [[ -S "$SOCK" ]] && break
+    grep -q 'bound and ready' "$LOG" && break
     if ! kill -0 "$STRATUMD_PID" 2>/dev/null; then
-        die "stratumd exited before socket appeared (see output above)"
+        die "stratumd exited before it was ready (see output above)"
     fi
     sleep 0.1
 done
-[[ -S "$SOCK" ]] || die "stratumd never created socket $SOCK"
+grep -q 'bound and ready' "$LOG" || die "stratumd was not ready after 5 s"
 say "stratumd ready (pid $STRATUMD_PID)"
 
 # ── subcommand: fs (drop into a sub-shell with stratum-fs in PATH) ─────
@@ -108,6 +108,11 @@ if [[ "${1:-}" == "fs" ]]; then
 fi
 
 # ── default: TUI (fg) ──────────────────────────────────────────────────
+
+if ! have "$TUI"; then
+    say "building TUI (cargo)..."
+    ( cd "$ROOT/tui" && cargo build --release )
+fi
 
 say "launching TUI (q quits)..."
 "$TUI" "$SOCK"

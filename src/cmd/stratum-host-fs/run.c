@@ -397,7 +397,7 @@ int stm_cmd_host_fs_main(int argc, char **argv)
         (void)pthread_detach(tid);
     }
 
-    stm_unix_listen_retire(socket_path);
+    stm_unix_listen_retire(listen_fd, socket_path);
     close(listen_fd);
     stm_unix_listen_closed(socket_path);
     fprintf(stderr, "stratum-host-fs: clean shutdown\n");

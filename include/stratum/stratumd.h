@@ -432,9 +432,9 @@ int stm_stratumd_parse_pool_serial_hex(const char *hex, uint8_t out[16]);
 /* ────────────────────────────────────────────────────────────────────── */
 
 /*
- * Bind + listen on a Unix-domain SOCK_STREAM at `path`. Removes a
- * socket file at `path` first only when it is in fact a socket
- * (S_ISSOCK gate, R95 P3-1 fix) that no process holds; anything else
+ * Bind + listen on a Unix-domain SOCK_STREAM at `path`. Removes what
+ * is at `path` first only when it is in fact a socket (S_ISSOCK gate,
+ * R95 P3-1 fix) and, on a host, one that no process holds; a file
  * there is left and refused (-EEXIST). The socket file's mode is
  * clamped to `mode` via umask-then-chmod; chmod failure is fatal,
  * matching janus's R11 P1-1 pattern (R95 P1-1 fix).
@@ -447,8 +447,8 @@ int stm_stratumd_parse_pool_serial_hex(const char *hex, uint8_t out[16]);
  *
  * The socket takes `path` only once it listens (stm_unix_listen_at), so on
  * a host `path` must leave room in sun_path for a dot and the pid:
- * -ENAMETOOLONG otherwise. A running daemon's socket at `path` is left
- * there: -EADDRINUSE.
+ * -ENAMETOOLONG otherwise. On a host a running daemon's socket at `path`
+ * is left there: -EADDRINUSE. On Thylacine it is removed.
  *
  * `sockbuf` of 0 keeps the platform-default socket buffers. A non-zero
  * value is set as SO_SNDBUF + SO_RCVBUF on the listener BEFORE bind(),
@@ -494,6 +494,8 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
 /* Test only: dup() of a connection answers ENOSYS, as Thylacine's pouch does for
  * a socket. */
 extern bool stm_stratumd_test_dup_unsupported;
+/* Test only: called by stm_stratumd_run just before its FS socket takes its path. */
+extern void (*stm_stratumd_test_before_publish)(void);
 #endif
 
 /*

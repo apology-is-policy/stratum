@@ -615,6 +615,7 @@ static stratumd_conn  *g_conns    = NULL;
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 bool stm_stratumd_test_dup_unsupported = false;
+void (*stm_stratumd_test_before_publish)(void) = NULL;
 #endif
 
 static int conn_dup(int fd)
@@ -1185,11 +1186,20 @@ static void *stratumd_ctl_worker(void *arg)
     return NULL;
 }
 
-stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
-                                          uint32_t msize_max,
-                                          uint32_t idle_timeout_ms,
-                                          bool allow_unauthenticated_peer,
-                                          atomic_bool *stop_flag)
+static bool ctl_stop_asked(atomic_bool *stop_flag, atomic_bool *own_stop)
+{
+    if (stop_flag && atomic_load_explicit(stop_flag, memory_order_acquire)) return true;
+    return own_stop && atomic_load_explicit(own_stop, memory_order_acquire);
+}
+
+/* `own_stop` is the flag of whoever runs this loop on a thread and has to end it
+ * whatever became of the daemon's `stop_flag`, which may be NULL or nobody's to set. */
+static stm_status accept_ctl_loop(int listen_fd, stm_ctl *ctl,
+                                  uint32_t msize_max,
+                                  uint32_t idle_timeout_ms,
+                                  bool allow_unauthenticated_peer,
+                                  atomic_bool *stop_flag,
+                                  atomic_bool *own_stop)
 {
     if (listen_fd < 0 || !ctl) return STM_EINVAL;
 
@@ -1197,18 +1207,16 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
         idle_timeout_ms = STM_STRATUMD_DEFAULT_IDLE_MS;
 
     while (1) {
-        if (stop_flag && atomic_load_explicit(stop_flag,
-                                                  memory_order_acquire))
+        if (ctl_stop_asked(stop_flag, own_stop))
             break;
 
-        /* SWISS-4g: poll-then-accept. macOS's `shutdown(unix-listen-
-         * sock, SHUT_RDWR)` does not reliably unblock a long-blocked
-         * accept() (the kernel doesn't propagate the shutdown event
-         * through the AF_UNIX listen path on Darwin). We poll with a
-         * 200ms timeout and re-check stop_flag between iterations.
-         * shutdown still works via the POLLERR/POLLHUP path on the
-         * pollfd. Discovered while debugging test_9p_socket hangs
-         * after adding concurrent-accept (user 2026-05-08). */
+        /* SWISS-4g: poll-then-accept. On macOS a shutdown() of a listening
+         * AF_UNIX socket says ENOTCONN and wakes nothing, neither a blocked
+         * accept() nor this poll; on Linux it shows here as POLLHUP. So the
+         * flags are what ends this loop: we poll with a 200ms timeout and
+         * re-check them between iterations. Discovered while debugging
+         * test_9p_socket hangs after adding concurrent-accept (user
+         * 2026-05-08). */
         struct pollfd pfd = { listen_fd, POLLIN, 0 };
         int prc = poll(&pfd, 1, /*timeout_ms=*/200);
         if (prc < 0) {
@@ -1229,8 +1237,7 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
                 pause_for_descriptors();
                 continue;
             }
-            if (stop_flag && atomic_load_explicit(stop_flag,
-                                                      memory_order_acquire))
+            if (ctl_stop_asked(stop_flag, own_stop))
                 break;
             return STM_EBACKEND;
         }
@@ -1304,14 +1311,27 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
     return STM_OK;
 }
 
+stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
+                                          uint32_t msize_max,
+                                          uint32_t idle_timeout_ms,
+                                          bool allow_unauthenticated_peer,
+                                          atomic_bool *stop_flag)
+{
+    return accept_ctl_loop(listen_fd, ctl, msize_max, idle_timeout_ms,
+                           allow_unauthenticated_peer, stop_flag, NULL);
+}
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* stm_stratumd_run — full daemon lifecycle.                              */
 /* ────────────────────────────────────────────────────────────────────── */
 
 /* Ends the /ctl/ accept loop, then every /ctl/ connection. The join is what
- * makes the second step final, since nothing accepts after it. */
-static void stratumd_stop_ctl(int ctl_fd, pthread_t ctl_tid)
+ * makes the second step final, since nothing accepts after it. The loop ends on
+ * its worker's own flag: the daemon's is not set on every way here, and the
+ * shutdown() wakes the loop on Linux alone. */
+static void stratumd_stop_ctl(int ctl_fd, pthread_t ctl_tid, atomic_bool *own_stop)
 {
+    atomic_store_explicit(own_stop, true, memory_order_release);
     (void)shutdown(ctl_fd, SHUT_RDWR);
     (void)pthread_join(ctl_tid, NULL);
     stratumd_conns_stop_reading();
@@ -1331,17 +1351,18 @@ typedef struct {
     uint32_t      idle_timeout_ms;
     bool          allow_unauthenticated_peer;
     atomic_bool  *stop_flag;
+    atomic_bool   own_stop;  /* set by stratumd_stop_ctl */
     stm_status    rc;        /* set by worker; read by parent after join */
 } ctl_worker_ctx;
 
 static void *ctl_worker_main(void *arg)
 {
     ctl_worker_ctx *w = (ctl_worker_ctx *)arg;
-    w->rc = stm_stratumd_accept_ctl_loop(w->listen_fd, w->ctl,
-                                            w->msize_max,
-                                            w->idle_timeout_ms,
-                                            w->allow_unauthenticated_peer,
-                                            w->stop_flag);
+    w->rc = accept_ctl_loop(w->listen_fd, w->ctl,
+                            w->msize_max,
+                            w->idle_timeout_ms,
+                            w->allow_unauthenticated_peer,
+                            w->stop_flag, &w->own_stop);
     return NULL;
 }
 
@@ -1453,7 +1474,7 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
                                                   opts->coordinator_uid,
                                                   opts->single_session);
 
-    stm_unix_listen_retire(opts->socket_path);
+    stm_unix_listen_retire(listen_fd, opts->socket_path);
     close(listen_fd);
     stm_unix_listen_closed(opts->socket_path);
     return rc;
@@ -1985,6 +2006,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
         wctx.idle_timeout_ms            = opts->idle_timeout_ms;
         wctx.allow_unauthenticated_peer = opts->allow_unauthenticated_peer;
         wctx.stop_flag                  = opts->stop_flag;
+        atomic_init(&wctx.own_stop, false);
         wctx.rc                         = STM_OK;
         /* R113 P1-1: block SIGINT/SIGTERM/SIGHUP/SIGQUIT in the
          * /ctl/ worker thread BEFORE pthread_create, then restore the
@@ -1998,11 +2020,9 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
          * shutdowns deadlock the daemon. The fix is to pin signals to
          * the calling thread by masking them on the worker.
          *
-         * The worker observes shutdown via the explicit
-         * shutdown(ctl_fd) issued from run() AFTER the FS loop
-         * returns — that surfaces as EBADF/EINVAL on accept, the
-         * stop_flag check fires (or shutdown alone is sufficient),
-         * and accept_ctl_loop returns cleanly. */
+         * The worker is ended by stratumd_stop_ctl from run(), on
+         * every way out past this point: it sets the worker's own
+         * flag, which the loop reads at least every 200 ms. */
         sigset_t worker_block, prev_mask;
         sigemptyset(&worker_block);
         sigaddset(&worker_block, SIGINT);
@@ -2015,7 +2035,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
         if (prc != 0) {
             fprintf(stderr,
                 "stratumd: pthread_create for /ctl/ failed (rc=%d)\n", prc);
-            stm_unix_listen_retire(opts->ctl_socket_path);
+            stm_unix_listen_retire(ctl_fd, opts->ctl_socket_path);
             close(ctl_fd);
             stm_unix_listen_closed(opts->ctl_socket_path);
             stm_ctl_destroy(ctl);
@@ -2051,8 +2071,8 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
             "stratumd: --corvus-user set but no stop_flag provided; "
             "the SESSION_CLOSED consumer cannot signal shutdown "
             "(invariant C-5 / STRATUM-API-V1.md §6) — refusing to start\n");
-        if (ctl_fd >= 0) stm_unix_listen_retire(opts->ctl_socket_path);
-        if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid);
+        if (ctl_fd >= 0) stm_unix_listen_retire(ctl_fd, opts->ctl_socket_path);
+        if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid, &wctx.own_stop);
         close(listen_fd);
         (void)unlink(fs_staged);
         if (ctl_fd >= 0) {
@@ -2084,8 +2104,8 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
                 (int)crc);
             /* Fatal: a Thylacine-bound stratumd MUST run the consumer.
              * Tear everything down. */
-            if (ctl_fd >= 0) stm_unix_listen_retire(opts->ctl_socket_path);
-            if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid);
+            if (ctl_fd >= 0) stm_unix_listen_retire(ctl_fd, opts->ctl_socket_path);
+            if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid, &wctx.own_stop);
             close(listen_fd);
             (void)unlink(fs_staged);
             if (ctl_fd >= 0) {
@@ -2099,15 +2119,19 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
         }
     }
 
-    /* Every step that can fail is behind: the FS socket takes its path. */
-    int published = stm_unix_listen_publish(fs_staged, opts->socket_path);
+    /* Every other step that can fail is behind: the FS socket takes its path,
+     * unless something took the path since the look. */
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (stm_stratumd_test_before_publish) stm_stratumd_test_before_publish();
+#endif
+    int published = stm_unix_listen_publish(listen_fd, fs_staged, opts->socket_path);
     if (published != 0) {
         fprintf(stderr,
             "stratumd: listen on %s failed: %s%s\n",
             opts->socket_path, strerror(-published), stm_unix_listen_hint(published));
         if (cnc) (void)stm_corvus_notify_stop(cnc);
-        if (ctl_fd >= 0) stm_unix_listen_retire(opts->ctl_socket_path);
-        if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid);
+        if (ctl_fd >= 0) stm_unix_listen_retire(ctl_fd, opts->ctl_socket_path);
+        if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid, &wctx.own_stop);
         close(listen_fd);
         if (ctl_fd >= 0) {
             close(ctl_fd);
@@ -2162,14 +2186,12 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
         if (rc == STM_OK && crc != STM_OK) rc = crc;
     }
 
-    /* /ctl/ worker shutdown: signal stop via shutdown(2) on the
-     * /ctl/ listen fd to unblock its accept(), then join the worker.
-     * The worker observes EBADF/EINVAL on accept after shutdown and
-     * checks stop_flag, then returns STM_OK. */
-    stm_unix_listen_retire(opts->socket_path);
-    if (ctl_fd >= 0) stm_unix_listen_retire(opts->ctl_socket_path);
+    /* Both paths given up while their sockets still take a dial, then
+     * the /ctl/ worker stopped and joined. */
+    stm_unix_listen_retire(listen_fd, opts->socket_path);
+    if (ctl_fd >= 0) stm_unix_listen_retire(ctl_fd, opts->ctl_socket_path);
     if (ctl_started) {
-        stratumd_stop_ctl(ctl_fd, ctl_tid);
+        stratumd_stop_ctl(ctl_fd, ctl_tid, &wctx.own_stop);
         if (rc == STM_OK && wctx.rc != STM_OK) rc = wctx.rc;
     }
 

@@ -11,6 +11,7 @@
  * unblock accept(), then joining the worker.
  */
 #include "tharness.h"
+#include "tsock.h"
 #include "test_fs_common.h"
 
 #include <stratum/9p.h>
@@ -97,24 +98,13 @@ static void wake_and_join(accept_ctx *ctx, pthread_t worker)
 /* Client helpers.                                                        */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* `path` as a socket address. One too long for it is cut short, and a dial of
- * it then finds nothing. */
-static void sock_addr(struct sockaddr_un *addr, const char *path)
-{
-    memset(addr, 0, sizeof *addr);
-    addr->sun_family = AF_UNIX;
-    size_t n = strlen(path);
-    if (n >= sizeof addr->sun_path) n = sizeof addr->sun_path - 1;
-    memcpy(addr->sun_path, path, n);
-}
-
 /* Connect a client socket to the listening Unix path. Retries up to
  * 50 × 10ms (= 500ms) to tolerate the worker thread being scheduled
  * after the test thread reaches connect(). */
 static int connect_client(const char *sock_path)
 {
     struct sockaddr_un addr;
-    sock_addr(&addr, sock_path);
+    tsock_addr(&addr, sock_path);
 
     for (int attempt = 0; attempt < 50; attempt++) {
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -173,13 +163,23 @@ static int recv_msg(int fd, uint8_t *buf, uint32_t cap, uint32_t *out_len)
     return 0;
 }
 
-/* Unique per-test socket path; reuses g_tmp_path's scheme. */
+/* The tests' sockets, in a directory of this program's own: a lock that anyone
+ * may keep on /tmp is then nothing to its listeners. */
+static char g_sock_dir[32];
+static void remove_sock_dir(void) { (void)rmdir(g_sock_dir); }
+
 static char g_sock_path[256];
 static void build_sock_path(const char *tag)
 {
-    snprintf(g_sock_path, sizeof g_sock_path,
-             "/tmp/stm_socktest_%d_%s.sock",
-             (int)getpid(), tag);
+    if (!g_sock_dir[0]) {
+        snprintf(g_sock_dir, sizeof g_sock_dir, "/tmp/stm_socktest_XXXXXX");
+        if (!mkdtemp(g_sock_dir)) {
+            perror("mkdtemp");
+            exit(1);
+        }
+        atexit(remove_sock_dir);
+    }
+    snprintf(g_sock_path, sizeof g_sock_path, "%s/%s.sock", g_sock_dir, tag);
     /* Pre-clean any stale socket. */
     (void)unlink(g_sock_path);
 }
@@ -511,7 +511,7 @@ static void *listen_race_thread(void *p)
 STM_TEST(p9_socket_name_is_there_only_once_it_listens) {
     build_sock_path("ready");
     struct sockaddr_un addr;
-    sock_addr(&addr, g_sock_path);
+    tsock_addr(&addr, g_sock_path);
     char staged[sizeof g_sock_path + 32];
     snprintf(staged, sizeof staged, "%s.%ld", g_sock_path, (long)getpid());
 
@@ -560,7 +560,7 @@ STM_TEST(p9_socket_publish_refuses_a_path_taken_since_the_look) {
     int rfd = open(g_sock_path, O_CREAT | O_WRONLY | O_EXCL, 0644);
     STM_ASSERT_TRUE(rfd >= 0);
     close(rfd);
-    STM_ASSERT_EQ(stm_unix_listen_publish(staged, g_sock_path), -EEXIST);
+    STM_ASSERT_EQ(stm_unix_listen_publish(fd, staged, g_sock_path), -EEXIST);
     close(fd);
 
     STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
@@ -573,11 +573,11 @@ STM_TEST(p9_socket_publish_refuses_a_path_taken_since_the_look) {
     STM_ASSERT_TRUE(fd >= 0);
     STM_ASSERT_EQ(stm_unix_listen_staged(fd, g_sock_path, 0600, 4, staged, sizeof staged), 0);
     struct sockaddr_un addr;
-    sock_addr(&addr, g_sock_path);
+    tsock_addr(&addr, g_sock_path);
     int other = socket(AF_UNIX, SOCK_STREAM, 0);
     STM_ASSERT_TRUE(other >= 0);
     STM_ASSERT_EQ(bind(other, (struct sockaddr *)&addr, sizeof addr), 0);
-    STM_ASSERT_EQ(stm_unix_listen_publish(staged, g_sock_path), -EADDRINUSE);
+    STM_ASSERT_EQ(stm_unix_listen_publish(fd, staged, g_sock_path), -EADDRINUSE);
     close(fd);
     STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
     STM_ASSERT_TRUE(S_ISSOCK(st.st_mode));
@@ -605,7 +605,7 @@ STM_TEST(p9_socket_listen_leaves_a_live_socket_and_clears_a_dead_one) {
 
     /* Dials nobody accepts, until one is turned away. */
     struct sockaddr_un addr;
-    sock_addr(&addr, g_sock_path);
+    tsock_addr(&addr, g_sock_path);
     int held[64];
     int n_held = 0;
     bool full = false;
@@ -652,7 +652,7 @@ STM_TEST(p9_socket_a_listeners_end_leaves_the_next_ones_name) {
     build_sock_path("end");
     int first = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
     STM_ASSERT_TRUE(first >= 0);
-    stm_unix_listen_retire(g_sock_path);
+    stm_unix_listen_retire(first, g_sock_path);
     struct stat st;
     STM_ASSERT_TRUE(lstat(g_sock_path, &st) != 0 && errno == ENOENT);
 
@@ -669,11 +669,95 @@ STM_TEST(p9_socket_a_listeners_end_leaves_the_next_ones_name) {
     (void)unlink(g_sock_path);
 }
 
-/* Daemons started at once on one path take turns at the look and the removal of a
- * dead daemon's socket, by a lock on the path's directory. A listener waits for a
- * turn another holds, and not for good; and it gives its own turn up, whether it
- * comes to listen or is refused. */
-STM_TEST(p9_socket_listen_waits_for_its_turn_and_gives_it_up) {
+/* A socket file no process holds: what a daemon that was killed leaves. */
+static void leave_dead_socket(const char *path)
+{
+    struct sockaddr_un addr;
+    tsock_addr(&addr, path);
+    int dead = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT_TRUE(dead >= 0);
+    STM_ASSERT_EQ(bind(dead, (struct sockaddr *)&addr, sizeof addr), 0);
+    close(dead);
+}
+
+/* A listener's end removes its path only while the file there is its own. A path
+ * somebody removed under it, and another daemon then took, is that daemon's. */
+STM_TEST(p9_socket_a_listeners_end_leaves_a_path_no_longer_its_own) {
+    build_sock_path("notown");
+    int first = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(first >= 0);
+    STM_ASSERT_EQ(unlink(g_sock_path), 0);
+    struct sockaddr_un addr;
+    tsock_addr(&addr, g_sock_path);
+    int other = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT_TRUE(other >= 0);
+    STM_ASSERT_EQ(bind(other, (struct sockaddr *)&addr, sizeof addr), 0);
+    STM_ASSERT_EQ(listen(other, 4), 0);
+
+    stm_unix_listen_retire(first, g_sock_path);
+    close(first);
+    stm_unix_listen_closed(g_sock_path);
+    struct stat st;
+    STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
+    STM_ASSERT_TRUE(S_ISSOCK(st.st_mode));
+    int c = connect_client(g_sock_path);
+    STM_ASSERT_TRUE(c >= 0);
+    close(c);
+    close(other);
+    (void)unlink(g_sock_path);
+
+    /* A file put where its socket was is left as well. */
+    first = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(first >= 0);
+    STM_ASSERT_EQ(unlink(g_sock_path), 0);
+    int rfd = open(g_sock_path, O_CREAT | O_WRONLY | O_EXCL, 0644);
+    STM_ASSERT_TRUE(rfd >= 0);
+    close(rfd);
+    stm_unix_listen_retire(first, g_sock_path);
+    close(first);
+    STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
+    STM_ASSERT_TRUE(S_ISREG(st.st_mode));
+    (void)unlink(g_sock_path);
+}
+
+/* What a listener's end removes is told by its descriptor, and a number is used
+ * again once its listener is closed. A socket bound on a number has nothing of
+ * the listener that had it before: one closed without giving its path up would
+ * else have the later one's end remove a name that was never its own. (Here the
+ * name is the first one's dead socket; where file numbers are used again it
+ * could be a running daemon's.) */
+STM_TEST(p9_socket_a_descriptor_used_again_has_no_path_of_the_one_before) {
+    build_sock_path("again");
+    int first = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(first >= 0);
+    close(first);
+    struct stat st;
+    STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
+
+    int second = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT_TRUE(second >= 0);
+    if (second != first) {
+        STM_ASSERT_EQ(dup2(second, first), first);
+        close(second);
+        second = first;
+    }
+    char other[sizeof g_sock_path + 8], staged[STM_UNIX_STAGED_MAX];
+    snprintf(other, sizeof other, "%s.b", g_sock_path);
+    STM_ASSERT_EQ(stm_unix_listen_staged(second, other, 0600, 4, staged, sizeof staged), 0);
+    stm_unix_listen_retire(second, g_sock_path);
+    STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
+    STM_ASSERT_TRUE(S_ISSOCK(st.st_mode));
+    close(second);
+    (void)unlink(staged);
+    (void)unlink(g_sock_path);
+}
+
+/* Daemons started at once on one path take turns at the look at a socket found
+ * there and its removal, by a lock on the path's directory. A listener that finds
+ * no socket asks for no turn. One that finds one asks, waits for a turn another
+ * holds, and not for good; and it gives its own turn up, whether it comes to
+ * listen or is refused. */
+STM_TEST(p9_socket_listen_takes_its_turn_at_a_socket_alone_and_gives_it_up) {
     char dir[] = "/tmp/stm_socktest_turn_XXXXXX";
     STM_ASSERT_TRUE(mkdtemp(dir) != NULL);
     char path[64];
@@ -681,18 +765,35 @@ STM_TEST(p9_socket_listen_waits_for_its_turn_and_gives_it_up) {
     int held = open(dir, O_RDONLY | O_DIRECTORY);
     STM_ASSERT_TRUE(held >= 0);
 
-    /* Free after a listener that came to listen. */
+    /* Nothing at the path: no turn asked for, whoever keeps the lock. */
+    STM_ASSERT_EQ(flock(held, LOCK_EX | LOCK_NB), 0);
+    unsigned asked = stm_unix_listen_test_turns_asked;
     int fd = stm_stratumd_listen_unix(path, 4, 0600, 0);
     STM_ASSERT_TRUE(fd >= 0);
+    STM_ASSERT_EQ(stm_unix_listen_test_turns_asked - asked, 0);
+    STM_ASSERT_EQ(flock(held, LOCK_UN), 0);
+
+    /* A running daemon's socket there: asked for, and given up by the one refused. */
+    asked = stm_unix_listen_test_turns_asked;
+    STM_ASSERT_EQ(stm_stratumd_listen_unix(path, 4, 0600, 0), -EADDRINUSE);
+    STM_ASSERT_EQ(stm_unix_listen_test_turns_asked - asked, 1);
     STM_ASSERT_EQ(flock(held, LOCK_EX | LOCK_NB), 0);
     STM_ASSERT_EQ(flock(held, LOCK_UN), 0);
-    /* And after one that was refused. */
-    STM_ASSERT_EQ(stm_stratumd_listen_unix(path, 4, 0600, 0), -EADDRINUSE);
+    stm_unix_listen_retire(fd, path);
+    close(fd);
+
+    /* A dead daemon's: asked for, and given up by the one that comes to listen. */
+    leave_dead_socket(path);
+    asked = stm_unix_listen_test_turns_asked;
+    fd = stm_stratumd_listen_unix(path, 4, 0600, 0);
+    STM_ASSERT_TRUE(fd >= 0);
+    STM_ASSERT_EQ(stm_unix_listen_test_turns_asked - asked, 1);
     STM_ASSERT_EQ(flock(held, LOCK_EX | LOCK_NB), 0);
-    stm_unix_listen_retire(path);
+    stm_unix_listen_retire(fd, path);
     close(fd);
 
     /* Another holds the turn, and keeps it: waited for, and then gone on without. */
+    leave_dead_socket(path);
     struct timespec began, ended;
     clock_gettime(CLOCK_MONOTONIC, &began);
     fd = stm_stratumd_listen_unix(path, 4, 0600, 0);
@@ -703,7 +804,7 @@ STM_TEST(p9_socket_listen_waits_for_its_turn_and_gives_it_up) {
     STM_ASSERT_TRUE(waited_ms >= 50);
 
     close(held);
-    stm_unix_listen_retire(path);
+    stm_unix_listen_retire(fd, path);
     close(fd);
     STM_ASSERT_EQ(rmdir(dir), 0);
 }
@@ -726,12 +827,7 @@ STM_TEST(p9_socket_turn_is_kept_from_the_look_to_the_removal) {
     STM_ASSERT_TRUE(mkdtemp(dir) != NULL);
     char path[64];
     snprintf(path, sizeof path, "%s/s.sock", dir);
-    struct sockaddr_un addr;
-    sock_addr(&addr, path);
-    int dead = socket(AF_UNIX, SOCK_STREAM, 0);
-    STM_ASSERT_TRUE(dead >= 0);
-    STM_ASSERT_EQ(bind(dead, (struct sockaddr *)&addr, sizeof addr), 0);
-    close(dead);
+    leave_dead_socket(path);
 
     g_turn_dir = dir;
     g_turn_tried = -1;
@@ -741,8 +837,116 @@ STM_TEST(p9_socket_turn_is_kept_from_the_look_to_the_removal) {
     STM_ASSERT_TRUE(fd >= 0);
     STM_ASSERT_EQ(g_turn_tried, EWOULDBLOCK);
 
-    stm_unix_listen_retire(path);
+    stm_unix_listen_retire(fd, path);
     close(fd);
+    STM_ASSERT_EQ(rmdir(dir), 0);
+}
+
+/* A whole stratumd, with /ctl/ on, whose start fails once its /ctl/ worker runs:
+ * the worker is stopped and the run returns, whoever set the daemon's stop flag
+ * or nobody, and nothing of the daemon is left. */
+typedef struct {
+    stm_stratumd_opts opts;
+    stm_status        rc;
+    atomic_bool       done;
+} failing_run;
+
+static void *failing_run_thread(void *arg)
+{
+    failing_run *r = arg;
+    r->rc = stm_stratumd_run(&r->opts);
+    atomic_store(&r->done, true);
+    return NULL;
+}
+
+static const char *g_take_path;
+static void take_the_path(void)
+{
+    int fd = open(g_take_path, O_CREAT | O_WRONLY | O_EXCL, 0600);
+    if (fd >= 0) close(fd);
+}
+
+/* The run's status. A run still going after ten seconds is not coming back, and
+ * its thread cannot be joined: the program ends there, failed. */
+static stm_status failing_run_status(failing_run *r, const char *what)
+{
+    atomic_init(&r->done, false);
+    r->rc = STM_OK;
+    pthread_t tid;
+    STM_ASSERT_EQ(pthread_create(&tid, NULL, failing_run_thread, r), 0);
+    for (int i = 0; i < 1000 && !atomic_load(&r->done); i++) usleep(10 * 1000);
+    if (!atomic_load(&r->done)) {
+        fprintf(stderr, "  FAIL %s: stm_stratumd_run has not returned after 10 s\n", what);
+        _exit(1);
+    }
+    pthread_join(tid, NULL);
+    return r->rc;
+}
+
+STM_TEST(p9_socket_stratumd_whose_start_fails_past_its_ctl_ends) {
+    make_tmp("9p_sock_failing");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    char dir[] = "/tmp/stm_socktest_fail_XXXXXX";
+    STM_ASSERT_TRUE(mkdtemp(dir) != NULL);
+    char fs_path[64], ctl_path[64];
+    snprintf(fs_path, sizeof fs_path, "%s/fs.sock", dir);
+    snprintf(ctl_path, sizeof ctl_path, "%s/ctl.sock", dir);
+    struct stat st;
+    atomic_bool stop;
+    atomic_init(&stop, false);
+
+    failing_run r;
+    memset(&r.opts, 0, sizeof r.opts);
+    r.opts.fs_path         = g_tmp_path;
+    r.opts.keyfile_path    = g_key_path;
+    r.opts.socket_path     = fs_path;
+    r.opts.ctl_socket_path = ctl_path;
+    r.opts.stop_flag       = &stop;
+
+    /* Its path taken between the look and the last step, with no corvus consumer
+     * to set the stop flag. */
+    g_take_path = fs_path;
+    stm_stratumd_test_before_publish = take_the_path;
+    stm_status rc = failing_run_status(&r, "a path taken since the look");
+    stm_stratumd_test_before_publish = NULL;
+    STM_ASSERT_EQ((int)rc, (int)STM_EBACKEND);
+    STM_ASSERT_FALSE(atomic_load(&stop));
+    STM_ASSERT_EQ(lstat(fs_path, &st), 0);
+    STM_ASSERT_TRUE(S_ISREG(st.st_mode));
+    STM_ASSERT_EQ(unlink(fs_path), 0);
+    STM_ASSERT_TRUE(lstat(ctl_path, &st) != 0 && errno == ENOENT);
+
+    /* The same with a corvus consumer running, waiting for a corvus that is not
+     * there. The consumer is stopped too, and its stop is what sets the daemon's
+     * flag: the one sign of it to be had from here. */
+    char corvus_path[64];
+    snprintf(corvus_path, sizeof corvus_path, "%s/no-corvus", dir);
+    r.opts.corvus_user          = "michael";
+    r.opts.corvus_notify_socket = corvus_path;
+    stm_stratumd_test_before_publish = take_the_path;
+    rc = failing_run_status(&r, "a path taken since the look, a corvus consumer running");
+    stm_stratumd_test_before_publish = NULL;
+    STM_ASSERT_EQ((int)rc, (int)STM_EBACKEND);
+    STM_ASSERT_TRUE(atomic_load(&stop));
+    STM_ASSERT_EQ(unlink(fs_path), 0);
+    STM_ASSERT_TRUE(lstat(ctl_path, &st) != 0 && errno == ENOENT);
+    atomic_store(&stop, false);
+    r.opts.corvus_notify_socket = NULL;
+
+    /* A corvus consumer that cannot start, the stop flag never set. */
+    r.opts.corvus_user = "michael\nthe-injector";
+    rc = failing_run_status(&r, "a corvus consumer that cannot start");
+    STM_ASSERT_TRUE(rc != STM_OK);
+    STM_ASSERT_FALSE(atomic_load(&stop));
+
+    /* A corvus consumer asked for with no stop flag at all. */
+    r.opts.corvus_user = "michael";
+    r.opts.stop_flag   = NULL;
+    rc = failing_run_status(&r, "a corvus consumer and no stop flag");
+    STM_ASSERT_EQ((int)rc, (int)STM_EINVAL);
+
+    /* Neither path, nor the name the FS socket was bound under. */
     STM_ASSERT_EQ(rmdir(dir), 0);
 }
 

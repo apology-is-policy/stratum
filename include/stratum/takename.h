@@ -4,9 +4,10 @@
 
 /*
  * Gives the file at `from` the name `to` only if `to` is free. An exclusive
- * rename where the system and the filesystem have one; else a link, which
- * refuses a name that is taken as well, and the removal of `from`; else, with
- * neither, a look at `to` and a plain rename, which is then all there is.
+ * rename where the system and the filesystem have one, and on Linux where a
+ * system-call filter lets it through; else a link, which refuses a name that is
+ * taken as well, and the removal of `from`; else, with neither, a look at `to`
+ * and a plain rename, which is then all there is.
  *
  * Returns 0, or -1 with errno set: EEXIST for a name that is taken.
  */

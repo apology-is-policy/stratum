@@ -34,7 +34,11 @@ int stm_take_name(const char *from, const char *to)
     if (!not_here(errno)) return -1;
 #elif defined(__linux__) && defined(SYS_renameat2)
     if (syscall(SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) == 0) return 0;
-    if (!not_here(errno)) return -1;
+    /* EPERM is also a system-call filter's word for a call it does not list. The call
+     * never says it of a name that is taken (that is EEXIST), and the link below
+     * refuses a taken name too. Where the link is refused as well, what is left is
+     * the last arm, as on a system with neither. */
+    if (errno != EPERM && !not_here(errno)) return -1;
 #endif
     if (link(from, to) == 0) {
         (void)unlink(from);

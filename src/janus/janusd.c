@@ -287,7 +287,7 @@ static int cmd_serve(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
 
     stm_status rc = janus_serve_loop(lfd, synfs, &g_shutdown);
-    stm_unix_listen_retire(socket_path);
+    stm_unix_listen_retire(lfd, socket_path);
     close(lfd);
     stm_unix_listen_closed(socket_path);
     janus_synfs_destroy(synfs);
