@@ -868,15 +868,31 @@ mod slate_state {
 
 // -- A daemon's socket can be dialed as soon as it can be seen --------
 
+/// Looks for `sock` with no sleep between the looks. The daemon is in a guard, so a bound that
+/// fires here does not leave it running.
+fn spin_until_seen(guard: &mut common::DaemonGuard, sock: &Path) {
+    use std::time::{Duration, Instant};
+
+    let began = Instant::now();
+    let mut looks = 0u32;
+    while !sock.exists() {
+        looks += 1;
+        if looks % 4096 == 0 {
+            let ended = guard.child.as_mut().expect("a child").try_wait().unwrap().is_some();
+            assert!(!ended, "{} ended before its socket appeared; its log:\n{}", guard.label, guard.dump_log());
+            assert!(began.elapsed() < Duration::from_secs(20), "{} socket never appeared", guard.label);
+        }
+        std::hint::spin_loop();
+    }
+}
+
 /// Whoever waits for a daemon waits for its socket's name, the manager among them, and a daemon
 /// binds its socket before it makes it listen: were the name there from the bind, a dial between
-/// the two would be refused. Each daemon is started and dialed the moment its name appears, with
-/// no sleep between the looks.
+/// the two would be refused. Each daemon is started and dialed the moment its name appears.
 #[test]
 fn a_socket_that_can_be_seen_can_be_dialed() {
     use std::os::unix::net::UnixStream;
     use std::process::Command;
-    use std::time::{Duration, Instant};
 
     let bin = common::locate_stratum_bin();
     let tmp = tempfile::Builder::new().prefix("seen-").tempdir().expect("tempdir");
@@ -892,7 +908,7 @@ fn a_socket_that_can_be_seen_can_be_dialed() {
             } else {
                 cmd.arg("host-fs").arg(&host);
             }
-            let mut child = cmd
+            let child = cmd
                 .arg("--listen")
                 .arg(&sock)
                 .arg("--allow-unauth")
@@ -900,19 +916,10 @@ fn a_socket_that_can_be_seen_can_be_dialed() {
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn the daemon");
-            let began = Instant::now();
-            let mut looks = 0u32;
-            while !sock.exists() {
-                looks += 1;
-                if looks % 4096 == 0 {
-                    assert!(child.try_wait().unwrap().is_none(), "{daemon} ended before its socket appeared");
-                    assert!(began.elapsed() < Duration::from_secs(20), "{daemon} socket never appeared");
-                }
-                std::hint::spin_loop();
-            }
+            let mut guard = common::DaemonGuard { child: Some(child), label: daemon, log_path: None };
+            spin_until_seen(&mut guard, &sock);
             let dial = UnixStream::connect(&sock);
-            let _ = child.kill();
-            let _ = child.wait();
+            guard.kill();
             if let Err(e) = dial {
                 refused.push(format!("{daemon}, start {start}: {e}"));
             }
@@ -923,6 +930,67 @@ fn a_socket_that_can_be_seen_can_be_dialed() {
         "{} of 120 dials made the moment the socket appeared failed: {:?}",
         refused.len(),
         &refused[..refused.len().min(3)]
+    );
+}
+
+/// stratumd makes its /ctl/ socket after its FS socket, and whoever waits for it waits for the FS
+/// socket's name alone: that name must be the last thing a start gives, there only once /ctl/
+/// can be dialed too.
+#[test]
+fn stratumd_is_seen_only_once_its_ctl_can_be_dialed() {
+    use std::os::unix::net::UnixStream;
+    use std::process::Command;
+
+    let bin = common::locate_stratum_bin();
+    let tmp = tempfile::Builder::new().prefix("last-").tempdir().expect("tempdir");
+    let vol = tmp.path().join("v.stm");
+    let mkfs = Command::new(&bin)
+        .arg("mkfs")
+        .arg(&vol)
+        .args(["--size", "64M"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run mkfs");
+    assert!(mkfs.status.success(), "mkfs: {}", String::from_utf8_lossy(&mkfs.stderr));
+    let key = tmp.path().join("v.stm.key");
+    let mut failed = Vec::new();
+    for start in 0..40 {
+        let fs = tmp.path().join(format!("fs-{start}.sock"));
+        let ctl = tmp.path().join(format!("ctl-{start}.sock"));
+        let log = tmp.path().join(format!("stratumd-{start}.log"));
+        let child = Command::new(&bin)
+            .arg("serve")
+            .arg(&vol)
+            .arg("--listen")
+            .arg(&fs)
+            .arg("--ctl-listen")
+            .arg(&ctl)
+            .arg("--keyfile")
+            .arg(&key)
+            .arg("--admin-uid")
+            .arg(unsafe { libc::geteuid() }.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn()
+            .expect("spawn stratumd");
+        let mut guard = common::DaemonGuard { child: Some(child), label: "stratumd", log_path: Some(log) };
+        spin_until_seen(&mut guard, &fs);
+        let ctl_dial = UnixStream::connect(&ctl);
+        let fs_dial = UnixStream::connect(&fs);
+        guard.kill();
+        if let Err(e) = ctl_dial {
+            failed.push(format!("/ctl/, start {start}: {e}"));
+        }
+        if let Err(e) = fs_dial {
+            failed.push(format!("FS, start {start}: {e}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} dials made the moment stratumd's FS socket appeared failed: {:?}",
+        failed.len(),
+        &failed[..failed.len().min(3)]
     );
 }
 

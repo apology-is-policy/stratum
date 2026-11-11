@@ -283,8 +283,10 @@ refuse:
 /* listen_unix.                                                           */
 /* ────────────────────────────────────────────────────────────────────── */
 
-int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode,
-                             int sockbuf)
+/* With `staged`, the socket listens and has not its path yet: stm_unix_listen_publish
+ * gives it. Without, it has its path on return. */
+static int listen_unix_fd(const char *path, int backlog, mode_t mode, int sockbuf,
+                          char *staged, size_t n)
 {
     if (!path || !*path) return -EINVAL;
     if (strlen(path) >= sizeof((struct sockaddr_un *)0)->sun_path)
@@ -301,24 +303,6 @@ int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode,
     if (backlog < 1) backlog = 1;
     if (backlog > SOMAXCONN) backlog = SOMAXCONN;
 
-    /* R95 P3-1 — refuse to clobber a non-socket file at `path`.
-     * Operators who typo `--listen /etc/passwd` deserve protection.
-     * lstat (not stat) so a symlink-to-non-socket also refuses. */
-    {
-        struct stat st;
-        if (lstat(path, &st) == 0) {
-            if (!S_ISSOCK(st.st_mode))
-                return -EEXIST;
-        } else if (errno != ENOENT) {
-            /* Permission denied / IO error reading the path — refuse
-             * rather than blunder in. */
-            return -errno;
-        }
-    }
-    /* Stale socket: unlink. ENOENT tolerated; other errors fatal
-     * (mirrors janus's R11 P3-X discipline). */
-    if (unlink(path) != 0 && errno != ENOENT) return -errno;
-
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -errno;
 
@@ -334,7 +318,8 @@ int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode,
                          &sockbuf, sizeof sockbuf);
     }
 
-    int rc = stm_unix_listen_at(fd, path, mode, backlog);
+    int rc = staged ? stm_unix_listen_staged(fd, path, mode, backlog, staged, n)
+                    : stm_unix_listen_at(fd, path, mode, backlog);
     if (rc != 0) {
         close(fd);
         return rc;
@@ -349,6 +334,12 @@ int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode,
     if (flags >= 0) (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 
     return fd;
+}
+
+int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode,
+                             int sockbuf)
+{
+    return listen_unix_fd(path, backlog, mode, sockbuf, NULL, 0);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -1418,16 +1409,6 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
                     ? opts->socket_mode
                     : STM_STRATUMD_DEFAULT_SOCKET_MODE;
 
-    int listen_fd = stm_stratumd_listen_unix(opts->socket_path,
-                                                backlog, mode,
-                                                STM_STRATUMD_FS_SOCKBUF);
-    if (listen_fd < 0) {
-        fprintf(stderr,
-            "stratumd: listen on %s failed: %s\n",
-            opts->socket_path, strerror(-listen_fd));
-        return STM_EBACKEND;
-    }
-
     uint32_t msize_max = opts->msize_max > 0u ? opts->msize_max
                                               : STM_9P_MSIZE_DEFAULT;
 
@@ -1440,17 +1421,24 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
             "patterns (got %zu, max %u)\n",
             opts->n_datasets_allowed,
             (unsigned)STM_PROXY_9P_PATTERN_MAX);
-        close(listen_fd);
-        (void)unlink(opts->socket_path);
         return STM_EINVAL;
     }
     if (opts->n_datasets_allowed > 0u && !opts->datasets_allowed) {
         fprintf(stderr,
             "stratumd: --role client: n_datasets_allowed > 0 but "
             "datasets_allowed is NULL\n");
-        close(listen_fd);
-        (void)unlink(opts->socket_path);
         return STM_EINVAL;
+    }
+
+    /* Last, as the coordinator's: a start that fails never shows its path. */
+    int listen_fd = stm_stratumd_listen_unix(opts->socket_path,
+                                                backlog, mode,
+                                                STM_STRATUMD_FS_SOCKBUF);
+    if (listen_fd < 0) {
+        fprintf(stderr,
+            "stratumd: listen on %s failed: %s%s\n",
+            opts->socket_path, strerror(-listen_fd), stm_unix_listen_hint(listen_fd));
+        return STM_EBACKEND;
     }
 
     stm_status rc = stratumd_accept_proxy_loop(listen_fd,
@@ -1465,8 +1453,9 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
                                                   opts->coordinator_uid,
                                                   opts->single_session);
 
+    stm_unix_listen_retire(opts->socket_path);
     close(listen_fd);
-    (void)unlink(opts->socket_path);
+    stm_unix_listen_closed(opts->socket_path);
     return rc;
 }
 
@@ -1819,14 +1808,16 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
     mode_t   mode    = opts->socket_mode != 0 ? opts->socket_mode
                                               : STM_STRATUMD_DEFAULT_SOCKET_MODE;
 
-    /* Bind FS listen socket. */
-    int listen_fd = stm_stratumd_listen_unix(opts->socket_path,
-                                                backlog, mode,
-                                                STM_STRATUMD_FS_SOCKBUF);
+    /* The FS socket listens from here and takes its path last, below: whoever waits
+     * for the daemon waits for that path, and it must not be there while a step that
+     * can still fail, /ctl/ among them, is ahead. */
+    char fs_staged[STM_UNIX_STAGED_MAX];
+    int listen_fd = listen_unix_fd(opts->socket_path, backlog, mode,
+                                   STM_STRATUMD_FS_SOCKBUF, fs_staged, sizeof fs_staged);
     if (listen_fd < 0) {
         fprintf(stderr,
-            "stratumd: listen on %s failed: %s\n",
-            opts->socket_path, strerror(-listen_fd));
+            "stratumd: listen on %s failed: %s%s\n",
+            opts->socket_path, strerror(-listen_fd), stm_unix_listen_hint(listen_fd));
         (void)stm_fs_unmount(fs);
         return STM_EBACKEND;
     }
@@ -1858,7 +1849,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
             fprintf(stderr,
                 "stratumd: stm_ctl_create failed (rc=%d)\n", (int)rc);
             close(listen_fd);
-            (void)unlink(opts->socket_path);
+            (void)unlink(fs_staged);
             (void)stm_fs_unmount(fs);
             return rc;
         }
@@ -1928,7 +1919,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
                 "stratumd: stm_ctl_attach_pool failed (rc=%d)\n", (int)rc);
             stm_ctl_destroy(ctl);
             close(listen_fd);
-            (void)unlink(opts->socket_path);
+            (void)unlink(fs_staged);
             (void)stm_fs_unmount(fs);
             return rc;
         }
@@ -1938,7 +1929,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
                 "stratumd: stm_scrub_create failed (rc=%d)\n", (int)rc);
             stm_ctl_destroy(ctl);
             close(listen_fd);
-            (void)unlink(opts->socket_path);
+            (void)unlink(fs_staged);
             (void)stm_fs_unmount(fs);
             return rc;
         }
@@ -1958,7 +1949,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
             stm_scrub_close(scrub);
             stm_ctl_destroy(ctl);
             close(listen_fd);
-            (void)unlink(opts->socket_path);
+            (void)unlink(fs_staged);
             (void)stm_fs_unmount(fs);
             return rc;
         }
@@ -1969,7 +1960,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
             stm_scrub_close(scrub);
             stm_ctl_destroy(ctl);
             close(listen_fd);
-            (void)unlink(opts->socket_path);
+            (void)unlink(fs_staged);
             (void)stm_fs_unmount(fs);
             return rc;
         }
@@ -1978,12 +1969,12 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
                                               backlog, mode, 0);
         if (ctl_fd < 0) {
             fprintf(stderr,
-                "stratumd: listen on %s (/ctl/) failed: %s\n",
-                opts->ctl_socket_path, strerror(-ctl_fd));
+                "stratumd: listen on %s (/ctl/) failed: %s%s\n",
+                opts->ctl_socket_path, strerror(-ctl_fd), stm_unix_listen_hint(ctl_fd));
             stm_ctl_destroy(ctl);
             stm_scrub_close(scrub);
             close(listen_fd);
-            (void)unlink(opts->socket_path);
+            (void)unlink(fs_staged);
             (void)stm_fs_unmount(fs);
             return STM_EBACKEND;
         }
@@ -2024,12 +2015,13 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
         if (prc != 0) {
             fprintf(stderr,
                 "stratumd: pthread_create for /ctl/ failed (rc=%d)\n", prc);
+            stm_unix_listen_retire(opts->ctl_socket_path);
             close(ctl_fd);
-            (void)unlink(opts->ctl_socket_path);
+            stm_unix_listen_closed(opts->ctl_socket_path);
             stm_ctl_destroy(ctl);
             stm_scrub_close(scrub);
             close(listen_fd);
-            (void)unlink(opts->socket_path);
+            (void)unlink(fs_staged);
             (void)stm_fs_unmount(fs);
             return STM_EIO;
         }
@@ -2059,12 +2051,13 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
             "stratumd: --corvus-user set but no stop_flag provided; "
             "the SESSION_CLOSED consumer cannot signal shutdown "
             "(invariant C-5 / STRATUM-API-V1.md §6) — refusing to start\n");
+        if (ctl_fd >= 0) stm_unix_listen_retire(opts->ctl_socket_path);
         if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid);
         close(listen_fd);
-        (void)unlink(opts->socket_path);
+        (void)unlink(fs_staged);
         if (ctl_fd >= 0) {
             close(ctl_fd);
-            (void)unlink(opts->ctl_socket_path);
+            stm_unix_listen_closed(opts->ctl_socket_path);
         }
         if (ctl) stm_ctl_destroy(ctl);
         if (scrub) stm_scrub_close(scrub);
@@ -2091,18 +2084,39 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
                 (int)crc);
             /* Fatal: a Thylacine-bound stratumd MUST run the consumer.
              * Tear everything down. */
+            if (ctl_fd >= 0) stm_unix_listen_retire(opts->ctl_socket_path);
             if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid);
             close(listen_fd);
-            (void)unlink(opts->socket_path);
+            (void)unlink(fs_staged);
             if (ctl_fd >= 0) {
                 close(ctl_fd);
-                (void)unlink(opts->ctl_socket_path);
+                stm_unix_listen_closed(opts->ctl_socket_path);
             }
             if (ctl) stm_ctl_destroy(ctl);
             if (scrub) stm_scrub_close(scrub);
             (void)stm_fs_unmount(fs);
             return crc;
         }
+    }
+
+    /* Every step that can fail is behind: the FS socket takes its path. */
+    int published = stm_unix_listen_publish(fs_staged, opts->socket_path);
+    if (published != 0) {
+        fprintf(stderr,
+            "stratumd: listen on %s failed: %s%s\n",
+            opts->socket_path, strerror(-published), stm_unix_listen_hint(published));
+        if (cnc) (void)stm_corvus_notify_stop(cnc);
+        if (ctl_fd >= 0) stm_unix_listen_retire(opts->ctl_socket_path);
+        if (ctl_started) stratumd_stop_ctl(ctl_fd, ctl_tid);
+        close(listen_fd);
+        if (ctl_fd >= 0) {
+            close(ctl_fd);
+            stm_unix_listen_closed(opts->ctl_socket_path);
+        }
+        if (ctl) stm_ctl_destroy(ctl);
+        if (scrub) stm_scrub_close(scrub);
+        (void)stm_fs_unmount(fs);
+        return STM_EBACKEND;
     }
 
     /* Deterministic boot-readiness signal (Thylacine launcher contract).
@@ -2152,6 +2166,8 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
      * /ctl/ listen fd to unblock its accept(), then join the worker.
      * The worker observes EBADF/EINVAL on accept after shutdown and
      * checks stop_flag, then returns STM_OK. */
+    stm_unix_listen_retire(opts->socket_path);
+    if (ctl_fd >= 0) stm_unix_listen_retire(opts->ctl_socket_path);
     if (ctl_started) {
         stratumd_stop_ctl(ctl_fd, ctl_tid);
         if (rc == STM_OK && wctx.rc != STM_OK) rc = wctx.rc;
@@ -2166,10 +2182,10 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
      * sync — per scrub.h "Borrowed references" + ctl.h R26 P3-4
      * ordering: servers → ctl → scrub → sync), then unmount the fs. */
     close(listen_fd);
-    (void)unlink(opts->socket_path);
+    stm_unix_listen_closed(opts->socket_path);
     if (ctl_fd >= 0) {
         close(ctl_fd);
-        (void)unlink(opts->ctl_socket_path);
+        stm_unix_listen_closed(opts->ctl_socket_path);
     }
     if (ctl) stm_ctl_destroy(ctl);
     if (scrub) stm_scrub_close(scrub);

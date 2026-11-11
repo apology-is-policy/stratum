@@ -33,6 +33,7 @@
 #include <stratum/cmds.h>
 #include <stratum/lp9.h>
 #include <stratum/slate.h>
+#include <stratum/listen.h>
 #include <stratum/stratumd.h>      /* listen_unix helper, peer-cred discipline */
 #include <stratum/types.h>
 
@@ -435,8 +436,8 @@ static int run_serve(const char *socket_path, uint32_t msize_max,
                                                   DEFAULT_BACKLOG, 0600, 0);
     if (listen_fd < 0) {
         fprintf(stderr,
-            "stratum-slate: listen on %s failed: %s\n",
-            socket_path, strerror(-listen_fd));
+            "stratum-slate: listen on %s failed: %s%s\n",
+            socket_path, strerror(-listen_fd), stm_unix_listen_hint(listen_fd));
         stm_slate_destroy(slate);
         return 2;
     }
@@ -461,8 +462,9 @@ static int run_serve(const char *socket_path, uint32_t msize_max,
      * The order matters: stm_slate_stop BEFORE drain so blocked
      * cond_wait readers exit their critical section first; drain
      * BEFORE destroy so no worker holds s->mu when mu is destroyed. */
+    stm_unix_listen_retire(socket_path);
     close(listen_fd);
-    (void)unlink(socket_path);
+    stm_unix_listen_closed(socket_path);
     stm_slate_stop(slate);
     worker_pool_drain();
     stm_slate_destroy(slate);
@@ -491,7 +493,8 @@ static void usage(const char *argv0)
             "(default: 0 = none — /redraw blocks)\n"
         "  --allow-unauth       Accept connections when peer creds\n"
         "                       cannot be resolved (TESTING ONLY)\n"
-        "  -h, --help           This message\n",
+        "  -h, --help           This message\n"
+        STM_UNIX_LISTEN_ROOM_NOTE,
         argv0, argv0, argv0);
 }
 

@@ -505,7 +505,9 @@ STM_TEST(janus_serve_loop_stops_on_flag_with_listen_fd_open)
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof addr);
         addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, sock, sizeof addr.sun_path - 1);
+        size_t n = strlen(sock);
+        if (n >= sizeof addr.sun_path) n = sizeof addr.sun_path - 1;
+        memcpy(addr.sun_path, sock, n);
         (void)connect(c, (struct sockaddr *)&addr, sizeof addr);
         close(c);
     }
@@ -542,6 +544,52 @@ STM_TEST(janus_listen_unix_enforces_0600)
     STM_ASSERT_EQ((long long)mode, 0600);
 
     close(lfd);
+    unlink(sock);
+    tmp_rm(dir);
+    free(dir);
+}
+
+/* A `mode` of 0 asks for the default, not for a socket nobody can dial. */
+STM_TEST(janus_listen_unix_mode_0_is_0600)
+{
+    char *dir = tmp_dir();
+    STM_ASSERT(dir);
+    char sock[1024];
+    snprintf(sock, sizeof sock, "%s/sock", dir);
+
+    int lfd = janus_listen_unix(sock, 0);
+    STM_ASSERT(lfd >= 0);
+    struct stat st;
+    STM_ASSERT_EQ(stat(sock, &st), 0);
+    STM_ASSERT_EQ(st.st_mode & 07777, 0600);
+
+    close(lfd);
+    unlink(sock);
+    tmp_rm(dir);
+    free(dir);
+}
+
+/* What is at the socket's path and is no socket is somebody's file: it is
+ * refused, and left as it was. */
+STM_TEST(janus_listen_unix_refuses_a_file_at_its_path)
+{
+    char *dir = tmp_dir();
+    STM_ASSERT(dir);
+    char sock[1024];
+    snprintf(sock, sizeof sock, "%s/sock", dir);
+    int rfd = open(sock, O_CREAT | O_WRONLY | O_EXCL, 0600);
+    STM_ASSERT(rfd >= 0);
+    STM_ASSERT_EQ(write(rfd, "kept", 4), 4);
+    close(rfd);
+
+    errno = 0;
+    STM_ASSERT_EQ(janus_listen_unix(sock, 0600), STM_EIO);
+    STM_ASSERT_EQ(errno, EEXIST);
+    struct stat st;
+    STM_ASSERT_EQ(lstat(sock, &st), 0);
+    STM_ASSERT(S_ISREG(st.st_mode));
+    STM_ASSERT_EQ(st.st_size, 4);
+
     unlink(sock);
     tmp_rm(dir);
     free(dir);

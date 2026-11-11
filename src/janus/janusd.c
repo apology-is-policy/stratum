@@ -28,6 +28,7 @@
 #include "synfs.h"
 
 #include <stratum/crypto.h>
+#include <stratum/listen.h>
 #include <stratum/types.h>
 
 #include <errno.h>
@@ -274,7 +275,8 @@ static int cmd_serve(int argc, char **argv)
 
     int lfd = janus_listen_unix(socket_path, 0600);
     if (lfd < 0) {
-        fprintf(stderr, "serve: listen on %s failed\n", socket_path);
+        fprintf(stderr, "serve: listen on %s failed: %s%s\n", socket_path,
+                strerror(errno), stm_unix_listen_hint(-errno));
         goto fail_after_synfs;
     }
 
@@ -285,8 +287,9 @@ static int cmd_serve(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
 
     stm_status rc = janus_serve_loop(lfd, synfs, &g_shutdown);
+    stm_unix_listen_retire(socket_path);
     close(lfd);
-    unlink(socket_path);
+    stm_unix_listen_closed(socket_path);
     janus_synfs_destroy(synfs);
     for (size_t i = 0; i < n_pools; i++) free(pools_storage[i]);
     return (rc == STM_OK) ? 0 : 1;
@@ -314,7 +317,8 @@ int main(int argc, char **argv)
                 "usage:\n"
                 "  janus setup --state-dir <dir> [--passphrase-from <path>]\n"
                 "  janus serve --socket <path> --pool <uuid>:<backend>:<config> ...\n"
-                "              [--passphrase-from <path>]\n");
+                "              [--passphrase-from <path>]\n"
+                STM_UNIX_LISTEN_ROOM_NOTE);
         return 2;
     }
     if (!strcmp(argv[1], "setup")) return cmd_setup(argc - 2, argv + 2);

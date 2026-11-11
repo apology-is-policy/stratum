@@ -19,11 +19,12 @@
 #include <sys/types.h>
 
 /*
- * Create + bind + listen on a Unix socket at `path`. If the path
- * already exists, it is unlinked. Socket is created with mode 0600
- * unless `mode` overrides it. The socket takes `path` only once it
- * listens (stm_unix_listen_at). Returns the listening fd (>= 0) on
- * success or STM_EIO as a negative.
+ * Makes a socket that listens at `path`, of mode `mode`, 0600 for a
+ * `mode` of 0. The socket takes `path` only once it listens, and what
+ * is at `path` already is cleared or refused as stm_unix_listen_staged
+ * says. Returns the listening fd (>= 0), or a negative stm_status
+ * (STM_EINVAL for no path or one too long for a socket address, else
+ * STM_EIO) with errno saying why.
  */
 int janus_listen_unix(const char *path, mode_t mode);
 

@@ -1918,6 +1918,34 @@ def escape_prefix_leg(stratum, root):
         term.kill()
 
 
+def no_room_leg(stratum, root):
+    """A daemon of the manager's that cannot listen says why and ends, and the manager says so
+    at once: it does not wait out its bound to say only that no socket came. Under a temporary
+    directory this long no socket path leaves room in a socket address."""
+    how = 'a temporary directory too long for a socket path'
+    long = f"{root}/{'n' * 100}"
+    host = f'{root}/no-room-host'
+    os.mkdir(long)
+    os.mkdir(host)
+    began = time.monotonic()
+    term = Term(['/usr/bin/env', f'XDG_RUNTIME_DIR={long}', f'TMPDIR={long}', stratum, 'tui', '--host', host])
+    try:
+        ended = term.exited(30)
+        took = time.monotonic() - began
+        # The path in the message is longer than a row, and the wrap falls anywhere.
+        said = re.sub(r'\s+', '', term.screen.text())
+        named = 'host-fsdidnotstart:' in said and 'Filenametoolong' in said and 'adotandthepid' in said
+        record(ended and term.rc == 1 and named, f"{how}: the manager ended with host-fs's own words",
+               f'{how}: ended={ended} rc={term.rc}, said {term.screen.text().strip()[-500:]!r}')
+        # Its bound for a socket is five seconds.
+        record(ended and took < 4, f'{how}: said at once', f'{how}: said after {took:.1f} s')
+        left = os.listdir(long)
+        record(not left, f'{how}: the session directory is gone', f'{how}: left {left}')
+    finally:
+        term.kill()
+        shutil.rmtree(long, ignore_errors=True)
+
+
 def dashed_host_leg(stratum, root):
     """A host directory or a volume whose name a daemon would read as an option is served as
     what it is: given to --host and to --vol, typed at Shift+F2, and opened from a panel."""
@@ -4065,6 +4093,7 @@ def run(stratum, root):
                       (escape_prefix_leg, (stratum, root)),
                       (editor_escape_leg, (stratum, root)),
                       (dashed_host_leg, (stratum, root)),
+                      (no_room_leg, (stratum, root)),
                       (unprintable_volume_leg, (stratum, vol, host, root)),
                       (editor_legs, (stratum, vol, host, f'{root}/env2')),
                       (wrong_passphrase_leg, (stratum, vol, host)),

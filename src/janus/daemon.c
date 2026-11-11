@@ -39,16 +39,22 @@
 
 int janus_listen_unix(const char *path, mode_t mode)
 {
-    if (!path) return STM_EINVAL;
-    if (strlen(path) >= sizeof ((struct sockaddr_un *)0)->sun_path) return STM_EINVAL;
-
-    /* A socket left by a run before this one. */
-    if (unlink(path) != 0 && errno != ENOENT) return STM_EIO;
+    if (!path) {
+        errno = EINVAL;
+        return STM_EINVAL;
+    }
+    if (strlen(path) >= sizeof ((struct sockaddr_un *)0)->sun_path) {
+        errno = ENAMETOOLONG;
+        return STM_EINVAL;
+    }
+    if (mode == 0) mode = 0600;
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return STM_EIO;
-    if (stm_unix_listen_at(fd, path, mode, 8) != 0) {
+    int rc = stm_unix_listen_at(fd, path, mode, 8);
+    if (rc != 0) {
         close(fd);
+        errno = -rc;
         return STM_EIO;
     }
     return fd;

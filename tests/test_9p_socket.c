@@ -21,15 +21,19 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -93,15 +97,24 @@ static void wake_and_join(accept_ctx *ctx, pthread_t worker)
 /* Client helpers.                                                        */
 /* ────────────────────────────────────────────────────────────────────── */
 
+/* `path` as a socket address. One too long for it is cut short, and a dial of
+ * it then finds nothing. */
+static void sock_addr(struct sockaddr_un *addr, const char *path)
+{
+    memset(addr, 0, sizeof *addr);
+    addr->sun_family = AF_UNIX;
+    size_t n = strlen(path);
+    if (n >= sizeof addr->sun_path) n = sizeof addr->sun_path - 1;
+    memcpy(addr->sun_path, path, n);
+}
+
 /* Connect a client socket to the listening Unix path. Retries up to
  * 50 × 10ms (= 500ms) to tolerate the worker thread being scheduled
  * after the test thread reaches connect(). */
 static int connect_client(const char *sock_path)
 {
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock_path, sizeof addr.sun_path - 1);
+    sock_addr(&addr, sock_path);
 
     for (int attempt = 0; attempt < 50; attempt++) {
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -498,9 +511,7 @@ static void *listen_race_thread(void *p)
 STM_TEST(p9_socket_name_is_there_only_once_it_listens) {
     build_sock_path("ready");
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, g_sock_path, sizeof addr.sun_path - 1);
+    sock_addr(&addr, g_sock_path);
     char staged[sizeof g_sock_path + 32];
     snprintf(staged, sizeof staged, "%s.%ld", g_sock_path, (long)getpid());
 
@@ -531,27 +542,208 @@ STM_TEST(p9_socket_name_is_there_only_once_it_listens) {
     STM_ASSERT_EQ(left, 0);
 }
 
-/* The socket is given its name by a link, which refuses a name that is taken:
- * what is there is left as it is, and nothing stays at the other name. */
-STM_TEST(p9_socket_listen_at_refuses_a_name_that_is_taken) {
+/* The socket is given its path only if the path is still free: one taken since
+ * the look is left as it is, and nothing stays at the name the socket was bound
+ * under. */
+STM_TEST(p9_socket_publish_refuses_a_path_taken_since_the_look) {
     build_sock_path("taken");
-    int rfd = open(g_sock_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    STM_ASSERT_TRUE(rfd >= 0);
-    close(rfd);
-
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     STM_ASSERT_TRUE(fd >= 0);
-    STM_ASSERT_EQ(stm_unix_listen_at(fd, g_sock_path, 0600, 4), -EEXIST);
+    char staged[STM_UNIX_STAGED_MAX];
+    STM_ASSERT_EQ(stm_unix_listen_staged(fd, g_sock_path, 0600, 4, staged, sizeof staged), 0);
+    struct stat st;
+    STM_ASSERT_EQ(lstat(staged, &st), 0);
+    STM_ASSERT_TRUE(S_ISSOCK(st.st_mode));
+    /* It listens, and the path is not there yet. */
+    STM_ASSERT_TRUE(lstat(g_sock_path, &st) != 0 && errno == ENOENT);
+
+    int rfd = open(g_sock_path, O_CREAT | O_WRONLY | O_EXCL, 0644);
+    STM_ASSERT_TRUE(rfd >= 0);
+    close(rfd);
+    STM_ASSERT_EQ(stm_unix_listen_publish(staged, g_sock_path), -EEXIST);
     close(fd);
 
-    struct stat st;
     STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
     STM_ASSERT_TRUE(S_ISREG(st.st_mode));
-    char staged[sizeof g_sock_path + 32];
-    snprintf(staged, sizeof staged, "%s.%ld", g_sock_path, (long)getpid());
     STM_ASSERT_TRUE(lstat(staged, &st) != 0 && errno == ENOENT);
-
     (void)unlink(g_sock_path);
+
+    /* A socket there since the look is a daemon's that started beside this one. */
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT_TRUE(fd >= 0);
+    STM_ASSERT_EQ(stm_unix_listen_staged(fd, g_sock_path, 0600, 4, staged, sizeof staged), 0);
+    struct sockaddr_un addr;
+    sock_addr(&addr, g_sock_path);
+    int other = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT_TRUE(other >= 0);
+    STM_ASSERT_EQ(bind(other, (struct sockaddr *)&addr, sizeof addr), 0);
+    STM_ASSERT_EQ(stm_unix_listen_publish(staged, g_sock_path), -EADDRINUSE);
+    close(fd);
+    STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
+    STM_ASSERT_TRUE(S_ISSOCK(st.st_mode));
+    STM_ASSERT_TRUE(lstat(staged, &st) != 0 && errno == ENOENT);
+    close(other);
+    (void)unlink(g_sock_path);
+}
+
+/* A daemon whose socket is at the path keeps it: a second listener is refused,
+ * the first sees nothing of the look and can still be dialed, and its queue being
+ * full changes nothing. Once no process holds the socket it is a dead daemon's,
+ * and the next listener clears it. */
+STM_TEST(p9_socket_listen_leaves_a_live_socket_and_clears_a_dead_one) {
+    build_sock_path("live");
+    int first = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(first >= 0);
+    struct stat before, after;
+    STM_ASSERT_EQ(lstat(g_sock_path, &before), 0);
+
+    STM_ASSERT_EQ(stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0), -EADDRINUSE);
+    STM_ASSERT_EQ(lstat(g_sock_path, &after), 0);
+    STM_ASSERT_EQ(before.st_ino, after.st_ino);
+    struct pollfd seen = { .fd = first, .events = POLLIN };
+    STM_ASSERT_EQ(poll(&seen, 1, 0), 0);
+
+    /* Dials nobody accepts, until one is turned away. */
+    struct sockaddr_un addr;
+    sock_addr(&addr, g_sock_path);
+    int held[64];
+    int n_held = 0;
+    bool full = false;
+    while (n_held < 64 && !full) {
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        STM_ASSERT_TRUE(c >= 0);
+        (void)fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK);
+        if (connect(c, (struct sockaddr *)&addr, sizeof addr) == 0) {
+            held[n_held++] = c;
+        } else {
+            full = true;
+            close(c);
+        }
+    }
+    STM_ASSERT_TRUE(full);
+    STM_ASSERT_EQ(stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0), -EADDRINUSE);
+    STM_ASSERT_EQ(lstat(g_sock_path, &after), 0);
+    STM_ASSERT_EQ(before.st_ino, after.st_ino);
+    for (int i = 0; i < n_held; i++) close(held[i]);
+
+    close(first);
+    int second = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(second >= 0);
+    int c = connect_client(g_sock_path);
+    STM_ASSERT_TRUE(c >= 0);
+    close(c);
+    close(second);
+    (void)unlink(g_sock_path);
+
+    /* Bound and not yet listening: a daemon's all the same. */
+    int bound = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT_TRUE(bound >= 0);
+    STM_ASSERT_EQ(bind(bound, (struct sockaddr *)&addr, sizeof addr), 0);
+    STM_ASSERT_EQ(stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0), -EADDRINUSE);
+    close(bound);
+    (void)unlink(g_sock_path);
+}
+
+/* A listener's path goes before the listener is closed. Once it is, the next
+ * listener at its path takes its socket for a dead daemon's and the path for
+ * its own: what the first does after its close must not take the new one's
+ * name. */
+STM_TEST(p9_socket_a_listeners_end_leaves_the_next_ones_name) {
+    build_sock_path("end");
+    int first = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(first >= 0);
+    stm_unix_listen_retire(g_sock_path);
+    struct stat st;
+    STM_ASSERT_TRUE(lstat(g_sock_path, &st) != 0 && errno == ENOENT);
+
+    int second = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
+    STM_ASSERT_TRUE(second >= 0);
+    close(first);
+    stm_unix_listen_closed(g_sock_path);
+    STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
+    STM_ASSERT_TRUE(S_ISSOCK(st.st_mode));
+    int c = connect_client(g_sock_path);
+    STM_ASSERT_TRUE(c >= 0);
+    close(c);
+    close(second);
+    (void)unlink(g_sock_path);
+}
+
+/* Daemons started at once on one path take turns at the look and the removal of a
+ * dead daemon's socket, by a lock on the path's directory. A listener waits for a
+ * turn another holds, and not for good; and it gives its own turn up, whether it
+ * comes to listen or is refused. */
+STM_TEST(p9_socket_listen_waits_for_its_turn_and_gives_it_up) {
+    char dir[] = "/tmp/stm_socktest_turn_XXXXXX";
+    STM_ASSERT_TRUE(mkdtemp(dir) != NULL);
+    char path[64];
+    snprintf(path, sizeof path, "%s/s.sock", dir);
+    int held = open(dir, O_RDONLY | O_DIRECTORY);
+    STM_ASSERT_TRUE(held >= 0);
+
+    /* Free after a listener that came to listen. */
+    int fd = stm_stratumd_listen_unix(path, 4, 0600, 0);
+    STM_ASSERT_TRUE(fd >= 0);
+    STM_ASSERT_EQ(flock(held, LOCK_EX | LOCK_NB), 0);
+    STM_ASSERT_EQ(flock(held, LOCK_UN), 0);
+    /* And after one that was refused. */
+    STM_ASSERT_EQ(stm_stratumd_listen_unix(path, 4, 0600, 0), -EADDRINUSE);
+    STM_ASSERT_EQ(flock(held, LOCK_EX | LOCK_NB), 0);
+    stm_unix_listen_retire(path);
+    close(fd);
+
+    /* Another holds the turn, and keeps it: waited for, and then gone on without. */
+    struct timespec began, ended;
+    clock_gettime(CLOCK_MONOTONIC, &began);
+    fd = stm_stratumd_listen_unix(path, 4, 0600, 0);
+    clock_gettime(CLOCK_MONOTONIC, &ended);
+    STM_ASSERT_TRUE(fd >= 0);
+    long waited_ms = (long)(ended.tv_sec - began.tv_sec) * 1000 +
+                     (ended.tv_nsec - began.tv_nsec) / 1000000;
+    STM_ASSERT_TRUE(waited_ms >= 50);
+
+    close(held);
+    stm_unix_listen_retire(path);
+    close(fd);
+    STM_ASSERT_EQ(rmdir(dir), 0);
+}
+
+/* The turn is kept from the look to the removal: between the two, over a dead
+ * daemon's socket, nobody else can take it. */
+static const char *g_turn_dir;
+static int g_turn_tried = -1;
+
+static void try_the_turn(void)
+{
+    int fd = open(g_turn_dir, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return;
+    g_turn_tried = flock(fd, LOCK_EX | LOCK_NB) == 0 ? 0 : errno;
+    close(fd);
+}
+
+STM_TEST(p9_socket_turn_is_kept_from_the_look_to_the_removal) {
+    char dir[] = "/tmp/stm_socktest_kept_XXXXXX";
+    STM_ASSERT_TRUE(mkdtemp(dir) != NULL);
+    char path[64];
+    snprintf(path, sizeof path, "%s/s.sock", dir);
+    struct sockaddr_un addr;
+    sock_addr(&addr, path);
+    int dead = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT_TRUE(dead >= 0);
+    STM_ASSERT_EQ(bind(dead, (struct sockaddr *)&addr, sizeof addr), 0);
+    close(dead);
+
+    g_turn_dir = dir;
+    g_turn_tried = -1;
+    stm_unix_listen_test_before_removal = try_the_turn;
+    int fd = stm_stratumd_listen_unix(path, 4, 0600, 0);
+    stm_unix_listen_test_before_removal = NULL;
+    STM_ASSERT_TRUE(fd >= 0);
+    STM_ASSERT_EQ(g_turn_tried, EWOULDBLOCK);
+
+    stm_unix_listen_retire(path);
+    close(fd);
+    STM_ASSERT_EQ(rmdir(dir), 0);
 }
 
 /* A socket left at the name the listener binds under first is a killed

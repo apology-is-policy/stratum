@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::spawn::{BackendMeta, SpawnCtx};
 use crate::tui;
@@ -133,15 +133,19 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         .stderr(open_log("host-fs")?)
         .process_group(0))
         .with_context(|| format!("spawn host-fs via {}", me.display()))?;
-    if let Err(e) = wait_for_sock(&host_fs_sock, Duration::from_secs(5)) {
+    // Headless, a daemon's words went to the terminal and there is no log to quote.
+    let log_of = |name: &str| log_redirect.then(|| session_dir.join(format!("{name}.log")));
+    if let Err(e) = crate::spawn::wait_for_helper(
+        &mut host_fs_child,
+        "host-fs",
+        &host_fs_sock,
+        log_of("host-fs").as_deref(),
+    ) {
         kill_and_reap(&mut host_fs_child);
         if tui::stop_requested() {
             bail!("asked to stop while host-fs started");
         }
-        return Err(e.context(format!(
-            "host-fs socket never appeared at {}",
-            host_fs_sock.display()
-        )));
+        return Err(e);
     }
 
     // SWISS-4a: spawn stratumd ONLY when --vol is set. The left panel
@@ -387,7 +391,12 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             return Err(anyhow!(e).context("spawn slate"));
         }
     };
-    if let Err(e) = wait_for_sock(&slate_sock, Duration::from_secs(5)) {
+    if let Err(e) = crate::spawn::wait_for_helper(
+        &mut slate_child,
+        "slate",
+        &slate_sock,
+        log_of("slate").as_deref(),
+    ) {
         kill_and_reap(&mut slate_child);
         if let Some(c) = stratumd_child.as_mut() {
             kill_and_reap(c);
@@ -396,10 +405,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         if tui::stop_requested() {
             bail!("asked to stop while slate started");
         }
-        return Err(e.context(format!(
-            "slate socket never appeared at {}",
-            slate_sock.display()
-        )));
+        return Err(e);
     }
 
     // SWISS-4a: per-panel attach plan. Left panel = stratumd if
@@ -746,21 +752,6 @@ impl Drop for SessionDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
-}
-
-fn wait_for_sock(path: &Path, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return Ok(());
-        }
-        if tui::stop_requested() {
-            bail!("asked to stop");
-        }
-        crate::passphrase::hold_if_in_front();
-        thread::sleep(Duration::from_millis(20));
-    }
-    bail!("timeout waiting for {}", path.display())
 }
 
 

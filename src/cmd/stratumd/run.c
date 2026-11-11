@@ -26,6 +26,7 @@
 #include <stratum/9p.h>
 #include <stratum/cmds.h>
 #include <stratum/crypto.h>
+#include <stratum/listen.h>
 #include <stratum/stratumd.h>
 #include <stratum/sync.h>
 #include <stratum/types.h>
@@ -212,7 +213,8 @@ static void usage(const char *argv0)
         "  --admin-uid <N>          /ctl admin principal, NAMED (A-6). Omit ->\n"
         "                           no admin (fail closed). NOT inferred from\n"
         "                           the daemon euid. N <= 4294967294.\n"
-        "  -h, --help               This message\n");
+        "  -h, --help               This message\n"
+        STM_UNIX_LISTEN_ROOM_NOTE);
 }
 
 /* TLY-A1 (R137 P2-1 close): un-static'd and namespaced so tests can

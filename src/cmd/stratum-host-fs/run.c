@@ -17,6 +17,7 @@
 #include <stratum/cmds.h>
 #include <stratum/host_fs.h>
 #include <stratum/lp9.h>
+#include <stratum/listen.h>
 #include <stratum/stratumd.h>      /* listen_unix helper, peer-cred discipline */
 #include <stratum/types.h>
 
@@ -197,7 +198,8 @@ static void usage(const char *argv0)
             "(default: 0 = none).\n"
         "  --allow-unauth          Accept connections when peer creds\n"
         "                          can't be resolved (TESTING ONLY).\n"
-        "  -h, --help              This message.\n",
+        "  -h, --help              This message.\n"
+        STM_UNIX_LISTEN_ROOM_NOTE,
         argv0);
 }
 
@@ -305,8 +307,8 @@ int stm_cmd_host_fs_main(int argc, char **argv)
     int listen_fd = stm_stratumd_listen_unix(socket_path, DEFAULT_BACKLOG, 0600, 0);
     if (listen_fd < 0) {
         fprintf(stderr,
-            "stratum-host-fs: listen on %s failed: %s\n",
-            socket_path, strerror(-listen_fd));
+            "stratum-host-fs: listen on %s failed: %s%s\n",
+            socket_path, strerror(-listen_fd), stm_unix_listen_hint(listen_fd));
         return 2;
     }
 
@@ -395,8 +397,9 @@ int stm_cmd_host_fs_main(int argc, char **argv)
         (void)pthread_detach(tid);
     }
 
+    stm_unix_listen_retire(socket_path);
     close(listen_fd);
-    (void)unlink(socket_path);
+    stm_unix_listen_closed(socket_path);
     fprintf(stderr, "stratum-host-fs: clean shutdown\n");
     return 0;
 }

@@ -65,6 +65,38 @@ pub fn wait_for_daemon(child: &mut Child, sock: &Path) -> Result<()> {
     Ok(())
 }
 
+/// host-fs and slate open nothing before they listen.
+const HELPER_START: Duration = Duration::from_secs(5);
+
+/// Waits for host-fs or slate to give its socket its name. One that cannot says why
+/// and exits, so that ends the wait, and `log`, where its words went, gives the reason.
+pub fn wait_for_helper(child: &mut Child, name: &str, sock: &Path, log: Option<&Path>) -> Result<()> {
+    let started = Instant::now();
+    while !sock.exists() {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(match log.and_then(last_words) {
+                Some(said) => anyhow!("{name} did not start: {said}"),
+                None => anyhow!("{name} stopped ({status}) before its socket appeared at {}", sock.display()),
+            });
+        }
+        if crate::tui::stop_requested() {
+            bail!("asked to stop");
+        }
+        if started.elapsed() >= HELPER_START {
+            bail!("{name} socket never appeared at {}", sock.display());
+        }
+        crate::passphrase::hold_if_in_front();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// The last line a daemon wrote to its log.
+fn last_words(log: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(log).ok()?;
+    text.lines().rev().find(|l| !l.trim().is_empty()).map(str::to_string)
+}
+
 /// What a daemon's log says about why it did not start, for the person who asked.
 /// Lines are told apart by how they begin, since a path in one could say anything.
 pub fn start_failure(log: &str) -> Option<String> {
@@ -242,16 +274,13 @@ impl SpawnCtx {
             sock.to_string_lossy().into_owned(),
             "--allow-unauth".into(),
         ];
-        let mut child = self
+        let (mut child, log) = self
             .spawn_inner(&args)
             .with_context(|| format!("spawn host-fs at {}", root.display()))?;
-        if let Err(e) = wait_for_sock(&sock, Duration::from_secs(5)) {
+        if let Err(e) = wait_for_helper(&mut child, "host-fs", &sock, Some(&log)) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(e.context(format!(
-                "host-fs socket never appeared at {}",
-                sock.display()
-            )));
+            return Err(e);
         }
         self.children.lock().unwrap().push(child);
         Ok(sock)
@@ -597,7 +626,8 @@ impl SpawnCtx {
         Ok(())
     }
 
-    fn spawn_inner(&self, args: &[String]) -> Result<Child> {
+    /// The child, and the log its stderr goes to.
+    fn spawn_inner(&self, args: &[String]) -> Result<(Child, PathBuf)> {
         use std::os::unix::process::CommandExt;
         // Redirect stderr to a per-spawn log file (matching embed.rs's
         // discipline) so mid-session daemon spawns don't collide with
@@ -620,6 +650,7 @@ impl SpawnCtx {
             .stderr(stderr_target)
             .process_group(0)
             .spawn()
+            .map(|child| (child, log_path))
             .map_err(|e| anyhow!(e))
     }
 }
@@ -648,6 +679,42 @@ mod tests {
         for as_it_is in ["v.stm", "/tmp/-h", "./-h", "dir/-h"] {
             assert_eq!(super::operand(Path::new(as_it_is)), Path::new(as_it_is));
         }
+    }
+
+    /// A helper that cannot listen says why and exits: the wait ends then, with its words,
+    /// and does not run to its bound to say only that no socket came.
+    #[test]
+    fn a_helper_that_exits_ends_the_wait_with_its_last_words() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let none = dir.path().join("none.sock");
+        let log = dir.path().join("helper.log");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "echo first >&2; echo 'stratum-host-fs: listen on /p failed: no room' >&2; echo >&2; exit 2"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn()
+            .unwrap();
+        let began = Instant::now();
+        let e = super::wait_for_helper(&mut child, "host-fs", &none, Some(&log)).unwrap_err();
+        assert_eq!(e.to_string(), "host-fs did not start: stratum-host-fs: listen on /p failed: no room");
+        assert!(began.elapsed() < Duration::from_secs(4), "the wait ran to its bound");
+
+        // No log to quote: how it ended, and where its socket was to be.
+        let mut child = Command::new("/bin/sh").args(["-c", "exit 3"]).stdin(Stdio::null()).spawn().unwrap();
+        let e = super::wait_for_helper(&mut child, "slate", &none, None).unwrap_err().to_string();
+        assert!(e.starts_with("slate stopped (") && e.ends_with(&format!("before its socket appeared at {}", none.display())), "{e}");
+
+        // One whose socket is there is waited for no longer, running or not.
+        let there = dir.path().join("there.sock");
+        std::fs::write(&there, b"").unwrap();
+        let mut child = Command::new("/bin/sh").args(["-c", "exec sleep 30"]).stdin(Stdio::null()).spawn().unwrap();
+        let waited = super::wait_for_helper(&mut child, "host-fs", &there, Some(&log));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(waited.is_ok(), "{waited:?}");
     }
 
     #[test]

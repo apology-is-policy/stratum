@@ -36,6 +36,7 @@
 #include <stratum/cmds.h>
 #include <stratum/fs.h>
 #include <stratum/keyfile.h>
+#include <stratum/takename.h>
 #include <stratum/types.h>
 
 #include "../cli_passphrase.h"
@@ -101,7 +102,7 @@ static void usage(void)
 "Creates a fresh stratum volume image with one initial dataset (id=1).\n"
 "After mkfs, point stratumd at it:\n"
 "\n"
-"    stratumd IMAGE --listen unix:/tmp/stm.sock\n"
+"    stratum serve IMAGE --listen /tmp/stm.sock\n"
 "\n"
 "Options:\n"
 "  --size SIZE      Image size with K/M/G suffix. Default: 64M.\n"
@@ -116,8 +117,9 @@ static void usage(void)
 "                   file the user owns whose mode gives no one else access\n"
 "                   (chmod go-rwx), or with --passphrase-stdin refused,\n"
 "                   unless --force. If missing, one is generated where its\n"
-"                   links point, seven at most, if " LINK_OWNERS " owns\n"
-"                   each.\n"
+"                   links point. Links at PATH, to a key that exists or to\n"
+"                   where one is to go, are followed when they are seven at\n"
+"                   most and " LINK_OWNERS " owns each.\n"
 "                   Default: IMAGE.key.\n"
 "  --passphrase-stdin  Read a passphrase line from stdin and use it to\n"
 "                   wrap the keyfile (KFP1 format). The passphrase is\n"
@@ -273,8 +275,8 @@ static void say_link_refused(const char *keyfile_path)
 static void say_links_too_many(const char *keyfile_path)
 {
     fprintf(stderr,
-        "stratum-mkfs: keyfile %s is reached through more than seven links, or names a path "
-        "too long: name the key where they lead\n", keyfile_path);
+        "stratum-mkfs: keyfile %s is reached through more than seven links or a loop of "
+        "them, or names a path too long: name the key file itself\n", keyfile_path);
 }
 
 /*
@@ -389,22 +391,11 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
     return key_in_the_way(keyfile_path, replaces_key, force) ? 1 : 0;
 }
 
-/* Without --force the name is taken only if it is still free: a link refuses one that
- * appeared during the format, where a rename would replace it. A filesystem with no
- * links has only the rename. */
+/* Without --force the name is taken only if it is still free: a plain rename would
+ * replace a key that appeared during the format. */
 static int take_key_name(const char *from, const char *to, bool force)
 {
-    if (force) return rename(from, to);
-    if (link(from, to) == 0) {
-        (void)unlink(from);
-        return 0;
-    }
-    bool no_links = errno == EPERM || errno == ENOTSUP || errno == EXDEV || errno == EMLINK ||
-                    errno == ENOSYS;
-#if defined(EOPNOTSUPP) && EOPNOTSUPP != ENOTSUP
-    no_links = no_links || errno == EOPNOTSUPP;
-#endif
-    return no_links ? rename(from, to) : -1;
+    return force ? rename(from, to) : stm_take_name(from, to);
 }
 
 /* Whether a link is one only its owner, the user, or root controls. The links on the
