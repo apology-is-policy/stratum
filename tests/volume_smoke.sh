@@ -747,6 +747,52 @@ else
             no "a daemon whose image's name was led to another between the lock and the mount served '$sd_seen' (a is the one it locked): $(tr '\n' ' ' < "$D/sd-led.plant" 2>/dev/null): $(tail -1 "$D/sd-serve.log")"
         fi
     fi
+    # The run that makes a corvus dataset and serves nothing mounts as the serving daemon does,
+    # through the descriptor its lock is on. There is nothing to ask it which volume it has, so
+    # the second volume here is under a key of its own, and which was mounted shows in how the
+    # run fails: a volume under another key is refused at the mount, and past the mount the run
+    # fails at the corvus daemon, which is not there. With the name led to the second volume
+    # from the start the mount is refused. Led there between the lock and the mount, the mount
+    # is of the first, the one that was locked, and the run gets past it.
+    sd_prov() {
+        sd_prov_log=$1; shift
+        (
+            for set in "$@"; do export "$set"; done
+            if [ "$(uname -s)" = Darwin ]; then export DYLD_INSERT_LIBRARIES="$PLANT_LIB"; else export LD_PRELOAD="$PLANT_LIB"; fi
+            exec "$B" serve "$D/sd-name.stm" --keyfile "$D/sd.key" --provision-corvus-dataset made --corvus-dataset-path /made \
+                --corvus-socket "$D/sd-no-corvus.sock" --corvus-session-token-file "$D/sd-token"
+        ) < /dev/null > "$sd_prov_log" 2>&1
+    }
+    past_the_mount() {
+        LC_ALL=C grep -q "^stratumd: provisioning: create corvus dataset 'made' failed" "$1" \
+            && ! LC_ALL=C grep -q '^stratumd: provisioning: mount of ' "$1"
+    }
+    printf '%033d' 0 > "$D/sd-token"
+    chmod 600 "$D/sd-token"
+    "$B" mkfs "$D/sd-c.stm" --size 64M --keyfile "$D/sd-c.key" < /dev/null > "$D/sd-mkfs-c.log" 2>&1; sd_c=$?
+    rm -f "$D/sd-name.stm"
+    ln -s "$D/sd-a.stm" "$D/sd-name.stm"
+    sd_prov "$D/sd-prov-none.log" STM_PLANT_AT="$D/sd-name.stm" STM_PLANT_LOG="$D/sd-prov-none.plant"
+    sdp_last=$(LC_ALL=C grep -n '^look:[0-9][0-9]*$' "$D/sd-prov-none.plant" 2>/dev/null | tail -1)
+    sdp_open=$(LC_ALL=C grep -n '^open:1$' "$D/sd-prov-none.plant" 2>/dev/null | head -1)
+    rm -f "$D/sd-name.stm"
+    ln -s "$D/sd-c.stm" "$D/sd-name.stm"
+    sd_prov "$D/sd-prov-c.log"
+    rm -f "$D/sd-name.stm"
+    ln -s "$D/sd-a.stm" "$D/sd-name.stm"
+    if [ "$sd_made" != 1 ] || [ "$sd_c" != 0 ] || ! past_the_mount "$D/sd-prov-none.log" \
+            || ! LC_ALL=C grep -q '^stratumd: provisioning: mount of ' "$D/sd-prov-c.log" \
+            || [ -z "$sdp_last" ] || [ -z "$sdp_open" ] || [ "${sdp_open%%:*}" -ge "${sdp_last%%:*}" ]; then
+        no "a provisioning run on a link to a volume, nothing left: made=$sd_made, the second volume: $sd_c, its looks: $(tr '\n' ' ' < "$D/sd-prov-none.plant" 2>/dev/null): on the first: $(tail -2 "$D/sd-prov-none.log" | head -1); on the second: $(tail -2 "$D/sd-prov-c.log" | head -1)"
+    else
+        sd_prov "$D/sd-prov-led.log" STM_PLANT_AT="$D/sd-name.stm" STM_PLANT_ON="${sdp_last#*:}" STM_PLANT_TO="$D/sd-c.stm" STM_PLANT_OVER=over STM_PLANT_LOG="$D/sd-prov-led.plant"
+        if past_the_mount "$D/sd-prov-led.log" && LC_ALL=C grep -q "^planted before ${sdp_last#*:}: done\$" "$D/sd-prov-led.plant" \
+                && [ "$(readlink "$D/sd-name.stm")" = "$D/sd-c.stm" ]; then
+            ok "a provisioning run mounts the image it locked, where its name was led to another between the lock and the mount"
+        else
+            no "a provisioning run whose image's name was led to another between the lock and the mount: $(tr '\n' ' ' < "$D/sd-prov-led.plant" 2>/dev/null): $(tail -2 "$D/sd-prov-led.log" | head -1)"
+        fi
+    fi
 fi
 
 # A link that cannot be read cannot be asked where it leads, and the kernel follows it all the

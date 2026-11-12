@@ -1157,6 +1157,87 @@ def stuck_helper_leg(stratum, vol, host, root):
             term.kill()
 
 
+def stuck_start_leg(stratum, vol, host, root):
+    """A stop asked while the manager starts. TERM and INT are held there until the screen
+    is up, and a wait at the start that asked only what the handler had seen was told of no
+    stop: the volume's daemon not answering, the manager waited in its first call for ever,
+    the TERM pending. The daemon is stopped the moment its socket has its name. The manager
+    starts two more daemons after that, each looked for twenty milliseconds apart, before
+    anything is asked of the first, so the stop is there in time; and that it was is seen:
+    the three daemons run and no screen comes."""
+    given_up = 10  # tui.rs HELD_AFTER, in seconds
+    how = 'the volume\'s daemon stuck while the manager starts'
+    term = Term([stratum, 'tui', '--vol', vol.v, '--host', host])
+    stuck, session = None, None
+    try:
+        term.expect(r'Passphrase for')
+        term.send(PASS.encode() + ENTER)
+        limit = time.monotonic() + 60
+        while time.monotonic() < limit and (stuck is None or session is None):
+            if session is None:
+                found = session_dir_guesses(term.pid, term.started)
+                session = found.pop() if len(found) == 1 else None
+            if stuck is None:
+                children = subprocess.run(['pgrep', '-P', str(term.pid)], capture_output=True, text=True).stdout.split()
+                serving = [c for c in children if ' serve ' in command_of(c) and ' slate ' not in command_of(c)]
+                stuck = int(serving[0]) if serving else None
+            time.sleep(0.005)
+        if stuck is None or session is None:
+            raise Failure(f'{how}: the search found the daemon {stuck} and the session directory {session}: '
+                          'it proves nothing')
+        sock = f'{session}/stratumd.sock'
+        there_already = os.path.exists(sock)
+        while not os.path.exists(sock) and time.monotonic() < limit:
+            time.sleep(0.0005)
+        os.kill(stuck, signal.SIGSTOP)
+        # host-fs and slate come up, slate is asked for the first panel and asks the daemon.
+        limit = time.monotonic() + 15
+        while len(session_daemons(session)) < 3 and time.monotonic() < limit:
+            term.pump(0.1)
+        said = {p: command_of(p).strip() for p in session_daemons(session)}
+        term.pump(3)
+        screen_up = b'\x1b[?1049h' in bytes(term.raw)
+        if len(said) < 3 or screen_up or os.waitpid(term.pid, os.WNOHANG)[0] != 0:
+            raise Failure(f'{how}: the daemons are {sorted(said.values())}, the screen came up: {screen_up}, '
+                          f'the socket was there before it was looked for: {there_already}: it proves nothing')
+        seen = len(term.raw)
+        os.kill(term.pid, signal.SIGTERM)
+        began = time.monotonic()
+        ended = term.exited(150)
+        took = time.monotonic() - began
+        waits = '' if ended else threads_waiting(term.pid)
+        words = ' | '.join(l.strip() for l in bytes(term.raw[seen:]).decode('utf-8', 'replace').splitlines() if l.strip())
+        print(f'note: {how}: after the stop was asked the manager said: {words[:600]}', flush=True)
+        # A start that was asked to stop has not come up, and ends as a failed start does.
+        record(ended and term.rc == 1, f'{how}: a stop asked meanwhile ended the manager, with 1 as a start that failed',
+               f'{how}: the manager ended={ended} rc={term.rc} {took:.0f} s after the stop was asked'
+               + (f'; its threads: {waits}' if waits else ''))
+        if ended:
+            # The call, then slate, which waits on the same daemon, then the daemon.
+            record(given_up + 60 <= took < given_up + 60 + 15,
+                   f'{how}: {given_up} s for the call that waited, and 30 s each for slate and the daemon ({took:.1f} s)',
+                   f'{how}: the manager ended {took:.1f} s after the SIGTERM, not after {given_up} s and two 30 s deadlines')
+            left = session_daemons(session)
+            record(not left, f'{how}: no daemon is left',
+                   f'{how}: {[said.get(p, command_of(p).strip()) for p in left]} still run, with no manager')
+            record(not os.path.exists(session), f'{how}: the session directory is gone',
+                   f'{how}: the session directory stayed')
+        signal_each(session_daemons(session), signal.SIGKILL)
+        limit = time.monotonic() + 30
+        while session_daemons(session) and time.monotonic() < limit:
+            time.sleep(0.2)
+        vol.serve()
+        vol.stop()
+        print(('ok' if ended else 'note') + f': after {how} the volume mounts and unmounts cleanly', flush=True)
+    finally:
+        if stuck is not None:
+            try:
+                os.kill(stuck, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        term.kill()
+
+
 def headless_output_gone_leg(stratum, vol, host, root):
     """Headless, the manager prints a line when the signal that ends it comes. After a HUP its
     stderr may have gone with the terminal, and that line must not panic it before the stop."""
@@ -4568,6 +4649,7 @@ def run(stratum, root):
                       (output_gone_leg, (stratum, vol, host, root)),
                       (stuck_daemon_leg, (stratum, vol, host, root)),
                       (stuck_helper_leg, (stratum, vol, host, root)),
+                      (stuck_start_leg, (stratum, vol, host, root)),
                       (headless_output_gone_leg, (stratum, vol, host, root)),
                       (headless_int_ignored_leg, (stratum, vol, host, root)),
                       (resize_leg, (stratum, vol, host, root)),
