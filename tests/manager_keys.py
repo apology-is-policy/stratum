@@ -2534,8 +2534,9 @@ def wizard_legs(stratum, vol, root):
 
         # A key name the user has linked to where the key is to go is not taken: mkfs makes the
         # key there, as it does from the landing screen and the command line.
+        # The user's alone whatever the umask: mkfs follows no link into a directory others can write.
         wkeys = os.path.join(root, 'wizard-keys')
-        os.makedirs(wkeys)
+        os.makedirs(wkeys, mode=0o700)
         os.symlink(f'{wkeys}/linked.stm.key', f'{w}/linked.stm.key')
         fill_wizard(term, b'linked', PASS.encode(), PASS.encode())
         term.expect(r'Created |File exists|mkfs failed', timeout=60)
@@ -2605,7 +2606,7 @@ def landing_legs(stratum, root):
         path = f'{root}/landing.stm'
         # The key named through a link of the user's own: made where it points, and said so.
         keys = f'{root}/landing-keys'
-        os.makedirs(keys, exist_ok=True)
+        os.makedirs(keys, mode=0o700, exist_ok=True)
         os.symlink(f'{keys}/landing.stm.key', path + '.key')
         term.send(b'n' + ENTER)
         term.expect(r'New volume path')

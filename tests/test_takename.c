@@ -98,4 +98,46 @@ STM_TEST(take_name_takes_a_link_to_nothing_for_a_name_that_is_taken)
     drop_names();
 }
 
+/* The two names are the open directory's, wherever its path has come to lead: the
+ * directory is renamed away, and another made at its path, before the name is taken. */
+STM_TEST(take_name_at_takes_the_name_in_the_directory_that_is_open)
+{
+    make_names();
+    put(g_from, "new");
+    int dir = open(g_dir, O_RDONLY | O_DIRECTORY);
+    STM_ASSERT(dir >= 0);
+    char moved[96];
+    char there[160];
+    snprintf(moved, sizeof moved, "%s.moved", g_dir);
+    STM_ASSERT_EQ(rename(g_dir, moved), 0);
+    STM_ASSERT_EQ(mkdir(g_dir, 0700), 0);
+    STM_ASSERT_EQ(stm_take_name_at(dir, "from", "to"), 0);
+    close(dir);
+    struct stat st;
+    STM_ASSERT(lstat(g_to, &st) != 0 && errno == ENOENT);
+    snprintf(there, sizeof there, "%s/to", moved);
+    holds(there, "new");
+    (void)unlink(there);
+    snprintf(there, sizeof there, "%s/from", moved);
+    STM_ASSERT(lstat(there, &st) != 0 && errno == ENOENT);
+    (void)rmdir(moved);
+    drop_names();
+}
+
+STM_TEST(take_name_at_leaves_a_name_that_is_taken)
+{
+    make_names();
+    put(g_from, "new");
+    put(g_to, "old");
+    int dir = open(g_dir, O_RDONLY | O_DIRECTORY);
+    STM_ASSERT(dir >= 0);
+    errno = 0;
+    STM_ASSERT_EQ(stm_take_name_at(dir, "from", "to"), -1);
+    STM_ASSERT_EQ(errno, EEXIST);
+    close(dir);
+    holds(g_to, "old");
+    holds(g_from, "new");
+    drop_names();
+}
+
 STM_TEST_MAIN("takename")

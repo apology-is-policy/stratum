@@ -19,6 +19,11 @@
  *                   it. Nothing on disk is changed: the program is told what the
  *                   system would tell it of another user's link, which no test can
  *                   make without being root.
+ *   STM_PLANT_EUID  a uid: the program is told it runs as that user, so a file of the
+ *                   real user's is to it another user's, with nothing on disk changed
+ *   STM_PLANT_MOVE  a directory: at the moment, no link is left; the directory is
+ *                   renamed to its name with ".away" after it and an empty one is made
+ *                   at its name, as whoever owns a directory above it could do
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -53,7 +58,15 @@ static void before(const char *kind, int *count, const char *path)
     snprintf(moment, sizeof moment, "%s:%d", kind, ++*count);
     const char *on = getenv("STM_PLANT_ON");
     const char *to = getenv("STM_PLANT_TO");
-    if (on && to && strcmp(on, moment) == 0) {
+    const char *move = getenv("STM_PLANT_MOVE");
+    if (on && move && *move && strcmp(on, moment) == 0) {
+        char away[4200];
+        snprintf(away, sizeof away, "%s.away", move);
+        int r = rename(move, away);
+        if (r == 0) r = mkdir(move, 0777);
+        snprintf(line, sizeof line, "moved before %s: %s\n", moment,
+                 r == 0 ? "done" : strerror(errno));
+    } else if (on && to && strcmp(on, moment) == 0) {
         const char *over = getenv("STM_PLANT_OVER");
         int r;
         if (over && *over) {
@@ -82,7 +95,19 @@ static void owned_as(const char *path, mode_t mode, uid_t *uid)
     *uid = (uid_t)strtoul(as, NULL, 10);
 }
 
+/* Who the program is told it runs as; `real` where the test says nothing. */
+static uid_t told_euid(uid_t real)
+{
+    const char *as = getenv("STM_PLANT_EUID");
+    return as && *as ? (uid_t)strtoul(as, NULL, 10) : real;
+}
+
 #if defined(__APPLE__)
+
+static uid_t plant_geteuid(void)
+{
+    return told_euid(geteuid());
+}
 
 static ssize_t plant_readlink(const char *path, char *buf, size_t n)
 {
@@ -112,10 +137,18 @@ static int plant_lstat(const char *path, struct stat *st)
 PLANT_INTERPOSE(plant_readlink, readlink);
 PLANT_INTERPOSE(plant_stat, stat);
 PLANT_INTERPOSE(plant_lstat, lstat);
+PLANT_INTERPOSE(plant_geteuid, geteuid);
 
 #else
 
 #include <dlfcn.h>
+
+uid_t geteuid(void)
+{
+    static uid_t (*real)(void);
+    if (!real) real = (uid_t (*)(void))dlsym(RTLD_NEXT, "geteuid");
+    return told_euid(real());
+}
 
 ssize_t readlink(const char *path, char *buf, size_t n)
 {

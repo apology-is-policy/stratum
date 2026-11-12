@@ -32,7 +32,8 @@
  * Exit codes:
  *   0  success
  *   1  a usage error, or a refusal that made nothing
- *   2  format failed
+ *   2  the format failed, or the volume is formatted and its key did not take, or
+ *      is not reached by, the name it was to have
  */
 #include <stratum/block.h>
 #include <stratum/cmds.h>
@@ -108,13 +109,13 @@ static void usage(void)
 "\n"
 "Options:\n"
 "  --size SIZE      Image size with K/M/G suffix. Default: 64M.\n"
-"  --force          Format over what is already at IMAGE, and with\n"
-"                   --passphrase-stdin replace an existing keyfile. Whatever\n"
-"                   they held is gone. Also follows any key link it can read,\n"
-"                   whoever owns it and however many names it has, and uses\n"
-"                   a keyfile that is not the user's alone. A new key is not\n"
-"                   sent through a link that cannot be read: it takes that\n"
-"                   link's place.\n"
+"  --force          Format over what is already at IMAGE, a file another user\n"
+"                   owns too, and with --passphrase-stdin replace an existing\n"
+"                   keyfile. Whatever they held is gone. Also follows any key\n"
+"                   link it can read, whoever owns it, however many names it\n"
+"                   has and wherever it leads, and uses a keyfile that is not\n"
+"                   the user's alone. A new key is not sent through a link\n"
+"                   that cannot be read: it takes that link's place.\n"
 "                   Never overrides a daemon using IMAGE, and a format\n"
 "                   cannot shrink a file: --size must reach it.\n"
 "  --key-as-is      Use the keyfile that is there although another user owns\n"
@@ -132,7 +133,9 @@ static void usage(void)
 "                   links point. Links at PATH, to a key that exists or to\n"
 "                   where one is to go, are followed when they are seven at\n"
 "                   most, " LINK_OWNERS " owns each, and each can be\n"
-"                   read and has no other name.\n"
+"                   read and has no other name. Where they lead out of\n"
+"                   PATH's directory, it must be to one that only\n"
+"                   " LINK_OWNERS " can change.\n"
 "                   Default: IMAGE.key.\n"
 "  --passphrase-stdin  Read a passphrase line from stdin and use it to\n"
 "                   wrap the keyfile (KFP1 format). The passphrase is\n"
@@ -270,12 +273,14 @@ enum key_links {
 struct key_walk {
     enum key_links why;
     int err;        /* KEY_LINKS_UNREAD: what readlink said */
+    int links;      /* how many were followed */
     bool there;     /* whether anything is where they end */
     struct stat st; /* what is there */
 };
 
 static const char *key_destination(const char *path, char *buf, size_t n, bool force,
                                    struct key_walk *walk);
+static bool link_is_trusted(const struct stat *st);
 
 /* A key used as it is decides who can open the volume: one another user owns, or that
  * its mode lets others read or write, is theirs as much as the user's. The corvus token
@@ -307,14 +312,14 @@ static void say_links_refused(const char *keyfile_path, const struct key_walk *w
         break;
     case KEY_LINKS_MANY_NAMES:
         fprintf(stderr,
-            "stratum-mkfs: keyfile %s is reached through a symlink that has more than one "
-            "name, and whoever gave it the one here would decide where the key goes: name "
-            "the key file itself, or pass --force to follow it\n", keyfile_path);
+            "stratum-mkfs: keyfile %s is reached through a symlink that has another name "
+            "besides this one, and any user may have given it either: name the key file "
+            "itself, or make the link again\n", keyfile_path);
         break;
     case KEY_LINKS_UNREAD:
         fprintf(stderr,
             "stratum-mkfs: keyfile %s is reached through a link that cannot be read (%s), "
-            "so where it leads cannot be asked about: name the key file itself\n",
+            "so where it leads cannot be asked about: see why, or name the key file itself\n",
             keyfile_path, strerror(walk->err));
         break;
     case KEY_LINKS_CHANGED:
@@ -337,9 +342,87 @@ static void say_name_leads_elsewhere(const char *keyfile_path)
     fprintf(stderr,
         "stratum-mkfs: keyfile %s does not lead where its links were read to end: a link "
         "or a file was left or changed on its way while it was looked at, or one of its "
+#if defined(__thylacine__)
+        "links is a share's, whose text the kernel reads from the share's root: "
+#else
         "links is a descriptor's, whose text names no file (a pipe's, an unlinked file's): "
+#endif
         "name the key file itself, or see what was left, before running again\n",
         keyfile_path);
+}
+
+/* The directory part of a path, "." where it has none. False when it does not fit. */
+static bool dir_part(const char *path, char *dir, size_t n)
+{
+    const char *slash = strrchr(path, '/');
+    size_t len = !slash || slash == path ? 1u : (size_t)(slash - path);
+    if (len >= n) return false;
+    memcpy(dir, slash ? path : ".", len);
+    dir[len] = '\0';
+    return true;
+}
+
+/* A directory to make a key in. One the user may write and search but not read still
+ * takes a key, so where it cannot be opened for reading it is opened for the search
+ * alone; it cannot be synced then, which is said. */
+static int open_key_dir(const char *dir)
+{
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+#if defined(O_SEARCH)
+    if (fd < 0 && errno == EACCES) fd = open(dir, O_SEARCH | O_DIRECTORY | O_CLOEXEC);
+#elif defined(O_PATH)
+    if (fd < 0 && errno == EACCES) fd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+#endif
+    return fd;
+}
+
+/* Links that lead a key out of the directory it was named in decide where it is kept,
+ * and their owner says less of that than it seems: a link of the user's or root's that
+ * once had a second name can be put anywhere by whoever gave it that name, and its text
+ * leads on from there. So the directory they lead to is asked about itself. NULL when
+ * it is the one the key was named in, which the user chose, or one where only the user
+ * or root can take a name away: theirs, with nobody else let to write it or, sticky,
+ * to do more than add names. Else what is wrong with it. */
+static const char *led_to_dir_refused(const struct stat *dd, const char *keyfile_path)
+{
+    char named[4096];
+    struct stat nd;
+    if (dir_part(keyfile_path, named, sizeof named) && stat(named, &nd) == 0
+            && nd.st_dev == dd->st_dev && nd.st_ino == dd->st_ino)
+        return NULL;
+    if (!link_is_trusted(dd)) return "belongs to another user";
+    if ((dd->st_mode & (S_IWGRP | S_IWOTH)) != 0 && (dd->st_mode & S_ISVTX) == 0)
+        return "others can change, going by its mode (chmod go-w mends that)";
+    return NULL;
+}
+
+static void say_dir_refused(const char *keyfile_path, const char *dir, const char *why,
+                            bool since_the_claim)
+{
+    fprintf(stderr,
+        "stratum-mkfs: %skeyfile %s is led by its links to the directory %s, which %s: "
+        "whoever can change that directory could remove the key, and the volume with it; "
+        "name the key file itself, or pass --force to follow the links\n",
+        since_the_claim ? "since the volume was claimed, " : "", keyfile_path, dir, why);
+}
+
+/* At the claim, by its path. Where a new key is made the directory is asked about
+ * again, through the descriptor the key is made in. */
+static bool key_dir_in_the_way(const char *keyfile_path, const char *leads_to, bool reached)
+{
+    char dir[4096];
+    struct stat dd;
+    if (!dir_part(leads_to, dir, sizeof dir)) return false;
+    if (stat(dir, &dd) != 0 || !S_ISDIR(dd.st_mode)) {
+        /* No directory yet for a key that is not there either. */
+        if (!reached) return false;
+        say_name_leads_elsewhere(keyfile_path);
+        return true;
+    }
+    const char *why = led_to_dir_refused(&dd, keyfile_path);
+    if (!why) return false;
+    say_dir_refused(keyfile_path, dir, why, false);
+    return true;
 }
 
 /*
@@ -375,6 +458,7 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
         say_name_leads_elsewhere(keyfile_path);
         return true;
     }
+    if (walk.links > 0 && key_dir_in_the_way(keyfile_path, leads_to, reached)) return true;
     if (!reached) return false;
     if (!replaces_key) {
         const char *why = key_not_the_users(&st, key_as_is);
@@ -432,6 +516,17 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
     if (look >= 0) {
         struct stat st;
         bool is_file = fstat(look, &st) == 0 && S_ISREG(st.st_mode);
+        /* A file another user owns is theirs to remove or to put an older copy over,
+         * whatever the key keeps unread, and an empty one left at a free name is how a
+         * volume comes to be in one. A disk is root's, formatted by a group's right. */
+        if (is_file && !*created && !force && st.st_uid != geteuid()) {
+            fprintf(stderr,
+                "stratum-mkfs: %s belongs to another user, who could remove the volume or "
+                "put an older copy of it back: remove the file or run as its owner, or pass "
+                "--force to format it\n", image_path);
+            if (look != fd) close(look);
+            return 1;
+        }
 #if !defined(__thylacine__)
         /* Nothing ends /dev/zero for the scan, and a format could not size it. */
         if (!is_file && stm_bdev_device_bytes(look) == 0) {
@@ -472,9 +567,9 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
 
 /* Without --force the name is taken only if it is still free: a plain rename would
  * replace a key that appeared during the format. */
-static int take_key_name(const char *from, const char *to, bool force)
+static int take_key_name(int dir, const char *from, const char *to, bool force)
 {
-    return force ? rename(from, to) : stm_take_name(from, to);
+    return force ? renameat(dir, from, dir, to) : stm_take_name_at(dir, from, to);
 }
 
 /* Whether a link is one only its owner, the user, or root controls. The links on the
@@ -491,6 +586,20 @@ static bool link_is_trusted(const struct stat *st)
     return false;
 }
 
+/* Whether what readlink said of a link just looked at tells that it went, or is no
+ * link any more, and not that it cannot be read. On Thylacine a share's link answers
+ * EINVAL and ENOENT for reasons of the share's own, so nothing there tells a change. */
+static bool link_went(int e)
+{
+#if defined(__thylacine__)
+    (void)e;
+    return false;
+#else
+    return e == ENOENT || e == EINVAL || e == ENOTDIR || e == ELOOP || e == ENAMETOOLONG
+        || e == ESTALE;
+#endif
+}
+
 /* A key named through a symlink belongs where the link points: replacing the link
  * would leave it beside the volume instead. A link is looked at before it is read, so
  * another user's is refused unread, and again after, so one put in its place meanwhile
@@ -500,7 +609,9 @@ static bool link_is_trusted(const struct stat *st)
  * link's, not of whoever gave it the name it has here: where nothing forbids it any
  * user can give a link of the user's or root's a second name, and its text, joined to
  * a directory of their choosing, would be followed. So a link with more than one name
- * is refused. NULL with walk->why saying which: more than seven links or a path too
+ * is refused; one that had a second name once is not told from any other here, and
+ * what is asked of the directory the links lead to is what holds against it. NULL with
+ * walk->why saying which: more than seven links or a path too
  * long, a link another user owns, one with more than one name, one that cannot be
  * read, one that changed. Forced, nothing is asked and a link that cannot be read is
  * taken for the end. */
@@ -510,6 +621,7 @@ static const char *key_destination(const char *path, char *buf, size_t n, bool f
     char here[4096];
     walk->why = KEY_LINKS_TOO_MANY;
     walk->err = 0;
+    walk->links = 0;
     walk->there = false;
     if (snprintf(here, sizeof here, "%s", path) >= (int)sizeof here) return NULL;
     for (int hops = 0; hops < 8; hops++) {
@@ -528,9 +640,8 @@ static const char *key_destination(const char *path, char *buf, size_t n, bool f
             }
             len = readlink(here, target, sizeof target - 1);
             if (len < 0 && !force) {
-                /* Gone, or no link any more: not one that cannot be read. */
                 int e = errno;
-                walk->why = (e == ENOENT || e == EINVAL) ? KEY_LINKS_CHANGED : KEY_LINKS_UNREAD;
+                walk->why = link_went(e) ? KEY_LINKS_CHANGED : KEY_LINKS_UNREAD;
                 walk->err = e;
                 return NULL;
             }
@@ -558,27 +669,9 @@ static const char *key_destination(const char *path, char *buf, size_t n, bool f
             : snprintf(next, sizeof next, "%.*s/%s", (int)(slash - here), here, target);
         if (w < 0 || w >= (int)sizeof next) return NULL;
         memcpy(here, next, (size_t)w + 1);
+        walk->links++;
     }
     return NULL;
-}
-
-/* The rename is not durable until the directory holding it is. */
-static void sync_dir_of(const char *path)
-{
-    const char *slash = strrchr(path, '/');
-    char dir[4096] = ".";
-    if (slash) {
-        size_t n = slash == path ? 1u : (size_t)(slash - path);
-        if (n >= sizeof dir) return;
-        memcpy(dir, path, n);
-        dir[n] = '\0';
-    }
-    int fd = open(dir, O_RDONLY | O_CLOEXEC);
-    if (fd < 0 || fsync(fd) != 0) {
-        fprintf(stderr, "stratum-mkfs: warning: cannot sync %s (%s), so a power cut "
-                        "could still lose the key's new name\n", dir, strerror(errno));
-    }
-    if (fd >= 0) close(fd);
 }
 
 int stm_cmd_mkfs_main(int argc, char **argv)
@@ -742,7 +835,10 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     bool created = false;
     /* Above every jump to the cleanup, which reads them. */
     char new_key_path[4096] = "";
+    char new_key_name[4096] = "";
     char key_target_buf[4096] = "";
+    const char *key_base = "";
+    int  key_dir_fd = -1;
     const char *key_target = keyfile_path;
     const char *format_key = keyfile_path;
     bool key_is_new = false;
@@ -796,17 +892,46 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             exit_code = 1;
             goto cleanup;
         }
+        char key_dir[4096];
+        key_base = strrchr(key_target, '/');
+        key_base = key_base ? key_base + 1 : key_target;
         int n = snprintf(new_key_path, sizeof new_key_path, "%s.new.%ld",
                          key_target, (long)getpid());
-        if (n < 0 || (size_t)n >= sizeof new_key_path) {
+        int m = snprintf(new_key_name, sizeof new_key_name, "%s.new.%ld",
+                         key_base, (long)getpid());
+        if (n < 0 || (size_t)n >= sizeof new_key_path || m < 0
+                || (size_t)m >= sizeof new_key_name
+                || !dir_part(key_target, key_dir, sizeof key_dir)) {
             fprintf(stderr, "stratum-mkfs: keyfile path too long: %s\n", keyfile_path);
             key_is_new = false;
             exit_code = 1;
             goto cleanup;
         }
+        /* The key is made in its directory through the directory's descriptor, and takes
+         * its name there: what is asked of the directory is asked of the one the key is
+         * in, wherever a path to it leads afterwards. */
+        key_dir_fd = open_key_dir(key_dir);
+        if (key_dir_fd < 0) {
+            fprintf(stderr, "stratum-mkfs: cannot make %s: %s\n", new_key_path, strerror(errno));
+            key_is_new = false;
+            exit_code = 1;
+            goto cleanup;
+        }
+        if (!force && walk.links > 0) {
+            struct stat dd;
+            const char *why = fstat(key_dir_fd, &dd) != 0 ? "cannot be looked at"
+                                                          : led_to_dir_refused(&dd, keyfile_path);
+            if (why) {
+                say_dir_refused(keyfile_path, key_dir, why, true);
+                key_is_new = false;
+                exit_code = 1;
+                goto cleanup;
+            }
+        }
         /* Made here, O_EXCL, so a file already at that name (a killed run's only key,
          * perhaps) is neither truncated nor removed: cleanup removes what this run made. */
-        int tfd = open(new_key_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        int tfd = openat(key_dir_fd, new_key_name,
+                         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (tfd < 0) {
             fprintf(stderr, "stratum-mkfs: cannot make %s: %s\n", new_key_path, strerror(errno));
             key_is_new = false;
@@ -913,7 +1038,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         key_is_new = false;
         temp_key_made = false;
         created = false;
-        if (take_key_name(new_key_path, key_target, force) != 0) {
+        if (take_key_name(key_dir_fd, new_key_name, key_base, force) != 0) {
             fprintf(stderr,
                 "stratum-mkfs: %s is formatted, but its key could not take the name %s (%s); "
                 "the key is at %s, keep it\n",
@@ -921,13 +1046,30 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             exit_code = 2;
             goto cleanup;
         }
-        sync_dir_of(key_target);
+        /* The rename is not durable until the directory holding it is. */
+        if (fsync(key_dir_fd) != 0) {
+            fprintf(stderr, "stratum-mkfs: warning: cannot sync the directory of %s (%s), so "
+                            "a power cut could still lose the key's new name\n",
+                    key_target, strerror(errno));
+        }
         /* The links to the key's place were followed by their text. Where that is not
          * the path the kernel follows, the name does not lead to the key, and every
          * later command is given the name. */
         struct stat made, named;
-        if (fstat(new_key_fd, &made) != 0 || stat(keyfile_path, &named) != 0
-                || named.st_dev != made.st_dev || named.st_ino != made.st_ino) {
+        int made_err = fstat(new_key_fd, &made) != 0 ? errno : 0;
+        int named_err = stat(keyfile_path, &named) != 0 ? errno : 0;
+        if (made_err != 0 || named_err != 0) {
+            fprintf(stderr,
+                "stratum-mkfs: %s is formatted and its key was put at %s, but whether the "
+                "name %s leads to it could not be seen (%s: %s): look for the key there, "
+                "keep it, and see what the name reaches before using it\n",
+                image_path, key_target, keyfile_path,
+                made_err != 0 ? "the key made" : "the name",
+                strerror(made_err != 0 ? made_err : named_err));
+            exit_code = 2;
+            goto cleanup;
+        }
+        if (named.st_dev != made.st_dev || named.st_ino != made.st_ino) {
             fprintf(stderr,
                 "stratum-mkfs: %s is formatted and its key was put at %s, but the name %s "
                 "does not lead to it: look for the key there, keep it, and name it by that "
@@ -953,9 +1095,10 @@ cleanup:
     if (new_key_fd >= 0) close(new_key_fd);
     /* What this run made and failed to finish, and nothing it found. */
     if (exit_code != 0) {
-        if (temp_key_made) unlink(new_key_path);
+        if (temp_key_made) unlinkat(key_dir_fd, new_key_name, 0);
         if (created) unlink(image_path);
     }
+    if (key_dir_fd >= 0) close(key_dir_fd);
     /* SWISS-4m: wipe + munlock the passphrase buffer regardless of
      * exit path. Stack-allocated, so munlock + memzero is enough —
      * the storage is freed when this stack frame unwinds. */

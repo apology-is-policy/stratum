@@ -13,4 +13,8 @@
  */
 int stm_take_name(const char *from, const char *to);
 
+/* The same of two names in the directory open as `dir`: the file stays in that
+ * directory whatever a path to it has come to lead to. */
+int stm_take_name_at(int dir, const char *from, const char *to);
+
 #endif

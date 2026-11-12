@@ -432,7 +432,8 @@ else
     # user's own to where the key is to go, and another link put over it just before mkfs asks
     # stands in for a name the kernel follows another way. The volume is formatted by then, so
     # it stays, and so does the key, where mkfs says it was put. The name being a link, mkfs
-    # looks at it three times at each asking: this is its tenth look.
+    # looks at it three times in each claim, once at the use and twice where the new key's
+    # place is asked about: this is its tenth look.
     ln -s "$D/pl-name.to" "$D/pl-name.key"
     planted name look:10 "" over; rc=$?
     if [ "$rc" = 2 ] && LC_ALL=C grep -q '^planted before look:10: done$' "$D/pl-name.plant" \
@@ -442,6 +443,71 @@ else
         ok "a key name that does not lead to the key mkfs made is said, with where the key was put, and the volume and the key are kept"
     else
         no "a key name that does not lead to the key mkfs made: rc=$rc: $(moments name): $(tail -1 "$D/pl-name.log"); image left: $([ -s "$D/pl-name.stm" ] && echo yes || echo no); key where it was put: $([ -f "$D/pl-name.to" ] && echo yes || echo no)"
+    fi
+    # Where the links lead is asked again where the new key is made, of the directory itself:
+    # a link of the user's own left after the claim, into a directory others can change, is
+    # refused there, and mkfs says the claim had not seen it.
+    mkdir "$D/pl-open"
+    chmod 777 "$D/pl-open"
+    planted dirs look:6 "$D/pl-open/pl.key"; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:6: done$' "$D/pl-dirs.plant" \
+            && LC_ALL=C grep -qF "stratum-mkfs: since the volume was claimed, keyfile $D/pl-dirs.key is led by its links to the directory $D/pl-open, which others can change, going by its mode" "$D/pl-dirs.log" \
+            && [ ! -e "$D/pl-dirs.stm" ] && [ -z "$(ls -A "$D/pl-open")" ]; then
+        ok "a link left after the claim that leads the new key into a directory others can change is refused where the key is made, and nothing is made"
+    else
+        no "a link left after the claim into a directory others can change: rc=$rc: $(moments dirs): $(tail -1 "$D/pl-dirs.log"); image left: $([ -e "$D/pl-dirs.stm" ] && echo yes || echo no); in the directory: $(ls -A "$D/pl-open" | tr '\n' ' ')"
+    fi
+    # The new key is made through its directory's descriptor, so it is in the directory
+    # that was asked about, wherever the path to it leads by then. Here the name is a link of
+    # the user's own into a directory of the user's, and once that directory is open and has
+    # been asked about it is moved away and another made at its path, as the owner of a
+    # directory above it could do. Nothing is made in the directory now at the path: the
+    # format, which reads the key by its path, finds none there and fails, and what the run
+    # made is removed. The library watches the directory the key was named in, whose third
+    # look is the one where the key is made.
+    mkdir "$D/pl-kept"
+    chmod 755 "$D/pl-kept"
+    ln -s "pl-kept/k.key" "$D/pl-moved.key"
+    if [ "$(uname -s)" = Darwin ]; then
+        DYLD_INSERT_LIBRARIES="$PLANT_LIB" STM_PLANT_AT="$D" STM_PLANT_ON=look:3 STM_PLANT_MOVE="$D/pl-kept" STM_PLANT_LOG="$D/pl-moved.plant" \
+            "$B" mkfs "$D/pl-moved.stm" --size 64M --keyfile "$D/pl-moved.key" < /dev/null > "$D/pl-moved.log" 2>&1; rc=$?
+    else
+        LD_PRELOAD="$PLANT_LIB" STM_PLANT_AT="$D" STM_PLANT_ON=look:3 STM_PLANT_MOVE="$D/pl-kept" STM_PLANT_LOG="$D/pl-moved.plant" \
+            "$B" mkfs "$D/pl-moved.stm" --size 64M --keyfile "$D/pl-moved.key" < /dev/null > "$D/pl-moved.log" 2>&1; rc=$?
+    fi
+    if [ "$rc" != 0 ] && [ "$(moments moved)" = "look:1 look:2 moved before look:3: done " ] \
+            && [ -d "$D/pl-kept.away" ] && [ -z "$(ls -A "$D/pl-kept")" ] && [ -z "$(ls -A "$D/pl-kept.away")" ] \
+            && [ ! -e "$D/pl-moved.stm" ]; then
+        ok "a key's directory moved away once it was asked about gets no key at its path, and nothing is left"
+    else
+        no "a key's directory moved away once it was asked about: rc=$rc: $(moments moved): $(tail -1 "$D/pl-moved.log"); at its path: $(ls -A "$D/pl-kept" 2>/dev/null | tr '\n' ' '); moved away: $(ls -A "$D/pl-kept.away" 2>/dev/null | tr '\n' ' '); image left: $([ -e "$D/pl-moved.stm" ] && echo yes || echo no)"
+    fi
+    # A file another user owns at the image's name is theirs to remove, and the volume with
+    # it: an empty one left at a free name is not formatted into. No test can make another
+    # user's file without being root, so mkfs is told it runs as another user, and the empty
+    # file, the real user's, is to it another's. The control is the same file with mkfs told
+    # nothing, which is formatted.
+    : > "$D/pl-img.stm"
+    if [ "$(uname -s)" = Darwin ]; then
+        DYLD_INSERT_LIBRARIES="$PLANT_LIB" STM_PLANT_EUID=$(($(id -u) + 1)) "$B" mkfs "$D/pl-img.stm" --size 64M < /dev/null > "$D/pl-img.log" 2>&1; rc=$?
+    else
+        LD_PRELOAD="$PLANT_LIB" STM_PLANT_EUID=$(($(id -u) + 1)) "$B" mkfs "$D/pl-img.stm" --size 64M < /dev/null > "$D/pl-img.log" 2>&1; rc=$?
+    fi
+    if [ "$rc" != 0 ] && LC_ALL=C grep -qF "stratum-mkfs: $D/pl-img.stm belongs to another user, who could remove the volume" "$D/pl-img.log" \
+            && [ -f "$D/pl-img.stm" ] && [ ! -s "$D/pl-img.stm" ] && [ ! -e "$D/pl-img.stm.key" ]; then
+        ok "an empty file at the image's name that is not the user's is not formatted into, and no key is made"
+    else
+        no "an empty file at the image's name that is not the user's: rc=$rc: $(tail -1 "$D/pl-img.log"); bytes in it: $(wc -c < "$D/pl-img.stm" | tr -d ' '); key made: $([ -e "$D/pl-img.stm.key" ] && echo yes || echo no)"
+    fi
+    if [ "$(uname -s)" = Darwin ]; then
+        DYLD_INSERT_LIBRARIES="$PLANT_LIB" "$B" mkfs "$D/pl-img.stm" --size 64M < /dev/null > "$D/pl-img-own.log" 2>&1; rc=$?
+    else
+        LD_PRELOAD="$PLANT_LIB" "$B" mkfs "$D/pl-img.stm" --size 64M < /dev/null > "$D/pl-img-own.log" 2>&1; rc=$?
+    fi
+    if [ "$rc" = 0 ] && [ -s "$D/pl-img.stm" ] && [ -f "$D/pl-img.stm.key" ]; then
+        ok "the same empty file, the user's own, is formatted"
+    else
+        no "the user's own empty file at the image's name: rc=$rc: $(tail -1 "$D/pl-img-own.log")"
     fi
 fi
 
@@ -483,11 +549,12 @@ fi
 # be: where nothing forbids it, any user can give a link of the user's or root's a name of
 # their choosing, and its text would lead the key from there. So it is not followed. With one
 # name again, the same link is: the control.
-if "$B" mkfs "$D/two-own.stm" --size 64M --keyfile "$D/two-own.key" < /dev/null > "$D/two-own.log" 2>&1 \
-        && ln -s "two-own.key" "$D/two-first.lnk" && ln -P "$D/two-first.lnk" "$D/two.key" 2> /dev/null && [ -L "$D/two.key" ]; then
+if ! "$B" mkfs "$D/two-own.stm" --size 64M --keyfile "$D/two-own.key" < /dev/null > "$D/two-own.log" 2>&1; then
+    no "a key of the user's own for the link with two names: $(tail -1 "$D/two-own.log")"
+elif ln -s "two-own.key" "$D/two-first.lnk" && ln -P "$D/two-first.lnk" "$D/two.key" 2> /dev/null && [ -L "$D/two.key" ]; then
     "$B" mkfs "$D/two.stm" --size 64M --keyfile "$D/two.key" < /dev/null > "$D/two.log" 2>&1
     rc=$?
-    if [ "$rc" != 0 ] && LC_ALL=C grep -q 'is reached through a symlink that has more than one name' "$D/two.log" && [ ! -e "$D/two.stm" ]; then
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q 'is reached through a symlink that has another name besides this one' "$D/two.log" && [ ! -e "$D/two.stm" ]; then
         ok "a link at the key's name that has a second name is refused, and nothing is made"
     else
         no "a link at the key's name that has a second name: rc=$rc: $(tail -1 "$D/two.log"); image left: $([ -e "$D/two.stm" ] && echo yes || echo no)"
@@ -500,7 +567,85 @@ if "$B" mkfs "$D/two-own.stm" --size 64M --keyfile "$D/two-own.key" < /dev/null 
         no "the same link with one name again: $(tail -1 "$D/two-one.log")"
     fi
 else
-    echo "note: a link with two names: none can be made here (no hard link to a link, or no key to point it at: $(tail -1 "$D/two-own.log" 2>/dev/null)), so there is nothing to check"
+    skipped "a link with two names: none can be made here (ln -P gives a link no second name)"
+fi
+
+# Where the links lead. A link of the user's own is followed, and where it leads the key out
+# of the directory it was named in, the directory it leads to is asked about: a link of the
+# user's or root's that once had a second name can be put anywhere by whoever gave it that
+# name, and nothing in the link tells. One others can change is refused, for a new key and
+# for one that is there, with --key-as-is too. The user's own with nobody else let to write,
+# and a sticky one, where others add names and take none away, are followed (the controls),
+# and so is a link that keeps the key in the directory it was named in, whatever that
+# directory's mode, since the user chose it. --force follows any.
+mkdir "$D/led-open" "$D/led-own" "$D/led-sticky" "$D/led-same"
+chmod 777 "$D/led-open" "$D/led-same"; chmod 755 "$D/led-own"; chmod 1777 "$D/led-sticky"
+ln -s "led-open/k.key" "$D/led-open.key"
+"$B" mkfs "$D/led-open.stm" --size 64M --keyfile "$D/led-open.key" < /dev/null > "$D/led-open.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ] && LC_ALL=C grep -qF "stratum-mkfs: keyfile $D/led-open.key is led by its links to the directory $D/led-open, which others can change, going by its mode" "$D/led-open.log" \
+        && [ ! -e "$D/led-open.stm" ] && [ -z "$(ls -A "$D/led-open")" ]; then
+    ok "a key link that leads into a directory others can change is refused before anything is made"
+else
+    no "a key link into a directory others can change: rc=$rc: $(tail -1 "$D/led-open.log"); image left: $([ -e "$D/led-open.stm" ] && echo yes || echo no); in the directory: $(ls -A "$D/led-open" | tr '\n' ' ')"
+fi
+printf '%s\n' "$PASS" | "$B" mkfs "$D/led-open-p.stm" --size 64M --passphrase-stdin --keyfile "$D/led-open.key" > "$D/led-open-p.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ] && LC_ALL=C grep -qF "is led by its links to the directory $D/led-open, which others can change" "$D/led-open-p.log" \
+        && [ ! -e "$D/led-open-p.stm" ] && [ -z "$(ls -A "$D/led-open")" ]; then
+    ok "the same with a passphrase"
+else
+    no "a key link into a directory others can change, with a passphrase: rc=$rc: $(tail -1 "$D/led-open-p.log")"
+fi
+for kind in own sticky; do
+    ln -s "led-$kind/k.key" "$D/led-$kind.key"
+    if "$B" mkfs "$D/led-$kind.stm" --size 64M --keyfile "$D/led-$kind.key" < /dev/null > "$D/led-$kind.log" 2>&1 \
+            && [ -f "$D/led-$kind/k.key" ] && [ -L "$D/led-$kind.key" ] && LC_ALL=C grep -q '^generated keyfile' "$D/led-$kind.log"; then
+        ok "a key link that leads into a directory of the user's that is $( [ $kind = own ] && echo "nobody else's to write" || echo sticky ) is followed"
+    else
+        no "a key link into the user's $kind directory: $(tail -1 "$D/led-$kind.log")"
+    fi
+done
+ln -s "k2.key" "$D/led-same/k.key"
+if "$B" mkfs "$D/led-same.stm" --size 64M --keyfile "$D/led-same/k.key" < /dev/null > "$D/led-same.log" 2>&1 \
+        && [ -f "$D/led-same/k2.key" ] && [ -L "$D/led-same/k.key" ]; then
+    ok "a key link that keeps the key in the directory it was named in is followed, whatever that directory's mode"
+else
+    no "a key link that keeps the key in its directory: $(tail -1 "$D/led-same.log")"
+fi
+cp "$D/led-own/k.key" "$D/led-open/have.key"
+chmod 600 "$D/led-open/have.key"
+ln -s "led-open/have.key" "$D/led-have.key"
+"$B" mkfs "$D/led-have.stm" --size 64M --keyfile "$D/led-have.key" < /dev/null > "$D/led-have.log" 2>&1
+rc=$?
+"$B" mkfs "$D/led-have-as.stm" --size 64M --key-as-is --keyfile "$D/led-have.key" < /dev/null > "$D/led-have-as.log" 2>&1
+rc2=$?
+if [ "$rc" != 0 ] && [ "$rc2" != 0 ] && [ ! -e "$D/led-have.stm" ] && [ ! -e "$D/led-have-as.stm" ] \
+        && LC_ALL=C grep -qF "is led by its links to the directory $D/led-open, which others can change" "$D/led-have.log" \
+        && LC_ALL=C grep -qF "is led by its links to the directory $D/led-open, which others can change" "$D/led-have-as.log"; then
+    ok "a key that is there, reached through a link into a directory others can change, is not used, with --key-as-is neither"
+else
+    no "a key reached through a link into a directory others can change: rc=$rc and, with --key-as-is, $rc2: $(tail -1 "$D/led-have.log") / $(tail -1 "$D/led-have-as.log")"
+fi
+rm "$D/led-open/have.key"
+# A directory the user may write and search but not read still takes a new key: its
+# descriptor is then one for the search alone. Root reads any directory, so run as root this
+# shows only that the key is made.
+mkdir "$D/led-wx"
+chmod 300 "$D/led-wx"
+"$B" mkfs "$D/led-wx.stm" --size 64M --keyfile "$D/led-wx/k.key" < /dev/null > "$D/led-wx.log" 2>&1
+rc=$?
+chmod 700 "$D/led-wx"
+if [ "$rc" = 0 ] && [ -f "$D/led-wx/k.key" ] && [ -s "$D/led-wx.stm" ] && LC_ALL=C grep -q '^generated keyfile' "$D/led-wx.log"; then
+    ok "a new key is made in a directory the user can write and search but not read"
+else
+    no "a new key in a directory that cannot be read: rc=$rc: $(tail -1 "$D/led-wx.log")"
+fi
+if "$B" mkfs "$D/led-open-f.stm" --size 64M --force --keyfile "$D/led-open.key" < /dev/null > "$D/led-open-f.log" 2>&1 \
+        && [ -f "$D/led-open/k.key" ] && [ -s "$D/led-open-f.stm" ]; then
+    ok "with --force the link into a directory others can change is followed"
+else
+    no "with --force, a key link into a directory others can change: $(tail -1 "$D/led-open-f.log")"
 fi
 
 # The links at the key's name are asked about one by one, seven at most. More than that are refused, not
@@ -535,7 +680,7 @@ else
     as=none
 fi
 if [ "$as" = none ]; then
-    skipped "another user's key link and another user's key: making one needs root, or STRATUM_TEST_SUDO=1 and sudo without a password"
+    skipped "another user's key link, key, image file and directory: making one needs root, or STRATUM_TEST_SUDO=1 and sudo without a password"
 else
     # A key another user owns is theirs, whatever its mode: with no passphrase it is not used.
     # Read by no one else, only its owner tells it from the user's own. As root the same is seen
@@ -629,6 +774,34 @@ else
             no "another user's link to an existing key $how: rc=$rc: $(tail -1 "$D/reuse.log"); image: $(ls "$D/reuse.stm" 2>/dev/null)"
         fi
     done
+    # An empty file another user owns, left at the image's free name where anyone may write it:
+    # its owner could remove the volume, so it is not formatted into. Run as root this is the
+    # same from the other side, a file that is not root's.
+    : > "$D/theirs.stm"
+    chmod 666 "$D/theirs.stm"
+    $as chown nobody "$D/theirs.stm"
+    "$B" mkfs "$D/theirs.stm" --size 64M < /dev/null > "$D/theirs-img.log" 2>&1
+    rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -qF "stratum-mkfs: $D/theirs.stm belongs to another user, who could remove the volume" "$D/theirs-img.log" \
+            && [ ! -s "$D/theirs.stm" ] && [ ! -e "$D/theirs.stm.key" ]; then
+        ok "another user's empty file at the image's name is not formatted into, and no key is made"
+    else
+        no "another user's empty file at the image's name: rc=$rc: $(tail -1 "$D/theirs-img.log"); bytes in it: $(wc -c < "$D/theirs.stm" | tr -d ' ')"
+    fi
+    # A link of the user's own that leads the key into another user's directory: whoever owns
+    # the directory could remove the key, whatever its mode says of others.
+    mkdir "$D/led-theirs"
+    chmod 755 "$D/led-theirs"
+    $as chown nobody "$D/led-theirs"
+    ln -s "led-theirs/k.key" "$D/led-theirs.key"
+    "$B" mkfs "$D/led-theirs.stm" --size 64M --keyfile "$D/led-theirs.key" < /dev/null > "$D/led-theirs.log" 2>&1
+    rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -qF "is led by its links to the directory $D/led-theirs, which belongs to another user" "$D/led-theirs.log" \
+            && [ ! -e "$D/led-theirs.stm" ]; then
+        ok "a key link that leads into another user's directory is refused before anything is made"
+    else
+        no "a key link into another user's directory: rc=$rc: $(tail -1 "$D/led-theirs.log"); image left: $([ -e "$D/led-theirs.stm" ] && echo yes || echo no)"
+    fi
 fi
 [ ! -e "$D/new.stm" ] && ok "that refusal left no empty image" || no "that refusal left an image behind"
 
