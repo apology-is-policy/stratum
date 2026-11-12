@@ -229,6 +229,32 @@ if "$B" mkfs "$D/shared.stm" --size 64M --force --keyfile "$D/raw.stm.key" < /de
 else
     no "--force over a key others can read: $(tail -1 "$D/shared.log")"
 fi
+# --key-as-is is the narrow way past that refusal: the key is used, and nothing else of what --force
+# does comes with it. Over a volume that is there it still refuses, with a passphrase it is refused
+# before anything is read, and what is no regular file is still no key (further down).
+kh2=$(cksum < "$D/raw.stm.key")
+if "$B" mkfs "$D/asis.stm" --size 64M --key-as-is --keyfile "$D/raw.stm.key" < /dev/null > "$D/asis.log" 2>&1 \
+        && LC_ALL=C grep -q 'using existing keyfile' "$D/asis.log" && [ -s "$D/asis.stm" ]; then
+    ok "with --key-as-is a key others can read is used"
+else
+    no "--key-as-is over a key others can read: $(tail -1 "$D/asis.log")"
+fi
+ah=$(cksum < "$D/asis.stm")
+"$B" mkfs "$D/asis.stm" --size 64M --key-as-is --keyfile "$D/raw.stm.key" < /dev/null > "$D/asis2.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ] && LC_ALL=C grep -q 'already holds data' "$D/asis2.log" && [ "$(cksum < "$D/asis.stm")" = "$ah" ]; then
+    ok "--key-as-is does not format over a volume that is there"
+else
+    no "--key-as-is over a volume that is there: rc=$rc: $(tail -1 "$D/asis2.log")"
+fi
+printf '%s\n' other | "$B" mkfs "$D/asis3.stm" --size 64M --key-as-is --passphrase-stdin --keyfile "$D/raw.stm.key" > "$D/asis3.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ] && LC_ALL=C grep -q -e '--key-as-is uses a key file that is there' "$D/asis3.log" && [ ! -e "$D/asis3.stm" ]; then
+    ok "--key-as-is with a passphrase is refused, and says why"
+else
+    no "--key-as-is with a passphrase: rc=$rc: $(tail -1 "$D/asis3.log"); image left: $([ -e "$D/asis3.stm" ] && echo yes || echo no)"
+fi
+[ "$(cksum < "$D/raw.stm.key")" = "$kh2" ] && ok "the key those three named is as it was" || no "--key-as-is changed the key it named"
 chmod 600 "$D/raw.stm.key"
 if "$B" mkfs "$D/own.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$D/own.log" 2>&1 \
         && LC_ALL=C grep -q 'using existing keyfile' "$D/own.log"; then
@@ -256,6 +282,13 @@ if [ "$rc" != 0 ] && LC_ALL=C grep -q '^stratum-mkfs: keyfile .* is not a regula
     ok "a directory at the key's name is refused before anything is made, and says why"
 else
     no "a directory at the key's name: rc=$rc: $(tail -1 "$D/dirkey.log"); image left: $([ -e "$D/dirkey.stm" ] && echo yes || echo no)"
+fi
+"$B" mkfs "$D/dirkey.stm" --size 64M --key-as-is --keyfile "$D/dir.key" < /dev/null > "$D/dirkey.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ] && LC_ALL=C grep -q '^stratum-mkfs: keyfile .* is not a regular file' "$D/dirkey.log" && [ ! -e "$D/dirkey.stm" ]; then
+    ok "with --key-as-is too, a directory at the key's name is no key"
+else
+    no "--key-as-is and a directory at the key's name: rc=$rc: $(tail -1 "$D/dirkey.log"); image left: $([ -e "$D/dirkey.stm" ] && echo yes || echo no)"
 fi
 
 # The links at the key's name are asked about one by one, seven at most. More than that are refused, not
@@ -308,6 +341,19 @@ else
     else
         no "a key another user owns: rc=$rc: $(tail -1 "$D/owned.log"); image left: $([ -e "$D/owned.stm" ] && echo yes || echo no)"
     fi
+    # Its owner is what --key-as-is is told to pass over, where the key can be read at all.
+    cp "$D/raw.stm.key" "$D/theirs-read.key"
+    chmod 644 "$D/theirs-read.key"
+    $as chown nobody "$D/theirs-read.key"
+    if [ "$(stat -c %u "$D/theirs-read.key" 2>/dev/null || stat -f %u "$D/theirs-read.key")" = "$(id -u)" ]; then
+        no "theirs-read.key is still the user's: it proves nothing"
+    fi
+    if "$B" mkfs "$D/owned-asis.stm" --size 64M --key-as-is --keyfile "$D/theirs-read.key" < /dev/null > "$D/owned-asis.log" 2>&1 \
+            && LC_ALL=C grep -q 'using existing keyfile' "$D/owned-asis.log" && [ -s "$D/owned-asis.stm" ]; then
+        ok "with --key-as-is a key another user owns, which the user can read, is used"
+    else
+        no "--key-as-is over a key another user owns: $(tail -1 "$D/owned-asis.log")"
+    fi
     if [ -n "$as" ]; then
         # Root can read any key, so there the owner is the only thing between it and the volume.
         $as "$B" mkfs "$D/rooted.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$D/rooted.log" 2>&1
@@ -339,6 +385,15 @@ else
         [ -z "$(ls -A "$D/theirs")" ] && [ ! -e "$D/planted.stm" ] && ok "that refusal $how made no key and no image" \
             || no "a refused key link $how left: $(ls -A "$D/theirs" | tr '\n' ' ')$(ls "$D/planted.stm" 2>/dev/null)"
     done
+    # --key-as-is is about a key that is there, not about whose link leads to one.
+    "$B" mkfs "$D/planted.stm" --size 64M --key-as-is < /dev/null > "$D/planted.log" 2>&1
+    rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q 'reached through a symlink another user owns' "$D/planted.log" \
+            && [ -z "$(ls -A "$D/theirs")" ] && [ ! -e "$D/planted.stm" ]; then
+        ok "--key-as-is does not follow another user's link, and makes nothing"
+    else
+        no "--key-as-is and another user's key link: rc=$rc: $(tail -1 "$D/planted.log"); left: $(ls -A "$D/theirs" | tr '\n' ' ')$(ls "$D/planted.stm" 2>/dev/null)"
+    fi
     if printf '%s\n' other | "$B" mkfs "$D/planted.stm" --size 64M --force --passphrase-stdin > "$D/planted.log" 2>&1 \
             && [ -s "$D/theirs/k" ]; then
         ok "with --force the key is made where another user's link points"

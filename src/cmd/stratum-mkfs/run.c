@@ -25,7 +25,8 @@
  *                   Default: 64M.
  *   --keyfile PATH  Path to write the PQ-hybrid keyfile (or, with no
  *                   passphrase, use one already there that is the
- *                   user's alone). Default: <IMAGE>.key.
+ *                   user's alone, or any under --key-as-is).
+ *                   Default: <IMAGE>.key.
  *
  * Exit codes:
  *   0  success
@@ -112,11 +113,17 @@ static void usage(void)
 "                   owns, and uses a keyfile that is not the user's alone.\n"
 "                   Never overrides a daemon using IMAGE, and a format\n"
 "                   cannot shrink a file: --size must reach it.\n"
+"  --key-as-is      Use the keyfile that is there although another user owns\n"
+"                   it or its mode gives others access. Nothing else of what\n"
+"                   --force does: no format over data, no key replaced, no\n"
+"                   link of another user's followed. Not with\n"
+"                   --passphrase-stdin, where the key is always new.\n"
 "  --keyfile PATH   Path to read/write the PQ-hybrid keyfile.\n"
 "                   If file exists, it's used as-is when it is a regular\n"
 "                   file the user owns whose mode gives no one else access\n"
-"                   (chmod go-rwx), or with --passphrase-stdin refused,\n"
-"                   unless --force. If missing, one is generated where its\n"
+"                   (chmod go-rwx) or --key-as-is says to, and with\n"
+"                   --passphrase-stdin it is refused, unless --force. If\n"
+"                   missing, one is generated where its\n"
 "                   links point. Links at PATH, to a key that exists or to\n"
 "                   where one is to go, are followed when they are seven at\n"
 "                   most and " LINK_OWNERS " owns each.\n"
@@ -248,18 +255,20 @@ static const char *key_destination(const char *path, char *buf, size_t n, bool f
 
 /* A key used as it is decides who can open the volume: one another user owns, or that
  * its mode lets others read or write, is theirs as much as the user's. The corvus token
- * is held to the same. NULL when the key is the user's alone, else what is wrong with it
- * and what mends that. */
-static const char *key_not_the_users(const struct stat *st)
+ * is held to the same. NULL when the key is the user's alone, or is a file the user said
+ * to use as it is, else what is wrong with it and what mends that. */
+static const char *key_not_the_users(const struct stat *st, bool as_is)
 {
     if (!S_ISREG(st->st_mode)) return "is not a regular file, so no key to use";
+    if (as_is) return NULL;
     if (st->st_uid != geteuid())
         return "belongs to another user, who could open any volume made with it: run as "
-               "its owner or make it the user's own, or, if it can be read, pass --force to "
-               "use it as it is";
+               "its owner or make it the user's own, or, if it can be read, pass "
+               "--key-as-is to use it as it is";
     if ((st->st_mode & (S_IRWXG | S_IRWXO)) != 0)
         return "can be read or written by others, going by its mode, and the volume "
-               "would be theirs to open: chmod go-rwx it, or pass --force to use it as it is";
+               "would be theirs to open: chmod go-rwx it, or pass --key-as-is to use it as "
+               "it is";
     return NULL;
 }
 
@@ -285,7 +294,8 @@ static void say_links_too_many(const char *keyfile_path)
  * the process ends: a daemon cannot start on the image between the look and the
  * format, and --force does not reach past a daemon already on it.
  */
-static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool force)
+static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool force,
+                           bool key_as_is)
 {
     struct stat st;
     char dest[4096];
@@ -302,7 +312,7 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
     }
     if (force || stat(keyfile_path, &st) != 0) return false;
     if (!replaces_key) {
-        const char *why = key_not_the_users(&st);
+        const char *why = key_not_the_users(&st, key_as_is);
         if (!why) return false;
         fprintf(stderr, "stratum-mkfs: keyfile %s %s\n", keyfile_path, why);
         return true;
@@ -314,15 +324,15 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
 }
 
 static int mkfs_claim(const char *image_path, const char *keyfile_path,
-                      bool replaces_key, bool force, uint64_t device_bytes,
-                      bool *created)
+                      bool replaces_key, bool force, bool key_as_is,
+                      uint64_t device_bytes, bool *created)
 {
     int fd = -1;
     *created = false;
     stm_status s = stm_bdev_claim_image(image_path, false, &fd);
     if (s == STM_ENOENT) {
         /* Asked now, so that a refusal leaves no empty image behind. */
-        if (key_in_the_way(keyfile_path, replaces_key, force)) return 1;
+        if (key_in_the_way(keyfile_path, replaces_key, force, key_as_is)) return 1;
         s = stm_bdev_claim_image(image_path, true, &fd);
         *created = s == STM_OK || s == STM_ENOLCK;
     }
@@ -342,7 +352,7 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
     }
 
     /* Asked before the look as well, which reads all of an empty disk. */
-    if (!*created && key_in_the_way(keyfile_path, replaces_key, force)) return 1;
+    if (!*created && key_in_the_way(keyfile_path, replaces_key, force, key_as_is)) return 1;
 
     /* Where the platform has no lock there is no descriptor to look through. */
     int look = fd >= 0 ? fd : open(image_path, O_RDONLY | O_CLOEXEC);
@@ -388,7 +398,7 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
             return 1;
         }
     }
-    return key_in_the_way(keyfile_path, replaces_key, force) ? 1 : 0;
+    return key_in_the_way(keyfile_path, replaces_key, force, key_as_is) ? 1 : 0;
 }
 
 /* Without --force the name is taken only if it is still free: a plain rename would
@@ -479,6 +489,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     const char *keyfile_path     = NULL;
     bool       passphrase_stdin  = false;
     bool       force             = false;
+    bool       key_as_is         = false;
     /* Dataset-root owner. Default 0/0 (historical behavior). Thylacine's
      * A-3 host-bake passes --root-uid/--root-gid = PRINCIPAL_SYSTEM so the
      * root is owned by the boot chain once the OS enforces 9P-mount rwx --
@@ -513,6 +524,8 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             i++;
         } else if (strcmp(argv[i], "--force") == 0) {
             force = true;
+        } else if (strcmp(argv[i], "--key-as-is") == 0) {
+            key_as_is = true;
         } else if (strcmp(argv[i], "--passphrase-stdin") == 0) {
             passphrase_stdin = true;
         } else if (strcmp(argv[i], "--seed") == 0) {
@@ -580,6 +593,12 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         return 1;
     }
 
+    if (key_as_is && passphrase_stdin) {
+        fputs("stratum-mkfs: --key-as-is uses a key file that is there as it is, and with "
+              "--passphrase-stdin the key is always made new: give one or the other\n", stderr);
+        return 1;
+    }
+
     /* Default keyfile path is <image>.key. */
     char default_key_path[1024];
     if (!keyfile_path) {
@@ -622,7 +641,8 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     const char *format_key = keyfile_path;
     bool key_is_new = false;
     bool temp_key_made = false;
-    if (mkfs_claim(image_path, keyfile_path, have_pass, force, device_bytes, &created) != 0) {
+    if (mkfs_claim(image_path, keyfile_path, have_pass, force, key_as_is, device_bytes,
+                   &created) != 0) {
         exit_code = 1;
         goto cleanup;
     }
@@ -640,10 +660,10 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             goto cleanup;
         }
         key_is_new = true;
-    } else if (!have_pass && !force && key_not_the_users(&st)) {
+    } else if (!have_pass && !force && key_not_the_users(&st, key_as_is)) {
         /* Made there, or changed, since the claim. */
         fprintf(stderr, "stratum-mkfs: since the volume was claimed, keyfile %s %s\n",
-                keyfile_path, key_not_the_users(&st));
+                keyfile_path, key_not_the_users(&st, key_as_is));
         exit_code = 1;
         goto cleanup;
     }
