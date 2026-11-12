@@ -264,10 +264,21 @@ void stm_unix_listen_closed(const char *path)
 #endif
 }
 
+static bool flag_is_set(void *arg)
+{
+    atomic_bool *stop = arg;
+    return stop && atomic_load_explicit(stop, memory_order_acquire);
+}
+
 int stm_unix_accept_or_stop(int fd, atomic_bool *stop)
 {
+    return stm_unix_accept_until(fd, flag_is_set, stop);
+}
+
+int stm_unix_accept_until(int fd, bool (*stopped)(void *arg), void *arg)
+{
     for (;;) {
-        if (stop && atomic_load_explicit(stop, memory_order_acquire)) return -ECANCELED;
+        if (stopped(arg)) return -ECANCELED;
 #ifdef STRATUM_BUILD_TESTING_HOOKS
         if (stm_unix_accept_test_before_wait) stm_unix_accept_test_before_wait();
 #endif
@@ -290,7 +301,7 @@ int stm_unix_accept_or_stop(int fd, atomic_bool *stop)
             (void)nanosleep(&ts, NULL);
             continue;
         }
-        if (stop && atomic_load_explicit(stop, memory_order_acquire)) return -ECANCELED;
+        if (stopped(arg)) return -ECANCELED;
         return -e;
     }
 }

@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -519,6 +520,64 @@ STM_TEST(janus_serve_loop_stops_on_flag_with_listen_fd_open)
     close(d.listen_fd);
     unlink(sock);
     janus_synfs_destroy(d.synfs);
+    tmp_rm(dir);
+    free(dir);
+}
+
+/* A moment with no descriptors left does not end the loop, which would leave every
+ * mount that asks janus for its key unanswered: the client it could not take waits,
+ * and the loop is still there once there are descriptors again. */
+STM_TEST(janus_serve_loop_waits_through_a_moment_with_no_descriptors)
+{
+    char *dir = tmp_dir();
+    STM_ASSERT(dir);
+    char keyfile[1024], sock[1024];
+    snprintf(keyfile, sizeof keyfile, "%s/keyfile", dir);
+    snprintf(sock,     sizeof sock,     "%s/sock",     dir);
+    make_keyfile(keyfile);
+
+    daemon_thread d;
+    STM_ASSERT_OK(spawn_daemon(TEST_UUID, keyfile, sock, &d));
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT(c >= 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    STM_ASSERT(strlen(sock) < sizeof addr.sun_path);
+    memcpy(addr.sun_path, sock, strlen(sock));
+
+    /* Every descriptor this process may have, taken. */
+    enum { MOST = 256 };
+    struct rlimit was, low;
+    STM_ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &was), 0);
+    low = was;
+    if (low.rlim_cur > MOST) low.rlim_cur = MOST;
+    STM_ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &low), 0);
+    static int taken[MOST];
+    int n = 0, last = 0;
+    while (n < MOST) {
+        int f = dup(c);
+        if (f < 0) { last = errno; break; }
+        taken[n++] = f;
+    }
+    STM_ASSERT_EQ(last, EMFILE);
+
+    /* The loop finds a client there and cannot take it. */
+    STM_ASSERT_EQ(connect(c, (struct sockaddr *)&addr, sizeof addr), 0);
+    struct timespec while_none = { 0, 600 * 1000 * 1000 };
+    nanosleep(&while_none, NULL);
+    bool ended_with_none = atomic_load_explicit(&d.returned, memory_order_acquire);
+
+    for (int i = 0; i < n; i++) close(taken[i]);
+    STM_ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &was), 0);
+    STM_ASSERT_FALSE(ended_with_none);
+    struct timespec after = { 0, 400 * 1000 * 1000 };
+    nanosleep(&after, NULL);
+    STM_ASSERT_FALSE(atomic_load_explicit(&d.returned, memory_order_acquire));
+    close(c);
+
+    stop_daemon(&d, sock);
+    STM_ASSERT_EQ((int)d.thread_rc, (int)STM_OK);
     tmp_rm(dir);
     free(dir);
 }

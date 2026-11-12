@@ -3,6 +3,7 @@
 #define STRATUM_LISTEN_H
 
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -81,6 +82,10 @@ void stm_unix_listen_closed(const char *path);
  */
 enum { STM_UNIX_ACCEPT_TICK_MS = 200 };
 int stm_unix_accept_or_stop(int fd, atomic_bool *stop);
+
+/* As stm_unix_accept_or_stop, for a stop kept some other way: `stopped(arg)` is asked
+ * wherever that one looks at its flag. */
+int stm_unix_accept_until(int fd, bool (*stopped)(void *arg), void *arg);
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 /* Test only: called between a look at the stop flag and the wait that follows. */

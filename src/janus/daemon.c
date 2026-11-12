@@ -194,6 +194,11 @@ static bool shutdown_requested(atomic_int *shutdown_flag)
         && atomic_load_explicit(shutdown_flag, memory_order_acquire);
 }
 
+static bool shutdown_asked(void *shutdown_flag)
+{
+    return shutdown_requested(shutdown_flag);
+}
+
 stm_status janus_serve_loop(int listen_fd, janus_synfs *synfs,
                               atomic_int *shutdown_flag)
 {
@@ -215,37 +220,12 @@ stm_status janus_serve_loop(int listen_fd, janus_synfs *synfs,
     uid_t self_uid = geteuid();
 
     for (;;) {
-        if (shutdown_requested(shutdown_flag)) break;
-
-        /* Never block in accept(): another thread closing or shutting
-         * down the listening socket does not reliably wake it. On
-         * macOS shutdown() leaves it blocked, and a close() that races
-         * its entry into accept() deadlocks both threads in the kernel
-         * until a client connects; on Linux close() leaves it blocked.
-         * Poll with a timeout and re-check the flag instead, the shape
-         * of stratumd's SWISS-4g loops. */
-        struct pollfd pfd = { listen_fd, POLLIN, 0 };
-        int ready = poll(&pfd, 1, /*timeout_ms=*/200);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            return STM_EIO;
-        }
-        if (ready == 0) continue;
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            if (shutdown_requested(shutdown_flag)) break;
-            return STM_EIO;
-        }
-        if (!(pfd.revents & POLLIN)) continue;
-
-        int cfd = accept(listen_fd, NULL, NULL);
-        if (cfd < 0) {
-            /* A client that gave up before we took it is not a
-             * daemon failure. */
-            if (errno == EINTR || errno == ECONNABORTED) continue;
-            if (shutdown_requested(shutdown_flag)) break;
-            /* Accept failure with shutdown not requested = abort. */
-            return STM_EIO;
-        }
+        /* Never left to wait in accept(), which no close or shutdown of the socket
+         * from another thread reliably wakes; and a moment with no descriptors or
+         * memory left is waited through, as a client that gave up is. */
+        int cfd = stm_unix_accept_until(listen_fd, shutdown_asked, shutdown_flag);
+        if (cfd == -ECANCELED) break;
+        if (cfd < 0) return STM_EIO;
 
         uid_t peer_uid = (uid_t)-1;
         stm_status prc = janus_peer_uid(cfd, &peer_uid);
