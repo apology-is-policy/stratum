@@ -16,9 +16,6 @@ compile_commands.json
 # macOS
 .DS_Store
 
-# Rust / Cargo
-tui/target/
-tui/Cargo.lock
 
 # Dist output
 dist/
@@ -44,8 +41,7 @@ third_party/xxHash_src/.git/
 bench/dedup_results_*.csv
 bench/reflink_results_*.csv
 
-# Rust crate build output (tui/)
-tools/stratum-slate-tty/target/
+# Rust crate build output
 tools/stratum/target/
 
 # Rust builds and the packaged binary

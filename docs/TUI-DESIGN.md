@@ -1,5 +1,8 @@
 # stratum-tui v2 — design
 
+> The program this describes, `tui/`, is removed. The manager in `tools/stratum` took its chrome
+> and works through the slate and `stratumd` daemons; this document is kept as the design's record.
+
 The v2 TUI is a FAR Commander-style dual-pane file manager + editor +
 admin console for stratum, built in Rust over `libstratum-9p`. It
 wholesale-lifts the v1 TUI's chrome (`tui/src/{ui,panel,app,editor,

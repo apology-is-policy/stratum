@@ -1,6 +1,6 @@
 //! slate synfs client — thin wrapper around libstratum-9p.
 //!
-//! Provides the higher-level operations slate-tty needs:
+//! Provides the higher-level operations the renderer needs:
 //!
 //!   * `dial` — open a 9P connection to a slate Unix socket.
 //!   * `read_path` — walk + lopen RDONLY + read-until-EOF + clunk.
@@ -12,7 +12,7 @@
 //!     returns the new version as a decimal string + '\n'.
 //!
 //! Concurrency note (carried from libstratum-9p docs): each
-//! `SlateClient` is one-op-at-a-time. The slate-tty design uses TWO
+//! `SlateClient` is one-op-at-a-time. The renderer uses TWO
 //! `SlateClient` instances (one for the main thread, one for the
 //! /redraw long-poll thread) precisely to avoid serialising
 //! interactive ops behind a blocked redraw read.

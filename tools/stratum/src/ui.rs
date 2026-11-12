@@ -1,10 +1,10 @@
-//! ratatui frame builder — slate-tty.
+//! ratatui frame builder for slate's panels.
 //!
-//! Visual aesthetic mirrors `tui/src/ui.rs` (FAR Commander):
+//! Visual aesthetic is FAR Commander's:
 //! double-line panel borders, blue/dark-gray active/inactive scheme,
 //! header row + horizontal rule, F-key bar at the bottom.
 //!
-//! What slate-tty does differently from tui:
+//! What it does differently from the first TUI, removed since:
 //!   - panels are sourced from /panels/X/entries (already pre-formatted
 //!     server-side), parsed into structured `Entry` rows for display.
 //!   - editor + dialogs are display-only at v1.0 (interactive driving
@@ -80,7 +80,7 @@ const CLR_POPUP_BG: Color = Color::Black;
 // surfaces — /editor/content, /status, /connection/socket — are
 // transported faithfully by slate per CLAUDE.md slate clause 23(g)
 // ("Slate's responsibility is to faithfully transport the bytes").
-// slate-tty IS the renderer-layer where the sanitization MUST happen.
+// This renderer IS the layer where the sanitization MUST happen.
 //
 // Policy: every control character becomes '?', EXCEPT '\n' and '\t',
 // which the renderer handles natively (line breaks + tabs). That is

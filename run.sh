@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# v2 dev launcher — builds + mkfs (if needed) + stratumd (bg) + TUI (fg).
+# Dev launcher: makes a volume if there is none, then opens it in the manager.
 #
 # Defaults:
 #   image    /tmp/stratum-dev.stm     (override: $STM_IMG)
 #   keyfile  $image.key
-#   socket   /tmp/stratum-dev.sock    (override: $STM_SOCK)
+#   socket   /tmp/stratum-dev.sock    (override: $STM_SOCK; `fs` only)
 #   size     64M                      (override: $STM_SIZE)
 #
 # Usage:
-#   ./run.sh                  # full launch
+#   ./run.sh                  # the manager on the volume; it starts and stops its own daemons
 #   ./run.sh fs               # FS-only: stratumd + drop you at a stratum-fs prompt-style shell
 #   ./run.sh wipe             # remove image + keyfile
 #
-# On exit (TUI quits or Ctrl-C) stratumd is killed. The image + keyfile
+# In `fs`, stratumd is stopped when the shell exits, or on Ctrl-C. The image + keyfile
 # persist across runs; pass `wipe` first if you want a clean slate.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$ROOT/build"
-TUI_TARGET="$ROOT/tui/target/release"
+STRATUM="$ROOT/dist/stratum"
 
 IMG="${STM_IMG:-/tmp/stratum-dev.stm}"
 KEY="${IMG}.key"
@@ -59,11 +59,28 @@ if [[ "${1:-}" == "wipe" ]]; then
     exit 0
 fi
 
-# ── build (if needed) ──────────────────────────────────────────────────
+# -- default: the manager (fg) ----------------------------------------
+
+if [[ "${1:-}" != "fs" ]]; then
+    if ! have "$STRATUM"; then
+        say "building the stratum binary (dist.sh)..."
+        "$ROOT/dist.sh" >&2
+    fi
+    if [[ ! -f "$IMG" ]]; then
+        say "creating volume $IMG (size=$SIZE)..."
+        "$STRATUM" mkfs "$IMG" --size "$SIZE"
+    else
+        say "using existing $IMG"
+    fi
+    say "opening $IMG in the manager (F10 quits)..."
+    "$STRATUM" tui --vol "$IMG" --keyfile "$KEY"
+    exit 0
+fi
+
+# -- fs: stratumd (bg) and a shell ------------------------------------
 
 MKFS="$BUILD/src/cmd/stratum-mkfs/stratum-mkfs"
 DAEMON="$BUILD/src/cmd/stratumd/stratumd"
-TUI="$TUI_TARGET/stratum-tui"
 
 if ! have "$MKFS" || ! have "$DAEMON"; then
     say "building C tree (cmake)..."
@@ -100,23 +117,9 @@ done
 grep -qs 'bound and ready' "$LOG" || die "stratumd was not ready after 5 s"
 say "stratumd ready (pid $STRATUMD_PID)"
 
-# ── subcommand: fs (drop into a sub-shell with stratum-fs in PATH) ─────
-
-if [[ "${1:-}" == "fs" ]]; then
-    export PATH="$BUILD/src/cmd/stratum-fs:$PATH"
-    export STRATUM_SOCKET="$SOCK"
-    say "launching shell with STRATUM_SOCKET=$SOCK + stratum-fs in PATH"
-    say "(exit shell to stop stratumd)"
-    "${SHELL:-/bin/sh}" -i || true
-    exit 0
-fi
-
-# ── default: TUI (fg) ──────────────────────────────────────────────────
-
-if ! have "$TUI"; then
-    say "building TUI (cargo)..."
-    ( cd "$ROOT/tui" && cargo build --release )
-fi
-
-say "launching TUI (q quits)..."
-"$TUI" "$SOCK"
+export PATH="$BUILD/src/cmd/stratum-fs:$PATH"
+export STRATUM_SOCKET="$SOCK"
+say "launching shell with STRATUM_SOCKET=$SOCK + stratum-fs in PATH"
+say "(exit shell to stop stratumd)"
+"${SHELL:-/bin/sh}" -i || true
+exit 0

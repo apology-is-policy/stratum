@@ -589,7 +589,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
      * opendir fresh each time). Use 1-based entry index as the
      * cookie -- stable across reopens and simple to compute; a resume
      * reads past the entries before the cookie again.
-     * Skip "." and ".." server-side; 9P clients (and the slate-tty
+     * Skip "." and ".." server-side; 9P clients (and the manager's
      * renderer) don't expect them. */
     int rc = STM_OK;
     uint64_t idx = 0;

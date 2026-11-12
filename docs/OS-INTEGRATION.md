@@ -614,7 +614,7 @@ In rough order of how often they bite OS integrators:
 
 - **C suite**: 54 ctest binaries covering every subsystem. Run via `ctest --test-dir build -j4`. Baseline: 54/54 GREEN.
 - **Rust e2e**: 33-case CRUD harness against a live stratumd over the wire. Run via `cargo test --release` in `tools/stratum-fs-e2e/`.
-- **Slate socket smoke**: e2e against a live slate daemon over `--allow-unauth`. Run via `cargo test --release` in `tools/stratum-slate-tty/`.
+- **Slate socket**: `tests/test_slate_socket.c` in the C suite, against a slate served in the test's own process. The Rust renderer that carried its own smoke test, `tools/stratum-slate-tty/`, is removed.
 - **Concurrent /ctl/**: 2-case Rust harness verifying concurrent-accept wall-time bounds. `tools/stratum/tests/concurrent_ctl.rs`.
 - **Compound-op race class**: 9-case pthread harness in `tests/test_compound_ops_concurrent.c`. Each case proves a specific lock-order or atomicity invariant.
 

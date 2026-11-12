@@ -1,6 +1,6 @@
-//! TUI loop — lifted from stratum-slate-tty's main.rs core (run_ui +
-//! handle_key + fetch_snapshot). Same FAR-Commander chrome, same
-//! /event verb routing.
+//! TUI loop (run_ui + handle_key + fetch_snapshot), first written for
+//! the stratum-slate-tty renderer this binary replaced: FAR-Commander
+//! chrome, /event verb routing.
 //!
 //! SWISS-4b adds:
 //!   - LocalDialog::Input modal (rendered via ui.rs::draw_local_dialog).

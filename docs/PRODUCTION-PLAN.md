@@ -265,7 +265,7 @@ Stratum as a modern alternative to VeraCrypt: a file-based volume and a manager 
 | T5.7 | Key hygiene in the `stratum` binary: all key material in locked memory. Today the daemon's mounts lock on a best-effort basis. Core dumps are off in every `stratum` process (T0.75) | S |
 | T5.8 | Warn on rollback: remember the highest generation beside the keyfile or in the recents, and say so when a volume comes back older | S |
 | T5.9 | A fully static binary (libsodium links dynamically today) and a post-quantum build as the default package | S |
-| T5.10 | Remove `tui/`, `tools/stratum-slate-tty` and `run.sh`'s use of them, if the decision goes that way | S |
+| T5.10 | Remove `tui/`, `tools/stratum-slate-tty` and `run.sh`'s use of them. **Done** *(pending)*: both are gone, and `run.sh` opens its volume in the manager, which starts and stops its own daemons; `run.sh fs` and `run.sh wipe` are as they were | S |
 | T5.11 | `stratum serve` with no key source answered only `run failed (rc=-22)`. It now finds `<volume>.key` or says what is missing | **Fixed** `5b1d083` |
 | T5.12 | The daemons outlived the manager, so a killed manager left the volume unlocked. They now stop when it does, however it ends: `4460db3`, `f440879`. **Fixed.** A `SIGKILL` of the manager still leaves its session directory behind | S |
 | T5.13 | Panels list in the backend's order, which on ext4 is hash order. Sort by name | S |

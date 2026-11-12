@@ -362,7 +362,7 @@ impl Drop for VolumeMapPoller {
         // No join — exiting on process shutdown via OS reclamation.
         // The thread will observe `stop` on its next tick (<= 1s) and
         // return cleanly. Process exit closes the /ctl/ socket fd via
-        // CtlClient::Drop. Matches the slate-tty redraw-thread pattern.
+        // CtlClient::Drop. Matches the redraw thread's pattern.
     }
 }
 

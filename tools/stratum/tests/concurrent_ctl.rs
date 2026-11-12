@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 // arbitrary paths. The TUI does this for snapshot dialogs too.
 //
 // We use 9P-direct via libstratum-9p through the FFI surface
-// (`stratum-slate-tty` does the same dance) — but that's its own
+// (the manager's renderer does the same dance) -- but that's its own
 // dependency. Easier: invoke `stratum fs -s SOCK cat PATH` and
 // measure wall time per call.
 
