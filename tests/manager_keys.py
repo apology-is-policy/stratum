@@ -588,10 +588,25 @@ def death_legs(stratum, vol, host, root):
                 term.kill()
 
 
+def proc_says(path):
+    """A file under /proc: read as root where this user is not let and sudo asks nothing.
+    A process that is not dumpable keeps its system call and its stack to root."""
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        pass
+    try:
+        got = subprocess.run(['sudo', '-n', 'cat', path], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return got.stdout if got.returncode == 0 else None
+
+
 def threads_waiting(pid):
-    """Where each thread of a process waits, as Linux says it: its name, its state, and
-    the system call it is in with that call's first three arguments. Nothing where /proc
-    does not say."""
+    """Where each thread of a process waits, as Linux says it: its name, its state, the
+    system call it is in with that call's first three arguments, and the kernel's first
+    frames under it. Nothing where /proc does not say."""
     said = []
     try:
         tids = sorted(os.listdir(f'/proc/{pid}/task'), key=int)
@@ -601,11 +616,14 @@ def threads_waiting(pid):
         about = []
         for name, take in (('comm', lambda t: t.strip()),
                            ('stat', lambda t: 'state ' + t.rsplit(')', 1)[1].split()[0]),
-                           ('syscall', lambda t: 'in call ' + ' '.join(t.split()[:4]))):
+                           ('syscall', lambda t: 'in call ' + ' '.join(t.split()[:4])),
+                           ('stack', lambda t: 'under ' + ' < '.join(
+                               line.split()[-1].split('+')[0] for line in t.splitlines()[:6] if line.split()))):
+            text = proc_says(f'/proc/{pid}/task/{tid}/{name}')
             try:
-                with open(f'/proc/{pid}/task/{tid}/{name}') as f:
-                    about.append(take(f.read()))
-            except (OSError, IndexError):
+                if text:
+                    about.append(take(text))
+            except IndexError:
                 pass
         if about:
             said.append(' '.join(about))

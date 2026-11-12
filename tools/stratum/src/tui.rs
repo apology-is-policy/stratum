@@ -407,15 +407,7 @@ fn exit_when_terminal_goes(ttys: Vec<i32>, session_dir: Option<PathBuf>) {
             thread::sleep(WATCH_TICK);
             // Every one of them: a read-only descriptor answers the write with EBADF, which
             // says nothing, so on macOS it could not see the terminal go.
-            let gone = ttys.iter().any(|&tty| {
-                let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
-                let no_attrs = unsafe { libc::tcgetattr(tty, &mut attrs) } != 0;
-                let nothing = 0u8;
-                let no_write = unsafe { libc::write(tty, (&nothing as *const u8).cast(), 0) } < 0
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO);
-                no_attrs || no_write
-            });
-            if gone {
+            if ttys.iter().any(|&tty| terminal_gone(tty)) {
                 if let Some(dir) = &session_dir {
                     let _ = std::fs::remove_dir_all(dir);
                 }
@@ -429,6 +421,21 @@ fn exit_when_terminal_goes(ttys: Vec<i32>, session_dir: Option<PathBuf>) {
         }
     });
     watch.expect("spawn the terminal watcher");
+}
+
+/// Whether the terminal behind `tty` has gone. Asked at every look, and of a terminal that
+/// may be holding the screen's write: an answer that waited there would keep the watcher
+/// from ever counting the manager as held.
+fn terminal_gone(tty: i32) -> bool {
+    let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
+    let no_attrs = unsafe { libc::tcgetattr(tty, &mut attrs) } != 0;
+    no_attrs || empty_write_fails(tty)
+}
+
+fn empty_write_fails(tty: i32) -> bool {
+    let nothing = 0u8;
+    let failed = unsafe { libc::write(tty, (&nothing as *const u8).cast(), 0) } < 0;
+    failed && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO)
 }
 
 /// The end of a manager its terminal holds, from the watcher's thread. The mode needs no
@@ -5608,6 +5615,47 @@ mod tests {
         STOOD_STILL.store(false, Ordering::Relaxed);
         assert!(stood, "the screen's thread went on after the terminal was given up");
         assert!(!WROTE.load(Ordering::Relaxed), "the screen wrote after the terminal was given up");
+    }
+
+    #[test]
+    fn the_watchers_look_does_not_wait_behind_a_write_the_terminal_holds() {
+        let (mut m, mut s) = (0, 0);
+        let rc = unsafe {
+            libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());
+        // Nobody reads the other end: the terminal fills, and the write waits in it.
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        static WRITTEN: AtomicU64 = AtomicU64::new(0);
+        thread::spawn(move || {
+            let block = [b'x'; 4096];
+            STARTED.store(true, Ordering::Relaxed);
+            loop {
+                let n = unsafe { libc::write(s, block.as_ptr().cast(), block.len()) };
+                if n <= 0 {
+                    break;
+                }
+                WRITTEN.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        });
+        let end = Instant::now() + Duration::from_secs(10);
+        let mut before = None;
+        loop {
+            thread::sleep(Duration::from_millis(300));
+            let now = (STARTED.load(Ordering::Relaxed), WRITTEN.load(Ordering::Relaxed));
+            if now.0 && before == Some(now) {
+                break;
+            }
+            before = Some(now);
+            assert!(Instant::now() < end, "the terminal went on taking what was written: it proves nothing");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(terminal_gone(s));
+        });
+        let answer = rx.recv_timeout(Duration::from_secs(5));
+        unsafe { libc::close(m) };
+        assert_eq!(answer, Ok(false), "the look at a terminal that holds a write did not answer, or said it had gone");
     }
 
     fn blank_snap() -> UiState {
