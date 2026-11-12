@@ -122,12 +122,14 @@ STM_TEST(fs_format_and_mount_use_the_keys_and_the_descriptor_given) {
     STM_ASSERT_OK(stm_fs_mount(moved, &mopts, &fs));
     STM_ASSERT_OK(stm_fs_unmount(fs));
 
-    /* Keys already loaded are a key file's, not a janus daemon's. */
+    /* Keys already loaded are a key file's, not a janus daemon's: refused as the options
+     * are read, before the pool is looked for. The pool is gone here, so a refusal that
+     * came any later would be the missing pool's. */
+    unlink(moved);
     mopts.keyfile_path = NULL;
     mopts.janus_socket = "/tmp/stm_v2_fs_no_such_janus.sock";
     STM_ASSERT_ERR(stm_fs_mount(moved, &mopts, &fs), STM_EINVAL);
     stm_hybrid_keys_wipe(&keys);
-    unlink(moved);
 }
 
 STM_TEST(fs_mount_without_format_fails) {

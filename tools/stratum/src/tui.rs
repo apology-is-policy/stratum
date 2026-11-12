@@ -5724,14 +5724,22 @@ mod tests {
     fn a_terminal_that_takes_nothing_is_waited_for_until_the_screen_is_to_be_left() {
         use io::Write as _;
         static TO_BE_LEFT: AtomicBool = AtomicBool::new(false);
+        static SAID: AtomicU64 = AtomicU64::new(0);
         static HELD: AtomicBool = AtomicBool::new(false);
         let limit = Duration::from_millis(300);
+        let tick = Duration::from_millis(10);
         let (m, s) = pty_that_does_not_wait();
         let mut out = OwnOutput {
             fd: s,
-            tick: Duration::from_millis(10),
+            tick,
             held_after: limit,
-            to_be_left: || TO_BE_LEFT.load(Ordering::Relaxed),
+            to_be_left: || {
+                let asked = TO_BE_LEFT.load(Ordering::Relaxed);
+                if asked {
+                    SAID.fetch_add(1, Ordering::Relaxed);
+                }
+                asked
+            },
             held: &HELD,
             refused: 0,
             paused: 0,
@@ -5753,6 +5761,12 @@ mod tests {
         assert_eq!(ended, Ok(Err(io::ErrorKind::TimedOut)));
         assert!(took >= limit - Duration::from_millis(50), "given up {took:?} after the asking: the wait before it was counted");
         assert!(HELD.load(Ordering::Relaxed));
+        // And a limit after it, no later. A terminal that says nothing of room makes each
+        // wait a whole tick to the count, however long the machine took over it, so the
+        // waits from the asking on are a number that does not move with the load.
+        let said = SAID.load(Ordering::Relaxed);
+        let most = (limit.as_millis() / tick.as_millis()) as u64 + 2;
+        assert!(said <= most, "given up after {said} waits from the asking, where the limit holds {most}: they were counted short");
         let mut out = writer.join().unwrap();
         assert!(out.refused > 0, "the terminal took all of it: it proves nothing");
         // Given up, nothing more is written to it and nothing waits for it.
@@ -5769,7 +5783,12 @@ mod tests {
     /// to the reader's side a moment later and leaves room behind it, so the pty is full
     /// only once it has refused for a while.
     fn fill(s: RawFd) -> usize {
-        let block = [b'x'; 1024];
+        fill_by(s, 1024)
+    }
+
+    /// The same, `each` bytes to a write.
+    fn fill_by(s: RawFd, each: usize) -> usize {
+        let block = vec![b'x'; each];
         let (mut held, mut refused_in_a_row) = (0usize, 0);
         while refused_in_a_row < 10 {
             let n = unsafe { libc::write(s, block.as_ptr().cast(), block.len()) };
@@ -5886,11 +5905,14 @@ mod tests {
     /// pty gives room back in steps. A terminal that takes fewer bytes than one step in the
     /// limit is not told from one that takes none, and the plan says so with what
     /// `manager_keys.py` measures; this holds the step under a bound on whatever system
-    /// runs it.
+    /// runs it. The writes are of the size the screen makes, a frame at a time: a pty may
+    /// give room back to a large write in larger steps than to a small one.
     #[test]
     fn a_full_pty_gives_room_back_before_its_reader_has_taken_eight_thousand_bytes() {
+        const FRAME: usize = 1 << 15;
+        let frame = vec![b'x'; FRAME];
         let (m, s) = pty_that_does_not_wait();
-        let held = fill(s);
+        let held = fill_by(s, FRAME);
         assert!(held > 0, "the pty took nothing at all");
         let mut some = [0u8; 256];
         let (mut since_room, mut longest, mut steps) = (0usize, 0usize, 0);
@@ -5907,7 +5929,7 @@ mod tests {
             // What was read leaves room a moment later, where it leaves any.
             thread::sleep(Duration::from_millis(2));
             let mut room = false;
-            while unsafe { libc::write(s, some.as_ptr().cast(), some.len()) } > 0 {
+            while unsafe { libc::write(s, frame.as_ptr().cast(), frame.len()) } > 0 {
                 room = true;
             }
             if room {
