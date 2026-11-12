@@ -31,8 +31,23 @@ stm_bdev_open_opts stm_bdev_open_opts_default(void)
         .queue_depth        = 0,
         .fixed_buffer_bytes = 0,
         .posix_threads      = 0,
+        .claimed_fd         = NULL,
     };
 }
+
+#if !defined(__thylacine__)
+int stm_bdev_dup_claimed(int fd, bool read_only)
+{
+    int fl = fcntl(fd, F_GETFL);
+    if (fl < 0) return -1;
+    /* A claim is opened for reading alone where the file refuses writing. */
+    if (!read_only && (fl & O_ACCMODE) == O_RDONLY) {
+        errno = EACCES;
+        return -1;
+    }
+    return fcntl(fd, F_DUPFD_CLOEXEC, 0);
+}
+#endif
 
 stm_status stm_bdev_open(const char *path,
                          const stm_bdev_open_opts *opts,
@@ -41,6 +56,8 @@ stm_status stm_bdev_open(const char *path,
     if (!path || !out_dev) return STM_EINVAL;
 
     stm_bdev_open_opts local = opts ? *opts : stm_bdev_open_opts_default();
+    if (local.claimed_fd && *local.claimed_fd < 0) local.claimed_fd = NULL;
+    if (local.claimed_fd && local.direct) return STM_EINVAL;
 
     if (local.backend == STM_BDEV_BACKEND_AUTO) {
 #if defined(__thylacine__)
@@ -68,6 +85,8 @@ stm_status stm_bdev_open(const char *path,
 #endif
 #if defined(__thylacine__)
     case STM_BDEV_BACKEND_THYLACINE:
+        /* Its device is no file, and nothing claims it. */
+        if (local.claimed_fd) return STM_ENOTSUPPORTED;
         return stm_bdev_open_thylacine(path, &local, out_dev);
 #endif
     default:

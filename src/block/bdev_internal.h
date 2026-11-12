@@ -58,6 +58,12 @@ struct stm_bdev {
     atomic_uint_fast64_t       io_fsyncs;
 };
 
+#if !defined(__thylacine__)
+/* A descriptor of the backend's own on the file `fd` has open, or -1 with errno set:
+ * EACCES where the device is to be written and `fd` was opened for reading alone. */
+int stm_bdev_dup_claimed(int fd, bool read_only);
+#endif
+
 /* Backend constructors. */
 stm_status stm_bdev_open_posix  (const char *path, const stm_bdev_open_opts *opts,
                                  stm_bdev **out);

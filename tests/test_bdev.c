@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static char g_tmp_path[256];
@@ -325,6 +326,80 @@ STM_TEST(bdev_iouring_a_full_table_does_not_reach_a_sync_caller) {
     while (atomic_load(&done) < DEPTH) {
         STM_ASSERT(stm_bdev_wait_completion(d, DEPTH) >= 0);
     }
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* A device opened through a descriptor the caller claimed is the file that descriptor
+ * has open: another file put at the name since is neither written nor made longer, and
+ * the caller's descriptor is still its own, with its claim. */
+STM_TEST(bdev_claimed_descriptor_is_the_device_wherever_the_name_leads) {
+    make_tmp("claimed");
+    char moved[300];
+    snprintf(moved, sizeof moved, "%s.moved", g_tmp_path);
+    unlink(moved);
+    int claim = -1;
+    STM_ASSERT_OK(stm_bdev_claim_image(g_tmp_path, true, &claim));
+    STM_ASSERT(claim >= 0);
+    STM_ASSERT_EQ(rename(g_tmp_path, moved), 0);
+    int fd = open(g_tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    STM_ASSERT(fd >= 0);
+    close(fd);
+
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    opts.claimed_fd = &claim;
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+    STM_ASSERT_OK(stm_bdev_resize(d, 1024 * 1024));
+    uint8_t w[4096], r[4096];
+    memset(w, 0xA5, sizeof w);
+    STM_ASSERT_OK(stm_bdev_write(d, 0, w, sizeof w));
+    STM_ASSERT_OK(stm_bdev_fsync(d));
+    stm_bdev_close(d);
+
+    struct stat at_name, was_claimed;
+    STM_ASSERT_EQ(stat(g_tmp_path, &at_name), 0);
+    STM_ASSERT_EQ(stat(moved, &was_claimed), 0);
+    STM_ASSERT_EQ((uint64_t)at_name.st_size, (uint64_t)0);
+    STM_ASSERT_EQ((uint64_t)was_claimed.st_size, (uint64_t)(1024 * 1024));
+    STM_ASSERT_EQ(pread(claim, r, sizeof r, 0), (ssize_t)sizeof r);
+    STM_ASSERT_MEM_EQ(w, r, sizeof w);
+    int second = -1;
+    STM_ASSERT_ERR(stm_bdev_claim_image(moved, false, &second), STM_EBUSY);
+    close(claim);
+    unlink(g_tmp_path);
+    unlink(moved);
+}
+
+/* What a claimed descriptor cannot carry: a device to be written, where it was opened
+ * for reading alone; direct I/O, the open being the caller's. A negative one stands for
+ * none, and the name is opened. */
+STM_TEST(bdev_claimed_descriptor_refusals) {
+    make_tmp("claimed_ro");
+    int fd = open(g_tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    STM_ASSERT(fd >= 0);
+    close(fd);
+    int ro = open(g_tmp_path, O_RDONLY);
+    STM_ASSERT(ro >= 0);
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    opts.claimed_fd = &ro;
+    stm_bdev *d = NULL;
+    STM_ASSERT_ERR(stm_bdev_open(g_tmp_path, &opts, &d), STM_EACCES);
+    opts.read_only = true;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+    stm_bdev_close(d);
+    opts.direct = true;
+    STM_ASSERT_ERR(stm_bdev_open(g_tmp_path, &opts, &d), STM_EINVAL);
+    close(ro);
+
+    int none = -1;
+    opts = stm_bdev_open_opts_default();
+    opts.claimed_fd = &none;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+    uint8_t w[4096];
+    memset(w, 0x5A, sizeof w);
+    STM_ASSERT_OK(stm_bdev_resize(d, 1024 * 1024));
+    STM_ASSERT_OK(stm_bdev_write(d, 0, w, sizeof w));
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

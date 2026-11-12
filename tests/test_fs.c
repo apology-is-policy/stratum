@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 
 #include <stratum/alloc.h>
+#include <stratum/block.h>
 #include <stratum/block_inject.h>
 #include <stratum/bootstrap.h>
 #include <stratum/btree_engine_testing.h>
@@ -79,6 +80,54 @@ STM_TEST(fs_format_mount_unmount_roundtrip) {
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
+}
+
+/* A format and a mount given the key-pair and the pool's descriptor use those: the key
+ * at the key's name is not read, and nothing is made or written at the pool's. */
+STM_TEST(fs_format_and_mount_use_the_keys_and_the_descriptor_given) {
+    make_tmp("given");
+    stm_hybrid_keys keys = {0};
+    STM_ASSERT_OK(stm_keyfile_load(g_key_path, &keys));
+    /* Another key takes the key's name, and the pool's file is moved from its own. */
+    STM_ASSERT_OK(stm_keyfile_generate(g_key_path));
+    char moved[300];
+    snprintf(moved, sizeof moved, "%s.moved", g_tmp_path);
+    unlink(moved);
+    int claim = -1;
+    STM_ASSERT_OK(stm_bdev_claim_image(g_tmp_path, true, &claim));
+    STM_ASSERT(claim >= 0);
+    STM_ASSERT_EQ(rename(g_tmp_path, moved), 0);
+
+    stm_fs_format_opts fopts = default_format_opts();
+    fopts.wrap_keys = &keys;
+    fopts.claimed_fd = &claim;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    struct stat st;
+    STM_ASSERT(stat(g_tmp_path, &st) != 0);
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    mopts.wrap_keys = &keys;
+    mopts.claimed_fd = &claim;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    STM_ASSERT(stat(g_tmp_path, &st) != 0);
+    close(claim);
+
+    /* By names alone, where the pool is now: the key at the key's name is not its key. */
+    mopts = rw_mount_opts();
+    fs = NULL;
+    STM_ASSERT(stm_fs_mount(moved, &mopts, &fs) != STM_OK);
+    mopts.wrap_keys = &keys;
+    STM_ASSERT_OK(stm_fs_mount(moved, &mopts, &fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Keys already loaded are a key file's, not a janus daemon's. */
+    mopts.keyfile_path = NULL;
+    mopts.janus_socket = "/tmp/stm_v2_fs_no_such_janus.sock";
+    STM_ASSERT_ERR(stm_fs_mount(moved, &mopts, &fs), STM_EINVAL);
+    stm_hybrid_keys_wipe(&keys);
+    unlink(moved);
 }
 
 STM_TEST(fs_mount_without_format_fails) {

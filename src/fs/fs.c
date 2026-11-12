@@ -1201,15 +1201,20 @@ stm_status stm_fs_format(const char *path, stm_fs_format_opts *opts)
      * we touch the pool device. SWISS-4m: passphrase-aware variant
      * if caller supplied one (KFP1 keyfile). */
     stm_hybrid_keys wk;
-    stm_status ks = (opts->keyfile_passphrase && opts->keyfile_passphrase_len > 0)
-        ? stm_keyfile_load_passphrase(opts->keyfile_path,
-                                          opts->keyfile_passphrase,
-                                          opts->keyfile_passphrase_len,
-                                          &wk)
-        : stm_keyfile_load(opts->keyfile_path, &wk);
-    if (ks != STM_OK) return ks;
+    if (opts->wrap_keys) {
+        wk = *opts->wrap_keys;
+    } else {
+        stm_status ks = (opts->keyfile_passphrase && opts->keyfile_passphrase_len > 0)
+            ? stm_keyfile_load_passphrase(opts->keyfile_path,
+                                              opts->keyfile_passphrase,
+                                              opts->keyfile_passphrase_len,
+                                              &wk)
+            : stm_keyfile_load(opts->keyfile_path, &wk);
+        if (ks != STM_OK) return ks;
+    }
 
     stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
+    bopts.claimed_fd = opts->claimed_fd;
     stm_bdev *d = NULL;
     stm_status s = stm_bdev_open(path, &bopts, &d);
     if (s != STM_OK) { stm_hybrid_keys_wipe(&wk); return s; }
@@ -1495,11 +1500,15 @@ stm_status stm_fs_mount(const char *path,
     int have_kf = opts->keyfile_path != NULL;
     int have_jn = opts->janus_socket != NULL;
     if (have_kf == have_jn) return STM_EINVAL;
+    /* Keys already loaded are a key file's. */
+    if (opts->wrap_keys && !have_kf) return STM_EINVAL;
 
     stm_hybrid_keys   wk = {0};
     stm_janus_client *janus = NULL;
 
-    if (have_kf) {
+    if (opts->wrap_keys) {
+        wk = *opts->wrap_keys;
+    } else if (have_kf) {
         /* SWISS-4m: if caller supplied a passphrase, the keyfile is
          * KFP1-encrypted. Otherwise legacy plaintext path. */
         stm_status ks = (opts->keyfile_passphrase && opts->keyfile_passphrase_len > 0)
@@ -1516,6 +1525,7 @@ stm_status stm_fs_mount(const char *path,
 
     stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
     bopts.read_only = opts->read_only;
+    bopts.claimed_fd = opts->claimed_fd;
     stm_bdev *d = NULL;
     stm_status s = stm_bdev_open(path, &bopts, &d);
     if (s != STM_OK) {

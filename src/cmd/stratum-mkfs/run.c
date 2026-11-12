@@ -50,6 +50,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <sys/param.h>
+#endif
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
@@ -282,6 +285,21 @@ static const char *key_destination(const char *path, char *buf, size_t n, bool f
                                    struct key_walk *walk);
 static bool link_is_trusted(const struct stat *st);
 
+/* What a name is the name of, for what is said of the links at it. */
+struct named {
+    const char *what;   /* before the path */
+    const char *goes;   /* what another user's link would decide */
+    const char *itself; /* what to name in place of a link */
+    const char *loss;   /* what whoever can change the directory it leads to could do */
+};
+static const struct named NAMED_KEY = {
+    "keyfile", "the key", "the key file itself", "could remove the key, and the volume with it",
+};
+static const struct named NAMED_IMAGE = {
+    "image", "the volume", "the image itself",
+    "could remove the volume, or put an older copy of it back",
+};
+
 /* A key used as it is decides who can open the volume: one another user owns, or that
  * its mode lets others read or write, is theirs as much as the user's. The corvus token
  * is held to the same. NULL when the key is the user's alone, or is a file the user said
@@ -301,43 +319,45 @@ static const char *key_not_the_users(const struct stat *st, bool as_is)
     return NULL;
 }
 
-/* Why the links at the key's name were not followed. */
-static void say_links_refused(const char *keyfile_path, const struct key_walk *walk)
+/* Why the links at a name were not followed. */
+static void say_links_refused(const struct named *n, const char *path,
+                              const struct key_walk *walk)
 {
     switch (walk->why) {
     case KEY_LINKS_ANOTHERS:
         fprintf(stderr,
-            "stratum-mkfs: keyfile %s is reached through a symlink another user owns, who "
-            "would decide where the key goes; pass --force to follow it\n", keyfile_path);
+            "stratum-mkfs: %s %s is reached through a symlink another user owns, who "
+            "would decide where %s goes; pass --force to follow it\n",
+            n->what, path, n->goes);
         break;
     case KEY_LINKS_MANY_NAMES:
         fprintf(stderr,
-            "stratum-mkfs: keyfile %s is reached through a symlink that has another name "
-            "besides this one, and any user may have given it either: name the key file "
-            "itself, or make the link again\n", keyfile_path);
+            "stratum-mkfs: %s %s is reached through a symlink that has another name "
+            "besides this one, and any user may have given it either: name %s, or make "
+            "the link again\n", n->what, path, n->itself);
         break;
     case KEY_LINKS_UNREAD:
         fprintf(stderr,
-            "stratum-mkfs: keyfile %s is reached through a link that cannot be read (%s), "
-            "so where it leads cannot be asked about: see why, or name the key file itself\n",
-            keyfile_path, strerror(walk->err));
+            "stratum-mkfs: %s %s is reached through a link that cannot be read (%s), "
+            "so where it leads cannot be asked about: see why, or name %s\n",
+            n->what, path, strerror(walk->err), n->itself);
         break;
     case KEY_LINKS_CHANGED:
         fprintf(stderr,
-            "stratum-mkfs: a link on the way to keyfile %s changed while it was being read, "
+            "stratum-mkfs: a link on the way to %s %s changed while it was being read, "
             "so nothing was asked of what is there now: see who changed it before running "
-            "again\n", keyfile_path);
+            "again\n", n->what, path);
         break;
     default:
         fprintf(stderr,
-            "stratum-mkfs: keyfile %s is reached through more than seven links or a loop of "
-            "them, or names a path too long: name the key file itself\n", keyfile_path);
+            "stratum-mkfs: %s %s is reached through more than seven links or a loop of "
+            "them, or names a path too long: name %s\n", n->what, path, n->itself);
         break;
     }
 }
 
 /* Where the name reaches something the links read from it do not end in. */
-static void say_name_leads_elsewhere(const char *keyfile_path)
+static void say_name_leads_elsewhere(const struct named *n, const char *path)
 {
     /* Chosen out here: fprintf can be a macro, and a directive among a macro's arguments
      * is undefined. */
@@ -347,10 +367,10 @@ static void say_name_leads_elsewhere(const char *keyfile_path)
     const char *whose = "a descriptor's, whose text names no file (a pipe's, an unlinked file's)";
 #endif
     fprintf(stderr,
-        "stratum-mkfs: keyfile %s does not lead where its links were read to end: a link "
+        "stratum-mkfs: %s %s does not lead where its links were read to end: a link "
         "or a file was left or changed on its way while it was looked at, or one of its "
-        "links is %s: name the key file itself, or see what was left, before running "
-        "again\n", keyfile_path, whose);
+        "links is %s: name %s, or see what was left, before running "
+        "again\n", n->what, path, whose, n->itself);
 }
 
 /* The directory part of a path, "." where it has none. False when it does not fit. */
@@ -366,7 +386,7 @@ static bool dir_part(const char *path, char *dir, size_t n)
 
 /* A directory to make a key in. One the user may write and search but not read still
  * takes a key, so where it cannot be opened for reading it is opened for the search
- * alone; it cannot be synced then, which is said. */
+ * alone. Linux does not sync a directory opened so, which is said; macOS does. */
 static int open_key_dir(const char *dir)
 {
     int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -398,19 +418,21 @@ static const char *led_to_dir_refused(const struct stat *dd, const char *keyfile
     return NULL;
 }
 
-static void say_dir_refused(const char *keyfile_path, const char *dir, const char *why,
-                            bool since_the_claim)
+static void say_dir_refused(const struct named *n, const char *path, const char *dir,
+                            const char *why, bool since_the_claim)
 {
     fprintf(stderr,
-        "stratum-mkfs: %skeyfile %s is led by its links to the directory %s, which %s: "
-        "whoever can change that directory could remove the key, and the volume with it; "
-        "name the key file itself, or pass --force to follow the links\n",
-        since_the_claim ? "since the volume was claimed, " : "", keyfile_path, dir, why);
+        "stratum-mkfs: %s%s %s is led by its links to the directory %s, which %s: "
+        "whoever can change that directory %s; "
+        "name %s, or pass --force to follow the links\n",
+        since_the_claim ? "since the volume was claimed, " : "", n->what, path, dir, why,
+        n->loss, n->itself);
 }
 
 /* At the claim, by its path. Where a new key is made the directory is asked about
  * again, through the descriptor the key is made in. */
-static bool key_dir_in_the_way(const char *keyfile_path, const char *leads_to, bool reached)
+static bool led_to_dir_in_the_way(const struct named *n, const char *path,
+                                  const char *leads_to, bool reached)
 {
     char dir[4096];
     struct stat dd;
@@ -418,12 +440,12 @@ static bool key_dir_in_the_way(const char *keyfile_path, const char *leads_to, b
     if (stat(dir, &dd) != 0 || !S_ISDIR(dd.st_mode)) {
         /* No directory yet for a key that is not there either. */
         if (!reached) return false;
-        say_name_leads_elsewhere(keyfile_path);
+        say_name_leads_elsewhere(n, path);
         return true;
     }
-    const char *why = led_to_dir_refused(&dd, keyfile_path);
+    const char *why = led_to_dir_refused(&dd, path);
     if (!why) return false;
-    say_dir_refused(keyfile_path, dir, why, false);
+    say_dir_refused(n, path, dir, why, false);
     return true;
 }
 
@@ -434,7 +456,7 @@ static bool key_dir_in_the_way(const char *keyfile_path, const char *leads_to, b
  * format, and --force does not reach past a daemon already on it.
  */
 static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool force,
-                           bool key_as_is, bool *key_there)
+                           bool key_as_is, bool *key_there, struct stat *key_seen)
 {
     struct stat st;
     char dest[4096];
@@ -443,7 +465,7 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
     const char *leads_to = key_destination(keyfile_path, dest, sizeof dest, force, &walk);
     /* Past where that gives up, the stat below would follow links nobody asked about. */
     if (!leads_to && !force) {
-        say_links_refused(keyfile_path, &walk);
+        say_links_refused(&NAMED_KEY, keyfile_path, &walk);
         return true;
     }
     if (force) return false;
@@ -457,15 +479,17 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
     bool reached = stat(keyfile_path, &st) == 0;
     if (reached != walk.there
             || (reached && (st.st_dev != walk.st.st_dev || st.st_ino != walk.st.st_ino))) {
-        say_name_leads_elsewhere(keyfile_path);
+        say_name_leads_elsewhere(&NAMED_KEY, keyfile_path);
         return true;
     }
-    if (walk.links > 0 && key_dir_in_the_way(keyfile_path, leads_to, reached)) return true;
+    if (walk.links > 0 && led_to_dir_in_the_way(&NAMED_KEY, keyfile_path, leads_to, reached))
+        return true;
     if (!reached) return false;
     if (!replaces_key) {
         const char *why = key_not_the_users(&st, key_as_is);
         if (!why) {
             *key_there = true;
+            *key_seen = st;
             return false;
         }
         fprintf(stderr, "stratum-mkfs: keyfile %s %s\n", keyfile_path, why);
@@ -477,16 +501,43 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
     return true;
 }
 
+/* The claim's open followed whatever links are at the image's name. They are asked
+ * about as a key's are, and the file the claim has open has to be the one they were
+ * read to end in: a link left or changed between the open and the reading is one that
+ * nothing was asked of. */
+static bool image_links_in_the_way(const char *image_path, int claimed)
+{
+    char dest[4096];
+    struct key_walk walk;
+    struct stat st;
+    const char *leads_to = key_destination(image_path, dest, sizeof dest, false, &walk);
+    if (!leads_to) {
+        say_links_refused(&NAMED_IMAGE, image_path, &walk);
+        return true;
+    }
+    if (fstat(claimed, &st) != 0 || !walk.there
+            || st.st_dev != walk.st.st_dev || st.st_ino != walk.st.st_ino) {
+        say_name_leads_elsewhere(&NAMED_IMAGE, image_path);
+        return true;
+    }
+    return walk.links > 0 && led_to_dir_in_the_way(&NAMED_IMAGE, image_path, leads_to, true);
+}
+
+/* 0 with the volume claimed: *claim_fd is the descriptor the claim holds on it, which
+ * the format and the mount go through, or -1 where there is none. */
 static int mkfs_claim(const char *image_path, const char *keyfile_path,
                       bool replaces_key, bool force, bool key_as_is,
-                      uint64_t device_bytes, bool *created, bool *key_there)
+                      uint64_t device_bytes, bool *created, int *claim_fd,
+                      bool *key_there, struct stat *key_seen)
 {
     int fd = -1;
     *created = false;
+    *claim_fd = -1;
     stm_status s = stm_bdev_claim_image(image_path, false, &fd);
     if (s == STM_ENOENT) {
         /* Asked now, so that a refusal leaves no empty image behind. */
-        if (key_in_the_way(keyfile_path, replaces_key, force, key_as_is, key_there)) return 1;
+        if (key_in_the_way(keyfile_path, replaces_key, force, key_as_is, key_there, key_seen))
+            return 1;
         s = stm_bdev_claim_image(image_path, true, &fd);
         *created = s == STM_OK || s == STM_ENOLCK;
     }
@@ -505,8 +556,13 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
         return 1;
     }
 
+    *claim_fd = fd;
+    /* A name this run made was free, and takes no link. */
+    if (fd >= 0 && !*created && !force && image_links_in_the_way(image_path, fd)) return 1;
+
     /* Asked before the look as well, which reads all of an empty disk. */
-    if (!*created && key_in_the_way(keyfile_path, replaces_key, force, key_as_is, key_there))
+    if (!*created
+            && key_in_the_way(keyfile_path, replaces_key, force, key_as_is, key_there, key_seen))
         return 1;
 
     /* Where the platform has no lock there is no descriptor to look through. */
@@ -564,7 +620,54 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
             return 1;
         }
     }
-    return key_in_the_way(keyfile_path, replaces_key, force, key_as_is, key_there) ? 1 : 0;
+    return key_in_the_way(keyfile_path, replaces_key, force, key_as_is, key_there, key_seen)
+        ? 1 : 0;
+}
+
+/* A key file to load. Opened without waiting: a FIFO left at the name is no key, and
+ * must not hold the run until somebody writes to it. */
+static int open_key_to_read(const char *path)
+{
+#if defined(__thylacine__)
+    return open(path, O_RDONLY | O_CLOEXEC);
+#else
+    return open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+#endif
+}
+
+/* Where the directory `dfd` has open is now, for telling where a key made in it is:
+ * the path it was opened by may lead elsewhere by then. False where the system does
+ * not say. */
+static bool dir_path_now(int dfd, char *buf, size_t n)
+{
+#if defined(__APPLE__)
+    char now[MAXPATHLEN];
+    if (fcntl(dfd, F_GETPATH, now) != 0) return false;
+    return snprintf(buf, n, "%s", now) < (int)n;
+#elif defined(__linux__)
+    char link[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", dfd);
+    ssize_t len = readlink(link, buf, n - 1);
+    if (len <= 0 || buf[0] != '/') return false;
+    buf[len] = '\0';
+    return true;
+#else
+    (void)dfd; (void)buf; (void)n;
+    return false;
+#endif
+}
+
+/* Where the key that `name` names in the directory `dfd` is, in words: by the
+ * directory's path as it is now where the system says it, else by the path it was
+ * asked about under. */
+static void key_place(int dfd, const char *name, const char *asked_dir, char *buf, size_t n)
+{
+    char now[4096];
+    if (dir_path_now(dfd, now, sizeof now))
+        snprintf(buf, n, "%s/%s", now, name);
+    else
+        snprintf(buf, n, "%s in the directory that %s named when the key was made, "
+                         "wherever that directory is now", name, asked_dir);
 }
 
 /* Without --force the name is taken only if it is still free: a plain rename would
@@ -840,15 +943,22 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     char new_key_name[4096] = "";
     char key_target_buf[4096] = "";
     const char *key_base = "";
+    char key_dir[4096] = "";
     int  key_dir_fd = -1;
     const char *key_target = keyfile_path;
-    const char *format_key = keyfile_path;
     bool key_is_new = false;
     bool temp_key_made = false;
     bool key_was_there = false;
+    struct stat key_seen;
     int  new_key_fd = -1;
+    int  old_key_fd = -1;
+    int  claim_fd = -1;
+    /* The key the volume is wrapped under, read through the descriptor it was asked
+     * about or made through, and never by its name. */
+    stm_hybrid_keys wrap;
+    memset(&key_seen, 0, sizeof key_seen);
     if (mkfs_claim(image_path, keyfile_path, have_pass, force, key_as_is, device_bytes,
-                   &created, &key_was_there) != 0) {
+                   &created, &claim_fd, &key_was_there, &key_seen) != 0) {
         exit_code = 1;
         goto cleanup;
     }
@@ -858,14 +968,16 @@ int stm_cmd_mkfs_main(int argc, char **argv)
      * mkfs_claim having refused one that exists unless forced. */
     key_is_new = have_pass;
     struct stat st;
-    if (!have_pass && stat(keyfile_path, &st) != 0) {
-        if (errno != ENOENT) {
-            fprintf(stderr, "stratum-mkfs: cannot stat keyfile %s: %s\n",
-                    keyfile_path, strerror(errno));
-            exit_code = 1;
-            goto cleanup;
-        }
+    /* A key that is there is opened once, here: what is asked of it is asked of the
+     * file this descriptor has open, and that file is the one the key is read from. */
+    if (!have_pass) old_key_fd = open_key_to_read(keyfile_path);
+    if (!have_pass && old_key_fd < 0 && errno == ENOENT) {
         key_is_new = true;
+    } else if (!have_pass && (old_key_fd < 0 || fstat(old_key_fd, &st) != 0)) {
+        fprintf(stderr, "stratum-mkfs: cannot open keyfile %s: %s\n",
+                keyfile_path, strerror(errno));
+        exit_code = 1;
+        goto cleanup;
     } else if (!have_pass && !force && !key_was_there) {
         /* What is asked of a key, and of the links to it, was asked at the claim, of
          * what was there then: a link left at a free name since would be followed
@@ -882,6 +994,15 @@ int stm_cmd_mkfs_main(int argc, char **argv)
                 keyfile_path, key_not_the_users(&st, key_as_is));
         exit_code = 1;
         goto cleanup;
+    } else if (!have_pass && !force
+               && (st.st_dev != key_seen.st_dev || st.st_ino != key_seen.st_ino)) {
+        /* A key of the user's own, and not the one the claim asked about. */
+        fprintf(stderr,
+            "stratum-mkfs: since the volume was claimed, keyfile %s leads to another file "
+            "than the one that was asked about: see what is there, and who changed it, "
+            "before running again\n", keyfile_path);
+        exit_code = 1;
+        goto cleanup;
     }
     if (key_is_new) {
         struct key_walk walk;
@@ -889,12 +1010,11 @@ int stm_cmd_mkfs_main(int argc, char **argv)
                                      &walk);
         if (!key_target) {
             /* A link left there since the claim: nothing there was asked about then. */
-            say_links_refused(keyfile_path, &walk);
+            say_links_refused(&NAMED_KEY, keyfile_path, &walk);
             key_is_new = false;
             exit_code = 1;
             goto cleanup;
         }
-        char key_dir[4096];
         key_base = strrchr(key_target, '/');
         key_base = key_base ? key_base + 1 : key_target;
         int n = snprintf(new_key_path, sizeof new_key_path, "%s.new.%ld",
@@ -924,7 +1044,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             const char *why = fstat(key_dir_fd, &dd) != 0 ? "cannot be looked at"
                                                           : led_to_dir_refused(&dd, keyfile_path);
             if (why) {
-                say_dir_refused(keyfile_path, key_dir, why, true);
+                say_dir_refused(&NAMED_KEY, keyfile_path, key_dir, why, true);
                 key_is_new = false;
                 exit_code = 1;
                 goto cleanup;
@@ -933,7 +1053,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         /* Made here, O_EXCL, so a file already at that name (a killed run's only key,
          * perhaps) is neither truncated nor removed: cleanup removes what this run made. */
         int tfd = openat(key_dir_fd, new_key_name,
-                         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+                         O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (tfd < 0) {
             fprintf(stderr, "stratum-mkfs: cannot make %s: %s\n", new_key_path, strerror(errno));
             key_is_new = false;
@@ -956,10 +1076,27 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             exit_code = 2;
             goto cleanup;
         }
-        format_key = new_key_path;
+        /* Read back through the descriptor that made it: the volume is wrapped under
+         * the key this run made, whatever is at that key's path by now. */
+        ks = have_pass ? stm_keyfile_load_passphrase_fd(tfd, passbuf, plen, &wrap)
+                       : stm_keyfile_load_fd(tfd, &wrap);
+        if (ks != STM_OK) {
+            fprintf(stderr, "stratum-mkfs: cannot read the new key back at %s: status=%d\n",
+                    new_key_path, (int)ks);
+            exit_code = 2;
+            goto cleanup;
+        }
     } else {
         fprintf(stderr, "using existing keyfile: %s\n", keyfile_path);
+        stm_status ks = stm_keyfile_load_fd(old_key_fd, &wrap);
+        if (ks != STM_OK) {
+            fprintf(stderr, "stratum-mkfs: keyfile %s could not be loaded as a key: "
+                            "status=%d\n", keyfile_path, (int)ks);
+            exit_code = 2;
+            goto cleanup;
+        }
     }
+    const char *key_name = key_is_new ? new_key_path : keyfile_path;
 
     /* Derive distinct UUIDs for pool + device with different salts. */
     uint64_t pool_uuid[2], device_uuid[2];
@@ -980,9 +1117,9 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         .bootstrap_size_bytes     = bootstrap_bytes,
         .pool_uuid                = { pool_uuid[0],   pool_uuid[1]   },
         .device_uuid              = { device_uuid[0], device_uuid[1] },
-        .keyfile_path             = format_key,
-        .keyfile_passphrase       = have_pass ? passbuf : NULL,
-        .keyfile_passphrase_len   = have_pass ? plen    : 0,
+        .keyfile_path             = key_name,
+        .wrap_keys                = &wrap,
+        .claimed_fd               = &claim_fd,
     };
 
     /* Phase 1: format. */
@@ -998,9 +1135,9 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     /* Phase 2: mount, init dataset root id=1, unmount. */
     stm_fs_mount_opts mopts = {
         .read_only                = false,
-        .keyfile_path             = format_key,
-        .keyfile_passphrase       = have_pass ? passbuf : NULL,
-        .keyfile_passphrase_len   = have_pass ? plen    : 0,
+        .keyfile_path             = key_name,
+        .wrap_keys                = &wrap,
+        .claimed_fd               = &claim_fd,
     };
     stm_fs *fs = NULL;
     rc = stm_fs_mount(image_path, &mopts, &fs);
@@ -1035,24 +1172,50 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         goto cleanup;
     }
 
+    /* The volume is in the file the claim had open, and every later command is given
+     * the name. Asked before the key takes its name, so that a run that fails here has
+     * replaced nothing. */
+    if (claim_fd >= 0) {
+        struct stat claimed, named;
+        bool leads = fstat(claim_fd, &claimed) == 0 && stat(image_path, &named) == 0
+            && named.st_dev == claimed.st_dev && named.st_ino == claimed.st_ino;
+        if (!leads) {
+            fprintf(stderr,
+                "stratum-mkfs: %s does not lead to the file it led to when the volume was "
+                "claimed: that file was formatted, and nothing was written to what the name "
+                "reaches now. See what is at the name, and who changed it, before running "
+                "again; a key this run made is removed\n", image_path);
+            exit_code = 2;
+            goto cleanup;
+        }
+    }
+
     if (key_is_new) {
         /* From here the only key to this volume is the new file: it is never removed. */
         key_is_new = false;
         temp_key_made = false;
         created = false;
+        char place[8400];
         if (take_key_name(key_dir_fd, new_key_name, key_base, force) != 0) {
+            int e = errno;
+            key_place(key_dir_fd, new_key_name, key_dir, place, sizeof place);
             fprintf(stderr,
                 "stratum-mkfs: %s is formatted, but its key could not take the name %s (%s); "
-                "the key is at %s, keep it\n",
-                image_path, keyfile_path, strerror(errno), new_key_path);
+                "the key is %s, keep it\n",
+                image_path, keyfile_path, strerror(e), place);
             exit_code = 2;
             goto cleanup;
         }
         /* The rename is not durable until the directory holding it is. */
         if (fsync(key_dir_fd) != 0) {
+            /* What a descriptor opened for the search alone answers is of the
+             * descriptor, and reads as a fault. */
+            const char *why = errno == EBADF
+                ? "it cannot be read, and one opened for the search alone is not synced here"
+                : strerror(errno);
             fprintf(stderr, "stratum-mkfs: warning: cannot sync the directory of %s (%s), so "
                             "a power cut could still lose the key's new name\n",
-                    key_target, strerror(errno));
+                    key_target, why);
         }
         /* The links to the key's place were followed by their text. Where that is not
          * the path the kernel follows, the name does not lead to the key, and every
@@ -1060,23 +1223,26 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         struct stat made, named;
         int made_err = fstat(new_key_fd, &made) != 0 ? errno : 0;
         int named_err = stat(keyfile_path, &named) != 0 ? errno : 0;
-        if (made_err != 0 || named_err != 0) {
+        bool leads_nowhere = named_err == ENOENT || named_err == ENOTDIR;
+        if (made_err != 0 || (named_err != 0 && !leads_nowhere)) {
+            key_place(key_dir_fd, key_base, key_dir, place, sizeof place);
             fprintf(stderr,
-                "stratum-mkfs: %s is formatted and its key was put at %s, but whether the "
+                "stratum-mkfs: %s is formatted and its key is %s, but whether the "
                 "name %s leads to it could not be seen (%s: %s): look for the key there, "
                 "keep it, and see what the name reaches before using it\n",
-                image_path, key_target, keyfile_path,
+                image_path, place, keyfile_path,
                 made_err != 0 ? "the key made" : "the name",
                 strerror(made_err != 0 ? made_err : named_err));
             exit_code = 2;
             goto cleanup;
         }
-        if (named.st_dev != made.st_dev || named.st_ino != made.st_ino) {
+        if (leads_nowhere || named.st_dev != made.st_dev || named.st_ino != made.st_ino) {
+            key_place(key_dir_fd, key_base, key_dir, place, sizeof place);
             fprintf(stderr,
-                "stratum-mkfs: %s is formatted and its key was put at %s, but the name %s "
+                "stratum-mkfs: %s is formatted and its key is %s, but the name %s "
                 "does not lead to it: look for the key there, keep it, and name it by that "
                 "path\n",
-                image_path, key_target, keyfile_path);
+                image_path, place, keyfile_path);
             exit_code = 2;
             goto cleanup;
         }
@@ -1094,7 +1260,9 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         passphrase_stdin ? " --passphrase-stdin" : "");
 
 cleanup:
+    stm_hybrid_keys_wipe(&wrap);
     if (new_key_fd >= 0) close(new_key_fd);
+    if (old_key_fd >= 0) close(old_key_fd);
     /* What this run made and failed to finish, and nothing it found. */
     if (exit_code != 0) {
         if (temp_key_made) unlinkat(key_dir_fd, new_key_name, 0);

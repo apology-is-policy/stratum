@@ -112,6 +112,15 @@ STM_MUST_USE
 stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out);
 
 /*
+ * As stm_keyfile_load, from `fd`: a file the caller has open for reading and closes.
+ * What a caller asks of a key file through its descriptor is then asked of the file
+ * the key comes from, wherever its name leads by the time it is read. The file is read
+ * from its start and the descriptor left past the key.
+ */
+STM_MUST_USE
+stm_status stm_keyfile_load_fd(int fd, stm_hybrid_keys *out);
+
+/*
  * Generate a fresh hybrid key pair, encrypt PK||SK under a KEK
  * derived from `passphrase` via Argon2id (interactive params), and
  * write the encrypted keyfile to `path`, as stm_keyfile_generate
@@ -151,6 +160,13 @@ stm_status stm_keyfile_load_passphrase(const char *path,
                                           const char *passphrase,
                                           size_t      pass_len,
                                           stm_hybrid_keys *out);
+
+/* As stm_keyfile_load_passphrase, from `fd`; see stm_keyfile_load_fd. */
+STM_MUST_USE
+stm_status stm_keyfile_load_passphrase_fd(int         fd,
+                                             const char *passphrase,
+                                             size_t      pass_len,
+                                             stm_hybrid_keys *out);
 
 /*
  * Wipe key material (both fields) with stm_ct_memzero. Callers

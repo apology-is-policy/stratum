@@ -693,9 +693,10 @@ stm_status stm_bdev_open_iouring(const char *path,
 #ifdef O_DIRECT
     if (opts->direct) flags |= O_DIRECT;
 #endif
-    int fd = open(path, flags);
+    int fd = opts->claimed_fd ? stm_bdev_dup_claimed(*opts->claimed_fd, opts->read_only)
+                              : open(path, flags);
     if (fd < 0) {
-        if (errno == ENOENT && !opts->read_only) {
+        if (errno == ENOENT && !opts->read_only && !opts->claimed_fd) {
             fd = open(path, (flags & ~O_DIRECT) | O_CREAT, 0600);
         }
         if (fd < 0) return errno_to_status_ur(errno);

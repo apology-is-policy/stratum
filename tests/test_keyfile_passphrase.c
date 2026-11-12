@@ -235,4 +235,50 @@ STM_TEST(keyfile_generate_fd_writes_a_loadable_key)
     unlink(TMP);
 }
 
+/* A key is read through the descriptor it was written through: what that file holds,
+ * from its start, wherever the descriptor stands and whatever is at the file's name by
+ * then. */
+STM_TEST(keyfile_load_fd_reads_the_file_the_descriptor_has_open)
+{
+    static const char *MOVED = "/tmp/stratum-keyfile-passphrase-test-moved.bin";
+    for (int form = 0; form < 2; form++) {
+        unlink(TMP);
+        unlink(MOVED);
+        int fd = open(TMP, O_RDWR | O_CREAT | O_EXCL, 0600);
+        STM_ASSERT(fd >= 0);
+        if (form == 0) {
+            STM_ASSERT_OK(stm_keyfile_generate_fd(fd));
+        } else {
+            STM_ASSERT_OK(stm_keyfile_generate_passphrase_fd(fd, "pw", 2));
+        }
+        /* The file is moved aside and another key takes its name. */
+        STM_ASSERT_EQ(rename(TMP, MOVED), 0);
+        stm_hybrid_keys by_fd = {0}, again = {0}, made = {0}, named = {0};
+        if (form == 0) {
+            STM_ASSERT_OK(stm_keyfile_generate(TMP));
+            STM_ASSERT_OK(stm_keyfile_load_fd(fd, &by_fd));
+            /* The first reading left the descriptor past the key. */
+            STM_ASSERT_OK(stm_keyfile_load_fd(fd, &again));
+            STM_ASSERT_OK(stm_keyfile_load(MOVED, &made));
+            STM_ASSERT_OK(stm_keyfile_load(TMP, &named));
+        } else {
+            STM_ASSERT_OK(stm_keyfile_generate_passphrase(TMP, "pw", 2));
+            STM_ASSERT_OK(stm_keyfile_load_passphrase_fd(fd, "pw", 2, &by_fd));
+            STM_ASSERT_OK(stm_keyfile_load_passphrase_fd(fd, "pw", 2, &again));
+            STM_ASSERT_OK(stm_keyfile_load_passphrase(MOVED, "pw", 2, &made));
+            STM_ASSERT_OK(stm_keyfile_load_passphrase(TMP, "pw", 2, &named));
+        }
+        STM_ASSERT_MEM_EQ(by_fd.pk, made.pk, sizeof made.pk);
+        STM_ASSERT_MEM_EQ(by_fd.sk, made.sk, sizeof made.sk);
+        STM_ASSERT_MEM_EQ(again.sk, made.sk, sizeof made.sk);
+        STM_ASSERT_MEM_NE(by_fd.sk, named.sk, sizeof named.sk);
+        close(fd);
+        unlink(TMP);
+        unlink(MOVED);
+    }
+    stm_hybrid_keys k = {0};
+    STM_ASSERT_ERR(stm_keyfile_load_fd(-1, &k), STM_EINVAL);
+    STM_ASSERT_ERR(stm_keyfile_load_passphrase_fd(-1, "pw", 2, &k), STM_EINVAL);
+}
+
 STM_TEST_MAIN("keyfile_passphrase")

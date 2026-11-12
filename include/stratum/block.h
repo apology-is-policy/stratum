@@ -70,6 +70,15 @@ typedef struct {
 
     /* Thread pool size for POSIX async. 0 → logical-CPU-count, capped at 64. */
     uint32_t posix_threads;
+
+    /* NULL, or where a descriptor the caller holds on the device is, as
+     * stm_bdev_claim_image gives one: the file that descriptor has open is the
+     * device then, and `path` only names it. The name is not opened again, so what
+     * the caller asked of the file it has open is asked of the device, wherever the
+     * name leads by now. The caller keeps the descriptor and closes it; a negative
+     * one stands for none. Nothing is created, and `direct` cannot be asked: the
+     * open is the caller's. */
+    const int *claimed_fd;
 } stm_bdev_open_opts;
 
 /* Default opts: auto backend, no O_DIRECT, RW, default queues. */

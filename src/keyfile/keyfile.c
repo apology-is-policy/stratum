@@ -158,13 +158,9 @@ stm_status stm_keyfile_generate_fd(int fd)
     return s;
 }
 
-stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out)
+/* The key in the file `fd` has open, read from where the descriptor stands. */
+static stm_status load_plain(int fd, stm_hybrid_keys *out)
 {
-    if (!path || !out) return STM_EINVAL;
-
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return STM_ENOENT;
-
     /* R10 P2-4: reject keyfiles with trailing bytes. An exact
      * length check closes a "stash arbitrary data after the keys"
      * vector: attackers with write access could otherwise plant
@@ -173,7 +169,6 @@ stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out)
      * accident. */
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        close(fd);
         return STM_EBACKEND;
     }
     /* SWISS-4m: peek at the first 8 bytes to distinguish plaintext
@@ -182,25 +177,20 @@ stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out)
      * _passphrase variant. Otherwise size-check + parse as v1. */
     uint8_t header[8];
     if (read_full(fd, header, sizeof header) < 0) {
-        close(fd);
         return STM_EBACKEND;
     }
     uint32_t peek_magic = load_u32_le(header);
     if (peek_magic == STM_KEYFILE_PASS_MAGIC) {
-        close(fd);
         return STM_EBADVERSION;
     }
     if (peek_magic != STM_KEYFILE_MAGIC) {
-        close(fd);
         return STM_EBADVERSION;
     }
     if ((uint64_t)st.st_size != (uint64_t)STM_KEYFILE_SIZE) {
-        close(fd);
         return STM_ERANGE;
     }
     /* Rewind to read the rest in one go. */
     if (lseek(fd, 0, SEEK_SET) < 0) {
-        close(fd);
         return STM_EBACKEND;
     }
 
@@ -210,17 +200,14 @@ stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out)
         ssize_t n = read(fd, buf + got, sizeof buf - got);
         if (n < 0) {
             if (errno == EINTR) continue;
-            close(fd);
             return STM_EBACKEND;
         }
         if (n == 0) {
-            close(fd);
             stm_ct_memzero(buf, sizeof buf);
             return STM_ERANGE;    /* short file */
         }
         got += (size_t)n;
     }
-    close(fd);
 
     uint32_t magic   = load_u32_le(buf + 0);
     uint32_t version = load_u32_le(buf + 4);
@@ -234,6 +221,24 @@ stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out)
     memcpy(out->sk, buf + 8 + STM_HYBRID_PK_LEN,         STM_HYBRID_SK_LEN);
     stm_ct_memzero(buf, sizeof buf);
     return STM_OK;
+}
+
+stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out)
+{
+    if (!path || !out) return STM_EINVAL;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return STM_ENOENT;
+    stm_status s = load_plain(fd, out);
+    close(fd);
+    return s;
+}
+
+stm_status stm_keyfile_load_fd(int fd, stm_hybrid_keys *out)
+{
+    if (fd < 0 || !out) return STM_EINVAL;
+    if (lseek(fd, 0, SEEK_SET) < 0) return STM_EBACKEND;
+    return load_plain(fd, out);
 }
 
 void stm_hybrid_keys_wipe(stm_hybrid_keys *kp)
@@ -382,26 +387,18 @@ stm_status stm_keyfile_generate_passphrase_fd(int         fd,
     return s;
 }
 
-stm_status stm_keyfile_load_passphrase(const char *path,
-                                          const char *passphrase,
-                                          size_t      pass_len,
-                                          stm_hybrid_keys *out)
+/* As load_plain, of a key kept under a passphrase. */
+static stm_status load_sealed(int fd, const char *passphrase, size_t pass_len,
+                              stm_hybrid_keys *out)
 {
-    if (!path || !passphrase || pass_len == 0 || !out) return STM_EINVAL;
-
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return STM_ENOENT;
-
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        close(fd);
         return STM_EBACKEND;
     }
     /* File must be at least the header + minimum AEAD tag — bound
      * the ciphertext buffer up front. Compute the EXPECTED size from
      * the header's mode field after we read it. */
     if ((uint64_t)st.st_size < (uint64_t)STM_KEYFILE_PASS_HEADER_LEN) {
-        close(fd);
         return STM_ERANGE;
     }
     /* Sanity cap — this format with our params doesn't exceed 8 KiB.
@@ -411,18 +408,15 @@ stm_status stm_keyfile_load_passphrase(const char *path,
                                           + STM_HYBRID_SK_LEN
                                           + STM_AEAD_TAG_LEN_MAX
                                           + 1024)) {
-        close(fd);
         return STM_ERANGE;
     }
     size_t total = (size_t)st.st_size;
     uint8_t *buf = malloc(total);
-    if (!buf) { close(fd); return STM_ENOMEM; }
+    if (!buf) return STM_ENOMEM;
     if (read_full(fd, buf, total) < 0) {
-        close(fd);
         free(buf);
         return STM_EBACKEND;
     }
-    close(fd);
 
     uint32_t magic   = load_u32_le(buf +  0);
     uint32_t version = load_u32_le(buf +  4);
@@ -502,4 +496,28 @@ stm_status stm_keyfile_load_passphrase(const char *path,
     memcpy(out->sk, pt + STM_HYBRID_PK_LEN,     STM_HYBRID_SK_LEN);
     stm_ct_memzero(pt, sizeof pt);
     return STM_OK;
+}
+
+stm_status stm_keyfile_load_passphrase(const char *path,
+                                          const char *passphrase,
+                                          size_t      pass_len,
+                                          stm_hybrid_keys *out)
+{
+    if (!path || !passphrase || pass_len == 0 || !out) return STM_EINVAL;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return STM_ENOENT;
+    stm_status s = load_sealed(fd, passphrase, pass_len, out);
+    close(fd);
+    return s;
+}
+
+stm_status stm_keyfile_load_passphrase_fd(int         fd,
+                                             const char *passphrase,
+                                             size_t      pass_len,
+                                             stm_hybrid_keys *out)
+{
+    if (fd < 0 || !passphrase || pass_len == 0 || !out) return STM_EINVAL;
+    if (lseek(fd, 0, SEEK_SET) < 0) return STM_EBACKEND;
+    return load_sealed(fd, passphrase, pass_len, out);
 }

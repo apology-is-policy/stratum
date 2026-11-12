@@ -306,9 +306,9 @@ fi
 # between two of mkfs's own system calls, so a small library loaded into mkfs does it, just before
 # the call it is told (tests/plant_at_look.c). mkfs looks at the name, reads a link it finds there
 # and looks at it again, and then asks what the name reaches: once before it makes the image and
-# once after. It looks again before it uses a key, once more where it makes one, and a last time
-# when the new key has taken the name. A link it found is one it asked about. One left after it
-# looked must not be followed.
+# once after. It opens the name to see whether a key is there to use, looks once more where it
+# makes one, and a last time when the new key has taken the name. A link it found is one it asked
+# about. One left after it looked must not be followed.
 case "$(uname -s)" in
     Darwin) PLANT_LIB=$D/plant.dylib; PLANT_HOW=-dynamiclib ;;
     *)      PLANT_LIB=$D/plant.so;    PLANT_HOW="-shared -fPIC" ;;
@@ -330,6 +330,33 @@ planted() {
     fi
 }
 moments() { tr '\n' ' ' < "$D/pl-$1.plant" 2>/dev/null; }
+# plant_run NAME=VALUE... -- ARGS: "$B" ARGS with the library loaded and told those settings.
+plant_run() {
+    (
+        while [ "$1" != -- ]; do export "$1"; shift; done
+        shift
+        if [ "$(uname -s)" = Darwin ]; then export DYLD_INSERT_LIBRARIES="$PLANT_LIB"; else export LD_PRELOAD="$PLANT_LIB"; fi
+        exec "$B" "$@"
+    )
+}
+# opens VOLUME KEY: whether that key opens that volume, by a daemon that comes up on it.
+opens() {
+    rm -f "$D/opens.sock"
+    "$B" serve "$1" --listen "$D/opens.sock" --keyfile "$2" < /dev/null > "$D/opens.log" 2>&1 &
+    op=$!
+    up=1
+    for _ in $(seq 1 100); do
+        [ -S "$D/opens.sock" ] && { up=0; break; }
+        kill -0 "$op" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -TERM "$op" 2>/dev/null
+    wait "$op" 2>/dev/null
+    rm -f "$D/opens.sock"
+    return $up
+}
+# The directory as the system names it: where mkfs says a key is, it says it so.
+DP=$(cd "$D" && pwd -P)
 if ! command -v cc > /dev/null 2>&1; then
     skipped "a link left at the key's name while mkfs looks: the library that leaves it needs a C compiler"
 elif ! cc $PLANT_HOW -o "$PLANT_LIB" "$HERE/plant_at_look.c" -ldl > "$D/plant-build.log" 2>&1; then
@@ -339,11 +366,11 @@ elif ! "$B" mkfs "$D/pl-own.stm" --size 64M --keyfile "$D/pl-own.key" < /dev/nul
 else
     # Nothing left: what the library sees says which moment is which below. If mkfs comes to look
     # more or fewer times, this is the check that says so, and those under it need their moments
-    # named again. Looks 1 and 2 are the claim before the image is made, 3 and 4 the claim after,
-    # 5 the use of a key, 6 where a new key's place is asked about, 7 what the name reaches once
-    # the key has taken it.
+    # named again. Looks 1 and 2 are the claim before the image is made, 3 and 4 the claim after;
+    # the open is where a key that is there is taken up for use; look 5 is where a new key's place
+    # is asked about, 6 what the name reaches once the key has taken it.
     planted none nothing; rc=$?
-    if [ "$rc" = 0 ] && [ "$(moments none)" = "look:1 look:2 look:3 look:4 look:5 look:6 look:7 " ] \
+    if [ "$rc" = 0 ] && [ "$(moments none)" = "look:1 look:2 look:3 look:4 open:1 look:5 look:6 " ] \
             && LC_ALL=C grep -q 'generated keyfile' "$D/pl-none.log"; then
         ok "the library sees each time mkfs reads the key's links and looks at the key"
     else
@@ -376,9 +403,9 @@ else
     else
         no "a link left after the claim read the key's links: rc=$rc: $(moments claim): $(tail -1 "$D/pl-claim.log"); image left: $([ -e "$D/pl-claim.stm" ] && echo yes || echo no)"
     fi
-    # Left after the claim, before the look that decides whether there is a key to use.
-    planted use look:5; rc=$?
-    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:5: done$' "$D/pl-use.plant" \
+    # Left after the claim, before the open that decides whether there is a key to use.
+    planted use open:1; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before open:1: done$' "$D/pl-use.plant" \
             && LC_ALL=C grep -q 'turned up after the volume was claimed' "$D/pl-use.log" && [ ! -e "$D/pl-use.stm" ]; then
         ok "a link left between the claim and the use of the key is not followed, and nothing is made"
     else
@@ -386,8 +413,8 @@ else
     fi
     # Left where the new key's place is asked about, and another user's as far as mkfs is told.
     # Nothing else asks at that moment: the claim found the name free, and so did the use.
-    planted ask look:6 "$D/pl-ask.to" "" "$(( $(id -u) + 1 ))"; rc=$?
-    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:6: done$' "$D/pl-ask.plant" \
+    planted ask look:5 "$D/pl-ask.to" "" "$(( $(id -u) + 1 ))"; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:5: done$' "$D/pl-ask.plant" \
             && LC_ALL=C grep -q 'reached through a symlink another user owns' "$D/pl-ask.log" && [ ! -e "$D/pl-ask.stm" ] \
             && ! ls "$D"/pl-ask.to* > /dev/null 2>&1; then
         ok "another user's link left where the new key's place is asked about is refused, and nothing is made"
@@ -416,6 +443,18 @@ else
     else
         no "a link to another key put in a key's place after the claim looked at it: rc=$rc: $(moments taken): $(tail -1 "$D/pl-taken.log"); image left: $([ -e "$D/pl-taken.stm" ] && echo yes || echo no)"
     fi
+    # A key is at the name and passes the claim, and a link to another key takes its place before
+    # the key is opened for use. The other is a key of the user's own too, and passes all that is
+    # asked of a key: it is still not the file the claim asked about.
+    cp "$D/pl-own.key" "$D/pl-reuse.key" && chmod 600 "$D/pl-reuse.key"
+    planted reuse open:1 "" over; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before open:1: done$' "$D/pl-reuse.plant" \
+            && LC_ALL=C grep -qF "since the volume was claimed, keyfile $D/pl-reuse.key leads to another file than the one that was asked about" "$D/pl-reuse.log" \
+            && [ ! -e "$D/pl-reuse.stm" ]; then
+        ok "a link to another key put in a key's place between the claim and the key's use is not followed, and nothing is made"
+    else
+        no "a link to another key put in a key's place between the claim and its use: rc=$rc: $(moments reuse): $(tail -1 "$D/pl-reuse.log"); image left: $([ -e "$D/pl-reuse.stm" ] && echo yes || echo no)"
+    fi
     # A link to nothing left inside the claim passes it, as the free name does: nothing is there
     # either way. It is asked about where the new key's place is, and another user's, as far as
     # mkfs is told, is refused there.
@@ -431,16 +470,16 @@ else
     # their text, and every later command is given the name. Here the name is a link of the
     # user's own to where the key is to go, and another link put over it just before mkfs asks
     # stands in for a name the kernel follows another way. The volume is formatted by then, so
-    # it stays, and so does the key, where mkfs says it was put. The name being a link, mkfs
-    # looks at it three times in each claim, once at the use and twice where the new key's
-    # place is asked about: this is its tenth look.
+    # it stays, and so does the key, where mkfs says it is. The name being a link, mkfs
+    # looks at it three times in each claim and twice where the new key's place is asked
+    # about: this is its ninth look.
     ln -s "$D/pl-name.to" "$D/pl-name.key"
-    planted name look:10 "" over; rc=$?
-    if [ "$rc" = 2 ] && LC_ALL=C grep -q '^planted before look:10: done$' "$D/pl-name.plant" \
-            && LC_ALL=C grep -qF "its key was put at $D/pl-name.to, but the name $D/pl-name.key does not lead to it" "$D/pl-name.log" \
+    planted name look:9 "" over; rc=$?
+    if [ "$rc" = 2 ] && LC_ALL=C grep -q '^planted before look:9: done$' "$D/pl-name.plant" \
+            && LC_ALL=C grep -qF "its key is $DP/pl-name.to, but the name $D/pl-name.key does not lead to it" "$D/pl-name.log" \
             && [ -s "$D/pl-name.stm" ] && [ -f "$D/pl-name.to" ] && [ ! -L "$D/pl-name.to" ] \
             && ! LC_ALL=C grep -q '^generated keyfile' "$D/pl-name.log"; then
-        ok "a key name that does not lead to the key mkfs made is said, with where the key was put, and the volume and the key are kept"
+        ok "a key name that does not lead to the key mkfs made is said, with where the key is, and the volume and the key are kept"
     else
         no "a key name that does not lead to the key mkfs made: rc=$rc: $(moments name): $(tail -1 "$D/pl-name.log"); image left: $([ -s "$D/pl-name.stm" ] && echo yes || echo no); key where it was put: $([ -f "$D/pl-name.to" ] && echo yes || echo no)"
     fi
@@ -449,8 +488,8 @@ else
     # refused there, and mkfs says the claim had not seen it.
     mkdir "$D/pl-open"
     chmod 777 "$D/pl-open"
-    planted dirs look:6 "$D/pl-open/pl.key"; rc=$?
-    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:6: done$' "$D/pl-dirs.plant" \
+    planted dirs look:5 "$D/pl-open/pl.key"; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:5: done$' "$D/pl-dirs.plant" \
             && LC_ALL=C grep -qF "stratum-mkfs: since the volume was claimed, keyfile $D/pl-dirs.key is led by its links to the directory $D/pl-open, which others can change, going by its mode" "$D/pl-dirs.log" \
             && [ ! -e "$D/pl-dirs.stm" ] && [ -z "$(ls -A "$D/pl-open")" ]; then
         ok "a link left after the claim that leads the new key into a directory others can change is refused where the key is made, and nothing is made"
@@ -458,29 +497,43 @@ else
         no "a link left after the claim into a directory others can change: rc=$rc: $(moments dirs): $(tail -1 "$D/pl-dirs.log"); image left: $([ -e "$D/pl-dirs.stm" ] && echo yes || echo no); in the directory: $(ls -A "$D/pl-open" | tr '\n' ' ')"
     fi
     # The new key is made through its directory's descriptor, so it is in the directory
-    # that was asked about, wherever the path to it leads by then. Here the name is a link of
-    # the user's own into a directory of the user's, and once that directory is open and has
-    # been asked about it is moved away and another made at its path, as the owner of a
-    # directory above it could do. Nothing is made in the directory now at the path: the
-    # format, which reads the key by its path, finds none there and fails, and what the run
-    # made is removed. The library watches the directory the key was named in, whose third
-    # look is the one where the key is made.
+    # that was asked about, wherever the path to it leads by then, and the volume is
+    # formatted with that key read back through the descriptor that made it. Here the name is
+    # a link of the user's own into a directory of the user's, and once that directory is open
+    # and has been asked about it is moved away and another made at its path, as the owner of
+    # a directory above it could do. Nothing is made in the directory now at the path. The
+    # volume is made, its key takes its name in the directory that was moved, and mkfs says
+    # where that is and that the name does not lead there. The library watches the directory
+    # the key was named in, whose third look is the one where the key is made.
     mkdir "$D/pl-kept"
     chmod 755 "$D/pl-kept"
     ln -s "pl-kept/k.key" "$D/pl-moved.key"
-    if [ "$(uname -s)" = Darwin ]; then
-        DYLD_INSERT_LIBRARIES="$PLANT_LIB" STM_PLANT_AT="$D" STM_PLANT_ON=look:3 STM_PLANT_MOVE="$D/pl-kept" STM_PLANT_LOG="$D/pl-moved.plant" \
-            "$B" mkfs "$D/pl-moved.stm" --size 64M --keyfile "$D/pl-moved.key" < /dev/null > "$D/pl-moved.log" 2>&1; rc=$?
+    plant_run STM_PLANT_AT="$D" STM_PLANT_ON=look:3 STM_PLANT_MOVE="$D/pl-kept" STM_PLANT_LOG="$D/pl-moved.plant" \
+        -- mkfs "$D/pl-moved.stm" --size 64M --keyfile "$D/pl-moved.key" < /dev/null > "$D/pl-moved.log" 2>&1; rc=$?
+    if [ "$rc" = 2 ] && [ "$(moments moved)" = "look:1 look:2 moved before look:3: done " ] \
+            && LC_ALL=C grep -qF "$D/pl-moved.stm is formatted and its key is $DP/pl-kept.away/k.key, but the name $D/pl-moved.key does not lead to it" "$D/pl-moved.log" \
+            && [ -z "$(ls -A "$D/pl-kept")" ] && [ "$(ls -A "$D/pl-kept.away")" = k.key ] \
+            && opens "$D/pl-moved.stm" "$D/pl-kept.away/k.key"; then
+        ok "a key's directory moved away once it was asked about gets no key at its path: the key is in the directory that was asked about, mkfs says where, and it opens the volume"
     else
-        LD_PRELOAD="$PLANT_LIB" STM_PLANT_AT="$D" STM_PLANT_ON=look:3 STM_PLANT_MOVE="$D/pl-kept" STM_PLANT_LOG="$D/pl-moved.plant" \
-            "$B" mkfs "$D/pl-moved.stm" --size 64M --keyfile "$D/pl-moved.key" < /dev/null > "$D/pl-moved.log" 2>&1; rc=$?
+        no "a key's directory moved away once it was asked about: rc=$rc: $(moments moved): $(tail -1 "$D/pl-moved.log"); at its path: $(ls -A "$D/pl-kept" 2>/dev/null | tr '\n' ' '); moved away: $(ls -A "$D/pl-kept.away" 2>/dev/null | tr '\n' ' '); the daemon on it: $(tail -1 "$D/opens.log" 2>/dev/null)"
     fi
-    if [ "$rc" != 0 ] && [ "$(moments moved)" = "look:1 look:2 moved before look:3: done " ] \
-            && [ -d "$D/pl-kept.away" ] && [ -z "$(ls -A "$D/pl-kept")" ] && [ -z "$(ls -A "$D/pl-kept.away")" ] \
-            && [ ! -e "$D/pl-moved.stm" ]; then
-        ok "a key's directory moved away once it was asked about gets no key at its path, and nothing is left"
+    # The same, and whoever moved the directory away leaves a key of theirs in the one at its
+    # path, under the name mkfs made its own by. A format that came back to the path for its
+    # key would wrap the volume under theirs. The key mkfs made is the one that opens it.
+    mkdir "$D/pl-put"
+    chmod 755 "$D/pl-put"
+    ln -s "pl-put/k.key" "$D/pl-theirs-put.key"
+    plant_run STM_PLANT_AT="$D" STM_PLANT_ON=look:3 STM_PLANT_MOVE="$D/pl-put" STM_PLANT_PUT="$D/pl-own.key" STM_PLANT_PUT_AS=k.key.new. \
+        STM_PLANT_LOG="$D/pl-theirs-put.plant" \
+        -- mkfs "$D/pl-theirs-put.stm" --size 64M --keyfile "$D/pl-theirs-put.key" < /dev/null > "$D/pl-theirs-put.log" 2>&1; rc=$?
+    put=$(ls -A "$D/pl-put" 2>/dev/null | LC_ALL=C grep -c '^k\.key\.new\.[0-9][0-9]*$')
+    if [ "$rc" = 2 ] && [ "$(moments theirs-put)" = "look:1 look:2 moved before look:3: done " ] && [ "$put" = 1 ] \
+            && [ "$(ls -A "$D/pl-put.away")" = k.key ] \
+            && opens "$D/pl-theirs-put.stm" "$D/pl-put.away/k.key" && ! opens "$D/pl-theirs-put.stm" "$D/pl-own.key"; then
+        ok "a key of another's left at the path of the key mkfs made is not the one the volume is made with"
     else
-        no "a key's directory moved away once it was asked about: rc=$rc: $(moments moved): $(tail -1 "$D/pl-moved.log"); at its path: $(ls -A "$D/pl-kept" 2>/dev/null | tr '\n' ' '); moved away: $(ls -A "$D/pl-kept.away" 2>/dev/null | tr '\n' ' '); image left: $([ -e "$D/pl-moved.stm" ] && echo yes || echo no)"
+        no "a key of another's left at the path of the key mkfs made: rc=$rc: $(moments theirs-put): $(tail -1 "$D/pl-theirs-put.log"); theirs left at the path: $put; moved away: $(ls -A "$D/pl-put.away" 2>/dev/null | tr '\n' ' '); the daemon last tried: $(tail -1 "$D/opens.log" 2>/dev/null)"
     fi
     # A file another user owns at the image's name is theirs to remove, and the volume with
     # it: an empty one left at a free name is not formatted into. No test can make another
@@ -508,6 +561,153 @@ else
         ok "the same empty file, the user's own, is formatted"
     else
         no "the user's own empty file at the image's name: rc=$rc: $(tail -1 "$D/pl-img-own.log")"
+    fi
+    # A link at the image's name is followed by the claim's open, so it is asked about as a
+    # key's links are. One the user owns, into the directory the image was named in, is
+    # followed: the control. The same link, another user's as far as mkfs is told, is not.
+    : > "$D/im-file.stm"
+    ln -s "$D/im-file.stm" "$D/im-theirs.stm"
+    plant_run STM_PLANT_AT="$D/im-theirs.stm" STM_PLANT_AS="$(( $(id -u) + 1 ))" STM_PLANT_LOG="$D/im-theirs.plant" \
+        -- mkfs "$D/im-theirs.stm" --size 64M < /dev/null > "$D/im-theirs.log" 2>&1; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -qF "stratum-mkfs: image $D/im-theirs.stm is reached through a symlink another user owns, who would decide where the volume goes" "$D/im-theirs.log" \
+            && [ ! -s "$D/im-file.stm" ] && [ ! -e "$D/im-theirs.stm.key" ]; then
+        ok "another user's link at the image's name is not followed: the file it leads to is not formatted, and no key is made"
+    else
+        no "another user's link at the image's name: rc=$rc: $(tail -1 "$D/im-theirs.log"); bytes in the file: $(wc -c < "$D/im-file.stm" | tr -d ' '); key made: $([ -e "$D/im-theirs.stm.key" ] && echo yes || echo no)"
+    fi
+    plant_run STM_PLANT_AT="$D/im-theirs.stm" STM_PLANT_LOG="$D/im-own.plant" \
+        -- mkfs "$D/im-theirs.stm" --size 64M < /dev/null > "$D/im-own.log" 2>&1; rc=$?
+    if [ "$rc" = 0 ] && [ -s "$D/im-file.stm" ] && [ -L "$D/im-theirs.stm" ] && opens "$D/im-theirs.stm" "$D/im-theirs.stm.key"; then
+        ok "the same link, the user's own, is followed: the file it leads to is formatted, and its key opens it by the link"
+    else
+        no "the user's own link at the image's name: rc=$rc: $(tail -1 "$D/im-own.log"); bytes in the file: $(wc -c < "$D/im-file.stm" | tr -d ' ')"
+    fi
+    # A link of the user's own that leads the image into a directory others can change.
+    mkdir "$D/im-open"
+    chmod 777 "$D/im-open"
+    : > "$D/im-open/v.stm"
+    ln -s "$D/im-open/v.stm" "$D/im-led.stm"
+    "$B" mkfs "$D/im-led.stm" --size 64M < /dev/null > "$D/im-led.log" 2>&1; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -qF "stratum-mkfs: image $D/im-led.stm is led by its links to the directory $D/im-open, which others can change, going by its mode" "$D/im-led.log" \
+            && LC_ALL=C grep -qF "could remove the volume, or put an older copy of it back; name the image itself" "$D/im-led.log" \
+            && [ ! -s "$D/im-open/v.stm" ] && [ ! -e "$D/im-led.stm.key" ]; then
+        ok "a link that leads the image into a directory others can change is not followed, and no key is made"
+    else
+        no "a link that leads the image into a directory others can change: rc=$rc: $(tail -1 "$D/im-led.log"); bytes in the file: $(wc -c < "$D/im-open/v.stm" | tr -d ' ')"
+    fi
+    # A link at the image's name with a second name: any user may have given it either.
+    : > "$D/im-two-file.stm"
+    if ln -s "im-two-file.stm" "$D/im-first.lnk" && ln -P "$D/im-first.lnk" "$D/im-two.stm" 2> /dev/null && [ -L "$D/im-two.stm" ]; then
+        "$B" mkfs "$D/im-two.stm" --size 64M < /dev/null > "$D/im-two.log" 2>&1; rc=$?
+        if [ "$rc" != 0 ] && LC_ALL=C grep -qF "stratum-mkfs: image $D/im-two.stm is reached through a symlink that has another name besides this one" "$D/im-two.log" \
+                && [ ! -s "$D/im-two-file.stm" ] && [ ! -e "$D/im-two.stm.key" ]; then
+            ok "a link at the image's name that has a second name is not followed, and no key is made"
+        else
+            no "a link at the image's name that has a second name: rc=$rc: $(tail -1 "$D/im-two.log"); bytes in the file: $(wc -c < "$D/im-two-file.stm" | tr -d ' ')"
+        fi
+    else
+        skipped "a link at the image's name with two names: none can be made here (ln -P gives a link no second name)"
+    fi
+    # The claim opens the name and then reads the links at it: the file it has open has to be
+    # the one the links are read to end in. Here the name is an empty file of the user's own,
+    # and just before the claim's look at it, which follows its open, a link of the user's own
+    # takes its place, to another empty file. The link passes all that is asked of a link, and
+    # nothing was asked of it when the file was opened: neither file is formatted.
+    : > "$D/im-swap.stm"
+    : > "$D/im-swap-to.stm"
+    plant_run STM_PLANT_AT="$D/im-swap.stm" STM_PLANT_ON=look:1 STM_PLANT_TO="$D/im-swap-to.stm" STM_PLANT_OVER=over STM_PLANT_LOG="$D/im-swap.plant" \
+        -- mkfs "$D/im-swap.stm" --size 64M < /dev/null > "$D/im-swap.log" 2>&1; rc=$?
+    if [ "$rc" != 0 ] && [ "$(tr '\n' ' ' < "$D/im-swap.plant")" = "open:1 planted before look:1: done readlink:1 look:2 " ] \
+            && LC_ALL=C grep -qF "stratum-mkfs: image $D/im-swap.stm does not lead where its links were read to end" "$D/im-swap.log" \
+            && [ ! -s "$D/im-swap-to.stm" ] && [ -z "$(ls "$D" | LC_ALL=C grep -F 'im-swap.stm.over')" ] && [ ! -e "$D/im-swap.stm.key" ]; then
+        ok "a link put at the image's name between the claim's open and its reading of the links is not followed, and nothing is formatted"
+    else
+        no "a link put at the image's name between the claim's open and its reading of the links: rc=$rc: $(tr '\n' ' ' < "$D/im-swap.plant" 2>/dev/null): $(tail -1 "$D/im-swap.log"); bytes where it leads: $(wc -c < "$D/im-swap-to.stm" | tr -d ' ')"
+    fi
+    # The format and the mount go through the descriptor the claim holds, so the volume is made
+    # in the file that was asked about, wherever the name leads by then. Here the name is a
+    # link of the user's own to an empty file of theirs, and once the volume is claimed another
+    # link takes its place, to a second empty file: the file a format that opened the name
+    # again would write. The library watches the key's name, whose fifth look comes after the
+    # claim and before the format, and leaves the link at the image's. Nothing is written to
+    # the second file, mkfs says the name leads elsewhere, and no key is left.
+    : > "$D/im-a.stm"
+    : > "$D/im-b.stm"
+    ln -s "$D/im-a.stm" "$D/im-race.stm"
+    plant_run STM_PLANT_AT="$D/im-race.stm.key" STM_PLANT_ON=look:5 STM_PLANT_LINK="$D/im-race.stm" STM_PLANT_TO="$D/im-b.stm" STM_PLANT_OVER=over \
+        STM_PLANT_LOG="$D/im-race.plant" \
+        -- mkfs "$D/im-race.stm" --size 64M < /dev/null > "$D/im-race.log" 2>&1; rc=$?
+    if [ "$rc" = 2 ] && LC_ALL=C grep -q '^planted before look:5: done$' "$D/im-race.plant" \
+            && LC_ALL=C grep -qF "stratum-mkfs: $D/im-race.stm does not lead to the file it led to when the volume was claimed" "$D/im-race.log" \
+            && [ ! -s "$D/im-b.stm" ] && [ -s "$D/im-a.stm" ] && [ "$(readlink "$D/im-race.stm")" = "$D/im-b.stm" ] \
+            && [ ! -e "$D/im-race.stm.key" ] && [ -z "$(ls "$D" | LC_ALL=C grep -F 'im-race.stm.key.new.')" ]; then
+        ok "an image name led elsewhere once the volume was claimed: the file that was claimed is the one formatted, nothing is written where the name leads, and no key is left"
+    else
+        no "an image name led elsewhere once the volume was claimed: rc=$rc: $(tr '\n' ' ' < "$D/im-race.plant" 2>/dev/null): $(tail -1 "$D/im-race.log"); bytes where the name leads now: $(wc -c < "$D/im-b.stm" | tr -d ' '); in the file claimed: $(wc -c < "$D/im-a.stm" | tr -d ' '); key left: $(ls "$D" | LC_ALL=C grep -c 'im-race.stm.key')"
+    fi
+    # A daemon mounts through the descriptor its lock is on, so the image it serves is the one
+    # it locked. Two volumes under one key, each holding a file that says which it is, and a
+    # name that is a link to the first. A daemon started on the name locks the first; the link
+    # is then put over with one to the second, just before the daemon's last look at the name,
+    # which comes after the lock and before the mount. A mount that opened the name again would
+    # serve the second with its lock on the first, and a second daemon could open either.
+    # The daemon itself is what is put behind: a function put behind is a shell around it, and
+    # a TERM to that shell would leave the daemon serving.
+    sd_up() {
+        rm -f "$D/sd.sock"
+        (
+            for set in "$@"; do export "$set"; done
+            if [ "$(uname -s)" = Darwin ]; then export DYLD_INSERT_LIBRARIES="$PLANT_LIB"; else export LD_PRELOAD="$PLANT_LIB"; fi
+            exec "$B" serve "$D/sd-name.stm" --listen "$D/sd.sock" --keyfile "$D/sd.key"
+        ) < /dev/null > "$D/sd-serve.log" 2>&1 &
+        SP=$!
+        for _ in $(seq 1 100); do
+            [ -S "$D/sd.sock" ] && return 0
+            kill -0 "$SP" 2>/dev/null || return 1
+            sleep 0.1
+        done
+        return 1
+    }
+    sd_down() {
+        kill -TERM "$SP" 2>/dev/null
+        wait "$SP" 2>/dev/null
+        sd_rc=$?
+        SP=
+        rm -f "$D/sd.sock"
+    }
+    sd_made=1
+    for which in a b; do
+        rm -f "$D/sd-name.stm"
+        "$B" mkfs "$D/sd-$which.stm" --size 64M --keyfile "$D/sd.key" < /dev/null > "$D/sd-mkfs-$which.log" 2>&1 \
+            && ln -s "$D/sd-$which.stm" "$D/sd-name.stm" && sd_up STM_PLANT_LOG="$D/sd-mark-$which.plant" \
+            && printf '%s\n' "$which" | "$B" fs -s "$D/sd.sock" write -n /which.txt > /dev/null 2>&1 || sd_made=0
+        sd_down
+    done
+    rm -f "$D/sd-name.stm"
+    ln -s "$D/sd-a.stm" "$D/sd-name.stm"
+    sd_seen=
+    if [ "$sd_made" = 1 ] && sd_up STM_PLANT_AT="$D/sd-name.stm" STM_PLANT_LOG="$D/sd-none.plant"; then
+        sd_seen=$("$B" fs -s "$D/sd.sock" read /which.txt 2>/dev/null)
+    fi
+    sd_down
+    # The daemon's looks at the name, as the library saw them with nothing left: the last is
+    # the one to leave the link before, and an open of the name, the lock's, comes before it.
+    sd_last=$(LC_ALL=C grep -n '^look:[0-9][0-9]*$' "$D/sd-none.plant" 2>/dev/null | tail -1)
+    sd_open=$(LC_ALL=C grep -n '^open:1$' "$D/sd-none.plant" 2>/dev/null | head -1)
+    if [ "$sd_seen" != a ] || [ -z "$sd_last" ] || [ -z "$sd_open" ] || [ "${sd_open%%:*}" -ge "${sd_last%%:*}" ]; then
+        no "a daemon on a link to a volume, nothing left: made=$sd_made, served: '$sd_seen', its looks: $(tr '\n' ' ' < "$D/sd-none.plant" 2>/dev/null): $(tail -1 "$D/sd-serve.log")"
+    else
+        sd_seen=
+        if sd_up STM_PLANT_AT="$D/sd-name.stm" STM_PLANT_ON="${sd_last#*:}" STM_PLANT_TO="$D/sd-b.stm" STM_PLANT_OVER=over STM_PLANT_LOG="$D/sd-led.plant"; then
+            sd_seen=$("$B" fs -s "$D/sd.sock" read /which.txt 2>/dev/null)
+        fi
+        sd_down
+        if [ "$sd_seen" = a ] && [ "$sd_rc" = 0 ] && LC_ALL=C grep -q "^planted before ${sd_last#*:}: done\$" "$D/sd-led.plant" \
+                && [ "$(readlink "$D/sd-name.stm")" = "$D/sd-b.stm" ]; then
+            ok "a daemon serves the image it locked, where its name was led to another between the lock and the mount"
+        else
+            no "a daemon whose image's name was led to another between the lock and the mount served '$sd_seen' (a is the one it locked): $(tr '\n' ' ' < "$D/sd-led.plant" 2>/dev/null): $(tail -1 "$D/sd-serve.log")"
+        fi
     fi
 fi
 
@@ -847,9 +1047,9 @@ chmod 600 "$D/late.stm.key"
 if "$B" mkfs "$D/late.stm" --size 64M > "$D/late.log" 2>&1; then
     no "a garbage key formatted a volume"
 else
-    # Only the format's own failure is the late one: a refusal at the claim leaves the same behind.
-    LC_ALL=C grep -q 'stm_fs_format failed' "$D/late.log" \
-        || no "the bad key was not refused by the format: $(tail -1 "$D/late.log")"
+    # Only a failure past the claim is the late one: a refusal at the claim leaves the same behind.
+    LC_ALL=C grep -q 'could not be loaded as a key' "$D/late.log" \
+        || no "the bad key was not refused where it is loaded: $(tail -1 "$D/late.log")"
     [ ! -e "$D/late.stm" ] && ok "a failed format over a bad key leaves no image" || no "a failed format left an image"
     [ "$(cat "$D/late.stm.key")" = 'not a key' ] && ok "a failed format leaves a key it found" || no "a failed format changed a key it found"
 fi

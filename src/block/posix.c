@@ -530,7 +530,8 @@ stm_status stm_bdev_open_posix(const char *path,
     if (opts->direct) flags |= O_DIRECT;
 #endif
 
-    int fd = open(path, flags);
+    int fd = opts->claimed_fd ? stm_bdev_dup_claimed(*opts->claimed_fd, opts->read_only)
+                              : open(path, flags);
     if (fd < 0) {
         /* If device doesn't exist as a regular file, try creating it for the
          * loopback workflow. Users pass a path to a non-existent file; we
@@ -540,7 +541,7 @@ stm_status stm_bdev_open_posix(const char *path,
          * Only do this when RW and without O_DIRECT (direct I/O on a
          * zero-length file is pointless).
          */
-        if (errno == ENOENT && !opts->read_only) {
+        if (errno == ENOENT && !opts->read_only && !opts->claimed_fd) {
 #ifdef O_DIRECT
             int cflags = flags & ~O_DIRECT;
 #else

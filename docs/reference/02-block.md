@@ -44,6 +44,7 @@ Open options:
 | `queue_depth` | Async queue size. 0 → backend default (512). |
 | `fixed_buffer_bytes` | io_uring only — fixed-buffer region size. |
 | `posix_threads` | Thread-pool size on POSIX async. 0 → CPU count, capped 64. |
+| `claimed_fd` | NULL, or where a descriptor the caller holds on the device is (`stm_bdev_claim_image` gives one): that open file is the device, `path` only names it, nothing is created, and `direct` cannot be asked. A negative one stands for none. |
 
 `stm_bdev_caps` reports the backend actually selected, logical size,
 physical block size, max single-op size, whether TRIM / SQPOLL / DAX /

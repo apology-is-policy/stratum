@@ -7,8 +7,9 @@
  * leave one there.
  *
  *   STM_PLANT_AT    the path watched, as the string the program passes
- *   STM_PLANT_ON    "readlink:N" or "look:N": just before the Nth readlink of that
- *                   path, or the Nth stat or lstat of it; anything else leaves nothing
+ *   STM_PLANT_ON    "readlink:N", "look:N" or "open:N": just before the Nth readlink of
+ *                   that path, the Nth stat or lstat of it, or the Nth open of it;
+ *                   anything else leaves nothing
  *   STM_PLANT_TO    where the link points
  *   STM_PLANT_LOG   each watched call is appended here, one a line, and the planting
  *   STM_PLANT_OVER  not empty: the link takes the place of whatever is at the path,
@@ -24,10 +25,17 @@
  *   STM_PLANT_MOVE  a directory: at the moment, no link is left; the directory is
  *                   renamed to its name with ".away" after it and an empty one is made
  *                   at its name, as whoever owns a directory above it could do
+ *   STM_PLANT_PUT   with STM_PLANT_MOVE, a file: it is given a name in the directory
+ *                   made, STM_PLANT_PUT_AS with the program's pid after it. Whoever
+ *                   moved the directory away can leave a file of theirs there, under
+ *                   the name a program made its own file by.
+ *   STM_PLANT_LINK  where the link is left, where that is not the path watched: one
+ *                   path's moment, and a link at another
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +44,7 @@
 
 static int g_readlinks;
 static int g_looks;
+static int g_opens;
 
 static void say(const char *line)
 {
@@ -64,18 +73,27 @@ static void before(const char *kind, int *count, const char *path)
         snprintf(away, sizeof away, "%s.away", move);
         int r = rename(move, away);
         if (r == 0) r = mkdir(move, 0777);
+        const char *put = getenv("STM_PLANT_PUT");
+        const char *put_as = getenv("STM_PLANT_PUT_AS");
+        if (r == 0 && put && *put && put_as && *put_as) {
+            char there[4400];
+            snprintf(there, sizeof there, "%s/%s%ld", move, put_as, (long)getpid());
+            r = link(put, there);
+        }
         snprintf(line, sizeof line, "moved before %s: %s\n", moment,
                  r == 0 ? "done" : strerror(errno));
     } else if (on && to && strcmp(on, moment) == 0) {
         const char *over = getenv("STM_PLANT_OVER");
+        const char *where = getenv("STM_PLANT_LINK");
+        if (!where || !*where) where = at;
         int r;
         if (over && *over) {
             char beside[4200];
-            snprintf(beside, sizeof beside, "%s.over", at);
+            snprintf(beside, sizeof beside, "%s.over", where);
             r = symlink(to, beside);
-            if (r == 0) r = rename(beside, at);
+            if (r == 0) r = rename(beside, where);
         } else {
-            r = symlink(to, at);
+            r = symlink(to, where);
         }
         snprintf(line, sizeof line, "planted before %s: %s\n", moment,
                  r == 0 ? "done" : strerror(errno));
@@ -129,6 +147,19 @@ static int plant_lstat(const char *path, struct stat *st)
     return r;
 }
 
+static int plant_open(const char *path, int flags, ...)
+{
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    before("open", &g_opens, path);
+    return open(path, flags, mode);
+}
+
 #define PLANT_INTERPOSE(mine, theirs)                                              \
     __attribute__((used)) static const struct { const void *mine_; const void *theirs_; } \
     plant_interpose_##theirs __attribute__((section("__DATA,__interpose"))) =      \
@@ -137,6 +168,7 @@ static int plant_lstat(const char *path, struct stat *st)
 PLANT_INTERPOSE(plant_readlink, readlink);
 PLANT_INTERPOSE(plant_stat, stat);
 PLANT_INTERPOSE(plant_lstat, lstat);
+PLANT_INTERPOSE(plant_open, open);
 PLANT_INTERPOSE(plant_geteuid, geteuid);
 
 #else
@@ -187,6 +219,41 @@ PLANT_LOOK(lstat, stat)
 #if defined(__GLIBC__)
 PLANT_LOOK(stat64, stat64)
 PLANT_LOOK(lstat64, stat64)
+#endif
+
+/* This library's own opens come through here too, and are of no path watched. */
+#define PLANT_OPEN(name)                                                          \
+    int name(const char *path, int flags, ...)                                     \
+    {                                                                              \
+        static int (*real)(const char *, int, ...);                                \
+        mode_t mode = 0;                                                           \
+        if (flags & O_CREAT) {                                                     \
+            va_list ap;                                                            \
+            va_start(ap, flags);                                                   \
+            mode = (mode_t)va_arg(ap, int);                                        \
+            va_end(ap);                                                            \
+        }                                                                          \
+        if (!real) real = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, #name); \
+        before("open", &g_opens, path);                                            \
+        return real(path, flags, mode);                                            \
+    }
+
+/* What a fortified build calls for an open with two arguments. */
+#define PLANT_OPEN_2(name)                                                        \
+    int name(const char *path, int flags);                                         \
+    int name(const char *path, int flags)                                          \
+    {                                                                              \
+        static int (*real)(const char *, int);                                     \
+        if (!real) real = (int (*)(const char *, int))dlsym(RTLD_NEXT, #name);     \
+        before("open", &g_opens, path);                                            \
+        return real(path, flags);                                                  \
+    }
+
+PLANT_OPEN(open)
+#if defined(__GLIBC__)
+PLANT_OPEN(open64)
+PLANT_OPEN_2(__open_2)
+PLANT_OPEN_2(__open64_2)
 #endif
 
 #endif

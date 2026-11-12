@@ -55,6 +55,7 @@
 #include <stratum/alloc.h>       /* stm_alloc_stats (P9-CTL-1d-debug) */
 #include <stratum/dirent.h>      /* STM_DIRENT_NAME_MAX, STM_DT_* (P8-POSIX-4) */
 #include <stratum/sync.h>        /* stm_corvus_mount_cfg (TLY-A3-keyslot-wrap) */
+#include <stratum/keyfile.h>     /* stm_hybrid_keys */
 
 #ifdef __cplusplus
 extern "C" {
@@ -126,6 +127,19 @@ typedef struct {
     const char *keyfile_passphrase;
     size_t      keyfile_passphrase_len;
 
+    /* NULL, or the key-pair of `keyfile_path` as the caller loaded it through a
+     * descriptor it holds on that file (stm_keyfile_load_fd): the file is not read
+     * by its name then, so what the caller asked of the file it has open is asked of
+     * the key that is used, and the passphrase fields are not looked at.
+     * `keyfile_path` is still given, as the key's name. Read during the call alone;
+     * the caller wipes its copy. */
+    const stm_hybrid_keys *wrap_keys;
+
+    /* NULL, or where a descriptor the caller holds on the pool's file is
+     * (stm_bdev_claim_image): the pool is the file that descriptor has open, and
+     * `path` only names it; see stm_bdev_open_opts.claimed_fd. */
+    const int *claimed_fd;
+
     /* TLY-A1: 16-byte binding anchor written into the uberblock at
      * format. If all-zero (or omitted by zero-init), stm_fs_format
      * CSPRNG-generates a fresh value AND writes it back into this
@@ -138,7 +152,8 @@ typedef struct {
 } stm_fs_format_opts;
 
 /*
- * Create a fresh pool at `path`. Opens/creates the bdev, resizes if
+ * Create a fresh pool at `path`. Opens/creates the bdev (with `claimed_fd`,
+ * uses the file the caller has open and creates nothing), resizes if
  * `device_size_bytes` is nonzero, formats the bootstrap pool, creates
  * the allocator, writes the first uberblock. The pool is closed on
  * return; call stm_fs_mount to use it.
@@ -220,6 +235,19 @@ typedef struct {
      * client default ("/srv/corvus/ops/unwrap"). */
     const char *corvus_socket;
     const char *corvus_session_token_file;
+
+    /* NULL, or the key-pair of `keyfile_path` as the caller loaded it through a
+     * descriptor it holds on that file (stm_keyfile_load_fd): the file is not read
+     * by its name then, so what the caller asked of the file it has open is asked of
+     * the key that is used, and the passphrase fields are not looked at.
+     * `keyfile_path` is still given, as the key's name, and not `janus_socket`. Read during the call alone;
+     * the caller wipes its copy. */
+    const stm_hybrid_keys *wrap_keys;
+
+    /* NULL, or where a descriptor the caller holds on the pool's file is
+     * (stm_bdev_claim_image): the pool is the file that descriptor has open, and
+     * `path` only names it; see stm_bdev_open_opts.claimed_fd. */
+    const int *claimed_fd;
 } stm_fs_mount_opts;
 
 /*

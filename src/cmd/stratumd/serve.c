@@ -602,9 +602,10 @@ static bool inflight_drain_within(stratumd_inflight *f, unsigned ms)
 
 /* Every live connection, so that a stop can end the reading side of each
  * and a client that keeps talking cannot hold the daemon up. The request in
- * hand still finishes and its reply still goes out. Each entry owns a dup,
- * so a stop cannot reach a number its worker has closed and accept has since
- * reused. */
+ * hand still finishes and its reply still goes out. An entry owns a dup, so a
+ * stop cannot reach a number its worker has closed and accept has since
+ * reused; where a connection has the one descriptor (conn_has_one_descriptor)
+ * the entry holds none, and a stop reaches nothing of it. */
 typedef struct stratumd_conn {
     int                   dup_fd;
     struct stratumd_conn *next;
@@ -1501,7 +1502,7 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
  * --ctl-listen refused (one-shot, nothing to serve). */
 static stm_status image_must_exist(const char *path);
 
-static stm_status stratumd_run_provision(const stm_stratumd_opts *opts)
+static stm_status stratumd_run_provision(const stm_stratumd_opts *opts, const int *claimed_fd)
 {
     if (!opts->provision_dataset_name || !*opts->provision_dataset_name) {
         fprintf(stderr,
@@ -1579,6 +1580,7 @@ static stm_status stratumd_run_provision(const stm_stratumd_opts *opts)
                                     ? opts->pool_serial : NULL,
         .corvus_socket             = opts->corvus_unwrap_socket,
         .corvus_session_token_file = opts->corvus_session_token_file,
+        .claimed_fd                = claimed_fd,
     };
     stm_fs *fs = NULL;
     stm_status rc = image_must_exist(opts->fs_path);
@@ -1748,7 +1750,7 @@ static void say_why_mount_failed(const stm_stratumd_opts *opts, stm_status rc)
                     "or it is damaged\n", opts->fs_path);
 }
 
-static stm_status stratumd_run_locked(const stm_stratumd_opts *opts);
+static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *claimed_fd);
 
 stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
 {
@@ -1759,12 +1761,14 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
         stm_status s = image_lock(opts->fs_path, &lock_fd);
         if (s != STM_OK) return s;
     }
-    stm_status rc = stratumd_run_locked(opts);
+    /* The mount goes through the descriptor the lock is on: the image served is the
+     * one that is locked, wherever its name leads by the time it is mounted. */
+    stm_status rc = stratumd_run_locked(opts, &lock_fd);
     if (lock_fd >= 0) close(lock_fd);
     return rc;
 }
 
-static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
+static stm_status stratumd_run_locked(const stm_stratumd_opts *opts, const int *claimed_fd)
 {
 
     /* A-3: publish the host-bake owner override before any worker spawns
@@ -1789,7 +1793,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
      * mounts, creates the dataset, unmounts; binds no socket and does
      * not block. Branches before the serving mount-opts build below
      * (stratumd_run_provision builds its own). */
-    if (opts->provision_corvus) return stratumd_run_provision(opts);
+    if (opts->provision_corvus) return stratumd_run_provision(opts, claimed_fd);
 
     stm_fs_mount_opts mopts = {
         .read_only             = opts->read_only,
@@ -1804,6 +1808,7 @@ static stm_status stratumd_run_locked(const stm_stratumd_opts *opts)
          * consulted only when corvus_session_token_file is set. */
         .corvus_socket             = opts->corvus_unwrap_socket,
         .corvus_session_token_file = opts->corvus_session_token_file,
+        .claimed_fd                = claimed_fd,
     };
 
     stm_fs *fs = NULL;
