@@ -933,6 +933,39 @@ def stuck_daemon_leg(stratum, vol, host, root):
     ours.close()
     theirs.close()
     print(f'note: a Unix stream socket here holds {held} bytes with nothing read', flush=True)
+    # When a full socket takes a write again, and when the system calls it writable: where
+    # the two differ, a client that waits to be told has a daemon that reads for one that
+    # does not, and the 9P client tries its write each tick whatever it is told.
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    ours.setblocking(False)
+    try:
+        held = 0
+        try:
+            while True:
+                held += ours.send(bytes(1 << 20))
+        except BlockingIOError:
+            pass
+        read, left, taken_after, writable_after = 0, held, None, None
+        while left > 0 and (taken_after is None or writable_after is None):
+            got = len(theirs.recv(min(512, left)))
+            if got == 0:
+                break
+            left -= got
+            read += got
+            if writable_after is None and select.select([], [ours], [], 0)[1]:
+                writable_after = read
+            if taken_after is None:
+                try:
+                    ours.send(b'x')
+                    taken_after = read
+                except BlockingIOError:
+                    pass
+        print(f'note: filled a megabyte at a time it holds {held}; read 512 at a time, a write was '
+              f'taken again after {taken_after} bytes read and the socket was called writable after '
+              f'{writable_after}', flush=True)
+    finally:
+        ours.close()
+        theirs.close()
     if sys.platform.startswith('linux'):
         # Linux says how much of a socket's output is unread, and the 9P client takes less
         # of it than a wait before for the daemon taking: how many bytes a daemon has to
