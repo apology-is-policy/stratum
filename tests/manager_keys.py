@@ -920,6 +920,19 @@ def stuck_daemon_leg(stratum, vol, host, root):
     signal ends a read, and the daemons would run on, the volume unlocked, for as long as
     the one that is stuck."""
     call_given_up = 10  # tui.rs HELD_AFTER, in seconds
+    # What a daemon has yet to read of a message the manager has written whole: nothing
+    # is sent meanwhile, so it is out of the manager's sight unless the system tells.
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    ours.setblocking(False)
+    held = 0
+    try:
+        while True:
+            held += ours.send(bytes(32768))
+    except BlockingIOError:
+        pass
+    ours.close()
+    theirs.close()
+    print(f'note: a Unix stream socket here holds {held} bytes with nothing read', flush=True)
     for how, in_flight in (('a daemon stuck, the output gone', False),
                            ('a daemon stuck with a call to it in flight, the output gone', True)):
         env_file = f'{root}/env-stuck{int(in_flight)}'

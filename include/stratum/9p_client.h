@@ -166,7 +166,10 @@ typedef struct {
  * write or the read again each tick, whatever the kernel says of the socket. From the
  * first true, a wait of give_up_after_ms with nothing sent and nothing received ends
  * the call with STM_EIO (stm_9p_last_errno says ETIMEDOUT), and the client refuses
- * every later call with STM_EBACKEND: the reply given up on may still come. The
+ * every later call with STM_EBACKEND: the reply given up on may still come. Where the
+ * system tells how much of what was written the daemon has yet to read (Linux), its
+ * reading of that counts as sending does; elsewhere what the kernel holds of a message
+ * is read out of the client's sight (8 KiB on macOS). The
  * dial's connect is under the rule as well: one a listener holds is tried again each
  * tick, and given up the same way (the dial returns STM_EIO, errno ETIMEDOUT). A wait
  * counts for what it lasted and for a tick at most, so a process that was stopped, or

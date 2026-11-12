@@ -92,7 +92,15 @@ STM_EBACKEND. A wait counts for what it lasted and for a tick at most:
 a wait a signal cut short counts for less than a tick, and a process
 that was stopped, or a machine that slept, has not waited meanwhile.
 Bytes sent or received start the count again, so a daemon that is only
-slow is waited for. The dial's own handshake waits by the same rule,
+slow is waited for. So does the daemon's reading of what the kernel
+already holds, where the system tells of it. A message goes into the
+kernel's buffer ahead of the daemon's reading, and once it is all there
+nothing more is sent while the daemon reads on. Linux says how much of a
+socket's output is still unread (`SIOCOUTQ`), and at each tick less of
+it than at the tick before counts as taken (`daemon_took`). macOS does
+not say; it holds 8 KiB (measured), so there a daemon that takes more
+than the limit to read that much and to answer is given up as one that
+does not answer. The dial's own handshake waits by the same rule,
 and so does its connect: the socket is made not to wait before it
 connects, a connect the listener holds (Linux, a full backlog that
 nobody accepts from; macOS refuses such a connect at once) is tried
@@ -289,6 +297,7 @@ struct stm_9p_client {
     bool      poisoned;       /* tag-mismatch detected, or a call given up */
     stm_9p_wait wait;         /* copied at dial; to_leave NULL = none */
     uint64_t  waited_ms;      /* since to_leave said true, nothing moved */
+    int       unread;         /* Linux: the socket's unread output at the last tick; -1 */
     uint8_t  *buf;            /* msize-sized request/response buffer */
 };
 ```
@@ -440,7 +449,9 @@ the SERVER's correctness viewed through the wire:
   The wait rule is tested against a daemon of the test's own that
   takes a client through the dial and then never answers, answers a
   byte at a time, never reads, reads slowly, or reads a little at a
-  time (16 KiB each 50 ms: what Linux's poll is late for); and against
+  time (16 KiB each 50 ms of half a megabyte: what Linux's poll is late
+  for, and slow enough that the kernel's part of the message is still
+  being read twice the limit after the last byte went in); and against
   a listener with a full backlog that accepts no one. Each give-up is
   bounded from below by time and from above by a count of `to_leave`'s
   sayings of true, which the machine's load does not move.

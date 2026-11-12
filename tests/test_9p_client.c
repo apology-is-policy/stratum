@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -2796,7 +2797,7 @@ static void test_sleep_ms(long ms)
 /* What a fake daemon does with the first message after the dial. */
 enum {
     FAKE_NEVER_ANSWERS,    /* takes it, and says nothing */
-    FAKE_ANSWERS_SLOWLY,   /* an Rclunk, a byte each 60 ms */
+    FAKE_ANSWERS_SLOWLY,   /* an Rclunk, a byte each 100 ms */
     FAKE_NEVER_READS,      /* leaves it where the client put it */
     FAKE_READS_SLOWLY,     /* a Twrite taken 64 KiB each 30 ms, then its Rwrite */
     FAKE_READS_A_LITTLE,   /* a Twrite taken 16 KiB each 50 ms, then its Rwrite */
@@ -2815,6 +2816,10 @@ typedef struct {
     atomic_int  unread;
     pthread_t   thread;
 } fake_daemon;
+
+/* Where set, a daemon stores 1 there once it has read something after the dial. In
+ * memory a child of the test shares, for a test whose call is made in one. */
+static atomic_int *g_fake_took;
 
 static bool fake_read(int fd, uint8_t *buf, size_t n)
 {
@@ -2889,8 +2894,10 @@ static void *fake_daemon_thread(void *arg)
         if (!fake_take(fd, hdr)) goto end;
         fake_u32(out, 7);
         out[4] = STM_9P_RCLUNK; out[5] = hdr[5]; out[6] = hdr[6];
+        /* Each gap is under the limit, and their sum well over it even less the part of
+         * a tick that a wait ended by the byte's coming does not count. */
         for (int i = 0; i < 7; i++) {
-            if (i) test_sleep_ms(60);
+            if (i) test_sleep_ms(100);
             if (!fake_write(fd, out + i, 1)) goto end;
         }
     } else if (d->mode == FAKE_READS_SLOWLY || d->mode == FAKE_READS_A_LITTLE) {
@@ -2919,6 +2926,7 @@ static void *fake_daemon_thread(void *arg)
         } else if (poll(&p, 1, 20) > 0) {
             static uint8_t scrap[4096];
             if (read(fd, scrap, sizeof scrap) <= 0) break;
+            if (g_fake_took) atomic_store(g_fake_took, 1);
         }
     }
     if (d->mode == FAKE_NEVER_READS) {
@@ -2965,6 +2973,18 @@ static bool leave_once_it_is_time(void *arg)
 {
     leave_from *l = arg;
     if (test_mono_ms() < l->from_ms) return false;
+    l->said++;
+    return true;
+}
+
+/* to_leave: true once the daemon has taken the call's message. A count of askings
+ * that began before that would have the daemon's taking in it, which starts a count
+ * again where the client sees it. */
+typedef struct { atomic_int *took; unsigned said; } leave_taken;
+static bool leave_once_it_is_taken(void *arg)
+{
+    leave_taken *l = arg;
+    if (!atomic_load(l->took)) return false;
     l->said++;
     return true;
 }
@@ -3164,6 +3184,10 @@ STM_TEST(p9_client_wait_counts_a_wait_a_signal_cut_short_for_what_it_lasted)
 
 STM_TEST(p9_client_wait_does_not_count_the_time_its_process_was_stopped)
 {
+    atomic_int *took = mmap(NULL, sizeof *took, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    STM_ASSERT(took != MAP_FAILED);
+    atomic_init(took, 0);
+    g_fake_took = took;
     fake_daemon d;
     fake_daemon_start(&d, "wait_stopped", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
 
@@ -3175,8 +3199,8 @@ STM_TEST(p9_client_wait_does_not_count_the_time_its_process_was_stopped)
     STM_ASSERT(child >= 0);
     if (child == 0) {
         close(says[0]);
-        leave_from l = { 0, 0 };
-        stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+        leave_taken l = { took, 0 };
+        stm_9p_wait w = { leave_once_it_is_taken, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
         stm_9p_dial_opts o = default_dial_opts(100);
         o.wait = &w;
         stm_9p_client *c = NULL;
@@ -3218,6 +3242,8 @@ STM_TEST(p9_client_wait_does_not_count_the_time_its_process_was_stopped)
     /* The stop is one tick to the count, whatever it lasted. */
     STM_ASSERT(told[3] <= (int64_t)WAIT_MOST_ASKINGS);
     fake_daemon_stop(&d);
+    g_fake_took = NULL;
+    munmap(took, sizeof *took);
 }
 
 #define WAIT_LITTLE (512u * 1024u)
@@ -3226,7 +3252,9 @@ STM_TEST(p9_client_wait_does_not_count_the_time_its_process_was_stopped)
  * calls a Unix socket writable only once three quarters of its buffer are free, and
  * takes a write as soon as any of it is. A daemon that reads a little at a time is
  * reading, and a client that waited for the call alone would count it as one that
- * takes nothing. */
+ * takes nothing. So would one that looked only at what it sends: the last of the
+ * message is in the kernel long before this daemon has read it, more than twice the
+ * limit before on Linux, and nothing is sent or received while it reads that. */
 STM_TEST(p9_client_wait_takes_a_daemon_that_reads_a_little_at_a_time_for_one_that_reads)
 {
     fake_daemon d;
@@ -3246,6 +3274,9 @@ STM_TEST(p9_client_wait_takes_a_daemon_that_reads_a_little_at_a_time_for_one_tha
     stm_status rc = stm_9p_write(c, 100, 0, big, WAIT_LITTLE, &written);
     uint64_t took = test_mono_ms() - began;
     free(big);
+    if (rc != STM_OK)
+        printf("  the call ended %d after %llu ms, errno %d\n", (int)rc, (unsigned long long)took,
+               stm_9p_last_errno(c));
     STM_ASSERT_OK(rc);
     STM_ASSERT_EQ(written, WAIT_LITTLE);
     /* Taken inside the limit, it proves nothing. */

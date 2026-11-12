@@ -44,6 +44,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <sys/ioctl.h>
+#include <linux/sockios.h>
+#endif
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* Wire pack/unpack — LE everywhere per 9P2000 spec.                     */
 /* ────────────────────────────────────────────────────────────────────── */
@@ -155,9 +160,13 @@ struct stm_9p_client {
     uint8_t  *buf;
     uint32_t  buf_cap;
     /* How a call waits (to_leave NULL: in the read or the write itself), and how long
-     * this client has waited since to_leave said true with nothing sent or received. */
+     * this client has waited since to_leave said true with nothing sent, nothing
+     * received, and nothing the daemon was seen to take. */
     stm_9p_wait wait;
     uint64_t    waited_ms;
+    /* How much of this client's writes the kernel held unread when it was last asked,
+     * where it tells; -1 before the first asking. */
+    int         unread;
 };
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -178,6 +187,25 @@ static uint64_t counted_ms(const stm_9p_wait *w, uint64_t began)
     return took < w->tick_ms ? took : w->tick_ms;
 }
 
+/* Whether the daemon has read any of what the kernel held of this client's writes since
+ * this was last asked. A message goes into the kernel's buffer ahead of the daemon's
+ * reading of it, and once it is all there nothing more is sent while the daemon reads
+ * on. Linux tells how much of a socket's output is still unread, and less of it than
+ * last time is the daemon taking. macOS does not tell; it holds 8 KiB. */
+static bool daemon_took(stm_9p_client *c)
+{
+#if defined(__linux__)
+    int unread = 0;
+    if (ioctl(c->fd, SIOCOUTQ, &unread) != 0) return false;
+    bool took = c->unread >= 0 && unread < c->unread;
+    c->unread = unread;
+    return took;
+#else
+    (void)c;
+    return false;
+#endif
+}
+
 /* A client with a wait rule, whose socket does not wait in a read or a write: waits a
  * tick for it to be readable or writable, and counts the wait where the call is to be
  * left. STM_OK for the read or the write to be tried again, which it is each tick
@@ -188,13 +216,20 @@ static stm_status wait_until(stm_9p_client *c, short events)
     struct pollfd p = { .fd = c->fd, .events = events, .revents = 0 };
     uint64_t began = mono_ms();
     int n = poll(&p, 1, (int)c->wait.tick_ms);
+    int poll_errno = errno;
+    /* Asked at every wait, so that what the next is held against is one wait old. */
+    bool took = daemon_took(c);
     if (n > 0) return STM_OK;
-    if (n < 0 && errno != EINTR) {
-        c->last_errno = errno;
+    if (n < 0 && poll_errno != EINTR) {
+        c->last_errno = poll_errno;
         return STM_EIO;
     }
     /* Nothing asked: a daemon may take as long as it takes, and nothing is counted. */
     if (!c->wait.to_leave(c->wait.arg)) return STM_OK;
+    if (took) {
+        c->waited_ms = 0;
+        return STM_OK;
+    }
     c->waited_ms += counted_ms(&c->wait, began);
     if (c->waited_ms >= c->wait.give_up_after_ms) {
         c->poisoned = 1;
@@ -573,6 +608,7 @@ stm_status stm_9p_dial_unix(const char *socket_path,
     c->fd = -1;
     c->next_tag = 1;
     if (opts->wait) c->wait = *opts->wait;
+    c->unread = -1;
     c->buf_cap = msize;
     c->buf = (uint8_t *)malloc(msize);
     if (!c->buf) {
