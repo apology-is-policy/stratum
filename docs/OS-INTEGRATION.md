@@ -612,11 +612,11 @@ In rough order of how often they bite OS integrators:
 
 ### What ships
 
-- **C suite**: one ctest binary for each `tests/test_*.c`, 82 today, covering every subsystem. Run via `ctest --test-dir build --output-on-failure`, as CI does. Baseline: all pass.
+- **C suite**: one ctest binary for each `tests/test_*.c`, 82 today, covering every subsystem. Run via `ctest --test-dir build --output-on-failure`, which is what CI runs. Baseline: all pass with no sanitizer; under the sanitizers some do not yet (`docs/PRODUCTION-PLAN.md`, T1.1).
 - **Rust e2e**: a CRUD harness against a live stratumd over the wire, `tools/stratum/tests/e2e_crud.rs`, 35 cases today. Run via `cargo test --release` in `tools/stratum/`.
 - **Slate socket**: `tests/test_slate_socket.c` in the C suite, against a slate served in the test's own process. The Rust renderer that carried its own smoke test, `tools/stratum-slate-tty/`, is removed.
 - **Concurrent /ctl/**: 2-case Rust harness verifying concurrent-accept wall-time bounds. `tools/stratum/tests/concurrent_ctl.rs`.
-- **Compound-op race class**: 9-case pthread harness in `tests/test_compound_ops_concurrent.c`. Each case proves a specific lock-order or atomicity invariant.
+- **Compound-op race class**: 17-case pthread harness in `tests/test_compound_ops_concurrent.c`. Each case proves a specific lock-order or atomicity invariant.
 
 ### For your OS
 

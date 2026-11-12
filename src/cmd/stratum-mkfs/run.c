@@ -290,6 +290,15 @@ static void say_links_too_many(const char *keyfile_path)
         "them, or names a path too long: name the key file itself\n", keyfile_path);
 }
 
+/* Where a link is at the end of the links that were read, left there since: nobody
+ * was asked about it. */
+static void say_link_unasked(const char *keyfile_path)
+{
+    fprintf(stderr,
+        "stratum-mkfs: a link turned up at keyfile %s while it was being looked at, so "
+        "nothing was asked of it: see who left it before running again\n", keyfile_path);
+}
+
 /*
  * Formatting over a pool loses it, and over a pool's key loses it just as
  * surely, so neither happens by naming the wrong path. The claim is held until
@@ -313,7 +322,13 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
         say_links_too_many(keyfile_path);
         return true;
     }
-    if (force || stat(keyfile_path, &st) != 0) return false;
+    /* Looked at where the links just read end, and not through the name: a stat of
+     * the name would follow a link left there since they were read. */
+    if (force || lstat(leads_to, &st) != 0) return false;
+    if (S_ISLNK(st.st_mode)) {
+        say_link_unasked(keyfile_path);
+        return true;
+    }
     if (!replaces_key) {
         const char *why = key_not_the_users(&st, key_as_is);
         if (!why) {
@@ -673,8 +688,9 @@ int stm_cmd_mkfs_main(int argc, char **argv)
          * what was there then: a link left at a free name since would be followed
          * here unasked. */
         fprintf(stderr,
-            "stratum-mkfs: keyfile %s was not there when the volume was claimed and is "
-            "now, so nothing has been asked of it: run again to use it\n", keyfile_path);
+            "stratum-mkfs: keyfile %s turned up after the volume was claimed, so nothing "
+            "was asked of it: see what is there, who owns it and where a link leads, "
+            "before running again\n", keyfile_path);
         exit_code = 1;
         goto cleanup;
     } else if (!have_pass && !force && key_not_the_users(&st, key_as_is)) {

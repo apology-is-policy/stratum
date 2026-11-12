@@ -9,6 +9,7 @@ B=${1:?usage: volume_smoke.sh path/to/stratum}
 [ -x "$B" ] || { echo "FAIL: $B is not executable"; exit 2; }
 # One check runs it from another directory.
 case "$B" in /*) ;; *) B=$PWD/$B ;; esac
+HERE=$(cd "$(dirname "$0")" && pwd)
 
 D=$(mktemp -d "${TMPDIR:-/tmp}/stratum-volume.XXXXXX") || exit 2
 V=$D/vol.stm
@@ -299,6 +300,73 @@ if [ "$rc" != 0 ] && LC_ALL=C grep -q '^stratum-mkfs: keyfile .* is not a regula
     ok "with --key-as-is too, a directory at the key's name is no key"
 else
     no "--key-as-is and a directory at the key's name: rc=$rc: $(tail -1 "$D/dirkey.log"); image left: $([ -e "$D/dirkey.stm" ] && echo yes || echo no)"
+fi
+
+# A link left at the key's name while mkfs is looking at it. No second process can leave one
+# between two of mkfs's own system calls, so a small library loaded into mkfs does it, just before
+# the call it is told (tests/plant_at_look.c). mkfs reads the links at the name and then looks at
+# what they end in, once before it makes the image and once after; it looks again before it uses
+# a key; and it reads the links once more where it makes one. A link it read is one it asked
+# about. One left after that must not be followed.
+case "$(uname -s)" in
+    Darwin) PLANT_LIB=$D/plant.dylib; PLANT_HOW=-dynamiclib ;;
+    *)      PLANT_LIB=$D/plant.so;    PLANT_HOW="-shared -fPIC" ;;
+esac
+# planted TAG MOMENT: mkfs for $D/pl-TAG.stm with the key name $D/pl-TAG.key, and a link to a key
+# of the user's own left at that name just before MOMENT. Not through env(1): macOS drops the
+# variable on the way through a system binary.
+planted() {
+    if [ "$(uname -s)" = Darwin ]; then
+        DYLD_INSERT_LIBRARIES="$PLANT_LIB" STM_PLANT_AT="$D/pl-$1.key" STM_PLANT_ON="$2" STM_PLANT_TO="$D/pl-own.key" \
+            STM_PLANT_LOG="$D/pl-$1.plant" "$B" mkfs "$D/pl-$1.stm" --size 64M --keyfile "$D/pl-$1.key" < /dev/null > "$D/pl-$1.log" 2>&1
+    else
+        LD_PRELOAD="$PLANT_LIB" STM_PLANT_AT="$D/pl-$1.key" STM_PLANT_ON="$2" STM_PLANT_TO="$D/pl-own.key" \
+            STM_PLANT_LOG="$D/pl-$1.plant" "$B" mkfs "$D/pl-$1.stm" --size 64M --keyfile "$D/pl-$1.key" < /dev/null > "$D/pl-$1.log" 2>&1
+    fi
+}
+moments() { tr '\n' ' ' < "$D/pl-$1.plant" 2>/dev/null; }
+if ! command -v cc > /dev/null 2>&1; then
+    skipped "a link left at the key's name while mkfs looks: the library that leaves it needs a C compiler"
+elif ! cc $PLANT_HOW -o "$PLANT_LIB" "$HERE/plant_at_look.c" -ldl > "$D/plant-build.log" 2>&1; then
+    no "the library that leaves a link while mkfs looks did not build: $(head -1 "$D/plant-build.log")"
+elif ! "$B" mkfs "$D/pl-own.stm" --size 64M --keyfile "$D/pl-own.key" < /dev/null > "$D/pl-own.log" 2>&1; then
+    no "a key of the user's own for the planted links: $(tail -1 "$D/pl-own.log")"
+else
+    # Nothing left: what the library sees says which moment is which below. If mkfs comes to look
+    # more or fewer times, this is the check that says so, and the three under it need their
+    # moments named again.
+    planted none nothing; rc=$?
+    if [ "$rc" = 0 ] && [ "$(moments none)" = "readlink:1 look:1 readlink:2 look:2 look:3 readlink:3 " ] \
+            && LC_ALL=C grep -q 'generated keyfile' "$D/pl-none.log"; then
+        ok "the library sees each time mkfs reads the key's links and looks at the key"
+    else
+        no "mkfs's looks at its key, as the library saw them: rc=$rc: $(moments none): $(tail -1 "$D/pl-none.log")"
+    fi
+    # The control: a link that is there before the first reading is asked about, is the user's
+    # own, and is followed.
+    planted first readlink:1; rc=$?
+    if [ "$rc" = 0 ] && LC_ALL=C grep -q '^planted before readlink:1: done$' "$D/pl-first.plant" \
+            && LC_ALL=C grep -q 'using existing keyfile' "$D/pl-first.log" && [ -s "$D/pl-first.stm" ]; then
+        ok "a link of the user's own that mkfs read at the key's name is followed"
+    else
+        no "a link there before mkfs read the key's links: rc=$rc: $(moments first): $(tail -1 "$D/pl-first.log")"
+    fi
+    # Left after the claim's last reading of the links and before its look at the key.
+    planted claim look:2; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:2: done$' "$D/pl-claim.plant" \
+            && LC_ALL=C grep -q 'a link turned up at keyfile' "$D/pl-claim.log" && [ ! -e "$D/pl-claim.stm" ]; then
+        ok "a link left after the claim read the key's links is not followed, and nothing is made"
+    else
+        no "a link left after the claim read the key's links: rc=$rc: $(moments claim): $(tail -1 "$D/pl-claim.log"); image left: $([ -e "$D/pl-claim.stm" ] && echo yes || echo no)"
+    fi
+    # Left after the claim, before the look that decides whether there is a key to use.
+    planted use look:3; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:3: done$' "$D/pl-use.plant" \
+            && LC_ALL=C grep -q 'turned up after the volume was claimed' "$D/pl-use.log" && [ ! -e "$D/pl-use.stm" ]; then
+        ok "a link left between the claim and the use of the key is not followed, and nothing is made"
+    else
+        no "a link left between the claim and the use: rc=$rc: $(moments use): $(tail -1 "$D/pl-use.log"); image left: $([ -e "$D/pl-use.stm" ] && echo yes || echo no)"
+    fi
 fi
 
 # The links at the key's name are asked about one by one, seven at most. More than that are refused, not

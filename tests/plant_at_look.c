@@ -1,0 +1,126 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/*
+ * Loaded into mkfs by tests/volume_smoke.sh (LD_PRELOAD, or DYLD_INSERT_LIBRARIES on
+ * macOS), never linked into anything: it leaves a symlink at a path at one exact moment
+ * of the program's own looking at that path. What mkfs must not do is follow a link
+ * that turned up between two of its looks, and no second process can be timed to
+ * leave one there.
+ *
+ *   STM_PLANT_AT   the path watched, as the string the program passes
+ *   STM_PLANT_ON   "readlink:N" or "look:N": just before the Nth readlink of that
+ *                  path, or the Nth stat or lstat of it; anything else leaves nothing
+ *   STM_PLANT_TO   where the link points
+ *   STM_PLANT_LOG  each watched call is appended here, one a line, and the planting
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int g_readlinks;
+static int g_looks;
+
+static void say(const char *line)
+{
+    const char *log = getenv("STM_PLANT_LOG");
+    if (!log) return;
+    int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return;
+    ssize_t w = write(fd, line, strlen(line));
+    (void)w;
+    close(fd);
+}
+
+static void before(const char *kind, int *count, const char *path)
+{
+    const char *at = getenv("STM_PLANT_AT");
+    if (!at || !path || strcmp(at, path) != 0) return;
+    int saved = errno;
+    char moment[64];
+    char line[160];
+    snprintf(moment, sizeof moment, "%s:%d", kind, ++*count);
+    const char *on = getenv("STM_PLANT_ON");
+    const char *to = getenv("STM_PLANT_TO");
+    if (on && to && strcmp(on, moment) == 0) {
+        int r = symlink(to, at);
+        snprintf(line, sizeof line, "planted before %s: %s\n", moment,
+                 r == 0 ? "done" : strerror(errno));
+    } else {
+        snprintf(line, sizeof line, "%s\n", moment);
+    }
+    say(line);
+    errno = saved;
+}
+
+#if defined(__APPLE__)
+
+static ssize_t plant_readlink(const char *path, char *buf, size_t n)
+{
+    before("readlink", &g_readlinks, path);
+    return readlink(path, buf, n);
+}
+
+static int plant_stat(const char *path, struct stat *st)
+{
+    before("look", &g_looks, path);
+    return stat(path, st);
+}
+
+static int plant_lstat(const char *path, struct stat *st)
+{
+    before("look", &g_looks, path);
+    return lstat(path, st);
+}
+
+#define PLANT_INTERPOSE(mine, theirs)                                              \
+    __attribute__((used)) static const struct { const void *mine_; const void *theirs_; } \
+    plant_interpose_##theirs __attribute__((section("__DATA,__interpose"))) =      \
+        { (const void *)(unsigned long)&mine, (const void *)(unsigned long)&theirs }
+
+PLANT_INTERPOSE(plant_readlink, readlink);
+PLANT_INTERPOSE(plant_stat, stat);
+PLANT_INTERPOSE(plant_lstat, lstat);
+
+#else
+
+#include <dlfcn.h>
+
+ssize_t readlink(const char *path, char *buf, size_t n)
+{
+    static ssize_t (*real)(const char *, char *, size_t);
+    if (!real) real = (ssize_t (*)(const char *, char *, size_t))dlsym(RTLD_NEXT, "readlink");
+    before("readlink", &g_readlinks, path);
+    return real(path, buf, n);
+}
+
+/* What a fortified build calls where it cannot see that the length fits. */
+ssize_t __readlink_chk(const char *path, char *buf, size_t n, size_t room);
+ssize_t __readlink_chk(const char *path, char *buf, size_t n, size_t room)
+{
+    static ssize_t (*real)(const char *, char *, size_t, size_t);
+    if (!real)
+        real = (ssize_t (*)(const char *, char *, size_t, size_t))dlsym(RTLD_NEXT, "__readlink_chk");
+    before("readlink", &g_readlinks, path);
+    return real(path, buf, n, room);
+}
+
+/* A program built with 64-bit file offsets asked for calls the 64 names. */
+#define PLANT_LOOK(name, type)                                                    \
+    int name(const char *path, struct type *st)                                    \
+    {                                                                              \
+        static int (*real)(const char *, struct type *);                           \
+        if (!real) real = (int (*)(const char *, struct type *))dlsym(RTLD_NEXT, #name); \
+        before("look", &g_looks, path);                                            \
+        return real(path, st);                                                     \
+    }
+
+PLANT_LOOK(stat, stat)
+PLANT_LOOK(lstat, stat)
+PLANT_LOOK(stat64, stat64)
+PLANT_LOOK(lstat64, stat64)
+
+#endif
