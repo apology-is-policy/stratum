@@ -339,16 +339,18 @@ static void say_links_refused(const char *keyfile_path, const struct key_walk *w
 /* Where the name reaches something the links read from it do not end in. */
 static void say_name_leads_elsewhere(const char *keyfile_path)
 {
+    /* Chosen out here: fprintf can be a macro, and a directive among a macro's arguments
+     * is undefined. */
+#if defined(__thylacine__)
+    const char *whose = "a share's, whose text the kernel reads from the share's root";
+#else
+    const char *whose = "a descriptor's, whose text names no file (a pipe's, an unlinked file's)";
+#endif
     fprintf(stderr,
         "stratum-mkfs: keyfile %s does not lead where its links were read to end: a link "
         "or a file was left or changed on its way while it was looked at, or one of its "
-#if defined(__thylacine__)
-        "links is a share's, whose text the kernel reads from the share's root: "
-#else
-        "links is a descriptor's, whose text names no file (a pipe's, an unlinked file's): "
-#endif
-        "name the key file itself, or see what was left, before running again\n",
-        keyfile_path);
+        "links is %s: name the key file itself, or see what was left, before running "
+        "again\n", keyfile_path, whose);
 }
 
 /* The directory part of a path, "." where it has none. False when it does not fit. */
