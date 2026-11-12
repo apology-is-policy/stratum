@@ -493,9 +493,9 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
                                        const struct stm_ds_policy_table *user_policy);
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-/* Test only: dup() of a connection answers ENOSYS, as Thylacine's pouch does for
- * a socket. */
-extern bool stm_stratumd_test_dup_unsupported;
+/* Test only: a connection is served with the one descriptor accept() gave, as on
+ * Thylacine, whose kernel refuses a second. */
+extern bool stm_stratumd_test_one_descriptor;
 /* Test only: called by stm_stratumd_run just before its FS socket takes its path. */
 extern void (*stm_stratumd_test_before_publish)(void);
 #endif

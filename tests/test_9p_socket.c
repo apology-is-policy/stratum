@@ -300,10 +300,19 @@ STM_TEST(p9_socket_listen_then_handshake) {
 }
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
+static int open_descriptors(void)
+{
+    int n = 0;
+    for (int fd = 0; fd < 1024; fd++)
+        if (fcntl(fd, F_GETFD) != -1) n++;
+    return n;
+}
+
 STM_TEST(p9_socket_a_connection_that_cannot_be_duplicated_is_served) {
-    /* Thylacine's pouch answers ENOSYS to dup() of a socket, and the daemon dups
-     * each connection so that a stop can reach it. Refusing every connection
-     * there would leave the volume unreachable. */
+    /* The daemon dups each connection so that a stop can reach it, and Thylacine's
+     * kernel refuses a second descriptor on a /srv connection (EACCES). A daemon
+     * that refused what it cannot dup would leave the volume unreachable there, so
+     * it asks for none. */
     make_tmp("9p_sock_nodup");
     build_sock_path("nodup");
     stm_fs_format_opts fopts = default_format_opts();
@@ -321,18 +330,32 @@ STM_TEST(p9_socket_a_connection_that_cannot_be_duplicated_is_served) {
     accept_ctx ctx = { .listen_fd = listen_fd, .fs = fs,
                         .run_status = STM_EBACKEND };
     atomic_init(&ctx.stop_flag, false);
-    stm_stratumd_test_dup_unsupported = true;
+    stm_stratumd_test_one_descriptor = true;
     pthread_t worker;
     STM_ASSERT_EQ(pthread_create(&worker, NULL, accept_loop_thread, &ctx), 0);
 
+    /* The daemon runs in this process, so a connection is the client's end and the
+     * daemon's: two descriptors, and a third where the daemon took a second. */
+    int before = open_descriptors();
     int cfd = connect_client(g_sock_path);
     STM_ASSERT_TRUE(cfd >= 0);
     STM_ASSERT_EQ(do_handshake(cfd, /*fid=*/100), 0);
     STM_ASSERT_EQ(do_clunk(cfd, /*tag=*/2, /*fid=*/100), 0);
+    int with_one = open_descriptors();
+    STM_ASSERT_EQ(with_one - before, 2);
+
+    /* The count sees a second descriptor where there is one. */
+    stm_stratumd_test_one_descriptor = false;
+    int cfd2 = connect_client(g_sock_path);
+    STM_ASSERT_TRUE(cfd2 >= 0);
+    STM_ASSERT_EQ(do_handshake(cfd2, /*fid=*/100), 0);
+    STM_ASSERT_EQ(do_clunk(cfd2, /*tag=*/2, /*fid=*/100), 0);
+    STM_ASSERT_EQ(open_descriptors() - with_one, 3);
+
     if (cfd >= 0) close(cfd);
+    if (cfd2 >= 0) close(cfd2);
 
     wake_and_join(&ctx, worker);
-    stm_stratumd_test_dup_unsupported = false;
     STM_ASSERT_EQ(ctx.run_status, STM_OK);
 
     close(listen_fd);

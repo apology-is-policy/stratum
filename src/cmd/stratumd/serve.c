@@ -614,34 +614,40 @@ static pthread_mutex_t g_conns_mu = PTHREAD_MUTEX_INITIALIZER;
 static stratumd_conn  *g_conns    = NULL;
 
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-bool stm_stratumd_test_dup_unsupported = false;
+bool stm_stratumd_test_one_descriptor = false;
 void (*stm_stratumd_test_before_publish)(void) = NULL;
 #endif
 
-static int conn_dup(int fd)
+/* Thylacine's kernel keeps a /srv connection to the descriptor accept() gave: a
+ * dup of one is refused (EACCES), and a shutdown() of one is not served. A
+ * connection there is tracked with nothing a stop can reach, and a stop waits for
+ * it to end. */
+static bool conn_has_one_descriptor(void)
 {
-#ifdef STRATUM_BUILD_TESTING_HOOKS
-    if (stm_stratumd_test_dup_unsupported) {
-        errno = ENOSYS;
-        return -1;
-    }
+#if defined(__thylacine__)
+    return true;
+#elif defined(STRATUM_BUILD_TESTING_HOOKS)
+    return stm_stratumd_test_one_descriptor;
+#else
+    return false;
 #endif
-    return dup(fd);
 }
 
 static stratumd_conn *stratumd_conn_track(int client_fd)
 {
     stratumd_conn *c = malloc(sizeof *c);
     if (!c) return NULL;
-    c->dup_fd = conn_dup(client_fd);
-    if (c->dup_fd < 0 && errno != ENOSYS) {
-        free(c);
-        return NULL;
+    c->dup_fd = -1;
+    if (!conn_has_one_descriptor()) {
+        c->dup_fd = dup(client_fd);
+        if (c->dup_fd < 0) {
+            int e = errno;
+            free(c);
+            errno = e;
+            return NULL;
+        }
+        (void)fcntl(c->dup_fd, F_SETFD, FD_CLOEXEC);
     }
-    /* Thylacine's pouch cannot duplicate a socket (ENOSYS). Such a connection is
-     * served with nothing a stop can reach, so a stop waits for it to end, which
-     * is all a stop gets there anyway: shutdown on a /srv stream does nothing. */
-    if (c->dup_fd >= 0) (void)fcntl(c->dup_fd, F_SETFD, FD_CLOEXEC);
     pthread_mutex_lock(&g_conns_mu);
     c->next = g_conns;
     g_conns = c;
