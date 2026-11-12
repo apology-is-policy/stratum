@@ -162,13 +162,17 @@ typedef struct {
  * own type-vs-flag invariants. */
 
 /* How a call waits for its daemon. Where a message cannot be sent or its reply has
- * not come, the call waits a tick at a time and asks to_leave between. From the first
- * true, a wait of give_up_after_ms with nothing sent and nothing received ends the
- * call with STM_EIO (stm_9p_last_errno says ETIMEDOUT), and the client refuses every
- * later call with STM_EBACKEND: the reply given up on may still come. A wait counts
- * for what it lasted and for a tick at most, so a process that was stopped, or a
- * machine that slept, has not waited meanwhile. to_leave is called on the calling
- * thread. tick_ms and give_up_after_ms are not 0. */
+ * not come, the call waits a tick at a time, asks to_leave between, and tries the
+ * write or the read again each tick, whatever the kernel says of the socket. From the
+ * first true, a wait of give_up_after_ms with nothing sent and nothing received ends
+ * the call with STM_EIO (stm_9p_last_errno says ETIMEDOUT), and the client refuses
+ * every later call with STM_EBACKEND: the reply given up on may still come. The
+ * dial's connect is under the rule as well: one a listener holds is tried again each
+ * tick, and given up the same way (the dial returns STM_EIO, errno ETIMEDOUT). A wait
+ * counts for what it lasted and for a tick at most, so a process that was stopped, or
+ * a machine that slept, has not waited meanwhile. to_leave is called on the calling
+ * thread. tick_ms and give_up_after_ms are not 0, and tick_ms is no more than INT_MAX:
+ * it is poll's timeout. */
 typedef struct {
     bool   (*to_leave)(void *arg);
     void    *arg;
@@ -213,9 +217,10 @@ typedef struct {
  * Returns:
  *   - STM_OK on success.
  *   - STM_EINVAL on NULL args, malformed opts (root_fid == NOFID; a wait
- *     with no to_leave, or with a tick or a limit of 0).
- *   - STM_EIO on connect/socket error (errno preserved in
- *     stm_9p_last_errno).
+ *     with no to_leave, with a tick or a limit of 0, or with a tick
+ *     above INT_MAX).
+ *   - STM_EIO on connect/socket error; for the connect, errno says
+ *     which (ETIMEDOUT where a wait rule gave it up).
  *   - STM_EBACKEND if the server's Rversion advertises a non-.L
  *     dialect.
  *   - STM_EOVERFLOW if the server's negotiated msize is below

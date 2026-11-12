@@ -33,6 +33,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -156,7 +157,7 @@ struct stm_9p_client {
     /* How a call waits (to_leave NULL: in the read or the write itself), and how long
      * this client has waited since to_leave said true with nothing sent or received. */
     stm_9p_wait wait;
-    uint32_t    waited_ms;
+    uint64_t    waited_ms;
 };
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -170,30 +171,37 @@ static uint64_t mono_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
-/* A client with a wait rule, whose socket does not wait in a read or a write: waits
- * until it can be read or written, a tick at a time. STM_OK where it can, or where it
- * has an end or an error for the read or the write to say. */
+/* How long a wait that began at `began` counts for: what it lasted, and a tick at most. */
+static uint64_t counted_ms(const stm_9p_wait *w, uint64_t began)
+{
+    uint64_t took = mono_ms() - began;
+    return took < w->tick_ms ? took : w->tick_ms;
+}
+
+/* A client with a wait rule, whose socket does not wait in a read or a write: waits a
+ * tick for it to be readable or writable, and counts the wait where the call is to be
+ * left. STM_OK for the read or the write to be tried again, which it is each tick
+ * whatever poll said: a kernel may take a write some time before it calls the socket
+ * writable, and a daemon that reads is not one that takes nothing. */
 static stm_status wait_until(stm_9p_client *c, short events)
 {
-    for (;;) {
-        struct pollfd p = { .fd = c->fd, .events = events, .revents = 0 };
-        uint64_t began = mono_ms();
-        int n = poll(&p, 1, (int)c->wait.tick_ms);
-        if (n > 0) return STM_OK;
-        if (n < 0 && errno != EINTR) {
-            c->last_errno = errno;
-            return STM_EIO;
-        }
-        /* Nothing asked: a daemon may take as long as it takes, and nothing is counted. */
-        if (!c->wait.to_leave(c->wait.arg)) continue;
-        uint64_t took = mono_ms() - began;
-        c->waited_ms += took < c->wait.tick_ms ? (uint32_t)took : c->wait.tick_ms;
-        if (c->waited_ms >= c->wait.give_up_after_ms) {
-            c->poisoned = 1;
-            c->last_errno = ETIMEDOUT;
-            return STM_EIO;
-        }
+    struct pollfd p = { .fd = c->fd, .events = events, .revents = 0 };
+    uint64_t began = mono_ms();
+    int n = poll(&p, 1, (int)c->wait.tick_ms);
+    if (n > 0) return STM_OK;
+    if (n < 0 && errno != EINTR) {
+        c->last_errno = errno;
+        return STM_EIO;
     }
+    /* Nothing asked: a daemon may take as long as it takes, and nothing is counted. */
+    if (!c->wait.to_leave(c->wait.arg)) return STM_OK;
+    c->waited_ms += counted_ms(&c->wait, began);
+    if (c->waited_ms >= c->wait.give_up_after_ms) {
+        c->poisoned = 1;
+        c->last_errno = ETIMEDOUT;
+        return STM_EIO;
+    }
+    return STM_OK;
 }
 
 static stm_status send_all(stm_9p_client *c, const void *buf, size_t len)
@@ -378,10 +386,16 @@ void stm_9p_close(stm_9p_client *c)
 }
 
 /* Connect a Unix socket to socket_path. Errors propagate via *out_fd
- * being -1 with c->last_errno populated. Single-attempt; retries
+ * being -1 with *out_errno populated. Single-attempt; retries
  * are the caller's policy at the lib boundary (test harness uses
- * the connect_client helper for that). */
-static stm_status do_connect(const char *socket_path, int *out_fd, int *out_errno)
+ * the connect_client helper for that).
+ *
+ * Under a wait rule the socket never waits in the kernel, the connect neither: a
+ * listener that takes nobody holds a connect that may wait (Linux, its backlog full)
+ * where no asking reaches it. So the connect is tried again each tick while the
+ * listener holds it, and given up by the rule, with ETIMEDOUT. */
+static stm_status do_connect(const char *socket_path, const stm_9p_wait *wait,
+                             int *out_fd, int *out_errno)
 {
     *out_fd = -1;
     if (!socket_path) return STM_EINVAL;
@@ -399,10 +413,36 @@ static stm_status do_connect(const char *socket_path, int *out_fd, int *out_errn
     memset(&addr, 0, sizeof addr);
     addr.sun_family = AF_UNIX;
     memcpy(addr.sun_path, socket_path, plen + 1);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
-        *out_errno = errno;
-        close(fd);
-        return STM_EIO;
+    if (wait->to_leave) {
+        /* A read or a write that waited in the kernel could take no look. The flag on
+         * one message would not do: macOS waits in a send that does not fit all the same. */
+        int fl = fcntl(fd, F_GETFL);
+        if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0) {
+            *out_errno = errno;
+            close(fd);
+            return STM_EIO;
+        }
+    }
+    uint64_t waited_ms = 0;
+    while (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        /* What a connect that was under way says once it is made. */
+        if (errno == EISCONN) break;
+        bool held = errno == EAGAIN || errno == EINPROGRESS || errno == EALREADY
+            || errno == EINTR;
+        if (!wait->to_leave || !held) {
+            *out_errno = errno;
+            close(fd);
+            return STM_EIO;
+        }
+        uint64_t began = mono_ms();
+        (void)poll(NULL, 0, (int)wait->tick_ms);
+        if (!wait->to_leave(wait->arg)) continue;
+        waited_ms += counted_ms(wait, began);
+        if (waited_ms >= wait->give_up_after_ms) {
+            *out_errno = ETIMEDOUT;
+            close(fd);
+            return STM_EIO;
+        }
     }
     *out_fd = fd;
     return STM_OK;
@@ -517,6 +557,8 @@ stm_status stm_9p_dial_unix(const char *socket_path,
     if (opts->wait && (!opts->wait->to_leave || opts->wait->tick_ms == 0
                        || opts->wait->give_up_after_ms == 0))
         return STM_EINVAL;
+    /* A tick is handed to poll, which takes an int and waits for ever on a negative one. */
+    if (opts->wait && opts->wait->tick_ms > (uint32_t)INT_MAX) return STM_EINVAL;
 
     uint32_t msize = opts->msize ? opts->msize : STM_9P_MSIZE_DEFAULT;
     if (msize < STM_9P_MSIZE_MIN) return STM_EINVAL;
@@ -539,21 +581,13 @@ stm_status stm_9p_dial_unix(const char *socket_path,
     }
 
     int connect_errno = 0;
-    stm_status rc = do_connect(socket_path, &c->fd, &connect_errno);
+    stm_status rc = do_connect(socket_path, &c->wait, &c->fd, &connect_errno);
     if (rc != STM_OK) {
-        c->last_errno = connect_errno;
         free(c->buf);
         free(c);
+        /* No client is left to ask: errno says why, as the header tells callers. */
+        errno = connect_errno;
         return rc;
-    }
-    if (c->wait.to_leave) {
-        /* A read or a write that waited in the kernel could take no look. The flag on
-         * one message would not do: macOS waits in a send that does not fit all the same. */
-        int fl = fcntl(c->fd, F_GETFL);
-        if (fl < 0 || fcntl(c->fd, F_SETFL, fl | O_NONBLOCK) != 0) {
-            stm_9p_close(c);
-            return STM_EIO;
-        }
     }
 
     rc = do_tversion(c, msize);

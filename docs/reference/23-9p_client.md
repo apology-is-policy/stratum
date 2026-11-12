@@ -51,7 +51,7 @@ typedef struct {
 typedef struct {
     bool   (*to_leave)(void *arg);  /* asked between ticks, on the calling thread */
     void    *arg;
-    uint32_t tick_ms;               /* not 0 */
+    uint32_t tick_ms;               /* not 0, and no more than INT_MAX: poll's timeout */
     uint32_t give_up_after_ms;      /* not 0 */
 } stm_9p_wait;
 
@@ -69,6 +69,8 @@ msize < STM_9P_MSIZE_MIN (1 KiB) the lib returns STM_EOVERFLOW.
 `stm_9p_last_errno` exposes the last syscall errno (read/write) for
 post-mortem diagnostics on STM_EIO; NOT available for dial-time
 failures because the client is freed before the caller can query it.
+A dial whose connect failed leaves the cause in `errno` (ETIMEDOUT
+where a wait rule gave the connect up).
 
 **A call's wait.** With `wait` NULL a call waits in its read or its
 write for as long as the daemon takes, and no signal ends it: a caller
@@ -77,7 +79,12 @@ never answer. With a `stm_9p_wait` the client's socket is made not to
 wait (`O_NONBLOCK`; a flag on one message would not do, macOS waits in
 a `send` that does not fit all the same), and where a message cannot be
 sent or its reply has not come the call polls a tick at a time and asks
-`to_leave` between. From the first true, `give_up_after_ms` of waiting
+`to_leave` between. The write or the read is tried again after every
+tick, whatever poll said: Linux calls a Unix socket writable only once
+three quarters of its send buffer are free, and takes a write as soon as
+any of it is, so a client that waited for poll alone would count a
+daemon that reads a little at a time as one that takes nothing. From
+the first true, `give_up_after_ms` of waiting
 with nothing sent and nothing received ends the call with STM_EIO,
 `stm_9p_last_errno` ETIMEDOUT, and poisons the client: the reply given
 up on may still come, so every later call is refused with
@@ -85,7 +92,13 @@ STM_EBACKEND. A wait counts for what it lasted and for a tick at most:
 a wait a signal cut short counts for less than a tick, and a process
 that was stopped, or a machine that slept, has not waited meanwhile.
 Bytes sent or received start the count again, so a daemon that is only
-slow is waited for. The dial's own handshake waits by the same rule.
+slow is waited for. The dial's own handshake waits by the same rule,
+and so does its connect: the socket is made not to wait before it
+connects, a connect the listener holds (Linux, a full backlog that
+nobody accepts from; macOS refuses such a connect at once) is tried
+again each tick, and given up the same way, the dial returning STM_EIO
+with `errno` ETIMEDOUT. A tick above INT_MAX is refused at the dial
+(STM_EINVAL): poll would take it for a wait without end.
 The manager dials every client of its own this way (tools/stratum/src/
 tui.rs `dial_daemon`), on its screen's flag for a stop asked or a quit.
 
@@ -275,7 +288,7 @@ struct stm_9p_client {
     int       last_errno;     /* last read/write syscall errno */
     bool      poisoned;       /* tag-mismatch detected, or a call given up */
     stm_9p_wait wait;         /* copied at dial; to_leave NULL = none */
-    uint32_t  waited_ms;      /* since to_leave said true, nothing moved */
+    uint64_t  waited_ms;      /* since to_leave said true, nothing moved */
     uint8_t  *buf;            /* msize-sized request/response buffer */
 };
 ```
@@ -426,7 +439,11 @@ the SERVER's correctness viewed through the wire:
   for each op.
   The wait rule is tested against a daemon of the test's own that
   takes a client through the dial and then never answers, answers a
-  byte at a time, never reads, or reads slowly.
+  byte at a time, never reads, reads slowly, or reads a little at a
+  time (16 KiB each 50 ms: what Linux's poll is late for); and against
+  a listener with a full backlog that accepts no one. Each give-up is
+  bounded from below by time and from above by a count of `to_leave`'s
+  sayings of true, which the machine's load does not move.
 - `tests/test_9p_socket.c` — bigger e2e harness that exercises
   9P-server + stratumd + libstratum-9p across two processes.
 - `tools/stratum/tests/concurrent_ctl.rs` -- Rust-side e2e
