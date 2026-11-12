@@ -588,6 +588,30 @@ def death_legs(stratum, vol, host, root):
                 term.kill()
 
 
+def threads_waiting(pid):
+    """Where each thread of a process waits, as Linux says it: its name, its state, and
+    the system call it is in with that call's first three arguments. Nothing where /proc
+    does not say."""
+    said = []
+    try:
+        tids = sorted(os.listdir(f'/proc/{pid}/task'), key=int)
+    except (OSError, ValueError):
+        return ''
+    for tid in tids:
+        about = []
+        for name, take in (('comm', lambda t: t.strip()),
+                           ('stat', lambda t: 'state ' + t.rsplit(')', 1)[1].split()[0]),
+                           ('syscall', lambda t: 'in call ' + ' '.join(t.split()[:4]))):
+            try:
+                with open(f'/proc/{pid}/task/{tid}/{name}') as f:
+                    about.append(take(f.read()))
+            except (OSError, IndexError):
+                pass
+        if about:
+            said.append(' '.join(about))
+    return '; '.join(said)
+
+
 def held_terminal_legs(stratum, vol, host, root):
     """A terminal that takes nothing holds the manager in its draw, and no signal ends a
     write. A stop asked must not wait there, the volume unlocked behind it, for as long as
@@ -636,15 +660,19 @@ def held_terminal_legs(stratum, vol, host, root):
                             term.rc = os.waitstatus_to_exitcode(status)
                             ended = True
                 took = time.monotonic() - asked
+                # Taken before anything is read: a manager still there says where it waits.
+                waits = '' if ended else threads_waiting(term.pid)
                 record(not left, f'{how}: the daemons stopped and the volume locked, with nothing read',
                        f'{how}: daemons {left} still serve the volume {took:.0f} s after the stop was asked')
                 # Not 0: the daemons were not waited for, and the screen was not put back.
                 record(ended and term.rc == 128 + signal.SIGTERM,
                        f'{how}: the manager ended as the signal alone would have ended it, with nothing read',
-                       f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s')
+                       f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s'
+                       + (f'; its threads: {waits}' if waits else ''))
                 if not ended:
                     # Read, it ends; and the rest of the leg is about a manager that has.
                     term.exited(30)
+                    print(f'note: {how}: once its terminal was read the manager ended, rc={term.rc}', flush=True)
                 cooked = termios.tcgetattr(term.fd)[3] & termios.ICANON
                 record(cooked, f'{how}: the terminal is out of raw mode', f'{how}: the terminal was left raw')
             else:
@@ -670,6 +698,9 @@ def held_terminal_legs(stratum, vol, host, root):
                        f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s')
                 if ended and term.rc == 0 and took < stall + 1:
                     raise Failure(f'{how}: its screen went out in {took:.1f} s, short of the stall: it proves nothing')
+                # Its last words can still be in the terminal: Linux ends a process with
+                # them unread, where macOS holds its end for them.
+                term.pump(1)
                 record(b'\x1b[?1049l' in bytes(term.raw[seen:]), f'{how}: the screen was put back',
                        f'{how}: the alternate screen was never left')
                 left = session_daemons(session)
