@@ -503,6 +503,8 @@ struct OwnOutput {
     held: &'static AtomicBool,
     /// How often the terminal took no more.
     refused: u64,
+    /// How often a wait for room was followed by a pause, so as not to spin.
+    paused: u64,
 }
 
 impl OwnOutput {
@@ -514,6 +516,7 @@ impl OwnOutput {
             to_be_left: screen_to_be_left,
             held: &TERMINAL_HELD,
             refused: 0,
+            paused: 0,
         }
     }
 }
@@ -524,6 +527,7 @@ impl io::Write for OwnOutput {
         // wait counts for what it lasted and for a tick at most: while the manager is
         // stopped, or the machine asleep, the terminal is given no time to take anything.
         let mut waited = Duration::ZERO;
+        let mut room_said = false;
         loop {
             if self.held.load(Ordering::Relaxed) {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "the terminal takes nothing"));
@@ -547,14 +551,22 @@ impl io::Write for OwnOutput {
                 self.held.store(true, Ordering::Relaxed);
                 continue;
             }
+            // Room said is taken at once: a frame goes out a pty's worth at a time, and
+            // between two of those the terminal holds whatever the first was cut at, half
+            // a sequence as often as not. A stop nothing can catch, landing there, leaves
+            // the shell's next words to be read as that sequence's end. What must not spin
+            // is room said that the write then did not find, and a poll that comes back at
+            // once saying nothing of room: those wait a moment.
+            let mut pause = room_said;
             let began = Instant::now();
             let mut room = libc::pollfd { fd: self.fd, events: libc::POLLOUT, revents: 0 };
-            unsafe { libc::poll(&mut room, 1, poll_ms(self.tick)) };
-            // A poll that answers at once, for a terminal that then takes nothing, must
-            // not spin.
+            room_said = unsafe { libc::poll(&mut room, 1, poll_ms(self.tick)) } == 1
+                && room.revents & libc::POLLOUT != 0;
+            pause |= !room_said;
             let short = Duration::from_millis(1).saturating_sub(began.elapsed());
-            if !short.is_zero() {
+            if pause && !short.is_zero() {
                 thread::sleep(short);
+                self.paused += 1;
             }
             waited += began.elapsed().min(self.tick);
         }
@@ -5635,6 +5647,7 @@ mod tests {
             to_be_left: || TO_BE_LEFT.load(Ordering::Relaxed),
             held: &HELD,
             refused: 0,
+            paused: 0,
         };
         let (tx, rx) = mpsc::channel();
         let writer = thread::spawn(move || {
@@ -5719,6 +5732,7 @@ mod tests {
             to_be_left: || true,
             held: &HELD,
             refused: 0,
+            paused: 0,
         };
         let began = Instant::now();
         let ended = out.write_all(&[b'x'; ALL]).map_err(|e| e.kind());
@@ -5734,11 +5748,58 @@ mod tests {
         }
     }
 
+    /// A frame is more than a pty holds, so it goes out in parts, and between two parts the
+    /// terminal has whatever the first was cut at. The next part follows the moment there
+    /// is room: a writer that paused there left half a sequence in the terminal for a
+    /// millisecond at a time, and a stop that nothing can catch, sent the moment the screen
+    /// showed, found it so once in thirty starts (and the shell's next line lost its first
+    /// character to that sequence).
+    #[test]
+    fn room_said_is_taken_at_once() {
+        use io::Write as _;
+        static HELD: AtomicBool = AtomicBool::new(false);
+        const ALL: usize = 1 << 17;
+        let (m, s) = pty_that_does_not_wait();
+        // Full, and read only a moment after the write has begun: its first try is refused.
+        let held = fill(s);
+        assert!(held > 0, "the pty took nothing at all");
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let mut taken = 0usize;
+            let mut some = [0u8; 4096];
+            while taken < held + ALL {
+                let n = unsafe { libc::read(m, some.as_mut_ptr().cast(), some.len()) };
+                if n <= 0 {
+                    break;
+                }
+                taken += n as usize;
+            }
+            taken
+        });
+        let mut out = OwnOutput {
+            fd: s,
+            tick: TAKE_TICK,
+            held_after: HELD_AFTER,
+            to_be_left: || false,
+            held: &HELD,
+            refused: 0,
+            paused: 0,
+        };
+        assert_eq!(out.write_all(&[b'x'; ALL]).map_err(|e| e.kind()), Ok(()));
+        assert!(out.refused > 0, "the terminal never made the write wait: it proves nothing");
+        assert_eq!(out.paused, 0, "of {} waits for room, {} were followed by a pause", out.refused, out.paused);
+        assert_eq!(reader.join().unwrap(), held + ALL);
+        unsafe {
+            libc::close(m);
+            libc::close(s);
+        }
+    }
+
     /// What tells a slow terminal from one that takes nothing is room coming back, and a
-    /// pty gives room back in steps: Linux moves what was written to the reader's side
-    /// only once the reader has all but emptied what is there, some four thousand bytes.
-    /// A terminal that takes fewer bytes than one step in the limit is not told from one
-    /// that takes none, and the manual says so with this number.
+    /// pty gives room back in steps. A terminal that takes fewer bytes than one step in the
+    /// limit is not told from one that takes none, and the plan says so with what
+    /// `manager_keys.py` measures; this holds the step under a bound on whatever system
+    /// runs it.
     #[test]
     fn a_full_pty_gives_room_back_before_its_reader_has_taken_eight_thousand_bytes() {
         let (m, s) = pty_that_does_not_wait();

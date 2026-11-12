@@ -1757,6 +1757,9 @@ def screen_job_control_leg(stratum, vol, host, root):
             then(term, how, manager)
         except Failure:
             print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+            # What the screen shows is what the bytes came to: a sequence cut short reads on
+            # into whatever is written next.
+            print(f'--- the last bytes written to the terminal: {bytes(term.raw[-320:])!r}', flush=True)
             raise
         finally:
             job_cleanup(term, held, session)
