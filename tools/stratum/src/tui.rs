@@ -5665,19 +5665,45 @@ mod tests {
         }
     }
 
+    /// Fills a pty that nothing reads, and says how much it held. What is written moves
+    /// to the reader's side a moment later and leaves room behind it, so the pty is full
+    /// only once it has refused for a while.
+    fn fill(s: RawFd) -> usize {
+        let block = [b'x'; 1024];
+        let (mut held, mut refused_in_a_row) = (0usize, 0);
+        while refused_in_a_row < 10 {
+            let n = unsafe { libc::write(s, block.as_ptr().cast(), block.len()) };
+            if n > 0 {
+                held += n as usize;
+                refused_in_a_row = 0;
+            } else {
+                refused_in_a_row += 1;
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        held
+    }
+
     #[test]
     fn a_terminal_that_is_only_slow_is_waited_for() {
         use io::Write as _;
         static HELD: AtomicBool = AtomicBool::new(false);
-        const ALL: usize = 1 << 15;
+        // Per second, what the reader below takes at most.
+        const PACE: usize = 256 * 50;
+        let limit = Duration::from_millis(1000);
+        // Full before the write, so that all of the write waits for the reader: three
+        // limits' worth at the reader's pace, whatever this system's pty holds.
+        const ALL: usize = 3 * PACE;
         let (m, s) = pty_that_does_not_wait();
+        let held = fill(s);
+        assert!(held > 0, "the pty took nothing at all");
         // A little at a time, and far more often than the limit: the whole takes longer
         // than the limit, and no one wait comes near it.
         let reader = thread::spawn(move || {
             let mut taken = 0usize;
             let mut some = [0u8; 256];
             let end = Instant::now() + Duration::from_secs(60);
-            while taken < ALL && Instant::now() < end {
+            while taken < held + ALL && Instant::now() < end {
                 let n = unsafe { libc::read(m, some.as_mut_ptr().cast(), some.len()) };
                 if n > 0 {
                     taken += n as usize;
@@ -5689,7 +5715,7 @@ mod tests {
         let mut out = OwnOutput {
             fd: s,
             tick: Duration::from_millis(10),
-            held_after: Duration::from_millis(1500),
+            held_after: limit,
             to_be_left: || true,
             held: &HELD,
             refused: 0,
@@ -5700,8 +5726,50 @@ mod tests {
         assert_eq!(ended, Ok(()), "a terminal that went on taking was given up after {took:?}");
         assert!(!HELD.load(Ordering::Relaxed));
         assert!(out.refused > 0, "the terminal never made the write wait: it proves nothing");
-        assert!(took > out.held_after, "all of it went out in {took:?}, inside the limit: it proves nothing");
-        assert_eq!(reader.join().unwrap(), ALL);
+        assert!(took > 2 * limit, "all of it went out in {took:?}, with {held} held before it: it proves nothing");
+        assert_eq!(reader.join().unwrap(), held + ALL);
+        unsafe {
+            libc::close(m);
+            libc::close(s);
+        }
+    }
+
+    /// What tells a slow terminal from one that takes nothing is room coming back, and a
+    /// pty gives room back in steps: Linux moves what was written to the reader's side
+    /// only once the reader has all but emptied what is there, some four thousand bytes.
+    /// A terminal that takes fewer bytes than one step in the limit is not told from one
+    /// that takes none, and the manual says so with this number.
+    #[test]
+    fn a_full_pty_gives_room_back_before_its_reader_has_taken_eight_thousand_bytes() {
+        let (m, s) = pty_that_does_not_wait();
+        let held = fill(s);
+        assert!(held > 0, "the pty took nothing at all");
+        let mut some = [0u8; 256];
+        let (mut since_room, mut longest, mut steps) = (0usize, 0usize, 0);
+        let mut taken = 0usize;
+        while taken < 3 * held + (1 << 15) {
+            // An emptied pty gave no room back at all: a read of it would wait for good.
+            let mut there = libc::pollfd { fd: m, events: libc::POLLIN, revents: 0 };
+            let ready = unsafe { libc::poll(&mut there, 1, 2000) };
+            assert_eq!(ready, 1, "nothing left to read and no room: {since_room} bytes read since the last, of a full pty that held {held}");
+            let n = unsafe { libc::read(m, some.as_mut_ptr().cast(), some.len()) };
+            assert!(n > 0, "the pty's other end read {n} with {taken} of its bytes taken: {}", io::Error::last_os_error());
+            taken += n as usize;
+            since_room += n as usize;
+            // What was read leaves room a moment later, where it leaves any.
+            thread::sleep(Duration::from_millis(2));
+            let mut room = false;
+            while unsafe { libc::write(s, some.as_ptr().cast(), some.len()) } > 0 {
+                room = true;
+            }
+            if room {
+                longest = longest.max(since_room);
+                since_room = 0;
+                steps += 1;
+            }
+            assert!(since_room <= 8192, "no room after {since_room} bytes read from a full pty that held {held}");
+        }
+        assert!(steps > 0 && longest <= 8192, "room came back {steps} times, at most {longest} bytes apart");
         unsafe {
             libc::close(m);
             libc::close(s);

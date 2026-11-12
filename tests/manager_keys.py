@@ -630,11 +630,60 @@ def threads_waiting(pid):
     return '; '.join(said)
 
 
+def pty_facts():
+    """What this system's pty holds with nothing read, and after how many bytes read a
+    writer that does not wait finds room again, each time over a few refills. The manager
+    tells a slow terminal from one that takes nothing by room coming back, so how slow a
+    terminal it can tell is this system's to say."""
+    m, s = os.openpty()
+    try:
+        os.set_blocking(s, False)
+
+        def put():
+            n = 0
+            while True:
+                try:
+                    n += os.write(s, b'x' * 256)
+                except BlockingIOError:
+                    return n
+
+        # What is written moves to the reader's side a moment later and leaves room.
+        held, refused = 0, 0
+        while refused < 10:
+            n = put()
+            held += n
+            refused = 0 if n else refused + 1
+            if not n:
+                time.sleep(0.005)
+        since, steps, taken = 0, [], 0
+        while taken < 3 * held + 32768:
+            if not select.select([m], [], [], 2)[0]:
+                raise Failure(f'a full pty that held {held} bytes gave no room back with {since} read: '
+                              f'no terminal here can be told slow from held')
+            got = len(os.read(m, 256))
+            taken += got
+            since += got
+            time.sleep(0.002)
+            if put():
+                steps.append(since)
+                since = 0
+        return held, sorted(steps)
+    finally:
+        os.close(m)
+        os.close(s)
+
+
 def held_terminal_legs(stratum, vol, host, root):
     """A terminal that takes nothing holds the manager in its draw, and no signal ends a
     write. A stop asked must not wait there, the volume unlocked behind it, for as long as
     nothing reads; and a terminal that is only slow must not be taken for one."""
     stall = 10  # tui.rs HELD_AFTER, in seconds
+    held, steps = pty_facts()
+    print(f'note: this system\'s pty holds {held} bytes with nothing read; refilled {len(steps)} times, room came '
+          f'back after {steps[0]} to {steps[-1]} bytes read, {steps[len(steps) // 2]} in the middle', flush=True)
+    # The slow terminal's pace: 256 bytes and a pause, such that the most this system
+    # waits for before it gives room back is read in half the stall.
+    pause = min(0.4, stall / 2 * 256 / steps[-1])
     for how, slow in (('a terminal that takes nothing', False), ('a slow terminal', True)):
         env_file = f'{root}/env-held{int(slow)}'
         term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file])
@@ -706,14 +755,14 @@ def held_terminal_legs(stratum, vol, host, root):
                             data = b''
                         term.raw += data
                         term.screen.feed(data)
-                        time.sleep(0.4)
+                        time.sleep(pause)
                     pid, status = os.waitpid(term.pid, os.WNOHANG)
                     if pid:
                         term.rc = os.waitstatus_to_exitcode(status)
                         ended = True
                 took = time.monotonic() - asked
                 record(ended and term.rc == 0, f'{how}: the manager ended cleanly, its screen taken at the terminal\'s pace ({took:.0f} s)',
-                       f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s')
+                       f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s, read 256 bytes each {pause:.2f} s')
                 if ended and term.rc == 0 and took < stall + 1:
                     raise Failure(f'{how}: its screen went out in {took:.1f} s, short of the stall: it proves nothing')
                 # Its last words can still be in the terminal: Linux ends a process with
