@@ -304,23 +304,27 @@ fi
 
 # A link left at the key's name while mkfs is looking at it. No second process can leave one
 # between two of mkfs's own system calls, so a small library loaded into mkfs does it, just before
-# the call it is told (tests/plant_at_look.c). mkfs reads the links at the name and then looks at
-# what they end in, once before it makes the image and once after; it looks again before it uses
-# a key; and it reads the links once more where it makes one. A link it read is one it asked
-# about. One left after that must not be followed.
+# the call it is told (tests/plant_at_look.c). mkfs looks at the name, reads a link it finds there
+# and looks at it again, and then asks what the name reaches: once before it makes the image and
+# once after. It looks again before it uses a key, and once more where it makes one. A link it
+# found is one it asked about. One left after it looked must not be followed.
 case "$(uname -s)" in
     Darwin) PLANT_LIB=$D/plant.dylib; PLANT_HOW=-dynamiclib ;;
     *)      PLANT_LIB=$D/plant.so;    PLANT_HOW="-shared -fPIC" ;;
 esac
-# planted TAG MOMENT: mkfs for $D/pl-TAG.stm with the key name $D/pl-TAG.key, and a link to a key
-# of the user's own left at that name just before MOMENT. Not through env(1): macOS drops the
-# variable on the way through a system binary.
+# planted TAG MOMENT [TO [OVER [AS]]]: mkfs for $D/pl-TAG.stm with the key name $D/pl-TAG.key, and
+# a link to TO (a key of the user's own unless given) left at that name just before MOMENT. OVER
+# not empty: it replaces what is there. AS a uid: mkfs is told that user owns it. The library is
+# named on the command itself: through env(1) macOS would drop it, as it does on the way through
+# any system binary.
 planted() {
     if [ "$(uname -s)" = Darwin ]; then
-        DYLD_INSERT_LIBRARIES="$PLANT_LIB" STM_PLANT_AT="$D/pl-$1.key" STM_PLANT_ON="$2" STM_PLANT_TO="$D/pl-own.key" \
+        DYLD_INSERT_LIBRARIES="$PLANT_LIB" STM_PLANT_AT="$D/pl-$1.key" STM_PLANT_ON="$2" STM_PLANT_TO="${3:-$D/pl-own.key}" \
+            STM_PLANT_OVER="${4:-}" STM_PLANT_AS="${5:-}" \
             STM_PLANT_LOG="$D/pl-$1.plant" "$B" mkfs "$D/pl-$1.stm" --size 64M --keyfile "$D/pl-$1.key" < /dev/null > "$D/pl-$1.log" 2>&1
     else
-        LD_PRELOAD="$PLANT_LIB" STM_PLANT_AT="$D/pl-$1.key" STM_PLANT_ON="$2" STM_PLANT_TO="$D/pl-own.key" \
+        LD_PRELOAD="$PLANT_LIB" STM_PLANT_AT="$D/pl-$1.key" STM_PLANT_ON="$2" STM_PLANT_TO="${3:-$D/pl-own.key}" \
+            STM_PLANT_OVER="${4:-}" STM_PLANT_AS="${5:-}" \
             STM_PLANT_LOG="$D/pl-$1.plant" "$B" mkfs "$D/pl-$1.stm" --size 64M --keyfile "$D/pl-$1.key" < /dev/null > "$D/pl-$1.log" 2>&1
     fi
 }
@@ -333,40 +337,87 @@ elif ! "$B" mkfs "$D/pl-own.stm" --size 64M --keyfile "$D/pl-own.key" < /dev/nul
     no "a key of the user's own for the planted links: $(tail -1 "$D/pl-own.log")"
 else
     # Nothing left: what the library sees says which moment is which below. If mkfs comes to look
-    # more or fewer times, this is the check that says so, and the three under it need their
-    # moments named again.
+    # more or fewer times, this is the check that says so, and those under it need their moments
+    # named again. Looks 1 and 2 are the claim before the image is made, 3 and 4 the claim after,
+    # 5 the use of a key, 6 where a new key's place is asked about.
     planted none nothing; rc=$?
-    if [ "$rc" = 0 ] && [ "$(moments none)" = "readlink:1 look:1 readlink:2 look:2 look:3 readlink:3 " ] \
+    if [ "$rc" = 0 ] && [ "$(moments none)" = "look:1 look:2 look:3 look:4 look:5 look:6 " ] \
             && LC_ALL=C grep -q 'generated keyfile' "$D/pl-none.log"; then
         ok "the library sees each time mkfs reads the key's links and looks at the key"
     else
         no "mkfs's looks at its key, as the library saw them: rc=$rc: $(moments none): $(tail -1 "$D/pl-none.log")"
     fi
-    # The control: a link that is there before the first reading is asked about, is the user's
+    # The control: a link that is there at the first look is read and asked about, is the user's
     # own, and is followed.
-    planted first readlink:1; rc=$?
-    if [ "$rc" = 0 ] && LC_ALL=C grep -q '^planted before readlink:1: done$' "$D/pl-first.plant" \
+    planted first look:1; rc=$?
+    if [ "$rc" = 0 ] && LC_ALL=C grep -q '^planted before look:1: done$' "$D/pl-first.plant" \
+            && LC_ALL=C grep -q '^readlink:1$' "$D/pl-first.plant" \
             && LC_ALL=C grep -q 'using existing keyfile' "$D/pl-first.log" && [ -s "$D/pl-first.stm" ]; then
         ok "a link of the user's own that mkfs read at the key's name is followed"
     else
         no "a link there before mkfs read the key's links: rc=$rc: $(moments first): $(tail -1 "$D/pl-first.log")"
     fi
-    # Left after the claim's last reading of the links and before its look at the key.
-    planted claim look:2; rc=$?
-    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:2: done$' "$D/pl-claim.plant" \
-            && LC_ALL=C grep -q 'a link turned up at keyfile' "$D/pl-claim.log" && [ ! -e "$D/pl-claim.stm" ]; then
+    # The same link at the same look, and another user's as far as mkfs is told: refused when the
+    # volume is claimed.
+    planted theirs look:1 "" "" "$(( $(id -u) + 1 ))"; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:1: done$' "$D/pl-theirs.plant" \
+            && LC_ALL=C grep -q 'reached through a symlink another user owns' "$D/pl-theirs.log" && [ ! -e "$D/pl-theirs.stm" ]; then
+        ok "another user's link at the key's name is refused when the volume is claimed, and nothing is made"
+    else
+        no "another user's link at the key's name when the volume is claimed: rc=$rc: $(moments theirs): $(tail -1 "$D/pl-theirs.log"); image left: $([ -e "$D/pl-theirs.stm" ] && echo yes || echo no)"
+    fi
+    # Left after the claim's last look for links at the name, before it asks what the name reaches.
+    planted claim look:4; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:4: done$' "$D/pl-claim.plant" \
+            && LC_ALL=C grep -q 'does not lead where its links were read to end' "$D/pl-claim.log" && [ ! -e "$D/pl-claim.stm" ]; then
         ok "a link left after the claim read the key's links is not followed, and nothing is made"
     else
         no "a link left after the claim read the key's links: rc=$rc: $(moments claim): $(tail -1 "$D/pl-claim.log"); image left: $([ -e "$D/pl-claim.stm" ] && echo yes || echo no)"
     fi
     # Left after the claim, before the look that decides whether there is a key to use.
-    planted use look:3; rc=$?
-    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:3: done$' "$D/pl-use.plant" \
+    planted use look:5; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:5: done$' "$D/pl-use.plant" \
             && LC_ALL=C grep -q 'turned up after the volume was claimed' "$D/pl-use.log" && [ ! -e "$D/pl-use.stm" ]; then
         ok "a link left between the claim and the use of the key is not followed, and nothing is made"
     else
         no "a link left between the claim and the use: rc=$rc: $(moments use): $(tail -1 "$D/pl-use.log"); image left: $([ -e "$D/pl-use.stm" ] && echo yes || echo no)"
     fi
+    # Left where the new key's place is asked about, and another user's as far as mkfs is told.
+    # Nothing else asks at that moment: the claim found the name free, and so did the use.
+    planted ask look:6 "$D/pl-ask.to" "" "$(( $(id -u) + 1 ))"; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:6: done$' "$D/pl-ask.plant" \
+            && LC_ALL=C grep -q 'reached through a symlink another user owns' "$D/pl-ask.log" && [ ! -e "$D/pl-ask.stm" ] \
+            && ! ls "$D"/pl-ask.to* > /dev/null 2>&1; then
+        ok "another user's link left where the new key's place is asked about is refused, and nothing is made"
+    else
+        no "another user's link left where the new key's place is asked about: rc=$rc: $(moments ask): $(tail -1 "$D/pl-ask.log"); image left: $([ -e "$D/pl-ask.stm" ] && echo yes || echo no); at its target: $(ls "$D"/pl-ask.to* 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+    # A link of the user's own is at the name, and another takes its place between mkfs's look at
+    # it and its reading of it: the one read is not the one that was asked about.
+    ln -s "$D/pl-own.key" "$D/pl-swap.key"
+    planted swap readlink:1 "$D/pl-swap.to" over; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before readlink:1: done$' "$D/pl-swap.plant" \
+            && LC_ALL=C grep -q 'changed while it was being read' "$D/pl-swap.log" && [ ! -e "$D/pl-swap.stm" ] \
+            && ! ls "$D"/pl-swap.to* > /dev/null 2>&1; then
+        ok "a link replaced between mkfs's look at it and its reading of it is not followed, and nothing is made"
+    else
+        no "a link replaced between mkfs's look at it and its reading of it: rc=$rc: $(moments swap): $(tail -1 "$D/pl-swap.log"); image left: $([ -e "$D/pl-swap.stm" ] && echo yes || echo no); at its target: $(ls "$D"/pl-swap.to* 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+fi
+
+# A link that cannot be read cannot be asked where it leads, and the kernel follows it all the
+# same. Only a system that keeps a mode on a link can make one: macOS does, Linux does not.
+ln -s "$D/raw.stm.key" "$D/unread.key"
+if chmod -h 000 "$D/unread.key" 2> /dev/null && ! readlink "$D/unread.key" > /dev/null 2>&1; then
+    "$B" mkfs "$D/unread.stm" --size 64M --keyfile "$D/unread.key" < /dev/null > "$D/unread.log" 2>&1
+    rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q 'is reached through a link that cannot be read' "$D/unread.log" && [ ! -e "$D/unread.stm" ]; then
+        ok "a link at the key's name that cannot be read is refused, and nothing is made"
+    else
+        no "a link at the key's name that cannot be read: rc=$rc: $(tail -1 "$D/unread.log"); image left: $([ -e "$D/unread.stm" ] && echo yes || echo no)"
+    fi
+else
+    echo "note: a link that cannot be read: none can be made here (a link keeps no mode, or this user reads it all the same), so there is nothing to check"
 fi
 
 # The links at the key's name are asked about one by one, seven at most. More than that are refused, not

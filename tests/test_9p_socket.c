@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -1088,6 +1089,45 @@ STM_TEST(p9_socket_r95_p2_1_slow_loris_releases_slot) {
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
+}
+
+/* A stop first shuts the reading side of each connection. What that does to a request
+ * the client had already sent, and to one it sends next, is the kernel's to decide, and
+ * two of them decide differently: Linux still hands over what was queued and refuses
+ * what is sent next, macOS drops what was queued and takes what is sent next only to
+ * drop it. ARCHITECTURE 15.8 says which, and this holds it to that. */
+STM_TEST(p9_socket_a_request_already_sent_when_the_reading_side_is_shut) {
+    int p[2];
+    char buf[16];
+    STM_ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    void (*was)(int) = signal(SIGPIPE, SIG_IGN);
+    STM_ASSERT_EQ(write(p[0], "sent", 4), 4);
+    STM_ASSERT_EQ(shutdown(p[1], SHUT_RD), 0);
+    ssize_t queued = read(p[1], buf, sizeof buf);
+    errno = 0;
+    ssize_t next = write(p[0], "next", 4);
+    int next_errno = errno;
+    ssize_t after = read(p[1], buf, sizeof buf);
+#if defined(__linux__)
+    STM_ASSERT_EQ(queued, 4);
+    STM_ASSERT_EQ(next, -1);
+    STM_ASSERT_EQ(next_errno, EPIPE);
+#elif defined(__APPLE__)
+    STM_ASSERT_EQ(queued, 0);
+    STM_ASSERT_EQ(next, 4);
+    (void)next_errno;
+#else
+    (void)queued;
+    (void)next;
+    (void)next_errno;
+#endif
+    STM_ASSERT_EQ(after, 0);
+    /* A reply still goes out on either. */
+    STM_ASSERT_EQ(write(p[1], "back", 4), 4);
+    STM_ASSERT_EQ(read(p[0], buf, sizeof buf), 4);
+    (void)signal(SIGPIPE, was);
+    close(p[0]);
+    close(p[1]);
 }
 
 STM_TEST_MAIN("9p_socket")

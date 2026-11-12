@@ -252,8 +252,25 @@ static bool image_holds_data(int fd, bool *out)
     }
 }
 
+/* Why the links at the key's name were not followed to where they end. */
+enum key_links {
+    KEY_LINKS_FOLLOWED,
+    KEY_LINKS_TOO_MANY,
+    KEY_LINKS_ANOTHERS,
+    KEY_LINKS_UNREAD,
+    KEY_LINKS_CHANGED,
+};
+
+/* What a reading of those links came to. */
+struct key_walk {
+    enum key_links why;
+    int err;        /* KEY_LINKS_UNREAD: what readlink said */
+    bool there;     /* whether anything is where they end */
+    struct stat st; /* what is there */
+};
+
 static const char *key_destination(const char *path, char *buf, size_t n, bool force,
-                                   bool *refused);
+                                   struct key_walk *walk);
 
 /* A key used as it is decides who can open the volume: one another user owns, or that
  * its mode lets others read or write, is theirs as much as the user's. The corvus token
@@ -274,29 +291,43 @@ static const char *key_not_the_users(const struct stat *st, bool as_is)
     return NULL;
 }
 
-/* Where another user's link would decide where the key goes. */
-static void say_link_refused(const char *keyfile_path)
+/* Why the links at the key's name were not followed. */
+static void say_links_refused(const char *keyfile_path, const struct key_walk *walk)
 {
-    fprintf(stderr,
-        "stratum-mkfs: keyfile %s is reached through a symlink another user owns, who would "
-        "decide where the key goes; pass --force to follow it\n", keyfile_path);
+    switch (walk->why) {
+    case KEY_LINKS_ANOTHERS:
+        fprintf(stderr,
+            "stratum-mkfs: keyfile %s is reached through a symlink another user owns, who "
+            "would decide where the key goes; pass --force to follow it\n", keyfile_path);
+        break;
+    case KEY_LINKS_UNREAD:
+        fprintf(stderr,
+            "stratum-mkfs: keyfile %s is reached through a link that cannot be read (%s), "
+            "so where it leads cannot be asked about: name the key file itself\n",
+            keyfile_path, strerror(walk->err));
+        break;
+    case KEY_LINKS_CHANGED:
+        fprintf(stderr,
+            "stratum-mkfs: a link at keyfile %s changed while it was being read, so nothing "
+            "was asked of the one there now: see who changed it before running again\n",
+            keyfile_path);
+        break;
+    default:
+        fprintf(stderr,
+            "stratum-mkfs: keyfile %s is reached through more than seven links or a loop of "
+            "them, or names a path too long: name the key file itself\n", keyfile_path);
+        break;
+    }
 }
 
-/* Where the links at the key's name are more than are followed here. */
-static void say_links_too_many(const char *keyfile_path)
+/* Where the name reaches something the links read from it do not end in. */
+static void say_name_leads_elsewhere(const char *keyfile_path)
 {
     fprintf(stderr,
-        "stratum-mkfs: keyfile %s is reached through more than seven links or a loop of "
-        "them, or names a path too long: name the key file itself\n", keyfile_path);
-}
-
-/* Where a link is at the end of the links that were read, left there since: nobody
- * was asked about it. */
-static void say_link_unasked(const char *keyfile_path)
-{
-    fprintf(stderr,
-        "stratum-mkfs: a link turned up at keyfile %s while it was being looked at, so "
-        "nothing was asked of it: see who left it before running again\n", keyfile_path);
+        "stratum-mkfs: keyfile %s does not lead where its links were read to end: a link "
+        "was left or changed there while they were read, or one of them is a descriptor's, "
+        "whose text names no file (a pipe's, an unlinked file's): name the key file "
+        "itself, or see who left a link, before running again\n", keyfile_path);
 }
 
 /*
@@ -310,25 +341,27 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
 {
     struct stat st;
     char dest[4096];
-    bool refused = false;
+    struct key_walk walk;
     *key_there = false;
-    const char *leads_to = key_destination(keyfile_path, dest, sizeof dest, force, &refused);
-    if (!leads_to && refused) {
-        say_link_refused(keyfile_path);
-        return true;
-    }
+    const char *leads_to = key_destination(keyfile_path, dest, sizeof dest, force, &walk);
     /* Past where that gives up, the stat below would follow links nobody asked about. */
     if (!leads_to && !force) {
-        say_links_too_many(keyfile_path);
+        say_links_refused(keyfile_path, &walk);
         return true;
     }
-    /* Looked at where the links just read end, and not through the name: a stat of
-     * the name would follow a link left there since they were read. */
-    if (force || lstat(leads_to, &st) != 0) return false;
-    if (S_ISLNK(st.st_mode)) {
-        say_link_unasked(keyfile_path);
+    if (force) return false;
+    /* The links were followed here by their text; the kernel follows them itself when
+     * the key is opened. What the name reaches has to be what they were read to end
+     * in: it is not where a link was left or changed after it was read, nor where a
+     * link's text is no path to what it opens, as a descriptor's is not for a pipe or
+     * an unlinked file. */
+    bool reached = stat(keyfile_path, &st) == 0;
+    if (reached != walk.there
+            || (reached && (st.st_dev != walk.st.st_dev || st.st_ino != walk.st.st_ino))) {
+        say_name_leads_elsewhere(keyfile_path);
         return true;
     }
+    if (!reached) return false;
     if (!replaces_key) {
         const char *why = key_not_the_users(&st, key_as_is);
         if (!why) {
@@ -434,37 +467,64 @@ static int take_key_name(const char *from, const char *to, bool force)
  * key's way are read here, so the kernel's protected_symlinks, which refuses to
  * follow another user's link in a shared sticky directory, never asks: there whoever
  * left the link would hold the key, and the volume is lost with it. */
-static bool link_is_trusted(const char *link)
+static bool link_is_trusted(const struct stat *st)
 {
-    struct stat st;
-    if (lstat(link, &st) != 0) return false;
-    if (st.st_uid == geteuid()) return true;
+    if (st->st_uid == geteuid()) return true;
 #if !defined(__thylacine__)
     /* Thylacine has no root: uid 0 is its invalid principal. */
-    if (st.st_uid == 0) return true;
+    if (st->st_uid == 0) return true;
 #endif
     return false;
 }
 
 /* A key named through a symlink belongs where the link points: replacing the link
- * would leave it beside the volume instead. NULL past seven links or for a path too
- * long, and, with *refused set, for a link another user owns, unless forced. */
+ * would leave it beside the volume instead. A link is looked at before it is read, so
+ * another user's is refused unread, and again after, so the one whose text is followed
+ * is the one that was asked about. Where another user cannot replace an entry of the
+ * user's or root's, as in a sticky directory, the first look settles that alone;
+ * where they can, no look here settles it. NULL with walk->why saying which: more
+ * than seven links or a path too long, a link another user owns, one that cannot be
+ * read, one that changed. Forced, nothing is asked and a link that cannot be read is
+ * taken for the end. */
 static const char *key_destination(const char *path, char *buf, size_t n, bool force,
-                                   bool *refused)
+                                   struct key_walk *walk)
 {
     char here[4096];
-    *refused = false;
+    walk->why = KEY_LINKS_TOO_MANY;
+    walk->err = 0;
+    walk->there = false;
     if (snprintf(here, sizeof here, "%s", path) >= (int)sizeof here) return NULL;
     for (int hops = 0; hops < 8; hops++) {
+        struct stat st;
         char target[4096];
-        ssize_t len = readlink(here, target, sizeof target - 1);
+        ssize_t len = -1;
+        bool there = lstat(here, &st) == 0;
+        if (there && S_ISLNK(st.st_mode)) {
+            if (!force && !link_is_trusted(&st)) {
+                walk->why = KEY_LINKS_ANOTHERS;
+                return NULL;
+            }
+            len = readlink(here, target, sizeof target - 1);
+            if (len < 0 && !force) {
+                walk->why = KEY_LINKS_UNREAD;
+                walk->err = errno;
+                return NULL;
+            }
+        }
         if (len < 0) {
             if (snprintf(buf, n, "%s", here) >= (int)n) return NULL;
+            walk->why = KEY_LINKS_FOLLOWED;
+            walk->there = there;
+            if (there) walk->st = st;
             return buf;
         }
-        if (!force && !link_is_trusted(here)) {
-            *refused = true;
-            return NULL;
+        if (!force) {
+            struct stat again;
+            if (lstat(here, &again) != 0 || !S_ISLNK(again.st_mode)
+                    || again.st_dev != st.st_dev || again.st_ino != st.st_ino) {
+                walk->why = KEY_LINKS_CHANGED;
+                return NULL;
+            }
         }
         target[len] = '\0';
         const char *slash = strrchr(here, '/');
@@ -701,18 +761,12 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         goto cleanup;
     }
     if (key_is_new) {
-        bool refused = false;
+        struct key_walk walk;
         key_target = key_destination(keyfile_path, key_target_buf, sizeof key_target_buf, force,
-                                     &refused);
-        if (!key_target && refused) {
-            /* Left there since the claim. */
-            say_link_refused(keyfile_path);
-            key_is_new = false;
-            exit_code = 1;
-            goto cleanup;
-        }
+                                     &walk);
         if (!key_target) {
-            say_links_too_many(keyfile_path);
+            /* A link left there since the claim: nothing there was asked about then. */
+            say_links_refused(keyfile_path, &walk);
             key_is_new = false;
             exit_code = 1;
             goto cleanup;

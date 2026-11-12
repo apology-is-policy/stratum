@@ -6,11 +6,19 @@
  * that turned up between two of its looks, and no second process can be timed to
  * leave one there.
  *
- *   STM_PLANT_AT   the path watched, as the string the program passes
- *   STM_PLANT_ON   "readlink:N" or "look:N": just before the Nth readlink of that
- *                  path, or the Nth stat or lstat of it; anything else leaves nothing
- *   STM_PLANT_TO   where the link points
- *   STM_PLANT_LOG  each watched call is appended here, one a line, and the planting
+ *   STM_PLANT_AT    the path watched, as the string the program passes
+ *   STM_PLANT_ON    "readlink:N" or "look:N": just before the Nth readlink of that
+ *                   path, or the Nth stat or lstat of it; anything else leaves nothing
+ *   STM_PLANT_TO    where the link points
+ *   STM_PLANT_LOG   each watched call is appended here, one a line, and the planting
+ *   STM_PLANT_OVER  not empty: the link takes the place of whatever is at the path,
+ *                   made beside it and renamed over, so it is another file than the
+ *                   one it replaces; without, something already there makes the
+ *                   planting fail
+ *   STM_PLANT_AS    a uid: an lstat of the path that finds a link says that user owns
+ *                   it. Nothing on disk is changed: the program is told what the
+ *                   system would tell it of another user's link, which no test can
+ *                   make without being root.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -46,7 +54,16 @@ static void before(const char *kind, int *count, const char *path)
     const char *on = getenv("STM_PLANT_ON");
     const char *to = getenv("STM_PLANT_TO");
     if (on && to && strcmp(on, moment) == 0) {
-        int r = symlink(to, at);
+        const char *over = getenv("STM_PLANT_OVER");
+        int r;
+        if (over && *over) {
+            char beside[4200];
+            snprintf(beside, sizeof beside, "%s.over", at);
+            r = symlink(to, beside);
+            if (r == 0) r = rename(beside, at);
+        } else {
+            r = symlink(to, at);
+        }
         snprintf(line, sizeof line, "planted before %s: %s\n", moment,
                  r == 0 ? "done" : strerror(errno));
     } else {
@@ -54,6 +71,15 @@ static void before(const char *kind, int *count, const char *path)
     }
     say(line);
     errno = saved;
+}
+
+/* After an lstat that worked: whose a link at the watched path is said to be. */
+static void owned_as(const char *path, mode_t mode, uid_t *uid)
+{
+    const char *at = getenv("STM_PLANT_AT");
+    const char *as = getenv("STM_PLANT_AS");
+    if (!at || !as || !*as || !path || strcmp(at, path) != 0 || !S_ISLNK(mode)) return;
+    *uid = (uid_t)strtoul(as, NULL, 10);
 }
 
 #if defined(__APPLE__)
@@ -73,7 +99,9 @@ static int plant_stat(const char *path, struct stat *st)
 static int plant_lstat(const char *path, struct stat *st)
 {
     before("look", &g_looks, path);
-    return lstat(path, st);
+    int r = lstat(path, st);
+    if (r == 0) owned_as(path, st->st_mode, &st->st_uid);
+    return r;
 }
 
 #define PLANT_INTERPOSE(mine, theirs)                                              \
@@ -108,19 +136,24 @@ ssize_t __readlink_chk(const char *path, char *buf, size_t n, size_t room)
     return real(path, buf, n, room);
 }
 
-/* A program built with 64-bit file offsets asked for calls the 64 names. */
 #define PLANT_LOOK(name, type)                                                    \
     int name(const char *path, struct type *st)                                    \
     {                                                                              \
         static int (*real)(const char *, struct type *);                           \
         if (!real) real = (int (*)(const char *, struct type *))dlsym(RTLD_NEXT, #name); \
         before("look", &g_looks, path);                                            \
-        return real(path, st);                                                     \
+        int r = real(path, st);                                                    \
+        if (r == 0) owned_as(path, st->st_mode, &st->st_uid);                      \
+        return r;                                                                  \
     }
 
 PLANT_LOOK(stat, stat)
 PLANT_LOOK(lstat, stat)
+/* A program built with 64-bit file offsets asked for calls the 64 names, which glibc
+ * has as functions of their own; elsewhere they are the same names or none. */
+#if defined(__GLIBC__)
 PLANT_LOOK(stat64, stat64)
 PLANT_LOOK(lstat64, stat64)
+#endif
 
 #endif
