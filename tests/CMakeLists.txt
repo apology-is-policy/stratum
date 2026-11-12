@@ -80,6 +80,10 @@ stm_add_test(test_pool       test_pool.c)
 stm_add_test(test_sync_multi test_sync_multi.c)
 stm_add_test(test_scrub      test_scrub.c)
 stm_add_test(test_dcache_concurrent test_dcache_concurrent.c)
+# Its hammer runs for as long as its writer does. Under a thread sanitizer in CI
+# that has been 10 s to 57 s on Linux and 41 s on macOS 14, and it was cut off at
+# 60 s on macOS 15, where test_locks, whose time it follows, took twice as long.
+set_tests_properties(test_dcache_concurrent PROPERTIES TIMEOUT 240)
 stm_add_test(test_rc2_concurrent test_rc2_concurrent.c test_fs_common.c)
 stm_add_test(test_rc3_concurrent test_rc3_concurrent.c test_fs_common.c)
 stm_add_test(test_cdc        test_cdc.c)
@@ -230,7 +234,10 @@ set_tests_properties(test_fs_snapshot_lists PROPERTIES TIMEOUT 300)
 set_tests_properties(test_fs_phase8     PROPERTIES TIMEOUT 180)
 set_tests_properties(test_fs_write_path PROPERTIES TIMEOUT 180)
 set_tests_properties(test_fs_identity   PROPERTIES TIMEOUT 180)
-set_tests_properties(test_fs_windows    PROPERTIES TIMEOUT 180)
+# One of its tests waits out real commit windows. Under a thread sanitizer in CI
+# the suite has taken 133 s to 172 s and been cut off at 180 s, and a test that is
+# cut off shows nothing of what the sanitizer found.
+set_tests_properties(test_fs_windows    PROPERTIES TIMEOUT 600)
 # test_9p forms a pool per leg: 155 legs, 22 s alone in a Debug build, past
 # 60 s beside the rest of the suite at ctest -j8, every leg passing. The two
 # below it read 43 s and 45 s there, on the same 60 s.
@@ -238,5 +245,7 @@ set_tests_properties(test_9p         PROPERTIES TIMEOUT 180)
 set_tests_properties(test_9p_client  PROPERTIES TIMEOUT 180)
 set_tests_properties(test_ctl        PROPERTIES TIMEOUT 180)
 # test_fs_frag fills and punches a 24 MiB pool per test (~18 s each
-# in a Debug build); 180 s leaves room for the sanitizers.
-set_tests_properties(test_fs_frag   PROPERTIES TIMEOUT 180)
+# in a Debug build). Under a thread sanitizer in CI it has taken 127 s
+# and 147 s on Linux and been cut off at 180 s there, and on macOS it
+# has never finished in 180 s.
+set_tests_properties(test_fs_frag   PROPERTIES TIMEOUT 600)
