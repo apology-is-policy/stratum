@@ -83,7 +83,7 @@ jobs:
 
   build-macos:
     name: macOS / clang / ${{ matrix.sanitizer }}
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
@@ -119,7 +119,7 @@ jobs:
       matrix:
         # Linux too: its optimized gcc build is what found T0.37, and ext4 lists
         # a directory in hash order, which the key legs must not assume away.
-        os: [ubuntu-24.04, macos-14]
+        os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@v4
 

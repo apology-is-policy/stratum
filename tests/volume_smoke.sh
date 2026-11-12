@@ -232,8 +232,9 @@ else
     no "--force over a key others can read: $(tail -1 "$D/shared.log")"
 fi
 # --key-as-is is the narrow way past that refusal: the key is used, and nothing else of what --force
-# does comes with it. Over a volume that is there it still refuses, with a passphrase it is refused
-# before anything is read, and what is no regular file is still no key (further down).
+# does comes with it. Over a volume that is there it still refuses, beside --passphrase-stdin it is
+# refused before a passphrase is read (with none to read, a read that came first is what would
+# fail), and what is no regular file is still no key (further down).
 kh2=$(cksum < "$D/raw.stm.key")
 if "$B" mkfs "$D/asis.stm" --size 64M --key-as-is --keyfile "$D/raw.stm.key" < /dev/null > "$D/asis.log" 2>&1 \
         && LC_ALL=C grep -q 'using existing keyfile' "$D/asis.log" && [ -s "$D/asis.stm" ]; then
@@ -249,14 +250,21 @@ if [ "$rc" != 0 ] && LC_ALL=C grep -q 'already holds data' "$D/asis2.log" && [ "
 else
     no "--key-as-is over a volume that is there: rc=$rc: $(tail -1 "$D/asis2.log")"
 fi
-printf '%s\n' other | "$B" mkfs "$D/asis3.stm" --size 64M --key-as-is --passphrase-stdin --keyfile "$D/raw.stm.key" > "$D/asis3.log" 2>&1
+"$B" mkfs "$D/asis3.stm" --size 64M --key-as-is --passphrase-stdin --keyfile "$D/raw.stm.key" < /dev/null > "$D/asis3.log" 2>&1
 rc=$?
 if [ "$rc" != 0 ] && LC_ALL=C grep -q -e '--key-as-is uses a key file that is there' "$D/asis3.log" && [ ! -e "$D/asis3.stm" ]; then
+    ok "--key-as-is beside --passphrase-stdin is refused before a passphrase is read"
+else
+    no "--key-as-is before a passphrase is read: rc=$rc: $(tail -1 "$D/asis3.log"); image left: $([ -e "$D/asis3.stm" ] && echo yes || echo no)"
+fi
+printf '%s\n' other | "$B" mkfs "$D/asis4.stm" --size 64M --key-as-is --passphrase-stdin --keyfile "$D/raw.stm.key" > "$D/asis4.log" 2>&1
+rc=$?
+if [ "$rc" != 0 ] && LC_ALL=C grep -q -e '--key-as-is uses a key file that is there' "$D/asis4.log" && [ ! -e "$D/asis4.stm" ]; then
     ok "--key-as-is with a passphrase is refused, and says why"
 else
-    no "--key-as-is with a passphrase: rc=$rc: $(tail -1 "$D/asis3.log"); image left: $([ -e "$D/asis3.stm" ] && echo yes || echo no)"
+    no "--key-as-is with a passphrase: rc=$rc: $(tail -1 "$D/asis4.log"); image left: $([ -e "$D/asis4.stm" ] && echo yes || echo no)"
 fi
-[ "$(cksum < "$D/raw.stm.key")" = "$kh2" ] && ok "the key those three named is as it was" || no "--key-as-is changed the key it named"
+[ "$(cksum < "$D/raw.stm.key")" = "$kh2" ] && ok "the key those four named is as it was" || no "--key-as-is changed the key it named"
 chmod 600 "$D/raw.stm.key"
 if "$B" mkfs "$D/own.stm" --size 64M --keyfile "$D/raw.stm.key" < /dev/null > "$D/own.log" 2>&1 \
         && LC_ALL=C grep -q 'using existing keyfile' "$D/own.log"; then

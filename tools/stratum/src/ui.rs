@@ -4,13 +4,8 @@
 //! double-line panel borders, blue/dark-gray active/inactive scheme,
 //! header row + horizontal rule, F-key bar at the bottom.
 //!
-//! What it does differently from the first TUI, removed since:
-//!   - panels are sourced from /panels/X/entries (already pre-formatted
-//!     server-side), parsed into structured `Entry` rows for display.
-//!   - editor + dialogs are display-only at v1.0 (interactive driving
-//!     lands in v1.1+).
-//!   - the F-key labels reflect slate's panel verbs ("Up/Down/Enter/
-//!     Backspace") rather than the v1 monolith's filesystem ops.
+//! Panels are sourced from /panels/X/entries (already pre-formatted
+//! server-side), parsed into structured `Entry` rows for display.
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -26,7 +21,7 @@ use crate::swiss5_view;
 use crate::snapgraph::SnapshotGraphState;
 use crate::volmap::VolumeMapState;
 
-// -- color palette (lifted from tui/src/ui.rs) ----------------------
+// -- color palette ---------------------------------------------------
 
 const CLR_BG: Color = Color::Black;
 
@@ -42,7 +37,6 @@ const CLR_LINK: Color = Color::Magenta;
 const CLR_OTHER: Color = Color::Gray;
 // SWISS-2: .stm volume files render in yellow — visual cue that
 // pressing Enter on them mounts the volume in the inactive panel.
-// Same color used in v1's TUI for the same purpose.
 const CLR_STM: Color = Color::Yellow;
 
 const CLR_CURSOR_FG: Color = Color::Black;
@@ -57,8 +51,7 @@ const CLR_FKEY_LABEL_FG: Color = Color::Black;
 const CLR_FKEY_LABEL_BG: Color = Color::Cyan;
 
 // Shift+F-key row uses a more subdued palette so the eye prefers the
-// regular row but the modifier layer is legible at a glance — same
-// posture as tui/src/ui.rs.
+// regular row but the modifier layer is legible at a glance.
 const CLR_SHIFT_FKEY_NUM: Color = Color::DarkGray;
 const CLR_SHIFT_FKEY_LABEL_FG: Color = Color::Yellow;
 const CLR_SHIFT_FKEY_LABEL_BG: Color = Color::DarkGray;
