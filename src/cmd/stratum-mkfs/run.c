@@ -384,9 +384,10 @@ static bool dir_part(const char *path, char *dir, size_t n)
     return true;
 }
 
-/* A directory to make a key in. One the user may write and search but not read still
- * takes a key, so where it cannot be opened for reading it is opened for the search
- * alone. Linux does not sync a directory opened so, which is said; macOS does. */
+/* A directory to make a key in, or to take an unfinished image out of. One the user
+ * may write and search but not read still takes a key, so where it cannot be opened
+ * for reading it is opened for the search alone. Linux does not sync a directory
+ * opened so, which is said; macOS does. */
 static int open_key_dir(const char *dir)
 {
     int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -635,9 +636,9 @@ static int open_key_to_read(const char *path)
 #endif
 }
 
-/* Where the directory `dfd` has open is now, for telling where a key made in it is:
- * the path it was opened by may lead elsewhere by then. False where the system does
- * not say. */
+/* Where the directory, or the file, `dfd` has open is now, for telling where what
+ * was made there is: the path it was opened by may lead elsewhere by then. False where
+ * the system does not say. */
 static bool dir_path_now(int dfd, char *buf, size_t n)
 {
 #if defined(__APPLE__)
@@ -655,6 +656,65 @@ static bool dir_path_now(int dfd, char *buf, size_t n)
     (void)dfd; (void)buf; (void)n;
     return false;
 #endif
+}
+
+/* Whether `name` in the directory `dfd` is the very file `fd` has open. */
+static bool names_the_file(int dfd, const char *name, int fd)
+{
+    struct stat held, named;
+    return fstat(fd, &held) == 0 && fstatat(dfd, name, &named, AT_SYMLINK_NOFOLLOW) == 0
+        && named.st_dev == held.st_dev && named.st_ino == held.st_ino;
+}
+
+/* The directory an image this run made is in, held for removing the image should the
+ * run fail: the path may lead elsewhere by then, and a removal by the path would take
+ * whatever it reaches. -1 where the directory cannot be opened or does not hold the
+ * file. */
+static int hold_image_dir(const char *image_path, const char *base, int claim_fd)
+{
+    char dir[4096];
+    if (!dir_part(image_path, dir, sizeof dir)) return -1;
+    int dfd = open_key_dir(dir);
+    if (dfd >= 0 && !names_the_file(dfd, base, claim_fd)) {
+        close(dfd);
+        dfd = -1;
+    }
+    return dfd;
+}
+
+/* An image this run made and did not finish is removed through the directory it was
+ * made in, and only while its name there is still that file. Anywhere else it is left,
+ * and said: a name alone may reach a file this run never made. */
+static void remove_made_image(const char *image_path, int dir_fd, const char *base,
+                              int claim_fd)
+{
+    if (claim_fd < 0) {
+        fprintf(stderr,
+            "stratum-mkfs: %s was made by this run and is left: it could not be locked, so "
+            "this run holds nothing that says which file it is, and it removes none by a "
+            "name alone\n", image_path);
+        return;
+    }
+    char now[4096];
+    bool said = dir_path_now(claim_fd, now, sizeof now);
+    if (dir_fd >= 0 && names_the_file(dir_fd, base, claim_fd)) {
+        if (unlinkat(dir_fd, base, 0) == 0) return;
+        fprintf(stderr, "stratum-mkfs: the image this run made could not be removed (%s); "
+                        "it is %s\n", strerror(errno), said ? now : image_path);
+        return;
+    }
+    struct stat held;
+    if (fstat(claim_fd, &held) == 0 && held.st_nlink == 0) {
+        fprintf(stderr,
+            "stratum-mkfs: the image this run made has no name any more and goes as the "
+            "run ends: nothing is removed by the name it was made by, which may reach "
+            "another file\n");
+        return;
+    }
+    fprintf(stderr,
+        "stratum-mkfs: the image this run made is left, %s%s: the name it was made by no "
+        "longer leads to it, and nothing is removed by a name that may reach another "
+        "file\n", said ? "at " : "wherever it is now", said ? now : "");
 }
 
 /* Where the key that `name` names in the directory `dfd` is, in words: by the
@@ -953,12 +1013,18 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     int  new_key_fd = -1;
     int  old_key_fd = -1;
     int  claim_fd = -1;
+    int  image_dir_fd = -1;
+    const char *image_base = strrchr(image_path, '/');
+    image_base = image_base ? image_base + 1 : image_path;
     /* The key the volume is wrapped under, read through the descriptor it was asked
      * about or made through, and never by its name. */
     stm_hybrid_keys wrap;
     memset(&key_seen, 0, sizeof key_seen);
-    if (mkfs_claim(image_path, keyfile_path, have_pass, force, key_as_is, device_bytes,
-                   &created, &claim_fd, &key_was_there, &key_seen) != 0) {
+    int refused = mkfs_claim(image_path, keyfile_path, have_pass, force, key_as_is,
+                             device_bytes, &created, &claim_fd, &key_was_there, &key_seen);
+    if (created && claim_fd >= 0)
+        image_dir_fd = hold_image_dir(image_path, image_base, claim_fd);
+    if (refused != 0) {
         exit_code = 1;
         goto cleanup;
     }
@@ -1184,7 +1250,8 @@ int stm_cmd_mkfs_main(int argc, char **argv)
                 "stratum-mkfs: %s does not lead to the file it led to when the volume was "
                 "claimed: that file was formatted, and nothing was written to what the name "
                 "reaches now. See what is at the name, and who changed it, before running "
-                "again; a key this run made is removed\n", image_path);
+                "again; a key this run made is removed, and so is an image it made, where "
+                "that is still in the directory it was made in\n", image_path);
             exit_code = 2;
             goto cleanup;
         }
@@ -1266,8 +1333,9 @@ cleanup:
     /* What this run made and failed to finish, and nothing it found. */
     if (exit_code != 0) {
         if (temp_key_made) unlinkat(key_dir_fd, new_key_name, 0);
-        if (created) unlink(image_path);
+        if (created) remove_made_image(image_path, image_dir_fd, image_base, claim_fd);
     }
+    if (image_dir_fd >= 0) close(image_dir_fd);
     if (key_dir_fd >= 0) close(key_dir_fd);
     /* SWISS-4m: wipe + munlock the passphrase buffer regardless of
      * exit path. Stack-allocated, so munlock + memzero is enough —

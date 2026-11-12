@@ -26,9 +26,10 @@
  *                   renamed to its name with ".away" after it and an empty one is made
  *                   at its name, as whoever owns a directory above it could do
  *   STM_PLANT_PUT   with STM_PLANT_MOVE, a file: it is given a name in the directory
- *                   made, STM_PLANT_PUT_AS with the program's pid after it. Whoever
- *                   moved the directory away can leave a file of theirs there, under
- *                   the name a program made its own file by.
+ *                   made, STM_PLANT_PUT_AT as it stands, or STM_PLANT_PUT_AS with the
+ *                   program's pid after it. Whoever moved the directory away can leave
+ *                   a file of theirs there, under the name a program made its own file
+ *                   by.
  *   STM_PLANT_LINK  where the link is left, where that is not the path watched: one
  *                   path's moment, and a link at another
  */
@@ -36,6 +37,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,9 +77,12 @@ static void before(const char *kind, int *count, const char *path)
         if (r == 0) r = mkdir(move, 0777);
         const char *put = getenv("STM_PLANT_PUT");
         const char *put_as = getenv("STM_PLANT_PUT_AS");
-        if (r == 0 && put && *put && put_as && *put_as) {
+        const char *put_at = getenv("STM_PLANT_PUT_AT");
+        bool at = put_at && *put_at;
+        if (r == 0 && put && *put && (at || (put_as && *put_as))) {
             char there[4400];
-            snprintf(there, sizeof there, "%s/%s%ld", move, put_as, (long)getpid());
+            if (at) snprintf(there, sizeof there, "%s/%s", move, put_at);
+            else snprintf(there, sizeof there, "%s/%s%ld", move, put_as, (long)getpid());
             r = link(put, there);
         }
         snprintf(line, sizeof line, "moved before %s: %s\n", moment,

@@ -504,13 +504,14 @@ else
     # a directory above it could do. Nothing is made in the directory now at the path. The
     # volume is made, its key takes its name in the directory that was moved, and mkfs says
     # where that is and that the name does not lead there. The library watches the directory
-    # the key was named in, whose third look is the one where the key is made.
+    # the key was named in, whose third look is the one where the key is made; the open before
+    # it is of the image, which this run makes there and holds its directory to remove it by.
     mkdir "$D/pl-kept"
     chmod 755 "$D/pl-kept"
     ln -s "pl-kept/k.key" "$D/pl-moved.key"
     plant_run STM_PLANT_AT="$D" STM_PLANT_ON=look:3 STM_PLANT_MOVE="$D/pl-kept" STM_PLANT_LOG="$D/pl-moved.plant" \
         -- mkfs "$D/pl-moved.stm" --size 64M --keyfile "$D/pl-moved.key" < /dev/null > "$D/pl-moved.log" 2>&1; rc=$?
-    if [ "$rc" = 2 ] && [ "$(moments moved)" = "look:1 look:2 moved before look:3: done " ] \
+    if [ "$rc" = 2 ] && [ "$(moments moved)" = "look:1 look:2 open:1 moved before look:3: done " ] \
             && LC_ALL=C grep -qF "$D/pl-moved.stm is formatted and its key is $DP/pl-kept.away/k.key, but the name $D/pl-moved.key does not lead to it" "$D/pl-moved.log" \
             && [ -z "$(ls -A "$D/pl-kept")" ] && [ "$(ls -A "$D/pl-kept.away")" = k.key ] \
             && opens "$D/pl-moved.stm" "$D/pl-kept.away/k.key"; then
@@ -528,7 +529,7 @@ else
         STM_PLANT_LOG="$D/pl-theirs-put.plant" \
         -- mkfs "$D/pl-theirs-put.stm" --size 64M --keyfile "$D/pl-theirs-put.key" < /dev/null > "$D/pl-theirs-put.log" 2>&1; rc=$?
     put=$(ls -A "$D/pl-put" 2>/dev/null | LC_ALL=C grep -c '^k\.key\.new\.[0-9][0-9]*$')
-    if [ "$rc" = 2 ] && [ "$(moments theirs-put)" = "look:1 look:2 moved before look:3: done " ] && [ "$put" = 1 ] \
+    if [ "$rc" = 2 ] && [ "$(moments theirs-put)" = "look:1 look:2 open:1 moved before look:3: done " ] && [ "$put" = 1 ] \
             && [ "$(ls -A "$D/pl-put.away")" = k.key ] \
             && opens "$D/pl-theirs-put.stm" "$D/pl-put.away/k.key" && ! opens "$D/pl-theirs-put.stm" "$D/pl-own.key"; then
         ok "a key of another's left at the path of the key mkfs made is not the one the volume is made with"
@@ -644,6 +645,43 @@ else
         ok "an image name led elsewhere once the volume was claimed: the file that was claimed is the one formatted, nothing is written where the name leads, and no key is left"
     else
         no "an image name led elsewhere once the volume was claimed: rc=$rc: $(tr '\n' ' ' < "$D/im-race.plant" 2>/dev/null): $(tail -1 "$D/im-race.log"); bytes where the name leads now: $(wc -c < "$D/im-b.stm" | tr -d ' '); in the file claimed: $(wc -c < "$D/im-a.stm" | tr -d ' '); key left: $(ls "$D" | LC_ALL=C grep -c 'im-race.stm.key')"
+    fi
+    # An image this run made is removed, should the run fail, through the directory it was made
+    # in and never by its path: the path may lead to another file by then, and a removal by it
+    # would take a file mkfs never made. Here the name is free, in a directory of the user's
+    # own, and just before mkfs's last look at the name that directory is moved away and
+    # another made at its path, holding a file of the user's under the image's name, as the
+    # owner of a directory above it could do. mkfs says the name leads elsewhere, the file at
+    # the name is as it was, and the image mkfs made and formatted is gone from the directory
+    # that was moved, with the key it made. A name that was free is opened twice, the second
+    # time to make it, and looked at once, last.
+    mkdir "$D/im-dir"
+    printf 'a file of the user that mkfs never made\n' > "$D/im-decoy"
+    plant_run STM_PLANT_AT="$D/im-dir/vol.stm" STM_PLANT_ON=look:1 STM_PLANT_MOVE="$D/im-dir" STM_PLANT_PUT="$D/im-decoy" STM_PLANT_PUT_AT=vol.stm \
+        STM_PLANT_LOG="$D/im-moved.plant" \
+        -- mkfs "$D/im-dir/vol.stm" --size 64M --keyfile "$D/im-moved.key" < /dev/null > "$D/im-moved.log" 2>&1; rc=$?
+    if [ "$rc" = 2 ] && [ "$(tr '\n' ' ' < "$D/im-moved.plant")" = "open:1 open:2 moved before look:1: done " ] \
+            && LC_ALL=C grep -qF "stratum-mkfs: $D/im-dir/vol.stm does not lead to the file it led to when the volume was claimed" "$D/im-moved.log" \
+            && cmp -s "$D/im-decoy" "$D/im-dir/vol.stm" && [ -z "$(ls -A "$D/im-dir.away")" ] \
+            && [ ! -e "$D/im-moved.key" ] && [ -z "$(ls "$D" | LC_ALL=C grep -F 'im-moved.key.new.')" ]; then
+        ok "a made image's directory moved away before the last look: the image mkfs made is removed from the directory it was made in, and the file now at its path is not touched"
+    else
+        no "a made image's directory moved away before the last look: rc=$rc: $(tr '\n' ' ' < "$D/im-moved.plant" 2>/dev/null): $(tail -1 "$D/im-moved.log"); at its path: $(ls -A "$D/im-dir" 2>/dev/null | tr '\n' ' '); in the directory moved: $(ls -A "$D/im-dir.away" 2>/dev/null | tr '\n' ' '); key left: $(ls "$D" | LC_ALL=C grep -c 'im-moved.key')"
+    fi
+    # The same where the name itself is taken over: a link of the user's own, to a file of
+    # theirs, is put over the image mkfs made, just before the last look. The image has no
+    # name left to be removed by, mkfs says so, and the link and the file it leads to are as
+    # they were put.
+    printf 'another file of the user that mkfs never made\n' > "$D/im-over-to"
+    plant_run STM_PLANT_AT="$D/im-over.stm" STM_PLANT_ON=look:1 STM_PLANT_TO="$D/im-over-to" STM_PLANT_OVER=over STM_PLANT_LOG="$D/im-over.plant" \
+        -- mkfs "$D/im-over.stm" --size 64M --keyfile "$D/im-over.key" < /dev/null > "$D/im-over.log" 2>&1; rc=$?
+    if [ "$rc" = 2 ] && [ "$(tr '\n' ' ' < "$D/im-over.plant")" = "open:1 open:2 planted before look:1: done " ] \
+            && LC_ALL=C grep -q '^stratum-mkfs: the image this run made has no name any more' "$D/im-over.log" \
+            && [ "$(readlink "$D/im-over.stm")" = "$D/im-over-to" ] && [ "$(cat "$D/im-over-to")" = 'another file of the user that mkfs never made' ] \
+            && [ ! -e "$D/im-over.key" ] && [ -z "$(ls "$D" | LC_ALL=C grep -F 'im-over.key.new.')" ]; then
+        ok "a link put over a made image before the last look is not removed by the image's name, and mkfs says the image has no name left"
+    else
+        no "a link put over a made image before the last look: rc=$rc: $(tr '\n' ' ' < "$D/im-over.plant" 2>/dev/null): $(tail -1 "$D/im-over.log"); at the name: $(ls -l "$D/im-over.stm" 2>&1 | cut -c1-160); key left: $(ls "$D" | LC_ALL=C grep -c 'im-over.key')"
     fi
     # A daemon mounts through the descriptor its lock is on, so the image it serves is the one
     # it locked. Two volumes under one key, each holding a file that says which it is, and a
