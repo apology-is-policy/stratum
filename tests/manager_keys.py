@@ -682,7 +682,7 @@ def held_terminal_legs(stratum, vol, host, root):
                 waits = '' if ended else threads_waiting(term.pid)
                 record(not left, f'{how}: the daemons stopped and the volume locked, with nothing read',
                        f'{how}: daemons {left} still serve the volume {took:.0f} s after the stop was asked')
-                # Not 0: the daemons were not waited for, and the screen was not put back.
+                # Not 0: the screen was not put back.
                 record(ended and term.rc == 128 + signal.SIGTERM,
                        f'{how}: the manager ended as the signal alone would have ended it, with nothing read',
                        f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s'

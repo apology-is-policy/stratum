@@ -47,7 +47,9 @@ fn main() {
     children_waited_for();
     // A path need not be UTF-8, and std::env::args panics on one that is not.
     let args: Vec<OsString> = std::env::args_os().collect();
-    match dispatch(args) {
+    let ended = dispatch(args);
+    tui::end_if_terminal_held();
+    match ended {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(e) => {
             // What std prints for an error main returns; tell stands in for its controls.

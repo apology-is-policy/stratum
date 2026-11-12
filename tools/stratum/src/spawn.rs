@@ -167,6 +167,10 @@ pub(crate) fn operand(path: &Path) -> PathBuf {
 /// pipe it wrote to has gone: the panic would skip the rest of the stop.
 pub(crate) fn tell(line: std::fmt::Arguments) {
     use std::io::Write as _;
+    // A terminal that takes nothing would hold this write, and the rest of the stop with it.
+    if crate::tui::terminal_held() {
+        return;
+    }
     let _ = writeln!(std::io::stderr(), "{}", told(line));
 }
 
