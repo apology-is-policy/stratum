@@ -306,8 +306,9 @@ fi
 # between two of mkfs's own system calls, so a small library loaded into mkfs does it, just before
 # the call it is told (tests/plant_at_look.c). mkfs looks at the name, reads a link it finds there
 # and looks at it again, and then asks what the name reaches: once before it makes the image and
-# once after. It looks again before it uses a key, and once more where it makes one. A link it
-# found is one it asked about. One left after it looked must not be followed.
+# once after. It looks again before it uses a key, once more where it makes one, and a last time
+# when the new key has taken the name. A link it found is one it asked about. One left after it
+# looked must not be followed.
 case "$(uname -s)" in
     Darwin) PLANT_LIB=$D/plant.dylib; PLANT_HOW=-dynamiclib ;;
     *)      PLANT_LIB=$D/plant.so;    PLANT_HOW="-shared -fPIC" ;;
@@ -339,9 +340,10 @@ else
     # Nothing left: what the library sees says which moment is which below. If mkfs comes to look
     # more or fewer times, this is the check that says so, and those under it need their moments
     # named again. Looks 1 and 2 are the claim before the image is made, 3 and 4 the claim after,
-    # 5 the use of a key, 6 where a new key's place is asked about.
+    # 5 the use of a key, 6 where a new key's place is asked about, 7 what the name reaches once
+    # the key has taken it.
     planted none nothing; rc=$?
-    if [ "$rc" = 0 ] && [ "$(moments none)" = "look:1 look:2 look:3 look:4 look:5 look:6 " ] \
+    if [ "$rc" = 0 ] && [ "$(moments none)" = "look:1 look:2 look:3 look:4 look:5 look:6 look:7 " ] \
             && LC_ALL=C grep -q 'generated keyfile' "$D/pl-none.log"; then
         ok "the library sees each time mkfs reads the key's links and looks at the key"
     else
@@ -403,6 +405,44 @@ else
     else
         no "a link replaced between mkfs's look at it and its reading of it: rc=$rc: $(moments swap): $(tail -1 "$D/pl-swap.log"); image left: $([ -e "$D/pl-swap.stm" ] && echo yes || echo no); at its target: $(ls "$D"/pl-swap.to* 2>/dev/null | wc -l | tr -d ' ')"
     fi
+    # A key is at the name, and a link to another key takes its place after the claim's last look
+    # for links. Both are keys of the user's own: what the name reaches is still not what was
+    # looked at.
+    cp "$D/pl-own.key" "$D/pl-taken.key" && chmod 600 "$D/pl-taken.key"
+    planted taken look:4 "" over; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:4: done$' "$D/pl-taken.plant" \
+            && LC_ALL=C grep -q 'does not lead where its links were read to end' "$D/pl-taken.log" && [ ! -e "$D/pl-taken.stm" ]; then
+        ok "a link to another key put in a key's place after the claim looked at it is not followed, and nothing is made"
+    else
+        no "a link to another key put in a key's place after the claim looked at it: rc=$rc: $(moments taken): $(tail -1 "$D/pl-taken.log"); image left: $([ -e "$D/pl-taken.stm" ] && echo yes || echo no)"
+    fi
+    # A link to nothing left inside the claim passes it, as the free name does: nothing is there
+    # either way. It is asked about where the new key's place is, and another user's, as far as
+    # mkfs is told, is refused there.
+    planted nowhere look:4 "$D/pl-nowhere.to" "" "$(( $(id -u) + 1 ))"; rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q '^planted before look:4: done$' "$D/pl-nowhere.plant" \
+            && LC_ALL=C grep -q 'reached through a symlink another user owns' "$D/pl-nowhere.log" && [ ! -e "$D/pl-nowhere.stm" ] \
+            && ! ls "$D"/pl-nowhere.to* > /dev/null 2>&1; then
+        ok "another user's link to nothing left inside the claim is refused where the new key's place is asked about, and nothing is made"
+    else
+        no "another user's link to nothing left inside the claim: rc=$rc: $(moments nowhere): $(tail -1 "$D/pl-nowhere.log"); image left: $([ -e "$D/pl-nowhere.stm" ] && echo yes || echo no); at its target: $(ls "$D"/pl-nowhere.to* 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+    # Once the new key has taken its place, the name has to reach it: mkfs followed the links by
+    # their text, and every later command is given the name. Here the name is a link of the
+    # user's own to where the key is to go, and another link put over it just before mkfs asks
+    # stands in for a name the kernel follows another way. The volume is formatted by then, so
+    # it stays, and so does the key, where mkfs says it was put. The name being a link, mkfs
+    # looks at it three times at each asking: this is its tenth look.
+    ln -s "$D/pl-name.to" "$D/pl-name.key"
+    planted name look:10 "" over; rc=$?
+    if [ "$rc" = 2 ] && LC_ALL=C grep -q '^planted before look:10: done$' "$D/pl-name.plant" \
+            && LC_ALL=C grep -qF "its key was put at $D/pl-name.to, but the name $D/pl-name.key does not lead to it" "$D/pl-name.log" \
+            && [ -s "$D/pl-name.stm" ] && [ -f "$D/pl-name.to" ] && [ ! -L "$D/pl-name.to" ] \
+            && ! LC_ALL=C grep -q '^generated keyfile' "$D/pl-name.log"; then
+        ok "a key name that does not lead to the key mkfs made is said, with where the key was put, and the volume and the key are kept"
+    else
+        no "a key name that does not lead to the key mkfs made: rc=$rc: $(moments name): $(tail -1 "$D/pl-name.log"); image left: $([ -s "$D/pl-name.stm" ] && echo yes || echo no); key where it was put: $([ -f "$D/pl-name.to" ] && echo yes || echo no)"
+    fi
 fi
 
 # A link that cannot be read cannot be asked where it leads, and the kernel follows it all the
@@ -416,8 +456,51 @@ if chmod -h 000 "$D/unread.key" 2> /dev/null && ! readlink "$D/unread.key" > /de
     else
         no "a link at the key's name that cannot be read: rc=$rc: $(tail -1 "$D/unread.log"); image left: $([ -e "$D/unread.stm" ] && echo yes || echo no)"
     fi
+    # Forced, nobody is asked. With no key to make, the name is only opened, and the kernel
+    # follows the link, mode or no mode: the key behind it is used. A new key is not sent
+    # through a link whose text cannot be read: it takes the link's place.
+    "$B" mkfs "$D/unread-f.stm" --size 64M --force --keyfile "$D/unread.key" < /dev/null > "$D/unread-f.log" 2>&1
+    rc=$?
+    if [ "$rc" = 0 ] && LC_ALL=C grep -q 'using existing keyfile' "$D/unread-f.log" && [ -s "$D/unread-f.stm" ] && [ -L "$D/unread.key" ]; then
+        ok "with --force the key behind a link that cannot be read is used, and the link stays"
+    else
+        no "with --force, a key behind a link that cannot be read: rc=$rc: $(tail -1 "$D/unread-f.log")"
+    fi
+    behind=$(cksum < "$D/raw.stm.key")
+    printf '%s\n' "$PASS" | "$B" mkfs "$D/unread-p.stm" --size 64M --force --passphrase-stdin --keyfile "$D/unread.key" > "$D/unread-p.log" 2>&1
+    rc=$?
+    if [ "$rc" = 0 ] && [ ! -L "$D/unread.key" ] && [ -f "$D/unread.key" ] && [ "$(cksum < "$D/raw.stm.key")" = "$behind" ] \
+            && LC_ALL=C grep -q '^generated encrypted keyfile' "$D/unread-p.log"; then
+        ok "with --force a new key takes the place of a link that cannot be read, and the key behind it stays as it was"
+    else
+        no "with --force and a passphrase, a link that cannot be read: rc=$rc: $(tail -1 "$D/unread-p.log"); still a link: $([ -L "$D/unread.key" ] && echo yes || echo no)"
+    fi
 else
     echo "note: a link that cannot be read: none can be made here (a link keeps no mode, or this user reads it all the same), so there is nothing to check"
+fi
+
+# A link with two names. Its owner is the user, and whoever gave it its second name need not
+# be: where nothing forbids it, any user can give a link of the user's or root's a name of
+# their choosing, and its text would lead the key from there. So it is not followed. With one
+# name again, the same link is: the control.
+if "$B" mkfs "$D/two-own.stm" --size 64M --keyfile "$D/two-own.key" < /dev/null > "$D/two-own.log" 2>&1 \
+        && ln -s "two-own.key" "$D/two-first.lnk" && ln -P "$D/two-first.lnk" "$D/two.key" 2> /dev/null && [ -L "$D/two.key" ]; then
+    "$B" mkfs "$D/two.stm" --size 64M --keyfile "$D/two.key" < /dev/null > "$D/two.log" 2>&1
+    rc=$?
+    if [ "$rc" != 0 ] && LC_ALL=C grep -q 'is reached through a symlink that has more than one name' "$D/two.log" && [ ! -e "$D/two.stm" ]; then
+        ok "a link at the key's name that has a second name is refused, and nothing is made"
+    else
+        no "a link at the key's name that has a second name: rc=$rc: $(tail -1 "$D/two.log"); image left: $([ -e "$D/two.stm" ] && echo yes || echo no)"
+    fi
+    rm "$D/two-first.lnk"
+    if "$B" mkfs "$D/two.stm" --size 64M --keyfile "$D/two.key" < /dev/null > "$D/two-one.log" 2>&1 \
+            && LC_ALL=C grep -q 'using existing keyfile' "$D/two-one.log" && [ -s "$D/two.stm" ]; then
+        ok "the same link with one name again is followed"
+    else
+        no "the same link with one name again: $(tail -1 "$D/two-one.log")"
+    fi
+else
+    echo "note: a link with two names: none can be made here (no hard link to a link, or no key to point it at: $(tail -1 "$D/two-own.log" 2>/dev/null)), so there is nothing to check"
 fi
 
 # The links at the key's name are asked about one by one, seven at most. More than that are refused, not

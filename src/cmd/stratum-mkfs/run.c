@@ -110,8 +110,11 @@ static void usage(void)
 "  --size SIZE      Image size with K/M/G suffix. Default: 64M.\n"
 "  --force          Format over what is already at IMAGE, and with\n"
 "                   --passphrase-stdin replace an existing keyfile. Whatever\n"
-"                   they held is gone. Also follows a key link another user\n"
-"                   owns, and uses a keyfile that is not the user's alone.\n"
+"                   they held is gone. Also follows any key link it can read,\n"
+"                   whoever owns it and however many names it has, and uses\n"
+"                   a keyfile that is not the user's alone. A new key is not\n"
+"                   sent through a link that cannot be read: it takes that\n"
+"                   link's place.\n"
 "                   Never overrides a daemon using IMAGE, and a format\n"
 "                   cannot shrink a file: --size must reach it.\n"
 "  --key-as-is      Use the keyfile that is there although another user owns\n"
@@ -128,7 +131,8 @@ static void usage(void)
 "                   --force. If missing, one is generated where its\n"
 "                   links point. Links at PATH, to a key that exists or to\n"
 "                   where one is to go, are followed when they are seven at\n"
-"                   most and " LINK_OWNERS " owns each.\n"
+"                   most, " LINK_OWNERS " owns each, and each can be\n"
+"                   read and has no other name.\n"
 "                   Default: IMAGE.key.\n"
 "  --passphrase-stdin  Read a passphrase line from stdin and use it to\n"
 "                   wrap the keyfile (KFP1 format). The passphrase is\n"
@@ -257,6 +261,7 @@ enum key_links {
     KEY_LINKS_FOLLOWED,
     KEY_LINKS_TOO_MANY,
     KEY_LINKS_ANOTHERS,
+    KEY_LINKS_MANY_NAMES,
     KEY_LINKS_UNREAD,
     KEY_LINKS_CHANGED,
 };
@@ -300,6 +305,12 @@ static void say_links_refused(const char *keyfile_path, const struct key_walk *w
             "stratum-mkfs: keyfile %s is reached through a symlink another user owns, who "
             "would decide where the key goes; pass --force to follow it\n", keyfile_path);
         break;
+    case KEY_LINKS_MANY_NAMES:
+        fprintf(stderr,
+            "stratum-mkfs: keyfile %s is reached through a symlink that has more than one "
+            "name, and whoever gave it the one here would decide where the key goes: name "
+            "the key file itself, or pass --force to follow it\n", keyfile_path);
+        break;
     case KEY_LINKS_UNREAD:
         fprintf(stderr,
             "stratum-mkfs: keyfile %s is reached through a link that cannot be read (%s), "
@@ -308,9 +319,9 @@ static void say_links_refused(const char *keyfile_path, const struct key_walk *w
         break;
     case KEY_LINKS_CHANGED:
         fprintf(stderr,
-            "stratum-mkfs: a link at keyfile %s changed while it was being read, so nothing "
-            "was asked of the one there now: see who changed it before running again\n",
-            keyfile_path);
+            "stratum-mkfs: a link on the way to keyfile %s changed while it was being read, "
+            "so nothing was asked of what is there now: see who changed it before running "
+            "again\n", keyfile_path);
         break;
     default:
         fprintf(stderr,
@@ -325,9 +336,10 @@ static void say_name_leads_elsewhere(const char *keyfile_path)
 {
     fprintf(stderr,
         "stratum-mkfs: keyfile %s does not lead where its links were read to end: a link "
-        "was left or changed there while they were read, or one of them is a descriptor's, "
-        "whose text names no file (a pipe's, an unlinked file's): name the key file "
-        "itself, or see who left a link, before running again\n", keyfile_path);
+        "or a file was left or changed on its way while it was looked at, or one of its "
+        "links is a descriptor's, whose text names no file (a pipe's, an unlinked file's): "
+        "name the key file itself, or see what was left, before running again\n",
+        keyfile_path);
 }
 
 /*
@@ -352,9 +364,11 @@ static bool key_in_the_way(const char *keyfile_path, bool replaces_key, bool for
     if (force) return false;
     /* The links were followed here by their text; the kernel follows them itself when
      * the key is opened. What the name reaches has to be what they were read to end
-     * in: it is not where a link was left or changed after it was read, nor where a
-     * link's text is no path to what it opens, as a descriptor's is not for a pipe or
-     * an unlinked file. */
+     * in: it is not where a link to something, or a file, was left or changed after
+     * the reading, nor where a link's text is no path to what it opens, as a
+     * descriptor's is not for a pipe or an unlinked file. A link to nothing left at a
+     * free name passes, as the free name does: it is asked about where the new key's
+     * place is. */
     bool reached = stat(keyfile_path, &st) == 0;
     if (reached != walk.there
             || (reached && (st.st_dev != walk.st.st_dev || st.st_ino != walk.st.st_ino))) {
@@ -479,11 +493,15 @@ static bool link_is_trusted(const struct stat *st)
 
 /* A key named through a symlink belongs where the link points: replacing the link
  * would leave it beside the volume instead. A link is looked at before it is read, so
- * another user's is refused unread, and again after, so the one whose text is followed
- * is the one that was asked about. Where another user cannot replace an entry of the
- * user's or root's, as in a sticky directory, the first look settles that alone;
- * where they can, no look here settles it. NULL with walk->why saying which: more
- * than seven links or a path too long, a link another user owns, one that cannot be
+ * another user's is refused unread, and again after, so one put in its place meanwhile
+ * and still there is not the one whose text is followed. Where another user cannot
+ * replace an entry of the user's or root's, as in a sticky directory, the first look
+ * settles that alone; where they can, no look here settles it. The owner is the
+ * link's, not of whoever gave it the name it has here: where nothing forbids it any
+ * user can give a link of the user's or root's a second name, and its text, joined to
+ * a directory of their choosing, would be followed. So a link with more than one name
+ * is refused. NULL with walk->why saying which: more than seven links or a path too
+ * long, a link another user owns, one with more than one name, one that cannot be
  * read, one that changed. Forced, nothing is asked and a link that cannot be read is
  * taken for the end. */
 static const char *key_destination(const char *path, char *buf, size_t n, bool force,
@@ -504,10 +522,16 @@ static const char *key_destination(const char *path, char *buf, size_t n, bool f
                 walk->why = KEY_LINKS_ANOTHERS;
                 return NULL;
             }
+            if (!force && st.st_nlink > 1) {
+                walk->why = KEY_LINKS_MANY_NAMES;
+                return NULL;
+            }
             len = readlink(here, target, sizeof target - 1);
             if (len < 0 && !force) {
-                walk->why = KEY_LINKS_UNREAD;
-                walk->err = errno;
+                /* Gone, or no link any more: not one that cannot be read. */
+                int e = errno;
+                walk->why = (e == ENOENT || e == EINVAL) ? KEY_LINKS_CHANGED : KEY_LINKS_UNREAD;
+                walk->err = e;
                 return NULL;
             }
         }
@@ -724,6 +748,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     bool key_is_new = false;
     bool temp_key_made = false;
     bool key_was_there = false;
+    int  new_key_fd = -1;
     if (mkfs_claim(image_path, keyfile_path, have_pass, force, key_as_is, device_bytes,
                    &created, &key_was_there) != 0) {
         exit_code = 1;
@@ -796,7 +821,8 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         stm_status ks = have_pass
             ? stm_keyfile_generate_passphrase_fd(tfd, passbuf, plen)
             : stm_keyfile_generate_fd(tfd);
-        close(tfd);
+        /* Kept open: once the key has taken its name, this is what the name has to reach. */
+        new_key_fd = tfd;
         if (ks != STM_OK) {
             fprintf(stderr, "stratum-mkfs: cannot write a new key at %s: status=%d\n",
                     new_key_path, (int)ks);
@@ -896,6 +922,20 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             goto cleanup;
         }
         sync_dir_of(key_target);
+        /* The links to the key's place were followed by their text. Where that is not
+         * the path the kernel follows, the name does not lead to the key, and every
+         * later command is given the name. */
+        struct stat made, named;
+        if (fstat(new_key_fd, &made) != 0 || stat(keyfile_path, &named) != 0
+                || named.st_dev != made.st_dev || named.st_ino != made.st_ino) {
+            fprintf(stderr,
+                "stratum-mkfs: %s is formatted and its key was put at %s, but the name %s "
+                "does not lead to it: look for the key there, keep it, and name it by that "
+                "path\n",
+                image_path, key_target, keyfile_path);
+            exit_code = 2;
+            goto cleanup;
+        }
         fprintf(stderr, "generated %skeyfile: %s\n", have_pass ? "encrypted " : "", keyfile_path);
     }
 
@@ -910,6 +950,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         passphrase_stdin ? " --passphrase-stdin" : "");
 
 cleanup:
+    if (new_key_fd >= 0) close(new_key_fd);
     /* What this run made and failed to finish, and nothing it found. */
     if (exit_code != 0) {
         if (temp_key_made) unlink(new_key_path);
