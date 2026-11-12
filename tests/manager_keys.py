@@ -12,6 +12,7 @@ KEYS_ONLY=leg,leg runs only those legs, each given what its parameters name (a s
 tree for vol and host).
 """
 import codecs
+import ctypes
 import fcntl
 import glob
 import inspect
@@ -675,10 +676,39 @@ def pty_facts():
         os.close(s)
 
 
+def fill_from_the_side(term):
+    """Fills the manager's terminal through an open of its own until it takes no more, as
+    another program's output would. The manager, idle, then finds no room for its next
+    write. Returns the open, to be kept while the leg lasts, and how much went in."""
+    libc = ctypes.CDLL(None)
+    libc.ptsname.restype = ctypes.c_char_p
+    libc.ptsname.argtypes = [ctypes.c_int]
+    name = libc.ptsname(term.fd)
+    if not name:
+        raise Failure('this system names no terminal for a pty: it proves nothing')
+    side = os.open(name, os.O_WRONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    try:
+        put, refused = 0, 0
+        while refused < 10:
+            try:
+                n = os.write(side, b' ' * 256)
+            except BlockingIOError:
+                n = 0
+            put += n
+            refused = 0 if n else refused + 1
+            if not n:
+                time.sleep(0.005)
+    except BaseException:
+        os.close(side)
+        raise
+    return side, put
+
+
 def held_terminal_legs(stratum, vol, host, root):
     """A terminal that takes nothing holds the manager in its draw, and no signal ends a
-    write. A stop asked must not wait there, the volume unlocked behind it, for as long as
-    nothing reads; and a terminal that is only slow must not be taken for one."""
+    write. The screen to be left, by a stop asked or by its key, must not wait there, the
+    volume unlocked behind it, for as long as nothing reads; and a terminal that is only
+    slow must not be taken for one."""
     stall = 10  # tui.rs HELD_AFTER, in seconds
     held, steps = pty_facts()
     print(f'note: this system\'s pty holds {held} bytes with nothing read; refilled {len(steps)} times, room came '
@@ -686,9 +716,17 @@ def held_terminal_legs(stratum, vol, host, root):
     # The slow terminal's pace: 256 bytes and a pause, such that the most this system
     # waits for before it gives room back is read in half the stall.
     pause = min(0.4, stall / 2 * 256 / steps[-1])
-    for how, slow in (('a terminal that takes nothing', False), ('a slow terminal', True)):
-        env_file = f'{root}/env-held{int(slow)}'
+    # What asks for the screen to be left, and what a manager held there ends with: what
+    # the signal alone would have left, or a plain failure where it was the key.
+    cases = (('a terminal that takes nothing', signal.SIGTERM, 128 + signal.SIGTERM),
+             ('a terminal that takes nothing, the stop asked by INT', signal.SIGINT, 128 + signal.SIGINT),
+             ('a full terminal and the key to leave', None, 1),
+             ('a slow terminal', signal.SIGTERM, 0))
+    for n, (how, asked_by, want) in enumerate(cases):
+        slow = want == 0
+        env_file = f'{root}/env-held{n}'
         term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file])
+        side = None
         try:
             term.expect(r'Passphrase for')
             term.send(PASS.encode() + ENTER)
@@ -706,18 +744,27 @@ def held_terminal_legs(stratum, vol, host, root):
             before = session_daemons(session)
             if len(before) < 3:
                 raise Failure(f'the search finds {before} before {how}: it proves nothing')
-            # From here nothing reads. Each resize asks for a whole frame, and twenty of
-            # them for more than any pty holds: the draw's write waits.
             seen = len(term.raw)
-            for i in range(20):
-                fcntl.ioctl(term.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS - 20 * (i % 2), 0, 0))
-                time.sleep(0.15)
-            os.kill(term.pid, signal.SIGTERM)
+            if asked_by is None:
+                # A held draw reads no key. So the manager is left idle, with nothing
+                # more to write, and its terminal filled from the side: it takes the key,
+                # and the first write that finds no room is the one that leaves the screen.
+                wait_quiet(term, how, quiet=2.0)
+                side, put = fill_from_the_side(term)
+                print(f'note: {how}: {put} bytes from the side filled it', flush=True)
+                term.send(b'\x11')
+            else:
+                # From here nothing reads. Each resize asks for a whole frame, and twenty of
+                # them for more than any pty holds: the draw's write waits.
+                for i in range(20):
+                    fcntl.ioctl(term.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS - 20 * (i % 2), 0, 0))
+                    time.sleep(0.15)
+                os.kill(term.pid, asked_by)
             asked = time.monotonic()
             if not slow:
                 time.sleep(3)
                 if os.waitpid(term.pid, os.WNOHANG)[0] != 0 or len(session_daemons(session)) < 3:
-                    raise Failure(f'{how}: the stop was seen to within 3 s, so no write was held: it proves nothing')
+                    raise Failure(f'{how}: the screen was left within 3 s, so no write was held: it proves nothing')
                 limit = asked + stall + 15
                 left, ended = before, False
                 while (left or not ended) and time.monotonic() < limit:
@@ -734,16 +781,19 @@ def held_terminal_legs(stratum, vol, host, root):
                 record(not left, f'{how}: the daemons stopped and the volume locked, with nothing read',
                        f'{how}: daemons {left} still serve the volume {took:.0f} s after the stop was asked')
                 # Not 0: the screen was not put back.
-                record(ended and term.rc == 128 + signal.SIGTERM,
-                       f'{how}: the manager ended as the signal alone would have ended it, with nothing read',
-                       f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s'
+                record(ended and term.rc == want,
+                       f'{how}: the manager ended with {want}, '
+                       + ('as the signal alone would have ended it' if asked_by else 'a failure') + ', with nothing read',
+                       f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s, {want} wanted'
                        + (f'; its threads: {waits}' if waits else ''))
-                if not ended:
-                    # Read, it ends; and the rest of the leg is about a manager that has.
+                if ended:
+                    cooked = termios.tcgetattr(term.fd)[3] & termios.ICANON
+                    record(cooked, f'{how}: the terminal is out of raw mode', f'{how}: the terminal was left raw')
+                else:
+                    # Read, it ends: the ordinary end, which says nothing of the held one.
                     term.exited(30)
-                    print(f'note: {how}: once its terminal was read the manager ended, rc={term.rc}', flush=True)
-                cooked = termios.tcgetattr(term.fd)[3] & termios.ICANON
-                record(cooked, f'{how}: the terminal is out of raw mode', f'{how}: the terminal was left raw')
+                    print(f'note: {how}: once its terminal was read the manager ended, rc={term.rc}; what a held '
+                          f'end leaves behind is not looked at', flush=True)
             else:
                 # Read, a little at a time: each write of the manager's is taken within a
                 # few seconds, though the frame takes longer than the stall to go out.
@@ -775,15 +825,19 @@ def held_terminal_legs(stratum, vol, host, root):
                 left = session_daemons(session)
                 record(not left, f'{how}: the daemons stopped and the volume locked',
                        f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
-            record(not os.path.exists(session), f'{how}: the session directory is gone', f'{how}: the session directory stayed')
+            if slow or ended:
+                record(not os.path.exists(session), f'{how}: the session directory is gone',
+                       f'{how}: the session directory stayed')
             signal_each(left)
             limit = time.monotonic() + 30
             while session_daemons(session) and time.monotonic() < limit:
                 time.sleep(0.2)
             vol.serve()
             vol.stop()
-            print(f'ok: after {how} the volume mounts and unmounts cleanly', flush=True)
+            print(('ok' if slow or ended else 'note') + f': after {how} the volume mounts and unmounts cleanly', flush=True)
         finally:
+            if side is not None:
+                os.close(side)
             term.kill()
 
 
