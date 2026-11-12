@@ -524,6 +524,16 @@ static bool image_links_in_the_way(const char *image_path, int claimed)
     return walk.links > 0 && led_to_dir_in_the_way(&NAMED_IMAGE, image_path, leads_to, true);
 }
 
+/* Whether the name is a link that leads to no file. errno is left as it was. */
+static bool link_to_no_file(const char *path)
+{
+    struct stat st;
+    int was = errno;
+    bool is = lstat(path, &st) == 0 && S_ISLNK(st.st_mode) && stat(path, &st) != 0 && errno == ENOENT;
+    errno = was;
+    return is;
+}
+
 /* 0 with the volume claimed: *claim_fd is the descriptor the claim holds on it, which
  * the format and the mount go through, or -1 where there is none. */
 static int mkfs_claim(const char *image_path, const char *keyfile_path,
@@ -541,6 +551,15 @@ static int mkfs_claim(const char *image_path, const char *keyfile_path,
             return 1;
         s = stm_bdev_claim_image(image_path, true, &fd);
         *created = s == STM_OK || s == STM_ENOLCK;
+        /* The make takes no link, so one that leads to no file is in its way, with or
+         * without --force; "File exists" would say nothing of that. */
+        if (!*created && errno == EEXIST && link_to_no_file(image_path)) {
+            fprintf(stderr,
+                "stratum-mkfs: %s is a link that leads to no file, and a new image is made only at "
+                "a name that is no link: name the file itself, or make an empty file where the link "
+                "leads\n", image_path);
+            return 1;
+        }
     }
     if (s == STM_EBUSY) {
         fprintf(stderr, "stratum-mkfs: %s is open in a running stratumd\n", image_path);

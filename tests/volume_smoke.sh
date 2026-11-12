@@ -596,6 +596,18 @@ else
     else
         no "a link that leads the image into a directory others can change: rc=$rc: $(tail -1 "$D/im-led.log"); bytes in the file: $(wc -c < "$D/im-open/v.stm" | tr -d ' ')"
     fi
+    # A link at the image's name that leads to no file. A new image is made at a name that is
+    # free and takes no link, so nothing is made where the link leads; mkfs says what the name
+    # is, where it said only that the file exists, and makes no key.
+    ln -s "$D/im-nowhere-file.stm" "$D/im-nowhere.stm"
+    "$B" mkfs "$D/im-nowhere.stm" --size 64M < /dev/null > "$D/im-nowhere.log" 2>&1; rc=$?
+    if [ "$rc" = 1 ] && LC_ALL=C grep -qF "stratum-mkfs: $D/im-nowhere.stm is a link that leads to no file" "$D/im-nowhere.log" \
+            && [ "$(wc -l < "$D/im-nowhere.log" | tr -d ' ')" = 1 ] \
+            && [ -L "$D/im-nowhere.stm" ] && [ ! -e "$D/im-nowhere-file.stm" ] && [ ! -e "$D/im-nowhere.stm.key" ]; then
+        ok "a link at the image's name that leads to no file is not followed and is said to be that, and no key is made"
+    else
+        no "a link at the image's name that leads to no file: rc=$rc: $(tail -1 "$D/im-nowhere.log"); where it leads: $(ls "$D" | LC_ALL=C grep -c 'im-nowhere-file'); key: $(ls "$D" | LC_ALL=C grep -c 'im-nowhere.stm.key')"
+    fi
     # A link at the image's name with a second name: any user may have given it either.
     : > "$D/im-two-file.stm"
     if ln -s "im-two-file.stm" "$D/im-first.lnk" && ln -P "$D/im-first.lnk" "$D/im-two.stm" 2> /dev/null && [ -L "$D/im-two.stm" ]; then
