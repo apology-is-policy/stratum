@@ -933,6 +933,43 @@ def stuck_daemon_leg(stratum, vol, host, root):
     ours.close()
     theirs.close()
     print(f'note: a Unix stream socket here holds {held} bytes with nothing read', flush=True)
+    if sys.platform.startswith('linux'):
+        # Linux says how much of a socket's output is unread, and the 9P client takes less
+        # of it than a wait before for the daemon taking: how many bytes a daemon has to
+        # read before that figure moves is how slow a reader it can still tell from none.
+        # Filled by writes larger than the socket holds, so the pieces are the kernel's own.
+        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        ours.setblocking(False)
+        try:
+            def unread():
+                return struct.unpack('i', fcntl.ioctl(ours, termios.TIOCOUTQ, bytes(4)))[0]
+            held = 0
+            try:
+                while True:
+                    held += ours.send(bytes(1 << 20))
+            except BlockingIOError:
+                pass
+            first = was = unread()
+            falls, since, left = [], 0, held
+            while left > 0:
+                got = len(theirs.recv(min(512, left)))
+                if got == 0:
+                    break
+                left -= got
+                since += got
+                now = unread()
+                if now < was:
+                    falls.append(since)
+                    since = 0
+                was = now
+            print(f'note: filled a megabyte at a time it holds {held}, and Linux says {first} unread; '
+                  f'read 512 at a time that fell {len(falls)} times, after {min(falls) if falls else 0} '
+                  f'to {max(falls) if falls else 0} bytes read, and says {was} with all read', flush=True)
+        except OSError as e:
+            print(f'note: the unread output of a Unix stream socket could not be asked: {e}', flush=True)
+        finally:
+            ours.close()
+            theirs.close()
     for how, in_flight in (('a daemon stuck, the output gone', False),
                            ('a daemon stuck with a call to it in flight, the output gone', True)):
         env_file = f'{root}/env-stuck{int(in_flight)}'
