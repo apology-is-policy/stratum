@@ -22,7 +22,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -131,6 +131,24 @@ fn next_log_name() -> String {
 /// How long a daemon asked to stop has to unmount before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(30);
 
+/// How long a child that was killed is waited for. A KILL ends a process at once, except
+/// one in a wait the kernel does not interrupt, an image on a disk that has stalled: that
+/// one ends when its wait does, and the rest of the stop is not kept behind it.
+const KILLED_GRACE: Duration = Duration::from_secs(5);
+
+/// Whether the child ended within `limit`. A child that is not this process's to wait for
+/// counts as ended.
+fn ended_within(child: &mut Child, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) if Instant::now() >= deadline => return false,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
 /// TERM, then KILL only after a daemon has had time to unmount: its last commit
 /// happens on the way out, and there is no periodic commit, so a kill there loses
 /// every write since the commit before it.
@@ -149,7 +167,117 @@ pub fn stop_child(child: &mut Child, name: &str) {
     }
     tell(format_args!("stratum: {name} didn't exit on SIGTERM; SIGKILL"));
     let _ = child.kill();
-    let _ = child.wait();
+    if !ended_within(child, KILLED_GRACE) {
+        tell(format_args!(
+            "stratum: {name} is still there {} s after SIGKILL; it is left to end when it can",
+            KILLED_GRACE.as_secs()
+        ));
+    }
+}
+
+/// Set once a helper was given up, for the screen: it ends then as on the stop that asked.
+static HELPER_GIVEN_UP: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn helper_given_up() -> bool {
+    HELPER_GIVEN_UP.load(Ordering::Relaxed)
+}
+
+/// What `Command::output` gives, of a helper that talks to a daemon, waited for as the
+/// manager's own calls to a daemon are: a tick at a time, with a look between at whether
+/// the wait is to be left. `output` waits in a read no signal ends, so a helper whose
+/// daemon never answers would hold the manager there past a stop asked, its daemons running
+/// and the volume unlocked. From the asking, a helper that has neither said anything nor
+/// ended for `held_after` is killed, its process group with it, and none is started. A
+/// wait counts for what it lasted and for a tick at most.
+fn output_until(
+    cmd: &mut Command,
+    tick: Duration,
+    held_after: Duration,
+    to_be_left: fn() -> bool,
+) -> std::io::Result<std::process::Output> {
+    use std::os::unix::io::AsRawFd as _;
+    let given_up = |what: &str| std::io::Error::new(std::io::ErrorKind::TimedOut, what.to_string());
+    if to_be_left() {
+        return Err(given_up("asked to stop: no helper is started"));
+    }
+    let mut child = cmd.spawn()?;
+    let mut said: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    let mut open = [
+        child.stdout.as_ref().map(|p| p.as_raw_fd()),
+        child.stderr.as_ref().map(|p| p.as_raw_fd()),
+    ];
+    for fd in open.iter().flatten() {
+        unsafe {
+            let fl = libc::fcntl(*fd, libc::F_GETFL);
+            libc::fcntl(*fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+    }
+    let mut waited = Duration::ZERO;
+    let status = loop {
+        let began = Instant::now();
+        let mut took = false;
+        if open.iter().all(Option::is_none) {
+            // Its pipes have closed: it has ended, or is about to.
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            std::thread::sleep(tick.min(Duration::from_millis(5)));
+        } else {
+            let mut fds: Vec<libc::pollfd> = open
+                .iter()
+                .flatten()
+                .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+                .collect();
+            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, crate::tui::poll_ms(tick)) };
+            for (slot, into) in open.iter_mut().zip(said.iter_mut()) {
+                let Some(fd) = *slot else { continue };
+                let mut buf = [0u8; 16384];
+                loop {
+                    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    if n > 0 {
+                        into.extend_from_slice(&buf[..n as usize]);
+                        took = true;
+                        continue;
+                    }
+                    let again = n < 0
+                        && matches!(
+                            std::io::Error::last_os_error().raw_os_error(),
+                            Some(libc::EAGAIN) | Some(libc::EINTR)
+                        );
+                    if !again {
+                        // Its end, or an error that reads as one.
+                        *slot = None;
+                        took = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if took || !to_be_left() {
+            waited = Duration::ZERO;
+            continue;
+        }
+        waited += began.elapsed().min(tick);
+        if waited >= held_after {
+            // Its group: the helper is its leader, and has not been waited for, so the
+            // number is still its own.
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = child.kill();
+            ended_within(&mut child, KILLED_GRACE);
+            return Err(given_up("asked to stop: a helper that said nothing and did not end was given up"));
+        }
+    };
+    let [stdout, stderr] = said;
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
+/// A helper of the manager's run to its end, or given up where the screen is to be left.
+fn helper_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    let out = output_until(cmd, crate::tui::TAKE_TICK, crate::tui::HELD_AFTER, crate::tui::waits_to_be_left);
+    if matches!(&out, Err(e) if e.kind() == std::io::ErrorKind::TimedOut) {
+        HELPER_GIVEN_UP.store(true, Ordering::Relaxed);
+    }
+    out
 }
 
 /// A path handed to a child as an operand. One that begins with '-' would be read as an
@@ -166,12 +294,9 @@ pub(crate) fn operand(path: &Path) -> PathBuf {
 /// A line on stderr that cannot panic, as eprintln! does once the terminal or the
 /// pipe it wrote to has gone: the panic would skip the rest of the stop.
 pub(crate) fn tell(line: std::fmt::Arguments) {
-    use std::io::Write as _;
-    // A terminal that takes nothing would hold this write, and the rest of the stop with it.
-    if crate::tui::terminal_held() {
-        return;
-    }
-    let _ = writeln!(std::io::stderr(), "{}", told(line));
+    let mut said = told(line);
+    said.push('\n');
+    crate::tui::say_on_stderr(&said);
 }
 
 /// What `tell` writes: a path, a child's words or a daemon's log line can be anyone's text,
@@ -507,13 +632,14 @@ impl SpawnCtx {
             .ok_or_else(|| anyhow!("socket path is not utf-8"))?;
         let mut full = vec!["fs", "-s", sock_str];
         full.extend_from_slice(args);
-        let out = crate::passphrase::as_its_own_program(&mut Command::new(&self.me))
-            .args(&full)
-            .stdin(stdin)
-            .stdout(stdout)
-            .stderr(std::process::Stdio::piped())
-            .process_group(0)
-            .output()?;
+        let out = helper_output(
+            crate::passphrase::as_its_own_program(&mut Command::new(&self.me))
+                .args(&full)
+                .stdin(stdin)
+                .stdout(stdout)
+                .stderr(std::process::Stdio::piped())
+                .process_group(0),
+        )?;
         if !out.status.success() {
             // R128 P3-1: prefer stratum-fs's own stderr line as the
             // user-facing message — it already starts with the "stratum-fs:"
@@ -551,13 +677,14 @@ impl SpawnCtx {
             .ok_or_else(|| anyhow!("socket path is not utf-8"))?;
         let mut full = vec!["fs", "-s", sock_str];
         full.extend_from_slice(args);
-        let out = crate::passphrase::as_its_own_program(&mut Command::new(&self.me))
-            .args(&full)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .process_group(0)
-            .output()?;
+        let out = helper_output(
+            crate::passphrase::as_its_own_program(&mut Command::new(&self.me))
+                .args(&full)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .process_group(0),
+        )?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let first = stderr.lines().next().unwrap_or("").trim();
@@ -754,5 +881,131 @@ mod tests {
     fn a_log_with_nothing_to_say_says_nothing() {
         assert_eq!(start_failure(""), None);
         assert_eq!(start_failure("stratumd: serving /v on /s\n"), None);
+    }
+
+    use super::{ended_within, output_until};
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    const TICK: Duration = Duration::from_millis(20);
+    const LIMIT: Duration = Duration::from_millis(300);
+
+    fn helper(script: &str) -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        cmd
+    }
+
+    fn there(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn a_place() -> std::path::PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!("stratum-helper-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    /// With nothing asked a helper is waited for as long as it takes: three limits here,
+    /// saying nothing, and what it then says is all there.
+    #[test]
+    fn a_helper_is_waited_for_while_nothing_is_asked() {
+        let began = Instant::now();
+        let out = output_until(&mut helper("sleep 1; echo done; echo also >&2; exit 3"), TICK, LIMIT, || false).unwrap();
+        assert!(began.elapsed() >= 3 * LIMIT, "ended after {:?}", began.elapsed());
+        assert_eq!(out.stdout, b"done\n");
+        assert_eq!(out.stderr, b"also\n");
+        assert_eq!(out.status.code(), Some(3));
+    }
+
+    static ASKED_FROM: OnceLock<Instant> = OnceLock::new();
+    static ASKED_SAID: AtomicU32 = AtomicU32::new(0);
+
+    /// From the asking, a helper that says nothing and does not end is given up one limit
+    /// on: not before, and after no more waits than the limit holds ticks, which a machine
+    /// that is busy cannot change. It is killed, and what it started with it.
+    #[test]
+    fn a_helper_that_says_nothing_is_given_up_a_limit_after_the_asking() {
+        fn asked() -> bool {
+            let yes = Instant::now() >= *ASKED_FROM.get().unwrap();
+            if yes {
+                ASKED_SAID.fetch_add(1, Ordering::Relaxed);
+            }
+            yes
+        }
+        let place = a_place();
+        let script = format!("echo $$ > {0}; sleep 30 & echo $! >> {0}; wait", place.display());
+        let lead = Duration::from_millis(400);
+        let began = Instant::now();
+        ASKED_FROM.set(began + lead).unwrap();
+        let end = output_until(&mut helper(&script), TICK, LIMIT, asked);
+        let took = began.elapsed();
+        let pids: Vec<i32> = std::fs::read_to_string(&place)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().parse().unwrap())
+            .collect();
+        let _ = std::fs::remove_file(&place);
+        assert_eq!(end.as_ref().err().map(|e| e.kind()), Some(std::io::ErrorKind::TimedOut), "ended {end:?}");
+        assert!(took >= lead + LIMIT - TICK, "given up after {took:?}, before a limit from the asking");
+        let waits = ASKED_SAID.load(Ordering::Relaxed);
+        let whole = (LIMIT.as_millis() / TICK.as_millis()) as u32;
+        assert!((whole..=whole + 1).contains(&waits), "{waits} waits were counted to a limit of {whole} ticks");
+        assert_eq!(pids.len(), 2, "the helper and the one it started: {pids:?}");
+        // The helper was waited for; what it started ends on the same KILL, a moment later.
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while pids.iter().any(|&pid| there(pid)) && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!pids.iter().any(|&pid| there(pid)), "left running: {pids:?}");
+    }
+
+    static SPEAKS_FROM: OnceLock<Instant> = OnceLock::new();
+
+    /// A helper that says something within each limit is waited for through three of them:
+    /// what it says starts the count again.
+    #[test]
+    fn a_helper_that_still_speaks_is_waited_for() {
+        fn asked() -> bool {
+            Instant::now() >= *SPEAKS_FROM.get().unwrap()
+        }
+        let began = Instant::now();
+        SPEAKS_FROM.set(began + Duration::from_millis(50)).unwrap();
+        let out = output_until(&mut helper("for i in 1 2 3 4 5 6 7 8 9 10; do echo $i; sleep 0.1; done"), TICK, LIMIT, asked)
+            .unwrap();
+        assert!(began.elapsed() >= 3 * LIMIT, "ended after {:?}", began.elapsed());
+        assert_eq!(out.stdout, b"1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+        assert!(out.status.success());
+    }
+
+    /// Once asked, no helper is started.
+    #[test]
+    fn no_helper_is_started_once_asked() {
+        let place = a_place();
+        let end = output_until(&mut helper(&format!("echo started > {}", place.display())), TICK, LIMIT, || true);
+        assert_eq!(end.as_ref().err().map(|e| e.kind()), Some(std::io::ErrorKind::TimedOut), "ended {end:?}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!place.exists(), "a helper ran all the same");
+    }
+
+    /// A child that has ended is said to have; one that has not is waited for the limit
+    /// and no longer.
+    #[test]
+    fn a_child_is_waited_for_a_limit_and_no_longer() {
+        let mut quick = Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+        assert!(ended_within(&mut quick, Duration::from_secs(5)));
+        let mut slow = Command::new("/bin/sh").args(["-c", "sleep 30"]).spawn().unwrap();
+        let began = Instant::now();
+        assert!(!ended_within(&mut slow, Duration::from_millis(200)));
+        let took = began.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(5), "waited {took:?}");
+        let _ = slow.kill();
+        let _ = slow.wait();
     }
 }

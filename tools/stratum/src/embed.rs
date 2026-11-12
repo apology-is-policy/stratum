@@ -534,6 +534,10 @@ fn attach_panel_with_retry(slate_sock: &Path, attach_path: &str, target_sock: &P
         .context("target socket path is not utf-8")?;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..50 {
+        // A dial given up for a stop asked is not made again, fifty times over.
+        if tui::stop_asked() {
+            return Err(last_err.unwrap_or_else(|| anyhow!("asked to stop")));
+        }
         match crate::slate::SlateClient::dial(slate_sock) {
             Ok(mut c) => {
                 return c

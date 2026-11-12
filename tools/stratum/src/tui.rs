@@ -440,13 +440,14 @@ const WATCH_TICK: Duration = Duration::from_millis(200);
 
 /// How long the screen waits at a time for a terminal that takes no more, before it looks
 /// at whether it is to be left.
-const TAKE_TICK: Duration = Duration::from_millis(100);
+pub(crate) const TAKE_TICK: Duration = Duration::from_millis(100);
 
 /// A terminal that has taken nothing for this long, with the screen to be left, counts as
 /// taking nothing. It is told by what the terminal takes and not by how long a frame is in
 /// going out, so one that is only slow is waited for. A daemon that has neither taken nor
-/// answered anything of a call for this long is given up the same way.
-const HELD_AFTER: Duration = Duration::from_secs(10);
+/// answered anything of a call for this long is given up the same way, and so is a helper
+/// that has neither said anything nor ended.
+pub(crate) const HELD_AFTER: Duration = Duration::from_secs(10);
 
 /// The screen is being left for good: by a key, an error or a stop asked.
 static LEAVING: AtomicBool = AtomicBool::new(false);
@@ -459,8 +460,15 @@ fn screen_to_be_left() -> bool {
     ASKED_TO_STOP.load(Ordering::Relaxed) || LEAVING.load(Ordering::Relaxed)
 }
 
+/// Whether what waits on a daemon, on a helper, or on the terminal for the manager's own
+/// words is to stop waiting: the screen to be left, or a stop that waits while blocked, as
+/// TERM and INT wait from the start until the screen.
+pub(crate) fn waits_to_be_left() -> bool {
+    screen_to_be_left() || stop_asked()
+}
+
 unsafe extern "C" fn daemon_call_to_be_left(_arg: *mut libc::c_void) -> bool {
-    screen_to_be_left()
+    waits_to_be_left()
 }
 
 /// Dials a daemon as every client of the manager's does: its calls wait a tick at a time
@@ -552,6 +560,42 @@ impl OwnOutput {
             paused: 0,
         }
     }
+}
+
+/// Writes one of the manager's own lines to standard error. Where that is the terminal the
+/// screen has its own open of, the line goes through that open, as the screen's writes do:
+/// a plain write to a terminal that takes nothing waits in the kernel, and the manager
+/// speaks in the middle of its stop (a daemon that did not stop in time is named before it
+/// is killed), so the write would hold the rest of the stop, the daemons not yet stopped
+/// still serving. Given up as the screen is, it says nothing from then on. Elsewhere, a
+/// file or a pipe or another terminal, it is written plainly.
+pub(crate) fn say_on_stderr(line: &str) {
+    use std::io::Write as _;
+    static SAME: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
+    let own = *SAME.get_or_init(|| {
+        let fd = own_output()?;
+        let mut err: libc::stat = unsafe { std::mem::zeroed() };
+        let mut ours: libc::stat = unsafe { std::mem::zeroed() };
+        let same = unsafe {
+            libc::isatty(2) == 1 && libc::fstat(2, &mut err) == 0 && libc::fstat(fd, &mut ours) == 0
+        } && err.st_rdev == ours.st_rdev;
+        same.then_some(fd)
+    });
+    match own {
+        Some(fd) => {
+            let mut out = OwnOutput { to_be_left: waits_to_be_left, ..OwnOutput::of_the_screen(fd) };
+            let _ = out.write_all(line.as_bytes());
+        }
+        None => {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+    }
+}
+
+/// The screen's own open of its terminal, made once; None where there is none to make.
+fn own_output() -> Option<RawFd> {
+    static OWN: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
+    *OWN.get_or_init(open_own_output)
 }
 
 impl io::Write for OwnOutput {
@@ -653,8 +697,7 @@ enum ScreenOut {
 
 impl ScreenOut {
     fn new() -> ScreenOut {
-        static OWN: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
-        match *OWN.get_or_init(open_own_output) {
+        match own_output() {
             // A frame is some thirteen kilobytes: it goes out in one write where it fits.
             Some(fd) => ScreenOut::Own(io::BufWriter::with_capacity(1 << 15, OwnOutput::of_the_screen(fd))),
             None => ScreenOut::Std(io::stdout()),
@@ -706,8 +749,9 @@ pub fn run(opts: Opts) -> Result<()> {
 
     stop_flag.store(true, Ordering::SeqCst);
 
-    // A call given up for a stop asked is that stop, and no failure of the screen's.
-    if result.is_err() && main_client.gave_up() && stop_requested() {
+    // A call or a helper given up for a stop asked is that stop, and no failure of the
+    // screen's.
+    if result.is_err() && stop_requested() && (main_client.gave_up() || crate::spawn::helper_given_up()) {
         return Ok(());
     }
     result
@@ -838,7 +882,7 @@ fn input_waiting(input: Option<RawFd>, tty: Option<i32>, timeout: Duration) -> i
     Ok(false)
 }
 
-fn poll_ms(wait: Duration) -> libc::c_int {
+pub(crate) fn poll_ms(wait: Duration) -> libc::c_int {
     libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX)
 }
 
@@ -1134,6 +1178,12 @@ fn run_ui(
     let mut snapgraph_marks: Vec<u64> = Vec::with_capacity(2);
     let result = (|| -> Result<()> {
         loop {
+            // A stop asked is seen before anything more is asked of a daemon: what the last
+            // pass waited on may just have been given up for it, and the next read of the
+            // panels would wait on the same daemon as long again.
+            if ASKED_TO_STOP.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             // SWISS-8g: tick the in-progress /ctl/ admin job (if any)
             // FIRST so completion swaps in a success/error dialog
             // BEFORE the rest of the loop runs.
