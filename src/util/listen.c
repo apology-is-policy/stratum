@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 void (*stm_unix_listen_test_before_removal)(void) = NULL;
 void (*stm_unix_listen_test_turn_asked)(void) = NULL;
+void (*stm_unix_accept_test_before_wait)(void) = NULL;
 #endif
 
 enum { TURN_NOT_ASKED = -2, TURN_NONE = -1 };
@@ -260,6 +262,37 @@ void stm_unix_listen_closed(const char *path)
 #else
     (void)path;
 #endif
+}
+
+int stm_unix_accept_or_stop(int fd, atomic_bool *stop)
+{
+    for (;;) {
+        if (stop && atomic_load_explicit(stop, memory_order_acquire)) return -ECANCELED;
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (stm_unix_accept_test_before_wait) stm_unix_accept_test_before_wait();
+#endif
+        struct pollfd pfd = { fd, POLLIN, 0 };
+        int ready = poll(&pfd, 1, STM_UNIX_ACCEPT_TICK_MS);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        if (ready == 0) continue;
+        /* Whatever poll saw there, accept() says: a socket that takes no more
+         * answers with the reason. */
+        int client = accept(fd, NULL, NULL);
+        if (client >= 0) return client;
+        int e = errno;
+        if (e == EINTR || e == ECONNABORTED || e == EAGAIN || e == EWOULDBLOCK) continue;
+        if (e == EMFILE || e == ENFILE || e == ENOBUFS || e == ENOMEM) {
+            /* The socket stays readable meanwhile, so wait rather than spin. */
+            struct timespec ts = { 0, 100L * 1000000L };
+            (void)nanosleep(&ts, NULL);
+            continue;
+        }
+        if (stop && atomic_load_explicit(stop, memory_order_acquire)) return -ECANCELED;
+        return -e;
+    }
 }
 
 const char *stm_unix_listen_hint(int err)

@@ -206,6 +206,14 @@ class Term:
                 self.raw += data
                 self.screen.feed(data)
 
+    def read_for(self, seconds):
+        """A wait as an emulator's: it reads. A terminal nobody reads takes a kilobyte or
+        so, and then holds the manager in its draw, where it cannot see to anything else."""
+        end = time.monotonic() + seconds
+        self.pump(seconds)
+        # A terminal that has gone is read at once.
+        time.sleep(max(0.0, end - time.monotonic()))
+
     def cut_output(self):
         """From here on, each write to the manager's stdout or stderr fails with EPIPE."""
         if self.out is not None:
@@ -263,8 +271,7 @@ class Term:
         # leg, which needs the volume these still hold.
         # mkdtemp's six characters follow the pid.
         session = f'stratum-{self.pid}-[^/]*/'
-        for pid in session_daemons(session):
-            os.kill(int(pid), signal.SIGTERM)
+        signal_each(session_daemons(session))
         end = time.monotonic() + 30
         while session_daemons(session) and time.monotonic() < end:
             time.sleep(0.2)
@@ -422,6 +429,16 @@ def admin_legs(term, vol, sock):
     term.pump(0.5)
 
 
+def signal_each(pids, sig=signal.SIGTERM):
+    """To the strays a leg found. One that went meanwhile is no failure, and must not end
+    the leg with its later ends unrun."""
+    for pid in pids:
+        try:
+            os.kill(int(pid), sig)
+        except ProcessLookupError:
+            pass
+
+
 def daemons_of(pattern):
     return subprocess.run(['pgrep', '-f', pattern], capture_output=True, text=True).stdout.split()
 
@@ -530,7 +547,12 @@ def death_legs(stratum, vol, host, root):
             limit = time.monotonic() + 30
             left = before
             while left and time.monotonic() < limit:
-                time.sleep(0.2)
+                # Read meanwhile, where there is a terminal: one that takes nothing is
+                # held_terminal_legs' matter, and would hold a manager still drawing here.
+                if closed:
+                    time.sleep(0.2)
+                else:
+                    term.read_for(0.2)
                 left = session_daemons(session)
             record(not left, f'{how}: the daemons stopped and the volume locked',
                    f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
@@ -554,8 +576,7 @@ def death_legs(stratum, vol, host, root):
             else:
                 # Nothing runs on a KILL to remove it, and it lies outside the run's root.
                 shutil.rmtree(session, ignore_errors=True)
-            for pid in left:
-                os.kill(int(pid), signal.SIGTERM)
+            signal_each(left)
             limit = time.monotonic() + 30
             while session_daemons(session) and time.monotonic() < limit:
                 time.sleep(0.2)
@@ -565,6 +586,105 @@ def death_legs(stratum, vol, host, root):
         finally:
             if not closed:
                 term.kill()
+
+
+def held_terminal_legs(stratum, vol, host, root):
+    """A terminal that takes nothing holds the manager in its draw, and no signal ends a
+    write. A stop asked must not wait there, the volume unlocked behind it, for as long as
+    nothing reads; and a terminal that is only slow must not be taken for one."""
+    stall = 10  # tui.rs HELD_AFTER, in seconds
+    for how, slow in (('a terminal that takes nothing', False), ('a slow terminal', True)):
+        env_file = f'{root}/env-held{int(slow)}'
+        term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file])
+        try:
+            term.expect(r'Passphrase for')
+            term.send(PASS.encode() + ENTER)
+            term.expect(r'from_vol\.txt', timeout=60)
+            quiet_by = time.monotonic() + 15
+            shown = term.screen.text()
+            while time.monotonic() < quiet_by:
+                term.pump(1.5)
+                if term.screen.text() == shown:
+                    break
+                shown = term.screen.text()
+            else:
+                raise Failure(f'{how}: the screen never went quiet: it proves nothing')
+            session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
+            before = session_daemons(session)
+            if len(before) < 3:
+                raise Failure(f'the search finds {before} before {how}: it proves nothing')
+            # From here nothing reads. Each resize asks for a whole frame, and twenty of
+            # them for more than any pty holds: the draw's write waits.
+            seen = len(term.raw)
+            for i in range(20):
+                fcntl.ioctl(term.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS - 20 * (i % 2), 0, 0))
+                time.sleep(0.15)
+            os.kill(term.pid, signal.SIGTERM)
+            asked = time.monotonic()
+            if not slow:
+                time.sleep(3)
+                if os.waitpid(term.pid, os.WNOHANG)[0] != 0 or len(session_daemons(session)) < 3:
+                    raise Failure(f'{how}: the stop was seen to within 3 s, so no write was held: it proves nothing')
+                limit = asked + stall + 15
+                left, ended = before, False
+                while (left or not ended) and time.monotonic() < limit:
+                    time.sleep(0.2)
+                    left = session_daemons(session)
+                    if not ended:
+                        pid, status = os.waitpid(term.pid, os.WNOHANG)
+                        if pid:
+                            term.rc = os.waitstatus_to_exitcode(status)
+                            ended = True
+                took = time.monotonic() - asked
+                record(not left, f'{how}: the daemons stopped and the volume locked, with nothing read',
+                       f'{how}: daemons {left} still serve the volume {took:.0f} s after the stop was asked')
+                # Not 0: the daemons were not waited for, and the screen was not put back.
+                record(ended and term.rc == 128 + signal.SIGTERM,
+                       f'{how}: the manager ended as the signal alone would have ended it, with nothing read',
+                       f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s')
+                if not ended:
+                    # Read, it ends; and the rest of the leg is about a manager that has.
+                    term.exited(30)
+                cooked = termios.tcgetattr(term.fd)[3] & termios.ICANON
+                record(cooked, f'{how}: the terminal is out of raw mode', f'{how}: the terminal was left raw')
+            else:
+                # Read, a little at a time: each write of the manager's is taken within a
+                # few seconds, though the frame takes longer than the stall to go out.
+                limit = asked + 120
+                ended = False
+                while not ended and time.monotonic() < limit:
+                    if select.select([term.fd], [], [], 0.4)[0]:
+                        try:
+                            data = os.read(term.fd, 256)
+                        except OSError:
+                            data = b''
+                        term.raw += data
+                        term.screen.feed(data)
+                        time.sleep(0.4)
+                    pid, status = os.waitpid(term.pid, os.WNOHANG)
+                    if pid:
+                        term.rc = os.waitstatus_to_exitcode(status)
+                        ended = True
+                took = time.monotonic() - asked
+                record(ended and term.rc == 0, f'{how}: the manager ended cleanly, its screen taken at the terminal\'s pace ({took:.0f} s)',
+                       f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s')
+                if ended and term.rc == 0 and took < stall + 1:
+                    raise Failure(f'{how}: its screen went out in {took:.1f} s, short of the stall: it proves nothing')
+                record(b'\x1b[?1049l' in bytes(term.raw[seen:]), f'{how}: the screen was put back',
+                       f'{how}: the alternate screen was never left')
+                left = session_daemons(session)
+                record(not left, f'{how}: the daemons stopped and the volume locked',
+                       f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
+            record(not os.path.exists(session), f'{how}: the session directory is gone', f'{how}: the session directory stayed')
+            signal_each(left)
+            limit = time.monotonic() + 30
+            while session_daemons(session) and time.monotonic() < limit:
+                time.sleep(0.2)
+            vol.serve()
+            vol.stop()
+            print(f'ok: after {how} the volume mounts and unmounts cleanly', flush=True)
+        finally:
+            term.kill()
 
 
 def output_gone_leg(stratum, vol, host, root):
@@ -600,8 +720,7 @@ def output_gone_leg(stratum, vol, host, root):
                f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
         record(not os.path.exists(session), f'{how}: the session directory is gone',
                f'{how}: the session directory stayed')
-        for pid in left:
-            os.kill(int(pid), signal.SIGTERM)
+        signal_each(left)
         limit = time.monotonic() + 30
         while session_daemons(session) and time.monotonic() < limit:
             time.sleep(0.2)
@@ -648,8 +767,7 @@ def stuck_daemon_leg(stratum, vol, host, root):
         record(not left, f'{how}: no daemon is left', f'{how}: daemons {left} still run, with no manager')
         record(not os.path.exists(session), f'{how}: the session directory is gone',
                f'{how}: the session directory stayed')
-        for pid in left:
-            os.kill(int(pid), signal.SIGKILL)
+        signal_each(left, signal.SIGKILL)
         limit = time.monotonic() + 30
         while session_daemons(session) and time.monotonic() < limit:
             time.sleep(0.2)
@@ -698,8 +816,7 @@ def headless_output_gone_leg(stratum, vol, host, root):
                f'{how}: daemons {left} still serve the volume, unlocked, with no manager')
         record(not os.path.exists(session), f'{how}: the session directory is gone',
                f'{how}: the session directory stayed')
-        for pid in left:
-            os.kill(int(pid), signal.SIGTERM)
+        signal_each(left)
         limit = time.monotonic() + 30
         while session_daemons(session) and time.monotonic() < limit:
             time.sleep(0.2)
@@ -829,8 +946,7 @@ def prompt_end_legs(stratum, vol, host, root):
             # ended at the prompt, before stratumd, is the rc and the message's to say.
             record(not os.path.exists(env_file), f'{how}: the session ended before slate',
                    f'{how}: the session reached slate, so the volume was unlocked')
-            for pid in left:
-                os.kill(int(pid), signal.SIGTERM)
+            signal_each(left)
         finally:
             if closed and term.rc is None:
                 try:
@@ -872,8 +988,7 @@ def missing_binary_leg(stratum, vol, host, root):
         record(not left, f'{how}: host-fs stopped', f'{how}: daemons {left} still run, with no manager')
         record(not os.path.exists(session), f'{how}: the session directory is gone',
                f'{how}: the session directory stayed')
-        for pid in left:
-            os.kill(int(pid), signal.SIGTERM)
+        signal_each(left)
     finally:
         term.kill()
         if os.path.exists(copy):
@@ -943,8 +1058,7 @@ def start_wait_stop_leg(stratum, vol, host, root):
         record(not left, f'{how}: the daemons stopped', f'{how}: daemons {left} still run, with no manager')
         record(not os.path.exists(session), f'{how}: the session directory is gone',
                f'{how}: the session directory stayed')
-        for pid in left:
-            os.kill(int(pid), signal.SIGTERM)
+        signal_each(left)
     finally:
         term.kill()
 
@@ -1317,8 +1431,7 @@ def job_cleanup(term, held, session):
         term.pump(1)
     term.kill()
     if session:
-        for pid in session_daemons(session):
-            os.kill(int(pid), signal.SIGTERM)
+        signal_each(session_daemons(session))
 
 
 def screen_behind_leg(stratum, vol, host, root):
@@ -4074,6 +4187,7 @@ def run(stratum, root):
                       (unreadable_name_legs, (stratum, root)),
                       (delete_batch_legs, (stratum, root)),
                       (death_legs, (stratum, vol, host, root)),
+                      (held_terminal_legs, (stratum, vol, host, root)),
                       (output_gone_leg, (stratum, vol, host, root)),
                       (stuck_daemon_leg, (stratum, vol, host, root)),
                       (headless_output_gone_leg, (stratum, vol, host, root)),

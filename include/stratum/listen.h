@@ -2,6 +2,7 @@
 #ifndef STRATUM_LISTEN_H
 #define STRATUM_LISTEN_H
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -68,7 +69,22 @@ int stm_unix_listen_at(int fd, const char *path, mode_t mode, int backlog);
 void stm_unix_listen_retire(int fd, const char *path);
 void stm_unix_listen_closed(const char *path);
 
+/*
+ * Waits on the listening socket `fd` for a connection, or for `*stop`, which a
+ * signal handler sets. Returns the connection, -ECANCELED once `*stop` is set,
+ * or -errno for a socket that takes no more. Between looks at `*stop` the wait
+ * is a poll of STM_UNIX_ACCEPT_TICK_MS, never an accept() left to wait: a
+ * signal that comes between a look and the wait interrupts nothing, nor does
+ * one that another thread takes, and that accept() would wait for the next
+ * client with the stop lost. A client that gave up is waited through, and so
+ * is a moment with no descriptors or memory left.
+ */
+enum { STM_UNIX_ACCEPT_TICK_MS = 200 };
+int stm_unix_accept_or_stop(int fd, atomic_bool *stop);
+
 #ifdef STRATUM_BUILD_TESTING_HOOKS
+/* Test only: called between a look at the stop flag and the wait that follows. */
+extern void (*stm_unix_accept_test_before_wait)(void);
 /* Test only: called on a host between the look that finds a dead daemon's socket
  * and its removal. */
 extern void (*stm_unix_listen_test_before_removal)(void);

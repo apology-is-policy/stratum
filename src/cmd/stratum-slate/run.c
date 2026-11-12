@@ -65,8 +65,8 @@
 static atomic_bool g_stop_flag = false;
 
 /* R126 P3-1: g_slate_ptr removed — was written but never read.
- * stop is signalled via g_stop_flag which the accept loop polls on
- * EINTR. Wake-blocked-readers happens in the post-accept-loop
+ * stop is signalled via g_stop_flag, which the accept loop looks at
+ * between waits. Wake-blocked-readers happens in the post-accept-loop
  * teardown via stm_slate_stop, NOT from the signal handler. */
 
 _Static_assert(ATOMIC_BOOL_LOCK_FREE == 2,
@@ -331,16 +331,9 @@ static stm_status accept_loop(int listen_fd, stm_slate *slate,
     sigaddset(&worker_block, SIGQUIT);
 
     while (1) {
-        if (atomic_load_explicit(&g_stop_flag, memory_order_acquire))
-            break;
-
-        int client_fd = accept(listen_fd, NULL, NULL);
-        if (client_fd < 0) {
-            if (errno == EINTR || errno == ECONNABORTED) continue;
-            if (atomic_load_explicit(&g_stop_flag, memory_order_acquire))
-                break;
-            return STM_EBACKEND;
-        }
+        int client_fd = stm_unix_accept_or_stop(listen_fd, &g_stop_flag);
+        if (client_fd == -ECANCELED) break;
+        if (client_fd < 0) return STM_EBACKEND;
 
         /* Peer-cred check: fail-closed unless --allow-unauth. */
         uid_t peer_uid = (uid_t)-1;

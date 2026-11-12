@@ -326,13 +326,12 @@ int stm_cmd_host_fs_main(int argc, char **argv)
     sigaddset(&worker_block, SIGHUP);
     sigaddset(&worker_block, SIGQUIT);
 
-    while (!atomic_load_explicit(&g_stop_flag, memory_order_acquire)) {
-        int client_fd = accept(listen_fd, NULL, NULL);
+    for (;;) {
+        int client_fd = stm_unix_accept_or_stop(listen_fd, &g_stop_flag);
+        if (client_fd == -ECANCELED) break;
         if (client_fd < 0) {
-            if (errno == EINTR || errno == ECONNABORTED) continue;
-            if (atomic_load_explicit(&g_stop_flag, memory_order_acquire)) break;
             fprintf(stderr,
-                "stratum-host-fs: accept failed: %s\n", strerror(errno));
+                "stratum-host-fs: accept failed: %s\n", strerror(-client_fd));
             break;
         }
 

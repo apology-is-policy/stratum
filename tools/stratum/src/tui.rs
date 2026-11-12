@@ -26,7 +26,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc};
+use std::sync::{atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering}, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -330,8 +330,11 @@ pub struct Opts {
 }
 
 static ASKED_TO_STOP: AtomicBool = AtomicBool::new(false);
+/// The signal that asked first, for an end that has to read as that signal's own.
+static ASKED_BY: AtomicI32 = AtomicI32::new(0);
 
-extern "C" fn ask_to_stop(_: libc::c_int) {
+extern "C" fn ask_to_stop(sig: libc::c_int) {
+    let _ = ASKED_BY.compare_exchange(0, sig, Ordering::Relaxed, Ordering::Relaxed);
     ASKED_TO_STOP.store(true, Ordering::Relaxed);
 }
 
@@ -392,27 +395,158 @@ pub fn stop_on_signals() {
 /// or anything else. Ending the process is the way out, and the daemons follow it
 /// on their lifeline. Linux fails tcgetattr on a terminal that has gone; macOS still
 /// answers it, and fails an empty write instead. Neither sends anything to a live one.
+///
+/// A terminal that is there and takes nothing holds the screen's write, and the UI thread
+/// with it: the handlers restart the call, so no signal ends it, and a stop asked would
+/// wait for as long as nothing reads, the volume unlocked behind it. The way out is the
+/// same, once the screen is to be left (`Held`).
 fn exit_when_terminal_goes(ttys: Vec<i32>, session_dir: Option<PathBuf>) {
-    let watch = crate::passphrase::spawn_helper("stratum-watch", move || loop {
-        thread::sleep(Duration::from_millis(200));
-        // Every one of them: a read-only descriptor answers the write with EBADF, which
-        // says nothing, so on macOS it could not see the terminal go.
-        let gone = ttys.iter().any(|&tty| {
-            let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
-            let no_attrs = unsafe { libc::tcgetattr(tty, &mut attrs) } != 0;
-            let nothing = 0u8;
-            let no_write = unsafe { libc::write(tty, (&nothing as *const u8).cast(), 0) } < 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO);
-            no_attrs || no_write
-        });
-        if gone {
-            if let Some(dir) = &session_dir {
-                let _ = std::fs::remove_dir_all(dir);
+    let watch = crate::passphrase::spawn_helper("stratum-watch", move || {
+        let mut held = Held::default();
+        loop {
+            thread::sleep(WATCH_TICK);
+            // Every one of them: a read-only descriptor answers the write with EBADF, which
+            // says nothing, so on macOS it could not see the terminal go.
+            let gone = ttys.iter().any(|&tty| {
+                let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
+                let no_attrs = unsafe { libc::tcgetattr(tty, &mut attrs) } != 0;
+                let nothing = 0u8;
+                let no_write = unsafe { libc::write(tty, (&nothing as *const u8).cast(), 0) } < 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO);
+                no_attrs || no_write
+            });
+            if gone {
+                if let Some(dir) = &session_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                std::process::exit(129);
             }
-            std::process::exit(129);
+            let leaving = ASKED_TO_STOP.load(Ordering::Relaxed) || LEAVING.load(Ordering::Relaxed);
+            held = held.after(leaving, WRITE_IN_HAND.load(Ordering::Relaxed));
+            if held.by_terminal() {
+                end_held_by_terminal(&ttys, session_dir.as_deref());
+            }
         }
     });
     watch.expect("spawn the terminal watcher");
+}
+
+/// The end of a manager its terminal holds, from the watcher's thread. The mode needs no
+/// output to go back; the alternate screen does, and stays. What the terminal has not
+/// taken is dropped: where this is the terminal's last open, macOS keeps a process that
+/// has ended until its terminal has drained. Dropping it wakes the screen's write, which
+/// would queue more, so the screen stands still first, for a second at most.
+fn end_held_by_terminal(ttys: &[i32], session_dir: Option<&Path>) -> ! {
+    if job_in_front(ttys.first().copied()) {
+        while disable_raw_mode().is_err_and(|e| e.kind() == io::ErrorKind::Interrupted) {}
+    }
+    let drop_untaken = || {
+        for &tty in ttys {
+            unsafe { libc::tcflush(tty, libc::TCOFLUSH) };
+        }
+    };
+    GIVEN_UP.store(true, Ordering::Relaxed);
+    for _ in 0..100 {
+        drop_untaken();
+        if STOOD_STILL.load(Ordering::Relaxed) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if let Some(dir) = session_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    drop_untaken();
+    // Not exit(), which flushes standard output: to that terminal.
+    unsafe { libc::_exit(held_end_code(ASKED_BY.load(Ordering::Relaxed))) }
+}
+
+/// The watcher has given the terminal up: the screen writes no more.
+static GIVEN_UP: AtomicBool = AtomicBool::new(false);
+/// The UI thread has seen that, and stands still.
+static STOOD_STILL: AtomicBool = AtomicBool::new(false);
+
+/// The process ends under this thread, which must add nothing to what the watcher drops.
+fn stand_still_if_given_up() {
+    if GIVEN_UP.load(Ordering::Relaxed) {
+        STOOD_STILL.store(true, Ordering::Relaxed);
+        loop {
+            thread::park();
+        }
+    }
+}
+
+/// How often the terminal's watcher looks.
+const WATCH_TICK: Duration = Duration::from_millis(200);
+
+/// How long a write of the screen's may stay in hand, once the screen is to be left, before
+/// its terminal counts as taking nothing. std hands a terminal a kilobyte at a time, so one
+/// that is only slow, down to a hundred bytes a second, is waited for.
+const HELD_AFTER: Duration = Duration::from_secs(10);
+
+/// The screen is being left for good: by a key, an error or a stop asked.
+static LEAVING: AtomicBool = AtomicBool::new(false);
+
+/// The screen's write in hand, each one given the next number; 0 with none in hand.
+static WRITE_IN_HAND: AtomicU64 = AtomicU64::new(0);
+static SCREEN_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// How many of the watcher's looks in a row have found one write of the screen's still in
+/// hand with the screen to be left. Looks are counted, not the clock read: while the
+/// manager is stopped, or the machine asleep, the terminal is given no time to take
+/// anything, and a write in hand across that was not held by it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Held {
+    write: u64,
+    looks: u32,
+}
+
+impl Held {
+    /// After one more look, which found the screen `leaving` or not, and `in_hand` as
+    /// WRITE_IN_HAND had it.
+    fn after(self, leaving: bool, in_hand: u64) -> Held {
+        if leaving && in_hand != 0 && in_hand == self.write {
+            Held { write: in_hand, looks: self.looks.saturating_add(1) }
+        } else {
+            // Not leaving, no write is remembered: the count starts at the asking.
+            Held { write: if leaving { in_hand } else { 0 }, looks: 0 }
+        }
+    }
+
+    fn by_terminal(self) -> bool {
+        u128::from(self.looks) * WATCH_TICK.as_millis() >= HELD_AFTER.as_millis()
+    }
+}
+
+/// The exit code of a manager its terminal held: what the signal that asked would have
+/// left, or a plain failure where it was a key or an error. Never 0: the daemons are not
+/// waited for, and the screen is not put back.
+fn held_end_code(asked_by: libc::c_int) -> libc::c_int {
+    if asked_by > 0 { 128 + asked_by } else { 1 }
+}
+
+/// The screen's output, each write of it timed for `exit_when_terminal_goes`.
+struct ScreenOut<W: io::Write>(W);
+
+impl<W: io::Write> ScreenOut<W> {
+    fn in_hand<T>(&mut self, write: impl FnOnce(&mut W) -> T) -> T {
+        stand_still_if_given_up();
+        WRITE_IN_HAND.store(SCREEN_WRITES.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        let done = write(&mut self.0);
+        WRITE_IN_HAND.store(0, Ordering::Relaxed);
+        stand_still_if_given_up();
+        done
+    }
+}
+
+impl<W: io::Write> io::Write for ScreenOut<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.in_hand(|out| out.write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.in_hand(|out| out.flush())
+    }
 }
 
 pub fn run(opts: Opts) -> Result<()> {
@@ -447,11 +581,13 @@ pub fn run(opts: Opts) -> Result<()> {
 }
 
 fn put_terminal_back() {
+    // For good, on an error or a panic: a terminal that takes nothing must not hold this either.
+    LEAVING.store(true, Ordering::Relaxed);
     let tty = [0, 1, 2].into_iter().find(|&fd| unsafe { libc::isatty(fd) } == 1);
     if job_in_front(tty) {
-        leave_screen(&mut io::stdout());
+        leave_screen(&mut ScreenOut(io::stdout()));
     } else {
-        leave_screen_behind(&mut io::stdout());
+        leave_screen_behind(&mut ScreenOut(io::stdout()));
     }
 }
 
@@ -780,7 +916,7 @@ fn run_ui(
             return Err(anyhow::Error::new(e).context("enable raw mode"));
         }
     }
-    let mut stdout = io::stdout();
+    let mut stdout = ScreenOut(io::stdout());
     if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
         put_terminal_back();
         put_back(job_control_caught);
@@ -1179,6 +1315,8 @@ fn run_ui(
         }
     })();
 
+    // From here a terminal that takes nothing holds a key's quit as it would a stop asked.
+    LEAVING.store(true, Ordering::Relaxed);
     // The mode put back only in front: behind, the shell has the terminal, and a set from
     // there would stop until `fg`. A stop that comes meanwhile lands once the handlers have gone.
     let mut jobs: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -5383,6 +5521,94 @@ fn read_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_terminal_holds_the_screen_only_once_it_is_to_be_left() {
+        let needed = u32::try_from(HELD_AFTER.as_millis() / WATCH_TICK.as_millis()).unwrap();
+        // One write in hand, look after look, with the screen to be left: the first look
+        // only remembers it.
+        let mut held = Held::default();
+        for _ in 0..=needed {
+            assert!(!held.by_terminal(), "held after {} looks, short of {needed}", held.looks);
+            held = held.after(true, 7);
+        }
+        assert!(held.by_terminal());
+        // That write ended and another began: a slow terminal, not one that takes nothing.
+        assert_eq!(held.after(true, 8), Held { write: 8, looks: 0 });
+        // Nothing asked: a terminal may take nothing for ever, and the count starts at the asking.
+        let mut idle = Held::default();
+        for _ in 0..10 * needed {
+            idle = idle.after(false, 7);
+        }
+        assert!(!idle.by_terminal());
+        assert_eq!(idle.after(true, 7), Held { write: 7, looks: 0 }, "the wait before the asking was counted");
+        // No write in hand: the UI thread is elsewhere.
+        let mut away = Held::default();
+        for _ in 0..10 * needed {
+            away = away.after(true, 0);
+        }
+        assert!(!away.by_terminal());
+    }
+
+    #[test]
+    fn a_held_manager_ends_as_its_signal_would_and_never_with_success() {
+        assert_eq!(held_end_code(libc::SIGTERM), 143);
+        assert_eq!(held_end_code(libc::SIGHUP), 129);
+        assert_eq!(held_end_code(0), 1);
+    }
+
+    #[test]
+    fn the_screens_write_is_in_hand_for_as_long_as_it_lasts() {
+        struct Looks(Vec<u64>);
+        impl io::Write for Looks {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.push(WRITE_IN_HAND.load(Ordering::Relaxed));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.push(WRITE_IN_HAND.load(Ordering::Relaxed));
+                Ok(())
+            }
+        }
+        use io::Write as _;
+        let mut out = ScreenOut(Looks(Vec::new()));
+        out.write_all(b"frame").unwrap();
+        assert_eq!(WRITE_IN_HAND.load(Ordering::Relaxed), 0, "in hand after the write returned");
+        out.flush().unwrap();
+        assert_eq!(WRITE_IN_HAND.load(Ordering::Relaxed), 0, "in hand after the flush returned");
+        let seen = &out.0 .0;
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0] != 0 && seen[1] != 0, "a write was not in hand while it ran: {seen:?}");
+        assert_ne!(seen[0], seen[1], "two writes were given one number, and would be counted as one that waits");
+
+        // Given up, the screen writes nothing more: its thread stands still for the end.
+        // In this one test, since the flags are the process's: no other test writes a screen.
+        static WROTE: AtomicBool = AtomicBool::new(false);
+        struct Tells;
+        impl io::Write for Tells {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                WROTE.store(true, Ordering::Relaxed);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        GIVEN_UP.store(true, Ordering::Relaxed);
+        thread::spawn(|| {
+            let _ = ScreenOut(Tells).write_all(b"more");
+        });
+        let end = Instant::now() + Duration::from_secs(5);
+        while !STOOD_STILL.load(Ordering::Relaxed) && Instant::now() < end {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let stood = STOOD_STILL.load(Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(50));
+        GIVEN_UP.store(false, Ordering::Relaxed);
+        STOOD_STILL.store(false, Ordering::Relaxed);
+        assert!(stood, "the screen's thread went on after the terminal was given up");
+        assert!(!WROTE.load(Ordering::Relaxed), "the screen wrote after the terminal was given up");
+    }
 
     fn blank_snap() -> UiState {
         let panel = || PanelView {
