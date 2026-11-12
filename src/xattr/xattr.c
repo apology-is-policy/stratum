@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Stratum v2 — xattr index implementation
  * (P8-POSIX-6 + 9.6-impl-4c + 9.7-impl-1c-iv).

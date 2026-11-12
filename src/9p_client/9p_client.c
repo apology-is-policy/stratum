@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * libstratum-9p — synchronous 9P2000.L client.
  *

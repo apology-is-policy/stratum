@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stm_ctl synfs — operational synthetic filesystem (ARCH §14.3).
  *

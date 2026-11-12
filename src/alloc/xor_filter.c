@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stm_xor_filter — xor8 construction (Phase 3 chunk 4d).
  *

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stm_take_name: a file is given a name only if the name is free. A daemon's
  * socket takes its path this way, and so does the key mkfs makes.

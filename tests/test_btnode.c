@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Leaf-node encode/decode tests for stm_btnode (Phase 3 chunk 5a).
  *

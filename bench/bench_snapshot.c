@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Snapshot benchmarks. Produces numbers for ROADMAP §9.2:
  *

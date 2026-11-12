@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Stratum v2 — extended attribute (xattr) layer (P8-POSIX-6).
  *

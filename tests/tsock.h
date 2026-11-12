@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * tsock -- accept() for the tests' in-process fake servers, and a path as
  * a socket address.

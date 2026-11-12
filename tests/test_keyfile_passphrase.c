@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Tests for the SWISS-4m passphrase-encrypted keyfile (KFP1) format.
  *

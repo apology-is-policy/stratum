@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * POSIX block backend. Sync ops via pread/pwrite/fsync; async simulated by a
  * thread pool that runs each op synchronously and pushes its result onto a

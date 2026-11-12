@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Stratum v2 — fs-layer tests for the Phase 8 POSIX surface.
  *

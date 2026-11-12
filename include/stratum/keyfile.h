@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Keyfile — MVP wrap-key backend (Phase 4 chunk P4-4a).
  *

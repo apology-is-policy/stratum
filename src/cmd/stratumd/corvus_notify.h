@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stratumd ↔ corvus notify-Spoor consumer (TLY-A4 — Thylacine v1.0
  * integration; STRATUM-API-V1.md §6).

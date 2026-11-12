@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_ctl — exercises the /ctl/ synthetic FS via the generic
  * stm_lp9_server.

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * XChaCha20-Poly1305-SIV — Stratum v2 nonce-misuse-resistant AEAD.
  *

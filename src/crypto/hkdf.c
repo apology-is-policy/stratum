@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * HKDF-SHA256 via libsodium's crypto_kdf_hkdf_sha256_*.
  *

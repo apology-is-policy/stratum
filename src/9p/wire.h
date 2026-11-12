@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Private wire helpers for the filesystem 9P2000.L server. Little-
  * endian packers and bounds-checked unpackers. 9P is little-endian

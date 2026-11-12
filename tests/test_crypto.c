@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * AEAD, HKDF, Argon2, X25519, random — correctness tests.
  *

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Top-level block-device façade. Owns the AUTO-backend decision and routes
  * every public call through the ops vtable.

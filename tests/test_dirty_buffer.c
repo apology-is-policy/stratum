@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_dirty_buffer — unit tests for the dirty buffer module
  * (SWISS-4q-flush). Verifies the C impl matches specs/writeback.tla.

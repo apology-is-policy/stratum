@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Multi-device commit + quorum tests (Phase 5 chunk P5-2).
  *

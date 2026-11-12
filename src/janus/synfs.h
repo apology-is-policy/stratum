@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * synfs — janus's synthetic filesystem, exposed to clients over 9P
  * (ARCH §7.9.1).

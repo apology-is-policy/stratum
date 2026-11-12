@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Scrub tests (Phase 5 chunks P5-5-α + P5-5-β).
  *

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stratumd — Unix-socket transport for the Stratum 9P2000.L server.
  *

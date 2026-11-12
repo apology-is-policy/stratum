@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * PQ-hybrid key wrap: X25519 + ML-KEM-768, HPKE-style (§7.3.4).
  *

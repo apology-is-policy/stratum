@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Private structures shared inside the btree_engine module — see
  * include/stratum/btree_engine.h for the public surface and

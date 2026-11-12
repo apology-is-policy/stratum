@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Stratum v2 — filesystem-side 9P2000.L server (P9-9P-1).
  *

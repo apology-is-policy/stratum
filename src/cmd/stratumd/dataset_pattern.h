@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Dataset pattern matcher (TLY-A2 — Thylacine multi-stratumd-per-pool).
  *

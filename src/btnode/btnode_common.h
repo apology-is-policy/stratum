@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Private header shared between leaf.c and internal.c. Not exposed
  * outside the stm_btnode module — see include/stratum/btnode.h for

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stm_dirty_buffer — per-inode plaintext write buffer (SWISS-4q-flush).
  *

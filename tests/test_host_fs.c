@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * host_fs: a name is served only while it leads to the file it was walked
  * to, and one session may walk any number of files.

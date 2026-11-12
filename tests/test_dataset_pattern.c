@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_dataset_pattern — TLY-A2-impl-1 unit tests for the dataset
  * pattern matcher.

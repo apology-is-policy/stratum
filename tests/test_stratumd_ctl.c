@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_stratumd_ctl — integration tests for stratumd's /ctl/ second
  * listener (P9-CTL-2c).

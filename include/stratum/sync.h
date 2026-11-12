@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Commit protocol — single-device (sync.tla) + multi-device quorum
  * (quorum.tla).

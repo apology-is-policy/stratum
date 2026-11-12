@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Tests for the inode allocator + value store (P8-POSIX-1 +
  * P8-POSIX-1b + 9.6-impl-4b-ii + 9.7-impl-1c-ii).

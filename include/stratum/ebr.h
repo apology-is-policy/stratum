@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Epoch-Based Reclamation (EBR) — safe lock-free memory reclamation for
  * the Bw-tree delta chains and tree-version handoff.

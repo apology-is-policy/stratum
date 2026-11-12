@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Internal backend interface for janus. A backend holds the wrap
  * key material (hybrid SK) for one or more pools and performs the

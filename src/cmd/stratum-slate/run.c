@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stratum-slate — slate daemon binary entry point (P9-SLATE-1).
  *

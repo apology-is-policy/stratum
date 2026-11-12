@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Basic fixed-width types, endian helpers, and the error enum shared by every
  * Stratum v2 subsystem. Deliberately small — only things that every file needs.

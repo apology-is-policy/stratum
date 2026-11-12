@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <stratum/types.h>
 
 const char *stm_strerror(stm_status s)

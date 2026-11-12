@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stratumd run-main — the body of stratumd's CLI lifecycle, factored
  * out of main.c so the swiss-army `stratum` binary (Rust) can FFI-

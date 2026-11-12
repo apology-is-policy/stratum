@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Per-dataset metadata-tree key encoding (Phase 9.7 — D1 per-dataset trees).
  *

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_slate — unit tests for stm_slate's state machine
  * (P9-SLATE-1).

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * PQ-hybrid wrap tests. When liboqs is absent these tests still exercise the
  * classical (X25519-only) path — that's the degraded-but-functional mode.

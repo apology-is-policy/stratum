@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * fs tests of the write path under failure and a full pool: a reclaim
  * commit that waits for the operation between its steps, an index change

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stm_sdarray — succinct sorted set of 64-bit integers (Phase 3 chunk 4c).
  *

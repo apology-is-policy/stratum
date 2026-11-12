@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* stratumd standalone binary — thin wrapper over stm_cmd_stratumd_main.
  *
  * The substantive lifecycle (argv parsing, signal handlers, run-loop,

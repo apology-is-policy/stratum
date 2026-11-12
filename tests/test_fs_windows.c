@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * fs tests of a commit beside other work: metadata nodes one commit
  * retires and the next reuses, and the reads, counts and renames that meet

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * host_fs — POSIX directory tree exported as 9P2000.L, read-only.
  *

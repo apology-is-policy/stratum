@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_stratumd_user_policy — TLY-A2-impl-1 + R139 close.
  *

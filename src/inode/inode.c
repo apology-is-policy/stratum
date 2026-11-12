@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Stratum v2 — inode index implementation
  * (9.7-impl-1c-ii: per-dataset metadata-tree engines).

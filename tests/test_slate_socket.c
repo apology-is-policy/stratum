@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_slate_socket — socket-level integration tests for slate
  * (P9-SLATE-1). Drives the slate state via libstratum-9p over a Unix

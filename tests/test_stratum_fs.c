@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_stratum_fs — integration tests for the stratum-fs CLI
  * (P9-CLI-1 FS-only).

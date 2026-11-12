@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Shared test scaffold for stm_fs test suites — implementations.
  * See tests/test_fs_common.h for the rationale.

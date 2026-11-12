@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Shared header/csum helpers for stm_btnode's leaf and internal
  * codecs (R7c P2-4 consolidation). Node-size-parameterized at

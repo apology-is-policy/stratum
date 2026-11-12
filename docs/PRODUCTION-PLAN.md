@@ -286,7 +286,7 @@ Stratum as a modern alternative to VeraCrypt: a file-based volume and a manager 
 | T6.2 | External review of the cryptography, on a written design, with the threat model's remaining items accepted or fixed |
 | T6.3 | Published benchmarks, with T1.10's method |
 | T6.4 | Release process: versions, signed builds, a security policy and a way to report |
-| T6.5 | The licence settled: `LICENSE` says GPL-3.0, and 254 source files say ISC |
+| T6.5 | The licence settled. **Done** *(pending)*: GPL-3.0-or-later. `LICENSE` was the GPL's text while 265 source files said ISC; they say GPL-3.0-or-later now, and so does the manager's manifest |
 
 ---
 

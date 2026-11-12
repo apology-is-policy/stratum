@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stratum-fs — thin CLI wrapping libstratum-9p (P9-CLI-1 FS-only).
  *

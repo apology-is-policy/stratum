@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Per-dataset extent index — btree_engine-backed via an attached
  * stm_dataset_index (P7-2 → 9.6-impl-4d → 9.7-impl-1c-v).

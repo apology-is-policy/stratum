@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * P7-VAL-1: dedup ratio benchmark for ROADMAP §10.2 exit criterion 1
  * ("Cold-tier dedup achieves target 3-5× on VM-image test set").

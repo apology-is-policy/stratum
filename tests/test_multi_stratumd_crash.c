@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_multi_stratumd_crash — TLY-A2-impl-4 crash-recovery sweep.
  *

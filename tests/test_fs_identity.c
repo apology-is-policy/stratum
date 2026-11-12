@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * fs tests of file identity: a reused inode number starts with none of its
  * previous tenant's records; names, handles, locks and if-gen operations

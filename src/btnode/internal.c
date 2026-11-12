@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stm_btnode — internal (branch) node encode/decode (Phase 3 chunk 5b;
  * message buffer 9.8-BE-format).

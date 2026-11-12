@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Metadata-node AEAD wrapper (Phase 4 chunk P4-3b).
  *

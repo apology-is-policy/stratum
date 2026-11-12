@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_xattr.c — P8-POSIX-6 + 9.7-impl-1c-iv.
  *

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_ctl_conn_lifecycle — exercises stm_ctl_destroy's worker-count
  * refcount + cv wait (P9.5-PARALLEL-1f / task #961).

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_proxy_9p — TLY-A2-impl-2 raw 9P-frame proxy.
  *

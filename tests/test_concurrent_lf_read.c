@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_concurrent_lf_read -- Stratum Stabilization Area D ground-truth repro
  * for the R171 P0 wait-free-read UAF family (btree_engine/engine.c:214-233;

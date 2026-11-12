@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_compound_ops_concurrent — exercises the compound-op-vs-reader
  * cross-subsystem race surface under the P9.5-PARALLEL-1 concurrent

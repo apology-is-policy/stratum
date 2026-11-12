@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_p9 — exercises the generic 9P server against a trivial
  * in-memory synthetic FS. Proves the wire codec + dispatch layer

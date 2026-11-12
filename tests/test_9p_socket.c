@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_9p_socket — integration tests for P9-9P-4 stratumd Unix-socket
  * transport. Drives the accept_loop in a worker pthread and connects

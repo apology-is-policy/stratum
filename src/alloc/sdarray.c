@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stm_sdarray — Elias-Fano-encoded sorted set (Phase 3 chunk 4c).
  *

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * SWISS-4m: shared passphrase-reader for stratum-mkfs / stratumd.
  *

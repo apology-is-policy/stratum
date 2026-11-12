@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * stratum-host-fs run-main — exports a host directory tree as 9P2000.L
  * read-only on a Unix socket. Used by the swiss-army `stratum`

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * fs tests of what a snapshot's lists must keep: across a delete of its newer
  * neighbour, a promote, a cold list at its cap, and a clone that shares the

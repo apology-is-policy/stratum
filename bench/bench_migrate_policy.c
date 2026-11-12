@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * P7-VAL-4: migration-policy heuristic validation for ROADMAP §10.2 exit
  * criterion 2 ("Migration policy heuristic produces reasonable hot/cold

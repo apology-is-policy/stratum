@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Per-dataset key rotation + retired-key sweeper tests (P4-4c,
  * ARCH §7.7.2).

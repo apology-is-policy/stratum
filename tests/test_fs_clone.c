@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * 9.7-impl-6f: integration tests for the v1.0 clone surface.
  *

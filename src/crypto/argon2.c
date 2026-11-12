@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Argon2id via libsodium's crypto_pwhash. Passphrase → wrap-key derivation.
  *

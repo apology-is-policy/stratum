@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Internal (non-public) per-mode entry points dispatched from aead.c.
  * Split per mode so Phase-9 SIMD drop-ins can replace one without touching

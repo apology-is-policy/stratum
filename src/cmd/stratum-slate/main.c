@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* stratum-slate standalone binary — thin wrapper over stm_cmd_slate_main.
  *
  * The substantive lifecycle (argv parsing, accept loop, worker pool,

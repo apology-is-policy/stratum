@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Bw-tree benchmarks. Produces numbers for Phase 2 exit criteria §5.2:
  *

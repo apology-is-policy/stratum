@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * 9P2000.L raw-frame proxy implementation. See `proxy_9p.h` for the
  * architecture summary + trust-boundary list.

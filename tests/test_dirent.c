@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_dirent.c — P8-POSIX-2 + 9.7-impl-1c-iii.
  *

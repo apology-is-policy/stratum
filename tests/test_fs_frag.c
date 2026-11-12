@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * fs tests on a fragmented pool: a write no free run holds goes in
  * pieces. Their fixture fills and punches a whole pool, so they run in a

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_corvus_provision — TLY-A3-keyslot-wrap chunk 5b: the operator
  * surface for provisioning a corvus-encrypted dataset.

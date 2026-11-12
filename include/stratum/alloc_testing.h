@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Testing hooks for the allocator. Compiled in only with
  * STRATUM_BUILD_TESTING_HOOKS.

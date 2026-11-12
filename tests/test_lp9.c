@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_lp9 — exercise stm_lp9_server via libstratum-9p client end to
  * end. A tiny in-test vops backend serves a fixed three-file synfs;

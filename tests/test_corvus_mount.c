@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_corvus_mount — TLY-A3-keyslot-impl-3b mount-time UNWRAP wiring.
  *

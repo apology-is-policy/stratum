@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Concurrent Bε-tree stress tests. Validates the rwlock fallback
  * wrapper: every operation seen under ASan / TSan with many threads.

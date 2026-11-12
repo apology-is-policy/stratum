@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * btree_engine — public API: lifecycle, descent, insert / split,
  * lookup, commit, scan, verify.

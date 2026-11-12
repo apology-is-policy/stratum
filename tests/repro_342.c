@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * repro_342 — host-side replay of the Thylacine #342 on-disk zeros corruption.
  *

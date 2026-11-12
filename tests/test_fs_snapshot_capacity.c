@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * fs tests of a snapshot's capacity: a drop born after the snapshot spends no list
  * entry, and past a list what the snapshot may name stays allocated, so no list

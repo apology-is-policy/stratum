@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Passphrase backend — Argon2id-derived KEK AEAD-wraps the hybrid
  * keypair in janus's per-pool state directory.

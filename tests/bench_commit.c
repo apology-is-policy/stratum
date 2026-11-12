@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * bench_commit -- Stratum Stabilization Area G durability-throughput probe.
  *

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Asynchronous block-device tests — verifies submit → completion → callback
  * fires with the right status and bytes.

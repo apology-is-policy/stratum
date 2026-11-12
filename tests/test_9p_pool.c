@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_9p_pool — CF-2a: the stratumd per-connection dispatch pool
  * (src/cmd/stratumd/fs_pool.c; docs/cf-2-design.md §3 + §8).

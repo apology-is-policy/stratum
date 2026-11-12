@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * test_ctl_concurrent — exercises stm_ctl_conn under concurrent regime
  * (P9.5-PARALLEL-1f / task #961).

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * bench_concurrent_write -- Stratum Stabilization Area D throughput probe.
  *

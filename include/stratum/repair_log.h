@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Repair-log sub-tree (Phase 7 chunk P7-15, ARCH §7.15.4).
  *

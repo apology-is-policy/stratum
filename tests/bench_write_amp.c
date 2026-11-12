@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * bench_write_amp -- CF-1 chunk 11 (9.8-BE-bench): metadata write
  * amplification, 9.7 serial write regime vs 9.8 Be concurrent regime,

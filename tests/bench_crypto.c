@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * bench_crypto -- Stratum Stabilization Area E crypto/integrity throughput
  * baseline. THE arc's G2 measurement reference: the cryptographic layer is

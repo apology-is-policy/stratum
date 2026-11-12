@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Dataset pattern matcher implementation. See `dataset_pattern.h` for
  * semantics + trust boundaries.

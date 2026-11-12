@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Stratum v2 — dirent index implementation
  * (P8-POSIX-2 + 9.6-impl-4c + 9.7-impl-1c-iii).

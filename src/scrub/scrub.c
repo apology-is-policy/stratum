@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Scrub — P5-5-α + β. Verify-only sweep with optional repair-callback
  * (ARCHITECTURE §7.14, §7.15, §12.7).

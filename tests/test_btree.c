@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /*
  * Bε-tree single-threaded correctness tests. Property-based where
  * reasonable; targeted unit tests for edge cases.
