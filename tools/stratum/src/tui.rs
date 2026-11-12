@@ -444,7 +444,8 @@ const TAKE_TICK: Duration = Duration::from_millis(100);
 
 /// A terminal that has taken nothing for this long, with the screen to be left, counts as
 /// taking nothing. It is told by what the terminal takes and not by how long a frame is in
-/// going out, so one that is only slow is waited for.
+/// going out, so one that is only slow is waited for. A daemon that has neither taken nor
+/// answered anything of a call for this long is given up the same way.
 const HELD_AFTER: Duration = Duration::from_secs(10);
 
 /// The screen is being left for good: by a key, an error or a stop asked.
@@ -456,6 +457,38 @@ static TERMINAL_HELD: AtomicBool = AtomicBool::new(false);
 
 fn screen_to_be_left() -> bool {
     ASKED_TO_STOP.load(Ordering::Relaxed) || LEAVING.load(Ordering::Relaxed)
+}
+
+unsafe extern "C" fn daemon_call_to_be_left(_arg: *mut libc::c_void) -> bool {
+    screen_to_be_left()
+}
+
+/// Dials a daemon as every client of the manager's does: its calls wait a tick at a time
+/// and look between at whether the screen is to be left. A call that waited in a read
+/// could not look: a daemon that never answers would hold the manager in it past a stop
+/// asked, its daemons running and the volume unlocked. With nothing asked a daemon is
+/// waited for as long as it takes.
+pub(crate) fn dial_daemon(
+    socket: &std::ffi::CStr,
+    root_fid: u32,
+) -> (crate::ffi::stm_status, *mut crate::ffi::stm_9p_client) {
+    let wait = crate::ffi::stm_9p_wait {
+        to_leave: Some(daemon_call_to_be_left),
+        arg: std::ptr::null_mut(),
+        tick_ms: TAKE_TICK.as_millis() as u32,
+        give_up_after_ms: HELD_AFTER.as_millis() as u32,
+    };
+    let opts = crate::ffi::stm_9p_dial_opts {
+        msize: crate::ffi::STM_9P_MSIZE_DEFAULT,
+        uname: c"".as_ptr(),
+        aname: c"".as_ptr(),
+        n_uname: u32::MAX,
+        root_fid,
+        wait: &wait,
+    };
+    let mut raw: *mut crate::ffi::stm_9p_client = std::ptr::null_mut();
+    let rc = unsafe { crate::ffi::stm_9p_dial_unix(socket.as_ptr(), &opts, &mut raw) };
+    (rc, raw)
 }
 
 pub(crate) fn terminal_held() -> bool {
@@ -673,6 +706,10 @@ pub fn run(opts: Opts) -> Result<()> {
 
     stop_flag.store(true, Ordering::SeqCst);
 
+    // A call given up for a stop asked is that stop, and no failure of the screen's.
+    if result.is_err() && main_client.gave_up() && stop_requested() {
+        return Ok(());
+    }
     result
 }
 

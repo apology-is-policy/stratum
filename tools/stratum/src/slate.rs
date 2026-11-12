@@ -69,16 +69,7 @@ impl SlateClient {
         let scratch_fid = base + 1;
         let cpath = CString::new(socket_path.as_os_str().to_string_lossy().as_bytes())
             .context("socket path contains NUL")?;
-        let empty = CString::new("").unwrap();
-        let opts = ffi::stm_9p_dial_opts {
-            msize: ffi::STM_9P_MSIZE_DEFAULT,
-            uname: empty.as_ptr(),
-            aname: empty.as_ptr(),
-            n_uname: u32::MAX,
-            root_fid,
-        };
-        let mut raw: *mut ffi::stm_9p_client = std::ptr::null_mut();
-        let rc = unsafe { ffi::stm_9p_dial_unix(cpath.as_ptr(), &opts, &mut raw) };
+        let (rc, raw) = crate::tui::dial_daemon(&cpath, root_fid);
         if rc != ffi::STM_OK {
             bail!("dial {}: stm_status {rc}", socket_path.display());
         }
@@ -269,6 +260,14 @@ impl SlateClient {
         let v: u64 = s.trim_end_matches('\n').parse()
             .map_err(|_| anyhow!("redraw response not a u64: {s:?}"))?;
         Ok(Some(v))
+    }
+}
+
+impl SlateClient {
+    /// Whether a call of this client's was given up: its daemon had not answered, and
+    /// the screen was to be left.
+    pub fn gave_up(&self) -> bool {
+        !self.raw.is_null() && unsafe { ffi::stm_9p_last_errno(self.raw) } == libc::ETIMEDOUT
     }
 }
 

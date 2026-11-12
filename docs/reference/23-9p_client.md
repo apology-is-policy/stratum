@@ -45,7 +45,15 @@ typedef struct {
     const char *aname;       /* mount-point selector */
     uint32_t    n_uname;     /* numeric uid; (uint32_t)-1 = default */
     uint32_t    root_fid;    /* caller-allocated root fid */
+    const stm_9p_wait *wait; /* how calls wait; NULL = for as long as the daemon takes */
 } stm_9p_dial_opts;
+
+typedef struct {
+    bool   (*to_leave)(void *arg);  /* asked between ticks, on the calling thread */
+    void    *arg;
+    uint32_t tick_ms;               /* not 0 */
+    uint32_t give_up_after_ms;      /* not 0 */
+} stm_9p_wait;
 
 stm_status stm_9p_dial_unix  (const char *path, const stm_9p_dial_opts *opts,
                               stm_9p_client **out);
@@ -61,6 +69,25 @@ msize < STM_9P_MSIZE_MIN (1 KiB) the lib returns STM_EOVERFLOW.
 `stm_9p_last_errno` exposes the last syscall errno (read/write) for
 post-mortem diagnostics on STM_EIO; NOT available for dial-time
 failures because the client is freed before the caller can query it.
+
+**A call's wait.** With `wait` NULL a call waits in its read or its
+write for as long as the daemon takes, and no signal ends it: a caller
+that must be able to leave cannot use it against a daemon that may
+never answer. With a `stm_9p_wait` the client's socket is made not to
+wait (`O_NONBLOCK`; a flag on one message would not do, macOS waits in
+a `send` that does not fit all the same), and where a message cannot be
+sent or its reply has not come the call polls a tick at a time and asks
+`to_leave` between. From the first true, `give_up_after_ms` of waiting
+with nothing sent and nothing received ends the call with STM_EIO,
+`stm_9p_last_errno` ETIMEDOUT, and poisons the client: the reply given
+up on may still come, so every later call is refused with
+STM_EBACKEND. A wait counts for what it lasted and for a tick at most:
+a wait a signal cut short counts for less than a tick, and a process
+that was stopped, or a machine that slept, has not waited meanwhile.
+Bytes sent or received start the count again, so a daemon that is only
+slow is waited for. The dial's own handshake waits by the same rule.
+The manager dials every client of its own this way (tools/stratum/src/
+tui.rs `dial_daemon`), on its screen's flag for a stop asked or a quit.
 
 ### Read-side ops
 
@@ -246,7 +273,9 @@ struct stm_9p_client {
     uint16_t  next_tag;       /* monotonic counter */
     uint32_t  root_fid;       /* caller-supplied at dial */
     int       last_errno;     /* last read/write syscall errno */
-    bool      poisoned;       /* tag-mismatch detected */
+    bool      poisoned;       /* tag-mismatch detected, or a call given up */
+    stm_9p_wait wait;         /* copied at dial; to_leave NULL = none */
+    uint32_t  waited_ms;      /* since to_leave said true, nothing moved */
     uint8_t  *buf;            /* msize-sized request/response buffer */
 };
 ```
@@ -395,6 +424,9 @@ the SERVER's correctness viewed through the wire:
   stratumd against a temp keyfile, dials via the lib, exercises
   every public op. Includes the R111 caller-cap-bound regressions
   for each op.
+  The wait rule is tested against a daemon of the test's own that
+  takes a client through the dial and then never answers, answers a
+  byte at a time, never reads, or reads slowly.
 - `tests/test_9p_socket.c` — bigger e2e harness that exercises
   9P-server + stratumd + libstratum-9p across two processes.
 - `tools/stratum/tests/concurrent_ctl.rs` -- Rust-side e2e

@@ -39,12 +39,21 @@ pub struct stm_9p_qid {
 }
 
 #[repr(C)]
+pub struct stm_9p_wait {
+    pub to_leave: Option<unsafe extern "C" fn(arg: *mut c_void) -> bool>,
+    pub arg: *mut c_void,
+    pub tick_ms: u32,
+    pub give_up_after_ms: u32,
+}
+
+#[repr(C)]
 pub struct stm_9p_dial_opts {
     pub msize: u32,
     pub uname: *const c_char,
     pub aname: *const c_char,
     pub n_uname: u32,
     pub root_fid: u32,
+    pub wait: *const stm_9p_wait,
 }
 
 #[repr(C)]
@@ -62,6 +71,8 @@ extern "C" {
     pub fn stm_9p_close(c: *mut stm_9p_client);
 
     pub fn stm_9p_msize(c: *const stm_9p_client) -> u32;
+
+    pub fn stm_9p_last_errno(c: *const stm_9p_client) -> c_int;
 
     pub fn stm_9p_walk(
         c: *mut stm_9p_client,

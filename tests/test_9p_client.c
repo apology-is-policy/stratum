@@ -32,15 +32,20 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -2770,6 +2775,430 @@ STM_TEST(p9_client_xattrwalk_invalid_args_einval)
     STM_ASSERT_OK(stm_9p_clunk(c, 100));
     stm_9p_close(c);
     destroy_client_fixture(&f);
+}
+
+/* A call's wait for its daemon (stm_9p_wait). */
+
+static uint64_t test_mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void test_sleep_ms(long ms)
+{
+    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+/* What a fake daemon does with the first message after the dial. */
+enum {
+    FAKE_NEVER_ANSWERS,    /* takes it, and says nothing */
+    FAKE_ANSWERS_SLOWLY,   /* an Rclunk, a byte each 60 ms */
+    FAKE_NEVER_READS,      /* leaves it where the client put it */
+    FAKE_READS_SLOWLY,     /* a Twrite taken 64 KiB each 30 ms, then its Rwrite */
+};
+
+/* A daemon that takes one client through the dial and then does what `mode` says. It
+ * ends the connection FAKE_HARD_MS after the dial at the latest, so that a client which
+ * waits for ever fails its test and does not hold it. */
+#define FAKE_HARD_MS 8000u
+typedef struct {
+    int         listen_fd;
+    int         mode;
+    uint32_t    msize;
+    atomic_bool done;
+    /* FAKE_NEVER_READS: how much of the client's message waited unread at the end. */
+    atomic_int  unread;
+    pthread_t   thread;
+} fake_daemon;
+
+static bool fake_read(int fd, uint8_t *buf, size_t n)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, buf + got, n - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        got += (size_t)r;
+    }
+    return true;
+}
+
+static bool fake_write(int fd, const uint8_t *buf, size_t n)
+{
+    size_t put = 0;
+    while (put < n) {
+        ssize_t r = write(fd, buf + put, n - put);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        put += (size_t)r;
+    }
+    return true;
+}
+
+static void fake_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t fake_g32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* One request read whole and thrown away; its header is left in hdr. */
+static bool fake_take(int fd, uint8_t hdr[7])
+{
+    static uint8_t scrap[4096];
+    if (!fake_read(fd, hdr, 7)) return false;
+    uint32_t left = fake_g32(hdr) - 7u;
+    while (left > 0) {
+        uint32_t n = left < sizeof scrap ? left : (uint32_t)sizeof scrap;
+        if (!fake_read(fd, scrap, n)) return false;
+        left -= n;
+    }
+    return true;
+}
+
+static void *fake_daemon_thread(void *arg)
+{
+    fake_daemon *d = arg;
+    int fd = accept(d->listen_fd, NULL, NULL);
+    if (fd < 0) return NULL;
+    uint8_t hdr[7], out[32];
+    /* Tversion -> Rversion, then Tattach -> Rattach. */
+    if (!fake_take(fd, hdr)) goto end;
+    fake_u32(out, 7 + 4 + 2 + 8);
+    out[4] = STM_9P_RVERSION; out[5] = hdr[5]; out[6] = hdr[6];
+    fake_u32(out + 7, d->msize);
+    out[11] = 8; out[12] = 0;
+    memcpy(out + 13, "9P2000.L", 8);
+    if (!fake_write(fd, out, 21)) goto end;
+    if (!fake_take(fd, hdr)) goto end;
+    memset(out, 0, sizeof out);
+    fake_u32(out, 7 + 13);
+    out[4] = STM_9P_RATTACH; out[5] = hdr[5]; out[6] = hdr[6];
+    if (!fake_write(fd, out, 20)) goto end;
+
+    uint64_t until = test_mono_ms() + FAKE_HARD_MS;
+    if (d->mode == FAKE_ANSWERS_SLOWLY) {
+        if (!fake_take(fd, hdr)) goto end;
+        fake_u32(out, 7);
+        out[4] = STM_9P_RCLUNK; out[5] = hdr[5]; out[6] = hdr[6];
+        for (int i = 0; i < 7; i++) {
+            if (i) test_sleep_ms(60);
+            if (!fake_write(fd, out + i, 1)) goto end;
+        }
+    } else if (d->mode == FAKE_READS_SLOWLY) {
+        static uint8_t chunk[64 * 1024];
+        uint8_t pre[16];
+        if (!fake_read(fd, hdr, 7) || !fake_read(fd, pre, 16)) goto end;
+        uint32_t left = fake_g32(hdr) - 7u - 16u;
+        while (left > 0) {
+            uint32_t n = left < sizeof chunk ? left : (uint32_t)sizeof chunk;
+            if (!fake_read(fd, chunk, n)) goto end;
+            left -= n;
+            test_sleep_ms(30);
+        }
+        fake_u32(out, 7 + 4);
+        out[4] = STM_9P_RWRITE; out[5] = hdr[5]; out[6] = hdr[6];
+        memcpy(out + 7, pre + 12, 4);
+        if (!fake_write(fd, out, 11)) goto end;
+    }
+    /* What comes now is taken and thrown away, or left unread, until the test is done. */
+    while (!atomic_load(&d->done) && test_mono_ms() < until) {
+        struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+        if (d->mode == FAKE_NEVER_READS) {
+            test_sleep_ms(20);
+        } else if (poll(&p, 1, 20) > 0) {
+            static uint8_t scrap[4096];
+            if (read(fd, scrap, sizeof scrap) <= 0) break;
+        }
+    }
+    if (d->mode == FAKE_NEVER_READS) {
+        int unread = 0;
+        if (ioctl(fd, FIONREAD, &unread) == 0) atomic_store(&d->unread, unread);
+    }
+end:
+    close(fd);
+    return NULL;
+}
+
+static void fake_daemon_start(fake_daemon *d, const char *tag, int mode, uint32_t msize)
+{
+    memset(d, 0, sizeof *d);
+    d->mode = mode;
+    d->msize = msize;
+    atomic_init(&d->done, false);
+    atomic_init(&d->unread, -1);
+    build_sock_path(tag);
+    (void)unlink(g_sock_path);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    STM_ASSERT(strlen(g_sock_path) < sizeof addr.sun_path);
+    memcpy(addr.sun_path, g_sock_path, strlen(g_sock_path) + 1);
+    d->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT(d->listen_fd >= 0);
+    STM_ASSERT_EQ(bind(d->listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    STM_ASSERT_EQ(listen(d->listen_fd, 1), 0);
+    STM_ASSERT_EQ(pthread_create(&d->thread, NULL, fake_daemon_thread, d), 0);
+}
+
+static void fake_daemon_stop(fake_daemon *d)
+{
+    atomic_store(&d->done, true);
+    pthread_join(d->thread, NULL);
+    close(d->listen_fd);
+    (void)unlink(g_sock_path);
+}
+
+/* to_leave: true from a moment on. */
+typedef struct { uint64_t from_ms; } leave_from;
+static bool leave_once_it_is_time(void *arg)
+{
+    const leave_from *l = arg;
+    return test_mono_ms() >= l->from_ms;
+}
+
+#define WAIT_TICK_MS  20u
+#define WAIT_LIMIT_MS 300u
+
+STM_TEST(p9_client_dial_refuses_a_wait_that_cannot_wait)
+{
+    leave_from l = { 0 };
+    stm_9p_wait no_ask  = { NULL, NULL, WAIT_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_wait no_tick = { leave_once_it_is_time, &l, 0, WAIT_LIMIT_MS };
+    stm_9p_wait no_end  = { leave_once_it_is_time, &l, WAIT_TICK_MS, 0 };
+    const stm_9p_wait *bad[] = { &no_ask, &no_tick, &no_end };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        stm_9p_dial_opts o = default_dial_opts(100);
+        o.wait = bad[i];
+        stm_9p_client *c = NULL;
+        STM_ASSERT_EQ(stm_9p_dial_unix("/tmp/nope.sock", &o, &c), STM_EINVAL);
+        STM_ASSERT(c == NULL);
+    }
+}
+
+STM_TEST(p9_client_wait_gives_a_call_up_only_once_asked_to_leave)
+{
+    fake_daemon d;
+    fake_daemon_start(&d, "wait_asked", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
+    leave_from l = { UINT64_MAX };
+    stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_dial_opts o = default_dial_opts(100);
+    o.wait = &w;
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Nothing is asked for three times the limit, and the call waits it out. */
+    uint64_t began = test_mono_ms();
+    l.from_ms = began + 3u * WAIT_LIMIT_MS;
+    stm_status rc = stm_9p_clunk(c, 100);
+    uint64_t took = test_mono_ms() - began;
+    STM_ASSERT_EQ(rc, STM_EIO);
+    /* Not the fake daemon's own end, which says EPIPE. */
+    STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
+    /* The count starts at the asking. */
+    STM_ASSERT(took >= 4u * WAIT_LIMIT_MS - 2u * WAIT_TICK_MS);
+
+    /* Given up, the client refuses every later call, and at once. */
+    began = test_mono_ms();
+    STM_ASSERT_EQ(stm_9p_clunk(c, 100), STM_EBACKEND);
+    STM_ASSERT(test_mono_ms() - began < WAIT_LIMIT_MS / 2u);
+    stm_9p_close(c);
+    fake_daemon_stop(&d);
+}
+
+STM_TEST(p9_client_wait_takes_a_slow_reply_for_a_reply)
+{
+    fake_daemon d;
+    fake_daemon_start(&d, "wait_slow", FAKE_ANSWERS_SLOWLY, STM_9P_MSIZE_DEFAULT);
+    leave_from l = { 0 };
+    stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_dial_opts o = default_dial_opts(100);
+    o.wait = &w;
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    uint64_t began = test_mono_ms();
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    /* A reply that came inside the limit proves nothing. */
+    STM_ASSERT(test_mono_ms() - began > WAIT_LIMIT_MS);
+    stm_9p_close(c);
+    fake_daemon_stop(&d);
+}
+
+#define WAIT_BIG (4u * 1024u * 1024u)
+
+STM_TEST(p9_client_wait_gives_up_a_message_the_daemon_does_not_take)
+{
+    fake_daemon d;
+    fake_daemon_start(&d, "wait_unread", FAKE_NEVER_READS, STM_9P_MSIZE_MAX);
+    leave_from l = { 0 };
+    stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_dial_opts o = default_dial_opts(100);
+    o.msize = STM_9P_MSIZE_MAX;
+    o.wait = &w;
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    uint8_t *big = calloc(1, WAIT_BIG);
+    STM_ASSERT(big != NULL);
+    uint32_t written = 0;
+    uint64_t began = test_mono_ms();
+    stm_status rc = stm_9p_write(c, 100, 0, big, WAIT_BIG, &written);
+    uint64_t took = test_mono_ms() - began;
+    free(big);
+    STM_ASSERT_EQ(rc, STM_EIO);
+    STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
+    STM_ASSERT(took >= WAIT_LIMIT_MS - 2u * WAIT_TICK_MS);
+    stm_9p_close(c);
+    fake_daemon_stop(&d);
+    /* A message the socket held whole was given up at its reply: it proves nothing of
+     * the wait to send. */
+    int unread = atomic_load(&d.unread);
+    STM_ASSERT(unread >= 0 && (uint32_t)unread < WAIT_BIG);
+}
+
+STM_TEST(p9_client_wait_takes_a_daemon_that_reads_slowly_for_one_that_reads)
+{
+    fake_daemon d;
+    fake_daemon_start(&d, "wait_reads", FAKE_READS_SLOWLY, STM_9P_MSIZE_MAX);
+    leave_from l = { 0 };
+    stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_dial_opts o = default_dial_opts(100);
+    o.msize = STM_9P_MSIZE_MAX;
+    o.wait = &w;
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    uint8_t *big = calloc(1, WAIT_BIG);
+    STM_ASSERT(big != NULL);
+    uint32_t written = 0;
+    uint64_t began = test_mono_ms();
+    stm_status rc = stm_9p_write(c, 100, 0, big, WAIT_BIG, &written);
+    uint64_t took = test_mono_ms() - began;
+    free(big);
+    STM_ASSERT_OK(rc);
+    STM_ASSERT_EQ(written, WAIT_BIG);
+    /* Taken inside the limit, it proves nothing. */
+    STM_ASSERT(took > WAIT_LIMIT_MS);
+    stm_9p_close(c);
+    fake_daemon_stop(&d);
+}
+
+static void wait_test_signal(int sig)
+{
+    (void)sig;
+}
+
+typedef struct {
+    pthread_t   whom;
+    atomic_bool done;
+} signal_storm;
+
+static void *signal_storm_thread(void *arg)
+{
+    signal_storm *st = arg;
+    while (!atomic_load(&st->done)) {
+        pthread_kill(st->whom, SIGUSR1);
+        test_sleep_ms(5);
+    }
+    return NULL;
+}
+
+STM_TEST(p9_client_wait_counts_a_wait_a_signal_cut_short_for_what_it_lasted)
+{
+    fake_daemon d;
+    fake_daemon_start(&d, "wait_signals", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
+    leave_from l = { 0 };
+    stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_dial_opts o = default_dial_opts(100);
+    o.wait = &w;
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* A signal each 5 ms that restarts nothing: every wait of a tick ends early. */
+    struct sigaction sa, was;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = wait_test_signal;
+    sigemptyset(&sa.sa_mask);
+    STM_ASSERT_EQ(sigaction(SIGUSR1, &sa, &was), 0);
+    signal_storm st;
+    st.whom = pthread_self();
+    atomic_init(&st.done, false);
+    pthread_t storm;
+    STM_ASSERT_EQ(pthread_create(&storm, NULL, signal_storm_thread, &st), 0);
+
+    uint64_t began = test_mono_ms();
+    stm_status rc = stm_9p_clunk(c, 100);
+    uint64_t took = test_mono_ms() - began;
+    atomic_store(&st.done, true);
+    pthread_join(storm, NULL);
+    sigaction(SIGUSR1, &was, NULL);
+    STM_ASSERT_EQ(rc, STM_EIO);
+    STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
+    /* Each counted as a whole tick, the limit would be reached in a quarter of it. */
+    STM_ASSERT(took >= WAIT_LIMIT_MS - 3u * WAIT_TICK_MS);
+    stm_9p_close(c);
+    fake_daemon_stop(&d);
+}
+
+STM_TEST(p9_client_wait_does_not_count_the_time_its_process_was_stopped)
+{
+    fake_daemon d;
+    fake_daemon_start(&d, "wait_stopped", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
+
+    /* The call is made in a child of this process, which is the one stopped: a process
+     * that a shell started may be continued by it the moment it stops. */
+    int says[2];
+    STM_ASSERT_EQ(pipe(says), 0);
+    pid_t child = fork();
+    STM_ASSERT(child >= 0);
+    if (child == 0) {
+        close(says[0]);
+        leave_from l = { 0 };
+        stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+        stm_9p_dial_opts o = default_dial_opts(100);
+        o.wait = &w;
+        stm_9p_client *c = NULL;
+        int64_t told[3] = { -1, 0, 0 };
+        if (retry_dial(g_sock_path, &o, &c) == STM_OK) {
+            char go = 'g';
+            if (write(says[1], &go, 1) == 1) {
+                uint64_t began = test_mono_ms();
+                told[1] = stm_9p_clunk(c, 100);
+                told[0] = (int64_t)(test_mono_ms() - began);
+                told[2] = stm_9p_last_errno(c);
+            }
+        }
+        ssize_t put = write(says[1], told, sizeof told);
+        _exit(put == (ssize_t)sizeof told ? 0 : 1);
+    }
+    close(says[1]);
+    char go = 0;
+    STM_ASSERT_EQ(read(says[0], &go, 1), 1);
+    /* A third of the limit into the call it is stopped, for three times the limit. */
+    const unsigned stopped_ms = 3u * WAIT_LIMIT_MS;
+    test_sleep_ms(WAIT_LIMIT_MS / 3u);
+    STM_ASSERT_EQ(kill(child, SIGSTOP), 0);
+    test_sleep_ms(stopped_ms);
+    STM_ASSERT_EQ(kill(child, SIGCONT), 0);
+    int64_t told[3] = { -1, 0, 0 };
+    STM_ASSERT(fake_read(says[0], (uint8_t *)told, sizeof told));
+    close(says[0]);
+    int status = 0;
+    STM_ASSERT_EQ(waitpid(child, &status, 0), child);
+    STM_ASSERT_EQ(told[1], STM_EIO);
+    STM_ASSERT_EQ(told[2], ETIMEDOUT);
+    /* A call that ended inside the stop's length was never stopped: it proves nothing. */
+    STM_ASSERT(told[0] >= (int64_t)stopped_ms);
+    /* One that counted the stop ends as it is continued. */
+    STM_ASSERT(told[0] >= (int64_t)(stopped_ms + WAIT_LIMIT_MS - 3u * WAIT_TICK_MS));
+    fake_daemon_stop(&d);
 }
 
 STM_TEST_MAIN("9p_client")

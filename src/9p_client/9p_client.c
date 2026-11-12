@@ -33,12 +33,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -151,11 +153,48 @@ struct stm_9p_client {
      * each op doesn't malloc/free. */
     uint8_t  *buf;
     uint32_t  buf_cap;
+    /* How a call waits (to_leave NULL: in the read or the write itself), and how long
+     * this client has waited since to_leave said true with nothing sent or received. */
+    stm_9p_wait wait;
+    uint32_t    waited_ms;
 };
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Socket I/O — robust against EINTR. EPIPE / EOF surfaced as STM_EIO.   */
 /* ────────────────────────────────────────────────────────────────────── */
+
+static uint64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* A client with a wait rule, whose socket does not wait in a read or a write: waits
+ * until it can be read or written, a tick at a time. STM_OK where it can, or where it
+ * has an end or an error for the read or the write to say. */
+static stm_status wait_until(stm_9p_client *c, short events)
+{
+    for (;;) {
+        struct pollfd p = { .fd = c->fd, .events = events, .revents = 0 };
+        uint64_t began = mono_ms();
+        int n = poll(&p, 1, (int)c->wait.tick_ms);
+        if (n > 0) return STM_OK;
+        if (n < 0 && errno != EINTR) {
+            c->last_errno = errno;
+            return STM_EIO;
+        }
+        /* Nothing asked: a daemon may take as long as it takes, and nothing is counted. */
+        if (!c->wait.to_leave(c->wait.arg)) continue;
+        uint64_t took = mono_ms() - began;
+        c->waited_ms += took < c->wait.tick_ms ? (uint32_t)took : c->wait.tick_ms;
+        if (c->waited_ms >= c->wait.give_up_after_ms) {
+            c->poisoned = 1;
+            c->last_errno = ETIMEDOUT;
+            return STM_EIO;
+        }
+    }
+}
 
 static stm_status send_all(stm_9p_client *c, const void *buf, size_t len)
 {
@@ -165,6 +204,11 @@ static stm_status send_all(stm_9p_client *c, const void *buf, size_t len)
         ssize_t n = write(c->fd, p + done, len - done);
         if (n < 0) {
             if (errno == EINTR) continue;
+            if (c->wait.to_leave && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                stm_status w = wait_until(c, POLLOUT);
+                if (w != STM_OK) return w;
+                continue;
+            }
             c->last_errno = errno;
             return STM_EIO;
         }
@@ -173,6 +217,7 @@ static stm_status send_all(stm_9p_client *c, const void *buf, size_t len)
             return STM_EIO;
         }
         done += (size_t)n;
+        c->waited_ms = 0;
     }
     return STM_OK;
 }
@@ -185,6 +230,11 @@ static stm_status recv_all(stm_9p_client *c, void *buf, size_t len)
         ssize_t n = read(c->fd, p + done, len - done);
         if (n < 0) {
             if (errno == EINTR) continue;
+            if (c->wait.to_leave && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                stm_status w = wait_until(c, POLLIN);
+                if (w != STM_OK) return w;
+                continue;
+            }
             c->last_errno = errno;
             return STM_EIO;
         }
@@ -193,6 +243,7 @@ static stm_status recv_all(stm_9p_client *c, void *buf, size_t len)
             return STM_EIO;
         }
         done += (size_t)n;
+        c->waited_ms = 0;
     }
     return STM_OK;
 }
@@ -463,6 +514,9 @@ stm_status stm_9p_dial_unix(const char *socket_path,
     *out = NULL;
     if (!socket_path || !opts) return STM_EINVAL;
     if (opts->root_fid == STM_9P_NOFID) return STM_EINVAL;
+    if (opts->wait && (!opts->wait->to_leave || opts->wait->tick_ms == 0
+                       || opts->wait->give_up_after_ms == 0))
+        return STM_EINVAL;
 
     uint32_t msize = opts->msize ? opts->msize : STM_9P_MSIZE_DEFAULT;
     if (msize < STM_9P_MSIZE_MIN) return STM_EINVAL;
@@ -476,6 +530,7 @@ stm_status stm_9p_dial_unix(const char *socket_path,
     if (!c) return STM_ENOMEM;
     c->fd = -1;
     c->next_tag = 1;
+    if (opts->wait) c->wait = *opts->wait;
     c->buf_cap = msize;
     c->buf = (uint8_t *)malloc(msize);
     if (!c->buf) {
@@ -490,6 +545,15 @@ stm_status stm_9p_dial_unix(const char *socket_path,
         free(c->buf);
         free(c);
         return rc;
+    }
+    if (c->wait.to_leave) {
+        /* A read or a write that waited in the kernel could take no look. The flag on
+         * one message would not do: macOS waits in a send that does not fit all the same. */
+        int fl = fcntl(c->fd, F_GETFL);
+        if (fl < 0 || fcntl(c->fd, F_SETFL, fl | O_NONBLOCK) != 0) {
+            stm_9p_close(c);
+            return STM_EIO;
+        }
     }
 
     rc = do_tversion(c, msize);

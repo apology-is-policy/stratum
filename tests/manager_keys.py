@@ -151,6 +151,7 @@ class Term:
         # The manager's stdout and stderr on a pipe the test can close, with the terminal
         # left as it is: its output can then go while the terminal stays.
         self.out = None
+        self.piped_bytes = 0
         if output_to_pipe:
             r, w = os.pipe()
         self.pid, self.fd = pty.fork()
@@ -193,6 +194,7 @@ class Term:
             if self.out is not None and self.out in ready:
                 data = os.read(self.out, 65536)
                 if data:
+                    self.piped_bytes += len(data)
                     self.piped.feed(data)
                 else:
                     self.cut_output()
@@ -831,54 +833,98 @@ def output_gone_leg(stratum, vol, host, root):
 
 def stuck_daemon_leg(stratum, vol, host, root):
     """A daemon that does not stop on SIGTERM is killed after 30 s. The manager says so on its
-    stderr, and with its output gone that must not panic it before it has put the rest away."""
-    how = 'a daemon stuck, the output gone'
-    env_file = f'{root}/env-stuck'
-    term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file],
-                output_to_pipe=True)
-    stuck = None
-    try:
-        term.expect(r'Passphrase for')
-        term.send(PASS.encode() + ENTER)
-        term.expect(r'from_vol\.txt', timeout=60)
-        session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
-        before = session_daemons(session)
-        host_fs = [p for p in before
-                   if ' host-fs ' in subprocess.run(['ps', '-ww', '-o', 'command=', '-p', p],
-                                                    capture_output=True, text=True).stdout]
-        if len(before) < 3 or len(host_fs) != 1:
-            raise Failure(f'the search finds {before}, host-fs {host_fs}, before {how}: it proves nothing')
-        # host-fs is stopped last, so slate and stratumd have stopped before the message.
-        stuck = int(host_fs[0])
-        os.kill(stuck, signal.SIGSTOP)
-        term.cut_output()
-        os.kill(term.pid, signal.SIGTERM)
-        began = time.monotonic()
-        ended = term.exited(100)
-        took = time.monotonic() - began
-        record(ended and term.rc == 0, f'{how}: the manager killed it and ended cleanly',
-               f'{how}: the manager ended={ended} rc={term.rc}')
-        # Only the 30 s deadline in stop_child ends a stop of a stopped process.
-        record(30 <= took < 90, f'{how}: the manager waited out its 30 s first ({took:.1f} s)',
-               f'{how}: the manager ended {took:.1f} s after the SIGTERM, not after the 30 s deadline')
-        left = session_daemons(session)
-        record(not left, f'{how}: no daemon is left', f'{how}: daemons {left} still run, with no manager')
-        record(not os.path.exists(session), f'{how}: the session directory is gone',
-               f'{how}: the session directory stayed')
-        signal_each(left, signal.SIGKILL)
-        limit = time.monotonic() + 30
-        while session_daemons(session) and time.monotonic() < limit:
-            time.sleep(0.2)
-        vol.serve()
-        vol.stop()
-        print(f'ok: after {how} the volume mounts and unmounts cleanly', flush=True)
-    finally:
-        if stuck is not None:
-            try:
-                os.kill(stuck, signal.SIGCONT)
-            except ProcessLookupError:
-                pass
-        term.kill()
+    stderr, and with its output gone that must not panic it before it has put the rest away.
+    A call of the manager's own that waits on that daemon must not hold the stop either: no
+    signal ends a read, and the daemons would run on, the volume unlocked, for as long as
+    the one that is stuck."""
+    call_given_up = 10  # tui.rs HELD_AFTER, in seconds
+    for how, in_flight in (('a daemon stuck, the output gone', False),
+                           ('a daemon stuck with a call to it in flight, the output gone', True)):
+        env_file = f'{root}/env-stuck{int(in_flight)}'
+        term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file],
+                    output_to_pipe=True)
+        stuck = None
+        try:
+            term.expect(r'Passphrase for')
+            term.send(PASS.encode() + ENTER)
+            term.expect(r'from_vol\.txt', timeout=60)
+            session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
+            before = session_daemons(session)
+            host_fs = [p for p in before
+                       if ' host-fs ' in subprocess.run(['ps', '-ww', '-o', 'command=', '-p', p],
+                                                        capture_output=True, text=True).stdout]
+            if len(before) < 3 or len(host_fs) != 1:
+                raise Failure(f'the search finds {before}, host-fs {host_fs}, before {how}: it proves nothing')
+            # host-fs is stopped last, so slate and stratumd have stopped before the message.
+            stuck = int(host_fs[0])
+            if in_flight:
+                # The screen answers a Tab by reading both panels again and drawing them,
+                # and the host's panel is read from host-fs. Seen twice with host-fs
+                # running, so that the silence below is the call's.
+                for _ in range(2):
+                    drawn = term.piped_bytes
+                    term.send(TAB)
+                    limit = time.monotonic() + 10
+                    while term.piped_bytes == drawn and time.monotonic() < limit:
+                        term.pump(0.1)
+                    if term.piped_bytes == drawn:
+                        raise Failure(f'{how}: the screen drew nothing for a Tab: it proves nothing')
+            # Quiet before the daemon is stopped and the output cut: a draw in flight when
+            # its output goes ends the manager with 1, as a lost output does.
+            quiet_by = time.monotonic() + 15
+            drawn = term.piped_bytes
+            while time.monotonic() < quiet_by:
+                term.pump(1.5)
+                if term.piped_bytes == drawn:
+                    break
+                drawn = term.piped_bytes
+            else:
+                raise Failure(f'{how}: the screen never went quiet: it proves nothing')
+            os.kill(stuck, signal.SIGSTOP)
+            if in_flight:
+                drawn = term.piped_bytes
+                term.send(TAB)
+                term.pump(3)
+                if term.piped_bytes != drawn:
+                    raise Failure(f'{how}: the screen drew for a Tab with host-fs stopped, '
+                                  'so no call waits on it: it proves nothing')
+            term.cut_output()
+            os.kill(term.pid, signal.SIGTERM)
+            began = time.monotonic()
+            ended = term.exited(130)
+            took = time.monotonic() - began
+            waits = '' if ended else threads_waiting(term.pid)
+            record(ended and term.rc == 0, f'{how}: the manager killed it and ended cleanly',
+                   f'{how}: the manager ended={ended} rc={term.rc}'
+                   + (f'; its threads: {waits}' if waits else ''))
+            if in_flight:
+                # The call is given up first, and slate, which waits on host-fs too, may
+                # need its own 30 s.
+                record(call_given_up + 30 <= took < call_given_up + 100,
+                       f'{how}: the manager gave the call up after {call_given_up} s and waited out the daemon\'s 30 s ({took:.1f} s)',
+                       f'{how}: the manager ended {took:.1f} s after the SIGTERM, not after the call\'s {call_given_up} s and the 30 s deadline')
+            else:
+                # Only the 30 s deadline in stop_child ends a stop of a stopped process.
+                record(30 <= took < 90, f'{how}: the manager waited out its 30 s first ({took:.1f} s)',
+                       f'{how}: the manager ended {took:.1f} s after the SIGTERM, not after the 30 s deadline')
+            left = session_daemons(session)
+            record(not left, f'{how}: no daemon is left', f'{how}: daemons {left} still run, with no manager')
+            record(not os.path.exists(session), f'{how}: the session directory is gone',
+                   f'{how}: the session directory stayed')
+            signal_each(left, signal.SIGKILL)
+            limit = time.monotonic() + 30
+            while session_daemons(session) and time.monotonic() < limit:
+                time.sleep(0.2)
+            vol.serve()
+            vol.stop()
+            print(f'ok: after {how} the volume mounts and unmounts cleanly', flush=True)
+        finally:
+            if stuck is not None:
+                try:
+                    os.kill(stuck, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+            term.kill()
 
 
 def headless_output_gone_leg(stratum, vol, host, root):
@@ -4133,7 +4179,7 @@ def screen_checks():
     """The terminal and the pipe through Term.pump as a leg's run feeds them, from fds that
     share no line discipline: neither may move or split what the other shows."""
     term = Term.__new__(Term)
-    term.screen, term.piped, term.raw = Screen(), Screen(onlcr=True), bytearray()
+    term.screen, term.piped, term.raw, term.piped_bytes = Screen(), Screen(onlcr=True), bytearray(), 0
     pty_r, pty_w = os.pipe()
     out_r, out_w = os.pipe()
     term.fd, term.out = pty_r, out_r

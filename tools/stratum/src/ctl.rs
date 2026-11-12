@@ -63,16 +63,7 @@ impl CtlClient {
         let scratch_fid = base + 1;
         let cpath = CString::new(socket_path.as_os_str().to_string_lossy().as_bytes())
             .context("/ctl/ socket path contains NUL")?;
-        let empty = CString::new("").unwrap();
-        let opts = ffi::stm_9p_dial_opts {
-            msize: ffi::STM_9P_MSIZE_DEFAULT,
-            uname: empty.as_ptr(),
-            aname: empty.as_ptr(),
-            n_uname: u32::MAX,
-            root_fid,
-        };
-        let mut raw: *mut ffi::stm_9p_client = std::ptr::null_mut();
-        let rc = unsafe { ffi::stm_9p_dial_unix(cpath.as_ptr(), &opts, &mut raw) };
+        let (rc, raw) = crate::tui::dial_daemon(&cpath, root_fid);
         if rc != ffi::STM_OK {
             bail!("dial /ctl/ {}: stm_status {rc}", socket_path.display());
         }

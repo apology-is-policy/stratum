@@ -93,6 +93,7 @@
 #include <stratum/9p.h>          /* STM_9P_T* / STM_9P_R* / STM_9P_MSIZE_* */
 #include <stratum/types.h>
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>           /* uid_t, gid_t */
@@ -160,6 +161,21 @@ typedef struct {
  * caller's flags through unchanged; server-side stratumd applies its
  * own type-vs-flag invariants. */
 
+/* How a call waits for its daemon. Where a message cannot be sent or its reply has
+ * not come, the call waits a tick at a time and asks to_leave between. From the first
+ * true, a wait of give_up_after_ms with nothing sent and nothing received ends the
+ * call with STM_EIO (stm_9p_last_errno says ETIMEDOUT), and the client refuses every
+ * later call with STM_EBACKEND: the reply given up on may still come. A wait counts
+ * for what it lasted and for a tick at most, so a process that was stopped, or a
+ * machine that slept, has not waited meanwhile. to_leave is called on the calling
+ * thread. tick_ms and give_up_after_ms are not 0. */
+typedef struct {
+    bool   (*to_leave)(void *arg);
+    void    *arg;
+    uint32_t tick_ms;
+    uint32_t give_up_after_ms;
+} stm_9p_wait;
+
 /* Connection options for stm_9p_dial_unix. */
 typedef struct {
     /* Maximum message size to negotiate. Pass 0 to use
@@ -184,6 +200,10 @@ typedef struct {
      * track caller-allocated fids; caller must clunk before re-using
      * a fid number. */
     uint32_t root_fid;
+
+    /* How the client's calls wait, the dial's own among them; copied. NULL: for as
+     * long as the daemon takes, which is for ever where it never answers. */
+    const stm_9p_wait *wait;
 } stm_9p_dial_opts;
 
 /* Dial a stratumd Unix socket, negotiate version, attach to root.
@@ -192,7 +212,8 @@ typedef struct {
  *
  * Returns:
  *   - STM_OK on success.
- *   - STM_EINVAL on NULL args, malformed opts (root_fid == NOFID).
+ *   - STM_EINVAL on NULL args, malformed opts (root_fid == NOFID; a wait
+ *     with no to_leave, or with a tick or a limit of 0).
  *   - STM_EIO on connect/socket error (errno preserved in
  *     stm_9p_last_errno).
  *   - STM_EBACKEND if the server's Rversion advertises a non-.L
