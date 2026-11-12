@@ -7,6 +7,8 @@
 set -u
 B=${1:?usage: volume_smoke.sh path/to/stratum}
 [ -x "$B" ] || { echo "FAIL: $B is not executable"; exit 2; }
+# One check runs it from another directory.
+case "$B" in /*) ;; *) B=$PWD/$B ;; esac
 
 D=$(mktemp -d "${TMPDIR:-/tmp}/stratum-volume.XXXXXX") || exit 2
 V=$D/vol.stm
