@@ -394,7 +394,8 @@ pub fn stop_on_signals() {
 /// read error by reading again, at full CPU, so the input loop cannot notice this
 /// or anything else. Ending the process is the way out, and the daemons follow it
 /// on their lifeline. Linux fails tcgetattr on a terminal that has gone; macOS still
-/// answers it, and fails an empty write instead. Neither sends anything to a live one.
+/// answers it, and fails an empty write instead, which is asked there alone. Neither
+/// sends anything to a live one.
 ///
 /// A terminal that is there and takes nothing holds the screen's write, and the UI thread
 /// with it: the handlers restart the call, so no signal ends it, and a stop asked would
@@ -432,10 +433,19 @@ fn terminal_gone(tty: i32) -> bool {
     no_attrs || empty_write_fails(tty)
 }
 
+/// macOS answers tcgetattr on a terminal that has gone, and fails an empty write there.
+#[cfg(target_os = "macos")]
 fn empty_write_fails(tty: i32) -> bool {
     let nothing = 0u8;
     let failed = unsafe { libc::write(tty, (&nothing as *const u8).cast(), 0) } < 0;
     failed && std::io::Error::last_os_error().raw_os_error() == Some(libc::EIO)
+}
+
+/// Not asked where tcgetattr tells: Linux lets a terminal have one write at a time, an
+/// empty one too, so this one would wait behind a write the terminal holds.
+#[cfg(not(target_os = "macos"))]
+fn empty_write_fails(_tty: i32) -> bool {
+    false
 }
 
 /// The end of a manager its terminal holds, from the watcher's thread. The mode needs no
