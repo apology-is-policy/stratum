@@ -749,9 +749,8 @@ pub fn run(opts: Opts) -> Result<()> {
 
     stop_flag.store(true, Ordering::SeqCst);
 
-    // A call or a helper given up for a stop asked is that stop, and no failure of the
-    // screen's.
-    if result.is_err() && stop_requested() && (main_client.gave_up() || crate::spawn::helper_given_up()) {
+    // A call given up for a stop asked is that stop, and no failure of the screen's.
+    if result.is_err() && stop_requested() && main_client.gave_up() {
         return Ok(());
     }
     result

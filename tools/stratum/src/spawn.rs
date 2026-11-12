@@ -22,7 +22,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -175,13 +175,6 @@ pub fn stop_child(child: &mut Child, name: &str) {
     }
 }
 
-/// Set once a helper was given up, for the screen: it ends then as on the stop that asked.
-static HELPER_GIVEN_UP: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn helper_given_up() -> bool {
-    HELPER_GIVEN_UP.load(Ordering::Relaxed)
-}
-
 /// What `Command::output` gives, of a helper that talks to a daemon, waited for as the
 /// manager's own calls to a daemon are: a tick at a time, with a look between at whether
 /// the wait is to be left. `output` waits in a read no signal ends, so a helper whose
@@ -272,12 +265,10 @@ fn output_until(
 }
 
 /// A helper of the manager's run to its end, or given up where the screen is to be left.
+/// One given up fails the action that ran it, which the screen shows as any failure of
+/// that action; the screen's loop then sees the stop.
 fn helper_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
-    let out = output_until(cmd, crate::tui::TAKE_TICK, crate::tui::HELD_AFTER, crate::tui::waits_to_be_left);
-    if matches!(&out, Err(e) if e.kind() == std::io::ErrorKind::TimedOut) {
-        HELPER_GIVEN_UP.store(true, Ordering::Relaxed);
-    }
-    out
+    output_until(cmd, crate::tui::TAKE_TICK, crate::tui::HELD_AFTER, crate::tui::waits_to_be_left)
 }
 
 /// A path handed to a child as an operand. One that begins with '-' would be read as an
