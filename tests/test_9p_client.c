@@ -32,6 +32,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -2798,6 +2799,7 @@ enum {
     FAKE_ANSWERS_SLOWLY,   /* an Rclunk, a byte each 60 ms */
     FAKE_NEVER_READS,      /* leaves it where the client put it */
     FAKE_READS_SLOWLY,     /* a Twrite taken 64 KiB each 30 ms, then its Rwrite */
+    FAKE_READS_A_LITTLE,   /* a Twrite taken 16 KiB each 50 ms, then its Rwrite */
 };
 
 /* A daemon that takes one client through the dial and then does what `mode` says. It
@@ -2891,16 +2893,18 @@ static void *fake_daemon_thread(void *arg)
             if (i) test_sleep_ms(60);
             if (!fake_write(fd, out + i, 1)) goto end;
         }
-    } else if (d->mode == FAKE_READS_SLOWLY) {
+    } else if (d->mode == FAKE_READS_SLOWLY || d->mode == FAKE_READS_A_LITTLE) {
         static uint8_t chunk[64 * 1024];
+        const uint32_t each = d->mode == FAKE_READS_SLOWLY ? (uint32_t)sizeof chunk : 16u * 1024u;
+        const unsigned pause_ms = d->mode == FAKE_READS_SLOWLY ? 30u : 50u;
         uint8_t pre[16];
         if (!fake_read(fd, hdr, 7) || !fake_read(fd, pre, 16)) goto end;
         uint32_t left = fake_g32(hdr) - 7u - 16u;
         while (left > 0) {
-            uint32_t n = left < sizeof chunk ? left : (uint32_t)sizeof chunk;
+            uint32_t n = left < each ? left : each;
             if (!fake_read(fd, chunk, n)) goto end;
             left -= n;
-            test_sleep_ms(30);
+            test_sleep_ms(pause_ms);
         }
         fake_u32(out, 7 + 4);
         out[4] = STM_9P_RWRITE; out[5] = hdr[5]; out[6] = hdr[6];
@@ -2955,24 +2959,32 @@ static void fake_daemon_stop(fake_daemon *d)
     (void)unlink(g_sock_path);
 }
 
-/* to_leave: true from a moment on. */
-typedef struct { uint64_t from_ms; } leave_from;
+/* to_leave: true from a moment on, and how many times it said so. */
+typedef struct { uint64_t from_ms; unsigned said; } leave_from;
 static bool leave_once_it_is_time(void *arg)
 {
-    const leave_from *l = arg;
-    return test_mono_ms() >= l->from_ms;
+    leave_from *l = arg;
+    if (test_mono_ms() < l->from_ms) return false;
+    l->said++;
+    return true;
 }
 
 #define WAIT_TICK_MS  20u
 #define WAIT_LIMIT_MS 300u
+/* The most askings that say true before a wait with nothing sent or received is given
+ * up: each is a whole tick counted, however long the machine took over it, and a
+ * signal or a wake may cut two short. A count, where a time would move with the load. */
+#define WAIT_MOST_ASKINGS (WAIT_LIMIT_MS / WAIT_TICK_MS + 2u)
 
 STM_TEST(p9_client_dial_refuses_a_wait_that_cannot_wait)
 {
-    leave_from l = { 0 };
+    leave_from l = { 0, 0 };
     stm_9p_wait no_ask  = { NULL, NULL, WAIT_TICK_MS, WAIT_LIMIT_MS };
     stm_9p_wait no_tick = { leave_once_it_is_time, &l, 0, WAIT_LIMIT_MS };
     stm_9p_wait no_end  = { leave_once_it_is_time, &l, WAIT_TICK_MS, 0 };
-    const stm_9p_wait *bad[] = { &no_ask, &no_tick, &no_end };
+    /* poll takes an int, and a negative one waits for ever. */
+    stm_9p_wait no_poll = { leave_once_it_is_time, &l, (uint32_t)INT_MAX + 1u, WAIT_LIMIT_MS };
+    const stm_9p_wait *bad[] = { &no_ask, &no_tick, &no_end, &no_poll };
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
         stm_9p_dial_opts o = default_dial_opts(100);
         o.wait = bad[i];
@@ -2986,7 +2998,7 @@ STM_TEST(p9_client_wait_gives_a_call_up_only_once_asked_to_leave)
 {
     fake_daemon d;
     fake_daemon_start(&d, "wait_asked", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
-    leave_from l = { UINT64_MAX };
+    leave_from l = { UINT64_MAX, 0 };
     stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
     stm_9p_dial_opts o = default_dial_opts(100);
     o.wait = &w;
@@ -3003,6 +3015,8 @@ STM_TEST(p9_client_wait_gives_a_call_up_only_once_asked_to_leave)
     STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
     /* The count starts at the asking. */
     STM_ASSERT(took >= 4u * WAIT_LIMIT_MS - 2u * WAIT_TICK_MS);
+    /* And ends a limit on: no more ticks than the limit holds. */
+    STM_ASSERT(l.said <= WAIT_MOST_ASKINGS);
 
     /* Given up, the client refuses every later call, and at once. */
     began = test_mono_ms();
@@ -3016,7 +3030,7 @@ STM_TEST(p9_client_wait_takes_a_slow_reply_for_a_reply)
 {
     fake_daemon d;
     fake_daemon_start(&d, "wait_slow", FAKE_ANSWERS_SLOWLY, STM_9P_MSIZE_DEFAULT);
-    leave_from l = { 0 };
+    leave_from l = { 0, 0 };
     stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
     stm_9p_dial_opts o = default_dial_opts(100);
     o.wait = &w;
@@ -3037,7 +3051,7 @@ STM_TEST(p9_client_wait_gives_up_a_message_the_daemon_does_not_take)
 {
     fake_daemon d;
     fake_daemon_start(&d, "wait_unread", FAKE_NEVER_READS, STM_9P_MSIZE_MAX);
-    leave_from l = { 0 };
+    leave_from l = { 0, 0 };
     stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
     stm_9p_dial_opts o = default_dial_opts(100);
     o.msize = STM_9P_MSIZE_MAX;
@@ -3055,6 +3069,7 @@ STM_TEST(p9_client_wait_gives_up_a_message_the_daemon_does_not_take)
     STM_ASSERT_EQ(rc, STM_EIO);
     STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
     STM_ASSERT(took >= WAIT_LIMIT_MS - 2u * WAIT_TICK_MS);
+    STM_ASSERT(l.said <= WAIT_MOST_ASKINGS);
     stm_9p_close(c);
     fake_daemon_stop(&d);
     /* A message the socket held whole was given up at its reply: it proves nothing of
@@ -3067,7 +3082,7 @@ STM_TEST(p9_client_wait_takes_a_daemon_that_reads_slowly_for_one_that_reads)
 {
     fake_daemon d;
     fake_daemon_start(&d, "wait_reads", FAKE_READS_SLOWLY, STM_9P_MSIZE_MAX);
-    leave_from l = { 0 };
+    leave_from l = { 0, 0 };
     stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
     stm_9p_dial_opts o = default_dial_opts(100);
     o.msize = STM_9P_MSIZE_MAX;
@@ -3114,7 +3129,7 @@ STM_TEST(p9_client_wait_counts_a_wait_a_signal_cut_short_for_what_it_lasted)
 {
     fake_daemon d;
     fake_daemon_start(&d, "wait_signals", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
-    leave_from l = { 0 };
+    leave_from l = { 0, 0 };
     stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
     stm_9p_dial_opts o = default_dial_opts(100);
     o.wait = &w;
@@ -3160,19 +3175,21 @@ STM_TEST(p9_client_wait_does_not_count_the_time_its_process_was_stopped)
     STM_ASSERT(child >= 0);
     if (child == 0) {
         close(says[0]);
-        leave_from l = { 0 };
+        leave_from l = { 0, 0 };
         stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
         stm_9p_dial_opts o = default_dial_opts(100);
         o.wait = &w;
         stm_9p_client *c = NULL;
-        int64_t told[3] = { -1, 0, 0 };
+        int64_t told[4] = { -1, 0, 0, 0 };
         if (retry_dial(g_sock_path, &o, &c) == STM_OK) {
             char go = 'g';
             if (write(says[1], &go, 1) == 1) {
+                l.said = 0;
                 uint64_t began = test_mono_ms();
                 told[1] = stm_9p_clunk(c, 100);
                 told[0] = (int64_t)(test_mono_ms() - began);
                 told[2] = stm_9p_last_errno(c);
+                told[3] = (int64_t)l.said;
             }
         }
         ssize_t put = write(says[1], told, sizeof told);
@@ -3187,7 +3204,7 @@ STM_TEST(p9_client_wait_does_not_count_the_time_its_process_was_stopped)
     STM_ASSERT_EQ(kill(child, SIGSTOP), 0);
     test_sleep_ms(stopped_ms);
     STM_ASSERT_EQ(kill(child, SIGCONT), 0);
-    int64_t told[3] = { -1, 0, 0 };
+    int64_t told[4] = { -1, 0, 0, 0 };
     STM_ASSERT(fake_read(says[0], (uint8_t *)told, sizeof told));
     close(says[0]);
     int status = 0;
@@ -3198,7 +3215,140 @@ STM_TEST(p9_client_wait_does_not_count_the_time_its_process_was_stopped)
     STM_ASSERT(told[0] >= (int64_t)stopped_ms);
     /* One that counted the stop ends as it is continued. */
     STM_ASSERT(told[0] >= (int64_t)(stopped_ms + WAIT_LIMIT_MS - 3u * WAIT_TICK_MS));
+    /* The stop is one tick to the count, whatever it lasted. */
+    STM_ASSERT(told[3] <= (int64_t)WAIT_MOST_ASKINGS);
     fake_daemon_stop(&d);
+}
+
+#define WAIT_LITTLE (512u * 1024u)
+
+/* The kernel may take a write some time before it calls the socket writable: Linux
+ * calls a Unix socket writable only once three quarters of its buffer are free, and
+ * takes a write as soon as any of it is. A daemon that reads a little at a time is
+ * reading, and a client that waited for the call alone would count it as one that
+ * takes nothing. */
+STM_TEST(p9_client_wait_takes_a_daemon_that_reads_a_little_at_a_time_for_one_that_reads)
+{
+    fake_daemon d;
+    fake_daemon_start(&d, "wait_little", FAKE_READS_A_LITTLE, STM_9P_MSIZE_MAX);
+    leave_from l = { 0, 0 };
+    stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_dial_opts o = default_dial_opts(100);
+    o.msize = STM_9P_MSIZE_MAX;
+    o.wait = &w;
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    uint8_t *big = calloc(1, WAIT_LITTLE);
+    STM_ASSERT(big != NULL);
+    uint32_t written = 0;
+    uint64_t began = test_mono_ms();
+    stm_status rc = stm_9p_write(c, 100, 0, big, WAIT_LITTLE, &written);
+    uint64_t took = test_mono_ms() - began;
+    free(big);
+    STM_ASSERT_OK(rc);
+    STM_ASSERT_EQ(written, WAIT_LITTLE);
+    /* Taken inside the limit, it proves nothing. */
+    STM_ASSERT(took > 2u * WAIT_LIMIT_MS);
+    stm_9p_close(c);
+    fake_daemon_stop(&d);
+}
+
+/* A listener whose backlog is full and that accepts no one. Should a dial still be
+ * waiting at it LISTENER_LETS_IN_MS on, it starts to accept, so that a dial which
+ * waits in the kernel fails its test and does not hold it. */
+#define LISTENER_LETS_IN_MS 5000u
+typedef struct {
+    int         listen_fd;
+    atomic_bool done;
+    atomic_bool let_in;
+    pthread_t   thread;
+} full_listener;
+
+static void *full_listener_thread(void *arg)
+{
+    full_listener *fl = arg;
+    uint64_t until = test_mono_ms() + LISTENER_LETS_IN_MS;
+    while (!atomic_load(&fl->done) && test_mono_ms() < until) test_sleep_ms(20);
+    while (!atomic_load(&fl->done)) {
+        struct pollfd p = { .fd = fl->listen_fd, .events = POLLIN, .revents = 0 };
+        atomic_store(&fl->let_in, true);
+        /* Taken and never answered, and left open to the end of the run. */
+        if (poll(&p, 1, 20) > 0) (void)accept(fl->listen_fd, NULL, NULL);
+    }
+    return NULL;
+}
+
+/* A dial waits for its daemon to take it. On Linux a listener with a full backlog
+ * holds a connect that may wait, for as long as nobody accepts; macOS refuses it at
+ * once. What a connect that does not wait is told says which this system does. */
+STM_TEST(p9_client_wait_gives_up_a_dial_that_a_listener_does_not_take)
+{
+    build_sock_path("wait_dial");
+    (void)unlink(g_sock_path);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    STM_ASSERT(strlen(g_sock_path) < sizeof addr.sun_path);
+    memcpy(addr.sun_path, g_sock_path, strlen(g_sock_path) + 1);
+    full_listener fl;
+    memset(&fl, 0, sizeof fl);
+    atomic_init(&fl.done, false);
+    atomic_init(&fl.let_in, false);
+    fl.listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    STM_ASSERT(fl.listen_fd >= 0);
+    STM_ASSERT_EQ(bind(fl.listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    STM_ASSERT_EQ(listen(fl.listen_fd, 1), 0);
+
+    /* Connects that do not wait, until one is not taken. */
+    enum { FILL_MOST = 64 };
+    int filler[FILL_MOST];
+    int filled = 0, told = 0;
+    while (filled < FILL_MOST) {
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        STM_ASSERT(fd >= 0);
+        STM_ASSERT_EQ(fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK), 0);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+            told = errno;
+            close(fd);
+            break;
+        }
+        filler[filled++] = fd;
+    }
+    STM_ASSERT(filled > 0 && filled < FILL_MOST);
+    STM_ASSERT(told == EAGAIN || told == ECONNREFUSED);
+    STM_ASSERT_EQ(pthread_create(&fl.thread, NULL, full_listener_thread, &fl), 0);
+
+    leave_from l = { 0, 0 };
+    stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_dial_opts o = default_dial_opts(100);
+    o.wait = &w;
+    stm_9p_client *c = NULL;
+    uint64_t began = test_mono_ms();
+    errno = 0;
+    stm_status rc = stm_9p_dial_unix(g_sock_path, &o, &c);
+    int why = errno;
+    uint64_t took = test_mono_ms() - began;
+    bool let_in = atomic_load(&fl.let_in);
+    atomic_store(&fl.done, true);
+    pthread_join(fl.thread, NULL);
+    for (int i = 0; i < filled; i++) close(filler[i]);
+    close(fl.listen_fd);
+    (void)unlink(g_sock_path);
+    if (c) stm_9p_close(c);
+
+    STM_ASSERT_EQ(rc, STM_EIO);
+    STM_ASSERT(c == NULL);
+    /* The listener had to let it in: it waited where no asking reaches. */
+    STM_ASSERT(!let_in);
+    if (told == EAGAIN) {
+        /* Held, and given up a limit after the asking. */
+        STM_ASSERT_EQ(why, ETIMEDOUT);
+        STM_ASSERT(took >= WAIT_LIMIT_MS - 2u * WAIT_TICK_MS);
+        STM_ASSERT(l.said <= WAIT_MOST_ASKINGS);
+    } else {
+        STM_ASSERT_EQ(why, ECONNREFUSED);
+    }
 }
 
 STM_TEST_MAIN("9p_client")
