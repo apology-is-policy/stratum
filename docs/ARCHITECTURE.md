@@ -5481,7 +5481,9 @@ Daemon shutdown:
 4. Close devices.
 5. Exit.
 
-On signal-induced shutdown (SIGTERM): same as clean shutdown but with a timeout (default 30 s); forced unmount beyond timeout.
+On a signal (SIGINT or SIGTERM): the clean shutdown above, with no deadline of the daemon's own and no forced unmount. The listeners stop accepting; each connection stops reading and the request it has in hand is answered, and a reply held up by a client that is not reading is cut off after 2 s. The final commit and the unmount then take as long as they take.
+
+As built, that is all `stratumd` does. An earlier text here promised a 30 s timeout with a forced unmount beyond it, which was never built. Whoever started the daemon may set a deadline of its own: the manager kills a daemon 30 s after asking it to stop, and a final commit slower than that loses what it had not yet written. A deadline that tells a slow commit from a stuck one is future work (`docs/PRODUCTION-PLAN.md`, T5.18).
 
 On SIGKILL: no cleanup. On next start, crash recovery (§12.12) activates.
 
