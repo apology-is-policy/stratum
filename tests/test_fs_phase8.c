@@ -7452,9 +7452,10 @@ STM_TEST(fs_two_directory_moves_cannot_close_a_ring) {
     struct fs_mv_gap g = { .at = STM_FS_RENAME_WALK_CHECKED, .other = &second };
     stm_fs_set_rename_walk_hook_for_test(fs, fs_mv_gap_hook, &g);
     stm_status first = stm_fs_rename(fs, 1, p, (const uint8_t *)"a", 1, d, (const uint8_t *)"a", 1, 0);
-    stm_fs_set_rename_walk_hook_for_test(fs, NULL, NULL);
     STM_ASSERT_TRUE(g.fired);
-    STM_ASSERT_EQ(pthread_join(g.th, NULL), 0);
+    /* The other rename walks too, and reads the hook as it goes: the hook stays until it has ended. */
+    if (g.fired) STM_ASSERT_EQ(pthread_join(g.th, NULL), 0);
+    stm_fs_set_rename_walk_hook_for_test(fs, NULL, NULL);
 
     STM_ASSERT_OK(first);
     STM_ASSERT_TRUE(!g.other_done_in_gap);
@@ -7495,9 +7496,10 @@ STM_TEST(fs_a_directory_rename_waits_for_the_walk) {
     struct fs_mv_gap g = { .at = STM_FS_RENAME_WALK_DIR, .other = &second };
     stm_fs_set_rename_walk_hook_for_test(fs, fs_mv_gap_hook, &g);
     stm_status first = stm_fs_rename(fs, 1, root, (const uint8_t *)"x", 1, z, (const uint8_t *)"x", 1, 0);
-    stm_fs_set_rename_walk_hook_for_test(fs, NULL, NULL);
     STM_ASSERT_TRUE(g.fired);
-    STM_ASSERT_EQ(pthread_join(g.th, NULL), 0);
+    /* The other rename walks too, and reads the hook as it goes: the hook stays until it has ended. */
+    if (g.fired) STM_ASSERT_EQ(pthread_join(g.th, NULL), 0);
+    stm_fs_set_rename_walk_hook_for_test(fs, NULL, NULL);
 
     STM_ASSERT_EQ(first, STM_EINVAL);
     STM_ASSERT_TRUE(!g.other_done_in_gap);

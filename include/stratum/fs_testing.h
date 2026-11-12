@@ -153,7 +153,8 @@ typedef void (*stm_fs_rename_rollback_hook)(bool wedged, void *arg);
 /*
  * Call `fn` where a rename of a directory holds its turn: after each directory of its walk down the
  * subtree, and once the walk has found the target is not under it. `fn` may start another rename and
- * wait a bounded time for it. NULL restores it.
+ * wait a bounded time for it. NULL restores it. A rename reads the hook as it walks, under no lock
+ * of the hook's: set it and clear it only while no rename runs.
  */
 typedef void (*stm_fs_rename_walk_hook)(stm_fs_rename_walk_point at, void *arg);
 void stm_fs_set_rename_walk_hook_for_test(stm_fs *fs,

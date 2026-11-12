@@ -137,24 +137,26 @@ static int drain_cqes(iouring_bdev *d, int max_events, bool blocking)
         int res = cqe->res;
         io_uring_cqe_seen(&d->ring, cqe);
 
+        /* The slot was filled under d->lock by the thread that submitted the op,
+         * which need not be this one. Only the kernel's round trip puts that
+         * before this, and nothing in the program says so: read it under the lock. */
+        pthread_mutex_lock(&d->lock);
         stm_op_result result = { .kind = p->kind, .user = p->user };
+        stm_bdev_completion_cb cb = p->cb;
+        pending_release(d, p);
+        atomic_fetch_sub(&d->inflight, 1);
+        pthread_mutex_unlock(&d->lock);
+
         if (res < 0) {
             result.status = errno_to_status_ur(-res);
             result.bytes  = 0;
-        } else if (p->kind == STM_OP_FSYNC) {
+        } else if (result.kind == STM_OP_FSYNC) {
             result.status = STM_OK;
             result.bytes  = 0;
         } else {
             result.status = STM_OK;
             result.bytes  = (size_t)res;
         }
-
-        stm_bdev_completion_cb cb = p->cb;
-
-        pthread_mutex_lock(&d->lock);
-        pending_release(d, p);
-        atomic_fetch_sub(&d->inflight, 1);
-        pthread_mutex_unlock(&d->lock);
 
         cb(&result);
         delivered++;

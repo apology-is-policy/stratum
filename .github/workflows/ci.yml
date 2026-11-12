@@ -159,7 +159,7 @@ jobs:
         # key and key link need; asked for and not to be had, the run fails.
         env:
           STRATUM_TEST_SUDO: 1
-        run: tests/volume_smoke.sh dist/stratum
+        run: bash tests/volume_smoke.sh dist/stratum
 
       - name: a daemon's stop with clients still connected
         run: python3 tests/stop_with_clients.py dist/stratum
