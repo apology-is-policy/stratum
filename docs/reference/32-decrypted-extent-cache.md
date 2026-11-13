@@ -101,6 +101,27 @@ The probe is reached from two shapes:
   **and the plaintext memcpy both run under the pin**; no pointer into
   the cache escapes it. The miss fetch runs UNPINNED (a pin must never
   span the blocking bdev read).
+- **A failed unlocked fetch is not the live read's answer.** The live
+  path's record is a copy, and the pin it was taken under has been left
+  by the time the miss body runs; the miss body resolves the record's key
+  under a second pin. A key rotation, a rewrite of the extent and a
+  keyschema sweep between the two leave the record stale and its key
+  pruned, and the fetch fails with `STM_ECORRUPT` of data that is whole; a
+  commit that gives the old blocks out again, or the collection of a
+  content entry, fails it the same way. So `stm_sync_read_extent` takes
+  any failure of the unlocked fetch as no answer and makes the read again
+  on the serial locked path (`stm_sync_read_extent_locked`), where the
+  lookup and the use of the record are one span under `s->lock`, which
+  the sweep, an overwrite's indexing, a commit and the content-entry
+  collection all take. That result, success or error, is the read's. The
+  snap read keeps its unlocked result: its record is from a frozen tree,
+  whose keys, blocks and content entries the snapshot holds while it is
+  there (the sweep counts a snapshot's references), and the filesystem
+  holds `fs->global` shared across a snapshot read while a snapshot's
+  deletion takes it exclusive. Staged by
+  `rc2_read_outlives_its_records_key` through
+  `stm_sync_set_read_prefetch_hook_for_test`, which fires on the
+  lock-free fetch only.
 - **The under-lock compounds** (truncate / migrate / snap-view / send via
   `sync_decrypt_extent_record_locked`): the RC-1 protocol verbatim —
   resolve the thread's EBR handle (`stm_ebr_thread_current()`; a NULL —

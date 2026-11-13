@@ -220,6 +220,26 @@ fence is in enter; never remove or weaken it.
   (whole-file rewrite in ONE call = the atomicity unit; truncate churn),
   and the pin-mode semantics (SH||SH coexist, SH excludes EX, EX excludes
   SH).
+- **Amended 2026-11-13 (`fc24bfc`): a failed lock-free fetch falls back
+  to the locked path.** As built above, the live read's miss body runs on
+  a by-value record with no pin, and resolves the record's DEK under a
+  short pin of its own. Between the lookup's pin and that one, a rotate,
+  an overwrite of the extent and a keyschema sweep leave the record stale
+  and its key pruned (the sweep counts the live tree's and the snapshots'
+  references, where the record no longer is), and the read failed with
+  `STM_ECORRUPT` of data that is whole. RC-3 closed this window for
+  writes (re-validate, retry, locked fallback); reads kept it. The
+  hammer's "zero read failures" held by chance: it failed once in CI
+  (run 43333293980, Linux, gcc, asan: 1 read of 8000). Now any failure of
+  the unlocked fetch sends the read to `stm_sync_read_extent_locked`,
+  under `s->lock`, where the record is looked up and used in one span;
+  that result is the read's. The snap read is unchanged (a frozen tree's
+  record does not go stale while its snapshot is there, and the fs holds
+  `fs->global` shared across the read against the snapshot's deletion).
+  Witness: `rc2_read_outlives_its_records_key`, staged through the
+  `stm_sync_set_read_prefetch_hook_for_test` seam. Not established: that
+  the CI failure was this mechanism; the hammer keeps the first failing
+  status now.
 
 ### RC-3 — retire `s->lock` from the WRITE path (user-voted scope)
 
