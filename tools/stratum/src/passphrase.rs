@@ -499,6 +499,26 @@ extern "C" fn stop_and_interrupt(sig: libc::c_int) {
     }
 }
 
+/// While this lives, a stop for the terminal interrupts what it stopped: a write made from
+/// behind fails with EINTR on each continue, where the kernel would make it again and stop
+/// again, whatever was asked meanwhile never looked at. Nothing is taken over where
+/// something else has SIGTTOU, a handler or an ignore.
+pub(crate) struct StopsInterrupt(Option<libc::sigaction>);
+
+impl StopsInterrupt {
+    pub(crate) fn new() -> Self {
+        Self(take_over(libc::SIGTTOU, &action(stop_and_interrupt, 0)))
+    }
+}
+
+impl Drop for StopsInterrupt {
+    fn drop(&mut self) {
+        if let Some(old) = self.0 {
+            unsafe { libc::sigaction(libc::SIGTTOU, &old, std::ptr::null_mut()) };
+        }
+    }
+}
+
 /// The most a passphrase may be: what `--passphrase-stdin` takes (STM_CLI_PASSPHRASE_MAX).
 pub const PASSPHRASE_MAX: usize = 255;
 

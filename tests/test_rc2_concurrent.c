@@ -575,8 +575,9 @@ STM_TEST(rc2_read_outlives_its_records_key) {
 
 /* The same window, its other arm: the key stays and the block goes.
  * Before the reader uses its record the extent is written again, so
- * the block the record names is freed; two commits make it free to
- * take; and writes to other files go on until one of them takes it.
+ * the block the record names is freed; two commits, one after the
+ * other, make it free to take; and writes to other files go on until
+ * one of them takes it.
  * The record then names a block that holds another extent's
  * ciphertext, and the data is whole, elsewhere. A filesystem does all
  * of this to a reader on a pool near full: a write that finds no
@@ -613,18 +614,18 @@ static void reuse_hook(void *arg)
     rc2_fill(w, 1u, 1u, DRH_LEN);
     h->st = stm_sync_write_extent(h->s, 1u, 1u, 0u, w, DRH_LEN);
     if (h->st == STM_OK) h->st = rbl_paddr_of(h->s, 1u, &h->new_paddr);
-    /* A block freed at one generation is free to take once a commit of
-     * a later one has swept it: the first commit makes the free
-     * durable, the second, of a tree changed since, sweeps it. */
+    /* A block is freed at the generation of the write that replaced
+     * it, and a commit sweeps what was freed before the generation it
+     * commits. So the first commit only makes the free durable, and
+     * the second, of the next generation, sweeps it: nothing has to
+     * change in between, the sweep itself is the change the second
+     * one writes. */
     if (h->st == STM_OK) h->st = stm_sync_commit(h->s);
-    rc2_fill(w, 2u, 0u, DRH_LEN);
-    if (h->st == STM_OK)
-        h->st = stm_sync_write_extent(h->s, 1u, 2u, 0u, w, DRH_LEN);
     if (h->st == STM_OK) h->st = stm_sync_commit(h->s);
 
     /* Other files' extents, until one sits where the record points. */
-    for (uint64_t ino = 3u; h->st == STM_OK && h->taker_ino == 0u &&
-                            ino < 3u + RBL_TRIES; ino++) {
+    for (uint64_t ino = 2u; h->st == STM_OK && h->taker_ino == 0u &&
+                            ino < 2u + RBL_TRIES; ino++) {
         uint64_t at = 0;
         rc2_fill(w, ino, 0u, DRH_LEN);
         h->st = stm_sync_write_extent(h->s, 1u, ino, 0u, w, DRH_LEN);

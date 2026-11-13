@@ -386,6 +386,16 @@ uint64_t stm_alloc_avail_netfree_blocks(const stm_alloc *a);
  * production caller does, or rides other dirt — e.g. the fs unlink
  * path's reclaim double-commit).
  *
+ * As built, the last two sentences say too much. A commit sweeps
+ * first, and the sweep is itself a change that commit writes: so the
+ * second of two commits made one after the other reclaims a free
+ * stamped with the generation current at the free, with nothing else
+ * changed in between (tests/test_rc2_concurrent.c,
+ * rc2_read_outlives_its_records_block). And the sync layer's drops of
+ * replaced blocks stamp the current generation, not one at or below
+ * the authoritative: they are reclaimed that way, by the commit after
+ * the one that made them durable.
+ *
  * Returns STM_ENOENT if no entry starts at `paddr`.
  */
 STM_MUST_USE

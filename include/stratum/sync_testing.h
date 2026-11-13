@@ -124,7 +124,9 @@ void stm_sync_set_read_prepopulate_hook_for_test(stm_sync *s,
  * uses anything its extent record names. The record is a copy by then
  * and no pin and no lock is held, so a hook may rotate, overwrite and
  * sweep: that is the window in which the record's key can be pruned
- * under the reader. It does NOT fire on locked-context fetches, the
+ * under the reader. It may as well overwrite, commit and write other
+ * files: the window in which the record's blocks can be given out
+ * again. It does NOT fire on locked-context fetches, the
  * read's own second attempt among them, so a hook that takes s->lock
  * is safe. Pass hook=NULL to clear.
  */

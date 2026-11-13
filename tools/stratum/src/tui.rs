@@ -577,6 +577,11 @@ pub(crate) fn say_on_stderr(line: &str) {
     if stop_asked() {
         crate::embed::never_stop_for_the_terminal();
     }
+    // A line begun before the stop can be what the manager is stopped at when the stop
+    // comes: written from behind under tostop it stopped the job there, and the shell's
+    // `kill` continues it into the same write, which made again would stop it again. So a
+    // stop for the terminal interrupts a line's write, and each continue asks first.
+    let _interrupted = crate::passphrase::StopsInterrupt::new();
     static SAME: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
     let own = *SAME.get_or_init(|| {
         let fd = own_output()?;
@@ -593,7 +598,20 @@ pub(crate) fn say_on_stderr(line: &str) {
             let _ = out.write_all(line.as_bytes());
         }
         None => {
-            let _ = std::io::stderr().write_all(line.as_bytes());
+            // write_all would make an interrupted write again without asking.
+            let (mut err, mut left) = (std::io::stderr(), line.as_bytes());
+            while !left.is_empty() {
+                match err.write(left) {
+                    Ok(0) => break,
+                    Ok(n) => left = &left[n..],
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                        if stop_asked() {
+                            crate::embed::never_stop_for_the_terminal();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         }
     }
 }
@@ -621,7 +639,14 @@ impl io::Write for OwnOutput {
             }
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
+                Some(libc::EINTR) => {
+                    // Stopped for the terminal and continued, the write is made again: a
+                    // stop asked meanwhile must not find it stopped there a second time.
+                    if stop_asked() {
+                        crate::embed::never_stop_for_the_terminal();
+                    }
+                    continue;
+                }
                 Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {}
                 _ => return Err(err),
             }

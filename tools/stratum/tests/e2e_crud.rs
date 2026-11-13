@@ -583,7 +583,6 @@ fn copy_200mb_file_roundtrip() {
     let sock = s.stratumd_sock.clone();
     let body_size: u64 = 200 * 1024 * 1024;
     // Pipe `dd if=/dev/zero bs=1M count=200` → `stratum fs write`.
-    use std::io::Write;
     let mut child = std::process::Command::new(&bin)
         .args(["fs", "-s", sock.to_str().unwrap(), "write", "/big.bin"])
         .stdin(Stdio::piped())
@@ -593,8 +592,12 @@ fn copy_200mb_file_roundtrip() {
         .unwrap();
     let mut sin = child.stdin.take().unwrap();
     let chunk = vec![0u8; 1024 * 1024];
+    let mut taken = true;
     for _ in 0..200 {
-        sin.write_all(&chunk).expect("write chunk");
+        taken = common::feed(&mut sin, &chunk).expect("write chunk");
+        if !taken {
+            break;
+        }
     }
     drop(sin);
     let out = child.wait_with_output().unwrap();
@@ -604,6 +607,7 @@ fn copy_200mb_file_roundtrip() {
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(taken, "200 MB write ended 0 without reading what it was given");
     // Verify size.
     let (code, stat_out, _) = s
         .fs_run(&sock, &["stat", "/big.bin"], Stdio::null())
@@ -684,7 +688,6 @@ fn many_concurrent_clients_against_one_daemon() {
         let sock = sock.clone();
         handles.push(thread::spawn(move || -> Result<(), String> {
             for i in 0..10u32 {
-                use std::io::Write as _;
                 let mut child = std::process::Command::new(&bin)
                     .args(["fs", "-s", sock.to_str().unwrap(),
                            "write", &format!("/concur/t{tid}-i{i}.bin")])
@@ -693,12 +696,16 @@ fn many_concurrent_clients_against_one_daemon() {
                     .stderr(Stdio::piped())
                     .spawn()
                     .map_err(|e| e.to_string())?;
-                if let Some(mut sin) = child.stdin.take() {
-                    sin.write_all(format!("t{tid}-i{i}\n").as_bytes())
-                        .map_err(|e| e.to_string())?;
-                }
+                let taken = match child.stdin.take() {
+                    Some(mut sin) => common::feed(&mut sin, format!("t{tid}-i{i}\n").as_bytes())
+                        .map_err(|e| e.to_string())?,
+                    None => true,
+                };
                 let out = child.wait_with_output()
                     .map_err(|e| e.to_string())?;
+                if out.status.success() && !taken {
+                    return Err(format!("write t{tid}-i{i} ended 0 without reading what it was given"));
+                }
                 if !out.status.success() {
                     return Err(format!("write t{tid}-i{i} (exit {}): {}",
                         out.status.code().unwrap_or(-1),
@@ -1064,11 +1071,12 @@ fn ctl_snapshots_subtree_lists_and_materializes() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn stratum fs write");
-        use std::io::Write as _;
-        if let Some(mut sin) = child.stdin.take() {
-            sin.write_all(name).unwrap();
-        }
+        let taken = match child.stdin.take() {
+            Some(mut sin) => common::feed(&mut sin, name).unwrap(),
+            None => true,
+        };
         let out = child.wait_with_output().expect("wait");
+        assert!(taken || !out.status.success(), "create-snapshot ended 0 without reading the name");
         let stderr = String::from_utf8_lossy(&out.stderr);
         // Only acceptable failure is the post-op fsync ENOTSUPPORTED
         // ("status=-205"). Anything else is a real test failure.
@@ -1188,11 +1196,12 @@ fn ctl_snapshots_lineage_chain_coherent() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn stratum fs write");
-        use std::io::Write as _;
-        if let Some(mut sin) = child.stdin.take() {
-            sin.write_all(name).unwrap();
-        }
+        let taken = match child.stdin.take() {
+            Some(mut sin) => common::feed(&mut sin, name).unwrap(),
+            None => true,
+        };
         let out = child.wait_with_output().expect("wait");
+        assert!(taken || !out.status.success(), "create-snapshot ended 0 without reading the name");
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() && !stderr.contains("status=-205") {
             panic!("create-snapshot failed (exit {:?}): {}",

@@ -50,6 +50,24 @@ class Failure(Exception):
     pass
 
 
+class Lost(Exception):
+    """A staging that did not hold: the process to be stopped in time was stopped late. It is
+    raised before anything of a leg's subject is asked or measured."""
+
+
+def staged(how, once, attempts=3):
+    """A leg that has to stop a process inside a window of the manager's start depends on when
+    this process runs, and on a busy machine the stop can land after the window. Such a staging
+    is seen to be lost before anything is measured, and is made again: each one lost is noted,
+    and a leg none of whose stagings held fails as one that proves nothing."""
+    for n in range(1, attempts + 1):
+        try:
+            return once()
+        except Lost as e:
+            print(f'note: {how}: staging {n} of {attempts} did not hold: {e}', flush=True)
+    raise Failure(f'{how}: none of {attempts} stagings held: it proves nothing')
+
+
 class Screen:
     """Just enough of a terminal for ratatui: moves, clears and text. Attributes are dropped."""
 
@@ -1298,7 +1316,7 @@ def stuck_start_leg(stratum, vol, host, root):
              ('host-fs stuck while a manager with no volume starts', ['--host', host], False,
               lambda said: ' host-fs ' in said, 'host-fs.sock', 2))
     for how, args, sealed, is_it, sock_name, daemons in cases:
-        stuck_start(stratum, vol, how, args, sealed, is_it, sock_name, daemons)
+        staged(how, lambda: stuck_start(stratum, vol, how, args, sealed, is_it, sock_name, daemons))
 
 
 def stuck_start(stratum, vol, how, args, sealed, is_it, sock_name, daemons):
@@ -1337,9 +1355,19 @@ def stuck_start(stratum, vol, how, args, sealed, is_it, sock_name, daemons):
         said = {p: command_of(p).strip() for p in session_daemons(session)}
         term.pump(3)
         screen_up = b'\x1b[?1049h' in bytes(term.raw)
-        if len(said) < daemons or screen_up or os.waitpid(term.pid, os.WNOHANG)[0] != 0:
-            raise Failure(f'{how}: the daemons are {sorted(said.values())}, the screen came up: {screen_up}, '
-                          f'the socket was there before it was looked for: {there_already}: it proves nothing')
+        gone = os.waitpid(term.pid, os.WNOHANG)[0] != 0
+        what = (f'the daemons are {sorted(said.values())}, the screen came up: {screen_up}, '
+                f'the socket was there before it was looked for: {there_already}')
+        if screen_up and len(said) >= daemons and not gone:
+            # The daemon answered before it was stopped, and the start went on to its screen.
+            # The manager is ended as a stop ends it, its daemons with it.
+            os.kill(stuck, signal.SIGCONT)
+            os.kill(term.pid, signal.SIGTERM)
+            term.exited(60)
+            signal_each(session_daemons(session), signal.SIGKILL)
+            raise Lost(what)
+        if len(said) < daemons or screen_up or gone:
+            raise Failure(f'{how}: {what}: it proves nothing')
         seen = len(term.raw)
         os.kill(term.pid, signal.SIGTERM)
         began = time.monotonic()
@@ -2341,55 +2369,114 @@ def screen_started_behind_leg(stratum, root):
             job_cleanup(term, [], None)
 
 
+def not_stopped_for_a_write(term, manager):
+    """Why a write of the manager's to this terminal would not stop it, or '': `stty tostop`
+    is not set there, or the manager's group is the one in front. A leg that looks for no
+    stop passes with either missing, and with nothing of its subject tested."""
+    if not termios.tcgetattr(term.fd)[3] & termios.TOSTOP:
+        return 'tostop is not set on the terminal'
+    if os.tcgetpgrp(term.fd) == os.getpgid(manager):
+        return 'the manager is in front'
+    return ''
+
+
+def set_tostop(term, on):
+    """As `stty tostop` and `stty -tostop` typed at the shell."""
+    a = termios.tcgetattr(term.fd)
+    a[3] = a[3] | termios.TOSTOP if on else a[3] & ~termios.TOSTOP
+    termios.tcsetattr(term.fd, termios.TCSANOW, a)
+
+
+def behind_at_its_warning(stratum, root, name, how, job):
+    """Starts a manager behind a job shell, `stty tostop` set, told to write its sockets to a
+    file that is there already. It warns that it will not write over the file, and that line,
+    written from behind, stops the job, as tostop has it: both daemons up, neither asked for a
+    panel yet, the start not done. The manager stops itself there, at one known place, so a
+    leg that needs it held at that place races nothing. `job` gets the terminal, the manager
+    and its session directory as each is known, for the leg's cleanup. Returns the daemons'
+    command lines by pid and the file."""
+    w = f'{root}/{name}'
+    os.makedirs(w, exist_ok=True)
+    env_file, report = f'{root}/{name}.env', f'{root}/{name}.report'
+    with open(env_file, 'w') as f:
+        f.write('taken\n')
+    if os.path.exists(report):
+        os.unlink(report)
+    term = job['term'] = Term([sys.executable, '-I', '-c', JOB_SHELL, '--behind', '--editor', '--tostop',
+                               f'--report={report}', stratum, 'tui', '--host', w, '--print-env-to', env_file])
+    limit = time.monotonic() + 60
+    manager = None
+    while manager is None and time.monotonic() < limit:
+        kids = subprocess.run(['pgrep', '-P', str(term.pid)], capture_output=True, text=True).stdout.split()
+        manager = job['manager'] = int(kids[0]) if kids else None
+    state = ''
+    while manager is not None and 'T' not in state and time.monotonic() < limit:
+        term.pump(0.2)
+        state = state_of(manager)
+    found = session_dir_guesses(manager, term.started) if manager is not None else set()
+    session = job['session'] = found.pop() if len(found) == 1 else None
+    said = {int(p): command_of(p).strip() for p in session_daemons(session)} if session else {}
+    stops = open(report).read().split() if os.path.exists(report) else []
+    why_not = not_stopped_for_a_write(term, manager) if manager is not None else 'no manager'
+    # Stopped once, by SIGTTOU, with both daemons up, the line not on the terminal and nothing
+    # drawn or set: the manager is in the write of its warning.
+    if ('T' not in state or stops != ['stopped', str(int(signal.SIGTTOU))] or len(said) != 2 or why_not
+            or sum(' host-fs ' in c for c in said.values()) != 1
+            or b'print-env-to' in bytes(term.raw) or b'\x1b[?1049h' in bytes(term.raw)
+            or tty_modes(term) != EDITOR_MODES):
+        raise Failure(f'{how}: the manager\'s state {state!r}, its stops {stops}, the daemons {sorted(said.values())}, '
+                      f'{why_not or "behind under tostop"}, the terminal {tty_modes(term)}, on it '
+                      f'{bytes(term.raw)[-200:]!r}: it proves nothing')
+    return said, env_file
+
+
+def behind_cleanup(job, stuck=None):
+    for pid in (job.get('manager'), stuck):
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+    if job.get('term') is not None:
+        job_cleanup(job['term'], [], job.get('session'))
+    if job.get('session'):
+        signal_each(session_daemons(job['session']), signal.SIGKILL)
+
+
 def stuck_start_behind_leg(stratum, root):
     """A stop asked while a manager started behind its shell starts, `stty tostop` set. What it
     says of its end is written from behind, and under tostop each line would stop the job where
     it stood: the first comes before slate is killed, so the daemons would stay, and a TERM,
     held blocked, could not end it until `fg`. host-fs is the daemon that does not answer, as
-    in stuck_start_leg. The manager is held stopped from its first child until host-fs is, so
-    that nothing is asked of host-fs before."""
+    in stuck_start_leg, and here it is stopped with nothing raced: the manager first stops
+    itself at its warning (behind_at_its_warning), host-fs is stopped while it is, and the
+    warning is then let through with tostop off for that line, as `stty -tostop` would. The
+    manager goes on to ask for its first panel, and waits."""
     how = 'host-fs stuck while a manager behind its shell starts, tostop set'
     given_up = 10  # tui.rs HELD_AFTER, in seconds
-    w = f'{root}/behind-start'
-    os.makedirs(w, exist_ok=True)
-    term = Term([sys.executable, '-I', '-c', JOB_SHELL, '--behind', '--editor', '--tostop', stratum, 'tui', '--host', w])
-    manager, stuck, session = None, None, None
+    job, stuck = {}, None
     try:
-        limit = time.monotonic() + 60
-        while manager is None and time.monotonic() < limit:
-            kids = subprocess.run(['pgrep', '-P', str(term.pid)], capture_output=True, text=True).stdout.split()
-            manager = int(kids[0]) if kids else None
-        first = []
-        while manager is not None and not first and time.monotonic() < limit:
-            first = subprocess.run(['pgrep', '-P', str(manager)], capture_output=True, text=True).stdout.split()
-        if not first:
-            raise Failure(f'{how}: no manager with a child under the job shell: it proves nothing')
-        os.kill(manager, signal.SIGSTOP)
-        serving = [c for c in first if ' host-fs ' in command_of(c)]
-        found = session_dir_guesses(manager, term.started)
-        if len(serving) != 1 or len(found) != 1 or ' tui ' not in command_of(manager):
-            raise Failure(f'{how}: the manager\'s first children are {[command_of(c).strip() for c in first]}, its session '
-                          f'directories {sorted(found)}: it proves nothing')
-        stuck, session = int(serving[0]), found.pop()
-        sock = f'{session}/host-fs.sock'
-        while not os.path.exists(sock) and time.monotonic() < limit:
-            time.sleep(0.0005)
+        said, _ = behind_at_its_warning(stratum, root, 'behind-start', how, job)
+        term, manager, session = job['term'], job['manager'], job['session']
+        stuck = [p for p, c in said.items() if ' host-fs ' in c][0]
         os.kill(stuck, signal.SIGSTOP)
-        only_host_fs = len(session_daemons(session)) == 1
-        os.kill(manager, signal.SIGCONT)
-        # slate comes up, is asked for the first panel and asks host-fs.
+        set_tostop(term, False)
+        os.killpg(os.getpgid(manager), signal.SIGCONT)
         limit = time.monotonic() + 15
-        while len(session_daemons(session)) < 2 and time.monotonic() < limit:
+        while b'print-env-to' not in bytes(term.raw) and time.monotonic() < limit:
             term.pump(0.1)
-        said = {p: command_of(p).strip() for p in session_daemons(session)}
+        set_tostop(term, True)
+        # The first panel is asked for, and slate asks host-fs.
         term.pump(3)
         state = state_of(manager)
         screen_up = b'\x1b[?1049h' in bytes(term.raw)
-        if (not only_host_fs or len(said) < 2 or screen_up or 'T' in state or not state
-                or tty_modes(term) != EDITOR_MODES):
-            raise Failure(f'{how}: slate was there before host-fs was stopped: {not only_host_fs}, the daemons are '
-                          f'{sorted(said.values())}, the screen came up: {screen_up}, the manager\'s state {state!r}, the '
-                          f'terminal {tty_modes(term)}: it proves nothing')
+        why_not = not_stopped_for_a_write(term, manager)
+        if (b'print-env-to' not in bytes(term.raw) or len(session_daemons(session)) != 2 or screen_up or 'T' in state
+                or not state or tty_modes(term) != EDITOR_MODES or why_not):
+            raise Failure(f'{how}: the warning went out: {b"print-env-to" in bytes(term.raw)}, the daemons are '
+                          f'{[command_of(p).strip() for p in session_daemons(session)]}, the screen came up: {screen_up}, '
+                          f'the manager\'s state {state!r}, the terminal {tty_modes(term)}, '
+                          f'{why_not or "behind under tostop"}: it proves nothing')
         seen = len(term.raw)
         # As `kill %1` on a job that runs.
         os.kill(manager, signal.SIGTERM)
@@ -2417,25 +2504,69 @@ def stuck_start_behind_leg(stratum, root):
                    f'{how}: the manager ended {took:.1f} s after the SIGTERM, not after {given_up} s and two 30 s deadlines')
             left = session_daemons(session)
             record(not left, f'{how}: no daemon is left',
-                   f'{how}: {[said.get(p, command_of(p).strip()) for p in left]} still run, with no manager')
+                   f'{how}: {[said.get(int(p), command_of(p).strip()) for p in left]} still run, with no manager')
             record(not os.path.exists(session), f'{how}: the session directory is gone',
                    f'{how}: the session directory stayed')
             modes = tty_modes(term)
             record(modes == EDITOR_MODES, f'{how}: the shell\'s mode was left as the shell set it',
                    f'{how}: the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
     except Failure:
-        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        if job.get('term') is not None:
+            print(f'--- screen at the failure\n{job["term"].screen.text()}\n---', flush=True)
         raise
     finally:
-        for pid in (manager, stuck):
-            if pid is not None:
-                try:
-                    os.kill(pid, signal.SIGCONT)
-                except ProcessLookupError:
-                    pass
-        job_cleanup(term, [], session)
-        if session:
-            signal_each(session_daemons(session), signal.SIGKILL)
+        behind_cleanup(job, stuck)
+
+
+def stopped_at_a_line_leg(stratum, root):
+    """A stop asked of a manager that a line of its own has stopped: behind its shell under
+    `stty tostop`, in the write of its warning (behind_at_its_warning). `kill %1` sends TERM
+    and CONT. The manager is continued inside that write, and made again as it was the write
+    would stop it again, the TERM, held blocked through the start, never looked at, and the
+    daemons serving until `fg`."""
+    how = 'a manager stopped behind at a line of its own, tostop set'
+    job = {}
+    try:
+        said, env_file = behind_at_its_warning(stratum, root, 'behind-line', how, job)
+        term, manager, session = job['term'], job['manager'], job['session']
+        seen = len(term.raw)
+        # As `kill %1` on a stopped job: the signal, then a continue, to its group.
+        os.killpg(os.getpgid(manager), signal.SIGTERM)
+        os.killpg(os.getpgid(manager), signal.SIGCONT)
+        began = time.monotonic()
+        ended, stopped = False, ''
+        while not ended and not stopped and time.monotonic() - began < 90:
+            ended = term.exited(1)
+            if not ended and 'T' in state_of(manager):
+                stopped = state_of(manager)
+        took = time.monotonic() - began
+        words = ' | '.join(l.strip() for l in bytes(term.raw[seen:]).decode('utf-8', 'replace').splitlines() if l.strip())
+        print(f'note: {how}: after the stop was asked the manager said: {words[:600]}', flush=True)
+        record(ended and term.rc == 1 and not stopped,
+               f'{how}: the stop ended the manager, rc 1, and the line did not stop it a second time ({took:.1f} s)',
+               f'{how}: the manager ended={ended} rc={term.rc} {took:.0f} s after the stop was asked'
+               + (f', stopped behind again (state {stopped!r}) with {len(session_daemons(session))} daemons running'
+                  if stopped else ''))
+        if ended:
+            record('print-env-to' in words and 'asked to stop before the screen' in words,
+                   f'{how}: it said the line it was stopped at, then that it was asked to stop before the screen',
+                   f'{how}: after the stop the manager said: {words[:300]}')
+            left = session_daemons(session)
+            record(not left, f'{how}: no daemon is left',
+                   f'{how}: {[said.get(int(p), command_of(p).strip()) for p in left]} still run, with no manager')
+            record(not os.path.exists(session), f'{how}: the session directory is gone',
+                   f'{how}: the session directory stayed')
+            record(open(env_file).read() == 'taken\n', f'{how}: the file that was there is as it was',
+                   f'{how}: the file that was there was written over')
+            modes = tty_modes(term)
+            record(modes == EDITOR_MODES, f'{how}: the shell\'s mode was left as the shell set it',
+                   f'{how}: the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
+    except Failure:
+        if job.get('term') is not None:
+            print(f'--- screen at the failure\n{job["term"].screen.text()}\n---', flush=True)
+        raise
+    finally:
+        behind_cleanup(job)
 
 
 # Runs a program in a session of its own, its descriptors still on the terminal, as `setsid`
@@ -4923,6 +5054,7 @@ def run(stratum, root):
                       (core_dumps_off_leg, (stratum, vol, host, root)),
                       (screen_started_behind_leg, (stratum, root)),
                       (stuck_start_behind_leg, (stratum, root)),
+                      (stopped_at_a_line_leg, (stratum, root)),
                       (setsid_screen_leg, (stratum, root)),
                       (input_spin_leg, (stratum, root)),
                       (leftover_input_leg, (stratum, root)),

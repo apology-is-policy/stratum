@@ -45,6 +45,19 @@ pub fn locate_stratum_bin() -> PathBuf {
     );
 }
 
+/// What a test writes to a child's stdin. A child that ends before it has read, as
+/// `fs write` does for a path it is refused, has closed its end of the pipe, and a writer
+/// that gets there after fails with a broken pipe. That is not the test's result: how the
+/// child ended and what it said is, and the caller reads those next. Returns whether the
+/// child's end was still open for all of it; the caller drops `to` to close it.
+pub fn feed(to: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<bool> {
+    match to.write_all(bytes) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Wait for a Unix socket to appear (or timeout).
 pub fn wait_for_sock(p: &Path, timeout: Duration) -> Result<()> {
     let start = Instant::now();
@@ -150,11 +163,8 @@ impl SessionBuilder {
         }
         let mut child = mkfs.spawn().context("spawn mkfs")?;
         if let Some(pass) = self.passphrase.as_ref() {
-            use std::io::Write as _;
             if let Some(mut sin) = child.stdin.take() {
-                sin.write_all(pass.as_bytes())?;
-                sin.write_all(b"\n")?;
-                drop(sin);
+                feed(&mut sin, &[pass.as_bytes(), b"\n"].concat())?;
             }
         }
         let out = child.wait_with_output()?;
@@ -215,11 +225,8 @@ impl SessionBuilder {
             .spawn()
             .context("spawn stratumd")?;
         if let Some(pass) = self.passphrase.as_ref() {
-            use std::io::Write as _;
             if let Some(mut sin) = stratumd_child.stdin.take() {
-                sin.write_all(pass.as_bytes())?;
-                sin.write_all(b"\n")?;
-                drop(sin);
+                feed(&mut sin, &[pass.as_bytes(), b"\n"].concat())?;
             }
         }
         let stratumd = DaemonGuard {
@@ -330,7 +337,6 @@ impl Session {
 
     /// Write file content via stratum fs (stdin pipe).
     pub fn fs_write_bytes(&self, sock: &Path, path: &str, body: &[u8]) -> Result<()> {
-        use std::io::Write as _;
         let sock_str = sock.to_str().unwrap();
         let mut child = Command::new(&self.bin)
             .args(["fs", "-s", sock_str, "write", path])
@@ -338,9 +344,10 @@ impl Session {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
-        if let Some(mut sin) = child.stdin.take() {
-            sin.write_all(body)?;
-        }
+        let taken = match child.stdin.take() {
+            Some(mut sin) => feed(&mut sin, body)?,
+            None => true,
+        };
         let out = child.wait_with_output()?;
         if !out.status.success() {
             return Err(anyhow!(
@@ -349,6 +356,9 @@ impl Session {
                 out.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
+        }
+        if !taken {
+            return Err(anyhow!("stratum fs write {} ended 0 without reading what it was given", path));
         }
         Ok(())
     }
