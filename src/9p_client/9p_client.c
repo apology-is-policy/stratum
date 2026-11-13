@@ -191,7 +191,8 @@ static uint64_t counted_ms(const stm_9p_wait *w, uint64_t began)
  * this was last asked. A message goes into the kernel's buffer ahead of the daemon's
  * reading of it, and once it is all there nothing more is sent while the daemon reads
  * on. Linux tells how much of a socket's output is still unread, and less of it than
- * last time is the daemon taking. macOS does not tell; it holds 8 KiB. */
+ * last time is the daemon taking; the figure falls a piece of the kernel's at a time,
+ * some 36 KB. macOS does not tell; it holds 8 KiB. */
 static bool daemon_took(stm_9p_client *c)
 {
 #if defined(__linux__)

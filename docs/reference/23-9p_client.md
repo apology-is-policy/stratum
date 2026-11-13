@@ -80,10 +80,14 @@ wait (`O_NONBLOCK`; a flag on one message would not do, macOS waits in
 a `send` that does not fit all the same), and where a message cannot be
 sent or its reply has not come the call polls a tick at a time and asks
 `to_leave` between. The write or the read is tried again after every
-tick, whatever poll said: Linux calls a Unix socket writable only once
-three quarters of its send buffer are free, and takes a write as soon as
-any of it is, so a client that waited for poll alone would count a
-daemon that reads a little at a time as one that takes nothing. From
+tick, whatever poll said: Linux calls a full Unix socket writable only
+once 183 KB of the 219 KB it holds have been read, and takes a write
+again after the first 37 KB (measured), so a client that waited for
+poll alone would count a daemon that reads a little at a time as one
+that takes nothing. macOS takes a write that does not fit a full
+socket's room only when it calls the socket writable, with 2048 of its
+8192 bytes read (measured), so there the two differ only for the last
+bytes of a message. From
 the first true, `give_up_after_ms` of waiting
 with nothing sent and nothing received ends the call with STM_EIO,
 `stm_9p_last_errno` ETIMEDOUT, and poisons the client: the reply given
@@ -97,10 +101,13 @@ already holds, where the system tells of it. A message goes into the
 kernel's buffer ahead of the daemon's reading, and once it is all there
 nothing more is sent while the daemon reads on. Linux says how much of a
 socket's output is still unread (`SIOCOUTQ`), and at each tick less of
-it than at the tick before counts as taken (`daemon_took`). macOS does
+it than at the tick before counts as taken (`daemon_took`). That figure
+falls a piece of the kernel's at a time, 36.5 KB (measured), so a
+daemon that takes more than the limit over one piece is given up as
+one that does not answer. macOS does
 not say; it holds 8 KiB (measured), so there a daemon that takes more
-than the limit to read that much and to answer is given up as one that
-does not answer. The dial's own handshake waits by the same rule,
+than the limit to read that much and to answer is given up the same
+way. The dial's own handshake waits by the same rule,
 and so does its connect: the socket is made not to wait before it
 connects, a connect the listener holds (Linux, a full backlog that
 nobody accepts from; macOS refuses such a connect at once) is tried

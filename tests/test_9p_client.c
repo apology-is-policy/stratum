@@ -3249,12 +3249,13 @@ STM_TEST(p9_client_wait_does_not_count_the_time_its_process_was_stopped)
 #define WAIT_LITTLE (512u * 1024u)
 
 /* The kernel may take a write some time before it calls the socket writable: Linux
- * calls a Unix socket writable only once three quarters of its buffer are free, and
- * takes a write as soon as any of it is. A daemon that reads a little at a time is
- * reading, and a client that waited for the call alone would count it as one that
- * takes nothing. So would one that looked only at what it sends: the last of the
- * message is in the kernel long before this daemon has read it, more than twice the
- * limit before on Linux, and nothing is sent or received while it reads that. */
+ * calls a full Unix socket writable only once five sixths of what it holds are read,
+ * and takes a write again after the first sixth (measured; manager_keys.py prints
+ * it). A daemon that reads a little at a time is reading, and a client that waited
+ * for the call alone would count it as one that takes nothing. So would one that
+ * looked only at what it sends: the last of the message is in the kernel long before
+ * this daemon has read it, more than twice the limit before on Linux, and nothing is
+ * sent or received while it reads that. */
 STM_TEST(p9_client_wait_takes_a_daemon_that_reads_a_little_at_a_time_for_one_that_reads)
 {
     fake_daemon d;
