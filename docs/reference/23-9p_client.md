@@ -302,16 +302,17 @@ Per-connection:
 ```c
 struct stm_9p_client {
     int       fd;             /* connected socket */
-    uint32_t  msize;          /* negotiated post-Rversion */
-    uint16_t  next_tag;       /* monotonic counter */
-    uint32_t  root_fid;       /* caller-supplied at dial */
+    uint32_t  msize;          /* negotiated; 0 before Tversion */
+    uint32_t  iounit;         /* msize - hdr - 4 */
+    uint16_t  next_tag;       /* cycles over 1..NOTAG-1; 0 unused */
     int       last_errno;     /* last read/write syscall errno */
-    bool      poisoned;       /* tag-mismatch detected, or a call given up */
+    int       poisoned;       /* tag-mismatch detected, or a call given up */
+    uint8_t  *buf;            /* msize-sized request/response buffer */
+    uint32_t  buf_cap;        /* its size */
     stm_9p_wait wait;         /* copied at dial; to_leave NULL = none */
     uint64_t  waited_ns;      /* since to_leave said true, nothing moved */
     bool      asked;          /* what to_leave said at the last look */
     int       unread;         /* Linux: the socket's unread output at the last tick; -1 */
-    uint8_t  *buf;            /* msize-sized request/response buffer */
 };
 ```
 

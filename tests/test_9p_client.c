@@ -35,7 +35,6 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
-#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -3189,10 +3188,11 @@ static void *signal_storm_thread(void *arg)
             nanosleep(&pause, NULL);
             continue;
         }
-        /* Waited out on the clock: a runner may sleep a thread a millisecond and more
-         * for a fifth of one (macOS in CI, some 2 ms). */
+        /* Waited out on the clock, and not yielded: macOS's runners slept a thread some
+         * 1.2 ms for a fifth of one, and one that yielded lost its CPU for whole
+         * milliseconds at a time. */
         uint64_t next = test_mono_ns() + (uint64_t)st->every_us * 1000u;
-        while (test_mono_ns() < next) sched_yield();
+        while (test_mono_ns() < next) {}
     }
     return NULL;
 }
@@ -3238,18 +3238,29 @@ STM_TEST(p9_client_wait_counts_a_wait_a_signal_cut_short_for_what_it_lasted)
     fake_daemon_stop(&d);
 }
 
-/* A storm of signals that cuts every wait shorter than a millisecond. Counted in whole
- * milliseconds each such wait counts for nothing, and the call waits for as long as the
- * storm blows; counted for what they lasted, the waits reach the limit within it. The
+/* to_leave: true, and when each look ended, the last thing it does. */
+#define WAIT_MOST_LOOKS 65536u
+typedef struct { uint64_t at_ns[WAIT_MOST_LOOKS]; unsigned n; unsigned missed; } looks_noted;
+static bool leave_and_note_when(void *arg)
+{
+    looks_noted *l = arg;
+    if (l->n < WAIT_MOST_LOOKS) l->at_ns[l->n++] = test_mono_ns();
+    else l->missed++;
+    return true;
+}
+
+/* A storm of signals that cuts the waits short, most of them under a millisecond. Counted
+ * in whole milliseconds such waits count for nothing, and the call waits for as long as
+ * the storm blows; counted for what they lasted, they reach the limit within it. The
  * storm ends before the daemon here hangs up (FAKE_HARD_MS). */
 #define WAIT_STORM_EVERY_US 200L
 #define WAIT_STORM_MS       6000u
+static looks_noted g_storm_looks;
 STM_TEST(p9_client_wait_counts_waits_shorter_than_a_millisecond)
 {
     fake_daemon d;
     fake_daemon_start(&d, "wait_storm", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
-    leave_from l = { 0, 0 };
-    stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_wait w = { leave_and_note_when, &g_storm_looks, WAIT_TICK_MS, WAIT_LIMIT_MS };
     stm_9p_dial_opts o = default_dial_opts(100);
     o.wait = &w;
     stm_9p_client *c = NULL;
@@ -3269,20 +3280,37 @@ STM_TEST(p9_client_wait_counts_waits_shorter_than_a_millisecond)
     pthread_t storm;
     STM_ASSERT_EQ(pthread_create(&storm, NULL, signal_storm_thread, &st), 0);
 
+    g_storm_looks.n = g_storm_looks.missed = 0;
     uint64_t began = test_mono_ms();
+    uint64_t began_ns = test_mono_ns();
     stm_status rc = stm_9p_clunk(c, 100);
     uint64_t took = test_mono_ms() - began;
     atomic_store(&st.done, true);
     pthread_join(storm, NULL);
     sigaction(SIGUSR1, &was, NULL);
-    printf("    note: given up in %llu ms, %u signals sent\n", (unsigned long long)took, st.sent);
+    /* A wait counted is begun after the call began or after a look, and counted a few
+     * instructions after the next look, so a count in whole milliseconds makes no more of
+     * this call's waits than the whole milliseconds from its start to its first look and
+     * between its looks. */
+    uint64_t floored_ms = 0, last_ns = began_ns;
+    for (unsigned i = 0; i < g_storm_looks.n; i++) {
+        floored_ms += (g_storm_looks.at_ns[i] - last_ns) / 1000000u;
+        last_ns = g_storm_looks.at_ns[i];
+    }
+    printf("    note: given up in %llu ms; %u signals, %u looks, %llu whole ms between the looks\n",
+           (unsigned long long)took, st.sent, g_storm_looks.n, (unsigned long long)floored_ms);
     STM_ASSERT_EQ(rc, STM_EIO);
     STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
-    /* No storm slower than a signal a millisecond proves anything here. */
-    STM_ASSERT(st.sent > took);
     STM_ASSERT(took >= WAIT_LIMIT_MS);
     /* Given up while the storm still blew, and not long after the limit. */
     STM_ASSERT(took < WAIT_STORM_MS / 2u);
+    /* What the test rests on: counted in whole milliseconds, this call's own waits would
+     * not have reached the limit by the time it was given up, with a tenth of the limit
+     * spared for the instants between a look and the count after it, which no look sees.
+     * Where they would have, either the waits were not cut short and this run proves
+     * nothing, or the client counts in whole milliseconds. */
+    STM_ASSERT_EQ(g_storm_looks.missed, 0u);
+    STM_ASSERT(floored_ms + WAIT_LIMIT_MS / 10u < WAIT_LIMIT_MS);
     stm_9p_close(c);
     fake_daemon_stop(&d);
 }

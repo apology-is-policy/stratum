@@ -347,6 +347,9 @@ pub(crate) fn set_when_in_front(
     mut set: impl FnMut() -> io::Result<()>,
 ) -> io::Result<bool> {
     let ttou = take_over(libc::SIGTTOU, &action(stop_and_interrupt, 0));
+    // As while a line is written: a signal that asks a stop waits, and the stop's look sees
+    // it. Taken with the stop where the set comes back, its handler would run after that look.
+    let _others = OthersWait::but(libc::SIGTTOU);
     let done = loop {
         // Never narrower than the stop's own look: once that says a stop is asked the stop
         // returns at once, and a set made again unasked would fail at once, for ever.
@@ -355,8 +358,14 @@ pub(crate) fn set_when_in_front(
         }
         match set() {
             Ok(()) => break Ok(true),
-            // After each stop behind, so a stop asked meanwhile is seen.
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // Only the stop interrupts the set, the others waiting, and only from behind: once
+            // a stop is asked it returns at once. So the set is given up here whatever `front`
+            // says, which asks of a descriptor that need not be the one set.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                if stop_asked() || crate::tui::stop_asked() {
+                    break Ok(false);
+                }
+            }
             Err(e) => break Err(e),
         }
     };
@@ -1384,12 +1393,14 @@ mod prompt_tests {
         }
     }
 
-    /// How a set made from behind ends, in a child of this test's own: `asked`, with a SIGQUIT
-    /// waiting, blocked, which is a stop asked, and the caller's own look saying no. Some(true)
-    /// where it ended as it should: asked, given up before the set was tried; else made again
-    /// on each interrupt until done. None where the child had not ended five seconds on. The
-    /// child makes only async-signal-safe calls: the test binary has other threads.
-    fn a_set_from_behind_ends(asked: bool) -> Option<bool> {
+    /// How a set ends whose every try fails as interrupted, in a child of this test's own:
+    /// `front`, what the job is said to be; `asked`, with a SIGQUIT waiting, blocked, which is
+    /// a stop asked, the caller's own look saying no. No terminal is set and no stop raised:
+    /// this is the set's loop. Some(true) where it ended as it should: behind and asked, given
+    /// up before the set was tried; said in front and asked, given up at its first interrupt;
+    /// nothing asked, made again until done. None where the child had not ended five seconds
+    /// on. The child makes only async-signal-safe calls: the test binary has other threads.
+    fn a_set_ends(front: bool, asked: bool) -> Option<bool> {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
@@ -1412,7 +1423,7 @@ mod prompt_tests {
                 }
                 let mut tries = 0u32;
                 let done = set_when_in_front(
-                    || false,
+                    || front,
                     || false,
                     || {
                         tries += 1;
@@ -1423,10 +1434,11 @@ mod prompt_tests {
                         }
                     },
                 );
-                let right = match done {
-                    Ok(false) => asked && tries == 0,
-                    Ok(true) => !asked && tries == 4,
-                    Err(_) => false,
+                let right = match (front, asked, done) {
+                    (false, false, Ok(true)) => tries == 4,
+                    (false, true, Ok(false)) => tries == 0,
+                    (true, true, Ok(false)) => tries == 1,
+                    _ => false,
                 };
                 libc::_exit(if right { 0 } else { 1 });
             }
@@ -1450,19 +1462,85 @@ mod prompt_tests {
     }
 
     /// A set from behind is given up once a stop is asked, whatever its caller's own look
-    /// says: the terminal's stop then returns at once, and the set, made again, would fail
-    /// with EINTR at once, for ever. With nothing asked it is made again until done.
+    /// says, and whatever the job is said to be: the terminal's stop then returns at once, and
+    /// the set, made again, would fail with EINTR at once, for ever. With nothing asked it is
+    /// made again until done.
     #[test]
     fn a_set_from_behind_is_given_up_once_a_stop_is_asked() {
-        assert_eq!(
-            a_set_from_behind_ends(false),
-            Some(true),
-            "nothing was asked and the set was not made again until done: it proves nothing"
-        );
-        match a_set_from_behind_ends(true) {
+        match a_set_ends(false, false) {
             Some(true) => {}
-            Some(false) => panic!("a stop was asked and the set was not given up before it was tried"),
+            Some(false) => panic!(
+                "nothing was asked and the set's loop gave the set up or failed it: behind, every set \
+                 would be given up as though a stop were asked"
+            ),
+            None => panic!("nothing was asked and the child did not end in five seconds: it proves nothing"),
+        }
+        match a_set_ends(false, true) {
+            Some(true) => {}
+            Some(false) => panic!("a stop was asked behind and the set was not given up before it was tried"),
             None => panic!("a stop was asked and the set spun, made again on each interrupt"),
+        }
+        match a_set_ends(true, true) {
+            Some(true) => {}
+            Some(false) => panic!("a stop was asked, the job said to be in front, and the set was not given up at its first interrupt"),
+            None => panic!("a stop was asked, the job said to be in front, and the set spun, made again on each interrupt"),
+        }
+    }
+
+    extern "C" fn nothing_done(_: libc::c_int) {}
+
+    /// What a set does with a signal that has a handler, in a child of this test's own: SIGHUP
+    /// caught and let through, then a set made in front. The child's code: 0 where SIGHUP
+    /// waited through the set and not after it, 1 where it did not wait, 2 where it still
+    /// waits, 3 where the set did not succeed.
+    fn a_sets_hold() -> i32 {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::sigaction(libc::SIGHUP, &action(nothing_done, libc::SA_RESTART), std::ptr::null_mut());
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGHUP);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                let mut held = false;
+                let done = set_when_in_front(
+                    || true,
+                    || false,
+                    || {
+                        held = libc::sigismember(&this_threads_mask(), libc::SIGHUP) == 1;
+                        Ok(())
+                    },
+                );
+                let after = libc::sigismember(&this_threads_mask(), libc::SIGHUP) == 1;
+                libc::_exit(match (done, held, after) {
+                    (Ok(true), true, false) => 0,
+                    (Ok(true), false, _) => 1,
+                    (Ok(true), true, true) => 2,
+                    _ => 3,
+                });
+            }
+        }
+        let mut status = 0;
+        let got = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(got, pid, "the child was not waited for");
+        assert!(libc::WIFEXITED(status), "the child did not end by itself: status {status:#x}");
+        libc::WEXITSTATUS(status)
+    }
+
+    /// A set holds every signal that has a handler for its span, as a line does: one that asks
+    /// a stop, taken with the terminal's stop where the set comes back, would have its handler
+    /// run after that stop's look.
+    #[test]
+    fn a_set_holds_the_signals_that_have_a_handler() {
+        match a_sets_hold() {
+            0 => {}
+            1 => panic!(
+                "a signal with a handler did not wait through the set: one asking a stop, handled after \
+                 the stop's look, would leave the manager stopped behind"
+            ),
+            2 => panic!("a signal with a handler still waits after the set"),
+            n => panic!("the set in front did not succeed (code {n}): it proves nothing"),
         }
     }
 
