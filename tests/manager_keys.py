@@ -767,6 +767,13 @@ def held_terminal_legs(stratum, vol, host, root):
                 for i in range(20):
                     fcntl.ioctl(term.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS - 20 * (i % 2), 0, 0))
                     time.sleep(0.15)
+                if slow:
+                    # How much the manager's own frames leave in the terminal is the
+                    # system's and the moment's to say: on Linux it was read in 11 s at
+                    # this pace, the stall and a second, and once in 8.9 s. Topped up from
+                    # the side, the terminal has all it holds to give, at its own pace.
+                    side, put = fill_from_the_side(term)
+                    print(f'note: {how}: {put} bytes from the side topped the terminal up', flush=True)
                 os.kill(term.pid, asked_by)
             asked = time.monotonic()
             if not slow:
@@ -841,7 +848,8 @@ def held_terminal_legs(stratum, vol, host, root):
                         term.rc = os.waitstatus_to_exitcode(status)
                         ended = True
                 took = time.monotonic() - asked
-                record(ended and term.rc == 0, f'{how}: the manager ended cleanly, its screen taken at the terminal\'s pace ({took:.0f} s)',
+                record(ended and term.rc == 0, f'{how}: the manager ended cleanly, its screen taken at the terminal\'s pace '
+                       f'({took:.0f} s for {len(term.raw) - seen} bytes, 256 each {pause:.2f} s)',
                        f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s, read 256 bytes each {pause:.2f} s')
                 if ended and term.rc == 0 and took < stall + 1:
                     raise Failure(f'{how}: its screen went out in {took:.1f} s, short of the stall: it proves nothing')
