@@ -1177,7 +1177,8 @@ def headless_words_held_leg(stratum, vol, host, root):
     manager's own lines hold its stop for longer than a terminal that takes nothing is given.
     The manager leads its session here, and on macOS its end waits for its terminal to drain but
     for the held end's drop: with standard output a file too, where its lines go through an
-    open of standard error's terminal of their own."""
+    open of standard error's terminal of their own. On Linux no end waits, nothing is dropped,
+    and what the side wrote is all read after the end."""
     stall = 10  # tui.rs HELD_AFTER, in seconds
     out = f'{root}/headless-out'
 
@@ -1193,7 +1194,8 @@ def headless_words_held_leg(stratum, vol, host, root):
             if len(daemons) < 3:
                 raise Failure(f'{how}: session {session}, daemons {daemons}: not up, it proves nothing')
             # Kept open while the manager lasts, as another program's would be.
-            side, put = fill_from_the_side(term)
+            filled = len(term.raw)
+            side, put = fill_from_the_side(term, b'#')
             print(f'note: {how}: {put} bytes from the side filled the terminal', flush=True)
             os.kill(term.pid, signal.SIGTERM)
             asked = time.monotonic()
@@ -1217,6 +1219,12 @@ def headless_words_held_leg(stratum, vol, host, root):
                    f'with nothing read ({took:.0f} s)',
                    f'{how}: the manager ended={ended} rc={term.rc} {took:.0f} s after a TERM, {128 + signal.SIGTERM} wanted'
                    + (f'; its threads: {waits}' if waits else ''))
+            if ended and sys.platform.startswith('linux'):
+                # Linux keeps no ended leader for its terminal's drain, and nothing is dropped there.
+                term.pump(2)
+                kept = bytes(term.raw[filled:]).count(b'#')
+                record(kept >= put, f'{how}: what the side wrote stayed in the terminal ({kept} of {put} bytes)',
+                       f'{how}: {kept} of the {put} bytes the side wrote were read after the end: the rest was dropped')
         except Failure:
             print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
             raise

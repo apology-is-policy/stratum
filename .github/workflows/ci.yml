@@ -1,12 +1,12 @@
-# A PROBE, never to be merged: the tip's legs that this change touches, on ubuntu-24.04, then each
-#   sabotage alone, applied, built, run and restored, its expressions as the batch has them: the draw's
-#   look out (red alone wanted on Linux too, where the HUP handler restarts the write), with the write's
-#   asking out too; the held end dropping anyone's terminal; the lines plain with standard output
-#   elsewhere; the screen keeping its parent's mask; the set at fg not putting the mode back; the lines'
-#   own open giving up by the screen's flag (unit); the held end not dropping on the lines' open and the
-#   held end dropping nothing (does a Linux leader's end wait for its terminal? red or green answers);
-#   the terminal's and the helper's waits before the asking counted, and the helper's progress not
-#   setting its count back (unit).
+# A PROBE, never to be merged: the tip's legs that this change touches and the manager's unit tests,
+#   on ubuntu-24.04, then each sabotage alone, applied, built, run and restored, its expressions as the
+#   batch has them, each file saved once, the tree checked after each: the draw's look out, with the
+#   write's asking out too; the lines plain with standard output elsewhere; the screen keeping its
+#   parent's mask; the set at fg not putting the mode back; the lines' own open giving up by the
+#   screen's flag (unit); the held end blind to the lines' flag; the drop made on Linux too (red wanted:
+#   no end waits there, so what the side wrote is lost); /dev/tty another terminal to the lines, and a
+#   polled open made again of /dev/tty (unit); the terminal's and the helper's waits before the asking
+#   counted, their look after the wait, and the helper's progress not setting its count back (unit).
 name: ci
 
 on:
@@ -45,6 +45,12 @@ jobs:
           KEYS_ONLY=held_headless_job_leg,attach_blocked_leg,screen_job_control_leg,no_terminal_hangup_leg,unread_hold_sets_leg,headless_words_held_leg,held_terminal_legs,screen_started_behind_leg \
               python3 -B tests/manager_keys.py dist/stratum
 
+      - name: the unit tests, the tip as it is
+        if: always()
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
+        run: (cd tools/stratum && cargo test --release --bin stratum)
+
       - name: each sabotage alone
         if: always()
         env:
@@ -54,7 +60,10 @@ jobs:
           sab() {
             local name=$1 run=$2 want=$3; shift 3
             local files=() f
-            while [ $# -gt 0 ]; do files+=("$1"); cp "$1" "/tmp/keep-$(basename "$1")"; perl -0pi -e "$2" "$1"; shift 2; done
+            while [ $# -gt 0 ]; do
+              case " ${files[*]-} " in *" $1 "*) ;; *) cp "$1" "/tmp/keep-$(basename "$1")";; esac
+              files+=("$1"); perl -0pi -e "$2" "$1"; shift 2
+            done
             local changed=0
             for f in "${files[@]}"; do cmp -s "$f" "/tmp/keep-$(basename "$f")" || changed=1; done
             if [ "$changed" = 0 ]; then echo "$name DID NOT APPLY"
@@ -69,18 +78,21 @@ jobs:
               esac
             fi
             for f in "${files[@]}"; do cp "/tmp/keep-$(basename "$f")" "$f"; done
+            git diff --quiet -- tools tests || { echo "$name LEFT THE TREE CHANGED"; git diff --stat -- tools tests; git checkout -- tools tests; }
           }
           sab r20-1de 'screen_job_control_leg' '^FAIL: the screen, tostop set, a STOP mid-pass, bg, then kill -HUP: a frame was drawn from behind after the HUP' tools/stratum/src/tui.rs 's/            if !may_touch_terminal\(tty\) \{\n                if ASKED_TO_STOP\.load\(Ordering::Relaxed\) \|\| !job_control\(terminal\.backend_mut\(\), tty\) \{\n                    return Ok\(\(\)\);\n                \}\n                \/\/ What the shell drew meanwhile is not in ratatui.s last frame\.\n                let _ = terminal\.clear\(\);\n            \}\n            let_through\(\|\| terminal\.draw\(\|frame\| \{/            std::convert::identity(terminal.draw(|frame| {/'
           sab r20-1dw 'screen_job_control_leg' '^FAIL: the screen, tostop set, a STOP mid-pass, bg, then kill -HUP' tools/stratum/src/tui.rs 's/                Some\(libc::EINTR\) => \{\n(?:[ ]*\/\/.*\n)*                    if stop_asked\(\) \{\n                        crate::embed::never_stop_for_the_terminal\(\);\n                    \}\n                    continue;\n                \}/                Some(libc::EINTR) => continue,/' tools/stratum/src/tui.rs 's/            if !may_touch_terminal\(tty\) \{\n                if ASKED_TO_STOP\.load\(Ordering::Relaxed\) \|\| !job_control\(terminal\.backend_mut\(\), tty\) \{\n                    return Ok\(\(\)\);\n                \}\n                \/\/ What the shell drew meanwhile is not in ratatui.s last frame\.\n                let _ = terminal\.clear\(\);\n            \}\n            let_through\(\|\| terminal\.draw\(\|frame\| \{/            std::convert::identity(terminal.draw(|frame| {/'
-          sab fl-32 'held_headless_job_leg' '^FAIL: headless as a job, its terminal held: [0-9]* of the' tools/stratum/src/tui.rs 's/            if libc::tcgetsid\(fd\) == me \{/            if true {/'
           sab fl-33 'held_headless_job_leg' '^FAIL: headless as a job, standard output a file, its terminal held' tools/stratum/src/tui.rs 's/        _ => reopen\(\)\.map\(\|fd\| \(fd, &LINES_HELD\)\),/        _ => None,/'
           sab fl-34 'attach_blocked_leg' '^FAIL: the screen attached to a running slate' tools/stratum/src/tui.rs 's/        libc::pthread_sigmask\(libc::SIG_UNBLOCK, &handled, std::ptr::null_mut\(\)\);\n    \}\n    let ttys/    }\n    let ttys/'
           sab fl-35 'screen_started_behind_leg' '^FAIL: the screen started behind, sent an INT with no continue, then fg: the terminal is' tools/stratum/src/tui.rs 's/            if in_front \{\n                while disable_raw_mode\(\)\.is_err_and\(\|e\| e\.kind\(\) == io::ErrorKind::Interrupted\) \{\}\n            \}\n//'
           sab fl-36 'unit:the_lines_open' 'another terminal: not an open of its own' tools/stratum/src/tui.rs 's/        _ => reopen\(\)\.map\(\|fd\| \(fd, &LINES_HELD\)\),/        _ => reopen().map(|fd| (fd, &TERMINAL_HELD)),/'
-          sab fl-37 'headless_words_held_leg' '^FAIL: headless, standard output a file, its terminal filled once the daemons are up: the manager ended=False' tools/stratum/src/tui.rs 's/    let lines = if LINES_HELD\.load\(Ordering::Relaxed\) \{ lines_output\(\) \} else \{ None \};/    let lines: Option<RawFd> = None;/'
-          sab kx-8 'held_terminal_legs' '^FAIL' tools/stratum/src/tui.rs 's/                libc::tcflush\(fd, libc::TCOFLUSH\);\n/                let _ = fd;\n/'
+          sab fl-38 'headless_words_held_leg' '^FAIL: headless, standard output a file, its terminal filled once the daemons are up: the manager ended=' tools/stratum/src/tui.rs 's/    TERMINAL_HELD\.load\(Ordering::Relaxed\) \|\| LINES_HELD\.load\(Ordering::Relaxed\)\n/    TERMINAL_HELD.load(Ordering::Relaxed)\n/'
+          sab fl-40 'headless_words_held_leg' '^FAIL: headless.*the rest was dropped' tools/stratum/src/tui.rs 's/    if cfg!\(target_os = "macos"\) \{\n        \/\/ Dropping it from behind/    if true {\n        \/\/ Dropping it from behind/'
+          sab fl-41 'unit:dev_tty_is' '/dev/tty: an open of /dev/tty is not the controlling terminal' tools/stratum/src/tui.rs 's/    tty\.is_some\(\) && \(ra == tty \|\| rb == tty\) && controlling\(a, ra\) && controlling\(b, rb\)\n/    false \&\& tty.is_some() \&\& (ra == tty || rb == tty) \&\& controlling(a, ra) \&\& controlling(b, rb)\n/'
+          sab fl-42 'unit:dev_tty_is' '/dev/tty: a polled open made again of /dev/tty' tools/stratum/src/tui.rs 's/    if !dev_tty && rdev_of\(fd\)\.is_some\(\) && rdev_of\(fd\) == dev_tty_rdev\(\) \{\n        return None;\n    \}\n//'
           sab kx-17 'unit:a_terminal_that_takes_nothing' 'the write ended with nothing asked' tools/stratum/src/tui.rs 's/            if asked \{\n                waited \+= began\.elapsed\(\)\.min\(self\.tick\);\n            \}\n/            waited += began.elapsed().min(self.tick);\n/'
+          sab kx-17a 'unit:a_terminal_that_takes_nothing' 'the wait before it was counted|the wait the asking came in was counted' tools/stratum/src/tui.rs 's/            let asked = \(self\.to_be_left\)\(\);\n(            if waited >= self\.held_after \{\n(?:.*\n)*?)            if asked \{\n/$1            let asked = (self.to_be_left)();\n            if asked {\n/'
           sab h-2u 'unit:' 'FAILED|panicked' tools/stratum/src/spawn.rs 's/        if took \{\n            waited = Duration::ZERO;\n            continue;\n        \}\n//'
           sab h-8u 'unit:a_helper_that_says_nothing' 'before a limit from the asking' tools/stratum/src/spawn.rs 's/        if asked_before \{\n            waited \+= began\.elapsed\(\)\.min\(tick\);\n        \}\n/        waited += began.elapsed().min(tick);\n/'
           sab h-8a 'unit:a_helper_that_says_nothing' 'the wait the asking came in was counted' tools/stratum/src/spawn.rs 's/        if asked_before \{\n            waited \+= began\.elapsed\(\)\.min\(tick\);/        if asked {\n            waited += began.elapsed().min(tick);/'
-          for n in r20-1de fl-37 kx-8; do echo "=== $n"; grep -a '^ok\|^FAIL\|^note\|^PASS' "/tmp/$n.log" | cut -c1-300; done
+          for n in r20-1de fl-38 fl-40; do echo "=== $n"; grep -a '^ok\|^FAIL\|^note\|^PASS' "/tmp/$n.log" | cut -c1-300; done

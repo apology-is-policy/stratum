@@ -48,15 +48,16 @@ fn main() {
     // A path need not be UTF-8, and std::env::args panics on one that is not.
     let args: Vec<OsString> = std::env::args_os().collect();
     let ended = dispatch(args);
-    tui::end_if_terminal_held();
-    match ended {
-        Ok(exit_code) => std::process::exit(exit_code),
-        Err(e) => {
-            // What std prints for an error main returns; tell stands in for its controls.
-            spawn::tell(format_args!("Error: {e:?}"));
-            std::process::exit(1);
-        }
+    // What std prints for an error main returns; tell stands in for its controls. Said before
+    // the held end, which then ends a run whose terminal this line was the first to give up.
+    if let Err(e) = &ended {
+        spawn::tell(format_args!("Error: {e:?}"));
     }
+    tui::end_if_terminal_held();
+    std::process::exit(match ended {
+        Ok(exit_code) => exit_code,
+        Err(_) => 1,
+    });
 }
 
 /// A core holds whatever passphrase or key the process has in memory, and a signal's default
