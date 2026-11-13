@@ -1,135 +1,29 @@
-# Stratum CI workflow.
-#
-# Jobs:
-#   build-linux   — gcc/clang × off/asan/tsan sanitizer matrix; runs ctest.
-#   build-macos   — clang × off/asan/tsan; POSIX backend only.
-#   manager       -- dist/stratum, the manager's tests, a volume end to end,
-#                    the manager's keys in a terminal; Linux and macOS.
-#   tlc-specs     -- TLC on all specs/*.tla with matching .cfg.
-#
+# A PROBE, never to be merged: what Linux says of two things macOS cannot show.
+#   out=asking: the EINTR arm of the manager's own writer does not ask whether a stop came.
+#   out=guard:  a stop for the terminal does not interrupt a line's write (StopsInterrupt out).
+#   out=none:   the tree as it is, and what a close does to a read another thread waits in.
 name: ci
 
 on:
   push:
-    # ci/<name>: a branch pushed to hear what CI says of it before it reaches main.
-    branches: [main, 'ci/**']
-  pull_request:
+    branches: ['ci/**']
 
 jobs:
-  build-linux:
-    name: Linux / ${{ matrix.compiler }} / ${{ matrix.sanitizer }}
+  probe:
+    name: probe / ${{ matrix.out }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc, clang]
-        sanitizer: [off, asan, tsan]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config cmake ninja-build \
-              liburing-dev
-
-      - name: install libsodium
-        run: |
-          # ubuntu-24.04's apt ships libsodium 1.0.18; we need 1.0.19+ for
-          # AEGIS-256. Build from source if apt's version is too old.
-          if apt list --installed 2>/dev/null | grep -q libsodium; then
-              sudo apt-get remove -y libsodium-dev libsodium23 || true
-          fi
-          wget -q -O /tmp/libsodium.tar.gz \
-              https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz
-          tar xzf /tmp/libsodium.tar.gz -C /tmp
-          cd /tmp/libsodium-1.0.20
-          ./configure --prefix=/usr/local --disable-debug
-          make -j$(nproc)
-          sudo make install
-          sudo ldconfig
-          pkg-config --modversion libsodium
-
-      - name: install liboqs
-        run: |
-          sudo apt-get install -y --no-install-recommends liboqs-dev || true
-          if ! pkg-config --exists liboqs; then
-              echo "liboqs not available via apt; building from source"
-              # 0.11.0 uses the final FIPS 203 symbol names
-              # (OQS_KEM_ml_kem_768_*); 0.10.0 had them as _ipd_ only.
-              git clone --depth 1 --branch 0.11.0 https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs
-              cmake -S /tmp/liboqs -B /tmp/liboqs/build -GNinja \
-                    -DCMAKE_INSTALL_PREFIX=/usr/local \
-                    -DOQS_BUILD_ONLY_LIB=ON -DOQS_USE_OPENSSL=OFF
-              sudo cmake --build /tmp/liboqs/build --target install
-          fi
-
-      - name: configure
-        env:
-          CC: ${{ matrix.compiler }}
-        run: |
-          cmake -B build -S . -GNinja \
-              -DSTM_SANITIZE=${{ matrix.sanitizer }} \
-              -DSTM_ENABLE_IOURING=ON \
-              -DSTM_ENABLE_PQ=ON \
-              -DSTM_WERROR=ON
-
-      - name: build
-        run: cmake --build build
-
-      - name: test
-        run: ctest --test-dir build --output-on-failure
-
-  build-macos:
-    name: macOS / clang / ${{ matrix.sanitizer }}
-    runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: [off, asan, tsan]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install deps
-        run: |
-          brew update
-          brew install cmake ninja pkg-config libsodium
-          # liboqs is optional on macOS — fall back to classical-only wrap.
-
-      - name: configure
-        run: |
-          cmake -B build -S . -GNinja \
-              -DSTM_SANITIZE=${{ matrix.sanitizer }} \
-              -DSTM_ENABLE_IOURING=OFF \
-              -DSTM_ENABLE_PQ=OFF \
-              -DSTM_WERROR=ON
-
-      - name: build
-        run: cmake --build build
-
-      - name: test
-        run: ctest --test-dir build --output-on-failure
-
-  manager:
-    name: Manager / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # Linux too: its optimized gcc build is what found T0.37, and ext4 lists
-        # a directory in hash order, which the key legs must not assume away.
-        os: [ubuntu-24.04, macos-15]
+        out: [none, asking, guard]
     steps:
       - uses: actions/checkout@v4
 
       - name: install deps (Linux)
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
               build-essential pkg-config cmake liburing-dev
-          # As in build-linux: apt's libsodium lacks AEGIS-256.
           wget -q -O /tmp/libsodium.tar.gz \
               https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz
           tar xzf /tmp/libsodium.tar.gz -C /tmp
@@ -137,72 +31,26 @@ jobs:
               && make -j"$(nproc)" && sudo make install)
           sudo ldconfig
 
-      - name: install deps (macOS)
-        if: runner.os == 'macOS'
+      - name: take the asking out
+        if: matrix.out == 'asking'
         run: |
-          brew update
-          brew install cmake pkg-config libsodium
-          # liboqs is optional on macOS, as in build-macos.
+          perl -0pi -e 's/                Some\(libc::EINTR\) => \{\n(.*\n){2}                    if stop_asked\(\) \{\n                        crate::embed::never_stop_for_the_terminal\(\);\n                    \}\n                    continue;\n                \}/                Some(libc::EINTR) => continue,/' tools/stratum/src/tui.rs
+          git diff --stat
+          if git diff --quiet; then echo "DID NOT APPLY"; exit 1; fi
+
+      - name: take the guard out
+        if: matrix.out == 'guard'
+        run: |
+          perl -0pi -e 's/    let _interrupted = crate::passphrase::StopsInterrupt::new\(\);\n//' tools/stratum/src/tui.rs
+          git diff --stat
+          if git diff --quiet; then echo "DID NOT APPLY"; exit 1; fi
 
       - name: build dist/stratum
         run: ./dist.sh
 
-      - name: test the manager
-        working-directory: tools/stratum
-        env:
-          STM_BIN: ${{ github.workspace }}/dist/stratum
-          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
-        run: cargo test --release
+      - name: a manager stopped behind at a line of its own
+        run: KEYS_ONLY=stopped_at_a_line_leg python3 tests/manager_keys.py dist/stratum
 
-      - name: a file-based volume end to end
-        # The runner has sudo without a password, which the checks of another user's
-        # key and key link need; asked for and not to be had, the run fails.
-        env:
-          STRATUM_TEST_SUDO: 1
-        run: bash tests/volume_smoke.sh dist/stratum
-
-      - name: a daemon's stop with clients still connected
-        run: python3 tests/stop_with_clients.py dist/stratum
-
-      - name: the manager's keys in a terminal
-        run: python3 tests/manager_keys.py dist/stratum
-
-  tlc-specs:
-    name: TLC / ${{ matrix.cfg }}
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        # Each entry runs `cfg` against `tla`. Most cfgs have a 1:1
-        # name match with a tla file; namespace_multi_bind is a second
-        # cfg sharing namespace.tla (added at P9-9P-2c for atomicity
-        # coverage).
-        include:
-          - { tla: sync,                cfg: sync }
-          - { tla: concurrency,         cfg: concurrency }
-          - { tla: structural,          cfg: structural }
-          - { tla: balanced,            cfg: balanced }
-          - { tla: merge,               cfg: merge }
-          - { tla: allocator,           cfg: allocator }
-          - { tla: namespace,           cfg: namespace }
-          - { tla: namespace,           cfg: namespace_multi_bind }
-          - { tla: inode,               cfg: inode }
-          - { tla: fid,                 cfg: fid }
-          - { tla: dcache_ebr,          cfg: dcache_ebr }
-          - { tla: dek_guard,           cfg: dek_guard }
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install java + tla2tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends default-jre wget
-          wget -q -O /tmp/tla2tools.jar \
-              https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-
-      - name: check ${{ matrix.cfg }}.cfg against ${{ matrix.tla }}.tla
-        run: |
-          cd specs
-          java -cp /tmp/tla2tools.jar tlc2.TLC \
-              -workers auto -deadlock \
-              -config ${{ matrix.cfg }}.cfg ${{ matrix.tla }}.tla
+      - name: a close under a read another thread waits in
+        if: always() && matrix.out == 'none'
+        run: python3 tests/probe_close_under_recv.py
