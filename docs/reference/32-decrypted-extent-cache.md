@@ -107,9 +107,11 @@ The probe is reached from two shapes:
   under a second pin. A key rotation, a rewrite of the extent and a
   keyschema sweep between the two leave the record stale and its key
   pruned, and the fetch fails with `STM_ECORRUPT` of data that is whole; a
-  commit that gives the old blocks out again fails it at the tag check
-  (`STM_EBADTAG`, the block holding another extent's ciphertext by
-  then), and the collection of a content entry fails it as well. So
+  commit that frees the old blocks and a later write that takes them
+  fail it at the tag check (`STM_EBADTAG`, the block holding another
+  extent's ciphertext by then; until that write the stale fetch still
+  returns the extent as it was), and the collection of a content entry
+  fails it as well. So
   `stm_sync_read_extent` takes
   any failure of the unlocked fetch as no answer and makes the read again
   on the serial locked path (`stm_sync_read_extent_locked`), where the
