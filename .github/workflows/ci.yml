@@ -1,10 +1,12 @@
-# A PROBE, never to be merged: the legs of the tip that only Linux can turn red, on ubuntu-24.04.
-#   The tip as it is: the started-behind cases, the hangup with no standard descriptor a terminal, the hold's
-#   sets with nothing read, and the headless terminal filled from the side (green wanted).
-#   Then each sabotage alone, applied, built, run and restored: the watcher's copy out (red at the hangup
-#   wanted); the screen's set at fg asking nothing after (red at the INT-then-fg case); the headless daemons'
-#   words as they were, the headless stop not counted as leaving, its signal not noted (each red at the
-#   filled terminal wanted).
+# A PROBE, never to be merged: the tip's legs that this change touches, on ubuntu-24.04, then each
+#   sabotage alone, applied, built, run and restored, its expressions as the batch has them: the draw's
+#   look out (red alone wanted on Linux too, where the HUP handler restarts the write), with the write's
+#   asking out too; the held end dropping anyone's terminal; the lines plain with standard output
+#   elsewhere; the screen keeping its parent's mask; the set at fg not putting the mode back; the lines'
+#   own open giving up by the screen's flag (unit); the held end not dropping on the lines' open and the
+#   held end dropping nothing (does a Linux leader's end wait for its terminal? red or green answers);
+#   the terminal's and the helper's waits before the asking counted, and the helper's progress not
+#   setting its count back (unit).
 name: ci
 
 on:
@@ -40,7 +42,7 @@ jobs:
 
       - name: the legs, the tip as it is
         run: |
-          KEYS_ONLY=screen_started_behind_leg,no_terminal_hangup_leg,unread_hold_sets_leg,headless_words_held_leg \
+          KEYS_ONLY=held_headless_job_leg,attach_blocked_leg,screen_job_control_leg,no_terminal_hangup_leg,unread_hold_sets_leg,headless_words_held_leg,held_terminal_legs,screen_started_behind_leg \
               python3 -B tests/manager_keys.py dist/stratum
 
       - name: each sabotage alone
@@ -50,21 +52,35 @@ jobs:
         run: |
           set -u +e
           sab() {
-            local name=$1 file=$2 expr=$3 legs=$4
-            cp "$file" /tmp/keep
-            perl -0pi -e "$expr" "$file"
-            if cmp -s "$file" /tmp/keep; then echo "$name DID NOT APPLY"; return; fi
-            if ! (cd tools/stratum && cargo build --release) > "/tmp/build-$name.log" 2>&1; then
-              echo "$name DID NOT BUILD"; tail -20 "/tmp/build-$name.log"; cp /tmp/keep "$file"; return
+            local name=$1 run=$2 want=$3; shift 3
+            local files=() f
+            while [ $# -gt 0 ]; do files+=("$1"); cp "$1" "/tmp/keep-$(basename "$1")"; perl -0pi -e "$2" "$1"; shift 2; done
+            local changed=0
+            for f in "${files[@]}"; do cmp -s "$f" "/tmp/keep-$(basename "$f")" || changed=1; done
+            if [ "$changed" = 0 ]; then echo "$name DID NOT APPLY"
+            elif ! (cd tools/stratum && cargo build --release) > "/tmp/build-$name.log" 2>&1; then
+              echo "$name DID NOT BUILD"; tail -20 "/tmp/build-$name.log"
+            else
+              case "$run" in
+                unit:*) (cd tools/stratum && cargo test --release --bin stratum -- ${run#unit:}) > "/tmp/$name.log" 2>&1
+                        echo "$name rc=$? (want red at: $want): $(grep -a 'panicked\|FAILED' "/tmp/$name.log" | head -4 | tr '\n' '|' | cut -c1-600)";;
+                *) KEYS_ONLY=$run python3 -B tests/manager_keys.py tools/stratum/target/release/stratum > "/tmp/$name.log" 2>&1
+                   echo "$name rc=$? (want red at: $want): $(grep -a '^FAIL' "/tmp/$name.log" | head -4 | tr '\n' '|' | cut -c1-600)";;
+              esac
             fi
-            KEYS_ONLY=$legs python3 -B tests/manager_keys.py tools/stratum/target/release/stratum > "/tmp/$name.log" 2>&1
-            echo "$name rc=$? (want red): $(grep -a '^FAIL' "/tmp/$name.log" | head -4 | tr '\n' '|' | cut -c1-500)"
-            cp /tmp/keep "$file"
+            for f in "${files[@]}"; do cp "/tmp/keep-$(basename "$f")" "$f"; done
           }
-          TU=tools/stratum/src/tui.rs; EM=tools/stratum/src/embed.rs
-          sab fl-27 $TU 's/    let copy = watch_copy\(tty, &ttys\);\n/    let copy: Option<std::os::fd::OwnedFd> = None;\n/' no_terminal_hangup_leg
-          sab fl-25 $TU 's/        Ok\(true\) if stop_asked\(\) => \{\n/        Ok(true) if false => {\n/' screen_started_behind_leg
-          sab fl-28 $EM 's/            return Ok\(tui::daemon_words_out\(\)\.map_or_else\(Stdio::inherit, Stdio::from\)\);\n/            return Ok(Stdio::inherit());\n/' headless_words_held_leg
-          sab fl-29 $EM 's/    tui::leave_for_good\(sig\);\n//' headless_words_held_leg
-          sab fl-30 $TU 's/    if sig > 0 \{\n        let _ = ASKED_BY/    if false {\n        let _ = ASKED_BY/' headless_words_held_leg
-          for n in fl-27 fl-28; do echo "=== $n"; grep -a '^ok\|^FAIL\|^note\|^PASS' "/tmp/$n.log" | cut -c1-300; done
+          sab r20-1de 'screen_job_control_leg' '^FAIL: the screen, tostop set, a STOP mid-pass, bg, then kill -HUP: a frame was drawn from behind after the HUP' tools/stratum/src/tui.rs 's/            if !may_touch_terminal\(tty\) \{\n                if ASKED_TO_STOP\.load\(Ordering::Relaxed\) \|\| !job_control\(terminal\.backend_mut\(\), tty\) \{\n                    return Ok\(\(\)\);\n                \}\n                \/\/ What the shell drew meanwhile is not in ratatui.s last frame\.\n                let _ = terminal\.clear\(\);\n            \}\n            let_through\(\|\| terminal\.draw\(\|frame\| \{/            std::convert::identity(terminal.draw(|frame| {/'
+          sab r20-1dw 'screen_job_control_leg' '^FAIL: the screen, tostop set, a STOP mid-pass, bg, then kill -HUP' tools/stratum/src/tui.rs 's/                Some\(libc::EINTR\) => \{\n(?:[ ]*\/\/.*\n)*                    if stop_asked\(\) \{\n                        crate::embed::never_stop_for_the_terminal\(\);\n                    \}\n                    continue;\n                \}/                Some(libc::EINTR) => continue,/' tools/stratum/src/tui.rs 's/            if !may_touch_terminal\(tty\) \{\n                if ASKED_TO_STOP\.load\(Ordering::Relaxed\) \|\| !job_control\(terminal\.backend_mut\(\), tty\) \{\n                    return Ok\(\(\)\);\n                \}\n                \/\/ What the shell drew meanwhile is not in ratatui.s last frame\.\n                let _ = terminal\.clear\(\);\n            \}\n            let_through\(\|\| terminal\.draw\(\|frame\| \{/            std::convert::identity(terminal.draw(|frame| {/'
+          sab fl-32 'held_headless_job_leg' '^FAIL: headless as a job, its terminal held: [0-9]* of the' tools/stratum/src/tui.rs 's/            if libc::tcgetsid\(fd\) == me \{/            if true {/'
+          sab fl-33 'held_headless_job_leg' '^FAIL: headless as a job, standard output a file, its terminal held' tools/stratum/src/tui.rs 's/        _ => reopen\(\)\.map\(\|fd\| \(fd, &LINES_HELD\)\),/        _ => None,/'
+          sab fl-34 'attach_blocked_leg' '^FAIL: the screen attached to a running slate' tools/stratum/src/tui.rs 's/        libc::pthread_sigmask\(libc::SIG_UNBLOCK, &handled, std::ptr::null_mut\(\)\);\n    \}\n    let ttys/    }\n    let ttys/'
+          sab fl-35 'screen_started_behind_leg' '^FAIL: the screen started behind, sent an INT with no continue, then fg: the terminal is' tools/stratum/src/tui.rs 's/            if in_front \{\n                while disable_raw_mode\(\)\.is_err_and\(\|e\| e\.kind\(\) == io::ErrorKind::Interrupted\) \{\}\n            \}\n//'
+          sab fl-36 'unit:the_lines_open' 'another terminal: not an open of its own' tools/stratum/src/tui.rs 's/        _ => reopen\(\)\.map\(\|fd\| \(fd, &LINES_HELD\)\),/        _ => reopen().map(|fd| (fd, &TERMINAL_HELD)),/'
+          sab fl-37 'headless_words_held_leg' '^FAIL: headless, standard output a file, its terminal filled once the daemons are up: the manager ended=False' tools/stratum/src/tui.rs 's/    let lines = if LINES_HELD\.load\(Ordering::Relaxed\) \{ lines_output\(\) \} else \{ None \};/    let lines: Option<RawFd> = None;/'
+          sab kx-8 'held_terminal_legs' '^FAIL' tools/stratum/src/tui.rs 's/                libc::tcflush\(fd, libc::TCOFLUSH\);\n/                let _ = fd;\n/'
+          sab kx-17 'unit:a_terminal_that_takes_nothing' 'the write ended with nothing asked' tools/stratum/src/tui.rs 's/            if asked \{\n                waited \+= began\.elapsed\(\)\.min\(self\.tick\);\n            \}\n/            waited += began.elapsed().min(self.tick);\n/'
+          sab h-2u 'unit:' 'FAILED|panicked' tools/stratum/src/spawn.rs 's/        if took \{\n            waited = Duration::ZERO;\n            continue;\n        \}\n//'
+          sab h-8u 'unit:a_helper_that_says_nothing' 'before a limit from the asking' tools/stratum/src/spawn.rs 's/        if asked_before \{\n            waited \+= began\.elapsed\(\)\.min\(tick\);\n        \}\n/        waited += began.elapsed().min(tick);\n/'
+          sab h-8a 'unit:a_helper_that_says_nothing' 'the wait the asking came in was counted' tools/stratum/src/spawn.rs 's/        if asked_before \{\n            waited \+= began\.elapsed\(\)\.min\(tick\);/        if asked {\n            waited += began.elapsed().min(tick);/'
+          for n in r20-1de fl-37 kx-8; do echo "=== $n"; grep -a '^ok\|^FAIL\|^note\|^PASS' "/tmp/$n.log" | cut -c1-300; done
