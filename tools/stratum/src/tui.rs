@@ -414,8 +414,10 @@ fn exit_when_terminal_goes(ttys: Vec<i32>, copy: Option<std::os::fd::OwnedFd>, s
 }
 
 /// A descriptor of the watcher's own for `tty`, the terminal the screen reads, unless one of
-/// `ttys` is that terminal. Where none is, nohup's way, the watcher would else watch nothing:
-/// standard input is that terminal only while the screen lasts, and is put back after.
+/// `ttys` has its device number. Where none is, nohup's way, the watcher would else watch
+/// nothing: standard input is that terminal only while the screen lasts, and is put back
+/// after. An open of /dev/tty has /dev/tty's own number, so beside the terminal's own
+/// descriptors a copy of one is made, and watches the same terminal again.
 fn watch_copy(tty: Option<RawFd>, ttys: &[i32]) -> Option<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
     let rdev = |fd: RawFd| {
@@ -488,6 +490,10 @@ pub(crate) fn leave_for_good(sig: libc::c_int) {
 /// written to it: the screen's writes fail at once, and `tell` says nothing.
 static TERMINAL_HELD: AtomicBool = AtomicBool::new(false);
 
+/// The same of standard error's terminal where that is another than the screen's: only the
+/// manager's lines go there, and only they are given up with it.
+static LINES_HELD: AtomicBool = AtomicBool::new(false);
+
 fn screen_to_be_left() -> bool {
     ASKED_TO_STOP.load(Ordering::Relaxed) || LEAVING.load(Ordering::Relaxed)
 }
@@ -532,7 +538,7 @@ pub(crate) fn dial_daemon(
 }
 
 pub(crate) fn terminal_held() -> bool {
-    TERMINAL_HELD.load(Ordering::Relaxed)
+    TERMINAL_HELD.load(Ordering::Relaxed) || LINES_HELD.load(Ordering::Relaxed)
 }
 
 /// The exit code of a manager its terminal held: what the signal that asked would have
@@ -543,10 +549,11 @@ fn held_end_code(asked_by: libc::c_int) -> libc::c_int {
 }
 
 /// The end of a manager whose terminal took nothing, its daemons stopped and its session
-/// put away by then; it returns where the terminal was not held. What the terminal has not
-/// taken is dropped: where this is the terminal's last open, macOS keeps a process that
-/// has ended until its terminal has drained. Not exit(), which flushes standard output:
-/// to that terminal.
+/// put away by then; it returns where no terminal was held. What a terminal it gave up and
+/// controls has not taken is dropped: macOS keeps a controlling process that has ended until
+/// its terminal has drained, and no other process, the terminal's last close included. Any
+/// other terminal keeps what other programs wrote to it. Not exit(), which flushes standard
+/// output: to that terminal.
 pub(crate) fn end_if_terminal_held() {
     if !terminal_held() {
         return;
@@ -554,13 +561,22 @@ pub(crate) fn end_if_terminal_held() {
     // Dropping it from behind would stop the job, and nothing would continue it.
     crate::embed::never_stop_for_the_terminal();
     unsafe {
-        for fd in 0..=2 {
-            if libc::isatty(fd) == 1 {
+        let me = libc::getpid();
+        for fd in held_opens() {
+            if libc::tcgetsid(fd) == me {
                 libc::tcflush(fd, libc::TCOFLUSH);
             }
         }
         libc::_exit(held_end_code(ASKED_BY.load(Ordering::Relaxed)))
     }
+}
+
+/// The opens of its own that gave their terminal up: the screen's, and the lines' where
+/// standard error is another terminal.
+fn held_opens() -> impl Iterator<Item = RawFd> {
+    let screen = if TERMINAL_HELD.load(Ordering::Relaxed) { own_output() } else { None };
+    let lines = if LINES_HELD.load(Ordering::Relaxed) { lines_output() } else { None };
+    screen.into_iter().chain(lines)
 }
 
 /// The screen's own open of its terminal for output, which does not wait in a write: a
@@ -594,13 +610,14 @@ impl OwnOutput {
     }
 }
 
-/// Writes one of the manager's own lines to standard error. Where that is the terminal the
-/// screen has its own open of, the line goes through that open, as the screen's writes do:
-/// a plain write to a terminal that takes nothing waits in the kernel, and the manager
-/// speaks in the middle of its stop (a daemon that did not stop in time is named before it
-/// is killed), so the write would hold the rest of the stop, the daemons not yet stopped
-/// still serving. Given up as the screen is, it says nothing from then on. Elsewhere, a
-/// file or a pipe or another terminal, it is written plainly.
+/// Writes one of the manager's own lines to standard error. Where that is a terminal, the
+/// line goes through an open of it that does not wait, the screen's own where it is the
+/// screen's terminal, as the screen's writes do: a plain write to a terminal that takes
+/// nothing waits in the kernel, and the manager speaks in the middle of its stop (a daemon
+/// that did not stop in time is named before it is killed), so the write would hold the
+/// rest of the stop, the daemons not yet stopped still serving. Given up as the screen is,
+/// it says nothing from then on. Elsewhere, a file or a pipe, or a terminal that cannot be
+/// opened again, it is written plainly.
 pub(crate) fn say_on_stderr(line: &str) {
     use std::io::Write as _;
     // Asked to stop, the manager only ends, and no word of that end may stop it for the
@@ -618,19 +635,11 @@ pub(crate) fn say_on_stderr(line: &str) {
     // unasked does. So a stop for the terminal interrupts a line's write on both, and each
     // continue asks first.
     let _interrupted = crate::passphrase::StopsInterrupt::new();
-    static SAME: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
-    let own = *SAME.get_or_init(|| {
-        let fd = own_output()?;
-        let mut err: libc::stat = unsafe { std::mem::zeroed() };
-        let mut ours: libc::stat = unsafe { std::mem::zeroed() };
-        let same = unsafe {
-            libc::isatty(2) == 1 && libc::fstat(2, &mut err) == 0 && libc::fstat(fd, &mut ours) == 0
-        } && err.st_rdev == ours.st_rdev;
-        same.then_some(fd)
-    });
+    static SAME: std::sync::OnceLock<Option<(RawFd, &'static AtomicBool)>> = std::sync::OnceLock::new();
+    let own = *SAME.get_or_init(|| lines_open(own_output(), 2, lines_output));
     match own {
-        Some(fd) => {
-            let mut out = OwnOutput { to_be_left: waits_to_be_left, ..OwnOutput::of_the_screen(fd) };
+        Some((fd, held)) => {
+            let mut out = OwnOutput { to_be_left: waits_to_be_left, held, ..OwnOutput::of_the_screen(fd) };
             let _ = out.write_all(line.as_bytes());
         }
         None => {
@@ -657,6 +666,34 @@ pub(crate) fn say_on_stderr(line: &str) {
 fn own_output() -> Option<RawFd> {
     static OWN: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
     *OWN.get_or_init(open_own_output)
+}
+
+/// Standard error's terminal opened again for the manager's lines, made once; None where there
+/// is none to make. By its name alone on macOS, where poll cannot watch /dev/tty.
+fn lines_output() -> Option<RawFd> {
+    static OWN: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
+    *OWN.get_or_init(|| reopen_terminal(2, cfg!(target_os = "linux")))
+}
+
+/// The open the manager's lines go through where `err` is a terminal, and the flag that open
+/// gives its terminal up by: the screen's own where that is `err`'s terminal, whose giving up
+/// is the screen's; else one of `err`'s own, whose giving up is the lines' alone.
+fn lines_open(
+    screen: Option<RawFd>,
+    err: RawFd,
+    reopen: impl FnOnce() -> Option<RawFd>,
+) -> Option<(RawFd, &'static AtomicBool)> {
+    if unsafe { libc::isatty(err) } != 1 {
+        return None;
+    }
+    let rdev = |fd: RawFd| {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_rdev)
+    };
+    match screen {
+        Some(fd) if rdev(fd).is_some() && rdev(fd) == rdev(err) => Some((fd, &TERMINAL_HELD)),
+        _ => reopen().map(|fd| (fd, &LINES_HELD)),
+    }
 }
 
 impl io::Write for OwnOutput {
@@ -691,12 +728,12 @@ impl io::Write for OwnOutput {
                 _ => return Err(err),
             }
             self.refused += 1;
+            // Only the waits a stop was asked before are counted, below: with nothing asked a
+            // terminal may take nothing for ever. Nor is the count set back with nothing asked:
+            // a stop is never taken back, and a blocked one is asked of nothing only for the
+            // moment between its handler's or sigwait's taking it and its being noted.
             let asked = (self.to_be_left)();
-            if !asked {
-                // Nothing asked: a terminal may take nothing for ever, and the count
-                // starts at the asking.
-                waited = Duration::ZERO;
-            } else if waited >= self.held_after {
+            if waited >= self.held_after {
                 self.held.store(true, Ordering::Relaxed);
                 continue;
             }
@@ -1196,6 +1233,16 @@ fn run_ui(
     spawn: Option<Arc<SpawnCtx>>,
 ) -> Result<()> {
     stop_on_signals();
+    // The signals the screen handles, whatever its parent blocked: a TERM would never reach
+    // its handler, nor a WINCH crossterm's. The embedded start has lifted them already.
+    unsafe {
+        let mut handled: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut handled);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGWINCH] {
+            libc::sigaddset(&mut handled, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &handled, std::ptr::null_mut());
+    }
     let ttys: Vec<i32> = [0, 1, 2]
         .into_iter()
         .filter(|&fd| unsafe { libc::isatty(fd) } == 1)
@@ -5859,6 +5906,42 @@ fn read_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manager's lines go through the screen's own open where standard error is the
+    /// screen's terminal, and give the screen up with it; on another terminal, or with no
+    /// screen open, through one of their own, whose giving up is theirs alone; elsewhere,
+    /// through none.
+    #[test]
+    fn the_lines_open_and_what_it_gives_up() {
+        let pty = || {
+            let (mut m, mut s) = (0, 0);
+            let rc = unsafe {
+                libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+            };
+            assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());
+            (m, s)
+        };
+        let ((ma, sa), (mb, sb)) = (pty(), pty());
+        let sa2 = unsafe { libc::dup(sa) };
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+        assert!(sa2 >= 0 && null >= 0, "dup or /dev/null failed");
+        let is = |got: Option<(RawFd, &'static AtomicBool)>, fd: RawFd, held: &'static AtomicBool| {
+            matches!(got, Some((f, h)) if f == fd && std::ptr::eq(h, held))
+        };
+        let same = lines_open(Some(sa), sa2, || panic!("the screen's terminal opened again"));
+        let other = lines_open(Some(sa), sb, || Some(sb));
+        let alone = lines_open(None, sb, || Some(sb));
+        let none = lines_open(Some(sa), null, || Some(sb));
+        unsafe {
+            for fd in [ma, sa, mb, sb, sa2, null] {
+                libc::close(fd);
+            }
+        }
+        assert!(is(same, sa, &TERMINAL_HELD), "the screen's terminal: not the screen's open and flag");
+        assert!(is(other, sb, &LINES_HELD), "another terminal: not an open of its own with the lines' flag");
+        assert!(is(alone, sb, &LINES_HELD), "no screen open: not an open of its own with the lines' flag");
+        assert!(none.is_none(), "standard error no terminal: an open all the same");
+    }
 
     /// Where standard input is no terminal and the screen did not make it its own (its open
     /// failed), job control is asked of the controlling terminal, opened above the standard

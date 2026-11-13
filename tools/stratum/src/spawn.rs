@@ -266,12 +266,14 @@ fn output_until(
         }
         let asked_before = asked;
         asked = to_be_left();
-        if took || !asked {
+        if took {
             waited = Duration::ZERO;
             continue;
         }
-        // Counted, the wait the asking came in would give the helper up as much as a tick
-        // before its limit.
+        // Only the waits a stop was asked before are counted, and nothing asked never sets the
+        // count back: a stop is never taken back, but a blocked one is asked of nothing for the
+        // moment between its being taken and its being noted. Counted, the wait the asking came
+        // in would give the helper up as much as a tick before its limit.
         if asked_before {
             waited += began.elapsed().min(tick);
         }
