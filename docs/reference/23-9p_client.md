@@ -95,6 +95,11 @@ up on may still come, so every later call is refused with
 STM_EBACKEND. A wait counts for what it lasted and for a tick at most:
 a wait a signal cut short counts for less than a tick, and a process
 that was stopped, or a machine that slept, has not waited meanwhile.
+It is counted to the nanosecond, so waits that a storm of signals cuts
+under a millisecond still add up, and only where `to_leave` said true
+at the look before it and at the look after it: the wait a stop is
+asked in began before the asking, so a call is given up no sooner than
+`give_up_after_ms` after it.
 Bytes sent or received start the count again, so a daemon that is only
 slow is waited for. So does the daemon's reading of what the kernel
 already holds, where the system tells of it. A message goes into the
@@ -303,7 +308,8 @@ struct stm_9p_client {
     int       last_errno;     /* last read/write syscall errno */
     bool      poisoned;       /* tag-mismatch detected, or a call given up */
     stm_9p_wait wait;         /* copied at dial; to_leave NULL = none */
-    uint64_t  waited_ms;      /* since to_leave said true, nothing moved */
+    uint64_t  waited_ns;      /* since to_leave said true, nothing moved */
+    bool      asked;          /* what to_leave said at the last look */
     int       unread;         /* Linux: the socket's unread output at the last tick; -1 */
     uint8_t  *buf;            /* msize-sized request/response buffer */
 };

@@ -574,6 +574,8 @@ pub(crate) fn say_on_stderr(line: &str) {
     // Asked to stop, the manager only ends, and no word of that end may stop it for the
     // terminal: under `stty tostop` a line written from behind its shell would, the daemons
     // not yet stopped still serving, and a TERM held blocked could not end it until `fg`.
+    // The line's stop below asks the same and, a stop asked, returns without stopping;
+    // this look spares the line that stop and the write it interrupts.
     if stop_asked() {
         crate::embed::never_stop_for_the_terminal();
     }
@@ -607,6 +609,7 @@ pub(crate) fn say_on_stderr(line: &str) {
                     Ok(0) => break,
                     Ok(n) => left = &left[n..],
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                        // As the screen's write asks, and for the same reason.
                         if stop_asked() {
                             crate::embed::never_stop_for_the_terminal();
                         }
@@ -642,8 +645,11 @@ impl io::Write for OwnOutput {
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINTR) => {
-                    // Stopped for the terminal and continued, the write is made again: a
-                    // stop asked meanwhile must not find it stopped there a second time.
+                    // Under a line's guard what interrupts the write is the line's stop: it
+                    // stopped the manager until a continue or, a stop being asked, returned
+                    // at once without stopping it. Made again unasked, the write would come
+                    // straight back here for as long as a stop is asked, the manager
+                    // spinning; so it asks first.
                     if stop_asked() {
                         crate::embed::never_stop_for_the_terminal();
                     }

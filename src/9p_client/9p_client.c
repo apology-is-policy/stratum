@@ -163,7 +163,7 @@ struct stm_9p_client {
      * this client has waited since to_leave said true with nothing sent, nothing
      * received, and nothing the daemon was seen to take. */
     stm_9p_wait wait;
-    uint64_t    waited_ms;
+    uint64_t    waited_ns;
     /* What to_leave said when it was last asked. A wait counts only where that was
      * true before it began. */
     bool        asked;
@@ -183,13 +183,15 @@ static uint64_t mono_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 }
 
-/* How long a wait that began at `began` counts for: the whole milliseconds it lasted,
- * and a tick at most. Two readings in milliseconds can lie up to one more apart than
- * the wait lasted, and a limit is not to be reached by time nobody waited. */
-static uint64_t counted_ms(const stm_9p_wait *w, uint64_t began)
+/* How long a wait that began at `began` counts for: what it lasted, to the nanosecond,
+ * and a tick at most. A limit is not to be reached by time nobody waited, nor put off by
+ * a storm of signals that cuts every wait short: floored to whole milliseconds, a wait
+ * under one would count for nothing. */
+static uint64_t counted_ns(const stm_9p_wait *w, uint64_t began)
 {
-    uint64_t took = (mono_ns() - began) / 1000000u;
-    return took < w->tick_ms ? took : w->tick_ms;
+    uint64_t took = mono_ns() - began;
+    uint64_t tick = (uint64_t)w->tick_ms * 1000000u;
+    return took < tick ? took : tick;
 }
 
 /* Whether the daemon has read any of what the kernel held of this client's writes since
@@ -235,14 +237,14 @@ static stm_status wait_until(stm_9p_client *c, short events)
     c->asked = c->wait.to_leave(c->wait.arg);
     if (!c->asked) return STM_OK;
     if (took) {
-        c->waited_ms = 0;
+        c->waited_ns = 0;
         return STM_OK;
     }
     /* The wait a stop is asked in began before the asking: counted, it would give
      * the call up as much as a tick before its limit. */
     if (!asked_before) return STM_OK;
-    c->waited_ms += counted_ms(&c->wait, began);
-    if (c->waited_ms >= c->wait.give_up_after_ms) {
+    c->waited_ns += counted_ns(&c->wait, began);
+    if (c->waited_ns >= (uint64_t)c->wait.give_up_after_ms * 1000000u) {
         c->poisoned = 1;
         c->last_errno = ETIMEDOUT;
         return STM_EIO;
@@ -271,7 +273,7 @@ static stm_status send_all(stm_9p_client *c, const void *buf, size_t len)
             return STM_EIO;
         }
         done += (size_t)n;
-        c->waited_ms = 0;
+        c->waited_ns = 0;
     }
     return STM_OK;
 }
@@ -297,7 +299,7 @@ static stm_status recv_all(stm_9p_client *c, void *buf, size_t len)
             return STM_EIO;
         }
         done += (size_t)n;
-        c->waited_ms = 0;
+        c->waited_ns = 0;
     }
     return STM_OK;
 }
@@ -469,7 +471,7 @@ static stm_status do_connect(const char *socket_path, const stm_9p_wait *wait,
             return STM_EIO;
         }
     }
-    uint64_t waited_ms = 0;
+    uint64_t waited_ns = 0;
     bool asked = false;
     while (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
         /* What a connect that was under way says once it is made. */
@@ -487,8 +489,8 @@ static stm_status do_connect(const char *socket_path, const stm_9p_wait *wait,
         asked = wait->to_leave(wait->arg);
         /* As a call's wait: one that began before the asking is not counted. */
         if (!asked || !asked_before) continue;
-        waited_ms += counted_ms(wait, began);
-        if (waited_ms >= wait->give_up_after_ms) {
+        waited_ns += counted_ns(wait, began);
+        if (waited_ns >= (uint64_t)wait->give_up_after_ms * 1000000u) {
             *out_errno = ETIMEDOUT;
             close(fd);
             return STM_EIO;

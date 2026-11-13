@@ -1861,6 +1861,14 @@ def cpu_seconds(pid):
     return seconds + (int(days) * 86400 if days else 0)
 
 
+def how_it_ran(pid, spent_before, took):
+    """Of a manager that neither ended nor stopped in `took` s: whether it spun meanwhile."""
+    spent = cpu_seconds(pid) - spent_before
+    if spent >= took / 2:
+        return f', running all the while ({spent:.0f} s of CPU)'
+    return f', {spent:.1f} s of CPU'
+
+
 def wait_state(term, pid, want, timeout):
     """`pid`'s state once it shows `want`, or when the time is up. The terminal is read meanwhile:
     one given back with TCSAFLUSH waits for its output to be read."""
@@ -2516,6 +2524,7 @@ def stuck_start_behind_leg(stratum, root):
                           f'the manager\'s state {state!r}, the terminal {tty_modes(term)}, '
                           f'{why_not or "behind under tostop"}: it proves nothing')
         seen = len(term.raw)
+        spent_before = cpu_seconds(manager)
         # As `kill %1` on a job that runs.
         # Taken before the signal: what is measured is then no shorter than what the manager waited.
         began = time.monotonic()
@@ -2526,13 +2535,14 @@ def stuck_start_behind_leg(stratum, root):
             if not ended and 'T' in state_of(manager):
                 stopped = state_of(manager)
         took = time.monotonic() - began
+        ran = '' if ended or stopped else how_it_ran(manager, spent_before, took)
         words = ' | '.join(l.strip() for l in bytes(term.raw[seen:]).decode('utf-8', 'replace').splitlines() if l.strip())
         print(f'note: {how}: after the stop was asked the manager said: {words[:600]}', flush=True)
         record(ended and term.rc == 1 and not stopped,
                f'{how}: the stop ended the manager, rc 1, and no word of its end stopped it',
                f'{how}: the manager ended={ended} rc={term.rc} {took:.0f} s after the stop was asked'
                + (f', stopped behind (state {stopped!r}) with {len(session_daemons(session))} daemons running'
-                  if stopped else ''))
+                  if stopped else ran))
         if ended:
             record('asked to stop before the screen' in words and 'pre-attach failed' not in words,
                    f'{how}: the manager said it was asked to stop before the screen, from behind',
@@ -2576,6 +2586,7 @@ def stopped_at_a_line_leg(stratum, vol, root):
             said, env_file = behind_at_its_warning(stratum, root, name, how, job, **shape)
             term, manager, session = job['term'], job['manager'], job['session']
             seen = len(term.raw)
+            spent_before = cpu_seconds(manager)
             # As `kill %1` on a stopped job: the signal, then a continue, to its group.
             os.killpg(os.getpgid(manager), signal.SIGTERM)
             os.killpg(os.getpgid(manager), signal.SIGCONT)
@@ -2586,6 +2597,7 @@ def stopped_at_a_line_leg(stratum, vol, root):
                 if not ended and 'T' in state_of(manager):
                     stopped = state_of(manager)
             took = time.monotonic() - began
+            ran = '' if ended or stopped else how_it_ran(manager, spent_before, took)
             words = ' | '.join(l.strip() for l in bytes(term.raw[seen:]).decode('utf-8', 'replace').splitlines()
                                if l.strip())
             print(f'note: {how}: after the stop was asked the manager said: {words[:600]}', flush=True)
@@ -2593,7 +2605,7 @@ def stopped_at_a_line_leg(stratum, vol, root):
                    f'{how}: the stop ended the manager, rc 1, and the line did not stop it a second time ({took:.1f} s)',
                    f'{how}: the manager ended={ended} rc={term.rc} {took:.0f} s after the stop was asked'
                    + (f', stopped behind again (state {stopped!r}) with {len(session_daemons(session))} daemons running'
-                      if stopped else ''))
+                      if stopped else ran))
             if ended:
                 record('print-env-to' in words and 'asked to stop before the screen' in words,
                        f'{how}: it said the line it was stopped at, then that it was asked to stop before the screen',
