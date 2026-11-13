@@ -118,6 +118,20 @@ void stm_sync_set_read_prepopulate_hook_for_test(stm_sync *s,
                                                     void *ctx);
 
 /*
+ * The read's stale-record seam: invoked by a LOCK-FREE fetch (the
+ * stm_sync_read_extent miss path) before it uses anything its extent
+ * record names. The record is a copy by then and no pin and no lock is
+ * held, so a hook may rotate, overwrite and sweep: that is the window
+ * in which the record's key can be pruned under the reader. It does
+ * NOT fire on locked-context fetches, the read's own second attempt
+ * among them, so a hook that takes s->lock is safe. Pass hook=NULL to
+ * clear.
+ */
+void stm_sync_set_read_prefetch_hook_for_test(stm_sync *s,
+                                                 void (*hook)(void *ctx),
+                                                 void *ctx);
+
+/*
  * RC-6 (#35) read-window seam, the [insert, publish] twin of the
  * prepopulate hook: invoked by the HOT-extent fetch between the
  * PROVISIONAL dcache insert and its commit-or-kill publish

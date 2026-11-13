@@ -574,6 +574,8 @@ struct stm_sync {
      * open. */
     void            (*write_phase2_test_hook)(void *ctx);
     void             *write_phase2_test_ctx;
+    void            (*read_prefetch_test_hook)(void *ctx);
+    void             *read_prefetch_test_ctx;
     void            (*read_prepopulate_test_hook)(void *ctx);
     void             *read_prepopulate_test_ctx;
     void            (*read_postinsert_test_hook)(void *ctx);
@@ -5768,6 +5770,17 @@ void stm_sync_set_write_phase2_hook_for_test(stm_sync *s,
     pthread_mutex_unlock(&s->lock);
 }
 
+void stm_sync_set_read_prefetch_hook_for_test(stm_sync *s,
+                                                 void (*hook)(void *ctx),
+                                                 void *ctx)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->read_prefetch_test_hook = hook;
+    s->read_prefetch_test_ctx  = ctx;
+    pthread_mutex_unlock(&s->lock);
+}
+
 void stm_sync_set_read_prepopulate_hook_for_test(stm_sync *s,
                                                     void (*hook)(void *ctx),
                                                     void *ctx)
@@ -7510,6 +7523,11 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
                                                size_t *out_read) {
     stm_extent_record rec = *rec_in;
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+    if (ebr && s->read_prefetch_test_hook)
+        s->read_prefetch_test_hook(s->read_prefetch_test_ctx);
+#endif
+
     /* P7-CAS-2: COLD-extent read. Resolve content_hash → CAS index
      * entry → AEAD-decrypt one of the replicas under stm_ad_cas
      * (binds to pool_uuid + content_hash). Mirrors the HOT path
@@ -7843,7 +7861,11 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
      * STM_EBUSY from the lookup (a mid-walk engine seal) retries whole
      * with a FRESH pin per attempt (the CF-2c contract); exhaustion
      * falls back to the serial locked path, which does not touch the
-     * seal machinery — a read never surfaces EBUSY.
+     * seal machinery -- a read never surfaces EBUSY. A miss whose
+     * unlocked fetch FAILS falls back the same way: the fetch works
+     * from a copy of the record, which a rotate + overwrite + sweep
+     * can outdate between the lookup's pin and the key's, so only the
+     * locked path's error is one about the data.
      *
      * The !ebr fallback (thread-handle registration OOM) and the
      * EBUSY-exhaustion fallback keep the pre-RC locked body verbatim
@@ -7899,6 +7921,15 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             } else {
                 rc = sync_extent_fetch_decrypt(s, ebr, &rec, slice_off,
                                                  slice_len, buf, out_read);
+                /* The record is a copy, and the pin it was taken under has
+                 * been left: an overwrite may have replaced it since, and
+                 * what it names been retired after it (its key pruned by a
+                 * sweep, its content entry collected, its blocks given out
+                 * again by a commit). So a failure here is no word about
+                 * the data. The read is made again below under s->lock,
+                 * where the record is looked up and used in one span that
+                 * none of those enters, and that result is the read's. */
+                if (rc != STM_OK) break;
             }
 
             /* P7-CAS-11/12/14: COLD promote-read-hit bump (live reads
@@ -7918,8 +7949,9 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             }
             return rc;
         }
-        /* EBUSY retries exhausted — fall through to the serial locked
-         * path (different lookup machinery; cannot EBUSY). */
+        /* EBUSY retries exhausted, or the unlocked fetch failed -- fall
+         * through to the serial locked path (different lookup machinery;
+         * cannot EBUSY, and its record cannot go stale under it). */
     }
 
     pthread_mutex_lock(&s->lock);

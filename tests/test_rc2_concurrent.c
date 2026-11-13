@@ -51,6 +51,7 @@
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
 #include <stratum/sync.h>
+#include <stratum/sync_testing.h>
 
 #include <pthread.h>
 #include <sched.h>
@@ -348,6 +349,7 @@ typedef struct {
     _Atomic size_t *reads_ok;
     _Atomic size_t *content_bad;
     _Atomic size_t *read_err;
+    atomic_int     *first_err;   /* the first status a read failed with */
 } drh_reader_ctx;
 
 static void *drh_reader(void *arg)
@@ -371,6 +373,8 @@ static void *drh_reader(void *arg)
              * interleaving with rotate + overwrite + sweep. An
              * ECORRUPT here = a reader observed a torn or stale-
              * beyond-the-pin map. */
+            int none = 0;
+            atomic_compare_exchange_strong(c->first_err, &none, (int)rc);
             atomic_fetch_add(c->read_err, 1u);
             continue;
         }
@@ -403,8 +407,10 @@ STM_TEST(rc2_dek_rotate_sweep_hammer) {
     _Atomic size_t content_bad = 0;
     _Atomic size_t read_err    = 0;
 
+    atomic_int     first_err   = 0;
+
     drh_reader_ctx rctx = { f.sync, &stop, &reads_ok, &content_bad,
-                            &read_err };
+                            &read_err, &first_err };
     pthread_t readers[DRH_READERS];
     for (int i = 0; i < DRH_READERS; i++)
         STM_ASSERT_EQ(pthread_create(&readers[i], NULL, drh_reader, &rctx), 0);
@@ -442,9 +448,11 @@ STM_TEST(rc2_dek_rotate_sweep_hammer) {
     for (int i = 0; i < DRH_READERS; i++)
         STM_ASSERT_EQ(pthread_join(readers[i], NULL), 0);
 
-    stm_test_info("rc2 drh: cycles=%zu reads_ok=%zu content_bad=%zu err=%zu",
+    stm_test_info("rc2 drh: cycles=%zu reads_ok=%zu content_bad=%zu err=%zu "
+                  "(first status %d)",
                   cycles_done, atomic_load(&reads_ok),
-                  atomic_load(&content_bad), atomic_load(&read_err));
+                  atomic_load(&content_bad), atomic_load(&read_err),
+                  atomic_load(&first_err));
 
     STM_ASSERT(cycles_done >= 8u);
     STM_ASSERT(atomic_load(&reads_ok) >= DRH_READS_MIN);
@@ -452,6 +460,78 @@ STM_TEST(rc2_dek_rotate_sweep_hammer) {
     STM_ASSERT_EQ(atomic_load(&read_err), 0u);
 
     free(wbuf);
+    rc2_fixture_close(&f);
+}
+
+/* ========================================================================= */
+/* rc2_read_outlives_its_records_key                                          */
+/* ========================================================================= */
+
+/* What the hammer above can only meet by chance, staged: a lock-free
+ * reader has its extent record, a copy, and before it resolves the
+ * record's key the key is rotated away from, the extent written again
+ * under the new one, and the old key swept. The record's key is gone
+ * and the data is whole. The read has to come back with the extent as
+ * it now is. */
+typedef struct {
+    stm_sync  *s;
+    int        fired;
+    stm_status rotated, written, swept;
+    size_t     pruned;
+} stale_ctx;
+
+static void stale_hook(void *arg)
+{
+    stale_ctx *h = arg;
+    if (h->fired++) return;
+    uint64_t new_kid = 0, old_kid = 0;
+    h->rotated = stm_sync_rotate_dataset_key(h->s, 1u, rc2_wk(), NULL,
+                                                &new_kid, &old_kid);
+    uint8_t *w = malloc(DRH_LEN);
+    if (!w) { h->written = STM_ENOMEM; return; }
+    rc2_fill(w, 1u, 1u, DRH_LEN);
+    h->written = stm_sync_write_extent(h->s, 1u, 1u, 0u, w, DRH_LEN);
+    free(w);
+    h->swept = stm_sync_keyschema_sweep(h->s, 1u, &h->pruned);
+}
+
+STM_TEST(rc2_read_outlives_its_records_key) {
+    struct rc2_fixture f;
+    rc2_fixture_open(&f, "stale");
+
+    uint8_t *wbuf = malloc(DRH_LEN);
+    uint8_t *buf  = malloc(DRH_LEN);
+    STM_ASSERT(wbuf != NULL && buf != NULL);
+    rc2_fill(wbuf, 1u, 0u, DRH_LEN);
+    STM_ASSERT_OK(stm_sync_write_extent(f.sync, 1u, 1u, 0u, wbuf, DRH_LEN));
+    /* The write left its plaintext in the cache, and a read served
+     * from there resolves no key. */
+    stm_sync_dcache_drain_for_test(f.sync);
+
+    stale_ctx h = { f.sync, 0, STM_EINVAL, STM_EINVAL, STM_EINVAL, 0 };
+    stm_sync_set_read_prefetch_hook_for_test(f.sync, stale_hook, &h);
+    size_t got = 0;
+    stm_status rc = stm_sync_read_extent(f.sync, 1u, 1u, 0u, buf, DRH_LEN,
+                                           &got);
+    stm_sync_set_read_prefetch_hook_for_test(f.sync, NULL, NULL);
+
+    /* The premise, or the read below proves nothing: the reader was in
+     * the window, once, and the key its record names was pruned there. */
+    STM_ASSERT_EQ(h.fired, 1);
+    STM_ASSERT_OK(h.rotated);
+    STM_ASSERT_OK(h.written);
+    STM_ASSERT_OK(h.swept);
+    STM_ASSERT_EQ(h.pruned, 1u);
+
+    STM_ASSERT_OK(rc);
+    STM_ASSERT_EQ(got, (size_t)DRH_LEN);
+    /* Made again under the lock, the read is of the extent as written
+     * in the window: the second version, whole. */
+    STM_ASSERT_EQ(rc2_ver_of(1u, 0u, buf[0]), 1u);
+    STM_ASSERT_EQ(rc2_verify_ver(buf, 1u, 1u, 0u, got), 0);
+
+    free(wbuf);
+    free(buf);
     rc2_fixture_close(&f);
 }
 
