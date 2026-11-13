@@ -803,8 +803,7 @@ fn put_terminal_back() {
     // For good, on an error or a panic: a terminal that takes nothing is not waited for
     // longer than after a stop asked.
     LEAVING.store(true, Ordering::Relaxed);
-    let tty = [0, 1, 2].into_iter().find(|&fd| unsafe { libc::isatty(fd) } == 1);
-    if job_in_front(tty) {
+    if job_in_front(SetTerminal::open().fd) {
         leave_screen(&mut ScreenOut::new());
     } else {
         leave_screen_behind(&mut ScreenOut::new());
@@ -981,6 +980,37 @@ impl Drop for OwnInput {
     }
 }
 
+/// The terminal crossterm sets, which job control is asked of: standard input when it is one,
+/// else the controlling terminal, opened here and kept while this lives. Asked of another, the
+/// job could be said in front of a set that stops behind.
+struct SetTerminal {
+    fd: Option<RawFd>,
+    _opened: Option<std::os::fd::OwnedFd>,
+}
+
+impl SetTerminal {
+    fn open() -> SetTerminal {
+        use std::os::fd::FromRawFd;
+        if unsafe { libc::isatty(0) } == 1 {
+            return SetTerminal { fd: Some(0), _opened: None };
+        }
+        let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        let mut fd = unsafe { libc::open(c"/dev/tty".as_ptr(), flags) };
+        if fd < 0 {
+            return SetTerminal { fd: None, _opened: None };
+        }
+        // Not where a closed standard descriptor was: output to it would come here.
+        if fd <= 2 {
+            let above = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+            if above >= 0 {
+                unsafe { libc::close(fd) };
+                fd = above;
+            }
+        }
+        SetTerminal { fd: Some(fd), _opened: Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }) }
+    }
+}
+
 static SUSPEND_ASKED: AtomicBool = AtomicBool::new(false);
 static CONTINUED: AtomicBool = AtomicBool::new(false);
 
@@ -1106,11 +1136,12 @@ fn run_ui(
         .into_iter()
         .filter(|&fd| unsafe { libc::isatty(fd) } == 1)
         .collect();
-    let tty = ttys.first().copied();
     // Before any thread looks at standard input, and before crossterm first does: its poll
     // watches the descriptor it finds there.
     let own_input = OwnInput::take();
     let input = (own_input.is_some() || unsafe { libc::isatty(0) } == 1).then_some(0);
+    let set_terminal = SetTerminal::open();
+    let tty = set_terminal.fd;
     if !ttys.is_empty() {
         exit_when_terminal_goes(ttys, spawn.as_ref().map(|s| s.session_dir.clone()));
     }
