@@ -305,7 +305,8 @@ struct stm_9p_client {
     uint32_t  msize;          /* negotiated; 0 before Tversion */
     uint32_t  iounit;         /* msize - hdr - 4 */
     uint16_t  next_tag;       /* cycles over 1..NOTAG-1; 0 unused */
-    int       last_errno;     /* last read/write syscall errno */
+    int       last_errno;     /* the last call's: its syscall's errno, ETIMEDOUT,
+                                 EPIPE or EPROTO; 0 after a reply */
     int       poisoned;       /* tag-mismatch detected, or a call given up */
     uint8_t  *buf;            /* msize-sized request/response buffer */
     uint32_t  buf_cap;        /* its size */
@@ -322,10 +323,10 @@ write target.
 
 ### Tag auto-allocation
 
-Each request gets a fresh tag from `next_tag++`. v2.0 is one-op-at-
-a-time, so collisions are impossible within a connection. Wrap at
-`STM_9P_NOTAG` (0xFFFF): the lib refuses subsequent ops with
-STM_EOVERFLOW. Callers wanting >64K ops per client must reconnect.
+Each request takes `next_tag`, which then steps over 1..NOTAG-1 and
+wraps back to 1; no request uses 0 or `STM_9P_NOTAG` (0xFFFF), which
+Tversion alone uses. v2.0 is one-op-at-a-time, so no two requests in
+flight share a tag, and a client makes any number of calls.
 
 ### Five trust boundaries (R111 doctrine)
 

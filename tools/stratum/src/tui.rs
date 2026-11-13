@@ -395,13 +395,15 @@ pub fn stop_on_signals() {
 /// or anything else. Ending the process is the way out, and the daemons follow it
 /// on their lifeline. Linux fails tcgetattr on a terminal that has gone; macOS still
 /// answers it, and fails an empty write instead, which is asked there alone. Neither
-/// sends anything to a live one.
-fn exit_when_terminal_goes(ttys: Vec<i32>, session_dir: Option<PathBuf>) {
+/// sends anything to a live one. `copy`, the watcher's own descriptor for a terminal
+/// none of `ttys` is, stays open while the process lives.
+fn exit_when_terminal_goes(ttys: Vec<i32>, copy: Option<std::os::fd::OwnedFd>, session_dir: Option<PathBuf>) {
     let watch = crate::passphrase::spawn_helper("stratum-watch", move || loop {
         thread::sleep(WATCH_TICK);
+        let own = copy.as_ref().map(|fd| fd.as_raw_fd());
         // Every one of them: a read-only descriptor answers the write with EBADF, which
         // says nothing, so on macOS it could not see the terminal go.
-        if ttys.iter().any(|&tty| terminal_gone(tty)) {
+        if ttys.iter().copied().chain(own).any(terminal_gone) {
             if let Some(dir) = &session_dir {
                 let _ = std::fs::remove_dir_all(dir);
             }
@@ -409,6 +411,24 @@ fn exit_when_terminal_goes(ttys: Vec<i32>, session_dir: Option<PathBuf>) {
         }
     });
     watch.expect("spawn the terminal watcher");
+}
+
+/// A descriptor of the watcher's own for `tty`, the terminal the screen reads, unless one of
+/// `ttys` is that terminal. Where none is, nohup's way, the watcher would else watch nothing:
+/// standard input is that terminal only while the screen lasts, and is put back after.
+fn watch_copy(tty: Option<RawFd>, ttys: &[i32]) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let rdev = |fd: RawFd| {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_rdev)
+    };
+    let fd = tty?;
+    let own = rdev(fd)?;
+    if ttys.iter().any(|&t| rdev(t) == Some(own)) {
+        return None;
+    }
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    (copy >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(copy) })
 }
 
 /// Whether the terminal behind `tty` has gone. Asked at every look, and of a terminal that
@@ -449,8 +469,20 @@ pub(crate) const TAKE_TICK: Duration = Duration::from_millis(100);
 /// that has neither said anything nor ended.
 pub(crate) const HELD_AFTER: Duration = Duration::from_secs(10);
 
-/// The screen is being left for good: by a key, an error or a stop asked.
+/// The screen is being left for good: by a key, an error or a stop asked; headless, the stop
+/// taken.
 static LEAVING: AtomicBool = AtomicBool::new(false);
+
+/// Headless, the stop is taken by waiting for its signal `sig`, which no handler sees, and a
+/// stop that waits no longer counts as asked: from then on the manager is leaving, and a
+/// terminal that takes nothing holds its lines no longer than after a stop asked. `sig` is
+/// the one that asked, for the end of a manager its terminal held.
+pub(crate) fn leave_for_good(sig: libc::c_int) {
+    if sig > 0 {
+        let _ = ASKED_BY.compare_exchange(0, sig, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    LEAVING.store(true, Ordering::Relaxed);
+}
 
 /// The terminal took nothing for HELD_AFTER with the screen to be left. Nothing more is
 /// written to it: the screen's writes fail at once, and `tell` says nothing.
@@ -707,28 +739,44 @@ fn open_own_output() -> Option<RawFd> {
     if unsafe { libc::isatty(1) } != 1 {
         return None;
     }
+    reopen_terminal(1, cfg!(target_os = "linux"))
+}
+
+/// Headless, a daemon's words go to the terminal standard error is, through an open of its own
+/// that does not wait: a terminal that takes nothing then loses them, rather than hold the
+/// daemon in a write, its stop and its unmount behind it, as the manager's own words would
+/// not. None where standard error is no terminal, or its terminal cannot be opened again.
+pub(crate) fn daemon_words_out() -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    if unsafe { libc::isatty(2) } != 1 {
+        return None;
+    }
+    // Never polled, so /dev/tty serves on macOS too.
+    reopen_terminal(2, true).map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// The terminal `fd` is, opened again to write, by its name, which has to lead to `fd`'s own
+/// terminal; else, with `dev_tty`, /dev/tty where `fd`'s terminal is the controlling one.
+fn reopen_terminal(fd: RawFd, dev_tty: bool) -> Option<RawFd> {
     let flags = libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
     let mut name = [0 as libc::c_char; 1024];
-    #[allow(unused_mut)]
-    let mut fd = -1;
-    if unsafe { libc::ttyname_r(1, name.as_mut_ptr(), name.len()) } == 0 {
-        fd = unsafe { libc::open(name.as_ptr(), flags) };
-        // The name has to lead to standard output's own terminal.
+    let mut again = -1;
+    if unsafe { libc::ttyname_r(fd, name.as_mut_ptr(), name.len()) } == 0 {
+        again = unsafe { libc::open(name.as_ptr(), flags) };
         let mut ours: libc::stat = unsafe { std::mem::zeroed() };
         let mut named: libc::stat = unsafe { std::mem::zeroed() };
-        if fd >= 0
-            && unsafe { libc::fstat(1, &mut ours) != 0 || libc::fstat(fd, &mut named) != 0
+        if again >= 0
+            && unsafe { libc::fstat(fd, &mut ours) != 0 || libc::fstat(again, &mut named) != 0
                 || ours.st_rdev != named.st_rdev }
         {
-            unsafe { libc::close(fd) };
-            fd = -1;
+            unsafe { libc::close(again) };
+            again = -1;
         }
     }
-    #[cfg(target_os = "linux")]
-    if fd < 0 && unsafe { libc::tcgetsid(1) == libc::getsid(0) } {
-        fd = unsafe { libc::open(c"/dev/tty".as_ptr(), flags) };
+    if again < 0 && dev_tty && unsafe { libc::tcgetsid(fd) == libc::getsid(0) } {
+        again = unsafe { libc::open(c"/dev/tty".as_ptr(), flags) };
     }
-    (fd >= 0).then_some(fd)
+    (again >= 0).then_some(again)
 }
 
 /// The screen's output: through the terminal's own open where there is one, and else
@@ -803,8 +851,7 @@ fn put_terminal_back() {
     // For good, on an error or a panic: a terminal that takes nothing is not waited for
     // longer than after a stop asked.
     LEAVING.store(true, Ordering::Relaxed);
-    let tty = [0, 1, 2].into_iter().find(|&fd| unsafe { libc::isatty(fd) } == 1);
-    if job_in_front(tty) {
+    if job_in_front(SetTerminal::open().fd) {
         leave_screen(&mut ScreenOut::new());
     } else {
         leave_screen_behind(&mut ScreenOut::new());
@@ -862,6 +909,21 @@ fn enter_screen(out: &mut impl io::Write) {
     while enable_raw_mode().is_err_and(|e| e.kind() == io::ErrorKind::Interrupted) {}
     let _ = execute!(out, EnterAlternateScreen, EnableMouseCapture);
     SCREEN_ON.store(true, Ordering::Relaxed);
+}
+
+/// Blocks the job-control signals on this thread, and returns the mask to put back: a stop or
+/// a continue that comes meanwhile waits, and lands once the screen's handlers have gone.
+fn hold_job_signals() -> libc::sigset_t {
+    let mut jobs: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut jobs);
+        for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU, libc::SIGCONT] {
+            libc::sigaddset(&mut jobs, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &jobs, &mut prev);
+    }
+    prev
 }
 
 /// In front of its terminal, or with no job control there to be behind.
@@ -978,6 +1040,38 @@ impl OwnInput {
 impl Drop for OwnInput {
     fn drop(&mut self) {
         unsafe { libc::dup2(self.saved.as_raw_fd(), 0) };
+    }
+}
+
+/// The terminal crossterm sets, which job control is asked of: standard input when it is one,
+/// else the controlling terminal, opened here and kept while this lives. Asked of another, the
+/// job could be said in front of a set that stops behind. Opened to write as well: the watcher
+/// may watch a copy, and on macOS only a write tells it the terminal has gone.
+struct SetTerminal {
+    fd: Option<RawFd>,
+    _opened: Option<std::os::fd::OwnedFd>,
+}
+
+impl SetTerminal {
+    fn open() -> SetTerminal {
+        use std::os::fd::FromRawFd;
+        if unsafe { libc::isatty(0) } == 1 {
+            return SetTerminal { fd: Some(0), _opened: None };
+        }
+        let flags = libc::O_RDWR | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        let mut fd = unsafe { libc::open(c"/dev/tty".as_ptr(), flags) };
+        if fd < 0 {
+            return SetTerminal { fd: None, _opened: None };
+        }
+        // Not where a closed standard descriptor was: output to it would come here.
+        if fd <= 2 {
+            let above = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+            if above >= 0 {
+                unsafe { libc::close(fd) };
+                fd = above;
+            }
+        }
+        SetTerminal { fd: Some(fd), _opened: Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }) }
     }
 }
 
@@ -1106,13 +1200,15 @@ fn run_ui(
         .into_iter()
         .filter(|&fd| unsafe { libc::isatty(fd) } == 1)
         .collect();
-    let tty = ttys.first().copied();
     // Before any thread looks at standard input, and before crossterm first does: its poll
     // watches the descriptor it finds there.
     let own_input = OwnInput::take();
     let input = (own_input.is_some() || unsafe { libc::isatty(0) } == 1).then_some(0);
-    if !ttys.is_empty() {
-        exit_when_terminal_goes(ttys, spawn.as_ref().map(|s| s.session_dir.clone()));
+    let set_terminal = SetTerminal::open();
+    let tty = set_terminal.fd;
+    let copy = watch_copy(tty, &ttys);
+    if !ttys.is_empty() || copy.is_some() {
+        exit_when_terminal_goes(ttys, copy, spawn.as_ref().map(|s| s.session_dir.clone()));
     }
     put_terminal_back_on_panic();
     // Before the screen goes in, so that no stop from outside finds it raw and uncaught.
@@ -1124,6 +1220,22 @@ fn run_ui(
     };
     // Started behind, the set stops until `fg`, as any program's does.
     match crate::passphrase::set_when_in_front(|| job_in_front(tty), stop_asked, enable_raw_mode) {
+        // A stop asked while the set waited behind, with no continue to end the wait there
+        // (`kill -INT %1`), waits through the set, and is seen once it is made at `fg`: the
+        // screen does not go up, and the mode goes back as the teardown puts it back.
+        Ok(true) if stop_asked() => {
+            let prev = hold_job_signals();
+            let in_front = job_in_front(tty);
+            if in_front {
+                while disable_raw_mode().is_err_and(|e| e.kind() == io::ErrorKind::Interrupted) {}
+            }
+            put_back(job_control_caught);
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &prev, std::ptr::null_mut()) };
+            if !in_front {
+                crate::embed::never_stop_for_the_terminal();
+            }
+            return Err(anyhow::anyhow!("asked to stop before the screen"));
+        }
         Ok(true) => {}
         Ok(false) => {
             put_back(job_control_caught);
@@ -1553,15 +1665,7 @@ fn run_ui(
     LEAVING.store(true, Ordering::Relaxed);
     // The mode put back only in front: behind, the shell has the terminal, and a set from
     // there would stop until `fg`. A stop that comes meanwhile lands once the handlers have gone.
-    let mut jobs: libc::sigset_t = unsafe { std::mem::zeroed() };
-    let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::sigemptyset(&mut jobs);
-        for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU, libc::SIGCONT] {
-            libc::sigaddset(&mut jobs, sig);
-        }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &jobs, &mut prev);
-    }
+    let prev = hold_job_signals();
     let front = job_in_front(tty);
     if front {
         leave_screen(terminal.backend_mut());
@@ -5755,6 +5859,63 @@ fn read_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where standard input is no terminal and the screen did not make it its own (its open
+    /// failed), job control is asked of the controlling terminal, opened above the standard
+    /// descriptors. In a child with a pty for its controlling terminal, /dev/null for standard
+    /// input and the other two closed, so the open lands on one; only async-signal-safe calls
+    /// there, as the test binary has other threads, and the answer in the exit code.
+    #[test]
+    fn the_set_terminal_where_standard_input_is_no_terminal() {
+        let (mut m, mut s) = (0, 0);
+        let rc = unsafe {
+            libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+        assert!(null >= 0, "/dev/null did not open");
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::setsid();
+                if libc::ioctl(s, libc::TIOCSCTTY as _, 0) != 0 {
+                    libc::_exit(10);
+                }
+                libc::dup2(null, 0);
+                libc::close(1);
+                libc::close(2);
+                let set = SetTerminal::open();
+                let code = match set.fd {
+                    None => 11,
+                    Some(fd) if fd <= 2 => 12,
+                    Some(fd) if libc::isatty(fd) != 1 => 13,
+                    Some(fd) if libc::tcgetsid(fd) != libc::getsid(0) => 14,
+                    Some(_) => 0,
+                };
+                libc::_exit(code);
+            }
+        }
+        let mut status = 0;
+        let got = unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe {
+            libc::close(null);
+            libc::close(s);
+            libc::close(m);
+        }
+        assert_eq!(got, pid, "the child was not waited for");
+        let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
+        let why = match code {
+            0 => "",
+            10 => "the pty did not become the controlling terminal: it proves nothing",
+            11 => "the set terminal was none",
+            12 => "the set terminal is a standard descriptor",
+            13 => "the set terminal is no terminal",
+            14 => "the set terminal is not the controlling one",
+            _ => "the child failed",
+        };
+        assert_eq!(code, 0, "standard input no terminal: {why}");
+    }
 
     /// A pty nobody reads unless the test does: its two ends, the terminal's end not
     /// waiting in a write.

@@ -208,7 +208,7 @@ impl EchoHeld {
         let given = set_when_in_front(
             || in_front(fd),
             stop_asked,
-            || match unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &orig) } {
+            || match set_dropping_input(fd, &orig) {
                 0 => Ok(()),
                 _ => Err(io::Error::last_os_error()),
             },
@@ -240,7 +240,7 @@ impl Drop for EchoHeld {
         // handlers go.
         let prev = block(&release_set());
         if in_front(fd) {
-            while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &self.orig) } != 0
+            while set_dropping_input(fd, &self.orig) != 0
                 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
             {}
         }
@@ -330,6 +330,17 @@ pub(crate) fn as_its_own_program(cmd: &mut std::process::Command) -> &mut std::p
     }
 }
 
+/// Sets `mode` at once, then drops what was typed. TCSAFLUSH would first wait for the output
+/// to be taken, on macOS for as long as the terminal reads nothing, and no stop asked ends
+/// that wait. Behind, each call stops the job for the terminal, as one set does. Returns 0, or
+/// -1 with errno set. Async-signal-safe.
+fn set_dropping_input(fd: RawFd, mode: &libc::termios) -> libc::c_int {
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, mode) } != 0 {
+        return -1;
+    }
+    unsafe { libc::tcflush(fd, libc::TCIFLUSH) }
+}
+
 /// In front of `fd`, or with no job control there to be behind: on a terminal that is not
 /// the controlling one (setsid, `su -c`) no shell has it, and tcgetpgrp fails.
 pub(crate) fn in_front(fd: RawFd) -> bool {
@@ -340,7 +351,8 @@ pub(crate) fn in_front(fd: RawFd) -> bool {
 /// Runs `set`, a terminal set, until done: behind, each try stops on SIGTTOU until `fg`, and
 /// a stop asked meanwhile, as `stop_asked` or the manager's own look tells, ends the wait.
 /// Returns whether it was done; an error other than EINTR (EIO: the terminal gone, or the
-/// group orphaned) ends it too.
+/// group orphaned) ends it too. `front` asks of the terminal `set` changes: one that said in
+/// front of a set stopped behind would, once a stop is asked, make it again for ever.
 pub(crate) fn set_when_in_front(
     front: impl Fn() -> bool,
     stop_asked: impl Fn() -> bool,
@@ -352,20 +364,17 @@ pub(crate) fn set_when_in_front(
     let _others = OthersWait::but(libc::SIGTTOU);
     let done = loop {
         // Never narrower than the stop's own look: once that says a stop is asked the stop
-        // returns at once, and a set made again unasked would fail at once, for ever.
+        // returns at once, and a set made again behind would fail at once, for ever. Nor tried
+        // behind once a stop is asked: each try sends SIGTTOU to the job's whole process group,
+        // and stops its other members, a pipeline's tee, while the manager ends.
         if !front() && (stop_asked() || crate::tui::stop_asked()) {
             break Ok(false);
         }
         match set() {
             Ok(()) => break Ok(true),
-            // Only the stop interrupts the set, the others waiting, and only from behind: once
-            // a stop is asked it returns at once. So the set is given up here whatever `front`
-            // says, which asks of a descriptor that need not be the one set.
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                if stop_asked() || crate::tui::stop_asked() {
-                    break Ok(false);
-                }
-            }
+            // The stop's return: behind, the look above sees to a stop asked meanwhile. After
+            // `fg` the job is in front, and the set made again gives a give-back's terminal back.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => break Err(e),
         }
     };
@@ -484,7 +493,7 @@ fn given_back_then_held(sig: libc::c_int, again: extern "C" fn(libc::c_int), fla
     unsafe {
         let errno = *errno_location();
         if in_front(fd) {
-            libc::tcsetattr(fd, libc::TCSAFLUSH, (*HOLD.orig.get()).as_ptr());
+            set_dropping_input(fd, &*(*HOLD.orig.get()).as_ptr());
         }
         stop_by(sig);
         libc::sigaction(sig, &action(again, flags), std::ptr::null_mut());
@@ -508,7 +517,7 @@ extern "C" fn held_again(_: libc::c_int) {
 
 unsafe fn hold_again(fd: RawFd) {
     if in_front(fd) {
-        libc::tcsetattr(fd, libc::TCSAFLUSH, (*HOLD.held.get()).as_ptr());
+        set_dropping_input(fd, &*(*HOLD.held.get()).as_ptr());
     }
 }
 
@@ -672,13 +681,13 @@ fn prompt_on(tty: File, label: &str) -> Result<(Zeroizing, EchoHeld)> {
     };
 
     // Cooked again, so the signal keys work while the key is derived, but with echo held
-    // off until the caller lets go. TCSAFLUSH: what was typed past the end is not left
-    // for the shell or the screen.
+    // off until the caller lets go. What was typed past the end is dropped, not left for
+    // the shell or the screen.
     let mut after = orig;
     if line.is_ok() {
         after.c_lflag &= !(libc::ECHO | libc::ECHONL);
     }
-    while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &after) } != 0
+    while set_dropping_input(fd, &after) != 0
         && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
     {}
     // So the next line is not glued to the hidden input.
@@ -692,14 +701,14 @@ fn prompt_on(tty: File, label: &str) -> Result<(Zeroizing, EchoHeld)> {
 /// Sets `quiet` and holds job control off until the terminal is given back, returning
 /// the mask to restore: a stop sent from outside then lands with the terminal sane. Only
 /// for the thread that reads, and the prompts run before the manager starts another.
-/// TCSAFLUSH drops what was typed ahead, which the cooked terminal showed in clear. The
+/// What was typed ahead, which the cooked terminal showed in clear, is dropped. The
 /// mode goes in before the block, so a caller in the background stops on SIGTTOU there,
 /// as any program does, rather than set a terminal it is not in front of.
 fn hold_terminal(fd: RawFd, quiet: &libc::termios) -> Result<libc::sigset_t> {
     let jobs = job_control_set();
     let off = libc::ECHO | libc::ICANON | libc::ISIG;
     for _ in 0..8 {
-        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, quiet) } != 0 {
+        if set_dropping_input(fd, quiet) != 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -951,8 +960,8 @@ mod prompt_tests {
         assert_eq!(line(&keys).expect("the character erased").len(), PASSPHRASE_MAX - 1);
     }
 
-    /// A pty whose fds no spawned child inherits, and whose output a thread reads: on
-    /// macOS a TCSAFLUSH waits for the output to be read.
+    /// A pty whose fds no spawned child inherits, and whose output a thread reads, as a
+    /// terminal's is: one not read fills, and a write to it waits.
     struct Pty {
         master: File,
         slave: Option<File>,
@@ -1393,14 +1402,14 @@ mod prompt_tests {
         }
     }
 
-    /// How a set ends whose every try fails as interrupted, in a child of this test's own:
-    /// `front`, what the job is said to be; `asked`, with a SIGQUIT waiting, blocked, which is
-    /// a stop asked, the caller's own look saying no. No terminal is set and no stop raised:
-    /// this is the set's loop. Some(true) where it ended as it should: behind and asked, given
-    /// up before the set was tried; said in front and asked, given up at its first interrupt;
-    /// nothing asked, made again until done. None where the child had not ended five seconds
-    /// on. The child makes only async-signal-safe calls: the test binary has other threads.
-    fn a_set_ends(front: bool, asked: bool) -> Option<bool> {
+    /// How a set's loop ends, in a child of this test's own: `front`, what the job is said to
+    /// be; `asked`, with a SIGQUIT waiting, blocked, which is a stop asked, the caller's own look
+    /// saying no; `fails`, how many tries fail as interrupted before one succeeds. No terminal
+    /// is set and no stop raised: this is the set's loop. Some(true) where it ended as it
+    /// should: behind and asked, given up before the set was tried; else made again on each
+    /// interrupt until done. None where the child had not ended five seconds on. The child
+    /// makes only async-signal-safe calls: the test binary has other threads.
+    fn a_set_ends(front: bool, asked: bool, fails: u32) -> Option<bool> {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
@@ -1427,18 +1436,17 @@ mod prompt_tests {
                     || false,
                     || {
                         tries += 1;
-                        if !asked && tries > 3 {
+                        if tries > fails {
                             Ok(())
                         } else {
                             Err(io::Error::from_raw_os_error(libc::EINTR))
                         }
                     },
                 );
-                let right = match (front, asked, done) {
-                    (false, false, Ok(true)) => tries == 4,
-                    (false, true, Ok(false)) => tries == 0,
-                    (true, true, Ok(false)) => tries == 1,
-                    _ => false,
+                let right = match done {
+                    Ok(false) => !front && asked && tries == 0,
+                    Ok(true) => (front || !asked) && u64::from(tries) == u64::from(fails) + 1,
+                    Err(_) => false,
                 };
                 libc::_exit(if right { 0 } else { 1 });
             }
@@ -1462,12 +1470,13 @@ mod prompt_tests {
     }
 
     /// A set from behind is given up once a stop is asked, whatever its caller's own look
-    /// says, and whatever the job is said to be: the terminal's stop then returns at once, and
-    /// the set, made again, would fail with EINTR at once, for ever. With nothing asked it is
-    /// made again until done.
+    /// says: the terminal's stop then returns at once, and the set, made again, would fail with
+    /// EINTR at once, for ever. With nothing asked it is made again until done. In front, where
+    /// a stop taken behind comes back at `fg`, it is made again after the interrupt, stop asked
+    /// or not: given up there, a give-back would leave the hold's mode on the terminal.
     #[test]
     fn a_set_from_behind_is_given_up_once_a_stop_is_asked() {
-        match a_set_ends(false, false) {
+        match a_set_ends(false, false, 3) {
             Some(true) => {}
             Some(false) => panic!(
                 "nothing was asked and the set's loop gave the set up or failed it: behind, every set \
@@ -1475,15 +1484,18 @@ mod prompt_tests {
             ),
             None => panic!("nothing was asked and the child did not end in five seconds: it proves nothing"),
         }
-        match a_set_ends(false, true) {
+        match a_set_ends(false, true, u32::MAX) {
             Some(true) => {}
             Some(false) => panic!("a stop was asked behind and the set was not given up before it was tried"),
             None => panic!("a stop was asked and the set spun, made again on each interrupt"),
         }
-        match a_set_ends(true, true) {
+        match a_set_ends(true, true, 1) {
             Some(true) => {}
-            Some(false) => panic!("a stop was asked, the job said to be in front, and the set was not given up at its first interrupt"),
-            None => panic!("a stop was asked, the job said to be in front, and the set spun, made again on each interrupt"),
+            Some(false) => panic!(
+                "a stop was asked, the job in front, and the set interrupted once was not made again: a \
+                 give-back continued in front would leave the hold's mode on the terminal"
+            ),
+            None => panic!("a stop was asked, the job in front, and the child did not end in five seconds"),
         }
     }
 

@@ -1,9 +1,10 @@
-# A PROBE, never to be merged: the storm test as the tip has it (its pause spun, its premise from the client's own
-# looks) on the runners, and on one CPU.
-#   macOS, off / asan / tsan: the storm test ten times, then the client's tests;
-#   macOS asan, floor: each wait floored to whole milliseconds, five times (red at the premise wanted);
-#   Linux, one CPU (taskset -c 0): the storm probe in each mode, then the storm test five times, spun as the tip
-#   has it, and five times yielding.
+# A PROBE, never to be merged: the legs of the tip that only Linux can turn red, on ubuntu-24.04.
+#   The tip as it is: the started-behind cases, the hangup with no standard descriptor a terminal, the hold's
+#   sets with nothing read, and the headless terminal filled from the side (green wanted).
+#   Then each sabotage alone, applied, built, run and restored: the watcher's copy out (red at the hangup
+#   wanted); the screen's set at fg asking nothing after (red at the INT-then-fg case); the headless daemons'
+#   words as they were, the headless stop not counted as leaving, its signal not noted (each red at the
+#   filled terminal wanted).
 name: ci
 
 on:
@@ -11,70 +12,11 @@ on:
     branches: ['ci/**']
 
 jobs:
-  storm:
-    name: storm / macos-15 / ${{ matrix.san }} / ${{ matrix.out }}
-    runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        san: [off, asan, tsan]
-        out: [none]
-        include:
-          - san: asan
-            out: floor
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: the machine
-        run: |
-          sysctl -n hw.ncpu hw.physicalcpu machdep.cpu.brand_string
-          uptime
-
-      - name: install deps
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: 1
-        run: brew install cmake ninja pkg-config libsodium
-
-      - name: floor each wait to whole milliseconds
-        if: matrix.out == 'floor'
-        run: |
-          perl -0pi -e 's/    uint64_t took = mono_ns\(\) - began;\n/    uint64_t took = (mono_ns() - began) \/ 1000000u * 1000000u;\n/' src/9p_client/9p_client.c
-          git diff --stat -- src/9p_client/9p_client.c
-          if git diff --quiet -- src/9p_client/9p_client.c; then echo "DID NOT APPLY"; exit 1; fi
-
-      - name: build the client's tests
-        run: |
-          cmake -B build -S . -DSTM_SANITIZE=${{ matrix.san }} -DSTM_ENABLE_IOURING=OFF -DSTM_ENABLE_PQ=OFF -DSTM_WERROR=ON
-          cmake --build build --target test_9p_client -j 3
-
-      - name: the storm test, ten times
-        run: |
-          for i in 1 2 3 4 5 6 7 8 9 10; do
-            STM_TEST_ONLY=p9_client_wait_counts_waits_shorter_than_a_millisecond \
-                ./build/tests/test_9p_client 2>&1 | grep -a 'note: given up\|FAIL\|passed' || true
-          done
-
-      - name: the client's tests
-        if: always() && matrix.out == 'none'
-        run: ./build/tests/test_9p_client
-
-  one-cpu:
-    name: one cpu / ubuntu-24.04
+  legs:
+    name: legs / ubuntu-24.04
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: the machine
-        run: |
-          nproc
-          uptime
-
-      - name: the storm probe on one CPU, each mode, twice
-        run: |
-          cc -O2 -Wall -Wextra -pthread -o probe_storm tests/probe_storm.c
-          for round in 1 2; do for mode in sleep yield spin; do
-            taskset -c 0 ./probe_storm $mode 1 3
-          done; done
 
       - name: install deps
         run: |
@@ -88,28 +30,41 @@ jobs:
               && make -j"$(nproc)" && sudo make install)
           sudo ldconfig
 
-      - name: build the client's tests, spun and yielding
-        run: |
-          cmake -B build -S . -DSTM_SANITIZE=off -DSTM_ENABLE_IOURING=OFF -DSTM_ENABLE_PQ=OFF -DSTM_WERROR=ON
-          cmake --build build --target test_9p_client -j"$(nproc)"
-          cp -R . /tmp/yielding && cd /tmp/yielding && rm -rf build
-          perl -0pi -e 's/        while \(test_mono_ns\(\) < next\) \{\}\n/        while (test_mono_ns() < next) sched_yield();\n/; s/#include <signal.h>\n/#include <sched.h>\n#include <signal.h>\n/' tests/test_9p_client.c
-          git diff --stat -- tests/test_9p_client.c
-          if [ "$(git diff -- tests/test_9p_client.c | grep -c '^+')" != 3 ]; then echo "DID NOT APPLY IN FULL"; exit 1; fi
-          cmake -B build -S . -DSTM_SANITIZE=off -DSTM_ENABLE_IOURING=OFF -DSTM_ENABLE_PQ=OFF -DSTM_WERROR=ON
-          cmake --build build --target test_9p_client -j"$(nproc)"
+      - name: build dist/stratum
+        run: ./dist.sh
 
-      - name: the storm test on one CPU, spun, five times
+      - name: the machine
         run: |
-          for i in 1 2 3 4 5; do
-            STM_TEST_ONLY=p9_client_wait_counts_waits_shorter_than_a_millisecond \
-                taskset -c 0 ./build/tests/test_9p_client 2>&1 | grep -a 'note: given up\|FAIL\|passed' || true
-          done
+          nproc
+          uptime
 
-      - name: the storm test on one CPU, yielding, five times
+      - name: the legs, the tip as it is
+        run: |
+          KEYS_ONLY=screen_started_behind_leg,no_terminal_hangup_leg,unread_hold_sets_leg,headless_words_held_leg \
+              python3 -B tests/manager_keys.py dist/stratum
+
+      - name: each sabotage alone
         if: always()
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
         run: |
-          for i in 1 2 3 4 5; do
-            STM_TEST_ONLY=p9_client_wait_counts_waits_shorter_than_a_millisecond \
-                taskset -c 0 /tmp/yielding/build/tests/test_9p_client 2>&1 | grep -a 'note: given up\|FAIL\|passed' || true
-          done
+          set -u
+          sab() {
+            local name=$1 file=$2 expr=$3 legs=$4
+            cp "$file" /tmp/keep
+            perl -0pi -e "$expr" "$file"
+            if cmp -s "$file" /tmp/keep; then echo "$name DID NOT APPLY"; return; fi
+            if ! (cd tools/stratum && cargo build --release) > "/tmp/build-$name.log" 2>&1; then
+              echo "$name DID NOT BUILD"; tail -20 "/tmp/build-$name.log"; cp /tmp/keep "$file"; return
+            fi
+            KEYS_ONLY=$legs python3 -B tests/manager_keys.py tools/stratum/target/release/stratum > "/tmp/$name.log" 2>&1
+            echo "$name rc=$? (want red): $(grep -a '^FAIL' "/tmp/$name.log" | head -4 | tr '\n' '|' | cut -c1-500)"
+            cp /tmp/keep "$file"
+          }
+          TU=tools/stratum/src/tui.rs; EM=tools/stratum/src/embed.rs
+          sab fl-27 $TU 's/    let copy = watch_copy\(tty, &ttys\);\n/    let copy: Option<std::os::fd::OwnedFd> = None;\n/' no_terminal_hangup_leg
+          sab fl-25 $TU 's/        Ok\(true\) if stop_asked\(\) => \{\n/        Ok(true) if false => {\n/' screen_started_behind_leg
+          sab fl-28 $EM 's/            return Ok\(tui::daemon_words_out\(\)\.map_or_else\(Stdio::inherit, Stdio::from\)\);\n/            return Ok(Stdio::inherit());\n/' headless_words_held_leg
+          sab fl-29 $EM 's/    tui::leave_for_good\(sig\);\n//' headless_words_held_leg
+          sab fl-30 $TU 's/    if sig > 0 \{\n        let _ = ASKED_BY/    if false {\n        let _ = ASKED_BY/' headless_words_held_leg
+          for n in fl-27 fl-28; do echo "=== $n"; grep -a '^ok\|^FAIL\|^note\|^PASS' "/tmp/$n.log" | cut -c1-300; done

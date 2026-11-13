@@ -100,12 +100,13 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // in the session directory, NOT to inherited stderr — otherwise
     // the daemons' "serving X on Y" startup messages collide with
     // ratatui's screen paint when the TUI enters raw mode (user
-    // 2026-05-08). Headless mode keeps stderr inherited (no TUI to
-    // collide with). Logs are removed at session_dir cleanup.
+    // 2026-05-08). Headless mode gives them the terminal (no TUI to
+    // collide with), through an open of its own that does not wait, or
+    // else stderr as it is. Logs are removed at session_dir cleanup.
     let log_redirect = !opts.headless;
     let open_log = |name: &str| -> Result<Stdio> {
         if !log_redirect {
-            return Ok(Stdio::inherit());
+            return Ok(tui::daemon_words_out().map_or_else(Stdio::inherit, Stdio::from));
         }
         let log_path = session_dir.join(format!("{name}.log"));
         let f = std::fs::OpenOptions::new()
@@ -604,6 +605,7 @@ fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigse
             libc::sigwait(&set, &mut sig);
         }
     }
+    tui::leave_for_good(sig);
     if sig != 0 {
         tell(format_args!("stratum: caught signal {sig}, shutting down."));
     } else {
