@@ -142,7 +142,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         log_of("host-fs").as_deref(),
     ) {
         kill_and_reap(&mut host_fs_child);
-        if tui::stop_requested() {
+        if tui::stop_asked() {
             bail!("asked to stop while host-fs started");
         }
         return Err(e);
@@ -196,9 +196,11 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         } else {
             None
         };
-        // The terminal closing, Ctrl-C, Ctrl-D or Ctrl-\ ends the prompt; a HUP or QUIT
-        // sent by kill takes effect once Enter is pressed, as the handlers restart the read.
-        if tui::stop_requested() {
+        // The terminal closing, Ctrl-C, Ctrl-D or Ctrl-\ ends the prompt; a signal sent by
+        // kill takes effect once Enter is pressed: the handlers of HUP and QUIT restart the
+        // read, and a TERM or INT is held blocked until the screen and found here, before
+        // the passphrase is used.
+        if tui::stop_asked() {
             kill_and_reap(&mut host_fs_child);
             if needs_passphrase {
                 bail!("asked to stop at the passphrase prompt");
@@ -304,7 +306,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             None => Ok(()),
         };
         if let Err(e) = waited {
-            if tui::stop_requested() {
+            if tui::stop_asked() {
                 if let Some(c) = stratumd_child.as_mut() {
                     kill_and_reap(c);
                 }
@@ -402,7 +404,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             kill_and_reap(c);
         }
         kill_and_reap(&mut host_fs_child);
-        if tui::stop_requested() {
+        if tui::stop_asked() {
             bail!("asked to stop while slate started");
         }
         return Err(e);
@@ -453,14 +455,19 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // (one libstratum-9p connection per attach call) — slate accepts
     // concurrently, host-fs spawned with concurrent-accept (R128
     // forward note), so this doesn't deadlock.
+    // One left for a stop asked is no failure to warn of: the stop is said below.
     if let Err(e) = attach_panel_with_retry(&slate_sock, "/connection/left/attach", &left_plan.sock)
     {
-        crate::spawn::tell(format_args!("stratum: warning: left-panel pre-attach failed: {e}"));
+        if !tui::stop_asked() {
+            crate::spawn::tell(format_args!("stratum: warning: left-panel pre-attach failed: {e}"));
+        }
     }
     if let Err(e) =
         attach_panel_with_retry(&slate_sock, "/connection/right/attach", &right_plan.sock)
     {
-        crate::spawn::tell(format_args!("stratum: warning: right-panel pre-attach failed: {e}"));
+        if !tui::stop_asked() {
+            crate::spawn::tell(format_args!("stratum: warning: right-panel pre-attach failed: {e}"));
+        }
     }
 
     // SWISS-4b: build the SpawnCtx so the TUI can spawn additional
@@ -496,6 +503,10 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             }
             stop_first = tui::stop_asked();
         }
+    } else if !opts.headless {
+        // No passphrase was asked and nothing is held: a stop that came during the start
+        // ends it the same. Headless, a stop is the run's own end, and is taken there.
+        stop_first = tui::stop_asked();
     }
     let result = if stop_first {
         Err(anyhow!("asked to stop before the screen"))
@@ -742,10 +753,10 @@ fn make_session_dir_in(base: &Path) -> Result<PathBuf> {
 }
 
 /// SIGKILL and reap: a daemon still binding its socket is gone before the session
-/// directory's removal reads the directory, and cannot add an entry after it.
+/// directory's removal reads the directory, and cannot add an entry after it. One the
+/// kernel does not end, in a wait it does not interrupt, is not waited for without end.
 fn kill_and_reap(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+    crate::spawn::kill_and_wait(child);
 }
 
 /// Removed however run() ends, a panic included. The daemons remove their own sockets

@@ -730,6 +730,13 @@ static void remove_made_image(const char *image_path, int dir_fd, const char *ba
             "another file\n");
         return;
     }
+    if (dir_fd < 0) {
+        fprintf(stderr,
+            "stratum-mkfs: the image this run made is left, %s%s: this run holds no "
+            "directory that names it, and nothing is removed by a name that may reach "
+            "another file\n", said ? "at " : "wherever it is now", said ? now : "");
+        return;
+    }
     fprintf(stderr,
         "stratum-mkfs: the image this run made is left, %s%s: the name it was made by no "
         "longer leads to it, and nothing is removed by a name that may reach another "

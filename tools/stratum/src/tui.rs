@@ -1263,6 +1263,13 @@ fn run_ui(
                     }
                 }
             }
+            // A copy asks its destination's daemon whether a name is there through a helper,
+            // on this thread and inside this pass. One given up for a stop says only that the
+            // name is not there, so the stop is looked for again here: the panels are read
+            // from that same daemon, and the read would wait as long again and hold slate in it.
+            if ASKED_TO_STOP.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             // SWISS-4n: refresh idle-timeout BEFORE building the
             // snapshot so the rendered hint matches what the next
             // keystroke will see (1s-since-last-input clears).

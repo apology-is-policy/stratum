@@ -46,14 +46,16 @@ pub enum BackendMeta {
 const DAEMON_START: Duration = Duration::from_secs(60);
 
 /// Waits for a daemon to bind its socket. One that refuses says why in its log and
-/// exits, so that ends the wait.
+/// exits, so that ends the wait. A stop ends it too, one held blocked among them: the
+/// manager's own start holds TERM and INT so until its screen, and no handler has seen
+/// those.
 pub fn wait_for_daemon(child: &mut Child, sock: &Path) -> Result<()> {
     let started = Instant::now();
     while !sock.exists() {
         if let Ok(Some(status)) = child.try_wait() {
             bail!("stratumd stopped ({status})");
         }
-        if crate::tui::stop_requested() {
+        if crate::tui::stop_asked() {
             bail!("asked to stop");
         }
         if started.elapsed() >= DAEMON_START {
@@ -79,7 +81,7 @@ pub fn wait_for_helper(child: &mut Child, name: &str, sock: &Path, log: Option<&
                 None => anyhow!("{name} stopped ({status}) before its socket appeared at {}", sock.display()),
             });
         }
-        if crate::tui::stop_requested() {
+        if crate::tui::stop_asked() {
             bail!("asked to stop");
         }
         if started.elapsed() >= HELPER_START {
@@ -146,6 +148,19 @@ fn ended_within(child: &mut Child, limit: Duration) -> bool {
             Ok(None) if Instant::now() >= deadline => return false,
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
         }
+    }
+}
+
+/// KILL, for a child whose start failed or was left: no commit of its own is lost. It is
+/// waited for as any killed child is, and said where it is still there.
+pub(crate) fn kill_and_wait(child: &mut Child) {
+    let pid = child.id();
+    let _ = child.kill();
+    if !ended_within(child, KILLED_GRACE) {
+        tell(format_args!(
+            "stratum: process {pid} is still there {} s after SIGKILL; it is left to end when it can",
+            KILLED_GRACE.as_secs()
+        ));
     }
 }
 
@@ -265,8 +280,8 @@ fn output_until(
 }
 
 /// A helper of the manager's run to its end, or given up where the screen is to be left.
-/// One given up fails the action that ran it, which the screen shows as any failure of
-/// that action; the screen's loop then sees the stop.
+/// One given up fails the action that ran it, and nothing of that is shown: the screen's
+/// loop looks for the stop before it asks a daemon anything more, and leaves.
 fn helper_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
     output_until(cmd, crate::tui::TAKE_TICK, crate::tui::HELD_AFTER, crate::tui::waits_to_be_left)
 }
@@ -398,8 +413,7 @@ impl SpawnCtx {
             .spawn_inner(&args)
             .with_context(|| format!("spawn host-fs at {}", root.display()))?;
         if let Err(e) = wait_for_helper(&mut child, "host-fs", &sock, Some(&log)) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_wait(&mut child);
             return Err(e);
         }
         self.children.lock().unwrap().push(child);
@@ -529,16 +543,14 @@ impl SpawnCtx {
                 }
                 drop(sin);
                 if let Err(e) = wr {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_wait(&mut child);
                     return Err(anyhow!(e).context("pipe passphrase to stratumd"));
                 }
             }
         }
 
         if let Err(e) = wait_for_daemon(&mut child, &sock) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_wait(&mut child);
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
             return Err(match start_failure(&log) {
                 Some(reason) => anyhow!("{reason} ({e})"),

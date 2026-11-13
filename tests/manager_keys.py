@@ -762,18 +762,25 @@ def held_terminal_legs(stratum, vol, host, root):
                 print(f'note: {how}: {put} bytes from the side filled it', flush=True)
                 term.send(b'\x11')
             else:
-                # From here nothing reads. Each resize asks for a whole frame, and twenty of
-                # them for more than any pty holds: the draw's write waits.
-                for i in range(20):
-                    fcntl.ioctl(term.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS - 20 * (i % 2), 0, 0))
-                    time.sleep(0.15)
                 if slow:
-                    # How much the manager's own frames leave in the terminal is the
-                    # system's and the moment's to say: on Linux it was read in 11 s at
-                    # this pace, the stall and a second, and once in 8.9 s. Topped up from
-                    # the side, the terminal has all it holds to give, at its own pace.
+                    # The terminal is filled first, from the side, with the manager idle,
+                    # and one resize then asks for one frame, a larger one: none of it
+                    # fits, so what has to go out at the terminal's pace is that frame,
+                    # some 21 KB, and not whatever part of a frame had not fitted when the
+                    # terminal filled. That part was the moment's: on Linux it went out in
+                    # 8.9 s once and in 11.2 s, against the stall and a second.
+                    wait_quiet(term, how, quiet=2.0)
                     side, put = fill_from_the_side(term)
-                    print(f'note: {how}: {put} bytes from the side topped the terminal up', flush=True)
+                    fcntl.ioctl(term.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS + 16, COLS + 60, 0, 0))
+                    time.sleep(1.0)
+                    print(f'note: {how}: {put} bytes from the side filled the terminal, then one resize '
+                          f'asked for one frame', flush=True)
+                else:
+                    # From here nothing reads. Each resize asks for a whole frame, and twenty
+                    # of them for more than any pty holds: the draw's write waits.
+                    for i in range(20):
+                        fcntl.ioctl(term.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS - 20 * (i % 2), 0, 0))
+                        time.sleep(0.15)
                 os.kill(term.pid, asked_by)
             asked = time.monotonic()
             if not slow:
@@ -1113,17 +1120,21 @@ def command_of(pid):
 
 
 def stuck_helper_leg(stratum, vol, host, root):
-    """Three more places where a stop asked could wait for as long as something does not
+    """Four more places where a stop asked could wait for as long as something does not
     answer. The manager makes a directory in a volume, and probes and walks it for a copy,
     through a helper program, and waited for that helper to end: with the volume's daemon
     not answering it never did. A call to slate itself that is given up ends the screen as
     the stop that asked, with 0. And the manager says which daemon it is about to kill
     before it kills it: on a terminal that takes nothing by then, those words waited, the
-    daemons after that one still serving."""
+    daemons after that one still serving. The last is a copy's question whether its
+    destination has the name already: asked through a helper too, but from inside the
+    screen's pass, which went on to read its panels from the same daemon once the helper
+    was given up, and waited as long again with slate held in that read."""
     given_up = 10  # tui.rs HELD_AFTER, in seconds
     cases = (('the volume\'s daemon stuck, a helper of the manager\'s waiting on it', 'helper'),
              ('slate stuck with a call to it in flight', 'slate'),
-             ('a daemon stuck with a call to it in flight, the terminal full by the time the manager speaks', 'words'))
+             ('a daemon stuck with a call to it in flight, the terminal full by the time the manager speaks', 'words'),
+             ('the volume\'s daemon stuck, a copy asking it whether a name is there', 'probe'))
     for n, (how, kind) in enumerate(cases):
         env_file = f'{root}/env-helper{n}'
         term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file])
@@ -1135,7 +1146,7 @@ def stuck_helper_leg(stratum, vol, host, root):
             session = os.path.dirname(read_env(env_file)['STRATUMD_SOCK'])
             before = session_daemons(session)
             said = {p: command_of(p).strip() for p in before}
-            if kind == 'helper':
+            if kind in ('helper', 'probe'):
                 which = [p for p in before if ' serve ' in said[p] and ' slate ' not in said[p]]
             else:
                 which = [p for p in before if (' slate ' if kind == 'slate' else ' host-fs ') in said[p]]
@@ -1157,6 +1168,22 @@ def stuck_helper_leg(stratum, vol, host, root):
                     helpers = [c for c in children if ' fs -s ' in command_of(c)]
                 if not helpers:
                     raise Failure(f'{how}: no helper of the manager\'s is there once the name is entered: it proves nothing')
+            elif kind == 'probe':
+                # The other panel is the host's. What its cursor is on is copied into the
+                # volume, and before anything is written the volume is asked for the name.
+                wait_quiet(term, how, quiet=1.5)
+                term.send(TAB)
+                wait_quiet(term, how, quiet=1.5)
+                os.kill(stuck, signal.SIGSTOP)
+                term.send(F5)
+                helpers, limit = [], time.monotonic() + 5
+                while not helpers and time.monotonic() < limit:
+                    term.pump(0.1)
+                    children = subprocess.run(['pgrep', '-P', str(term.pid)], capture_output=True, text=True).stdout.split()
+                    helpers = [c for c in children if ' fs -s ' in command_of(c) and ' stat ' in command_of(c)]
+                if not helpers:
+                    raise Failure(f'{how}: no helper of the manager\'s asks the volume about a name once the copy '
+                                  'is started: it proves nothing')
             else:
                 # A Tab is answered by reading the panels again, through slate, and drawing
                 # them. Seen twice with every daemon running, so that the silence below is
@@ -1263,14 +1290,28 @@ def stuck_start_leg(stratum, vol, host, root):
     the TERM pending. The daemon is stopped the moment its socket has its name. The manager
     starts two more daemons after that, each looked for twenty milliseconds apart, before
     anything is asked of the first, so the stop is there in time; and that it was is seen:
-    the three daemons run and no screen comes."""
+    the three daemons run and no screen comes. The same with no volume and so no passphrase,
+    host-fs the daemon that does not answer: there the stop was found by the first call as
+    well, but the manager then put its screen up and took it down, and ended 0."""
+    cases = (('the volume\'s daemon stuck while the manager starts', ['--vol', vol.v, '--host', host], True,
+              lambda said: ' serve ' in said and ' slate ' not in said, 'stratumd.sock', 3),
+             ('host-fs stuck while a manager with no volume starts', ['--host', host], False,
+              lambda said: ' host-fs ' in said, 'host-fs.sock', 2))
+    for how, args, sealed, is_it, sock_name, daemons in cases:
+        stuck_start(stratum, vol, how, args, sealed, is_it, sock_name, daemons)
+
+
+def stuck_start(stratum, vol, how, args, sealed, is_it, sock_name, daemons):
+    """One case of stuck_start_leg: `is_it` picks the daemon to stop out of the manager's
+    children by its command line, `sock_name` is its socket in the session directory, and
+    `daemons` how many the start has running by the time it first asks one anything."""
     given_up = 10  # tui.rs HELD_AFTER, in seconds
-    how = 'the volume\'s daemon stuck while the manager starts'
-    term = Term([stratum, 'tui', '--vol', vol.v, '--host', host])
+    term = Term([stratum, 'tui'] + args)
     stuck, session = None, None
     try:
-        term.expect(r'Passphrase for')
-        term.send(PASS.encode() + ENTER)
+        if sealed:
+            term.expect(r'Passphrase for')
+            term.send(PASS.encode() + ENTER)
         limit = time.monotonic() + 60
         while time.monotonic() < limit and (stuck is None or session is None):
             if session is None:
@@ -1278,25 +1319,25 @@ def stuck_start_leg(stratum, vol, host, root):
                 session = found.pop() if len(found) == 1 else None
             if stuck is None:
                 children = subprocess.run(['pgrep', '-P', str(term.pid)], capture_output=True, text=True).stdout.split()
-                serving = [c for c in children if ' serve ' in command_of(c) and ' slate ' not in command_of(c)]
+                serving = [c for c in children if is_it(command_of(c))]
                 stuck = int(serving[0]) if serving else None
             time.sleep(0.005)
         if stuck is None or session is None:
             raise Failure(f'{how}: the search found the daemon {stuck} and the session directory {session}: '
                           'it proves nothing')
-        sock = f'{session}/stratumd.sock'
+        sock = f'{session}/{sock_name}'
         there_already = os.path.exists(sock)
         while not os.path.exists(sock) and time.monotonic() < limit:
             time.sleep(0.0005)
         os.kill(stuck, signal.SIGSTOP)
-        # host-fs and slate come up, slate is asked for the first panel and asks the daemon.
+        # The rest come up, slate is asked for the first panel and asks the daemon.
         limit = time.monotonic() + 15
-        while len(session_daemons(session)) < 3 and time.monotonic() < limit:
+        while len(session_daemons(session)) < daemons and time.monotonic() < limit:
             term.pump(0.1)
         said = {p: command_of(p).strip() for p in session_daemons(session)}
         term.pump(3)
         screen_up = b'\x1b[?1049h' in bytes(term.raw)
-        if len(said) < 3 or screen_up or os.waitpid(term.pid, os.WNOHANG)[0] != 0:
+        if len(said) < daemons or screen_up or os.waitpid(term.pid, os.WNOHANG)[0] != 0:
             raise Failure(f'{how}: the daemons are {sorted(said.values())}, the screen came up: {screen_up}, '
                           f'the socket was there before it was looked for: {there_already}: it proves nothing')
         seen = len(term.raw)
@@ -1307,6 +1348,11 @@ def stuck_start_leg(stratum, vol, host, root):
         waits = '' if ended else threads_waiting(term.pid)
         words = ' | '.join(l.strip() for l in bytes(term.raw[seen:]).decode('utf-8', 'replace').splitlines() if l.strip())
         print(f'note: {how}: after the stop was asked the manager said: {words[:600]}', flush=True)
+        # The stop is said once, as what ended the start. An attach given up for it is no
+        # failure of a panel's to warn of.
+        record('asked to stop before the screen' in words and 'pre-attach failed' not in words,
+               f'{how}: the manager said it was asked to stop before the screen, and warned of no attach',
+               f'{how}: the manager did not say only that it was asked to stop before the screen')
         # A start that was asked to stop has not come up, and ends as a failed start does.
         record(ended and term.rc == 1, f'{how}: a stop asked meanwhile ended the manager, with 1 as a start that failed',
                f'{how}: the manager ended={ended} rc={term.rc} {took:.0f} s after the stop was asked'
@@ -1325,9 +1371,10 @@ def stuck_start_leg(stratum, vol, host, root):
         limit = time.monotonic() + 30
         while session_daemons(session) and time.monotonic() < limit:
             time.sleep(0.2)
-        vol.serve()
-        vol.stop()
-        print(('ok' if ended else 'note') + f': after {how} the volume mounts and unmounts cleanly', flush=True)
+        if sealed:
+            vol.serve()
+            vol.stop()
+            print(('ok' if ended else 'note') + f': after {how} the volume mounts and unmounts cleanly', flush=True)
     finally:
         if stuck is not None:
             try:
@@ -1438,6 +1485,13 @@ def prompt_end_legs(stratum, vol, host, root):
         except OSError:
             pass
 
+    def term_sent(term):
+        # A TERM the manager itself holds blocked from its start until the screen: it ends
+        # no read and runs no handler, and is there to be asked after once Enter is pressed.
+        os.kill(term.pid, signal.SIGTERM)
+        time.sleep(0.5)
+        term.send(PASS.encode() + ENTER)
+
     def typed_then_close(term):
         # Typed, never submitted. With HUP ignored, as nohup leaves it, only the read's
         # end can tell the manager the terminal has gone.
@@ -1451,6 +1505,7 @@ def prompt_end_legs(stratum, vol, host, root):
              # Blocked, it would wait for the screen, after the volume was unlocked.
              ('a QUIT sent at the prompt, blocked by its parent', quit_sent, (), (signal.SIGQUIT,)),
              ('a HUP sent at the prompt, blocked by its parent', hup_sent, (), (signal.SIGHUP,)),
+             ('a TERM sent at the prompt', term_sent, (), ()),
              ('its terminal closing before Enter, HUP ignored', typed_then_close, (signal.SIGHUP,), ()))
     for i, (how, end, ignored, blocked) in enumerate(cases):
         env_file = f'{root}/env-prompt{i}'
@@ -1549,10 +1604,19 @@ def missing_binary_leg(stratum, vol, host, root):
             os.unlink(copy)
 
 def start_wait_stop_leg(stratum, vol, host, root):
-    """Ctrl-\\ in stratumd's start, a wait of up to 60 s: the stop ends the session there, and is
-    named as a stop, not as a daemon that failed to start. stratumd is held stopped from the
-    moment it appears, so no socket can end the wait first, however fast the key comes."""
-    how = 'Ctrl-\\ in the stratumd start'
+    """A stop in stratumd's start, a wait of up to 60 s, comes two ways. Ctrl-\\ is a QUIT, which
+    the manager takes at once. A TERM it holds blocked from its start until the screen, so the
+    wait has to look for one that is pending: a wait that asked only what the handler had seen
+    waited its sixty seconds out and called the stop a daemon that did not start."""
+    for how, ask in (('Ctrl-\\ in the stratumd start', lambda term: term.send(b'\x1c')),
+                     ('a TERM sent in the stratumd start', lambda term: os.kill(term.pid, signal.SIGTERM))):
+        start_wait_stop(stratum, vol, host, root, how, ask)
+
+
+def start_wait_stop(stratum, vol, host, root, how, ask):
+    """The stop ends the session in the wait, and is named as a stop, not as a daemon that failed
+    to start. stratumd is held stopped from the moment it appears, so no socket can end the wait
+    first, however fast the stop comes."""
     term = Term([stratum, 'tui', '--vol', vol.v, '--host', host])
     try:
         term.expect(r'Passphrase for')
@@ -1584,7 +1648,7 @@ def start_wait_stop_leg(stratum, vol, host, root):
         term.pump(0.3)
         record(not term.showing(re.compile('again')), f'{how}: a key typed then is not shown',
                f'{how}: a key typed while stratumd started was shown')
-        term.send(b'\x1c')
+        ask(term)
         asked = time.monotonic()
         # Past the 60 s start timeout: a wait that does not end on the stop ends there instead,
         # and the stop, seen afterwards, would still be named.
