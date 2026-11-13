@@ -1,10 +1,15 @@
 # A PROBE, never to be merged: what Linux says of things macOS cannot show.
 # One leg, a manager stopped behind at a line of its own, in three shapes, with one thing taken out:
-#   out=asking: the EINTR arm of the manager's own writer does not ask whether a stop came.
-#   out=guard:  a stop for the terminal does not interrupt a line's write (no StopsInterrupt).
-#   out=twin:   the echo hold's stop is not taken over for the line (it restarts).
-#   out=plain:  the plain write's loop does not ask.
-#   out=none:   the tree as it is; and the guard's unit test, the leaving client, two signals at once.
+#   out=asking:    the EINTR arm of the manager's own writer does not ask whether a stop came.
+#   out=guard:     a stop for the terminal does not interrupt a line's write (no StopsInterrupt).
+#   out=twin:      the echo hold's stop is not taken over for the line (it restarts).
+#   out=plain:     the plain write's loop does not ask.
+#   out=line-stop: the line's stop does not ask whether a stop is asked (its unit test must be red).
+#   out=none:      the tree as it is; and the guard's unit tests, the leaving client, two signals at once.
+# The wait rule (job wait): the wait a stop is asked in counted again, in a call and in a dial, each
+# to be red at the client's tests; and how long after the asking a call is given up, measured.
+# A manager whose start waits on a stuck daemon (job stuck-start), six times, its figure to the
+# millisecond: the tree as it is, and with the wait a stop is asked in counted again.
 name: ci
 
 on:
@@ -18,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        out: [none, asking, guard, twin, plain]
+        out: [none, asking, guard, twin, plain, line-stop]
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +59,11 @@ jobs:
         run: |
           perl -0pi -e 's/(                    Err\(e\) if e\.kind\(\) == io::ErrorKind::Interrupted => \{\n)                        if stop_asked\(\) \{\n                            crate::embed::never_stop_for_the_terminal\(\);\n                        \}\n/$1/' tools/stratum/src/tui.rs
 
+      - name: take the asking out of a line's stop
+        if: matrix.out == 'line-stop'
+        run: |
+          perl -0pi -e 's/(extern "C" fn a_lines_stop\(sig: libc::c_int\) \{\n)    if stop_asked_in_a_handler\(\) \{\n        return;\n    \}\n/$1/; s/    if !stop_asked_in_a_handler\(\) \{\n        given_back_then_held\(sig, stop_given_back_and_interrupt, 0\);\n    \}\n/    given_back_then_held(sig, stop_given_back_and_interrupt, 0);\n/' tools/stratum/src/passphrase.rs
+
       - name: what was taken out
         if: matrix.out != 'none'
         run: |
@@ -66,12 +76,12 @@ jobs:
       - name: a manager stopped behind at a line of its own, three shapes
         run: KEYS_ONLY=stopped_at_a_line_leg python3 tests/manager_keys.py dist/stratum
 
-      - name: the guard's unit test
-        if: always() && matrix.out == 'none'
+      - name: the guard's unit tests
+        if: always() && (matrix.out == 'none' || matrix.out == 'line-stop')
         working-directory: tools/stratum
         env:
           STM_BUILD_DIR: ${{ github.workspace }}/build-dist
-        run: cargo test --release --bin stratum a_lines_guard
+        run: cargo test --release --bin stratum a_lines_
 
       - name: a client that leaves
         if: always() && matrix.out == 'none'
@@ -84,18 +94,103 @@ jobs:
           /tmp/two-signals 20000
           /tmp/two-signals 20000
 
-  # What a step's process inherits of each signal, and what an exec keeps of a signal's flags
-  # when it resets the handler: the unit test of the line's guard failed its premise on macOS.
-  inherited:
-    name: inherited / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  wait:
+    name: wait / ${{ matrix.out }}
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        out: [none, call, dial]
     steps:
       - uses: actions/checkout@v4
-      - name: what a step inherits, and what an exec keeps
+
+      - name: install deps (Linux)
         run: |
-          cc -O2 -o /tmp/exec-flags tests/probe_exec_flags.c
-          /tmp/exec-flags
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config cmake liburing-dev
+          wget -q -O /tmp/libsodium.tar.gz \
+              https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz
+          tar xzf /tmp/libsodium.tar.gz -C /tmp
+          (cd /tmp/libsodium-1.0.20 && ./configure --prefix=/usr/local --disable-debug \
+              && make -j"$(nproc)" && sudo make install)
+          sudo ldconfig
+
+      - name: count the wait the asking came in, in a call
+        if: matrix.out == 'call'
+        run: |
+          perl -0pi -e 's/    if \(!asked_before\) return STM_OK;\n/    (void)asked_before;\n/' src/9p_client/9p_client.c
+
+      - name: count the wait the asking came in, in a dial
+        if: matrix.out == 'dial'
+        run: |
+          perl -0pi -e 's/        if \(!asked \|\| !asked_before\) continue;\n/        (void)asked_before;\n        if (!asked) continue;\n/' src/9p_client/9p_client.c
+
+      - name: what was taken out
+        if: matrix.out != 'none'
+        run: |
+          git diff --stat
+          if git diff --quiet; then echo "DID NOT APPLY"; exit 1; fi
+
+      - name: add the measuring test and build the client's tests
+        run: |
+          python3 tests/probe_measure_wait.py .
+          cmake -B build-probe -S . -DSTM_SANITIZE=off -DSTM_ENABLE_IOURING=OFF -DSTM_ENABLE_PQ=OFF -DSTM_WERROR=ON
+          cmake --build build-probe --target test_9p_client -j"$(nproc)"
+
+      - name: how long after the asking a call is given up
+        run: |
+          for into in 10 50 90; do for i in 1 2 3; do
+            STM_TEST_ONLY=p9_client_wait_measure_the_wait_the_asking_came_in MEASURE_INTO_PCT=$into \
+                ./build-probe/tests/test_9p_client 2>&1 | grep MEASURE
+          done; done
+
+      - name: the client's tests
+        if: always()
+        run: ./build-probe/tests/test_9p_client
+
+  stuck-start:
+    name: stuck start / ${{ matrix.count }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        count: [tip, old]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install deps (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config cmake liburing-dev
+          wget -q -O /tmp/libsodium.tar.gz \
+              https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz
+          tar xzf /tmp/libsodium.tar.gz -C /tmp
+          (cd /tmp/libsodium-1.0.20 && ./configure --prefix=/usr/local --disable-debug \
+              && make -j"$(nproc)" && sudo make install)
+          sudo ldconfig
+
+      - name: count the wait the asking came in, as before
+        if: matrix.count == 'old'
+        run: |
+          perl -0pi -e 's/    if \(!asked_before\) return STM_OK;\n/    (void)asked_before;\n/' src/9p_client/9p_client.c
+          git diff --stat
+          if git diff --quiet; then echo "DID NOT APPLY"; exit 1; fi
+
+      - name: the leg's figures to the millisecond
+        run: |
+          perl -pi -e 's/\{took:\.1f\}/{took:.3f}/g' tests/manager_keys.py
+          git diff --stat -- tests/manager_keys.py
+
+      - name: build dist/stratum
+        run: ./dist.sh
+
+      - name: a manager whose start waits on a stuck daemon, six times
+        run: |
+          rc=0
+          for i in 1 2 3 4 5 6; do
+            KEYS_ONLY=stuck_start_leg python3 tests/manager_keys.py dist/stratum > leg-$i.log 2>&1 || rc=1
+            grep -a 'two 30 s deadlines\|slate and the daemon\|^FAIL\|^PASS\|did not hold' leg-$i.log | cut -c1-240
+          done
+          exit $rc

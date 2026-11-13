@@ -164,6 +164,9 @@ struct stm_9p_client {
      * received, and nothing the daemon was seen to take. */
     stm_9p_wait wait;
     uint64_t    waited_ms;
+    /* What to_leave said when it was last asked. A wait counts only where that was
+     * true before it began. */
+    bool        asked;
     /* How much of this client's writes the kernel held unread when it was last asked,
      * where it tells; -1 before the first asking. */
     int         unread;
@@ -173,17 +176,19 @@ struct stm_9p_client {
 /* Socket I/O — robust against EINTR. EPIPE / EOF surfaced as STM_EIO.   */
 /* ────────────────────────────────────────────────────────────────────── */
 
-static uint64_t mono_ms(void)
+static uint64_t mono_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 }
 
-/* How long a wait that began at `began` counts for: what it lasted, and a tick at most. */
+/* How long a wait that began at `began` counts for: the whole milliseconds it lasted,
+ * and a tick at most. Two readings in milliseconds can lie up to one more apart than
+ * the wait lasted, and a limit is not to be reached by time nobody waited. */
 static uint64_t counted_ms(const stm_9p_wait *w, uint64_t began)
 {
-    uint64_t took = mono_ms() - began;
+    uint64_t took = (mono_ns() - began) / 1000000u;
     return took < w->tick_ms ? took : w->tick_ms;
 }
 
@@ -215,7 +220,7 @@ static bool daemon_took(stm_9p_client *c)
 static stm_status wait_until(stm_9p_client *c, short events)
 {
     struct pollfd p = { .fd = c->fd, .events = events, .revents = 0 };
-    uint64_t began = mono_ms();
+    uint64_t began = mono_ns();
     int n = poll(&p, 1, (int)c->wait.tick_ms);
     int poll_errno = errno;
     /* Asked at every wait, so that what the next is held against is one wait old. */
@@ -226,11 +231,16 @@ static stm_status wait_until(stm_9p_client *c, short events)
         return STM_EIO;
     }
     /* Nothing asked: a daemon may take as long as it takes, and nothing is counted. */
-    if (!c->wait.to_leave(c->wait.arg)) return STM_OK;
+    bool asked_before = c->asked;
+    c->asked = c->wait.to_leave(c->wait.arg);
+    if (!c->asked) return STM_OK;
     if (took) {
         c->waited_ms = 0;
         return STM_OK;
     }
+    /* The wait a stop is asked in began before the asking: counted, it would give
+     * the call up as much as a tick before its limit. */
+    if (!asked_before) return STM_OK;
     c->waited_ms += counted_ms(&c->wait, began);
     if (c->waited_ms >= c->wait.give_up_after_ms) {
         c->poisoned = 1;
@@ -460,6 +470,7 @@ static stm_status do_connect(const char *socket_path, const stm_9p_wait *wait,
         }
     }
     uint64_t waited_ms = 0;
+    bool asked = false;
     while (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
         /* What a connect that was under way says once it is made. */
         if (errno == EISCONN) break;
@@ -470,9 +481,12 @@ static stm_status do_connect(const char *socket_path, const stm_9p_wait *wait,
             close(fd);
             return STM_EIO;
         }
-        uint64_t began = mono_ms();
+        uint64_t began = mono_ns();
         (void)poll(NULL, 0, (int)wait->tick_ms);
-        if (!wait->to_leave(wait->arg)) continue;
+        bool asked_before = asked;
+        asked = wait->to_leave(wait->arg);
+        /* As a call's wait: one that began before the asking is not counted. */
+        if (!asked || !asked_before) continue;
         waited_ms += counted_ms(wait, began);
         if (waited_ms >= wait->give_up_after_ms) {
             *out_errno = ETIMEDOUT;

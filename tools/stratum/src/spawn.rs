@@ -196,7 +196,8 @@ pub fn stop_child(child: &mut Child, name: &str) {
 /// daemon never answers would hold the manager there past a stop asked, its daemons running
 /// and the volume unlocked. From the asking, a helper that has neither said anything nor
 /// ended for `held_after` is killed, its process group with it, and none is started. A
-/// wait counts for what it lasted and for a tick at most.
+/// wait counts for what it lasted and for a tick at most, and only where the look before
+/// it said the wait is to be left: the one a stop is asked in began before the asking.
 fn output_until(
     cmd: &mut Command,
     tick: Duration,
@@ -221,6 +222,8 @@ fn output_until(
         }
     }
     let mut waited = Duration::ZERO;
+    // What the last look said: no, above.
+    let mut asked = false;
     let status = loop {
         let began = Instant::now();
         let mut took = false;
@@ -261,11 +264,17 @@ fn output_until(
                 }
             }
         }
-        if took || !to_be_left() {
+        let asked_before = asked;
+        asked = to_be_left();
+        if took || !asked {
             waited = Duration::ZERO;
             continue;
         }
-        waited += began.elapsed().min(tick);
+        // Counted, the wait the asking came in would give the helper up as much as a tick
+        // before its limit.
+        if asked_before {
+            waited += began.elapsed().min(tick);
+        }
         if waited >= held_after {
             // Its group: the helper is its leader, and has not been waited for, so the
             // number is still its own.
@@ -956,10 +965,13 @@ mod tests {
             .collect();
         let _ = std::fs::remove_file(&place);
         assert_eq!(end.as_ref().err().map(|e| e.kind()), Some(std::io::ErrorKind::TimedOut), "ended {end:?}");
-        assert!(took >= lead + LIMIT - TICK, "given up after {took:?}, before a limit from the asking");
+        assert!(took >= lead + LIMIT, "given up after {took:?}, before a limit from the asking");
+        // The first look that says yes ends a wait that began before the asking, and the
+        // limit takes as many more as it holds: a number, which a busy machine cannot move.
         let waits = ASKED_SAID.load(Ordering::Relaxed);
         let whole = (LIMIT.as_millis() / TICK.as_millis()) as u32;
-        assert!((whole..=whole + 1).contains(&waits), "{waits} waits were counted to a limit of {whole} ticks");
+        assert!(waits > whole, "given up at look {waits} from the asking, a limit of {whole} ticks: the wait the asking came in was counted");
+        assert!(waits <= whole + 2, "{waits} waits were counted to a limit of {whole} ticks");
         assert_eq!(pids.len(), 2, "the helper and the one it started: {pids:?}");
         // The helper was waited for; what it started ends on the same KILL, a moment later.
         let gone_by = Instant::now() + Duration::from_secs(5);

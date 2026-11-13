@@ -653,7 +653,8 @@ impl io::Write for OwnOutput {
                 _ => return Err(err),
             }
             self.refused += 1;
-            if !(self.to_be_left)() {
+            let asked = (self.to_be_left)();
+            if !asked {
                 // Nothing asked: a terminal may take nothing for ever, and the count
                 // starts at the asking.
                 waited = Duration::ZERO;
@@ -678,7 +679,10 @@ impl io::Write for OwnOutput {
                 thread::sleep(short);
                 self.paused += 1;
             }
-            waited += began.elapsed().min(self.tick);
+            // The wait a stop is asked in began before the asking, and is none of the limit.
+            if asked {
+                waited += began.elapsed().min(self.tick);
+            }
         }
     }
 
@@ -5798,13 +5802,17 @@ mod tests {
         let ended = rx.recv_timeout(Duration::from_secs(10));
         let took = asked.elapsed();
         assert_eq!(ended, Ok(Err(io::ErrorKind::TimedOut)));
-        assert!(took >= limit - Duration::from_millis(50), "given up {took:?} after the asking: the wait before it was counted");
+        assert!(took >= limit, "given up {took:?} after the asking: the wait before it was counted");
         assert!(HELD.load(Ordering::Relaxed));
         // And a limit after it, no later. A terminal that says nothing of room makes each
         // wait a whole tick to the count, however long the machine took over it, so the
         // waits from the asking on are a number that does not move with the load.
+        // The first look that says yes follows a wait that began before the asking, and the
+        // look that finds the limit reached follows as many more as the limit holds.
         let said = SAID.load(Ordering::Relaxed);
-        let most = (limit.as_millis() / tick.as_millis()) as u64 + 2;
+        let whole = (limit.as_millis() / tick.as_millis()) as u64;
+        assert!(said > whole, "given up at look {said} from the asking, a limit of {whole} waits: the wait the asking came in was counted");
+        let most = whole + 3;
         assert!(said <= most, "given up after {said} waits from the asking, where the limit holds {most}: they were counted short");
         let mut out = writer.join().unwrap();
         assert!(out.refused > 0, "the terminal took all of it: it proves nothing");
