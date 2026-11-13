@@ -35,6 +35,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -2788,6 +2789,13 @@ static uint64_t test_mono_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+static uint64_t test_mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
 static void test_sleep_ms(long ms)
 {
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
@@ -3177,7 +3185,14 @@ static void *signal_storm_thread(void *arg)
     while (!atomic_load(&st->done) && test_mono_ms() < st->until_ms) {
         pthread_kill(st->whom, SIGUSR1);
         st->sent++;
-        nanosleep(&pause, NULL);
+        if (st->every_us >= 1000L) {
+            nanosleep(&pause, NULL);
+            continue;
+        }
+        /* Waited out on the clock: a runner may sleep a thread a millisecond and more
+         * for a fifth of one (macOS in CI, some 2 ms). */
+        uint64_t next = test_mono_ns() + (uint64_t)st->every_us * 1000u;
+        while (test_mono_ns() < next) sched_yield();
     }
     return NULL;
 }
