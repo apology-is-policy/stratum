@@ -87,7 +87,7 @@ static void *conn_thread(void *arg)
     if (stm_lp9_server_create(stm_slate_vops(), slate,
                                   stm_slate_root(slate),
                                   msize_max, &srv) != STM_OK) {
-        close(fd);
+        (void)shutdown(fd, SHUT_RDWR);
         return NULL;
     }
     uint8_t *req  = malloc(msize_max);
@@ -112,7 +112,10 @@ out:
     free(req);
     free(resp);
     stm_lp9_server_destroy(srv);
-    close(fd);
+    /* The other end sees the connection end; the descriptor stays the
+     * fixture's to close, so that its number is not another's by the
+     * time the fixture shuts it down. */
+    (void)shutdown(fd, SHUT_RDWR);
     return NULL;
 }
 
@@ -120,10 +123,20 @@ out:
 /* Accept thread.                                                         */
 /* ────────────────────────────────────────────────────────────────────── */
 
+#define FIXTURE_CONNS_MAX 256u
+typedef struct {
+    pthread_t tid;
+    int       fd;
+} conn_slot;
+
 typedef struct {
     int          listen_fd;
     stm_slate   *slate;
     atomic_bool  stop_flag;
+    /* The connections taken. Written by the accept thread alone, and
+     * read by the fixture once that thread is joined. */
+    conn_slot    conns[FIXTURE_CONNS_MAX];
+    unsigned     n_conns;
 } accept_ctx;
 
 static void *accept_thread(void *arg)
@@ -132,6 +145,7 @@ static void *accept_thread(void *arg)
     while (1) {
         int client_fd = tsock_accept(ax->listen_fd, &ax->stop_flag);
         if (client_fd < 0) return NULL;
+        if (ax->n_conns == FIXTURE_CONNS_MAX) { close(client_fd); continue; }
         conn_ctx *cx = malloc(sizeof *cx);
         if (!cx) { close(client_fd); continue; }
         cx->fd = client_fd;
@@ -143,9 +157,40 @@ static void *accept_thread(void *arg)
             free(cx);
             continue;
         }
-        pthread_detach(tid);
+        ax->conns[ax->n_conns].tid = tid;
+        ax->conns[ax->n_conns].fd  = client_fd;
+        ax->n_conns++;
     }
     return NULL;
+}
+
+/* Ends the connections a fixture took and waits for their threads. A
+ * connection's thread reads its slate until it returns, a clunk for
+ * each fid as its client goes at the least, so the slate is destroyed
+ * only after this, as stratum-slate destroys its own only once its
+ * workers are joined. Call it with the accept thread joined, and the
+ * slate stopped: a thread that waits in /redraw is woken by the stop
+ * and not by its socket. */
+static void accept_ctx_drain(accept_ctx *ax)
+{
+    for (unsigned i = 0; i < ax->n_conns; i++)
+        (void)shutdown(ax->conns[i].fd, SHUT_RDWR);
+    for (unsigned i = 0; i < ax->n_conns; i++) {
+        pthread_join(ax->conns[i].tid, NULL);
+        close(ax->conns[i].fd);
+    }
+    ax->n_conns = 0;
+}
+
+/* A connection ended under a writer is an error to this harness, as it
+ * is to the daemons, and no death: a fixture torn down first ends its
+ * connections, and the slate attached to it may still write to one. */
+static void fixture_ignores_sigpipe(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -171,6 +216,7 @@ typedef struct {
 static void setup_fixture(slate_fixture *f, const char *tag)
 {
     memset(f, 0, sizeof *f);
+    fixture_ignores_sigpipe();
     build_sock_path(tag);
     STM_ASSERT_OK(stm_slate_create(&f->slate));
     f->listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600, 0);
@@ -190,11 +236,7 @@ static void destroy_fixture(slate_fixture *f)
     close(f->listen_fd);
     f->listen_fd = -1;
     stm_slate_stop(f->slate);
-    /* Per-conn pthreads are detached; they exit when their client
-     * fd hits EOF (which is now, because the test client closed)
-     * or when slate_stop broadcasts (waking any blocked /redraw
-     * readers). For tests, we accept that residual workers may
-     * briefly outlive destroy — they finish quickly. */
+    accept_ctx_drain(&f->ctx);
     stm_slate_destroy(f->slate);
     (void)unlink(g_sock_path);
 }
@@ -533,6 +575,7 @@ typedef struct {
 static void setup_backend_fixture(slate_backend_fixture *f, const char *tag)
 {
     memset(f, 0, sizeof *f);
+    fixture_ignores_sigpipe();
     snprintf(f->sock_path, sizeof f->sock_path,
              "/tmp/stm_slate_be_%d_%s.sock", (int)getpid(), tag);
     (void)unlink(f->sock_path);
@@ -554,6 +597,7 @@ static void destroy_backend_fixture(slate_backend_fixture *f)
     close(lf);
     pthread_join(f->accept_tid, NULL);
     stm_slate_stop(f->slate);
+    accept_ctx_drain(&f->ctx);
     stm_slate_destroy(f->slate);
     (void)unlink(f->sock_path);
 }
@@ -2111,34 +2155,17 @@ STM_TEST(slate_socket_event_zero_byte_einval)
     destroy_fixture(&f);
 }
 
-/* SWISS-4q-supervise smoke test: post-destroy + respawn sequence on
- * the SAME socket path still serves entries (whether via stale-worker
- * happy path OR via auto-reconnect; both surface as a successful Tread
- * with B's root entries). The "auto-reconnect fires" claim is
- * intentionally NOT asserted at the wire layer because the test
- * harness's per-conn worker pthreads on the backend slate are detached
- * (see destroy_backend_fixture comment above) — they outlive the
- * stm_slate_destroy() and continue serving F's persistent bc fd from
- * (technically) freed memory until either side closes. In practice on
- * macOS, the brief window means F's panel_entries_render sees the
- * stale worker as still functional and never triggers reconnect.
+/* SWISS-4q-supervise: a backend torn down and another started at the
+ * SAME socket path, and the foreground still serves its entries. The
+ * first backend's connections end with it (destroy_backend_fixture
+ * shuts them and joins their threads before the slate is freed), so
+ * the foreground's standing connection to it is dead by the second
+ * read, and that read can succeed only if the foreground dials the
+ * new backend and asks again. The harness used to leave the first
+ * backend's connection threads running past the destroy, serving the
+ * foreground from freed memory, and this test passed that way too.
  *
- * What this test DOES verify:
- *   - Post-destroy + respawn at same path doesn't crash (no SIGPIPE,
- *     no use-after-free abort).
- *   - SIGPIPE doesn't kill the test on writes to broken sockets.
- *   - The /panels/left/entries materializer is exercised end-to-end
- *     under the new goto-retry structure.
- *
- * What this test does NOT verify (needs manual repro per
- * SWISS-4q-supervise next-session notes):
- *   - That auto-reconnect actually fires when the persistent bc
- *     write returns EPIPE. To test this rigorously we'd need a
- *     test-only API to forcibly close the panel's bc fd (close from
- *     inside slate.c, since bc->fd is a lib internal). Forward-noted
- *     as part of P9-SLATE-FIX-SESSIONS / SWISS-4q-supervise-test.
- *   - That /log/tail captures the reconnect lines. Manual repro
- *     remains the validation path. */
+ * Not looked at here: that /log/tail says the reconnect. */
 STM_TEST(slate_socket_panel_entries_after_backend_respawn_smoke)
 {
     struct sigaction sa = {0};
@@ -2183,9 +2210,8 @@ STM_TEST(slate_socket_panel_entries_after_backend_respawn_smoke)
     STM_ASSERT(strstr(ebuf, " version\n") != NULL);
     STM_ASSERT_OK(stm_9p_clunk(c, 202u));
 
-    /* Save B's socket path; tear down B (simulating "the backend
-     * died" — though per the comment above, the per-conn worker
-     * may outlive this on the test harness side). */
+    /* Save B's socket path; tear down B: the backend died, and its
+     * connections with it. */
     char be_path[256];
     size_t be_path_len = strlen(be.sock_path);
     STM_ASSERT(be_path_len < sizeof be_path);
@@ -2208,11 +2234,8 @@ STM_TEST(slate_socket_panel_entries_after_backend_respawn_smoke)
     STM_ASSERT_EQ(pthread_create(&be2.accept_tid, NULL,
                                     accept_thread, &be2.ctx), 0);
 
-    /* Read entries again. Either: (a) auto-reconnect fires, dials B',
-     * retries against the fresh client, returns its root; or (b)
-     * stale B worker keeps serving from freed memory and returns
-     * the same content. Both surfaces produce a valid Tread; the
-     * test only asserts non-crash + non-empty content. */
+    /* Read entries again: the standing connection to B is dead, so
+     * this is served only by a dial of B' and the request made again. */
     STM_ASSERT_OK(stm_9p_walk(c, 200u, 203u, 3u, enames, eqids, &walked));
     STM_ASSERT_OK(stm_9p_lopen(c, 203u, 0u, &oqid, &iounit));
     uint32_t egot2 = 0;
