@@ -1854,6 +1854,8 @@ def cpu_seconds(pid):
         pass
     # [[dd-]hh:]mm:ss.cc
     spent = subprocess.run(['ps', '-o', 'time=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+    if not spent:
+        return None
     days, _, clock = spent.rpartition('-')
     seconds = 0.0
     for part in clock.split(':'):
@@ -1863,7 +1865,10 @@ def cpu_seconds(pid):
 
 def how_it_ran(pid, spent_before, took):
     """Of a manager that neither ended nor stopped in `took` s: whether it spun meanwhile."""
-    spent = cpu_seconds(pid) - spent_before
+    now = cpu_seconds(pid)
+    if now is None:
+        return ', gone by the time its CPU was read'
+    spent = now - spent_before
     if spent >= took / 2:
         return f', running all the while ({spent:.0f} s of CPU)'
     return f', {spent:.1f} s of CPU'

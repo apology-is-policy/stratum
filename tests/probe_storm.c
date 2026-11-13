@@ -213,5 +213,7 @@ int main(int argc, char **argv)
     }
     printf("  cpu %.2f s in %d s; context switches: %ld voluntary, %ld involuntary\n", cpu, secs,
            ru1.ru_nvcsw - ru0.ru_nvcsw, ru1.ru_nivcsw - ru0.ru_nivcsw);
+    for (int i = 0; i < senders; i++) free(s[i].at);
+    free(all);
     return 0;
 }

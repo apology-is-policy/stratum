@@ -35,7 +35,6 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
-#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -3189,10 +3188,11 @@ static void *signal_storm_thread(void *arg)
             nanosleep(&pause, NULL);
             continue;
         }
-        /* Waited out on the clock: a runner may sleep a thread a millisecond and more
-         * for a fifth of one (macOS in CI, some 2 ms). */
+        /* Waited out on the clock, and not yielded: macOS's runners slept a thread some
+         * 1.2 ms for a fifth of one, and one that yielded lost its CPU for whole
+         * milliseconds at a time. */
         uint64_t next = test_mono_ns() + (uint64_t)st->every_us * 1000u;
-        while (test_mono_ns() < next) sched_yield();
+        while (test_mono_ns() < next) {}
     }
     return NULL;
 }
@@ -3260,7 +3260,6 @@ STM_TEST(p9_client_wait_counts_waits_shorter_than_a_millisecond)
 {
     fake_daemon d;
     fake_daemon_start(&d, "wait_storm", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
-    g_storm_looks.n = g_storm_looks.missed = 0;
     stm_9p_wait w = { leave_and_note_when, &g_storm_looks, WAIT_TICK_MS, WAIT_LIMIT_MS };
     stm_9p_dial_opts o = default_dial_opts(100);
     o.wait = &w;
@@ -3281,18 +3280,23 @@ STM_TEST(p9_client_wait_counts_waits_shorter_than_a_millisecond)
     pthread_t storm;
     STM_ASSERT_EQ(pthread_create(&storm, NULL, signal_storm_thread, &st), 0);
 
+    g_storm_looks.n = g_storm_looks.missed = 0;
     uint64_t began = test_mono_ms();
+    uint64_t began_ns = test_mono_ns();
     stm_status rc = stm_9p_clunk(c, 100);
     uint64_t took = test_mono_ms() - began;
     atomic_store(&st.done, true);
     pthread_join(storm, NULL);
     sigaction(SIGUSR1, &was, NULL);
-    /* A wait counted is begun after one look and counted a few instructions after the
-     * next, so a count in whole milliseconds makes no more of this call's waits than the
-     * whole milliseconds between its looks. */
-    uint64_t floored_ms = 0;
-    for (unsigned i = 1; i < g_storm_looks.n; i++)
-        floored_ms += (g_storm_looks.at_ns[i] - g_storm_looks.at_ns[i - 1]) / 1000000u;
+    /* A wait counted is begun after the call began or after a look, and counted a few
+     * instructions after the next look, so a count in whole milliseconds makes no more of
+     * this call's waits than the whole milliseconds from its start to its first look and
+     * between its looks. */
+    uint64_t floored_ms = 0, last_ns = began_ns;
+    for (unsigned i = 0; i < g_storm_looks.n; i++) {
+        floored_ms += (g_storm_looks.at_ns[i] - last_ns) / 1000000u;
+        last_ns = g_storm_looks.at_ns[i];
+    }
     printf("    note: given up in %llu ms; %u signals, %u looks, %llu whole ms between the looks\n",
            (unsigned long long)took, st.sent, g_storm_looks.n, (unsigned long long)floored_ms);
     STM_ASSERT_EQ(rc, STM_EIO);
