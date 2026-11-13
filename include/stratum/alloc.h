@@ -376,25 +376,19 @@ uint64_t stm_alloc_avail_netfree_blocks(const stm_alloc *a);
  *   - refcount = 0 (already PENDING): STM_EINVAL (double-free).
  *
  * free_gen contract (CF-4 B): the free itself mutates the alloc tree,
- * so the NEXT commit always runs — but its sweep requires `free_gen <
- * target_gen`, and commits after that no longer advance gens when
- * nothing else changed (the clean-commit short-circuit). A free stamped
- * `free_gen == current_gen` on an otherwise-quiescent pool therefore
- * reaches durable-PENDING on the next commit but is reclaimed (swept to
- * FREE) only by the next MUTATING commit after that. Stamp a gen <= the
- * authoritative gen when prompt reclamation matters (every in-tree
- * production caller does, or rides other dirt — e.g. the fs unlink
- * path's reclaim double-commit).
- *
- * As built, the last two sentences say too much. A commit sweeps
- * first, and the sweep is itself a change that commit writes: so the
- * second of two commits made one after the other reclaims a free
- * stamped with the generation current at the free, with nothing else
- * changed in between (tests/test_rc2_concurrent.c,
- * rc2_read_outlives_its_records_block). And the sync layer's drops of
- * replaced blocks stamp the current generation, not one at or below
- * the authoritative: they are reclaimed that way, by the commit after
- * the one that made them durable.
+ * so the NEXT commit always runs, and makes the PENDING entry durable.
+ * A commit sweeps the entries with `free_gen < committed_gen`, and
+ * does so before it asks whether anything changed: a sweep is itself
+ * a change that commit writes. So a free stamped with a gen <= the
+ * authoritative gen is reclaimed (swept to FREE) by the next commit,
+ * and one stamped with the gen current at the free by the commit
+ * after that one, with nothing else changed in between: the second
+ * of two commits made one after the other (tests/test_rc2_concurrent.c,
+ * rc2_read_outlives_its_records_block). Only with nothing left to
+ * sweep does a commit of an unchanged pool stop short (the
+ * clean-commit short-circuit). The evacuation paths stamp the
+ * authoritative gen; the sync layer's drops of replaced blocks stamp
+ * the current one.
  *
  * Returns STM_ENOENT if no entry starts at `paddr`.
  */

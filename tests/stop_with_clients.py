@@ -78,8 +78,34 @@ class Client:
                 self.end = 'closed between replies' if self.sock.recv(1) == b'' else 'sent an unasked byte'
         except (BrokenPipeError, ConnectionResetError):
             self.end = 'closed between replies'
+        except OSError as err:
+            # Said to the leg that reads the end: a thread's own traceback fails nothing.
+            self.end = 'failed: %s' % err
+
+    def leave(self):
+        """Stops sending and waits to be let go: the daemon reads the end and closes its side,
+        which is what the idle read returns on. Returns '' when the daemon did, after serving,
+        and else what was seen in place of it."""
+        self.sock.shutdown(socket.SHUT_WR)
+        self.thread.join(BOUND_S)
+        if self.thread.is_alive():
+            seen = 'its read still waits, %d s on' % BOUND_S
+        elif self.end != 'closed between replies' or self.replies < 1:
+            seen = 'it saw: %s, after %d replies' % (self.end, self.replies)
+        else:
+            seen = ''
+        self.close()
+        return seen
 
     def close(self):
+        # A read the thread still waits in is ended first. A close does not end it: what
+        # becomes of that read, and whether the daemon is told, differs between systems
+        # (macOS: the read fails with EBADF).
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.thread.join(BOUND_S)
         self.sock.close()
 
 
@@ -227,10 +253,12 @@ def main():
         daemon = Daemon(binary, work, 1)
         client = Client(daemon.fs_sock, False)
         wait_for(lambda: client.replies >= 1, 30)
-        client.close()
+        seen = client.leave()
         time.sleep(0.5)
-        if daemon.proc.poll() is None:
-            ok('a client leaving does not stop the daemon')
+        if seen:
+            no('a client leaving: the daemon did not let it go (%s): it proves nothing' % seen)
+        elif daemon.proc.poll() is None:
+            ok('a client leaving, let go by the daemon, does not stop it')
         else:
             no('a client leaving stopped the daemon, rc=%s' % daemon.proc.returncode)
 

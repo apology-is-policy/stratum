@@ -54,7 +54,8 @@ typedef struct stm_hybrid_keys {
  *
  * Wire format (variable-length):
  *
- *   [0..4)            magic = 'KFP1' (passphrase-encrypted v1)
+ *   [0..4)            magic = the bytes 'PFP1', 0x31504650 little-endian
+ *                     (passphrase-encrypted v1; the format is called KFP1)
  *   [4..8)            version = 1
  *   [8..12)           argon2id t_cost (iterations, LE)
  *   [12..16)          argon2id m_cost_kib (memory in KiB, LE)
@@ -72,7 +73,7 @@ typedef struct stm_hybrid_keys {
  * cost per attempt — for `interactive` params (~100 ms) on commodity
  * hardware, that's a meaningful deterrent for low-entropy
  * passphrases and a non-issue for high-entropy ones. */
-#define STM_KEYFILE_PASS_MAGIC      UINT32_C(0x31504650)  /* 'KFP1' */
+#define STM_KEYFILE_PASS_MAGIC      UINT32_C(0x31504650)  /* 'PFP1' on disk */
 #define STM_KEYFILE_PASS_VERSION    1u
 #define STM_KEYFILE_PASS_HEADER_LEN 72u
 

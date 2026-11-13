@@ -579,8 +579,10 @@ pub(crate) fn say_on_stderr(line: &str) {
     }
     // A line begun before the stop can be what the manager is stopped at when the stop
     // comes: written from behind under tostop it stopped the job there, and the shell's
-    // `kill` continues it into the same write, which made again would stop it again. So a
-    // stop for the terminal interrupts a line's write, and each continue asks first.
+    // `kill` continues it into the same write, which made again would stop it again:
+    // Linux makes it again by itself, and on macOS, where it fails, a loop that writes on
+    // unasked does. So a stop for the terminal interrupts a line's write on both, and each
+    // continue asks first.
     let _interrupted = crate::passphrase::StopsInterrupt::new();
     static SAME: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
     let own = *SAME.get_or_init(|| {

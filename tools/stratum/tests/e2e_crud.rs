@@ -44,6 +44,26 @@ fn fs_write_then_read_roundtrip() {
     assert_eq!(body, b"hello world\n");
 }
 
+/// The same through a volume sealed with a passphrase, which mkfs and stratumd each read
+/// from their standard input.
+#[test]
+fn fs_write_then_read_roundtrip_on_a_sealed_volume() {
+    let s = SessionBuilder { volume_size: "64M", passphrase: Some("correct horse battery staple".into()) }
+        .build()
+        .expect("a session with a passphrase");
+    let key = std::fs::read(&s.stm_keyfile).expect("the key file");
+    // STM_KEYFILE_PASS_MAGIC, where a key kept in the clear starts with 'KFIL'.
+    assert_eq!(
+        u32::from_le_bytes(key[..4].try_into().unwrap()),
+        0x3150_4650,
+        "the key is not sealed with a passphrase: it proves nothing"
+    );
+    s.fs_write_bytes(&s.stratumd_sock, "/hello.txt", b"hello world\n")
+        .unwrap();
+    let body = s.fs_read(&s.stratumd_sock, "/hello.txt").unwrap();
+    assert_eq!(body, b"hello world\n");
+}
+
 #[test]
 fn fs_overwrite_existing_file() {
     let s = session();

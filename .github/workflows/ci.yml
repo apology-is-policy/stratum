@@ -1,7 +1,10 @@
-# A PROBE, never to be merged: what Linux says of two things macOS cannot show.
+# A PROBE, never to be merged: what Linux says of things macOS cannot show.
+# One leg, a manager stopped behind at a line of its own, in three shapes, with one thing taken out:
 #   out=asking: the EINTR arm of the manager's own writer does not ask whether a stop came.
-#   out=guard:  a stop for the terminal does not interrupt a line's write (StopsInterrupt out).
-#   out=none:   the tree as it is, and what a close does to a read another thread waits in.
+#   out=guard:  a stop for the terminal does not interrupt a line's write (no StopsInterrupt).
+#   out=twin:   the echo hold's stop is not taken over for the line (it restarts).
+#   out=plain:  the plain write's loop does not ask.
+#   out=none:   the tree as it is; and the guard's unit test, the leaving client, two signals at once.
 name: ci
 
 on:
@@ -15,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        out: [none, asking, guard]
+        out: [none, asking, guard, twin, plain]
     steps:
       - uses: actions/checkout@v4
 
@@ -35,22 +38,48 @@ jobs:
         if: matrix.out == 'asking'
         run: |
           perl -0pi -e 's/                Some\(libc::EINTR\) => \{\n(.*\n){2}                    if stop_asked\(\) \{\n                        crate::embed::never_stop_for_the_terminal\(\);\n                    \}\n                    continue;\n                \}/                Some(libc::EINTR) => continue,/' tools/stratum/src/tui.rs
-          git diff --stat
-          if git diff --quiet; then echo "DID NOT APPLY"; exit 1; fi
 
       - name: take the guard out
         if: matrix.out == 'guard'
         run: |
           perl -0pi -e 's/    let _interrupted = crate::passphrase::StopsInterrupt::new\(\);\n//' tools/stratum/src/tui.rs
+
+      - name: take the echo hold's twin out
+        if: matrix.out == 'twin'
+        run: |
+          perl -0pi -e 's/            held if held == given_back => Some\(action\(stop_given_back_and_interrupt, 0\)\),\n//' tools/stratum/src/passphrase.rs
+
+      - name: take the plain write's asking out
+        if: matrix.out == 'plain'
+        run: |
+          perl -0pi -e 's/(                    Err\(e\) if e\.kind\(\) == io::ErrorKind::Interrupted => \{\n)                        if stop_asked\(\) \{\n                            crate::embed::never_stop_for_the_terminal\(\);\n                        \}\n/$1/' tools/stratum/src/tui.rs
+
+      - name: what was taken out
+        if: matrix.out != 'none'
+        run: |
           git diff --stat
           if git diff --quiet; then echo "DID NOT APPLY"; exit 1; fi
 
       - name: build dist/stratum
         run: ./dist.sh
 
-      - name: a manager stopped behind at a line of its own
+      - name: a manager stopped behind at a line of its own, three shapes
         run: KEYS_ONLY=stopped_at_a_line_leg python3 tests/manager_keys.py dist/stratum
 
-      - name: a close under a read another thread waits in
+      - name: the guard's unit test
         if: always() && matrix.out == 'none'
-        run: python3 tests/probe_close_under_recv.py
+        working-directory: tools/stratum
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
+        run: cargo test --release --bin stratum a_lines_guard
+
+      - name: a client that leaves
+        if: always() && matrix.out == 'none'
+        run: python3 tests/stop_with_clients.py dist/stratum
+
+      - name: two signals taken where a write comes back
+        if: always() && matrix.out == 'none'
+        run: |
+          cc -O2 -o /tmp/two-signals tests/probe_two_signals.c
+          /tmp/two-signals 20000
+          /tmp/two-signals 20000
