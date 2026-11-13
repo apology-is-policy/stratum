@@ -456,9 +456,12 @@ extern "C" fn stop_given_back(sig: libc::c_int) {
 }
 
 /// The same while a line of the manager's is written (`StopsInterrupt`): without SA_RESTART,
-/// so the write it stopped fails with EINTR on each continue.
+/// so the write it stopped fails with EINTR on each continue; and, as `a_lines_stop`, not
+/// taken once a stop is asked.
 extern "C" fn stop_given_back_and_interrupt(sig: libc::c_int) {
-    given_back_then_held(sig, stop_given_back_and_interrupt, 0);
+    if !stop_asked_in_a_handler() {
+        given_back_then_held(sig, stop_given_back_and_interrupt, 0);
+    }
 }
 
 fn given_back_then_held(sig: libc::c_int, again: extern "C" fn(libc::c_int), flags: libc::c_int) {
@@ -509,6 +512,36 @@ extern "C" fn stop_and_interrupt(sig: libc::c_int) {
     }
 }
 
+/// A line's stop where SIGTTOU was at its default (`StopsInterrupt`): as
+/// `stop_and_interrupt`, but not taken once a stop is asked. The write fails with EINTR
+/// either way, and its loop, which asks the same, lets the line through. So a stop asked
+/// after the line's own look does not leave the manager stopped behind, its daemons
+/// serving: neither one that came in between, nor one sent to a manager that a stop from
+/// outside held there, nor, on Linux, one whose continue dropped the pending SIGTTOU and
+/// had the kernel make the write again. What stays is a stop asked between this look and
+/// the stop itself.
+extern "C" fn a_lines_stop(sig: libc::c_int) {
+    if stop_asked_in_a_handler() {
+        return;
+    }
+    unsafe {
+        let errno = *errno_location();
+        stop_by(sig);
+        libc::sigaction(sig, &action(a_lines_stop, 0), std::ptr::null_mut());
+        *errno_location() = errno;
+    }
+}
+
+/// `stop_asked`, which makes only async-signal-safe calls, with errno kept.
+fn stop_asked_in_a_handler() -> bool {
+    unsafe {
+        let errno = *errno_location();
+        let asked = crate::tui::stop_asked();
+        *errno_location() = errno;
+        asked
+    }
+}
+
 /// While this lives, a stop for the terminal interrupts what it stopped: a write made from
 /// behind fails with EINTR on each continue. Linux would else make the write again by
 /// itself, and it would stop again, whatever was asked meanwhile never looked at; macOS
@@ -537,7 +570,7 @@ impl StopsInterrupt {
         let given_back = stop_given_back as extern "C" fn(libc::c_int) as libc::sighandler_t;
         let ours = match old.sa_sigaction {
             _ if !has => None,
-            libc::SIG_DFL => Some(action(stop_and_interrupt, 0)),
+            libc::SIG_DFL => Some(action(a_lines_stop, 0)),
             held if held == given_back => Some(action(stop_given_back_and_interrupt, 0)),
             _ => None,
         };
@@ -557,9 +590,10 @@ impl Drop for StopsInterrupt {
 }
 
 /// Blocks on this thread every signal that has a handler, `sig` and the faults apart. One
-/// at its default action says nothing of a write it is taken at, and an interrupt nobody
-/// catches ends a line that waits, as it did. Its drop unblocks the ones it blocked itself
-/// and no other, so a block made meanwhile stays.
+/// at its default action is let through: an interrupt nobody catches ends a line that
+/// waits, as it did. A stop from outside is such a one, and Linux may make the write again
+/// after its continue: the line's own stop, which asks first, meets that. Its drop unblocks
+/// the ones it blocked itself and no other, so a block made meanwhile stays.
 pub(crate) struct OthersWait(libc::sigset_t);
 
 impl OthersWait {
@@ -1209,6 +1243,16 @@ mod prompt_tests {
                 assert_eq!(action_of(s).0, libc::SIG_DFL, "signal {s} is not at its default: it proves nothing");
             }
             let was = now();
+            // Given back even where an assertion below fails: they are the process's.
+            struct Defaults([libc::c_int; 4]);
+            impl Drop for Defaults {
+                fn drop(&mut self) {
+                    for s in self.0 {
+                        unsafe { libc::signal(s, libc::SIG_DFL) };
+                    }
+                }
+            }
+            let _defaults = Defaults([sig, free, held, ignored]);
             unsafe {
                 for s in [free, held] {
                     libc::sigaction(s, &action(taken, libc::SA_RESTART), std::ptr::null_mut());
@@ -1223,14 +1267,14 @@ mod prompt_tests {
             );
             {
                 let _guard = StopsInterrupt::over(sig);
-                assert_eq!(now(), (handler(stop_and_interrupt), 0), "the default action was not taken over");
+                assert_eq!(now(), (handler(a_lines_stop), 0), "the default action was not taken over");
                 let during = this_threads_mask();
                 for s in [free, held] {
                     assert!(is(&during, s), "signal {s} is taken while a line is written");
                 }
                 assert!(!is(&during, dfl), "signal {dfl}, at its default action, waits while a line is written");
                 assert!(!is(&during, ignored), "signal {ignored}, ignored, waits while a line is written");
-                for s in [sig, libc::SIGSEGV, libc::SIGBUS] {
+                for s in [libc::SIGSEGV, libc::SIGBUS] {
                     assert!(!is(&during, s), "signal {s} waits while a line is written");
                 }
                 // As the write's loop does of the signal itself once a stop is asked.
@@ -1252,6 +1296,8 @@ mod prompt_tests {
                     (handler(stop_given_back_and_interrupt), 0),
                     "the echo hold's stop still restarts what it stopped"
                 );
+                // It has a handler here, and is the one handled signal that must not wait.
+                assert!(!is(&this_threads_mask(), sig), "the signal itself waits while a line is written");
             }
             assert_eq!(now(), (handler(stop_given_back), libc::SA_RESTART), "the echo hold's stop was not put back");
             unsafe { libc::signal(sig, libc::SIG_IGN) };
@@ -1260,12 +1306,84 @@ mod prompt_tests {
                 assert_eq!(now().0, libc::SIG_IGN, "an ignore was taken over");
             }
             assert_eq!(now().0, libc::SIG_IGN, "an ignore was not left");
-            for s in [sig, free, held, ignored] {
-                unsafe { libc::signal(s, libc::SIG_DFL) };
-            }
         })
         .join()
         .expect("the guard's thread");
+    }
+
+    /// Whether a child of this test's own stops at a stop for the terminal taken under a
+    /// line's guard. `held`: under an echo hold, where the guard has the twin. `asked`: with
+    /// a SIGQUIT waiting, blocked, which is a stop asked. The child is a job of its own (an
+    /// orphaned group's stop is dropped) and makes only async-signal-safe calls: the test
+    /// binary has other threads.
+    fn stops_at_a_lines_stop(held: bool, asked: bool) -> bool {
+        let null = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDWR) };
+        assert!(null >= 0, "/dev/null did not open");
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::setpgid(0, 0);
+                let mut dfl: libc::sigaction = std::mem::zeroed();
+                dfl.sa_sigaction = libc::SIG_DFL;
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                for s in [libc::SIGTTOU, libc::SIGQUIT] {
+                    libc::sigaction(s, &dfl, std::ptr::null_mut());
+                    libc::sigaddset(&mut set, s);
+                }
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                if held {
+                    (*HOLD.orig.get()).write(std::mem::zeroed());
+                    (*HOLD.held.get()).write(std::mem::zeroed());
+                    HOLD.fd.store(null, Ordering::Release);
+                    libc::sigaction(libc::SIGTTOU, &action(stop_given_back, libc::SA_RESTART), std::ptr::null_mut());
+                }
+                if asked {
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGQUIT);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                    libc::kill(libc::getpid(), libc::SIGQUIT);
+                }
+                let guard = StopsInterrupt::new();
+                libc::kill(libc::getpid(), libc::SIGTTOU);
+                drop(guard);
+                libc::_exit(0);
+            }
+        }
+        let mut status = 0;
+        let got = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        unsafe { libc::close(null) };
+        assert_eq!(got, pid, "the child was not waited for");
+        if libc::WIFSTOPPED(status) {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+            return true;
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the child neither stopped nor ended 0: status {status:#x}"
+        );
+        false
+    }
+
+    /// A stop for the terminal taken while a line is written stops the manager where
+    /// nothing is asked, and is not taken once a stop is asked, outside the echo hold and
+    /// under it: the write it interrupted fails either way, and its loop says the line.
+    #[test]
+    fn a_lines_stop_is_not_taken_once_a_stop_is_asked() {
+        for held in [false, true] {
+            assert!(
+                stops_at_a_lines_stop(held, false),
+                "echo held={held}: nothing was asked and the line's stop did not stop the child: it proves nothing"
+            );
+            assert!(
+                !stops_at_a_lines_stop(held, true),
+                "echo held={held}: a stop was asked and the line's stop stopped the child all the same"
+            );
+        }
     }
 
     /// A helper starts with none of what the main thread waits on; a plain thread from the

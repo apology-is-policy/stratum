@@ -174,7 +174,11 @@ typedef struct {
  * dial's connect is under the rule as well: one a listener holds is tried again each
  * tick, and given up the same way (the dial returns STM_EIO, errno ETIMEDOUT). A wait
  * counts for what it lasted and for a tick at most, so a process that was stopped, or
- * a machine that slept, has not waited meanwhile. to_leave is called on the calling
+ * a machine that slept, has not waited meanwhile. And it counts only where to_leave
+ * said true before it began (the client's last asking, for a call; a dial has asked
+ * nothing before its first wait): the wait a stop is asked in began before the asking,
+ * so a call or a dial is given up no sooner than give_up_after_ms after the asking.
+ * to_leave is called on the calling
  * thread. tick_ms and give_up_after_ms are not 0, and tick_ms is no more than INT_MAX:
  * it is poll's timeout. */
 typedef struct {

@@ -2992,9 +2992,10 @@ static bool leave_once_it_is_taken(void *arg)
 #define WAIT_TICK_MS  20u
 #define WAIT_LIMIT_MS 300u
 /* The most askings that say true before a wait with nothing sent or received is given
- * up: each is a whole tick counted, however long the machine took over it, and a
+ * up: the first ends a wait that began before the asking and counts for nothing, each
+ * after it is a whole tick counted, however long the machine took over it, and a
  * signal or a wake may cut two short. A count, where a time would move with the load. */
-#define WAIT_MOST_ASKINGS (WAIT_LIMIT_MS / WAIT_TICK_MS + 2u)
+#define WAIT_MOST_ASKINGS (WAIT_LIMIT_MS / WAIT_TICK_MS + 3u)
 
 STM_TEST(p9_client_dial_refuses_a_wait_that_cannot_wait)
 {
@@ -3033,8 +3034,8 @@ STM_TEST(p9_client_wait_gives_a_call_up_only_once_asked_to_leave)
     STM_ASSERT_EQ(rc, STM_EIO);
     /* Not the fake daemon's own end, which says EPIPE. */
     STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
-    /* The count starts at the asking. */
-    STM_ASSERT(took >= 4u * WAIT_LIMIT_MS - 2u * WAIT_TICK_MS);
+    /* The count starts at the asking, and the whole limit follows it. */
+    STM_ASSERT(took >= 4u * WAIT_LIMIT_MS);
     /* And ends a limit on: no more ticks than the limit holds. */
     STM_ASSERT(l.said <= WAIT_MOST_ASKINGS);
 
@@ -3042,6 +3043,37 @@ STM_TEST(p9_client_wait_gives_a_call_up_only_once_asked_to_leave)
     began = test_mono_ms();
     STM_ASSERT_EQ(stm_9p_clunk(c, 100), STM_EBACKEND);
     STM_ASSERT(test_mono_ms() - began < WAIT_LIMIT_MS / 2u);
+    stm_9p_close(c);
+    fake_daemon_stop(&d);
+}
+
+/* A stop is asked in the middle of a wait, and that wait began before the asking:
+ * counted, it gave a call up as much as a tick before its limit. Here the asking comes
+ * nine tenths of the way through the call's first wait, a long one. The time may not
+ * be short of the limit, and the number of askings that said true does not move with
+ * the machine: a wait counts a tick at most, so the limit takes as many as it holds,
+ * after the one the asking came in. */
+#define WAIT_LONG_TICK_MS 100u
+STM_TEST(p9_client_wait_does_not_count_the_wait_the_asking_came_in)
+{
+    fake_daemon d;
+    fake_daemon_start(&d, "wait_came_in", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
+    leave_from l = { UINT64_MAX, 0 };
+    stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_LONG_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_dial_opts o = default_dial_opts(100);
+    o.wait = &w;
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    uint64_t began = test_mono_ms();
+    l.from_ms = began + 9u * WAIT_LONG_TICK_MS / 10u;
+    stm_status rc = stm_9p_clunk(c, 100);
+    uint64_t ended = test_mono_ms();
+    STM_ASSERT_EQ(rc, STM_EIO);
+    STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
+    STM_ASSERT(ended - l.from_ms >= WAIT_LIMIT_MS);
+    STM_ASSERT(l.said > WAIT_LIMIT_MS / WAIT_LONG_TICK_MS);
+    STM_ASSERT(l.said <= WAIT_LIMIT_MS / WAIT_LONG_TICK_MS + 3u);
     stm_9p_close(c);
     fake_daemon_stop(&d);
 }
@@ -3176,8 +3208,9 @@ STM_TEST(p9_client_wait_counts_a_wait_a_signal_cut_short_for_what_it_lasted)
     sigaction(SIGUSR1, &was, NULL);
     STM_ASSERT_EQ(rc, STM_EIO);
     STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
-    /* Each counted as a whole tick, the limit would be reached in a quarter of it. */
-    STM_ASSERT(took >= WAIT_LIMIT_MS - 3u * WAIT_TICK_MS);
+    /* Each counted as a whole tick, the limit would be reached in a quarter of it; and
+     * counted for a part of a millisecond more than it lasted, a little before it. */
+    STM_ASSERT(took >= WAIT_LIMIT_MS);
     stm_9p_close(c);
     fake_daemon_stop(&d);
 }
@@ -3374,9 +3407,11 @@ STM_TEST(p9_client_wait_gives_up_a_dial_that_a_listener_does_not_take)
     /* The listener had to let it in: it waited where no asking reaches. */
     STM_ASSERT(!let_in);
     if (told == EAGAIN) {
-        /* Held, and given up a limit after the asking. */
+        /* Held, and given up a limit after the asking: a dial has asked nothing before
+         * its first wait, which so counts for nothing, as the wait a stop is asked in. */
         STM_ASSERT_EQ(why, ETIMEDOUT);
-        STM_ASSERT(took >= WAIT_LIMIT_MS - 2u * WAIT_TICK_MS);
+        STM_ASSERT(took >= WAIT_LIMIT_MS);
+        STM_ASSERT(l.said > WAIT_LIMIT_MS / WAIT_TICK_MS);
         STM_ASSERT(l.said <= WAIT_MOST_ASKINGS);
     } else {
         STM_ASSERT_EQ(why, ECONNREFUSED);

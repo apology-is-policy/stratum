@@ -376,12 +376,13 @@ uint64_t stm_alloc_avail_netfree_blocks(const stm_alloc *a);
  *   - refcount = 0 (already PENDING): STM_EINVAL (double-free).
  *
  * free_gen contract (CF-4 B): the free itself mutates the alloc tree,
- * so the NEXT commit always runs, and makes the PENDING entry durable.
- * A commit sweeps the entries with `free_gen < committed_gen`, and
- * does so before it asks whether anything changed: a sweep is itself
- * a change that commit writes. So a free stamped with a gen <= the
- * authoritative gen is reclaimed (swept to FREE) by the next commit,
- * and one stamped with the gen current at the free by the commit
+ * so the NEXT commit always runs. A commit sweeps the entries with
+ * `free_gen < committed_gen`, and does so before it asks whether
+ * anything changed: a sweep is itself a change that commit writes.
+ * So a free stamped with a gen <= the authoritative gen is reclaimed
+ * (swept to FREE) by the next commit, its PENDING entry never made
+ * durable; and one stamped with the gen current at the free is made
+ * durable as PENDING by the next commit and reclaimed by the commit
  * after that one, with nothing else changed in between: the second
  * of two commits made one after the other (tests/test_rc2_concurrent.c,
  * rc2_read_outlives_its_records_block). Only with nothing left to

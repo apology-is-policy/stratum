@@ -1095,8 +1095,9 @@ def stuck_daemon_leg(stratum, vol, host, root):
                     raise Failure(f'{how}: the screen drew for a Tab with host-fs stopped, '
                                   'so no call waits on it: it proves nothing')
             term.cut_output()
-            os.kill(term.pid, signal.SIGTERM)
+            # Taken before the signal: what is measured is then no shorter than what the manager waited.
             began = time.monotonic()
+            os.kill(term.pid, signal.SIGTERM)
             ended = term.exited(130)
             took = time.monotonic() - began
             waits = '' if ended else threads_waiting(term.pid)
@@ -1223,8 +1224,9 @@ def stuck_helper_leg(stratum, vol, host, root):
                     raise Failure(f'{how}: the screen drew for a Tab with the daemon stopped, so no call '
                                   'waits on it: it proves nothing')
             seen = len(term.raw)
-            os.kill(term.pid, signal.SIGTERM)
+            # Taken before the signal: what is measured is then no shorter than what the manager waited.
             began = time.monotonic()
+            os.kill(term.pid, signal.SIGTERM)
             if kind == 'words':
                 # Read until the call is given up and the screen left; from then on nothing
                 # is read, and the terminal is filled from the side. slate, which waits on
@@ -1369,8 +1371,9 @@ def stuck_start(stratum, vol, how, args, sealed, is_it, sock_name, daemons):
         if len(said) < daemons or screen_up or gone:
             raise Failure(f'{how}: {what}: it proves nothing')
         seen = len(term.raw)
-        os.kill(term.pid, signal.SIGTERM)
+        # Taken before the signal: what is measured is then no shorter than what the manager waited.
         began = time.monotonic()
+        os.kill(term.pid, signal.SIGTERM)
         ended = term.exited(150)
         took = time.monotonic() - began
         waits = '' if ended else threads_waiting(term.pid)
@@ -2514,8 +2517,9 @@ def stuck_start_behind_leg(stratum, root):
                           f'{why_not or "behind under tostop"}: it proves nothing')
         seen = len(term.raw)
         # As `kill %1` on a job that runs.
-        os.kill(manager, signal.SIGTERM)
+        # Taken before the signal: what is measured is then no shorter than what the manager waited.
         began = time.monotonic()
+        os.kill(manager, signal.SIGTERM)
         ended, stopped = False, ''
         while not ended and not stopped and time.monotonic() - began < 150:
             ended = term.exited(1)
