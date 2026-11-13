@@ -1986,6 +1986,13 @@ stm_status stm_sync_promote_policy_collect(stm_sync *s,
  * paddrs with live writes. Multi-writer harnesses without one
  * of these provisions can produce intermittent UNREPAIRABLE
  * phantoms uncorrelated with on-disk corruption.
+ * With more than one replica a stale record can cost more than a
+ * false report: where one replica's old block still holds the old
+ * bytes and another's has been given out again, the old bytes
+ * verify, the other replica is taken for damaged, and the repair
+ * writes the old ciphertext over a block that now belongs to
+ * another extent, reads it back, and reports REPAIRED. Nothing in
+ * the cb looks the record up again before it rewrites.
  *
  * Lifetime contract: `sync` is borrowed (the cb's ctx) and MUST
  * outlive `sc`. Callers MUST close scrub BEFORE closing sync (per

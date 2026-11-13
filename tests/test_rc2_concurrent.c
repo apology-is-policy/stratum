@@ -493,6 +493,17 @@ static void stale_hook(void *arg)
     h->written = stm_sync_write_extent(h->s, 1u, 1u, 0u, w, DRH_LEN);
     free(w);
     h->swept = stm_sync_keyschema_sweep(h->s, 1u, &h->pruned);
+    /* That write left its plaintext in the cache as well. Left there,
+     * it would serve the read's second attempt, and the locked fetch
+     * this test is about would not run. */
+    stm_sync_dcache_drain_for_test(h->s);
+}
+
+/* The two older read seams sit past the decrypt. They are for the
+ * unlocked fetch's windows, and a hook of theirs may take the lock. */
+static void count_hook(void *arg)
+{
+    (*(int *)arg)++;
 }
 
 STM_TEST(rc2_read_outlives_its_records_key) {
@@ -509,11 +520,21 @@ STM_TEST(rc2_read_outlives_its_records_key) {
     stm_sync_dcache_drain_for_test(f.sync);
 
     stale_ctx h = { f.sync, 0, STM_EINVAL, STM_EINVAL, STM_EINVAL, 0 };
+    uint64_t hits0 = 0, misses0 = 0, hits1 = 0, misses1 = 0;
+    stm_sync_dcache_stats(f.sync, &hits0, &misses0, NULL);
+    int prepopulate = 0, postinsert = 0;
     stm_sync_set_read_prefetch_hook_for_test(f.sync, stale_hook, &h);
+    stm_sync_set_read_prepopulate_hook_for_test(f.sync, count_hook,
+                                                  &prepopulate);
+    stm_sync_set_read_postinsert_hook_for_test(f.sync, count_hook,
+                                                 &postinsert);
     size_t got = 0;
     stm_status rc = stm_sync_read_extent(f.sync, 1u, 1u, 0u, buf, DRH_LEN,
                                            &got);
     stm_sync_set_read_prefetch_hook_for_test(f.sync, NULL, NULL);
+    stm_sync_set_read_prepopulate_hook_for_test(f.sync, NULL, NULL);
+    stm_sync_set_read_postinsert_hook_for_test(f.sync, NULL, NULL);
+    stm_sync_dcache_stats(f.sync, &hits1, &misses1, NULL);
 
     /* The premise, or the read below proves nothing: the reader was in
      * the window, once, and the key its record names was pruned there. */
@@ -529,6 +550,18 @@ STM_TEST(rc2_read_outlives_its_records_key) {
      * in the window: the second version, whole. */
     STM_ASSERT_EQ(rc2_ver_of(1u, 0u, buf[0]), 1u);
     STM_ASSERT_EQ(rc2_verify_ver(buf, 1u, 1u, 0u, got), 0);
+    /* And it was made from the device, under the lock: one miss, no
+     * hit. Served from the cache, the second attempt would have run
+     * none of the locked fetch. */
+    STM_ASSERT_EQ(hits1 - hits0, 0u);
+    STM_ASSERT_EQ(misses1 - misses0, 1u);
+    /* The locked fetch decrypted and filled the cache, and no seam
+     * fired in it: the stale-record seam once, in the unlocked fetch,
+     * and the two past the decrypt not at all, the unlocked fetch
+     * having failed before them. One that fired under the lock would
+     * deadlock a hook that takes it. */
+    STM_ASSERT_EQ(prepopulate, 0);
+    STM_ASSERT_EQ(postinsert, 0);
 
     free(wbuf);
     free(buf);

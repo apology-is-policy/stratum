@@ -571,6 +571,12 @@ impl OwnOutput {
 /// file or a pipe or another terminal, it is written plainly.
 pub(crate) fn say_on_stderr(line: &str) {
     use std::io::Write as _;
+    // Asked to stop, the manager only ends, and no word of that end may stop it for the
+    // terminal: under `stty tostop` a line written from behind its shell would, the daemons
+    // not yet stopped still serving, and a TERM held blocked could not end it until `fg`.
+    if stop_asked() {
+        crate::embed::never_stop_for_the_terminal();
+    }
     static SAME: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
     let own = *SAME.get_or_init(|| {
         let fd = own_output()?;

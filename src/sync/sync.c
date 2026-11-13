@@ -7757,7 +7757,7 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
     memcpy(buf, (uint8_t *)pbuf + slice_off, slice_len);
     {
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-        if (s->read_prepopulate_test_hook)
+        if (ebr && s->read_prepopulate_test_hook)
             s->read_prepopulate_test_hook(s->read_prepopulate_test_ctx);
 #endif
         uint8_t hkey[STM_CAS_HASH_LEN];
@@ -7781,7 +7781,7 @@ static stm_status sync_extent_fetch_decrypt(stm_sync *s,
         dcache_insert(s, hkey, STM_EXTENT_KIND_HOT, pbuf, rec.len,
                       /*visible_at_birth=*/false);
 #ifdef STRATUM_BUILD_TESTING_HOOKS
-        if (s->read_postinsert_test_hook)
+        if (ebr && s->read_postinsert_test_hook)
             s->read_postinsert_test_hook(s->read_postinsert_test_ctx);
 #endif
         dcache_publish_hot_gated(s, ebr, hkey,
