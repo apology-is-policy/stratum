@@ -162,9 +162,10 @@ impl SessionBuilder {
             mkfs.stdin(Stdio::null());
         }
         let mut child = mkfs.spawn().context("spawn mkfs")?;
+        let mut taken = true;
         if let Some(pass) = self.passphrase.as_ref() {
             if let Some(mut sin) = child.stdin.take() {
-                feed(&mut sin, &[pass.as_bytes(), b"\n"].concat())?;
+                taken = feed(&mut sin, &[pass.as_bytes(), b"\n"].concat())?;
             }
         }
         let out = child.wait_with_output()?;
@@ -172,6 +173,9 @@ impl SessionBuilder {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!("mkfs failed (exit {}): {}",
                 out.status.code().unwrap_or(-1), stderr));
+        }
+        if !taken {
+            return Err(anyhow!("mkfs ended 0 before its passphrase was written: it read none"));
         }
 
         // Spawn host-fs.
@@ -224,9 +228,10 @@ impl SessionBuilder {
             .stderr(Stdio::from(std::fs::File::create(&stratumd_log)?))
             .spawn()
             .context("spawn stratumd")?;
+        let mut taken = true;
         if let Some(pass) = self.passphrase.as_ref() {
             if let Some(mut sin) = stratumd_child.stdin.take() {
-                feed(&mut sin, &[pass.as_bytes(), b"\n"].concat())?;
+                taken = feed(&mut sin, &[pass.as_bytes(), b"\n"].concat())?;
             }
         }
         let stratumd = DaemonGuard {
@@ -234,7 +239,11 @@ impl SessionBuilder {
             label: "stratumd",
             log_path: Some(stratumd_log),
         };
+        // One that had ended by the write has no socket, and this says so with its log.
         stratumd.wait_ready(&stratumd_sock, Duration::from_secs(8))?;
+        if !taken {
+            return Err(anyhow!("stratumd serves, and had closed its input before its passphrase was written: it read none"));
+        }
 
         // Spawn slate.
         let slate_log = root.join("slate.log");
