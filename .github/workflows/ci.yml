@@ -4,10 +4,12 @@
 #   out=guard:     a stop for the terminal does not interrupt a line's write (no StopsInterrupt).
 #   out=twin:      the echo hold's stop is not taken over for the line (it restarts).
 #   out=plain:     the plain write's loop does not ask.
-#   out=line-stop: the line's stop does not ask whether a stop is asked (its unit test must be red).
+#   out=line-stop: the terminal's stop does not ask whether a stop is asked (its unit test must be red).
+#   out=set-look:  a set from behind asks only its caller (the set's unit test must be red: it spins).
 #   out=none:      the tree as it is; and the guard's unit tests, the leaving client, two signals at once.
-# The wait rule (job wait): the wait a stop is asked in counted again, in a call and in a dial, each
-# to be red at the client's tests; and how long after the asking a call is given up, measured.
+# The wait rule (job wait): the wait a stop is asked in counted again, in a call and in a dial, and each
+# wait floored to whole milliseconds, each to be red at the client's tests; how long after the asking a
+# call is given up, measured; and the storm of signals each 0.2 ms, five times.
 # A manager whose start waits on a stuck daemon (job stuck-start), six times, its figure to the
 # millisecond: the tree as it is, and with the wait a stop is asked in counted again.
 name: ci
@@ -23,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        out: [none, asking, guard, twin, plain, line-stop]
+        out: [none, asking, guard, twin, plain, line-stop, set-look]
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +44,7 @@ jobs:
       - name: take the asking out
         if: matrix.out == 'asking'
         run: |
-          perl -0pi -e 's/                Some\(libc::EINTR\) => \{\n(.*\n){2}                    if stop_asked\(\) \{\n                        crate::embed::never_stop_for_the_terminal\(\);\n                    \}\n                    continue;\n                \}/                Some(libc::EINTR) => continue,/' tools/stratum/src/tui.rs
+          perl -0pi -e 's/                Some\(libc::EINTR\) => \{\n(?:[ ]*\/\/.*\n)*                    if stop_asked\(\) \{\n                        crate::embed::never_stop_for_the_terminal\(\);\n                    \}\n                    continue;\n                \}/                Some(libc::EINTR) => continue,/' tools/stratum/src/tui.rs
 
       - name: take the guard out
         if: matrix.out == 'guard'
@@ -57,12 +59,17 @@ jobs:
       - name: take the plain write's asking out
         if: matrix.out == 'plain'
         run: |
-          perl -0pi -e 's/(                    Err\(e\) if e\.kind\(\) == io::ErrorKind::Interrupted => \{\n)                        if stop_asked\(\) \{\n                            crate::embed::never_stop_for_the_terminal\(\);\n                        \}\n/$1/' tools/stratum/src/tui.rs
+          perl -0pi -e 's/(                    Err\(e\) if e\.kind\(\) == io::ErrorKind::Interrupted => \{\n(?:[ ]*\/\/.*\n)*)                        if stop_asked\(\) \{\n                            crate::embed::never_stop_for_the_terminal\(\);\n                        \}\n/$1/' tools/stratum/src/tui.rs
 
-      - name: take the asking out of a line's stop
+      - name: take the asking out of the terminal's stop
         if: matrix.out == 'line-stop'
         run: |
-          perl -0pi -e 's/(extern "C" fn a_lines_stop\(sig: libc::c_int\) \{\n)    if stop_asked_in_a_handler\(\) \{\n        return;\n    \}\n/$1/; s/    if !stop_asked_in_a_handler\(\) \{\n        given_back_then_held\(sig, stop_given_back_and_interrupt, 0\);\n    \}\n/    given_back_then_held(sig, stop_given_back_and_interrupt, 0);\n/' tools/stratum/src/passphrase.rs
+          perl -0pi -e 's/(extern "C" fn stop_and_interrupt\(sig: libc::c_int\) \{\n)    if stop_asked_in_a_handler\(\) \{\n        return;\n    \}\n/$1/; s/    if !stop_asked_in_a_handler\(\) \{\n        given_back_then_held\(sig, stop_given_back_and_interrupt, 0\);\n    \}\n/    given_back_then_held(sig, stop_given_back_and_interrupt, 0);\n/' tools/stratum/src/passphrase.rs
+
+      - name: the set's look asking only its caller
+        if: matrix.out == 'set-look'
+        run: |
+          perl -0pi -e 's/        if !front\(\) && \(stop_asked\(\) \|\| crate::tui::stop_asked\(\)\) \{\n/        if !front() \&\& stop_asked() {\n/' tools/stratum/src/passphrase.rs
 
       - name: what was taken out
         if: matrix.out != 'none'
@@ -76,12 +83,12 @@ jobs:
       - name: a manager stopped behind at a line of its own, three shapes
         run: KEYS_ONLY=stopped_at_a_line_leg python3 tests/manager_keys.py dist/stratum
 
-      - name: the guard's unit tests
-        if: always() && (matrix.out == 'none' || matrix.out == 'line-stop')
+      - name: the guard's and the set's unit tests
+        if: always() && (matrix.out == 'none' || matrix.out == 'line-stop' || matrix.out == 'set-look')
         working-directory: tools/stratum
         env:
           STM_BUILD_DIR: ${{ github.workspace }}/build-dist
-        run: cargo test --release --bin stratum a_lines_
+        run: cargo test --release --bin stratum -- a_lines_ a_set_from_behind
 
       - name: a client that leaves
         if: always() && matrix.out == 'none'
@@ -100,7 +107,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        out: [none, call, dial]
+        out: [none, call, dial, floor]
     steps:
       - uses: actions/checkout@v4
 
@@ -126,6 +133,11 @@ jobs:
         run: |
           perl -0pi -e 's/        if \(!asked \|\| !asked_before\) continue;\n/        (void)asked_before;\n        if (!asked) continue;\n/' src/9p_client/9p_client.c
 
+      - name: floor each wait to whole milliseconds
+        if: matrix.out == 'floor'
+        run: |
+          perl -0pi -e 's/    uint64_t took = mono_ns\(\) - began;\n/    uint64_t took = (mono_ns() - began) \/ 1000000u * 1000000u;\n/' src/9p_client/9p_client.c
+
       - name: what was taken out
         if: matrix.out != 'none'
         run: |
@@ -144,6 +156,14 @@ jobs:
             STM_TEST_ONLY=p9_client_wait_measure_the_wait_the_asking_came_in MEASURE_INTO_PCT=$into \
                 ./build-probe/tests/test_9p_client 2>&1 | grep MEASURE
           done; done
+
+      - name: a storm of signals each 0.2 ms, five times
+        if: always()
+        run: |
+          for i in 1 2 3 4 5; do
+            STM_TEST_ONLY=p9_client_wait_counts_waits_shorter_than_a_millisecond \
+                ./build-probe/tests/test_9p_client 2>&1 | grep -a 'note: given up\|FAIL\|passed'
+          done
 
       - name: the client's tests
         if: always()

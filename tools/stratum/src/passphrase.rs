@@ -338,8 +338,9 @@ pub(crate) fn in_front(fd: RawFd) -> bool {
 }
 
 /// Runs `set`, a terminal set, until done: behind, each try stops on SIGTTOU until `fg`, and
-/// a stop asked meanwhile, as `stop_asked` tells, ends the wait. Returns whether it was done;
-/// an error other than EINTR (EIO: the terminal gone, or the group orphaned) ends it too.
+/// a stop asked meanwhile, as `stop_asked` or the manager's own look tells, ends the wait.
+/// Returns whether it was done; an error other than EINTR (EIO: the terminal gone, or the
+/// group orphaned) ends it too.
 pub(crate) fn set_when_in_front(
     front: impl Fn() -> bool,
     stop_asked: impl Fn() -> bool,
@@ -347,7 +348,9 @@ pub(crate) fn set_when_in_front(
 ) -> io::Result<bool> {
     let ttou = take_over(libc::SIGTTOU, &action(stop_and_interrupt, 0));
     let done = loop {
-        if !front() && stop_asked() {
+        // Never narrower than the stop's own look: once that says a stop is asked the stop
+        // returns at once, and a set made again unasked would fail at once, for ever.
+        if !front() && (stop_asked() || crate::tui::stop_asked()) {
             break Ok(false);
         }
         match set() {
@@ -456,8 +459,8 @@ extern "C" fn stop_given_back(sig: libc::c_int) {
 }
 
 /// The same while a line of the manager's is written (`StopsInterrupt`): without SA_RESTART,
-/// so the write it stopped fails with EINTR on each continue; and, as `a_lines_stop`, not
-/// taken once a stop is asked.
+/// so the write it stopped fails with EINTR on each continue; and, as
+/// `stop_and_interrupt`, not taken once a stop is asked.
 extern "C" fn stop_given_back_and_interrupt(sig: libc::c_int) {
     if !stop_asked_in_a_handler() {
         given_back_then_held(sig, stop_given_back_and_interrupt, 0);
@@ -500,34 +503,27 @@ unsafe fn hold_again(fd: RawFd) {
     }
 }
 
-/// While a set waits behind: stops as SIGTTOU would, and returns without SA_RESTART, so the
-/// set it interrupted fails with EINTR on each continue (Linux would restart it; macOS fails
-/// it either way).
+/// The stop for the terminal where SIGTTOU was at its default, while a set waits behind and
+/// while a line is written (`StopsInterrupt`): stops as SIGTTOU would, and returns without
+/// SA_RESTART, so the set or the write it stopped fails with EINTR on each continue (Linux
+/// would make it again by itself; macOS fails it either way). Not taken once a stop is
+/// asked: the call fails with EINTR all the same, and its loop, which asks the same, lets
+/// the line through or gives the set up. So a stop asked after the loop's own look does not
+/// leave the manager stopped behind, its daemons serving: neither one that came in between,
+/// nor one sent to a manager that a stop from outside held there, nor, on Linux, one whose
+/// continue dropped the pending SIGTTOU and had the kernel make the call again. What stays
+/// is a stop asked between this look and the stop itself, however long a stop from outside
+/// held the manager there. Every call made again on EINTR under this must ask first: once a
+/// stop is asked this returns at once, and a loop that made the call again unasked would
+/// spin.
 extern "C" fn stop_and_interrupt(sig: libc::c_int) {
-    unsafe {
-        let errno = *errno_location();
-        stop_by(sig);
-        libc::sigaction(sig, &action(stop_and_interrupt, 0), std::ptr::null_mut());
-        *errno_location() = errno;
-    }
-}
-
-/// A line's stop where SIGTTOU was at its default (`StopsInterrupt`): as
-/// `stop_and_interrupt`, but not taken once a stop is asked. The write fails with EINTR
-/// either way, and its loop, which asks the same, lets the line through. So a stop asked
-/// after the line's own look does not leave the manager stopped behind, its daemons
-/// serving: neither one that came in between, nor one sent to a manager that a stop from
-/// outside held there, nor, on Linux, one whose continue dropped the pending SIGTTOU and
-/// had the kernel make the write again. What stays is a stop asked between this look and
-/// the stop itself.
-extern "C" fn a_lines_stop(sig: libc::c_int) {
     if stop_asked_in_a_handler() {
         return;
     }
     unsafe {
         let errno = *errno_location();
         stop_by(sig);
-        libc::sigaction(sig, &action(a_lines_stop, 0), std::ptr::null_mut());
+        libc::sigaction(sig, &action(stop_and_interrupt, 0), std::ptr::null_mut());
         *errno_location() = errno;
     }
 }
@@ -570,7 +566,7 @@ impl StopsInterrupt {
         let given_back = stop_given_back as extern "C" fn(libc::c_int) as libc::sighandler_t;
         let ours = match old.sa_sigaction {
             _ if !has => None,
-            libc::SIG_DFL => Some(action(a_lines_stop, 0)),
+            libc::SIG_DFL => Some(action(stop_and_interrupt, 0)),
             held if held == given_back => Some(action(stop_given_back_and_interrupt, 0)),
             _ => None,
         };
@@ -1267,7 +1263,7 @@ mod prompt_tests {
             );
             {
                 let _guard = StopsInterrupt::over(sig);
-                assert_eq!(now(), (handler(a_lines_stop), 0), "the default action was not taken over");
+                assert_eq!(now(), (handler(stop_and_interrupt), 0), "the default action was not taken over");
                 let during = this_threads_mask();
                 for s in [free, held] {
                     assert!(is(&during, s), "signal {s} is taken while a line is written");
@@ -1317,7 +1313,7 @@ mod prompt_tests {
     /// orphaned group's stop is dropped) and makes only async-signal-safe calls: the test
     /// binary has other threads.
     fn stops_at_a_lines_stop(held: bool, asked: bool) -> bool {
-        let null = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDWR) };
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
         assert!(null >= 0, "/dev/null did not open");
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
@@ -1377,12 +1373,96 @@ mod prompt_tests {
         for held in [false, true] {
             assert!(
                 stops_at_a_lines_stop(held, false),
-                "echo held={held}: nothing was asked and the line's stop did not stop the child: it proves nothing"
+                "echo held={held}: nothing was asked and the line's stop did not stop the child: either this \
+                 system proves nothing here, or the stop no longer stops where nothing is asked, and every line \
+                 written from behind under tostop would spin"
             );
             assert!(
                 !stops_at_a_lines_stop(held, true),
                 "echo held={held}: a stop was asked and the line's stop stopped the child all the same"
             );
+        }
+    }
+
+    /// How a set made from behind ends, in a child of this test's own: `asked`, with a SIGQUIT
+    /// waiting, blocked, which is a stop asked, and the caller's own look saying no. Some(true)
+    /// where it ended as it should: asked, given up before the set was tried; else made again
+    /// on each interrupt until done. None where the child had not ended five seconds on. The
+    /// child makes only async-signal-safe calls: the test binary has other threads.
+    fn a_set_from_behind_ends(asked: bool) -> Option<bool> {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::setpgid(0, 0);
+                let mut dfl: libc::sigaction = std::mem::zeroed();
+                dfl.sa_sigaction = libc::SIG_DFL;
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                for s in [libc::SIGTTOU, libc::SIGQUIT] {
+                    libc::sigaction(s, &dfl, std::ptr::null_mut());
+                    libc::sigaddset(&mut set, s);
+                }
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                if asked {
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGQUIT);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                    libc::kill(libc::getpid(), libc::SIGQUIT);
+                }
+                let mut tries = 0u32;
+                let done = set_when_in_front(
+                    || false,
+                    || false,
+                    || {
+                        tries += 1;
+                        if !asked && tries > 3 {
+                            Ok(())
+                        } else {
+                            Err(io::Error::from_raw_os_error(libc::EINTR))
+                        }
+                    },
+                );
+                let right = match done {
+                    Ok(false) => asked && tries == 0,
+                    Ok(true) => !asked && tries == 4,
+                    Err(_) => false,
+                };
+                libc::_exit(if right { 0 } else { 1 });
+            }
+        }
+        let mut status = 0;
+        let waited = Instant::now();
+        while waited.elapsed() < Duration::from_secs(5) {
+            let got = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            assert!(got == 0 || got == pid, "the child was not waited for");
+            if got == pid {
+                assert!(libc::WIFEXITED(status), "the child did not end by itself: status {status:#x}");
+                return Some(libc::WEXITSTATUS(status) == 0);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+        None
+    }
+
+    /// A set from behind is given up once a stop is asked, whatever its caller's own look
+    /// says: the terminal's stop then returns at once, and the set, made again, would fail
+    /// with EINTR at once, for ever. With nothing asked it is made again until done.
+    #[test]
+    fn a_set_from_behind_is_given_up_once_a_stop_is_asked() {
+        assert_eq!(
+            a_set_from_behind_ends(false),
+            Some(true),
+            "nothing was asked and the set was not made again until done: it proves nothing"
+        );
+        match a_set_from_behind_ends(true) {
+            Some(true) => {}
+            Some(false) => panic!("a stop was asked and the set was not given up before it was tried"),
+            None => panic!("a stop was asked and the set spun, made again on each interrupt"),
         }
     }
 

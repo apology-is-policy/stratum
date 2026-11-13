@@ -3165,14 +3165,19 @@ static void wait_test_signal(int sig)
 typedef struct {
     pthread_t   whom;
     atomic_bool done;
+    long        every_us;
+    uint64_t    until_ms;
+    unsigned    sent;
 } signal_storm;
 
 static void *signal_storm_thread(void *arg)
 {
     signal_storm *st = arg;
-    while (!atomic_load(&st->done)) {
+    struct timespec pause = { st->every_us / 1000000L, (st->every_us % 1000000L) * 1000L };
+    while (!atomic_load(&st->done) && test_mono_ms() < st->until_ms) {
         pthread_kill(st->whom, SIGUSR1);
-        test_sleep_ms(5);
+        st->sent++;
+        nanosleep(&pause, NULL);
     }
     return NULL;
 }
@@ -3197,6 +3202,9 @@ STM_TEST(p9_client_wait_counts_a_wait_a_signal_cut_short_for_what_it_lasted)
     signal_storm st;
     st.whom = pthread_self();
     atomic_init(&st.done, false);
+    st.every_us = 5000;
+    st.until_ms = UINT64_MAX;
+    st.sent = 0;
     pthread_t storm;
     STM_ASSERT_EQ(pthread_create(&storm, NULL, signal_storm_thread, &st), 0);
 
@@ -3209,8 +3217,57 @@ STM_TEST(p9_client_wait_counts_a_wait_a_signal_cut_short_for_what_it_lasted)
     STM_ASSERT_EQ(rc, STM_EIO);
     STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
     /* Each counted as a whole tick, the limit would be reached in a quarter of it; and
-     * counted for a part of a millisecond more than it lasted, a little before it. */
+     * counted for more than it lasted, before it. */
     STM_ASSERT(took >= WAIT_LIMIT_MS);
+    stm_9p_close(c);
+    fake_daemon_stop(&d);
+}
+
+/* A storm of signals that cuts every wait shorter than a millisecond. Counted in whole
+ * milliseconds each such wait counts for nothing, and the call waits for as long as the
+ * storm blows; counted for what they lasted, the waits reach the limit within it. The
+ * storm ends before the daemon here hangs up (FAKE_HARD_MS). */
+#define WAIT_STORM_EVERY_US 200L
+#define WAIT_STORM_MS       6000u
+STM_TEST(p9_client_wait_counts_waits_shorter_than_a_millisecond)
+{
+    fake_daemon d;
+    fake_daemon_start(&d, "wait_storm", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
+    leave_from l = { 0, 0 };
+    stm_9p_wait w = { leave_once_it_is_time, &l, WAIT_TICK_MS, WAIT_LIMIT_MS };
+    stm_9p_dial_opts o = default_dial_opts(100);
+    o.wait = &w;
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    struct sigaction sa, was;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = wait_test_signal;
+    sigemptyset(&sa.sa_mask);
+    STM_ASSERT_EQ(sigaction(SIGUSR1, &sa, &was), 0);
+    signal_storm st;
+    st.whom = pthread_self();
+    atomic_init(&st.done, false);
+    st.every_us = WAIT_STORM_EVERY_US;
+    st.until_ms = test_mono_ms() + WAIT_STORM_MS;
+    st.sent = 0;
+    pthread_t storm;
+    STM_ASSERT_EQ(pthread_create(&storm, NULL, signal_storm_thread, &st), 0);
+
+    uint64_t began = test_mono_ms();
+    stm_status rc = stm_9p_clunk(c, 100);
+    uint64_t took = test_mono_ms() - began;
+    atomic_store(&st.done, true);
+    pthread_join(storm, NULL);
+    sigaction(SIGUSR1, &was, NULL);
+    printf("    note: given up in %llu ms, %u signals sent\n", (unsigned long long)took, st.sent);
+    STM_ASSERT_EQ(rc, STM_EIO);
+    STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
+    /* No storm slower than a signal a millisecond proves anything here. */
+    STM_ASSERT(st.sent > took);
+    STM_ASSERT(took >= WAIT_LIMIT_MS);
+    /* Given up while the storm still blew, and not long after the limit. */
+    STM_ASSERT(took < WAIT_STORM_MS / 2u);
     stm_9p_close(c);
     fake_daemon_stop(&d);
 }
