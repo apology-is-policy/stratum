@@ -515,9 +515,9 @@ extern "C" fn stop_and_interrupt(sig: libc::c_int) {
 /// fails such a write whatever SIGTTOU's action is, and there the caller's own loop is what
 /// must not write on unasked. The default action is taken over, and the echo hold's stop,
 /// which restarts; nothing is where something else has SIGTTOU, a handler or an ignore.
-/// Every other signal waits meanwhile: of two taken where the write comes back, Linux has
-/// the first one's action say whether the write is made again, and the manager's handlers
-/// for a stop asked restart. One that waits so is seen by `stop_asked`.
+/// Every other signal that has a handler waits meanwhile: taken with the stop where the
+/// write comes back, one whose handler restarts has Linux make the write again, and the
+/// manager's handlers for a stop asked restart. One that waits so is seen by `stop_asked`.
 pub(crate) struct StopsInterrupt {
     sig: libc::c_int,
     old: Option<libc::sigaction>,
@@ -556,24 +556,31 @@ impl Drop for StopsInterrupt {
     }
 }
 
-/// Blocks on this thread every signal but `sig` and the faults. Its drop unblocks the ones
-/// it blocked itself and no other, so a block made meanwhile stays.
+/// Blocks on this thread every signal that has a handler, `sig` and the faults apart. One
+/// at its default action says nothing of a write it is taken at, and an interrupt nobody
+/// catches ends a line that waits, as it did. Its drop unblocks the ones it blocked itself
+/// and no other, so a block made meanwhile stays.
 pub(crate) struct OthersWait(libc::sigset_t);
 
 impl OthersWait {
     pub(crate) fn but(sig: libc::c_int) -> Self {
-        let mut all: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let apart = [sig, libc::SIGSEGV, libc::SIGBUS, libc::SIGFPE, libc::SIGILL, libc::SIGTRAP, libc::SIGABRT, libc::SIGSYS];
+        let mut handled: libc::sigset_t = unsafe { std::mem::zeroed() };
         let mut prev: libc::sigset_t = unsafe { std::mem::zeroed() };
         let mut mine: libc::sigset_t = unsafe { std::mem::zeroed() };
         unsafe {
-            libc::sigfillset(&mut all);
-            for keep in [sig, libc::SIGSEGV, libc::SIGBUS, libc::SIGFPE, libc::SIGILL, libc::SIGTRAP, libc::SIGABRT, libc::SIGSYS] {
-                libc::sigdelset(&mut all, keep);
-            }
+            libc::sigemptyset(&mut handled);
             libc::sigemptyset(&mut mine);
-            if libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut prev) == 0 {
+            for other in (1..=64).filter(|other| !apart.contains(other)) {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                let known = libc::sigaction(other, std::ptr::null(), &mut act) == 0;
+                if known && act.sa_sigaction != libc::SIG_DFL && act.sa_sigaction != libc::SIG_IGN {
+                    libc::sigaddset(&mut handled, other);
+                }
+            }
+            if libc::pthread_sigmask(libc::SIG_BLOCK, &handled, &mut prev) == 0 {
                 for other in 1..=64 {
-                    if libc::sigismember(&all, other) == 1 && libc::sigismember(&prev, other) == 0 {
+                    if libc::sigismember(&handled, other) == 1 && libc::sigismember(&prev, other) == 0 {
                         libc::sigaddset(&mut mine, other);
                     }
                 }
@@ -1165,22 +1172,29 @@ mod prompt_tests {
         asked().into_iter().map(|sig| unsafe { libc::sigismember(mask, sig) } == 1).collect()
     }
 
+    extern "C" fn taken(_: libc::c_int) {}
+
     /// A line's guard, asked of a signal nothing else here uses. The default action is
     /// taken over by one that does not restart, the echo hold's stop by its twin that does
-    /// not, an ignore is left; every other signal waits meanwhile, the faults and the
-    /// signal itself apart; and it gives back what it took and no more: what was blocked
-    /// before stays blocked, and so does a block made while it lived.
+    /// not, an ignore is left; every other signal that has a handler waits meanwhile, and
+    /// one ignored or at its default action does not, nor the faults, nor the signal
+    /// itself; and it gives back what it took and no more: what was blocked before stays
+    /// blocked, and so does a block made while it lived.
     #[test]
     fn a_lines_guard_takes_over_what_restarts_and_the_others_wait() {
         std::thread::spawn(|| {
             let sig = libc::SIGUSR2;
+            // With a handler: one free, one blocked before. With none: one ignored, one at
+            // its default action.
+            let (free, held, ignored, dfl) = (libc::SIGURG, libc::SIGUSR1, libc::SIGWINCH, libc::SIGTERM);
             let is = |mask: &libc::sigset_t, s: libc::c_int| unsafe { libc::sigismember(mask, s) } == 1;
             let handler = |f: extern "C" fn(libc::c_int)| f as libc::sighandler_t;
-            let now = || {
+            let action_of = |s: libc::c_int| {
                 let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
-                assert_eq!(unsafe { libc::sigaction(sig, std::ptr::null(), &mut act) }, 0);
+                assert_eq!(unsafe { libc::sigaction(s, std::ptr::null(), &mut act) }, 0);
                 (act.sa_sigaction, act.sa_flags & libc::SA_RESTART)
             };
+            let now = || action_of(sig);
             let one = |s: libc::c_int| {
                 let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
                 unsafe {
@@ -1189,24 +1203,30 @@ mod prompt_tests {
                 }
                 set
             };
-            let waits = [
-                libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGTTIN,
-                libc::SIGCHLD, libc::SIGWINCH,
-            ];
-            block(&one(libc::SIGUSR1));
+            for s in [sig, free, held, ignored, dfl] {
+                assert_eq!(action_of(s), (libc::SIG_DFL, 0), "signal {s} is not at its default: it proves nothing");
+            }
+            unsafe {
+                for s in [free, held] {
+                    libc::sigaction(s, &action(taken, libc::SA_RESTART), std::ptr::null_mut());
+                }
+                libc::signal(ignored, libc::SIG_IGN);
+            }
+            block(&one(held));
             let before = this_threads_mask();
             assert!(
-                !waits.iter().chain(&[sig]).any(|&s| is(&before, s)) && is(&before, libc::SIGUSR1),
+                ![sig, free, ignored, dfl].iter().any(|&s| is(&before, s)) && is(&before, held),
                 "this thread's mask is not as the test set it: it proves nothing"
             );
-            assert_eq!(now(), (libc::SIG_DFL, 0), "SIGUSR2 is not at its default: it proves nothing");
             {
                 let _guard = StopsInterrupt::over(sig);
                 assert_eq!(now(), (handler(stop_and_interrupt), 0), "the default action was not taken over");
                 let during = this_threads_mask();
-                for s in waits {
+                for s in [free, held] {
                     assert!(is(&during, s), "signal {s} is taken while a line is written");
                 }
+                assert!(!is(&during, dfl), "signal {dfl}, at its default action, waits while a line is written");
+                assert!(!is(&during, ignored), "signal {ignored}, ignored, waits while a line is written");
                 for s in [sig, libc::SIGSEGV, libc::SIGBUS] {
                     assert!(!is(&during, s), "signal {s} waits while a line is written");
                 }
@@ -1215,8 +1235,8 @@ mod prompt_tests {
             }
             assert_eq!(now(), (libc::SIG_DFL, 0), "the default action was not put back");
             let after = this_threads_mask();
-            assert!(!waits.iter().any(|&s| is(&after, s)), "a signal still waits after the line");
-            assert!(is(&after, libc::SIGUSR1), "what was blocked before the line was unblocked after it");
+            assert!(!is(&after, free), "a signal still waits after the line");
+            assert!(is(&after, held), "what was blocked before the line was unblocked after it");
             assert!(is(&after, sig), "a block made during the line was undone after it");
             unsafe {
                 libc::pthread_sigmask(libc::SIG_UNBLOCK, &one(sig), std::ptr::null_mut());
@@ -1237,7 +1257,9 @@ mod prompt_tests {
                 assert_eq!(now().0, libc::SIG_IGN, "an ignore was taken over");
             }
             assert_eq!(now().0, libc::SIG_IGN, "an ignore was not left");
-            unsafe { libc::signal(sig, libc::SIG_DFL) };
+            for s in [sig, free, held, ignored] {
+                unsafe { libc::signal(s, libc::SIG_DFL) };
+            }
         })
         .join()
         .expect("the guard's thread");
