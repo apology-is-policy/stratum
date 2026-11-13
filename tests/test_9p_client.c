@@ -3252,7 +3252,8 @@ static bool leave_and_note_when(void *arg)
 /* A storm of signals that cuts the waits short, most of them under a millisecond. Counted
  * in whole milliseconds such waits count for nothing: where every one is under a
  * millisecond the call waits for as long as the storm blows, and elsewhere it is given up
- * past the limit, inside the storm, which only the premise below tells. Counted for what
+ * past the limit, inside the storm or after it: red at the premise below and, past three
+ * seconds, at the bound too. Counted for what
  * they lasted, they reach the limit within it. The storm ends before the daemon here hangs
  * up (FAKE_HARD_MS). */
 #define WAIT_STORM_EVERY_US 200L

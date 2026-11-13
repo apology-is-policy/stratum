@@ -973,6 +973,197 @@ def unread_since_enter_leg(stratum, vol, host, root):
     print(f'ok: after {how} the volume mounts and unmounts cleanly', flush=True)
 
 
+def wait_unread(what, timeout, tick=0.05):
+    """`what()` once true, or when the time is up, with nothing read from the terminal: what the
+    manager writes meanwhile waits in it, unread."""
+    limit = time.monotonic() + timeout
+    got = what()
+    while not got and time.monotonic() < limit:
+        time.sleep(tick)
+        got = what()
+    return got
+
+
+def unread_hold_sets_leg(stratum, vol, host, root):
+    """The terminal's mode set where the echo hold sets it, with what the manager wrote since left
+    unread: the line the prompt ends with, or the prompt itself. A set that waited for the output
+    to go would wait there for as long as nothing reads, on macOS (Linux's ptys do not wait): the
+    headless start's let-go, its stop request held and the volume unlocked; a stop from outside
+    and the continue after it, while stratumd derives the key; and the prompt's own end, before
+    stratumd starts. The prompt's first set comes before anything is written, and is not staged.
+    Headless, the daemons' words go to the terminal too, and must not hold a daemon there either:
+    with what this one holds, a daemon's last line waits, on macOS."""
+    stall = 10  # tui.rs HELD_AFTER, in seconds
+
+    def headless_let_go():
+        how = 'headless, nothing read from the Enter on'
+        term = Term([stratum, 'tui', '--headless', '--vol', vol.v, '--host', host])
+        session = None
+        try:
+            term.expect(r'Passphrase for')
+            session = session_dir_of(term.pid)
+            if not session:
+                raise Failure(f'{how}: no session directory at the prompt: it proves nothing')
+            term.send(PASS.encode() + ENTER)
+            # From here nothing reads until the daemons are seen to stop.
+            if not wait_unread(lambda: len(session_daemons(session)) >= 3, 60):
+                raise Failure(f'{how}: daemons {session_daemons(session)}: the start did not get that far, '
+                              'it proves nothing')
+            time.sleep(3)
+            sock = f'{session}/stratumd.sock'
+            os.kill(term.pid, signal.SIGTERM)
+            taken = wait_unread(lambda: not daemons_of(sock), 15)
+            record(taken, f'{how}: the TERM was taken, stratumd stopped and the volume locked, with nothing read',
+                   f'{how}: stratumd still serves the volume 15 s after a TERM, with nothing read')
+            gone = wait_unread(lambda: not session_daemons(session), 15)
+            record(gone, f'{how}: every daemon stopped, with nothing read',
+                   f'{how}: daemons {session_daemons(session)} still run 15 s after a TERM, with nothing read')
+            ended = term.exited(30)
+            said = 'caught signal 15' in term.screen.text()
+            record(ended and term.rc == 0 and said, f'{how}: it ended on the TERM, rc 0',
+                   f'{how}: ended={ended} rc={term.rc}, said it caught the TERM={said}')
+        except Failure:
+            print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+            raise
+        finally:
+            term.kill()
+            if session:
+                signal_each(session_daemons(session))
+
+    def stop_and_continue():
+        # Under a job shell: the manager's own group, a session's leader, is orphaned, and a
+        # TSTP to it is dropped.
+        how = 'a TSTP and then a CONT while stratumd derives the key, nothing read from the Enter on'
+        term = Term([sys.executable, '-I', '-c', JOB_SHELL, stratum, 'tui', '--vol', vol.v, '--host', host])
+        manager, session, held = None, None, []
+        try:
+            term.expect(r'Passphrase for')
+            manager = child_running(term.pid, 'tui')
+            session = session_dir_of(manager) if manager else None
+            if not session:
+                raise Failure(f'{how}: manager {manager}, session {session}: it proves nothing')
+            sock = f'{session}/stratumd.sock'
+            term.send(PASS.encode() + ENTER)
+            # From here nothing reads.
+            held = wait_unread(lambda: daemons_of(sock), 10, tick=0.005)
+            for pid in held:
+                os.kill(int(pid), signal.SIGSTOP)
+            modes = tty_modes(term)
+            if not held or os.path.exists(sock) or modes != HELD_MODES:
+                raise Failure(f'{how}: stratumd held={held}, socket made={os.path.exists(sock)}, the terminal '
+                              f'{modes}: not in the unlock with echo held off, it proves nothing')
+            os.kill(manager, signal.SIGTSTP)
+            stopped = wait_unread(lambda: 'T' in state_of(manager), 5)
+            modes = tty_modes(term)
+            record(stopped and all(modes.values()), f'{how}: the TSTP stopped it with the terminal given back',
+                   f'{how}: stopped={stopped}, the terminal {modes}, 5 s after the TSTP')
+            os.kill(manager, signal.SIGCONT)
+            again = wait_unread(lambda: 'T' not in state_of(manager) and tty_modes(term) == HELD_MODES, 5)
+            record(again, f'{how}: continued in front, echo is held off again',
+                   f'{how}: 5 s after the CONT its state {state_of(manager)!r}, the terminal {tty_modes(term)}')
+        except Failure:
+            print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+            raise
+        finally:
+            job_cleanup(term, held, session)
+
+    def prompt_end():
+        how = 'the passphrase typed with nothing read, the prompt too'
+        term = Term([stratum, 'tui', '--vol', vol.v, '--host', host])
+        session = None
+        try:
+            # Nothing is read at all: the prompt waits in the terminal, unread.
+            quiet = wait_unread(lambda: tty_modes(term) == RAW_MODES, 30)
+            session = session_dir_of(term.pid)
+            if not quiet or not session:
+                raise Failure(f'{how}: the terminal {tty_modes(term)}, session {session}: not at the prompt, '
+                              'it proves nothing')
+            # Past the drop of what was typed ahead, which follows the set at once.
+            time.sleep(0.5)
+            term.send(PASS.encode() + ENTER)
+            up = wait_unread(lambda: len(session_daemons(session)) >= 3, 30)
+            record(up, f'{how}: the start went on past the Enter',
+                   f'{how}: daemons {session_daemons(session)} 30 s after the Enter: the start never went on')
+            os.kill(term.pid, signal.SIGTERM)
+            gone = wait_unread(lambda: not session_daemons(session), stall + 9)
+            record(gone, f'{how}: a TERM stopped the daemons, with nothing read',
+                   f'{how}: daemons {session_daemons(session)} still serve {stall + 9} s after a TERM, '
+                   'with nothing read')
+        except Failure:
+            print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+            raise
+        finally:
+            term.kill()
+            if session:
+                signal_each(session_daemons(session))
+
+    for case in (headless_let_go, stop_and_continue, prompt_end):
+        try:
+            case()
+        except (Failure, OSError) as e:
+            record(False, '', f'unread_hold_sets_leg: {case.__name__}: {e}')
+    vol.serve()
+    vol.stop()
+    print('ok: after the echo hold\'s sets with nothing read the volume mounts and unmounts cleanly', flush=True)
+
+
+def headless_words_held_leg(stratum, vol, host, root):
+    """Headless, a terminal that takes nothing once the daemons are up, filled from the side as
+    another program's output fills it. A TERM must still stop the daemons and end the manager:
+    neither may a daemon's words, which go to the terminal too, hold it in a write, nor the
+    manager's own lines hold its stop for longer than a terminal that takes nothing is given."""
+    stall = 10  # tui.rs HELD_AFTER, in seconds
+    how = 'headless, its terminal filled once the daemons are up'
+    term = Term([stratum, 'tui', '--headless', '--vol', vol.v, '--host', host])
+    session, side = None, None
+    try:
+        term.expect(r'Passphrase for')
+        session = session_dir_of(term.pid)
+        term.send(PASS.encode() + ENTER)
+        term.expect(r'send SIGTERM', timeout=60)
+        daemons = session_daemons(session) if session else []
+        if len(daemons) < 3:
+            raise Failure(f'{how}: session {session}, daemons {daemons}: not up, it proves nothing')
+        # Kept open while the manager lasts: its exit is then not the terminal's last close, which
+        # on macOS waits for what the terminal holds to be read.
+        side, put = fill_from_the_side(term)
+        print(f'note: {how}: {put} bytes from the side filled the terminal', flush=True)
+        os.kill(term.pid, signal.SIGTERM)
+        asked = time.monotonic()
+        limit = asked + stall + 9
+        left, ended = daemons, False
+        while (left or not ended) and time.monotonic() < limit:
+            time.sleep(0.2)
+            left = session_daemons(session)
+            if not ended:
+                pid, status = os.waitpid(term.pid, os.WNOHANG)
+                if pid:
+                    term.rc = os.waitstatus_to_exitcode(status)
+                    ended = True
+        took = time.monotonic() - asked
+        waits = '' if ended else threads_waiting(term.pid)
+        record(not left, f'{how}: a TERM stopped every daemon, with nothing read ({took:.0f} s)',
+               f'{how}: daemons {left} still run {took:.0f} s after a TERM, with nothing read')
+        # Its last lines given up, it ends as a manager its terminal held: as the signal alone would.
+        record(ended and term.rc == 128 + signal.SIGTERM,
+               f'{how}: the manager ended {128 + signal.SIGTERM}, as the signal alone would have ended it, '
+               f'with nothing read ({took:.0f} s)',
+               f'{how}: the manager ended={ended} rc={term.rc} {took:.0f} s after a TERM, {128 + signal.SIGTERM} wanted'
+               + (f'; its threads: {waits}' if waits else ''))
+    except Failure:
+        print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        if side is not None:
+            os.close(side)
+        term.kill()
+        if session:
+            signal_each(session_daemons(session))
+    vol.serve()
+    vol.stop()
+    print(f'ok: after {how} the volume mounts and unmounts cleanly', flush=True)
+
+
 def output_gone_leg(stratum, vol, host, root):
     """Its output going, as it does when its terminal closes, but with no watcher to race:
     the terminal stays, so only the UI thread can see it. Whatever the manager's last
@@ -1847,6 +2038,8 @@ if pid == 0:
     if '--null' in flags:
         for fd in (0, 1, 2):
             os.dup2(os.open(os.devnull, os.O_RDWR), fd)
+    if '--close0' in flags:
+        os.close(0)
     os.execv(sys.argv[1], sys.argv[1:])
 os.close(r)
 try:
@@ -2431,7 +2624,9 @@ def screen_started_behind_leg(stratum, root):
     program's does, and it then comes up (on macOS that set fails with EINTR after the stop,
     which the screen library does not retry). A `kill %1` while it waits ends it there, with the
     terminal left to the shell; so too where no standard descriptor is a terminal and the screen
-    sets the controlling one."""
+    sets the controlling one, and where standard input is closed (Rust's runtime puts /dev/null
+    there, so the screen takes the terminal as for /dev/null). A stop asked with no continue,
+    as `kill -INT %1` sends it, waits until `fg`, and then ends it before the screen."""
     w = f'{root}/behind'
     os.makedirs(w, exist_ok=True)
 
@@ -2458,13 +2653,37 @@ def screen_started_behind_leg(stratum, root):
         record(modes == EDITOR_MODES, f'{how}: the shell\'s mode was left as the shell set it',
                f'{how}: the terminal is {modes}, not the shell\'s {EDITOR_MODES}')
 
+    def int_then_fg(term, how, manager):
+        # The handler's stop request waits through the set, and the manager stays stopped.
+        os.kill(manager, signal.SIGINT)
+        term.pump(1)
+        state = state_of(manager)
+        if 'T' not in state or tty_modes(term) != EDITOR_MODES:
+            raise Failure(f'{how}: its state {state!r}, the terminal {tty_modes(term)}: not still stopped behind '
+                          'after the INT, it proves nothing')
+        seen = len(term.raw)
+        os.kill(term.pid, signal.SIGUSR2)
+        ended = term.exited(30)
+        said = 'asked to stop before the screen' in term.screen.text()
+        state = '' if ended else state_of(manager)
+        record(ended and term.rc == 1 and said, f'{how}: at fg it ended, rc 1, and said so',
+               f'{how}: ended={ended} rc={term.rc}, said so={said}, its state {state!r}')
+        modes = tty_modes(term)
+        record(all(modes.values()), f'{how}: the terminal was left as the shell gave it at fg',
+               f'{how}: the terminal is {modes}, not as the shell gave it at fg')
+        shown = b'\x1b[?1049h' in term.raw[seen:]
+        record(not shown, f'{how}: no screen was put up', f'{how}: a screen was put up after the stop was asked')
+
     # Under tostop the end behind must stop for nothing either: not the last word, not the
     # watcher's probe of the terminal.
     cases = (('the screen started behind, then fg', (), fg_then_quit),
              ('the screen started behind, sent a TERM while it waits', (), kill_while_waiting),
              ('the screen started behind, tostop set, sent a TERM while it waits', ('--tostop',), kill_while_waiting),
              ('the screen started behind, no standard descriptor a terminal, sent a TERM while it waits', ('--null',),
-              lambda term, how, manager: kill_while_waiting(term, how, manager, seen=False)))
+              lambda term, how, manager: kill_while_waiting(term, how, manager, seen=False)),
+             ('the screen started behind, standard input closed, sent a TERM while it waits', ('--close0',),
+              kill_while_waiting),
+             ('the screen started behind, sent an INT with no continue, then fg', (), int_then_fg))
     for how, flags, then in cases:
         term = Term([sys.executable, '-I', '-c', JOB_SHELL, '--behind', '--editor', *flags, stratum, 'tui', '--host', w])
         manager = None
@@ -2485,6 +2704,82 @@ def screen_started_behind_leg(stratum, root):
             raise
         finally:
             job_cleanup(term, [], None)
+
+
+def no_terminal_hangup_leg(stratum, root):
+    """No standard descriptor a terminal, as GNU nohup starts it, and HUP ignored: the screen reads
+    the controlling terminal. Once that hangs up, a read of it returns nothing, again and again,
+    and the manager is ended only by its watcher, the daemons following on their lifeline. On
+    macOS the screen cannot come up so (kqueue cannot watch /dev/tty): it ends at once, rc 1."""
+    how = 'the screen, no standard descriptor a terminal, HUP ignored, its terminal hung up'
+    w = f'{root}/nohup'
+    os.makedirs(w, exist_ok=True)
+    term = Term([sys.executable, '-I', '-c', JOB_SHELL, '--null', stratum, 'tui', '--host', w],
+                ignored=(signal.SIGHUP,))
+    manager, session, closed = None, None, False
+    try:
+        limit = time.monotonic() + 10
+        ended = False
+        while manager is None and not ended and time.monotonic() < limit:
+            manager = child_running(term.pid, 'tui')
+            ended = manager is None and term.exited(0.05)
+        if sys.platform == 'darwin':
+            ended = ended or term.exited(10)
+            record(ended and term.rc == 1, f'{how}: on macOS the screen cannot come up so, and it ended at once, rc 1',
+                   f'{how}: on macOS ended={ended} rc={term.rc}, rc 1 at once wanted')
+            left = daemons_of(w) + (session_daemons(f'stratum-{manager}-[^/]*/') if manager else [])
+            record(not left, f'{how}: on macOS nothing was left running', f'{how}: on macOS daemons {left} were left')
+            return
+        if manager is None:
+            raise Failure(f'{how}: no manager under the job shell: it proves nothing')
+        session = session_dir_of(manager)
+        up = wait_until(term, lambda: tty_modes(term) == RAW_MODES, 30)
+        if not up or not session:
+            raise Failure(f'{how}: the terminal {tty_modes(term)}, session {session}: the screen is not up, '
+                          'it proves nothing')
+        term.pump(1)
+        before = session_daemons(session)
+        spent = cpu_seconds(manager) or 0.0
+        os.close(term.fd)
+        closed = True
+        hung = time.monotonic()
+        while term.rc is None and time.monotonic() < hung + 5:
+            pid, status = os.waitpid(term.pid, os.WNOHANG)
+            if pid:
+                term.rc = os.waitstatus_to_exitcode(status)
+            else:
+                time.sleep(0.1)
+        took = time.monotonic() - hung
+        state = '' if term.rc is not None else state_of(manager) + how_it_ran(manager, spent, took)
+        record(term.rc == 129, f'{how}: the watcher ended it, rc 129, {took:.1f} s after the hangup',
+               f'{how}: rc={term.rc} {took:.0f} s after the hangup, its state {state!r}')
+        left = before
+        limit = time.monotonic() + 15
+        while left and time.monotonic() < limit:
+            time.sleep(0.2)
+            left = session_daemons(session)
+        record(not left, f'{how}: its daemons stopped', f'{how}: daemons {left} still serve 15 s after the hangup')
+    except Failure:
+        if not closed:
+            print(f'--- screen at the failure\n{term.screen.text()}\n---', flush=True)
+        raise
+    finally:
+        if not closed:
+            job_cleanup(term, [], None)
+        elif term.rc is None:
+            # The job shell ends only with the manager, which no signal but a KILL ends now.
+            for pid in (manager, term.pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                os.waitpid(term.pid, 0)
+            except ChildProcessError:
+                pass
+            term.rc = -9
+        if session:
+            signal_each(session_daemons(session))
 
 
 def not_stopped_for_a_write(term, manager):
@@ -5203,6 +5498,8 @@ def run(stratum, root):
                       (death_legs, (stratum, vol, host, root)),
                       (held_terminal_legs, (stratum, vol, host, root)),
                       (unread_since_enter_leg, (stratum, vol, host, root)),
+                      (unread_hold_sets_leg, (stratum, vol, host, root)),
+                      (headless_words_held_leg, (stratum, vol, host, root)),
                       (output_gone_leg, (stratum, vol, host, root)),
                       (stuck_daemon_leg, (stratum, vol, host, root)),
                       (stuck_helper_leg, (stratum, vol, host, root)),
@@ -5219,6 +5516,7 @@ def run(stratum, root):
                       (screen_job_control_leg, (stratum, vol, host, root)),
                       (core_dumps_off_leg, (stratum, vol, host, root)),
                       (screen_started_behind_leg, (stratum, root)),
+                      (no_terminal_hangup_leg, (stratum, root)),
                       (stuck_start_behind_leg, (stratum, root)),
                       (stopped_at_a_line_leg, (stratum, vol, root)),
                       (setsid_screen_leg, (stratum, root)),
