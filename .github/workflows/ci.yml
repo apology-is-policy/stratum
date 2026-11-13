@@ -48,7 +48,7 @@ jobs:
         env:
           STM_BUILD_DIR: ${{ github.workspace }}/build-dist
         run: |
-          set -u
+          set -u +e
           sab() {
             local name=$1 file=$2 expr=$3 legs=$4
             cp "$file" /tmp/keep
