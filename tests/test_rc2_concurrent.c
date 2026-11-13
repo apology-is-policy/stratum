@@ -45,6 +45,7 @@
 #include <stratum/block.h>
 #include <stratum/crypto.h>
 #include <stratum/ebr.h>
+#include <stratum/extent.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
 #include <stratum/inode.h>
@@ -562,6 +563,126 @@ STM_TEST(rc2_read_outlives_its_records_key) {
      * deadlock a hook that takes it. */
     STM_ASSERT_EQ(prepopulate, 0);
     STM_ASSERT_EQ(postinsert, 0);
+
+    free(wbuf);
+    free(buf);
+    rc2_fixture_close(&f);
+}
+
+/* ========================================================================= */
+/* rc2_read_outlives_its_records_block                                        */
+/* ========================================================================= */
+
+/* The same window, its other arm: the key stays and the block goes.
+ * Before the reader uses its record the extent is written again, so
+ * the block the record names is freed; two commits make it free to
+ * take; and writes to other files go on until one of them takes it.
+ * The record then names a block that holds another extent's
+ * ciphertext, and the data is whole, elsewhere. A filesystem does all
+ * of this to a reader on a pool near full: a write that finds no
+ * space drains what is buffered, commits twice and reserves again. */
+#define RBL_TRIES 64u
+
+typedef struct {
+    stm_sync  *s;
+    int        fired;
+    uint64_t   old_paddr;   /* the block the reader's record names */
+    uint64_t   new_paddr;   /* where the extent is once written again */
+    uint64_t   taker_ino;   /* whose extent took the old block; 0: nobody's */
+    stm_status st;          /* the first step of the hook that failed */
+} reuse_ctx;
+
+static stm_status rbl_paddr_of(stm_sync *s, uint64_t ino, uint64_t *out)
+{
+    stm_extent_record e;
+    stm_status rc = stm_extent_lookup_at(stm_sync_extent_index(s), 1u, ino,
+                                           0u, &e);
+    if (rc == STM_OK) *out = e.paddrs[0];
+    return rc;
+}
+
+static void reuse_hook(void *arg)
+{
+    reuse_ctx *h = arg;
+    if (h->fired++) return;
+    uint8_t *w = malloc(DRH_LEN);
+    if (!w) { h->st = STM_ENOMEM; return; }
+
+    /* The extent again: the record in the tree now names new blocks,
+     * and the old ones wait to be freed. */
+    rc2_fill(w, 1u, 1u, DRH_LEN);
+    h->st = stm_sync_write_extent(h->s, 1u, 1u, 0u, w, DRH_LEN);
+    if (h->st == STM_OK) h->st = rbl_paddr_of(h->s, 1u, &h->new_paddr);
+    /* A block freed at one generation is free to take once a commit of
+     * a later one has swept it: the first commit makes the free
+     * durable, the second, of a tree changed since, sweeps it. */
+    if (h->st == STM_OK) h->st = stm_sync_commit(h->s);
+    rc2_fill(w, 2u, 0u, DRH_LEN);
+    if (h->st == STM_OK)
+        h->st = stm_sync_write_extent(h->s, 1u, 2u, 0u, w, DRH_LEN);
+    if (h->st == STM_OK) h->st = stm_sync_commit(h->s);
+
+    /* Other files' extents, until one sits where the record points. */
+    for (uint64_t ino = 3u; h->st == STM_OK && h->taker_ino == 0u &&
+                            ino < 3u + RBL_TRIES; ino++) {
+        uint64_t at = 0;
+        rc2_fill(w, ino, 0u, DRH_LEN);
+        h->st = stm_sync_write_extent(h->s, 1u, ino, 0u, w, DRH_LEN);
+        if (h->st == STM_OK) h->st = rbl_paddr_of(h->s, ino, &at);
+        if (h->st == STM_OK && at == h->old_paddr) h->taker_ino = ino;
+    }
+    free(w);
+    /* Those writes left their plaintext in the cache, the extent's
+     * new version among them. */
+    stm_sync_dcache_drain_for_test(h->s);
+}
+
+STM_TEST(rc2_read_outlives_its_records_block) {
+    struct rc2_fixture f;
+    rc2_fixture_open(&f, "reuse");
+
+    uint8_t *wbuf = malloc(DRH_LEN);
+    uint8_t *buf  = malloc(DRH_LEN);
+    STM_ASSERT(wbuf != NULL && buf != NULL);
+    rc2_fill(wbuf, 1u, 0u, DRH_LEN);
+    STM_ASSERT_OK(stm_sync_write_extent(f.sync, 1u, 1u, 0u, wbuf, DRH_LEN));
+    STM_ASSERT_OK(stm_sync_commit(f.sync));
+    stm_sync_dcache_drain_for_test(f.sync);
+
+    reuse_ctx h = { f.sync, 0, 0, 0, 0, STM_EINVAL };
+    STM_ASSERT_OK(rbl_paddr_of(f.sync, 1u, &h.old_paddr));
+    uint64_t hits0 = 0, misses0 = 0, hits1 = 0, misses1 = 0;
+    stm_sync_dcache_stats(f.sync, &hits0, &misses0, NULL);
+    stm_sync_set_read_prefetch_hook_for_test(f.sync, reuse_hook, &h);
+    size_t got = 0;
+    stm_status rc = stm_sync_read_extent(f.sync, 1u, 1u, 0u, buf, DRH_LEN,
+                                           &got);
+    stm_sync_set_read_prefetch_hook_for_test(f.sync, NULL, NULL);
+    stm_sync_dcache_stats(f.sync, &hits1, &misses1, NULL);
+
+    stm_test_info("rc2 reuse: the record's block %llu, the extent now at "
+                  "%llu, the block taken by file %llu",
+                  (unsigned long long)h.old_paddr,
+                  (unsigned long long)h.new_paddr,
+                  (unsigned long long)h.taker_ino);
+
+    /* The premise, or the read below proves nothing: the reader was in
+     * the window, once; the extent moved; and the block its record
+     * names is another file's by then. */
+    STM_ASSERT_EQ(h.fired, 1);
+    STM_ASSERT_OK(h.st);
+    STM_ASSERT(h.new_paddr != h.old_paddr);
+    STM_ASSERT(h.taker_ino != 0u);
+
+    STM_ASSERT_OK(rc);
+    STM_ASSERT_EQ(got, (size_t)DRH_LEN);
+    /* Not the other file's bytes and not the first version: the extent
+     * as written in the window, whole, read from the device under the
+     * lock. */
+    STM_ASSERT_EQ(rc2_ver_of(1u, 0u, buf[0]), 1u);
+    STM_ASSERT_EQ(rc2_verify_ver(buf, 1u, 1u, 0u, got), 0);
+    STM_ASSERT_EQ(hits1 - hits0, 0u);
+    STM_ASSERT_EQ(misses1 - misses0, 1u);
 
     free(wbuf);
     free(buf);

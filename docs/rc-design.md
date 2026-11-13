@@ -243,7 +243,12 @@ fence is in enter; never remove or weaken it.
   Witness: `rc2_read_outlives_its_records_key`, staged through the
   `stm_sync_set_read_prefetch_hook_for_test` seam; its second attempt is
   made from the device (the hook empties the cache its own write
-  filled: one miss, no hit), and no seam fires in it. Not established: that
+  filled: one miss, no hit), and no seam fires in it. The window's other
+  arm, the record's blocks freed, swept by two commits and taken by
+  another file's extent, is `rc2_read_outlives_its_records_block`: there
+  the unlocked fetch fails the tag check (`STM_EBADTAG`) on the other
+  extent's ciphertext, and the locked one reads the extent where it now
+  is. Not established: that
   the CI failure was this mechanism; the hammer keeps the first failing
   status now.
 
