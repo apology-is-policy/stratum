@@ -1203,9 +1203,12 @@ mod prompt_tests {
                 }
                 set
             };
+            // The action alone: a default action's flags say nothing, and macOS keeps
+            // SA_RESTART on one whose handler an exec reset.
             for s in [sig, free, held, ignored, dfl] {
-                assert_eq!(action_of(s), (libc::SIG_DFL, 0), "signal {s} is not at its default: it proves nothing");
+                assert_eq!(action_of(s).0, libc::SIG_DFL, "signal {s} is not at its default: it proves nothing");
             }
+            let was = now();
             unsafe {
                 for s in [free, held] {
                     libc::sigaction(s, &action(taken, libc::SA_RESTART), std::ptr::null_mut());
@@ -1233,7 +1236,7 @@ mod prompt_tests {
                 // As the write's loop does of the signal itself once a stop is asked.
                 block(&one(sig));
             }
-            assert_eq!(now(), (libc::SIG_DFL, 0), "the default action was not put back");
+            assert_eq!(now(), was, "the default action was not put back");
             let after = this_threads_mask();
             assert!(!is(&after, free), "a signal still waits after the line");
             assert!(is(&after, held), "what was blocked before the line was unblocked after it");

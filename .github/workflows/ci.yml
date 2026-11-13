@@ -83,3 +83,19 @@ jobs:
           cc -O2 -o /tmp/two-signals tests/probe_two_signals.c
           /tmp/two-signals 20000
           /tmp/two-signals 20000
+
+  # What a step's process inherits of each signal, and what an exec keeps of a signal's flags
+  # when it resets the handler: the unit test of the line's guard failed its premise on macOS.
+  inherited:
+    name: inherited / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - name: what a step inherits, and what an exec keeps
+        run: |
+          cc -O2 -o /tmp/exec-flags tests/probe_exec_flags.c
+          /tmp/exec-flags
