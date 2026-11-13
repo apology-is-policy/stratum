@@ -121,7 +121,10 @@ The probe is reached from two shapes:
   deletion takes it exclusive. Staged by
   `rc2_read_outlives_its_records_key` through
   `stm_sync_set_read_prefetch_hook_for_test`, which fires on the
-  lock-free fetch only.
+  lock-free fetch only, as the two seams past the decrypt do. The
+  second attempt holds `s->lock` across its device reads and its
+  decryption, so a read that fails for a true reason holds writers and
+  commits for that long (PRODUCTION-PLAN T3.22).
 - **The under-lock compounds** (truncate / migrate / snap-view / send via
   `sync_decrypt_extent_record_locked`): the RC-1 protocol verbatim —
   resolve the thread's EBR handle (`stm_ebr_thread_current()`; a NULL —

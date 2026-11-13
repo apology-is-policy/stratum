@@ -233,11 +233,17 @@ fence is in enter; never remove or weaken it.
   (run 43333293980, Linux, gcc, asan: 1 read of 8000). Now any failure of
   the unlocked fetch sends the read to `stm_sync_read_extent_locked`,
   under `s->lock`, where the record is looked up and used in one span;
-  that result is the read's. The snap read is unchanged (a frozen tree's
+  that result is the read's. The price: a read that fails for a true
+  reason makes its device reads and its decryption a second time inside
+  that lock, which RC-2 had taken reads off, and writers' reserves and
+  indexing and commits wait for it (PRODUCTION-PLAN T3.22). The snap
+  read is unchanged (a frozen tree's
   record does not go stale while its snapshot is there, and the fs holds
   `fs->global` shared across the read against the snapshot's deletion).
   Witness: `rc2_read_outlives_its_records_key`, staged through the
-  `stm_sync_set_read_prefetch_hook_for_test` seam. Not established: that
+  `stm_sync_set_read_prefetch_hook_for_test` seam; its second attempt is
+  made from the device (the hook empties the cache its own write
+  filled: one miss, no hit), and no seam fires in it. Not established: that
   the CI failure was this mechanism; the hammer keeps the first failing
   status now.
 
@@ -729,8 +735,10 @@ finds the four-party re-insert trace above).
 **Tests** (`tests/test_corvus_mount.c`; new seam
 `stm_sync_set_read_postinsert_hook_for_test`, the [insert, publish]
 twin of the prepopulate seam — same contract: no sync locks held,
-fires on locked-context fetches too, so regressions arm it around
-lock-free reads only):
+fired on locked-context fetches too as first built, so regressions
+armed it around lock-free reads only; since a read whose unlocked
+fetch fails is made again under `s->lock`, both seams fire in the
+unlocked fetch only):
 
 - `corvus_rc6_read_evict_third_party` — the deterministic F1 witness:
   the prepopulate hook lands the evict; the postinsert hook issues a
