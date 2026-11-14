@@ -28,7 +28,7 @@ jobs:
         run: |
           perl -0pi -e 's/        if \(!held \|\| floored_ms \+ WAIT_LIMIT_MS \/ 10u < WAIT_LIMIT_MS\) break;\n/        break;\n/' tests/test_9p_client.c
           git diff --stat -- tests/test_9p_client.c
-          git diff --quiet -- tests/test_9p_client.c && { echo "w-18 DID NOT APPLY"; exit 1; }
+          if git diff --quiet -- tests/test_9p_client.c; then echo "w-18 DID NOT APPLY"; exit 1; fi
 
       - name: build the client test
         run: |
