@@ -1,7 +1,7 @@
-# A PROBE, never to be merged: the 9P client's storm test (a signal each 0.2 ms cutting its waits short) on one CPU of
-#   ubuntu-24.04, alone and beside a busy competitor on that CPU, to see whether a test kept from its CPU by another
-#   program gives its premise red (few signals, few looks, the whole ms between the looks near the time taken, given
-#   up past the limit) with the client's give-up still within its bound, as one local run under a held machine did.
+# A PROBE, never to be merged: the 9P client's storm test, now made again where its premise alone did not hold, on
+#   one CPU of ubuntu-24.04: alone (green on its first run), beside a busy program at a higher priority for its first
+#   run only (red premise on run 1, its bounds held, then green on run 2: the run made again), and beside it throughout
+#   (red after three runs: a run that proves nothing never passes).
 name: ci
 
 on:
@@ -31,30 +31,28 @@ jobs:
           cmake --build build --target test_9p_client
           find build -name test_9p_client -type f
 
-      - name: the storm test on one CPU, alone and beside a competitor
+      - name: the storm test on one CPU, alone, beside a competitor for its first run, and throughout
         run: |
           set -u +e
           X=$(find build -name test_9p_client -type f | head -1)
           nproc; uptime
-          run() {
-            local tag=$1; shift
-            local out; out=$(STM_TEST_ONLY=p9_client_wait_counts_waits_shorter_than_a_millisecond "$@" "$X" 2>&1); local rc=$?
-            echo "$tag rc=$rc | $(printf '%s\n' "$out" | grep -a 'note: given up' | sed 's/ *note: //') | $(printf '%s\n' "$out" | grep -a -i -m3 'assert\|FAIL ' | tr '\n' ' ' | cut -c1-300)"
-          }
-          echo "=== control: pinned to CPU 0, nice 19, nothing else there"
-          for i in 1 2 3 4 5; do run "alone-19" taskset -c 0 nice -n 19; done
-          echo "=== a competitor spinning on CPU 0 at nice 0, the test at nice 19"
+          export STM_TEST_ONLY=p9_client_wait_counts_waits_shorter_than_a_millisecond
+          echo "=== alone, nice 19, pinned to CPU 0"
+          for i in 1 2 3; do stdbuf -oL -eL taskset -c 0 nice -n 19 "$X" 2>&1 | grep -a 'note: run\|passed,\|FAIL'; done
+          echo "=== a competitor on CPU 0 at nice 0 until the first run ends"
+          for i in 1 2 3 4 5; do
+            taskset -c 0 sh -c 'while :; do :; done' & SPIN=$!
+            sleep 0.5
+            stdbuf -oL -eL taskset -c 0 nice -n 19 "$X" 2>&1 | while IFS= read -r l; do
+              case "$l" in *'note: run 1:'*) kill "$SPIN" 2>/dev/null;; esac
+              case "$l" in *'note: run'*|*'passed,'*|*FAIL*) echo "$l";; esac
+            done
+            kill "$SPIN" 2>/dev/null; wait "$SPIN" 2>/dev/null
+            echo "--"
+          done
+          echo "=== the competitor throughout"
           taskset -c 0 sh -c 'while :; do :; done' & SPIN=$!
-          sleep 1
-          for i in 1 2 3 4 5; do run "beside-19" taskset -c 0 nice -n 19; done
-          echo "=== the same competitor, the test at nice 0 (an equal share)"
-          for i in 1 2 3 4 5; do run "beside-0" taskset -c 0 nice -n 0; done
-          kill "$SPIN"; wait "$SPIN" 2>/dev/null
-          echo "=== control again: alone at nice 19"
-          for i in 1 2 3; do run "alone-19b" taskset -c 0 nice -n 19; done
-          echo "=== the whole output of one run beside the competitor"
-          taskset -c 0 sh -c 'while :; do :; done' & SPIN=$!
-          sleep 1
-          STM_TEST_ONLY=p9_client_wait_counts_waits_shorter_than_a_millisecond taskset -c 0 nice -n 19 "$X" 2>&1 | tail -20
+          sleep 0.5
+          for i in 1 2; do stdbuf -oL -eL taskset -c 0 nice -n 19 "$X" 2>&1 | grep -a 'note: run\|passed,\|FAIL'; echo "--"; done
           kill "$SPIN"; wait "$SPIN" 2>/dev/null
           true
