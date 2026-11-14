@@ -693,10 +693,16 @@ def threads_waiting(pid):
     try:
         tids = sorted(os.listdir(f'/proc/{pid}/task'), key=int)
     except (OSError, ValueError):
-        import subprocess as _sp
-        out = f'/tmp/sample-{pid}.txt'
-        _sp.run(['sample', str(pid), '1', '-mayDie', '-file', out], capture_output=True)
-        return f'sampled to {out}'
+        import subprocess as _sp, time as _t
+        kids = _sp.run(['pgrep', '-P', str(pid)], capture_output=True, text=True).stdout.split()
+        with open(f'/tmp/held-{pid}.txt', 'w') as h:
+            h.write(f'at {_t.time():.3f}\n')
+            h.write(_sp.run(['ps', '-o', 'pid,ppid,stat,wchan,time,command', '-p', ','.join([str(pid)] + kids)], capture_output=True, text=True).stdout)
+            for q in [str(pid)] + kids:
+                h.write(_sp.run(['lsof', '-a', '-p', q, '-d', '0,1,2'], capture_output=True, text=True).stdout)
+        for q in [str(pid)] + kids:
+            _sp.run(['sample', q, '1', '-mayDie', '-file', f'/tmp/sample-{q}.txt'], capture_output=True)
+        return f'sampled {pid} and children {kids}'
     for tid in tids:
         about = []
         for name, take in (('comm', lambda t: t.strip()),

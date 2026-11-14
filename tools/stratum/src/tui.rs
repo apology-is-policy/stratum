@@ -735,7 +735,8 @@ fn probe_log(s: &str) {
     if let Some(p) = std::env::var_os("STM_PROBE_LOG") {
         use std::io::Write as _;
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(p) {
-            let _ = writeln!(f, "{} {}", std::process::id(), s);
+            let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+            let _ = writeln!(f, "{} {} {}", std::process::id(), ms, s);
         }
     }
 }
@@ -800,7 +801,7 @@ impl io::Write for OwnOutput {
             let mut room = libc::pollfd { fd: self.fd, events: libc::POLLOUT, revents: 0 };
             let polled = unsafe { libc::poll(&mut room, 1, poll_ms(self.tick)) };
             room_said = polled == 1 && room.revents & libc::POLLOUT != 0;
-            if self.refused <= 40 || self.refused % 500 == 0 {
+            {
                 probe_log(&format!("write fd={} refused={} polled={} revents={:#x} asked={} waited_ms={} held_after_ms={} tick_ms={}",
                     self.fd, self.refused, polled, room.revents, asked, waited.as_millis(), self.held_after.as_millis(), self.tick.as_millis()));
             }

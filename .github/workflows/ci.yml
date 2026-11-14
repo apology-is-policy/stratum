@@ -1,8 +1,8 @@
-# A PROBE, never to be merged: macos-15, where the manager's legs with standard output, and standard error,
-#   given as /dev/tty failed in CI run 43584241627 (held 19 s) though they pass on a later macOS. It measures
-#   /dev/tty there (ttyname, tcgetsid, a non-blocking write on a full terminal, poll's answer), then runs those
-#   two legs with a log of what the manager opened and what each refused write and poll said, the manager
-#   sampled where it is still there; and the unit test of an open of /dev/tty, logged too.
+# A PROBE, never to be merged: macos-15 again. Probe 17 found /dev/tty there as on a later macOS and both opens
+#   giving up, yet the screen's case took 15 s and the headless one held in stop_child. This measures how long a
+#   100 ms nanosleep and a 100 ms poll timeout take there, then runs the two legs twice with a timestamped log
+#   (each manager's wall time from the asking to the give-up against the wait it counted), the held manager and
+#   its daemons sampled, their states and descriptors 0-2 listed.
 name: ci
 
 on:
@@ -31,15 +31,17 @@ jobs:
           sysctl -n hw.ncpu
           python3 --version
 
-      - name: /dev/tty measured
-        run: python3 -B tests/probe_devtty_facts.py
+      - name: sleeps measured
+        run: python3 -B tests/probe_sleeps.py
 
       - name: the two legs, logged
         if: always()
         env:
           STM_PROBE_LOG: /tmp/probe.log
           KEYS_ONLY: held_terminal_legs,headless_words_held_leg
-        run: python3 -B tests/manager_keys.py dist/stratum || true
+        run: |
+          python3 -B tests/manager_keys.py dist/stratum || true
+          python3 -B tests/manager_keys.py dist/stratum || true
 
       - name: the log, per manager
         if: always()
@@ -48,17 +50,16 @@ jobs:
       - name: where a held manager waits
         if: always()
         run: |
+          for f in /tmp/held-*.txt; do
+            [ -f "$f" ] || continue
+            echo "=== $f"; cut -c1-200 "$f" | head -60
+          done
           for f in /tmp/sample-*.txt; do
             [ -f "$f" ] || continue
             echo "=== $f"
-            grep -a -E 'Thread_|^ *\+ *[0-9]+ ' "$f" | grep -a -v -E '^ *\+ *[0-9]+ +[!:?]' | cut -c1-200 | head -120
+            grep -a -E 'Thread_|^ *\+ ' "$f" | cut -c1-180 | head -60
           done
 
-      - name: the unit test of an open of /dev/tty, logged
+      - name: sleeps measured again, after the legs
         if: always()
-        env:
-          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
-          STM_PROBE_LOG: /tmp/probe-unit.log
-        run: |
-          (cd tools/stratum && cargo test --release --bin stratum -- an_open_of_dev_tty dev_tty_is) || true
-          head -40 /tmp/probe-unit.log 2>/dev/null | cut -c1-260
+        run: python3 -B tests/probe_sleeps.py
