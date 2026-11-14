@@ -550,25 +550,25 @@ fn held_end_code(asked_by: libc::c_int) -> libc::c_int {
 
 /// The end of a manager whose terminal took nothing, its daemons stopped and its session
 /// put away by then; it returns where no terminal was held. What a terminal it gave up and
-/// controls has not taken is dropped: macOS keeps a controlling process that has ended until
-/// its terminal has drained, and no other process, the terminal's last close included. Any
-/// other terminal keeps what other programs wrote to it. Not exit(), which flushes standard
-/// output: to that terminal.
+/// controls has not taken is dropped on macOS, which keeps a controlling process that has ended
+/// until its terminal has drained, and no other process, the terminal's last close included.
+/// Linux keeps none, and there nothing is dropped. Any other terminal keeps what other programs
+/// wrote to it. Not exit(), which flushes standard output: to that terminal.
 pub(crate) fn end_if_terminal_held() {
     if !terminal_held() {
         return;
     }
-    // Dropping it from behind would stop the job, and nothing would continue it.
-    crate::embed::never_stop_for_the_terminal();
-    unsafe {
-        let me = libc::getpid();
+    if cfg!(target_os = "macos") {
+        // Dropping it from behind would stop the job, and nothing would continue it.
+        crate::embed::never_stop_for_the_terminal();
+        let me = unsafe { libc::getpid() };
         for fd in held_opens() {
-            if libc::tcgetsid(fd) == me {
-                libc::tcflush(fd, libc::TCOFLUSH);
+            if unsafe { libc::tcgetsid(fd) } == me {
+                unsafe { libc::tcflush(fd, libc::TCOFLUSH) };
             }
         }
-        libc::_exit(held_end_code(ASKED_BY.load(Ordering::Relaxed)))
     }
+    unsafe { libc::_exit(held_end_code(ASKED_BY.load(Ordering::Relaxed))) }
 }
 
 /// The opens of its own that gave their terminal up: the screen's, and the lines' where
@@ -686,14 +686,38 @@ fn lines_open(
     if unsafe { libc::isatty(err) } != 1 {
         return None;
     }
-    let rdev = |fd: RawFd| {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_rdev)
-    };
     match screen {
-        Some(fd) if rdev(fd).is_some() && rdev(fd) == rdev(err) => Some((fd, &TERMINAL_HELD)),
+        Some(fd) if same_terminal(fd, err) => Some((fd, &TERMINAL_HELD)),
         _ => reopen().map(|fd| (fd, &LINES_HELD)),
     }
+}
+
+/// Whether `a` and `b` are one terminal: the same device, or one an open of /dev/tty, which has
+/// a device number of its own, and the other the controlling terminal, as su leaves the screen's
+/// open on Linux. Only async-signal-safe calls, for the unit test's child.
+fn same_terminal(a: RawFd, b: RawFd) -> bool {
+    let (ra, rb) = (rdev_of(a), rdev_of(b));
+    if ra.is_none() || rb.is_none() {
+        return false;
+    }
+    if ra == rb {
+        return true;
+    }
+    let tty = dev_tty_rdev();
+    let controlling = |fd: RawFd, r| r == tty || unsafe { libc::tcgetsid(fd) == libc::getsid(0) };
+    tty.is_some() && (ra == tty || rb == tty) && controlling(a, ra) && controlling(b, rb)
+}
+
+/// A descriptor's device number, where it has one.
+fn rdev_of(fd: RawFd) -> Option<libc::dev_t> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_rdev)
+}
+
+/// /dev/tty's own device number.
+fn dev_tty_rdev() -> Option<libc::dev_t> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::stat(c"/dev/tty".as_ptr(), &mut st) } == 0).then_some(st.st_rdev)
 }
 
 impl io::Write for OwnOutput {
@@ -794,7 +818,11 @@ pub(crate) fn daemon_words_out() -> Option<std::os::fd::OwnedFd> {
 
 /// The terminal `fd` is, opened again to write, by its name, which has to lead to `fd`'s own
 /// terminal; else, with `dev_tty`, /dev/tty where `fd`'s terminal is the controlling one.
+/// Without it never /dev/tty, which is also the name a descriptor of /dev/tty has.
 fn reopen_terminal(fd: RawFd, dev_tty: bool) -> Option<RawFd> {
+    if !dev_tty && rdev_of(fd).is_some() && rdev_of(fd) == dev_tty_rdev() {
+        return None;
+    }
     let flags = libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
     let mut name = [0 as libc::c_char; 1024];
     let mut again = -1;
@@ -5941,6 +5969,84 @@ mod tests {
         assert!(is(other, sb, &LINES_HELD), "another terminal: not an open of its own with the lines' flag");
         assert!(is(alone, sb, &LINES_HELD), "no screen open: not an open of its own with the lines' flag");
         assert!(none.is_none(), "standard error no terminal: an open all the same");
+    }
+
+    /// An open of /dev/tty and the controlling terminal are one terminal to the manager's lines,
+    /// another terminal is not, and no open that will be polled on macOS is of /dev/tty, not even
+    /// by its name. In a child leading a session with a pty for its controlling terminal; only
+    /// async-signal-safe calls there, and the answer in the exit code. A child that hangs, as a
+    /// call that is not safe there could, is killed and counts as a failure.
+    #[test]
+    fn dev_tty_is_the_controlling_terminal() {
+        let pty = || {
+            let (mut m, mut s) = (0, 0);
+            let rc = unsafe {
+                libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+            };
+            assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());
+            (m, s)
+        };
+        let ((ma, sa), (mb, sb)) = (pty(), pty());
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::setsid();
+                if libc::ioctl(sa, libc::TIOCSCTTY as _, 0) != 0 {
+                    libc::_exit(10);
+                }
+                let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                let held = |got: Option<(RawFd, &'static AtomicBool)>| {
+                    matches!(got, Some((f, h)) if f == tty && std::ptr::eq(h, &TERMINAL_HELD))
+                };
+                let code = if tty < 0 {
+                    11
+                } else if !same_terminal(tty, sa) || !same_terminal(sa, tty) {
+                    12
+                } else if same_terminal(tty, sb) || same_terminal(sb, tty) {
+                    13
+                } else if reopen_terminal(tty, false).is_some() {
+                    14
+                } else if !held(lines_open(Some(tty), sa, || None)) {
+                    15
+                } else {
+                    0
+                };
+                libc::_exit(code);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut status, mut got) = (0, 0);
+        while got == 0 && Instant::now() < deadline {
+            got = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if got == 0 {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let hung = got == 0;
+        if hung {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        unsafe {
+            for fd in [ma, sa, mb, sb] {
+                libc::close(fd);
+            }
+        }
+        let code = if !hung && libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
+        let why = match code {
+            0 => "",
+            10 => "the pty did not become the controlling terminal: it proves nothing",
+            11 => "/dev/tty did not open: it proves nothing",
+            12 => "an open of /dev/tty is not the controlling terminal to the lines",
+            13 => "an open of /dev/tty is another terminal to the lines",
+            14 => "a polled open made again of /dev/tty",
+            15 => "the lines on /dev/tty not through the screen's open of the controlling terminal",
+            _ => "the child hung or failed",
+        };
+        assert_eq!(code, 0, "/dev/tty: {why}");
     }
 
     /// Where standard input is no terminal and the screen did not make it its own (its open

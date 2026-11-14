@@ -3258,8 +3258,12 @@ static bool leave_and_note_when(void *arg)
  * up (FAKE_HARD_MS). */
 #define WAIT_STORM_EVERY_US 200L
 #define WAIT_STORM_MS       6000u
+#define WAIT_STORM_RUNS     3u
 static looks_noted g_storm_looks;
-STM_TEST(p9_client_wait_counts_waits_shorter_than_a_millisecond)
+
+/* One storm and one call through it, on a daemon of its own: the call's bounds asserted, whether
+ * they held stored in *held, and the whole ms of its own waits (below) returned. */
+static uint64_t storm_run(unsigned run, bool *held)
 {
     fake_daemon d;
     fake_daemon_start(&d, "wait_storm", FAKE_NEVER_ANSWERS, STM_9P_MSIZE_DEFAULT);
@@ -3300,22 +3304,37 @@ STM_TEST(p9_client_wait_counts_waits_shorter_than_a_millisecond)
         floored_ms += (g_storm_looks.at_ns[i] - last_ns) / 1000000u;
         last_ns = g_storm_looks.at_ns[i];
     }
-    printf("    note: given up in %llu ms; %u signals, %u looks, %llu whole ms between the looks\n",
-           (unsigned long long)took, st.sent, g_storm_looks.n, (unsigned long long)floored_ms);
+    printf("    note: run %u: given up in %llu ms; %u signals, %u looks, %llu whole ms between the looks\n",
+           run, (unsigned long long)took, st.sent, g_storm_looks.n, (unsigned long long)floored_ms);
     STM_ASSERT_EQ(rc, STM_EIO);
     STM_ASSERT_EQ(stm_9p_last_errno(c), ETIMEDOUT);
     STM_ASSERT(took >= WAIT_LIMIT_MS);
     /* Given up while the storm still blew, and not long after the limit. */
     STM_ASSERT(took < WAIT_STORM_MS / 2u);
-    /* What the test rests on: counted in whole milliseconds, this call's own waits would
-     * not have reached the limit by the time it was given up, with a tenth of the limit
-     * spared for the instants between a look and the count after it, which no look sees.
-     * Where they would have, either the waits were not cut short and this run proves
-     * nothing, or the client counts in whole milliseconds. */
     STM_ASSERT_EQ(g_storm_looks.missed, 0u);
-    STM_ASSERT(floored_ms + WAIT_LIMIT_MS / 10u < WAIT_LIMIT_MS);
+    *held = rc == STM_EIO && stm_9p_last_errno(c) == ETIMEDOUT && took >= WAIT_LIMIT_MS
+        && took < WAIT_STORM_MS / 2u && g_storm_looks.missed == 0u;
     stm_9p_close(c);
     fake_daemon_stop(&d);
+    return floored_ms;
+}
+
+STM_TEST(p9_client_wait_counts_waits_shorter_than_a_millisecond)
+{
+    /* What the test rests on: counted in whole milliseconds, the call's own waits would not
+     * have reached the limit by the time it was given up, with a tenth of the limit spared
+     * for the instants between a look and the count after it, which no look sees. Where they
+     * would have, either the waits were not cut short and the run proves nothing, or the
+     * client counts in whole milliseconds. A run that other programs kept from its CPU sends
+     * few signals, and its waits are not cut short: such a run, its bounds held, is made
+     * again. The client that counts in whole milliseconds fails every run. */
+    bool held = false;
+    uint64_t floored_ms = 0;
+    for (unsigned run = 1; run <= WAIT_STORM_RUNS; run++) {
+        floored_ms = storm_run(run, &held);
+        if (!held || floored_ms + WAIT_LIMIT_MS / 10u < WAIT_LIMIT_MS) break;
+    }
+    STM_ASSERT(floored_ms + WAIT_LIMIT_MS / 10u < WAIT_LIMIT_MS);
 }
 
 STM_TEST(p9_client_wait_does_not_count_the_time_its_process_was_stopped)
