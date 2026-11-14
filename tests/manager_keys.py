@@ -1140,14 +1140,26 @@ def unread_hold_sets_leg(stratum, vol, host, root):
         term = Term([stratum, 'tui', '--vol', vol.v, '--host', host])
         session = None
         try:
-            # Nothing is read at all: the prompt waits in the terminal, unread.
-            quiet = wait_unread(lambda: tty_modes(term) == RAW_MODES, 30)
+            # Nothing is read at all: the prompt waits in the terminal, unread. Nothing is written
+            # before the prompt's first set, and the label only after the drop of what was typed
+            # ahead, which follows the set: keys sent once the terminal has something to read are
+            # the prompt's, as a person's are. Looked at, never read.
+            early = []
+
+            def at_prompt():
+                shown = readable(term)
+                modes = tty_modes(term)
+                if shown and modes != RAW_MODES:
+                    early.append(modes)
+                return modes == RAW_MODES
+
+            quiet = wait_unread(at_prompt, 30)
             session = session_dir_of(term.pid)
-            if not quiet or not session:
-                raise Failure(f'{how}: the terminal {tty_modes(term)}, session {session}: not at the prompt, '
-                              'it proves nothing')
-            # Past the drop of what was typed ahead, which follows the set at once.
-            time.sleep(0.5)
+            if not quiet or not session or early:
+                raise Failure(f'{how}: the terminal {tty_modes(term)}, session {session}, written to before the '
+                              f'prompt set it {early[:1]}: not at the prompt, it proves nothing')
+            if not wait_unread(lambda: readable(term), 30):
+                raise Failure(f'{how}: nothing shown 30 s after the prompt set the terminal: it proves nothing')
             term.send(PASS.encode() + ENTER)
             up = wait_unread(lambda: len(session_daemons(session)) >= 3, 30)
             record(up, f'{how}: the start went on past the Enter',
@@ -2288,6 +2300,11 @@ EDITOR_MODES = {'ECHO': False, 'ICANON': False, 'ISIG': True}
 def tty_modes(term):
     lflag = termios.tcgetattr(term.fd)[3]
     return {m: bool(lflag & getattr(termios, m)) for m in ('ECHO', 'ICANON', 'ISIG')}
+
+
+def readable(term):
+    """Whether the terminal has something to read, looked at and not read."""
+    return bool(select.select([term.fd], [], [], 0)[0])
 
 
 def state_of(pid):

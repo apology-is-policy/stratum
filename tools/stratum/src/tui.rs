@@ -6214,10 +6214,11 @@ mod tests {
         assert_eq!(ended, Err(io::ErrorKind::TimedOut), "a terminal that takes nothing, the write ended after {took:?}");
         assert!(HELD.load(Ordering::Relaxed));
         assert!(took >= limit, "given up after {took:?}, short of the limit");
-        // Each wait counts a tick at most, and one that runs late loses what it ran over: the
-        // give-up's time past the count is that loss, the count's own last tick none of it.
+        // A wait counts what it lasted, a tick at most: what one ran past its tick, and the time
+        // between two, the count does not see. The give-up's time past the count is that, the
+        // count's own last tick none of it.
         let unseen = took.saturating_sub(out.waited);
-        assert!(unseen <= limit / 4, "given up {took:?} after the asking, {unseen:?} past the {:?} counted: its waits ran late", out.waited);
+        assert!(unseen <= limit / 4, "given up {took:?} after the asking, {unseen:?} past the {:?} counted: its waits ran late, or the loop stalled between them", out.waited);
         let most = (limit.as_millis() / tick.as_millis()) as u64 + 12;
         assert!(out.refused <= most, "tried {} times within the limit, where {most} at most: a poll that cannot watch it is not waited out longer each time", out.refused);
     }
