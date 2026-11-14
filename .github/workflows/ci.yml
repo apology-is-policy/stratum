@@ -49,7 +49,9 @@ jobs:
         if: always()
         env:
           STM_BUILD_DIR: ${{ github.workspace }}/build-dist
-        run: (cd tools/stratum && cargo test --release --bin stratum 2>&1 | tee /tmp/unit.log; grep -a 'note: an open' /tmp/unit.log)
+        run: |
+          (cd tools/stratum && cargo test --release --bin stratum 2>&1) | tee /tmp/unit.log
+          grep -a 'note: an open' /tmp/unit.log
 
       - name: the /dev/tty unit test five times more
         if: always()
@@ -144,7 +146,9 @@ jobs:
         if: always()
         env:
           STM_BUILD_DIR: ${{ github.workspace }}/build-dist
-        run: (cd tools/stratum && cargo test --release --bin stratum 2>&1 | tee /tmp/unit.log; grep -a 'note: an open' /tmp/unit.log)
+        run: |
+          (cd tools/stratum && cargo test --release --bin stratum 2>&1) | tee /tmp/unit.log
+          grep -a 'note: an open' /tmp/unit.log
 
       - name: the /dev/tty unit test five times more
         if: always()
