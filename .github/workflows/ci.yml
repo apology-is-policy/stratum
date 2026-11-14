@@ -1,7 +1,6 @@
-# A PROBE, never to be merged: the 9P client's storm test, now made again where its premise alone did not hold, on
-#   one CPU of ubuntu-24.04: alone (green on its first run), beside a busy program at a higher priority for its first
-#   run only (red premise on run 1, its bounds held, then green on run 2: the run made again), and beside it throughout
-#   (red after three runs: a run that proves nothing never passes).
+# A PROBE, never to be merged: the storm test with its run NOT made again (the batch's w-18, its expression as the
+#   batch has it), on one CPU of ubuntu-24.04 beside a busy program at a higher priority for its first run only: red
+#   wanted at the premise after one run, where the test as it is passes on its second (probe 14).
 name: ci
 
 on:
@@ -25,21 +24,22 @@ jobs:
           (cd /tmp/libsodium-1.0.20 && ./configure --prefix=/usr/local --disable-debug && make -j"$(nproc)" && sudo make install)
           sudo ldconfig
 
+      - name: the run not made again (w-18)
+        run: |
+          perl -0pi -e 's/        if \(!held \|\| floored_ms \+ WAIT_LIMIT_MS \/ 10u < WAIT_LIMIT_MS\) break;\n/        break;\n/' tests/test_9p_client.c
+          git diff --stat -- tests/test_9p_client.c
+          git diff --quiet -- tests/test_9p_client.c && { echo "w-18 DID NOT APPLY"; exit 1; }
+
       - name: build the client test
         run: |
           cmake -B build -S . -GNinja -DSTM_SANITIZE=off -DSTM_ENABLE_IOURING=ON -DSTM_ENABLE_PQ=OFF
           cmake --build build --target test_9p_client
-          find build -name test_9p_client -type f
 
-      - name: the storm test on one CPU, alone, beside a competitor for its first run, and throughout
+      - name: beside a competitor for its first run
         run: |
           set -u +e
           X=$(find build -name test_9p_client -type f | head -1)
-          nproc; uptime
           export STM_TEST_ONLY=p9_client_wait_counts_waits_shorter_than_a_millisecond
-          echo "=== alone, nice 19, pinned to CPU 0"
-          for i in 1 2 3; do stdbuf -oL -eL taskset -c 0 nice -n 19 "$X" 2>&1 | grep -a 'note: run\|passed,\|FAIL'; done
-          echo "=== a competitor on CPU 0 at nice 0 until the first run ends"
           for i in 1 2 3 4 5; do
             taskset -c 0 sh -c 'while :; do :; done' & SPIN=$!
             sleep 0.5
@@ -50,9 +50,6 @@ jobs:
             kill "$SPIN" 2>/dev/null; wait "$SPIN" 2>/dev/null
             echo "--"
           done
-          echo "=== the competitor throughout"
-          taskset -c 0 sh -c 'while :; do :; done' & SPIN=$!
-          sleep 0.5
-          for i in 1 2; do stdbuf -oL -eL taskset -c 0 nice -n 19 "$X" 2>&1 | grep -a 'note: run\|passed,\|FAIL'; echo "--"; done
-          kill "$SPIN"; wait "$SPIN" 2>/dev/null
+          echo "=== alone (green wanted: on an idle CPU run 1 proves)"
+          stdbuf -oL -eL taskset -c 0 nice -n 19 "$X" 2>&1 | grep -a 'note: run\|passed,\|FAIL'
           true
