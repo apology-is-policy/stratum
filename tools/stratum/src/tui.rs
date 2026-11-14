@@ -599,6 +599,8 @@ struct OwnOutput {
     held_after: Duration,
     to_be_left: fn() -> bool,
     held: &'static AtomicBool,
+    /// This write's wait as counted toward `held_after`.
+    waited: Duration,
     /// How often the terminal took no more.
     refused: u64,
     /// How often a wait for room was followed by a pause, so as not to spin.
@@ -613,6 +615,7 @@ impl OwnOutput {
             held_after: HELD_AFTER,
             to_be_left: screen_to_be_left,
             held: &TERMINAL_HELD,
+            waited: Duration::ZERO,
             refused: 0,
             paused: 0,
         }
@@ -734,7 +737,7 @@ impl io::Write for OwnOutput {
         // How long this write has waited with nothing taken and the screen to be left. A
         // wait counts for what it lasted and for a tick at most: while the manager is
         // stopped, or the machine asleep, the terminal is given no time to take anything.
-        let mut waited = Duration::ZERO;
+        self.waited = Duration::ZERO;
         let mut room_said = false;
         let mut unwatched = Duration::from_millis(1);
         loop {
@@ -767,7 +770,7 @@ impl io::Write for OwnOutput {
             // a stop is never taken back, and a blocked one is asked of nothing only for the
             // moment between its handler's or sigwait's taking it and its being noted.
             let asked = (self.to_be_left)();
-            if waited >= self.held_after {
+            if self.waited >= self.held_after {
                 self.held.store(true, Ordering::Relaxed);
                 continue;
             }
@@ -805,7 +808,7 @@ impl io::Write for OwnOutput {
             }
             // The wait a stop is asked in began before the asking, and is none of the limit.
             if asked {
-                waited += began.elapsed().min(self.tick);
+                self.waited += began.elapsed().min(self.tick);
             }
         }
     }
@@ -1073,7 +1076,7 @@ fn input_waiting(input: Option<RawFd>, tty: Option<i32>, timeout: Duration) -> i
 /// Rounded up: a wait under a millisecond rounded down would be none, and a loop around it
 /// would spin.
 pub(crate) fn poll_ms(wait: Duration) -> libc::c_int {
-    libc::c_int::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX)
+    libc::c_int::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX)
 }
 
 /// Standard input, for the screen's life, a descriptor of the terminal's own that does not
@@ -6107,6 +6110,11 @@ mod tests {
             return dev_tty_given_up();
         }
         let (ended, status, said) = run_leading_a_pty("an_open_of_dev_tty_gives_up_a_terminal_that_takes_nothing", "dev-tty");
+        // Past the harness's capture, so that every run, the whole suite's too, shows the bound's margin.
+        for l in said.lines().filter(|l| l.starts_with("note: an open of /dev/tty given up")) {
+            use io::Write as _;
+            let _ = writeln!(io::stderr(), "{l}");
+        }
         assert!(ended, "the child did not end in 20 s: {said}");
         // Its filter matching nothing would end it well too.
         assert!(status.success() && said.contains("1 passed"), "the child ended {status:?}:\n{said}");
@@ -6195,18 +6203,21 @@ mod tests {
             panic!("an open made again of /dev/tty is none: the screen and the lines would write to it as it is");
         };
         let held = fill(fd);
-        let mut out = OwnOutput { fd, tick, held_after: limit, to_be_left: || true, held: &HELD, refused: 0, paused: 0 };
+        let mut out = OwnOutput { fd, tick, held_after: limit, to_be_left: || true, held: &HELD, waited: Duration::ZERO, refused: 0, paused: 0 };
         let began = Instant::now();
         let ended = out.write_all(&[b'x'; 4096]).map_err(|e| e.kind());
         let took = began.elapsed();
+        eprintln!("note: an open of /dev/tty given up {took:?} after the asking, {:?} counted, {} tries", out.waited, out.refused);
         // On macOS the end of a controlling process waits for its terminal to drain.
         unsafe { libc::tcflush(fd, libc::TCOFLUSH) };
         assert!(held > 0, "the terminal took nothing before the write: it proves nothing");
         assert_eq!(ended, Err(io::ErrorKind::TimedOut), "a terminal that takes nothing, the write ended after {took:?}");
         assert!(HELD.load(Ordering::Relaxed));
         assert!(took >= limit, "given up after {took:?}, short of the limit");
-        // Each wait counts a tick at most: one that runs late loses what it ran over.
-        assert!(took <= limit + limit / 4, "given up after {took:?}, a quarter past the limit and more: its waits ran late");
+        // Each wait counts a tick at most, and one that runs late loses what it ran over: the
+        // give-up's time past the count is that loss, the count's own last tick none of it.
+        let unseen = took.saturating_sub(out.waited);
+        assert!(unseen <= limit / 4, "given up {took:?} after the asking, {unseen:?} past the {:?} counted: its waits ran late", out.waited);
         let most = (limit.as_millis() / tick.as_millis()) as u64 + 12;
         assert!(out.refused <= most, "tried {} times within the limit, where {most} at most: a poll that cannot watch it is not waited out longer each time", out.refused);
     }
@@ -6253,6 +6264,30 @@ mod tests {
         assert_eq!(unsafe { libc::ioctl(got, libc::TIOCGWINSZ, &mut size) }, 0, "{}", io::Error::last_os_error());
         assert_eq!(size.ws_row, CHILD_PTY_ROWS, "/dev/tty's open is another terminal than {name}");
         assert_eq!(other, None, "another terminal's node shut, an open of it made again is one of /dev/tty, the controlling terminal");
+        let flags = unsafe { libc::fcntl(got, libc::F_GETFL) };
+        assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0, "the open made again of /dev/tty waits in a write: a terminal that takes nothing would hold it");
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_WRONLY, "the open made again of /dev/tty is not for writing alone");
+        assert!(unsafe { libc::fcntl(got, libc::F_GETFD) } & libc::FD_CLOEXEC != 0, "the open made again of /dev/tty is left to what the manager starts");
+        use io::Write as _;
+        static HELD: AtomicBool = AtomicBool::new(false);
+        let held = fill(got);
+        let mut out = OwnOutput {
+            fd: got,
+            tick: TAKE_TICK,
+            held_after: Duration::from_millis(300),
+            to_be_left: || true,
+            held: &HELD,
+            waited: Duration::ZERO,
+            refused: 0,
+            paused: 0,
+        };
+        let began = Instant::now();
+        let ended = out.write_all(&[b'x'; 4096]).map_err(|e| e.kind());
+        let took = began.elapsed();
+        // On macOS the end of a controlling process waits for its terminal to drain.
+        unsafe { libc::tcflush(got, libc::TCOFLUSH) };
+        assert!(held > 0, "the terminal took nothing before the write: it proves nothing");
+        assert_eq!(ended, Err(io::ErrorKind::TimedOut), "through /dev/tty standing in, a terminal that takes nothing, the write ended after {took:?}");
     }
 
     /// `then`'s answer, with `fd`'s terminal's node shut and its mode put back after. An open of
@@ -6279,7 +6314,7 @@ mod tests {
     fn a_wait_is_polled_for_whole_milliseconds_rounded_up() {
         assert_eq!(poll_ms(Duration::ZERO), 0);
         for (wait, ms) in [
-            (Duration::from_micros(1), 1),
+            (Duration::from_nanos(1), 1),
             (Duration::from_micros(999), 1),
             (Duration::from_millis(1), 1),
             (Duration::from_micros(1001), 2),
@@ -6381,6 +6416,7 @@ mod tests {
                 asked
             },
             held: &HELD,
+            waited: Duration::ZERO,
             refused: 0,
             paused: 0,
         };
@@ -6481,6 +6517,7 @@ mod tests {
             held_after: limit,
             to_be_left: || true,
             held: &HELD,
+            waited: Duration::ZERO,
             refused: 0,
             paused: 0,
         };
@@ -6532,6 +6569,7 @@ mod tests {
             held_after: HELD_AFTER,
             to_be_left: || false,
             held: &HELD,
+            waited: Duration::ZERO,
             refused: 0,
             paused: 0,
         };

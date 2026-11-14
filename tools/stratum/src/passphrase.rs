@@ -1009,7 +1009,8 @@ mod prompt_tests {
             }
         }
 
-        /// Starts the prompt and waits for its mode.
+        /// Starts the prompt and waits for its mode, then for its label: the mode is set a moment
+        /// before what was typed ahead is dropped, and keys sent between would go with it.
         fn prompt(&mut self) -> std::sync::mpsc::Receiver<Result<(Vec<u8>, EchoHeld)>> {
             let slave = self.slave.take().expect("one prompt per pty");
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1021,6 +1022,7 @@ mod prompt_tests {
                 assert!(Instant::now() < end, "the prompt never turned canonical mode off");
                 std::thread::sleep(Duration::from_millis(5));
             }
+            self.wait_shown(b"P: ");
             rx
         }
 
@@ -1041,7 +1043,7 @@ mod prompt_tests {
         }
     }
 
-    /// Keys sent only once the mode is set reach read_line as typed, Ctrl-C among them,
+    /// Keys sent once the prompt is shown reach read_line as typed, Ctrl-C among them,
     /// and the terminal is given back as it was.
     #[test]
     fn on_a_terminal_the_mode_is_set_for_the_keys_and_restored_after() {
