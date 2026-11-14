@@ -1,8 +1,10 @@
-# A PROBE, never to be merged: macos-15 again. Probe 17 found /dev/tty there as on a later macOS and both opens
-#   giving up, yet the screen's case took 15 s and the headless one held in stop_child. This measures how long a
-#   100 ms nanosleep and a 100 ms poll timeout take there, then runs the two legs twice with a timestamped log
-#   (each manager's wall time from the asking to the give-up against the wait it counted), the held manager and
-#   its daemons sampled, their states and descriptors 0-2 listed.
+# A PROBE, never to be merged: the pause after a poll that cannot watch /dev/tty made poll's timeout, not a sleep,
+#   which macOS lets run late; the /dev/tty fallback and the held end's own reading witnessed in children; a wait
+#   rounded up to whole milliseconds. On macos-15, where a 100 ms sleep took 139-164 ms at the median, and on
+#   ubuntu-24.04: sleeps measured, the whole leg suite, the two /dev/tty cases three times more (seconds to a tenth),
+#   the unit tests, the /dev/tty unit test five times more (its give-up's wall time printed), then each sabotage
+#   alone. Wanted: the /dev/tty give-ups some 10 s after the TERM; the pause a sleep again red on macos-15 (green
+#   on Linux, whose poll watches /dev/tty, and on the later macOS here, where a sleep runs 9% late).
 name: ci
 
 on:
@@ -10,7 +12,7 @@ on:
     branches: ['ci/**']
 
 jobs:
-  probe:
+  probe-mac:
     name: probe / macos-15
     runs-on: macos-15
     steps:
@@ -26,40 +28,187 @@ jobs:
 
       - name: the machine
         run: |
-          sw_vers
           uname -a
-          sysctl -n hw.ncpu
+          (sw_vers || cat /etc/os-release) 2>/dev/null | head -4
+          (nproc || sysctl -n hw.ncpu) 2>/dev/null
           python3 --version
 
       - name: sleeps measured
         run: python3 -B tests/probe_sleeps.py
 
-      - name: the two legs, logged
+      - name: the whole leg suite
+        if: always()
+        run: |
+          python3 -B tests/manager_keys.py dist/stratum > /tmp/legs-all.log 2>&1; echo "legs rc=$?"
+          echo "ok lines: $(grep -ac '^ok' /tmp/legs-all.log)"
+          grep -a '^FAIL\|^PASS' /tmp/legs-all.log | cut -c1-300
+          grep -a '/dev/tty' /tmp/legs-all.log | grep -a '^ok\|^FAIL' | cut -c1-260
+
+      - name: the two /dev/tty cases, three times more
         if: always()
         env:
-          STM_PROBE_LOG: /tmp/probe.log
           KEYS_ONLY: held_terminal_legs,headless_words_held_leg
         run: |
-          python3 -B tests/manager_keys.py dist/stratum || true
-          python3 -B tests/manager_keys.py dist/stratum || true
+          for i in 1 2 3; do
+            python3 -B tests/manager_keys.py dist/stratum > /tmp/legs-$i.log 2>&1; echo "run $i rc=$?"
+            grep -a '^FAIL\|^PASS' /tmp/legs-$i.log | cut -c1-300
+            grep -a 'with nothing read (' /tmp/legs-$i.log | cut -c1-260
+          done
 
-      - name: the log, per manager
+      - name: the unit tests
         if: always()
-        run: python3 -B tests/probe_log_summary.py /tmp/probe.log
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
+        run: (cd tools/stratum && cargo test --release --bin stratum)
 
-      - name: where a held manager waits
+      - name: the /dev/tty unit test five times more
+        if: always()
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
+        run: |
+          cd tools/stratum
+          for i in 1 2 3 4 5; do cargo test --release --bin stratum an_open_of_dev_tty -- --nocapture 2>&1 | grep -a 'PROBE\|test result\|panicked'; done
+
+      - name: each sabotage alone
+        if: always()
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
+        run: |
+          set -u +e
+          sab() {
+            local name=$1 run=$2 want=$3 f=$4 e=$5
+            cp "$f" /tmp/keep-file
+            perl -0pi -e "$e" "$f"
+            if cmp -s "$f" /tmp/keep-file; then echo "$name DID NOT APPLY"
+            elif ! (cd tools/stratum && cargo build --release) > "/tmp/build-$name.log" 2>&1; then
+              echo "$name DID NOT BUILD"; tail -20 "/tmp/build-$name.log"
+            else
+              case "$run" in
+                unit:*) (cd tools/stratum && cargo test --release --bin stratum -- ${run#unit:}) > "/tmp/$name.log" 2>&1
+                        echo "$name rc=$? (want red at: $want): matched=$(grep -acE -- "$want" "/tmp/$name.log") $(grep -a 'PROBE' "/tmp/$name.log" | head -2 | tr '\n' '|') $(grep -a -A1 'panicked' "/tmp/$name.log" | head -6 | tr '\n' '|' | cut -c1-700)";;
+                *) KEYS_ONLY=$run python3 -B tests/manager_keys.py tools/stratum/target/release/stratum > "/tmp/$name.log" 2>&1
+                   echo "$name rc=$? (want red at: $want): matched=$(grep -acE -- "$want" "/tmp/$name.log") $(grep -a '^FAIL' "/tmp/$name.log" | head -4 | tr '\n' '|' | cut -c1-600)";;
+              esac
+            fi
+            cp /tmp/keep-file "$f"
+            git diff --quiet -- tools tests || { echo "$name LEFT THE TREE CHANGED"; git diff --stat -- tools tests; git checkout -- tools tests; }
+          }
+          sab fl-48 'unit:an_open_of_dev_tty' 'a quarter past the limit and more: its waits ran late' tools/stratum/src/tui.rs 's/                unsafe \{ libc::poll\(std::ptr::null_mut\(\), 0, poll_ms\(short\)\) \};\n/                thread::sleep(short);\n/'
+          sab fl-48a 'unit:an_open_of_dev_tty' 'a quarter past the limit and more: its waits ran late' tools/stratum/src/tui.rs 's/                unsafe \{ libc::poll\(std::ptr::null_mut\(\), 0, poll_ms\(short\)\) \};\n/                unsafe { libc::poll(std::ptr::null_mut(), 0, poll_ms(short * 3 \/ 2)) };\n/'
+          sab fl-48b 'unit:a_wait_is_polled' 'rounded down: a wait under a millisecond would be none' tools/stratum/src/tui.rs 's/    libc::c_int::try_from\(wait\.as_micros\(\)\.div_ceil\(1000\)\)\.unwrap_or/    libc::c_int::try_from(wait.as_millis()).unwrap_or/'
+          sab fl-49 'unit:dev_tty_stands_in' 'an open of it made again is none' tools/stratum/src/tui.rs 's/    if again < 0 && unsafe \{ libc::tcgetsid\(fd\) == libc::getsid\(0\) \} \{\n/    if again < 0 \&\& false {\n/'
+          sab fl-49a 'unit:dev_tty_stands_in' 'node shut, an open of it made again is one of /dev/tty, the controlling terminal' tools/stratum/src/tui.rs 's/    if again < 0 && unsafe \{ libc::tcgetsid\(fd\) == libc::getsid\(0\) \} \{\n/    if again < 0 {\n/'
+          sab fl-50 'unit:a_held_end_ends' 'term-waiting: the child ended' tools/stratum/src/tui.rs 's/    unsafe \{ libc::_exit\(held_end_code\(asked_by\(ASKED_BY\.load\(Ordering::Relaxed\)\)\)\) \}\n/    unsafe { libc::_exit(held_end_code(ASKED_BY.load(Ordering::Relaxed))) }\n/'
+          sab fl-43 'unit:an_open_of_dev_tty' 'a poll that cannot watch it is not waited out longer each time' tools/stratum/src/tui.rs 's/                unwatched = \(unwatched \* 2\)\.min\(self\.tick\);\n/                unwatched = unwatched.min(self.tick);\n/'
+          sab fl-44 'unit:an_open_of_dev_tty' 'an open made again of /dev/tty is none' tools/stratum/src/tui.rs 's/fn reopen_terminal\(fd: RawFd\) -> Option<RawFd> \{\n/fn reopen_terminal(fd: RawFd) -> Option<RawFd> {\n    if rdev_of(fd).is_some() \&\& rdev_of(fd) == dev_tty_rdev() {\n        return None;\n    }\n/'
+          sab fl-44a 'headless_words_held_leg' '^FAIL: headless, standard output a file, standard error /dev/tty, its terminal filled once the daemons are up: (daemons|the manager ended=False)' tools/stratum/src/tui.rs 's/fn reopen_terminal\(fd: RawFd\) -> Option<RawFd> \{\n/fn reopen_terminal(fd: RawFd) -> Option<RawFd> {\n    if rdev_of(fd).is_some() \&\& rdev_of(fd) == dev_tty_rdev() {\n        return None;\n    }\n/'
+          sab fl-44b 'held_terminal_legs' '^FAIL: a terminal that takes nothing, standard output given as /dev/tty: (daemons|the manager ended=False)' tools/stratum/src/tui.rs 's/fn reopen_terminal\(fd: RawFd\) -> Option<RawFd> \{\n/fn reopen_terminal(fd: RawFd) -> Option<RawFd> {\n    if rdev_of(fd).is_some() \&\& rdev_of(fd) == dev_tty_rdev() {\n        return None;\n    }\n/'
+          sab fl-45 'unit:a_held_end_reads' 'a TERM waiting while blocked is not the one that asked' tools/stratum/src/tui.rs 's/    if noted > 0 \{ noted \} else \{ waiting_stop\(\)\.unwrap_or\(0\) \}\n/    if noted > 0 { noted } else { 0 }\n/'
+
+      - name: sleeps measured again, after the rest
+        if: always()
+        run: python3 -B tests/probe_sleeps.py
+
+  probe-linux:
+    name: probe / ubuntu-24.04
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config cmake liburing-dev
+          wget -q -O /tmp/libsodium.tar.gz \
+              https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz
+          tar xzf /tmp/libsodium.tar.gz -C /tmp
+          (cd /tmp/libsodium-1.0.20 && ./configure --prefix=/usr/local --disable-debug \
+              && make -j"$(nproc)" && sudo make install)
+          sudo ldconfig
+
+      - name: build dist/stratum
+        run: ./dist.sh
+
+      - name: the machine
+        run: |
+          uname -a
+          (sw_vers || cat /etc/os-release) 2>/dev/null | head -4
+          (nproc || sysctl -n hw.ncpu) 2>/dev/null
+          python3 --version
+
+      - name: sleeps measured
+        run: python3 -B tests/probe_sleeps.py
+
+      - name: the whole leg suite
         if: always()
         run: |
-          for f in /tmp/held-*.txt; do
-            [ -f "$f" ] || continue
-            echo "=== $f"; cut -c1-200 "$f" | head -60
-          done
-          for f in /tmp/sample-*.txt; do
-            [ -f "$f" ] || continue
-            echo "=== $f"
-            grep -a -E 'Thread_|^ *\+ ' "$f" | cut -c1-180 | head -60
+          python3 -B tests/manager_keys.py dist/stratum > /tmp/legs-all.log 2>&1; echo "legs rc=$?"
+          echo "ok lines: $(grep -ac '^ok' /tmp/legs-all.log)"
+          grep -a '^FAIL\|^PASS' /tmp/legs-all.log | cut -c1-300
+          grep -a '/dev/tty' /tmp/legs-all.log | grep -a '^ok\|^FAIL' | cut -c1-260
+
+      - name: the two /dev/tty cases, three times more
+        if: always()
+        env:
+          KEYS_ONLY: held_terminal_legs,headless_words_held_leg
+        run: |
+          for i in 1 2 3; do
+            python3 -B tests/manager_keys.py dist/stratum > /tmp/legs-$i.log 2>&1; echo "run $i rc=$?"
+            grep -a '^FAIL\|^PASS' /tmp/legs-$i.log | cut -c1-300
+            grep -a 'with nothing read (' /tmp/legs-$i.log | cut -c1-260
           done
 
-      - name: sleeps measured again, after the legs
+      - name: the unit tests
+        if: always()
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
+        run: (cd tools/stratum && cargo test --release --bin stratum)
+
+      - name: the /dev/tty unit test five times more
+        if: always()
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
+        run: |
+          cd tools/stratum
+          for i in 1 2 3 4 5; do cargo test --release --bin stratum an_open_of_dev_tty -- --nocapture 2>&1 | grep -a 'PROBE\|test result\|panicked'; done
+
+      - name: each sabotage alone
+        if: always()
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
+        run: |
+          set -u +e
+          sab() {
+            local name=$1 run=$2 want=$3 f=$4 e=$5
+            cp "$f" /tmp/keep-file
+            perl -0pi -e "$e" "$f"
+            if cmp -s "$f" /tmp/keep-file; then echo "$name DID NOT APPLY"
+            elif ! (cd tools/stratum && cargo build --release) > "/tmp/build-$name.log" 2>&1; then
+              echo "$name DID NOT BUILD"; tail -20 "/tmp/build-$name.log"
+            else
+              case "$run" in
+                unit:*) (cd tools/stratum && cargo test --release --bin stratum -- ${run#unit:}) > "/tmp/$name.log" 2>&1
+                        echo "$name rc=$? (want red at: $want): matched=$(grep -acE -- "$want" "/tmp/$name.log") $(grep -a 'PROBE' "/tmp/$name.log" | head -2 | tr '\n' '|') $(grep -a -A1 'panicked' "/tmp/$name.log" | head -6 | tr '\n' '|' | cut -c1-700)";;
+                *) KEYS_ONLY=$run python3 -B tests/manager_keys.py tools/stratum/target/release/stratum > "/tmp/$name.log" 2>&1
+                   echo "$name rc=$? (want red at: $want): matched=$(grep -acE -- "$want" "/tmp/$name.log") $(grep -a '^FAIL' "/tmp/$name.log" | head -4 | tr '\n' '|' | cut -c1-600)";;
+              esac
+            fi
+            cp /tmp/keep-file "$f"
+            git diff --quiet -- tools tests || { echo "$name LEFT THE TREE CHANGED"; git diff --stat -- tools tests; git checkout -- tools tests; }
+          }
+          sab fl-48 'unit:an_open_of_dev_tty' 'a quarter past the limit and more: its waits ran late' tools/stratum/src/tui.rs 's/                unsafe \{ libc::poll\(std::ptr::null_mut\(\), 0, poll_ms\(short\)\) \};\n/                thread::sleep(short);\n/'
+          sab fl-48a 'unit:an_open_of_dev_tty' 'a quarter past the limit and more: its waits ran late' tools/stratum/src/tui.rs 's/                unsafe \{ libc::poll\(std::ptr::null_mut\(\), 0, poll_ms\(short\)\) \};\n/                unsafe { libc::poll(std::ptr::null_mut(), 0, poll_ms(short * 3 \/ 2)) };\n/'
+          sab fl-48b 'unit:a_wait_is_polled' 'rounded down: a wait under a millisecond would be none' tools/stratum/src/tui.rs 's/    libc::c_int::try_from\(wait\.as_micros\(\)\.div_ceil\(1000\)\)\.unwrap_or/    libc::c_int::try_from(wait.as_millis()).unwrap_or/'
+          sab fl-49 'unit:dev_tty_stands_in' 'an open of it made again is none' tools/stratum/src/tui.rs 's/    if again < 0 && unsafe \{ libc::tcgetsid\(fd\) == libc::getsid\(0\) \} \{\n/    if again < 0 \&\& false {\n/'
+          sab fl-49a 'unit:dev_tty_stands_in' 'node shut, an open of it made again is one of /dev/tty, the controlling terminal' tools/stratum/src/tui.rs 's/    if again < 0 && unsafe \{ libc::tcgetsid\(fd\) == libc::getsid\(0\) \} \{\n/    if again < 0 {\n/'
+          sab fl-50 'unit:a_held_end_ends' 'term-waiting: the child ended' tools/stratum/src/tui.rs 's/    unsafe \{ libc::_exit\(held_end_code\(asked_by\(ASKED_BY\.load\(Ordering::Relaxed\)\)\)\) \}\n/    unsafe { libc::_exit(held_end_code(ASKED_BY.load(Ordering::Relaxed))) }\n/'
+          sab fl-43 'unit:an_open_of_dev_tty' 'a poll that cannot watch it is not waited out longer each time' tools/stratum/src/tui.rs 's/                unwatched = \(unwatched \* 2\)\.min\(self\.tick\);\n/                unwatched = unwatched.min(self.tick);\n/'
+          sab fl-44 'unit:an_open_of_dev_tty' 'an open made again of /dev/tty is none' tools/stratum/src/tui.rs 's/fn reopen_terminal\(fd: RawFd\) -> Option<RawFd> \{\n/fn reopen_terminal(fd: RawFd) -> Option<RawFd> {\n    if rdev_of(fd).is_some() \&\& rdev_of(fd) == dev_tty_rdev() {\n        return None;\n    }\n/'
+          sab fl-44a 'headless_words_held_leg' '^FAIL: headless, standard output a file, standard error /dev/tty, its terminal filled once the daemons are up: (daemons|the manager ended=False)' tools/stratum/src/tui.rs 's/fn reopen_terminal\(fd: RawFd\) -> Option<RawFd> \{\n/fn reopen_terminal(fd: RawFd) -> Option<RawFd> {\n    if rdev_of(fd).is_some() \&\& rdev_of(fd) == dev_tty_rdev() {\n        return None;\n    }\n/'
+          sab fl-44b 'held_terminal_legs' '^FAIL: a terminal that takes nothing, standard output given as /dev/tty: (daemons|the manager ended=False)' tools/stratum/src/tui.rs 's/fn reopen_terminal\(fd: RawFd\) -> Option<RawFd> \{\n/fn reopen_terminal(fd: RawFd) -> Option<RawFd> {\n    if rdev_of(fd).is_some() \&\& rdev_of(fd) == dev_tty_rdev() {\n        return None;\n    }\n/'
+          sab fl-45 'unit:a_held_end_reads' 'a TERM waiting while blocked is not the one that asked' tools/stratum/src/tui.rs 's/    if noted > 0 \{ noted \} else \{ waiting_stop\(\)\.unwrap_or\(0\) \}\n/    if noted > 0 { noted } else { 0 }\n/'
+
+      - name: sleeps measured again, after the rest
         if: always()
         run: python3 -B tests/probe_sleeps.py
