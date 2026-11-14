@@ -909,7 +909,7 @@ def held_terminal_legs(stratum, vol, host, root):
                 record(ended and term.rc == want,
                        f'{how}: the manager ended with {want}, '
                        + ('as the signal alone would have ended it' if asked_by else 'a failure')
-                       + f', with nothing read ({took:.1f} s)',
+                       + f', with nothing read ({took:.0f} s)',
                        f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s, {want} wanted'
                        + (f'; its threads: {waits}' if waits else ''))
                 if ended:
@@ -1021,7 +1021,7 @@ def unread_since_enter_leg(stratum, vol, host, root):
                f'{how}: daemons {left} still serve the volume {took:.0f} s after the stop was asked')
         record(ended and term.rc == 128 + signal.SIGTERM,
                f'{how}: the manager ended with {128 + signal.SIGTERM}, as the signal alone would have ended it, '
-               f'with nothing read ({took:.1f} s)',
+               f'with nothing read ({took:.0f} s)',
                f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s, {128 + signal.SIGTERM} wanted'
                + (f'; its threads: {waits}' if waits else ''))
     except Failure:
@@ -1218,12 +1218,12 @@ def headless_words_held_leg(stratum, vol, host, root):
                         ended = True
             took = time.monotonic() - asked
             waits = '' if ended else threads_waiting(term.pid)
-            record(not left, f'{how}: a TERM stopped every daemon, with nothing read ({took:.1f} s)',
+            record(not left, f'{how}: a TERM stopped every daemon, with nothing read ({took:.0f} s)',
                    f'{how}: daemons {left} still run {took:.0f} s after a TERM, with nothing read')
             # Its last lines given up, it ends as a manager its terminal held: as the signal alone would.
             record(ended and term.rc == 128 + signal.SIGTERM,
                    f'{how}: the manager ended {128 + signal.SIGTERM}, as the signal alone would have ended it, '
-                   f'with nothing read ({took:.1f} s)',
+                   f'with nothing read ({took:.0f} s)',
                    f'{how}: the manager ended={ended} rc={term.rc} {took:.0f} s after a TERM, {128 + signal.SIGTERM} wanted'
                    + (f'; its threads: {waits}' if waits else ''))
             if ended and sys.platform.startswith('linux'):
@@ -1297,10 +1297,10 @@ def held_headless_job_leg(stratum, vol, host, root):
             wait_unread(gone, stall + 9, tick=0.2)
             took = time.monotonic() - asked
             left = session_daemons(session)
-            record(not left, f'{how}: a TERM stopped every daemon, with nothing read ({took:.1f} s)',
+            record(not left, f'{how}: a TERM stopped every daemon, with nothing read ({took:.0f} s)',
                    f'{how}: daemons {left} still run {took:.0f} s after a TERM, with nothing read')
             state = state_of(manager)
-            record(over(), f'{how}: the manager ended, with nothing read ({took:.1f} s)',
+            record(over(), f'{how}: the manager ended, with nothing read ({took:.0f} s)',
                    f'{how}: the manager still runs {took:.0f} s after a TERM, with nothing read, its state '
                    f'{state!r}; its threads: {threads_waiting(manager)}')
             # The job shell ends with it, and leads the session: its own end waits for the terminal to
@@ -1684,7 +1684,7 @@ def stuck_helper_leg(stratum, vol, host, root):
                 record(not left, f'{how}: every daemon was stopped, with nothing read',
                        f'{how}: {[said.get(p, p) for p in left]} still there {took:.0f} s after the stop was asked')
                 record(ended and term.rc == 128 + signal.SIGTERM,
-                       f'{how}: the manager ended as the signal alone would have ended it ({took:.1f} s)',
+                       f'{how}: the manager ended as the signal alone would have ended it ({took:.0f} s)',
                        f'{how}: the manager ended={ended} rc={term.rc} in {took:.0f} s'
                        + (f'; its threads: {waits}' if waits else ''))
                 if ended:
