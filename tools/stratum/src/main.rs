@@ -54,10 +54,7 @@ fn main() {
         spawn::tell(format_args!("Error: {e:?}"));
     }
     tui::end_if_terminal_held();
-    std::process::exit(match ended {
-        Ok(exit_code) => exit_code,
-        Err(_) => 1,
-    });
+    std::process::exit(ended.unwrap_or(1));
 }
 
 /// A core holds whatever passphrase or key the process has in memory, and a signal's default
