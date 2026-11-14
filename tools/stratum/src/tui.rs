@@ -695,10 +695,12 @@ fn lines_open(
     if unsafe { libc::isatty(err) } != 1 {
         return None;
     }
-    match screen {
+    let r = match screen {
         Some(fd) if same_terminal(fd, err) => Some((fd, &TERMINAL_HELD)),
         _ => reopen().map(|fd| (fd, &LINES_HELD)),
-    }
+    };
+    probe_log(&format!("lines_open(screen {screen:?}, err {err}): {:?}", r.map(|(fd, f)| (fd, std::ptr::eq(f, &TERMINAL_HELD)))));
+    r
 }
 
 /// Whether `a` and `b` are one terminal: the same device, or one an open of /dev/tty, which has
@@ -727,6 +729,15 @@ fn rdev_of(fd: RawFd) -> Option<libc::dev_t> {
 fn dev_tty_rdev() -> Option<libc::dev_t> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     (unsafe { libc::stat(c"/dev/tty".as_ptr(), &mut st) } == 0).then_some(st.st_rdev)
+}
+
+fn probe_log(s: &str) {
+    if let Some(p) = std::env::var_os("STM_PROBE_LOG") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(p) {
+            let _ = writeln!(f, "{} {}", std::process::id(), s);
+        }
+    }
 }
 
 impl io::Write for OwnOutput {
@@ -759,7 +770,10 @@ impl io::Write for OwnOutput {
                     continue;
                 }
                 Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {}
-                _ => return Err(err),
+                _ => {
+                    probe_log(&format!("write fd={} error {:?}", self.fd, err));
+                    return Err(err);
+                }
             }
             self.refused += 1;
             // Only the waits a stop was asked before are counted, below: with nothing asked a
@@ -768,6 +782,7 @@ impl io::Write for OwnOutput {
             // moment between its handler's or sigwait's taking it and its being noted.
             let asked = (self.to_be_left)();
             if waited >= self.held_after {
+                probe_log(&format!("write fd={} held after refused={} waited_ms={}", self.fd, self.refused, waited.as_millis()));
                 self.held.store(true, Ordering::Relaxed);
                 continue;
             }
@@ -785,6 +800,10 @@ impl io::Write for OwnOutput {
             let mut room = libc::pollfd { fd: self.fd, events: libc::POLLOUT, revents: 0 };
             let polled = unsafe { libc::poll(&mut room, 1, poll_ms(self.tick)) };
             room_said = polled == 1 && room.revents & libc::POLLOUT != 0;
+            if self.refused <= 40 || self.refused % 500 == 0 {
+                probe_log(&format!("write fd={} refused={} polled={} revents={:#x} asked={} waited_ms={} held_after_ms={} tick_ms={}",
+                    self.fd, self.refused, polled, room.revents, asked, waited.as_millis(), self.held_after.as_millis(), self.tick.as_millis()));
+            }
             pause |= !room_said;
             let moment = if polled == 1 && room.revents & libc::POLLNVAL != 0 {
                 let this = unwatched;
@@ -852,9 +871,13 @@ fn reopen_terminal(fd: RawFd) -> Option<RawFd> {
             again = -1;
         }
     }
+    let by_name = again;
     if again < 0 && unsafe { libc::tcgetsid(fd) == libc::getsid(0) } {
         again = unsafe { libc::open(c"/dev/tty".as_ptr(), flags) };
     }
+    probe_log(&format!("reopen_terminal({fd}): rdev {:?}, ttyname {:?}, by name {by_name}, tcgetsid {} getsid {}, result {again} rdev {:?}",
+        rdev_of(fd), unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }, unsafe { libc::tcgetsid(fd) }, unsafe { libc::getsid(0) },
+        if again >= 0 { rdev_of(again) } else { None }));
     (again >= 0).then_some(again)
 }
 
@@ -869,8 +892,14 @@ impl ScreenOut {
     fn new() -> ScreenOut {
         match own_output() {
             // A frame is some thirteen kilobytes: it goes out in one write where it fits.
-            Some(fd) => ScreenOut::Own(io::BufWriter::with_capacity(1 << 15, OwnOutput::of_the_screen(fd))),
-            None => ScreenOut::Std(io::stdout()),
+            Some(fd) => {
+                probe_log(&format!("screen out: own fd={fd}"));
+                ScreenOut::Own(io::BufWriter::with_capacity(1 << 15, OwnOutput::of_the_screen(fd)))
+            }
+            None => {
+                probe_log("screen out: standard output as it is");
+                ScreenOut::Std(io::stdout())
+            }
         }
     }
 }

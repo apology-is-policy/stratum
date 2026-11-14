@@ -693,7 +693,10 @@ def threads_waiting(pid):
     try:
         tids = sorted(os.listdir(f'/proc/{pid}/task'), key=int)
     except (OSError, ValueError):
-        return ''
+        import subprocess as _sp
+        out = f'/tmp/sample-{pid}.txt'
+        _sp.run(['sample', str(pid), '1', '-mayDie', '-file', out], capture_output=True)
+        return f'sampled to {out}'
     for tid in tids:
         about = []
         for name, take in (('comm', lambda t: t.strip()),
@@ -2177,7 +2180,7 @@ def pending_hup_leg(stratum, vol, host, root):
 # --stdout=PATH gives the job that file as its standard output, as `> PATH` does: its standard
 # error is still the terminal.
 JOB_SHELL = r"""
-import os, signal, subprocess, sys, termios
+import os, select, signal, subprocess, sys, termios
 flags = set()
 while sys.argv[1].startswith('--'):
     flags.add(sys.argv.pop(1))
@@ -2239,8 +2242,24 @@ signal.signal(signal.SIGUSR1, behind)
 signal.signal(signal.SIGUSR2, front)
 for sig in (signal.SIGTERM, signal.SIGHUP):
     signal.signal(sig, forward)
+# A handler runs between bytecodes: a signal landing after the last check and before a blocking
+# waitpid is entered slept there until the child changed. The wakeup descriptor ends the select
+# for a signal that came before it too; SIGCHLD says the child changed.
+wake_r, wake_w = os.pipe()
+os.set_blocking(wake_r, False)
+os.set_blocking(wake_w, False)
+signal.set_wakeup_fd(wake_w)
+signal.signal(signal.SIGCHLD, lambda *_: None)
+options = os.WNOHANG | (0 if report is None else os.WUNTRACED | os.WCONTINUED)
 while True:
-    _, status = os.waitpid(pid, 0 if report is None else os.WUNTRACED | os.WCONTINUED)
+    got, status = os.waitpid(pid, options)
+    if not got:
+        select.select([wake_r], [], [], 0.1)
+        try:
+            os.read(wake_r, 4096)
+        except BlockingIOError:
+            pass
+        continue
     if os.WIFSTOPPED(status):
         os.write(report, b'stopped %d\n' % os.WSTOPSIG(status))
     elif os.WIFCONTINUED(status):
