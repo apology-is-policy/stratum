@@ -1,6 +1,13 @@
-# A PROBE, never to be merged: the storm test with its run NOT made again (the batch's w-18, its expression as the
-#   batch has it), on one CPU of ubuntu-24.04 beside a busy program at a higher priority for its first run only: red
-#   wanted at the premise after one run, where the test as it is passes on its second (probe 14).
+# A PROBE, never to be merged: the tip's legs that this change touches and the manager's unit tests,
+#   on ubuntu-24.04, then each sabotage alone, applied, built, run and restored, its expressions as the
+#   batch has them, each file saved once, the tree checked after each: the lines plain with standard
+#   output elsewhere; the lines' own open giving up by the screen's flag (unit); the held end blind to the
+#   lines' flag; the drop made on Linux too (no end waits there); /dev/tty another terminal to the lines,
+#   and the controlling test against the pid (unit, its checks in a group of their own); the unwatched
+#   wait not lengthened (green wanted here); an open of /dev/tty refused (unit, the headless case with
+#   standard error /dev/tty, the screen's case with standard output /dev/tty); the held end blind to a
+#   stop waiting blocked (unit); the fill counted as nothing (both headless legs); the terminal's waits
+#   before the asking counted, and its look after the wait (unit).
 name: ci
 
 on:
@@ -8,8 +15,8 @@ on:
     branches: ['ci/**']
 
 jobs:
-  storm:
-    name: storm / ubuntu-24.04
+  legs:
+    name: legs / ubuntu-24.04
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -17,39 +24,82 @@ jobs:
       - name: install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake ninja-build liburing-dev
-          sudo apt-get remove -y libsodium-dev libsodium23 || true
-          wget -q -O /tmp/libsodium.tar.gz https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz
+          sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config cmake liburing-dev
+          wget -q -O /tmp/libsodium.tar.gz \
+              https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz
           tar xzf /tmp/libsodium.tar.gz -C /tmp
-          (cd /tmp/libsodium-1.0.20 && ./configure --prefix=/usr/local --disable-debug && make -j"$(nproc)" && sudo make install)
+          (cd /tmp/libsodium-1.0.20 && ./configure --prefix=/usr/local --disable-debug \
+              && make -j"$(nproc)" && sudo make install)
           sudo ldconfig
 
-      - name: the run not made again (w-18)
-        run: |
-          perl -0pi -e 's/        if \(!held \|\| floored_ms \+ WAIT_LIMIT_MS \/ 10u < WAIT_LIMIT_MS\) break;\n/        break;\n/' tests/test_9p_client.c
-          git diff --stat -- tests/test_9p_client.c
-          if git diff --quiet -- tests/test_9p_client.c; then echo "w-18 DID NOT APPLY"; exit 1; fi
+      - name: build dist/stratum
+        run: ./dist.sh
 
-      - name: build the client test
+      - name: the machine
         run: |
-          cmake -B build -S . -GNinja -DSTM_SANITIZE=off -DSTM_ENABLE_IOURING=ON -DSTM_ENABLE_PQ=OFF
-          cmake --build build --target test_9p_client
+          nproc
+          uptime
 
-      - name: beside a competitor for its first run
+      - name: the legs, the tip as it is
+        run: |
+          KEYS_ONLY=held_headless_job_leg,attach_blocked_leg,screen_job_control_leg,no_terminal_hangup_leg,unread_hold_sets_leg,headless_words_held_leg,held_terminal_legs,screen_started_behind_leg,stopped_at_a_line_leg \
+              python3 -B tests/manager_keys.py dist/stratum
+
+      - name: the unit tests, the tip as it is
+        if: always()
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
+        run: (cd tools/stratum && cargo test --release --bin stratum)
+
+      - name: the unit tests, the tip as it is
+        if: always()
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
+        run: (cd tools/stratum && cargo test --release --bin stratum)
+
+      - name: each sabotage alone
+        if: always()
+        env:
+          STM_BUILD_DIR: ${{ github.workspace }}/build-dist
         run: |
           set -u +e
-          X=$(find build -name test_9p_client -type f | head -1)
-          export STM_TEST_ONLY=p9_client_wait_counts_waits_shorter_than_a_millisecond
-          for i in 1 2 3 4 5; do
-            taskset -c 0 sh -c 'while :; do :; done' & SPIN=$!
-            sleep 0.5
-            stdbuf -oL -eL taskset -c 0 nice -n 19 "$X" 2>&1 | while IFS= read -r l; do
-              case "$l" in *'note: run 1:'*) kill "$SPIN" 2>/dev/null;; esac
-              case "$l" in *'note: run'*|*'passed,'*|*FAIL*) echo "$l";; esac
+          sab() {
+            local name=$1 run=$2 want=$3; shift 3
+            local files=() f
+            while [ $# -gt 0 ]; do
+              case " ${files[*]-} " in *" $1 "*) ;; *) cp "$1" "/tmp/keep-$(basename "$1")";; esac
+              files+=("$1"); perl -0pi -e "$2" "$1"; shift 2
             done
-            kill "$SPIN" 2>/dev/null; wait "$SPIN" 2>/dev/null
-            echo "--"
-          done
-          echo "=== alone (green wanted: on an idle CPU run 1 proves)"
-          stdbuf -oL -eL taskset -c 0 nice -n 19 "$X" 2>&1 | grep -a 'note: run\|passed,\|FAIL'
-          true
+            local changed=0
+            for f in "${files[@]}"; do cmp -s "$f" "/tmp/keep-$(basename "$f")" || changed=1; done
+            if [ "$changed" = 0 ]; then echo "$name DID NOT APPLY"
+            elif ! (cd tools/stratum && cargo build --release) > "/tmp/build-$name.log" 2>&1; then
+              echo "$name DID NOT BUILD"; tail -20 "/tmp/build-$name.log"
+            else
+              case "$run" in
+                unit:*) (cd tools/stratum && cargo test --release --bin stratum -- ${run#unit:}) > "/tmp/$name.log" 2>&1
+                        echo "$name rc=$? (want red at: $want): matched=$(grep -acE -- "$want" "/tmp/$name.log") $(grep -a -A1 'panicked' "/tmp/$name.log" | head -6 | tr '\n' '|' | cut -c1-700)";;
+                *) KEYS_ONLY=$run python3 -B tests/manager_keys.py tools/stratum/target/release/stratum > "/tmp/$name.log" 2>&1
+                   echo "$name rc=$? (want red at: $want): matched=$(grep -acE -- "$want" "/tmp/$name.log") $(grep -a '^FAIL' "/tmp/$name.log" | head -4 | tr '\n' '|' | cut -c1-600)";;
+              esac
+            fi
+            for f in "${files[@]}"; do cp "/tmp/keep-$(basename "$f")" "$f"; done
+            git diff --quiet -- tools tests || { echo "$name LEFT THE TREE CHANGED"; git diff --stat -- tools tests; git checkout -- tools tests; }
+          }
+          sab fl-33 'held_headless_job_leg' '^FAIL: headless as a job, standard output a file, its terminal held' tools/stratum/src/tui.rs 's/        _ => reopen\(\)\.map\(\|fd\| \(fd, &LINES_HELD\)\),/        _ => None,/'
+          sab fl-36 'unit:the_lines_open' 'another terminal: not an open of its own' tools/stratum/src/tui.rs 's/        _ => reopen\(\)\.map\(\|fd\| \(fd, &LINES_HELD\)\),/        _ => reopen().map(|fd| (fd, &TERMINAL_HELD)),/'
+          sab fl-38 'headless_words_held_leg' '^FAIL: headless, standard output a file, its terminal filled once the daemons are up: the manager ended=' tools/stratum/src/tui.rs 's/    TERMINAL_HELD\.load\(Ordering::Relaxed\) \|\| LINES_HELD\.load\(Ordering::Relaxed\)\n/    TERMINAL_HELD.load(Ordering::Relaxed)\n/'
+          sab fl-40 'headless_words_held_leg' '^FAIL: headless.*the rest was dropped' tools/stratum/src/tui.rs 's/    if cfg!\(target_os = "macos"\) \{\n        \/\/ Dropping it from behind/    if true {\n        \/\/ Dropping it from behind/'
+          sab fl-41 'unit:dev_tty_is' '/dev/tty: an open of /dev/tty is not the controlling terminal' tools/stratum/src/tui.rs 's/    tty\.is_some\(\) && \(ra == tty \|\| rb == tty\) && controlling\(a, ra\) && controlling\(b, rb\)\n/    false \&\& tty.is_some() \&\& (ra == tty || rb == tty) \&\& controlling(a, ra) \&\& controlling(b, rb)\n/'
+          sab fl-43 'unit:an_open_of_dev_tty' 'a poll that cannot watch it is not waited out longer each time' tools/stratum/src/tui.rs 's/                unwatched = \(unwatched \* 2\)\.min\(self\.tick\);\n/                unwatched = unwatched.min(self.tick);\n/'
+          sab fl-44 'unit:an_open_of_dev_tty' 'an open made again of /dev/tty is none' tools/stratum/src/tui.rs 's/fn reopen_terminal\(fd: RawFd\) -> Option<RawFd> \{\n/fn reopen_terminal(fd: RawFd) -> Option<RawFd> {\n    if rdev_of(fd).is_some() \&\& rdev_of(fd) == dev_tty_rdev() {\n        return None;\n    }\n/'
+          sab fl-44a 'headless_words_held_leg' '^FAIL: headless, standard output a file, standard error /dev/tty, its terminal filled once the daemons are up: (daemons|the manager ended=False)' tools/stratum/src/tui.rs 's/fn reopen_terminal\(fd: RawFd\) -> Option<RawFd> \{\n/fn reopen_terminal(fd: RawFd) -> Option<RawFd> {\n    if rdev_of(fd).is_some() \&\& rdev_of(fd) == dev_tty_rdev() {\n        return None;\n    }\n/'
+          sab fl-44b 'held_terminal_legs' '^FAIL: a terminal that takes nothing, standard output given as /dev/tty: (daemons|the manager ended=False)' tools/stratum/src/tui.rs 's/fn reopen_terminal\(fd: RawFd\) -> Option<RawFd> \{\n/fn reopen_terminal(fd: RawFd) -> Option<RawFd> {\n    if rdev_of(fd).is_some() \&\& rdev_of(fd) == dev_tty_rdev() {\n        return None;\n    }\n/'
+          sab fl-45 'unit:a_held_end_reads' 'a TERM waiting while blocked is not the one that asked' tools/stratum/src/tui.rs 's/    if noted > 0 \{ noted \} else \{ waiting_stop\(\)\.unwrap_or\(0\) \}\n/    if noted > 0 { noted } else { 0 }\n/'
+          sab fl-46 'unit:dev_tty_is' '/dev/tty: an open of /dev/tty is not the controlling terminal' tools/stratum/src/tui.rs 's/    let controlling = \|fd: RawFd, r\| r == tty \|\| unsafe \{ libc::tcgetsid\(fd\) == libc::getsid\(0\) \};/    let controlling = |fd: RawFd, r| r == tty || unsafe { libc::tcgetsid(fd) == libc::getpid() };/'
+          sab fl-47 'headless_words_held_leg' 'the side put nothing in the terminal: it proves nothing' tests/manager_keys.py 's/            put \+= n\n/            put += 0 * n\n/'
+          sab fl-47a 'held_headless_job_leg' 'the other program put nothing in the terminal: it proves nothing' tests/manager_keys.py 's/            put \+= n\n/            put += 0 * n\n/'
+          sab kx-17 'unit:a_terminal_that_takes_nothing' 'the write ended with nothing asked' tools/stratum/src/tui.rs 's/            if asked \{\n                waited \+= began\.elapsed\(\)\.min\(self\.tick\);\n            \}\n/            waited += began.elapsed().min(self.tick);\n/'
+          sab kx-17a 'unit:a_terminal_that_takes_nothing' 'the wait before it was counted|the wait the asking came in was counted' tools/stratum/src/tui.rs 's/            let asked = \(self\.to_be_left\)\(\);\n(            if waited >= self\.held_after \{\n(?:.*\n)*?)            if asked \{\n/$1            let asked = (self.to_be_left)();\n            if asked {\n/'
+          for n in fl-40 fl-44a fl-44b fl-47; do echo "=== $n"; grep -a '^ok\|^FAIL\|^note\|^PASS' "/tmp/$n.log" | cut -c1-300; done

@@ -344,23 +344,32 @@ pub fn stop_requested() -> bool {
 }
 
 /// A stop asked, or one waiting while blocked, as TERM and INT wait until the screen: a
-/// shell's `kill %1` to a stopped job. One ignored is not a stop, though Linux keeps it
-/// pending while it is blocked.
+/// shell's `kill %1` to a stopped job.
 pub fn stop_asked() -> bool {
-    if stop_requested() {
-        return true;
-    }
+    stop_requested() || waiting_stop().is_some()
+}
+
+/// The first of TERM, INT, HUP and QUIT waiting while blocked. One ignored is not a stop,
+/// though Linux keeps it pending while it is blocked.
+fn waiting_stop() -> Option<libc::c_int> {
     let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
     if unsafe { libc::sigpending(&mut pending) } != 0 {
-        return false;
+        return None;
     }
-    [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT].into_iter().any(|sig| {
+    [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT].into_iter().find(|&sig| {
         let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
         let waiting = unsafe { libc::sigismember(&pending, sig) } == 1;
         waiting
             && unsafe { libc::sigaction(sig, std::ptr::null(), &mut act) } == 0
             && act.sa_sigaction != libc::SIG_IGN
     })
+}
+
+/// The signal a held end reads as the one that asked: `noted`, the first a handler or the
+/// sigwait took; else a stop waiting while blocked, as TERM and INT wait through the start,
+/// which no handler sees; else none.
+fn asked_by(noted: libc::c_int) -> libc::c_int {
+    if noted > 0 { noted } else { waiting_stop().unwrap_or(0) }
 }
 
 /// Ending by the default action would leave the terminal raw, the session
@@ -568,7 +577,7 @@ pub(crate) fn end_if_terminal_held() {
             }
         }
     }
-    unsafe { libc::_exit(held_end_code(ASKED_BY.load(Ordering::Relaxed))) }
+    unsafe { libc::_exit(held_end_code(asked_by(ASKED_BY.load(Ordering::Relaxed)))) }
 }
 
 /// The opens of its own that gave their terminal up: the screen's, and the lines' where
@@ -669,10 +678,10 @@ fn own_output() -> Option<RawFd> {
 }
 
 /// Standard error's terminal opened again for the manager's lines, made once; None where there
-/// is none to make. By its name alone on macOS, where poll cannot watch /dev/tty.
+/// is none to make.
 fn lines_output() -> Option<RawFd> {
     static OWN: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
-    *OWN.get_or_init(|| reopen_terminal(2, cfg!(target_os = "linux")))
+    *OWN.get_or_init(|| reopen_terminal(2))
 }
 
 /// The open the manager's lines go through where `err` is a terminal, and the flag that open
@@ -727,6 +736,7 @@ impl io::Write for OwnOutput {
         // stopped, or the machine asleep, the terminal is given no time to take anything.
         let mut waited = Duration::ZERO;
         let mut room_said = false;
+        let mut unwatched = Duration::from_millis(1);
         loop {
             if self.held.load(Ordering::Relaxed) {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "the terminal takes nothing"));
@@ -766,14 +776,24 @@ impl io::Write for OwnOutput {
             // a sequence as often as not. A stop nothing can catch, landing there, leaves
             // the shell's next words to be read as that sequence's end. What must not spin
             // is room said that the write then did not find, and a poll that comes back at
-            // once saying nothing of room: those wait a moment.
+            // once saying nothing of room: those wait a moment. A poll that cannot watch the
+            // descriptor at all, as macOS's cannot watch /dev/tty, waits longer each time,
+            // toward the tick: the terminal is tried that much less often while it takes
+            // nothing, and the parts of a frame wait that much longer for each other there.
             let mut pause = room_said;
             let began = Instant::now();
             let mut room = libc::pollfd { fd: self.fd, events: libc::POLLOUT, revents: 0 };
-            room_said = unsafe { libc::poll(&mut room, 1, poll_ms(self.tick)) } == 1
-                && room.revents & libc::POLLOUT != 0;
+            let polled = unsafe { libc::poll(&mut room, 1, poll_ms(self.tick)) };
+            room_said = polled == 1 && room.revents & libc::POLLOUT != 0;
             pause |= !room_said;
-            let short = Duration::from_millis(1).saturating_sub(began.elapsed());
+            let moment = if polled == 1 && room.revents & libc::POLLNVAL != 0 {
+                let this = unwatched;
+                unwatched = (unwatched * 2).min(self.tick);
+                this
+            } else {
+                Duration::from_millis(1)
+            };
+            let short = moment.saturating_sub(began.elapsed());
             if pause && !short.is_zero() {
                 thread::sleep(short);
                 self.paused += 1;
@@ -794,13 +814,12 @@ impl io::Write for OwnOutput {
 /// waiting in a write is this screen's mode and not the shell's. None where standard output
 /// is no terminal, or its terminal cannot be opened again: the node is not ours to open
 /// after su to another user, and has no name where devpts is another mount's. /dev/tty is
-/// the same terminal when standard output's is the controlling one; poll cannot watch
-/// /dev/tty on macOS, so there the screen writes to standard output as it is.
+/// the same terminal when standard output's is the controlling one, and stands in then.
 fn open_own_output() -> Option<RawFd> {
     if unsafe { libc::isatty(1) } != 1 {
         return None;
     }
-    reopen_terminal(1, cfg!(target_os = "linux"))
+    reopen_terminal(1)
 }
 
 /// Headless, a daemon's words go to the terminal standard error is, through an open of its own
@@ -812,17 +831,12 @@ pub(crate) fn daemon_words_out() -> Option<std::os::fd::OwnedFd> {
     if unsafe { libc::isatty(2) } != 1 {
         return None;
     }
-    // Never polled, so /dev/tty serves on macOS too.
-    reopen_terminal(2, true).map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    reopen_terminal(2).map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
 /// The terminal `fd` is, opened again to write, by its name, which has to lead to `fd`'s own
-/// terminal; else, with `dev_tty`, /dev/tty where `fd`'s terminal is the controlling one.
-/// Without it never /dev/tty, which is also the name a descriptor of /dev/tty has.
-fn reopen_terminal(fd: RawFd, dev_tty: bool) -> Option<RawFd> {
-    if !dev_tty && rdev_of(fd).is_some() && rdev_of(fd) == dev_tty_rdev() {
-        return None;
-    }
+/// terminal; else /dev/tty where `fd`'s terminal is the controlling one.
+fn reopen_terminal(fd: RawFd) -> Option<RawFd> {
     let flags = libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
     let mut name = [0 as libc::c_char; 1024];
     let mut again = -1;
@@ -838,7 +852,7 @@ fn reopen_terminal(fd: RawFd, dev_tty: bool) -> Option<RawFd> {
             again = -1;
         }
     }
-    if again < 0 && dev_tty && unsafe { libc::tcgetsid(fd) == libc::getsid(0) } {
+    if again < 0 && unsafe { libc::tcgetsid(fd) == libc::getsid(0) } {
         again = unsafe { libc::open(c"/dev/tty".as_ptr(), flags) };
     }
     (again >= 0).then_some(again)
@@ -5972,10 +5986,11 @@ mod tests {
     }
 
     /// An open of /dev/tty and the controlling terminal are one terminal to the manager's lines,
-    /// another terminal is not, and no open that will be polled on macOS is of /dev/tty, not even
-    /// by its name. In a child leading a session with a pty for its controlling terminal; only
-    /// async-signal-safe calls there, and the answer in the exit code. A child that hangs, as a
-    /// call that is not safe there could, is killed and counts as a failure.
+    /// and another terminal is not. In a child leading a session with a pty for its controlling
+    /// terminal, the checks made in a child of its own in a group of its own, as a shell's job
+    /// is, so that neither its pid nor its group is its session's. Only async-signal-safe calls
+    /// there, and the answer in the exit code; a child that hangs, as a call that is not safe
+    /// there could, is killed and counts as a failure.
     #[test]
     fn dev_tty_is_the_controlling_terminal() {
         let pty = || {
@@ -5995,30 +6010,53 @@ mod tests {
                 if libc::ioctl(sa, libc::TIOCSCTTY as _, 0) != 0 {
                     libc::_exit(10);
                 }
-                let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
-                let held = |got: Option<(RawFd, &'static AtomicBool)>| {
-                    matches!(got, Some((f, h)) if f == tty && std::ptr::eq(h, &TERMINAL_HELD))
-                };
-                let code = if tty < 0 {
-                    11
-                } else if !same_terminal(tty, sa) || !same_terminal(sa, tty) {
-                    12
-                } else if same_terminal(tty, sb) || same_terminal(sb, tty) {
-                    13
-                } else if reopen_terminal(tty, false).is_some() {
-                    14
-                } else if !held(lines_open(Some(tty), sa, || None)) {
-                    15
-                } else {
-                    0
-                };
-                libc::_exit(code);
+                let checks = libc::fork();
+                if checks == 0 {
+                    if libc::setpgid(0, 0) != 0 || libc::getpgrp() == libc::getsid(0) {
+                        libc::_exit(16);
+                    }
+                    let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                    let held = |got: Option<(RawFd, &'static AtomicBool)>| {
+                        matches!(got, Some((f, h)) if f == tty && std::ptr::eq(h, &TERMINAL_HELD))
+                    };
+                    let code = if tty < 0 {
+                        11
+                    } else if !same_terminal(tty, sa) || !same_terminal(sa, tty) {
+                        12
+                    } else if same_terminal(tty, sb) || same_terminal(sb, tty) {
+                        13
+                    } else if !held(lines_open(Some(tty), sa, || None)) {
+                        14
+                    } else {
+                        0
+                    };
+                    libc::_exit(code);
+                }
+                if checks < 0 {
+                    libc::_exit(17);
+                }
+                // Waited for as the test waits for this child, and killed where it hangs.
+                let (mut status, mut got) = (0, 0);
+                for _ in 0..800 {
+                    got = libc::waitpid(checks, &mut status, libc::WNOHANG);
+                    if got != 0 {
+                        break;
+                    }
+                    let moment = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
+                    libc::nanosleep(&moment, std::ptr::null_mut());
+                }
+                if got != checks {
+                    libc::kill(checks, libc::SIGKILL);
+                    libc::_exit(17);
+                }
+                libc::_exit(if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 17 });
             }
         }
         let deadline = Instant::now() + Duration::from_secs(10);
         let (mut status, mut got) = (0, 0);
         while got == 0 && Instant::now() < deadline {
             got = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            assert!(got == 0 || got == pid, "the child was not waited for");
             if got == 0 {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -6041,12 +6079,109 @@ mod tests {
             10 => "the pty did not become the controlling terminal: it proves nothing",
             11 => "/dev/tty did not open: it proves nothing",
             12 => "an open of /dev/tty is not the controlling terminal to the lines",
-            13 => "an open of /dev/tty is another terminal to the lines",
-            14 => "a polled open made again of /dev/tty",
-            15 => "the lines on /dev/tty not through the screen's open of the controlling terminal",
+            13 => "another terminal is one with /dev/tty to the lines",
+            14 => "the lines on /dev/tty not through the screen's open of the controlling terminal",
+            16 => "the checks not in a group of their own, apart from the session's: it proves nothing",
+            17 => "the checks' child was not made, hung or failed",
             _ => "the child hung or failed",
         };
         assert_eq!(code, 0, "/dev/tty: {why}");
+    }
+
+    /// Where its terminal's name will not open, the screen and the manager's lines write through
+    /// an open of /dev/tty, and on a terminal that takes nothing that open is given up within its
+    /// limit once a stop is asked, as one by name is. On macOS poll cannot watch it, and the
+    /// wait for room grows toward the tick, so it is tried a few times a limit and no more. In
+    /// this test binary run again, leading a session with a full pty for its controlling
+    /// terminal, its answer in its own result; this run only starts it and reads that.
+    #[test]
+    fn an_open_of_dev_tty_gives_up_a_terminal_that_takes_nothing() {
+        use std::os::unix::process::CommandExt as _;
+        const CHILD: &str = "STM_DEV_TTY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return dev_tty_given_up();
+        }
+        let (mut m, mut s) = (0, 0);
+        let rc = unsafe {
+            libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());
+        unsafe {
+            for fd in [m, s] {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        let me = std::env::current_exe().expect("the test binary's path");
+        let mut run = std::process::Command::new(me);
+        run.args(["an_open_of_dev_tty_gives_up_a_terminal_that_takes_nothing", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        unsafe {
+            run.pre_exec(move || {
+                if libc::setsid() < 0 || libc::ioctl(s, libc::TIOCSCTTY as _, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = run.spawn().expect("the test binary run again with the pty for its terminal");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut ended = None;
+        while ended.is_none() && Instant::now() < deadline {
+            ended = child.try_wait().expect("the child was not waited for");
+            if ended.is_none() {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        if ended.is_none() {
+            let _ = child.kill();
+            // On macOS its end waits for its terminal to drain: drained here.
+            unsafe { libc::fcntl(m, libc::F_SETFL, libc::fcntl(m, libc::F_GETFL) | libc::O_NONBLOCK) };
+            let mut some = [0u8; 4096];
+            let end = Instant::now() + Duration::from_secs(5);
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < end {
+                unsafe { libc::read(m, some.as_mut_ptr().cast(), some.len()) };
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let out = child.wait_with_output().expect("the child's words");
+        unsafe {
+            libc::close(m);
+            libc::close(s);
+        }
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(ended.is_some(), "the child did not end in 20 s: {said}");
+        // Its filter matching nothing would end it well too.
+        assert!(out.status.success() && said.contains("1 passed"), "the child ended {:?}:\n{said}", out.status);
+    }
+
+    /// The child's half: /dev/tty filled, then written through an open of it made again, as the
+    /// screen's and the lines' are, a stop asked from the start.
+    fn dev_tty_given_up() {
+        use io::Write as _;
+        static HELD: AtomicBool = AtomicBool::new(false);
+        let limit = Duration::from_millis(300);
+        let tick = Duration::from_millis(20);
+        let tty = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(tty >= 0, "/dev/tty did not open: it proves nothing: {}", io::Error::last_os_error());
+        let Some(fd) = reopen_terminal(tty) else {
+            panic!("an open made again of /dev/tty is none: the screen and the lines would write to it as it is");
+        };
+        let held = fill(fd);
+        let mut out = OwnOutput { fd, tick, held_after: limit, to_be_left: || true, held: &HELD, refused: 0, paused: 0 };
+        let began = Instant::now();
+        let ended = out.write_all(&[b'x'; 4096]).map_err(|e| e.kind());
+        let took = began.elapsed();
+        // On macOS the end of a controlling process waits for its terminal to drain.
+        unsafe { libc::tcflush(fd, libc::TCOFLUSH) };
+        assert!(held > 0, "the terminal took nothing before the write: it proves nothing");
+        assert_eq!(ended, Err(io::ErrorKind::TimedOut), "a terminal that takes nothing, the write ended after {took:?}");
+        assert!(HELD.load(Ordering::Relaxed));
+        assert!(took >= limit, "given up after {took:?}, short of the limit");
+        let most = (limit.as_millis() / tick.as_millis()) as u64 + 12;
+        assert!(out.refused <= most, "tried {} times within the limit, where {most} at most: a poll that cannot watch it is not waited out longer each time", out.refused);
     }
 
     /// Where standard input is no terminal and the screen did not make it its own (its open
@@ -6354,6 +6489,30 @@ mod tests {
         assert_eq!(held_end_code(libc::SIGTERM), 143);
         assert_eq!(held_end_code(libc::SIGHUP), 129);
         assert_eq!(held_end_code(0), 1);
+    }
+
+    /// A stop waiting while blocked, as TERM and INT wait through the start, is the one a held
+    /// end reads as asking where no handler noted one; one noted comes first.
+    #[test]
+    fn a_held_end_reads_a_stop_waiting_blocked_as_the_one_that_asked() {
+        let before = asked_by(0);
+        let mut term: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let (waiting, noted) = unsafe {
+            libc::sigemptyset(&mut term);
+            libc::sigaddset(&mut term, libc::SIGTERM);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &term, std::ptr::null_mut());
+            // To this thread alone, where it waits blocked until taken below.
+            libc::raise(libc::SIGTERM);
+            let got = (asked_by(0), asked_by(libc::SIGHUP));
+            let mut taken = 0;
+            libc::sigwait(&term, &mut taken);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &term, std::ptr::null_mut());
+            got
+        };
+        assert_eq!(before, 0, "a stop waited before the test: it proves nothing");
+        assert_eq!(waiting, libc::SIGTERM, "a TERM waiting while blocked is not the one that asked");
+        assert_eq!(noted, libc::SIGHUP, "the signal noted is not the one that asked");
+        assert_eq!(held_end_code(waiting), 143);
     }
 
     #[test]

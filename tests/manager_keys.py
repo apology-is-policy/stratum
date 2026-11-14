@@ -789,7 +789,8 @@ def held_terminal_legs(stratum, vol, host, root):
     """A terminal that takes nothing holds the manager in its draw, and no signal ends a
     write. The screen to be left, by a stop asked or by its key, must not wait there, the
     volume unlocked behind it, for as long as nothing reads; and a terminal that is only
-    slow must not be taken for one."""
+    slow must not be taken for one. Standard output given as /dev/tty too, as a launcher may
+    send the screen to the terminal by its alias: on macOS poll cannot watch that open."""
     stall = 10  # tui.rs HELD_AFTER, in seconds
     held, steps = pty_facts()
     print(f'note: this system\'s pty holds {held} bytes with nothing read; refilled {len(steps)} times, room came '
@@ -806,13 +807,17 @@ def held_terminal_legs(stratum, vol, host, root):
     stopped_for = 15
     cases = (('a terminal that takes nothing', signal.SIGTERM, 128 + signal.SIGTERM),
              ('a terminal that takes nothing, the stop asked by INT', signal.SIGINT, 128 + signal.SIGINT),
+             ('a terminal that takes nothing, standard output given as /dev/tty', signal.SIGTERM, 128 + signal.SIGTERM),
              ('a terminal that takes nothing, the manager stopped meanwhile', signal.SIGTERM, 128 + signal.SIGTERM),
              ('a full terminal and the key to leave', None, 1),
              ('a slow terminal', signal.SIGTERM, 0))
     for n, (how, asked_by, want) in enumerate(cases):
         slow = want == 0
         env_file = f'{root}/env-held{n}'
-        term = Term([stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file])
+        argv = [stratum, 'tui', '--vol', vol.v, '--host', host, '--print-env-to', env_file]
+        if how.endswith('standard output given as /dev/tty'):
+            argv = ['/bin/sh', '-c', 'exec "$0" "$@" > /dev/tty', *argv]
+        term = Term(argv)
         side = None
         try:
             term.expect(r'Passphrase for')
@@ -1177,8 +1182,8 @@ def headless_words_held_leg(stratum, vol, host, root):
     manager's own lines hold its stop for longer than a terminal that takes nothing is given.
     The manager leads its session here, and on macOS its end waits for its terminal to drain but
     for the held end's drop: with standard output a file too, where its lines go through an
-    open of standard error's terminal of their own. On Linux no end waits, nothing is dropped,
-    and what the side wrote is all read after the end."""
+    open of standard error's terminal of their own, by its name or, given as /dev/tty, of /dev/tty.
+    On Linux no end waits, nothing is dropped, and what the side wrote is all read after the end."""
     stall = 10  # tui.rs HELD_AFTER, in seconds
     out = f'{root}/headless-out'
 
@@ -1197,6 +1202,8 @@ def headless_words_held_leg(stratum, vol, host, root):
             filled = len(term.raw)
             side, put = fill_from_the_side(term, b'#')
             print(f'note: {how}: {put} bytes from the side filled the terminal', flush=True)
+            if put <= 0:
+                raise Failure(f'{how}: the side put nothing in the terminal: it proves nothing')
             os.kill(term.pid, signal.SIGTERM)
             asked = time.monotonic()
             limit = asked + stall + 9
@@ -1238,7 +1245,10 @@ def headless_words_held_leg(stratum, vol, host, root):
     headless = [stratum, 'tui', '--headless', '--vol', vol.v, '--host', host]
     for how, argv in (('headless, its terminal filled once the daemons are up', headless),
                       ('headless, standard output a file, its terminal filled once the daemons are up',
-                       ['/bin/sh', '-c', f'exec "$0" "$@" >> {shlex.quote(out)}', *headless])):
+                       ['/bin/sh', '-c', f'exec "$0" "$@" >> {shlex.quote(out)}', *headless]),
+                      ('headless, standard output a file, standard error /dev/tty, its terminal filled once the '
+                       'daemons are up',
+                       ['/bin/sh', '-c', f'exec "$0" "$@" >> {shlex.quote(out)} 2>/dev/tty', *headless])):
         try:
             case(how, argv)
         except (Failure, OSError) as e:
@@ -1277,6 +1287,8 @@ def held_headless_job_leg(stratum, vol, host, root):
                 raise Failure(f'{how}: daemons {daemons}, the manager leads its session={leads}: it proves nothing')
             side, put = fill_from_the_side(term, mark)
             print(f'note: {how}: {put} bytes from the side filled the terminal', flush=True)
+            if put <= 0:
+                raise Failure(f'{how}: the other program put nothing in the terminal: it proves nothing')
             filled = len(term.raw)
             os.kill(manager, signal.SIGTERM)
             asked = time.monotonic()
@@ -2974,8 +2986,8 @@ def behind_at_its_warning(stratum, root, name, how, job, stdout_a_file=False, vo
     leg that needs it held at that place races nothing. With `stdout_a_file` its standard
     output is a file, and the line goes to standard error's terminal through an open of its
     own. With `node_shut` too, the terminal's node is shut to its user before the manager
-    starts, as after su to another one, so that it cannot be opened again (on macOS, where no
-    /dev/tty stands in), and the line is written to standard error plainly. With `vol`, a sealed volume, it is started in front,
+    starts, as after su to another one, so that it cannot be opened again by its name, and the
+    line goes through an open of /dev/tty, which stands in for it. With `vol`, a sealed volume, it is started in front,
     given the passphrase and moved behind while stratumd derives the key (hold_stratumd):
     from the passphrase's Enter echo is held off, and the hold has the stops for the terminal.
     `job` gets the terminal, the manager and its session directory as each is known, for the
@@ -3155,17 +3167,15 @@ def stopped_at_a_line_leg(stratum, vol, root):
     stop is taken by a handler that does not restart; macOS fails the write, and the loop
     around it writes on. So the shapes: the line through the screen's own open of the
     terminal; standard output a file, through an open of standard error's terminal of its
-    own; that with the terminal's node shut too, on macOS, where it is written plainly, by
-    another loop; and the start of a sealed volume, where the echo hold has the stops, which
+    own; that with the terminal's node shut too, through an open of /dev/tty, which stands in
+    for the node; and the start of a sealed volume, where the echo hold has the stops, which
     restart."""
     base = 'a manager stopped behind at a line of its own, tostop set'
     shapes = [(base, 'behind-line', {}),
               (f'{base}, standard output a file', 'behind-plain', {'stdout_a_file': True})]
     shut = f'{base}, standard output a file, the terminal node shut'
-    if sys.platform.startswith('linux'):
-        print(f'note: {shut}: macOS only, where no /dev/tty stands in for the node', flush=True)
-    elif os.geteuid() == 0:
-        print(f'note: {shut}: root opens any node, so the plain write is never reached', flush=True)
+    if os.geteuid() == 0:
+        print(f'note: {shut}: root opens any node, so /dev/tty never stands in for it', flush=True)
     else:
         shapes.append((shut, 'behind-shut', {'stdout_a_file': True, 'node_shut': True}))
     shapes.append((f'{base}, a sealed volume unlocked behind', 'behind-sealed', {'vol': vol}))
