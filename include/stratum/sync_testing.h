@@ -141,13 +141,36 @@ void stm_sync_set_read_prefetch_hook_for_test(stm_sync *s,
  * before it reads a replica. The caller holds the scrub's lock and
  * the pool's shared lock, not s->lock, so a hook may overwrite the
  * extent, commit and write other files: the window in which the
- * record's blocks can be given out again. It does NOT fire on the
- * callback's second look, which is made under s->lock. Pass
+ * record's blocks can be given out again. A hook that commits takes
+ * the pool's shared lock a second time on the same thread, which
+ * deadlocks if a pool writer (a device add, fail or evacuation) is
+ * waiting for it, so such a hook is for a test that runs no pool
+ * writer meanwhile. The second look has its own seam, below. Pass
  * hook=NULL to clear.
  */
 void stm_sync_set_scrub_verify_hook_for_test(stm_sync *s,
                                                 void (*hook)(void *ctx),
                                                 void *ctx);
+
+/*
+ * Scrub's second-look seam: invoked by the production verify callback
+ * under s->lock, once the record at the extent's coordinates is found
+ * to be the write the callback read by, and before any rewrite. The
+ * hook runs holding s->lock, so it must not take it (no commit, no
+ * write): it is where a test sees that the lock is held. Pass
+ * hook=NULL to clear.
+ */
+void stm_sync_set_scrub_second_look_hook_for_test(stm_sync *s,
+                                                     void (*hook)(void *ctx),
+                                                     void *ctx);
+
+/*
+ * Whether s->lock is free at this instant: 0 when it was (taken and
+ * given back at once), else pthread_mutex_trylock's error, EBUSY while
+ * another thread holds it; -1 for a NULL handle. For a test's helper
+ * thread to see that a seam runs under the lock.
+ */
+int stm_sync_trylock_for_test(stm_sync *s);
 
 /*
  * RC-6 (#35) read-window seam, the [insert, publish] twin of the

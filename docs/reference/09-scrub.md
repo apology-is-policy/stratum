@@ -298,7 +298,9 @@ Both modes continue past per-block failure (§7.16.1).
 
 ## Locking
 
-Lock order: `sc.lock → pool.rdlock → sync.lock (via stm_sync_alloc) → alloc.lock`.
+Lock order: `sc.lock -> pool.rdlock -> sync.lock -> alloc.lock`. The
+production cb takes `sync.lock` itself, and under it the extent
+index's, the dataset index's and the repair log's own locks.
 
 Matches POOL OUTER, SYNC INNER, ALLOC LEAF. Holding `pool.rdlock`
 across the bdev reads prevents concurrent `stm_pool_finish_evacuation`
@@ -344,15 +346,18 @@ of the already-locked pool struct):
 - `stm_pool_replace_claim_locked(pool)` (`pool.c:460-465`) — the
   caller-locked variant.
 - `stm_sync_alloc(sync, dev)`: takes sync.lock briefly (pool order
-  is OUTER → SYNC, so this is correct under our held rdlock).
+  is OUTER -> SYNC, so this is correct under our held rdlock), and so
+  not from inside a cb's own hold of sync.lock: the production cb,
+  which holds it for its second look, reads `sync->allocs[dev]`
+  directly there.
 - `stm_alloc_*` accessors on the alloc returned by
   `stm_sync_alloc` (alloc.lock is LEAF; no path back up).
 - `stm_bdev_read` on the bdev returned by `stm_pool_device_bdev`
   (no pool/sync locks).
 
 When in doubt, prefer `_locked` variants of pool APIs and treat the
-held rdlock as a snapshot of pool state — the cb is a leaf in the
-lock-acquire DAG.
+held rdlock as a snapshot of pool state: the cb takes no lock that
+ranks above `sync.lock`.
 
 ## Spec cross-reference
 
@@ -410,7 +415,7 @@ SPEC-TO-CODE:
 
 ## Tests
 
-`tests/test_scrub.c` (30 tests):
+`tests/test_scrub.c` (52 tests), among them:
 
 - Lifecycle: `scrub_create_initial_state_is_idle`,
   `scrub_create_rejects_null_args`, `scrub_status_get_rejects_null_args`.
@@ -659,13 +664,17 @@ Deferred (γ-scope / future):
   should install the production cb after `stm_scrub_create`.
 - ~~**P7-5 single-replica corner**~~. **CLOSED by P7-6**: the
   production cb walks every replica of an extent and rewrites each
-  that fails from one that verifies; only an extent with no replica
-  that verifies is `UNREPAIRABLE`.
+  that fails from one that verifies. An extent is `UNREPAIRABLE` when
+  no replica verifies, when a failed replica's block cannot be
+  written (its device is not ONLINE, or the allocator does not hold
+  it as the extent's), when a rewrite or its read-back fails, and on
+  a transient (R37 P2-1 below).
 - **R37 P2-1 transient-error overload**: the P7-5 production cb
   charges every non-OK outcome to `STM_SCRUB_VERIFY_UNREPAIRABLE` —
   including transient `malloc` failures, `bdev_read` STM_EIO,
-  `stm_pool_device_bdev` returning NULL (mid-replace race), and
-  zero `stm_aead_tag_len`. Operators MUST NOT auto-replace devices
+  `stm_pool_device_bdev` returning NULL (mid-replace race), zero
+  `stm_aead_tag_len`, and the second look's lookup failing (no EBR
+  handle, or the engine busy past its retry bound). Operators MUST NOT auto-replace devices
   on a single `blocks_unrepairable` reading; a near-OOM scrub run
   will libel healthy blocks. A future API extension (transient
   outcome enum + separate `blocks_skipped_transient` counter) will
@@ -679,16 +688,30 @@ Deferred (γ-scope / future):
   ciphertext over the other extent's block and reported REPAIRED,
   and a verdict from it could call whole data `UNREPAIRABLE`. The
   cb's first look, unlocked, now answers only "every replica
-  verified"; anything else is judged again under `sync->lock` by the
-  record the extent has then, where no block can be given out, and
-  any rewrite is made there. An extent gone or moved answers OK.
-  Tests: `scrub_repair_outlives_its_records_block`,
+  verified". Anything else is judged again under `sync->lock`,
+  without which no block becomes free: the record at the copy's
+  coordinates, found by the lock-free lookup, must be the copy's
+  write (the same blocks, generation, length, key and origin), or
+  the cb answers OK. An unchanged record can still name a block it
+  no longer owns, since a device evacuation frees the ranges it moves
+  without rewriting the records (a defect of evacuation, tracked on
+  its own); so a failed replica is rewritten, from the first look's
+  verified replica, only when its device is ONLINE and the allocator
+  holds a live run starting at its block. Tests (test_scrub):
+  `scrub_repair_outlives_its_records_block`,
   `scrub_stale_record_is_not_called_lost`,
   `scrub_deleted_extent_is_not_repaired`,
   `scrub_moved_extent_answers_at_its_own_base`,
-  `scrub_repair_seam_fires_outside_the_lock` (test_scrub) and
-  `corvus_scrub_second_look_after_logout_reports_nothing`
-  (test_corvus_mount).
+  `scrub_extent_back_on_its_old_blocks_is_not_called_lost`,
+  `scrub_extent_written_again_in_its_generation_is_not_repaired`,
+  `scrub_does_not_rewrite_onto_a_faulted_device`,
+  `scrub_second_look_holds_the_lock`,
+  `scrub_record_naming_a_freed_block_is_not_repaired`,
+  `scrub_evacuated_extent_is_not_repaired_over_a_write`,
+  `scrub_evacuated_extent_is_not_repaired_over_a_reservation`,
+  `scrub_repair_seam_fires_outside_the_lock`; (test_corvus_mount)
+  `corvus_scrub_damage_reported_while_unlocked`,
+  `corvus_scrub_second_look_after_logout_reports_nothing`.
 - **FAULTED-device blocks are skipped silently**. Status_get
   gives no indication that coverage was degraded. Operators
   monitoring "scrub finished without errors" may misread the

@@ -1938,8 +1938,10 @@ stm_status stm_sync_promote_policy_collect(stm_sync *s,
  *     and AEAD-verify each (the nonce and AD shape of
  *     `stm_sync_write_extent`). All verify: STM_SCRUB_VERIFY_OK. Some
  *     fail and one verifies: each that failed is rewritten from it and
- *     read back, STM_SCRUB_VERIFY_REPAIRED. None verifies, or a
- *     rewrite fails: STM_SCRUB_VERIFY_UNREPAIRABLE (bptr.tla's
+ *     read back, STM_SCRUB_VERIFY_REPAIRED. None verifies, a failed
+ *     replica's block cannot be written (its device is not ONLINE, or
+ *     the allocator does not hold it as the extent's), or a rewrite
+ *     fails: STM_SCRUB_VERIFY_UNREPAIRABLE (bptr.tla's
  *     `NoOriginalOKMeansUnrepairable` and `WriteVerifyMandatory`).
  *     The extent's other replicas answer OK; its first one carries
  *     the verdict.
@@ -1956,12 +1958,14 @@ stm_status stm_sync_promote_policy_collect(stm_sync *s,
  * between persistent corruption (AEAD-tag failure on quiescent
  * data) and transient failures (`malloc` returning NULL,
  * `stm_bdev_read` returning STM_EIO, the device's bdev disappearing
- * mid-step). All five transient modes — `cbuf`/`pbuf` malloc fail,
+ * mid-step). All six transient modes -- a buffer `malloc` failing,
  * bdev_read non-OK, NULL bdev from `stm_pool_device_bdev`, zero
- * `stm_aead_tag_len` — charge to STM_SCRUB_VERIFY_UNREPAIRABLE,
+ * `stm_aead_tag_len`, and the second look's lookup failing (no EBR
+ * handle, or the engine busy past its retry bound) -- charge to
+ * STM_SCRUB_VERIFY_UNREPAIRABLE,
  * which is semantically a permanent data-loss attestation per ARCH
- * §7.16.2. Operators MUST NOT alert solely on `blocks_unrepairable`
- * — a near-OOM scrub run will libel healthy blocks. A future API
+ * section 7.16.2. Operators MUST NOT alert solely on `blocks_unrepairable`
+ * -- a near-OOM scrub run will libel healthy blocks. A future API
  * extension (transient outcome enum + separate counter) will give
  * operators a clean signal; until then, treat
  * `blocks_unrepairable` as a "investigate, don't auto-replace"
@@ -1972,18 +1976,26 @@ stm_status stm_sync_promote_policy_collect(stm_sync *s,
  * index's own lock and reads with no lock held; by then the extent
  * may have been written again and its blocks given to another extent
  * by two commits, so it answers only "every replica verified". Any
- * other result is judged again under `sync->lock`, by the record the
- * extent has at the copy's (dataset, ino, offset): no block can be
- * given out while that lock is held (a commit sweeps freed blocks,
- * and an unwritten reservation is given back, only under it), so the
- * replicas read and any rewrite are that record's. An extent no
- * longer there, or no longer starting at this block, answers OK: its
- * blocks are not this extent's now, and its new version answers at
- * its own first block. The second look's device reads and rewrites
- * hold writers and commits for their time, once per extent the first
- * look found wanting, per pass. A missing key answers OK at either
- * look: a key pruned once nothing live used it, or a locked dataset,
- * leaves nothing to verify, which is not damage.
+ * other result is judged again under `sync->lock`, without which no
+ * block becomes free (a commit sweeps freed blocks, and an unwritten
+ * reservation is given back, only under it): the record at the copy's
+ * (dataset, ino, offset), by the lock-free lookup, must be the copy's
+ * write -- the same blocks, generation, length, key and origin --
+ * else the cb answers OK, the copy's blocks not being that extent's
+ * now. A record moved with its blocks to other coordinates (a key
+ * shift, a reflink sibling) is judged at them on a later pass. An
+ * unchanged record can still name a block it no longer owns: a device
+ * evacuation frees each range it moves without rewriting the records
+ * that name it. So a failed replica is rewritten only when its device
+ * is ONLINE and the allocator holds a live run starting at its block,
+ * long enough for the ciphertext; otherwise it is left unwritten and
+ * the extent is UNREPAIRABLE. The rewrite copies the first look's
+ * verified replica, so the second look reads nothing: its cost under
+ * the lock is one lookup, and one write and one read back per failed
+ * replica, once per extent the first look found wanting, per pass. A
+ * missing key answers OK at either look: a key pruned once nothing
+ * live used it, or a locked dataset, leaves nothing to verify, which
+ * is not damage.
  *
  * Lifetime contract: `sync` is borrowed (the cb's ctx) and MUST
  * outlive `sc`. Callers MUST close scrub BEFORE closing sync (per

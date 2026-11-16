@@ -582,6 +582,8 @@ struct stm_sync {
     void             *read_postinsert_test_ctx;
     void            (*scrub_verify_test_hook)(void *ctx);
     void             *scrub_verify_test_ctx;
+    void            (*scrub_second_look_test_hook)(void *ctx);
+    void             *scrub_second_look_test_ctx;
     unsigned          drop_fail_n;
     stm_status        drop_fail;
 #endif
@@ -5805,6 +5807,25 @@ void stm_sync_set_scrub_verify_hook_for_test(stm_sync *s,
     pthread_mutex_unlock(&s->lock);
 }
 
+void stm_sync_set_scrub_second_look_hook_for_test(stm_sync *s,
+                                                     void (*hook)(void *ctx),
+                                                     void *ctx)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->lock);
+    s->scrub_second_look_test_hook = hook;
+    s->scrub_second_look_test_ctx  = ctx;
+    pthread_mutex_unlock(&s->lock);
+}
+
+int stm_sync_trylock_for_test(stm_sync *s)
+{
+    if (!s) return -1;
+    int r = pthread_mutex_trylock(&s->lock);
+    if (r == 0) pthread_mutex_unlock(&s->lock);
+    return r;
+}
+
 void stm_sync_set_read_postinsert_hook_for_test(stm_sync *s,
                                                    void (*hook)(void *ctx),
                                                    void *ctx)
@@ -10849,21 +10870,20 @@ static stm_status cas_auto_gc_sweep_locked(stm_sync *s)
  * (only base paddrs are in the index) and charge to OK trivially.
  *
  * Lock context (per scrub.h "Callback contract"):
- *   - Invoked under sc->lock + pool->rdlock.
- *   - Does NOT take sync->lock — extent_idx has its own mutex;
- *     pool_uuid, metadata_key, pool are immutable post-create.
- *   - The cb internally writes via stm_bdev_write to non-OK
- *     replicas; that's allowed because pool's rdlock guards device
- *     pointers (no concurrent remove); bdev write is thread-safe per
- *     pool.h's contract on pure-deref readers.
- *   - Lock order: sc.lock → pool.rdlock → extent_idx.lock (LEAF).
+ *   - Invoked under sc->lock + pool->rdlock, which keep every device
+ *     pointer and device state fixed for the call.
+ *   - Takes s->lock twice: briefly for the record's key, then for the
+ *     second look, which judges and rewrites a failing extent. The
+ *     replica reads before it hold no sync lock.
+ *   - Lock order: sc.lock -> pool.rdlock -> s.lock -> the extent
+ *     index's, the dataset index's and the repair log's own locks.
  *
  * Plaintext hygiene: AEAD-decrypt outputs plaintext into a temp
  * buffer; ct_memzero before free.
  *
  * R38 P3-1 — repair logging (ARCH §7.15.4 / bptr.tla::LogIntegrity)
  * P7-15 closes this: every Phase 3 rewrite emits one
- * `stm_repair_log_entry` via `emit_repair_log_locked` with the
+ * `stm_repair_log_entry` via `emit_repair_log` with the
  * (target_paddr, source_paddr, target_idx, source_idx, type,
  * result) tuple. The on-disk persistence is the per-pool repair-
  * log sub-tree rooted at `ub_repair_log_root` (P7-15 / v16); the
@@ -10939,186 +10959,157 @@ static bool scrub_dek_locked(stm_sync *s, const stm_extent_record *rec,
     return true;
 }
 
-/* bptr.tla::ScanRead x NReplicas, and with `repair` the rest of the
- * protocol: read each replica of `rec` and AEAD-verify it under the
- * canonical (rec->paddrs[0], rec->gen) nonce; then rewrite each that
- * failed from one that verified. Without `repair` nothing is written,
- * and the answer is OK when every replica verified, UNREPAIRABLE when
- * any did not.
- *
- * A rewrite writes over the target replica's block, so it is sound
- * only while that block is `rec`'s: `repair` is passed only under
- * s->lock, with `rec` looked up under it (sync_scrub_verify_cb). */
-static stm_scrub_verify_outcome
-scrub_verify_replicas(stm_sync *s, const stm_extent_record *rec,
-                      const uint8_t dek[32], bool repair)
+/* Whether two records are one write: the same blocks, generation,
+ * length, key and origin. Blocks reused by a later write come back
+ * under a new generation. */
+static bool scrub_same_write(const stm_extent_record *a,
+                             const stm_extent_record *b)
 {
-    /* AEAD setup matching stm_sync_write_extent. Hardcoded AEGIS-256
-     * (R36 P1-3) so cross-host portability is preserved. */
-    stm_aead_mode mode = STM_AEAD_AEGIS256;
-    size_t tag_len = stm_aead_tag_len(mode);
-    if (tag_len == 0) return STM_SCRUB_VERIFY_UNREPAIRABLE;
+    if (a->kind != b->kind || a->n_replicas != b->n_replicas ||
+        a->gen != b->gen || a->len != b->len || a->key_id != b->key_id ||
+        a->origin_dataset_id != b->origin_dataset_id ||
+        a->origin_ino != b->origin_ino || a->origin_off != b->origin_off)
+        return false;
+    for (uint8_t i = 0; i < a->n_replicas; i++)
+        if (a->paddrs[i] != b->paddrs[i]) return false;
+    return true;
+}
 
-    size_t total_bytes = rec->len + tag_len;
-
-    void *cbuf = malloc(total_bytes);
-    void *src_bytes = malloc(total_bytes);  /* picked-source ciphertext */
-    void *back_buf  = malloc(total_bytes);  /* verify-back ciphertext */
-    void *pbuf      = malloc(rec->len);
-    if (!cbuf || !src_bytes || !back_buf || !pbuf) {
-        free(cbuf); free(src_bytes); free(back_buf); free(pbuf);
-        return STM_SCRUB_VERIFY_UNREPAIRABLE;
+/* The record now at `rec`'s (dataset, ino, offset), by the lock-free
+ * lookup: it walks one record's path rather than collecting the inode,
+ * and resolves the dataset's engine inside the EBR pin, as the paddr
+ * walk does, since this caller holds no fs->global. STM_EBUSY when no
+ * EBR handle can be had or the engine stays busy past the retry bound. */
+static stm_status scrub_lookup_now(stm_sync *s, const stm_extent_record *rec,
+                                   stm_extent_record *now)
+{
+    stm_ebr_thread *ebr = stm_ebr_thread_current();
+    if (!ebr) return STM_EBUSY;
+    for (unsigned attempt = 0; attempt < STM_BTREE_ENGINE_EBUSY_RETRY_MAX;
+         attempt++) {
+        stm_ebr_enter(ebr);
+        stm_status ls = stm_extent_lookup_at_concurrent(s->extent_idx, ebr,
+                                                        rec->dataset_id,
+                                                        rec->ino, rec->off,
+                                                        now);
+        stm_ebr_exit(ebr);
+        if (ls != STM_EBUSY) return ls;
     }
+    return STM_EBUSY;
+}
 
-    stm_ad_extent ad;
-    memset(&ad, 0, sizeof ad);
-    ad.magic        = STM_AD_MAGIC_EXTENT;
-    ad.version      = STM_AD_VERSION_EXTENT;
-    ad.pool_uuid[0] = s->pool_uuid[0];
-    ad.pool_uuid[1] = s->pool_uuid[1];
-    /* P7-16: AD reconstructs from `origin`, not the record's live
-     * (dataset_id, ino, off). For reflinked extents the lookup may
-     * return any of the records sharing these blocks; origin is
-     * invariant across such siblings
-     * (extent.tla::SharedReplicasAreCohabit) so AD reconstructs
-     * identically. The AEAD ciphertext was bound to `origin` at write
-     * time. */
-    ad.dataset_id   = rec->origin_dataset_id;
-    ad.ino          = rec->origin_ino;
-    ad.offset       = rec->origin_off;
-    ad.content_kind = 0;
+/* Whether the block a rewrite would write is still the record's. Its
+ * device must be ONLINE: an evacuation step frees the range it moved
+ * without rewriting the records that name it, and writes still reserve
+ * on the evacuating device, so a block such a record names there may be
+ * another write's, reserved at that very block; and a device never comes
+ * back from EVACUATING (only REMOVED follows), nor from FAULTED but
+ * through a rejoin, whose content may lag. And the allocator must hold a
+ * live run that starts at that block and holds the whole ciphertext: a
+ * record naming a block it no longer owns finds it ENOENT or inside
+ * another run, since no two live records start a run at one block
+ * (LiveReplicasDisjoint, refused at insert). Caller holds the pool's
+ * shared lock, so no device changes state, and s->lock, under which no
+ * allocator run is freed. */
+static bool scrub_target_owned_locked(stm_sync *s, uint64_t paddr,
+                                      size_t total_bytes)
+{
+    uint16_t dev = stm_paddr_device(paddr);
+    if (dev >= STM_POOL_DEVICES_MAX || !s->allocs[dev]) return false;
+    const stm_pool_device *di = stm_pool_device_info(s->pool, dev);
+    if (!di || di->state != STM_DEV_STATE_ONLINE) return false;
+    uint64_t run = 0;
+    uint32_t refs = 0;
+    if (stm_alloc_lookup(s->allocs[dev], paddr, &run, &refs) != STM_OK)
+        return false;
+    return refs >= 1 && run * (uint64_t)STM_UB_SIZE >= total_bytes;
+}
 
-    /* Phase 1 (bptr.tla::ScanRead x NReplicas). P7-15 splits non-OK
-     * into `replica_io_err[j]==true` (bdev_read failed or device
-     * unreachable) and `replica_io_err[j]==false` (read succeeded but
-     * AEAD-decrypt failed -> csum-fail) so the repair-log `type` field
-     * can carry the bptr.tla `read_outcome` tag. */
-    bool        replica_ok[STM_EXTENT_MAX_REPLICAS]      = { false };
-    bool        replica_io_err[STM_EXTENT_MAX_REPLICAS]  = { false };
-    int         picked = -1;
-    bool        all_ok = true;
-    stm_scrub_verify_outcome final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
+/* What the first look learned of a record's replicas. */
+typedef struct {
+    bool ok[STM_EXTENT_MAX_REPLICAS];
+    bool io_err[STM_EXTENT_MAX_REPLICAS];
+    int  picked;      /* the first replica that verified; -1: none */
+    bool all_ok;
+} scrub_reads;
 
+/* bptr.tla::ScanRead x NReplicas: read each replica of `rec` and
+ * AEAD-verify it under the canonical (rec->paddrs[0], rec->gen) nonce,
+ * keeping the first that verifies in `src`. P7-15 splits a failure into
+ * an I/O error (`io_err`) and a csum-fail so the repair log's `type`
+ * can carry bptr.tla's `read_outcome`. */
+static void scrub_read_replicas(stm_sync *s, const stm_extent_record *rec,
+                                const uint8_t dek[32],
+                                const stm_ad_extent *ad, size_t total_bytes,
+                                void *cbuf, void *src, void *pbuf,
+                                scrub_reads *rd)
+{
+    memset(rd, 0, sizeof *rd);
+    rd->picked = -1;
+    rd->all_ok = true;
     for (uint8_t i = 0; i < rec->n_replicas; i++) {
         uint16_t dev = stm_paddr_device(rec->paddrs[i]);
         stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
-        if (!bd) {
-            replica_io_err[i] = true;
-            all_ok = false;
-            continue;
-        }
         uint64_t boff = stm_paddr_offset(rec->paddrs[i]) * (uint64_t)STM_UB_SIZE;
-        stm_status rs = stm_bdev_read(bd, boff, cbuf, total_bytes);
-        if (rs != STM_OK) {
-            replica_io_err[i] = true;
-            all_ok = false;
+        if (!bd || stm_bdev_read(bd, boff, cbuf, total_bytes) != STM_OK) {
+            rd->io_err[i] = true;
+            rd->all_ok = false;
             continue;
         }
-
         size_t pt_out = 0;
-        stm_status ds = stm_extent_decrypt(mode, dek,
-                                              rec->paddrs[0], rec->gen,
-                                              &ad, cbuf, total_bytes,
-                                              pbuf, rec->len, &pt_out);
-        if (ds == STM_OK) {
-            replica_ok[i] = true;
-            if (picked < 0) {
-                picked = (int)i;
-                /* Save the picked source's ciphertext for repairs. */
-                memcpy(src_bytes, cbuf, total_bytes);
-            }
-        } else {
-            all_ok = false;   /* csum-fail (replica_io_err stays false) */
+        if (stm_extent_decrypt(STM_AEAD_AEGIS256, dek, rec->paddrs[0],
+                               rec->gen, ad, cbuf, total_bytes, pbuf,
+                               rec->len, &pt_out) != STM_OK) {
+            rd->all_ok = false;   /* csum-fail */
+            continue;
+        }
+        rd->ok[i] = true;
+        if (rd->picked < 0) {
+            rd->picked = (int)i;
+            memcpy(src, cbuf, total_bytes);
         }
     }
+}
 
-    if (all_ok) {
-        final_outcome = STM_SCRUB_VERIFY_OK;
-        goto done;
-    }
-    /* Phase 2 (bptr.tla::ScanComplete): if no replica verified, the
-     * extent is unrepairable; and the pass that may not write stops
-     * here either way. */
-    if (!repair || picked < 0) {
-        final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
-        goto done;
-    }
-
-    /* Phase 3 (bptr.tla::RewriteReplica): rewrite each non-OK replica
-     * from the picked source's ciphertext, then verify-back-read +
-     * AEAD-check. Any verify-back failure -> UNREPAIRABLE per
-     * bptr.tla::WriteVerifyMandatory. The source's bytes verified under
-     * `rec`'s key, nonce and AD, so they are `rec`'s ciphertext,
-     * whenever they were read.
-     *
-     * P7-15: every rewrite (success or failure) emits a
-     * `stm_repair_log_entry` via emit_repair_log so the on-disk
-     * audit trail (ARCH section 7.15.4 / bptr.tla::LogIntegrity)
-     * records which replica's bytes were rewritten from which source,
-     * the bptr.tla read_outcome that prompted the repair (CSUM_FAIL vs
-     * IO_ERR, from Phase 1's replica_io_err[]), and the verify-back
-     * result. Emits land on the next sync_commit. */
+/* bptr.tla::RewriteReplica and RewriteComplete: rewrite each replica the
+ * first look found failing from the one it verified (`src`, the
+ * record's ciphertext: it verified under the record's key, nonce and
+ * AD), then read it back and verify it. A replica whose block is not
+ * the record's now is not written: UNREPAIRABLE. Any failure ->
+ * UNREPAIRABLE (bptr.tla::WriteVerifyMandatory). Every attempt emits a
+ * repair-log entry (P7-15; ARCH section 7.15.4), landing on the next
+ * commit. Caller holds s->lock, and `rec` is live under it. */
+static stm_scrub_verify_outcome
+scrub_rewrite_locked(stm_sync *s, const stm_extent_record *rec,
+                     const uint8_t dek[32], const stm_ad_extent *ad,
+                     size_t total_bytes, const scrub_reads *rd,
+                     const void *src, void *back, void *pbuf)
+{
     bool any_rewrite = false;
     for (uint8_t j = 0; j < rec->n_replicas; j++) {
-        if (replica_ok[j]) continue;
-        stm_repair_type pre_type = replica_io_err[j] ? STM_REPAIR_TYPE_IO_ERR
-                                                      : STM_REPAIR_TYPE_CSUM_FAIL;
-        uint64_t target_paddr = rec->paddrs[j];
-        uint64_t source_paddr = rec->paddrs[picked];
-
-        uint16_t dev_j = stm_paddr_device(target_paddr);
-        stm_bdev *bd_j = stm_pool_device_bdev(s->pool, dev_j);
-        if (!bd_j) {
-            /* Can't reach this replica's device -- the extent is
-             * partially unrepairable. Per bptr.tla a single
-             * RewriteReplica failure -> UNREPAIRABLE. */
-            emit_repair_log(s, target_paddr, j, source_paddr, (uint8_t)picked,
-                              pre_type, STM_REPAIR_RESULT_FAIL);
-            final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
-            goto done;
+        if (rd->ok[j]) continue;
+        stm_repair_type pre_type = rd->io_err[j] ? STM_REPAIR_TYPE_IO_ERR
+                                                 : STM_REPAIR_TYPE_CSUM_FAIL;
+        uint64_t target = rec->paddrs[j];
+        uint64_t source = rec->paddrs[rd->picked];
+        stm_bdev *bd_j = stm_pool_device_bdev(s->pool, stm_paddr_device(target));
+        uint64_t boff_j = stm_paddr_offset(target) * (uint64_t)STM_UB_SIZE;
+        size_t pt_out = 0;
+        if (!bd_j || !scrub_target_owned_locked(s, target, total_bytes) ||
+            stm_bdev_write(bd_j, boff_j, src, total_bytes) != STM_OK ||
+            stm_bdev_read(bd_j, boff_j, back, total_bytes) != STM_OK ||
+            stm_extent_decrypt(STM_AEAD_AEGIS256, dek, rec->paddrs[0],
+                               rec->gen, ad, back, total_bytes, pbuf,
+                               rec->len, &pt_out) != STM_OK) {
+            emit_repair_log(s, target, j, source, (uint8_t)rd->picked,
+                            pre_type, STM_REPAIR_RESULT_FAIL);
+            return STM_SCRUB_VERIFY_UNREPAIRABLE;
         }
-        uint64_t boff_j = stm_paddr_offset(target_paddr) * (uint64_t)STM_UB_SIZE;
-        stm_status ws = stm_bdev_write(bd_j, boff_j, src_bytes, total_bytes);
-        if (ws != STM_OK) {
-            emit_repair_log(s, target_paddr, j, source_paddr, (uint8_t)picked,
-                              pre_type, STM_REPAIR_RESULT_FAIL);
-            final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
-            goto done;
-        }
-        /* Verify-back: read the bytes we just wrote and AEAD-check. */
-        stm_status rs = stm_bdev_read(bd_j, boff_j, back_buf, total_bytes);
-        if (rs != STM_OK) {
-            emit_repair_log(s, target_paddr, j, source_paddr, (uint8_t)picked,
-                              pre_type, STM_REPAIR_RESULT_FAIL);
-            final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
-            goto done;
-        }
-        size_t pt_out2 = 0;
-        stm_status ds = stm_extent_decrypt(mode, dek,
-                                              rec->paddrs[0], rec->gen,
-                                              &ad, back_buf, total_bytes,
-                                              pbuf, rec->len, &pt_out2);
-        if (ds != STM_OK) {
-            emit_repair_log(s, target_paddr, j, source_paddr, (uint8_t)picked,
-                              pre_type, STM_REPAIR_RESULT_FAIL);
-            final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
-            goto done;
-        }
-        emit_repair_log(s, target_paddr, j, source_paddr, (uint8_t)picked,
-                          pre_type, STM_REPAIR_RESULT_OK_VERIFIED);
+        emit_repair_log(s, target, j, source, (uint8_t)rd->picked,
+                        pre_type, STM_REPAIR_RESULT_OK_VERIFIED);
         any_rewrite = true;
     }
-
-    /* Phase 4 (bptr.tla::RewriteComplete). */
-    final_outcome = any_rewrite ? STM_SCRUB_VERIFY_REPAIRED
-                                : STM_SCRUB_VERIFY_OK;
-
-done:
-    stm_ct_memzero(pbuf, rec->len);
-    /* src_bytes + back_buf hold ciphertext, not plaintext -- no
-     * sensitive material. Plain free is fine. */
-    free(cbuf); free(src_bytes); free(back_buf); free(pbuf);
-    return final_outcome;
+    return any_rewrite ? STM_SCRUB_VERIFY_REPAIRED : STM_SCRUB_VERIFY_OK;
 }
 
 static stm_scrub_verify_outcome
@@ -11169,53 +11160,89 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
         s->scrub_verify_test_hook(s->scrub_verify_test_ctx);
 #endif
 
-    /* The first look, with no lock held, only sorts the whole from the
-     * rest. Its record is a copy taken under the extent index's lock
-     * alone, and since then the extent may have been written again and
-     * two commits may have given its blocks to another extent: then a
-     * replica fails because its block is someone else's now, and one
-     * whose block nobody has taken yet still verifies. A verdict from
-     * that copy can call whole data lost, and a repair from it would
-     * write the extent's old ciphertext over the other extent's block.
-     * So a failure is no word about the data. */
-    stm_scrub_verify_outcome first = scrub_verify_replicas(s, &rec, dek,
-                                                           false);
-    stm_ct_memzero(dek, sizeof dek);
-    if (first == STM_SCRUB_VERIFY_OK) return STM_SCRUB_VERIFY_OK;
+    /* AEAD setup matching stm_sync_write_extent. Hardcoded AEGIS-256
+     * (R36 P1-3) so cross-host portability is preserved. P7-16: the AD
+     * is the record's `origin`, which reflink siblings share
+     * (extent.tla::SharedReplicasAreCohabit); the ciphertext was bound
+     * to it at write time. */
+    size_t tag_len = stm_aead_tag_len(STM_AEAD_AEGIS256);
+    size_t total_bytes = rec.len + tag_len;
+    void *cbuf = malloc(total_bytes);
+    void *src  = malloc(total_bytes);
+    void *back = malloc(total_bytes);
+    void *pbuf = malloc(rec.len);
+    stm_scrub_verify_outcome out = STM_SCRUB_VERIFY_UNREPAIRABLE;
+    if (tag_len == 0 || !cbuf || !src || !back || !pbuf) goto done;
 
-    /* The second look, and any rewrite, under s->lock, by the record
-     * the extent has now. A block becomes free to take only at a
-     * commit (stm_alloc_commit sweeps what was freed) or when a
-     * reservation nothing was written to is given back, and both run
-     * under s->lock; so while it is held, the blocks of a record live
-     * at the lookup stay that record's, whatever is written meanwhile.
-     * The lookup is by the copy's coordinates: where the extent there
-     * no longer names this block, the block is not this extent's base
-     * any more, and there is nothing to judge here. A reflink sibling
-     * still naming it is judged at its own coordinates, on a later
-     * pass.
-     *
-     * Device reads and a rewrite under s->lock hold every writer and
-     * commit for their time, but only for an extent the first look
-     * found wanting: once per such extent per pass. */
-    stm_scrub_verify_outcome out;
+    stm_ad_extent ad;
+    memset(&ad, 0, sizeof ad);
+    ad.magic        = STM_AD_MAGIC_EXTENT;
+    ad.version      = STM_AD_VERSION_EXTENT;
+    ad.pool_uuid[0] = s->pool_uuid[0];
+    ad.pool_uuid[1] = s->pool_uuid[1];
+    ad.dataset_id   = rec.origin_dataset_id;
+    ad.ino          = rec.origin_ino;
+    ad.offset       = rec.origin_off;
+    ad.content_kind = 0;
+
+    /* The first look reads with no lock held, by a copy taken under the
+     * extent index's lock alone. By then the extent may have been
+     * written again and two commits may have given its blocks to
+     * another extent: a replica fails because its block is someone
+     * else's now, and one whose block nobody has taken yet still
+     * verifies. So it answers only "every replica verified"; a verdict
+     * or a repair from the copy could call whole data lost, or write
+     * the extent's old ciphertext over another extent's block. */
+    scrub_reads rd;
+    scrub_read_replicas(s, &rec, dek, &ad, total_bytes, cbuf, src, pbuf, &rd);
+    if (rd.all_ok) {
+        out = STM_SCRUB_VERIFY_OK;
+        goto done;
+    }
+
+    /* The second look, under s->lock: is the copy still the extent's
+     * write? No block becomes free while s->lock is held (a commit
+     * sweeps freed blocks, and an unwritten reservation is given back,
+     * only under it). A record looked up at the copy's coordinates that
+     * is another write, or none, answers OK: the copy's blocks are not
+     * that extent's now. A record moved to other coordinates with its
+     * blocks (a key shift, a reflink sibling still naming them) is
+     * judged at its own coordinates on a later pass. A record unchanged
+     * here names blocks that are its own until the lock is dropped, but
+     * for an evacuation, which frees the range it moved without
+     * rewriting the record: each block a rewrite would write is checked
+     * for that (scrub_target_owned_locked). The second look reads
+     * nothing: the first look read the blocks the record names, and its
+     * verified replica is the record's ciphertext. Its device I/O is one
+     * write and one read back per failed replica. */
     stm_extent_record now;
     pthread_mutex_lock(&s->lock);
-    ls = stm_extent_lookup_at(s->extent_idx, rec.dataset_id, rec.ino,
-                              rec.off, &now);
-    if (ls == STM_ENOENT)
+    ls = scrub_lookup_now(s, &rec, &now);
+    if (ls == STM_ENOENT) {
         out = STM_SCRUB_VERIFY_OK;
-    else if (ls != STM_OK)
-        out = STM_SCRUB_VERIFY_UNREPAIRABLE;
-    else if (now.kind != STM_EXTENT_KIND_HOT || now.paddrs[0] != paddr)
+    } else if (ls != STM_OK) {
+        out = STM_SCRUB_VERIFY_UNREPAIRABLE;   /* transient: not judged */
+    } else if (!scrub_same_write(&now, &rec)) {
         out = STM_SCRUB_VERIFY_OK;
-    else if (!scrub_record_usable(&now))
-        out = STM_SCRUB_VERIFY_UNREPAIRABLE;
-    else if (!scrub_dek_locked(s, &now, dek))
-        out = STM_SCRUB_VERIFY_OK;
-    else
-        out = scrub_verify_replicas(s, &now, dek, true);
+    } else if (!scrub_dek_locked(s, &now, dek)) {
+        out = STM_SCRUB_VERIFY_OK;   /* the key evicted between the looks */
+    } else {
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (s->scrub_second_look_test_hook)
+            s->scrub_second_look_test_hook(s->scrub_second_look_test_ctx);
+#endif
+        if (rd.picked < 0)   /* bptr.tla::ScanComplete: none verified */
+            out = STM_SCRUB_VERIFY_UNREPAIRABLE;
+        else
+            out = scrub_rewrite_locked(s, &now, dek, &ad, total_bytes, &rd,
+                                       src, back, pbuf);
+    }
     pthread_mutex_unlock(&s->lock);
+
+done:
+    if (pbuf) stm_ct_memzero(pbuf, rec.len);
+    /* cbuf, src and back hold ciphertext, not plaintext. */
+    free(cbuf); free(src); free(back); free(pbuf);
     stm_ct_memzero(dek, sizeof dek);
     return out;
 }

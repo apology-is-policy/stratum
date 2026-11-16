@@ -40,6 +40,7 @@
 #include <stratum/sync.h>
 #include <stratum/sync_testing.h>   /* dcache drain: disk-path reads */
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -2264,6 +2265,494 @@ STM_TEST(scrub_repair_seam_fires_outside_the_lock) {
 
     stm_scrub_close(sc);
     mirror2_extent_teardown(&fx);
+}
+
+/* The second look takes a record as the copy's write only when every
+ * field of the write agrees. An extent written again, and again two
+ * commits later, can land back on its old blocks under a new
+ * generation: every replica then fails under the copy's nonce, and that
+ * says nothing of the extent as it is. And an extent written twice in
+ * one generation has the same generation at new blocks: a rewrite by
+ * the copy's verdict would put the old ciphertext over the new
+ * version's replica. */
+typedef struct {
+    mirror2_extent_fx *fx;
+    bool       same_gen;      /* written again before any commit */
+    int        fired;
+    stm_status st;
+    stm_extent_record now;    /* the record at the extent's coordinates */
+    uint8_t    disk[2 * SRB_LEN];   /* its replica 1, before the pass */
+} t87_again_ctx;
+
+static void t87_again_hook(void *arg)
+{
+    t87_again_ctx *h = arg;
+    if (h->fired++) return;
+    stm_sync *s = h->fx->s;
+    uint8_t w[SRB_LEN];
+    srb_fill(w, 1u, 1u);
+    h->st = stm_sync_write_extent(s, 1u, 1u, 0u, w, SRB_LEN);
+    if (!h->same_gen) {
+        if (h->st == STM_OK) h->st = stm_sync_commit(s);
+        if (h->st == STM_OK) h->st = stm_sync_commit(s);
+        srb_fill(w, 1u, 2u);
+        if (h->st == STM_OK)
+            h->st = stm_sync_write_extent(s, 1u, 1u, 0u, w, SRB_LEN);
+    }
+    if (h->st == STM_OK)
+        h->st = stm_extent_lookup_at(stm_sync_extent_index(s), 1u, 1u, 0u,
+                                     &h->now);
+    if (h->st == STM_OK && h->same_gen)
+        /* The copy's replica 1 fails; its block is nobody's yet. */
+        corrupt_replica_on_disk(h->fx->paths[1], h->fx->extent_rec.paddrs[1]);
+    if (h->st == STM_OK)
+        srb_pread(h->fx->paths[1], h->now.paddrs[1], h->disk, sizeof h->disk);
+}
+
+static void t87_again_case(const char *tag, bool same_gen)
+{
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, tag);
+    if (!same_gen) STM_ASSERT_OK(stm_sync_commit(fx.s));
+    stm_sync_dcache_drain_for_test(fx.s);
+    const stm_extent_record old = fx.extent_rec;
+
+    t87_again_ctx h;
+    memset(&h, 0, sizeof h);
+    h.fx = &fx;
+    h.same_gen = same_gen;
+    h.st = STM_EINVAL;
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
+    stm_sync_set_scrub_verify_hook_for_test(fx.s, t87_again_hook, &h);
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    stm_scrub_status st;
+    memset(&st, 0, sizeof st);
+    for (int i = 0; i < 4096 && h.fired == 0; i++) {
+        if (stm_scrub_step(sc) != STM_OK ||
+            stm_scrub_status_get(sc, &st) != STM_OK) {
+            STM_ASSERT(false);
+            break;
+        }
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+    }
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    stm_test_info("scrub written again (%s): old blocks %llu/%llu gen %llu, "
+                  "now %llu/%llu gen %llu; after its step repaired %llu, "
+                  "unrepairable %llu", tag,
+                  (unsigned long long)old.paddrs[0],
+                  (unsigned long long)old.paddrs[1],
+                  (unsigned long long)old.gen,
+                  (unsigned long long)h.now.paddrs[0],
+                  (unsigned long long)h.now.paddrs[1],
+                  (unsigned long long)h.now.gen,
+                  (unsigned long long)st.blocks_repaired,
+                  (unsigned long long)st.blocks_unrepairable);
+
+    /* The premise: back on the old blocks under a new generation, or at
+     * new blocks under the old one. */
+    STM_ASSERT_EQ(h.fired, 1);
+    STM_ASSERT_OK(h.st);
+    if (same_gen) {
+        STM_ASSERT_EQ(h.now.gen, old.gen);
+        STM_ASSERT(h.now.paddrs[0] != old.paddrs[0]);
+        STM_ASSERT(h.now.paddrs[1] != old.paddrs[1]);
+    } else {
+        STM_ASSERT(h.now.gen != old.gen);
+        STM_ASSERT_EQ(h.now.paddrs[0], old.paddrs[0]);
+        STM_ASSERT_EQ(h.now.paddrs[1], old.paddrs[1]);
+    }
+
+    /* Nothing repaired, nothing called lost, the new version's replica 1
+     * as it was written; nor over the rest of the pass. */
+    STM_ASSERT_EQ(st.blocks_repaired, 0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, 0u);
+    uint8_t now_disk[2 * SRB_LEN];
+    srb_pread(fx.paths[1], h.now.paddrs[1], now_disk, sizeof now_disk);
+    STM_ASSERT(memcmp(now_disk, h.disk, sizeof now_disk) == 0);
+    run_scrub_done(sc);
+    stm_sync_set_scrub_verify_hook_for_test(fx.s, NULL, NULL);
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ(st.blocks_repaired, 0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, 0u);
+
+    /* The new version reads whole from its replica 1 alone. */
+    corrupt_replica_on_disk(fx.paths[0], h.now.paddrs[0]);
+    stm_sync_dcache_drain_for_test(fx.s);
+    uint8_t out[SRB_LEN];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(fx.s, 1u, 1u, 0u, out, sizeof out,
+                                         &got));
+    STM_ASSERT_EQ(got, (size_t)SRB_LEN);
+    STM_ASSERT(srb_is(out, 1u, same_gen ? 1u : 2u));
+
+    stm_scrub_close(sc);
+    mirror2_extent_teardown(&fx);
+}
+
+STM_TEST(scrub_extent_back_on_its_old_blocks_is_not_called_lost) {
+    t87_again_case("again_back", false);
+}
+
+STM_TEST(scrub_extent_written_again_in_its_generation_is_not_repaired) {
+    t87_again_case("again_gen", true);
+}
+
+/* A replica on a device that is not ONLINE is not rewritten: the
+ * extent, with one replica verified, is UNREPAIRABLE, and the faulted
+ * device's block is left as it is. */
+STM_TEST(scrub_does_not_rewrite_onto_a_faulted_device) {
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, "faulted");
+    STM_ASSERT_OK(stm_sync_commit(fx.s));
+    corrupt_replica_on_disk(fx.paths[1], fx.extent_rec.paddrs[1]);
+    uint8_t before[2 * SRB_LEN], after[2 * SRB_LEN];
+    srb_pread(fx.paths[1], fx.extent_rec.paddrs[1], before, sizeof before);
+    STM_ASSERT_OK(stm_pool_fail_device(fx.pool, 1));
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    run_scrub_done(sc);
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ(st.blocks_repaired, 0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, 1u);
+    srb_pread(fx.paths[1], fx.extent_rec.paddrs[1], after, sizeof after);
+    STM_ASSERT(memcmp(after, before, sizeof after) == 0);
+
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_pool_rejoin_device(fx.pool, 1));
+    mirror2_extent_teardown(&fx);
+}
+
+/* The second look judges and rewrites holding s->lock: a helper thread
+ * started from its seam finds the lock taken, and the main thread finds
+ * it free once the pass is over. */
+typedef struct { stm_sync *s; int fired; int held; } t87_lock_ctx;
+
+static void *t87_trylock_thread(void *arg)
+{
+    t87_lock_ctx *c = arg;
+    c->held = stm_sync_trylock_for_test(c->s);
+    return NULL;
+}
+
+static void t87_lock_hook(void *arg)
+{
+    t87_lock_ctx *c = arg;
+    c->fired++;
+    pthread_t t;
+    if (pthread_create(&t, NULL, t87_trylock_thread, c) != 0) {
+        c->held = -2;
+        return;
+    }
+    (void)pthread_join(t, NULL);
+}
+
+STM_TEST(scrub_second_look_holds_the_lock) {
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, "lockheld");
+    corrupt_replica_on_disk(fx.paths[1], fx.extent_rec.paddrs[1]);
+
+    t87_lock_ctx c = { fx.s, 0, 0 };
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
+    stm_sync_set_scrub_second_look_hook_for_test(fx.s, t87_lock_hook, &c);
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    run_scrub_done(sc);
+    stm_sync_set_scrub_second_look_hook_for_test(fx.s, NULL, NULL);
+
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ(c.fired, 1);
+    STM_ASSERT_EQ(c.held, EBUSY);
+    STM_ASSERT_EQ(st.blocks_repaired, 1u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, 0u);
+    STM_ASSERT_EQ(stm_sync_trylock_for_test(fx.s), 0);
+
+    stm_scrub_close(sc);
+    mirror2_extent_teardown(&fx);
+}
+
+/* A record that names a block it no longer owns -- freed under it, as an
+ * evacuation step frees the range it moved -- is not repaired into it
+ * once the block lies inside another run. */
+static void t87_fill_disk(const char *path, uint64_t paddr, size_t n,
+                          uint8_t seed)
+{
+    uint8_t *b = malloc(n);
+    STM_ASSERT(b != NULL);
+    if (!b) return;
+    for (size_t i = 0; i < n; i++) b[i] = (uint8_t)(seed ^ (i * 13u));
+    int fd = open(path, O_WRONLY);
+    STM_ASSERT(fd >= 0);
+    if (fd >= 0) {
+        ssize_t put = pwrite(fd, b, n,
+                             (off_t)(stm_paddr_offset(paddr) *
+                                     (uint64_t)STM_UB_SIZE));
+        STM_ASSERT_EQ((size_t)put, n);
+        STM_ASSERT_EQ(close(fd), 0);
+    }
+    free(b);
+}
+
+STM_TEST(scrub_record_naming_a_freed_block_is_not_repaired) {
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, "freedblk");
+    STM_ASSERT_OK(stm_sync_commit(fx.s));
+    stm_extent_index *eidx = stm_sync_extent_index(fx.s);
+    const stm_extent_record e1 = fx.extent_rec;
+    uint8_t w[SRB_LEN];
+    srb_fill(w, 2u, 0u);
+    STM_ASSERT_OK(stm_sync_write_extent(fx.s, 1u, 2u, 0u, w, SRB_LEN));
+    stm_extent_record e2;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1u, 2u, 0u, &e2));
+    STM_ASSERT_OK(stm_sync_commit(fx.s));
+    uint64_t len1 = 0, len2 = 0;
+    uint32_t rc = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(fx.a1, e1.paddrs[1], &len1, &rc));
+    STM_ASSERT_OK(stm_alloc_lookup(fx.a1, e2.paddrs[1], &len2, &rc));
+    STM_ASSERT_EQ(e2.paddrs[1], e1.paddrs[1] + len1);
+
+    /* The first file goes; the second's block on device 1 is freed with
+     * its record left naming it; two commits make both free to take. */
+    bool changed = false;
+    STM_ASSERT_OK(stm_sync_truncate(fx.s, 1u, 1u, 0u, &changed));
+    STM_ASSERT(changed);
+    STM_ASSERT_OK(stm_alloc_free(fx.a1, e2.paddrs[1], 0u));
+    STM_ASSERT_OK(stm_sync_commit(fx.s));
+    STM_ASSERT_OK(stm_sync_commit(fx.s));
+    stm_extent_record e2_now;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1u, 2u, 0u, &e2_now));
+    STM_ASSERT_EQ(e2_now.paddrs[1], e2.paddrs[1]);
+    STM_ASSERT_EQ(stm_alloc_lookup(fx.a1, e2.paddrs[1], NULL, NULL),
+                  STM_ENOENT);
+
+    /* A write in flight reserves both, starting before the second's block,
+     * and puts its bytes there. */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(fx.a1, len1 + len2, e1.paddrs[1], &p));
+    STM_ASSERT_EQ(p, e1.paddrs[1]);
+    size_t n = (size_t)((len1 + len2) * STM_UB_SIZE);
+    t87_fill_disk(fx.paths[1], p, n, 0xC3u);
+    uint8_t *before = malloc(n), *after = malloc(n);
+    STM_ASSERT(before && after);
+    if (before && after) srb_pread(fx.paths[1], p, before, n);
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    run_scrub_done(sc);
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    stm_test_info("scrub freed block: the record names %llu, the reservation "
+                  "starts at %llu for %llu blocks; repaired %llu, "
+                  "unrepairable %llu",
+                  (unsigned long long)e2.paddrs[1], (unsigned long long)p,
+                  (unsigned long long)(len1 + len2),
+                  (unsigned long long)st.blocks_repaired,
+                  (unsigned long long)st.blocks_unrepairable);
+    STM_ASSERT_EQ(st.blocks_repaired, 0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, 1u);
+    if (before && after) {
+        srb_pread(fx.paths[1], p, after, n);
+        STM_ASSERT(memcmp(after, before, n) == 0);
+    }
+    free(before);
+    free(after);
+
+    /* The second file still reads, from its replica 0. */
+    stm_sync_dcache_drain_for_test(fx.s);
+    uint8_t out[SRB_LEN];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(fx.s, 1u, 2u, 0u, out, sizeof out,
+                                         &got));
+    STM_ASSERT_EQ(got, (size_t)SRB_LEN);
+    STM_ASSERT(srb_is(out, 2u, 0u));
+
+    STM_ASSERT_OK(stm_alloc_unreserve(fx.a1, p));
+    stm_scrub_close(sc);
+    mirror2_extent_teardown(&fx);
+}
+
+/* A device evacuation frees each range it moves without rewriting the
+ * records that name it, and writes still reserve on the evacuating
+ * device. An extent whose replica 1 was on it keeps naming the freed
+ * block; another write then takes the block, inside a run of its own or
+ * reserved at that very block. Scrub does not repair the extent there. */
+static void t87_evac_case(const char *tag, bool exact)
+{
+    char paths[3][256];
+    stm_bdev *bds[3];
+    for (size_t i = 0; i < 3; i++) {
+        snprintf(paths[i], sizeof paths[i], "/tmp/stm_v2_scrub_t87_%s_%d_%zu.bin",
+                 tag, (int)getpid(), i);
+        unlink(paths[i]);
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(paths[i], &bo, &bds[i]));
+        STM_ASSERT_OK(stm_bdev_resize(bds[i], TEST_DEVICE_BYTES));
+    }
+    const uint64_t du[3][2] = { {0xAAA0, 0xBBB0}, {0xAAA1, 0xBBB1},
+                                {0xAAA2, 0xBBB2} };
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = 3;
+    for (size_t i = 0; i < 3; i++) {
+        opts.devices[i].uuid[0]    = du[i][0];
+        opts.devices[i].uuid[1]    = du[i][1];
+        opts.devices[i].size_bytes = TEST_DEVICE_BYTES;
+        opts.devices[i].role       = STM_DEV_ROLE_DATA;
+        opts.devices[i].class_     = STM_DEV_CLASS_SSD;
+        opts.devices[i].state      = STM_DEV_STATE_ONLINE;
+        opts.devices[i].bdev       = bds[i];
+    }
+    stm_pool *pool = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &pool));
+    stm_alloc *a[3] = { 0 };
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID, du[0],
+                                     TEST_BOOTSTRAP_BYTES, &a[0]));
+    stm_redundancy_profile prof = { STM_RED_MIRROR, 2u };
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a[0], make_wk(), &prof, &s));
+    for (uint16_t i = 1; i < 3; i++) {
+        STM_ASSERT_OK(stm_alloc_create(bds[i], POOL_UUID, du[i],
+                                         TEST_BOOTSTRAP_BYTES, &a[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(a[i], i));
+        STM_ASSERT_OK(stm_sync_attach_alloc(s, i, a[i]));
+    }
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    stm_extent_index *eidx = stm_sync_extent_index(s);
+    static uint8_t buf[3 * 4096];
+    for (size_t i = 0; i < 4096; i++) buf[i] = (uint8_t)(i * 3u);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1, 2, 0, buf, 4096));   /* X */
+    for (size_t i = 0; i < 4096; i++) buf[i] = (uint8_t)(i & 0xFFu);
+    STM_ASSERT_OK(stm_sync_write_extent(s, 1, 1, 0, buf, 4096));   /* E */
+    stm_extent_record e;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &e));
+    STM_ASSERT_EQ(stm_paddr_device(e.paddrs[0]), (uint16_t)0);
+    STM_ASSERT_EQ(stm_paddr_device(e.paddrs[1]), (uint16_t)1);
+    uint64_t len_e = 0;
+    uint32_t rc = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(a[1], e.paddrs[1], &len_e, &rc));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    bool changed = false;                                          /* X goes */
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 2, 0, &changed));
+    STM_ASSERT(changed);
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Evacuate device 1 onto device 2. */
+    STM_ASSERT_OK(stm_pool_begin_evacuation(pool, 1, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_status es = STM_OK;
+    for (int k = 0; k < 64; k++) {
+        uint64_t op = 0, np = 0;
+        es = stm_sync_evacuation_step(s, 1, 2, &op, &np);
+        if (es != STM_OK) break;
+    }
+    STM_ASSERT_EQ(es, STM_ENOENT);
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_extent_record e_now;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &e_now));
+    STM_ASSERT_EQ(e_now.paddrs[1], e.paddrs[1]);
+    STM_ASSERT_EQ(stm_alloc_lookup(a[1], e.paddrs[1], NULL, NULL), STM_ENOENT);
+
+    uint64_t taken = 0, taken_len = 0, reserved = 0;
+    stm_extent_record f;
+    memset(&f, 0, sizeof f);
+    for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(0x5Au ^ (i * 7u));
+    if (exact) {
+        /* A write in flight reserves exactly the freed block. */
+        STM_ASSERT_OK(stm_alloc_reserve(a[1], len_e, e.paddrs[1], &reserved));
+        STM_ASSERT_EQ(reserved, e.paddrs[1]);
+        taken = reserved;
+        taken_len = len_e;
+        t87_fill_disk(paths[1], taken, (size_t)(taken_len * STM_UB_SIZE), 0x96u);
+    } else {
+        /* F, three pages, takes a run over it. */
+        STM_ASSERT_OK(stm_sync_write_extent(s, 1, 3, 0, buf, sizeof buf));
+        STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 3, 0, &f));
+        STM_ASSERT_EQ(stm_paddr_device(f.paddrs[1]), (uint16_t)1);
+        STM_ASSERT_OK(stm_alloc_lookup(a[1], f.paddrs[1], &taken_len, &rc));
+        taken = f.paddrs[1];
+        STM_ASSERT(taken < e.paddrs[1] && e.paddrs[1] < taken + taken_len);
+        STM_ASSERT_OK(stm_sync_commit(s));
+    }
+    size_t n = (size_t)(taken_len * STM_UB_SIZE);
+    uint8_t *before = malloc(n), *after = malloc(n);
+    STM_ASSERT(before && after);
+    if (before && after) srb_pread(paths[1], taken, before, n);
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(s, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    stm_scrub_status st;
+    memset(&st, 0, sizeof st);
+    for (int i = 0; i < 4096; i++) {
+        if (stm_scrub_step(sc) != STM_OK ||
+            stm_scrub_status_get(sc, &st) != STM_OK) {
+            STM_ASSERT(false);
+            break;
+        }
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        if (st.cursor_device_id > 0 ||
+            st.cursor_start_block > stm_paddr_offset(e.paddrs[0])) break;
+    }
+    stm_test_info("scrub evacuated (%s): E names %llu; the other write's "
+                  "run starts at %llu for %llu blocks; after the step that "
+                  "met E repaired %llu, unrepairable %llu", tag,
+                  (unsigned long long)e.paddrs[1], (unsigned long long)taken,
+                  (unsigned long long)taken_len,
+                  (unsigned long long)st.blocks_repaired,
+                  (unsigned long long)st.blocks_unrepairable);
+    STM_ASSERT_EQ(st.blocks_repaired, 0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, 1u);
+    if (before && after) {
+        srb_pread(paths[1], taken, after, n);
+        STM_ASSERT(memcmp(after, before, n) == 0);
+    }
+    free(before);
+    free(after);
+
+    if (!exact) {
+        /* F reads whole from its replica 1 alone. */
+        corrupt_replica_on_disk(paths[0], f.paddrs[0]);
+        stm_sync_dcache_drain_for_test(s);
+        static uint8_t out[3 * 4096];
+        size_t got = 0;
+        STM_ASSERT_OK(stm_sync_read_extent(s, 1, 3, 0, out, sizeof out, &got));
+        STM_ASSERT_EQ(got, sizeof out);
+        STM_ASSERT(memcmp(out, buf, sizeof out) == 0);
+    } else {
+        STM_ASSERT_OK(stm_alloc_unreserve(a[1], reserved));
+    }
+
+    stm_scrub_close(sc);
+    stm_sync_close(s);
+    for (size_t i = 0; i < 3; i++) stm_alloc_close(a[i]);
+    stm_pool_close(pool);
+    for (size_t i = 0; i < 3; i++) {
+        stm_bdev_close(bds[i]);
+        unlink(paths[i]);
+    }
+}
+
+STM_TEST(scrub_evacuated_extent_is_not_repaired_over_a_write) {
+    t87_evac_case("evac_taken", false);
+}
+
+STM_TEST(scrub_evacuated_extent_is_not_repaired_over_a_reservation) {
+    t87_evac_case("evac_exact", true);
 }
 
 /* ========================================================================= */
