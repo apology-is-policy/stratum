@@ -582,8 +582,8 @@ struct stm_sync {
     void             *read_postinsert_test_ctx;
     void            (*scrub_verify_test_hook)(void *ctx);
     void             *scrub_verify_test_ctx;
-    void            (*scrub_second_look_test_hook)(void *ctx);
-    void             *scrub_second_look_test_ctx;
+    void            (*scrub_rewrite_test_hook)(void *ctx);
+    void             *scrub_rewrite_test_ctx;
     unsigned          drop_fail_n;
     stm_status        drop_fail;
 #endif
@@ -5807,14 +5807,14 @@ void stm_sync_set_scrub_verify_hook_for_test(stm_sync *s,
     pthread_mutex_unlock(&s->lock);
 }
 
-void stm_sync_set_scrub_second_look_hook_for_test(stm_sync *s,
-                                                     void (*hook)(void *ctx),
-                                                     void *ctx)
+void stm_sync_set_scrub_rewrite_hook_for_test(stm_sync *s,
+                                                 void (*hook)(void *ctx),
+                                                 void *ctx)
 {
     if (!s) return;
     pthread_mutex_lock(&s->lock);
-    s->scrub_second_look_test_hook = hook;
-    s->scrub_second_look_test_ctx  = ctx;
+    s->scrub_rewrite_test_hook = hook;
+    s->scrub_rewrite_test_ctx  = ctx;
     pthread_mutex_unlock(&s->lock);
 }
 
@@ -10875,8 +10875,11 @@ static stm_status cas_auto_gc_sweep_locked(stm_sync *s)
  *   - Takes s->lock twice: briefly for the record's key, then for the
  *     second look, which judges and rewrites a failing extent. The
  *     replica reads before it hold no sync lock.
- *   - Lock order: sc.lock -> pool.rdlock -> s.lock -> the extent
- *     index's, the dataset index's and the repair log's own locks.
+ *   - Lock order: sc.lock -> pool.rdlock -> the extent index's lock
+ *     (the paddr lookup, released before s->lock); then s.lock -> the
+ *     dataset index's lock (or the EBR pin dropped while it is taken),
+ *     the engine's commit_mu, the allocator's, the bdev's and the
+ *     repair log's own locks.
  *
  * Plaintext hygiene: AEAD-decrypt outputs plaintext into a temp
  * buffer; ct_memzero before free.
@@ -10976,10 +10979,13 @@ static bool scrub_same_write(const stm_extent_record *a,
 }
 
 /* The record now at `rec`'s (dataset, ino, offset), by the lock-free
- * lookup: it walks one record's path rather than collecting the inode,
- * and resolves the dataset's engine inside the EBR pin, as the paddr
- * walk does, since this caller holds no fs->global. STM_EBUSY when no
- * EBR handle can be had or the engine stays busy past the retry bound. */
+ * lookup: it resolves the dataset's engine inside the EBR pin, as the
+ * paddr walk does, since this caller holds no fs->global, and scans the
+ * inode's records until one covers the offset, copying none (keys are
+ * not in offset order, so the scan is bounded by the inode's extent
+ * count, not by the tree's height). STM_EBUSY when no EBR handle can be
+ * had or the engine stays busy past the retry bound, yielding between
+ * attempts as the bound's contract asks. */
 static stm_status scrub_lookup_now(stm_sync *s, const stm_extent_record *rec,
                                    stm_extent_record *now)
 {
@@ -10994,6 +11000,7 @@ static stm_status scrub_lookup_now(stm_sync *s, const stm_extent_record *rec,
                                                         now);
         stm_ebr_exit(ebr);
         if (ls != STM_EBUSY) return ls;
+        sched_yield();
     }
     return STM_EBUSY;
 }
@@ -11006,11 +11013,16 @@ static stm_status scrub_lookup_now(stm_sync *s, const stm_extent_record *rec,
  * back from EVACUATING (only REMOVED follows), nor from FAULTED but
  * through a rejoin, whose content may lag. And the allocator must hold a
  * live run that starts at that block and holds the whole ciphertext: a
- * record naming a block it no longer owns finds it ENOENT or inside
- * another run, since no two live records start a run at one block
- * (LiveReplicasDisjoint, refused at insert). Caller holds the pool's
- * shared lock, so no device changes state, and s->lock, under which no
- * allocator run is freed. */
+ * record naming a block it no longer owns finds it ENOENT, PENDING, too
+ * short, or inside another run, since no two live records start a run at
+ * one block (LiveReplicasDisjoint, refused at insert). That holds only
+ * while the device's allocator is right about it, and one is not after a
+ * device FAULTED across a commit is remounted and rejoined: commits skip
+ * a FAULTED allocator and rejoin does not reconcile it, so its blocks are
+ * given out again under the records naming them (an open defect of that
+ * path, which harms every writer). Caller holds the pool's shared lock,
+ * so no device changes state, and s->lock, under which no allocator run
+ * is freed. */
 static bool scrub_target_owned_locked(stm_sync *s, uint64_t paddr,
                                       size_t total_bytes)
 {
@@ -11095,7 +11107,12 @@ scrub_rewrite_locked(stm_sync *s, const stm_extent_record *rec,
         stm_bdev *bd_j = stm_pool_device_bdev(s->pool, stm_paddr_device(target));
         uint64_t boff_j = stm_paddr_offset(target) * (uint64_t)STM_UB_SIZE;
         size_t pt_out = 0;
-        if (!bd_j || !scrub_target_owned_locked(s, target, total_bytes) ||
+        bool owned = bd_j && scrub_target_owned_locked(s, target, total_bytes);
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+        if (owned && s->scrub_rewrite_test_hook)
+            s->scrub_rewrite_test_hook(s->scrub_rewrite_test_ctx);
+#endif
+        if (!owned ||
             stm_bdev_write(bd_j, boff_j, src, total_bytes) != STM_OK ||
             stm_bdev_read(bd_j, boff_j, back, total_bytes) != STM_OK ||
             stm_extent_decrypt(STM_AEAD_AEGIS256, dek, rec->paddrs[0],
@@ -11126,7 +11143,6 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     stm_status ls = stm_extent_lookup_by_paddr(s->extent_idx, paddr, &rec);
     if (ls == STM_ENOENT) return STM_SCRUB_VERIFY_OK;
     if (ls != STM_OK)     return STM_SCRUB_VERIFY_UNREPAIRABLE;
-    if (!scrub_record_usable(&rec)) return STM_SCRUB_VERIFY_UNREPAIRABLE;
 
     /* Each scrub block is processed once. To avoid duplicate-charging
      * a single extent's outcome across each of its replica paddrs,
@@ -11136,6 +11152,7 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
      * scanned independently by scrub but the extent's verify+repair
      * is canonicalized to the first replica's invocation. */
     if (paddr != rec.paddrs[0]) return STM_SCRUB_VERIFY_OK;
+    if (!scrub_record_usable(&rec)) return STM_SCRUB_VERIFY_UNREPAIRABLE;
 
     /* Briefly takes s->lock; lock order sc.lock (caller-held) ->
      * pool.rdlock (caller-held) -> s.lock is the established direction
@@ -11213,8 +11230,9 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
      * rewriting the record: each block a rewrite would write is checked
      * for that (scrub_target_owned_locked). The second look reads
      * nothing: the first look read the blocks the record names, and its
-     * verified replica is the record's ciphertext. Its device I/O is one
-     * write and one read back per failed replica. */
+     * verified replica is the record's ciphertext. Under the lock: the
+     * lookup (a scan of the inode's records), then per failed replica an
+     * allocator lookup, one write and one read back. */
     stm_extent_record now;
     pthread_mutex_lock(&s->lock);
     ls = scrub_lookup_now(s, &rec, &now);
@@ -11227,10 +11245,6 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     } else if (!scrub_dek_locked(s, &now, dek)) {
         out = STM_SCRUB_VERIFY_OK;   /* the key evicted between the looks */
     } else {
-#ifdef STRATUM_BUILD_TESTING_HOOKS
-        if (s->scrub_second_look_test_hook)
-            s->scrub_second_look_test_hook(s->scrub_second_look_test_ctx);
-#endif
         if (rd.picked < 0)   /* bptr.tla::ScanComplete: none verified */
             out = STM_SCRUB_VERIFY_UNREPAIRABLE;
         else

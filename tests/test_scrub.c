@@ -2428,9 +2428,9 @@ STM_TEST(scrub_does_not_rewrite_onto_a_faulted_device) {
     mirror2_extent_teardown(&fx);
 }
 
-/* The second look judges and rewrites holding s->lock: a helper thread
- * started from its seam finds the lock taken, and the main thread finds
- * it free once the pass is over. */
+/* The second look rewrites holding s->lock: a helper thread started from
+ * the seam just before the write finds the lock taken, and the main
+ * thread finds it free once the pass is over. */
 typedef struct { stm_sync *s; int fired; int held; } t87_lock_ctx;
 
 static void *t87_trylock_thread(void *arg)
@@ -2452,7 +2452,7 @@ static void t87_lock_hook(void *arg)
     (void)pthread_join(t, NULL);
 }
 
-STM_TEST(scrub_second_look_holds_the_lock) {
+STM_TEST(scrub_rewrite_holds_the_lock) {
     mirror2_extent_fx fx;
     mirror2_extent_setup(&fx, "lockheld");
     corrupt_replica_on_disk(fx.paths[1], fx.extent_rec.paddrs[1]);
@@ -2461,10 +2461,10 @@ STM_TEST(scrub_second_look_holds_the_lock) {
     stm_scrub *sc = NULL;
     STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
     STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
-    stm_sync_set_scrub_second_look_hook_for_test(fx.s, t87_lock_hook, &c);
+    stm_sync_set_scrub_rewrite_hook_for_test(fx.s, t87_lock_hook, &c);
     STM_ASSERT_OK(stm_scrub_start(sc));
     run_scrub_done(sc);
-    stm_sync_set_scrub_second_look_hook_for_test(fx.s, NULL, NULL);
+    stm_sync_set_scrub_rewrite_hook_for_test(fx.s, NULL, NULL);
 
     stm_scrub_status st;
     STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
@@ -2479,8 +2479,9 @@ STM_TEST(scrub_second_look_holds_the_lock) {
 }
 
 /* A record that names a block it no longer owns -- freed under it, as an
- * evacuation step frees the range it moved -- is not repaired into it
- * once the block lies inside another run. */
+ * evacuation step frees the range it moved -- is not repaired into it:
+ * here the block lies inside another run; below, a run starts at it but
+ * is too short, or is waiting to be swept. */
 static void t87_fill_disk(const char *path, uint64_t paddr, size_t n,
                           uint8_t seed)
 {
@@ -2500,7 +2501,7 @@ static void t87_fill_disk(const char *path, uint64_t paddr, size_t n,
     free(b);
 }
 
-STM_TEST(scrub_record_naming_a_freed_block_is_not_repaired) {
+STM_TEST(scrub_record_naming_a_block_inside_another_run_is_not_repaired) {
     mirror2_extent_fx fx;
     mirror2_extent_setup(&fx, "freedblk");
     STM_ASSERT_OK(stm_sync_commit(fx.s));
@@ -2578,6 +2579,94 @@ STM_TEST(scrub_record_naming_a_freed_block_is_not_repaired) {
     STM_ASSERT_OK(stm_alloc_unreserve(fx.a1, p));
     stm_scrub_close(sc);
     mirror2_extent_teardown(&fx);
+}
+
+typedef enum { T87_SHORT_RUN, T87_PENDING_RUN } t87_run_mode;
+
+static void t87_owned_case(const char *tag, t87_run_mode mode)
+{
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, tag);
+    STM_ASSERT_OK(stm_sync_commit(fx.s));
+    /* No run is shorter than two blocks, so the short arm judges a file
+     * of three pages (four blocks with its tag). */
+    uint64_t ino = 1u;
+    stm_extent_record e = fx.extent_rec;
+    if (mode == T87_SHORT_RUN) {
+        static uint8_t big[3 * SRB_LEN];
+        for (size_t i = 0; i < sizeof big; i++) big[i] = (uint8_t)(i * 5u);
+        ino = 2u;
+        STM_ASSERT_OK(stm_sync_write_extent(fx.s, 1u, ino, 0u, big,
+                                              sizeof big));
+        STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(fx.s), 1u,
+                                           ino, 0u, &e));
+        STM_ASSERT_OK(stm_sync_commit(fx.s));
+    }
+    uint64_t len = 0, run = 0;
+    uint32_t refs = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(fx.a1, e.paddrs[1], &len, &refs));
+    STM_ASSERT(len > 2u || mode == T87_PENDING_RUN);
+
+    /* The extent's run on device 1 is freed with its record left naming
+     * it. Swept by two commits and reserved again at its start, shorter;
+     * or left waiting for the sweep. */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_free(fx.a1, e.paddrs[1], 0u));
+    if (mode == T87_SHORT_RUN) {
+        STM_ASSERT_OK(stm_sync_commit(fx.s));
+        STM_ASSERT_OK(stm_sync_commit(fx.s));
+        STM_ASSERT_EQ(stm_alloc_lookup(fx.a1, e.paddrs[1], NULL, NULL),
+                      STM_ENOENT);
+        STM_ASSERT_OK(stm_alloc_reserve(fx.a1, 2u, e.paddrs[1], &p));
+        STM_ASSERT_EQ(p, e.paddrs[1]);
+        STM_ASSERT_OK(stm_alloc_lookup(fx.a1, e.paddrs[1], &run, &refs));
+        STM_ASSERT_EQ(run, 2u);
+        STM_ASSERT_EQ(refs, 1u);
+    } else {
+        STM_ASSERT_OK(stm_alloc_lookup(fx.a1, e.paddrs[1], &run, &refs));
+        STM_ASSERT_EQ(run, len);
+        STM_ASSERT_EQ(refs, 0u);
+    }
+    stm_extent_record e_now;
+    STM_ASSERT_OK(stm_extent_lookup_at(stm_sync_extent_index(fx.s), 1u, ino,
+                                       0u, &e_now));
+    STM_ASSERT_EQ(e_now.paddrs[1], e.paddrs[1]);
+    STM_ASSERT_EQ(e_now.gen, e.gen);
+
+    /* Other bytes there: the extent's replica 1 fails. */
+    size_t n = (size_t)(len * STM_UB_SIZE);
+    t87_fill_disk(fx.paths[1], e.paddrs[1], n, 0x69u);
+    uint8_t *before = malloc(n), *after = malloc(n);
+    STM_ASSERT(before && after);
+    if (before && after) srb_pread(fx.paths[1], e.paddrs[1], before, n);
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    run_scrub_done(sc);
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ(st.blocks_repaired, 0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable, 1u);
+    if (before && after) {
+        srb_pread(fx.paths[1], e.paddrs[1], after, n);
+        STM_ASSERT(memcmp(after, before, n) == 0);
+    }
+    free(before);
+    free(after);
+
+    if (p != 0u) STM_ASSERT_OK(stm_alloc_unreserve(fx.a1, p));
+    stm_scrub_close(sc);
+    mirror2_extent_teardown(&fx);
+}
+
+STM_TEST(scrub_record_naming_a_shorter_run_is_not_repaired) {
+    t87_owned_case("shortrun", T87_SHORT_RUN);
+}
+
+STM_TEST(scrub_record_naming_a_pending_run_is_not_repaired) {
+    t87_owned_case("pendrun", T87_PENDING_RUN);
 }
 
 /* A device evacuation frees each range it moves without rewriting the

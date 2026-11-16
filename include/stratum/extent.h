@@ -1035,9 +1035,10 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
  *     internal mutex, then the scan runs lock-free against it.
  *
  *   - Single-extent first-match (per `NoOverlapWithinIno`): the scan
- *     terminates as soon as an offset-covering record is found, so the
- *     cost is bounded by (tree height + spill walks for that one
- *     record), NOT by the count of extents under (ds, ino).
+ *     terminates as soon as an offset-covering record is found. The
+ *     inode's keys are not in offset order, so the records before it
+ *     are decoded too: the cost is bounded by the count of extents
+ *     under (ds, ino), as for stm_extent_lookup_at, with no allocation.
  *
  * Returns the same status codes as stm_extent_lookup_at, plus
  * STM_EINVAL if `ebr` is NULL.

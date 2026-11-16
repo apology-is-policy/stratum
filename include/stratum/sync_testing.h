@@ -145,7 +145,7 @@ void stm_sync_set_read_prefetch_hook_for_test(stm_sync *s,
  * the pool's shared lock a second time on the same thread, which
  * deadlocks if a pool writer (a device add, fail or evacuation) is
  * waiting for it, so such a hook is for a test that runs no pool
- * writer meanwhile. The second look has its own seam, below. Pass
+ * writer meanwhile. The rewrite has its own seam, below. Pass
  * hook=NULL to clear.
  */
 void stm_sync_set_scrub_verify_hook_for_test(stm_sync *s,
@@ -153,16 +153,17 @@ void stm_sync_set_scrub_verify_hook_for_test(stm_sync *s,
                                                 void *ctx);
 
 /*
- * Scrub's second-look seam: invoked by the production verify callback
- * under s->lock, once the record at the extent's coordinates is found
- * to be the write the callback read by, and before any rewrite. The
- * hook runs holding s->lock, so it must not take it (no commit, no
- * write): it is where a test sees that the lock is held. Pass
- * hook=NULL to clear.
+ * Scrub's rewrite seam: invoked by the production verify callback under
+ * s->lock, in its second look, for each failed replica it is about to
+ * rewrite: after the block has been found the extent's (its device
+ * ONLINE, the allocator's run there) and before the write. The hook
+ * runs holding s->lock, so it must not take it (no commit, no write):
+ * it is where a test sees that the lock is held across the rewrite.
+ * Pass hook=NULL to clear.
  */
-void stm_sync_set_scrub_second_look_hook_for_test(stm_sync *s,
-                                                     void (*hook)(void *ctx),
-                                                     void *ctx);
+void stm_sync_set_scrub_rewrite_hook_for_test(stm_sync *s,
+                                                 void (*hook)(void *ctx),
+                                                 void *ctx);
 
 /*
  * Whether s->lock is free at this instant: 0 when it was (taken and

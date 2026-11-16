@@ -1940,8 +1940,8 @@ stm_status stm_sync_promote_policy_collect(stm_sync *s,
  *     fail and one verifies: each that failed is rewritten from it and
  *     read back, STM_SCRUB_VERIFY_REPAIRED. None verifies, a failed
  *     replica's block cannot be written (its device is not ONLINE, or
- *     the allocator does not hold it as the extent's), or a rewrite
- *     fails: STM_SCRUB_VERIFY_UNREPAIRABLE (bptr.tla's
+ *     the allocator holds no live run starting there long enough for
+ *     the ciphertext), or a rewrite fails: STM_SCRUB_VERIFY_UNREPAIRABLE (bptr.tla's
  *     `NoOriginalOKMeansUnrepairable` and `WriteVerifyMandatory`).
  *     The extent's other replicas answer OK; its first one carries
  *     the verdict.
@@ -1961,7 +1961,8 @@ stm_status stm_sync_promote_policy_collect(stm_sync *s,
  * mid-step). All six transient modes -- a buffer `malloc` failing,
  * bdev_read non-OK, NULL bdev from `stm_pool_device_bdev`, zero
  * `stm_aead_tag_len`, and the second look's lookup failing (no EBR
- * handle, or the engine busy past its retry bound) -- charge to
+ * handle, the engine busy past its retry bound, or an error such as
+ * ENOMEM, EIO or ECORRUPT) -- charge to
  * STM_SCRUB_VERIFY_UNREPAIRABLE,
  * which is semantically a permanent data-loss attestation per ARCH
  * section 7.16.2. Operators MUST NOT alert solely on `blocks_unrepairable`
@@ -1989,10 +1990,16 @@ stm_status stm_sync_promote_policy_collect(stm_sync *s,
  * that name it. So a failed replica is rewritten only when its device
  * is ONLINE and the allocator holds a live run starting at its block,
  * long enough for the ciphertext; otherwise it is left unwritten and
- * the extent is UNREPAIRABLE. The rewrite copies the first look's
- * verified replica, so the second look reads nothing: its cost under
- * the lock is one lookup, and one write and one read back per failed
- * replica, once per extent the first look found wanting, per pass. A
+ * the extent is UNREPAIRABLE. That rests on the allocator being right
+ * about the device, which it is not after a device faulted across a
+ * commit is remounted and rejoined: commits skip a faulted allocator
+ * and a rejoin does not reconcile it, so its blocks are given out again
+ * under the records naming them (an open defect of that path, which
+ * harms every writer). The rewrite copies the first look's verified
+ * replica, so the second look reads nothing: its cost under the lock is
+ * the lookup (a scan of the inode's records, with no allocation), then
+ * per failed replica an allocator lookup, one write and one read back,
+ * once per extent the first look found wanting, per pass. A
  * missing key answers OK at either look: a key pruned once nothing
  * live used it, or a locked dataset, leaves nothing to verify, which
  * is not damage.

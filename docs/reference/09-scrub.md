@@ -299,8 +299,11 @@ Both modes continue past per-block failure (§7.16.1).
 ## Locking
 
 Lock order: `sc.lock -> pool.rdlock -> sync.lock -> alloc.lock`. The
-production cb takes `sync.lock` itself, and under it the extent
-index's, the dataset index's and the repair log's own locks.
+production cb takes the extent index's lock for its paddr lookup and
+releases it; then `sync.lock` itself, and under it the dataset
+index's lock (or drops its EBR pin while taking it), the engine's
+`commit_mu`, and the allocator's, the bdev's and the repair log's own
+locks.
 
 Matches POOL OUTER, SYNC INNER, ALLOC LEAF. Holding `pool.rdlock`
 across the bdev reads prevents concurrent `stm_pool_finish_evacuation`
@@ -415,7 +418,7 @@ SPEC-TO-CODE:
 
 ## Tests
 
-`tests/test_scrub.c` (52 tests), among them:
+`tests/test_scrub.c` (53 tests), among them:
 
 - Lifecycle: `scrub_create_initial_state_is_idle`,
   `scrub_create_rejects_null_args`, `scrub_status_get_rejects_null_args`.
@@ -674,7 +677,8 @@ Deferred (γ-scope / future):
   including transient `malloc` failures, `bdev_read` STM_EIO,
   `stm_pool_device_bdev` returning NULL (mid-replace race), zero
   `stm_aead_tag_len`, and the second look's lookup failing (no EBR
-  handle, or the engine busy past its retry bound). Operators MUST NOT auto-replace devices
+  handle, the engine busy past its retry bound, or an error such as
+  ENOMEM, EIO or ECORRUPT). Operators MUST NOT auto-replace devices
   on a single `blocks_unrepairable` reading; a near-OOM scrub run
   will libel healthy blocks. A future API extension (transient
   outcome enum + separate `blocks_skipped_transient` counter) will
@@ -697,7 +701,12 @@ Deferred (γ-scope / future):
   without rewriting the records (a defect of evacuation, tracked on
   its own); so a failed replica is rewritten, from the first look's
   verified replica, only when its device is ONLINE and the allocator
-  holds a live run starting at its block. Tests (test_scrub):
+  holds a live run starting at its block, long enough for the
+  ciphertext. That rests on the allocator being right about the
+  device, which it is not after a device faulted across a commit is
+  remounted and rejoined (commits skip a faulted allocator, a rejoin
+  does not reconcile it): an open defect of that path, which harms
+  every writer. Tests (test_scrub):
   `scrub_repair_outlives_its_records_block`,
   `scrub_stale_record_is_not_called_lost`,
   `scrub_deleted_extent_is_not_repaired`,
@@ -705,8 +714,10 @@ Deferred (γ-scope / future):
   `scrub_extent_back_on_its_old_blocks_is_not_called_lost`,
   `scrub_extent_written_again_in_its_generation_is_not_repaired`,
   `scrub_does_not_rewrite_onto_a_faulted_device`,
-  `scrub_second_look_holds_the_lock`,
-  `scrub_record_naming_a_freed_block_is_not_repaired`,
+  `scrub_rewrite_holds_the_lock`,
+  `scrub_record_naming_a_block_inside_another_run_is_not_repaired`,
+  `scrub_record_naming_a_shorter_run_is_not_repaired`,
+  `scrub_record_naming_a_pending_run_is_not_repaired`,
   `scrub_evacuated_extent_is_not_repaired_over_a_write`,
   `scrub_evacuated_extent_is_not_repaired_over_a_reservation`,
   `scrub_repair_seam_fires_outside_the_lock`; (test_corvus_mount)

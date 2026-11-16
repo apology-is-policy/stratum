@@ -73,10 +73,11 @@
  * dataset index per call; lifetime is safe because the fs.c layer
  * holds fs->global SH/EX across every extent op, and
  * `stm_dataset_destroy` and rollback take fs->global EX (so a slot's
- * engine cannot be closed mid-op). The one caller outside fs->global
- * is the scrub's `stm_extent_lookup_by_paddr`: it walks pinned and
- * resolves each engine inside the pin, so an engine a rollback
- * retires under it stays alive until the walk leaves.
+ * engine cannot be closed mid-op). The callers outside fs->global are
+ * the scrub's: `stm_extent_lookup_by_paddr` and its second look's
+ * `stm_extent_lookup_at_concurrent`. Both resolve each engine inside an
+ * EBR pin, so an engine a rollback retires under them stays alive until
+ * they leave.
  *
  * Audit-trigger surface: this module is on CLAUDE.md's trigger list.
  *

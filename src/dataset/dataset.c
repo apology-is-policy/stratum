@@ -1569,8 +1569,9 @@ static stm_status dataset_engine_open_locked(stm_dataset_index *idx,
  * the free past its exit; a reader arriving after sees NULL and lazily
  * re-opens from the durable triple. Serial ops and _concurrent writers
  * are excluded by the callers' fs-level EX envelope (rollback / destroy
- * / unmount all hold fs->global EX). The scrub's extent walk holds no
- * fs->global: it resolves each engine inside an EBR pin, which keeps a
+ * / unmount all hold fs->global EX). The scrub's extent lookups (the
+ * paddr walk and the second look's concurrent lookup) hold no
+ * fs->global: each resolves its engine inside an EBR pin, which keeps a
  * retired engine alive until it leaves (extent_index.c).
  */
 static void dataset_engine_close_locked(dataset_slot *slot) {
