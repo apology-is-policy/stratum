@@ -21,6 +21,7 @@
 
 #include "tharness.h"
 
+#include <stratum/crypto.h>
 #include <stratum/extent.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
@@ -102,9 +103,14 @@ static stm_status pipe_send_to_recv(stm_send_handle *sh, stm_recv_handle *rh)
             continue;
         }
         if (sn == STM_ENOENT) break;
+        /* The harness's asserts do not end a test, so a failure here
+         * must: a send that fails once fails on every call, and the
+         * loop would go on writing its failure lines for ever. */
         STM_ASSERT_OK(sn);
+        if (sn != STM_OK) { free(buf); return sn; }
         stm_status ra = stm_recv_apply(rh, buf, out_len);
         STM_ASSERT_OK(ra);
+        if (ra != STM_OK) { free(buf); return ra; }
     }
     free(buf);
     return stm_recv_finish(rh);
@@ -190,6 +196,73 @@ STM_TEST(full_send_roundtrip_three_extents) {
     STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0, out, sizeof out, &got));
     STM_ASSERT_MEM_EQ(data[2], out, sizeof data[2]);
 
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* ========================================================================= */
+/* T0.88: send of a clone, its shared extents under its origin's key.        */
+/* ========================================================================= */
+
+/* A clone shares its origin's extents, and each keeps the key it was
+ * written under: the origin's. The clone has a key of its own, of the
+ * same number, for what it writes after. A send of the clone carries
+ * both kinds; each must be read under the key of the dataset that
+ * wrote it, as the read path does. */
+STM_TEST(send_clone_shared_and_own_extents) {
+    testpool src; testpool_setup(&src, "clone_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "clone_tgt", POOL_UUID_TGT);
+
+    uint8_t shared[4096], own[4096];
+    for (size_t i = 0; i < sizeof shared; i++) {
+        shared[i] = (uint8_t)(0x40u + (i % 17u));
+        own[i]    = (uint8_t)(0x90u + (i % 13u));
+    }
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, shared, sizeof shared));
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(src.fs, 1, "origin", 6, &snap_id));
+    uint64_t clone_id = 0;
+    STM_ASSERT_OK(stm_fs_create_clone(src.fs, 1, "c_send", snap_id,
+                                        &clone_id));
+    STM_ASSERT_OK(stm_fs_write(src.fs, clone_id, 2, 0, own, sizeof own));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+
+    /* The premise: one record of each kind, both of key number 0, and
+     * both keys loaded. */
+    stm_sync *s_src = stm_fs_sync_for_test(src.fs);
+    stm_extent_index *eidx = stm_sync_extent_index(s_src);
+    stm_extent_record rs, ro;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, clone_id, 1, 0, &rs));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, clone_id, 2, 0, &ro));
+    STM_ASSERT_EQ(rs.origin_dataset_id, (uint64_t)1);
+    STM_ASSERT_EQ(ro.origin_dataset_id, clone_id);
+    STM_ASSERT_EQ(rs.key_id, ro.key_id);
+    uint8_t k1[32], kc[32];
+    STM_ASSERT_OK(stm_sync_get_dek(s_src, 1, rs.key_id, k1));
+    STM_ASSERT_OK(stm_sync_get_dek(s_src, clone_id, ro.key_id, kc));
+    STM_ASSERT(memcmp(k1, kc, sizeof k1) != 0);
+
+    stm_sync *s_tgt = stm_fs_sync_for_test(tgt.fs);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(s_src, clone_id, 0, 0, &sh));
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
+    STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+    stm_send_close(sh);
+    stm_recv_close(rh);
+
+    stm_sync_dcache_drain_for_test(s_tgt);
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    STM_ASSERT_MEM_EQ(shared, out, sizeof shared);
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    STM_ASSERT_MEM_EQ(own, out, sizeof own);
+
+    stm_ct_memzero(k1, sizeof k1);
+    stm_ct_memzero(kc, sizeof kc);
     testpool_teardown(&src);
     testpool_teardown(&tgt);
 }
@@ -497,6 +570,7 @@ STM_TEST(recv_rejects_tampered_csum) {
         }
         if (sn == STM_ENOENT) { free(buf); break; }
         STM_ASSERT_OK(sn);
+        if (sn != STM_OK) { free(buf); break; }   /* else for ever */
         rec *r = malloc(sizeof *r);
         STM_ASSERT(r != NULL);
         r->bytes = buf; r->len = out_len; r->next = NULL;
@@ -980,6 +1054,7 @@ STM_TEST(p7cas9_recv_cold_unprovisioned_target_dataset_rollback) {
         stm_status sn = stm_send_next(sh, buf, cap, &out_len, &needed);
         if (sn == STM_ENOENT) break;
         STM_ASSERT_OK(sn);
+        if (sn != STM_OK) break;   /* else for ever */
         stm_status ra = stm_recv_apply(rh, buf, out_len);
         if (ra != STM_OK) { saw_failure = true; break; }
     }
@@ -1135,6 +1210,7 @@ static stm_status pipe_and_count(stm_send_handle *sh, stm_recv_handle *rh,
         stm_status sn = stm_send_next(sh, buf, cap, &out_len, &needed);
         if (sn == STM_ENOENT) break;
         STM_ASSERT_OK(sn);
+        if (sn != STM_OK) { free(buf); return sn; }   /* else for ever */
 
         /* Inspect the record's type byte (le32 at offset 0 → low byte). */
         uint8_t type = buf[0];
@@ -1144,6 +1220,7 @@ static stm_status pipe_and_count(stm_send_handle *sh, stm_recv_handle *rh,
 
         stm_status ra = stm_recv_apply(rh, buf, out_len);
         STM_ASSERT_OK(ra);
+        if (ra != STM_OK) { free(buf); return ra; }
     }
     free(buf);
     return stm_recv_finish(rh);

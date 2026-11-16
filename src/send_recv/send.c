@@ -85,13 +85,17 @@ typedef struct {
     uint64_t link_gen;
 } send_extent_meta;
 
-/* P7-10 / R42 P2-1: snapshot of (key_id, DEK) pairs the send needs.
- * Captured at send_init (under sync->lock) so a concurrent rotate +
+/* P7-10 / R42 P2-1: snapshot of the DEKs the send needs, one per
+ * (dataset, key_id) the records' keys belong to: the record's ORIGIN
+ * dataset, as the read path asks (a clone's shared extent was written,
+ * and keeps its key, under its origin's). Captured at send_init so a
+ * concurrent rotate +
  * overwrite + keyschema_sweep between init and the per-extent emit
  * can't poison the send by pruning a key still referenced by the
  * snapshotted extent set. The wipe on send_close zeros the DEKs
  * before free. */
 typedef struct {
+    uint64_t dataset_id;
     uint64_t key_id;
     uint8_t  dek[32];
 } send_dek_slot;
@@ -109,7 +113,7 @@ struct stm_send_handle {
     size_t             n_extents;
     size_t             cap_extents;
 
-    send_dek_slot     *deks;          /* snapshot per unique key_id */
+    send_dek_slot     *deks;          /* one per (origin dataset, key_id) */
     size_t             n_deks;
     size_t             cap_deks;
 
@@ -458,10 +462,14 @@ stm_status stm_send_init(stm_sync *sync,
          * directly via cas_paddrs + stm_ad_cas + metadata_key. */
         if (h->extents[i].kind == STM_EXTENT_KIND_COLD) continue;
 
+        uint64_t kds = h->extents[i].origin_dataset_id;
         uint64_t kid = h->extents[i].key_id;
         bool already = false;
         for (size_t j = 0; j < h->n_deks; j++) {
-            if (h->deks[j].key_id == kid) { already = true; break; }
+            if (h->deks[j].dataset_id == kds && h->deks[j].key_id == kid) {
+                already = true;
+                break;
+            }
         }
         if (already) continue;
 
@@ -492,8 +500,9 @@ stm_status stm_send_init(stm_sync *sync,
         }
 
         send_dek_slot *slot = &h->deks[h->n_deks++];
+        slot->dataset_id = kds;
         slot->key_id = kid;
-        stm_status ks = stm_sync_get_dek(sync, dataset_id, kid, slot->dek);
+        stm_status ks = stm_sync_get_dek(sync, kds, kid, slot->dek);
         if (ks != STM_OK) {
             /* No DEK for an extent the iter just collected — must
              * be a sweep race that resolved against this exact
@@ -592,7 +601,8 @@ static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
      * invariant ever drifts. */
     const uint8_t *dek_p = NULL;
     for (size_t i = 0; i < h->n_deks; i++) {
-        if (h->deks[i].key_id == m->key_id) {
+        if (h->deks[i].dataset_id == m->origin_dataset_id &&
+            h->deks[i].key_id == m->key_id) {
             dek_p = h->deks[i].dek;
             break;
         }
