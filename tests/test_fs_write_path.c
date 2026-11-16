@@ -224,14 +224,21 @@ static const char *const mid_op_name[] = {
     "transition", "direct", "sparse"
 };
 
-static void mid_op_put(stm_fs *fs, uint64_t ino, uint64_t off, uint64_t len,
+/* False on a failure, which a caller looping on the pool's state must
+ * stop at: the harness's asserts do not end a test. */
+static bool mid_op_put(stm_fs *fs, uint64_t ino, uint64_t off, uint64_t len,
                        uint8_t byte)
 {
     uint8_t *b = malloc((size_t)len);
+    STM_ASSERT(b != NULL);
+    if (!b) return false;
     memset(b, byte, (size_t)len);
-    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, off, b, (size_t)len));
+    stm_status ws = stm_fs_write(fs, 1, ino, off, b, (size_t)len);
+    STM_ASSERT_OK(ws);
     free(b);
-    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_status cs = stm_fs_commit(fs);
+    STM_ASSERT_OK(cs);
+    return ws == STM_OK && cs == STM_OK;
 }
 
 static uint8_t mid_op_byte(stm_fs *fs, uint64_t ino, uint64_t off)
@@ -2188,10 +2195,11 @@ static bool peer_charge_pool(const char *name, peer_charge *out)
     stm_fs_stats st = {0};
     uint64_t off = 0;
     for (;;) {
-        STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
-        if (st.data_avail_blocks < 512u) break;
+        stm_status gs = stm_fs_stats_get(fs, &st);
+        STM_ASSERT_OK(gs);
+        if (gs != STM_OK || st.data_avail_blocks < 512u) break;
         uint64_t len = st.data_avail_blocks >= 2048u ? MIB : 65536u;
-        mid_op_put(fs, f, off, len, 0x77);
+        if (!mid_op_put(fs, f, off, len, 0x77)) break;
         off += len;
     }
     uint8_t w[4096];

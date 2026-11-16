@@ -1508,8 +1508,13 @@ STM_TEST(impl6_stat_reader_vs_chmod_writer_same_inode) {
     rc.iterations = PER_INODE_ITERATIONS;
 
     pthread_t wt, rt;
-    STM_ASSERT_EQ(0, pthread_create(&wt, NULL, setattr_thread, &wc));
-    STM_ASSERT_EQ(0, pthread_create(&rt, NULL, stat_reader_thread, &rc));
+    int cw = pthread_create(&wt, NULL, setattr_thread, &wc);
+    int cr = pthread_create(&rt, NULL, stat_reader_thread, &rc);
+    STM_ASSERT_EQ(0, cw);
+    STM_ASSERT_EQ(0, cr);
+    /* A thread never started is not waited for, nor joined. */
+    if (cw != 0) atomic_store(&wc.done, true);
+    if (cr != 0) atomic_store(&rc.done, true);
 
     /* wait_two_threads keys on the setattr_ctx done-flag layout; the
      * reader_ctx's done flag sits at the same trailing position, so a
@@ -1525,8 +1530,8 @@ STM_TEST(impl6_stat_reader_vs_chmod_writer_same_inode) {
         struct timespec ns = { 0, 10 * 1000 * 1000 };
         nanosleep(&ns, NULL);
     }
-    (void)pthread_join(wt, NULL);
-    (void)pthread_join(rt, NULL);
+    if (cw == 0) (void)pthread_join(wt, NULL);
+    if (cr == 0) (void)pthread_join(rt, NULL);
     STM_ASSERT_TRUE(ok);
 
     STM_ASSERT_EQ(0, atomic_load(&wc.err));
@@ -1572,8 +1577,13 @@ STM_TEST(impl6_stat_reader_vs_chmod_writer_disjoint_inodes) {
     rc.iterations = PER_INODE_ITERATIONS;
 
     pthread_t wt, rt;
-    STM_ASSERT_EQ(0, pthread_create(&wt, NULL, setattr_thread, &wc));
-    STM_ASSERT_EQ(0, pthread_create(&rt, NULL, stat_reader_thread, &rc));
+    int cw = pthread_create(&wt, NULL, setattr_thread, &wc);
+    int cr = pthread_create(&rt, NULL, stat_reader_thread, &rc);
+    STM_ASSERT_EQ(0, cw);
+    STM_ASSERT_EQ(0, cr);
+    /* A thread never started is not waited for, nor joined. */
+    if (cw != 0) atomic_store(&wc.done, true);
+    if (cr != 0) atomic_store(&rc.done, true);
 
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1586,8 +1596,8 @@ STM_TEST(impl6_stat_reader_vs_chmod_writer_disjoint_inodes) {
         struct timespec ns = { 0, 10 * 1000 * 1000 };
         nanosleep(&ns, NULL);
     }
-    (void)pthread_join(wt, NULL);
-    (void)pthread_join(rt, NULL);
+    if (cw == 0) (void)pthread_join(wt, NULL);
+    if (cr == 0) (void)pthread_join(rt, NULL);
     STM_ASSERT_TRUE(ok);
 
     STM_ASSERT_EQ(0, atomic_load(&wc.err));
@@ -1695,8 +1705,13 @@ STM_TEST(impl6_read_write_same_inode_buffered) {
     rc.iterations = PER_INODE_ITERATIONS;
 
     pthread_t wt, rt;
-    STM_ASSERT_EQ(0, pthread_create(&wt, NULL, buffered_write_thread, &wc));
-    STM_ASSERT_EQ(0, pthread_create(&rt, NULL, buffered_read_thread, &rc));
+    int cw = pthread_create(&wt, NULL, buffered_write_thread, &wc);
+    int cr = pthread_create(&rt, NULL, buffered_read_thread, &rc);
+    STM_ASSERT_EQ(0, cw);
+    STM_ASSERT_EQ(0, cr);
+    /* A thread never started is not waited for, nor joined. */
+    if (cw != 0) atomic_store(&wc.done, true);
+    if (cr != 0) atomic_store(&rc.done, true);
 
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1709,8 +1724,8 @@ STM_TEST(impl6_read_write_same_inode_buffered) {
         struct timespec ns = { 0, 10 * 1000 * 1000 };
         nanosleep(&ns, NULL);
     }
-    (void)pthread_join(wt, NULL);
-    (void)pthread_join(rt, NULL);
+    if (cw == 0) (void)pthread_join(wt, NULL);
+    if (cr == 0) (void)pthread_join(rt, NULL);
     STM_ASSERT_TRUE(ok);
 
     STM_ASSERT_EQ(0, atomic_load(&wc.err));

@@ -501,6 +501,15 @@ static void *fake_corvus_unwrap_thread(void *arg)
     }
 }
 
+/* The thread ends by itself once its script is used up; a test that dials
+ * fewer times than scripted (a failing one) would leave it in accept for
+ * ever, so every join asks it to stop first. */
+static void fake_corvus_unwrap_join(pthread_t tid, fake_corvus_unwrap *fc)
+{
+    atomic_store_explicit(&fc->stop, true, memory_order_release);
+    pthread_join(tid, NULL);
+}
+
 static int fake_corvus_unwrap_start(fake_corvus_unwrap *fc, const char *tag)
 {
     memset(fc, 0, sizeof *fc);
@@ -608,7 +617,7 @@ STM_TEST(corvus_unwrap_once_happy_path)
         STM_ASSERT_EQ((int)fc.last_request[4 + i], (int)token[i]);
     }
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(resp);
 }
@@ -686,7 +695,7 @@ STM_TEST(corvus_unwrap_once_eof_mid_response_is_ebackend)
                                                 &status, dek);
     STM_ASSERT_EQ((int)rc, (int)STM_EBACKEND);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
 }
 
@@ -720,7 +729,7 @@ STM_TEST(corvus_unwrap_once_malformed_payload_len_is_eprotocol)
                                                 &status, dek);
     STM_ASSERT_EQ((int)rc, (int)STM_EPROTOCOL);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
 }
 
@@ -754,7 +763,7 @@ STM_TEST(corvus_unwrap_once_bad_auth_returns_ok_with_status)
     STM_ASSERT_EQ((int)rc, (int)STM_OK);
     STM_ASSERT_EQ((int)status, (int)STM_CORVUS_STATUS_BAD_AUTH);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(resp);
 }
@@ -803,7 +812,7 @@ STM_TEST(corvus_unwrap_retries_on_internal_then_succeeds)
     }
     STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 2);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(r1);
     free(r2);
@@ -852,8 +861,7 @@ STM_TEST(corvus_unwrap_no_retry_on_bad_auth)
 
     /* The harness is still waiting for a second client (n_responses=2):
      * raise its stop flag and join before closing the listener. */
-    atomic_store_explicit(&fc.stop, true, memory_order_release);
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(r1);
     free(r2);
@@ -891,7 +899,7 @@ STM_TEST(corvus_unwrap_exhausts_retries_then_returns_last)
     STM_ASSERT_EQ((int)rc, (int)STM_ECORVUSINTERNAL);
     STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 3);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     for (int i = 0; i < 3; i++) free(resps[i]);
 }
@@ -926,7 +934,7 @@ STM_TEST(corvus_unwrap_clamps_n_retries_to_three)
     STM_ASSERT_EQ((int)rc, (int)STM_ECORVUSINTERNAL);
     STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 4);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     for (int i = 0; i < 4; i++) free(resps[i]);
 }
@@ -970,7 +978,7 @@ STM_TEST(corvus_unwrap_retries_on_transport_failure)
     }
     STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 2);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(r2);
 }
@@ -1003,7 +1011,7 @@ STM_TEST(corvus_unwrap_zero_retries_single_attempt)
     STM_ASSERT_EQ((int)rc, (int)STM_ECORVUSINTERNAL);
     STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 1);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(r);
 }
@@ -1060,7 +1068,7 @@ STM_TEST(corvus_unwrap_once_oversize_payload_len_is_eprotocol)
                                                 &status, dek);
     STM_ASSERT_EQ((int)rc, (int)STM_EPROTOCOL);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
 }
 
@@ -1104,7 +1112,7 @@ STM_TEST(corvus_unwrap_once_zero_timeout_uses_default)
         STM_ASSERT_EQ((int)dek[i], 0x9A);
     }
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(resp);
 }
@@ -1514,7 +1522,7 @@ STM_TEST(corvus_wrap_once_happy_path)
         STM_ASSERT_EQ((int)fc.last_request[61 + i], (int)dek[i]);
     }
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(resp);
 }
@@ -1619,7 +1627,7 @@ STM_TEST(corvus_wrap_once_eof_mid_response_is_ebackend)
                                               &env_len);
     STM_ASSERT_EQ((int)rc, (int)STM_EBACKEND);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
 }
 
@@ -1657,7 +1665,7 @@ STM_TEST(corvus_wrap_once_oversize_envelope_is_eprotocol)
                                               &env_len);
     STM_ASSERT_EQ((int)rc, (int)STM_EPROTOCOL);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
 }
 
@@ -1692,7 +1700,7 @@ STM_TEST(corvus_wrap_once_empty_envelope_is_eprotocol)
                                               &env_len);
     STM_ASSERT_EQ((int)rc, (int)STM_EPROTOCOL);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(resp);
 }
@@ -1731,7 +1739,7 @@ STM_TEST(corvus_wrap_once_bad_auth_returns_ok_with_status)
     STM_ASSERT_EQ((int)status, (int)STM_CORVUS_STATUS_BAD_AUTH);
     STM_ASSERT_EQ((long long)env_len, 0LL);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(resp);
 }
@@ -1772,7 +1780,7 @@ STM_TEST(corvus_wrap_once_zero_timeout_uses_default)
     STM_ASSERT_EQ((int)status, (int)STM_CORVUS_STATUS_OK);
     STM_ASSERT_EQ((long long)env_len, 64LL);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(resp);
 }
@@ -1820,7 +1828,7 @@ STM_TEST(corvus_wrap_retries_on_internal_then_succeeds)
     for (int i = 0; i < 128; i++) STM_ASSERT_EQ((int)env[i], 0x3D);
     STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 2);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(r1);
     free(r2);
@@ -1866,8 +1874,7 @@ STM_TEST(corvus_wrap_no_retry_on_perm_denied)
 
     /* The harness is still waiting for a second client (n_responses=2):
      * raise its stop flag and join before closing the listener. */
-    atomic_store_explicit(&fc.stop, true, memory_order_release);
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(r1);
     free(r2);
@@ -1908,7 +1915,7 @@ STM_TEST(corvus_wrap_exhausts_retries_then_returns_last)
     STM_ASSERT_EQ((int)rc, (int)STM_ECORVUSINTERNAL);
     STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 3);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     for (int i = 0; i < 3; i++) free(resps[i]);
 }
@@ -1944,7 +1951,7 @@ STM_TEST(corvus_wrap_zero_retries_single_attempt)
     STM_ASSERT_EQ((int)rc, (int)STM_ECORVUSINTERNAL);
     STM_ASSERT_EQ(atomic_load(&fc.n_accepts), 1);
 
-    pthread_join(tid, NULL);
+    fake_corvus_unwrap_join(tid, &fc);
     fake_corvus_unwrap_stop(&fc);
     free(r);
 }

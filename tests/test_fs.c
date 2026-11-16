@@ -2417,6 +2417,7 @@ static uint64_t alloc_tree_total_blocks(stm_sync *sync) {
     /* Single-device pool by construction in test_fs harness. */
     stm_alloc *a0 = stm_sync_alloc(sync, 0);
     STM_ASSERT_TRUE(a0 != NULL);
+    if (!a0) return 0;
     uint64_t cursor_block = 0;
     for (;;) {
         uint64_t paddr = 0, length = 0;
@@ -2424,6 +2425,7 @@ static uint64_t alloc_tree_total_blocks(stm_sync *sync) {
                                                           &paddr, &length);
         if (s == STM_ENOENT) break;
         STM_ASSERT_OK(s);
+        if (s != STM_OK) break;   /* the cursor would not move */
         total += length;
         cursor_block = stm_paddr_offset(paddr) + length;
         if (cursor_block >= (UINT64_C(1) << 48)) break;

@@ -95,11 +95,15 @@ static stm_status pipe_send_to_recv(stm_send_handle *sh, stm_recv_handle *rh)
         size_t out_len = 0, needed = 0;
         stm_status sn = stm_send_next(sh, buf, cap, &out_len, &needed);
         if (sn == STM_ERANGE) {
-            /* Grow buffer + retry. */
+            /* Grow buffer + retry: once, to a larger buffer, else the
+             * same answer again would loop for ever. */
+            STM_ASSERT(needed > cap);
             free(buf);
+            if (needed <= cap) return sn;
             cap = needed;
             buf = malloc(cap);
             STM_ASSERT(buf != NULL);
+            if (!buf) return STM_ENOMEM;
             continue;
         }
         if (sn == STM_ENOENT) break;
